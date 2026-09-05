@@ -1,0 +1,38 @@
+{
+  "name": "@andrewpopov/lane-broker",
+  "version": "0.1.0",
+  "description": "Machine-wide test-lane coordinator: serializes conflicting test lanes, caps concurrent heavy lanes, and refuses to start new work while the machine is overloaded.",
+  "author": "Andrew Popov",
+  "license": "MIT",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/andrewpopov/lane-broker.git"
+  },
+  "bugs": {
+    "url": "https://github.com/andrewpopov/lane-broker/issues"
+  },
+  "homepage": "https://github.com/andrewpopov/lane-broker#readme",
+  "keywords": [
+    "test-runner",
+    "concurrency",
+    "scheduler",
+    "load-average",
+    "cli"
+  ],
+  "bin": {
+    "lane": "bin/lane.js"
+  },
+  "files": [
+    "bin",
+    "src"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test tests/",
+    "lint": "node --check bin/lane.js && for f in src/*.js; do node --check \"$f\"; done"
+  },
+  "dependencies": {}
+}
