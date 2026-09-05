@@ -31,8 +31,9 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test tests/",
-    "lint": "node --check bin/lane.js && for f in src/*.js; do node --check \"$f\"; done"
+    "test": "node --test tests/*.test.js",
+    "lint": "node --check bin/lane.js && for f in src/*.js; do node --check \"$f\"; done",
+    "prepare": "git config core.hooksPath .githooks || true"
   },
   "dependencies": {}
 }
