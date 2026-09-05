@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+# Local pre-push gate: this repo's CI, run on your own machine (GitHub Actions
+# is disabled fleet-wide). Cheapest first. Escape hatch: git push --no-verify,
+# for a WIP branch — never to get past a red check.
+set -e
+cd "$(git rev-parse --show-toplevel)"
+npm run lint
+npm test
