@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { sanitizeKey, expandConflicts, resolveTicketConfig, ConfigError, loadGlobalConfig, brokerHome } from '../src/config.js';
+import { sanitizeKey, expandConflicts, resolveTicketConfig, ConfigError, loadGlobalConfig, reloadGlobalConfig, DEFAULT_GLOBAL_CONFIG, brokerHome } from '../src/config.js';
 import { freshEnv, writeRepoConfig, writeGlobalConfig } from './helpers.js';
 
 test('sanitizeKey strips characters outside [A-Za-z0-9_.-]', () => {
@@ -51,6 +51,66 @@ test('an invalid global config throws ConfigError with a clear message', () => {
   process.env.LANE_BROKER_HOME = home;
   try {
     assert.throws(() => loadGlobalConfig(), ConfigError);
+  } finally {
+    process.env.LANE_BROKER_HOME = prevHome;
+  }
+});
+
+test('reloadGlobalConfig picks up a changed value from disk', () => {
+  const { home } = freshEnv();
+  writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 40, loadOpen: 11, loadOpenSamples: 3, sampleMs: 5000 });
+  const prevHome = process.env.LANE_BROKER_HOME;
+  process.env.LANE_BROKER_HOME = home;
+  try {
+    const first = loadGlobalConfig();
+    assert.equal(first.loadOpen, 11);
+    writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 40, loadOpen: 30, loadOpenSamples: 3, sampleMs: 5000 });
+    const reloaded = reloadGlobalConfig(first);
+    assert.equal(reloaded.loadOpen, 30);
+  } finally {
+    process.env.LANE_BROKER_HOME = prevHome;
+  }
+});
+
+test('reloadGlobalConfig returns previous when the file becomes invalid JSON', () => {
+  const { home } = freshEnv();
+  writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 15, loadOpen: 11, loadOpenSamples: 3, sampleMs: 5000 });
+  const prevHome = process.env.LANE_BROKER_HOME;
+  process.env.LANE_BROKER_HOME = home;
+  try {
+    const first = loadGlobalConfig();
+    fs.writeFileSync(path.join(home, 'config.json'), '{ not valid json');
+    const reloaded = reloadGlobalConfig(first);
+    assert.deepEqual(reloaded, first);
+  } finally {
+    process.env.LANE_BROKER_HOME = prevHome;
+  }
+});
+
+test('reloadGlobalConfig returns previous when the file fails validation', () => {
+  const { home } = freshEnv();
+  writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 15, loadOpen: 11, loadOpenSamples: 3, sampleMs: 5000 });
+  const prevHome = process.env.LANE_BROKER_HOME;
+  process.env.LANE_BROKER_HOME = home;
+  try {
+    const first = loadGlobalConfig();
+    // loadOpen >= loadClose is rejected by validateGlobalConfig.
+    writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 15, loadOpen: 20, loadOpenSamples: 3, sampleMs: 5000 });
+    const reloaded = reloadGlobalConfig(first);
+    assert.deepEqual(reloaded, first);
+  } finally {
+    process.env.LANE_BROKER_HOME = prevHome;
+  }
+});
+
+test('reloadGlobalConfig falls back to defaults when there is no previous', () => {
+  const { home } = freshEnv();
+  const prevHome = process.env.LANE_BROKER_HOME;
+  process.env.LANE_BROKER_HOME = home;
+  try {
+    writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 15, loadOpen: 20, loadOpenSamples: 3, sampleMs: 5000 }); // invalid
+    const reloaded = reloadGlobalConfig(undefined);
+    assert.deepEqual(reloaded, DEFAULT_GLOBAL_CONFIG);
   } finally {
     process.env.LANE_BROKER_HOME = prevHome;
   }

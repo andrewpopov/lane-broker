@@ -96,6 +96,13 @@ A lane with `localRefused: true` (the `sim` lane by default, matching the
 rouge fleet split) is refused on `lane run` unless `--allow-local-sim` is
 passed — print a fleet-offload message and exit `69` instead.
 
+A supervisor that is still waiting to start (queued behind capacity or a
+closed load gate) re-reads the global config on every poll, so an edit to
+`config.json` — e.g. raising `loadOpen` to reopen a stuck gate — takes effect
+within one `sampleMs`, not only for supervisors started afterward. A missing
+or invalid config file during a reload is ignored and the last known-good
+config keeps being used; it never crashes or wedges a running supervisor.
+
 ## Scheduling
 
 One atomic transaction, under a short-held global mutex: a queued ticket

@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { paths, ensureStateDirs, appendHistory, atomicWriteJson } from './state.js';
 import { enqueue, tryStart, dequeueSync } from './scheduler.js';
 import { readLease, writeLease, removeLease, isGroupAlive, processStartTime } from './lease.js';
-import { loadGlobalConfig } from './config.js';
+import { loadGlobalConfig, reloadGlobalConfig } from './config.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
 const CANCEL_GRACE_MS = 10_000;
@@ -127,7 +127,7 @@ class CappedLogWriter {
 async function main() {
   const ticket = readTicketFromEnv();
   const root = ensureStateDirs().root;
-  const globalCfg = loadGlobalConfig();
+  let globalCfg = loadGlobalConfig();
   const supervisorStart = processStartTime(process.pid);
   const enriched = {
     ...ticket,
@@ -147,6 +147,13 @@ async function main() {
 
   let started;
   for (;;) {
+    // Re-read the config each iteration rather than reusing the snapshot
+    // taken at startup: a supervisor can poll for a long time before it
+    // starts (queued behind capacity or a closed load gate), and an operator
+    // adjusting thresholds mid-run must take effect within one sampleMs, not
+    // never. reloadGlobalConfig() falls back to the last known-good value on
+    // a missing/invalid file, so a bad edit can't crash or wedge this loop.
+    globalCfg = reloadGlobalConfig(globalCfg);
     if (cancelledBeforeStart || cancelRequested(root, ticket.id)) {
       dequeueSync(root, ticket.id);
       clearCancelRequest(root, ticket.id);

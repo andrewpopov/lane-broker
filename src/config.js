@@ -79,6 +79,26 @@ export function loadGlobalConfig() {
   return cfg;
 }
 
+/**
+ * Re-read the global config for a long-running process (the supervisor's
+ * polling loop). A supervisor holding a stale snapshot forever is the bug
+ * this exists to fix: it must notice a threshold change within one
+ * `sampleMs`, not never. But it must also never crash, or silently change
+ * behaviour, because someone saved a broken config while it's mid-run — an
+ * operator mid-edit, a half-written file, or a typo should degrade to "keep
+ * doing what you were doing" rather than take down every running lane. So
+ * any read/parse/validation failure here falls back to `previous` (or
+ * `DEFAULT_GLOBAL_CONFIG` if there is no previous yet) instead of throwing.
+ */
+export function reloadGlobalConfig(previous) {
+  const fallback = previous === undefined ? { ...DEFAULT_GLOBAL_CONFIG } : previous;
+  try {
+    return loadGlobalConfig();
+  } catch {
+    return fallback;
+  }
+}
+
 const repoIdentityCache = new Map();
 
 /** Resolve `<gitFileDir>/gitdir: <path>` style pointer contents to an absolute path. */
