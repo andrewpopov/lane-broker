@@ -6,7 +6,7 @@ import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from 
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
  *  possibly-running work and must count against both conflicts and capacity. */
-const HELD_STATES = new Set([LEASE_STATE.RUNNING, LEASE_STATE.ORPHANED]);
+export const HELD_STATES = new Set([LEASE_STATE.RUNNING, LEASE_STATE.ORPHANED]);
 
 function nextSeq(root) {
   const file = paths(root).seq;

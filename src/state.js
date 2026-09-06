@@ -90,9 +90,11 @@ export function processStartTime(pid) {
     }).trim();
     return out || null;
   } catch (err) {
-    // `ps` ran and exited non-zero (pid not found) -> confirmed gone.
-    if (err.status !== undefined) return null;
-    // execFileSync itself failed to run `ps` (EAGAIN under load, ENOENT, etc.) -> indeterminate.
+    // `ps` ran and exited non-zero (pid not found) -> confirmed gone. A
+    // spawn-level failure (EAGAIN under load, ENOENT, EPERM, ...) commonly
+    // carries `status: null` too, so only a numeric status counts as "ran".
+    if (typeof err.status === 'number') return null;
+    // execFileSync itself failed to run `ps` -> indeterminate.
     return undefined;
   }
 }
@@ -194,14 +196,33 @@ export async function withLock(root, fn, { timeoutMs = 15_000, pollMs = 25 } = {
       // Renaming the whole lock dir away first is one atomic syscall: the
       // "lock" path goes straight from existing-with-our-owner to gone.
       const trash = path.join(root, `.lock-release-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
+      let renamedAway = false;
       try {
         fs.renameSync(lockDir, trash);
-        fs.rmSync(trash, { recursive: true, force: true });
+        renamedAway = true;
       } catch {
+        // The rename itself failed (lockDir already gone, or some other
+        // transient issue) — fall back to a guarded compare-and-remove: only
+        // touch lockDir if it still shows our own token, since a contender
+        // may have already acquired it.
+        const current = readJsonSafe(ownerFile);
+        if (current && current.token === token) {
+          try {
+            fs.rmSync(lockDir, { recursive: true, force: true });
+          } catch {
+            // already gone
+          }
+        }
+      }
+      if (renamedAway) {
+        // We are released: the lockDir path is free (or already reclaimed by
+        // a contender). Cleaning up the trash directory is best-effort — a
+        // failure here is a leak, never a reason to touch lockDir again,
+        // since a contender may already own that path by now.
         try {
-          fs.rmSync(lockDir, { recursive: true, force: true });
+          fs.rmSync(trash, { recursive: true, force: true });
         } catch {
-          // already gone
+          // leaked trash dir; ignore
         }
       }
     }

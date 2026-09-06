@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import { ensureStateDirs, paths, withLock, bootId } from './state.js';
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
-import { listQueue } from './scheduler.js';
+import { listQueue, HELD_STATES } from './scheduler.js';
 import { readGateState } from './load.js';
 import { loadGlobalConfig } from './config.js';
 
@@ -30,7 +30,7 @@ export async function collectStatus() {
       weight: l.weight,
     }));
 
-  const runningWeight = leases.filter((l) => l.state === LEASE_STATE.RUNNING).reduce((s, l) => s + (l.weight || 0), 0);
+  const runningWeight = leases.filter((l) => HELD_STATES.has(l.state)).reduce((s, l) => s + (l.weight || 0), 0);
 
   const queued = queue.map((t, i) => ({
     id: t.id,

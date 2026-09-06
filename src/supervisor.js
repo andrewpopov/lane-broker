@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 import { paths, ensureStateDirs, appendHistory, atomicWriteJson } from './state.js';
 import { enqueue, tryStart, dequeueSync } from './scheduler.js';
 import { readLease, writeLease, removeLease, isGroupAlive, processStartTime } from './lease.js';
@@ -65,12 +66,19 @@ class CappedLogWriter {
     // toward the cap so a pre-existing (or re-opened) log can't bypass it.
     const flags = fs.constants.O_CREAT | fs.constants.O_WRONLY | fs.constants.O_APPEND | (fs.constants.O_NOFOLLOW || 0);
     this.failed = false;
+    this.pausedSources = new Set();
     this.stream = fs.createWriteStream(logPath, { flags });
     this.stream.on('error', (err) => {
       // Disk-full, a symlink refusal, or any other stream failure must never
-      // crash the supervisor or the lane it is running.
+      // crash the supervisor or the lane it is running. Switch to discard
+      // mode permanently and resume anything paused waiting on this stream's
+      // 'drain' — that event will never come once the stream has errored, so
+      // without this the child's stdout/stderr pipes stay paused forever and
+      // the run hangs instead of failing.
       this.failed = true;
       this.error = err;
+      for (const src of this.pausedSources) src.resume();
+      this.pausedSources.clear();
     });
     this.bytes = existingBytes;
     this.truncated = existingBytes >= LOG_CAP_BYTES;
@@ -88,6 +96,20 @@ class CappedLogWriter {
     }
     this.bytes += chunk.length;
     return this.stream.write(chunk);
+  }
+
+  /** Pause `source` until this writer's stream drains. If the writer fails
+   *  while `source` is paused, the error handler above resumes it — a
+   *  stream error never fires 'drain', so without that, `source` would stay
+   *  paused forever. */
+  pauseUntilDrain(source) {
+    if (this.failed) return;
+    source.pause();
+    this.pausedSources.add(source);
+    this.stream.once('drain', () => {
+      this.pausedSources.delete(source);
+      source.resume();
+    });
   }
 
   /** Await the stream fully flushing before the process exits, so the log's tail is never lost. */
@@ -152,16 +174,10 @@ async function main() {
 
   const logWriter = new CappedLogWriter(ticket.logPath);
   child.stdout.on('data', (c) => {
-    if (!logWriter.write(c)) {
-      child.stdout.pause();
-      logWriter.stream.once('drain', () => child.stdout.resume());
-    }
+    if (!logWriter.write(c)) logWriter.pauseUntilDrain(child.stdout);
   });
   child.stderr.on('data', (c) => {
-    if (!logWriter.write(c)) {
-      child.stderr.pause();
-      logWriter.stream.once('drain', () => child.stderr.resume());
-    }
+    if (!logWriter.write(c)) logWriter.pauseUntilDrain(child.stderr);
   });
 
   writeLease(root, { ...started.lease, childPgid: child.pid, heartbeatAt: Date.now(), startedAt });
@@ -237,7 +253,14 @@ async function main() {
   });
 }
 
-main().catch((err) => {
-  process.stderr.write(`lane-broker supervisor error: ${err.stack || err.message}\n`);
-  process.exit(1);
-});
+export { CappedLogWriter };
+
+// Guard so this module can be imported (e.g. by tests exercising
+// CappedLogWriter directly) without running the supervisor for real; it only
+// runs when invoked as the entrypoint, as run.js spawns it (`node supervisor.js`).
+if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
+  main().catch((err) => {
+    process.stderr.write(`lane-broker supervisor error: ${err.stack || err.message}\n`);
+    process.exit(1);
+  });
+}
