@@ -24,8 +24,8 @@ export async function collectStatus() {
       key: l.key,
       state: l.state,
       pid: l.childPgid,
-      elapsedMs: now - (l.heartbeatAt || now),
-      startedApproxMs: l.heartbeatAt ? now - l.heartbeatAt : null,
+      elapsedMs: l.startedAt ? now - l.startedAt : null,
+      heartbeatAgeMs: l.heartbeatAt ? now - l.heartbeatAt : null,
       log: l.logPath,
       weight: l.weight,
     }));
@@ -46,6 +46,7 @@ export async function collectStatus() {
     loadGate: {
       closed: gate.closed,
       lastLoad: gate.lastLoad ?? null,
+      sampleAgeMs: gate.lastSampleAt ? now - gate.lastSampleAt : null,
       consecutiveUnder: gate.consecutiveUnder || 0,
       loadClose: cfg.loadClose,
       loadOpen: cfg.loadOpen,
@@ -69,7 +70,8 @@ export function renderStatusText(status) {
   lines.push(`capacity: ${status.used}/${status.capacity} used`);
   lines.push(
     `load gate: ${status.loadGate.closed ? 'CLOSED' : 'open'}` +
-      ` (load ${status.loadGate.lastLoad ?? '?'}, close>${status.loadGate.loadClose}, open<${status.loadGate.loadOpen} x${status.loadGate.loadOpenSamples}` +
+      ` (load ${status.loadGate.lastLoad ?? '?'}, sampled ${fmtMs(status.loadGate.sampleAgeMs)} ago` +
+      `, close>${status.loadGate.loadClose}, open<${status.loadGate.loadOpen} x${status.loadGate.loadOpenSamples}` +
       `, consecutive-under ${status.loadGate.consecutiveUnder})`,
   );
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
@@ -80,7 +82,10 @@ export function renderStatusText(status) {
   } else {
     for (const r of status.running) {
       const flag = r.state === 'ORPHANED' ? ' [ORPHANED]' : '';
-      lines.push(`  ${r.id}  key=${r.key}  pid=${r.pid ?? '-'}  since-heartbeat=${fmtMs(r.startedApproxMs)}  log=${r.log}${flag}`);
+      lines.push(
+        `  ${r.id}  key=${r.key}  pid=${r.pid ?? '-'}  elapsed=${fmtMs(r.elapsedMs)}  ` +
+          `heartbeat-age=${fmtMs(r.heartbeatAgeMs)}  log=${r.log}${flag}`,
+      );
     }
   }
   lines.push('');

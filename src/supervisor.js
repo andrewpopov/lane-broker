@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { paths, ensureStateDirs, appendHistory, atomicWriteJson } from './state.js';
 import { enqueue, tryStart, dequeueSync } from './scheduler.js';
-import { readLease, writeLease, removeLease, isGroupAlive, processStartTime, LEASE_STATE } from './lease.js';
+import { readLease, writeLease, removeLease, isGroupAlive, processStartTime } from './lease.js';
 import { loadGlobalConfig } from './config.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
@@ -55,38 +55,62 @@ async function killGroup(pgid) {
 
 class CappedLogWriter {
   constructor(logPath) {
-    this.stream = fs.createWriteStream(logPath, { flags: 'a' });
-    this.bytes = 0;
-    this.truncated = false;
+    let existingBytes = 0;
+    try {
+      existingBytes = fs.statSync(logPath).size;
+    } catch {
+      // new file
+    }
+    // O_NOFOLLOW refuses to open through a symlink; existing bytes count
+    // toward the cap so a pre-existing (or re-opened) log can't bypass it.
+    const flags = fs.constants.O_CREAT | fs.constants.O_WRONLY | fs.constants.O_APPEND | (fs.constants.O_NOFOLLOW || 0);
+    this.failed = false;
+    this.stream = fs.createWriteStream(logPath, { flags });
+    this.stream.on('error', (err) => {
+      // Disk-full, a symlink refusal, or any other stream failure must never
+      // crash the supervisor or the lane it is running.
+      this.failed = true;
+      this.error = err;
+    });
+    this.bytes = existingBytes;
+    this.truncated = existingBytes >= LOG_CAP_BYTES;
   }
 
+  /** Returns false when the caller should pause its source until 'drain' fires. */
   write(chunk) {
-    if (this.truncated) return;
+    if (this.truncated || this.failed) return true;
     if (this.bytes + chunk.length > LOG_CAP_BYTES) {
       const remaining = LOG_CAP_BYTES - this.bytes;
       if (remaining > 0) this.stream.write(chunk.subarray(0, remaining));
       this.stream.write('\n[lane-broker] log truncated at 50MB\n');
       this.truncated = true;
-      return;
+      return true;
     }
     this.bytes += chunk.length;
-    this.stream.write(chunk);
+    return this.stream.write(chunk);
   }
 
-  close() {
-    this.stream.end();
+  /** Await the stream fully flushing before the process exits, so the log's tail is never lost. */
+  finish() {
+    return new Promise((resolve) => {
+      if (this.failed) {
+        resolve();
+        return;
+      }
+      this.stream.end(resolve);
+    });
   }
 }
 
 async function main() {
   const ticket = readTicketFromEnv();
-  const root = ensureStateDirs(process.env.LANE_BROKER_STATE_DIR || undefined).root;
+  const root = ensureStateDirs().root;
   const globalCfg = loadGlobalConfig();
   const supervisorStart = processStartTime(process.pid);
   const enriched = {
     ...ticket,
     supervisorPid: process.pid,
-    supervisorStart,
+    supervisorStart: supervisorStart === undefined ? null : supervisorStart,
   };
 
   let cancelledBeforeStart = false;
@@ -108,6 +132,12 @@ async function main() {
     }
     started = await tryStart(root, enriched, globalCfg);
     if (started.started) break;
+    if (started.reason === 'not-head' && started.position === null) {
+      // Our own ticket is no longer in the queue without ever having
+      // started: it was cancelled out from under us. Without this, a queued
+      // cancel leaves this supervisor polling forever.
+      process.exit(0);
+    }
     await sleep(globalCfg.sampleMs);
   }
 
@@ -121,13 +151,24 @@ async function main() {
   });
 
   const logWriter = new CappedLogWriter(ticket.logPath);
-  child.stdout.on('data', (c) => logWriter.write(c));
-  child.stderr.on('data', (c) => logWriter.write(c));
+  child.stdout.on('data', (c) => {
+    if (!logWriter.write(c)) {
+      child.stdout.pause();
+      logWriter.stream.once('drain', () => child.stdout.resume());
+    }
+  });
+  child.stderr.on('data', (c) => {
+    if (!logWriter.write(c)) {
+      child.stderr.pause();
+      logWriter.stream.once('drain', () => child.stderr.resume());
+    }
+  });
 
-  writeLease(root, { ...started.lease, childPgid: child.pid, heartbeatAt: Date.now() });
+  writeLease(root, { ...started.lease, childPgid: child.pid, heartbeatAt: Date.now(), startedAt });
 
   let finished = false;
   let cancelling = false;
+  let killPromise = null;
 
   const heartbeat = setInterval(() => {
     if (finished) return;
@@ -136,36 +177,27 @@ async function main() {
     if (!cancelling && cancelRequested(root, ticket.id)) {
       cancelling = true;
       clearCancelRequest(root, ticket.id);
-      killGroup(child.pid);
+      killPromise = killGroup(child.pid);
     }
   }, globalCfg.sampleMs);
 
-  process.on('SIGTERM', () => {
+  const onCancelSignal = () => {
     if (!cancelling && !finished) {
       cancelling = true;
-      killGroup(child.pid);
+      killPromise = killGroup(child.pid);
     }
-  });
-  process.on('SIGINT', () => {
-    if (!cancelling && !finished) {
-      cancelling = true;
-      killGroup(child.pid);
-    }
-  });
+  };
+  process.on('SIGTERM', onCancelSignal);
+  process.on('SIGINT', onCancelSignal);
 
-  child.on('exit', (code, signal) => {
+  async function finalizeAndExit(result, exitCode) {
     finished = true;
     clearInterval(heartbeat);
-    logWriter.close();
-    const endedAt = Date.now();
-    const result = {
-      id: ticket.id,
-      exit: code,
-      signal,
-      startedAt,
-      endedAt,
-      waitedMs: startedAt - enriched.createdAt || 0,
-    };
+    // killGroup must be awaited on every path: if the group leader exited
+    // but a TERM-resistant descendant is still alive, we must not write the
+    // result / release the lease until the whole group is confirmed gone.
+    if (killPromise) await killPromise;
+    await logWriter.finish();
     atomicWriteJson(ticket.resultPath, result);
     appendHistory(root, {
       id: ticket.id,
@@ -176,7 +208,32 @@ async function main() {
       ...result,
     });
     removeLease(root, ticket.id); // release always comes last
-    process.exit(0);
+    process.exit(exitCode);
+  }
+
+  child.on('error', (err) => {
+    if (finished) return;
+    const endedAt = Date.now();
+    finalizeAndExit(
+      { id: ticket.id, exit: 1, signal: null, startedAt, endedAt, waitedMs: startedAt - enriched.createdAt || 0, error: err.message },
+      1,
+    );
+  });
+
+  // Listen on 'close' rather than 'exit': 'close' fires only after stdio is
+  // fully drained, so a chatty child's buffered tail is never lost.
+  child.on('close', (code, signal) => {
+    if (finished) return;
+    const endedAt = Date.now();
+    const result = {
+      id: ticket.id,
+      exit: code,
+      signal,
+      startedAt,
+      endedAt,
+      waitedMs: startedAt - enriched.createdAt || 0,
+    };
+    finalizeAndExit(result, 0);
   });
 }
 

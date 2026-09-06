@@ -4,8 +4,6 @@ import os from 'node:os';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 
-const LOCK_STALE_MS = 30_000;
-
 export function stateHome() {
   return process.env.LANE_BROKER_STATE || path.join(os.homedir(), '.cache', 'lane-broker');
 }
@@ -67,7 +65,7 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function isProcessAlive(pid) {
+export function isPidAlive(pid) {
   try {
     process.kill(pid, 0);
     return true;
@@ -77,50 +75,145 @@ function isProcessAlive(pid) {
 }
 
 /**
- * Acquire the global mutex: an mkdir-atomic lock directory holding owner
- * pid + timestamp. Recoverable if the owner process is dead, or the lock
- * is older than LOCK_STALE_MS (a transaction should never legitimately
- * hold it that long).
+ * Process start time, used to defeat PID reuse. Returns:
+ *  - a string (the `ps` start-time line) if the process is alive,
+ *  - `null` if `ps` ran and confirmed the pid does not exist,
+ *  - `undefined` if the probe itself failed (e.g. cannot fork under load) —
+ *    callers must treat this as "could not determine", never as "gone".
+ * Pinned to the C locale so the output format is stable across environments.
+ */
+export function processStartTime(pid) {
+  try {
+    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
+      encoding: 'utf8',
+      env: { ...process.env, LC_ALL: 'C', LC_TIME: 'C' },
+    }).trim();
+    return out || null;
+  } catch (err) {
+    // `ps` ran and exited non-zero (pid not found) -> confirmed gone.
+    if (err.status !== undefined) return null;
+    // execFileSync itself failed to run `ps` (EAGAIN under load, ENOENT, etc.) -> indeterminate.
+    return undefined;
+  }
+}
+
+/** Is the owner of the lock alive? Fails closed: an indeterminate probe never counts as stale. */
+function isLockOwnerAlive(owner) {
+  if (!owner) return false;
+  if (!isPidAlive(owner.pid)) return false;
+  if (!owner.start) return true; // couldn't capture a start time at acquire time; fall back to pid-alive
+  const current = processStartTime(owner.pid);
+  if (current === undefined) return true; // probe failed: fail closed, never steal
+  if (current === null) return false; // confirmed gone
+  return current === owner.start;
+}
+
+/**
+ * Acquire the global mutex. Ownership is published atomically: the owner
+ * file is written inside a staging directory first, then the whole staging
+ * directory is renamed onto the lock dir path. A rename onto an existing
+ * non-empty directory fails atomically (ENOTEMPTY/EEXIST/ENOTDIR), so a
+ * contender can never observe a lock dir with no owner file — the two-step
+ * mkdir-then-write race this replaces is exactly what let a mid-acquire lock
+ * be mistaken for stale and stolen.
+ *
+ * Release is compare-and-remove: a lock is only removed by whoever's token
+ * is recorded as its owner, so an evicted/timed-out holder's `finally` can
+ * never delete a lock that has since been re-acquired by someone else.
+ *
+ * Recovery (stealing an existing lock) requires the owner's pid to be
+ * confirmed dead (pid + start-time, to defeat pid reuse) — never elapsed
+ * time alone, and never on an indeterminate liveness probe or an unreadable
+ * owner file (both are treated as "young": back off and retry).
  */
 export async function withLock(root, fn, { timeoutMs = 15_000, pollMs = 25 } = {}) {
   const lockDir = paths(root).lock;
   fs.mkdirSync(root, { recursive: true });
   const ownerFile = path.join(lockDir, 'owner.json');
   const deadline = Date.now() + timeoutMs;
+  const token = crypto.randomUUID();
+  const start = processStartTime(process.pid);
+
   for (;;) {
+    const staging = path.join(root, `.lock-stage-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
+    let acquired = false;
     try {
-      fs.mkdirSync(lockDir);
-      fs.writeFileSync(ownerFile, JSON.stringify({ pid: process.pid, at: Date.now() }));
-      break;
-    } catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-      const owner = readJsonSafe(ownerFile);
-      const stale = !owner || Date.now() - owner.at > LOCK_STALE_MS || !isProcessAlive(owner.pid);
-      if (stale) {
-        try {
-          fs.rmSync(lockDir, { recursive: true, force: true });
-        } catch {
-          // lost the race to another recoverer; loop and try again
-        }
-        continue;
+      fs.mkdirSync(staging, { recursive: true });
+      fs.writeFileSync(
+        path.join(staging, 'owner.json'),
+        JSON.stringify({ pid: process.pid, token, start: start === undefined ? null : start, at: Date.now() }),
+      );
+      fs.renameSync(staging, lockDir);
+      acquired = true;
+    } catch {
+      // Any failure here (contention, or a transient ENOENT/EINVAL racing a
+      // concurrent recoverer) must never escape as a hard error — it is
+      // treated as contention and retried below.
+      try {
+        fs.rmSync(staging, { recursive: true, force: true });
+      } catch {
+        // already gone
       }
+    }
+    if (acquired) break;
+
+    const owner = readJsonSafe(ownerFile);
+    if (!owner) {
+      // Lock dir exists but its owner file is missing/unreadable: treat as
+      // YOUNG (mid-acquire, or a foreign/legacy lock), never as stale.
       if (Date.now() > deadline) {
-        throw new Error(`lane-broker: timed out waiting for the global lock held by pid ${owner.pid}`);
+        throw new Error('lane-broker: timed out waiting for the global lock (owner unreadable)');
       }
       await sleep(pollMs);
+      continue;
     }
+    if (!isLockOwnerAlive(owner)) {
+      try {
+        fs.rmSync(lockDir, { recursive: true, force: true });
+      } catch {
+        // lost the race to another recoverer; loop and try again
+      }
+      continue;
+    }
+    if (Date.now() > deadline) {
+      throw new Error(`lane-broker: timed out waiting for the global lock held by pid ${owner.pid}`);
+    }
+    await sleep(pollMs);
   }
+
   try {
     return await fn();
   } finally {
-    fs.rmSync(lockDir, { recursive: true, force: true });
+    const owner = readJsonSafe(ownerFile);
+    if (owner && owner.token === token) {
+      // A recursive rmSync on the live path is not atomic: it unlinks
+      // owner.json, then rmdir's the now-empty lockDir as a second step. In
+      // that gap a concurrent contender's rename(staging, lockDir) can land
+      // on the momentarily-empty directory and succeed, so our rmdir then
+      // fails on a directory someone else just repopulated (ENOTEMPTY).
+      // Renaming the whole lock dir away first is one atomic syscall: the
+      // "lock" path goes straight from existing-with-our-owner to gone.
+      const trash = path.join(root, `.lock-release-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
+      try {
+        fs.renameSync(lockDir, trash);
+        fs.rmSync(trash, { recursive: true, force: true });
+      } catch {
+        try {
+          fs.rmSync(lockDir, { recursive: true, force: true });
+        } catch {
+          // already gone
+        }
+      }
+    }
   }
 }
 
 let cachedBootId = process.env.LANE_BROKER_BOOT_ID || null;
 
 /** A boot identifier that changes across a reboot: darwin sysctl, linux /proc/stat btime,
- *  or a computed epoch-boot-time fallback derived from os.uptime(). */
+ *  or a computed epoch-boot-time fallback derived from os.uptime(). The fallback is rounded
+ *  to the nearest 10s so two processes sampling Date.now()/os.uptime() microseconds apart
+ *  agree on the same id instead of drifting by a second and reaping each other's leases. */
 export function bootId() {
   if (process.env.LANE_BROKER_BOOT_ID) return process.env.LANE_BROKER_BOOT_ID;
   if (cachedBootId) return cachedBootId;
@@ -143,6 +236,7 @@ export function bootId() {
   } catch {
     // fall through to the computed fallback
   }
-  cachedBootId = String(Math.round(Date.now() / 1000 - os.uptime()));
+  const approxBootEpoch = Date.now() / 1000 - os.uptime();
+  cachedBootId = String(Math.round(approxBootEpoch / 10) * 10);
   return cachedBootId;
 }

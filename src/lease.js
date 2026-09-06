@@ -1,7 +1,8 @@
-import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
-import { paths, atomicWriteJson, readJsonSafe, bootId } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, bootId, isPidAlive, processStartTime } from './state.js';
+
+export { isPidAlive, processStartTime };
 
 export const LEASE_STATE = { RUNNING: 'RUNNING', ORPHANED: 'ORPHANED', DONE: 'DONE' };
 
@@ -39,15 +40,6 @@ export function listLeases(root) {
     .filter(Boolean);
 }
 
-export function isPidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 export function isGroupAlive(pgid) {
   try {
     process.kill(-pgid, 0);
@@ -57,20 +49,18 @@ export function isGroupAlive(pgid) {
   }
 }
 
-/** Process start time, used to defeat PID reuse. Returns null if it cannot be determined. */
-export function processStartTime(pid) {
-  try {
-    return execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8' }).trim() || null;
-  } catch {
-    return null;
-  }
-}
-
+/**
+ * Is the supervisor that holds this lease still alive? Fails closed: if the
+ * liveness probe itself cannot be completed (e.g. `ps` cannot fork under
+ * load), the lease is kept rather than declared dead — a transient probe
+ * failure must never look like the supervisor exited.
+ */
 export function isSupervisorAlive(lease) {
   if (!isPidAlive(lease.supervisorPid)) return false;
   if (!lease.supervisorStart) return true; // couldn't capture a start time at write time; fall back to pid-alive
   const current = processStartTime(lease.supervisorPid);
-  if (!current) return false; // process vanished between the kill(0) probe and the ps call
+  if (current === undefined) return true; // probe failed: fail closed, keep the lease
+  if (current === null) return false; // confirmed gone
   return current === lease.supervisorStart;
 }
 

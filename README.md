@@ -34,9 +34,9 @@ features like pipes or globbing.
 
 | Flag | Purpose |
 |---|---|
-| `--repo <name>` | Repo identity used in the lease key. |
-| `--lane <name>` | Lane name (`default` if omitted); looked up in `.lane-broker.json`. |
-| `--weight <n>` | Override the configured weight for this run. |
+| `--repo <name>` | Repo label, used only as a fallback for the lease key. When `cwd` is inside a git repo, the git identity (`git rev-parse --git-common-dir`) always wins, so the same repo resolves to the same key whether or not `--repo` is passed; `--repo` only determines the key outside a git repo. |
+| `--lane <name>` | Lane name (`default` if omitted); looked up in `.lane-broker.json`. If the repo config declares `lanes`, an undeclared name is refused (exit `64`) rather than silently keying on a private, unconflicting lane. |
+| `--weight <n>` | Override the configured weight for this run; must be a positive number (validated before enqueueing, exit `2` otherwise). |
 | `--detach` | Print the run id and return immediately instead of waiting. |
 | `--timeout <duration>` | e.g. `30s`, `5m`, `500ms`. Exit `75` if not finished in time — see below. |
 | `--allow-local-sim` | Override a lane's `localRefused: true`. |
@@ -48,6 +48,9 @@ only *waits* on the supervisor's result file. If the calling agent (or its
 running suite are unaffected — `lane status` still shows it RUNNING, and a
 later `lane run` on the same key waits behind it. `lane wait <id>` reattaches;
 this is the sanctioned way to outlive a short tool ceiling on a long lane.
+`lane wait` on an id that is neither queued, leased, nor resulted fails fast
+(after a short grace period, to avoid racing a `lane run --detach` that
+hasn't finished enqueueing yet) rather than blocking forever on a typo.
 
 ## Config
 
@@ -98,8 +101,12 @@ passed — print a fleet-offload message and exit `69` instead.
 One atomic transaction, under a short-held global mutex: a queued ticket
 starts only when **all** of:
 - it is the head of the global FIFO (strict FIFO — no backfill behind it),
-- no `RUNNING` lease conflicts with its key,
-- running weight + its weight fits `capacity`,
+- a queued ticket whose supervisor has already died is dequeued first, so a
+  crashed supervisor can never wedge every other ticket behind it forever,
+- no `RUNNING` **or `ORPHANED`** lease conflicts with its key — an ORPHANED
+  lease still represents real, possibly-running work, so it blocks exactly
+  like a RUNNING one (it just can't be auto-reaped; see ORPHANED handling),
+- running weight (RUNNING + ORPHANED) + its weight fits `capacity`,
 - the load gate is open,
 - the broker is not paused.
 
@@ -109,10 +116,17 @@ starts only when **all** of:
 right after a spike does not reopen it.
 
 **Reentrancy**: the supervisor exports `LANE_BROKER_LEASE=<id>` and
-`LANE_BROKER_KEY=<key>` to the child. A nested `lane run` for the *exact same*
-key runs directly with no new lease (no deadlock). A nested `lane run` for any
-other key is refused with exit `64` — v1 has no lane hierarchy, so "narrower"
-is defined as identical, not partially overlapping.
+`LANE_BROKER_KEY=<key>` to the child. A nested `lane run` reuses the inherited
+lease (no new acquisition, no deadlock) when either:
+- it requests the *exact same* key, or
+- it requests lane `prepush` under an inherited lease of the *same repo*
+  (any lane) — so a pre-push hook wrapped in `lane run --lane prepush` works
+  regardless of which lane it nests inside.
+
+A reentrant run may not *widen* the inherited lease's weight (a `--weight`
+higher than the inherited lease's is refused). Any other nested key — a
+different repo, or a different lane that isn't `prepush` — is refused with
+exit `64`; v1 has no general lane hierarchy.
 
 ## Exit codes
 
@@ -135,11 +149,20 @@ existence alone never decides this — process start-time is compared against
 what was recorded at spawn time, to defeat PID reuse.
 
 If the supervisor dies but the child group is still alive, the lease is
-marked **ORPHANED** and is *never* auto-reaped — `lane status` flags it. Use
-`lane cancel <id>` to tear it down: it TERMs the process group, waits a grace
-period, KILLs, verifies the group is gone, and only then releases the lease.
-This is intentionally conservative: an ORPHANED lease still represents real,
-possibly-important, running work.
+marked **ORPHANED** and is *never* auto-reaped — `lane status` flags it, and
+the scheduler continues to treat it as held (see Scheduling above): it blocks
+conflicting keys and counts against capacity exactly like a RUNNING lease.
+Use `lane cancel <id>` to tear it down: it TERMs the process group, waits a
+grace period, KILLs, verifies the group is gone, and only then releases the
+lease. This is intentionally conservative: an ORPHANED lease still represents
+real, possibly-important, running work.
+
+`lane cancel` only ever reports success once it has verified the outcome. If
+the lease's supervisor is alive but unresponsive (stopped, starved) and does
+not release the lease within its grace period, `lane cancel` exits non-zero
+and reports the lease as still held, rather than silently declaring success —
+it does not take over killing the group out from under a supervisor that
+might still resume and act on its own.
 
 ## The current-load caveat
 
@@ -171,11 +194,27 @@ symlinks.
 ## Verify locally
 
 ```bash
-npm ci
+npm install
 npm test
 npm run lint
 ```
 
+`npm run lint` is `node --check` — a syntax parser, not a full linter. It
+catches parse errors only (no unused vars, no shadowing, no undefined
+globals); the pre-push hook's real coverage is `npm test`.
+
 ## License
 
 [MIT](./LICENSE)
+
+### Running the tests
+
+`npm test` runs the suite with `--test-concurrency=1`. That is deliberate, not
+timidity: every test here drives **real** processes — detached supervisors,
+process groups, SIGSTOP/SIGTERM/SIGKILL, an 8×200 mutex contention hammer, a
+200k-line log tee. Running the files in parallel multiplies that by the number
+of workers and the suite starves itself: `no-backfill` then times out waiting
+for a lease that a scheduled-out CLI has not written yet, on a machine where it
+passes standalone in under two seconds. A test suite for a tool that exists to
+stop parallel processes from starving each other should not itself be a
+thundering herd.
