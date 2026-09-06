@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
 import os from 'node:os';
-import { execFileSync } from 'node:child_process';
 import { repoIdentity } from '../src/config.js';
+import { gitFixture } from './helpers.js';
 
 let counter = 0;
 
@@ -15,9 +15,7 @@ function freshDir() {
 
 function initRepo(dir) {
   fs.mkdirSync(dir, { recursive: true });
-  execFileSync('git', ['init', '-q'], { cwd: dir });
-  execFileSync('git', ['config', 'user.email', 'test@example.com'], { cwd: dir });
-  execFileSync('git', ['config', 'user.name', 'Test'], { cwd: dir });
+  gitFixture(['init', '-q'], dir);
 }
 
 /** Prepend a directory containing a `git` shim to PATH; the shim marks that it ran and fails. */
@@ -50,11 +48,11 @@ test('a linked worktree resolves to the same identity as its primary checkout', 
   const mainDir = freshDir();
   initRepo(mainDir);
   fs.writeFileSync(path.join(mainDir, 'README.md'), 'x');
-  execFileSync('git', ['add', '.'], { cwd: mainDir });
-  execFileSync('git', ['commit', '-q', '-m', 'init'], { cwd: mainDir });
+  gitFixture(['add', '.'], mainDir);
+  gitFixture(['commit', '-q', '-m', 'init'], mainDir);
 
   const wtDir = path.join(freshDir(), 'wt');
-  execFileSync('git', ['worktree', 'add', wtDir, '-b', 'b'], { cwd: mainDir });
+  gitFixture(['worktree', 'add', wtDir, '-b', 'b'], mainDir);
 
   const mainId = repoIdentity(mainDir);
   const wtId = repoIdentity(wtDir);
