@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { ensureStateDirs, paths, withLock, bootId } from './state.js';
+import { ensureStateDirs, paths, withLock, bootId, readJsonSafe } from './state.js';
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
 import { listQueue, HELD_STATES } from './scheduler.js';
 import { readGateState } from './load.js';
@@ -15,6 +15,7 @@ export async function collectStatus() {
   const gate = readGateState(root);
   const p = paths(root);
   const paused = fs.existsSync(p.pause) ? fs.readFileSync(p.pause, 'utf8').trim() : null;
+  const configWarning = readJsonSafe(p.configWarning);
 
   const now = Date.now();
   const running = leases
@@ -43,6 +44,7 @@ export async function collectStatus() {
     capacity: cfg.capacity,
     used: runningWeight,
     paused,
+    configWarning: configWarning ? { message: configWarning.message, firstAt: configWarning.firstAt, lastAt: configWarning.lastAt } : null,
     loadGate: {
       closed: gate.closed,
       lastLoad: gate.lastLoad ?? null,
@@ -75,6 +77,12 @@ export function renderStatusText(status) {
       `, consecutive-under ${status.loadGate.consecutiveUnder})`,
   );
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
+  if (status.configWarning) {
+    lines.push(
+      `config: WARNING — some supervisor(s) cannot read the global config and are running on their last known-good ` +
+        `values: ${status.configWarning.message} (since ${fmtMs(Date.now() - status.configWarning.firstAt)} ago)`,
+    );
+  }
   lines.push('');
   lines.push('RUNNING:');
   if (status.running.length === 0) {

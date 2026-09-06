@@ -46,3 +46,32 @@ test('a spike back above loadClose while reopening re-closes and resets the coun
   assert.equal(s.closed, true);
   assert.equal(s.consecutiveUnder, 0);
 });
+
+test('a threshold change mid-countdown restarts the count under the new thresholds rather than blending them', () => {
+  let s = updateGateState(null, 20, CFG); // closes
+  s = updateGateState(s, 5, CFG); // 1 of 3 under the original loadOpen (11)
+  s = updateGateState(s, 5, CFG); // 2 of 3
+  assert.equal(s.consecutiveUnder, 2);
+  // Another supervisor reloads a raised loadOpen mid-countdown. A stale
+  // supervisor still using the old fingerprint must not get to treat this
+  // sample as "3 of 3" and reopen the gate under a config nobody installed.
+  const RAISED = { loadClose: 40, loadOpen: 30, loadOpenSamples: 3 };
+  s = updateGateState(s, 5, RAISED);
+  assert.equal(s.consecutiveUnder, 1, 'the countdown must restart at 1, not continue to 3');
+  assert.equal(s.closed, true, 'a threshold change alone must never reopen the gate');
+});
+
+test('a threshold change does not reopen a gate on its own even when the counter had already reached the sample count', () => {
+  let s = updateGateState(null, 20, CFG); // closes
+  s = updateGateState(s, 5, CFG);
+  s = updateGateState(s, 5, CFG);
+  s = updateGateState(s, 5, CFG); // 3 of 3 -> reopens under CFG
+  assert.equal(s.closed, false);
+  // Re-close it, then verify a bare threshold change (no new sample beyond
+  // the reset) cannot itself flip `closed`.
+  s = updateGateState(s, 50, CFG); // closes again
+  const RAISED = { loadClose: 40, loadOpen: 30, loadOpenSamples: 3 };
+  s = updateGateState(s, 20, RAISED); // between old and new open thresholds
+  assert.equal(s.closed, true, 'closed must reflect the load sample and countdown, never the fingerprint change alone');
+  assert.equal(s.consecutiveUnder, 1);
+});

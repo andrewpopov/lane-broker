@@ -21,14 +21,35 @@ export function readLoadAvg() {
   return os.loadavg()[0];
 }
 
+/** Fingerprint of the threshold fields that govern hysteresis, so a config
+ *  change can be detected against the shared, unversioned gate state. */
+function thresholdFingerprint({ loadClose, loadOpen, loadOpenSamples }) {
+  return `${loadClose}|${loadOpen}|${loadOpenSamples}`;
+}
+
 /**
  * Pure hysteresis transition: closes immediately above loadClose; once
  * closed, reopens only after `loadOpenSamples` consecutive samples below
  * loadOpen. Samples at or above loadOpen (but below loadClose) reset the
  * consecutive-under counter without reopening.
+ *
+ * Concurrent supervisors reload their own config independently and all write
+ * this one shared state, so a threshold edit lands mid-countdown for some of
+ * them and not others. Blending a countdown that started under the old
+ * thresholds with samples judged under the new ones would let the decision
+ * satisfy neither config that was ever installed. So whenever the incoming
+ * thresholds don't match the fingerprint stamped on the stored state, the
+ * countdown restarts from zero under the new thresholds. `closed` is left
+ * untouched: a config edit is not evidence the machine got quieter.
  */
-export function updateGateState(prev, load, { loadClose, loadOpen, loadOpenSamples }) {
+export function updateGateState(prev, load, cfg) {
+  const { loadClose, loadOpen, loadOpenSamples } = cfg;
+  const fingerprint = thresholdFingerprint(cfg);
   const state = prev ? { ...prev } : { closed: false, consecutiveUnder: 0 };
+  if (state.fingerprint !== fingerprint) {
+    state.consecutiveUnder = 0;
+    state.fingerprint = fingerprint;
+  }
   if (load > loadClose) {
     state.closed = true;
     state.consecutiveUnder = 0;
