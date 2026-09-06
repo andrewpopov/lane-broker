@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 export const BIN = fileURLToPath(new URL('../bin/lane.js', import.meta.url));
@@ -63,6 +63,54 @@ export function laneRun(args, { env, cwd } = {}) {
 /** Spawn `lane <args>` without waiting — caller controls lifecycle (signals, timing). */
 export function laneSpawn(args, { env, cwd } = {}) {
   return spawn(process.execPath, [BIN, ...args], { env, cwd: cwd || process.cwd() });
+}
+
+let localEnvVarNames = null;
+
+/**
+ * Names of git's repository-local env vars (GIT_DIR, GIT_INDEX_FILE, ...), per
+ * `git rev-parse --local-env-vars`. A hook invocation leaks these into every
+ * child process it spawns; a fixture that shells out to git while one of them
+ * is set operates on whatever repo they point at instead of its own temp dir.
+ * That happened for real: a pre-push run leaked GIT_DIR/GIT_WORK_TREE into
+ * `npm test`, and this suite's own git fixtures then mutated the live
+ * lane-broker repo (set core.bare=true, added a stray worktree, committed a
+ * tree deletion) instead of the throwaway directories they were given.
+ */
+function localEnvVarList() {
+  if (!localEnvVarNames) {
+    localEnvVarNames = execFileSync('git', ['rev-parse', '--local-env-vars'], {
+      encoding: 'utf8',
+    })
+      .split('\n')
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+  return localEnvVarNames;
+}
+
+/**
+ * Run a git fixture command with a sanitized environment and an explicit,
+ * hermetic identity: no repository-local env leaked in from a caller (e.g. a
+ * pre-push hook), and no dependence on the invoking user's git config.
+ */
+export function gitFixture(args, cwd) {
+  if (!cwd) throw new Error('gitFixture requires an explicit cwd');
+  const env = { ...process.env };
+  for (const name of [...localEnvVarList(), 'GIT_QUARANTINE_PATH']) {
+    delete env[name];
+  }
+  return execFileSync(
+    'git',
+    [
+      '-c', 'user.name=lane-broker-test',
+      '-c', 'user.email=test@example.invalid',
+      '-c', 'commit.gpgsign=false',
+      '-c', 'init.defaultBranch=main',
+      ...args,
+    ],
+    { cwd, env, encoding: 'utf8' },
+  );
 }
 
 export function sleep(ms) {

@@ -31,9 +31,15 @@ function parseRunArgs(args) {
       case '--lane':
         opts.lane = flagArgs[++i];
         break;
-      case '--weight':
-        opts.weightOverride = Number(flagArgs[++i]);
+      case '--weight': {
+        const raw = flagArgs[++i];
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n <= 0) {
+          throw new Error(`--weight must be a positive number (got "${raw}")`);
+        }
+        opts.weightOverride = n;
         break;
+      }
       case '--detach':
         opts.detach = true;
         break;
@@ -72,7 +78,14 @@ async function main() {
 
   switch (sub) {
     case 'run': {
-      const { opts, cmd } = parseRunArgs(rest);
+      let opts;
+      let cmd;
+      try {
+        ({ opts, cmd } = parseRunArgs(rest));
+      } catch (err) {
+        process.stderr.write(`lane run: ${err.message}\n`);
+        return 2;
+      }
       const result = await runCommand({
         repo: opts.repo,
         lane: opts.lane,
@@ -112,11 +125,11 @@ async function main() {
     }
     case 'pause': {
       const reason = rest.join(' ');
-      const result = pauseCommand(reason);
+      const result = await pauseCommand(reason);
       return result.exitCode;
     }
     case 'resume': {
-      const result = resumeCommand();
+      const result = await resumeCommand();
       return result.exitCode;
     }
     default:

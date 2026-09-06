@@ -2,7 +2,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { paths, atomicWriteJson, readJsonSafe, withLock, bootId } from './state.js';
 import { sampleAndUpdateGate } from './load.js';
-import { listLeases, reapAll, writeLease, LEASE_STATE } from './lease.js';
+import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
+
+/** Leases that hold their key: RUNNING and ORPHANED both represent real,
+ *  possibly-running work and must count against both conflicts and capacity. */
+export const HELD_STATES = new Set([LEASE_STATE.RUNNING, LEASE_STATE.ORPHANED]);
 
 function nextSeq(root) {
   const file = paths(root).seq;
@@ -75,6 +79,14 @@ function conflicts(ticket, lease) {
 export async function tryStart(root, ticket, globalCfg, loadSampler) {
   return withLock(root, () => {
     reapAll(root, bootId());
+    // A queued ticket whose supervisor already died (crashed, or the machine
+    // killed it) must not sit at the FIFO head forever — dequeue it before
+    // checking who's next.
+    for (const t of listQueue(root)) {
+      if (t && t.id !== ticket.id && !isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart })) {
+        dequeueSync(root, t.id);
+      }
+    }
     const queue = listQueue(root);
     const position = queue.findIndex((t) => t && t.id === ticket.id);
     if (position !== 0) {
@@ -88,12 +100,12 @@ export async function tryStart(root, ticket, globalCfg, loadSampler) {
     if (gate.closed) {
       return { started: false, reason: 'load-gate-closed', load: gate.lastLoad };
     }
-    const running = listLeases(root).filter((l) => l.state === LEASE_STATE.RUNNING);
-    const blocker = running.find((l) => conflicts(ticket, l));
+    const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
+    const blocker = held.find((l) => conflicts(ticket, l));
     if (blocker) {
       return { started: false, reason: 'conflict', with: blocker.id, key: blocker.key };
     }
-    const runningWeight = running.reduce((sum, l) => sum + (l.weight || 0), 0);
+    const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
     if (runningWeight + ticket.weight > globalCfg.capacity) {
       return { started: false, reason: 'capacity', runningWeight, capacity: globalCfg.capacity };
     }

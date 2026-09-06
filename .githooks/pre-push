@@ -3,6 +3,13 @@
 # is disabled fleet-wide). Cheapest first. Escape hatch: git push --no-verify,
 # for a WIP branch — never to get past a red check.
 set -e
+# Incident: git exports its repository-local env vars (GIT_DIR, GIT_INDEX_FILE,
+# GIT_WORK_TREE, ...) to hooks, and those leak into every child process this
+# hook spawns. `npm test` inherited them, so this suite's git fixtures (init,
+# add, commit, worktree add) operated on the live repo instead of their temp
+# dirs — set core.bare=true on it, added a stray worktree, and committed a
+# tree that deleted every file. Scrub them before running anything.
+for v in $(git rev-parse --local-env-vars) GIT_QUARANTINE_PATH; do unset "$v"; done
 cd "$(git rev-parse --show-toplevel)"
 npm run lint
 npm test
