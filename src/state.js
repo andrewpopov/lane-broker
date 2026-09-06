@@ -20,6 +20,7 @@ export function paths(root = stateHome()) {
     pause: path.join(root, 'PAUSE'),
     lock: path.join(root, 'lock'),
     loadGate: path.join(root, 'load-gate.json'),
+    configWarning: path.join(root, 'config-warning.json'),
     seq: path.join(root, 'seq'),
   };
 }

@@ -90,11 +90,12 @@ export function loadGlobalConfig() {
  * any read/parse/validation failure here falls back to `previous` (or
  * `DEFAULT_GLOBAL_CONFIG` if there is no previous yet) instead of throwing.
  */
-export function reloadGlobalConfig(previous) {
+export function reloadGlobalConfig(previous, { onError } = {}) {
   const fallback = previous === undefined ? { ...DEFAULT_GLOBAL_CONFIG } : previous;
   try {
     return loadGlobalConfig();
-  } catch {
+  } catch (err) {
+    if (onError) onError(err);
     return fallback;
   }
 }

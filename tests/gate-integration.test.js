@@ -55,7 +55,8 @@ test('load gate: a config edit raising loadOpen mid-flight lets a stuck gate reo
 
   // Wait for the gate to actually observe the high load and close, rather
   // than a fixed sleep racing the supervisor's own startup/spawn overhead.
-  await waitFor(() => readJsonSafe(paths(state).loadGate)?.closed === true, { timeoutMs: 5000 });
+  const closed = await waitFor(() => readJsonSafe(paths(state).loadGate)?.closed === true, { timeoutMs: 5000 });
+  assert.ok(closed, 'the gate must actually observe the high load and close before the rest of this test means anything');
   assert.equal(fs.existsSync(path.join(paths(state).leases, `${id}.json`)), false, 'must not start while the load gate is closed');
 
   // Drop the load to 12.83, matching the real incident: above the original
@@ -64,8 +65,13 @@ test('load gate: a config edit raising loadOpen mid-flight lets a stuck gate reo
   // consecutive-under counter to 0 forever, exactly as observed live.
   fs.writeFileSync(loadFile, '12.83');
   // Wait for at least one sample to land at the new load, then give a few
-  // more sample cycles' margin before asserting it stays closed.
-  await waitFor(() => readJsonSafe(paths(state).loadGate)?.lastLoad === 12.83, { timeoutMs: 5000 });
+  // more sample cycles' margin before asserting it stays closed. Asserting
+  // this wait (not just the sleep after it) matters: without it, a slow
+  // supervisor's first sample could still be pending when the config gets
+  // rewritten below, and the test would pass against pre-fix code for the
+  // wrong reason (timing luck rather than proof of the fix).
+  const sampledOldLoad = await waitFor(() => readJsonSafe(paths(state).loadGate)?.lastLoad === 12.83, { timeoutMs: 5000 });
+  assert.ok(sampledOldLoad, 'the gate must sample the pre-incident load (12.83) before the config is rewritten below');
   await sleep(400);
   assert.equal(fs.existsSync(path.join(paths(state).leases, `${id}.json`)), false, 'must still be closed: load sits between the original loadOpen and loadClose');
 

@@ -1,10 +1,10 @@
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { paths, ensureStateDirs, appendHistory, atomicWriteJson } from './state.js';
+import { paths, ensureStateDirs, appendHistory, atomicWriteJson, readJsonSafe } from './state.js';
 import { enqueue, tryStart, dequeueSync } from './scheduler.js';
 import { readLease, writeLease, removeLease, isGroupAlive, processStartTime } from './lease.js';
-import { loadGlobalConfig, reloadGlobalConfig } from './config.js';
+import { reloadGlobalConfig } from './config.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
 const CANCEL_GRACE_MS = 10_000;
@@ -17,6 +17,44 @@ function readTicketFromEnv() {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+let lastConfigErrorMessage = null;
+
+/**
+ * Persist a config reload failure so it's visible via `lane status` instead
+ * of silently pinning the last known-good thresholds forever — an operator
+ * who saved a broken file otherwise believes their new thresholds are live
+ * when they are not, which is operationally indistinguishable from the
+ * incident this fix exists to prevent. Only the first occurrence of a given
+ * message goes to stderr: the shared config staying broken for many
+ * `sampleMs` must not spam a line every poll. The persisted record itself is
+ * a single overwritten object, never an unbounded log.
+ */
+function recordConfigReloadError(root, err) {
+  const now = Date.now();
+  const prev = readJsonSafe(paths(root).configWarning);
+  const firstAt = prev && prev.message === err.message ? prev.firstAt : now;
+  if (err.message !== lastConfigErrorMessage) {
+    lastConfigErrorMessage = err.message;
+    process.stderr.write(`lane-broker supervisor: config reload failed, still using last known-good config: ${err.message}\n`);
+  }
+  try {
+    atomicWriteJson(paths(root).configWarning, { message: err.message, firstAt, lastAt: now });
+  } catch {
+    // best-effort; a failure here must never affect scheduling
+  }
+}
+
+/** Clear a previously recorded config warning once a reload succeeds again. */
+function clearConfigReloadWarning(root) {
+  if (lastConfigErrorMessage === null) return; // nothing was ever recorded this run
+  lastConfigErrorMessage = null;
+  try {
+    fs.unlinkSync(paths(root).configWarning);
+  } catch {
+    // already gone
+  }
 }
 
 function cancelRequested(root, id) {
@@ -127,7 +165,11 @@ class CappedLogWriter {
 async function main() {
   const ticket = readTicketFromEnv();
   const root = ensureStateDirs().root;
-  let globalCfg = loadGlobalConfig();
+  // reloadGlobalConfig(undefined), not loadGlobalConfig(): a supervisor that
+  // launches while config.json is missing, mid-write, or invalid must start
+  // on defaults rather than crash before it ever reaches the resilient
+  // polling loop below — the exact torn-read window this fix exists for.
+  let globalCfg = reloadGlobalConfig(undefined, { onError: (err) => recordConfigReloadError(root, err) });
   const supervisorStart = processStartTime(process.pid);
   const enriched = {
     ...ticket,
@@ -153,7 +195,14 @@ async function main() {
     // adjusting thresholds mid-run must take effect within one sampleMs, not
     // never. reloadGlobalConfig() falls back to the last known-good value on
     // a missing/invalid file, so a bad edit can't crash or wedge this loop.
-    globalCfg = reloadGlobalConfig(globalCfg);
+    let reloadFailed = false;
+    globalCfg = reloadGlobalConfig(globalCfg, {
+      onError: (err) => {
+        reloadFailed = true;
+        recordConfigReloadError(root, err);
+      },
+    });
+    if (!reloadFailed) clearConfigReloadWarning(root);
     if (cancelledBeforeStart || cancelRequested(root, ticket.id)) {
       dequeueSync(root, ticket.id);
       clearCancelRequest(root, ticket.id);
@@ -260,7 +309,7 @@ async function main() {
   });
 }
 
-export { CappedLogWriter };
+export { CappedLogWriter, recordConfigReloadError, clearConfigReloadWarning };
 
 // Guard so this module can be imported (e.g. by tests exercising
 // CappedLogWriter directly) without running the supervisor for real; it only
