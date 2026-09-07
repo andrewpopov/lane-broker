@@ -208,7 +208,20 @@ async function main() {
       clearCancelRequest(root, ticket.id);
       process.exit(0);
     }
-    started = await tryStart(root, enriched, globalCfg);
+    // tryStart re-reads the config again inside its lock (BRAIN-182): the
+    // outer reload above can be superseded by an edit that lands in the gap
+    // between this poll's reload and the lock actually being granted. Reuse
+    // the same fallback/warning handling so a reload failure inside the lock
+    // degrades exactly like one out here.
+    started = await tryStart(root, enriched, globalCfg, undefined, undefined, () => {
+      globalCfg = reloadGlobalConfig(globalCfg, {
+        onError: (err) => {
+          reloadFailed = true;
+          recordConfigReloadError(root, err);
+        },
+      });
+      return globalCfg;
+    });
     if (started.started) break;
     if (started.reason === 'not-head' && started.position === null) {
       // Our own ticket is no longer in the queue without ever having
