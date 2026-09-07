@@ -23,7 +23,6 @@ export function paths(root = stateHome()) {
     configWarning: path.join(root, 'config-warning.json'),
     cpuSample: path.join(root, 'cpu-sample.json'),
     cpuGate: path.join(root, 'cpu-gate.json'),
-    admissionState: path.join(root, 'admission-state.json'),
     admissionLog: path.join(root, 'admission-decisions.log'),
     conflictSkipState: path.join(root, 'conflict-skip-state.json'),
     seq: path.join(root, 'seq'),

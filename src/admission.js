@@ -125,42 +125,21 @@ export function sampleAndUpdateCpuGate(root, cfg, cpuSample) {
   return next;
 }
 
-/** Coerce a persisted (possibly corrupt) admission-state file into a safe
- *  shape — same rationale as sanitizeGateState above. */
-function readAdmissionState(root) {
-  const raw = readJsonSafe(paths(root).admissionState);
-  return {
-    lastAdmittedAt: raw && Number.isFinite(raw.lastAdmittedAt) ? raw.lastAdmittedAt : 0,
-    lastAdmittedLeaseId: raw && typeof raw.lastAdmittedLeaseId === 'string' ? raw.lastAdmittedLeaseId : null,
-  };
-}
-
-/** Record a real lease start, for the cooldown tracker below. Best-effort
- *  (Codex review finding #1): this runs AFTER the lease is already written
- *  and the ticket dequeued, so a failure here must never surface as a
- *  failed admission — worst case is a slightly stale cooldown timer, never
- *  a lost or duplicated lease. Caller must hold the global lock. */
-export function recordAdmission(root, leaseId, now = Date.now()) {
-  try {
-    atomicWriteJson(paths(root).admissionState, { lastAdmittedAt: now, lastAdmittedLeaseId: leaseId });
-  } catch {
-    // best-effort — see doc comment above
-  }
-}
-
 /**
- * Is the admission cooldown currently blocking a new admission? Cleared
- * early — before admissionCooldownMs has elapsed — the moment the
- * previously admitted lease is no longer among the held leases (i.e. it has
- * already finished), since the cooldown exists to let one just-started
- * process's CPU ramp-up become visible in the sampler, not to throttle
- * admissions indefinitely once that process is gone.
+ * Is the admission cooldown currently blocking a new admission? Derived
+ * directly from the held leases' own `admittedAt` field (stamped by
+ * scheduler.js on the exact same write that admits a lease) rather than a
+ * separate admission-state.json + its own write — there is nothing here
+ * that needs to be atomic with anything else, so it costs nothing extra
+ * inside the lock. A lease with no `admittedAt` (an old lease file from
+ * before this field existed) simply never counts toward the cooldown,
+ * same fail-open tolerance as every other OPTIONAL lease field in this
+ * codebase. This also folds in the old "clear early once the previously
+ * admitted lease is no longer held" behavior for free: a finished lease is
+ * no longer in `heldLeases` at all, so it can't hold the cooldown open.
  */
-export function cooldownActive(root, heldLeaseIds, cfg, now = Date.now()) {
-  const state = readAdmissionState(root);
-  if (!state.lastAdmittedAt) return false;
-  if (state.lastAdmittedLeaseId && !heldLeaseIds.has(state.lastAdmittedLeaseId)) return false;
-  return now - state.lastAdmittedAt < cfg.admissionCooldownMs;
+export function cooldownActive(heldLeases, cfg, now = Date.now()) {
+  return heldLeases.some((l) => Number.isFinite(l.admittedAt) && now - l.admittedAt < cfg.admissionCooldownMs);
 }
 
 /**
@@ -242,10 +221,32 @@ function unavailableDecision(heldLeases, reason) {
 }
 
 /**
- * Glue: sample the host, update the CPU gate, check the cooldown, and run
- * the predicate above — everything the new rule needs for one candidate on
- * one poll. Caller must hold the global lock (same requirement as
- * sampleAndUpdateGate in load.js).
+ * Best-effort host CPU sample, wrapped so a sampler failure is treated
+ * identically to a missing sample and NEVER throws. Deliberately takes no
+ * lock and does no gate/cooldown work. Its cpu-sample.json sidecar IS
+ * shared, read-then-write state — see the correctness note on
+ * sampleHostCpu in cpu.js for the residual race this deliberately accepts
+ * (a monotonic-write guard, not a lock) and why: this is telemetry-only
+ * while schedulerMode stays 'shadow', and the measured lock-hold cost of
+ * including it inside the lock was not worth paying for that. Called
+ * BEFORE tryStart acquires the global mutex.
+ */
+export function sampleCpuSafe(root, cpuSampler = sampleHostCpu) {
+  try {
+    return cpuSampler(root) || null;
+  } catch {
+    return null; // sampler failure: treated identically to a missing sample
+  }
+}
+
+/**
+ * Glue: update the CPU gate from an already-taken sample, check the
+ * cooldown, and run the predicate above — everything the new rule needs for
+ * one candidate on one poll. `cpuSample` must come from sampleCpuSafe()
+ * called BEFORE the caller acquired the global lock (see its doc comment) —
+ * this function only does the part that DOES need to be atomic with the
+ * admission decision: the CPU gate's read-then-write of its shared,
+ * consecutive-under counter. Caller must hold the global lock.
  *
  * The whole body is wrapped in try/catch (Codex review finding #1): every
  * read/write this touches is already best-effort internally, but this is a
@@ -255,17 +256,10 @@ function unavailableDecision(heldLeases, reason) {
  * here must degrade to the same fail-safe as a missing sample, never abort
  * tryStart (which would kill the caller's detached supervisor).
  */
-export function evaluateNewAdmission(root, cfg, ticket, heldLeases, cpuSampler = sampleHostCpu) {
+export function evaluateNewAdmission(root, cfg, ticket, heldLeases, cpuSample) {
   try {
-    let cpuSample = null;
-    try {
-      cpuSample = cpuSampler(root) || null;
-    } catch {
-      cpuSample = null; // sampler failure: treated identically to a missing sample
-    }
     const cpuGateState = sampleAndUpdateCpuGate(root, cfg, cpuSample);
-    const heldLeaseIds = new Set(heldLeases.map((l) => l.id));
-    const blocked = cooldownActive(root, heldLeaseIds, cfg);
+    const blocked = cooldownActive(heldLeases, cfg);
     const result = evaluateCpuAdmission({
       cpuSample,
       heldLeases,
@@ -325,7 +319,9 @@ export function formatAdmissionLog(f) {
  * output at all. Append to a real file under the broker's state root
  * (alongside the other admission sidecars) in addition to stderr, both
  * best-effort: neither ever throws, since a logging failure must never
- * affect scheduling.
+ * affect scheduling. Pure telemetry — nothing reads it back to make a
+ * decision — so the caller (scheduler.js) calls this AFTER releasing the
+ * global lock, on both the admit and deny paths, never from inside it.
  */
 export function logAdmissionDecision(root, fields) {
   const line = `${formatAdmissionLog(fields)}\n`;

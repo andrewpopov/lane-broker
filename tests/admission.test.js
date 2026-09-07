@@ -8,7 +8,7 @@ import {
   updateCpuGateState,
   evaluateCpuAdmission,
   evaluateNewAdmission,
-  recordAdmission,
+  sampleCpuSafe,
   cooldownActive,
   sampleAndUpdateCpuGate,
   formatAdmissionLog,
@@ -255,26 +255,32 @@ test('cpu gate: a threshold change does not reopen a gate on its own even when t
   assert.equal(s.consecutiveUnder, 1);
 });
 
+// cooldownActive is now derived directly from the held leases' own
+// `admittedAt` field (stamped by scheduler.js on the same write that admits
+// a lease) rather than a separate admission-state.json file and its own
+// write inside the lock — see the doc comment on cooldownActive.
+
 test('admission cooldown blocks right after an admission and clears once admissionCooldownMs has elapsed', () => {
-  const { state } = freshEnv();
   const cfg = { admissionCooldownMs: 1000 };
-  recordAdmission(state, 'lease-1', 1_000_000);
-  assert.equal(cooldownActive(state, new Set(['lease-1']), cfg, 1_000_500), true);
-  assert.equal(cooldownActive(state, new Set(['lease-1']), cfg, 1_002_000), false);
+  const held = [{ id: 'lease-1', admittedAt: 1_000_000 }];
+  assert.equal(cooldownActive(held, cfg, 1_000_500), true);
+  assert.equal(cooldownActive(held, cfg, 1_002_000), false);
 });
 
 test('admission cooldown clears early once the previously admitted lease is no longer held, even mid-window', () => {
-  const { state } = freshEnv();
   const cfg = { admissionCooldownMs: 60_000 };
-  recordAdmission(state, 'lease-1', 1_000_000);
   // Still well inside the cooldown window by elapsed time, but lease-1 has
-  // already finished (absent from the held set) -> must clear early.
-  assert.equal(cooldownActive(state, new Set(), cfg, 1_000_500), false);
+  // already finished, so it's simply absent from heldLeases -> clears early.
+  assert.equal(cooldownActive([], cfg, 1_000_500), false);
 });
 
 test('with no prior admission recorded, the cooldown never blocks', () => {
-  const { state } = freshEnv();
-  assert.equal(cooldownActive(state, new Set(), { admissionCooldownMs: 60_000 }), false);
+  assert.equal(cooldownActive([], { admissionCooldownMs: 60_000 }), false);
+});
+
+test('an old held lease with no admittedAt field never counts toward the cooldown', () => {
+  const held = [{ id: 'legacy', weight: 1 }]; // predates this field entirely
+  assert.equal(cooldownActive(held, { admissionCooldownMs: 60_000 }, 1_000_000), false);
 });
 
 function baseTicket(id, overrides = {}) {
@@ -363,65 +369,76 @@ test('active mode still admits when the new predicate agrees there is room', asy
 });
 
 // --- Codex review findings 1 and 5: the whole phase-1 CPU path must never
-// throw, and corrupt persisted state must degrade to a safe default. ---
+// throw, and corrupt persisted state must degrade to a safe default.
+//
+// Sampling itself (and its own never-throw guarantee) now lives in
+// sampleCpuSafe, called BEFORE the lock (see scheduler.js); evaluateNewAdmission
+// takes an already-sampled cpuSample value directly rather than a sampler
+// function, since it only runs the part that must stay atomic with the
+// admission decision (the CPU gate's counter). ---
 
-test('evaluateNewAdmission never throws when the CPU sampler itself throws, and degrades to the same fail-safe as a missing sample', () => {
+test('sampleCpuSafe never throws when the CPU sampler itself throws, and returns null (treated identically to a missing sample)', () => {
   const { state } = freshEnv();
   const throwingSampler = () => {
     throw new Error('boom: simulated sampler failure');
   };
   let result;
   assert.doesNotThrow(() => {
-    result = evaluateNewAdmission(state, { cpuAdmissionPercent: 75, cpuClosePercent: 90, cpuOpenPercent: 70, cpuOpenSamples: 3, admissionCooldownMs: 5000 }, { weight: 1 }, [], throwingSampler);
+    result = sampleCpuSafe(state, throwingSampler);
   });
-  // Caught at the inner boundary (identical to a null/missing sample), so it
-  // never even reaches the outer catch-all's generic 'admission-error'.
-  assert.equal(result.admit, true, 'nothing held -> fail open, same as a missing sample');
-  assert.equal(result.reason, 'sample-unavailable-empty');
+  assert.equal(result, null);
 });
 
-test('evaluateNewAdmission denies (fails closed) on a sampler exception when something is already held', () => {
+test('sampleCpuSafe never throws when the sampler returns an unexpected shape (e.g. undefined)', () => {
   const { state } = freshEnv();
-  const throwingSampler = () => {
-    throw new Error('boom');
-  };
+  const weirdSampler = () => undefined;
+  let result;
+  assert.doesNotThrow(() => {
+    result = sampleCpuSafe(state, weirdSampler);
+  });
+  assert.equal(result, null);
+});
+
+test('evaluateNewAdmission degrades to the missing-sample fail-safe when cpuSample is null and nothing is held', () => {
+  const { state } = freshEnv();
+  const result = evaluateNewAdmission(
+    state,
+    { cpuAdmissionPercent: 75, cpuClosePercent: 90, cpuOpenPercent: 70, cpuOpenSamples: 3, admissionCooldownMs: 5000 },
+    { weight: 1 },
+    [],
+    null,
+  );
+  assert.equal(result.admit, true, 'nothing held -> fail open, same as a missing sample');
+  assert.equal(result.reason, 'sample-unavailable-empty');
+  assert.equal(result.hostBusyCores, null);
+  assert.equal(result.cores, null);
+  assert.equal(result.sampleStale, true);
+});
+
+test('evaluateNewAdmission denies (fails closed) with a null cpuSample when something is already held', () => {
+  const { state } = freshEnv();
   const result = evaluateNewAdmission(
     state,
     { cpuAdmissionPercent: 75, cpuClosePercent: 90, cpuOpenPercent: 70, cpuOpenSamples: 3, admissionCooldownMs: 5000 },
     { weight: 1 },
     [{ id: 'held-1', weight: 1 }],
-    throwingSampler,
+    null,
   );
   assert.equal(result.admit, false);
   assert.equal(result.reason, 'sample-unavailable-held');
 });
 
-test('evaluateNewAdmission falls back to the generic admission-error shape if something beyond the sampler itself misbehaves', () => {
+test('evaluateNewAdmission falls back to the generic admission-error shape if something beyond the sample itself misbehaves', () => {
   const { state } = freshEnv();
-  // A candidateWeight that can't be coerced sanely still must not throw —
-  // exercised via a ticket missing entirely rather than trying to force an
-  // exception deeper in the pipeline (which is already individually
-  // hardened); this proves the outer belt-and-suspenders catch is wired up
-  // and produces the documented shape if it is ever reached.
-  const cpuSampler = () => ({ hostBusyCores: 1, cores: 8, stale: false });
+  // A missing ticket (null) still must not throw — this proves the outer
+  // belt-and-suspenders catch is wired up and produces the documented shape.
+  const cpuSample = { hostBusyCores: 1, cores: 8, stale: false };
   let result;
   assert.doesNotThrow(() => {
-    result = evaluateNewAdmission(state, { cpuAdmissionPercent: 75, cpuClosePercent: 90, cpuOpenPercent: 70, cpuOpenSamples: 3, admissionCooldownMs: 5000 }, null, [], cpuSampler);
+    result = evaluateNewAdmission(state, { cpuAdmissionPercent: 75, cpuClosePercent: 90, cpuOpenPercent: 70, cpuOpenSamples: 3, admissionCooldownMs: 5000 }, null, [], cpuSample);
   });
   assert.equal(result.reason, 'admission-error');
   assert.equal(result.admit, true, 'nothing held -> fail open');
-});
-
-test('evaluateNewAdmission never throws when the cpuSampler returns an unexpected shape (e.g. undefined)', () => {
-  const { state } = freshEnv();
-  const weirdSampler = () => undefined;
-  let result;
-  assert.doesNotThrow(() => {
-    result = evaluateNewAdmission(state, { cpuAdmissionPercent: 75, cpuClosePercent: 90, cpuOpenPercent: 70, cpuOpenSamples: 3, admissionCooldownMs: 5000 }, { weight: 1 }, [], weirdSampler);
-  });
-  assert.equal(result.hostBusyCores, null);
-  assert.equal(result.cores, null);
-  assert.equal(result.sampleStale, true);
 });
 
 test('sampleAndUpdateCpuGate sanitizes a corrupt persisted gate file instead of NaN-ing the hysteresis shut forever', () => {
@@ -461,4 +478,42 @@ test('formatAdmissionLog always carries the known double-count bias note', () =>
     cooldownBlocked: false,
   });
   assert.match(line, new RegExp(`bias=${KNOWN_BIAS_NOTE}`));
+});
+
+// --- Lock-hold-time fix: the decision log and the CPU sample must not
+// lengthen the critical section, and the cooldown must be derivable from
+// the lease itself rather than a separate file written inside the lock. ---
+
+test('a successful admission stamps admittedAt on the written lease, so the cooldown needs no separate file', async () => {
+  const { state } = freshEnv();
+  const globalCfg = { ...DEFAULT_GLOBAL_CONFIG, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1 };
+  const ticket = baseTicket('admits-cleanly');
+  await enqueue(state, ticket);
+  const result = await tryStart(state, ticket, globalCfg);
+  assert.equal(result.started, true);
+  assert.ok(Number.isFinite(result.lease.admittedAt), 'the lease must carry an admittedAt timestamp');
+});
+
+test('the admission decision log is written on a deny path too (capacity), not only on a successful admission', async () => {
+  const { state } = freshEnv();
+  const globalCfg = { ...DEFAULT_GLOBAL_CONFIG, capacity: 1, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1 };
+  writeLease(state, {
+    id: 'holder',
+    key: 'other:key',
+    bootId: bootId(),
+    supervisorPid: process.pid,
+    supervisorStart: null,
+    childPgid: null,
+    heartbeatAt: Date.now(),
+    weight: 1,
+    state: LEASE_STATE.RUNNING,
+  });
+  const ticket = baseTicket('denied-by-capacity', { key: 'ticket:key', weight: 1 });
+  await enqueue(state, ticket);
+  const result = await tryStart(state, ticket, globalCfg);
+  assert.equal(result.started, false);
+  assert.equal(result.reason, 'capacity');
+  const logged = fs.readFileSync(paths(state).admissionLog, 'utf8');
+  assert.match(logged, /candidate=denied-by-capacity/);
+  assert.match(logged, /current=deny:capacity/);
 });

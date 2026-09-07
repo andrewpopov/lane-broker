@@ -105,10 +105,23 @@ export function computeBusyCores(prev, snapshot) {
  * `tryStart` poll (already on its own ~sampleMs cadence) supplies the next
  * point, so this never holds the global lock waiting on time to pass.
  *
- * The sidecar write is best-effort (Codex review finding #1): a permissions
- * error, full disk, or any other write failure must never make this throw —
- * shadow mode must never be able to affect what actually starts, and even in
- * active mode a broken sidecar should degrade to "stale", not crash tryStart.
+ * This IS a read-then-write transaction on shared state — cpu-sample.json —
+ * called deliberately OUTSIDE the global lock (see scheduler.js's tryStart)
+ * because the measured lock-hold cost of including it was not worth paying
+ * while this whole predicate is telemetry-only (schedulerMode: 'shadow').
+ * That means two supervisors CAN race this: both read the same `prev`, and
+ * without the guard below could commit snapshots out of chronological
+ * order, regressing the persisted baseline and corrupting a later caller's
+ * delta. The write is made monotonic against that: immediately before
+ * committing, re-read whatever is currently on disk and skip the write if
+ * it already holds a snapshot at least as new as ours. This narrows the
+ * race to the (much smaller) gap between that re-read and the write itself
+ * — it does not eliminate it. If schedulerMode ever moves to 'active', this
+ * sample and its write need to move under the same lock as the CPU gate
+ * update (evaluateNewAdmission), the same way the load gate already is.
+ * The write itself stays best-effort (Codex review finding #1): a
+ * permissions error, full disk, or any other failure here must never make
+ * this throw or abort admission.
  */
 export function sampleHostCpu(root, cpus = os.cpus()) {
   const override = readCpuBusyOverride();
@@ -118,7 +131,10 @@ export function sampleHostCpu(root, cpus = os.cpus()) {
   const now = Date.now();
   const snapshot = { at: now, cpus: cpus.map(cpuTimes) };
   try {
-    atomicWriteJson(file, snapshot);
+    const latest = readJsonSafe(file);
+    if (!latest || !Number.isFinite(latest.at) || latest.at < snapshot.at) {
+      atomicWriteJson(file, snapshot);
+    }
   } catch {
     // best-effort: a failed sidecar write must never abort admission
   }

@@ -183,6 +183,42 @@ test('starvation bound: once a conflict-blocked head has been skipped conflictSk
   assert.equal(aResult3.started, true, 'once truly nothing conflicts, the previously-starved head starts');
 });
 
+test('starvation bound (fail-closed): if the skip count cannot be durably recorded, the conflicted head is never skipped at all', async () => {
+  const { state } = freshEnv();
+  const globalCfg = baseCfg();
+  writeLease(state, heldLease('holder', 'a-key'));
+
+  // Make conflict-skip-state.json permanently unwritable: pre-create it as
+  // a directory, so atomicWriteJson's final rename(tmp, file) always fails
+  // (EISDIR) — a persistent failure, never healing, exactly the case Codex
+  // review flagged (as opposed to one dropped write).
+  const fs = await import('node:fs');
+  const { paths } = await import('../src/state.js');
+  fs.mkdirSync(paths(state).conflictSkipState);
+
+  const head = baseTicket('head', { key: 'a-key' });
+  const other = baseTicket('other', { key: 'other-key' });
+  await enqueue(state, head);
+  await enqueue(state, other);
+
+  // `other` doesn't conflict with anything, so under a working recorder it
+  // would be allowed to skip ahead (see the very first test above). With
+  // recording permanently broken, it must be refused every single time,
+  // not just once — a fail-open bug here specifically only shows up after
+  // repeated attempts, not the first.
+  for (let i = 0; i < 5; i += 1) {
+    const otherResult = await tryStart(state, other, globalCfg);
+    assert.equal(otherResult.started, false, `attempt ${i}: other must never be allowed to skip ahead while recording is broken`);
+    assert.equal(otherResult.reason, 'not-head');
+  }
+
+  // The head itself is not punished by this: once its own conflict clears,
+  // it starts normally (strict FIFO, not stuck).
+  removeLease(state, 'holder');
+  const headResult = await tryStart(state, head, globalCfg);
+  assert.equal(headResult.started, true, 'the head must still start on its own once its conflict clears');
+});
+
 test('a corrupt/unreadable queue record behind a conflict-blocked head stops selection rather than being skipped over', async () => {
   const { state } = freshEnv();
   const globalCfg = baseCfg();
