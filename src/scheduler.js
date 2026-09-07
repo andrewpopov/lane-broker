@@ -156,8 +156,16 @@ export function selectCandidate(queue, held) {
  * interleaving between two supervisors could produce a decision no config
  * ever installed would have produced: the load gate and the CPU gate's
  * consecutive-under counter (see admission.js's evaluateNewAdmission).
+ *
+ * The config itself is part of that locked, consistent view: `globalCfg`
+ * is only the outer snapshot used for `sampleMs` between polls. Everything
+ * decided inside the lock re-reads via `reloadCfg` (default: reuse
+ * `globalCfg`) FIRST THING inside the callback, so a config edit that lands
+ * between this function's outer read and the lock being granted can never
+ * become a stale, already-superseded transition of the load/CPU gate — only
+ * a transition the config in effect at decision time would actually produce.
  */
-export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler) {
+export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler, reloadCfg = () => globalCfg) {
   // Every poll samples, regardless of whether this ticket turns out to be
   // the one actually evaluated below (that requires the locked, consistent
   // queue/lease view this function doesn't have yet). See cpu.js's
@@ -166,6 +174,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler)
   const cpuSample = sampleCpuSafe(root, cpuSampler);
 
   const { result, logFields } = await withLock(root, () => {
+    const cfg = reloadCfg() || globalCfg;
     reapAll(root, bootId());
     // A queued ticket whose supervisor already died (crashed, or the machine
     // killed it) must not sit at the FIFO head forever — dequeue it before
@@ -205,7 +214,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler)
     // behavior until its own conflict actually clears.
     const skipState = readSkipState(root);
     const skipCount = skipState.headId === headTicket.id ? skipState.count : 0;
-    const skipExhausted = headConflicted && skipCount >= globalCfg.conflictSkipLimit;
+    const skipExhausted = headConflicted && skipCount >= cfg.conflictSkipLimit;
     const candidate = !headConflicted ? headTicket : skipExhausted ? null : selectCandidate(queue, held);
     if (!candidate) {
       // Either nobody in the queue is conflict-free (selectCandidate found
@@ -229,15 +238,15 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler)
       const reason = fs.readFileSync(paths(root).pause, 'utf8').trim();
       return { result: { started: false, reason: 'paused', pauseReason: reason } };
     }
-    const gate = sampleAndUpdateGate(root, globalCfg, loadSampler);
+    const gate = sampleAndUpdateGate(root, cfg, loadSampler);
     // Phase 1 (ZIRK scheduler project, shadow-mode admission — see
     // src/admission.js): computed on every poll that reaches this point,
     // regardless of schedulerMode, so shadow and active log identically and
     // only differ in whether the result below is allowed to gate a start.
     // Only the CPU gate's own read-then-write of its shared counter happens
     // here, inside the lock; the sample itself was already taken above.
-    const cpuDecision = evaluateNewAdmission(root, globalCfg, ticket, held, cpuSample);
-    const logBase = { candidateId: ticket.id, mode: globalCfg.schedulerMode, ...cpuDecision };
+    const cpuDecision = evaluateNewAdmission(root, cfg, ticket, held, cpuSample);
+    const logBase = { candidateId: ticket.id, mode: cfg.schedulerMode, ...cpuDecision };
 
     if (gate.closed) {
       return {
@@ -246,9 +255,9 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler)
       };
     }
     const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
-    if (runningWeight + ticket.weight > globalCfg.capacity) {
+    if (runningWeight + ticket.weight > cfg.capacity) {
       return {
-        result: { started: false, reason: 'capacity', runningWeight, capacity: globalCfg.capacity },
+        result: { started: false, reason: 'capacity', runningWeight, capacity: cfg.capacity },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'capacity' },
       };
     }
@@ -256,7 +265,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler)
     // for the conflict/capacity checks above, and it only ever gates a start
     // in 'active' mode — 'shadow' always falls through to the exact
     // admission the current rule would have made.
-    if (globalCfg.schedulerMode === 'active' && !cpuDecision.admit) {
+    if (cfg.schedulerMode === 'active' && !cpuDecision.admit) {
       return {
         result: {
           started: false,
