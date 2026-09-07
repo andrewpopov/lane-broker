@@ -1,6 +1,6 @@
 {
   "name": "@andrewpopov/lane-broker",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Machine-wide test-lane coordinator: serializes conflicting test lanes, caps concurrent heavy lanes, and refuses to start new work while the machine is overloaded.",
   "author": "Andrew Popov",
   "license": "MIT",

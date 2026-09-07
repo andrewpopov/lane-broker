@@ -10,7 +10,7 @@ Zero runtime dependencies — Node `child_process`/`fs`/`os` only (Node ≥ 20).
 ## Install
 
 ```
-npm install -g github:andrewpopov/lane-broker#v0.2.0
+npm install -g github:andrewpopov/lane-broker#v0.2.1
 ```
 
 This installs the `lane` command.
