@@ -18,6 +18,25 @@ test('a local sim lane is refused by default with exit 69', async () => {
   assert.match(result.stderr, /fleet/i);
 });
 
+test('without ROUGE_FLEET_SUBMIT_DSN set, the refusal names the env var to set rather than an unexpanded template', async () => {
+  const { repoDir, env } = setup();
+  const { ROUGE_FLEET_SUBMIT_DSN, ...envWithoutDsn } = env;
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'sim', '--', 'true'], { env: envWithoutDsn, cwd: repoDir });
+  assert.equal(result.code, 69);
+  assert.doesNotMatch(result.stderr, /\$\{ROUGE_FLEET_SUBMIT_DSN\}/, 'must never print the raw unexpanded template');
+  assert.match(result.stderr, /set ROUGE_FLEET_SUBMIT_DSN/);
+});
+
+test('with ROUGE_FLEET_SUBMIT_DSN set, the refusal prints its actual value', async () => {
+  const { repoDir, env } = setup();
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'sim', '--', 'true'], {
+    env: { ...env, ROUGE_FLEET_SUBMIT_DSN: 'https://fleet.example.invalid/submit' },
+    cwd: repoDir,
+  });
+  assert.equal(result.code, 69);
+  assert.match(result.stderr, /https:\/\/fleet\.example\.invalid\/submit/);
+});
+
 test('--allow-local-sim overrides the refusal and runs the command', async () => {
   const { repoDir, env } = setup();
   const result = await laneRun(['run', '--repo', 'r', '--lane', 'sim', '--allow-local-sim', '--', 'true'], { env, cwd: repoDir });
