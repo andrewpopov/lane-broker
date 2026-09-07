@@ -10,6 +10,24 @@ export const DEFAULT_GLOBAL_CONFIG = {
   loadOpen: 11,
   loadOpenSamples: 3,
   sampleMs: 5000,
+  // Phase 1 (ZIRK scheduler project) additions — see src/admission.js. All
+  // optional-with-defaults so a version-1 config written before this phase
+  // still loads unchanged.
+  cpuClosePercent: 90,
+  cpuOpenPercent: 70,
+  cpuAdmissionPercent: 75,
+  cpuOpenSamples: 3,
+  admissionCooldownMs: 5000,
+  memoryCloseBytes: 4294967296,
+  memoryOpenBytes: 8589934592,
+  schedulerMode: 'shadow',
+  // Second, separate body of work (conflict-skip starvation bound — see
+  // selectCandidate() in src/scheduler.js): how many times a conflict-blocked
+  // FIFO head may be skipped in favor of a later, non-conflicting ticket
+  // before the skip is refused and the head is left to block until it can
+  // run itself. Without this, three or more conflicting keys can starve a
+  // head forever by alternating which other ticket is held.
+  conflictSkipLimit: 3,
 };
 
 export const DEFAULT_REPO_CONFIG = {
@@ -43,6 +61,32 @@ function validateGlobalConfig(cfg, sourcePath) {
   assert(cfg.loadOpen < cfg.loadClose, `${sourcePath}: "loadOpen" must be less than "loadClose"`);
   assert(Number.isInteger(cfg.loadOpenSamples) && cfg.loadOpenSamples > 0, `${sourcePath}: "loadOpenSamples" must be a positive integer`);
   assert(Number.isFinite(cfg.sampleMs) && cfg.sampleMs > 0, `${sourcePath}: "sampleMs" must be a positive number`);
+  assert(
+    Number.isFinite(cfg.cpuClosePercent) && cfg.cpuClosePercent > 0 && cfg.cpuClosePercent <= 100,
+    `${sourcePath}: "cpuClosePercent" must be a number in (0, 100]`,
+  );
+  assert(
+    Number.isFinite(cfg.cpuOpenPercent) && cfg.cpuOpenPercent > 0 && cfg.cpuOpenPercent <= 100,
+    `${sourcePath}: "cpuOpenPercent" must be a number in (0, 100]`,
+  );
+  assert(cfg.cpuOpenPercent < cfg.cpuClosePercent, `${sourcePath}: "cpuOpenPercent" must be less than "cpuClosePercent"`);
+  assert(
+    Number.isFinite(cfg.cpuAdmissionPercent) && cfg.cpuAdmissionPercent > 0 && cfg.cpuAdmissionPercent <= 100,
+    `${sourcePath}: "cpuAdmissionPercent" must be a number in (0, 100]`,
+  );
+  assert(Number.isInteger(cfg.cpuOpenSamples) && cfg.cpuOpenSamples > 0, `${sourcePath}: "cpuOpenSamples" must be a positive integer`);
+  assert(Number.isFinite(cfg.admissionCooldownMs) && cfg.admissionCooldownMs >= 0, `${sourcePath}: "admissionCooldownMs" must be a non-negative number`);
+  assert(Number.isFinite(cfg.memoryCloseBytes) && cfg.memoryCloseBytes > 0, `${sourcePath}: "memoryCloseBytes" must be a positive number`);
+  assert(Number.isFinite(cfg.memoryOpenBytes) && cfg.memoryOpenBytes > 0, `${sourcePath}: "memoryOpenBytes" must be a positive number`);
+  assert(cfg.memoryCloseBytes < cfg.memoryOpenBytes, `${sourcePath}: "memoryCloseBytes" must be less than "memoryOpenBytes"`);
+  assert(
+    cfg.schedulerMode === 'shadow' || cfg.schedulerMode === 'active',
+    `${sourcePath}: "schedulerMode" must be "shadow" or "active"`,
+  );
+  assert(
+    Number.isInteger(cfg.conflictSkipLimit) && cfg.conflictSkipLimit >= 0,
+    `${sourcePath}: "conflictSkipLimit" must be a non-negative integer`,
+  );
 }
 
 function validateRepoConfig(cfg, sourcePath) {

@@ -21,6 +21,10 @@ export function paths(root = stateHome()) {
     lock: path.join(root, 'lock'),
     loadGate: path.join(root, 'load-gate.json'),
     configWarning: path.join(root, 'config-warning.json'),
+    cpuSample: path.join(root, 'cpu-sample.json'),
+    cpuGate: path.join(root, 'cpu-gate.json'),
+    admissionLog: path.join(root, 'admission-decisions.log'),
+    conflictSkipState: path.join(root, 'conflict-skip-state.json'),
     seq: path.join(root, 'seq'),
   };
 }
@@ -44,6 +48,41 @@ export function atomicWriteFile(file, data) {
 
 export function atomicWriteJson(file, obj) {
   atomicWriteFile(file, `${JSON.stringify(obj, null, 2)}\n`);
+}
+
+/**
+ * Encode one fingerprint value so the join below can't be forged: a plain
+ * `number` is its bare `String(...)` form (a JS number's string form never
+ * contains the `|` delimiter or a quote character, and this keeps the
+ * fingerprint of today's all-numeric callers byte-identical to before this
+ * function existed — no forced reset of already-persisted gate state).
+ * Anything else (string, boolean, etc.) goes through `JSON.stringify`, which
+ * is self-delimiting: it owns its surrounding quotes and escapes any
+ * interior quote or backslash, so an embedded `|` inside a string value
+ * stays unambiguously inside that one token instead of reading as a
+ * separator. Mixing a bare number token with a quoted JSON token is also
+ * how `1` and `"1"` end up encoded differently, which a delimiter-joined
+ * `String(value)` on its own would not do.
+ */
+function encodeFingerprintValue(value) {
+  return typeof value === 'number' ? String(value) : JSON.stringify(value);
+}
+
+/**
+ * Fingerprint of the threshold values that govern a gate's hysteresis
+ * (order matters), so a config change can be detected against shared,
+ * unversioned gate state written by multiple independent readers —
+ * concurrent supervisors reload their own config independently and all
+ * write the same shared file, so a threshold edit lands mid-countdown for
+ * some of them and not others; blending a countdown started under old
+ * thresholds with samples judged under new ones can produce a decision no
+ * config that was ever installed would have produced. Not a cryptographic
+ * hash, just a stable, cheap-to-compute-every-poll join. Shared by every
+ * gate (src/load.js, src/admission.js) so they can't drift apart by each
+ * keeping a private copy.
+ */
+export function fingerprintOf(...values) {
+  return values.map(encodeFingerprintValue).join('|');
 }
 
 export function readJsonSafe(file) {

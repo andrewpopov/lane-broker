@@ -44,6 +44,13 @@ export function writeLoadFile(base, value) {
   return file;
 }
 
+/** CPU-gate equivalent of writeLoadFile, for LANE_BROKER_CPU_BUSY_FILE. */
+export function writeCpuBusyFile(base, hostBusyCores, cores) {
+  const file = path.join(base, 'cpu-busy');
+  fs.writeFileSync(file, `${hostBusyCores},${cores}`);
+  return file;
+}
+
 /** Spawn `lane <args>` and resolve with { code, stdout, stderr } on exit. */
 export function laneRun(args, { env, cwd } = {}) {
   return new Promise((resolve) => {

@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import os from 'node:os';
-import { paths, atomicWriteJson, readJsonSafe } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, fingerprintOf } from './state.js';
 
 /**
  * Current 1-minute load average. Tests inject a value via
@@ -21,12 +21,6 @@ export function readLoadAvg() {
   return os.loadavg()[0];
 }
 
-/** Fingerprint of the threshold fields that govern hysteresis, so a config
- *  change can be detected against the shared, unversioned gate state. */
-function thresholdFingerprint({ loadClose, loadOpen, loadOpenSamples }) {
-  return `${loadClose}|${loadOpen}|${loadOpenSamples}`;
-}
-
 /**
  * Pure hysteresis transition: closes immediately above loadClose; once
  * closed, reopens only after `loadOpenSamples` consecutive samples below
@@ -44,7 +38,7 @@ function thresholdFingerprint({ loadClose, loadOpen, loadOpenSamples }) {
  */
 export function updateGateState(prev, load, cfg) {
   const { loadClose, loadOpen, loadOpenSamples } = cfg;
-  const fingerprint = thresholdFingerprint(cfg);
+  const fingerprint = fingerprintOf(loadClose, loadOpen, loadOpenSamples);
   const state = prev ? { ...prev } : { closed: false, consecutiveUnder: 0 };
   if (state.fingerprint !== fingerprint) {
     state.consecutiveUnder = 0;
