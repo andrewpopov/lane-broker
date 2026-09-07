@@ -1,14 +1,30 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { ensureStateDirs, paths, withLock, bootId, readJsonSafe } from './state.js';
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
 import { listQueue, HELD_STATES } from './scheduler.js';
 import { readGateState } from './load.js';
 import { loadGlobalConfig } from './config.js';
 
-export async function collectStatus() {
+/** Holder pid of the global lock, read directly off disk — used to name the
+ *  holder in the "couldn't take the lock" diagnostic without re-taking it. */
+function currentLockHolderPid(root) {
+  const owner = readJsonSafe(path.join(paths(root).lock, 'owner.json'));
+  return owner ? owner.pid : null;
+}
+
+export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
   const root = ensureStateDirs().root;
   const cfg = loadGlobalConfig();
-  await withLock(root, () => reapAll(root, bootId()));
+  let lockError = null;
+  try {
+    await withLock(root, () => reapAll(root, bootId()), { timeoutMs: lockTimeoutMs });
+  } catch (err) {
+    // The lock is only needed to reap stale leases before reporting; the
+    // leases/queue/gate files underneath are readable without it. A timeout
+    // here must be surfaced, never swallowed into a silent blank report.
+    lockError = { message: err.message, holderPid: currentLockHolderPid(root) };
+  }
 
   const leases = listLeases(root);
   const queue = listQueue(root);
@@ -56,6 +72,7 @@ export async function collectStatus() {
     },
     running,
     queued,
+    lockError,
   };
 }
 
@@ -70,12 +87,16 @@ function fmtMs(ms) {
 export function renderStatusText(status) {
   const lines = [];
   lines.push(`capacity: ${status.used}/${status.capacity} used`);
-  lines.push(
-    `load gate: ${status.loadGate.closed ? 'CLOSED' : 'open'}` +
-      ` (load ${status.loadGate.lastLoad ?? '?'}, sampled ${fmtMs(status.loadGate.sampleAgeMs)} ago` +
-      `, close>${status.loadGate.loadClose}, open<${status.loadGate.loadOpen} x${status.loadGate.loadOpenSamples}` +
-      `, consecutive-under ${status.loadGate.consecutiveUnder})`,
-  );
+  if (status.loadGate.lastLoad == null && status.loadGate.sampleAgeMs == null) {
+    lines.push('load gate: open (no sample yet — samples are taken when a ticket reaches the queue head)');
+  } else {
+    lines.push(
+      `load gate: ${status.loadGate.closed ? 'CLOSED' : 'open'}` +
+        ` (load ${status.loadGate.lastLoad ?? '?'}, sampled ${fmtMs(status.loadGate.sampleAgeMs)} ago` +
+        `, close>${status.loadGate.loadClose}, open<${status.loadGate.loadOpen} x${status.loadGate.loadOpenSamples}` +
+        `, consecutive-under ${status.loadGate.consecutiveUnder})`,
+    );
+  }
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
   if (status.configWarning) {
     lines.push(
@@ -108,12 +129,52 @@ export function renderStatusText(status) {
   return lines.join('\n');
 }
 
+/** Write `text` to `stream` and resolve only once the write has actually
+ *  been accepted by the underlying fd. `process.stdout.write` on a pipe is
+ *  asynchronous and does not block the event loop on its own — if the
+ *  process's exit code is already set and nothing else is keeping the loop
+ *  alive, node can exit before a large or slow-draining write reaches the
+ *  reader, so a caller under load can walk away with zero bytes written
+ *  despite a clean exit code. Awaiting the write's own callback is what
+ *  actually orders "reported" after "delivered". */
+function writeAndFlush(stream, text) {
+  return new Promise((resolve, reject) => {
+    stream.write(text, (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
 export async function statusCommand({ json } = {}) {
+  const root = ensureStateDirs().root;
   const status = await collectStatus();
-  if (json) {
-    process.stdout.write(`${JSON.stringify(status, null, 2)}\n`);
-  } else {
-    process.stdout.write(`${renderStatusText(status)}\n`);
+
+  // The lock diagnostic goes to stderr in BOTH modes, before either branch:
+  // a --json caller that only reads stdout still gets `lockError` in the
+  // payload, but a human watching the terminal must see the warning too.
+  if (status.lockError) {
+    process.stderr.write(
+      `lane status: could not take the broker lock within 5s (held by pid ${status.lockError.holderPid ?? 'unknown'}); ` +
+        `showing the last persisted state, which may be stale\n`,
+    );
   }
-  return { exitCode: 0 };
+
+  if (json) {
+    const text = `${JSON.stringify(status, null, 2)}\n`;
+    if (status.capacity == null) {
+      process.stderr.write(`lane status: internal error — rendered an empty report; state root ${root}\n`);
+      return { exitCode: 1 };
+    }
+    await writeAndFlush(process.stdout, text);
+    return { exitCode: status.lockError ? 1 : 0 };
+  }
+
+  const text = `${renderStatusText(status)}\n`;
+  if (!text || !text.includes('capacity:')) {
+    process.stderr.write(`lane status: internal error — rendered an empty report; state root ${root}\n`);
+    return { exitCode: 1 };
+  }
+  await writeAndFlush(process.stdout, text);
+  return { exitCode: status.lockError ? 1 : 0 };
 }
