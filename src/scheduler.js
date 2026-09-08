@@ -4,6 +4,7 @@ import { paths, atomicWriteJson, readJsonSafe, withLock, bootId } from './state.
 import { sampleAndUpdateGate } from './load.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
 import { evaluateNewAdmission, sampleCpuSafe, logAdmissionDecision } from './admission.js';
+import { readMemoryInfo } from './cpu.js';
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
  *  possibly-running work and must count against both conflicts and capacity. */
@@ -165,7 +166,7 @@ export function selectCandidate(queue, held) {
  * become a stale, already-superseded transition of the load/CPU gate — only
  * a transition the config in effect at decision time would actually produce.
  */
-export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler, reloadCfg = () => globalCfg) {
+export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler, reloadCfg = () => globalCfg, memoryReader = readMemoryInfo) {
   // Every poll samples, regardless of whether this ticket turns out to be
   // the one actually evaluated below (that requires the locked, consistent
   // queue/lease view this function doesn't have yet). See cpu.js's
@@ -258,15 +259,25 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // Only the CPU gate's own read-then-write of its shared counter happens
     // here, inside the lock; the sample itself was already taken above.
     const cpuDecision = evaluateNewAdmission(root, cfg, ticket, held, cpuSample);
-    const logBase = { candidateId: ticket.id, mode: cfg.schedulerMode, ...cpuDecision };
+    // BRAIN-207: when admissionLoadGate is false the gate is sampled and
+    // logged exactly as before (its hysteresis countdown must not stall for
+    // want of observation), but it is never allowed to deny — for an idle
+    // broker OR one holding non-conflicting leases. `loadGateIgnored`
+    // records the decisions where that actually mattered (a closed gate the
+    // flag suppressed), so shadow telemetry can tell "gate never got the
+    // chance to matter" from "gate genuinely never closed".
+    const loadGateIgnored = !cfg.admissionLoadGate && gate.closed;
+    const logBase = { candidateId: ticket.id, mode: cfg.schedulerMode, loadGateIgnored, ...cpuDecision };
     // What the CURRENT rule would decide, for telemetry (BRAIN-198's shadow
     // ledger needs to tell an ordinary admission from one only the idle
     // exemption allowed) — applies to every branch below that ends in a
     // start, not just the final one, since active-mode CPU denial can still
-    // veto an idle-exempt admission.
-    const baselineReason = gate.closed && brokerIdle ? 'idle-exempt' : 'ok';
+    // veto an idle-exempt admission. 'idle-exempt' only applies when the
+    // gate itself is live (admissionLoadGate: true); with the gate
+    // informational-only, every start is an ordinary 'ok', idle or not.
+    const baselineReason = cfg.admissionLoadGate && gate.closed && brokerIdle ? 'idle-exempt' : 'ok';
 
-    if (gate.closed && !brokerIdle) {
+    if (cfg.admissionLoadGate && gate.closed && !brokerIdle) {
       return {
         result: { started: false, reason: 'load-gate-closed', load: gate.lastLoad },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'load-gate-closed' },
@@ -277,6 +288,24 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       return {
         result: { started: false, reason: 'capacity', runningWeight, capacity: cfg.capacity },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'capacity' },
+      };
+    }
+    // Memory brake (BRAIN-207): a best-effort, never-throwing reader; only
+    // an explicit 'critical' reading denies (applies to an idle broker too
+    // — this is a hard machine-health brake, not something the idle
+    // exemption should ever bypass). Any other value, a null reading, or a
+    // throwing reader all admit — same fail-open tolerance as the CPU/load
+    // samplers elsewhere in this function.
+    let memInfo = null;
+    try {
+      memInfo = memoryReader();
+    } catch {
+      memInfo = null;
+    }
+    if (memInfo && memInfo.macPressure === 'critical') {
+      return {
+        result: { started: false, reason: 'memory-critical', macPressure: memInfo.macPressure },
+        logFields: { ...logBase, currentDecision: 'deny', currentReason: 'memory-critical' },
       };
     }
     // Phase 1's predicate is an ADDITIONAL constraint, never a replacement

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { freshEnv } from './helpers.js';
-import { sampleHostCpu, computeBusyCores, readMemoryInfo } from '../src/cpu.js';
+import { sampleHostCpu, computeBusyCores, readMemoryInfo, parseGroupCpuOutput, observedGroupCpuCores } from '../src/cpu.js';
 
 /** Build os.cpus()-shaped fixtures from just {idle, total} per core. */
 function fakeCpus(cores) {
@@ -132,6 +132,76 @@ test('sampleHostCpu never throws when the sidecar write fails (e.g. the state ro
     const result = sampleHostCpu(brokenRoot, fakeCpus([{ idle: 100, total: 200 }]));
     assert.equal(result.stale, true);
   });
+});
+
+test('parseGroupCpuOutput: an all-blank/whitespace ps output is null, not a fabricated zero (BRAIN-207)', () => {
+  // Number('') === 0, so the blank line must be filtered BEFORE the Number()
+  // coercion, not after -- otherwise "nothing usable" reads as "a real
+  // process at exactly 0% CPU" instead of null (no observation).
+  assert.equal(parseGroupCpuOutput('\n'), null);
+  assert.equal(parseGroupCpuOutput('   \n  \n'), null);
+  assert.equal(parseGroupCpuOutput(''), null);
+});
+
+test('parseGroupCpuOutput sums usable rows into a cores-busy fraction, ignoring blank lines', () => {
+  assert.equal(parseGroupCpuOutput(' 12.5\n 37.5\n\n'), 0.5);
+});
+
+test('parseGroupCpuOutput treats non-numeric garbage as no usable rows', () => {
+  assert.equal(parseGroupCpuOutput('garbage'), null);
+});
+
+test('observedGroupCpuCores returns null for a falsy pgid without shelling out', () => {
+  assert.equal(observedGroupCpuCores(null), null);
+  assert.equal(observedGroupCpuCores(0), null);
+});
+
+// BRAIN-207 Codex pre-merge review: both probes must be bounded (timeout:
+// 2000 passed to execFileSync) so a hung `ps`/`sysctl` can never hold the
+// supervisor heartbeat (observedGroupCpuCores) or the global admission lock
+// (readMemoryInfo, called from inside tryStart) open indefinitely. A timed-
+// out exec throws (Node surfaces ETIMEDOUT the same way any other
+// execFileSync failure throws), so injecting a throwing exec is exactly
+// what a real timeout looks like from the caller's side.
+
+test('observedGroupCpuCores passes a 2000ms timeout bound to exec, so a hung `ps` cannot stall the heartbeat forever', () => {
+  let capturedOptions = null;
+  const spyExec = (cmd, args, options) => {
+    capturedOptions = options;
+    return ' 10\n';
+  };
+  observedGroupCpuCores(1234, spyExec);
+  assert.equal(capturedOptions.timeout, 2000);
+});
+
+test('readMemoryInfo passes a 2000ms timeout bound to exec, so a hung `sysctl` cannot stall the admission lock forever', { skip: process.platform !== 'darwin' }, () => {
+  let capturedOptions = null;
+  const spyExec = (cmd, args, options) => {
+    capturedOptions = options;
+    return '1';
+  };
+  readMemoryInfo(spyExec);
+  assert.equal(capturedOptions.timeout, 2000);
+});
+
+test('observedGroupCpuCores: an exec that throws (simulating a ps timeout) yields null, not a crash', () => {
+  const timingOutExec = () => {
+    const err = new Error('spawnSync ps ETIMEDOUT');
+    err.code = 'ETIMEDOUT';
+    throw err;
+  };
+  assert.equal(observedGroupCpuCores(1234, timingOutExec), null);
+});
+
+test('readMemoryInfo: an exec that throws (simulating a sysctl timeout) yields a non-denying reading, not a crash', () => {
+  const timingOutExec = () => {
+    const err = new Error('spawnSync sysctl ETIMEDOUT');
+    err.code = 'ETIMEDOUT';
+    throw err;
+  };
+  const info = readMemoryInfo(timingOutExec);
+  assert.equal(info.macPressure, null, 'a timed-out probe degrades to null, same as any other sysctl failure');
+  assert.notEqual(info.macPressure, 'critical');
 });
 
 test('readMemoryInfo never throws and reports a numeric availableBytes', () => {

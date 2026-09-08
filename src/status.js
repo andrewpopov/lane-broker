@@ -69,6 +69,10 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       loadClose: cfg.loadClose,
       loadOpen: cfg.loadOpen,
       loadOpenSamples: cfg.loadOpenSamples,
+      // BRAIN-207: whether a closed gate is actually allowed to deny a
+      // start. false means the gate line below is informational only —
+      // still sampled and reported, never enforced.
+      admission: Boolean(cfg.admissionLoadGate),
     },
     running,
     queued,
@@ -87,14 +91,15 @@ function fmtMs(ms) {
 export function renderStatusText(status) {
   const lines = [];
   lines.push(`capacity: ${status.used}/${status.capacity} used`);
+  const informationalSuffix = status.loadGate.admission ? '' : ' [informational]';
   if (status.loadGate.lastLoad == null && status.loadGate.sampleAgeMs == null) {
-    lines.push('load gate: open (no sample yet — samples are taken when a ticket reaches the queue head)');
+    lines.push(`load gate: open (no sample yet — samples are taken when a ticket reaches the queue head)${informationalSuffix}`);
   } else {
     lines.push(
       `load gate: ${status.loadGate.closed ? 'CLOSED' : 'open'}` +
         ` (load ${status.loadGate.lastLoad ?? '?'}, sampled ${fmtMs(status.loadGate.sampleAgeMs)} ago` +
         `, close>${status.loadGate.loadClose}, open<${status.loadGate.loadOpen} x${status.loadGate.loadOpenSamples}` +
-        `, consecutive-under ${status.loadGate.consecutiveUnder})`,
+        `, consecutive-under ${status.loadGate.consecutiveUnder})${informationalSuffix}`,
     );
   }
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
