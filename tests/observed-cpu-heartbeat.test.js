@@ -55,7 +55,7 @@ test('a real running lane\'s lease gets a numeric observedCpuCores from a live h
       return null;
     }
     return names[0] ? names[0].replace(/\.json$/, '') : null;
-  });
+  }, { timeoutMs: 15000 }); // same reason as below: three node startups on a loaded host
 
   const lease = await waitFor(
     () => {
