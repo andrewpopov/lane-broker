@@ -8,11 +8,17 @@ import { isPidAlive } from '../src/lease.js';
 
 test('cancelling a queued ticket lets its supervisor exit instead of polling forever', async () => {
   const { base, home, state, env } = freshEnv();
-  writeGlobalConfig(home, { version: 1, capacity: 1, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
+  const globalConfig = { version: 1, capacity: 1, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 };
+  writeGlobalConfig(home, globalConfig);
   const repoDir = path.join(base, 'repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
 
   // Occupy the only capacity slot so the second ticket is stuck queued.
+  // This wait measures host startup cost (spawn + broker claiming the lease
+  // under contention), not broker behaviour under test, so it gets a
+  // generous, load-scaled budget rather than a fixed one calibrated for an
+  // idle box.
+  const STARTUP_TIMEOUT_MS = Math.max(60_000, 30 * globalConfig.sampleMs);
   const blocker = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', 'sleep', '5'], { env, cwd: repoDir });
   await waitFor(
     () => {
@@ -22,7 +28,7 @@ test('cancelling a queued ticket lets its supervisor exit instead of polling for
         return false;
       }
     },
-    { timeoutMs: 15000 },
+    { timeoutMs: STARTUP_TIMEOUT_MS },
   );
 
   const queued = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', 'true'], { env, cwd: repoDir });
@@ -41,7 +47,9 @@ test('cancelling a queued ticket lets its supervisor exit instead of polling for
       return false;
     }
   };
-  await waitFor(() => queueFileExists(), { timeoutMs: 15000 });
+  // Same startup-dominated wait: enqueuing the second ticket depends on
+  // host load, not on the cancel-exit logic under test.
+  await waitFor(() => queueFileExists(), { timeoutMs: STARTUP_TIMEOUT_MS });
 
   // Find the queued ticket's own supervisor pid so we can confirm it exits.
   const queueDir = paths(state).queue;
@@ -54,8 +62,12 @@ test('cancelling a queued ticket lets its supervisor exit instead of polling for
   assert.equal(cancelResult.code, 0, `stderr: ${cancelResult.stderr}`);
   assert.equal(queueFileExists(), false, 'the queued ticket must actually be removed');
 
-  // The supervisor must notice its ticket is gone and exit -- not poll forever.
-  await waitFor(() => !isPidAlive(supervisorPid), { timeoutMs: 15000 });
+  // The supervisor must notice its ticket is gone and exit -- not poll
+  // forever. This IS the behaviour under test, so its budget stays tight
+  // relative to the supervisor's own poll cadence (sampleMs) rather than
+  // generous like the startup waits above: a supervisor that really polls
+  // forever must still fail this assertion by name.
+  await waitFor(() => !isPidAlive(supervisorPid), { timeoutMs: 20 * globalConfig.sampleMs });
 
   await new Promise((resolve) => {
     if (blocker.exitCode !== null || blocker.signalCode !== null) return resolve();

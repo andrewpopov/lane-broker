@@ -231,6 +231,9 @@ symlinks.
   first line of this file instead of `os.loadavg()`, for deterministic gate
   tests.
 - `LANE_BROKER_BOOT_ID` — override the detected boot id, to simulate a reboot.
+- `LANE_BROKER_TEST_ROUNDS` — override the dead-owner-lock contention sweep's
+  round count (default 4; the original suite ran 10) for a fuller sweep, e.g.
+  `LANE_BROKER_TEST_ROUNDS=10 npm test`.
 
 ## Verify locally
 

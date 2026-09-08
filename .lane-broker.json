@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "lanes": {
+    "default": { "weight": 2 },
+    "prepush": { "weight": 2 }
+  },
+  "conflicts": []
+}
