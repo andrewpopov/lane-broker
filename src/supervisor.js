@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { paths, ensureStateDirs, appendHistory, atomicWriteJson, readJsonSafe } from './state.js';
 import { enqueue, tryStart, dequeueSync } from './scheduler.js';
 import { readLease, writeLease, removeLease, isGroupAlive, processStartTime } from './lease.js';
+import { observedGroupCpuCores } from './cpu.js';
 import { reloadGlobalConfig } from './config.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
@@ -162,6 +163,40 @@ class CappedLogWriter {
   }
 }
 
+/**
+ * Pure: resolve a ticket's `cmd` into the actual [cmd, args] a lane's child
+ * should be spawned with (BRAIN-207). `nice -n <n> cmd args...` execs `cmd`
+ * in place (it doesn't fork+wait), so the spawned process's pid/pgid, exit
+ * code, and signal propagation are exactly what a bare spawn of `cmd` would
+ * give — the wrapper is a no-op past the initial exec. `nice: 0` (or a
+ * missing/invalid `ticket.nice`) spawns the bare command with no wrapper at
+ * all, so a niceless lane pays nothing extra. Split out as its own function
+ * so the wrapping decision is unit-testable without spawning a real process.
+ */
+export function resolveNicedSpawn(ticket) {
+  const nice = Number.isInteger(ticket.nice) && ticket.nice >= 0 ? ticket.nice : 0;
+  if (nice > 0) return ['/usr/bin/nice', ['-n', String(nice), ...ticket.cmd]];
+  return [ticket.cmd[0], ticket.cmd.slice(1)];
+}
+
+/**
+ * Pure: fold one heartbeat's observed-CPU reading into a lease update
+ * (BRAIN-207). A finite `observed` stamps observedCpuCores + observedAt on
+ * the SAME write as the heartbeat; a null/non-finite reading (probe failed,
+ * or returned nothing usable) leaves whatever was there before untouched —
+ * a failed probe must never clobber a good prior observation with
+ * "unknown". Split out so both branches are unit-testable without a real
+ * process group.
+ */
+export function applyHeartbeatObservation(lease, observed, now = Date.now()) {
+  const update = { ...lease, heartbeatAt: now };
+  if (Number.isFinite(observed)) {
+    update.observedCpuCores = observed;
+    update.observedAt = now;
+  }
+  return update;
+}
+
 async function main() {
   const ticket = readTicketFromEnv();
   const root = ensureStateDirs().root;
@@ -233,7 +268,7 @@ async function main() {
   }
 
   const startedAt = Date.now();
-  const [cmd, ...args] = ticket.cmd;
+  const [cmd, args] = resolveNicedSpawn(ticket);
   const child = spawn(cmd, args, {
     cwd: ticket.cwd,
     detached: true,
@@ -258,7 +293,10 @@ async function main() {
   const heartbeat = setInterval(() => {
     if (finished) return;
     const lease = readLease(root, ticket.id);
-    if (lease) writeLease(root, { ...lease, heartbeatAt: Date.now() });
+    if (lease) {
+      const observed = child.pid ? observedGroupCpuCores(child.pid) : null;
+      writeLease(root, applyHeartbeatObservation(lease, observed));
+    }
     if (!cancelling && cancelRequested(root, ticket.id)) {
       cancelling = true;
       clearCancelRequest(root, ticket.id);

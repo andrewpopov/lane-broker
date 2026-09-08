@@ -38,7 +38,7 @@ function holdLease(state, overrides = {}) {
 
 test('load gate: refuses to start while closed, starts once it reopens after enough consecutive low samples', async () => {
   const { base, home, state, env: baseEnv } = freshEnv();
-  writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 10, loadOpen: 5, loadOpenSamples: 2, sampleMs: 150 });
+  writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 10, loadOpen: 5, loadOpenSamples: 2, sampleMs: 150, admissionLoadGate: true });
   const repoDir = path.join(base, 'repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
   holdLease(state);
@@ -68,7 +68,7 @@ test('load gate: refuses to start while closed, starts once it reopens after eno
 
 test('load gate: a config edit raising loadOpen mid-flight lets a stuck gate reopen, matching the real incident', async () => {
   const { base, home, state, env: baseEnv } = freshEnv();
-  writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 15, loadOpen: 11, loadOpenSamples: 2, sampleMs: 150 });
+  writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 15, loadOpen: 11, loadOpenSamples: 2, sampleMs: 150, admissionLoadGate: true });
   const repoDir = path.join(base, 'repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
   holdLease(state);
@@ -115,7 +115,7 @@ test('load gate: a config edit raising loadOpen mid-flight lets a stuck gate reo
   // below the original loadOpen (11). This is the end-to-end proof that a
   // running supervisor picks up a config change instead of being stuck on
   // its startup snapshot.
-  writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 40, loadOpen: 14, loadOpenSamples: 2, sampleMs: 150 });
+  writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 40, loadOpen: 14, loadOpenSamples: 2, sampleMs: 150, admissionLoadGate: true });
 
   const lease = await waitFor(() => fs.existsSync(path.join(paths(state).leases, `${id}.json`)), { timeoutMs: 5000 });
   assert.ok(lease, 'should start once the reloaded config raises loadOpen above the current load');
@@ -123,7 +123,7 @@ test('load gate: a config edit raising loadOpen mid-flight lets a stuck gate reo
 
 test('BRAIN-197: an idle broker (no held leases) starts its head immediately even while the load gate is closed', async () => {
   const { base, home, state, env: baseEnv } = freshEnv();
-  writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 10, loadOpen: 5, loadOpenSamples: 2, sampleMs: 150 });
+  writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 10, loadOpen: 5, loadOpenSamples: 2, sampleMs: 150, admissionLoadGate: true });
   const repoDir = path.join(base, 'repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
   // Deliberately no holdLease() here: the broker holds nothing, so the

@@ -13,7 +13,7 @@ import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 const srcDir = fileURLToPath(new URL('../src', import.meta.url));
 
 function makeCfg(overrides) {
-  return { ...DEFAULT_GLOBAL_CONFIG, ...overrides };
+  return { ...DEFAULT_GLOBAL_CONFIG, admissionLoadGate: true, ...overrides };
 }
 
 function persistClosedGate(state, cfg, consecutiveUnder) {

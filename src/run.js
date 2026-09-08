@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { ensureStateDirs, paths, readJsonSafe } from './state.js';
-import { resolveTicketConfig, ConfigError } from './config.js';
+import { resolveTicketConfig, reloadGlobalConfig, ConfigError } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE } from './lease.js';
 import { listQueue } from './scheduler.js';
 
@@ -80,6 +80,11 @@ export async function runCommand({
     throw err;
   }
   const weight = weightOverride ?? resolved.weight;
+  // A bad/missing global config must never block enqueueing a lane — it
+  // degrades to the default `laneNice`, the same fallback shape
+  // reloadGlobalConfig gives the supervisor's own polling loop.
+  const globalCfg = reloadGlobalConfig(undefined);
+  const nice = resolved.nice ?? globalCfg.laneNice;
 
   const inheritedLease = process.env.LANE_BROKER_LEASE;
   const inheritedKey = process.env.LANE_BROKER_KEY;
@@ -145,6 +150,7 @@ export async function runCommand({
     repoId: resolved.repoId,
     lane: resolved.lane,
     weight,
+    nice,
     conflicts: resolved.conflicts,
     cwd,
     cmd,

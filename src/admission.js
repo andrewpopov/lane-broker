@@ -143,19 +143,21 @@ export function cooldownActive(heldLeases, cfg, now = Date.now()) {
 }
 
 /**
- * KNOWN BIAS, documented per Codex review finding #4 rather than fixed in
- * phase 1: externalBusy only subtracts a lease's *observed* CPU, which phase
- * 1 never populates (see leaseDemand above — cpu.js's observedGroupCpuCores
- * exists but isn't wired into any held lease yet). hostBusyCores already
- * includes every held lease's real CPU use, so reservedSum then adds each
- * one's cold-start estimate BACK on top of that same work — a systematic
- * double count. Harmless while schedulerMode stays 'shadow' (the decision is
- * never enforced), but 'active' would systematically over-deny. Do not flip
- * to 'active' until observed CPU is wired in (phase 3) or this is otherwise
- * corrected. This is deliberately loud: every admission log line below
- * carries `bias=self-not-subtracted` so this can't be missed.
+ * KNOWN BIAS, documented per Codex review finding #4, partially corrected by
+ * BRAIN-207: externalBusy subtracts a lease's *observed* CPU
+ * (src/cpu.js's observedGroupCpuCores, wired into the supervisor heartbeat),
+ * so hostBusyCores no longer double-counts that lease's own reservation once
+ * an observation exists. But a lease still shows this bias until its FIRST
+ * heartbeat lands an observation — a cold-start lease's estimate is added to
+ * reservedSum with nothing yet subtracted from hostBusyCores on its behalf,
+ * the same systematic double count as before for that lease specifically.
+ * Harmless while schedulerMode stays 'shadow' (the decision is never
+ * enforced), but 'active' would still over-deny for any freshly-admitted
+ * lease. This is deliberately loud: every admission log line below carries
+ * `bias=self-subtracted-when-observed` so the remaining cold-start gap can't
+ * be missed.
  */
-export const KNOWN_BIAS_NOTE = 'self-not-subtracted';
+export const KNOWN_BIAS_NOTE = 'self-subtracted-when-observed';
 
 /**
  * The new admission predicate (phase 1), pure function of its inputs so it
@@ -299,6 +301,7 @@ export function formatAdmissionLog(f) {
     `candidate=${f.candidateId}`,
     `mode=${f.mode}`,
     `current=${f.currentDecision}:${f.currentReason}`,
+    `loadGateIgnored=${Boolean(f.loadGateIgnored)}`,
     `new=${f.admit ? 'admit' : 'deny'}:${f.reason}`,
     `sample=${f.sampleStale ? 'stale' : 'ok'}`,
     `hostBusyCores=${fmt(f.hostBusyCores)}`,

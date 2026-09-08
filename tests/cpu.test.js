@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { freshEnv } from './helpers.js';
-import { sampleHostCpu, computeBusyCores, readMemoryInfo } from '../src/cpu.js';
+import { sampleHostCpu, computeBusyCores, readMemoryInfo, parseGroupCpuOutput, observedGroupCpuCores } from '../src/cpu.js';
 
 /** Build os.cpus()-shaped fixtures from just {idle, total} per core. */
 function fakeCpus(cores) {
@@ -132,6 +132,28 @@ test('sampleHostCpu never throws when the sidecar write fails (e.g. the state ro
     const result = sampleHostCpu(brokenRoot, fakeCpus([{ idle: 100, total: 200 }]));
     assert.equal(result.stale, true);
   });
+});
+
+test('parseGroupCpuOutput: an all-blank/whitespace ps output is null, not a fabricated zero (BRAIN-207)', () => {
+  // Number('') === 0, so the blank line must be filtered BEFORE the Number()
+  // coercion, not after -- otherwise "nothing usable" reads as "a real
+  // process at exactly 0% CPU" instead of null (no observation).
+  assert.equal(parseGroupCpuOutput('\n'), null);
+  assert.equal(parseGroupCpuOutput('   \n  \n'), null);
+  assert.equal(parseGroupCpuOutput(''), null);
+});
+
+test('parseGroupCpuOutput sums usable rows into a cores-busy fraction, ignoring blank lines', () => {
+  assert.equal(parseGroupCpuOutput(' 12.5\n 37.5\n\n'), 0.5);
+});
+
+test('parseGroupCpuOutput treats non-numeric garbage as no usable rows', () => {
+  assert.equal(parseGroupCpuOutput('garbage'), null);
+});
+
+test('observedGroupCpuCores returns null for a falsy pgid without shelling out', () => {
+  assert.equal(observedGroupCpuCores(null), null);
+  assert.equal(observedGroupCpuCores(0), null);
 });
 
 test('readMemoryInfo never throws and reports a numeric availableBytes', () => {

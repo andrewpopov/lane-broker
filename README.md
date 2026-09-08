@@ -64,9 +64,23 @@ hasn't finished enqueueing yet) rather than blocking forever on a typo.
   "loadClose": 15,
   "loadOpen": 11,
   "loadOpenSamples": 3,
-  "sampleMs": 5000
+  "sampleMs": 5000,
+  "admissionLoadGate": false,
+  "laneNice": 10
 }
 ```
+
+`admissionLoadGate` (default `false`): whether the load gate is allowed to
+deny a start at all. With the default, the gate is still sampled and reported
+every poll (`lane status` shows it, `[informational]` suffixed), but it never
+blocks a start — not for an idle broker, not for one already holding
+non-conflicting leases. Set `true` to make a closed gate hard-deny again
+(pre-BRAIN-207 behaviour, including the BRAIN-197 idle exemption).
+
+`laneNice` (default `10`, range `0`-`19`): every lane is spawned under `nice
+-n <laneNice>` so a heavy test run doesn't starve interactive work on a
+shared machine. `0` disables niceing (the bare command is spawned with no
+wrapper). A lane's own `nice` in `.lane-broker.json` overrides this.
 
 **Per repo** — `.lane-broker.json`, discovered by walking up from `cwd` to the
 git worktree root (repo identity is the realpath of `git rev-parse
@@ -79,7 +93,7 @@ set of leases):
   "lanes": {
     "default": { "weight": 2 },
     "sim":     { "weight": 2, "localRefused": true },
-    "lint":    { "weight": 1 },
+    "lint":    { "weight": 1, "nice": 15 },
     "e2e":     { "weight": 2 },
     "prepush": { "weight": 2 }
   },
@@ -95,6 +109,9 @@ conflict, regardless of `conflicts`. With no config file, there is a single
 A lane with `localRefused: true` (the `sim` lane by default, matching the
 rouge fleet split) is refused on `lane run` unless `--allow-local-sim` is
 passed — print a fleet-offload message and exit `69` instead.
+
+A lane's own `nice` (integer `0`-`19`) overrides the global `laneNice` for
+that lane only; omit it to use the global default.
 
 A supervisor that is still waiting to start (queued behind capacity or a
 closed load gate) re-reads the global config on every poll, so an edit to
@@ -114,13 +131,25 @@ starts only when **all** of:
   lease still represents real, possibly-running work, so it blocks exactly
   like a RUNNING one (it just can't be auto-reaped; see ORPHANED handling),
 - running weight (RUNNING + ORPHANED) + its weight fits `capacity`,
-- the load gate is open,
+- the load gate is open, **or `admissionLoadGate` is `false` (the default)**,
+- macOS memory pressure is not `critical`,
 - the broker is not paused.
 
 **Load gate**: closes immediately when the 1-minute loadavg exceeds
 `loadClose`; reopens only after `loadOpenSamples` consecutive samples (spaced
 `sampleMs` apart) below `loadOpen`. This hysteresis means a single low sample
-right after a spike does not reopen it.
+right after a spike does not reopen it. The gate is always sampled and always
+logged, but with `admissionLoadGate: false` (the default) it is
+**informational only** — it never denies a start, `lane status` marks its
+line `[informational]`, and the admission log carries `loadGateIgnored=true`
+whenever a closed gate would otherwise have mattered. Set
+`admissionLoadGate: true` to make it a hard gate again.
+
+**Memory brake**: an always-on, unconditional check — not gated by
+`admissionLoadGate` — that denies a start (`memory-critical`) when macOS
+reports `kern.memorystatus_vm_pressure_level` as critical. A missing or
+non-critical reading (including on non-macOS platforms, where this is always
+a no-op) never denies.
 
 **Reentrancy**: the supervisor exports `LANE_BROKER_LEASE=<id>` and
 `LANE_BROKER_KEY=<key>` to the child. A nested `lane run` reuses the inherited

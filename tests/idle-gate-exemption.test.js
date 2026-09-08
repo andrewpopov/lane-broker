@@ -17,7 +17,7 @@ import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 // reapAll pass tryStart runs on every poll.
 
 function makeCfg(overrides) {
-  return { ...DEFAULT_GLOBAL_CONFIG, ...overrides };
+  return { ...DEFAULT_GLOBAL_CONFIG, admissionLoadGate: true, ...overrides };
 }
 
 function persistClosedGate(state, cfg, consecutiveUnder = 0) {

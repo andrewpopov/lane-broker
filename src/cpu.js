@@ -170,13 +170,33 @@ export function readMemoryInfo() {
 }
 
 /**
+ * Pure parse of `ps -o %cpu=`'s raw text into a cores-busy figure, split out
+ * from observedGroupCpuCores below so it's unit-testable without shelling
+ * out. `Number('')` is `0`, so a blank/whitespace-only line (there's always
+ * at least a trailing newline, and `ps` can emit blank rows) must be
+ * filtered out BEFORE the Number() coercion, not after — otherwise it reads
+ * as a real, valid zero-percent process instead of "nothing usable here",
+ * and a probe that returned no rows at all would wrongly report 0 (a
+ * legitimate reading) rather than null (no observation).
+ */
+export function parseGroupCpuOutput(text) {
+  const values = text
+    .split('\n')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+    .map(Number)
+    .filter((n) => Number.isFinite(n));
+  if (values.length === 0) return null;
+  return values.reduce((sum, v) => sum + v, 0) / 100;
+}
+
+/**
  * Best-effort observed CPU (in cores) for one lease's process group, summing
  * `ps`'s %cpu across every process in the group. Returns null (never
- * throws) when the pgid is unknown or the probe itself fails — the same
- * fail-safe shape as processStartTime() in state.js. Not called anywhere
- * yet in phase 1 (see the "for now the cold-start estimate is enough"
- * note on leaseDemand in src/admission.js); it exists so a later phase can
- * slot in a live-observed reservation without a new sampling mechanism.
+ * throws) when the pgid is unknown, the probe itself fails, or the probe
+ * returns nothing usable — the same fail-safe shape as processStartTime()
+ * in state.js. Wired into the supervisor heartbeat (BRAIN-207): telemetry
+ * only, folded into leaseDemand's max(observed, cold) in src/admission.js.
  */
 export function observedGroupCpuCores(pgid) {
   if (!pgid) return null;
@@ -185,12 +205,7 @@ export function observedGroupCpuCores(pgid) {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
     });
-    const values = out
-      .split('\n')
-      .map((s) => Number(s.trim()))
-      .filter((n) => Number.isFinite(n));
-    if (values.length === 0) return null;
-    return values.reduce((sum, v) => sum + v, 0) / 100;
+    return parseGroupCpuOutput(out);
   } catch {
     return null;
   }

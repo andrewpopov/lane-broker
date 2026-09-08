@@ -28,6 +28,17 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // run itself. Without this, three or more conflicting keys can starve a
   // head forever by alternating which other ticket is held.
   conflictSkipLimit: 3,
+  // BRAIN-207 (forgiving admission): whether the load gate is allowed to
+  // deny a start at all. Default false — the gate is informational-only
+  // (still sampled every poll, still logged) until an operator opts back
+  // into hard denial. `true` reproduces every byte of the pre-BRAIN-207
+  // behaviour, idle-exemption included.
+  admissionLoadGate: false,
+  // Lanes are spawned under `nice -n <laneNice>` by default so a heavy test
+  // run doesn't starve interactive work on a shared machine. 0 disables
+  // niceing (spawns the bare command). A `.lane-broker.json` lane's own
+  // `nice` overrides this per-lane.
+  laneNice: 10,
 };
 
 export const DEFAULT_REPO_CONFIG = {
@@ -87,6 +98,11 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isInteger(cfg.conflictSkipLimit) && cfg.conflictSkipLimit >= 0,
     `${sourcePath}: "conflictSkipLimit" must be a non-negative integer`,
   );
+  assert(typeof cfg.admissionLoadGate === 'boolean', `${sourcePath}: "admissionLoadGate" must be a boolean`);
+  assert(
+    Number.isInteger(cfg.laneNice) && cfg.laneNice >= 0 && cfg.laneNice <= 19,
+    `${sourcePath}: "laneNice" must be an integer in [0, 19]`,
+  );
 }
 
 function validateRepoConfig(cfg, sourcePath) {
@@ -98,6 +114,12 @@ function validateRepoConfig(cfg, sourcePath) {
     assert(Number.isFinite(lane.weight) && lane.weight > 0, `${sourcePath}: lane "${name}".weight must be a positive number`);
     if (lane.localRefused !== undefined) {
       assert(typeof lane.localRefused === 'boolean', `${sourcePath}: lane "${name}".localRefused must be a boolean`);
+    }
+    if (lane.nice !== undefined) {
+      assert(
+        Number.isInteger(lane.nice) && lane.nice >= 0 && lane.nice <= 19,
+        `${sourcePath}: lane "${name}".nice must be an integer in [0, 19]`,
+      );
     }
   }
   if (cfg.conflicts !== undefined) {
@@ -314,6 +336,10 @@ export function resolveTicketConfig({ cwd, repo, lane }) {
     key,
     weight: laneCfg.weight,
     localRefused: Boolean(laneCfg.localRefused),
+    // null (not defaulted here) when the lane doesn't declare its own nice:
+    // the caller (run.js) applies the global `laneNice` fallback, the same
+    // "per-lane overrides global" shape as everything else in this file.
+    nice: Number.isInteger(laneCfg.nice) ? laneCfg.nice : null,
     conflicts,
   };
 }
