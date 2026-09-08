@@ -5,8 +5,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { freshEnv } from './helpers.js';
-import { paths, atomicWriteJson, readJsonSafe, fingerprintOf } from '../src/state.js';
+import { paths, atomicWriteJson, readJsonSafe, fingerprintOf, bootId } from '../src/state.js';
 import { enqueue, tryStart } from '../src/scheduler.js';
+import { writeLease, LEASE_STATE } from '../src/lease.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 
 const srcDir = fileURLToPath(new URL('../src', import.meta.url));
@@ -43,12 +44,48 @@ async function enqueueTicket(state, overrides = {}) {
   return ticket;
 }
 
+/**
+ * BRAIN-197: the load gate no longer blocks an idle broker, so every test
+ * in this file that means to exercise the gate itself (not the idle
+ * exemption) needs a live, NON-CONFLICTING holder lease with capacity to
+ * spare — otherwise `tryStart` never even reaches the config-under-lock
+ * codepaths these tests exist to pin, it just falls through the exemption.
+ * Different key from the ticket under test, fresh heartbeat, and this test
+ * process's own (alive) pid so it survives the `reapAll` pass tryStart runs
+ * on every poll.
+ */
+function holdLease(state, overrides = {}) {
+  const lease = {
+    id: 'holder-1',
+    key: 'repo/holder-lane',
+    bootId: bootId(),
+    supervisorPid: process.pid,
+    supervisorStart: null,
+    childPgid: null,
+    heartbeatAt: Date.now(),
+    admittedAt: Date.now(),
+    cwd: '/tmp',
+    cmd: ['sleep', '999'],
+    weight: 1,
+    logPath: '/tmp/holder-log',
+    resultPath: '/tmp/holder-result',
+    state: LEASE_STATE.RUNNING,
+    ...overrides,
+  };
+  writeLease(state, lease);
+  return lease;
+}
+
 test('tryStart re-reads config INSIDE the lock: a stale outer cfg cannot make an already-superseded gate transition authoritative', async () => {
   const { state } = freshEnv();
 
   const cfgA = makeCfg({ loadOpenSamples: 1, loadClose: 10, loadOpen: 5 });
   const cfgB = makeCfg({ loadOpenSamples: 3, loadClose: 10, loadOpen: 5 });
 
+  // BRAIN-197: without a held lease the broker reads idle and the gate is
+  // exempted outright, which would make this test pass without ever
+  // reaching the reloadCfg codepath it exists to pin.
+  holdLease(state);
   const ticket = await enqueueTicket(state);
   // Gate is CLOSED under cfgA, no consecutive-under samples yet.
   persistClosedGate(state, cfgA, 0);
@@ -75,6 +112,10 @@ test('control: when reloadCfg returns the SAME stale cfg, one under-sample is en
 
   const cfgA = makeCfg({ loadOpenSamples: 1, loadClose: 10, loadOpen: 5 });
 
+  // Same reasoning as the test above: a held lease keeps the gate genuinely
+  // in play, so this control proves the harness reopens the gate on its
+  // own merits, not because the broker happened to be idle.
+  holdLease(state);
   const ticket = await enqueueTicket(state);
   persistClosedGate(state, cfgA, 0);
 
@@ -120,6 +161,15 @@ test('MUTATION: tryStart ignoring reloadCfg (using globalCfg instead) makes the 
       logPath: '/tmp/log',
       resultPath: '/tmp/result',
     };
+    // BRAIN-197: this is the dangerous case. Under the idle exemption BOTH
+    // the real scheduler and this mutant would start an idle ticket for the
+    // same (wrong) reason — an empty `held`, not a bypassed reloadCfg — so
+    // the assertion below would throw either way and the test would keep
+    // passing without proving anything about the BRAIN-182 guard. A live,
+    // non-conflicting holder keeps the gate genuinely applying to both the
+    // real and the mutant scheduler, so only the mutant's ignored reloadCfg
+    // makes it start.
+    holdLease(state);
     await mutantEnqueue(state, ticket);
     persistClosedGate(state, cfgA, 0);
 

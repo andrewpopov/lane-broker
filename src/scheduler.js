@@ -238,7 +238,19 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       const reason = fs.readFileSync(paths(root).pause, 'utf8').trim();
       return { result: { started: false, reason: 'paused', pauseReason: reason } };
     }
+    // The gate must still be SAMPLED unconditionally (its hysteresis
+    // countdown depends on every poll observing a sample, closed broker or
+    // not), but a gate closed by load the broker itself never generated
+    // must not starve a broker that is holding nothing. `held` only counts
+    // RUNNING/ORPHANED leases, so this is exactly "nothing is running or
+    // might still be running" — not "nothing conflicts with this ticket"
+    // and not a zero-weight reading, which a corrupt/legacy lease missing
+    // `weight` could satisfy while genuinely busy. The exemption is
+    // self-limiting: the instant this ticket's lease is written below,
+    // held.length > 0 and the gate resumes blocking everything behind it,
+    // so at most one lane ever starts on a closed gate (BRAIN-197).
     const gate = sampleAndUpdateGate(root, cfg, loadSampler);
+    const brokerIdle = held.length === 0;
     // Phase 1 (ZIRK scheduler project, shadow-mode admission — see
     // src/admission.js): computed on every poll that reaches this point,
     // regardless of schedulerMode, so shadow and active log identically and
@@ -247,8 +259,14 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // here, inside the lock; the sample itself was already taken above.
     const cpuDecision = evaluateNewAdmission(root, cfg, ticket, held, cpuSample);
     const logBase = { candidateId: ticket.id, mode: cfg.schedulerMode, ...cpuDecision };
+    // What the CURRENT rule would decide, for telemetry (BRAIN-198's shadow
+    // ledger needs to tell an ordinary admission from one only the idle
+    // exemption allowed) — applies to every branch below that ends in a
+    // start, not just the final one, since active-mode CPU denial can still
+    // veto an idle-exempt admission.
+    const baselineReason = gate.closed && brokerIdle ? 'idle-exempt' : 'ok';
 
-    if (gate.closed) {
+    if (gate.closed && !brokerIdle) {
       return {
         result: { started: false, reason: 'load-gate-closed', load: gate.lastLoad },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'load-gate-closed' },
@@ -274,7 +292,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
           projectedBusy: cpuDecision.projectedBusy,
           budget: cpuDecision.budget,
         },
-        logFields: { ...logBase, currentDecision: 'start', currentReason: 'ok' },
+        logFields: { ...logBase, currentDecision: 'start', currentReason: baselineReason },
       };
     }
     if (ticket.id !== headTicket.id && headConflicted) {
@@ -309,7 +327,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       state: LEASE_STATE.RUNNING,
     };
     writeLease(root, lease);
-    return { result: { started: true, lease }, logFields: { ...logBase, currentDecision: 'start', currentReason: 'ok' } };
+    return { result: { started: true, lease }, logFields: { ...logBase, currentDecision: 'start', currentReason: baselineReason } };
   });
 
   // Pure telemetry: nothing reads this back to make a decision, so it never

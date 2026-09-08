@@ -3,13 +3,45 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, writeLoadFile, laneRun, laneSpawn, sleep, waitFor } from './helpers.js';
-import { paths, readJsonSafe } from '../src/state.js';
+import { paths, readJsonSafe, bootId } from '../src/state.js';
+import { writeLease, LEASE_STATE } from '../src/lease.js';
+
+/**
+ * BRAIN-197: the load gate no longer blocks an idle broker, so a gate test
+ * that expects a closed gate to refuse a start needs a live, NON-CONFLICTING
+ * holder lease (different key, capacity to spare) or the candidate would sail
+ * through on the idle exemption before the gate mechanics under test ever
+ * run. Fresh heartbeat + this test process's own (alive) pid, matching
+ * bootId, so it survives the real supervisor's own reapAll pass.
+ */
+function holdLease(state, overrides = {}) {
+  const lease = {
+    id: 'holder-1',
+    key: 'repo/holder-lane',
+    bootId: bootId(),
+    supervisorPid: process.pid,
+    supervisorStart: null,
+    childPgid: null,
+    heartbeatAt: Date.now(),
+    admittedAt: Date.now(),
+    cwd: '/tmp',
+    cmd: ['sleep', '999'],
+    weight: 1,
+    logPath: '/tmp/holder-log',
+    resultPath: '/tmp/holder-result',
+    state: LEASE_STATE.RUNNING,
+    ...overrides,
+  };
+  writeLease(state, lease);
+  return lease;
+}
 
 test('load gate: refuses to start while closed, starts once it reopens after enough consecutive low samples', async () => {
   const { base, home, state, env: baseEnv } = freshEnv();
   writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 10, loadOpen: 5, loadOpenSamples: 2, sampleMs: 150 });
   const repoDir = path.join(base, 'repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
+  holdLease(state);
 
   const loadFile = writeLoadFile(base, 20); // closed
   const env = { ...baseEnv, LANE_BROKER_LOADAVG_FILE: loadFile };
@@ -39,6 +71,7 @@ test('load gate: a config edit raising loadOpen mid-flight lets a stuck gate reo
   writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 15, loadOpen: 11, loadOpenSamples: 2, sampleMs: 150 });
   const repoDir = path.join(base, 'repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
+  holdLease(state);
 
   const loadFile = writeLoadFile(base, 20); // above loadClose (15); closes the gate
   const env = { ...baseEnv, LANE_BROKER_LOADAVG_FILE: loadFile };
@@ -86,4 +119,32 @@ test('load gate: a config edit raising loadOpen mid-flight lets a stuck gate reo
 
   const lease = await waitFor(() => fs.existsSync(path.join(paths(state).leases, `${id}.json`)), { timeoutMs: 5000 });
   assert.ok(lease, 'should start once the reloaded config raises loadOpen above the current load');
+});
+
+test('BRAIN-197: an idle broker (no held leases) starts its head immediately even while the load gate is closed', async () => {
+  const { base, home, state, env: baseEnv } = freshEnv();
+  writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 10, loadOpen: 5, loadOpenSamples: 2, sampleMs: 150 });
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
+  // Deliberately no holdLease() here: the broker holds nothing, so the
+  // closed gate below must not block this admission at all.
+
+  const loadFile = writeLoadFile(base, 20); // closed, and stays closed for the whole test
+  const env = { ...baseEnv, LANE_BROKER_LOADAVG_FILE: loadFile };
+
+  const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', 'sleep', '1'], { env, cwd: repoDir });
+  const id = await new Promise((resolve) => {
+    let out = '';
+    child.stdout.on('data', (d) => {
+      out += d;
+    });
+    child.on('exit', () => resolve(out.trim()));
+  });
+  assert.ok(id, 'lane run --detach should print an id');
+
+  const lease = await waitFor(() => fs.existsSync(path.join(paths(state).leases, `${id}.json`)), { timeoutMs: 5000 });
+  assert.ok(lease, 'an idle broker must start its head even though the load gate never reopened');
+
+  const gateState = readJsonSafe(paths(state).loadGate);
+  assert.equal(gateState?.closed, true, 'the gate itself must still read closed: the exemption bypasses it, it does not reopen it');
 });
