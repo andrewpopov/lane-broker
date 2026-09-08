@@ -2,15 +2,16 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor } from './helpers.js';
+import { paths } from '../src/state.js';
 import { runCommand } from '../src/run.js';
 
 function setup() {
-  const { base, home, env } = freshEnv();
+  const { base, home, state, env } = freshEnv();
   writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
   const repoDir = path.join(base, 'repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
-  return { base, home, repoDir, env };
+  return { base, home, state, repoDir, env };
 }
 
 test('--detach prints the id and the --log path exists immediately, before the child produces output', async () => {
@@ -69,10 +70,22 @@ test('a supervisor that fails to spawn synchronously never prints an id and exit
 });
 
 test('lane run --timeout names the lane as QUEUED with a position when it never reached the head', async () => {
-  const { repoDir, env } = setup();
+  const { state, repoDir, env } = setup();
   // Occupy the only capacity slot on the same key so the second run stays queued.
   const blockerPromise = laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'sleep', '2'], { env, cwd: repoDir });
-  await new Promise((resolve) => setTimeout(resolve, 300));
+  // Synchronize on the blocker's actual admission (its lease exists) rather
+  // than sleeping a fixed delay and assuming it got there first -- a sleep
+  // only proves elapsed time, not that the blocker was admitted before the
+  // second run below is even submitted.
+  await waitFor(() => {
+    let names;
+    try {
+      names = fs.readdirSync(paths(state).leases).filter((n) => n.endsWith('.json'));
+    } catch {
+      return false;
+    }
+    return names.length > 0;
+  });
 
   const timedOut = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--timeout', '300ms', '--', 'true'], {
     env,

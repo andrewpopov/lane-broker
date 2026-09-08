@@ -6,6 +6,17 @@ export { isPidAlive, processStartTime };
 
 export const LEASE_STATE = { RUNNING: 'RUNNING', ORPHANED: 'ORPHANED', DONE: 'DONE' };
 
+/**
+ * How long a reader tolerates a ticket id being neither queued, leased, nor
+ * resulted before concluding it doesn't exist. A `lane run`/`lane wait`
+ * supervisor is spawned before it has enqueued its own ticket, and
+ * `tryStart` (scheduler.js) dequeues a ticket and only then writes its lease
+ * -- an unlocked reader can land in either gap. One shared constant so both
+ * readers (src/wait.js, src/run.js) tolerate the same race the same way,
+ * rather than each guessing its own window.
+ */
+export const NOT_FOUND_GRACE_MS = 3000;
+
 export function leaseFile(root, id) {
   return path.join(paths(root).leases, `${id}.json`);
 }
