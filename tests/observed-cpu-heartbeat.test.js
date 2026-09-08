@@ -44,7 +44,7 @@ test('a real running lane\'s lease gets a numeric observedCpuCores from a live h
 
   // Busy-loop so there is real, non-zero CPU for `ps` to observe within a
   // couple of heartbeat intervals, rather than racing a near-idle `sleep`.
-  const cmd = ['node', '-e', 'const end = Date.now() + 3000; while (Date.now() < end) { Math.sqrt(Math.random()); }'];
+  const cmd = ['node', '-e', 'const end = Date.now() + 12000; while (Date.now() < end) { Math.sqrt(Math.random()); }'];
   const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', ...cmd], { env, cwd: repoDir });
 
   const leaseId = await waitFor(() => {
@@ -62,10 +62,17 @@ test('a real running lane\'s lease gets a numeric observedCpuCores from a live h
       const l = readLease(state, leaseId);
       return l && Number.isFinite(l.observedCpuCores) ? l : null;
     },
-    { timeoutMs: 5000 },
+    // Generous on purpose: under a loaded host three node startups (CLI,
+    // supervisor, child) can take seconds, and the busy loop above must
+    // still be alive when the first observation lands — a child that
+    // finished first takes its lease with it and this reads as "never
+    // observed", which is a timing artifact, not the bug this test guards.
+    { timeoutMs: 15000 },
   );
   assert.ok(Number.isFinite(lease.observedCpuCores), 'a live busy child must eventually get a numeric observedCpuCores');
   assert.ok(Number.isFinite(lease.observedAt), 'observedAt must be stamped alongside it');
 
+  // Done observing — don't sit out the rest of the busy loop.
+  try { process.kill(-lease.childPgid, 'SIGKILL'); } catch { /* already gone */ }
   await new Promise((resolve) => child.on('exit', resolve));
 });
