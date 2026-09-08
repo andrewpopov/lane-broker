@@ -2,8 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor } from './helpers.js';
-import { paths } from '../src/state.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun } from './helpers.js';
 import { runCommand } from '../src/run.js';
 
 function setup() {
@@ -69,44 +68,12 @@ test('a supervisor that fails to spawn synchronously never prints an id and exit
   }
 });
 
-test('lane run --timeout names the lane as QUEUED with a position when it never reached the head', async () => {
-  const { state, repoDir, env } = setup();
-  // Occupy the only capacity slot on the same key so the second run stays queued.
-  const blockerPromise = laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'sleep', '2'], { env, cwd: repoDir });
-  // Synchronize on the blocker's actual admission (its lease exists) rather
-  // than sleeping a fixed delay and assuming it got there first -- a sleep
-  // only proves elapsed time, not that the blocker was admitted before the
-  // second run below is even submitted.
-  await waitFor(() => {
-    let names;
-    try {
-      names = fs.readdirSync(paths(state).leases).filter((n) => n.endsWith('.json'));
-    } catch {
-      return false;
-    }
-    return names.length > 0;
-  });
-
-  const timedOut = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--timeout', '300ms', '--', 'true'], {
-    env,
-    cwd: repoDir,
-  });
-  assert.equal(timedOut.code, 75, `stderr: ${timedOut.stderr}`);
-  assert.match(timedOut.stderr, /REMAINS QUEUED at position 1 of 1/);
-  assert.match(timedOut.stderr, /next: lane wait/);
-
-  await blockerPromise;
-});
-
-test('lane run --timeout names the lane as RUNNING with an elapsed time once it has started', async () => {
-  const { home, repoDir, env } = setup();
-  writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
-
-  const timedOut = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--timeout', '300ms', '--', 'sleep', '2'], {
-    env,
-    cwd: repoDir,
-  });
-  assert.equal(timedOut.code, 75, `stderr: ${timedOut.stderr}`);
-  assert.match(timedOut.stderr, /is RUNNING \(started/);
-  assert.match(timedOut.stderr, /next: lane wait/);
-});
+// The two `lane run --timeout` state-naming assertions (QUEUED-with-position,
+// RUNNING-with-elapsed-time) that used to live here were moved to
+// tests/run-not-found-grace.test.js (BRAIN-201): they raced real scheduler
+// admission latency against a fixed --timeout window, and that latency was
+// measured on this machine spanning ~200ms to ~68s under contention -- no
+// timeout value makes that deterministic. The fake-supervisor harness in
+// run-not-found-grace.test.js drives the same `describeLaneState` code path
+// with the ticket's queue/lease state set directly and deterministically,
+// with no dependence on real process-admission timing.

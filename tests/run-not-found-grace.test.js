@@ -148,3 +148,70 @@ test('a command that completes during the grace window is reported as finished, 
 
   assert.equal(result.exitCode, 7, `stderr: ${stderr}`);
 });
+
+test('lane run --timeout names the lane as QUEUED with a position when it never reached the head', async () => {
+  const { repoDir, env } = setup();
+
+  const { result, stderr } = await runWithFakeSupervisor({
+    env,
+    cwd: repoDir,
+    timeoutMs: 50,
+    // Deterministic: `enqueue` is called directly on a known schedule (a
+    // short, generous sleep well inside the 50ms deadline check, which only
+    // fires after the run loop's first 200ms poll) and the ticket is never
+    // dequeued or leased by anything -- there is no real scheduler admitting
+    // it. So at the moment `describeLaneState` inspects the queue, this
+    // ticket is provably the sole entry, regardless of machine load. This
+    // does not race real process-admission latency the way the old
+    // `--timeout 300ms` against a real spawned blocker did.
+    choreograph: async (ticket, root) => {
+      await sleep(20);
+      await enqueue(root, ticket);
+    },
+  });
+
+  assert.equal(result.exitCode, 75, `stderr: ${stderr}`);
+  assert.match(stderr, /REMAINS QUEUED at position 1 of 1/);
+  assert.match(stderr, /next: lane wait/);
+});
+
+test('lane run --timeout names the lane as RUNNING with an elapsed time once it has started', async () => {
+  const { repoDir, env } = setup();
+
+  const { result, stderr } = await runWithFakeSupervisor({
+    env,
+    cwd: repoDir,
+    timeoutMs: 50,
+    // Deterministic: `writeLease` is called directly, with a RUNNING state
+    // and a real `startedAt`, on a known schedule (a short sleep well inside
+    // the 50ms deadline check). The result file is never written, so at the
+    // moment `describeLaneState` inspects the lease it is provably present
+    // and RUNNING, regardless of machine load -- this does not race a real
+    // child's actual start time the way the old `--timeout 300ms` against a
+    // real spawned `sleep 2` did.
+    choreograph: async (ticket, root) => {
+      await sleep(20);
+      writeLease(root, {
+        id: ticket.id,
+        key: ticket.key,
+        bootId: bootId(),
+        supervisorPid: process.pid,
+        supervisorStart: null,
+        childPgid: null,
+        heartbeatAt: Date.now(),
+        admittedAt: Date.now(),
+        startedAt: Date.now(),
+        cwd: ticket.cwd,
+        cmd: ticket.cmd,
+        weight: ticket.weight,
+        logPath: ticket.logPath,
+        resultPath: ticket.resultPath,
+        state: LEASE_STATE.RUNNING,
+      });
+    },
+  });
+
+  assert.equal(result.exitCode, 75, `stderr: ${stderr}`);
+  assert.match(stderr, /is RUNNING \(started/);
+  assert.match(stderr, /next: lane wait/);
+});
