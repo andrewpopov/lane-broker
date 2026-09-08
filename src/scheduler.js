@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths, atomicWriteJson, readJsonSafe, withLock, bootId } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, appendHistory } from './state.js';
 import { sampleAndUpdateGate } from './load.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
 import { evaluateNewAdmission, sampleCpuSafe, logAdmissionDecision } from './admission.js';
@@ -140,10 +140,81 @@ export function selectCandidate(queue, held) {
 }
 
 /**
+ * Restricted backfill selection used ONLY once the head's skip allowance is
+ * exhausted (skipExhausted in tryStart). selectCandidate's own filter --
+ * "not conflicting with anything currently HELD" -- is not enough here: the
+ * Codex counterexample that got the first version of this fix rejected
+ * showed that admitting anything held-conflict-free can renew the head's
+ * blocker set forever. Head A conflicts with declared keys B and C; while B
+ * is held, C is free to start; B drains; a fresh B arrives and IS held-
+ * conflict-free (nothing currently held conflicts with it, since the old B
+ * already drained) so it starts too, alternating B/C admissions and never
+ * letting A's conflict genuinely clear. Every admission in that cycle was
+ * legal under selectCandidate's rule and A starves anyway.
+ *
+ * The additional constraint here is condition (a) from BRAIN-202: a
+ * candidate is eligible only if it could never itself become one of the
+ * head's blockers -- i.e. a lease at the candidate's key would not conflict
+ * with the head. That's exactly conflicts(headTicket, lease) -- the SAME
+ * predicate that decided headConflicted above -- applied to a hypothetical
+ * lease carrying the candidate's key. It is intentionally NOT hand-rolled:
+ * conflicts() already knows how to read a ticket's declared conflicts list,
+ * and duplicating that logic here would be the kind of parallel special
+ * case that drifts the moment the declaration format changes.
+ *
+ * Because this filter is strictly NARROWER than selectCandidate's (every
+ * candidate it admits also passes the held-conflict check below), every
+ * backfill admitted from here on can only drain the set of the head's
+ * blockers, never add to it -- restoring the natural starvation bound the
+ * unrestricted version relies on, without needing conflictSkipLimit to fire
+ * a second time.
+ *
+ * Capacity/reservation (condition (b)) is deliberately NOT applied inside
+ * this loop. This function only decides WHICH ticket is eligible, walking
+ * the FIFO queue in the same order and stopping at the same barriers as
+ * selectCandidate (a corrupt/unreadable record stops the walk rather than
+ * being skipped over, same as Codex review finding #7). Folding a capacity
+ * check in here would turn a bounded selection into a search for a smaller
+ * candidate further down the queue if the first eligible one doesn't fit --
+ * explicitly rejected in review, since it would change selection order.
+ * The reservation inequality is enforced exactly once in tryStart, against
+ * the single candidate this function returns, and a failure there denies
+ * the poll outright instead of trying anyone else.
+ */
+function selectBackfillCandidate(queue, held, headTicket) {
+  for (const t of queue) {
+    if (!t) return null;
+    if (conflicts(headTicket, { key: t.key })) continue;
+    if (held.some((l) => conflicts(t, l))) continue;
+    return t;
+  }
+  return null;
+}
+
+/**
  * The single atomic transaction: a ticket starts only when it is selected
  * per selectCandidate() above AND fits capacity AND the load gate is open
  * AND the broker is not paused. No backfill behind a capacity- or
  * gate-blocked head — only a conflict-blocked head is skipped.
+ *
+ * BRAIN-202: once the conflicted head's skip allowance is exhausted,
+ * selection switches to selectBackfillCandidate's restricted rule instead
+ * of stopping entirely (see that function's doc comment for condition (a),
+ * and the headReserve arithmetic below for condition (b)). The combined
+ * guarantee this buys is honest, not absolute -- three qualifications:
+ *   - NOT retroactive. The inequality only constrains admissions made from
+ *     this poll forward; a backfill already admitted before the head became
+ *     exhausted may already be sitting in the capacity being reserved.
+ *   - The load gate and `lane pause` are unaffected and still apply exactly
+ *     as before -- a restricted backfill candidate still has to pass both,
+ *     same as any other candidate reaching this point.
+ *   - Interacts with BRAIN-197's idle exemption: that exemption only fires
+ *     when `held.length === 0`. A restricted backfill keeps something held,
+ *     so if the load gate closes while it runs, the conflicted head loses
+ *     the idle exemption it would otherwise have gotten once the broker
+ *     drained to true idle. This is a real, accepted change to the head's
+ *     liveness conditions -- not worked around here, on purpose (see the
+ *     plan this ticket shipped from).
  *
  * Shadow-mode bookkeeping must not lengthen the hold on the global lock,
  * the most contended resource in the system: the CPU sample is taken
@@ -183,6 +254,14 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     for (const t of listQueue(root)) {
       if (t && t.id !== ticket.id && !isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart })) {
         dequeueSync(root, t.id);
+        // The queue record is gone the instant dequeueSync returns, so this
+        // is the only record that a queued ticket was ever dropped for a
+        // dead supervisor rather than cancelled or started — it must land
+        // somewhere that outlives the deleted file (BRAIN-202), not just
+        // stderr of whichever poll happened to notice. appendHistory is the
+        // same durable, best-effort ledger cancel.js and supervisor.js
+        // already use for "this id is done and here's why".
+        appendHistory(root, { id: t.id, key: t.key, dequeuedDeadSupervisor: true, supervisorPid: t.supervisorPid, at: Date.now() });
       }
     }
     const queue = listQueue(root);
@@ -216,12 +295,34 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     const skipState = readSkipState(root);
     const skipCount = skipState.headId === headTicket.id ? skipState.count : 0;
     const skipExhausted = headConflicted && skipCount >= cfg.conflictSkipLimit;
-    const candidate = !headConflicted ? headTicket : skipExhausted ? null : selectCandidate(queue, held);
+    // Once exhausted, this is no longer "no backfill at all" (BRAIN-202):
+    // selectBackfillCandidate's restricted rule still lets a ticket run
+    // behind the head, as long as it can never become one of the head's
+    // own blockers -- see that function's doc comment for why this is
+    // narrower than, not a relaxation of, the ordinary selectCandidate path.
+    const candidate = !headConflicted ? headTicket : skipExhausted ? selectBackfillCandidate(queue, held, headTicket) : selectCandidate(queue, held);
+    if (skipExhausted && ticket.id === headTicket.id) {
+      // Once exhausted, whatever selectBackfillCandidate found (if anything)
+      // is a bounded exception carved out for a ticket that CANNOT renew the
+      // head's blocker (condition (a) — see that function's doc comment),
+      // never evidence that the head's own conflict has cleared. Reporting
+      // 'not-head' here (as the generic branches below would, since some
+      // other ticket IS the selected candidate) would be a worse diagnostic
+      // than pre-BRAIN-202: it reads as "someone valid is ahead of you,
+      // wait your turn" when the truth is the head is still genuinely
+      // conflict-blocked regardless of what runs alongside it. This check
+      // is scoped to skipExhausted only — before exhaustion, an ordinary
+      // skip-ahead candidate really does mean "not your turn yet" and
+      // 'not-head' remains the right, unchanged answer (see selectCandidate
+      // and the first test in tests/conflict-skip.test.js).
+      const blocker = held.find((l) => conflicts(headTicket, l));
+      return { result: { started: false, reason: 'conflict', with: blocker.id, key: blocker.key } };
+    }
     if (!candidate) {
       // Either nobody in the queue is conflict-free (selectCandidate found
-      // nothing, which implies the head itself conflicts too), or the head's
-      // skip allowance is exhausted and we deliberately stop looking past
-      // it. Either way the head is the one genuinely blocked here.
+      // nothing, which implies the head itself conflicts too), or the
+      // restricted backfill search found nothing eligible either. Either
+      // way the head is the one genuinely blocked here.
       const blocker = held.find((l) => conflicts(headTicket, l));
       if (ticket.id === headTicket.id) {
         return { result: { started: false, reason: 'conflict', with: blocker.id, key: blocker.key } };
@@ -284,7 +385,26 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       };
     }
     const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
-    if (runningWeight + ticket.weight > cfg.capacity) {
+    // Condition (b) from BRAIN-202: a backfill admitted while the head's
+    // skip allowance is exhausted must leave room for the head's OWN
+    // weight too, or condition (a) above is protecting a head that can
+    // never actually get a slot once its conflict clears. This reservation
+    // is NOT retroactive -- it only constrains what's admitted from this
+    // poll forward; backfill admitted before the head became exhausted may
+    // already occupy the capacity being reserved for, and this ticket's own
+    // weight is already counted once in runningWeight+ticket.weight, so the
+    // extra term below is exactly headTicket's weight, never double-counted
+    // (headTicket.weight is 0 when candidate.id === headTicket.id, i.e.
+    // the head is its own candidate and reserves nothing against itself). A
+    // weight-0 head reserves nothing here -- arithmetically fine, but it
+    // also protects nothing, since any capacity at all satisfies the
+    // inequality. Note this also does nothing for a head whose OWN weight
+    // exceeds capacity outright: no backfill can ever satisfy the
+    // inequality, so that head stalls exactly as it would with zero
+    // backfill running -- a pre-existing impossible-head condition, not
+    // something this ticket introduces or fixes.
+    const headReserve = skipExhausted && candidate.id !== headTicket.id ? headTicket.weight : 0;
+    if (runningWeight + ticket.weight + headReserve > cfg.capacity) {
       return {
         result: { started: false, reason: 'capacity', runningWeight, capacity: cfg.capacity },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'capacity' },

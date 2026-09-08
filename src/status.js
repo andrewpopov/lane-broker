@@ -13,6 +13,30 @@ function currentLockHolderPid(root) {
   return owner ? owner.pid : null;
 }
 
+/** BRAIN-202: the incident that motivated the restricted-backfill fix in
+ *  scheduler.js was invisible in `lane status` for nine hours — `elapsed`
+ *  and `heartbeat-age` both describe the SUPERVISOR, which stayed healthy
+ *  the whole time; nothing described the CHILD, which had stopped writing
+ *  output. Five minutes with no write to a lane's own log is the threshold
+ *  below for flagging that, report-only. This is explicitly NOT a "hung"
+ *  detector — a legitimately quiet compile step looks identical to a wedged
+ *  one from mtime alone — so it must never gate an auto-cancel; it only
+ *  gives a human something to look at that they'd otherwise have to derive
+ *  by hand from `ls -la` on the log file. */
+export const LOG_STALE_MS = 5 * 60 * 1000;
+
+/** The age, in ms, of the last write to `logPath`, or null if the path is
+ *  missing, unset, or unreadable — never throws. A lease with no log yet
+ *  (or a log on a since-unmounted volume) must not crash `lane status`. */
+function logMtimeAgeMs(logPath) {
+  if (!logPath) return null;
+  try {
+    return Date.now() - fs.statSync(logPath).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
 export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
   const root = ensureStateDirs().root;
   const cfg = loadGlobalConfig();
@@ -43,6 +67,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       pid: l.childPgid,
       elapsedMs: l.startedAt ? now - l.startedAt : null,
       heartbeatAgeMs: l.heartbeatAt ? now - l.heartbeatAt : null,
+      logAgeMs: logMtimeAgeMs(l.logPath),
       log: l.logPath,
       weight: l.weight,
     }));
@@ -116,9 +141,12 @@ export function renderStatusText(status) {
   } else {
     for (const r of status.running) {
       const flag = r.state === 'ORPHANED' ? ' [ORPHANED]' : '';
+      // Report-only (BRAIN-202): flags a quiet log, never implies the lane
+      // is hung and never feeds any auto-cancel decision — see LOG_STALE_MS.
+      const logFlag = r.logAgeMs != null && r.logAgeMs >= LOG_STALE_MS ? `  no log output for ${fmtMs(r.logAgeMs)}` : '';
       lines.push(
         `  ${r.id}  key=${r.key}  pid=${r.pid ?? '-'}  elapsed=${fmtMs(r.elapsedMs)}  ` +
-          `heartbeat-age=${fmtMs(r.heartbeatAgeMs)}  log=${r.log}${flag}`,
+          `heartbeat-age=${fmtMs(r.heartbeatAgeMs)}  log=${r.log}${logFlag}${flag}`,
       );
     }
   }

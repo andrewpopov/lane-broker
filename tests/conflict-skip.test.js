@@ -137,7 +137,7 @@ test('the skipped head still starts as soon as its conflict clears', async () =>
 // starts too — alternating B/C tickets can keep skipping past A forever
 // unless something explicitly bounds it. ---
 
-test('starvation bound: once a conflict-blocked head has been skipped conflictSkipLimit times, a later ticket may no longer jump ahead of it', async () => {
+test('starvation bound: once the skip allowance is exhausted, a ticket that could BLOCK the head may no longer jump ahead — an unrelated one still may', async () => {
   const { state } = freshEnv();
   const limit = 3;
   const globalCfg = baseCfg({ conflictSkipLimit: limit });
@@ -171,16 +171,86 @@ test('starvation bound: once a conflict-blocked head has been skipped conflictSk
 
   const aResult2 = await tryStart(state, A, globalCfg);
   assert.equal(aResult2.started, false);
-  assert.equal(aResult2.reason, 'conflict', 'once the allowance is exhausted, A is reported as conflict-blocked, not merely skipped');
+  assert.equal(aResult2.reason, 'conflict', 'once the allowance is exhausted, A is reported as conflict-blocked, not merely skipped — even though a restricted backfill candidate exists behind it');
 
+  // A candidate whose key IS one of A's declared conflicts must still be
+  // refused once exhausted: admitting it would renew A's blocker set
+  // (Codex's rotation counterexample) — exactly what the skip limit exists
+  // to bound, and rule (a) must keep bounding it forever, not just for the
+  // first conflictSkipLimit skips.
+  const renewer = baseTicket('renewer', { key: 'c-key' });
+  await enqueue(state, renewer);
+  const renewerResult = await tryStart(state, renewer, globalCfg);
+  assert.equal(renewerResult.started, false);
+  assert.equal(renewerResult.reason, 'not-head', "a candidate that could become one of A's own blockers must never be admitted, exhausted or not");
+
+  // An UNRELATED candidate cannot renew A's blocker set (BRAIN-202): the set
+  // of things that could ever block A can only shrink from here, so
+  // refusing it buys no safety and only idles the machine — this is the
+  // exact 9-hour stall the restricted-backfill rule exists to fix.
   const anotherResult = await tryStart(state, another, globalCfg);
-  assert.equal(anotherResult.started, false);
-  assert.equal(anotherResult.reason, 'not-head', 'the skip allowance is exhausted: a later ticket may no longer jump ahead of the still-blocked head');
+  assert.equal(anotherResult.started, true, 'an unrelated candidate cannot block A, so it is still admitted once the skip allowance is exhausted');
 
   // ...and once that conflict actually clears, A finally starts.
   removeLease(state, 'blocker-final');
   const aResult3 = await tryStart(state, A, globalCfg);
   assert.equal(aResult3.started, true, 'once truly nothing conflicts, the previously-starved head starts');
+});
+
+// --- Codex's second vet finding: the test above only ever injects blockers
+// via writeLease, so it never exercises the actual rotation scenario rule
+// (a) exists for — a candidate carrying one of the head's declared conflict
+// keys, held-conflict-free RIGHT NOW because nothing is currently holding
+// that key, arriving through tryStart itself. This is the counterexample
+// that got the first version of this fix rejected: admit it now, and a
+// later admission at the OTHER declared key would alternate forever,
+// letting A's conflict "clear" in name only. ---
+
+test('rotation counterexample: a candidate at one of the head\'s declared conflict keys is refused even when nothing currently held conflicts with it', async () => {
+  const { state } = freshEnv();
+  const limit = 1;
+  const globalCfg = baseCfg({ conflictSkipLimit: limit });
+
+  const A = baseTicket('A', { key: 'a-key', conflicts: ['b-key', 'c-key'] });
+  await enqueue(state, A);
+
+  // A lease on A's OWN key keeps headConflicted true for the rest of the
+  // test without ever touching b-key/c-key, so any refusal of a b-key/c-key
+  // candidate below can only be rule (a) — never the ordinary held-conflict
+  // check, which would trivially explain it away.
+  writeLease(state, heldLease('self-blocker', 'a-key'));
+
+  // Reach exhaustion via one ordinary skip (limit=1), same shape as the
+  // pre-exhaustion loop in the test above.
+  const filler = baseTicket('filler', { key: 'filler-key' });
+  await enqueue(state, filler);
+  const fillerResult = await tryStart(state, filler, globalCfg);
+  assert.equal(fillerResult.started, true, 'ordinary skip-ahead still works before exhaustion');
+
+  // b-key and c-key are genuinely free right now — nothing holds either.
+  // Under the OLD unrestricted selectCandidate, a ticket at either key would
+  // be perfectly eligible (nothing held conflicts with it); admitting it is
+  // exactly the rotation Codex's counterexample describes.
+  const atB = baseTicket('at-b', { key: 'b-key' });
+  const atC = baseTicket('at-c', { key: 'c-key' });
+  await enqueue(state, atB);
+  await enqueue(state, atC);
+
+  const atBResult = await tryStart(state, atB, globalCfg);
+  assert.equal(atBResult.started, false);
+  assert.equal(
+    atBResult.reason,
+    'not-head',
+    "a candidate at one of A's declared conflict keys is refused even though nothing currently held conflicts with it",
+  );
+
+  const atCResult = await tryStart(state, atC, globalCfg);
+  assert.equal(atCResult.started, false);
+  assert.equal(
+    atCResult.reason,
+    'not-head',
+    'same for the other declared conflict key — rule (a) excludes the whole declared set, not just whatever happens to be held right now',
+  );
 });
 
 test('starvation bound (fail-closed): if the skip count cannot be durably recorded, the conflicted head is never skipped at all', async () => {
