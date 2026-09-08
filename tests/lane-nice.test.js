@@ -4,7 +4,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneSpawn, laneRun, waitFor } from './helpers.js';
-import { paths } from '../src/state.js';
+import { paths, readJsonSafe } from '../src/state.js';
 import { readLease, isGroupAlive } from '../src/lease.js';
 import { resolveNicedSpawn } from '../src/supervisor.js';
 
@@ -71,6 +71,56 @@ test('lane cancel on a niced RUNNING lane still kills the whole process group', 
   if (child.exitCode === null && child.signalCode === null) {
     await new Promise((resolve) => child.on('exit', resolve));
   }
+});
+
+test('a missing command under nice surfaces exit 127 by name (the wrapper, not a spawn error)', async () => {
+  const { base, home, state, env } = freshEnv();
+  writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100, laneNice: 10 });
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
+
+  const child = laneSpawn(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', 'definitely-not-a-command-xyz'],
+    { env, cwd: repoDir },
+  );
+  const id = await new Promise((resolve) => {
+    let out = '';
+    child.stdout.on('data', (d) => {
+      out += d;
+    });
+    child.on('exit', () => resolve(out.trim()));
+  });
+  assert.ok(id, 'lane run --detach should print an id even though the command will fail');
+
+  const resultPath = path.join(paths(state).results, `${id}.json`);
+  const result = await waitFor(() => readJsonSafe(resultPath), { timeoutMs: 5000 });
+  assert.equal(result.exit, 127, `nice execs the missing command in place and reports its own not-found exit; got ${JSON.stringify(result)}`);
+  assert.equal(result.error, undefined, 'this is the wrapper exiting 127, not a structured node spawn-error result');
+});
+
+test('with laneNice: 0, the SAME missing command still produces the old structured spawn-error result (the contract change is bounded to the wrapper)', async () => {
+  const { base, home, state, env } = freshEnv();
+  writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100, laneNice: 0 });
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
+
+  const child = laneSpawn(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', 'definitely-not-a-command-xyz'],
+    { env, cwd: repoDir },
+  );
+  const id = await new Promise((resolve) => {
+    let out = '';
+    child.stdout.on('data', (d) => {
+      out += d;
+    });
+    child.on('exit', () => resolve(out.trim()));
+  });
+  assert.ok(id, 'lane run --detach should print an id even though the command will fail');
+
+  const resultPath = path.join(paths(state).results, `${id}.json`);
+  const result = await waitFor(() => readJsonSafe(resultPath), { timeoutMs: 5000 });
+  assert.equal(result.exit, 1, `a bare spawn of a missing command hits Node's spawn-error handler; got ${JSON.stringify(result)}`);
+  assert.equal(typeof result.error, 'string', 'the old shape carries a structured spawn-error message');
 });
 
 test('laneNice: 0 spawns the bare command with no nice wrapper', () => {

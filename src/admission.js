@@ -18,20 +18,46 @@ export function coldStartEstimate(weight) {
 }
 
 /**
- * leaseDemand = max(observed process-group CPU if available and fresh, the
- * cold-start estimate). `lease.observedCpuCores` is an OPTIONAL field —
- * phase 1 never writes it (see src/cpu.js's observedGroupCpuCores, which
- * exists but isn't wired into the lease lifecycle yet: "for now the
- * cold-start estimate from weight is enough"), so every existing lease file
- * on disk loads fine and falls through to the cold-start branch. When a
- * later phase starts populating it, this is the only function that needs
- * to change.
+ * How long an observed-CPU reading (src/cpu.js's observedGroupCpuCores, via
+ * the supervisor heartbeat) stays usable before leaseDemand falls back to
+ * the cold-start estimate. Codex pre-merge review: without this, a lease
+ * whose job goes idle (or a probe that stops updating for any reason) keeps
+ * its LAST observed figure forever — a one-time 7-core reading on a now-idle
+ * lease would deny admission indefinitely in 'active' mode, and this is what
+ * makes `admissionLoadGate: true` fail to restore byte-for-byte pre-BRAIN-207
+ * behaviour (leaseDemand's bias note is a live admission input, not just
+ * telemetry, once schedulerMode is 'active'). The supervisor heartbeat runs
+ * every `sampleMs` (default 5000ms, see config.js's DEFAULT_GLOBAL_CONFIG) —
+ * so this default TTL is 6x the DEFAULT heartbeat interval, not 3x (an
+ * operator raising sampleMs shortens that margin accordingly); it exists to
+ * survive a couple of missed/slow heartbeats, not to track a fast-changing
+ * live figure.
  */
-export function leaseDemand(lease) {
-  const cold = coldStartEstimate(lease.weight);
+export const OBSERVATION_TTL_MS = 30_000;
+
+/**
+ * leaseDemand = max(observed process-group CPU if available, fresh, and
+ * non-negative, the cold-start estimate). `lease.observedCpuCores` /
+ * `lease.observedAt` are OPTIONAL fields — an old lease file with neither
+ * falls through to the cold-start branch, same fail-safe shape as every
+ * other optional lease field in this codebase.
+ */
+/** The lease's observed CPU (cores) if it is a finite, non-negative reading
+ *  no older than OBSERVATION_TTL_MS; otherwise null. The ONE freshness rule
+ *  both consumers below share — reservedSum (leaseDemand) and the
+ *  externalBusy subtraction — so a stale reading can neither keep denying
+ *  nor keep under-counting ambient load. */
+export function freshObservedCores(lease, now = Date.now()) {
   const observed = lease.observedCpuCores;
-  if (Number.isFinite(observed) && observed >= 0) return Math.max(observed, cold);
-  return cold;
+  const observedAt = lease.observedAt;
+  const fresh = Number.isFinite(observedAt) && now - observedAt <= OBSERVATION_TTL_MS;
+  return fresh && Number.isFinite(observed) && observed >= 0 ? observed : null;
+}
+
+export function leaseDemand(lease, now = Date.now()) {
+  const cold = coldStartEstimate(lease.weight);
+  const observed = freshObservedCores(lease, now);
+  return observed === null ? cold : Math.max(observed, cold);
 }
 
 /**
@@ -174,7 +200,7 @@ export const KNOWN_BIAS_NOTE = 'self-subtracted-when-observed';
  * otherwise until a valid sample arrives. See KNOWN_BIAS_NOTE above for a
  * bias this does NOT correct.
  */
-export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, cpuGateState, cooldownBlocked, cfg }) {
+export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, cpuGateState, cooldownBlocked, cfg, now = Date.now() }) {
   if (!cpuSample || cpuSample.stale || !Number.isFinite(cpuSample.hostBusyCores)) {
     if (heldLeases.length === 0) {
       return { admit: true, reason: 'sample-unavailable-empty', externalBusy: null, projectedBusy: null, budget: null };
@@ -182,12 +208,9 @@ export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, c
     return { admit: false, reason: 'sample-unavailable-held', externalBusy: null, projectedBusy: null, budget: null };
   }
 
-  const brokerObserved = heldLeases.reduce((sum, l) => {
-    const observed = l.observedCpuCores;
-    return sum + (Number.isFinite(observed) && observed >= 0 ? observed : 0);
-  }, 0);
+  const brokerObserved = heldLeases.reduce((sum, l) => sum + (freshObservedCores(l, now) ?? 0), 0);
   const externalBusy = Math.max(0, cpuSample.hostBusyCores - brokerObserved);
-  const reservedSum = heldLeases.reduce((sum, l) => sum + leaseDemand(l), 0);
+  const reservedSum = heldLeases.reduce((sum, l) => sum + leaseDemand(l, now), 0);
   const candidateEstimate = coldStartEstimate(candidateWeight);
   const projectedBusy = externalBusy + reservedSum + candidateEstimate;
   const budget = (cfg.cpuAdmissionPercent / 100) * cpuSample.cores;

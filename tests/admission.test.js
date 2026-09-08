@@ -13,6 +13,7 @@ import {
   sampleAndUpdateCpuGate,
   formatAdmissionLog,
   KNOWN_BIAS_NOTE,
+  OBSERVATION_TTL_MS,
 } from '../src/admission.js';
 import { enqueue, tryStart } from '../src/scheduler.js';
 import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig } from '../src/config.js';
@@ -32,8 +33,9 @@ test('leaseDemand falls back to the cold-start estimate when there is no observe
 });
 
 test('leaseDemand takes the max of a fresh observed measurement and the cold-start estimate', () => {
-  assert.equal(leaseDemand({ weight: 2, observedCpuCores: 3.5 }), 3.5);
-  assert.equal(leaseDemand({ weight: 2, observedCpuCores: 0.1 }), 2, 'cold-start wins when observed is lower');
+  const now = Date.now();
+  assert.equal(leaseDemand({ weight: 2, observedCpuCores: 3.5, observedAt: now }, now), 3.5);
+  assert.equal(leaseDemand({ weight: 2, observedCpuCores: 0.1, observedAt: now }, now), 2, 'cold-start wins when observed is lower');
 });
 
 test('an old lease file with no observedCpuCores field still loads and leaseDemand uses the cold-start branch', () => {
@@ -53,6 +55,31 @@ test('an old lease file with no observedCpuCores field still loads and leaseDema
   const loaded = readLease(state, 'legacy');
   assert.equal(loaded.observedCpuCores, undefined);
   assert.equal(leaseDemand(loaded), 2);
+});
+
+// BRAIN-207 Codex pre-merge review: an observation must expire, or a
+// one-time high reading on a lease that later goes idle denies admission
+// forever in 'active' mode.
+
+test('leaseDemand: a STALE observation (older than OBSERVATION_TTL_MS) falls back to the cold-start estimate', () => {
+  const now = Date.now();
+  const observedAt = now - (OBSERVATION_TTL_MS + 1);
+  assert.equal(
+    leaseDemand({ weight: 2, observedCpuCores: 7, observedAt }, now),
+    2,
+    'a stale high observation must not keep denying forever',
+  );
+});
+
+test('leaseDemand: an observation exactly at the TTL boundary is still fresh (<=, not <)', () => {
+  const now = Date.now();
+  const observedAt = now - OBSERVATION_TTL_MS;
+  assert.equal(leaseDemand({ weight: 2, observedCpuCores: 7, observedAt }, now), 7);
+});
+
+test('leaseDemand: observedCpuCores with no observedAt at all falls back to the cold-start estimate', () => {
+  const now = Date.now();
+  assert.equal(leaseDemand({ weight: 2, observedCpuCores: 7 }, now), 2, 'no observedAt means the reading can never be judged fresh');
 });
 
 test('an old global config file with none of the phase-1 scheduler keys still loads, with their defaults filled in', () => {
@@ -116,7 +143,8 @@ test('evaluateCpuAdmission floors externalBusy at zero when broker-observed CPU 
   const cpuSample = { hostBusyCores: 1.0, cores: 4, stale: false };
   // A held lease reporting more observed CPU than the whole host sample shows
   // (measurement noise/timing skew) must never drive externalBusy negative.
-  const heldLeases = [{ id: 'a', weight: 2, observedCpuCores: 3 }];
+  const now = Date.now();
+  const heldLeases = [{ id: 'a', weight: 2, observedCpuCores: 3, observedAt: now }];
   const result = evaluateCpuAdmission({
     cpuSample,
     heldLeases,
@@ -124,6 +152,7 @@ test('evaluateCpuAdmission floors externalBusy at zero when broker-observed CPU 
     cpuGateState: { closed: false },
     cooldownBlocked: false,
     cfg: { cpuAdmissionPercent: 75 },
+    now,
   });
   assert.equal(result.externalBusy, 0);
   // reservedSum = leaseDemand(max(3, cold 2)) = 3; candidateEstimate = 1 -> projected = 0+3+1 = 4
@@ -516,4 +545,16 @@ test('the admission decision log is written on a deny path too (capacity), not o
   const logged = fs.readFileSync(paths(state).admissionLog, 'utf8');
   assert.match(logged, /candidate=denied-by-capacity/);
   assert.match(logged, /current=deny:capacity/);
+});
+
+test('externalBusy: a STALE observation is not subtracted from hostBusyCores (same TTL as leaseDemand)', () => {
+  const now = 1_000_000;
+  const cfg = { ...DEFAULT_GLOBAL_CONFIG, cpuAdmissionPercent: 100 };
+  const cpuSample = { hostBusyCores: 6, cores: 12, stale: false, sampledAt: now };
+  const heldLeases = [{ weight: 2, observedCpuCores: 5, observedAt: now - OBSERVATION_TTL_MS - 1 }];
+  const result = evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight: 2, cpuGateState: { closed: false }, cooldownBlocked: false, cfg, now });
+  assert.equal(result.externalBusy, 6, 'a stale observation must not be subtracted: externalBusy stays at the raw host reading');
+  const freshLeases = [{ weight: 2, observedCpuCores: 5, observedAt: now }];
+  const fresh = evaluateCpuAdmission({ cpuSample, heldLeases: freshLeases, candidateWeight: 2, cpuGateState: { closed: false }, cooldownBlocked: false, cfg, now });
+  assert.equal(fresh.externalBusy, 1, 'a fresh observation IS subtracted');
 });

@@ -148,14 +148,19 @@ export function sampleHostCpu(root, cpus = os.cpus()) {
  * yet — see src/admission.js). Never throws: a failed pressure probe
  * reports `null`, exactly like a missing CPU sample does elsewhere here.
  */
-export function readMemoryInfo() {
+export function readMemoryInfo(exec = execFileSync) {
   const availableBytes = os.freemem();
   let macPressure = null;
   if (process.platform === 'darwin') {
     try {
-      const out = execFileSync('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'], {
+      // 2s bound (Codex pre-merge review): this now runs INSIDE tryStart's
+      // global lock (see scheduler.js), so a hung `sysctl` must never be
+      // able to hold the lock open indefinitely — a timeout is treated
+      // exactly like any other probe failure (macPressure stays null).
+      const out = exec('sysctl', ['-n', 'kern.memorystatus_vm_pressure_level'], {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 2000,
       }).trim();
       const level = Number(out);
       if (level === 1) macPressure = 'normal';
@@ -198,12 +203,17 @@ export function parseGroupCpuOutput(text) {
  * in state.js. Wired into the supervisor heartbeat (BRAIN-207): telemetry
  * only, folded into leaseDemand's max(observed, cold) in src/admission.js.
  */
-export function observedGroupCpuCores(pgid) {
+export function observedGroupCpuCores(pgid, exec = execFileSync) {
   if (!pgid) return null;
   try {
-    const out = execFileSync('ps', ['-o', '%cpu=', '-g', String(pgid)], {
+    // 2s bound (Codex pre-merge review): this runs synchronously INSIDE the
+    // supervisor heartbeat, so a hung `ps` must never be able to stall
+    // heartbeats/cancellation indefinitely — a timeout is treated exactly
+    // like any other probe failure (null, same as an unknown pgid).
+    const out = exec('ps', ['-o', '%cpu=', '-g', String(pgid)], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2000,
     });
     return parseGroupCpuOutput(out);
   } catch {

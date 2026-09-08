@@ -80,7 +80,12 @@ non-conflicting leases. Set `true` to make a closed gate hard-deny again
 `laneNice` (default `10`, range `0`-`19`): every lane is spawned under `nice
 -n <laneNice>` so a heavy test run doesn't starve interactive work on a
 shared machine. `0` disables niceing (the bare command is spawned with no
-wrapper). A lane's own `nice` in `.lane-broker.json` overrides this.
+wrapper). A lane's own `nice` in `.lane-broker.json` overrides this. Niceing
+changes the launch-failure contract for a missing/non-executable command:
+with `nice > 0`, `nice` itself execs and reports the failure, so the lane's
+recorded exit is `127` (command not found) or `126` (found but not
+executable) instead of the structured spawn-error result a bare (`nice: 0`)
+spawn would have produced.
 
 **Per repo** — `.lane-broker.json`, discovered by walking up from `cwd` to the
 git worktree root (repo identity is the realpath of `git rev-parse

@@ -156,6 +156,54 @@ test('observedGroupCpuCores returns null for a falsy pgid without shelling out',
   assert.equal(observedGroupCpuCores(0), null);
 });
 
+// BRAIN-207 Codex pre-merge review: both probes must be bounded (timeout:
+// 2000 passed to execFileSync) so a hung `ps`/`sysctl` can never hold the
+// supervisor heartbeat (observedGroupCpuCores) or the global admission lock
+// (readMemoryInfo, called from inside tryStart) open indefinitely. A timed-
+// out exec throws (Node surfaces ETIMEDOUT the same way any other
+// execFileSync failure throws), so injecting a throwing exec is exactly
+// what a real timeout looks like from the caller's side.
+
+test('observedGroupCpuCores passes a 2000ms timeout bound to exec, so a hung `ps` cannot stall the heartbeat forever', () => {
+  let capturedOptions = null;
+  const spyExec = (cmd, args, options) => {
+    capturedOptions = options;
+    return ' 10\n';
+  };
+  observedGroupCpuCores(1234, spyExec);
+  assert.equal(capturedOptions.timeout, 2000);
+});
+
+test('readMemoryInfo passes a 2000ms timeout bound to exec, so a hung `sysctl` cannot stall the admission lock forever', { skip: process.platform !== 'darwin' }, () => {
+  let capturedOptions = null;
+  const spyExec = (cmd, args, options) => {
+    capturedOptions = options;
+    return '1';
+  };
+  readMemoryInfo(spyExec);
+  assert.equal(capturedOptions.timeout, 2000);
+});
+
+test('observedGroupCpuCores: an exec that throws (simulating a ps timeout) yields null, not a crash', () => {
+  const timingOutExec = () => {
+    const err = new Error('spawnSync ps ETIMEDOUT');
+    err.code = 'ETIMEDOUT';
+    throw err;
+  };
+  assert.equal(observedGroupCpuCores(1234, timingOutExec), null);
+});
+
+test('readMemoryInfo: an exec that throws (simulating a sysctl timeout) yields a non-denying reading, not a crash', () => {
+  const timingOutExec = () => {
+    const err = new Error('spawnSync sysctl ETIMEDOUT');
+    err.code = 'ETIMEDOUT';
+    throw err;
+  };
+  const info = readMemoryInfo(timingOutExec);
+  assert.equal(info.macPressure, null, 'a timed-out probe degrades to null, same as any other sysctl failure');
+  assert.notEqual(info.macPressure, 'critical');
+});
+
 test('readMemoryInfo never throws and reports a numeric availableBytes', () => {
   const info = readMemoryInfo();
   assert.equal(typeof info.availableBytes, 'number');
