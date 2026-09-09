@@ -1,5 +1,5 @@
 import { ensureStateDirs, paths, readJsonSafe } from './state.js';
-import { readLease } from './lease.js';
+import { readLease, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
 
 function sleep(ms) {
@@ -32,8 +32,8 @@ export async function waitCommand(id, { timeoutMs } = {}) {
   // leased nor resulted is not something we can ever wait for -- fail fast
   // instead of blocking forever on a typo. Tolerate a short grace window so
   // this doesn't race a `lane run --detach` whose supervisor hasn't finished
-  // enqueueing yet.
-  const NOT_FOUND_GRACE_MS = 3000;
+  // enqueueing yet. NOT_FOUND_GRACE_MS is shared with run.js's
+  // describeLaneState (src/lease.js) -- one tolerance for this race, not two.
   let notFoundSince = null;
   try {
     for (;;) {

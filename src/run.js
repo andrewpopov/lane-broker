@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { ensureStateDirs, paths, readJsonSafe } from './state.js';
 import { resolveTicketConfig, reloadGlobalConfig, ConfigError } from './config.js';
-import { isPidAlive, readLease, LEASE_STATE } from './lease.js';
+import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
 
 const supervisorPath = fileURLToPath(new URL('./supervisor.js', import.meta.url));
@@ -30,21 +30,58 @@ function fmtAgo(ms) {
   return `${m}m${s % 60}s`;
 }
 
-/** Precisely name where a still-not-finished lane sits at timeout: queued at
- *  a known position, or running since a known time — never the vague "queued
- *  or running" that reads as "it's running somewhere" regardless of which. */
-function describeLaneState(root, id) {
-  const lease = readLease(root, id);
-  if (lease && (lease.state === LEASE_STATE.RUNNING || lease.state === LEASE_STATE.ORPHANED)) {
-    const startedAgo = lease.startedAt ? fmtAgo(Date.now() - lease.startedAt) : 'an unknown time';
-    return `${id} is RUNNING (started ${startedAgo} ago); next: lane wait ${id} | lane cancel ${id}`;
+/** Format a finished command's result the same way at every call site that
+ *  reads one, instead of repeating the signal/exit branch three times. */
+function resultExit(prefix, result) {
+  if (result.signal) {
+    process.stderr.write(`${prefix}: command terminated by signal ${result.signal}\n`);
+    return 1;
   }
-  const queue = listQueue(root);
-  const idx = queue.findIndex((t) => t.id === id);
-  if (idx !== -1) {
-    return `${id} REMAINS QUEUED at position ${idx + 1} of ${queue.length}; next: lane wait ${id} | lane cancel ${id}`;
+  return result.exit ?? 1;
+}
+
+/**
+ * Precisely name where a still-not-finished lane sits at timeout: queued at
+ * a known position, or running since a known time — never the vague "queued
+ * or running" that reads as "it's running somewhere" regardless of which.
+ *
+ * Neither the lease nor the queue is guaranteed to have the id the instant
+ * the `--timeout` deadline fires: the supervisor may not have finished
+ * enqueueing yet (measured ~200ms after spawn, easily inside a short
+ * --timeout), or the id may be sitting in the publication gap `tryStart`
+ * (scheduler.js) leaves between dequeuing the queue record and writing the
+ * lease. Re-check over NOT_FOUND_GRACE_MS (shared with `lane wait`, see
+ * src/lease.js) before concluding "could not be determined" — prefer any
+ * positive finding, and keep re-reading the result file too, since a command
+ * that finishes and gets reaped during the grace must be reported as
+ * finished, not as indeterminate. This is the price of a determinate answer
+ * on an already-abnormal path: a `lane run --timeout 300ms` against a lane
+ * that genuinely never appears can now take up to ~3.3s to return instead of
+ * ~0.3s, bounded and only on this path.
+ */
+async function describeLaneState(root, id, resultPath) {
+  const graceDeadline = Date.now() + NOT_FOUND_GRACE_MS;
+  for (;;) {
+    const result = readJsonSafe(resultPath);
+    if (result) return { finished: true, result };
+
+    const lease = readLease(root, id);
+    if (lease && (lease.state === LEASE_STATE.RUNNING || lease.state === LEASE_STATE.ORPHANED)) {
+      const startedAgo = lease.startedAt ? fmtAgo(Date.now() - lease.startedAt) : 'an unknown time';
+      return { finished: false, text: `${id} is RUNNING (started ${startedAgo} ago); next: lane wait ${id} | lane cancel ${id}` };
+    }
+
+    const queue = listQueue(root);
+    const idx = queue.findIndex((t) => t.id === id);
+    if (idx !== -1) {
+      return { finished: false, text: `${id} REMAINS QUEUED at position ${idx + 1} of ${queue.length}; next: lane wait ${id} | lane cancel ${id}` };
+    }
+
+    if (Date.now() >= graceDeadline) {
+      return { finished: false, text: `${id} status could not be determined; next: lane wait ${id} | lane cancel ${id}` };
+    }
+    await sleep(50);
   }
-  return `${id} status could not be determined; next: lane wait ${id} | lane cancel ${id}`;
 }
 
 /**
@@ -226,14 +263,14 @@ export async function runCommand({
     for (;;) {
       const result = readJsonSafe(resultPath);
       if (result) {
-        if (result.signal) {
-          process.stderr.write(`lane run: command terminated by signal ${result.signal}\n`);
-          return { exitCode: 1 };
-        }
-        return { exitCode: result.exit ?? 1 };
+        return { exitCode: resultExit('lane run', result) };
       }
       if (deadline && Date.now() > deadline) {
-        process.stderr.write(`lane run: waited ${timeoutMs}ms, not failed — ${describeLaneState(root, id)}\n`);
+        const state = await describeLaneState(root, id, resultPath);
+        if (state.finished) {
+          return { exitCode: resultExit('lane run', state.result) };
+        }
+        process.stderr.write(`lane run: waited ${timeoutMs}ms, not failed — ${state.text}\n`);
         return { exitCode: 75 };
       }
       if (!isPidAlive(supervisor.pid)) {
@@ -242,11 +279,7 @@ export async function runCommand({
         // before concluding it died with nothing to show for it.
         const finalResult = readJsonSafe(resultPath);
         if (finalResult) {
-          if (finalResult.signal) {
-            process.stderr.write(`lane run: command terminated by signal ${finalResult.signal}\n`);
-            return { exitCode: 1 };
-          }
-          return { exitCode: finalResult.exit ?? 1 };
+          return { exitCode: resultExit('lane run', finalResult) };
         }
         // The supervisor exited without ever writing a result: it was cancelled
         // while still queued (or crashed) before the child ever ran.
