@@ -21,6 +21,29 @@ function sleep(ms) {
 }
 
 /**
+ * Drain the microtask queue via a real (never mocked) setImmediate. Node
+ * processes the microtask queue to exhaustion -- including microtasks newly
+ * queued while draining it -- before running any macrotask, so one await of
+ * a real setImmediate is enough to let an arbitrarily deep synchronous
+ * promise chain (e.g. `enqueue`'s uncontested `withLock`, or a whole
+ * `describeLaneState` iteration up to its next real timer) settle, without
+ * depending on how many `.then` hops it happens to take today.
+ */
+function flush() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+/** A promise the test can resolve from outside, to gate a choreograph phase
+ *  on an explicit signal instead of a wall-clock sleep. */
+function deferred() {
+  let resolve;
+  const promise = new Promise((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
+
+/**
  * Run `runCommand` under a fake supervisor that never actually spawns a
  * process. `choreograph(ticket, root)` is free to enqueue/dequeue/lease/
  * result the ticket on whatever schedule the test wants, standing in for the
@@ -41,11 +64,12 @@ async function runWithFakeSupervisor({ env, cwd, timeoutMs, choreograph }) {
     stderr += chunk;
     return origWrite(chunk, ...rest);
   };
+  let choreographDone = Promise.resolve();
   try {
     const spawnSupervisor = (execPath, args, opts) => {
       const ticket = JSON.parse(Buffer.from(opts.env.LANE_BROKER_TICKET, 'base64').toString('utf8'));
       const root = process.env.LANE_BROKER_STATE;
-      Promise.resolve().then(() => choreograph(ticket, root));
+      choreographDone = Promise.resolve().then(() => choreograph(ticket, root));
       // Stand in for the real child_process handle: a pid that is always
       // alive (this test process's own) so `isPidAlive` never mistakes the
       // fake supervisor for one that crashed with nothing to show for it.
@@ -58,6 +82,10 @@ async function runWithFakeSupervisor({ env, cwd, timeoutMs, choreograph }) {
       timeoutMs,
       spawnSupervisor,
     });
+    // Make the fake supervisor's simulated actions -- and any error it
+    // threw -- observable, instead of letting them run as an orphaned,
+    // unawaited promise the test never checks in on.
+    await choreographDone;
     return { result, stderr };
   } finally {
     process.stderr.write = origWrite;
@@ -67,23 +95,27 @@ async function runWithFakeSupervisor({ env, cwd, timeoutMs, choreograph }) {
   }
 }
 
-test('a ticket in the dequeue-before-lease publication gap at timeout is reported RUNNING once the lease lands, never indeterminate', async () => {
+test('a ticket in the dequeue-before-lease publication gap at timeout is reported RUNNING once the lease lands, never indeterminate', async (t) => {
   const { repoDir, env } = setup();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
 
-  const { result, stderr } = await runWithFakeSupervisor({
+  const lease = deferred();
+  const runPromise = runWithFakeSupervisor({
     env,
     cwd: repoDir,
     timeoutMs: 180,
+    // State-driven, not wall-clock: enqueue+dequeue happen immediately (no
+    // real scheduler is involved here -- this fake supervisor IS `tryStart`,
+    // standing in for it), landing the ticket in the dequeue-before-lease
+    // publication gap right away. `writeLease` is held behind an explicit
+    // gate that the test only releases after it has driven the fake clock
+    // past the 180ms deadline and into `describeLaneState`'s grace loop --
+    // so the gap provably straddles the deadline check on every run,
+    // regardless of how fast or slow the machine is.
     choreograph: async (ticket, root) => {
-      // t=50: enqueued, same as a real supervisor would.
-      await sleep(50);
       await enqueue(root, ticket);
-      // t=150: tryStart's dequeueSync fires -- the ticket is now in neither
-      // the queue nor a lease. The 180ms deadline lands inside this gap.
-      await sleep(100);
       dequeueSync(root, ticket.id);
-      // t=250: the lease is finally written, closing the gap.
-      await sleep(100);
+      await lease.promise;
       writeLease(root, {
         id: ticket.id,
         key: ticket.key,
@@ -104,30 +136,80 @@ test('a ticket in the dequeue-before-lease publication gap at timeout is reporte
     },
   });
 
+  // Let the choreograph run its synchronous-to-first-real-wait portion:
+  // enqueue (an uncontested `withLock` never touches a real timer) and the
+  // immediate dequeueSync, up to where it blocks on the lease gate.
+  await flush();
+
+  // Advance the fake clock past `timeoutMs` (180ms). runCommand's main loop
+  // polls every 200ms, so this is the tick that fires its first deadline
+  // check and drops into `describeLaneState`'s grace loop -- at this exact
+  // (virtual) instant the ticket is dequeued but the lease gate is still
+  // held shut.
+  t.mock.timers.tick(200);
+  await flush();
+
+  // Release the gate: the lease lands while `describeLaneState` is polling,
+  // the same shape as the original race but now ordered on purpose.
+  lease.resolve();
+  await flush();
+
+  // Fire describeLaneState's own 50ms poll so it re-reads state and observes
+  // the now-published lease.
+  t.mock.timers.tick(50);
+  await flush();
+
+  const { result, stderr } = await runPromise;
+
   assert.equal(result.exitCode, 75, `stderr: ${stderr}`);
   assert.match(stderr, /is RUNNING \(started/);
   assert.doesNotMatch(stderr, /status could not be determined/);
 });
 
-test('a lane that genuinely never appears still reports indeterminate, bounded by the grace window', async () => {
+test('a lane that genuinely never appears still reports indeterminate, bounded by the grace window', async (t) => {
   const { repoDir, env } = setup();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
 
-  const startedAt = Date.now();
-  const { result, stderr } = await runWithFakeSupervisor({
+  const runPromise = runWithFakeSupervisor({
     env,
     cwd: repoDir,
     timeoutMs: 50,
     // Never enqueue, lease, or result the ticket at all.
     choreograph: async () => {},
   });
-  const elapsedMs = Date.now() - startedAt;
+
+  let settled = false;
+  runPromise.then(() => {
+    settled = true;
+  });
+
+  // Drive the fake clock forward on describeLaneState's own poll granularity
+  // (50ms). Because the clock is virtual, the number of ticks it takes to
+  // settle is a direct, deterministic measurement of the code's own
+  // termination bound -- not a race against real scheduling, so there is no
+  // jitter left to tolerate. Capped well above the expected settle point so
+  // a genuine hang fails the test instead of the runner's own timeout.
+  let elapsedMs = 0;
+  for (let i = 0; i < 80 && !settled; i++) {
+    t.mock.timers.tick(50);
+    elapsedMs += 50;
+    await flush();
+  }
+  assert.ok(settled, `describeLaneState did not settle after ${elapsedMs}ms of virtual time`);
+
+  const { result, stderr } = await runPromise;
 
   assert.equal(result.exitCode, 75, `stderr: ${stderr}`);
   assert.match(stderr, /status could not be determined/);
-  // Proves the grace terminates rather than hangs: it must wait out the
-  // full grace window before giving up, but never much longer than it.
-  assert.ok(elapsedMs >= NOT_FOUND_GRACE_MS, `expected at least the grace window to elapse, got ${elapsedMs}ms`);
-  assert.ok(elapsedMs < NOT_FOUND_GRACE_MS + 2000, `expected the grace window to be bounded, got ${elapsedMs}ms`);
+  // Proves the grace terminates rather than hangs: it must wait out the full
+  // grace window before giving up. The bound is tight (NOT_FOUND_GRACE_MS +
+  // 300ms) because, with a virtual clock, the only slack left is two FIXED,
+  // deterministic overheads rather than real-time jitter: the main run
+  // loop's own 200ms poll cadence (timeoutMs=50 is shorter than that, so the
+  // deadline is only actually noticed on the loop's next 200ms poll) plus
+  // describeLaneState's own 50ms poll granularity.
+  assert.ok(elapsedMs >= NOT_FOUND_GRACE_MS, `expected at least the grace window to elapse, got ${elapsedMs}ms (virtual)`);
+  assert.ok(elapsedMs < NOT_FOUND_GRACE_MS + 300, `expected the grace window to be tightly bounded, got ${elapsedMs}ms (virtual)`);
 });
 
 test('a command that completes during the grace window is reported as finished, not indeterminate', async () => {
