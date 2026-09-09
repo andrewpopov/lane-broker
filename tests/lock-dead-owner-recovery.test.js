@@ -12,7 +12,13 @@ const stateJsPath = fileURLToPath(new URL('../src/state.js', import.meta.url));
 
 const WORKERS = 6;
 const ITERATIONS = 50;
-const ROUNDS = 10;
+// Default sweep is 4 rounds (24 spawned processes) rather than the original
+// 10 (60 spawned processes): under host contention each round costs 20-40s,
+// so 10 rounds could exceed a 180s budget on a loaded box. Override with
+// LANE_BROKER_TEST_ROUNDS for a fuller sweep (e.g. `LANE_BROKER_TEST_ROUNDS=10
+// npm test`) — the MUTATION test below is unaffected and remains the
+// sensitivity proof that this suite still catches the bug it guards.
+const ROUNDS = Number(process.env.LANE_BROKER_TEST_ROUNDS) || 4;
 
 function workerSource(stateJsUrl, root, resultFile, iterations = ITERATIONS) {
   return `

@@ -12,4 +12,15 @@ set -e
 for v in $(git rev-parse --local-env-vars) GIT_QUARANTINE_PATH; do unset "$v"; done
 cd "$(git rev-parse --show-toplevel)"
 npm run lint
-npm test
+# Run the suite through the lane broker itself when it's available, so a
+# pre-push gate on this repo doesn't contend with other lanes on the box.
+# Skip the broker when we're already inside a lane (the inherited lease is
+# reused for `prepush` under the same repo per README "Reentrancy", but a
+# `lane` binary that isn't actually on PATH there must still fall back
+# rather than fail the push outright).
+if [ -z "$LANE_BROKER_LEASE" ] && command -v lane >/dev/null 2>&1; then
+  lane run --repo lane-broker --lane prepush -- npm test
+else
+  echo "pre-push: running npm test directly (no lane broker on PATH, or already inside a lane)"
+  npm test
+fi
