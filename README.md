@@ -9,11 +9,29 @@ Zero runtime dependencies — Node `child_process`/`fs`/`os` only (Node ≥ 20).
 
 ## Install
 
-```
-npm install -g github:andrewpopov/lane-broker#v0.2.2
+**Do not `npm install -g github:owner/repo#tag` directly.** On npm 11.9.0 /
+node 24 that form can exit 0 while leaving a dangling symlink into npm's own
+git-clone cache — an empty package directory with no `bin/lane.js`, even
+though `npm ls -g` still reports the right version. npm later prunes that
+cache and `lane` breaks machine-wide. Pack first, then install the tarball:
+
+```sh
+tmp=$(mktemp -d)
+(cd "$tmp" && npm pack "github:andrewpopov/lane-broker#v0.3.0")
+npm install -g "$tmp"/*.tgz
+rm -rf "$tmp"
 ```
 
-This installs the `lane` command.
+This installs the `lane` command. Verify it by running it, not by reading a
+version — `lane --help` must actually work, and after any upgrade check that
+the installed source really changed (the version string can be correct while
+the code behind it is stale, which is exactly how a merged fix goes
+unnoticed).
+
+Do not reinstall while lanes are running: `npm install -g` replaces the
+package directory, and a supervisor that lazily imports a module afterwards
+exits with `supervisor exited unexpectedly with no result`. Wait until
+`lane status` shows nothing RUNNING or queued.
 
 ## Use
 
