@@ -16,10 +16,6 @@ function setup() {
   return { base, home, state, repoDir, env };
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 /**
  * Drain the microtask queue via a real (never mocked) setImmediate. Node
  * processes the microtask queue to exhaustion -- including microtasks newly
@@ -212,67 +208,98 @@ test('a lane that genuinely never appears still reports indeterminate, bounded b
   assert.ok(elapsedMs < NOT_FOUND_GRACE_MS + 300, `expected the grace window to be tightly bounded, got ${elapsedMs}ms (virtual)`);
 });
 
-test('a command that completes during the grace window is reported as finished, not indeterminate', async () => {
+test('a command that completes during the grace window is reported as finished, not indeterminate', async (t) => {
   const { repoDir, env } = setup();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
 
-  const { result, stderr } = await runWithFakeSupervisor({
+  const resultGate = deferred();
+  const runPromise = runWithFakeSupervisor({
     env,
     cwd: repoDir,
     timeoutMs: 50,
+    // Never enqueued or leased at all -- as if the command ran and finished
+    // entirely inside the startup gap. Writing the result is held behind an
+    // explicit gate the test only releases once it has driven the fake clock
+    // into `describeLaneState`'s grace loop -- so "the result lands well
+    // within NOT_FOUND_GRACE_MS" is state-driven, exercising the exact path
+    // this test names (the grace loop noticing a result, not the main run
+    // loop's own pre-deadline poll), instead of a real `sleep(500)` racing a
+    // real 3000ms grace deadline that a bad enough stall could still lose.
     choreograph: async (ticket, root) => {
-      // Never enqueued or leased at all -- as if the command ran and
-      // finished entirely inside the startup gap -- but the result lands
-      // well within NOT_FOUND_GRACE_MS.
-      await sleep(500);
+      await resultGate.promise;
       atomicWriteJson(ticket.resultPath, { id: ticket.id, exit: 7, signal: null, startedAt: Date.now(), endedAt: Date.now(), waitedMs: 0 });
     },
   });
 
+  await flush();
+
+  // Advance past `timeoutMs` (50ms). The main loop polls every 200ms, so
+  // this is the tick that first notices the deadline and drops into
+  // `describeLaneState`'s grace loop -- at this instant no result exists yet.
+  t.mock.timers.tick(200);
+  await flush();
+
+  // Release the gate: the result lands while describeLaneState is mid-grace.
+  resultGate.resolve();
+  await flush();
+
+  // Fire describeLaneState's own 50ms poll so it re-reads state and observes
+  // the now-written result.
+  t.mock.timers.tick(50);
+  await flush();
+
+  const { result, stderr } = await runPromise;
+
   assert.equal(result.exitCode, 7, `stderr: ${stderr}`);
 });
 
-test('lane run --timeout names the lane as QUEUED with a position when it never reached the head', async () => {
+test('lane run --timeout names the lane as QUEUED with a position when it never reached the head', async (t) => {
   const { repoDir, env } = setup();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
 
-  const { result, stderr } = await runWithFakeSupervisor({
+  // Deterministic: `enqueue` runs immediately in the choreograph microtask
+  // (an uncontested `withLock` never touches a real timer) and the ticket is
+  // never dequeued or leased by anything -- there is no real scheduler
+  // admitting it. `flush()` lets it finish before the fake clock is ever
+  // ticked past the main loop's first 200ms poll, so at the moment
+  // `describeLaneState` inspects the queue this ticket is provably the sole
+  // entry, regardless of machine load -- no real sleep racing anything.
+  const runPromise = runWithFakeSupervisor({
     env,
     cwd: repoDir,
     timeoutMs: 50,
-    // Deterministic: `enqueue` is called directly on a known schedule (a
-    // short, generous sleep well inside the 50ms deadline check, which only
-    // fires after the run loop's first 200ms poll) and the ticket is never
-    // dequeued or leased by anything -- there is no real scheduler admitting
-    // it. So at the moment `describeLaneState` inspects the queue, this
-    // ticket is provably the sole entry, regardless of machine load. This
-    // does not race real process-admission latency the way the old
-    // `--timeout 300ms` against a real spawned blocker did.
     choreograph: async (ticket, root) => {
-      await sleep(20);
       await enqueue(root, ticket);
     },
   });
+
+  await flush();
+  t.mock.timers.tick(200);
+  await flush();
+
+  const { result, stderr } = await runPromise;
 
   assert.equal(result.exitCode, 75, `stderr: ${stderr}`);
   assert.match(stderr, /REMAINS QUEUED at position 1 of 1/);
   assert.match(stderr, /next: lane wait/);
 });
 
-test('lane run --timeout names the lane as RUNNING with an elapsed time once it has started', async () => {
+test('lane run --timeout names the lane as RUNNING with an elapsed time once it has started', async (t) => {
   const { repoDir, env } = setup();
+  t.mock.timers.enable({ apis: ['setTimeout', 'Date'] });
 
-  const { result, stderr } = await runWithFakeSupervisor({
+  // Deterministic: `writeLease` runs immediately in the choreograph
+  // microtask, with a RUNNING state and a real (fake-clock) `startedAt`.
+  // `flush()` lets it land before the fake clock is ever ticked past the
+  // main loop's first 200ms poll. The result file is never written, so at
+  // the moment `describeLaneState` inspects the lease it is provably present
+  // and RUNNING, regardless of machine load -- no real sleep racing a real
+  // child's actual start time.
+  const runPromise = runWithFakeSupervisor({
     env,
     cwd: repoDir,
     timeoutMs: 50,
-    // Deterministic: `writeLease` is called directly, with a RUNNING state
-    // and a real `startedAt`, on a known schedule (a short sleep well inside
-    // the 50ms deadline check). The result file is never written, so at the
-    // moment `describeLaneState` inspects the lease it is provably present
-    // and RUNNING, regardless of machine load -- this does not race a real
-    // child's actual start time the way the old `--timeout 300ms` against a
-    // real spawned `sleep 2` did.
     choreograph: async (ticket, root) => {
-      await sleep(20);
       writeLease(root, {
         id: ticket.id,
         key: ticket.key,
@@ -292,6 +319,17 @@ test('lane run --timeout names the lane as RUNNING with an elapsed time once it 
       });
     },
   });
+
+  // Nudge the fake clock off epoch 0 first: `startedAt: Date.now()` at the
+  // true epoch is `0`, which is falsy and would make `describeLaneState`
+  // report "started an unknown time ago" instead of exercising the elapsed-
+  // time formatting this test is named for.
+  t.mock.timers.tick(1);
+  await flush();
+  t.mock.timers.tick(200);
+  await flush();
+
+  const { result, stderr } = await runPromise;
 
   assert.equal(result.exitCode, 75, `stderr: ${stderr}`);
   assert.match(stderr, /is RUNNING \(started/);
