@@ -45,14 +45,19 @@ function runningRow(overrides = {}) {
   };
 }
 
-test('lane status flags a stale log with "no log output for <duration>"', () => {
+test('lane status flags a stale log with "log file unchanged for <duration>"', () => {
   const text = renderStatusText(baseStatus({ running: [runningRow({ logAgeMs: LOG_STALE_MS + 1000 })] }));
-  assert.match(text, /no log output for \d+m\d+s/);
+  assert.match(text, /log file unchanged for \d+m\d+s/);
 });
 
 test('lane status does not flag a fresh log', () => {
   const text = renderStatusText(baseStatus({ running: [runningRow({ logAgeMs: 5_000 })] }));
-  assert.doesNotMatch(text, /no log output for/);
+  assert.doesNotMatch(text, /log file unchanged for/);
+});
+
+test('lane status never claims "no log output" -- that overstates what an mtime can prove (a capped/discard-mode log can go quiet on disk while the child keeps writing)', () => {
+  const text = renderStatusText(baseStatus({ running: [runningRow({ logAgeMs: LOG_STALE_MS + 1000 })] }));
+  assert.doesNotMatch(text, /no log output/);
 });
 
 test('lane status never calls a quiet log "hung" -- report-only wording', () => {
@@ -89,7 +94,7 @@ test('a missing log file does not flag as stale and does not crash collectStatus
     assert.equal(row.logAgeMs, null, 'a missing log must report null age, not throw');
 
     const text = renderStatusText(status);
-    assert.doesNotMatch(text, /no log output for/, 'null age must never be treated as stale');
+    assert.doesNotMatch(text, /log file unchanged for/, 'null age must never be treated as stale');
   } finally {
     process.env.LANE_BROKER_HOME = prevHome;
     process.env.LANE_BROKER_STATE = prevState;

@@ -166,8 +166,6 @@ test('starvation bound: once the skip allowance is exhausted, a ticket that coul
 
   // The skip allowance is now exhausted. One more conflicting job arrives...
   writeLease(state, heldLease('blocker-final', 'b-key'));
-  const another = baseTicket('another', { key: 'other-key-final' });
-  await enqueue(state, another);
 
   const aResult2 = await tryStart(state, A, globalCfg);
   assert.equal(aResult2.started, false);
@@ -177,7 +175,15 @@ test('starvation bound: once the skip allowance is exhausted, a ticket that coul
   // refused once exhausted: admitting it would renew A's blocker set
   // (Codex's rotation counterexample) — exactly what the skip limit exists
   // to bound, and rule (a) must keep bounding it forever, not just for the
-  // first conflictSkipLimit skips.
+  // first conflictSkipLimit skips. It is enqueued directly behind A, with
+  // nothing else queued yet, so it is the very first candidate
+  // selectBackfillCandidate examines — its rejection can only be rule (a)'s
+  // doing. Without rule (a), the ordinary held-conflict check (selectCandidate)
+  // finds nothing currently held conflicts with 'c-key' (only 'b-key' is
+  // held right now), so this ticket WOULD be selected and started; enqueuing
+  // it behind some other, already-eligible ticket would let that other
+  // ticket win the slot first and make the assertion pass for the wrong
+  // reason, same as the bug this test previously had (Codex review).
   const renewer = baseTicket('renewer', { key: 'c-key' });
   await enqueue(state, renewer);
   const renewerResult = await tryStart(state, renewer, globalCfg);
@@ -188,6 +194,8 @@ test('starvation bound: once the skip allowance is exhausted, a ticket that coul
   // of things that could ever block A can only shrink from here, so
   // refusing it buys no safety and only idles the machine — this is the
   // exact 9-hour stall the restricted-backfill rule exists to fix.
+  const another = baseTicket('another', { key: 'other-key-final' });
+  await enqueue(state, another);
   const anotherResult = await tryStart(state, another, globalCfg);
   assert.equal(anotherResult.started, true, 'an unrelated candidate cannot block A, so it is still admitted once the skip allowance is exhausted');
 

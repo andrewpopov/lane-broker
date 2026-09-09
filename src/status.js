@@ -17,12 +17,17 @@ function currentLockHolderPid(root) {
  *  scheduler.js was invisible in `lane status` for nine hours — `elapsed`
  *  and `heartbeat-age` both describe the SUPERVISOR, which stayed healthy
  *  the whole time; nothing described the CHILD, which had stopped writing
- *  output. Five minutes with no write to a lane's own log is the threshold
- *  below for flagging that, report-only. This is explicitly NOT a "hung"
- *  detector — a legitimately quiet compile step looks identical to a wedged
- *  one from mtime alone — so it must never gate an auto-cancel; it only
- *  gives a human something to look at that they'd otherwise have to derive
- *  by hand from `ls -la` on the log file. */
+ *  output. Five minutes with no change to a lane's own log FILE's mtime is
+ *  the threshold below for flagging that, report-only. This is explicitly
+ *  NOT a "no output" detector: `CappedLogWriter` (src/supervisor.js) caps
+ *  the log at LOG_CAP_BYTES and switches to a discard mode on cap or write
+ *  failure, so a child can be emitting output continuously while the log
+ *  file itself stops changing — the flag can only speak to the file's
+ *  mtime, never to whether the child actually went quiet. Nor is it a
+ *  "hung" detector — a legitimately quiet compile step looks identical to a
+ *  wedged one from mtime alone — so it must never gate an auto-cancel; it
+ *  only gives a human something to look at that they'd otherwise have to
+ *  derive by hand from `ls -la` on the log file. */
 export const LOG_STALE_MS = 5 * 60 * 1000;
 
 /** The age, in ms, of the last write to `logPath`, or null if the path is
@@ -141,9 +146,11 @@ export function renderStatusText(status) {
   } else {
     for (const r of status.running) {
       const flag = r.state === 'ORPHANED' ? ' [ORPHANED]' : '';
-      // Report-only (BRAIN-202): flags a quiet log, never implies the lane
-      // is hung and never feeds any auto-cancel decision — see LOG_STALE_MS.
-      const logFlag = r.logAgeMs != null && r.logAgeMs >= LOG_STALE_MS ? `  no log output for ${fmtMs(r.logAgeMs)}` : '';
+      // Report-only (BRAIN-202): flags a quiet log FILE (mtime), never a
+      // quiet child — a capped/discard-mode log (CappedLogWriter) can leave
+      // the file unchanged while the child keeps writing — and never implies
+      // the lane is hung or feeds any auto-cancel decision. See LOG_STALE_MS.
+      const logFlag = r.logAgeMs != null && r.logAgeMs >= LOG_STALE_MS ? `  log file unchanged for ${fmtMs(r.logAgeMs)}` : '';
       lines.push(
         `  ${r.id}  key=${r.key}  pid=${r.pid ?? '-'}  elapsed=${fmtMs(r.elapsedMs)}  ` +
           `heartbeat-age=${fmtMs(r.heartbeatAgeMs)}  log=${r.log}${logFlag}${flag}`,

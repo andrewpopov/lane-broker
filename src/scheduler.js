@@ -57,14 +57,24 @@ export async function enqueue(root, ticket) {
   });
 }
 
+/** Remove a queue record. Returns whether the ticket is now durably not
+ *  queued: true when there was never a file (nothing to remove), when the
+ *  file was gone by the time we tried (a benign unlink race — ENOENT — the
+ *  end state is identical to a successful unlink), or when the unlink
+ *  actually succeeded. Returns false only for a genuine unlink failure
+ *  (e.g. permissions, a busy/locked file) that leaves the record on disk —
+ *  callers that log a durable "this ticket was dequeued" event must check
+ *  this before doing so, or the log can claim a dequeue that never
+ *  happened while the ticket stays queued. */
 export function dequeueSync(root, id) {
   const file = findQueueFile(root, id);
-  if (file) {
-    try {
-      fs.unlinkSync(file);
-    } catch {
-      // already gone
-    }
+  if (!file) return true;
+  try {
+    fs.unlinkSync(file);
+    return true;
+  } catch (err) {
+    if (err.code === 'ENOENT') return true; // already gone
+    return false;
   }
 }
 
@@ -253,15 +263,20 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // checking who's next.
     for (const t of listQueue(root)) {
       if (t && t.id !== ticket.id && !isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart })) {
-        dequeueSync(root, t.id);
-        // The queue record is gone the instant dequeueSync returns, so this
-        // is the only record that a queued ticket was ever dropped for a
-        // dead supervisor rather than cancelled or started — it must land
-        // somewhere that outlives the deleted file (BRAIN-202), not just
-        // stderr of whichever poll happened to notice. appendHistory is the
-        // same durable, best-effort ledger cancel.js and supervisor.js
-        // already use for "this id is done and here's why".
-        appendHistory(root, { id: t.id, key: t.key, dequeuedDeadSupervisor: true, supervisorPid: t.supervisorPid, at: Date.now() });
+        const removed = dequeueSync(root, t.id);
+        // Only record the event when the record is actually gone. A failed
+        // unlink (dequeueSync returns false) leaves the ticket queued, so
+        // logging the dequeue here would be false — worse, the SAME false
+        // event would then be appended again on every subsequent poll,
+        // since the ticket is still sitting at the head with a dead
+        // supervisor. The queue record being gone is what makes this the
+        // only durable record of the drop (BRAIN-202), not just stderr of
+        // whichever poll happened to notice. appendHistory is the same
+        // durable, best-effort ledger cancel.js and supervisor.js already
+        // use for "this id is done and here's why".
+        if (removed) {
+          appendHistory(root, { id: t.id, key: t.key, dequeuedDeadSupervisor: true, supervisorPid: t.supervisorPid, at: Date.now() });
+        }
       }
     }
     const queue = listQueue(root);
