@@ -140,3 +140,41 @@ test('readMemorySample: a throwing exec degrades to null, never a crash', { skip
     else process.env.LANE_BROKER_MEMORY_FILE = prev;
   }
 });
+
+// Codex pre-merge review (BRAIN-211): Number('') is 0, not NaN, so a
+// field-count-correct but EMPTY override was accepted as a real 0-of-0
+// sample and rendered "HEALTHY 0.0%" — silently contradicting this
+// function's documented fall-through-on-malformed contract. A fixture that
+// fabricates a healthy reading is worse than one that fails outright: it
+// would let a future test pass for entirely the wrong reason.
+test('readMemorySample does not accept blank override fields as a zeroed sample', () => {
+  const prev = process.env.LANE_BROKER_MEMORY_FILE;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-broker-memblank-'));
+  try {
+    for (const blank of [',,', ' , , ', '1,,3']) {
+      const file = path.join(dir, 'memory');
+      fs.writeFileSync(file, blank);
+      process.env.LANE_BROKER_MEMORY_FILE = file;
+      const sample = readMemorySample();
+      // Either it fell through to the real host reading, or (non-darwin) it
+      // returned null. What it must NEVER do is hand back the blanks as a
+      // 0-of-0 sample that classifies as healthy.
+      const fabricated =
+        sample && sample.swapTotalBytes === 0 && sample.swapUsedBytes === 0 && sample.compressorBytes === 0;
+      assert.equal(fabricated, false, `blank override ${JSON.stringify(blank)} was accepted as a zeroed sample`);
+    }
+  } finally {
+    if (prev === undefined) delete process.env.LANE_BROKER_MEMORY_FILE;
+    else process.env.LANE_BROKER_MEMORY_FILE = prev;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Codex also flagged the absence of a zero-total fixture. classifyMemorySample
+// guards the division, but nothing pinned that it stays guarded.
+test('classifyMemorySample: a zero swap total does not divide by zero or emit NaN', () => {
+  const c = classifyMemorySample({ swapUsedBytes: 0, swapTotalBytes: 0, compressorBytes: 0, sampledAt: 1 });
+  assert.ok(Number.isFinite(c.swapUsedPct), 'swapUsedPct must be finite, never NaN');
+  assert.equal(c.swapUsedPct, 0);
+  assert.equal(c.level, 'healthy');
+});

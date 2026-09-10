@@ -14,10 +14,16 @@ function readMemoryOverride() {
   if (!file) return null;
   try {
     const first = fs.readFileSync(file, 'utf8').split('\n')[0].trim();
-    const [usedStr, totalStr, compressorStr] = first.split(',');
-    const swapUsedBytes = Number(usedStr);
-    const swapTotalBytes = Number(totalStr);
-    const compressorBytes = Number(compressorStr);
+    const parts = first.split(',');
+    // Number('') and Number(' ') are 0, not NaN — so a field-count-correct but
+    // EMPTY override (",," ) would coerce to three zeros and be accepted as a
+    // real 0-of-0 sample, rendering "HEALTHY 0.0%" instead of falling through
+    // as this function's contract promises. Reject blank fields explicitly.
+    const numeric = (v) => (typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN);
+    const [usedStr, totalStr, compressorStr] = parts;
+    const swapUsedBytes = numeric(usedStr);
+    const swapTotalBytes = numeric(totalStr);
+    const compressorBytes = numeric(compressorStr);
     if (Number.isFinite(swapUsedBytes) && Number.isFinite(swapTotalBytes) && Number.isFinite(compressorBytes)) {
       return { swapUsedBytes, swapTotalBytes, compressorBytes, sampledAt: Date.now() };
     }
