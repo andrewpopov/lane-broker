@@ -4,6 +4,7 @@ import { ensureStateDirs, paths, withLock, bootId, readJsonSafe } from './state.
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
 import { listQueue, HELD_STATES } from './scheduler.js';
 import { readGateState } from './load.js';
+import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfig } from './config.js';
 
 /** Holder pid of the global lock, read directly off disk — used to name the
@@ -74,6 +75,11 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       // still sampled and reported, never enforced.
       admission: Boolean(cfg.admissionLoadGate),
     },
+    // BRAIN-211: swap/compressor headroom, sampled fresh on every status
+    // call. Purely informational — never an admission input; see memory.js.
+    // null whenever the sample itself is unavailable (non-macOS host, or a
+    // failed probe), never a fabricated reading.
+    memory: classifyMemorySample(readMemorySample()),
     running,
     queued,
     lockError,
@@ -86,6 +92,25 @@ function fmtMs(ms) {
   if (s < 60) return `${s}s`;
   const m = Math.floor(s / 60);
   return `${m}m${s % 60}s`;
+}
+
+function fmtMB(bytes) {
+  if (bytes == null || !Number.isFinite(bytes)) return '?';
+  return `${(bytes / (1024 * 1024)).toFixed(0)}MB`;
+}
+
+/** BRAIN-211: the memory line is informational-only, always — there is no
+ *  admission flag to gate it on like loadGate.admission, since nothing ever
+ *  reads this reading back for a start decision. */
+function renderMemoryLine(memory) {
+  if (!memory) {
+    return 'memory: unavailable (no swap sample — see docs on BRAIN-211) [informational]';
+  }
+  const compressor = memory.compressorBytes == null ? '' : `, compressor ${fmtMB(memory.compressorBytes)}`;
+  return (
+    `memory: ${memory.level.toUpperCase()} (swap ${fmtMB(memory.swapUsedBytes)}/${fmtMB(memory.swapTotalBytes)}` +
+    ` ${memory.swapUsedPct.toFixed(1)}%${compressor}) [informational]`
+  );
 }
 
 export function renderStatusText(status) {
@@ -102,6 +127,7 @@ export function renderStatusText(status) {
         `, consecutive-under ${status.loadGate.consecutiveUnder})${informationalSuffix}`,
     );
   }
+  lines.push(renderMemoryLine(status.memory));
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
   if (status.configWarning) {
     lines.push(
