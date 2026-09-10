@@ -51,6 +51,13 @@ export function writeCpuBusyFile(base, hostBusyCores, cores) {
   return file;
 }
 
+/** Memory-telemetry equivalent of writeLoadFile, for LANE_BROKER_MEMORY_FILE. */
+export function writeMemoryFile(base, swapUsedBytes, swapTotalBytes, compressorBytes) {
+  const file = path.join(base, 'memory');
+  fs.writeFileSync(file, `${swapUsedBytes},${swapTotalBytes},${compressorBytes}`);
+  return file;
+}
+
 /** Spawn `lane <args>` and resolve with { code, stdout, stderr } on exit. */
 export function laneRun(args, { env, cwd } = {}) {
   return new Promise((resolve) => {
