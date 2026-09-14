@@ -51,6 +51,15 @@ export function parseSwapUsage(text) {
 
 const PAGE_SIZE_RE = /page size of (\d+) bytes/;
 const COMPRESSOR_RE = /Pages occupied by compressor:\s*(\d+)\./;
+const FREE_RE = /Pages free:\s*(\d+)\./;
+const INACTIVE_RE = /Pages inactive:\s*(\d+)\./;
+const SPECULATIVE_RE = /Pages speculative:\s*(\d+)\./;
+
+/** Shared page-size extraction for every vm_stat parser below. */
+function parseVmStatPageSize(text) {
+  const match = PAGE_SIZE_RE.exec(text || '');
+  return match ? Number(match[1]) : NaN;
+}
 
 /**
  * Pure parse of `vm_stat`'s raw text into `{ pageSize, compressorPages }`.
@@ -58,14 +67,38 @@ const COMPRESSOR_RE = /Pages occupied by compressor:\s*(\d+)\./;
  * half-fabricated reading.
  */
 export function parseVmStat(text) {
-  const pageSizeMatch = PAGE_SIZE_RE.exec(text || '');
+  const pageSize = parseVmStatPageSize(text);
   const compressorMatch = COMPRESSOR_RE.exec(text || '');
-  const pageSize = pageSizeMatch ? Number(pageSizeMatch[1]) : NaN;
   const compressorPages = compressorMatch ? Number(compressorMatch[1]) : NaN;
   if (!Number.isFinite(pageSize) || !Number.isFinite(compressorPages)) {
     return { pageSize: null, compressorPages: null };
   }
   return { pageSize, compressorPages };
+}
+
+/**
+ * Pure parse of `vm_stat`'s raw text into macOS's actually-available memory,
+ * in bytes: (free + inactive + speculative) pages × page size (BRAIN-252).
+ * `os.freemem()` on macOS counts only free pages and so undercounts
+ * available memory by an order of magnitude — inactive and speculative
+ * pages are just as reclaimable on demand. Purgeable pages are deliberately
+ * excluded: on macOS they are a property of pages already counted in
+ * inactive, so adding them would double-count. Requires the page size and
+ * all three counters; any missing/malformed field returns null rather than
+ * a partial, half-fabricated sum.
+ */
+export function parseVmStatAvailable(text) {
+  const pageSize = parseVmStatPageSize(text);
+  const freeMatch = FREE_RE.exec(text || '');
+  const inactiveMatch = INACTIVE_RE.exec(text || '');
+  const speculativeMatch = SPECULATIVE_RE.exec(text || '');
+  const freePages = freeMatch ? Number(freeMatch[1]) : NaN;
+  const inactivePages = inactiveMatch ? Number(inactiveMatch[1]) : NaN;
+  const speculativePages = speculativeMatch ? Number(speculativeMatch[1]) : NaN;
+  if (!Number.isFinite(pageSize) || !Number.isFinite(freePages) || !Number.isFinite(inactivePages) || !Number.isFinite(speculativePages)) {
+    return null;
+  }
+  return pageSize * (freePages + inactivePages + speculativePages);
 }
 
 /**

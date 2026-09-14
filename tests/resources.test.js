@@ -66,6 +66,106 @@ test('Linux capacity follows nested cgroup v2 membership and ancestor limits', (
   assert.equal(snapshot.availableMemoryBytes, 3 * GiB, 'the tighter ancestor remaining-memory limit wins');
 });
 
+const SAMPLE_VM_STAT_TEXT = `Mach Virtual Memory Statistics: (page size of 16384 bytes)
+Pages free:                              105036.
+Pages active:                           1191718.
+Pages inactive:                         1180377.
+Pages speculative:                        10655.
+Pages throttled:                              0.
+Pages wired down:                        227360.
+Pages purgeable:                          30601.
+`;
+
+test('macOS available memory sums free+inactive+speculative pages from vm_stat, excluding purgeable (BRAIN-252)', () => {
+  const snapshot = detectResourceCapacity({
+    platform: 'darwin',
+    parallelism: 8,
+    totalMemory: 48 * 1024 ** 3,
+    // Deliberately different from the vm_stat-derived figure, so the
+    // assertion below cannot pass by the fixture accidentally agreeing
+    // with itself.
+    freeMemory: 1.8 * 1024 ** 3,
+    vmStatText: SAMPLE_VM_STAT_TEXT,
+  });
+  assert.equal(snapshot.availableMemoryBytes, 16384 * (105036 + 1180377 + 10655));
+  assert.ok(snapshot.source.split('+').includes('vm_stat'));
+});
+
+test('macOS falls back to os.freemem when vm_stat output is malformed', () => {
+  const snapshot = detectResourceCapacity({
+    platform: 'darwin',
+    parallelism: 8,
+    totalMemory: 48 * 1024 ** 3,
+    freeMemory: 1.8 * 1024 ** 3,
+    vmStatText: 'not vm_stat output at all',
+  });
+  assert.equal(snapshot.availableMemoryBytes, 1.8 * 1024 ** 3);
+  assert.equal(snapshot.source, 'os');
+});
+
+test('macOS falls back to os.freemem when the vm_stat exec throws', () => {
+  const snapshot = detectResourceCapacity({
+    platform: 'darwin',
+    parallelism: 8,
+    totalMemory: 48 * 1024 ** 3,
+    freeMemory: 1.8 * 1024 ** 3,
+    exec: () => {
+      throw new Error('vm_stat not found');
+    },
+  });
+  assert.equal(snapshot.availableMemoryBytes, 1.8 * 1024 ** 3);
+  assert.equal(snapshot.source, 'os');
+});
+
+test('macOS clamps an implausibly large vm_stat result to total memory', () => {
+  const snapshot = detectResourceCapacity({
+    platform: 'darwin',
+    parallelism: 8,
+    // Small enough that the sample's ~21.2GB parsed figure exceeds it.
+    totalMemory: 4 * 1024 ** 3,
+    freeMemory: 1 * 1024 ** 3,
+    vmStatText: SAMPLE_VM_STAT_TEXT,
+  });
+  assert.equal(snapshot.availableMemoryBytes, 4 * 1024 ** 3);
+  assert.ok(snapshot.source.split('+').includes('vm_stat'));
+});
+
+test('macOS execs vm_stat with a hard 2s bound (timeout + killSignal)', () => {
+  let capturedArgs = null;
+  detectResourceCapacity({
+    platform: 'darwin',
+    parallelism: 8,
+    totalMemory: 48 * 1024 ** 3,
+    freeMemory: 1.8 * 1024 ** 3,
+    exec: (cmd, args, options) => {
+      capturedArgs = { cmd, args, options };
+      return SAMPLE_VM_STAT_TEXT;
+    },
+  });
+  assert.equal(capturedArgs.cmd, 'vm_stat');
+  assert.equal(capturedArgs.options.timeout, 2000);
+  assert.equal(capturedArgs.options.killSignal, 'SIGKILL');
+});
+
+test('Linux ignores vmStatText entirely, even when it is complete and would parse to a different value', () => {
+  const snapshot = detectResourceCapacity({
+    platform: 'linux',
+    parallelism: 8,
+    totalMemory: 32 * 1024 ** 3,
+    freeMemory: 20 * 1024 ** 3,
+    // Complete, valid vm_stat text that would parse to 16384*(105036+1180377+10655)
+    // = ~21.23GB, distinct from the 20GiB freeMemory below — proves the
+    // platform gate actually excludes this path on Linux rather than the
+    // assertion coincidentally matching either value.
+    vmStatText: SAMPLE_VM_STAT_TEXT,
+    readFile: () => {
+      throw new Error('missing');
+    },
+  });
+  assert.equal(snapshot.availableMemoryBytes, 20 * 1024 ** 3);
+  assert.equal(snapshot.source, 'os');
+});
+
 test('ticket resources preserve weight as CPU and memory compatibility estimates', () => {
   assert.deepEqual(resolveTicketResources({ weight: 2, defaultMemoryBytesPerWeight: 1024 }), {
     cpuCores: 2,
