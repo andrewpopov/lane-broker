@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { paths, atomicWriteJson, readJsonSafe } from './state.js';
+import { detectResourceCapacity } from './resources.js';
 
 /**
  * Test-only override, the CPU-gate equivalent of load.js's readLoadAvg /
@@ -139,7 +140,14 @@ export function sampleHostCpu(root, cpus = os.cpus()) {
     // best-effort: a failed sidecar write must never abort admission
   }
   const { hostBusyCores, stale } = computeBusyCores(prev, snapshot);
-  return { hostBusyCores, cores: cpus.length, stale, sampledAt: now };
+  const capacity = detectResourceCapacity({ parallelism: cpus.length });
+  return {
+    hostBusyCores: Number.isFinite(hostBusyCores) ? Math.min(hostBusyCores, capacity.cpuCores) : hostBusyCores,
+    cores: capacity.cpuCores,
+    stale,
+    sampledAt: now,
+    source: capacity.source,
+  };
 }
 
 /**
@@ -149,7 +157,8 @@ export function sampleHostCpu(root, cpus = os.cpus()) {
  * reports `null`, exactly like a missing CPU sample does elsewhere here.
  */
 export function readMemoryInfo(exec = execFileSync) {
-  const availableBytes = os.freemem();
+  const capacity = detectResourceCapacity();
+  const availableBytes = capacity.availableMemoryBytes;
   let macPressure = null;
   if (process.platform === 'darwin') {
     try {
@@ -171,7 +180,33 @@ export function readMemoryInfo(exec = execFileSync) {
       macPressure = null; // sysctl missing/failed: never let this crash a poll
     }
   }
-  return { availableBytes, macPressure };
+  return { availableBytes, totalBytes: capacity.memoryBytes, macPressure, source: capacity.source };
+}
+
+export function parseGroupRssOutput(text) {
+  const values = String(text ?? '')
+    .split('\n')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map(Number)
+    .filter((n) => Number.isFinite(n) && n >= 0);
+  if (values.length === 0) return null;
+  return values.reduce((sum, kib) => sum + kib, 0) * 1024;
+}
+
+/** Best-effort RSS estimate for every process in a worker's process group. */
+export function observedGroupMemoryBytes(pgid, exec = execFileSync) {
+  if (!pgid) return null;
+  try {
+    const out = exec('ps', ['-o', 'rss=', '-g', String(pgid)], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2000,
+    });
+    return parseGroupRssOutput(out);
+  } catch {
+    return null;
+  }
 }
 
 /**

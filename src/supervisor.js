@@ -4,7 +4,7 @@ import { pathToFileURL } from 'node:url';
 import { paths, ensureStateDirs, appendHistory, atomicWriteJson, readJsonSafe } from './state.js';
 import { enqueue, tryStart, dequeueSync } from './scheduler.js';
 import { readLease, writeLease, removeLease, isGroupAlive, processStartTime } from './lease.js';
-import { observedGroupCpuCores } from './cpu.js';
+import { observedGroupCpuCores, observedGroupMemoryBytes } from './cpu.js';
 import { reloadGlobalConfig } from './config.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
@@ -188,10 +188,14 @@ export function resolveNicedSpawn(ticket) {
  * "unknown". Split out so both branches are unit-testable without a real
  * process group.
  */
-export function applyHeartbeatObservation(lease, observed, now = Date.now()) {
+export function applyHeartbeatObservation(lease, observed, now = Date.now(), observedMemoryBytes = null) {
   const update = { ...lease, heartbeatAt: now };
   if (Number.isFinite(observed)) {
     update.observedCpuCores = observed;
+    update.observedAt = now;
+  }
+  if (Number.isFinite(observedMemoryBytes)) {
+    update.observedMemoryBytes = observedMemoryBytes;
     update.observedAt = now;
   }
   return update;
@@ -295,7 +299,8 @@ async function main() {
     const lease = readLease(root, ticket.id);
     if (lease) {
       const observed = child.pid ? observedGroupCpuCores(child.pid) : null;
-      writeLease(root, applyHeartbeatObservation(lease, observed));
+      const observedMemory = child.pid ? observedGroupMemoryBytes(child.pid) : null;
+      writeLease(root, applyHeartbeatObservation(lease, observed, Date.now(), observedMemory));
     }
     if (!cancelling && cancelRequested(root, ticket.id)) {
       cancelling = true;
@@ -328,6 +333,7 @@ async function main() {
       repo: ticket.repoId,
       lane: ticket.lane,
       weight: ticket.weight,
+      resources: ticket.resources,
       ...result,
     });
     removeLease(root, ticket.id); // release always comes last

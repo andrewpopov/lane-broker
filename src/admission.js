@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import { paths, atomicWriteJson, readJsonSafe, fingerprintOf } from './state.js';
 import { sampleHostCpu } from './cpu.js';
+import { evaluateMemoryAdmission, resolveTicketResources } from './resources.js';
 
 /**
  * Cold-start CPU-core estimate for a lease with no observed measurement yet.
@@ -55,7 +56,7 @@ export function freshObservedCores(lease, now = Date.now()) {
 }
 
 export function leaseDemand(lease, now = Date.now()) {
-  const cold = coldStartEstimate(lease.weight);
+  const cold = coldStartEstimate(lease.resources?.cpuCores ?? lease.weight);
   const observed = freshObservedCores(lease, now);
   return observed === null ? cold : Math.max(observed, cold);
 }
@@ -200,7 +201,7 @@ export const KNOWN_BIAS_NOTE = 'self-subtracted-when-observed';
  * otherwise until a valid sample arrives. See KNOWN_BIAS_NOTE above for a
  * bias this does NOT correct.
  */
-export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, cpuGateState, cooldownBlocked, cfg, now = Date.now() }) {
+export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, candidateResources, cpuGateState, cooldownBlocked, cfg, now = Date.now() }) {
   if (!cpuSample || cpuSample.stale || !Number.isFinite(cpuSample.hostBusyCores)) {
     if (heldLeases.length === 0) {
       return { admit: true, reason: 'sample-unavailable-empty', externalBusy: null, projectedBusy: null, budget: null };
@@ -211,9 +212,11 @@ export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, c
   const brokerObserved = heldLeases.reduce((sum, l) => sum + (freshObservedCores(l, now) ?? 0), 0);
   const externalBusy = Math.max(0, cpuSample.hostBusyCores - brokerObserved);
   const reservedSum = heldLeases.reduce((sum, l) => sum + leaseDemand(l, now), 0);
-  const candidateEstimate = coldStartEstimate(candidateWeight);
+  const candidateEstimate = coldStartEstimate(candidateResources?.cpuCores ?? candidateWeight);
   const projectedBusy = externalBusy + reservedSum + candidateEstimate;
-  const budget = (cfg.cpuAdmissionPercent / 100) * cpuSample.cores;
+  const percentBudget = (cfg.cpuAdmissionPercent / 100) * cpuSample.cores;
+  const reserveBudget = Math.max(0, cpuSample.cores - (cfg.cpuReserveCores ?? 0));
+  const budget = Math.min(percentBudget, reserveBudget);
 
   if (cpuGateState.closed) {
     return { admit: false, reason: 'cpu-gate-closed', externalBusy, projectedBusy, budget };
@@ -247,14 +250,9 @@ function unavailableDecision(heldLeases, reason) {
 
 /**
  * Best-effort host CPU sample, wrapped so a sampler failure is treated
- * identically to a missing sample and NEVER throws. Deliberately takes no
- * lock and does no gate/cooldown work. Its cpu-sample.json sidecar IS
- * shared, read-then-write state — see the correctness note on
- * sampleHostCpu in cpu.js for the residual race this deliberately accepts
- * (a monotonic-write guard, not a lock) and why: this is telemetry-only
- * while schedulerMode stays 'shadow', and the measured lock-hold cost of
- * including it inside the lock was not worth paying for that. Called
- * BEFORE tryStart acquires the global mutex.
+ * identically to a missing sample and NEVER throws. The scheduler calls it
+ * while holding the global lock because sampleHostCpu updates shared sample
+ * state used by an active admission decision.
  */
 export function sampleCpuSafe(root, cpuSampler = sampleHostCpu) {
   try {
@@ -267,11 +265,7 @@ export function sampleCpuSafe(root, cpuSampler = sampleHostCpu) {
 /**
  * Glue: update the CPU gate from an already-taken sample, check the
  * cooldown, and run the predicate above — everything the new rule needs for
- * one candidate on one poll. `cpuSample` must come from sampleCpuSafe()
- * called BEFORE the caller acquired the global lock (see its doc comment) —
- * this function only does the part that DOES need to be atomic with the
- * admission decision: the CPU gate's read-then-write of its shared,
- * consecutive-under counter. Caller must hold the global lock.
+ * one candidate on one poll. Caller must hold the global lock.
  *
  * The whole body is wrapped in try/catch (Codex review finding #1): every
  * read/write this touches is already best-effort internally, but this is a
@@ -281,20 +275,38 @@ export function sampleCpuSafe(root, cpuSampler = sampleHostCpu) {
  * here must degrade to the same fail-safe as a missing sample, never abort
  * tryStart (which would kill the caller's detached supervisor).
  */
-export function evaluateNewAdmission(root, cfg, ticket, heldLeases, cpuSample) {
+export function evaluateNewAdmission(root, cfg, ticket, heldLeases, cpuSample, memoryInfo) {
   try {
     const cpuGateState = sampleAndUpdateCpuGate(root, cfg, cpuSample);
     const blocked = cooldownActive(heldLeases, cfg);
-    const result = evaluateCpuAdmission({
+    const candidateResources = resolveTicketResources({
+      weight: ticket.weight,
+      cpuCores: ticket.resources?.cpuCores,
+      memoryBytes: ticket.resources?.memoryBytes,
+      defaultMemoryBytesPerWeight: cfg.defaultMemoryBytesPerWeight,
+    });
+    const cpuResult = evaluateCpuAdmission({
       cpuSample,
       heldLeases,
       candidateWeight: ticket.weight,
+      candidateResources,
       cpuGateState,
       cooldownBlocked: blocked,
       cfg,
     });
+    const memoryResult = memoryInfo
+      ? evaluateMemoryAdmission({ memoryInfo, heldLeases, candidateResources, cfg })
+      : { admit: true, reason: 'not-sampled', projectedAvailableBytes: null, memoryBudgetBytes: null };
     return {
-      ...result,
+      ...cpuResult,
+      admit: cpuResult.admit && memoryResult.admit,
+      reason: !cpuResult.admit ? cpuResult.reason : !memoryResult.admit ? memoryResult.reason : cpuResult.reason,
+      cpuReason: cpuResult.reason,
+      memoryReason: memoryResult.reason,
+      candidateCpuCores: candidateResources.cpuCores,
+      candidateMemoryBytes: candidateResources.memoryBytes,
+      projectedAvailableBytes: memoryResult.projectedAvailableBytes,
+      memoryBudgetBytes: memoryResult.memoryBudgetBytes,
       hostBusyCores: cpuSample ? cpuSample.hostBusyCores : null,
       cores: cpuSample ? cpuSample.cores : null,
       sampleStale: cpuSample ? cpuSample.stale : true,
@@ -332,6 +344,10 @@ export function formatAdmissionLog(f) {
     `externalBusy=${fmt(f.externalBusy)}`,
     `projectedBusy=${fmt(f.projectedBusy)}`,
     `budget=${fmt(f.budget)}`,
+    `candidateCpu=${fmt(f.candidateCpuCores)}`,
+    `candidateMemoryBytes=${f.candidateMemoryBytes ?? 'n/a'}`,
+    `projectedAvailableBytes=${f.projectedAvailableBytes ?? 'n/a'}`,
+    `memoryBudgetBytes=${f.memoryBudgetBytes ?? 'n/a'}`,
     `cpuGate=${f.cpuGateClosed ? 'closed' : 'open'}`,
     `cooldown=${f.cooldownBlocked ? 'blocked' : 'clear'}`,
     `bias=${KNOWN_BIAS_NOTE}`,

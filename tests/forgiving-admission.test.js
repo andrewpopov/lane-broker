@@ -15,7 +15,7 @@ import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 // lease... suppresses the idle exemption").
 
 function makeCfg(overrides) {
-  return { ...DEFAULT_GLOBAL_CONFIG, admissionLoadGate: false, ...overrides };
+  return { ...DEFAULT_GLOBAL_CONFIG, schedulerMode: 'shadow', admissionLoadGate: false, ...overrides };
 }
 
 function persistClosedGate(state, cfg, consecutiveUnder = 0) {

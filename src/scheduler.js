@@ -5,6 +5,7 @@ import { sampleAndUpdateGate } from './load.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
 import { evaluateNewAdmission, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
+import { detectResourceCapacity, effectiveWeightCapacity } from './resources.js';
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
  *  possibly-running work and must count against both conflicts and capacity. */
@@ -249,7 +250,7 @@ function recordCapacitySkip(root, headId) {
  * consume that same capacity indefinitely and could starve the head PERMANENTLY instead of
  * temporarily. Do not add a grace period to this path.
  */
-function resolveCapacityBlock(root, cfg, headId, headWeight, runningWeight, skipCount) {
+function resolveCapacityBlock(root, cfg, headId, headWeight, runningWeight, capacity, skipCount) {
   const phase = skipCount < cfg.conflictSkipLimit ? 'blocked' : 'exhausted';
   const state = readCapacitySkipState(root);
   const sameHead = state.headId === headId;
@@ -260,7 +261,7 @@ function resolveCapacityBlock(root, cfg, headId, headWeight, runningWeight, skip
       headId,
       headWeight,
       runningWeight,
-      capacity: cfg.capacity,
+      capacity,
       skipCount,
       skipLimit: cfg.conflictSkipLimit,
     });
@@ -332,18 +333,10 @@ export function selectCapacityCandidate(queue, held, runningWeight, capacity) {
  * AND the broker is not paused. No backfill behind a capacity- or
  * gate-blocked head — only a conflict-blocked head is skipped.
  *
- * Shadow-mode bookkeeping must not lengthen the hold on the global lock,
- * the most contended resource in the system: the CPU sample is taken
- * BEFORE the lock and passed in, and the admission decision log (pure
- * telemetry nothing reads back) is written AFTER the lock releases, on
- * every path. The CPU sample IS a read-then-write on shared state
- * (cpu-sample.json) — see the correctness note on sampleHostCpu in cpu.js
- * for the residual race this accepts and why, and what changes if
- * schedulerMode ever moves to 'active'. What stays inside this lock is
- * exactly what reads-then-writes shared gate state where a torn
- * interleaving between two supervisors could produce a decision no config
- * ever installed would have produced: the load gate and the CPU gate's
- * consecutive-under counter (see admission.js's evaluateNewAdmission).
+ * Resource sampling and the admission decision share the global lock. CPU
+ * sampling reads and updates cpu-sample.json, so serializing it prevents two
+ * supervisors from diffing the same baseline and admitting concurrently on
+ * inconsistent observations. The decision log remains outside the lock.
  *
  * The config itself is part of that locked, consistent view: `globalCfg`
  * is only the outer snapshot used for `sampleMs` between polls. Everything
@@ -354,13 +347,6 @@ export function selectCapacityCandidate(queue, held, runningWeight, capacity) {
  * a transition the config in effect at decision time would actually produce.
  */
 export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler, reloadCfg = () => globalCfg, memoryReader = readMemoryInfo) {
-  // Every poll samples, regardless of whether this ticket turns out to be
-  // the one actually evaluated below (that requires the locked, consistent
-  // queue/lease view this function doesn't have yet). See cpu.js's
-  // sampleHostCpu for how the sidecar write stays monotonic despite racing
-  // outside this lock.
-  const cpuSample = sampleCpuSafe(root, cpuSampler);
-
   const { result, logFields } = await withLock(root, () => {
     const cfg = reloadCfg() || globalCfg;
     const now = Date.now();
@@ -398,6 +384,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // before selection can even be decided, not just whether the eventual
     // candidate fits.
     const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
+    const weightCapacity = effectiveWeightCapacity(cfg, detectResourceCapacity().cpuCores);
     const headConflicted = held.some((l) => conflicts(headTicket, l));
     const blocker = headConflicted ? held.find((l) => conflicts(headTicket, l)) : null;
     // Starvation bound (Codex review finding #6): a conflict-blocked head
@@ -437,19 +424,19 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // comment) and, deliberately, with NO headBlockGraceMs equivalent (see
     // resolveCapacityBlock's doc comment for why that would be actively
     // wrong here).
-    const headCapacityBlocked = !headConflicted && runningWeight + headTicket.weight > cfg.capacity;
+    const headCapacityBlocked = !headConflicted && runningWeight + headTicket.weight > weightCapacity;
     const capacitySkipState = headCapacityBlocked ? readCapacitySkipState(root) : null;
     const capacitySameHead = headCapacityBlocked && capacitySkipState.headId === headTicket.id;
     const capacitySkipCount = capacitySameHead ? capacitySkipState.count : 0;
     const capacityBlock = headCapacityBlocked
-      ? resolveCapacityBlock(root, cfg, headTicket.id, headTicket.weight, runningWeight, capacitySkipCount)
+      ? resolveCapacityBlock(root, cfg, headTicket.id, headTicket.weight, runningWeight, weightCapacity, capacitySkipCount)
       : null;
     const capacitySkipExhausted = headCapacityBlocked && capacityBlock.phase === 'exhausted';
 
     const candidate = headConflicted
       ? (skipExhausted ? null : selectCandidate(queue, held))
       : headCapacityBlocked
-        ? (capacitySkipExhausted ? null : selectCapacityCandidate(queue, held, runningWeight, cfg.capacity))
+        ? (capacitySkipExhausted ? null : selectCapacityCandidate(queue, held, runningWeight, weightCapacity))
         : headTicket;
     if (!candidate) {
       // Either nobody in the queue is eligible (selectCandidate/
@@ -487,6 +474,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       const reason = fs.readFileSync(paths(root).pause, 'utf8').trim();
       return { result: { started: false, reason: 'paused', pauseReason: reason } };
     }
+    const cpuSample = sampleCpuSafe(root, cpuSampler);
     // The gate must still be SAMPLED unconditionally (its hysteresis
     // countdown depends on every poll observing a sample, closed broker or
     // not), but a gate closed by load the broker itself never generated
@@ -506,7 +494,13 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // only differ in whether the result below is allowed to gate a start.
     // Only the CPU gate's own read-then-write of its shared counter happens
     // here, inside the lock; the sample itself was already taken above.
-    const cpuDecision = evaluateNewAdmission(root, cfg, ticket, held, cpuSample);
+    let memInfo = null;
+    try {
+      memInfo = memoryReader();
+    } catch {
+      memInfo = null;
+    }
+    const cpuDecision = evaluateNewAdmission(root, cfg, ticket, held, cpuSample, memInfo);
     // BRAIN-207: when admissionLoadGate is false the gate is sampled and
     // logged exactly as before (its hysteresis countdown must not stall for
     // want of observation), but it is never allowed to deny — for an idle
@@ -531,9 +525,9 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'load-gate-closed' },
       };
     }
-    if (runningWeight + ticket.weight > cfg.capacity) {
+    if (runningWeight + ticket.weight > weightCapacity) {
       return {
-        result: { started: false, reason: 'capacity', runningWeight, capacity: cfg.capacity },
+        result: { started: false, reason: 'capacity', runningWeight, capacity: weightCapacity },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'capacity' },
       };
     }
@@ -543,12 +537,6 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // exemption should ever bypass). Any other value, a null reading, or a
     // throwing reader all admit — same fail-open tolerance as the CPU/load
     // samplers elsewhere in this function.
-    let memInfo = null;
-    try {
-      memInfo = memoryReader();
-    } catch {
-      memInfo = null;
-    }
     if (memInfo && memInfo.macPressure === 'critical') {
       return {
         result: { started: false, reason: 'memory-critical', macPressure: memInfo.macPressure },
@@ -563,8 +551,9 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       return {
         result: {
           started: false,
-          reason: 'cpu-admission',
-          cpuReason: cpuDecision.reason,
+          reason: cpuDecision.cpuReason !== 'ok' ? 'cpu-admission' : 'memory-admission',
+          cpuReason: cpuDecision.cpuReason,
+          memoryReason: cpuDecision.memoryReason,
           projectedBusy: cpuDecision.projectedBusy,
           budget: cpuDecision.budget,
         },
@@ -605,6 +594,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       cwd: ticket.cwd,
       cmd: ticket.cmd,
       weight: ticket.weight,
+      resources: ticket.resources,
       logPath: ticket.logPath,
       resultPath: ticket.resultPath,
       state: LEASE_STATE.RUNNING,

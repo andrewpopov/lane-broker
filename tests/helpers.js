@@ -30,7 +30,11 @@ export function freshEnv(extra = {}) {
 }
 
 export function writeGlobalConfig(home, cfg) {
-  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(cfg, null, 2));
+  // Most integration tests predate resource admission and exercise another
+  // scheduler dimension. Keep those fixtures independent of ambient host load;
+  // active-admission tests opt in explicitly.
+  const deterministicCfg = { schedulerMode: 'shadow', ...cfg };
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(deterministicCfg, null, 2));
 }
 
 export function writeRepoConfig(dir, cfg) {

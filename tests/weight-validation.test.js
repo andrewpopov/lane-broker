@@ -36,3 +36,40 @@ test('--weight -1 and --weight 0 are also rejected', async () => {
     assert.equal(result.code, 2, `--weight ${bad} should be rejected; stderr: ${result.stderr}`);
   }
 });
+
+test('--cpu and --memory reject malformed values before enqueueing', async () => {
+  const { base, home, env } = freshEnv();
+  writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
+
+  for (const args of [
+    ['--cpu', 'zero'],
+    ['--cpu', '0'],
+    ['--memory', 'lots'],
+    ['--memory', '0'],
+  ]) {
+    const result = await laneRun(['run', ...args, '--', 'true'], { env, cwd: repoDir });
+    assert.equal(result.code, 2, `${args.join(' ')} should be rejected; stderr: ${result.stderr}`);
+  }
+});
+
+test('active admission rejects a permanently impossible request before enqueueing', async () => {
+  const { base, home, state, env } = freshEnv();
+  writeGlobalConfig(home, {
+    version: 1,
+    capacity: 'auto',
+    loadClose: 1000,
+    loadOpen: 900,
+    loadOpenSamples: 1,
+    sampleMs: 100,
+    schedulerMode: 'active',
+  });
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
+
+  const result = await laneRun(['run', '--memory', '999TiB', '--', 'true'], { env, cwd: repoDir });
+  assert.equal(result.code, 64, `stderr: ${result.stderr}`);
+  assert.match(result.stderr, /requested resources exceed this environment's budget/);
+  assert.equal(fs.existsSync(paths(state).queue), false, 'state is not created for an impossible request');
+});

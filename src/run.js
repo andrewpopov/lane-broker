@@ -7,6 +7,7 @@ import { ensureStateDirs, paths, readJsonSafe } from './state.js';
 import { resolveTicketConfig, reloadGlobalConfig, ConfigError } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
+import { detectResourceCapacity, leaseResources, resolveTicketResources } from './resources.js';
 
 const supervisorPath = fileURLToPath(new URL('./supervisor.js', import.meta.url));
 
@@ -93,6 +94,8 @@ export async function runCommand({
   repo,
   lane,
   weightOverride,
+  cpuOverride,
+  memoryOverride,
   detach,
   timeoutMs,
   allowLocalSim,
@@ -122,7 +125,12 @@ export async function runCommand({
   // reloadGlobalConfig gives the supervisor's own polling loop.
   const globalCfg = reloadGlobalConfig(undefined);
   const nice = resolved.nice ?? globalCfg.laneNice;
-
+  const resources = resolveTicketResources({
+    weight,
+    cpuCores: cpuOverride ?? resolved.cpuCores,
+    memoryBytes: memoryOverride ?? resolved.memoryBytes,
+    defaultMemoryBytesPerWeight: globalCfg.defaultMemoryBytesPerWeight,
+  });
   const inheritedLease = process.env.LANE_BROKER_LEASE;
   const inheritedKey = process.env.LANE_BROKER_KEY;
   if (inheritedLease) {
@@ -136,10 +144,18 @@ export async function runCommand({
       // under any lane, not just the one it happens to nest inside).
       const prepushUnderSameRepo = resolved.lane === 'prepush' && inheritedRepoId !== null && inheritedRepoId === resolved.repoId;
       if (sameKey || prepushUnderSameRepo) {
+        const inheritedResources = leaseResources(inheritedLeaseRecord, globalCfg);
         if (weight > inheritedLeaseRecord.weight) {
           process.stderr.write(
             `lane run: refusing to widen the inherited lease's weight (have ${inheritedLeaseRecord.weight}, ` +
               `requested ${weight}). Reentrant runs must not exceed the inherited weight.\n`,
+          );
+          return { exitCode: 64 };
+        }
+        if (resources.cpuCores > inheritedResources.cpuCores || resources.memoryBytes > inheritedResources.memoryBytes) {
+          process.stderr.write(
+            `lane run: refusing to widen inherited resources (have ${inheritedResources.cpuCores} CPU / ` +
+              `${inheritedResources.memoryBytes} bytes, requested ${resources.cpuCores} CPU / ${resources.memoryBytes} bytes).\n`,
           );
           return { exitCode: 64 };
         }
@@ -175,6 +191,28 @@ export async function runCommand({
     return { exitCode: 69 };
   }
 
+  // Shadow mode is observational. In active mode, reject a request that can
+  // never fit even on an otherwise idle machine instead of leaving a
+  // permanent FIFO head polling forever. Reentrant runs returned above and
+  // consume no additional machine reservation.
+  const host = detectResourceCapacity();
+  const cpuBudget = Math.max(
+    0,
+    Math.min(host.cpuCores - globalCfg.cpuReserveCores, (globalCfg.cpuAdmissionPercent / 100) * host.cpuCores),
+  );
+  const memoryBudget = Math.max(0, host.memoryBytes - globalCfg.memoryReserveBytes);
+  if (
+    globalCfg.schedulerMode === 'active' &&
+    (resources.cpuCores > cpuBudget || resources.memoryBytes > memoryBudget)
+  ) {
+    process.stderr.write(
+      `lane run: requested resources exceed this environment's budget (` +
+        `${resources.cpuCores}/${cpuBudget.toFixed(2)} CPU cores, ` +
+        `${resources.memoryBytes}/${memoryBudget} memory bytes).\n`,
+    );
+    return { exitCode: 64 };
+  }
+
   const root = ensureStateDirs().root;
   const id = crypto.randomUUID();
   const p = paths(root);
@@ -187,6 +225,7 @@ export async function runCommand({
     repoId: resolved.repoId,
     lane: resolved.lane,
     weight,
+    resources,
     nice,
     conflicts: resolved.conflicts,
     cwd,

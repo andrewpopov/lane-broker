@@ -84,12 +84,12 @@ test('leaseDemand: observedCpuCores with no observedAt at all falls back to the 
 
 test('an old global config file with none of the phase-1 scheduler keys still loads, with their defaults filled in', () => {
   const { home } = freshEnv();
-  writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 15, loadOpen: 11, loadOpenSamples: 3, sampleMs: 5000 });
+  writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 15, loadOpen: 11, loadOpenSamples: 3, sampleMs: 5000, schedulerMode: 'active' });
   const prev = process.env.LANE_BROKER_HOME;
   process.env.LANE_BROKER_HOME = home;
   try {
     const cfg = loadGlobalConfig();
-    assert.equal(cfg.schedulerMode, 'shadow');
+    assert.equal(cfg.schedulerMode, 'active');
     assert.equal(cfg.cpuAdmissionPercent, 75);
     assert.equal(cfg.cpuClosePercent, 90);
     assert.equal(cfg.cpuOpenPercent, 70);
@@ -97,6 +97,9 @@ test('an old global config file with none of the phase-1 scheduler keys still lo
     assert.equal(cfg.admissionCooldownMs, 5000);
     assert.equal(cfg.memoryCloseBytes, 4294967296);
     assert.equal(cfg.memoryOpenBytes, 8589934592);
+    assert.equal(cfg.cpuReserveCores, 1);
+    assert.equal(cfg.memoryReserveBytes, 2147483648);
+    assert.equal(cfg.defaultMemoryBytesPerWeight, 1073741824);
   } finally {
     process.env.LANE_BROKER_HOME = prev;
   }

@@ -4,10 +4,11 @@ import { statusCommand } from '../src/status.js';
 import { cancelCommand } from '../src/cancel.js';
 import { waitCommand } from '../src/wait.js';
 import { pauseCommand, resumeCommand } from '../src/pause.js';
+import { parseByteSize } from '../src/resources.js';
 
 function usage() {
   return `Usage:
-  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--detach]
+  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--detach]
            [--timeout <duration>] [--allow-local-sim] [--log <path>] -- <command...>
   lane status [--json]
   lane cancel <id>
@@ -38,6 +39,20 @@ function parseRunArgs(args) {
           throw new Error(`--weight must be a positive number (got "${raw}")`);
         }
         opts.weightOverride = n;
+        break;
+      }
+      case '--cpu': {
+        const raw = flagArgs[++i];
+        const n = Number(raw);
+        if (!Number.isFinite(n) || n <= 0) throw new Error(`--cpu must be a positive number (got "${raw}")`);
+        opts.cpuOverride = n;
+        break;
+      }
+      case '--memory': {
+        const raw = flagArgs[++i];
+        const bytes = parseByteSize(raw);
+        if (bytes === null) throw new Error(`--memory must be a positive size such as 2GiB or 512MiB (got "${raw}")`);
+        opts.memoryOverride = bytes;
         break;
       }
       case '--detach':
@@ -90,6 +105,8 @@ async function main() {
         repo: opts.repo,
         lane: opts.lane,
         weightOverride: opts.weightOverride,
+        cpuOverride: opts.cpuOverride,
+        memoryOverride: opts.memoryOverride,
         detach: opts.detach,
         timeoutMs: opts.timeout ? parseDurationMs(opts.timeout) : undefined,
         allowLocalSim: opts.allowLocalSim,

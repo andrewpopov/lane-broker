@@ -55,6 +55,8 @@ features like pipes or globbing.
 | `--repo <name>` | Repo label, used only as a fallback for the lease key. When `cwd` is inside a git repo, the git identity (`git rev-parse --git-common-dir`) always wins, so the same repo resolves to the same key whether or not `--repo` is passed; `--repo` only determines the key outside a git repo. |
 | `--lane <name>` | Lane name (`default` if omitted); looked up in `.lane-broker.json`. If the repo config declares `lanes`, an undeclared name is refused (exit `64`) rather than silently keying on a private, unconflicting lane. |
 | `--weight <n>` | Override the configured weight for this run; must be a positive number (validated before enqueueing, exit `2` otherwise). |
+| `--cpu <cores>` | Override the lane's CPU reservation; fractional cores are supported. |
+| `--memory <size>` | Override the lane's memory reservation, e.g. `768MiB` or `4GiB`. |
 | `--detach` | Print the run id and return immediately instead of waiting. |
 | `--timeout <duration>` | e.g. `30s`, `5m`, `500ms`. Exit `75` if not finished in time — see below. |
 | `--allow-local-sim` | Override a lane's `localRefused: true`. |
@@ -78,7 +80,12 @@ hasn't finished enqueueing yet) rather than blocking forever on a typo.
 ```json
 {
   "version": 1,
-  "capacity": 2,
+  "capacity": "auto",
+  "schedulerMode": "active",
+  "cpuAdmissionPercent": 75,
+  "cpuReserveCores": 1,
+  "memoryReserveBytes": 2147483648,
+  "defaultMemoryBytesPerWeight": 1073741824,
   "loadClose": 15,
   "loadOpen": 11,
   "loadOpenSamples": 3,
@@ -87,6 +94,20 @@ hasn't finished enqueueing yet) rather than blocking forever on a typo.
   "laneNice": 10
 }
 ```
+
+By default lane-broker detects the resources visible to its process and
+actively reserves CPU and memory before starting a worker. On Linux this
+includes cgroup v2 quota, CPU-set, and memory limits; WSL is treated as Linux.
+On macOS it uses the logical CPUs and memory visible to Node. `capacity:
+"auto"` derives the legacy weight cap from the detected CPU budget. A numeric
+capacity remains supported as an additional compatibility cap.
+
+`cpuAdmissionPercent` and `cpuReserveCores` retain CPU headroom for interactive
+work. `memoryReserveBytes` is held back from worker reservations and current
+available memory. Legacy lanes without explicit resource values reserve one
+CPU core per weight unit and `defaultMemoryBytesPerWeight` bytes per weight
+unit. Set `schedulerMode` to `"shadow"` to log resource decisions without
+enforcing them.
 
 `admissionLoadGate` (default `false`): whether the load gate is allowed to
 deny a start at all. With the default, the gate is still sampled and reported
@@ -114,7 +135,7 @@ set of leases):
 {
   "version": 1,
   "lanes": {
-    "default": { "weight": 2 },
+    "default": { "weight": 2, "cpuCores": 2, "memoryBytes": 2147483648 },
     "sim":     { "weight": 2, "localRefused": true },
     "lint":    { "weight": 1, "nice": 15 },
     "e2e":     { "weight": 2 },
@@ -153,7 +174,10 @@ starts only when **all** of:
 - no `RUNNING` **or `ORPHANED`** lease conflicts with its key — an ORPHANED
   lease still represents real, possibly-running work, so it blocks exactly
   like a RUNNING one (it just can't be auto-reaped; see ORPHANED handling),
-- running weight (RUNNING + ORPHANED) + its weight fits `capacity`,
+- running weight (RUNNING + ORPHANED) + its weight fits the explicit or
+  automatically detected capacity,
+- CPU reservations plus measured external load fit the configured CPU budget,
+- memory reservations and estimated growth leave the configured memory reserve,
 - the load gate is open, **or `admissionLoadGate` is `false` (the default)**,
 - macOS memory pressure is not `critical`,
 - the broker is not paused.
@@ -182,8 +206,8 @@ lease (no new acquisition, no deadlock) when either:
   (any lane) — so a pre-push hook wrapped in `lane run --lane prepush` works
   regardless of which lane it nests inside.
 
-A reentrant run may not *widen* the inherited lease's weight (a `--weight`
-higher than the inherited lease's is refused). Any other nested key — a
+A reentrant run may not *widen* the inherited lease's weight, CPU reservation,
+or memory reservation. Any other nested key — a
 different repo, or a different lane that isn't `prepush` — is refused with
 exit `64`; v1 has no general lane hierarchy.
 

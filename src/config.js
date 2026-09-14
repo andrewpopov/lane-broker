@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 
 export const DEFAULT_GLOBAL_CONFIG = {
   version: 1,
-  capacity: 2,
+  capacity: 'auto',
   loadClose: 15,
   loadOpen: 11,
   loadOpenSamples: 3,
@@ -20,7 +20,10 @@ export const DEFAULT_GLOBAL_CONFIG = {
   admissionCooldownMs: 5000,
   memoryCloseBytes: 4294967296,
   memoryOpenBytes: 8589934592,
-  schedulerMode: 'shadow',
+  cpuReserveCores: 1,
+  memoryReserveBytes: 2147483648,
+  defaultMemoryBytesPerWeight: 1073741824,
+  schedulerMode: 'active',
   // Second, separate body of work (conflict-skip starvation bound — see
   // selectCandidate() in src/scheduler.js): how many times a conflict-blocked
   // FIFO head may be skipped in favor of a later, non-conflicting ticket
@@ -81,7 +84,10 @@ export class ConfigError extends Error {}
 function validateGlobalConfig(cfg, sourcePath) {
   assert(cfg && typeof cfg === 'object', `${sourcePath}: config must be an object`);
   assert(Number.isInteger(cfg.version), `${sourcePath}: "version" must be an integer`);
-  assert(Number.isFinite(cfg.capacity) && cfg.capacity > 0, `${sourcePath}: "capacity" must be a positive number`);
+  assert(
+    cfg.capacity === 'auto' || (Number.isFinite(cfg.capacity) && cfg.capacity > 0),
+    `${sourcePath}: "capacity" must be "auto" or a positive number`,
+  );
   assert(Number.isFinite(cfg.loadClose) && cfg.loadClose > 0, `${sourcePath}: "loadClose" must be a positive number`);
   assert(Number.isFinite(cfg.loadOpen) && cfg.loadOpen > 0, `${sourcePath}: "loadOpen" must be a positive number`);
   assert(cfg.loadOpen < cfg.loadClose, `${sourcePath}: "loadOpen" must be less than "loadClose"`);
@@ -105,6 +111,12 @@ function validateGlobalConfig(cfg, sourcePath) {
   assert(Number.isFinite(cfg.memoryCloseBytes) && cfg.memoryCloseBytes > 0, `${sourcePath}: "memoryCloseBytes" must be a positive number`);
   assert(Number.isFinite(cfg.memoryOpenBytes) && cfg.memoryOpenBytes > 0, `${sourcePath}: "memoryOpenBytes" must be a positive number`);
   assert(cfg.memoryCloseBytes < cfg.memoryOpenBytes, `${sourcePath}: "memoryCloseBytes" must be less than "memoryOpenBytes"`);
+  assert(Number.isFinite(cfg.cpuReserveCores) && cfg.cpuReserveCores >= 0, `${sourcePath}: "cpuReserveCores" must be a non-negative number`);
+  assert(Number.isFinite(cfg.memoryReserveBytes) && cfg.memoryReserveBytes >= 0, `${sourcePath}: "memoryReserveBytes" must be a non-negative number`);
+  assert(
+    Number.isFinite(cfg.defaultMemoryBytesPerWeight) && cfg.defaultMemoryBytesPerWeight > 0,
+    `${sourcePath}: "defaultMemoryBytesPerWeight" must be a positive number`,
+  );
   assert(
     cfg.schedulerMode === 'shadow' || cfg.schedulerMode === 'active',
     `${sourcePath}: "schedulerMode" must be "shadow" or "active"`,
@@ -131,6 +143,12 @@ function validateRepoConfig(cfg, sourcePath) {
   for (const [name, lane] of Object.entries(cfg.lanes)) {
     assert(lane && typeof lane === 'object', `${sourcePath}: lane "${name}" must be an object`);
     assert(Number.isFinite(lane.weight) && lane.weight > 0, `${sourcePath}: lane "${name}".weight must be a positive number`);
+    if (lane.cpuCores !== undefined) {
+      assert(Number.isFinite(lane.cpuCores) && lane.cpuCores > 0, `${sourcePath}: lane "${name}".cpuCores must be a positive number`);
+    }
+    if (lane.memoryBytes !== undefined) {
+      assert(Number.isFinite(lane.memoryBytes) && lane.memoryBytes > 0, `${sourcePath}: lane "${name}".memoryBytes must be a positive number`);
+    }
     if (lane.localRefused !== undefined) {
       assert(typeof lane.localRefused === 'boolean', `${sourcePath}: lane "${name}".localRefused must be a boolean`);
     }
@@ -354,6 +372,8 @@ export function resolveTicketConfig({ cwd, repo, lane }) {
     lane: laneName,
     key,
     weight: laneCfg.weight,
+    cpuCores: Number.isFinite(laneCfg.cpuCores) ? laneCfg.cpuCores : null,
+    memoryBytes: Number.isFinite(laneCfg.memoryBytes) ? laneCfg.memoryBytes : null,
     localRefused: Boolean(laneCfg.localRefused),
     // null (not defaulted here) when the lane doesn't declare its own nice:
     // the caller (run.js) applies the global `laneNice` fallback, the same

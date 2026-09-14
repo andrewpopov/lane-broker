@@ -23,7 +23,15 @@ import { bootId, paths, atomicWriteJson } from '../src/state.js';
  */
 
 function baseCfg(overrides = {}) {
-  return { ...DEFAULT_GLOBAL_CONFIG, capacity: 10, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, ...overrides };
+  return {
+    ...DEFAULT_GLOBAL_CONFIG,
+    schedulerMode: 'shadow',
+    capacity: 10,
+    loadClose: 1000,
+    loadOpen: 900,
+    loadOpenSamples: 1,
+    ...overrides,
+  };
 }
 
 function baseTicket(id, overrides = {}) {

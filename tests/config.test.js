@@ -19,17 +19,23 @@ test('expandConflicts turns a wildcard pair into a full adjacency map', () => {
   assert.equal(adj.get('default').has('lint'), false);
 });
 
-test('resolveTicketConfig resolves weight, key, and conflicts from a repo config file', () => {
+test('resolveTicketConfig resolves weight, resources, key, and conflicts from a repo config file', () => {
   const { base } = freshEnv();
   const repoDir = path.join(base, 'repo');
   writeRepoConfig(repoDir, {
     version: 1,
-    lanes: { default: { weight: 2 }, sim: { weight: 2, localRefused: true }, lint: { weight: 1 } },
+    lanes: {
+      default: { weight: 2 },
+      sim: { weight: 2, cpuCores: 1.5, memoryBytes: 3221225472, localRefused: true },
+      lint: { weight: 1 },
+    },
     conflicts: [['sim', '*']],
   });
   const resolved = resolveTicketConfig({ cwd: repoDir, repo: 'rouge', lane: 'sim' });
   assert.equal(resolved.key, 'rouge:sim');
   assert.equal(resolved.weight, 2);
+  assert.equal(resolved.cpuCores, 1.5);
+  assert.equal(resolved.memoryBytes, 3221225472);
   assert.equal(resolved.localRefused, true);
   assert.deepEqual(resolved.conflicts.sort(), ['rouge:default', 'rouge:lint']);
 });

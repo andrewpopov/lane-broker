@@ -6,6 +6,7 @@ import { listQueue, HELD_STATES, conflicts, readSkipState, readCapacitySkipState
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfig } from './config.js';
+import { detectResourceCapacity, effectiveWeightCapacity, leaseResources } from './resources.js';
 
 /** Holder pid of the global lock, read directly off disk — used to name the
  *  holder in the "couldn't take the lock" diagnostic without re-taking it. */
@@ -97,6 +98,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
   const configWarning = readJsonSafe(p.configWarning);
 
   const now = Date.now();
+  const resourceCapacity = detectResourceCapacity();
   const running = leases
     .filter((l) => l.state === LEASE_STATE.RUNNING || l.state === LEASE_STATE.ORPHANED)
     .map((l) => ({
@@ -108,20 +110,44 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       heartbeatAgeMs: l.heartbeatAt ? now - l.heartbeatAt : null,
       log: l.logPath,
       weight: l.weight,
+      resources: leaseResources(l, cfg),
+      observedCpuCores: l.observedCpuCores ?? null,
+      observedMemoryBytes: l.observedMemoryBytes ?? null,
     }));
 
   const runningWeight = leases.filter((l) => HELD_STATES.has(l.state)).reduce((s, l) => s + (l.weight || 0), 0);
+  const held = leases.filter((l) => HELD_STATES.has(l.state));
+  const reservedCpuCores = held.reduce((sum, lease) => sum + leaseResources(lease, cfg).cpuCores, 0);
+  const reservedMemoryBytes = held.reduce((sum, lease) => sum + leaseResources(lease, cfg).memoryBytes, 0);
 
   const queued = queue.map((t, i) => ({
     id: t.id,
     key: t.key,
     position: i + 1,
     waitedMs: now - t.createdAt,
+    resources: leaseResources(t, cfg),
   }));
 
   return {
-    capacity: cfg.capacity,
+    capacity: effectiveWeightCapacity(cfg, resourceCapacity.cpuCores),
     used: runningWeight,
+    resources: {
+      source: resourceCapacity.source,
+      cpuCores: resourceCapacity.cpuCores,
+      cpuBudgetCores: Math.max(
+        0,
+        Math.min(
+          resourceCapacity.cpuCores - cfg.cpuReserveCores,
+          (cfg.cpuAdmissionPercent / 100) * resourceCapacity.cpuCores,
+        ),
+      ),
+      reservedCpuCores,
+      memoryBytes: resourceCapacity.memoryBytes,
+      availableMemoryBytes: resourceCapacity.availableMemoryBytes,
+      memoryBudgetBytes: Math.max(0, resourceCapacity.memoryBytes - cfg.memoryReserveBytes),
+      reservedMemoryBytes,
+      mode: cfg.schedulerMode,
+    },
     paused,
     // BRAIN-249: null unless the queue is genuinely stalled (a conflict-
     // blocked head whose skip allowance is exhausted) — see computeHeadBlock.
@@ -190,6 +216,13 @@ function renderMemoryLine(memory) {
 export function renderStatusText(status) {
   const lines = [];
   lines.push(`capacity: ${status.used}/${status.capacity} used`);
+  if (status.resources) {
+    lines.push(
+      `resources: CPU ${status.resources.reservedCpuCores.toFixed(2)}/${status.resources.cpuBudgetCores.toFixed(2)} cores, ` +
+        `memory ${fmtMB(status.resources.reservedMemoryBytes)}/${fmtMB(status.resources.memoryBudgetBytes)} reserved, ` +
+        `${fmtMB(status.resources.availableMemoryBytes)} currently available (${status.resources.source}, ${status.resources.mode})`,
+    );
+  }
   const informationalSuffix = status.loadGate.admission ? '' : ' [informational]';
   if (status.loadGate.lastLoad == null && status.loadGate.sampleAgeMs == null) {
     lines.push(`load gate: open (no sample yet — samples are taken when a ticket reaches the queue head)${informationalSuffix}`);

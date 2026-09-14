@@ -159,8 +159,9 @@ test('readMemorySample does not accept blank override fields as a zeroed sample'
       // Either it fell through to the real host reading, or (non-darwin) it
       // returned null. What it must NEVER do is hand back the blanks as a
       // 0-of-0 sample that classifies as healthy.
-      const fabricated =
-        sample && sample.swapTotalBytes === 0 && sample.swapUsedBytes === 0 && sample.compressorBytes === 0;
+      const fabricated = Boolean(
+        sample && sample.swapTotalBytes === 0 && sample.swapUsedBytes === 0 && sample.compressorBytes === 0,
+      );
       assert.equal(fabricated, false, `blank override ${JSON.stringify(blank)} was accepted as a zeroed sample`);
     }
   } finally {

@@ -2,7 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { freshEnv } from './helpers.js';
-import { sampleHostCpu, computeBusyCores, readMemoryInfo, parseGroupCpuOutput, observedGroupCpuCores } from '../src/cpu.js';
+import {
+  sampleHostCpu,
+  computeBusyCores,
+  readMemoryInfo,
+  parseGroupCpuOutput,
+  parseGroupRssOutput,
+  observedGroupCpuCores,
+  observedGroupMemoryBytes,
+} from '../src/cpu.js';
 
 /** Build os.cpus()-shaped fixtures from just {idle, total} per core. */
 function fakeCpus(cores) {
@@ -149,6 +157,24 @@ test('parseGroupCpuOutput sums usable rows into a cores-busy fraction, ignoring 
 
 test('parseGroupCpuOutput treats non-numeric garbage as no usable rows', () => {
   assert.equal(parseGroupCpuOutput('garbage'), null);
+});
+
+test('parseGroupRssOutput sums KiB rows and returns bytes', () => {
+  assert.equal(parseGroupRssOutput('1024\n2048\n'), 3 * 1024 ** 2);
+  assert.equal(parseGroupRssOutput(''), null);
+});
+
+test('observedGroupMemoryBytes is bounded and fails safely', () => {
+  let options;
+  assert.equal(
+    observedGroupMemoryBytes(123, (_cmd, _args, passedOptions) => {
+      options = passedOptions;
+      return '512\n';
+    }),
+    512 * 1024,
+  );
+  assert.equal(options.timeout, 2000);
+  assert.equal(observedGroupMemoryBytes(123, () => { throw new Error('timeout'); }), null);
 });
 
 test('observedGroupCpuCores returns null for a falsy pgid without shelling out', () => {
