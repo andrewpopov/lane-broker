@@ -69,13 +69,34 @@ export function dequeueSync(root, id) {
   }
 }
 
-/** Whether `lease` blocks `ticket` from starting: same key, or declared conflict. Exported for
- *  status.js's read-only "why is the queue not moving" report (BRAIN-249) — the exact same
- *  predicate tryStart uses to decide, so the report can never describe a different notion of
- *  "conflict" than the scheduler actually enforces. */
-export function conflicts(ticket, lease) {
-  if (lease.key === ticket.key) return true;
-  return Array.isArray(ticket.conflicts) && ticket.conflicts.includes(lease.key);
+/**
+ * BRAIN-255: whether `held` blocks `ticket` from starting, and by which lease. A declared
+ * `conflicts` entry is absolute regardless of `ticket.maxConcurrent` — a lane conflicting with
+ * `*` stays exclusive against every other lane no matter its own ceiling — and is checked first.
+ * Same-key holders are then counted against `ticket.maxConcurrent` (default 1, resolved in
+ * config.js's resolveTicketConfig — this is the load-bearing compatibility default: a ticket that
+ * never declared the field behaves exactly like the pre-BRAIN-255 "always mutually exclusive on
+ * the same key" rule). Only once the count of held same-key leases reaches the ceiling does an
+ * additional same-key lease block; which one of them is returned as `blocker` is arbitrary (only
+ * its existence, not its identity, is meaningful to any caller).
+ *
+ * This is the single predicate behind every "is this ticket blocked" question in the scheduler —
+ * selectCandidate, selectCapacityCandidate, and tryStart's own head-conflict check below all call
+ * this rather than hand-rolling a per-lease predicate, and status.js's read-only report
+ * (BRAIN-249) calls it too, so `lane status` can never describe a different notion of "blocked"
+ * than the scheduler actually enforces.
+ */
+export function blockedBy(held, ticket) {
+  const sameKeyHeld = [];
+  for (const lease of held) {
+    if (lease.key === ticket.key) {
+      sameKeyHeld.push(lease);
+      continue;
+    }
+    if (Array.isArray(ticket.conflicts) && ticket.conflicts.includes(lease.key)) return lease;
+  }
+  const ceiling = Number.isInteger(ticket.maxConcurrent) && ticket.maxConcurrent >= 1 ? ticket.maxConcurrent : 1;
+  return sameKeyHeld.length >= ceiling ? sameKeyHeld[sameKeyHeld.length - 1] : null;
 }
 
 /** Coerce a persisted (possibly corrupt) skip-count file into a safe shape. Exported for
@@ -303,7 +324,7 @@ function resolveCapacityBlock(root, cfg, headId, headWeight, runningWeight, capa
 export function selectCandidate(queue, held) {
   for (const t of queue) {
     if (!t) return null;
-    if (!held.some((l) => conflicts(t, l))) return t;
+    if (!blockedBy(held, t)) return t;
   }
   return null;
 }
@@ -321,7 +342,7 @@ export function selectCandidate(queue, held) {
 export function selectCapacityCandidate(queue, held, runningWeight, capacity) {
   for (const t of queue) {
     if (!t) return null;
-    if (held.some((l) => conflicts(t, l))) continue;
+    if (blockedBy(held, t)) continue;
     if (runningWeight + t.weight <= capacity) return t;
   }
   return null;
@@ -385,8 +406,8 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // candidate fits.
     const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
     const weightCapacity = effectiveWeightCapacity(cfg, detectResourceCapacity().cpuCores);
-    const headConflicted = held.some((l) => conflicts(headTicket, l));
-    const blocker = headConflicted ? held.find((l) => conflicts(headTicket, l)) : null;
+    const blocker = blockedBy(held, headTicket);
+    const headConflicted = blocker !== null;
     // Starvation bound (Codex review finding #6): a conflict-blocked head
     // does NOT have a natural bound in general — with three or more
     // conflicting keys, alternating which one is held can keep skipping a
@@ -609,6 +630,11 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       cmd: ticket.cmd,
       weight: ticket.weight,
       resources: ticket.resources,
+      // BRAIN-255: carried onto the lease (not just the ticket) so a
+      // held-lease-only view — status.js's report, or a later poll's
+      // `blockedBy` call against a DIFFERENT ticket of the same key — can
+      // still see the ceiling this holder was admitted under.
+      maxConcurrent: ticket.maxConcurrent,
       logPath: ticket.logPath,
       resultPath: ticket.resultPath,
       state: LEASE_STATE.RUNNING,

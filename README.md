@@ -150,8 +150,20 @@ set of leases):
 
 `conflicts` is a list of `[laneA, laneB]` pairs; `*` means "every other lane
 in this repo". Two lanes with the *same key* (same repo + lane name) always
-conflict, regardless of `conflicts`. With no config file, there is a single
-`default` lane of weight 2.
+conflict, regardless of `conflicts` — unless that lane declares
+`maxConcurrent`. With no config file, there is a single `default` lane of
+weight 2.
+
+A lane's own `maxConcurrent` (integer >= 1, e.g. `"fleet": { "weight": 1,
+"maxConcurrent": 4 }`) relaxes ONLY the same-key rule above: up to that many
+same-key tickets may hold a lease at once, each counted individually against
+`capacity` and CPU/memory admission (a ceiling is the most that MAY run, not
+a reservation — resource admission can still allow fewer). It never relaxes
+a declared `conflicts` entry, which stays absolute regardless of either
+lane's `maxConcurrent`. Omit it (the default, `1`) for today's exact
+behaviour — a lane never declaring it is unconditionally exclusive against
+itself, exactly as before this field existed. This is the shape a worker
+pool needs (N sim runs at once), not a test lane (which wants exactly one).
 
 A lane with `localRefused: true` (the `sim` lane by default, matching the
 rouge fleet split) is refused on `lane run` unless `--allow-local-sim` is

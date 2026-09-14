@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ensureStateDirs, paths, withLock, bootId, readJsonSafe } from './state.js';
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
-import { listQueue, HELD_STATES, conflicts, readSkipState, readCapacitySkipState } from './scheduler.js';
+import { listQueue, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState } from './scheduler.js';
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfig } from './config.js';
@@ -39,7 +39,7 @@ function computeHeadBlock(root, cfg, queue, leases, now) {
   if (!head) return null;
   const held = leases.filter((l) => HELD_STATES.has(l.state));
   const runningWeight = held.reduce((s, l) => s + (l.weight || 0), 0);
-  const blocker = held.find((l) => conflicts(head, l));
+  const blocker = blockedBy(held, head);
   if (blocker) {
     const skipState = readSkipState(root);
     const sameHead = skipState.headId === head.id;
@@ -110,6 +110,9 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       heartbeatAgeMs: l.heartbeatAt ? now - l.heartbeatAt : null,
       log: l.logPath,
       weight: l.weight,
+      // BRAIN-255: default 1 for a lease written before this field existed,
+      // matching resolveTicketConfig's own compatibility default.
+      maxConcurrent: l.maxConcurrent ?? 1,
       resources: leaseResources(l, cfg),
       observedCpuCores: l.observedCpuCores ?? null,
       observedMemoryBytes: l.observedMemoryBytes ?? null,
@@ -285,9 +288,13 @@ export function renderStatusText(status) {
   } else {
     for (const r of status.running) {
       const flag = r.state === 'ORPHANED' ? ' [ORPHANED]' : '';
+      // BRAIN-255: only shown once it's non-default, so "2 running" reads
+      // differently against a maxConcurrent: 8 lane than a plain exclusive
+      // one, without cluttering the common (ceiling 1) case.
+      const ceiling = r.maxConcurrent > 1 ? `  ceiling=${r.maxConcurrent}` : '';
       lines.push(
         `  ${r.id}  key=${r.key}  pid=${r.pid ?? '-'}  elapsed=${fmtMs(r.elapsedMs)}  ` +
-          `heartbeat-age=${fmtMs(r.heartbeatAgeMs)}  log=${r.log}${flag}`,
+          `heartbeat-age=${fmtMs(r.heartbeatAgeMs)}  log=${r.log}${flag}${ceiling}`,
       );
     }
   }
