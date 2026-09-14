@@ -32,7 +32,8 @@
   },
   "scripts": {
     "test": "node --test --test-concurrency=1 tests/*.test.js",
-    "lint": "node --check bin/lane.js && for f in src/*.js; do node --check \"$f\"; done",
+    "lint": "node --check bin/lane.js && for f in src/*.js scripts/*.sh; do case \"$f\" in *.sh) sh -n \"$f\" || exit 1 ;; *) node --check \"$f\" || exit 1 ;; esac; done",
+    "verify": "npm run lint && sh scripts/verify-suite.sh",
     "prepare": "git config core.hooksPath .githooks || true"
   },
   "dependencies": {}
