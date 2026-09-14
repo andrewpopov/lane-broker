@@ -521,7 +521,12 @@ test('a successful admission stamps admittedAt on the written lease, so the cool
   const globalCfg = { ...DEFAULT_GLOBAL_CONFIG, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1 };
   const ticket = baseTicket('admits-cleanly');
   await enqueue(state, ticket);
-  const result = await tryStart(state, ticket, globalCfg);
+  // schedulerMode defaults to 'active' (DEFAULT_GLOBAL_CONFIG), so a real
+  // ambient CPU reading (the default cpuSampler) could independently deny
+  // this on a busy box -- pin it to a clearly-admitting value; this test is
+  // about admittedAt, not CPU admission (BRAIN-257).
+  const cpuSampler = () => ({ hostBusyCores: 0, cores: 12, stale: false, sampledAt: Date.now() });
+  const result = await tryStart(state, ticket, globalCfg, undefined, cpuSampler);
   assert.equal(result.started, true);
   assert.ok(Number.isFinite(result.lease.admittedAt), 'the lease must carry an admittedAt timestamp');
 });

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { freshEnv, writeGlobalConfig, writeMemoryFile, laneRun } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeMemoryFile, writeCpuBusyFile, laneRun } from './helpers.js';
 import { renderStatusText } from '../src/status.js';
 import { enqueue, tryStart } from '../src/scheduler.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
@@ -81,8 +81,16 @@ test('negative control: an exhausted memory reading (swap ~100% used) never deni
   const { state, base } = freshEnv();
   const cfg = { ...DEFAULT_GLOBAL_CONFIG, capacity: 2, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1 };
   const memoryFile = writeMemoryFile(base, 44 * 1024 * 1024 * 1024, 44 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024);
-  const prev = process.env.LANE_BROKER_MEMORY_FILE;
+  // Pin CPU to a clearly-admitting reading so this negative control is only
+  // ever exercising the memory reading it's named for: the real ambient
+  // host CPU (nothing else here pins it) can independently deny admission
+  // on a busy box, which would make this test fail for a reason that has
+  // nothing to do with memory -- see BRAIN-257.
+  const cpuBusyFile = writeCpuBusyFile(base, 0, 12);
+  const prevMemory = process.env.LANE_BROKER_MEMORY_FILE;
+  const prevCpu = process.env.LANE_BROKER_CPU_BUSY_FILE;
   process.env.LANE_BROKER_MEMORY_FILE = memoryFile;
+  process.env.LANE_BROKER_CPU_BUSY_FILE = cpuBusyFile;
 
   const ticket = {
     id: 'candidate-1',
@@ -99,14 +107,18 @@ test('negative control: an exhausted memory reading (swap ~100% used) never deni
 
   try {
     await enqueue(state, ticket);
-    // loadSampler -> 0 (open gate), cpuSampler default, memoryReader default
-    // (the pre-existing macPressure brake) -> null on this host in the
-    // common case, which never denies either; the point of this test is
-    // LANE_BROKER_MEMORY_FILE specifically, which nothing in tryStart reads.
+    // loadSampler -> 0 (open gate); cpuSampler default reads the pinned
+    // LANE_BROKER_CPU_BUSY_FILE above (clearly admitting), so this can only
+    // be denied by memory; memoryReader default (the pre-existing
+    // macPressure brake) -> null on this host in the common case, which
+    // never denies either; the point of this test is LANE_BROKER_MEMORY_FILE
+    // specifically, which nothing in tryStart reads.
     const result = await tryStart(state, ticket, cfg, () => 0);
     assert.equal(result.started, true, 'an exhausted BRAIN-211 swap reading must never deny a start -- it is informational only');
   } finally {
-    if (prev === undefined) delete process.env.LANE_BROKER_MEMORY_FILE;
-    else process.env.LANE_BROKER_MEMORY_FILE = prev;
+    if (prevMemory === undefined) delete process.env.LANE_BROKER_MEMORY_FILE;
+    else process.env.LANE_BROKER_MEMORY_FILE = prevMemory;
+    if (prevCpu === undefined) delete process.env.LANE_BROKER_CPU_BUSY_FILE;
+    else process.env.LANE_BROKER_CPU_BUSY_FILE = prevCpu;
   }
 });
