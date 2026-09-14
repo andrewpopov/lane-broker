@@ -158,6 +158,12 @@ function validateRepoConfig(cfg, sourcePath) {
         `${sourcePath}: lane "${name}".nice must be an integer in [0, 19]`,
       );
     }
+    if (lane.maxConcurrent !== undefined) {
+      assert(
+        Number.isInteger(lane.maxConcurrent) && lane.maxConcurrent >= 1,
+        `${sourcePath}: lane "${name}".maxConcurrent must be an integer >= 1`,
+      );
+    }
   }
   if (cfg.conflicts !== undefined) {
     assert(Array.isArray(cfg.conflicts), `${sourcePath}: "conflicts" must be an array of pairs`);
@@ -379,6 +385,12 @@ export function resolveTicketConfig({ cwd, repo, lane }) {
     // the caller (run.js) applies the global `laneNice` fallback, the same
     // "per-lane overrides global" shape as everything else in this file.
     nice: Number.isInteger(laneCfg.nice) ? laneCfg.nice : null,
+    // BRAIN-255: how many same-key holders may run at once. Defaulted HERE
+    // (not left null for a caller fallback like `nice` above) because 1 is
+    // the load-bearing compatibility default for every lane that predates
+    // this field, not an operator-configurable global — there is no
+    // equivalent of `laneNice` to fall back to.
+    maxConcurrent: Number.isInteger(laneCfg.maxConcurrent) ? laneCfg.maxConcurrent : 1,
     conflicts,
   };
 }

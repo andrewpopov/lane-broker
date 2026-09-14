@@ -227,6 +227,7 @@ export async function runCommand({
     weight,
     resources,
     nice,
+    maxConcurrent: resolved.maxConcurrent,
     conflicts: resolved.conflicts,
     cwd,
     cmd,
