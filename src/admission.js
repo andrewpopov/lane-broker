@@ -329,6 +329,14 @@ function fmt(n) {
  * rule running TODAY made; `new` is what phase 1's predicate would have
  * decided, always computed, never gating outside `schedulerMode=active`.
  * `bias` is always present — see KNOWN_BIAS_NOTE above.
+ *
+ * `memorySource`/`macPressure` (BRAIN-252) exist because the byte
+ * arithmetic alone could not explain a memory denial: while os.freemem()
+ * was making the gate unsatisfiable, the line showed a plausible-looking
+ * projectedAvailableBytes and said nothing about where that figure came
+ * from or what the OS itself reported about pressure. They are appended at
+ * the end, immediately before `bias`, so no field anyone already greps
+ * moves or changes meaning.
  */
 export function formatAdmissionLog(f) {
   return [
@@ -350,6 +358,8 @@ export function formatAdmissionLog(f) {
     `memoryBudgetBytes=${f.memoryBudgetBytes ?? 'n/a'}`,
     `cpuGate=${f.cpuGateClosed ? 'closed' : 'open'}`,
     `cooldown=${f.cooldownBlocked ? 'blocked' : 'clear'}`,
+    `memorySource=${f.memorySource ?? 'n/a'}`,
+    `macPressure=${f.macPressure ?? 'n/a'}`,
     `bias=${KNOWN_BIAS_NOTE}`,
   ].join(' ');
 }

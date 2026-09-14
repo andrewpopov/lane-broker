@@ -512,6 +512,88 @@ test('formatAdmissionLog always carries the known double-count bias note', () =>
   assert.match(line, new RegExp(`bias=${KNOWN_BIAS_NOTE}`));
 });
 
+// BRAIN-252's memory denial was undiagnosable from the log line: it showed
+// the byte arithmetic but never said where the available-memory figure came
+// from or what the OS itself reported about pressure. The three tests below
+// pin the two fields that answer that, and pin that adding them moved
+// nothing else — the line is grepped in anger, so its fields and their
+// relative order are a contract.
+function admissionLogFields(overrides = {}) {
+  return {
+    candidateId: 'x',
+    mode: 'shadow',
+    currentDecision: 'start',
+    currentReason: 'ok',
+    admit: true,
+    reason: 'ok',
+    sampleStale: false,
+    hostBusyCores: 1,
+    cores: 8,
+    externalBusy: 1,
+    projectedBusy: 2,
+    budget: 6,
+    candidateCpuCores: 1,
+    candidateMemoryBytes: 1024,
+    projectedAvailableBytes: 2048,
+    memoryBudgetBytes: 4096,
+    cpuGateClosed: false,
+    cooldownBlocked: false,
+    ...overrides,
+  };
+}
+
+test('formatAdmissionLog reports where the memory figure came from and what the OS said about pressure', () => {
+  const line = formatAdmissionLog(admissionLogFields({ memorySource: 'os+vm_stat', macPressure: 'critical' }));
+  assert.match(line, /memorySource=os\+vm_stat/);
+  assert.match(line, /macPressure=critical/);
+  assert.ok(line.indexOf('memorySource=') < line.indexOf('macPressure='), 'memorySource comes first');
+  assert.ok(line.indexOf('macPressure=') < line.indexOf('bias='), 'both new fields sit at the end, before bias=');
+});
+
+test('formatAdmissionLog renders an absent or null memory reading as n/a, never as the literal "undefined"', () => {
+  // scheduler.js passes `memInfo?.source` / `memInfo?.macPressure`: a
+  // throwing memory reader leaves memInfo null (both undefined here), while
+  // a non-darwin host or a failed sysctl probe yields an explicit null
+  // macPressure. Neither may reach the log as "undefined".
+  for (const fields of [admissionLogFields(), admissionLogFields({ memorySource: null, macPressure: null })]) {
+    const line = formatAdmissionLog(fields);
+    assert.match(line, /memorySource=n\/a/);
+    assert.match(line, /macPressure=n\/a/);
+    assert.ok(!line.includes('undefined'), 'a missing reading must render as n/a');
+  }
+});
+
+test('formatAdmissionLog still emits every pre-existing field, in its original relative order', () => {
+  const line = formatAdmissionLog(admissionLogFields({ memorySource: 'os', macPressure: 'normal' }));
+  const expectedOrder = [
+    'lane-broker-admission',
+    'candidate=',
+    'mode=',
+    'current=',
+    'loadGateIgnored=',
+    'new=',
+    'sample=',
+    'hostBusyCores=',
+    'cores=',
+    'externalBusy=',
+    'projectedBusy=',
+    'budget=',
+    'candidateCpu=',
+    'candidateMemoryBytes=',
+    'projectedAvailableBytes=',
+    'memoryBudgetBytes=',
+    'cpuGate=',
+    'cooldown=',
+    `bias=${KNOWN_BIAS_NOTE}`,
+  ];
+  let cursor = -1;
+  for (const token of expectedOrder) {
+    const at = line.indexOf(token, cursor + 1);
+    assert.ok(at > cursor, `${JSON.stringify(token)} must still appear, after the field checked before it`);
+    cursor = at;
+  }
+});
+
 // --- Lock-hold-time fix: the decision log and the CPU sample must not
 // lengthen the critical section, and the cooldown must be derivable from
 // the lease itself rather than a separate file written inside the lock. ---
