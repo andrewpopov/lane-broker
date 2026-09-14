@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
-import { freshEnv, writeRepoConfig, writeLoadFile, laneRun } from './helpers.js';
+import { freshEnv, writeRepoConfig, writeLoadFile, writeCpuBusyFile, laneRun } from './helpers.js';
 
 /**
  * A supervisor launching while config.json is missing, mid-write, or invalid
@@ -20,9 +20,12 @@ test('a malformed global config at supervisor startup does not crash the lane; i
 
   // Defaults close the gate above loadClose: 15 -- pin the injected load well
   // under that so this test's outcome depends only on startup surviving the
-  // bad config, not on the real host's load average.
+  // bad config, not on the real host's load average. Defaults also run
+  // schedulerMode 'active', so the real ambient CPU reading needs the same
+  // treatment (BRAIN-257) -- pin it to a clearly-admitting value.
   const loadFile = writeLoadFile(base, 1);
-  const env = { ...baseEnv, LANE_BROKER_LOADAVG_FILE: loadFile };
+  const cpuBusyFile = writeCpuBusyFile(base, 0, 12);
+  const env = { ...baseEnv, LANE_BROKER_LOADAVG_FILE: loadFile, LANE_BROKER_CPU_BUSY_FILE: cpuBusyFile };
 
   const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'true'], { env, cwd: repoDir });
   assert.equal(result.code, 0, `expected the lane to run on default config; stderr: ${result.stderr}`);
@@ -39,7 +42,8 @@ test('a global config that fails validation at supervisor startup runs on defaul
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
 
   const loadFile = writeLoadFile(base, 1);
-  const env = { ...baseEnv, LANE_BROKER_LOADAVG_FILE: loadFile };
+  const cpuBusyFile = writeCpuBusyFile(base, 0, 12);
+  const env = { ...baseEnv, LANE_BROKER_LOADAVG_FILE: loadFile, LANE_BROKER_CPU_BUSY_FILE: cpuBusyFile };
 
   const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'true'], { env, cwd: repoDir });
   assert.equal(result.code, 0, `expected the lane to run on default config; stderr: ${result.stderr}`);

@@ -101,8 +101,14 @@ test('idle broker: a closed load gate does not block a broker holding nothing (B
   persistClosedGate(state, cfg, 0);
 
   const loadSampler = () => 20; // stays above loadClose: the gate is genuinely still closed, not reopening on its own
+  // schedulerMode defaults to 'active' (DEFAULT_GLOBAL_CONFIG via makeCfg), so
+  // the real ambient CPU reading (the default cpuSampler) could independently
+  // deny this admission on a busy box -- this test is about the load-gate
+  // idle exemption, not CPU admission, so pin CPU to a clearly-admitting
+  // value (BRAIN-257).
+  const cpuSampler = () => ({ hostBusyCores: 0, cores: 12, stale: false, sampledAt: Date.now() });
 
-  const result = await tryStart(state, ticket, cfg, loadSampler);
+  const result = await tryStart(state, ticket, cfg, loadSampler, cpuSampler);
   assert.equal(result.started, true, 'nothing is held, so the closed gate must not block this admission');
 
   const gateState = readJsonSafe(paths(state).loadGate);
@@ -172,8 +178,14 @@ test('admission happens once the last holder is reaped', async () => {
   const ticket = await enqueueTicket(state, { key: 'repo/candidate', weight: 1 });
   persistClosedGate(state, cfg, 0);
   const loadSampler = () => 20;
+  // schedulerMode defaults to 'active' (DEFAULT_GLOBAL_CONFIG via makeCfg):
+  // once the holder is reaped below, `after` reaches the real CPU-admission
+  // check, which the real ambient host CPU could independently deny on a
+  // busy box -- this test is about the idle exemption, not CPU admission,
+  // so pin CPU to a clearly-admitting value (BRAIN-257).
+  const cpuSampler = () => ({ hostBusyCores: 0, cores: 12, stale: false, sampledAt: Date.now() });
 
-  const before = await tryStart(state, ticket, cfg, loadSampler);
+  const before = await tryStart(state, ticket, cfg, loadSampler, cpuSampler);
   assert.equal(before.started, false, 'still one live holder: the gate must still apply');
   assert.equal(before.reason, 'load-gate-closed');
 
@@ -184,7 +196,7 @@ test('admission happens once the last holder is reaped', async () => {
   const deadGroup = await deadGroupPgid();
   writeLease(state, { ...holder, supervisorPid: dead, childPgid: deadGroup });
 
-  const after = await tryStart(state, ticket, cfg, loadSampler);
+  const after = await tryStart(state, ticket, cfg, loadSampler, cpuSampler);
   assert.equal(after.started, true, 'the last holder is gone: the broker is idle again and the exemption applies');
 });
 
