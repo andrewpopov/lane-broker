@@ -1,5 +1,8 @@
 import fs from 'node:fs';
 import os from 'node:os';
+import { execFileSync } from 'node:child_process';
+
+import { parseVmStatAvailable } from './memory.js';
 
 const GIB = 1024 ** 3;
 
@@ -82,11 +85,50 @@ export function detectResourceCapacity({
   totalMemory = os.totalmem(),
   freeMemory = os.freemem(),
   readFile = fs.readFileSync,
+  vmStatText = null,
+  exec = execFileSync,
 } = {}) {
   let cpuCores = Math.max(1, Number(parallelism) || 1);
   let memoryBytes = Math.max(1, Number(totalMemory) || 1);
   let availableMemoryBytes = Math.max(0, Number(freeMemory) || 0);
   const sources = ['os'];
+
+  if (platform === 'darwin') {
+    // os.freemem() on macOS counts only free pages, excluding
+    // inactive/speculative pages that are just as reclaimable (BRAIN-252) —
+    // it reads ~1.8GB "free" on a box that's actually ~80% idle. vm_stat's
+    // fuller accounting fixes that. Any failure (missing binary, malformed
+    // output, timeout, an implausible result) falls back to freeMemory
+    // above — never throws, never leaves availableMemoryBytes null on
+    // darwin.
+    let text = vmStatText;
+    if (text == null) {
+      try {
+        // 2s bound, stdio ignore-stderr: same shape as the pressure probe
+        // in cpu.js's readMemoryInfo — a hung vm_stat must never stall a
+        // caller sitting inside the scheduler's global lock. killSignal
+        // makes the bound hard: execFileSync's default SIGTERM can be
+        // caught/ignored and still leave the caller waiting past timeout.
+        text = exec('vm_stat', [], {
+          encoding: 'utf8',
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: 2000,
+          killSignal: 'SIGKILL',
+        });
+      } catch {
+        text = null; // vm_stat missing/failed: fall back to freeMemory
+      }
+    }
+    const vmStatAvailableBytes = text != null ? parseVmStatAvailable(text) : null;
+    // Sanity-bound the parsed result: it must be a positive number and
+    // cannot exceed total memory (a vm_stat body that doesn't match the
+    // detected page size, or overlapping counters, could otherwise produce
+    // a number larger than the machine has).
+    if (Number.isFinite(vmStatAvailableBytes) && vmStatAvailableBytes > 0) {
+      availableMemoryBytes = Math.min(vmStatAvailableBytes, memoryBytes);
+      sources.push('vm_stat');
+    }
+  }
 
   if (platform === 'linux') {
     let foundCpu = false;

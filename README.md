@@ -98,9 +98,12 @@ hasn't finished enqueueing yet) rather than blocking forever on a typo.
 By default lane-broker detects the resources visible to its process and
 actively reserves CPU and memory before starting a worker. On Linux this
 includes cgroup v2 quota, CPU-set, and memory limits; WSL is treated as Linux.
-On macOS it uses the logical CPUs and memory visible to Node. `capacity:
-"auto"` derives the legacy weight cap from the detected CPU budget. A numeric
-capacity remains supported as an additional compatibility cap.
+On macOS it uses the logical CPUs visible to Node; available memory is sampled
+via `vm_stat` (free + inactive + speculative pages), because
+`os.freemem()` counts only free pages and undercounts available memory by an
+order of magnitude on macOS. `capacity: "auto"` derives the legacy weight cap
+from the detected CPU budget. A numeric capacity remains supported as an
+additional compatibility cap.
 
 `cpuAdmissionPercent` and `cpuReserveCores` retain CPU headroom for interactive
 work. `memoryReserveBytes` is held back from worker reservations and current
