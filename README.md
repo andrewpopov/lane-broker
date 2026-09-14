@@ -292,6 +292,13 @@ npm run lint
 catches parse errors only (no unused vars, no shadowing, no undefined
 globals); the pre-push hook's real coverage is `npm test`.
 
+Before committing, run `npm run verify` — it runs exactly what the pre-push
+hook runs: lint, then the suite through `lane run` when the broker is on
+PATH (falling back to a direct `npm test` otherwise). That distinction
+matters — a test can pass standalone and still fail only under `lane run`,
+so a `verify` that just called `npm test` directly would miss exactly the
+failure the hook is there to catch.
+
 ## License
 
 [MIT](./LICENSE)
