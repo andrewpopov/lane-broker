@@ -9,6 +9,34 @@ export const BIN = fileURLToPath(new URL('../bin/lane.js', import.meta.url));
 let counter = 0;
 
 /** Fresh, isolated $LANE_BROKER_HOME / $LANE_BROKER_STATE for one test. */
+// Ambient LANE_BROKER_* vars a test must never inherit. The suite itself runs INSIDE a lane --
+// the committed pre-push hook invokes `lane run ... npm test` -- so the broker exports its own
+// lease/ticket/key into this process, and `...process.env` handed them straight to every `lane
+// run` a test spawns. A child seeing LANE_BROKER_LEASE takes the reentrancy path (reuse the
+// inherited lease) instead of enqueueing, so an assertion like "no queue state is created" fails
+// under the gate while passing standalone -- a red gate nobody can push past, on this repo of all
+// of them. Same class of bug, and the same fix, as the git-env scrub the pre-push hook itself
+// documents at the top of .githooks/pre-push.
+//
+// HOME and STATE are absent here on purpose: freshEnv overwrites both explicitly below.
+const INHERITED_BROKER_VARS = [
+  'LANE_BROKER_LEASE',
+  'LANE_BROKER_TICKET',
+  'LANE_BROKER_KEY',
+  'LANE_BROKER_BOOT_ID',
+  'LANE_BROKER_CPU_BUSY_FILE',
+  'LANE_BROKER_LOADAVG_FILE',
+  'LANE_BROKER_MEMORY_FILE',
+];
+
+/** `process.env` with every ambient broker variable removed, so a test's environment is decided by
+ *  the test and never by whatever invoked the suite. */
+function scrubbedProcessEnv() {
+  const env = { ...process.env };
+  for (const key of INHERITED_BROKER_VARS) delete env[key];
+  return env;
+}
+
 export function freshEnv(extra = {}) {
   counter += 1;
   const base = fs.mkdtempSync(path.join(os.tmpdir(), `lane-broker-test-${counter}-`));
@@ -21,7 +49,7 @@ export function freshEnv(extra = {}) {
     home,
     state,
     env: {
-      ...process.env,
+      ...scrubbedProcessEnv(),
       LANE_BROKER_HOME: home,
       LANE_BROKER_STATE: state,
       ...extra,
