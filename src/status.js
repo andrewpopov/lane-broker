@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ensureStateDirs, paths, withLock, bootId, readJsonSafe } from './state.js';
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
-import { listQueue, HELD_STATES } from './scheduler.js';
+import { listQueue, HELD_STATES, conflicts, readSkipState, readCapacitySkipState } from './scheduler.js';
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfig } from './config.js';
@@ -12,6 +12,68 @@ import { loadGlobalConfig } from './config.js';
 function currentLockHolderPid(root) {
   const owner = readJsonSafe(path.join(paths(root).lock, 'owner.json'));
   return owner ? owner.pid : null;
+}
+
+/**
+ * BRAIN-249: "why is the queue not moving" — read-only, so unlike
+ * scheduler.js's resolveHeadBlock/resolveCapacityBlock this never writes
+ * either skip-state file (a `lane status` call must never mutate scheduling
+ * state); a legacy conflict file with no `blockedSince` is treated as
+ * "starting now" here too, purely for this one render, without persisting
+ * it — the next real tryStart poll does the actual healing. Returns null
+ * whenever there's nothing to report: no queue, the head neither conflicts
+ * nor fails to fit capacity, or its skip allowance for whichever reason
+ * applies isn't actually exhausted yet (selection is still finding a way to
+ * make progress, so this isn't the stalled case this report exists for).
+ *
+ * `kind` distinguishes the two mutually-exclusive block reasons for
+ * renderStatusText: 'conflict' carries the time-bounded blockedMs/graceMs/
+ * refused shape (see resolveHeadBlock), 'capacity' does not — BRAIN-249
+ * part 2 deliberately has no grace period for capacity (see
+ * resolveCapacityBlock's doc comment in scheduler.js), so there is nothing
+ * to count down.
+ */
+function computeHeadBlock(root, cfg, queue, leases, now) {
+  const head = queue[0];
+  if (!head) return null;
+  const held = leases.filter((l) => HELD_STATES.has(l.state));
+  const runningWeight = held.reduce((s, l) => s + (l.weight || 0), 0);
+  const blocker = held.find((l) => conflicts(head, l));
+  if (blocker) {
+    const skipState = readSkipState(root);
+    const sameHead = skipState.headId === head.id;
+    const skipCount = sameHead ? skipState.count : 0;
+    if (skipCount < cfg.conflictSkipLimit) return null;
+    const blockedSince = sameHead && skipState.blockedSince != null ? skipState.blockedSince : now;
+    const blockedMs = now - blockedSince;
+    return {
+      kind: 'conflict',
+      headId: head.id,
+      blockingLeaseId: blocker.id,
+      blockingKey: blocker.key,
+      skipCount,
+      skipLimit: cfg.conflictSkipLimit,
+      graceMs: cfg.headBlockGraceMs,
+      blockedMs,
+      refused: blockedMs < cfg.headBlockGraceMs,
+    };
+  }
+  if (runningWeight + head.weight > cfg.capacity) {
+    const capState = readCapacitySkipState(root);
+    const sameHead = capState.headId === head.id;
+    const skipCount = sameHead ? capState.count : 0;
+    if (skipCount < cfg.conflictSkipLimit) return null;
+    return {
+      kind: 'capacity',
+      headId: head.id,
+      headWeight: head.weight,
+      runningWeight,
+      capacity: cfg.capacity,
+      skipCount,
+      skipLimit: cfg.conflictSkipLimit,
+    };
+  }
+  return null;
 }
 
 export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
@@ -61,6 +123,9 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
     capacity: cfg.capacity,
     used: runningWeight,
     paused,
+    // BRAIN-249: null unless the queue is genuinely stalled (a conflict-
+    // blocked head whose skip allowance is exhausted) — see computeHeadBlock.
+    headBlock: computeHeadBlock(root, cfg, queue, leases, now),
     configWarning: configWarning ? { message: configWarning.message, firstAt: configWarning.firstAt, lastAt: configWarning.lastAt } : null,
     loadGate: {
       closed: gate.closed,
@@ -85,6 +150,15 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
     lockError,
   };
 }
+
+/** BRAIN-249: how old a load-gate sample can be before `lane status` flags it
+ *  as stale rather than current. Fixed, not derived from any one broker's
+ *  configured sampleMs (default 5s) — an operator reading "sampled 173m ago"
+ *  needs the same stale/fresh call regardless of what sampleMs happens to be
+ *  set to on this machine, and a healthy queue samples on essentially every
+ *  poll, so anything this many multiples older can only mean nothing has
+ *  been selected in that whole span. */
+const STALE_SAMPLE_MS = 5 * 60 * 1000;
 
 function fmtMs(ms) {
   if (ms == null) return '-';
@@ -120,12 +194,48 @@ export function renderStatusText(status) {
   if (status.loadGate.lastLoad == null && status.loadGate.sampleAgeMs == null) {
     lines.push(`load gate: open (no sample yet — samples are taken when a ticket reaches the queue head)${informationalSuffix}`);
   } else {
+    // BRAIN-249: sampleAndUpdateGate only runs once a candidate is actually
+    // SELECTED (see tryStart's own comment on why) — a queue that never
+    // selects anything (every ticket behind a conflict-blocked, skip-
+    // exhausted head) samples nothing, so this reading only gets older.
+    // Rendering an hours-old sample as plain "load gate: open" is exactly
+    // what made a stalled queue look like a crashed sampler in the BRAIN-249
+    // incident; flag it instead, reusing the same "samples are taken when a
+    // ticket reaches the queue head" explanation as the no-sample-yet branch
+    // above rather than inventing new wording for the same underlying fact.
+    const stale = status.loadGate.sampleAgeMs != null && status.loadGate.sampleAgeMs > STALE_SAMPLE_MS;
+    const staleNote = stale
+      ? ' — STALE: samples are taken when a ticket reaches the queue head, so this means nothing has been selected in that long, not that sampling crashed'
+      : '';
     lines.push(
       `load gate: ${status.loadGate.closed ? 'CLOSED' : 'open'}` +
         ` (load ${status.loadGate.lastLoad ?? '?'}, sampled ${fmtMs(status.loadGate.sampleAgeMs)} ago` +
         `, close>${status.loadGate.loadClose}, open<${status.loadGate.loadOpen} x${status.loadGate.loadOpenSamples}` +
-        `, consecutive-under ${status.loadGate.consecutiveUnder})${informationalSuffix}`,
+        `, consecutive-under ${status.loadGate.consecutiveUnder})${staleNote}${informationalSuffix}`,
     );
+  }
+  if (status.headBlock) {
+    const hb = status.headBlock;
+    if (hb.kind === 'capacity') {
+      // BRAIN-249 part 2: no grace/refused distinction here — capacity
+      // backfill has no time-based resume (see resolveCapacityBlock's doc
+      // comment in scheduler.js), so this is always "refused until running
+      // work drains", never "refused for N more".
+      lines.push(
+        `queue stalled: head ${hb.headId} (weight ${hb.headWeight}) does not fit capacity ` +
+          `(${hb.runningWeight}/${hb.capacity} running); skip allowance exhausted (${hb.skipCount}/${hb.skipLimit}), ` +
+          `backfill refused until running work drains`,
+      );
+    } else {
+      lines.push(
+        hb.refused
+          ? `queue stalled: head ${hb.headId} is blocked by lease ${hb.blockingLeaseId} (key ${hb.blockingKey}); ` +
+              `skip allowance exhausted (${hb.skipCount}/${hb.skipLimit}), backfill refused for ` +
+              `${fmtMs(hb.graceMs - hb.blockedMs)} more (grace ${fmtMs(hb.graceMs)})`
+          : `queue: head ${hb.headId} is still blocked by lease ${hb.blockingLeaseId} (key ${hb.blockingKey}), but the ` +
+              `${fmtMs(hb.graceMs)} grace period has lapsed — backfill resumed past it`,
+      );
+    }
   }
   lines.push(renderMemoryLine(status.memory));
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);

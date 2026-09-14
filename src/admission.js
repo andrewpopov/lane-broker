@@ -339,18 +339,16 @@ export function formatAdmissionLog(f) {
 }
 
 /**
- * Write one decision line. Codex review finding #2: production supervisors
- * are spawned with stdio: 'ignore' (run.js), so stderr-only logging is
- * silently discarded on every real run — shadow mode would have no readable
- * output at all. Append to a real file under the broker's state root
- * (alongside the other admission sidecars) in addition to stderr, both
- * best-effort: neither ever throws, since a logging failure must never
- * affect scheduling. Pure telemetry — nothing reads it back to make a
- * decision — so the caller (scheduler.js) calls this AFTER releasing the
- * global lock, on both the admit and deny paths, never from inside it.
+ * Shared low-level writer for every broker-side log line, admission
+ * decisions and BRAIN-249's head-block lines alike: append to a real file
+ * under the broker's state root (alongside the other admission sidecars) in
+ * addition to stderr, both best-effort. Codex review finding #2: production
+ * supervisors are spawned with stdio: 'ignore' (run.js), so stderr-only
+ * logging is silently discarded on every real run — a poll loop that never
+ * writes to the shared file would have no readable output at all. Neither
+ * write ever throws, since a logging failure must never affect scheduling.
  */
-export function logAdmissionDecision(root, fields) {
-  const line = `${formatAdmissionLog(fields)}\n`;
+function writeBrokerLog(root, line) {
   try {
     process.stderr.write(line);
   } catch {
@@ -361,4 +359,76 @@ export function logAdmissionDecision(root, fields) {
   } catch {
     // best-effort — disk-full or similar must never affect scheduling, same tolerance as appendHistory in state.js
   }
+}
+
+/**
+ * Write one admission-decision line. Pure telemetry — nothing reads it back
+ * to make a decision — so the caller (scheduler.js) calls this AFTER
+ * releasing the global lock, on both the admit and deny paths, never from
+ * inside it.
+ */
+export function logAdmissionDecision(root, fields) {
+  writeBrokerLog(root, `${formatAdmissionLog(fields)}\n`);
+}
+
+/**
+ * BRAIN-249: one grep-able line (`lane-broker-head-block`) for a conflict-
+ * blocked FIFO head, so a stall that never even reaches CPU/gate admission
+ * evaluation (nothing is ever selected there — see logAdmissionDecision's
+ * doc comment: that log line only fires once a candidate is chosen) still
+ * leaves a trace. Written to the SAME admission-decisions.log via
+ * writeBrokerLog above rather than a second sidecar file, so investigating a
+ * stall and investigating a CPU-admission decision are both one `grep
+ * admission-decisions.log` away.
+ *
+ * Bounded by state TRANSITIONS, never by poll: scheduler.js's
+ * resolveHeadBlock only calls this when the phase actually changes for the
+ * current head (a new head starts being blocked, its skip allowance becomes
+ * exhausted, or the grace period lapses and backfill resumes) — never once
+ * per poll, or a multi-hour stall would write one line per queued ticket per
+ * poll forever.
+ */
+export function formatHeadBlockLog(f) {
+  return [
+    'lane-broker-head-block',
+    `event=${f.event}`,
+    `headId=${f.headId}`,
+    `blockingLease=${f.blockingLeaseId}`,
+    `blockingKey=${f.blockingKey}`,
+    `skip=${f.skipCount}/${f.skipLimit}`,
+    `graceMs=${f.graceMs}`,
+    `blockedMs=${Math.round(f.blockedMs)}`,
+  ].join(' ');
+}
+
+export function logHeadBlock(root, fields) {
+  writeBrokerLog(root, `${formatHeadBlockLog(fields)}\n`);
+}
+
+/**
+ * BRAIN-249 part 2: the same `lane-broker-head-block` grep token, transition-
+ * only discipline, and log destination as formatHeadBlockLog/logHeadBlock
+ * above, for the CAPACITY-blocked head case instead of the conflict case —
+ * a head that doesn't conflict with anything held but simply doesn't fit
+ * under capacity. Distinct fields, because there is no single blocking
+ * lease to name here: the head is blocked by the SUM of everything
+ * currently held, so this reports `headWeight`/`runningWeight`/`capacity`
+ * instead of a blocking lease id/key. No `graceMs`/`blockedMs` fields —
+ * see scheduler.js's resolveCapacityBlock for why this path is
+ * deliberately NOT time-bounded the way the conflict path is.
+ */
+export function formatCapacityBlockLog(f) {
+  return [
+    'lane-broker-head-block',
+    `event=${f.event}`,
+    `headId=${f.headId}`,
+    `headWeight=${f.headWeight}`,
+    `runningWeight=${f.runningWeight}`,
+    `capacity=${f.capacity}`,
+    `skip=${f.skipCount}/${f.skipLimit}`,
+  ].join(' ');
+}
+
+export function logCapacityBlock(root, fields) {
+  writeBrokerLog(root, `${formatCapacityBlockLog(fields)}\n`);
 }

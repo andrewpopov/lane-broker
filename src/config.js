@@ -28,6 +28,21 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // run itself. Without this, three or more conflicting keys can starve a
   // head forever by alternating which other ticket is held.
   conflictSkipLimit: 3,
+  // BRAIN-249: conflictSkipLimit bounds how many times a conflict-blocked
+  // head may be SKIPPED, but nothing previously bounded how LONG it could
+  // then sit blocked once that allowance ran out -- if the lease holding the
+  // head's key is a legitimately long-running job (hours, not a crash),
+  // skip-exhaustion would refuse backfill forever, turning one blocked
+  // ticket into every ticket behind it also blocked, machine-wide. Once the
+  // head has been sitting blocked for at least this long, resume
+  // backfilling past it even with the skip allowance exhausted -- see
+  // headBlockedMs/resolveHeadBlock in src/scheduler.js. A reclaim-by-time
+  // that steals the held KEY itself (killing the long-running job) was
+  // explicitly rejected for the same incident this exists to fix: it would
+  // have killed a genuine multi-hour run just because it outlasted a
+  // timer. This only changes who else is allowed to start; it never touches
+  // the lease already holding the key.
+  headBlockGraceMs: 600_000,
   // BRAIN-207 (forgiving admission): whether the load gate is allowed to
   // deny a start at all. Default false — the gate is informational-only
   // (still sampled every poll, still logged) until an operator opts back
@@ -97,6 +112,10 @@ function validateGlobalConfig(cfg, sourcePath) {
   assert(
     Number.isInteger(cfg.conflictSkipLimit) && cfg.conflictSkipLimit >= 0,
     `${sourcePath}: "conflictSkipLimit" must be a non-negative integer`,
+  );
+  assert(
+    Number.isInteger(cfg.headBlockGraceMs) && cfg.headBlockGraceMs >= 0,
+    `${sourcePath}: "headBlockGraceMs" must be a non-negative integer`,
   );
   assert(typeof cfg.admissionLoadGate === 'boolean', `${sourcePath}: "admissionLoadGate" must be a boolean`);
   assert(
