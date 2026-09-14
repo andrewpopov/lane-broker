@@ -25,6 +25,11 @@ export function paths(root = stateHome()) {
     cpuGate: path.join(root, 'cpu-gate.json'),
     admissionLog: path.join(root, 'admission-decisions.log'),
     conflictSkipState: path.join(root, 'conflict-skip-state.json'),
+    // BRAIN-249 part 2: the capacity-blocked head's own skip counter — kept
+    // separate from conflictSkipState (see readCapacitySkipState's doc
+    // comment in scheduler.js for why a shared counter would let the two
+    // block reasons interfere with each other's allowance).
+    capacitySkipState: path.join(root, 'capacity-skip-state.json'),
     seq: path.join(root, 'seq'),
   };
 }

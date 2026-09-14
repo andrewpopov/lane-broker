@@ -103,3 +103,23 @@ test('lane status reports the grace period lapsed and backfill resumed once it h
   assert.match(text, /queue: head head-abc is still blocked by lease holder-xyz \(key rouge:sim\)/);
   assert.match(text, /grace period has lapsed — backfill resumed past it/);
 });
+
+test('lane status names a capacity-blocked head, its weight, and the running/capacity figures, with no grace-period wording', () => {
+  const text = renderStatusText(
+    baseStatus({
+      headBlock: {
+        kind: 'capacity',
+        headId: 'savoro-prepush',
+        headWeight: 8,
+        runningWeight: 2,
+        capacity: 8,
+        skipCount: 2,
+        skipLimit: 2,
+      },
+    }),
+  );
+  assert.match(text, /queue stalled: head savoro-prepush \(weight 8\) does not fit capacity \(2\/8 running\)/);
+  assert.match(text, /skip allowance exhausted \(2\/2\)/);
+  assert.match(text, /backfill refused until running work drains/);
+  assert.doesNotMatch(text, /grace/i);
+});

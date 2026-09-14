@@ -404,3 +404,31 @@ export function formatHeadBlockLog(f) {
 export function logHeadBlock(root, fields) {
   writeBrokerLog(root, `${formatHeadBlockLog(fields)}\n`);
 }
+
+/**
+ * BRAIN-249 part 2: the same `lane-broker-head-block` grep token, transition-
+ * only discipline, and log destination as formatHeadBlockLog/logHeadBlock
+ * above, for the CAPACITY-blocked head case instead of the conflict case —
+ * a head that doesn't conflict with anything held but simply doesn't fit
+ * under capacity. Distinct fields, because there is no single blocking
+ * lease to name here: the head is blocked by the SUM of everything
+ * currently held, so this reports `headWeight`/`runningWeight`/`capacity`
+ * instead of a blocking lease id/key. No `graceMs`/`blockedMs` fields —
+ * see scheduler.js's resolveCapacityBlock for why this path is
+ * deliberately NOT time-bounded the way the conflict path is.
+ */
+export function formatCapacityBlockLog(f) {
+  return [
+    'lane-broker-head-block',
+    `event=${f.event}`,
+    `headId=${f.headId}`,
+    `headWeight=${f.headWeight}`,
+    `runningWeight=${f.runningWeight}`,
+    `capacity=${f.capacity}`,
+    `skip=${f.skipCount}/${f.skipLimit}`,
+  ].join(' ');
+}
+
+export function logCapacityBlock(root, fields) {
+  writeBrokerLog(root, `${formatCapacityBlockLog(fields)}\n`);
+}

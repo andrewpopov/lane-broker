@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ensureStateDirs, paths, withLock, bootId, readJsonSafe } from './state.js';
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
-import { listQueue, HELD_STATES, conflicts, readSkipState } from './scheduler.js';
+import { listQueue, HELD_STATES, conflicts, readSkipState, readCapacitySkipState } from './scheduler.js';
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfig } from './config.js';
@@ -16,37 +16,64 @@ function currentLockHolderPid(root) {
 
 /**
  * BRAIN-249: "why is the queue not moving" — read-only, so unlike
- * scheduler.js's resolveHeadBlock this never writes conflict-skip-state.json
- * (a `lane status` call must never mutate scheduling state); a legacy file
- * with no `blockedSince` is treated as "starting now" here too, purely for
- * this one render, without persisting it — the next real tryStart poll does
- * the actual healing. Returns null whenever there's nothing to report: no
- * queue, no conflict at the head, or the head's skip allowance isn't
- * actually exhausted yet (selectCandidate is still finding a way to make
- * progress, so this isn't the stalled case this report exists for).
+ * scheduler.js's resolveHeadBlock/resolveCapacityBlock this never writes
+ * either skip-state file (a `lane status` call must never mutate scheduling
+ * state); a legacy conflict file with no `blockedSince` is treated as
+ * "starting now" here too, purely for this one render, without persisting
+ * it — the next real tryStart poll does the actual healing. Returns null
+ * whenever there's nothing to report: no queue, the head neither conflicts
+ * nor fails to fit capacity, or its skip allowance for whichever reason
+ * applies isn't actually exhausted yet (selection is still finding a way to
+ * make progress, so this isn't the stalled case this report exists for).
+ *
+ * `kind` distinguishes the two mutually-exclusive block reasons for
+ * renderStatusText: 'conflict' carries the time-bounded blockedMs/graceMs/
+ * refused shape (see resolveHeadBlock), 'capacity' does not — BRAIN-249
+ * part 2 deliberately has no grace period for capacity (see
+ * resolveCapacityBlock's doc comment in scheduler.js), so there is nothing
+ * to count down.
  */
 function computeHeadBlock(root, cfg, queue, leases, now) {
   const head = queue[0];
   if (!head) return null;
   const held = leases.filter((l) => HELD_STATES.has(l.state));
+  const runningWeight = held.reduce((s, l) => s + (l.weight || 0), 0);
   const blocker = held.find((l) => conflicts(head, l));
-  if (!blocker) return null;
-  const skipState = readSkipState(root);
-  const sameHead = skipState.headId === head.id;
-  const skipCount = sameHead ? skipState.count : 0;
-  if (skipCount < cfg.conflictSkipLimit) return null;
-  const blockedSince = sameHead && skipState.blockedSince != null ? skipState.blockedSince : now;
-  const blockedMs = now - blockedSince;
-  return {
-    headId: head.id,
-    blockingLeaseId: blocker.id,
-    blockingKey: blocker.key,
-    skipCount,
-    skipLimit: cfg.conflictSkipLimit,
-    graceMs: cfg.headBlockGraceMs,
-    blockedMs,
-    refused: blockedMs < cfg.headBlockGraceMs,
-  };
+  if (blocker) {
+    const skipState = readSkipState(root);
+    const sameHead = skipState.headId === head.id;
+    const skipCount = sameHead ? skipState.count : 0;
+    if (skipCount < cfg.conflictSkipLimit) return null;
+    const blockedSince = sameHead && skipState.blockedSince != null ? skipState.blockedSince : now;
+    const blockedMs = now - blockedSince;
+    return {
+      kind: 'conflict',
+      headId: head.id,
+      blockingLeaseId: blocker.id,
+      blockingKey: blocker.key,
+      skipCount,
+      skipLimit: cfg.conflictSkipLimit,
+      graceMs: cfg.headBlockGraceMs,
+      blockedMs,
+      refused: blockedMs < cfg.headBlockGraceMs,
+    };
+  }
+  if (runningWeight + head.weight > cfg.capacity) {
+    const capState = readCapacitySkipState(root);
+    const sameHead = capState.headId === head.id;
+    const skipCount = sameHead ? capState.count : 0;
+    if (skipCount < cfg.conflictSkipLimit) return null;
+    return {
+      kind: 'capacity',
+      headId: head.id,
+      headWeight: head.weight,
+      runningWeight,
+      capacity: cfg.capacity,
+      skipCount,
+      skipLimit: cfg.conflictSkipLimit,
+    };
+  }
+  return null;
 }
 
 export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
@@ -189,14 +216,26 @@ export function renderStatusText(status) {
   }
   if (status.headBlock) {
     const hb = status.headBlock;
-    lines.push(
-      hb.refused
-        ? `queue stalled: head ${hb.headId} is blocked by lease ${hb.blockingLeaseId} (key ${hb.blockingKey}); ` +
-            `skip allowance exhausted (${hb.skipCount}/${hb.skipLimit}), backfill refused for ` +
-            `${fmtMs(hb.graceMs - hb.blockedMs)} more (grace ${fmtMs(hb.graceMs)})`
-        : `queue: head ${hb.headId} is still blocked by lease ${hb.blockingLeaseId} (key ${hb.blockingKey}), but the ` +
-            `${fmtMs(hb.graceMs)} grace period has lapsed — backfill resumed past it`,
-    );
+    if (hb.kind === 'capacity') {
+      // BRAIN-249 part 2: no grace/refused distinction here — capacity
+      // backfill has no time-based resume (see resolveCapacityBlock's doc
+      // comment in scheduler.js), so this is always "refused until running
+      // work drains", never "refused for N more".
+      lines.push(
+        `queue stalled: head ${hb.headId} (weight ${hb.headWeight}) does not fit capacity ` +
+          `(${hb.runningWeight}/${hb.capacity} running); skip allowance exhausted (${hb.skipCount}/${hb.skipLimit}), ` +
+          `backfill refused until running work drains`,
+      );
+    } else {
+      lines.push(
+        hb.refused
+          ? `queue stalled: head ${hb.headId} is blocked by lease ${hb.blockingLeaseId} (key ${hb.blockingKey}); ` +
+              `skip allowance exhausted (${hb.skipCount}/${hb.skipLimit}), backfill refused for ` +
+              `${fmtMs(hb.graceMs - hb.blockedMs)} more (grace ${fmtMs(hb.graceMs)})`
+          : `queue: head ${hb.headId} is still blocked by lease ${hb.blockingLeaseId} (key ${hb.blockingKey}), but the ` +
+              `${fmtMs(hb.graceMs)} grace period has lapsed — backfill resumed past it`,
+      );
+    }
   }
   lines.push(renderMemoryLine(status.memory));
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);

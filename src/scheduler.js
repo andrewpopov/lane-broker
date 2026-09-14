@@ -3,7 +3,7 @@ import path from 'node:path';
 import { paths, atomicWriteJson, readJsonSafe, withLock, bootId } from './state.js';
 import { sampleAndUpdateGate } from './load.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
-import { evaluateNewAdmission, sampleCpuSafe, logAdmissionDecision, logHeadBlock } from './admission.js';
+import { evaluateNewAdmission, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
@@ -198,6 +198,82 @@ function resolveHeadBlock(root, cfg, headId, blocker, sameHead, skipState, skipC
   return { blockedMs, phase };
 }
 
+/** Coerce a persisted (possibly corrupt) capacity-skip-count file into a safe shape (BRAIN-249
+ *  part 2). Exported for status.js's read-only report, same reason as readSkipState above.
+ *  Mirrors readSkipState's shape/tolerance, but tracks a SEPARATE counter, keyed the
+ *  same way (headId + count + loggedPhase), for the capacity-blocked case. Kept in its own file
+ *  (paths().capacitySkipState) rather than folded into conflict-skip-state.json: the two block
+ *  reasons are mutually exclusive for a given head at a given poll (a head is either conflicted,
+ *  or — if not — capacity-blocked or fine), but the SAME headId can transition between the two
+ *  reasons over its lifetime (its conflict clears while capacity is still tight, or vice versa);
+ *  sharing one counter would let an exhausted conflict-skip count silently exhaust the capacity
+ *  allowance too, or vice versa, for a reason that never actually applied to this head. No
+ *  `blockedSince`/grace field — see resolveCapacityBlock's doc comment for why the capacity path
+ *  is deliberately NOT time-bounded the way the conflict path is. */
+export function readCapacitySkipState(root) {
+  const raw = readJsonSafe(paths(root).capacitySkipState);
+  if (!raw || typeof raw.headId !== 'string' || !Number.isFinite(raw.count) || raw.count < 0) {
+    return { headId: null, count: 0, loggedPhase: null };
+  }
+  const loggedPhase = typeof raw.loggedPhase === 'string' ? raw.loggedPhase : null;
+  return { headId: raw.headId, count: raw.count, loggedPhase };
+}
+
+/** Capacity-block counterpart of recordSkip — same fail-CLOSED discipline (Codex review
+ *  precedent, see recordSkip's own doc comment above): a persistent write failure must refuse
+ *  the skip rather than let it happen uncounted, or a capacity-blocked head could be backfilled
+ *  past forever on a broken disk. */
+function recordCapacitySkip(root, headId) {
+  const prev = readCapacitySkipState(root);
+  const sameHead = prev.headId === headId;
+  const count = sameHead ? prev.count + 1 : 1;
+  const loggedPhase = sameHead ? prev.loggedPhase : null;
+  try {
+    atomicWriteJson(paths(root).capacitySkipState, { headId, count, loggedPhase });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * BRAIN-249 part 2: derive whether a capacity-blocked head's backfill allowance is exhausted,
+ * and log the transition (via logCapacityBlock, never per poll) exactly like resolveHeadBlock
+ * does for the conflict case — with one deliberate asymmetry: NO headBlockGraceMs equivalent.
+ * A conflict may never clear on its own (a lease can legitimately run for hours with nothing
+ * forcing it to finish), so refusing conflict backfill forever would starve every ticket behind
+ * it — hence the time-boxed grace period. A capacity block is different in kind: it is refused
+ * BECAUSE backfill would consume the very capacity the head needs, so the refusal is
+ * self-terminating — running work drains, the machine empties, and the head eventually fits and
+ * starts on its own. Adding a time-based "resume backfilling anyway" here would let backfill
+ * consume that same capacity indefinitely and could starve the head PERMANENTLY instead of
+ * temporarily. Do not add a grace period to this path.
+ */
+function resolveCapacityBlock(root, cfg, headId, headWeight, runningWeight, skipCount) {
+  const phase = skipCount < cfg.conflictSkipLimit ? 'blocked' : 'exhausted';
+  const state = readCapacitySkipState(root);
+  const sameHead = state.headId === headId;
+  const prevPhase = sameHead ? state.loggedPhase : null;
+  if (phase !== prevPhase) {
+    logCapacityBlock(root, {
+      event: phase === 'blocked' ? 'head-capacity-blocked' : 'capacity-backfill-refused',
+      headId,
+      headWeight,
+      runningWeight,
+      capacity: cfg.capacity,
+      skipCount,
+      skipLimit: cfg.conflictSkipLimit,
+    });
+    try {
+      atomicWriteJson(paths(root).capacitySkipState, { headId, count: skipCount, loggedPhase: phase });
+    } catch {
+      // best-effort — see recordCapacitySkip's doc comment for why the count itself must fail
+      // closed; only this logging/dedup write is allowed to be lossy.
+    }
+  }
+  return { phase };
+}
+
 /**
  * Walk the FIFO queue in order and return the first ticket with no
  * conflicting held lease, or null if every queued ticket up to and
@@ -209,10 +285,14 @@ function resolveHeadBlock(root, cfg, headId, blocker, sameHead, skipState, skipC
  * when the conflicting job ends) — see tryStart's own conflictSkipLimit
  * enforcement for the case (Codex review finding #6) where three or more
  * conflicting keys defeat that bound by alternating which one is held.
- * Capacity and the load/CPU gates do NOT skip this way — a capacity- or
- * gate-blocked head has no such bound and needs an aging/round-robin scheme
- * (a separate ticket), so this function never even looks past a head
- * blocked only by those.
+ *
+ * The load/CPU gates do NOT skip this way — a gate-blocked head has no such
+ * bound and needs an aging/round-robin scheme (a separate ticket), so this
+ * function never even looks past a head blocked only by those. Capacity
+ * DOES now have its own analogous bound — see selectCapacityCandidate below
+ * — but that is a separate walk with a separate exhaustion counter, invoked
+ * only when the head does not conflict at all; this function still only
+ * ever looks past a CONFLICT.
  *
  * A corrupt/unreadable queue record (listQueue represents these as `null`)
  * STOPS the walk rather than being skipped over (Codex review finding #7):
@@ -223,6 +303,25 @@ export function selectCandidate(queue, held) {
   for (const t of queue) {
     if (!t) return null;
     if (!held.some((l) => conflicts(t, l))) return t;
+  }
+  return null;
+}
+
+/**
+ * Like selectCandidate, but for the head-fits-capacity case (BRAIN-249 part 2): used only when
+ * the head itself does not conflict with anything held but simply does not fit under capacity
+ * (e.g. a weight-8 lane against an 8-wide machine with anything else running). Walks the queue
+ * for the first ticket that neither conflicts with anything held NOR would itself still exceed
+ * capacity if admitted — a conflicting ticket is skipped over exactly like selectCandidate does,
+ * and a ticket that has no conflict but also doesn't fit capacity is skipped over too (a lighter
+ * ticket further back may still fit), rather than stopping the walk. A corrupt/unreadable record
+ * (Codex review finding #7, same rationale as selectCandidate) still stops the walk outright.
+ */
+export function selectCapacityCandidate(queue, held, runningWeight, capacity) {
+  for (const t of queue) {
+    if (!t) return null;
+    if (held.some((l) => conflicts(t, l))) continue;
+    if (runningWeight + t.weight <= capacity) return t;
   }
   return null;
 }
@@ -294,6 +393,11 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       // head (a null record has no id to have matched `position` above).
       return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
     }
+    // Computed early (moved up from the real capacity check further below)
+    // because BRAIN-249 part 2 needs to know whether the HEAD itself fits
+    // before selection can even be decided, not just whether the eventual
+    // candidate fits.
+    const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
     const headConflicted = held.some((l) => conflicts(headTicket, l));
     const blocker = headConflicted ? held.find((l) => conflicts(headTicket, l)) : null;
     // Starvation bound (Codex review finding #6): a conflict-blocked head
@@ -317,23 +421,66 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     const skipCount = sameHead ? skipState.count : 0;
     const headBlock = headConflicted ? resolveHeadBlock(root, cfg, headTicket.id, blocker, sameHead, skipState, skipCount, now) : null;
     const skipExhausted = headConflicted && headBlock.phase === 'exhausted';
-    const candidate = !headConflicted ? headTicket : skipExhausted ? null : selectCandidate(queue, held);
+
+    // BRAIN-249 part 2: a head that does NOT conflict with anything held can
+    // still be blocked — it simply doesn't FIT under capacity/held weight
+    // (e.g. a weight-8 lane against an 8-wide machine with anything else
+    // running: `savoro:prepush` against `capacity: 8`, the live incident
+    // this covers). selectCandidate only ever looks past a CONFLICT, so a
+    // head like this was previously "selected" every poll (headConflicted
+    // is false) and denied at the real capacity check further below,
+    // forever — nothing behind it, however light and non-conflicting, ever
+    // got a turn; admission-decisions.log showed the same candidate denied
+    // `capacity` on every single poll. Apply the same skip-and-exhaust bound
+    // conflicts get, reusing conflictSkipLimit as the threshold but tracked
+    // in its own capacitySkipState (see readCapacitySkipState's doc
+    // comment) and, deliberately, with NO headBlockGraceMs equivalent (see
+    // resolveCapacityBlock's doc comment for why that would be actively
+    // wrong here).
+    const headCapacityBlocked = !headConflicted && runningWeight + headTicket.weight > cfg.capacity;
+    const capacitySkipState = headCapacityBlocked ? readCapacitySkipState(root) : null;
+    const capacitySameHead = headCapacityBlocked && capacitySkipState.headId === headTicket.id;
+    const capacitySkipCount = capacitySameHead ? capacitySkipState.count : 0;
+    const capacityBlock = headCapacityBlocked
+      ? resolveCapacityBlock(root, cfg, headTicket.id, headTicket.weight, runningWeight, capacitySkipCount)
+      : null;
+    const capacitySkipExhausted = headCapacityBlocked && capacityBlock.phase === 'exhausted';
+
+    const candidate = headConflicted
+      ? (skipExhausted ? null : selectCandidate(queue, held))
+      : headCapacityBlocked
+        ? (capacitySkipExhausted ? null : selectCapacityCandidate(queue, held, runningWeight, cfg.capacity))
+        : headTicket;
     if (!candidate) {
-      // Either nobody in the queue is conflict-free (selectCandidate found
-      // nothing, which implies the head itself conflicts too), or the head's
-      // skip allowance is exhausted (and still within headBlockGraceMs) and
-      // we deliberately stop looking past it. Either way the head is the one
-      // genuinely blocked here.
-      if (ticket.id === headTicket.id) {
+      // Either nobody in the queue is eligible (selectCandidate/
+      // selectCapacityCandidate found nothing), or the head's skip
+      // allowance for whichever reason applies here (conflict or capacity)
+      // is exhausted and we deliberately stop looking past it. Either way
+      // the head is the one genuinely blocked — EXCEPT for the
+      // headCapacityBlocked + "ticket is the head itself" combination,
+      // handled by the deliberate no-op comment below.
+      if (ticket.id !== headTicket.id) {
+        return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
+      }
+      if (headConflicted) {
         return { result: { started: false, reason: 'conflict', with: blocker.id, key: blocker.key } };
       }
-      return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
-    }
-    if (candidate.id !== ticket.id) {
-      // A non-conflicting ticket earlier in the queue gets to go first (or
-      // already has). This ticket just isn't up yet — same as the old
-      // strict-head "not-head", just computed against the conflict-skip
-      // selection instead of raw queue position.
+      // headCapacityBlocked, and this poll's own ticket IS the head: fall
+      // through to the real capacity check further below instead of
+      // returning a synthetic result here. Before BRAIN-249 part 2 existed,
+      // `candidate` was unconditionally `headTicket` whenever `!headConflicted`
+      // — this exact case always fell through to that real check, which sets
+      // `logFields` for logAdmissionDecision. Short-circuiting here instead
+      // would silently drop that admission-decision log line for a head that
+      // has nothing left behind it to backfill (tests/admission.test.js's
+      // "the admission decision log is written on a deny path too
+      // (capacity)" pins this). The eventual denial reason is 'capacity'
+      // either way — only whether it is logged differs.
+    } else if (candidate.id !== ticket.id) {
+      // A non-conflicting/fitting ticket earlier in the queue gets to go
+      // first (or already has). This ticket just isn't up yet — same as the
+      // old strict-head "not-head", just computed against the conflict/
+      // capacity-skip selection instead of raw queue position.
       return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
     }
     if (fs.existsSync(paths(root).pause)) {
@@ -384,7 +531,6 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'load-gate-closed' },
       };
     }
-    const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
     if (runningWeight + ticket.weight > cfg.capacity) {
       return {
         result: { started: false, reason: 'capacity', runningWeight, capacity: cfg.capacity },
@@ -431,6 +577,14 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       // can't be durably recorded, refuse the skip rather than let it
       // happen uncounted (see recordSkip's doc comment).
       if (!recordSkip(root, headTicket.id, now)) {
+        return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
+      }
+    } else if (ticket.id !== headTicket.id && headCapacityBlocked) {
+      // BRAIN-249 part 2: same event, same fail-CLOSED discipline as the
+      // conflict branch above, for a ticket genuinely skipping ahead of a
+      // head that doesn't fit capacity (see recordCapacitySkip's doc
+      // comment).
+      if (!recordCapacitySkip(root, headTicket.id)) {
         return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
       }
     }
