@@ -509,7 +509,21 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // flag suppressed), so shadow telemetry can tell "gate never got the
     // chance to matter" from "gate genuinely never closed".
     const loadGateIgnored = !cfg.admissionLoadGate && gate.closed;
-    const logBase = { candidateId: ticket.id, mode: cfg.schedulerMode, loadGateIgnored, ...cpuDecision };
+    const logBase = {
+      candidateId: ticket.id,
+      mode: cfg.schedulerMode,
+      loadGateIgnored,
+      ...cpuDecision,
+      // Provenance for the memory fields above: cpuDecision carries the byte
+      // arithmetic but not where the available-memory figure came from or
+      // what the OS reported about pressure, which is exactly what made the
+      // os.freemem() denial (BRAIN-252) undiagnosable from the log. `memInfo`
+      // is null when the reader throws, and readMemoryInfo reports a null
+      // macPressure off macOS or on a failed probe — formatAdmissionLog
+      // renders either as 'n/a'.
+      memorySource: memInfo?.source,
+      macPressure: memInfo?.macPressure,
+    };
     // What the CURRENT rule would decide, for telemetry (BRAIN-198's shadow
     // ledger needs to tell an ordinary admission from one only the idle
     // exemption allowed) — applies to every branch below that ends in a
