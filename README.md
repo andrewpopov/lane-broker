@@ -17,7 +17,7 @@ cache and `lane` breaks machine-wide. Pack first, then install the tarball:
 
 ```sh
 tmp=$(mktemp -d)
-(cd "$tmp" && npm pack "github:andrewpopov/lane-broker#v0.3.0")
+(cd "$tmp" && npm pack "github:andrewpopov/lane-broker#v0.4.0")
 npm install -g "$tmp"/*.tgz
 rm -rf "$tmp"
 ```
