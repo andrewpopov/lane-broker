@@ -151,10 +151,12 @@ export function sampleHostCpu(root, cpus = os.cpus()) {
 }
 
 /**
- * Best-effort available-memory + (on macOS) memory-pressure reading, for a
- * fail-safe only (ZIRK scheduler phase 1 does not gate admission on this
- * yet — see src/admission.js). Never throws: a failed pressure probe
- * reports `null`, exactly like a missing CPU sample does elsewhere here.
+ * Best-effort available-memory + (on macOS) memory-pressure reading. Gates
+ * admission via src/admission.js's evaluateMemoryAdmission (macPressure
+ * 'critical' denies outright; the byte figures feed the headroom checks) —
+ * see also scheduler.js's own hard 'critical' brake ahead of that. Never
+ * throws: a failed pressure probe reports `null`, exactly like a missing
+ * CPU sample does elsewhere here.
  */
 export function readMemoryInfo(exec = execFileSync) {
   const capacity = detectResourceCapacity();

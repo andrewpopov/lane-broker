@@ -348,6 +348,8 @@ export function formatAdmissionLog(f) {
     `candidateMemoryBytes=${f.candidateMemoryBytes ?? 'n/a'}`,
     `projectedAvailableBytes=${f.projectedAvailableBytes ?? 'n/a'}`,
     `memoryBudgetBytes=${f.memoryBudgetBytes ?? 'n/a'}`,
+    `memorySource=${f.memorySource ?? 'n/a'}`,
+    `macPressure=${f.macPressure ?? 'n/a'}`,
     `cpuGate=${f.cpuGateClosed ? 'closed' : 'open'}`,
     `cooldown=${f.cooldownBlocked ? 'blocked' : 'clear'}`,
     `bias=${KNOWN_BIAS_NOTE}`,

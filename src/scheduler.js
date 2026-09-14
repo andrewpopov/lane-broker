@@ -509,7 +509,14 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // flag suppressed), so shadow telemetry can tell "gate never got the
     // chance to matter" from "gate genuinely never closed".
     const loadGateIgnored = !cfg.admissionLoadGate && gate.closed;
-    const logBase = { candidateId: ticket.id, mode: cfg.schedulerMode, loadGateIgnored, ...cpuDecision };
+    const logBase = {
+      candidateId: ticket.id,
+      mode: cfg.schedulerMode,
+      loadGateIgnored,
+      memorySource: memInfo ? memInfo.source : null,
+      macPressure: memInfo ? memInfo.macPressure : null,
+      ...cpuDecision,
+    };
     // What the CURRENT rule would decide, for telemetry (BRAIN-198's shadow
     // ledger needs to tell an ordinary admission from one only the idle
     // exemption allowed) — applies to every branch below that ends in a
