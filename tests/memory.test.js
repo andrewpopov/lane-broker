@@ -6,10 +6,11 @@ import os from 'node:os';
 import {
   parseSwapUsage,
   parseVmStat,
+  parseVmStatAvailable,
   classifyMemorySample,
   readMemorySample,
-  SWAP_TIGHT_PCT,
-  SWAP_EXHAUSTED_PCT,
+  AVAILABLE_TIGHT_PCT,
+  AVAILABLE_EXHAUSTED_PCT,
 } from '../src/memory.js';
 
 test('parseSwapUsage reads total/used out of real sysctl-shaped text', () => {
@@ -44,26 +45,104 @@ test('parseVmStat returns both fields null when either is missing/malformed', ()
   });
 });
 
-test('classifyMemorySample: healthy well below the tight threshold', () => {
-  const sample = { swapUsedBytes: 100 * 1024 * 1024, swapTotalBytes: 2048 * 1024 * 1024, compressorBytes: 50 * 1024 * 1024, sampledAt: 1 };
+test('parseVmStatAvailable reads free+inactive+speculative out of real vm_stat-shaped text', () => {
+  const text = [
+    'Mach Virtual Memory Statistics: (page size of 16384 bytes)',
+    'Pages free:                              105036.',
+    'Pages inactive:                          1180377.',
+    'Pages speculative:                       10655.',
+    '',
+  ].join('\n');
+  assert.equal(parseVmStatAvailable(text), 16384 * (105036 + 1180377 + 10655));
+});
+
+const GiB = 1024 * 1024 * 1024;
+
+// BRAIN-273: the whole point of this table is rows 1 and 3, where a
+// swap-based classifier and an availability-based classifier disagree.
+// Row 1 uses the REAL measured incident numbers from the ticket, not
+// invented ones: swap 25494/26624MB (95.8%), available 17.06GiB of 48GiB.
+test('classifyMemorySample: high swap + high availability is healthy (the BRAIN-273 incident shape, real numbers)', () => {
+  const sample = {
+    swapUsedBytes: 25494 * 1024 * 1024,
+    swapTotalBytes: 26624 * 1024 * 1024,
+    compressorBytes: 24833 * 1024 * 1024,
+    availableBytes: 17.06 * GiB,
+    totalMemoryBytes: 48 * GiB,
+    sampledAt: 1,
+  };
   const c = classifyMemorySample(sample);
   assert.equal(c.level, 'healthy');
-  assert.ok(c.swapUsedPct < SWAP_TIGHT_PCT);
+  assert.ok(c.swapUsedPct > 90, 'sanity: this fixture really is high-swap');
+  assert.ok(c.availablePct > AVAILABLE_TIGHT_PCT);
 });
 
-test('classifyMemorySample: tight between the two thresholds', () => {
-  const sample = { swapUsedBytes: 1200 * 1024 * 1024, swapTotalBytes: 2048 * 1024 * 1024, compressorBytes: null, sampledAt: 1 };
-  const c = classifyMemorySample(sample);
-  assert.equal(c.level, 'tight');
-  assert.ok(c.swapUsedPct >= SWAP_TIGHT_PCT && c.swapUsedPct < SWAP_EXHAUSTED_PCT);
-});
-
-test('classifyMemorySample: exhausted at/above the exhausted threshold (the 2026-09-09 incident shape)', () => {
-  // 42GB swap used out of a 44GB total -- the actual incident figures.
-  const sample = { swapUsedBytes: 42 * 1024 * 1024 * 1024, swapTotalBytes: 44 * 1024 * 1024 * 1024, compressorBytes: 8 * 1024 * 1024 * 1024, sampledAt: 1 };
+test('classifyMemorySample: high swap + low availability is exhausted', () => {
+  const sample = {
+    swapUsedBytes: 25494 * 1024 * 1024,
+    swapTotalBytes: 26624 * 1024 * 1024,
+    compressorBytes: 24833 * 1024 * 1024,
+    availableBytes: 0.5 * GiB,
+    totalMemoryBytes: 48 * GiB,
+    sampledAt: 1,
+  };
   const c = classifyMemorySample(sample);
   assert.equal(c.level, 'exhausted');
-  assert.ok(c.swapUsedPct >= SWAP_EXHAUSTED_PCT);
+  assert.ok(c.availablePct <= AVAILABLE_EXHAUSTED_PCT);
+});
+
+test('classifyMemorySample: low swap + low availability is exhausted (availability drives the verdict, not swap)', () => {
+  const sample = {
+    swapUsedBytes: 0.05 * GiB,
+    swapTotalBytes: 1 * GiB,
+    compressorBytes: null,
+    availableBytes: 0.5 * GiB,
+    totalMemoryBytes: 48 * GiB,
+    sampledAt: 1,
+  };
+  const c = classifyMemorySample(sample);
+  assert.equal(c.level, 'exhausted');
+  assert.ok(c.swapUsedPct < AVAILABLE_EXHAUSTED_PCT, 'sanity: this fixture really is low-swap');
+});
+
+test('classifyMemorySample: low swap + high availability is healthy', () => {
+  const sample = {
+    swapUsedBytes: 0.1 * GiB,
+    swapTotalBytes: 1 * GiB,
+    compressorBytes: null,
+    availableBytes: 17 * GiB,
+    totalMemoryBytes: 48 * GiB,
+    sampledAt: 1,
+  };
+  const c = classifyMemorySample(sample);
+  assert.equal(c.level, 'healthy');
+});
+
+test('classifyMemorySample: tight between the two availability thresholds', () => {
+  const sample = {
+    swapUsedBytes: 1 * GiB,
+    swapTotalBytes: 2 * GiB,
+    compressorBytes: null,
+    availableBytes: 5 * GiB, // 5/48 = ~10.4%, between AVAILABLE_EXHAUSTED_PCT (8) and AVAILABLE_TIGHT_PCT (15)
+    totalMemoryBytes: 48 * GiB,
+    sampledAt: 1,
+  };
+  const c = classifyMemorySample(sample);
+  assert.equal(c.level, 'tight');
+});
+
+test('classifyMemorySample: missing availability yields null (unavailable), never a swap-derived guess', () => {
+  // Same swap numbers as the incident fixture above, but no availability
+  // signal at all -- this must NOT fall back to classifying off swap.
+  assert.equal(
+    classifyMemorySample({
+      swapUsedBytes: 25494 * 1024 * 1024,
+      swapTotalBytes: 26624 * 1024 * 1024,
+      compressorBytes: 24833 * 1024 * 1024,
+      sampledAt: 1,
+    }),
+    null,
+  );
 });
 
 test('classifyMemorySample: null sample yields null classification, never a fabricated 0%', () => {
@@ -172,10 +251,26 @@ test('readMemorySample does not accept blank override fields as a zeroed sample'
 });
 
 // Codex also flagged the absence of a zero-total fixture. classifyMemorySample
-// guards the division, but nothing pinned that it stays guarded.
+// guards the division, but nothing pinned that it stays guarded. Swap is now
+// display-context only, but a zero swap total must still render as 0%, never
+// NaN, alongside a real availability-derived verdict.
 test('classifyMemorySample: a zero swap total does not divide by zero or emit NaN', () => {
-  const c = classifyMemorySample({ swapUsedBytes: 0, swapTotalBytes: 0, compressorBytes: 0, sampledAt: 1 });
+  const c = classifyMemorySample({
+    swapUsedBytes: 0,
+    swapTotalBytes: 0,
+    compressorBytes: 0,
+    availableBytes: 17 * GiB,
+    totalMemoryBytes: 48 * GiB,
+    sampledAt: 1,
+  });
   assert.ok(Number.isFinite(c.swapUsedPct), 'swapUsedPct must be finite, never NaN');
   assert.equal(c.swapUsedPct, 0);
   assert.equal(c.level, 'healthy');
+});
+
+test('classifyMemorySample: a zero total memory yields null rather than dividing by zero', () => {
+  assert.equal(
+    classifyMemorySample({ swapUsedBytes: 0, swapTotalBytes: 0, compressorBytes: 0, availableBytes: 0, totalMemoryBytes: 0, sampledAt: 1 }),
+    null,
+  );
 });

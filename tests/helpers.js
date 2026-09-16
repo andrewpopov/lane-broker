@@ -83,10 +83,18 @@ export function writeCpuBusyFile(base, hostBusyCores, cores) {
   return file;
 }
 
-/** Memory-telemetry equivalent of writeLoadFile, for LANE_BROKER_MEMORY_FILE. */
-export function writeMemoryFile(base, swapUsedBytes, swapTotalBytes, compressorBytes) {
+/**
+ * Memory-telemetry equivalent of writeLoadFile, for LANE_BROKER_MEMORY_FILE.
+ * `availableBytes`/`totalMemoryBytes` (BRAIN-273) are optional -- omitting
+ * them exercises the "no availability signal" -> unavailable path.
+ */
+export function writeMemoryFile(base, swapUsedBytes, swapTotalBytes, compressorBytes, availableBytes, totalMemoryBytes) {
   const file = path.join(base, 'memory');
-  fs.writeFileSync(file, `${swapUsedBytes},${swapTotalBytes},${compressorBytes}`);
+  const fields = [swapUsedBytes, swapTotalBytes, compressorBytes];
+  if (availableBytes !== undefined || totalMemoryBytes !== undefined) {
+    fields.push(availableBytes, totalMemoryBytes);
+  }
+  fs.writeFileSync(file, fields.join(','));
   return file;
 }
 

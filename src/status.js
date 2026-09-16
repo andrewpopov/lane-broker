@@ -202,17 +202,26 @@ function fmtMB(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(0)}MB`;
 }
 
-/** BRAIN-211: the memory line is informational-only, always — there is no
- *  admission flag to gate it on like loadGate.admission, since nothing ever
- *  reads this reading back for a start decision. */
+/** BRAIN-211/BRAIN-273: the memory line is informational-only, always —
+ *  there is no admission flag to gate it on like loadGate.admission, since
+ *  nothing ever reads this reading back for a start decision. The verdict
+ *  (HEALTHY/TIGHT/EXHAUSTED) is driven by actual availability
+ *  (classifyMemorySample); swap and compressor are appended only as
+ *  footprint context, explicitly labeled as such — see memory.js's
+ *  AVAILABLE_TIGHT_PCT comment for why swap can never drive the verdict. */
 function renderMemoryLine(memory) {
   if (!memory) {
-    return 'memory: unavailable (no swap sample — see docs on BRAIN-211) [informational]';
+    return 'memory: unavailable (no vm_stat availability sample — see BRAIN-273) [informational]';
   }
-  const compressor = memory.compressorBytes == null ? '' : `, compressor ${fmtMB(memory.compressorBytes)}`;
+  const swapFootprint =
+    memory.swapUsedPct == null
+      ? ''
+      : ` swap footprint ${fmtMB(memory.swapUsedBytes)}/${fmtMB(memory.swapTotalBytes)} ${memory.swapUsedPct.toFixed(1)}%,`;
+  const compressor = memory.compressorBytes == null ? '' : ` compressor ${fmtMB(memory.compressorBytes)}`;
+  const context = `${swapFootprint}${compressor}`.trim();
   return (
-    `memory: ${memory.level.toUpperCase()} (swap ${fmtMB(memory.swapUsedBytes)}/${fmtMB(memory.swapTotalBytes)}` +
-    ` ${memory.swapUsedPct.toFixed(1)}%${compressor}) [informational]`
+    `memory: ${memory.level.toUpperCase()} (available ${fmtMB(memory.availableBytes)}/${fmtMB(memory.totalMemoryBytes)}` +
+    ` ${memory.availablePct.toFixed(1)}%${context ? `; ${context}` : ''}) [informational]`
   );
 }
 
