@@ -9,10 +9,19 @@ import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 // admission -- see memory.js and scheduler.js's own (separate, pre-existing)
 // macPressure brake for why this must never become a second one.
 
-test('lane status renders the memory line with an injected exhausted reading', async () => {
+test('lane status renders the memory line with an injected exhausted reading (low availability, BRAIN-273)', async () => {
   const { home, state, base } = freshEnv();
   writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
-  const memoryFile = writeMemoryFile(base, 42 * 1024 * 1024 * 1024, 44 * 1024 * 1024 * 1024, 8 * 1024 * 1024 * 1024);
+  // High swap AND low availability -- both signals agree here, unlike the
+  // BRAIN-273 incident fixture below. 0.5GiB available of 48GiB total.
+  const memoryFile = writeMemoryFile(
+    base,
+    42 * 1024 * 1024 * 1024,
+    44 * 1024 * 1024 * 1024,
+    8 * 1024 * 1024 * 1024,
+    0.5 * 1024 * 1024 * 1024,
+    48 * 1024 * 1024 * 1024,
+  );
 
   const result = await laneRun(['status'], {
     env: { ...process.env, LANE_BROKER_HOME: home, LANE_BROKER_STATE: state, LANE_BROKER_MEMORY_FILE: memoryFile },
@@ -28,7 +37,14 @@ test('lane status renders the memory line with an injected exhausted reading', a
 test('lane status renders the memory line with an injected healthy reading', async () => {
   const { home, state, base } = freshEnv();
   writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
-  const memoryFile = writeMemoryFile(base, 100 * 1024 * 1024, 2048 * 1024 * 1024, 50 * 1024 * 1024);
+  const memoryFile = writeMemoryFile(
+    base,
+    100 * 1024 * 1024,
+    2048 * 1024 * 1024,
+    50 * 1024 * 1024,
+    17 * 1024 * 1024 * 1024,
+    48 * 1024 * 1024 * 1024,
+  );
 
   const result = await laneRun(['status'], {
     env: { ...process.env, LANE_BROKER_HOME: home, LANE_BROKER_STATE: state, LANE_BROKER_MEMORY_FILE: memoryFile },
@@ -36,6 +52,31 @@ test('lane status renders the memory line with an injected healthy reading', asy
 
   assert.equal(result.code, 0, `expected exit 0; got ${result.code}, stderr: ${result.stderr}`);
   assert.match(result.stdout, /memory: HEALTHY/);
+});
+
+// BRAIN-273: the actual bug -- a machine with near-full swap (95.8%, the
+// real incident figure) but healthy real availability (17.06GiB of 48GiB,
+// the real incident figure) must render HEALTHY, not EXHAUSTED. This is the
+// exact shape a swap-ratio classifier gets backwards.
+test('lane status renders HEALTHY when swap is exhausted-looking but real availability is fine (the BRAIN-273 incident shape)', async () => {
+  const { home, state, base } = freshEnv();
+  writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
+  const memoryFile = writeMemoryFile(
+    base,
+    25494 * 1024 * 1024,
+    26624 * 1024 * 1024,
+    24833 * 1024 * 1024,
+    17.06 * 1024 * 1024 * 1024,
+    48 * 1024 * 1024 * 1024,
+  );
+
+  const result = await laneRun(['status'], {
+    env: { ...process.env, LANE_BROKER_HOME: home, LANE_BROKER_STATE: state, LANE_BROKER_MEMORY_FILE: memoryFile },
+  });
+
+  assert.equal(result.code, 0, `expected exit 0; got ${result.code}, stderr: ${result.stderr}`);
+  assert.match(result.stdout, /memory: HEALTHY/);
+  assert.match(result.stdout, /swap footprint/);
 });
 
 test('renderStatusText degrades gracefully when the memory sample is unavailable (null), never crashing or printing undefined/NaN', () => {
