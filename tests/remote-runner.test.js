@@ -253,7 +253,11 @@ test('an undeclared lane in the snapshot\'s own .lane-broker.json is refused', a
 
   const result = await getResult(header.ticketId, root, env);
   assert.equal(result.kind, 'refused');
-  assert.equal(result.exit, null);
+  // BRAIN-319 T3a: the recorded exit is the actual preflight refusal code
+  // (64 = ConfigError, matching src/run.js's "unknown lane" refusal) --
+  // a remote-client caller trusts this as the real exit status (see
+  // src/remote-client.js's isGreen/dispatchRemote), so it must never be null.
+  assert.equal(result.exit, 64);
 });
 
 // ---- fresh admission: I4 ----

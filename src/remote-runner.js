@@ -298,6 +298,12 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     kind = 'cancelled';
   } else if (PREFLIGHT_REFUSAL_EXIT_CODES.has(runOutcome.exitCode)) {
     kind = 'refused';
+    // BRAIN-319 T3a: record the actual preflight refusal code (64/69/2) so a
+    // client can trust it as the exit status -- there is no structured
+    // result record for a preflight refusal (run.js returns before ever
+    // calling idOverride/onTicketCreated), so runOutcome.exitCode is the
+    // only place this value exists.
+    exit = runOutcome.exitCode;
   } else {
     kind = 'unfinished';
   }

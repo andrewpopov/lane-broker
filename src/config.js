@@ -134,6 +134,41 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isInteger(cfg.laneNice) && cfg.laneNice >= 0 && cfg.laneNice <= 19,
     `${sourcePath}: "laneNice" must be an integer in [0, 19]`,
   );
+  if (cfg.runners !== undefined) validateRunners(cfg.runners, sourcePath);
+}
+
+const RUNNER_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+
+/**
+ * BRAIN-319 T3a: `runners` is optional and absent by default, so a config
+ * written before this field exists still loads unchanged (I6). Each entry's
+ * `ssh` is a destination string handed to the ssh binary as its OWN argv
+ * element (never through a shell) -- rejecting a leading `-` here is the
+ * only line of defense against it being read as an ssh option instead of a
+ * destination.
+ */
+function validateRunners(runners, sourcePath) {
+  assert(Array.isArray(runners), `${sourcePath}: "runners" must be an array`);
+  const seenNames = new Set();
+  for (const runner of runners) {
+    assert(runner && typeof runner === 'object', `${sourcePath}: each "runners" entry must be an object`);
+    assert(
+      typeof runner.name === 'string' && RUNNER_NAME_RE.test(runner.name),
+      `${sourcePath}: runner "name" must match ${RUNNER_NAME_RE}`,
+    );
+    assert(!seenNames.has(runner.name), `${sourcePath}: duplicate runner name "${runner.name}"`);
+    seenNames.add(runner.name);
+    assert(
+      typeof runner.ssh === 'string' && runner.ssh.length > 0 && !runner.ssh.startsWith('-'),
+      `${sourcePath}: runner "${runner.name}".ssh must be a non-empty string not starting with "-"`,
+    );
+    if (runner.root !== undefined) {
+      assert(typeof runner.root === 'string' && runner.root.length > 0, `${sourcePath}: runner "${runner.name}".root must be a non-empty string`);
+    }
+    if (runner.shell !== undefined) {
+      assert(typeof runner.shell === 'string' && runner.shell.length > 0, `${sourcePath}: runner "${runner.name}".shell must be a non-empty string`);
+    }
+  }
 }
 
 function validateRepoConfig(cfg, sourcePath) {
@@ -163,6 +198,9 @@ function validateRepoConfig(cfg, sourcePath) {
         Number.isInteger(lane.maxConcurrent) && lane.maxConcurrent >= 1,
         `${sourcePath}: lane "${name}".maxConcurrent must be an integer >= 1`,
       );
+    }
+    if (lane.remote !== undefined) {
+      assert(typeof lane.remote === 'boolean', `${sourcePath}: lane "${name}".remote must be a boolean`);
     }
   }
   if (cfg.conflicts !== undefined) {
@@ -407,5 +445,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     // equivalent of `laneNice` to fall back to.
     maxConcurrent: Number.isInteger(laneCfg.maxConcurrent) ? laneCfg.maxConcurrent : 1,
     conflicts,
+    // BRAIN-319 T3a: opt-in per lane, defaulted false so a repo config
+    // written before this field exists resolves identically (I6).
+    remote: laneCfg.remote === true,
   };
 }
