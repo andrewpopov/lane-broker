@@ -143,3 +143,55 @@ test('a caller killed with SIGKILL does not stop the lane; it still finishes and
   assert.match(logged, new RegExp(postKillMark), 'the post-kill output must still reach the log');
   assert.doesNotMatch(logged, /lane-broker supervisor error/, 'the supervisor must not crash when the caller disappears');
 });
+
+test('a queued foreground caller\'s stderr carries only its own child\'s output, never broker telemetry (BRAIN-308 follow-up)', async () => {
+  const { base, state, repoDir, env } = setup();
+  const holderLog = path.join(base, 'holder.log');
+  const waiterLog = path.join(base, 'waiter.log');
+  const errMark = 'WAITER-ERR-MARK-b41';
+
+  // First foreground run holds the `same/default` key for long enough (several
+  // sampleMs=100 polls) that the second run must actually wait in the queue
+  // rather than start immediately.
+  const holder = laneRun(
+    ['run', '--repo', 'same', '--lane', 'default', '--log', holderLog, '--', 'sh', '-c', 'sleep 1.5'],
+    { env, cwd: repoDir },
+  );
+
+  await waitFor(() => {
+    try {
+      return fs.readdirSync(paths(state).leases).some((n) => n.endsWith('.json'));
+    } catch {
+      return false;
+    }
+  });
+
+  const waiter = laneRun(
+    ['run', '--repo', 'same', '--lane', 'default', '--log', waiterLog, '--', 'sh', '-c', `echo ${errMark} >&2`],
+    { env, cwd: repoDir },
+  );
+
+  const [holderResult, waiterResult] = await Promise.all([holder, waiter]);
+
+  assert.equal(holderResult.code, 0, `holder stderr: ${holderResult.stderr}`);
+  assert.equal(waiterResult.code, 0, `waiter stderr: ${waiterResult.stderr}`);
+  assert.match(waiterResult.stderr, new RegExp(errMark), 'caller stderr must contain its own child\'s marker');
+  assert.doesNotMatch(
+    waiterResult.stderr,
+    /^lane-broker-admission/m,
+    `queued caller's stderr must not carry broker admission telemetry: ${waiterResult.stderr}`,
+  );
+  assert.doesNotMatch(
+    waiterResult.stderr,
+    /^lane-broker-head-block/m,
+    `queued caller's stderr must not carry broker head-block telemetry: ${waiterResult.stderr}`,
+  );
+  assert.doesNotMatch(
+    waiterResult.stderr,
+    /^lane-broker-capacity/m,
+    `queued caller's stderr must not carry broker capacity telemetry: ${waiterResult.stderr}`,
+  );
+
+  const admissionLogged = fs.readFileSync(paths(state).admissionLog, 'utf8');
+  assert.match(admissionLogged, /^lane-broker-admission/m, 'the admission-decisions log file must still receive telemetry');
+});

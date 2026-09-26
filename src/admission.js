@@ -367,19 +367,14 @@ export function formatAdmissionLog(f) {
 /**
  * Shared low-level writer for every broker-side log line, admission
  * decisions and BRAIN-249's head-block lines alike: append to a real file
- * under the broker's state root (alongside the other admission sidecars) in
- * addition to stderr, both best-effort. Codex review finding #2: production
- * supervisors are spawned with stdio: 'ignore' (run.js), so stderr-only
- * logging is silently discarded on every real run — a poll loop that never
- * writes to the shared file would have no readable output at all. Neither
- * write ever throws, since a logging failure must never affect scheduling.
+ * under the broker's state root (alongside the other admission sidecars),
+ * best-effort. The file is the one durable, greppable record. Never stderr:
+ * a foreground `lane run` forwards the supervisor's stderr to its caller
+ * (BRAIN-308), where it belongs to the child's own output, and an admission
+ * line fires once per poll while a candidate waits. Never throws, since a
+ * logging failure must never affect scheduling.
  */
 function writeBrokerLog(root, line) {
-  try {
-    process.stderr.write(line);
-  } catch {
-    // best-effort
-  }
   try {
     fs.appendFileSync(paths(root).admissionLog, line);
   } catch {
