@@ -15,22 +15,11 @@ LABEL="${LABEL:-${1:-verify}}"
 # `lane` binary that isn't actually on PATH there must still fall back
 # rather than fail the push outright).
 if [ -z "$LANE_BROKER_LEASE" ] && command -v lane >/dev/null 2>&1; then
-  # `lane run` swallows the child's stdout/stderr into its log file, so a
-  # failure here is otherwise silent. Point it at a scratch log and replay
-  # that log on failure only; always clean it up, and never let this
-  # replay step change the suite's own exit code.
-  log_file="$(mktemp "${TMPDIR:-/tmp}/lane-broker-verify.XXXXXX")"
-  set +e
-  lane run --repo lane-broker --lane prepush --log "$log_file" -- npm test
-  status=$?
-  set -e
-  if [ "$status" -ne 0 ]; then
-    echo "$LABEL: npm test failed under lane run (exit $status); log follows:" >&2
-    cat "$log_file" >&2
-    rm -f "$log_file"
-    exit "$status"
-  fi
-  rm -f "$log_file"
+  # Foreground `lane run` streams the child's stdout/stderr straight through
+  # (BRAIN-308), so a failure here is no longer silent and there's nothing to
+  # replay -- the default per-id log under lane-broker's own state dir is
+  # enough; no need for a scratch --log path here.
+  lane run --repo lane-broker --lane prepush -- npm test
 else
   echo "$LABEL: running npm test directly (no lane broker on PATH, or already inside a lane)"
   npm test

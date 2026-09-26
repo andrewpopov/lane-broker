@@ -164,6 +164,88 @@ class CappedLogWriter {
 }
 
 /**
+ * Tees child output to the supervisor's OWN stdout/stderr, so a foreground
+ * `lane run` caller sees it live alongside the `--log` file (BRAIN-308).
+ * Same write()/pauseUntilDrain() contract as CappedLogWriter so both share
+ * one gated source (see backpressureGate below) without either knowing the
+ * other exists -- this class never touches the log or the cap, only the
+ * pipe back to the caller.
+ *
+ * The caller can vanish out from under this pipe (SIGKILL): its read end
+ * closes, and the next write here gets an async EPIPE 'error' (macOS pipes
+ * are async). Forwarding must then stop permanently without taking the lane
+ * down -- the child keeps running, logging, and finishing normally either
+ * way. Unlike CappedLogWriter, this stream (the supervisor's own
+ * process.stdout/stderr) is never ours to close, so there is no `finish()`
+ * here -- see `drain()`, called instead at exit.
+ */
+class ForwardWriter {
+  constructor(stream) {
+    this.stream = stream;
+    this.failed = false;
+    this.pausedSources = new Set();
+    stream.on('error', () => {
+      this.failed = true;
+      for (const src of this.pausedSources) src.resume();
+      this.pausedSources.clear();
+    });
+  }
+
+  write(chunk) {
+    if (this.failed) return true;
+    return this.stream.write(chunk);
+  }
+
+  pauseUntilDrain(source) {
+    if (this.failed) return;
+    source.pause();
+    this.pausedSources.add(source);
+    this.stream.once('drain', () => {
+      this.pausedSources.delete(source);
+      source.resume();
+    });
+  }
+
+  /** Await pending writes actually reaching the OS pipe before process.exit()
+   *  -- on macOS a pipe write is async, and process.exit() can otherwise drop
+   *  its tail. Bounded so a caller that stopped reading (not erroring) can't
+   *  wedge the lease release forever. */
+  drain(timeoutMs = 2000) {
+    if (this.failed || this.stream.writableLength === 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      const timer = setTimeout(resolve, timeoutMs);
+      this.stream.once('drain', () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
+  }
+}
+
+/**
+ * The log writer and a ForwardWriter both call pauseUntilDrain(source) on
+ * the same child.stdout/child.stderr independently, each unaware of the
+ * other. Handed this gate instead of the raw stream, they still just call
+ * source.pause()/source.resume() -- but the gate only actually pauses the
+ * real stream on the first blocker and only resumes it once every blocker
+ * has drained (or failed), so neither writer's backpressure gets silently
+ * dropped by the other draining first.
+ */
+function backpressureGate(source) {
+  let blockers = 0;
+  return {
+    pause() {
+      blockers += 1;
+      if (blockers === 1) source.pause();
+    },
+    resume() {
+      blockers = Math.max(0, blockers - 1);
+      if (blockers === 0) source.resume();
+    },
+  };
+}
+
+/**
  * Pure: resolve a ticket's `cmd` into the actual [cmd, args] a lane's child
  * should be spawned with (BRAIN-207). `nice -n <n> cmd args...` execs `cmd`
  * in place (it doesn't fork+wait), so the spawned process's pid/pgid, exit
@@ -281,11 +363,25 @@ async function main() {
   });
 
   const logWriter = new CappedLogWriter(ticket.logPath);
+  // ticket.forwardOutput (BRAIN-308) is set explicitly by run.js's foreground
+  // path, not inferred from our own fd state -- a --detach caller never even
+  // connects a pipe here (see run.js), so there is nothing to guess from.
+  const forwardOutput = ticket.forwardOutput === true;
+  const stdoutForward = forwardOutput ? new ForwardWriter(process.stdout) : null;
+  const stderrForward = forwardOutput ? new ForwardWriter(process.stderr) : null;
+  const stdoutGate = backpressureGate(child.stdout);
+  const stderrGate = backpressureGate(child.stderr);
   child.stdout.on('data', (c) => {
-    if (!logWriter.write(c)) logWriter.pauseUntilDrain(child.stdout);
+    const loggedOk = logWriter.write(c);
+    const forwardedOk = stdoutForward ? stdoutForward.write(c) : true;
+    if (!loggedOk) logWriter.pauseUntilDrain(stdoutGate);
+    if (!forwardedOk) stdoutForward.pauseUntilDrain(stdoutGate);
   });
   child.stderr.on('data', (c) => {
-    if (!logWriter.write(c)) logWriter.pauseUntilDrain(child.stderr);
+    const loggedOk = logWriter.write(c);
+    const forwardedOk = stderrForward ? stderrForward.write(c) : true;
+    if (!loggedOk) logWriter.pauseUntilDrain(stderrGate);
+    if (!forwardedOk) stderrForward.pauseUntilDrain(stderrGate);
   });
 
   writeLease(root, { ...started.lease, childPgid: child.pid, heartbeatAt: Date.now(), startedAt });
@@ -326,6 +422,12 @@ async function main() {
     // result / release the lease until the whole group is confirmed gone.
     if (killPromise) await killPromise;
     await logWriter.finish();
+    // Flush the forward pipes before exiting (BRAIN-308) -- process.exit()
+    // below can otherwise drop the async tail of a macOS pipe write. Skipped
+    // once a writer has failed (dead caller): draining a pipe nobody is
+    // reading would just wait out its own bounded timeout for nothing.
+    if (stdoutForward) await stdoutForward.drain();
+    if (stderrForward) await stderrForward.drain();
     atomicWriteJson(ticket.resultPath, result);
     appendHistory(root, {
       id: ticket.id,

@@ -98,7 +98,12 @@ export function writeMemoryFile(base, swapUsedBytes, swapTotalBytes, compressorB
   return file;
 }
 
-/** Spawn `lane <args>` and resolve with { code, stdout, stderr } on exit. */
+/** Spawn `lane <args>` and resolve with { code, stdout, stderr } once stdio is
+ *  fully drained. Waits for 'close' rather than 'exit': 'exit' can fire
+ *  before a piped chunk still in flight is delivered (BRAIN-308's foreground
+ *  streaming made this observable -- a large forwarded stdout could resolve
+ *  before its tail arrived), so an assertion on captured output must wait
+ *  for 'close' the same way the supervisor's own child listener does. */
 export function laneRun(args, { env, cwd } = {}) {
   return new Promise((resolve) => {
     const child = spawn(process.execPath, [BIN, ...args], { env, cwd: cwd || process.cwd() });
@@ -110,7 +115,7 @@ export function laneRun(args, { env, cwd } = {}) {
     child.stderr.on('data', (d) => {
       stderr += d;
     });
-    child.on('exit', (code) => resolve({ code, stdout, stderr }));
+    child.on('close', (code) => resolve({ code, stdout, stderr }));
   });
 }
 

@@ -24,6 +24,23 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Await a readable stream reaching 'end'/'close', bounded so a stream that
+ *  never ends (shouldn't happen -- the supervisor has already exited by the
+ *  time this is called) can't hang `lane run` forever (BRAIN-308). */
+function waitForStreamEnd(stream, timeoutMs = 2000) {
+  if (!stream || stream.readableEnded || stream.destroyed) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    const done = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    stream.once('end', done);
+    stream.once('close', done);
+    stream.once('error', done);
+  });
+}
+
 function fmtAgo(ms) {
   const s = Math.floor(ms / 1000);
   if (s < 60) return `${s}s`;
@@ -234,6 +251,10 @@ export async function runCommand({
     createdAt: Date.now(),
     logPath,
     resultPath,
+    // Told explicitly rather than inferred from fd state on the supervisor
+    // side (BRAIN-308): a `--detach` caller's own stdio is irrelevant to the
+    // supervisor, which never even inherits it (stdio stays 'ignore' below).
+    forwardOutput: !detach,
   };
 
   // Create the log file at registration, before the supervisor is spawned,
@@ -251,7 +272,10 @@ export async function runCommand({
       [supervisorPath],
       {
         detached: true,
-        stdio: 'ignore',
+        // A detached caller must never hold the supervisor's pipes -- `ID=$(lane
+        // run --detach ...)` has to return immediately, so only a foreground
+        // (waiting) caller gets piped stdio to forward (BRAIN-308).
+        stdio: detach ? 'ignore' : ['ignore', 'pipe', 'pipe'],
         env: {
           ...process.env,
           LANE_BROKER_TICKET: Buffer.from(JSON.stringify(ticket)).toString('base64'),
@@ -285,6 +309,52 @@ export async function runCommand({
     return { exitCode: 0 };
   }
 
+  // Foreground only, from here on: tee the supervisor's own stdout/stderr
+  // (which is where the supervisor tees the child's output -- see
+  // src/supervisor.js) straight through to ours, stream-separated, so a
+  // waiting caller sees the child's output live instead of only its exit
+  // code (BRAIN-308). `--log` keeps writing the same bytes independently.
+  // `.pipe(dest, { end: false })` rather than a manual 'data' handler so
+  // dest's own backpressure (its 'drain' event) is respected automatically.
+  //
+  // Our OWN stdout/stderr can itself break mid-run -- `lane run ... | head
+  // -1` closes its read end the moment `head` has what it wants, and the
+  // next write here gets an async EPIPE 'error' (pipe() does not handle
+  // dest errors for you; an unhandled one would crash this process with a
+  // stack trace instead of returning the lane's real exit code). On that
+  // error: stop forwarding, and destroy the supervisor's read end too, so
+  // its own next write EPIPEs and its ForwardWriter (src/supervisor.js)
+  // stops on its own -- the lane keeps running and logging regardless.
+  const stopForwarding = (readable, dest) => {
+    readable.unpipe(dest);
+    readable.destroy();
+  };
+  const onStdoutError = () => stopForwarding(supervisor.stdout, process.stdout);
+  const onStderrError = () => stopForwarding(supervisor.stderr, process.stderr);
+  process.stdout.on('error', onStdoutError);
+  process.stderr.on('error', onStderrError);
+  supervisor.stdout.pipe(process.stdout, { end: false });
+  supervisor.stderr.pipe(process.stderr, { end: false });
+
+  // Once we've actually found a result, the supervisor is confirmed exited
+  // (finalizeAndExit only writes the result then process.exit()s), so its
+  // stdout/stderr pipes are closing right about now -- wait (briefly; pipe
+  // writes are async and this must never wedge) for the tail to actually
+  // arrive before returning, so a caller piping our output never loses it.
+  const finishedReturn = async (exitCode) => {
+    await Promise.all([waitForStreamEnd(supervisor.stdout), waitForStreamEnd(supervisor.stderr)]);
+    return { exitCode };
+  };
+
+  // Every other return path leaves the supervisor running (queued, timed
+  // out, or cancelled before it ever started) -- destroy the read ends so a
+  // still-running supervisor's open pipe doesn't hold our event loop open.
+  const abortReturn = (exitCode) => {
+    supervisor.stdout.destroy();
+    supervisor.stderr.destroy();
+    return { exitCode };
+  };
+
   let cancelling = false;
   const forwardCancel = () => {
     if (cancelling) return;
@@ -303,15 +373,15 @@ export async function runCommand({
     for (;;) {
       const result = readJsonSafe(resultPath);
       if (result) {
-        return { exitCode: resultExit('lane run', result) };
+        return finishedReturn(resultExit('lane run', result));
       }
       if (deadline && Date.now() > deadline) {
         const state = await describeLaneState(root, id, resultPath);
         if (state.finished) {
-          return { exitCode: resultExit('lane run', state.result) };
+          return finishedReturn(resultExit('lane run', state.result));
         }
         process.stderr.write(`lane run: waited ${timeoutMs}ms, not failed — ${state.text}\n`);
-        return { exitCode: 75 };
+        return abortReturn(75);
       }
       if (!isPidAlive(supervisor.pid)) {
         // The supervisor may have written its result and exited in the gap
@@ -319,21 +389,29 @@ export async function runCommand({
         // before concluding it died with nothing to show for it.
         const finalResult = readJsonSafe(resultPath);
         if (finalResult) {
-          return { exitCode: resultExit('lane run', finalResult) };
+          return finishedReturn(resultExit('lane run', finalResult));
         }
         // The supervisor exited without ever writing a result: it was cancelled
         // while still queued (or crashed) before the child ever ran.
         if (cancelling) {
           process.stderr.write(`lane run: cancelled before the lane started (id ${id})\n`);
-          return { exitCode: 130 };
+          return abortReturn(130);
         }
         process.stderr.write(`lane run: supervisor exited unexpectedly with no result (id ${id})\n`);
-        return { exitCode: 1 };
+        return abortReturn(1);
       }
       await sleep(200);
     }
   } finally {
     process.off('SIGINT', forwardCancel);
     process.off('SIGTERM', forwardCancel);
+    // An in-process caller (e.g. a test calling runCommand() directly) shares
+    // the real process.stdout/stderr across every call -- leaving these
+    // pipes and error listeners attached past our own return would leak onto
+    // whichever caller runs next.
+    supervisor.stdout.unpipe(process.stdout);
+    supervisor.stderr.unpipe(process.stderr);
+    process.stdout.off('error', onStdoutError);
+    process.stderr.off('error', onStderrError);
   }
 }

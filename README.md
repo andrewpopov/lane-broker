@@ -72,6 +72,16 @@ this is the sanctioned way to outlive a short tool ceiling on a long lane.
 (after a short grace period, to avoid racing a `lane run --detach` that
 hasn't finished enqueueing yet) rather than blocking forever on a typo.
 
+**Foreground `lane run` streams the child's output live**, stream-separated:
+the child's stdout goes to `lane run`'s own stdout, its stderr to `lane
+run`'s own stderr, exactly as if the command had been run directly — and
+`--log` keeps writing the same bytes to a file regardless. If the caller
+disappears (killed, or the tool ceiling above), the lane keeps running and
+logging normally; nothing is lost except the live view. `lane wait` and a
+`--detach` run do *not* stream — a `--detach` caller returns before the
+child even starts, and `lane wait` reattaches to a run whose supervisor was
+never told to forward to it — both still get the `--log` file.
+
 ## Config
 
 **Global** — `$LANE_BROKER_HOME/config.json` (default
