@@ -270,6 +270,23 @@ export function resolveNicedSpawn(ticket) {
  * "unknown". Split out so both branches are unit-testable without a real
  * process group.
  */
+/**
+ * The lane child's environment. Besides the lease identity it carries the
+ * lane's resource grant, so a test runner inside the lane can size its worker
+ * pool to what the broker reserved (BRAIN-318): an unsized vitest spawns
+ * cores-1 workers and was measured averaging 4.2 cores on a 2-core lease.
+ */
+export function childEnv(ticket, baseEnv = process.env) {
+  const env = { ...baseEnv, LANE_BROKER_LEASE: ticket.id, LANE_BROKER_KEY: ticket.key };
+  const cpuCores = ticket.resources?.cpuCores;
+  const memoryBytes = ticket.resources?.memoryBytes;
+  if (Number.isFinite(cpuCores) && cpuCores > 0) env.LANE_BROKER_CPU_CORES = String(cpuCores);
+  else delete env.LANE_BROKER_CPU_CORES;
+  if (Number.isFinite(memoryBytes) && memoryBytes > 0) env.LANE_BROKER_MEMORY_BYTES = String(memoryBytes);
+  else delete env.LANE_BROKER_MEMORY_BYTES;
+  return env;
+}
+
 export function applyHeartbeatObservation(lease, observed, now = Date.now(), observedMemoryBytes = null) {
   const update = { ...lease, heartbeatAt: now };
   if (Number.isFinite(observed)) {
@@ -359,7 +376,7 @@ async function main() {
     cwd: ticket.cwd,
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, LANE_BROKER_LEASE: ticket.id, LANE_BROKER_KEY: ticket.key },
+    env: childEnv(ticket),
   });
 
   const logWriter = new CappedLogWriter(ticket.logPath);
