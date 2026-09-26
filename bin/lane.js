@@ -16,7 +16,7 @@ import {
 function usage() {
   return `Usage:
   lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--detach]
-           [--timeout <duration>] [--allow-local-sim] [--log <path>] -- <command...>
+           [--timeout <duration>] [--allow-local-sim] [--local] [--log <path>] -- <command...>
   lane status [--json]
   lane cancel <id>
   lane wait <id> [--timeout <duration>]
@@ -71,6 +71,10 @@ function parseRunArgs(args) {
       case '--allow-local-sim':
         opts.allowLocalSim = true;
         break;
+      // BRAIN-319 T3b-1: forces a remote-eligible lane to run locally.
+      case '--local':
+        opts.local = true;
+        break;
       case '--log':
         opts.log = flagArgs[++i];
         break;
@@ -123,6 +127,7 @@ async function main() {
         detach: opts.detach,
         timeoutMs: opts.timeout ? parseDurationMs(opts.timeout) : undefined,
         allowLocalSim: opts.allowLocalSim,
+        local: opts.local,
         log: opts.log,
         cmd,
       });
