@@ -31,12 +31,15 @@ export function paths(root = stateHome()) {
     // block reasons interfere with each other's allowance).
     capacitySkipState: path.join(root, 'capacity-skip-state.json'),
     seq: path.join(root, 'seq'),
+    // BRAIN-319 T3b-2 (C3): one durable attempt record per remote-eligible
+    // ticket, keyed by ticket id -- see src/attempts.js.
+    attempts: path.join(root, 'attempts'),
   };
 }
 
 export function ensureStateDirs(root = stateHome()) {
   const p = paths(root);
-  for (const dir of [p.root, p.leases, p.queue, p.logs, p.results, p.cancel]) {
+  for (const dir of [p.root, p.leases, p.queue, p.logs, p.results, p.cancel, p.attempts]) {
     fs.mkdirSync(dir, { recursive: true });
   }
   return p;
