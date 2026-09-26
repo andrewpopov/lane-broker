@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
 import { freshEnv, writeGlobalConfig, writeRepoConfig } from './helpers.js';
 import { runCommand } from '../src/run.js';
 import { atomicWriteJson, bootId } from '../src/state.js';
@@ -69,7 +70,11 @@ async function runWithFakeSupervisor({ env, cwd, timeoutMs, choreograph }) {
       // Stand in for the real child_process handle: a pid that is always
       // alive (this test process's own) so `isPidAlive` never mistakes the
       // fake supervisor for one that crashed with nothing to show for it.
-      return Object.assign(new EventEmitter(), { pid: process.pid, unref() {} });
+      // A foreground run spawns the supervisor with piped stdout/stderr
+      // (BRAIN-308), so the real handle always has both; this fake prints
+      // nothing, so they start already ended.
+      const silent = () => new PassThrough().end();
+      return Object.assign(new EventEmitter(), { pid: process.pid, unref() {}, stdout: silent(), stderr: silent() });
     };
     const result = await runCommand({
       repo: 'r',
