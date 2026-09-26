@@ -1,6 +1,5 @@
 import fs from 'node:fs';
-import path from 'node:path';
-import { ensureStateDirs, paths, atomicWriteFile, appendHistory, atomicWriteJson, withLock } from './state.js';
+import { ensureStateDirs, paths, atomicWriteFile, appendHistory, atomicWriteJson, withLock, cancelMarkerPath } from './state.js';
 import { readLease, removeLease, isSupervisorAlive, isGroupAlive } from './lease.js';
 import { dequeueSync, listQueue } from './scheduler.js';
 
@@ -10,9 +9,9 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function writeCancelMarker(p, id) {
-  fs.mkdirSync(p.cancel, { recursive: true });
-  atomicWriteFile(path.join(p.cancel, id), String(Date.now()));
+function writeCancelMarker(root, id) {
+  fs.mkdirSync(paths(root).cancel, { recursive: true });
+  atomicWriteFile(cancelMarkerPath(root, id), String(Date.now()));
 }
 
 /** TERM the group, wait a grace period, KILL, verify gone. Used when there is no supervisor left to do it. */
@@ -42,7 +41,6 @@ async function killGroupDirectly(pgid) {
 /** `lane cancel <id>`: cancels a queued ticket or a running/ORPHANED lease. */
 export async function cancelCommand(id) {
   const root = ensureStateDirs().root;
-  const p = paths(root);
 
   // Dequeue and mark cancelled atomically, under the same lock the scheduler
   // uses to move a ticket from queue to lease -- otherwise the supervisor
@@ -53,7 +51,7 @@ export async function cancelCommand(id) {
     const stillQueued = listQueue(root).find((t) => t && t.id === id);
     if (!stillQueued) return false;
     dequeueSync(root, id);
-    writeCancelMarker(p, id);
+    writeCancelMarker(root, id);
     return true;
   });
   if (dequeuedHere) {
@@ -67,7 +65,7 @@ export async function cancelCommand(id) {
     return { exitCode: 1 };
   }
 
-  writeCancelMarker(p, id);
+  writeCancelMarker(root, id);
 
   if (isSupervisorAlive(lease)) {
     try {

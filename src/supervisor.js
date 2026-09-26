@@ -1,11 +1,15 @@
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { paths, ensureStateDirs, appendHistory, atomicWriteJson, readJsonSafe } from './state.js';
+import { paths, ensureStateDirs, appendHistory, atomicWriteJson, readJsonSafe, isCancelled, cancelMarkerPath } from './state.js';
 import { enqueue, tryStart, dequeueSync } from './scheduler.js';
 import { readLease, writeLease, removeLease, isGroupAlive, processStartTime } from './lease.js';
 import { observedGroupCpuCores, observedGroupMemoryBytes } from './cpu.js';
 import { reloadGlobalConfig } from './config.js';
+import { detectResourceCapacity, checkResourceBudget } from './resources.js';
+import { selectRunner, dispatchRemote } from './remote-client.js';
+import { createAttempt, updateAttempt, fallbackToLocal, publishTerminal } from './attempts.js';
+import { writeBrokerLog } from './admission.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
 const CANCEL_GRACE_MS = 10_000;
@@ -59,12 +63,12 @@ function clearConfigReloadWarning(root) {
 }
 
 function cancelRequested(root, id) {
-  return fs.existsSync(`${paths(root).cancel}/${id}`);
+  return isCancelled(root, id);
 }
 
 function clearCancelRequest(root, id) {
   try {
-    fs.unlinkSync(`${paths(root).cancel}/${id}`);
+    fs.unlinkSync(cancelMarkerPath(root, id));
   } catch {
     // none pending
   }
@@ -300,6 +304,172 @@ export function applyHeartbeatObservation(lease, observed, now = Date.now(), obs
   return update;
 }
 
+/**
+ * BRAIN-319 T3b-2: exit 130, signal null, so run.js's own `resultExit`
+ * (`result.exit ?? 1`) reports 130 for this ticket -- the same convention
+ * `dispatchRemote` (remote-client.js) already uses for a runner-confirmed
+ * `kind: 'cancelled'` result (C5: a cancelled ticket's result is exit 130
+ * regardless of the remote outcome).
+ */
+function remoteCancelledResult(ticket, startedAt) {
+  const endedAt = Date.now();
+  return {
+    id: ticket.id,
+    exit: 130,
+    signal: null,
+    startedAt: startedAt ?? null,
+    endedAt,
+    waitedMs: startedAt ? endedAt - startedAt : null,
+    cancelled: true,
+    executor: 'remote',
+  };
+}
+
+/** The exact "requested resources exceed this environment's budget" refusal run.js applies at
+ *  preflight, re-applied here once a remote-eligible ticket has fallen back to local -- run.js
+ *  skipped it specifically so a runner could still take an oversized request (BRAIN-319 T3b-1). */
+function localBudgetRefusalResult(ticket, budget) {
+  return { id: ticket.id, exit: budget.exitCode, signal: null, startedAt: null, endedAt: Date.now(), waitedMs: 0, error: budget.message.trim() };
+}
+
+/**
+ * Attempt a remote runner for a remote-eligible ticket (`ticket.remote`,
+ * BRAIN-319 T3b-1's payload), BEFORE the ticket is ever handed to the local
+ * scheduler. Resolves to `{ fallback: true, attemptGeneration, fallbackReason }`
+ * when the caller must continue into the EXISTING local enqueue+run path
+ * below with the same ticket id, or `{ fallback: false }` once the attempt
+ * has reached a terminal outcome here (confirmed, cancelled, or refused) --
+ * `process.exit()` has already been called on that path, matching every
+ * other terminal path in this file.
+ */
+async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
+  const attemptStartedAt = Date.now();
+  await createAttempt(root, enriched.id, { runner: null });
+
+  // Reuses the SAME two writers a local child's output goes through
+  // (CappedLogWriter/ForwardWriter, defined above) -- no second relay.
+  // Backpressure is not applied here (unlike the local child path below):
+  // `dispatchRemote` hands us plain data chunks, not a pausable stream, so
+  // there is no source on our side to gate.
+  const logWriter = new CappedLogWriter(enriched.logPath);
+  const forwardOutput = enriched.forwardOutput === true;
+  const stdoutForward = forwardOutput ? new ForwardWriter(process.stdout) : null;
+  const stderrForward = forwardOutput ? new ForwardWriter(process.stderr) : null;
+  const onStdout = (chunk) => {
+    logWriter.write(chunk);
+    if (stdoutForward) stdoutForward.write(chunk);
+  };
+  const onStderr = (chunk) => {
+    logWriter.write(chunk);
+    if (stderrForward) stderrForward.write(chunk);
+  };
+
+  async function finish(result, exitCode) {
+    await logWriter.finish();
+    if (stdoutForward) await stdoutForward.drain();
+    if (stderrForward) await stderrForward.drain();
+    atomicWriteJson(enriched.resultPath, result);
+    appendHistory(root, {
+      id: enriched.id,
+      key: enriched.key,
+      repo: enriched.repoId,
+      lane: enriched.lane,
+      weight: enriched.weight,
+      resources: enriched.resources,
+      ...result,
+    });
+    process.exit(exitCode);
+  }
+
+  async function fallbackOrRefuse(runner, reason) {
+    const fb = await fallbackToLocal(root, enriched.id, reason);
+    if (!fb.ok) {
+      if (fb.cancelled) {
+        await publishTerminal(root, enriched.id, 0, () => finish(remoteCancelledResult(enriched, attemptStartedAt), 130));
+        return { fallback: false };
+      }
+      throw new Error(`lane-broker supervisor: could not fall back to local for ${enriched.id} (attempt record missing)`);
+    }
+
+    const skipLine = `lane: remote-skip: ${runner ? runner.name : 'none'}: ${reason} — running locally\n`;
+    process.stderr.write(skipLine);
+    writeBrokerLog(root, skipLine);
+
+    const host = detectResourceCapacity();
+    const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host });
+    if (!budget.ok) {
+      process.stderr.write(budget.message);
+      await publishTerminal(root, enriched.id, fb.attempt.generation, ({ cancelled }) => {
+        if (cancelled) finish(remoteCancelledResult(enriched, attemptStartedAt), 130);
+        else finish(localBudgetRefusalResult(enriched, budget), budget.exitCode);
+      });
+      return { fallback: false };
+    }
+
+    return { fallback: true, attemptGeneration: fb.attempt.generation, fallbackReason: reason };
+  }
+
+  const { runner, skipped } = await selectRunner(globalCfg.runners || [], {});
+  if (!runner) {
+    const reason = skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : 'no runners configured';
+    return fallbackOrRefuse(null, reason);
+  }
+
+  await updateAttempt(root, enriched.id, 0, { phase: 'running', runner: runner.name });
+  process.stderr.write(`lane: running on ${runner.name}\n`);
+
+  const dispatch = await dispatchRemote({
+    ...enriched.remote,
+    argv: enriched.cmd,
+    lane: enriched.lane,
+    ticketId: enriched.id,
+    generation: 0,
+    onStdout,
+    onStderr,
+    abortSignal,
+  });
+
+  if (dispatch.outcome === 'confirmed') {
+    const published = await publishTerminal(root, enriched.id, 0, ({ cancelled }) => {
+      if (cancelled) {
+        finish(remoteCancelledResult(enriched, attemptStartedAt), 130);
+        return;
+      }
+      const endedAt = Date.now();
+      finish(
+        {
+          id: enriched.id,
+          exit: dispatch.exitCode,
+          signal: null,
+          executor: 'remote',
+          runner: runner.name,
+          remoteKind: dispatch.result.kind,
+          startedAt: attemptStartedAt,
+          endedAt,
+          waitedMs: endedAt - enriched.createdAt || 0,
+        },
+        dispatch.exitCode,
+      );
+    });
+    if (!published.ok) {
+      // Generation mismatch: unreachable on this path today (nothing else
+      // advances generation 0 while this supervisor is the sole writer),
+      // but a confirmed remote result must never be silently dropped.
+      process.stderr.write(`lane-broker supervisor: could not publish a confirmed remote result for ${enriched.id}\n`);
+      process.exit(1);
+    }
+    return { fallback: false };
+  }
+
+  if (dispatch.outcome === 'cancelled') {
+    await publishTerminal(root, enriched.id, 0, () => finish(remoteCancelledResult(enriched, attemptStartedAt), 130));
+    return { fallback: false };
+  }
+
+  // 'ineligible' or 'unconfirmed'
+  return fallbackOrRefuse(runner, dispatch.reason);
+}
+
 async function main() {
   const ticket = readTicketFromEnv();
   const root = ensureStateDirs().root;
@@ -316,12 +486,28 @@ async function main() {
   };
 
   let cancelledBeforeStart = false;
+  // BRAIN-319 T3b-2: the same SIGTERM/SIGINT this supervisor already reacts
+  // to (queued-cancel above, killGroup once running below) also aborts an
+  // in-flight remote dispatch, via this AbortController's signal -- no
+  // separate remote-specific cancel path.
+  const abortController = new AbortController();
   process.on('SIGTERM', () => {
     cancelledBeforeStart = true;
+    abortController.abort();
   });
   process.on('SIGINT', () => {
     cancelledBeforeStart = true;
+    abortController.abort();
   });
+
+  let attemptGeneration = null;
+  let fallbackReason;
+  if (ticket.remote) {
+    const outcome = await runRemoteAttempt(root, enriched, globalCfg, abortController.signal);
+    if (!outcome.fallback) return; // terminal outcome: runRemoteAttempt already called process.exit()
+    attemptGeneration = outcome.attemptGeneration;
+    fallbackReason = outcome.fallbackReason;
+  }
 
   await enqueue(root, enriched);
 
@@ -445,18 +631,38 @@ async function main() {
     // reading would just wait out its own bounded timeout for nothing.
     if (stdoutForward) await stdoutForward.drain();
     if (stderrForward) await stderrForward.drain();
-    atomicWriteJson(ticket.resultPath, result);
-    appendHistory(root, {
-      id: ticket.id,
-      key: ticket.key,
-      repo: ticket.repoId,
-      lane: ticket.lane,
-      weight: ticket.weight,
-      resources: ticket.resources,
-      ...result,
-    });
-    removeLease(root, ticket.id); // release always comes last
-    process.exit(exitCode);
+
+    const writeAndExit = (finalResult, finalExitCode) => {
+      atomicWriteJson(ticket.resultPath, finalResult);
+      appendHistory(root, {
+        id: ticket.id,
+        key: ticket.key,
+        repo: ticket.repoId,
+        lane: ticket.lane,
+        weight: ticket.weight,
+        resources: ticket.resources,
+        ...finalResult,
+      });
+      removeLease(root, ticket.id); // release always comes last
+      process.exit(finalExitCode);
+    };
+
+    // BRAIN-319 T3b-2: this ticket started life as a remote attempt that fell
+    // back to local (`attemptGeneration` non-null) -- go through the SAME
+    // one terminal writer every remote-side path uses, so a cancel racing
+    // this exact finish is decided the same way (C5), and the attempt
+    // record is removed once this local run's outcome is actually published.
+    if (attemptGeneration !== null) {
+      const published = await publishTerminal(root, ticket.id, attemptGeneration, ({ cancelled }) => {
+        if (cancelled) writeAndExit(remoteCancelledResult(enriched, startedAt), 130);
+        else writeAndExit({ ...result, executor: 'local', fallbackReason }, exitCode);
+      });
+      if (published.ok) return;
+      // Generation mismatch: unreachable today (this supervisor is the sole
+      // writer of its own attempt record past the fallback), but a real
+      // local result must never be silently dropped -- write it directly.
+    }
+    writeAndExit(result, exitCode);
   }
 
   child.on('error', (err) => {

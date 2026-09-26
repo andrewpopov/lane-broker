@@ -37,6 +37,19 @@ export function paths(root = stateHome()) {
   };
 }
 
+/** Deterministic path of a ticket's cancel marker: one file per id under
+ *  `paths(root).cancel`. Single source of truth for the naming convention
+ *  `cancel.js` (write), `attempts.js` and `supervisor.js` (read) all share. */
+export function cancelMarkerPath(root, id) {
+  return path.join(paths(root).cancel, id);
+}
+
+/** Does a cancel marker exist for `id`? Existence-only -- its contents (a
+ *  timestamp, written by `cancel.js`) are never read by any consumer. */
+export function isCancelled(root, id) {
+  return fs.existsSync(cancelMarkerPath(root, id));
+}
+
 export function ensureStateDirs(root = stateHome()) {
   const p = paths(root);
   for (const dir of [p.root, p.leases, p.queue, p.logs, p.results, p.cancel, p.attempts]) {

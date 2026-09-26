@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths, atomicWriteJson, readJsonSafe, withLock, bootId } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled } from './state.js';
 import { isPidAlive, processStartTime } from './lease.js';
 
 /**
@@ -25,13 +25,6 @@ import { isPidAlive, processStartTime } from './lease.js';
 
 function attemptFile(root, id) {
   return path.join(paths(root).attempts, `${id}.json`);
-}
-
-/** Same cancel-marker convention `src/cancel.js` writes and `src/supervisor.js`
- *  (`cancelRequested`) reads: one file per ticket id under `paths(root).cancel`,
- *  existence-only (its contents are not read here, same as both of those). */
-function hasCancelMarker(root, id) {
-  return fs.existsSync(path.join(paths(root).cancel, id));
 }
 
 function removeAttempt(root, id) {
@@ -132,7 +125,7 @@ export async function updateAttempt(root, id, expectedGeneration, patch) {
  */
 export async function fallbackToLocal(root, id, reason) {
   return withLock(root, () => {
-    if (hasCancelMarker(root, id)) {
+    if (isCancelled(root, id)) {
       return { ok: false, cancelled: true };
     }
     const current = readAttempt(root, id);
@@ -160,7 +153,7 @@ export async function fallbackToLocal(root, id, reason) {
  */
 export async function publishTerminal(root, id, generation, resultWriterFn) {
   return withLock(root, () => {
-    if (hasCancelMarker(root, id)) {
+    if (isCancelled(root, id)) {
       resultWriterFn({ cancelled: true });
       removeAttempt(root, id);
       return { ok: true, cancelled: true };
