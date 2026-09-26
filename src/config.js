@@ -301,9 +301,16 @@ export function repoIdentity(cwd) {
   return result;
 }
 
-/** Walk up from `cwd` looking for .lane-broker.json, stopping at the git common dir's worktree root. */
-export function findRepoConfigPath(cwd, gitCommonDir) {
-  const stopAt = gitCommonDir ? path.dirname(gitCommonDir) : null;
+/**
+ * Walk up from `cwd` looking for .lane-broker.json, stopping at `configRoot`
+ * when given (BRAIN-319: a `lane remote-exec` snapshot work dir has no
+ * `.git`, so the git-common-dir-derived stop point below is unavailable —
+ * without an explicit floor the walk would continue past the snapshot root
+ * into whatever happens to sit above it on the runner's filesystem), or
+ * otherwise at the git common dir's worktree root, same as before.
+ */
+export function findRepoConfigPath(cwd, gitCommonDir, configRoot) {
+  const stopAt = configRoot ? path.resolve(configRoot) : gitCommonDir ? path.dirname(gitCommonDir) : null;
   let dir = path.resolve(cwd);
   for (;;) {
     const candidate = path.join(dir, '.lane-broker.json');
@@ -315,9 +322,9 @@ export function findRepoConfigPath(cwd, gitCommonDir) {
   }
 }
 
-export function loadRepoConfig(cwd) {
+export function loadRepoConfig(cwd, configRoot) {
   const commonDir = repoIdentity(cwd);
-  const configPath = findRepoConfigPath(cwd, commonDir);
+  const configPath = findRepoConfigPath(cwd, commonDir, configRoot);
   if (!configPath) return { ...DEFAULT_REPO_CONFIG, declared: false };
   let parsed;
   try {
@@ -354,14 +361,22 @@ export function expandConflicts(conflicts, laneNames) {
  * weight, whether this is a refused local sim, and the set of conflicting
  * fully-qualified keys within this repo.
  */
-export function resolveTicketConfig({ cwd, repo, lane }) {
-  const repoConfig = loadRepoConfig(cwd);
+export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityOverride }) {
+  const repoConfig = loadRepoConfig(cwd, configRoot);
   const commonDir = repoIdentity(cwd);
   // The git identity wins whenever it can be determined, so the same repo
   // always resolves to the same key regardless of whether --repo is passed
   // (or passed inconsistently across invocations); --repo is a fallback
   // label for cwds with no git identity to key on.
-  const repoId = sanitizeKey(commonDir || repo || cwd);
+  //
+  // BRAIN-319 T3 (C7): `repoIdentityOverride` pins the key to a caller-given
+  // identity unconditionally, bypassing git entirely -- needed once
+  // `lane remote-exec`'s snapshot work dir gets its OWN synthetic `.git`
+  // (so real consumers can run plain git commands against it): without
+  // this, `repoIdentity(cwd)` would find that synthetic repo and derive a
+  // key unique to THIS ticket's throwaway `.git`, breaking the invariant
+  // that the same repo+lane always maps to the same lease key.
+  const repoId = repoIdentityOverride ? sanitizeKey(repoIdentityOverride) : sanitizeKey(commonDir || repo || cwd);
   const laneName = lane || 'default';
   if (repoConfig.declared && !Object.prototype.hasOwnProperty.call(repoConfig.lanes, laneName)) {
     const declared = Object.keys(repoConfig.lanes).sort().join(', ');

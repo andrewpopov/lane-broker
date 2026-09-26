@@ -25,7 +25,7 @@ export class RemoteIneligibleError extends Error {
  * before shelling out to git -- there is no src-side helper for this yet, so
  * this is the first one and later remote-* modules should reuse it.
  */
-function scrubbedGitEnv() {
+export function scrubbedGitEnv() {
   const env = { ...process.env };
   let names = [];
   try {
@@ -83,15 +83,47 @@ function validatePathShape(relPath) {
   }
 }
 
-/** Lexical (no realpath) escape check: does `target`, resolved relative to the
- *  directory containing `relPath` under `root`, stay inside `root`? */
-function checkSymlinkEscape(root, relPath, target) {
+/**
+ * Lexical (no realpath) escape check: walk `target`, resolved relative to the
+ * directory containing `relPath`, one component at a time (rather than a
+ * single `path.normalize`), so a `..` cannot silently cancel out a component
+ * that passed through another manifest symlink entry on the way. A naive
+ * `path.normalize(dir + '/' + target)` hides exactly that case: given
+ * `a/b/x -> ../..` and `a/b/s -> x/../y`, normalizing `a/b/x/../y` collapses
+ * straight to `a/y` -- inside the root -- even though actually FOLLOWING the
+ * path means stepping through the symlink `a/b/x` first, whose own target
+ * escapes upward. `symlinkPaths` is the full set of symlink entry paths in
+ * the manifest (both `relPath`'s own ancestor chain and every step of the
+ * walked target are checked against it). Throws `RemoteIneligibleError` for
+ * an out-of-root escape OR a walk that passes through another symlink entry.
+ */
+function checkSymlinkEscape(relPath, target, symlinkPaths) {
   if (path.isAbsolute(target)) throw new RemoteIneligibleError('symlink target is absolute', relPath);
-  const dir = path.dirname(path.join(root, relPath));
-  const resolved = path.normalize(path.join(dir, target));
-  const rootNorm = path.normalize(root);
-  if (resolved !== rootNorm && !resolved.startsWith(rootNorm + path.sep)) {
-    throw new RemoteIneligibleError('symlink target escapes root', relPath);
+
+  const dirSegs = path.posix.dirname(relPath) === '.' ? [] : path.posix.dirname(relPath).split('/');
+
+  // "the path walked to reach it": relPath's own ancestor directories.
+  let acc = '';
+  for (const seg of dirSegs) {
+    acc = acc ? `${acc}/${seg}` : seg;
+    if (symlinkPaths.has(acc)) {
+      throw new RemoteIneligibleError('symlink target escapes root (ancestor is a symlink)', relPath);
+    }
+  }
+
+  const stack = [...dirSegs];
+  for (const part of target.split('/')) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      if (stack.length === 0) throw new RemoteIneligibleError('symlink target escapes root', relPath);
+      stack.pop();
+      continue;
+    }
+    stack.push(part);
+    const cur = stack.join('/');
+    if (symlinkPaths.has(cur) && cur !== relPath) {
+      throw new RemoteIneligibleError('symlink target escapes root (passes through a symlink entry)', relPath);
+    }
   }
 }
 
@@ -177,22 +209,28 @@ export function buildManifest(worktreeRoot) {
       continue; // staged-delete / unstaged-delete: not on disk -> not in the snapshot.
     }
     if (st.isDirectory()) throw new RemoteIneligibleError('directory entry', relPath);
-    if (st.isSymbolicLink()) {
-      const target = fs.readlinkSync(absPath);
-      checkSymlinkEscape(root, relPath, target);
-    }
     rawEntries.push(computeEntry(absPath, relPath, st));
+  }
+
+  // Escape checking runs as a second pass, once every symlink entry's path is
+  // known: a chained escape (see checkSymlinkEscape) can only be detected
+  // against the FULL set of symlink paths, not path-by-path as each is
+  // discovered in `git ls-files` order.
+  const symlinkPaths = new Set(rawEntries.filter((e) => e.type === 'symlink').map((e) => e.path));
+  for (const e of rawEntries) {
+    if (e.type === 'symlink') checkSymlinkEscape(e.path, e.target, symlinkPaths);
   }
 
   const entries = sortEntries(rawEntries).map(canonicalizeEntry);
   return { entries, manifestHash: manifestHashOf(entries) };
 }
 
-function walkDir(root) {
+function walkDir(root, ignoreRootGit) {
   const results = [];
   function recurse(absDir, relDir) {
     const names = fs.readdirSync(absDir).sort();
     for (const name of names) {
+      if (ignoreRootGit && relDir === '' && name === '.git') continue;
       const abs = path.join(absDir, name);
       const rel = relDir ? `${relDir}/${name}` : name;
       const st = fs.lstatSync(abs);
@@ -212,11 +250,15 @@ function walkDir(root) {
  * git -- used on the runner side, where the extracted snapshot has no .git),
  * and compare it against `expectedManifest`. Returns `{ok:true}` or
  * `{ok:false, reason}` naming the first mismatch found while walking both
- * entry lists in sorted-path order together.
+ * entry lists in sorted-path order together. `ignoreRootGit` (BRAIN-319 T3):
+ * skip exactly a `.git` directory sitting at `dir`'s own root -- nothing
+ * else -- so re-verifying after `remote-exec` has git-init'd the snapshot
+ * (to give real consumers a working git repo) doesn't see its own `.git` as
+ * an unexpected extra entry, while still catching any actual tree mutation.
  */
-export function verifyManifestNoGit(dir, expectedManifest) {
+export function verifyManifestNoGit(dir, expectedManifest, { ignoreRootGit = false } = {}) {
   const expected = sortEntries(expectedManifest.entries).map(canonicalizeEntry);
-  const actual = sortEntries(walkDir(path.resolve(dir))).map(canonicalizeEntry);
+  const actual = sortEntries(walkDir(path.resolve(dir), ignoreRootGit)).map(canonicalizeEntry);
 
   let i = 0;
   let j = 0;

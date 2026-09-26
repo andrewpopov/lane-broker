@@ -120,6 +120,23 @@ export async function runCommand({
   cmd,
   log,
   spawnSupervisor = spawn,
+  // BRAIN-319 (`lane remote-exec`): resolve `.lane-broker.json` from a
+  // gitless snapshot work dir without walking above it — see
+  // findRepoConfigPath's own doc comment in config.js.
+  configRoot,
+  // BRAIN-319 T3 (C7): pin the resolved lease key's repo identity to this
+  // exact value regardless of what `.git` may exist under `cwd` — see
+  // resolveTicketConfig's own doc comment in config.js.
+  repoIdentityOverride,
+  // BRAIN-319: let a caller that already generated and durably recorded a
+  // ticket id (`lane remote-exec`'s remote-id file, written before the
+  // child can start) use that same id here, instead of one generated fresh
+  // inside this function that the caller could never have learned in time.
+  idOverride,
+  // BRAIN-319: called with the ticket id as soon as it exists (before the
+  // supervisor is spawned, so before any child can start). Returning
+  // `false` aborts the run without ever spawning the supervisor.
+  onTicketCreated,
 }) {
   if (!cmd || cmd.length === 0) {
     process.stderr.write('lane run: no command given (pass it after --)\n');
@@ -128,7 +145,7 @@ export async function runCommand({
 
   let resolved;
   try {
-    resolved = resolveTicketConfig({ cwd, repo, lane });
+    resolved = resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityOverride });
   } catch (err) {
     if (err instanceof ConfigError) {
       process.stderr.write(`lane run: ${err.message}\n`);
@@ -231,7 +248,13 @@ export async function runCommand({
   }
 
   const root = ensureStateDirs().root;
-  const id = crypto.randomUUID();
+  const id = idOverride || crypto.randomUUID();
+  if (onTicketCreated) {
+    const proceed = await onTicketCreated(id);
+    if (proceed === false) {
+      return { exitCode: 130 };
+    }
+  }
   const p = paths(root);
   const logPath = log || path.join(p.logs, `${id}.log`);
   const resultPath = path.join(p.results, `${id}.json`);

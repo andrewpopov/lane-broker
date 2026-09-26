@@ -36,7 +36,7 @@ export function encodeSnapshot(worktreeRoot, header, entries) {
 }
 
 /** Buffered line/byte reader over any async-iterable of Buffer/string chunks. */
-function makeReader(readable) {
+export function makeReader(readable) {
   let buf = Buffer.alloc(0);
   let done = false;
   const it = readable[Symbol.asyncIterator]();
@@ -115,47 +115,53 @@ function validateFrame(frame, expectedByPath, seen, symlinkPaths, maxFileBytes, 
   return { ok: true };
 }
 
-function checkExtractSymlinkTarget(destDir, relPath, target) {
+/**
+ * Same chain-aware walk as `checkSymlinkEscape` in remote-manifest.js (see
+ * its comment for why a naive `path.normalize` is unsafe): step through
+ * `target` one component at a time against `relPath`'s directory, rejecting
+ * both an out-of-root escape and a walk that passes through another manifest
+ * symlink entry. `symlinkPaths` is the manifest's full symlink-path set.
+ */
+function checkExtractSymlinkTarget(relPath, target, symlinkPaths) {
   if (typeof target !== 'string' || path.isAbsolute(target)) {
     return { ok: false, reason: `symlink target absolute: ${relPath}` };
   }
-  const dir = path.dirname(path.join(destDir, relPath));
-  const resolved = path.normalize(path.join(dir, target));
-  const rootNorm = path.normalize(destDir);
-  if (resolved !== rootNorm && !resolved.startsWith(rootNorm + path.sep)) {
-    return { ok: false, reason: `symlink target escapes: ${relPath}` };
+
+  const dirname = path.posix.dirname(relPath);
+  const dirSegs = dirname === '.' ? [] : dirname.split('/');
+
+  let acc = '';
+  for (const seg of dirSegs) {
+    acc = acc ? `${acc}/${seg}` : seg;
+    if (symlinkPaths.has(acc)) return { ok: false, reason: `symlink target escapes (ancestor is a symlink): ${relPath}` };
+  }
+
+  const stack = [...dirSegs];
+  for (const part of target.split('/')) {
+    if (part === '' || part === '.') continue;
+    if (part === '..') {
+      if (stack.length === 0) return { ok: false, reason: `symlink target escapes: ${relPath}` };
+      stack.pop();
+      continue;
+    }
+    stack.push(part);
+    const cur = stack.join('/');
+    if (symlinkPaths.has(cur) && cur !== relPath) {
+      return { ok: false, reason: `symlink target escapes (passes through a symlink entry): ${relPath}` };
+    }
   }
   return { ok: true };
 }
 
 /**
- * Extract a framed snapshot stream into a fresh `destDir` (refused if it
- * already exists), validating every frame against `expectedManifest` BEFORE
- * writing anything, then re-verifying the written tree with
- * `verifyManifestNoGit`. Returns `{ok:true}` or `{ok:false, reason}` -- never
- * throws for a malformed/adversarial stream, and never writes outside
- * `destDir`.
+ * Read and JSON-parse the header line off an already-constructed `reader`
+ * (from `makeReader`), without consuming anything past it. Returns
+ * `{ok:true, header}` or `{ok:false, reason}` -- shared by `extractSnapshot`
+ * (which reads the header for you) and callers such as `lane remote-exec`
+ * that must validate header fields (ticketId, generation, repoKey, ...)
+ * themselves before any extraction happens.
  */
-export async function extractSnapshot(readable, destDir, expectedManifest, limits = {}) {
-  const maxFileBytes = limits.maxFileBytes ?? Infinity;
-  const maxTotalBytes = limits.maxTotalBytes ?? Infinity;
-  const maxLineBytes = limits.maxLineBytes ?? 1_000_000;
-
-  try {
-    fs.mkdirSync(destDir);
-  } catch (err) {
-    if (err.code === 'EEXIST') return { ok: false, reason: 'destDir already exists' };
-    throw err;
-  }
-
-  const reader = makeReader(readable);
-  const expectedByPath = new Map(expectedManifest.entries.map((e) => [e.path, e]));
-  const symlinkPaths = new Set(
-    expectedManifest.entries.filter((e) => e.type === 'symlink').map((e) => e.path),
-  );
-  const seen = new Set();
-  let cumulativeBytes = 0;
-
+export async function readHeaderLine(reader, maxLineBytes = 1_000_000) {
   let headerLine;
   try {
     headerLine = await reader.readLine(maxLineBytes);
@@ -169,9 +175,39 @@ export async function extractSnapshot(readable, destDir, expectedManifest, limit
   } catch {
     return { ok: false, reason: 'malformed json: header' };
   }
-  if (header && header.manifest && header.manifest.manifestHash !== expectedManifest.manifestHash) {
-    return { ok: false, reason: 'header manifest hash mismatch' };
+  return { ok: true, header };
+}
+
+/**
+ * Extract the frame stream (everything after the header line) from an
+ * already-constructed `reader` into a fresh `destDir` (refused if it already
+ * exists), validating every frame against `expectedManifest` BEFORE writing
+ * anything, then re-verifying the written tree with `verifyManifestNoGit`.
+ * Returns `{ok:true}` or `{ok:false, reason}` -- never throws for a
+ * malformed/adversarial stream, and never writes outside `destDir`. Split out
+ * of `extractSnapshot` so a caller that must inspect the header itself first
+ * (e.g. `lane remote-exec`, which needs ticketId/repoKey/argv before it can
+ * decide where `destDir` even is) can read the header with `readHeaderLine`
+ * and then hand the same reader here.
+ */
+export async function extractFrames(reader, destDir, expectedManifest, limits = {}) {
+  const maxFileBytes = limits.maxFileBytes ?? Infinity;
+  const maxTotalBytes = limits.maxTotalBytes ?? Infinity;
+  const maxLineBytes = limits.maxLineBytes ?? 1_000_000;
+
+  try {
+    fs.mkdirSync(destDir);
+  } catch (err) {
+    if (err.code === 'EEXIST') return { ok: false, reason: 'destDir already exists' };
+    throw err;
   }
+
+  const expectedByPath = new Map(expectedManifest.entries.map((e) => [e.path, e]));
+  const symlinkPaths = new Set(
+    expectedManifest.entries.filter((e) => e.type === 'symlink').map((e) => e.path),
+  );
+  const seen = new Set();
+  let cumulativeBytes = 0;
 
   for (;;) {
     let line;
@@ -222,7 +258,7 @@ export async function extractSnapshot(readable, destDir, expectedManifest, limit
       fs.chmodSync(fullPath, frame.exec ? 0o755 : 0o644);
       cumulativeBytes += frame.size;
     } else {
-      const escapeCheck = checkExtractSymlinkTarget(destDir, frame.path, frame.target);
+      const escapeCheck = checkExtractSymlinkTarget(frame.path, frame.target, symlinkPaths);
       if (!escapeCheck.ok) return escapeCheck;
       try {
         fs.symlinkSync(frame.target, fullPath);
@@ -239,4 +275,29 @@ export async function extractSnapshot(readable, destDir, expectedManifest, limit
   if (await reader.hasMore()) return { ok: false, reason: 'trailing bytes after terminator' };
 
   return verifyManifestNoGit(destDir, expectedManifest);
+}
+
+/**
+ * Extract a framed snapshot stream into a fresh `destDir` (refused if it
+ * already exists), validating every frame against `expectedManifest` BEFORE
+ * writing anything, then re-verifying the written tree with
+ * `verifyManifestNoGit`. Returns `{ok:true}` or `{ok:false, reason}` -- never
+ * throws for a malformed/adversarial stream, and never writes outside
+ * `destDir`. Reads and discards the header line itself, checking only that
+ * its embedded manifest hash matches `expectedManifest.manifestHash`; a
+ * caller that needs the rest of the header (ticketId, argv, ...) should use
+ * `readHeaderLine` + `extractFrames` directly instead.
+ */
+export async function extractSnapshot(readable, destDir, expectedManifest, limits = {}) {
+  const maxLineBytes = limits.maxLineBytes ?? 1_000_000;
+  const reader = makeReader(readable);
+
+  const headerResult = await readHeaderLine(reader, maxLineBytes);
+  if (!headerResult.ok) return headerResult;
+  const { header } = headerResult;
+  if (header && header.manifest && header.manifest.manifestHash !== expectedManifest.manifestHash) {
+    return { ok: false, reason: 'header manifest hash mismatch' };
+  }
+
+  return extractFrames(reader, destDir, expectedManifest, limits);
 }

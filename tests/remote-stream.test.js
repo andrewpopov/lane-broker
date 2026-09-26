@@ -179,6 +179,28 @@ test('adversarial: a frame nested under a manifest symlink ancestor is rejected'
   await assertNothingOutsideDest(base, dest);
 });
 
+test('adversarial: a symlink chain that escapes only when actually followed is rejected', async () => {
+  // a/b/x -> ../..   (lexically fine on its own: a/b/../.. == root)
+  // a/b/s -> x/../y  (lexically normalizes to a/y -- inside root -- but FOLLOWING it
+  //                   means stepping through the symlink a/b/x first, whose own target escapes)
+  const entries = [
+    { path: 'a/b/x', type: 'symlink', target: '../..' },
+    { path: 'a/b/s', type: 'symlink', target: 'x/../y' },
+  ];
+  const manifest = { entries, manifestHash: manifestHashOf(entries) };
+  const { base, dest } = freshDest('remote-stream-adv-symchain');
+  const streamReadable = streamOf([
+    line({ protocol: 1, manifest: { entries: manifest.entries, manifestHash: manifest.manifestHash } }),
+    line({ path: 'a/b/x', type: 'symlink', target: '../..' }),
+    line({ path: 'a/b/s', type: 'symlink', target: 'x/../y' }),
+    line({ end: true }),
+  ]);
+  const result = await extractSnapshot(streamReadable, dest, manifest, {});
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /symlink target escapes/);
+  await assertNothingOutsideDest(base, dest);
+});
+
 test('adversarial: a symlink target escaping destDir is rejected even when it matches the manifest', async () => {
   const entries = [{ path: 'evil', type: 'symlink', target: '../../../../etc/passwd' }];
   const manifest = { entries, manifestHash: manifestHashOf(entries) };

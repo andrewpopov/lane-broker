@@ -132,6 +132,20 @@ test('a symlink escaping the worktree is ineligible', () => {
   assert.throws(() => buildManifest(dir), RemoteIneligibleError);
 });
 
+test('a symlink chain that escapes only when actually followed is ineligible', () => {
+  // a/b/x -> ../..   (a real symlink entry, itself lexically fine: a/b/../.. == root)
+  // a/b/s -> x/../y  (lexically normalizes to a/y -- inside root -- but FOLLOWING it
+  //                   means stepping through a/b/x first, whose own target escapes)
+  const dir = tmpRepo();
+  fs.mkdirSync(path.join(dir, 'a', 'b'), { recursive: true });
+  fs.symlinkSync('../..', path.join(dir, 'a', 'b', 'x'));
+  fs.symlinkSync('x/../y', path.join(dir, 'a', 'b', 's'));
+  gitFixture(['add', '-A'], dir);
+  gitFixture(['commit', '-q', '-m', 'init'], dir);
+
+  assert.throws(() => buildManifest(dir), RemoteIneligibleError);
+});
+
 test('a gitlink/submodule entry is ineligible', () => {
   const dir = tmpRepo();
   const subRepo = tmpRepo();

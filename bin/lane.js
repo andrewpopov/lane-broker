@@ -5,6 +5,13 @@ import { cancelCommand } from '../src/cancel.js';
 import { waitCommand } from '../src/wait.js';
 import { pauseCommand, resumeCommand } from '../src/pause.js';
 import { parseByteSize } from '../src/resources.js';
+import {
+  remoteExecCommand,
+  remoteProbeCommand,
+  remoteResultCommand,
+  remoteCancelCommand,
+  defaultRemoteRoot,
+} from '../src/remote-runner.js';
 
 function usage() {
   return `Usage:
@@ -72,6 +79,12 @@ function parseRunArgs(args) {
     }
   }
   return { opts, cmd };
+}
+
+/** BRAIN-319 T2 hidden remote-* subcommands: `--root <dir>` only. */
+function parseRootFlag(args) {
+  const idx = args.indexOf('--root');
+  return idx === -1 ? undefined : args[idx + 1];
 }
 
 function parseDurationMs(spec) {
@@ -147,6 +160,37 @@ async function main() {
     }
     case 'resume': {
       const result = await resumeCommand();
+      return result.exitCode;
+    }
+    // BRAIN-319 T2: hidden runner-side subcommands, invoked by a client Mac
+    // over ssh — deliberately not listed in usage() above.
+    case 'remote-probe': {
+      const result = await remoteProbeCommand();
+      return result.exitCode;
+    }
+    case 'remote-exec': {
+      const root = parseRootFlag(rest) || defaultRemoteRoot();
+      const result = await remoteExecCommand({ root });
+      return result.exitCode;
+    }
+    case 'remote-result': {
+      const id = rest[0];
+      if (!id) {
+        process.stderr.write('lane remote-result: missing <ticketId>\n');
+        return 2;
+      }
+      const root = parseRootFlag(rest.slice(1)) || defaultRemoteRoot();
+      const result = await remoteResultCommand(id, { root });
+      return result.exitCode;
+    }
+    case 'remote-cancel': {
+      const id = rest[0];
+      if (!id) {
+        process.stderr.write('lane remote-cancel: missing <ticketId>\n');
+        return 2;
+      }
+      const root = parseRootFlag(rest.slice(1)) || defaultRemoteRoot();
+      const result = await remoteCancelCommand(id, { root });
       return result.exitCode;
     }
     default:
