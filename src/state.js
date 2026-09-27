@@ -50,6 +50,17 @@ export function isCancelled(root, id) {
   return fs.existsSync(cancelMarkerPath(root, id));
 }
 
+/** Write the cancel marker for `id`, durably and idempotently. Single writer
+ *  used by every "we have accepted a cancellation" site (`cancel.js`'s
+ *  `lane cancel`, `wait.js`'s Ctrl-C forwarding, `supervisor.js`'s own
+ *  signal handlers) -- BRAIN-319 T3b-5: a cancellation a caller has already
+ *  decided to honour must be recorded BEFORE anything else happens, so a
+ *  later `publishTerminal`/`isCancelled` check can never miss it. */
+export function writeCancelMarkerFile(root, id) {
+  fs.mkdirSync(paths(root).cancel, { recursive: true });
+  atomicWriteFile(cancelMarkerPath(root, id), String(Date.now()));
+}
+
 export function ensureStateDirs(root = stateHome()) {
   const p = paths(root);
   for (const dir of [p.root, p.leases, p.queue, p.logs, p.results, p.cancel, p.attempts]) {

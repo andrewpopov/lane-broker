@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { gitFixture, laneRun, laneSpawn, waitFor, sleep } from './helpers.js';
-import { tmpDir, setup, markerCmd, detachAndWait, resultOf } from './remote-harness.js';
+import { tmpDir, setup, markerCmd, detachAndWait, resultOf, probeCount } from './remote-harness.js';
 import { paths, readJsonSafe } from '../src/state.js';
 
 /**
@@ -115,6 +115,89 @@ test('a tracked .env in the worktree is ineligible for remote and runs locally',
   );
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
+});
+
+test('an ineligible tree is refused before ever probing a runner: zero probes, no "running on" line', async () => {
+  // Codex pre-merge finding #5: eligibility (buildManifest) must be decided
+  // BEFORE selectRunner ever dials anything -- a foreground run (not
+  // --detach) is needed here since a detached supervisor's own stderr goes
+  // nowhere (stdio 'ignore'), and the "running on" banner is written to
+  // the supervisor's OWN stderr, not the child's captured output.
+  const { env, repoDir, probeLogPath } = setup();
+  gitFixture(['add', '-f', '.lane-broker.json'], repoDir);
+  fs.writeFileSync(path.join(repoDir, '.env'), 'SECRET=1');
+  gitFixture(['add', '-f', '.env'], repoDir);
+  gitFixture(['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '-m', 'x'], repoDir);
+  const marker = path.join(tmpDir('marker'), 'where');
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...markerCmd(marker, 0)], { env, cwd: repoDir });
+  assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
+  assert.doesNotMatch(result.stderr, /running on/);
+  assert.match(result.stderr, /remote-skip/);
+  assert.equal(probeCount(probeLogPath), 0, 'an ineligible tree must never dial a runner at all');
+});
+
+// ---- Codex pre-merge BLOCKER #1: durable cancellation, forced 130 ----
+
+test('a fallback child that traps SIGTERM and exits 0 still reports 130, never the child\'s own 0', async () => {
+  const { env, repoDir } = setup({ ssh: 'down' }); // forces an immediate local fallback
+  const startedMarker = path.join(tmpDir('started'), 'started');
+  const body = `
+require('fs').writeFileSync(${JSON.stringify(startedMarker)}, 'x');
+process.on('SIGTERM', () => { process.exit(0); });
+setInterval(() => {}, 1000);
+`;
+  const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', process.execPath, '-e', body], { env, cwd: repoDir });
+  let stderr = '';
+  child.stderr.on('data', (d) => {
+    stderr += d;
+  });
+  await waitFor(() => fs.existsSync(startedMarker), { timeoutMs: 15_000 });
+  await sleep(300);
+  child.kill('SIGINT');
+  const exitCode = await new Promise((resolve) => child.on('close', resolve));
+  assert.equal(exitCode, 130, `stderr: ${stderr}`);
+});
+
+// ---- Codex pre-merge BLOCKER #2: drain-then-publish, real async drain ----
+
+test('SIGINT during the post-completion drain of a remote success still reports 130, never the child\'s own 0', async () => {
+  const { env, repoDir } = setup();
+  const logPath = path.join(tmpDir('log'), 'out.log');
+  // Deliberately large + a slow reader: the goal is to make the SUPERVISOR's
+  // own drain (ForwardWriter/CappedLogWriter, after the remote child has
+  // already exited 0) span a long, comfortably-hittable wall-clock window,
+  // so the SIGINT below reliably lands mid-drain rather than racing a
+  // sub-100ms round trip.
+  const bytes = 24 * 1024 * 1024;
+  const body = `process.stdout.write(Buffer.alloc(${bytes}, 'a')); process.exit(0);`;
+  const child = laneSpawn(
+    ['run', '--repo', 'r', '--lane', 'default', '--log', logPath, '--', process.execPath, '-e', body],
+    { env, cwd: repoDir },
+  );
+  let sentSignal = false;
+  child.stdout.on('data', async (chunk) => {
+    if (!sentSignal) {
+      sentSignal = true;
+      child.kill('SIGINT');
+    }
+    void chunk;
+    await sleep(40);
+  });
+  let stderr = '';
+  child.stderr.on('data', (d) => {
+    stderr += d;
+  });
+
+  const exitCode = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timed out -- likely hung')), 90_000);
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+  });
+
+  assert.equal(exitCode, 130, `stderr: ${stderr}; a cancellation observed during the drain must win over the child's own successful exit`);
 });
 
 // ---- cancellation ----

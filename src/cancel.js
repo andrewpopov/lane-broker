@@ -1,6 +1,5 @@
-import fs from 'node:fs';
 import path from 'node:path';
-import { ensureStateDirs, paths, atomicWriteFile, appendHistory, atomicWriteJson, withLock, cancelMarkerPath } from './state.js';
+import { ensureStateDirs, paths, appendHistory, atomicWriteJson, withLock, writeCancelMarkerFile } from './state.js';
 import { readLease, removeLease, isSupervisorAlive, isGroupAlive } from './lease.js';
 import { dequeueSync, listQueue } from './scheduler.js';
 import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult } from './attempts.js';
@@ -11,11 +10,6 @@ const GRACE_MS = 10_000;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function writeCancelMarker(root, id) {
-  fs.mkdirSync(paths(root).cancel, { recursive: true });
-  atomicWriteFile(cancelMarkerPath(root, id), String(Date.now()));
 }
 
 /** TERM the group, wait a grace period, KILL, verify gone. Used when there is no supervisor left to do it. */
@@ -62,7 +56,7 @@ async function killGroupDirectly(pgid) {
  */
 async function cancelAttempt(root, id, attempt) {
   if (supervisorAlive(attempt)) {
-    writeCancelMarker(root, id);
+    writeCancelMarkerFile(root, id);
     try {
       process.kill(attempt.supervisor.pid, 'SIGTERM');
     } catch {
@@ -85,7 +79,7 @@ async function cancelAttempt(root, id, attempt) {
   }
 
   // ORPHANED-REMOTE: reconcile directly, no supervisor left to do it.
-  writeCancelMarker(root, id);
+  writeCancelMarkerFile(root, id);
   const globalCfg = loadGlobalConfig();
   const runnerCfg = (globalCfg.runners || []).find((r) => r.name === attempt.runner);
   if (runnerCfg) {
@@ -120,7 +114,7 @@ export async function cancelCommand(id) {
     const stillQueued = listQueue(root).find((t) => t && t.id === id);
     if (!stillQueued) return false;
     dequeueSync(root, id);
-    writeCancelMarker(root, id);
+    writeCancelMarkerFile(root, id);
     return true;
   });
   if (dequeuedHere) {
@@ -142,7 +136,7 @@ export async function cancelCommand(id) {
     return { exitCode: 1 };
   }
 
-  writeCancelMarker(root, id);
+  writeCancelMarkerFile(root, id);
 
   if (isSupervisorAlive(lease)) {
     try {

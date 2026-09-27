@@ -2,6 +2,7 @@ import { ensureStateDirs, paths, readJsonSafe } from './state.js';
 import { readLease, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
 import { readAttempt, supervisorAlive } from './attempts.js';
+import { cancelCommand } from './cancel.js';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -13,17 +14,22 @@ export async function waitCommand(id, { timeoutMs } = {}) {
   const resultPath = `${paths(root).results}/${id}.json`;
 
   let cancelling = false;
+  // BRAIN-319 T3b-5: delegate to the SAME attempt-aware cancel logic
+  // `lane cancel` uses -- forwarding straight to a lease's supervisorPid (as
+  // this used to) never even looks at an attempt record, so Ctrl-C on a
+  // `lane wait` reattached to a still mid-remote-dispatch (or post-fallback,
+  // not-yet-leased) ticket was silently swallowed. `cancelCommand` covers
+  // queued/leased/attempt (live or ORPHANED-REMOTE) uniformly; fired here
+  // without awaiting it (a signal handler can't usefully await), while this
+  // function's own polling loop below observes the eventual result the same
+  // way it always does.
   const forwardCancel = () => {
     if (cancelling) return;
     cancelling = true;
-    const lease = readLease(root, id);
-    if (lease && lease.supervisorPid) {
-      try {
-        process.kill(lease.supervisorPid, 'SIGTERM');
-      } catch {
-        // supervisor already gone
-      }
-    }
+    cancelCommand(id).catch(() => {
+      // best-effort: any failure here still leaves the polling loop below to
+      // report whatever state actually results.
+    });
   };
   process.on('SIGINT', forwardCancel);
   process.on('SIGTERM', forwardCancel);
@@ -46,21 +52,28 @@ export async function waitCommand(id, { timeoutMs } = {}) {
         }
         return { exitCode: result.exit ?? 1 };
       }
-      // BRAIN-319 T3b-4 (C4): an attempt record still mid remote-dispatch
-      // counts as "found" (no result yet, but something is genuinely
-      // working on it) UNLESS its supervisor is confirmed dead --
-      // ORPHANED-REMOTE never has a result coming, so waiting on it must
-      // fail fast and name the reconciliation step, not sit in the same
-      // not-found grace window a genuine typo would.
+      // BRAIN-319 T3b-4/T3b-5 (C4): an attempt record still mid remote-
+      // dispatch, or a post-fallback ticket that fell back but was never
+      // admitted (no lease yet), counts as "found" (no result yet, but
+      // something is genuinely working on it) UNLESS its supervisor is
+      // confirmed dead -- fixed to ANY attempt executor, not just 'remote':
+      // a fallback ticket cancelled/crashed while still queued locally has
+      // the exact same "nothing will ever produce a result" shape. Skipped
+      // when a LEASE also exists: an admitted (leased) ticket's child group
+      // can still be genuinely alive and finishing under a dead supervisor
+      // (the existing ORPHANED-lease path in cancel.js can reconcile that),
+      // so this check must never race ahead of a real, still-running child.
+      const lease = readLease(root, id);
       const attempt = readAttempt(root, id);
-      if (attempt && attempt.executor === 'remote' && !supervisorAlive(attempt)) {
+      if (attempt && !lease && !supervisorAlive(attempt)) {
+        const label = attempt.executor === 'remote' ? 'ORPHANED-REMOTE' : 'ORPHANED (post-fallback)';
         process.stderr.write(
-          `lane wait: ${id} is ORPHANED-REMOTE (runner ${attempt.runner ?? 'unknown'}) -- its supervisor is gone and nothing ` +
+          `lane wait: ${id} is ${label} (runner ${attempt.runner ?? 'unknown'}) -- its supervisor is gone and nothing ` +
             `will ever produce a result; reconcile with: lane cancel ${id}\n`,
         );
         return { exitCode: 1 };
       }
-      const found = readLease(root, id) || listQueue(root).some((t) => t && t.id === id) || Boolean(attempt);
+      const found = lease || listQueue(root).some((t) => t && t.id === id) || Boolean(attempt);
       if (found) {
         notFoundSince = null;
       } else {

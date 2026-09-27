@@ -61,6 +61,12 @@ export function makeFakeSshBin() {
   // doubling as the probed runner's busy state.
   const runnerHome = tmpDir('fake-runner-home');
   const runnerState = tmpDir('fake-runner-state');
+  // BRAIN-319 T3b-5 (finding #5): a durable log of every `remote-probe` this
+  // fake ssh sees, one destination name per line -- lets a test assert "no
+  // probe happened at all" for an ineligible tree, not just "no dispatch."
+  const probeLogDir = tmpDir('fake-probe-log');
+  const probeLogPath = path.join(probeLogDir, 'probes.log');
+  fs.writeFileSync(probeLogPath, '');
   const laneShim = path.join(binDir, 'lane');
   fs.writeFileSync(
     laneShim,
@@ -76,6 +82,7 @@ process.exit(res.status == null ? 1 : res.status);
   fs.writeFileSync(
     sshBin,
     `#!/usr/bin/env node
+const fs = require('fs');
 const { spawn } = require('child_process');
 
 const argv = process.argv.slice(2);
@@ -86,6 +93,10 @@ for (let i = 0; i < argv.length; i += 1) {
 }
 const destination = rest[0];
 const commandString = rest[1];
+
+if (commandString && commandString.includes('remote-probe')) {
+  try { fs.appendFileSync(${JSON.stringify(probeLogPath)}, destination + '\\n'); } catch {}
+}
 
 function exitNow(code) {
   process.exitCode = code;
@@ -161,7 +172,7 @@ if (destination === 'die-midstream') {
   );
   fs.chmodSync(sshBin, 0o755);
 
-  return { binDir, sshBin };
+  return { binDir, sshBin, probeLogPath };
 }
 
 export function makeRunner({ ssh, root, name = ssh }) {
@@ -219,7 +230,7 @@ export function makeDispatchArgs(overrides = {}) {
 /** One global config (runners + admission knobs) and one repo config (lane
  *  `remote: true`) per test, sharing a fresh fake-ssh binDir. */
 export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1 } = {}) {
-  const { binDir } = makeFakeSshBin();
+  const { binDir, probeLogPath } = makeFakeSshBin();
   const runnerRoot = tmpDir('remote-dispatch-runner-root');
   const { home, state, env } = freshEnv();
   const cfg = {
@@ -240,7 +251,16 @@ export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1 } = {}) 
   const repoDir = tmpDir('remote-dispatch-repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight, remote: true } } });
   gitFixture(['init', '-q'], repoDir);
-  return { env: { ...env, PATH: `${binDir}${path.delimiter}${env.PATH}` }, home, state, repoDir, runnerRoot };
+  return { env: { ...env, PATH: `${binDir}${path.delimiter}${env.PATH}` }, home, state, repoDir, runnerRoot, probeLogPath };
+}
+
+/** Number of `remote-probe` calls logged so far (see makeFakeSshBin's `probeLogPath`). */
+export function probeCount(probeLogPath) {
+  try {
+    return fs.readFileSync(probeLogPath, 'utf8').split('\n').filter(Boolean).length;
+  } catch {
+    return 0;
+  }
 }
 
 /** A `[cmd, ...args]` argv that reports where it ran (via LANE_FAKE_RUNNER,

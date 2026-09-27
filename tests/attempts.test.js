@@ -186,3 +186,26 @@ test('an attempt record survives a simulated reboot (boot id change) rather than
     else process.env.LANE_BROKER_BOOT_ID = prevBootIdEnv;
   }
 });
+
+test('publishTerminal refuses a writer that returns a Promise, in both the cancelled and non-cancelled branch', async () => {
+  const { state } = freshEnv();
+  await createAttempt(state, 'idAsyncA', {});
+  await assert.rejects(
+    () => publishTerminal(state, 'idAsyncA', 0, () => Promise.resolve()),
+    /must be synchronous/,
+    'a non-cancelled async writer must be refused',
+  );
+  // Refused: the attempt must survive, untouched by the rejected call.
+  assert.ok(readAttempt(state, 'idAsyncA'), 'a refused publish must never remove the attempt record');
+
+  await createAttempt(state, 'idAsyncB', {});
+  const dir = paths(state).cancel;
+  fs.mkdirSync(dir, { recursive: true });
+  atomicWriteFile(path.join(dir, 'idAsyncB'), String(Date.now()));
+  await assert.rejects(
+    () => publishTerminal(state, 'idAsyncB', 0, () => Promise.resolve()),
+    /must be synchronous/,
+    'a cancelled-branch async writer must also be refused',
+  );
+  assert.ok(readAttempt(state, 'idAsyncB'), 'a refused cancelled-branch publish must never remove the attempt record either');
+});

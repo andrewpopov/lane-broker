@@ -173,10 +173,32 @@ export async function fallbackToLocal(root, id, reason) {
  * Either way (steps 1 or 3), the attempt record is removed once
  * `resultWriterFn` returns -- the attempt is over.
  */
+/**
+ * `resultWriterFn` MUST be synchronous. Everything that can take real time
+ * (draining logs/output pipes, an ssh round trip, ...) has to happen BEFORE
+ * calling `publishTerminal`, not inside its callback: this whole function
+ * runs as one `withLock` transaction, and if the callback kicked off async
+ * work without awaiting it, `withLock` would release the mutex and this
+ * function would report success LONG before that work (or even the actual
+ * `atomicWriteJson`) has happened -- a crash or SIGINT in that gap then
+ * leaves neither an attempt record nor a result.json (BRAIN-319 T3b-5).
+ * Enforced here, not just documented: a writer that returns a thenable
+ * throws immediately, so a regression fails loudly instead of silently
+ * reopening the gap.
+ */
+function assertSyncWriter(returned) {
+  if (returned && typeof returned.then === 'function') {
+    throw new TypeError(
+      'publishTerminal: resultWriterFn must be synchronous (it returned a Promise) -- drain/await ' +
+        'everything BEFORE calling publishTerminal, then pass a plain synchronous writer',
+    );
+  }
+}
+
 export async function publishTerminal(root, id, generation, resultWriterFn) {
   return withLock(root, () => {
     if (isCancelled(root, id)) {
-      resultWriterFn({ cancelled: true });
+      assertSyncWriter(resultWriterFn({ cancelled: true }));
       removeAttempt(root, id);
       return { ok: true, cancelled: true };
     }
@@ -184,7 +206,7 @@ export async function publishTerminal(root, id, generation, resultWriterFn) {
     if (!current || current.generation !== generation) {
       return { ok: false };
     }
-    resultWriterFn({ cancelled: false });
+    assertSyncWriter(resultWriterFn({ cancelled: false }));
     removeAttempt(root, id);
     return { ok: true, cancelled: false };
   });

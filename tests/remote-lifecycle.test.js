@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { laneRun, waitFor, sleep } from './helpers.js';
+import { laneRun, laneSpawn, waitFor, sleep, writeGlobalConfig } from './helpers.js';
 import { tmpDir, setup, markerCmd, detachAndWait, resultOf } from './remote-harness.js';
 import { readAttempt } from '../src/attempts.js';
 
@@ -156,4 +156,132 @@ test('an attempt record survives a changed boot id and still reports ORPHANED-RE
     // ordinary live-supervisor cancel path cleans everything up.
     await laneRun(['cancel', id], { env });
   }
+});
+
+// ---- Codex pre-merge BLOCKER #3: Ctrl-C on `lane wait` for a remote attempt ----
+
+/** Like sleeperCmd, but also records WHERE it ran (via LANE_FAKE_RUNNER) to
+ *  `whereMarker` -- so a test can prove a local re-run never overwrote it
+ *  with 'local' after a remote-run cancellation. */
+function sleeperMarkerCmd(startedMarker, whereMarker) {
+  return [
+    process.execPath,
+    '-e',
+    `const fs = require('fs');
+fs.writeFileSync(${JSON.stringify(startedMarker)}, 'x');
+fs.writeFileSync(${JSON.stringify(whereMarker)}, process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local');
+setInterval(() => {}, 1000);`,
+  ];
+}
+
+test('SIGINT to `lane wait` on a detached remote run cancels it: exit 130, runner ticket cancelled, no local re-run', async () => {
+  const { env, runnerRoot, repoDir } = setup();
+  const startedMarker = path.join(tmpDir('started'), 'started');
+  const whereMarker = path.join(tmpDir('where'), 'where');
+  const started = await laneRun(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...sleeperMarkerCmd(startedMarker, whereMarker)],
+    { env, cwd: repoDir },
+  );
+  assert.equal(started.code, 0, `--detach should not fail: ${started.stderr}`);
+  const id = started.stdout.trim();
+  await waitFor(() => fs.existsSync(startedMarker), { timeoutMs: 15_000 });
+  assert.equal(fs.readFileSync(whereMarker, 'utf8'), 'remote');
+
+  const waitChild = laneSpawn(['wait', id], { env });
+  let waitStderr = '';
+  waitChild.stderr.on('data', (d) => {
+    waitStderr += d;
+  });
+  await sleep(500); // let `lane wait` actually attach and poll at least once
+  waitChild.kill('SIGINT');
+  // Bounded: a broken cancel-forwarding path here must fail this test fast
+  // and by name, never hang the whole suite waiting on a `lane wait` that
+  // will genuinely never get a result (nothing else will ever cancel it).
+  const exitCode = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      waitChild.kill('SIGKILL');
+      reject(new Error(`lane wait never exited after SIGINT -- stderr so far: ${waitStderr}`));
+    }, 20_000);
+    waitChild.on('close', (code) => {
+      clearTimeout(timer);
+      resolve(code);
+    });
+  });
+  assert.equal(exitCode, 130, `stderr: ${waitStderr}`);
+  // Still 'remote': if a local re-run had happened it would have overwritten
+  // this with 'local' (or, at minimum, restarted -- there is no other way
+  // the file could be rewritten).
+  assert.equal(fs.readFileSync(whereMarker, 'utf8'), 'remote', 'a local rerun must never have happened');
+
+  const ticketsDir = path.join(runnerRoot, 'tickets');
+  const [remoteTicketId] = fs.readdirSync(ticketsDir);
+  const record = await waitFor(() => {
+    const fp = path.join(ticketsDir, remoteTicketId, 'result.json');
+    return fs.existsSync(fp) ? JSON.parse(fs.readFileSync(fp, 'utf8')) : null;
+  });
+  assert.equal(record.kind, 'cancelled');
+});
+
+// ---- Codex pre-merge SHOULD-FIX #4: queued-fallback cancellation/orphan ----
+
+/** Force a remote-eligible ticket to fall back AND sit QUEUED (never
+ *  leased): capacity 1, occupied by a long-running local blocker first. */
+async function startQueuedFallback(env, home, state, repoDir) {
+  writeGlobalConfig(home, {
+    version: 1,
+    capacity: 1,
+    loadClose: 1000,
+    loadOpen: 900,
+    loadOpenSamples: 1,
+    sampleMs: 100,
+    runners: [{ name: 'skybox', ssh: 'down', shell: 'sh -c', root: tmpDir('blocked-runner-root') }],
+  });
+  const blocker = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', 'sleep', '30'], { env, cwd: repoDir });
+  assert.equal(blocker.code, 0, `blocker --detach should not fail: ${blocker.stderr}`);
+  await waitFor(() => fs.readdirSync(path.join(state, 'leases')).filter((n) => n.endsWith('.json')).length > 0, { timeoutMs: 15_000 });
+
+  const marker = path.join(tmpDir('marker'), 'where');
+  const started = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], { env, cwd: repoDir });
+  assert.equal(started.code, 0, `--detach should not fail: ${started.stderr}`);
+  const id = started.stdout.trim();
+  await waitFor(() => readAttempt(state, id)?.executor === 'local', { timeoutMs: 15_000 });
+  assert.equal(fs.existsSync(path.join(state, 'leases', `${id}.json`)), false, 'must still be queued, not leased, for this test to mean anything');
+  return { id, marker, blockerId: blocker.stdout.trim() };
+}
+
+test('cancel while a post-fallback ticket sits QUEUED (capacity full): result 130, attempt removed, wait returns 130 not a hang', async () => {
+  const { env, home, state, repoDir } = setup({ ssh: 'down' });
+  const { id, marker, blockerId } = await startQueuedFallback(env, home, state, repoDir);
+
+  const cancelResult = await laneRun(['cancel', id], { env });
+  assert.equal(cancelResult.code, 0, `stderr: ${cancelResult.stderr}`);
+
+  const result = await waitFor(() => resultOf(state, id), { timeoutMs: 15_000 });
+  assert.equal(result.exit, 130);
+  assert.equal(result.cancelled, true);
+  await waitFor(() => readAttempt(state, id) === null, { timeoutMs: 15_000 });
+  assert.equal(fs.existsSync(marker), false, 'the child must never have run at all');
+
+  const waited = await laneRun(['wait', id, '--timeout', '10s'], { env });
+  assert.equal(waited.code, 130, `stderr: ${waited.stderr} -- must not hang or time out`);
+
+  await laneRun(['cancel', blockerId], { env }); // cleanup: release the blocker's own child group
+});
+
+test('supervisor SIGKILLed after fallback (still queued): wait fails fast, naming it, instead of hanging', async () => {
+  const { env, home, state, repoDir } = setup({ ssh: 'down' });
+  const { id, blockerId } = await startQueuedFallback(env, home, state, repoDir);
+
+  const attempt = readAttempt(state, id);
+  assert.ok(attempt, 'expected an attempt record for the still-queued fallback ticket');
+  assert.equal(attempt.executor, 'local');
+  process.kill(attempt.supervisor.pid, 'SIGKILL');
+  await sleep(300);
+
+  const waited = await laneRun(['wait', id, '--timeout', '5s'], { env });
+  assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
+  assert.match(waited.stderr, /ORPHANED/);
+  assert.match(waited.stderr, new RegExp(`lane cancel ${id}`));
+
+  await laneRun(['cancel', blockerId], { env }); // cleanup: release the blocker's own child group
 });

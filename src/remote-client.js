@@ -319,6 +319,14 @@ export async function dispatchRemote(opts) {
     deadlines = {},
     sshBin = 'ssh',
     env,
+    // BRAIN-319 T3b-5: a caller (the supervisor) that has already decided
+    // eligibility up front -- BEFORE ever probing/selecting a runner -- can
+    // hand the manifest it already built here instead of having this
+    // function build it again. Kept as ONE code path either way: this is
+    // still the only place `buildManifest` is called for a dispatch: either
+    // by the caller (once, up front) or by this function itself when no
+    // caller has done so (every existing direct caller/test, unchanged).
+    manifest: prebuiltManifest,
   } = opts;
 
   const transferDeadlineMs = deadlines.transferMs ?? 5 * 60_000;
@@ -326,12 +334,14 @@ export async function dispatchRemote(opts) {
   const resultAttempts = deadlines.resultAttempts ?? 3;
   const cancelDeadlineMs = deadlines.cancelMs ?? 15_000;
 
-  let manifest;
-  try {
-    manifest = buildManifest(worktreeRoot);
-  } catch (err) {
-    if (err instanceof RemoteIneligibleError) return { outcome: 'ineligible', reason: err.message };
-    throw err;
+  let manifest = prebuiltManifest;
+  if (!manifest) {
+    try {
+      manifest = buildManifest(worktreeRoot);
+    } catch (err) {
+      if (err instanceof RemoteIneligibleError) return { outcome: 'ineligible', reason: err.message };
+      throw err;
+    }
   }
 
   if (abortSignal && abortSignal.aborted) return { outcome: 'cancelled' };
