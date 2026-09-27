@@ -182,6 +182,30 @@ function validateRunners(runners, sourcePath) {
   }
 }
 
+/**
+ * BRAIN-320 S1b: the shape rules for a lane's `remoteDeps` -- non-empty
+ * array of "." or a canonical relative path, no duplicates -- shared between
+ * `.lane-broker.json` validation (below) and the runner's own re-validation
+ * of a protocol-2 header's `remoteDeps` field (remote-runner.js), so the two
+ * ends never drift apart on what counts as a valid value.
+ */
+export function isValidRemoteDepsShape(dirs) {
+  if (!Array.isArray(dirs) || dirs.length === 0) return false;
+  const seen = new Set();
+  for (const dir of dirs) {
+    if (dir !== '.' && !(typeof dir === 'string' && isCanonicalRelPath(dir))) return false;
+    if (seen.has(dir)) return false;
+    seen.add(dir);
+  }
+  return true;
+}
+
+/** Same sharing rationale as `isValidRemoteDepsShape` above, for `remoteSetup`. */
+export function isValidRemoteSetupShape(setup) {
+  if (!Array.isArray(setup) || setup.length === 0) return false;
+  return setup.every((argv) => Array.isArray(argv) && argv.length > 0 && argv.every((a) => typeof a === 'string' && a.length > 0));
+}
+
 function validateRepoConfig(cfg, sourcePath) {
   assert(cfg && typeof cfg === 'object', `${sourcePath}: config must be an object`);
   assert(Number.isInteger(cfg.version), `${sourcePath}: "version" must be an integer`);
@@ -215,30 +239,15 @@ function validateRepoConfig(cfg, sourcePath) {
     }
     if (lane.remoteDeps !== undefined) {
       assert(
-        Array.isArray(lane.remoteDeps) && lane.remoteDeps.length > 0,
-        `${sourcePath}: lane "${name}".remoteDeps must be a non-empty array`,
+        isValidRemoteDepsShape(lane.remoteDeps),
+        `${sourcePath}: lane "${name}".remoteDeps must be a non-empty array of "." or canonical relative paths, no duplicates`,
       );
-      const seenDirs = new Set();
-      for (const dir of lane.remoteDeps) {
-        assert(
-          dir === '.' || (typeof dir === 'string' && isCanonicalRelPath(dir)),
-          `${sourcePath}: lane "${name}".remoteDeps entries must be "." or a canonical relative path`,
-        );
-        assert(!seenDirs.has(dir), `${sourcePath}: lane "${name}".remoteDeps has a duplicate entry "${dir}"`);
-        seenDirs.add(dir);
-      }
     }
     if (lane.remoteSetup !== undefined) {
       assert(
-        Array.isArray(lane.remoteSetup) && lane.remoteSetup.length > 0,
-        `${sourcePath}: lane "${name}".remoteSetup must be a non-empty array`,
+        isValidRemoteSetupShape(lane.remoteSetup),
+        `${sourcePath}: lane "${name}".remoteSetup must be a non-empty array of non-empty arrays of non-empty strings`,
       );
-      for (const argv of lane.remoteSetup) {
-        assert(
-          Array.isArray(argv) && argv.length > 0 && argv.every((a) => typeof a === 'string' && a.length > 0),
-          `${sourcePath}: lane "${name}".remoteSetup entries must be non-empty arrays of non-empty strings`,
-        );
-      }
     }
   }
   if (cfg.conflicts !== undefined) {

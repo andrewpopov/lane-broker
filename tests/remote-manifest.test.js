@@ -11,6 +11,7 @@ import {
   manifestHashOf,
   isCanonicalRelPath,
   validateRemoteDeps,
+  checkRemoteDepsDirsOnDisk,
 } from '../src/remote-manifest.js';
 
 function tmpRepo() {
@@ -344,4 +345,48 @@ test('validateRemoteDeps: valid non-overlapping sibling dirs pass', () => {
   const manifest = manifestOf(['api/package-lock.json', 'web/package-lock.json']);
   const result = validateRemoteDeps(manifest, ['api', 'web']);
   assert.deepEqual(result, { ok: true });
+});
+
+// ---- checkRemoteDepsDirsOnDisk (BRAIN-320 S1b 1c) ----
+
+test('checkRemoteDepsDirsOnDisk: a real directory tree passes', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-deps-disk-'));
+  fs.mkdirSync(path.join(dir, 'web'), { recursive: true });
+  const result = checkRemoteDepsDirsOnDisk(dir, ['web', '.']);
+  assert.deepEqual(result, { ok: true });
+});
+
+test('checkRemoteDepsDirsOnDisk: a symlinked path component is rejected', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-deps-disk-'));
+  const real = path.join(dir, 'real-web');
+  fs.mkdirSync(real, { recursive: true });
+  fs.symlinkSync(real, path.join(dir, 'web'));
+  const result = checkRemoteDepsDirsOnDisk(dir, ['web']);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /symlink/);
+});
+
+test('checkRemoteDepsDirsOnDisk: a symlinked ANCESTOR component is rejected', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-deps-disk-'));
+  const real = path.join(dir, 'real-a');
+  fs.mkdirSync(path.join(real, 'b'), { recursive: true });
+  fs.symlinkSync(real, path.join(dir, 'a'));
+  const result = checkRemoteDepsDirsOnDisk(dir, ['a/b']);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /symlink/);
+});
+
+test('checkRemoteDepsDirsOnDisk: a missing dir is rejected', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-deps-disk-'));
+  const result = checkRemoteDepsDirsOnDisk(dir, ['nope']);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /does not exist/);
+});
+
+test('checkRemoteDepsDirsOnDisk: a path component that is a plain file (not a directory) is rejected', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-deps-disk-'));
+  fs.writeFileSync(path.join(dir, 'notadir'), 'x');
+  const result = checkRemoteDepsDirsOnDisk(dir, ['notadir']);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /not a directory/);
 });

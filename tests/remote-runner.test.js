@@ -198,7 +198,7 @@ test('an unsupported protocol version is rejected before any child runs', async 
   const markerFile = path.join(tmpDir('remote-exec-marker'), 'marker');
   const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
   const header = makeHeader({
-    protocol: 2,
+    protocol: 3,
     argv: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(markerFile)}, '1')`],
   });
 
@@ -209,6 +209,121 @@ test('an unsupported protocol version is rejected before any child runs', async 
   assert.equal(result.kind, 'rejected');
   assert.match(result.reason, /protocol/);
   assert.equal(fs.existsSync(markerFile), false, 'the child must never have run');
+});
+
+// BRAIN-320 S1b: a protocol-1 header must never carry remoteDeps/remoteSetup.
+test('a protocol-1 header carrying remoteDeps is rejected before any child runs', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const markerFile = path.join(tmpDir('remote-exec-marker'), 'marker');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello', 'package-lock.json': '{}' });
+  const header = makeHeader({
+    protocol: 1,
+    remoteDeps: ['.'],
+    argv: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(markerFile)}, '1')`],
+  });
+
+  const { code } = await runOne(header, entries, { env, root, src });
+  assert.equal(code, 0);
+
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.kind, 'rejected');
+  assert.match(result.reason, /protocol 1/);
+  assert.equal(fs.existsSync(markerFile), false, 'the child must never have run');
+});
+
+// BRAIN-320 S1b: a plain protocol-1 header (no remoteDeps/remoteSetup) keeps
+// today's exact result shape -- no `phase` field at all (I6).
+test('a plain protocol-1 header result has no phase field', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ protocol: 1 });
+
+  const { code } = await runOne(header, entries, { env, root, src });
+  assert.equal(code, 0);
+
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.protocol, 1);
+  assert.equal(result.kind, 'completed');
+  assert.equal('phase' in result, false, 'protocol-1 results must never carry a phase field');
+});
+
+// BRAIN-320 S1b: shape validation for a protocol-2 header's remoteDeps/remoteSetup.
+test('a protocol-2 header with an invalid remoteDeps shape is rejected', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ protocol: 2, remoteDeps: [] }); // empty array is invalid shape
+
+  const { code } = await runOne(header, entries, { env, root, src });
+  assert.equal(code, 0);
+
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.kind, 'rejected');
+  assert.match(result.reason, /remoteDeps/);
+});
+
+test('a protocol-2 header with an invalid remoteSetup shape is rejected', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ protocol: 2, remoteSetup: [[]] }); // empty argv is invalid shape
+
+  const { code } = await runOne(header, entries, { env, root, src });
+  assert.equal(code, 0);
+
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.kind, 'rejected');
+  assert.match(result.reason, /remoteSetup/);
+});
+
+// BRAIN-320 S1b (1c): proves remoteExecCommand actually WIRES the runner-side
+// re-check (validateRemoteDeps against the manifest, re-run after extraction)
+// rather than merely defining it -- a manifest whose lockfile dir also has an
+// npm-shrinkwrap.json passes header-shape validation (remoteDeps: ['.'] is a
+// valid shape) and extraction (both are real files on disk), so only the 1c
+// re-check itself can catch this before the pipeline ever runs.
+test('a protocol-2 header with remoteDeps whose dir has a shrinkwrap alongside the lockfile is rejected, and the pipeline never runs', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const markerFile = path.join(tmpDir('remote-exec-marker'), 'marker');
+  const { dir: src, entries } = makeSnapshotSource({
+    'package-lock.json': '{}',
+    'npm-shrinkwrap.json': '{}',
+  });
+  const header = makeHeader({
+    protocol: 2,
+    remoteDeps: ['.'],
+    argv: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(markerFile)}, '1')`],
+  });
+
+  const { code } = await runOne(header, entries, { env, root, src });
+  assert.equal(code, 0);
+
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.kind, 'rejected');
+  assert.match(result.reason, /shrinkwrap/);
+  assert.equal(result.phase, null, 'no phase was ever recorded -- the pipeline never started');
+  assert.equal(fs.existsSync(markerFile), false, 'the command must never have run');
+});
+
+// BRAIN-320 S1b: a plain protocol-2 header (no remoteDeps/remoteSetup) still
+// runs the caller's argv, through the pipeline, ending at phase "command".
+test('a plain protocol-2 header (no remoteDeps/remoteSetup) runs the command and reports phase command', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ protocol: 2, argv: [process.execPath, '-e', 'process.exit(0)'] });
+
+  const { code } = await runOne(header, entries, { env, root, src });
+  assert.equal(code, 0);
+
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.protocol, 2);
+  assert.equal(result.kind, 'completed');
+  assert.equal(result.exit, 0);
+  assert.equal(result.phase, 'command');
 });
 
 test('an invalid ticketId (path traversal) is refused with nothing written on disk outside root', async () => {

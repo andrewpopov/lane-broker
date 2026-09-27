@@ -362,4 +362,38 @@ export function validateRemoteDeps(manifest, dirs) {
   return { ok: true };
 }
 
+/**
+ * BRAIN-320 S1b (1c): runner-side re-check that each `remoteDeps` dir is a
+ * real directory on the EXTRACTED tree, with no path component a symlink.
+ * `validateRemoteDeps` (above) only ever inspects the manifest -- it cannot
+ * see the real filesystem `remote-exec` just wrote -- so this is the
+ * runner's own defense-in-depth for the moment right before the deps phase
+ * is about to run `npm ci` inside one of these dirs. `root` is the
+ * extracted work dir; `dirs` is the header's `remoteDeps` array (each "."
+ * or a canonical relative path). Returns `{ok:true}` or `{ok:false, reason}`
+ * naming the first violation -- never throws.
+ */
+export function checkRemoteDepsDirsOnDisk(root, dirs) {
+  for (const dir of dirs) {
+    const segs = dir === '.' ? [] : dir.split('/');
+    let acc = path.resolve(root);
+    for (const seg of segs) {
+      acc = path.join(acc, seg);
+      let st;
+      try {
+        st = fs.lstatSync(acc);
+      } catch {
+        return { ok: false, reason: `remoteDeps dir "${dir}" does not exist on disk` };
+      }
+      if (st.isSymbolicLink()) {
+        return { ok: false, reason: `remoteDeps dir "${dir}" has a symlink path component: "${seg}"` };
+      }
+      if (!st.isDirectory()) {
+        return { ok: false, reason: `remoteDeps dir "${dir}" path component is not a directory: "${seg}"` };
+      }
+    }
+  }
+  return { ok: true };
+}
+
 export { sortEntries, canonicalizeEntry };

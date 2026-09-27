@@ -12,6 +12,7 @@ import {
   remoteCancelCommand,
   defaultRemoteRoot,
 } from '../src/remote-runner.js';
+import { remotePipelineCommand } from '../src/remote-pipeline.js';
 
 function usage() {
   return `Usage:
@@ -196,6 +197,17 @@ async function main() {
       }
       const root = parseRootFlag(rest.slice(1)) || defaultRemoteRoot();
       const result = await remoteCancelCommand(id, { root });
+      return result.exitCode;
+    }
+    // BRAIN-320 S1b: hidden -- the pipeline `remote-exec` spawns as a
+    // protocol-2 ticket's own child, never invoked by a human or a client.
+    case 'remote-pipeline': {
+      const ticketDir = rest[0];
+      if (!ticketDir) {
+        process.stderr.write('lane remote-pipeline: missing <ticketDir>\n');
+        return 2;
+      }
+      const result = await remotePipelineCommand(ticketDir);
       return result.exitCode;
     }
     default:
