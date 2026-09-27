@@ -420,6 +420,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
 
   const dispatch = await dispatchRemote({
     ...enriched.remote,
+    runner,
     argv: enriched.cmd,
     lane: enriched.lane,
     ticketId: enriched.id,
