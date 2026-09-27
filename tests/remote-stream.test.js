@@ -6,7 +6,7 @@ import path from 'node:path';
 import { Readable } from 'node:stream';
 import { gitFixture } from './helpers.js';
 import { buildManifest, manifestHashOf } from '../src/remote-manifest.js';
-import { encodeSnapshot, extractSnapshot } from '../src/remote-stream.js';
+import { encodeSnapshot, extractSnapshot, serializeHeader } from '../src/remote-stream.js';
 
 function tmpDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
@@ -52,6 +52,23 @@ test('round trip: encode -> extract -> verify ok, including exec bit and a symli
   assert.equal(fs.readFileSync(path.join(dest, 'plain.txt'), 'utf8'), 'hello world');
   assert.equal(fs.statSync(path.join(dest, 'run.sh')).mode & 0o777, 0o755);
   assert.equal(fs.readlinkSync(path.join(dest, 'link.txt')), 'target.txt');
+});
+
+test('serializeHeader is byte-identical to the first line encodeSnapshot emits', async () => {
+  const src = tmpRepo();
+  fs.writeFileSync(path.join(src, 'plain.txt'), 'hello world');
+  gitFixture(['add', '.'], src);
+  gitFixture(['commit', '-q', '-m', 'init'], src);
+
+  const manifest = buildManifest(src);
+  const header = { ticketId: 't1', generation: 0, repoKey: 'r', lane: 'default', argv: ['node'], relCwd: '' };
+
+  const streamReadable = encodeSnapshot(src, header, manifest.entries);
+  const reader = streamReadable[Symbol.asyncIterator]();
+  const { value: firstChunk } = await reader.next();
+  const emittedLine = Buffer.isBuffer(firstChunk) ? firstChunk.toString('utf8') : String(firstChunk);
+
+  assert.equal(serializeHeader(header, manifest.entries), emittedLine);
 });
 
 test('destDir already existing is refused', async () => {

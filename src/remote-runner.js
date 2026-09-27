@@ -8,7 +8,7 @@ import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, readJsonSafe,
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, loadGlobalConfig } from './config.js';
 import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores } from './resources.js';
-import { makeReader, readHeaderLine, extractFrames } from './remote-stream.js';
+import { makeReader, readHeaderLine, extractFrames, MAX_HEADER_BYTES } from './remote-stream.js';
 import { runCommand } from './run.js';
 import { cancelCommand } from './cancel.js';
 import { collectStatus } from './status.js';
@@ -243,7 +243,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   }
 
   const reader = makeReader(stdin);
-  const headerResult = await readHeaderLine(reader, 1_000_000);
+  const headerResult = await readHeaderLine(reader, MAX_HEADER_BYTES);
   if (!headerResult.ok) {
     process.stderr.write(`lane remote-exec: ${headerResult.reason}\n`);
     return { exitCode: 1 };

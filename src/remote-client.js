@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process';
 import { buildManifest, RemoteIneligibleError } from './remote-manifest.js';
-import { encodeSnapshot } from './remote-stream.js';
+import { encodeSnapshot, serializeHeader, MAX_HEADER_BYTES } from './remote-stream.js';
 
 /**
  * BRAIN-319 T3a: the CLIENT side of the remote runner protocol implemented
@@ -493,6 +493,24 @@ export async function dispatchRemote(opts) {
     if (Array.isArray(remoteSetup) && remoteSetup.length > 0) header.remoteSetup = remoteSetup;
   }
   if (Number.isInteger(queueTimeoutMs) && queueTimeoutMs > 0) header.queueTimeoutMs = queueTimeoutMs;
+
+  // BRAIN-320 follow-up: reject an oversized header locally, before ever
+  // dialing ssh. `serializeHeader` is the exact function `encodeSnapshot`
+  // uses for this same line (below), so the byte count checked here can
+  // never disagree with what actually gets sent -- a repo whose manifest
+  // alone exceeds the runner's `MAX_HEADER_BYTES` used to dial ssh, get its
+  // stdin closed by `lane remote-exec` before a ticket dir even existed,
+  // and surface only as an opaque "ssh stdin error" with a silent fallback
+  // to local. This turns that into a named ineligible reason up front.
+  const headerLine = serializeHeader(header, manifest.entries);
+  const headerBytes = Buffer.byteLength(headerLine, 'utf8');
+  if (headerBytes > MAX_HEADER_BYTES) {
+    return {
+      outcome: 'ineligible',
+      reason: `snapshot header is ${headerBytes} bytes, over the runner limit of ${MAX_HEADER_BYTES} (too many files)`,
+    };
+  }
+
   const snapshotStream = encodeSnapshot(worktreeRoot, header, manifest.entries);
 
   const execCommand = buildRemoteCommand(runner, 'remote-exec');
