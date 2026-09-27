@@ -7,6 +7,21 @@ import { manifestHashOf, sortEntries, verifyManifestNoGit, isCanonicalRelPath } 
 const NEWLINE = 0x0a;
 
 /**
+ * Upper bound on the snapshot HEADER line (protocol + ticket fields +
+ * the full sorted manifest, one JSON line -- see `serializeHeader`).
+ * BRAIN-320 (follow-up): a large repo's manifest alone can exceed the old
+ * 1 MB frame-header-sized cap well before hitting any real file-count
+ * limit (rouge's 8,788-file manifest serializes to ~1.6 MB), so the
+ * snapshot header gets its own, much larger budget. This bounds ONLY the
+ * snapshot header line read by `lane remote-exec` (`remote-runner.js`) and
+ * the client-side precheck in `dispatchRemote` (`remote-client.js`) -- it
+ * does not change the per-FRAME header default (`extractFrames`/
+ * `extractSnapshot`'s own `maxLineBytes`), which bounds one manifest
+ * entry's frame line, not the whole manifest.
+ */
+export const MAX_HEADER_BYTES = 16 * 1024 * 1024;
+
+/**
  * Reject a `relPath` whose ancestor directories are no longer plain
  * directories by the time we're about to open it -- lstat each ancestor
  * component under `worktreeRoot` rather than trusting the manifest's earlier
@@ -69,6 +84,22 @@ function readVerifiedFile(worktreeRoot, entry) {
 }
 
 /**
+ * Serialize the snapshot HEADER line exactly as `encodeSnapshot` emits it as
+ * its first yielded chunk -- factored out so the client-side oversized-
+ * header precheck in `dispatchRemote` (remote-client.js) computes the same
+ * bytes `encodeSnapshot` will actually send, rather than a second
+ * hand-rolled serialization that could silently disagree with it. `entries`
+ * is sorted here (matching `encodeSnapshot`'s own `sortEntries` call); pass
+ * a precomputed `manifestHash` to avoid rehashing when the caller already
+ * has one.
+ */
+export function serializeHeader(header, entries, manifestHash) {
+  const ordered = sortEntries(entries);
+  const hash = manifestHash ?? manifestHashOf(entries);
+  return `${JSON.stringify({ protocol: 1, ...header, manifest: { entries: ordered, manifestHash: hash } })}\n`;
+}
+
+/**
  * Encode a worktree snapshot as a framed byte stream: one header line, then
  * per entry a frame-header line followed by exactly `size` raw bytes for a
  * file (no body for a symlink), then a `{end:true}` terminator line. Reads
@@ -78,9 +109,10 @@ function readVerifiedFile(worktreeRoot, entry) {
 export function encodeSnapshot(worktreeRoot, header, entries) {
   const manifestHash = manifestHashOf(entries);
   const ordered = sortEntries(entries);
+  const headerLine = serializeHeader(header, entries, manifestHash);
 
   async function* generate() {
-    yield Buffer.from(`${JSON.stringify({ protocol: 1, ...header, manifest: { entries: ordered, manifestHash } })}\n`, 'utf8');
+    yield Buffer.from(headerLine, 'utf8');
     for (const entry of ordered) {
       if (entry.type === 'file') {
         yield Buffer.from(`${JSON.stringify({ path: entry.path, type: 'file', exec: !!entry.exec, size: entry.size })}\n`, 'utf8');
@@ -221,7 +253,7 @@ function checkExtractSymlinkTarget(relPath, target, symlinkPaths) {
  * that must validate header fields (ticketId, generation, repoKey, ...)
  * themselves before any extraction happens.
  */
-export async function readHeaderLine(reader, maxLineBytes = 1_000_000) {
+export async function readHeaderLine(reader, maxLineBytes = MAX_HEADER_BYTES) {
   let headerLine;
   try {
     headerLine = await reader.readLine(maxLineBytes);

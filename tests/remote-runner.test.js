@@ -8,7 +8,7 @@ import { spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { freshEnv, writeGlobalConfig, BIN, laneRun, sleep, waitFor } from './helpers.js';
 import { manifestHashOf, verifyManifestNoGit } from '../src/remote-manifest.js';
-import { encodeSnapshot } from '../src/remote-stream.js';
+import { encodeSnapshot, serializeHeader, MAX_HEADER_BYTES } from '../src/remote-stream.js';
 import { sanitizeKey } from '../src/config.js';
 import { paths, readJsonSafe } from '../src/state.js';
 import { writeLease } from '../src/lease.js';
@@ -160,6 +160,30 @@ for (const exitCode of [1, 42, 75, 255]) {
     assert.equal(result.exit, exitCode);
   });
 }
+
+// ---- BRAIN-320 follow-up: the snapshot header is raised to MAX_HEADER_BYTES ----
+
+test('a manifest large enough that its header exceeds the old 1 MB cap (but stays under MAX_HEADER_BYTES) still completes', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const files = {};
+  for (let i = 0; i < 9000; i += 1) {
+    files[`f${String(i).padStart(6, '0')}.txt`] = 'x';
+  }
+  const { dir: src, entries } = makeSnapshotSource(files);
+  const header = makeHeader();
+
+  const headerBytes = Buffer.byteLength(serializeHeader(header, entries), 'utf8');
+  assert.ok(headerBytes > 1_000_000, `expected a header over 1 MB, got ${headerBytes}`);
+  assert.ok(headerBytes < MAX_HEADER_BYTES, `expected a header under MAX_HEADER_BYTES, got ${headerBytes}`);
+
+  const { code } = await runOne(header, entries, { env, root, src });
+  assert.equal(code, 0);
+
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.kind, 'completed');
+  assert.equal(result.exit, 0);
+});
 
 // ---- adversarial / malformed input ----
 

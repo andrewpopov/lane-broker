@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor, sleep } from './helpers.js';
 import { tmpDir, makeFakeSshBin, makeRunner, clientEnv, makeGitWorktree, makeDispatchArgs } from './remote-harness.js';
 import { shellQuote, buildRemoteCommand, selectRunner, dispatchRemote, isGreen, needsProtocol2, classifyRemoteResult } from '../src/remote-client.js';
+import { MAX_HEADER_BYTES } from '../src/remote-stream.js';
 
 // ---- end-to-end dispatch: happy path ----
 
@@ -124,6 +125,43 @@ test('dispatchRemote: a tracked .env is ineligible, and nothing is spawned', asy
 
   assert.equal(result.outcome, 'ineligible');
   assert.match(result.reason, /denylisted secret path/);
+  assert.ok(elapsedMs < 5000, `should return immediately, took ${elapsedMs}ms`);
+});
+
+test('dispatchRemote: a manifest whose header would exceed MAX_HEADER_BYTES is ineligible before dialing ssh', async () => {
+  const { binDir, sshBin } = makeFakeSshBin();
+  const { env } = clientEnv(binDir);
+  const src = makeGitWorktree({ 'a.txt': 'hello' });
+  // A destination that would hang forever if anything were actually dialed --
+  // proves the precheck ran before spawn, not merely that dispatch failed fast.
+  const runner = makeRunner({ ssh: 'must-not-be-dialed', root: tmpDir('remote-exec-root') });
+
+  // Enough manifest entries, with long-enough paths, that the serialized
+  // header alone exceeds MAX_HEADER_BYTES -- no real files need to back
+  // these entries on disk, since the precheck runs before encodeSnapshot
+  // ever reads a file body.
+  const sha256 = crypto.createHash('sha256').update('x').digest('hex');
+  const entries = [];
+  for (let i = 0; i < 130_000; i += 1) {
+    entries.push({ path: `f${String(i).padStart(7, '0')}.txt`, type: 'file', exec: false, size: 1, sha256 });
+  }
+
+  const before = Date.now();
+  const result = await dispatchRemote({
+    ...makeDispatchArgs(),
+    runner,
+    worktreeRoot: src,
+    manifest: { entries },
+    sshBin,
+    env,
+    deadlines: { transferMs: 30_000 },
+  });
+  const elapsedMs = Date.now() - before;
+
+  assert.equal(result.outcome, 'ineligible');
+  assert.match(result.reason, /snapshot header is \d+ bytes, over the runner limit of \d+/);
+  const reportedBytes = Number(result.reason.match(/snapshot header is (\d+) bytes/)[1]);
+  assert.ok(reportedBytes > MAX_HEADER_BYTES, `expected the reported size to exceed MAX_HEADER_BYTES, got ${reportedBytes}`);
   assert.ok(elapsedMs < 5000, `should return immediately, took ${elapsedMs}ms`);
 });
 
