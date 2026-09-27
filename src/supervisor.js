@@ -16,7 +16,7 @@ import { enqueue, tryStart, dequeueSync } from './scheduler.js';
 import { readLease, writeLease, removeLease, isGroupAlive, processStartTime } from './lease.js';
 import { observedGroupCpuCores, observedGroupMemoryBytes } from './cpu.js';
 import { reloadGlobalConfig } from './config.js';
-import { detectResourceCapacity, checkResourceBudget } from './resources.js';
+import { detectResourceCapacity, checkResourceBudget, localSimRefusal } from './resources.js';
 import { selectRunner, dispatchRemote, needsProtocol2 } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { createAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
@@ -317,11 +317,14 @@ export function applyHeartbeatObservation(lease, observed, now = Date.now(), obs
   return update;
 }
 
-/** The exact "requested resources exceed this environment's budget" refusal run.js applies at
- *  preflight, re-applied here once a remote-eligible ticket has fallen back to local -- run.js
- *  skipped it specifically so a runner could still take an oversized request (BRAIN-319 T3b-1). */
-function localBudgetRefusalResult(ticket, budget) {
-  return { id: ticket.id, exit: budget.exitCode, signal: null, startedAt: null, endedAt: Date.now(), waitedMs: 0, error: budget.message.trim() };
+/** The exact "requested resources exceed this environment's budget" (checkResourceBudget) or
+ *  "this lane is refused for local runs by default" (localSimRefusal) result shape run.js
+ *  applies at preflight, re-applied here once a remote-eligible ticket has fallen back to
+ *  local -- run.js skipped both checks specifically so a runner could still take an oversized
+ *  or local-refused request (BRAIN-319 T3b-1, BRAIN-320). Shared by both refusal reasons since
+ *  they carry the same {exitCode, message} shape. */
+function localRefusalResult(ticket, refusal) {
+  return { id: ticket.id, exit: refusal.exitCode, signal: null, startedAt: null, endedAt: Date.now(), waitedMs: 0, error: refusal.message.trim() };
 }
 
 /**
@@ -421,11 +424,24 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     process.stderr.write(skipLine);
     writeBrokerLog(root, skipLine);
 
+    // BRAIN-320: a `localRefused` lane (rouge's `sim`) that was remote-
+    // eligible reaches here only once the remote attempt itself has fallen
+    // back to local -- run.js's own immediate refusal was skipped for
+    // exactly this lane/eligibility combination, so it must be re-applied
+    // now, before the resource-budget check below (mirroring run.js's own
+    // ordering: local-sim refusal, then budget).
+    if (enriched.localRefused && !enriched.allowLocalSim) {
+      const refusal = localSimRefusal(enriched.lane);
+      process.stderr.write(refusal.message);
+      await publishAndExit(fb.attempt.generation, () => localRefusalResult(enriched, refusal));
+      return { fallback: false };
+    }
+
     const host = detectResourceCapacity();
     const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host });
     if (!budget.ok) {
       process.stderr.write(budget.message);
-      await publishAndExit(fb.attempt.generation, () => localBudgetRefusalResult(enriched, budget));
+      await publishAndExit(fb.attempt.generation, () => localRefusalResult(enriched, budget));
       return { fallback: false };
     }
 

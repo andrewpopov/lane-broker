@@ -225,6 +225,10 @@ without `remote: true`, nothing changes.
 runners while leaving every other, ad-hoc lane name usable without being
 refused as undeclared.
 
+A `localRefused: true` lane (BRAIN-320) marked `remote` tries runners first;
+only a *fallback to local execution* is refused, unless `--allow-local-sim`
+is also passed.
+
 `ssh` is an ssh destination (an alias from `~/.ssh/config`, or
 `ssh://user@host:port`); it may not start with `-`. `shell` (default
 `bash -lc`) wraps every remote command so a non-interactive ssh finds

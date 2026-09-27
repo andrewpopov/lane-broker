@@ -7,7 +7,7 @@ import { ensureStateDirs, paths, readJsonSafe } from './state.js';
 import { resolveTicketConfig, reloadGlobalConfig, ConfigError } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
-import { detectResourceCapacity, leaseResources, resolveTicketResources, checkResourceBudget } from './resources.js';
+import { detectResourceCapacity, leaseResources, resolveTicketResources, checkResourceBudget, localSimRefusal } from './resources.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
 
 const supervisorPath = fileURLToPath(new URL('./supervisor.js', import.meta.url));
@@ -269,16 +269,16 @@ export async function runCommand({
     // env var) -- fall through to normal acquisition rather than trusting it.
   }
 
-  if (resolved.localRefused && !allowLocalSim) {
-    const dsn = process.env.ROUGE_FLEET_SUBMIT_DSN;
-    const submitHint = dsn
-      ? `submit to the fleet instead: ${dsn}`
-      : 'submit to the fleet instead (set ROUGE_FLEET_SUBMIT_DSN, or pass --allow-local-sim to run here)';
-    process.stderr.write(
-      `lane run: lane "${resolved.lane}" is refused for local runs by default (${submitHint}). ` +
-        `Pass --allow-local-sim to override.\n`,
-    );
-    return { exitCode: 69 };
+  // BRAIN-320 (local-refused + remote): a `localRefused` lane that is ALSO
+  // remote-eligible must try a remote runner first -- only a *fallback to
+  // local execution* is refused. The supervisor re-applies this exact check
+  // (via `ticket.localRefused`/`ticket.allowLocalSim` below) once/if a
+  // remote attempt actually falls back, mirroring how the resource-budget
+  // refusal below is skipped here and re-applied on that same fallback path.
+  if (resolved.localRefused && !allowLocalSim && !remoteEligible) {
+    const refusal = localSimRefusal(resolved.lane);
+    process.stderr.write(refusal.message);
+    return { exitCode: refusal.exitCode };
   }
 
   // Shadow mode is observational. In active mode, reject a request that can
@@ -321,6 +321,12 @@ export async function runCommand({
     nice,
     maxConcurrent: resolved.maxConcurrent,
     conflicts: resolved.conflicts,
+    // BRAIN-320: carried so the supervisor's remote-fallback path
+    // (`fallbackOrRefuse` in supervisor.js) can re-apply the local-sim
+    // refusal if/when a remote-eligible localRefused lane falls back to
+    // running locally -- see the immediate-refusal comment above.
+    localRefused: resolved.localRefused,
+    allowLocalSim: Boolean(allowLocalSim),
     cwd,
     cmd,
     createdAt: Date.now(),

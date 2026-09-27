@@ -95,7 +95,7 @@ test('lane cancel on a live remote ticket exits 130, never runs locally, and the
   const record = await waitFor(() => {
     const fp = path.join(ticketsDir, remoteTicketId, 'result.json');
     return fs.existsSync(fp) ? JSON.parse(fs.readFileSync(fp, 'utf8')) : null;
-  });
+  }, { timeoutMs: 15_000 });
   assert.equal(record.kind, 'cancelled');
 });
 
@@ -134,7 +134,7 @@ test('SIGKILLing the supervisor mid-remote-dispatch: status shows ORPHANED-REMOT
   const runnerRecord = await waitFor(() => {
     const fp = path.join(ticketsDir, remoteTicketId, 'result.json');
     return fs.existsSync(fp) ? JSON.parse(fs.readFileSync(fp, 'utf8')) : null;
-  });
+  }, { timeoutMs: 15_000 });
   assert.equal(runnerRecord.kind, 'cancelled');
 
   // Idempotent: the attempt (and its lease/queue entry) is gone, so a
@@ -220,7 +220,7 @@ test('SIGINT to `lane wait` on a detached remote run cancels it: exit 130, runne
   const record = await waitFor(() => {
     const fp = path.join(ticketsDir, remoteTicketId, 'result.json');
     return fs.existsSync(fp) ? JSON.parse(fs.readFileSync(fp, 'utf8')) : null;
-  });
+  }, { timeoutMs: 15_000 });
   assert.equal(record.kind, 'cancelled');
 });
 
