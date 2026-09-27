@@ -458,6 +458,13 @@ symlinks.
   inside the exact gap between wait's own unlocked reads of result.json and
   the attempt's liveness, the race BRAIN-319 fixed (a completed run
   observed mid-publish must never be reported as ORPHANED-REMOTE).
+- `LANE_BROKER_TEST_PAUSE_AFTER_QUEUE_TIMEOUT` — if set, a queued supervisor
+  pauses right after `tryStart` returns `reason: 'queue-timeout'`, before its
+  own recheck of the durable cancel marker, until the named file appears --
+  so a test can deterministically land a `lane cancel` write inside the
+  window between an expiry being recorded and the expiry being finalized
+  (BRAIN-320 review fix B: a cancel that lands in that window must still win
+  over the expiry).
 
 ## Verify locally
 

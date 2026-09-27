@@ -127,11 +127,16 @@ function neverFits(reservation, capacity) {
  * probe that hangs past it is SIGKILLed and counted as a skip, never as a
  * hang for the whole selection.
  *
- * `opts.needsProtocol2` (BRAIN-320 S1a/1d): true when the ticket's lane
- * declares `remoteDeps`/`remoteSetup` and therefore needs protocol 2 -- a
- * runner whose probe does not offer `2` in `protocols` is skipped. An
- * optionless lane (the default) leaves this false and accepts a protocol-1
- * runner exactly as before (I6).
+ * `opts.requireProtocol2` (BRAIN-320 S1a/1d; renamed by the BRAIN-320
+ * review-fix-D pass, was `needsProtocol2`): true when the ticket's lane
+ * declares `remoteDeps`/`remoteSetup` (it needs protocol 2 to run at all)
+ * OR the client has `remoteQueueTimeoutMs` configured (only a 0.7.0+,
+ * protocol-2-capable runner honours a queue timeout -- an older runner
+ * silently ignores it) -- either way, a runner whose probe does not offer
+ * `2` in `protocols` is skipped. This governs RUNNER SELECTION only: the
+ * exec header's own protocol is still derived from `needsProtocol2(remote)`
+ * alone (see `dispatchRemote`), so an optionless lane still sends a
+ * protocol-1 header even when `remoteQueueTimeoutMs` made this true.
  *
  * `opts.reservation` (BRAIN-320 S1e): the ticket's resolved
  * `{weight, cpuCores, memoryBytes}`, checked against each probe's static
@@ -140,7 +145,7 @@ function neverFits(reservation, capacity) {
 export async function selectRunner(runners, opts = {}) {
   const deadlineMs = opts.deadlineMs ?? 6000;
   const sshBin = opts.sshBin ?? 'ssh';
-  const { env, needsProtocol2 = false, reservation } = opts;
+  const { env, requireProtocol2 = false, reservation } = opts;
   const skipped = [];
   for (const runner of runners) {
     const cmd = buildRemoteCommand(runner, 'remote-probe');
@@ -164,8 +169,8 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason: `unsupported protocol: ${probe.protocol}` });
       continue;
     }
-    if (needsProtocol2 && !(Array.isArray(probe.protocols) && probe.protocols.includes(2))) {
-      skipped.push({ name: runner.name, reason: 'runner does not support protocol 2 (remoteDeps/remoteSetup)' });
+    if (requireProtocol2 && !(Array.isArray(probe.protocols) && probe.protocols.includes(2))) {
+      skipped.push({ name: runner.name, reason: 'runner does not support protocol 2 (remoteDeps/remoteSetup/remoteQueueTimeoutMs)' });
       continue;
     }
     if (probe.paused) {

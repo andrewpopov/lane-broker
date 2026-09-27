@@ -477,11 +477,11 @@ test('selectRunner: a runner lacking protocol 2 is skipped for a remoteDeps lane
   const { env } = clientEnv(binDir);
   const runners = [makeRunner({ ssh: 'normal' })];
 
-  const needsV2 = await selectRunner(runners, { sshBin, env, deadlineMs: 3000, needsProtocol2: true });
+  const needsV2 = await selectRunner(runners, { sshBin, env, deadlineMs: 3000, requireProtocol2: true });
   assert.equal(needsV2.runner, null);
   assert.match(needsV2.skipped[0].reason, /protocol 2/);
 
-  const optionless = await selectRunner(runners, { sshBin, env, deadlineMs: 3000, needsProtocol2: false });
+  const optionless = await selectRunner(runners, { sshBin, env, deadlineMs: 3000, requireProtocol2: false });
   assert.equal(optionless.runner.name, runners[0].name);
 });
 
@@ -498,7 +498,7 @@ test('selectRunner: a runner offering protocol 2 is used for a remoteDeps lane',
   const { env } = clientEnv(binDir);
   const runners = [makeRunner({ ssh: 'normal' })];
 
-  const { runner, skipped } = await selectRunner(runners, { sshBin, env, deadlineMs: 3000, needsProtocol2: true });
+  const { runner, skipped } = await selectRunner(runners, { sshBin, env, deadlineMs: 3000, requireProtocol2: true });
   assert.equal(runner.name, runners[0].name);
   assert.equal(skipped.length, 0);
 });

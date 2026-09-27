@@ -214,6 +214,12 @@ function cleanupWork(workDir) {
  * nonzero) -- see the module-level comment on kind derivation below.
  */
 export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = process.stdin } = {}) {
+  // BRAIN-320 review fix A: resolve once, up front -- every path derived
+  // below (ticketDir, workDir, and the protocol-2 pipeline argv) is passed
+  // to a child that runs with a DIFFERENT cwd (the extracted work dir, see
+  // `cwd:` in the runCommand call below), so a relative `root` must never
+  // reach any of those derivations un-resolved.
+  root = path.resolve(root);
   // BRAIN-319 I4: this process is invoked by ssh as a fresh node process
   // after any login-shell startup already ran, so scrubbing here — rather
   // than relying on `env -u` upstream — satisfies "after shell startup":
@@ -224,6 +230,17 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   delete process.env.LANE_BROKER_KEY;
   delete process.env.LANE_BROKER_TICKET;
   process.env.LANE_BROKER_LOCAL = '1';
+
+  // BRAIN-320 review fix C: also scrub git's own repo-local env vars
+  // (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, ..., plus GIT_QUARANTINE_PATH)
+  // out of this process's env, same list `scrubbedGitEnv` derives for
+  // `buildManifest` -- otherwise every deps/setup/command child this runner
+  // spawns (not just the synthetic `git init` above) inherits whatever repo
+  // the runner's own shell happened to be sitting in.
+  const scrubbed = scrubbedGitEnv();
+  for (const name of Object.keys(process.env)) {
+    if (!(name in scrubbed)) delete process.env[name];
+  }
 
   const reader = makeReader(stdin);
   const headerResult = await readHeaderLine(reader, 1_000_000);
@@ -486,6 +503,7 @@ export async function remoteResultCommand(ticketId, { root = defaultRemoteRoot()
     process.stderr.write('lane remote-result: missing or invalid ticketId\n');
     return { exitCode: 2 };
   }
+  root = path.resolve(root);
   const resultPath = path.join(root, 'tickets', ticketId, 'result.json');
   const data = readJsonSafe(resultPath);
   process.stdout.write(`${JSON.stringify(data || { protocol: 1, missing: true })}\n`);
@@ -504,6 +522,7 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
     process.stderr.write('lane remote-cancel: missing or invalid ticketId\n');
     return { exitCode: 2 };
   }
+  root = path.resolve(root);
   const ticketDir = path.join(root, 'tickets', ticketId);
   if (!fs.existsSync(ticketDir)) {
     process.stdout.write(`${JSON.stringify({ protocol: 1, ticketId, action: 'no-such-ticket' })}\n`);

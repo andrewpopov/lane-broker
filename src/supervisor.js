@@ -459,8 +459,14 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     }
   }
 
+  // BRAIN-320 review fix D: runner SELECTION requires protocol 2 whenever
+  // the lane itself needs it OR the client has a queue timeout configured
+  // (only a 0.7.0+ runner honours `queueTimeoutMs`) -- but the exec header's
+  // own protocol (inside dispatchRemote) still derives from
+  // `needsProtocol2(enriched.remote)` alone, so an optionless lane still
+  // sends a protocol-1 header even when this is true.
   const { runner, skipped } = await selectRunner(globalCfg.runners || [], {
-    needsProtocol2: needsProtocol2(enriched.remote),
+    requireProtocol2: needsProtocol2(enriched.remote) || Boolean(globalCfg.remoteQueueTimeoutMs),
     reservation: {
       weight: enriched.weight,
       cpuCores: enriched.resources.cpuCores,
@@ -620,7 +626,7 @@ async function main() {
    * would never see it and would fall through to a bare, reasonless
    * 'unfinished'.
    */
-  async function finalizeQueuedAndExit(outcome = 'cancelled') {
+  async function finalizeQueuedAndExit(outcome = 'cancelled', { forcePublish = false } = {}) {
     const isTimeout = outcome === 'queue-timeout';
     const buildResult = () =>
       isTimeout
@@ -649,7 +655,16 @@ async function main() {
     };
     if (attemptGeneration !== null) {
       await publishTerminal(root, ticket.id, attemptGeneration, () => publish(buildResult()));
-    } else if (isTimeout) {
+    } else if (isTimeout || forcePublish) {
+      // BRAIN-320 review fix B: `forcePublish` is only ever set by the
+      // queue-timeout-then-cancel recheck above -- a ticket the queue-
+      // timeout branch was ABOUT to publish (unconditionally, since it's
+      // never a remote-attempt fallback) still needs a structured result
+      // once the outcome flips to 'cancelled', or nothing at all would be
+      // recorded here (a plain queued-cancel elsewhere in this function
+      // relies on remote-exec's own ticket-local marker instead, but this
+      // recheck is reached via a BROKER-level `lane cancel` that never
+      // touches that marker).
       publish(buildResult());
     }
     clearTicketMarkers(root, ticket.id);
@@ -702,13 +717,30 @@ async function main() {
       await finalizeQueuedAndExit('cancelled');
     }
     if (started.reason === 'queue-timeout') {
+      // Test-only seam: `LANE_BROKER_TEST_PAUSE_AFTER_QUEUE_TIMEOUT` widens
+      // the gap between tryStart recording the expiry and the cancel
+      // recheck below, so a test can deterministically land a `lane cancel`
+      // marker write into that exact window (see README's "Testing hooks").
+      const pauseFile = process.env.LANE_BROKER_TEST_PAUSE_AFTER_QUEUE_TIMEOUT;
+      if (pauseFile) {
+        while (!fs.existsSync(pauseFile)) {
+          await sleep(10);
+        }
+      }
+      // BRAIN-320 review fix B: a runner-side `lane cancel` can land between
+      // tryStart recording the expiry and this branch running. Re-check the
+      // durable cancel marker here -- if a cancel was ALSO requested, it
+      // wins: publish 'cancelled', never let the expiry silently overwrite
+      // an explicit cancel that arrived after it.
+      const cancelWon = cancelRequested(root, ticket.id);
+      const outcome = cancelWon ? 'cancelled' : 'queue-timeout';
       // BRAIN-320 S1d: tryStart already wrote the durable expiry marker
       // (distinct from a cancel marker) under its own lock before returning
       // this reason -- dequeue and publish the queue-timeout result the same
       // way a queued cancel is finalized, so `remote-exec`'s own kind
       // derivation (reading this ticket's result.json) sees it.
       dequeueSync(root, ticket.id);
-      await finalizeQueuedAndExit('queue-timeout');
+      await finalizeQueuedAndExit(outcome, { forcePublish: cancelWon });
     }
     await sleep(globalCfg.sampleMs);
   }

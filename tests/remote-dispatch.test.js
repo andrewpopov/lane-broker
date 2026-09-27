@@ -561,6 +561,21 @@ test('queue timeout: with no remoteQueueTimeoutMs configured, a busy runner brok
   assert.equal(result.executor, 'remote');
 });
 
+test('BRAIN-320 review fix D: with remoteQueueTimeoutMs configured, an optionless lane skips an old-style (protocol-2-less) runner and falls back local', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'old-runner', remoteQueueTimeoutMs: 300 });
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+  );
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'local', 'an old runner cannot honour remoteQueueTimeoutMs, so selection must skip it');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'local');
+  assert.match(result.fallbackReason, /does not support protocol 2/);
+});
+
 test('mixed versions: a v1 (optionless) lane still dispatches remotely against the same old-style probe', async () => {
   const { env, state, repoDir } = setup({ ssh: 'old-runner' });
   const marker = path.join(tmpDir('marker'), 'where');
