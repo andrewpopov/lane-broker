@@ -1,15 +1,79 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
-import { manifestHashOf, sortEntries, verifyManifestNoGit } from './remote-manifest.js';
+import { manifestHashOf, sortEntries, verifyManifestNoGit, isCanonicalRelPath } from './remote-manifest.js';
 
 const NEWLINE = 0x0a;
+
+/**
+ * Reject a `relPath` whose ancestor directories are no longer plain
+ * directories by the time we're about to open it -- lstat each ancestor
+ * component under `worktreeRoot` rather than trusting the manifest's earlier
+ * snapshot of the tree shape. Paired with `O_NOFOLLOW` on the leaf open
+ * itself (below), this closes the TOCTOU where a manifest entry's own
+ * ancestor is swapped for a symlink between `buildManifest` and encode time.
+ */
+function assertAncestorsUnchanged(worktreeRoot, relPath) {
+  const segs = relPath.split('/');
+  let acc = worktreeRoot;
+  for (let i = 0; i < segs.length - 1; i += 1) {
+    acc = path.join(acc, segs[i]);
+    let st;
+    try {
+      st = fs.lstatSync(acc);
+    } catch (err) {
+      throw new Error(`ancestor missing since manifest was built: ${relPath}: ${err.message}`);
+    }
+    if (!st.isDirectory()) {
+      throw new Error(`ancestor is no longer a directory since manifest was built: ${relPath}`);
+    }
+  }
+}
+
+/**
+ * Read one manifest-listed file's bytes at encode time, re-verifying it
+ * against the manifest entry it claims to be BEFORE the bytes are ever
+ * yielded onto the wire (BRAIN-319 review finding #2): open with
+ * `O_NOFOLLOW` (refusing a leaf swapped for a symlink), require the open fd
+ * to fstat as a regular file, then check both `size` and `sha256` against
+ * the entry -- a same-length content swap passed only a length check before.
+ * Any mismatch throws, which the generator surfaces as a stream 'error'
+ * (never a partial/wrong body reaching ssh).
+ */
+function readVerifiedFile(worktreeRoot, entry) {
+  assertAncestorsUnchanged(worktreeRoot, entry.path);
+  const absPath = path.join(worktreeRoot, entry.path);
+  let fd;
+  try {
+    fd = fs.openSync(absPath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  } catch (err) {
+    throw new Error(`open failed for encode: ${entry.path}: ${err.message}`);
+  }
+  let buf;
+  try {
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) throw new Error(`not a regular file: ${entry.path}`);
+    buf = fs.readFileSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  if (buf.length !== entry.size) {
+    throw new Error(`file changed size on disk since manifest was built: ${entry.path}`);
+  }
+  const sha256 = crypto.createHash('sha256').update(buf).digest('hex');
+  if (sha256 !== entry.sha256) {
+    throw new Error(`file changed content on disk since manifest was built: ${entry.path}`);
+  }
+  return buf;
+}
 
 /**
  * Encode a worktree snapshot as a framed byte stream: one header line, then
  * per entry a frame-header line followed by exactly `size` raw bytes for a
  * file (no body for a symlink), then a `{end:true}` terminator line. Reads
- * file bytes off disk at encode time, in path-sorted order.
+ * file bytes off disk at encode time (re-verified against the manifest via
+ * `readVerifiedFile`), in path-sorted order.
  */
 export function encodeSnapshot(worktreeRoot, header, entries) {
   const manifestHash = manifestHashOf(entries);
@@ -20,11 +84,7 @@ export function encodeSnapshot(worktreeRoot, header, entries) {
     for (const entry of ordered) {
       if (entry.type === 'file') {
         yield Buffer.from(`${JSON.stringify({ path: entry.path, type: 'file', exec: !!entry.exec, size: entry.size })}\n`, 'utf8');
-        const buf = fs.readFileSync(path.join(worktreeRoot, entry.path));
-        if (buf.length !== entry.size) {
-          throw new Error(`file changed size on disk since manifest was built: ${entry.path}`);
-        }
-        yield buf;
+        yield readVerifiedFile(worktreeRoot, entry);
       } else {
         yield Buffer.from(`${JSON.stringify({ path: entry.path, type: 'symlink', target: entry.target })}\n`, 'utf8');
       }
@@ -87,8 +147,8 @@ function validateFrame(frame, expectedByPath, seen, symlinkPaths, maxFileBytes, 
   if (!frame || typeof frame.path !== 'string') return { ok: false, reason: 'malformed frame' };
   const p = frame.path;
   if (path.isAbsolute(p)) return { ok: false, reason: `absolute path: ${p}` };
+  if (!isCanonicalRelPath(p)) return { ok: false, reason: `invalid path: ${p}` };
   const segs = p.split('/');
-  if (segs.some((s) => s === '..' || s === '')) return { ok: false, reason: `invalid path: ${p}` };
 
   const entry = expectedByPath.get(p);
   if (!entry) return { ok: false, reason: `unlisted path: ${p}` };

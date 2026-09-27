@@ -206,6 +206,38 @@ test('dispatchRemote: abort during a sleeping remote child resolves cancelled, a
   assert.equal(final.kind, 'cancelled');
 });
 
+// ---- BRAIN-319 review finding #3: an encode error must not hang dispatch ----
+
+test('dispatchRemote: a file changed between manifest and encode resolves unconfirmed within a bound (never hangs)', async () => {
+  const { binDir, sshBin } = makeFakeSshBin();
+  const { env } = clientEnv(binDir);
+  const src = makeGitWorktree({ 'a.txt': 'aaaa' });
+  const runner = makeRunner({ ssh: 'normal', root: tmpDir('remote-exec-root') });
+
+  const dispatchPromise = dispatchRemote({
+    ...makeDispatchArgs(),
+    runner,
+    worktreeRoot: src,
+    sshBin,
+    env,
+    deadlines: { transferMs: 5000, resultMs: 2000, resultAttempts: 1 },
+  });
+  // dispatchRemote runs synchronously (buildManifest included) up to its first await, so by
+  // the time this statement runs the manifest has already been built from the ORIGINAL
+  // content; the encode generator hasn't read the file yet (it only does so once the stream
+  // is actually pumped, on a later tick). Mutating here reproduces "changed between manifest
+  // and encode" deterministically, without a fragile timing race.
+  fs.writeFileSync(path.join(src, 'a.txt'), 'bbbb');
+
+  const result = await Promise.race([
+    dispatchPromise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('dispatchRemote hung past 15s bound')), 15_000)),
+  ]);
+
+  assert.equal(result.outcome, 'unconfirmed');
+  assert.match(result.reason, /changed content|snapshot stream error/);
+});
+
 // ---- selectRunner ----
 
 test('selectRunner: sequential order, skips an unreachable runner and picks the next usable one', async () => {

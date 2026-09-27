@@ -203,8 +203,32 @@ function pipeSnapshot(child, stream, deadlineMs, abortSignal) {
       finish({ ok: false, reason: 'aborted' });
     };
     if (abortSignal) abortSignal.addEventListener('abort', onAbort, { once: true });
-    child.stdin.on('error', () => finish({ ok: false, reason: 'ssh stdin error' }));
-    stream.on('error', () => finish({ ok: false, reason: 'snapshot stream error' }));
+    child.stdin.on('error', () => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // already gone
+      }
+      finish({ ok: false, reason: 'ssh stdin error' });
+    });
+    // An encode/stream error (BRAIN-319 review finding #3) must not leave ssh's stdin open:
+    // ssh has no way to know the transfer is over, so it would otherwise wait on stdin EOF
+    // forever while the runner waits for bytes that are never coming. Destroy stdin and kill
+    // ssh here so `waitClosed` resolves promptly and dispatchRemote can go straight to
+    // unconfirmed with this reason, instead of hanging on an ssh session nothing will ever end.
+    stream.on('error', (err) => {
+      try {
+        child.stdin.destroy();
+      } catch {
+        // already gone
+      }
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // already gone
+      }
+      finish({ ok: false, reason: `snapshot stream error: ${err.message}` });
+    });
     child.stdin.on('finish', () => finish({ ok: true }));
     child.on('close', () => finish({ ok: false, reason: 'ssh closed before transfer finished' }));
     stream.pipe(child.stdin);
@@ -320,10 +344,14 @@ export async function dispatchRemote(opts) {
   if (onStdout) child.stdout.on('data', onStdout);
   if (onStderr) child.stderr.on('data', onStderr);
 
-  // Bounds only the write phase; ignored deliberately below (BRAIN-319:
-  // "IGNORE ssh's exit code") -- the authoritative outcome only ever comes
-  // from the fetched result record.
-  await pipeSnapshot(child, snapshotStream, transferDeadlineMs, abortSignal);
+  // ssh's own EXIT CODE is ignored deliberately below (BRAIN-319: "IGNORE
+  // ssh's exit code") -- the authoritative outcome only ever comes from the
+  // fetched result record. pipeResult itself is still consulted: an encode
+  // failure (finding #3) means no complete manifest-bound stream was ever
+  // sent, so the runner cannot plausibly hold a matching result yet -- go
+  // straight to unconfirmed instead of burning up to resultAttempts *
+  // resultDeadlineMs retrying a fetch that was never going to bind.
+  const pipeResult = await pipeSnapshot(child, snapshotStream, transferDeadlineMs, abortSignal);
   // The ssh session IS the remote job; wait for it to close (unbounded here
   // -- an outer --timeout is the caller's concern), killable by abort.
   await waitClosed(child, abortSignal);
@@ -331,6 +359,10 @@ export async function dispatchRemote(opts) {
   if (abortSignal && abortSignal.aborted) {
     await remoteCancelBestEffort(runner, ticketId, sshBin, cancelDeadlineMs, env);
     return { outcome: 'cancelled' };
+  }
+
+  if (!pipeResult.ok) {
+    return { outcome: 'unconfirmed', reason: pipeResult.reason };
   }
 
   const expected = { ticketId, generation, manifestHash: manifest.manifestHash };

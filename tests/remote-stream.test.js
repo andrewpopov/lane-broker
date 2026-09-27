@@ -298,6 +298,112 @@ test('adversarial: one corrupted byte in a file body passes framing but fails th
   await assertNothingOutsideDest(base, dest);
 });
 
+// ---- BRAIN-319 review finding #1: non-canonical path components ----
+
+test('adversarial: a symlink registered with non-canonical "." segments cannot defeat the ancestor check', async () => {
+  // The symlink entry's own manifest path is `a/././link`, physically `a/link`. Without
+  // canonicalization, a sibling file `a/link/escaped`'s ancestor prefix `a/link` never matches
+  // the literal string `a/././link` in the symlink-path set, so the ancestor-is-symlink guard
+  // never fires and the file frame would be accepted (and then walked through the symlink).
+  const entries = [
+    { path: 'a/././link', type: 'symlink', target: '../../..' },
+    { path: 'a/link/escaped', type: 'file', exec: false, size: 2, sha256: 'x' },
+  ];
+  const manifest = { entries, manifestHash: manifestHashOf(entries) };
+  const { base, dest } = freshDest('remote-stream-adv-noncanonical-symlink');
+  const body = Buffer.from('xx');
+  const streamReadable = streamOf([
+    line({ protocol: 1, manifest: { entries: manifest.entries, manifestHash: manifest.manifestHash } }),
+    line({ path: 'a/././link', type: 'symlink', target: '../../..' }),
+    line({ path: 'a/link/escaped', type: 'file', exec: false, size: body.length }),
+    body,
+    line({ end: true }),
+  ]);
+  // `a/link -> ../../..` resolves ABOVE `base`, so assertNothingOutsideDest(base, ...) cannot
+  // see an escape there: check the exact escape target, and always remove it so a canary run
+  // that disables the guard cannot leave a stray file that poisons other tests.
+  const escapeTarget = path.resolve(dest, 'a', '../../..', 'escaped');
+  try {
+    const result = await extractSnapshot(streamReadable, dest, manifest, {});
+    assert.equal(result.ok, false);
+    assert.match(result.reason, /invalid path/);
+    assert.equal(fs.existsSync(escapeTarget), false, `extraction escaped to ${escapeTarget}`);
+    await assertNothingOutsideDest(base, dest);
+  } finally {
+    fs.rmSync(escapeTarget, { force: true });
+  }
+});
+
+for (const badPath of ['a/./b', './a', 'a/', 'a\\b']) {
+  test(`adversarial: a frame path with a non-canonical component (${JSON.stringify(badPath)}) is rejected`, async () => {
+    const { manifest } = smallManifest();
+    const { base, dest } = freshDest('remote-stream-adv-noncanonical');
+    const streamReadable = streamOf([
+      line({ protocol: 1, manifest: { entries: manifest.entries, manifestHash: manifest.manifestHash } }),
+      line({ path: badPath, type: 'file', exec: false, size: 0 }),
+      line({ end: true }),
+    ]);
+    const result = await extractSnapshot(streamReadable, dest, manifest, {});
+    assert.equal(result.ok, false);
+    assert.match(result.reason, /invalid path|unlisted path/);
+    await assertNothingOutsideDest(base, dest);
+  });
+}
+
+// ---- BRAIN-319 review finding #2: encode-time re-verification ----
+
+test('adversarial: a manifest file swapped for a same-length symlink after buildManifest fails the encode, never emitting the outside bytes', async () => {
+  const src = tmpRepo();
+  fs.writeFileSync(path.join(src, 'a.txt'), 'aaaa');
+  gitFixture(['add', 'a.txt'], src);
+  gitFixture(['commit', '-q', '-m', 'init'], src);
+  const manifest = buildManifest(src);
+
+  const outsideBase = tmpDir('remote-stream-outside');
+  const outsideFile = path.join(outsideBase, 'secret.txt');
+  fs.writeFileSync(outsideFile, 'aaaa'); // same length as the original a.txt
+
+  // Swap a.txt for a same-length symlink to the outside file -- only the hash check (not
+  // the length check) can catch this.
+  fs.rmSync(path.join(src, 'a.txt'));
+  fs.symlinkSync(outsideFile, path.join(src, 'a.txt'));
+
+  const readable = encodeSnapshot(src, {}, manifest.entries);
+  const chunks = [];
+  let caught = null;
+  try {
+    for await (const chunk of readable) chunks.push(chunk);
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught, 'encode should throw rather than emit the swapped file');
+  const emitted = Buffer.concat(chunks).toString('utf8');
+  assert.ok(!emitted.includes('aaaa'), 'the outside file\'s bytes must never appear in the emitted stream');
+});
+
+test('adversarial: a manifest file whose content changes (same size) after buildManifest fails the encode before emitting its body', async () => {
+  const src = tmpRepo();
+  fs.writeFileSync(path.join(src, 'a.txt'), 'aaaa');
+  gitFixture(['add', 'a.txt'], src);
+  gitFixture(['commit', '-q', '-m', 'init'], src);
+  const manifest = buildManifest(src);
+
+  fs.writeFileSync(path.join(src, 'a.txt'), 'bbbb'); // same length, different bytes/hash
+
+  const readable = encodeSnapshot(src, {}, manifest.entries);
+  const chunks = [];
+  let caught = null;
+  try {
+    for await (const chunk of readable) chunks.push(chunk);
+  } catch (err) {
+    caught = err;
+  }
+  assert.ok(caught, 'encode should throw on a hash mismatch');
+  assert.match(caught.message, /changed content/);
+  const emitted = Buffer.concat(chunks).toString('utf8');
+  assert.ok(!emitted.includes('bbbb'), 'the mismatched body must never be emitted');
+});
+
 test('adversarial: an early terminator (missing manifest entry) is rejected', async () => {
   const entries = [
     { path: 'a.txt', type: 'file', exec: false, size: 4, sha256: 'x' },

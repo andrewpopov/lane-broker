@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { gitFixture } from './helpers.js';
-import { buildManifest, verifyManifestNoGit, RemoteIneligibleError, manifestHashOf } from '../src/remote-manifest.js';
+import { buildManifest, verifyManifestNoGit, RemoteIneligibleError, manifestHashOf, isCanonicalRelPath } from '../src/remote-manifest.js';
 
 function tmpRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-manifest-test-'));
@@ -59,6 +59,31 @@ test('.env.example is allowed', () => {
   const manifest = buildManifest(dir);
   assert.ok(entryFor(manifest, '.env.example'));
 });
+
+// ---- BRAIN-319 review finding #4: template-suffixed .env variants ----
+
+for (const name of ['.env.worker.example', '.env.sample', '.env.dist']) {
+  test(`${name} (a template, not a secret) is allowed`, () => {
+    const dir = tmpRepo();
+    fs.writeFileSync(path.join(dir, name), 'SECRET=changeme');
+    gitFixture(['add', '-f', name], dir);
+    gitFixture(['commit', '-q', '-m', 'init'], dir);
+
+    const manifest = buildManifest(dir);
+    assert.ok(entryFor(manifest, name), `${name} should be included`);
+  });
+}
+
+for (const name of ['.env', '.env.local', '.env.production']) {
+  test(`${name} stays denylisted`, () => {
+    const dir = tmpRepo();
+    fs.writeFileSync(path.join(dir, name), 'SECRET=1');
+    gitFixture(['add', '-f', name], dir);
+    gitFixture(['commit', '-q', '-m', 'init'], dir);
+
+    assert.throws(() => buildManifest(dir), RemoteIneligibleError, name);
+  });
+}
 
 test('a *.pem file and an id_rsa-shaped file are ineligible', () => {
   for (const name of ['server.pem', 'id_rsa']) {
@@ -162,6 +187,21 @@ test('a gitlink/submodule entry is ineligible', () => {
   fs.writeFileSync(path.join(dir, 'subrepo', 'x.txt'), 'x');
 
   assert.throws(() => buildManifest(dir), RemoteIneligibleError);
+});
+
+// ---- BRAIN-319 review finding #1: canonical path predicate ----
+
+test('isCanonicalRelPath accepts plain relative paths and rejects non-canonical components', () => {
+  assert.equal(isCanonicalRelPath('a/b'), true);
+  assert.equal(isCanonicalRelPath('a'), true);
+  assert.equal(isCanonicalRelPath('a/./b'), false);
+  assert.equal(isCanonicalRelPath('./a'), false);
+  assert.equal(isCanonicalRelPath('a/'), false);
+  assert.equal(isCanonicalRelPath('a\\b'), false);
+  assert.equal(isCanonicalRelPath('a/../b'), false);
+  assert.equal(isCanonicalRelPath('/a'), false);
+  assert.equal(isCanonicalRelPath(''), false);
+  assert.equal(isCanonicalRelPath('a//b'), false);
 });
 
 test('manifestHashOf is stable regardless of input entry order', () => {

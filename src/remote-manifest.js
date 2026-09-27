@@ -65,21 +65,49 @@ export function manifestHashOf(entries) {
   return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
 }
 
+/** Basenames whose trailing suffix marks a secret-shaped path as a template, not a real secret. */
+const ENV_TEMPLATE_SUFFIXES = ['.example', '.sample', '.template', '.dist'];
+
 function isDenylistedPath(relPath) {
   const base = path.posix.basename(relPath);
-  if (base === '.env.example') return false;
-  if (base === '.env' || base.startsWith('.env.')) return true;
+  if (base === '.env' || base.startsWith('.env.')) {
+    return !ENV_TEMPLATE_SUFFIXES.some((suffix) => base.endsWith(suffix));
+  }
   if (base.endsWith('.pem')) return true;
   if (base.startsWith('id_')) return true;
   return false;
+}
+
+/**
+ * True iff `p` is a canonical relative path: a plain string, POSIX-separated,
+ * no absolute/leading/trailing slash, no backslash or NUL byte, and no ''/'.'/'..'
+ * segment. This is the ONE predicate every manifest entry path and every
+ * extracted frame path must satisfy -- both the local builder (`buildManifest`,
+ * `verifyManifestNoGit`) and the wire-side extractor (`remote-stream.js`'s
+ * `validateFrame`) call it before anything is created on disk. A non-canonical
+ * path (e.g. `a/./b`) that still passes a bare `'..'`-only check can make a
+ * symlink-ancestor lookup miss its own entry: the ancestor check compares a
+ * frame's literal path segments against the manifest's literal symlink paths,
+ * so a symlink registered as `a/././link` never matches the ancestor prefix
+ * `a/link` computed for a sibling frame `a/link/escaped` (BRAIN-319 review).
+ */
+export function isCanonicalRelPath(p) {
+  if (typeof p !== 'string' || p.length === 0) return false;
+  if (p.includes('\\') || p.includes('\0')) return false;
+  if (p.startsWith('/') || p.endsWith('/')) return false;
+  if (path.posix.isAbsolute(p)) return false;
+  for (const seg of p.split('/')) {
+    if (seg === '' || seg === '.' || seg === '..') return false;
+  }
+  return true;
 }
 
 function validatePathShape(relPath) {
   if (path.posix.isAbsolute(relPath) || relPath.startsWith('/')) {
     throw new RemoteIneligibleError('absolute path', relPath);
   }
-  for (const seg of relPath.split('/')) {
-    if (seg === '..' || seg === '') throw new RemoteIneligibleError('invalid path segment', relPath);
+  if (!isCanonicalRelPath(relPath)) {
+    throw new RemoteIneligibleError('invalid path segment', relPath);
   }
 }
 
