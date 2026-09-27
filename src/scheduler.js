@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths, atomicWriteJson, readJsonSafe, withLock, bootId } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled } from './state.js';
 import { sampleAndUpdateGate } from './load.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
 import { evaluateNewAdmission, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock } from './admission.js';
@@ -611,6 +611,24 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       if (!recordCapacitySkip(root, headTicket.id)) {
         return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
       }
+    }
+    // BRAIN-319: re-check the cancel marker here, INSIDE the same lock as the
+    // dequeue-and-lease-write below, right before this ticket is actually
+    // admitted to run -- this is the last point before the caller (see
+    // supervisor.js) spawns the child with no further await in between. A
+    // marker written between the outer, unlocked cancelRequested() check in
+    // supervisor.js's poll loop and this lock being granted would otherwise
+    // never be re-observed until after the child had already started;
+    // checking it again here makes "the marker exists" and "the ticket gets
+    // admitted" atomic. Deliberately does not dequeue: leaving the ticket in
+    // the queue lets the very next poll's own cancelRequested() check (which
+    // already dequeues and finalizes through publishTerminal) do that, so
+    // there is exactly one dequeue-and-finalize code path rather than two.
+    if (isCancelled(root, ticket.id)) {
+      return {
+        result: { started: false, reason: 'cancelled' },
+        logFields: { ...logBase, currentDecision: 'deny', currentReason: 'cancelled' },
+      };
     }
     dequeueSync(root, ticket.id);
     const lease = {

@@ -213,7 +213,14 @@ test('an unsupported protocol version is rejected before any child runs', async 
 
 test('an invalid ticketId (path traversal) is refused with nothing written on disk outside root', async () => {
   const { env } = freshShadowEnv();
-  const root = tmpDir('remote-exec-root');
+  // `root` gets its own private parent directory (rather than the shared
+  // system temp dir tmpDir() would otherwise put it directly under) so that
+  // `path.dirname(root)` -- where a `../escaped` traversal would land -- is
+  // private to this test: an unrelated stray file left there by a parallel
+  // run/session can never make the assertion below fail.
+  const privateParent = tmpDir('remote-exec-root-parent');
+  const root = path.join(privateParent, 'root');
+  fs.mkdirSync(root);
   const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
   const header = makeHeader({ ticketId: '../escaped' });
 
@@ -221,7 +228,7 @@ test('an invalid ticketId (path traversal) is refused with nothing written on di
   assert.notEqual(code, 0);
   assert.match(err, /invalid ticketId/);
   assert.equal(fs.existsSync(path.join(root, 'escaped')), false);
-  assert.equal(fs.existsSync(path.join(path.dirname(root), 'escaped')), false);
+  assert.equal(fs.existsSync(path.join(privateParent, 'escaped')), false);
 });
 
 test('a pre-existing ticket directory is refused untouched, with no result written', async () => {
@@ -527,6 +534,48 @@ test('remote-cancel fired against a confirmed-running (leased) child also result
 
   const result = await getResult(header.ticketId, root, env);
   assert.equal(result.kind, 'cancelled');
+});
+
+test('remote-cancel fired in the window between remote-id being recorded and the broker registering it still stops the child (BRAIN-319)', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const markerFile = path.join(tmpDir('remote-exec-marker'), 'marker');
+  const pauseFile = path.join(tmpDir('remote-exec-pause'), 'go');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({
+    argv: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(markerFile)}, '1')`],
+  });
+
+  const stream = encodeSnapshot(src, header, entries);
+  const spawnEnv = { ...env, LANE_BROKER_TEST_PAUSE_AFTER_TICKET_ID: pauseFile };
+  const { child } = spawnRemoteExec(stream, { env: spawnEnv, root });
+
+  // Wait until remote-id exists: onTicketCreated has already written it and
+  // already found the ticket-local `cancelled` marker unset, and is now
+  // paused (pauseFile doesn't exist yet) -- well before run.js has even
+  // spawned the supervisor, let alone before the supervisor has enqueued or
+  // leased this same id with the local broker.
+  const remoteIdPath = path.join(root, 'tickets', header.ticketId, 'remote-id');
+  await waitFor(() => fs.existsSync(remoteIdPath));
+
+  await laneRun(['remote-cancel', header.ticketId, '--root', root], { env });
+
+  // Release the pause: onTicketCreated's own ticket-local check already ran
+  // and missed the cancel (it arrived after), so run.js proceeds to spawn
+  // the supervisor exactly as if nothing had happened. Only the broker's own
+  // cancel marker -- written by remote-cancel above, re-checked by
+  // scheduler.js's tryStart under its admission lock right before the ticket
+  // would be admitted -- can still stop the child from ever running.
+  fs.mkdirSync(path.dirname(pauseFile), { recursive: true });
+  fs.writeFileSync(pauseFile, '1');
+
+  const code = await waitClose(child);
+  assert.equal(code, 0);
+
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.kind, 'cancelled');
+  await sleep(500); // outlast any window where the child could still be starting
+  assert.equal(fs.existsSync(markerFile), false, 'the child must never have run');
 });
 
 // ---- remote-result / remote-probe ----

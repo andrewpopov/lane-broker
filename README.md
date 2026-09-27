@@ -301,6 +301,13 @@ symlinks.
 - `LANE_BROKER_TEST_ROUNDS` — override the dead-owner-lock contention sweep's
   round count (default 4; the original suite ran 10) for a fuller sweep, e.g.
   `LANE_BROKER_TEST_ROUNDS=10 npm test`.
+- `LANE_BROKER_TEST_PAUSE_AFTER_TICKET_ID` — if set, `lane remote-exec` pauses
+  right after writing its ticket's `remote-id` file AND checking its own
+  ticket-local `cancelled` marker (finding it not yet set), until the named
+  file appears -- so a test can deterministically land `lane remote-cancel`
+  inside the window that check cannot see: after `remote-id` is recorded but
+  before the supervisor (not yet spawned) has enqueued or leased that same id
+  with the local broker.
 
 ## Verify locally
 

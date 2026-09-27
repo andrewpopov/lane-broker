@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, readJsonSafe } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, readJsonSafe, writeCancelMarkerFile } from './state.js';
 import { manifestHashOf, scrubbedGitEnv, verifyManifestNoGit } from './remote-manifest.js';
 import { makeReader, readHeaderLine, extractFrames } from './remote-stream.js';
 import { runCommand } from './run.js';
@@ -272,6 +272,22 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     onTicketCreated: async (id) => {
       atomicWriteFile(path.join(ticketDir, 'remote-id'), id);
       if (fs.existsSync(cancelledMarker)) return false;
+      // Test-only seam (BRAIN-319): hold here, right after the ticket-local
+      // `cancelled` check above has already come back false, until the named
+      // file appears -- lets a test deterministically land `lane
+      // remote-cancel` in the exact window this ticket-local check cannot
+      // see: after it has already run, but before the supervisor (which
+      // run.js has not spawned yet, since it's still awaiting this callback)
+      // has enqueued or leased the ticket with the LOCAL BROKER. Only the
+      // broker's own cancel marker (written by remote-cancel, checked again
+      // by scheduler.js's tryStart under its admission lock) can still catch
+      // a cancellation requested in this exact window.
+      const pauseFile = process.env.LANE_BROKER_TEST_PAUSE_AFTER_TICKET_ID;
+      if (pauseFile) {
+        while (!fs.existsSync(pauseFile)) {
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      }
       return true;
     },
   });
@@ -367,8 +383,26 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
   if (fs.existsSync(remoteIdPath)) {
     const remoteLaneId = fs.readFileSync(remoteIdPath, 'utf8').trim();
     if (isUuid(remoteLaneId)) {
-      const result = await cancelCommand(remoteLaneId);
-      cancelledBroker = result.exitCode === 0;
+      // BRAIN-319: write the LOCAL broker's own cancel marker for this id
+      // BEFORE calling cancelCommand. onTicketCreated (above) can write
+      // `remote-id` well before the supervisor has enqueued or leased that
+      // same id -- cancelCommand only knows how to act on a queued ticket, a
+      // held lease, or an attempt record, so calling it first can find none
+      // of those and do nothing, silently losing the cancellation. The
+      // marker is checked again, inside the same admission lock, by
+      // scheduler.js's tryStart right before a ticket is admitted to run
+      // (see its own comment) -- so writing it here first is what makes a
+      // cancel requested in that window still honoured once the ticket is
+      // registered, rather than depending on cancelCommand having anything
+      // to find yet.
+      const brokerRoot = ensureStateDirs().root;
+      writeCancelMarkerFile(brokerRoot, remoteLaneId);
+      // cancelCommand may still legitimately report failure here (e.g. "no
+      // queued ticket or lease" if the id isn't registered yet) -- that is
+      // not evidence the cancellation was lost, since the marker above
+      // already guarantees it will be honoured once the ticket appears.
+      await cancelCommand(remoteLaneId);
+      cancelledBroker = true;
     }
   }
 
