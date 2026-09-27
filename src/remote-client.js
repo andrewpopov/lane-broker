@@ -435,6 +435,12 @@ export async function dispatchRemote(opts) {
     generation,
     remoteDeps = null,
     remoteSetup = null,
+    // BRAIN-320 S1d: opt-in, from the CLIENT machine's global config
+    // (`remoteQueueTimeoutMs`) -- unset (undefined/null) means the header
+    // carries no such key at all, byte-identical to before this slice (I6).
+    // Rides on both protocol 1 and 2: an older runner simply ignores an
+    // unknown field, which is fine, since the whole feature is opt-in.
+    queueTimeoutMs = null,
     onStdout,
     onStderr,
     abortSignal,
@@ -481,6 +487,7 @@ export async function dispatchRemote(opts) {
     if (Array.isArray(remoteDeps) && remoteDeps.length > 0) header.remoteDeps = remoteDeps;
     if (Array.isArray(remoteSetup) && remoteSetup.length > 0) header.remoteSetup = remoteSetup;
   }
+  if (Number.isInteger(queueTimeoutMs) && queueTimeoutMs > 0) header.queueTimeoutMs = queueTimeoutMs;
   const snapshotStream = encodeSnapshot(worktreeRoot, header, manifest.entries);
 
   const execCommand = buildRemoteCommand(runner, 'remote-exec');

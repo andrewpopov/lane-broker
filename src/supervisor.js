@@ -9,6 +9,7 @@ import {
   readJsonSafe,
   isCancelled,
   cancelMarkerPath,
+  expireMarkerPath,
   writeCancelMarkerFile,
 } from './state.js';
 import { enqueue, tryStart, dequeueSync } from './scheduler.js';
@@ -76,11 +77,13 @@ function cancelRequested(root, id) {
   return isCancelled(root, id);
 }
 
-function clearCancelRequest(root, id) {
-  try {
-    fs.unlinkSync(cancelMarkerPath(root, id));
-  } catch {
-    // none pending
+function clearTicketMarkers(root, id) {
+  for (const marker of [cancelMarkerPath(root, id), expireMarkerPath(root, id)]) {
+    try {
+      fs.unlinkSync(marker);
+    } catch {
+      // none pending
+    }
   }
 }
 
@@ -398,7 +401,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
       return;
     }
     // Cleanup only, AFTER the terminal write above -- never before (BLOCKER #1).
-    clearCancelRequest(root, enriched.id);
+    clearTicketMarkers(root, enriched.id);
     process.exit(Number.isInteger(finalResult.exit) ? finalResult.exit : 1);
   }
 
@@ -485,6 +488,10 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     lane: enriched.lane,
     ticketId: enriched.id,
     generation: 0,
+    // BRAIN-320 S1d: opt-in, from THIS (client) machine's own global config
+    // -- never the runner's -- so an unset value here means the header
+    // carries no queueTimeoutMs at all (I6).
+    queueTimeoutMs: globalCfg.remoteQueueTimeoutMs,
     onStdout,
     onStderr,
     abortSignal,
@@ -597,24 +604,56 @@ async function main() {
    * too before either site can observe the dequeue), so `publishTerminal`'s
    * own `isCancelled` check resolves this correctly on its own.
    */
-  async function finalizeQueuedCancelAndExit() {
-    if (attemptGeneration !== null) {
-      await publishTerminal(root, ticket.id, attemptGeneration, () => {
-        const cancelledResult = { ...remoteCancelledResult(enriched.id, null), executor: 'local', fallbackReason };
-        atomicWriteJson(ticket.resultPath, cancelledResult);
-        appendHistory(root, {
-          id: ticket.id,
-          key: ticket.key,
-          repo: ticket.repoId,
-          lane: ticket.lane,
-          weight: ticket.weight,
-          resources: ticket.resources,
-          ...cancelledResult,
-        });
+  /**
+   * BRAIN-320 S1d: shared by the queued-cancel exit (unchanged behaviour)
+   * and the new queued queue-timeout exit -- both finalize a ticket that was
+   * dequeued without ever being leased, through the same publish/exit shape,
+   * differing only in the result they publish and the process exit code.
+   * `outcome` is `'cancelled'` (default, today's behaviour) or
+   * `'queue-timeout'` (BRAIN-320 1f/1g: exit 75, `reason: 'queue-timeout'`).
+   *
+   * A queue-timeout ticket is never itself a remote attempt fallback
+   * (`ticket.remote` is unset for the runner-side pipeline ticket this
+   * expires), so `attemptGeneration` is always null on that path -- unlike
+   * the cancel path, a queue-timeout result is published UNCONDITIONALLY,
+   * or `remote-exec`'s own kind derivation (reading this exact result.json)
+   * would never see it and would fall through to a bare, reasonless
+   * 'unfinished'.
+   */
+  async function finalizeQueuedAndExit(outcome = 'cancelled') {
+    const isTimeout = outcome === 'queue-timeout';
+    const buildResult = () =>
+      isTimeout
+        ? {
+            id: enriched.id,
+            exit: 75,
+            signal: null,
+            startedAt: null,
+            endedAt: Date.now(),
+            waitedMs: null,
+            cancelled: false,
+            reason: 'queue-timeout',
+          }
+        : { ...remoteCancelledResult(enriched.id, null), executor: 'local', fallbackReason };
+    const publish = (result) => {
+      atomicWriteJson(ticket.resultPath, result);
+      appendHistory(root, {
+        id: ticket.id,
+        key: ticket.key,
+        repo: ticket.repoId,
+        lane: ticket.lane,
+        weight: ticket.weight,
+        resources: ticket.resources,
+        ...result,
       });
+    };
+    if (attemptGeneration !== null) {
+      await publishTerminal(root, ticket.id, attemptGeneration, () => publish(buildResult()));
+    } else if (isTimeout) {
+      publish(buildResult());
     }
-    clearCancelRequest(root, ticket.id);
-    process.exit(0);
+    clearTicketMarkers(root, ticket.id);
+    process.exit(isTimeout ? 75 : 0);
   }
 
   await enqueue(root, enriched);
@@ -637,7 +676,7 @@ async function main() {
     if (!reloadFailed) clearConfigReloadWarning(root);
     if (cancelledBeforeStart || cancelRequested(root, ticket.id)) {
       dequeueSync(root, ticket.id);
-      await finalizeQueuedCancelAndExit();
+      await finalizeQueuedAndExit('cancelled');
     }
     // tryStart re-reads the config again inside its lock (BRAIN-182): the
     // outer reload above can be superseded by an edit that lands in the gap
@@ -659,8 +698,17 @@ async function main() {
       // started: it was cancelled out from under us (by `lane cancel`,
       // which dequeues + writes the marker itself before this is ever
       // observed). Same finalize-through-publishTerminal fix as the
-      // cancelledBeforeStart branch above -- see finalizeQueuedCancelAndExit.
-      await finalizeQueuedCancelAndExit();
+      // cancelledBeforeStart branch above -- see finalizeQueuedAndExit.
+      await finalizeQueuedAndExit('cancelled');
+    }
+    if (started.reason === 'queue-timeout') {
+      // BRAIN-320 S1d: tryStart already wrote the durable expiry marker
+      // (distinct from a cancel marker) under its own lock before returning
+      // this reason -- dequeue and publish the queue-timeout result the same
+      // way a queued cancel is finalized, so `remote-exec`'s own kind
+      // derivation (reading this ticket's result.json) sees it.
+      dequeueSync(root, ticket.id);
+      await finalizeQueuedAndExit('queue-timeout');
     }
     await sleep(globalCfg.sampleMs);
   }
@@ -769,7 +817,7 @@ async function main() {
       });
       removeLease(root, ticket.id); // release always comes last
       // Cleanup only, AFTER the terminal write above -- never before (BLOCKER #1).
-      clearCancelRequest(root, ticket.id);
+      clearTicketMarkers(root, ticket.id);
     };
 
     // BRAIN-319 T3b-2: this ticket started life as a remote attempt that fell

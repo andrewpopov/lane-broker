@@ -481,6 +481,86 @@ test('mixed versions: a v2 (remoteSetup) lane against a runner whose probe lacks
   assert.match(result.fallbackReason, /does not support protocol 2/);
 });
 
+// ---- BRAIN-320 S1d: opt-in queue timeout ----
+
+test('queue timeout: the client global config carries remoteQueueTimeoutMs, the runner broker never starts the ticket, and the run falls back and completes LOCALLY', async () => {
+  const { env, state, repoDir, runnerState } = setup({ remoteQueueTimeoutMs: 300 });
+  fs.mkdirSync(runnerState, { recursive: true });
+  fs.writeFileSync(path.join(runnerState, 'PAUSE'), 'kept busy for the test');
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+  );
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'local', 'the run must have fallen back and executed locally');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'local');
+  assert.match(result.fallbackReason, /queue-timeout/);
+});
+
+test('queue timeout: a user cancel while queued (deadline still pending) exits 130, never falls back locally, and the runner ticket is cancelled -- not queue-timeout', async () => {
+  const { env, runnerRoot, runnerState, repoDir } = setup({ remoteQueueTimeoutMs: 30_000 });
+  fs.mkdirSync(runnerState, { recursive: true });
+  fs.writeFileSync(path.join(runnerState, 'PAUSE'), 'kept busy for the test');
+  const marker = path.join(tmpDir('marker'), 'where');
+
+  const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', ...markerCmd(marker, 0)], { env, cwd: repoDir });
+  let stderr = '';
+  child.stderr.on('data', (d) => {
+    stderr += d;
+  });
+
+  const ticketsDir = path.join(runnerRoot, 'tickets');
+  await waitFor(
+    () => {
+      try {
+        return fs.readdirSync(ticketsDir).length > 0 ? true : null;
+      } catch {
+        return null;
+      }
+    },
+    { timeoutMs: 15_000 },
+  );
+  child.kill('SIGINT');
+
+  const exitCode = await new Promise((resolve) => child.on('close', resolve));
+  assert.equal(exitCode, 130, `stderr: ${stderr}`);
+  assert.equal(fs.existsSync(marker), false, 'a local rerun must never happen after a user cancel');
+
+  const [remoteTicketId] = fs.readdirSync(ticketsDir);
+  const resultPath = path.join(ticketsDir, remoteTicketId, 'result.json');
+  const record = await waitFor(() => readJsonSafe(resultPath), { timeoutMs: 15_000 });
+  assert.equal(record.kind, 'cancelled');
+  assert.notEqual(record.reason, 'queue-timeout');
+});
+
+test('queue timeout: with no remoteQueueTimeoutMs configured, a busy runner broker is not treated as expired -- the run still dispatches remotely once the runner frees up', async () => {
+  const { env, state, repoDir, runnerState } = setup();
+  fs.mkdirSync(runnerState, { recursive: true });
+  const pauseFile = path.join(runnerState, 'PAUSE');
+  fs.writeFileSync(pauseFile, 'kept busy for the test');
+  setTimeout(() => {
+    try {
+      fs.unlinkSync(pauseFile);
+    } catch {
+      // already gone
+    }
+  }, 600);
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+    '30s',
+  );
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'remote', 'no queueTimeoutMs was configured, so the ticket must never have expired');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+});
+
 test('mixed versions: a v1 (optionless) lane still dispatches remotely against the same old-style probe', async () => {
   const { env, state, repoDir } = setup({ ssh: 'old-runner' });
   const marker = path.join(tmpDir('marker'), 'where');

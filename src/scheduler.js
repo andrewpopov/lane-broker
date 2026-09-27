@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, writeExpireMarkerFile } from './state.js';
 import { sampleAndUpdateGate } from './load.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
 import { evaluateNewAdmission, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock } from './admission.js';
@@ -384,6 +384,22 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     const position = queue.findIndex((t) => t && t.id === ticket.id);
     if (position === -1) {
       return { result: { started: false, reason: 'not-head', position: null, queueLength: queue.length } };
+    }
+    // BRAIN-320 S1d: opt-in queue timeout for a remote ticket -- decided here,
+    // right after `position` is resolved and BEFORE any selection/gate logic,
+    // so a ticket blocked behind someone else's conflict or capacity still
+    // expires on schedule instead of only ever being checked once it would
+    // otherwise have been selected. `ticket.startDeadline` is only ever set
+    // by run.js for a runner-side pipeline ticket dispatched with a
+    // `queueTimeoutMs` header field (I6: absent for every other ticket, so
+    // this branch is a no-op for them). A user cancel takes precedence: if
+    // the marker is already there, this ticket is on its way to being
+    // finalized as cancelled (the outer poll loop's own cancelRequested
+    // check, or this same tryStart's cancel re-check further below once
+    // selected) -- never overwrite that outcome with an expiry.
+    if (Number.isFinite(ticket.startDeadline) && now >= ticket.startDeadline && !isCancelled(root, ticket.id)) {
+      writeExpireMarkerFile(root, ticket.id);
+      return { result: { started: false, reason: 'queue-timeout' } };
     }
     // Selection depends only on the queue and who currently holds a key —
     // resolve it BEFORE touching the load/CPU gates (both of which persist a

@@ -148,6 +148,14 @@ function validateHeaderFields(header) {
   } else if (header.remoteSetup !== undefined && !isValidRemoteSetupShape(header.remoteSetup)) {
     return { ok: false, reason: 'invalid remoteSetup' };
   }
+  // BRAIN-320 S1d: opt-in on both protocols -- an old runner simply ignores
+  // an unknown field, which is fine (the feature is opt-in), but THIS
+  // runner, once it understands the field at all, validates it the same way
+  // regardless of protocol. Absent is always fine (I6); present must be a
+  // positive integer.
+  if (header.queueTimeoutMs !== undefined && !(Number.isInteger(header.queueTimeoutMs) && header.queueTimeoutMs > 0)) {
+    return { ok: false, reason: 'invalid queueTimeoutMs' };
+  }
   return { ok: true };
 }
 
@@ -359,6 +367,10 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     // change the lease key -- pin it to repoKey regardless.
     repoIdentityOverride: header.repoKey,
     idOverride: remoteLaneId,
+    // BRAIN-320 S1d: opt-in queue timeout, relative ms, straight from the
+    // validated header field -- see run.js's own doc comment on
+    // `startDeadlineMs` for how it becomes an absolute deadline.
+    startDeadlineMs: header.queueTimeoutMs,
     // BRAIN-319 C5: fires as soon as the id exists, before the supervisor
     // is ever spawned (run.js's own hook point) -- this is what makes
     // "remote-id exists" and "the child could have started" the same fact.
@@ -399,7 +411,18 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   let kind;
   let exit = null;
   let signal = null;
-  if (structured) {
+  let reason = null;
+  // A user cancel that landed after the expiry still wins (kind cancelled below).
+  if (structured && structured.reason === 'queue-timeout' && !cancelled) {
+    // BRAIN-320 S1d: the LOCAL broker's own scheduler expired this ticket
+    // before it was ever admitted -- never 'completed' (it never ran), so
+    // this check comes BEFORE the general `structured` branch below. The
+    // client's `classifyRemoteResult` treats 'unfinished' as unconfirmed and
+    // falls back locally; `reason` carries 'queue-timeout' through for the
+    // fallback log line.
+    kind = 'unfinished';
+    reason = 'queue-timeout';
+  } else if (structured) {
     exit = structured.exit;
     signal = structured.signal;
     kind = cancelled ? 'cancelled' : 'completed';
@@ -417,7 +440,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     kind = 'unfinished';
   }
 
-  writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId }));
+  writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason }));
   cleanupWork(workDir);
   return { exitCode: 0 };
 }

@@ -166,6 +166,110 @@ test('dispatchRemote: a runner returning a result with the wrong manifestHash (r
   assert.match(result.reason, /did not bind/);
 });
 
+// ---- queue timeout (BRAIN-320 S1d, opt-in) ----
+
+/** Fast-poll shadow config for the fake runner's OWN broker (a separate
+ *  `LANE_BROKER_HOME`/`LANE_BROKER_STATE` from the client's, see
+ *  makeFakeSshBin's own doc comment) -- 5s default sampleMs would make a
+ *  small queueTimeoutMs take a full extra poll cycle to observe. */
+function fastRunnerConfig(runnerHome) {
+  writeGlobalConfig(runnerHome, { sampleMs: 50, capacity: 4 });
+}
+
+test('dispatchRemote: a runner-side ticket that never starts (broker paused) is unconfirmed with reason queue-timeout', async () => {
+  const { binDir, sshBin, runnerHome, runnerState } = makeFakeSshBin();
+  fastRunnerConfig(runnerHome);
+  fs.mkdirSync(runnerState, { recursive: true });
+  fs.writeFileSync(path.join(runnerState, 'PAUSE'), 'kept busy for the test');
+  const { env } = clientEnv(binDir);
+  const src = makeGitWorktree({ 'a.txt': 'hello' });
+  const runner = makeRunner({ ssh: 'normal', root: tmpDir('remote-exec-root') });
+
+  const result = await dispatchRemote({
+    ...makeDispatchArgs(),
+    runner,
+    worktreeRoot: src,
+    sshBin,
+    env,
+    queueTimeoutMs: 300,
+    deadlines: { resultMs: 5000, resultAttempts: 5 },
+  });
+
+  assert.equal(result.outcome, 'unconfirmed');
+  assert.match(result.reason, /queue-timeout/);
+});
+
+test('dispatchRemote: without queueTimeoutMs, a runner-side ticket stuck behind a paused broker just keeps waiting (never expires)', async () => {
+  const { binDir, sshBin, runnerHome, runnerState } = makeFakeSshBin();
+  fastRunnerConfig(runnerHome);
+  fs.mkdirSync(runnerState, { recursive: true });
+  fs.writeFileSync(path.join(runnerState, 'PAUSE'), 'kept busy for the test');
+  const { env } = clientEnv(binDir);
+  const src = makeGitWorktree({ 'a.txt': 'hello' });
+  const runner = makeRunner({ ssh: 'normal', root: tmpDir('remote-exec-root') });
+
+  // No queueTimeoutMs passed at all (I6: absent by default). Unpause shortly
+  // after dispatch starts, well past where a 300ms timeout would have fired
+  // in the sibling test above, and confirm the ticket still completes
+  // normally instead of having been expired out from under it.
+  setTimeout(() => {
+    try {
+      fs.unlinkSync(path.join(runnerState, 'PAUSE'));
+    } catch {
+      // already gone
+    }
+  }, 600);
+
+  const result = await dispatchRemote({
+    ...makeDispatchArgs({ argv: [process.execPath, '-e', 'process.exit(0)'] }),
+    runner,
+    worktreeRoot: src,
+    sshBin,
+    env,
+    deadlines: { resultMs: 5000, resultAttempts: 5 },
+  });
+
+  assert.equal(result.outcome, 'confirmed');
+  assert.equal(result.exitCode, 0);
+});
+
+test('dispatchRemote: a ticket that starts just before its queueTimeoutMs deadline runs to completion (kind completed)', async () => {
+  const { binDir, sshBin, runnerHome, runnerState } = makeFakeSshBin();
+  fastRunnerConfig(runnerHome);
+  fs.mkdirSync(runnerState, { recursive: true });
+  const pauseFile = path.join(runnerState, 'PAUSE');
+  fs.writeFileSync(pauseFile, 'kept busy for the test');
+  const { env } = clientEnv(binDir);
+  const src = makeGitWorktree({ 'a.txt': 'hello' });
+  const runner = makeRunner({ ssh: 'normal', root: tmpDir('remote-exec-root') });
+
+  // Unpause WELL before the queueTimeoutMs deadline -- the ticket must be
+  // admitted and run to completion, never expired, once it started (BRAIN-320
+  // 1f: "cancellation stays consistent -- a ticket that started just before
+  // the deadline runs to completion").
+  setTimeout(() => {
+    try {
+      fs.unlinkSync(pauseFile);
+    } catch {
+      // already gone
+    }
+  }, 100);
+
+  const result = await dispatchRemote({
+    ...makeDispatchArgs({ argv: [process.execPath, '-e', 'process.exit(0)'] }),
+    runner,
+    worktreeRoot: src,
+    sshBin,
+    env,
+    queueTimeoutMs: 2000,
+    deadlines: { resultMs: 5000, resultAttempts: 5 },
+  });
+
+  assert.equal(result.outcome, 'confirmed');
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.result.kind, 'completed');
+});
+
 // ---- cancellation ----
 
 test('dispatchRemote: abort during a sleeping remote child resolves cancelled, and the ticket\'s own result kind becomes cancelled', async () => {
