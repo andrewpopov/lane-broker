@@ -10,6 +10,9 @@ import { makeReader, readHeaderLine, extractFrames } from './remote-stream.js';
 import { runCommand } from './run.js';
 import { cancelCommand } from './cancel.js';
 import { collectStatus } from './status.js';
+import { readLease } from './lease.js';
+import { readAttempt } from './attempts.js';
+import { listQueue } from './scheduler.js';
 
 // BRAIN-319 T3: fixed, deterministic author/committer identity for the
 // synthetic snapshot commit -- this is never a real authored change, just a
@@ -378,34 +381,44 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
 
   atomicWriteFile(path.join(ticketDir, 'cancelled'), String(Date.now()));
 
-  let cancelledBroker = false;
+  // BRAIN-319 P3 (Codex re-review): report two separate facts instead of one
+  // overclaiming `cancelledBroker`. `cancelRequested` is "did we durably
+  // record this cancellation at the broker level" (the marker write below,
+  // gated on a broker ticket id actually existing yet). `cancelConfirmed` is
+  // "do we have proof it already took (or will definitely take) effect" --
+  // either `cancelCommand` itself confirmed a real action (exit 0), or the
+  // ticket was never registered with the broker at all, in which case
+  // `cancelCommand` can only fail ("no queued ticket or lease") but the
+  // marker written just above is re-checked, INSIDE the same admission lock,
+  // by scheduler.js's tryStart right before this ticket would ever be
+  // admitted (see its own comment) -- so the marker alone already governs
+  // the outcome and there is nothing further to confirm. A registered-but-
+  // unresponsive supervisor (e.g. SIGSTOPped) is neither of those: it is
+  // genuinely unconfirmed.
+  let cancelRequested = false;
+  let cancelConfirmed = false;
   const remoteIdPath = path.join(ticketDir, 'remote-id');
   if (fs.existsSync(remoteIdPath)) {
     const remoteLaneId = fs.readFileSync(remoteIdPath, 'utf8').trim();
     if (isUuid(remoteLaneId)) {
-      // BRAIN-319: write the LOCAL broker's own cancel marker for this id
-      // BEFORE calling cancelCommand. onTicketCreated (above) can write
-      // `remote-id` well before the supervisor has enqueued or leased that
-      // same id -- cancelCommand only knows how to act on a queued ticket, a
-      // held lease, or an attempt record, so calling it first can find none
-      // of those and do nothing, silently losing the cancellation. The
-      // marker is checked again, inside the same admission lock, by
-      // scheduler.js's tryStart right before a ticket is admitted to run
-      // (see its own comment) -- so writing it here first is what makes a
-      // cancel requested in that window still honoured once the ticket is
-      // registered, rather than depending on cancelCommand having anything
-      // to find yet.
+      // Write the LOCAL broker's own cancel marker for this id BEFORE
+      // calling cancelCommand. onTicketCreated (above) can write `remote-id`
+      // well before the supervisor has enqueued or leased that same id --
+      // cancelCommand only knows how to act on a queued ticket, a held
+      // lease, or an attempt record, so calling it first can find none of
+      // those and do nothing, silently losing the cancellation.
       const brokerRoot = ensureStateDirs().root;
       writeCancelMarkerFile(brokerRoot, remoteLaneId);
-      // cancelCommand may still legitimately report failure here (e.g. "no
-      // queued ticket or lease" if the id isn't registered yet) -- that is
-      // not evidence the cancellation was lost, since the marker above
-      // already guarantees it will be honoured once the ticket appears.
-      await cancelCommand(remoteLaneId);
-      cancelledBroker = true;
+      cancelRequested = true;
+      const wasRegistered =
+        Boolean(readLease(brokerRoot, remoteLaneId)) ||
+        Boolean(readAttempt(brokerRoot, remoteLaneId)) ||
+        listQueue(brokerRoot).some((t) => t && t.id === remoteLaneId);
+      const result = await cancelCommand(remoteLaneId);
+      cancelConfirmed = result.exitCode === 0 || !wasRegistered;
     }
   }
 
-  process.stdout.write(`${JSON.stringify({ protocol: 1, ticketId, markedCancelled: true, cancelledBroker })}\n`);
+  process.stdout.write(`${JSON.stringify({ protocol: 1, ticketId, markedCancelled: true, cancelRequested, cancelConfirmed })}\n`);
   return { exitCode: 0 };
 }

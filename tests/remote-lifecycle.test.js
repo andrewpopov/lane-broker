@@ -5,6 +5,8 @@ import path from 'node:path';
 import { laneRun, laneSpawn, waitFor, sleep, writeGlobalConfig } from './helpers.js';
 import { tmpDir, setup, markerCmd, detachAndWait, resultOf } from './remote-harness.js';
 import { readAttempt } from '../src/attempts.js';
+import { readLease, isGroupAlive } from '../src/lease.js';
+import { paths } from '../src/state.js';
 
 /**
  * BRAIN-319 T3b-4: `lane status`/`wait`/`cancel` against an attempt record
@@ -284,4 +286,80 @@ test('supervisor SIGKILLed after fallback (still queued): wait fails fast, namin
   assert.match(waited.stderr, new RegExp(`lane cancel ${id}`));
 
   await laneRun(['cancel', blockerId], { env }); // cleanup: release the blocker's own child group
+});
+
+// ---- BRAIN-319 P1 (Codex re-review): admitted (leased) fallback, dead supervisor ----
+
+/** Force a remote-eligible ticket to fall back AND get ADMITTED (leased) --
+ *  plenty of default capacity, unlike startQueuedFallback above. */
+async function startAdmittedFallback(env, state, repoDir, argv) {
+  const started = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...argv], { env, cwd: repoDir });
+  assert.equal(started.code, 0, `--detach should not fail: ${started.stderr}`);
+  const id = started.stdout.trim();
+  await waitFor(() => readAttempt(state, id)?.executor === 'local', { timeoutMs: 15_000 });
+  await waitFor(() => Boolean(readLease(state, id)), { timeoutMs: 15_000 });
+  return id;
+}
+
+test('SIGKILLing a fallback supervisor after its local child has been admitted (child keeps running): lane wait exits 1 fast, naming it', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'down' });
+  const id = await startAdmittedFallback(env, state, repoDir, ['sleep', '30']);
+
+  const attempt = readAttempt(state, id);
+  assert.ok(attempt, 'expected an attempt record for the admitted fallback ticket');
+  assert.equal(attempt.executor, 'local');
+  const lease = readLease(state, id);
+  assert.ok(lease, 'the ticket must be leased (admitted), not just queued, for this test to mean anything');
+
+  process.kill(attempt.supervisor.pid, 'SIGKILL');
+  await sleep(300);
+
+  const startedAt = Date.now();
+  const waited = await laneRun(['wait', id, '--timeout', '10s'], { env });
+  assert.ok(Date.now() - startedAt < 8000, 'must fail fast off the attempt-liveness check, not poll out to the timeout');
+  assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
+  assert.match(waited.stderr, /ORPHANED/);
+  assert.match(waited.stderr, new RegExp(`lane cancel ${id}`));
+
+  // Cleanup: `lane wait` deliberately never kills or releases the child (that
+  // stays `lane cancel`'s job) -- the detached `sleep 30` is still alive
+  // under its own process group. Reap it directly so nothing leaks past this
+  // test.
+  try {
+    process.kill(-lease.childPgid, 'SIGKILL');
+  } catch {
+    // already gone
+  }
+  await waitFor(() => !isGroupAlive(lease.childPgid), { timeoutMs: 5000 });
+});
+
+test('a completed fallback run leaves no attempt record, and a later `lane cancel` on that id is a no-op that does not overwrite the result (no stale lock left behind)', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'down' });
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 7)],
+    env,
+    repoDir,
+  );
+  assert.equal(waited.code, 7, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'local', 'ssh is down, so this must have run as a local fallback');
+  assert.equal(readAttempt(state, id), null, 'a completed fallback run must leave no attempt record');
+
+  const originalResult = resultOf(state, id);
+  assert.equal(originalResult.exit, 7);
+
+  // BRAIN-319 P2: process.exit used to happen INSIDE the publishTerminal
+  // writer, before withLock's own `finally` (mutex release) ever ran -- the
+  // global lock must already be gone by the time the supervisor has exited.
+  assert.equal(fs.existsSync(paths(state).lock), false, 'the global lock must not be left held after the supervisor exits');
+
+  const startedAt = Date.now();
+  const cancelResult = await laneRun(['cancel', id], { env });
+  assert.ok(
+    Date.now() - startedAt < 3000,
+    'cancel on an unregistered id must return fast -- a still-held lock would force it through the ~15s stale-lock recovery path instead',
+  );
+  assert.equal(cancelResult.code, 1, 'nothing left to cancel');
+
+  assert.deepEqual(resultOf(state, id), originalResult, 'the already-published result must be untouched');
 });

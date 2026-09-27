@@ -710,7 +710,19 @@ async function main() {
     if (stdoutForward) await stdoutForward.drain();
     if (stderrForward) await stderrForward.drain();
 
-    const writeAndExit = (finalResult, finalExitCode) => {
+    // BRAIN-319 P2 (Codex re-review): `writeResult` only WRITES -- no
+    // `process.exit` in here. The old `writeAndExit` called `process.exit`
+    // from INSIDE the `publishTerminal` writer below, which runs inside ONE
+    // `withLock` transaction -- `process.exit()` terminates the process
+    // before that transaction's own `finally` (mutex release) ever runs, and
+    // before `publishTerminal` itself gets to `removeAttempt`. A completed
+    // fallback run then left both the global lock AND its attempt record
+    // stale, so a later `lane cancel` could "reconcile" an orphaned-looking
+    // attempt that was actually already done, and overwrite its result.
+    // Exactly the shape `publishAndExit` (above, in `runRemoteAttempt`)
+    // already gets right: write, let `publishTerminal` return (mutex
+    // released, attempt removed), THEN exit.
+    const writeResult = (finalResult) => {
       atomicWriteJson(ticket.resultPath, finalResult);
       appendHistory(root, {
         id: ticket.id,
@@ -724,7 +736,6 @@ async function main() {
       removeLease(root, ticket.id); // release always comes last
       // Cleanup only, AFTER the terminal write above -- never before (BLOCKER #1).
       clearCancelRequest(root, ticket.id);
-      process.exit(finalExitCode);
     };
 
     // BRAIN-319 T3b-2: this ticket started life as a remote attempt that fell
@@ -733,16 +744,25 @@ async function main() {
     // this exact finish is decided the same way (C5), and the attempt
     // record is removed once this local run's outcome is actually published.
     if (attemptGeneration !== null) {
+      let finalExitCode = exitCode;
       const published = await publishTerminal(root, ticket.id, attemptGeneration, ({ cancelled }) => {
-        if (cancelled) writeAndExit(remoteCancelledResult(enriched.id, startedAt), 130);
-        else writeAndExit({ ...result, executor: 'local', fallbackReason }, exitCode);
+        if (cancelled) {
+          finalExitCode = 130;
+          writeResult(remoteCancelledResult(enriched.id, startedAt));
+        } else {
+          writeResult({ ...result, executor: 'local', fallbackReason });
+        }
       });
-      if (published.ok) return;
+      if (published.ok) {
+        process.exit(finalExitCode);
+        return;
+      }
       // Generation mismatch: unreachable today (this supervisor is the sole
       // writer of its own attempt record past the fallback), but a real
       // local result must never be silently dropped -- write it directly.
     }
-    writeAndExit(result, exitCode);
+    writeResult(result);
+    process.exit(exitCode);
   }
 
   child.on('error', (err) => {

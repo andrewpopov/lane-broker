@@ -536,6 +536,58 @@ test('remote-cancel fired against a confirmed-running (leased) child also result
   assert.equal(result.kind, 'cancelled');
 });
 
+test('remote-cancel against a stopped (SIGSTOP) supervisor reports cancelRequested true and cancelConfirmed false (BRAIN-319 P3)', async () => {
+  const { env, state } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ argv: [process.execPath, '-e', 'setInterval(() => {}, 1000)'] });
+
+  const stream = encodeSnapshot(src, header, entries);
+  const { child } = spawnRemoteExec(stream, { env, root });
+
+  let leaseRecord;
+  await waitFor(() => {
+    const leasesDir = paths(state).leases;
+    let names;
+    try {
+      names = fs.readdirSync(leasesDir);
+    } catch {
+      return false;
+    }
+    return names.some((n) => {
+      const lease = readJsonSafe(path.join(leasesDir, n));
+      if (lease && lease.key && lease.key.startsWith(`${sanitizeKey(header.repoKey)}:`)) {
+        leaseRecord = lease;
+        return true;
+      }
+      return false;
+    });
+  });
+
+  // The ticket IS registered (a real lease exists) but its supervisor cannot
+  // react to SIGTERM while stopped -- cancelCommand's own grace-period wait
+  // times out and reports failure, so `cancelConfirmed` must be false even
+  // though `cancelRequested` (the durable marker write) always succeeds.
+  process.kill(leaseRecord.supervisorPid, 'SIGSTOP');
+  try {
+    const cancelResult = await laneRun(['remote-cancel', header.ticketId, '--root', root], { env });
+    assert.equal(cancelResult.code, 0, `stderr: ${cancelResult.stderr}`);
+    const parsed = JSON.parse(cancelResult.stdout.trim());
+    assert.equal(parsed.cancelRequested, true);
+    assert.equal(parsed.cancelConfirmed, false);
+  } finally {
+    // Resume it so nothing leaks past this test -- the pending SIGTERM
+    // cancelCommand already sent gets handled the instant it's running again.
+    process.kill(leaseRecord.supervisorPid, 'SIGCONT');
+  }
+
+  const code = await waitClose(child);
+  assert.equal(code, 0);
+
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.kind, 'cancelled');
+});
+
 test('remote-cancel fired in the window between remote-id being recorded and the broker registering it still stops the child (BRAIN-319)', async () => {
   const { env } = freshShadowEnv();
   const root = tmpDir('remote-exec-root');

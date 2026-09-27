@@ -52,20 +52,23 @@ export async function waitCommand(id, { timeoutMs } = {}) {
         }
         return { exitCode: result.exit ?? 1 };
       }
-      // BRAIN-319 T3b-4/T3b-5 (C4): an attempt record still mid remote-
-      // dispatch, or a post-fallback ticket that fell back but was never
-      // admitted (no lease yet), counts as "found" (no result yet, but
-      // something is genuinely working on it) UNLESS its supervisor is
-      // confirmed dead -- fixed to ANY attempt executor, not just 'remote':
-      // a fallback ticket cancelled/crashed while still queued locally has
-      // the exact same "nothing will ever produce a result" shape. Skipped
-      // when a LEASE also exists: an admitted (leased) ticket's child group
-      // can still be genuinely alive and finishing under a dead supervisor
-      // (the existing ORPHANED-lease path in cancel.js can reconcile that),
-      // so this check must never race ahead of a real, still-running child.
+      // BRAIN-319 T3b-4/T3b-5 (C4), fixed by P1 (Codex re-review): an attempt
+      // record still mid remote-dispatch, still queued after a local
+      // fallback, OR already admitted and running (leased) after that
+      // fallback all count as "found" (no result yet, but something is
+      // genuinely working on it) UNLESS the attempt's OWN recorded
+      // supervisor (pid + start time + boot id) is confirmed dead -- fixed
+      // to ANY attempt executor, not just 'remote', and decided purely from
+      // `supervisorAlive(attempt)`, never from lease presence: `readLease`
+      // never reaps, so an admitted fallback whose supervisor died while its
+      // lease is still held would otherwise sit RUNNING forever and this
+      // loop would poll it forever too, even though nobody is left to react
+      // to the child's eventual 'close' event and write a result. Reported
+      // here, never acted on: no kill, no lease release -- that stays `lane
+      // cancel`'s job (named in the message below).
       const lease = readLease(root, id);
       const attempt = readAttempt(root, id);
-      if (attempt && !lease && !supervisorAlive(attempt)) {
+      if (attempt && !supervisorAlive(attempt)) {
         const label = attempt.executor === 'remote' ? 'ORPHANED-REMOTE' : 'ORPHANED (post-fallback)';
         process.stderr.write(
           `lane wait: ${id} is ${label} (runner ${attempt.runner ?? 'unknown'}) -- its supervisor is gone and nothing ` +
