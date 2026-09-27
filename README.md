@@ -53,7 +53,7 @@ features like pipes or globbing.
 | Flag | Purpose |
 |---|---|
 | `--repo <name>` | Repo label, used only as a fallback for the lease key. When `cwd` is inside a git repo, the git identity (`git rev-parse --git-common-dir`) always wins, so the same repo resolves to the same key whether or not `--repo` is passed; `--repo` only determines the key outside a git repo. |
-| `--lane <name>` | Lane name (`default` if omitted); looked up in `.lane-broker.json`. If the repo config declares `lanes`, an undeclared name is refused (exit `64`) rather than silently keying on a private, unconflicting lane. |
+| `--lane <name>` | Lane name (`default` if omitted); looked up in `.lane-broker.json`. If the repo config declares `lanes`, an undeclared name is refused (exit `64`) rather than silently keying on a private, unconflicting lane — unless the repo config sets `"undeclaredLanes": "allow"`, in which case an undeclared name resolves like the no-config-file case (default weight, never remote-eligible) instead of being refused. |
 | `--weight <n>` | Override the configured weight for this run; must be a positive number (validated before enqueueing, exit `2` otherwise). |
 | `--cpu <cores>` | Override the lane's CPU reservation; fractional cores are supported. |
 | `--memory <size>` | Override the lane's memory reservation, e.g. `768MiB` or `4GiB`. |
@@ -61,6 +61,7 @@ features like pipes or globbing.
 | `--timeout <duration>` | e.g. `30s`, `5m`, `500ms`. Exit `75` if not finished in time — see below. |
 | `--allow-local-sim` | Override a lane's `localRefused: true`. |
 | `--log <path>` | Override the default log path. |
+| `--local` | Never dispatch to a remote runner (same as `LANE_BROKER_LOCAL=1`). |
 
 **Every run gets a detached supervisor**, always. `lane run` spawns it, then
 only *waits* on the supervisor's result file. If the calling agent (or its
@@ -164,6 +165,14 @@ conflict, regardless of `conflicts` — unless that lane declares
 `maxConcurrent`. With no config file, there is a single `default` lane of
 weight 2.
 
+A top-level `"undeclaredLanes": "allow"` (default `"refuse"`, today's
+behaviour) lets an undeclared `--lane` name through instead of refusing it:
+it resolves exactly like the no-config-file case (default weight, never
+remote-eligible, no `conflicts` entry of its own), except that a declared
+lane's `["*", "other"]` conflict still reaches it. This exists so a repo can
+declare and remote-enable one specific lane (e.g. `prepush`) while its
+sessions keep using ad-hoc lane names for everything else.
+
 A lane's own `maxConcurrent` (integer >= 1, e.g. `"fleet": { "weight": 1,
 "maxConcurrent": 4 }`) relaxes ONLY the same-key rule above: up to that many
 same-key tickets may hold a lease at once, each counted individually against
@@ -188,6 +197,82 @@ closed load gate) re-reads the global config on every poll, so an edit to
 within one `sampleMs`, not only for supervisors started afterward. A missing
 or invalid config file during a reload is ignored and the last known-good
 config keeps being used; it never crashes or wedges a running supervisor.
+
+## Remote runners (BRAIN-319)
+
+A lane can run on another machine instead of this one, and fall back to this
+machine's broker when none is usable. It is opt-in twice: the machine lists
+runners, and the repo marks a lane `remote`. With no `runners`, or a lane
+without `remote: true`, nothing changes.
+
+```json
+// ~/.config/lane-broker/config.json (the client machine)
+"runners": [
+  { "name": "skybox", "ssh": "skybox-runner" },
+  { "name": "grandy", "ssh": "mac-grandy", "shell": "zsh -lc" }
+]
+```
+
+```json
+// .lane-broker.json (the repo)
+{
+  "undeclaredLanes": "allow",
+  "lanes": { "prepush": { "weight": 2, "remote": true } }
+}
+```
+
+`undeclaredLanes: "allow"` opts one lane (`prepush` here) into remote
+runners while leaving every other, ad-hoc lane name usable without being
+refused as undeclared.
+
+`ssh` is an ssh destination (an alias from `~/.ssh/config`, or
+`ssh://user@host:port`); it may not start with `-`. `shell` (default
+`bash -lc`) wraps every remote command so a non-interactive ssh finds
+`node` and `lane`. `root` (default `~/.cache/lane-broker/remote` on the
+runner) holds per-ticket work dirs. A runner has no `runners` of its own.
+
+What a remote run does:
+
+1. **Decide eligibility locally**, before touching the network. The file
+   set is the worktree's tracked + untracked-not-ignored files that exist on
+   disk (so staged, unstaged and deleted changes are all reflected). A tree
+   with a submodule, special file, escaping symlink, or a secret-shaped path
+   (`.env`, `.env.*` other than `*.example/.sample/.template/.dist`,
+   `*.pem`, `id_*`) stays local. Gitignored files are never sent.
+2. **Pick a runner**: probe each in config order (`lane remote-probe`, 6 s
+   hard deadline) and take the first that is reachable, speaks protocol 1,
+   is not paused and has no queue. None → local.
+3. **Send a snapshot**, not history: a framed stream of exactly the listed
+   files. Each file is re-read without following symlinks and its sha256
+   checked before its bytes are sent. The runner validates every frame
+   against the file list before writing it, into a fresh per-ticket dir,
+   then re-hashes the whole tree and gives it a throwaway one-commit git
+   repo (hooks off) so gates that call git still work.
+4. **Run under the runner's own broker** as a fresh ticket — the caller's
+   lease is never inherited, and `LANE_BROKER_LOCAL=1` stops re-dispatch.
+   The runner's admission protects whatever else that machine is doing.
+5. **Stream output live** (foreground stdout/stderr and `--log`), then fetch
+   the result over a second ssh call. **ssh's own exit code is never
+   used.** A result counts only if its protocol, ticket id, attempt
+   generation and file-list hash all match what was sent.
+
+Anything uncertain — unreachable runner, transport death mid-run, a result
+that is missing or does not match, a rejected snapshot — **re-runs the
+command locally**, printing `lane: remote-skip: <runner>: <reason> —
+running locally`. Re-running costs CPU; reporting an unverified green would
+cost the gate. A cancelled run is the one exception: it is never re-run,
+and always reports `130`, whatever the command exited with.
+
+A remote run takes no local capacity or resource reservation. `lane status`
+lists it under REMOTE; if its supervisor dies it shows as ORPHANED-REMOTE
+(it survives a reboot), `lane wait` exits `1` naming it, and `lane cancel`
+reconciles it (best-effort cancel on the runner, then a `130` result).
+
+Runner setup: install this package (same release as the client), make
+`lane` resolvable through the runner's `shell`, and install whatever the
+repo's own gate needs there (for example the Playwright browsers its tests
+launch). Each run installs dependencies from scratch in its fresh dir;
+there is deliberately no `node_modules` cache yet.
 
 ## Scheduling
 
@@ -301,6 +386,13 @@ symlinks.
 - `LANE_BROKER_TEST_ROUNDS` — override the dead-owner-lock contention sweep's
   round count (default 4; the original suite ran 10) for a fuller sweep, e.g.
   `LANE_BROKER_TEST_ROUNDS=10 npm test`.
+- `LANE_BROKER_TEST_PAUSE_AFTER_TICKET_ID` — if set, `lane remote-exec` pauses
+  right after writing its ticket's `remote-id` file AND checking its own
+  ticket-local `cancelled` marker (finding it not yet set), until the named
+  file appears -- so a test can deterministically land `lane remote-cancel`
+  inside the window that check cannot see: after `remote-id` is recorded but
+  before the supervisor (not yet spawned) has enqueued or leased that same id
+  with the local broker.
 
 ## Verify locally
 

@@ -183,6 +183,32 @@ export function effectiveWeightCapacity(cfg, cpuCores) {
   return Math.max(1, Math.floor(budget));
 }
 
+/**
+ * The "requested resources exceed this environment's budget" refusal,
+ * extracted so `run.js` and the supervisor's remote-fallback path (BRAIN-319
+ * T3b) apply the exact same message and exit code -- a request that would
+ * have been refused locally must still be refused once it falls back from a
+ * remote runner, not silently admitted because the check only ran once.
+ */
+export function checkResourceBudget({ resources, globalCfg, host }) {
+  const cpuBudget = Math.max(
+    0,
+    Math.min(host.cpuCores - globalCfg.cpuReserveCores, (globalCfg.cpuAdmissionPercent / 100) * host.cpuCores),
+  );
+  const memoryBudget = Math.max(0, host.memoryBytes - globalCfg.memoryReserveBytes);
+  if (globalCfg.schedulerMode === 'active' && (resources.cpuCores > cpuBudget || resources.memoryBytes > memoryBudget)) {
+    return {
+      ok: false,
+      exitCode: 64,
+      message:
+        `lane run: requested resources exceed this environment's budget (` +
+        `${resources.cpuCores}/${cpuBudget.toFixed(2)} CPU cores, ` +
+        `${resources.memoryBytes}/${memoryBudget} memory bytes).\n`,
+    };
+  }
+  return { ok: true };
+}
+
 export function evaluateMemoryAdmission({ memoryInfo, heldLeases, candidateResources, cfg, now = Date.now() }) {
   if (!memoryInfo || !Number.isFinite(memoryInfo.availableBytes)) {
     return { admit: false, reason: 'memory-unavailable', projectedAvailableBytes: null, memoryBudgetBytes: null };

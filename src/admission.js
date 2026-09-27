@@ -374,7 +374,7 @@ export function formatAdmissionLog(f) {
  * line fires once per poll while a candidate waits. Never throws, since a
  * logging failure must never affect scheduling.
  */
-function writeBrokerLog(root, line) {
+export function writeBrokerLog(root, line) {
   try {
     fs.appendFileSync(paths(root).admissionLog, line);
   } catch {

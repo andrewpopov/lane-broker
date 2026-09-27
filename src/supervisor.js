@@ -1,11 +1,25 @@
 import fs from 'node:fs';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
-import { paths, ensureStateDirs, appendHistory, atomicWriteJson, readJsonSafe } from './state.js';
+import {
+  paths,
+  ensureStateDirs,
+  appendHistory,
+  atomicWriteJson,
+  readJsonSafe,
+  isCancelled,
+  cancelMarkerPath,
+  writeCancelMarkerFile,
+} from './state.js';
 import { enqueue, tryStart, dequeueSync } from './scheduler.js';
 import { readLease, writeLease, removeLease, isGroupAlive, processStartTime } from './lease.js';
 import { observedGroupCpuCores, observedGroupMemoryBytes } from './cpu.js';
 import { reloadGlobalConfig } from './config.js';
+import { detectResourceCapacity, checkResourceBudget } from './resources.js';
+import { selectRunner, dispatchRemote } from './remote-client.js';
+import { buildManifest, RemoteIneligibleError } from './remote-manifest.js';
+import { createAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
+import { writeBrokerLog } from './admission.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
 const CANCEL_GRACE_MS = 10_000;
@@ -59,12 +73,12 @@ function clearConfigReloadWarning(root) {
 }
 
 function cancelRequested(root, id) {
-  return fs.existsSync(`${paths(root).cancel}/${id}`);
+  return isCancelled(root, id);
 }
 
 function clearCancelRequest(root, id) {
   try {
-    fs.unlinkSync(`${paths(root).cancel}/${id}`);
+    fs.unlinkSync(cancelMarkerPath(root, id));
   } catch {
     // none pending
   }
@@ -300,6 +314,188 @@ export function applyHeartbeatObservation(lease, observed, now = Date.now(), obs
   return update;
 }
 
+/** The exact "requested resources exceed this environment's budget" refusal run.js applies at
+ *  preflight, re-applied here once a remote-eligible ticket has fallen back to local -- run.js
+ *  skipped it specifically so a runner could still take an oversized request (BRAIN-319 T3b-1). */
+function localBudgetRefusalResult(ticket, budget) {
+  return { id: ticket.id, exit: budget.exitCode, signal: null, startedAt: null, endedAt: Date.now(), waitedMs: 0, error: budget.message.trim() };
+}
+
+/**
+ * Attempt a remote runner for a remote-eligible ticket (`ticket.remote`,
+ * BRAIN-319 T3b-1's payload), BEFORE the ticket is ever handed to the local
+ * scheduler. Resolves to `{ fallback: true, attemptGeneration, fallbackReason }`
+ * when the caller must continue into the EXISTING local enqueue+run path
+ * below with the same ticket id, or `{ fallback: false }` once the attempt
+ * has reached a terminal outcome here (confirmed, cancelled, or refused) --
+ * `process.exit()` has already been called on that path, matching every
+ * other terminal path in this file.
+ */
+async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
+  const attemptStartedAt = Date.now();
+  await createAttempt(root, enriched.id, { runner: null });
+
+  // Reuses the SAME two writers a local child's output goes through
+  // (CappedLogWriter/ForwardWriter, defined above) -- no second relay.
+  // Backpressure is not applied here (unlike the local child path below):
+  // `dispatchRemote` hands us plain data chunks, not a pausable stream, so
+  // there is no source on our side to gate.
+  const logWriter = new CappedLogWriter(enriched.logPath);
+  const forwardOutput = enriched.forwardOutput === true;
+  const stdoutForward = forwardOutput ? new ForwardWriter(process.stdout) : null;
+  const stderrForward = forwardOutput ? new ForwardWriter(process.stderr) : null;
+  const onStdout = (chunk) => {
+    logWriter.write(chunk);
+    if (stdoutForward) stdoutForward.write(chunk);
+  };
+  const onStderr = (chunk) => {
+    logWriter.write(chunk);
+    if (stderrForward) stderrForward.write(chunk);
+  };
+
+  function writeResultSync(result) {
+    atomicWriteJson(enriched.resultPath, result);
+    appendHistory(root, {
+      id: enriched.id,
+      key: enriched.key,
+      repo: enriched.repoId,
+      lane: enriched.lane,
+      weight: enriched.weight,
+      resources: enriched.resources,
+      ...result,
+    });
+  }
+
+  /**
+   * Codex pre-merge BLOCKER #2: drain FIRST (async, outside any lock), THEN
+   * publish inside ONE synchronous `publishTerminal` transaction. The old
+   * shape called an async `finish()` from INSIDE `resultWriterFn` without
+   * awaiting it -- `publishTerminal` removed the attempt and released the
+   * mutex immediately, before the drain (or even the `atomicWriteJson`) had
+   * actually happened, so a SIGINT or crash in that window left neither an
+   * attempt record nor a result.json. `buildConfirmedResult` is called only
+   * when `publishTerminal` itself decides this was NOT a cancellation
+   * (its `isCancelled` check, the single source of truth here) -- it must
+   * never assume that outcome on its own.
+   */
+  async function publishAndExit(generation, buildConfirmedResult) {
+    await logWriter.finish();
+    if (stdoutForward) await stdoutForward.drain();
+    if (stderrForward) await stderrForward.drain();
+
+    let finalResult = null;
+    const published = await publishTerminal(root, enriched.id, generation, ({ cancelled }) => {
+      finalResult = cancelled ? remoteCancelledResult(enriched.id, attemptStartedAt) : buildConfirmedResult();
+      writeResultSync(finalResult);
+    });
+    if (!published.ok) {
+      // Generation mismatch: unreachable on every call site below (nothing
+      // else advances this attempt's generation while this supervisor is
+      // its sole writer), but a real terminal outcome must never be
+      // silently dropped -- fail loud rather than hang or exit 0.
+      process.stderr.write(`lane-broker supervisor: could not publish a result for ${enriched.id}\n`);
+      process.exit(1);
+      return;
+    }
+    // Cleanup only, AFTER the terminal write above -- never before (BLOCKER #1).
+    clearCancelRequest(root, enriched.id);
+    process.exit(Number.isInteger(finalResult.exit) ? finalResult.exit : 1);
+  }
+
+  async function fallbackOrRefuse(runner, reason) {
+    const fb = await fallbackToLocal(root, enriched.id, reason);
+    if (!fb.ok) {
+      if (fb.cancelled) {
+        await publishAndExit(0, () => {
+          throw new Error('unreachable: fallbackToLocal reported cancelled');
+        });
+        return { fallback: false };
+      }
+      throw new Error(`lane-broker supervisor: could not fall back to local for ${enriched.id} (attempt record missing)`);
+    }
+
+    const skipLine = `lane: remote-skip: ${runner ? runner.name : 'none'}: ${reason} — running locally\n`;
+    process.stderr.write(skipLine);
+    writeBrokerLog(root, skipLine);
+
+    const host = detectResourceCapacity();
+    const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host });
+    if (!budget.ok) {
+      process.stderr.write(budget.message);
+      await publishAndExit(fb.attempt.generation, () => localBudgetRefusalResult(enriched, budget));
+      return { fallback: false };
+    }
+
+    return { fallback: true, attemptGeneration: fb.attempt.generation, fallbackReason: reason };
+  }
+
+  // Codex pre-merge finding #5: decide ELIGIBILITY before ever probing a
+  // runner. `buildManifest` used to run only inside `dispatchRemote`, AFTER
+  // `selectRunner` had already dialed a runner and this function had
+  // already printed "running on <runner>" -- an ineligible tree (e.g. a
+  // tracked .env) then fell back only after a real probe and a misleading
+  // banner. Built once, here; handed to `dispatchRemote` as `manifest` below
+  // so it is never rebuilt (one code path, see dispatchRemote's own doc
+  // comment).
+  let manifest;
+  try {
+    manifest = buildManifest(enriched.remote.worktreeRoot);
+  } catch (err) {
+    if (!(err instanceof RemoteIneligibleError)) throw err;
+    return fallbackOrRefuse(null, err.message);
+  }
+
+  const { runner, skipped } = await selectRunner(globalCfg.runners || [], {});
+  if (!runner) {
+    const reason = skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : 'no runners configured';
+    return fallbackOrRefuse(null, reason);
+  }
+
+  await updateAttempt(root, enriched.id, 0, { phase: 'running', runner: runner.name });
+  // Printed only now that eligibility is settled and a usable runner is
+  // about to actually be dialed for the transfer -- see finding #5 above.
+  process.stderr.write(`lane: running on ${runner.name}\n`);
+
+  const dispatch = await dispatchRemote({
+    ...enriched.remote,
+    manifest,
+    runner,
+    argv: enriched.cmd,
+    lane: enriched.lane,
+    ticketId: enriched.id,
+    generation: 0,
+    onStdout,
+    onStderr,
+    abortSignal,
+  });
+
+  if (dispatch.outcome === 'confirmed') {
+    const endedAt = Date.now();
+    await publishAndExit(0, () => ({
+      id: enriched.id,
+      exit: dispatch.exitCode,
+      signal: null,
+      executor: 'remote',
+      runner: runner.name,
+      remoteKind: dispatch.result.kind,
+      startedAt: attemptStartedAt,
+      endedAt,
+      waitedMs: endedAt - enriched.createdAt || 0,
+    }));
+    return { fallback: false };
+  }
+
+  if (dispatch.outcome === 'cancelled') {
+    await publishAndExit(0, () => {
+      throw new Error('unreachable: dispatchRemote reported cancelled');
+    });
+    return { fallback: false };
+  }
+
+  // 'ineligible' or 'unconfirmed'
+  return fallbackOrRefuse(runner, dispatch.reason);
+}
+
 async function main() {
   const ticket = readTicketFromEnv();
   const root = ensureStateDirs().root;
@@ -316,12 +512,76 @@ async function main() {
   };
 
   let cancelledBeforeStart = false;
+  // BRAIN-319 T3b-2: the same SIGTERM/SIGINT this supervisor already reacts
+  // to (queued-cancel above, killGroup once running below) also aborts an
+  // in-flight remote dispatch, via this AbortController's signal -- no
+  // separate remote-specific cancel path.
+  const abortController = new AbortController();
+  // Codex pre-merge BLOCKER #1: a signal alone used to leave `cancelling`/
+  // `cancelledBeforeStart` as in-memory-only state -- nothing durable
+  // recorded that a cancellation was ACCEPTED. `publishTerminal`'s cancelled
+  // branch (and the queued-cancel check below) both decide purely from the
+  // marker, so a caller that signals the supervisor directly (never having
+  // gone through `lane cancel`, which already writes it) could have a child
+  // that exits 0 on TERM publish a plain green result. Writing the marker
+  // HERE, synchronously, in the same tick the signal is accepted, closes
+  // that gap for every cancellation source uniformly. These two listeners
+  // are never `process.off()`'d, so they stay registered (and keep firing,
+  // alongside `onCancelSignal` below once the local child exists) for this
+  // supervisor's ENTIRE lifetime -- the single, authoritative marker-write
+  // site regardless of which phase (remote-dispatch, queued, or a running
+  // local child) the cancellation actually lands in. `onCancelSignal`
+  // (below) deliberately does NOT duplicate this write.
   process.on('SIGTERM', () => {
     cancelledBeforeStart = true;
+    writeCancelMarkerFile(root, ticket.id);
+    abortController.abort();
   });
   process.on('SIGINT', () => {
     cancelledBeforeStart = true;
+    writeCancelMarkerFile(root, ticket.id);
+    abortController.abort();
   });
+
+  let attemptGeneration = null;
+  let fallbackReason;
+  if (ticket.remote) {
+    const outcome = await runRemoteAttempt(root, enriched, globalCfg, abortController.signal);
+    if (!outcome.fallback) return; // terminal outcome: runRemoteAttempt already called process.exit()
+    attemptGeneration = outcome.attemptGeneration;
+    fallbackReason = outcome.fallbackReason;
+  }
+
+  /**
+   * Codex pre-merge SHOULD-FIX #4: a post-fallback ticket cancelled while
+   * still QUEUED (never leased) used to just `process.exit(0)` at either of
+   * the two call sites below, leaving its attempt record neither published
+   * nor removed -- `lane wait` (which counts a live attempt record as
+   * "found") then polled forever. Both sites are reached only once the
+   * marker is already guaranteed durable (this supervisor's own signal
+   * handlers write it; `lane cancel`'s queued-dequeue branch already did
+   * too before either site can observe the dequeue), so `publishTerminal`'s
+   * own `isCancelled` check resolves this correctly on its own.
+   */
+  async function finalizeQueuedCancelAndExit() {
+    if (attemptGeneration !== null) {
+      await publishTerminal(root, ticket.id, attemptGeneration, () => {
+        const cancelledResult = { ...remoteCancelledResult(enriched.id, null), executor: 'local', fallbackReason };
+        atomicWriteJson(ticket.resultPath, cancelledResult);
+        appendHistory(root, {
+          id: ticket.id,
+          key: ticket.key,
+          repo: ticket.repoId,
+          lane: ticket.lane,
+          weight: ticket.weight,
+          resources: ticket.resources,
+          ...cancelledResult,
+        });
+      });
+    }
+    clearCancelRequest(root, ticket.id);
+    process.exit(0);
+  }
 
   await enqueue(root, enriched);
 
@@ -343,8 +603,7 @@ async function main() {
     if (!reloadFailed) clearConfigReloadWarning(root);
     if (cancelledBeforeStart || cancelRequested(root, ticket.id)) {
       dequeueSync(root, ticket.id);
-      clearCancelRequest(root, ticket.id);
-      process.exit(0);
+      await finalizeQueuedCancelAndExit();
     }
     // tryStart re-reads the config again inside its lock (BRAIN-182): the
     // outer reload above can be superseded by an edit that lands in the gap
@@ -363,9 +622,11 @@ async function main() {
     if (started.started) break;
     if (started.reason === 'not-head' && started.position === null) {
       // Our own ticket is no longer in the queue without ever having
-      // started: it was cancelled out from under us. Without this, a queued
-      // cancel leaves this supervisor polling forever.
-      process.exit(0);
+      // started: it was cancelled out from under us (by `lane cancel`,
+      // which dequeues + writes the marker itself before this is ever
+      // observed). Same finalize-through-publishTerminal fix as the
+      // cancelledBeforeStart branch above -- see finalizeQueuedCancelAndExit.
+      await finalizeQueuedCancelAndExit();
     }
     await sleep(globalCfg.sampleMs);
   }
@@ -415,9 +676,12 @@ async function main() {
       const observedMemory = child.pid ? observedGroupMemoryBytes(child.pid) : null;
       writeLease(root, applyHeartbeatObservation(lease, observed, Date.now(), observedMemory));
     }
+    // Codex pre-merge BLOCKER #1: the marker must survive until AFTER the
+    // terminal write below decides on it -- clearing it here (as this used
+    // to, the instant it was observed) let a child that exits 0 on TERM
+    // race ahead of `finalizeAndExit`'s own check and publish green.
     if (!cancelling && cancelRequested(root, ticket.id)) {
       cancelling = true;
-      clearCancelRequest(root, ticket.id);
       killPromise = killGroup(child.pid);
     }
   }, globalCfg.sampleMs);
@@ -445,17 +709,59 @@ async function main() {
     // reading would just wait out its own bounded timeout for nothing.
     if (stdoutForward) await stdoutForward.drain();
     if (stderrForward) await stderrForward.drain();
-    atomicWriteJson(ticket.resultPath, result);
-    appendHistory(root, {
-      id: ticket.id,
-      key: ticket.key,
-      repo: ticket.repoId,
-      lane: ticket.lane,
-      weight: ticket.weight,
-      resources: ticket.resources,
-      ...result,
-    });
-    removeLease(root, ticket.id); // release always comes last
+
+    // BRAIN-319 P2 (Codex re-review): `writeResult` only WRITES -- no
+    // `process.exit` in here. The old `writeAndExit` called `process.exit`
+    // from INSIDE the `publishTerminal` writer below, which runs inside ONE
+    // `withLock` transaction -- `process.exit()` terminates the process
+    // before that transaction's own `finally` (mutex release) ever runs, and
+    // before `publishTerminal` itself gets to `removeAttempt`. A completed
+    // fallback run then left both the global lock AND its attempt record
+    // stale, so a later `lane cancel` could "reconcile" an orphaned-looking
+    // attempt that was actually already done, and overwrite its result.
+    // Exactly the shape `publishAndExit` (above, in `runRemoteAttempt`)
+    // already gets right: write, let `publishTerminal` return (mutex
+    // released, attempt removed), THEN exit.
+    const writeResult = (finalResult) => {
+      atomicWriteJson(ticket.resultPath, finalResult);
+      appendHistory(root, {
+        id: ticket.id,
+        key: ticket.key,
+        repo: ticket.repoId,
+        lane: ticket.lane,
+        weight: ticket.weight,
+        resources: ticket.resources,
+        ...finalResult,
+      });
+      removeLease(root, ticket.id); // release always comes last
+      // Cleanup only, AFTER the terminal write above -- never before (BLOCKER #1).
+      clearCancelRequest(root, ticket.id);
+    };
+
+    // BRAIN-319 T3b-2: this ticket started life as a remote attempt that fell
+    // back to local (`attemptGeneration` non-null) -- go through the SAME
+    // one terminal writer every remote-side path uses, so a cancel racing
+    // this exact finish is decided the same way (C5), and the attempt
+    // record is removed once this local run's outcome is actually published.
+    if (attemptGeneration !== null) {
+      let finalExitCode = exitCode;
+      const published = await publishTerminal(root, ticket.id, attemptGeneration, ({ cancelled }) => {
+        if (cancelled) {
+          finalExitCode = 130;
+          writeResult(remoteCancelledResult(enriched.id, startedAt));
+        } else {
+          writeResult({ ...result, executor: 'local', fallbackReason });
+        }
+      });
+      if (published.ok) {
+        process.exit(finalExitCode);
+        return;
+      }
+      // Generation mismatch: unreachable today (this supervisor is the sole
+      // writer of its own attempt record past the fallback), but a real
+      // local result must never be silently dropped -- write it directly.
+    }
+    writeResult(result);
     process.exit(exitCode);
   }
 

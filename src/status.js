@@ -3,6 +3,7 @@ import path from 'node:path';
 import { ensureStateDirs, paths, withLock, bootId, readJsonSafe } from './state.js';
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
 import { listQueue, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState } from './scheduler.js';
+import { listAttempts, supervisorAlive } from './attempts.js';
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfig } from './config.js';
@@ -131,6 +132,25 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
     resources: leaseResources(t, cfg),
   }));
 
+  // BRAIN-319 T3b-4 (C4): an attempt still mid remote-dispatch (executor
+  // 'remote') is neither a lease nor a queue entry -- `used`/`reservedCpu
+  // Cores`/`reservedMemoryBytes` above are derived from `leases` alone, so
+  // a remote attempt intentionally never counts toward local capacity or
+  // resource reservations. An attempt that has already fallen back
+  // (executor 'local') is excluded here since it shows up as a normal
+  // queued/running entry instead once `enqueue()` runs (or, in the gap
+  // between fallback and that enqueue landing, as neither -- a narrow,
+  // accepted window no worse than any other ticket's own enqueue race).
+  const remote = listAttempts(root)
+    .filter((a) => a.executor === 'remote')
+    .map((a) => ({
+      id: a.id,
+      runner: a.runner,
+      phase: a.phase,
+      elapsedMs: a.startedAt ? now - a.startedAt : null,
+      orphaned: !supervisorAlive(a),
+    }));
+
   return {
     capacity: effectiveWeightCapacity(cfg, resourceCapacity.cpuCores),
     used: runningWeight,
@@ -176,6 +196,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
     memory: classifyMemorySample(readMemorySample()),
     running,
     queued,
+    remote,
     lockError,
   };
 }
@@ -314,6 +335,18 @@ export function renderStatusText(status) {
   } else {
     for (const q of status.queued) {
       lines.push(`  #${q.position} ${q.id}  key=${q.key}  waited=${fmtMs(q.waitedMs)}`);
+    }
+  }
+  if (status.remote) {
+    lines.push('');
+    lines.push('REMOTE:');
+    if (status.remote.length === 0) {
+      lines.push('  (none)');
+    } else {
+      for (const r of status.remote) {
+        const flag = r.orphaned ? `  [ORPHANED-REMOTE] — reconcile with: lane cancel ${r.id}` : '';
+        lines.push(`  ${r.id}  runner=${r.runner ?? '-'}  phase=${r.phase}  elapsed=${fmtMs(r.elapsedMs)}${flag}`);
+      }
     }
   }
   return lines.join('\n');

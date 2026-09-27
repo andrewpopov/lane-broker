@@ -134,6 +134,41 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isInteger(cfg.laneNice) && cfg.laneNice >= 0 && cfg.laneNice <= 19,
     `${sourcePath}: "laneNice" must be an integer in [0, 19]`,
   );
+  if (cfg.runners !== undefined) validateRunners(cfg.runners, sourcePath);
+}
+
+const RUNNER_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+
+/**
+ * BRAIN-319 T3a: `runners` is optional and absent by default, so a config
+ * written before this field exists still loads unchanged (I6). Each entry's
+ * `ssh` is a destination string handed to the ssh binary as its OWN argv
+ * element (never through a shell) -- rejecting a leading `-` here is the
+ * only line of defense against it being read as an ssh option instead of a
+ * destination.
+ */
+function validateRunners(runners, sourcePath) {
+  assert(Array.isArray(runners), `${sourcePath}: "runners" must be an array`);
+  const seenNames = new Set();
+  for (const runner of runners) {
+    assert(runner && typeof runner === 'object', `${sourcePath}: each "runners" entry must be an object`);
+    assert(
+      typeof runner.name === 'string' && RUNNER_NAME_RE.test(runner.name),
+      `${sourcePath}: runner "name" must match ${RUNNER_NAME_RE}`,
+    );
+    assert(!seenNames.has(runner.name), `${sourcePath}: duplicate runner name "${runner.name}"`);
+    seenNames.add(runner.name);
+    assert(
+      typeof runner.ssh === 'string' && runner.ssh.length > 0 && !runner.ssh.startsWith('-'),
+      `${sourcePath}: runner "${runner.name}".ssh must be a non-empty string not starting with "-"`,
+    );
+    if (runner.root !== undefined) {
+      assert(typeof runner.root === 'string' && runner.root.length > 0, `${sourcePath}: runner "${runner.name}".root must be a non-empty string`);
+    }
+    if (runner.shell !== undefined) {
+      assert(typeof runner.shell === 'string' && runner.shell.length > 0, `${sourcePath}: runner "${runner.name}".shell must be a non-empty string`);
+    }
+  }
 }
 
 function validateRepoConfig(cfg, sourcePath) {
@@ -164,12 +199,21 @@ function validateRepoConfig(cfg, sourcePath) {
         `${sourcePath}: lane "${name}".maxConcurrent must be an integer >= 1`,
       );
     }
+    if (lane.remote !== undefined) {
+      assert(typeof lane.remote === 'boolean', `${sourcePath}: lane "${name}".remote must be a boolean`);
+    }
   }
   if (cfg.conflicts !== undefined) {
     assert(Array.isArray(cfg.conflicts), `${sourcePath}: "conflicts" must be an array of pairs`);
     for (const pair of cfg.conflicts) {
       assert(Array.isArray(pair) && pair.length === 2, `${sourcePath}: each "conflicts" entry must be a 2-element array`);
     }
+  }
+  if (cfg.undeclaredLanes !== undefined) {
+    assert(
+      cfg.undeclaredLanes === 'allow' || cfg.undeclaredLanes === 'refuse',
+      `${sourcePath}: "undeclaredLanes" must be "allow" or "refuse"`,
+    );
   }
 }
 
@@ -301,9 +345,16 @@ export function repoIdentity(cwd) {
   return result;
 }
 
-/** Walk up from `cwd` looking for .lane-broker.json, stopping at the git common dir's worktree root. */
-export function findRepoConfigPath(cwd, gitCommonDir) {
-  const stopAt = gitCommonDir ? path.dirname(gitCommonDir) : null;
+/**
+ * Walk up from `cwd` looking for .lane-broker.json, stopping at `configRoot`
+ * when given (BRAIN-319: a `lane remote-exec` snapshot work dir has no
+ * `.git`, so the git-common-dir-derived stop point below is unavailable —
+ * without an explicit floor the walk would continue past the snapshot root
+ * into whatever happens to sit above it on the runner's filesystem), or
+ * otherwise at the git common dir's worktree root, same as before.
+ */
+export function findRepoConfigPath(cwd, gitCommonDir, configRoot) {
+  const stopAt = configRoot ? path.resolve(configRoot) : gitCommonDir ? path.dirname(gitCommonDir) : null;
   let dir = path.resolve(cwd);
   for (;;) {
     const candidate = path.join(dir, '.lane-broker.json');
@@ -315,9 +366,9 @@ export function findRepoConfigPath(cwd, gitCommonDir) {
   }
 }
 
-export function loadRepoConfig(cwd) {
+export function loadRepoConfig(cwd, configRoot) {
   const commonDir = repoIdentity(cwd);
-  const configPath = findRepoConfigPath(cwd, commonDir);
+  const configPath = findRepoConfigPath(cwd, commonDir, configRoot);
   if (!configPath) return { ...DEFAULT_REPO_CONFIG, declared: false };
   let parsed;
   try {
@@ -325,7 +376,13 @@ export function loadRepoConfig(cwd) {
   } catch (err) {
     throw new ConfigError(`${configPath}: invalid JSON (${err.message})`);
   }
-  const cfg = { version: 1, conflicts: [], ...parsed, lanes: { ...DEFAULT_REPO_CONFIG.lanes, ...(parsed.lanes || {}) } };
+  const cfg = {
+    version: 1,
+    conflicts: [],
+    undeclaredLanes: 'refuse',
+    ...parsed,
+    lanes: { ...DEFAULT_REPO_CONFIG.lanes, ...(parsed.lanes || {}) },
+  };
   validateRepoConfig(cfg, configPath);
   return { ...cfg, declared: true };
 }
@@ -354,21 +411,36 @@ export function expandConflicts(conflicts, laneNames) {
  * weight, whether this is a refused local sim, and the set of conflicting
  * fully-qualified keys within this repo.
  */
-export function resolveTicketConfig({ cwd, repo, lane }) {
-  const repoConfig = loadRepoConfig(cwd);
+export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityOverride }) {
+  const repoConfig = loadRepoConfig(cwd, configRoot);
   const commonDir = repoIdentity(cwd);
   // The git identity wins whenever it can be determined, so the same repo
   // always resolves to the same key regardless of whether --repo is passed
   // (or passed inconsistently across invocations); --repo is a fallback
   // label for cwds with no git identity to key on.
-  const repoId = sanitizeKey(commonDir || repo || cwd);
+  //
+  // BRAIN-319 T3 (C7): `repoIdentityOverride` pins the key to a caller-given
+  // identity unconditionally, bypassing git entirely -- needed once
+  // `lane remote-exec`'s snapshot work dir gets its OWN synthetic `.git`
+  // (so real consumers can run plain git commands against it): without
+  // this, `repoIdentity(cwd)` would find that synthetic repo and derive a
+  // key unique to THIS ticket's throwaway `.git`, breaking the invariant
+  // that the same repo+lane always maps to the same lease key.
+  const repoId = repoIdentityOverride ? sanitizeKey(repoIdentityOverride) : sanitizeKey(commonDir || repo || cwd);
   const laneName = lane || 'default';
-  if (repoConfig.declared && !Object.prototype.hasOwnProperty.call(repoConfig.lanes, laneName)) {
+  const isDeclaredLane = Object.prototype.hasOwnProperty.call(repoConfig.lanes, laneName);
+  if (repoConfig.declared && !isDeclaredLane && repoConfig.undeclaredLanes !== 'allow') {
     const declared = Object.keys(repoConfig.lanes).sort().join(', ');
     throw new ConfigError(`unknown lane "${laneName}"; declared: ${declared}`);
   }
   const laneCfg = repoConfig.lanes[laneName] || { weight: DEFAULT_REPO_CONFIG.lanes.default.weight };
-  const laneNames = Object.keys(repoConfig.lanes);
+  const declaredLaneNames = Object.keys(repoConfig.lanes);
+  // BRAIN-319 (undeclaredLanes: "allow"): an allowed undeclared lane resolves
+  // like the no-config-file case in every other respect, but a declared
+  // lane's `["*", "other"]` conflict must still reach it -- so it joins the
+  // conflict-expansion universe (never `repoConfig.lanes` itself, which
+  // stays declared-only) purely so `expandConflicts`'s `*` wildcard sees it.
+  const laneNames = isDeclaredLane ? declaredLaneNames : [...declaredLaneNames, laneName];
   const adj = expandConflicts(repoConfig.conflicts || [], laneNames);
   const conflictingLaneNames = adj.has(laneName) ? [...adj.get(laneName)] : [];
   const key = `${repoId}:${sanitizeKey(laneName)}`;
@@ -392,5 +464,8 @@ export function resolveTicketConfig({ cwd, repo, lane }) {
     // equivalent of `laneNice` to fall back to.
     maxConcurrent: Number.isInteger(laneCfg.maxConcurrent) ? laneCfg.maxConcurrent : 1,
     conflicts,
+    // BRAIN-319 T3a: opt-in per lane, defaulted false so a repo config
+    // written before this field exists resolves identically (I6).
+    remote: laneCfg.remote === true,
   };
 }

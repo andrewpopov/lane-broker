@@ -1,0 +1,417 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor, sleep } from './helpers.js';
+import { tmpDir, makeFakeSshBin, makeRunner, clientEnv, makeGitWorktree, makeDispatchArgs } from './remote-harness.js';
+import { shellQuote, buildRemoteCommand, selectRunner, dispatchRemote, isGreen } from '../src/remote-client.js';
+
+// ---- end-to-end dispatch: happy path ----
+
+test('dispatchRemote: a completed exit 0 is confirmed, streaming stdout through the callback', async () => {
+  const { binDir, sshBin } = makeFakeSshBin();
+  const { env } = clientEnv(binDir);
+  const src = makeGitWorktree({ 'a.txt': 'hello' });
+  const runner = makeRunner({ ssh: 'normal', root: tmpDir('remote-exec-root') });
+  let stdout = '';
+
+  const result = await dispatchRemote({
+    ...makeDispatchArgs({ argv: [process.execPath, '-e', "process.stdout.write('hi-from-remote\\n')"] }),
+    runner,
+    worktreeRoot: src,
+    sshBin,
+    env,
+    onStdout: (d) => {
+      stdout += d;
+    },
+  });
+
+  assert.equal(result.outcome, 'confirmed');
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.result.kind, 'completed');
+  assert.match(stdout, /hi-from-remote/);
+});
+
+for (const exitCode of [1, 42, 255]) {
+  test(`dispatchRemote: a child exiting ${exitCode} is confirmed with that exact exitCode`, async () => {
+    const { binDir, sshBin } = makeFakeSshBin();
+    const { env } = clientEnv(binDir);
+    const src = makeGitWorktree({ 'a.txt': 'hello' });
+    const runner = makeRunner({ ssh: 'normal', root: tmpDir('remote-exec-root') });
+
+    const result = await dispatchRemote({
+      ...makeDispatchArgs({ argv: [process.execPath, '-e', `process.exit(${exitCode})`] }),
+      runner,
+      worktreeRoot: src,
+      sshBin,
+      env,
+    });
+
+    assert.equal(result.outcome, 'confirmed');
+    assert.equal(result.exitCode, exitCode);
+  });
+}
+
+test('dispatchRemote: an undeclared lane in the snapshot\'s own .lane-broker.json is confirmed with the refusal exit 64', async () => {
+  const { binDir, sshBin } = makeFakeSshBin();
+  const { env } = clientEnv(binDir);
+  const src = makeGitWorktree({
+    '.lane-broker.json': JSON.stringify({ version: 1, lanes: { default: { weight: 1 } } }),
+  });
+  const runner = makeRunner({ ssh: 'normal', root: tmpDir('remote-exec-root') });
+
+  const result = await dispatchRemote({
+    ...makeDispatchArgs({ lane: 'no-such-lane' }),
+    runner,
+    worktreeRoot: src,
+    sshBin,
+    env,
+  });
+
+  assert.equal(result.outcome, 'confirmed');
+  assert.equal(result.exitCode, 64);
+  assert.equal(result.result.kind, 'refused');
+});
+
+test('dispatchRemote: relCwd is honoured end to end', async () => {
+  const { binDir, sshBin } = makeFakeSshBin();
+  const { env } = clientEnv(binDir);
+  const src = makeGitWorktree({ 'sub/.keep': 'x' });
+  const runner = makeRunner({ ssh: 'normal', root: tmpDir('remote-exec-root') });
+  let stdout = '';
+
+  const result = await dispatchRemote({
+    ...makeDispatchArgs({
+      relCwd: 'sub',
+      argv: [process.execPath, '-e', 'process.stdout.write(require("path").basename(process.cwd()))'],
+    }),
+    runner,
+    worktreeRoot: src,
+    sshBin,
+    env,
+    onStdout: (d) => {
+      stdout += d;
+    },
+  });
+
+  assert.equal(result.outcome, 'confirmed');
+  assert.equal(result.exitCode, 0);
+  assert.equal(stdout, 'sub');
+});
+
+// ---- ineligible: nothing spawned ----
+
+test('dispatchRemote: a tracked .env is ineligible, and nothing is spawned', async () => {
+  const { binDir, sshBin } = makeFakeSshBin();
+  const { env } = clientEnv(binDir);
+  const src = makeGitWorktree({ '.env': 'SECRET=1', 'a.txt': 'hello' });
+  // A destination that would hang forever if anything were actually dialed --
+  // proves nothing was spawned, rather than merely that it failed fast.
+  const runner = makeRunner({ ssh: 'must-not-be-dialed', root: tmpDir('remote-exec-root') });
+
+  const before = Date.now();
+  const result = await dispatchRemote({
+    ...makeDispatchArgs(),
+    runner,
+    worktreeRoot: src,
+    sshBin,
+    env,
+    deadlines: { transferMs: 30_000 },
+  });
+  const elapsedMs = Date.now() - before;
+
+  assert.equal(result.outcome, 'ineligible');
+  assert.match(result.reason, /denylisted secret path/);
+  assert.ok(elapsedMs < 5000, `should return immediately, took ${elapsedMs}ms`);
+});
+
+// ---- adversarial transport ----
+
+test('dispatchRemote: ssh dying mid-transfer (die-midstream) is unconfirmed', async () => {
+  const { binDir, sshBin } = makeFakeSshBin();
+  const { env } = clientEnv(binDir);
+  const src = makeGitWorktree({ 'a.txt': 'hello'.repeat(1000), 'b.txt': 'world'.repeat(1000) });
+  const runner = makeRunner({ ssh: 'die-midstream', root: tmpDir('remote-exec-root') });
+
+  const result = await dispatchRemote({
+    ...makeDispatchArgs(),
+    runner,
+    worktreeRoot: src,
+    sshBin,
+    env,
+    deadlines: { transferMs: 10_000, resultMs: 5000, resultAttempts: 2 },
+  });
+
+  assert.equal(result.outcome, 'unconfirmed');
+});
+
+test('dispatchRemote: a runner returning a result with the wrong manifestHash (result-tamper) is unconfirmed', async () => {
+  const { binDir, sshBin } = makeFakeSshBin();
+  const { env } = clientEnv(binDir);
+  const src = makeGitWorktree({ 'a.txt': 'hello' });
+  const runner = makeRunner({ ssh: 'result-tamper', root: tmpDir('remote-exec-root') });
+
+  const result = await dispatchRemote({
+    ...makeDispatchArgs(),
+    runner,
+    worktreeRoot: src,
+    sshBin,
+    env,
+    deadlines: { resultMs: 5000, resultAttempts: 2 },
+  });
+
+  assert.equal(result.outcome, 'unconfirmed');
+  assert.match(result.reason, /did not bind/);
+});
+
+// ---- cancellation ----
+
+test('dispatchRemote: abort during a sleeping remote child resolves cancelled, and the ticket\'s own result kind becomes cancelled', async () => {
+  const { binDir, sshBin } = makeFakeSshBin();
+  const { env } = clientEnv(binDir);
+  const src = makeGitWorktree({ 'a.txt': 'hello' });
+  const root = tmpDir('remote-exec-root');
+  const runner = makeRunner({ ssh: 'normal', root });
+  const ticketId = crypto.randomUUID();
+  const controller = new AbortController();
+
+  const dispatchPromise = dispatchRemote({
+    ...makeDispatchArgs({ ticketId, argv: [process.execPath, '-e', 'setInterval(() => {}, 1000)'] }),
+    runner,
+    worktreeRoot: src,
+    sshBin,
+    env,
+    abortSignal: controller.signal,
+  });
+
+  // Wait until the remote ticket directory exists (extraction has started/finished) before
+  // firing the abort, so this exercises "cancel a run actually in flight", not a race with dial.
+  await waitFor(() => fs.existsSync(path.join(root, 'tickets', ticketId)), { timeoutMs: 15_000 });
+  await sleep(300);
+  controller.abort();
+
+  const result = await dispatchPromise;
+  assert.equal(result.outcome, 'cancelled');
+
+  const final = await waitFor(
+    async () => {
+      const { stdout } = await laneRun(['remote-result', ticketId, '--root', root], { env });
+      const parsed = JSON.parse(stdout.trim());
+      return parsed.kind === 'cancelled' ? parsed : null;
+    },
+    { timeoutMs: 15_000 },
+  );
+  assert.equal(final.kind, 'cancelled');
+});
+
+// ---- BRAIN-319 review finding #3: an encode error must not hang dispatch ----
+
+test('dispatchRemote: a file changed between manifest and encode resolves unconfirmed within a bound (never hangs)', async () => {
+  const { binDir, sshBin } = makeFakeSshBin();
+  const { env } = clientEnv(binDir);
+  const src = makeGitWorktree({ 'a.txt': 'aaaa' });
+  const runner = makeRunner({ ssh: 'normal', root: tmpDir('remote-exec-root') });
+
+  const dispatchPromise = dispatchRemote({
+    ...makeDispatchArgs(),
+    runner,
+    worktreeRoot: src,
+    sshBin,
+    env,
+    deadlines: { transferMs: 5000, resultMs: 2000, resultAttempts: 1 },
+  });
+  // dispatchRemote runs synchronously (buildManifest included) up to its first await, so by
+  // the time this statement runs the manifest has already been built from the ORIGINAL
+  // content; the encode generator hasn't read the file yet (it only does so once the stream
+  // is actually pumped, on a later tick). Mutating here reproduces "changed between manifest
+  // and encode" deterministically, without a fragile timing race.
+  fs.writeFileSync(path.join(src, 'a.txt'), 'bbbb');
+
+  const result = await Promise.race([
+    dispatchPromise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('dispatchRemote hung past 15s bound')), 15_000)),
+  ]);
+
+  assert.equal(result.outcome, 'unconfirmed');
+  assert.match(result.reason, /changed content|snapshot stream error/);
+});
+
+// ---- selectRunner ----
+
+test('selectRunner: sequential order, skips an unreachable runner and picks the next usable one', async () => {
+  const { binDir, sshBin } = makeFakeSshBin();
+  const { env } = clientEnv(binDir);
+  const runners = [makeRunner({ ssh: 'down' }), makeRunner({ ssh: 'normal', name: 'second' })];
+
+  const { runner, skipped } = await selectRunner(runners, { sshBin, env, deadlineMs: 3000 });
+
+  assert.equal(runner.name, 'second');
+  assert.equal(skipped.length, 1);
+  assert.equal(skipped[0].name, runners[0].name);
+});
+
+test('selectRunner: a paused runner is skipped', async () => {
+  const { binDir, sshBin } = makeFakeSshBin();
+  const { env } = clientEnv(binDir);
+  await laneRun(['pause', 'maintenance'], { env });
+  const runners = [makeRunner({ ssh: 'normal' })];
+
+  const { runner, skipped } = await selectRunner(runners, { sshBin, env, deadlineMs: 3000 });
+
+  assert.equal(runner, null);
+  assert.equal(skipped.length, 1);
+  assert.match(skipped[0].reason, /paused/);
+});
+
+test('selectRunner: a runner with a queued ticket is skipped', async () => {
+  const { binDir, sshBin } = makeFakeSshBin();
+  const { home, state, env } = freshEnv();
+  const globalConfig = { version: 1, capacity: 1, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 };
+  writeGlobalConfig(home, globalConfig);
+  const repoDir = tmpDir('remote-client-queue-repo');
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
+  const clientPath = { env: { ...env, PATH: `${binDir}${path.delimiter}${env.PATH}` } };
+
+  // Occupy the only capacity slot so a second ticket is stuck queued, same
+  // pattern as tests/queued-cancel.test.js.
+  const STARTUP_TIMEOUT_MS = Math.max(60_000, 30 * globalConfig.sampleMs);
+  const blockerPromise = laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'sleep', '5'], { env: clientPath.env, cwd: repoDir });
+  await waitFor(
+    () => {
+      try {
+        return fs.readdirSync(path.join(state, 'leases')).filter((n) => n.endsWith('.json')).length > 0;
+      } catch {
+        return false;
+      }
+    },
+    { timeoutMs: STARTUP_TIMEOUT_MS },
+  );
+  const queuedPromise = laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'true'], { env: clientPath.env, cwd: repoDir });
+  await waitFor(
+    () => {
+      try {
+        return fs.readdirSync(path.join(state, 'queue')).length > 0;
+      } catch {
+        return false;
+      }
+    },
+    { timeoutMs: STARTUP_TIMEOUT_MS },
+  );
+
+  const runners = [makeRunner({ ssh: 'normal' })];
+  const { runner, skipped } = await selectRunner(runners, { sshBin, env: clientPath.env, deadlineMs: 3000 });
+
+  assert.equal(runner, null);
+  assert.ok(skipped.length >= 1);
+  assert.match(skipped[0].reason, /queued/);
+
+  await Promise.all([blockerPromise, queuedPromise]);
+});
+
+test('selectRunner: a protocol-2 runner is skipped', async () => {
+  const { binDir } = makeFakeSshBin();
+  // A second fake ssh whose "normal" path answers remote-probe honestly is not enough here --
+  // build a bespoke fake ssh that always answers protocol 2 regardless of subcommand.
+  const sshBin = path.join(binDir, 'ssh-protocol-mismatch');
+  fs.writeFileSync(
+    sshBin,
+    `#!/usr/bin/env node
+process.stdout.write(JSON.stringify({ protocol: 2, version: '0.0.0', paused: false, queued: 0, running: 0 }) + '\\n');
+process.exit(0);
+`,
+  );
+  fs.chmodSync(sshBin, 0o755);
+  const { env } = clientEnv(binDir);
+  const runners = [makeRunner({ ssh: 'normal' })];
+
+  const { runner, skipped } = await selectRunner(runners, { sshBin, env, deadlineMs: 3000 });
+
+  assert.equal(runner, null);
+  assert.match(skipped[0].reason, /protocol/);
+});
+
+test('selectRunner: none usable returns {runner:null, skipped:[...]}', async () => {
+  const { binDir, sshBin } = makeFakeSshBin();
+  const { env } = clientEnv(binDir);
+  const runners = [makeRunner({ ssh: 'down' }), makeRunner({ ssh: 'down', name: 'second' })];
+
+  const { runner, skipped } = await selectRunner(runners, { sshBin, env, deadlineMs: 3000 });
+
+  assert.equal(runner, null);
+  assert.equal(skipped.length, 2);
+});
+
+// ---- shellQuote ----
+
+test('shellQuote round-trips spaces, quotes, $, backticks and newlines through a real shell', () => {
+  const cases = [
+    'plain',
+    'has spaces',
+    `has "double" quotes`,
+    `has 'single' quotes`,
+    'has $DOLLAR and $(command)',
+    'has `backticks`',
+    'has\nnewlines\nin it',
+    "mix: $ ` ' \" \n end",
+  ];
+  for (const value of cases) {
+    const out = execFileSync('sh', ['-c', `printf '%s' ${shellQuote(value)}`], { encoding: 'utf8' });
+    assert.equal(out, value, `round-trip failed for ${JSON.stringify(value)}`);
+  }
+});
+
+test('dispatchRemote: weird argv (spaces/quotes/$/backticks/newlines) reaches the remote child byte-identical', async () => {
+  const { binDir, sshBin } = makeFakeSshBin();
+  const { env } = clientEnv(binDir);
+  const src = makeGitWorktree({ 'a.txt': 'hello' });
+  const runner = makeRunner({ ssh: 'normal', root: tmpDir('remote-exec-root') });
+  const weird = ['has spaces', 'has "double"', "has 'single'", 'has $DOLLAR', 'has `backtick`', 'has\nnewline'];
+
+  let stdout = '';
+  const result = await dispatchRemote({
+    ...makeDispatchArgs({
+      argv: [process.execPath, '-e', 'process.stdout.write(JSON.stringify(process.argv.slice(1)))', ...weird],
+    }),
+    runner,
+    worktreeRoot: src,
+    sshBin,
+    env,
+    onStdout: (d) => {
+      stdout += d;
+    },
+  });
+
+  assert.equal(result.outcome, 'confirmed');
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(JSON.parse(stdout), weird);
+});
+
+// ---- buildRemoteCommand ----
+
+test('buildRemoteCommand includes --root only when the runner configures one', () => {
+  const withoutRoot = buildRemoteCommand({ name: 'r', ssh: 'r' }, 'remote-probe');
+  assert.doesNotMatch(withoutRoot, /--root/);
+  const withRoot = buildRemoteCommand({ name: 'r', ssh: 'r', root: '/srv/lane-broker/remote' }, 'remote-result', ['abc']);
+  assert.match(withRoot, /--root/);
+  assert.match(withRoot, /\/srv\/lane-broker\/remote/);
+});
+
+// ---- isGreen ----
+
+test('isGreen: true only for a bound, completed, unsignalled, exact zero exit', () => {
+  const expected = { ticketId: 't1', generation: 0, manifestHash: 'h1' };
+  const green = { protocol: 1, ticketId: 't1', generation: 0, manifestHash: 'h1', kind: 'completed', exit: 0, signal: null };
+  assert.equal(isGreen(green, expected), true);
+
+  assert.equal(isGreen({ ...green, exit: 1 }, expected), false, 'nonzero exit');
+  assert.equal(isGreen({ ...green, signal: 'SIGTERM' }, expected), false, 'signalled');
+  assert.equal(isGreen({ ...green, kind: 'refused' }, expected), false, 'wrong kind');
+  assert.equal(isGreen({ ...green, ticketId: 'other' }, expected), false, 'ticketId mismatch');
+  assert.equal(isGreen({ ...green, generation: 1 }, expected), false, 'generation mismatch');
+  assert.equal(isGreen({ ...green, manifestHash: 'other' }, expected), false, 'manifestHash mismatch');
+  assert.equal(isGreen({ ...green, protocol: 2 }, expected), false, 'protocol mismatch');
+  assert.equal(isGreen({ ...green, exit: '0' }, expected), false, 'non-integer exit');
+  assert.equal(isGreen(null, expected), false, 'null result');
+});

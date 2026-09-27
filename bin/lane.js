@@ -5,11 +5,18 @@ import { cancelCommand } from '../src/cancel.js';
 import { waitCommand } from '../src/wait.js';
 import { pauseCommand, resumeCommand } from '../src/pause.js';
 import { parseByteSize } from '../src/resources.js';
+import {
+  remoteExecCommand,
+  remoteProbeCommand,
+  remoteResultCommand,
+  remoteCancelCommand,
+  defaultRemoteRoot,
+} from '../src/remote-runner.js';
 
 function usage() {
   return `Usage:
   lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--detach]
-           [--timeout <duration>] [--allow-local-sim] [--log <path>] -- <command...>
+           [--timeout <duration>] [--allow-local-sim] [--local] [--log <path>] -- <command...>
   lane status [--json]
   lane cancel <id>
   lane wait <id> [--timeout <duration>]
@@ -64,6 +71,10 @@ function parseRunArgs(args) {
       case '--allow-local-sim':
         opts.allowLocalSim = true;
         break;
+      // BRAIN-319 T3b-1: forces a remote-eligible lane to run locally.
+      case '--local':
+        opts.local = true;
+        break;
       case '--log':
         opts.log = flagArgs[++i];
         break;
@@ -72,6 +83,12 @@ function parseRunArgs(args) {
     }
   }
   return { opts, cmd };
+}
+
+/** BRAIN-319 T2 hidden remote-* subcommands: `--root <dir>` only. */
+function parseRootFlag(args) {
+  const idx = args.indexOf('--root');
+  return idx === -1 ? undefined : args[idx + 1];
 }
 
 function parseDurationMs(spec) {
@@ -110,6 +127,7 @@ async function main() {
         detach: opts.detach,
         timeoutMs: opts.timeout ? parseDurationMs(opts.timeout) : undefined,
         allowLocalSim: opts.allowLocalSim,
+        local: opts.local,
         log: opts.log,
         cmd,
       });
@@ -147,6 +165,37 @@ async function main() {
     }
     case 'resume': {
       const result = await resumeCommand();
+      return result.exitCode;
+    }
+    // BRAIN-319 T2: hidden runner-side subcommands, invoked by a client Mac
+    // over ssh — deliberately not listed in usage() above.
+    case 'remote-probe': {
+      const result = await remoteProbeCommand();
+      return result.exitCode;
+    }
+    case 'remote-exec': {
+      const root = parseRootFlag(rest) || defaultRemoteRoot();
+      const result = await remoteExecCommand({ root });
+      return result.exitCode;
+    }
+    case 'remote-result': {
+      const id = rest[0];
+      if (!id) {
+        process.stderr.write('lane remote-result: missing <ticketId>\n');
+        return 2;
+      }
+      const root = parseRootFlag(rest.slice(1)) || defaultRemoteRoot();
+      const result = await remoteResultCommand(id, { root });
+      return result.exitCode;
+    }
+    case 'remote-cancel': {
+      const id = rest[0];
+      if (!id) {
+        process.stderr.write('lane remote-cancel: missing <ticketId>\n');
+        return 2;
+      }
+      const root = parseRootFlag(rest.slice(1)) || defaultRemoteRoot();
+      const result = await remoteCancelCommand(id, { root });
       return result.exitCode;
     }
     default:

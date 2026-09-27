@@ -1,13 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { ensureStateDirs, paths, readJsonSafe } from './state.js';
 import { resolveTicketConfig, reloadGlobalConfig, ConfigError } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
-import { detectResourceCapacity, leaseResources, resolveTicketResources } from './resources.js';
+import { detectResourceCapacity, leaseResources, resolveTicketResources, checkResourceBudget } from './resources.js';
+import { scrubbedGitEnv } from './remote-manifest.js';
 
 const supervisorPath = fileURLToPath(new URL('./supervisor.js', import.meta.url));
 
@@ -39,6 +40,27 @@ function waitForStreamEnd(stream, timeoutMs = 2000) {
     stream.once('close', done);
     stream.once('error', done);
   });
+}
+
+/**
+ * `git rev-parse --show-toplevel` under the same git-env scrub `remote-
+ * manifest.js` uses (BRAIN-319: never let a hook's exported GIT_DIR/etc leak
+ * into this). Returns null (never throws) on any failure -- a caller that
+ * cannot resolve a worktree root for a remote-eligible lane must fall back
+ * to running locally, not crash the run.
+ */
+function resolveWorktreeRoot(cwd) {
+  try {
+    return execFileSync('git', ['rev-parse', '--show-toplevel'], {
+      cwd,
+      encoding: 'utf8',
+      env: scrubbedGitEnv(),
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 5000,
+    }).trim();
+  } catch {
+    return null;
+  }
 }
 
 function fmtAgo(ms) {
@@ -116,10 +138,32 @@ export async function runCommand({
   detach,
   timeoutMs,
   allowLocalSim,
+  // BRAIN-319 T3b-1: force this run local even when the lane opts into
+  // `remote: true` and runners are configured. Mirrored by the
+  // LANE_BROKER_LOCAL=1 env var below (bin/lane.js's `--local` flag sets
+  // this option; the env var lets a nested/scripted caller force it too).
+  local,
   cwd = process.cwd(),
   cmd,
   log,
   spawnSupervisor = spawn,
+  // BRAIN-319 (`lane remote-exec`): resolve `.lane-broker.json` from a
+  // gitless snapshot work dir without walking above it — see
+  // findRepoConfigPath's own doc comment in config.js.
+  configRoot,
+  // BRAIN-319 T3 (C7): pin the resolved lease key's repo identity to this
+  // exact value regardless of what `.git` may exist under `cwd` — see
+  // resolveTicketConfig's own doc comment in config.js.
+  repoIdentityOverride,
+  // BRAIN-319: let a caller that already generated and durably recorded a
+  // ticket id (`lane remote-exec`'s remote-id file, written before the
+  // child can start) use that same id here, instead of one generated fresh
+  // inside this function that the caller could never have learned in time.
+  idOverride,
+  // BRAIN-319: called with the ticket id as soon as it exists (before the
+  // supervisor is spawned, so before any child can start). Returning
+  // `false` aborts the run without ever spawning the supervisor.
+  onTicketCreated,
 }) {
   if (!cmd || cmd.length === 0) {
     process.stderr.write('lane run: no command given (pass it after --)\n');
@@ -128,7 +172,7 @@ export async function runCommand({
 
   let resolved;
   try {
-    resolved = resolveTicketConfig({ cwd, repo, lane });
+    resolved = resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityOverride });
   } catch (err) {
     if (err instanceof ConfigError) {
       process.stderr.write(`lane run: ${err.message}\n`);
@@ -142,6 +186,25 @@ export async function runCommand({
   // reloadGlobalConfig gives the supervisor's own polling loop.
   const globalCfg = reloadGlobalConfig(undefined);
   const nice = resolved.nice ?? globalCfg.laneNice;
+  // BRAIN-319 T3b-1: eligible for the supervisor to attempt a remote runner
+  // for -- the supervisor itself does not act on this yet (T3b-2). A nested
+  // run (LANE_BROKER_LEASE inherited) never goes remote regardless of the
+  // lane/config, since it either reuses the ancestor's lease below or is
+  // itself the remote-exec child of an already-remote run (I5: a runner
+  // never re-dispatches).
+  const remoteWanted =
+    resolved.remote === true &&
+    Array.isArray(globalCfg.runners) &&
+    globalCfg.runners.length > 0 &&
+    !local &&
+    process.env.LANE_BROKER_LOCAL !== '1' &&
+    !process.env.LANE_BROKER_LEASE;
+  // Resolved eagerly (not deferred to ticket construction) so the
+  // resource-budget skip below and the ticket payload agree on the exact
+  // same eligibility -- a worktree root that fails to resolve must also
+  // re-enable the local budget check, not just omit `ticket.remote`.
+  const remoteWorktreeRoot = remoteWanted ? resolveWorktreeRoot(cwd) : null;
+  const remoteEligible = remoteWanted && remoteWorktreeRoot !== null;
   const resources = resolveTicketResources({
     weight,
     cpuCores: cpuOverride ?? resolved.cpuCores,
@@ -212,26 +275,28 @@ export async function runCommand({
   // never fit even on an otherwise idle machine instead of leaving a
   // permanent FIFO head polling forever. Reentrant runs returned above and
   // consume no additional machine reservation.
+  //
+  // BRAIN-319 T3b-1: skipped here when remoteEligible -- a runner may be
+  // larger than this machine, so the local budget is not yet the right
+  // refusal to make. The supervisor (T3b-2) re-applies this exact check via
+  // `checkResourceBudget` if the run ends up falling back to local.
   const host = detectResourceCapacity();
-  const cpuBudget = Math.max(
-    0,
-    Math.min(host.cpuCores - globalCfg.cpuReserveCores, (globalCfg.cpuAdmissionPercent / 100) * host.cpuCores),
-  );
-  const memoryBudget = Math.max(0, host.memoryBytes - globalCfg.memoryReserveBytes);
-  if (
-    globalCfg.schedulerMode === 'active' &&
-    (resources.cpuCores > cpuBudget || resources.memoryBytes > memoryBudget)
-  ) {
-    process.stderr.write(
-      `lane run: requested resources exceed this environment's budget (` +
-        `${resources.cpuCores}/${cpuBudget.toFixed(2)} CPU cores, ` +
-        `${resources.memoryBytes}/${memoryBudget} memory bytes).\n`,
-    );
-    return { exitCode: 64 };
+  if (!remoteEligible) {
+    const budget = checkResourceBudget({ resources, globalCfg, host });
+    if (!budget.ok) {
+      process.stderr.write(budget.message);
+      return { exitCode: budget.exitCode };
+    }
   }
 
   const root = ensureStateDirs().root;
-  const id = crypto.randomUUID();
+  const id = idOverride || crypto.randomUUID();
+  if (onTicketCreated) {
+    const proceed = await onTicketCreated(id);
+    if (proceed === false) {
+      return { exitCode: 130 };
+    }
+  }
   const p = paths(root);
   const logPath = log || path.join(p.logs, `${id}.log`);
   const resultPath = path.join(p.results, `${id}.json`);
@@ -256,6 +321,42 @@ export async function runCommand({
     // supervisor, which never even inherits it (stdio stays 'ignore' below).
     forwardOutput: !detach,
   };
+
+  // BRAIN-319 T3b-1: when eligible, hand the supervisor everything it needs
+  // to attempt a remote runner without re-resolving config itself --
+  // `worktreeRoot`/`repoKey` in particular must be exactly what this process
+  // resolved, not re-derived later against a possibly different cwd.
+  // `repoKey` is `resolved.repoId` (config.js): the realpath'd git COMMON
+  // dir, which is shared by every worktree of one repo, so the same repo
+  // maps to the same key regardless of which worktree dispatched it --
+  // `worktreeRoot` stays this specific checkout (what actually gets
+  // snapshotted). If the worktree root can't be resolved, this run is not
+  // remote-eligible after all: fall through with no `remote` key, exactly
+  // today's ticket shape (I6).
+  //
+  // The supervisor does not act on this field yet -- it always runs the
+  // ticket locally regardless of `runners`/`ticket.remote` until T3b-2 wires
+  // the remote-dispatch/fallback executor.
+  if (remoteEligible) {
+    // `remoteWorktreeRoot` is git's own realpath'd toplevel; resolve `cwd`
+    // the same way before diffing them, or a symlinked tmp/mount point
+    // (e.g. macOS /var -> /private/var) makes an in-root cwd look like it
+    // sits many directories outside the root it's actually inside.
+    let resolvedCwd;
+    try {
+      resolvedCwd = fs.realpathSync(cwd);
+    } catch {
+      resolvedCwd = path.resolve(cwd);
+    }
+    ticket.remote = {
+      worktreeRoot: remoteWorktreeRoot,
+      relCwd: path.relative(remoteWorktreeRoot, resolvedCwd) || '',
+      repoKey: resolved.repoId,
+      weight,
+      cpuCores: resources.cpuCores,
+      memoryBytes: resources.memoryBytes,
+    };
+  }
 
   // Create the log file at registration, before the supervisor is spawned,
   // so `--log <path>` exists the instant the id is printed rather than

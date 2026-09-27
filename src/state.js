@@ -31,12 +31,39 @@ export function paths(root = stateHome()) {
     // block reasons interfere with each other's allowance).
     capacitySkipState: path.join(root, 'capacity-skip-state.json'),
     seq: path.join(root, 'seq'),
+    // BRAIN-319 T3b-2 (C3): one durable attempt record per remote-eligible
+    // ticket, keyed by ticket id -- see src/attempts.js.
+    attempts: path.join(root, 'attempts'),
   };
+}
+
+/** Deterministic path of a ticket's cancel marker: one file per id under
+ *  `paths(root).cancel`. Single source of truth for the naming convention
+ *  `cancel.js` (write), `attempts.js` and `supervisor.js` (read) all share. */
+export function cancelMarkerPath(root, id) {
+  return path.join(paths(root).cancel, id);
+}
+
+/** Does a cancel marker exist for `id`? Existence-only -- its contents (a
+ *  timestamp, written by `cancel.js`) are never read by any consumer. */
+export function isCancelled(root, id) {
+  return fs.existsSync(cancelMarkerPath(root, id));
+}
+
+/** Write the cancel marker for `id`, durably and idempotently. Single writer
+ *  used by every "we have accepted a cancellation" site (`cancel.js`'s
+ *  `lane cancel`, `wait.js`'s Ctrl-C forwarding, `supervisor.js`'s own
+ *  signal handlers) -- BRAIN-319 T3b-5: a cancellation a caller has already
+ *  decided to honour must be recorded BEFORE anything else happens, so a
+ *  later `publishTerminal`/`isCancelled` check can never miss it. */
+export function writeCancelMarkerFile(root, id) {
+  fs.mkdirSync(paths(root).cancel, { recursive: true });
+  atomicWriteFile(cancelMarkerPath(root, id), String(Date.now()));
 }
 
 export function ensureStateDirs(root = stateHome()) {
   const p = paths(root);
-  for (const dir of [p.root, p.leases, p.queue, p.logs, p.results, p.cancel]) {
+  for (const dir of [p.root, p.leases, p.queue, p.logs, p.results, p.cancel, p.attempts]) {
     fs.mkdirSync(dir, { recursive: true });
   }
   return p;
