@@ -103,6 +103,15 @@ function exitNow(code) {
   process.exit(code);
 }
 
+if (destination === 'old-runner' && commandString && commandString.includes('remote-probe')) {
+  // BRAIN-320 S1c (1d): simulate a pre-S1a runner (0.6.0) whose remote-probe
+  // response has no 'protocols' field at all -- the client must skip it for
+  // a protocol-2-needing lane, but still use it for an optionless (protocol
+  // 1) lane, exactly as it did before 'protocols' existed.
+  process.stdout.write(JSON.stringify({ protocol: 1, paused: false, queued: 0, running: 0, version: '0.6.0', capacity: {} }) + '\\n');
+  exitNow(0);
+}
+
 if (destination === 'down') {
   exitNow(255);
 }

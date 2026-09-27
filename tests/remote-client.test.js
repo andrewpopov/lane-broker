@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor, sleep } from './helpers.js';
 import { tmpDir, makeFakeSshBin, makeRunner, clientEnv, makeGitWorktree, makeDispatchArgs } from './remote-harness.js';
-import { shellQuote, buildRemoteCommand, selectRunner, dispatchRemote, isGreen } from '../src/remote-client.js';
+import { shellQuote, buildRemoteCommand, selectRunner, dispatchRemote, isGreen, needsProtocol2, classifyRemoteResult } from '../src/remote-client.js';
 
 // ---- end-to-end dispatch: happy path ----
 
@@ -515,8 +515,8 @@ test('buildRemoteCommand includes --root only when the runner configures one', (
 
 // ---- isGreen ----
 
-test('isGreen: true only for a bound, completed, unsignalled, exact zero exit', () => {
-  const expected = { ticketId: 't1', generation: 0, manifestHash: 'h1' };
+test('isGreen: true only for a bound, completed, unsignalled, exact zero exit (protocol 1)', () => {
+  const expected = { protocol: 1, ticketId: 't1', generation: 0, manifestHash: 'h1' };
   const green = { protocol: 1, ticketId: 't1', generation: 0, manifestHash: 'h1', kind: 'completed', exit: 0, signal: null };
   assert.equal(isGreen(green, expected), true);
 
@@ -529,4 +529,95 @@ test('isGreen: true only for a bound, completed, unsignalled, exact zero exit', 
   assert.equal(isGreen({ ...green, protocol: 2 }, expected), false, 'protocol mismatch');
   assert.equal(isGreen({ ...green, exit: '0' }, expected), false, 'non-integer exit');
   assert.equal(isGreen(null, expected), false, 'null result');
+});
+
+// ---- needsProtocol2 ----
+
+test('needsProtocol2: true iff remoteDeps or remoteSetup is a non-empty array', () => {
+  assert.equal(needsProtocol2({}), false);
+  assert.equal(needsProtocol2({ remoteDeps: null, remoteSetup: null }), false);
+  assert.equal(needsProtocol2({ remoteDeps: [], remoteSetup: [] }), false, 'empty arrays do not count');
+  assert.equal(needsProtocol2({ remoteDeps: ['.'] }), true);
+  assert.equal(needsProtocol2({ remoteSetup: [['npm', 'run', 'build']] }), true);
+  assert.equal(needsProtocol2(undefined), false);
+});
+
+// ---- classifyRemoteResult (BRAIN-320 S1c: the single classifier) ----
+
+test('classifyRemoteResult: protocol 2, exit 0/no signal/phase command -> confirmed green', () => {
+  const expected = { protocol: 2, ticketId: 't1', generation: 0, manifestHash: 'h1' };
+  const record = { protocol: 2, ticketId: 't1', generation: 0, manifestHash: 'h1', kind: 'completed', exit: 0, signal: null, phase: 'command' };
+  const result = classifyRemoteResult(record, expected);
+  assert.deepEqual(result, { outcome: 'confirmed', result: record, exitCode: 0, phase: 'command', green: true });
+  assert.equal(isGreen(record, expected), true);
+});
+
+// Canary target #1: "a completed/0 result with phase deps is never green" (spec 1h).
+test('classifyRemoteResult: canary -- completed/exit 0 with phase deps is never green', () => {
+  const expected = { protocol: 2, ticketId: 't1', generation: 0, manifestHash: 'h1' };
+  const record = { protocol: 2, ticketId: 't1', generation: 0, manifestHash: 'h1', kind: 'completed', exit: 0, signal: null, phase: 'deps' };
+  const result = classifyRemoteResult(record, expected);
+  assert.equal(result.outcome, 'unconfirmed');
+  assert.match(result.reason, /exit 0 outside phase command/);
+  assert.equal(isGreen(record, expected), false);
+});
+
+test('classifyRemoteResult: protocol 2, nonzero exit with phase deps or setup -> confirmed red, never falls back', () => {
+  const expected = { protocol: 2, ticketId: 't1', generation: 0, manifestHash: 'h1' };
+  for (const phase of ['deps', 'setup']) {
+    const record = { protocol: 2, ticketId: 't1', generation: 0, manifestHash: 'h1', kind: 'completed', exit: 1, signal: null, phase };
+    const result = classifyRemoteResult(record, expected);
+    assert.deepEqual(result, { outcome: 'confirmed', result: record, exitCode: 1, phase, green: false });
+  }
+});
+
+test('classifyRemoteResult: protocol 2, nonzero exit with phase command -> confirmed red (as today)', () => {
+  const expected = { protocol: 2, ticketId: 't1', generation: 0, manifestHash: 'h1' };
+  const record = { protocol: 2, ticketId: 't1', generation: 0, manifestHash: 'h1', kind: 'completed', exit: 3, signal: null, phase: 'command' };
+  const result = classifyRemoteResult(record, expected);
+  assert.deepEqual(result, { outcome: 'confirmed', result: record, exitCode: 3, phase: 'command', green: false });
+});
+
+test('classifyRemoteResult: protocol 2, phase missing/unrecognized -> unconfirmed, never green', () => {
+  const expected = { protocol: 2, ticketId: 't1', generation: 0, manifestHash: 'h1' };
+  for (const phase of [undefined, null, 'bogus']) {
+    const record = { protocol: 2, ticketId: 't1', generation: 0, manifestHash: 'h1', kind: 'completed', exit: 0, signal: null, phase };
+    const result = classifyRemoteResult(record, expected);
+    assert.equal(result.outcome, 'unconfirmed');
+    assert.match(result.reason, /unrecognized phase/);
+  }
+});
+
+test('classifyRemoteResult: protocol 2, a signal reported alongside exit 0 -> unconfirmed, never green', () => {
+  const expected = { protocol: 2, ticketId: 't1', generation: 0, manifestHash: 'h1' };
+  const record = { protocol: 2, ticketId: 't1', generation: 0, manifestHash: 'h1', kind: 'completed', exit: 0, signal: 'SIGTERM', phase: 'command' };
+  const result = classifyRemoteResult(record, expected);
+  assert.equal(result.outcome, 'unconfirmed');
+  assert.match(result.reason, /signal alongside exit 0/);
+});
+
+test('classifyRemoteResult: a protocol-2 record does not bind against a protocol-1 expectation, and vice versa', () => {
+  const expectedV2 = { protocol: 2, ticketId: 't1', generation: 0, manifestHash: 'h1' };
+  const recordV1 = { protocol: 1, ticketId: 't1', generation: 0, manifestHash: 'h1', kind: 'completed', exit: 0, signal: null };
+  assert.equal(classifyRemoteResult(recordV1, expectedV2).outcome, 'unconfirmed');
+
+  const expectedV1 = { protocol: 1, ticketId: 't1', generation: 0, manifestHash: 'h1' };
+  const recordV2 = { protocol: 2, ticketId: 't1', generation: 0, manifestHash: 'h1', kind: 'completed', exit: 0, signal: null, phase: 'command' };
+  assert.equal(classifyRemoteResult(recordV2, expectedV1).outcome, 'unconfirmed');
+});
+
+test('classifyRemoteResult: protocol 1 classification is unchanged (refused/cancelled/completed)', () => {
+  const expected = { protocol: 1, ticketId: 't1', generation: 0, manifestHash: 'h1' };
+  assert.deepEqual(
+    classifyRemoteResult({ protocol: 1, ticketId: 't1', generation: 0, manifestHash: 'h1', kind: 'refused', exit: 64 }, expected).exitCode,
+    64,
+  );
+  assert.equal(
+    classifyRemoteResult({ protocol: 1, ticketId: 't1', generation: 0, manifestHash: 'h1', kind: 'cancelled' }, expected).exitCode,
+    130,
+  );
+  assert.equal(
+    classifyRemoteResult({ protocol: 1, ticketId: 't1', generation: 0, manifestHash: 'h1', kind: 'unfinished' }, expected).outcome,
+    'unconfirmed',
+  );
 });

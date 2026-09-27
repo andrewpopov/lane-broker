@@ -366,3 +366,131 @@ test('~5MB of remote stdout under a slowly-draining foreground caller completes,
   assert.equal(total, bytes, 'the caller must have received every byte, in full');
   assert.ok(fs.statSync(logPath).size > 0, '--log must have captured output too');
 });
+
+// ---- BRAIN-320 S1c: protocol-2 dispatch end to end ----
+
+test('protocol 2: remoteSetup succeeds, command exits 0 -> green, ran remotely, phase command recorded', async () => {
+  const { env, state, repoDir } = setup();
+  writeRepoConfig(repoDir, {
+    version: 1,
+    lanes: { default: { weight: 1, remote: true, remoteSetup: [[process.execPath, '-e', 'process.exit(0)']] } },
+  });
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+  );
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+  assert.equal(result.remoteKind, 'completed');
+  assert.equal(result.remotePhase, 'command');
+});
+
+test('protocol 2: remoteSetup fails -> exit is the setup exit, the local command never runs, phase setup attributed', async () => {
+  const { env, state, repoDir } = setup();
+  writeRepoConfig(repoDir, {
+    version: 1,
+    lanes: { default: { weight: 1, remote: true, remoteSetup: [[process.execPath, '-e', 'process.exit(7)']] } },
+  });
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+  );
+  assert.equal(waited.code, 7, `stderr: ${waited.stderr}`);
+  assert.equal(fs.existsSync(marker), false, 'the local command must never have run');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+  assert.equal(result.remotePhase, 'setup');
+  const log = fs.readFileSync(paths(state).admissionLog, 'utf8');
+  assert.match(log, /lane: remote failed during setup \(exit 7\); this can also be a registry or network failure on skybox/);
+});
+
+test('protocol 2: remoteDeps (npm ci) fails -> exit is npm ci\'s exit, the local command never runs, phase deps attributed', async () => {
+  const { env, state, repoDir } = setup();
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, remoteDeps: ['.'] } } });
+  // A tiny fixture whose package.json declares a dependency the lockfile does
+  // not have -- `npm ci` fails deterministically, without ever reaching a
+  // registry (same fixture shape as tests/remote-pipeline.test.js's
+  // makeDepsFixture({lockMismatch: true})). `.npmrc` is belt-and-braces.
+  fs.writeFileSync(
+    path.join(repoDir, 'package.json'),
+    JSON.stringify({ name: 'fixture', version: '1.0.0', private: true, dependencies: { 'left-pad': '^1.0.0' } }),
+  );
+  fs.writeFileSync(
+    path.join(repoDir, 'package-lock.json'),
+    JSON.stringify({ name: 'fixture', version: '1.0.0', lockfileVersion: 3, requires: true, packages: { '': { name: 'fixture', version: '1.0.0' } } }),
+  );
+  fs.writeFileSync(
+    path.join(repoDir, '.npmrc'),
+    'registry=http://127.0.0.1:9\nfetch-retries=0\nfetch-retry-mintimeout=100\nfetch-retry-maxtimeout=100\nfetch-timeout=2000\n',
+  );
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+    '60s',
+  );
+  assert.notEqual(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.existsSync(marker), false, 'the local command must never have run');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+  assert.equal(result.remotePhase, 'deps');
+  const log = fs.readFileSync(paths(state).admissionLog, 'utf8');
+  assert.match(log, /lane: remote failed during deps \(exit \d+\); this can also be a registry or network failure on skybox/);
+});
+
+test('protocol 1: an optionless remote lane still sends protocol 1 (no phase in the result)', async () => {
+  const { env, state, repoDir } = setup();
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+  );
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+  assert.equal(result.remoteKind, 'completed');
+  assert.equal(result.remotePhase, null, 'a protocol-1 result carries no pipeline phase');
+});
+
+// ---- BRAIN-320 S1c: mixed protocol versions against a pre-S1a (0.6.0-style) runner ----
+
+test('mixed versions: a v2 (remoteSetup) lane against a runner whose probe lacks protocols is skipped, falls back local', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'old-runner' });
+  writeRepoConfig(repoDir, {
+    version: 1,
+    lanes: { default: { weight: 1, remote: true, remoteSetup: [[process.execPath, '-e', 'process.exit(0)']] } },
+  });
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+  );
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'local');
+  assert.match(result.fallbackReason, /does not support protocol 2/);
+});
+
+test('mixed versions: a v1 (optionless) lane still dispatches remotely against the same old-style probe', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'old-runner' });
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+  );
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+});

@@ -16,7 +16,7 @@ import { readLease, writeLease, removeLease, isGroupAlive, processStartTime } fr
 import { observedGroupCpuCores, observedGroupMemoryBytes } from './cpu.js';
 import { reloadGlobalConfig } from './config.js';
 import { detectResourceCapacity, checkResourceBudget } from './resources.js';
-import { selectRunner, dispatchRemote } from './remote-client.js';
+import { selectRunner, dispatchRemote, needsProtocol2 } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { createAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog } from './admission.js';
@@ -456,11 +456,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     }
   }
 
-  const needsProtocol2 =
-    (Array.isArray(enriched.remote.remoteDeps) && enriched.remote.remoteDeps.length > 0) ||
-    (Array.isArray(enriched.remote.remoteSetup) && enriched.remote.remoteSetup.length > 0);
   const { runner, skipped } = await selectRunner(globalCfg.runners || [], {
-    needsProtocol2,
+    needsProtocol2: needsProtocol2(enriched.remote),
     reservation: {
       weight: enriched.weight,
       cpuCores: enriched.resources.cpuCores,
@@ -477,10 +474,9 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
   // about to actually be dialed for the transfer -- see finding #5 above.
   process.stderr.write(`lane: running on ${runner.name}\n`);
 
-  // BRAIN-320 S1a: `enriched.remote.remoteDeps`/`remoteSetup` ride along in
-  // this spread but dispatchRemote does not read them yet -- sending them to
-  // the runner and switching the exec header to protocol 2 is BRAIN-320
-  // S1b/S1c, not this slice.
+  // BRAIN-320 S1c: `enriched.remote.remoteDeps`/`remoteSetup` ride along in
+  // this spread and are what `dispatchRemote` derives its protocol-2 exec
+  // header from (see its own `needsProtocol2` call).
   const dispatch = await dispatchRemote({
     ...enriched.remote,
     manifest,
@@ -496,6 +492,18 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
 
   if (dispatch.outcome === 'confirmed') {
     const endedAt = Date.now();
+    // BRAIN-320 S1c (1b/1g): a deps/setup failure is a TERMINAL red -- it is
+    // already 'confirmed' here (never 'unconfirmed'), so it can never reach
+    // `fallbackOrRefuse` below; falling back could turn this red into a
+    // green against stale local deps. Attribute the phase to the human
+    // (stderr) and to the durable records (attempt + terminal result/
+    // history) before publishing.
+    if (dispatch.phase === 'deps' || dispatch.phase === 'setup') {
+      const phaseLine = `lane: remote failed during ${dispatch.phase} (exit ${dispatch.exitCode}); this can also be a registry or network failure on ${runner.name}\n`;
+      process.stderr.write(phaseLine);
+      writeBrokerLog(root, phaseLine);
+    }
+    await updateAttempt(root, enriched.id, 0, { remotePhase: dispatch.phase ?? null });
     await publishAndExit(0, () => ({
       id: enriched.id,
       exit: dispatch.exitCode,
@@ -503,6 +511,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
       executor: 'remote',
       runner: runner.name,
       remoteKind: dispatch.result.kind,
+      remotePhase: dispatch.phase ?? null,
       startedAt: attemptStartedAt,
       endedAt,
       waitedMs: endedAt - enriched.createdAt || 0,
