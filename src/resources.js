@@ -220,6 +220,28 @@ export function checkResourceBudget({ resources, globalCfg, host }) {
   return { ok: true };
 }
 
+/**
+ * The "this lane is refused for local runs by default" refusal, extracted
+ * (BRAIN-320) so `run.js`'s immediate refusal and the supervisor's
+ * remote-fallback refusal (a `localRefused` lane whose remote attempt fell
+ * back to local, and `--allow-local-sim` was never passed) apply the exact
+ * same message and exit code -- one refusal path per reason, same pattern
+ * as `checkResourceBudget` above.
+ */
+export function localSimRefusal(lane) {
+  const dsn = process.env.ROUGE_FLEET_SUBMIT_DSN;
+  const submitHint = dsn
+    ? `submit to the fleet instead: ${dsn}`
+    : 'submit to the fleet instead (set ROUGE_FLEET_SUBMIT_DSN, or pass --allow-local-sim to run here)';
+  return {
+    ok: false,
+    exitCode: 69,
+    message:
+      `lane run: lane "${lane}" is refused for local runs by default (${submitHint}). ` +
+      `Pass --allow-local-sim to override.\n`,
+  };
+}
+
 export function evaluateMemoryAdmission({ memoryInfo, heldLeases, candidateResources, cfg, now = Date.now() }) {
   if (!memoryInfo || !Number.isFinite(memoryInfo.availableBytes)) {
     return { admit: false, reason: 'memory-unavailable', projectedAvailableBytes: null, memoryBudgetBytes: null };

@@ -368,6 +368,11 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   const runOutcome = await runCommand({
     repo: header.repoKey,
     lane: header.lane,
+    // BRAIN-320: a `localRefused` lane must never be refused HERE -- this
+    // IS the remote runner a localRefused lane is trying to reach by being
+    // dispatched at all; refusing it again on this side would make every
+    // remote-eligible localRefused lane refuse twice over.
+    allowLocalSim: true,
     weightOverride: header.weight,
     cpuOverride: header.cpuCores,
     memoryOverride: header.memoryBytes,
