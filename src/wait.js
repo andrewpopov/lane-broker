@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { ensureStateDirs, paths, readJsonSafe } from './state.js';
 import { readLease, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
@@ -69,12 +70,49 @@ export async function waitCommand(id, { timeoutMs } = {}) {
       const lease = readLease(root, id);
       const attempt = readAttempt(root, id);
       if (attempt && !supervisorAlive(attempt)) {
-        const label = attempt.executor === 'remote' ? 'ORPHANED-REMOTE' : 'ORPHANED (post-fallback)';
-        process.stderr.write(
-          `lane wait: ${id} is ${label} (runner ${attempt.runner ?? 'unknown'}) -- its supervisor is gone and nothing ` +
-            `will ever produce a result; reconcile with: lane cancel ${id}\n`,
-        );
-        return { exitCode: 1 };
+        // BRAIN-319 orphan-race fix: the two reads above (result, then
+        // attempt+liveness) are not atomic with the supervisor's own
+        // publish-then-exit (`publishTerminal` writes result.json and
+        // removes the attempt record, then the process exits) -- a
+        // supervisor that does exactly that BETWEEN this iteration's
+        // earlier `readJsonSafe(resultPath)` (which found nothing) and
+        // this liveness check can die (so `supervisorAlive` now reports
+        // false) in a run that actually SUCCEEDED. Re-read the result
+        // here, right before declaring an orphan: if it showed up in that
+        // gap, this is a completed run observed mid-publish, not an
+        // orphan. Test-only seam: `LANE_BROKER_TEST_PAUSE_BEFORE_WAIT_ORPHAN`
+        // widens this exact gap deterministically (see README's "Testing
+        // hooks").
+        const pauseFile = process.env.LANE_BROKER_TEST_PAUSE_BEFORE_WAIT_ORPHAN;
+        if (pauseFile) {
+          while (!fs.existsSync(pauseFile)) {
+            await sleep(10);
+          }
+        }
+        const settledResult = readJsonSafe(resultPath);
+        if (settledResult) {
+          if (settledResult.signal) {
+            process.stderr.write(`lane wait: command terminated by signal ${settledResult.signal}\n`);
+            return { exitCode: 1 };
+          }
+          return { exitCode: settledResult.exit ?? 1 };
+        }
+        // Still no result: re-read the attempt too, in case
+        // `publishTerminal` removed it in the same gap without us having
+        // observed the result yet (its own write is what we just missed).
+        // A re-read that now finds no attempt at all is not an orphan --
+        // fall through to the ordinary queued/leased/found check below,
+        // which will keep polling (or fail via the NOT_FOUND_GRACE_MS path
+        // if it's genuinely gone from everywhere).
+        const settledAttempt = readAttempt(root, id);
+        if (settledAttempt && !supervisorAlive(settledAttempt)) {
+          const label = settledAttempt.executor === 'remote' ? 'ORPHANED-REMOTE' : 'ORPHANED (post-fallback)';
+          process.stderr.write(
+            `lane wait: ${id} is ${label} (runner ${settledAttempt.runner ?? 'unknown'}) -- its supervisor is gone and nothing ` +
+              `will ever produce a result; reconcile with: lane cancel ${id}\n`,
+          );
+          return { exitCode: 1 };
+        }
       }
       const found = lease || listQueue(root).some((t) => t && t.id === id) || Boolean(attempt);
       if (found) {

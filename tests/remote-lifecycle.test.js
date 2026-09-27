@@ -291,13 +291,25 @@ test('supervisor SIGKILLed after fallback (still queued): wait fails fast, namin
 // ---- BRAIN-319 P1 (Codex re-review): admitted (leased) fallback, dead supervisor ----
 
 /** Force a remote-eligible ticket to fall back AND get ADMITTED (leased) --
- *  plenty of default capacity, unlike startQueuedFallback above. */
+ *  plenty of default capacity, unlike startQueuedFallback above. The lease
+ *  record is written by `tryStart` the instant the ticket is admitted, with
+ *  `childPgid: null` (see scheduler.js) -- the supervisor only fills in the
+ *  real pid in a SEPARATE, later `writeLease` call, once `spawn()` actually
+ *  returns (supervisor.js). Waiting for "a lease exists" alone can return
+ *  during that gap, especially under CPU contention where the supervisor's
+ *  own spawn is delayed: a caller that snapshots `childPgid` at that point
+ *  captures `null` forever, and `isGroupAlive(null)` -- `process.kill(-pgid,
+ *  0)` with `pgid` coerced to `-0` -- is `process.kill(0, 0)`, which
+ *  targets the CALLER's own process group and so is vacuously always true.
+ *  A test polling `!isGroupAlive(lease.childPgid)` on a stale null pgid
+ *  then hangs to its own timeout even though the real child died normally.
+ *  Wait for the pid to actually land before returning the lease's id. */
 async function startAdmittedFallback(env, state, repoDir, argv) {
   const started = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...argv], { env, cwd: repoDir });
   assert.equal(started.code, 0, `--detach should not fail: ${started.stderr}`);
   const id = started.stdout.trim();
   await waitFor(() => readAttempt(state, id)?.executor === 'local', { timeoutMs: 15_000 });
-  await waitFor(() => Boolean(readLease(state, id)), { timeoutMs: 15_000 });
+  await waitFor(() => Boolean(readLease(state, id)?.childPgid), { timeoutMs: 15_000 });
   return id;
 }
 

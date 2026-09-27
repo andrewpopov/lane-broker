@@ -393,6 +393,13 @@ symlinks.
   inside the window that check cannot see: after `remote-id` is recorded but
   before the supervisor (not yet spawned) has enqueued or leased that same id
   with the local broker.
+- `LANE_BROKER_TEST_PAUSE_BEFORE_WAIT_ORPHAN` — if set, `lane wait` pauses,
+  right after finding no result yet and an attempt record whose supervisor
+  is dead, until the named file appears -- so a test can deterministically
+  land a supervisor's publish-then-exit (result written, attempt removed)
+  inside the exact gap between wait's own unlocked reads of result.json and
+  the attempt's liveness, the race BRAIN-319 fixed (a completed run
+  observed mid-publish must never be reported as ORPHANED-REMOTE).
 
 ## Verify locally
 
