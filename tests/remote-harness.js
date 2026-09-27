@@ -103,6 +103,15 @@ function exitNow(code) {
   process.exit(code);
 }
 
+if (destination === 'old-runner' && commandString && commandString.includes('remote-probe')) {
+  // BRAIN-320 S1c (1d): simulate a pre-S1a runner (0.6.0) whose remote-probe
+  // response has no 'protocols' field at all -- the client must skip it for
+  // a protocol-2-needing lane, but still use it for an optionless (protocol
+  // 1) lane, exactly as it did before 'protocols' existed.
+  process.stdout.write(JSON.stringify({ protocol: 1, paused: false, queued: 0, running: 0, version: '0.6.0', capacity: {} }) + '\\n');
+  exitNow(0);
+}
+
 if (destination === 'down') {
   exitNow(255);
 }
@@ -172,7 +181,11 @@ if (destination === 'die-midstream') {
   );
   fs.chmodSync(sshBin, 0o755);
 
-  return { binDir, sshBin, probeLogPath };
+  // BRAIN-320 S1d: exposed so a test can reach into the fake runner's OWN
+  // broker state directly (e.g. pausing it, or pre-seeding a lease) to make
+  // it durably busy for a `remote-exec` dispatch, without affecting the
+  // client's own state (see the cross-contamination comment above).
+  return { binDir, sshBin, probeLogPath, runnerHome, runnerState };
 }
 
 export function makeRunner({ ssh, root, name = ssh }) {
@@ -229,8 +242,8 @@ export function makeDispatchArgs(overrides = {}) {
 
 /** One global config (runners + admission knobs) and one repo config (lane
  *  `remote: true`) per test, sharing a fresh fake-ssh binDir. */
-export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1 } = {}) {
-  const { binDir, probeLogPath } = makeFakeSshBin();
+export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1, remoteQueueTimeoutMs } = {}) {
+  const { binDir, probeLogPath, runnerHome, runnerState } = makeFakeSshBin();
   const runnerRoot = tmpDir('remote-dispatch-runner-root');
   const { home, state, env } = freshEnv();
   const cfg = {
@@ -247,11 +260,18 @@ export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1 } = {}) 
     cfg.cpuAdmissionPercent = cpuAdmissionPercent;
     cfg.cpuReserveCores = 0;
   }
+  // BRAIN-320 S1d: opt-in on the CLIENT machine's own global config -- the
+  // runner's own broker (a separate LANE_BROKER_HOME, see makeFakeSshBin's
+  // doc comment) gets its own fast-poll config below regardless, so a small
+  // queueTimeoutMs here doesn't just wait out the runner's 5s default
+  // sampleMs before ever observing the expiry.
+  if (remoteQueueTimeoutMs !== undefined) cfg.remoteQueueTimeoutMs = remoteQueueTimeoutMs;
   writeGlobalConfig(home, cfg);
+  writeGlobalConfig(runnerHome, { sampleMs: 50, capacity: 4 });
   const repoDir = tmpDir('remote-dispatch-repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight, remote: true } } });
   gitFixture(['init', '-q'], repoDir);
-  return { env: { ...env, PATH: `${binDir}${path.delimiter}${env.PATH}` }, home, state, repoDir, runnerRoot, probeLogPath };
+  return { env: { ...env, PATH: `${binDir}${path.delimiter}${env.PATH}` }, home, state, repoDir, runnerRoot, probeLogPath, runnerHome, runnerState };
 }
 
 /** Number of `remote-probe` calls logged so far (see makeFakeSshBin's `probeLogPath`). */

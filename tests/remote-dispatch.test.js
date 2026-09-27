@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { gitFixture, laneRun, laneSpawn, waitFor, sleep } from './helpers.js';
+import { gitFixture, laneRun, laneSpawn, waitFor, sleep, writeRepoConfig } from './helpers.js';
 import { tmpDir, setup, markerCmd, detachAndWait, resultOf, probeCount } from './remote-harness.js';
 import { paths, readJsonSafe } from '../src/state.js';
 
@@ -137,6 +137,22 @@ test('an ineligible tree is refused before ever probing a runner: zero probes, n
   assert.equal(probeCount(probeLogPath), 0, 'an ineligible tree must never dial a runner at all');
 });
 
+// ---- BRAIN-320 S1a: remoteDeps eligibility ----
+
+test('a remoteDeps lane with no package-lock.json is ineligible and never probes a runner', async () => {
+  const { env, repoDir, probeLogPath } = setup();
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, remoteDeps: ['.'] } } });
+  gitFixture(['add', '-f', '.lane-broker.json'], repoDir);
+  gitFixture(['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '-m', 'x'], repoDir);
+  const marker = path.join(tmpDir('marker'), 'where');
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...markerCmd(marker, 0)], { env, cwd: repoDir });
+  assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
+  assert.doesNotMatch(result.stderr, /running on/);
+  assert.match(result.stderr, /remote-skip/);
+  assert.equal(probeCount(probeLogPath), 0, 'a remoteDeps-ineligible tree must never dial a runner at all');
+});
+
 // ---- Codex pre-merge BLOCKER #1: durable cancellation, forced 130 ----
 
 test('a fallback child that traps SIGTERM and exits 0 still reports 130, never the child\'s own 0', async () => {
@@ -268,17 +284,19 @@ test('--detach + lane wait works for a remotely-dispatched run', async () => {
 
 // ---- oversize resource request ----
 
-test('oversize resources + a usable runner: the CLIENT never refuses at preflight -- the ticket reaches the runner', async () => {
+test('oversize resources + a usable runner: BRAIN-320 S1e catches the impossible fit client-side and falls back local, itself refused', async () => {
   // The fake "runner" here is this same machine, sharing this same
   // restrictive global config (a real runner would have its own, separate,
-  // presumably bigger one) -- so it legitimately refuses this oversize
-  // request too, on ITS OWN admission (`remote-runner.js` runs `lane run`
-  // in-process with LANE_BROKER_LOCAL=1, I5). What this test actually
-  // proves is the CLIENT-side skip (BRAIN-319 T3b-1): `lane run` never
-  // printed its own "exceed this environment's budget" refusal and never
-  // returned before a supervisor/ticket ever existed -- the exit 64 here is
-  // the RUNNER's own confirmed refusal (`kind: 'refused'`), not a client
-  // preflight short-circuit.
+  // presumably bigger one) -- its `remote-probe` STATIC capacity (S1e)
+  // therefore honestly reports this same tiny weight/CPU budget. Before
+  // BRAIN-320, `lane run` never checked that ahead of time (BRAIN-319
+  // T3b-1) and dialed the runner regardless, which refused on its OWN
+  // admission once dispatched (`kind: 'refused'`). Now the client's fit
+  // check (1e) is a STATIC impossibility check using that same probe
+  // capacity: weight 1000 can never fit a runner whose reported capacity
+  // weight is 4, so selectRunner skips it without ever dialing -- same
+  // "no runners usable" fallback shape as the runner-down case below, and
+  // the LOCAL preflight (this same restrictive config) then refuses it too.
   const { env, state, repoDir } = setup({ cpuAdmissionPercent: 1, weight: 1000 });
   const marker = path.join(tmpDir('marker'), 'where');
   const { id, waited } = await detachAndWait(
@@ -287,10 +305,16 @@ test('oversize resources + a usable runner: the CLIENT never refuses at prefligh
     repoDir,
   );
   assert.equal(waited.code, 64, `stderr: ${waited.stderr}`);
-  assert.equal(fs.existsSync(marker), false, 'the runner refused before the child command ever ran');
+  assert.equal(fs.existsSync(marker), false, 'refused before the child command ever ran');
   const result = resultOf(state, id);
-  assert.equal(result.executor, 'remote', "this must be the RUNNER refusing, not the client's own local preflight");
-  assert.equal(result.remoteKind, 'refused');
+  // A local budget refusal (localBudgetRefusalResult) carries no `executor`
+  // field -- same shape as the "runner down" fallback-refusal variant below.
+  // `remoteKind` is undefined here too, distinguishing this from the old
+  // behaviour this test used to assert (a RUNNER-confirmed `kind: 'refused'`
+  // with `executor: 'remote'`), proving the runner was never dialed at all.
+  assert.equal(result.executor, undefined, 'the client skipped the runner client-side on the static fit check, before any executor was recorded');
+  assert.equal(result.remoteKind, undefined);
+  assert.match(result.error, /exceed this environment's budget/);
 });
 
 test('oversize resources + the runner down: refused exactly as today, once it falls back', async () => {
@@ -341,4 +365,227 @@ test('~5MB of remote stdout under a slowly-draining foreground caller completes,
   assert.equal(exitCode, 0, `stderr: ${stderr}`);
   assert.equal(total, bytes, 'the caller must have received every byte, in full');
   assert.ok(fs.statSync(logPath).size > 0, '--log must have captured output too');
+});
+
+// ---- BRAIN-320 S1c: protocol-2 dispatch end to end ----
+
+test('protocol 2: remoteSetup succeeds, command exits 0 -> green, ran remotely, phase command recorded', async () => {
+  const { env, state, repoDir } = setup();
+  writeRepoConfig(repoDir, {
+    version: 1,
+    lanes: { default: { weight: 1, remote: true, remoteSetup: [[process.execPath, '-e', 'process.exit(0)']] } },
+  });
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+  );
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+  assert.equal(result.remoteKind, 'completed');
+  assert.equal(result.remotePhase, 'command');
+});
+
+test('protocol 2: remoteSetup fails -> exit is the setup exit, the local command never runs, phase setup attributed', async () => {
+  const { env, state, repoDir } = setup();
+  writeRepoConfig(repoDir, {
+    version: 1,
+    lanes: { default: { weight: 1, remote: true, remoteSetup: [[process.execPath, '-e', 'process.exit(7)']] } },
+  });
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+  );
+  assert.equal(waited.code, 7, `stderr: ${waited.stderr}`);
+  assert.equal(fs.existsSync(marker), false, 'the local command must never have run');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+  assert.equal(result.remotePhase, 'setup');
+  const log = fs.readFileSync(paths(state).admissionLog, 'utf8');
+  assert.match(log, /lane: remote failed during setup \(exit 7\); this can also be a registry or network failure on skybox/);
+});
+
+test('protocol 2: remoteDeps (npm ci) fails -> exit is npm ci\'s exit, the local command never runs, phase deps attributed', async () => {
+  const { env, state, repoDir } = setup();
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, remoteDeps: ['.'] } } });
+  // A tiny fixture whose package.json declares a dependency the lockfile does
+  // not have -- `npm ci` fails deterministically, without ever reaching a
+  // registry (same fixture shape as tests/remote-pipeline.test.js's
+  // makeDepsFixture({lockMismatch: true})). `.npmrc` is belt-and-braces.
+  fs.writeFileSync(
+    path.join(repoDir, 'package.json'),
+    JSON.stringify({ name: 'fixture', version: '1.0.0', private: true, dependencies: { 'left-pad': '^1.0.0' } }),
+  );
+  fs.writeFileSync(
+    path.join(repoDir, 'package-lock.json'),
+    JSON.stringify({ name: 'fixture', version: '1.0.0', lockfileVersion: 3, requires: true, packages: { '': { name: 'fixture', version: '1.0.0' } } }),
+  );
+  fs.writeFileSync(
+    path.join(repoDir, '.npmrc'),
+    'registry=http://127.0.0.1:9\nfetch-retries=0\nfetch-retry-mintimeout=100\nfetch-retry-maxtimeout=100\nfetch-timeout=2000\n',
+  );
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+    '60s',
+  );
+  assert.notEqual(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.existsSync(marker), false, 'the local command must never have run');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+  assert.equal(result.remotePhase, 'deps');
+  const log = fs.readFileSync(paths(state).admissionLog, 'utf8');
+  assert.match(log, /lane: remote failed during deps \(exit \d+\); this can also be a registry or network failure on skybox/);
+});
+
+test('protocol 1: an optionless remote lane still sends protocol 1 (no phase in the result)', async () => {
+  const { env, state, repoDir } = setup();
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+  );
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+  assert.equal(result.remoteKind, 'completed');
+  assert.equal(result.remotePhase, null, 'a protocol-1 result carries no pipeline phase');
+});
+
+// ---- BRAIN-320 S1c: mixed protocol versions against a pre-S1a (0.6.0-style) runner ----
+
+test('mixed versions: a v2 (remoteSetup) lane against a runner whose probe lacks protocols is skipped, falls back local', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'old-runner' });
+  writeRepoConfig(repoDir, {
+    version: 1,
+    lanes: { default: { weight: 1, remote: true, remoteSetup: [[process.execPath, '-e', 'process.exit(0)']] } },
+  });
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+  );
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'local');
+  assert.match(result.fallbackReason, /does not support protocol 2/);
+});
+
+// ---- BRAIN-320 S1d: opt-in queue timeout ----
+
+test('queue timeout: the client global config carries remoteQueueTimeoutMs, the runner broker never starts the ticket, and the run falls back and completes LOCALLY', async () => {
+  const { env, state, repoDir, runnerState } = setup({ remoteQueueTimeoutMs: 300 });
+  fs.mkdirSync(runnerState, { recursive: true });
+  fs.writeFileSync(path.join(runnerState, 'PAUSE'), 'kept busy for the test');
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+  );
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'local', 'the run must have fallen back and executed locally');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'local');
+  assert.match(result.fallbackReason, /queue-timeout/);
+});
+
+test('queue timeout: a user cancel while queued (deadline still pending) exits 130, never falls back locally, and the runner ticket is cancelled -- not queue-timeout', async () => {
+  const { env, runnerRoot, runnerState, repoDir } = setup({ remoteQueueTimeoutMs: 30_000 });
+  fs.mkdirSync(runnerState, { recursive: true });
+  fs.writeFileSync(path.join(runnerState, 'PAUSE'), 'kept busy for the test');
+  const marker = path.join(tmpDir('marker'), 'where');
+
+  const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', ...markerCmd(marker, 0)], { env, cwd: repoDir });
+  let stderr = '';
+  child.stderr.on('data', (d) => {
+    stderr += d;
+  });
+
+  const ticketsDir = path.join(runnerRoot, 'tickets');
+  await waitFor(
+    () => {
+      try {
+        return fs.readdirSync(ticketsDir).length > 0 ? true : null;
+      } catch {
+        return null;
+      }
+    },
+    { timeoutMs: 15_000 },
+  );
+  child.kill('SIGINT');
+
+  const exitCode = await new Promise((resolve) => child.on('close', resolve));
+  assert.equal(exitCode, 130, `stderr: ${stderr}`);
+  assert.equal(fs.existsSync(marker), false, 'a local rerun must never happen after a user cancel');
+
+  const [remoteTicketId] = fs.readdirSync(ticketsDir);
+  const resultPath = path.join(ticketsDir, remoteTicketId, 'result.json');
+  const record = await waitFor(() => readJsonSafe(resultPath), { timeoutMs: 15_000 });
+  assert.equal(record.kind, 'cancelled');
+  assert.notEqual(record.reason, 'queue-timeout');
+});
+
+test('queue timeout: with no remoteQueueTimeoutMs configured, a busy runner broker is not treated as expired -- the run still dispatches remotely once the runner frees up', async () => {
+  const { env, state, repoDir, runnerState } = setup();
+  fs.mkdirSync(runnerState, { recursive: true });
+  const pauseFile = path.join(runnerState, 'PAUSE');
+  fs.writeFileSync(pauseFile, 'kept busy for the test');
+  setTimeout(() => {
+    try {
+      fs.unlinkSync(pauseFile);
+    } catch {
+      // already gone
+    }
+  }, 600);
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+    '30s',
+  );
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'remote', 'no queueTimeoutMs was configured, so the ticket must never have expired');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+});
+
+test('BRAIN-320 review fix D: with remoteQueueTimeoutMs configured, an optionless lane skips an old-style (protocol-2-less) runner and falls back local', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'old-runner', remoteQueueTimeoutMs: 300 });
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+  );
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'local', 'an old runner cannot honour remoteQueueTimeoutMs, so selection must skip it');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'local');
+  assert.match(result.fallbackReason, /does not support protocol 2/);
+});
+
+test('mixed versions: a v1 (optionless) lane still dispatches remotely against the same old-style probe', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'old-runner' });
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+  );
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
 });

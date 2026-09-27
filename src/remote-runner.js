@@ -5,7 +5,9 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, readJsonSafe, writeCancelMarkerFile } from './state.js';
-import { manifestHashOf, scrubbedGitEnv, verifyManifestNoGit } from './remote-manifest.js';
+import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
+import { isValidRemoteDepsShape, isValidRemoteSetupShape, loadGlobalConfig } from './config.js';
+import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores } from './resources.js';
 import { makeReader, readHeaderLine, extractFrames } from './remote-stream.js';
 import { runCommand } from './run.js';
 import { cancelCommand } from './cancel.js';
@@ -13,6 +15,11 @@ import { collectStatus } from './status.js';
 import { readLease } from './lease.js';
 import { readAttempt } from './attempts.js';
 import { listQueue } from './scheduler.js';
+
+// BRAIN-320 S1b (1b): the absolute path to `bin/lane.js`, so a protocol-2
+// pipeline's argv (`[node, lane.js, 'remote-pipeline', ticketDir]`) is
+// spawnable regardless of the runner's own PATH/cwd.
+const laneBinPath = fileURLToPath(new URL('../bin/lane.js', import.meta.url));
 
 // BRAIN-319 T3: fixed, deterministic author/committer identity for the
 // synthetic snapshot commit -- this is never a real authored change, just a
@@ -96,7 +103,9 @@ function isValidRelCwd(v) {
  * safe before it can even be used to build the ticket directory path).
  */
 function validateHeaderFields(header) {
-  if (header.protocol !== 1) return { ok: false, reason: `unsupported protocol: ${header.protocol}` };
+  if (header.protocol !== 1 && header.protocol !== 2) {
+    return { ok: false, reason: `unsupported protocol: ${header.protocol}` };
+  }
   if (!Number.isInteger(header.generation) || header.generation < 0) {
     return { ok: false, reason: 'invalid generation: must be a non-negative integer' };
   }
@@ -125,12 +134,48 @@ function validateHeaderFields(header) {
   if (header.manifest.manifestHash !== expectedHash) {
     return { ok: false, reason: 'manifest hash does not match its own entries' };
   }
+  // BRAIN-320 S1b (1a/1d): a protocol-1 header behaves EXACTLY as today (I6)
+  // -- it must never carry either option. A protocol-2 header MAY carry
+  // either, each checked against the exact same shape rules `.lane-
+  // broker.json` itself is validated against (src/config.js), so the two
+  // ends of this field can never drift apart on what counts as valid.
+  if (header.protocol === 1) {
+    if (header.remoteDeps !== undefined || header.remoteSetup !== undefined) {
+      return { ok: false, reason: 'protocol 1 does not support remoteDeps/remoteSetup' };
+    }
+  } else if (header.remoteDeps !== undefined && !isValidRemoteDepsShape(header.remoteDeps)) {
+    return { ok: false, reason: 'invalid remoteDeps' };
+  } else if (header.remoteSetup !== undefined && !isValidRemoteSetupShape(header.remoteSetup)) {
+    return { ok: false, reason: 'invalid remoteSetup' };
+  }
+  // BRAIN-320 S1d: opt-in on both protocols -- an old runner simply ignores
+  // an unknown field, which is fine (the feature is opt-in), but THIS
+  // runner, once it understands the field at all, validates it the same way
+  // regardless of protocol. Absent is always fine (I6); present must be a
+  // positive integer.
+  if (header.queueTimeoutMs !== undefined && !(Number.isInteger(header.queueTimeoutMs) && header.queueTimeoutMs > 0)) {
+    return { ok: false, reason: 'invalid queueTimeoutMs' };
+  }
   return { ok: true };
 }
 
-function buildResult(header, { kind, exit = null, signal = null, remoteLaneId = null, reason = null }) {
+/** `<ticketDir>/phase` as it stood at read time -- deps|setup|command, or
+ *  null if the pipeline never got far enough to write one (or this is a
+ *  protocol-1 ticket, which never runs the pipeline at all). Read AFTER the
+ *  broker's own structured result exists (BRAIN-320 S1b 1b), never from
+ *  anything the pipeline itself reports. */
+function readPhase(ticketDir) {
+  try {
+    return fs.readFileSync(path.join(ticketDir, 'phase'), 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null }) {
+  const isProtocol2 = header.protocol === 2;
   return {
-    protocol: 1,
+    protocol: isProtocol2 ? 2 : 1,
     ticketId: header.ticketId,
     generation: header.generation,
     manifestHash: header.manifest?.manifestHash ?? null,
@@ -139,6 +184,10 @@ function buildResult(header, { kind, exit = null, signal = null, remoteLaneId = 
     signal,
     remoteLaneId,
     reason,
+    // Omitted entirely (not merely null) for a protocol-1 result -- JSON.stringify
+    // drops an `undefined` value, so the shape stays byte-identical to before
+    // this slice (I6).
+    phase: isProtocol2 ? readPhase(ticketDir) : undefined,
     finishedAt: Date.now(),
   };
 }
@@ -165,6 +214,12 @@ function cleanupWork(workDir) {
  * nonzero) -- see the module-level comment on kind derivation below.
  */
 export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = process.stdin } = {}) {
+  // BRAIN-320 review fix A: resolve once, up front -- every path derived
+  // below (ticketDir, workDir, and the protocol-2 pipeline argv) is passed
+  // to a child that runs with a DIFFERENT cwd (the extracted work dir, see
+  // `cwd:` in the runCommand call below), so a relative `root` must never
+  // reach any of those derivations un-resolved.
+  root = path.resolve(root);
   // BRAIN-319 I4: this process is invoked by ssh as a fresh node process
   // after any login-shell startup already ran, so scrubbing here — rather
   // than relying on `env -u` upstream — satisfies "after shell startup":
@@ -175,6 +230,17 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   delete process.env.LANE_BROKER_KEY;
   delete process.env.LANE_BROKER_TICKET;
   process.env.LANE_BROKER_LOCAL = '1';
+
+  // BRAIN-320 review fix C: also scrub git's own repo-local env vars
+  // (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, ..., plus GIT_QUARANTINE_PATH)
+  // out of this process's env, same list `scrubbedGitEnv` derives for
+  // `buildManifest` -- otherwise every deps/setup/command child this runner
+  // spawns (not just the synthetic `git init` above) inherits whatever repo
+  // the runner's own shell happened to be sitting in.
+  const scrubbed = scrubbedGitEnv();
+  for (const name of Object.keys(process.env)) {
+    if (!(name in scrubbed)) delete process.env[name];
+  }
 
   const reader = makeReader(stdin);
   const headerResult = await readHeaderLine(reader, 1_000_000);
@@ -208,7 +274,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
 
   const fieldCheck = validateHeaderFields(header);
   if (!fieldCheck.ok) {
-    writeResult(ticketDir, buildResult(header, { kind: 'rejected', reason: fieldCheck.reason }));
+    writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: fieldCheck.reason }));
     process.stderr.write(`lane remote-exec: ${fieldCheck.reason}\n`);
     return { exitCode: 0 };
   }
@@ -219,7 +285,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     maxTotalBytes: MAX_TOTAL_BYTES,
   });
   if (!extractResult.ok) {
-    writeResult(ticketDir, buildResult(header, { kind: 'rejected', reason: extractResult.reason }));
+    writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: extractResult.reason }));
     process.stderr.write(`lane remote-exec: ${extractResult.reason}\n`);
     cleanupWork(workDir);
     return { exitCode: 0 };
@@ -233,17 +299,40 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   // side effect of it) is still caught.
   const gitResult = gitInitSnapshot(workDir);
   if (!gitResult.ok) {
-    writeResult(ticketDir, buildResult(header, { kind: 'rejected', reason: gitResult.reason }));
+    writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: gitResult.reason }));
     process.stderr.write(`lane remote-exec: ${gitResult.reason}\n`);
     cleanupWork(workDir);
     return { exitCode: 0 };
   }
   const postGitVerify = verifyManifestNoGit(workDir, header.manifest, { ignoreRootGit: true });
   if (!postGitVerify.ok) {
-    writeResult(ticketDir, buildResult(header, { kind: 'rejected', reason: postGitVerify.reason }));
+    writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: postGitVerify.reason }));
     process.stderr.write(`lane remote-exec: ${postGitVerify.reason}\n`);
     cleanupWork(workDir);
     return { exitCode: 0 };
+  }
+
+  // BRAIN-320 S1b (1c): re-run `validateRemoteDeps` against the EXTRACTED
+  // tree's manifest for a protocol-2 header carrying `remoteDeps`, then
+  // lstat-walk each dir on disk -- `validateRemoteDeps` only ever inspects
+  // the manifest, which cannot see what the runner's own filesystem looks
+  // like right now. Any violation is a rejection, and the command (or any
+  // phase of it) never runs.
+  if (header.protocol === 2 && Array.isArray(header.remoteDeps)) {
+    const depsManifestCheck = validateRemoteDeps(header.manifest, header.remoteDeps);
+    if (!depsManifestCheck.ok) {
+      writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: depsManifestCheck.reason }));
+      process.stderr.write(`lane remote-exec: ${depsManifestCheck.reason}\n`);
+      cleanupWork(workDir);
+      return { exitCode: 0 };
+    }
+    const depsDiskCheck = checkRemoteDepsDirsOnDisk(workDir, header.remoteDeps);
+    if (!depsDiskCheck.ok) {
+      writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: depsDiskCheck.reason }));
+      process.stderr.write(`lane remote-exec: ${depsDiskCheck.reason}\n`);
+      cleanupWork(workDir);
+      return { exitCode: 0 };
+    }
   }
 
   const cancelledMarker = path.join(ticketDir, 'cancelled');
@@ -254,14 +343,40 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   // resolve a repo above this ticket's own directory.
   process.env.GIT_CEILING_DIRECTORIES = ticketDir;
 
+  // BRAIN-320 S1b (1b): a protocol-2 header runs through ONE broker-owned
+  // pipeline (deps -> setup -> command) as this ticket's own child, instead
+  // of running the caller's argv directly -- admission, the resource grant,
+  // nice, and cancellation (a process-group kill) then cover every phase
+  // and every descendant. `pipeline.json` is written BEFORE runCommand is
+  // ever called, so it exists the instant the pipeline's own child could
+  // start reading it.
+  let pipelineCmd = header.argv;
+  if (header.protocol === 2) {
+    const remoteRootAbs = path.resolve(root);
+    atomicWriteJson(path.join(ticketDir, 'pipeline.json'), {
+      workDir,
+      relCwd: header.relCwd || '',
+      remoteDeps: header.remoteDeps || [],
+      remoteSetup: header.remoteSetup || [],
+      argv: header.argv,
+      npmCacheDir: path.join(remoteRootAbs, 'npm-cache'),
+      npmUserConfig: path.join(remoteRootAbs, 'npmrc'),
+    });
+    pipelineCmd = [process.execPath, laneBinPath, 'remote-pipeline', ticketDir];
+  }
+
   const runOutcome = await runCommand({
     repo: header.repoKey,
     lane: header.lane,
     weightOverride: header.weight,
     cpuOverride: header.cpuCores,
     memoryOverride: header.memoryBytes,
+    // Unchanged by protocol: `.lane-broker.json` resolution (via
+    // `configRoot` below) walks from this same cwd, and a protocol-2
+    // pipeline resolves its own phase cwds from `pipeline.json`'s absolute
+    // paths regardless of what this process's own cwd happens to be.
     cwd: path.join(workDir, header.relCwd || ''),
-    cmd: header.argv,
+    cmd: pipelineCmd,
     // BRAIN-319 C7: resolve `.lane-broker.json` from the snapshot itself,
     // never above it (the snapshot has no `.git` to derive a stop point from).
     configRoot: workDir,
@@ -269,6 +384,10 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     // change the lease key -- pin it to repoKey regardless.
     repoIdentityOverride: header.repoKey,
     idOverride: remoteLaneId,
+    // BRAIN-320 S1d: opt-in queue timeout, relative ms, straight from the
+    // validated header field -- see run.js's own doc comment on
+    // `startDeadlineMs` for how it becomes an absolute deadline.
+    startDeadlineMs: header.queueTimeoutMs,
     // BRAIN-319 C5: fires as soon as the id exists, before the supervisor
     // is ever spawned (run.js's own hook point) -- this is what makes
     // "remote-id exists" and "the child could have started" the same fact.
@@ -309,7 +428,18 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   let kind;
   let exit = null;
   let signal = null;
-  if (structured) {
+  let reason = null;
+  // A user cancel that landed after the expiry still wins (kind cancelled below).
+  if (structured && structured.reason === 'queue-timeout' && !cancelled) {
+    // BRAIN-320 S1d: the LOCAL broker's own scheduler expired this ticket
+    // before it was ever admitted -- never 'completed' (it never ran), so
+    // this check comes BEFORE the general `structured` branch below. The
+    // client's `classifyRemoteResult` treats 'unfinished' as unconfirmed and
+    // falls back locally; `reason` carries 'queue-timeout' through for the
+    // fallback log line.
+    kind = 'unfinished';
+    reason = 'queue-timeout';
+  } else if (structured) {
     exit = structured.exit;
     signal = structured.signal;
     kind = cancelled ? 'cancelled' : 'completed';
@@ -327,7 +457,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     kind = 'unfinished';
   }
 
-  writeResult(ticketDir, buildResult(header, { kind, exit, signal, remoteLaneId }));
+  writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason }));
   cleanupWork(workDir);
   return { exitCode: 0 };
 }
@@ -338,12 +468,30 @@ export async function remoteProbeCommand() {
   const status = await collectStatus();
   const pkgPath = fileURLToPath(new URL('../package.json', import.meta.url));
   const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+  // BRAIN-320 S1a (1d/1e): `protocols` is the new negotiation field ([1, 2]
+  // -- this runner understands protocol 2 too); `protocol: 1` stays for a
+  // client built before this field existed (I6). Capacity is STATIC (this
+  // host's budget, not current load) and reuses the broker's own
+  // capacity/budget math -- never re-derived here -- so the client's fit
+  // check (1e) agrees with what admission would actually apply.
+  const globalCfg = loadGlobalConfig();
+  const host = detectResourceCapacity();
+  // CPU/memory budgets are only enforced in active mode (checkResourceBudget);
+  // in shadow mode they are reported as null so the client never skips on them.
+  const enforced = globalCfg.schedulerMode === 'active';
   const payload = {
     protocol: 1,
+    protocols: [1, 2],
     version: pkg.version,
     paused: Boolean(status.paused),
     queued: status.queued.length,
     running: status.running.length,
+    capacity: {
+      weight: effectiveWeightCapacity(globalCfg, host.cpuCores),
+      cpuCores: enforced ? cpuBudgetCores(host, globalCfg) : null,
+      memoryBytes: enforced ? host.memoryBytes : null,
+      memoryReserveBytes: enforced ? globalCfg.memoryReserveBytes : null,
+    },
   };
   process.stdout.write(`${JSON.stringify(payload)}\n`);
   return { exitCode: 0 };
@@ -355,6 +503,7 @@ export async function remoteResultCommand(ticketId, { root = defaultRemoteRoot()
     process.stderr.write('lane remote-result: missing or invalid ticketId\n');
     return { exitCode: 2 };
   }
+  root = path.resolve(root);
   const resultPath = path.join(root, 'tickets', ticketId, 'result.json');
   const data = readJsonSafe(resultPath);
   process.stdout.write(`${JSON.stringify(data || { protocol: 1, missing: true })}\n`);
@@ -373,6 +522,7 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
     process.stderr.write('lane remote-cancel: missing or invalid ticketId\n');
     return { exitCode: 2 };
   }
+  root = path.resolve(root);
   const ticketDir = path.join(root, 'tickets', ticketId);
   if (!fs.existsSync(ticketDir)) {
     process.stdout.write(`${JSON.stringify({ protocol: 1, ticketId, action: 'no-such-ticket' })}\n`);

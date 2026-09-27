@@ -138,6 +138,16 @@ export async function runCommand({
   detach,
   timeoutMs,
   allowLocalSim,
+  // BRAIN-320 S1d: opt-in queue timeout (relative ms) for a runner-side
+  // pipeline ticket -- `lane remote-exec` passes this from the exec
+  // header's `queueTimeoutMs` field (itself only present when the CLIENT
+  // machine's global config set `remoteQueueTimeoutMs`, I6). Stamped into
+  // an ABSOLUTE `ticket.startDeadline` at ticket-creation time below, so
+  // `scheduler.js`'s `tryStart` can compare it against `Date.now()` under
+  // its own lock without re-deriving "relative to when" itself. A plain
+  // `lane run` never passes this, so `ticket.startDeadline` stays absent
+  // and the whole S1d expiry path is a no-op for every other caller (I6).
+  startDeadlineMs,
   // BRAIN-319 T3b-1: force this run local even when the lane opts into
   // `remote: true` and runners are configured. Mirrored by the
   // LANE_BROKER_LOCAL=1 env var below (bin/lane.js's `--local` flag sets
@@ -322,6 +332,15 @@ export async function runCommand({
     forwardOutput: !detach,
   };
 
+  // BRAIN-320 S1d: stamped once, here, from the same Date.now() this
+  // function otherwise uses for `createdAt` -- an absolute deadline, so a
+  // supervisor that polls for a while before its first tryStart still
+  // expires the ticket at the intended wall-clock time, not `startDeadlineMs`
+  // after whenever the first poll happens to land.
+  if (Number.isFinite(startDeadlineMs) && startDeadlineMs > 0) {
+    ticket.startDeadline = ticket.createdAt + startDeadlineMs;
+  }
+
   // BRAIN-319 T3b-1: when eligible, hand the supervisor everything it needs
   // to attempt a remote runner without re-resolving config itself --
   // `worktreeRoot`/`repoKey` in particular must be exactly what this process
@@ -355,6 +374,11 @@ export async function runCommand({
       weight,
       cpuCores: resources.cpuCores,
       memoryBytes: resources.memoryBytes,
+      // BRAIN-320 S1a: carried through so the supervisor's eligibility hook
+      // and (later slice) dispatchRemote's protocol-2 header see exactly what
+      // this process resolved, not a re-derived value.
+      remoteDeps: resolved.remoteDeps,
+      remoteSetup: resolved.remoteSetup,
     };
   }
 

@@ -170,8 +170,8 @@ function sleeperMarkerCmd(startedMarker, whereMarker) {
     process.execPath,
     '-e',
     `const fs = require('fs');
-fs.writeFileSync(${JSON.stringify(startedMarker)}, 'x');
 fs.writeFileSync(${JSON.stringify(whereMarker)}, process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local');
+fs.writeFileSync(${JSON.stringify(startedMarker)}, 'x');
 setInterval(() => {}, 1000);`,
   ];
 }

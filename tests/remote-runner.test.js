@@ -82,9 +82,11 @@ function streamOf(chunks) {
   return Readable.from(gen());
 }
 
-/** Spawn the real `bin/lane.js remote-exec --root <root>`, feeding `stream` as stdin. */
-function spawnRemoteExec(stream, { env, root }) {
-  const child = spawn(process.execPath, [BIN, 'remote-exec', '--root', root], { env });
+/** Spawn the real `bin/lane.js remote-exec --root <root>`, feeding `stream` as stdin.
+ *  `cwd`, when given, lets a test exercise a RELATIVE `root` from a known directory
+ *  (BRAIN-320 review fix A). */
+function spawnRemoteExec(stream, { env, root, cwd }) {
+  const child = spawn(process.execPath, [BIN, 'remote-exec', '--root', root], cwd ? { env, cwd } : { env });
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', (d) => {
@@ -118,9 +120,9 @@ async function getResult(ticketId, root, env) {
   return JSON.parse(stdout.trim());
 }
 
-async function runOne(header, entries, { env, root, src }) {
+async function runOne(header, entries, { env, root, src, cwd }) {
   const stream = encodeSnapshot(src, header, entries);
-  const { child, err } = spawnRemoteExec(stream, { env, root });
+  const { child, err } = spawnRemoteExec(stream, { env, root, cwd });
   const code = await waitClose(child);
   return { code, err: err() };
 }
@@ -198,7 +200,7 @@ test('an unsupported protocol version is rejected before any child runs', async 
   const markerFile = path.join(tmpDir('remote-exec-marker'), 'marker');
   const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
   const header = makeHeader({
-    protocol: 2,
+    protocol: 3,
     argv: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(markerFile)}, '1')`],
   });
 
@@ -209,6 +211,168 @@ test('an unsupported protocol version is rejected before any child runs', async 
   assert.equal(result.kind, 'rejected');
   assert.match(result.reason, /protocol/);
   assert.equal(fs.existsSync(markerFile), false, 'the child must never have run');
+});
+
+// BRAIN-320 S1b: a protocol-1 header must never carry remoteDeps/remoteSetup.
+test('a protocol-1 header carrying remoteDeps is rejected before any child runs', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const markerFile = path.join(tmpDir('remote-exec-marker'), 'marker');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello', 'package-lock.json': '{}' });
+  const header = makeHeader({
+    protocol: 1,
+    remoteDeps: ['.'],
+    argv: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(markerFile)}, '1')`],
+  });
+
+  const { code } = await runOne(header, entries, { env, root, src });
+  assert.equal(code, 0);
+
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.kind, 'rejected');
+  assert.match(result.reason, /protocol 1/);
+  assert.equal(fs.existsSync(markerFile), false, 'the child must never have run');
+});
+
+// BRAIN-320 S1b: a plain protocol-1 header (no remoteDeps/remoteSetup) keeps
+// today's exact result shape -- no `phase` field at all (I6).
+test('a plain protocol-1 header result has no phase field', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ protocol: 1 });
+
+  const { code } = await runOne(header, entries, { env, root, src });
+  assert.equal(code, 0);
+
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.protocol, 1);
+  assert.equal(result.kind, 'completed');
+  assert.equal('phase' in result, false, 'protocol-1 results must never carry a phase field');
+});
+
+// BRAIN-320 S1b: shape validation for a protocol-2 header's remoteDeps/remoteSetup.
+test('a protocol-2 header with an invalid remoteDeps shape is rejected', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ protocol: 2, remoteDeps: [] }); // empty array is invalid shape
+
+  const { code } = await runOne(header, entries, { env, root, src });
+  assert.equal(code, 0);
+
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.kind, 'rejected');
+  assert.match(result.reason, /remoteDeps/);
+});
+
+test('a protocol-2 header with an invalid remoteSetup shape is rejected', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ protocol: 2, remoteSetup: [[]] }); // empty argv is invalid shape
+
+  const { code } = await runOne(header, entries, { env, root, src });
+  assert.equal(code, 0);
+
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.kind, 'rejected');
+  assert.match(result.reason, /remoteSetup/);
+});
+
+// BRAIN-320 S1b (1c): proves remoteExecCommand actually WIRES the runner-side
+// re-check (validateRemoteDeps against the manifest, re-run after extraction)
+// rather than merely defining it -- a manifest whose lockfile dir also has an
+// npm-shrinkwrap.json passes header-shape validation (remoteDeps: ['.'] is a
+// valid shape) and extraction (both are real files on disk), so only the 1c
+// re-check itself can catch this before the pipeline ever runs.
+test('a protocol-2 header with remoteDeps whose dir has a shrinkwrap alongside the lockfile is rejected, and the pipeline never runs', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const markerFile = path.join(tmpDir('remote-exec-marker'), 'marker');
+  const { dir: src, entries } = makeSnapshotSource({
+    'package-lock.json': '{}',
+    'npm-shrinkwrap.json': '{}',
+  });
+  const header = makeHeader({
+    protocol: 2,
+    remoteDeps: ['.'],
+    argv: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(markerFile)}, '1')`],
+  });
+
+  const { code } = await runOne(header, entries, { env, root, src });
+  assert.equal(code, 0);
+
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.kind, 'rejected');
+  assert.match(result.reason, /shrinkwrap/);
+  assert.equal(result.phase, null, 'no phase was ever recorded -- the pipeline never started');
+  assert.equal(fs.existsSync(markerFile), false, 'the command must never have run');
+});
+
+// BRAIN-320 S1b: a plain protocol-2 header (no remoteDeps/remoteSetup) still
+// runs the caller's argv, through the pipeline, ending at phase "command".
+test('a plain protocol-2 header (no remoteDeps/remoteSetup) runs the command and reports phase command', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ protocol: 2, argv: [process.execPath, '-e', 'process.exit(0)'] });
+
+  const { code } = await runOne(header, entries, { env, root, src });
+  assert.equal(code, 0);
+
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.protocol, 2);
+  assert.equal(result.kind, 'completed');
+  assert.equal(result.exit, 0);
+  assert.equal(result.phase, 'command');
+});
+
+// BRAIN-320 review fix A: a relative --root must resolve against remote-exec's
+// OWN cwd once, up front -- not get re-derived against the protocol-2
+// pipeline child's DIFFERENT cwd (the extracted work dir), or the pipeline
+// can't find its own pipeline.json.
+test('a relative --root still completes phase command (protocol 2)', async () => {
+  const { env } = freshShadowEnv();
+  const base = tmpDir('remote-exec-relroot-base');
+  const rootAbs = path.join(base, 'remote-root');
+  fs.mkdirSync(rootAbs, { recursive: true });
+  const relRoot = path.relative(base, rootAbs);
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ protocol: 2, argv: [process.execPath, '-e', 'process.exit(0)'] });
+
+  const { code, err } = await runOne(header, entries, { env, root: relRoot, src, cwd: base });
+  assert.equal(code, 0, `stderr: ${err}`);
+
+  const result = await getResult(header.ticketId, rootAbs, env);
+  assert.equal(result.protocol, 2);
+  assert.equal(result.kind, 'completed');
+  assert.equal(result.exit, 0);
+  assert.equal(result.phase, 'command');
+});
+
+// BRAIN-320 review fix C: git's own repo-local env vars (GIT_DIR here) must
+// never reach a deps/setup/command child -- remote-exec already scrubs
+// LANE_BROKER_* off its own process.env at the top; this proves the same
+// scrub now covers git's vars too, using the same list `scrubbedGitEnv`
+// (remote-manifest.js) derives.
+test('GIT_DIR set in the runner\'s own env is unset by the time a remoteSetup step runs', async () => {
+  const probeFile = path.join(tmpDir('remote-exec-probe'), 'gitdir');
+  const { env } = freshShadowEnv({ GIT_DIR: '/nonexistent/bogus-git-dir', PROBE_FILE: probeFile });
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({
+    protocol: 2,
+    remoteSetup: [[process.execPath, '-e', "require('fs').writeFileSync(process.env.PROBE_FILE, process.env.GIT_DIR || '')"]],
+    argv: [process.execPath, '-e', 'process.exit(0)'],
+  });
+
+  const { code, err } = await runOne(header, entries, { env, root, src });
+  assert.equal(code, 0, `stderr: ${err}`);
+
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.kind, 'completed', `reason: ${result.reason}`);
+  assert.equal(fs.readFileSync(probeFile, 'utf8'), '', 'GIT_DIR must have been unset before the setup child ran');
 });
 
 test('an invalid ticketId (path traversal) is refused with nothing written on disk outside root', async () => {
@@ -622,6 +786,58 @@ test('remote-cancel against a not-yet-registered id reports cancelRequested true
   assert.equal(code, 0);
 });
 
+// BRAIN-320 review fix B: a direct runner-side `lane cancel <id>` (the
+// BROKER-level cancel, never touching the ticket-local `cancelled` marker
+// remote-cancel writes) landing between tryStart's expiry and the
+// supervisor's finalize must still win -- the published result must be
+// 'cancelled', not 'queue-timeout'.
+test('a broker-level lane cancel landing after a queue-timeout expiry, before finalize, wins: the LOCAL BROKER\'s own published result is cancelled, not queue-timeout', async () => {
+  const { env: baseEnv, home, state } = freshEnv();
+  writeGlobalConfig(home, { schedulerMode: 'shadow', sampleMs: 30 });
+  // Keep the local broker permanently paused so the ticket sits queued
+  // (never admitted) past its own startDeadline -- tryStart's expiry check
+  // runs regardless of pause state (it's evaluated before the pause check),
+  // so this reliably drives 'queue-timeout' without ever actually starting.
+  fs.mkdirSync(state, { recursive: true });
+  fs.writeFileSync(path.join(state, 'PAUSE'), 'kept busy for the test');
+
+  const pauseFile = path.join(tmpDir('remote-exec-pause'), 'go');
+  const env = { ...baseEnv, LANE_BROKER_TEST_PAUSE_AFTER_QUEUE_TIMEOUT: pauseFile };
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ protocol: 2, queueTimeoutMs: 200, argv: [process.execPath, '-e', 'process.exit(0)'] });
+
+  const stream = encodeSnapshot(src, header, entries);
+  const { child } = spawnRemoteExec(stream, { env, root });
+
+  const remoteIdPath = path.join(root, 'tickets', header.ticketId, 'remote-id');
+  await waitFor(() => fs.existsSync(remoteIdPath));
+  const remoteLaneId = fs.readFileSync(remoteIdPath, 'utf8').trim();
+
+  // Give the supervisor time to actually observe the expiry (queueTimeoutMs
+  // plus a few sampleMs polls) and reach the pause -- then fire the
+  // BROKER-level cancel directly against the local broker, never through
+  // `lane remote-cancel` (which also writes remote-exec's own ticket-local
+  // marker, a separate, independent signal remote-exec's own kind
+  // derivation already covers -- this test targets the LOCAL BROKER's own
+  // published result instead, which is exactly what finalizeQueuedAndExit
+  // decides).
+  await sleep(500);
+  const cancelResult = await laneRun(['cancel', remoteLaneId], { env });
+  assert.equal(cancelResult.code, 0, `stderr: ${cancelResult.stderr}`);
+
+  fs.mkdirSync(path.dirname(pauseFile), { recursive: true });
+  fs.writeFileSync(pauseFile, '1');
+
+  const code = await waitClose(child);
+  assert.equal(code, 0);
+
+  const structured = readJsonSafe(path.join(paths(state).results, `${remoteLaneId}.json`));
+  assert.ok(structured, 'the local broker must have published a result for the raced ticket');
+  assert.equal(structured.cancelled, true);
+  assert.notEqual(structured.reason, 'queue-timeout');
+});
+
 test('remote-cancel fired in the window between remote-id being recorded and the broker registering it still stops the child (BRAIN-319)', async () => {
   const { env } = freshShadowEnv();
   const root = tmpDir('remote-exec-root');
@@ -692,6 +908,32 @@ test('remote-probe reports the expected shape', async () => {
   assert.equal(typeof payload.paused, 'boolean');
   assert.ok(Number.isInteger(payload.queued));
   assert.ok(Number.isInteger(payload.running));
+});
+
+test('remote-probe reports protocols and static capacity (BRAIN-320 S1a/1d/1e)', async () => {
+  // Active mode (freshEnv writes no config.json): CPU/memory budgets are enforced, so reported.
+  const { env } = freshEnv();
+  const { code, stdout } = await laneRun(['remote-probe'], { env });
+  assert.equal(code, 0);
+  const payload = JSON.parse(stdout.trim());
+  assert.equal(payload.protocol, 1, 'protocol stays 1 for an old client');
+  assert.deepEqual(payload.protocols, [1, 2]);
+  assert.ok(payload.capacity && typeof payload.capacity === 'object');
+  assert.ok(Number.isFinite(payload.capacity.weight) && payload.capacity.weight > 0);
+  assert.ok(Number.isFinite(payload.capacity.cpuCores) && payload.capacity.cpuCores >= 0);
+  assert.ok(Number.isFinite(payload.capacity.memoryBytes) && payload.capacity.memoryBytes > 0);
+  assert.ok(Number.isFinite(payload.capacity.memoryReserveBytes) && payload.capacity.memoryReserveBytes >= 0);
+});
+
+test('remote-probe reports no CPU/memory capacity in shadow mode, where admission never enforces it', async () => {
+  const { env } = freshShadowEnv();
+  const { code, stdout } = await laneRun(['remote-probe'], { env });
+  assert.equal(code, 0);
+  const { capacity } = JSON.parse(stdout.trim());
+  assert.ok(Number.isFinite(capacity.weight) && capacity.weight > 0);
+  assert.equal(capacity.cpuCores, null);
+  assert.equal(capacity.memoryBytes, null);
+  assert.equal(capacity.memoryReserveBytes, null);
 });
 
 // ---- cleanup ----

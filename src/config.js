@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { isCanonicalRelPath } from './remote-manifest.js';
 
 export const DEFAULT_GLOBAL_CONFIG = {
   version: 1,
@@ -134,6 +135,16 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isInteger(cfg.laneNice) && cfg.laneNice >= 0 && cfg.laneNice <= 19,
     `${sourcePath}: "laneNice" must be an integer in [0, 19]`,
   );
+  // BRAIN-320 S1a: how long a remote ticket may sit queued on the runner
+  // before it is cancelled and treated as unconfirmed (fallback to local).
+  // Absent by default (not read yet -- that is a later slice) so a config
+  // written before this field exists still loads unchanged (I6).
+  if (cfg.remoteQueueTimeoutMs !== undefined) {
+    assert(
+      Number.isInteger(cfg.remoteQueueTimeoutMs) && cfg.remoteQueueTimeoutMs > 0,
+      `${sourcePath}: "remoteQueueTimeoutMs" must be a positive integer`,
+    );
+  }
   if (cfg.runners !== undefined) validateRunners(cfg.runners, sourcePath);
 }
 
@@ -171,6 +182,30 @@ function validateRunners(runners, sourcePath) {
   }
 }
 
+/**
+ * BRAIN-320 S1b: the shape rules for a lane's `remoteDeps` -- non-empty
+ * array of "." or a canonical relative path, no duplicates -- shared between
+ * `.lane-broker.json` validation (below) and the runner's own re-validation
+ * of a protocol-2 header's `remoteDeps` field (remote-runner.js), so the two
+ * ends never drift apart on what counts as a valid value.
+ */
+export function isValidRemoteDepsShape(dirs) {
+  if (!Array.isArray(dirs) || dirs.length === 0) return false;
+  const seen = new Set();
+  for (const dir of dirs) {
+    if (dir !== '.' && !(typeof dir === 'string' && isCanonicalRelPath(dir))) return false;
+    if (seen.has(dir)) return false;
+    seen.add(dir);
+  }
+  return true;
+}
+
+/** Same sharing rationale as `isValidRemoteDepsShape` above, for `remoteSetup`. */
+export function isValidRemoteSetupShape(setup) {
+  if (!Array.isArray(setup) || setup.length === 0) return false;
+  return setup.every((argv) => Array.isArray(argv) && argv.length > 0 && argv.every((a) => typeof a === 'string' && a.length > 0));
+}
+
 function validateRepoConfig(cfg, sourcePath) {
   assert(cfg && typeof cfg === 'object', `${sourcePath}: config must be an object`);
   assert(Number.isInteger(cfg.version), `${sourcePath}: "version" must be an integer`);
@@ -201,6 +236,18 @@ function validateRepoConfig(cfg, sourcePath) {
     }
     if (lane.remote !== undefined) {
       assert(typeof lane.remote === 'boolean', `${sourcePath}: lane "${name}".remote must be a boolean`);
+    }
+    if (lane.remoteDeps !== undefined) {
+      assert(
+        isValidRemoteDepsShape(lane.remoteDeps),
+        `${sourcePath}: lane "${name}".remoteDeps must be a non-empty array of "." or canonical relative paths, no duplicates`,
+      );
+    }
+    if (lane.remoteSetup !== undefined) {
+      assert(
+        isValidRemoteSetupShape(lane.remoteSetup),
+        `${sourcePath}: lane "${name}".remoteSetup must be a non-empty array of non-empty arrays of non-empty strings`,
+      );
     }
   }
   if (cfg.conflicts !== undefined) {
@@ -467,5 +514,10 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     // BRAIN-319 T3a: opt-in per lane, defaulted false so a repo config
     // written before this field exists resolves identically (I6).
     remote: laneCfg.remote === true,
+    // BRAIN-320 S1a: honoured only when this lane runs remotely (1a); a lane
+    // with neither declared behaves exactly as in 0.6.0 (I6), including the
+    // protocol it speaks (1d).
+    remoteDeps: Array.isArray(laneCfg.remoteDeps) ? laneCfg.remoteDeps : null,
+    remoteSetup: Array.isArray(laneCfg.remoteSetup) ? laneCfg.remoteSetup : null,
   };
 }

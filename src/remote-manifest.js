@@ -312,4 +312,88 @@ export function verifyManifestNoGit(dir, expectedManifest, { ignoreRootGit = fal
   return { ok: true };
 }
 
+/** True iff `dir` (a canonical `remoteDeps` entry, or `.`) is `path`'s ancestor, or equal to it. */
+function dirContains(dir, p) {
+  if (dir === '.') return true;
+  return p === dir || p.startsWith(`${dir}/`);
+}
+
+/**
+ * BRAIN-320 S1a: pure client-side eligibility check for a `remoteDeps` lane,
+ * run against the manifest `buildManifest` already produces -- before ever
+ * probing a runner (see supervisor.js's eligibility hook, which calls this
+ * right alongside `buildManifest`). `dirs` is `resolveTicketConfig`'s
+ * `remoteDeps` array. Returns `{ok:true}` or `{ok:false, reason}`; a caller
+ * treats `!ok` as "fall back to local" (same shape as `RemoteIneligibleError`,
+ * but this never throws -- it is meant to be checked, not caught). Exported
+ * (not folded into `buildManifest` itself) so the runner can re-run the exact
+ * same rules against the extracted tree (1c) in the next slice.
+ */
+export function validateRemoteDeps(manifest, dirs) {
+  const paths = manifest.entries.map((e) => e.path);
+  const pathSet = new Set(paths);
+
+  for (let i = 0; i < dirs.length; i += 1) {
+    for (let j = i + 1; j < dirs.length; j += 1) {
+      if (dirContains(dirs[i], dirs[j]) || dirContains(dirs[j], dirs[i])) {
+        return { ok: false, reason: `remoteDeps dirs overlap: "${dirs[i]}" and "${dirs[j]}"` };
+      }
+    }
+  }
+
+  for (const dir of dirs) {
+    const lockfile = dir === '.' ? 'package-lock.json' : `${dir}/package-lock.json`;
+    if (!pathSet.has(lockfile)) {
+      return { ok: false, reason: `remoteDeps dir "${dir}" has no ${lockfile} in the manifest` };
+    }
+    const shrinkwrap = dir === '.' ? 'npm-shrinkwrap.json' : `${dir}/npm-shrinkwrap.json`;
+    if (pathSet.has(shrinkwrap)) {
+      return { ok: false, reason: `remoteDeps dir "${dir}" has a ${shrinkwrap} (would override the lockfile)` };
+    }
+    const nodeModulesPrefix = dir === '.' ? 'node_modules/' : `${dir}/node_modules/`;
+    const nodeModulesExact = dir === '.' ? 'node_modules' : `${dir}/node_modules`;
+    for (const p of paths) {
+      if (p === nodeModulesExact || p.startsWith(nodeModulesPrefix)) {
+        return { ok: false, reason: `remoteDeps dir "${dir}" has a manifest entry under node_modules: "${p}"` };
+      }
+    }
+  }
+
+  return { ok: true };
+}
+
+/**
+ * BRAIN-320 S1b (1c): runner-side re-check that each `remoteDeps` dir is a
+ * real directory on the EXTRACTED tree, with no path component a symlink.
+ * `validateRemoteDeps` (above) only ever inspects the manifest -- it cannot
+ * see the real filesystem `remote-exec` just wrote -- so this is the
+ * runner's own defense-in-depth for the moment right before the deps phase
+ * is about to run `npm ci` inside one of these dirs. `root` is the
+ * extracted work dir; `dirs` is the header's `remoteDeps` array (each "."
+ * or a canonical relative path). Returns `{ok:true}` or `{ok:false, reason}`
+ * naming the first violation -- never throws.
+ */
+export function checkRemoteDepsDirsOnDisk(root, dirs) {
+  for (const dir of dirs) {
+    const segs = dir === '.' ? [] : dir.split('/');
+    let acc = path.resolve(root);
+    for (const seg of segs) {
+      acc = path.join(acc, seg);
+      let st;
+      try {
+        st = fs.lstatSync(acc);
+      } catch {
+        return { ok: false, reason: `remoteDeps dir "${dir}" does not exist on disk` };
+      }
+      if (st.isSymbolicLink()) {
+        return { ok: false, reason: `remoteDeps dir "${dir}" has a symlink path component: "${seg}"` };
+      }
+      if (!st.isDirectory()) {
+        return { ok: false, reason: `remoteDeps dir "${dir}" path component is not a directory: "${seg}"` };
+      }
+    }
+  }
+  return { ok: true };
+}
+
 export { sortEntries, canonicalizeEntry };

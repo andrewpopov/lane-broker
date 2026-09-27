@@ -16,6 +16,11 @@ export function paths(root = stateHome()) {
     logs: path.join(root, 'logs'),
     results: path.join(root, 'results'),
     cancel: path.join(root, 'cancel'),
+    // BRAIN-320 S1d: a queue-timeout expiry marker, one file per ticket id --
+    // kept separate from `cancel` (see `isExpired`'s doc comment) so a later
+    // reader can always tell a runner-side queue-timeout expiry apart from a
+    // user cancel, even though both end a queued ticket without a lease.
+    expire: path.join(root, 'expire'),
     history: path.join(root, 'history.jsonl'),
     pause: path.join(root, 'PAUSE'),
     lock: path.join(root, 'lock'),
@@ -61,9 +66,32 @@ export function writeCancelMarkerFile(root, id) {
   atomicWriteFile(cancelMarkerPath(root, id), String(Date.now()));
 }
 
+/** Deterministic path of a ticket's queue-timeout expiry marker (BRAIN-320 S1d) --
+ *  same one-file-per-id convention as `cancelMarkerPath`, but a DISTINCT
+ *  directory, so "expired" and "cancelled" can never be confused by a later
+ *  reader even though both end a queued ticket the same way (never leased). */
+export function expireMarkerPath(root, id) {
+  return path.join(paths(root).expire, id);
+}
+
+/** Does a queue-timeout expiry marker exist for `id`? Existence-only, same
+ *  contract as `isCancelled`. */
+export function isExpired(root, id) {
+  return fs.existsSync(expireMarkerPath(root, id));
+}
+
+/** Write the queue-timeout expiry marker for `id`, durably and idempotently --
+ *  the expiry counterpart of `writeCancelMarkerFile`, written by
+ *  `scheduler.js`'s `tryStart` under the same admission lock as every other
+ *  decision it makes. */
+export function writeExpireMarkerFile(root, id) {
+  fs.mkdirSync(paths(root).expire, { recursive: true });
+  atomicWriteFile(expireMarkerPath(root, id), String(Date.now()));
+}
+
 export function ensureStateDirs(root = stateHome()) {
   const p = paths(root);
-  for (const dir of [p.root, p.leases, p.queue, p.logs, p.results, p.cancel, p.attempts]) {
+  for (const dir of [p.root, p.leases, p.queue, p.logs, p.results, p.cancel, p.expire, p.attempts]) {
     fs.mkdirSync(dir, { recursive: true });
   }
   return p;

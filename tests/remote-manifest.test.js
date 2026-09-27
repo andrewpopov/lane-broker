@@ -4,7 +4,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { gitFixture } from './helpers.js';
-import { buildManifest, verifyManifestNoGit, RemoteIneligibleError, manifestHashOf, isCanonicalRelPath } from '../src/remote-manifest.js';
+import {
+  buildManifest,
+  verifyManifestNoGit,
+  RemoteIneligibleError,
+  manifestHashOf,
+  isCanonicalRelPath,
+  validateRemoteDeps,
+  checkRemoteDepsDirsOnDisk,
+} from '../src/remote-manifest.js';
 
 function tmpRepo() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-manifest-test-'));
@@ -270,4 +278,115 @@ test('verifyManifestNoGit reports a hash mismatch', () => {
   const result = verifyManifestNoGit(plainDir, manifest);
   assert.equal(result.ok, false);
   assert.match(result.reason, /^hash mismatch: a\.txt$/);
+});
+
+// ---- BRAIN-320 S1a/1c: validateRemoteDeps ----
+
+function manifestOf(paths) {
+  return { entries: paths.map((p) => ({ path: p, type: 'file' })) };
+}
+
+test('validateRemoteDeps: missing lockfile makes the dir ineligible', () => {
+  const manifest = manifestOf(['web/package.json', 'web/src/index.js']);
+  const result = validateRemoteDeps(manifest, ['web']);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /package-lock\.json/);
+});
+
+test('validateRemoteDeps: a shrinkwrap alongside the lockfile makes the dir ineligible', () => {
+  const manifest = manifestOf(['web/package-lock.json', 'web/npm-shrinkwrap.json']);
+  const result = validateRemoteDeps(manifest, ['web']);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /npm-shrinkwrap\.json/);
+});
+
+test('validateRemoteDeps: a manifest entry under node_modules makes the dir ineligible', () => {
+  const manifest = manifestOf(['web/package-lock.json', 'web/node_modules/x/index.js']);
+  const result = validateRemoteDeps(manifest, ['web']);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /node_modules/);
+});
+
+test('validateRemoteDeps: an entry literally named <dir>/node_modules is also caught', () => {
+  const manifest = manifestOf(['web/package-lock.json', 'web/node_modules']);
+  const result = validateRemoteDeps(manifest, ['web']);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /node_modules/);
+});
+
+test('validateRemoteDeps: two overlapping dirs (one an ancestor of the other) are rejected', () => {
+  const manifest = manifestOf(['package-lock.json', 'web/package-lock.json']);
+  const result = validateRemoteDeps(manifest, ['.', 'web']);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /overlap/);
+});
+
+test('validateRemoteDeps: two identical dirs overlap', () => {
+  const manifest = manifestOf(['web/package-lock.json']);
+  const result = validateRemoteDeps(manifest, ['web', 'web']);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /overlap/);
+});
+
+test('validateRemoteDeps: "." overlaps every other dir', () => {
+  const manifest = manifestOf(['package-lock.json', 'server/package-lock.json']);
+  const result = validateRemoteDeps(manifest, ['.', 'server']);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /overlap/);
+});
+
+test('validateRemoteDeps: a valid single "." dir passes', () => {
+  const manifest = manifestOf(['package-lock.json', 'src/index.js']);
+  const result = validateRemoteDeps(manifest, ['.']);
+  assert.deepEqual(result, { ok: true });
+});
+
+test('validateRemoteDeps: valid non-overlapping sibling dirs pass', () => {
+  const manifest = manifestOf(['api/package-lock.json', 'web/package-lock.json']);
+  const result = validateRemoteDeps(manifest, ['api', 'web']);
+  assert.deepEqual(result, { ok: true });
+});
+
+// ---- checkRemoteDepsDirsOnDisk (BRAIN-320 S1b 1c) ----
+
+test('checkRemoteDepsDirsOnDisk: a real directory tree passes', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-deps-disk-'));
+  fs.mkdirSync(path.join(dir, 'web'), { recursive: true });
+  const result = checkRemoteDepsDirsOnDisk(dir, ['web', '.']);
+  assert.deepEqual(result, { ok: true });
+});
+
+test('checkRemoteDepsDirsOnDisk: a symlinked path component is rejected', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-deps-disk-'));
+  const real = path.join(dir, 'real-web');
+  fs.mkdirSync(real, { recursive: true });
+  fs.symlinkSync(real, path.join(dir, 'web'));
+  const result = checkRemoteDepsDirsOnDisk(dir, ['web']);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /symlink/);
+});
+
+test('checkRemoteDepsDirsOnDisk: a symlinked ANCESTOR component is rejected', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-deps-disk-'));
+  const real = path.join(dir, 'real-a');
+  fs.mkdirSync(path.join(real, 'b'), { recursive: true });
+  fs.symlinkSync(real, path.join(dir, 'a'));
+  const result = checkRemoteDepsDirsOnDisk(dir, ['a/b']);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /symlink/);
+});
+
+test('checkRemoteDepsDirsOnDisk: a missing dir is rejected', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-deps-disk-'));
+  const result = checkRemoteDepsDirsOnDisk(dir, ['nope']);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /does not exist/);
+});
+
+test('checkRemoteDepsDirsOnDisk: a path component that is a plain file (not a directory) is rejected', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-deps-disk-'));
+  fs.writeFileSync(path.join(dir, 'notadir'), 'x');
+  const result = checkRemoteDepsDirsOnDisk(dir, ['notadir']);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /not a directory/);
 });

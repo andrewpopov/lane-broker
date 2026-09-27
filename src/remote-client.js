@@ -94,18 +94,58 @@ function runWithDeadline(cmdBin, argv, deadlineMs, env) {
 }
 
 /**
+ * BRAIN-320 S1e: true iff `probe.capacity` proves this ticket can NEVER be
+ * admitted on this runner -- a STATIC impossibility check using the same
+ * inequalities admission uses (resources.js), never a reason to skip on
+ * temporary pressure. Missing/malformed capacity fields never cause a skip
+ * (an older or misbehaving probe degrades to "assume it might fit", not to
+ * refusing every runner).
+ */
+function neverFits(reservation, capacity) {
+  if (!capacity || typeof capacity !== 'object') return false;
+  const { weight, cpuCores, memoryBytes } = reservation;
+  if (Number.isFinite(capacity.weight) && Number.isFinite(weight) && weight > capacity.weight) return true;
+  if (Number.isFinite(capacity.cpuCores) && Number.isFinite(cpuCores) && cpuCores > capacity.cpuCores) return true;
+  if (
+    Number.isFinite(capacity.memoryBytes) &&
+    Number.isFinite(capacity.memoryReserveBytes) &&
+    Number.isFinite(memoryBytes) &&
+    memoryBytes + capacity.memoryReserveBytes > capacity.memoryBytes
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Probe every configured runner SEQUENTIALLY, in preference order (BRAIN-319
- * C8), returning the first usable one -- exit 0, `protocol === 1`,
- * `paused === false`, `queued === 0` -- as `{runner, probe, skipped}` (any
- * earlier candidates passed over on the way to it), or `{runner: null,
- * skipped}` naming why every candidate was passed over. `opts.deadlineMs`
- * (default 6000) bounds each individual probe; a probe that hangs past it is
- * SIGKILLed and counted as a skip, never as a hang for the whole selection.
+ * C8), returning the first usable one -- exit 0, protocol usable, not
+ * `paused`, `queued === 0`, and (1e) statically able to fit the ticket -- as
+ * `{runner, probe, skipped}` (any earlier candidates passed over on the way
+ * to it), or `{runner: null, skipped}` naming why every candidate was passed
+ * over. `opts.deadlineMs` (default 6000) bounds each individual probe; a
+ * probe that hangs past it is SIGKILLed and counted as a skip, never as a
+ * hang for the whole selection.
+ *
+ * `opts.requireProtocol2` (BRAIN-320 S1a/1d; renamed by the BRAIN-320
+ * review-fix-D pass, was `needsProtocol2`): true when the ticket's lane
+ * declares `remoteDeps`/`remoteSetup` (it needs protocol 2 to run at all)
+ * OR the client has `remoteQueueTimeoutMs` configured (only a 0.7.0+,
+ * protocol-2-capable runner honours a queue timeout -- an older runner
+ * silently ignores it) -- either way, a runner whose probe does not offer
+ * `2` in `protocols` is skipped. This governs RUNNER SELECTION only: the
+ * exec header's own protocol is still derived from `needsProtocol2(remote)`
+ * alone (see `dispatchRemote`), so an optionless lane still sends a
+ * protocol-1 header even when `remoteQueueTimeoutMs` made this true.
+ *
+ * `opts.reservation` (BRAIN-320 S1e): the ticket's resolved
+ * `{weight, cpuCores, memoryBytes}`, checked against each probe's static
+ * `capacity` (1e). The existing `queued > 0` skip is unchanged.
  */
 export async function selectRunner(runners, opts = {}) {
   const deadlineMs = opts.deadlineMs ?? 6000;
   const sshBin = opts.sshBin ?? 'ssh';
-  const { env } = opts;
+  const { env, requireProtocol2 = false, reservation } = opts;
   const skipped = [];
   for (const runner of runners) {
     const cmd = buildRemoteCommand(runner, 'remote-probe');
@@ -129,6 +169,10 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason: `unsupported protocol: ${probe.protocol}` });
       continue;
     }
+    if (requireProtocol2 && !(Array.isArray(probe.protocols) && probe.protocols.includes(2))) {
+      skipped.push({ name: runner.name, reason: 'runner does not support protocol 2 (remoteDeps/remoteSetup/remoteQueueTimeoutMs)' });
+      continue;
+    }
     if (probe.paused) {
       skipped.push({ name: runner.name, reason: 'paused' });
       continue;
@@ -137,38 +181,119 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason: `queued: ${probe.queued}` });
       continue;
     }
+    if (reservation && neverFits(reservation, probe.capacity)) {
+      skipped.push({ name: runner.name, reason: 'runner capacity can never fit this ticket' });
+      continue;
+    }
     return { runner, probe, skipped };
   }
   return { runner: null, skipped };
 }
 
-/** True iff `record` is bound to `expected` (BRAIN-319 C6: ticketId, generation, manifestHash all match). */
+/**
+ * BRAIN-320 S1c (1d): the SINGLE place that decides whether a ticket's lane
+ * needs protocol 2 -- true iff `remote.remoteDeps` or `remote.remoteSetup` is
+ * a non-empty array. Both the runner-selection probe filter (supervisor.js's
+ * call to `selectRunner`) and `dispatchRemote`'s own exec-header protocol
+ * derive from this one function, so the two can never disagree about which
+ * protocol a given ticket speaks. An optionless lane (`remoteDeps`/
+ * `remoteSetup` absent or empty) always answers false and keeps speaking
+ * protocol 1, byte-identical to before this slice (I6).
+ */
+export function needsProtocol2(remote) {
+  return (
+    (Array.isArray(remote?.remoteDeps) && remote.remoteDeps.length > 0) ||
+    (Array.isArray(remote?.remoteSetup) && remote.remoteSetup.length > 0)
+  );
+}
+
+/** True iff `record` is bound to `expected` (BRAIN-319 C6: ticketId,
+ *  generation, manifestHash all match) AND was sent on the SAME protocol
+ *  `expected.protocol` names -- a protocol-2 dispatch must not accept a
+ *  protocol-1 record and vice versa (BRAIN-320 S1c). */
 function matchesTicket(record, expected) {
   return (
     !!record &&
-    record.protocol === 1 &&
+    record.protocol === expected.protocol &&
     record.ticketId === expected.ticketId &&
     record.generation === expected.generation &&
     record.manifestHash === expected.manifestHash
   );
 }
 
+const PIPELINE_PHASES = new Set(['deps', 'setup', 'command']);
+
 /**
- * Pure "is this a passing green result" predicate: bound to `expected` AND
- * `kind === 'completed'` with a real integer zero exit and no signal. The
- * single definition of green -- `dispatchRemote` reuses `matchesTicket`
- * (the same binding half of this predicate) for its own confirm/unconfirm
- * decision, so there is exactly one place that decides whether a result
- * belongs to a given ticket.
+ * BRAIN-320 S1c (1b/1g): the ONE place that classifies a fetched
+ * `remote-result` record for a given `expected` ticket -- both
+ * `dispatchRemote` (below) and `isGreen` call through here, so there is
+ * exactly one definition of "bound, confirmed, and green" (I7: green only
+ * from phase `command`). Pure; never touches the network or the filesystem.
+ *
+ * Returns `{outcome: 'unconfirmed', reason}` or `{outcome: 'confirmed',
+ * result, exitCode, green, phase?}`. `phase` is only ever set for a
+ * protocol-2 record; a protocol-1 record's classification is unchanged from
+ * before this slice.
+ *
+ * Protocol-2 completed rules (I7):
+ *  - exit 0, no signal, phase 'command' -> confirmed, green.
+ *  - nonzero integer exit, phase 'deps'|'setup'|'command' -> confirmed, red
+ *    (terminal -- the caller must never fall back locally for this outcome).
+ *  - exit 0 but phase !== 'command', phase missing/unrecognized, or a signal
+ *    reported alongside exit 0 (a self-contradictory record) -> unconfirmed,
+ *    never green.
+ */
+export function classifyRemoteResult(record, expected) {
+  if (!matchesTicket(record, expected)) {
+    return {
+      outcome: 'unconfirmed',
+      reason: 'result did not bind to this ticket (protocol/ticketId/generation/manifestHash mismatch)',
+    };
+  }
+
+  if (record.kind === 'completed') {
+    if (record.protocol === 2) {
+      if (record.exit === 0 && record.signal) {
+        return { outcome: 'unconfirmed', reason: 'completed result reports a signal alongside exit 0' };
+      }
+      const exitCode = record.signal ? 1 : record.exit;
+      if (!Number.isInteger(exitCode)) {
+        return { outcome: 'unconfirmed', reason: 'completed result has a non-integer exit' };
+      }
+      if (!PIPELINE_PHASES.has(record.phase)) {
+        return { outcome: 'unconfirmed', reason: `completed result has an unrecognized phase: ${JSON.stringify(record.phase)}` };
+      }
+      if (exitCode === 0 && record.phase !== 'command') {
+        return { outcome: 'unconfirmed', reason: `completed result reports exit 0 outside phase command (phase: ${record.phase})` };
+      }
+      return { outcome: 'confirmed', result: record, exitCode, phase: record.phase, green: exitCode === 0 && record.phase === 'command' };
+    }
+    const exitCode = record.signal ? 1 : record.exit;
+    if (!Number.isInteger(exitCode)) return { outcome: 'unconfirmed', reason: 'completed result has a non-integer exit' };
+    return { outcome: 'confirmed', result: record, exitCode, green: exitCode === 0 };
+  }
+  if (record.kind === 'refused') {
+    if (!Number.isInteger(record.exit)) return { outcome: 'unconfirmed', reason: 'refused result has a non-integer exit' };
+    return { outcome: 'confirmed', result: record, exitCode: record.exit, green: false };
+  }
+  if (record.kind === 'cancelled') {
+    return { outcome: 'confirmed', result: record, exitCode: 130, green: false };
+  }
+  // rejected / unfinished / any other kind: no exit code this client may trust.
+  return {
+    outcome: 'unconfirmed',
+    reason: record.reason ? `${record.kind}: ${record.reason}` : `unusable result kind: ${record.kind}`,
+  };
+}
+
+/**
+ * Pure "is this a passing green result" predicate: bound to `expected`
+ * (protocol included) AND classified `confirmed` with `green === true` by
+ * `classifyRemoteResult` -- the single definition of green.
  */
 export function isGreen(result, expected) {
-  return (
-    matchesTicket(result, expected) &&
-    result.kind === 'completed' &&
-    Number.isInteger(result.exit) &&
-    result.exit === 0 &&
-    !result.signal
-  );
+  const classified = classifyRemoteResult(result, expected);
+  return classified.outcome === 'confirmed' && classified.green === true;
 }
 
 /** Pipe `stream` into `child.stdin`, bounded by `deadlineMs`, killable by `abortSignal`.
@@ -313,6 +438,14 @@ export async function dispatchRemote(opts) {
     argv,
     ticketId,
     generation,
+    remoteDeps = null,
+    remoteSetup = null,
+    // BRAIN-320 S1d: opt-in, from the CLIENT machine's global config
+    // (`remoteQueueTimeoutMs`) -- unset (undefined/null) means the header
+    // carries no such key at all, byte-identical to before this slice (I6).
+    // Rides on both protocol 1 and 2: an older runner simply ignores an
+    // unknown field, which is fine, since the whole feature is opt-in.
+    queueTimeoutMs = null,
     onStdout,
     onStderr,
     abortSignal,
@@ -346,7 +479,20 @@ export async function dispatchRemote(opts) {
 
   if (abortSignal && abortSignal.aborted) return { outcome: 'cancelled' };
 
-  const header = { ticketId, generation, repoKey, lane, weight, cpuCores, memoryBytes, argv, relCwd };
+  // BRAIN-320 S1c (1d): the protocol this dispatch speaks is derived here,
+  // from `needsProtocol2`, and nowhere else -- `header.protocol` is the
+  // single source `encodeSnapshot` serializes and `expected.protocol` (below)
+  // binds the fetched result against. remoteDeps/remoteSetup only ever ride
+  // in the header when they are actually present (undefined, never null --
+  // a protocol-1 header must never carry either key at all, see
+  // remote-runner.js's `validateHeaderFields`).
+  const protocol = needsProtocol2({ remoteDeps, remoteSetup }) ? 2 : 1;
+  const header = { protocol, ticketId, generation, repoKey, lane, weight, cpuCores, memoryBytes, argv, relCwd };
+  if (protocol === 2) {
+    if (Array.isArray(remoteDeps) && remoteDeps.length > 0) header.remoteDeps = remoteDeps;
+    if (Array.isArray(remoteSetup) && remoteSetup.length > 0) header.remoteSetup = remoteSetup;
+  }
+  if (Number.isInteger(queueTimeoutMs) && queueTimeoutMs > 0) header.queueTimeoutMs = queueTimeoutMs;
   const snapshotStream = encodeSnapshot(worktreeRoot, header, manifest.entries);
 
   const execCommand = buildRemoteCommand(runner, 'remote-exec');
@@ -375,7 +521,7 @@ export async function dispatchRemote(opts) {
     return { outcome: 'unconfirmed', reason: pipeResult.reason };
   }
 
-  const expected = { ticketId, generation, manifestHash: manifest.manifestHash };
+  const expected = { protocol, ticketId, generation, manifestHash: manifest.manifestHash };
   let record = null;
   for (let attempt = 0; attempt < resultAttempts; attempt += 1) {
     if (abortSignal && abortSignal.aborted) {
@@ -395,25 +541,13 @@ export async function dispatchRemote(opts) {
   }
 
   if (!record) return { outcome: 'unconfirmed', reason: 'result not available after retries' };
-  if (!matchesTicket(record, expected)) {
-    return { outcome: 'unconfirmed', reason: 'result did not bind to this ticket (protocol/ticketId/generation/manifestHash mismatch)' };
-  }
 
-  if (record.kind === 'completed') {
-    const exitCode = record.signal ? 1 : record.exit;
-    if (!Number.isInteger(exitCode)) return { outcome: 'unconfirmed', reason: 'completed result has a non-integer exit' };
-    return { outcome: 'confirmed', result: record, exitCode };
+  // BRAIN-320 S1c: classification (bound? kind? green?) all happens in ONE
+  // place, `classifyRemoteResult`, shared with `isGreen` -- see its own doc
+  // comment for the phase rules (I7: green only from phase 'command').
+  const classification = classifyRemoteResult(record, expected);
+  if (classification.outcome === 'unconfirmed') {
+    return { outcome: 'unconfirmed', reason: classification.reason };
   }
-  if (record.kind === 'refused') {
-    if (!Number.isInteger(record.exit)) return { outcome: 'unconfirmed', reason: 'refused result has a non-integer exit' };
-    return { outcome: 'confirmed', result: record, exitCode: record.exit };
-  }
-  if (record.kind === 'cancelled') {
-    return { outcome: 'confirmed', result: record, exitCode: 130 };
-  }
-  // rejected / unfinished / any other kind: no exit code this client may trust.
-  return {
-    outcome: 'unconfirmed',
-    reason: record.reason ? `${record.kind}: ${record.reason}` : `unusable result kind: ${record.kind}`,
-  };
+  return { outcome: 'confirmed', result: record, exitCode: classification.exitCode, phase: classification.phase };
 }
