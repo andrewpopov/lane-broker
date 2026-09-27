@@ -343,6 +343,121 @@ test('selectRunner: none usable returns {runner:null, skipped:[...]}', async () 
   assert.equal(skipped.length, 2);
 });
 
+// ---- BRAIN-320 S1a: needsProtocol2 / runner-fit ----
+
+/** A bespoke fake ssh that answers `remote-probe` (and anything else) with a fixed JSON payload,
+ *  same pattern as the "a protocol-2 runner is skipped" test above but parameterized. */
+function makeFixedProbeSsh(binDir, name, payload) {
+  const sshBin = path.join(binDir, name);
+  fs.writeFileSync(
+    sshBin,
+    `#!/usr/bin/env node
+process.stdout.write(${JSON.stringify(JSON.stringify(payload))} + '\\n');
+process.exit(0);
+`,
+  );
+  fs.chmodSync(sshBin, 0o755);
+  return sshBin;
+}
+
+test('selectRunner: a runner lacking protocol 2 is skipped for a remoteDeps lane, but used for an optionless lane', async () => {
+  const { binDir } = makeFakeSshBin();
+  const sshBin = makeFixedProbeSsh(binDir, 'ssh-v1-only', {
+    protocol: 1,
+    protocols: [1],
+    version: '0.0.0',
+    paused: false,
+    queued: 0,
+    running: 0,
+  });
+  const { env } = clientEnv(binDir);
+  const runners = [makeRunner({ ssh: 'normal' })];
+
+  const needsV2 = await selectRunner(runners, { sshBin, env, deadlineMs: 3000, needsProtocol2: true });
+  assert.equal(needsV2.runner, null);
+  assert.match(needsV2.skipped[0].reason, /protocol 2/);
+
+  const optionless = await selectRunner(runners, { sshBin, env, deadlineMs: 3000, needsProtocol2: false });
+  assert.equal(optionless.runner.name, runners[0].name);
+});
+
+test('selectRunner: a runner offering protocol 2 is used for a remoteDeps lane', async () => {
+  const { binDir } = makeFakeSshBin();
+  const sshBin = makeFixedProbeSsh(binDir, 'ssh-v2', {
+    protocol: 1,
+    protocols: [1, 2],
+    version: '0.0.0',
+    paused: false,
+    queued: 0,
+    running: 0,
+  });
+  const { env } = clientEnv(binDir);
+  const runners = [makeRunner({ ssh: 'normal' })];
+
+  const { runner, skipped } = await selectRunner(runners, { sshBin, env, deadlineMs: 3000, needsProtocol2: true });
+  assert.equal(runner.name, runners[0].name);
+  assert.equal(skipped.length, 0);
+});
+
+test('selectRunner: a runner whose capacity can never fit the ticket is skipped and the next runner is used', async () => {
+  const { binDir } = makeFakeSshBin();
+  const tooSmallPayload = {
+    protocol: 1,
+    protocols: [1, 2],
+    version: '0.0.0',
+    paused: false,
+    queued: 0,
+    running: 0,
+    capacity: { weight: 1, cpuCores: 1, memoryBytes: 2_000_000_000, memoryReserveBytes: 0 },
+  };
+  const bigEnoughPayload = {
+    protocol: 1,
+    protocols: [1, 2],
+    version: '0.0.0',
+    paused: false,
+    queued: 0,
+    running: 0,
+    capacity: { weight: 100, cpuCores: 64, memoryBytes: 64_000_000_000, memoryReserveBytes: 0 },
+  };
+  const smallSsh = makeFixedProbeSsh(binDir, 'ssh-too-small', tooSmallPayload);
+  const bigSsh = makeFixedProbeSsh(binDir, 'ssh-big-enough', bigEnoughPayload);
+  // selectRunner takes exactly one sshBin per call, so exercise the fit skip
+  // against a too-small runner first, then confirm a big-enough runner is
+  // accepted with the exact same reservation -- proving the skip is about
+  // capacity, not something else about the fixture.
+  const { env } = clientEnv(binDir);
+  const reservation = { weight: 2, cpuCores: 4, memoryBytes: 8_000_000_000 };
+
+  const tooSmall = await selectRunner([makeRunner({ ssh: 'normal' })], { sshBin: smallSsh, env, deadlineMs: 3000, reservation });
+  assert.equal(tooSmall.runner, null);
+  assert.match(tooSmall.skipped[0].reason, /capacity/);
+
+  const bigEnough = await selectRunner([makeRunner({ ssh: 'normal' })], { sshBin: bigSsh, env, deadlineMs: 3000, reservation });
+  assert.equal(bigEnough.runner.name, 'normal');
+});
+
+test('selectRunner: temporary pressure (queued > 0) is unaffected by the fit check -- still skipped by the existing rule', async () => {
+  const { binDir } = makeFakeSshBin();
+  const sshBin = makeFixedProbeSsh(binDir, 'ssh-queued', {
+    protocol: 1,
+    protocols: [1, 2],
+    version: '0.0.0',
+    paused: false,
+    queued: 1,
+    running: 1,
+    capacity: { weight: 100, cpuCores: 64, memoryBytes: 64_000_000_000, memoryReserveBytes: 0 },
+  });
+  const { env } = clientEnv(binDir);
+  const { runner, skipped } = await selectRunner([makeRunner({ ssh: 'normal' })], {
+    sshBin,
+    env,
+    deadlineMs: 3000,
+    reservation: { weight: 1, cpuCores: 1, memoryBytes: 1_000_000_000 },
+  });
+  assert.equal(runner, null);
+  assert.match(skipped[0].reason, /queued/);
+});
+
 // ---- shellQuote ----
 
 test('shellQuote round-trips spaces, quotes, $, backticks and newlines through a real shell', () => {

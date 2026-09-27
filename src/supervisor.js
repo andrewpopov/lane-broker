@@ -17,7 +17,7 @@ import { observedGroupCpuCores, observedGroupMemoryBytes } from './cpu.js';
 import { reloadGlobalConfig } from './config.js';
 import { detectResourceCapacity, checkResourceBudget } from './resources.js';
 import { selectRunner, dispatchRemote } from './remote-client.js';
-import { buildManifest, RemoteIneligibleError } from './remote-manifest.js';
+import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { createAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog } from './admission.js';
 
@@ -445,7 +445,28 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     return fallbackOrRefuse(null, err.message);
   }
 
-  const { runner, skipped } = await selectRunner(globalCfg.runners || [], {});
+  // BRAIN-320 S1a: client-side remoteDeps eligibility (1c), run right
+  // alongside the manifest-build eligibility check above and before any
+  // runner is ever probed -- same reasoning as the Codex finding #5 comment
+  // above this block.
+  if (Array.isArray(enriched.remote.remoteDeps) && enriched.remote.remoteDeps.length > 0) {
+    const depsCheck = validateRemoteDeps(manifest, enriched.remote.remoteDeps);
+    if (!depsCheck.ok) {
+      return fallbackOrRefuse(null, depsCheck.reason);
+    }
+  }
+
+  const needsProtocol2 =
+    (Array.isArray(enriched.remote.remoteDeps) && enriched.remote.remoteDeps.length > 0) ||
+    (Array.isArray(enriched.remote.remoteSetup) && enriched.remote.remoteSetup.length > 0);
+  const { runner, skipped } = await selectRunner(globalCfg.runners || [], {
+    needsProtocol2,
+    reservation: {
+      weight: enriched.weight,
+      cpuCores: enriched.resources.cpuCores,
+      memoryBytes: enriched.resources.memoryBytes,
+    },
+  });
   if (!runner) {
     const reason = skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : 'no runners configured';
     return fallbackOrRefuse(null, reason);
@@ -456,6 +477,10 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
   // about to actually be dialed for the transfer -- see finding #5 above.
   process.stderr.write(`lane: running on ${runner.name}\n`);
 
+  // BRAIN-320 S1a: `enriched.remote.remoteDeps`/`remoteSetup` ride along in
+  // this spread but dispatchRemote does not read them yet -- sending them to
+  // the runner and switching the exec header to protocol 2 is BRAIN-320
+  // S1b/S1c, not this slice.
   const dispatch = await dispatchRemote({
     ...enriched.remote,
     manifest,

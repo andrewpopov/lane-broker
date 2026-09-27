@@ -694,6 +694,32 @@ test('remote-probe reports the expected shape', async () => {
   assert.ok(Number.isInteger(payload.running));
 });
 
+test('remote-probe reports protocols and static capacity (BRAIN-320 S1a/1d/1e)', async () => {
+  // Active mode (freshEnv writes no config.json): CPU/memory budgets are enforced, so reported.
+  const { env } = freshEnv();
+  const { code, stdout } = await laneRun(['remote-probe'], { env });
+  assert.equal(code, 0);
+  const payload = JSON.parse(stdout.trim());
+  assert.equal(payload.protocol, 1, 'protocol stays 1 for an old client');
+  assert.deepEqual(payload.protocols, [1, 2]);
+  assert.ok(payload.capacity && typeof payload.capacity === 'object');
+  assert.ok(Number.isFinite(payload.capacity.weight) && payload.capacity.weight > 0);
+  assert.ok(Number.isFinite(payload.capacity.cpuCores) && payload.capacity.cpuCores >= 0);
+  assert.ok(Number.isFinite(payload.capacity.memoryBytes) && payload.capacity.memoryBytes > 0);
+  assert.ok(Number.isFinite(payload.capacity.memoryReserveBytes) && payload.capacity.memoryReserveBytes >= 0);
+});
+
+test('remote-probe reports no CPU/memory capacity in shadow mode, where admission never enforces it', async () => {
+  const { env } = freshShadowEnv();
+  const { code, stdout } = await laneRun(['remote-probe'], { env });
+  assert.equal(code, 0);
+  const { capacity } = JSON.parse(stdout.trim());
+  assert.ok(Number.isFinite(capacity.weight) && capacity.weight > 0);
+  assert.equal(capacity.cpuCores, null);
+  assert.equal(capacity.memoryBytes, null);
+  assert.equal(capacity.memoryReserveBytes, null);
+});
+
 // ---- cleanup ----
 
 test('the per-ticket work dir is removed after the result is written, but result.json is kept', async () => {

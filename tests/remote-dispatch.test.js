@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { gitFixture, laneRun, laneSpawn, waitFor, sleep } from './helpers.js';
+import { gitFixture, laneRun, laneSpawn, waitFor, sleep, writeRepoConfig } from './helpers.js';
 import { tmpDir, setup, markerCmd, detachAndWait, resultOf, probeCount } from './remote-harness.js';
 import { paths, readJsonSafe } from '../src/state.js';
 
@@ -137,6 +137,22 @@ test('an ineligible tree is refused before ever probing a runner: zero probes, n
   assert.equal(probeCount(probeLogPath), 0, 'an ineligible tree must never dial a runner at all');
 });
 
+// ---- BRAIN-320 S1a: remoteDeps eligibility ----
+
+test('a remoteDeps lane with no package-lock.json is ineligible and never probes a runner', async () => {
+  const { env, repoDir, probeLogPath } = setup();
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, remoteDeps: ['.'] } } });
+  gitFixture(['add', '-f', '.lane-broker.json'], repoDir);
+  gitFixture(['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', 'commit', '-q', '-m', 'x'], repoDir);
+  const marker = path.join(tmpDir('marker'), 'where');
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...markerCmd(marker, 0)], { env, cwd: repoDir });
+  assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
+  assert.doesNotMatch(result.stderr, /running on/);
+  assert.match(result.stderr, /remote-skip/);
+  assert.equal(probeCount(probeLogPath), 0, 'a remoteDeps-ineligible tree must never dial a runner at all');
+});
+
 // ---- Codex pre-merge BLOCKER #1: durable cancellation, forced 130 ----
 
 test('a fallback child that traps SIGTERM and exits 0 still reports 130, never the child\'s own 0', async () => {
@@ -268,17 +284,19 @@ test('--detach + lane wait works for a remotely-dispatched run', async () => {
 
 // ---- oversize resource request ----
 
-test('oversize resources + a usable runner: the CLIENT never refuses at preflight -- the ticket reaches the runner', async () => {
+test('oversize resources + a usable runner: BRAIN-320 S1e catches the impossible fit client-side and falls back local, itself refused', async () => {
   // The fake "runner" here is this same machine, sharing this same
   // restrictive global config (a real runner would have its own, separate,
-  // presumably bigger one) -- so it legitimately refuses this oversize
-  // request too, on ITS OWN admission (`remote-runner.js` runs `lane run`
-  // in-process with LANE_BROKER_LOCAL=1, I5). What this test actually
-  // proves is the CLIENT-side skip (BRAIN-319 T3b-1): `lane run` never
-  // printed its own "exceed this environment's budget" refusal and never
-  // returned before a supervisor/ticket ever existed -- the exit 64 here is
-  // the RUNNER's own confirmed refusal (`kind: 'refused'`), not a client
-  // preflight short-circuit.
+  // presumably bigger one) -- its `remote-probe` STATIC capacity (S1e)
+  // therefore honestly reports this same tiny weight/CPU budget. Before
+  // BRAIN-320, `lane run` never checked that ahead of time (BRAIN-319
+  // T3b-1) and dialed the runner regardless, which refused on its OWN
+  // admission once dispatched (`kind: 'refused'`). Now the client's fit
+  // check (1e) is a STATIC impossibility check using that same probe
+  // capacity: weight 1000 can never fit a runner whose reported capacity
+  // weight is 4, so selectRunner skips it without ever dialing -- same
+  // "no runners usable" fallback shape as the runner-down case below, and
+  // the LOCAL preflight (this same restrictive config) then refuses it too.
   const { env, state, repoDir } = setup({ cpuAdmissionPercent: 1, weight: 1000 });
   const marker = path.join(tmpDir('marker'), 'where');
   const { id, waited } = await detachAndWait(
@@ -287,10 +305,16 @@ test('oversize resources + a usable runner: the CLIENT never refuses at prefligh
     repoDir,
   );
   assert.equal(waited.code, 64, `stderr: ${waited.stderr}`);
-  assert.equal(fs.existsSync(marker), false, 'the runner refused before the child command ever ran');
+  assert.equal(fs.existsSync(marker), false, 'refused before the child command ever ran');
   const result = resultOf(state, id);
-  assert.equal(result.executor, 'remote', "this must be the RUNNER refusing, not the client's own local preflight");
-  assert.equal(result.remoteKind, 'refused');
+  // A local budget refusal (localBudgetRefusalResult) carries no `executor`
+  // field -- same shape as the "runner down" fallback-refusal variant below.
+  // `remoteKind` is undefined here too, distinguishing this from the old
+  // behaviour this test used to assert (a RUNNER-confirmed `kind: 'refused'`
+  // with `executor: 'remote'`), proving the runner was never dialed at all.
+  assert.equal(result.executor, undefined, 'the client skipped the runner client-side on the static fit check, before any executor was recorded');
+  assert.equal(result.remoteKind, undefined);
+  assert.match(result.error, /exceed this environment's budget/);
 });
 
 test('oversize resources + the runner down: refused exactly as today, once it falls back', async () => {

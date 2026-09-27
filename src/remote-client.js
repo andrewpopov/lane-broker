@@ -94,18 +94,53 @@ function runWithDeadline(cmdBin, argv, deadlineMs, env) {
 }
 
 /**
+ * BRAIN-320 S1e: true iff `probe.capacity` proves this ticket can NEVER be
+ * admitted on this runner -- a STATIC impossibility check using the same
+ * inequalities admission uses (resources.js), never a reason to skip on
+ * temporary pressure. Missing/malformed capacity fields never cause a skip
+ * (an older or misbehaving probe degrades to "assume it might fit", not to
+ * refusing every runner).
+ */
+function neverFits(reservation, capacity) {
+  if (!capacity || typeof capacity !== 'object') return false;
+  const { weight, cpuCores, memoryBytes } = reservation;
+  if (Number.isFinite(capacity.weight) && Number.isFinite(weight) && weight > capacity.weight) return true;
+  if (Number.isFinite(capacity.cpuCores) && Number.isFinite(cpuCores) && cpuCores > capacity.cpuCores) return true;
+  if (
+    Number.isFinite(capacity.memoryBytes) &&
+    Number.isFinite(capacity.memoryReserveBytes) &&
+    Number.isFinite(memoryBytes) &&
+    memoryBytes + capacity.memoryReserveBytes > capacity.memoryBytes
+  ) {
+    return true;
+  }
+  return false;
+}
+
+/**
  * Probe every configured runner SEQUENTIALLY, in preference order (BRAIN-319
- * C8), returning the first usable one -- exit 0, `protocol === 1`,
- * `paused === false`, `queued === 0` -- as `{runner, probe, skipped}` (any
- * earlier candidates passed over on the way to it), or `{runner: null,
- * skipped}` naming why every candidate was passed over. `opts.deadlineMs`
- * (default 6000) bounds each individual probe; a probe that hangs past it is
- * SIGKILLed and counted as a skip, never as a hang for the whole selection.
+ * C8), returning the first usable one -- exit 0, protocol usable, not
+ * `paused`, `queued === 0`, and (1e) statically able to fit the ticket -- as
+ * `{runner, probe, skipped}` (any earlier candidates passed over on the way
+ * to it), or `{runner: null, skipped}` naming why every candidate was passed
+ * over. `opts.deadlineMs` (default 6000) bounds each individual probe; a
+ * probe that hangs past it is SIGKILLed and counted as a skip, never as a
+ * hang for the whole selection.
+ *
+ * `opts.needsProtocol2` (BRAIN-320 S1a/1d): true when the ticket's lane
+ * declares `remoteDeps`/`remoteSetup` and therefore needs protocol 2 -- a
+ * runner whose probe does not offer `2` in `protocols` is skipped. An
+ * optionless lane (the default) leaves this false and accepts a protocol-1
+ * runner exactly as before (I6).
+ *
+ * `opts.reservation` (BRAIN-320 S1e): the ticket's resolved
+ * `{weight, cpuCores, memoryBytes}`, checked against each probe's static
+ * `capacity` (1e). The existing `queued > 0` skip is unchanged.
  */
 export async function selectRunner(runners, opts = {}) {
   const deadlineMs = opts.deadlineMs ?? 6000;
   const sshBin = opts.sshBin ?? 'ssh';
-  const { env } = opts;
+  const { env, needsProtocol2 = false, reservation } = opts;
   const skipped = [];
   for (const runner of runners) {
     const cmd = buildRemoteCommand(runner, 'remote-probe');
@@ -129,12 +164,20 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason: `unsupported protocol: ${probe.protocol}` });
       continue;
     }
+    if (needsProtocol2 && !(Array.isArray(probe.protocols) && probe.protocols.includes(2))) {
+      skipped.push({ name: runner.name, reason: 'runner does not support protocol 2 (remoteDeps/remoteSetup)' });
+      continue;
+    }
     if (probe.paused) {
       skipped.push({ name: runner.name, reason: 'paused' });
       continue;
     }
     if (probe.queued !== 0) {
       skipped.push({ name: runner.name, reason: `queued: ${probe.queued}` });
+      continue;
+    }
+    if (reservation && neverFits(reservation, probe.capacity)) {
+      skipped.push({ name: runner.name, reason: 'runner capacity can never fit this ticket' });
       continue;
     }
     return { runner, probe, skipped };

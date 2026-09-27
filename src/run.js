@@ -355,6 +355,11 @@ export async function runCommand({
       weight,
       cpuCores: resources.cpuCores,
       memoryBytes: resources.memoryBytes,
+      // BRAIN-320 S1a: carried through so the supervisor's eligibility hook
+      // and (later slice) dispatchRemote's protocol-2 header see exactly what
+      // this process resolved, not a re-derived value.
+      remoteDeps: resolved.remoteDeps,
+      remoteSetup: resolved.remoteSetup,
     };
   }
 

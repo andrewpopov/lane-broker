@@ -6,6 +6,8 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, readJsonSafe, writeCancelMarkerFile } from './state.js';
 import { manifestHashOf, scrubbedGitEnv, verifyManifestNoGit } from './remote-manifest.js';
+import { loadGlobalConfig } from './config.js';
+import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores } from './resources.js';
 import { makeReader, readHeaderLine, extractFrames } from './remote-stream.js';
 import { runCommand } from './run.js';
 import { cancelCommand } from './cancel.js';
@@ -338,12 +340,30 @@ export async function remoteProbeCommand() {
   const status = await collectStatus();
   const pkgPath = fileURLToPath(new URL('../package.json', import.meta.url));
   const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+  // BRAIN-320 S1a (1d/1e): `protocols` is the new negotiation field ([1, 2]
+  // -- this runner understands protocol 2 too); `protocol: 1` stays for a
+  // client built before this field existed (I6). Capacity is STATIC (this
+  // host's budget, not current load) and reuses the broker's own
+  // capacity/budget math -- never re-derived here -- so the client's fit
+  // check (1e) agrees with what admission would actually apply.
+  const globalCfg = loadGlobalConfig();
+  const host = detectResourceCapacity();
+  // CPU/memory budgets are only enforced in active mode (checkResourceBudget);
+  // in shadow mode they are reported as null so the client never skips on them.
+  const enforced = globalCfg.schedulerMode === 'active';
   const payload = {
     protocol: 1,
+    protocols: [1, 2],
     version: pkg.version,
     paused: Boolean(status.paused),
     queued: status.queued.length,
     running: status.running.length,
+    capacity: {
+      weight: effectiveWeightCapacity(globalCfg, host.cpuCores),
+      cpuCores: enforced ? cpuBudgetCores(host, globalCfg) : null,
+      memoryBytes: enforced ? host.memoryBytes : null,
+      memoryReserveBytes: enforced ? globalCfg.memoryReserveBytes : null,
+    },
   };
   process.stdout.write(`${JSON.stringify(payload)}\n`);
   return { exitCode: 0 };

@@ -184,6 +184,20 @@ export function effectiveWeightCapacity(cfg, cpuCores) {
 }
 
 /**
+ * The CPU core budget for admission on `host` under `globalCfg`: the smaller
+ * of "all cores minus the reserve" and "cpuAdmissionPercent of all cores".
+ * Extracted so every caller that needs a runner's/host's static CPU budget
+ * (`checkResourceBudget` below, and BRAIN-320 S1a's `remote-probe` capacity
+ * report) shares this one formula instead of each re-deriving it.
+ */
+export function cpuBudgetCores(host, globalCfg) {
+  return Math.max(
+    0,
+    Math.min(host.cpuCores - globalCfg.cpuReserveCores, (globalCfg.cpuAdmissionPercent / 100) * host.cpuCores),
+  );
+}
+
+/**
  * The "requested resources exceed this environment's budget" refusal,
  * extracted so `run.js` and the supervisor's remote-fallback path (BRAIN-319
  * T3b) apply the exact same message and exit code -- a request that would
@@ -191,10 +205,7 @@ export function effectiveWeightCapacity(cfg, cpuCores) {
  * remote runner, not silently admitted because the check only ran once.
  */
 export function checkResourceBudget({ resources, globalCfg, host }) {
-  const cpuBudget = Math.max(
-    0,
-    Math.min(host.cpuCores - globalCfg.cpuReserveCores, (globalCfg.cpuAdmissionPercent / 100) * host.cpuCores),
-  );
+  const cpuBudget = cpuBudgetCores(host, globalCfg);
   const memoryBudget = Math.max(0, host.memoryBytes - globalCfg.memoryReserveBytes);
   if (globalCfg.schedulerMode === 'active' && (resources.cpuCores > cpuBudget || resources.memoryBytes > memoryBudget)) {
     return {
