@@ -8,7 +8,7 @@ import { observedGroupCpuCores, observedGroupMemoryBytes } from './cpu.js';
 import { reloadGlobalConfig } from './config.js';
 import { detectResourceCapacity, checkResourceBudget } from './resources.js';
 import { selectRunner, dispatchRemote } from './remote-client.js';
-import { createAttempt, updateAttempt, fallbackToLocal, publishTerminal } from './attempts.js';
+import { createAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog } from './admission.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
@@ -304,27 +304,6 @@ export function applyHeartbeatObservation(lease, observed, now = Date.now(), obs
   return update;
 }
 
-/**
- * BRAIN-319 T3b-2: exit 130, signal null, so run.js's own `resultExit`
- * (`result.exit ?? 1`) reports 130 for this ticket -- the same convention
- * `dispatchRemote` (remote-client.js) already uses for a runner-confirmed
- * `kind: 'cancelled'` result (C5: a cancelled ticket's result is exit 130
- * regardless of the remote outcome).
- */
-function remoteCancelledResult(ticket, startedAt) {
-  const endedAt = Date.now();
-  return {
-    id: ticket.id,
-    exit: 130,
-    signal: null,
-    startedAt: startedAt ?? null,
-    endedAt,
-    waitedMs: startedAt ? endedAt - startedAt : null,
-    cancelled: true,
-    executor: 'remote',
-  };
-}
-
 /** The exact "requested resources exceed this environment's budget" refusal run.js applies at
  *  preflight, re-applied here once a remote-eligible ticket has fallen back to local -- run.js
  *  skipped it specifically so a runner could still take an oversized request (BRAIN-319 T3b-1). */
@@ -385,7 +364,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     const fb = await fallbackToLocal(root, enriched.id, reason);
     if (!fb.ok) {
       if (fb.cancelled) {
-        await publishTerminal(root, enriched.id, 0, () => finish(remoteCancelledResult(enriched, attemptStartedAt), 130));
+        await publishTerminal(root, enriched.id, 0, () => finish(remoteCancelledResult(enriched.id, attemptStartedAt), 130));
         return { fallback: false };
       }
       throw new Error(`lane-broker supervisor: could not fall back to local for ${enriched.id} (attempt record missing)`);
@@ -400,7 +379,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     if (!budget.ok) {
       process.stderr.write(budget.message);
       await publishTerminal(root, enriched.id, fb.attempt.generation, ({ cancelled }) => {
-        if (cancelled) finish(remoteCancelledResult(enriched, attemptStartedAt), 130);
+        if (cancelled) finish(remoteCancelledResult(enriched.id, attemptStartedAt), 130);
         else finish(localBudgetRefusalResult(enriched, budget), budget.exitCode);
       });
       return { fallback: false };
@@ -433,7 +412,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
   if (dispatch.outcome === 'confirmed') {
     const published = await publishTerminal(root, enriched.id, 0, ({ cancelled }) => {
       if (cancelled) {
-        finish(remoteCancelledResult(enriched, attemptStartedAt), 130);
+        finish(remoteCancelledResult(enriched.id, attemptStartedAt), 130);
         return;
       }
       const endedAt = Date.now();
@@ -463,7 +442,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
   }
 
   if (dispatch.outcome === 'cancelled') {
-    await publishTerminal(root, enriched.id, 0, () => finish(remoteCancelledResult(enriched, attemptStartedAt), 130));
+    await publishTerminal(root, enriched.id, 0, () => finish(remoteCancelledResult(enriched.id, attemptStartedAt), 130));
     return { fallback: false };
   }
 
@@ -655,7 +634,7 @@ async function main() {
     // record is removed once this local run's outcome is actually published.
     if (attemptGeneration !== null) {
       const published = await publishTerminal(root, ticket.id, attemptGeneration, ({ cancelled }) => {
-        if (cancelled) writeAndExit(remoteCancelledResult(enriched, startedAt), 130);
+        if (cancelled) writeAndExit(remoteCancelledResult(enriched.id, startedAt), 130);
         else writeAndExit({ ...result, executor: 'local', fallbackReason }, exitCode);
       });
       if (published.ok) return;

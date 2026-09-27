@@ -1,0 +1,159 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { laneRun, waitFor, sleep } from './helpers.js';
+import { tmpDir, setup, markerCmd, detachAndWait, resultOf } from './remote-harness.js';
+import { readAttempt } from '../src/attempts.js';
+
+/**
+ * BRAIN-319 T3b-4: `lane status`/`wait`/`cancel` against an attempt record
+ * still mid remote-dispatch, or ORPHANED-REMOTE (dead supervisor). Drives
+ * the REAL CLI, same fake-ssh transport as tests/remote-dispatch.test.js.
+ */
+
+/** A never-exiting remote command that writes `startedMarker` the instant it
+ *  starts, so a test can wait for the dispatch to be genuinely in flight
+ *  before acting on it (SIGKILL, cancel, status) instead of racing dial. */
+function sleeperCmd(startedMarker) {
+  return [
+    process.execPath,
+    '-e',
+    `require('fs').writeFileSync(${JSON.stringify(startedMarker)}, 'x'); setInterval(() => {}, 1000);`,
+  ];
+}
+
+async function startSleepingRemote(env, repoDir) {
+  const startedMarker = path.join(tmpDir('started'), 'started');
+  const started = await laneRun(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...sleeperCmd(startedMarker)],
+    { env, cwd: repoDir },
+  );
+  assert.equal(started.code, 0, `--detach should not fail: ${started.stderr}`);
+  const id = started.stdout.trim();
+  await waitFor(() => fs.existsSync(startedMarker), { timeoutMs: 15_000 });
+  return { id, startedMarker };
+}
+
+test('lane status shows a REMOTE entry for a sleeping remote child, and it counts toward nothing', async () => {
+  const { env, state, repoDir } = setup();
+  const { id } = await startSleepingRemote(env, repoDir);
+  try {
+    const result = await laneRun(['status', '--json'], { env });
+    assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+    const status = JSON.parse(result.stdout);
+    const entry = status.remote.find((r) => r.id === id);
+    assert.ok(entry, 'expected a REMOTE entry for the sleeping ticket');
+    assert.equal(entry.runner, 'skybox');
+    assert.equal(entry.phase, 'running');
+    assert.equal(entry.orphaned, false);
+    assert.ok(entry.elapsedMs >= 0);
+    // Never counted toward local capacity/resources: nothing is running or
+    // queued locally, and used/reserved stay at zero.
+    assert.equal(status.running.length, 0);
+    assert.equal(status.queued.length, 0);
+    assert.equal(status.used, 0);
+    assert.equal(status.resources.reservedCpuCores, 0);
+    assert.equal(status.resources.reservedMemoryBytes, 0);
+
+    const text = (await laneRun(['status'], { env })).stdout;
+    assert.match(text, /REMOTE:/);
+    assert.match(text, new RegExp(id));
+  } finally {
+    await laneRun(['cancel', id], { env });
+  }
+});
+
+test('lane wait on a live remote ticket blocks until its result, then returns its real exit', async () => {
+  const { env, repoDir } = setup();
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 7)],
+    env,
+    repoDir,
+  );
+  assert.equal(waited.code, 7, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
+});
+
+test('lane cancel on a live remote ticket exits 130, never runs locally, and the runner\'s own ticket is cancelled', async () => {
+  const { env, state, runnerRoot, repoDir } = setup();
+  const { id } = await startSleepingRemote(env, repoDir);
+
+  const cancelResult = await laneRun(['cancel', id], { env });
+  assert.equal(cancelResult.code, 0, `stderr: ${cancelResult.stderr}`);
+
+  const waited = await laneRun(['wait', id, '--timeout', '15s'], { env });
+  assert.equal(waited.code, 130, `stderr: ${waited.stderr}`);
+  assert.equal(resultOf(state, id).cancelled, true);
+  assert.equal(readAttempt(state, id), null, 'the attempt record must be gone once cancellation is published');
+
+  const ticketsDir = path.join(runnerRoot, 'tickets');
+  const [remoteTicketId] = fs.readdirSync(ticketsDir);
+  const record = await waitFor(() => {
+    const fp = path.join(ticketsDir, remoteTicketId, 'result.json');
+    return fs.existsSync(fp) ? JSON.parse(fs.readFileSync(fp, 'utf8')) : null;
+  });
+  assert.equal(record.kind, 'cancelled');
+});
+
+test('SIGKILLing the supervisor mid-remote-dispatch: status shows ORPHANED-REMOTE, wait exits 1 naming it, cancel reconciles, and a second cancel is a no-op', async () => {
+  const { env, state, runnerRoot, repoDir } = setup();
+  const { id } = await startSleepingRemote(env, repoDir);
+
+  const attempt = readAttempt(state, id);
+  assert.ok(attempt, 'expected an attempt record');
+  process.kill(attempt.supervisor.pid, 'SIGKILL');
+  // Give the OS a moment to actually reap the pid before probing liveness.
+  await sleep(300);
+
+  const status = JSON.parse((await laneRun(['status', '--json'], { env })).stdout);
+  const entry = status.remote.find((r) => r.id === id);
+  assert.ok(entry, 'expected the orphaned attempt to still be reported');
+  assert.equal(entry.orphaned, true);
+
+  const statusText = (await laneRun(['status'], { env })).stdout;
+  assert.match(statusText, /ORPHANED-REMOTE/);
+
+  const waited = await laneRun(['wait', id, '--timeout', '5s'], { env });
+  assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
+  assert.match(waited.stderr, /ORPHANED-REMOTE/);
+  assert.match(waited.stderr, new RegExp(`lane cancel ${id}`));
+
+  const cancelResult = await laneRun(['cancel', id], { env });
+  assert.equal(cancelResult.code, 0, `stderr: ${cancelResult.stderr}`);
+  assert.equal(readAttempt(state, id), null, 'the attempt record must be gone once reconciled');
+  const result = resultOf(state, id);
+  assert.equal(result.exit, 130);
+  assert.equal(result.cancelled, true);
+
+  const ticketsDir = path.join(runnerRoot, 'tickets');
+  const [remoteTicketId] = fs.readdirSync(ticketsDir);
+  const runnerRecord = await waitFor(() => {
+    const fp = path.join(ticketsDir, remoteTicketId, 'result.json');
+    return fs.existsSync(fp) ? JSON.parse(fs.readFileSync(fp, 'utf8')) : null;
+  });
+  assert.equal(runnerRecord.kind, 'cancelled');
+
+  // Idempotent: the attempt (and its lease/queue entry) is gone, so a
+  // second cancel is a harmless no-op, not a crash or a double-write.
+  const secondCancel = await laneRun(['cancel', id], { env });
+  assert.equal(secondCancel.code, 1);
+  assert.equal(resultOf(state, id).exit, 130, 'the already-published result must be untouched');
+});
+
+test('an attempt record survives a changed boot id and still reports ORPHANED-REMOTE', async () => {
+  const { env, state, repoDir } = setup();
+  const { id } = await startSleepingRemote(env, repoDir);
+  try {
+    const bootChangedEnv = { ...env, LANE_BROKER_BOOT_ID: 'a-brand-new-boot-id' };
+    const status = JSON.parse((await laneRun(['status', '--json'], { env: bootChangedEnv })).stdout);
+    const entry = status.remote.find((r) => r.id === id);
+    assert.ok(entry, 'the attempt record must not have been reaped by the boot change alone');
+    assert.equal(entry.orphaned, true);
+  } finally {
+    // The supervisor is genuinely still alive under its REAL boot id -- the
+    // ordinary live-supervisor cancel path cleans everything up.
+    await laneRun(['cancel', id], { env });
+  }
+});

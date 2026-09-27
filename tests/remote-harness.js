@@ -2,8 +2,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { freshEnv, writeGlobalConfig, BIN } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, gitFixture, laneRun, BIN } from './helpers.js';
+import { paths, readJsonSafe } from '../src/state.js';
 
 /**
  * The fake-ssh transport harness shared by tests/remote-client.test.js
@@ -44,6 +46,21 @@ export function freshShadowEnv(extra) {
  */
 export function makeFakeSshBin() {
   const binDir = tmpDir('fake-ssh-bin');
+  // A real runner is a SEPARATE machine with its own `~/.cache/lane-broker`
+  // -- its own internal `lane run` (inside `lane remote-exec`) never shares
+  // queue/lease state with the client that dispatched to it. This same-
+  // machine fake transport would otherwise leak the two together (both
+  // sides inherit the same LANE_BROKER_HOME/STATE through the spawn chain),
+  // which would make a remote attempt's inner ticket show up as a real
+  // local lease on the CLIENT's own `lane status` -- exactly the
+  // cross-contamination BRAIN-319 T3b-4's "never counted toward local
+  // capacity" tests exist to catch. Only `remote-exec` gets this override
+  // (below): `remote-probe`/`remote-result`/`remote-cancel` intentionally
+  // keep reading the shared state, since existing tests (e.g. "a runner
+  // with a queued ticket is skipped") rely on the client's own queue/lease
+  // doubling as the probed runner's busy state.
+  const runnerHome = tmpDir('fake-runner-home');
+  const runnerState = tmpDir('fake-runner-state');
   const laneShim = path.join(binDir, 'lane');
   fs.writeFileSync(
     laneShim,
@@ -122,7 +139,18 @@ if (destination === 'die-midstream') {
   // a hang this script must not reproduce. Relaying through its own
   // separate pipes instead means this script's exit alone closes what it
   // owns, regardless of what the grandchild keeps doing.
-  const child = spawn('sh', ['-c', commandString], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, LANE_FAKE_RUNNER: '1' } });
+  // remote-cancel needs the SAME isolated state remote-exec's inner ticket
+  // lives in (it calls cancelCommand(remoteLaneId) internally, which
+  // resolves the real lease to actually kill via LANE_BROKER_STATE) --
+  // remote-probe/remote-result intentionally keep sharing the client's
+  // state (see the comment above makeFakeSshBin).
+  const remoteExecEnv = commandString.includes('remote-exec') || commandString.includes('remote-cancel')
+    ? { LANE_BROKER_HOME: ${JSON.stringify(runnerHome)}, LANE_BROKER_STATE: ${JSON.stringify(runnerState)} }
+    : {};
+  const child = spawn('sh', ['-c', commandString], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, LANE_FAKE_RUNNER: '1', ...remoteExecEnv },
+  });
   process.stdin.pipe(child.stdin);
   child.stdout.pipe(process.stdout);
   child.stderr.pipe(process.stderr);
@@ -180,4 +208,66 @@ export function makeDispatchArgs(overrides = {}) {
     argv: [process.execPath, '-e', 'process.exit(0)'],
     ...overrides,
   };
+}
+
+// ---------------------------------------------------------------------------
+// CLI-level helpers, shared by tests/remote-dispatch.test.js and
+// tests/remote-lifecycle.test.js: both drive the REAL `lane run` CLI (not
+// dispatchRemote/selectRunner directly) over this same fake-ssh transport.
+// ---------------------------------------------------------------------------
+
+/** One global config (runners + admission knobs) and one repo config (lane
+ *  `remote: true`) per test, sharing a fresh fake-ssh binDir. */
+export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1 } = {}) {
+  const { binDir } = makeFakeSshBin();
+  const runnerRoot = tmpDir('remote-dispatch-runner-root');
+  const { home, state, env } = freshEnv();
+  const cfg = {
+    version: 1,
+    capacity: 4,
+    loadClose: 1000,
+    loadOpen: 900,
+    loadOpenSamples: 1,
+    sampleMs: 100,
+    runners: [{ name: 'skybox', ssh, shell: 'sh -c', root: runnerRoot }],
+  };
+  if (cpuAdmissionPercent !== undefined) {
+    cfg.schedulerMode = 'active';
+    cfg.cpuAdmissionPercent = cpuAdmissionPercent;
+    cfg.cpuReserveCores = 0;
+  }
+  writeGlobalConfig(home, cfg);
+  const repoDir = tmpDir('remote-dispatch-repo');
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight, remote: true } } });
+  gitFixture(['init', '-q'], repoDir);
+  return { env: { ...env, PATH: `${binDir}${path.delimiter}${env.PATH}` }, home, state, repoDir, runnerRoot };
+}
+
+/** A `[cmd, ...args]` argv that reports where it ran (via LANE_FAKE_RUNNER,
+ *  only ever set by the fake ssh's spawned remote child) by writing 'remote'
+ *  or 'local' to `markerPath`, optionally after emitting `stdoutText`, then
+ *  exits `exitCode`. */
+export function markerCmd(markerPath, exitCode = 0, stdoutText = null) {
+  const body = `
+const fs = require('fs');
+${stdoutText ? `process.stdout.write(${JSON.stringify(stdoutText)});` : ''}
+fs.writeFileSync(${JSON.stringify(markerPath)}, process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local');
+process.exit(${exitCode});
+`;
+  return [process.execPath, '-e', body];
+}
+
+export async function detachAndWait(args, env, cwd, waitTimeout = '30s') {
+  const started = await laneRun(args, { env, cwd });
+  assert.equal(started.code, 0, `--detach itself should not fail: ${started.stderr}`);
+  const id = started.stdout.trim();
+  // Bounded: a ticket that should have been refused (or otherwise never
+  // completes) must fail this test fast and by name, never hang the whole
+  // suite waiting on a `lane wait` that has nothing to wait for.
+  const waited = await laneRun(['wait', id, '--timeout', waitTimeout], { env });
+  return { id, waited };
+}
+
+export function resultOf(state, id) {
+  return readJsonSafe(path.join(paths(state).results, `${id}.json`));
 }

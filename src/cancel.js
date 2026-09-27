@@ -1,7 +1,11 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { ensureStateDirs, paths, atomicWriteFile, appendHistory, atomicWriteJson, withLock, cancelMarkerPath } from './state.js';
 import { readLease, removeLease, isSupervisorAlive, isGroupAlive } from './lease.js';
 import { dequeueSync, listQueue } from './scheduler.js';
+import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult } from './attempts.js';
+import { remoteCancel } from './remote-client.js';
+import { loadGlobalConfig } from './config.js';
 
 const GRACE_MS = 10_000;
 
@@ -38,6 +42,71 @@ async function killGroupDirectly(pgid) {
   }
 }
 
+/**
+ * Cancel a ticket still tracked ONLY as an attempt record (BRAIN-319 T3b-4,
+ * C4/C5) -- mid remote-dispatch, or ORPHANED-REMOTE.
+ *  - Live supervisor: write the cancel marker and SIGTERM it, exactly the
+ *    lease path above -- the supervisor's own abort -> remote-cancel ->
+ *    `publishTerminal` chain (supervisor.js) does the actual cancellation;
+ *    this just waits for the attempt record to disappear as proof it did.
+ *  - ORPHANED-REMOTE (dead supervisor): no supervisor left to react, so
+ *    reconcile it here directly: best-effort `remote-cancel` against the
+ *    runner recorded on the attempt (looked up BY NAME in the CURRENT
+ *    global config -- a runner that has since been removed/renamed is
+ *    reported and skipped, never a reason to fail the reconciliation), then
+ *    `publishTerminal` with the shared cancelled-result shape, which also
+ *    removes the record. Idempotent: once reconciled, a second call finds
+ *    no attempt record (and no lease/queue entry) and falls through to the
+ *    ordinary "nothing to cancel" branch above -- same as re-cancelling any
+ *    already-finished ticket today.
+ */
+async function cancelAttempt(root, id, attempt) {
+  if (supervisorAlive(attempt)) {
+    writeCancelMarker(root, id);
+    try {
+      process.kill(attempt.supervisor.pid, 'SIGTERM');
+    } catch {
+      // race: supervisor just exited
+    }
+    const deadline = Date.now() + GRACE_MS + 5000;
+    while (Date.now() < deadline && readAttempt(root, id)) {
+      await sleep(100);
+    }
+    const stillHeld = readAttempt(root, id);
+    if (stillHeld) {
+      process.stderr.write(
+        `lane cancel: supervisor ${attempt.supervisor.pid} did not release ${id} within the grace period; ` +
+          `remote attempt is still held (runner=${stillHeld.runner ?? '-'})\n`,
+      );
+      return { exitCode: 1 };
+    }
+    process.stdout.write(`lane cancel: cancelled ${id}\n`);
+    return { exitCode: 0 };
+  }
+
+  // ORPHANED-REMOTE: reconcile directly, no supervisor left to do it.
+  writeCancelMarker(root, id);
+  const globalCfg = loadGlobalConfig();
+  const runnerCfg = (globalCfg.runners || []).find((r) => r.name === attempt.runner);
+  if (runnerCfg) {
+    await remoteCancel(runnerCfg, id);
+  } else if (attempt.runner) {
+    process.stderr.write(`lane cancel: runner "${attempt.runner}" is no longer configured; skipping remote-cancel\n`);
+  }
+
+  const resultPath = path.join(paths(root).results, `${id}.json`);
+  const published = await publishTerminal(root, id, attempt.generation, () => {
+    atomicWriteJson(resultPath, remoteCancelledResult(id, attempt.startedAt));
+    appendHistory(root, { id, cancelled: true, endedAt: Date.now(), executor: 'remote', runner: attempt.runner });
+  });
+  if (!published.ok) {
+    process.stderr.write(`lane cancel: could not reconcile orphaned remote attempt ${id}\n`);
+    return { exitCode: 1 };
+  }
+  process.stdout.write(`lane cancel: cancelled orphaned remote attempt ${id} (runner ${attempt.runner ?? '-'})\n`);
+  return { exitCode: 0 };
+}
+
 /** `lane cancel <id>`: cancels a queued ticket or a running/ORPHANED lease. */
 export async function cancelCommand(id) {
   const root = ensureStateDirs().root;
@@ -61,6 +130,14 @@ export async function cancelCommand(id) {
 
   const lease = readLease(root, id);
   if (!lease) {
+    // BRAIN-319 T3b-4 (C4): a ticket that fell back to local already shows
+    // up as a queue entry or a lease above/below -- this branch is reached
+    // only while it is still genuinely mid remote-dispatch (or ORPHANED-
+    // REMOTE), so today's queued/leased cancel behaviour is unchanged.
+    const attempt = readAttempt(root, id);
+    if (attempt) {
+      return cancelAttempt(root, id, attempt);
+    }
     process.stderr.write(`lane cancel: no queued ticket or lease for ${id}\n`);
     return { exitCode: 1 };
   }

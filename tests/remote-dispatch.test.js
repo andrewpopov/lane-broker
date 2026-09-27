@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, gitFixture, laneRun, laneSpawn, waitFor, sleep } from './helpers.js';
-import { tmpDir, makeFakeSshBin, clientEnv } from './remote-harness.js';
+import { gitFixture, laneRun, laneSpawn, waitFor, sleep } from './helpers.js';
+import { tmpDir, setup, markerCmd, detachAndWait, resultOf } from './remote-harness.js';
 import { paths, readJsonSafe } from '../src/state.js';
 
 /**
@@ -12,62 +12,6 @@ import { paths, readJsonSafe } from '../src/state.js';
  * transport from tests/remote-harness.js -- no direct calls into
  * src/supervisor.js or src/attempts.js.
  */
-
-/** One global config (runners + admission knobs) and one repo config (lane
- *  `remote: true`) per test, sharing the fake-ssh binDir from makeFakeSshBin(). */
-function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1 } = {}) {
-  const { binDir } = makeFakeSshBin();
-  const runnerRoot = tmpDir('remote-dispatch-runner-root');
-  const { home, state, env } = freshEnv();
-  const cfg = {
-    version: 1,
-    capacity: 4,
-    loadClose: 1000,
-    loadOpen: 900,
-    loadOpenSamples: 1,
-    sampleMs: 100,
-    runners: [{ name: 'skybox', ssh, shell: 'sh -c', root: runnerRoot }],
-  };
-  if (cpuAdmissionPercent !== undefined) {
-    cfg.schedulerMode = 'active';
-    cfg.cpuAdmissionPercent = cpuAdmissionPercent;
-    cfg.cpuReserveCores = 0;
-  }
-  writeGlobalConfig(home, cfg);
-  const repoDir = tmpDir('remote-dispatch-repo');
-  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight, remote: true } } });
-  gitFixture(['init', '-q'], repoDir);
-  return { env: { ...env, PATH: `${binDir}${path.delimiter}${env.PATH}` }, home, state, repoDir, runnerRoot };
-}
-
-/** A `[cmd, ...args]` argv that reports where it ran (via LANE_FAKE_RUNNER,
- *  only ever set by the fake ssh's spawned remote child) by writing 'remote'
- *  or 'local' to `markerPath`, optionally after emitting `stdoutText`, then
- *  exits `exitCode`. */
-function markerCmd(markerPath, exitCode = 0, stdoutText = null) {
-  const body = `
-const fs = require('fs');
-${stdoutText ? `process.stdout.write(${JSON.stringify(stdoutText)});` : ''}
-fs.writeFileSync(${JSON.stringify(markerPath)}, process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local');
-process.exit(${exitCode});
-`;
-  return [process.execPath, '-e', body];
-}
-
-async function detachAndWait(args, env, cwd, waitTimeout = '30s') {
-  const started = await laneRun(args, { env, cwd });
-  assert.equal(started.code, 0, `--detach itself should not fail: ${started.stderr}`);
-  const id = started.stdout.trim();
-  // Bounded: a ticket that should have been refused (or otherwise never
-  // completes) must fail this test fast and by name, never hang the whole
-  // suite waiting on a `lane wait` that has nothing to wait for.
-  const waited = await laneRun(['wait', id, '--timeout', waitTimeout], { env });
-  return { id, waited };
-}
-
-function resultOf(state, id) {
-  return readJsonSafe(path.join(paths(state).results, `${id}.json`));
-}
 
 // ---- usable runner: exit passthrough, output relay, stderr banner ----
 

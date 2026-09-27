@@ -76,6 +76,28 @@ export function supervisorAlive(attempt) {
   return current === sup.startTime;
 }
 
+/**
+ * BRAIN-319 T3b-4 (C5): exit 130, signal null, so `run.js`'s own `resultExit`
+ * (`result.exit ?? 1`) reports 130 for this ticket -- the same convention
+ * `dispatchRemote` (remote-client.js) already uses for a runner-confirmed
+ * `kind: 'cancelled'` result. Shared here (not duplicated per caller) since
+ * both the live-supervisor path (supervisor.js) and the ORPHANED-REMOTE
+ * reconciliation path (cancel.js) need to write the exact same shape.
+ */
+export function remoteCancelledResult(id, startedAt) {
+  const endedAt = Date.now();
+  return {
+    id,
+    exit: 130,
+    signal: null,
+    startedAt: startedAt ?? null,
+    endedAt,
+    waitedMs: startedAt ? endedAt - startedAt : null,
+    cancelled: true,
+    executor: 'remote',
+  };
+}
+
 /** Create the initial attempt record for `id` (generation 0, executor 'remote',
  *  phase 'probe'), stamped with THIS process's own identity as the owning
  *  supervisor. `runner` is not yet known at this point in the real dispatch

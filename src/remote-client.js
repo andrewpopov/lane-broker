@@ -255,6 +255,13 @@ async function remoteCancelBestEffort(runner, ticketId, sshBin, deadlineMs, env)
   await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
 }
 
+/** Public entry point for `remoteCancelBestEffort`, for a caller with no `dispatchRemote` of
+ *  its own in flight -- BRAIN-319 T3b-4's ORPHANED-REMOTE reconciliation (`lane cancel`, no
+ *  live supervisor left to have done this itself). Same best-effort contract: never throws. */
+export async function remoteCancel(runner, ticketId, { sshBin = 'ssh', deadlineMs = 15_000, env } = {}) {
+  await remoteCancelBestEffort(runner, ticketId, sshBin, deadlineMs, env);
+}
+
 /**
  * Dispatch one lane run to `runner` over ssh and resolve to exactly one of
  * `{outcome:'ineligible'|'confirmed'|'unconfirmed'|'cancelled', ...}`

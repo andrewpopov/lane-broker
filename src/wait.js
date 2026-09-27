@@ -1,6 +1,7 @@
 import { ensureStateDirs, paths, readJsonSafe } from './state.js';
 import { readLease, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
+import { readAttempt, supervisorAlive } from './attempts.js';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -45,7 +46,21 @@ export async function waitCommand(id, { timeoutMs } = {}) {
         }
         return { exitCode: result.exit ?? 1 };
       }
-      const found = readLease(root, id) || listQueue(root).some((t) => t && t.id === id);
+      // BRAIN-319 T3b-4 (C4): an attempt record still mid remote-dispatch
+      // counts as "found" (no result yet, but something is genuinely
+      // working on it) UNLESS its supervisor is confirmed dead --
+      // ORPHANED-REMOTE never has a result coming, so waiting on it must
+      // fail fast and name the reconciliation step, not sit in the same
+      // not-found grace window a genuine typo would.
+      const attempt = readAttempt(root, id);
+      if (attempt && attempt.executor === 'remote' && !supervisorAlive(attempt)) {
+        process.stderr.write(
+          `lane wait: ${id} is ORPHANED-REMOTE (runner ${attempt.runner ?? 'unknown'}) -- its supervisor is gone and nothing ` +
+            `will ever produce a result; reconcile with: lane cancel ${id}\n`,
+        );
+        return { exitCode: 1 };
+      }
+      const found = readLease(root, id) || listQueue(root).some((t) => t && t.id === id) || Boolean(attempt);
       if (found) {
         notFoundSince = null;
       } else {
