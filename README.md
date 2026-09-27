@@ -240,8 +240,10 @@ What a remote run does:
    (`.env`, `.env.*` other than `*.example/.sample/.template/.dist`,
    `*.pem`, `id_*`) stays local. Gitignored files are never sent.
 2. **Pick a runner**: probe each in config order (`lane remote-probe`, 6 s
-   hard deadline) and take the first that is reachable, speaks protocol 1,
-   is not paused and has no queue. None → local.
+   hard deadline) and take the first that is reachable, speaks the protocol
+   the lane needs (below), is not paused, has no queue, and could ever fit
+   the lane's reservation (weight, CPU budget, memory plus its reserve, from
+   the runner's static capacity — never its momentary load). None → local.
 3. **Send a snapshot**, not history: a framed stream of exactly the listed
    files. Each file is re-read without following symlinks and its sha256
    checked before its bytes are sent. The runner validates every frame
@@ -271,8 +273,64 @@ reconciles it (best-effort cancel on the runner, then a `130` result).
 Runner setup: install this package (same release as the client), make
 `lane` resolvable through the runner's `shell`, and install whatever the
 repo's own gate needs there (for example the Playwright browsers its tests
-launch). Each run installs dependencies from scratch in its fresh dir;
-there is deliberately no `node_modules` cache yet.
+launch). A snapshot carries no `node_modules` and no build output, so a
+lane whose command needs them either installs them itself (as a pre-push
+gate usually does) or declares them (below).
+
+### Dependencies and setup on the runner (BRAIN-320)
+
+```json
+// .lane-broker.json (the repo)
+"lanes": {
+  "default": {
+    "weight": 2,
+    "remote": true,
+    "remoteDeps": ["."],
+    "remoteSetup": [["npm", "run", "build"]]
+  }
+}
+```
+
+- `remoteDeps`: dirs (relative to the repo root, `.` for the root) whose
+  `package-lock.json` the runner installs from with a fresh
+  `npm ci --no-audit --no-fund` on every run.
+- `remoteSetup`: argv arrays run in the repo root after deps, before the
+  command.
+
+Both apply only when the lane runs remotely; a local run (including a
+fallback) uses the local worktree as it is. A lane with either option
+speaks protocol 2 and is only sent to runners that offer it; a lane with
+neither speaks protocol 1 exactly as before.
+
+On the runner, deps, setup and the command run as one pipeline under the
+ticket's single admission, in one process group, so the CPU/memory grant
+and cancellation cover all of them. `npm ci` runs with a controlled
+environment: inherited `npm_config_*` and `NODE_ENV` are removed, and the
+download cache (`<root>/npm-cache`, integrity-checked by npm and the only
+thing reused between runs), user and global npmrc (`<root>/npmrc`,
+`<root>/npmrc-global`) belong to the runner. A tracked repo `.npmrc` still
+applies. Lifecycle scripts run, as they would locally.
+
+Eligibility is checked on both ends: every deps dir must have a
+`package-lock.json`, no `npm-shrinkwrap.json` (npm would prefer it), no
+tracked files under its `node_modules`, and no two dirs may overlap. On
+the client a violation keeps the run local; on the runner (which also
+rejects a deps dir that is missing or reached through a symlink) it is a
+rejection, which falls back.
+
+A run is green only if the **command** phase exited 0. A failure in deps
+or setup is a final red with that exit code — it is not re-run locally,
+because the local tree's own dependencies could turn it green — and prints
+`lane: remote failed during deps (exit N); this can also be a registry or
+network failure on <runner>`.
+
+### Queue timeout
+
+`remoteQueueTimeoutMs` in the client machine's global config (unset by
+default) bounds how long a remote ticket may wait in the runner's queue.
+If the runner's broker has not started it by then, the runner expires it
+(a ticket that has started always runs to completion) and the client runs
+it locally instead. A user cancel still wins: exit `130`, no local run.
 
 ## Scheduling
 
