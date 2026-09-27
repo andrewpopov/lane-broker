@@ -381,22 +381,26 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
 
   atomicWriteFile(path.join(ticketDir, 'cancelled'), String(Date.now()));
 
-  // BRAIN-319 P3 (Codex re-review): report two separate facts instead of one
-  // overclaiming `cancelledBroker`. `cancelRequested` is "did we durably
-  // record this cancellation at the broker level" (the marker write below,
-  // gated on a broker ticket id actually existing yet). `cancelConfirmed` is
-  // "do we have proof it already took (or will definitely take) effect" --
-  // either `cancelCommand` itself confirmed a real action (exit 0), or the
-  // ticket was never registered with the broker at all, in which case
-  // `cancelCommand` can only fail ("no queued ticket or lease") but the
-  // marker written just above is re-checked, INSIDE the same admission lock,
-  // by scheduler.js's tryStart right before this ticket would ever be
-  // admitted (see its own comment) -- so the marker alone already governs
-  // the outcome and there is nothing further to confirm. A registered-but-
-  // unresponsive supervisor (e.g. SIGSTOPped) is neither of those: it is
-  // genuinely unconfirmed.
+  // BRAIN-319 P3 (Codex re-review, then a focused follow-up pass): report
+  // three separate facts instead of one overclaiming `cancelledBroker`.
+  // `cancelRequested` is "did we durably record this cancellation at the
+  // broker level" (the marker write below, gated on a broker ticket id
+  // actually existing yet) -- that marker is re-checked, INSIDE the same
+  // admission lock, by scheduler.js's tryStart right before this ticket
+  // would ever be admitted (see its own comment), so it alone is what
+  // actually governs the outcome for a not-yet-registered ticket.
+  // `cancelConfirmed` is ONLY true when `cancelCommand` itself reports a
+  // real, already-completed action (exit 0) -- never inferred from
+  // `registered`, which is read WITHOUT the admission lock: admission can
+  // dequeue a ticket (moving it from "queued" to "about to be leased")
+  // between that unlocked read and `cancelCommand`'s own attempt, so
+  // "unregistered at read time" is not proof of anything by the time
+  // `cancelCommand` actually runs. `registered` is reported purely as
+  // informational context for a human reading the JSON, never something a
+  // caller may act on.
   let cancelRequested = false;
   let cancelConfirmed = false;
+  let registered = false;
   const remoteIdPath = path.join(ticketDir, 'remote-id');
   if (fs.existsSync(remoteIdPath)) {
     const remoteLaneId = fs.readFileSync(remoteIdPath, 'utf8').trim();
@@ -410,15 +414,17 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
       const brokerRoot = ensureStateDirs().root;
       writeCancelMarkerFile(brokerRoot, remoteLaneId);
       cancelRequested = true;
-      const wasRegistered =
+      // Informational only (see comment above) -- NOT part of the
+      // cancelConfirmed decision.
+      registered =
         Boolean(readLease(brokerRoot, remoteLaneId)) ||
         Boolean(readAttempt(brokerRoot, remoteLaneId)) ||
         listQueue(brokerRoot).some((t) => t && t.id === remoteLaneId);
       const result = await cancelCommand(remoteLaneId);
-      cancelConfirmed = result.exitCode === 0 || !wasRegistered;
+      cancelConfirmed = result.exitCode === 0;
     }
   }
 
-  process.stdout.write(`${JSON.stringify({ protocol: 1, ticketId, markedCancelled: true, cancelRequested, cancelConfirmed })}\n`);
+  process.stdout.write(`${JSON.stringify({ protocol: 1, ticketId, markedCancelled: true, cancelRequested, cancelConfirmed, registered })}\n`);
   return { exitCode: 0 };
 }

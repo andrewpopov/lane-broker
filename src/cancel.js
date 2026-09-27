@@ -166,9 +166,40 @@ export async function cancelCommand(id) {
   // ORPHANED: no supervisor left to react to the cancel request. Do the kill
   // sequence ourselves, then release.
   await killGroupDirectly(lease.childPgid);
-  const endedAt = Date.now();
-  atomicWriteJson(lease.resultPath, { id, exit: null, signal: 'SIGKILL', startedAt: null, endedAt, waitedMs: null, cancelled: true });
-  appendHistory(root, { id, key: lease.key, cancelled: true, endedAt });
+
+  // BRAIN-319 (older bug, fixed alongside P1/P2/P3): a ticket that fell back
+  // to local and was ADMITTED (leased) still has its attempt record --
+  // attempts.js's own doc comment is explicit that it survives until
+  // `publishTerminal`, exactly like the still-queued/mid-remote-dispatch
+  // cases `cancelAttempt` above already finalizes through. Writing the
+  // plain lease-only SIGKILL result directly here (as this used to) leaves
+  // that record stale once the lease is removed below: a LATER `lane
+  // cancel` on the same id would find no lease, find the stale attempt, and
+  // "reconcile" it via `cancelAttempt`'s ORPHANED-REMOTE branch --
+  // overwriting this already-published result with a synthetic one.
+  // Publishing through the SAME `publishTerminal` transaction removes the
+  // attempt atomically with the result write, and reuses `remoteCancelled
+  // Result` (exit 130, signal null) -- the same shape every other
+  // attempt-tracked cancellation path in this file already produces --
+  // rather than the plain-lease SIGKILL/exit-null shape, so an
+  // attempt-tracked ticket's cancellation result looks the same regardless
+  // of which of the three reconciliation paths actually caught it.
+  const attempt = readAttempt(root, id);
+  if (attempt) {
+    const published = await publishTerminal(root, id, attempt.generation, () => {
+      atomicWriteJson(lease.resultPath, { ...remoteCancelledResult(id, attempt.startedAt), executor: attempt.executor });
+      appendHistory(root, { id, key: lease.key, cancelled: true, endedAt: Date.now(), executor: attempt.executor });
+    });
+    if (!published.ok) {
+      process.stderr.write(`lane cancel: could not reconcile orphaned lease ${id} against its own attempt record\n`);
+      return { exitCode: 1 };
+    }
+  } else {
+    // Plain lease-only ticket (no attempt record) -- unchanged behaviour.
+    const endedAt = Date.now();
+    atomicWriteJson(lease.resultPath, { id, exit: null, signal: 'SIGKILL', startedAt: null, endedAt, waitedMs: null, cancelled: true });
+    appendHistory(root, { id, key: lease.key, cancelled: true, endedAt });
+  }
   removeLease(root, id);
   process.stdout.write(`lane cancel: cancelled orphaned lease ${id}\n`);
   return { exitCode: 0 };

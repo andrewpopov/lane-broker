@@ -568,6 +568,8 @@ test('remote-cancel against a stopped (SIGSTOP) supervisor reports cancelRequest
   // react to SIGTERM while stopped -- cancelCommand's own grace-period wait
   // times out and reports failure, so `cancelConfirmed` must be false even
   // though `cancelRequested` (the durable marker write) always succeeds.
+  // `registered` reflects the (unlocked, informational-only) read that DID
+  // see the lease.
   process.kill(leaseRecord.supervisorPid, 'SIGSTOP');
   try {
     const cancelResult = await laneRun(['remote-cancel', header.ticketId, '--root', root], { env });
@@ -575,6 +577,7 @@ test('remote-cancel against a stopped (SIGSTOP) supervisor reports cancelRequest
     const parsed = JSON.parse(cancelResult.stdout.trim());
     assert.equal(parsed.cancelRequested, true);
     assert.equal(parsed.cancelConfirmed, false);
+    assert.equal(parsed.registered, true);
   } finally {
     // Resume it so nothing leaks past this test -- the pending SIGTERM
     // cancelCommand already sent gets handled the instant it's running again.
@@ -586,6 +589,37 @@ test('remote-cancel against a stopped (SIGSTOP) supervisor reports cancelRequest
 
   const result = await getResult(header.ticketId, root, env);
   assert.equal(result.kind, 'cancelled');
+});
+
+test('remote-cancel against a not-yet-registered id reports cancelRequested true, cancelConfirmed false, registered false (BRAIN-319 P3 follow-up)', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const pauseFile = path.join(tmpDir('remote-exec-pause'), 'go');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ argv: [process.execPath, '-e', 'process.exit(0)'] });
+
+  const stream = encodeSnapshot(src, header, entries);
+  const spawnEnv = { ...env, LANE_BROKER_TEST_PAUSE_AFTER_TICKET_ID: pauseFile };
+  const { child } = spawnRemoteExec(stream, { env: spawnEnv, root });
+
+  // remote-id exists, but onTicketCreated is paused (pauseFile doesn't exist
+  // yet) -- run.js has not spawned the supervisor, so this id is registered
+  // NOWHERE in the local broker (no queue entry, no lease, no attempt
+  // record) at the moment remote-cancel runs.
+  const remoteIdPath = path.join(root, 'tickets', header.ticketId, 'remote-id');
+  await waitFor(() => fs.existsSync(remoteIdPath));
+
+  const cancelResult = await laneRun(['remote-cancel', header.ticketId, '--root', root], { env });
+  assert.equal(cancelResult.code, 0, `stderr: ${cancelResult.stderr}`);
+  const parsed = JSON.parse(cancelResult.stdout.trim());
+  assert.equal(parsed.cancelRequested, true, 'the marker write itself always succeeds');
+  assert.equal(parsed.cancelConfirmed, false, 'cancelCommand had nothing registered to act on yet');
+  assert.equal(parsed.registered, false, 'the (unlocked, informational) read saw no queue/lease/attempt entry');
+
+  fs.mkdirSync(path.dirname(pauseFile), { recursive: true });
+  fs.writeFileSync(pauseFile, '1');
+  const code = await waitClose(child);
+  assert.equal(code, 0);
 });
 
 test('remote-cancel fired in the window between remote-id being recorded and the broker registering it still stops the child (BRAIN-319)', async () => {

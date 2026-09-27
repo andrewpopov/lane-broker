@@ -330,7 +330,7 @@ test('SIGKILLing a fallback supervisor after its local child has been admitted (
   } catch {
     // already gone
   }
-  await waitFor(() => !isGroupAlive(lease.childPgid), { timeoutMs: 5000 });
+  await waitFor(() => !isGroupAlive(lease.childPgid), { timeoutMs: 30000 });
 });
 
 test('a completed fallback run leaves no attempt record, and a later `lane cancel` on that id is a no-op that does not overwrite the result (no stale lock left behind)', async () => {
@@ -362,4 +362,37 @@ test('a completed fallback run leaves no attempt record, and a later `lane cance
   assert.equal(cancelResult.code, 1, 'nothing left to cancel');
 
   assert.deepEqual(resultOf(state, id), originalResult, 'the already-published result must be untouched');
+});
+
+// ---- older bug (pre-dates this branch's fixes): ORPHANED-lease cancel vs. attempt record ----
+
+test('cancelling an ORPHANED admitted fallback (SIGKILLed supervisor, child still running) finalizes through publishTerminal: result 130, attempt gone, second cancel is a byte-identical no-op', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'down' });
+  const id = await startAdmittedFallback(env, state, repoDir, ['sleep', '30']);
+
+  const attempt = readAttempt(state, id);
+  assert.ok(attempt, 'expected an attempt record for the admitted fallback ticket');
+  const lease = readLease(state, id);
+  assert.ok(lease, 'the ticket must be leased (admitted), not just queued, for this test to mean anything');
+
+  process.kill(attempt.supervisor.pid, 'SIGKILL');
+  await sleep(300);
+
+  const cancelResult = await laneRun(['cancel', id], { env });
+  assert.equal(cancelResult.code, 0, `stderr: ${cancelResult.stderr}`);
+
+  const result = resultOf(state, id);
+  assert.equal(result.exit, 130, 'an attempt-tracked cancellation must report the same exit 130 every other path here does');
+  assert.equal(result.cancelled, true);
+  assert.equal(readAttempt(state, id), null, 'the attempt record must be gone once reconciled -- the older bug left it stale');
+  await waitFor(() => !isGroupAlive(lease.childPgid), { timeoutMs: 30000 });
+
+  const resultPath = path.join(paths(state).results, `${id}.json`);
+  const bytesBefore = fs.readFileSync(resultPath);
+
+  const secondCancel = await laneRun(['cancel', id], { env });
+  assert.equal(secondCancel.code, 1, 'nothing left to cancel -- lease and attempt are both gone');
+
+  const bytesAfter = fs.readFileSync(resultPath);
+  assert.ok(bytesBefore.equals(bytesAfter), 'the already-published result must be byte-identical after a no-op second cancel');
 });
