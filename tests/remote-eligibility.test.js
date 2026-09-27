@@ -19,7 +19,7 @@ const RUNNERS = [{ name: 'skybox', ssh: 'skybox-runner' }];
  * back to the caller (BRAIN-319 T3b-1's only observable seam onto the ticket
  * payload -- same pattern as tests/run-not-found-grace.test.js).
  */
-async function captureTicket({ env, cwd, local, extraEnv = {} }) {
+async function captureTicket({ env, cwd, local, lane = 'default', extraEnv = {} }) {
   let capturedTicket = null;
   let spawnCalled = false;
   const spawnSupervisor = (execPath, args, opts) => {
@@ -56,7 +56,7 @@ async function captureTicket({ env, cwd, local, extraEnv = {} }) {
   try {
     const result = await runCommand({
       repo: 'r',
-      lane: 'default',
+      lane,
       cmd: ['true'],
       cwd,
       local,
@@ -112,6 +112,32 @@ for (const [label, cfg, opts] of NO_REMOTE_CASES) {
     assert.equal(Object.prototype.hasOwnProperty.call(ticket, 'remote'), false, 'I6: ineligible ticket must carry no "remote" key at all');
   });
 }
+
+test('an allowed undeclared lane is never remote-eligible even when runners are configured', async () => {
+  const { base, home, env } = freshEnv();
+  writeGlobalConfig(home, {
+    version: 1,
+    capacity: 2,
+    loadClose: 1000,
+    loadOpen: 900,
+    loadOpenSamples: 1,
+    sampleMs: 100,
+    runners: RUNNERS,
+  });
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, {
+    version: 1,
+    undeclaredLanes: 'allow',
+    lanes: { default: { weight: 1 }, prepush: { weight: 2, remote: true } },
+  });
+  gitFixture(['init', '-q'], repoDir);
+
+  const { result, ticket, spawnCalled, stderr } = await captureTicket({ env, cwd: repoDir, lane: 'zirk788' });
+  assert.equal(result.exitCode, 0, `stderr: ${stderr}`);
+  assert.ok(spawnCalled, 'supervisor should have been spawned');
+  assert.ok(ticket, 'ticket should have been captured');
+  assert.equal(Object.prototype.hasOwnProperty.call(ticket, 'remote'), false, 'an allowed undeclared lane must never be remote-eligible');
+});
 
 test('ticket payload carries a "remote" block, with the documented shape, when every condition is met', async () => {
   const { env, repoDir } = setup({ runners: RUNNERS, remote: true });

@@ -209,6 +209,12 @@ function validateRepoConfig(cfg, sourcePath) {
       assert(Array.isArray(pair) && pair.length === 2, `${sourcePath}: each "conflicts" entry must be a 2-element array`);
     }
   }
+  if (cfg.undeclaredLanes !== undefined) {
+    assert(
+      cfg.undeclaredLanes === 'allow' || cfg.undeclaredLanes === 'refuse',
+      `${sourcePath}: "undeclaredLanes" must be "allow" or "refuse"`,
+    );
+  }
 }
 
 export function loadGlobalConfig() {
@@ -370,7 +376,13 @@ export function loadRepoConfig(cwd, configRoot) {
   } catch (err) {
     throw new ConfigError(`${configPath}: invalid JSON (${err.message})`);
   }
-  const cfg = { version: 1, conflicts: [], ...parsed, lanes: { ...DEFAULT_REPO_CONFIG.lanes, ...(parsed.lanes || {}) } };
+  const cfg = {
+    version: 1,
+    conflicts: [],
+    undeclaredLanes: 'refuse',
+    ...parsed,
+    lanes: { ...DEFAULT_REPO_CONFIG.lanes, ...(parsed.lanes || {}) },
+  };
   validateRepoConfig(cfg, configPath);
   return { ...cfg, declared: true };
 }
@@ -416,12 +428,19 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   // that the same repo+lane always maps to the same lease key.
   const repoId = repoIdentityOverride ? sanitizeKey(repoIdentityOverride) : sanitizeKey(commonDir || repo || cwd);
   const laneName = lane || 'default';
-  if (repoConfig.declared && !Object.prototype.hasOwnProperty.call(repoConfig.lanes, laneName)) {
+  const isDeclaredLane = Object.prototype.hasOwnProperty.call(repoConfig.lanes, laneName);
+  if (repoConfig.declared && !isDeclaredLane && repoConfig.undeclaredLanes !== 'allow') {
     const declared = Object.keys(repoConfig.lanes).sort().join(', ');
     throw new ConfigError(`unknown lane "${laneName}"; declared: ${declared}`);
   }
   const laneCfg = repoConfig.lanes[laneName] || { weight: DEFAULT_REPO_CONFIG.lanes.default.weight };
-  const laneNames = Object.keys(repoConfig.lanes);
+  const declaredLaneNames = Object.keys(repoConfig.lanes);
+  // BRAIN-319 (undeclaredLanes: "allow"): an allowed undeclared lane resolves
+  // like the no-config-file case in every other respect, but a declared
+  // lane's `["*", "other"]` conflict must still reach it -- so it joins the
+  // conflict-expansion universe (never `repoConfig.lanes` itself, which
+  // stays declared-only) purely so `expandConflicts`'s `*` wildcard sees it.
+  const laneNames = isDeclaredLane ? declaredLaneNames : [...declaredLaneNames, laneName];
   const adj = expandConflicts(repoConfig.conflicts || [], laneNames);
   const conflictingLaneNames = adj.has(laneName) ? [...adj.get(laneName)] : [];
   const key = `${repoId}:${sanitizeKey(laneName)}`;

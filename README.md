@@ -53,7 +53,7 @@ features like pipes or globbing.
 | Flag | Purpose |
 |---|---|
 | `--repo <name>` | Repo label, used only as a fallback for the lease key. When `cwd` is inside a git repo, the git identity (`git rev-parse --git-common-dir`) always wins, so the same repo resolves to the same key whether or not `--repo` is passed; `--repo` only determines the key outside a git repo. |
-| `--lane <name>` | Lane name (`default` if omitted); looked up in `.lane-broker.json`. If the repo config declares `lanes`, an undeclared name is refused (exit `64`) rather than silently keying on a private, unconflicting lane. |
+| `--lane <name>` | Lane name (`default` if omitted); looked up in `.lane-broker.json`. If the repo config declares `lanes`, an undeclared name is refused (exit `64`) rather than silently keying on a private, unconflicting lane — unless the repo config sets `"undeclaredLanes": "allow"`, in which case an undeclared name resolves like the no-config-file case (default weight, never remote-eligible) instead of being refused. |
 | `--weight <n>` | Override the configured weight for this run; must be a positive number (validated before enqueueing, exit `2` otherwise). |
 | `--cpu <cores>` | Override the lane's CPU reservation; fractional cores are supported. |
 | `--memory <size>` | Override the lane's memory reservation, e.g. `768MiB` or `4GiB`. |
@@ -165,6 +165,14 @@ conflict, regardless of `conflicts` — unless that lane declares
 `maxConcurrent`. With no config file, there is a single `default` lane of
 weight 2.
 
+A top-level `"undeclaredLanes": "allow"` (default `"refuse"`, today's
+behaviour) lets an undeclared `--lane` name through instead of refusing it:
+it resolves exactly like the no-config-file case (default weight, never
+remote-eligible, no `conflicts` entry of its own), except that a declared
+lane's `["*", "other"]` conflict still reaches it. This exists so a repo can
+declare and remote-enable one specific lane (e.g. `prepush`) while its
+sessions keep using ad-hoc lane names for everything else.
+
 A lane's own `maxConcurrent` (integer >= 1, e.g. `"fleet": { "weight": 1,
 "maxConcurrent": 4 }`) relaxes ONLY the same-key rule above: up to that many
 same-key tickets may hold a lease at once, each counted individually against
@@ -207,8 +215,15 @@ without `remote: true`, nothing changes.
 
 ```json
 // .lane-broker.json (the repo)
-"lanes": { "prepush": { "weight": 2, "remote": true } }
+{
+  "undeclaredLanes": "allow",
+  "lanes": { "prepush": { "weight": 2, "remote": true } }
+}
 ```
+
+`undeclaredLanes: "allow"` opts one lane (`prepush` here) into remote
+runners while leaving every other, ad-hoc lane name usable without being
+refused as undeclared.
 
 `ssh` is an ssh destination (an alias from `~/.ssh/config`, or
 `ssh://user@host:port`); it may not start with `-`. `shell` (default
