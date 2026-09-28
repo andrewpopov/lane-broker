@@ -257,10 +257,35 @@ function validateRepoConfig(cfg, sourcePath) {
     }
   }
   if (cfg.undeclaredLanes !== undefined) {
-    assert(
-      cfg.undeclaredLanes === 'allow' || cfg.undeclaredLanes === 'refuse',
-      `${sourcePath}: "undeclaredLanes" must be "allow" or "refuse"`,
-    );
+    if (cfg.undeclaredLanes === 'allow' || cfg.undeclaredLanes === 'refuse') {
+      // valid string forms
+    } else if (cfg.undeclaredLanes && typeof cfg.undeclaredLanes === 'object' && !Array.isArray(cfg.undeclaredLanes)) {
+      // BRAIN-325: {"as": "<declared lane>"} -- an undeclared lane is allowed
+      // and inherits sizing/remote settings from the named declared lane. See
+      // resolveTicketConfig's own doc comment for what is/isn't inherited.
+      const keys = Object.keys(cfg.undeclaredLanes);
+      assert(
+        keys.length === 1 && keys[0] === 'as',
+        `${sourcePath}: "undeclaredLanes" object must have exactly the key "as"`,
+      );
+      assert(
+        typeof cfg.undeclaredLanes.as === 'string' && cfg.undeclaredLanes.as.length > 0,
+        `${sourcePath}: "undeclaredLanes.as" must be a non-empty string`,
+      );
+      assert(
+        Object.prototype.hasOwnProperty.call(cfg.lanes, cfg.undeclaredLanes.as),
+        `${sourcePath}: "undeclaredLanes.as" must name a declared lane`,
+      );
+      assert(
+        cfg.lanes[cfg.undeclaredLanes.as].localRefused !== true,
+        `${sourcePath}: "undeclaredLanes.as" template lane "${cfg.undeclaredLanes.as}" must not be localRefused`,
+      );
+    } else {
+      assert(
+        false,
+        `${sourcePath}: "undeclaredLanes" must be "allow" or "refuse" (or an object {"as": "<declared lane>"})`,
+      );
+    }
   }
 }
 
@@ -476,11 +501,40 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   const repoId = repoIdentityOverride ? sanitizeKey(repoIdentityOverride) : sanitizeKey(commonDir || repo || cwd);
   const laneName = lane || 'default';
   const isDeclaredLane = Object.prototype.hasOwnProperty.call(repoConfig.lanes, laneName);
-  if (repoConfig.declared && !isDeclaredLane && repoConfig.undeclaredLanes !== 'allow') {
+  // BRAIN-325: {"as": "<declared lane>"} is an allow form that additionally
+  // names a template lane to inherit sizing/remote settings from.
+  const undeclaredTemplateName =
+    repoConfig.undeclaredLanes && typeof repoConfig.undeclaredLanes === 'object'
+      ? repoConfig.undeclaredLanes.as
+      : null;
+  const undeclaredAllowed = repoConfig.undeclaredLanes === 'allow' || undeclaredTemplateName !== null;
+  if (repoConfig.declared && !isDeclaredLane && !undeclaredAllowed) {
     const declared = Object.keys(repoConfig.lanes).sort().join(', ');
     throw new ConfigError(`unknown lane "${laneName}"; declared: ${declared}`);
   }
-  const laneCfg = repoConfig.lanes[laneName] || { weight: DEFAULT_REPO_CONFIG.lanes.default.weight };
+  let laneCfg;
+  if (isDeclaredLane) {
+    laneCfg = repoConfig.lanes[laneName];
+  } else if (undeclaredTemplateName) {
+    // Inherit weight/cpuCores/memoryBytes/nice/remote/remoteDeps/remoteSetup
+    // from the named declared lane, keeping this lane's OWN key/name. Not
+    // inherited: `localRefused` (stays default false), the template's named
+    // conflicts (only the `*` wildcard universe below reaches this lane, same
+    // as any other undeclared-but-allowed lane), and `maxConcurrent` (stays
+    // the default of 1, below).
+    const templateCfg = repoConfig.lanes[undeclaredTemplateName];
+    laneCfg = {
+      weight: templateCfg.weight,
+      cpuCores: templateCfg.cpuCores,
+      memoryBytes: templateCfg.memoryBytes,
+      nice: templateCfg.nice,
+      remote: templateCfg.remote,
+      remoteDeps: templateCfg.remoteDeps,
+      remoteSetup: templateCfg.remoteSetup,
+    };
+  } else {
+    laneCfg = { weight: DEFAULT_REPO_CONFIG.lanes.default.weight };
+  }
   const declaredLaneNames = Object.keys(repoConfig.lanes);
   // BRAIN-319 (undeclaredLanes: "allow"): an allowed undeclared lane resolves
   // like the no-config-file case in every other respect, but a declared

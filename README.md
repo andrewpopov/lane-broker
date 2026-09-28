@@ -173,6 +173,19 @@ lane's `["*", "other"]` conflict still reaches it. This exists so a repo can
 declare and remote-enable one specific lane (e.g. `prepush`) while its
 sessions keep using ad-hoc lane names for everything else.
 
+`"undeclaredLanes": {"as": "<declared lane>"}` (BRAIN-325) is a second allow
+form: an undeclared `--lane` name still keeps its own key and name (the
+same-key exclusivity rule above is unaffected — two sessions using the same
+ad-hoc name still conflict with each other), but instead of the no-config-file
+default it inherits `weight`, `cpuCores`, `memoryBytes`, `nice`, `remote`,
+`remoteDeps` and `remoteSetup` from the named declared lane. It does NOT
+inherit that lane's own named `conflicts` entries or its `maxConcurrent`
+(stays `1`) — only the `*` wildcard universe still reaches it, same as plain
+`"allow"`. The named lane must be declared and must not be `localRefused`.
+This is for a repo where every ad-hoc per-ticket lane (e.g. `zirk812`) should
+run at the same size and remote eligibility as one canonical template lane,
+without an operator hand-declaring each one.
+
 A lane's own `maxConcurrent` (integer >= 1, e.g. `"fleet": { "weight": 1,
 "maxConcurrent": 4 }`) relaxes ONLY the same-key rule above: up to that many
 same-key tickets may hold a lease at once, each counted individually against
