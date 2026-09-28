@@ -139,6 +139,43 @@ test('an allowed undeclared lane is never remote-eligible even when runners are 
   assert.equal(Object.prototype.hasOwnProperty.call(ticket, 'remote'), false, 'an allowed undeclared lane must never be remote-eligible');
 });
 
+// BRAIN-325: this is the seam through which the remote runner side resolves
+// an undeclared lane too -- `lane remote-exec` snapshots `.lane-broker.json`
+// and calls this same `runCommand` -> `resolveTicketConfig` path with
+// `configRoot` pointed at the snapshot work dir (src/remote-runner.js), so
+// there is no separate "remote-side" resolver to keep in sync.
+test('an "as"-resolved undeclared lane inherits remote eligibility (weight, cpuCores, memoryBytes) from its template', async () => {
+  const { base, home, env } = freshEnv();
+  writeGlobalConfig(home, {
+    version: 1,
+    capacity: 2,
+    loadClose: 1000,
+    loadOpen: 900,
+    loadOpenSamples: 1,
+    sampleMs: 100,
+    runners: RUNNERS,
+  });
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, {
+    version: 1,
+    undeclaredLanes: { as: 'prepush' },
+    lanes: {
+      default: { weight: 1 },
+      prepush: { weight: 2, cpuCores: 1.5, memoryBytes: 1073741824, remote: true, remoteDeps: ['.'] },
+    },
+  });
+  gitFixture(['init', '-q'], repoDir);
+
+  const { result, ticket, spawnCalled, stderr } = await captureTicket({ env, cwd: repoDir, lane: 'zirk812' });
+  assert.equal(result.exitCode, 0, `stderr: ${stderr}`);
+  assert.ok(spawnCalled, 'supervisor should have been spawned');
+  assert.ok(ticket, 'ticket should have been captured');
+  assert.ok(ticket.remote, 'an "as"-resolved undeclared lane inheriting remote:true must be remote-eligible');
+  assert.equal(ticket.remote.weight, 2);
+  assert.equal(ticket.remote.cpuCores, 1.5);
+  assert.equal(ticket.remote.memoryBytes, 1073741824);
+});
+
 test('ticket payload carries a "remote" block, with the documented shape, when every condition is met', async () => {
   const { env, repoDir } = setup({ runners: RUNNERS, remote: true });
   const { result, ticket, stderr } = await captureTicket({ env, cwd: repoDir });
