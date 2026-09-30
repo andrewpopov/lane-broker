@@ -958,6 +958,13 @@ test('remote-result state: a queued runner-side lane is queued', async () => {
   assert.equal(r.state, 'queued');
 });
 
+test('remote-result state: a queued entry whose supervisor is dead is gone', async () => {
+  const f = await stateFixture();
+  const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
+  await enqueue(f.state, { id: f.laneId, key: 'k:default', weight: 1, supervisorPid: Number(dead.stdout.toString()) });
+  assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'gone');
+});
+
 test('remote-result state: a lease whose supervisor is alive is running; a dead one is gone', async () => {
   const f = await stateFixture();
   const lease = {

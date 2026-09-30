@@ -607,6 +607,12 @@ export async function dispatchRemote(opts) {
     if (fetched && fetched.state === 'gone') break;
     if (!alive) {
       if (attemptsMade >= resultAttempts) break;
+      // A failed fetch (null) means the transport is likely still down: back off between tries.
+      // A {missing:true} with no state (older runner) keeps the back-to-back retries.
+      if (!fetched) {
+        await sleep(backoffMs, abortSignal);
+        backoffMs = Math.min(backoffMs * 2, RESULT_POLL_MAX_MS);
+      }
       continue;
     }
     waitedFrom ??= now();

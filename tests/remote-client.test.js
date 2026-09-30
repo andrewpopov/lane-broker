@@ -792,7 +792,9 @@ if (cmd.includes('remote-exec')) {
   const script = JSON.parse(fs.readFileSync(${JSON.stringify(scriptPath)}, 'utf8'));
   const n = Number(fs.readFileSync(${JSON.stringify(countPath)}, 'utf8'));
   fs.writeFileSync(${JSON.stringify(countPath)}, String(n + 1));
-  process.stdout.write(JSON.stringify(script[Math.min(n, script.length - 1)]) + '\\n');
+  const entry = script[Math.min(n, script.length - 1)];
+  if (entry === null) process.exit(1);
+  process.stdout.write(JSON.stringify(entry) + '\\n');
 } else if (cmd.includes('remote-cancel')) {
   fs.appendFileSync(${JSON.stringify(logPath)}, 'cancel\\n');
   process.stdout.write('{}\\n');
@@ -865,6 +867,12 @@ test('dispatchRemote: the poll backoff grows to a 30s cap', async () => {
     [...Array(8).fill({ protocol: 1, missing: true, state: 'queued' }), 'RESULT'],
   );
   assert.deepEqual(clock.slept, [5000, 10_000, 20_000, 30_000, 30_000, 30_000, 30_000, 30_000]);
+});
+
+test('dispatchRemote: failed fetches back off between attempts, then running, then a result is confirmed', async () => {
+  const { result, clock } = await dispatchWithScript([null, null, { protocol: 1, missing: true, state: 'running' }, 'RESULT']);
+  assert.equal(result.outcome, 'confirmed');
+  assert.deepEqual(clock.slept, [5000, 10_000, 20_000]);
 });
 
 test('dispatchRemote: state gone is unconfirmed after one fetch, without waiting', async () => {

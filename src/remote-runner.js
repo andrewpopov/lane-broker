@@ -523,7 +523,10 @@ export function remoteTicketState(ticketDir, brokerRoot, now = Date.now()) {
   if (!isUuid(laneId)) return 'gone';
   const lease = readLease(brokerRoot, laneId);
   if (lease && (isSupervisorAlive(lease) || isGroupAlive(lease.childPgid))) return 'running';
-  if (listQueue(brokerRoot).some((t) => t && t.id === laneId)) return 'queued';
+  const queued = listQueue(brokerRoot).some(
+    (t) => t && t.id === laneId && isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart }),
+  );
+  if (queued) return 'queued';
   try {
     const finished = fs.statSync(path.join(paths(brokerRoot).results, `${laneId}.json`));
     if (now - finished.mtimeMs < RESULT_FINALIZE_GRACE_MS) return 'running';
