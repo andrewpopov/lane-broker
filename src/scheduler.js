@@ -1,11 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, writeExpireMarkerFile } from './state.js';
-import { sampleAndUpdateGate } from './load.js';
+import { sampleAndUpdateGate, readGateState } from './load.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
-import { evaluateNewAdmission, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock } from './admission.js';
+import { evaluateNewAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
-import { detectResourceCapacity, effectiveWeightCapacity } from './resources.js';
+import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, resolveTicketResources } from './resources.js';
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
  *  possibly-running work and must count against both conflicts and capacity. */
@@ -97,6 +97,51 @@ export function blockedBy(held, ticket) {
   }
   const ceiling = Number.isInteger(ticket.maxConcurrent) && ticket.maxConcurrent >= 1 ? ticket.maxConcurrent : 1;
   return sameKeyHeld.length >= ceiling ? sameKeyHeld[sameKeyHeld.length - 1] : null;
+}
+
+/**
+ * BRAIN-338: a READ-ONLY answer to "would `tryStart` admit this not-yet-
+ * queued ticket right now?", so the supervisor can decide between queuing
+ * on a busy runner and running locally. It takes the same gates `tryStart`
+ * does, from the same helpers (`blockedBy`, `effectiveWeightCapacity`,
+ * `cooldownActive`, `evaluateMemoryAdmission`, the persisted load gate),
+ * but never samples CPU or writes any state -- `tryStart` samples under the
+ * lock and that sample mutates shared baselines. So the CPU projected-over-
+ * budget check is deliberately not repeated here; an approximate "yes"
+ * only means the ticket runs locally as it did before this seam existed.
+ * Returns `{ admit, reason }`.
+ */
+export function couldAdmitNow(root, cfg, ticket, memoryReader = readMemoryInfo) {
+  if (listQueue(root).length > 0) return { admit: false, reason: 'queue-ahead' };
+  if (fs.existsSync(paths(root).pause)) return { admit: false, reason: 'paused' };
+  const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
+  if (blockedBy(held, ticket)) return { admit: false, reason: 'conflict' };
+  const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
+  if (runningWeight + ticket.weight > effectiveWeightCapacity(cfg, detectResourceCapacity().cpuCores)) {
+    return { admit: false, reason: 'capacity' };
+  }
+  if (cfg.admissionLoadGate && held.length > 0 && readGateState(root).closed) return { admit: false, reason: 'load-gate-closed' };
+  let memInfo = null;
+  try {
+    memInfo = memoryReader();
+  } catch {
+    memInfo = null;
+  }
+  if (memInfo && memInfo.macPressure === 'critical') return { admit: false, reason: 'memory-critical' };
+  if (cfg.schedulerMode === 'active') {
+    if (cooldownActive(held, cfg)) return { admit: false, reason: 'cooldown' };
+    if (memInfo) {
+      const candidateResources = resolveTicketResources({
+        weight: ticket.weight,
+        cpuCores: ticket.resources?.cpuCores,
+        memoryBytes: ticket.resources?.memoryBytes,
+        defaultMemoryBytesPerWeight: cfg.defaultMemoryBytesPerWeight,
+      });
+      const memory = evaluateMemoryAdmission({ memoryInfo: memInfo, heldLeases: held, candidateResources, cfg });
+      if (!memory.admit) return { admit: false, reason: memory.reason };
+    }
+  }
+  return { admit: true, reason: 'ok' };
 }
 
 /** Coerce a persisted (possibly corrupt) skip-count file into a safe shape. Exported for
