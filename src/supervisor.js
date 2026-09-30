@@ -501,7 +501,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
   let queuedAt;
   if (queuedChoice) {
     queuedAt = `${runner.name}(${probe.queued})`;
-    const local = couldAdmitNow(root, globalCfg, enriched);
+    const local = await couldAdmitNow(root, globalCfg, enriched);
     if (local.admit) {
       const reason = skipped.map((s) => `${s.name}: ${s.reason}`).join('; ');
       return fallbackOrRefuse(null, `${reason}; local can admit now, not queuing on ${queuedAt}`);

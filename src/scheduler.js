@@ -100,18 +100,46 @@ export function blockedBy(held, ticket) {
 }
 
 /**
- * BRAIN-338: a READ-ONLY answer to "would `tryStart` admit this not-yet-
- * queued ticket right now?", so the supervisor can decide between queuing
- * on a busy runner and running locally. It takes the same gates `tryStart`
- * does, from the same helpers (`blockedBy`, `effectiveWeightCapacity`,
- * `cooldownActive`, `evaluateMemoryAdmission`, the persisted load gate),
- * but never samples CPU or writes any state -- `tryStart` samples under the
- * lock and that sample mutates shared baselines. So the CPU projected-over-
- * budget check is deliberately not repeated here; an approximate "yes"
- * only means the ticket runs locally as it did before this seam existed.
+ * The liveness maintenance every admission decision starts with: reap/orphan
+ * stale leases, and dequeue queued tickets whose supervisor already died
+ * (crashed, or the machine killed it) so they never sit at the FIFO head
+ * forever. `keepTicketId` is the caller's own ticket, never dequeued here.
+ * Caller must hold the global lock.
+ */
+export function reapStale(root, keepTicketId) {
+  reapAll(root, bootId());
+  for (const t of listQueue(root)) {
+    if (t && t.id !== keepTicketId && !isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart })) {
+      dequeueSync(root, t.id);
+    }
+  }
+}
+
+/**
+ * BRAIN-338: "would `tryStart` admit this not-yet-queued ticket right now?",
+ * so the supervisor can decide between queuing on a busy runner and running
+ * locally. It takes the same gates `tryStart` does, from the same helpers
+ * (`reapStale`, `blockedBy`, `effectiveWeightCapacity`, `cooldownActive`,
+ * `evaluateMemoryAdmission`, the persisted load gate), under the same global
+ * lock. It performs the same stale-record reaping every `tryStart` poll
+ * performs, but never samples CPU or advances the load gate. The CPU
+ * projected-over-budget check is deliberately not repeated (sampling mutates
+ * shared baselines); an optimistic "yes" only means the ticket runs locally
+ * as before.
+ *
+ * Accepted limitation: with `admissionLoadGate` on, the persisted gate state
+ * is read without sampling, so a gate one low-load sample from reopening
+ * reads closed and the ticket may queue remotely instead of starting locally.
  * Returns `{ admit, reason }`.
  */
-export function couldAdmitNow(root, cfg, ticket, memoryReader = readMemoryInfo) {
+export async function couldAdmitNow(root, cfg, ticket, memoryReader = readMemoryInfo) {
+  return withLock(root, () => {
+    reapStale(root, ticket.id);
+    return couldAdmitLocked(root, cfg, ticket, memoryReader);
+  });
+}
+
+function couldAdmitLocked(root, cfg, ticket, memoryReader) {
   if (listQueue(root).length > 0) return { admit: false, reason: 'queue-ahead' };
   if (fs.existsSync(paths(root).pause)) return { admit: false, reason: 'paused' };
   const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
@@ -416,15 +444,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
   const { result, logFields } = await withLock(root, () => {
     const cfg = reloadCfg() || globalCfg;
     const now = Date.now();
-    reapAll(root, bootId());
-    // A queued ticket whose supervisor already died (crashed, or the machine
-    // killed it) must not sit at the FIFO head forever — dequeue it before
-    // checking who's next.
-    for (const t of listQueue(root)) {
-      if (t && t.id !== ticket.id && !isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart })) {
-        dequeueSync(root, t.id);
-      }
-    }
+    reapStale(root, ticket.id);
     const queue = listQueue(root);
     const position = queue.findIndex((t) => t && t.id === ticket.id);
     if (position === -1) {

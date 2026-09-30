@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { freshEnv, writeGlobalConfig, laneRun, waitFor, writeRepoConfig } from './helpers.js';
+import { spawn } from 'node:child_process';
 import { tmpDir, makeRunner, setup, markerCmd, detachAndWait, resultOf } from './remote-harness.js';
 import { selectRunner } from '../src/remote-client.js';
 import { couldAdmitNow, enqueue } from '../src/scheduler.js';
@@ -111,32 +112,66 @@ const cfg = { ...DEFAULT_GLOBAL_CONFIG, capacity: 2, schedulerMode: 'shadow' };
 const holder = (id, key = 'other:key', weight = 1) =>
   ({ id, key, bootId: bootId(), supervisorPid: process.pid, weight, state: LEASE_STATE.RUNNING, admittedAt: 0 });
 
-test('couldAdmitNow: idle broker admits', () => {
+test('couldAdmitNow: idle broker admits', async () => {
   const { state } = freshEnv();
-  assert.deepEqual(couldAdmitNow(state, cfg, ticket, () => null), { admit: true, reason: 'ok' });
+  assert.deepEqual(await couldAdmitNow(state, cfg, ticket, () => null), { admit: true, reason: 'ok' });
 });
 
 test('couldAdmitNow: denies on capacity, same-key conflict, pause and queue-ahead', async () => {
   const { state } = freshEnv();
   writeLease(state, holder('h1', 'other:key', 2));
-  assert.equal(couldAdmitNow(state, cfg, ticket, () => null).reason, 'capacity');
+  assert.equal((await couldAdmitNow(state, cfg, ticket, () => null)).reason, 'capacity');
 
   const s2 = freshEnv().state;
   writeLease(s2, holder('h2', ticket.key, 1));
-  assert.equal(couldAdmitNow(s2, cfg, ticket, () => null).reason, 'conflict');
+  assert.equal((await couldAdmitNow(s2, cfg, ticket, () => null)).reason, 'conflict');
 
   const s3 = freshEnv().state;
   fs.writeFileSync(paths(s3).pause, 'maintenance');
-  assert.equal(couldAdmitNow(s3, cfg, ticket, () => null).reason, 'paused');
+  assert.equal((await couldAdmitNow(s3, cfg, ticket, () => null)).reason, 'paused');
 
   const s4 = freshEnv().state;
   await enqueue(s4, { ...ticket, id: 'ahead', supervisorPid: process.pid, supervisorStart: null });
-  assert.equal(couldAdmitNow(s4, cfg, ticket, () => null).reason, 'queue-ahead');
+  assert.equal((await couldAdmitNow(s4, cfg, ticket, () => null)).reason, 'queue-ahead');
 });
 
-test('couldAdmitNow: memory-critical pressure denies', () => {
+test('couldAdmitNow: memory-critical pressure denies', async () => {
   const { state } = freshEnv();
-  assert.equal(couldAdmitNow(state, cfg, ticket, () => ({ availableBytes: 1e12, totalBytes: 1e12, macPressure: 'critical' })).reason, 'memory-critical');
+  assert.equal((await couldAdmitNow(state, cfg, ticket, () => ({ availableBytes: 1e12, totalBytes: 1e12, macPressure: 'critical' }))).reason, 'memory-critical');
+});
+
+// Reaping: crash/reboot leftovers must not read as queue-ahead / conflict / capacity.
+
+async function deadPid() {
+  const child = spawn(process.execPath, ['-e', '0'], { stdio: 'ignore' });
+  await new Promise((resolve) => child.on('exit', resolve));
+  return child.pid;
+}
+
+test('couldAdmitNow: a queued record whose supervisor is dead is reaped, not counted as queue-ahead', async () => {
+  const { state } = freshEnv();
+  await enqueue(state, { ...ticket, id: 'ghost', supervisorPid: await deadPid(), supervisorStart: null });
+  assert.deepEqual(await couldAdmitNow(state, cfg, ticket, () => null), { admit: true, reason: 'ok' });
+  assert.equal(fs.readdirSync(paths(state).queue).length, 0, 'the dead record was dequeued');
+});
+
+test('couldAdmitNow: a lease whose supervisor and group are dead is reaped, not counted as conflict or capacity', async () => {
+  const { state } = freshEnv();
+  const dead = await deadPid();
+  writeLease(state, { ...holder('dead-same-key', ticket.key), supervisorPid: dead, childPgid: dead });
+  writeLease(state, { ...holder('dead-heavy', 'other:key', 2), supervisorPid: dead, childPgid: dead });
+  assert.deepEqual(await couldAdmitNow(state, cfg, ticket, () => null), { admit: true, reason: 'ok' });
+});
+
+test('couldAdmitNow: a lease whose supervisor is dead but whose group is alive still blocks', async () => {
+  const { state } = freshEnv();
+  const child = spawn('sleep', ['30'], { detached: true, stdio: 'ignore' });
+  try {
+    writeLease(state, { ...holder('orphan', 'other:key', 2), supervisorPid: await deadPid(), childPgid: child.pid });
+    assert.equal((await couldAdmitNow(state, cfg, ticket, () => null)).reason, 'capacity');
+  } finally {
+    process.kill(-child.pid, 'SIGKILL');
+  }
 });
 
 // ---- maxRemoteQueue config ----
