@@ -10,7 +10,7 @@ import { freshEnv, writeGlobalConfig, BIN, laneRun, sleep, waitFor } from './hel
 import { manifestHashOf, verifyManifestNoGit } from '../src/remote-manifest.js';
 import { encodeSnapshot, serializeHeader, MAX_HEADER_BYTES } from '../src/remote-stream.js';
 import { sanitizeKey } from '../src/config.js';
-import { paths, readJsonSafe } from '../src/state.js';
+import { paths, readJsonSafe, bootId, processStartTime } from '../src/state.js';
 import { writeLease } from '../src/lease.js';
 import { enqueue } from '../src/scheduler.js';
 
@@ -925,77 +925,80 @@ test('remote-result reports {missing:true} for an unknown ticket, and the real r
 
 // ---- remote-result state (BRAIN-339) ----
 
-/** A ticket dir on a fresh runner root, optionally with a `remote-id`; the broker state dirs
- *  are created by a first remote-result call. */
-async function stateFixture({ withRemoteId = true } = {}) {
+/** A ticket dir on a fresh runner root. `publisher` (default: this live test process) is written
+ *  as publisher.json unless null; `remoteId` as remote-id unless false. Broker state dirs are
+ *  created by a first remote-result call. */
+async function stateFixture({ publisher = 'self', remoteId = true } = {}) {
   const { env, state } = freshShadowEnv();
   const root = tmpDir('remote-exec-root');
   const ticketId = crypto.randomUUID();
   const laneId = crypto.randomUUID();
   const ticketDir = path.join(root, 'tickets', ticketId);
   fs.mkdirSync(ticketDir, { recursive: true });
-  if (withRemoteId) fs.writeFileSync(path.join(ticketDir, 'remote-id'), laneId);
+  if (remoteId) fs.writeFileSync(path.join(ticketDir, 'remote-id'), laneId);
+  if (publisher) {
+    const record = publisher === 'self' ? { pid: process.pid, start: processStartTime(process.pid), bootId: bootId() } : publisher;
+    fs.writeFileSync(path.join(ticketDir, 'publisher.json'), JSON.stringify(record));
+  }
   await getResult(ticketId, root, env);
   return { env, state, root, ticketId, laneId, ticketDir };
 }
 
-test('remote-result state: a ticket with no remote-id (never started) is gone', async () => {
-  const f = await stateFixture({ withRemoteId: false });
-  const r = await getResult(f.ticketId, f.root, f.env);
-  assert.deepEqual(r, { protocol: 1, missing: true, state: 'gone' });
-});
+function deadPid() {
+  return Number(spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']).stdout.toString());
+}
 
-test('remote-result state: remote-id with nothing alive and no result is gone', async () => {
+test('remote-result state: a live publisher that is not queued is running', async () => {
   const f = await stateFixture();
-  assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'gone');
+  assert.deepEqual(await getResult(f.ticketId, f.root, f.env), { protocol: 1, missing: true, state: 'running' });
 });
 
-test('remote-result state: a queued runner-side lane is queued', async () => {
+test('remote-result state: a live publisher whose lane is queued is queued', async () => {
   const f = await stateFixture();
   await enqueue(f.state, { id: f.laneId, key: 'k:default', weight: 1, supervisorPid: process.pid });
-  const r = await getResult(f.ticketId, f.root, f.env);
-  assert.equal(r.missing, true);
-  assert.equal(r.state, 'queued');
+  assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'queued');
 });
 
-test('remote-result state: a queued entry whose supervisor is dead is gone', async () => {
-  const f = await stateFixture();
-  const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
-  await enqueue(f.state, { id: f.laneId, key: 'k:default', weight: 1, supervisorPid: Number(dead.stdout.toString()) });
-  assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'gone');
-});
-
-test('remote-result state: a lease whose supervisor is alive is running; a dead one is gone', async () => {
-  const f = await stateFixture();
-  const lease = {
-    id: f.laneId,
-    key: 'k:default',
-    weight: 1,
-    supervisorPid: process.pid,
-    supervisorStart: null,
-    childPgid: process.pid,
-    startedAt: Date.now(),
-    heartbeatAt: Date.now(),
-  };
-  writeLease(f.state, lease);
+test('remote-result state: a live publisher with no remote-id yet (pre-admission) is running', async () => {
+  const f = await stateFixture({ remoteId: false });
   assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'running');
+});
 
-  const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
-  const deadPid = Number(dead.stdout.toString());
-  writeLease(f.state, { ...lease, supervisorPid: deadPid, childPgid: deadPid });
+test('remote-result state: a dead publisher pid is gone', async () => {
+  const pid = deadPid();
+  const f = await stateFixture({ publisher: { pid, start: 'Mon Jan  1 00:00:00 2024', bootId: bootId() } });
   assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'gone');
 });
 
-test('remote-result state: a just-recorded broker result (remote-exec finalizing) is running', async () => {
-  const f = await stateFixture();
-  const resultsDir = paths(f.state).results;
-  fs.mkdirSync(resultsDir, { recursive: true });
-  const file = path.join(resultsDir, `${f.laneId}.json`);
-  fs.writeFileSync(file, JSON.stringify({ exit: 0 }));
-  assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'running');
-  const old = new Date(Date.now() - 120_000);
-  fs.utimesSync(file, old, old);
+test('remote-result state: a publisher pid reused by another process (start-time mismatch) is gone', async () => {
+  const f = await stateFixture({ publisher: { pid: process.pid, start: 'Mon Jan  1 00:00:00 2001', bootId: bootId() } });
   assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'gone');
+});
+
+test('remote-result state: a publisher from a different boot is gone', async () => {
+  const f = await stateFixture({ publisher: { pid: process.pid, start: processStartTime(process.pid), bootId: 'some-other-boot' } });
+  assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'gone');
+});
+
+test('remote-result state: no publisher.json (older runner) is gone', async () => {
+  const f = await stateFixture({ publisher: null });
+  assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'gone');
+});
+
+test('remote-exec writes publisher.json naming its own process, boot and start time', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader();
+  const stream = encodeSnapshot(src, header, entries);
+  const { child } = spawnRemoteExec(stream, { env, root });
+  const remoteExecPid = child.pid;
+  const publisherFile = path.join(root, 'tickets', header.ticketId, 'publisher.json');
+  await waitClose(child);
+  const publisher = JSON.parse(fs.readFileSync(publisherFile, 'utf8'));
+  assert.equal(publisher.pid, remoteExecPid);
+  assert.equal(publisher.bootId, bootId());
+  assert.equal(typeof publisher.start, 'string');
 });
 
 test('remote-result state: a present result.json is returned as-is, with no state', async () => {

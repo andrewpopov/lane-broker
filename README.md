@@ -373,14 +373,19 @@ ssh keepalive (15 s x 4) ends a session after about a minute of silence
 (network blip, laptop sleep), but the job on the runner keeps going. The
 client then polls `lane remote-result` (5 s backoff, growing to 30 s) as
 long as the runner reports the ticket `queued` or `running`, and uses the
-result when it lands; it does not rerun the work locally. It gives up
-(and falls back to local) as soon as the runner reports `gone` (no such
-ticket, killed, or never started), or after `remoteResultWaitMs` in the
+result when it lands; it does not rerun the work locally. "Alive" means
+the `remote-exec` process that will publish `result.json` is alive: it
+records itself in the ticket's `publisher.json` (pid, start time, boot id)
+as soon as the ticket dir exists, and `queued` vs `running` is only a
+label. The client gives up (and falls back to local) as soon as the
+runner reports `gone` (no such ticket, a dead publisher, or a ticket from
+a runner version that writes no `publisher.json`), or after `remoteResultWaitMs` in the
 client's global config (default 3 hours). A runner too old to report a
 state gets the previous behaviour: three back-to-back fetches, then local.
 A cancel during the wait still sends `remote-cancel` and exits `130`.
 Stale never-started ticket directories on the runner are not garbage
-collected.
+collected. If `remote-exec` dies while its detached supervisor survives,
+the ticket reads `gone`, which is correct: nothing would publish the result.
 
 ## Scheduling
 

@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, readJsonSafe, writeCancelMarkerFile } from './state.js';
+import { atomicWriteFile, atomicWriteJson, bootId, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, loadGlobalConfig } from './config.js';
 import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores } from './resources.js';
@@ -12,7 +12,7 @@ import { makeReader, readHeaderLine, extractFrames, MAX_HEADER_BYTES } from './r
 import { runCommand } from './run.js';
 import { cancelCommand } from './cancel.js';
 import { collectStatus } from './status.js';
-import { readLease, isSupervisorAlive, isGroupAlive } from './lease.js';
+import { readLease, isSupervisorAlive } from './lease.js';
 import { readAttempt } from './attempts.js';
 import { listQueue } from './scheduler.js';
 
@@ -271,6 +271,13 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     }
     throw err;
   }
+  // BRAIN-339: recorded before anything slow (extraction, git init, preflight) so
+  // `remote-result` can tell whether this process, the only publisher of result.json, is alive.
+  atomicWriteJson(path.join(ticketDir, 'publisher.json'), {
+    pid: process.pid,
+    start: processStartTime(process.pid),
+    bootId: bootId(),
+  });
 
   const fieldCheck = validateHeaderFields(header);
   if (!fieldCheck.ok) {
@@ -502,42 +509,31 @@ export async function remoteProbeCommand() {
   return { exitCode: 0 };
 }
 
-/** How long after the local broker recorded a finished result for a ticket's lane we still
- *  report it `running`: remote-exec writes result.json right after that record lands. */
-const RESULT_FINALIZE_GRACE_MS = 30_000;
-
 /**
- * BRAIN-339: liveness of a ticket that has no result.json, from the runner's own broker
- * bookkeeping -- `remote-id` is the runner-side lane id, so its lease (supervisor or child
- * group alive) means `running`, its queue entry means `queued`, and a just-written broker
- * result means remote-exec is finalizing (`running`). Anything else (no ticket dir, no
- * remote-id, or nothing alive and no result) is `gone`. Never throws.
+ * BRAIN-339: liveness of a ticket that has no result.json. It is decided by the one process
+ * that will ever publish that file -- the `remote-exec` that recorded itself in
+ * `publisher.json` when it created the ticket dir: alive means same boot, pid alive, same
+ * start time (fail-closed, via `isSupervisorAlive`). The label is `queued` when the ticket's
+ * runner-side lane is in the broker queue, else `running`; a client treats both as alive.
+ * No publisher.json (an older runner) or a dead publisher is `gone`. Accepted limit: if
+ * remote-exec dies while its detached supervisor survives, this reads `gone`, which is right
+ * since nothing would publish. Never throws, never creates directories.
  */
-export function remoteTicketState(ticketDir, brokerRoot, now = Date.now()) {
-  let laneId;
+export function remoteTicketState(ticketDir, brokerRoot) {
+  const publisher = readJsonSafe(path.join(ticketDir, 'publisher.json'));
+  if (!publisher || publisher.bootId !== bootId()) return 'gone';
+  if (!isSupervisorAlive({ supervisorPid: publisher.pid, supervisorStart: publisher.start })) return 'gone';
+  let laneId = null;
   try {
     laneId = fs.readFileSync(path.join(ticketDir, 'remote-id'), 'utf8').trim();
   } catch {
-    return 'gone';
+    // pre-admission phases: no lane yet
   }
-  if (!isUuid(laneId)) return 'gone';
-  const lease = readLease(brokerRoot, laneId);
-  if (lease && (isSupervisorAlive(lease) || isGroupAlive(lease.childPgid))) return 'running';
-  const queued = listQueue(brokerRoot).some(
-    (t) => t && t.id === laneId && isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart }),
-  );
-  if (queued) return 'queued';
-  try {
-    const finished = fs.statSync(path.join(paths(brokerRoot).results, `${laneId}.json`));
-    if (now - finished.mtimeMs < RESULT_FINALIZE_GRACE_MS) return 'running';
-  } catch {
-    // no broker result recorded
-  }
-  return 'gone';
+  return laneId && listQueue(brokerRoot).some((t) => t && t.id === laneId) ? 'queued' : 'running';
 }
 
 /** `lane remote-result <ticketId>`: print result.json, or {missing:true, state} where state is
- *  queued|running|gone (BRAIN-339; `missing:true` stays for older clients). */
+ *  queued|running|gone (is the publishing remote-exec alive) (BRAIN-339; `missing:true` stays for older clients). */
 export async function remoteResultCommand(ticketId, { root = defaultRemoteRoot() } = {}) {
   if (!isUuid(ticketId)) {
     process.stderr.write('lane remote-result: missing or invalid ticketId\n');
@@ -546,7 +542,7 @@ export async function remoteResultCommand(ticketId, { root = defaultRemoteRoot()
   root = path.resolve(root);
   const ticketDir = path.join(root, 'tickets', ticketId);
   const data = readJsonSafe(path.join(ticketDir, 'result.json'));
-  const record = data || { protocol: 1, missing: true, state: remoteTicketState(ticketDir, ensureStateDirs().root) };
+  const record = data || { protocol: 1, missing: true, state: remoteTicketState(ticketDir, stateHome()) };
   process.stdout.write(`${JSON.stringify(record)}\n`);
   return { exitCode: 0 };
 }
