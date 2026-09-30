@@ -222,6 +222,28 @@ function tombPath(root, ownerPid, ownerToken) {
 }
 
 /**
+ * Thrown by `withLock` when it gives up waiting for the global lock, on every
+ * timeout path. Contention, not a fault: a caller that can simply try again
+ * (a queued supervisor's poll loop) catches this class by identity, never by
+ * message text.
+ */
+export class LockTimeoutError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'LockTimeoutError';
+    this.code = 'LANE_LOCK_TIMEOUT';
+  }
+}
+
+// `LANE_BROKER_TEST_LOCK_TIMEOUT_MS` (README "Testing hooks") shortens the
+// default acquire deadline so a test can force a timeout without holding the
+// lock for 15s.
+function lockTimeoutMsDefault() {
+  const override = Number(process.env.LANE_BROKER_TEST_LOCK_TIMEOUT_MS);
+  return Number.isFinite(override) && override > 0 ? override : 15_000;
+}
+
+/**
  * Best-effort GC of tombs older than TOMB_TTL_MS. Run once per withLock call,
  * before the acquire loop. A contender suspended for longer than the TTL
  * between reading a dead owner and attempting the takeover rename could in
@@ -408,7 +430,7 @@ function recoverDeadLock(root, lockDir, ownerFile, observedOwner) {
  * (pid, token) it is acting on. "How long has this sat here" never enters a
  * takeover decision; only liveness does.
  */
-export async function withLock(root, fn, { timeoutMs = 15_000, pollMs = 25 } = {}) {
+export async function withLock(root, fn, { timeoutMs = lockTimeoutMsDefault(), pollMs = 25 } = {}) {
   const lockDir = paths(root).lock;
   fs.mkdirSync(root, { recursive: true });
   const ownerFile = path.join(lockDir, 'owner.json');
@@ -449,7 +471,7 @@ export async function withLock(root, fn, { timeoutMs = 15_000, pollMs = 25 } = {
       // on but wait and re-evaluate; report by name rather than assume
       // stale.
       if (Date.now() > deadline) {
-        throw new Error(
+        throw new LockTimeoutError(
           `lane-broker: timed out waiting for the global lock at ${lockDir} — owner.json is unreadable; needs manual removal`,
         );
       }
@@ -467,7 +489,7 @@ export async function withLock(root, fn, { timeoutMs = 15_000, pollMs = 25 } = {
       if (won && Date.now() > deadline) {
         // We moved a dead lock aside but our own deadline has passed: leave
         // the path free for whoever is still waiting and give up honestly.
-        throw new Error(
+        throw new LockTimeoutError(
           `lane-broker: timed out waiting for the global lock (recovered dead pid ${owner.pid}, but the deadline passed)`,
         );
       }
@@ -478,7 +500,7 @@ export async function withLock(root, fn, { timeoutMs = 15_000, pollMs = 25 } = {
       // check — sleep and re-evaluate the deadline like any other
       // contention wait.
       if (Date.now() > deadline) {
-        throw new Error(
+        throw new LockTimeoutError(
           `lane-broker: timed out waiting for the global lock held by dead pid ${owner.pid} (recovery kept failing)`,
         );
       }
@@ -486,7 +508,7 @@ export async function withLock(root, fn, { timeoutMs = 15_000, pollMs = 25 } = {
       continue;
     }
     if (Date.now() > deadline) {
-      throw new Error(`lane-broker: timed out waiting for the global lock held by pid ${owner.pid}`);
+      throw new LockTimeoutError(`lane-broker: timed out waiting for the global lock held by pid ${owner.pid}`);
     }
     await sleep(pollMs);
   }

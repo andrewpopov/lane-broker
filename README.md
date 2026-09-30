@@ -500,6 +500,9 @@ symlinks.
 - `LANE_BROKER_TEST_ROUNDS` — override the dead-owner-lock contention sweep's
   round count (default 4; the original suite ran 10) for a fuller sweep, e.g.
   `LANE_BROKER_TEST_ROUNDS=10 npm test`.
+- `LANE_BROKER_TEST_LOCK_TIMEOUT_MS` — overrides `withLock`'s default 15s
+  acquire deadline, so a test can force a lock-acquire timeout (BRAIN-345: a
+  queued supervisor must treat one as contention and keep polling).
 - `LANE_BROKER_TEST_PAUSE_AFTER_TICKET_ID` — if set, `lane remote-exec` pauses
   right after writing its ticket's `remote-id` file AND checking its own
   ticket-local `cancelled` marker (finding it not yet set), until the named
