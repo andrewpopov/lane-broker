@@ -589,3 +589,18 @@ test('mixed versions: a v1 (optionless) lane still dispatches remotely against t
   const result = resultOf(state, id);
   assert.equal(result.executor, 'remote');
 });
+
+// ---- BRAIN-341: a remote attempt's waitedMs is queue wait, never the run's own duration ----
+
+test('remote run: waitedMs records the wait before the command started, not the ~2.5s the command ran', async () => {
+  const { env, state, repoDir } = setup();
+  const runMs = 2500;
+  const cmd = [process.execPath, '-e', `setTimeout(() => process.exit(0), ${runMs});`];
+  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...cmd], env, repoDir);
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+  assert.ok(Number.isFinite(result.waitedMs), `waitedMs should be a number, got ${result.waitedMs}`);
+  assert.ok(result.waitedMs < runMs - 500, `waitedMs ${result.waitedMs} must not include the ${runMs}ms run`);
+  assert.ok(result.endedAt - result.startedAt >= runMs - 100, 'startedAt must still mean "command started"');
+});

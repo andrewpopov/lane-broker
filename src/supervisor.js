@@ -551,6 +551,10 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
       writeBrokerLog(root, phaseLine);
     }
     await updateAttempt(root, enriched.id, 0, { remotePhase: dispatch.phase ?? null });
+    // BRAIN-341: queue wait = enqueue -> the moment the command started, i.e.
+    // everything before the runner-reported run. Never the run itself.
+    const runMs = dispatch.result.runMs;
+    const remoteWaitedMs = Number.isFinite(runMs) && runMs >= 0 ? Math.max(0, endedAt - enriched.createdAt - runMs) : null;
     await publishAndExit(0, () => ({
       id: enriched.id,
       exit: dispatch.exitCode,
@@ -560,9 +564,9 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
       ...(queuedAt ? { queuedAt } : {}),
       remoteKind: dispatch.result.kind,
       remotePhase: dispatch.phase ?? null,
-      startedAt: attemptStartedAt,
+      startedAt: remoteWaitedMs === null ? attemptStartedAt : enriched.createdAt + remoteWaitedMs,
       endedAt,
-      waitedMs: endedAt - enriched.createdAt || 0,
+      waitedMs: remoteWaitedMs,
     }));
     return { fallback: false };
   }

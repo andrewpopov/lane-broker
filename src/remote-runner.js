@@ -172,7 +172,7 @@ function readPhase(ticketDir) {
   }
 }
 
-function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null }) {
+function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, runMs }) {
   const isProtocol2 = header.protocol === 2;
   return {
     protocol: isProtocol2 ? 2 : 1,
@@ -189,6 +189,10 @@ function buildResult(header, ticketDir, { kind, exit = null, signal = null, remo
     // this slice (I6).
     phase: isProtocol2 ? readPhase(ticketDir) : undefined,
     finishedAt: Date.now(),
+    // BRAIN-341: a duration on the runner's own clock (never an absolute
+    // time, so clock skew cannot matter). Omitted when unknown or for an
+    // older runner, so the client records waitedMs null instead of a guess.
+    runMs,
   };
 }
 
@@ -443,6 +447,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   let exit = null;
   let signal = null;
   let reason = null;
+  let runMs;
   // A user cancel that landed after the expiry still wins (kind cancelled below).
   if (structured && structured.reason === 'queue-timeout' && !cancelled) {
     // BRAIN-320 S1d: the LOCAL broker's own scheduler expired this ticket
@@ -456,6 +461,9 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   } else if (structured) {
     exit = structured.exit;
     signal = structured.signal;
+    if (Number.isFinite(structured.startedAt) && Number.isFinite(structured.endedAt)) {
+      runMs = Math.max(0, structured.endedAt - structured.startedAt);
+    }
     kind = cancelled ? 'cancelled' : 'completed';
   } else if (cancelled) {
     kind = 'cancelled';
@@ -471,7 +479,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     kind = 'unfinished';
   }
 
-  writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason }));
+  writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, runMs }));
   cleanupWork(workDir);
   return { exitCode: 0 };
 }
