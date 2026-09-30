@@ -251,6 +251,23 @@ test('remoteQueueTimeoutMs rejects zero/negative/non-integer', () => {
   }
 });
 
+test('remoteResultWaitMs (BRAIN-339) accepts a positive integer and rejects zero', () => {
+  const base = { version: 1, capacity: 2, loadClose: 15, loadOpen: 11, loadOpenSamples: 3, sampleMs: 5000 };
+  const prevHome = process.env.LANE_BROKER_HOME;
+  try {
+    const ok = freshEnv();
+    writeGlobalConfig(ok.home, { ...base, remoteResultWaitMs: 60000 });
+    process.env.LANE_BROKER_HOME = ok.home;
+    assert.equal(loadGlobalConfig().remoteResultWaitMs, 60000);
+    const bad = freshEnv();
+    writeGlobalConfig(bad.home, { ...base, remoteResultWaitMs: 0 });
+    process.env.LANE_BROKER_HOME = bad.home;
+    assert.throws(() => loadGlobalConfig(), ConfigError);
+  } finally {
+    process.env.LANE_BROKER_HOME = prevHome;
+  }
+});
+
 test('brokerHome respects LANE_BROKER_HOME', () => {
   const prev = process.env.LANE_BROKER_HOME;
   process.env.LANE_BROKER_HOME = '/tmp/wherever';

@@ -154,6 +154,15 @@ function validateGlobalConfig(cfg, sourcePath) {
       `${sourcePath}: "remoteQueueTimeoutMs" must be a positive integer`,
     );
   }
+  // BRAIN-339: how long the client keeps waiting for a remote job's result after its ssh
+  // session drops while the runner still reports the job queued/running. Absent means the
+  // dispatcher's 3h default.
+  if (cfg.remoteResultWaitMs !== undefined) {
+    assert(
+      Number.isInteger(cfg.remoteResultWaitMs) && cfg.remoteResultWaitMs > 0,
+      `${sourcePath}: "remoteResultWaitMs" must be a positive integer`,
+    );
+  }
   if (cfg.runners !== undefined) validateRunners(cfg.runners, sourcePath);
 }
 

@@ -531,6 +531,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     // -- never the runner's -- so an unset value here means the header
     // carries no queueTimeoutMs at all (I6).
     queueTimeoutMs: globalCfg.remoteQueueTimeoutMs,
+    resultWaitMs: globalCfg.remoteResultWaitMs,
     onStdout,
     onStderr,
     abortSignal,

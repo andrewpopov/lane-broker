@@ -398,6 +398,26 @@ function waitClosed(child, abortSignal) {
   });
 }
 
+const DEFAULT_RESULT_WAIT_MS = 3 * 60 * 60_000;
+const RESULT_POLL_START_MS = 5_000;
+const RESULT_POLL_MAX_MS = 30_000;
+
+/** Sleep `ms`, resolving early (never rejecting) if `abortSignal` fires. */
+function sleepUnlessAborted(ms, abortSignal) {
+  return new Promise((resolve) => {
+    if (abortSignal && abortSignal.aborted) return resolve();
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    if (abortSignal) abortSignal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 /** `lane remote-result <ticketId>` over ssh, bounded by `deadlineMs`. Returns the parsed
  *  record, `{missing:true}`, or `null` on any transport/parse failure (never throws). */
 async function fetchRemoteResult(runner, ticketId, sshBin, deadlineMs, env) {
@@ -437,7 +457,8 @@ export async function remoteCancel(runner, ticketId, { sshBin = 'ssh', deadlineM
  * awaited unboundedly, since it IS the remote job running), `resultMs`
  * (default 30s per attempt) and `resultAttempts` (default 3) for fetching
  * `remote-result`, `cancelMs` (default 15s) for the best-effort
- * `remote-cancel` on abort.
+ * `remote-cancel` on abort. BRAIN-339: while `remote-result` reports the job `queued`/`running`
+ * the client polls it (5s backoff growing to 30s) for up to `resultWaitMs`.
  */
 export async function dispatchRemote(opts) {
   const {
@@ -460,6 +481,12 @@ export async function dispatchRemote(opts) {
     // Rides on both protocol 1 and 2: an older runner simply ignores an
     // unknown field, which is fine, since the whole feature is opt-in.
     queueTimeoutMs = null,
+    // BRAIN-339: from the CLIENT's global config (`remoteResultWaitMs`); how long to keep
+    // polling a runner that reports the job still queued/running after ssh dropped.
+    resultWaitMs = DEFAULT_RESULT_WAIT_MS,
+    // Injectable for tests: sleep(ms, abortSignal) resolves early on abort; now() is a clock.
+    sleep = sleepUnlessAborted,
+    now = Date.now,
     onStdout,
     onStderr,
     abortSignal,
@@ -555,7 +582,11 @@ export async function dispatchRemote(opts) {
 
   const expected = { protocol, ticketId, generation, manifestHash: manifest.manifestHash };
   let record = null;
-  for (let attempt = 0; attempt < resultAttempts; attempt += 1) {
+  let attemptsMade = 0;
+  let waitedFrom = null;
+  let backoffMs = RESULT_POLL_START_MS;
+  let waitExpired = false;
+  while (true) {
     if (abortSignal && abortSignal.aborted) {
       await remoteCancelBestEffort(runner, ticketId, sshBin, cancelDeadlineMs, env);
       return { outcome: 'cancelled' };
@@ -565,6 +596,26 @@ export async function dispatchRemote(opts) {
       record = fetched;
       break;
     }
+    attemptsMade += 1;
+    // BRAIN-339: a runner that reports the job alive (state queued/running) is waited on, since
+    // the ssh session dropping does not stop the job; `gone` is final. A runner with no `state`
+    // (older version) or a failed fetch keeps the bounded back-to-back retries.
+    // Once alive was seen, a failed fetch (transport still down) is tolerated for the wait budget.
+    const alive = fetched
+      ? fetched.state === 'queued' || fetched.state === 'running'
+      : waitedFrom !== null;
+    if (fetched && fetched.state === 'gone') break;
+    if (!alive) {
+      if (attemptsMade >= resultAttempts) break;
+      continue;
+    }
+    waitedFrom ??= now();
+    if (now() - waitedFrom >= resultWaitMs) {
+      waitExpired = true;
+      break;
+    }
+    await sleep(backoffMs, abortSignal);
+    backoffMs = Math.min(backoffMs * 2, RESULT_POLL_MAX_MS);
   }
 
   if (abortSignal && abortSignal.aborted) {
@@ -572,7 +623,14 @@ export async function dispatchRemote(opts) {
     return { outcome: 'cancelled' };
   }
 
-  if (!record) return { outcome: 'unconfirmed', reason: 'result not available after retries' };
+  if (!record) {
+    return {
+      outcome: 'unconfirmed',
+      reason: waitExpired
+        ? `remote job still running after waiting ${resultWaitMs}ms for its result`
+        : 'result not available after retries',
+    };
+  }
 
   // BRAIN-320 S1c: classification (bound? kind? green?) all happens in ONE
   // place, `classifyRemoteResult`, shared with `isGreen` -- see its own doc

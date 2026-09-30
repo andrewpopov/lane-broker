@@ -12,7 +12,7 @@ import { makeReader, readHeaderLine, extractFrames, MAX_HEADER_BYTES } from './r
 import { runCommand } from './run.js';
 import { cancelCommand } from './cancel.js';
 import { collectStatus } from './status.js';
-import { readLease } from './lease.js';
+import { readLease, isSupervisorAlive, isGroupAlive } from './lease.js';
 import { readAttempt } from './attempts.js';
 import { listQueue } from './scheduler.js';
 
@@ -502,16 +502,49 @@ export async function remoteProbeCommand() {
   return { exitCode: 0 };
 }
 
-/** `lane remote-result <ticketId>`: print result.json, or {missing:true}. */
+/** How long after the local broker recorded a finished result for a ticket's lane we still
+ *  report it `running`: remote-exec writes result.json right after that record lands. */
+const RESULT_FINALIZE_GRACE_MS = 30_000;
+
+/**
+ * BRAIN-339: liveness of a ticket that has no result.json, from the runner's own broker
+ * bookkeeping -- `remote-id` is the runner-side lane id, so its lease (supervisor or child
+ * group alive) means `running`, its queue entry means `queued`, and a just-written broker
+ * result means remote-exec is finalizing (`running`). Anything else (no ticket dir, no
+ * remote-id, or nothing alive and no result) is `gone`. Never throws.
+ */
+export function remoteTicketState(ticketDir, brokerRoot, now = Date.now()) {
+  let laneId;
+  try {
+    laneId = fs.readFileSync(path.join(ticketDir, 'remote-id'), 'utf8').trim();
+  } catch {
+    return 'gone';
+  }
+  if (!isUuid(laneId)) return 'gone';
+  const lease = readLease(brokerRoot, laneId);
+  if (lease && (isSupervisorAlive(lease) || isGroupAlive(lease.childPgid))) return 'running';
+  if (listQueue(brokerRoot).some((t) => t && t.id === laneId)) return 'queued';
+  try {
+    const finished = fs.statSync(path.join(paths(brokerRoot).results, `${laneId}.json`));
+    if (now - finished.mtimeMs < RESULT_FINALIZE_GRACE_MS) return 'running';
+  } catch {
+    // no broker result recorded
+  }
+  return 'gone';
+}
+
+/** `lane remote-result <ticketId>`: print result.json, or {missing:true, state} where state is
+ *  queued|running|gone (BRAIN-339; `missing:true` stays for older clients). */
 export async function remoteResultCommand(ticketId, { root = defaultRemoteRoot() } = {}) {
   if (!isUuid(ticketId)) {
     process.stderr.write('lane remote-result: missing or invalid ticketId\n');
     return { exitCode: 2 };
   }
   root = path.resolve(root);
-  const resultPath = path.join(root, 'tickets', ticketId, 'result.json');
-  const data = readJsonSafe(resultPath);
-  process.stdout.write(`${JSON.stringify(data || { protocol: 1, missing: true })}\n`);
+  const ticketDir = path.join(root, 'tickets', ticketId);
+  const data = readJsonSafe(path.join(ticketDir, 'result.json'));
+  const record = data || { protocol: 1, missing: true, state: remoteTicketState(ticketDir, ensureStateDirs().root) };
+  process.stdout.write(`${JSON.stringify(record)}\n`);
   return { exitCode: 0 };
 }
 

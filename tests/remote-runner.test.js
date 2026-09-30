@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { freshEnv, writeGlobalConfig, BIN, laneRun, sleep, waitFor } from './helpers.js';
 import { manifestHashOf, verifyManifestNoGit } from '../src/remote-manifest.js';
@@ -12,6 +12,7 @@ import { encodeSnapshot, serializeHeader, MAX_HEADER_BYTES } from '../src/remote
 import { sanitizeKey } from '../src/config.js';
 import { paths, readJsonSafe } from '../src/state.js';
 import { writeLease } from '../src/lease.js';
+import { enqueue } from '../src/scheduler.js';
 
 function tmpDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
@@ -911,7 +912,7 @@ test('remote-result reports {missing:true} for an unknown ticket, and the real r
   const root = tmpDir('remote-exec-root');
 
   const missing = await getResult(crypto.randomUUID(), root, env);
-  assert.deepEqual(missing, { protocol: 1, missing: true });
+  assert.deepEqual(missing, { protocol: 1, missing: true, state: 'gone' });
 
   const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
   const header = makeHeader();
@@ -920,6 +921,80 @@ test('remote-result reports {missing:true} for an unknown ticket, and the real r
   const result = await getResult(header.ticketId, root, env);
   assert.equal(result.ticketId, header.ticketId);
   assert.equal(result.kind, 'completed');
+});
+
+// ---- remote-result state (BRAIN-339) ----
+
+/** A ticket dir on a fresh runner root, optionally with a `remote-id`; the broker state dirs
+ *  are created by a first remote-result call. */
+async function stateFixture({ withRemoteId = true } = {}) {
+  const { env, state } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const ticketId = crypto.randomUUID();
+  const laneId = crypto.randomUUID();
+  const ticketDir = path.join(root, 'tickets', ticketId);
+  fs.mkdirSync(ticketDir, { recursive: true });
+  if (withRemoteId) fs.writeFileSync(path.join(ticketDir, 'remote-id'), laneId);
+  await getResult(ticketId, root, env);
+  return { env, state, root, ticketId, laneId, ticketDir };
+}
+
+test('remote-result state: a ticket with no remote-id (never started) is gone', async () => {
+  const f = await stateFixture({ withRemoteId: false });
+  const r = await getResult(f.ticketId, f.root, f.env);
+  assert.deepEqual(r, { protocol: 1, missing: true, state: 'gone' });
+});
+
+test('remote-result state: remote-id with nothing alive and no result is gone', async () => {
+  const f = await stateFixture();
+  assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'gone');
+});
+
+test('remote-result state: a queued runner-side lane is queued', async () => {
+  const f = await stateFixture();
+  await enqueue(f.state, { id: f.laneId, key: 'k:default', weight: 1, supervisorPid: process.pid });
+  const r = await getResult(f.ticketId, f.root, f.env);
+  assert.equal(r.missing, true);
+  assert.equal(r.state, 'queued');
+});
+
+test('remote-result state: a lease whose supervisor is alive is running; a dead one is gone', async () => {
+  const f = await stateFixture();
+  const lease = {
+    id: f.laneId,
+    key: 'k:default',
+    weight: 1,
+    supervisorPid: process.pid,
+    supervisorStart: null,
+    childPgid: process.pid,
+    startedAt: Date.now(),
+    heartbeatAt: Date.now(),
+  };
+  writeLease(f.state, lease);
+  assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'running');
+
+  const dead = spawnSync(process.execPath, ['-e', 'process.stdout.write(String(process.pid))']);
+  const deadPid = Number(dead.stdout.toString());
+  writeLease(f.state, { ...lease, supervisorPid: deadPid, childPgid: deadPid });
+  assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'gone');
+});
+
+test('remote-result state: a just-recorded broker result (remote-exec finalizing) is running', async () => {
+  const f = await stateFixture();
+  const resultsDir = paths(f.state).results;
+  fs.mkdirSync(resultsDir, { recursive: true });
+  const file = path.join(resultsDir, `${f.laneId}.json`);
+  fs.writeFileSync(file, JSON.stringify({ exit: 0 }));
+  assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'running');
+  const old = new Date(Date.now() - 120_000);
+  fs.utimesSync(file, old, old);
+  assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'gone');
+});
+
+test('remote-result state: a present result.json is returned as-is, with no state', async () => {
+  const f = await stateFixture();
+  fs.writeFileSync(path.join(f.ticketDir, 'result.json'), JSON.stringify({ protocol: 1, kind: 'completed' }));
+  assert.deepEqual(await getResult(f.ticketId, f.root, f.env), { protocol: 1, kind: 'completed' });
 });
 
 test('remote-probe reports the expected shape', async () => {

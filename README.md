@@ -367,6 +367,21 @@ If the runner's broker has not started it by then, the runner expires it
 (a ticket that has started always runs to completion) and the client runs
 it locally instead. A user cancel still wins: exit `130`, no local run.
 
+### When the ssh session drops mid-job
+
+ssh keepalive (15 s x 4) ends a session after about a minute of silence
+(network blip, laptop sleep), but the job on the runner keeps going. The
+client then polls `lane remote-result` (5 s backoff, growing to 30 s) as
+long as the runner reports the ticket `queued` or `running`, and uses the
+result when it lands; it does not rerun the work locally. It gives up
+(and falls back to local) as soon as the runner reports `gone` (no such
+ticket, killed, or never started), or after `remoteResultWaitMs` in the
+client's global config (default 3 hours). A runner too old to report a
+state gets the previous behaviour: three back-to-back fetches, then local.
+A cancel during the wait still sends `remote-cancel` and exits `130`.
+Stale never-started ticket directories on the runner are not garbage
+collected.
+
 ## Scheduling
 
 One atomic transaction, under a short-held global mutex: a queued ticket
