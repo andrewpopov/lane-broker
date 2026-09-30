@@ -1,11 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, writeExpireMarkerFile } from './state.js';
-import { sampleAndUpdateGate } from './load.js';
+import { sampleAndUpdateGate, readGateState } from './load.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
-import { evaluateNewAdmission, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock } from './admission.js';
+import { evaluateNewAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
-import { detectResourceCapacity, effectiveWeightCapacity } from './resources.js';
+import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, resolveTicketResources } from './resources.js';
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
  *  possibly-running work and must count against both conflicts and capacity. */
@@ -97,6 +97,79 @@ export function blockedBy(held, ticket) {
   }
   const ceiling = Number.isInteger(ticket.maxConcurrent) && ticket.maxConcurrent >= 1 ? ticket.maxConcurrent : 1;
   return sameKeyHeld.length >= ceiling ? sameKeyHeld[sameKeyHeld.length - 1] : null;
+}
+
+/**
+ * The liveness maintenance every admission decision starts with: reap/orphan
+ * stale leases, and dequeue queued tickets whose supervisor already died
+ * (crashed, or the machine killed it) so they never sit at the FIFO head
+ * forever. `keepTicketId` is the caller's own ticket, never dequeued here.
+ * Caller must hold the global lock.
+ */
+export function reapStale(root, keepTicketId) {
+  reapAll(root, bootId());
+  for (const t of listQueue(root)) {
+    if (t && t.id !== keepTicketId && !isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart })) {
+      dequeueSync(root, t.id);
+    }
+  }
+}
+
+/**
+ * BRAIN-338: "would `tryStart` admit this not-yet-queued ticket right now?",
+ * so the supervisor can decide between queuing on a busy runner and running
+ * locally. It takes the same gates `tryStart` does, from the same helpers
+ * (`reapStale`, `blockedBy`, `effectiveWeightCapacity`, `cooldownActive`,
+ * `evaluateMemoryAdmission`, the persisted load gate), under the same global
+ * lock. It performs the same stale-record reaping every `tryStart` poll
+ * performs, but never samples CPU or advances the load gate. The CPU
+ * projected-over-budget check is deliberately not repeated (sampling mutates
+ * shared baselines); an optimistic "yes" only means the ticket runs locally
+ * as before.
+ *
+ * Accepted limitation: with `admissionLoadGate` on, the persisted gate state
+ * is read without sampling, so a gate one low-load sample from reopening
+ * reads closed and the ticket may queue remotely instead of starting locally.
+ * Returns `{ admit, reason }`.
+ */
+export async function couldAdmitNow(root, cfg, ticket, memoryReader = readMemoryInfo) {
+  return withLock(root, () => {
+    reapStale(root, ticket.id);
+    return couldAdmitLocked(root, cfg, ticket, memoryReader);
+  });
+}
+
+function couldAdmitLocked(root, cfg, ticket, memoryReader) {
+  if (listQueue(root).length > 0) return { admit: false, reason: 'queue-ahead' };
+  if (fs.existsSync(paths(root).pause)) return { admit: false, reason: 'paused' };
+  const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
+  if (blockedBy(held, ticket)) return { admit: false, reason: 'conflict' };
+  const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
+  if (runningWeight + ticket.weight > effectiveWeightCapacity(cfg, detectResourceCapacity().cpuCores)) {
+    return { admit: false, reason: 'capacity' };
+  }
+  if (cfg.admissionLoadGate && held.length > 0 && readGateState(root).closed) return { admit: false, reason: 'load-gate-closed' };
+  let memInfo = null;
+  try {
+    memInfo = memoryReader();
+  } catch {
+    memInfo = null;
+  }
+  if (memInfo && memInfo.macPressure === 'critical') return { admit: false, reason: 'memory-critical' };
+  if (cfg.schedulerMode === 'active') {
+    if (cooldownActive(held, cfg)) return { admit: false, reason: 'cooldown' };
+    if (memInfo) {
+      const candidateResources = resolveTicketResources({
+        weight: ticket.weight,
+        cpuCores: ticket.resources?.cpuCores,
+        memoryBytes: ticket.resources?.memoryBytes,
+        defaultMemoryBytesPerWeight: cfg.defaultMemoryBytesPerWeight,
+      });
+      const memory = evaluateMemoryAdmission({ memoryInfo: memInfo, heldLeases: held, candidateResources, cfg });
+      if (!memory.admit) return { admit: false, reason: memory.reason };
+    }
+  }
+  return { admit: true, reason: 'ok' };
 }
 
 /** Coerce a persisted (possibly corrupt) skip-count file into a safe shape. Exported for
@@ -371,15 +444,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
   const { result, logFields } = await withLock(root, () => {
     const cfg = reloadCfg() || globalCfg;
     const now = Date.now();
-    reapAll(root, bootId());
-    // A queued ticket whose supervisor already died (crashed, or the machine
-    // killed it) must not sit at the FIFO head forever — dequeue it before
-    // checking who's next.
-    for (const t of listQueue(root)) {
-      if (t && t.id !== ticket.id && !isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart })) {
-        dequeueSync(root, t.id);
-      }
-    }
+    reapStale(root, ticket.id);
     const queue = listQueue(root);
     const position = queue.findIndex((t) => t && t.id === ticket.id);
     if (position === -1) {

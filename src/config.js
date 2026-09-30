@@ -47,6 +47,11 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // timer. This only changes who else is allowed to start; it never touches
   // the lease already holding the key.
   headBlockGraceMs: 600_000,
+  // BRAIN-338: how many tickets may already be queued on the least-loaded
+  // runner for a remote-eligible ticket to be queued there instead of
+  // running locally -- only when this machine could not admit it right now
+  // either. 0 disables (a runner with any queue is skipped).
+  maxRemoteQueue: 2,
   // BRAIN-207 (forgiving admission): whether the load gate is allowed to
   // deny a start at all. Default false — the gate is informational-only
   // (still sampled every poll, still logged) until an operator opts back
@@ -129,6 +134,10 @@ function validateGlobalConfig(cfg, sourcePath) {
   assert(
     Number.isInteger(cfg.headBlockGraceMs) && cfg.headBlockGraceMs >= 0,
     `${sourcePath}: "headBlockGraceMs" must be a non-negative integer`,
+  );
+  assert(
+    Number.isInteger(cfg.maxRemoteQueue) && cfg.maxRemoteQueue >= 0,
+    `${sourcePath}: "maxRemoteQueue" must be a non-negative integer`,
   );
   assert(typeof cfg.admissionLoadGate === 'boolean', `${sourcePath}: "admissionLoadGate" must be a boolean`);
   assert(

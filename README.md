@@ -264,6 +264,21 @@ What a remote run does:
    the lane needs (below), is not paused, has no queue, and could ever fit
    the lane's reservation (weight, CPU budget, memory plus its reserve, from
    the runner's static capacity — never its momentary load). None → local.
+   If no runner is idle, the usable runner with the fewest queued tickets
+   (ties: config order) is taken **only if** it has at most `maxRemoteQueue`
+   queued (global config, integer >= 0, default `2`; `0` = never queue on a
+   runner) **and** this machine could not start the ticket right now either
+   (its queue is non-empty, or a conflict, capacity, pause, load-gate,
+   cooldown or memory check refuses it); otherwise the run stays local.
+   A run queued this way records `queuedAt: "<runner>(<queued at pick time>)"`
+   in its result and attempt record and logs `lane: queuing on ...`. The
+   local check reaps stale records like every admission poll but never
+   samples CPU or advances the load gate, so it skips the CPU projection (it
+   can say "would admit" where the real admission later would not — that only
+   means running locally, as before). With `admissionLoadGate` on it reads
+   the persisted gate without sampling, so a gate one low-load sample from
+   reopening reads closed and the ticket may queue remotely instead of
+   starting locally.
 3. **Send a snapshot**, not history: a framed stream of exactly the listed
    files. Each file is re-read without following symlinks and its sha256
    checked before its bytes are sent. The runner validates every frame

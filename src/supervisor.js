@@ -12,7 +12,7 @@ import {
   expireMarkerPath,
   writeCancelMarkerFile,
 } from './state.js';
-import { enqueue, tryStart, dequeueSync } from './scheduler.js';
+import { enqueue, tryStart, dequeueSync, couldAdmitNow } from './scheduler.js';
 import { readLease, writeLease, removeLease, isGroupAlive, processStartTime } from './lease.js';
 import { observedGroupCpuCores, observedGroupMemoryBytes } from './cpu.js';
 import { reloadGlobalConfig } from './config.js';
@@ -481,7 +481,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
   // own protocol (inside dispatchRemote) still derives from
   // `needsProtocol2(enriched.remote)` alone, so an optionless lane still
   // sends a protocol-1 header even when this is true.
-  const { runner, skipped } = await selectRunner(globalCfg.runners || [], {
+  const { runner, skipped, queuedChoice, probe } = await selectRunner(globalCfg.runners || [], {
+    maxRemoteQueue: globalCfg.maxRemoteQueue,
     requireProtocol2: needsProtocol2(enriched.remote) || Boolean(globalCfg.remoteQueueTimeoutMs),
     reservation: {
       weight: enriched.weight,
@@ -494,7 +495,23 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     return fallbackOrRefuse(null, reason);
   }
 
-  await updateAttempt(root, enriched.id, 0, { phase: 'running', runner: runner.name });
+  // BRAIN-338: every runner has a queue. Queue on the least-loaded one only
+  // when this machine could not start the ticket right now either;
+  // otherwise run locally, exactly as when no runner was idle.
+  let queuedAt;
+  if (queuedChoice) {
+    queuedAt = `${runner.name}(${probe.queued})`;
+    const local = await couldAdmitNow(root, globalCfg, enriched);
+    if (local.admit) {
+      const reason = skipped.map((s) => `${s.name}: ${s.reason}`).join('; ');
+      return fallbackOrRefuse(null, `${reason}; local can admit now, not queuing on ${queuedAt}`);
+    }
+    const line = `lane: queuing on ${queuedAt}: local cannot admit now (${local.reason})\n`;
+    process.stderr.write(line);
+    writeBrokerLog(root, line);
+  }
+
+  await updateAttempt(root, enriched.id, 0, { phase: 'running', runner: runner.name, ...(queuedAt ? { queuedAt } : {}) });
   // Printed only now that eligibility is settled and a usable runner is
   // about to actually be dialed for the transfer -- see finding #5 above.
   process.stderr.write(`lane: running on ${runner.name}\n`);
@@ -539,6 +556,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
       signal: null,
       executor: 'remote',
       runner: runner.name,
+      ...(queuedAt ? { queuedAt } : {}),
       remoteKind: dispatch.result.kind,
       remotePhase: dispatch.phase ?? null,
       startedAt: attemptStartedAt,

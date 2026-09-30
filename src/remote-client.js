@@ -141,12 +141,21 @@ function neverFits(reservation, capacity) {
  * `opts.reservation` (BRAIN-320 S1e): the ticket's resolved
  * `{weight, cpuCores, memoryBytes}`, checked against each probe's static
  * `capacity` (1e). The existing `queued > 0` skip is unchanged.
+ *
+ * `opts.maxRemoteQueue` (BRAIN-338, default 0): when NO runner is idle, the
+ * usable runner (every check above passed except `queued === 0`, and able to
+ * fit the reservation) with the FEWEST queued tickets, provided
+ * `1 <= queued <= maxRemoteQueue` (ties go to config order), is returned as
+ * `{runner, probe, skipped, queuedChoice: true}`. This only PICKS; whether
+ * to queue there instead of running locally is the caller's call, and
+ * nothing is dispatched here. 0 keeps the pre-BRAIN-338 behaviour exactly.
  */
 export async function selectRunner(runners, opts = {}) {
   const deadlineMs = opts.deadlineMs ?? 6000;
   const sshBin = opts.sshBin ?? 'ssh';
-  const { env, requireProtocol2 = false, reservation } = opts;
+  const { env, requireProtocol2 = false, reservation, maxRemoteQueue = 0 } = opts;
   const skipped = [];
+  let queuedBest = null;
   for (const runner of runners) {
     const cmd = buildRemoteCommand(runner, 'remote-probe');
     const res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
@@ -178,7 +187,11 @@ export async function selectRunner(runners, opts = {}) {
       continue;
     }
     if (probe.queued !== 0) {
-      skipped.push({ name: runner.name, reason: `queued: ${probe.queued}` });
+      const overCap = maxRemoteQueue > 0 && probe.queued > maxRemoteQueue;
+      skipped.push({ name: runner.name, reason: `queued: ${probe.queued}${overCap ? ` (over maxRemoteQueue ${maxRemoteQueue})` : ''}` });
+      const fits = !(reservation && neverFits(reservation, probe.capacity));
+      const queueable = Number.isInteger(probe.queued) && probe.queued > 0 && probe.queued <= maxRemoteQueue;
+      if (fits && queueable && (!queuedBest || probe.queued < queuedBest.probe.queued)) queuedBest = { runner, probe };
       continue;
     }
     if (reservation && neverFits(reservation, probe.capacity)) {
@@ -187,6 +200,7 @@ export async function selectRunner(runners, opts = {}) {
     }
     return { runner, probe, skipped };
   }
+  if (queuedBest) return { ...queuedBest, skipped, queuedChoice: true };
   return { runner: null, skipped };
 }
 
