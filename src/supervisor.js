@@ -11,6 +11,7 @@ import {
   cancelMarkerPath,
   expireMarkerPath,
   writeCancelMarkerFile,
+  LockTimeoutError,
 } from './state.js';
 import { enqueue, tryStart, dequeueSync, couldAdmitNow } from './scheduler.js';
 import { readLease, writeLease, removeLease, isGroupAlive, processStartTime } from './lease.js';
@@ -737,15 +738,25 @@ async function main() {
     // between this poll's reload and the lock actually being granted. Reuse
     // the same fallback/warning handling so a reload failure inside the lock
     // degrades exactly like one out here.
-    started = await tryStart(root, enriched, globalCfg, undefined, undefined, () => {
-      globalCfg = reloadGlobalConfig(globalCfg, {
-        onError: (err) => {
-          reloadFailed = true;
-          recordConfigReloadError(root, err);
-        },
+    try {
+      started = await tryStart(root, enriched, globalCfg, undefined, undefined, () => {
+        globalCfg = reloadGlobalConfig(globalCfg, {
+          onError: (err) => {
+            reloadFailed = true;
+            recordConfigReloadError(root, err);
+          },
+        });
+        return globalCfg;
       });
-      return globalCfg;
-    });
+    } catch (err) {
+      // BRAIN-345: failing to get the global lock within its deadline is
+      // contention, not a fault. Dying here published no result and lost the
+      // ticket; keep polling instead. Anything else still escapes.
+      if (!(err instanceof LockTimeoutError)) throw err;
+      writeBrokerLog(root, `lane: lock-timeout: ${enriched.id}: ${err.message} — still queued, retrying\n`);
+      await sleep(globalCfg.sampleMs);
+      continue;
+    }
     if (started.started) break;
     if (started.reason === 'not-head' && started.position === null) {
       // Our own ticket is no longer in the queue without ever having
