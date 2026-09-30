@@ -133,6 +133,9 @@ function sanitizeGateState(raw) {
 export function sampleAndUpdateCpuGate(root, cfg, cpuSample) {
   const file = paths(root).cpuGate;
   const prev = sanitizeGateState(readJsonSafe(file));
+  // BRAIN-346: a reused measurement is the SAME observation again — hysteresis advances once per
+  // new observation, never once per poll that happened to re-read it.
+  if (cpuSample?.reused) return prev;
   if (
     !cpuSample ||
     cpuSample.stale ||
@@ -278,9 +281,9 @@ function unavailableDecision(heldLeases, reason) {
  * while holding the global lock because sampleHostCpu updates shared sample
  * state used by an active admission decision.
  */
-export function sampleCpuSafe(root, cpuSampler = sampleHostCpu) {
+export function sampleCpuSafe(root, cpuSampler = sampleHostCpu, reuseWindowMs = 0) {
   try {
-    return cpuSampler(root) || null;
+    return cpuSampler(root, undefined, { reuseWindowMs }) || null;
   } catch {
     return null; // sampler failure: treated identically to a missing sample
   }

@@ -124,13 +124,23 @@ export function computeBusyCores(prev, snapshot) {
  * permissions error, full disk, or any other failure here must never make
  * this throw or abort admission.
  */
-export function sampleHostCpu(root, cpus = os.cpus()) {
+export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0 } = {}) {
   const override = readCpuBusyOverride();
   if (override) return override;
   const file = paths(root).cpuSample;
   const prev = readJsonSafe(file);
   const now = Date.now();
   const snapshot = { at: now, cpus: cpus.map(cpuTimes) };
+  const { hostBusyCores, stale } = computeBusyCores(prev, snapshot);
+  const capacity = detectResourceCapacity({ parallelism: cpus.length });
+  const measured = Number.isFinite(hostBusyCores) ? Math.min(hostBusyCores, capacity.cpuCores) : hostBusyCores;
+  // BRAIN-346: the head and a backfill candidate now sample back to back, and os.cpus() counters
+  // advance in coarse ticks, so the second poll often sees no advance and reads "stale" — which
+  // admission treats as "unavailable, admit on an idle broker". Carry the last VALID measurement
+  // in the sidecar and reuse it while it is younger than reuseWindowMs, flagged `reused` so the
+  // CPU gate's hysteresis does not count it as a new observation.
+  const lastValid = !stale && Number.isFinite(measured) ? { hostBusyCores: measured, cores: capacity.cpuCores, at: now } : prev?.lastValid;
+  if (lastValid) snapshot.lastValid = lastValid;
   try {
     const latest = readJsonSafe(file);
     if (!latest || !Number.isFinite(latest.at) || latest.at < snapshot.at) {
@@ -139,10 +149,19 @@ export function sampleHostCpu(root, cpus = os.cpus()) {
   } catch {
     // best-effort: a failed sidecar write must never abort admission
   }
-  const { hostBusyCores, stale } = computeBusyCores(prev, snapshot);
-  const capacity = detectResourceCapacity({ parallelism: cpus.length });
+  const reusable =
+    stale &&
+    prev?.lastValid &&
+    Number.isFinite(prev.lastValid.hostBusyCores) &&
+    prev.lastValid.cores === capacity.cpuCores &&
+    Number.isFinite(prev.lastValid.at) &&
+    now - prev.lastValid.at >= 0 &&
+    now - prev.lastValid.at < reuseWindowMs;
+  if (reusable) {
+    return { hostBusyCores: prev.lastValid.hostBusyCores, cores: capacity.cpuCores, stale: false, reused: true, sampledAt: now, source: capacity.source };
+  }
   return {
-    hostBusyCores: Number.isFinite(hostBusyCores) ? Math.min(hostBusyCores, capacity.cpuCores) : hostBusyCores,
+    hostBusyCores: measured,
     cores: capacity.cpuCores,
     stale,
     sampledAt: now,

@@ -532,9 +532,12 @@ export function selectCapacityCandidate(queue, held, runningWeight, capacity) {
 
 /**
  * The single atomic transaction: a ticket starts only when it is selected
- * per selectCandidate() above AND fits capacity AND the load gate is open
- * AND the broker is not paused. No backfill behind a capacity- or
- * gate-blocked head — only a conflict-blocked head is skipped.
+ * AND fits capacity AND the load gate is open AND the broker is not paused.
+ * Selection is FIFO with three bounded skips past a head that cannot start:
+ * conflict (selectCandidate), capacity (selectCapacityCandidate) and, for a
+ * head denied only by projected-over-budget CPU, resource (selectResourceCandidate,
+ * then a reservation). A gate-blocked head is never skipped. See the README's
+ * "Fairness and backfill" section.
  *
  * Resource sampling and the admission decision share the global lock. CPU
  * sampling reads and updates cpu-sample.json, so serializing it prevents two
@@ -694,7 +697,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       const reason = fs.readFileSync(paths(root).pause, 'utf8').trim();
       return { result: { started: false, reason: 'paused', pauseReason: reason } };
     }
-    const cpuSample = sampleCpuSafe(root, cpuSampler);
+    const cpuSample = sampleCpuSafe(root, cpuSampler, cfg.sampleMs / 2);
     // The gate must still be SAMPLED unconditionally (its hysteresis
     // countdown depends on every poll observing a sample, closed broker or
     // not), but a gate closed by load the broker itself never generated
@@ -784,16 +787,17 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     const headPolling = ticket.id === headTicket.id;
     const resourceDenied =
       cfg.schedulerMode === 'active' && !cpuDecision.admit && cpuDecision.cpuReason === 'projected-over-budget' && cpuDecision.memoryReason === 'ok';
-    // BRAIN-346 idle exemption: a RESERVED head on a fully idle broker (orphaned leases count as
-    // held) whose projection overshoots the budget by at most resourceIdleOvershootCores starts
-    // anyway. Same lock transaction as the lease write below, so two supervisors never both
-    // exempt. Only a pure CPU-projection denial qualifies: a joint memory denial never does.
+    // BRAIN-346 idle exemption: the head on a fully idle broker (orphaned leases count as held)
+    // whose projection overshoots the budget by at most resourceIdleOvershootCores starts anyway
+    // — ambient load alone can make a big lane unsatisfiable with nothing running, with or
+    // without anyone queued behind it. Same lock transaction as the lease write below, so two
+    // supervisors never both exempt. Only a pure CPU-projection denial qualifies: a joint memory
+    // denial never does.
     const idleExempt =
       resourceDenied &&
       headPolling &&
       held.length === 0 &&
       cfg.resourceIdleOvershootCores > 0 &&
-      resourceReserved(resourceRecord) &&
       cpuDecision.projectedBusy - cpuDecision.budget <= cfg.resourceIdleOvershootCores;
     if (cfg.schedulerMode === 'active' && !cpuDecision.admit && !idleExempt) {
       if (headPolling) {

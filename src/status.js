@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ensureStateDirs, paths, withLock, bootId, readJsonSafe } from './state.js';
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
-import { listQueue, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState } from './scheduler.js';
+import { listQueue, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState, readResourceSkipState } from './scheduler.js';
+import { projectBusy, ticketCpuEstimate } from './admission.js';
 import { listAttempts, supervisorAlive } from './attempts.js';
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
@@ -35,7 +36,7 @@ function currentLockHolderPid(root) {
  * resolveCapacityBlock's doc comment in scheduler.js), so there is nothing
  * to count down.
  */
-function computeHeadBlock(root, cfg, queue, leases, now) {
+function computeHeadBlock(root, cfg, queue, leases, now, weightCapacity) {
   const head = queue[0];
   if (!head) return null;
   const held = leases.filter((l) => HELD_STATES.has(l.state));
@@ -60,7 +61,9 @@ function computeHeadBlock(root, cfg, queue, leases, now) {
       refused: blockedMs < cfg.headBlockGraceMs,
     };
   }
-  if (runningWeight + head.weight > cfg.capacity) {
+  // The EFFECTIVE capacity, never raw cfg.capacity: with `capacity: 'auto'` the raw value is a
+  // string, the comparison is always false, and a capacity-blocked head was never reported.
+  if (runningWeight + head.weight > weightCapacity) {
     const capState = readCapacitySkipState(root);
     const sameHead = capState.headId === head.id;
     const skipCount = sameHead ? capState.count : 0;
@@ -70,12 +73,33 @@ function computeHeadBlock(root, cfg, queue, leases, now) {
       headId: head.id,
       headWeight: head.weight,
       runningWeight,
-      capacity: cfg.capacity,
+      capacity: weightCapacity,
       skipCount,
       skipLimit: cfg.conflictSkipLimit,
     };
   }
   return null;
+}
+
+/**
+ * BRAIN-346: read-only view of resource-skip-state.json for the current head. `projectedBusy` is
+ * recomputed from the record's ambient snapshot against the leases held NOW, with the same
+ * projectBusy maths admission uses; `budget` is the one the head was last denied against.
+ * Null when there is no head, the record belongs to another head, or backfill is off.
+ */
+function computeResourceBlock(root, cfg, head, held, now) {
+  if (!head || !(cfg.resourceSkipLimit > 0)) return null;
+  const record = readResourceSkipState(root);
+  if (!record || record.headId !== head.id) return null;
+  return {
+    headId: head.id,
+    count: record.count,
+    limit: cfg.resourceSkipLimit,
+    reserved: record.reserved,
+    projectedBusy: projectBusy(record.externalBusy, held, ticketCpuEstimate(head, cfg), now),
+    budget: record.budget,
+    deniedAgeMs: now - record.deniedAt,
+  };
 }
 
 export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
@@ -174,7 +198,9 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
     paused,
     // BRAIN-249: null unless the queue is genuinely stalled (a conflict-
     // blocked head whose skip allowance is exhausted) — see computeHeadBlock.
-    headBlock: computeHeadBlock(root, cfg, queue, leases, now),
+    headBlock: computeHeadBlock(root, cfg, queue, leases, now, effectiveWeightCapacity(cfg, resourceCapacity.cpuCores)),
+    // BRAIN-346: the projected-over-budget head's backfill allowance / reservation, if any.
+    resourceBlock: computeResourceBlock(root, cfg, queue[0], held, now),
     configWarning: configWarning ? { message: configWarning.message, firstAt: configWarning.firstAt, lastAt: configWarning.lastAt } : null,
     loadGate: {
       closed: gate.closed,
@@ -302,6 +328,14 @@ export function renderStatusText(status) {
               `${fmtMs(hb.graceMs)} grace period has lapsed — backfill resumed past it`,
       );
     }
+  }
+  if (status.resourceBlock) {
+    const rb = status.resourceBlock;
+    lines.push(
+      `resource-blocked: head ${rb.headId} projects ${rb.projectedBusy.toFixed(2)} > budget ${rb.budget.toFixed(2)} cores ` +
+        `(denied ${fmtMs(rb.deniedAgeMs)} ago); backfill ${rb.count}/${rb.limit}` +
+        (rb.reserved ? ', RESERVED — nothing else is admitted past it' : ''),
+    );
   }
   lines.push(renderMemoryLine(status.memory));
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);

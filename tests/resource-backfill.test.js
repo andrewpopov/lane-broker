@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { freshEnv } from './helpers.js';
+import { freshEnv, writeGlobalConfig } from './helpers.js';
 import { enqueue, tryStart, readResourceSkipState } from '../src/scheduler.js';
+import { sampleHostCpu } from '../src/cpu.js';
+import { collectStatus, renderStatusText } from '../src/status.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { writeLease, removeLease, readLease, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths, atomicWriteJson } from '../src/state.js';
@@ -210,19 +212,35 @@ test('6: reserved + idle + over by <= the overshoot: the head starts as resource
   assert.equal(readResourceSkipState(state), null);
 });
 
-test('6b: the exemption needs the reservation and an idle broker', async () => {
+test('6b: the exemption needs an idle broker (a held lease means no exemption)', async () => {
   const cfg = baseCfg({ resourceIdleOvershootCores: 1 });
+  const head = ticket('head', { weight: 4 });
   const { state } = freshEnv();
+  await enqueue(state, head);
+  writeLease(state, heldLease('holder', 'other:key', 1));
+  assert.equal((await poll(state, head, cfg, { ext: 4.6 })).started, false, 'a held lease means the broker is not idle');
+});
+
+test('6c: a lone over-budget head on an idle broker starts within the overshoot, with no backfill needed', async () => {
+  const { state } = freshEnv();
+  const cfg = baseCfg({ resourceIdleOvershootCores: 1 });
   const head = ticket('head', { weight: 4 });
   await enqueue(state, head);
-  seedRecord(state, 'head', { count: 1, reserved: false });
-  assert.equal((await poll(state, head, cfg)).started, false, 'not reserved: no exemption');
+  assert.equal(readResourceSkipState(state), null, 'no record, no reservation, nobody behind it');
 
-  const { state: busy } = freshEnv();
-  await enqueue(busy, head);
-  seedRecord(busy, 'head', { count: 3, reserved: true });
-  writeLease(busy, heldLease('holder', 'other:key', 1));
-  assert.equal((await poll(busy, head, cfg, { ext: 4.6 })).started, false, 'a held lease means the broker is not idle');
+  const result = await poll(state, head, cfg); // 5.4 + 4 = 9.4 vs budget 9: today's real stall
+  assert.equal(result.started, true);
+  assert.match(readLog(state), /current=start:resource-idle-exempt/);
+  assert.match(readLog(state), /event=resource-idle-exempt headId=head overshoot=0.40/);
+});
+
+test('6d: an ORPHANED lease counts as held, so a lone over-budget head is not exempted', async () => {
+  const { state } = freshEnv();
+  const cfg = baseCfg({ resourceIdleOvershootCores: 1 });
+  const head = ticket('head', { weight: 4 });
+  await enqueue(state, head);
+  writeLease(state, { ...heldLease('orphan', 'other:key', 1), state: LEASE_STATE.ORPHANED });
+  assert.equal((await poll(state, head, cfg, { ext: 4.6 })).started, false);
 });
 
 test('7: reserved + idle + over by more than the overshoot: the head is not started', async () => {
@@ -314,4 +332,94 @@ test('12: resourceSkipLimit 0 is strict FIFO: nothing is recorded and nothing ba
   assert.equal(fs.existsSync(paths(state).resourceSkipState), false, 'a zero limit never records an allowance');
   seedRecord(state, 'head');
   assert.equal((await poll(state, small, cfg)).started, false);
+});
+
+/** os.cpus()-shaped, 10 cores, each core `busy` fraction busy over a 1000-tick delta from `base`. */
+function cpus10(base, busy) {
+  return Array.from({ length: 10 }, () => {
+    const total = 2000 + base * 1000;
+    const idle = 1000 + base * 1000 * (1 - busy);
+    return { model: 'test', speed: 0, times: { user: total - idle, nice: 0, sys: 0, idle, irq: 0 } };
+  });
+}
+const realSampler = (cpus) => (root, _cpus, opts) => sampleHostCpu(root, cpus, opts);
+
+test('13: a back-to-back sample reuses the last valid measurement (real sampler path) and never becomes unavailable-then-admit', async () => {
+  const { state } = freshEnv();
+  const cfg = baseCfg();
+  const head = ticket('head', { weight: 4 });
+  await enqueue(state, head);
+  sampleHostCpu(state, cpus10(0, 0.54)); // baseline snapshot
+  const advanced = cpus10(1, 0.54); // 10 cores x 0.54 busy = 5.4 busy cores
+
+  const first = await tryStart(state, head, cfg, undefined, realSampler(advanced), undefined, memory());
+  assert.equal(first.reason, 'cpu-admission', 'a valid measurement: 5.4 + 4 > 9');
+  assert.equal(first.cpuReason, 'projected-over-budget');
+
+  const gateBefore = fs.readFileSync(paths(state).cpuGate, 'utf8');
+  await new Promise((r) => setTimeout(r, 10));
+  // Same counters again: nothing advanced, so the raw delta is "stale". On an idle broker that
+  // used to read sample-unavailable-empty and ADMIT.
+  const second = await tryStart(state, head, cfg, undefined, realSampler(advanced), undefined, memory());
+  assert.equal(second.started, false, 'the reused measurement still denies');
+  assert.equal(second.cpuReason, 'projected-over-budget');
+  assert.equal(fs.readFileSync(paths(state).cpuGate, 'utf8'), gateBefore, 'a reused measurement is not a new observation: hysteresis does not advance');
+  assert.match(readLog(state), /sample=ok/);
+});
+
+test('13b: reuse is bounded by the window; without it (or past it) the raw stale reading stands', async () => {
+  const { state } = freshEnv();
+  sampleHostCpu(state, cpus10(0, 0.54));
+  const advanced = cpus10(1, 0.54);
+  assert.equal(sampleHostCpu(state, advanced).stale, false);
+  assert.equal(sampleHostCpu(state, advanced).stale, true, 'no window: today\'s behaviour');
+  assert.equal(sampleHostCpu(state, advanced, { reuseWindowMs: 60_000 }).reused, true);
+  await new Promise((r) => setTimeout(r, 15));
+  assert.equal(sampleHostCpu(state, advanced, { reuseWindowMs: 5 }).stale, true, 'older than the window: not reused');
+});
+
+async function withStatusEnv(home, state, fn) {
+  const prev = { h: process.env.LANE_BROKER_HOME, s: process.env.LANE_BROKER_STATE };
+  process.env.LANE_BROKER_HOME = home;
+  process.env.LANE_BROKER_STATE = state;
+  try {
+    return await fn();
+  } finally {
+    process.env.LANE_BROKER_HOME = prev.h;
+    process.env.LANE_BROKER_STATE = prev.s;
+  }
+}
+
+test('status: a capacity-blocked head is reported under capacity "auto" (effective capacity, not the raw string)', async () => {
+  const { home, state } = freshEnv();
+  const { detectResourceCapacity } = await import('../src/resources.js');
+  const cores = detectResourceCapacity().cpuCores;
+  // effective capacity = floor(cores - reserve) = 2
+  writeGlobalConfig(home, { version: 1, capacity: 'auto', cpuReserveCores: cores - 2, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, conflictSkipLimit: 1 });
+  writeLease(state, heldLease('holder', 'other:key', 2));
+  const head = ticket('head', { weight: 1 });
+  await enqueue(state, head);
+  atomicWriteJson(paths(state).capacitySkipState, { headId: 'head', count: 1, loggedPhase: 'exhausted' });
+
+  const status = await withStatusEnv(home, state, () => collectStatus());
+  assert.equal(status.headBlock?.kind, 'capacity', 'the head does not fit 2/2 and its allowance is exhausted');
+  assert.equal(status.headBlock.capacity, 2);
+});
+
+test('status: reports the resource block (count/limit, reserved, projected vs budget)', async () => {
+  const { home, state } = freshEnv();
+  writeGlobalConfig(home, { version: 1, capacity: 10, resourceSkipLimit: 3, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1 });
+  const head = ticket('head', { weight: 4 });
+  await enqueue(state, head);
+  assert.equal((await withStatusEnv(home, state, () => collectStatus())).resourceBlock, null, 'no record, no block');
+
+  seedRecord(state, 'head', { count: 3, reserved: true });
+  const status = await withStatusEnv(home, state, () => collectStatus());
+  assert.equal(status.resourceBlock.headId, 'head');
+  assert.equal(status.resourceBlock.count, 3);
+  assert.equal(status.resourceBlock.limit, 3);
+  assert.equal(status.resourceBlock.reserved, true);
+  assert.ok(Math.abs(status.resourceBlock.projectedBusy - 9.4) < 1e-9);
+  assert.equal(status.resourceBlock.budget, 9);
+  assert.match(renderStatusText(status), /resource-blocked: head head projects 9\.40 > budget 9\.00 cores .*backfill 3\/3, RESERVED/);
 });

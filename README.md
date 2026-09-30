@@ -101,6 +101,8 @@ never told to forward to it — both still get the `--log` file.
   "loadOpen": 11,
   "loadOpenSamples": 3,
   "sampleMs": 5000,
+  "resourceSkipLimit": 3,
+  "resourceIdleOvershootCores": 1,
   "admissionLoadGate": false,
   "laneNice": 10
 }
@@ -392,7 +394,8 @@ ticket reads `gone` and the client reruns locally.
 
 One atomic transaction, under a short-held global mutex: a queued ticket
 starts only when **all** of:
-- it is the head of the global FIFO (strict FIFO — no backfill behind it),
+- it is the head of the global FIFO, or the head is blocked in one of the ways
+  the **Fairness and backfill** section below allows a bounded skip past,
 - a queued ticket whose supervisor has already died is dequeued first, so a
   crashed supervisor can never wedge every other ticket behind it forever,
 - no `RUNNING` **or `ORPHANED`** lease conflicts with its key — an ORPHANED
@@ -405,6 +408,61 @@ starts only when **all** of:
 - the load gate is open, **or `admissionLoadGate` is `false` (the default)**,
 - macOS memory pressure is not `critical`,
 - the broker is not paused.
+
+**Fairness and backfill.** The queue is FIFO, and a head that cannot start may
+be overtaken only in three bounded ways, each with its own allowance and each
+ending in strict FIFO for that head once spent:
+
+- *Conflict* (`conflictSkipLimit`, default 3): a head blocked by a lane-key
+  conflict is skipped for the first non-conflicting ticket. Once the allowance
+  is used, backfill is refused for `headBlockGraceMs` (default 10 minutes) and
+  then resumes, so a multi-hour lease cannot stall everyone behind it.
+- *Capacity* (same `conflictSkipLimit`, counted separately): a head that does
+  not fit the weight capacity is skipped for a ticket that does. No time-based
+  resume: refusal is self-terminating because running work drains.
+- *Resource* (`resourceSkipLimit`, default 3; BRAIN-346): a head denied **only**
+  by `projected-over-budget` CPU (with memory fine; not cooldown, a closed CPU
+  gate, memory, sample-unavailable, load gate or shadow mode) may be overtaken
+  by up to `resourceSkipLimit` tickets. The head's own denial records the
+  ambient load and budget it was denied against (`resource-skip-state.json`);
+  the backfill candidate is the smallest-CPU-claim ticket that fits the
+  remaining headroom, that does not conflict, and that would not make the head
+  conflicted. It still goes through the normal, unchanged admission. The head
+  keeps being evaluated every poll and starts the moment it fits. When the
+  allowance is used the head is **reserved**: nothing but the head is admitted,
+  and that also stops *capacity* backfill past the same head. Conflict-path
+  backfill is unaffected. A backfill whose count cannot be written to disk is
+  refused, never uncounted. `resourceSkipLimit: 0` restores strict FIFO for
+  resource denials.
+
+**Bounded idle exemption** (`resourceIdleOvershootCores`, default 1; `0`
+disables): ambient load can make a large lane unsatisfiable even with nothing
+running (9 cores of budget, 5.4 busy, a 4-core head projects 9.4). When the
+broker is fully idle (no RUNNING **or ORPHANED** lease) and the head's only
+denial is `projected-over-budget` with memory admitting, the head starts if it
+overshoots the budget by at most that many cores. It needs neither a record nor
+a reservation, so a lone head benefits too. The check and the lease write share
+one lock transaction, so two supervisors never both exempt. macOS memory
+pressure `warn` or unknown does not block it, only `critical` does (as for every
+start). It is logged as `current=start:resource-idle-exempt`.
+
+Resource backfill events are explicit `lane-broker-head-block` lines in
+`admission-decisions.log`, written after the lease is published:
+`resource-backfill-start skipPast=<head> count=<n>`, `resource-reserved`, and
+`resource-idle-exempt`. `current=start:ok` is not an admission signal for them.
+`lane status` shows a `resource-blocked:` line (count/limit, reserved,
+projected vs budget) while the head has a record.
+
+Assumptions and limits. Backfill selection looks at CPU claims only; it does not
+pre-check memory, so a small-CPU, large-memory ticket can be selected and then
+denied by normal memory admission, holding back larger-CPU tickets meanwhile.
+Nothing guarantees the head ever starts if external CPU never drops or a lease
+never ends; the reservation only stops it being overtaken. A back-to-back CPU
+sample whose counters did not advance reuses the last valid measurement while
+it is younger than `sampleMs/2` (and does not advance the CPU gate's
+hysteresis) rather than reading as "unavailable, admit". Supervisors only
+enforce the reservation once running the new version: during a mixed-version
+rollout an older supervisor can still backfill past a reserved head.
 
 **Load gate**: closes immediately when the 1-minute loadavg exceeds
 `loadClose`; reopens only after `loadOpenSamples` consecutive samples (spaced
