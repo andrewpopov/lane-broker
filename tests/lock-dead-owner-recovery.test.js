@@ -20,10 +20,11 @@ const ITERATIONS = 50;
 // sensitivity proof that this suite still catches the bug it guards.
 const ROUNDS = Number(process.env.LANE_BROKER_TEST_ROUNDS) || 4;
 
-function workerSource(stateJsUrl, root, resultFile, iterations = ITERATIONS) {
+function workerSource(stateJsUrl, root, resultFile, iterations = ITERATIONS, rendezvous = false) {
   return `
 import { withLock } from ${JSON.stringify(stateJsUrl)};
 import fs from 'node:fs';
+import path from 'node:path';
 
 const root = ${JSON.stringify(root)};
 const marker = ${JSON.stringify(path.join(root, '..', 'contention-marker'))};
@@ -34,6 +35,16 @@ for (let i = 0; i < ${iterations}; i++) {
     await withLock(root, async () => {
       if (fs.existsSync(marker)) overlaps += 1;
       fs.writeFileSync(marker, String(process.pid));
+      if (${rendezvous}) {
+        // Hold the critical section until BOTH contenders have entered it, so
+        // an admitted second holder is observed as an overlap every run.
+        const dir = path.dirname(marker);
+        fs.writeFileSync(path.join(dir, 'entered-' + process.pid), '');
+        const stop = Date.now() + 10000;
+        while (fs.readdirSync(dir).filter((f) => f.startsWith('entered-')).length < 2 && Date.now() < stop) {
+          await new Promise((r) => setTimeout(r, 1));
+        }
+      }
       await new Promise((r) => setTimeout(r, 5));
       fs.unlinkSync(marker);
     });
@@ -64,14 +75,14 @@ function plantDeadLock(state, deadPid, token) {
   );
 }
 
-async function runRound({ base, state }, stateJsUrl, deadPid, round, { workers = WORKERS, iterations = ITERATIONS } = {}) {
+async function runRound({ base, state }, stateJsUrl, deadPid, round, { workers = WORKERS, iterations = ITERATIONS, rendezvous = false } = {}) {
   plantDeadLock(state, deadPid, `dead-${round}`);
 
   const runs = [];
   for (let w = 0; w < workers; w += 1) {
     const scriptFile = path.join(base, `worker-${round}-${w}.mjs`);
     const resultFile = path.join(base, `result-${round}-${w}.json`);
-    fs.writeFileSync(scriptFile, workerSource(stateJsUrl, state, resultFile, iterations));
+    fs.writeFileSync(scriptFile, workerSource(stateJsUrl, state, resultFile, iterations, rendezvous));
     runs.push({ scriptFile, resultFile });
   }
 
@@ -122,18 +133,36 @@ test('MUTATION: the pre-fix blind rmSync reintroduces overlap on the same dead-o
   // Recreate the pre-fix behaviour: swap the atomic-takeover call for the
   // blind, unconditional rmSync it replaced. This proves the new guard in
   // state.js is actually load-bearing, not decoration.
-  // A widened race window (a random sleep between "observed dead" and the
-  // blind rm) is added so the pre-fix bug reproduces reliably on this
-  // machine instead of depending on luck: it still exercises exactly the
-  // same defect (two contenders that both observed the SAME dead owner both
-  // acting on that stale observation), just makes the window wide enough to
-  // hit deterministically rather than needing thousands of iterations.
+  // The race is driven explicitly, not by timing: both contenders observe the
+  // same dead owner and meet at a barrier (files in the shared parent dir).
+  // The leader (lowest pid) removes the dead lock and acquires; only once
+  // that live owner is visible does the follower perform its stale blind rm,
+  // which deletes the leader's LIVE lock. The follower then acquires while
+  // the leader is still inside its critical section (the worker holds it
+  // until both have entered), so the overlap occurs on every run.
   const source = fs.readFileSync(stateJsPath, 'utf8');
-  const guarded = 'recoverDeadLock(root, lockDir, ownerFile, owner);';
+  const guarded = 'const won = recoverDeadLock(root, lockDir, ownerFile, owner);';
   assert.ok(source.includes(guarded), 'expected the atomic-takeover call site in state.js; test needs updating');
   const mutated = source.replace(
     guarded,
-    `await sleep(Math.random() * 15);\n      try {\n        fs.rmSync(lockDir, { recursive: true, force: true });\n      } catch {\n        // lost the race to another recoverer; loop and try again\n      }`,
+    `const gate = path.join(root, '..');
+      fs.writeFileSync(path.join(gate, 'observed-' + process.pid), '');
+      const observed = () => fs.readdirSync(gate).filter((f) => f.startsWith('observed-'));
+      while (observed().length < 2) await sleep(1);
+      const leader = Math.min(...observed().map((f) => Number(f.slice('observed-'.length)))) === process.pid;
+      if (!leader) {
+        for (;;) {
+          const now = readJsonSafe(ownerFile);
+          if (now && now.token !== owner.token) break;
+          await sleep(1);
+        }
+      }
+      try {
+        fs.rmSync(lockDir, { recursive: true, force: true });
+      } catch {
+        // lost the race to another recoverer; loop and try again
+      }
+      const won = true;`,
   );
   assert.notEqual(mutated, source, 'mutation must actually change the source');
 
@@ -145,34 +174,19 @@ test('MUTATION: the pre-fix blind rmSync reintroduces overlap on the same dead-o
   const env = freshEnv();
   const deadPid = await spawnDeadPid();
 
-  const MUTANT_WORKERS = 16;
+  const MUTANT_WORKERS = 2;
   const MUTANT_ITERATIONS = 1;
-  const MUTANT_ROUNDS = 10;
 
-  let totalOverlaps = 0;
-  let totalEscaped = 0;
-  let round = 0;
-  // Escalate rounds a bit if the machine is fast enough not to reproduce it
-  // immediately; report whatever settings it took.
-  for (; round < MUTANT_ROUNDS && totalOverlaps === 0; round += 1) {
-    const { overlaps, escaped } = await runRound(env, stateJsUrl, deadPid, round, {
-      workers: MUTANT_WORKERS,
-      iterations: MUTANT_ITERATIONS,
-    });
-    totalOverlaps += overlaps;
-    totalEscaped += escaped;
-  }
+  const { overlaps: totalOverlaps, escaped: totalEscaped } = await runRound(env, stateJsUrl, deadPid, 0, {
+    workers: MUTANT_WORKERS,
+    iterations: MUTANT_ITERATIONS,
+    rendezvous: true,
+  });
 
   fs.rmSync(mutantDir, { recursive: true, force: true });
 
-  process.stdout.write(
-    `[lock-dead-owner-recovery] mutant reproduced overlaps=${totalOverlaps} within round=${round} ` +
-      `(WORKERS=${MUTANT_WORKERS}, ITERATIONS=${MUTANT_ITERATIONS})\n`,
-  );
-
   assert.ok(
     totalOverlaps > 0,
-    `expected the pre-fix blind rmSync to reproduce at least one overlap within ${round} round(s) ` +
-      `(WORKERS=${MUTANT_WORKERS}, ITERATIONS=${MUTANT_ITERATIONS}, widened race sleep 0-15ms), got 0 — escaped=${totalEscaped}`,
+    `expected the pre-fix blind rmSync to reproduce an overlap, got 0 — escaped=${totalEscaped}`,
   );
 });
