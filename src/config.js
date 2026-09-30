@@ -47,6 +47,15 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // timer. This only changes who else is allowed to start; it never touches
   // the lease already holding the key.
   headBlockGraceMs: 600_000,
+  // BRAIN-346: how many tickets may start behind a FIFO head denied only by
+  // projected-over-budget CPU before the head is reserved (nothing else is
+  // admitted past it). 0 restores strict FIFO for resource denials.
+  resourceSkipLimit: 3,
+  // BRAIN-346: a reserved head on a fully idle broker may start when its
+  // projection overshoots the CPU budget by at most this many cores (ambient
+  // load can make a big lane unsatisfiable even with nothing running).
+  // 0 disables the exemption.
+  resourceIdleOvershootCores: 1,
   // BRAIN-338: how many tickets may already be queued on the least-loaded
   // runner for a remote-eligible ticket to be queued there instead of
   // running locally -- only when this machine could not admit it right now
@@ -134,6 +143,14 @@ function validateGlobalConfig(cfg, sourcePath) {
   assert(
     Number.isInteger(cfg.headBlockGraceMs) && cfg.headBlockGraceMs >= 0,
     `${sourcePath}: "headBlockGraceMs" must be a non-negative integer`,
+  );
+  assert(
+    Number.isInteger(cfg.resourceSkipLimit) && cfg.resourceSkipLimit >= 0,
+    `${sourcePath}: "resourceSkipLimit" must be a non-negative integer`,
+  );
+  assert(
+    Number.isFinite(cfg.resourceIdleOvershootCores) && cfg.resourceIdleOvershootCores >= 0,
+    `${sourcePath}: "resourceIdleOvershootCores" must be a non-negative number`,
   );
   assert(
     Number.isInteger(cfg.maxRemoteQueue) && cfg.maxRemoteQueue >= 0,

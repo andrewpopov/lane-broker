@@ -187,6 +187,33 @@ export function cooldownActive(heldLeases, cfg, now = Date.now()) {
 export const KNOWN_BIAS_NOTE = 'self-subtracted-when-observed';
 
 /**
+ * The CPU projection, shared by admission (evaluateCpuAdmission below) and BRAIN-346's backfill
+ * selection (scheduler.js's selectResourceCandidate), so the two can never disagree about what
+ * "fits" means: busy = ambient load + every held lease's demand + the candidate's claim.
+ */
+export function projectBusy(externalBusy, heldLeases, candidateEstimate, now = Date.now()) {
+  return externalBusy + heldLeases.reduce((sum, l) => sum + leaseDemand(l, now), 0) + candidateEstimate;
+}
+
+/** The CPU-core budget for one sample: the smaller of the percent budget and all-cores-minus-reserve. */
+export function cpuBudget(cpuSample, cfg) {
+  const percentBudget = (cfg.cpuAdmissionPercent / 100) * cpuSample.cores;
+  const reserveBudget = Math.max(0, cpuSample.cores - (cfg.cpuReserveCores ?? 0));
+  return Math.min(percentBudget, reserveBudget);
+}
+
+/** A ticket's CPU claim as admission computes it (resolved resources, cold-start estimate). */
+export function ticketCpuEstimate(ticket, cfg) {
+  const resources = resolveTicketResources({
+    weight: ticket.weight,
+    cpuCores: ticket.resources?.cpuCores,
+    memoryBytes: ticket.resources?.memoryBytes,
+    defaultMemoryBytesPerWeight: cfg.defaultMemoryBytesPerWeight,
+  });
+  return coldStartEstimate(resources.cpuCores);
+}
+
+/**
  * The new admission predicate (phase 1), pure function of its inputs so it
  * can be unit-tested without touching disk or the real CPU:
  *
@@ -211,12 +238,9 @@ export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, c
 
   const brokerObserved = heldLeases.reduce((sum, l) => sum + (freshObservedCores(l, now) ?? 0), 0);
   const externalBusy = Math.max(0, cpuSample.hostBusyCores - brokerObserved);
-  const reservedSum = heldLeases.reduce((sum, l) => sum + leaseDemand(l, now), 0);
   const candidateEstimate = coldStartEstimate(candidateResources?.cpuCores ?? candidateWeight);
-  const projectedBusy = externalBusy + reservedSum + candidateEstimate;
-  const percentBudget = (cfg.cpuAdmissionPercent / 100) * cpuSample.cores;
-  const reserveBudget = Math.max(0, cpuSample.cores - (cfg.cpuReserveCores ?? 0));
-  const budget = Math.min(percentBudget, reserveBudget);
+  const projectedBusy = projectBusy(externalBusy, heldLeases, candidateEstimate, now);
+  const budget = cpuBudget(cpuSample, cfg);
 
   if (cpuGateState.closed) {
     return { admit: false, reason: 'cpu-gate-closed', externalBusy, projectedBusy, budget };
@@ -452,4 +476,18 @@ export function formatCapacityBlockLog(f) {
 
 export function logCapacityBlock(root, fields) {
   writeBrokerLog(root, `${formatCapacityBlockLog(fields)}\n`);
+}
+
+/**
+ * BRAIN-346: explicit events for resource backfill. `current=start:ok` in the admission log is
+ * not an admission signal for these, so each is its own `lane-broker-head-block` line, written
+ * only after the lease it describes has been published. `fields` are rendered as key=value pairs
+ * in insertion order.
+ */
+export function formatResourceEventLog(event, fields) {
+  return ['lane-broker-head-block', `event=${event}`, ...Object.entries(fields).map(([k, v]) => `${k}=${v}`)].join(' ');
+}
+
+export function logResourceEvent(root, event, fields) {
+  writeBrokerLog(root, `${formatResourceEventLog(event, fields)}\n`);
 }
