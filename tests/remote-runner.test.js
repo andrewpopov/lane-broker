@@ -10,9 +10,10 @@ import { freshEnv, writeGlobalConfig, BIN, laneRun, sleep, waitFor } from './hel
 import { manifestHashOf, verifyManifestNoGit } from '../src/remote-manifest.js';
 import { encodeSnapshot, serializeHeader, MAX_HEADER_BYTES } from '../src/remote-stream.js';
 import { sanitizeKey } from '../src/config.js';
-import { paths, readJsonSafe, bootId, processStartTime } from '../src/state.js';
+import { paths, readJsonSafe, processStartTime } from '../src/state.js';
 import { writeLease } from '../src/lease.js';
 import { enqueue } from '../src/scheduler.js';
+import { remoteResultCommand } from '../src/remote-runner.js';
 
 function tmpDir(prefix) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
@@ -937,7 +938,7 @@ async function stateFixture({ publisher = 'self', remoteId = true } = {}) {
   fs.mkdirSync(ticketDir, { recursive: true });
   if (remoteId) fs.writeFileSync(path.join(ticketDir, 'remote-id'), laneId);
   if (publisher) {
-    const record = publisher === 'self' ? { pid: process.pid, start: processStartTime(process.pid), bootId: bootId() } : publisher;
+    const record = publisher === 'self' ? { pid: process.pid, start: processStartTime(process.pid) } : publisher;
     fs.writeFileSync(path.join(ticketDir, 'publisher.json'), JSON.stringify(record));
   }
   await getResult(ticketId, root, env);
@@ -966,17 +967,12 @@ test('remote-result state: a live publisher with no remote-id yet (pre-admission
 
 test('remote-result state: a dead publisher pid is gone', async () => {
   const pid = deadPid();
-  const f = await stateFixture({ publisher: { pid, start: 'Mon Jan  1 00:00:00 2024', bootId: bootId() } });
+  const f = await stateFixture({ publisher: { pid, start: 'Mon Jan  1 00:00:00 2024' } });
   assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'gone');
 });
 
 test('remote-result state: a publisher pid reused by another process (start-time mismatch) is gone', async () => {
-  const f = await stateFixture({ publisher: { pid: process.pid, start: 'Mon Jan  1 00:00:00 2001', bootId: bootId() } });
-  assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'gone');
-});
-
-test('remote-result state: a publisher from a different boot is gone', async () => {
-  const f = await stateFixture({ publisher: { pid: process.pid, start: processStartTime(process.pid), bootId: 'some-other-boot' } });
+  const f = await stateFixture({ publisher: { pid: process.pid, start: 'Mon Jan  1 00:00:00 2001' } });
   assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'gone');
 });
 
@@ -985,7 +981,7 @@ test('remote-result state: no publisher.json (older runner) is gone', async () =
   assert.equal((await getResult(f.ticketId, f.root, f.env)).state, 'gone');
 });
 
-test('remote-exec writes publisher.json naming its own process, boot and start time', async () => {
+test('remote-exec writes publisher.json naming its own process and start time', async () => {
   const { env } = freshShadowEnv();
   const root = tmpDir('remote-exec-root');
   const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
@@ -997,8 +993,42 @@ test('remote-exec writes publisher.json naming its own process, boot and start t
   await waitClose(child);
   const publisher = JSON.parse(fs.readFileSync(publisherFile, 'utf8'));
   assert.equal(publisher.pid, remoteExecPid);
-  assert.equal(publisher.bootId, bootId());
+  assert.equal(publisher.bootId, undefined);
   assert.equal(typeof publisher.start, 'string');
+});
+
+test('remote-result: a result.json that lands between the first read and the liveness check is returned, not gone', async () => {
+  const f = await stateFixture({ publisher: { pid: deadPid(), start: 'Mon Jan  1 00:00:00 2024' } });
+  const record = { protocol: 1, kind: 'completed', exit: 0 };
+  let reads = 0;
+  let out = '';
+  const realWrite = process.stdout.write;
+  process.stdout.write = (chunk) => {
+    out += chunk;
+    return true;
+  };
+  try {
+    await remoteResultCommand(f.ticketId, { root: f.root, readResult: () => (reads++ === 0 ? null : record) });
+  } finally {
+    process.stdout.write = realWrite;
+  }
+  assert.equal(reads, 2);
+  assert.deepEqual(JSON.parse(out.trim()), record);
+});
+
+test('remote-exec survives SIGHUP (a dropped ssh session) and still publishes the command exit', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ argv: [process.execPath, '-e', 'setTimeout(() => process.exit(7), 2000)'] });
+  const { child } = spawnRemoteExec(encodeSnapshot(src, header, entries), { env, root });
+  const ticketDir = path.join(root, 'tickets', header.ticketId);
+  await waitFor(() => fs.existsSync(path.join(ticketDir, 'remote-id')), { timeoutMs: 30_000 });
+  child.kill('SIGHUP');
+  assert.equal(await waitClose(child), 0);
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.kind, 'completed');
+  assert.equal(result.exit, 7);
 });
 
 test('remote-result state: a present result.json is returned as-is, with no state', async () => {

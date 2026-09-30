@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { atomicWriteFile, atomicWriteJson, bootId, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, loadGlobalConfig } from './config.js';
 import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores } from './resources.js';
@@ -271,12 +271,14 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     }
     throw err;
   }
+  // Node's default for SIGHUP is to exit, but this process must outlive a dropped ssh session
+  // to publish result.json; explicit cancellation goes through remote-cancel.
+  process.on('SIGHUP', () => {});
   // BRAIN-339: recorded before anything slow (extraction, git init, preflight) so
   // `remote-result` can tell whether this process, the only publisher of result.json, is alive.
   atomicWriteJson(path.join(ticketDir, 'publisher.json'), {
     pid: process.pid,
     start: processStartTime(process.pid),
-    bootId: bootId(),
   });
 
   const fieldCheck = validateHeaderFields(header);
@@ -512,7 +514,7 @@ export async function remoteProbeCommand() {
 /**
  * BRAIN-339: liveness of a ticket that has no result.json. It is decided by the one process
  * that will ever publish that file -- the `remote-exec` that recorded itself in
- * `publisher.json` when it created the ticket dir: alive means same boot, pid alive, same
+ * `publisher.json` when it created the ticket dir: alive means pid alive with the same
  * start time (fail-closed, via `isSupervisorAlive`). The label is `queued` when the ticket's
  * runner-side lane is in the broker queue, else `running`; a client treats both as alive.
  * No publisher.json (an older runner) or a dead publisher is `gone`. Accepted limit: if
@@ -521,7 +523,7 @@ export async function remoteProbeCommand() {
  */
 export function remoteTicketState(ticketDir, brokerRoot) {
   const publisher = readJsonSafe(path.join(ticketDir, 'publisher.json'));
-  if (!publisher || publisher.bootId !== bootId()) return 'gone';
+  if (!publisher) return 'gone';
   if (!isSupervisorAlive({ supervisorPid: publisher.pid, supervisorStart: publisher.start })) return 'gone';
   let laneId = null;
   try {
@@ -534,15 +536,21 @@ export function remoteTicketState(ticketDir, brokerRoot) {
 
 /** `lane remote-result <ticketId>`: print result.json, or {missing:true, state} where state is
  *  queued|running|gone (is the publishing remote-exec alive) (BRAIN-339; `missing:true` stays for older clients). */
-export async function remoteResultCommand(ticketId, { root = defaultRemoteRoot() } = {}) {
+export async function remoteResultCommand(ticketId, { root = defaultRemoteRoot(), readResult = readJsonSafe } = {}) {
   if (!isUuid(ticketId)) {
     process.stderr.write('lane remote-result: missing or invalid ticketId\n');
     return { exitCode: 2 };
   }
   root = path.resolve(root);
   const ticketDir = path.join(root, 'tickets', ticketId);
-  const data = readJsonSafe(path.join(ticketDir, 'result.json'));
-  const record = data || { protocol: 1, missing: true, state: remoteTicketState(ticketDir, stateHome()) };
+  const resultPath = path.join(ticketDir, 'result.json');
+  let record = readResult(resultPath);
+  if (!record) {
+    const state = remoteTicketState(ticketDir, stateHome());
+    // The publisher may have written result.json and exited between the read above and the
+    // liveness check; re-read once before concluding it died with nothing to show (as run.js does).
+    record = (state === 'gone' && readResult(resultPath)) || { protocol: 1, missing: true, state };
+  }
   process.stdout.write(`${JSON.stringify(record)}\n`);
   return { exitCode: 0 };
 }
