@@ -49,9 +49,9 @@ function waitForStreamEnd(stream, timeoutMs = 2000) {
  * cannot resolve a worktree root for a remote-eligible lane must fall back
  * to running locally, not crash the run.
  */
-function resolveWorktreeRoot(cwd) {
+function gitRevParse(cwd, arg) {
   try {
-    return execFileSync('git', ['rev-parse', '--show-toplevel'], {
+    return execFileSync('git', ['rev-parse', arg], {
       cwd,
       encoding: 'utf8',
       env: scrubbedGitEnv(),
@@ -61,6 +61,22 @@ function resolveWorktreeRoot(cwd) {
   } catch {
     return null;
   }
+}
+
+function resolveWorktreeRoot(cwd) {
+  return gitRevParse(cwd, '--show-toplevel');
+}
+
+const HISTORY_COMMAND_MAX = 300;
+
+/** Why a run of a remote-capable lane (`remote: true`) is executing locally,
+ *  decided at ticket creation. A remote attempt that later falls back is
+ *  recorded by the supervisor as `fallback:<reason>` instead. */
+function localReasonFor(resolved, eligible, local) {
+  if (resolved.remote !== true || eligible) return undefined;
+  if (local) return 'forced-flag';
+  if (process.env.LANE_BROKER_LOCAL === '1') return 'forced-env';
+  return 'not-eligible';
 }
 
 function fmtAgo(ms) {
@@ -215,6 +231,8 @@ export async function runCommand({
   // re-enable the local budget check, not just omit `ticket.remote`.
   const remoteWorktreeRoot = remoteWanted ? resolveWorktreeRoot(cwd) : null;
   const remoteEligible = remoteWanted && remoteWorktreeRoot !== null;
+  const localReason = localReasonFor(resolved, remoteEligible, local);
+  const headTree = gitRevParse(cwd, 'HEAD^{tree}');
   const resources = resolveTicketResources({
     weight,
     cpuCores: cpuOverride ?? resolved.cpuCores,
@@ -336,6 +354,12 @@ export async function runCommand({
     // side (BRAIN-308): a `--detach` caller's own stdio is irrelevant to the
     // supervisor, which never even inherits it (stdio stays 'ignore' below).
     forwardOutput: !detach,
+    // BRAIN-347: history provenance, stamped once here and read back by the
+    // supervisor's single history-row builder. `headTree` is omitted outside
+    // a git repo; it must never fail the run.
+    command: cmd.join(' ').slice(0, HISTORY_COMMAND_MAX),
+    ...(headTree ? { headTree } : {}),
+    ...(localReason ? { localReason } : {}),
   };
 
   // BRAIN-320 S1d: stamped once, here, from the same Date.now() this
