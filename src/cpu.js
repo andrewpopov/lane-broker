@@ -220,75 +220,79 @@ export function readMemoryInfo(exec = execFileSync) {
   return { availableBytes, totalBytes: capacity.memoryBytes, macPressure, source: capacity.source };
 }
 
-export function parseGroupRssOutput(text) {
-  const values = String(text ?? '')
-    .split('\n')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map(Number)
-    .filter((n) => Number.isFinite(n) && n >= 0);
-  if (values.length === 0) return null;
-  return values.reduce((sum, kib) => sum + kib, 0) * 1024;
+/** Parse `ps -A -o pid=,ppid=,pgid=,pcpu=,rss=` text into rows; unparseable lines are dropped. */
+export function parseProcessTable(text) {
+  const rows = [];
+  for (const line of String(text ?? '').split('\n')) {
+    const f = line.trim().split(/\s+/).map(Number);
+    if (f.length !== 5 || !f.every(Number.isFinite)) continue;
+    const [pid, ppid, pgid, pcpu, rss] = f;
+    rows.push({ pid, ppid, pgid, pcpu, rss });
+  }
+  return rows;
 }
 
-/** Best-effort RSS estimate for every process in a worker's process group. */
-export function observedGroupMemoryBytes(pgid, exec = execFileSync) {
+/**
+ * BRAIN-353: a lease's processes are its whole process group PLUS every
+ * descendant (ppid walk) of any member. A command that spawns workers with
+ * `detached: true` puts them in NEW process groups, so a pgid-only sum sees ~0
+ * while they burn cores. Processes whose pid is in stopPids or whose pgid is in
+ * stopPgids (other leases' supervisors and child groups, for a nested `lane run`)
+ * are never selected nor descended into, so a nested lease is not counted twice;
+ * the lease's own pgid is never a stop. Returns { cores, memoryBytes }, or null when no
+ * process is in the group (unknown/dead id) — never a fabricated zero.
+ */
+export function selectLeaseTree(rows, pgid, { stopPids = new Set(), stopPgids = new Set() } = {}) {
+  const stopped = (r) => stopPids.has(r.pid) || (r.pgid !== pgid && stopPgids.has(r.pgid));
+  const selected = new Set(rows.filter((r) => r.pgid === pgid && !stopped(r)).map((r) => r.pid));
+  if (selected.size === 0) return null;
+  const childrenOf = new Map();
+  for (const r of rows) if (!stopped(r)) childrenOf.set(r.ppid, [...(childrenOf.get(r.ppid) ?? []), r.pid]);
+  const stack = [...selected];
+  while (stack.length > 0) {
+    for (const child of childrenOf.get(stack.pop()) ?? []) {
+      if (!selected.has(child)) {
+        selected.add(child);
+        stack.push(child);
+      }
+    }
+  }
+  let pcpu = 0;
+  let rssKib = 0;
+  for (const r of rows) {
+    if (!selected.has(r.pid)) continue;
+    pcpu += Math.max(0, r.pcpu);
+    rssKib += Math.max(0, r.rss);
+  }
+  return { cores: pcpu / 100, memoryBytes: rssKib * 1024 };
+}
+
+/**
+ * Best-effort observed CPU (cores) and RSS (bytes) of one lease's whole
+ * descendant tree from a single `ps` snapshot. Null (never throws) when the id
+ * is unknown, the probe fails, or no process belongs to it. 2s bound: this runs
+ * synchronously INSIDE the supervisor heartbeat, so a hung `ps` must never
+ * stall heartbeats/cancellation — a timeout is just another probe failure.
+ * Telemetry only (BRAIN-207), folded into leaseDemand in src/admission.js.
+ */
+export function observeLeaseTree(pgid, { stopPids, stopPgids } = {}, exec = execFileSync) {
   if (!pgid) return null;
   try {
-    const out = exec('ps', ['-o', 'rss=', '-g', String(pgid)], {
+    const out = exec('ps', ['-A', '-o', 'pid=,ppid=,pgid=,pcpu=,rss='], {
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 2000,
     });
-    return parseGroupRssOutput(out);
+    return selectLeaseTree(parseProcessTable(out), Number(pgid), { stopPids, stopPgids });
   } catch {
     return null;
   }
 }
 
-/**
- * Pure parse of `ps -o %cpu=`'s raw text into a cores-busy figure, split out
- * from observedGroupCpuCores below so it's unit-testable without shelling
- * out. `Number('')` is `0`, so a blank/whitespace-only line (there's always
- * at least a trailing newline, and `ps` can emit blank rows) must be
- * filtered out BEFORE the Number() coercion, not after — otherwise it reads
- * as a real, valid zero-percent process instead of "nothing usable here",
- * and a probe that returned no rows at all would wrongly report 0 (a
- * legitimate reading) rather than null (no observation).
- */
-export function parseGroupCpuOutput(text) {
-  const values = text
-    .split('\n')
-    .map((s) => s.trim())
-    .filter((s) => s.length > 0)
-    .map(Number)
-    .filter((n) => Number.isFinite(n));
-  if (values.length === 0) return null;
-  return values.reduce((sum, v) => sum + v, 0) / 100;
-}
-
-/**
- * Best-effort observed CPU (in cores) for one lease's process group, summing
- * `ps`'s %cpu across every process in the group. Returns null (never
- * throws) when the pgid is unknown, the probe itself fails, or the probe
- * returns nothing usable — the same fail-safe shape as processStartTime()
- * in state.js. Wired into the supervisor heartbeat (BRAIN-207): telemetry
- * only, folded into leaseDemand's max(observed, cold) in src/admission.js.
- */
 export function observedGroupCpuCores(pgid, exec = execFileSync) {
-  if (!pgid) return null;
-  try {
-    // 2s bound (Codex pre-merge review): this runs synchronously INSIDE the
-    // supervisor heartbeat, so a hung `ps` must never be able to stall
-    // heartbeats/cancellation indefinitely — a timeout is treated exactly
-    // like any other probe failure (null, same as an unknown pgid).
-    const out = exec('ps', ['-o', '%cpu=', '-g', String(pgid)], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 2000,
-    });
-    return parseGroupCpuOutput(out);
-  } catch {
-    return null;
-  }
+  return observeLeaseTree(pgid, {}, exec)?.cores ?? null;
+}
+
+export function observedGroupMemoryBytes(pgid, exec = execFileSync) {
+  return observeLeaseTree(pgid, {}, exec)?.memoryBytes ?? null;
 }

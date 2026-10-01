@@ -14,8 +14,8 @@ import {
   LockTimeoutError,
 } from './state.js';
 import { enqueue, tryStart, dequeueSync, couldAdmitNow } from './scheduler.js';
-import { readLease, writeLease, removeLease, isGroupAlive, processStartTime } from './lease.js';
-import { observedGroupCpuCores, observedGroupMemoryBytes } from './cpu.js';
+import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
+import { observeLeaseTree } from './cpu.js';
 import { reloadGlobalConfig } from './config.js';
 import { detectResourceCapacity, checkResourceBudget, localSimRefusal } from './resources.js';
 import { selectRunner, dispatchRemote, needsProtocol2 } from './remote-client.js';
@@ -846,8 +846,9 @@ async function main() {
     if (finished) return;
     const lease = readLease(root, ticket.id);
     if (lease) {
-      const observed = child.pid ? observedGroupCpuCores(child.pid) : null;
-      const observedMemory = child.pid ? observedGroupMemoryBytes(child.pid) : null;
+      const tree = observeLeaseTree(child.pid, otherLeaseStops(root, ticket.id));
+      const observed = tree?.cores ?? null;
+      const observedMemory = tree?.memoryBytes ?? null;
       writeLease(root, applyHeartbeatObservation(lease, observed, Date.now(), observedMemory));
     }
     // Codex pre-merge BLOCKER #1: the marker must survive until AFTER the
@@ -974,4 +975,20 @@ if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
     process.stderr.write(`lane-broker supervisor error: ${err.stack || err.message}\n`);
     process.exit(1);
   });
+}
+
+/** Other held leases' supervisor pids and child groups, so a nested `lane run` is not observed twice (BRAIN-353). */
+function otherLeaseStops(root, ownId) {
+  const stopPids = new Set();
+  const stopPgids = new Set();
+  try {
+    for (const l of listLeases(root)) {
+      if (l.id === ownId) continue;
+      if (Number.isFinite(l.supervisorPid)) stopPids.add(l.supervisorPid);
+      if (Number.isFinite(l.childPgid)) stopPgids.add(l.childPgid);
+    }
+  } catch {
+    // never let a lease-listing failure break the heartbeat: observe without stops
+  }
+  return { stopPids, stopPgids };
 }
