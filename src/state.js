@@ -35,6 +35,8 @@ export function paths(root = stateHome()) {
     // comment in scheduler.js for why a shared counter would let the two
     // block reasons interfere with each other's allowance).
     capacitySkipState: path.join(root, 'capacity-skip-state.json'),
+    // BRAIN-346: the projected-over-budget head's backfill allowance and reservation latch.
+    resourceSkipState: path.join(root, 'resource-skip-state.json'),
     seq: path.join(root, 'seq'),
     // BRAIN-319 T3b-2 (C3): one durable attempt record per remote-eligible
     // ticket, keyed by ticket id -- see src/attempts.js.

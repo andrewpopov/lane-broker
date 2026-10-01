@@ -124,13 +124,41 @@ export function computeBusyCores(prev, snapshot) {
  * permissions error, full disk, or any other failure here must never make
  * this throw or abort admission.
  */
-export function sampleHostCpu(root, cpus = os.cpus()) {
+/**
+ * BRAIN-346: true only for a VALIDATED read whose counters did not move at all since `prev`: the
+ * same raw core count, and every core's total and idle counters exactly equal. `===` is false for
+ * NaN, so a malformed entry never qualifies, and a regressing counter (clock skew, reset) never
+ * does either. Only this shape may reuse the last measurement; every other stale reading
+ * (malformed, regressing, topology change, too old, no baseline) stays unavailable.
+ */
+function countersUnchanged(prev, snapshot) {
+  if (!prev || !Array.isArray(prev.cpus) || prev.cpus.length === 0 || prev.cpus.length !== snapshot.cpus.length) return false;
+  if (!Number.isFinite(prev.at) || snapshot.at - prev.at < 0 || snapshot.at - prev.at > MAX_SAMPLE_GAP_MS) return false;
+  return snapshot.cpus.every((s, i) => prev.cpus[i] && prev.cpus[i].total === s.total && prev.cpus[i].idle === s.idle);
+}
+
+export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0 } = {}) {
   const override = readCpuBusyOverride();
   if (override) return override;
   const file = paths(root).cpuSample;
   const prev = readJsonSafe(file);
   const now = Date.now();
   const snapshot = { at: now, cpus: cpus.map(cpuTimes) };
+  const { hostBusyCores, stale } = computeBusyCores(prev, snapshot);
+  const capacity = detectResourceCapacity({ parallelism: cpus.length });
+  const measured = Number.isFinite(hostBusyCores) ? Math.min(hostBusyCores, capacity.cpuCores) : hostBusyCores;
+  // BRAIN-346: the head and a backfill candidate now sample back to back, and os.cpus() counters
+  // advance in coarse ticks, so the second poll often sees no advance and reads "stale" — which
+  // admission treats as "unavailable, admit on an idle broker". Carry the last VALID measurement
+  // in the sidecar and reuse it while it is younger than reuseWindowMs, flagged `reused` so the
+  // CPU gate's hysteresis does not count it as a new observation.
+  // It survives ONLY a legitimate unchanged-counter read that follows a valid measurement. Any
+  // other stale read (malformed, regressing, topology change, no baseline) drops it: that read is
+  // about to become the persisted baseline, and carrying the old measurement over it would let a
+  // repeat of the same bad counters match `countersUnchanged` and reuse a pre-fault figure.
+  const unchanged = stale && countersUnchanged(prev, snapshot);
+  const lastValid = !stale && Number.isFinite(measured) ? { hostBusyCores: measured, cores: capacity.cpuCores, at: now } : unchanged ? prev.lastValid : undefined;
+  if (lastValid) snapshot.lastValid = lastValid;
   try {
     const latest = readJsonSafe(file);
     if (!latest || !Number.isFinite(latest.at) || latest.at < snapshot.at) {
@@ -139,10 +167,19 @@ export function sampleHostCpu(root, cpus = os.cpus()) {
   } catch {
     // best-effort: a failed sidecar write must never abort admission
   }
-  const { hostBusyCores, stale } = computeBusyCores(prev, snapshot);
-  const capacity = detectResourceCapacity({ parallelism: cpus.length });
+  const reusable =
+    unchanged &&
+    prev.lastValid &&
+    Number.isFinite(prev.lastValid.hostBusyCores) &&
+    prev.lastValid.cores === capacity.cpuCores &&
+    Number.isFinite(prev.lastValid.at) &&
+    now - prev.lastValid.at >= 0 &&
+    now - prev.lastValid.at < reuseWindowMs;
+  if (reusable) {
+    return { hostBusyCores: prev.lastValid.hostBusyCores, cores: capacity.cpuCores, stale: false, reused: true, sampledAt: now, source: capacity.source };
+  }
   return {
-    hostBusyCores: Number.isFinite(hostBusyCores) ? Math.min(hostBusyCores, capacity.cpuCores) : hostBusyCores,
+    hostBusyCores: measured,
     cores: capacity.cpuCores,
     stale,
     sampledAt: now,

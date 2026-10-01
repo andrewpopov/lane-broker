@@ -3,7 +3,7 @@ import path from 'node:path';
 import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, writeExpireMarkerFile } from './state.js';
 import { sampleAndUpdateGate, readGateState } from './load.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
-import { evaluateNewAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock } from './admission.js';
+import { evaluateNewAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, projectBusy, ticketCpuEstimate } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
 import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, resolveTicketResources } from './resources.js';
 
@@ -370,6 +370,139 @@ function resolveCapacityBlock(root, cfg, headId, headWeight, runningWeight, capa
 }
 
 /**
+ * BRAIN-346: the projected-over-budget head's record (resource-skip-state.json):
+ * `{ headId, count, reserved, inScope, deniedAt, budget, externalBusy }`. `count`/`reserved` are the
+ * head's allowance and survive ANY denial kind for the same head; they are dropped only when the
+ * head starts, leaves queue[0], or resourceSkipLimit is 0. `inScope` is whether the head's LATEST
+ * denial was projected-over-budget (memory ok): an out-of-scope denial pauses backfill without
+ * resetting the allowance. Written by the head's own denials (recordResourceDenial,
+ * markResourceOutOfScope) and by a backfill's count (recordResourceBackfill). Anything missing
+ * or malformed reads as null, which means "no backfill"; a missing `inScope` reads as false.
+ */
+export function readResourceSkipState(root) {
+  const raw = readJsonSafe(paths(root).resourceSkipState);
+  if (
+    !raw ||
+    typeof raw.headId !== 'string' ||
+    !Number.isInteger(raw.count) ||
+    raw.count < 0 ||
+    typeof raw.reserved !== 'boolean' ||
+    !Number.isFinite(raw.budget) ||
+    !Number.isFinite(raw.externalBusy) ||
+    !Number.isFinite(raw.deniedAt)
+  ) {
+    return null;
+  }
+  return {
+    headId: raw.headId,
+    count: raw.count,
+    reserved: raw.reserved,
+    inScope: raw.inScope === true,
+    deniedAt: raw.deniedAt,
+    budget: raw.budget,
+    externalBusy: raw.externalBusy,
+  };
+}
+
+/** The record for exactly this head, or null: resource backfill is active-mode only, off at
+ *  resourceSkipLimit 0, and a record left by any other head is never consulted. */
+function resourceRecordFor(root, cfg, headId) {
+  if (cfg.schedulerMode !== 'active' || !(cfg.resourceSkipLimit > 0)) return null;
+  const record = readResourceSkipState(root);
+  return record && record.headId === headId ? record : null;
+}
+
+const resourceBackfillOpen = (record, cfg) => record !== null && record.inScope && !record.reserved && record.count < cfg.resourceSkipLimit;
+const resourceReserved = (record) => record !== null && record.reserved;
+
+/** The head's own in-scope denial (projected-over-budget, memory ok): create the record for a new
+ *  head, or refresh the budget/externalBusy snapshot while carrying count/reserved forward for
+ *  the same head. Best-effort: a failed write leaves the old record (or none), never an allowance. */
+function recordResourceDenial(root, cfg, headId, cpuDecision, now, write) {
+  if (!(cfg.resourceSkipLimit > 0)) return;
+  const prev = readResourceSkipState(root);
+  const same = prev !== null && prev.headId === headId;
+  try {
+    write(paths(root).resourceSkipState, {
+      headId,
+      count: same ? prev.count : 0,
+      reserved: same ? prev.reserved : false,
+      inScope: true,
+      deniedAt: now,
+      budget: cpuDecision.budget,
+      externalBusy: cpuDecision.externalBusy,
+    });
+  } catch {
+    // best-effort — see doc comment
+  }
+}
+
+/** The head's latest denial is NOT projected-over-budget: pause backfill but keep the allowance
+ *  (count/reserved). Never creates a record — there is no allowance to keep for a fresh head. */
+function markResourceOutOfScope(root, headId, now, write) {
+  const prev = readResourceSkipState(root);
+  if (prev === null || prev.headId !== headId || !prev.inScope) return;
+  try {
+    write(paths(root).resourceSkipState, { ...prev, inScope: false, deniedAt: now });
+  } catch {
+    // best-effort: a stale inScope only lets a candidate reach its own unchanged fresh admission
+  }
+}
+
+/** Count a backfill past the head and latch the reservation when the allowance is used up.
+ *  Fail CLOSED like recordSkip: the caller refuses the backfill when this returns null. */
+function recordResourceBackfill(root, cfg, record, write) {
+  const count = record.count + 1;
+  const reserved = count >= cfg.resourceSkipLimit;
+  try {
+    write(paths(root).resourceSkipState, { ...record, count, reserved });
+    return { count, reserved };
+  } catch {
+    return null;
+  }
+}
+
+function clearResourceSkipState(root) {
+  try {
+    fs.unlinkSync(paths(root).resourceSkipState);
+  } catch {
+    // already gone
+  }
+}
+
+/**
+ * BRAIN-346: pick the backfill ticket behind a head denied projected-over-budget. Walks the queue
+ * like selectCapacityCandidate (a null record stops the walk; conflicting or weight-overflowing
+ * tickets are skipped) and additionally skips any ticket whose start would make the head
+ * conflicted. Among tickets whose CPU claim fits the headroom the head's record was denied
+ * against (the same projectBusy maths admission uses, over the CURRENT held leases), it returns
+ * the smallest claim, earliest in the queue on ties.
+ *
+ * Admission-failure recovery rule: selection is stateless. A selected ticket that fresh admission
+ * then denies is simply selected again next poll; because the smallest claim always goes first, a
+ * mispredicted ticket can only ever hold back tickets with an equal or larger claim, never a
+ * smaller one. The head is never a candidate here (index 0).
+ */
+export function selectResourceCandidate(queue, held, runningWeight, weightCapacity, record, cfg, now = Date.now()) {
+  const headTicket = queue[0];
+  let best = null;
+  let bestClaim = Infinity;
+  for (const t of queue.slice(1)) {
+    if (!t) return best;
+    if (blockedBy(held, t)) continue;
+    if (runningWeight + t.weight > weightCapacity) continue;
+    if (blockedBy([...held, { key: t.key }], headTicket)) continue;
+    const claim = ticketCpuEstimate(t, cfg);
+    if (projectBusy(record.externalBusy, held, claim, now) > record.budget) continue;
+    if (claim < bestClaim) {
+      best = t;
+      bestClaim = claim;
+    }
+  }
+  return best;
+}
+
+/**
  * Walk the FIFO queue in order and return the first ticket with no
  * conflicting held lease, or null if every queued ticket up to and
  * including the first unreadable record conflicts with something currently
@@ -423,9 +556,12 @@ export function selectCapacityCandidate(queue, held, runningWeight, capacity) {
 
 /**
  * The single atomic transaction: a ticket starts only when it is selected
- * per selectCandidate() above AND fits capacity AND the load gate is open
- * AND the broker is not paused. No backfill behind a capacity- or
- * gate-blocked head — only a conflict-blocked head is skipped.
+ * AND fits capacity AND the load gate is open AND the broker is not paused.
+ * Selection is FIFO with three bounded skips past a head that cannot start:
+ * conflict (selectCandidate), capacity (selectCapacityCandidate) and, for a
+ * head denied only by projected-over-budget CPU, resource (selectResourceCandidate,
+ * then a reservation). A gate-blocked head is never skipped. See the README's
+ * "Fairness and backfill" section.
  *
  * Resource sampling and the admission decision share the global lock. CPU
  * sampling reads and updates cpu-sample.json, so serializing it prevents two
@@ -440,8 +576,8 @@ export function selectCapacityCandidate(queue, held, runningWeight, capacity) {
  * become a stale, already-superseded transition of the load/CPU gate — only
  * a transition the config in effect at decision time would actually produce.
  */
-export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler, reloadCfg = () => globalCfg, memoryReader = readMemoryInfo) {
-  const { result, logFields } = await withLock(root, () => {
+export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler, reloadCfg = () => globalCfg, memoryReader = readMemoryInfo, writeResourceState = atomicWriteJson) {
+  const { result, logFields, events } = await withLock(root, () => {
     const cfg = reloadCfg() || globalCfg;
     const now = Date.now();
     reapStale(root, ticket.id);
@@ -535,11 +671,20 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       : null;
     const capacitySkipExhausted = headCapacityBlocked && capacityBlock.phase === 'exhausted';
 
+    // BRAIN-346: a head whose last in-scope denial was projected-over-budget (see its record) may
+    // be backfilled past, bounded by resourceSkipLimit, then reserved. A reservation also stops
+    // capacity backfill past that same head (the one cross-kind check); conflict backfill is
+    // never affected — a conflict-blocked head never reaches either resource path.
+    const resourceRecord = headConflicted ? null : resourceRecordFor(root, cfg, headTicket.id);
+    const capacityReserved = headCapacityBlocked && resourceReserved(resourceRecord);
+    const resourceBackfill = !headConflicted && !headCapacityBlocked && resourceBackfillOpen(resourceRecord, cfg);
     const candidate = headConflicted
       ? (skipExhausted ? null : selectCandidate(queue, held))
       : headCapacityBlocked
-        ? (capacitySkipExhausted ? null : selectCapacityCandidate(queue, held, runningWeight, weightCapacity))
-        : headTicket;
+        ? (capacitySkipExhausted || capacityReserved ? null : selectCapacityCandidate(queue, held, runningWeight, weightCapacity))
+        : resourceBackfill && ticket.id !== headTicket.id
+          ? selectResourceCandidate(queue, held, runningWeight, weightCapacity, resourceRecord, cfg, now)
+          : headTicket;
     if (!candidate) {
       // Either nobody in the queue is eligible (selectCandidate/
       // selectCapacityCandidate found nothing), or the head's skip
@@ -576,7 +721,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       const reason = fs.readFileSync(paths(root).pause, 'utf8').trim();
       return { result: { started: false, reason: 'paused', pauseReason: reason } };
     }
-    const cpuSample = sampleCpuSafe(root, cpuSampler);
+    const cpuSample = sampleCpuSafe(root, cpuSampler, cfg.sampleMs / 2);
     // The gate must still be SAMPLED unconditionally (its hysteresis
     // countdown depends on every poll observing a sample, closed broker or
     // not), but a gate closed by load the broker itself never generated
@@ -636,12 +781,14 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     const baselineReason = cfg.admissionLoadGate && gate.closed && brokerIdle ? 'idle-exempt' : 'ok';
 
     if (cfg.admissionLoadGate && gate.closed && !brokerIdle) {
+      if (ticket.id === headTicket.id) markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
       return {
         result: { started: false, reason: 'load-gate-closed', load: gate.lastLoad },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'load-gate-closed' },
       };
     }
     if (runningWeight + ticket.weight > weightCapacity) {
+      if (ticket.id === headTicket.id) markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
       return {
         result: { started: false, reason: 'capacity', runningWeight, capacity: weightCapacity },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'capacity' },
@@ -654,6 +801,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // throwing reader all admit — same fail-open tolerance as the CPU/load
     // samplers elsewhere in this function.
     if (memInfo && memInfo.macPressure === 'critical') {
+      if (ticket.id === headTicket.id) markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
       return {
         result: { started: false, reason: 'memory-critical', macPressure: memInfo.macPressure },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'memory-critical' },
@@ -663,7 +811,28 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // for the conflict/capacity checks above, and it only ever gates a start
     // in 'active' mode — 'shadow' always falls through to the exact
     // admission the current rule would have made.
-    if (cfg.schedulerMode === 'active' && !cpuDecision.admit) {
+    const headPolling = ticket.id === headTicket.id;
+    const resourceDenied =
+      cfg.schedulerMode === 'active' && !cpuDecision.admit && cpuDecision.cpuReason === 'projected-over-budget' && cpuDecision.memoryReason === 'ok';
+    // BRAIN-346 idle exemption: the head on a fully idle broker (orphaned leases count as held)
+    // whose projection overshoots the budget by at most resourceIdleOvershootCores starts anyway
+    // — ambient load alone can make a big lane unsatisfiable with nothing running, with or
+    // without anyone queued behind it. Same lock transaction as the lease write below, so two
+    // supervisors never both exempt. Only a pure CPU-projection denial qualifies: a joint memory
+    // denial never does.
+    const idleExempt =
+      resourceDenied &&
+      headPolling &&
+      held.length === 0 &&
+      cfg.resourceIdleOvershootCores > 0 &&
+      cpuDecision.projectedBusy - cpuDecision.budget <= cfg.resourceIdleOvershootCores;
+    if (cfg.schedulerMode === 'active' && !cpuDecision.admit && !idleExempt) {
+      if (headPolling) {
+        // Cooldown is the head's own backfill echoing back (each admission starts one), so it
+        // changes nothing. Any other out-of-scope denial pauses backfill but keeps the allowance.
+        if (resourceDenied) recordResourceDenial(root, cfg, headTicket.id, cpuDecision, now, writeResourceState);
+        else if (cpuDecision.cpuReason !== 'cooldown') markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
+      }
       return {
         result: {
           started: false,
@@ -676,6 +845,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
         logFields: { ...logBase, currentDecision: 'start', currentReason: baselineReason },
       };
     }
+    let recorded = null;
     if (ticket.id !== headTicket.id && headConflicted) {
       // This ticket is genuinely skipping ahead of the still-blocked head —
       // count it toward conflictSkipLimit above. Fail CLOSED: if the count
@@ -690,6 +860,12 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       // head that doesn't fit capacity (see recordCapacitySkip's doc
       // comment).
       if (!recordCapacitySkip(root, headTicket.id)) {
+        return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
+      }
+    } else if (ticket.id !== headTicket.id && resourceBackfill) {
+      // BRAIN-346: same event, same fail-CLOSED discipline; a refused write never restarts the allowance.
+      recorded = recordResourceBackfill(root, cfg, resourceRecord, writeResourceState);
+      if (!recorded) {
         return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
       }
     }
@@ -739,12 +915,26 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       state: LEASE_STATE.RUNNING,
     };
     writeLease(root, lease);
-    return { result: { started: true, lease }, logFields: { ...logBase, currentDecision: 'start', currentReason: baselineReason } };
+    const events = [];
+    if (recorded) {
+      events.push(['resource-backfill-start', { skipPast: headTicket.id, count: recorded.count }]);
+      if (recorded.reserved) events.push(['resource-reserved', { headId: headTicket.id, count: recorded.count, limit: cfg.resourceSkipLimit }]);
+    }
+    if (idleExempt) {
+      events.push(['resource-idle-exempt', { headId: headTicket.id, overshoot: (cpuDecision.projectedBusy - cpuDecision.budget).toFixed(2) }]);
+    }
+    if (headPolling) clearResourceSkipState(root);
+    return {
+      result: { started: true, lease },
+      logFields: { ...logBase, currentDecision: 'start', currentReason: idleExempt ? 'resource-idle-exempt' : baselineReason },
+      events,
+    };
   });
 
   // Pure telemetry: nothing reads this back to make a decision, so it never
   // needs to be atomic with anything above — write it after the lock has
   // already been released, on both the admit and deny paths.
   if (logFields) logAdmissionDecision(root, logFields);
+  for (const [event, fields] of events || []) logResourceEvent(root, event, fields);
   return result;
 }
