@@ -329,6 +329,30 @@ function localRefusalResult(ticket, refusal) {
 }
 
 /**
+ * BRAIN-347: the ONE history-row builder every supervisor terminal path goes
+ * through. `executor` defaults to 'local' (a remote result overrides it via
+ * the `result` spread); `localReason` is the ticket's creation-time reason, or
+ * `fallback:<reason>` when a remote attempt fell back to local.
+ */
+function historyRow(ticket, result, { fallbackReason } = {}) {
+  const executor = result.executor ?? 'local';
+  const localReason = executor === 'local' ? (fallbackReason === undefined ? ticket.localReason : `fallback:${fallbackReason}`) : undefined;
+  return {
+    id: ticket.id,
+    key: ticket.key,
+    repo: ticket.repoId,
+    lane: ticket.lane,
+    weight: ticket.weight,
+    resources: ticket.resources,
+    command: ticket.command,
+    headTree: ticket.headTree,
+    ...result,
+    executor,
+    ...(localReason ? { localReason } : {}),
+  };
+}
+
+/**
  * Attempt a remote runner for a remote-eligible ticket (`ticket.remote`,
  * BRAIN-319 T3b-1's payload), BEFORE the ticket is ever handed to the local
  * scheduler. Resolves to `{ fallback: true, attemptGeneration, fallbackReason }`
@@ -360,17 +384,10 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     if (stderrForward) stderrForward.write(chunk);
   };
 
+  let selectedRunner = null;
   function writeResultSync(result) {
     atomicWriteJson(enriched.resultPath, result);
-    appendHistory(root, {
-      id: enriched.id,
-      key: enriched.key,
-      repo: enriched.repoId,
-      lane: enriched.lane,
-      weight: enriched.weight,
-      resources: enriched.resources,
-      ...result,
-    });
+    appendHistory(root, historyRow(enriched, { ...result, ...(selectedRunner ? { runner: selectedRunner } : {}) }));
   }
 
   /**
@@ -512,6 +529,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     writeBrokerLog(root, line);
   }
 
+  selectedRunner = runner.name;
   await updateAttempt(root, enriched.id, 0, { phase: 'running', runner: runner.name, ...(queuedAt ? { queuedAt } : {}) });
   // Printed only now that eligibility is settled and a usable runner is
   // about to actually be dialed for the transfer -- see finding #5 above.
@@ -683,15 +701,7 @@ async function main() {
         : { ...remoteCancelledResult(enriched.id, null), executor: 'local', fallbackReason };
     const publish = (result) => {
       atomicWriteJson(ticket.resultPath, result);
-      appendHistory(root, {
-        id: ticket.id,
-        key: ticket.key,
-        repo: ticket.repoId,
-        lane: ticket.lane,
-        weight: ticket.weight,
-        resources: ticket.resources,
-        ...result,
-      });
+      appendHistory(root, historyRow(ticket, result, { fallbackReason }));
     };
     if (attemptGeneration !== null) {
       await publishTerminal(root, ticket.id, attemptGeneration, () => publish(buildResult()));
@@ -895,15 +905,7 @@ async function main() {
     // released, attempt removed), THEN exit.
     const writeResult = (finalResult) => {
       atomicWriteJson(ticket.resultPath, finalResult);
-      appendHistory(root, {
-        id: ticket.id,
-        key: ticket.key,
-        repo: ticket.repoId,
-        lane: ticket.lane,
-        weight: ticket.weight,
-        resources: ticket.resources,
-        ...finalResult,
-      });
+      appendHistory(root, historyRow(ticket, finalResult, { fallbackReason }));
       removeLease(root, ticket.id); // release always comes last
       // Cleanup only, AFTER the terminal write above -- never before (BLOCKER #1).
       clearTicketMarkers(root, ticket.id);
@@ -919,7 +921,7 @@ async function main() {
       const published = await publishTerminal(root, ticket.id, attemptGeneration, ({ cancelled }) => {
         if (cancelled) {
           finalExitCode = 130;
-          writeResult(remoteCancelledResult(enriched.id, startedAt));
+          writeResult({ ...remoteCancelledResult(enriched.id, startedAt), executor: 'local' });
         } else {
           writeResult({ ...result, executor: 'local', fallbackReason });
         }

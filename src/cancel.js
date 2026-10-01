@@ -198,7 +198,7 @@ export async function cancelCommand(id) {
     // Plain lease-only ticket (no attempt record) -- unchanged behaviour.
     const endedAt = Date.now();
     atomicWriteJson(lease.resultPath, { id, exit: null, signal: 'SIGKILL', startedAt: null, endedAt, waitedMs: null, cancelled: true });
-    appendHistory(root, { id, key: lease.key, cancelled: true, endedAt });
+    appendHistory(root, { id, key: lease.key, cancelled: true, endedAt, executor: 'local' });
   }
   removeLease(root, id);
   process.stdout.write(`lane cancel: cancelled orphaned lease ${id}\n`);
