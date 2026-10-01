@@ -6,8 +6,9 @@ import {
   sampleHostCpu,
   computeBusyCores,
   readMemoryInfo,
-  parseGroupCpuOutput,
-  parseGroupRssOutput,
+  parseProcessTable,
+  selectLeaseTree,
+  observeLeaseTree,
   observedGroupCpuCores,
   observedGroupMemoryBytes,
 } from '../src/cpu.js';
@@ -142,26 +143,80 @@ test('sampleHostCpu never throws when the sidecar write fails (e.g. the state ro
   });
 });
 
-test('parseGroupCpuOutput: an all-blank/whitespace ps output is null, not a fabricated zero (BRAIN-207)', () => {
-  // Number('') === 0, so the blank line must be filtered BEFORE the Number()
-  // coercion, not after -- otherwise "nothing usable" reads as "a real
-  // process at exactly 0% CPU" instead of null (no observation).
-  assert.equal(parseGroupCpuOutput('\n'), null);
-  assert.equal(parseGroupCpuOutput('   \n  \n'), null);
-  assert.equal(parseGroupCpuOutput(''), null);
+// ps -A -o pid=,ppid=,pgid=,pcpu=,rss= fixture. Lane pgid is 100; its npm child 101 spawns
+// workers with `detached: true`, so 102/103 sit in their OWN groups (as in production) and 104 is
+// a grandchild of 102. 200/201 are an unrelated tree; 300 is an orphan reparented to init.
+const PS_FIXTURE = [
+  '  100     1   100   0.0   1000',
+  '  101   100   100  10.0   2000',
+  '  102   101   746 150.0   4000',
+  '  103   101 25854 100.0   8000',
+  '  104   102   746  50.0   1000',
+  '  200     1   200 400.0 999999',
+  '  201   200   200 100.0 999999',
+  '  300     1   300  90.0 999999',
+  '',
+].join('\n');
+
+test('parseProcessTable skips blank and malformed rows', () => {
+  const rows = parseProcessTable('  1 0 1 2.5 100\n\ngarbage\n1 2 3\n');
+  assert.deepEqual(rows, [{ pid: 1, ppid: 0, pgid: 1, pcpu: 2.5, rss: 100 }]);
+  assert.deepEqual(parseProcessTable(''), []);
 });
 
-test('parseGroupCpuOutput sums usable rows into a cores-busy fraction, ignoring blank lines', () => {
-  assert.equal(parseGroupCpuOutput(' 12.5\n 37.5\n\n'), 0.5);
+test('selectLeaseTree includes detached descendants in other process groups and excludes unrelated trees (BRAIN-353)', () => {
+  const tree = selectLeaseTree(parseProcessTable(PS_FIXTURE), 100);
+  assert.equal(tree.cores, 3.1); // (0 + 10 + 150 + 100 + 50) / 100
+  assert.equal(tree.memoryBytes, 16000 * 1024);
 });
 
-test('parseGroupCpuOutput treats non-numeric garbage as no usable rows', () => {
-  assert.equal(parseGroupCpuOutput('garbage'), null);
+test('selectLeaseTree is null for an id with no process in the group, never a fabricated zero', () => {
+  assert.equal(selectLeaseTree(parseProcessTable(PS_FIXTURE), 999), null);
+  assert.equal(selectLeaseTree([], 100), null);
 });
 
-test('parseGroupRssOutput sums KiB rows and returns bytes', () => {
-  assert.equal(parseGroupRssOutput('1024\n2048\n'), 3 * 1024 ** 2);
-  assert.equal(parseGroupRssOutput(''), null);
+test('selectLeaseTree terminates on a ppid cycle and an orphan chain', () => {
+  const rows = parseProcessTable('10 12 10 100 1\n11 10 11 100 1\n12 11 12 100 1\n13 9999 13 100 1\n');
+  assert.equal(selectLeaseTree(rows, 10).cores, 3); // 10,11,12 form a cycle; orphan 13 stays out
+});
+
+test('selectLeaseTree excludes a nested lease (inner supervisor pid, inner child group) but keeps the outer tree', () => {
+  const rows = parseProcessTable(
+    [
+      '100 1 100 10.0 100', // outer lane child
+      '110 100 100 10.0 100', // inner `lane run` client, outer group
+      '111 110 111 20.0 100', // inner supervisor (stopPid), own group
+      '112 111 112 300.0 100', // inner child group (stopPgid)
+      '113 112 113 100.0 100', // inner detached worker, descends from stopped pids
+      '120 100 120 50.0 100', // outer's own detached worker
+    ].join('\n'),
+  );
+  const stops = { stopPids: new Set([111]), stopPgids: new Set([112]) };
+  assert.equal(selectLeaseTree(rows, 100, stops).cores, 0.7);
+  assert.equal(selectLeaseTree(rows, 100).cores, 4.9);
+});
+
+test('selectLeaseTree ignores its own pgid in stopPgids', () => {
+  const rows = parseProcessTable('100 1 100 10.0 100\n101 100 101 20.0 100');
+  assert.equal(selectLeaseTree(rows, 100, { stopPgids: new Set([100]) }).cores, 0.3);
+});
+
+test('observeLeaseTree reads real descendants, including a detached grandchild in its own process group', async () => {
+  const { spawn } = await import('node:child_process');
+  const spin = 'const e=Date.now()+3000;while(Date.now()<e){}';
+  const mid = `require('child_process').spawn(process.execPath,['-e',${JSON.stringify(spin)}],{detached:true,stdio:'ignore'}).unref();setTimeout(()=>{},3000)`;
+  const child = spawn(process.execPath, ['-e', mid], { detached: true, stdio: 'ignore' });
+  try {
+    await new Promise((r) => setTimeout(r, 1500));
+    const tree = observeLeaseTree(child.pid);
+    assert.ok(tree, 'lease tree observed');
+    assert.ok(tree.cores > 0.3, `expected the detached busy grandchild in the sum, got ${tree.cores}`);
+  } finally {
+    try {
+      process.kill(-child.pid, 'SIGKILL');
+    } catch {}
+    // the detached grandchild is outside the killed group; it exits on its own after ~3s
+  }
 });
 
 test('observedGroupMemoryBytes is bounded and fails safely', () => {
@@ -169,7 +224,7 @@ test('observedGroupMemoryBytes is bounded and fails safely', () => {
   assert.equal(
     observedGroupMemoryBytes(123, (_cmd, _args, passedOptions) => {
       options = passedOptions;
-      return '512\n';
+      return '1 0 123 0.0 512\n';
     }),
     512 * 1024,
   );
@@ -194,7 +249,7 @@ test('observedGroupCpuCores passes a 2000ms timeout bound to exec, so a hung `ps
   let capturedOptions = null;
   const spyExec = (cmd, args, options) => {
     capturedOptions = options;
-    return ' 10\n';
+    return '1234 1 1234 10.0 100\n';
   };
   observedGroupCpuCores(1234, spyExec);
   assert.equal(capturedOptions.timeout, 2000);
