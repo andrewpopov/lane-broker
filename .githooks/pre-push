@@ -11,4 +11,19 @@ set -e
 # tree that deleted every file. Scrub them before running anything.
 for v in $(git rev-parse --local-env-vars) GIT_QUARANTINE_PATH; do unset "$v"; done
 cd "$(git rev-parse --show-toplevel)"
+# A push that only deletes refs has nothing to verify (a branch delete used to
+# run the whole suite). Every line must be a deletion -- an all-zero local sha --
+# and there must be at least one line, so empty stdin still runs the gate.
+deletions=0
+only_deletes=1
+while read -r _local_ref local_sha _remote_ref _remote_sha; do
+  case "$local_sha" in
+    '' | *[!0]*) only_deletes=0 ;;
+    *) deletions=$((deletions + 1)) ;;
+  esac
+done
+if [ "$only_deletes" = "1" ] && [ "$deletions" -gt 0 ]; then
+  echo "pre-push: deletion-only push; nothing to verify."
+  exit 0
+fi
 LABEL=pre-push npm run verify
