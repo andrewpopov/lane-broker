@@ -866,6 +866,13 @@ async function main() {
     // but a TERM-resistant descendant is still alive, we must not write the
     // result / release the lease until the whole group is confirmed gone.
     if (killPromise) await killPromise;
+    // BRAIN-349: a cancelled run is 'cancelled' (exit 130) whatever the child
+    // itself exited with -- a child that traps TERM and exits 0 must not read
+    // as success. Same shape as the remote-cancel result (remoteCancelledResult).
+    if (cancelling) {
+      result = { ...result, exit: 130, signal: null, cancelled: true };
+      exitCode = 130;
+    }
     await logWriter.finish();
     // Flush the forward pipes before exiting (BRAIN-308) -- process.exit()
     // below can otherwise drop the async tail of a macOS pipe write. Skipped
