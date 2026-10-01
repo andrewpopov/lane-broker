@@ -371,10 +371,13 @@ function resolveCapacityBlock(root, cfg, headId, headWeight, runningWeight, capa
 
 /**
  * BRAIN-346: the projected-over-budget head's record (resource-skip-state.json):
- * `{ headId, count, reserved, deniedAt, budget, externalBusy }`. Written only by the head's own
- * in-scope denial (see recordResourceDenial) and by a backfill's count (recordResourceBackfill).
- * Anything missing or malformed reads as null, which means "no backfill" — never a default that
- * would grant an allowance.
+ * `{ headId, count, reserved, inScope, deniedAt, budget, externalBusy }`. `count`/`reserved` are the
+ * head's allowance and survive ANY denial kind for the same head; they are dropped only when the
+ * head starts, leaves queue[0], or resourceSkipLimit is 0. `inScope` is whether the head's LATEST
+ * denial was projected-over-budget (memory ok): an out-of-scope denial pauses backfill without
+ * resetting the allowance. Written by the head's own denials (recordResourceDenial,
+ * markResourceOutOfScope) and by a backfill's count (recordResourceBackfill). Anything missing
+ * or malformed reads as null, which means "no backfill"; a missing `inScope` reads as false.
  */
 export function readResourceSkipState(root) {
   const raw = readJsonSafe(paths(root).resourceSkipState);
@@ -390,7 +393,15 @@ export function readResourceSkipState(root) {
   ) {
     return null;
   }
-  return { headId: raw.headId, count: raw.count, reserved: raw.reserved, deniedAt: raw.deniedAt, budget: raw.budget, externalBusy: raw.externalBusy };
+  return {
+    headId: raw.headId,
+    count: raw.count,
+    reserved: raw.reserved,
+    inScope: raw.inScope === true,
+    deniedAt: raw.deniedAt,
+    budget: raw.budget,
+    externalBusy: raw.externalBusy,
+  };
 }
 
 /** The record for exactly this head, or null: resource backfill is active-mode only, off at
@@ -401,7 +412,7 @@ function resourceRecordFor(root, cfg, headId) {
   return record && record.headId === headId ? record : null;
 }
 
-const resourceBackfillOpen = (record, cfg) => record !== null && !record.reserved && record.count < cfg.resourceSkipLimit;
+const resourceBackfillOpen = (record, cfg) => record !== null && record.inScope && !record.reserved && record.count < cfg.resourceSkipLimit;
 const resourceReserved = (record) => record !== null && record.reserved;
 
 /** The head's own in-scope denial (projected-over-budget, memory ok): create the record for a new
@@ -416,12 +427,25 @@ function recordResourceDenial(root, cfg, headId, cpuDecision, now, write) {
       headId,
       count: same ? prev.count : 0,
       reserved: same ? prev.reserved : false,
+      inScope: true,
       deniedAt: now,
       budget: cpuDecision.budget,
       externalBusy: cpuDecision.externalBusy,
     });
   } catch {
     // best-effort — see doc comment
+  }
+}
+
+/** The head's latest denial is NOT projected-over-budget: pause backfill but keep the allowance
+ *  (count/reserved). Never creates a record — there is no allowance to keep for a fresh head. */
+function markResourceOutOfScope(root, headId, now, write) {
+  const prev = readResourceSkipState(root);
+  if (prev === null || prev.headId !== headId || !prev.inScope) return;
+  try {
+    write(paths(root).resourceSkipState, { ...prev, inScope: false, deniedAt: now });
+  } catch {
+    // best-effort: a stale inScope only lets a candidate reach its own unchanged fresh admission
   }
 }
 
@@ -757,12 +781,14 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     const baselineReason = cfg.admissionLoadGate && gate.closed && brokerIdle ? 'idle-exempt' : 'ok';
 
     if (cfg.admissionLoadGate && gate.closed && !brokerIdle) {
+      if (ticket.id === headTicket.id) markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
       return {
         result: { started: false, reason: 'load-gate-closed', load: gate.lastLoad },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'load-gate-closed' },
       };
     }
     if (runningWeight + ticket.weight > weightCapacity) {
+      if (ticket.id === headTicket.id) markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
       return {
         result: { started: false, reason: 'capacity', runningWeight, capacity: weightCapacity },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'capacity' },
@@ -775,6 +801,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // throwing reader all admit — same fail-open tolerance as the CPU/load
     // samplers elsewhere in this function.
     if (memInfo && memInfo.macPressure === 'critical') {
+      if (ticket.id === headTicket.id) markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
       return {
         result: { started: false, reason: 'memory-critical', macPressure: memInfo.macPressure },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'memory-critical' },
@@ -801,10 +828,10 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       cpuDecision.projectedBusy - cpuDecision.budget <= cfg.resourceIdleOvershootCores;
     if (cfg.schedulerMode === 'active' && !cpuDecision.admit && !idleExempt) {
       if (headPolling) {
-        // Cooldown is the head's own backfill echoing back (each admission starts one), so it must
-        // not erase the count; any other non-scope denial ends the resource episode.
+        // Cooldown is the head's own backfill echoing back (each admission starts one), so it
+        // changes nothing. Any other out-of-scope denial pauses backfill but keeps the allowance.
         if (resourceDenied) recordResourceDenial(root, cfg, headTicket.id, cpuDecision, now, writeResourceState);
-        else if (cpuDecision.cpuReason !== 'cooldown') clearResourceSkipState(root);
+        else if (cpuDecision.cpuReason !== 'cooldown') markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
       }
       return {
         result: {

@@ -124,6 +124,19 @@ export function computeBusyCores(prev, snapshot) {
  * permissions error, full disk, or any other failure here must never make
  * this throw or abort admission.
  */
+/**
+ * BRAIN-346: true only for a VALIDATED read whose counters did not move at all since `prev`: the
+ * same raw core count, and every core's total and idle counters exactly equal. `===` is false for
+ * NaN, so a malformed entry never qualifies, and a regressing counter (clock skew, reset) never
+ * does either. Only this shape may reuse the last measurement; every other stale reading
+ * (malformed, regressing, topology change, too old, no baseline) stays unavailable.
+ */
+function countersUnchanged(prev, snapshot) {
+  if (!prev || !Array.isArray(prev.cpus) || prev.cpus.length === 0 || prev.cpus.length !== snapshot.cpus.length) return false;
+  if (!Number.isFinite(prev.at) || snapshot.at - prev.at < 0 || snapshot.at - prev.at > MAX_SAMPLE_GAP_MS) return false;
+  return snapshot.cpus.every((s, i) => prev.cpus[i] && prev.cpus[i].total === s.total && prev.cpus[i].idle === s.idle);
+}
+
 export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0 } = {}) {
   const override = readCpuBusyOverride();
   if (override) return override;
@@ -139,7 +152,9 @@ export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0 } = {}
   // admission treats as "unavailable, admit on an idle broker". Carry the last VALID measurement
   // in the sidecar and reuse it while it is younger than reuseWindowMs, flagged `reused` so the
   // CPU gate's hysteresis does not count it as a new observation.
-  const lastValid = !stale && Number.isFinite(measured) ? { hostBusyCores: measured, cores: capacity.cpuCores, at: now } : prev?.lastValid;
+  // A topology change (raw core count) drops it: a measurement over different cores is not this host's.
+  const sameTopology = Array.isArray(prev?.cpus) && prev.cpus.length === cpus.length;
+  const lastValid = !stale && Number.isFinite(measured) ? { hostBusyCores: measured, cores: capacity.cpuCores, at: now } : sameTopology ? prev.lastValid : undefined;
   if (lastValid) snapshot.lastValid = lastValid;
   try {
     const latest = readJsonSafe(file);
@@ -151,7 +166,8 @@ export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0 } = {}
   }
   const reusable =
     stale &&
-    prev?.lastValid &&
+    countersUnchanged(prev, snapshot) &&
+    prev.lastValid &&
     Number.isFinite(prev.lastValid.hostBusyCores) &&
     prev.lastValid.cores === capacity.cpuCores &&
     Number.isFinite(prev.lastValid.at) &&

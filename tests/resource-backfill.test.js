@@ -65,7 +65,7 @@ function poll(state, t, cfg, { ext = 5.4, mem = memory(), write } = {}) {
 }
 
 function seedRecord(state, headId, overrides = {}) {
-  atomicWriteJson(paths(state).resourceSkipState, { headId, count: 0, reserved: false, deniedAt: Date.now(), budget: 9, externalBusy: 5.4, ...overrides });
+  atomicWriteJson(paths(state).resourceSkipState, { headId, count: 0, reserved: false, inScope: true, deniedAt: Date.now(), budget: 9, externalBusy: 5.4, ...overrides });
 }
 
 const readLog = (state) => fs.readFileSync(paths(state).admissionLog, 'utf8');
@@ -180,6 +180,61 @@ test('4: after resourceSkipLimit backfills the reservation latches and a further
   assert.equal(readLease(state, 'extra'), null);
 });
 
+test('4b: a reserved record refuses backfill even with the count below the limit', async () => {
+  const { state } = freshEnv();
+  const head = ticket('head', { weight: 4 });
+  const small = ticket('small');
+  await enqueue(state, head);
+  await enqueue(state, small);
+  seedRecord(state, 'head', { count: 1, reserved: true });
+  const result = await poll(state, small, baseCfg());
+  assert.equal(result.started, false, 'reserved alone is enough to refuse');
+  assert.equal(result.reason, 'not-head');
+});
+
+test('4c: the reservation and count survive out-of-scope denials; only the latest denial gates backfill', async () => {
+  const cfg = baseCfg();
+  for (const kind of ['cpu-gate-closed', 'memory-headroom']) {
+    const { state } = freshEnv();
+    const head = ticket('head', { weight: 4 });
+    const extra = ticket('extra');
+    await enqueue(state, head);
+    await enqueue(state, extra);
+    seedRecord(state, 'head', { count: 3, reserved: true });
+
+    const out =
+      kind === 'cpu-gate-closed'
+        ? await poll(state, head, cfg, { ext: 9.5 }) // 95% busy closes the CPU gate
+        : await poll(state, head, cfg, { mem: memory({ availableBytes: 1 * GIB }) });
+    assert.equal(out.started, false, kind);
+    const mid = readResourceSkipState(state);
+    assert.deepEqual({ count: mid.count, reserved: mid.reserved, inScope: mid.inScope }, { count: 3, reserved: true, inScope: false }, `${kind}: allowance kept, backfill paused`);
+
+    atomicWriteJson(paths(state).cpuGate, { closed: false, consecutiveUnder: 0 });
+    const back = await poll(state, head, cfg); // projected-over-budget again
+    assert.equal(back.cpuReason, 'projected-over-budget', kind);
+    const after = readResourceSkipState(state);
+    assert.deepEqual({ count: after.count, reserved: after.reserved, inScope: after.inScope }, { count: 3, reserved: true, inScope: true }, `${kind}: still reserved, not recreated at 0`);
+    assert.equal((await poll(state, extra, cfg)).started, false, `${kind}: an otherwise-admissible ticket is still refused`);
+  }
+});
+
+test('4d: an out-of-scope latest denial pauses an unreserved head\'s backfill without resetting the count', async () => {
+  const { state } = freshEnv();
+  const cfg = baseCfg();
+  const head = ticket('head', { weight: 4 });
+  const small = ticket('small');
+  await enqueue(state, head);
+  await enqueue(state, small);
+  seedRecord(state, 'head', { count: 2 });
+  await poll(state, head, cfg, { mem: memory({ availableBytes: 1 * GIB }) });
+  assert.equal(readResourceSkipState(state).count, 2);
+  assert.equal((await poll(state, small, cfg)).reason, 'not-head', 'paused while the latest denial is out of scope');
+  await poll(state, head, cfg); // in scope again
+  assert.equal((await poll(state, small, cfg)).started, true, 'resumes, one backfill left of the allowance');
+  assert.equal(readResourceSkipState(state).count, 3);
+});
+
 test('5: while reserved, capacity-path backfill is refused too, with the capacity skip count below its limit', async () => {
   const cfg = baseCfg();
   async function scenario(reserved) {
@@ -280,7 +335,7 @@ test('9: fail-closed: a failing skip WRITE refuses the backfill every time', asy
   const small = ticket('small');
   await enqueue(state, head);
   await enqueue(state, small);
-  seedRecord(state, 'head');
+  seedRecord(state, 'head', { count: 2 });
   const failingWrite = () => {
     throw new Error('disk full');
   };
@@ -290,7 +345,12 @@ test('9: fail-closed: a failing skip WRITE refuses the backfill every time', asy
     assert.equal(result.reason, 'not-head');
   }
   assert.equal(readLease(state, 'small'), null);
-  assert.equal(readResourceSkipState(state).count, 0, 'the allowance is never reset or advanced by a failed write');
+  assert.equal(readResourceSkipState(state).count, 2, 'the allowance is never reset or advanced by a failed write');
+
+  const recovered = await poll(state, small, cfg); // writes work again
+  assert.equal(recovered.started, true, 'the partially consumed allowance recovers once writes succeed');
+  const after = readResourceSkipState(state);
+  assert.deepEqual({ count: after.count, reserved: after.reserved }, { count: 3, reserved: true });
 });
 
 test('10: a preloaded active-mode record plus shadow mode means no backfill', async () => {
@@ -422,4 +482,31 @@ test('status: reports the resource block (count/limit, reserved, projected vs bu
   assert.ok(Math.abs(status.resourceBlock.projectedBusy - 9.4) < 1e-9);
   assert.equal(status.resourceBlock.budget, 9);
   assert.match(renderStatusText(status), /resource-blocked: head head projects 9\.40 > budget 9\.00 cores .*backfill 3\/3, RESERVED/);
+});
+
+function noTimes(n) {
+  return Array.from({ length: n }, () => ({ model: 'test', speed: 0 }));
+}
+
+test('13c: reuse is only for validated, unchanged counters: malformed, regressing or re-shaped reads stay unavailable', async () => {
+  const window = { reuseWindowMs: 60_000 };
+  const fresh = () => {
+    const { state } = freshEnv();
+    sampleHostCpu(state, cpus10(0, 0.54));
+    assert.equal(sampleHostCpu(state, cpus10(1, 0.54)).stale, false, 'fixture: one valid measurement');
+    return state;
+  };
+
+  const malformed = sampleHostCpu(fresh(), noTimes(10), window);
+  assert.equal(malformed.stale, true, 'a malformed read is unavailable, not reuse');
+  assert.equal(malformed.reused, undefined);
+
+  const regressed = sampleHostCpu(fresh(), cpus10(0, 0.54), window); // counters went backwards
+  assert.equal(regressed.stale, true, 'a counter regression is unavailable, not reuse');
+  assert.equal(regressed.reused, undefined);
+
+  const state = fresh();
+  const eight = cpus10(1, 0.54).slice(0, 8);
+  assert.equal(sampleHostCpu(state, eight, window).stale, true, 'a topology change is unavailable');
+  assert.equal(sampleHostCpu(state, eight, window).stale, true, 'and the old measurement is not carried over the new topology');
 });

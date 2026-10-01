@@ -431,7 +431,11 @@ ending in strict FIFO for that head once spent:
   keeps being evaluated every poll and starts the moment it fits. When the
   allowance is used the head is **reserved**: nothing but the head is admitted,
   and that also stops *capacity* backfill past the same head. Conflict-path
-  backfill is unaffected. A backfill whose count cannot be written to disk is
+  backfill is unaffected. The head's count and reservation survive any other
+  denial of the same head (closed CPU gate, memory, unavailable sample); such a
+  denial only pauses backfill until the head is next denied by the projection.
+  They are dropped only when the head starts, leaves the front of the queue, or
+  the limit is 0. A backfill whose count cannot be written to disk is
   refused, never uncounted. `resourceSkipLimit: 0` restores strict FIFO for
   resource denials.
 
@@ -441,7 +445,9 @@ running (9 cores of budget, 5.4 busy, a 4-core head projects 9.4). When the
 broker is fully idle (no RUNNING **or ORPHANED** lease) and the head's only
 denial is `projected-over-budget` with memory admitting, the head starts if it
 overshoots the budget by at most that many cores. It needs neither a record nor
-a reservation, so a lone head benefits too. The check and the lease write share
+a reservation, so a lone head benefits too. The two knobs are independent:
+`resourceSkipLimit: 0` turns backfill and the reservation off but does **not**
+disable the exemption; only `resourceIdleOvershootCores: 0` does. The check and the lease write share
 one lock transaction, so two supervisors never both exempt. macOS memory
 pressure `warn` or unknown does not block it, only `critical` does (as for every
 start). It is logged as `current=start:resource-idle-exempt`.
@@ -459,7 +465,9 @@ denied by normal memory admission, holding back larger-CPU tickets meanwhile.
 Nothing guarantees the head ever starts if external CPU never drops or a lease
 never ends; the reservation only stops it being overtaken. A back-to-back CPU
 sample whose counters did not advance reuses the last valid measurement while
-it is younger than `sampleMs/2` (and does not advance the CPU gate's
+it is younger than `sampleMs/2`, but only when the read itself is valid and its
+counters are exactly unchanged on the same raw core count (a malformed or
+regressing read, or a topology change, stays unavailable) (and does not advance the CPU gate's
 hysteresis) rather than reading as "unavailable, admit". Supervisors only
 enforce the reservation once running the new version: during a mixed-version
 rollout an older supervisor can still backfill past a reserved head.
