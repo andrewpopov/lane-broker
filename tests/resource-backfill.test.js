@@ -505,6 +505,12 @@ test('13c: reuse is only for validated, unchanged counters: malformed, regressin
   assert.equal(regressed.stale, true, 'a counter regression is unavailable, not reuse');
   assert.equal(regressed.reused, undefined);
 
+  const stateR = fresh();
+  assert.equal(sampleHostCpu(stateR, cpus10(0, 0.54), window).stale, true, 'regression: unavailable');
+  const again = sampleHostCpu(stateR, cpus10(0, 0.54), window); // the SAME regressed counters, inside the window
+  assert.equal(again.stale, true, 'repeating regressed counters never reuses the pre-regression measurement');
+  assert.equal(again.reused, undefined);
+
   const state = fresh();
   const eight = cpus10(1, 0.54).slice(0, 8);
   assert.equal(sampleHostCpu(state, eight, window).stale, true, 'a topology change is unavailable');

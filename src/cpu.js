@@ -152,9 +152,12 @@ export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0 } = {}
   // admission treats as "unavailable, admit on an idle broker". Carry the last VALID measurement
   // in the sidecar and reuse it while it is younger than reuseWindowMs, flagged `reused` so the
   // CPU gate's hysteresis does not count it as a new observation.
-  // A topology change (raw core count) drops it: a measurement over different cores is not this host's.
-  const sameTopology = Array.isArray(prev?.cpus) && prev.cpus.length === cpus.length;
-  const lastValid = !stale && Number.isFinite(measured) ? { hostBusyCores: measured, cores: capacity.cpuCores, at: now } : sameTopology ? prev.lastValid : undefined;
+  // It survives ONLY a legitimate unchanged-counter read that follows a valid measurement. Any
+  // other stale read (malformed, regressing, topology change, no baseline) drops it: that read is
+  // about to become the persisted baseline, and carrying the old measurement over it would let a
+  // repeat of the same bad counters match `countersUnchanged` and reuse a pre-fault figure.
+  const unchanged = stale && countersUnchanged(prev, snapshot);
+  const lastValid = !stale && Number.isFinite(measured) ? { hostBusyCores: measured, cores: capacity.cpuCores, at: now } : unchanged ? prev.lastValid : undefined;
   if (lastValid) snapshot.lastValid = lastValid;
   try {
     const latest = readJsonSafe(file);
@@ -165,8 +168,7 @@ export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0 } = {}
     // best-effort: a failed sidecar write must never abort admission
   }
   const reusable =
-    stale &&
-    countersUnchanged(prev, snapshot) &&
+    unchanged &&
     prev.lastValid &&
     Number.isFinite(prev.lastValid.hostBusyCores) &&
     prev.lastValid.cores === capacity.cpuCores &&
