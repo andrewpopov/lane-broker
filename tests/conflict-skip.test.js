@@ -18,7 +18,7 @@ import { bootId } from '../src/state.js';
  */
 
 function baseCfg(overrides = {}) {
-  return { ...DEFAULT_GLOBAL_CONFIG, schedulerMode: 'shadow', capacity: 10, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, ...overrides };
+  return { ...DEFAULT_GLOBAL_CONFIG, schedulerMode: 'shadow', capacity: 10, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, conflictSafeBackfill: false, ...overrides };
 }
 
 function baseTicket(id, overrides = {}) {
