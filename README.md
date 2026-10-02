@@ -125,6 +125,16 @@ CPU core per weight unit and `defaultMemoryBytesPerWeight` bytes per weight
 unit. Set `schedulerMode` to `"shadow"` to log resource decisions without
 enforcing them.
 
+`settledDemandEnabled` (default `true`): once a lease is settled (admitted at
+least `settledDemandSettleMs`, default 120000, ago, with a fresh observation
+and at least two observations in the last `settledDemandWindowMs`, default
+180000), admission charges `max(observedNow, clamp(recentPeak *
+settledDemandHeadroom, booking * settledDemandFloorFraction, booking))`
+(defaults 1.25 and 0.5) instead of its full booking, so a lane that books 4
+cores but uses 1 stops starving the queue. Unsettled leases are charged as
+before; `false` restores that for every lease. The admission log's
+`leaseDemand=<id8>:<cores>(settled|cold)` field shows the basis per held lease.
+
 `admissionLoadGate` (default `false`): whether the load gate is allowed to
 deny a start at all. With the default, the gate is still sampled and reported
 every poll (`lane status` shows it, `[informational]` suffixed), but it never

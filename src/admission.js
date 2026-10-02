@@ -55,10 +55,38 @@ export function freshObservedCores(lease, now = Date.now()) {
   return fresh && Number.isFinite(observed) && observed >= 0 ? observed : null;
 }
 
-export function leaseDemand(lease, now = Date.now()) {
+/** BRAIN-354: how many observations a lease keeps (src/supervisor.js's applyHeartbeatObservation). */
+export const OBSERVED_HISTORY_MAX = 64;
+
+/** Current observation plus the trailing history within windowMs, as plain core readings. */
+function recentObservedCores(lease, now, windowMs, current) {
+  const history = Array.isArray(lease.observedCpuHistory) ? lease.observedCpuHistory : [];
+  const inWindow = history.filter((h) => h && Number.isFinite(h.at) && Number.isFinite(h.cores) && h.cores >= 0 && now - h.at <= windowMs);
+  return { count: inWindow.length, peak: Math.max(current, ...inWindow.map((h) => h.cores)) };
+}
+
+/**
+ * BRAIN-354: a lease's CPU demand and the basis it was charged on. A SETTLED lease (admitted at
+ * least settleMs ago, fresh observation, >= 2 observations in the trailing window) is charged
+ * max(observedNow, clamp(recentPeak * headroom, cold * floorFraction, cold)) instead of its full
+ * booking; everything else — including cfg without the settledDemand knobs, and old leases with no
+ * observedCpuHistory — keeps max(observed, cold) / cold.
+ */
+export function leaseDemandBasis(lease, now = Date.now(), cfg) {
   const cold = coldStartEstimate(lease.resources?.cpuCores ?? lease.weight);
   const observed = freshObservedCores(lease, now);
-  return observed === null ? cold : Math.max(observed, cold);
+  if (observed === null) return { demand: cold, basis: 'cold' };
+  const unsettled = { demand: Math.max(observed, cold), basis: 'cold' };
+  if (cfg?.settledDemandEnabled !== true) return unsettled;
+  if (!Number.isFinite(lease.admittedAt) || now - lease.admittedAt < cfg.settledDemandSettleMs) return unsettled;
+  const { count, peak } = recentObservedCores(lease, now, cfg.settledDemandWindowMs, observed);
+  if (count < 2) return unsettled;
+  const padded = Math.min(cold, Math.max(cold * cfg.settledDemandFloorFraction, peak * cfg.settledDemandHeadroom));
+  return { demand: Math.max(observed, padded), basis: 'settled' };
+}
+
+export function leaseDemand(lease, now = Date.now(), cfg) {
+  return leaseDemandBasis(lease, now, cfg).demand;
 }
 
 /**
@@ -194,8 +222,8 @@ export const KNOWN_BIAS_NOTE = 'self-subtracted-when-observed';
  * selection (scheduler.js's selectResourceCandidate), so the two can never disagree about what
  * "fits" means: busy = ambient load + every held lease's demand + the candidate's claim.
  */
-export function projectBusy(externalBusy, heldLeases, candidateEstimate, now = Date.now()) {
-  return externalBusy + heldLeases.reduce((sum, l) => sum + leaseDemand(l, now), 0) + candidateEstimate;
+export function projectBusy(externalBusy, heldLeases, candidateEstimate, now = Date.now(), cfg) {
+  return externalBusy + heldLeases.reduce((sum, l) => sum + leaseDemand(l, now, cfg), 0) + candidateEstimate;
 }
 
 /** The CPU-core budget for one sample: the smaller of the percent budget and all-cores-minus-reserve. */
@@ -242,19 +270,23 @@ export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, c
   const brokerObserved = heldLeases.reduce((sum, l) => sum + (freshObservedCores(l, now) ?? 0), 0);
   const externalBusy = Math.max(0, cpuSample.hostBusyCores - brokerObserved);
   const candidateEstimate = coldStartEstimate(candidateResources?.cpuCores ?? candidateWeight);
-  const projectedBusy = projectBusy(externalBusy, heldLeases, candidateEstimate, now);
+  const projectedBusy = projectBusy(externalBusy, heldLeases, candidateEstimate, now, cfg);
   const budget = cpuBudget(cpuSample, cfg);
+  const leaseDemands = heldLeases.map((l) => {
+    const { demand, basis } = leaseDemandBasis(l, now, cfg);
+    return `${String(l.id).slice(0, 8)}:${fmt(demand)}(${basis})`;
+  });
 
   if (cpuGateState.closed) {
-    return { admit: false, reason: 'cpu-gate-closed', externalBusy, projectedBusy, budget };
+    return { admit: false, reason: 'cpu-gate-closed', externalBusy, projectedBusy, budget, leaseDemands };
   }
   if (cooldownBlocked) {
-    return { admit: false, reason: 'cooldown', externalBusy, projectedBusy, budget };
+    return { admit: false, reason: 'cooldown', externalBusy, projectedBusy, budget, leaseDemands };
   }
   if (projectedBusy > budget) {
-    return { admit: false, reason: 'projected-over-budget', externalBusy, projectedBusy, budget };
+    return { admit: false, reason: 'projected-over-budget', externalBusy, projectedBusy, budget, leaseDemands };
   }
-  return { admit: true, reason: 'ok', externalBusy, projectedBusy, budget };
+  return { admit: true, reason: 'ok', externalBusy, projectedBusy, budget, leaseDemands };
 }
 
 /** The "nothing usable is known" fallback shared by a missing/stale sample
@@ -387,6 +419,7 @@ export function formatAdmissionLog(f) {
     `cooldown=${f.cooldownBlocked ? 'blocked' : 'clear'}`,
     `memorySource=${f.memorySource ?? 'n/a'}`,
     `macPressure=${f.macPressure ?? 'n/a'}`,
+    `leaseDemand=${f.leaseDemands?.length ? f.leaseDemands.join(',') : 'none'}`,
     `bias=${KNOWN_BIAS_NOTE}`,
   ].join(' ');
 }

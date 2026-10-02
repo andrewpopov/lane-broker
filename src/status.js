@@ -96,7 +96,7 @@ function computeResourceBlock(root, cfg, head, held, now) {
     count: record.count,
     limit: cfg.resourceSkipLimit,
     reserved: record.reserved,
-    projectedBusy: projectBusy(record.externalBusy, held, ticketCpuEstimate(head, cfg), now),
+    projectedBusy: projectBusy(record.externalBusy, held, ticketCpuEstimate(head, cfg), now, cfg),
     budget: record.budget,
     deniedAgeMs: now - record.deniedAt,
   };
