@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import { buildManifest, RemoteIneligibleError } from './remote-manifest.js';
 import { encodeSnapshot, serializeHeader, MAX_HEADER_BYTES } from './remote-stream.js';
+import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
 
 /**
  * BRAIN-319 T3a: the CLIENT side of the remote runner protocol implemented
@@ -101,9 +102,14 @@ function runWithDeadline(cmdBin, argv, deadlineMs, env) {
  * (an older or misbehaving probe degrades to "assume it might fit", not to
  * refusing every runner).
  */
-function neverFits(reservation, capacity) {
+function neverFits(reservation, probe) {
+  const capacity = probe.capacity;
   if (!capacity || typeof capacity !== 'object') return false;
-  const { weight, cpuCores, memoryBytes } = reservation;
+  const { weight, memoryBytes } = reservation;
+  // BRAIN-360: only a runner that advertises elastic claims will admit below the declared claim; any
+  // other runner is dispatched the full claim and refuses it (exit 64) if its budget is smaller.
+  const elastic = Array.isArray(probe.capabilities) && probe.capabilities.includes(ELASTIC_CLAIMS_CAPABILITY);
+  const cpuCores = elastic && Number.isFinite(reservation.minCpuCores) ? reservation.minCpuCores : reservation.cpuCores;
   if (Number.isFinite(capacity.weight) && Number.isFinite(weight) && weight > capacity.weight) return true;
   if (Number.isFinite(capacity.cpuCores) && Number.isFinite(cpuCores) && cpuCores > capacity.cpuCores) return true;
   if (
@@ -189,12 +195,12 @@ export async function selectRunner(runners, opts = {}) {
     if (probe.queued !== 0) {
       const overCap = maxRemoteQueue > 0 && probe.queued > maxRemoteQueue;
       skipped.push({ name: runner.name, reason: `queued: ${probe.queued}${overCap ? ` (over maxRemoteQueue ${maxRemoteQueue})` : ''}` });
-      const fits = !(reservation && neverFits(reservation, probe.capacity));
+      const fits = !(reservation && neverFits(reservation, probe));
       const queueable = Number.isInteger(probe.queued) && probe.queued > 0 && probe.queued <= maxRemoteQueue;
       if (fits && queueable && (!queuedBest || probe.queued < queuedBest.probe.queued)) queuedBest = { runner, probe };
       continue;
     }
-    if (reservation && neverFits(reservation, probe.capacity)) {
+    if (reservation && neverFits(reservation, probe)) {
       skipped.push({ name: runner.name, reason: 'runner capacity can never fit this ticket' });
       continue;
     }
@@ -469,6 +475,7 @@ export async function dispatchRemote(opts) {
     lane,
     weight,
     cpuCores,
+    minCpuCores,
     memoryBytes,
     argv,
     ticketId,
@@ -533,6 +540,7 @@ export async function dispatchRemote(opts) {
     if (Array.isArray(remoteDeps) && remoteDeps.length > 0) header.remoteDeps = remoteDeps;
     if (Array.isArray(remoteSetup) && remoteSetup.length > 0) header.remoteSetup = remoteSetup;
   }
+  if (Number.isFinite(minCpuCores)) header.minCpuCores = minCpuCores;
   if (Number.isInteger(queueTimeoutMs) && queueTimeoutMs > 0) header.queueTimeoutMs = queueTimeoutMs;
 
   // BRAIN-320 follow-up: reject an oversized header locally, before ever

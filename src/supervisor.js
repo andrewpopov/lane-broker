@@ -17,7 +17,7 @@ import { enqueue, tryStart, dequeueSync, couldAdmitNow } from './scheduler.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { observeLeaseTree } from './cpu.js';
 import { reloadGlobalConfig } from './config.js';
-import { detectResourceCapacity, checkResourceBudget, localSimRefusal } from './resources.js';
+import { detectResourceCapacity, checkResourceBudget, localSimRefusal, leaseCpuCores } from './resources.js';
 import { selectRunner, dispatchRemote, needsProtocol2 } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { createAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
@@ -294,9 +294,9 @@ export function resolveNicedSpawn(ticket) {
  * pool to what the broker reserved (BRAIN-318): an unsized vitest spawns
  * cores-1 workers and was measured averaging 4.2 cores on a 2-core lease.
  */
-export function childEnv(ticket, baseEnv = process.env) {
+export function childEnv(ticket, baseEnv = process.env, grantedCpuCores = ticket.resources?.cpuCores) {
   const env = { ...baseEnv, LANE_BROKER_LEASE: ticket.id, LANE_BROKER_KEY: ticket.key };
-  const cpuCores = ticket.resources?.cpuCores;
+  const cpuCores = grantedCpuCores;
   const memoryBytes = ticket.resources?.memoryBytes;
   if (Number.isFinite(cpuCores) && cpuCores > 0) env.LANE_BROKER_CPU_CORES = String(cpuCores);
   else delete env.LANE_BROKER_CPU_CORES;
@@ -507,6 +507,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     reservation: {
       weight: enriched.weight,
       cpuCores: enriched.resources.cpuCores,
+      minCpuCores: enriched.resources.minCpuCores,
       memoryBytes: enriched.resources.memoryBytes,
     },
   });
@@ -583,6 +584,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
       executor: 'remote',
       runner: runner.name,
       ...(queuedAt ? { queuedAt } : {}),
+      ...(Number.isFinite(dispatch.result.grantedCpuCores) ? { grantedCpuCores: dispatch.result.grantedCpuCores } : {}),
       remoteKind: dispatch.result.kind,
       remotePhase: dispatch.phase ?? null,
       startedAt: remoteWaitedMs === null ? attemptStartedAt : enriched.createdAt + remoteWaitedMs,
@@ -813,7 +815,7 @@ async function main() {
     cwd: ticket.cwd,
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: childEnv(ticket),
+    env: childEnv(ticket, process.env, leaseCpuCores(started.lease)),
   });
 
   const logWriter = new CappedLogWriter(ticket.logPath);
@@ -907,6 +909,8 @@ async function main() {
     // already gets right: write, let `publishTerminal` return (mutex
     // released, attempt removed), THEN exit.
     const writeResult = (finalResult) => {
+      // BRAIN-360: an elastic lease's grant rides on the result (a runner relays it to its submitter)
+      if (started.lease.grantedCpuCores !== undefined) finalResult = { ...finalResult, grantedCpuCores: started.lease.grantedCpuCores };
       atomicWriteJson(ticket.resultPath, finalResult);
       appendHistory(root, historyRow(ticket, finalResult, { fallbackReason }));
       removeLease(root, ticket.id); // release always comes last

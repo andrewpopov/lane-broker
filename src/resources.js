@@ -162,16 +162,50 @@ export function detectResourceCapacity({
   return { cpuCores, memoryBytes, availableMemoryBytes, source: sources.join('+') };
 }
 
-export function resolveTicketResources({ weight, cpuCores, memoryBytes, defaultMemoryBytesPerWeight = GIB }) {
+/**
+ * `minCpuCores` (BRAIN-360) is the floor an elastic lane accepts; it only
+ * appears on the result when it is a real floor, strictly below the claim, so
+ * a lane without one resolves to exactly the shape it always had.
+ */
+export function resolveTicketResources({ weight, cpuCores, minCpuCores, memoryBytes, defaultMemoryBytesPerWeight = GIB }) {
   const cpu = cpuCores ?? weight;
   const memory = memoryBytes ?? Math.max(1, Number(weight) || 1) * defaultMemoryBytesPerWeight;
-  return { cpuCores: cpu, memoryBytes: Math.round(memory) };
+  const elastic = Number.isFinite(minCpuCores) && minCpuCores > 0 && minCpuCores < cpu;
+  return { cpuCores: cpu, ...(elastic ? { minCpuCores } : {}), memoryBytes: Math.round(memory) };
+}
+
+/**
+ * BRAIN-360: the CPU cores a held lease is CHARGED for -- the elastic grant when
+ * admission gave it less than it declared, else its declared claim. Every place
+ * that charges a lease's CPU (reservedSum, settled demand, status, a nested run's
+ * widening check) reads this, never `lease.resources.cpuCores` directly.
+ */
+export function leaseCpuCores(lease) {
+  return Number.isFinite(lease.grantedCpuCores) ? lease.grantedCpuCores : lease.resources?.cpuCores;
+}
+
+/** remote-probe capability: this runner resolves `minCpuCores` itself and admits at a partial claim. */
+export const ELASTIC_CLAIMS_CAPABILITY = 'elastic-claims/1';
+
+/**
+ * BRAIN-360: the integer claims an elastic lane may be admitted at when its full `cpuCores` does not
+ * fit: `{ hi, lo }`, tried downward from `hi` to `lo`. Grants are integers only: `hi` is the largest
+ * integer strictly below the claim that also fits the CPU headroom the full-claim evaluation measured
+ * (`headroom` = budget minus everything already projected busy), `lo` is `ceil(minCpuCores)`, so a
+ * fractional floor rounds UP and a grant is never below it. The headroom bound is what keeps the walk
+ * short whatever the declared claim is. Null when there is no floor or nothing in range.
+ */
+export function elasticClaimRange({ cpuCores, minCpuCores, headroom }) {
+  if (!Number.isFinite(minCpuCores) || !Number.isFinite(cpuCores) || !Number.isFinite(headroom) || !(minCpuCores < cpuCores)) return null;
+  const hi = Math.min(Math.ceil(cpuCores) - 1, Math.floor(headroom));
+  const lo = Math.ceil(minCpuCores);
+  return hi >= lo ? { hi, lo } : null;
 }
 
 export function leaseResources(lease, cfg) {
   return resolveTicketResources({
     weight: lease.weight,
-    cpuCores: lease.resources?.cpuCores,
+    cpuCores: leaseCpuCores(lease),
     memoryBytes: lease.resources?.memoryBytes,
     defaultMemoryBytesPerWeight: cfg.defaultMemoryBytesPerWeight,
   });
@@ -207,13 +241,13 @@ export function cpuBudgetCores(host, globalCfg) {
 export function checkResourceBudget({ resources, globalCfg, host }) {
   const cpuBudget = cpuBudgetCores(host, globalCfg);
   const memoryBudget = Math.max(0, host.memoryBytes - globalCfg.memoryReserveBytes);
-  if (globalCfg.schedulerMode === 'active' && (resources.cpuCores > cpuBudget || resources.memoryBytes > memoryBudget)) {
+  if (globalCfg.schedulerMode === 'active' && ((resources.minCpuCores ?? resources.cpuCores) > cpuBudget || resources.memoryBytes > memoryBudget)) {
     return {
       ok: false,
       exitCode: 64,
       message:
         `lane run: requested resources exceed this environment's budget (` +
-        `${resources.cpuCores}/${cpuBudget.toFixed(2)} CPU cores, ` +
+        `${resources.minCpuCores ?? resources.cpuCores}/${cpuBudget.toFixed(2)} CPU cores, ` +
         `${resources.memoryBytes}/${memoryBudget} memory bytes).\n`,
     };
   }

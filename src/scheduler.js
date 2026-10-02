@@ -3,7 +3,7 @@ import path from 'node:path';
 import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, writeExpireMarkerFile } from './state.js';
 import { sampleAndUpdateGate, readGateState } from './load.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
-import { evaluateNewAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, projectBusy, ticketCpuEstimate } from './admission.js';
+import { evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, projectBusy, ticketCpuEstimate } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
 import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, resolveTicketResources } from './resources.js';
 
@@ -763,7 +763,15 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // BRAIN-355: a safe backfill must leave room for the blocked head once its conflict clears, so
     // the head's claim joins the held leases for the CPU projection and memory admission.
     const headReservation = { id: headTicket.id, key: headTicket.key, weight: headTicket.weight, resources: headTicket.resources };
-    const cpuDecision = evaluateNewAdmission(root, cfg, ticket, safeBackfill ? [...held, headReservation] : held, cpuSample, memInfo);
+    const admissionHeld = safeBackfill ? [...held, headReservation] : held;
+    const fullDecision = evaluateNewAdmission(root, cfg, ticket, admissionHeld, cpuSample, memInfo);
+    // BRAIN-360: an elastic ticket (resources.minCpuCores) denied ONLY by the CPU projection is
+    // re-evaluated at smaller claims, over the same held leases (and, for a safe backfill, the same
+    // head reservation), so the grant can never delay what the full claim could not. Active mode
+    // only: shadow never denies, so there is nothing to relax.
+    const elastic = cfg.schedulerMode === 'active' ? evaluateElasticAdmission(cfg, ticket, admissionHeld, cpuSample, memInfo, fullDecision) : null;
+    const cpuDecision = elastic ? { ...elastic.decision, declaredCpuCores: fullDecision.candidateCpuCores } : fullDecision;
+    const grantedCpuCores = elastic ? elastic.grantedCpuCores : fullDecision.candidateCpuCores ?? resolveTicketResources({ weight: ticket.weight, cpuCores: ticket.resources?.cpuCores }).cpuCores;
     // BRAIN-207: when admissionLoadGate is false the gate is sampled and
     // logged exactly as before (its hysteresis countdown must not stall for
     // want of observation), but it is never allowed to deny — for an idle
@@ -921,6 +929,8 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       cmd: ticket.cmd,
       weight: ticket.weight,
       resources: ticket.resources,
+      // BRAIN-360: elastic lanes only; what admission actually charged. `resources.cpuCores` stays the declaration.
+      ...(ticket.resources?.minCpuCores !== undefined ? { grantedCpuCores } : {}),
       // BRAIN-255: carried onto the lease (not just the ticket) so a
       // held-lease-only view — status.js's report, or a later poll's
       // `blockedBy` call against a DIFFERENT ticket of the same key — can
@@ -948,6 +958,9 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     if (recorded) {
       events.push(['resource-backfill-start', { skipPast: headTicket.id, count: recorded.count }]);
       if (recorded.reserved) events.push(['resource-reserved', { headId: headTicket.id, count: recorded.count, limit: cfg.resourceSkipLimit }]);
+    }
+    if (elastic) {
+      events.push(['elastic-grant', { candidateId: ticket.id, declared: fullDecision.candidateCpuCores, granted: grantedCpuCores, min: ticket.resources.minCpuCores }]);
     }
     if (idleExempt) {
       events.push(['resource-idle-exempt', { headId: headTicket.id, overshoot: (cpuDecision.projectedBusy - cpuDecision.budget).toFixed(2) }]);

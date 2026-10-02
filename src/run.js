@@ -150,6 +150,7 @@ export async function runCommand({
   lane,
   weightOverride,
   cpuOverride,
+  minCpuOverride,
   memoryOverride,
   detach,
   timeoutMs,
@@ -236,6 +237,7 @@ export async function runCommand({
   const resources = resolveTicketResources({
     weight,
     cpuCores: cpuOverride ?? resolved.cpuCores,
+    minCpuCores: minCpuOverride ?? resolved.minCpuCores ?? undefined,
     memoryBytes: memoryOverride ?? resolved.memoryBytes,
     defaultMemoryBytesPerWeight: globalCfg.defaultMemoryBytesPerWeight,
   });
@@ -260,7 +262,7 @@ export async function runCommand({
           );
           return { exitCode: 64 };
         }
-        if (resources.cpuCores > inheritedResources.cpuCores || resources.memoryBytes > inheritedResources.memoryBytes) {
+        if ((resources.minCpuCores ?? resources.cpuCores) > inheritedResources.cpuCores || resources.memoryBytes > inheritedResources.memoryBytes) {
           process.stderr.write(
             `lane run: refusing to widen inherited resources (have ${inheritedResources.cpuCores} CPU / ` +
               `${inheritedResources.memoryBytes} bytes, requested ${resources.cpuCores} CPU / ${resources.memoryBytes} bytes).\n`,
@@ -403,6 +405,8 @@ export async function runCommand({
       repoKey: resolved.repoId,
       weight,
       cpuCores: resources.cpuCores,
+      // BRAIN-360: elastic lanes only, so a non-elastic ticket's remote payload is unchanged
+      ...(resources.minCpuCores !== undefined ? { minCpuCores: resources.minCpuCores } : {}),
       memoryBytes: resources.memoryBytes,
       // BRAIN-320 S1a: carried through so the supervisor's eligibility hook
       // and (later slice) dispatchRemote's protocol-2 header see exactly what
