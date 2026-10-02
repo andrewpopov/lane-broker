@@ -236,6 +236,7 @@ export async function runCommand({
   const resources = resolveTicketResources({
     weight,
     cpuCores: cpuOverride ?? resolved.cpuCores,
+    minCpuCores: resolved.minCpuCores ?? undefined,
     memoryBytes: memoryOverride ?? resolved.memoryBytes,
     defaultMemoryBytesPerWeight: globalCfg.defaultMemoryBytesPerWeight,
   });
@@ -260,7 +261,7 @@ export async function runCommand({
           );
           return { exitCode: 64 };
         }
-        if (resources.cpuCores > inheritedResources.cpuCores || resources.memoryBytes > inheritedResources.memoryBytes) {
+        if ((resources.minCpuCores ?? resources.cpuCores) > inheritedResources.cpuCores || resources.memoryBytes > inheritedResources.memoryBytes) {
           process.stderr.write(
             `lane run: refusing to widen inherited resources (have ${inheritedResources.cpuCores} CPU / ` +
               `${inheritedResources.memoryBytes} bytes, requested ${resources.cpuCores} CPU / ${resources.memoryBytes} bytes).\n`,

@@ -508,6 +508,8 @@ export async function remoteProbeCommand() {
     paused: Boolean(status.paused),
     queued: status.queued.length,
     running: status.running.length,
+    // BRAIN-360: additive; the CPU the runner's leases are charged (grants, not declarations)
+    reservedCpuCores: status.resources?.reservedCpuCores,
     capacity: {
       weight: effectiveWeightCapacity(globalCfg, host.cpuCores),
       cpuCores: enforced ? cpuBudgetCores(host, globalCfg) : null,

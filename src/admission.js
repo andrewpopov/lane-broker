@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import { paths, atomicWriteJson, readJsonSafe, fingerprintOf } from './state.js';
 import { sampleHostCpu } from './cpu.js';
-import { evaluateMemoryAdmission, resolveTicketResources } from './resources.js';
+import { evaluateMemoryAdmission, resolveTicketResources, leaseCpuCores, elasticCpuClaims } from './resources.js';
 
 /**
  * Cold-start CPU-core estimate for a lease with no observed measurement yet.
@@ -73,7 +73,7 @@ function recentObservedCores(lease, now, windowMs, current) {
  * observedCpuHistory — keeps max(observed, cold) / cold.
  */
 export function leaseDemandBasis(lease, now = Date.now(), cfg) {
-  const cold = coldStartEstimate(lease.resources?.cpuCores ?? lease.weight);
+  const cold = coldStartEstimate(leaseCpuCores(lease) ?? lease.weight);
   const observed = freshObservedCores(lease, now);
   if (observed === null) return { demand: cold, basis: 'cold' };
   const unsettled = { demand: Math.max(observed, cold), basis: 'cold' };
@@ -338,43 +338,83 @@ export function evaluateNewAdmission(root, cfg, ticket, heldLeases, cpuSample, m
   try {
     const cpuGateState = sampleAndUpdateCpuGate(root, cfg, cpuSample);
     const blocked = cooldownActive(heldLeases, cfg);
-    const candidateResources = resolveTicketResources({
-      weight: ticket.weight,
-      cpuCores: ticket.resources?.cpuCores,
-      memoryBytes: ticket.resources?.memoryBytes,
-      defaultMemoryBytesPerWeight: cfg.defaultMemoryBytesPerWeight,
-    });
-    const cpuResult = evaluateCpuAdmission({
-      cpuSample,
-      heldLeases,
-      candidateWeight: ticket.weight,
-      candidateResources,
-      cpuGateState,
-      cooldownBlocked: blocked,
-      cfg,
-    });
-    const memoryResult = memoryInfo
-      ? evaluateMemoryAdmission({ memoryInfo, heldLeases, candidateResources, cfg })
-      : { admit: true, reason: 'not-sampled', projectedAvailableBytes: null, memoryBudgetBytes: null };
-    return {
-      ...cpuResult,
-      admit: cpuResult.admit && memoryResult.admit,
-      reason: !cpuResult.admit ? cpuResult.reason : !memoryResult.admit ? memoryResult.reason : cpuResult.reason,
-      cpuReason: cpuResult.reason,
-      memoryReason: memoryResult.reason,
-      candidateCpuCores: candidateResources.cpuCores,
-      candidateMemoryBytes: candidateResources.memoryBytes,
-      projectedAvailableBytes: memoryResult.projectedAvailableBytes,
-      memoryBudgetBytes: memoryResult.memoryBudgetBytes,
-      hostBusyCores: cpuSample ? cpuSample.hostBusyCores : null,
-      cores: cpuSample ? cpuSample.cores : null,
-      sampleStale: cpuSample ? cpuSample.stale : true,
-      cpuGateClosed: cpuGateState.closed,
-      cooldownBlocked: blocked,
-    };
+    return decideAdmission(cfg, ticket, heldLeases, cpuSample, memoryInfo, cpuGateState, blocked);
   } catch {
     return unavailableDecision(heldLeases, 'admission-error');
   }
+}
+
+/** The pure CPU + memory decision for one claim, given an already-updated gate and cooldown. */
+function decideAdmission(cfg, ticket, heldLeases, cpuSample, memoryInfo, cpuGateState, blocked) {
+  const candidateResources = resolveTicketResources({
+    weight: ticket.weight,
+    cpuCores: ticket.resources?.cpuCores,
+    memoryBytes: ticket.resources?.memoryBytes,
+    defaultMemoryBytesPerWeight: cfg.defaultMemoryBytesPerWeight,
+  });
+  const cpuResult = evaluateCpuAdmission({
+    cpuSample,
+    heldLeases,
+    candidateWeight: ticket.weight,
+    candidateResources,
+    cpuGateState,
+    cooldownBlocked: blocked,
+    cfg,
+  });
+  const memoryResult = memoryInfo
+    ? evaluateMemoryAdmission({ memoryInfo, heldLeases, candidateResources, cfg })
+    : { admit: true, reason: 'not-sampled', projectedAvailableBytes: null, memoryBudgetBytes: null };
+  return {
+    ...cpuResult,
+    admit: cpuResult.admit && memoryResult.admit,
+    reason: !cpuResult.admit ? cpuResult.reason : !memoryResult.admit ? memoryResult.reason : cpuResult.reason,
+    cpuReason: cpuResult.reason,
+    memoryReason: memoryResult.reason,
+    candidateCpuCores: candidateResources.cpuCores,
+    candidateMemoryBytes: candidateResources.memoryBytes,
+    projectedAvailableBytes: memoryResult.projectedAvailableBytes,
+    memoryBudgetBytes: memoryResult.memoryBudgetBytes,
+    hostBusyCores: cpuSample ? cpuSample.hostBusyCores : null,
+    cores: cpuSample ? cpuSample.cores : null,
+    sampleStale: cpuSample ? cpuSample.stale : true,
+    cpuGateClosed: cpuGateState.closed,
+    cooldownBlocked: blocked,
+  };
+}
+
+/**
+ * BRAIN-360: a denial that more CPU headroom alone would cure -- the CPU projection (gate open, no
+ * cooldown: evaluateCpuAdmission reports those first) is the ONLY thing that said no, and memory
+ * said yes. Everything else (memory, a closed CPU gate, cooldown, an unavailable sample, an
+ * admission error) is never elastic, and neither are the checks that live outside this predicate
+ * (conflict, weight capacity, load gate, pause), which tryStart evaluates on their own.
+ */
+export function isCpuOnlyDenial(decision) {
+  return decision.admit === false && decision.cpuReason === 'projected-over-budget' && decision.memoryReason === 'ok';
+}
+
+/**
+ * BRAIN-360: when `fullDecision` is a CPU-only denial and the ticket declares `resources.minCpuCores`,
+ * re-run the COMPLETE predicate (CPU projection + memory, same gate state, cooldown, held leases and
+ * sample as the full claim) at each smaller claim, largest first, and return the first that admits:
+ * `{ decision, grantedCpuCores }`. Memory keeps the full declared claim. Null when not elastic, not
+ * a CPU-only denial, or nothing down to the floor fits -- the caller then keeps `fullDecision`
+ * (and with it the pre-existing wait / backfill / idle-exemption behaviour) untouched.
+ */
+export function evaluateElasticAdmission(cfg, ticket, heldLeases, cpuSample, memoryInfo, fullDecision) {
+  if (!isCpuOnlyDenial(fullDecision)) return null;
+  const declared = resolveTicketResources({ weight: ticket.weight, cpuCores: ticket.resources?.cpuCores });
+  const claims = elasticCpuClaims({ cpuCores: declared.cpuCores, minCpuCores: ticket.resources?.minCpuCores });
+  try {
+    for (const claim of claims) {
+      const resized = { ...ticket, resources: { ...ticket.resources, cpuCores: claim } };
+      const decision = decideAdmission(cfg, resized, heldLeases, cpuSample, memoryInfo, { closed: fullDecision.cpuGateClosed }, fullDecision.cooldownBlocked);
+      if (decision.admit) return { decision, grantedCpuCores: claim };
+    }
+  } catch {
+    // same fail-safe as evaluateNewAdmission: an error is never an elastic grant
+  }
+  return null;
 }
 
 function fmt(n) {
@@ -412,6 +452,7 @@ export function formatAdmissionLog(f) {
     `projectedBusy=${fmt(f.projectedBusy)}`,
     `budget=${fmt(f.budget)}`,
     `candidateCpu=${fmt(f.candidateCpuCores)}`,
+    ...(f.declaredCpuCores !== undefined ? [`declaredCpu=${fmt(f.declaredCpuCores)}`] : []),
     `candidateMemoryBytes=${f.candidateMemoryBytes ?? 'n/a'}`,
     `projectedAvailableBytes=${f.projectedAvailableBytes ?? 'n/a'}`,
     `memoryBudgetBytes=${f.memoryBudgetBytes ?? 'n/a'}`,

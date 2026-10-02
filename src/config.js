@@ -276,6 +276,12 @@ function validateRepoConfig(cfg, sourcePath) {
     if (lane.cpuCores !== undefined) {
       assert(Number.isFinite(lane.cpuCores) && lane.cpuCores > 0, `${sourcePath}: lane "${name}".cpuCores must be a positive number`);
     }
+    if (lane.minCpuCores !== undefined) {
+      assert(Number.isFinite(lane.minCpuCores) && lane.minCpuCores > 0, `${sourcePath}: lane "${name}".minCpuCores must be a positive number`);
+      // an unset cpuCores resolves to weight (resolveTicketResources), so that is the claim the floor sits under
+      const claim = lane.cpuCores ?? lane.weight;
+      assert(lane.minCpuCores <= claim, `${sourcePath}: lane "${name}".minCpuCores (${lane.minCpuCores}) must be <= its cpuCores (${claim})`);
+    }
     if (lane.memoryBytes !== undefined) {
       assert(Number.isFinite(lane.memoryBytes) && lane.memoryBytes > 0, `${sourcePath}: lane "${name}".memoryBytes must be a positive number`);
     }
@@ -576,7 +582,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   if (isDeclaredLane) {
     laneCfg = repoConfig.lanes[laneName];
   } else if (undeclaredTemplateName) {
-    // Inherit weight/cpuCores/memoryBytes/nice/remote/remoteDeps/remoteSetup
+    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/remote/remoteDeps/remoteSetup
     // from the named declared lane, keeping this lane's OWN key/name. Not
     // inherited: `localRefused` (stays default false), the template's named
     // conflicts (only the `*` wildcard universe below reaches this lane, same
@@ -586,6 +592,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     laneCfg = {
       weight: templateCfg.weight,
       cpuCores: templateCfg.cpuCores,
+      minCpuCores: templateCfg.minCpuCores,
       memoryBytes: templateCfg.memoryBytes,
       nice: templateCfg.nice,
       remote: templateCfg.remote,
@@ -612,6 +619,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     key,
     weight: laneCfg.weight,
     cpuCores: Number.isFinite(laneCfg.cpuCores) ? laneCfg.cpuCores : null,
+    minCpuCores: Number.isFinite(laneCfg.minCpuCores) ? laneCfg.minCpuCores : null,
     memoryBytes: Number.isFinite(laneCfg.memoryBytes) ? laneCfg.memoryBytes : null,
     localRefused: Boolean(laneCfg.localRefused),
     // null (not defaulted here) when the lane doesn't declare its own nice:

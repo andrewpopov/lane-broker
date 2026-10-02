@@ -189,7 +189,7 @@ sessions keep using ad-hoc lane names for everything else.
 form: an undeclared `--lane` name still keeps its own key and name (the
 same-key exclusivity rule above is unaffected — two sessions using the same
 ad-hoc name still conflict with each other), but instead of the no-config-file
-default it inherits `weight`, `cpuCores`, `memoryBytes`, `nice`, `remote`,
+default it inherits `weight`, `cpuCores`, `minCpuCores`, `memoryBytes`, `nice`, `remote`,
 `remoteDeps` and `remoteSetup` from the named declared lane. It does NOT
 inherit that lane's own named `conflicts` entries or its `maxConcurrent`
 (stays `1`) — only the `*` wildcard universe still reaches it, same as plain
@@ -467,6 +467,52 @@ disable the exemption; only `resourceIdleOvershootCores: 0` does. The check and 
 one lock transaction, so two supervisors never both exempt. macOS memory
 pressure `warn` or unknown does not block it, only `critical` does (as for every
 start). It is logged as `current=start:resource-idle-exempt`.
+
+### Elastic CPU claims (`minCpuCores`, BRAIN-360)
+
+A lane may declare `"minCpuCores": <n>` (a positive number, at most its
+`cpuCores`, or its `weight` when `cpuCores` is unset; a config that violates
+this is refused by name). Without it, nothing below applies and every
+decision is byte-for-byte what it was.
+
+If the lane's full `cpuCores` does not fit but the CPU projection
+(`projected-over-budget`, memory fine) is the ONLY thing denying it, admission
+re-runs the complete predicate at each smaller claim: the integers below
+`cpuCores`, largest first, down to `minCpuCores` (then `minCpuCores` itself if
+it is fractional), over the same held leases, sample, gate and cooldown, and
+admits at the first that passes. Nothing else is ever relaxed: a memory,
+conflict, weight-capacity, load-gate, closed-CPU-gate, cooldown, pause or
+unavailable-sample denial waits exactly as before, memory is always reserved at
+the full declared `memoryBytes`, and `weight` always counts in full (a partial
+grant frees no capacity slots; the conservative choice, since `weight` is the
+exclusivity unit and not a CPU measure). If even `minCpuCores` does not fit, the
+lane waits with the same `projected-over-budget` denial (and the existing
+backfill, reservation and idle-exemption behaviour, which judge the full
+claim). Active `schedulerMode` only; shadow never denies, so it never relaxes.
+
+The lease records `grantedCpuCores` and keeps `resources.cpuCores` as the
+declaration. Everything that charges a lease's CPU uses the grant: the CPU
+projection (including settled demand, BRAIN-354), safe-backfill head
+reservations (BRAIN-355), `lane status`, and `history.jsonl`
+(`grantedCpuCores`, additive beside `resources`). The child gets the grant in
+`LANE_BROKER_CPU_CORES`, so a test runner sizing its workers from it uses what
+it was actually given. `lane status` marks a short grant on its RUNNING line
+(`cpu=2/4 (elastic)`), and the admission log line gains `declaredCpu=` and an
+`elastic-grant` event only when a grant was reduced.
+
+Queue fairness: an elastic head is granted a partial claim when it reaches the
+head (the point of the feature). Backfill never uses elasticity to get ahead:
+resource-backfill selection still requires the candidate's FULL claim to fit
+the head's denial headroom, a reserved head refuses every backfill candidate
+regardless, and a safe backfill (BRAIN-355) is judged with the blocked head's
+full claim already reserved, so a smaller grant cannot delay the head.
+
+Remote: a runner applies the same admission (it is the same code, with the
+lane config resolved from the shipped snapshot). The client's static
+"never fits" runner check uses `minCpuCores` as the claim, and `remote-probe`
+reports `reservedCpuCores` (grants, not declarations). Runner selection
+otherwise stays as it was; an older runner ignores the field and runs the lane
+at its full claim or waits.
 
 Resource backfill events are explicit `lane-broker-head-block` lines in
 `admission-decisions.log`, written after the lease is published:

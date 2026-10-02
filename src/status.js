@@ -8,7 +8,7 @@ import { listAttempts, supervisorAlive } from './attempts.js';
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfig } from './config.js';
-import { detectResourceCapacity, effectiveWeightCapacity, leaseResources } from './resources.js';
+import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores } from './resources.js';
 
 /** Holder pid of the global lock, read directly off disk — used to name the
  *  holder in the "couldn't take the lock" diagnostic without re-taking it. */
@@ -139,6 +139,8 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       // matching resolveTicketConfig's own compatibility default.
       maxConcurrent: l.maxConcurrent ?? 1,
       resources: leaseResources(l, cfg),
+      declaredCpuCores: l.resources?.cpuCores ?? l.weight,
+      grantedCpuCores: leaseCpuCores(l) ?? l.weight,
       observedCpuCores: l.observedCpuCores ?? null,
       observedMemoryBytes: l.observedMemoryBytes ?? null,
     }));
@@ -235,6 +237,11 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
  *  poll, so anything this many multiples older can only mean nothing has
  *  been selected in that whole span. */
 const STALE_SAMPLE_MS = 5 * 60 * 1000;
+
+/** BRAIN-360: shown only when admission granted less CPU than the lane declared. */
+function elasticNote(r) {
+  return r.grantedCpuCores < r.declaredCpuCores ? `  cpu=${r.grantedCpuCores}/${r.declaredCpuCores} (elastic)` : '';
+}
 
 function fmtMs(ms) {
   if (ms == null) return '-';
@@ -358,7 +365,7 @@ export function renderStatusText(status) {
       const ceiling = r.maxConcurrent > 1 ? `  ceiling=${r.maxConcurrent}` : '';
       lines.push(
         `  ${r.id}  key=${r.key}  pid=${r.pid ?? '-'}  elapsed=${fmtMs(r.elapsedMs)}  ` +
-          `heartbeat-age=${fmtMs(r.heartbeatAgeMs)}  log=${r.log}${flag}${ceiling}`,
+          `heartbeat-age=${fmtMs(r.heartbeatAgeMs)}  log=${r.log}${flag}${ceiling}${elasticNote(r)}`,
       );
     }
   }
