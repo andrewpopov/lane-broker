@@ -184,18 +184,22 @@ export function leaseCpuCores(lease) {
   return Number.isFinite(lease.grantedCpuCores) ? lease.grantedCpuCores : lease.resources?.cpuCores;
 }
 
+/** remote-probe capability: this runner resolves `minCpuCores` itself and admits at a partial claim. */
+export const ELASTIC_CLAIMS_CAPABILITY = 'elastic-claims/1';
+
 /**
- * BRAIN-360: the claims an elastic lane may be admitted at when its full
- * `cpuCores` does not fit: the integers strictly below the claim, largest first,
- * down to `minCpuCores`, then `minCpuCores` itself when it is fractional.
- * Empty when the ticket declares no floor.
+ * BRAIN-360: the integer claims an elastic lane may be admitted at when its full `cpuCores` does not
+ * fit: `{ hi, lo }`, tried downward from `hi` to `lo`. Grants are integers only: `hi` is the largest
+ * integer strictly below the claim that also fits the CPU headroom the full-claim evaluation measured
+ * (`headroom` = budget minus everything already projected busy), `lo` is `ceil(minCpuCores)`, so a
+ * fractional floor rounds UP and a grant is never below it. The headroom bound is what keeps the walk
+ * short whatever the declared claim is. Null when there is no floor or nothing in range.
  */
-export function elasticCpuClaims({ cpuCores, minCpuCores }) {
-  if (!Number.isFinite(minCpuCores) || !Number.isFinite(cpuCores) || !(minCpuCores < cpuCores)) return [];
-  const claims = [];
-  for (let k = Math.ceil(cpuCores) - 1; k >= minCpuCores; k -= 1) claims.push(k);
-  if (!Number.isInteger(minCpuCores)) claims.push(minCpuCores);
-  return claims;
+export function elasticClaimRange({ cpuCores, minCpuCores, headroom }) {
+  if (!Number.isFinite(minCpuCores) || !Number.isFinite(cpuCores) || !Number.isFinite(headroom) || !(minCpuCores < cpuCores)) return null;
+  const hi = Math.min(Math.ceil(cpuCores) - 1, Math.floor(headroom));
+  const lo = Math.ceil(minCpuCores);
+  return hi >= lo ? { hi, lo } : null;
 }
 
 export function leaseResources(lease, cfg) {

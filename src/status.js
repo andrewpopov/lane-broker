@@ -8,7 +8,7 @@ import { listAttempts, supervisorAlive } from './attempts.js';
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfig } from './config.js';
-import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores } from './resources.js';
+import { detectResourceCapacity, effectiveWeightCapacity, leaseResources } from './resources.js';
 
 /** Holder pid of the global lock, read directly off disk — used to name the
  *  holder in the "couldn't take the lock" diagnostic without re-taking it. */
@@ -139,8 +139,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       // matching resolveTicketConfig's own compatibility default.
       maxConcurrent: l.maxConcurrent ?? 1,
       resources: leaseResources(l, cfg),
-      declaredCpuCores: l.resources?.cpuCores ?? l.weight,
-      grantedCpuCores: leaseCpuCores(l) ?? l.weight,
+      ...(Number.isFinite(l.grantedCpuCores) ? { declaredCpuCores: l.resources?.cpuCores ?? l.weight, grantedCpuCores: l.grantedCpuCores } : {}),
       observedCpuCores: l.observedCpuCores ?? null,
       observedMemoryBytes: l.observedMemoryBytes ?? null,
     }));

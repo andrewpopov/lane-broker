@@ -2,14 +2,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneRun } from './helpers.js';
+import { spawnSync } from 'node:child_process';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneRun, gitFixture, BIN } from './helpers.js';
+import { tmpDir, setup, markerCmd, makeFakeSshBin, clientEnv, makeRunner } from './remote-harness.js';
+import { selectRunner } from '../src/remote-client.js';
 import { enqueue, tryStart } from '../src/scheduler.js';
 import { DEFAULT_GLOBAL_CONFIG, resolveTicketConfig } from '../src/config.js';
 import { writeLease, readLease, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths, atomicWriteJson } from '../src/state.js';
 import { childEnv } from '../src/supervisor.js';
 import { leaseDemand, projectBusy } from '../src/admission.js';
-import { elasticCpuClaims, resolveTicketResources, leaseCpuCores, leaseResources } from '../src/resources.js';
+import { elasticClaimRange, resolveTicketResources, leaseCpuCores, leaseResources, ELASTIC_CLAIMS_CAPABILITY } from '../src/resources.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
 
 /**
@@ -65,12 +68,15 @@ function heldLease(id, key, extra = {}) {
   return { id, key, bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight: 1, state: LEASE_STATE.RUNNING, ...extra };
 }
 
-test('elasticCpuClaims: integers below the claim, largest first, down to the floor, then a fractional floor', () => {
-  assert.deepEqual(elasticCpuClaims({ cpuCores: 4, minCpuCores: 2 }), [3, 2]);
-  assert.deepEqual(elasticCpuClaims({ cpuCores: 4, minCpuCores: 1.5 }), [3, 2, 1.5]);
-  assert.deepEqual(elasticCpuClaims({ cpuCores: 2.5, minCpuCores: 1 }), [2, 1]);
-  assert.deepEqual(elasticCpuClaims({ cpuCores: 4, minCpuCores: 4 }), []);
-  assert.deepEqual(elasticCpuClaims({ cpuCores: 4 }), []);
+test('elasticClaimRange: integer claims only, bounded by the measured headroom, floor rounded UP', () => {
+  assert.deepEqual(elasticClaimRange({ cpuCores: 4, minCpuCores: 2, headroom: 3.5 }), { hi: 3, lo: 2 });
+  assert.deepEqual(elasticClaimRange({ cpuCores: 4, minCpuCores: 2, headroom: 2.9 }), { hi: 2, lo: 2 });
+  assert.deepEqual(elasticClaimRange({ cpuCores: 4, minCpuCores: 1.5, headroom: 7 }), { hi: 3, lo: 2 }, 'a fractional floor of 1.5 means 2, never 1.5');
+  assert.equal(elasticClaimRange({ cpuCores: 4, minCpuCores: 1.5, headroom: 1.5 }), null, '1.5 cores of headroom is below the rounded floor');
+  assert.deepEqual(elasticClaimRange({ cpuCores: 2.5, minCpuCores: 1, headroom: 9 }), { hi: 2, lo: 1 });
+  assert.deepEqual(elasticClaimRange({ cpuCores: 1e20, minCpuCores: 1, headroom: 2.5 }), { hi: 2, lo: 1 }, 'the headroom bounds the walk, not the declaration');
+  assert.equal(elasticClaimRange({ cpuCores: 4, minCpuCores: 4, headroom: 9 }), null);
+  assert.equal(elasticClaimRange({ cpuCores: 4, headroom: 9 }), null);
 });
 
 test('resolveTicketResources only carries a floor that is strictly below the claim', () => {
@@ -112,6 +118,19 @@ test('partial fit: admitted at the LARGEST k >= min whose complete predicate pas
   }
 });
 
+test('grants are integers: a fractional floor of 1.5 is never granted as 1.5', async () => {
+  const frac = (id) => ticket(id, { resources: { cpuCores: 4, minCpuCores: 1.5, memoryBytes: GIB } });
+  const denied = freshEnv();
+  await enqueue(denied.state, frac('e'));
+  const none = await poll(denied.state, frac('e'), baseCfg(), { ext: 7.5 }); // 1.5 cores of headroom
+  assert.equal(none.started, false, 'the old walk granted 1.5 here');
+  assert.equal(none.cpuReason, 'projected-over-budget');
+  const ok = freshEnv();
+  await enqueue(ok.state, frac('e'));
+  const granted = await poll(ok.state, frac('e'), baseCfg(), { ext: 7 });
+  assert.equal(granted.lease.grantedCpuCores, 2);
+});
+
 test('below the floor: waits with the same denial reason as a lane with no floor', async () => {
   const { state } = freshEnv();
   const t = elastic('e');
@@ -127,7 +146,7 @@ test('below the floor: waits with the same denial reason as a lane with no floor
   assert.equal(result.cpuReason, 'projected-over-budget');
 });
 
-test('no minCpuCores: decisions are unchanged at every ambient load (grant == declaration, no elastic trace)', async () => {
+test('no minCpuCores: decisions are unchanged at every ambient load, and the lease record is exactly the pre-change shape', async () => {
   for (const ext of [0, 2, 5, 5.01, 6, 7.5, 8.9]) {
     const { state } = freshEnv();
     const p = plain('p');
@@ -136,7 +155,26 @@ test('no minCpuCores: decisions are unchanged at every ambient load (grant == de
     const fits = ext + 4 <= 9;
     assert.equal(result.started, fits, `ext ${ext}`);
     if (fits) {
-      assert.equal(result.lease.grantedCpuCores, 4);
+      // the FULL pre-change lease record (what scheduler.js wrote before BRAIN-360), key for key
+      const lease = readLease(state, 'p');
+      const expected = {
+        id: 'p',
+        key: 'r:p',
+        bootId: bootId(),
+        supervisorPid: process.pid,
+        supervisorStart: null,
+        childPgid: null,
+        heartbeatAt: lease.heartbeatAt,
+        admittedAt: lease.admittedAt,
+        cwd: p.cwd,
+        cmd: p.cmd,
+        weight: 1,
+        resources: { cpuCores: 4, memoryBytes: GIB },
+        logPath: '/dev/null',
+        resultPath: '/dev/null',
+        state: LEASE_STATE.RUNNING,
+      };
+      assert.deepEqual(lease, expected, `ext ${ext}`);
     } else {
       assert.equal(result.reason, 'cpu-admission');
       assert.equal(result.cpuReason, 'projected-over-budget');
@@ -144,6 +182,21 @@ test('no minCpuCores: decisions are unchanged at every ambient load (grant == de
       assert.equal(result.budget, 9);
     }
     assert.doesNotMatch(readLog(state), /declaredCpu=|elastic-grant/, `ext ${ext}`);
+  }
+});
+
+test('no minCpuCores: the status entry is exactly the pre-change shape', async () => {
+  const { state } = freshEnv();
+  const prev = process.env.LANE_BROKER_STATE;
+  process.env.LANE_BROKER_STATE = state;
+  try {
+    writeLease(state, heldLease('l', 'r:l', { resources: { cpuCores: 4, memoryBytes: GIB }, childPgid: process.pid, startedAt: Date.now() }));
+    const entry = (await collectStatus()).running.find((r) => r.id === 'l');
+    assert.deepEqual(Object.keys(entry), ['id', 'key', 'state', 'pid', 'elapsedMs', 'heartbeatAgeMs', 'log', 'weight', 'maxConcurrent', 'resources', 'observedCpuCores', 'observedMemoryBytes']);
+    assert.doesNotMatch(renderStatusText(await collectStatus()), /elastic/);
+  } finally {
+    if (prev === undefined) delete process.env.LANE_BROKER_STATE;
+    else process.env.LANE_BROKER_STATE = prev;
   }
 });
 
@@ -262,6 +315,24 @@ test('a reserved head is not delayed by an elastic backfill: reservation refuses
   assert.equal(readLease(state, 'small'), null);
 });
 
+test('reservation isolation: a candidate whose FULL claim fits is refused while the head is reserved, and admitted when it is not', async () => {
+  const run = async (reserved) => {
+    const { state } = freshEnv();
+    const head = plain('head', { resources: { cpuCores: 8, memoryBytes: GIB } }); // 2+8 > 9: denied
+    const cand = elastic('cand'); // 2+4 = 6 <= 9: its FULL claim fits
+    await enqueue(state, head);
+    await enqueue(state, cand);
+    atomicWriteJson(paths(state).resourceSkipState, { headId: 'head', count: reserved ? 1 : 0, reserved, inScope: true, deniedAt: Date.now(), budget: 9, externalBusy: 2 });
+    return poll(state, cand, baseCfg(), { ext: 2 });
+  };
+  const open = await run(false);
+  assert.equal(open.started, true, 'control: with an unreserved head the same candidate backfills');
+  assert.equal(open.lease.grantedCpuCores, 4);
+  const reserved = await run(true);
+  assert.equal(reserved.started, false, 'the reservation alone is what refuses it');
+  assert.equal(reserved.reason, 'not-head');
+});
+
 test('an elastic HEAD is admitted at a partial claim when it reaches the head', async () => {
   const { state } = freshEnv();
   const head = elastic('head');
@@ -349,4 +420,125 @@ test('end to end: a real lane is granted the largest fitting k, its child sees i
   const rows = fs.readFileSync(paths(state).history, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
   assert.equal(rows.at(-1).grantedCpuCores, 2);
   assert.equal(rows.at(-1).resources.cpuCores, 4, 'the declaration is still recorded beside the grant');
+});
+
+test('a pathological declared claim returns promptly with a bounded grant (child process, hard timeout)', () => {
+  const code = `
+    import { evaluateElasticAdmission } from ${JSON.stringify(new URL('../src/admission.js', import.meta.url).href)};
+    import { DEFAULT_GLOBAL_CONFIG } from ${JSON.stringify(new URL('../src/config.js', import.meta.url).href)};
+    const cfg = { ...DEFAULT_GLOBAL_CONFIG, schedulerMode: 'active', cpuAdmissionPercent: 100, cpuReserveCores: 1, admissionCooldownMs: 0 };
+    const sample = { hostBusyCores: 5, cores: 10, stale: false };
+    const ticket = { id: 't', weight: 1, resources: { cpuCores: 1e20, minCpuCores: 1, memoryBytes: 1 } };
+    const full = { admit: false, cpuReason: 'projected-over-budget', memoryReason: 'ok', budget: 9, projectedBusy: 5 + 1e20, candidateCpuCores: 1e20, cpuGateClosed: false, cooldownBlocked: false };
+    const r = evaluateElasticAdmission(cfg, ticket, [], sample, null, full);
+    console.log(JSON.stringify(r && r.grantedCpuCores));
+  `;
+  const res = spawnSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 15_000 });
+  assert.equal(res.error, undefined, `did not return in time: ${res.error}`);
+  assert.equal(res.status, 0, res.stderr);
+  assert.equal(res.stdout.trim(), '4', 'ambient 5 of a 9-core budget leaves exactly 4');
+});
+
+test('config refuses an absurd cpuCores / minCpuCores by name, including through an undeclaredLanes template', () => {
+  const { base } = freshEnv();
+  const resolve = (cfg, lane = 'default') => {
+    const dir = path.join(base, `r-${Math.random().toString(16).slice(2)}`);
+    writeRepoConfig(dir, { version: 1, ...cfg });
+    return () => resolveTicketConfig({ cwd: dir, repo: 'r', lane, configRoot: dir });
+  };
+  assert.throws(resolve({ lanes: { default: { weight: 1, cpuCores: 1e20, minCpuCores: 1 } } }), /lane "default"\.cpuCores must be <= 1024/);
+  assert.throws(resolve({ lanes: { default: { weight: 1, cpuCores: 1024, minCpuCores: 1025 } } }), /lane "default"\.minCpuCores/);
+  assert.equal(resolve({ lanes: { default: { weight: 1, cpuCores: 1024, minCpuCores: 1024 } } })().minCpuCores, 1024);
+  assert.throws(
+    resolve({ lanes: { tpl: { weight: 1, cpuCores: 1e20 } }, undeclaredLanes: { as: 'tpl' } }, 'zirk1'),
+    /lane "tpl"\.cpuCores must be <= 1024/,
+    'an inheriting ad-hoc lane cannot reach an unvalidated template',
+  );
+});
+
+function fixedProbeSsh(binDir, byDestination) {
+  const sshBin = path.join(binDir, 'ssh-mixed');
+  fs.writeFileSync(
+    sshBin,
+    `#!/usr/bin/env node
+const argv = process.argv.slice(2).filter((a, i, all) => a !== '-o' && all[i - 1] !== '-o');
+const payloads = ${JSON.stringify(byDestination)};
+process.stdout.write(JSON.stringify(payloads[argv[0]]) + '\\n');
+`,
+  );
+  fs.chmodSync(sshBin, 0o755);
+  return sshBin;
+}
+
+test('mixed versions: a runner without elastic-claims/1 is judged on the FULL claim, one with it on the floor', async () => {
+  const { binDir } = makeFakeSshBin();
+  const probe = (capabilities) => ({
+    protocol: 1,
+    protocols: [1, 2],
+    version: '0.0.0',
+    paused: false,
+    queued: 0,
+    running: 0,
+    ...(capabilities ? { capabilities } : {}),
+    capacity: { weight: 100, cpuCores: 3, memoryBytes: 64_000_000_000, memoryReserveBytes: 0 },
+  });
+  const sshBin = fixedProbeSsh(binDir, { old: probe(null), new: probe([ELASTIC_CLAIMS_CAPABILITY]) });
+  const { env } = clientEnv(binDir);
+  const reservation = { weight: 1, cpuCores: 4, minCpuCores: 2, memoryBytes: 1 };
+  const old = makeRunner({ ssh: 'old', name: 'old' });
+  const neu = makeRunner({ ssh: 'new', name: 'new' });
+
+  const oldOnly = await selectRunner([old], { sshBin, env, deadlineMs: 3000, reservation });
+  assert.equal(oldOnly.runner, null, 'budget 3 < full claim 4: dispatching would be a terminal exit-64 refusal');
+  assert.match(oldOnly.skipped[0].reason, /capacity/);
+
+  const both = await selectRunner([old, neu], { sshBin, env, deadlineMs: 3000, reservation });
+  assert.equal(both.runner.name, 'new', 'the old runner is skipped and the elastic one used');
+
+  const neuOnly = await selectRunner([neu], { sshBin, env, deadlineMs: 3000, reservation });
+  assert.equal(neuOnly.runner.name, 'new', 'floor 2 <= budget 3');
+});
+
+test('remote-probe advertises elastic-claims/1', () => {
+  const { env } = freshEnv();
+  const res = spawnSync(process.execPath, [BIN, 'remote-probe'], { env, encoding: 'utf8' });
+  assert.equal(res.status, 0, res.stderr);
+  assert.deepEqual(JSON.parse(res.stdout).capabilities, [ELASTIC_CLAIMS_CAPABILITY]);
+});
+
+test('remote run: the runner-side grant reaches BOTH the runner history and the submitter result and history', async () => {
+  const { env, home, state, repoDir, runnerHome, runnerState } = setup();
+  const busy = writeCpuBusyFile(path.dirname(home), 6.5, 10);
+  writeGlobalConfig(runnerHome, { version: 1, sampleMs: 50, capacity: 100, schedulerMode: 'active', cpuAdmissionPercent: 100, cpuReserveCores: 1, admissionCooldownMs: 0, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1 });
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, cpuCores: 4, minCpuCores: 2, memoryBytes: 1048576, remote: true } } });
+  gitFixture(['add', '-A'], repoDir);
+  gitFixture(['commit', '-q', '-m', 'x'], repoDir);
+  const marker = path.join(tmpDir('marker'), 'where');
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...markerCmd(marker, 0)], {
+    env: { ...env, LANE_BROKER_CPU_BUSY_FILE: busy },
+    cwd: repoDir,
+  });
+  assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
+  const last = (root) => fs.readFileSync(paths(root).history, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).at(-1);
+  const submitter = last(state);
+  assert.equal(submitter.executor, 'remote');
+  assert.equal(submitter.grantedCpuCores, 2, 'submitter history');
+  assert.equal(submitter.resources.cpuCores, 4);
+  const runnerRow = last(runnerState);
+  assert.equal(runnerRow.grantedCpuCores, 2, 'runner history');
+});
+
+test('non-elastic: no history row or result carries a grant field', async () => {
+  const { base, home, state, env } = freshEnv();
+  writeGlobalConfig(home, { version: 1, capacity: 100, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, cpuCores: 2 } } });
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'true'], { env, cwd: repoDir });
+  assert.equal(result.code, 0, result.stderr);
+  const row = JSON.parse(fs.readFileSync(paths(state).history, 'utf8').trim().split('\n').at(-1));
+  assert.equal('grantedCpuCores' in row, false);
+  assert.deepEqual(row.resources.cpuCores, 2);
+  const res = JSON.parse(fs.readFileSync(path.join(paths(state).results, `${row.id}.json`), 'utf8'));
+  assert.equal('grantedCpuCores' in res, false);
 });

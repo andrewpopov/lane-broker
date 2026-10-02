@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, loadGlobalConfig } from './config.js';
-import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores } from './resources.js';
+import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores, ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
 import { makeReader, readHeaderLine, extractFrames, MAX_HEADER_BYTES } from './remote-stream.js';
 import { runCommand } from './run.js';
 import { cancelCommand } from './cancel.js';
@@ -117,6 +117,7 @@ function validateHeaderFields(header) {
   }
   if (!isPositiveFiniteOrAbsent(header.weight)) return { ok: false, reason: 'invalid weight' };
   if (!isPositiveFiniteOrAbsent(header.cpuCores)) return { ok: false, reason: 'invalid cpuCores' };
+  if (!isPositiveFiniteOrAbsent(header.minCpuCores)) return { ok: false, reason: 'invalid minCpuCores' };
   if (!isPositiveFiniteOrAbsent(header.memoryBytes)) return { ok: false, reason: 'invalid memoryBytes' };
   if (!Array.isArray(header.argv) || header.argv.length === 0 || !header.argv.every((a) => typeof a === 'string')) {
     return { ok: false, reason: 'invalid argv: must be a non-empty array of strings' };
@@ -172,7 +173,7 @@ function readPhase(ticketDir) {
   }
 }
 
-function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, runMs }) {
+function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, runMs, grantedCpuCores }) {
   const isProtocol2 = header.protocol === 2;
   return {
     protocol: isProtocol2 ? 2 : 1,
@@ -193,6 +194,8 @@ function buildResult(header, ticketDir, { kind, exit = null, signal = null, remo
     // time, so clock skew cannot matter). Omitted when unknown or for an
     // older runner, so the client records waitedMs null instead of a guess.
     runMs,
+    // BRAIN-360: additive; only an elastic lane's runner-side grant (an old submitter ignores it)
+    grantedCpuCores,
   };
 }
 
@@ -388,6 +391,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     allowLocalSim: true,
     weightOverride: header.weight,
     cpuOverride: header.cpuCores,
+    minCpuOverride: header.minCpuCores,
     memoryOverride: header.memoryBytes,
     // Unchanged by protocol: `.lane-broker.json` resolution (via
     // `configRoot` below) walks from this same cwd, and a protocol-2
@@ -448,6 +452,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   let signal = null;
   let reason = null;
   let runMs;
+  let grantedCpuCores;
   // A user cancel that landed after the expiry still wins (kind cancelled below).
   if (structured && structured.reason === 'queue-timeout' && !cancelled) {
     // BRAIN-320 S1d: the LOCAL broker's own scheduler expired this ticket
@@ -461,6 +466,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   } else if (structured) {
     exit = structured.exit;
     signal = structured.signal;
+    if (Number.isFinite(structured.grantedCpuCores)) grantedCpuCores = structured.grantedCpuCores;
     if (Number.isFinite(structured.startedAt) && Number.isFinite(structured.endedAt)) {
       runMs = Math.max(0, structured.endedAt - structured.startedAt);
     }
@@ -479,7 +485,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     kind = 'unfinished';
   }
 
-  writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, runMs }));
+  writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, runMs, grantedCpuCores }));
   cleanupWork(workDir);
   return { exitCode: 0 };
 }
@@ -504,6 +510,8 @@ export async function remoteProbeCommand() {
   const payload = {
     protocol: 1,
     protocols: [1, 2],
+    // BRAIN-360: this runner resolves minCpuCores itself, so a submitter may judge fit by the floor
+    capabilities: [ELASTIC_CLAIMS_CAPABILITY],
     version: pkg.version,
     paused: Boolean(status.paused),
     queued: status.queued.length,

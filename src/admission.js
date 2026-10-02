@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import { paths, atomicWriteJson, readJsonSafe, fingerprintOf } from './state.js';
 import { sampleHostCpu } from './cpu.js';
-import { evaluateMemoryAdmission, resolveTicketResources, leaseCpuCores, elasticCpuClaims } from './resources.js';
+import { evaluateMemoryAdmission, resolveTicketResources, leaseCpuCores, elasticClaimRange } from './resources.js';
 
 /**
  * Cold-start CPU-core estimate for a lease with no observed measurement yet.
@@ -396,17 +396,20 @@ export function isCpuOnlyDenial(decision) {
 /**
  * BRAIN-360: when `fullDecision` is a CPU-only denial and the ticket declares `resources.minCpuCores`,
  * re-run the COMPLETE predicate (CPU projection + memory, same gate state, cooldown, held leases and
- * sample as the full claim) at each smaller claim, largest first, and return the first that admits:
+ * sample as the full claim) at each smaller INTEGER claim (elasticClaimRange), largest first, and return the first that admits:
  * `{ decision, grantedCpuCores }`. Memory keeps the full declared claim. Null when not elastic, not
  * a CPU-only denial, or nothing down to the floor fits -- the caller then keeps `fullDecision`
  * (and with it the pre-existing wait / backfill / idle-exemption behaviour) untouched.
  */
 export function evaluateElasticAdmission(cfg, ticket, heldLeases, cpuSample, memoryInfo, fullDecision) {
-  if (!isCpuOnlyDenial(fullDecision)) return null;
-  const declared = resolveTicketResources({ weight: ticket.weight, cpuCores: ticket.resources?.cpuCores });
-  const claims = elasticCpuClaims({ cpuCores: declared.cpuCores, minCpuCores: ticket.resources?.minCpuCores });
   try {
-    for (const claim of claims) {
+    if (!isCpuOnlyDenial(fullDecision)) return null;
+    const declared = resolveTicketResources({ weight: ticket.weight, cpuCores: ticket.resources?.cpuCores });
+    // headroom: what the budget has left once everything but this ticket's own claim is counted
+    const headroom = fullDecision.budget - (fullDecision.projectedBusy - fullDecision.candidateCpuCores);
+    const range = elasticClaimRange({ cpuCores: declared.cpuCores, minCpuCores: ticket.resources?.minCpuCores, headroom });
+    if (!range) return null;
+    for (let claim = range.hi; claim >= range.lo; claim -= 1) {
       const resized = { ...ticket, resources: { ...ticket.resources, cpuCores: claim } };
       const decision = decideAdmission(cfg, resized, heldLeases, cpuSample, memoryInfo, { closed: fullDecision.cpuGateClosed }, fullDecision.cooldownBlocked);
       if (decision.admit) return { decision, grantedCpuCores: claim };

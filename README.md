@@ -471,15 +471,17 @@ start). It is logged as `current=start:resource-idle-exempt`.
 ### Elastic CPU claims (`minCpuCores`, BRAIN-360)
 
 A lane may declare `"minCpuCores": <n>` (a positive number, at most its
-`cpuCores`, or its `weight` when `cpuCores` is unset; a config that violates
-this is refused by name). Without it, nothing below applies and every
+`cpuCores`, or its `weight` when `cpuCores` is unset; both `cpuCores` and
+`minCpuCores` are capped at 1024; a config that violates this is refused by
+name, including through an `undeclaredLanes` template). Without it, nothing below applies and every
 decision is byte-for-byte what it was.
 
 If the lane's full `cpuCores` does not fit but the CPU projection
 (`projected-over-budget`, memory fine) is the ONLY thing denying it, admission
-re-runs the complete predicate at each smaller claim: the integers below
-`cpuCores`, largest first, down to `minCpuCores` (then `minCpuCores` itself if
-it is fractional), over the same held leases, sample, gate and cooldown, and
+re-runs the complete predicate at each smaller INTEGER claim: from the largest
+integer below `cpuCores` that also fits the CPU headroom the full-claim
+evaluation measured, down to `ceil(minCpuCores)` (a fractional floor rounds up;
+a grant is never fractional and never below the floor), over the same held leases, sample, gate and cooldown, and
 admits at the first that passes. Nothing else is ever relaxed: a memory,
 conflict, weight-capacity, load-gate, closed-CPU-gate, cooldown, pause or
 unavailable-sample denial waits exactly as before, memory is always reserved at
@@ -494,7 +496,10 @@ The lease records `grantedCpuCores` and keeps `resources.cpuCores` as the
 declaration. Everything that charges a lease's CPU uses the grant: the CPU
 projection (including settled demand, BRAIN-354), safe-backfill head
 reservations (BRAIN-355), `lane status`, and `history.jsonl`
-(`grantedCpuCores`, additive beside `resources`). The child gets the grant in
+(`grantedCpuCores`, additive beside `resources`) and on the result
+(`result.json`). These fields exist only for leases of lanes that declare
+`minCpuCores`; every other lease, status entry, history row and result is
+unchanged. The child gets the grant in
 `LANE_BROKER_CPU_CORES`, so a test runner sizing its workers from it uses what
 it was actually given. `lane status` marks a short grant on its RUNNING line
 (`cpu=2/4 (elastic)`), and the admission log line gains `declaredCpu=` and an
@@ -507,12 +512,16 @@ the head's denial headroom, a reserved head refuses every backfill candidate
 regardless, and a safe backfill (BRAIN-355) is judged with the blocked head's
 full claim already reserved, so a smaller grant cannot delay the head.
 
-Remote: a runner applies the same admission (it is the same code, with the
-lane config resolved from the shipped snapshot). The client's static
-"never fits" runner check uses `minCpuCores` as the claim, and `remote-probe`
-reports `reservedCpuCores` (grants, not declarations). Runner selection
-otherwise stays as it was; an older runner ignores the field and runs the lane
-at its full claim or waits.
+Remote: a runner applies the same admission (it is the same code). The submitter
+sends `minCpuCores` in the exec header (only for an elastic lane), and the
+runner's grant comes back as an additive `grantedCpuCores` on the remote result,
+so the submitter's result and history record it too. `remote-probe` advertises
+the `elastic-claims/1` capability and reports `reservedCpuCores` (grants, not
+declarations). The client's static "never fits" runner check uses the floor only
+for a runner that advertises `elastic-claims/1`; any other (older) runner is
+judged on the FULL claim, since it would be dispatched the full claim and refuse
+it terminally (exit 64) if its budget is smaller. Upgrade runners before relying
+on elasticity.
 
 Resource backfill events are explicit `lane-broker-head-block` lines in
 `admission-decisions.log`, written after the lease is published:

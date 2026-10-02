@@ -266,6 +266,9 @@ export function isValidRemoteSetupShape(setup) {
   return setup.every((argv) => Array.isArray(argv) && argv.length > 0 && argv.every((a) => typeof a === 'string' && a.length > 0));
 }
 
+/** Sanity bound on a lane's declared `cpuCores`/`minCpuCores`: no machine has more, and an absurd claim is a typo. */
+export const MAX_LANE_CPU_CORES = 1024;
+
 function validateRepoConfig(cfg, sourcePath) {
   assert(cfg && typeof cfg === 'object', `${sourcePath}: config must be an object`);
   assert(Number.isInteger(cfg.version), `${sourcePath}: "version" must be an integer`);
@@ -275,10 +278,12 @@ function validateRepoConfig(cfg, sourcePath) {
     assert(Number.isFinite(lane.weight) && lane.weight > 0, `${sourcePath}: lane "${name}".weight must be a positive number`);
     if (lane.cpuCores !== undefined) {
       assert(Number.isFinite(lane.cpuCores) && lane.cpuCores > 0, `${sourcePath}: lane "${name}".cpuCores must be a positive number`);
+      assert(lane.cpuCores <= MAX_LANE_CPU_CORES, `${sourcePath}: lane "${name}".cpuCores must be <= ${MAX_LANE_CPU_CORES}`);
     }
     if (lane.minCpuCores !== undefined) {
       assert(Number.isFinite(lane.minCpuCores) && lane.minCpuCores > 0, `${sourcePath}: lane "${name}".minCpuCores must be a positive number`);
       // an unset cpuCores resolves to weight (resolveTicketResources), so that is the claim the floor sits under
+      assert(lane.minCpuCores <= MAX_LANE_CPU_CORES, `${sourcePath}: lane "${name}".minCpuCores must be <= ${MAX_LANE_CPU_CORES}`);
       const claim = lane.cpuCores ?? lane.weight;
       assert(lane.minCpuCores <= claim, `${sourcePath}: lane "${name}".minCpuCores (${lane.minCpuCores}) must be <= its cpuCores (${claim})`);
     }

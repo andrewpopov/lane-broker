@@ -929,8 +929,8 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       cmd: ticket.cmd,
       weight: ticket.weight,
       resources: ticket.resources,
-      // BRAIN-360: what admission actually charged; `resources.cpuCores` stays the declaration.
-      grantedCpuCores,
+      // BRAIN-360: elastic lanes only; what admission actually charged. `resources.cpuCores` stays the declaration.
+      ...(ticket.resources?.minCpuCores !== undefined ? { grantedCpuCores } : {}),
       // BRAIN-255: carried onto the lease (not just the ticket) so a
       // held-lease-only view — status.js's report, or a later poll's
       // `blockedBy` call against a DIFFERENT ticket of the same key — can

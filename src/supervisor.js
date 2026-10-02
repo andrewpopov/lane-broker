@@ -336,7 +336,7 @@ function localRefusalResult(ticket, refusal) {
  * the `result` spread); `localReason` is the ticket's creation-time reason, or
  * `fallback:<reason>` when a remote attempt fell back to local.
  */
-function historyRow(ticket, result, { fallbackReason, grantedCpuCores } = {}) {
+function historyRow(ticket, result, { fallbackReason } = {}) {
   const executor = result.executor ?? 'local';
   const localReason = executor === 'local' ? (fallbackReason === undefined ? ticket.localReason : `fallback:${fallbackReason}`) : undefined;
   return {
@@ -346,7 +346,6 @@ function historyRow(ticket, result, { fallbackReason, grantedCpuCores } = {}) {
     lane: ticket.lane,
     weight: ticket.weight,
     resources: ticket.resources,
-    ...(grantedCpuCores !== undefined ? { grantedCpuCores } : {}),
     command: ticket.command,
     headTree: ticket.headTree,
     ...result,
@@ -507,7 +506,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     requireProtocol2: needsProtocol2(enriched.remote) || Boolean(globalCfg.remoteQueueTimeoutMs),
     reservation: {
       weight: enriched.weight,
-      cpuCores: enriched.resources.minCpuCores ?? enriched.resources.cpuCores,
+      cpuCores: enriched.resources.cpuCores,
+      minCpuCores: enriched.resources.minCpuCores,
       memoryBytes: enriched.resources.memoryBytes,
     },
   });
@@ -584,6 +584,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
       executor: 'remote',
       runner: runner.name,
       ...(queuedAt ? { queuedAt } : {}),
+      ...(Number.isFinite(dispatch.result.grantedCpuCores) ? { grantedCpuCores: dispatch.result.grantedCpuCores } : {}),
       remoteKind: dispatch.result.kind,
       remotePhase: dispatch.phase ?? null,
       startedAt: remoteWaitedMs === null ? attemptStartedAt : enriched.createdAt + remoteWaitedMs,
@@ -908,8 +909,10 @@ async function main() {
     // already gets right: write, let `publishTerminal` return (mutex
     // released, attempt removed), THEN exit.
     const writeResult = (finalResult) => {
+      // BRAIN-360: an elastic lease's grant rides on the result (a runner relays it to its submitter)
+      if (started.lease.grantedCpuCores !== undefined) finalResult = { ...finalResult, grantedCpuCores: started.lease.grantedCpuCores };
       atomicWriteJson(ticket.resultPath, finalResult);
-      appendHistory(root, historyRow(ticket, finalResult, { fallbackReason, grantedCpuCores: leaseCpuCores(started.lease) }));
+      appendHistory(root, historyRow(ticket, finalResult, { fallbackReason }));
       removeLease(root, ticket.id); // release always comes last
       // Cleanup only, AFTER the terminal write above -- never before (BLOCKER #1).
       clearTicketMarkers(root, ticket.id);

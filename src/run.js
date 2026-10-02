@@ -150,6 +150,7 @@ export async function runCommand({
   lane,
   weightOverride,
   cpuOverride,
+  minCpuOverride,
   memoryOverride,
   detach,
   timeoutMs,
@@ -236,7 +237,7 @@ export async function runCommand({
   const resources = resolveTicketResources({
     weight,
     cpuCores: cpuOverride ?? resolved.cpuCores,
-    minCpuCores: resolved.minCpuCores ?? undefined,
+    minCpuCores: minCpuOverride ?? resolved.minCpuCores ?? undefined,
     memoryBytes: memoryOverride ?? resolved.memoryBytes,
     defaultMemoryBytesPerWeight: globalCfg.defaultMemoryBytesPerWeight,
   });
@@ -404,6 +405,8 @@ export async function runCommand({
       repoKey: resolved.repoId,
       weight,
       cpuCores: resources.cpuCores,
+      // BRAIN-360: elastic lanes only, so a non-elastic ticket's remote payload is unchanged
+      ...(resources.minCpuCores !== undefined ? { minCpuCores: resources.minCpuCores } : {}),
       memoryBytes: resources.memoryBytes,
       // BRAIN-320 S1a: carried through so the supervisor's eligibility hook
       // and (later slice) dispatchRemote's protocol-2 header see exactly what
