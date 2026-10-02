@@ -25,6 +25,16 @@ export const DEFAULT_GLOBAL_CONFIG = {
   memoryReserveBytes: 2147483648,
   defaultMemoryBytesPerWeight: 1073741824,
   schedulerMode: 'active',
+  // BRAIN-354: once a lease is settled, admission charges its measured CPU
+  // (trailing-window peak * headroom, floored at floorFraction of its booking
+  // and capped at the booking) instead of the full booking. Settled = admitted
+  // at least settleMs ago with >= 2 fresh observations in the last windowMs.
+  // false restores the pre-BRAIN-354 max(observed, booking) charge.
+  settledDemandEnabled: true,
+  settledDemandSettleMs: 120_000,
+  settledDemandWindowMs: 180_000,
+  settledDemandHeadroom: 1.25,
+  settledDemandFloorFraction: 0.5,
   // Second, separate body of work (conflict-skip starvation bound — see
   // selectCandidate() in src/scheduler.js): how many times a conflict-blocked
   // FIFO head may be skipped in favor of a later, non-conflicting ticket
@@ -135,6 +145,14 @@ function validateGlobalConfig(cfg, sourcePath) {
   assert(
     cfg.schedulerMode === 'shadow' || cfg.schedulerMode === 'active',
     `${sourcePath}: "schedulerMode" must be "shadow" or "active"`,
+  );
+  assert(typeof cfg.settledDemandEnabled === 'boolean', `${sourcePath}: "settledDemandEnabled" must be a boolean`);
+  assert(Number.isFinite(cfg.settledDemandSettleMs) && cfg.settledDemandSettleMs >= 0, `${sourcePath}: "settledDemandSettleMs" must be a non-negative number`);
+  assert(Number.isFinite(cfg.settledDemandWindowMs) && cfg.settledDemandWindowMs > 0, `${sourcePath}: "settledDemandWindowMs" must be a positive number`);
+  assert(Number.isFinite(cfg.settledDemandHeadroom) && cfg.settledDemandHeadroom >= 1, `${sourcePath}: "settledDemandHeadroom" must be a number >= 1`);
+  assert(
+    Number.isFinite(cfg.settledDemandFloorFraction) && cfg.settledDemandFloorFraction >= 0 && cfg.settledDemandFloorFraction <= 1,
+    `${sourcePath}: "settledDemandFloorFraction" must be a number in [0, 1]`,
   );
   assert(
     Number.isInteger(cfg.conflictSkipLimit) && cfg.conflictSkipLimit >= 0,

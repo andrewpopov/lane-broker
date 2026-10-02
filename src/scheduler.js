@@ -493,7 +493,7 @@ export function selectResourceCandidate(queue, held, runningWeight, weightCapaci
     if (runningWeight + t.weight > weightCapacity) continue;
     if (blockedBy([...held, { key: t.key }], headTicket)) continue;
     const claim = ticketCpuEstimate(t, cfg);
-    if (projectBusy(record.externalBusy, held, claim, now) > record.budget) continue;
+    if (projectBusy(record.externalBusy, held, claim, now, cfg) > record.budget) continue;
     if (claim < bestClaim) {
       best = t;
       bestClaim = claim;

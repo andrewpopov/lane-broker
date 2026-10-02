@@ -14,8 +14,11 @@ import {
   formatAdmissionLog,
   KNOWN_BIAS_NOTE,
   OBSERVATION_TTL_MS,
+  OBSERVED_HISTORY_MAX,
+  projectBusy,
 } from '../src/admission.js';
 import { enqueue, tryStart } from '../src/scheduler.js';
+import { applyHeartbeatObservation } from '../src/supervisor.js';
 import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig } from '../src/config.js';
 import { writeLease, readLease, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths, atomicWriteJson } from '../src/state.js';
@@ -647,4 +650,77 @@ test('externalBusy: a STALE observation is not subtracted from hostBusyCores (sa
   const freshLeases = [{ weight: 2, observedCpuCores: 5, observedAt: now }];
   const fresh = evaluateCpuAdmission({ cpuSample, heldLeases: freshLeases, candidateWeight: 2, cpuGateState: { closed: false }, cooldownBlocked: false, cfg, now });
   assert.equal(fresh.externalBusy, 1, 'a fresh observation IS subtracted');
+});
+
+// BRAIN-354: settled demand
+const SD = { ...DEFAULT_GLOBAL_CONFIG };
+const SD_NOW = 1_000_000_000;
+function settledLease(obs, history, over = {}) {
+  return {
+    id: 'abcdef123456',
+    weight: 4,
+    admittedAt: SD_NOW - 300_000,
+    observedCpuCores: obs,
+    observedAt: SD_NOW,
+    observedCpuHistory: history.map(([agoMs, cores]) => ({ at: SD_NOW - agoMs, cores })),
+    ...over,
+  };
+}
+const steady = (c) => [[10_000, c], [5_000, c]];
+
+test('settled demand: 1.0 observed on a 4 booking is charged the floor (2.0)', () => {
+  assert.equal(leaseDemand(settledLease(1.0, steady(1.0)), SD_NOW, SD), 2);
+});
+test('settled demand: 3.6 observed is capped at the booking (4)', () => {
+  assert.equal(leaseDemand(settledLease(3.6, steady(3.6)), SD_NOW, SD), 4);
+});
+test('settled demand: 2.0 observed is charged peak x headroom (2.5)', () => {
+  assert.equal(leaseDemand(settledLease(2.0, steady(2.0)), SD_NOW, SD), 2.5);
+});
+test('settled demand: observed above the booking (5.0) is charged as observed', () => {
+  assert.equal(leaseDemand(settledLease(5.0, steady(5.0)), SD_NOW, SD), 5);
+});
+test('settled demand: unsettled (admitted 30 s ago) keeps the full booking', () => {
+  assert.equal(leaseDemand(settledLease(1.0, steady(1.0), { admittedAt: SD_NOW - 30_000 }), SD_NOW, SD), 4);
+});
+test('settled demand: a stale observation keeps the full booking', () => {
+  assert.equal(leaseDemand(settledLease(1.0, steady(1.0), { observedAt: SD_NOW - OBSERVATION_TTL_MS - 1 }), SD_NOW, SD), 4);
+});
+test('settled demand: a burst inside the window keeps the charge at peak x headroom, capped (4)', () => {
+  assert.equal(leaseDemand(settledLease(1.0, [[150_000, 1.0], [100_000, 3.8], [5_000, 1.0]]), SD_NOW, SD), 4);
+});
+test('settled demand: a burst older than the window drops out (floor)', () => {
+  assert.equal(leaseDemand(settledLease(1.0, [[200_000, 3.8], [10_000, 1.0], [5_000, 1.0]]), SD_NOW, SD), 2);
+});
+test('settled demand: a single in-window observation is not enough history', () => {
+  assert.equal(leaseDemand(settledLease(1.0, [[5_000, 1.0]]), SD_NOW, SD), 4);
+});
+test('settled demand: the disabled switch restores max(observed, booking)', () => {
+  assert.equal(leaseDemand(settledLease(1.0, steady(1.0)), SD_NOW, { ...SD, settledDemandEnabled: false }), 4);
+});
+test('settled demand: an old lease with no history (and no cfg) keeps the old behaviour', () => {
+  const { observedCpuHistory, ...old } = settledLease(1.0, []);
+  assert.equal(leaseDemand(old, SD_NOW, SD), 4);
+  assert.equal(leaseDemand(settledLease(1.0, steady(1.0)), SD_NOW), 4, 'no cfg means no settled charge');
+});
+test('settled demand: projectBusy and the admission log use the settled demand', () => {
+  const lease = settledLease(1.0, steady(1.0));
+  assert.equal(projectBusy(0, [lease], 1, SD_NOW, SD), 3);
+  const r = evaluateCpuAdmission({
+    cpuSample: { hostBusyCores: 1, cores: 8, stale: false },
+    heldLeases: [lease],
+    candidateWeight: 1,
+    cpuGateState: { closed: false },
+    cooldownBlocked: false,
+    cfg: SD,
+    now: SD_NOW,
+  });
+  assert.equal(r.projectedBusy, 3); // externalBusy 0 + settled 2 + candidate 1
+  assert.match(formatAdmissionLog({ candidateId: 'x', mode: 'active', leaseDemands: r.leaseDemands }), /leaseDemand=abcdef12:2\.00\(settled\)/);
+});
+test('applyHeartbeatObservation appends a bounded observation history', () => {
+  let lease = {};
+  for (let i = 0; i < OBSERVED_HISTORY_MAX + 10; i++) lease = applyHeartbeatObservation(lease, 1, i * 1000);
+  assert.equal(lease.observedCpuHistory.length, OBSERVED_HISTORY_MAX);
+  assert.deepEqual(lease.observedCpuHistory.at(-1), { at: (OBSERVED_HISTORY_MAX + 9) * 1000, cores: 1 });
 });

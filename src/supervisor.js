@@ -21,7 +21,7 @@ import { detectResourceCapacity, checkResourceBudget, localSimRefusal } from './
 import { selectRunner, dispatchRemote, needsProtocol2 } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { createAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
-import { writeBrokerLog } from './admission.js';
+import { writeBrokerLog, OBSERVED_HISTORY_MAX } from './admission.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
 const CANCEL_GRACE_MS = 10_000;
@@ -310,6 +310,8 @@ export function applyHeartbeatObservation(lease, observed, now = Date.now(), obs
   if (Number.isFinite(observed)) {
     update.observedCpuCores = observed;
     update.observedAt = now;
+    // BRAIN-354: bounded trailing history for admission's settled-demand peak.
+    update.observedCpuHistory = [...(Array.isArray(lease.observedCpuHistory) ? lease.observedCpuHistory : []), { at: now, cores: observed }].slice(-OBSERVED_HISTORY_MAX);
   }
   if (Number.isFinite(observedMemoryBytes)) {
     update.observedMemoryBytes = observedMemoryBytes;
