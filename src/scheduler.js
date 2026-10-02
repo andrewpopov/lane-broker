@@ -678,8 +678,21 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     const resourceRecord = headConflicted ? null : resourceRecordFor(root, cfg, headTicket.id);
     const capacityReserved = headCapacityBlocked && resourceReserved(resourceRecord);
     const resourceBackfill = !headConflicted && !headCapacityBlocked && resourceBackfillOpen(resourceRecord, cfg);
+    // BRAIN-355: an exhausted conflict-blocked head still admits a ticket that provably cannot
+    // delay it. The ticket polling decides for itself (admission below reserves the head's
+    // resources); it is never counted as a skip.
+    const safeBackfill =
+      skipExhausted &&
+      cfg.conflictSafeBackfill &&
+      ticket.id !== headTicket.id &&
+      // an unreadable (null) ticket ahead of this one stops backfill, as it stops every selector's walk
+      queue.slice(0, position).every(Boolean) &&
+      !blockedBy(held, ticket) &&
+      !blockedBy([{ key: ticket.key }], headTicket) &&
+      !blockedBy([{ key: headTicket.key }], ticket) &&
+      runningWeight + headTicket.weight + ticket.weight <= weightCapacity;
     const candidate = headConflicted
-      ? (skipExhausted ? null : selectCandidate(queue, held))
+      ? (skipExhausted ? (safeBackfill ? ticket : null) : selectCandidate(queue, held))
       : headCapacityBlocked
         ? (capacitySkipExhausted || capacityReserved ? null : selectCapacityCandidate(queue, held, runningWeight, weightCapacity))
         : resourceBackfill && ticket.id !== headTicket.id
@@ -747,7 +760,10 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     } catch {
       memInfo = null;
     }
-    const cpuDecision = evaluateNewAdmission(root, cfg, ticket, held, cpuSample, memInfo);
+    // BRAIN-355: a safe backfill must leave room for the blocked head once its conflict clears, so
+    // the head's claim joins the held leases for the CPU projection and memory admission.
+    const headReservation = { id: headTicket.id, key: headTicket.key, weight: headTicket.weight, resources: headTicket.resources };
+    const cpuDecision = evaluateNewAdmission(root, cfg, ticket, safeBackfill ? [...held, headReservation] : held, cpuSample, memInfo);
     // BRAIN-207: when admissionLoadGate is false the gate is sampled and
     // logged exactly as before (its hysteresis countdown must not stall for
     // want of observation), but it is never allowed to deny — for an idle
@@ -846,7 +862,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       };
     }
     let recorded = null;
-    if (ticket.id !== headTicket.id && headConflicted) {
+    if (ticket.id !== headTicket.id && headConflicted && !safeBackfill) {
       // This ticket is genuinely skipping ahead of the still-blocked head —
       // count it toward conflictSkipLimit above. Fail CLOSED: if the count
       // can't be durably recorded, refuse the skip rather than let it
@@ -915,6 +931,19 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       state: LEASE_STATE.RUNNING,
     };
     writeLease(root, lease);
+    if (safeBackfill) {
+      logHeadBlock(root, {
+        event: 'safe-backfill',
+        headId: headTicket.id,
+        candidateId: ticket.id,
+        blockingLeaseId: blocker.id,
+        blockingKey: blocker.key,
+        skipCount,
+        skipLimit: cfg.conflictSkipLimit,
+        graceMs: cfg.headBlockGraceMs,
+        blockedMs: headBlock.blockedMs,
+      });
+    }
     const events = [];
     if (recorded) {
       events.push(['resource-backfill-start', { skipPast: headTicket.id, count: recorded.count }]);

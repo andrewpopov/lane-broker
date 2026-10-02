@@ -474,6 +474,7 @@ export function formatHeadBlockLog(f) {
     'lane-broker-head-block',
     `event=${f.event}`,
     `headId=${f.headId}`,
+    ...(f.candidateId ? [`candidate=${f.candidateId}`] : []),
     `blockingLease=${f.blockingLeaseId}`,
     `blockingKey=${f.blockingKey}`,
     `skip=${f.skipCount}/${f.skipLimit}`,

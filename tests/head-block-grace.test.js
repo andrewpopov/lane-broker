@@ -30,6 +30,7 @@ function baseCfg(overrides = {}) {
     loadClose: 1000,
     loadOpen: 900,
     loadOpenSamples: 1,
+    conflictSafeBackfill: false, // pins the BRAIN-249 refusal; BRAIN-355 is in conflict-safe-backfill.test.js
     ...overrides,
   };
 }

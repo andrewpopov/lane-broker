@@ -57,6 +57,12 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // timer. This only changes who else is allowed to start; it never touches
   // the lease already holding the key.
   headBlockGraceMs: 600_000,
+  // BRAIN-355: once a conflict-blocked head has used its skip allowance, still
+  // start a later ticket that cannot delay it -- one that conflicts with the
+  // head in neither direction and fits capacity, projected CPU and memory
+  // together with the head's own claim. Such a start is not counted as a skip.
+  // false restores the BRAIN-249 refusal of all backfill for headBlockGraceMs.
+  conflictSafeBackfill: true,
   // BRAIN-346: how many tickets may start behind a FIFO head denied only by
   // projected-over-budget CPU before the head is reserved (nothing else is
   // admitted past it). 0 restores strict FIFO for resource denials.
@@ -162,6 +168,7 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isInteger(cfg.headBlockGraceMs) && cfg.headBlockGraceMs >= 0,
     `${sourcePath}: "headBlockGraceMs" must be a non-negative integer`,
   );
+  assert(typeof cfg.conflictSafeBackfill === 'boolean', `${sourcePath}: "conflictSafeBackfill" must be a boolean`);
   assert(
     Number.isInteger(cfg.resourceSkipLimit) && cfg.resourceSkipLimit >= 0,
     `${sourcePath}: "resourceSkipLimit" must be a non-negative integer`,

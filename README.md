@@ -426,7 +426,13 @@ ending in strict FIFO for that head once spent:
 - *Conflict* (`conflictSkipLimit`, default 3): a head blocked by a lane-key
   conflict is skipped for the first non-conflicting ticket. Once the allowance
   is used, backfill is refused for `headBlockGraceMs` (default 10 minutes) and
-  then resumes, so a multi-hour lease cannot stall everyone behind it.
+  then resumes, so a multi-hour lease cannot stall everyone behind it. Except
+  (`conflictSafeBackfill`, default `true`; BRAIN-355) a ticket that cannot delay
+  the head still starts during that refusal: it conflicts with the head in
+  neither direction (`*` included) and fits weight capacity, projected CPU and
+  memory together with the head's own claim reserved. It is not counted as a
+  skip and is logged as `lane-broker-head-block event=safe-backfill`. `false`
+  restores the plain refusal.
 - *Capacity* (same `conflictSkipLimit`, counted separately): a head that does
   not fit the weight capacity is skipped for a ticket that does. No time-based
   resume: refusal is self-terminating because running work drains.
