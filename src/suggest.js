@@ -3,7 +3,7 @@ import { ensureStateDirs, paths } from './state.js';
 
 /**
  * BRAIN-361 `lane suggest`: from history.jsonl, compare each lane's DECLARED cpuCores with the
- * peak cores its finished runs actually used. Read-only; never edits config.
+ * SUSTAINED cores (per-run time-weighted mean) its finished runs actually used; peak is shown, never sized from. Read-only; never edits config.
  */
 
 export const MIN_RUNS = 5;
@@ -44,7 +44,7 @@ export function buildSuggestions(rows, { repo, days = 7, now = Date.now() } = {}
     if (!row || typeof row !== 'object' || (repo && row.repo !== repo) || !row.lane) continue;
     if (Number.isFinite(row.endedAt) && row.endedAt < since) continue;
     if (!Number.isFinite(row.startedAt)) continue; // never ran (refusal, queue timeout)
-    if (!Number.isFinite(row.observedCpu?.peak)) {
+    if (!Number.isFinite(row.observedCpu?.peak) || !Number.isFinite(row.observedCpu?.mean)) {
       skippedNoObservation += 1;
       continue;
     }
@@ -78,17 +78,19 @@ export function buildSuggestions(rows, { repo, days = 7, now = Date.now() } = {}
       tooFewRuns.push({ repo: g.repo, lane: g.lane, runs: g.rows.length });
       continue;
     }
-    const peaks = g.rows.map((r) => r.observedCpu.peak).sort((a, b) => a - b);
+    const asc = (key) => g.rows.map((r) => r.observedCpu[key]).sort((a, b) => a - b);
+    const means = asc('mean');
+    const peaks = asc('peak');
     // the bucket's rows are in lane order, not time order: the declaration is the NEWEST row's
     const newest = g.rows.reduce((a, r) => (rowTime(r) >= rowTime(a) ? r : a));
     const declared = newest.resources?.cpuCores ?? newest.weight;
-    // The label is judged on the raw ceil(p90 peak); the reported suggestion is floored at 1 whole core
+    // The label is judged on the raw ceil(p90 mean); the reported suggestion is floored at 1 whole core
     // (config accepts any positive cpuCores, so a fractional booking like 0.5 is legal but not worth suggesting).
-    const needed = Math.ceil(percentile(peaks, 0.9));
+    const needed = Math.ceil(percentile(means, 0.9));
     const suggested = Math.max(1, needed);
     const verdict = needed > declared ? 'under-booked' : needed <= OVERBOOKED_FRACTION * declared ? 'over-booked' : 'ok';
     const foldedLaneNames = new Set(g.rows.map((r) => r.lane).filter((l) => l !== g.lane)).size;
-    groups.push({ repo: g.repo, lane: g.lane, grouping: g.grouping, runs: peaks.length, foldedLaneNames, declaredCpuCores: declared, p50Peak: percentile(peaks, 0.5), p90Peak: percentile(peaks, 0.9), suggestedCpuCores: suggested, verdict });
+    groups.push({ repo: g.repo, lane: g.lane, grouping: g.grouping, runs: means.length, foldedLaneNames, declaredCpuCores: declared, meanP50: percentile(means, 0.5), meanP90: percentile(means, 0.9), p50Peak: percentile(peaks, 0.5), p90Peak: percentile(peaks, 0.9), suggestedCpuCores: suggested, verdict });
   }
   const order = { 'under-booked': 0, 'over-booked': 1, ok: 2 };
   groups.sort((a, b) => order[a.verdict] - order[b.verdict] || a.repo.localeCompare(b.repo) || a.lane.localeCompare(b.lane));
@@ -96,12 +98,12 @@ export function buildSuggestions(rows, { repo, days = 7, now = Date.now() } = {}
 }
 
 export function renderSuggestText(report) {
-  const lines = [`lane suggest: last ${report.days}d, groups with >= ${report.minRuns} observed runs (suggested = ceil(p90 peak))`];
+  const lines = [`lane suggest: last ${report.days}d, groups with >= ${report.minRuns} observed runs (suggested = ceil(p90 mean); peak is informational)`];
   if (report.groups.length === 0) lines.push('  (no lane has enough observed runs yet)');
   for (const g of report.groups) {
     const note = g.verdict === 'under-booked' ? '  UNDER-BOOKED' : g.verdict === 'over-booked' ? '  over-booked (wastes capacity)' : '';
     lines.push(
-      `  ${g.repo}:${g.lane}  runs=${g.runs}${g.foldedLaneNames > 0 ? ` (${g.foldedLaneNames} ad-hoc lane names folded)` : ''}  declared=${g.declaredCpuCores}  p50-peak=${g.p50Peak}  p90-peak=${g.p90Peak}  suggested=${g.suggestedCpuCores}${note}`,
+      `  ${g.repo}:${g.lane}  runs=${g.runs}${g.foldedLaneNames > 0 ? ` (${g.foldedLaneNames} ad-hoc lane names folded)` : ''}  declared=${g.declaredCpuCores}  mean p50/p90=${g.meanP50}/${g.meanP90}  peak p50/p90=${g.p50Peak}/${g.p90Peak}  suggested=${g.suggestedCpuCores}${note}`,
     );
   }
   lines.push(`skipped: ${report.skippedNoObservation} finished run(s) without observedCpu; ${report.tooFewRuns.length} lane(s) with < ${report.minRuns} observed runs`);
