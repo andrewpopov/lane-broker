@@ -22,7 +22,7 @@ import { selectRunner, dispatchRemote, needsProtocol2 } from './remote-client.js
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { createAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX } from './admission.js';
-import { foldObservedCpu, summarizeObservedCpu, exceedsBooking } from './observed.js';
+import { observedLeaseFields, summarizeObservedCpu, sanitizeObservedCpu, sanitizeRssPeak } from './observed.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
 const CANCEL_GRACE_MS = 10_000;
@@ -306,30 +306,30 @@ export function childEnv(ticket, baseEnv = process.env, grantedCpuCores = ticket
   return env;
 }
 
-export function applyHeartbeatObservation(lease, observed, now = Date.now(), observedMemoryBytes = null) {
+export function applyHeartbeatObservation(lease, observed, now = Date.now(), observedMemoryBytes = null, maxGapMs) {
   const update = { ...lease, heartbeatAt: now };
   if (Number.isFinite(observed)) {
     update.observedCpuCores = observed;
     update.observedAt = now;
     // BRAIN-354: bounded trailing history for admission's settled-demand peak.
     update.observedCpuHistory = [...(Array.isArray(lease.observedCpuHistory) ? lease.observedCpuHistory : []), { at: now, cores: observed }].slice(-OBSERVED_HISTORY_MAX);
-    // BRAIN-361: whole-run stats for the history row, and the continuous-overrun anchor for `lane status`.
-    update.observedCpuStats = foldObservedCpu(lease.observedCpuStats, observed, now);
-    if (exceedsBooking(lease, observed)) {
-      const continuing = Number.isFinite(lease.overrunSince);
-      update.overrunSince = continuing ? lease.overrunSince : now;
-      update.overrunPeak = Math.max(continuing ? lease.overrunPeak ?? 0 : 0, observed);
-    } else {
-      delete update.overrunSince;
-      delete update.overrunPeak;
-    }
   }
   if (Number.isFinite(observedMemoryBytes)) {
     update.observedMemoryBytes = observedMemoryBytes;
     update.observedAt = now;
-    update.observedRssPeakBytes = Math.max(Number.isFinite(lease.observedRssPeakBytes) ? lease.observedRssPeakBytes : 0, observedMemoryBytes);
   }
+  // BRAIN-361: report-only usage telemetry, isolated so it can never cost the lease its heartbeat.
+  const { fields, drop } = observedLeaseFields(lease, observed, observedMemoryBytes, now, maxGapMs);
+  for (const key of drop) delete update[key];
+  Object.assign(update, fields);
   return update;
+}
+
+/** BRAIN-361: a runner's usage fields, each kept only when well-formed; a malformed one is dropped, never thrown on. */
+function relayedUsage(result) {
+  const observedCpu = sanitizeObservedCpu(result?.observedCpu);
+  const rssPeak = sanitizeRssPeak(result?.observedRssPeakBytes);
+  return { ...(observedCpu ? { observedCpu } : {}), ...(rssPeak !== undefined ? { observedRssPeakBytes: rssPeak } : {}) };
 }
 
 /** The exact "requested resources exceed this environment's budget" (checkResourceBudget) or
@@ -598,8 +598,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
       runner: runner.name,
       ...(queuedAt ? { queuedAt } : {}),
       ...(Number.isFinite(dispatch.result.grantedCpuCores) ? { grantedCpuCores: dispatch.result.grantedCpuCores } : {}),
-      ...(Number.isFinite(dispatch.result.observedCpu?.peak) ? { observedCpu: dispatch.result.observedCpu } : {}),
-      ...(Number.isFinite(dispatch.result.observedRssPeakBytes) ? { observedRssPeakBytes: dispatch.result.observedRssPeakBytes } : {}),
+      ...relayedUsage(dispatch.result),
       remoteKind: dispatch.result.kind,
       remotePhase: dispatch.phase ?? null,
       startedAt: remoteWaitedMs === null ? attemptStartedAt : enriched.createdAt + remoteWaitedMs,
@@ -863,12 +862,17 @@ async function main() {
 
   const heartbeat = setInterval(() => {
     if (finished) return;
-    const lease = readLease(root, ticket.id);
-    if (lease) {
-      const tree = observeLeaseTree(child.pid, otherLeaseStops(root, ticket.id));
-      const observed = tree?.cores ?? null;
-      const observedMemory = tree?.memoryBytes ?? null;
-      writeLease(root, applyHeartbeatObservation(lease, observed, Date.now(), observedMemory));
+    try {
+      const lease = readLease(root, ticket.id);
+      if (lease) {
+        const tree = observeLeaseTree(child.pid, otherLeaseStops(root, ticket.id));
+        const observed = tree?.cores ?? null;
+        const observedMemory = tree?.memoryBytes ?? null;
+        // a gap of more than two heartbeats between good readings ends an overrun streak
+        writeLease(root, applyHeartbeatObservation(lease, observed, Date.now(), observedMemory, 2 * globalCfg.sampleMs));
+      }
+    } catch {
+      // observation is telemetry: nothing in it may take the supervisor down while its child runs
     }
     // Codex pre-merge BLOCKER #1: the marker must survive until AFTER the
     // terminal write below decides on it -- clearing it here (as this used
@@ -931,7 +935,8 @@ async function main() {
       const finalLease = readLease(root, ticket.id);
       const observedCpu = summarizeObservedCpu(finalLease?.observedCpuStats);
       if (observedCpu) finalResult = { ...finalResult, observedCpu };
-      if (Number.isFinite(finalLease?.observedRssPeakBytes)) finalResult = { ...finalResult, observedRssPeakBytes: finalLease.observedRssPeakBytes };
+      const rssPeak = sanitizeRssPeak(finalLease?.observedRssPeakBytes);
+      if (rssPeak !== undefined) finalResult = { ...finalResult, observedRssPeakBytes: rssPeak };
       atomicWriteJson(ticket.resultPath, finalResult);
       appendHistory(root, historyRow(ticket, finalResult, { fallbackReason }));
       removeLease(root, ticket.id); // release always comes last

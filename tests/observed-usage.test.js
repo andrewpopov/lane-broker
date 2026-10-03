@@ -11,7 +11,7 @@ import { writeLease, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths } from '../src/state.js';
 import { applyHeartbeatObservation } from '../src/supervisor.js';
 import { leaseDemand, projectBusy } from '../src/admission.js';
-import { foldObservedCpu, summarizeObservedCpu, leaseOverrun, OVERRUN_MIN_MS } from '../src/observed.js';
+import { foldObservedCpu, summarizeObservedCpu, sanitizeObservedCpu, sanitizeRssPeak, leaseOverrun, OVERRUN_MIN_MS } from '../src/observed.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
 import { buildSuggestions, renderSuggestText } from '../src/suggest.js';
 
@@ -81,11 +81,65 @@ test('an elastic lease is judged against its GRANT, not its declaration', () => 
   assert.equal(leaseOverrun(replay(lease4(), every10s(0, 2 * MIN, 3.5))), null, 'the same load on a 4-core booking is fine');
 });
 
-test('a failed probe (null reading) neither starts nor clears an overrun', () => {
-  const over = replay(lease4(), every10s(0, 60_000, 6));
-  const probeFailed = applyHeartbeatObservation(over, null, 1_000_000 + 70_000);
-  assert.equal(probeFailed.overrunSince, over.overrunSince);
+test('a failed probe resets the overrun streak: no instant 10-minute overrun after a gap', () => {
+  const t0 = 1_000_000;
+  const over = replay(lease4(), every10s(0, 60_000, 6), t0);
+  assert.ok(Number.isFinite(over.overrunSince));
+  const probeFailed = applyHeartbeatObservation(over, null, t0 + 70_000);
+  assert.equal('overrunSince' in probeFailed, false);
+  const later = applyHeartbeatObservation(probeFailed, 6, t0 + 10 * MIN);
+  assert.equal(leaseOverrun(later), null, 'one reading 10 minutes later is a new streak of length 0');
   assert.equal(OVERRUN_MIN_MS, 2 * MIN);
+});
+
+test('a gap of more than two heartbeats between good readings also resets the streak (stalled heartbeat, clock jump)', () => {
+  const t0 = 1_000_000;
+  const over = replay(lease4(), every10s(0, 60_000, 6), t0);
+  const gap = applyHeartbeatObservation(over, 6, t0 + 10 * MIN, null, 10_000);
+  assert.equal(gap.overrunSince, t0 + 10 * MIN, 'streak restarts at the new reading');
+  assert.equal(leaseOverrun(gap), null);
+  const bridged = applyHeartbeatObservation(over, 6, t0 + 60_000 + 10_000, null, 10_000);
+  assert.equal(bridged.overrunSince, over.overrunSince, 'a normal 2-heartbeat gap keeps the streak');
+});
+
+test('malformed persisted stats never throw out of the heartbeat step; they are discarded and restarted', () => {
+  const evil = { valueOf: 0, toString: 0 };
+  const bad = [
+    { peak: evil, area: 0, spanMs: 0, samples: 1, lastAt: 5, lastCores: 1 },
+    { peak: 1, area: '0', spanMs: 0, samples: 1, lastAt: 5, lastCores: 1 },
+    { peak: 1, area: 0, spanMs: 0, samples: evil, lastAt: 5, lastCores: 1 },
+    { peak: 1, area: 0, spanMs: 0, samples: 1, lastAt: 5, lastCores: null },
+    'garbage',
+    [],
+  ];
+  for (const stats of bad) {
+    const l = applyHeartbeatObservation({ ...lease4(), observedCpuStats: stats, overrunSince: evil, overrunPeak: evil, observedRssPeakBytes: evil }, 2, 1_000_000, GIB);
+    assert.deepEqual(summarizeObservedCpu(l.observedCpuStats), { peak: 2, mean: 2, samples: 1 }, JSON.stringify(stats));
+    assert.equal(l.observedRssPeakBytes, GIB);
+    assert.equal(l.heartbeatAt, 1_000_000, 'the heartbeat itself always advances');
+  }
+  assert.equal(summarizeObservedCpu({ peak: evil, area: 0, spanMs: 0, samples: 1, lastAt: 1, lastCores: 1 }), null);
+  // a lease whose resources are hostile must not throw either
+  const hostile = applyHeartbeatObservation({ id: 'x', resources: { cpuCores: evil }, grantedCpuCores: evil, observedCpuStats: bad[0] }, 3, 5);
+  assert.equal(hostile.heartbeatAt, 5);
+});
+
+test('relayed usage is validated at both remote sites: malformed fields are dropped, well-formed ones kept', () => {
+  assert.deepEqual(sanitizeObservedCpu({ peak: 2, mean: 1, samples: 4, extra: 'x' }), { peak: 2, mean: 1, samples: 4 });
+  for (const o of [null, 'x', { peak: 2 }, { peak: 2, mean: '1', samples: 4 }, { peak: { valueOf: 0 }, mean: 1, samples: 1 }, { peak: 1, mean: NaN, samples: 1 }]) {
+    assert.equal(sanitizeObservedCpu(o), null, JSON.stringify(o));
+  }
+  assert.equal(sanitizeRssPeak('7'), undefined);
+  assert.equal(sanitizeRssPeak(7), 7);
+});
+
+test('a backward clock jump never rewinds lastAt, so no interval is counted twice', () => {
+  let s;
+  for (const at of [1000, 2000, 1000, 2000]) s = foldObservedCpu(s, 1, at);
+  assert.equal(s.spanMs, 1000, 'span is 1000..2000 once, not 2000');
+  assert.equal(s.lastAt, 2000);
+  assert.equal(s.samples, 4);
+  assert.equal(summarizeObservedCpu(s).mean, 1);
 });
 
 test('REPORT-ONLY: an overrunning lease changes no admission decision', async () => {
@@ -264,6 +318,44 @@ test('configLane is recorded on a history row only for an ad-hoc lane inheriting
   const byLane = Object.fromEntries(rows.map((r) => [r.lane, r]));
   assert.equal(byLane.zirk812.configLane, 'default');
   assert.equal('configLane' in byLane.default, false, 'a declared lane row stays byte-identical');
+});
+
+test('suggest: the declaration is the NEWEST row by time, even when ad-hoc rows interleave with the template', () => {
+  const at = (i) => ({ startedAt: NOW - (100 - i) * 60_000, endedAt: NOW - (100 - i) * 60_000 + 1000 });
+  const rows = [
+    row('default', 2, { declared: 4, extra: at(1) }),
+    row('zirk1', 2, { declared: 4, extra: { ...at(2), configLane: 'default' } }),
+    row('default', 2, { declared: 8, extra: at(3) }),
+    row('default', 2, { declared: 8, extra: at(4) }),
+    row('default', 2, { declared: 8, extra: at(5) }),
+  ];
+  // lane-order grouping puts the three declared-lane rows after the ad-hoc one; the old code read the last of those
+  const report = buildSuggestions([rows[0], rows[2], rows[3], rows[4], rows[1]], { days: 7, now: NOW });
+  assert.equal(report.groups[0].declaredCpuCores, 8);
+  assert.equal(buildSuggestions(rows, { days: 7, now: NOW }).groups[0].declaredCpuCores, 8);
+});
+
+test('suggest: the suggestion is floored at 1 core but the label uses the unclamped ceil(p90 peak)', () => {
+  const idle = buildSuggestions(many('idle', [0, 0, 0, 0, 0], { declared: 0.5 }), { days: 7, now: NOW }).groups[0];
+  assert.equal(idle.suggestedCpuCores, 1);
+  assert.notEqual(idle.verdict, 'under-booked', 'an idle lane booked at 0.5 is not under-booked');
+  assert.equal(idle.verdict, 'over-booked');
+  const busy = buildSuggestions(many('busy', [0.2, 0.2, 0.2, 0.2, 0.2], { declared: 0.5 }), { days: 7, now: NOW }).groups[0];
+  assert.equal(busy.suggestedCpuCores, 1);
+  assert.equal(busy.verdict, 'under-booked', 'ceil(0.2) = 1 > 0.5 is genuinely under-booked');
+});
+
+test('suggest: the resources fallback never pools rows whose memory or minCpuCores differ', () => {
+  const legacy = (lane, resources) => ({ ...row(lane, 3, { declared: 2 }), resources });
+  const sig = (memoryBytes, minCpuCores) => ({ cpuCores: 2, memoryBytes, ...(minCpuCores ? { minCpuCores } : {}) });
+  const rows = [
+    ...Array.from({ length: 5 }, (_, i) => legacy(`a${i}`, sig(GIB))),
+    ...Array.from({ length: 5 }, (_, i) => legacy(`b${i}`, sig(2 * GIB))),
+    ...Array.from({ length: 5 }, (_, i) => legacy(`c${i}`, sig(GIB, 1))),
+  ];
+  const report = buildSuggestions(rows, { days: 7, now: NOW });
+  assert.deepEqual(report.groups.map((g) => [g.lane, g.runs]), [['(by resources)', 5], ['(by resources)', 5], ['(by resources)', 5]], 'three signatures, three groups, none merged into 15');
+  assert.equal(report.tooFewRuns.length, 0);
 });
 
 test('lane suggest CLI: reads history.jsonl, --json shape, --repo / --days', () => {

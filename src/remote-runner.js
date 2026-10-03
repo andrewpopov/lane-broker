@@ -15,6 +15,7 @@ import { collectStatus } from './status.js';
 import { readLease, isSupervisorAlive } from './lease.js';
 import { readAttempt } from './attempts.js';
 import { listQueue } from './scheduler.js';
+import { sanitizeObservedCpu, sanitizeRssPeak } from './observed.js';
 
 // BRAIN-320 S1b (1b): the absolute path to `bin/lane.js`, so a protocol-2
 // pipeline's argv (`[node, lane.js, 'remote-pipeline', ticketDir]`) is
@@ -472,8 +473,8 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     exit = structured.exit;
     signal = structured.signal;
     if (Number.isFinite(structured.grantedCpuCores)) grantedCpuCores = structured.grantedCpuCores;
-    if (Number.isFinite(structured.observedCpu?.peak)) observedCpu = structured.observedCpu;
-    if (Number.isFinite(structured.observedRssPeakBytes)) observedRssPeakBytes = structured.observedRssPeakBytes;
+    observedCpu = sanitizeObservedCpu(structured.observedCpu) ?? undefined;
+    observedRssPeakBytes = sanitizeRssPeak(structured.observedRssPeakBytes);
     if (Number.isFinite(structured.startedAt) && Number.isFinite(structured.endedAt)) {
       runMs = Math.max(0, structured.endedAt - structured.startedAt);
     }

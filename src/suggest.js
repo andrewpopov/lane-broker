@@ -9,6 +9,8 @@ import { ensureStateDirs, paths } from './state.js';
 export const MIN_RUNS = 5;
 export const OVERBOOKED_FRACTION = 0.5;
 
+const rowTime = (r) => (Number.isFinite(r.endedAt) ? r.endedAt : r.startedAt);
+
 /** Nearest-rank percentile of an ascending-sorted array. */
 function percentile(sorted, p) {
   return sorted[Math.max(0, Math.ceil(p * sorted.length) - 1)];
@@ -77,9 +79,14 @@ export function buildSuggestions(rows, { repo, days = 7, now = Date.now() } = {}
       continue;
     }
     const peaks = g.rows.map((r) => r.observedCpu.peak).sort((a, b) => a - b);
-    const declared = g.rows.at(-1).resources?.cpuCores ?? g.rows.at(-1).weight;
-    const suggested = Math.max(1, Math.ceil(percentile(peaks, 0.9)));
-    const verdict = suggested > declared ? 'under-booked' : suggested <= OVERBOOKED_FRACTION * declared ? 'over-booked' : 'ok';
+    // the bucket's rows are in lane order, not time order: the declaration is the NEWEST row's
+    const newest = g.rows.reduce((a, r) => (rowTime(r) >= rowTime(a) ? r : a));
+    const declared = newest.resources?.cpuCores ?? newest.weight;
+    // The label is judged on the raw ceil(p90 peak); the reported suggestion is floored at 1 whole core
+    // (config accepts any positive cpuCores, so a fractional booking like 0.5 is legal but not worth suggesting).
+    const needed = Math.ceil(percentile(peaks, 0.9));
+    const suggested = Math.max(1, needed);
+    const verdict = needed > declared ? 'under-booked' : needed <= OVERBOOKED_FRACTION * declared ? 'over-booked' : 'ok';
     const foldedLaneNames = new Set(g.rows.map((r) => r.lane).filter((l) => l !== g.lane)).size;
     groups.push({ repo: g.repo, lane: g.lane, grouping: g.grouping, runs: peaks.length, foldedLaneNames, declaredCpuCores: declared, p50Peak: percentile(peaks, 0.5), p90Peak: percentile(peaks, 0.9), suggestedCpuCores: suggested, verdict });
   }
