@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { runCommand } from '../src/run.js';
 import { statusCommand } from '../src/status.js';
+import { suggestCommand } from '../src/suggest.js';
 import { cancelCommand } from '../src/cancel.js';
 import { waitCommand } from '../src/wait.js';
 import { pauseCommand, resumeCommand } from '../src/pause.js';
@@ -19,6 +20,7 @@ function usage() {
   lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--detach]
            [--timeout <duration>] [--allow-local-sim] [--local] [--log <path>] -- <command...>
   lane status [--json]
+  lane suggest [--repo <name>] [--days <n>] [--json]
   lane cancel <id>
   lane wait <id> [--timeout <duration>]
   lane pause ["reason"]
@@ -137,6 +139,16 @@ async function main() {
     case 'status': {
       const json = rest.includes('--json');
       const result = await statusCommand({ json });
+      return result.exitCode;
+    }
+    case 'suggest': {
+      const flag = (name) => (rest.indexOf(name) === -1 ? undefined : rest[rest.indexOf(name) + 1]);
+      const days = flag('--days') === undefined ? 7 : Number(flag('--days'));
+      if (!(days > 0)) {
+        process.stderr.write('lane suggest: --days must be a positive number\n');
+        return 2;
+      }
+      const result = await suggestCommand({ repo: flag('--repo'), days, json: rest.includes('--json') });
       return result.exitCode;
     }
     case 'cancel': {

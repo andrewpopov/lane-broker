@@ -336,6 +336,7 @@ export async function runCommand({
     key: resolved.key,
     repoId: resolved.repoId,
     lane: resolved.lane,
+    ...(resolved.configLane ? { configLane: resolved.configLane } : {}),
     weight,
     resources,
     nice,

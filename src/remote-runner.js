@@ -15,6 +15,7 @@ import { collectStatus } from './status.js';
 import { readLease, isSupervisorAlive } from './lease.js';
 import { readAttempt } from './attempts.js';
 import { listQueue } from './scheduler.js';
+import { sanitizeObservedCpu, sanitizeRssPeak } from './observed.js';
 
 // BRAIN-320 S1b (1b): the absolute path to `bin/lane.js`, so a protocol-2
 // pipeline's argv (`[node, lane.js, 'remote-pipeline', ticketDir]`) is
@@ -173,7 +174,7 @@ function readPhase(ticketDir) {
   }
 }
 
-function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, runMs, grantedCpuCores }) {
+function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, runMs, grantedCpuCores, observedCpu, observedRssPeakBytes }) {
   const isProtocol2 = header.protocol === 2;
   return {
     protocol: isProtocol2 ? 2 : 1,
@@ -196,6 +197,9 @@ function buildResult(header, ticketDir, { kind, exit = null, signal = null, remo
     runMs,
     // BRAIN-360: additive; only an elastic lane's runner-side grant (an old submitter ignores it)
     grantedCpuCores,
+    // BRAIN-361: additive; what the lane actually used on the runner, relayed to the submitter's history
+    observedCpu,
+    observedRssPeakBytes,
   };
 }
 
@@ -453,6 +457,8 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   let reason = null;
   let runMs;
   let grantedCpuCores;
+  let observedCpu;
+  let observedRssPeakBytes;
   // A user cancel that landed after the expiry still wins (kind cancelled below).
   if (structured && structured.reason === 'queue-timeout' && !cancelled) {
     // BRAIN-320 S1d: the LOCAL broker's own scheduler expired this ticket
@@ -467,6 +473,8 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     exit = structured.exit;
     signal = structured.signal;
     if (Number.isFinite(structured.grantedCpuCores)) grantedCpuCores = structured.grantedCpuCores;
+    observedCpu = sanitizeObservedCpu(structured.observedCpu) ?? undefined;
+    observedRssPeakBytes = sanitizeRssPeak(structured.observedRssPeakBytes);
     if (Number.isFinite(structured.startedAt) && Number.isFinite(structured.endedAt)) {
       runMs = Math.max(0, structured.endedAt - structured.startedAt);
     }
@@ -485,7 +493,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     kind = 'unfinished';
   }
 
-  writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, runMs, grantedCpuCores }));
+  writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, runMs, grantedCpuCores, observedCpu, observedRssPeakBytes }));
   cleanupWork(workDir);
   return { exitCode: 0 };
 }
