@@ -411,6 +411,7 @@ export function readResourceSkipState(root) {
     count: raw.count,
     reserved: raw.reserved,
     inScope: raw.inScope === true,
+    behindConflict: raw.behindConflict === true,
     deniedAt: raw.deniedAt,
     budget: raw.budget,
     externalBusy: raw.externalBusy,
@@ -419,10 +420,10 @@ export function readResourceSkipState(root) {
 
 /** The record for exactly this head, or null: resource backfill is active-mode only, off at
  *  resourceSkipLimit 0, and a record left by any other head is never consulted. */
-function resourceRecordFor(root, cfg, headId) {
+function resourceRecordFor(root, cfg, headId, behindConflict = false) {
   if (cfg.schedulerMode !== 'active' || !(cfg.resourceSkipLimit > 0)) return null;
   const record = readResourceSkipState(root);
-  return record && record.headId === headId ? record : null;
+  return record && record.headId === headId && record.behindConflict === behindConflict ? record : null;
 }
 
 const resourceBackfillOpen = (record, cfg) => record !== null && record.inScope && !record.reserved && record.count < cfg.resourceSkipLimit;
@@ -430,8 +431,10 @@ const resourceReserved = (record) => record !== null && record.reserved;
 
 /** The head's own in-scope denial (projected-over-budget, memory ok): create the record for a new
  *  head, or refresh the budget/externalBusy snapshot while carrying count/reserved forward for
- *  the same head. Best-effort: a failed write leaves the old record (or none), never an allowance. */
-function recordResourceDenial(root, cfg, headId, cpuDecision, now, write) {
+ *  the same head. Best-effort: a failed write leaves the old record (or none), never an allowance.
+ *  `behindConflict` (BRAIN-365) marks the snapshot as a conflict-backfill candidate's denial, not
+ *  the head's: only a conflicted head reads it, and the head's own next denial overwrites it. */
+function recordResourceDenial(root, cfg, headId, cpuDecision, now, write, behindConflict = false) {
   if (!(cfg.resourceSkipLimit > 0)) return;
   const prev = readResourceSkipState(root);
   const same = prev !== null && prev.headId === headId;
@@ -441,6 +444,7 @@ function recordResourceDenial(root, cfg, headId, cpuDecision, now, write) {
       count: same ? prev.count : 0,
       reserved: same ? prev.reserved : false,
       inScope: true,
+      ...(behindConflict ? { behindConflict } : {}),
       deniedAt: now,
       budget: cpuDecision.budget,
       externalBusy: cpuDecision.externalBusy,
@@ -483,6 +487,13 @@ function clearResourceSkipState(root) {
   }
 }
 
+/** The smallest CPU claim a ticket can be admitted at: its estimate, or for an elastic ticket its floor. */
+function ticketCpuFloor(ticket, cfg) {
+  const estimate = ticketCpuEstimate(ticket, cfg);
+  const min = ticket.resources?.minCpuCores;
+  return Number.isFinite(min) ? Math.min(estimate, Math.ceil(min)) : estimate;
+}
+
 /**
  * BRAIN-346: pick the backfill ticket behind a head denied projected-over-budget. Walks the queue
  * like selectCapacityCandidate (a null record stops the walk; conflicting or weight-overflowing
@@ -495,18 +506,27 @@ function clearResourceSkipState(root) {
  * then denies is simply selected again next poll; because the smallest claim always goes first, a
  * mispredicted ticket can only ever hold back tickets with an equal or larger claim, never a
  * smaller one. The head is never a candidate here (index 0).
+ *
+ * BRAIN-365: `headReserved` is the same walk for a CONFLICT-blocked head (see tryStart): the head
+ * cannot start now, so its own claim and weight are counted as held (the BRAIN-355 reservation),
+ * a ticket is skipped when its key and the head's conflict in either direction, and the record
+ * is the snapshot a conflict-backfill candidate was denied against.
+ *
+ * An elastic ticket (BRAIN-360) is judged, and ranked, at its floor: ceil(minCpuCores).
  */
-export function selectResourceCandidate(queue, held, runningWeight, weightCapacity, record, cfg, now = Date.now()) {
+export function selectResourceCandidate(queue, held, runningWeight, weightCapacity, record, cfg, now = Date.now(), headReserved = false) {
   const headTicket = queue[0];
+  const view = headReserved ? [...held, { id: headTicket.id, key: headTicket.key, weight: headTicket.weight, resources: headTicket.resources }] : held;
+  const viewWeight = headReserved ? runningWeight + headTicket.weight : runningWeight;
   let best = null;
   let bestClaim = Infinity;
   for (const t of queue.slice(1)) {
     if (!t) return best;
     if (blockedBy(held, t)) continue;
-    if (runningWeight + t.weight > weightCapacity) continue;
-    if (blockedBy([...held, { key: t.key }], headTicket)) continue;
-    const claim = ticketCpuEstimate(t, cfg);
-    if (projectBusy(record.externalBusy, held, claim, now, cfg) > record.budget) continue;
+    if (viewWeight + t.weight > weightCapacity) continue;
+    if (headReserved ? blockedBy([{ key: t.key }], headTicket) || blockedBy([{ key: headTicket.key }], t) : blockedBy([...held, { key: t.key }], headTicket)) continue;
+    const claim = ticketCpuFloor(t, cfg);
+    if (projectBusy(record.externalBusy, view, claim, now, cfg) > record.budget) continue;
     if (claim < bestClaim) {
       best = t;
       bestClaim = claim;
@@ -704,8 +724,21 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       !blockedBy([{ key: ticket.key }], headTicket) &&
       !blockedBy([{ key: headTicket.key }], ticket) &&
       runningWeight + headTicket.weight + ticket.weight <= weightCapacity;
+    // BRAIN-365: the first non-conflicting ticket behind a conflicted head may be one that admission
+    // keeps denying projected-over-budget, which would pin every smaller ticket behind it. That
+    // denial leaves a behind-conflict record (below); while it stands, the walk prefers the smallest
+    // ticket that fits, with the head's claim reserved, and falls back to the first non-conflicting
+    // ticket (so the denied one is still re-evaluated, refreshing the record).
+    const conflictRecord = headConflicted && !skipExhausted ? resourceRecordFor(root, cfg, headTicket.id, true) : null;
+    const conflictPick = conflictRecord ? selectResourceCandidate(queue, held, runningWeight, weightCapacity, conflictRecord, cfg, now, true) : null;
+    // A pick that is denied for anything but the CPU projection invalidates the record it was picked
+    // from (the record has no allowance worth keeping, unlike the head's own), so the next poll
+    // falls back to re-evaluating the first non-conflicting ticket instead of re-picking it.
+    const dropPickRecord = () => {
+      if (conflictPick && ticket.id === conflictPick.id) clearResourceSkipState(root);
+    };
     const candidate = headConflicted
-      ? (skipExhausted ? (safeBackfill ? ticket : null) : selectCandidate(queue, held))
+      ? (skipExhausted ? (safeBackfill ? ticket : null) : conflictPick ?? selectCandidate(queue, held))
       : headCapacityBlocked
         ? (capacitySkipExhausted || capacityReserved ? null : selectCapacityCandidate(queue, held, runningWeight, weightCapacity))
         : resourceBackfill && ticket.id !== headTicket.id
@@ -776,7 +809,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // BRAIN-355: a safe backfill must leave room for the blocked head once its conflict clears, so
     // the head's claim joins the held leases for the CPU projection and memory admission.
     const headReservation = { id: headTicket.id, key: headTicket.key, weight: headTicket.weight, resources: headTicket.resources };
-    const admissionHeld = safeBackfill ? [...held, headReservation] : held;
+    const admissionHeld = safeBackfill || conflictPick ? [...held, headReservation] : held;
     const fullDecision = evaluateNewAdmission(root, cfg, ticket, admissionHeld, cpuSample, memInfo);
     // BRAIN-360: an elastic ticket (resources.minCpuCores) denied ONLY by the CPU projection is
     // re-evaluated at smaller claims, over the same held leases (and, for a safe backfill, the same
@@ -819,6 +852,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
 
     if (cfg.admissionLoadGate && gate.closed && !brokerIdle) {
       if (ticket.id === headTicket.id) markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
+      dropPickRecord();
       return {
         result: { started: false, reason: 'load-gate-closed', load: gate.lastLoad },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'load-gate-closed' },
@@ -826,6 +860,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     }
     if (runningWeight + ticket.weight > weightCapacity) {
       if (ticket.id === headTicket.id) markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
+      dropPickRecord();
       return {
         result: { started: false, reason: 'capacity', runningWeight, capacity: weightCapacity },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'capacity' },
@@ -839,6 +874,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // samplers elsewhere in this function.
     if (memInfo && memInfo.macPressure === 'critical') {
       if (ticket.id === headTicket.id) markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
+      dropPickRecord();
       return {
         result: { started: false, reason: 'memory-critical', macPressure: memInfo.macPressure },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'memory-critical' },
@@ -869,6 +905,10 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
         // changes nothing. Any other out-of-scope denial pauses backfill but keeps the allowance.
         if (resourceDenied) recordResourceDenial(root, cfg, headTicket.id, cpuDecision, now, writeResourceState);
         else if (cpuDecision.cpuReason !== 'cooldown') markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
+      } else if (headConflicted && !skipExhausted && resourceDenied) {
+        recordResourceDenial(root, cfg, headTicket.id, cpuDecision, now, writeResourceState, true);
+      } else if (cpuDecision.cpuReason !== 'cooldown') {
+        dropPickRecord();
       }
       return {
         result: {
