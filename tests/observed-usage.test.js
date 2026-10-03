@@ -102,6 +102,14 @@ test('a gap of more than two heartbeats between good readings also resets the st
   assert.equal(bridged.overrunSince, over.overrunSince, 'a normal 2-heartbeat gap keeps the streak');
 });
 
+test('a clock rollback restarts the overrun streak instead of bridging the retained boundary', () => {
+  const l = replay(lease4(), [[0, 6], [-200_000, 6], [5_000, 6]], 1_000_000);
+  assert.equal(l.overrunSince, 1_005_000, 'the 5s-later reading is not a continuation of the pre-rollback streak');
+  assert.equal(leaseOverrun(l), null);
+  const equal = replay(lease4(), [[0, 6], [0, 6]], 1_000_000);
+  assert.equal(equal.overrunSince, 1_000_000, 'an equal timestamp restarts too');
+});
+
 test('malformed persisted stats never throw out of the heartbeat step; they are discarded and restarted', () => {
   const evil = { valueOf: 0, toString: 0 };
   const bad = [

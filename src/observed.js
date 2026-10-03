@@ -85,16 +85,19 @@ export function observedLeaseFields(lease, observed, observedMemoryBytes, now, m
     const drop = [];
     if (isNum(observed)) {
       fields.observedCpuStats = foldObservedCpu(lease.observedCpuStats, observed, now);
-      const prev = validStats(lease.observedCpuStats) ? lease.observedCpuStats.lastAt : null;
-      const continuing = isNum(lease.overrunSince) && prev !== null && now - prev >= 0 && now - prev <= maxGapMs;
+      // continuity is measured from the previous OVER-BOOKING reading's own time (not the stats' integration
+      // boundary, which never moves back), and only a strictly later reading continues: a rolled-back or equal clock restarts the streak
+      const gap = isNum(lease.overrunLastAt) ? now - lease.overrunLastAt : NaN;
+      const continuing = isNum(lease.overrunSince) && gap > 0 && gap <= maxGapMs;
       if (exceedsBooking(lease, observed)) {
         fields.overrunSince = continuing ? lease.overrunSince : now;
+        fields.overrunLastAt = now;
         fields.overrunPeak = Math.max(continuing && isNum(lease.overrunPeak) ? lease.overrunPeak : 0, observed);
-      } else drop.push('overrunSince', 'overrunPeak');
-    } else drop.push('overrunSince', 'overrunPeak');
+      } else drop.push('overrunSince', 'overrunPeak', 'overrunLastAt');
+    } else drop.push('overrunSince', 'overrunPeak', 'overrunLastAt');
     if (isNum(observedMemoryBytes)) fields.observedRssPeakBytes = Math.max(isNum(lease.observedRssPeakBytes) ? lease.observedRssPeakBytes : 0, observedMemoryBytes);
     return { fields, drop };
   } catch {
-    return { fields: {}, drop: ['observedCpuStats', 'overrunSince', 'overrunPeak', 'observedRssPeakBytes'] };
+    return { fields: {}, drop: ['observedCpuStats', 'overrunSince', 'overrunPeak', 'overrunLastAt', 'observedRssPeakBytes'] };
   }
 }
