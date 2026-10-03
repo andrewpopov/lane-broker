@@ -102,6 +102,27 @@ function computeResourceBlock(root, cfg, head, held, now) {
   };
 }
 
+/** Report-only (BRAIN-202): five minutes without a change to a lane's own log
+ *  FILE mtime is flagged in `lane status`. `elapsed` and `heartbeat-age`
+ *  describe the SUPERVISOR, which stays healthy while a child goes quiet, so
+ *  nothing else surfaced it. This is NOT a "no output" detector:
+ *  `CappedLogWriter` (src/supervisor.js) switches to discard mode on cap or
+ *  write failure, so the file can stop changing while the child keeps
+ *  writing. Nor is it a "hung" detector (a quiet compile looks identical to a
+ *  wedged process from mtime alone), so it must never feed an auto-cancel. */
+export const LOG_STALE_MS = 5 * 60 * 1000;
+
+/** Age in ms of the last write to `logPath`, or null if unset or unreadable.
+ *  Never throws: a lease with no log yet must not crash `lane status`. */
+function logMtimeAgeMs(logPath) {
+  if (!logPath) return null;
+  try {
+    return Date.now() - fs.statSync(logPath).mtimeMs;
+  } catch {
+    return null;
+  }
+}
+
 export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
   const root = ensureStateDirs().root;
   const cfg = loadGlobalConfig();
@@ -133,6 +154,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       pid: l.childPgid,
       elapsedMs: l.startedAt ? now - l.startedAt : null,
       heartbeatAgeMs: l.heartbeatAt ? now - l.heartbeatAt : null,
+      logAgeMs: logMtimeAgeMs(l.logPath),
       log: l.logPath,
       weight: l.weight,
       // BRAIN-255: default 1 for a lease written before this field existed,
@@ -362,9 +384,10 @@ export function renderStatusText(status) {
       // differently against a maxConcurrent: 8 lane than a plain exclusive
       // one, without cluttering the common (ceiling 1) case.
       const ceiling = r.maxConcurrent > 1 ? `  ceiling=${r.maxConcurrent}` : '';
+      const logFlag = r.logAgeMs != null && r.logAgeMs >= LOG_STALE_MS ? `  log file unchanged for ${fmtMs(r.logAgeMs)}` : '';
       lines.push(
         `  ${r.id}  key=${r.key}  pid=${r.pid ?? '-'}  elapsed=${fmtMs(r.elapsedMs)}  ` +
-          `heartbeat-age=${fmtMs(r.heartbeatAgeMs)}  log=${r.log}${flag}${ceiling}${elasticNote(r)}`,
+          `heartbeat-age=${fmtMs(r.heartbeatAgeMs)}  log=${r.log}${logFlag}${flag}${ceiling}${elasticNote(r)}`,
       );
     }
   }
