@@ -561,9 +561,15 @@ things are now kept from it, report-only: **nothing here is read by admission**.
 - **`lane suggest [--repo <name>] [--days N=7] [--json]`.** Groups history by
   repo + lane; for groups with at least 5 finished runs that have `observedCpu`,
   prints the declared `cpuCores` against the p50 and p90 (nearest-rank) of the
-  runs' PEAK cores, and `suggested = ceil(p90 peak)`, never below 1 core (config
+  runs' per-run time-weighted MEAN cores (`mean p50/p90`), with the same of the
+  PEAK cores (`peak p50/p90`) shown as information only. `suggested = ceil(p90 mean)`,
+  never below 1 core. The basis is the mean because admission charges the booked
+  cores for a lease's whole life and OVERRUN means sustained >1.25x for 2 minutes;
+  a peak is a brief spike (a parallel tsc or lint step), so sizing from it books
+  capacity no run holds for more than seconds. `--json` carries `meanP50`/`meanP90`
+  alongside `p50Peak`/`p90Peak`. (The floor: config
   accepts any positive `cpuCores`, so 0.5 is legal; the UNDER/over label is judged on
-  the unclamped ceil, so an idle lane booked at 0.5 is not flagged under-booked).
+  the unclamped ceil(p90 mean), so an idle lane booked at 0.5 is not flagged under-booked).
   The declared figure is the newest row's. `UNDER-BOOKED` means
   suggested > declared (the dangerous case: the lane burns more than it reserves);
   `over-booked` means suggested <= 0.5 x declared. Rows without `observedCpu`
