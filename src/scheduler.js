@@ -491,7 +491,7 @@ function clearResourceSkipState(root) {
 function ticketCpuFloor(ticket, cfg) {
   const estimate = ticketCpuEstimate(ticket, cfg);
   const min = ticket.resources?.minCpuCores;
-  return Number.isFinite(min) && min < estimate ? Math.ceil(min) : estimate;
+  return Number.isFinite(min) ? Math.min(estimate, Math.ceil(min)) : estimate;
 }
 
 /**
@@ -731,6 +731,12 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // ticket (so the denied one is still re-evaluated, refreshing the record).
     const conflictRecord = headConflicted && !skipExhausted ? resourceRecordFor(root, cfg, headTicket.id, true) : null;
     const conflictPick = conflictRecord ? selectResourceCandidate(queue, held, runningWeight, weightCapacity, conflictRecord, cfg, now, true) : null;
+    // A pick that is denied for anything but the CPU projection invalidates the record it was picked
+    // from (the record has no allowance worth keeping, unlike the head's own), so the next poll
+    // falls back to re-evaluating the first non-conflicting ticket instead of re-picking it.
+    const dropPickRecord = () => {
+      if (conflictPick && ticket.id === conflictPick.id) clearResourceSkipState(root);
+    };
     const candidate = headConflicted
       ? (skipExhausted ? (safeBackfill ? ticket : null) : conflictPick ?? selectCandidate(queue, held))
       : headCapacityBlocked
@@ -846,6 +852,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
 
     if (cfg.admissionLoadGate && gate.closed && !brokerIdle) {
       if (ticket.id === headTicket.id) markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
+      dropPickRecord();
       return {
         result: { started: false, reason: 'load-gate-closed', load: gate.lastLoad },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'load-gate-closed' },
@@ -853,6 +860,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     }
     if (runningWeight + ticket.weight > weightCapacity) {
       if (ticket.id === headTicket.id) markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
+      dropPickRecord();
       return {
         result: { started: false, reason: 'capacity', runningWeight, capacity: weightCapacity },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'capacity' },
@@ -866,6 +874,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // samplers elsewhere in this function.
     if (memInfo && memInfo.macPressure === 'critical') {
       if (ticket.id === headTicket.id) markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
+      dropPickRecord();
       return {
         result: { started: false, reason: 'memory-critical', macPressure: memInfo.macPressure },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'memory-critical' },
@@ -898,6 +907,8 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
         else if (cpuDecision.cpuReason !== 'cooldown') markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
       } else if (headConflicted && !skipExhausted && resourceDenied) {
         recordResourceDenial(root, cfg, headTicket.id, cpuDecision, now, writeResourceState, true);
+      } else if (cpuDecision.cpuReason !== 'cooldown') {
+        dropPickRecord();
       }
       return {
         result: {

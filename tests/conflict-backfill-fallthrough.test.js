@@ -117,3 +117,44 @@ test('an elastic ticket is picked when its floor fits', async () => {
   assert.equal(result.started, true);
   assert.ok(result.lease.grantedCpuCores < 4, 'granted below its declared claim');
 });
+
+test('a memory-denied pick drops the record, so the original candidate is re-evaluated once CPU load falls', async () => {
+  const big = ticket('big', { key: 'jun:prepush', weight: 4 });
+  const small = ticket('small', { key: 'mobile:test', weight: 1 });
+  const state = await setup(big, small);
+
+  await poll(state, big);
+  const tight = () => ({ availableBytes: 1, totalBytes: 64 * GIB, macPressure: 'normal', source: 'test' });
+  const memoryDenied = await tryStart(state, small, cfg, undefined, sampler, undefined, tight);
+  assert.equal(memoryDenied.started, false);
+  assert.equal(memoryDenied.reason, 'memory-admission');
+  assert.equal(readResourceSkipState(state), null, 'the record the pick came from is dropped');
+
+  const idle = () => ({ hostBusyCores: 0, cores: 10, stale: false, sampledAt: Date.now() });
+  const result = await tryStart(state, big, cfg, undefined, idle, undefined, memory);
+  assert.equal(result.started, true, 'the first non-conflicting ticket is evaluated again and fits');
+});
+
+test('a fractional elastic floor is charged as min(claim, ceil(min)), and ranks by it', async () => {
+  // elastic claim 1.5 (min 1.2): charged 1.5, not ceil(1.2) = 2. With 2 + 4 + 1 (head) = 7 held, headroom is 2.
+  const big = ticket('big', { key: 'jun:prepush', weight: 4 });
+  const frac = ticket('frac', { key: 'a:frac', weight: 1, resources: { cpuCores: 1.5, minCpuCores: 1.2 } });
+  const one = ticket('one', { key: 'b:one', weight: 1 });
+  const state = await setup(big, frac, one);
+
+  await poll(state, big);
+  // `one` claims 1 < 1.5, so it ranks ahead of `frac`; and `frac` (1.5 <= 2) is a valid pick on its own
+  assert.equal((await poll(state, frac)).reason, 'not-head', 'the smaller 1-core ticket goes first');
+  assert.equal((await poll(state, one)).started, true);
+});
+
+test('a fractional claim that fits headroom only uncapped-floor-wise is picked', async () => {
+  // headroom 2: frac 1.5 fits; a ceil-uncapped floor of 2 would also fit, so tighten via a heavier holder
+  const big = ticket('big', { key: 'jun:prepush', weight: 4 });
+  const frac = ticket('frac', { key: 'a:frac', weight: 1, resources: { cpuCores: 1.5, minCpuCores: 1.2 } });
+  const state = await setup(big, frac);
+  const busy = () => ({ hostBusyCores: 2.5, cores: 10, stale: false, sampledAt: Date.now() }); // headroom 9 - (2.5+4+1) = 1.5
+  await tryStart(state, big, cfg, undefined, busy, undefined, memory);
+  const result = await tryStart(state, frac, cfg, undefined, busy, undefined, memory);
+  assert.equal(result.started, true, 'claim 1.5 fits headroom 1.5; ceil(1.2) = 2 would not');
+});
