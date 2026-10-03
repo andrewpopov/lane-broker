@@ -44,6 +44,12 @@ lane wait <id> [--timeout 5m]
 lane pause "reason" | lane resume
 ```
 
+`lane status` adds `  log file unchanged for <duration>` to a RUNNING line once the
+lane's log file mtime is 5+ minutes old (`logAgeMs` in `--json`). Report-only: it
+describes the file, not the child (a capped log stops changing while the child
+keeps writing; a quiet build looks identical to a wedged one), and never
+triggers a cancel.
+
 Everything after `--` is the command, passed as `argv` (not through a shell —
 `spawn(cmd[0], cmd.slice(1))`). Use `sh -c '...'` explicitly if you need shell
 features like pipes or globbing.
@@ -622,8 +628,10 @@ the queue so you know what's waiting and why.
 
 `$LANE_BROKER_STATE` (default `~/.cache/lane-broker`): `leases/`, `queue/`,
 `logs/` (per-run, capped at 50MB with a truncation notice), `results/`,
-`history.jsonl` (one line per completed run), and `PAUSE` (present while
-paused). All writes are atomic (temp file + rename) and never follow
+`history.jsonl` (one line per completed run, plus one `dequeuedDeadSupervisor: true`
+row `{id, key, error, supervisorPid, endedAt, executor}` (`error: "supervisor died while queued"`, so a history reader counts it as an error, not a failed run) when a queued ticket whose
+supervisor died is dropped from the queue; it is written only once the queue
+record is actually removed), and `PAUSE` (present while paused). All writes are atomic (temp file + rename) and never follow
 symlinks.
 
 ## Testing hooks

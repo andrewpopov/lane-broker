@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, writeExpireMarkerFile } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, writeExpireMarkerFile, appendHistory } from './state.js';
 import { sampleAndUpdateGate, readGateState } from './load.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
 import { evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, projectBusy, ticketCpuEstimate } from './admission.js';
@@ -58,14 +58,21 @@ export async function enqueue(root, ticket) {
   });
 }
 
+/** Remove a queue record. Returns whether the ticket is now durably not
+ *  queued: true when there was never a file (nothing to remove), when the
+ *  file was gone by the time we tried (a benign unlink race, ENOENT, with the
+ *  same end state as a successful unlink), or when the unlink succeeded.
+ *  Returns false only for a genuine unlink failure (e.g. EPERM) that leaves
+ *  the record on disk. A caller that logs a durable "dequeued" event must
+ *  check this first, or the log claims a dequeue that never happened. */
 export function dequeueSync(root, id) {
   const file = findQueueFile(root, id);
-  if (file) {
-    try {
-      fs.unlinkSync(file);
-    } catch {
-      // already gone
-    }
+  if (!file) return true;
+  try {
+    fs.unlinkSync(file);
+    return true;
+  } catch (err) {
+    return err.code === 'ENOENT';
   }
 }
 
@@ -110,7 +117,13 @@ export function reapStale(root, keepTicketId) {
   reapAll(root, bootId());
   for (const t of listQueue(root)) {
     if (t && t.id !== keepTicketId && !isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart })) {
-      dequeueSync(root, t.id);
+      // Only a real dequeue is recorded: a failed unlink leaves the ticket
+      // queued, and logging it would repeat the false event on every poll.
+      // The queue record is gone afterwards, so history is the only durable
+      // trace of the drop (BRAIN-202). Same row conventions as cancel.js.
+      if (dequeueSync(root, t.id)) {
+        appendHistory(root, { id: t.id, key: t.key, dequeuedDeadSupervisor: true, error: 'supervisor died while queued', supervisorPid: t.supervisorPid, endedAt: Date.now(), executor: 'local' });
+      }
     }
   }
 }

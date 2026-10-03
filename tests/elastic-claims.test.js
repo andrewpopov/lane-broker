@@ -192,7 +192,7 @@ test('no minCpuCores: the status entry is exactly the pre-change shape', async (
   try {
     writeLease(state, heldLease('l', 'r:l', { resources: { cpuCores: 4, memoryBytes: GIB }, childPgid: process.pid, startedAt: Date.now() }));
     const entry = (await collectStatus()).running.find((r) => r.id === 'l');
-    assert.deepEqual(Object.keys(entry), ['id', 'key', 'state', 'pid', 'elapsedMs', 'heartbeatAgeMs', 'log', 'weight', 'maxConcurrent', 'resources', 'observedCpuCores', 'observedMemoryBytes']);
+    assert.deepEqual(Object.keys(entry), ['id', 'key', 'state', 'pid', 'elapsedMs', 'heartbeatAgeMs', 'logAgeMs', 'log', 'weight', 'maxConcurrent', 'resources', 'observedCpuCores', 'observedMemoryBytes']);
     assert.doesNotMatch(renderStatusText(await collectStatus()), /elastic/);
   } finally {
     if (prev === undefined) delete process.env.LANE_BROKER_STATE;
