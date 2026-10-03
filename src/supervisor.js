@@ -22,6 +22,7 @@ import { selectRunner, dispatchRemote, needsProtocol2 } from './remote-client.js
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { createAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX } from './admission.js';
+import { foldObservedCpu, summarizeObservedCpu, exceedsBooking } from './observed.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
 const CANCEL_GRACE_MS = 10_000;
@@ -312,10 +313,21 @@ export function applyHeartbeatObservation(lease, observed, now = Date.now(), obs
     update.observedAt = now;
     // BRAIN-354: bounded trailing history for admission's settled-demand peak.
     update.observedCpuHistory = [...(Array.isArray(lease.observedCpuHistory) ? lease.observedCpuHistory : []), { at: now, cores: observed }].slice(-OBSERVED_HISTORY_MAX);
+    // BRAIN-361: whole-run stats for the history row, and the continuous-overrun anchor for `lane status`.
+    update.observedCpuStats = foldObservedCpu(lease.observedCpuStats, observed, now);
+    if (exceedsBooking(lease, observed)) {
+      const continuing = Number.isFinite(lease.overrunSince);
+      update.overrunSince = continuing ? lease.overrunSince : now;
+      update.overrunPeak = Math.max(continuing ? lease.overrunPeak ?? 0 : 0, observed);
+    } else {
+      delete update.overrunSince;
+      delete update.overrunPeak;
+    }
   }
   if (Number.isFinite(observedMemoryBytes)) {
     update.observedMemoryBytes = observedMemoryBytes;
     update.observedAt = now;
+    update.observedRssPeakBytes = Math.max(Number.isFinite(lease.observedRssPeakBytes) ? lease.observedRssPeakBytes : 0, observedMemoryBytes);
   }
   return update;
 }
@@ -344,6 +356,7 @@ function historyRow(ticket, result, { fallbackReason } = {}) {
     key: ticket.key,
     repo: ticket.repoId,
     lane: ticket.lane,
+    ...(ticket.configLane ? { configLane: ticket.configLane } : {}),
     weight: ticket.weight,
     resources: ticket.resources,
     command: ticket.command,
@@ -585,6 +598,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
       runner: runner.name,
       ...(queuedAt ? { queuedAt } : {}),
       ...(Number.isFinite(dispatch.result.grantedCpuCores) ? { grantedCpuCores: dispatch.result.grantedCpuCores } : {}),
+      ...(Number.isFinite(dispatch.result.observedCpu?.peak) ? { observedCpu: dispatch.result.observedCpu } : {}),
+      ...(Number.isFinite(dispatch.result.observedRssPeakBytes) ? { observedRssPeakBytes: dispatch.result.observedRssPeakBytes } : {}),
       remoteKind: dispatch.result.kind,
       remotePhase: dispatch.phase ?? null,
       startedAt: remoteWaitedMs === null ? attemptStartedAt : enriched.createdAt + remoteWaitedMs,
@@ -911,6 +926,12 @@ async function main() {
     const writeResult = (finalResult) => {
       // BRAIN-360: an elastic lease's grant rides on the result (a runner relays it to its submitter)
       if (started.lease.grantedCpuCores !== undefined) finalResult = { ...finalResult, grantedCpuCores: started.lease.grantedCpuCores };
+      // BRAIN-361: what the lease actually used, from the last heartbeat's lease file (absent when no
+      // heartbeat ever observed it); additive, and relayed by a runner to its submitter like the grant.
+      const finalLease = readLease(root, ticket.id);
+      const observedCpu = summarizeObservedCpu(finalLease?.observedCpuStats);
+      if (observedCpu) finalResult = { ...finalResult, observedCpu };
+      if (Number.isFinite(finalLease?.observedRssPeakBytes)) finalResult = { ...finalResult, observedRssPeakBytes: finalLease.observedRssPeakBytes };
       atomicWriteJson(ticket.resultPath, finalResult);
       appendHistory(root, historyRow(ticket, finalResult, { fallbackReason }));
       removeLease(root, ticket.id); // release always comes last

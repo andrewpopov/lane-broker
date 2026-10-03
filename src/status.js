@@ -8,7 +8,8 @@ import { listAttempts, supervisorAlive } from './attempts.js';
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfig } from './config.js';
-import { detectResourceCapacity, effectiveWeightCapacity, leaseResources } from './resources.js';
+import { leaseOverrun } from './observed.js';
+import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores } from './resources.js';
 
 /** Holder pid of the global lock, read directly off disk — used to name the
  *  holder in the "couldn't take the lock" diagnostic without re-taking it. */
@@ -163,6 +164,9 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       resources: leaseResources(l, cfg),
       ...(Number.isFinite(l.grantedCpuCores) ? { declaredCpuCores: l.resources?.cpuCores ?? l.weight, grantedCpuCores: l.grantedCpuCores } : {}),
       observedCpuCores: l.observedCpuCores ?? null,
+      // BRAIN-361: report-only; never read by admission
+      bookedCpuCores: leaseCpuCores(l) ?? null,
+      overrun: leaseOverrun(l),
       observedMemoryBytes: l.observedMemoryBytes ?? null,
     }));
 
@@ -262,6 +266,12 @@ const STALE_SAMPLE_MS = 5 * 60 * 1000;
 /** BRAIN-360: shown only when admission granted less CPU than the lane declared. */
 function elasticNote(r) {
   return r.grantedCpuCores < r.declaredCpuCores ? `  cpu=${r.grantedCpuCores}/${r.declaredCpuCores} (elastic)` : '';
+}
+
+/** BRAIN-361: `  cpu 7.80/4` observed vs booked, so an under-booked lease is visible at a glance. */
+function observedNote(r) {
+  if (!Number.isFinite(r.observedCpuCores) || !Number.isFinite(r.bookedCpuCores)) return '';
+  return `  cpu ${r.observedCpuCores.toFixed(2)}/${r.bookedCpuCores}`;
 }
 
 function fmtMs(ms) {
@@ -379,7 +389,7 @@ export function renderStatusText(status) {
     lines.push('  (none)');
   } else {
     for (const r of status.running) {
-      const flag = r.state === 'ORPHANED' ? ' [ORPHANED]' : '';
+      const flag = (r.state === 'ORPHANED' ? ' [ORPHANED]' : '') + (r.overrun ? ` [OVERRUN peak ${r.overrun.observedPeak} for ${fmtMs(r.overrun.sinceMs)}]` : '');
       // BRAIN-255: only shown once it's non-default, so "2 running" reads
       // differently against a maxConcurrent: 8 lane than a plain exclusive
       // one, without cluttering the common (ceiling 1) case.
@@ -387,7 +397,7 @@ export function renderStatusText(status) {
       const logFlag = r.logAgeMs != null && r.logAgeMs >= LOG_STALE_MS ? `  log file unchanged for ${fmtMs(r.logAgeMs)}` : '';
       lines.push(
         `  ${r.id}  key=${r.key}  pid=${r.pid ?? '-'}  elapsed=${fmtMs(r.elapsedMs)}  ` +
-          `heartbeat-age=${fmtMs(r.heartbeatAgeMs)}  log=${r.log}${logFlag}${flag}${ceiling}${elasticNote(r)}`,
+          `heartbeat-age=${fmtMs(r.heartbeatAgeMs)}  log=${r.log}${logFlag}${flag}${ceiling}${elasticNote(r)}${observedNote(r)}`,
       );
     }
   }

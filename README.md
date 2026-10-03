@@ -39,6 +39,7 @@ exits with `supervisor exited unexpectedly with no result`. Wait until
 lane run --repo rouge --lane default -- npm test
 lane run --repo rouge --lane lint    -- npm run lint
 lane status [--json]
+lane suggest [--repo <name>] [--days 7] [--json]
 lane cancel <id>
 lane wait <id> [--timeout 5m]
 lane pause "reason" | lane resume
@@ -537,6 +538,39 @@ for a runner that advertises `elastic-claims/1`; any other (older) runner is
 judged on the FULL claim, since it would be dispatched the full claim and refuse
 it terminally (exit 64) if its budget is smaller. Upgrade runners before relying
 on elasticity.
+
+### Observed CPU, the OVERRUN flag and `lane suggest` (BRAIN-361)
+
+Every heartbeat already observes a lease's whole process tree (CPU and RSS). Two
+things are now kept from it, report-only: **nothing here is read by admission**.
+
+- **`observedCpu` in `history.jsonl`.** A finished run's row carries
+  `observedCpu: { peak, mean, samples }` (cores, 3 decimals) and
+  `observedRssPeakBytes`. `peak` is the highest heartbeat reading; `mean` is
+  **time-weighted** (each reading is held until the next, so a long quiet stretch
+  outweighs a short spike); `samples` is the reading count. Additive: old readers
+  ignore the fields, and a run shorter than one heartbeat has none. A remote run
+  carries them back on the remote result (like `grantedCpuCores`), so the
+  submitter's history has them too.
+- **`OVERRUN` in `lane status`.** A RUNNING lease whose observed cores stay above
+  1.25 x its charged cores (its elastic grant, else its declared `cpuCores`)
+  continuously for 2 minutes is marked `[OVERRUN peak <n> for <duration>]`; one
+  reading back under the threshold resets the clock, so a single spike never
+  flags. Each RUNNING line also shows `cpu <observed>/<booked>`. `--json` adds
+  `bookedCpuCores` and `overrun: { sinceMs, observedPeak } | null` per lease.
+- **`lane suggest [--repo <name>] [--days N=7] [--json]`.** Groups history by
+  repo + lane; for groups with at least 5 finished runs that have `observedCpu`,
+  prints the declared `cpuCores` against the p50 and p90 (nearest-rank) of the
+  runs' PEAK cores, and `suggested = ceil(p90 peak)`. `UNDER-BOOKED` means
+  suggested > declared (the dangerous case: the lane burns more than it reserves);
+  `over-booked` means suggested <= 0.5 x declared. Rows without `observedCpu`
+  (older history, sub-heartbeat runs) are skipped and counted in the last line.
+  An ad-hoc lane name that inherits a declared lane (`undeclaredLanes: {"as": ...}`)
+  records `configLane` on its history row (only when it differs from `lane`), and
+  `lane suggest` groups by `configLane ?? lane`, reporting how many ad-hoc names were
+  folded in. Older rows without it that are too few to report on their own pool by
+  identical `cpuCores`+`memoryBytes`+`minCpuCores` within a repo, labelled `(by resources)`.
+  It never edits config.
 
 Resource backfill events are explicit `lane-broker-head-block` lines in
 `admission-decisions.log`, written after the lease is published:

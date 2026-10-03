@@ -185,14 +185,14 @@ test('no minCpuCores: decisions are unchanged at every ambient load, and the lea
   }
 });
 
-test('no minCpuCores: the status entry is exactly the pre-change shape', async () => {
+test('no minCpuCores: the status entry has no elastic fields (BRAIN-361 adds bookedCpuCores/overrun, never declared/granted)', async () => {
   const { state } = freshEnv();
   const prev = process.env.LANE_BROKER_STATE;
   process.env.LANE_BROKER_STATE = state;
   try {
     writeLease(state, heldLease('l', 'r:l', { resources: { cpuCores: 4, memoryBytes: GIB }, childPgid: process.pid, startedAt: Date.now() }));
     const entry = (await collectStatus()).running.find((r) => r.id === 'l');
-    assert.deepEqual(Object.keys(entry), ['id', 'key', 'state', 'pid', 'elapsedMs', 'heartbeatAgeMs', 'logAgeMs', 'log', 'weight', 'maxConcurrent', 'resources', 'observedCpuCores', 'observedMemoryBytes']);
+    assert.deepEqual(Object.keys(entry), ['id', 'key', 'state', 'pid', 'elapsedMs', 'heartbeatAgeMs', 'logAgeMs', 'log', 'weight', 'maxConcurrent', 'resources', 'observedCpuCores', 'bookedCpuCores', 'overrun', 'observedMemoryBytes']);
     assert.doesNotMatch(renderStatusText(await collectStatus()), /elastic/);
   } finally {
     if (prev === undefined) delete process.env.LANE_BROKER_STATE;

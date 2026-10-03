@@ -621,6 +621,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   return {
     repoId,
     lane: laneName,
+    // BRAIN-361: the declared lane an ad-hoc name inherited from; present only when it differs from `lane`
+    ...(!isDeclaredLane && undeclaredTemplateName ? { configLane: undeclaredTemplateName } : {}),
     key,
     weight: laneCfg.weight,
     cpuCores: Number.isFinite(laneCfg.cpuCores) ? laneCfg.cpuCores : null,
