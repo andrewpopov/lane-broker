@@ -439,6 +439,15 @@ ending in strict FIFO for that head once spent:
   memory together with the head's own claim reserved. It is not counted as a
   skip and is logged as `lane-broker-head-block event=safe-backfill`. `false`
   restores the plain refusal.
+  Before the allowance is used (BRAIN-365), if the first non-conflicting ticket
+  is denied `projected-over-budget` (memory fine) it records that denial's
+  ambient load and budget in `resource-skip-state.json`, marked
+  `behindConflict`; while that record stands, the next ticket chosen behind the
+  head is the smallest-CPU-claim one that fits (an elastic ticket at its
+  `minCpuCores` floor), with the head's claim and weight reserved, no conflict
+  with the head in either direction, and an unreadable record stopping the walk.
+  If none fits, the first non-conflicting ticket is evaluated again, refreshing
+  the record. Such a start still counts as a skip.
 - *Capacity* (same `conflictSkipLimit`, counted separately): a head that does
   not fit the weight capacity is skipped for a ticket that does. No time-based
   resume: refusal is self-terminating because running work drains.
