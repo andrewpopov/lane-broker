@@ -571,7 +571,9 @@ things are now kept from it, report-only: **nothing here is read by admission**.
   accepts any positive `cpuCores`, so 0.5 is legal; the UNDER/over label is judged on
   the unclamped ceil(p90 mean), so an idle lane booked at 0.5 is not flagged under-booked).
   The declared figure is the newest row's. `UNDER-BOOKED` means
-  suggested > declared (the dangerous case: the lane burns more than it reserves);
+  the unclamped p90 exceeds 1.25 x declared (`OVERRUN_FACTOR`, the tolerance OVERRUN
+  uses, so both reports agree on "over its booking"; ceil rounding alone, like a p90
+  of 4.15 on a booking of 4, is `ok` though `suggested` still shows 5);
   `over-booked` means suggested <= 0.5 x declared. Rows without `observedCpu`
   (older history, sub-heartbeat runs) are skipped and counted in the last line.
   An ad-hoc lane name that inherits a declared lane (`undeclaredLanes: {"as": ...}`)
@@ -579,6 +581,22 @@ things are now kept from it, report-only: **nothing here is read by admission**.
   `lane suggest` groups by `configLane ?? lane`, reporting how many ad-hoc names were
   folded in. Older rows without it that are too few to report on their own pool by
   identical `cpuCores`+`memoryBytes`+`minCpuCores` within a repo, labelled `(by resources)`.
+  Two rules keep the mean honest (BRAIN-371). **Short runs:** a run under 2 minutes
+  (`OVERRUN_MIN_MS`, the same bar OVERRUN uses) is excluded and counted as
+  `shortRunsExcluded`, because its mean is mostly process startup, not sustained load
+  (jun `focused` runs have a ~5 s median). A group left with fewer than 5 sustained
+  runs prints `insufficient sustained runs (N short excluded)`, and in `--json` has
+  `suggestedCpuCores: null` and `verdict: 'insufficient'`. **Elastic grants:** a row
+  with `grantedCpuCores` was granted that many cores (possibly below declared) and its
+  workers sized from the grant, so its raw mean understates need (rouge sim: declared
+  4, granted 2, mean ~2). Its need is `mean / granted x declared` (declared being that
+  row's own `cpuCores`), used in place of the mean for the percentile; peak stays
+  unscaled. `elasticRuns` counts such rows and `grantedBelowDeclaredPct` is the share of
+  sustained runs granted below declared; text output appends
+  `elastic: X% of runs granted below declared` when it is above 0. Rows that can't be
+  measured are excluded and counted, never guessed: `unfinishedRuns` (no finite start or
+  end time) and `malformedRuns` (an elastic row whose declared cores aren't a positive
+  number). So no NaN reaches the output.
   It never edits config.
 
 Resource backfill events are explicit `lane-broker-head-block` lines in
