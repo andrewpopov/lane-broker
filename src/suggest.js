@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import { ensureStateDirs, paths } from './state.js';
+import { OVERRUN_FACTOR, OVERRUN_MIN_MS } from './observed.js';
 
 /**
  * BRAIN-361 `lane suggest`: from history.jsonl, compare each lane's DECLARED cpuCores with the
@@ -9,6 +10,7 @@ import { ensureStateDirs, paths } from './state.js';
 export const MIN_RUNS = 5;
 export const OVERBOOKED_FRACTION = 0.5;
 
+const foldedNames = (g) => new Set(g.rows.map((r) => r.lane).filter((l) => l !== g.lane)).size;
 const rowTime = (r) => (Number.isFinite(r.endedAt) ? r.endedAt : r.startedAt);
 
 /** Nearest-rank percentile of an ascending-sorted array. */
@@ -78,32 +80,50 @@ export function buildSuggestions(rows, { repo, days = 7, now = Date.now() } = {}
       tooFewRuns.push({ repo: g.repo, lane: g.lane, runs: g.rows.length });
       continue;
     }
-    const asc = (key) => g.rows.map((r) => r.observedCpu[key]).sort((a, b) => a - b);
-    const means = asc('mean');
-    const peaks = asc('peak');
+    // Runs under OVERRUN_MIN_MS are mostly process startup, so their mean says nothing about sustained need.
+    const sustained = g.rows.filter((r) => !(r.endedAt - r.startedAt < OVERRUN_MIN_MS));
+    const shortRunsExcluded = g.rows.length - sustained.length;
     // the bucket's rows are in lane order, not time order: the declaration is the NEWEST row's
     const newest = g.rows.reduce((a, r) => (rowTime(r) >= rowTime(a) ? r : a));
     const declared = newest.resources?.cpuCores ?? newest.weight;
+    if (sustained.length < MIN_RUNS) {
+      groups.push({ repo: g.repo, lane: g.lane, grouping: g.grouping, runs: sustained.length, shortRunsExcluded, foldedLaneNames: foldedNames(g), declaredCpuCores: declared, meanP50: null, meanP90: null, p50Peak: null, p90Peak: null, elasticRuns: 0, grantedBelowDeclaredPct: 0, suggestedCpuCores: null, verdict: 'insufficient' });
+      continue;
+    }
+    // An elastic run was granted fewer cores than declared and its workers sized from the grant, so its raw
+    // mean understates need: scale it back to declared-equivalent. Peak stays raw (information only).
+    const rowDeclared = (r) => r.resources?.cpuCores ?? r.weight;
+    const isElastic = (r) => Number.isFinite(r.grantedCpuCores) && r.grantedCpuCores > 0;
+    const need = (r) => (isElastic(r) ? (r.observedCpu.mean / r.grantedCpuCores) * rowDeclared(r) : r.observedCpu.mean);
+    const means = sustained.map(need).sort((a, b) => a - b);
+    const peaks = sustained.map((r) => r.observedCpu.peak).sort((a, b) => a - b);
+    const elastic = sustained.filter(isElastic);
+    const grantedBelowDeclaredPct = Math.round((100 * elastic.filter((r) => r.grantedCpuCores < rowDeclared(r)).length) / sustained.length);
     // The label is judged on the raw ceil(p90 mean); the reported suggestion is floored at 1 whole core
     // (config accepts any positive cpuCores, so a fractional booking like 0.5 is legal but not worth suggesting).
     const needed = Math.ceil(percentile(means, 0.9));
     const suggested = Math.max(1, needed);
-    const verdict = needed > declared ? 'under-booked' : needed <= OVERBOOKED_FRACTION * declared ? 'over-booked' : 'ok';
-    const foldedLaneNames = new Set(g.rows.map((r) => r.lane).filter((l) => l !== g.lane)).size;
-    groups.push({ repo: g.repo, lane: g.lane, grouping: g.grouping, runs: means.length, foldedLaneNames, declaredCpuCores: declared, meanP50: percentile(means, 0.5), meanP90: percentile(means, 0.9), p50Peak: percentile(peaks, 0.5), p90Peak: percentile(peaks, 0.9), suggestedCpuCores: suggested, verdict });
+    // Same tolerance as overrun detection: ceil rounding alone (p90 4.15 on a booking of 4) is not under-booking.
+    const verdict = percentile(means, 0.9) > OVERRUN_FACTOR * declared ? 'under-booked' : needed <= OVERBOOKED_FRACTION * declared ? 'over-booked' : 'ok';
+    groups.push({ repo: g.repo, lane: g.lane, grouping: g.grouping, runs: means.length, shortRunsExcluded, foldedLaneNames: foldedNames(g), elasticRuns: elastic.length, grantedBelowDeclaredPct, declaredCpuCores: declared, meanP50: percentile(means, 0.5), meanP90: percentile(means, 0.9), p50Peak: percentile(peaks, 0.5), p90Peak: percentile(peaks, 0.9), suggestedCpuCores: suggested, verdict });
   }
-  const order = { 'under-booked': 0, 'over-booked': 1, ok: 2 };
+  const order = { 'under-booked': 0, 'over-booked': 1, ok: 2, insufficient: 3 };
   groups.sort((a, b) => order[a.verdict] - order[b.verdict] || a.repo.localeCompare(b.repo) || a.lane.localeCompare(b.lane));
   return { days, minRuns: MIN_RUNS, groups, tooFewRuns, skippedNoObservation };
 }
 
 export function renderSuggestText(report) {
-  const lines = [`lane suggest: last ${report.days}d, groups with >= ${report.minRuns} observed runs (suggested = ceil(p90 mean); peak is informational)`];
+  const lines = [`lane suggest: last ${report.days}d, groups with >= ${report.minRuns} observed runs (suggested = ceil(p90 mean) over runs >= 2 min; peak is informational)`];
   if (report.groups.length === 0) lines.push('  (no lane has enough observed runs yet)');
   for (const g of report.groups) {
+    if (g.verdict === 'insufficient') {
+      lines.push(`  ${g.repo}:${g.lane}  declared=${g.declaredCpuCores}  insufficient sustained runs (${g.shortRunsExcluded} short excluded)`);
+      continue;
+    }
+    const elasticNote = g.grantedBelowDeclaredPct > 0 ? `  elastic: ${g.grantedBelowDeclaredPct}% of runs granted below declared` : '';
     const note = g.verdict === 'under-booked' ? '  UNDER-BOOKED' : g.verdict === 'over-booked' ? '  over-booked (wastes capacity)' : '';
     lines.push(
-      `  ${g.repo}:${g.lane}  runs=${g.runs}${g.foldedLaneNames > 0 ? ` (${g.foldedLaneNames} ad-hoc lane names folded)` : ''}  declared=${g.declaredCpuCores}  mean p50/p90=${g.meanP50}/${g.meanP90}  peak p50/p90=${g.p50Peak}/${g.p90Peak}  suggested=${g.suggestedCpuCores}${note}`,
+      `  ${g.repo}:${g.lane}  runs=${g.runs}${g.foldedLaneNames > 0 ? ` (${g.foldedLaneNames} ad-hoc lane names folded)` : ''}  declared=${g.declaredCpuCores}  mean p50/p90=${g.meanP50}/${g.meanP90}  peak p50/p90=${g.p50Peak}/${g.p90Peak}  suggested=${g.suggestedCpuCores}${note}${elasticNote}`,
     );
   }
   lines.push(`skipped: ${report.skippedNoObservation} finished run(s) without observedCpu; ${report.tooFewRuns.length} lane(s) with < ${report.minRuns} observed runs`);
