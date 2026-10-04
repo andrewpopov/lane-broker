@@ -79,6 +79,9 @@ function makeDepsFixture({ lockMismatch = false } = {}) {
     '  fs.writeFileSync(process.env.POSTINSTALL_ENV_FILE, JSON.stringify({',
     "    npm_config_test_leak: process.env.npm_config_test_leak || null,",
     '    NODE_ENV: process.env.NODE_ENV || null,',
+    '    TMPDIR: process.env.TMPDIR || null,',
+    '    TMP: process.env.TMP || null,',
+    '    TEMP: process.env.TEMP || null,',
     '  }));',
     '}',
     'function finish() {',
@@ -347,4 +350,42 @@ test('cancel during deps: kind cancelled, and the sleeping postinstall process i
 
   await waitFor(() => !isPidAlive(postinstallPid), { timeoutMs: 20_000 });
   assert.equal(fs.existsSync(ranFile), false, 'postinstall must never have completed');
+});
+
+// ---- BRAIN-374: per-ticket TMPDIR ----
+
+test('TMPDIR/TMP/TEMP point at <ticketDir>/tmp (0700, beside work) for deps, setup and command, and the dir is removed afterwards', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-pipeline-root');
+  const markerDir = tmpDir('remote-pipeline-markers');
+  const depsEnvFile = path.join(markerDir, 'postinstall-env.json');
+  const setupEnvFile = path.join(markerDir, 'setup-env.json');
+  const commandEnvFile = path.join(markerDir, 'command-env.json');
+  const probe = (file) =>
+    `const fs = require('fs'); fs.writeFileSync(${JSON.stringify(file)}, JSON.stringify({TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP, mode: fs.statSync(process.env.TMPDIR).mode & 0o777}))`;
+  const { dir: src, entries } = makeSnapshotSource(makeDepsFixture());
+  const header = makeHeader({
+    remoteDeps: ['.'],
+    remoteSetup: [[process.execPath, '-e', probe(setupEnvFile)]],
+    argv: [process.execPath, '-e', probe(commandEnvFile)],
+  });
+
+  // A decoy ambient TMPDIR proves the runner overrides it rather than inheriting it.
+  const spawnEnv = { ...env, TMPDIR: markerDir, POSTINSTALL_ENV_FILE: depsEnvFile };
+  const stream = encodeSnapshot(src, header, entries);
+  const { child } = spawnRemoteExec(stream, { env: spawnEnv, root });
+  assert.equal(await waitClose(child), 0);
+  assert.equal((await getResult(header.ticketId, root, env)).kind, 'completed');
+
+  const ticketDir = path.join(root, 'tickets', header.ticketId);
+  const expected = path.join(ticketDir, 'tmp');
+  for (const file of [depsEnvFile, setupEnvFile, commandEnvFile]) {
+    const seen = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert.equal(seen.TMPDIR, expected, `${path.basename(file)} TMPDIR`);
+    assert.equal(seen.TMP, expected, `${path.basename(file)} TMP`);
+    assert.equal(seen.TEMP, expected, `${path.basename(file)} TEMP`);
+  }
+  assert.equal(JSON.parse(fs.readFileSync(commandEnvFile, 'utf8')).mode, 0o700);
+  assert.equal(fs.existsSync(expected), false, 'the tmp dir is removed once the lane ends');
+  assert.equal(fs.existsSync(path.join(ticketDir, 'work')), false);
 });
