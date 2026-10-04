@@ -593,7 +593,10 @@ things are now kept from it, report-only: **nothing here is read by admission**.
   row's own `cpuCores`), used in place of the mean for the percentile; peak stays
   unscaled. `elasticRuns` counts such rows and `grantedBelowDeclaredPct` is the share of
   sustained runs granted below declared; text output appends
-  `elastic: X% of runs granted below declared` when it is above 0.
+  `elastic: X% of runs granted below declared` when it is above 0. Rows that can't be
+  measured are excluded and counted, never guessed: `unfinishedRuns` (no finite start or
+  end time) and `malformedRuns` (an elastic row whose declared cores aren't a positive
+  number). So no NaN reaches the output.
   It never edits config.
 
 Resource backfill events are explicit `lane-broker-head-block` lines in

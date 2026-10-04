@@ -271,7 +271,7 @@ function fixtureRows() {
 test('suggest math: p50/p90 of MEAN (peak shown), ceil, under/over-booked, too-few-runs, and missing observedCpu counted', () => {
   const report = buildSuggestions(fixtureRows(), { repo: 'r', days: 7, now: NOW });
   const by = Object.fromEntries(report.groups.map((g) => [g.lane, g]));
-  assert.deepEqual(by.hot, { repo: 'r', lane: 'hot', grouping: 'lane', foldedLaneNames: 0, shortRunsExcluded: 0, elasticRuns: 0, grantedBelowDeclaredPct: 0, runs: 10, declaredCpuCores: 3, meanP50: 2.5, meanP90: 4.5, p50Peak: 5, p90Peak: 9, suggestedCpuCores: 5, verdict: 'under-booked' });
+  assert.deepEqual(by.hot, { repo: 'r', lane: 'hot', grouping: 'lane', foldedLaneNames: 0, shortRunsExcluded: 0, unfinishedRuns: 0, malformedRuns: 0, elasticRuns: 0, grantedBelowDeclaredPct: 0, runs: 10, declaredCpuCores: 3, meanP50: 2.5, meanP90: 4.5, p50Peak: 5, p90Peak: 9, suggestedCpuCores: 5, verdict: 'under-booked' });
   assert.equal(by.idle.suggestedCpuCores, 1);
   assert.equal(by.idle.verdict, 'over-booked');
   assert.equal(by.ok.suggestedCpuCores, 4);
@@ -307,7 +307,7 @@ test('suggest: ad-hoc lanes group under the configLane they inherited and report
   ];
   const report = buildSuggestions(rows, { repo: 'r', days: 7, now: NOW });
   assert.equal(report.groups.length, 1, `grouped by literal lane name this would be 13 groups of 1-2: ${JSON.stringify(report.groups)}`);
-  assert.deepEqual(report.groups[0], { repo: 'r', lane: 'default', grouping: 'lane', runs: 14, shortRunsExcluded: 0, elasticRuns: 0, grantedBelowDeclaredPct: 0, foldedLaneNames: 12, declaredCpuCores: 4, meanP50: 3.5, meanP90: 3.5, p50Peak: 7, p90Peak: 7, suggestedCpuCores: 4, verdict: 'ok' });
+  assert.deepEqual(report.groups[0], { repo: 'r', lane: 'default', grouping: 'lane', runs: 14, shortRunsExcluded: 0, unfinishedRuns: 0, malformedRuns: 0, elasticRuns: 0, grantedBelowDeclaredPct: 0, foldedLaneNames: 12, declaredCpuCores: 4, meanP50: 3.5, meanP90: 3.5, p50Peak: 7, p90Peak: 7, suggestedCpuCores: 4, verdict: 'ok' });
   assert.match(renderSuggestText(report), /runs=14 \(12 ad-hoc lane names folded\)/);
 });
 
@@ -320,7 +320,7 @@ test('suggest: rows from before configLane existed pool by identical resources, 
   ];
   const report = buildSuggestions(rows, { days: 7, now: NOW });
   assert.equal(report.groups.length, 1);
-  assert.deepEqual(report.groups[0], { repo: 'r', lane: '(by resources)', grouping: 'resources', runs: 6, shortRunsExcluded: 0, elasticRuns: 0, grantedBelowDeclaredPct: 0, foldedLaneNames: 6, declaredCpuCores: 2, meanP50: 1.5, meanP90: 1.5, p50Peak: 3, p90Peak: 3, suggestedCpuCores: 2, verdict: 'ok' });
+  assert.deepEqual(report.groups[0], { repo: 'r', lane: '(by resources)', grouping: 'resources', runs: 6, shortRunsExcluded: 0, unfinishedRuns: 0, malformedRuns: 0, elasticRuns: 0, grantedBelowDeclaredPct: 0, foldedLaneNames: 6, declaredCpuCores: 2, meanP50: 1.5, meanP90: 1.5, p50Peak: 3, p90Peak: 3, suggestedCpuCores: 2, verdict: 'ok' });
   assert.equal(report.tooFewRuns.length, 2);
   assert.match(renderSuggestText(report), /r:\(by resources\) /);
 });
@@ -387,6 +387,28 @@ test('suggest: UNDER-BOOKED needs the p90 to exceed OVERRUN_FACTOR x booking; ce
   assert.equal(at(5.2).verdict, 'under-booked', '5.2 > 1.25 x 4');
 });
 
+test('suggest: malformed rows are excluded and counted separately; no NaN or null reaches a numeric field', () => {
+  const unfinished = row('w', 4, { mean: 9, extra: { endedAt: undefined } });
+  const noDeclared = row('w', 4, { mean: 9, extra: { grantedCpuCores: 2, resources: { memoryBytes: GIB }, weight: undefined } });
+  const good = many('w', [4, 4, 4, 4, 4, 4], { mean: 2, declared: 4 });
+  const g = buildSuggestions([unfinished, noDeclared, ...good], { days: 7, now: NOW }).groups[0];
+  assert.equal(g.unfinishedRuns, 1);
+  assert.equal(g.malformedRuns, 1);
+  assert.equal(g.shortRunsExcluded, 0, 'an unfinished run is not a short one');
+  assert.equal(g.runs, 6);
+  assert.equal(g.meanP90, 2, 'the mean-9 malformed rows never reach the percentile');
+  // insufficient path: elastic stats come from its sustained rows, and every numeric field stays a number
+  const few = [unfinished, noDeclared, ...many('v', [4, 4, 4], { mean: 2, declared: 4, extra: { grantedCpuCores: 2 } }), row('v', 4, { extra: { endedAt: NOW - 86_400_000 + 5000 } })];
+  const fewG = buildSuggestions(few.map((r, i) => (i < 2 ? { ...r, lane: 'v' } : r)), { days: 7, now: NOW }).groups[0];
+  assert.equal(fewG.verdict, 'insufficient');
+  assert.equal(fewG.elasticRuns, 3);
+  assert.equal(fewG.grantedBelowDeclaredPct, 100);
+  for (const f of [g, fewG]) {
+    for (const k of ['runs', 'shortRunsExcluded', 'unfinishedRuns', 'malformedRuns', 'elasticRuns', 'grantedBelowDeclaredPct', 'declaredCpuCores']) assert.ok(Number.isFinite(f[k]), `${k} is finite`);
+  }
+  assert.doesNotMatch(JSON.stringify(g), /null|NaN/);
+});
+
 test('suggest: runs under 2 minutes are excluded and counted; too few sustained runs means no suggestion', () => {
   const short = { startedAt: NOW - 86_400_000, endedAt: NOW - 86_400_000 + 5000 };
   const mixed = [...many('focused', [8, 8, 8, 8, 8, 8], { mean: 4, extra: short }), ...many('focused', [2, 2, 2, 2, 2], { mean: 1 })];
@@ -429,7 +451,7 @@ test('lane suggest CLI: reads history.jsonl, --json shape, --repo / --days', () 
   assert.equal(res.status, 0, res.stderr);
   const report = JSON.parse(res.stdout);
   assert.deepEqual(Object.keys(report).sort(), ['days', 'groups', 'minRuns', 'skippedNoObservation', 'tooFewRuns']);
-  assert.deepEqual(Object.keys(report.groups[0]).sort(), ['declaredCpuCores', 'elasticRuns', 'foldedLaneNames', 'grantedBelowDeclaredPct', 'grouping', 'lane', 'meanP50', 'meanP90', 'p50Peak', 'p90Peak', 'repo', 'runs', 'shortRunsExcluded', 'suggestedCpuCores', 'verdict']);
+  assert.deepEqual(Object.keys(report.groups[0]).sort(), ['declaredCpuCores', 'elasticRuns', 'foldedLaneNames', 'grantedBelowDeclaredPct', 'grouping', 'lane', 'malformedRuns', 'meanP50', 'meanP90', 'p50Peak', 'p90Peak', 'repo', 'runs', 'shortRunsExcluded', 'suggestedCpuCores', 'unfinishedRuns', 'verdict']);
   assert.equal(run('--repo', 'nonexistent').stdout.includes('no lane has enough observed runs'), true);
   assert.equal(run('--days', 'x').status, 2);
 });
