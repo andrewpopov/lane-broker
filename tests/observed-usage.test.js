@@ -409,6 +409,18 @@ test('suggest: malformed rows are excluded and counted separately; no NaN or nul
   assert.doesNotMatch(JSON.stringify(g), /null|NaN/);
 });
 
+test('suggest: the declaration comes from the newest row with a usable one; none usable means insufficient', () => {
+  const good = many('d', [4, 4, 4, 4, 4, 4], { mean: 3, declared: 4, ageDays: 2 });
+  const newestMalformed = row('d', 4, { mean: 3, ageDays: 0.5, extra: { grantedCpuCores: 2, resources: { cpuCores: 'x', memoryBytes: GIB } } });
+  const g = buildSuggestions([...good, newestMalformed], { days: 7, now: NOW }).groups[0];
+  assert.equal(g.declaredCpuCores, 4, 'a malformed newest row does not supply the declaration');
+  assert.equal(g.verdict, 'ok');
+  const allBad = many('e', [4, 4, 4, 4, 4, 4], { mean: 2, declared: 'x' });
+  const b = buildSuggestions(allBad, { days: 7, now: NOW }).groups[0];
+  assert.equal(b.verdict, 'insufficient', 'no usable declaration anywhere: the group cannot be judged');
+  assert.equal(b.suggestedCpuCores, null);
+});
+
 test('suggest: runs under 2 minutes are excluded and counted; too few sustained runs means no suggestion', () => {
   const short = { startedAt: NOW - 86_400_000, endedAt: NOW - 86_400_000 + 5000 };
   const mixed = [...many('focused', [8, 8, 8, 8, 8, 8], { mean: 4, extra: short }), ...many('focused', [2, 2, 2, 2, 2], { mean: 1 })];

@@ -94,10 +94,12 @@ export function buildSuggestions(rows, { repo, days = 7, now = Date.now() } = {}
     const shortRunsExcluded = scalable.length - sustained.length;
     const elastic = sustained.filter(isElastic);
     const grantedBelowDeclaredPct = sustained.length === 0 ? 0 : Math.round((100 * elastic.filter((r) => r.grantedCpuCores < rowDeclared(r)).length) / sustained.length);
-    // the bucket's rows are in lane order, not time order: the declaration is the NEWEST row's
-    const newest = g.rows.reduce((a, r) => (rowTime(r) >= rowTime(a) ? r : a));
-    const declared = newest.resources?.cpuCores ?? newest.weight;
-    if (sustained.length < MIN_RUNS) {
+    // the bucket's rows are in lane order, not time order: the declaration is the NEWEST row's that has a usable
+    // one; a group with none can't be judged, so it reports insufficient rather than a NaN-driven label
+    const declaredRows = g.rows.filter((r) => Number.isFinite(rowDeclared(r)) && rowDeclared(r) > 0);
+    const newest = declaredRows.length > 0 ? declaredRows.reduce((a, r) => (rowTime(r) >= rowTime(a) ? r : a)) : null;
+    const declared = newest ? rowDeclared(newest) : null;
+    if (declared === null || sustained.length < MIN_RUNS) {
       groups.push({ repo: g.repo, lane: g.lane, grouping: g.grouping, runs: sustained.length, shortRunsExcluded, unfinishedRuns, malformedRuns, foldedLaneNames: foldedNames(g), declaredCpuCores: declared, meanP50: null, meanP90: null, p50Peak: null, p90Peak: null, elasticRuns: elastic.length, grantedBelowDeclaredPct, suggestedCpuCores: null, verdict: 'insufficient' });
       continue;
     }
