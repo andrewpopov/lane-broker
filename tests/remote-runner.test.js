@@ -1089,3 +1089,77 @@ test('the per-ticket work dir is removed after the result is written, but result
   assert.equal(fs.existsSync(path.join(ticketDir, 'work')), false);
   assert.equal(fs.existsSync(path.join(ticketDir, 'result.json')), true);
 });
+
+// ---- BRAIN-374: per-ticket TMPDIR ----
+
+function tmpProbeArgv(file) {
+  return [
+    process.execPath,
+    '-e',
+    `const fs = require('fs'); fs.writeFileSync(${JSON.stringify(file)}, JSON.stringify({TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP})); fs.writeFileSync(require('path').join(process.env.TMPDIR, 'scratch'), 'x'); process.exit(Number(process.env.PROBE_EXIT || 0))`,
+  ];
+}
+
+test('a protocol-1 argv sees TMPDIR/TMP/TEMP = <ticketDir>/tmp, and the dir is removed after success', async () => {
+  const probeFile = path.join(tmpDir('remote-exec-probe'), 'env.json');
+  const { env } = freshShadowEnv({ TMPDIR: os.tmpdir() });
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ argv: tmpProbeArgv(probeFile) });
+  const { code, err } = await runOne(header, entries, { env, root, src });
+  assert.equal(code, 0, `stderr: ${err}`);
+
+  const ticketDir = path.join(root, 'tickets', header.ticketId);
+  const seen = JSON.parse(fs.readFileSync(probeFile, 'utf8'));
+  const expected = path.join(ticketDir, 'tmp');
+  assert.deepEqual(seen, { TMPDIR: expected, TMP: expected, TEMP: expected });
+  assert.equal(fs.existsSync(expected), false);
+  assert.equal(fs.existsSync(path.join(ticketDir, 'result.json')), true);
+});
+
+test('the per-ticket tmp dir is removed after a failing command, scratch files included', async () => {
+  const probeFile = path.join(tmpDir('remote-exec-probe'), 'env.json');
+  const { env } = freshShadowEnv({ PROBE_EXIT: '3' });
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ argv: tmpProbeArgv(probeFile) });
+  const { code } = await runOne(header, entries, { env, root, src });
+  assert.equal(code, 0);
+
+  const ticketDir = path.join(root, 'tickets', header.ticketId);
+  assert.equal(fs.existsSync(probeFile), true, 'the command ran (and wrote into tmp)');
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.exit, 3);
+  assert.equal(fs.existsSync(path.join(ticketDir, 'tmp')), false);
+});
+
+test('the per-ticket tmp dir is removed after an early extract/verify rejection', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const ticketId = crypto.randomUUID();
+  const entries = [{ path: 'a.txt', type: 'file', exec: false, size: 4, sha256: crypto.createHash('sha256').update('aaaa').digest('hex') }];
+  const header = {
+    protocol: 1,
+    ticketId,
+    generation: 0,
+    repoKey: 'r',
+    lane: 'default',
+    argv: [process.execPath, '-e', 'process.exit(0)'],
+    relCwd: '',
+    manifest: { entries, manifestHash: manifestHashOf(entries) },
+  };
+  const body = Buffer.from('aaab');
+  const stream = streamOf([
+    line(header),
+    line({ path: 'a.txt', type: 'file', exec: false, size: body.length }),
+    body,
+    line({ end: true }),
+  ]);
+  const { child } = spawnRemoteExec(stream, { env, root });
+  assert.equal(await waitClose(child), 0);
+
+  const ticketDir = path.join(root, 'tickets', ticketId);
+  assert.equal((await getResult(ticketId, root, env)).kind, 'rejected');
+  assert.equal(fs.existsSync(path.join(ticketDir, 'tmp')), false);
+  assert.equal(fs.existsSync(path.join(ticketDir, 'work')), false);
+});

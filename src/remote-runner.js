@@ -207,11 +207,15 @@ function writeResult(ticketDir, result) {
   atomicWriteJson(path.join(ticketDir, 'result.json'), result);
 }
 
-function cleanupWork(workDir) {
-  try {
-    fs.rmSync(workDir, { recursive: true, force: true });
-  } catch {
-    // best-effort; a leaked work dir under a per-ticket directory is harmless
+// BRAIN-374: the runner's own /tmp can be RAM-backed, so every phase gets a
+// per-ticket TMPDIR on disk instead, removed with the work dir.
+function cleanupWork(ticketDir) {
+  for (const dir of [path.join(ticketDir, 'work'), path.join(ticketDir, 'tmp')]) {
+    try {
+      fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      // best-effort; a leaked dir under a per-ticket directory is harmless
+    }
   }
 }
 
@@ -300,6 +304,14 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   }
 
   const workDir = path.join(ticketDir, 'work');
+  // Every phase env is derived from this process's env (buildDepsEnv, the
+  // pipeline's setup/command children, and a protocol-1 argv via runCommand),
+  // so setting it once here covers them all.
+  const tmpDir = path.join(ticketDir, 'tmp');
+  fs.mkdirSync(tmpDir, { mode: 0o700 });
+  process.env.TMPDIR = tmpDir;
+  process.env.TMP = tmpDir;
+  process.env.TEMP = tmpDir;
   const extractResult = await extractFrames(reader, workDir, header.manifest, {
     maxFileBytes: MAX_FILE_BYTES,
     maxTotalBytes: MAX_TOTAL_BYTES,
@@ -307,7 +319,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   if (!extractResult.ok) {
     writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: extractResult.reason }));
     process.stderr.write(`lane remote-exec: ${extractResult.reason}\n`);
-    cleanupWork(workDir);
+    cleanupWork(ticketDir);
     return { exitCode: 0 };
   }
 
@@ -321,14 +333,14 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   if (!gitResult.ok) {
     writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: gitResult.reason }));
     process.stderr.write(`lane remote-exec: ${gitResult.reason}\n`);
-    cleanupWork(workDir);
+    cleanupWork(ticketDir);
     return { exitCode: 0 };
   }
   const postGitVerify = verifyManifestNoGit(workDir, header.manifest, { ignoreRootGit: true });
   if (!postGitVerify.ok) {
     writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: postGitVerify.reason }));
     process.stderr.write(`lane remote-exec: ${postGitVerify.reason}\n`);
-    cleanupWork(workDir);
+    cleanupWork(ticketDir);
     return { exitCode: 0 };
   }
 
@@ -343,14 +355,14 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     if (!depsManifestCheck.ok) {
       writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: depsManifestCheck.reason }));
       process.stderr.write(`lane remote-exec: ${depsManifestCheck.reason}\n`);
-      cleanupWork(workDir);
+      cleanupWork(ticketDir);
       return { exitCode: 0 };
     }
     const depsDiskCheck = checkRemoteDepsDirsOnDisk(workDir, header.remoteDeps);
     if (!depsDiskCheck.ok) {
       writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: depsDiskCheck.reason }));
       process.stderr.write(`lane remote-exec: ${depsDiskCheck.reason}\n`);
-      cleanupWork(workDir);
+      cleanupWork(ticketDir);
       return { exitCode: 0 };
     }
   }
@@ -494,7 +506,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   }
 
   writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, runMs, grantedCpuCores, observedCpu, observedRssPeakBytes }));
-  cleanupWork(workDir);
+  cleanupWork(ticketDir);
   return { exitCode: 0 };
 }
 
