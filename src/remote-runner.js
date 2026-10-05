@@ -22,6 +22,12 @@ import { sanitizeObservedCpu, sanitizeRssPeak } from './observed.js';
 // spawnable regardless of the runner's own PATH/cwd.
 const laneBinPath = fileURLToPath(new URL('../bin/lane.js', import.meta.url));
 
+// BRAIN-374/BRAIN-376: per-ticket TMPDIR base. /var/tmp is disk-backed per the
+// FHS (/tmp is tmpfs on the runners) and short enough that a Unix socket bound
+// under os.tmpdir() stays inside sun_path's 107 bytes, which a path under the
+// ticket directory (86 bytes before the socket name) does not.
+const REMOTE_TMP_BASE = '/var/tmp';
+
 // BRAIN-319 T3: fixed, deterministic author/committer identity for the
 // synthetic snapshot commit -- this is never a real authored change, just a
 // tree real git commands (status/check-ignore/etc.) can run against.
@@ -209,8 +215,8 @@ function writeResult(ticketDir, result) {
 
 // BRAIN-374: the runner's own /tmp can be RAM-backed, so every phase gets a
 // per-ticket TMPDIR on disk instead, removed with the work dir.
-function cleanupWork(ticketDir) {
-  for (const dir of [path.join(ticketDir, 'work'), path.join(ticketDir, 'tmp')]) {
+function cleanupWork(workDir, tmpDir) {
+  for (const dir of [workDir, tmpDir]) {
     try {
       fs.rmSync(dir, { recursive: true, force: true });
     } catch {
@@ -307,8 +313,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   // Every phase env is derived from this process's env (buildDepsEnv, the
   // pipeline's setup/command children, and a protocol-1 argv via runCommand),
   // so setting it once here covers them all.
-  const tmpDir = path.join(ticketDir, 'tmp');
-  fs.mkdirSync(tmpDir, { mode: 0o700 });
+  const tmpDir = fs.mkdtempSync(path.join(REMOTE_TMP_BASE, 'lb-'));
   process.env.TMPDIR = tmpDir;
   process.env.TMP = tmpDir;
   process.env.TEMP = tmpDir;
@@ -319,7 +324,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   if (!extractResult.ok) {
     writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: extractResult.reason }));
     process.stderr.write(`lane remote-exec: ${extractResult.reason}\n`);
-    cleanupWork(ticketDir);
+    cleanupWork(workDir, tmpDir);
     return { exitCode: 0 };
   }
 
@@ -333,14 +338,14 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   if (!gitResult.ok) {
     writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: gitResult.reason }));
     process.stderr.write(`lane remote-exec: ${gitResult.reason}\n`);
-    cleanupWork(ticketDir);
+    cleanupWork(workDir, tmpDir);
     return { exitCode: 0 };
   }
   const postGitVerify = verifyManifestNoGit(workDir, header.manifest, { ignoreRootGit: true });
   if (!postGitVerify.ok) {
     writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: postGitVerify.reason }));
     process.stderr.write(`lane remote-exec: ${postGitVerify.reason}\n`);
-    cleanupWork(ticketDir);
+    cleanupWork(workDir, tmpDir);
     return { exitCode: 0 };
   }
 
@@ -355,14 +360,14 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     if (!depsManifestCheck.ok) {
       writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: depsManifestCheck.reason }));
       process.stderr.write(`lane remote-exec: ${depsManifestCheck.reason}\n`);
-      cleanupWork(ticketDir);
+      cleanupWork(workDir, tmpDir);
       return { exitCode: 0 };
     }
     const depsDiskCheck = checkRemoteDepsDirsOnDisk(workDir, header.remoteDeps);
     if (!depsDiskCheck.ok) {
       writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: depsDiskCheck.reason }));
       process.stderr.write(`lane remote-exec: ${depsDiskCheck.reason}\n`);
-      cleanupWork(ticketDir);
+      cleanupWork(workDir, tmpDir);
       return { exitCode: 0 };
     }
   }
@@ -506,7 +511,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   }
 
   writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, runMs, grantedCpuCores, observedCpu, observedRssPeakBytes }));
-  cleanupWork(ticketDir);
+  cleanupWork(workDir, tmpDir);
   return { exitCode: 0 };
 }
 

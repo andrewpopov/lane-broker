@@ -1096,11 +1096,11 @@ function tmpProbeArgv(file) {
   return [
     process.execPath,
     '-e',
-    `const fs = require('fs'); fs.writeFileSync(${JSON.stringify(file)}, JSON.stringify({TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP})); fs.writeFileSync(require('path').join(process.env.TMPDIR, 'scratch'), 'x'); process.exit(Number(process.env.PROBE_EXIT || 0))`,
+    `const fs = require('fs'); fs.writeFileSync(${JSON.stringify(file)}, JSON.stringify({TMPDIR: process.env.TMPDIR, TMP: process.env.TMP, TEMP: process.env.TEMP, mode: fs.statSync(process.env.TMPDIR).mode & 0o777})); fs.writeFileSync(require('path').join(process.env.TMPDIR, 'scratch'), 'x'); process.exit(Number(process.env.PROBE_EXIT || 0))`,
   ];
 }
 
-test('a protocol-1 argv sees TMPDIR/TMP/TEMP = <ticketDir>/tmp, and the dir is removed after success', async () => {
+test('a protocol-1 argv sees TMPDIR/TMP/TEMP = one 0700 /var/tmp/lb-* dir, and the dir is removed after success', async () => {
   const probeFile = path.join(tmpDir('remote-exec-probe'), 'env.json');
   const { env } = freshShadowEnv({ TMPDIR: os.tmpdir() });
   const root = tmpDir('remote-exec-root');
@@ -1111,8 +1111,10 @@ test('a protocol-1 argv sees TMPDIR/TMP/TEMP = <ticketDir>/tmp, and the dir is r
 
   const ticketDir = path.join(root, 'tickets', header.ticketId);
   const seen = JSON.parse(fs.readFileSync(probeFile, 'utf8'));
-  const expected = path.join(ticketDir, 'tmp');
-  assert.deepEqual(seen, { TMPDIR: expected, TMP: expected, TEMP: expected });
+  const expected = seen.TMPDIR;
+  assert.ok(expected.startsWith('/var/tmp/lb-'), `TMPDIR ${expected} must be a /var/tmp/lb-* dir`);
+  assert.notEqual(expected, os.tmpdir(), 'the ambient TMPDIR is overridden');
+  assert.deepEqual(seen, { TMPDIR: expected, TMP: expected, TEMP: expected, mode: 0o700 });
   assert.equal(fs.existsSync(expected), false);
   assert.equal(fs.existsSync(path.join(ticketDir, 'result.json')), true);
 });
@@ -1126,15 +1128,23 @@ test('the per-ticket tmp dir is removed after a failing command, scratch files i
   const { code } = await runOne(header, entries, { env, root, src });
   assert.equal(code, 0);
 
-  const ticketDir = path.join(root, 'tickets', header.ticketId);
   assert.equal(fs.existsSync(probeFile), true, 'the command ran (and wrote into tmp)');
   const result = await getResult(header.ticketId, root, env);
   assert.equal(result.exit, 3);
-  assert.equal(fs.existsSync(path.join(ticketDir, 'tmp')), false);
+  const { TMPDIR: seenTmp } = JSON.parse(fs.readFileSync(probeFile, 'utf8'));
+  assert.ok(seenTmp.startsWith('/var/tmp/lb-'), `TMPDIR ${seenTmp} must be a /var/tmp/lb-* dir`);
+  assert.equal(fs.existsSync(seenTmp), false);
 });
 
 test('the per-ticket tmp dir is removed after an early extract/verify rejection', async () => {
-  const { env } = freshShadowEnv();
+  // No command runs on this path, so a preload hook records the mkdtemp the runner made.
+  const mkdtempLog = path.join(tmpDir('remote-exec-mkdtemp'), 'log');
+  const hook = path.join(tmpDir('remote-exec-hook'), 'hook.cjs');
+  fs.writeFileSync(
+    hook,
+    `const fs = require('fs'); const orig = fs.mkdtempSync; fs.mkdtempSync = (...a) => { const d = orig.apply(fs, a); fs.appendFileSync(${JSON.stringify(mkdtempLog)}, d + '\\n'); return d; };`,
+  );
+  const { env } = freshShadowEnv({ NODE_OPTIONS: `--require=${hook}` });
   const root = tmpDir('remote-exec-root');
   const ticketId = crypto.randomUUID();
   const entries = [{ path: 'a.txt', type: 'file', exec: false, size: 4, sha256: crypto.createHash('sha256').update('aaaa').digest('hex') }];
@@ -1160,6 +1170,8 @@ test('the per-ticket tmp dir is removed after an early extract/verify rejection'
 
   const ticketDir = path.join(root, 'tickets', ticketId);
   assert.equal((await getResult(ticketId, root, env)).kind, 'rejected');
-  assert.equal(fs.existsSync(path.join(ticketDir, 'tmp')), false);
+  const made = fs.readFileSync(mkdtempLog, 'utf8').split('\n').filter((d) => d.startsWith('/var/tmp/lb-'));
+  assert.equal(made.length, 1, 'the runner created exactly one /var/tmp/lb-* dir before extraction');
+  assert.equal(fs.existsSync(made[0]), false);
   assert.equal(fs.existsSync(path.join(ticketDir, 'work')), false);
 });
