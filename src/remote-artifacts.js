@@ -103,21 +103,27 @@ function walkGlob(workDir, pattern, visit) {
   const stack = [literalDirPrefix(pattern)];
   while (stack.length > 0) {
     const rel = stack.pop();
-    let entries;
+    // opendirSync iterates one entry at a time, so a pathologically wide directory hits the scan cap
+    // instead of being listed into memory in full first (readdirSync would allocate the whole listing).
+    let dir;
     try {
-      entries = fs.readdirSync(path.join(workDir, rel), { withFileTypes: true });
+      dir = fs.opendirSync(path.join(workDir, rel));
     } catch {
       continue;
     }
-    for (const entry of entries) {
-      scanned += 1;
-      if (scanned > MAX_SCANNED_ENTRIES) throw refusal(`more than ${MAX_SCANNED_ENTRIES} entries scanned for ${pattern}`);
-      const child = rel ? `${rel}/${entry.name}` : entry.name;
-      if (entry.isDirectory()) {
-        if (child !== '.git') stack.push(child);
-      } else if (artifactMatches(pattern, child)) {
-        visit(child);
+    try {
+      for (let entry = dir.readSync(); entry !== null; entry = dir.readSync()) {
+        scanned += 1;
+        if (scanned > MAX_SCANNED_ENTRIES) throw refusal(`more than ${MAX_SCANNED_ENTRIES} entries scanned for ${pattern}`);
+        const child = rel ? `${rel}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          if (child !== '.git') stack.push(child);
+        } else if (artifactMatches(pattern, child)) {
+          visit(child);
+        }
       }
+    } finally {
+      dir.closeSync();
     }
   }
 }
