@@ -3,7 +3,10 @@ import path from 'node:path';
 import { ensureStateDirs, paths, withLock, bootId, readJsonSafe } from './state.js';
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
 import { listQueue, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState, readResourceSkipState } from './scheduler.js';
-import { projectBusy, ticketCpuEstimate } from './admission.js';
+import { cpuBudget, projectBusy, ticketCpuEstimate } from './admission.js';
+import { classLocks, simArmed, usedByClass } from './allocation.js';
+import { queuedClaimsByClass } from './allocation-shadow.js';
+import { readLastSimDemandAt } from './sim-arm.js';
 import { listAttempts, supervisorAlive } from './attempts.js';
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
@@ -223,6 +226,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       mode: cfg.schedulerMode,
     },
     paused,
+    ...(cfg.allocationShadow ? { allocation: computeAllocation(root, cfg, queue.filter(Boolean), held, resourceCapacity.cpuCores, now) } : {}),
     // BRAIN-249: null unless the queue is genuinely stalled (a conflict-
     // blocked head whose skip allowance is exhausted) — see computeHeadBlock.
     headBlock: computeHeadBlock(root, cfg, queue, leases, now, effectiveWeightCapacity(cfg, resourceCapacity.cpuCores)),
@@ -262,6 +266,17 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
  *  poll, so anything this many multiples older can only mean nothing has
  *  been selected in that whole span. */
 const STALE_SAMPLE_MS = 5 * 60 * 1000;
+
+/** BRAIN-379 (shadow): per-class CPU used, soft-lock target and queued claim. Report-only; read-only like the rest of status. */
+function computeAllocation(root, cfg, queue, held, cpuCores, now) {
+  const B = cpuBudget({ cores: cpuCores }, cfg);
+  const used = usedByClass(held, now, cfg);
+  const queued = queuedClaimsByClass(queue, cfg);
+  const lastSimDemandAt = readLastSimDemandAt(root);
+  const armed = simArmed({ now, lastSimDemandAt, simQueued: queued.sim > 0, simCharged: held.some((l) => l.class === 'sim'), simArmWindowMs: cfg.simArmWindowMs });
+  const target = classLocks({ B, armed });
+  return { shadow: true, budgetCores: B, armed, lastSimDemandAt, test: { used: used.test, target: target.L_t, queued: queued.test }, sim: { used: used.sim, target: target.L_s, queued: queued.sim } };
+}
 
 /** BRAIN-360: shown only when admission granted less CPU than the lane declared. */
 function elasticNote(r) {
@@ -374,6 +389,11 @@ export function renderStatusText(status) {
         `(denied ${fmtMs(rb.deniedAgeMs)} ago); backfill ${rb.count}/${rb.limit}` +
         (rb.reserved ? ', RESERVED — nothing else is admitted past it' : ''),
     );
+  }
+  if (status.allocation) {
+    const a = status.allocation;
+    const cls = (name, c) => `${name} used ${c.used.toFixed(2)}/target ${c.target.toFixed(2)} queued ${c.queued.toFixed(2)}`;
+    lines.push(`allocation (shadow): ${cls('test', a.test)}; ${cls('sim', a.sim)}; sims ${a.armed ? 'armed' : 'unarmed'}`);
   }
   lines.push(renderMemoryLine(status.memory));
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);

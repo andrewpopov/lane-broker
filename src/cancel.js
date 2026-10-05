@@ -2,6 +2,7 @@ import path from 'node:path';
 import { ensureStateDirs, paths, appendHistory, atomicWriteJson, withLock, writeCancelMarkerFile } from './state.js';
 import { readLease, removeLease, isSupervisorAlive, isGroupAlive } from './lease.js';
 import { dequeueSync, listQueue } from './scheduler.js';
+import { touchSimArmFor } from './sim-arm.js';
 import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { remoteCancel } from './remote-client.js';
 import { loadGlobalConfig } from './config.js';
@@ -115,6 +116,7 @@ export async function cancelCommand(id) {
     if (!stillQueued) return false;
     dequeueSync(root, id);
     writeCancelMarkerFile(root, id);
+    touchSimArmFor(root, stillQueued);
     return true;
   });
   if (dequeuedHere) {
@@ -201,6 +203,7 @@ export async function cancelCommand(id) {
     appendHistory(root, { id, key: lease.key, cancelled: true, endedAt, executor: 'local' });
   }
   removeLease(root, id);
+  touchSimArmFor(root, lease);
   process.stdout.write(`lane cancel: cancelled orphaned lease ${id}\n`);
   return { exitCode: 0 };
 }
