@@ -354,7 +354,7 @@ test('cancel during deps: kind cancelled, and the sleeping postinstall process i
 
 // ---- BRAIN-374: per-ticket TMPDIR ----
 
-test('TMPDIR/TMP/TEMP point at <ticketDir>/tmp (0700, beside work) for deps, setup and command, and the dir is removed afterwards', async () => {
+test('TMPDIR/TMP/TEMP point at one 0700 /var/tmp/lb-* dir for deps, setup and command, and the dir is removed afterwards', async () => {
   const { env } = freshShadowEnv();
   const root = tmpDir('remote-pipeline-root');
   const markerDir = tmpDir('remote-pipeline-markers');
@@ -378,14 +378,43 @@ test('TMPDIR/TMP/TEMP point at <ticketDir>/tmp (0700, beside work) for deps, set
   assert.equal((await getResult(header.ticketId, root, env)).kind, 'completed');
 
   const ticketDir = path.join(root, 'tickets', header.ticketId);
-  const expected = path.join(ticketDir, 'tmp');
+  const commandSeen = JSON.parse(fs.readFileSync(commandEnvFile, 'utf8'));
+  const expected = commandSeen.TMPDIR;
+  assert.ok(expected.startsWith('/var/tmp/lb-'), `TMPDIR ${expected} must be a /var/tmp/lb-* dir`);
+  assert.notEqual(expected, markerDir, 'the decoy ambient TMPDIR is overridden');
   for (const file of [depsEnvFile, setupEnvFile, commandEnvFile]) {
     const seen = JSON.parse(fs.readFileSync(file, 'utf8'));
     assert.equal(seen.TMPDIR, expected, `${path.basename(file)} TMPDIR`);
     assert.equal(seen.TMP, expected, `${path.basename(file)} TMP`);
     assert.equal(seen.TEMP, expected, `${path.basename(file)} TEMP`);
   }
-  assert.equal(JSON.parse(fs.readFileSync(commandEnvFile, 'utf8')).mode, 0o700);
+  assert.equal(commandSeen.mode, 0o700);
   assert.equal(fs.existsSync(expected), false, 'the tmp dir is removed once the lane ends');
   assert.equal(fs.existsSync(path.join(ticketDir, 'work')), false);
+});
+
+// ---- BRAIN-376: the per-ticket TMPDIR must stay short ----
+
+test('BRAIN-376: the default TMPDIR leaves room for a Unix socket path inside sun_path (107 bytes)', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-pipeline-root');
+  const markerDir = tmpDir('remote-pipeline-markers');
+  const commandEnvFile = path.join(markerDir, 'command-env.json');
+  const { dir: src, entries } = makeSnapshotSource(makeDepsFixture());
+  const header = makeHeader({
+    remoteDeps: ['.'],
+    argv: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(commandEnvFile)}, JSON.stringify({TMPDIR: process.env.TMPDIR}))`],
+  });
+
+  const stream = encodeSnapshot(src, header, entries);
+  const { child } = spawnRemoteExec(stream, { env: { ...env, POSTINSTALL_ENV_FILE: path.join(markerDir, 'deps-env.json') }, root });
+  assert.equal(await waitClose(child), 0);
+  assert.equal((await getResult(header.ticketId, root, env)).kind, 'completed');
+
+  const seenTmpdir = JSON.parse(fs.readFileSync(commandEnvFile, 'utf8')).TMPDIR;
+  // 40 bytes of headroom for the socket file name a consumer's test appends.
+  assert.ok(
+    Buffer.byteLength(seenTmpdir) + 40 < 107,
+    `TMPDIR ${seenTmpdir} (${Buffer.byteLength(seenTmpdir)} bytes) leaves under 40 bytes for a socket name; sun_path caps a Unix socket path at 107 bytes`,
+  );
 });
