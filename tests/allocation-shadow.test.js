@@ -1,13 +1,13 @@
-import test, { mock } from 'node:test';
+import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun } from './helpers.js';
 import { enqueue, tryStart } from '../src/scheduler.js';
-import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
-import { writeLease, LEASE_STATE } from '../src/lease.js';
-import { bootId, paths, atomicWriteJson } from '../src/state.js';
-import { readLastSimDemandAt } from '../src/sim-arm.js';
+import { writeLease } from '../src/lease.js';
+import { paths, atomicWriteJson, bootId } from '../src/state.js';
+import { readLastSimDemandAt, touchSimArm } from '../src/sim-arm.js';
+import { evaluateQueue } from '../src/allocation.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
 
 /**
@@ -15,45 +15,16 @@ import { collectStatus, renderStatusText } from '../src/status.js';
  * and memory reader injected. Fixture machine: 10 cores, reserve 1, 100% -> B = 9.
  */
 
+import { fileURLToPath } from 'node:url';
+import { loadModules, baseCfg as scenarioBaseCfg, heldLease as scenarioHeldLease, sampler, memory, ticket, sim, scenarios, runScript, liveTrace } from './allocation-scenarios.js';
+
 const GIB = 1024 ** 3;
 const SHADOW_TOKEN = 'lane-broker-allocation-shadow';
+const m = await loadModules(fileURLToPath(new URL('../src', import.meta.url)));
+const baseCfg = (overrides) => scenarioBaseCfg(m, overrides);
+const heldLease = (...args) => scenarioHeldLease(m, ...args);
 
-function baseCfg(overrides = {}) {
-  return {
-    ...DEFAULT_GLOBAL_CONFIG,
-    schedulerMode: 'active',
-    capacity: 10,
-    loadClose: 1000,
-    loadOpen: 900,
-    loadOpenSamples: 1,
-    cpuAdmissionPercent: 100,
-    cpuReserveCores: 1,
-    admissionCooldownMs: 0,
-    resourceSkipLimit: 3,
-    resourceIdleOvershootCores: 0,
-    ...overrides,
-  };
-}
-
-const sampler = (hostBusyCores) => () => ({ hostBusyCores, cores: 10, stale: false, sampledAt: Date.now() });
-const memory = () => ({ availableBytes: 64 * GIB, totalBytes: 64 * GIB, macPressure: 'normal', source: 'test' });
-
-const ticket = (id, overrides = {}) => ({
-  id,
-  key: `r:${id}`,
-  weight: 1,
-  cwd: process.cwd(),
-  cmd: ['true'],
-  supervisorPid: process.pid,
-  supervisorStart: null,
-  logPath: '/dev/null',
-  resultPath: '/dev/null',
-  ...overrides,
-});
-
-const heldLease = (id, key, weight, extra = {}) => ({ id, key, bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), admittedAt: Date.now(), weight, state: LEASE_STATE.RUNNING, ...extra });
-
-const poll = (state, t, cfg, { ext = 0, evaluator } = {}) => tryStart(state, t, cfg, undefined, sampler(ext), undefined, memory, undefined, evaluator);
+const poll = (state, t, cfg, { ext = 0, evaluator, mem = memory } = {}) => tryStart(state, t, cfg, undefined, sampler(ext), undefined, mem, undefined, evaluator);
 
 const readLog = (state) => {
   try {
@@ -65,104 +36,9 @@ const readLog = (state) => {
 const shadowLines = (state) => readLog(state).split('\n').filter((l) => l.startsWith(`${SHADOW_TOKEN} `));
 const liveLines = (state) => readLog(state).split('\n').filter((l) => l && !l.startsWith(SHADOW_TOKEN));
 const field = (line, name) => new RegExp(`(?:^| )${name}=(\\S*)`).exec(line)?.[1];
+const candidateOf = (line, idPrefix) => field(line, 'candidates').split(',').find((c) => c.startsWith(`${idPrefix}:`));
 
 // ---- the hard invariant -------------------------------------------------------------------------
-
-/**
- * A scripted run on a frozen, scripted clock so every persisted timestamp is reproducible. Returns
- * everything live admission produced: each poll's result, the skip/reservation/lease/queue files raw,
- * and the live admission log lines.
- */
-async function runScript(script, allocationShadow) {
-  const { state } = freshEnv();
-  let clock = 1_700_000_000_000;
-  const dateNow = mock.method(Date, 'now', () => clock);
-  try {
-    const cfg = baseCfg({ allocationShadow });
-    const results = [];
-    for (const step of script) {
-      clock += 1000;
-      if (step.enqueue) await enqueue(state, step.enqueue);
-      else if (step.lease) writeLease(state, { ...step.lease, heartbeatAt: clock, admittedAt: clock });
-      else if (step.release) fs.unlinkSync(path.join(paths(state).leases, `${step.release}.json`));
-      else {
-        const r = await poll(state, step.poll, cfg, { ext: step.ext ?? 0 });
-        results.push({ poll: step.poll.id, started: r.started, reason: r.reason ?? null, cpuReason: r.cpuReason ?? null });
-      }
-    }
-    const raw = (dir, name) => {
-      try {
-        return fs.readFileSync(path.join(dir, name), 'utf8');
-      } catch {
-        return null;
-      }
-    };
-    const p = paths(state);
-    const dirContents = (dir) => Object.fromEntries(fs.readdirSync(dir).sort().map((n) => [n, fs.readFileSync(path.join(dir, n), 'utf8')]));
-    return {
-      results,
-      conflictSkip: raw(p.root, 'conflict-skip-state.json'),
-      capacitySkip: raw(p.root, 'capacity-skip-state.json'),
-      resourceSkip: raw(p.root, 'resource-skip-state.json'),
-      leases: dirContents(p.leases),
-      queue: dirContents(p.queue),
-      liveLog: liveLines(state),
-      shadowLines: shadowLines(state),
-    };
-  } finally {
-    dateNow.mock.restore();
-  }
-}
-
-const sim = (id, weight = 1, extra = {}) => ticket(id, { class: 'sim', weight, ...extra });
-
-// A resource-denied head backfilled past (resource skip counter + reservation latch), mixed classes.
-const RESOURCE_SCRIPT = [
-  { enqueue: ticket('head', { weight: 4 }) },
-  { enqueue: sim('s1') },
-  { enqueue: ticket('t1') },
-  { enqueue: sim('s2', 2) },
-  { enqueue: ticket('t2', { weight: 2 }) },
-  { poll: sim('s1'), ext: 5.4 },
-  { poll: ticket('head', { weight: 4 }), ext: 5.4 },
-  { poll: sim('s1'), ext: 5.4 },
-  { poll: ticket('t1'), ext: 5.4 },
-  { poll: ticket('head', { weight: 4 }), ext: 5.4 },
-  { poll: sim('s2', 2), ext: 5.4 },
-  { poll: ticket('t2', { weight: 2 }), ext: 5.4 },
-  { poll: ticket('head', { weight: 4 }), ext: 5.4 },
-  { release: 's1' },
-  { release: 't1' },
-  { poll: ticket('head', { weight: 4 }), ext: 0 },
-];
-
-// A conflict-blocked head that is skipped (conflict skip counter) until its allowance is exhausted, with a sim queued.
-const CONFLICT_SCRIPT = [
-  { lease: heldLease('holder', 'r:lock', 1) },
-  { enqueue: ticket('chead', { key: 'r:lock', conflicts: [] }) },
-  { enqueue: sim('cs1') },
-  { enqueue: ticket('ct1') },
-  { enqueue: sim('cs2') },
-  { enqueue: ticket('ct2') },
-  { poll: ticket('chead', { key: 'r:lock', conflicts: [] }) },
-  { poll: sim('cs1') },
-  { poll: ticket('ct1') },
-  { poll: sim('cs2') },
-  { poll: ticket('ct2') },
-  { poll: ticket('chead', { key: 'r:lock', conflicts: [] }) },
-];
-
-// A head that does not fit weight capacity (capacity skip counter), tests holding most of B so sim locks bite.
-const CAPACITY_SCRIPT = [
-  { lease: heldLease('big', 'r:big', 5, { resources: { cpuCores: 5, memoryBytes: GIB } }) },
-  { enqueue: ticket('khead', { weight: 6 }) },
-  { enqueue: sim('ks1') },
-  { enqueue: ticket('kt1', { weight: 2 }) },
-  { poll: ticket('khead', { weight: 6 }) },
-  { poll: sim('ks1') },
-  { poll: ticket('kt1', { weight: 2 }) },
-  { poll: ticket('khead', { weight: 6 }) },
-];
 
 // What proves each script really drove its skip machinery (the head's start clears the resource record, so that one shows in the live log).
 const EXERCISED = {
@@ -170,24 +46,32 @@ const EXERCISED = {
   conflict: (r) => r.conflictSkip !== null,
   capacity: (r) => r.capacitySkip !== null,
 };
+const SCENARIOS = scenarios(m);
 
-for (const [name, script, exercised] of [
-  ['resource backfill + reservation', RESOURCE_SCRIPT, 'resource'],
-  ['conflict skip + exhausted allowance', CONFLICT_SCRIPT, 'conflict'],
-  ['capacity skip', CAPACITY_SCRIPT, 'capacity'],
-]) {
+for (const name of Object.keys(SCENARIOS)) {
   test(`live selection is byte-identical with shadow on and off (${name}): admission sequence, skip/reservation files, leases, queue, live log`, async () => {
-    const off = await runScript(script, false);
-    const on = await runScript(script, true);
+    const off = await runScript(m, SCENARIOS[name], { allocationShadow: false });
+    const on = await runScript(m, SCENARIOS[name], { allocationShadow: true });
     assert.deepEqual(on.results, off.results, 'identical admission sequence');
     for (const file of ['conflictSkip', 'capacitySkip', 'resourceSkip']) assert.equal(on[file], off[file], `${file} state file is byte-identical`);
     assert.deepEqual(on.leases, off.leases, 'identical lease files');
     assert.deepEqual(on.queue, off.queue, 'identical queue files');
     assert.deepEqual(on.liveLog, off.liveLog, 'identical live admission log lines');
     assert.equal(off.shadowLines.length, 0, 'shadow off writes no shadow record');
-    assert.ok(on.shadowLines.length >= 3, `shadow on records evaluations (got ${on.shadowLines.length})`);
-    assert.ok(EXERCISED[exercised](off), `the script really exercised the ${exercised} skip path (otherwise this proves nothing)`);
+    assert.ok(on.shadowLines.length >= 2, `shadow on records evaluations (got ${on.shadowLines.length})`);
+    assert.ok(EXERCISED[name](off), `the script really exercised the ${name} skip path (otherwise this proves nothing)`);
     assert.ok(off.results.some((r) => r.started) && off.results.some((r) => !r.started), 'script mixes starts and denials');
+  });
+}
+
+// The traces were generated by running these same scripts on MAIN's code (see allocation-scenarios.js), so this
+// is the comparison against the pre-change broker that the on/off test above cannot make.
+const GOLDEN = JSON.parse(fs.readFileSync(new URL('./fixtures/allocation-golden-trace.json', import.meta.url), 'utf8'));
+for (const name of Object.keys(SCENARIOS)) {
+  test(`GOLDEN TRACE (${name}): the branch with shadow ON reproduces main's admission trace exactly`, async () => {
+    const on = await runScript(m, SCENARIOS[name], { allocationShadow: true });
+    assert.deepEqual(liveTrace(on), GOLDEN[name]);
+    assert.ok(on.shadowLines.length >= 2, 'shadow really ran');
   });
 }
 
@@ -236,7 +120,7 @@ test('a shadow record is written for a blocked head evaluation, carrying the act
   const [line] = shadowLines(state);
   assert.equal(field(line, 'poller'), 'head');
   assert.equal(field(line, 'actual'), 'cpu-admission');
-  assert.equal(field(line, 'budgetSource'), 'sample');
+  assert.equal(field(line, 'budgetSource'), 'live');
   assert.equal(field(line, 'B'), '9');
   assert.equal(field(line, 'externalBusy'), '5.4');
 });
@@ -282,9 +166,9 @@ test('the shadow record format: B, usage, locks, arm state, selection, actual ou
   assert.ok(Number.isFinite(stamp));
   assert.equal(
     line,
-    `${SHADOW_TOKEN} poller=headaaaa head=headaaaa actual=started select=simbbbbb selectReason=backfill B=9 budgetSource=sample externalBusy=0 ` +
-      `used_t=5 used_s=0 L_t=1.35 L_s=2.7 armed=true lastSimDemandAt=${stamp} skip=none:0+1/3 reserved=false ` +
-      'candidates=headaaaa:test:3:class-lock,simbbbbb:sim:1:ok',
+    `${SHADOW_TOKEN} ts=${field(line, 'ts')} poller=headaaaa head=headaaaa actual=started select=simbbbbb selectReason=backfill B=9 budgetSource=live chargeSource=live externalBusy=0 ` +
+      `used_t=5 used_s=0 L_t=1.35 L_s=2.7 armed=true lastSimDemandAt=${stamp} cfg=lockT:0.15,lockS:0.3,armWindowMs:300000,mode:active skip=none:0+1/3 reserved=false ` +
+      'candidates=headaaaa:test:c=3:e=3:k=3:class-lock,simbbbbb:sim:c=1:e=1:k=1:ok',
   );
 });
 
@@ -415,4 +299,219 @@ test('lane status shows the allocation line and object only when allocationShado
     if (prevHome === undefined) delete process.env.LANE_BROKER_HOME;
     else process.env.LANE_BROKER_HOME = prevHome;
   }
+});
+
+// ---- review round: lock discipline, guard parity, skip budget, charges, arm-stamp exits -------------
+
+test('the shadow evaluation and its log append run AFTER the global lock is released', async () => {
+  const { state } = freshEnv();
+  const cfg = baseCfg({ allocationShadow: true });
+  await enqueue(state, ticket('head'));
+  let lockHeldDuringEvaluation = null;
+  let lockHeldAtLogAppend = null;
+  const result = await poll(state, ticket('head'), cfg, {
+    evaluator: (args) => {
+      lockHeldDuringEvaluation = fs.existsSync(paths(state).lock);
+      const evaluation = evaluateQueue(args);
+      lockHeldAtLogAppend = fs.existsSync(paths(state).lock); // the append follows immediately in the same tick
+      return evaluation;
+    },
+  });
+  assert.equal(result.started, true);
+  assert.equal(lockHeldDuringEvaluation, false, 'evaluator ran with the lock still held');
+  assert.equal(lockHeldAtLogAppend, false);
+  assert.equal(shadowLines(state).length, 1);
+});
+
+test('the hypothetical admission includes the existing guards: weight capacity, memory brake, pause, cooldown', async () => {
+  const headAt = async (setup, cfgOverrides, pollOptions) => {
+    const { state } = freshEnv();
+    const cfg = baseCfg({ allocationShadow: true, ...cfgOverrides });
+    setup?.(state);
+    await enqueue(state, ticket('head', { weight: 3 }));
+    const live = await poll(state, ticket('head', { weight: 3 }), cfg, pollOptions);
+    const line = shadowLines(state)[0];
+    return { live, line, head: candidateOf(line, 'head') };
+  };
+
+  const capacity = await headAt(null, { capacity: 2 });
+  assert.equal(capacity.live.reason, 'capacity');
+  assert.match(capacity.head, /:capacity:guards=capacity$/);
+  assert.equal(field(capacity.line, 'select'), 'none', 'a weight-3 candidate is not selectable at capacity 2');
+
+  const memoryCritical = await headAt(null, {}, { mem: () => ({ availableBytes: GIB, totalBytes: 64 * GIB, macPressure: 'critical', source: 'test' }) });
+  assert.equal(memoryCritical.live.reason, 'memory-critical');
+  assert.match(memoryCritical.head, /:memory-critical:guards=memory-critical(\||$)/);
+  assert.equal(field(memoryCritical.line, 'select'), 'none');
+
+  const paused = await headAt((state) => fs.writeFileSync(paths(state).pause, 'maintenance'), {});
+  assert.equal(paused.live.reason, 'paused');
+  assert.match(paused.head, /:paused:guards=paused$/);
+
+  const cooldown = await headAt(
+    (state) => writeLease(state, heldLease('held', 'r:held', 1, { resources: { cpuCores: 1, memoryBytes: GIB } })),
+    { admissionCooldownMs: 600_000 },
+  );
+  assert.equal(cooldown.live.cpuReason, 'cooldown');
+  assert.match(cooldown.head, /:cooldown:guards=cooldown$/);
+  assert.equal(field(cooldown.line, 'select'), 'none');
+
+  const clear = await headAt(null, {});
+  assert.equal(clear.live.started, true);
+  assert.match(clear.head, /:ok$/, 'with every guard passing the same candidate is ok');
+  assert.equal(field(clear.line, 'select'), 'head');
+});
+
+test('class-only skips spend the resource skip budget, not the conflict one (unequal limits)', async () => {
+  const run = async (cfgOverrides) => {
+    const { state } = freshEnv();
+    const cfg = baseCfg({ allocationShadow: true, ...cfgOverrides });
+    writeLease(state, heldLease('held', 'r:held', 5, { resources: { cpuCores: 5, memoryBytes: GIB } }));
+    await enqueue(state, ticket('head', { weight: 3 }));
+    await enqueue(state, sim('s1'));
+    const live = await poll(state, ticket('head', { weight: 3 }), cfg);
+    assert.equal(live.started, true, 'live is unaffected either way');
+    return shadowLines(state)[0];
+  };
+  const open = await run({ conflictSkipLimit: 7, resourceSkipLimit: 1 });
+  assert.match(open, / skip=none:0\+1\/1 /, 'limit is resourceSkipLimit (1), not conflictSkipLimit (7)');
+  assert.equal(field(open, 'selectReason'), 'backfill');
+  const exhausted = await run({ conflictSkipLimit: 7, resourceSkipLimit: 0 });
+  assert.match(exhausted, / skip=none:0\+0\/0 /);
+  assert.equal(field(exhausted, 'selectReason'), 'skip-budget-exhausted');
+  assert.equal(field(exhausted, 'select'), 'none');
+});
+
+test('the record carries the evaluation timestamp, config values, per-candidate claims and reservation amounts', async () => {
+  const { state } = freshEnv();
+  const cfg = baseCfg({ allocationShadow: true, simArmWindowMs: 120_000 });
+  await enqueue(state, ticket('head', { weight: 3 }));
+  await enqueue(state, ticket('big', { weight: 8 }));
+  await poll(state, ticket('head', { weight: 3 }), cfg);
+  const [line] = shadowLines(state);
+  assert.ok(Number.isFinite(Number(field(line, 'ts'))));
+  assert.match(field(line, 'cfg'), /^lockT:0\.15,lockS:0\.3,armWindowMs:120000,mode:active$/);
+  assert.match(candidateOf(line, 'head'), /^head:test:c=3:e=3:k=3:ok$/);
+  assert.equal(candidateOf(line, 'big'), 'big:test:c=8:e=6:k=6:ok', 'an oversized test claim (8 > B - L_s = 6.3) is clamped to floor(6.3)');
+  assert.equal(field(line, 'chargeSource'), 'recomputed', 'nothing held, so there were no live charges to reuse');
+});
+
+test('a held lease is charged at the demand the live CPU evaluation computed (chargeSource=live)', async () => {
+  const { state } = freshEnv();
+  const cfg = baseCfg({ allocationShadow: true });
+  writeLease(state, heldLease('held', 'r:held', 4, { resources: { cpuCores: 4, memoryBytes: GIB } }));
+  await enqueue(state, ticket('head'));
+  await poll(state, ticket('head'), cfg);
+  const [line] = shadowLines(state);
+  assert.equal(field(line, 'chargeSource'), 'live');
+  assert.equal(field(line, 'used_t'), '4');
+});
+
+test('reconciliation rewrites the arm stamp only when it is stale (older than a tenth of the window), not on every poll', async () => {
+  const stampAfterPoll = async (ageMs) => {
+    const { state } = freshEnv();
+    const cfg = baseCfg();
+    await enqueue(state, sim('s1'));
+    const seeded = Date.now() - ageMs;
+    fs.writeFileSync(paths(state).simArm, JSON.stringify({ lastSimDemandAt: seeded }));
+    await poll(state, ticket('nobody'), cfg); // not queued: returns before reconciliation
+    await enqueue(state, ticket('head'));
+    await poll(state, ticket('head'), cfg);
+    return { seeded, after: readLastSimDemandAt(state) };
+  };
+  const fresh = await stampAfterPoll(1000);
+  assert.equal(fresh.after, fresh.seeded, 'a fresh stamp is left alone');
+  const stale = await stampAfterPoll(120_000);
+  assert.ok(stale.after > stale.seeded, 'a stale stamp is advanced');
+});
+
+test('touchSimArm is monotonic: it never moves back, and it retries when a slower writer clobbers it with an older value', () => {
+  const { state } = freshEnv();
+  atomicWriteJson(paths(state).simArm, { lastSimDemandAt: 300 });
+  touchSimArm(state, 200);
+  assert.equal(readLastSimDemandAt(state), 300);
+
+  atomicWriteJson(paths(state).simArm, { lastSimDemandAt: 50 });
+  let clobbers = 0;
+  touchSimArm(state, 200, {
+    afterWrite: () => {
+      if (clobbers++ < 2) atomicWriteJson(paths(state).simArm, { lastSimDemandAt: 100 }); // a competing writer with an older time
+    },
+  });
+  assert.equal(readLastSimDemandAt(state), 200, 'rewritten until it holds our value');
+  assert.equal(clobbers, 3);
+});
+
+/** The 5-minute tail: after the LAST sim demand leaves through `exit`, a test head is still held back by an armed sim lock. */
+async function assertTailAfter(exit) {
+  const { state } = freshEnv();
+  const cfg = baseCfg({ allocationShadow: true });
+  const prev = process.env.LANE_BROKER_STATE;
+  process.env.LANE_BROKER_STATE = state;
+  try {
+    const before = Date.now();
+    await exit(state);
+    assert.ok(readLastSimDemandAt(state) >= before, 'the exit stamped the arm file');
+    assert.equal(fs.existsSync(paths(state).queue) ? fs.readdirSync(paths(state).queue).length : 0, 0, 'no sim demand remains');
+    await enqueue(state, ticket('head'));
+    await poll(state, ticket('head'), cfg);
+    const [line] = shadowLines(state);
+    assert.equal(field(line, 'armed'), 'true', 'sims stay armed for the window');
+    assert.equal(field(line, 'L_s'), '2.7');
+  } finally {
+    if (prev === undefined) delete process.env.LANE_BROKER_STATE;
+    else process.env.LANE_BROKER_STATE = prev;
+  }
+}
+
+const clearStamp = (state) => fs.rmSync(paths(state).simArm, { force: true });
+const DEAD_PID = 2 ** 22 + 12345;
+const DEAD_PGID = 2 ** 22 + 54321;
+
+test('5-minute tail after a queued sim is cancelled', async () => {
+  await assertTailAfter(async (state) => {
+    await enqueue(state, sim('s1'));
+    clearStamp(state);
+    const { cancelCommand } = await import('../src/cancel.js');
+    assert.equal((await cancelCommand('s1')).exitCode, 0);
+  });
+});
+
+test('5-minute tail after an orphaned sim lease is cancelled', async () => {
+  await assertTailAfter(async (state) => {
+    writeLease(state, heldLease('orph', 'r:orph', 1, { class: 'sim', state: 'ORPHANED', supervisorPid: DEAD_PID, childPgid: DEAD_PGID, resultPath: path.join(state, 'orph-result.json') }));
+    clearStamp(state);
+    const { cancelCommand } = await import('../src/cancel.js');
+    assert.equal((await cancelCommand('orph')).exitCode, 0);
+  });
+});
+
+test('5-minute tail after a sim lease is reaped', async () => {
+  await assertTailAfter(async (state) => {
+    writeLease(state, heldLease('dead', 'r:dead', 1, { class: 'sim', supervisorPid: DEAD_PID, childPgid: DEAD_PGID }));
+    clearStamp(state);
+    const { reapAll } = await import('../src/lease.js');
+    assert.deepEqual(reapAll(state, bootId()), [{ id: 'dead', action: 'reaped' }]);
+  });
+});
+
+test('5-minute tail after a queued sim whose supervisor died is dequeued', async () => {
+  await assertTailAfter(async (state) => {
+    await enqueue(state, sim('ghost', 1, { supervisorPid: DEAD_PID }));
+    clearStamp(state);
+    await poll(state, ticket('other'), baseCfg()); // any locked evaluation reaps the dead queued supervisor
+  });
+});
+
+test('5-minute tail after a sim lane runs to completion (release path), end to end', async () => {
+  const { base, home, state, env } = freshEnv();
+  writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 }, sims: { weight: 1, class: 'sim' } } });
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'sims', '--', 'sleep', '1'], { env, cwd: repoDir });
+  assert.equal(result.code, 0, result.stderr);
+  const rows = fs.readFileSync(paths(state).history, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const endedAt = rows.at(-1).endedAt;
+  assert.ok(Number.isFinite(endedAt));
+  assert.ok(readLastSimDemandAt(state) >= endedAt, 'the stamp is at least as late as the end of the run, not just the admission 1s earlier');
 });

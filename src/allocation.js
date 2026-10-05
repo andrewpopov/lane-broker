@@ -36,12 +36,15 @@ const simLockCeiling = (B) => SIM_LOCK_FRACTION * B;
 /**
  * CHARGED demand per class: every RUNNING/ORPHANED lease at its leaseDemandBasis demand. A
  * synthetic head reservation (BRAIN-355) is never a lease and is never counted here.
+ * `charges` (lease id -> demand) is the per-lease demand the LIVE CPU evaluation actually computed
+ * (evaluateCpuAdmission's leaseCharges, at the clock live admission read); a lease absent from it is
+ * recomputed from `now`.
  */
-export function usedByClass(leases, now, cfg) {
+export function usedByClass(leases, now, cfg, charges = null) {
   const used = { test: 0, sim: 0 };
   for (const lease of leases) {
     if (lease.synthetic === true || !CHARGED_STATES.has(lease.state)) continue;
-    used[classOf(lease)] += leaseDemandBasis(lease, now, cfg).demand;
+    used[classOf(lease)] += charges?.get(lease.id) ?? leaseDemandBasis(lease, now, cfg).demand;
   }
   return used;
 }
@@ -66,13 +69,17 @@ export function ticketClaims(ticket, cfg) {
  * outcome); 'over-free' (does not fit even with no lock, the existing CPU guard denies it anyway).
  * `reservedHead` is a BRAIN-355 synthetic reservation's claim: it shrinks free but is in no used_c.
  * `idleExempt` is the BRAIN-346 idle overshoot: it waives only over-free, never the class lock.
- * `simsCanArm` is whether this runner can ever arm sims; if so an oversized TEST claim is clamped
- * to B - L_s (real-valued; the grant floors to whole cores, never below 1) so it can never wait forever on a lock that arms later.
+ * `simsCanArm` is whether this runner can ever arm sims; if so an oversized TEST claim (claim > B - L_s, and ONLY
+ * such a claim; every other claim, fractional ones included, is untouched) is clamped to the grant floor(B - L_s),
+ * the elastic-grant convention (whole cores, rounded down), so it can never wait forever on a lock that arms later.
+ * Tiny-B edge: when B - L_s < 1 the grant is 1 core (never 0, a claim below one core cannot run), which exceeds
+ * B - L_s: that test is class-locked while sims are armed and admitted once they disarm, so it waits at most
+ * simArmWindowMs after the last sim demand rather than forever.
  */
 export function evaluateCandidate({ candidate, cfg, B, usedT, usedS, externalBusy = 0, reservedHead = 0, armed, locks = classLocks({ B, armed }), simsCanArm = true, idleExempt = false }) {
   const klass = classOf(candidate);
   const { claim, floorClaim } = ticketClaims(candidate, cfg);
-  const clampedClaim = klass === 'test' && simsCanArm ? Math.max(1, Math.floor(Math.min(claim, B - simLockCeiling(B)))) : claim;
+  const clampedClaim = klass === 'test' && simsCanArm && claim > B - simLockCeiling(B) ? Math.max(1, Math.floor(B - simLockCeiling(B))) : claim;
   const effectiveClaim = Math.min(floorClaim, clampedClaim);
   const reservedOther = klass === 'sim' ? Math.max(0, locks.L_t - usedT) : Math.max(0, locks.L_s - usedS);
   const free = B - (usedT + usedS) - reservedHead;
@@ -81,7 +88,7 @@ export function evaluateCandidate({ candidate, cfg, B, usedT, usedS, externalBus
   const fits = effectiveClaim <= limit;
   const reason = fits ? 'ok' : fitsWithoutLock ? 'class-lock' : 'over-free';
   const eligible = fits || (idleExempt && reason === 'over-free' && effectiveClaim <= free - reservedOther);
-  return { eligible, claim, clampedClaim, effectiveClaim, reservedOther, reason, class: klass, limit };
+  return { eligible, claim, clampedClaim, effectiveClaim, reservedOther, reservedHead, reason, class: klass, limit };
 }
 
 /**
@@ -94,17 +101,21 @@ export function evaluateCandidate({ candidate, cfg, B, usedT, usedS, externalBus
  *  - a backfill past the head (blocked for class OR cpu/conflict) consumes one skip from the same
  *    bounded budget (`skipBudget.limit`/`.used`), except a BRAIN-355 safe backfill, which is uncounted;
  *  - `conflictBlocked(ticket)` / `safeBackfill(ticket)` are the live scheduler's own verdicts, passed in.
+ *  - `existingGuards(ticket)` returns the reasons (possibly none) the live scheduler's OTHER guards (weight
+ *    capacity, memory, pause, load/CPU gate, cooldown) deny that ticket, so "would admit" means every existing
+ *    guard AND the class lock pass. `charges` is the per-lease demand live admission computed (see usedByClass).
  *
  * A null queue entry (an unreadable record) stops the walk, as in every live selector.
  */
-export function evaluateQueue({ queue, held, now, cfg, B, externalBusy = 0, lastSimDemandAt, simsCanArm = true, skipBudget, reservation = null, conflictBlocked = () => false, safeBackfill = () => false, idleExempt = false }) {
-  const used = usedByClass(held, now, cfg);
+export function evaluateQueue({ queue, held, now, cfg, B, externalBusy = 0, lastSimDemandAt, simsCanArm = true, skipBudget, reservation = null, conflictBlocked = () => false, safeBackfill = () => false, existingGuards = () => [], charges = null, idleExempt = false }) {
+  const used = usedByClass(held, now, cfg, charges);
   const simQueued = queue.some((t) => t && classOf(t) === 'sim');
   const simCharged = held.some((l) => !l.synthetic && CHARGED_STATES.has(l.state) && classOf(l) === 'sim');
   const armed = simsCanArm && simArmed({ now, lastSimDemandAt, simQueued, simCharged, simArmWindowMs: cfg.simArmWindowMs });
   const locks = classLocks({ B, armed });
   const head = queue[0] ?? null;
-  const headClaim = head ? ticketClaims(head, cfg).floorClaim : 0;
+  // BRAIN-355 reserves the head's FULL resources (not its elastic floor) for a safe backfill, so does this.
+  const headClaim = head ? ticketClaims(head, cfg).claim : 0;
 
   const decisions = [];
   for (let index = 0; index < queue.length; index++) {
@@ -116,7 +127,9 @@ export function evaluateQueue({ queue, held, now, cfg, B, externalBusy = 0, last
     const safe = index > 0 && safeBackfill(ticket) === true;
     const verdict = evaluateCandidate({ candidate: ticket, cfg, B, usedT: used.test, usedS: used.sim, externalBusy, reservedHead: safe ? headClaim : 0, armed, locks, simsCanArm, idleExempt: idleExempt && index === 0 });
     const conflicted = conflictBlocked(ticket) === true;
-    decisions.push({ id: ticket.id, index, ...verdict, eligible: verdict.eligible && !conflicted, reason: conflicted ? 'conflict' : verdict.reason, safeBackfill: safe, skipped: false });
+    const guards = existingGuards(ticket);
+    const denied = conflicted || guards.length > 0;
+    decisions.push({ id: ticket.id, index, ...verdict, eligible: verdict.eligible && !denied, reason: conflicted ? 'conflict' : guards.length > 0 ? guards[0] : verdict.reason, guards, safeBackfill: safe, skipped: false });
   }
 
   const budgetUsed = skipBudget?.used ?? 0;

@@ -272,21 +272,19 @@ export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, c
   const candidateEstimate = coldStartEstimate(candidateResources?.cpuCores ?? candidateWeight);
   const projectedBusy = projectBusy(externalBusy, heldLeases, candidateEstimate, now, cfg);
   const budget = cpuBudget(cpuSample, cfg);
-  const leaseDemands = heldLeases.map((l) => {
-    const { demand, basis } = leaseDemandBasis(l, now, cfg);
-    return `${String(l.id).slice(0, 8)}:${fmt(demand)}(${basis})`;
-  });
+  const leaseCharges = heldLeases.map((l) => ({ id: l.id, ...leaseDemandBasis(l, now, cfg) }));
+  const leaseDemands = leaseCharges.map(({ id, demand, basis }) => `${String(id).slice(0, 8)}:${fmt(demand)}(${basis})`);
 
   if (cpuGateState.closed) {
-    return { admit: false, reason: 'cpu-gate-closed', externalBusy, projectedBusy, budget, leaseDemands };
+    return { admit: false, reason: 'cpu-gate-closed', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges };
   }
   if (cooldownBlocked) {
-    return { admit: false, reason: 'cooldown', externalBusy, projectedBusy, budget, leaseDemands };
+    return { admit: false, reason: 'cooldown', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges };
   }
   if (projectedBusy > budget) {
-    return { admit: false, reason: 'projected-over-budget', externalBusy, projectedBusy, budget, leaseDemands };
+    return { admit: false, reason: 'projected-over-budget', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges };
   }
-  return { admit: true, reason: 'ok', externalBusy, projectedBusy, budget, leaseDemands };
+  return { admit: true, reason: 'ok', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges };
 }
 
 /** The "nothing usable is known" fallback shared by a missing/stale sample

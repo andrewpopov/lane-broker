@@ -760,6 +760,7 @@ async function main() {
     if (!reloadFailed) clearConfigReloadWarning(root);
     if (cancelledBeforeStart || cancelRequested(root, ticket.id)) {
       dequeueSync(root, ticket.id);
+      touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit('cancelled');
     }
     // tryStart re-reads the config again inside its lock (BRAIN-182): the
@@ -819,6 +820,7 @@ async function main() {
       // way a queued cancel is finalized, so `remote-exec`'s own kind
       // derivation (reading this ticket's result.json) sees it.
       dequeueSync(root, ticket.id);
+      touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit(outcome, { forcePublish: cancelWon });
     }
     await sleep(globalCfg.sampleMs);
@@ -940,8 +942,8 @@ async function main() {
       if (rssPeak !== undefined) finalResult = { ...finalResult, observedRssPeakBytes: rssPeak };
       atomicWriteJson(ticket.resultPath, finalResult);
       appendHistory(root, historyRow(ticket, finalResult, { fallbackReason }));
-      touchSimArmFor(root, ticket);
       removeLease(root, ticket.id); // release always comes last
+      touchSimArmFor(root, ticket); // after the release: the arm stamp's I/O never delays freeing the lease
       // Cleanup only, AFTER the terminal write above -- never before (BLOCKER #1).
       clearTicketMarkers(root, ticket.id);
     };

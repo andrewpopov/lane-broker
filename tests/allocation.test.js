@@ -270,3 +270,40 @@ test('the arm window decides whether tests are held back: 4m59s ago is armed, 5m
   assert.equal(lapsed.head.eligible, true);
   assert.equal(lapsed.head.reservedOther, 0);
 });
+
+test('only an OVERSIZED test claim is clamped: fractional and in-range claims are left untouched', () => {
+  const clampOf = (claim, B) => evaluateCandidate({ candidate: ticket('t', 'test', claim), cfg: CFG, B, usedT: 0, usedS: 0, armed: true }).clampedClaim;
+  assert.equal(clampOf(1.5, 15), 1.5, 'a fractional in-range claim is not floored to 1');
+  assert.equal(clampOf(10.4, 15), 10.4, 'at B - L_s = 10.5 and below: untouched');
+  assert.equal(clampOf(11, 15), 10, 'above B - L_s: clamped to floor(B - L_s)');
+  assert.equal(clampOf(3, 1), 1, 'tiny-B edge: B - L_s = 0.7 < 1, the grant is 1 core, never 0');
+  assert.equal(evaluateCandidate({ candidate: ticket('t', 'test', 3), cfg: CFG, B: 1, usedT: 0, usedS: 0, armed: true }).reason, 'class-lock', 'and it is class-locked while sims are armed (it runs once they disarm)');
+  assert.equal(evaluateCandidate({ candidate: ticket('t', 'test', 3), cfg: CFG, B: 1, usedT: 0, usedS: 0, armed: false }).eligible, true);
+});
+
+test('a safe backfill leaves room for the head\'s FULL claim (as BRAIN-355 live does), not its elastic floor', () => {
+  // B=15, 6 held, head wants 8 (floor 2), the backfill candidate wants 2: 15 - 6 - 8 = 1 < 2
+  const held = [lease('r', 'test', 6)];
+  const head = ticket('head', 'test', 8, { minCpuCores: 2 });
+  const out = run({ held, queue: [head, ticket('bf', 'test', 2)], conflictBlocked: (t) => t.id === 'head', safeBackfill: (t) => t.id === 'bf', skipBudget: { limit: 3, used: 3 } });
+  assert.equal(out.decisions[1].reservedHead, 8);
+  assert.equal(out.decisions[1].eligible, false);
+  assert.equal(out.selection, null);
+  const fits = run({ held, queue: [head, ticket('bf', 'test', 1)], conflictBlocked: (t) => t.id === 'head', safeBackfill: (t) => t.id === 'bf', skipBudget: { limit: 3, used: 3 } });
+  assert.equal(fits.selection, 'bf');
+});
+
+test('existing guards (weight capacity, memory, pause...) veto a candidate the class locks would admit', () => {
+  const guarded = run({ queue: [ticket('head', 'test', 3)], existingGuards: (t) => (t.id === 'head' ? ['capacity'] : []) });
+  assert.equal(guarded.selection, null);
+  assert.equal(guarded.decisions[0].reason, 'capacity');
+  assert.deepEqual(guarded.decisions[0].guards, ['capacity']);
+  assert.equal(run({ queue: [ticket('head', 'test', 3)] }).selection, 'head');
+});
+
+test('charges supplied by the live evaluation replace the recomputed per-lease demand', () => {
+  const held = [lease('r', 'test', 2), lease('s', 'sim', 1)];
+  assert.deepEqual(usedByClass(held, NOW, CFG), { test: 2, sim: 1 });
+  assert.deepEqual(usedByClass(held, NOW, CFG, new Map([['r', 5.5]])), { test: 5.5, sim: 1 }, 'a lease absent from the map is still recomputed');
+  assert.equal(run({ held, queue: [], charges: new Map([['r', 5.5]]) }).used.test, 5.5);
+});

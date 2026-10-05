@@ -203,6 +203,7 @@ export async function cancelCommand(id) {
     appendHistory(root, { id, key: lease.key, cancelled: true, endedAt, executor: 'local' });
   }
   removeLease(root, id);
+  touchSimArmFor(root, lease);
   process.stdout.write(`lane cancel: cancelled orphaned lease ${id}\n`);
   return { exitCode: 0 };
 }

@@ -158,7 +158,12 @@ line to `admission-decisions.log` (B, per-class used CPU, the 0.15·B test and
 0.30·B sim soft locks, arm state, what class-aware allocation WOULD select, the
 actual live outcome, per-candidate verdicts), and `lane status` gains an
 `allocation` line/object. It never changes a live decision, skip counter or
-reservation. The sim arm stamp (`lastSimDemandAt`) lives in `sim-arm.json` in the
+reservation. The record is written after the broker lock is released, and only
+for the head's poll or a poll that actually starts a ticket (to keep the log
+small); every queued candidate's verdict (claim, effective and clamped claim,
+reservation, and the existing guards that deny it) is in the head record's
+`candidates=` list. A lane of class `sim` must resolve to at most 2 CPU cores.
+The sim arm stamp (`lastSimDemandAt`) lives in `sim-arm.json` in the
 state root; a missing or unreadable file means unarmed.
 
 `laneNice` (default `10`, range `0`-`19`): every lane is spawned under `nice

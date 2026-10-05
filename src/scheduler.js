@@ -125,6 +125,7 @@ export function reapStale(root, keepTicketId) {
       // The queue record is gone afterwards, so history is the only durable
       // trace of the drop (BRAIN-202). Same row conventions as cancel.js.
       if (dequeueSync(root, t.id)) {
+        touchSimArmFor(root, t);
         appendHistory(root, { id: t.id, key: t.key, dequeuedDeadSupervisor: true, error: 'supervisor died while queued', supervisorPid: t.supervisorPid, endedAt: Date.now(), executor: 'local' });
       }
     }
@@ -615,7 +616,8 @@ export function selectCapacityCandidate(queue, held, runningWeight, capacity) {
 export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler, reloadCfg = () => globalCfg, memoryReader = readMemoryInfo, writeResourceState = atomicWriteJson, shadowEvaluator = undefined) {
   // `shadow` is what the live evaluation below hands the BRAIN-379 shadow recorder; it is only ever
   // filled with copies and flags, never read back by the live decision.
-  const decide = (shadow) => {
+  const shadow = {};
+  const decide = () => {
     const cfg = reloadCfg() || globalCfg;
     const now = Date.now();
     reapStale(root, ticket.id);
@@ -647,7 +649,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // what it did before this ticket existed: one cheap read, no side
     // effects. Only the selected candidate pays for a real gate evaluation.
     const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
-    reconcileSimArm(root, queue, held, now);
+    const lastSimDemandAt = reconcileSimArm(root, queue, held, now, cfg.simArmWindowMs);
     const headTicket = queue[0];
     if (!headTicket) {
       // The literal head's own queue record is corrupt/unreadable (Codex
@@ -752,7 +754,8 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
         : resourceBackfill && ticket.id !== headTicket.id
           ? selectResourceCandidate(queue, held, runningWeight, weightCapacity, resourceRecord, cfg, now)
           : headTicket;
-    // BRAIN-379 shadow: snapshot, before anything below can write, exactly what the live selection saw.
+    // BRAIN-379 shadow: a cheap snapshot, taken under the lock before anything below can write, of exactly what
+    // the live selection saw. Evaluation and logging happen after the lock is released (see the end of tryStart).
     if (cfg.allocationShadow === true) {
       try {
         shadow.inputs = captureShadowInputs({
@@ -761,16 +764,19 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
           now,
           cfg,
           cpuCores,
+          lastSimDemandAt,
+          // a class-only skip spends the same bounded budget as a resource skip
           skipBudget: headConflicted
             ? { kind: 'conflict', limit: cfg.conflictSkipLimit, used: skipCount }
             : headCapacityBlocked
               ? { kind: 'capacity', limit: cfg.conflictSkipLimit, used: capacitySkipCount }
-              : resourceRecord
-                ? { kind: 'resource', limit: cfg.resourceSkipLimit, used: resourceRecord.count }
-                : { kind: 'none', limit: cfg.conflictSkipLimit, used: 0 },
+              : { kind: resourceRecord ? 'resource' : 'none', limit: cfg.resourceSkipLimit, used: resourceRecord ? resourceRecord.count : 0 },
           reservation: { reserved: capacityReserved || resourceReserved(resourceRecord) },
-          conflictBlocked: (t) => blockedBy(held, t) !== null,
-          safeBackfill: (t) => isSafeBackfill(t, queue.findIndex((q) => q && q.id === t.id)),
+          conflicted: queue.map((t) => (t ? blockedBy(held, t) !== null : false)),
+          safeBackfill: queue.map((t, i) => i > 0 && t !== null && isSafeBackfill(t, i)),
+          runningWeight,
+          weightCapacity,
+          paused: fs.existsSync(paths(root).pause),
         });
       } catch (err) {
         shadow.captureError = err;
@@ -843,8 +849,19 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     const headReservation = { id: headTicket.id, key: headTicket.key, weight: headTicket.weight, resources: headTicket.resources };
     const admissionHeld = safeBackfill || conflictPick ? [...held, headReservation] : held;
     const fullDecision = evaluateNewAdmission(root, cfg, ticket, admissionHeld, cpuSample, memInfo);
-    shadow.cpuSample = cpuSample;
-    shadow.externalBusy = fullDecision.externalBusy;
+    if (shadow.inputs) {
+      // what the LIVE evaluation produced (same clock reads, same charges), copied out for the post-lock evaluator
+      shadow.live = {
+        cores: Number.isFinite(cpuSample?.cores) ? cpuSample.cores : null,
+        budget: fullDecision.budget,
+        externalBusy: fullDecision.externalBusy,
+        leaseCharges: (fullDecision.leaseCharges ?? []).map(({ id, demand }) => [id, demand]),
+        cpuReason: fullDecision.cpuReason,
+        memInfo: memInfo ? { ...memInfo } : null,
+        loadGateBlocking: cfg.admissionLoadGate && gate.closed && !brokerIdle,
+        idleExempt: false,
+      };
+    }
     // BRAIN-360: an elastic ticket (resources.minCpuCores) denied ONLY by the CPU projection is
     // re-evaluated at smaller claims, over the same held leases (and, for a safe backfill, the same
     // head reservation), so the grant can never delay what the full claim could not. Active mode
@@ -933,7 +950,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       held.length === 0 &&
       cfg.resourceIdleOvershootCores > 0 &&
       cpuDecision.projectedBusy - cpuDecision.budget <= cfg.resourceIdleOvershootCores;
-    shadow.idleExempt = idleExempt;
+    if (shadow.live) shadow.live.idleExempt = idleExempt;
     if (cfg.schedulerMode === 'active' && !cpuDecision.admit && !idleExempt) {
       if (headPolling) {
         // Cooldown is the head's own backfill echoing back (each admission starts one), so it
@@ -1063,15 +1080,14 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       events,
     };
   };
-  const { result, logFields, events } = await withLock(root, () => {
-    const shadow = {};
-    const outcome = decide(shadow);
-    const headTicketId = shadow.inputs?.queue[0]?.id;
-    // One record per poll cycle (the head's poll) plus one per real admission; a non-head poll that starts nothing adds no information.
-    const recordsShadow = headTicketId === ticket.id || outcome.result.started === true;
-    if (recordsShadow && (shadow.inputs || shadow.captureError)) recordAllocationShadow({ root, shadow, outcome, pollerId: ticket.id, evaluator: shadowEvaluator });
-    return outcome;
-  });
+  const { result, logFields, events } = await withLock(root, decide);
+
+  // BRAIN-379: evaluated and logged after the lock is released, so shadow never lengthens a live admission or release.
+  // One record per poll cycle (the head's poll) plus one per real admission; a non-head poll that starts nothing adds
+  // no information (its verdict is in the head record's candidate list).
+  if ((shadow.inputs && (shadow.inputs.queue[0]?.id === ticket.id || result.started === true)) || shadow.captureError) {
+    recordAllocationShadow({ root, shadow, result, pollerId: ticket.id, evaluator: shadowEvaluator });
+  }
 
   // Pure telemetry: nothing reads this back to make a decision, so it never
   // needs to be atomic with anything above — write it after the lock has

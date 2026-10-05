@@ -64,3 +64,13 @@ test('allocationShadow must be a boolean and simArmWindowMs a positive integer',
   for (const bad of ['yes', 1, null]) assert.throws(() => load({ allocationShadow: bad }), (e) => e instanceof ConfigError && /"allocationShadow" must be a boolean/.test(e.message), `allocationShadow ${JSON.stringify(bad)}`);
   for (const bad of [0, -5, 1.5, '300000', null]) assert.throws(() => load({ simArmWindowMs: bad }), (e) => e instanceof ConfigError && /"simArmWindowMs" must be a positive integer/.test(e.message), `simArmWindowMs ${JSON.stringify(bad)}`);
 });
+
+test('a sim lane whose resolved CPU claim exceeds 2 cores is rejected, whether it comes from cpuCores or the weight fallback', () => {
+  const rejected = (lane) => assert.throws(() => resolveLane({ default: { weight: 1 }, sims: lane }, 'sims'), (e) => e instanceof ConfigError && /class "sim", so its CPU claim \(\d+\) must be <= 2 cores/.test(e.message), JSON.stringify(lane));
+  rejected({ class: 'sim', weight: 8 });
+  rejected({ class: 'sim', weight: 1, cpuCores: 8 });
+  rejected({ class: 'sim', weight: 1, cpuCores: 3 });
+  assert.equal(resolveLane({ default: { weight: 1 }, sims: { class: 'sim', weight: 2 } }, 'sims').class, 'sim');
+  assert.equal(resolveLane({ default: { weight: 1 }, sims: { class: 'sim', weight: 8, cpuCores: 2 } }, 'sims').class, 'sim', 'cpuCores overrides weight for the claim');
+  assert.equal(resolveLane({ default: { weight: 1 }, heavy: { class: 'test', weight: 8 } }, 'heavy').class, 'test', 'the ceiling is for sims only');
+});
