@@ -54,8 +54,10 @@ export const SCRUBBED_ENV_PREFIXES = ['LANE_'];
  * but are not hashed. That is safe because a git dependency is cached only when pinned to a 40-hex commit
  * (`lockEligibility`): credentials decide whether the install SUCCEEDS, never what it installs.
  */
-export const AUTH_ENV_NAMES = new Set(['GIT_SSH', 'GIT_SSH_COMMAND']);
-export const AUTH_ENV_PREFIXES = ['SSH_'];
+export const AUTH_ENV_NAMES = new Set(['SSH_AUTH_SOCK', 'SSH_AGENT_PID', 'GIT_SSH', 'GIT_SSH_COMMAND']);
+
+/** Per-connection ssh session info, different on every run and read by no install. Any OTHER `SSH_*` variable is hashed. */
+export const SESSION_ENV_NAMES = new Set(['SSH_CONNECTION', 'SSH_CLIENT', 'SSH_TTY']);
 export const PER_RUN_PATH_ENV_NAMES = ['TMPDIR', 'TMP', 'TEMP'];
 
 const isScrubbed = (name) => SCRUBBED_ENV_NAMES.has(name) || SCRUBBED_ENV_PREFIXES.some((p) => name.startsWith(p));
@@ -166,20 +168,21 @@ export function parseMountOutput(text, target) {
  * noexec/nosuid/nodev/ro. The paths themselves differ per run and stay out of the key, but whether a
  * build can execute from its temp dir does not. Unreadable is a value ('unknown'), never a crash.
  */
-export function tempDirFsProperties(env, { readMounts = defaultReadMounts } = {}) {
-  const dirs = [...new Set(PER_RUN_PATH_ENV_NAMES.map((n) => env[n]).filter(Boolean))].sort();
-  if (dirs.length === 0) dirs.push(os.tmpdir());
-  return dirs
-    .map((dir) => {
-      try {
-        const real = fs.realpathSync(dir);
-        const mounts = readMounts();
-        return (process.platform === 'darwin' ? parseMountOutput(mounts, real) : parseMountInfo(mounts, real)) ?? 'unknown';
-      } catch {
-        return 'unknown';
-      }
-    })
-    .join(';');
+export function tempDirFsProperties(env, { readMounts = defaultReadMounts, platform = process.platform } = {}) {
+  const describe = (dir) => {
+    try {
+      const real = fs.realpathSync(dir);
+      const mounts = readMounts();
+      return (platform === 'darwin' ? parseMountOutput(mounts, real) : parseMountInfo(mounts, real)) ?? 'unknown';
+    } catch {
+      return 'unknown';
+    }
+  };
+  // By variable NAME, so swapping which variable points at which filesystem changes the fingerprint.
+  const parts = PER_RUN_PATH_ENV_NAMES.map((name) => `${name}=${env[name] ? describe(env[name]) : 'unset'}`);
+  // What a tool that ignores the variables falls back to (node's os.tmpdir() order, evaluated on the install's env).
+  if (!env.TMPDIR) parts.push(`os.tmpdir=${describe(env.TMP || env.TEMP || '/tmp')}`);
+  return parts.join(';');
 }
 
 function defaultReadMounts() {
@@ -380,7 +383,7 @@ export function computeDepsKey({
     parts.push([`tarball:${rel}`, bytes]);
   }
   const unhashed = (name) =>
-    isScrubbed(name) || PER_RUN_PATH_ENV_NAMES.includes(name) || AUTH_ENV_NAMES.has(name) || AUTH_ENV_PREFIXES.some((p) => name.startsWith(p));
+    isScrubbed(name) || PER_RUN_PATH_ENV_NAMES.includes(name) || AUTH_ENV_NAMES.has(name) || SESSION_ENV_NAMES.has(name);
   for (const name of Object.keys(env).filter((k) => !unhashed(k)).sort()) parts.push([`env:${name}`, String(env[name])]);
   for (const name of NPM_CONFIG_FILE_ENVS) {
     if (env[name]) parts.push([`file:${name}`, readIfExists(env[name]) ?? '']);

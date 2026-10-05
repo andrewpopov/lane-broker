@@ -139,6 +139,16 @@ test('key: identical inputs give the same key; volatile variables do not matter,
   });
   assert.equal(computeDepsKey(volatile).key, a.key, 'per-run and authentication variables are not part of the key (a git dep is pinned to a sha, so credentials decide success, not content)');
 
+  const sshBuild = (value) => {
+    const i = f.inputs();
+    i.env.SSH_BUILD_MODE = value;
+    return computeDepsKey(i).key;
+  };
+  assert.notEqual(sshBuild('native'), sshBuild('portable'), 'an SSH_* variable that is not auth or session info is hashed');
+  const withAgent = f.inputs();
+  Object.assign(withAgent.env, { SSH_AUTH_SOCK: '/other.sock', SSH_AGENT_PID: '4242', SSH_CLIENT: '1.2.3.4 5 22', SSH_TTY: '/dev/pts/9' });
+  assert.equal(computeDepsKey(withAgent).key, a.key, 'named auth and session variables are not');
+
   for (const change of [{ PATH: '/other/bin' }, { HOME: '/home/other' }, { CC: 'clang' }, { HTTPS_PROXY: 'http://p' }, { npm_config_registry: 'http://r.invalid' }]) {
     const i = f.inputs();
     Object.assign(i.env, change);
@@ -738,17 +748,39 @@ test('temp dir filesystem properties come from the longest covering mount: fs ty
   assert.equal(parseMountOutput(mac, '/private/tmp/x/lb'), 'tmpfs|noexec,nosuid');
 });
 
+test('temp dir fingerprint is by variable name: swapping which variable is on the noexec mount changes it', () => {
+  const exec = tmpDir('deps-cache-exec');
+  const noexec = tmpDir('deps-cache-noexec');
+  const real = (d) => fs.realpathSync(d);
+  const table = [`1 0 0:1 / ${real(exec)} rw - ext4 /dev/a rw`, `2 0 0:2 / ${real(noexec)} rw,noexec - ext4 /dev/b rw`].join('\n');
+  const nameDirs = (env) => tempDirFsProperties(env, { readMounts: () => table, platform: 'linux' });
+  const a = nameDirs({ TMPDIR: exec, TMP: noexec });
+  const b = nameDirs({ TMPDIR: noexec, TMP: exec });
+  assert.notEqual(a, b, 'the same two dirs under swapped names are different environments');
+  assert.match(a, /^TMPDIR=.*;TMP=.*;TEMP=unset$/);
+  assert.notEqual(nameDirs({ TMPDIR: exec }), nameDirs({ TMPDIR: exec, TEMP: exec }), 'unset is a value');
+  assert.match(nameDirs({ TMP: noexec }), /os\.tmpdir=/, 'the fallback is recorded when TMPDIR is unset');
+  assert.doesNotMatch(nameDirs({ TMPDIR: exec }), /os\.tmpdir/);
+
+  const f = makeKeyFixture();
+  const keyFor = (env) => {
+    const i = f.inputs();
+    i.tempFsProps = () => nameDirs(env);
+    return computeDepsKey(i).key;
+  };
+  assert.notEqual(keyFor({ TMPDIR: exec, TMP: noexec }), keyFor({ TMPDIR: noexec, TMP: exec }), 'and so are their keys');
+});
+
 test('tempDirFsProperties reads each temp dir the install sees, ignores their per-run paths, and never throws', () => {
   const dirA = tmpDir('deps-cache-tmpa');
   const dirB = tmpDir('deps-cache-tmpb');
   const mounts = () => MOUNTINFO;
-  const linux = process.platform === 'linux';
-  const a = tempDirFsProperties({ TMPDIR: dirA }, { readMounts: mounts });
-  const b = tempDirFsProperties({ TMPDIR: dirB }, { readMounts: mounts });
+  const a = tempDirFsProperties({ TMPDIR: dirA }, { readMounts: mounts, platform: 'linux' });
+  const b = tempDirFsProperties({ TMPDIR: dirB }, { readMounts: mounts, platform: 'linux' });
   assert.equal(a, b, 'two different per-run paths on the same filesystem give the same properties');
-  if (linux) assert.equal(a, parseMountInfo(MOUNTINFO, fs.realpathSync(dirA)), 'looked up in the table by the dir\'s real path');
-  assert.equal(tempDirFsProperties({ TMPDIR: '/does/not/exist' }, { readMounts: mounts }), 'unknown');
-  assert.equal(tempDirFsProperties({ TMPDIR: dirA }, { readMounts: () => { throw new Error('no /proc'); } }), 'unknown');
+  assert.match(a, new RegExp(`^TMPDIR=${parseMountInfo(MOUNTINFO, fs.realpathSync(dirA)).replace('|', '\\|')};`), 'looked up in the table by the dir\'s real path');
+  assert.match(tempDirFsProperties({ TMPDIR: '/does/not/exist' }, { readMounts: mounts, platform: 'linux' }), /^TMPDIR=unknown;/);
+  assert.match(tempDirFsProperties({ TMPDIR: dirA }, { readMounts: () => { throw new Error('no /proc'); }, platform: 'linux' }), /^TMPDIR=unknown;/);
 });
 
 // ---- absolute install path ----
