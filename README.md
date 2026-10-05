@@ -64,6 +64,7 @@ features like pipes or globbing.
 | `--weight <n>` | Override the configured weight for this run; must be a positive number (validated before enqueueing, exit `2` otherwise). |
 | `--cpu <cores>` | Override the lane's CPU reservation; fractional cores are supported. |
 | `--memory <size>` | Override the lane's memory reservation, e.g. `768MiB` or `4GiB`. |
+| `--priority high\|medium\|low` | BRAIN-380 priority tier (default `medium`). Beats env `LANE_BROKER_PRIORITY`, which beats the lane's `priority` in `.lane-broker.json` (an `undeclaredLanes.as` template passes its tier on), which beats `medium`. Any invalid value from any of the three exits `64`. See "Priority (foundations)" below. |
 | `--detach` | Print the run id and return immediately instead of waiting. |
 | `--timeout <duration>` | e.g. `30s`, `5m`, `500ms`. Exit `75` if not finished in time — see below. |
 | `--allow-local-sim` | Override a lane's `localRefused: true`. |
@@ -665,6 +666,35 @@ or memory reservation. Any other nested key — a
 different repo, or a different lane that isn't `prepush` — is refused with
 exit `64`; v1 has no general lane hierarchy.
 
+### Priority (foundations, BRAIN-380 slice 1)
+
+The scheduler is still strictly FIFO: this slice records tiers and a priority
+clock but reorders nothing, and `lane status` says so
+(`priority: inactive (legacy scheduler; run lane migrate-scheduler)`). Each
+queued ticket persists `priorityRequested`, `priorityAdmitted` (equal to
+requested until the per-repo high cap ships), `prioOriginAt` and
+`schedVersion: 2`. The resolved tier is exported to the lane child (and to a
+reentrant child) as `LANE_BROKER_PRIORITY`; a `remote-exec` ticket ignores the
+runner shell's value and is `medium`.
+
+The priority clock is `nowEff = max(wall clock, hwm)`, where `hwm` is a
+persisted high-water mark (`priority-hwm.json` in the state root) advanced under
+the broker lock on every locked evaluation and every enqueue. `lane run` takes
+the lock briefly to stamp `prioOriginAt = nowEff`, so a wall-clock step backwards
+freezes a ticket's age instead of reversing it, and a ticket created during the
+rollback starts at zero age. `createdAt` and every deadline derived from it stay
+on the wall clock. `lane status` reads the mark and never writes it, and shows
+each queued ticket's tier plus its effective rank once it has aged a step.
+
+Global config (all optional): `priorityAgingMs` (integer in `[60000, 3600000]`,
+default `600000`: one tier of age per period), `priorityAgeMaxMs` (integer in
+`[priorityAgingMs, 86400000]`, default `2 x priorityAgingMs`),
+`priorityWeights` `{tier, age, fairshare}` (`tier` and `age` in `(0, 100]`,
+`age >= tier`, `fairshare` exactly `0`; defaults `2/2/0`) and
+`maxQueuedHighPerRepo` (non-negative integer, default `1`; not enforced yet).
+`src/priority.js` holds the pure score (`min(W_tier, W_tier*tierFactor +
+W_age*ageFactor)`) and `orderQueue`; no selector calls them yet.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -673,7 +703,7 @@ exit `64`; v1 has no general lane hierarchy.
 | the child's exit code | Passed straight through on completion. |
 | `1` | The command errored, was signalled, or the supervisor died unexpectedly. |
 | `2` | Bad CLI usage (missing command / argument). |
-| `64` | Nested `lane run` would widen the inherited lease — refused. |
+| `64` | Nested `lane run` would widen the inherited lease — refused; or an invalid `--priority` / `LANE_BROKER_PRIORITY` / lane `priority`. |
 | `69` | Local-sim lane refused (fleet-offload message); use `--allow-local-sim`. |
 | `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. |
 | `130` | Cancelled (SIGINT/SIGTERM) while still queued, before the lane ever started. |
@@ -714,7 +744,7 @@ the queue so you know what's waiting and why.
 ## State
 
 `$LANE_BROKER_STATE` (default `~/.cache/lane-broker`): `leases/`, `queue/`,
-`logs/` (per-run, capped at 50MB with a truncation notice), `results/`,
+`priority-hwm.json` (the priority clock's high-water mark), `logs/` (per-run, capped at 50MB with a truncation notice), `results/`,
 `history.jsonl` (one line per completed run, plus one `dequeuedDeadSupervisor: true`
 row `{id, key, error, supervisorPid, endedAt, executor}` (`error: "supervisor died while queued"`, so a history reader counts it as an error, not a failed run) when a queued ticket whose
 supervisor died is dropped from the queue; it is written only once the queue

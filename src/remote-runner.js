@@ -250,6 +250,8 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   delete process.env.LANE_BROKER_LEASE;
   delete process.env.LANE_BROKER_KEY;
   delete process.env.LANE_BROKER_TICKET;
+  // BRAIN-380: a remote-exec ticket's tier comes only from the dispatch header (none yet, so medium), never the runner shell.
+  delete process.env.LANE_BROKER_PRIORITY;
   process.env.LANE_BROKER_LOCAL = '1';
 
   // BRAIN-320 review fix C: also scrub git's own repo-local env vars
@@ -410,6 +412,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     // dispatched at all; refusing it again on this side would make every
     // remote-eligible localRefused lane refuse twice over.
     allowLocalSim: true,
+    priority: 'medium',
     weightOverride: header.weight,
     cpuOverride: header.cpuCores,
     minCpuOverride: header.minCpuCores,

@@ -18,6 +18,7 @@ import { touchSimArmFor } from './sim-arm.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { observeLeaseTree } from './cpu.js';
 import { reloadGlobalConfig } from './config.js';
+import { isPriorityTier } from './priority.js';
 import { detectResourceCapacity, checkResourceBudget, localSimRefusal, leaseCpuCores } from './resources.js';
 import { selectRunner, dispatchRemote, needsProtocol2 } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
@@ -304,6 +305,9 @@ export function childEnv(ticket, baseEnv = process.env, grantedCpuCores = ticket
   else delete env.LANE_BROKER_CPU_CORES;
   if (Number.isFinite(memoryBytes) && memoryBytes > 0) env.LANE_BROKER_MEMORY_BYTES = String(memoryBytes);
   else delete env.LANE_BROKER_MEMORY_BYTES;
+  // BRAIN-380: nested `lane run` calls inherit the tier this ticket was ADMITTED at, never the caller's own shell value.
+  if (isPriorityTier(ticket.priorityAdmitted)) env.LANE_BROKER_PRIORITY = ticket.priorityAdmitted;
+  else delete env.LANE_BROKER_PRIORITY;
   return env;
 }
 

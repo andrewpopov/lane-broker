@@ -41,6 +41,8 @@ export function paths(root = stateHome()) {
     simArm: path.join(root, 'sim-arm.json'),
     simArmLock: path.join(root, 'sim-arm.lock'),
     seq: path.join(root, 'seq'),
+    // BRAIN-380: broker-wide high-water mark of wall time (the priority clock); see src/priority-clock.js.
+    hwm: path.join(root, 'priority-hwm.json'),
     // BRAIN-319 T3b-2 (C3): one durable attempt record per remote-eligible
     // ticket, keyed by ticket id -- see src/attempts.js.
     attempts: path.join(root, 'attempts'),

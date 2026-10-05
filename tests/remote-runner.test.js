@@ -509,6 +509,23 @@ test('a real matching lease forwarded via LANE_BROKER_LEASE/KEY is NOT reused (I
   assert.equal(probe.local, '1');
 });
 
+// BRAIN-380: a remote-exec ticket's tier comes only from the dispatch header (none yet, so medium). The runner shell's own
+// LANE_BROKER_PRIORITY -- valid or not -- must neither set the tier nor fail the run.
+for (const shellValue of ['high', 'low', 'not-a-tier']) {
+  test(`a remote-exec ticket ignores the runner shell's LANE_BROKER_PRIORITY=${shellValue}: medium, and its child sees medium`, async () => {
+    const { env } = freshShadowEnv();
+    const root = tmpDir('remote-exec-root');
+    const probeFile = path.join(tmpDir('remote-exec-probe'), 'probe.json');
+    const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+    const header = makeHeader({
+      argv: [process.execPath, '-e', `require('fs').writeFileSync(process.env.PROBE_FILE, JSON.stringify({prio:process.env.LANE_BROKER_PRIORITY||null}))`],
+    });
+    const { code, err } = await runOne(header, entries, { env: { ...env, LANE_BROKER_PRIORITY: shellValue, PROBE_FILE: probeFile }, root, src });
+    assert.equal(code, 0, err);
+    assert.equal(JSON.parse(fs.readFileSync(probeFile, 'utf8')).prio, 'medium');
+  });
+}
+
 // BRAIN-319 T3: reworked to not depend on `lane cancel`'s SIGTERM grace
 // window (that wait is real, host-load-dependent time -- it was the source
 // of an observed flake under heavy ambient machine load). A bounded sleep

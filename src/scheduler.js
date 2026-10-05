@@ -7,6 +7,8 @@ import { evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleC
 import { readMemoryInfo } from './cpu.js';
 import { captureShadowInputs, recordAllocationShadow } from './allocation-shadow.js';
 import { reconcileSimArm, touchSimArmFor } from './sim-arm.js';
+import { advanceHwm } from './priority-clock.js';
+import { DEFAULT_PRIORITY, isPriorityTier, originOrNow } from './priority.js';
 import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, resolveTicketResources } from './resources.js';
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
@@ -53,8 +55,20 @@ function findQueueFile(root, id) {
 /** Enqueue a ticket at the tail of the global FIFO. Caller must NOT hold the lock. */
 export async function enqueue(root, ticket) {
   return withLock(root, () => {
+    const nowEff = advanceHwm(root);
     const seq = nextSeq(root);
-    const record = { ...ticket, seq, createdAt: ticket.createdAt || Date.now() };
+    const priorityRequested = isPriorityTier(ticket.priorityRequested) ? ticket.priorityRequested : DEFAULT_PRIORITY;
+    const record = {
+      ...ticket,
+      seq,
+      createdAt: ticket.createdAt || Date.now(),
+      priorityRequested,
+      // BRAIN-380 slice 1: nothing demotes yet, so admitted == requested; the per-repo high cap lands later.
+      priorityAdmitted: priorityRequested,
+      // An origin from `lane run` was stamped under this same lock; one that is missing or ahead of the clock starts at zero age.
+      prioOriginAt: originOrNow(ticket.prioOriginAt, nowEff),
+      schedVersion: 2,
+    };
     atomicWriteJson(queueFile(root, seq, ticket.id), record);
     touchSimArmFor(root, record);
     return record;
@@ -151,6 +165,7 @@ export function reapStale(root, keepTicketId) {
  */
 export async function couldAdmitNow(root, cfg, ticket, memoryReader = readMemoryInfo) {
   return withLock(root, () => {
+    advanceHwm(root);
     reapStale(root, ticket.id);
     return couldAdmitLocked(root, cfg, ticket, memoryReader);
   });
@@ -632,6 +647,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
   const decide = () => {
     const cfg = reloadCfg() || globalCfg;
     const now = Date.now();
+    advanceHwm(root, now);
     reapStale(root, ticket.id);
     const queue = listQueue(root);
     const position = queue.findIndex((t) => t && t.id === ticket.id);

@@ -11,6 +11,8 @@ import { listAttempts, supervisorAlive } from './attempts.js';
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfig } from './config.js';
+import { effectiveNow } from './priority-clock.js';
+import { priorityOf, effectiveRank, tierName } from './priority.js';
 import { leaseOverrun } from './observed.js';
 import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores } from './resources.js';
 
@@ -178,13 +180,23 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
   const reservedCpuCores = held.reduce((sum, lease) => sum + leaseResources(lease, cfg).cpuCores, 0);
   const reservedMemoryBytes = held.reduce((sum, lease) => sum + leaseResources(lease, cfg).memoryBytes, 0);
 
-  const queued = queue.map((t, i) => ({
-    id: t.id,
-    key: t.key,
-    position: i + 1,
-    waitedMs: now - t.createdAt,
-    resources: leaseResources(t, cfg),
-  }));
+  // BRAIN-380: read-only view of the priority clock (status never writes the mark). Until
+  // `lane migrate-scheduler` exists the broker runs the legacy FIFO scheduler, so the queue below
+  // stays FIFO and the rank is informational: what the ticket's age would be worth.
+  const nowEff = effectiveNow(root, now);
+  const queued = queue.map((t, i) => {
+    const rank = effectiveRank(t, nowEff, cfg);
+    const tier = priorityOf(t);
+    return {
+      id: t.id,
+      key: t.key,
+      position: i + 1,
+      waitedMs: now - t.createdAt,
+      priority: tier,
+      ...(tierName(rank) !== tier ? { effectiveRank: tierName(rank) } : {}),
+      resources: leaseResources(t, cfg),
+    };
+  });
 
   // BRAIN-319 T3b-4 (C4): an attempt still mid remote-dispatch (executor
   // 'remote') is neither a lease nor a queue entry -- `used`/`reservedCpu
@@ -226,6 +238,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       mode: cfg.schedulerMode,
     },
     paused,
+    priority: { active: false, mode: 'legacy', nowEff },
     ...(cfg.allocationShadow ? { allocation: computeAllocation(root, cfg, queue.filter(Boolean), held, resourceCapacity.cpuCores, now) } : {}),
     // BRAIN-249: null unless the queue is genuinely stalled (a conflict-
     // blocked head whose skip allowance is exhausted) — see computeHeadBlock.
@@ -396,6 +409,9 @@ export function renderStatusText(status) {
     lines.push(`allocation (shadow): ${cls('test', a.test)}; ${cls('sim', a.sim)}; sims ${a.armed ? 'armed' : 'unarmed'}`);
   }
   lines.push(renderMemoryLine(status.memory));
+  if (status.priority && !status.priority.active) {
+    lines.push('priority: inactive (legacy scheduler; run lane migrate-scheduler)');
+  }
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
   if (status.configWarning) {
     lines.push(
@@ -427,7 +443,8 @@ export function renderStatusText(status) {
     lines.push('  (none)');
   } else {
     for (const q of status.queued) {
-      lines.push(`  #${q.position} ${q.id}  key=${q.key}  waited=${fmtMs(q.waitedMs)}`);
+      const tier = q.priority ? `  priority=${q.priority}${q.effectiveRank ? ` (aged to ${q.effectiveRank})` : ''}` : '';
+      lines.push(`  #${q.position} ${q.id}  key=${q.key}  waited=${fmtMs(q.waitedMs)}${tier}`);
     }
   }
   if (status.remote) {

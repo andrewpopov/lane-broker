@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { isCanonicalRelPath } from './remote-manifest.js';
+import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
 
 export const DEFAULT_GLOBAL_CONFIG = {
   version: 1,
@@ -94,6 +95,14 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // BRAIN-379: how long after the last sim demand (a sim ticket queued or a sim lease charged) the
   // sim soft lock stays armed.
   simArmWindowMs: 300_000,
+  // BRAIN-380: priority tiers. Each `priorityAgingMs` of waiting is worth one tier, and aging stops at
+  // `priorityAgeMaxMs` (default 2 x agingMs, derived at load when unset). Score = min(W_tier,
+  // W_tier*tierFactor + W_age*ageFactor); `fairshare` is a reserved slot and must stay 0.
+  priorityAgingMs: 600_000,
+  priorityAgeMaxMs: 1_200_000,
+  priorityWeights: { tier: 2, age: 2, fairshare: 0 },
+  // At most this many queued high tickets per repo per broker (0 disables high). Enforced in a later slice.
+  maxQueuedHighPerRepo: 1,
 };
 
 export const DEFAULT_REPO_CONFIG = {
@@ -214,6 +223,32 @@ function validateGlobalConfig(cfg, sourcePath) {
     );
   }
   if (cfg.runners !== undefined) validateRunners(cfg.runners, sourcePath);
+  validatePriorityConfig(cfg, sourcePath);
+}
+
+function validatePriorityConfig(cfg, sourcePath) {
+  assert(
+    Number.isInteger(cfg.priorityAgingMs) && cfg.priorityAgingMs >= 60_000 && cfg.priorityAgingMs <= 3_600_000,
+    `${sourcePath}: "priorityAgingMs" must be an integer in [60000, 3600000]`,
+  );
+  assert(
+    Number.isInteger(cfg.priorityAgeMaxMs) && cfg.priorityAgeMaxMs >= cfg.priorityAgingMs && cfg.priorityAgeMaxMs <= 86_400_000,
+    `${sourcePath}: "priorityAgeMaxMs" must be an integer in [priorityAgingMs, 86400000]`,
+  );
+  const weights = cfg.priorityWeights;
+  assert(weights && typeof weights === 'object' && !Array.isArray(weights), `${sourcePath}: "priorityWeights" must be an object`);
+  for (const name of ['tier', 'age']) {
+    assert(
+      Number.isFinite(weights[name]) && weights[name] > 0 && weights[name] <= 100,
+      `${sourcePath}: "priorityWeights.${name}" must be a number in (0, 100]`,
+    );
+  }
+  assert(weights.age >= weights.tier, `${sourcePath}: "priorityWeights.age" must be >= "priorityWeights.tier" (a low ticket must be able to reach the ceiling)`);
+  assert(weights.fairshare === 0, `${sourcePath}: "priorityWeights.fairshare" must be exactly 0 until its factor exists`);
+  assert(
+    Number.isInteger(cfg.maxQueuedHighPerRepo) && cfg.maxQueuedHighPerRepo >= 0,
+    `${sourcePath}: "maxQueuedHighPerRepo" must be a non-negative integer`,
+  );
 }
 
 const RUNNER_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
@@ -320,6 +355,9 @@ function validateRepoConfig(cfg, sourcePath) {
         assert(simClaim <= MAX_SIM_CPU_CORES, `${sourcePath}: lane "${name}" is class "sim", so its CPU claim (${simClaim}) must be <= ${MAX_SIM_CPU_CORES} cores`);
       }
     }
+    if (lane.priority !== undefined) {
+      assert(isPriorityTier(lane.priority), `${sourcePath}: lane "${name}".priority must be one of ${PRIORITY_TIERS.join(', ')}`);
+    }
     if (lane.maxConcurrent !== undefined) {
       assert(
         Number.isInteger(lane.maxConcurrent) && lane.maxConcurrent >= 1,
@@ -381,6 +419,22 @@ function validateRepoConfig(cfg, sourcePath) {
   }
 }
 
+/**
+ * BRAIN-380 precedence: `lane run --priority`, then env `LANE_BROKER_PRIORITY`, then the lane's
+ * `.lane-broker.json` tier (the `undeclaredLanes` template is already folded into `configTier`),
+ * then medium. A value is validated only when it is the one that applies; an invalid one throws
+ * ConfigError, which `lane run` maps to exit 64.
+ */
+export function resolvePriority({ cli, env, configTier }) {
+  const choose = (value, source) => {
+    assert(isPriorityTier(value), `${source} must be one of ${PRIORITY_TIERS.join(', ')} (got "${value}")`);
+    return value;
+  };
+  if (cli !== undefined) return choose(cli, '--priority');
+  if (env !== undefined) return choose(env, 'LANE_BROKER_PRIORITY');
+  return configTier ?? DEFAULT_PRIORITY;
+}
+
 export function loadGlobalConfig() {
   const home = brokerHome();
   const file = path.join(home, 'config.json');
@@ -392,6 +446,13 @@ export function loadGlobalConfig() {
     throw new ConfigError(`${file}: invalid JSON (${err.message})`);
   }
   const cfg = { ...DEFAULT_GLOBAL_CONFIG, ...parsed };
+  // A partial `priorityWeights` overrides only the weights it names; the age cap follows the aging step unless set.
+  if (parsed.priorityWeights && typeof parsed.priorityWeights === 'object' && !Array.isArray(parsed.priorityWeights)) {
+    cfg.priorityWeights = { ...DEFAULT_GLOBAL_CONFIG.priorityWeights, ...parsed.priorityWeights };
+  }
+  if (parsed.priorityAgeMaxMs === undefined && Number.isInteger(cfg.priorityAgingMs)) {
+    cfg.priorityAgeMaxMs = 2 * cfg.priorityAgingMs;
+  }
   validateGlobalConfig(cfg, file);
   return cfg;
 }
@@ -608,7 +669,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   if (isDeclaredLane) {
     laneCfg = repoConfig.lanes[laneName];
   } else if (undeclaredTemplateName) {
-    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/remote/remoteDeps/remoteSetup/class
+    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/remote/remoteDeps/remoteSetup/class/priority
     // from the named declared lane, keeping this lane's OWN key/name. Not
     // inherited: `localRefused` (stays default false), the template's named
     // conflicts (only the `*` wildcard universe below reaches this lane, same
@@ -625,6 +686,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       remoteDeps: templateCfg.remoteDeps,
       remoteSetup: templateCfg.remoteSetup,
       class: templateCfg.class,
+      priority: templateCfg.priority,
     };
   } else {
     laneCfg = { weight: DEFAULT_REPO_CONFIG.lanes.default.weight };
@@ -663,6 +725,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     maxConcurrent: Number.isInteger(laneCfg.maxConcurrent) ? laneCfg.maxConcurrent : 1,
     // BRAIN-379: allocation class; defaulted here so every lane predating the field is a 'test'.
     class: laneCfg.class === 'sim' ? 'sim' : 'test',
+    // BRAIN-380: the lane's declared tier (validated above); null lets the caller fall through to the default.
+    priority: isPriorityTier(laneCfg.priority) ? laneCfg.priority : null,
     conflicts,
     // BRAIN-319 T3a: opt-in per lane, defaulted false so a repo config
     // written before this field exists resolves identically (I6).

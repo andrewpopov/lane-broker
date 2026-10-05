@@ -3,10 +3,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { ensureStateDirs, paths, readJsonSafe } from './state.js';
-import { resolveTicketConfig, reloadGlobalConfig, ConfigError } from './config.js';
+import { ensureStateDirs, paths, readJsonSafe, LockTimeoutError } from './state.js';
+import { resolveTicketConfig, reloadGlobalConfig, resolvePriority, ConfigError } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
+import { stampPriorityOrigin, effectiveNow } from './priority-clock.js';
 import { detectResourceCapacity, leaseResources, resolveTicketResources, checkResourceBudget, localSimRefusal } from './resources.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
 
@@ -170,6 +171,9 @@ export async function runCommand({
   // LANE_BROKER_LOCAL=1 env var below (bin/lane.js's `--local` flag sets
   // this option; the env var lets a nested/scripted caller force it too).
   local,
+  // BRAIN-380: the raw `--priority` value (validated here, exit 64), or the tier a caller that must
+  // not read this process's env pins (`lane remote-exec` passes 'medium').
+  priority: priorityOverride,
   cwd = process.cwd(),
   cmd,
   log,
@@ -200,6 +204,17 @@ export async function runCommand({
   let resolved;
   try {
     resolved = resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityOverride });
+  } catch (err) {
+    if (err instanceof ConfigError) {
+      process.stderr.write(`lane run: ${err.message}\n`);
+      return { exitCode: 64 };
+    }
+    throw err;
+  }
+  // BRAIN-380: resolved and validated before the reentrancy check below, so a bad value exits 64 on every path.
+  let priority;
+  try {
+    priority = resolvePriority({ cli: priorityOverride, env: process.env.LANE_BROKER_PRIORITY, configTier: resolved.priority });
   } catch (err) {
     if (err instanceof ConfigError) {
       process.stderr.write(`lane run: ${err.message}\n`);
@@ -270,7 +285,7 @@ export async function runCommand({
           return { exitCode: 64 };
         }
         // Reentrant: an ancestor already holds a lease covering this run. Run directly, no new acquisition.
-        const child = spawn(cmd[0], cmd.slice(1), { cwd, stdio: 'inherit' });
+        const child = spawn(cmd[0], cmd.slice(1), { cwd, stdio: 'inherit', env: { ...process.env, LANE_BROKER_PRIORITY: priority } });
         return new Promise((resolve) => {
           child.on('error', (err) => {
             process.stderr.write(`lane run: failed to start command: ${err.message}\n`);
@@ -320,6 +335,16 @@ export async function runCommand({
   }
 
   const root = ensureStateDirs().root;
+  // BRAIN-380: the priority origin is `nowEff`, stamped under the broker lock in the same transaction that
+  // advances the high-water mark. Under lock contention it degrades to an unlocked read, which can only
+  // UNDER-state nowEff (never invents age) and must not make `lane run` fail where it never used to.
+  let prioOriginAt;
+  try {
+    prioOriginAt = await stampPriorityOrigin(root);
+  } catch (err) {
+    if (!(err instanceof LockTimeoutError)) throw err;
+    prioOriginAt = effectiveNow(root);
+  }
   const id = idOverride || crypto.randomUUID();
   if (onTicketCreated) {
     const proceed = await onTicketCreated(id);
@@ -352,6 +377,9 @@ export async function runCommand({
     cwd,
     cmd,
     createdAt: Date.now(),
+    priorityRequested: priority,
+    priorityAdmitted: priority,
+    prioOriginAt,
     logPath,
     resultPath,
     // Told explicitly rather than inferred from fd state on the supervisor
