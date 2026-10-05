@@ -263,9 +263,10 @@ export function checkResourceBudget({ resources, globalCfg, host }) {
  * as `checkResourceBudget` above.
  */
 export function localSimRefusal(lane) {
-  const dsn = process.env.ROUGE_FLEET_SUBMIT_DSN;
-  const submitHint = dsn
-    ? `submit to the fleet instead: ${dsn}`
+  // BRAIN-382: name the variable, never print its value -- it is a DSN with a password, and this
+  // message lands in agent transcripts.
+  const submitHint = process.env.ROUGE_FLEET_SUBMIT_DSN
+    ? 'submit to the fleet instead, via the DSN in ROUGE_FLEET_SUBMIT_DSN'
     : 'submit to the fleet instead (set ROUGE_FLEET_SUBMIT_DSN, or pass --allow-local-sim to run here)';
   return {
     ok: false,

@@ -27,14 +27,16 @@ test('without ROUGE_FLEET_SUBMIT_DSN set, the refusal names the env var to set r
   assert.match(result.stderr, /set ROUGE_FLEET_SUBMIT_DSN/);
 });
 
-test('with ROUGE_FLEET_SUBMIT_DSN set, the refusal prints its actual value', async () => {
+test('with ROUGE_FLEET_SUBMIT_DSN set, the refusal names the variable but never prints its value (BRAIN-382)', async () => {
   const { repoDir, env } = setup();
   const result = await laneRun(['run', '--repo', 'r', '--lane', 'sim', '--', 'true'], {
-    env: { ...env, ROUGE_FLEET_SUBMIT_DSN: 'https://fleet.example.invalid/submit' },
+    env: { ...env, ROUGE_FLEET_SUBMIT_DSN: 'postgres://fleet_submit:planted-secret-7f3a@db.example.invalid:5432/rouge_sim' },
     cwd: repoDir,
   });
   assert.equal(result.code, 69);
-  assert.match(result.stderr, /https:\/\/fleet\.example\.invalid\/submit/);
+  assert.match(result.stderr, /ROUGE_FLEET_SUBMIT_DSN/);
+  assert.doesNotMatch(result.stderr, /planted-secret-7f3a/, 'the DSN password must never reach stderr');
+  assert.doesNotMatch(result.stderr, /db\.example\.invalid/, 'no part of the DSN value is printed');
 });
 
 test('--allow-local-sim overrides the refusal and runs the command', async () => {
