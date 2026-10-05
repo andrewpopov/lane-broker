@@ -2,6 +2,7 @@ import { spawn } from 'node:child_process';
 import { buildManifest, RemoteIneligibleError } from './remote-manifest.js';
 import { encodeSnapshot, serializeHeader, MAX_HEADER_BYTES } from './remote-stream.js';
 import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
+import { isPriorityTier } from './priority.js';
 
 /**
  * BRAIN-319 T3a: the CLIENT side of the remote runner protocol implemented
@@ -488,6 +489,10 @@ export async function dispatchRemote(opts) {
     // Rides on both protocol 1 and 2: an older runner simply ignores an
     // unknown field, which is fine, since the whole feature is opt-in.
     queueTimeoutMs = null,
+    // BRAIN-380 §6: the tier the submitter resolved BEFORE any cap, and the wait it has accrued on its own priority
+    // clock. Additive header fields: an older runner ignores them, so its ticket is simply medium.
+    priorityRequested,
+    priorityAccruedMs,
     // BRAIN-339: from the CLIENT's global config (`remoteResultWaitMs`); how long to keep
     // polling a runner that reports the job still queued/running after ssh dropped.
     resultWaitMs = DEFAULT_RESULT_WAIT_MS,
@@ -542,6 +547,8 @@ export async function dispatchRemote(opts) {
   }
   if (Number.isFinite(minCpuCores)) header.minCpuCores = minCpuCores;
   if (Number.isInteger(queueTimeoutMs) && queueTimeoutMs > 0) header.queueTimeoutMs = queueTimeoutMs;
+  if (isPriorityTier(priorityRequested)) header.priorityRequested = priorityRequested;
+  if (Number.isInteger(priorityAccruedMs) && priorityAccruedMs >= 0) header.priorityAccruedMs = priorityAccruedMs;
 
   // BRAIN-320 follow-up: reject an oversized header locally, before ever
   // dialing ssh. `serializeHeader` is the exact function `encodeSnapshot`

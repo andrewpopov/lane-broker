@@ -8,7 +8,8 @@ import { readMemoryInfo } from './cpu.js';
 import { captureShadowInputs, recordAllocationShadow } from './allocation-shadow.js';
 import { reconcileSimArm, touchSimArmFor } from './sim-arm.js';
 import { advanceHwm } from './priority-clock.js';
-import { DEFAULT_PRIORITY, isPriorityTier, originOrNow } from './priority.js';
+import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, effectiveRank, score } from './priority.js';
+import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView } from './fairness.js';
 import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, resolveTicketResources } from './resources.js';
 
@@ -84,20 +85,33 @@ function findQueueFile(root, id) {
   return match ? path.join(dir, match) : null;
 }
 
-/** Enqueue a ticket at the tail of the global FIFO. Caller must NOT hold the lock. */
-export async function enqueue(root, ticket) {
+/**
+ * Enqueue a ticket at the tail of the global FIFO. Caller must NOT hold the lock. Returns the persisted record, whose
+ * `priorityRequested`/`priorityAdmitted`/`priorityDemoted` tell the caller whether the per-repo high cap demoted it.
+ */
+export async function enqueue(root, ticket, { maxQueuedHighPerRepo } = DEFAULT_GLOBAL_CONFIG) {
   return withLock(root, () => {
     assertNotMigrating(root);
     const nowEff = advanceHwm(root);
-    const seq = nextSeq(root);
     const priorityRequested = isPriorityTier(ticket.priorityRequested) ? ticket.priorityRequested : DEFAULT_PRIORITY;
+    // BRAIN-380 §7: the high cap, per broker. It shares this lock with the seq allocation and the queue write below,
+    // so two racing enqueues cannot both read "no high queued". Counted after stale cleanup, across lanes and worktrees.
+    let demoted = false;
+    if (priorityRequested === 'high') {
+      reapStale(root, ticket.id);
+      const queuedHigh = listQueue(root).filter(
+        (t) => t && t.repoId === ticket.repoId && t.priorityRequested === 'high' && t.priorityAdmitted === 'high',
+      ).length;
+      demoted = queuedHigh >= maxQueuedHighPerRepo;
+    }
+    const seq = nextSeq(root);
     const record = {
       ...ticket,
       seq,
       createdAt: ticket.createdAt || Date.now(),
       priorityRequested,
-      // BRAIN-380 slice 1: nothing demotes yet, so admitted == requested; the per-repo high cap lands later.
-      priorityAdmitted: priorityRequested,
+      priorityAdmitted: demoted ? 'medium' : priorityRequested,
+      priorityDemoted: demoted,
       // An origin from `lane run` was stamped under this same lock; one that is missing or ahead of the clock starts at zero age.
       prioOriginAt: originOrNow(ticket.prioOriginAt, nowEff),
       schedVersion: 2,
@@ -954,6 +968,10 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     const logBase = {
       candidateId: ticket.id,
       mode: cfg.schedulerMode,
+      // BRAIN-380 §8: who the head was and how it ranked. Decision lines only; a not-head poll writes none.
+      headTier: priorityOf(headTicket),
+      headRank: effectiveRank(headTicket, nowEff, cfg),
+      headScore: score(headTicket, nowEff, cfg),
       loadGateIgnored,
       ...cpuDecision,
       // Provenance for the memory fields above: cpuDecision carries the byte
@@ -1091,8 +1109,16 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       };
     }
     dequeueSync(root, ticket.id);
+    // BRAIN-380 §8: what the scheduler saw at admission, from this ticket's own queue record (the supervisor's copy of
+    // the ticket predates the cap), carried on the lease and then into its terminal history row.
+    const queued = queue[position];
     const lease = {
       id: ticket.id,
+      priorityRequested: isPriorityTier(queued.priorityRequested) ? queued.priorityRequested : DEFAULT_PRIORITY,
+      priorityAdmitted: priorityOf(queued),
+      priorityDemoted: queued.priorityDemoted === true,
+      effectiveRankAtStart: effectiveRank(queued, nowEff, cfg),
+      scoreAtStart: score(queued, nowEff, cfg),
       key: ticket.key,
       bootId: bootId(),
       supervisorPid: ticket.supervisorPid,

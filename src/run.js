@@ -179,6 +179,9 @@ export async function runCommand({
   // BRAIN-380: the raw `--priority` value (validated here, exit 64), or the tier a caller that must
   // not read this process's env pins (`lane remote-exec` passes 'medium').
   priority: priorityOverride,
+  // BRAIN-380 §6: wait a submitter already accrued (`lane remote-exec` only; validated there). The origin is anchored
+  // on THIS host's priority clock, minus that wait, so the other host's wall clock never enters.
+  priorityAccruedMs = 0,
   cwd = process.cwd(),
   cmd,
   log,
@@ -358,6 +361,7 @@ export async function runCommand({
     }
     prioOriginAt = effectiveNow(root);
   }
+  prioOriginAt -= priorityAccruedMs;
   const id = idOverride || crypto.randomUUID();
   if (onTicketCreated) {
     const proceed = await onTicketCreated(id);

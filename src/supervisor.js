@@ -20,7 +20,8 @@ import { touchSimArmFor } from './sim-arm.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { observeLeaseTree } from './cpu.js';
 import { reloadGlobalConfig } from './config.js';
-import { isPriorityTier } from './priority.js';
+import { effectiveNow } from './priority-clock.js';
+import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
 import { detectResourceCapacity, checkResourceBudget, localSimRefusal, leaseCpuCores } from './resources.js';
 import { selectRunner, dispatchRemote, needsProtocol2 } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
@@ -355,7 +356,7 @@ function localRefusalResult(ticket, refusal) {
  * the `result` spread); `localReason` is the ticket's creation-time reason, or
  * `fallback:<reason>` when a remote attempt fell back to local.
  */
-function historyRow(ticket, result, { fallbackReason } = {}) {
+function historyRow(ticket, result, { fallbackReason, lease } = {}) {
   const executor = result.executor ?? 'local';
   const localReason = executor === 'local' ? (fallbackReason === undefined ? ticket.localReason : `fallback:${fallbackReason}`) : undefined;
   return {
@@ -368,6 +369,8 @@ function historyRow(ticket, result, { fallbackReason } = {}) {
     resources: ticket.resources,
     command: ticket.command,
     headTree: ticket.headTree,
+    // BRAIN-380 §8: only a ticket that was admitted has a lease, so only its row carries the admission audit
+    ...priorityAuditOf(lease),
     ...result,
     executor,
     ...(localReason ? { localReason } : {}),
@@ -588,6 +591,10 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     // -- never the runner's -- so an unset value here means the header
     // carries no queueTimeoutMs at all (I6).
     queueTimeoutMs: globalCfg.remoteQueueTimeoutMs,
+    // BRAIN-380 §6: the tier BEFORE any cap, and the wait this ticket has accrued on THIS host's priority clock. The
+    // runner re-anchors from the wait, never from our timestamps, so clock skew between hosts cannot matter.
+    priorityRequested: enriched.priorityRequested,
+    priorityAccruedMs: waitedMs(enriched, effectiveNow(root)),
     resultWaitMs: globalCfg.remoteResultWaitMs,
     onStdout,
     onStderr,
@@ -778,7 +785,8 @@ async function main() {
   }
 
   try {
-    await enqueue(root, enriched);
+    const queued = await enqueue(root, enriched, globalCfg);
+    if (queued.priorityDemoted) process.stderr.write('lane run: priority high demoted to medium (repo already has a queued high ticket)\n');
   } catch (err) {
     if (!(err instanceof MigrationInProgressError)) throw err;
     return exitMigrating();
@@ -874,7 +882,7 @@ async function main() {
     cwd: ticket.cwd,
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: childEnv(ticket, process.env, leaseCpuCores(started.lease)),
+    env: childEnv({ ...ticket, priorityAdmitted: started.lease.priorityAdmitted }, process.env, leaseCpuCores(started.lease)),
   });
 
   const logWriter = new CappedLogWriter(ticket.logPath);
@@ -983,7 +991,7 @@ async function main() {
       const rssPeak = sanitizeRssPeak(finalLease?.observedRssPeakBytes);
       if (rssPeak !== undefined) finalResult = { ...finalResult, observedRssPeakBytes: rssPeak };
       atomicWriteJson(ticket.resultPath, finalResult);
-      appendHistory(root, historyRow(ticket, finalResult, { fallbackReason }));
+      appendHistory(root, historyRow(ticket, finalResult, { fallbackReason, lease: started.lease }));
       removeLease(root, ticket.id); // release always comes last
       touchSimArmFor(root, ticket); // after the release: the arm stamp's I/O never delays freeing the lease
       // Cleanup only, AFTER the terminal write above -- never before (BLOCKER #1).

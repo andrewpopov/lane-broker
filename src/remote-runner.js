@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, assertNotMigrating, MigrationInProgressError } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, loadGlobalConfig } from './config.js';
+import { remotePriorityFrom, PRIORITY_CAPABILITY } from './priority.js';
 import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores, ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
 import { makeReader, readHeaderLine, extractFrames, MAX_HEADER_BYTES } from './remote-stream.js';
 import { runCommand } from './run.js';
@@ -413,6 +414,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     pipelineCmd = [process.execPath, laneBinPath, 'remote-pipeline', ticketDir];
   }
 
+  const remotePriority = remotePriorityFrom(header);
   const runOutcome = await runCommand({
     repo: header.repoKey,
     lane: header.lane,
@@ -421,7 +423,11 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     // dispatched at all; refusing it again on this side would make every
     // remote-eligible localRefused lane refuse twice over.
     allowLocalSim: true,
-    priority: 'medium',
+    // BRAIN-380 §6: priority comes ONLY from the validated header, never this shell's LANE_BROKER_PRIORITY. The tier is
+    // what the submitter asked for; this runner's own enqueue applies its own cap. The accrued wait is anchored on this
+    // runner's own priority clock in runCommand, so the submitter's timestamps are never read.
+    priority: remotePriority.priority,
+    priorityAccruedMs: remotePriority.accruedMs,
     weightOverride: header.weight,
     cpuOverride: header.cpuCores,
     minCpuOverride: header.minCpuCores,
@@ -548,7 +554,7 @@ export async function remoteProbeCommand() {
     protocol: 1,
     protocols: [1, 2],
     // BRAIN-360: this runner resolves minCpuCores itself, so a submitter may judge fit by the floor
-    capabilities: [ELASTIC_CLAIMS_CAPABILITY],
+    capabilities: [ELASTIC_CLAIMS_CAPABILITY, PRIORITY_CAPABILITY],
     version: pkg.version,
     paused: Boolean(status.paused),
     queued: status.queued.length,

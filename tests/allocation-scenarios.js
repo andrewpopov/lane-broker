@@ -136,7 +136,10 @@ export function scenarios(m) {
 // pids and boot ids differ between the run that made a trace and any later run; nothing else may
 const VOLATILE_KEYS = new Set(['supervisorPid', 'bootId']);
 // BRAIN-380 slice 1 stamps these on every queue record without touching selection; main's records never carry them
-const PRIORITY_FIELDS = ['priorityRequested', 'priorityAdmitted', 'prioOriginAt', 'schedVersion'];
+const PRIORITY_FIELDS = ['priorityRequested', 'priorityAdmitted', 'priorityDemoted', 'prioOriginAt', 'schedVersion'];
+// BRAIN-380 slice 4 adds the admission audit to every lease and the head's tier/rank/score to every decision line
+const LEASE_AUDIT_FIELDS = ['priorityRequested', 'priorityAdmitted', 'priorityDemoted', 'effectiveRankAtStart', 'scoreAtStart'];
+const stripHeadPriority = (line) => line.replace(/ headTier=\S+ headRank=\S+ headScore=\S+/, '');
 const normalize = (value) => JSON.parse(JSON.stringify(value, (k, v) => (VOLATILE_KEYS.has(k) ? '<volatile>' : v)));
 
 /**
@@ -189,9 +192,12 @@ export async function runScript(m, script, { allocationShadow, freshState, seams
       conflictSkip: raw(p.conflictSkipState),
       capacitySkip: raw(p.capacitySkipState),
       resourceSkip: raw(p.resourceSkipState),
-      leases: dirJson(p.leases, ['class']),
+      leases: dirJson(p.leases, ['class', ...LEASE_AUDIT_FIELDS]),
       queue: dirJson(p.queue, PRIORITY_FIELDS),
-      liveLog: log.split('\n').filter((l) => l && !l.startsWith('lane-broker-allocation-shadow')),
+      liveLog: log
+        .split('\n')
+        .filter((l) => l && !l.startsWith('lane-broker-allocation-shadow'))
+        .map(stripHeadPriority),
       shadowLines: log.split('\n').filter((l) => l.startsWith('lane-broker-allocation-shadow ')),
     };
   } finally {

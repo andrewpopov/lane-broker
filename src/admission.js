@@ -462,6 +462,9 @@ export function formatAdmissionLog(f) {
     `memorySource=${f.memorySource ?? 'n/a'}`,
     `macPressure=${f.macPressure ?? 'n/a'}`,
     `leaseDemand=${f.leaseDemands?.length ? f.leaseDemands.join(',') : 'none'}`,
+    `headTier=${f.headTier ?? 'n/a'}`,
+    `headRank=${f.headRank ?? 'n/a'}`,
+    `headScore=${fmt(f.headScore)}`,
     `bias=${KNOWN_BIAS_NOTE}`,
   ].join(' ');
 }

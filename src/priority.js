@@ -9,6 +9,11 @@
 export const PRIORITY_TIERS = ['low', 'medium', 'high'];
 export const DEFAULT_PRIORITY = 'medium';
 
+/** BRAIN-380 §6: the capability a runner advertises when it reads the priority header fields (`priority/1`). */
+export const PRIORITY_CAPABILITY = 'priority/1';
+/** A submitter's accrued wait is trusted only up to a day, the same bound as the age cap in config. */
+const MAX_ACCRUED_MS = 86_400_000;
+
 const TIER_BASE = { low: 0, medium: 1, high: 2 };
 const MAX_BASE = 2;
 
@@ -28,6 +33,28 @@ export function priorityOf(ticket) {
  */
 export function originOrNow(prioOriginAt, nowEff) {
   return Number.isFinite(prioOriginAt) && prioOriginAt >= 0 && prioOriginAt <= nowEff ? prioOriginAt : nowEff;
+}
+
+/** Remote header: accrued wait is a finite integer in [0, 24h], otherwise 0. */
+export function sanitizeAccruedMs(value) {
+  return Number.isInteger(value) && value >= 0 && value <= MAX_ACCRUED_MS ? value : 0;
+}
+
+/** Remote header: a runner's view of what the submitter sent. An unknown tier is medium and an invalid wait is 0. */
+export function remotePriorityFrom(header) {
+  return {
+    priority: isPriorityTier(header?.priorityRequested) ? header.priorityRequested : DEFAULT_PRIORITY,
+    accruedMs: sanitizeAccruedMs(header?.priorityAccruedMs),
+  };
+}
+
+/** The audit fields a lease and its terminal history row carry (BRAIN-380 §8); only those the lease actually has. */
+export function priorityAuditOf(record) {
+  const audit = {};
+  for (const key of ['priorityRequested', 'priorityAdmitted', 'priorityDemoted', 'effectiveRankAtStart', 'scoreAtStart']) {
+    if (record?.[key] !== undefined) audit[key] = record[key];
+  }
+  return audit;
 }
 
 export function waitedMs(ticket, nowEff) {

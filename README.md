@@ -674,8 +674,8 @@ exit `64`; v1 has no general lane hierarchy.
 Without the scheduler fence (next section) the scheduler is strictly FIFO: tiers
 and the priority clock are recorded but reorder nothing, and `lane status` says so
 (`priority: inactive (legacy scheduler; run lane migrate-scheduler)`). Each
-queued ticket persists `priorityRequested`, `priorityAdmitted` (equal to
-requested until the per-repo high cap ships), `prioOriginAt` and
+queued ticket persists `priorityRequested`, `priorityAdmitted` (the requested tier,
+unless the per-repo high cap demoted it, see below), `priorityDemoted`, `prioOriginAt` and
 `schedVersion: 2`. The resolved tier is exported to the lane child (and to a
 reentrant child) as `LANE_BROKER_PRIORITY`; a `remote-exec` ticket ignores the
 runner shell's value and is `medium`.
@@ -694,7 +694,7 @@ default `600000`: one tier of age per period), `priorityAgeMaxMs` (integer in
 `[priorityAgingMs, 86400000]`, default `2 x priorityAgingMs`),
 `priorityWeights` `{tier, age, fairshare}` (`tier` and `age` in `(0, 100]`,
 `age >= tier`, `fairshare` exactly `0`; defaults `2/2/0`) and
-`maxQueuedHighPerRepo` (non-negative integer, default `1`; not enforced yet).
+`maxQueuedHighPerRepo` (non-negative integer, default `1`; `0` demotes every high).
 `src/priority.js` holds the pure score (`min(W_tier, W_tier*tierFactor +
 W_age*ageFactor)`) and `orderQueue`; see "Priority (ordered selection)" for where they are live.
 
@@ -778,6 +778,39 @@ prints "already migrated" and exits 0. A marker left by a crashed migrator is ta
 Behind the fence, a queue record without `schedVersion` (only an escaped pre-migration process can write one) is
 moved to `queue-quarantine/`, logged as `lane-broker-head-block event=legacy-record-after-fence`, and never
 selected. Its supervisor finds its queue file gone and exits as cancelled.
+
+### The high cap, the remote hop and the audit (BRAIN-380 slice 4)
+
+**The high cap.** At most `maxQueuedHighPerRepo` (default `1`) tickets of one repo can sit in the queue as `high`.
+`enqueue` counts them under the same state-root lock that allocates the sequence number and writes the queue record
+(so two racing `lane run`s cannot both see "none queued"), across lanes and worktrees, after dead-supervisor cleanup.
+A high at or over the cap is admitted as `medium`: the record keeps `priorityRequested: high` and gets
+`priorityAdmitted: medium`, `priorityDemoted: true`, and `lane run` prints
+`lane run: priority high demoted to medium (repo already has a queued high ticket)` to stderr. A demoted ticket does
+not hold the slot. The cap is recorded in legacy mode too, but it only reorders anything behind the scheduler fence.
+The lane child sees the admitted tier in `LANE_BROKER_PRIORITY`.
+
+**The cap is per broker.** Remote dispatch happens before the local enqueue, and every runner has its own broker and
+its own cap. A repo can therefore hold one queued high on the Mac and one on each runner at the same time. That is
+deliberate.
+
+**Remote.** The submitter adds two fields to the `remote-exec` header: `priorityRequested` (the tier before any cap)
+and `priorityAccruedMs` (`max(0, nowEff - prioOriginAt)` on the submitter's own priority clock, so it includes any
+probing or waiting before dispatch; ssh and snapshot transfer time is not counted). No wall-clock timestamp crosses
+the hop, so clock skew between hosts cannot change a ticket's age. The runner validates both (an unknown tier is
+`medium`; a wait that is not an integer in `[0, 86400000]` is `0`), applies its own cap in its own `enqueue`, and
+sets `prioOriginAt = runnerNowEff - priorityAccruedMs` on its own clock. It never touches `createdAt`, and it never
+reads the runner shell's `LANE_BROKER_PRIORITY`. The probe advertises the capability `priority/1` next to
+`elastic-claims/1`. A runner without it ignores the fields and its tickets are effectively `medium`; runner
+selection does not change. If the remote attempt falls back to local, the local ticket keeps its own original
+`prioOriginAt`: the time spent on the attempt counts once, through the local clock, and no remote age is added.
+
+**Audit.** When a ticket is admitted, its lease records `priorityRequested`, `priorityAdmitted`, `priorityDemoted`,
+`effectiveRankAtStart` and `scoreAtStart`, and its terminal `history.jsonl` row carries the same fields next to
+`waitedMs`. Each `admission-decisions.log` decision line also ends with `headTier=`, `headRank=` and `headScore=`
+(the queue head's tier, effective rank and score at that evaluation). Polls by a ticket that is not up are still not
+logged. Tier and rank describe what the scheduler saw. They cannot show how much time a tier saved anyone, and
+nothing here claims it: compare wait distributions by tier, and do not read a causal effect into them.
 
 ## Exit codes
 
