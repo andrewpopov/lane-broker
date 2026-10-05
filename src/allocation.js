@@ -72,22 +72,27 @@ export function ticketClaims(ticket, cfg) {
  * `simsCanArm` is whether this runner can ever arm sims; if so an oversized TEST claim (claim > B - L_s, and ONLY
  * such a claim; every other claim, fractional ones included, is untouched) is clamped to the grant floor(B - L_s),
  * the elastic-grant convention (whole cores, rounded down), so it can never wait forever on a lock that arms later.
- * Tiny-B edge: when B - L_s < 1 the grant is 1 core (never 0, a claim below one core cannot run), which exceeds
- * B - L_s: that test is class-locked while sims are armed and admitted once they disarm, so it waits at most
- * simArmWindowMs after the last sim demand rather than forever.
+ * Tiny-B edge: when B - L_s < 1 there is no whole-core grant that fits under the lock (a grant of 0 cannot run and
+ * 1 would exceed B - L_s), so no grant is invented: the oversized claim is `clamp-impossible`, class-blocked while sims
+ * are armed (the idle overshoot never bypasses it), and evaluated at its full claim once they disarm, so it waits at
+ * most simArmWindowMs after the last sim demand rather than forever.
  */
 export function evaluateCandidate({ candidate, cfg, B, usedT, usedS, externalBusy = 0, reservedHead = 0, armed, locks = classLocks({ B, armed }), simsCanArm = true, idleExempt = false }) {
   const klass = classOf(candidate);
   const { claim, floorClaim } = ticketClaims(candidate, cfg);
-  const clampedClaim = klass === 'test' && simsCanArm && claim > B - simLockCeiling(B) ? Math.max(1, Math.floor(B - simLockCeiling(B))) : claim;
+  const oversized = klass === 'test' && simsCanArm && claim > B - simLockCeiling(B);
+  const clampGrant = Math.floor(B - simLockCeiling(B));
+  const clampImpossible = oversized && clampGrant < 1;
+  const clampedClaim = oversized && !clampImpossible ? clampGrant : claim;
   const effectiveClaim = Math.min(floorClaim, clampedClaim);
   const reservedOther = klass === 'sim' ? Math.max(0, locks.L_t - usedT) : Math.max(0, locks.L_s - usedS);
   const free = B - (usedT + usedS) - reservedHead;
   const limit = free - Math.max(reservedOther, externalBusy);
   const fitsWithoutLock = effectiveClaim <= free - externalBusy;
   const fits = effectiveClaim <= limit;
-  const reason = fits ? 'ok' : fitsWithoutLock ? 'class-lock' : 'over-free';
-  const eligible = fits || (idleExempt && reason === 'over-free' && effectiveClaim <= free - reservedOther);
+  const clampBlocked = clampImpossible && armed;
+  const reason = clampBlocked ? 'clamp-impossible' : fits ? 'ok' : fitsWithoutLock ? 'class-lock' : 'over-free';
+  const eligible = !clampBlocked && (fits || (idleExempt && reason === 'over-free' && effectiveClaim <= free - reservedOther));
   return { eligible, claim, clampedClaim, effectiveClaim, reservedOther, reservedHead, reason, class: klass, limit };
 }
 

@@ -39,6 +39,7 @@ export function paths(root = stateHome()) {
     resourceSkipState: path.join(root, 'resource-skip-state.json'),
     // BRAIN-379: when sim demand last existed (arms the sim soft lock); see src/sim-arm.js.
     simArm: path.join(root, 'sim-arm.json'),
+    simArmLock: path.join(root, 'sim-arm.lock'),
     seq: path.join(root, 'seq'),
     // BRAIN-319 T3b-2 (C3): one durable attempt record per remote-eligible
     // ticket, keyed by ticket id -- see src/attempts.js.

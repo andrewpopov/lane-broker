@@ -8,6 +8,7 @@ import { writeLease } from '../src/lease.js';
 import { paths, atomicWriteJson, bootId } from '../src/state.js';
 import { readLastSimDemandAt, touchSimArm } from '../src/sim-arm.js';
 import { evaluateQueue } from '../src/allocation.js';
+import { captureShadowInputs, existingGuardsFor } from '../src/allocation-shadow.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
 
 /**
@@ -24,7 +25,7 @@ const m = await loadModules(fileURLToPath(new URL('../src', import.meta.url)));
 const baseCfg = (overrides) => scenarioBaseCfg(m, overrides);
 const heldLease = (...args) => scenarioHeldLease(m, ...args);
 
-const poll = (state, t, cfg, { ext = 0, evaluator, mem = memory } = {}) => tryStart(state, t, cfg, undefined, sampler(ext), undefined, mem, undefined, evaluator);
+const poll = (state, t, cfg, { ext = 0, evaluator, capture, mem = memory } = {}) => tryStart(state, t, cfg, undefined, sampler(ext), undefined, mem, undefined, { evaluator, capture });
 
 const readLog = (state) => {
   try {
@@ -34,6 +35,8 @@ const readLog = (state) => {
   }
 };
 const shadowLines = (state) => readLog(state).split('\n').filter((l) => l.startsWith(`${SHADOW_TOKEN} `));
+// the decision-relevant config values every record carries (the fixture machine's, see baseCfg)
+const CFG_EVIDENCE = 'lockT:0.15,lockS:0.3,armWindowMs:300000,mode:active,capacity:10,cpuPct:100,cpuReserve:1,memReserveB:2147483648,memCloseB:4294967296,memOpenB:8589934592,conflictSkip:3,resourceSkip:3,loadGate:false,safeBackfill:true';
 const liveLines = (state) => readLog(state).split('\n').filter((l) => l && !l.startsWith(SHADOW_TOKEN));
 const field = (line, name) => new RegExp(`(?:^| )${name}=(\\S*)`).exec(line)?.[1];
 const candidateOf = (line, idPrefix) => field(line, 'candidates').split(',').find((c) => c.startsWith(`${idPrefix}:`));
@@ -167,7 +170,7 @@ test('the shadow record format: B, usage, locks, arm state, selection, actual ou
   assert.equal(
     line,
     `${SHADOW_TOKEN} ts=${field(line, 'ts')} poller=headaaaa head=headaaaa actual=started select=simbbbbb selectReason=backfill B=9 budgetSource=live chargeSource=live externalBusy=0 ` +
-      `used_t=5 used_s=0 L_t=1.35 L_s=2.7 armed=true lastSimDemandAt=${stamp} cfg=lockT:0.15,lockS:0.3,armWindowMs:300000,mode:active skip=none:0+1/3 reserved=false ` +
+      `used_t=5 used_s=0 L_t=1.35 L_s=2.7 armed=true lastSimDemandAt=${stamp} cfg=${CFG_EVIDENCE} skip=none:0+1/3 reserved=false ` +
       'candidates=headaaaa:test:c=3:e=3:k=3:class-lock,simbbbbb:sim:c=1:e=1:k=1:ok',
   );
 });
@@ -346,7 +349,7 @@ test('the hypothetical admission includes the existing guards: weight capacity, 
 
   const paused = await headAt((state) => fs.writeFileSync(paths(state).pause, 'maintenance'), {});
   assert.equal(paused.live.reason, 'paused');
-  assert.match(paused.head, /:paused:guards=paused$/);
+  assert.match(paused.head, /:paused:guards=paused\|unknown$/, 'no CPU/memory sample was taken, so those guards are unknown');
 
   const cooldown = await headAt(
     (state) => writeLease(state, heldLease('held', 'r:held', 1, { resources: { cpuCores: 1, memoryBytes: GIB } })),
@@ -390,7 +393,7 @@ test('the record carries the evaluation timestamp, config values, per-candidate 
   await poll(state, ticket('head', { weight: 3 }), cfg);
   const [line] = shadowLines(state);
   assert.ok(Number.isFinite(Number(field(line, 'ts'))));
-  assert.match(field(line, 'cfg'), /^lockT:0\.15,lockS:0\.3,armWindowMs:120000,mode:active$/);
+  assert.equal(field(line, 'cfg'), CFG_EVIDENCE.replace('armWindowMs:300000', 'armWindowMs:120000'));
   assert.match(candidateOf(line, 'head'), /^head:test:c=3:e=3:k=3:ok$/);
   assert.equal(candidateOf(line, 'big'), 'big:test:c=8:e=6:k=6:ok', 'an oversized test claim (8 > B - L_s = 6.3) is clamped to floor(6.3)');
   assert.equal(field(line, 'chargeSource'), 'recomputed', 'nothing held, so there were no live charges to reuse');
@@ -425,21 +428,103 @@ test('reconciliation rewrites the arm stamp only when it is stale (older than a 
   assert.ok(stale.after > stale.seeded, 'a stale stamp is advanced');
 });
 
-test('touchSimArm is monotonic: it never moves back, and it retries when a slower writer clobbers it with an older value', () => {
-  const { state } = freshEnv();
-  atomicWriteJson(paths(state).simArm, { lastSimDemandAt: 300 });
-  touchSimArm(state, 200);
-  assert.equal(readLastSimDemandAt(state), 300);
+test('touchSimArm is monotonic: the final value is the max whatever the interleaving', () => {
+  const stamp = (state) => readLastSimDemandAt(state);
+  const seed = (state, value) => atomicWriteJson(paths(state).simArm, { lastSimDemandAt: value });
 
-  atomicWriteJson(paths(state).simArm, { lastSimDemandAt: 50 });
-  let clobbers = 0;
-  touchSimArm(state, 200, {
-    afterWrite: () => {
-      if (clobbers++ < 2) atomicWriteJson(paths(state).simArm, { lastSimDemandAt: 100 }); // a competing writer with an older time
-    },
-  });
-  assert.equal(readLastSimDemandAt(state), 200, 'rewritten until it holds our value');
-  assert.equal(clobbers, 3);
+  // never moves back
+  const plain = freshEnv().state;
+  seed(plain, 300);
+  assert.equal(touchSimArm(plain, 200), true);
+  assert.equal(stamp(plain), 300);
+
+  // the old failure: A is about to write 100, but B completes a write of 200 first. A must re-read under the lock.
+  const raced = freshEnv().state;
+  seed(raced, 50);
+  touchSimArm(raced, 100, { beforeLock: () => touchSimArm(raced, 200) });
+  assert.equal(stamp(raced), 200, 'the older writer saw the newer value and left it');
+
+  // and the other order: the older write lands first, the newer one wins
+  const forward = freshEnv().state;
+  seed(forward, 50);
+  touchSimArm(forward, 200, { beforeLock: () => touchSimArm(forward, 100) });
+  assert.equal(stamp(forward), 200);
+
+  // mutual exclusion: a writer that arrives while another holds the lock does not interleave a write
+  const held = freshEnv().state;
+  seed(held, 50);
+  let inner;
+  touchSimArm(held, 100, { afterRead: () => (inner = touchSimArm(held, 999, { lockWaitMs: 10 })) });
+  assert.equal(inner, false, 'the second writer could not take the lock mid read-compare-write');
+  assert.equal(stamp(held), 100, 'and so could not interleave its own write');
+  assert.equal(fs.existsSync(paths(held).simArmLock), false, 'the lock is released');
+});
+
+test('a stale stamp lock left by a crashed writer is broken; a fresh one is respected', () => {
+  const { state } = freshEnv();
+  const lock = paths(state).simArmLock;
+  fs.writeFileSync(lock, '');
+  assert.equal(touchSimArm(state, 100, { lockWaitMs: 10 }), false, 'a fresh lock held by someone else is not stolen');
+  assert.equal(readLastSimDemandAt(state), null);
+  const old = new Date(Date.now() - 60_000);
+  fs.utimesSync(lock, old, old);
+  assert.equal(touchSimArm(state, 100, { lockWaitMs: 10 }), true);
+  assert.equal(readLastSimDemandAt(state), 100);
+});
+
+test('with allocationShadow off the shadow snapshot is never built; with it on, once per head poll', async () => {
+  const run = async (allocationShadow) => {
+    const { state } = freshEnv();
+    let builds = 0;
+    const capture = (args) => {
+      builds += 1;
+      return captureShadowInputs(args);
+    };
+    await enqueue(state, ticket('head'));
+    await poll(state, ticket('head'), baseCfg({ allocationShadow }), { capture });
+    return { builds, lines: shadowLines(state).length };
+  };
+  assert.deepEqual(await run(false), { builds: 0, lines: 0 });
+  assert.deepEqual(await run(true), { builds: 1, lines: 1 });
+});
+
+test('with live admission returning before it sampled, the CPU/load/memory guards are unknown and nothing is hypothetically selected', async () => {
+  const { state } = freshEnv();
+  const cfg = baseCfg({ allocationShadow: true });
+  writeLease(state, heldLease('holder', 'r:lock', 1, { resources: { cpuCores: 1, memoryBytes: GIB } }));
+  await enqueue(state, ticket('chead', { key: 'r:lock' }));
+  await enqueue(state, ticket('free1'));
+  const live = await poll(state, ticket('chead', { key: 'r:lock' }), cfg);
+  assert.equal(live.reason, 'not-head', 'live lets the non-conflicting ticket go ahead; this poll never reaches the CPU/memory sample');
+  const [line] = shadowLines(state);
+  assert.equal(candidateOf(line, 'chead').split(':')[5], 'conflict');
+  assert.match(candidateOf(line, 'free1'), /:unknown:guards=unknown$/);
+  assert.equal(field(line, 'select'), 'none');
+});
+
+test('memory admission counts the blocked head\'s reservation for a safe backfill (and a conflict pick), as live does', () => {
+  // 3 GiB budget; the held lease and the head each book 1 GiB, so a 1.5 GiB candidate breaches only WITH the head reserved
+  const cfg = baseCfg({ memoryReserveBytes: 0 });
+  const withRes = (memoryBytes) => ({ cpuCores: 1, memoryBytes });
+  const queue = [ticket('chead', { resources: withRes(GIB) }), ticket('bf', { resources: withRes(1.5 * GIB) })];
+  const inputs = (overrides) => ({ cfg, held: [heldLease('holder', 'r:lock', 1, { resources: withRes(GIB) })], queue, safeBackfill: [false, false], conflictPickId: null, paused: false, runningWeight: 1, weightCapacity: 10, ...overrides });
+  const live = { memInfo: { availableBytes: 64 * GIB, totalBytes: 3 * GIB, macPressure: 'normal' }, memAt: Date.now(), cpuReason: 'ok', loadGateBlocking: false };
+  const guardsFor = (i) => existingGuardsFor(i, live, new Map(queue.map((t, n) => [t, n])))(queue[1]);
+  assert.deepEqual(guardsFor(inputs({})), [], 'with no reservation the candidate fits');
+  assert.deepEqual(guardsFor(inputs({ safeBackfill: [false, true] })), ['memory-reservations'], 'safe backfill reserves the head');
+  assert.deepEqual(guardsFor(inputs({ conflictPickId: 'bf' })), ['memory-reservations'], 'so does a conflict pick');
+});
+
+test('shadow memory admission is evaluated at the captured memory observation time, not a fresh clock read', () => {
+  const cfg = baseCfg({ memoryReserveBytes: GIB });
+  const observedAt = 1_700_000_000_000;
+  const holder = heldLease('holder', 'r:h', 1, { resources: { cpuCores: 1, memoryBytes: GIB }, observedAt, observedMemoryBytes: GIB });
+  const queue = [ticket('head', { resources: { cpuCores: 1, memoryBytes: GIB / 2 } })];
+  const inputs = { cfg, held: [holder], queue, safeBackfill: [false], conflictPickId: null, paused: false, runningWeight: 1, weightCapacity: 10 };
+  const memInfo = { availableBytes: 2 * GIB, totalBytes: 64 * GIB, macPressure: 'normal' };
+  const guards = (memAt) => existingGuardsFor(inputs, { memInfo, memAt, cpuReason: 'ok', loadGateBlocking: false }, new Map([[queue[0], 0]]))(queue[0]);
+  assert.deepEqual(guards(observedAt + 1000), [], 'the observation was fresh at the time live looked');
+  assert.deepEqual(guards(observedAt + 120_000), ['memory-headroom'], 'and would have been stale two minutes on; the captured time decides, Date.now() (years later) does not');
 });
 
 /** The 5-minute tail: after the LAST sim demand leaves through `exit`, a test head is still held back by an armed sim lock. */

@@ -69,7 +69,7 @@
         "childPgid": null,
         "heartbeatAt": 1700000016000,
         "admittedAt": 1700000016000,
-        "cwd": "/Volumes/Lexar/worktrees/lane-broker/brain-379-allocation",
+        "cwd": "<cwd>",
         "cmd": [
           "true"
         ],
@@ -84,7 +84,7 @@
         "id": "s2",
         "key": "r:s2",
         "weight": 2,
-        "cwd": "/Volumes/Lexar/worktrees/lane-broker/brain-379-allocation",
+        "cwd": "<cwd>",
         "cmd": [
           "true"
         ],
@@ -100,7 +100,7 @@
         "id": "t2",
         "key": "r:t2",
         "weight": 2,
-        "cwd": "/Volumes/Lexar/worktrees/lane-broker/brain-379-allocation",
+        "cwd": "<cwd>",
         "cmd": [
           "true"
         ],
@@ -175,7 +175,7 @@
         "childPgid": null,
         "heartbeatAt": 1700000008000,
         "admittedAt": 1700000008000,
-        "cwd": "/Volumes/Lexar/worktrees/lane-broker/brain-379-allocation",
+        "cwd": "<cwd>",
         "cmd": [
           "true"
         ],
@@ -193,7 +193,7 @@
         "childPgid": null,
         "heartbeatAt": 1700000010000,
         "admittedAt": 1700000010000,
-        "cwd": "/Volumes/Lexar/worktrees/lane-broker/brain-379-allocation",
+        "cwd": "<cwd>",
         "cmd": [
           "true"
         ],
@@ -211,7 +211,7 @@
         "childPgid": null,
         "heartbeatAt": 1700000009000,
         "admittedAt": 1700000009000,
-        "cwd": "/Volumes/Lexar/worktrees/lane-broker/brain-379-allocation",
+        "cwd": "<cwd>",
         "cmd": [
           "true"
         ],
@@ -229,7 +229,7 @@
         "childPgid": null,
         "heartbeatAt": 1700000011000,
         "admittedAt": 1700000011000,
-        "cwd": "/Volumes/Lexar/worktrees/lane-broker/brain-379-allocation",
+        "cwd": "<cwd>",
         "cmd": [
           "true"
         ],
@@ -256,7 +256,7 @@
         "id": "chead",
         "key": "r:lock",
         "weight": 1,
-        "cwd": "/Volumes/Lexar/worktrees/lane-broker/brain-379-allocation",
+        "cwd": "<cwd>",
         "cmd": [
           "true"
         ],
@@ -335,7 +335,7 @@
         "childPgid": null,
         "heartbeatAt": 1700000006000,
         "admittedAt": 1700000006000,
-        "cwd": "/Volumes/Lexar/worktrees/lane-broker/brain-379-allocation",
+        "cwd": "<cwd>",
         "cmd": [
           "true"
         ],
@@ -353,7 +353,7 @@
         "childPgid": null,
         "heartbeatAt": 1700000007000,
         "admittedAt": 1700000007000,
-        "cwd": "/Volumes/Lexar/worktrees/lane-broker/brain-379-allocation",
+        "cwd": "<cwd>",
         "cmd": [
           "true"
         ],
@@ -368,7 +368,7 @@
         "id": "khead",
         "key": "r:khead",
         "weight": 6,
-        "cwd": "/Volumes/Lexar/worktrees/lane-broker/brain-379-allocation",
+        "cwd": "<cwd>",
         "cmd": [
           "true"
         ],

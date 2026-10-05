@@ -16,7 +16,7 @@ const short = (id) => (typeof id === 'string' ? id.slice(0, SHORT) : 'none');
 const fmt = (n) => (Number.isFinite(n) ? Number(n.toFixed(2)).toString() : 'n/a');
 
 /** Copies of everything the evaluator reads, so nothing it could do reaches a live object. */
-export function captureShadowInputs({ queue, held, now, cfg, cpuCores, lastSimDemandAt, skipBudget, reservation, conflicted, safeBackfill, runningWeight, weightCapacity, paused }) {
+export function captureShadowInputs({ queue, held, now, cfg, cpuCores, lastSimDemandAt, skipBudget, reservation, conflicted, safeBackfill, conflictPickId, runningWeight, weightCapacity, paused }) {
   return {
     queue: structuredClone(queue),
     held: structuredClone(held),
@@ -28,6 +28,7 @@ export function captureShadowInputs({ queue, held, now, cfg, cpuCores, lastSimDe
     reservation: { ...reservation },
     conflicted,
     safeBackfill,
+    conflictPickId,
     runningWeight,
     weightCapacity,
     paused,
@@ -41,11 +42,16 @@ const CANDIDATE_INDEPENDENT_CPU_DENIALS = new Set(['cpu-gate-closed', 'cooldown'
  * Per-candidate reasons the live scheduler's EXISTING guards (other than the held-key conflict and the CPU
  * projection, which the evaluator itself covers) deny it: pause, weight capacity, load gate, memory brake, the
  * CPU gate / cooldown / unavailable-sample denials and the memory admission (the last three only in active mode,
- * as live). Guards live admission never reached (no CPU sample on an early return) are simply absent.
+ * as live). Memory admission counts the blocked head's reservation for a safe backfill / conflict pick exactly as
+ * live does, and is evaluated at the captured memory observation time. When live admission returned before it
+ * sampled (no `live`), the CPU, load and memory guards are UNKNOWN: every candidate carries `unknown` and is never
+ * hypothetically selected.
  */
-export function existingGuardsFor(inputs, live) {
+export function existingGuardsFor(inputs, live, indexOf) {
   const { cfg, held } = inputs;
   const active = cfg.schedulerMode === 'active';
+  const head = inputs.queue[0];
+  const headReservation = head ? { id: head.id, key: head.key, weight: head.weight, resources: head.resources } : null;
   return (ticket) => {
     const reasons = [];
     if (inputs.paused) reasons.push('paused');
@@ -61,10 +67,13 @@ export function existingGuardsFor(inputs, live) {
           memoryBytes: ticket.resources?.memoryBytes,
           defaultMemoryBytesPerWeight: cfg.defaultMemoryBytesPerWeight,
         });
-        const memory = evaluateMemoryAdmission({ memoryInfo: live.memInfo, heldLeases: held, candidateResources, cfg });
+        const reservesHead = headReservation && (inputs.safeBackfill[indexOf.get(ticket)] === true || ticket.id === inputs.conflictPickId);
+        const heldLeases = reservesHead ? [...held, headReservation] : held;
+        const memory = evaluateMemoryAdmission({ memoryInfo: live.memInfo, heldLeases, candidateResources, cfg, now: live.memAt });
         if (!memory.admit) reasons.push(memory.reason);
       }
     }
+    if (!live) reasons.push('unknown');
     return reasons;
   };
 }
@@ -80,6 +89,26 @@ function candidateToken(d) {
   if (d.reservedHead > 0) parts.push(`resv=${fmt(d.reservedHead)}`);
   if (d.guards.length > 0) parts.push(`guards=${d.guards.join('|')}`);
   return parts.join(':');
+}
+
+/** The decision-relevant config values, so a record can be replayed without the config file of that moment. */
+function configEvidence(cfg) {
+  return [
+    `lockT:${TEST_LOCK_FRACTION}`,
+    `lockS:${SIM_LOCK_FRACTION}`,
+    `armWindowMs:${cfg.simArmWindowMs}`,
+    `mode:${cfg.schedulerMode}`,
+    `capacity:${cfg.capacity}`,
+    `cpuPct:${cfg.cpuAdmissionPercent}`,
+    `cpuReserve:${cfg.cpuReserveCores}`,
+    `memReserveB:${cfg.memoryReserveBytes}`,
+    `memCloseB:${cfg.memoryCloseBytes}`,
+    `memOpenB:${cfg.memoryOpenBytes}`,
+    `conflictSkip:${cfg.conflictSkipLimit}`,
+    `resourceSkip:${cfg.resourceSkipLimit}`,
+    `loadGate:${cfg.admissionLoadGate}`,
+    `safeBackfill:${cfg.conflictSafeBackfill}`,
+  ].join(',');
 }
 
 export function formatAllocationShadowLog(f) {
@@ -102,7 +131,7 @@ export function formatAllocationShadowLog(f) {
     `L_s=${fmt(e.locks.L_s)}`,
     `armed=${e.armed}`,
     `lastSimDemandAt=${f.lastSimDemandAt ?? 'none'}`,
-    `cfg=lockT:${TEST_LOCK_FRACTION},lockS:${SIM_LOCK_FRACTION},armWindowMs:${f.simArmWindowMs},mode:${f.schedulerMode}`,
+    `cfg=${configEvidence(f.cfg)}`,
     `skip=${f.skipBudget.kind}:${e.skipBudget.used}+${e.skipBudget.consumed}/${e.skipBudget.limit}`,
     `reserved=${f.reservation.reserved}`,
     `candidates=${e.decisions.length ? e.decisions.map(candidateToken).join(',') : 'none'}`,
@@ -124,8 +153,8 @@ export function recordAllocationShadow({ root, shadow, result, pollerId, evaluat
     const B = liveBudget ? live.budget : cpuBudget({ cores: Number.isFinite(live?.cores) ? live.cores : inputs.cpuCores }, inputs.cfg);
     const externalBusy = Number.isFinite(live?.externalBusy) ? live.externalBusy : 0;
     const charged = live && live.leaseCharges.length > 0;
-    const guardsOf = existingGuardsFor(inputs, live);
     const indexOf = new Map(inputs.queue.map((t, i) => [t, i]));
+    const guardsOf = existingGuardsFor(inputs, live, indexOf);
     const evaluation = evaluator({
       queue: inputs.queue,
       held: inputs.held,
@@ -154,8 +183,7 @@ export function recordAllocationShadow({ root, shadow, result, pollerId, evaluat
         chargeSource: charged ? 'live' : 'recomputed',
         externalBusy,
         lastSimDemandAt: inputs.lastSimDemandAt,
-        simArmWindowMs: inputs.cfg.simArmWindowMs,
-        schedulerMode: inputs.cfg.schedulerMode,
+        cfg: inputs.cfg,
         skipBudget: inputs.skipBudget,
         reservation: inputs.reservation,
       })}\n`,

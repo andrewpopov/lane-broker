@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { paths, atomicWriteJson, readJsonSafe } from './state.js';
 
 /**
@@ -10,27 +11,62 @@ export function readLastSimDemandAt(root) {
   return raw && Number.isFinite(raw.lastSimDemandAt) ? raw.lastSimDemandAt : null;
 }
 
-const MAX_WRITE_ATTEMPTS = 4;
+const LOCK_WAIT_MS = 1000;
+const LOCK_STALE_MS = 2000;
+const LOCK_POLL_MS = 2;
+
+const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 /**
- * Record sim demand at `now`. Monotonic: the stamp never moves back. The release path calls this without the
- * broker lock, so a plain read-check-write could be clobbered by a slower writer carrying an older time; each
- * write is therefore an atomic temp-then-rename followed by a re-read, repeated (a small, fixed bound) while the
- * file still holds a value older than ours. One window remains (a clobber landing after our last re-read) and it
- * is deliberately accepted: it can only shorten the tail by the gap between two near-simultaneous events, and the
- * next locked evaluation with sim demand re-stamps. Best-effort: a failed write only means "less armed".
- * `afterWrite` is a test seam to interleave a competing writer.
+ * A tiny exclusive lock file (O_EXCL create), held only across one read-compare-write. The broker's own lock is
+ * async and the release path is not, so this is a separate, synchronous mutex. A lock older than LOCK_STALE_MS belongs
+ * to a crashed holder and is broken. Returns whether it was acquired within `waitMs`.
  */
-export function touchSimArm(root, now = Date.now(), { afterWrite } = {}) {
+function acquireStampLock(file, waitMs) {
+  for (let waited = 0; ; waited += LOCK_POLL_MS) {
+    try {
+      fs.closeSync(fs.openSync(file, 'wx'));
+      return true;
+    } catch (err) {
+      if (err.code !== 'EEXIST') return false;
+    }
+    try {
+      if (Date.now() - fs.statSync(file).mtimeMs > LOCK_STALE_MS) fs.unlinkSync(file);
+    } catch {
+      // the holder released it between our attempt and the stat
+    }
+    if (waited >= waitMs) return false;
+    sleepSync(LOCK_POLL_MS);
+  }
+}
+
+/**
+ * Record sim demand at `now`. Genuinely monotonic: the read, the compare and the write happen under the stamp lock,
+ * so whatever the interleaving the file ends at the maximum of every value ever offered and never moves back. Callers
+ * hold the broker lock or not (the release path does not); this mutex is independent of it. If the lock cannot be had
+ * within the wait (a wedged but not yet stale holder) the write is skipped: best-effort, shadow-grade state, "less
+ * armed" at worst, and the next locked evaluation with sim demand re-stamps. Returns whether the stamp is now >= `now`.
+ * `beforeLock` / `afterRead` are test seams to interleave a competing writer.
+ */
+export function touchSimArm(root, now = Date.now(), { beforeLock, afterRead, lockWaitMs = LOCK_WAIT_MS } = {}) {
   try {
-    for (let attempt = 0; attempt < MAX_WRITE_ATTEMPTS; attempt++) {
+    beforeLock?.();
+    const lock = paths(root).simArmLock;
+    if (!acquireStampLock(lock, lockWaitMs)) return false;
+    try {
       const held = readLastSimDemandAt(root);
-      if (held !== null && held >= now) return;
-      atomicWriteJson(paths(root).simArm, { lastSimDemandAt: now });
-      afterWrite?.(attempt);
+      afterRead?.(held);
+      if (held === null || held < now) atomicWriteJson(paths(root).simArm, { lastSimDemandAt: now });
+      return true;
+    } finally {
+      try {
+        fs.unlinkSync(lock);
+      } catch {
+        // already broken as stale by another writer
+      }
     }
   } catch {
-    // best-effort: shadow-grade state, never allowed to affect scheduling
+    return false;
   }
 }
 

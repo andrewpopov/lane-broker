@@ -142,7 +142,7 @@ const normalize = (value) => JSON.parse(JSON.stringify(value, (k, v) => (VOLATIL
  * admission produced: each poll's result, the skip/reservation files, lease and queue files, the live log lines.
  * `liveOnly` drops fields only this slice adds (a lease's `class`), so a main run and a branch run compare.
  */
-export async function runScript(m, script, { allocationShadow, freshState, evaluator } = {}) {
+export async function runScript(m, script, { allocationShadow, freshState, seams } = {}) {
   const state = freshState ?? fs.mkdtempSync(path.join(os.tmpdir(), 'lane-broker-scenario-'));
   fs.mkdirSync(state, { recursive: true });
   let clock = 1_700_000_000_000;
@@ -157,7 +157,7 @@ export async function runScript(m, script, { allocationShadow, freshState, evalu
       else if (step.lease) m.writeLease(state, { ...step.lease, heartbeatAt: clock, admittedAt: clock });
       else if (step.release) fs.unlinkSync(path.join(m.paths(state).leases, `${step.release}.json`));
       else {
-        const r = await m.tryStart(state, step.poll, cfg, undefined, sampler(step.ext ?? 0), undefined, memory, undefined, evaluator);
+        const r = await m.tryStart(state, step.poll, cfg, undefined, sampler(step.ext ?? 0), undefined, memory, undefined, seams);
         results.push({ poll: step.poll.id, started: r.started, reason: r.reason ?? null, cpuReason: r.cpuReason ?? null });
       }
     }
@@ -197,8 +197,19 @@ export async function runScript(m, script, { allocationShadow, freshState, evalu
   }
 }
 
-/** The live-only part of a run: what the golden trace records. */
-export const liveTrace = ({ results, conflictSkip, capacitySkip, resourceSkip, leases, queue, liveLog }) => ({ results, conflictSkip, capacitySkip, resourceSkip, leases, queue, liveLog });
+/**
+ * The live-only part of a run: what the golden trace records. Every absolute path (this checkout's cwd, the
+ * scenario's state root, the system temp dir) becomes a placeholder, so the trace is the same from any checkout.
+ */
+export function liveTrace({ state, results, conflictSkip, capacitySkip, resourceSkip, leases, queue, liveLog }) {
+  const text = JSON.stringify({ results, conflictSkip, capacitySkip, resourceSkip, leases, queue, liveLog });
+  const jsonEscaped = (p) => JSON.stringify(p).slice(1, -1);
+  const relocated = [
+    [state, '<state>'],
+    [process.cwd(), '<cwd>'],
+  ].reduce((acc, [abs, placeholder]) => acc.split(jsonEscaped(abs)).join(placeholder), text);
+  return JSON.parse(relocated);
+}
 
 if (import.meta.url === pathToFileURL(process.argv[1] ?? '').href) {
   const srcDir = process.argv[2];

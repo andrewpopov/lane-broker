@@ -276,9 +276,13 @@ test('only an OVERSIZED test claim is clamped: fractional and in-range claims ar
   assert.equal(clampOf(1.5, 15), 1.5, 'a fractional in-range claim is not floored to 1');
   assert.equal(clampOf(10.4, 15), 10.4, 'at B - L_s = 10.5 and below: untouched');
   assert.equal(clampOf(11, 15), 10, 'above B - L_s: clamped to floor(B - L_s)');
-  assert.equal(clampOf(3, 1), 1, 'tiny-B edge: B - L_s = 0.7 < 1, the grant is 1 core, never 0');
-  assert.equal(evaluateCandidate({ candidate: ticket('t', 'test', 3), cfg: CFG, B: 1, usedT: 0, usedS: 0, armed: true }).reason, 'class-lock', 'and it is class-locked while sims are armed (it runs once they disarm)');
-  assert.equal(evaluateCandidate({ candidate: ticket('t', 'test', 3), cfg: CFG, B: 1, usedT: 0, usedS: 0, armed: false }).eligible, true);
+  assert.equal(clampOf(3, 1), 3, 'tiny-B edge: B - L_s = 0.7 < 1, no whole-core grant fits, so none is invented');
+  const tiny = (armed, claim = 3) => evaluateCandidate({ candidate: ticket('t', 'test', claim), cfg: CFG, B: 1, usedT: 0, usedS: 0, armed });
+  assert.equal(tiny(true).reason, 'clamp-impossible', 'class-blocked while sims are armed');
+  assert.equal(tiny(true).eligible, false);
+  assert.equal(evaluateCandidate({ candidate: ticket('t', 'test', 3), cfg: CFG, B: 1, usedT: 0, usedS: 0, armed: true, idleExempt: true }).eligible, false, 'the idle overshoot never bypasses it');
+  assert.notEqual(tiny(false).reason, 'clamp-impossible', 'evaluated at its full claim once sims disarm');
+  assert.equal(tiny(false, 0.5).eligible, true, 'and a claim under B - L_s is no clamp case at all');
 });
 
 test('a safe backfill leaves room for the head\'s FULL claim (as BRAIN-355 live does), not its elastic floor', () => {
