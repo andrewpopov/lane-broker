@@ -14,6 +14,7 @@ import {
   LockTimeoutError,
 } from './state.js';
 import { enqueue, tryStart, dequeueSync, couldAdmitNow } from './scheduler.js';
+import { touchSimArmFor } from './sim-arm.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { observeLeaseTree } from './cpu.js';
 import { reloadGlobalConfig } from './config.js';
@@ -939,6 +940,7 @@ async function main() {
       if (rssPeak !== undefined) finalResult = { ...finalResult, observedRssPeakBytes: rssPeak };
       atomicWriteJson(ticket.resultPath, finalResult);
       appendHistory(root, historyRow(ticket, finalResult, { fallbackReason }));
+      touchSimArmFor(root, ticket);
       removeLease(root, ticket.id); // release always comes last
       // Cleanup only, AFTER the terminal write above -- never before (BLOCKER #1).
       clearTicketMarkers(root, ticket.id);

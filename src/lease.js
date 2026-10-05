@@ -1,6 +1,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { paths, atomicWriteJson, readJsonSafe, bootId, isPidAlive, processStartTime } from './state.js';
+import { touchSimArmFor } from './sim-arm.js';
 
 export { isPidAlive, processStartTime };
 
@@ -84,16 +85,19 @@ export function isSupervisorAlive(lease) {
 export function reapIfStale(root, lease, currentBootId = bootId()) {
   if (lease.bootId !== currentBootId) {
     removeLease(root, lease.id);
+    touchSimArmFor(root, lease);
     return 'reaped';
   }
   if (isSupervisorAlive(lease)) return 'kept';
   if (!isGroupAlive(lease.childPgid)) {
     removeLease(root, lease.id);
+    touchSimArmFor(root, lease);
     return 'reaped';
   }
   if (lease.state !== LEASE_STATE.ORPHANED) {
     writeLease(root, { ...lease, state: LEASE_STATE.ORPHANED });
   }
+  touchSimArmFor(root, lease);
   return 'orphaned';
 }
 

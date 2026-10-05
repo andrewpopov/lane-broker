@@ -88,6 +88,12 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // niceing (spawns the bare command). A `.lane-broker.json` lane's own
   // `nice` overrides this per-lane.
   laneNice: 10,
+  // BRAIN-379 (balancer P2, slice 2): record, in admission-decisions.log and `lane status`, what
+  // class-aware test/sim allocation WOULD decide. Never changes a live admission decision.
+  allocationShadow: false,
+  // BRAIN-379: how long after the last sim demand (a sim ticket queued or a sim lease charged) the
+  // sim soft lock stays armed.
+  simArmWindowMs: 300_000,
 };
 
 export const DEFAULT_REPO_CONFIG = {
@@ -182,6 +188,8 @@ function validateGlobalConfig(cfg, sourcePath) {
     `${sourcePath}: "maxRemoteQueue" must be a non-negative integer`,
   );
   assert(typeof cfg.admissionLoadGate === 'boolean', `${sourcePath}: "admissionLoadGate" must be a boolean`);
+  assert(typeof cfg.allocationShadow === 'boolean', `${sourcePath}: "allocationShadow" must be a boolean`);
+  assert(Number.isInteger(cfg.simArmWindowMs) && cfg.simArmWindowMs > 0, `${sourcePath}: "simArmWindowMs" must be a positive integer`);
   assert(
     Number.isInteger(cfg.laneNice) && cfg.laneNice >= 0 && cfg.laneNice <= 19,
     `${sourcePath}: "laneNice" must be an integer in [0, 19]`,
@@ -269,6 +277,9 @@ export function isValidRemoteSetupShape(setup) {
 /** Sanity bound on a lane's declared `cpuCores`/`minCpuCores`: no machine has more, and an absurd claim is a typo. */
 export const MAX_LANE_CPU_CORES = 1024;
 
+/** BRAIN-379: a lane's allocation class; an undeclared class is 'test'. */
+export const LANE_CLASSES = ['test', 'sim'];
+
 function validateRepoConfig(cfg, sourcePath) {
   assert(cfg && typeof cfg === 'object', `${sourcePath}: config must be an object`);
   assert(Number.isInteger(cfg.version), `${sourcePath}: "version" must be an integer`);
@@ -298,6 +309,9 @@ function validateRepoConfig(cfg, sourcePath) {
         Number.isInteger(lane.nice) && lane.nice >= 0 && lane.nice <= 19,
         `${sourcePath}: lane "${name}".nice must be an integer in [0, 19]`,
       );
+    }
+    if (lane.class !== undefined) {
+      assert(LANE_CLASSES.includes(lane.class), `${sourcePath}: lane "${name}".class must be "test" or "sim"`);
     }
     if (lane.maxConcurrent !== undefined) {
       assert(
@@ -587,7 +601,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   if (isDeclaredLane) {
     laneCfg = repoConfig.lanes[laneName];
   } else if (undeclaredTemplateName) {
-    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/remote/remoteDeps/remoteSetup
+    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/remote/remoteDeps/remoteSetup/class
     // from the named declared lane, keeping this lane's OWN key/name. Not
     // inherited: `localRefused` (stays default false), the template's named
     // conflicts (only the `*` wildcard universe below reaches this lane, same
@@ -603,6 +617,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       remote: templateCfg.remote,
       remoteDeps: templateCfg.remoteDeps,
       remoteSetup: templateCfg.remoteSetup,
+      class: templateCfg.class,
     };
   } else {
     laneCfg = { weight: DEFAULT_REPO_CONFIG.lanes.default.weight };
@@ -639,6 +654,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     // this field, not an operator-configurable global — there is no
     // equivalent of `laneNice` to fall back to.
     maxConcurrent: Number.isInteger(laneCfg.maxConcurrent) ? laneCfg.maxConcurrent : 1,
+    // BRAIN-379: allocation class; defaulted here so every lane predating the field is a 'test'.
+    class: laneCfg.class === 'sim' ? 'sim' : 'test',
     conflicts,
     // BRAIN-319 T3a: opt-in per lane, defaulted false so a repo config
     // written before this field exists resolves identically (I6).

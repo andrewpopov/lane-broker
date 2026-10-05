@@ -5,6 +5,8 @@ import { sampleAndUpdateGate, readGateState } from './load.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
 import { evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, projectBusy, ticketCpuEstimate } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
+import { captureShadowInputs, recordAllocationShadow } from './allocation-shadow.js';
+import { reconcileSimArm, touchSimArmFor } from './sim-arm.js';
 import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, resolveTicketResources } from './resources.js';
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
@@ -54,6 +56,7 @@ export async function enqueue(root, ticket) {
     const seq = nextSeq(root);
     const record = { ...ticket, seq, createdAt: ticket.createdAt || Date.now() };
     atomicWriteJson(queueFile(root, seq, ticket.id), record);
+    touchSimArmFor(root, record);
     return record;
   });
 }
@@ -609,8 +612,10 @@ export function selectCapacityCandidate(queue, held, runningWeight, capacity) {
  * become a stale, already-superseded transition of the load/CPU gate — only
  * a transition the config in effect at decision time would actually produce.
  */
-export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler, reloadCfg = () => globalCfg, memoryReader = readMemoryInfo, writeResourceState = atomicWriteJson) {
-  const { result, logFields, events } = await withLock(root, () => {
+export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler, reloadCfg = () => globalCfg, memoryReader = readMemoryInfo, writeResourceState = atomicWriteJson, shadowEvaluator = undefined) {
+  // `shadow` is what the live evaluation below hands the BRAIN-379 shadow recorder; it is only ever
+  // filled with copies and flags, never read back by the live decision.
+  const decide = (shadow) => {
     const cfg = reloadCfg() || globalCfg;
     const now = Date.now();
     reapStale(root, ticket.id);
@@ -642,6 +647,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // what it did before this ticket existed: one cheap read, no side
     // effects. Only the selected candidate pays for a real gate evaluation.
     const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
+    reconcileSimArm(root, queue, held, now);
     const headTicket = queue[0];
     if (!headTicket) {
       // The literal head's own queue record is corrupt/unreadable (Codex
@@ -655,7 +661,8 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // before selection can even be decided, not just whether the eventual
     // candidate fits.
     const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
-    const weightCapacity = effectiveWeightCapacity(cfg, detectResourceCapacity().cpuCores);
+    const cpuCores = detectResourceCapacity().cpuCores;
+    const weightCapacity = effectiveWeightCapacity(cfg, cpuCores);
     const blocker = blockedBy(held, headTicket);
     const headConflicted = blocker !== null;
     // Starvation bound (Codex review finding #6): a conflict-blocked head
@@ -714,16 +721,17 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // BRAIN-355: an exhausted conflict-blocked head still admits a ticket that provably cannot
     // delay it. The ticket polling decides for itself (admission below reserves the head's
     // resources); it is never counted as a skip.
-    const safeBackfill =
+    const isSafeBackfill = (t, tPosition) =>
       skipExhausted &&
       cfg.conflictSafeBackfill &&
-      ticket.id !== headTicket.id &&
+      t.id !== headTicket.id &&
       // an unreadable (null) ticket ahead of this one stops backfill, as it stops every selector's walk
-      queue.slice(0, position).every(Boolean) &&
-      !blockedBy(held, ticket) &&
-      !blockedBy([{ key: ticket.key }], headTicket) &&
-      !blockedBy([{ key: headTicket.key }], ticket) &&
-      runningWeight + headTicket.weight + ticket.weight <= weightCapacity;
+      queue.slice(0, tPosition).every(Boolean) &&
+      !blockedBy(held, t) &&
+      !blockedBy([{ key: t.key }], headTicket) &&
+      !blockedBy([{ key: headTicket.key }], t) &&
+      runningWeight + headTicket.weight + t.weight <= weightCapacity;
+    const safeBackfill = isSafeBackfill(ticket, position);
     // BRAIN-365: the first non-conflicting ticket behind a conflicted head may be one that admission
     // keeps denying projected-over-budget, which would pin every smaller ticket behind it. That
     // denial leaves a behind-conflict record (below); while it stands, the walk prefers the smallest
@@ -744,6 +752,30 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
         : resourceBackfill && ticket.id !== headTicket.id
           ? selectResourceCandidate(queue, held, runningWeight, weightCapacity, resourceRecord, cfg, now)
           : headTicket;
+    // BRAIN-379 shadow: snapshot, before anything below can write, exactly what the live selection saw.
+    if (cfg.allocationShadow === true) {
+      try {
+        shadow.inputs = captureShadowInputs({
+          queue,
+          held,
+          now,
+          cfg,
+          cpuCores,
+          skipBudget: headConflicted
+            ? { kind: 'conflict', limit: cfg.conflictSkipLimit, used: skipCount }
+            : headCapacityBlocked
+              ? { kind: 'capacity', limit: cfg.conflictSkipLimit, used: capacitySkipCount }
+              : resourceRecord
+                ? { kind: 'resource', limit: cfg.resourceSkipLimit, used: resourceRecord.count }
+                : { kind: 'none', limit: cfg.conflictSkipLimit, used: 0 },
+          reservation: { reserved: capacityReserved || resourceReserved(resourceRecord) },
+          conflictBlocked: (t) => blockedBy(held, t) !== null,
+          safeBackfill: (t) => isSafeBackfill(t, queue.findIndex((q) => q && q.id === t.id)),
+        });
+      } catch (err) {
+        shadow.captureError = err;
+      }
+    }
     if (!candidate) {
       // Either nobody in the queue is eligible (selectCandidate/
       // selectCapacityCandidate found nothing), or the head's skip
@@ -811,6 +843,8 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     const headReservation = { id: headTicket.id, key: headTicket.key, weight: headTicket.weight, resources: headTicket.resources };
     const admissionHeld = safeBackfill || conflictPick ? [...held, headReservation] : held;
     const fullDecision = evaluateNewAdmission(root, cfg, ticket, admissionHeld, cpuSample, memInfo);
+    shadow.cpuSample = cpuSample;
+    shadow.externalBusy = fullDecision.externalBusy;
     // BRAIN-360: an elastic ticket (resources.minCpuCores) denied ONLY by the CPU projection is
     // re-evaluated at smaller claims, over the same held leases (and, for a safe backfill, the same
     // head reservation), so the grant can never delay what the full claim could not. Active mode
@@ -899,6 +933,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       held.length === 0 &&
       cfg.resourceIdleOvershootCores > 0 &&
       cpuDecision.projectedBusy - cpuDecision.budget <= cfg.resourceIdleOvershootCores;
+    shadow.idleExempt = idleExempt;
     if (cfg.schedulerMode === 'active' && !cpuDecision.admit && !idleExempt) {
       if (headPolling) {
         // Cooldown is the head's own backfill echoing back (each admission starts one), so it
@@ -989,11 +1024,14 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       // `blockedBy` call against a DIFFERENT ticket of the same key — can
       // still see the ceiling this holder was admitted under.
       maxConcurrent: ticket.maxConcurrent,
+      // BRAIN-379: allocation class, so a held-lease-only view can charge the lease to its class.
+      class: ticket.class,
       logPath: ticket.logPath,
       resultPath: ticket.resultPath,
       state: LEASE_STATE.RUNNING,
     };
     writeLease(root, lease);
+    touchSimArmFor(root, lease, now);
     if (safeBackfill) {
       logHeadBlock(root, {
         event: 'safe-backfill',
@@ -1024,6 +1062,15 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       logFields: { ...logBase, currentDecision: 'start', currentReason: idleExempt ? 'resource-idle-exempt' : baselineReason },
       events,
     };
+  };
+  const { result, logFields, events } = await withLock(root, () => {
+    const shadow = {};
+    const outcome = decide(shadow);
+    const headTicketId = shadow.inputs?.queue[0]?.id;
+    // One record per poll cycle (the head's poll) plus one per real admission; a non-head poll that starts nothing adds no information.
+    const recordsShadow = headTicketId === ticket.id || outcome.result.started === true;
+    if (recordsShadow && (shadow.inputs || shadow.captureError)) recordAllocationShadow({ root, shadow, outcome, pollerId: ticket.id, evaluator: shadowEvaluator });
+    return outcome;
   });
 
   // Pure telemetry: nothing reads this back to make a decision, so it never
