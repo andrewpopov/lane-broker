@@ -216,7 +216,7 @@ form: an undeclared `--lane` name still keeps its own key and name (the
 same-key exclusivity rule above is unaffected — two sessions using the same
 ad-hoc name still conflict with each other), but instead of the no-config-file
 default it inherits `weight`, `cpuCores`, `minCpuCores`, `memoryBytes`, `nice`, `remote`,
-`remoteDeps` and `remoteSetup` from the named declared lane. It does NOT
+`remoteDeps`, `remoteSetup`, `remoteArtifacts` and `remoteArtifactsOn` from the named declared lane. It does NOT
 inherit that lane's own named `conflicts` entries or its `maxConcurrent`
 (stays `1`) — only the `*` wildcard universe still reaches it, same as plain
 `"allow"`. The named lane must be declared and must not be `localRefused`.
@@ -501,6 +501,64 @@ Not covered: native code that links against system libraries beyond glibc,
 the compiler and python versions (a toolchain or library upgrade that keeps
 the same versions); clear `<root>/deps-cache` after a runner OS or toolchain
 change that those do not reflect.
+
+### Returning files from a remote run (BRAIN-398)
+
+A gate that leaves a stamp for a later check (a lane stamp, a report) writes it on the runner, not in your worktree. List
+those files and a remote run brings them back:
+
+```json
+"lanes": {
+  "default": {
+    "remote": true,
+    "remoteArtifacts": ["artifacts/test-lane/default-latest.json", "reports/*.json"],
+    "remoteArtifactsOn": "success"
+  }
+}
+```
+
+- `remoteArtifacts`: paths relative to the repo root, or simple globs (`*` within one path segment, `**` as a whole
+  segment for any depth). At most 50, canonical, no `..`, no absolute paths, and each under a glob-free directory
+  (`reports/*.json` is fine; `*.json`, `**/*.json` and a root-level file are config errors).
+- `remoteArtifactsOn`: `success` (default, only when the command exits 0) or `always` (also when it fails; never for a
+  cancelled, refused or unfinished run).
+- Remote only. A local run, including a fallback, ignores both: the files are already in the worktree.
+
+The runner, and the branch code it runs, are less trusted than the submitter, so the submitter is strict.
+
+How it travels: after the command, and before the work dir is deleted, the runner copies the matches next to the
+ticket's `result.json` (sha256 per file; nothing is created for zero files). The result carries only a summary. The
+submitter then runs `lane remote-artifacts <ticketId>` over ssh (a framed stream, the same framing and reader as the
+snapshot, protocol 1 exactly), checks every path, cap and sha256, and writes each file atomically at the same relative
+path in your worktree, creating parent directories. On every exit path, success or not, it asks the runner to delete its
+copies (`lane remote-artifacts-release`), and every `remote-exec` and `remote-probe` on a runner drops any older than
+24 hours. What a runner prints to the submitter's ssh calls is captured only up to its last 64 KiB (1 MiB for the other
+calls). The log gets `lane: remote artifacts: N file(s) returned: <names>`, and the history row records `remoteArtifacts`.
+
+What it refuses, as a warning and never a change to the exit code or to the published result:
+
+- Runner side: a protected path (below), a symlink, a directory or other special file, a path whose realpath is outside
+  the work dir. Any of these refuses the whole set, as does a cap: 16 MiB per file, 64 MiB in total, 200 files (global
+  config `remoteArtifactMaxFileBytes`, `remoteArtifactMaxTotalBytes`, `remoteArtifactMaxCount`; the runner and the
+  submitter each apply their own). The walk stops at the count cap, and bytes are read through an `O_NOFOLLOW` fd limited
+  to the cap, never trusting an earlier size.
+- Submitter side: a path that is not canonical, not under the literal directory of a declared pattern it matches, or
+  protected; a sha256 mismatch or an unknown stream version (the whole stream); a destination that is not a regular file
+  or has ANY symlink ancestor directory; and any file git tracks, checked on the canonical spelling too. An artifact never
+  overwrites tracked content, whether declared by glob or by exact path.
+- Protected paths, wherever they appear: any segment equal to or starting with `.git` (so `.git` files in linked
+  worktrees, `.github`, `.githooks`, `.gitmodules`), `.env*`, `.yarnrc*`, `.npmrc`, `.lane-broker.json`,
+  `node_modules`, `package.json`, `package-lock.json`, `npm-shrinkwrap.json` and `*.lock`, compared case-insensitively.
+- Writes go to a temp file in the destination directory; the ancestors and containment are re-checked, then the file is
+  renamed into place. Residual race, out of scope: a process on the submitting machine that swaps a directory for a
+  symlink between that re-check and the rename. The runner cannot touch that filesystem, and a local mutator can already
+  write the worktree.
+- A runner that does not advertise `artifacts/1` in `remote-probe` still runs the command; the submitter warns that
+  nothing will be returned.
+
+A warning shows in the log as `lane: warning: remote artifacts: ...` and in the history row as
+`remoteArtifactsWarning`. The lane's success is about the command: a stamp that did not arrive shows up when whatever
+reads it refuses.
 
 ### Queue timeout
 

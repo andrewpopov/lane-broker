@@ -56,7 +56,7 @@ function assertAncestorsUnchanged(worktreeRoot, relPath) {
  * Any mismatch throws, which the generator surfaces as a stream 'error'
  * (never a partial/wrong body reaching ssh).
  */
-function readVerifiedFile(worktreeRoot, entry) {
+export function readVerifiedFile(worktreeRoot, entry) {
   assertAncestorsUnchanged(worktreeRoot, entry.path);
   const absPath = path.join(worktreeRoot, entry.path);
   let fd;

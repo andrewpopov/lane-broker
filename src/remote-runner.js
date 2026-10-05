@@ -4,9 +4,11 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { pipeline } from 'node:stream/promises';
 import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
-import { isValidRemoteDepsShape, isValidRemoteSetupShape, loadGlobalConfig } from './config.js';
+import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, loadGlobalConfig } from './config.js';
+import { ARTIFACTS_CAPABILITY, artifactLimitsOf, collectArtifacts, encodeArtifacts, pruneStaleArtifacts } from './remote-artifacts.js';
 import { remotePriorityFrom, PRIORITY_CAPABILITY } from './priority.js';
 import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores, ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
 import { makeReader, readHeaderLine, extractFrames, MAX_HEADER_BYTES } from './remote-stream.js';
@@ -172,6 +174,13 @@ function validateHeaderFields(header) {
   if (header.queueTimeoutMs !== undefined && !(Number.isInteger(header.queueTimeoutMs) && header.queueTimeoutMs > 0)) {
     return { ok: false, reason: 'invalid queueTimeoutMs' };
   }
+  // BRAIN-398: additive on both protocols (an older runner ignores them; the submitter checks the probe capability first).
+  if (header.remoteArtifacts !== undefined && !isValidRemoteArtifactsShape(header.remoteArtifacts)) {
+    return { ok: false, reason: 'invalid remoteArtifacts' };
+  }
+  if (header.remoteArtifactsOn !== undefined && !REMOTE_ARTIFACTS_ON.includes(header.remoteArtifactsOn)) {
+    return { ok: false, reason: 'invalid remoteArtifactsOn' };
+  }
   return { ok: true };
 }
 
@@ -193,7 +202,7 @@ function readDeps(ticketDir) {
   return readJsonSafe(path.join(ticketDir, 'deps.json')) ?? undefined;
 }
 
-function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, runMs, grantedCpuCores, observedCpu, observedRssPeakBytes }) {
+function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, runMs, grantedCpuCores, observedCpu, observedRssPeakBytes, artifacts }) {
   const isProtocol2 = header.protocol === 2;
   return {
     protocol: isProtocol2 ? 2 : 1,
@@ -221,7 +230,27 @@ function buildResult(header, ticketDir, { kind, exit = null, signal = null, remo
     // BRAIN-361: additive; what the lane actually used on the runner, relayed to the submitter's history
     observedCpu,
     observedRssPeakBytes,
+    // BRAIN-398: additive summary of the stored artifacts; the bytes travel separately (`lane remote-artifacts`)
+    artifacts,
   };
+}
+
+/**
+ * BRAIN-398: store the files the lane declared, when this run's outcome and `remoteArtifactsOn` say to. Returns the
+ * summary for the result (`undefined` when the policy skipped it). A collection failure is data, not an error: the
+ * result stays exactly what the command produced.
+ */
+function storeArtifacts(header, ticketDir, workDir, { kind, exit, signal }) {
+  if (header.remoteArtifacts === undefined || kind !== 'completed') return undefined;
+  // Everything artifact-shaped, config reload included, answers for itself: it may only ever produce a warning in
+  // the result, never stop the result (with the command's true exit) from being published.
+  try {
+    const commandSucceeded = exit === 0 && !signal && (header.protocol !== 2 || readPhase(ticketDir) === 'command');
+    if ((header.remoteArtifactsOn ?? 'success') === 'success' && !commandSucceeded) return undefined;
+    return collectArtifacts(workDir, header.remoteArtifacts, path.join(ticketDir, 'artifacts'), artifactLimitsOf(loadGlobalConfig()));
+  } catch (err) {
+    return { ok: false, reason: `could not collect artifacts: ${err.message}` };
+  }
 }
 
 function writeResult(ticketDir, result) {
@@ -329,6 +358,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     }
     throw err;
   }
+  pruneStaleArtifacts(ticketsDir);
   await testHoldAt('remote-exec-committed');
   // Node's default for SIGHUP is to exit, but this process must outlive a dropped ssh session
   // to publish result.json; explicit cancellation goes through remote-cancel.
@@ -562,14 +592,19 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     kind = 'unfinished';
   }
 
-  writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, runMs, grantedCpuCores, observedCpu, observedRssPeakBytes }));
-  cleanupWork(workDir, tmpDir);
+  const artifacts = storeArtifacts(header, ticketDir, workDir, { kind, exit, signal });
+  try {
+    writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, runMs, grantedCpuCores, observedCpu, observedRssPeakBytes, artifacts }));
+  } finally {
+    cleanupWork(workDir, tmpDir);
+  }
   return { exitCode: 0 };
 }
 
 /** `lane remote-probe`: one JSON line describing this host's local broker,
  *  reusing status.js's own reader rather than a second implementation. */
-export async function remoteProbeCommand() {
+export async function remoteProbeCommand({ root = defaultRemoteRoot() } = {}) {
+  pruneStaleArtifacts(path.join(path.resolve(root), 'tickets'));
   const status = await collectStatus();
   const pkgPath = fileURLToPath(new URL('../package.json', import.meta.url));
   const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
@@ -589,7 +624,7 @@ export async function remoteProbeCommand() {
     protocol: 1,
     protocols: [1, 2],
     // BRAIN-360: this runner resolves minCpuCores itself, so a submitter may judge fit by the floor
-    capabilities: [ELASTIC_CLAIMS_CAPABILITY, PRIORITY_CAPABILITY],
+    capabilities: [ELASTIC_CLAIMS_CAPABILITY, PRIORITY_CAPABILITY, ARTIFACTS_CAPABILITY],
     version: pkg.version,
     // BRAIN-380 slice 4: a draining runner takes no new work. `draining` names why; `paused` is also set so a client
     // built before this field skips the runner the way it skips a paused one.
@@ -651,6 +686,36 @@ export async function remoteResultCommand(ticketId, { root = defaultRemoteRoot()
     record = (state === 'gone' && readResult(resultPath)) || { protocol: 1, missing: true, state };
   }
   process.stdout.write(`${JSON.stringify(record)}\n`);
+  return { exitCode: 0 };
+}
+
+/** `lane remote-artifacts <ticketId>` (BRAIN-398): stream the stored artifacts, framed; nonzero and silent when there are none. */
+export async function remoteArtifactsCommand(ticketId, { root = defaultRemoteRoot(), stdout = process.stdout } = {}) {
+  if (!isUuid(ticketId)) {
+    process.stderr.write('lane remote-artifacts: missing or invalid ticketId\n');
+    return { exitCode: 2 };
+  }
+  const stream = encodeArtifacts(path.join(path.resolve(root), 'tickets', ticketId, 'artifacts'), ticketId);
+  if (!stream) {
+    process.stderr.write('lane remote-artifacts: no artifacts stored for this ticket\n');
+    return { exitCode: 1 };
+  }
+  try {
+    await pipeline(stream, stdout, { end: false });
+  } catch (err) {
+    process.stderr.write(`lane remote-artifacts: ${err.message}\n`);
+    return { exitCode: 1 };
+  }
+  return { exitCode: 0 };
+}
+
+/** `lane remote-artifacts-release <ticketId>`: delete the stored copies once the submitter has them. Idempotent. */
+export async function remoteArtifactsReleaseCommand(ticketId, { root = defaultRemoteRoot() } = {}) {
+  if (!isUuid(ticketId)) {
+    process.stderr.write('lane remote-artifacts-release: missing or invalid ticketId\n');
+    return { exitCode: 2 };
+  }
+  fs.rmSync(path.join(path.resolve(root), 'tickets', ticketId, 'artifacts'), { recursive: true, force: true });
   return { exitCode: 0 };
 }
 

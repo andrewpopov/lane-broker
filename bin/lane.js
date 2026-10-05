@@ -12,6 +12,8 @@ import {
   remoteProbeCommand,
   remoteResultCommand,
   remoteCancelCommand,
+  remoteArtifactsCommand,
+  remoteArtifactsReleaseCommand,
   defaultRemoteRoot,
 } from '../src/remote-runner.js';
 import { remotePipelineCommand } from '../src/remote-pipeline.js';
@@ -216,7 +218,7 @@ async function main() {
     // BRAIN-319 T2: hidden runner-side subcommands, invoked by a client Mac
     // over ssh — deliberately not listed in usage() above.
     case 'remote-probe': {
-      const result = await remoteProbeCommand();
+      const result = await remoteProbeCommand({ root: parseRootFlag(rest) || defaultRemoteRoot() });
       return result.exitCode;
     }
     case 'remote-exec': {
@@ -232,6 +234,17 @@ async function main() {
       }
       const root = parseRootFlag(rest.slice(1)) || defaultRemoteRoot();
       const result = await remoteResultCommand(id, { root });
+      return result.exitCode;
+    }
+    case 'remote-artifacts':
+    case 'remote-artifacts-release': {
+      const id = rest[0];
+      if (!id) {
+        process.stderr.write(`lane ${sub}: missing <ticketId>\n`);
+        return 2;
+      }
+      const root = parseRootFlag(rest.slice(1)) || defaultRemoteRoot();
+      const result = await (sub === 'remote-artifacts' ? remoteArtifactsCommand : remoteArtifactsReleaseCommand)(id, { root });
       return result.exitCode;
     }
     case 'remote-cancel': {

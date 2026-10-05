@@ -25,6 +25,7 @@ import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
 import { detectResourceCapacity, checkResourceBudget, localSimRefusal, leaseCpuCores } from './resources.js';
 import { selectRunner, dispatchRemote, needsProtocol2 } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
+import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
 import { createAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX } from './admission.js';
 import { observedLeaseFields, summarizeObservedCpu, sanitizeObservedCpu, sanitizeRssPeak } from './observed.js';
@@ -347,6 +348,45 @@ function relayedDeps(result) {
   return { depsCache: deps.outcome, ...(Number.isFinite(deps.ms) && deps.ms >= 0 ? { depsMs: deps.ms } : {}) };
 }
 
+/**
+ * BRAIN-398: install the files a confirmed remote run returned into the submitter's worktree and say so. Every outcome
+ * short of success is a warning (stderr, the admission log, the history row); the lane's exit code is never touched,
+ * and this never throws. Returns the history-row fields.
+ */
+function returnRemoteArtifacts(root, enriched, dispatch) {
+  const declared = enriched.remote.remoteArtifacts;
+  const reported = dispatch.result.artifacts;
+  const warnings = [];
+  let names = [];
+  try {
+    if (dispatch.artifacts?.ok) {
+      const { written, refused } = installArtifacts(enriched.remote.worktreeRoot, dispatch.artifacts.files, declared);
+      names = written;
+      for (const r of refused) warnings.push(`refused ${r.path}: ${r.reason}`);
+    } else if (dispatch.artifacts) {
+      warnings.push(`not returned: ${dispatch.artifacts.reason}`);
+    } else if (reported?.ok === false) {
+      warnings.push(`the runner could not collect them: ${reported.reason}`);
+    }
+    if (reported?.ok === true) for (const m of reported.missing ?? []) warnings.push(`declared but not produced: ${m}`);
+  } catch (err) {
+    warnings.push(`not returned: ${err.message}`);
+  }
+  const lines = [];
+  if (dispatch.artifacts?.ok || reported?.ok === true) {
+    lines.push(`lane: remote artifacts: ${names.length} file(s) returned${names.length ? `: ${names.join(', ')}` : ''}\n`);
+  }
+  for (const w of warnings) lines.push(`lane: warning: remote artifacts: ${w}\n`);
+  for (const line of lines) {
+    process.stderr.write(line);
+    writeBrokerLog(root, line);
+  }
+  return {
+    ...(names.length > 0 ? { remoteArtifacts: names } : {}),
+    ...(warnings.length > 0 ? { remoteArtifactsWarning: warnings.join('; ') } : {}),
+  };
+}
+
 /** The exact "requested resources exceed this environment's budget" (checkResourceBudget) or
  *  "this lane is refused for local runs by default" (localSimRefusal) result shape run.js
  *  applies at preflight, re-applied here once a remote-eligible ticket has fallen back to
@@ -583,11 +623,24 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
   // about to actually be dialed for the transfer -- see finding #5 above.
   process.stderr.write(`lane: running on ${runner.name}\n`);
 
+  // BRAIN-398: a runner without `artifacts/1` would run the command and silently return nothing, so say so up front.
+  const declaredArtifacts = enriched.remote.remoteArtifacts;
+  const artifactsSupported = Boolean(declaredArtifacts) && Array.isArray(probe?.capabilities) && probe.capabilities.includes(ARTIFACTS_CAPABILITY);
+  let artifactsUnsupportedWarning;
+  if (declaredArtifacts && !artifactsSupported) {
+    artifactsUnsupportedWarning = `runner ${runner.name} does not support ${ARTIFACTS_CAPABILITY}; nothing will be returned`;
+    const line = `lane: warning: remote artifacts: ${artifactsUnsupportedWarning}\n`;
+    process.stderr.write(line);
+    writeBrokerLog(root, line);
+  }
+
   // BRAIN-320 S1c: `enriched.remote.remoteDeps`/`remoteSetup` ride along in
   // this spread and are what `dispatchRemote` derives its protocol-2 exec
   // header from (see its own `needsProtocol2` call).
   const dispatch = await dispatchRemote({
     ...enriched.remote,
+    remoteArtifacts: artifactsSupported ? declaredArtifacts : null,
+    artifactLimits: artifactLimitsOf(globalCfg),
     manifest,
     runner,
     argv: enriched.cmd,
@@ -622,6 +675,11 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
       writeBrokerLog(root, phaseLine);
     }
     await updateAttempt(root, enriched.id, 0, { remotePhase: dispatch.phase ?? null });
+    const artifactFields = artifactsSupported
+      ? returnRemoteArtifacts(root, enriched, dispatch)
+      : artifactsUnsupportedWarning
+        ? { remoteArtifactsWarning: artifactsUnsupportedWarning }
+        : {};
     // BRAIN-341: queue wait = enqueue -> the moment the command started, i.e.
     // everything before the runner-reported run. Never the run itself.
     const runMs = dispatch.result.runMs;
@@ -636,6 +694,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
       ...(Number.isFinite(dispatch.result.grantedCpuCores) ? { grantedCpuCores: dispatch.result.grantedCpuCores } : {}),
       ...relayedUsage(dispatch.result),
       ...relayedDeps(dispatch.result),
+      ...artifactFields,
       remoteKind: dispatch.result.kind,
       remotePhase: dispatch.phase ?? null,
       startedAt: remoteWaitedMs === null ? attemptStartedAt : enriched.createdAt + remoteWaitedMs,
