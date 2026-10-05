@@ -79,3 +79,23 @@ export function orderQueue(raw, nowEff, cfg) {
   flush();
   return ordered;
 }
+
+/**
+ * BRAIN-380 R4-2/R4-3: the effective view. `reservations` are `{id, seq}` for every ticket holding a
+ * BRAIN-346 reservation latch, `seq` being its `reservationSeq`. Exactly one is ACTIVE: the lowest `seq`
+ * whose owner is queued and not behind an unreadable (`null`) record. The owner is moved to index 0 and
+ * everything else keeps its relative order; the other reservations are dormant (they reserve nothing).
+ * Never a timestamp: equal wall times or a clock rollback cannot reorder reservations.
+ */
+export function promoteReservationOwner(ordered, reservations) {
+  const barrier = ordered.indexOf(null);
+  const reach = barrier === -1 ? ordered.length : barrier;
+  const byAge = [...reservations].sort((a, b) => a.seq - b.seq || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  for (const { id } of byAge) {
+    const index = ordered.findIndex((t) => t !== null && t.id === id);
+    if (index === -1 || index >= reach) continue;
+    const queue = index === 0 ? ordered : [ordered[index], ...ordered.slice(0, index), ...ordered.slice(index + 1)];
+    return { queue, ownerId: id };
+  }
+  return { queue: ordered, ownerId: null };
+}

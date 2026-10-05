@@ -485,7 +485,9 @@ ending in strict FIFO for that head once spent:
   denial of the same head (closed CPU gate, memory, unavailable sample); such a
   denial only pauses backfill until the head is next denied by the projection.
   They are dropped only when the head starts, leaves the front of the queue, or
-  the limit is 0. A backfill whose count cannot be written to disk is
+  the limit is 0 (behind the priority scheduler fence, see "Priority (ordered
+  selection)" below, the front moves for reasons unrelated to the owner, so they
+  are dropped only when the ticket starts or leaves the queue, or the limit is 0). A backfill whose count cannot be written to disk is
   refused, never uncounted. `resourceSkipLimit: 0` restores strict FIFO for
   resource denials.
 
@@ -668,8 +670,8 @@ exit `64`; v1 has no general lane hierarchy.
 
 ### Priority (foundations, BRAIN-380 slice 1)
 
-The scheduler is still strictly FIFO: this slice records tiers and a priority
-clock but reorders nothing, and `lane status` says so
+Without the scheduler fence (next section) the scheduler is strictly FIFO: tiers
+and the priority clock are recorded but reorder nothing, and `lane status` says so
 (`priority: inactive (legacy scheduler; run lane migrate-scheduler)`). Each
 queued ticket persists `priorityRequested`, `priorityAdmitted` (equal to
 requested until the per-repo high cap ships), `prioOriginAt` and
@@ -693,7 +695,48 @@ default `600000`: one tier of age per period), `priorityAgeMaxMs` (integer in
 `age >= tier`, `fairshare` exactly `0`; defaults `2/2/0`) and
 `maxQueuedHighPerRepo` (non-negative integer, default `1`; not enforced yet).
 `src/priority.js` holds the pure score (`min(W_tier, W_tier*tierFactor +
-W_age*ageFactor)`) and `orderQueue`; no selector calls them yet.
+W_age*ageFactor)`) and `orderQueue`; see "Priority (ordered selection)" for where they are live.
+
+### Priority (ordered selection, BRAIN-380 slice 2)
+
+Everything here runs only while a **valid** `sched-v2.json` (`{"version": 2,
+"migratedAt": <ms>}`) is in the state root. Without one the scheduler is the
+legacy FIFO over the three singleton skip files, unchanged. An unreadable,
+malformed or wrong-version fence or `fairness-v2.json` also runs legacy mode and
+logs `lane-broker-head-block event=scheduler-fence-invalid reason=...` (once per
+process). The command that writes the fence is a later slice.
+
+- **One ordered view.** Each locked evaluation orders the queue once, with
+  `nowEff = max(wall clock, hwm)`: `(score desc, seq asc)` within each run of
+  readable records, never across an unreadable record. The active reservation
+  owner, if any, is then moved to index 0 (never across an unreadable record,
+  which suspends its reservation for that evaluation). Every selector (conflict,
+  capacity and resource walks, BRAIN-365's conflict backfill, BRAIN-355's safe
+  backfill) and the allocation shadow snapshot receive that one array, so
+  "head" means index 0 of it. "Smallest fitting claim" ties go to the earlier
+  ordered-view position. `lane status` runs the same pipeline read-only, shows
+  `priority: active`, positions from that array and the promoted owner.
+- **Per-ticket fairness.** `fairness-v2.json` maps ticket id to one record per
+  blocking reason (`conflict`, `capacity`, `resource`), each
+  `{reason, skipsCharged, ...}`: conflict adds `blockedSince`, `graceStartedAt`
+  and `loggedPhase`; capacity adds `loggedPhase`; resource adds `reserved`,
+  `reservationSeq`, `inScope`, `behindConflict`, `deniedAt`, `budget` and
+  `externalBusy`. The skip budget applies to the current head using its own
+  counter. A displaced ticket's counter pauses and its conflict grace keeps
+  running from its own `graceStartedAt`. A record is deleted only when the ticket
+  departs (starts, is cancelled, expires or is reaped; removal is noticed on the
+  next evaluation, except while an unreadable queue record hides which ids
+  left). The singleton files are never read or written behind the fence.
+- **One active reservation.** A reservation record carries `reservationSeq`,
+  drawn from the monotonic queue counter when the resource allowance is used
+  up, never a timestamp. The lowest `reservationSeq` whose owner is queued and
+  not behind an unreadable record is active and promoted; the others are
+  dormant (kept with their counters, reserving nothing). A higher-priority
+  arrival does not take it over. It is released when the owner starts or leaves
+  the queue, or `resourceSkipLimit` is 0.
+- **Backfill.** BRAIN-355 safe backfill stays poll-driven: whichever ticket
+  polls and proves it cannot delay the effective head may start, an exception to
+  priority order that makes no promise about other queued tickets.
 
 ## Exit codes
 
@@ -744,7 +787,7 @@ the queue so you know what's waiting and why.
 ## State
 
 `$LANE_BROKER_STATE` (default `~/.cache/lane-broker`): `leases/`, `queue/`,
-`priority-hwm.json` (the priority clock's high-water mark), `logs/` (per-run, capped at 50MB with a truncation notice), `results/`,
+`priority-hwm.json` (the priority clock's high-water mark), `sched-v2.json` and `fairness-v2.json` (the priority scheduler fence and its per-ticket fairness records), `logs/` (per-run, capped at 50MB with a truncation notice), `results/`,
 `history.jsonl` (one line per completed run, plus one `dequeuedDeadSupervisor: true`
 row `{id, key, error, supervisorPid, endedAt, executor}` (`error: "supervisor died while queued"`, so a history reader counts it as an error, not a failed run) when a queued ticket whose
 supervisor died is dropped from the queue; it is written only once the queue

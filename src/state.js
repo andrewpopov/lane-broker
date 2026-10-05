@@ -41,6 +41,10 @@ export function paths(root = stateHome()) {
     simArm: path.join(root, 'sim-arm.json'),
     simArmLock: path.join(root, 'sim-arm.lock'),
     seq: path.join(root, 'seq'),
+    // BRAIN-380: the scheduler fence (its presence, valid, switches priority ordering on) and the per-ticket
+    // fairness records that replace the three singleton skip files behind it; see src/fairness.js.
+    schedFence: path.join(root, 'sched-v2.json'),
+    fairness: path.join(root, 'fairness-v2.json'),
     // BRAIN-380: broker-wide high-water mark of wall time (the priority clock); see src/priority-clock.js.
     hwm: path.join(root, 'priority-hwm.json'),
     // BRAIN-319 T3b-2 (C3): one durable attempt record per remote-eligible

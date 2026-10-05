@@ -9,6 +9,7 @@ import { captureShadowInputs, recordAllocationShadow } from './allocation-shadow
 import { reconcileSimArm, touchSimArmFor } from './sim-arm.js';
 import { advanceHwm } from './priority-clock.js';
 import { DEFAULT_PRIORITY, isPriorityTier, originOrNow } from './priority.js';
+import { resolveScheduler, legacyStore, fairnessStore, effectiveView } from './fairness.js';
 import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, resolveTicketResources } from './resources.js';
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
@@ -212,8 +213,8 @@ function couldAdmitLocked(root, cfg, ticket, memoryReader) {
  *  actual transition. Both are `null` for a file written before BRAIN-249 (or any other missing/
  *  malformed value) — never defaulted to something that would read as "infinitely old" or
  *  "already logged". */
-export function readSkipState(root) {
-  const raw = readJsonSafe(paths(root).conflictSkipState);
+export function readSkipState(root, store = legacyStore(root), headId = null) {
+  const raw = store.read('conflict', headId);
   if (!raw || typeof raw.headId !== 'string' || !Number.isFinite(raw.count) || raw.count < 0) {
     return { headId: null, count: 0, blockedSince: null, loggedPhase: null };
   }
@@ -244,14 +245,14 @@ export function readSkipState(root) {
  *  strict FIFO (the head blocks everyone until its own conflict clears).
  *  Losing backfill on a broken disk is the correct trade against unbounded
  *  starvation. */
-function recordSkip(root, headId, now = Date.now()) {
-  const prev = readSkipState(root);
+function recordSkip(root, store, headId, now = Date.now()) {
+  const prev = readSkipState(root, store, headId);
   const sameHead = prev.headId === headId;
   const count = sameHead ? prev.count + 1 : 1;
   const blockedSince = sameHead && prev.blockedSince != null ? prev.blockedSince : now;
   const loggedPhase = sameHead ? prev.loggedPhase : null;
   try {
-    atomicWriteJson(paths(root).conflictSkipState, { headId, count, blockedSince, loggedPhase });
+    store.write('conflict', headId, { headId, count, blockedSince, loggedPhase });
     return true;
   } catch {
     return false;
@@ -297,7 +298,7 @@ function recordSkip(root, headId, now = Date.now()) {
  * appears to have lapsed sooner than it actually did, and a dropped log
  * line is telemetry, not a scheduling decision.
  */
-function resolveHeadBlock(root, cfg, headId, blocker, sameHead, skipState, skipCount, now) {
+function resolveHeadBlock(root, store, cfg, headId, blocker, sameHead, skipState, skipCount, now) {
   const blockedSince = sameHead && skipState.blockedSince != null ? skipState.blockedSince : now;
   const blockedMs = now - blockedSince;
   const phase = skipCount < cfg.conflictSkipLimit ? 'blocked' : blockedMs < cfg.headBlockGraceMs ? 'exhausted' : 'resumed';
@@ -317,7 +318,7 @@ function resolveHeadBlock(root, cfg, headId, blocker, sameHead, skipState, skipC
   }
   if (blockedSinceChanged || phase !== prevPhase) {
     try {
-      atomicWriteJson(paths(root).conflictSkipState, { headId, count: skipCount, blockedSince, loggedPhase: phase });
+      store.write('conflict', headId, { headId, count: skipCount, blockedSince, loggedPhase: phase });
     } catch {
       // best-effort — see doc comment above
     }
@@ -337,8 +338,8 @@ function resolveHeadBlock(root, cfg, headId, blocker, sameHead, skipState, skipC
  *  allowance too, or vice versa, for a reason that never actually applied to this head. No
  *  `blockedSince`/grace field — see resolveCapacityBlock's doc comment for why the capacity path
  *  is deliberately NOT time-bounded the way the conflict path is. */
-export function readCapacitySkipState(root) {
-  const raw = readJsonSafe(paths(root).capacitySkipState);
+export function readCapacitySkipState(root, store = legacyStore(root), headId = null) {
+  const raw = store.read('capacity', headId);
   if (!raw || typeof raw.headId !== 'string' || !Number.isFinite(raw.count) || raw.count < 0) {
     return { headId: null, count: 0, loggedPhase: null };
   }
@@ -350,13 +351,13 @@ export function readCapacitySkipState(root) {
  *  precedent, see recordSkip's own doc comment above): a persistent write failure must refuse
  *  the skip rather than let it happen uncounted, or a capacity-blocked head could be backfilled
  *  past forever on a broken disk. */
-function recordCapacitySkip(root, headId) {
-  const prev = readCapacitySkipState(root);
+function recordCapacitySkip(root, store, headId) {
+  const prev = readCapacitySkipState(root, store, headId);
   const sameHead = prev.headId === headId;
   const count = sameHead ? prev.count + 1 : 1;
   const loggedPhase = sameHead ? prev.loggedPhase : null;
   try {
-    atomicWriteJson(paths(root).capacitySkipState, { headId, count, loggedPhase });
+    store.write('capacity', headId, { headId, count, loggedPhase });
     return true;
   } catch {
     return false;
@@ -376,9 +377,9 @@ function recordCapacitySkip(root, headId) {
  * consume that same capacity indefinitely and could starve the head PERMANENTLY instead of
  * temporarily. Do not add a grace period to this path.
  */
-function resolveCapacityBlock(root, cfg, headId, headWeight, runningWeight, capacity, skipCount) {
+function resolveCapacityBlock(root, store, cfg, headId, headWeight, runningWeight, capacity, skipCount) {
   const phase = skipCount < cfg.conflictSkipLimit ? 'blocked' : 'exhausted';
-  const state = readCapacitySkipState(root);
+  const state = readCapacitySkipState(root, store, headId);
   const sameHead = state.headId === headId;
   const prevPhase = sameHead ? state.loggedPhase : null;
   if (phase !== prevPhase) {
@@ -392,7 +393,7 @@ function resolveCapacityBlock(root, cfg, headId, headWeight, runningWeight, capa
       skipLimit: cfg.conflictSkipLimit,
     });
     try {
-      atomicWriteJson(paths(root).capacitySkipState, { headId, count: skipCount, loggedPhase: phase });
+      store.write('capacity', headId, { headId, count: skipCount, loggedPhase: phase });
     } catch {
       // best-effort — see recordCapacitySkip's doc comment for why the count itself must fail
       // closed; only this logging/dedup write is allowed to be lossy.
@@ -411,8 +412,8 @@ function resolveCapacityBlock(root, cfg, headId, headWeight, runningWeight, capa
  * markResourceOutOfScope) and by a backfill's count (recordResourceBackfill). Anything missing
  * or malformed reads as null, which means "no backfill"; a missing `inScope` reads as false.
  */
-export function readResourceSkipState(root) {
-  const raw = readJsonSafe(paths(root).resourceSkipState);
+export function readResourceSkipState(root, store = legacyStore(root), headId = null) {
+  const raw = store.read('resource', headId);
   if (
     !raw ||
     typeof raw.headId !== 'string' ||
@@ -434,14 +435,15 @@ export function readResourceSkipState(root) {
     deniedAt: raw.deniedAt,
     budget: raw.budget,
     externalBusy: raw.externalBusy,
+    ...(Number.isInteger(raw.reservationSeq) ? { reservationSeq: raw.reservationSeq } : {}),
   };
 }
 
 /** The record for exactly this head, or null: resource backfill is active-mode only, off at
  *  resourceSkipLimit 0, and a record left by any other head is never consulted. */
-function resourceRecordFor(root, cfg, headId, behindConflict = false) {
+function resourceRecordFor(root, store, cfg, headId, behindConflict = false) {
   if (cfg.schedulerMode !== 'active' || !(cfg.resourceSkipLimit > 0)) return null;
-  const record = readResourceSkipState(root);
+  const record = readResourceSkipState(root, store, headId);
   return record && record.headId === headId && record.behindConflict === behindConflict ? record : null;
 }
 
@@ -453,21 +455,22 @@ const resourceReserved = (record) => record !== null && record.reserved;
  *  the same head. Best-effort: a failed write leaves the old record (or none), never an allowance.
  *  `behindConflict` (BRAIN-365) marks the snapshot as a conflict-backfill candidate's denial, not
  *  the head's: only a conflicted head reads it, and the head's own next denial overwrites it. */
-function recordResourceDenial(root, cfg, headId, cpuDecision, now, write, behindConflict = false) {
+function recordResourceDenial(root, store, cfg, headId, cpuDecision, now, write, behindConflict = false) {
   if (!(cfg.resourceSkipLimit > 0)) return;
-  const prev = readResourceSkipState(root);
+  const prev = readResourceSkipState(root, store, headId);
   const same = prev !== null && prev.headId === headId;
   try {
-    write(paths(root).resourceSkipState, {
+    store.write('resource', headId, {
       headId,
       count: same ? prev.count : 0,
       reserved: same ? prev.reserved : false,
+      ...(same && prev.reservationSeq !== undefined ? { reservationSeq: prev.reservationSeq } : {}),
       inScope: true,
       ...(behindConflict ? { behindConflict } : {}),
       deniedAt: now,
       budget: cpuDecision.budget,
       externalBusy: cpuDecision.externalBusy,
-    });
+    }, write);
   } catch {
     // best-effort — see doc comment
   }
@@ -475,11 +478,11 @@ function recordResourceDenial(root, cfg, headId, cpuDecision, now, write, behind
 
 /** The head's latest denial is NOT projected-over-budget: pause backfill but keep the allowance
  *  (count/reserved). Never creates a record — there is no allowance to keep for a fresh head. */
-function markResourceOutOfScope(root, headId, now, write) {
-  const prev = readResourceSkipState(root);
+function markResourceOutOfScope(root, store, headId, now, write) {
+  const prev = readResourceSkipState(root, store, headId);
   if (prev === null || prev.headId !== headId || !prev.inScope) return;
   try {
-    write(paths(root).resourceSkipState, { ...prev, inScope: false, deniedAt: now });
+    store.write('resource', headId, { ...prev, inScope: false, deniedAt: now }, write);
   } catch {
     // best-effort: a stale inScope only lets a candidate reach its own unchanged fresh admission
   }
@@ -487,22 +490,17 @@ function markResourceOutOfScope(root, headId, now, write) {
 
 /** Count a backfill past the head and latch the reservation when the allowance is used up.
  *  Fail CLOSED like recordSkip: the caller refuses the backfill when this returns null. */
-function recordResourceBackfill(root, cfg, record, write) {
+function recordResourceBackfill(root, store, cfg, record, write) {
   const count = record.count + 1;
   const reserved = count >= cfg.resourceSkipLimit;
   try {
-    write(paths(root).resourceSkipState, { ...record, count, reserved });
+    // Behind the fence a reservation is ordered by `reservationSeq`, drawn from the monotonic queue counter
+    // when it is earned (never a timestamp, which can tie or step back). Legacy never draws one.
+    const earnedSeq = store.v2 && reserved && !record.reserved ? { reservationSeq: nextSeq(root) } : {};
+    store.write('resource', record.headId, { ...record, count, reserved, ...earnedSeq }, write);
     return { count, reserved };
   } catch {
     return null;
-  }
-}
-
-function clearResourceSkipState(root) {
-  try {
-    fs.unlinkSync(paths(root).resourceSkipState);
-  } catch {
-    // already gone
   }
 }
 
@@ -519,7 +517,9 @@ function ticketCpuFloor(ticket, cfg) {
  * tickets are skipped) and additionally skips any ticket whose start would make the head
  * conflicted. Among tickets whose CPU claim fits the headroom the head's record was denied
  * against (the same projectBusy maths admission uses, over the CURRENT held leases), it returns
- * the smallest claim, earliest in the queue on ties.
+ * the smallest claim, earliest in the queue on ties. Behind the scheduler fence `queue` is the ordered
+ * effective view (BRAIN-380), so "earliest" is ordered-view position and `queue[0]` is the effective head
+ * (the reservation owner when one is promoted); the strict `<` below is what makes that the tie-break.
  *
  * Admission-failure recovery rule: selection is stateless. A selected ticket that fresh admission
  * then denies is simply selected again next poll; because the smallest claim always goes first, a
@@ -647,9 +647,16 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
   const decide = () => {
     const cfg = reloadCfg() || globalCfg;
     const now = Date.now();
-    advanceHwm(root, now);
+    const nowEff = advanceHwm(root, now);
     reapStale(root, ticket.id);
-    const queue = listQueue(root);
+    // BRAIN-380: behind a valid scheduler fence this evaluation is priority-ordered, over per-ticket fairness
+    // records; otherwise it is the legacy FIFO over the singleton files, untouched. `queue` is the ONE array
+    // every selector, the safe-backfill predicate and the shadow snapshot below receive.
+    const sched = resolveScheduler(root);
+    const store = sched.v2 ? fairnessStore(root, sched.tickets) : legacyStore(root);
+    const rawQueue = listQueue(root);
+    store.prune(rawQueue);
+    const { queue, ownerId: reservationOwnerId } = sched.v2 ? effectiveView(rawQueue, nowEff, cfg, store) : { queue: rawQueue, ownerId: null };
     const position = queue.findIndex((t) => t && t.id === ticket.id);
     if (position === -1) {
       return { result: { started: false, reason: 'not-head', position: null, queueLength: queue.length } };
@@ -711,10 +718,10 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // that additionally requires the head to have been blocked for LESS
     // than headBlockGraceMs for the exhaustion to still apply; past that,
     // backfill resumes despite the exhausted count.
-    const skipState = readSkipState(root);
+    const skipState = readSkipState(root, store, headTicket.id);
     const sameHead = skipState.headId === headTicket.id;
     const skipCount = sameHead ? skipState.count : 0;
-    const headBlock = headConflicted ? resolveHeadBlock(root, cfg, headTicket.id, blocker, sameHead, skipState, skipCount, now) : null;
+    const headBlock = headConflicted ? resolveHeadBlock(root, store, cfg, headTicket.id, blocker, sameHead, skipState, skipCount, now) : null;
     const skipExhausted = headConflicted && headBlock.phase === 'exhausted';
 
     // BRAIN-249 part 2: a head that does NOT conflict with anything held can
@@ -733,11 +740,11 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // resolveCapacityBlock's doc comment for why that would be actively
     // wrong here).
     const headCapacityBlocked = !headConflicted && runningWeight + headTicket.weight > weightCapacity;
-    const capacitySkipState = headCapacityBlocked ? readCapacitySkipState(root) : null;
+    const capacitySkipState = headCapacityBlocked ? readCapacitySkipState(root, store, headTicket.id) : null;
     const capacitySameHead = headCapacityBlocked && capacitySkipState.headId === headTicket.id;
     const capacitySkipCount = capacitySameHead ? capacitySkipState.count : 0;
     const capacityBlock = headCapacityBlocked
-      ? resolveCapacityBlock(root, cfg, headTicket.id, headTicket.weight, runningWeight, weightCapacity, capacitySkipCount)
+      ? resolveCapacityBlock(root, store, cfg, headTicket.id, headTicket.weight, runningWeight, weightCapacity, capacitySkipCount)
       : null;
     const capacitySkipExhausted = headCapacityBlocked && capacityBlock.phase === 'exhausted';
 
@@ -745,7 +752,9 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // be backfilled past, bounded by resourceSkipLimit, then reserved. A reservation also stops
     // capacity backfill past that same head (the one cross-kind check); conflict backfill is
     // never affected — a conflict-blocked head never reaches either resource path.
-    const resourceRecord = headConflicted ? null : resourceRecordFor(root, cfg, headTicket.id);
+    const headRecord = headConflicted ? null : resourceRecordFor(root, store, cfg, headTicket.id);
+    // A reservation that is not the ACTIVE one is dormant: kept with its counters, reserving nothing (R4-3).
+    const resourceRecord = sched.v2 && headRecord?.reserved && headTicket.id !== reservationOwnerId ? { ...headRecord, reserved: false } : headRecord;
     const capacityReserved = headCapacityBlocked && resourceReserved(resourceRecord);
     const resourceBackfill = !headConflicted && !headCapacityBlocked && resourceBackfillOpen(resourceRecord, cfg);
     // BRAIN-355: an exhausted conflict-blocked head still admits a ticket that provably cannot
@@ -768,13 +777,13 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // denial leaves a behind-conflict record (below); while it stands, the walk prefers the smallest
     // ticket that fits, with the head's claim reserved, and falls back to the first non-conflicting
     // ticket (so the denied one is still re-evaluated, refreshing the record).
-    const conflictRecord = headConflicted && !skipExhausted ? resourceRecordFor(root, cfg, headTicket.id, true) : null;
+    const conflictRecord = headConflicted && !skipExhausted ? resourceRecordFor(root, store, cfg, headTicket.id, true) : null;
     const conflictPick = conflictRecord ? selectResourceCandidate(queue, held, runningWeight, weightCapacity, conflictRecord, cfg, now, true) : null;
     // A pick that is denied for anything but the CPU projection invalidates the record it was picked
     // from (the record has no allowance worth keeping, unlike the head's own), so the next poll
     // falls back to re-evaluating the first non-conflicting ticket instead of re-picking it.
     const dropPickRecord = () => {
-      if (conflictPick && ticket.id === conflictPick.id) clearResourceSkipState(root);
+      if (conflictPick && ticket.id === conflictPick.id) store.dropResourceRecord(headTicket.id);
     };
     const candidate = headConflicted
       ? (skipExhausted ? (safeBackfill ? ticket : null) : conflictPick ?? selectCandidate(queue, held))
@@ -934,7 +943,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     const baselineReason = cfg.admissionLoadGate && gate.closed && brokerIdle ? 'idle-exempt' : 'ok';
 
     if (cfg.admissionLoadGate && gate.closed && !brokerIdle) {
-      if (ticket.id === headTicket.id) markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
+      if (ticket.id === headTicket.id) markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
       dropPickRecord();
       return {
         result: { started: false, reason: 'load-gate-closed', load: gate.lastLoad },
@@ -942,7 +951,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       };
     }
     if (runningWeight + ticket.weight > weightCapacity) {
-      if (ticket.id === headTicket.id) markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
+      if (ticket.id === headTicket.id) markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
       dropPickRecord();
       return {
         result: { started: false, reason: 'capacity', runningWeight, capacity: weightCapacity },
@@ -956,7 +965,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // throwing reader all admit — same fail-open tolerance as the CPU/load
     // samplers elsewhere in this function.
     if (memInfo && memInfo.macPressure === 'critical') {
-      if (ticket.id === headTicket.id) markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
+      if (ticket.id === headTicket.id) markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
       dropPickRecord();
       return {
         result: { started: false, reason: 'memory-critical', macPressure: memInfo.macPressure },
@@ -987,10 +996,10 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       if (headPolling) {
         // Cooldown is the head's own backfill echoing back (each admission starts one), so it
         // changes nothing. Any other out-of-scope denial pauses backfill but keeps the allowance.
-        if (resourceDenied) recordResourceDenial(root, cfg, headTicket.id, cpuDecision, now, writeResourceState);
-        else if (cpuDecision.cpuReason !== 'cooldown') markResourceOutOfScope(root, headTicket.id, now, writeResourceState);
+        if (resourceDenied) recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState);
+        else if (cpuDecision.cpuReason !== 'cooldown') markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
       } else if (headConflicted && !skipExhausted && resourceDenied) {
-        recordResourceDenial(root, cfg, headTicket.id, cpuDecision, now, writeResourceState, true);
+        recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState, true);
       } else if (cpuDecision.cpuReason !== 'cooldown') {
         dropPickRecord();
       }
@@ -1012,7 +1021,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       // count it toward conflictSkipLimit above. Fail CLOSED: if the count
       // can't be durably recorded, refuse the skip rather than let it
       // happen uncounted (see recordSkip's doc comment).
-      if (!recordSkip(root, headTicket.id, now)) {
+      if (!recordSkip(root, store, headTicket.id, now)) {
         return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
       }
     } else if (ticket.id !== headTicket.id && headCapacityBlocked) {
@@ -1020,12 +1029,12 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       // conflict branch above, for a ticket genuinely skipping ahead of a
       // head that doesn't fit capacity (see recordCapacitySkip's doc
       // comment).
-      if (!recordCapacitySkip(root, headTicket.id)) {
+      if (!recordCapacitySkip(root, store, headTicket.id)) {
         return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
       }
     } else if (ticket.id !== headTicket.id && resourceBackfill) {
       // BRAIN-346: same event, same fail-CLOSED discipline; a refused write never restarts the allowance.
-      recorded = recordResourceBackfill(root, cfg, resourceRecord, writeResourceState);
+      recorded = recordResourceBackfill(root, store, cfg, resourceRecord, writeResourceState);
       if (!recorded) {
         return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
       }
@@ -1105,7 +1114,10 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     if (idleExempt) {
       events.push(['resource-idle-exempt', { headId: headTicket.id, overshoot: (cpuDecision.projectedBusy - cpuDecision.budget).toFixed(2) }]);
     }
-    if (headPolling) clearResourceSkipState(root);
+    // Legacy: the head's own start clears the singleton. Behind the fence every starting ticket's records leave
+    // with it (a displaced ticket may start as a backfill), and with them any reservation it owned.
+    if (sched.v2) store.depart(ticket.id);
+    else if (headPolling) store.dropResourceRecord();
     return {
       result: { started: true, lease },
       logFields: { ...logBase, currentDecision: 'start', currentReason: idleExempt ? 'resource-idle-exempt' : baselineReason },
