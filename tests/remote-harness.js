@@ -131,6 +131,17 @@ if (destination === 'die-midstream') {
   });
   process.stdin.on('end', finish);
   process.stdin.on('error', finish);
+} else if (destination === 'no-artifacts' && commandString.includes('remote-probe')) {
+  // BRAIN-398: a runner built before artifacts/1 -- its probe simply lacks the capability.
+  const child = spawn('sh', ['-c', commandString], { stdio: ['ignore', 'pipe', 'inherit'] });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  child.on('close', () => {
+    const probe = JSON.parse(out.trim());
+    probe.capabilities = probe.capabilities.filter((c) => !c.startsWith('artifacts/'));
+    process.stdout.write(\`\${JSON.stringify(probe)}\\n\`);
+    exitNow(0);
+  });
 } else if (destination === 'result-tamper' && commandString.includes('remote-result')) {
   const child = spawn('sh', ['-c', commandString], { stdio: ['ignore', 'pipe', 'inherit'] });
   let out = '';

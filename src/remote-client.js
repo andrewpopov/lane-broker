@@ -1,6 +1,8 @@
 import { spawn } from 'node:child_process';
 import { buildManifest, RemoteIneligibleError } from './remote-manifest.js';
-import { encodeSnapshot, serializeHeader, MAX_HEADER_BYTES } from './remote-stream.js';
+import { encodeSnapshot, serializeHeader, makeReader, MAX_HEADER_BYTES } from './remote-stream.js';
+import { receiveArtifacts, artifactLimitsOf } from './remote-artifacts.js';
+import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
 import { isPriorityTier } from './priority.js';
 
@@ -442,6 +444,42 @@ async function fetchRemoteResult(runner, ticketId, sshBin, deadlineMs, env) {
   }
 }
 
+/**
+ * BRAIN-398: `lane remote-artifacts <ticketId>` over ssh -- read the framed stream, verify it (`receiveArtifacts`),
+ * then ask the runner to delete its copies (best-effort). Resolves `{ok:true, files}` or `{ok:false, reason}`; never
+ * throws or rejects, and never writes anything: installing is the caller's step.
+ */
+async function fetchRemoteArtifacts(runner, ticketId, { patterns, limits, sshBin, deadlineMs, env }) {
+  const cmd = buildRemoteCommand(runner, 'remote-artifacts', [ticketId]);
+  let child;
+  try {
+    child = spawn(sshBin, sshArgv(runner, cmd), { stdio: ['ignore', 'pipe', 'pipe'], env });
+  } catch (err) {
+    return { ok: false, reason: `ssh failed to start: ${err.message}` };
+  }
+  let stderr = '';
+  child.stderr.on('data', (d) => {
+    stderr += d;
+  });
+  const exited = new Promise((resolve) => {
+    child.on('close', (code) => resolve(code));
+    child.on('error', () => resolve(null));
+  });
+  const timer = setTimeout(() => child.kill('SIGKILL'), deadlineMs);
+  const received = await receiveArtifacts(makeReader(child.stdout), { ticketId, patterns, limits });
+  if (!received.ok) {
+    // Nothing reads the rest of the stream, and an unread pipe never closes the child.
+    child.stdout.destroy();
+    child.kill('SIGKILL');
+  }
+  const code = await exited;
+  clearTimeout(timer);
+  if (!received.ok) return { ok: false, reason: stderr.trim() ? `${received.reason} (${stderr.trim()})` : received.reason };
+  if (code !== 0) return { ok: false, reason: `remote-artifacts exited ${code}` };
+  await runWithDeadline(sshBin, sshArgv(runner, buildRemoteCommand(runner, 'remote-artifacts-release', [ticketId])), deadlineMs, env);
+  return received;
+}
+
 /** `lane remote-cancel <ticketId>` over ssh, best-effort: failures are swallowed since this
  *  only ever runs alongside an abort the caller has already decided to honour regardless. */
 async function remoteCancelBestEffort(runner, ticketId, sshBin, deadlineMs, env) {
@@ -490,6 +528,11 @@ export async function dispatchRemote(opts) {
     // BRAIN-389: only `false` (the lane opted out) rides in the header; the cache is on by default on the runner.
     remoteDepsCache = true,
     remoteDepsCacheRootScriptsSafe = false,
+    // BRAIN-398: the lane's declared artifact paths/globs and policy (null: none, or the runner cannot return them),
+    // and the submitter's own caps on what it will accept back.
+    remoteArtifacts = null,
+    remoteArtifactsOn = 'success',
+    artifactLimits,
     // BRAIN-320 S1d: opt-in, from the CLIENT machine's global config
     // (`remoteQueueTimeoutMs`) -- unset (undefined/null) means the header
     // carries no such key at all, byte-identical to before this slice (I6).
@@ -553,6 +596,10 @@ export async function dispatchRemote(opts) {
     if (Array.isArray(remoteSetup) && remoteSetup.length > 0) header.remoteSetup = remoteSetup;
     if (remoteDepsCache === false) header.remoteDepsCache = false;
     if (remoteDepsCacheRootScriptsSafe === true) header.remoteDepsCacheRootScriptsSafe = true;
+  }
+  if (Array.isArray(remoteArtifacts) && remoteArtifacts.length > 0) {
+    header.remoteArtifacts = remoteArtifacts;
+    header.remoteArtifactsOn = remoteArtifactsOn;
   }
   if (Number.isFinite(minCpuCores)) header.minCpuCores = minCpuCores;
   if (Number.isInteger(queueTimeoutMs) && queueTimeoutMs > 0) header.queueTimeoutMs = queueTimeoutMs;
@@ -669,5 +716,17 @@ export async function dispatchRemote(opts) {
   if (classification.outcome === 'unconfirmed') {
     return { outcome: 'unconfirmed', reason: classification.reason };
   }
-  return { outcome: 'confirmed', result: record, exitCode: classification.exitCode, phase: classification.phase };
+  const confirmed = { outcome: 'confirmed', result: record, exitCode: classification.exitCode, phase: classification.phase };
+  // BRAIN-398: only a runner that stored files for this result is asked for them; a failure here is reported, never
+  // allowed to change the confirmed outcome.
+  if (header.remoteArtifacts && record.artifacts?.ok === true && record.artifacts.count > 0) {
+    confirmed.artifacts = await fetchRemoteArtifacts(runner, ticketId, {
+      patterns: remoteArtifacts,
+      limits: artifactLimits ?? artifactLimitsOf(DEFAULT_GLOBAL_CONFIG),
+      sshBin,
+      deadlineMs: deadlines.artifactsMs ?? 2 * 60_000,
+      env,
+    });
+  }
+  return confirmed;
 }

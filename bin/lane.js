@@ -12,6 +12,8 @@ import {
   remoteProbeCommand,
   remoteResultCommand,
   remoteCancelCommand,
+  remoteArtifactsCommand,
+  remoteArtifactsReleaseCommand,
   defaultRemoteRoot,
 } from '../src/remote-runner.js';
 import { remotePipelineCommand } from '../src/remote-pipeline.js';
@@ -232,6 +234,17 @@ async function main() {
       }
       const root = parseRootFlag(rest.slice(1)) || defaultRemoteRoot();
       const result = await remoteResultCommand(id, { root });
+      return result.exitCode;
+    }
+    case 'remote-artifacts':
+    case 'remote-artifacts-release': {
+      const id = rest[0];
+      if (!id) {
+        process.stderr.write(`lane ${sub}: missing <ticketId>\n`);
+        return 2;
+      }
+      const root = parseRootFlag(rest.slice(1)) || defaultRemoteRoot();
+      const result = await (sub === 'remote-artifacts' ? remoteArtifactsCommand : remoteArtifactsReleaseCommand)(id, { root });
       return result.exitCode;
     }
     case 'remote-cancel': {

@@ -1192,3 +1192,34 @@ test('the per-ticket tmp dir is removed after an early extract/verify rejection'
   assert.equal(fs.existsSync(made[0]), false);
   assert.equal(fs.existsSync(path.join(ticketDir, 'work')), false);
 });
+
+// ---- BRAIN-398: remoteArtifacts in the dispatch header ----
+
+for (const [label, fields] of [
+  ['a traversal path', { remoteArtifacts: ['../outside.txt'] }],
+  ['an absolute path', { remoteArtifacts: ['/etc/passwd'] }],
+  ['a non-array', { remoteArtifacts: 'a.json' }],
+  ['an unknown policy', { remoteArtifacts: ['a.json'], remoteArtifactsOn: 'sometimes' }],
+]) {
+  test(`a header whose remoteArtifacts is ${label} is rejected before anything runs`, async () => {
+    const { env } = freshShadowEnv();
+    const root = tmpDir('remote-exec-root');
+    const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+    const header = makeHeader({ ...fields });
+    const { code } = await runOne(header, entries, { env, root, src });
+    assert.equal(code, 0);
+    const result = await getResult(header.ticketId, root, env);
+    assert.equal(result.kind, 'rejected');
+    assert.match(result.reason, /invalid remoteArtifacts/);
+  });
+}
+
+test('lane remote-artifacts refuses a ticket id that is not a uuid, and reports nothing stored for a real one', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const bad = await laneRun(['remote-artifacts', '../x', '--root', root], { env });
+  assert.equal(bad.code, 2);
+  const none = await laneRun(['remote-artifacts', crypto.randomUUID(), '--root', root], { env });
+  assert.equal(none.code, 1);
+  assert.equal(none.stdout, '');
+});

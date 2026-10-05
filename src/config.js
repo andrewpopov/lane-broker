@@ -109,6 +109,11 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // `remoteDepsCache: false` opts that lane out.
   remoteDepsCache: true,
   remoteDepsCacheMaxBytes: DEFAULT_DEPS_CACHE_MAX_BYTES,
+  // BRAIN-398: caps on the files a remote run returns (`remoteArtifacts`), enforced by the runner that collects them and
+  // again by the submitter that receives them, each from its own config.
+  remoteArtifactMaxFileBytes: 16 * 1024 * 1024,
+  remoteArtifactMaxTotalBytes: 64 * 1024 * 1024,
+  remoteArtifactMaxCount: 200,
 };
 
 export const DEFAULT_REPO_CONFIG = {
@@ -233,6 +238,9 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isInteger(cfg.remoteDepsCacheMaxBytes) && cfg.remoteDepsCacheMaxBytes > 0,
     `${sourcePath}: "remoteDepsCacheMaxBytes" must be a positive integer`,
   );
+  for (const field of ['remoteArtifactMaxFileBytes', 'remoteArtifactMaxTotalBytes', 'remoteArtifactMaxCount']) {
+    assert(Number.isInteger(cfg[field]) && cfg[field] > 0, `${sourcePath}: "${field}" must be a positive integer`);
+  }
   if (cfg.runners !== undefined) validateRunners(cfg.runners, sourcePath);
   validatePriorityConfig(cfg, sourcePath);
 }
@@ -323,6 +331,31 @@ export function isValidRemoteSetupShape(setup) {
 /** Sanity bound on a lane's declared `cpuCores`/`minCpuCores`: no machine has more, and an absurd claim is a typo. */
 export const MAX_LANE_CPU_CORES = 1024;
 
+/** BRAIN-398: a glob segment is plain text plus `*` (any run within the segment), or exactly `**` (any number of segments). */
+function isValidArtifactSegment(seg) {
+  return !seg.includes('**') || seg === '**';
+}
+
+export const REMOTE_ARTIFACTS_ON = ['success', 'always'];
+export const MAX_REMOTE_ARTIFACT_PATTERNS = 50;
+
+/**
+ * BRAIN-398: the shape rules for a lane's `remoteArtifacts` -- a non-empty array of canonical relative paths or simple
+ * globs, no duplicates -- shared between `.lane-broker.json` validation and the runner's own re-validation of the
+ * dispatch header, same as `isValidRemoteDepsShape`.
+ */
+export function isValidRemoteArtifactsShape(patterns) {
+  if (!Array.isArray(patterns) || patterns.length === 0 || patterns.length > MAX_REMOTE_ARTIFACT_PATTERNS) return false;
+  const seen = new Set();
+  for (const pattern of patterns) {
+    if (typeof pattern !== 'string' || !isCanonicalRelPath(pattern)) return false;
+    if (!pattern.split('/').every(isValidArtifactSegment)) return false;
+    if (seen.has(pattern)) return false;
+    seen.add(pattern);
+  }
+  return true;
+}
+
 /** BRAIN-379: a lane's allocation class; an undeclared class is 'test'. */
 export const LANE_CLASSES = ['test', 'sim'];
 
@@ -389,6 +422,15 @@ function validateRepoConfig(cfg, sourcePath) {
         isValidRemoteSetupShape(lane.remoteSetup),
         `${sourcePath}: lane "${name}".remoteSetup must be a non-empty array of non-empty arrays of non-empty strings`,
       );
+    }
+    if (lane.remoteArtifacts !== undefined) {
+      assert(
+        isValidRemoteArtifactsShape(lane.remoteArtifacts),
+        `${sourcePath}: lane "${name}".remoteArtifacts must be a non-empty array (at most ${MAX_REMOTE_ARTIFACT_PATTERNS}) of canonical relative paths or globs ("*" within a segment, "**" as a whole segment), no duplicates`,
+      );
+    }
+    if (lane.remoteArtifactsOn !== undefined) {
+      assert(REMOTE_ARTIFACTS_ON.includes(lane.remoteArtifactsOn), `${sourcePath}: lane "${name}".remoteArtifactsOn must be "success" or "always"`);
     }
     for (const field of ['remoteDepsCache', 'remoteDepsCacheRootScriptsSafe']) {
       if (lane[field] !== undefined) assert(typeof lane[field] === 'boolean', `${sourcePath}: lane "${name}".${field} must be a boolean`);
@@ -683,7 +725,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   if (isDeclaredLane) {
     laneCfg = repoConfig.lanes[laneName];
   } else if (undeclaredTemplateName) {
-    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/class/priority
+    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteArtifacts/remoteArtifactsOn/class/priority
     // from the named declared lane, keeping this lane's OWN key/name. Not
     // inherited: `localRefused` (stays default false), the template's named
     // conflicts (only the `*` wildcard universe below reaches this lane, same
@@ -701,6 +743,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       remoteSetup: templateCfg.remoteSetup,
       remoteDepsCache: templateCfg.remoteDepsCache,
       remoteDepsCacheRootScriptsSafe: templateCfg.remoteDepsCacheRootScriptsSafe,
+      remoteArtifacts: templateCfg.remoteArtifacts,
+      remoteArtifactsOn: templateCfg.remoteArtifactsOn,
       class: templateCfg.class,
       priority: templateCfg.priority,
     };
@@ -756,5 +800,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     remoteDepsCache: laneCfg.remoteDepsCache !== false,
     // BRAIN-389: true declares this lane's root install/prepare scripts leave node_modules alone, so a cached tree is safe.
     remoteDepsCacheRootScriptsSafe: laneCfg.remoteDepsCacheRootScriptsSafe === true,
+    // BRAIN-398: files a remote run returns to the submitter's worktree; ignored by a local run (they are already there).
+    remoteArtifacts: Array.isArray(laneCfg.remoteArtifacts) ? laneCfg.remoteArtifacts : null,
+    remoteArtifactsOn: laneCfg.remoteArtifactsOn === 'always' ? 'always' : 'success',
   };
 }

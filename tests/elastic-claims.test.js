@@ -15,6 +15,7 @@ import { leaseDemand, projectBusy } from '../src/admission.js';
 import { elasticClaimRange, resolveTicketResources, leaseCpuCores, leaseResources, ELASTIC_CLAIMS_CAPABILITY } from '../src/resources.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
 import { PRIORITY_CAPABILITY } from '../src/priority.js';
+import { ARTIFACTS_CAPABILITY } from '../src/remote-artifacts.js';
 
 /**
  * BRAIN-360: elastic CPU claims. Fixture machine: 10 cores, reserve 1, 100% -> CPU budget 9,
@@ -512,7 +513,7 @@ test('remote-probe advertises elastic-claims/1', () => {
   const { env } = freshEnv();
   const res = spawnSync(process.execPath, [BIN, 'remote-probe'], { env, encoding: 'utf8' });
   assert.equal(res.status, 0, res.stderr);
-  assert.deepEqual(JSON.parse(res.stdout).capabilities, [ELASTIC_CLAIMS_CAPABILITY, PRIORITY_CAPABILITY]);
+  assert.deepEqual(JSON.parse(res.stdout).capabilities, [ELASTIC_CLAIMS_CAPABILITY, PRIORITY_CAPABILITY, ARTIFACTS_CAPABILITY]);
 });
 
 test('remote run: the runner-side grant reaches BOTH the runner history and the submitter result and history', async () => {
