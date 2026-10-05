@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { atomicWriteJson, atomicWriteFile, readJsonSafe } from './state.js';
 import { isCanonicalRelPath, scrubbedGitEnv } from './remote-manifest.js';
+import { literalDirPrefix } from './config.js';
 import { readHeaderLine, readVerifiedFile } from './remote-stream.js';
 
 /**
@@ -22,6 +23,9 @@ export const ARTIFACTS_CAPABILITY = 'artifacts/1';
 
 const STALE_ARTIFACTS_MS = 24 * 60 * 60_000;
 const MAX_FRAME_LINE_BYTES = 1_000_000;
+// The stream header lists at most `maxCount` (default 200) short entries.
+const MAX_STREAM_HEADER_BYTES = 256 * 1024;
+export const ARTIFACT_STREAM_PROTOCOL = 1;
 
 /** The three caps, as named in a global config (`remoteArtifactMax*`). */
 export const artifactLimitsOf = (cfg) => ({
@@ -58,59 +62,115 @@ function sha256Of(buf) {
   return crypto.createHash('sha256').update(buf).digest('hex');
 }
 
-/** Every file path a glob could name: walk from its literal directory prefix, never descending into a symlink. */
+/** A reason a whole artifact set is refused; anything else thrown is an unexpected error. */
+class ArtifactRefusal extends Error {}
+
+const refusal = (reason) => new ArtifactRefusal(reason);
+
+/**
+ * Paths an artifact may never be written to or collected from, whatever the lane declares: any segment that is, or
+ * starts with, `.git` (a linked worktree's `.git` FILE, `.github`, `.githooks`, `.gitmodules`...), `.env*`, `.yarnrc*`,
+ * `.npmrc`, `.lane-broker.json`, `node_modules`, `package.json`, `package-lock.json`, `npm-shrinkwrap.json` and
+ * `*.lock`. Compared case-insensitively, since the submitter's filesystem usually is.
+ */
+export function isDeniedArtifactPath(relPath) {
+  return relPath.split('/').some((segment) => {
+    const seg = segment.toLowerCase();
+    return (
+      seg.startsWith('.git') ||
+      seg.startsWith('.env') ||
+      seg.startsWith('.yarnrc') ||
+      seg.endsWith('.lock') ||
+      ['.npmrc', '.lane-broker.json', 'node_modules', 'package.json', 'package-lock.json', 'npm-shrinkwrap.json'].includes(seg)
+    );
+  });
+}
+
+/** True iff `relPath` sits under the glob-free directory of a declared pattern it matches. */
+function isUnderDeclaredDir(relPath, patterns) {
+  return patterns.some((pattern) => {
+    const dir = literalDirPrefix(pattern);
+    return dir !== '' && relPath.startsWith(`${dir}/`) && artifactMatches(pattern, relPath);
+  });
+}
+
+// A glob over a huge tree with few matches still costs a walk; bound the walk itself, not just the match count.
+const MAX_SCANNED_ENTRIES = 100_000;
+
+/** Visit every file path a glob could name, from its literal directory prefix, never descending into a symlink. */
 function walkGlob(workDir, pattern, visit) {
-  const segs = pattern.split('/');
-  const literal = [];
-  while (literal.length < segs.length - 1 && !isGlobPattern(segs[literal.length])) literal.push(segs[literal.length]);
-  const walk = (rel) => {
+  let scanned = 0;
+  const stack = [literalDirPrefix(pattern)];
+  while (stack.length > 0) {
+    const rel = stack.pop();
     let entries;
     try {
       entries = fs.readdirSync(path.join(workDir, rel), { withFileTypes: true });
     } catch {
-      return;
+      continue;
     }
     for (const entry of entries) {
+      scanned += 1;
+      if (scanned > MAX_SCANNED_ENTRIES) throw refusal(`more than ${MAX_SCANNED_ENTRIES} entries scanned for ${pattern}`);
       const child = rel ? `${rel}/${entry.name}` : entry.name;
       if (entry.isDirectory()) {
-        if (child !== '.git') walk(child);
+        if (child !== '.git') stack.push(child);
       } else if (artifactMatches(pattern, child)) {
         visit(child);
       }
     }
-  };
-  walk(literal.join('/'));
+  }
+}
+
+/** Read at most `limit` bytes from `fd`; null if the file has more. Never trusts a size reported earlier. */
+function readCapped(fd, limit) {
+  const chunk = Buffer.allocUnsafe(64 * 1024);
+  const parts = [];
+  let total = 0;
+  for (;;) {
+    const n = fs.readSync(fd, chunk, 0, chunk.length, null);
+    if (n === 0) return Buffer.concat(parts);
+    total += n;
+    if (total > limit) return null;
+    parts.push(Buffer.from(chunk.subarray(0, n)));
+  }
+}
+
+function quietRm(dir) {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // best-effort
+  }
 }
 
 /**
  * Runner side. Copy the regular files `patterns` name under `workDir` into `destDir` (`files/<rel>` plus
- * `manifest.json`), refusing the WHOLE set on any violation: a symlink, a non-regular file, a path that resolves
- * outside `workDir`, or a cap (`maxFileBytes`, `maxTotalBytes`, `maxCount`). Never throws. Returns
- * `{ok:true, count, bytes, missing}` or `{ok:false, reason}` (a refusal leaves no `destDir`).
+ * `manifest.json`), refusing the WHOLE set on any violation: a denied path, a symlink, a non-regular file, a path that
+ * resolves outside `workDir`, or a cap (`maxFileBytes`, `maxTotalBytes`, `maxCount`). The walk stops at the count cap;
+ * bytes are read through an `O_NOFOLLOW` fd and limited to the cap, never trusting an earlier `lstat` size. Zero files
+ * creates nothing. Never throws. Returns `{ok:true, count, bytes, missing}` or `{ok:false, reason}` (a refusal leaves
+ * no `destDir`).
  */
 export function collectArtifacts(workDir, patterns, destDir, { maxFileBytes, maxTotalBytes, maxCount }) {
-  fs.rmSync(destDir, { recursive: true, force: true });
-  const refuse = (reason) => {
-    fs.rmSync(destDir, { recursive: true, force: true });
-    return { ok: false, reason };
-  };
   try {
+    fs.rmSync(destDir, { recursive: true, force: true });
     const realWork = fs.realpathSync(workDir);
     const candidates = new Set();
+    const add = (rel) => {
+      candidates.add(rel);
+      if (candidates.size > maxCount) throw refusal(`more than ${maxCount} files match (count cap)`);
+    };
     for (const pattern of patterns) {
-      if (!isGlobPattern(pattern)) {
-        candidates.add(pattern);
-        continue;
-      }
-      walkGlob(workDir, pattern, (rel) => candidates.add(rel));
-      if (candidates.size > maxCount) return refuse(`more than ${maxCount} files match (count cap)`);
+      if (isGlobPattern(pattern)) walkGlob(workDir, pattern, add);
+      else add(pattern);
     }
-    if (candidates.size > maxCount) return refuse(`more than ${maxCount} files match (count cap)`);
 
     const files = [];
     const missing = [];
     let total = 0;
     for (const rel of [...candidates].sort()) {
+      if (isDeniedArtifactPath(rel)) throw refusal(`refusing a protected path: ${rel}`);
       const abs = path.join(workDir, rel);
       let st;
       try {
@@ -122,27 +182,31 @@ export function collectArtifacts(workDir, patterns, destDir, { maxFileBytes, max
         }
         throw err;
       }
-      if (st.isSymbolicLink()) return refuse(`refusing a symlink: ${rel}`);
-      if (!st.isFile()) return refuse(`not a regular file: ${rel}`);
-      if (!isInside(realWork, fs.realpathSync(abs))) return refuse(`resolves outside the work dir: ${rel}`);
-      if (st.size > maxFileBytes) return refuse(`${rel} is ${st.size} bytes, over the per-file cap of ${maxFileBytes}`);
-      total += st.size;
-      if (total > maxTotalBytes) return refuse(`artifacts exceed the total cap of ${maxTotalBytes} bytes`);
+      if (st.isSymbolicLink()) throw refusal(`refusing a symlink: ${rel}`);
+      if (!st.isFile()) throw refusal(`not a regular file: ${rel}`);
+      if (!isInside(realWork, fs.realpathSync(abs))) throw refusal(`resolves outside the work dir: ${rel}`);
+      if (!isCanonicalRelPath(rel)) throw refusal(`invalid path: ${rel}`);
       const fd = fs.openSync(abs, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
       let buf;
+      const room = Math.min(maxFileBytes, maxTotalBytes - total);
       try {
-        if (!fs.fstatSync(fd).isFile()) return refuse(`not a regular file: ${rel}`);
-        buf = fs.readFileSync(fd);
+        if (!fs.fstatSync(fd).isFile()) throw refusal(`not a regular file: ${rel}`);
+        buf = readCapped(fd, room);
       } finally {
         fs.closeSync(fd);
       }
+      if (buf === null) {
+        throw refusal(maxFileBytes <= maxTotalBytes - total ? `${rel} is over the per-file cap of ${maxFileBytes} bytes` : `artifacts exceed the total cap of ${maxTotalBytes} bytes`);
+      }
+      total += buf.length;
       atomicWriteFile(path.join(destDir, 'files', rel), buf);
       files.push({ path: rel, size: buf.length, sha256: sha256Of(buf) });
     }
-    atomicWriteJson(path.join(destDir, 'manifest.json'), { files });
+    if (files.length > 0) atomicWriteJson(path.join(destDir, 'manifest.json'), { files });
     return { ok: true, count: files.length, bytes: total, missing };
   } catch (err) {
-    return refuse(`could not collect artifacts: ${err.message}`);
+    quietRm(destDir);
+    return { ok: false, reason: err instanceof ArtifactRefusal ? err.message : `could not collect artifacts: ${err.message}` };
   }
 }
 
@@ -152,7 +216,7 @@ export function encodeArtifacts(artifactsDir, ticketId) {
   if (!manifest || !Array.isArray(manifest.files)) return null;
   const filesDir = path.join(artifactsDir, 'files');
   async function* generate() {
-    yield Buffer.from(`${JSON.stringify({ protocol: 1, ticketId, files: manifest.files })}\n`, 'utf8');
+    yield Buffer.from(`${JSON.stringify({ protocol: ARTIFACT_STREAM_PROTOCOL, ticketId, files: manifest.files })}\n`, 'utf8');
     for (const entry of manifest.files) {
       yield Buffer.from(`${JSON.stringify(entry)}\n`, 'utf8');
       yield readVerifiedFile(filesDir, entry);
@@ -188,9 +252,10 @@ export function pruneStaleArtifacts(ticketsDir, now = Date.now()) {
  */
 export async function receiveArtifacts(reader, { ticketId, patterns, limits }) {
   try {
-    const headerResult = await readHeaderLine(reader, MAX_FRAME_LINE_BYTES * 16);
+    const headerResult = await readHeaderLine(reader, MAX_STREAM_HEADER_BYTES);
     if (!headerResult.ok) return headerResult;
     const { header } = headerResult;
+    if (header?.protocol !== ARTIFACT_STREAM_PROTOCOL) return { ok: false, reason: `unsupported artifact stream protocol: ${JSON.stringify(header?.protocol)}` };
     if (!header || header.ticketId !== ticketId || !Array.isArray(header.files)) return { ok: false, reason: 'artifact stream does not bind to this ticket' };
     if (header.files.length > limits.maxCount) return { ok: false, reason: `${header.files.length} artifacts, over the count cap of ${limits.maxCount}` };
     const seen = new Set();
@@ -198,7 +263,8 @@ export async function receiveArtifacts(reader, { ticketId, patterns, limits }) {
     for (const entry of header.files) {
       const p = entry?.path;
       if (typeof p !== 'string' || !isCanonicalRelPath(p)) return { ok: false, reason: `invalid artifact path: ${JSON.stringify(p)}` };
-      if (!patterns.some((pattern) => artifactMatches(pattern, p))) return { ok: false, reason: `artifact was not declared: ${p}` };
+      if (isDeniedArtifactPath(p)) return { ok: false, reason: `protected artifact path: ${p}` };
+      if (!isUnderDeclaredDir(p, patterns)) return { ok: false, reason: `artifact was not declared: ${p}` };
       if (seen.has(p)) return { ok: false, reason: `duplicate artifact: ${p}` };
       seen.add(p);
       if (!Number.isInteger(entry.size) || entry.size < 0) return { ok: false, reason: `invalid artifact size: ${p}` };
@@ -243,12 +309,74 @@ function trackedAmong(worktreeRoot, relPaths) {
   return new Set(out.split('\0').filter(Boolean));
 }
 
+/** Why `relPath` cannot be written under `realRoot` (an ancestor that is a symlink or not a directory), or null. */
+function unsafeAncestor(realRoot, relPath) {
+  let acc = realRoot;
+  for (const seg of relPath.split('/').slice(0, -1)) {
+    acc = path.join(acc, seg);
+    const st = fs.lstatSync(acc, { throwIfNoEntry: false });
+    if (!st) return null; // nothing deeper exists yet either
+    if (st.isSymbolicLink()) return `an ancestor directory is a symlink: ${path.relative(realRoot, acc)}`;
+    if (!st.isDirectory()) return `an ancestor is not a directory: ${path.relative(realRoot, acc)}`;
+  }
+  return null;
+}
+
+/** `relPath` spelled as the filesystem spells it (a case-insensitive volume would otherwise hide a tracked file). */
+function canonicalRel(realRoot, relPath) {
+  const segs = relPath.split('/');
+  let existing = path.join(realRoot, ...segs);
+  const rest = [];
+  while (!fs.existsSync(existing) && existing !== realRoot) {
+    rest.unshift(path.basename(existing));
+    existing = path.dirname(existing);
+  }
+  return path.relative(realRoot, path.join(fs.realpathSync.native(existing), ...rest)).split(path.sep).join('/');
+}
+
+/**
+ * Write `bytes` at `relPath` under `realRoot`: a temp file in the destination directory, then a re-check that no
+ * ancestor is a symlink and the directory still resolves inside the root, then a rename. Residual race, accepted: a
+ * process on THIS machine that swaps a directory for a symlink between that re-check and the rename. The runner is
+ * the adversary this guards against, and it cannot touch this filesystem; a local concurrent mutator can already write
+ * the worktree directly.
+ */
+function writeContained(realRoot, relPath, bytes) {
+  const dest = path.join(realRoot, relPath);
+  const dir = path.dirname(dest);
+  const check = () => {
+    const reason = unsafeAncestor(realRoot, relPath);
+    if (reason) throw new Error(reason);
+    if (!isInside(realRoot, fs.realpathSync(dir))) throw new Error('destination resolves outside the worktree');
+    const st = fs.lstatSync(dest, { throwIfNoEntry: false });
+    if (st && !st.isFile()) throw new Error(st.isSymbolicLink() ? 'destination is a symlink' : 'destination is not a regular file');
+  };
+  const reason = unsafeAncestor(realRoot, relPath);
+  if (reason) throw new Error(reason);
+  fs.mkdirSync(dir, { recursive: true });
+  const tmp = path.join(dir, `.${path.basename(dest)}.${process.pid}-${crypto.randomBytes(6).toString('hex')}.tmp`);
+  const fd = fs.openSync(tmp, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, 0o644);
+  try {
+    try {
+      fs.writeFileSync(fd, bytes);
+    } finally {
+      fs.closeSync(fd);
+    }
+    check();
+    fs.renameSync(tmp, dest);
+  } catch (err) {
+    fs.rmSync(tmp, { force: true });
+    throw err;
+  }
+}
+
 /**
  * Submitter side: write verified `files` into `worktreeRoot` at the same relative paths, atomically, one file at a
- * time. Per file it refuses: a non-canonical path, a destination that resolves outside the worktree (realpath of its
- * deepest existing ancestor), a destination that is a symlink or not a regular file, and a git-tracked destination
- * unless the path is listed in `patterns` EXACTLY (a glob never overwrites a tracked file). Never throws.
- * Returns `{written:[path], refused:[{path, reason}]}`.
+ * time. The runner is less trusted than this machine, so per file it refuses: a non-canonical path; a protected path
+ * (`isDeniedArtifactPath`); a path outside the glob-free directory of a declared pattern it matches; any ancestor
+ * directory that is a symlink; a destination that is not a regular file; and ANY file git tracks (checked on the
+ * canonical spelling too) -- an artifact never overwrites tracked content, however it is declared. If git cannot be
+ * asked, everything is refused. Never throws. Returns `{written:[path], refused:[{path, reason}]}`.
  */
 export function installArtifacts(worktreeRoot, files, patterns) {
   const written = [];
@@ -259,57 +387,49 @@ export function installArtifacts(worktreeRoot, files, patterns) {
   } catch (err) {
     return { written, refused: files.map((f) => ({ path: f.path, reason: `worktree unavailable: ${err.message}` })) };
   }
-  const exact = new Set(patterns.filter((p) => !isGlobPattern(p)));
-  const needsTrackedCheck = files.filter((f) => !exact.has(f.path)).map((f) => f.path);
-  let tracked = new Set();
-  let trackedError = null;
-  if (needsTrackedCheck.length > 0) {
+
+  const accepted = [];
+  for (const file of files) {
+    const refuse = (reason) => refused.push({ path: file.path, reason });
     try {
-      tracked = trackedAmong(realRoot, needsTrackedCheck);
+      if (!isCanonicalRelPath(file.path)) refuse('invalid path');
+      else if (isDeniedArtifactPath(file.path)) refuse('protected path');
+      else if (!isUnderDeclaredDir(file.path, patterns)) refuse('not under the literal directory of a declared pattern');
+      else {
+        const ancestor = unsafeAncestor(realRoot, file.path);
+        const st = fs.lstatSync(path.join(realRoot, file.path), { throwIfNoEntry: false });
+        if (ancestor) refuse(ancestor);
+        else if (st && !st.isFile()) refuse(st.isSymbolicLink() ? 'destination is a symlink' : 'destination is not a regular file');
+        else {
+          const canonical = canonicalRel(realRoot, file.path);
+          if (isDeniedArtifactPath(canonical)) refuse('protected path');
+          else accepted.push({ file, canonical });
+        }
+      }
     } catch (err) {
-      trackedError = err.message;
+      refuse(`could not check destination: ${err.message}`);
     }
   }
 
-  for (const file of files) {
-    const refuse = (reason) => refused.push({ path: file.path, reason });
-    if (!isCanonicalRelPath(file.path)) {
-      refuse('invalid path');
-      continue;
-    }
-    if (!exact.has(file.path)) {
-      if (trackedError) {
-        refuse(`could not check whether git tracks it: ${trackedError}`);
-        continue;
-      }
-      if (tracked.has(file.path)) {
-        refuse('git tracks this file; only a path listed exactly in remoteArtifacts may overwrite it');
-        continue;
-      }
-    }
-    const dest = path.join(realRoot, file.path);
-    let ancestor = path.dirname(dest);
-    while (!fs.existsSync(ancestor) && ancestor !== realRoot) ancestor = path.dirname(ancestor);
-    let outside = false;
+  let tracked = new Set();
+  if (accepted.length > 0) {
     try {
-      outside = !isInside(realRoot, fs.realpathSync(ancestor));
-    } catch {
-      outside = true;
+      tracked = trackedAmong(realRoot, [...new Set(accepted.flatMap(({ file, canonical }) => [file.path, canonical]))]);
+    } catch (err) {
+      for (const { file } of accepted) refused.push({ path: file.path, reason: `could not check whether git tracks it: ${err.message}` });
+      return { written, refused };
     }
-    if (outside) {
-      refuse('destination resolves outside the worktree');
+  }
+  for (const { file, canonical } of accepted) {
+    if (tracked.has(file.path) || tracked.has(canonical)) {
+      refused.push({ path: file.path, reason: 'git tracks this file; artifacts never overwrite tracked content' });
       continue;
     }
     try {
-      const st = fs.lstatSync(dest, { throwIfNoEntry: false });
-      if (st && !st.isFile()) {
-        refuse(st.isSymbolicLink() ? 'destination is a symlink' : 'destination is not a regular file');
-        continue;
-      }
-      atomicWriteFile(dest, file.bytes);
+      writeContained(realRoot, file.path, file.bytes);
       written.push(file.path);
     } catch (err) {
-      refuse(`write failed: ${err.message}`);
+      refused.push({ path: file.path, reason: err.message });
     }
   }
   return { written, refused };

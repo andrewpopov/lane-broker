@@ -57,14 +57,14 @@ function artifactStream(ticketId, files, { mutateEntry } = {}) {
 
 test('remoteArtifacts shape: accepts canonical paths and simple globs, refuses traversal, absolute paths and bad globs', () => {
   assert.equal(isValidRemoteArtifactsShape(['artifacts/test-lane/default-latest.json', 'out/*.json', 'reports/**/summary.txt']), true);
-  for (const bad of [[], '../x', ['../x'], ['a/../x'], ['/etc/passwd'], ['a//b'], ['a/'], ['./a'], ['a/**b'], ['a', 'a'], [''], [1]]) {
+  for (const bad of [[], '../x', ['../x'], ['a/../x'], ['/etc/passwd'], ['a//b'], ['a/'], ['./a'], ['a/**b'], ['a/b', 'a/b'], [''], [1], ['*.json'], ['**/*.json'], ['stamp.json'], ['*/x.json']]) {
     assert.equal(isValidRemoteArtifactsShape(bad), false, JSON.stringify(bad));
   }
 });
 
 test('a repo config with a bad remoteArtifacts or remoteArtifactsOn is a ConfigError', () => {
   const { base } = freshEnv();
-  for (const lane of [{ remoteArtifacts: ['../x'] }, { remoteArtifacts: 'x' }, { remoteArtifactsOn: 'sometimes' }]) {
+  for (const lane of [{ remoteArtifacts: ['../x'] }, { remoteArtifacts: 'x' }, { remoteArtifacts: ['**/*.json'] }, { remoteArtifactsOn: 'sometimes' }]) {
     const repoDir = path.join(base, `repo-${Math.random()}`);
     writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, ...lane } } });
     assert.throws(() => resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' }), ConfigError, JSON.stringify(lane));
@@ -77,10 +77,10 @@ test('remoteArtifacts and remoteArtifactsOn resolve with the policy defaulting t
   writeRepoConfig(repoDir, {
     version: 1,
     undeclaredLanes: { as: 'prepush' },
-    lanes: { default: { weight: 1 }, prepush: { weight: 1, remote: true, remoteArtifacts: ['a/b.json'], remoteArtifactsOn: 'always' }, plain: { weight: 1, remoteArtifacts: ['x'] } },
+    lanes: { default: { weight: 1 }, prepush: { weight: 1, remote: true, remoteArtifacts: ['a/b.json'], remoteArtifactsOn: 'always' }, plain: { weight: 1, remoteArtifacts: ['x/y.json'] } },
   });
   const declared = resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'plain' });
-  assert.deepEqual(declared.remoteArtifacts, ['x']);
+  assert.deepEqual(declared.remoteArtifacts, ['x/y.json']);
   assert.equal(declared.remoteArtifactsOn, 'success');
   const adHoc = resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'zirk1' });
   assert.deepEqual(adHoc.remoteArtifacts, ['a/b.json']);
@@ -185,39 +185,56 @@ test('stream: what collect stores, encode frames and receive verifies round-trip
 test('receive: a sha256 mismatch is refused', async () => {
   const id = crypto.randomUUID();
   const chunks = [
-    frame({ protocol: 1, ticketId: id, files: [{ path: 'a.json', size: 5, sha256: sha(Buffer.from('alpha')) }] }),
-    frame({ path: 'a.json', size: 5, sha256: sha(Buffer.from('alpha')) }),
+    frame({ protocol: 1, ticketId: id, files: [{ path: 'out/a.json', size: 5, sha256: sha(Buffer.from('alpha')) }] }),
+    frame({ path: 'out/a.json', size: 5, sha256: sha(Buffer.from('alpha')) }),
     'ALPHA', // same length, different bytes
     frame({ end: true }),
   ];
-  const got = await receiveArtifacts(stream(chunks), { ticketId: id, patterns: ['a.json'], limits: LIMITS });
+  const got = await receiveArtifacts(stream(chunks), { ticketId: id, patterns: ['out/a.json'], limits: LIMITS });
   assert.equal(got.ok, false);
   assert.match(got.reason, /sha256 mismatch/);
 });
 
-test('receive: a traversal, absolute, or undeclared path from the runner is refused', async () => {
+test('receive: a traversal, absolute, undeclared or protected path from the runner is refused', async () => {
   const id = crypto.randomUUID();
-  for (const [bad, pattern] of [['../evil.txt', '*'], ['/etc/passwd', '*'], ['a/../../evil', '*'], ['other.txt', 'a.json']]) {
+  for (const [bad, pattern, reason] of [
+    ['../evil.txt', 'out/*', /invalid artifact path/],
+    ['/etc/passwd', 'out/*', /invalid artifact path/],
+    ['a/../../evil', 'out/*', /invalid artifact path/],
+    ['other/x.txt', 'out/*', /was not declared/],
+    ['x.txt', 'out/*', /was not declared/],
+    ['.git/config', '.git/*', /protected/],
+  ]) {
     const got = await receiveArtifacts(artifactStream(id, { [bad]: 'x' }), { ticketId: id, patterns: [pattern], limits: LIMITS });
     assert.equal(got.ok, false, bad);
-    assert.match(got.reason, /invalid artifact path|was not declared/, bad);
+    assert.match(got.reason, reason, bad);
   }
 });
 
 test('receive: the submitter enforces its own per-file, total and count caps, and a stream for another ticket is refused', async () => {
   const id = crypto.randomUUID();
-  const files = { 'a.bin': 'x'.repeat(10), 'b.bin': 'y'.repeat(10) };
-  const run = (limits, ticketId = id) => receiveArtifacts(artifactStream(id, files), { ticketId, patterns: ['*.bin'], limits });
+  const files = { 'out/a.bin': 'x'.repeat(10), 'out/b.bin': 'y'.repeat(10) };
+  const run = (limits, ticketId = id) => receiveArtifacts(artifactStream(id, files), { ticketId, patterns: ['out/*.bin'], limits });
   assert.match((await run({ ...LIMITS, maxFileBytes: 9 })).reason, /per-file cap/);
   assert.match((await run({ ...LIMITS, maxTotalBytes: 15 })).reason, /total cap/);
   assert.match((await run({ ...LIMITS, maxCount: 1 })).reason, /count cap/);
   assert.match((await run(LIMITS, crypto.randomUUID())).reason, /does not bind/);
 });
 
+test('receive: a stream speaking an unknown protocol version is refused', async () => {
+  const id = crypto.randomUUID();
+  for (const protocol of [999, 2, undefined]) {
+    const entry = { path: 'out/a.json', size: 1, sha256: sha(Buffer.from('a')) };
+    const got = await receiveArtifacts(stream([frame({ protocol, ticketId: id, files: [entry] }), frame(entry), 'a', frame({ end: true })]), { ticketId: id, patterns: ['out/a.json'], limits: LIMITS });
+    assert.equal(got.ok, false, String(protocol));
+    assert.match(got.reason, /unsupported artifact stream protocol/);
+  }
+});
+
 test('receive: a truncated stream is refused', async () => {
   const id = crypto.randomUUID();
-  const entry = { path: 'a.json', size: 5, sha256: sha(Buffer.from('alpha')) };
-  const got = await receiveArtifacts(stream([frame({ protocol: 1, ticketId: id, files: [entry] }), frame(entry), 'al']), { ticketId: id, patterns: ['a.json'], limits: LIMITS });
+  const entry = { path: 'out/a.json', size: 5, sha256: sha(Buffer.from('alpha')) };
+  const got = await receiveArtifacts(stream([frame({ protocol: 1, ticketId: id, files: [entry] }), frame(entry), 'al']), { ticketId: id, patterns: ['out/a.json'], limits: LIMITS });
   assert.equal(got.ok, false);
   assert.match(got.reason, /truncated/);
 });
@@ -236,16 +253,49 @@ test('install: writes each file at its relative path, creating parent directorie
   assert.deepEqual(fs.readdirSync(path.join(wt, 'artifacts/test-lane')), ['default-latest.json'], 'no temp file left behind');
 });
 
-test('install: a tracked file is overwritten only when listed by exact path, never through a glob', () => {
+test('install: a git-tracked file is never overwritten, whether declared by glob or by its exact path', () => {
   const wt = worktreeWithTracked({ 'out/tracked.json': 'old', 'out/other.json': 'old' });
-  const viaGlob = installArtifacts(wt, [file('out/tracked.json', 'new')], ['out/*.json']);
-  assert.equal(viaGlob.written.length, 0);
-  assert.match(viaGlob.refused[0].reason, /git tracks/);
-  assert.equal(fs.readFileSync(path.join(wt, 'out/tracked.json'), 'utf8'), 'old');
+  for (const patterns of [['out/*.json'], ['out/tracked.json']]) {
+    const out = installArtifacts(wt, [file('out/tracked.json', 'new')], patterns);
+    assert.equal(out.written.length, 0, JSON.stringify(patterns));
+    assert.match(out.refused[0].reason, /git tracks/);
+    assert.equal(fs.readFileSync(path.join(wt, 'out/tracked.json'), 'utf8'), 'old');
+  }
+});
 
-  const viaExact = installArtifacts(wt, [file('out/tracked.json', 'new')], ['out/tracked.json']);
-  assert.deepEqual(viaExact.written, ['out/tracked.json']);
-  assert.equal(fs.readFileSync(path.join(wt, 'out/tracked.json'), 'utf8'), 'new');
+for (const denied of ['.git/config', '.github/workflows/ci.yml', '.githooks/pre-push', 'sub/.git', '.gitmodules', 'package.json', 'package-lock.json', 'npm-shrinkwrap.json', 'pkg/node_modules/x/index.js', 'out/.env', 'out/.env.local', '.npmrc', 'out/.yarnrc.yml', 'out/yarn.lock', 'out/Cargo.lock', '.lane-broker.json', 'out/PACKAGE.JSON']) {
+  test(`install: a protected path (${denied}) is refused even when a declared pattern names it`, () => {
+    const wt = worktreeWithTracked({ 'src.txt': 'x' });
+    const dir = path.dirname(denied) === '.' ? 'out' : path.dirname(denied);
+    const out = installArtifacts(wt, [file(denied, 'pwn')], [denied, `${dir}/*`]);
+    assert.equal(out.written.length, 0);
+    assert.match(out.refused[0].reason, /protected/);
+    if (denied === '.git/config') assert.doesNotMatch(fs.readFileSync(path.join(wt, '.git/config'), 'utf8'), /pwn/);
+    assert.equal(fs.existsSync(path.join(wt, denied)), denied === '.git/config');
+  });
+}
+
+test('install: a path outside the literal directory of every declared pattern is refused', () => {
+  const wt = worktreeWithTracked({ 'src.txt': 'x' });
+  const out = installArtifacts(wt, [file('elsewhere/a.json', 'x'), file('out/a.json', 'x')], ['out/*.json']);
+  assert.deepEqual(out.written, ['out/a.json']);
+  assert.match(out.refused[0].reason, /literal directory/);
+});
+
+test('install: an alias directory (symlink inside the worktree) cannot be used to overwrite a tracked file', () => {
+  const wt = worktreeWithTracked({ 'real/tracked.json': 'old' });
+  fs.symlinkSync('real', path.join(wt, 'alias'));
+  const out = installArtifacts(wt, [file('alias/tracked.json', 'pwn')], ['alias/*.json']);
+  assert.equal(out.written.length, 0);
+  assert.match(out.refused[0].reason, /symlink/);
+  assert.equal(fs.readFileSync(path.join(wt, 'real/tracked.json'), 'utf8'), 'old');
+});
+
+test('install: if git cannot say what is tracked, nothing is written', () => {
+  const notRepo = tmp('artifacts-not-a-repo');
+  const out = installArtifacts(notRepo, [file('out/a.json', 'x')], ['out/*.json']);
+  assert.equal(out.written.length, 0);
+  assert.match(out.refused[0].reason, /whether git tracks/);
 });
 
 test('install: an untracked file is overwritten through a glob', () => {
@@ -261,7 +311,7 @@ test('install: traversal and absolute paths are refused and nothing is written o
   const wt = path.join(parent, 'wt');
   fs.mkdirSync(wt);
   execFileSync('git', ['init', '-q'], { cwd: wt });
-  const out = installArtifacts(wt, [file('../escaped.txt', 'x'), file('/tmp/lane-artifact-abs.txt', 'x')], ['*']);
+  const out = installArtifacts(wt, [file('../escaped.txt', 'x'), file('/tmp/lane-artifact-abs.txt', 'x')], ['out/*']);
   assert.equal(out.written.length, 0);
   assert.deepEqual(out.refused.map((r) => r.reason), ['invalid path', 'invalid path']);
   assert.equal(fs.existsSync(path.join(parent, 'escaped.txt')), false);
@@ -271,12 +321,13 @@ test('install: a destination that is a symlink, or sits under a symlinked direct
   const outside = tmp('artifacts-outside');
   const wt = worktreeWithTracked({ 'src.txt': 'x' });
   fs.writeFileSync(path.join(outside, 'target.txt'), 'untouched');
-  fs.symlinkSync(path.join(outside, 'target.txt'), path.join(wt, 'leaf.txt'));
+  fs.mkdirSync(path.join(wt, 'out'));
+  fs.symlinkSync(path.join(outside, 'target.txt'), path.join(wt, 'out/leaf.txt'));
   fs.symlinkSync(outside, path.join(wt, 'linkdir'));
-  const out = installArtifacts(wt, [file('leaf.txt', 'pwn'), file('linkdir/new.txt', 'pwn')], ['leaf.txt', 'linkdir/new.txt']);
+  const out = installArtifacts(wt, [file('out/leaf.txt', 'pwn'), file('linkdir/new.txt', 'pwn')], ['out/*.txt', 'linkdir/*.txt']);
   assert.equal(out.written.length, 0);
   assert.match(out.refused[0].reason, /symlink/);
-  assert.match(out.refused[1].reason, /outside the worktree/);
+  assert.match(out.refused[1].reason, /symlink/);
   assert.equal(fs.readFileSync(path.join(outside, 'target.txt'), 'utf8'), 'untouched');
   assert.equal(fs.existsSync(path.join(outside, 'new.txt')), false);
 });
@@ -298,4 +349,30 @@ test('prune: stored artifacts older than a day are removed, recent ones kept', (
   pruneStaleArtifacts(tickets);
   assert.equal(fs.existsSync(path.join(tickets, 'old', 'artifacts')), false);
   assert.equal(fs.existsSync(path.join(tickets, 'recent', 'artifacts')), true);
+});
+
+// ---- more runner-side collection ----
+
+test('collect: a protected path is refused (a glob cannot sweep up .git or package.json)', () => {
+  const work = workDirWith({ 'out/ok.json': '1', 'out/package.json': '{}' });
+  const { res } = collect(work, ['out/*.json']);
+  assert.equal(res.ok, false);
+  assert.match(res.reason, /protected path/);
+  const dotGit = collect(workDirWith({ '.git/config': 'x' }), ['.git/config']).res;
+  assert.equal(dotGit.ok, false);
+  assert.match(dotGit.reason, /protected path/);
+});
+
+test('collect: zero matching files creates nothing on disk', () => {
+  const { dest, res } = collect(workDirWith({ 'out/a.txt': '1' }), ['out/*.json']);
+  assert.equal(res.ok, true);
+  assert.equal(res.count, 0);
+  assert.equal(fs.existsSync(dest), false);
+});
+
+test('collect: the walk stops at the count cap instead of listing every match first', () => {
+  const work = workDirWith(Object.fromEntries(Array.from({ length: 30 }, (_, i) => [`out/f${i}.bin`, 'x'])));
+  const res = collect(work, ['out/*.bin'], { ...LIMITS, maxCount: 5 }).res;
+  assert.equal(res.ok, false);
+  assert.match(res.reason, /count cap/);
 });

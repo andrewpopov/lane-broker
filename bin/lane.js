@@ -218,7 +218,7 @@ async function main() {
     // BRAIN-319 T2: hidden runner-side subcommands, invoked by a client Mac
     // over ssh — deliberately not listed in usage() above.
     case 'remote-probe': {
-      const result = await remoteProbeCommand();
+      const result = await remoteProbeCommand({ root: parseRootFlag(rest) || defaultRemoteRoot() });
       return result.exitCode;
     }
     case 'remote-exec': {

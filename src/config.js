@@ -336,6 +336,13 @@ function isValidArtifactSegment(seg) {
   return !seg.includes('**') || seg === '**';
 }
 
+/** BRAIN-398: the glob-free directory a pattern lives under (`out/*.json` -> `out`; `*.json` and `**\/x` -> ''). */
+export function literalDirPrefix(pattern) {
+  const segs = pattern.split('/').slice(0, -1);
+  const end = segs.findIndex((seg) => seg.includes('*'));
+  return (end === -1 ? segs : segs.slice(0, end)).join('/');
+}
+
 export const REMOTE_ARTIFACTS_ON = ['success', 'always'];
 export const MAX_REMOTE_ARTIFACT_PATTERNS = 50;
 
@@ -350,6 +357,7 @@ export function isValidRemoteArtifactsShape(patterns) {
   for (const pattern of patterns) {
     if (typeof pattern !== 'string' || !isCanonicalRelPath(pattern)) return false;
     if (!pattern.split('/').every(isValidArtifactSegment)) return false;
+    if (literalDirPrefix(pattern) === '') return false;
     if (seen.has(pattern)) return false;
     seen.add(pattern);
   }
@@ -426,7 +434,7 @@ function validateRepoConfig(cfg, sourcePath) {
     if (lane.remoteArtifacts !== undefined) {
       assert(
         isValidRemoteArtifactsShape(lane.remoteArtifacts),
-        `${sourcePath}: lane "${name}".remoteArtifacts must be a non-empty array (at most ${MAX_REMOTE_ARTIFACT_PATTERNS}) of canonical relative paths or globs ("*" within a segment, "**" as a whole segment), no duplicates`,
+        `${sourcePath}: lane "${name}".remoteArtifacts must be a non-empty array (at most ${MAX_REMOTE_ARTIFACT_PATTERNS}) of canonical relative paths or globs ("*" within a segment, "**" as a whole segment), each under a literal directory (so "**/*.json" and "*.json" are refused), no duplicates`,
       );
     }
     if (lane.remoteArtifactsOn !== undefined) {

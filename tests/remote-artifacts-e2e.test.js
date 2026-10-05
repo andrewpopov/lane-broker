@@ -113,23 +113,74 @@ test('a declared file the command never produced is a warning, not a failure', a
   assert.match(resultOf(state, id).remoteArtifactsWarning, new RegExp(`declared but not produced: ${STAMP}`));
 });
 
-test('a tracked file is overwritten only when listed by exact path; a glob leaves it alone and warns', async () => {
+test('a git-tracked file is never overwritten, whether declared by glob or by exact path; the lane still exits 0 with a warning', async () => {
   const { env, state, repoDir } = setup();
-  configure(repoDir, { remoteArtifacts: ['out/*.json'] });
   fs.mkdirSync(path.join(repoDir, 'out'));
   fs.writeFileSync(path.join(repoDir, 'out/tracked.json'), 'committed');
+  configure(repoDir, { remoteArtifacts: ['out/*.json'] });
   gitFixture(['add', '-A'], repoDir);
   gitFixture(['commit', '-q', '-m', 'x'], repoDir);
 
-  const viaGlob = await runLane(env, repoDir, writerCmd({ 'out/tracked.json': 'from-runner' }));
-  assert.equal(viaGlob.waited.code, 0, viaGlob.waited.stderr);
-  assert.equal(fs.readFileSync(path.join(repoDir, 'out/tracked.json'), 'utf8'), 'committed');
-  assert.match(resultOf(state, viaGlob.id).remoteArtifactsWarning, /git tracks/);
+  for (const patterns of [['out/*.json'], ['out/tracked.json']]) {
+    configure(repoDir, { remoteArtifacts: patterns });
+    const run = await runLane(env, repoDir, writerCmd({ 'out/tracked.json': 'from-runner' }));
+    assert.equal(run.waited.code, 0, run.waited.stderr);
+    assert.equal(fs.readFileSync(path.join(repoDir, 'out/tracked.json'), 'utf8'), 'committed');
+    assert.match(resultOf(state, run.id).remoteArtifactsWarning, /git tracks/);
+  }
+});
 
-  configure(repoDir, { remoteArtifacts: ['out/tracked.json'] });
-  const viaExact = await runLane(env, repoDir, writerCmd({ 'out/tracked.json': 'from-runner' }));
-  assert.equal(viaExact.waited.code, 0, viaExact.waited.stderr);
-  assert.equal(fs.readFileSync(path.join(repoDir, 'out/tracked.json'), 'utf8'), 'from-runner');
+test('the runner deletes its stored copies even when the submitter refuses what it was sent', async () => {
+  const { env, home, repoDir, runnerRoot } = setup();
+  const cfg = JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8'));
+  writeGlobalConfig(home, { ...cfg, remoteArtifactMaxTotalBytes: 3 });
+  configure(repoDir, { remoteArtifacts: [STAMP] });
+  const { waited } = await runLane(env, repoDir, writerCmd({ [STAMP]: 'more than three bytes' }));
+  assert.equal(waited.code, 0, waited.stderr);
+  const [ticket] = fs.readdirSync(path.join(runnerRoot, 'tickets'));
+  assert.equal(fs.existsSync(path.join(runnerRoot, 'tickets', ticket, 'artifacts')), false);
+});
+
+test('nothing is stored on the runner for a run that produced no artifacts', async () => {
+  const { env, repoDir, runnerRoot } = setup();
+  configure(repoDir, { remoteArtifacts: ['reports/*.json'] });
+  const { waited } = await runLane(env, repoDir, writerCmd({}));
+  assert.equal(waited.code, 0, waited.stderr);
+  const [ticket] = fs.readdirSync(path.join(runnerRoot, 'tickets'));
+  assert.equal(fs.existsSync(path.join(runnerRoot, 'tickets', ticket, 'artifacts')), false);
+});
+
+test('a command that makes the runner\'s artifact directory undeletable cannot change the result: the true exit is published and the submitter does not fall back', async () => {
+  const { env, state, repoDir } = setup();
+  configure(repoDir, { remoteArtifacts: [STAMP], remoteArtifactsOn: 'always' });
+  // `..` of the work dir is the ticket dir, where the runner stores artifacts: leave a read-only dir with a file in it.
+  const body = `
+const fs = require('fs');
+fs.mkdirSync('../artifacts');
+fs.writeFileSync('../artifacts/blocker', 'x');
+fs.chmodSync('../artifacts', 0o555);
+fs.mkdirSync('artifacts/test-lane', { recursive: true });
+fs.writeFileSync(${JSON.stringify(STAMP)}, 'x');
+process.exit(3);
+`;
+  const { id, waited } = await runLane(env, repoDir, [process.execPath, '-e', body]);
+  assert.equal(waited.code, 3, waited.stderr);
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote', 'a published result means no local fallback');
+  assert.equal(result.exit, 3);
+  assert.match(result.remoteArtifactsWarning, /could not collect artifacts/);
+  assert.equal(fs.existsSync(path.join(repoDir, STAMP)), false);
+});
+
+test('a runner prunes artifacts older than a day on every probe, not only on artifact jobs', async () => {
+  const { env, runnerRoot } = setup();
+  const stale = path.join(runnerRoot, 'tickets', 'old-ticket', 'artifacts');
+  fs.mkdirSync(stale, { recursive: true });
+  const old = (Date.now() - 25 * 60 * 60_000) / 1000;
+  fs.utimesSync(stale, old, old);
+  const res = await laneRun(['remote-probe', '--root', runnerRoot], { env });
+  assert.equal(res.code, 0, res.stderr);
+  assert.equal(fs.existsSync(stale), false);
 });
 
 test('a runner without artifacts/1 runs the command, warns, and returns nothing', async () => {

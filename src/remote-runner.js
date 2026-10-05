@@ -240,11 +240,17 @@ function buildResult(header, ticketDir, { kind, exit = null, signal = null, remo
  * summary for the result (`undefined` when the policy skipped it). A collection failure is data, not an error: the
  * result stays exactly what the command produced.
  */
-function storeArtifacts(header, ticketDir, workDir, { kind, exit, signal }, runnerCfg) {
+function storeArtifacts(header, ticketDir, workDir, { kind, exit, signal }) {
   if (header.remoteArtifacts === undefined || kind !== 'completed') return undefined;
-  const commandSucceeded = exit === 0 && !signal && (header.protocol !== 2 || readPhase(ticketDir) === 'command');
-  if ((header.remoteArtifactsOn ?? 'success') === 'success' && !commandSucceeded) return undefined;
-  return collectArtifacts(workDir, header.remoteArtifacts, path.join(ticketDir, 'artifacts'), artifactLimitsOf(runnerCfg));
+  // Everything artifact-shaped, config reload included, answers for itself: it may only ever produce a warning in
+  // the result, never stop the result (with the command's true exit) from being published.
+  try {
+    const commandSucceeded = exit === 0 && !signal && (header.protocol !== 2 || readPhase(ticketDir) === 'command');
+    if ((header.remoteArtifactsOn ?? 'success') === 'success' && !commandSucceeded) return undefined;
+    return collectArtifacts(workDir, header.remoteArtifacts, path.join(ticketDir, 'artifacts'), artifactLimitsOf(loadGlobalConfig()));
+  } catch (err) {
+    return { ok: false, reason: `could not collect artifacts: ${err.message}` };
+  }
 }
 
 function writeResult(ticketDir, result) {
@@ -352,7 +358,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     }
     throw err;
   }
-  if (header.remoteArtifacts !== undefined) pruneStaleArtifacts(ticketsDir);
+  pruneStaleArtifacts(ticketsDir);
   await testHoldAt('remote-exec-committed');
   // Node's default for SIGHUP is to exit, but this process must outlive a dropped ssh session
   // to publish result.json; explicit cancellation goes through remote-cancel.
@@ -586,15 +592,19 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     kind = 'unfinished';
   }
 
-  const artifacts = storeArtifacts(header, ticketDir, workDir, { kind, exit, signal }, loadGlobalConfig());
-  writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, runMs, grantedCpuCores, observedCpu, observedRssPeakBytes, artifacts }));
-  cleanupWork(workDir, tmpDir);
+  const artifacts = storeArtifacts(header, ticketDir, workDir, { kind, exit, signal });
+  try {
+    writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, runMs, grantedCpuCores, observedCpu, observedRssPeakBytes, artifacts }));
+  } finally {
+    cleanupWork(workDir, tmpDir);
+  }
   return { exitCode: 0 };
 }
 
 /** `lane remote-probe`: one JSON line describing this host's local broker,
  *  reusing status.js's own reader rather than a second implementation. */
-export async function remoteProbeCommand() {
+export async function remoteProbeCommand({ root = defaultRemoteRoot() } = {}) {
+  pruneStaleArtifacts(path.join(path.resolve(root), 'tickets'));
   const status = await collectStatus();
   const pkgPath = fileURLToPath(new URL('../package.json', import.meta.url));
   const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));

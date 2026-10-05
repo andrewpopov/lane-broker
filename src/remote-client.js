@@ -59,8 +59,28 @@ function sshArgv(runner, commandString) {
   ];
 }
 
-/** Spawn `cmdBin argv`, capturing stdout/stderr, SIGKILL on `deadlineMs`. Never rejects. */
-function runWithDeadline(cmdBin, argv, deadlineMs, env) {
+// BRAIN-398: a runner is less trusted than this machine, so what it prints is bounded. Every capture keeps its tail.
+const DEFAULT_CAPTURE_BYTES = 1024 * 1024;
+const ARTIFACT_CAPTURE_BYTES = 64 * 1024;
+
+/** Collects chunks, keeping only the last `max` bytes. `text()` marks a truncated capture. */
+function tailCapture(max) {
+  let buf = Buffer.alloc(0);
+  let truncated = false;
+  return {
+    push(chunk) {
+      buf = Buffer.concat([buf, Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)]);
+      if (buf.length > max) {
+        buf = buf.subarray(buf.length - max);
+        truncated = true;
+      }
+    },
+    text: () => (truncated ? `[truncated] ${buf.toString('utf8')}` : buf.toString('utf8')),
+  };
+}
+
+/** Spawn `cmdBin argv`, capturing (the tail of) stdout/stderr, SIGKILL on `deadlineMs`. Never rejects. */
+export function runWithDeadline(cmdBin, argv, deadlineMs, env, maxCaptureBytes = DEFAULT_CAPTURE_BYTES) {
   return new Promise((resolve) => {
     let child;
     try {
@@ -69,8 +89,8 @@ function runWithDeadline(cmdBin, argv, deadlineMs, env) {
       resolve({ code: null, stdout: '', stderr: '', timedOut: false, spawnError: true });
       return;
     }
-    let stdout = '';
-    let stderr = '';
+    const out = tailCapture(maxCaptureBytes);
+    const err = tailCapture(maxCaptureBytes);
     let timedOut = false;
     const timer = setTimeout(() => {
       timedOut = true;
@@ -80,19 +100,15 @@ function runWithDeadline(cmdBin, argv, deadlineMs, env) {
         // already gone
       }
     }, deadlineMs);
-    child.stdout.on('data', (d) => {
-      stdout += d;
-    });
-    child.stderr.on('data', (d) => {
-      stderr += d;
-    });
+    child.stdout.on('data', (d) => out.push(d));
+    child.stderr.on('data', (d) => err.push(d));
     child.on('close', (code) => {
       clearTimeout(timer);
-      resolve({ code, stdout, stderr, timedOut });
+      resolve({ code, stdout: out.text(), stderr: err.text(), timedOut });
     });
     child.on('error', () => {
       clearTimeout(timer);
-      resolve({ code: null, stdout, stderr, timedOut, spawnError: true });
+      resolve({ code: null, stdout: out.text(), stderr: err.text(), timedOut, spawnError: true });
     });
   });
 }
@@ -450,6 +466,15 @@ async function fetchRemoteResult(runner, ticketId, sshBin, deadlineMs, env) {
  * throws or rejects, and never writes anything: installing is the caller's step.
  */
 async function fetchRemoteArtifacts(runner, ticketId, { patterns, limits, sshBin, deadlineMs, env }) {
+  try {
+    return await readRemoteArtifacts(runner, ticketId, { patterns, limits, sshBin, deadlineMs, env });
+  } finally {
+    // Every exit path -- success, refusal, truncation, error -- tells the runner to drop its copies.
+    await runWithDeadline(sshBin, sshArgv(runner, buildRemoteCommand(runner, 'remote-artifacts-release', [ticketId])), deadlineMs, env, ARTIFACT_CAPTURE_BYTES);
+  }
+}
+
+async function readRemoteArtifacts(runner, ticketId, { patterns, limits, sshBin, deadlineMs, env }) {
   const cmd = buildRemoteCommand(runner, 'remote-artifacts', [ticketId]);
   let child;
   try {
@@ -457,10 +482,8 @@ async function fetchRemoteArtifacts(runner, ticketId, { patterns, limits, sshBin
   } catch (err) {
     return { ok: false, reason: `ssh failed to start: ${err.message}` };
   }
-  let stderr = '';
-  child.stderr.on('data', (d) => {
-    stderr += d;
-  });
+  const stderr = tailCapture(ARTIFACT_CAPTURE_BYTES);
+  child.stderr.on('data', (d) => stderr.push(d));
   const exited = new Promise((resolve) => {
     child.on('close', (code) => resolve(code));
     child.on('error', () => resolve(null));
@@ -474,9 +497,9 @@ async function fetchRemoteArtifacts(runner, ticketId, { patterns, limits, sshBin
   }
   const code = await exited;
   clearTimeout(timer);
-  if (!received.ok) return { ok: false, reason: stderr.trim() ? `${received.reason} (${stderr.trim()})` : received.reason };
+  const detail = stderr.text().trim();
+  if (!received.ok) return { ok: false, reason: detail ? `${received.reason} (${detail})` : received.reason };
   if (code !== 0) return { ok: false, reason: `remote-artifacts exited ${code}` };
-  await runWithDeadline(sshBin, sshArgv(runner, buildRemoteCommand(runner, 'remote-artifacts-release', [ticketId])), deadlineMs, env);
   return received;
 }
 
