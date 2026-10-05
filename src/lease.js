@@ -1,6 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
-import { paths, atomicWriteJson, readJsonSafe, bootId, isPidAlive, processStartTime } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, bootId, isPidAlive, processStartTime, listJsonRecordsStrict } from './state.js';
 import { touchSimArmFor } from './sim-arm.js';
 
 export { isPidAlive, processStartTime };
@@ -50,6 +50,11 @@ export function listLeases(root) {
     .filter((n) => n.endsWith('.json'))
     .map((n) => readJsonSafe(path.join(dir, n)))
     .filter(Boolean);
+}
+
+/** Every lease record, or a thrown `UnreadableRecordError`: for decisions that must not proceed past a record they cannot read. */
+export function listLeasesStrict(root) {
+  return listJsonRecordsStrict(paths(root).leases);
 }
 
 export function isGroupAlive(pgid) {

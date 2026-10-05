@@ -4,9 +4,10 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, assertNotMigrating, MigrationInProgressError } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, loadGlobalConfig } from './config.js';
+import { remotePriorityFrom, PRIORITY_CAPABILITY } from './priority.js';
 import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores, ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
 import { makeReader, readHeaderLine, extractFrames, MAX_HEADER_BYTES } from './remote-stream.js';
 import { runCommand } from './run.js';
@@ -241,6 +242,15 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   // `cwd:` in the runCommand call below), so a relative `root` must never
   // reach any of those derivations un-resolved.
   root = path.resolve(root);
+  // BRAIN-380: a runner mid-`lane migrate-scheduler` takes no new work. Exit 75 before reading the header or making a
+  // ticket directory, so nothing is left behind for the client to reconcile. (`root` is the remote ticket root, not the broker's.)
+  try {
+    assertNotMigrating(stateHome());
+  } catch (err) {
+    if (!(err instanceof MigrationInProgressError)) throw err;
+    process.stderr.write(`lane remote-exec: ${err.message}\n`);
+    return { exitCode: 75 };
+  }
   // BRAIN-319 I4: this process is invoked by ssh as a fresh node process
   // after any login-shell startup already ran, so scrubbing here — rather
   // than relying on `env -u` upstream — satisfies "after shell startup":
@@ -250,6 +260,8 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   delete process.env.LANE_BROKER_LEASE;
   delete process.env.LANE_BROKER_KEY;
   delete process.env.LANE_BROKER_TICKET;
+  // BRAIN-380: a remote-exec ticket's tier comes only from the dispatch header (none yet, so medium), never the runner shell.
+  delete process.env.LANE_BROKER_PRIORITY;
   process.env.LANE_BROKER_LOCAL = '1';
 
   // BRAIN-320 review fix C: also scrub git's own repo-local env vars
@@ -402,6 +414,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     pipelineCmd = [process.execPath, laneBinPath, 'remote-pipeline', ticketDir];
   }
 
+  const remotePriority = remotePriorityFrom(header);
   const runOutcome = await runCommand({
     repo: header.repoKey,
     lane: header.lane,
@@ -410,6 +423,11 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     // dispatched at all; refusing it again on this side would make every
     // remote-eligible localRefused lane refuse twice over.
     allowLocalSim: true,
+    // BRAIN-380 §6: priority comes ONLY from the validated header, never this shell's LANE_BROKER_PRIORITY. The tier is
+    // what the submitter asked for; this runner's own enqueue applies its own cap. The accrued wait is anchored on this
+    // runner's own priority clock in runCommand, so the submitter's timestamps are never read.
+    priority: remotePriority.priority,
+    priorityAccruedMs: remotePriority.accruedMs,
     weightOverride: header.weight,
     cpuOverride: header.cpuCores,
     minCpuOverride: header.minCpuCores,
@@ -536,7 +554,7 @@ export async function remoteProbeCommand() {
     protocol: 1,
     protocols: [1, 2],
     // BRAIN-360: this runner resolves minCpuCores itself, so a submitter may judge fit by the floor
-    capabilities: [ELASTIC_CLAIMS_CAPABILITY],
+    capabilities: [ELASTIC_CLAIMS_CAPABILITY, PRIORITY_CAPABILITY],
     version: pkg.version,
     paused: Boolean(status.paused),
     queued: status.queued.length,

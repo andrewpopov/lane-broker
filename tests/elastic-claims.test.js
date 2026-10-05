@@ -14,6 +14,7 @@ import { childEnv } from '../src/supervisor.js';
 import { leaseDemand, projectBusy } from '../src/admission.js';
 import { elasticClaimRange, resolveTicketResources, leaseCpuCores, leaseResources, ELASTIC_CLAIMS_CAPABILITY } from '../src/resources.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
+import { PRIORITY_CAPABILITY } from '../src/priority.js';
 
 /**
  * BRAIN-360: elastic CPU claims. Fixture machine: 10 cores, reserve 1, 100% -> CPU budget 9,
@@ -173,8 +174,16 @@ test('no minCpuCores: decisions are unchanged at every ambient load, and the lea
         logPath: '/dev/null',
         resultPath: '/dev/null',
         state: LEASE_STATE.RUNNING,
+        // BRAIN-380 slice 4: the admission audit, the only addition since BRAIN-360
+        priorityRequested: 'medium',
+        priorityAdmitted: 'medium',
+        priorityDemoted: false,
+        effectiveRankAtStart: 1,
       };
-      assert.deepEqual(lease, expected, `ext ${ext}`);
+      // the real clock: a ticket that waited a few ms has aged a hair past the medium base of 1
+      const { scoreAtStart, ...rest } = lease;
+      assert.ok(scoreAtStart >= 1 && scoreAtStart < 1.01, `ext ${ext}: ${scoreAtStart}`);
+      assert.deepEqual(rest, expected, `ext ${ext}`);
     } else {
       assert.equal(result.reason, 'cpu-admission');
       assert.equal(result.cpuReason, 'projected-over-budget');
@@ -503,7 +512,7 @@ test('remote-probe advertises elastic-claims/1', () => {
   const { env } = freshEnv();
   const res = spawnSync(process.execPath, [BIN, 'remote-probe'], { env, encoding: 'utf8' });
   assert.equal(res.status, 0, res.stderr);
-  assert.deepEqual(JSON.parse(res.stdout).capabilities, [ELASTIC_CLAIMS_CAPABILITY]);
+  assert.deepEqual(JSON.parse(res.stdout).capabilities, [ELASTIC_CLAIMS_CAPABILITY, PRIORITY_CAPABILITY]);
 });
 
 test('remote run: the runner-side grant reaches BOTH the runner history and the submitter result and history', async () => {

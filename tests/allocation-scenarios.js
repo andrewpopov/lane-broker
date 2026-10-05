@@ -135,12 +135,17 @@ export function scenarios(m) {
 
 // pids and boot ids differ between the run that made a trace and any later run; nothing else may
 const VOLATILE_KEYS = new Set(['supervisorPid', 'bootId']);
+// BRAIN-380 slice 1 stamps these on every queue record without touching selection; main's records never carry them
+const PRIORITY_FIELDS = ['priorityRequested', 'priorityAdmitted', 'priorityDemoted', 'prioOriginAt', 'schedVersion'];
+// BRAIN-380 slice 4 adds the admission audit to every lease and the head's tier/rank/score to every decision line
+const LEASE_AUDIT_FIELDS = ['priorityRequested', 'priorityAdmitted', 'priorityDemoted', 'effectiveRankAtStart', 'scoreAtStart'];
+const stripHeadPriority = (line) => line.replace(/ headTier=\S+ headRank=\S+ headScore=\S+/, '');
 const normalize = (value) => JSON.parse(JSON.stringify(value, (k, v) => (VOLATILE_KEYS.has(k) ? '<volatile>' : v)));
 
 /**
  * Run one script on a frozen, scripted clock so every persisted timestamp is reproducible. Returns what LIVE
  * admission produced: each poll's result, the skip/reservation files, lease and queue files, the live log lines.
- * `liveOnly` drops fields only this slice adds (a lease's `class`), so a main run and a branch run compare.
+ * `liveOnly` drops fields only a later slice adds (a lease's `class`, a queue record's priority fields), so a main run and a branch run compare.
  */
 export async function runScript(m, script, { allocationShadow, freshState, seams } = {}) {
   const state = freshState ?? fs.mkdtempSync(path.join(os.tmpdir(), 'lane-broker-scenario-'));
@@ -187,9 +192,12 @@ export async function runScript(m, script, { allocationShadow, freshState, seams
       conflictSkip: raw(p.conflictSkipState),
       capacitySkip: raw(p.capacitySkipState),
       resourceSkip: raw(p.resourceSkipState),
-      leases: dirJson(p.leases, ['class']),
-      queue: dirJson(p.queue),
-      liveLog: log.split('\n').filter((l) => l && !l.startsWith('lane-broker-allocation-shadow')),
+      leases: dirJson(p.leases, ['class', ...LEASE_AUDIT_FIELDS]),
+      queue: dirJson(p.queue, PRIORITY_FIELDS),
+      liveLog: log
+        .split('\n')
+        .filter((l) => l && !l.startsWith('lane-broker-allocation-shadow'))
+        .map(stripHeadPriority),
       shadowLines: log.split('\n').filter((l) => l.startsWith('lane-broker-allocation-shadow ')),
     };
   } finally {

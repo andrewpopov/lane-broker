@@ -8,11 +8,40 @@ export function stateHome() {
   return process.env.LANE_BROKER_STATE || path.join(os.homedir(), '.cache', 'lane-broker');
 }
 
+/** What the migration leaves where old code expects the queue DIRECTORY, so old code fails on its own: `mkdir` and every
+ *  queue write underneath it hit ENOTDIR/EEXIST. New code then keeps its queue in `queue-v2/`. */
+export const QUEUE_FENCE_NOTE = 'lane-broker scheduler migrated to v2; upgrade lane-broker\n';
+
+/**
+ * Has `lane migrate-scheduler` replaced the legacy `queue/` directory with the fence file? True ONLY for a regular file
+ * that starts with the exact note. A symlink (even to a directory) or anything else is the legacy `queue/`, because
+ * that is what old code would follow: new code must never be sent to `queue-v2/` while old code uses the same `queue`.
+ */
+export function queueFenced(root) {
+  const file = path.join(root, 'queue');
+  let fd;
+  try {
+    if (!fs.lstatSync(file).isFile()) return false;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const buf = Buffer.alloc(Buffer.byteLength(QUEUE_FENCE_NOTE));
+    const read = fs.readSync(fd, buf, 0, buf.length, 0);
+    return buf.subarray(0, read).toString('utf8') === QUEUE_FENCE_NOTE;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
 export function paths(root = stateHome()) {
   return {
     root,
     leases: path.join(root, 'leases'),
-    queue: path.join(root, 'queue'),
+    // A getter, not a value: every queue read and write goes through it, and the answer (legacy `queue/` or `queue-v2/`)
+    // is whatever the state root says at the moment of use.
+    get queue() {
+      return path.join(root, queueFenced(root) ? 'queue-v2' : 'queue');
+    },
     logs: path.join(root, 'logs'),
     results: path.join(root, 'results'),
     cancel: path.join(root, 'cancel'),
@@ -41,6 +70,16 @@ export function paths(root = stateHome()) {
     simArm: path.join(root, 'sim-arm.json'),
     simArmLock: path.join(root, 'sim-arm.lock'),
     seq: path.join(root, 'seq'),
+    // BRAIN-380: the scheduler fence (its presence, valid, switches priority ordering on) and the per-ticket
+    // fairness records that replace the three singleton skip files behind it; see src/fairness.js.
+    schedFence: path.join(root, 'sched-v2.json'),
+    fairness: path.join(root, 'fairness-v2.json'),
+    // BRAIN-380: broker-wide high-water mark of wall time (the priority clock); see src/priority-clock.js.
+    hwm: path.join(root, 'priority-hwm.json'),
+    // BRAIN-380 slice 3: present only while `lane migrate-scheduler` runs; every new-code admission entry point refuses on it.
+    migrating: path.join(root, 'migrating'),
+    // BRAIN-380 slice 3: a queue record without `schedVersion` found behind the fence is moved here and never selected.
+    queueQuarantine: path.join(root, 'queue-quarantine'),
     // BRAIN-319 T3b-2 (C3): one durable attempt record per remote-eligible
     // ticket, keyed by ticket id -- see src/attempts.js.
     attempts: path.join(root, 'attempts'),
@@ -102,17 +141,94 @@ export function ensureStateDirs(root = stateHome()) {
   return p;
 }
 
-/** Write `data` to `file` atomically: write to a temp file in the same dir, then rename. Never follows symlinks. */
-export function atomicWriteFile(file, data) {
+/**
+ * Write `data` to `file` atomically: write to a temp file in the same dir, then rename. Never follows symlinks.
+ * `fsync` (BRAIN-380's migration writes only) makes the result durable across power loss: the file is fsynced before
+ * the rename and the directory after it, so neither the bytes nor the rename can be lost behind a later write.
+ */
+export function atomicWriteFile(file, data, { fsync = false } = {}) {
   const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true });
   const tmp = path.join(dir, `.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
-  fs.writeFileSync(tmp, data, { flag: 'wx' });
+  if (fsync) {
+    const fd = fs.openSync(tmp, 'wx');
+    try {
+      fs.writeFileSync(fd, data);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } else {
+    fs.writeFileSync(tmp, data, { flag: 'wx' });
+  }
   fs.renameSync(tmp, file);
+  if (fsync) fsyncDirectory(dir);
 }
 
-export function atomicWriteJson(file, obj) {
-  atomicWriteFile(file, `${JSON.stringify(obj, null, 2)}\n`);
+/** Make a rename, create or unlink inside `dir` durable. */
+export function fsyncDirectory(dir) {
+  const dirFd = fs.openSync(dir, 'r');
+  try {
+    fs.fsyncSync(dirFd);
+  } finally {
+    fs.closeSync(dirFd);
+  }
+}
+
+export function atomicWriteJson(file, obj, opts) {
+  atomicWriteFile(file, `${JSON.stringify(obj, null, 2)}\n`, opts);
+}
+
+/** Thrown by `assertNotMigrating`; callers map it to exit 75 ("try again later", the same convention as a lock timeout). */
+export class MigrationInProgressError extends Error {
+  constructor() {
+    super('scheduler migration in progress');
+    this.name = 'MigrationInProgressError';
+    this.code = 'LANE_MIGRATION_IN_PROGRESS';
+  }
+}
+
+/** The one guard every new-code admission entry point calls. Existence-only: the marker's contents are the migrator's own business. */
+export function assertNotMigrating(root) {
+  if (fs.existsSync(paths(root).migrating)) throw new MigrationInProgressError();
+}
+
+/** An unreadable record found by a strict listing; `file` names it. */
+export class UnreadableRecordError extends Error {
+  constructor(file, cause) {
+    super(`${file}: ${cause}`);
+    this.name = 'UnreadableRecordError';
+    this.file = file;
+  }
+}
+
+/**
+ * Fail-closed counterpart of `readJsonSafe` + `.filter(Boolean)`: every `*.json` in `dir`, sorted by name, THROWING
+ * `UnreadableRecordError` for any file that cannot be read or is not a JSON object. Only a file that vanishes between
+ * the listing and the read (a benign removal race) is skipped, as is a directory that does not exist.
+ */
+export function listJsonRecordsStrict(dir) {
+  let names;
+  try {
+    names = fs.readdirSync(dir).sort();
+  } catch (err) {
+    if (err.code === 'ENOENT') return [];
+    throw new UnreadableRecordError(dir, err.message);
+  }
+  const records = [];
+  for (const name of names.filter((n) => n.endsWith('.json'))) {
+    const file = path.join(dir, name);
+    let record;
+    try {
+      record = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (err) {
+      if (err.code === 'ENOENT') continue;
+      throw new UnreadableRecordError(file, err.message);
+    }
+    if (record === null || typeof record !== 'object' || Array.isArray(record)) throw new UnreadableRecordError(file, 'not a JSON object');
+    records.push(record);
+  }
+  return records;
 }
 
 /**

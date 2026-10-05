@@ -43,6 +43,7 @@ lane suggest [--repo <name>] [--days 7] [--json]
 lane cancel <id>
 lane wait <id> [--timeout 5m]
 lane pause "reason" | lane resume
+lane migrate-scheduler [--dry-run]
 ```
 
 `lane status` adds `  log file unchanged for <duration>` to a RUNNING line once the
@@ -64,6 +65,7 @@ features like pipes or globbing.
 | `--weight <n>` | Override the configured weight for this run; must be a positive number (validated before enqueueing, exit `2` otherwise). |
 | `--cpu <cores>` | Override the lane's CPU reservation; fractional cores are supported. |
 | `--memory <size>` | Override the lane's memory reservation, e.g. `768MiB` or `4GiB`. |
+| `--priority high\|medium\|low` | BRAIN-380 priority tier (default `medium`). Beats env `LANE_BROKER_PRIORITY`, which beats the lane's `priority` in `.lane-broker.json` (an `undeclaredLanes.as` template passes its tier on), which beats `medium`. Any invalid value from any of the three exits `64`. See "Priority (foundations)" below. |
 | `--detach` | Print the run id and return immediately instead of waiting. |
 | `--timeout <duration>` | e.g. `30s`, `5m`, `500ms`. Exit `75` if not finished in time — see below. |
 | `--allow-local-sim` | Override a lane's `localRefused: true`. |
@@ -484,7 +486,9 @@ ending in strict FIFO for that head once spent:
   denial of the same head (closed CPU gate, memory, unavailable sample); such a
   denial only pauses backfill until the head is next denied by the projection.
   They are dropped only when the head starts, leaves the front of the queue, or
-  the limit is 0. A backfill whose count cannot be written to disk is
+  the limit is 0 (behind the priority scheduler fence, see "Priority (ordered
+  selection)" below, the front moves for reasons unrelated to the owner, so they
+  are dropped only when the ticket starts or leaves the queue, or the limit is 0). A backfill whose count cannot be written to disk is
   refused, never uncounted. `resourceSkipLimit: 0` restores strict FIFO for
   resource denials.
 
@@ -665,6 +669,174 @@ or memory reservation. Any other nested key — a
 different repo, or a different lane that isn't `prepush` — is refused with
 exit `64`; v1 has no general lane hierarchy.
 
+### Priority (foundations, BRAIN-380 slice 1)
+
+Without the scheduler fence (next section) the scheduler is strictly FIFO: tiers
+and the priority clock are recorded but reorder nothing, and `lane status` says so
+(`priority: inactive (legacy scheduler; run lane migrate-scheduler)`). Each
+queued ticket persists `priorityRequested`, `priorityAdmitted` (the requested tier,
+unless the per-repo high cap demoted it, see below), `priorityDemoted`, `prioOriginAt` and
+`schedVersion: 2`. The resolved tier is exported to the lane child (and to a
+reentrant child) as `LANE_BROKER_PRIORITY`; a `remote-exec` ticket ignores the
+runner shell's value and is `medium`.
+
+The priority clock is `nowEff = max(wall clock, hwm)`, where `hwm` is a
+persisted high-water mark (`priority-hwm.json` in the state root) advanced under
+the broker lock on every locked evaluation and every enqueue. `lane run` takes
+the lock briefly to stamp `prioOriginAt = nowEff`, so a wall-clock step backwards
+freezes a ticket's age instead of reversing it, and a ticket created during the
+rollback starts at zero age. `createdAt` and every deadline derived from it stay
+on the wall clock. `lane status` reads the mark and never writes it, and shows
+each queued ticket's tier plus its effective rank once it has aged a step.
+
+Global config (all optional): `priorityAgingMs` (integer in `[60000, 3600000]`,
+default `600000`: one tier of age per period), `priorityAgeMaxMs` (integer in
+`[priorityAgingMs, 86400000]`, default `2 x priorityAgingMs`),
+`priorityWeights` `{tier, age, fairshare}` (`tier` and `age` in `(0, 100]`,
+`age >= tier`, `fairshare` exactly `0`; defaults `2/2/0`) and
+`maxQueuedHighPerRepo` (non-negative integer, default `1`; `0` demotes every high).
+`src/priority.js` holds the pure score (`min(W_tier, W_tier*tierFactor +
+W_age*ageFactor)`) and `orderQueue`; see "Priority (ordered selection)" for where they are live.
+
+### Priority (ordered selection, BRAIN-380 slice 2)
+
+Everything here runs only while a **valid** `sched-v2.json` (`{"version": 2,
+"migratedAt": <ms>}`) is in the state root. Without one the scheduler is the
+legacy FIFO over the three singleton skip files, unchanged. An unreadable,
+malformed or wrong-version fence or `fairness-v2.json` also runs legacy mode and
+logs `lane-broker-head-block event=scheduler-fence-invalid reason=...` (once per
+process). `lane migrate-scheduler` (below) writes the fence.
+
+- **One ordered view.** Each locked evaluation orders the queue once, with
+  `nowEff = max(wall clock, hwm)`: `(score desc, seq asc)` within each run of
+  readable records, never across an unreadable record. The active reservation
+  owner, if any, is then moved to index 0 (never across an unreadable record,
+  which suspends its reservation for that evaluation, nor while the owner is
+  class-ineligible: `effectiveView` takes an `eligible(ticket)` filter that defaults
+  to allow-all because BRAIN-379 allocation is shadow-only, and is to be wired to
+  its enforcement when that goes live). Every selector (conflict,
+  capacity and resource walks, BRAIN-365's conflict backfill, BRAIN-355's safe
+  backfill) and the allocation shadow snapshot receive that one array, so
+  "head" means index 0 of it. "Smallest fitting claim" ties go to the earlier
+  ordered-view position. `lane status` runs the same pipeline read-only, shows
+  `priority: active`, positions from that array and the promoted owner.
+- **Per-ticket fairness.** `fairness-v2.json` maps ticket id to one record per
+  blocking reason (`conflict`, `capacity`, `resource`), each
+  `{reason, skipsCharged, ...}`: conflict adds `blockedSince`, `graceStartedAt`
+  and `loggedPhase`; capacity adds `loggedPhase`; resource adds `reserved`,
+  `reservationSeq`, `inScope`, `behindConflict`, `deniedAt`, `budget` and
+  `externalBusy`. The skip budget applies to the current head using its own
+  counter. A displaced ticket's counter pauses and its conflict grace keeps
+  running from its own `graceStartedAt`. A record is deleted only when the ticket
+  departs (starts, is cancelled, expires or is reaped; removal is noticed on the
+  next evaluation, except while an unreadable queue record hides which ids
+  left). The singleton files are never read or written behind the fence.
+- **One active reservation.** A reservation record carries `reservationSeq`,
+  drawn from the monotonic queue counter when the resource allowance is used
+  up, never a timestamp. The lowest `reservationSeq` whose owner is queued and
+  not behind an unreadable record is active and promoted; the others are
+  dormant (kept with their counters, reserving nothing). A higher-priority
+  arrival does not take it over. It is released when the owner starts or leaves
+  the queue, or `resourceSkipLimit` is 0.
+- **Backfill.** BRAIN-355 safe backfill stays poll-driven: whichever ticket
+  polls and proves it cannot delay the effective head may start, an exception to
+  priority order that makes no promise about other queued tickets.
+
+### Migrating to the priority scheduler (BRAIN-380 slice 3)
+
+Priority ordering stays off until `lane migrate-scheduler` writes the fence. The cutover is explicit, drained and
+fail-closed, and it is **per broker**: it migrates the state root of the machine it runs on (`$LANE_BROKER_STATE`), so
+the Mac and each runner are migrated separately, each in its own drained window. Upgrade the Mac and both runners
+together, and migrate each (a mixed-version fleet is "no worse than today", see Scheduling).
+
+1. `lane pause`.
+2. Wait for running lanes to finish and the queue to empty (`lane status`). A lease left by a crashed run still
+   counts until an admission poll reaps it; if one blocks, `lane resume`, let one poll run, and pause again.
+3. `lane migrate-scheduler --dry-run`. It reports every precondition as `ok:` or `refused:` and changes nothing.
+4. `lane migrate-scheduler`.
+5. `lane resume`. The broker stays paused after migrating, on purpose.
+
+Under one hold of the broker lock the command writes a `migrating` marker, then checks (all of them, fail-closed):
+
+- the broker is paused;
+- the queue is empty;
+- no lease is `RUNNING` or `ORPHANED`;
+- no attempt record is left in `attempts/` (a supervisor still probing or dispatching a remote attempt is invisible
+  to the queue);
+- no live process runs lane-broker's `bin/lane.js`, `src/supervisor.js` or `src/remote-pipeline.js`, whatever its
+  version. Every argv token of every process is examined (so `node --require x.js /old/bin/lane.js` is caught) and
+  symlinks are resolved; a process that merely mentions one of those paths, an editor for instance, blocks it too.
+  The check reads the machine's process table, so a lane process serving a different state root blocks it too.
+  The migrator and its ancestors are excluded. It is a snapshot, taken once, so it is defence in depth: the queue
+  fence below is what stops an old process that starts after it.
+
+Lease, attempt and queue records are read strictly: an unreadable record refuses the migration instead of being
+skipped. On any failure the marker is removed, the broker stays paused, and the command exits 1 naming every failed
+check with its ids or pids. While the marker exists, `lane run`, remote dispatch, `enqueue`, attempt creation and
+`remote-exec` on a runner all refuse with exit 75 and "scheduler migration in progress".
+
+If everything holds, it writes `fairness-v2.json` (`{"version": 2, "tickets": {}}`, all there is at a drained
+point), then fences the queue (below), then writes `sched-v2.json` (the commit point), each fsynced along with its
+directory, then renames the legacy
+`conflict-skip-state.json`, `capacity-skip-state.json` and `resource-skip-state.json` to `*.migrated-<timestamp>`
+and removes the marker. Re-running is safe: `fairness-v2.json` without a fence redoes the cutover, and a valid fence
+prints "already migrated" and exits 0. A marker left by a crashed migrator is taken over by the next run.
+
+**The queue fence.** Old code ignores `migrating` and the scheduler fence, so the migration also makes old code fail by
+itself. It renames the (empty) `queue/` directory to `queue.legacy-<timestamp>/` and creates a regular FILE named
+`queue` holding "lane-broker scheduler migrated to v2; upgrade lane-broker". New code keeps its queue in `queue-v2/`
+(every queue read and write goes through `paths().queue`; `seq` stays shared). An old `lane run` then fails at its
+first `mkdir queue`, and an old supervisor that was already past it fails at its first queue write (ENOTDIR). Old
+`tryStart` starts only a ticket it finds in the queue, so no old process can be admitted. If a valid fence is found
+together with a non-empty legacy `queue/` directory (a crash or manual tampering), new code refuses admission with an
+error naming the directory rather than guessing.
+
+A migrator that dies after the fence leaves its `migrating` marker behind. Re-running `lane migrate-scheduler` sees the
+valid fence, removes the marker (fsyncing the directory) and reports "already migrated (recovered)".
+
+Behind the fence, a queue record without `schedVersion` (only an escaped pre-migration process can write one) is
+moved to `queue-quarantine/`, logged as `lane-broker-head-block event=legacy-record-after-fence`, and never
+selected. Its supervisor finds its queue file gone and exits as cancelled. If the quarantine rename itself fails, the
+record is still never selectable: it reads as an unreadable-record barrier for that evaluation and the failure is
+logged as `action=quarantine-failed`. A valid fence over a missing or malformed `fairness-v2.json` (every field a
+selector reads is type-checked) runs the legacy scheduler and logs `scheduler-fence-invalid`. Turning resource
+backfill off (`resourceSkipLimit` 0, or shadow mode) releases every reservation latch; turning it back on makes a
+ticket earn one again.
+
+### The high cap, the remote hop and the audit (BRAIN-380 slice 4)
+
+**The high cap.** At most `maxQueuedHighPerRepo` (default `1`) tickets of one repo can sit in the queue as `high`.
+`enqueue` counts them under the same state-root lock that allocates the sequence number and writes the queue record
+(so two racing `lane run`s cannot both see "none queued"), across lanes and worktrees. A queued high whose supervisor
+is dead (pid plus start time, a read-only check) does not count; `enqueue` never reaps or otherwise changes other tickets.
+A high at or over the cap is admitted as `medium`: the record keeps `priorityRequested: high` and gets
+`priorityAdmitted: medium`, `priorityDemoted: true`, and `lane run` prints
+`lane run: priority high demoted to medium (repo already has a queued high ticket)` to stderr. A demoted ticket does
+not hold the slot. The cap is recorded in legacy mode too, but it only reorders anything behind the scheduler fence.
+The lane child sees the admitted tier in `LANE_BROKER_PRIORITY`.
+
+**The cap is per broker.** Remote dispatch happens before the local enqueue, and every runner has its own broker and
+its own cap. A repo can therefore hold one queued high on the Mac and one on each runner at the same time. That is
+deliberate.
+
+**Remote.** The submitter adds two fields to the `remote-exec` header: `priorityRequested` (the tier before any cap)
+and `priorityAccruedMs` (`max(0, nowEff - prioOriginAt)` on the submitter's own priority clock, so it includes any
+probing or waiting before dispatch; ssh and snapshot transfer time is not counted). No wall-clock timestamp crosses
+the hop, so clock skew between hosts cannot change a ticket's age. The runner validates both (an unknown tier is
+`medium`; a wait that is not an integer in `[0, 86400000]` is `0`), applies its own cap in its own `enqueue`, and
+sets `prioOriginAt = runnerNowEff - priorityAccruedMs` on its own clock. It never touches `createdAt`, and it never
+reads the runner shell's `LANE_BROKER_PRIORITY`. The probe advertises the capability `priority/1` next to
+`elastic-claims/1`. A runner without it ignores the fields and its tickets are effectively `medium`; runner
+selection does not change. If the remote attempt falls back to local, the local ticket keeps its own original
+`prioOriginAt`: the time spent on the attempt counts once, through the local clock, and no remote age is added.
+
+**Audit.** When a ticket is admitted, its lease records `priorityRequested`, `priorityAdmitted`, `priorityDemoted`,
+`effectiveRankAtStart` and `scoreAtStart`, and its terminal `history.jsonl` row carries the same fields next to
+`waitedMs`. Each `admission-decisions.log` decision line also ends with `headTier=`, `headRank=` and `headScore=`
+(the queue head's tier, effective rank and score at that evaluation). Polls by a ticket that is not up are still not
+logged. Tier and rank describe what the scheduler saw. They cannot show how much time a tier saved anyone, and
+nothing here claims it: compare wait distributions by tier, and do not read a causal effect into them.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -673,9 +845,9 @@ exit `64`; v1 has no general lane hierarchy.
 | the child's exit code | Passed straight through on completion. |
 | `1` | The command errored, was signalled, or the supervisor died unexpectedly. |
 | `2` | Bad CLI usage (missing command / argument). |
-| `64` | Nested `lane run` would widen the inherited lease — refused. |
+| `64` | Nested `lane run` would widen the inherited lease — refused; or an invalid `--priority` / `LANE_BROKER_PRIORITY` / lane `priority`. |
 | `69` | Local-sim lane refused (fleet-offload message); use `--allow-local-sim`. |
-| `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. |
+| `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. Also `lane run` / `remote-exec` refused with "scheduler migration in progress" while `lane migrate-scheduler` runs. |
 | `130` | Cancelled (SIGINT/SIGTERM) while still queued, before the lane ever started. |
 
 ## ORPHANED handling
@@ -714,7 +886,7 @@ the queue so you know what's waiting and why.
 ## State
 
 `$LANE_BROKER_STATE` (default `~/.cache/lane-broker`): `leases/`, `queue/`,
-`logs/` (per-run, capped at 50MB with a truncation notice), `results/`,
+`priority-hwm.json` (the priority clock's high-water mark), `migrating` (present only while `lane migrate-scheduler` runs), `queue-quarantine/` (see below), `sched-v2.json` and `fairness-v2.json` (the priority scheduler fence and its per-ticket fairness records), `logs/` (per-run, capped at 50MB with a truncation notice), `results/`,
 `history.jsonl` (one line per completed run, plus one `dequeuedDeadSupervisor: true`
 row `{id, key, error, supervisorPid, endedAt, executor}` (`error: "supervisor died while queued"`, so a history reader counts it as an error, not a failed run) when a queued ticket whose
 supervisor died is dropped from the queue; it is written only once the queue

@@ -11,6 +11,9 @@ import { listAttempts, supervisorAlive } from './attempts.js';
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfig } from './config.js';
+import { effectiveNow } from './priority-clock.js';
+import { resolveScheduler, legacyStore, fairnessStore, effectiveView } from './fairness.js';
+import { priorityOf, effectiveRank, tierName } from './priority.js';
 import { leaseOverrun } from './observed.js';
 import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores } from './resources.js';
 
@@ -40,14 +43,14 @@ function currentLockHolderPid(root) {
  * resolveCapacityBlock's doc comment in scheduler.js), so there is nothing
  * to count down.
  */
-function computeHeadBlock(root, cfg, queue, leases, now, weightCapacity) {
+function computeHeadBlock(root, store, cfg, queue, leases, now, weightCapacity) {
   const head = queue[0];
   if (!head) return null;
   const held = leases.filter((l) => HELD_STATES.has(l.state));
   const runningWeight = held.reduce((s, l) => s + (l.weight || 0), 0);
   const blocker = blockedBy(held, head);
   if (blocker) {
-    const skipState = readSkipState(root);
+    const skipState = readSkipState(root, store, head.id);
     const sameHead = skipState.headId === head.id;
     const skipCount = sameHead ? skipState.count : 0;
     if (skipCount < cfg.conflictSkipLimit) return null;
@@ -68,7 +71,7 @@ function computeHeadBlock(root, cfg, queue, leases, now, weightCapacity) {
   // The EFFECTIVE capacity, never raw cfg.capacity: with `capacity: 'auto'` the raw value is a
   // string, the comparison is always false, and a capacity-blocked head was never reported.
   if (runningWeight + head.weight > weightCapacity) {
-    const capState = readCapacitySkipState(root);
+    const capState = readCapacitySkipState(root, store, head.id);
     const sameHead = capState.headId === head.id;
     const skipCount = sameHead ? capState.count : 0;
     if (skipCount < cfg.conflictSkipLimit) return null;
@@ -91,9 +94,9 @@ function computeHeadBlock(root, cfg, queue, leases, now, weightCapacity) {
  * projectBusy maths admission uses; `budget` is the one the head was last denied against.
  * Null when there is no head, the record belongs to another head, or backfill is off.
  */
-function computeResourceBlock(root, cfg, head, held, now) {
+function computeResourceBlock(root, store, cfg, head, held, now) {
   if (!head || !(cfg.resourceSkipLimit > 0)) return null;
-  const record = readResourceSkipState(root);
+  const record = readResourceSkipState(root, store, head.id);
   if (!record || record.headId !== head.id) return null;
   return {
     headId: head.id,
@@ -141,7 +144,12 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
   }
 
   const leases = listLeases(root);
-  const queue = listQueue(root);
+  // BRAIN-380: behind a valid scheduler fence status runs the scheduler's own pipeline, read-only: the persisted
+  // clock (never advanced here), orderQueue, then the reservation owner's promotion. Positions below come from
+  // that one array, and the skip/reservation views read the per-ticket store, never the singleton files.
+  const sched = resolveScheduler(root, { log: false });
+  const store = sched.v2 ? fairnessStore(root, sched.tickets) : legacyStore(root);
+  const rawQueue = listQueue(root);
   const gate = readGateState(root);
   const p = paths(root);
   const paused = fs.existsSync(p.pause) ? fs.readFileSync(p.pause, 'utf8').trim() : null;
@@ -178,13 +186,25 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
   const reservedCpuCores = held.reduce((sum, lease) => sum + leaseResources(lease, cfg).cpuCores, 0);
   const reservedMemoryBytes = held.reduce((sum, lease) => sum + leaseResources(lease, cfg).memoryBytes, 0);
 
-  const queued = queue.map((t, i) => ({
-    id: t.id,
-    key: t.key,
-    position: i + 1,
-    waitedMs: now - t.createdAt,
-    resources: leaseResources(t, cfg),
-  }));
+  // BRAIN-380: read-only view of the priority clock (status never writes the mark). Without
+  // a valid scheduler fence the broker runs the legacy FIFO scheduler, so the queue below
+  // stays FIFO and the rank is informational: what the ticket's age would be worth.
+  const nowEff = effectiveNow(root, now);
+  const { queue, ownerId: reservationOwnerId } = sched.v2 ? effectiveView(rawQueue, nowEff, cfg, store) : { queue: rawQueue, ownerId: null };
+  const queued = queue.map((t, i) => {
+    const rank = effectiveRank(t, nowEff, cfg);
+    const tier = priorityOf(t);
+    return {
+      id: t.id,
+      key: t.key,
+      position: i + 1,
+      waitedMs: now - t.createdAt,
+      priority: tier,
+      ...(t.id === reservationOwnerId ? { reservationOwner: true } : {}),
+      ...(tierName(rank) !== tier ? { effectiveRank: tierName(rank) } : {}),
+      resources: leaseResources(t, cfg),
+    };
+  });
 
   // BRAIN-319 T3b-4 (C4): an attempt still mid remote-dispatch (executor
   // 'remote') is neither a lease nor a queue entry -- `used`/`reservedCpu
@@ -226,12 +246,13 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       mode: cfg.schedulerMode,
     },
     paused,
+    priority: sched.v2 ? { active: true, mode: 'v2', nowEff, reservationOwner: reservationOwnerId } : { active: false, mode: 'legacy', nowEff },
     ...(cfg.allocationShadow ? { allocation: computeAllocation(root, cfg, queue.filter(Boolean), held, resourceCapacity.cpuCores, now) } : {}),
     // BRAIN-249: null unless the queue is genuinely stalled (a conflict-
     // blocked head whose skip allowance is exhausted) — see computeHeadBlock.
-    headBlock: computeHeadBlock(root, cfg, queue, leases, now, effectiveWeightCapacity(cfg, resourceCapacity.cpuCores)),
+    headBlock: computeHeadBlock(root, store, cfg, queue, leases, now, effectiveWeightCapacity(cfg, resourceCapacity.cpuCores)),
     // BRAIN-346: the projected-over-budget head's backfill allowance / reservation, if any.
-    resourceBlock: computeResourceBlock(root, cfg, queue[0], held, now),
+    resourceBlock: computeResourceBlock(root, store, cfg, queue[0], held, now),
     configWarning: configWarning ? { message: configWarning.message, firstAt: configWarning.firstAt, lastAt: configWarning.lastAt } : null,
     loadGate: {
       closed: gate.closed,
@@ -396,6 +417,11 @@ export function renderStatusText(status) {
     lines.push(`allocation (shadow): ${cls('test', a.test)}; ${cls('sim', a.sim)}; sims ${a.armed ? 'armed' : 'unarmed'}`);
   }
   lines.push(renderMemoryLine(status.memory));
+  if (status.priority && !status.priority.active) {
+    lines.push('priority: inactive (legacy scheduler; run lane migrate-scheduler)');
+  } else if (status.priority) {
+    lines.push(`priority: active${status.priority.reservationOwner ? ` (reservation owner ${status.priority.reservationOwner} promoted to the front)` : ''}`);
+  }
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
   if (status.configWarning) {
     lines.push(
@@ -422,12 +448,13 @@ export function renderStatusText(status) {
     }
   }
   lines.push('');
-  lines.push('QUEUE (FIFO):');
+  lines.push(status.priority?.active ? 'QUEUE (priority order):' : 'QUEUE (FIFO):');
   if (status.queued.length === 0) {
     lines.push('  (none)');
   } else {
     for (const q of status.queued) {
-      lines.push(`  #${q.position} ${q.id}  key=${q.key}  waited=${fmtMs(q.waitedMs)}`);
+      const tier = q.priority ? `  priority=${q.priority}${q.effectiveRank ? ` (aged to ${q.effectiveRank})` : ''}` : '';
+      lines.push(`  #${q.position} ${q.id}  key=${q.key}  waited=${fmtMs(q.waitedMs)}${tier}${q.reservationOwner ? '  [reservation owner]' : ''}`);
     }
   }
   if (status.remote) {

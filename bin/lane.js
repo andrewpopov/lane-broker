@@ -5,6 +5,7 @@ import { suggestCommand } from '../src/suggest.js';
 import { cancelCommand } from '../src/cancel.js';
 import { waitCommand } from '../src/wait.js';
 import { pauseCommand, resumeCommand } from '../src/pause.js';
+import { migrateSchedulerCommand } from '../src/migrate.js';
 import { parseByteSize } from '../src/resources.js';
 import {
   remoteExecCommand,
@@ -17,7 +18,7 @@ import { remotePipelineCommand } from '../src/remote-pipeline.js';
 
 function usage() {
   return `Usage:
-  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--detach]
+  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--detach]
            [--timeout <duration>] [--allow-local-sim] [--local] [--log <path>] -- <command...>
   lane status [--json]
   lane suggest [--repo <name>] [--days <n>] [--json]
@@ -25,6 +26,7 @@ function usage() {
   lane wait <id> [--timeout <duration>]
   lane pause ["reason"]
   lane resume
+  lane migrate-scheduler [--dry-run]
 `;
 }
 
@@ -65,6 +67,10 @@ function parseRunArgs(args) {
         opts.memoryOverride = bytes;
         break;
       }
+      // Validated (exit 64) by runCommand, together with the env and config sources; a missing value is invalid, not absent.
+      case '--priority':
+        opts.priority = flagArgs[++i] ?? '';
+        break;
       case '--detach':
         opts.detach = true;
         break;
@@ -127,6 +133,7 @@ async function main() {
         weightOverride: opts.weightOverride,
         cpuOverride: opts.cpuOverride,
         memoryOverride: opts.memoryOverride,
+        priority: opts.priority,
         detach: opts.detach,
         timeoutMs: opts.timeout ? parseDurationMs(opts.timeout) : undefined,
         allowLocalSim: opts.allowLocalSim,
@@ -178,6 +185,15 @@ async function main() {
     }
     case 'resume': {
       const result = await resumeCommand();
+      return result.exitCode;
+    }
+    case 'migrate-scheduler': {
+      const unknown = rest.filter((a) => a !== '--dry-run');
+      if (unknown.length > 0) {
+        process.stderr.write(`lane migrate-scheduler: unknown argument "${unknown[0]}"\n`);
+        return 2;
+      }
+      const result = await migrateSchedulerCommand({ dryRun: rest.includes('--dry-run') });
       return result.exitCode;
     }
     // BRAIN-319 T2: hidden runner-side subcommands, invoked by a client Mac
