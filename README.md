@@ -365,8 +365,13 @@ gate usually does) or declares them (below).
 ```
 
 - `remoteDeps`: dirs (relative to the repo root, `.` for the root) whose
-  `package-lock.json` the runner installs from with a fresh
-  `npm ci --no-audit --no-fund` on every run.
+  `package-lock.json` the runner installs from with
+  `npm ci --no-audit --no-fund`, or from the runner's installed-deps cache
+  when it has seen the same lockfile and environment before (below).
+- `remoteDepsCache`: `false` opts this lane out of that cache.
+- `remoteDepsCacheRootScriptsSafe`: `true` declares that the repo's root
+  install/prepare scripts leave `node_modules` alone, so a cached tree is
+  safe despite them.
 - `remoteSetup`: argv arrays run in the repo root after deps, before the
   command.
 
@@ -396,6 +401,106 @@ or setup is a final red with that exit code — it is not re-run locally,
 because the local tree's own dependencies could turn it green — and prints
 `lane: remote failed during deps (exit N); this can also be a registry or
 network failure on <runner>`.
+
+### Installed-deps cache (BRAIN-389)
+
+`npm ci` costs 25-45 s on every remote run, which dwarfs a short lane. The
+runner keeps each installed `node_modules` under
+`<root>/deps-cache/<key>/` and a later run with the same key gets a copy of
+that tree instead of installing. The cache must never hand a run a different
+tree than a fresh `npm ci` would, so it fails closed: anything it cannot
+prove reproducible is installed normally and logged as `skip` with the
+reason.
+
+- **Eligibility**, per `remoteDeps` dir. The lockfile (`package-lock.json`,
+  or `npm-shrinkwrap.json` when present) must be v2 or v3 with a `packages`
+  map, and every non-root entry must be an `https://registry.npmjs.org/`
+  tarball with `integrity`, a `git+...#<40-hex sha>`, or a `file:*.tgz` with
+  `integrity`. `file:` dirs, links, workspaces, unresolved entries and
+  anything else are refused. An entry with no `resolved` is allowed only when
+  an enclosing package bundles it (the parent's `bundleDependencies`, or
+  `inDepBundle`) and that parent passes the same checks; a top-level
+  bundled entry gets the normal checks. Every root script `npm ci` can run
+  (`predependencies`, `dependencies`, `postdependencies`, `preinstall`,
+  `install`, `postinstall`, `prepublish`, `preprepare`, `prepare`,
+  `postprepare`; from npm 11.9.0's `arborist/reify.js` and `lib/commands/ci.js`)
+  must be an exact command on the allowlist (today only
+  `git config core.hooksPath .githooks || true`), or the lane must declare
+  `remoteDepsCacheRootScriptsSafe: true` ("these scripts do not touch
+  `node_modules`").
+- **Key**: sha256 of the lockfile and `package.json` bytes, the `.npmrc` of
+  that dir and of the repo root, the bytes of every `file:` tarball the
+  lockfile names, the node version, platform and arch, the glibc runtime
+  version and `/etc/os-release` `ID` and `VERSION_ID`, the npm version, the
+  exact `npm ci` argv, and the WHOLE deps-phase environment (plus the bytes
+  of the runner's user/global npmrc). When any lock entry has an install
+  script, the first line of `cc --version` and `python3 --version` too (a
+  missing tool is a value). Also in the key: npm's effective `ignore-scripts` and
+  `script-shell` (asked of `npm config get` in the install's own env and cwd),
+  and, for each of `TMPDIR`, `TMP` and `TEMP` BY NAME (`unset`, or the fs
+  type and `noexec`/`nosuid`/`nodev`/`ro` of its target; plus the
+  `os.tmpdir()` fallback when `TMPDIR` is unset), the filesystem properties of
+  the temp dirs (from `/proc/self/mountinfo` on Linux or `mount` on macOS),
+  since a build can behave differently where it cannot execute from its temp
+  dir. The paths themselves differ per run and are not hashed; they join the
+  relocatability scan instead. The variables that differ on every run are
+  REMOVED from the environment npm and every script see, not just left out of
+  the key: `PWD`, `OLDPWD`, `SHLVL`, `_`, `GIT_CEILING_DIRECTORIES` and any
+  `LANE_*`. Only these named variables reach the install without being
+  hashed: authentication (`SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `GIT_SSH`,
+  `GIT_SSH_COMMAND`) and ssh per-connection info (`SSH_CONNECTION`,
+  `SSH_CLIENT`, `SSH_TTY`). Credentials decide whether a pinned git
+  dependency can be fetched, not which commit it is; a pin does not constrain
+  what a dependency's own lifecycle scripts generate, so every other `SSH_*`
+  variable is hashed like any other. Any other change is a miss.
+- **Hit**: the stored tree is COPIED into the work dir (a reflink where the
+  filesystem has them), as private writable files, so nothing a lane does to
+  its tree can reach the store. The store itself is read-only. The copy is
+  slower than a hardlink farm and is the price of that isolation. `npm ci`
+  is skipped, so the allowlisted root scripts (whose effect is on the work
+  dir's `.git/config`, not on `node_modules`) are REPLAYED, in npm's order,
+  by calling npm's own `@npmcli/run-script` the way `lib/commands/ci.js`
+  does, with the install's env plus what `npm ci` adds (`npm_command=ci`,
+  `INIT_CWD`, `npm_execpath` and friends; compared against a real `npm ci`).
+  Not reproduced are the informational `npm_config_{prefix,global_prefix,
+  init_module,noproxy,npm_version,user_agent}` echoes, which no allowlisted
+  command reads. Nothing is replayed when npm's effective `ignore-scripts` is
+  true, because a miss would not have run them.
+- **Miss**: `npm ci` runs exactly as before, then the result is copied into
+  the store and published with an atomic rename. Two runs missing on the same
+  key at once both install; one publish wins and the other is discarded. The
+  tree is NOT published when
+  - the install changed a file outside `node_modules` (a hit would skip
+    whatever wrote it). The only exception is the one `.git/config` line the
+    allowlisted script writes (`hooksPath = .githooks`); a new hook file or
+    any other `.git` write is not cached;
+  - npm's own record (`node_modules/.package-lock.json`) lacks a lock entry
+    that applies to this platform (`os`, `cpu`, `libc`), as when npm skips an
+    optional dependency: `reason=incomplete-optional missing=<names>`;
+  - any installed file or symlink target contains the absolute work-dir path
+    (every file is scanned, large ones in chunks): the tree would only work
+    where it was installed. `reason=absolute-install-path file=<rel>`.
+
+  The run still uses its own tree in every case, and the log says why.
+- **Leases and eviction**: least recently used first, whenever a publish or a
+  lease release leaves the store over `remoteDepsCacheMaxBytes` (runner
+  global config, default 10 GiB). A run holds a lease on its key until its
+  pipeline ends; taking and dropping a lease, and choosing and quarantining
+  eviction victims, each happen under the broker lock, so a lease either
+  protects its key or finds it already gone (a miss). An unreadable lease
+  counts as live; one left by a dead process is ignored.
+- **Config** (runner machine's global config): `remoteDepsCache` (default
+  `true`) and `remoteDepsCacheMaxBytes`. A lane's `remoteDepsCache: false`
+  opts that lane out.
+- **Observability**: the run logs `deps-cache hit|miss key=<12 hex> dir=<d>
+  ms=<n>` (`skip` when caching is off or refused, with a reason), and the
+  result and history row carry `depsCache` (`hit`, `miss` or `skip`) and
+  `depsMs` for the whole deps phase.
+
+Not covered: native code that links against system libraries beyond glibc,
+the compiler and python versions (a toolchain or library upgrade that keeps
+the same versions); clear `<root>/deps-cache` after a runner OS or toolchain
+change that those do not reflect.
 
 ### Queue timeout
 

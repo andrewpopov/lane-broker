@@ -460,6 +460,8 @@ export async function runCommand({
       // this process resolved, not a re-derived value.
       remoteDeps: resolved.remoteDeps,
       remoteSetup: resolved.remoteSetup,
+      remoteDepsCache: resolved.remoteDepsCache,
+      remoteDepsCacheRootScriptsSafe: resolved.remoteDepsCacheRootScriptsSafe,
     };
   }
 

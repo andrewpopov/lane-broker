@@ -47,9 +47,12 @@ function migratedRoot() {
 const OLD_CODE_TAG = 'v0.17.0';
 function extractOldCode() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-broker-old-'));
-  const archive = spawnSync('git', ['-C', REPO, 'archive', OLD_CODE_TAG], { maxBuffer: 256 * 1024 * 1024 });
+  // Archive to a file, then extract it: piping the archive into tar's stdin hit EPIPE under heavy host load.
+  const tarball = path.join(dir, 'old.tar');
+  const archive = spawnSync('git', ['-C', REPO, 'archive', '-o', tarball, OLD_CODE_TAG]);
   assert.equal(archive.status, 0, `git archive ${OLD_CODE_TAG} failed (is the tag fetched locally? run: git fetch --tags): ${archive.stderr}`);
-  execFileSync('tar', ['-x', '-C', dir], { input: archive.stdout });
+  execFileSync('tar', ['-x', '-f', tarball, '-C', dir]);
+  fs.rmSync(tarball);
   assert.ok(fs.existsSync(path.join(dir, 'bin', 'lane.js')), `${OLD_CODE_TAG} has bin/lane.js`);
   return dir;
 }

@@ -157,6 +157,13 @@ function validateHeaderFields(header) {
   } else if (header.remoteSetup !== undefined && !isValidRemoteSetupShape(header.remoteSetup)) {
     return { ok: false, reason: 'invalid remoteSetup' };
   }
+  // BRAIN-389: the lane's opt-out of the deps cache; only `false` is ever sent, and only with protocol 2 (deps).
+  if (header.remoteDepsCache !== undefined && (header.protocol !== 2 || header.remoteDepsCache !== false)) {
+    return { ok: false, reason: 'invalid remoteDepsCache' };
+  }
+  if (header.remoteDepsCacheRootScriptsSafe !== undefined && (header.protocol !== 2 || header.remoteDepsCacheRootScriptsSafe !== true)) {
+    return { ok: false, reason: 'invalid remoteDepsCacheRootScriptsSafe' };
+  }
   // BRAIN-320 S1d: opt-in on both protocols -- an old runner simply ignores
   // an unknown field, which is fine (the feature is opt-in), but THIS
   // runner, once it understands the field at all, validates it the same way
@@ -181,6 +188,11 @@ function readPhase(ticketDir) {
   }
 }
 
+/** BRAIN-389: the pipeline's own record of its deps phase (`deps.json`), relayed in the result; absent when there was none. */
+function readDeps(ticketDir) {
+  return readJsonSafe(path.join(ticketDir, 'deps.json')) ?? undefined;
+}
+
 function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, runMs, grantedCpuCores, observedCpu, observedRssPeakBytes }) {
   const isProtocol2 = header.protocol === 2;
   return {
@@ -197,6 +209,8 @@ function buildResult(header, ticketDir, { kind, exit = null, signal = null, remo
     // drops an `undefined` value, so the shape stays byte-identical to before
     // this slice (I6).
     phase: isProtocol2 ? readPhase(ticketDir) : undefined,
+    // BRAIN-389: additive; an older client ignores it
+    deps: isProtocol2 ? readDeps(ticketDir) : undefined,
     finishedAt: Date.now(),
     // BRAIN-341: a duration on the runner's own clock (never an absolute
     // time, so clock skew cannot matter). Omitted when unknown or for an
@@ -414,6 +428,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   let pipelineCmd = header.argv;
   if (header.protocol === 2) {
     const remoteRootAbs = path.resolve(root);
+    const runnerCfg = loadGlobalConfig();
     atomicWriteJson(path.join(ticketDir, 'pipeline.json'), {
       workDir,
       relCwd: header.relCwd || '',
@@ -422,6 +437,13 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
       argv: header.argv,
       npmCacheDir: path.join(remoteRootAbs, 'npm-cache'),
       npmUserConfig: path.join(remoteRootAbs, 'npmrc'),
+      // BRAIN-389: the runner's own config decides whether and how far to cache; the lane can only opt out.
+      depsCache: {
+        enabled: header.remoteDepsCache !== false && runnerCfg.remoteDepsCache,
+        rootScriptsSafe: header.remoteDepsCacheRootScriptsSafe === true,
+        root: path.join(remoteRootAbs, 'deps-cache'),
+        maxBytes: runnerCfg.remoteDepsCacheMaxBytes,
+      },
     });
     pipelineCmd = [process.execPath, laneBinPath, 'remote-pipeline', ticketDir];
   }

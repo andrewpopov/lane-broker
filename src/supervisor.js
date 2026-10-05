@@ -340,6 +340,13 @@ function relayedUsage(result) {
   return { ...(observedCpu ? { observedCpu } : {}), ...(rssPeak !== undefined ? { observedRssPeakBytes: rssPeak } : {}) };
 }
 
+/** BRAIN-389: the runner's deps-phase outcome (hit|miss|skip) and wall time, each kept only when well-formed. */
+function relayedDeps(result) {
+  const deps = result?.deps;
+  if (!deps || !['hit', 'miss', 'skip'].includes(deps.outcome)) return {};
+  return { depsCache: deps.outcome, ...(Number.isFinite(deps.ms) && deps.ms >= 0 ? { depsMs: deps.ms } : {}) };
+}
+
 /** The exact "requested resources exceed this environment's budget" (checkResourceBudget) or
  *  "this lane is refused for local runs by default" (localSimRefusal) result shape run.js
  *  applies at preflight, re-applied here once a remote-eligible ticket has fallen back to
@@ -628,6 +635,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
       ...(queuedAt ? { queuedAt } : {}),
       ...(Number.isFinite(dispatch.result.grantedCpuCores) ? { grantedCpuCores: dispatch.result.grantedCpuCores } : {}),
       ...relayedUsage(dispatch.result),
+      ...relayedDeps(dispatch.result),
       remoteKind: dispatch.result.kind,
       remotePhase: dispatch.phase ?? null,
       startedAt: remoteWaitedMs === null ? attemptStartedAt : enriched.createdAt + remoteWaitedMs,
