@@ -141,8 +141,8 @@ async function describeLaneState(root, id, resultPath) {
   }
 }
 
-function refuseForMigration() {
-  process.stderr.write('lane run: scheduler migration in progress; try again once `lane migrate-scheduler` has finished\n');
+function refuseForMigration(err) {
+  process.stderr.write(`lane run: ${err.message}; try again once \`lane migrate-scheduler\` has finished\n`);
   return { exitCode: 75 };
 }
 
@@ -351,13 +351,13 @@ export async function runCommand({
   try {
     prioOriginAt = await stampPriorityOrigin(root);
   } catch (err) {
-    if (err instanceof MigrationInProgressError) return refuseForMigration();
+    if (err instanceof MigrationInProgressError) return refuseForMigration(err);
     if (!(err instanceof LockTimeoutError)) throw err;
     // The migrator holds the lock for its whole run, so contention is the likely moment to see its marker; it can be read without the lock.
     try {
       assertNotMigrating(root);
     } catch (migrating) {
-      if (migrating instanceof MigrationInProgressError) return refuseForMigration();
+      if (migrating instanceof MigrationInProgressError) return refuseForMigration(migrating);
       throw migrating;
     }
   }

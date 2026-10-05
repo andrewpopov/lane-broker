@@ -3,6 +3,9 @@ import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { isPidAlive, processStartTime, isProcessAlive } from './process-liveness.js';
+
+export { isPidAlive, processStartTime };
 
 export function stateHome() {
   return process.env.LANE_BROKER_STATE || path.join(os.homedir(), '.cache', 'lane-broker');
@@ -78,6 +81,10 @@ export function paths(root = stateHome()) {
     hwm: path.join(root, 'priority-hwm.json'),
     // BRAIN-380 slice 3: present only while `lane migrate-scheduler` runs; every new-code admission entry point refuses on it.
     migrating: path.join(root, 'migrating'),
+    // BRAIN-380 slice 4: present only while `lane migrate-scheduler --when-idle` waits for the broker to go quiet. Every
+    // NEW intake entry point refuses on it (like `migrating`); already-queued tickets keep being admitted. Holds
+    // `{pid, startTime, startedAt}` of the waiting command, so a SIGKILLed one is recognisably stale.
+    draining: path.join(root, 'draining'),
     // BRAIN-380 slice 3: a queue record without `schedVersion` found behind the fence is moved here and never selected.
     queueQuarantine: path.join(root, 'queue-quarantine'),
     // BRAIN-319 T3b-2 (C3): one durable attempt record per remote-eligible
@@ -179,18 +186,121 @@ export function atomicWriteJson(file, obj, opts) {
   atomicWriteFile(file, `${JSON.stringify(obj, null, 2)}\n`, opts);
 }
 
+export const DRAINING_MESSAGE = 'scheduler migration pending (draining)';
+
 /** Thrown by `assertNotMigrating`; callers map it to exit 75 ("try again later", the same convention as a lock timeout). */
 export class MigrationInProgressError extends Error {
-  constructor() {
-    super('scheduler migration in progress');
+  constructor(message = 'scheduler migration in progress') {
+    super(message);
     this.name = 'MigrationInProgressError';
     this.code = 'LANE_MIGRATION_IN_PROGRESS';
   }
 }
 
-/** The one guard every new-code admission entry point calls. Existence-only: the marker's contents are the migrator's own business. */
+/** What `lane migrate-scheduler --when-idle` writes into PAUSE when IT pauses the broker (see `pausedByDrain`). Includes the owner's pid, so no other pause can carry it by accident. */
+export const drainPauseReason = (pid) => `paused for scheduler migration (lane migrate-scheduler --when-idle, pid ${pid})`;
+
+/**
+ * The drain marker, or null when there is none. `state` is:
+ *  - `live`: the `lane migrate-scheduler --when-idle` that wrote it is running (pid alive AND the same start time, which
+ *    defeats pid reuse; see `isProcessAlive`);
+ *  - `stale`: it parsed, and its owner is confirmed gone;
+ *  - `unknown`: the file cannot be read, parsed or understood. Fails closed: intake refuses, and nothing deletes it until
+ *    it can be judged (`drainBlocksIntake`, `clearStaleDrainMarker`). An operator clears one by hand: see the README.
+ * `pausedByDrain` is true when that drain, not an operator, paused the broker (so recovery may resume it).
+ */
+export function readDrainMarker(root) {
+  const file = paths(root).draining;
+  let raw;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    return { state: 'unknown', pid: null, startedAt: null, startTime: null, pausedByDrain: false };
+  }
+  let marker;
+  try {
+    marker = JSON.parse(raw);
+  } catch {
+    marker = null;
+  }
+  if (marker === null || typeof marker !== 'object' || !Number.isInteger(marker.pid)) {
+    return { state: 'unknown', pid: null, startedAt: null, startTime: null, pausedByDrain: false };
+  }
+  return {
+    state: isProcessAlive(marker.pid, marker.startTime) ? 'live' : 'stale',
+    pid: marker.pid,
+    startedAt: marker.startedAt ?? null,
+    startTime: marker.startTime ?? null,
+    pausedByDrain: marker.pausedByDrain === true,
+  };
+}
+
+/** Does this marker refuse new intake? Everything but a confirmed-dead owner does. */
+export const drainBlocksIntake = (marker) => marker !== null && marker.state !== 'stale';
+
+/**
+ * Release the pause a drain made, if it still owns it: the marker says the drain paused the broker AND PAUSE still holds
+ * that drain's own reason. A pause someone else set (or re-set) is never touched. Caller holds the broker lock.
+ */
+export function releaseDrainPause(root, marker) {
+  const file = paths(root).pause;
+  if (!marker.pausedByDrain || marker.pid === null) return false;
+  let reason;
+  try {
+    reason = fs.readFileSync(file, 'utf8');
+  } catch {
+    return false;
+  }
+  if (reason !== drainPauseReason(marker.pid)) return false;
+  fs.rmSync(file, { force: true });
+  fsyncDirectory(root);
+  return true;
+}
+
+/**
+ * Clean up after a SIGKILLed drain: resume the broker if that drain paused it (`releaseDrainPause`), then remove its
+ * marker. Only a marker that parsed AND whose owner is confirmed dead is touched; an `unknown` one stays. Caller holds
+ * the broker lock: an unlocked remove could delete a marker a new drain just wrote. Returns whether one was removed.
+ */
+export function clearStaleDrainMarker(root) {
+  const marker = readDrainMarker(root);
+  if (marker?.state !== 'stale') return false;
+  releaseDrainPause(root, marker);
+  fs.rmSync(paths(root).draining, { force: true });
+  fsyncDirectory(root);
+  return true;
+}
+
+/**
+ * Test seam (precedent: LANE_BROKER_TEST_PAUSE_AFTER_TICKET_ID): `LANE_BROKER_TEST_DRAIN_AT=<point>` starts a drain, owned by
+ * the live pid in `LANE_BROKER_TEST_DRAIN_PID`, the moment a caller reaches `<point>`, so a test can land the drain
+ * exactly in the window between an intake check and the write it guards. A no-op unless the variable is set.
+ */
+export function testDrainAt(root, point) {
+  if (process.env.LANE_BROKER_TEST_DRAIN_AT !== point) return;
+  const pid = Number(process.env.LANE_BROKER_TEST_DRAIN_PID);
+  atomicWriteJson(paths(root).draining, { pid, startTime: processStartTime(pid) ?? null, startedAt: Date.now() });
+}
+
+/**
+ * Test seam: `LANE_BROKER_TEST_HOLD_AT=<point>` makes a caller reaching `<point>` write `LANE_BROKER_TEST_HOLD_READY` and wait
+ * for `LANE_BROKER_TEST_HOLD_GO` to exist, so a test can act at an exact point of a multi-step intake. A no-op unless set.
+ */
+export async function testHoldAt(point) {
+  if (process.env.LANE_BROKER_TEST_HOLD_AT !== point) return;
+  fs.writeFileSync(process.env.LANE_BROKER_TEST_HOLD_READY, 'x');
+  while (!fs.existsSync(process.env.LANE_BROKER_TEST_HOLD_GO)) await sleep(20);
+}
+
+/**
+ * The one guard every new-code intake entry point calls. Existence-only for `migrating` (the migrator's own business);
+ * a drain marker refuses while its owner is alive or it cannot be judged, so a SIGKILLed `--when-idle` cannot block
+ * intake for ever (a stale marker is ignored) but a half-written or damaged one never lets intake through.
+ */
 export function assertNotMigrating(root) {
   if (fs.existsSync(paths(root).migrating)) throw new MigrationInProgressError();
+  if (drainBlocksIntake(readDrainMarker(root))) throw new MigrationInProgressError(DRAINING_MESSAGE);
 }
 
 /** An unreadable record found by a strict listing; `file` names it. */
@@ -284,40 +394,6 @@ export function appendHistory(root, record) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-export function isPidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Process start time, used to defeat PID reuse. Returns:
- *  - a string (the `ps` start-time line) if the process is alive,
- *  - `null` if `ps` ran and confirmed the pid does not exist,
- *  - `undefined` if the probe itself failed (e.g. cannot fork under load) —
- *    callers must treat this as "could not determine", never as "gone".
- * Pinned to the C locale so the output format is stable across environments.
- */
-export function processStartTime(pid) {
-  try {
-    const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
-      encoding: 'utf8',
-      env: { ...process.env, LC_ALL: 'C', LC_TIME: 'C' },
-    }).trim();
-    return out || null;
-  } catch (err) {
-    // `ps` ran and exited non-zero (pid not found) -> confirmed gone. A
-    // spawn-level failure (EAGAIN under load, ENOENT, EPERM, ...) commonly
-    // carries `status: null` too, so only a numeric status counts as "ran".
-    if (typeof err.status === 'number') return null;
-    // execFileSync itself failed to run `ps` -> indeterminate.
-    return undefined;
-  }
 }
 
 /** Is the owner of the lock alive? Fails closed: an indeterminate probe never counts as stale. */

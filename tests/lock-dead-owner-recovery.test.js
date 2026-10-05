@@ -169,6 +169,7 @@ test('MUTATION: the pre-fix blind rmSync reintroduces overlap on the same dead-o
   const mutantDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'lane-broker-mutant-state-'));
   const mutantPath = path.join(mutantDir, 'state.js');
   fs.writeFileSync(mutantPath, mutated);
+  fs.copyFileSync(fileURLToPath(new URL('../src/process-liveness.js', import.meta.url)), path.join(mutantDir, 'process-liveness.js')); // state.js imports it
   const stateJsUrl = pathToFileURL(mutantPath).href;
 
   const env = freshEnv();

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, assertNotMigrating, listJsonRecordsStrict } from './state.js';
-import { isPidAlive, processStartTime } from './lease.js';
+import { isProcessAlive, processStartTime } from './process-liveness.js';
 
 /**
  * BRAIN-319 (.review-plan.md v3 C3/C4/C5): one durable ATTEMPT record per
@@ -73,12 +73,7 @@ export function supervisorAlive(attempt) {
   const sup = attempt && attempt.supervisor;
   if (!sup) return false;
   if (sup.bootId !== bootId()) return false;
-  if (!isPidAlive(sup.pid)) return false;
-  if (!sup.startTime) return true; // no start time captured at write time: fall back to pid-alive
-  const current = processStartTime(sup.pid);
-  if (current === undefined) return true; // probe failed: fail closed, keep believing alive
-  if (current === null) return false; // confirmed gone
-  return current === sup.startTime;
+  return isProcessAlive(sup.pid, sup.startTime);
 }
 
 /**
@@ -131,8 +126,10 @@ export async function createAttempt(root, id, { runner = null } = {}) {
 /** Apply `patch` to the stored record, but only if its generation is still
  *  exactly `expectedGeneration` -- the fence against a stale writer acting
  *  on state that has since moved on (e.g. already fell back to local). */
-export async function updateAttempt(root, id, expectedGeneration, patch) {
+export async function updateAttempt(root, id, expectedGeneration, patch, { refuseWhileMigrating = false } = {}) {
   return withLock(root, () => {
+    // BRAIN-380: the intake check and the write are one locked step, so a migration cannot start between them.
+    if (refuseWhileMigrating) assertNotMigrating(root);
     const current = readAttempt(root, id);
     if (!current || current.generation !== expectedGeneration) {
       return { ok: false };

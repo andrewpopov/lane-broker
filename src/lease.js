@@ -1,6 +1,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
-import { paths, atomicWriteJson, readJsonSafe, bootId, isPidAlive, processStartTime, listJsonRecordsStrict } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, bootId, listJsonRecordsStrict } from './state.js';
+import { isPidAlive, processStartTime, isProcessAlive } from './process-liveness.js';
 import { touchSimArmFor } from './sim-arm.js';
 
 export { isPidAlive, processStartTime };
@@ -73,12 +74,7 @@ export function isGroupAlive(pgid) {
  * failure must never look like the supervisor exited.
  */
 export function isSupervisorAlive(lease) {
-  if (!isPidAlive(lease.supervisorPid)) return false;
-  if (!lease.supervisorStart) return true; // couldn't capture a start time at write time; fall back to pid-alive
-  const current = processStartTime(lease.supervisorPid);
-  if (current === undefined) return true; // probe failed: fail closed, keep the lease
-  if (current === null) return false; // confirmed gone
-  return current === lease.supervisorStart;
+  return isProcessAlive(lease.supervisorPid, lease.supervisorStart);
 }
 
 /**

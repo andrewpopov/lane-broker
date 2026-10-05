@@ -39,13 +39,18 @@ function migratedRoot() {
   return f;
 }
 
-/** main's code, extracted read-only into a temp dir: the "old version" a rollout may still have running. */
+/**
+ * The "old version" a rollout may still have running, extracted read-only into a temp dir. Pinned to the tag v0.17.0,
+ * the last release BEFORE the priority scheduler: `origin/main` moves on (it is 0.18.0+, which is new code and is
+ * admitted fine against a migrated root), so it cannot stand for old code. A missing tag fails the test loudly.
+ */
+const OLD_CODE_TAG = 'v0.17.0';
 function extractOldCode() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-broker-old-'));
-  const archive = spawnSync('git', ['-C', REPO, 'archive', 'origin/main'], { maxBuffer: 256 * 1024 * 1024 });
-  assert.equal(archive.status, 0, `git archive origin/main: ${archive.stderr}`);
+  const archive = spawnSync('git', ['-C', REPO, 'archive', OLD_CODE_TAG], { maxBuffer: 256 * 1024 * 1024 });
+  assert.equal(archive.status, 0, `git archive ${OLD_CODE_TAG} failed (is the tag fetched locally? run: git fetch --tags): ${archive.stderr}`);
   execFileSync('tar', ['-x', '-C', dir], { input: archive.stdout });
-  assert.ok(fs.existsSync(path.join(dir, 'bin', 'lane.js')), 'main has bin/lane.js');
+  assert.ok(fs.existsSync(path.join(dir, 'bin', 'lane.js')), `${OLD_CODE_TAG} has bin/lane.js`);
   return dir;
 }
 

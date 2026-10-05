@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, assertNotMigrating, MigrationInProgressError } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, loadGlobalConfig } from './config.js';
 import { remotePriorityFrom, PRIORITY_CAPABILITY } from './priority.js';
@@ -292,18 +292,30 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     return { exitCode: 1 };
   }
 
+  // BRAIN-380: the check at the top ran before a (possibly slow) header read, so a drain may have started since. The check
+  // and the ticket directory (the intake commit point) are ONE locked step: nothing is created after a drain publishes, and a
+  // drain that publishes afterwards finds this live `lane remote-exec` in its process check and waits for it.
+  testDrainAt(stateHome(), 'remote-exec');
   const ticketsDir = path.join(root, 'tickets');
-  fs.mkdirSync(ticketsDir, { recursive: true });
   const ticketDir = path.join(ticketsDir, header.ticketId);
   try {
-    fs.mkdirSync(ticketDir);
+    await withLock(stateHome(), () => {
+      assertNotMigrating(stateHome());
+      fs.mkdirSync(ticketsDir, { recursive: true });
+      fs.mkdirSync(ticketDir);
+    });
   } catch (err) {
+    if (err instanceof MigrationInProgressError) {
+      process.stderr.write(`lane remote-exec: ${err.message}\n`);
+      return { exitCode: 75 };
+    }
     if (err.code === 'EEXIST') {
       process.stderr.write(`lane remote-exec: ticket directory already exists: ${ticketDir}\n`);
       return { exitCode: 1 };
     }
     throw err;
   }
+  await testHoldAt('remote-exec-committed');
   // Node's default for SIGHUP is to exit, but this process must outlive a dropped ssh session
   // to publish result.json; explicit cancellation goes through remote-cancel.
   process.on('SIGHUP', () => {});
@@ -550,13 +562,17 @@ export async function remoteProbeCommand() {
   // CPU/memory budgets are only enforced in active mode (checkResourceBudget);
   // in shadow mode they are reported as null so the client never skips on them.
   const enforced = globalCfg.schedulerMode === 'active';
+  const draining = drainBlocksIntake(status.draining);
   const payload = {
     protocol: 1,
     protocols: [1, 2],
     // BRAIN-360: this runner resolves minCpuCores itself, so a submitter may judge fit by the floor
     capabilities: [ELASTIC_CLAIMS_CAPABILITY, PRIORITY_CAPABILITY],
     version: pkg.version,
-    paused: Boolean(status.paused),
+    // BRAIN-380 slice 4: a draining runner takes no new work. `draining` names why; `paused` is also set so a client
+    // built before this field skips the runner the way it skips a paused one.
+    draining,
+    paused: Boolean(status.paused) || draining,
     queued: status.queued.length,
     running: status.running.length,
     // BRAIN-360: additive; the CPU the runner's leases are charged (grants, not declarations)
