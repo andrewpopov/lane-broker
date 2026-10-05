@@ -368,10 +368,34 @@ test('disabling the limit RELEASES the reservation latch, and re-enabling it req
     assert.equal(viewOf(state, activeCfg()).ownerId, 'owner');
     fs.writeFileSync(paths(state).pause, 'test');
     await poll(state, ticket('high', { priorityRequested: 'high' }), activeCfg({ resourceSkipLimit: 0 }));
-    const released = readFairness(state).owner.resource;
-    assert.equal(released.reserved, false, 'the latch is deleted from the store, not merely ignored');
-    assert.equal(released.reservationSeq, undefined);
+    assert.equal(readFairness(state).owner.resource, undefined, 'the latch AND the counter are deleted from the store, not merely ignored');
     assert.equal(viewOf(state, activeCfg()).ownerId, null, 'turning the limit back on does not resurrect it');
+  });
+});
+
+test('after a release, re-enabling the limit lets the ticket earn a reservation again through the normal path', async () => {
+  await withClock(async () => {
+    const cfg = activeCfg();
+    const { state } = fenced(cfg);
+    const head = ticket('head', { weight: 4 });
+    await enqueue(state, head);
+    const earn = async (prefix) => {
+      await poll(state, head, cfg);
+      for (let i = 0; i < 3; i += 1) {
+        const small = ticket(`${prefix}${i}`);
+        await enqueue(state, small);
+        assert.equal((await poll(state, small, cfg)).started, true, `${prefix}${i}`);
+        removeLease(state, small.id);
+      }
+      return readFairness(state).head.resource;
+    };
+    const first = await earn('a');
+    assert.equal(first.reserved, true);
+    await poll(state, head, activeCfg({ resourceSkipLimit: 0 })); // disabled: released
+    assert.equal(readFairness(state).head.resource, undefined);
+    const second = await earn('b'); // re-enabled: counter and latch start over, and are earned the ordinary way
+    assert.equal(second.reserved, true, 'earned again');
+    assert.ok(second.reservationSeq > first.reservationSeq, 'a fresh seq, drawn at the new latch');
   });
 });
 

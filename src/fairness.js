@@ -221,14 +221,15 @@ export function fairnessStore(root, tickets) {
         // best-effort
       }
     },
-    /** The reservation limit is off: every latch is released, so re-enabling it makes a ticket earn one again. */
+    /** The reservation limit is off: each latched ticket's whole resource record (counter and latch) is dropped, so re-enabling
+     *  it makes the ticket earn its allowance and then a reservation from scratch. */
     releaseReservations: () => {
       const held = Object.entries(tickets).filter(([, perReason]) => perReason.resource?.reserved === true);
       if (held.length === 0) return;
       const next = { ...tickets };
       for (const [id, perReason] of held) {
-        const { reservationSeq: _seq, ...resource } = perReason.resource;
-        next[id] = { ...perReason, resource: { ...resource, reserved: false } };
+        const { resource: _released, ...others } = perReason;
+        next[id] = others;
       }
       try {
         persist(next);

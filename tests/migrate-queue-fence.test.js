@@ -10,7 +10,6 @@ import { enqueue, tryStart, listQueue, LegacyQueueAfterFenceError } from '../src
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { migrateScheduler, runsLaneBroker, fenceLegacyQueue } from '../src/migrate.js';
 import { readSchedulerFence } from '../src/fairness.js';
-import { runCommand } from '../src/run.js';
 import { withLock, paths, atomicWriteFile, atomicWriteJson, queueFenced, MigrationInProgressError, QUEUE_FENCE_NOTE } from '../src/state.js';
 import { readHwm, effectiveNow } from '../src/priority-clock.js';
 import { waitedMs } from '../src/priority.js';
@@ -186,6 +185,63 @@ test('a crash between the queue fence and the scheduler fence is completed by a 
   assert.equal(readSchedulerFence(state).status, 'valid');
 });
 
+// ---- a symlinked queue ----
+
+test('a symlinked queue/ is the legacy queue for new code too, and the migration refuses it', async () => {
+  const { state } = migratedRoot();
+  const elsewhere = path.join(path.dirname(state), 'elsewhere-queue');
+  fs.mkdirSync(elsewhere);
+  fs.symlinkSync(elsewhere, path.join(state, 'queue'));
+  assert.equal(queueFenced(state), false, 'only a regular file with the note is the fence');
+  assert.equal(paths(state).queue, path.join(state, 'queue'), 'new code uses the same directory old code follows');
+  await enqueue(state, ticket('a'));
+  assert.equal(fs.readdirSync(elsewhere).length, 1, 'through the link, as old code would');
+  fs.rmSync(path.join(elsewhere, fs.readdirSync(elsewhere)[0]));
+  const result = await migrate(state);
+  assert.equal(result.status, 'refused');
+  assert.match(result.checks.flatMap((c) => c.failures).join('\n'), /queue\/ is a symlink/);
+  assert.equal(readSchedulerFence(state).status, 'missing');
+  assert.ok(fs.lstatSync(path.join(state, 'queue')).isSymbolicLink(), 'nothing was moved');
+});
+
+test('a regular file named queue that is not the exact fence note is not the fence, and the migration refuses it', async () => {
+  const { state } = migratedRoot();
+  fs.writeFileSync(path.join(state, 'queue'), 'something else');
+  assert.equal(queueFenced(state), false);
+  const result = await migrate(state);
+  assert.equal(result.status, 'refused');
+  assert.match(result.checks.flatMap((c) => c.failures).join('\n'), /not the scheduler fence/);
+});
+
+// ---- the window between the two renames ----
+
+test('a crash between the fence\'s two renames: old code recreates queue/ and enqueues, a re-run REFUSES, then completes once drained', async () => {
+  const { state, env } = migratedRoot();
+  fs.mkdirSync(path.join(state, 'queue')); // a real root has the legacy directory
+  const script = `
+    import { migrateScheduler } from ${JSON.stringify(path.join(SRC, 'migrate.js'))};
+    await migrateScheduler(process.env.LANE_BROKER_STATE, { readProcesses: () => [], afterQueueRename: () => process.kill(process.pid, 'SIGKILL') });
+  `;
+  const crashed = spawnSync(process.execPath, ['--input-type=module', '-e', script], { env });
+  assert.equal(crashed.signal, 'SIGKILL');
+  assert.equal(fs.existsSync(path.join(state, 'queue')), false, 'the legacy directory is moved and the fence is not yet in place');
+  assert.ok(fs.readFileSync(path.join(state, 'queue.fence.tmp'), 'utf8').startsWith('lane-broker scheduler migrated'), 'the fence was durable before the move');
+  assert.equal(readSchedulerFence(state).status, 'missing');
+  // old code, paused broker: ensureStateDirs recreates queue/ and its supervisor enqueues
+  fs.mkdirSync(path.join(state, 'queue'));
+  fs.writeFileSync(path.join(state, 'queue', '000000000001-old.json'), JSON.stringify(ticket('old')));
+  fs.rmSync(paths(state).migrating, { force: true }); // the dead migrator's marker is taken over either way
+  const refused = await migrate(state);
+  assert.equal(refused.status, 'refused');
+  assert.match(refused.checks.flatMap((c) => c.failures).join('\n'), /queue is not empty: 1 queued ticket\(s\): old/);
+  assert.equal(readSchedulerFence(state).status, 'missing');
+  fs.rmSync(path.join(state, 'queue', '000000000001-old.json')); // drained
+  assert.equal((await migrate(state)).status, 'migrated');
+  assert.equal(queueFenced(state), true);
+  assert.equal(fs.existsSync(path.join(state, 'queue.fence.tmp')), false);
+  assert.equal(fs.readdirSync(state).filter((n) => n.startsWith('queue.legacy-')).length, 2, 'both legacy directories are kept');
+});
+
 // ---- fence and a non-empty legacy directory ----
 
 test('a valid fence over a non-empty legacy queue/ directory refuses admission with a clear error', async () => {
@@ -226,9 +282,10 @@ test('a lock timeout while stamping the origin leaves it null, so enqueue gives 
   // Ticket creation runs in its own process (runCommand prints to stdout, which a node:test file process must not swallow),
   // with a supervisor stub that hands back the ticket it would have been spawned with.
   const script = `
-        import { runCommand } from ${JSON.stringify(path.join(SRC, 'run.js'))};
+    import { EventEmitter } from 'node:events';
+    import { runCommand } from ${JSON.stringify(path.join(SRC, 'run.js'))};
     let ticket;
-    await runCommand({
+    const outcome = await runCommand({
       lane: 'default', cmd: ['true'], cwd: ${JSON.stringify(repoDir)}, detach: true,
       spawnSupervisor: (_exe, _args, opts) => {
         ticket = JSON.parse(Buffer.from(opts.env.LANE_BROKER_TICKET, 'base64').toString('utf8'));
@@ -238,15 +295,16 @@ test('a lock timeout while stamping the origin leaves it null, so enqueue gives 
         return fake;
       },
     });
-    process.stderr.write(JSON.stringify(ticket));
+    process.stderr.write(JSON.stringify({ exitCode: outcome.exitCode, ticket }));
   `;
   const holder = withLock(state, () => sleep(1500));
   await sleep(100);
   const created = spawnSync(process.execPath, ['--input-type=module', '-e', script], { env: { ...env, LANE_BROKER_TEST_LOCK_TIMEOUT_MS: '200' }, encoding: 'utf8' });
   await holder;
   assert.equal(created.status, 0, created.stderr);
-  const ticketJson = created.stderr.slice(created.stderr.indexOf('{"id"'));
-  const made = JSON.parse(ticketJson);
+  const { exitCode, ticket: made } = JSON.parse(created.stderr.slice(created.stderr.lastIndexOf('{"exitCode"')));
+  assert.equal(exitCode, 0, `runCommand succeeded (a supervisor start failure returns 1): ${created.stderr}`);
+  assert.equal(created.stdout.trim(), made.id, 'the detached run printed the id of the ticket it created');
   assert.equal(made.prioOriginAt, null, 'no unlocked read of the clock');
   const record = await enqueue(state, { ...made, supervisorPid: process.pid });
   assert.equal(record.prioOriginAt, readHwm(state), 'enqueue assigned nowEff under the lock (the mark, mid-rollback)');

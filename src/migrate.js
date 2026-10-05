@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { paths, stateHome, withLock, atomicWriteJson, atomicWriteFile, fsyncDirectory, readJsonSafe, isPidAlive, UnreadableRecordError, QUEUE_FENCE_NOTE } from './state.js';
+import { paths, stateHome, withLock, atomicWriteJson, atomicWriteFile, fsyncDirectory, queueFenced, readJsonSafe, isPidAlive, UnreadableRecordError, QUEUE_FENCE_NOTE } from './state.js';
 import { listLeasesStrict, LEASE_STATE } from './lease.js';
 import { listAttemptsStrict } from './attempts.js';
 import { listQueueStrict } from './scheduler.js';
@@ -82,6 +82,10 @@ function checkPreconditions(root, { readProcesses, pid }) {
   };
 
   check('paused', () => (fs.existsSync(p.pause) ? [] : ['the broker is not paused; run `lane pause` first']));
+  check('queue layout', () => {
+    const type = queueEntryType(root);
+    return ['directory', 'absent', 'fence'].includes(type) ? [] : [`queue/ is ${type}; old and new code would not agree on the queue. Fix it by hand before migrating`];
+  });
   check('queue', () => {
     const queued = listQueueStrict(root);
     return queued.length === 0 ? [] : [`queue is not empty: ${queued.length} queued ticket(s): ${queued.map((t) => t.id ?? '(no id)').join(', ')}`];
@@ -120,21 +124,42 @@ function liveMigrator(root, pid) {
  * starts only a ticket it finds in the queue). New code keeps its queue in `queue-v2/` (`paths().queue`). `seq` stays
  * shared. Idempotent: a `queue` that is already the file means an earlier run got this far.
  */
-export function fenceLegacyQueue(root, stamp) {
+export function fenceLegacyQueue(root, stamp, { afterRename = () => {} } = {}) {
   const legacy = path.join(root, 'queue');
-  let isDirectory = false;
-  try {
-    isDirectory = fs.lstatSync(legacy).isDirectory();
-  } catch (err) {
-    if (err.code !== 'ENOENT') throw err;
-  }
-  fs.mkdirSync(path.join(root, 'queue-v2'), { recursive: true });
-  if (isDirectory) {
-    fs.renameSync(legacy, `${legacy}.legacy-${stamp}`);
+  const pending = path.join(root, 'queue.fence.tmp');
+  const type = queueEntryType(root);
+  if (type === 'fence') {
     fsyncDirectory(root);
+    return; // an earlier run got this far
   }
-  if (isDirectory || !fs.existsSync(legacy)) atomicWriteFile(legacy, QUEUE_FENCE_NOTE, { fsync: true });
+  if (type !== 'directory' && type !== 'absent') throw new Error(`queue is ${type}, not a directory`);
+  fs.mkdirSync(path.join(root, 'queue-v2'), { recursive: true });
+  // The fence file is made durable BEFORE the directory moves, so the window with neither is two renames wide.
+  atomicWriteFile(pending, QUEUE_FENCE_NOTE, { fsync: true });
+  if (type === 'directory') {
+    let aside = `${legacy}.legacy-${stamp}`;
+    for (let n = 2; fs.existsSync(aside); n += 1) aside = `${legacy}.legacy-${stamp}-${n}`;
+    fs.renameSync(legacy, aside);
+    afterRename();
+  }
+  fs.renameSync(pending, legacy);
   fsyncDirectory(root);
+}
+
+/** `queue` as the cutover finds it: `directory` (legacy), `absent`, `fence` (ours), or a description of what else is there. */
+function queueEntryType(root) {
+  const entry = path.join(root, 'queue');
+  let st;
+  try {
+    st = fs.lstatSync(entry);
+  } catch (err) {
+    if (err.code === 'ENOENT') return 'absent';
+    throw err;
+  }
+  if (st.isDirectory()) return 'directory';
+  if (st.isSymbolicLink()) return 'a symlink';
+  if (st.isFile()) return queueFenced(root) ? 'fence' : 'a file that is not the scheduler fence';
+  return 'neither a directory nor a regular file';
 }
 
 /** Remove the `migrating` marker durably. */
@@ -157,9 +182,9 @@ function archiveSingletons(root, stamp) {
 /**
  * Core of the command. Resolves `{status, checks}` where status is `already-migrated`, `fairness-invalid` (a valid
  * fence over an invalid fairness file: the broker is running legacy), `refused`, `ready` (dry run, all preconditions
- * hold) or `migrated`. `afterFairness` (before the queue fence) and `afterFence` are test seams.
+ * hold) or `migrated`. `afterFairness` (before the queue fence), `afterQueueRename` (between the fence's two renames) and `afterFence` are test seams.
  */
-export async function migrateScheduler(root, { dryRun = false, readProcesses = readProcessTable, afterFairness = () => {}, afterFence = () => {}, pid = process.pid, now = Date.now } = {}) {
+export async function migrateScheduler(root, { dryRun = false, readProcesses = readProcessTable, afterFairness = () => {}, afterFence = () => {}, afterQueueRename = () => {}, pid = process.pid, now = Date.now } = {}) {
   const p = paths(root);
   return withLock(root, async () => {
     if (readSchedulerFence(root).status === 'valid') {
@@ -181,7 +206,7 @@ export async function migrateScheduler(root, { dryRun = false, readProcesses = r
       atomicWriteJson(p.fairness, { version: SCHEDULER_V2_VERSION, tickets: {} }, { fsync: true });
       const stamp = new Date(now()).toISOString().replace(/[:.]/g, '-');
       await afterFairness();
-      fenceLegacyQueue(root, stamp);
+      fenceLegacyQueue(root, stamp, { afterRename: afterQueueRename });
       atomicWriteJson(p.schedFence, { version: SCHEDULER_V2_VERSION, migratedAt: now() }, { fsync: true });
       await afterFence();
       const archived = archiveSingletons(root, stamp);

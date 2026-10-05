@@ -12,12 +12,24 @@ export function stateHome() {
  *  queue write underneath it hit ENOTDIR/EEXIST. New code then keeps its queue in `queue-v2/`. */
 export const QUEUE_FENCE_NOTE = 'lane-broker scheduler migrated to v2; upgrade lane-broker\n';
 
-/** Has `lane migrate-scheduler` replaced the legacy `queue/` directory with the fence file? */
+/**
+ * Has `lane migrate-scheduler` replaced the legacy `queue/` directory with the fence file? True ONLY for a regular file
+ * that starts with the exact note. A symlink (even to a directory) or anything else is the legacy `queue/`, because
+ * that is what old code would follow: new code must never be sent to `queue-v2/` while old code uses the same `queue`.
+ */
 export function queueFenced(root) {
+  const file = path.join(root, 'queue');
+  let fd;
   try {
-    return !fs.lstatSync(path.join(root, 'queue')).isDirectory();
+    if (!fs.lstatSync(file).isFile()) return false;
+    fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+    const buf = Buffer.alloc(Buffer.byteLength(QUEUE_FENCE_NOTE));
+    const read = fs.readSync(fd, buf, 0, buf.length, 0);
+    return buf.subarray(0, read).toString('utf8') === QUEUE_FENCE_NOTE;
   } catch {
     return false;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
   }
 }
 
