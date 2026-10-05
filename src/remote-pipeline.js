@@ -1,8 +1,23 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
-import { atomicWriteFile, readJsonSafe } from './state.js';
+import { spawn, execFileSync } from 'node:child_process';
+import { atomicWriteFile, atomicWriteJson, readJsonSafe, withLock, ensureStateDirs } from './state.js';
+import {
+  computeDepsKey,
+  entryTree,
+  materializeFromStore,
+  publishToStore,
+  touchLastUsed,
+  acquireLease,
+  evictLeastRecentlyUsed,
+  purgeTrash,
+  snapshotOutsideNodeModules,
+  snapshotChanges,
+  findInstallPathReference,
+  findWritableStoreFile,
+  quarantineEntry,
+} from './deps-cache.js';
 
 /**
  * BRAIN-320 S1b (1b): `lane remote-pipeline <ticketDir>` is the hidden
@@ -16,6 +31,8 @@ import { atomicWriteFile, readJsonSafe } from './state.js';
  */
 
 const NPM_CONFIG_ENV_RE = /^npm_config_/i;
+
+const DEPS_INSTALL_ARGV = ['npm', 'ci', '--no-audit', '--no-fund'];
 
 function writePhase(ticketDir, phase) {
   atomicWriteFile(path.join(ticketDir, 'phase'), phase);
@@ -90,6 +107,135 @@ async function runPhaseCommand(argv, cwd, env) {
   return r.code ?? 1;
 }
 
+/** BRAIN-389: the one log line per deps dir, on the pipeline's stderr, which flows to the submitter. */
+function logDepsCache(outcome, dir, ms, { key, published, reason, file } = {}) {
+  const fields = [
+    key ? `key=${key.slice(0, 12)}` : null,
+    `dir=${dir}`,
+    `ms=${ms}`,
+    published === undefined ? null : `published=${published ? 'yes' : 'no'}`,
+    reason ? `reason=${/^[\w-]+$/.test(reason) ? reason : JSON.stringify(reason)}` : null,
+    file ? `file=${file}` : null,
+  ].filter(Boolean);
+  process.stderr.write(`deps-cache ${outcome} ${fields.join(' ')}\n`);
+}
+
+/** Hit: build the tree as a hardlink farm from the store. False (with the partial tree removed) means install instead. */
+function materializeHit(depsCache, key, cwd, releaseLeases) {
+  const tree = path.join(cwd, 'node_modules');
+  if (!fs.existsSync(entryTree(depsCache.root, key))) return false;
+  try {
+    const writable = findWritableStoreFile(depsCache.root, key);
+    if (writable) {
+      // something chmod'ed a shared inode: the entry's bytes can no longer be trusted
+      process.stderr.write(`deps-cache corrupt key=${key.slice(0, 12)} writable store file ${writable}; evicting and installing instead\n`);
+      quarantineEntry(depsCache.root, key);
+      return false;
+    }
+    releaseLeases.push(acquireLease(depsCache.root, key));
+    materializeFromStore(depsCache.root, key, tree);
+    touchLastUsed(depsCache.root, key);
+    return true;
+  } catch (err) {
+    process.stderr.write(`deps-cache materialize failed, installing instead: ${err.message}\n`);
+    // A farm's directories are writable and its files are links, so a plain rm never touches the store's inodes.
+    fs.rmSync(tree, { recursive: true, force: true });
+    return false;
+  }
+}
+
+/** Copy the freshly installed tree into the store, then trim the store to its bound under the broker lock. */
+async function publishAndEvict(depsCache, key, cwd, releaseLeases) {
+  const result = publishToStore(depsCache.root, key, path.join(cwd, 'node_modules'));
+  if (!result.published) return result;
+  touchLastUsed(depsCache.root, key);
+  releaseLeases.push(acquireLease(depsCache.root, key));
+  try {
+    await withLock(ensureStateDirs().root, () => evictLeastRecentlyUsed(depsCache.root, depsCache.maxBytes));
+  } catch (err) {
+    process.stderr.write(`deps-cache eviction skipped: ${err.message}\n`);
+  }
+  purgeTrash(depsCache.root);
+  return result;
+}
+
+/** Install one deps dir: from the store on a hit, else `npm ci` (then publish when that is safe). */
+async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases, npmVersion }) {
+  const started = Date.now();
+  const cwd = dir === '.' ? workDir : path.join(workDir, dir);
+  const done = (outcome, fields = {}) => {
+    const ms = Date.now() - started;
+    logDepsCache(outcome, dir, ms, fields);
+    return { dir, outcome, ms, ...(fields.key ? { key: fields.key.slice(0, 12) } : {}), ...(fields.reason ? { reason: fields.reason } : {}), ...(fields.file ? { file: fields.file } : {}) };
+  };
+
+  let keyed = { key: null, reason: 'disabled' };
+  if (depsCache?.enabled) {
+    try {
+      keyed = computeDepsKey({ dir: cwd, rootDir: workDir, installArgv: DEPS_INSTALL_ARGV, env: depsEnv, npmVersion: npmVersion() });
+    } catch (err) {
+      keyed = { key: null, reason: `key not computed: ${err.message}` };
+    }
+  }
+  const { key } = keyed;
+
+  if (key && materializeHit(depsCache, key, cwd, releaseLeases)) return { exitCode: 0, record: done('hit', { key }) };
+
+  const before = key ? snapshotOutsideNodeModules(cwd) : null;
+  const exitCode = await runPhaseCommand(DEPS_INSTALL_ARGV, cwd, depsEnv);
+  if (!key) return { exitCode, record: done('skip', { reason: keyed.reason }) };
+  if (exitCode !== 0) return { exitCode, record: done('miss', { key, published: false, reason: 'install failed' }) };
+
+  const outside = snapshotChanges(before, snapshotOutsideNodeModules(cwd));
+  if (outside.length > 0) {
+    const shown = outside.slice(0, 3).join(', ');
+    return { exitCode, record: done('miss', { key, published: false, reason: `install changed files outside node_modules: ${shown}${outside.length > 3 ? ', ...' : ''}` }) };
+  }
+  if (!fs.existsSync(path.join(cwd, 'node_modules'))) {
+    return { exitCode, record: done('miss', { key, published: false, reason: 'install produced no node_modules' }) };
+  }
+  const installPaths = [...new Set([workDir, fs.realpathSync(workDir)])];
+  const embedded = findInstallPathReference(path.join(cwd, 'node_modules'), installPaths);
+  if (embedded) return { exitCode, record: done('skip', { key, reason: 'absolute-install-path', file: embedded }) };
+  try {
+    const result = await publishAndEvict(depsCache, key, cwd, releaseLeases);
+    return { exitCode, record: done('miss', { key, published: result.published, ...(result.published ? {} : { reason: 'another run published this key first' }) }) };
+  } catch (err) {
+    // the tree is installed and usable for this run whatever happened to the store
+    return { exitCode, record: done('miss', { key, published: false, reason: `publish failed: ${err.message}` }) };
+  }
+}
+
+function aggregateDepsOutcome(records) {
+  if (records.some((r) => r.outcome === 'miss')) return 'miss';
+  return records.length > 0 && records.every((r) => r.outcome === 'hit') ? 'hit' : 'skip';
+}
+
+/**
+ * The deps phase: every dir in order, stopping at the first failed install. Records
+ * `<ticketDir>/deps.json` (outcome, wall ms, per-dir detail) for `remote-exec` to put in the result.
+ */
+async function runDepsPhase({ ticketDir, workDir, remoteDeps, depsEnv, depsCache, releaseLeases }) {
+  const phaseStart = Date.now();
+  let npmVersionMemo;
+  const npmVersion = () => {
+    npmVersionMemo ??= execFileSync('npm', ['--version'], { cwd: workDir, env: depsEnv, encoding: 'utf8' }).trim();
+    return npmVersionMemo;
+  };
+  const records = [];
+  let exitCode = 0;
+  for (const dir of remoteDeps) {
+    const r = await installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases, npmVersion });
+    records.push(r.record);
+    if (r.exitCode !== 0) {
+      exitCode = r.exitCode;
+      break;
+    }
+  }
+  atomicWriteJson(path.join(ticketDir, 'deps.json'), { outcome: aggregateDepsOutcome(records), ms: Date.now() - phaseStart, dirs: records });
+  return exitCode;
+}
+
 /**
  * `lane remote-pipeline <ticketDir>`: read `<ticketDir>/pipeline.json`
  * (written by remote-exec before this process is ever spawned) and run, in
@@ -103,31 +249,34 @@ export async function remotePipelineCommand(ticketDir) {
     process.stderr.write(`lane remote-pipeline: missing or invalid pipeline.json in ${ticketDir}\n`);
     return { exitCode: 1 };
   }
-  const { workDir, relCwd, remoteDeps = [], remoteSetup = [], argv, npmCacheDir, npmUserConfig } = payload;
+  const { workDir, relCwd, remoteDeps = [], remoteSetup = [], argv, npmCacheDir, npmUserConfig, depsCache } = payload;
   const npmGlobalConfig = path.join(path.dirname(npmUserConfig), 'npmrc-global');
   ensureNpmrcFile(npmUserConfig);
   ensureNpmrcFile(npmGlobalConfig);
 
-  if (remoteDeps.length > 0) {
-    writePhase(ticketDir, 'deps');
-    const depsEnv = buildDepsEnv(npmCacheDir, npmUserConfig, npmGlobalConfig);
-    for (const dir of remoteDeps) {
-      const cwd = dir === '.' ? workDir : path.join(workDir, dir);
-      const code = await runPhaseCommand(['npm', 'ci', '--no-audit', '--no-fund'], cwd, depsEnv);
+  // A materialized tree is leased until the whole pipeline ends, so eviction never takes a key a running lane holds.
+  const releaseLeases = [];
+  try {
+    if (remoteDeps.length > 0) {
+      writePhase(ticketDir, 'deps');
+      const depsEnv = buildDepsEnv(npmCacheDir, npmUserConfig, npmGlobalConfig);
+      const code = await runDepsPhase({ ticketDir, workDir, remoteDeps, depsEnv, depsCache, releaseLeases });
       if (code !== 0) return { exitCode: code };
     }
-  }
 
-  if (remoteSetup.length > 0) {
-    writePhase(ticketDir, 'setup');
-    for (const setupArgv of remoteSetup) {
-      const code = await runPhaseCommand(setupArgv, workDir, process.env);
-      if (code !== 0) return { exitCode: code };
+    if (remoteSetup.length > 0) {
+      writePhase(ticketDir, 'setup');
+      for (const setupArgv of remoteSetup) {
+        const code = await runPhaseCommand(setupArgv, workDir, process.env);
+        if (code !== 0) return { exitCode: code };
+      }
     }
-  }
 
-  writePhase(ticketDir, 'command');
-  const cmdCwd = path.join(workDir, relCwd || '');
-  const code = await runPhaseCommand(argv, cmdCwd, process.env);
-  return { exitCode: code };
+    writePhase(ticketDir, 'command');
+    const cmdCwd = path.join(workDir, relCwd || '');
+    const code = await runPhaseCommand(argv, cmdCwd, process.env);
+    return { exitCode: code };
+  } finally {
+    for (const release of releaseLeases) release();
+  }
 }

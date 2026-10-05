@@ -365,8 +365,10 @@ gate usually does) or declares them (below).
 ```
 
 - `remoteDeps`: dirs (relative to the repo root, `.` for the root) whose
-  `package-lock.json` the runner installs from with a fresh
-  `npm ci --no-audit --no-fund` on every run.
+  `package-lock.json` the runner installs from with
+  `npm ci --no-audit --no-fund`, or from the runner's installed-deps cache
+  when it has seen the same lockfile and environment before (below).
+- `remoteDepsCache`: `false` opts this lane out of that cache.
 - `remoteSetup`: argv arrays run in the repo root after deps, before the
   command.
 
@@ -396,6 +398,55 @@ or setup is a final red with that exit code — it is not re-run locally,
 because the local tree's own dependencies could turn it green — and prints
 `lane: remote failed during deps (exit N); this can also be a registry or
 network failure on <runner>`.
+
+### Installed-deps cache (BRAIN-389)
+
+`npm ci` costs 25-45 s on every remote run, which dwarfs a short lane. The
+runner keeps each installed `node_modules` under
+`<root>/deps-cache/<key>/` and a later run with the same key gets that tree
+back instead of installing.
+
+- **Key**, per `remoteDeps` dir: sha256 of the lockfile (`package-lock.json`,
+  or `npm-shrinkwrap.json` when present) and `package.json` bytes, the
+  `.npmrc` of that dir and of the repo root, the node version, platform and
+  arch, the npm version, the exact `npm ci` argv, and every `npm_config_*`
+  value of the deps environment (plus the bytes of the runner's user/global
+  npmrc). Any change is a miss. A dir with no lockfile, or whose lockfile
+  links local packages (workspaces, `file:` dirs, whose content the key does
+  not cover), is never cached.
+- **Hit**: the tree is rebuilt as a hardlink farm. Directories are real and
+  writable; files are hardlinks to read-only store files. A tool that
+  writes a file in place gets `EACCES` instead of silently corrupting the
+  cache; creating files and renaming over them works. A `chmod` on such a
+  file changes the shared store inode, so do not run one in a lane. As a
+  guard, every hit first samples the store's files (the first 200 plus 200
+  at random); if any is writable the entry is treated as corrupt, evicted,
+  and the run installs with `npm ci` instead.
+- **Miss**: `npm ci` runs exactly as before, then the result is copied into
+  the store and published with an atomic rename. Two runs missing on the same
+  key at once both install; one publish wins and the other is discarded. If
+  the install changed any file outside `node_modules` (a postinstall script
+  that generates files, say), that key is not cached, because a hit would
+  skip the script; the run still uses its own tree, and the log says why. The same holds when
+  the installed `node_modules` contains the absolute work-dir path (text
+  files up to 2 MB, symlink targets, `.bin` shims): the tree would only work
+  where it was installed, so it logs `deps-cache skip ...
+  reason=absolute-install-path file=<rel>` and is not published.
+- **Eviction**: least recently used first, whenever a publish leaves the
+  store over `remoteDepsCacheMaxBytes` (runner global config, default
+  10 GiB). It runs under the broker lock and never evicts a key a live run
+  holds a lease on.
+- **Config** (runner machine's global config): `remoteDepsCache` (default
+  `true`) and `remoteDepsCacheMaxBytes`. A lane's `remoteDepsCache: false`
+  opts that lane out.
+- **Observability**: the run logs `deps-cache hit|miss key=<12 hex> dir=<d>
+  ms=<n>` (`skip` when caching is off or impossible, with a reason), and the
+  result and history row carry `depsCache` (`hit`, `miss` or `skip`) and
+  `depsMs` for the whole deps phase.
+
+Not in the key: the runner's system libraries and `PATH`. A lockfile whose
+packages compile native code against them is cached as built; clear
+`<root>/deps-cache` after a runner OS or toolchain upgrade.
 
 ### Queue timeout
 

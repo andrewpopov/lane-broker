@@ -4,6 +4,7 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { isCanonicalRelPath } from './remote-manifest.js';
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
+import { DEFAULT_DEPS_CACHE_MAX_BYTES } from './deps-cache.js';
 
 export const DEFAULT_GLOBAL_CONFIG = {
   version: 1,
@@ -103,6 +104,11 @@ export const DEFAULT_GLOBAL_CONFIG = {
   priorityWeights: { tier: 2, age: 2, fairshare: 0 },
   // At most this many queued high tickets per repo per broker (0 disables high). Enforced in a later slice.
   maxQueuedHighPerRepo: 1,
+  // BRAIN-389: on a remote RUNNER, reuse an installed node_modules tree (keyed by lockfile + environment) instead of
+  // a fresh `npm ci` per run, within this many bytes of store (least recently used evicted). A lane's own
+  // `remoteDepsCache: false` opts that lane out.
+  remoteDepsCache: true,
+  remoteDepsCacheMaxBytes: DEFAULT_DEPS_CACHE_MAX_BYTES,
 };
 
 export const DEFAULT_REPO_CONFIG = {
@@ -222,6 +228,11 @@ function validateGlobalConfig(cfg, sourcePath) {
       `${sourcePath}: "remoteResultWaitMs" must be a positive integer`,
     );
   }
+  assert(typeof cfg.remoteDepsCache === 'boolean', `${sourcePath}: "remoteDepsCache" must be a boolean`);
+  assert(
+    Number.isInteger(cfg.remoteDepsCacheMaxBytes) && cfg.remoteDepsCacheMaxBytes > 0,
+    `${sourcePath}: "remoteDepsCacheMaxBytes" must be a positive integer`,
+  );
   if (cfg.runners !== undefined) validateRunners(cfg.runners, sourcePath);
   validatePriorityConfig(cfg, sourcePath);
 }
@@ -378,6 +389,9 @@ function validateRepoConfig(cfg, sourcePath) {
         isValidRemoteSetupShape(lane.remoteSetup),
         `${sourcePath}: lane "${name}".remoteSetup must be a non-empty array of non-empty arrays of non-empty strings`,
       );
+    }
+    if (lane.remoteDepsCache !== undefined) {
+      assert(typeof lane.remoteDepsCache === 'boolean', `${sourcePath}: lane "${name}".remoteDepsCache must be a boolean`);
     }
   }
   if (cfg.conflicts !== undefined) {
@@ -669,7 +683,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   if (isDeclaredLane) {
     laneCfg = repoConfig.lanes[laneName];
   } else if (undeclaredTemplateName) {
-    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/remote/remoteDeps/remoteSetup/class/priority
+    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/remote/remoteDeps/remoteSetup/remoteDepsCache/class/priority
     // from the named declared lane, keeping this lane's OWN key/name. Not
     // inherited: `localRefused` (stays default false), the template's named
     // conflicts (only the `*` wildcard universe below reaches this lane, same
@@ -685,6 +699,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       remote: templateCfg.remote,
       remoteDeps: templateCfg.remoteDeps,
       remoteSetup: templateCfg.remoteSetup,
+      remoteDepsCache: templateCfg.remoteDepsCache,
       class: templateCfg.class,
       priority: templateCfg.priority,
     };
@@ -736,5 +751,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     // protocol it speaks (1d).
     remoteDeps: Array.isArray(laneCfg.remoteDeps) ? laneCfg.remoteDeps : null,
     remoteSetup: Array.isArray(laneCfg.remoteSetup) ? laneCfg.remoteSetup : null,
+    // BRAIN-389: false opts this lane out of the runner's installed-deps cache; anything else leaves it on.
+    remoteDepsCache: laneCfg.remoteDepsCache !== false,
   };
 }
