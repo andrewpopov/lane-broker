@@ -166,14 +166,77 @@ async function materializeHit(depsCache, key, cwd, releaseLeases) {
 }
 
 /**
- * A hit skips `npm ci`, and with it the allowlisted root scripts whose effect (the work dir's `.git/config`)
- * lives outside the cached tree. Run each of them, in npm's order, through `npm run <event> --ignore-scripts`
- * (which runs exactly that script with npm's lifecycle environment, and no pre/post hooks of its own).
- * The one difference from `npm ci` is `npm_command`, which npm sets to `run-script`.
+ * npm's own answer for the settings that decide whether root scripts run and under which shell, in the install's
+ * env and cwd (so `.npmrc`, env and flags are resolved exactly as `npm ci` will): `npm config get ignore-scripts script-shell`.
  */
-async function replayRootScripts(cwd, scripts, depsEnv) {
-  for (const event of allowlistedRootEvents(scripts)) {
-    const code = await runPhaseCommand(['npm', 'run', event, '--ignore-scripts'], cwd, depsEnv);
+function effectiveNpmConfig(cwd, depsEnv) {
+  const out = execFileSync('npm', ['config', 'get', 'ignore-scripts', 'script-shell'], { cwd, env: depsEnv, encoding: 'utf8' });
+  const value = (key) => out.split('\n').find((l) => l.startsWith(`${key}=`))?.slice(key.length + 1).trim();
+  const ignoreScripts = value('ignore-scripts');
+  const scriptShell = value('script-shell');
+  if (ignoreScripts === undefined || scriptShell === undefined) throw new Error(`unreadable npm config: ${out.slice(0, 80)}`);
+  return { ignoreScripts, scriptShell };
+}
+
+/** The directory of the npm on PATH (its `bin/npm-cli.js` is two levels down), skipping wrappers that are not npm itself. */
+function findNpmRoot(env) {
+  for (const dir of (env.PATH ?? '').split(path.delimiter)) {
+    try {
+      const real = fs.realpathSync(path.join(dir, 'npm'));
+      const root = path.dirname(path.dirname(real));
+      if (path.basename(real) === 'npm-cli.js' && fs.existsSync(path.join(root, 'node_modules', '@npmcli', 'run-script'))) return root;
+    } catch {
+      // not on this PATH entry
+    }
+  }
+  return null;
+}
+
+// What `npm ci --no-audit --no-fund` puts in a lifecycle script's environment on top of the env it was given
+// (npm 11.9.0, compared against a real `npm ci` by dumping `process.env` from a prepare script): `npm_command`
+// (lib/npm.js), `INIT_CWD` and the non-default CLI flags as empty `npm_config_*` (@npmcli/config/lib/set-envs.js),
+// `COLOR`, `NODE`, `npm_execpath`, `npm_node_execpath` and `npm_config_local_prefix`. Not reproduced, being
+// informational echoes of npm's own config that no allowlisted command reads: `npm_config_{prefix,global_prefix,
+// init_module,noproxy,npm_version,user_agent}`. The rest comes from @npmcli/run-script, which the replay uses unchanged.
+function replayEnv(depsEnv, cwd, npmRoot) {
+  return {
+    ...depsEnv,
+    npm_command: 'ci',
+    INIT_CWD: cwd,
+    npm_config_audit: '',
+    npm_config_fund: '',
+    npm_config_local_prefix: cwd,
+    npm_execpath: path.join(npmRoot, 'bin', 'npm-cli.js'),
+    npm_node_execpath: process.execPath,
+    NODE: process.execPath,
+    COLOR: '0',
+  };
+}
+
+const REPLAY_RUN_SCRIPT = `
+const run = require(process.argv[1]);
+run({ path: process.cwd(), args: [], scriptShell: process.argv[3] || undefined, stdio: 'inherit', event: process.argv[2] })
+  .catch((err) => process.exit(typeof err.code === 'number' ? err.code : 1));
+`;
+
+/**
+ * A hit skips `npm ci`, and with it the allowlisted root scripts whose effect (the work dir's `.git/config`)
+ * lives outside the cached tree. Replay each, in npm's order, through npm's own `@npmcli/run-script` called as
+ * `lib/commands/ci.js` calls it, with the install's env plus what `npm ci` adds (above). Not replayed at all
+ * when npm's effective `ignore-scripts` is true (a miss would not have run them). False means "could not
+ * replay": the caller installs instead.
+ */
+async function replayRootScripts(cwd, scripts, depsEnv, npmConfig) {
+  if (npmConfig.ignoreScripts === 'true') return true;
+  const events = allowlistedRootEvents(scripts);
+  if (events.length === 0) return true;
+  const npmRoot = findNpmRoot(depsEnv);
+  if (!npmRoot) return false;
+  const env = replayEnv(depsEnv, cwd, npmRoot);
+  const runScriptModule = path.join(npmRoot, 'node_modules', '@npmcli', 'run-script');
+  const shell = npmConfig.scriptShell === 'null' ? '' : npmConfig.scriptShell;
+  for (const event of events) {
+    const code = await runPhaseCommand([process.execPath, '-e', REPLAY_RUN_SCRIPT, runScriptModule, event, shell], cwd, env);
     if (code !== 0) return false;
   }
   return true;
@@ -213,9 +276,12 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
   };
 
   let keyed = { key: null, reason: 'disabled' };
+  let npmConfig;
   if (depsCache?.enabled) {
     try {
+      npmConfig = effectiveNpmConfig(cwd, depsEnv);
       keyed = computeDepsKey({
+        npmConfig,
         dir: cwd,
         rootDir: workDir,
         installArgv: DEPS_INSTALL_ARGV,
@@ -230,7 +296,7 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
   const { key } = keyed;
 
   if (key && (await materializeHit(depsCache, key, cwd, releaseLeases))) {
-    if (await replayRootScripts(cwd, keyed.scripts, depsEnv)) return { exitCode: 0, record: done('hit', { key }) };
+    if (await replayRootScripts(cwd, keyed.scripts, depsEnv, npmConfig)) return { exitCode: 0, record: done('hit', { key }) };
     process.stderr.write('deps-cache replay of the root scripts failed, installing instead\n');
     fs.rmSync(path.join(cwd, 'node_modules'), { recursive: true, force: true });
   }

@@ -24,6 +24,9 @@ import {
   ALLOWED_ROOT_SCRIPTS,
   ROOT_SCRIPT_NAMES,
   scrubDepsEnv,
+  parseMountInfo,
+  parseMountOutput,
+  tempDirFsProperties,
   unexplainedChanges,
   allowlistedRootEvents,
   snapshotOutsideNodeModules,
@@ -115,6 +118,8 @@ function makeKeyFixture({ lockPackages, scripts, tarball } = {}) {
     npmVersion: '11.9.0',
     system: { glibc: '2.39', libc: 'glibc', osId: 'ubuntu', osVersionId: '24.04' },
     toolVersion: (cmd) => `${cmd} 13.2.0`,
+    npmConfig: { ignoreScripts: 'false', scriptShell: 'null' },
+    tempFsProps: () => 'ext4|',
   });
   return { root, userconfig, globalconfig, inputs };
 }
@@ -130,8 +135,9 @@ test('key: identical inputs give the same key; volatile variables do not matter,
     TMPDIR: '/var/tmp/lb-other', TMP: '/x', TEMP: '/x', PWD: '/elsewhere', OLDPWD: '/o', SHLVL: '3', _: '/usr/bin/other',
     GIT_CEILING_DIRECTORIES: '/tickets/other', SSH_CONNECTION: '1.2.3.4 5 6.7.8.9 22', SSH_AUTH_SOCK: '/tmp/agent',
     LANE_BROKER_LEASE: 'other-ticket', LANE_BROKER_CPU_CORES: '7', LANE_FAKE_RUNNER: '1',
+    GIT_SSH: '/usr/bin/ssh-other', GIT_SSH_COMMAND: 'ssh -i /other/key',
   });
-  assert.equal(computeDepsKey(volatile).key, a.key, 'per-run variables are excluded from the key');
+  assert.equal(computeDepsKey(volatile).key, a.key, 'per-run and authentication variables are not part of the key (a git dep is pinned to a sha, so credentials decide success, not content)');
 
   for (const change of [{ PATH: '/other/bin' }, { HOME: '/home/other' }, { CC: 'clang' }, { HTTPS_PROXY: 'http://p' }, { npm_config_registry: 'http://r.invalid' }]) {
     const i = f.inputs();
@@ -205,6 +211,18 @@ test('key: every key input changes the key', () => {
   });
   keyWith('npm_config value', (i) => {
     i.env.npm_config_cache = '/elsewhere';
+  });
+  keyWith('effective npm ignore-scripts', (i) => {
+    i.npmConfig = { ignoreScripts: 'true', scriptShell: 'null' };
+  });
+  keyWith('effective npm script-shell', (i) => {
+    i.npmConfig = { ignoreScripts: 'false', scriptShell: '/bin/dash' };
+  });
+  keyWith('temp dir filesystem type', (i) => {
+    i.tempFsProps = () => 'tmpfs|';
+  });
+  keyWith('temp dir mounted noexec', (i) => {
+    i.tempFsProps = () => 'ext4|noexec';
   });
   keyWith('arbitrary env var', (i) => {
     i.env.CXX = 'clang++';
@@ -695,9 +713,42 @@ test('the allowlisted git-config script explains exactly its own .git/config lin
   assert.deepEqual(allowlistedRootEvents({ prepare: scripts.prepare, postinstall: 'husky install', prepublish: scripts.prepare }), ['prepublish', 'prepare']);
 });
 
-test('scrubDepsEnv removes shell, ssh and lane variables, and keeps the rest including the temp dirs', () => {
-  const scrubbed = scrubDepsEnv({ PATH: '/bin', HOME: '/h', TMPDIR: '/var/tmp/lb-1', TMP: '/t', TEMP: '/t', PWD: '/p', OLDPWD: '/o', SHLVL: '2', _: '/x', GIT_CEILING_DIRECTORIES: '/c', SSH_CONNECTION: 'x', SSH_AUTH_SOCK: 'y', LANE_BROKER_LEASE: 'z', LANE_OMIT: 'dev', npm_config_cache: '/c' });
-  assert.deepEqual(Object.keys(scrubbed).sort(), ['HOME', 'PATH', 'TEMP', 'TMP', 'TMPDIR', 'npm_config_cache']);
+test('scrubDepsEnv removes shell and lane variables, and keeps the ssh/auth and temp-dir ones the install needs', () => {
+  const scrubbed = scrubDepsEnv({ PATH: '/bin', HOME: '/h', TMPDIR: '/var/tmp/lb-1', TMP: '/t', TEMP: '/t', PWD: '/p', OLDPWD: '/o', SHLVL: '2', _: '/x', GIT_CEILING_DIRECTORIES: '/c', SSH_CONNECTION: 'x', SSH_AUTH_SOCK: '/agent', GIT_SSH_COMMAND: 'ssh -i k', LANE_BROKER_LEASE: 'z', LANE_OMIT: 'dev', npm_config_cache: '/c' });
+  assert.deepEqual(Object.keys(scrubbed).sort(), ['GIT_SSH_COMMAND', 'HOME', 'PATH', 'SSH_AUTH_SOCK', 'SSH_CONNECTION', 'TEMP', 'TMP', 'TMPDIR', 'npm_config_cache']);
+});
+
+const MOUNTINFO = [
+  '22 1 8:1 / / rw,relatime shared:1 - ext4 /dev/sda1 rw,errors=remount-ro',
+  '30 22 0:25 / /tmp rw,nosuid,nodev shared:2 - tmpfs tmpfs rw,size=1000k',
+  '31 22 0:26 / /var/tmp rw,noexec,nosuid,relatime shared:3 - ext4 /dev/sdb1 rw',
+  '32 31 0:27 / /var/tmp/my\\040space ro,relatime shared:4 - xfs /dev/sdc1 rw',
+].join('\n');
+
+test('temp dir filesystem properties come from the longest covering mount: fs type and noexec/nosuid/nodev/ro', () => {
+  assert.equal(parseMountInfo(MOUNTINFO, '/home/runner'), 'ext4|');
+  assert.equal(parseMountInfo(MOUNTINFO, '/tmp/lb-1'), 'tmpfs|nodev,nosuid');
+  assert.equal(parseMountInfo(MOUNTINFO, '/var/tmp/lb-1'), 'ext4|noexec,nosuid');
+  assert.equal(parseMountInfo(MOUNTINFO, '/var/tmp/my space/x'), 'xfs|ro', 'escaped mount points are decoded');
+  assert.equal(parseMountInfo(MOUNTINFO, '/var/tmpfoo'), 'ext4|', '/var/tmp does not cover /var/tmpfoo');
+
+  const mac = ['/dev/disk3s1 on / (apfs, sealed, local, read-only, journaled)', '/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled, nobrowse)', 'tmpfs on /private/tmp/x (tmpfs, local, noexec, nosuid)'].join('\n');
+  assert.equal(parseMountOutput(mac, '/System/Volumes/Data/tmp'), 'apfs|');
+  assert.equal(parseMountOutput(mac, '/usr/lib'), 'apfs|ro');
+  assert.equal(parseMountOutput(mac, '/private/tmp/x/lb'), 'tmpfs|noexec,nosuid');
+});
+
+test('tempDirFsProperties reads each temp dir the install sees, ignores their per-run paths, and never throws', () => {
+  const dirA = tmpDir('deps-cache-tmpa');
+  const dirB = tmpDir('deps-cache-tmpb');
+  const mounts = () => MOUNTINFO;
+  const linux = process.platform === 'linux';
+  const a = tempDirFsProperties({ TMPDIR: dirA }, { readMounts: mounts });
+  const b = tempDirFsProperties({ TMPDIR: dirB }, { readMounts: mounts });
+  assert.equal(a, b, 'two different per-run paths on the same filesystem give the same properties');
+  if (linux) assert.equal(a, parseMountInfo(MOUNTINFO, fs.realpathSync(dirA)), 'looked up in the table by the dir\'s real path');
+  assert.equal(tempDirFsProperties({ TMPDIR: '/does/not/exist' }, { readMounts: mounts }), 'unknown');
+  assert.equal(tempDirFsProperties({ TMPDIR: dirA }, { readMounts: () => { throw new Error('no /proc'); } }), 'unknown');
 });
 
 // ---- absolute install path ----

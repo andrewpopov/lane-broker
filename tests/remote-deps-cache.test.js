@@ -93,10 +93,12 @@ function setupWithNpmSpy(opts) {
   const s = setup(opts);
   const spyDir = tmpDir('deps-cache-npm-spy');
   const log = path.join(spyDir, 'npm-calls.log');
+  const envLog = path.join(spyDir, 'npm-env.log');
   const shim = path.join(spyDir, 'npm');
-  fs.writeFileSync(shim, `#!/bin/sh\necho "$@" >> ${JSON.stringify(log)}\nexec ${JSON.stringify(REAL_NPM)} "$@"\n`, { mode: 0o755 });
+  fs.writeFileSync(shim, `#!/bin/sh\necho "$@" >> ${JSON.stringify(log)}\necho "ssh_auth_sock=$SSH_AUTH_SOCK" >> ${JSON.stringify(envLog)}\nexec ${JSON.stringify(REAL_NPM)} "$@"\n`, { mode: 0o755 });
   s.env = { ...s.env, PATH: `${spyDir}${path.delimiter}${s.env.PATH}` };
   s.npmCiCalls = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter((l) => l.startsWith('ci ')).length : 0);
+  s.npmEnvLog = () => (fs.existsSync(envLog) ? fs.readFileSync(envLog, 'utf8') : '');
   s.storeDir = path.join(s.runnerRoot, 'deps-cache');
   s.storedKeys = () => (fs.existsSync(s.storeDir) ? fs.readdirSync(s.storeDir).filter((n) => /^[0-9a-f]{64}$/.test(n)) : []);
   return s;
@@ -364,7 +366,6 @@ test('every hit replays the allowlisted root script: core.hooksPath is set in th
   assert.equal(hit.row.depsCache, 'hit');
   assert.equal(s.npmCiCalls(), 1);
   assert.equal(hit.probe.hooksPath, '.githooks', 'the hit replayed it, since npm ci did not run');
-  assert.match(hit.stdout + hit.stderr, /prepare/, 'npm run showed which script it replayed');
 });
 
 test('a root script that writes anything else under .git (a hook file) is not published', async () => {
@@ -406,4 +407,26 @@ test('the per-run TMPDIR path is part of the relocatability scan', async () => {
   assert.equal(run.row.depsCache, 'skip');
   assert.match(run.stderr, /reason=absolute-install-path file=hello-tool\/tmp\.txt/);
   assert.equal(s.storedKeys().length, 0);
+});
+
+test('SSH_AUTH_SOCK reaches the install (a git+ssh dependency needs it) but is not part of the key', async () => {
+  const s = setupWithNpmSpy();
+  const repoDir = makeGitWorktree(repoFiles());
+  const first = await runLane(s, repoDir, { env: { ...s.env, SSH_AUTH_SOCK: '/run/agent-one.sock' } });
+  assert.equal(first.row.depsCache, 'miss');
+  assert.match(s.npmEnvLog(), /ssh_auth_sock=\/run\/agent-one\.sock/, 'npm ci was started with the agent socket');
+
+  const second = await runLane(s, repoDir, { env: { ...s.env, SSH_AUTH_SOCK: '/run/agent-two.sock', GIT_SSH_COMMAND: 'ssh -i /other' } });
+  assert.equal(second.row.depsCache, 'hit', 'a different agent socket is the same key');
+});
+
+test('with ignore-scripts in effect (from .npmrc) a hit does not replay the root script a miss did not run', async () => {
+  const s = setupWithNpmSpy();
+  const repoDir = makeGitWorktree(repoFiles({ prepare: 'git config core.hooksPath .githooks || true', npmrcExtra: 'ignore-scripts=true\n' }));
+  const miss = await runLane(s, repoDir);
+  assert.equal(miss.row.depsCache, 'miss');
+  assert.equal(miss.probe.hooksPath, null, 'npm ci ran no scripts');
+  const hit = await runLane(s, repoDir);
+  assert.equal(hit.row.depsCache, 'hit');
+  assert.equal(hit.probe.hooksPath, null, 'and neither did the hit');
 });

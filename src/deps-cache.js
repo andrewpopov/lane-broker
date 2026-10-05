@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { isProcessAlive, processStartTime } from './process-liveness.js';
@@ -41,12 +42,20 @@ const NPM_CONFIG_FILE_ENVS = ['npm_config_userconfig', 'npm_config_globalconfig'
  * settings...), so the variables that differ on every run without meaning anything to an install are
  * REMOVED from it before npm or any script sees them (`scrubDepsEnv`), not merely left out of the key:
  * a variable that reaches the install but not the key would let two different installs share an entry.
- * Removed: shell bookkeeping, the ssh session, git's ceiling (the work dir has its own `.git`), and lane's
- * own ticket/id variables. A few tools do need a temp dir, so TMPDIR/TMP/TEMP stay in the environment, are
+ * Removed: shell bookkeeping, git's ceiling (the work dir has its own `.git`), and lane's own ticket/id
+ * variables. A few tools do need a temp dir, so TMPDIR/TMP/TEMP stay in the environment, are
  * not hashed, and their (per-run) paths join the relocatability scan instead.
  */
 export const SCRUBBED_ENV_NAMES = new Set(['PWD', 'OLDPWD', 'SHLVL', '_', 'GIT_CEILING_DIRECTORIES']);
-export const SCRUBBED_ENV_PREFIXES = ['SSH_', 'LANE_'];
+export const SCRUBBED_ENV_PREFIXES = ['LANE_'];
+
+/**
+ * Authentication inputs reach the install (a git+ssh dependency needs SSH_AUTH_SOCK, GIT_SSH or GIT_SSH_COMMAND)
+ * but are not hashed. That is safe because a git dependency is cached only when pinned to a 40-hex commit
+ * (`lockEligibility`): credentials decide whether the install SUCCEEDS, never what it installs.
+ */
+export const AUTH_ENV_NAMES = new Set(['GIT_SSH', 'GIT_SSH_COMMAND']);
+export const AUTH_ENV_PREFIXES = ['SSH_'];
 export const PER_RUN_PATH_ENV_NAMES = ['TMPDIR', 'TMP', 'TEMP'];
 
 const isScrubbed = (name) => SCRUBBED_ENV_NAMES.has(name) || SCRUBBED_ENV_PREFIXES.some((p) => name.startsWith(p));
@@ -112,6 +121,69 @@ function firstLineOfCommand(cmd, env) {
   } catch {
     return 'missing';
   }
+}
+
+/** Mount flags that change what a process can do in a directory; the rest (atime policy, ...) is irrelevant. */
+const BEHAVIOUR_FLAGS = ['ro', 'noexec', 'nosuid', 'nodev'];
+
+const unescapeMountPath = (p) => p.replace(/\\([0-7]{3})/g, (_, o) => String.fromCharCode(parseInt(o, 8)));
+const coversPath = (mountPoint, target) => mountPoint === '/' || target === mountPoint || target.startsWith(`${mountPoint}/`);
+
+function describeMount(fstype, options) {
+  const flags = options.map((o) => (o === 'read-only' ? 'ro' : o)).filter((o) => BEHAVIOUR_FLAGS.includes(o)).sort();
+  return `${fstype}|${flags.join(',')}`;
+}
+
+/** The fs type and behaviour flags of the Linux mount covering `target`, from `/proc/self/mountinfo` text. */
+export function parseMountInfo(text, target) {
+  let best = null;
+  for (const line of text.split('\n')) {
+    const [pre, post] = line.split(' - ');
+    if (!post) continue;
+    const fields = pre.split(' ');
+    const mountPoint = unescapeMountPath(fields[4] ?? '');
+    if (!coversPath(mountPoint, target) || (best && mountPoint.length < best.mountPoint.length)) continue;
+    const superOptions = (post.split(' ')[2] ?? '').split(',');
+    best = { mountPoint, desc: describeMount(post.split(' ')[0], [...(fields[5] ?? '').split(','), ...superOptions]) };
+  }
+  return best?.desc ?? null;
+}
+
+/** Same for macOS `mount` output lines: `/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled)`. */
+export function parseMountOutput(text, target) {
+  let best = null;
+  for (const line of text.split('\n')) {
+    const m = line.match(/^.+? on (.+?) \((.*)\)$/);
+    if (!m || !coversPath(m[1], target) || (best && m[1].length < best.mountPoint.length)) continue;
+    const [fstype, ...options] = m[2].split(',').map((x) => x.trim());
+    best = { mountPoint: m[1], desc: describeMount(fstype, options) };
+  }
+  return best?.desc ?? null;
+}
+
+/**
+ * The filesystem properties of each temp dir the install sees (TMPDIR, TMP, TEMP): fs type and
+ * noexec/nosuid/nodev/ro. The paths themselves differ per run and stay out of the key, but whether a
+ * build can execute from its temp dir does not. Unreadable is a value ('unknown'), never a crash.
+ */
+export function tempDirFsProperties(env, { readMounts = defaultReadMounts } = {}) {
+  const dirs = [...new Set(PER_RUN_PATH_ENV_NAMES.map((n) => env[n]).filter(Boolean))].sort();
+  if (dirs.length === 0) dirs.push(os.tmpdir());
+  return dirs
+    .map((dir) => {
+      try {
+        const real = fs.realpathSync(dir);
+        const mounts = readMounts();
+        return (process.platform === 'darwin' ? parseMountOutput(mounts, real) : parseMountInfo(mounts, real)) ?? 'unknown';
+      } catch {
+        return 'unknown';
+      }
+    })
+    .join(';');
+}
+
+function defaultReadMounts() {
+  return process.platform === 'darwin' ? execFileSync('mount', { encoding: 'utf8' }) : fs.readFileSync('/proc/self/mountinfo', 'utf8');
 }
 
 let systemMemo;
@@ -237,6 +309,8 @@ export function unexplainedChanges(changes, { scripts, configBefore, configAfter
  *    bytes of every `file:` tarball the lockfile names;
  *  - node version/platform/arch (`runtime`), the glibc runtime and distro (`system`), the npm version;
  *  - when any lock entry has an install script, the first line of `cc --version` and `python3 --version`;
+ *  - the effective npm `ignore-scripts` and `script-shell` (`npmConfig`, resolved by npm itself in the
+ *    install's env and cwd), and the filesystem properties of the temp dirs (`tempFsProps`);
  *  - the exact install argv;
  *  - the whole `env` (already scrubbed by `scrubDepsEnv`; TMPDIR/TMP/TEMP are also left out), plus the
  *    bytes of the user/global npmrc files it points at.
@@ -251,6 +325,8 @@ export function computeDepsKey({
   runtime = { version: process.version, platform: process.platform, arch: process.arch },
   system = currentSystem(),
   toolVersion = (cmd) => firstLineOfCommand(cmd, env),
+  npmConfig = { ignoreScripts: 'false', scriptShell: 'null' },
+  tempFsProps = () => tempDirFsProperties(env),
 }) {
   let lockfileName = null;
   let lockfile = null;
@@ -292,6 +368,9 @@ export function computeDepsKey({
     ['os-id', system.osId],
     ['os-version-id', system.osVersionId],
     ['npm-version', npmVersion],
+    ['npm-ignore-scripts', npmConfig.ignoreScripts],
+    ['npm-script-shell', npmConfig.scriptShell],
+    ['temp-fs', tempFsProps()],
     ['install-argv', JSON.stringify(installArgv)],
   ];
   if (eligibility.hasInstallScript) parts.push(['cc-version', toolVersion('cc')], ['python3-version', toolVersion('python3')]);
@@ -300,7 +379,8 @@ export function computeDepsKey({
     if (!bytes) return { key: null, reason: `file: tarball ${rel} is not in the snapshot` };
     parts.push([`tarball:${rel}`, bytes]);
   }
-  const unhashed = (name) => isScrubbed(name) || PER_RUN_PATH_ENV_NAMES.includes(name);
+  const unhashed = (name) =>
+    isScrubbed(name) || PER_RUN_PATH_ENV_NAMES.includes(name) || AUTH_ENV_NAMES.has(name) || AUTH_ENV_PREFIXES.some((p) => name.startsWith(p));
   for (const name of Object.keys(env).filter((k) => !unhashed(k)).sort()) parts.push([`env:${name}`, String(env[name])]);
   for (const name of NPM_CONFIG_FILE_ENVS) {
     if (env[name]) parts.push([`file:${name}`, readIfExists(env[name]) ?? '']);

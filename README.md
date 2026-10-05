@@ -435,11 +435,19 @@ reason.
   exact `npm ci` argv, and the WHOLE deps-phase environment (plus the bytes
   of the runner's user/global npmrc). When any lock entry has an install
   script, the first line of `cc --version` and `python3 --version` too (a
-  missing tool is a value). The variables that differ on every run are REMOVED
-  from the environment npm and every script see, not just left out of the
-  key: `PWD`, `OLDPWD`, `SHLVL`, `_`, `GIT_CEILING_DIRECTORIES`, and any
-  `SSH_*` or `LANE_*`. `TMPDIR`, `TMP` and `TEMP` stay (tools need a temp
-  dir) but are not hashed, and their paths join the relocatability scan.
+  missing tool is a value). Also in the key: npm's effective `ignore-scripts` and
+  `script-shell` (asked of `npm config get` in the install's own env and cwd),
+  and the filesystem properties of the temp dirs (fs type and
+  `noexec`/`nosuid`/`nodev`/`ro`, from `/proc/self/mountinfo` on Linux or
+  `mount` on macOS), since a build can behave differently where it cannot
+  execute from its temp dir. The temp dirs' paths differ per run and are not
+  hashed; they join the relocatability scan instead. The variables that differ
+  on every run are REMOVED from the environment npm and every script see, not
+  just left out of the key: `PWD`, `OLDPWD`, `SHLVL`, `_`,
+  `GIT_CEILING_DIRECTORIES` and any `LANE_*`. Authentication inputs
+  (`SSH_*`, `GIT_SSH`, `GIT_SSH_COMMAND`) reach the install but are NOT
+  hashed: a git dependency is cached only when pinned to a 40-hex commit, so
+  credentials decide whether the install succeeds, never what it installs.
   Any other change is a miss.
 - **Hit**: the stored tree is COPIED into the work dir (a reflink where the
   filesystem has them), as private writable files, so nothing a lane does to
@@ -447,8 +455,13 @@ reason.
   slower than a hardlink farm and is the price of that isolation. `npm ci`
   is skipped, so the allowlisted root scripts (whose effect is on the work
   dir's `.git/config`, not on `node_modules`) are REPLAYED, in npm's order,
-  as `npm run <event> --ignore-scripts`; `npm_command` is the one lifecycle
-  variable that differs from a real `npm ci`.
+  by calling npm's own `@npmcli/run-script` the way `lib/commands/ci.js`
+  does, with the install's env plus what `npm ci` adds (`npm_command=ci`,
+  `INIT_CWD`, `npm_execpath` and friends; compared against a real `npm ci`).
+  Not reproduced are the informational `npm_config_{prefix,global_prefix,
+  init_module,noproxy,npm_version,user_agent}` echoes, which no allowlisted
+  command reads. Nothing is replayed when npm's effective `ignore-scripts` is
+  true, because a miss would not have run them.
 - **Miss**: `npm ci` runs exactly as before, then the result is copied into
   the store and published with an atomic rename. Two runs missing on the same
   key at once both install; one publish wins and the other is discarded. The
