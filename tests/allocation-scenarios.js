@@ -14,6 +14,8 @@ import { pathToFileURL } from 'node:url';
  *
  * (run with cwd = a checkout of this branch: lease records carry the cwd). Needs a main that has none of this
  * slice; once main carries it, the trace is the new baseline and only a deliberate live change may alter it.
+ * ROG-2181 was such a change (a sim no longer passes a test head except by safe backfill): the committed trace was
+ * regenerated from the branch with `node tests/allocation-scenarios.js .`, and the resource script no longer releases `s1`.
  */
 
 const GIB = 1024 ** 3;
@@ -100,7 +102,6 @@ export function scenarios(m) {
       { poll: sim('s2', 2), ext: 5.4 },
       { poll: ticket('t2', { weight: 2 }), ext: 5.4 },
       { poll: head, ext: 5.4 },
-      { release: 's1' },
       { release: 't1' },
       { poll: head, ext: 0 },
     ],

@@ -327,3 +327,42 @@ test('blockedBy: a declared conflict blocks unconditionally regardless of maxCon
   const blocker = blockedBy(held, ticket);
   assert.ok(blocker && blocker.key === 'fleet:other');
 });
+
+// ROG-2181: rouge fleet sims run as `fleet` lane leases with a ceiling (20) far above what the machine holds, so
+// the ceiling must never be the bound -- CPU and memory admission are.
+async function admitFleet(cfg, { cores, memory, extraResources = {} }) {
+  const { state } = freshEnv();
+  const key = 'rouge:fleet';
+  const sampler = () => ({ hostBusyCores: 0, cores, stale: false, sampledAt: Date.now() });
+  const tickets = Array.from({ length: 20 }, (_, i) =>
+    baseTicket(`f${String(i).padStart(2, '0')}`, { key, class: 'sim', maxConcurrent: 20, resources: { cpuCores: 1, ...extraResources } }),
+  );
+  for (const t of tickets) await enqueue(state, t);
+  const results = [];
+  for (const t of tickets) results.push(await tryStart(state, t, cfg, undefined, sampler, undefined, memory));
+  return results;
+}
+
+test('20 fleet tickets with maxConcurrent 20 are bounded by CPU admission, not by the ceiling', async () => {
+  const cfg = baseCfg({ schedulerMode: 'active', cpuAdmissionPercent: 100, cpuReserveCores: 1, admissionCooldownMs: 0 });
+  const memory = () => ({ availableBytes: 1024 ** 4, totalBytes: 1024 ** 4, macPressure: 'normal', source: 'test' });
+  const results = await admitFleet(cfg, { cores: 10, memory });
+  const started = results.filter((r) => r.started);
+  assert.equal(started.length, 9, 'a 10-core machine with a 1-core reserve holds nine 1-core sims, well under the ceiling of 20');
+  for (const r of results.slice(9)) {
+    assert.equal(r.reason === 'conflict', false, 'never the maxConcurrent ceiling');
+    assert.equal(r.reason === 'not-head' || r.reason === 'cpu-admission', true, JSON.stringify(r));
+  }
+  assert.equal(results[9].reason, 'cpu-admission');
+});
+
+test('20 fleet tickets with maxConcurrent 20 are bounded by memory admission, not by the ceiling', async () => {
+  const GIB = 1024 ** 3;
+  const cfg = baseCfg({ schedulerMode: 'active', cpuAdmissionPercent: 100, cpuReserveCores: 0, admissionCooldownMs: 0, memoryReserveBytes: 2 * GIB });
+  const memory = () => ({ availableBytes: 8 * GIB, totalBytes: 16 * GIB, macPressure: 'normal', source: 'test' });
+  const results = await admitFleet(cfg, { cores: 64, memory, extraResources: { memoryBytes: GIB } });
+  const started = results.filter((r) => r.started);
+  assert.equal(started.length > 0 && started.length < 20, true, `memory bounds the pool: ${started.length}`);
+  assert.equal(results[started.length].reason, 'memory-admission');
+  assert.equal(results.some((r) => r.reason === 'conflict'), false, 'never the maxConcurrent ceiling');
+});

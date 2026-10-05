@@ -165,6 +165,21 @@ for the head's poll or a poll that actually starts a ticket (to keep the log
 small); every queued candidate's verdict (claim, effective and clamped claim,
 reservation, and the existing guards that deny it) is in the head record's
 `candidates=` list. A lane of class `sim` must resolve to at most 2 CPU cores.
+Live enforcement (ROG-2181): the guarantee is that a `sim`-class ticket never delays
+a waiting test ticket, not a literal start order. Behind a head that is not class
+`sim`, a sim starts only through BRAIN-355's safe backfill, which is available on
+every path (not just after a conflict-blocked head's skips are exhausted, and it
+counts no skip): it must not conflict with the head or anything held, and held
+weight + the head's weight + its own must fit capacity. Admission reserves the
+head's CPU and memory claim while it is evaluated. A sim is never admitted by the
+conflict, capacity or resource skip walks (they step over it, so a later test
+ticket still backfills), and `conflictSafeBackfill: false` therefore turns every
+sim pass off. A sim reservation owner never overrides a test ticket ranked ahead
+of it: its reservation stays dormant until no test ranks above it. Test tickets,
+and a sim behind a sim head, behave as before. The shadow snapshot above is
+unchanged. `maxConcurrent` stays a ceiling only: a pool lane with a high ceiling
+(e.g. 20 `fleet` tickets) is bounded by CPU and memory admission.
+
 The sim arm stamp (`lastSimDemandAt`) lives in `sim-arm.json` in the
 state root; a missing or unreadable file means unarmed.
 
@@ -234,6 +249,14 @@ lane's `maxConcurrent`. Omit it (the default, `1`) for today's exact
 behaviour — a lane never declaring it is unconditionally exclusive against
 itself, exactly as before this field existed. This is the shape a worker
 pool needs (N sim runs at once), not a test lane (which wants exactly one).
+
+A lane's `aging` (boolean, default `true`, ROG-2181) set to `false` stops its
+tickets accruing priority age: score and effective rank use the tier alone, so an
+old low ticket on that lane can never tie a fresh medium or high one (without it,
+aging lets a low ticket tie a fresh high after `priorityAgeMaxMs`, and the older
+ticket wins the tie). An undeclared lane resolved via `undeclaredLanes.as`
+inherits its template's `aging`. Use it for a long-running `class: "sim"` lane
+that must always queue behind test lanes. Lanes that omit it age exactly as before.
 
 A lane with `localRefused: true` (the `sim` lane by default, matching the
 rouge fleet split) is refused on `lane run` unless `--allow-local-sim` is

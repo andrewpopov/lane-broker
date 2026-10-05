@@ -384,6 +384,7 @@ export async function runCommand({
     nice,
     maxConcurrent: resolved.maxConcurrent,
     class: resolved.class,
+    aging: resolved.aging,
     conflicts: resolved.conflicts,
     // BRAIN-320: carried so the supervisor's remote-fallback path
     // (`fallbackOrRefuse` in supervisor.js) can re-apply the local-sim

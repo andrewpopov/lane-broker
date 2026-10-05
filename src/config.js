@@ -410,6 +410,9 @@ function validateRepoConfig(cfg, sourcePath) {
     if (lane.priority !== undefined) {
       assert(isPriorityTier(lane.priority), `${sourcePath}: lane "${name}".priority must be one of ${PRIORITY_TIERS.join(', ')}`);
     }
+    if (lane.aging !== undefined) {
+      assert(typeof lane.aging === 'boolean', `${sourcePath}: lane "${name}".aging must be a boolean`);
+    }
     if (lane.maxConcurrent !== undefined) {
       assert(
         Number.isInteger(lane.maxConcurrent) && lane.maxConcurrent >= 1,
@@ -733,7 +736,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   if (isDeclaredLane) {
     laneCfg = repoConfig.lanes[laneName];
   } else if (undeclaredTemplateName) {
-    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteArtifacts/remoteArtifactsOn/class/priority
+    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteArtifacts/remoteArtifactsOn/class/priority/aging
     // from the named declared lane, keeping this lane's OWN key/name. Not
     // inherited: `localRefused` (stays default false), the template's named
     // conflicts (only the `*` wildcard universe below reaches this lane, same
@@ -755,6 +758,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       remoteArtifactsOn: templateCfg.remoteArtifactsOn,
       class: templateCfg.class,
       priority: templateCfg.priority,
+      aging: templateCfg.aging,
     };
   } else {
     laneCfg = { weight: DEFAULT_REPO_CONFIG.lanes.default.weight };
@@ -795,6 +799,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     class: laneCfg.class === 'sim' ? 'sim' : 'test',
     // BRAIN-380: the lane's declared tier (validated above); null lets the caller fall through to the default.
     priority: isPriorityTier(laneCfg.priority) ? laneCfg.priority : null,
+    // ROG-2181: false stops this lane's tickets accruing priority age; every lane predating the field ages.
+    aging: laneCfg.aging !== false,
     conflicts,
     // BRAIN-319 T3a: opt-in per lane, defaulted false so a repo config
     // written before this field exists resolves identically (I6).

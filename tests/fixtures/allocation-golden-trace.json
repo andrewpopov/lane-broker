@@ -4,8 +4,8 @@
       {
         "poll": "s1",
         "started": false,
-        "reason": "not-head",
-        "cpuReason": null
+        "reason": "cpu-admission",
+        "cpuReason": "projected-over-budget"
       },
       {
         "poll": "head",
@@ -15,9 +15,9 @@
       },
       {
         "poll": "s1",
-        "started": true,
-        "reason": null,
-        "cpuReason": null
+        "started": false,
+        "reason": "cpu-admission",
+        "cpuReason": "projected-over-budget"
       },
       {
         "poll": "t1",
@@ -34,13 +34,13 @@
       {
         "poll": "s2",
         "started": false,
-        "reason": "not-head",
-        "cpuReason": null
+        "reason": "cpu-admission",
+        "cpuReason": "projected-over-budget"
       },
       {
         "poll": "t2",
-        "started": false,
-        "reason": "not-head",
+        "started": true,
+        "reason": null,
         "cpuReason": null
       },
       {
@@ -67,8 +67,8 @@
         "supervisorPid": "<volatile>",
         "supervisorStart": null,
         "childPgid": null,
-        "heartbeatAt": 1700000016000,
-        "admittedAt": 1700000016000,
+        "heartbeatAt": 1700000015000,
+        "admittedAt": 1700000015000,
         "cwd": "<cwd>",
         "cmd": [
           "true"
@@ -77,9 +77,43 @@
         "logPath": "/dev/null",
         "resultPath": "/dev/null",
         "state": "RUNNING"
+      },
+      "t2.json": {
+        "id": "t2",
+        "key": "r:t2",
+        "bootId": "<volatile>",
+        "supervisorPid": "<volatile>",
+        "supervisorStart": null,
+        "childPgid": null,
+        "heartbeatAt": 1700000012000,
+        "admittedAt": 1700000012000,
+        "cwd": "<cwd>",
+        "cmd": [
+          "true"
+        ],
+        "weight": 2,
+        "logPath": "/dev/null",
+        "resultPath": "/dev/null",
+        "state": "RUNNING"
       }
     },
     "queue": {
+      "000000000002-s1.json": {
+        "id": "s1",
+        "key": "r:s1",
+        "weight": 1,
+        "cwd": "<cwd>",
+        "cmd": [
+          "true"
+        ],
+        "supervisorPid": "<volatile>",
+        "supervisorStart": null,
+        "logPath": "/dev/null",
+        "resultPath": "/dev/null",
+        "class": "sim",
+        "seq": 2,
+        "createdAt": 1700000002000
+      },
       "000000000004-s2.json": {
         "id": "s2",
         "key": "r:s2",
@@ -95,32 +129,20 @@
         "class": "sim",
         "seq": 4,
         "createdAt": 1700000004000
-      },
-      "000000000005-t2.json": {
-        "id": "t2",
-        "key": "r:t2",
-        "weight": 2,
-        "cwd": "<cwd>",
-        "cmd": [
-          "true"
-        ],
-        "supervisorPid": "<volatile>",
-        "supervisorStart": null,
-        "logPath": "/dev/null",
-        "resultPath": "/dev/null",
-        "seq": 5,
-        "createdAt": 1700000005000
       }
     },
     "liveLog": [
+      "lane-broker-admission candidate=s1 mode=active current=start:ok loadGateIgnored=false new=deny:projected-over-budget sample=ok hostBusyCores=5.40 cores=10 externalBusy=5.40 projectedBusy=10.40 budget=9.00 candidateCpu=1.00 candidateMemoryBytes=1073741824 projectedAvailableBytes=63350767616 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=head:4.00(cold) bias=self-subtracted-when-observed",
       "lane-broker-admission candidate=head mode=active current=start:ok loadGateIgnored=false new=deny:projected-over-budget sample=ok hostBusyCores=5.40 cores=10 externalBusy=5.40 projectedBusy=9.40 budget=9.00 candidateCpu=4.00 candidateMemoryBytes=4294967296 projectedAvailableBytes=64424509440 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=none bias=self-subtracted-when-observed",
-      "lane-broker-admission candidate=s1 mode=active current=start:ok loadGateIgnored=false new=admit:ok sample=ok hostBusyCores=5.40 cores=10 externalBusy=5.40 projectedBusy=6.40 budget=9.00 candidateCpu=1.00 candidateMemoryBytes=1073741824 projectedAvailableBytes=67645734912 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=none bias=self-subtracted-when-observed",
+      "lane-broker-admission candidate=s1 mode=active current=start:ok loadGateIgnored=false new=deny:projected-over-budget sample=ok hostBusyCores=5.40 cores=10 externalBusy=5.40 projectedBusy=10.40 budget=9.00 candidateCpu=1.00 candidateMemoryBytes=1073741824 projectedAvailableBytes=63350767616 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=head:4.00(cold) bias=self-subtracted-when-observed",
+      "lane-broker-admission candidate=t1 mode=active current=start:ok loadGateIgnored=false new=admit:ok sample=ok hostBusyCores=5.40 cores=10 externalBusy=5.40 projectedBusy=6.40 budget=9.00 candidateCpu=1.00 candidateMemoryBytes=1073741824 projectedAvailableBytes=67645734912 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=none bias=self-subtracted-when-observed",
       "lane-broker-head-block event=resource-backfill-start skipPast=head count=1",
-      "lane-broker-admission candidate=t1 mode=active current=start:ok loadGateIgnored=false new=admit:ok sample=ok hostBusyCores=5.40 cores=10 externalBusy=5.40 projectedBusy=7.40 budget=9.00 candidateCpu=1.00 candidateMemoryBytes=1073741824 projectedAvailableBytes=66571993088 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=s1:1.00(cold) bias=self-subtracted-when-observed",
+      "lane-broker-admission candidate=head mode=active current=start:ok loadGateIgnored=false new=deny:projected-over-budget sample=ok hostBusyCores=5.40 cores=10 externalBusy=5.40 projectedBusy=10.40 budget=9.00 candidateCpu=4.00 candidateMemoryBytes=4294967296 projectedAvailableBytes=63350767616 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=t1:1.00(cold) bias=self-subtracted-when-observed",
+      "lane-broker-admission candidate=s2 mode=active current=start:ok loadGateIgnored=false new=deny:projected-over-budget sample=ok hostBusyCores=5.40 cores=10 externalBusy=5.40 projectedBusy=12.40 budget=9.00 candidateCpu=2.00 candidateMemoryBytes=2147483648 projectedAvailableBytes=61203283968 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=t1:1.00(cold),head:4.00(cold) bias=self-subtracted-when-observed",
+      "lane-broker-admission candidate=t2 mode=active current=start:ok loadGateIgnored=false new=admit:ok sample=ok hostBusyCores=5.40 cores=10 externalBusy=5.40 projectedBusy=8.40 budget=9.00 candidateCpu=2.00 candidateMemoryBytes=2147483648 projectedAvailableBytes=65498251264 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=t1:1.00(cold) bias=self-subtracted-when-observed",
       "lane-broker-head-block event=resource-backfill-start skipPast=head count=2",
-      "lane-broker-admission candidate=head mode=active current=start:ok loadGateIgnored=false new=deny:projected-over-budget sample=ok hostBusyCores=5.40 cores=10 externalBusy=5.40 projectedBusy=11.40 budget=9.00 candidateCpu=4.00 candidateMemoryBytes=4294967296 projectedAvailableBytes=62277025792 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=s1:1.00(cold),t1:1.00(cold) bias=self-subtracted-when-observed",
-      "lane-broker-admission candidate=head mode=active current=start:ok loadGateIgnored=false new=deny:projected-over-budget sample=ok hostBusyCores=5.40 cores=10 externalBusy=5.40 projectedBusy=11.40 budget=9.00 candidateCpu=4.00 candidateMemoryBytes=4294967296 projectedAvailableBytes=62277025792 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=s1:1.00(cold),t1:1.00(cold) bias=self-subtracted-when-observed",
-      "lane-broker-admission candidate=head mode=active current=start:ok loadGateIgnored=false new=admit:ok sample=ok hostBusyCores=0.00 cores=10 externalBusy=0.00 projectedBusy=4.00 budget=9.00 candidateCpu=4.00 candidateMemoryBytes=4294967296 projectedAvailableBytes=64424509440 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=none bias=self-subtracted-when-observed"
+      "lane-broker-admission candidate=head mode=active current=start:ok loadGateIgnored=false new=deny:projected-over-budget sample=ok hostBusyCores=5.40 cores=10 externalBusy=5.40 projectedBusy=12.40 budget=9.00 candidateCpu=4.00 candidateMemoryBytes=4294967296 projectedAvailableBytes=61203283968 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=t1:1.00(cold),t2:2.00(cold) bias=self-subtracted-when-observed",
+      "lane-broker-admission candidate=head mode=active current=start:ok loadGateIgnored=false new=admit:ok sample=ok hostBusyCores=0.00 cores=10 externalBusy=0.00 projectedBusy=6.00 budget=9.00 candidateCpu=4.00 candidateMemoryBytes=4294967296 projectedAvailableBytes=62277025792 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=t2:2.00(cold) bias=self-subtracted-when-observed"
     ]
   },
   "conflict": {
@@ -162,7 +184,7 @@
         "cpuReason": null
       }
     ],
-    "conflictSkip": "{\n  \"headId\": \"chead\",\n  \"count\": 3,\n  \"blockedSince\": 1700000007000,\n  \"loggedPhase\": \"exhausted\"\n}\n",
+    "conflictSkip": "{\n  \"headId\": \"chead\",\n  \"count\": 2,\n  \"blockedSince\": 1700000007000,\n  \"loggedPhase\": \"blocked\"\n}\n",
     "capacitySkip": null,
     "resourceSkip": null,
     "leases": {
@@ -271,12 +293,12 @@
     },
     "liveLog": [
       "lane-broker-head-block event=head-blocked headId=chead blockingLease=holder blockingKey=r:lock skip=0/3 graceMs=600000 blockedMs=0",
-      "lane-broker-admission candidate=cs1 mode=active current=start:ok loadGateIgnored=false new=admit:ok sample=ok hostBusyCores=0.00 cores=10 externalBusy=0.00 projectedBusy=2.00 budget=9.00 candidateCpu=1.00 candidateMemoryBytes=1073741824 projectedAvailableBytes=66571993088 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=holder:1.00(cold) bias=self-subtracted-when-observed",
+      "lane-broker-head-block event=safe-backfill headId=chead candidate=cs1 blockingLease=holder blockingKey=r:lock skip=0/3 graceMs=600000 blockedMs=1000",
+      "lane-broker-admission candidate=cs1 mode=active current=start:ok loadGateIgnored=false new=admit:ok sample=ok hostBusyCores=0.00 cores=10 externalBusy=0.00 projectedBusy=3.00 budget=9.00 candidateCpu=1.00 candidateMemoryBytes=1073741824 projectedAvailableBytes=65498251264 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=holder:1.00(cold),chead:1.00(cold) bias=self-subtracted-when-observed",
       "lane-broker-admission candidate=ct1 mode=active current=start:ok loadGateIgnored=false new=admit:ok sample=ok hostBusyCores=0.00 cores=10 externalBusy=0.00 projectedBusy=3.00 budget=9.00 candidateCpu=1.00 candidateMemoryBytes=1073741824 projectedAvailableBytes=65498251264 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=cs1:1.00(cold),holder:1.00(cold) bias=self-subtracted-when-observed",
-      "lane-broker-admission candidate=cs2 mode=active current=start:ok loadGateIgnored=false new=admit:ok sample=ok hostBusyCores=0.00 cores=10 externalBusy=0.00 projectedBusy=4.00 budget=9.00 candidateCpu=1.00 candidateMemoryBytes=1073741824 projectedAvailableBytes=64424509440 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=cs1:1.00(cold),ct1:1.00(cold),holder:1.00(cold) bias=self-subtracted-when-observed",
-      "lane-broker-head-block event=skip-exhausted headId=chead blockingLease=holder blockingKey=r:lock skip=3/3 graceMs=600000 blockedMs=4000",
-      "lane-broker-head-block event=safe-backfill headId=chead candidate=ct2 blockingLease=holder blockingKey=r:lock skip=3/3 graceMs=600000 blockedMs=4000",
-      "lane-broker-admission candidate=ct2 mode=active current=start:ok loadGateIgnored=false new=admit:ok sample=ok hostBusyCores=0.00 cores=10 externalBusy=0.00 projectedBusy=6.00 budget=9.00 candidateCpu=1.00 candidateMemoryBytes=1073741824 projectedAvailableBytes=62277025792 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=cs1:1.00(cold),cs2:1.00(cold),ct1:1.00(cold),holder:1.00(cold),chead:1.00(cold) bias=self-subtracted-when-observed"
+      "lane-broker-head-block event=safe-backfill headId=chead candidate=cs2 blockingLease=holder blockingKey=r:lock skip=1/3 graceMs=600000 blockedMs=3000",
+      "lane-broker-admission candidate=cs2 mode=active current=start:ok loadGateIgnored=false new=admit:ok sample=ok hostBusyCores=0.00 cores=10 externalBusy=0.00 projectedBusy=5.00 budget=9.00 candidateCpu=1.00 candidateMemoryBytes=1073741824 projectedAvailableBytes=63350767616 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=cs1:1.00(cold),ct1:1.00(cold),holder:1.00(cold),chead:1.00(cold) bias=self-subtracted-when-observed",
+      "lane-broker-admission candidate=ct2 mode=active current=start:ok loadGateIgnored=false new=admit:ok sample=ok hostBusyCores=0.00 cores=10 externalBusy=0.00 projectedBusy=5.00 budget=9.00 candidateCpu=1.00 candidateMemoryBytes=1073741824 projectedAvailableBytes=63350767616 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=cs1:1.00(cold),cs2:1.00(cold),ct1:1.00(cold),holder:1.00(cold) bias=self-subtracted-when-observed"
     ]
   },
   "capacity": {
@@ -289,8 +311,8 @@
       },
       {
         "poll": "ks1",
-        "started": true,
-        "reason": null,
+        "started": false,
+        "reason": "not-head",
         "cpuReason": null
       },
       {
@@ -307,7 +329,7 @@
       }
     ],
     "conflictSkip": null,
-    "capacitySkip": "{\n  \"headId\": \"khead\",\n  \"count\": 2,\n  \"loggedPhase\": \"blocked\"\n}\n",
+    "capacitySkip": "{\n  \"headId\": \"khead\",\n  \"count\": 1,\n  \"loggedPhase\": \"blocked\"\n}\n",
     "resourceSkip": null,
     "leases": {
       "big.json": {
@@ -325,24 +347,6 @@
           "cpuCores": 5,
           "memoryBytes": 1073741824
         }
-      },
-      "ks1.json": {
-        "id": "ks1",
-        "key": "r:ks1",
-        "bootId": "<volatile>",
-        "supervisorPid": "<volatile>",
-        "supervisorStart": null,
-        "childPgid": null,
-        "heartbeatAt": 1700000006000,
-        "admittedAt": 1700000006000,
-        "cwd": "<cwd>",
-        "cmd": [
-          "true"
-        ],
-        "weight": 1,
-        "logPath": "/dev/null",
-        "resultPath": "/dev/null",
-        "state": "RUNNING"
       },
       "kt1.json": {
         "id": "kt1",
@@ -378,13 +382,28 @@
         "resultPath": "/dev/null",
         "seq": 1,
         "createdAt": 1700000002000
+      },
+      "000000000002-ks1.json": {
+        "id": "ks1",
+        "key": "r:ks1",
+        "weight": 1,
+        "cwd": "<cwd>",
+        "cmd": [
+          "true"
+        ],
+        "supervisorPid": "<volatile>",
+        "supervisorStart": null,
+        "logPath": "/dev/null",
+        "resultPath": "/dev/null",
+        "class": "sim",
+        "seq": 2,
+        "createdAt": 1700000003000
       }
     },
     "liveLog": [
       "lane-broker-head-block event=head-capacity-blocked headId=khead headWeight=6 runningWeight=5 capacity=10 skip=0/3",
-      "lane-broker-admission candidate=ks1 mode=active current=start:ok loadGateIgnored=false new=admit:ok sample=ok hostBusyCores=0.00 cores=10 externalBusy=0.00 projectedBusy=6.00 budget=9.00 candidateCpu=1.00 candidateMemoryBytes=1073741824 projectedAvailableBytes=66571993088 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=big:5.00(cold) bias=self-subtracted-when-observed",
-      "lane-broker-admission candidate=kt1 mode=active current=start:ok loadGateIgnored=false new=admit:ok sample=ok hostBusyCores=0.00 cores=10 externalBusy=0.00 projectedBusy=8.00 budget=9.00 candidateCpu=2.00 candidateMemoryBytes=2147483648 projectedAvailableBytes=64424509440 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=big:5.00(cold),ks1:1.00(cold) bias=self-subtracted-when-observed",
-      "lane-broker-admission candidate=khead mode=active current=deny:capacity loadGateIgnored=false new=deny:projected-over-budget sample=ok hostBusyCores=0.00 cores=10 externalBusy=0.00 projectedBusy=14.00 budget=9.00 candidateCpu=6.00 candidateMemoryBytes=6442450944 projectedAvailableBytes=57982058496 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=big:5.00(cold),ks1:1.00(cold),kt1:2.00(cold) bias=self-subtracted-when-observed"
+      "lane-broker-admission candidate=kt1 mode=active current=start:ok loadGateIgnored=false new=admit:ok sample=ok hostBusyCores=0.00 cores=10 externalBusy=0.00 projectedBusy=7.00 budget=9.00 candidateCpu=2.00 candidateMemoryBytes=2147483648 projectedAvailableBytes=65498251264 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=big:5.00(cold) bias=self-subtracted-when-observed",
+      "lane-broker-admission candidate=khead mode=active current=deny:capacity loadGateIgnored=false new=deny:projected-over-budget sample=ok hostBusyCores=0.00 cores=10 externalBusy=0.00 projectedBusy=13.00 budget=9.00 candidateCpu=6.00 candidateMemoryBytes=6442450944 projectedAvailableBytes=59055800320 memoryBudgetBytes=66571993088 cpuGate=open cooldown=clear memorySource=test macPressure=normal leaseDemand=big:5.00(cold),kt1:2.00(cold) bias=self-subtracted-when-observed"
     ]
   }
 }
