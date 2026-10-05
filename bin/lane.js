@@ -26,7 +26,7 @@ function usage() {
   lane wait <id> [--timeout <duration>]
   lane pause ["reason"]
   lane resume
-  lane migrate-scheduler [--dry-run]
+  lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
 `;
 }
 
@@ -188,12 +188,29 @@ async function main() {
       return result.exitCode;
     }
     case 'migrate-scheduler': {
-      const unknown = rest.filter((a) => a !== '--dry-run');
+      const timeoutIdx = rest.indexOf('--timeout');
+      const flags = rest.filter((a, i) => !(timeoutIdx !== -1 && (i === timeoutIdx || i === timeoutIdx + 1)));
+      const unknown = flags.filter((a) => a !== '--dry-run' && a !== '--when-idle');
       if (unknown.length > 0) {
         process.stderr.write(`lane migrate-scheduler: unknown argument "${unknown[0]}"\n`);
         return 2;
       }
-      const result = await migrateSchedulerCommand({ dryRun: rest.includes('--dry-run') });
+      const dryRun = flags.includes('--dry-run');
+      const whenIdle = flags.includes('--when-idle');
+      if ((dryRun && whenIdle) || (timeoutIdx !== -1 && !whenIdle)) {
+        process.stderr.write('lane migrate-scheduler: --when-idle excludes --dry-run, and --timeout needs --when-idle\n');
+        return 2;
+      }
+      let timeoutMs;
+      if (timeoutIdx !== -1) {
+        try {
+          timeoutMs = parseDurationMs(rest[timeoutIdx + 1]);
+        } catch (err) {
+          process.stderr.write(`lane migrate-scheduler: ${err.message}\n`);
+          return 2;
+        }
+      }
+      const result = await migrateSchedulerCommand({ dryRun, whenIdle, ...(timeoutMs === undefined ? {} : { timeoutMs }) });
       return result.exitCode;
     }
     // BRAIN-319 T2: hidden runner-side subcommands, invoked by a client Mac

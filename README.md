@@ -43,7 +43,7 @@ lane suggest [--repo <name>] [--days 7] [--json]
 lane cancel <id>
 lane wait <id> [--timeout 5m]
 lane pause "reason" | lane resume
-lane migrate-scheduler [--dry-run]
+lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
 ```
 
 `lane status` adds `  log file unchanged for <duration>` to a RUNNING line once the
@@ -749,12 +749,46 @@ fail-closed, and it is **per broker**: it migrates the state root of the machine
 the Mac and each runner are migrated separately, each in its own drained window. Upgrade the Mac and both runners
 together, and migrate each (a mixed-version fleet is "no worse than today", see Scheduling).
 
-1. `lane pause`.
-2. Wait for running lanes to finish and the queue to empty (`lane status`). A lease left by a crashed run still
-   counts until an admission poll reaps it; if one blocks, `lane resume`, let one poll run, and pause again.
-3. `lane migrate-scheduler --dry-run`. It reports every precondition as `ok:` or `refused:` and changes nothing.
-4. `lane migrate-scheduler`.
-5. `lane resume`. The broker stays paused after migrating, on purpose.
+Run **`lane migrate-scheduler --when-idle [--timeout <duration>]`** (default timeout 6h). It drains the broker, then
+pauses, migrates and resumes in one step, and leaves nothing half-done on any outcome:
+
+1. It writes a `draining` marker (atomically, under the lock). From then on every NEW intake refuses with exit 75 and
+   "scheduler migration pending (draining)": `lane run` ticket creation, remote dispatch, attempt creation, `enqueue`
+   and `remote-exec` on a runner. Tickets already in the queue and leases already running are NOT affected: the broker
+   keeps admitting and finishing them, which is the point. A ticket created a moment before the marker but not yet
+   queued is refused at its `enqueue` with the same exit 75 (retry it). `lane remote-probe` reports the runner as
+   `draining` (and `paused`, for older submitters), so a submitter skips it the way it skips a paused runner, and
+   `lane status` shows "draining for scheduler migration (pid N, since T)".
+2. It polls every 5 seconds until the broker is quiescent (the same checks as the migration, below, minus "paused"),
+   printing a line each time the counts change: `draining: queued 2, running 1, attempts 0, lane processes 4`.
+3. At quiescence, in one hold of the lock, it pauses the broker, runs the migration unchanged (marker, checks,
+   `fairness-v2.json`, the queue fence, the scheduler fence), resumes, and removes the `draining` marker, so nothing can
+   slip in between. If the broker was already paused when it started, it stays paused at the end. A check that fails
+   only because something became busy again (a stray `lane status` is a lane process) sends it back to waiting.
+4. It exits 1, with the `draining` marker removed and the pause state exactly as it found it, on the timeout and on any
+   refusal that cannot clear by waiting (an unreadable record, an unreadable process table, another migrator). Ctrl-C
+   and SIGTERM do the same (exit 130 / 143). Already migrated: it exits 0 at once.
+
+A broker that is paused while queued tickets exist never drains (a paused broker starts nothing); the command says so
+and waits out its timeout. `lane resume` first, or let it drain unpaused.
+
+**A SIGKILLed `--when-idle` leaves its `draining` marker behind.** The marker holds `{pid, startTime, startedAt}`, so it
+is recognised as stale (pid dead, or reused by a process with another start time) and then it refuses nothing. The next
+`lane run` removes it (under the lock), `lane status` reports it as stale, and re-running `--when-idle` takes it over.
+(A kill in the sub-second migration window itself is the existing "crashed migrator" case below.)
+
+**The manual path** is the same sequence, and its order matters: `lane pause` stops the broker admitting anything,
+including tickets that are already queued, so a paused broker never empties its queue. Wait for idle FIRST, with the
+broker unpaused (`lane status`: nothing queued, nothing running; a lease left by a crashed run counts until an
+admission poll reaps it), and only then, with nothing new able to arrive, run it back to back:
+
+1. `lane pause`, then at once `lane migrate-scheduler --dry-run` (reports every precondition as `ok:` or `refused:`,
+   changes nothing). If anything slipped in, `lane resume` and wait again.
+2. `lane migrate-scheduler`.
+3. `lane resume`. The broker stays paused after a manual migrate, on purpose.
+
+Without `--when-idle`, intake is not stopped while you wait, so under steady load the window may never come: use
+`--when-idle`.
 
 Under one hold of the broker lock the command writes a `migrating` marker, then checks (all of them, fail-closed):
 
@@ -773,7 +807,8 @@ Under one hold of the broker lock the command writes a `migrating` marker, then 
 Lease, attempt and queue records are read strictly: an unreadable record refuses the migration instead of being
 skipped. On any failure the marker is removed, the broker stays paused, and the command exits 1 naming every failed
 check with its ids or pids. While the marker exists, `lane run`, remote dispatch, `enqueue`, attempt creation and
-`remote-exec` on a runner all refuse with exit 75 and "scheduler migration in progress".
+`remote-exec` on a runner all refuse with exit 75 and "scheduler migration in progress" (the `draining` marker refuses
+the same entry points, with "scheduler migration pending (draining)").
 
 If everything holds, it writes `fairness-v2.json` (`{"version": 2, "tickets": {}}`, all there is at a drained
 point), then fences the queue (below), then writes `sched-v2.json` (the commit point), each fsynced along with its
@@ -847,7 +882,7 @@ nothing here claims it: compare wait distributions by tier, and do not read a ca
 | `2` | Bad CLI usage (missing command / argument). |
 | `64` | Nested `lane run` would widen the inherited lease — refused; or an invalid `--priority` / `LANE_BROKER_PRIORITY` / lane `priority`. |
 | `69` | Local-sim lane refused (fleet-offload message); use `--allow-local-sim`. |
-| `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. Also `lane run` / `remote-exec` refused with "scheduler migration in progress" while `lane migrate-scheduler` runs. |
+| `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. Also `lane run` / `remote-exec` refused with "scheduler migration in progress" while `lane migrate-scheduler` runs, or "scheduler migration pending (draining)" while `--when-idle` waits. |
 | `130` | Cancelled (SIGINT/SIGTERM) while still queued, before the lane ever started. |
 
 ## ORPHANED handling
@@ -886,7 +921,7 @@ the queue so you know what's waiting and why.
 ## State
 
 `$LANE_BROKER_STATE` (default `~/.cache/lane-broker`): `leases/`, `queue/`,
-`priority-hwm.json` (the priority clock's high-water mark), `migrating` (present only while `lane migrate-scheduler` runs), `queue-quarantine/` (see below), `sched-v2.json` and `fairness-v2.json` (the priority scheduler fence and its per-ticket fairness records), `logs/` (per-run, capped at 50MB with a truncation notice), `results/`,
+`priority-hwm.json` (the priority clock's high-water mark), `migrating` (present only while `lane migrate-scheduler` runs), `draining` (present only while `lane migrate-scheduler --when-idle` waits for the broker to go idle), `queue-quarantine/` (see below), `sched-v2.json` and `fairness-v2.json` (the priority scheduler fence and its per-ticket fairness records), `logs/` (per-run, capped at 50MB with a truncation notice), `results/`,
 `history.jsonl` (one line per completed run, plus one `dequeuedDeadSupervisor: true`
 row `{id, key, error, supervisorPid, endedAt, executor}` (`error: "supervisor died while queued"`, so a history reader counts it as an error, not a failed run) when a queued ticket whose
 supervisor died is dropped from the queue; it is written only once the queue

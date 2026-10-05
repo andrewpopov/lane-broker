@@ -699,8 +699,8 @@ async function main() {
   let fallbackReason;
   // BRAIN-380: createAttempt and enqueue refuse under the lock while `lane migrate-scheduler` runs. The ticket never
   // started, so publish exit 75 (through the attempt, if a fallback one exists) rather than die with no result.
-  async function exitMigrating() {
-    process.stderr.write('lane: scheduler migration in progress\n');
+  async function exitMigrating(err) {
+    process.stderr.write(`lane: ${err.message}\n`);
     const publish = () => atomicWriteJson(ticket.resultPath, migrationRefusalResult(ticket));
     if (attemptGeneration !== null) await publishTerminal(root, ticket.id, attemptGeneration, publish);
     else publish();
@@ -713,7 +713,7 @@ async function main() {
       outcome = await runRemoteAttempt(root, enriched, globalCfg, abortController.signal);
     } catch (err) {
       if (!(err instanceof MigrationInProgressError)) throw err;
-      return exitMigrating();
+      return exitMigrating(err);
     }
     if (!outcome.fallback) return; // terminal outcome: runRemoteAttempt already called process.exit()
     attemptGeneration = outcome.attemptGeneration;
@@ -789,7 +789,7 @@ async function main() {
     if (queued.priorityDemoted) process.stderr.write('lane run: priority high demoted to medium (repo already has a queued high ticket)\n');
   } catch (err) {
     if (!(err instanceof MigrationInProgressError)) throw err;
-    return exitMigrating();
+    return exitMigrating(err);
   }
 
   let started;

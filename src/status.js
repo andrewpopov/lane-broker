@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { ensureStateDirs, paths, withLock, bootId, readJsonSafe } from './state.js';
+import { ensureStateDirs, paths, withLock, bootId, readJsonSafe, readDrainMarker } from './state.js';
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
 import { listQueue, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState, readResourceSkipState } from './scheduler.js';
 import { cpuBudget, projectBusy, ticketCpuEstimate } from './admission.js';
@@ -153,6 +153,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
   const gate = readGateState(root);
   const p = paths(root);
   const paused = fs.existsSync(p.pause) ? fs.readFileSync(p.pause, 'utf8').trim() : null;
+  const draining = readDrainMarker(root);
   const configWarning = readJsonSafe(p.configWarning);
 
   const now = Date.now();
@@ -246,6 +247,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       mode: cfg.schedulerMode,
     },
     paused,
+    draining,
     priority: sched.v2 ? { active: true, mode: 'v2', nowEff, reservationOwner: reservationOwnerId } : { active: false, mode: 'legacy', nowEff },
     ...(cfg.allocationShadow ? { allocation: computeAllocation(root, cfg, queue.filter(Boolean), held, resourceCapacity.cpuCores, now) } : {}),
     // BRAIN-249: null unless the queue is genuinely stalled (a conflict-
@@ -421,6 +423,11 @@ export function renderStatusText(status) {
     lines.push('priority: inactive (legacy scheduler; run lane migrate-scheduler)');
   } else if (status.priority) {
     lines.push(`priority: active${status.priority.reservationOwner ? ` (reservation owner ${status.priority.reservationOwner} promoted to the front)` : ''}`);
+  }
+  if (status.draining?.live) {
+    lines.push(`draining for scheduler migration (pid ${status.draining.pid}, since ${new Date(status.draining.startedAt).toISOString()}): new tickets are refused, queued ones still run`);
+  } else if (status.draining) {
+    lines.push(`drain marker is stale (pid ${status.draining.pid ?? 'unknown'} is gone); the next lane run or lane migrate-scheduler clears it`);
   }
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
   if (status.configWarning) {

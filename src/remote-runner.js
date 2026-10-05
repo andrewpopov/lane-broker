@@ -550,13 +550,17 @@ export async function remoteProbeCommand() {
   // CPU/memory budgets are only enforced in active mode (checkResourceBudget);
   // in shadow mode they are reported as null so the client never skips on them.
   const enforced = globalCfg.schedulerMode === 'active';
+  const draining = Boolean(status.draining?.live);
   const payload = {
     protocol: 1,
     protocols: [1, 2],
     // BRAIN-360: this runner resolves minCpuCores itself, so a submitter may judge fit by the floor
     capabilities: [ELASTIC_CLAIMS_CAPABILITY, PRIORITY_CAPABILITY],
     version: pkg.version,
-    paused: Boolean(status.paused),
+    // BRAIN-380 slice 4: a draining runner takes no new work. `draining` names why; `paused` is also set so a client
+    // built before this field skips the runner the way it skips a paused one.
+    draining,
+    paused: Boolean(status.paused) || draining,
     queued: status.queued.length,
     running: status.running.length,
     // BRAIN-360: additive; the CPU the runner's leases are charged (grants, not declarations)

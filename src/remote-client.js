@@ -189,6 +189,10 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason: 'runner does not support protocol 2 (remoteDeps/remoteSetup/remoteQueueTimeoutMs)' });
       continue;
     }
+    if (probe.draining) {
+      skipped.push({ name: runner.name, reason: 'draining' });
+      continue;
+    }
     if (probe.paused) {
       skipped.push({ name: runner.name, reason: 'paused' });
       continue;
