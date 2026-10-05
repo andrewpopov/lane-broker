@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { paths, stateHome, withLock, atomicWriteJson, atomicWriteFile, fsyncDirectory, queueFenced, readJsonSafe, isPidAlive, processStartTime, readDrainMarker, UnreadableRecordError, QUEUE_FENCE_NOTE } from './state.js';
+import { paths, stateHome, withLock, atomicWriteJson, atomicWriteFile, fsyncDirectory, queueFenced, readJsonSafe, isPidAlive, processStartTime, readDrainMarker, clearStaleDrainMarker, drainPauseReason, UnreadableRecordError, QUEUE_FENCE_NOTE } from './state.js';
 import { listLeasesStrict, LEASE_STATE } from './lease.js';
 import { listAttemptsStrict } from './attempts.js';
 import { listQueueStrict } from './scheduler.js';
@@ -205,6 +205,17 @@ const isTransient = (check) => TRANSIENT_CHECKS.has(check.name) && !check.unread
 /** A refusal whose every failure is something that clears by itself once the broker is idle. */
 const stillBusy = (result) => result.status === 'refused' && result.checks.every((c) => c.failures.length === 0 || isTransient(c));
 
+/** (Re)write the drain marker for `pid`, keeping its start time and `startedAt` if it is already ours. Caller holds the broker lock. */
+function writeDrainMarker(root, { pid, now, pausedByDrain = false }) {
+  const existing = readDrainMarker(root);
+  const ours = existing?.pid === pid;
+  atomicWriteJson(
+    paths(root).draining,
+    { pid, startTime: ours ? existing.startTime : (processStartTime(pid) ?? null), startedAt: ours ? existing.startedAt : now(), ...(pausedByDrain ? { pausedByDrain: true } : {}) },
+    { fsync: true },
+  );
+}
+
 /** Remove the drain marker if `pid` wrote it. Caller holds the broker lock. */
 function removeDrainMarker(root, pid) {
   if (readDrainMarker(root)?.pid !== pid) return;
@@ -233,12 +244,16 @@ export async function migrateScheduler(root, { dryRun = false, fromDrain = false
         // admission for ever. The fence is durable, so the migration is done: finish the cleanup.
         const recovered = !dryRun && fs.existsSync(p.migrating);
         if (recovered) removeMarker(root);
+        if (!dryRun) clearStaleDrainMarker(root); // a drain killed after the fence may still hold the pause it made
         return { status: v2 ? (recovered ? 'recovered' : 'already-migrated') : 'fairness-invalid', checks: [] };
       }
       const other = liveMigrator(root, pid);
       if (other !== null) return { status: 'refused', checks: [{ name: 'migrator', failures: [`another lane migrate-scheduler is running (pid ${other})`] }] };
       if (fromDrain && !fs.existsSync(p.pause)) {
-        atomicWriteFile(p.pause, 'paused for scheduler migration');
+        // Ownership is durable BEFORE the pause exists: a drain killed from here on is recognised by its marker and its own
+        // reason in PAUSE (`releaseDrainPause`), and a pause somebody else set never matches either.
+        writeDrainMarker(root, { pid, now, pausedByDrain: true });
+        atomicWriteFile(p.pause, drainPauseReason(pid), { fsync: true });
         pausedHere = true;
       }
       if (!dryRun) atomicWriteJson(p.migrating, { pid, startedAt: now() }, { fsync: true });
@@ -268,8 +283,12 @@ export async function migrateScheduler(root, { dryRun = false, fromDrain = false
         fs.rmSync(p.pause, { force: true });
         fsyncDirectory(root);
       }
-      // Kept only when the broker turned out to be busy again, so the drain loop can keep waiting under the same marker.
-      if (fromDrain && !(result && stillBusy(result))) removeDrainMarker(root, pid);
+      // Kept only when the broker turned out to be busy again, so the drain loop can keep waiting under the same marker
+      // (which no longer owns a pause).
+      if (fromDrain) {
+        if (!(result && stillBusy(result))) removeDrainMarker(root, pid);
+        else if (pausedHere) writeDrainMarker(root, { pid, now });
+      }
     }
     return fromDrain ? { ...result, resumed: pausedHere } : result;
   });
@@ -293,12 +312,16 @@ function abortableSleep(ms, signal) {
 /** Take the drain marker under the lock. Refuses while another migrator or drain is alive; a stale marker (dead owner) is taken over. */
 async function startDrain(root, { pid, now }) {
   return withLock(root, () => {
+    // Without its own start time a marker could not tell a reused pid from this process, so it could read as live for ever.
+    if (!processStartTime(pid)) return { refused: `cannot read this process's start time (ps failed for pid ${pid}); not starting a drain, no marker written` };
     const other = liveMigrator(root, pid);
     if (other !== null) return { refused: `another lane migrate-scheduler is running (pid ${other})` };
     const existing = readDrainMarker(root);
-    if (existing?.live && existing.pid !== pid) return { refused: `another lane migrate-scheduler --when-idle is draining (pid ${existing.pid})` };
-    atomicWriteJson(paths(root).draining, { pid, startTime: processStartTime(pid) ?? null, startedAt: now() }, { fsync: true });
-    return { tookOverStale: Boolean(existing && !existing.live) };
+    if (existing?.state === 'unknown') return { refused: `the drain marker ${paths(root).draining} cannot be read or parsed, so it cannot be judged; if no lane migrate-scheduler --when-idle is running, remove that file and run again` };
+    if (existing?.state === 'live' && existing.pid !== pid) return { refused: `another lane migrate-scheduler --when-idle is draining (pid ${existing.pid})` };
+    const tookOverStale = clearStaleDrainMarker(root); // also resumes a pause that dead drain made
+    writeDrainMarker(root, { pid, now });
+    return { tookOverStale };
   });
 }
 

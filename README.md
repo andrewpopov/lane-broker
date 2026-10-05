@@ -772,10 +772,20 @@ pauses, migrates and resumes in one step, and leaves nothing half-done on any ou
 A broker that is paused while queued tickets exist never drains (a paused broker starts nothing); the command says so
 and waits out its timeout. `lane resume` first, or let it drain unpaused.
 
-**A SIGKILLed `--when-idle` leaves its `draining` marker behind.** The marker holds `{pid, startTime, startedAt}`, so it
-is recognised as stale (pid dead, or reused by a process with another start time) and then it refuses nothing. The next
-`lane run` removes it (under the lock), `lane status` reports it as stale, and re-running `--when-idle` takes it over.
-(A kill in the sub-second migration window itself is the existing "crashed migrator" case below.)
+**A SIGKILLed `--when-idle` leaves its `draining` marker behind.** The marker holds `{pid, startTime, startedAt}` (a drain
+that cannot read its own start time refuses to start, so no marker can outlive a reused pid), so it is recognised as
+stale (pid dead, or reused by a process with another start time) and then it refuses nothing. When the drain paused the
+broker it also records `pausedByDrain: true` first and writes its own reason ("paused for scheduler migration (lane
+migrate-scheduler --when-idle, pid N)") into PAUSE. Whoever clears a stale marker (the next `lane run`, under the
+lock; a re-run of `--when-idle`, before or after the fence) resumes the broker only if the marker says the drain paused
+it AND PAUSE still holds that exact reason: a pause an operator set is never lifted. `lane status` reports a stale marker.
+(A kill in the sub-second migration window leaves the existing "crashed migrator" `migrating` marker too, below; intake
+stays refused until a re-run finishes the job.)
+
+**An unreadable or malformed `draining` file fails closed.** If the marker cannot be read or parsed it cannot be judged:
+new intake refuses, the probe reports `draining`, `lane status` says so, no `lane` command deletes it, and
+`--when-idle` will not start over it. If no `lane migrate-scheduler --when-idle` is running, remove it by hand
+(`rm "$LANE_BROKER_STATE/draining"`, default `~/.cache/lane-broker/draining`).
 
 **The manual path** is the same sequence, and its order matters: `lane pause` stops the broker admitting anything,
 including tickets that are already queued, so a paused broker never empties its queue. Wait for idle FIRST, with the

@@ -424,10 +424,12 @@ export function renderStatusText(status) {
   } else if (status.priority) {
     lines.push(`priority: active${status.priority.reservationOwner ? ` (reservation owner ${status.priority.reservationOwner} promoted to the front)` : ''}`);
   }
-  if (status.draining?.live) {
+  if (status.draining?.state === 'live') {
     lines.push(`draining for scheduler migration (pid ${status.draining.pid}, since ${new Date(status.draining.startedAt).toISOString()}): new tickets are refused, queued ones still run`);
+  } else if (status.draining?.state === 'unknown') {
+    lines.push(`drain marker (the "draining" file in the state root) is unreadable or malformed, so new tickets are refused; if no lane migrate-scheduler --when-idle is running, remove that file`);
   } else if (status.draining) {
-    lines.push(`drain marker is stale (pid ${status.draining.pid ?? 'unknown'} is gone); the next lane run or lane migrate-scheduler clears it`);
+    lines.push(`drain marker is stale (pid ${status.draining.pid} is gone); the next lane run or lane migrate-scheduler clears it`);
   }
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
   if (status.configWarning) {

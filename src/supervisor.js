@@ -13,7 +13,7 @@ import {
   writeCancelMarkerFile,
   LockTimeoutError,
   MigrationInProgressError,
-  assertNotMigrating,
+  testDrainAt,
 } from './state.js';
 import { enqueue, tryStart, dequeueSync, couldAdmitNow } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
@@ -560,18 +560,18 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     writeBrokerLog(root, line);
   }
 
-  // BRAIN-380: remote dispatch is an admission entry point; refuse before anything is sent to a runner.
+  // BRAIN-380: remote dispatch is an admission entry point. The marker check and the attempt write are ONE locked step
+  // (`refuseWhileMigrating`), so a migration or drain cannot start between them; refuse before anything is sent to a runner.
+  testDrainAt(root, 'dispatch');
   try {
-    assertNotMigrating(root);
+    await updateAttempt(root, enriched.id, 0, { phase: 'running', runner: runner.name, ...(queuedAt ? { queuedAt } : {}) }, { refuseWhileMigrating: true });
   } catch (err) {
     if (!(err instanceof MigrationInProgressError)) throw err;
     process.stderr.write(`lane: ${err.message}\n`);
     await publishAndExit(0, () => migrationRefusalResult(enriched));
     return { fallback: false };
   }
-
   selectedRunner = runner.name;
-  await updateAttempt(root, enriched.id, 0, { phase: 'running', runner: runner.name, ...(queuedAt ? { queuedAt } : {}) });
   // Printed only now that eligibility is settled and a usable runner is
   // about to actually be dialed for the transfer -- see finding #5 above.
   process.stderr.write(`lane: running on ${runner.name}\n`);

@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, assertNotMigrating, MigrationInProgressError } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, assertNotMigrating, drainBlocksIntake, testDrainAt, withLock, MigrationInProgressError } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, loadGlobalConfig } from './config.js';
 import { remotePriorityFrom, PRIORITY_CAPABILITY } from './priority.js';
@@ -292,6 +292,17 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     return { exitCode: 1 };
   }
 
+  // BRAIN-380: the check at the top ran before a (possibly slow) header read, so a drain may have started since. Re-check under
+  // the broker lock BEFORE the ticket directory exists or anything is extracted: a refusal leaves nothing behind.
+  testDrainAt(stateHome(), 'remote-exec');
+  try {
+    await withLock(stateHome(), () => assertNotMigrating(stateHome()));
+  } catch (err) {
+    if (!(err instanceof MigrationInProgressError)) throw err;
+    process.stderr.write(`lane remote-exec: ${err.message}\n`);
+    return { exitCode: 75 };
+  }
+
   const ticketsDir = path.join(root, 'tickets');
   fs.mkdirSync(ticketsDir, { recursive: true });
   const ticketDir = path.join(ticketsDir, header.ticketId);
@@ -550,7 +561,7 @@ export async function remoteProbeCommand() {
   // CPU/memory budgets are only enforced in active mode (checkResourceBudget);
   // in shadow mode they are reported as null so the client never skips on them.
   const enforced = globalCfg.schedulerMode === 'active';
-  const draining = Boolean(status.draining?.live);
+  const draining = drainBlocksIntake(status.draining);
   const payload = {
     protocol: 1,
     protocols: [1, 2],

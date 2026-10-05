@@ -12,6 +12,7 @@ import { createAttempt, readAttempt } from '../src/attempts.js';
 import { writeLease, removeLease, LEASE_STATE } from '../src/lease.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { migrateScheduler, migrateSchedulerCommand, drainMigrateScheduler } from '../src/migrate.js';
+import { clearStaleDrainMarker, drainPauseReason } from '../src/state.js';
 import { resolveScheduler } from '../src/fairness.js';
 import { selectRunner } from '../src/remote-client.js';
 import { stampPriorityOrigin } from '../src/priority-clock.js';
@@ -412,12 +413,12 @@ test('a SIGKILLed drain leaves a marker that is recognised as stale, ignored by 
   const child = laneSpawn(['migrate-scheduler', '--when-idle'], { env });
   const closed = new Promise((resolve) => child.on('close', resolve));
   await waitFor(() => exists(state, 'draining'), { timeoutMs: 30_000 });
-  assert.equal(readDrainMarker(state).live, true);
+  assert.equal(readDrainMarker(state).state, 'live');
   child.kill('SIGKILL');
   await closed;
 
   assert.equal(exists(state, 'draining'), true, 'SIGKILL leaves the marker behind');
-  assert.equal(readDrainMarker(state).live, false, 'but its owner is gone, so it is stale');
+  assert.equal(readDrainMarker(state).state, 'stale', 'but its owner is gone, so it is stale');
   const status = await laneRun(['status'], { env });
   assert.match(status.stdout, /drain marker is stale/);
   assert.equal(exists(state, 'draining'), true, 'status is read-only');
@@ -441,7 +442,7 @@ test('a SIGKILLed drain leaves a marker that is recognised as stale, ignored by 
 test('a marker whose pid was reused by another process (start time differs) is stale', () => {
   const { state } = freshEnv();
   atomicWriteJson(paths(state).draining, { pid: process.pid, startTime: 'Mon Jan  1 00:00:00 1990', startedAt: Date.now() });
-  assert.equal(readDrainMarker(state).live, false);
+  assert.equal(readDrainMarker(state).state, 'stale');
 });
 
 test('--when-idle on an already-migrated root exits 0 at once, without a drain marker or a wait', async () => {
@@ -471,4 +472,145 @@ test('the CLI timeout flag is wired: --timeout 1s gives up, exits 1 and clears t
   assert.equal(result.code, 1, result.stderr);
   assert.match(result.stderr, /not idle after 1s/);
   assert.equal(exists(state, 'draining'), false);
+});
+
+// ---- review fixes: pause ownership, remote intake races, unreadable marker, start time ----
+
+const MIGRATE_URL = new URL('../src/migrate.js', import.meta.url).href;
+
+/**
+ * A drain in a child process that stops dead at `seam` (`afterFairness`: paused, before the fence; `afterFence`: paused, after
+ * the fence), so the test can SIGKILL it at the one moment it owns a pause. Resolves once the child is at the seam.
+ */
+async function drainKilledAt(state, seam) {
+  const ready = path.join(path.dirname(state), `ready-${seam}`);
+  const code = `
+    import fs from 'node:fs';
+    import { drainMigrateScheduler } from ${JSON.stringify(MIGRATE_URL)};
+    setInterval(() => {}, 1000);
+    const stop = async () => { fs.writeFileSync(process.env.READY, 'x'); await new Promise(() => {}); };
+    await drainMigrateScheduler(process.env.ROOT, { pollMs: 10, readProcesses: () => [], ${seam}: stop });
+  `;
+  const child = spawn(process.execPath, ['--input-type=module', '-e', code], { env: { ...process.env, ROOT: state, READY: ready } });
+  const closed = new Promise((resolve) => child.on('close', resolve));
+  await waitFor(() => fs.existsSync(ready), { timeoutMs: 30_000 });
+  const pid = child.pid;
+  child.kill('SIGKILL');
+  await closed;
+  return pid;
+}
+
+for (const seam of ['afterFairness', 'afterFence']) {
+  const fenced = seam === 'afterFence';
+  test(`SIGKILL after the drain paused the broker (${fenced ? 'after' : 'before'} the fence): a lane run releases the drain's own pause`, async () => {
+    const { state } = freshEnv();
+    const pid = await drainKilledAt(state, seam);
+    assert.equal(fs.readFileSync(paths(state).pause, 'utf8'), drainPauseReason(pid), 'the drain paused the broker with its own reason');
+    assert.equal(readJsonSafe(paths(state).draining).pausedByDrain, true);
+    assert.equal(readDrainMarker(state).state, 'stale');
+
+    await assert.rejects(stampPriorityOrigin(state), MigrationInProgressError, 'the stale migrating marker still refuses intake until a re-run');
+    assert.equal(isPaused(state), false, 'the dead drain\'s pause is released');
+    assert.equal(exists(state, 'draining'), false);
+  });
+
+  test(`SIGKILL after the drain paused the broker (${fenced ? 'after' : 'before'} the fence): a re-run resumes it and finishes`, async () => {
+    const { state } = freshEnv();
+    await drainKilledAt(state, seam);
+    const result = await drainMigrateScheduler(state, FAST);
+    assert.equal(result.status, fenced ? 'recovered' : 'migrated');
+    assert.equal(isPaused(state), false, 'resumed, not mistaken for an operator pause');
+    assert.equal(exists(state, 'draining'), false);
+    assert.equal(exists(state, 'migrating'), false);
+    assert.equal(resolveScheduler(state, { log: false }).v2, true);
+  });
+}
+
+test('SIGKILL of a drain on an operator-paused broker: recovery never resumes the operator\'s pause', async () => {
+  const { state } = freshEnv();
+  pause(state);
+  await drainKilledAt(state, 'afterFairness');
+  assert.equal(readJsonSafe(paths(state).draining).pausedByDrain, undefined, 'the drain did not pause it');
+  await assert.rejects(stampPriorityOrigin(state), MigrationInProgressError);
+  assert.equal(fs.readFileSync(paths(state).pause, 'utf8'), 'operator');
+  const result = await drainMigrateScheduler(state, FAST);
+  assert.equal(result.status, 'migrated');
+  assert.equal(fs.readFileSync(paths(state).pause, 'utf8'), 'operator');
+});
+
+test('a stale marker that claims the pause is not resumed when PAUSE now holds somebody else\'s reason', async () => {
+  const { state } = freshEnv();
+  const pid = await deadPid();
+  atomicWriteJson(paths(state).draining, { pid, startTime: null, startedAt: Date.now(), pausedByDrain: true });
+  pause(state); // an operator paused it afterwards
+  assert.equal(clearStaleDrainMarker(state), true);
+  assert.equal(fs.readFileSync(paths(state).pause, 'utf8'), 'operator');
+  assert.equal(exists(state, 'draining'), false);
+});
+
+test('remote dispatch: a drain that starts between the intake check and the attempt write is refused, the attempt closed, nothing sent', async () => {
+  const { env, state, repoDir } = remoteSetup();
+  const marker = path.join(tmpDir('race-marker'), 'where');
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...markerCmd(marker, 0)], {
+    env: { ...env, LANE_BROKER_TEST_DRAIN_AT: 'dispatch', LANE_BROKER_TEST_DRAIN_PID: String(process.pid) },
+    cwd: repoDir,
+  });
+  assert.equal(exists(state, 'draining'), true, 'the seam fired');
+  assert.equal(result.code, 75, result.stderr);
+  assert.match(result.stderr, /scheduler migration pending \(draining\)/);
+  assert.equal(fs.existsSync(marker), false, 'the command never ran, remotely or locally');
+  assert.deepEqual(fs.readdirSync(paths(state).attempts), [], 'the attempt record is closed');
+});
+
+test('remote-exec: a drain that starts while the header is being read is refused before a ticket directory or any extraction', async () => {
+  const { state, env } = freshEnv();
+  const root = tmpDir('race-remote-exec-root');
+  const child = laneSpawn(['remote-exec', '--root', root], { env: { ...env, LANE_BROKER_TEST_DRAIN_AT: 'remote-exec', LANE_BROKER_TEST_DRAIN_PID: String(process.pid) } });
+  let stderr = '';
+  child.stderr.on('data', (d) => (stderr += d));
+  const closed = new Promise((resolve) => child.on('close', resolve));
+  child.stdin.end(`${JSON.stringify({ ticketId: '123e4567-e89b-42d3-a456-426614174000' })}\n`);
+  assert.equal(await closed, 75, stderr);
+  assert.equal(exists(state, 'draining'), true, 'the seam fired');
+  assert.match(stderr, /scheduler migration pending \(draining\)/);
+  assert.equal(fs.existsSync(path.join(root, 'tickets')), false, 'no ticket directory, so nothing was extracted either');
+});
+
+for (const [kind, write] of [
+  ['garbage', (file) => fs.writeFileSync(file, '{not json')],
+  ['a JSON value that is not a marker', (file) => fs.writeFileSync(file, '"hello"')],
+  ['a marker without a pid', (file) => fs.writeFileSync(file, '{"startedAt": 1}')],
+  ['a directory (unreadable as a file)', (file) => fs.mkdirSync(file)],
+]) {
+  test(`an unreadable drain marker (${kind}) fails closed: intake refuses, nothing deletes it, a drain will not start over it`, async () => {
+    const { state, env } = freshEnv();
+    write(paths(state).draining);
+    const refusal = (err) => err instanceof MigrationInProgressError && err.message === DRAINING_MESSAGE;
+    await assert.rejects(enqueue(state, ticket('t')), refusal);
+    await assert.rejects(stampPriorityOrigin(state), refusal, 'the lane-run path would clear a STALE marker, but not this one');
+    assert.equal(readDrainMarker(state).state, 'unknown');
+    assert.equal(clearStaleDrainMarker(state), false);
+    assert.equal(fs.existsSync(paths(state).draining), true, 'still there: it could not be judged');
+
+    const probe = JSON.parse((await laneRun(['remote-probe'], { env })).stdout);
+    assert.equal(probe.draining, true);
+    assert.match((await laneRun(['status'], { env })).stdout, /drain marker .* is unreadable or malformed/);
+
+    const result = await drainMigrateScheduler(state, FAST);
+    assert.equal(result.status, 'refused');
+    assert.match(result.checks[0].failures[0], /cannot be read or parsed.*remove that file/);
+    assert.equal(fs.existsSync(paths(state).draining), true);
+
+    fs.rmSync(paths(state).draining, { recursive: true, force: true }); // what the README tells an operator to do
+    await enqueue(state, ticket('after'));
+  });
+}
+
+test('a drain that cannot read its own start time refuses to start and writes no marker', async () => {
+  const { state } = freshEnv();
+  const result = await drainMigrateScheduler(state, { ...FAST, pid: await deadPid() });
+  assert.equal(result.status, 'refused');
+  assert.match(result.checks[0].failures[0], /cannot read this process's start time/);
+  assert.equal(exists(state, 'draining'), false);
+  assert.equal(isPaused(state), false);
 });
