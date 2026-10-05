@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, assertNotMigrating, drainBlocksIntake, testDrainAt, withLock, MigrationInProgressError } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, loadGlobalConfig } from './config.js';
 import { remotePriorityFrom, PRIORITY_CAPABILITY } from './priority.js';
@@ -292,29 +292,30 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     return { exitCode: 1 };
   }
 
-  // BRAIN-380: the check at the top ran before a (possibly slow) header read, so a drain may have started since. Re-check under
-  // the broker lock BEFORE the ticket directory exists or anything is extracted: a refusal leaves nothing behind.
+  // BRAIN-380: the check at the top ran before a (possibly slow) header read, so a drain may have started since. The check
+  // and the ticket directory (the intake commit point) are ONE locked step: nothing is created after a drain publishes, and a
+  // drain that publishes afterwards finds this live `lane remote-exec` in its process check and waits for it.
   testDrainAt(stateHome(), 'remote-exec');
-  try {
-    await withLock(stateHome(), () => assertNotMigrating(stateHome()));
-  } catch (err) {
-    if (!(err instanceof MigrationInProgressError)) throw err;
-    process.stderr.write(`lane remote-exec: ${err.message}\n`);
-    return { exitCode: 75 };
-  }
-
   const ticketsDir = path.join(root, 'tickets');
-  fs.mkdirSync(ticketsDir, { recursive: true });
   const ticketDir = path.join(ticketsDir, header.ticketId);
   try {
-    fs.mkdirSync(ticketDir);
+    await withLock(stateHome(), () => {
+      assertNotMigrating(stateHome());
+      fs.mkdirSync(ticketsDir, { recursive: true });
+      fs.mkdirSync(ticketDir);
+    });
   } catch (err) {
+    if (err instanceof MigrationInProgressError) {
+      process.stderr.write(`lane remote-exec: ${err.message}\n`);
+      return { exitCode: 75 };
+    }
     if (err.code === 'EEXIST') {
       process.stderr.write(`lane remote-exec: ticket directory already exists: ${ticketDir}\n`);
       return { exitCode: 1 };
     }
     throw err;
   }
+  await testHoldAt('remote-exec-committed');
   // Node's default for SIGHUP is to exit, but this process must outlive a dropped ssh session
   // to publish result.json; explicit cancellation goes through remote-cancel.
   process.on('SIGHUP', () => {});

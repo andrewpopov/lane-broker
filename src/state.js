@@ -284,6 +284,16 @@ export function testDrainAt(root, point) {
 }
 
 /**
+ * Test seam: `LANE_BROKER_TEST_HOLD_AT=<point>` makes a caller reaching `<point>` write `LANE_BROKER_TEST_HOLD_READY` and wait
+ * for `LANE_BROKER_TEST_HOLD_GO` to exist, so a test can act at an exact point of a multi-step intake. A no-op unless set.
+ */
+export async function testHoldAt(point) {
+  if (process.env.LANE_BROKER_TEST_HOLD_AT !== point) return;
+  fs.writeFileSync(process.env.LANE_BROKER_TEST_HOLD_READY, 'x');
+  while (!fs.existsSync(process.env.LANE_BROKER_TEST_HOLD_GO)) await sleep(20);
+}
+
+/**
  * The one guard every new-code intake entry point calls. Existence-only for `migrating` (the migrator's own business);
  * a drain marker refuses while its owner is alive or it cannot be judged, so a SIGKILLed `--when-idle` cannot block
  * intake for ever (a stale marker is ignored) but a half-written or damaged one never lets intake through.

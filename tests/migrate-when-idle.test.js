@@ -614,3 +614,49 @@ test('a drain that cannot read its own start time refuses to start and writes no
   assert.equal(exists(state, 'draining'), false);
   assert.equal(isPaused(state), false);
 });
+
+test('remote-exec: the intake check and the ticket directory are one locked step, so a drain published right after it finds the ticket in flight and waits', async () => {
+  const { state, env } = freshEnv();
+  const root = tmpDir('commit-point-root');
+  const dir = tmpDir('commit-point-hold');
+  const ready = path.join(dir, 'ready');
+  const go = path.join(dir, 'go');
+  const ticketId = '123e4567-e89b-42d3-a456-426614174001';
+  const child = laneSpawn(['remote-exec', '--root', root], { env: { ...env, LANE_BROKER_TEST_HOLD_AT: 'remote-exec-committed', LANE_BROKER_TEST_HOLD_READY: ready, LANE_BROKER_TEST_HOLD_GO: go } });
+  const closed = new Promise((resolve) => child.on('close', resolve));
+  child.stdin.end(`${JSON.stringify({ ticketId })}\n`);
+  try {
+    await waitFor(() => fs.existsSync(ready), { timeoutMs: 30_000 });
+    // Held right after the locked step: the commit point has happened, so the ticket directory exists...
+    assert.equal(fs.existsSync(path.join(root, 'tickets', ticketId)), true, 'the ticket directory was created inside the locked check');
+    // ...and a drain published now is not allowed to migrate under it: it counts this live remote-exec.
+    const table = () => [{ pid: child.pid, ppid: 1, command: `${process.execPath} ${path.join(path.dirname(SUPERVISOR), '..', 'bin', 'lane.js')} remote-exec --root ${root}` }];
+    const drain = await drainMigrateScheduler(state, { ...FAST, readProcesses: table, timeoutMs: 300, pollMs: 20 });
+    assert.equal(drain.status, 'timeout');
+    assert.match(drain.checks.flatMap((c) => c.failures).join('\n'), new RegExp(`lane process pid ${child.pid} is alive`));
+    assert.equal(exists(state, 'schedFence'), false, 'nothing migrated under the in-flight ticket');
+  } finally {
+    fs.writeFileSync(go, ''); // never leave the held child waiting, even when an assertion above failed
+    await closed;
+  }
+});
+
+test('the drain captures its identity once: the marker carries the validated start time and nothing re-probes it', async () => {
+  const { state } = freshEnv();
+  let probes = 0;
+  const readStartTime = () => {
+    probes += 1;
+    return probes === 1 ? 'Mon Jan  1 00:00:00 2024' : null; // a second probe would fail
+  };
+  const seen = [];
+  const result = await drainMigrateScheduler(state, {
+    ...FAST,
+    readStartTime,
+    afterFairness: () => seen.push(readJsonSafe(paths(state).draining)), // mid-migration: the marker was rewritten for the pause
+  });
+  assert.equal(result.status, 'migrated');
+  assert.equal(probes, 1);
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].startTime, 'Mon Jan  1 00:00:00 2024');
+  assert.equal(seen[0].pausedByDrain, true);
+});

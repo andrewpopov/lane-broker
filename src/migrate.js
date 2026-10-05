@@ -205,15 +205,14 @@ const isTransient = (check) => TRANSIENT_CHECKS.has(check.name) && !check.unread
 /** A refusal whose every failure is something that clears by itself once the broker is idle. */
 const stillBusy = (result) => result.status === 'refused' && result.checks.every((c) => c.failures.length === 0 || isTransient(c));
 
-/** (Re)write the drain marker for `pid`, keeping its start time and `startedAt` if it is already ours. Caller holds the broker lock. */
-function writeDrainMarker(root, { pid, now, pausedByDrain = false }) {
-  const existing = readDrainMarker(root);
-  const ours = existing?.pid === pid;
-  atomicWriteJson(
-    paths(root).draining,
-    { pid, startTime: ours ? existing.startTime : (processStartTime(pid) ?? null), startedAt: ours ? existing.startedAt : now(), ...(pausedByDrain ? { pausedByDrain: true } : {}) },
-    { fsync: true },
-  );
+/**
+ * (Re)write the drain marker from an `identity` (`{pid, startTime, startedAt}`) captured and validated ONCE, by `startDrain`.
+ * Never probes the process again, and refuses a missing start time: a marker without one could read as live for ever after
+ * pid reuse. Caller holds the broker lock.
+ */
+function writeDrainMarker(root, { pid, startTime, startedAt }, { pausedByDrain = false } = {}) {
+  if (!startTime) throw new Error(`refusing to write a drain marker for pid ${pid} without a start time`);
+  atomicWriteJson(paths(root).draining, { pid, startTime, startedAt, ...(pausedByDrain ? { pausedByDrain: true } : {}) }, { fsync: true });
 }
 
 /** Remove the drain marker if `pid` wrote it. Caller holds the broker lock. */
@@ -228,7 +227,7 @@ function removeDrainMarker(root, pid) {
  * fence over an invalid fairness file: the broker is running legacy), `refused`, `ready` (dry run, all preconditions
  * hold) or `migrated`. `afterFairness` (before the queue fence), `afterQueueRename` (between the fence's two renames) and `afterFence` are test seams.
  *
- * `fromDrain` (`--when-idle`, at quiescence) makes the pause part of the same lock hold: it pauses the broker if it is
+ * `fromDrain` (`--when-idle`, at quiescence; the drain's identity, see `writeDrainMarker`) makes the pause part of the same lock hold: it pauses the broker if it is
  * not paused, and on EVERY outcome (migrated, refused, thrown) resumes it again if this call paused it, then removes
  * the drain marker (unless the refusal is only "busy again", see `stillBusy`), so nothing can be admitted between the
  * quiescence check and the resume.
@@ -252,7 +251,7 @@ export async function migrateScheduler(root, { dryRun = false, fromDrain = false
       if (fromDrain && !fs.existsSync(p.pause)) {
         // Ownership is durable BEFORE the pause exists: a drain killed from here on is recognised by its marker and its own
         // reason in PAUSE (`releaseDrainPause`), and a pause somebody else set never matches either.
-        writeDrainMarker(root, { pid, now, pausedByDrain: true });
+        writeDrainMarker(root, fromDrain, { pausedByDrain: true });
         atomicWriteFile(p.pause, drainPauseReason(pid), { fsync: true });
         pausedHere = true;
       }
@@ -287,7 +286,7 @@ export async function migrateScheduler(root, { dryRun = false, fromDrain = false
       // (which no longer owns a pause).
       if (fromDrain) {
         if (!(result && stillBusy(result))) removeDrainMarker(root, pid);
-        else if (pausedHere) writeDrainMarker(root, { pid, now });
+        else if (pausedHere) writeDrainMarker(root, fromDrain);
       }
     }
     return fromDrain ? { ...result, resumed: pausedHere } : result;
@@ -310,18 +309,20 @@ function abortableSleep(ms, signal) {
 }
 
 /** Take the drain marker under the lock. Refuses while another migrator or drain is alive; a stale marker (dead owner) is taken over. */
-async function startDrain(root, { pid, now }) {
+async function startDrain(root, { pid, now, readStartTime }) {
   return withLock(root, () => {
     // Without its own start time a marker could not tell a reused pid from this process, so it could read as live for ever.
-    if (!processStartTime(pid)) return { refused: `cannot read this process's start time (ps failed for pid ${pid}); not starting a drain, no marker written` };
+    const startTime = readStartTime(pid); // the one probe: this value is what the marker carries
+    if (!startTime) return { refused: `cannot read this process's start time (ps failed for pid ${pid}); not starting a drain, no marker written` };
     const other = liveMigrator(root, pid);
     if (other !== null) return { refused: `another lane migrate-scheduler is running (pid ${other})` };
     const existing = readDrainMarker(root);
     if (existing?.state === 'unknown') return { refused: `the drain marker ${paths(root).draining} cannot be read or parsed, so it cannot be judged; if no lane migrate-scheduler --when-idle is running, remove that file and run again` };
     if (existing?.state === 'live' && existing.pid !== pid) return { refused: `another lane migrate-scheduler --when-idle is draining (pid ${existing.pid})` };
     const tookOverStale = clearStaleDrainMarker(root); // also resumes a pause that dead drain made
-    writeDrainMarker(root, { pid, now });
-    return { tookOverStale };
+    const identity = { pid, startTime, startedAt: now() };
+    writeDrainMarker(root, identity);
+    return { tookOverStale, identity };
   });
 }
 
@@ -332,9 +333,9 @@ async function startDrain(root, { pid, now }) {
  * `aborted`. Whatever the outcome the drain marker is gone and a pause this command made is undone; only a SIGKILL
  * leaves a marker, and `readDrainMarker` recognises that one as stale.
  */
-export async function drainMigrateScheduler(root, { timeoutMs = DRAIN_TIMEOUT_MS, pollMs = DRAIN_POLL_MS, signal = new AbortController().signal, log = () => {}, sleep = abortableSleep, readProcesses = readProcessTable, pid = process.pid, now = Date.now, ...seams } = {}) {
+export async function drainMigrateScheduler(root, { timeoutMs = DRAIN_TIMEOUT_MS, pollMs = DRAIN_POLL_MS, signal = new AbortController().signal, log = () => {}, sleep = abortableSleep, readProcesses = readProcessTable, pid = process.pid, now = Date.now, readStartTime = processStartTime, ...seams } = {}) {
   if (readSchedulerFence(root).status === 'valid') return migrateScheduler(root, { readProcesses, pid, now });
-  const started = await startDrain(root, { pid, now });
+  const started = await startDrain(root, { pid, now, readStartTime });
   if (started.refused) return { status: 'refused', checks: [{ name: 'migrator', failures: [started.refused] }] };
   if (started.tookOverStale) log('lane migrate-scheduler: took over a stale drain marker left by a killed run');
   const deadline = now() + timeoutMs;
@@ -354,7 +355,7 @@ export async function drainMigrateScheduler(root, { timeoutMs = DRAIN_TIMEOUT_MS
         log('lane migrate-scheduler: the broker is paused, so queued tickets will not start until `lane resume`; waiting');
       }
       if (failing.length === 0) {
-        const result = await migrateScheduler(root, { readProcesses, pid, now, fromDrain: true, ...seams });
+        const result = await migrateScheduler(root, { readProcesses, pid, now, fromDrain: started.identity, ...seams });
         if (!stillBusy(result)) return result;
       }
       if (now() >= deadline) return { status: 'timeout', counts, checks: failing };
