@@ -13,17 +13,21 @@ import {
   publishToStore,
   touchLastUsed,
   acquireLease,
+  trimStore,
   evictLeastRecentlyUsed,
   purgeTrash,
   removeTree,
   findInstallPathReference,
-  findWritableStoreFile,
-  quarantineEntry,
+  findMissingInstalled,
+  lockEligibility,
+  SCAN_CHUNK_BYTES,
+  ALLOWED_ROOT_SCRIPTS,
   snapshotOutsideNodeModules,
   snapshotChanges,
 } from '../src/deps-cache.js';
 import { resolveTicketConfig, loadGlobalConfig, ConfigError, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { freshEnv, writeRepoConfig, writeGlobalConfig } from './helpers.js';
+import { withLock } from '../src/state.js';
 
 /**
  * BRAIN-389: the installed-deps store. Everything here runs on synthetic trees (no npm, no network);
@@ -83,17 +87,18 @@ function publish(cacheRoot, opts) {
   return { key, src, bytes: result.bytes };
 }
 
-/** Test-only: remove a materialized farm (writable dirs, linked files) without touching store inodes. */
-function removeFarm(dir) {
-  fs.rmSync(dir, { recursive: true, force: true });
-}
-
 // ---- key ----
 
-function makeKeyFixture() {
+const REGISTRY_ENTRY = (version) => ({ version, resolved: `https://registry.npmjs.org/x/-/x-${version}.tgz`, integrity: 'sha512-abc' });
+
+function makeKeyFixture({ lockPackages, scripts, tarball } = {}) {
   const root = tmpDir('deps-cache-key');
-  fs.writeFileSync(path.join(root, 'package.json'), '{"name":"a"}');
-  fs.writeFileSync(path.join(root, 'package-lock.json'), JSON.stringify({ lockfileVersion: 3, packages: { '': { name: 'a' }, 'node_modules/x': { version: '1.0.0' } } }));
+  fs.writeFileSync(path.join(root, 'package.json'), JSON.stringify({ name: 'a', ...(scripts ? { scripts } : {}) }));
+  fs.writeFileSync(
+    path.join(root, 'package-lock.json'),
+    JSON.stringify({ lockfileVersion: 3, packages: lockPackages ?? { '': { name: 'a' }, 'node_modules/x': REGISTRY_ENTRY('1.0.0') } }),
+  );
+  if (tarball) fs.writeFileSync(path.join(root, 'x-1.0.0.tgz'), tarball);
   const userconfig = path.join(root, 'userrc');
   const globalconfig = path.join(root, 'globalrc');
   fs.writeFileSync(userconfig, '');
@@ -102,30 +107,49 @@ function makeKeyFixture() {
     dir: root,
     rootDir: root,
     installArgv: ['npm', 'ci', '--no-audit', '--no-fund'],
-    env: { npm_config_cache: '/r/npm-cache', npm_config_userconfig: userconfig, npm_config_globalconfig: globalconfig, PATH: '/bin' },
+    env: { npm_config_cache: '/r/npm-cache', npm_config_userconfig: userconfig, npm_config_globalconfig: globalconfig, PATH: '/bin', HOME: '/home/runner' },
     npmVersion: '11.9.0',
+    system: { glibc: '2.39', libc: 'glibc', osId: 'ubuntu', osVersionId: '24.04' },
+    toolVersion: (cmd) => `${cmd} 13.2.0`,
   });
   return { root, userconfig, globalconfig, inputs };
 }
 
-test('key: identical inputs give the same key, and a non-npm env var does not matter', () => {
+test('key: identical inputs give the same key; volatile variables do not matter, any other does', () => {
   const f = makeKeyFixture();
   const a = computeDepsKey(f.inputs());
-  const withOtherEnv = f.inputs();
-  withOtherEnv.env.PATH = '/somewhere/else';
   assert.match(a.key, /^[0-9a-f]{64}$/);
   assert.equal(computeDepsKey(f.inputs()).key, a.key);
-  assert.equal(computeDepsKey(withOtherEnv).key, a.key);
+
+  const volatile = f.inputs();
+  Object.assign(volatile.env, {
+    TMPDIR: '/var/tmp/lb-other', TMP: '/x', TEMP: '/x', PWD: '/elsewhere', OLDPWD: '/o', SHLVL: '3', _: '/usr/bin/other',
+    GIT_CEILING_DIRECTORIES: '/tickets/other', SSH_CONNECTION: '1.2.3.4 5 6.7.8.9 22', SSH_AUTH_SOCK: '/tmp/agent',
+    LANE_BROKER_LEASE: 'other-ticket', LANE_BROKER_CPU_CORES: '7', LANE_FAKE_RUNNER: '1',
+  });
+  assert.equal(computeDepsKey(volatile).key, a.key, 'per-run variables are excluded from the key');
+
+  for (const change of [{ PATH: '/other/bin' }, { HOME: '/home/other' }, { CC: 'clang' }, { HTTPS_PROXY: 'http://p' }, { npm_config_registry: 'http://r.invalid' }]) {
+    const i = f.inputs();
+    Object.assign(i.env, change);
+    assert.notEqual(computeDepsKey(i).key, a.key, `${Object.keys(change)[0]} is part of the key`);
+  }
 });
 
 test('key: every key input changes the key', () => {
-  const f = makeKeyFixture();
+  const f = makeKeyFixture({
+    lockPackages: { '': { name: 'a' }, 'node_modules/x': { ...REGISTRY_ENTRY('1.0.0'), hasInstallScript: true }, 'node_modules/t': { version: '1.0.0', resolved: 'file:x-1.0.0.tgz', integrity: 'sha512-t' } },
+    tarball: 'tarball bytes one',
+  });
   const base = computeDepsKey(f.inputs()).key;
+  assert.match(base, /^[0-9a-f]{64}$/);
   const changed = {};
   const keyWith = (name, mutate) => {
     const inputs = f.inputs();
     const restore = mutate(inputs) ?? (() => {});
-    changed[name] = computeDepsKey(inputs).key;
+    const result = computeDepsKey(inputs);
+    assert.ok(result.key, `${name}: ${result.reason}`);
+    changed[name] = result.key;
     restore();
   };
   const rewrite = (file, content) => {
@@ -133,20 +157,18 @@ test('key: every key input changes the key', () => {
     fs.writeFileSync(file, content);
     return () => (had === null ? fs.rmSync(file) : fs.writeFileSync(file, had));
   };
+  const lockFile = path.join(f.root, 'package-lock.json');
+  const lockWith = (fn) => {
+    const lock = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+    fn(lock);
+    return rewrite(lockFile, JSON.stringify(lock));
+  };
 
-  keyWith('lockfile bytes', () => rewrite(path.join(f.root, 'package-lock.json'), JSON.stringify({ lockfileVersion: 3, packages: { '': { name: 'a' }, 'node_modules/x': { version: '1.0.1' } } })));
-  keyWith('lockfile name (shrinkwrap)', () => rewrite(path.join(f.root, 'npm-shrinkwrap.json'), fs.readFileSync(path.join(f.root, 'package-lock.json'))));
+  keyWith('lockfile bytes', () => lockWith((lock) => (lock.packages['node_modules/x'].version = '1.0.1')));
+  keyWith('lockfile name (shrinkwrap)', () => rewrite(path.join(f.root, 'npm-shrinkwrap.json'), fs.readFileSync(lockFile)));
   keyWith('package.json', () => rewrite(path.join(f.root, 'package.json'), '{"name":"a","x":1}'));
   keyWith('dir .npmrc', () => rewrite(path.join(f.root, '.npmrc'), 'foo=bar\n'));
-  const subdir = path.join(f.root, 'sub');
-  fs.mkdirSync(subdir);
-  fs.copyFileSync(path.join(f.root, 'package.json'), path.join(subdir, 'package.json'));
-  fs.copyFileSync(path.join(f.root, 'package-lock.json'), path.join(subdir, 'package-lock.json'));
-  const subBase = computeDepsKey({ ...f.inputs(), dir: subdir }).key;
-  fs.writeFileSync(path.join(f.root, '.npmrc'), 'root=1\n');
-  changed['root .npmrc'] = computeDepsKey({ ...f.inputs(), dir: subdir }).key;
-  fs.rmSync(path.join(f.root, '.npmrc'));
-  assert.notEqual(changed['root .npmrc'], subBase);
+  keyWith('file: tarball bytes', () => rewrite(path.join(f.root, 'x-1.0.0.tgz'), 'tarball bytes two'));
   keyWith('node version', (i) => {
     i.runtime = { version: 'v0.0.0', platform: process.platform, arch: process.arch };
   });
@@ -155,6 +177,21 @@ test('key: every key input changes the key', () => {
   });
   keyWith('node arch', (i) => {
     i.runtime = { version: process.version, platform: process.platform, arch: 'mips' };
+  });
+  keyWith('glibc', (i) => {
+    i.system = { ...i.system, glibc: '2.31' };
+  });
+  keyWith('os id', (i) => {
+    i.system = { ...i.system, osId: 'debian' };
+  });
+  keyWith('os version id', (i) => {
+    i.system = { ...i.system, osVersionId: '22.04' };
+  });
+  keyWith('cc version', (i) => {
+    i.toolVersion = (cmd) => (cmd === 'cc' ? 'cc 14.0.0' : 'python3 13.2.0');
+  });
+  keyWith('python3 version (missing is a value)', (i) => {
+    i.toolVersion = (cmd) => (cmd === 'python3' ? 'missing' : 'cc 13.2.0');
   });
   keyWith('npm version', (i) => {
     i.npmVersion = '11.9.1';
@@ -165,32 +202,120 @@ test('key: every key input changes the key', () => {
   keyWith('npm_config value', (i) => {
     i.env.npm_config_cache = '/elsewhere';
   });
-  keyWith('extra npm_config var', (i) => {
-    i.env.npm_config_registry = 'http://registry.invalid';
+  keyWith('arbitrary env var', (i) => {
+    i.env.CXX = 'clang++';
   });
   keyWith('userconfig bytes', () => rewrite(f.userconfig, 'registry=http://other.invalid\n'));
   keyWith('globalconfig bytes', () => rewrite(f.globalconfig, 'registry=http://other.invalid\n'));
 
-  for (const [name, key] of Object.entries(changed)) {
-    assert.match(key, /^[0-9a-f]{64}$/, name);
-    assert.notEqual(key, base, `changing "${name}" must change the key`);
-  }
+  for (const [name, key] of Object.entries(changed)) assert.notEqual(key, base, `changing "${name}" must change the key`);
   assert.equal(new Set(Object.values(changed)).size, Object.keys(changed).length, 'each input changes the key to its own value');
   assert.equal(computeDepsKey(f.inputs()).key, base, 'restoring every input restores the key');
 });
 
-test('key: no lockfile, or a lockfile that links local packages, is not cacheable', () => {
+test('key: the root .npmrc is an input', () => {
   const f = makeKeyFixture();
-  const lock = path.join(f.root, 'package-lock.json');
-  const original = fs.readFileSync(lock);
-  fs.rmSync(lock);
-  assert.deepEqual(computeDepsKey(f.inputs()), { key: null, reason: 'no lockfile' });
-  fs.writeFileSync(lock, JSON.stringify({ packages: { '': {}, 'packages/a': {}, 'node_modules/a': { resolved: 'packages/a', link: true } } }));
-  assert.match(computeDepsKey(f.inputs()).reason, /links local packages/);
-  fs.writeFileSync(lock, '{not json');
-  assert.match(computeDepsKey(f.inputs()).reason, /not valid JSON/);
-  fs.writeFileSync(lock, original);
-  assert.ok(computeDepsKey(f.inputs()).key);
+  const sub = path.join(f.root, 'sub');
+  fs.mkdirSync(sub);
+  for (const n of ['package.json', 'package-lock.json']) fs.copyFileSync(path.join(f.root, n), path.join(sub, n));
+  const before = computeDepsKey({ ...f.inputs(), dir: sub }).key;
+  fs.writeFileSync(path.join(f.root, '.npmrc'), 'root=1\n');
+  assert.notEqual(computeDepsKey({ ...f.inputs(), dir: sub }).key, before);
+});
+
+test('key: the compiler versions only matter when some lock entry has an install script', () => {
+  const plain = makeKeyFixture();
+  const i = plain.inputs();
+  const a = computeDepsKey(i).key;
+  i.toolVersion = () => 'something else entirely';
+  assert.equal(computeDepsKey(i).key, a);
+});
+
+test('eligibility: only a pinned v2/v3 lock is cached; every other source is refused with its reason', () => {
+  const ok = {
+    lockfileVersion: 3,
+    packages: {
+      '': { name: 'a' },
+      'node_modules/reg': REGISTRY_ENTRY('1.0.0'),
+      'node_modules/git': { version: '1.0.0', resolved: 'git+ssh://git@github.com/o/r.git#0123456789abcdef0123456789abcdef01234567' },
+      'node_modules/tgz': { version: '1.0.0', resolved: 'file:vendor/jun-client/jun-1.0.0.tgz', integrity: 'sha512-t' },
+      'node_modules/bundled': { version: '1.0.0', inBundle: true },
+    },
+  };
+  const verdict = lockEligibility(ok);
+  assert.equal(verdict.ok, true);
+  assert.deepEqual(verdict.tarballs, ['vendor/jun-client/jun-1.0.0.tgz']);
+
+  const withEntry = (name, entry) => ({ lockfileVersion: 3, packages: { '': {}, [name]: entry } });
+  const refused = {
+    'lockfile v1': { lockfileVersion: 1, dependencies: {} },
+    'no packages map': { lockfileVersion: 3 },
+    'file: dir': withEntry('node_modules/d', { version: '1.0.0', resolved: 'file:../d' }),
+    'link': withEntry('node_modules/l', { resolved: 'packages/l', link: true }),
+    'workspace member': withEntry('packages/w', { version: '1.0.0' }),
+    'missing resolved': withEntry('node_modules/m', { version: '1.0.0', integrity: 'sha512-abc' }),
+    'registry without integrity': withEntry('node_modules/r', { version: '1.0.0', resolved: 'https://registry.npmjs.org/r/-/r-1.0.0.tgz' }),
+    'other registry': withEntry('node_modules/o', { version: '1.0.0', resolved: 'https://npm.example.com/o.tgz', integrity: 'sha512-abc' }),
+    'http registry': withEntry('node_modules/h', { version: '1.0.0', resolved: 'http://registry.npmjs.org/h.tgz', integrity: 'sha512-abc' }),
+    'git branch, not a sha': withEntry('node_modules/g', { version: '1.0.0', resolved: 'git+ssh://git@github.com/o/r.git#main' }),
+    'file tarball without integrity': withEntry('node_modules/f', { version: '1.0.0', resolved: 'file:f.tgz' }),
+  };
+  for (const [name, lock] of Object.entries(refused)) {
+    const result = lockEligibility(lock);
+    assert.equal(result.ok, false, name);
+    assert.ok(result.reason.length > 0, name);
+  }
+});
+
+test('key: an ineligible lock or a missing tarball is not cacheable and says why', () => {
+  const f = makeKeyFixture({ lockPackages: { '': {}, 'node_modules/d': { version: '1.0.0', resolved: 'file:../d' } } });
+  const refused = computeDepsKey(f.inputs());
+  assert.equal(refused.key, null);
+  assert.match(refused.reason, /node_modules\/d resolves to an unpinned source/);
+
+  const noTarball = makeKeyFixture({ lockPackages: { '': {}, 'node_modules/t': { version: '1.0.0', resolved: 'file:x-1.0.0.tgz', integrity: 'sha512-t' } } });
+  assert.match(computeDepsKey(noTarball.inputs()).reason, /tarball x-1\.0\.0\.tgz is not in the snapshot/);
+
+  const none = makeKeyFixture();
+  fs.rmSync(path.join(none.root, 'package-lock.json'));
+  assert.deepEqual(computeDepsKey(none.inputs()), { key: null, reason: 'no lockfile' });
+  fs.writeFileSync(path.join(none.root, 'package-lock.json'), '{not json');
+  assert.match(computeDepsKey(none.inputs()).reason, /not valid JSON/);
+});
+
+test('key: a root lifecycle script outside the allowlist is not cacheable unless the lane declares it safe', () => {
+  assert.ok(ALLOWED_ROOT_SCRIPTS.has('git config core.hooksPath .githooks || true'));
+  const allowed = makeKeyFixture({ scripts: { prepare: 'git config core.hooksPath .githooks || true', test: 'node --test' } });
+  assert.ok(computeDepsKey(allowed.inputs()).key, 'the known prepare script and non-install scripts are fine');
+
+  for (const name of ['preinstall', 'install', 'postinstall', 'prepare', 'preprepare', 'postprepare']) {
+    const f = makeKeyFixture({ scripts: { [name]: 'husky install' } });
+    const result = computeDepsKey(f.inputs());
+    assert.equal(result.key, null, name);
+    assert.match(result.reason, new RegExp(`${name}: husky install`));
+    assert.ok(computeDepsKey({ ...f.inputs(), rootScriptsSafe: true }).key, `${name} is cacheable once the lane declares root scripts safe`);
+  }
+  const near = makeKeyFixture({ scripts: { prepare: 'git config core.hooksPath .githooks' } });
+  assert.equal(computeDepsKey(near.inputs()).key, null, 'the allowlist is exact strings, not a prefix');
+});
+
+test('optional completeness: lock entries for this platform that npm did not install are found', () => {
+  const lock = {
+    packages: {
+      '': {},
+      'node_modules/a': { version: '1' },
+      'node_modules/@s/b': { version: '1' },
+      'node_modules/mac-only': { version: '1', os: ['darwin'], optional: true },
+      'node_modules/not-linux': { version: '1', os: ['!linux'], optional: true },
+      'node_modules/arm-only': { version: '1', cpu: ['arm64'], optional: true },
+      'node_modules/musl-only': { version: '1', os: ['linux'], libc: ['musl'], optional: true },
+      'node_modules/glibc-only': { version: '1', os: ['linux'], libc: ['glibc'], optional: true },
+    },
+  };
+  const here = { platform: 'linux', arch: 'x64', libc: 'glibc' };
+  assert.deepEqual(findMissingInstalled(lock, { 'node_modules/a': {}, 'node_modules/@s/b': {}, 'node_modules/glibc-only': {} }, here), []);
+  assert.deepEqual(findMissingInstalled(lock, { 'node_modules/a': {} }, here), ['@s/b', 'glibc-only']);
+  assert.deepEqual(findMissingInstalled(lock, { 'node_modules/a': {}, 'node_modules/@s/b': {} }, { platform: 'darwin', arch: 'arm64', libc: undefined }), ['arm-only', 'mac-only', 'not-linux'], 'on macOS: mac-only and arm-only apply, the linux ones do not');
 });
 
 // ---- publish / materialize ----
@@ -206,34 +331,56 @@ test('materialize reproduces the stored tree, including the .bin symlink, and th
   assert.equal(out.trim(), 'tool ran');
 });
 
-test('materialize makes hardlinks (same inode as the store) inside real, writable directories', () => {
+test('materialize makes private writable copies: no shared inodes, read-only store, writable farm', () => {
   const cacheRoot = tmpDir('deps-cache-store');
   const { key } = publish(cacheRoot);
   const work = tmpDir('deps-cache-work');
-  const farm = path.join(work, 'node_modules');
-  materializeFromStore(cacheRoot, key, farm);
+  const copy = path.join(work, 'node_modules');
+  materializeFromStore(cacheRoot, key, copy);
   const stored = path.join(entryTree(cacheRoot, key), 'pkg1', 'package.json');
-  assert.equal(fs.statSync(path.join(farm, 'pkg1', 'package.json')).ino, fs.statSync(stored).ino);
-  assert.ok((fs.statSync(path.join(farm, 'pkg1')).mode & 0o200) !== 0, 'farm directories are owner-writable');
+  const mine = path.join(copy, 'pkg1', 'package.json');
+  assert.notEqual(fs.statSync(mine).ino, fs.statSync(stored).ino, 'a copy, never a hardlink');
+  assert.equal(fs.statSync(mine).nlink, 1);
+  assert.equal(fs.statSync(stored).nlink, 1);
+  assert.ok((fs.statSync(mine).mode & 0o200) !== 0, 'copied files are owner-writable');
+  assert.ok((fs.statSync(path.join(copy, 'pkg1')).mode & 0o200) !== 0, 'copied directories are owner-writable');
+  assert.equal(fs.statSync(path.join(copy, 'pkg0', 'cli.js')).mode & 0o111, 0o111, 'the exec bit survives');
   assert.ok((fs.statSync(path.join(entryTree(cacheRoot, key), 'pkg1')).mode & 0o222) === 0, 'store directories are read-only');
   assert.ok((fs.statSync(stored).mode & 0o222) === 0, 'store files are read-only');
 });
 
-test('an in-place write to a materialized file fails with EACCES and the store stays intact', { skip: IS_ROOT && 'root ignores file modes' }, () => {
+test('an in-place edit of a materialized file changes only that run\'s copy', () => {
   const cacheRoot = tmpDir('deps-cache-store');
   const { key, src } = publish(cacheRoot);
   const before = treeDigest(src);
   const work = tmpDir('deps-cache-work');
-  const farm = path.join(work, 'node_modules');
-  materializeFromStore(cacheRoot, key, farm);
-
-  const target = path.join(farm, 'pkg3', 'package.json');
-  assert.throws(() => fs.writeFileSync(target, 'corrupted'), { code: 'EACCES' });
-  assert.throws(() => fs.appendFileSync(target, 'corrupted'), { code: 'EACCES' });
-  assert.throws(() => fs.truncateSync(target, 0), { code: 'EACCES' });
-
+  const copy = path.join(work, 'node_modules');
+  materializeFromStore(cacheRoot, key, copy);
+  fs.appendFileSync(path.join(copy, 'pkg3', 'package.json'), ' edited');
+  assert.notEqual(treeDigest(copy), before);
   assert.equal(treeDigest(entryTree(cacheRoot, key)), before, 'the store is byte-identical');
-  assert.equal(treeDigest(farm), before, 'and so is the farm that failed to write');
+});
+
+test('a run that chmods a file, edits it and restores the mode cannot affect another run\'s hit', () => {
+  const cacheRoot = tmpDir('deps-cache-store');
+  const { key, src } = publish(cacheRoot);
+  const before = treeDigest(src);
+  const [workA, workB] = [tmpDir('deps-cache-work-a'), tmpDir('deps-cache-work-b')];
+  const copyA = path.join(workA, 'node_modules');
+  const copyB = path.join(workB, 'node_modules');
+  materializeFromStore(cacheRoot, key, copyA);
+
+  // the attack on a hardlink farm: make the shared inode writable, edit it, put the mode back
+  const target = path.join(copyA, 'pkg5', 'lib', 'deep', 'index.js');
+  const mode = fs.statSync(target).mode & 0o7777;
+  fs.chmodSync(target, 0o666);
+  fs.writeFileSync(target, 'module.exports = "poisoned";\n');
+  fs.chmodSync(target, mode & ~0o222);
+
+  materializeFromStore(cacheRoot, key, copyB);
+  assert.equal(treeDigest(copyB), before, 'the second run gets the original bytes');
+  assert.equal(treeDigest(entryTree(cacheRoot, key)), before, 'and the store was never touched');
+  assert.equal(fs.readFileSync(path.join(copyB, 'pkg5', 'lib', 'deep', 'index.js'), 'utf8'), 'module.exports = 5;\n');
 });
 
 test('rename-over, new files and new directories work in a materialized tree and never reach the store', () => {
@@ -360,21 +507,85 @@ test('using an entry (touchLastUsed) makes it the newest, so the next-oldest is 
   assert.deepEqual(evictLeastRecentlyUsed(cacheRoot, a.bytes * 2 + 1), [b.key]);
 });
 
-test('eviction never takes a key a live run holds a lease on, even when it is the oldest and the store is over bound', () => {
+function makeLock() {
+  const lockRoot = tmpDir('deps-cache-lock');
+  return (fn) => withLock(lockRoot, fn);
+}
+
+test('eviction never takes a key a live run holds a lease on, even when it is the oldest and the store is over bound', async () => {
   const cacheRoot = tmpDir('deps-cache-store');
+  const lock = makeLock();
   const [oldest, middle, newest] = [1, 2, 3].map(() => publish(cacheRoot));
   ageEntry(cacheRoot, oldest.key, 3 * 60_000);
   ageEntry(cacheRoot, middle.key, 2 * 60_000);
   ageEntry(cacheRoot, newest.key, 60_000);
-  const release = acquireLease(cacheRoot, oldest.key);
+  const release = await acquireLease(cacheRoot, oldest.key, 1, lock);
 
-  const evicted = evictLeastRecentlyUsed(cacheRoot, oldest.bytes + 1);
+  const evicted = evictLeastRecentlyUsed(cacheRoot, 1);
   assert.ok(!evicted.includes(oldest.key), 'the leased key survives');
-  assert.deepEqual(evicted, [middle.key, newest.key], 'eviction moves on to the next-oldest, as far as the bound requires');
+  assert.deepEqual(evicted, [middle.key, newest.key], 'eviction moves on to the next-oldest');
   assert.deepEqual(liveKeys(cacheRoot), [oldest.key]);
 
-  release();
-  assert.deepEqual(evictLeastRecentlyUsed(cacheRoot, 0), [oldest.key], 'once released it is evictable again');
+  await release();
+  assert.deepEqual(liveKeys(cacheRoot), [], 'releasing the lease re-runs the trim: the key that was over bound only because it was leased goes now');
+  assert.deepEqual(fs.readdirSync(cacheRoot).filter((n) => n.startsWith('.trash-')), [], 'and the trash is purged');
+});
+
+test('a lease file is written whole (no temp file left behind) and names a live process', async () => {
+  const cacheRoot = tmpDir('deps-cache-store');
+  const { key } = publish(cacheRoot);
+  const release = await acquireLease(cacheRoot, key, 1 << 30, makeLock());
+  const leases = fs.readdirSync(path.join(entryDir(cacheRoot, key), 'leases'));
+  assert.equal(leases.length, 1);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(entryDir(cacheRoot, key), 'leases', leases[0]), 'utf8')).pid, process.pid);
+  assert.deepEqual(fs.readdirSync(entryDir(cacheRoot, key)).filter((n) => n.startsWith('.lease-tmp-')), []);
+  await release();
+});
+
+test('a lease that cannot be read counts as live and protects its key', () => {
+  const cacheRoot = tmpDir('deps-cache-store');
+  const { key } = publish(cacheRoot);
+  fs.writeFileSync(path.join(entryDir(cacheRoot, key), 'leases', 'torn'), '{"pid": 12');
+  assert.deepEqual(evictLeastRecentlyUsed(cacheRoot, 0), []);
+  fs.writeFileSync(path.join(entryDir(cacheRoot, key), 'leases', 'torn'), '{"no":"pid"}');
+  assert.deepEqual(evictLeastRecentlyUsed(cacheRoot, 0), []);
+  assert.deepEqual(liveKeys(cacheRoot), [key]);
+});
+
+test('lease versus eviction: eviction is mid-quarantine when a run tries to lease; the lease waits, then finds the entry gone (a miss), never a lease inside the trash', async () => {
+  const cacheRoot = tmpDir('deps-cache-store');
+  const lock = makeLock();
+  const { key } = publish(cacheRoot);
+  const order = [];
+  let leasing;
+  await lock(() => {
+    evictLeastRecentlyUsed(cacheRoot, 0, {
+      beforeQuarantine: () => {
+        // the run arrives exactly between eviction's lease check and its move
+        leasing = acquireLease(cacheRoot, key, 0, lock).then(
+          () => order.push('lease-acquired'),
+          (err) => order.push(`lease-failed:${err.code}`),
+        );
+        order.push('quarantine');
+      },
+    });
+    order.push('eviction-done');
+  });
+  await leasing;
+  assert.deepEqual(order, ['quarantine', 'eviction-done', 'lease-failed:ENOENT'], 'the lease could not slip in before the move');
+  const trashed = fs.readdirSync(cacheRoot).filter((n) => n.startsWith('.trash-'));
+  for (const t of trashed) assert.deepEqual(fs.readdirSync(path.join(cacheRoot, t, 'leases')), [], 'no lease ended up inside the quarantined entry');
+});
+
+test('lease versus eviction, the other order: a lease taken first protects the key from the whole eviction', async () => {
+  const cacheRoot = tmpDir('deps-cache-store');
+  const lock = makeLock();
+  const { key } = publish(cacheRoot);
+  const release = await acquireLease(cacheRoot, key, 0, lock);
+  await trimStore(cacheRoot, 0, lock);
+  assert.deepEqual(liveKeys(cacheRoot), [key]);
+  await release();
+  assert.deepEqual(liveKeys(cacheRoot), []);
 });
 
 test('a lease left by a dead process does not protect its key', async () => {
@@ -406,20 +617,9 @@ test('removeTree removes a read-only store entry', () => {
   assert.equal(fs.existsSync(entryDir(cacheRoot, key)), false);
 });
 
-test('removing an evicted store entry does not make a running lane\'s linked files writable', { skip: IS_ROOT && 'root ignores file modes' }, () => {
-  const cacheRoot = tmpDir('deps-cache-store');
-  const { key } = publish(cacheRoot);
-  const work = tmpDir('deps-cache-work');
-  const farm = path.join(work, 'node_modules');
-  materializeFromStore(cacheRoot, key, farm);
-  removeTree(entryDir(cacheRoot, key));
-  assert.throws(() => fs.writeFileSync(path.join(farm, 'pkg1', 'package.json'), 'x'), { code: 'EACCES' });
-  removeFarm(work);
-});
-
 // ---- postinstall safety ----
 
-test('the outside-node_modules snapshot sees added, changed and removed files and ignores node_modules', () => {
+test('the outside-node_modules snapshot sees added, changed and removed files and ignores node_modules and the top-level .git', () => {
   const dir = tmpDir('deps-cache-outside');
   fs.writeFileSync(path.join(dir, 'package.json'), '{}');
   fs.mkdirSync(path.join(dir, 'src'));
@@ -428,6 +628,8 @@ test('the outside-node_modules snapshot sees added, changed and removed files an
 
   fs.mkdirSync(path.join(dir, 'node_modules', 'x'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'node_modules', 'x', 'index.js'), 'ignored');
+  fs.mkdirSync(path.join(dir, '.git'));
+  fs.writeFileSync(path.join(dir, '.git', 'config'), 'the prepare script rewrites this');
   assert.deepEqual(snapshotChanges(before, snapshotOutsideNodeModules(dir)), []);
 
   fs.writeFileSync(path.join(dir, 'generated.txt'), 'new');
@@ -438,43 +640,40 @@ test('the outside-node_modules snapshot sees added, changed and removed files an
 
 // ---- absolute install path ----
 
-test('install-path scan finds the path in a text file, a symlink target and a shim, and skips big files', () => {
+test('install-path scan finds the path in a text file, a symlink target and a shim', () => {
   const tree = tmpDir('deps-cache-scan');
   const work = '/var/tmp/lb-x/tickets/abc/work';
   assert.equal(findInstallPathReference(makeTree(tree), [work]), null, 'a clean tree has none');
 
   const cases = {
-    text: () => fs.writeFileSync(path.join(tree, 'pkg1', 'config.json'), `{"root":"${work}/node_modules/pkg1"}`),
-    symlink: () => fs.symlinkSync(`${work}/node_modules/pkg2`, path.join(tree, 'link-out')),
-    shim: () => fs.writeFileSync(path.join(tree, '.bin', 'shim'), `#!/bin/sh\nexec node "${work}/node_modules/pkg0/cli.js" "$@"\n`, { mode: 0o755 }),
+    text: ['pkg1/config.json', () => fs.writeFileSync(path.join(tree, 'pkg1', 'config.json'), `{"root":"${work}/node_modules/pkg1"}`)],
+    symlink: ['link-out', () => fs.symlinkSync(`${work}/node_modules/pkg2`, path.join(tree, 'link-out'))],
+    shim: ['.bin/shim', () => fs.writeFileSync(path.join(tree, '.bin', 'shim'), `#!/bin/sh\nexec node "${work}/node_modules/pkg0/cli.js" "$@"\n`, { mode: 0o755 })],
   };
-  for (const [name, plant] of Object.entries(cases)) {
+  for (const [name, [rel, plant]] of Object.entries(cases)) {
     plant();
-    assert.ok(findInstallPathReference(tree, [work]), `${name} is found`);
-    fs.rmSync(path.join(tree, { text: 'pkg1/config.json', symlink: 'link-out', shim: '.bin/shim' }[name]));
+    assert.equal(findInstallPathReference(tree, [work]), rel, `${name} is found`);
+    fs.rmSync(path.join(tree, rel));
   }
-  fs.writeFileSync(path.join(tree, 'big.bin'), Buffer.concat([Buffer.from(work), Buffer.alloc(3 * 1024 * 1024)]));
-  assert.equal(findInstallPathReference(tree, [work]), null, 'a file over the size cap is not searched');
 });
 
-// ---- read-only guard ----
-
-test('the read-only sample flags a writable store file, in the first files and among the rest', { skip: IS_ROOT && 'root ignores file modes' }, () => {
-  const cacheRoot = tmpDir('deps-cache-store');
-  const { key } = publish(cacheRoot, { packages: 220 }); // 220 * 2 + 2 files: more than the 200-file head
-  assert.equal(findWritableStoreFile(cacheRoot, key), null);
-
-  const files = [];
-  const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).forEach((e) => (e.isDirectory() ? walk(path.join(d, e.name)) : e.isFile() && files.push(path.join(d, e.name))));
-  walk(entryTree(cacheRoot, key));
-  fs.chmodSync(files[0], 0o644);
-  assert.ok(findWritableStoreFile(cacheRoot, key), 'a writable file at the head is found');
-  fs.chmodSync(files[0], 0o444);
-  for (const f of files.slice(200)) fs.chmodSync(f, 0o644);
-  assert.ok(findWritableStoreFile(cacheRoot, key), 'writable files past the head are found by the random sample');
-  assert.equal(quarantineEntry(cacheRoot, key), true);
-  purgeTrash(cacheRoot);
-  assert.deepEqual(fs.readdirSync(cacheRoot), []);
+test('install-path scan has no size cap: a large file is streamed, including a path straddling a chunk boundary', () => {
+  const tree = tmpDir('deps-cache-scan');
+  const work = '/var/tmp/lb-x/tickets/abc/work';
+  const big = path.join(tree, 'native.node');
+  const size = 3 * SCAN_CHUNK_BYTES + 1000;
+  const plant = (offset) => {
+    const buf = Buffer.alloc(size, 0x41);
+    Buffer.from(work).copy(buf, offset);
+    fs.writeFileSync(big, buf);
+  };
+  assert.ok(size > 2 * 1024 * 1024, 'bigger than any size cap the earlier design had');
+  fs.writeFileSync(big, Buffer.alloc(size, 0x41));
+  assert.equal(findInstallPathReference(tree, [work]), null, 'a large clean file is clean');
+  for (const offset of [0, 7, SCAN_CHUNK_BYTES - 5, SCAN_CHUNK_BYTES - work.length, SCAN_CHUNK_BYTES, 2 * SCAN_CHUNK_BYTES - 1, size - work.length]) {
+    plant(offset);
+    assert.equal(findInstallPathReference(tree, [work]), 'native.node', `found at offset ${offset}`);
+  }
 });
 
 // ---- config ----
@@ -520,4 +719,13 @@ test('config: a lane may opt out with remoteDepsCache false; absent means on; a 
   const bad = path.join(base, 'repo-deps-cache-bad');
   writeRepoConfig(bad, { version: 1, lanes: { default: { weight: 2, remoteDepsCache: 'no' } } });
   assert.throws(() => resolveTicketConfig({ cwd: bad, repo: 'x', lane: 'default' }), ConfigError);
+  const badSafe = path.join(base, 'repo-deps-cache-bad-safe');
+  writeRepoConfig(badSafe, { version: 1, lanes: { default: { weight: 2, remoteDepsCacheRootScriptsSafe: 1 } } });
+  assert.throws(() => resolveTicketConfig({ cwd: badSafe, repo: 'x', lane: 'default' }), ConfigError);
+
+  const safe = path.join(base, 'repo-deps-cache-safe');
+  writeRepoConfig(safe, { version: 1, lanes: { default: { weight: 2 }, s: { weight: 2, remoteDepsCacheRootScriptsSafe: true } }, undeclaredLanes: { as: 's' } });
+  assert.equal(resolveTicketConfig({ cwd: safe, repo: 'x', lane: 'default' }).remoteDepsCacheRootScriptsSafe, false, 'defaults to false');
+  assert.equal(resolveTicketConfig({ cwd: safe, repo: 'x', lane: 's' }).remoteDepsCacheRootScriptsSafe, true);
+  assert.equal(resolveTicketConfig({ cwd: safe, repo: 'x', lane: 'adhoc' }).remoteDepsCacheRootScriptsSafe, true, 'an ad-hoc lane inherits it');
 });

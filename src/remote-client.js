@@ -489,6 +489,7 @@ export async function dispatchRemote(opts) {
     remoteSetup = null,
     // BRAIN-389: only `false` (the lane opted out) rides in the header; the cache is on by default on the runner.
     remoteDepsCache = true,
+    remoteDepsCacheRootScriptsSafe = false,
     // BRAIN-320 S1d: opt-in, from the CLIENT machine's global config
     // (`remoteQueueTimeoutMs`) -- unset (undefined/null) means the header
     // carries no such key at all, byte-identical to before this slice (I6).
@@ -551,6 +552,7 @@ export async function dispatchRemote(opts) {
     if (Array.isArray(remoteDeps) && remoteDeps.length > 0) header.remoteDeps = remoteDeps;
     if (Array.isArray(remoteSetup) && remoteSetup.length > 0) header.remoteSetup = remoteSetup;
     if (remoteDepsCache === false) header.remoteDepsCache = false;
+    if (remoteDepsCacheRootScriptsSafe === true) header.remoteDepsCacheRootScriptsSafe = true;
   }
   if (Number.isFinite(minCpuCores)) header.minCpuCores = minCpuCores;
   if (Number.isInteger(queueTimeoutMs) && queueTimeoutMs > 0) header.queueTimeoutMs = queueTimeoutMs;

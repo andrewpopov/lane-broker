@@ -390,8 +390,8 @@ function validateRepoConfig(cfg, sourcePath) {
         `${sourcePath}: lane "${name}".remoteSetup must be a non-empty array of non-empty arrays of non-empty strings`,
       );
     }
-    if (lane.remoteDepsCache !== undefined) {
-      assert(typeof lane.remoteDepsCache === 'boolean', `${sourcePath}: lane "${name}".remoteDepsCache must be a boolean`);
+    for (const field of ['remoteDepsCache', 'remoteDepsCacheRootScriptsSafe']) {
+      if (lane[field] !== undefined) assert(typeof lane[field] === 'boolean', `${sourcePath}: lane "${name}".${field} must be a boolean`);
     }
   }
   if (cfg.conflicts !== undefined) {
@@ -683,7 +683,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   if (isDeclaredLane) {
     laneCfg = repoConfig.lanes[laneName];
   } else if (undeclaredTemplateName) {
-    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/remote/remoteDeps/remoteSetup/remoteDepsCache/class/priority
+    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/class/priority
     // from the named declared lane, keeping this lane's OWN key/name. Not
     // inherited: `localRefused` (stays default false), the template's named
     // conflicts (only the `*` wildcard universe below reaches this lane, same
@@ -700,6 +700,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       remoteDeps: templateCfg.remoteDeps,
       remoteSetup: templateCfg.remoteSetup,
       remoteDepsCache: templateCfg.remoteDepsCache,
+      remoteDepsCacheRootScriptsSafe: templateCfg.remoteDepsCacheRootScriptsSafe,
       class: templateCfg.class,
       priority: templateCfg.priority,
     };
@@ -753,5 +754,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     remoteSetup: Array.isArray(laneCfg.remoteSetup) ? laneCfg.remoteSetup : null,
     // BRAIN-389: false opts this lane out of the runner's installed-deps cache; anything else leaves it on.
     remoteDepsCache: laneCfg.remoteDepsCache !== false,
+    // BRAIN-389: true declares this lane's root install/prepare scripts leave node_modules alone, so a cached tree is safe.
+    remoteDepsCacheRootScriptsSafe: laneCfg.remoteDepsCacheRootScriptsSafe === true,
   };
 }

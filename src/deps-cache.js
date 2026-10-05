@@ -7,7 +7,7 @@ import { isProcessAlive, processStartTime } from './process-liveness.js';
 /**
  * BRAIN-389: a content-addressed store of installed `node_modules` trees on a
  * remote runner, so a `remoteDeps` dir whose lockfile/environment has been
- * seen before is materialized instead of running `npm ci` again.
+ * seen before gets a copy of an installed tree instead of running `npm ci`.
  *
  *   <cacheRoot>/<key>/node_modules   the tree, every file and dir read-only
  *   <cacheRoot>/<key>/meta.json      { bytes, createdAt }
@@ -15,32 +15,50 @@ import { isProcessAlive, processStartTime } from './process-liveness.js';
  *   <cacheRoot>/<key>/leases/<id>    one file per live run holding the key
  *   <cacheRoot>/.tmp-*, .trash-*     unpublished / evicted trees awaiting removal
  *
- * A hit is a hardlink farm (real, writable directories; files are links to the
- * read-only store files), so an in-place write to a materialized file fails
- * with EACCES instead of corrupting the store, while creating and renaming
- * over files still works.
+ * A hit COPIES the stored tree into the work dir as private, writable files.
+ * Nothing a lane does to its own tree can reach the store: a hardlink would
+ * share the inode, and a lane that chmods a linked file, edits it and restores
+ * the mode would poison every later hit.
+ *
+ * The cache must never hand a run a different tree than a fresh `npm ci`
+ * would, so everything here fails closed: a dir is cached only when its key
+ * covers every input, its sources are pinned and its install is reproducible.
  */
 
 export const DEFAULT_DEPS_CACHE_MAX_BYTES = 10 * 1024 ** 3;
 
 /** Bumping this invalidates every existing entry. */
-const KEY_VERSION = 'v1';
+const KEY_VERSION = 'v2';
 
 /** npm reads npm-shrinkwrap.json in preference to package-lock.json. */
 const LOCKFILES = ['npm-shrinkwrap.json', 'package-lock.json'];
 
-const NPM_CONFIG_ENV_RE = /^npm_config_/i;
-
 /** npm_config_* values that name a file whose BYTES also shape an install. */
 const NPM_CONFIG_FILE_ENVS = ['npm_config_userconfig', 'npm_config_globalconfig'];
 
+/**
+ * The deps environment is hashed whole (an install can read any variable: PATH, CC, HOME, proxy
+ * settings...) except these, which differ on every run without changing what an install produces:
+ * per-ticket temp dirs, shell bookkeeping, the ssh session, and lane's own ticket/id variables.
+ */
+export const VOLATILE_ENV_NAMES = new Set(['TMPDIR', 'TMP', 'TEMP', 'PWD', 'OLDPWD', 'SHLVL', '_', 'GIT_CEILING_DIRECTORIES']);
+export const VOLATILE_ENV_PREFIXES = ['SSH_', 'LANE_'];
+
+/** Root lifecycle scripts npm runs on `npm ci`. Their commands are not covered by the lockfile. */
+export const ROOT_SCRIPT_NAMES = ['preinstall', 'install', 'postinstall', 'prepare', 'preprepare', 'postprepare'];
+
+/** Exact root-script commands known not to touch `node_modules`; any other needs the lane's explicit say-so. */
+export const ALLOWED_ROOT_SCRIPTS = new Set(['git config core.hooksPath .githooks || true']);
+
+/** A lock `resolved` pinned to content: an npmjs.org tarball with integrity, a git commit, or a local tarball with integrity. */
+const REGISTRY_RE = /^https:\/\/registry\.npmjs\.org\//;
+const GIT_PINNED_RE = /^git\+.+#[0-9a-f]{40}$/;
+const FILE_TARBALL_RE = /^file:.+\.tgz$/;
+
+/** Files are searched for the install path in chunks of this size, so a large file never needs to fit in memory. */
+export const SCAN_CHUNK_BYTES = 1024 * 1024;
+
 const KEY_RE = /^[0-9a-f]{64}$/;
-
-/** Files up to this size are searched for the install path; a larger one is a binary blob, not a shim or config. */
-const MAX_SCANNED_FILE_BYTES = 2 * 1024 * 1024;
-
-/** A hit checks this many files from the front of the store plus this many chosen at random. */
-const READ_ONLY_SAMPLE = 200;
 
 /** Unpublished temp dirs older than this belong to a crashed publisher. */
 const STALE_TMP_MS = 60 * 60 * 1000;
@@ -54,23 +72,89 @@ function readIfExists(file) {
   }
 }
 
-/** A lockfile that links local packages (workspaces, `file:` deps) installs symlinks into files the key does not cover. */
-function linksLocalPackages(lockfileBytes) {
-  const lock = JSON.parse(lockfileBytes.toString('utf8'));
-  const packages = lock && typeof lock === 'object' ? lock.packages : undefined;
-  if (!packages || typeof packages !== 'object') return false;
-  return Object.keys(packages).some((k) => k !== '' && !k.startsWith('node_modules/'));
+function firstLineOfCommand(cmd, env) {
+  try {
+    const out = execFileSync(cmd, ['--version'], { env, encoding: 'utf8', timeout: 5000, stdio: ['ignore', 'pipe', 'ignore'] });
+    return out.split('\n')[0].trim();
+  } catch {
+    return 'missing';
+  }
+}
+
+let systemMemo;
+/** What the installed native code was built against: glibc (null on musl/macOS), the libc family, and the distro. */
+export function currentSystem() {
+  if (systemMemo) return systemMemo;
+  const glibc = process.report?.getReport?.().header?.glibcVersionRuntime ?? '';
+  let osId = '';
+  let osVersionId = '';
+  try {
+    const text = fs.readFileSync('/etc/os-release', 'utf8');
+    const field = (name) => text.match(new RegExp(`^${name}=(.*)$`, 'm'))?.[1].replace(/^"|"$/g, '') ?? '';
+    osId = field('ID');
+    osVersionId = field('VERSION_ID');
+  } catch {
+    // not a Linux with /etc/os-release
+  }
+  systemMemo = { glibc, libc: process.platform === 'linux' ? (glibc ? 'glibc' : 'musl') : undefined, osId, osVersionId };
+  return systemMemo;
 }
 
 /**
- * The cache key for one `remoteDeps` dir: a sha256 over everything that can change what `npm ci`
- * produces there. Returns `{ key }` or `{ key: null, reason }` when the dir cannot be cached at all.
+ * Whether every lock entry is pinned to content, so `npm ci` from this lock is reproducible. Fails closed:
+ * lock v2/v3 with a `packages` map only, and every non-root entry must be an npmjs.org tarball with
+ * integrity, a git commit pin, or a `file:*.tgz` with integrity (returned in `tarballs`, which the key
+ * hashes). `file:` dirs, links, workspaces and unresolved entries are refused. An `inBundle` entry has no
+ * `resolved` of its own: its bytes ride inside its parent's integrity-checked tarball.
+ */
+export function lockEligibility(lock) {
+  if (!lock || ![2, 3].includes(lock.lockfileVersion) || !lock.packages || typeof lock.packages !== 'object') {
+    return { ok: false, reason: 'lockfile is not v2 or v3 with a packages map' };
+  }
+  const tarballs = [];
+  let hasInstallScript = false;
+  for (const [name, entry] of Object.entries(lock.packages)) {
+    if (entry?.hasInstallScript) hasInstallScript = true;
+    if (name === '') continue;
+    if (!entry || typeof entry !== 'object') return { ok: false, reason: `lock entry ${name} is malformed` };
+    if (entry.link === true) return { ok: false, reason: `lock entry ${name} is a link` };
+    if (!name.startsWith('node_modules/')) return { ok: false, reason: `lock entry ${name} is not under node_modules (workspace or local package)` };
+    if (entry.inBundle === true) continue;
+    const { resolved, integrity } = entry;
+    if (typeof resolved !== 'string') return { ok: false, reason: `lock entry ${name} has no resolved` };
+    if (REGISTRY_RE.test(resolved) && typeof integrity === 'string') continue;
+    if (GIT_PINNED_RE.test(resolved)) continue;
+    if (FILE_TARBALL_RE.test(resolved) && typeof integrity === 'string') {
+      tarballs.push(resolved.slice('file:'.length));
+      continue;
+    }
+    return { ok: false, reason: `lock entry ${name} resolves to an unpinned source: ${resolved.slice(0, 80)}` };
+  }
+  return { ok: true, tarballs: tarballs.sort(), hasInstallScript };
+}
+
+/** The first root lifecycle script that is neither allowlisted nor declared safe, as "<name>: <command>"; else null. */
+function unsafeRootScript(packageJson, rootScriptsSafe) {
+  if (rootScriptsSafe) return null;
+  const scripts = packageJson.scripts && typeof packageJson.scripts === 'object' ? packageJson.scripts : {};
+  for (const name of ROOT_SCRIPT_NAMES) {
+    if (name in scripts && !ALLOWED_ROOT_SCRIPTS.has(scripts[name])) return `${name}: ${String(scripts[name]).slice(0, 80)}`;
+  }
+  return null;
+}
+
+/**
+ * The cache key for one `remoteDeps` dir: a sha256 over everything that can change what `npm ci` produces
+ * there. Returns `{ key, lock }`, or `{ key: null, reason }` when the dir must not be cached at all
+ * (lockfile not pinned, or a root lifecycle script that is not known to leave `node_modules` alone).
  *
- *  - the lockfile (name and bytes), `package.json`, and the `.npmrc` of the dir and of the repo root;
- *  - node version/platform/arch (`runtime`, injectable for tests) and the npm version;
+ *  - the lockfile (name and bytes), `package.json`, the `.npmrc` of the dir and of the repo root, and the
+ *    bytes of every `file:` tarball the lockfile names;
+ *  - node version/platform/arch (`runtime`), the glibc runtime and distro (`system`), the npm version;
+ *  - when any lock entry has an install script, the first line of `cc --version` and `python3 --version`;
  *  - the exact install argv;
- *  - every `npm_config_*` value in `env` (the deps env the pipeline controls), plus the bytes of the
- *    user/global npmrc files those values point at.
+ *  - the whole `env` minus VOLATILE_ENV_NAMES / VOLATILE_ENV_PREFIXES, plus the bytes of the user/global
+ *    npmrc files it points at.
  */
 export function computeDepsKey({
   dir,
@@ -78,7 +162,10 @@ export function computeDepsKey({
   installArgv,
   env,
   npmVersion,
+  rootScriptsSafe = false,
   runtime = { version: process.version, platform: process.platform, arch: process.arch },
+  system = currentSystem(),
+  toolVersion = (cmd) => firstLineOfCommand(cmd, env),
 }) {
   let lockfileName = null;
   let lockfile = null;
@@ -92,11 +179,19 @@ export function computeDepsKey({
   if (!lockfile) return { key: null, reason: 'no lockfile' };
   const packageJson = readIfExists(path.join(dir, 'package.json'));
   if (!packageJson) return { key: null, reason: 'no package.json' };
+
+  let lock;
+  let pkg;
   try {
-    if (linksLocalPackages(lockfile)) return { key: null, reason: 'lockfile links local packages (workspaces or file: deps)' };
+    lock = JSON.parse(lockfile.toString('utf8'));
+    pkg = JSON.parse(packageJson.toString('utf8'));
   } catch {
-    return { key: null, reason: 'lockfile is not valid JSON' };
+    return { key: null, reason: 'lockfile or package.json is not valid JSON' };
   }
+  const eligibility = lockEligibility(lock);
+  if (!eligibility.ok) return { key: null, reason: eligibility.reason };
+  const script = unsafeRootScript(pkg, rootScriptsSafe);
+  if (script) return { key: null, reason: `root lifecycle script not known to leave node_modules alone (${script})` };
 
   const parts = [
     ['key-version', KEY_VERSION],
@@ -108,11 +203,20 @@ export function computeDepsKey({
     ['node-version', runtime.version],
     ['node-platform', runtime.platform],
     ['node-arch', runtime.arch],
+    ['glibc', system.glibc],
+    ['os-id', system.osId],
+    ['os-version-id', system.osVersionId],
     ['npm-version', npmVersion],
     ['install-argv', JSON.stringify(installArgv)],
   ];
-  const npmConfigNames = Object.keys(env).filter((k) => NPM_CONFIG_ENV_RE.test(k)).sort();
-  for (const name of npmConfigNames) parts.push([`env:${name}`, String(env[name])]);
+  if (eligibility.hasInstallScript) parts.push(['cc-version', toolVersion('cc')], ['python3-version', toolVersion('python3')]);
+  for (const rel of eligibility.tarballs) {
+    const bytes = readIfExists(path.resolve(dir, rel));
+    if (!bytes) return { key: null, reason: `file: tarball ${rel} is not in the snapshot` };
+    parts.push([`tarball:${rel}`, bytes]);
+  }
+  const volatile = (name) => VOLATILE_ENV_NAMES.has(name) || VOLATILE_ENV_PREFIXES.some((p) => name.startsWith(p));
+  for (const name of Object.keys(env).filter((k) => !volatile(k)).sort()) parts.push([`env:${name}`, String(env[name])]);
   for (const name of NPM_CONFIG_FILE_ENVS) {
     if (env[name]) parts.push([`file:${name}`, readIfExists(env[name]) ?? '']);
   }
@@ -123,7 +227,30 @@ export function computeDepsKey({
     hash.update(`${label}:${bytes.length}:`);
     hash.update(bytes);
   }
-  return { key: hash.digest('hex') };
+  return { key: hash.digest('hex'), lock };
+}
+
+function listAllows(list, value) {
+  if (!Array.isArray(list) || list.length === 0) return true;
+  if (list.includes(`!${value}`)) return false;
+  const positive = list.filter((x) => !x.startsWith('!'));
+  return positive.length === 0 || positive.includes(value);
+}
+
+/**
+ * Lock entries that apply to this platform (honouring `os`, `cpu` and `libc`) but are absent from
+ * `installed`, npm's own record (`node_modules/.package-lock.json`'s `packages`) of what it put on disk.
+ * npm skips an optional dependency it cannot install without failing; a tree missing one must not be cached.
+ */
+export function findMissingInstalled(lock, installed, { platform, arch, libc }) {
+  const missing = [];
+  for (const [name, entry] of Object.entries(lock.packages)) {
+    if (name === '' || !entry) continue;
+    if (!listAllows(entry.os, platform) || !listAllows(entry.cpu, arch)) continue;
+    if (libc !== undefined && !listAllows(entry.libc, libc)) continue;
+    if (!(name in installed)) missing.push(name.slice('node_modules/'.length));
+  }
+  return missing.sort();
 }
 
 export function entryDir(cacheRoot, key) {
@@ -153,9 +280,17 @@ function cloneTree(src, dst, { onFile, dirMode }) {
   fs.chmodSync(dst, dirMode(srcMode));
 }
 
+/** Copy one file (a reflink where the filesystem has them) and set its mode; returns its size. */
+function copyFileAs(src, dst, transformMode) {
+  fs.copyFileSync(src, dst, fs.constants.COPYFILE_FICLONE);
+  const st = fs.statSync(src);
+  fs.chmodSync(dst, transformMode(st.mode & 0o7777));
+  return st.size;
+}
+
 /**
  * Remove a store tree. Its directories are read-only, which `rm` cannot descend, so make just the
- * directories writable first. Never the files: a running lane's farm shares their inodes.
+ * directories writable first.
  */
 export function removeTree(target) {
   try {
@@ -167,21 +302,20 @@ export function removeTree(target) {
 }
 
 /**
- * Materialize a stored tree at `destTree` as a hardlink farm. Throws on any failure (including a
- * `destTree` that already exists); the caller removes the partial tree and installs instead.
+ * Copy a stored tree to `destTree` as private files and directories the lane may write freely. Throws on
+ * any failure (including a `destTree` that already exists); the caller removes the partial tree and installs.
  */
 export function materializeFromStore(cacheRoot, key, destTree) {
   cloneTree(entryTree(cacheRoot, key), destTree, {
-    onFile: (s, d) => fs.linkSync(s, d),
+    onFile: (s, d) => copyFileAs(s, d, (mode) => mode | 0o200),
     dirMode: (mode) => mode | 0o200,
   });
 }
 
 /**
- * Copy an installed tree into the store and publish it atomically (build under `.tmp-*`, then rename
- * onto `<key>`). It is a COPY, never a link: the lane about to run in `srcTree` may write to it.
- * Returns `{ published: true, bytes }`, or `{ published: false }` when another run published the same
- * key first (that run's tree is equally valid; ours is discarded).
+ * Copy an installed tree into the store, read-only, and publish it atomically (build under `.tmp-*`,
+ * then rename onto `<key>`). Returns `{ published: true, bytes }`, or `{ published: false }` when another
+ * run published the same key first (that run's tree is equally valid; ours is discarded).
  */
 export function publishToStore(cacheRoot, key, srcTree) {
   fs.mkdirSync(cacheRoot, { recursive: true });
@@ -191,10 +325,7 @@ export function publishToStore(cacheRoot, key, srcTree) {
     let bytes = 0;
     cloneTree(srcTree, path.join(tmp, 'node_modules'), {
       onFile: (s, d) => {
-        fs.copyFileSync(s, d, fs.constants.COPYFILE_FICLONE);
-        const st = fs.statSync(d);
-        bytes += st.size;
-        fs.chmodSync(d, st.mode & 0o7555);
+        bytes += copyFileAs(s, d, (mode) => mode & 0o7555);
       },
       dirMode: (mode) => mode & 0o7555,
     });
@@ -217,68 +348,6 @@ export function publishToStore(cacheRoot, key, srcTree) {
   }
 }
 
-/** Move an entry aside atomically for `purgeTrash`; false if it was already gone. */
-export function quarantineEntry(cacheRoot, key) {
-  try {
-    fs.renameSync(entryDir(cacheRoot, key), path.join(cacheRoot, `.trash-${key}-${crypto.randomBytes(4).toString('hex')}`));
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
- * Sample a stored tree's files (the first READ_ONLY_SAMPLE plus READ_ONLY_SAMPLE random others) and
- * return the first one that is writable, as a path relative to the tree, or null if all are read-only.
- * A writable store file means something chmod'ed a shared inode, so the entry can no longer be trusted.
- */
-export function findWritableStoreFile(cacheRoot, key) {
-  const root = entryTree(cacheRoot, key);
-  const files = [];
-  const walk = (abs) => {
-    for (const ent of fs.readdirSync(abs, { withFileTypes: true })) {
-      const p = path.join(abs, ent.name);
-      if (ent.isDirectory()) walk(p);
-      else if (ent.isFile()) files.push(p);
-    }
-  };
-  walk(root);
-  const rest = files.slice(READ_ONLY_SAMPLE);
-  const sample = files.slice(0, READ_ONLY_SAMPLE);
-  for (let i = 0; i < READ_ONLY_SAMPLE && rest.length > 0; i += 1) sample.push(rest[crypto.randomInt(rest.length)]);
-  const writable = sample.find((f) => (fs.statSync(f).mode & 0o222) !== 0);
-  return writable ? path.relative(root, writable) : null;
-}
-
-/**
- * The first file under `tree` (relative path) that holds one of `needles` (absolute paths) as bytes: a
- * symlink target, or a regular file up to MAX_SCANNED_FILE_BYTES. Such a tree only works where it was
- * installed, so it must not be cached. Null when clean.
- */
-export function findInstallPathReference(tree, needles) {
-  const bufs = needles.map((n) => Buffer.from(n, 'utf8'));
-  const walk = (abs, rel) => {
-    for (const ent of fs.readdirSync(abs, { withFileTypes: true })) {
-      const p = path.join(abs, ent.name);
-      const r = rel ? `${rel}/${ent.name}` : ent.name;
-      let hit = false;
-      if (ent.isDirectory()) {
-        const found = walk(p, r);
-        if (found) return found;
-      } else if (ent.isSymbolicLink()) {
-        const target = Buffer.from(fs.readlinkSync(p), 'utf8');
-        hit = bufs.some((b) => target.includes(b));
-      } else if (ent.isFile() && fs.statSync(p).size <= MAX_SCANNED_FILE_BYTES) {
-        const content = fs.readFileSync(p);
-        hit = bufs.some((b) => content.includes(b));
-      }
-      if (hit) return r;
-    }
-    return null;
-  };
-  return walk(tree, '');
-}
-
 /** Mark `key` as just used (the LRU clock). Best-effort: a failed touch must never fail a lane. */
 export function touchLastUsed(cacheRoot, key) {
   const file = path.join(entryDir(cacheRoot, key), '.last-used');
@@ -291,22 +360,40 @@ export function touchLastUsed(cacheRoot, key) {
 }
 
 /**
- * Record that this process is using `key`, so eviction skips it. Throws if the entry is gone
- * (evicted before we could lease it): the caller treats that as a miss. Returns a release function.
+ * Leases and eviction share ONE lock (`lock(fn)`, the broker lock in production). A lease is taken, and
+ * eviction chooses and quarantines its victims, each as a single critical section, so a run either holds
+ * its lease before eviction looks (the key is skipped) or finds the entry gone when it tries (a miss).
+ * Throws if the entry is gone; the caller treats that as a miss.
+ *
+ * The lease file is written under a temp name and renamed in, so a reader never sees a half-written one.
+ * Returns `async release()`, which drops the lease and trims the store to `maxBytes` (an entry that
+ * was over the bound only because a lease protected it can go now).
  */
-export function acquireLease(cacheRoot, key) {
-  const file = path.join(entryDir(cacheRoot, key), 'leases', `${process.pid}-${crypto.randomBytes(4).toString('hex')}`);
-  fs.writeFileSync(file, JSON.stringify({ pid: process.pid, start: processStartTime(process.pid) ?? null }));
-  return () => {
-    try {
-      fs.unlinkSync(file);
-    } catch {
-      // the key was evicted anyway
-    }
+export async function acquireLease(cacheRoot, key, maxBytes, lock) {
+  const leasePath = await lock(() => {
+    const keyDir = entryDir(cacheRoot, key);
+    const tmp = path.join(keyDir, `.lease-tmp-${crypto.randomBytes(4).toString('hex')}`);
+    const file = path.join(keyDir, 'leases', `${process.pid}-${crypto.randomBytes(4).toString('hex')}`);
+    fs.writeFileSync(tmp, JSON.stringify({ pid: process.pid, start: processStartTime(process.pid) ?? null }));
+    fs.renameSync(tmp, file);
+    return file;
+  });
+  return async () => {
+    await lock(() => {
+      fs.rmSync(leasePath, { force: true });
+      evictLeastRecentlyUsed(cacheRoot, maxBytes);
+    });
+    purgeTrash(cacheRoot);
   };
 }
 
-/** Live leases on an entry; a lease whose process is gone is removed as stale. */
+/** Trim the store to `maxBytes` under the lock, then delete what was evicted outside it. */
+export async function trimStore(cacheRoot, maxBytes, lock) {
+  await lock(() => evictLeastRecentlyUsed(cacheRoot, maxBytes));
+  purgeTrash(cacheRoot);
+}
+
+/** Live leases on an entry. A dead process's lease is removed as stale; one that cannot be read counts as live. */
 function liveLeases(keyDir) {
   const dir = path.join(keyDir, 'leases');
   let names;
@@ -318,14 +405,16 @@ function liveLeases(keyDir) {
   let live = 0;
   for (const name of names) {
     const file = path.join(dir, name);
-    let lease = null;
+    let lease;
     try {
       lease = JSON.parse(fs.readFileSync(file, 'utf8'));
     } catch {
-      // unreadable: treated as stale below
+      live += 1;
+      continue;
     }
     if (lease && Number.isInteger(lease.pid) && isProcessAlive(lease.pid, lease.start)) live += 1;
-    else fs.rmSync(file, { force: true });
+    else if (lease && Number.isInteger(lease.pid)) fs.rmSync(file, { force: true });
+    else live += 1;
   }
   return live;
 }
@@ -342,10 +431,11 @@ function readMetaBytes(keyDir) {
 /**
  * Pick the least-recently-used entries until the store fits `maxBytes`, skipping every key a live run
  * holds a lease on, and move each (atomically, by rename) to `.trash-*`. Cheap and meant to run under
- * the broker lock; the caller removes the trash afterwards with `purgeTrash`, outside the lock.
- * An entry with no readable `meta.json` is damaged and goes first. Returns the evicted keys.
+ * the lock; the caller removes the trash afterwards with `purgeTrash`, outside it. An entry with no
+ * readable `meta.json` is damaged and goes first. Returns the evicted keys.
+ * `beforeQuarantine(key)` is a test seam, called between the lease check and the move.
  */
-export function evictLeastRecentlyUsed(cacheRoot, maxBytes, { now = Date.now() } = {}) {
+export function evictLeastRecentlyUsed(cacheRoot, maxBytes, { now = Date.now(), beforeQuarantine } = {}) {
   let names;
   try {
     names = fs.readdirSync(cacheRoot);
@@ -381,7 +471,12 @@ export function evictLeastRecentlyUsed(cacheRoot, maxBytes, { now = Date.now() }
   for (const entry of victims) {
     if (total <= maxBytes && !entry.damaged) break;
     if (liveLeases(entry.full) > 0) continue;
-    if (!quarantineEntry(cacheRoot, entry.key)) continue;
+    if (beforeQuarantine) beforeQuarantine(entry.key);
+    try {
+      fs.renameSync(entry.full, path.join(cacheRoot, `.trash-${entry.key}-${crypto.randomBytes(4).toString('hex')}`));
+    } catch {
+      continue;
+    }
     total -= entry.bytes;
     evicted.push(entry.key);
   }
@@ -401,16 +496,70 @@ export function purgeTrash(cacheRoot) {
   }
 }
 
+/** Does the file hold any of `needles`? Files over SCAN_CHUNK_BYTES are read in chunks overlapping by the longest needle. */
+function fileContains(file, needles) {
+  const size = fs.statSync(file).size;
+  if (size <= SCAN_CHUNK_BYTES) {
+    const content = fs.readFileSync(file);
+    return needles.some((n) => content.includes(n));
+  }
+  const overlap = Math.max(...needles.map((n) => n.length)) - 1;
+  const buf = Buffer.alloc(SCAN_CHUNK_BYTES + overlap);
+  const fd = fs.openSync(file, 'r');
+  try {
+    let carry = 0;
+    for (let pos = 0; pos < size; ) {
+      const n = fs.readSync(fd, buf, carry, SCAN_CHUNK_BYTES, pos);
+      if (n === 0) break;
+      const window = buf.subarray(0, carry + n);
+      if (needles.some((needle) => window.includes(needle))) return true;
+      carry = Math.min(overlap, window.length);
+      window.copy(buf, 0, window.length - carry);
+      pos += n;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+  return false;
+}
+
 /**
- * Everything under `dir` except `node_modules` trees, as path -> "type:size:mtimeMs". Taken before and
- * after an install: any difference means a lifecycle script wrote outside `node_modules`, which a
- * cached `node_modules` could never reproduce.
+ * The first file under `tree` (relative path) that holds one of `needles` (absolute paths) as bytes: a
+ * symlink target, or ANY regular file at all (no size cap). Such a tree only works where it was
+ * installed, so it must not be cached. Null when clean.
+ */
+export function findInstallPathReference(tree, needles) {
+  const bufs = needles.map((n) => Buffer.from(n, 'utf8'));
+  const walk = (abs, rel) => {
+    for (const ent of fs.readdirSync(abs, { withFileTypes: true })) {
+      const p = path.join(abs, ent.name);
+      const r = rel ? `${rel}/${ent.name}` : ent.name;
+      if (ent.isDirectory()) {
+        const found = walk(p, r);
+        if (found) return found;
+      } else if (ent.isSymbolicLink()) {
+        const target = Buffer.from(fs.readlinkSync(p), 'utf8');
+        if (bufs.some((b) => target.includes(b))) return r;
+      } else if (ent.isFile() && fileContains(p, bufs)) {
+        return r;
+      }
+    }
+    return null;
+  };
+  return walk(tree, '');
+}
+
+/**
+ * Everything under `dir` except `node_modules` trees (and the snapshot's own top-level `.git`, which the
+ * allowlisted `git config core.hooksPath` root script legitimately rewrites), as path -> "type:size:mtimeMs".
+ * Taken before and after an install: any difference means a lifecycle script wrote outside `node_modules`,
+ * which a cached `node_modules` could never reproduce.
  */
 export function snapshotOutsideNodeModules(dir) {
   const out = new Map();
   const walk = (abs, rel) => {
     for (const ent of fs.readdirSync(abs, { withFileTypes: true })) {
-      if (ent.name === 'node_modules') continue;
+      if (ent.name === 'node_modules' || (rel === '' && ent.name === '.git')) continue;
       const childRel = rel ? `${rel}/${ent.name}` : ent.name;
       const st = fs.lstatSync(path.join(abs, ent.name));
       out.set(childRel, `${ent.isDirectory() ? 'd' : ent.isSymbolicLink() ? 'l' : 'f'}:${st.size}:${st.mtimeMs}`);

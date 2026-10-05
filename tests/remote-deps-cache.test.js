@@ -43,23 +43,38 @@ const fixtureBase = (() => {
   };
 })();
 
-/** The files of a repo whose lane installs the fixture. `lockEdit`/`postinstall` make variants. */
-function repoFiles({ lockEdit, postinstall = null, laneExtra = {} } = {}) {
+const POSTINSTALLS = {
+  outside: "require('fs').writeFileSync('generated-by-postinstall.txt', process.cwd())",
+  embed: "require('fs').writeFileSync('node_modules/hello-tool/where.txt', process.cwd())",
+  'embed-big': "require('fs').writeFileSync('node_modules/hello-tool/native.bin', Buffer.concat([Buffer.alloc(3 * 1024 * 1024, 65), Buffer.from(process.cwd())]))",
+  'drop-installed-record': "const f = 'node_modules/.package-lock.json'; const l = JSON.parse(require('fs').readFileSync(f, 'utf8')); delete l.packages['node_modules/hello-tool']; require('fs').writeFileSync(f, JSON.stringify(l))",
+  harmless: "process.exit(0)",
+};
+
+/**
+ * The files of a repo whose lane installs the fixture. `lockEdit` makes a variant lock; `postinstall` names a
+ * root script from POSTINSTALLS; `prepare` sets a root prepare script. A lane declaring a postinstall also
+ * declares root scripts safe, unless `rootScriptsSafe` says otherwise.
+ */
+function repoFiles({ lockEdit, postinstall = null, prepare = null, rootScriptsSafe = postinstall !== null, tarball, laneExtra = {} } = {}) {
   const base = fixtureBase();
   const pkg = JSON.parse(base.packageJson);
   const lock = JSON.parse(base.lock);
   if (postinstall) {
-    const target = postinstall === 'embed' ? 'node_modules/hello-tool/where.txt' : 'generated-by-postinstall.txt';
-    pkg.scripts = { postinstall: `node -e "require('fs').writeFileSync('${target}', process.cwd())"` };
+    pkg.scripts = { ...pkg.scripts, postinstall: `node -e "${POSTINSTALLS[postinstall].replace(/"/g, '\\"')}"` };
     lock.packages[''].hasInstallScript = true;
   }
+  if (prepare) pkg.scripts = { ...pkg.scripts, prepare };
   if (lockEdit) lockEdit(lock);
   return {
     'package.json': JSON.stringify(pkg),
     'package-lock.json': JSON.stringify(lock),
-    'hello-tool-1.0.0.tgz': base.tarball,
+    'hello-tool-1.0.0.tgz': tarball ?? base.tarball,
     '.npmrc': NPMRC,
-    '.lane-broker.json': JSON.stringify({ version: 1, lanes: { default: { weight: 1, remote: true, remoteDeps: ['.'], ...laneExtra } } }),
+    '.lane-broker.json': JSON.stringify({
+      version: 1,
+      lanes: { default: { weight: 1, remote: true, remoteDeps: ['.'], ...(rootScriptsSafe ? { remoteDepsCacheRootScriptsSafe: true } : {}), ...laneExtra } },
+    }),
   };
 }
 
@@ -96,9 +111,9 @@ function probeCommand(marker) {
 
 const lastRow = (state) => fs.readFileSync(paths(state).history, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).at(-1);
 
-async function runLane(s, repoDir, { repo = 'r', marker } = {}) {
+async function runLane(s, repoDir, { repo = 'r', marker, env = s.env } = {}) {
   const markerPath = marker ?? path.join(tmpDir('deps-cache-marker'), 'probe.json');
-  const r = await laneRun(['run', '--repo', repo, '--lane', 'default', '--', ...probeCommand(markerPath)], { env: s.env, cwd: repoDir });
+  const r = await laneRun(['run', '--repo', repo, '--lane', 'default', '--', ...probeCommand(markerPath)], { env, cwd: repoDir });
   const probe = fs.existsSync(markerPath) ? JSON.parse(fs.readFileSync(markerPath, 'utf8')) : null;
   return { ...r, probe, row: r.code === 0 || fs.existsSync(paths(s.state).history) ? lastRow(s.state) : null };
 }
@@ -123,20 +138,22 @@ test('a miss installs and publishes; the next run is a hit that runs no npm ci, 
   assert.equal(second.probe.out, 'hello from the bin', 'the .bin symlink works in the materialized tree');
   assert.ok(second.row.depsMs < first.row.depsMs, `hit ${second.row.depsMs}ms should beat miss ${first.row.depsMs}ms`);
   assert.equal(s.storedKeys().length, 1, 'same key, no second entry');
-  if (!IS_ROOT) assert.equal(second.probe.inPlace, 'EACCES', 'an in-place write to an installed file fails loudly');
+  assert.equal(second.probe.inPlace, 'wrote', 'the hit is a private copy: an in-place write to an installed file just works');
 });
 
-test('the store survives a lane that tried to write in place: the next hit still installs the original bytes', { skip: IS_ROOT && 'root ignores file modes' }, async () => {
+test('what a lane does to its own tree never reaches the store: the next hit gets the original bytes', async () => {
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(repoFiles());
   await runLane(s, repoDir); // miss: publishes
-  const hit = await runLane(s, repoDir); // hit: its command attempted an in-place append
-  assert.equal(hit.probe.inPlace, 'EACCES');
+  const hit = await runLane(s, repoDir); // hit: its command appended to an installed file and added a new one
+  assert.equal(hit.probe.inPlace, 'wrote');
   const key = s.storedKeys()[0];
-  const stored = JSON.parse(fs.readFileSync(path.join(s.storeDir, key, 'node_modules', 'hello-tool', 'package.json'), 'utf8'));
-  assert.equal(stored.name, 'hello-tool');
-  assert.equal(fs.existsSync(path.join(s.storeDir, key, 'node_modules', 'hello-tool', 'new-file.txt')), false, 'files a lane created never reach the store');
-  assert.equal(fs.existsSync(path.join(s.storeDir, key, 'node_modules', '.bin', 'hello-tool')), true);
+  const storedTree = path.join(s.storeDir, key, 'node_modules');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(storedTree, 'hello-tool', 'package.json'), 'utf8')).name, 'hello-tool');
+  assert.ok(!fs.readFileSync(path.join(storedTree, 'hello-tool', 'package.json'), 'utf8').endsWith(' '), 'the in-place append stayed in the lane\'s copy');
+  assert.equal(fs.existsSync(path.join(storedTree, 'hello-tool', 'new-file.txt')), false, 'files a lane created never reach the store');
+  assert.equal(fs.existsSync(path.join(storedTree, '.bin', 'hello-tool')), true);
+  if (!IS_ROOT) assert.equal(fs.statSync(path.join(storedTree, 'hello-tool', 'package.json')).mode & 0o222, 0, 'the store stays read-only');
 });
 
 test('a lockfile change is a miss and installs again', async () => {
@@ -193,20 +210,25 @@ test('an install that writes outside node_modules is not cached, says why, and s
   assert.equal(s.npmCiCalls(), 2);
 });
 
-test('with a store bound smaller than two trees, publishing a second key evicts the first (and never the one just published)', async () => {
+test('a store bound that holds one tree: publishing a second key evicts the first, and releasing the lease trims what the lease had protected', async () => {
   const s = setupWithNpmSpy();
-  writeGlobalConfig(s.runnerHome, { sampleMs: 50, capacity: 4, remoteDepsCacheMaxBytes: 1 });
   const a = await runLane(s, makeGitWorktree(repoFiles()));
   assert.equal(a.row.depsCache, 'miss');
-  const keysAfterA = s.storedKeys();
-  assert.equal(keysAfterA.length, 1, 'the entry the run itself holds survives even though it exceeds the bound');
+  const [keyA] = s.storedKeys();
+  const bytes = JSON.parse(fs.readFileSync(path.join(s.storeDir, keyA, 'meta.json'), 'utf8')).bytes;
 
+  writeGlobalConfig(s.runnerHome, { sampleMs: 50, capacity: 4, remoteDepsCacheMaxBytes: bytes + 1 });
   const b = await runLane(s, makeGitWorktree(repoFiles({ lockEdit: (lock) => (lock.packages[''].version = '2.0.0') })));
   assert.equal(b.row.depsCache, 'miss');
   const keysAfterB = s.storedKeys();
   assert.equal(keysAfterB.length, 1);
-  assert.notEqual(keysAfterB[0], keysAfterA[0], 'the older key was evicted, the newer one kept');
+  assert.notEqual(keysAfterB[0], keyA, 'the older key was evicted, the newer one kept');
   assert.deepEqual(fs.readdirSync(s.storeDir).filter((n) => n.startsWith('.trash-') || n.startsWith('.tmp-')), []);
+
+  writeGlobalConfig(s.runnerHome, { sampleMs: 50, capacity: 4, remoteDepsCacheMaxBytes: 1 });
+  const c = await runLane(s, makeGitWorktree(repoFiles({ lockEdit: (lock) => (lock.packages[''].version = '3.0.0') })));
+  assert.equal(c.row.depsCache, 'miss');
+  assert.equal(s.storedKeys().length, 0, 'over the bound only while this run held its lease; trimmed when it released it');
 });
 
 test('two real runs missing on the same key at once both succeed and leave one intact entry that the next run hits', async () => {
@@ -230,6 +252,7 @@ test('two real runs missing on the same key at once both succeed and leave one i
   assert.equal(next.probe.out, 'hello from the bin');
 });
 
+
 test('an install that embeds its own absolute path under node_modules is not cached, and the run still succeeds', async () => {
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(repoFiles({ postinstall: 'embed' }));
@@ -246,24 +269,74 @@ test('an install that embeds its own absolute path under node_modules is not cac
   assert.equal(s.npmCiCalls(), 2, 'never a hit: the baked-in path would be wrong in the next work dir');
 });
 
-test('a hit whose stored files were made writable is treated as corrupt: evicted, reinstalled, republished read-only', { skip: IS_ROOT && 'root ignores file modes' }, async () => {
+test('a large file (over any size cap) that embeds the install path is not cached', async () => {
+  const s = setupWithNpmSpy();
+  const first = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'embed-big' })));
+  assert.equal(first.code, 0, first.stderr);
+  assert.equal(first.row.depsCache, 'skip');
+  assert.match(first.stderr, /reason=absolute-install-path file=hello-tool\/native\.bin/);
+  assert.equal(s.storedKeys().length, 0);
+});
+
+test('a changed environment variable is a miss', async () => {
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(repoFiles());
   await runLane(s, repoDir);
-  const [key] = s.storedKeys();
-  const victim = path.join(s.storeDir, key, 'node_modules', 'hello-tool', 'package.json');
-  fs.chmodSync(victim, 0o644); // what a tool that chmods a hardlinked file does to the shared inode
-  assert.equal(s.npmCiCalls(), 1);
+  assert.equal((await runLane(s, repoDir)).row.depsCache, 'hit');
+  const changed = await runLane(s, repoDir, { env: { ...s.env, CXX: 'a-different-compiler' } });
+  assert.equal(changed.code, 0, changed.stderr);
+  assert.equal(changed.row.depsCache, 'miss');
+  assert.equal(s.storedKeys().length, 2);
+  const volatile = await runLane(s, repoDir, { env: { ...s.env, SSH_CONNECTION: '1.2.3.4 1 5.6.7.8 22', LANE_FAKE_OTHER: 'x' } });
+  assert.equal(volatile.row.depsCache, 'hit', 'ssh and lane variables are excluded from the key');
+});
 
-  const again = await runLane(s, repoDir);
-  assert.equal(again.code, 0, again.stderr);
-  assert.match(again.stderr, /deps-cache corrupt key=[0-9a-f]{12} writable store file hello-tool\/package\.json/);
-  assert.equal(again.row.depsCache, 'miss');
-  assert.equal(s.npmCiCalls(), 2, 'it fell back to npm ci');
-  assert.deepEqual(s.storedKeys(), [key], 'the same key was republished');
-  assert.equal(fs.statSync(victim).mode & 0o222, 0, 'the fresh entry is read-only again');
-  assert.deepEqual(fs.readdirSync(s.storeDir).filter((n) => n.startsWith('.trash-')), []);
+test('a changed file: tarball is a miss and installs again', async () => {
+  const s = setupWithNpmSpy();
+  await runLane(s, makeGitWorktree(repoFiles()));
+  const changed = await runLane(s, makeGitWorktree(repoFiles({ tarball: Buffer.concat([fixtureBase().tarball, Buffer.from('changed')]) })));
+  assert.equal(changed.row.depsCache, 'miss');
+  assert.equal(s.npmCiCalls(), 2, 'it did not reuse the cached tree for the changed tarball');
+  assert.equal(s.storedKeys().length, 2);
+});
 
-  const third = await runLane(s, repoDir);
-  assert.equal(third.row.depsCache, 'hit');
+test('a lock that is not pinned to content is skipped with its reason, and the run still installs', async () => {
+  const s = setupWithNpmSpy();
+  const noIntegrity = (lock) => delete lock.packages['node_modules/hello-tool'].integrity;
+  const run = await runLane(s, makeGitWorktree(repoFiles({ lockEdit: noIntegrity })));
+  assert.equal(run.code, 0, run.stderr);
+  assert.equal(run.row.depsCache, 'skip');
+  assert.match(run.stderr, /deps-cache skip dir=\. ms=\d+ reason="lock entry node_modules\/hello-tool resolves to an unpinned source/);
+  assert.equal(s.storedKeys().length, 0);
+});
+
+test('a root lifecycle script outside the allowlist skips the cache unless the lane declares root scripts safe', async () => {
+  const s = setupWithNpmSpy();
+  const skipped = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'harmless', rootScriptsSafe: false })));
+  assert.equal(skipped.code, 0, skipped.stderr);
+  assert.equal(skipped.row.depsCache, 'skip');
+  assert.match(skipped.stderr, /reason="root lifecycle script not known to leave node_modules alone \(postinstall: node -e/);
+  assert.equal(s.storedKeys().length, 0);
+
+  const declared = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'harmless', rootScriptsSafe: true })));
+  assert.equal(declared.row.depsCache, 'miss');
+  assert.equal(s.storedKeys().length, 1);
+});
+
+test('the allowlisted prepare script (git config core.hooksPath) does not stop a tree being cached', async () => {
+  const s = setupWithNpmSpy();
+  const repoDir = makeGitWorktree(repoFiles({ prepare: 'git config core.hooksPath .githooks || true' }));
+  const first = await runLane(s, repoDir);
+  assert.equal(first.code, 0, first.stderr);
+  assert.match(first.stderr, /deps-cache miss key=[0-9a-f]{12} dir=\. ms=\d+ published=yes/);
+  assert.equal((await runLane(s, repoDir)).row.depsCache, 'hit');
+});
+
+test('an install npm did not fully record (a simulated missing optional dependency) is not published', async () => {
+  const s = setupWithNpmSpy();
+  const run = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'drop-installed-record' })));
+  assert.equal(run.code, 0, run.stderr);
+  assert.equal(run.row.depsCache, 'skip');
+  assert.match(run.stderr, /deps-cache skip key=[0-9a-f]{12} dir=\. ms=\d+ reason=incomplete-optional missing=hello-tool/);
+  assert.equal(s.storedKeys().length, 0);
 });

@@ -10,13 +10,12 @@ import {
   publishToStore,
   touchLastUsed,
   acquireLease,
-  evictLeastRecentlyUsed,
-  purgeTrash,
+  trimStore,
+  findMissingInstalled,
+  currentSystem,
   snapshotOutsideNodeModules,
   snapshotChanges,
   findInstallPathReference,
-  findWritableStoreFile,
-  quarantineEntry,
 } from './deps-cache.js';
 
 /**
@@ -108,7 +107,7 @@ async function runPhaseCommand(argv, cwd, env) {
 }
 
 /** BRAIN-389: the one log line per deps dir, on the pipeline's stderr, which flows to the submitter. */
-function logDepsCache(outcome, dir, ms, { key, published, reason, file } = {}) {
+function logDepsCache(outcome, dir, ms, { key, published, reason, file, missing } = {}) {
   const fields = [
     key ? `key=${key.slice(0, 12)}` : null,
     `dir=${dir}`,
@@ -116,29 +115,26 @@ function logDepsCache(outcome, dir, ms, { key, published, reason, file } = {}) {
     published === undefined ? null : `published=${published ? 'yes' : 'no'}`,
     reason ? `reason=${/^[\w-]+$/.test(reason) ? reason : JSON.stringify(reason)}` : null,
     file ? `file=${file}` : null,
+    missing ? `missing=${missing.slice(0, 5).join(',')}${missing.length > 5 ? ',...' : ''}` : null,
   ].filter(Boolean);
   process.stderr.write(`deps-cache ${outcome} ${fields.join(' ')}\n`);
 }
 
-/** Hit: build the tree as a hardlink farm from the store. False (with the partial tree removed) means install instead. */
-function materializeHit(depsCache, key, cwd, releaseLeases) {
+/** Leases and eviction serialize on the broker's own lock, the same one admission uses. */
+const brokerLock = (fn) => withLock(ensureStateDirs().root, fn);
+
+/** Hit: copy the stored tree into place. False (with the partial tree removed) means install instead. */
+async function materializeHit(depsCache, key, cwd, releaseLeases) {
   const tree = path.join(cwd, 'node_modules');
   if (!fs.existsSync(entryTree(depsCache.root, key))) return false;
   try {
-    const writable = findWritableStoreFile(depsCache.root, key);
-    if (writable) {
-      // something chmod'ed a shared inode: the entry's bytes can no longer be trusted
-      process.stderr.write(`deps-cache corrupt key=${key.slice(0, 12)} writable store file ${writable}; evicting and installing instead\n`);
-      quarantineEntry(depsCache.root, key);
-      return false;
-    }
-    releaseLeases.push(acquireLease(depsCache.root, key));
+    const release = await acquireLease(depsCache.root, key, depsCache.maxBytes, brokerLock);
+    releaseLeases.push(release);
     materializeFromStore(depsCache.root, key, tree);
     touchLastUsed(depsCache.root, key);
     return true;
   } catch (err) {
     process.stderr.write(`deps-cache materialize failed, installing instead: ${err.message}\n`);
-    // A farm's directories are writable and its files are links, so a plain rm never touches the store's inodes.
     fs.rmSync(tree, { recursive: true, force: true });
     return false;
   }
@@ -149,13 +145,13 @@ async function publishAndEvict(depsCache, key, cwd, releaseLeases) {
   const result = publishToStore(depsCache.root, key, path.join(cwd, 'node_modules'));
   if (!result.published) return result;
   touchLastUsed(depsCache.root, key);
-  releaseLeases.push(acquireLease(depsCache.root, key));
   try {
-    await withLock(ensureStateDirs().root, () => evictLeastRecentlyUsed(depsCache.root, depsCache.maxBytes));
+    releaseLeases.push(await acquireLease(depsCache.root, key, depsCache.maxBytes, brokerLock));
+    await trimStore(depsCache.root, depsCache.maxBytes, brokerLock);
   } catch (err) {
-    process.stderr.write(`deps-cache eviction skipped: ${err.message}\n`);
+    // this run has its own tree whatever happens to the store; the next publish or release trims it
+    process.stderr.write(`deps-cache lease or eviction skipped: ${err.message}\n`);
   }
-  purgeTrash(depsCache.root);
   return result;
 }
 
@@ -166,20 +162,35 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
   const done = (outcome, fields = {}) => {
     const ms = Date.now() - started;
     logDepsCache(outcome, dir, ms, fields);
-    return { dir, outcome, ms, ...(fields.key ? { key: fields.key.slice(0, 12) } : {}), ...(fields.reason ? { reason: fields.reason } : {}), ...(fields.file ? { file: fields.file } : {}) };
+    return {
+      dir,
+      outcome,
+      ms,
+      ...(fields.key ? { key: fields.key.slice(0, 12) } : {}),
+      ...(fields.reason ? { reason: fields.reason } : {}),
+      ...(fields.file ? { file: fields.file } : {}),
+      ...(fields.missing ? { missing: fields.missing } : {}),
+    };
   };
 
   let keyed = { key: null, reason: 'disabled' };
   if (depsCache?.enabled) {
     try {
-      keyed = computeDepsKey({ dir: cwd, rootDir: workDir, installArgv: DEPS_INSTALL_ARGV, env: depsEnv, npmVersion: npmVersion() });
+      keyed = computeDepsKey({
+        dir: cwd,
+        rootDir: workDir,
+        installArgv: DEPS_INSTALL_ARGV,
+        env: depsEnv,
+        npmVersion: npmVersion(),
+        rootScriptsSafe: depsCache.rootScriptsSafe === true,
+      });
     } catch (err) {
       keyed = { key: null, reason: `key not computed: ${err.message}` };
     }
   }
   const { key } = keyed;
 
-  if (key && materializeHit(depsCache, key, cwd, releaseLeases)) return { exitCode: 0, record: done('hit', { key }) };
+  if (key && (await materializeHit(depsCache, key, cwd, releaseLeases))) return { exitCode: 0, record: done('hit', { key }) };
 
   const before = key ? snapshotOutsideNodeModules(cwd) : null;
   const exitCode = await runPhaseCommand(DEPS_INSTALL_ARGV, cwd, depsEnv);
@@ -194,6 +205,8 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
   if (!fs.existsSync(path.join(cwd, 'node_modules'))) {
     return { exitCode, record: done('miss', { key, published: false, reason: 'install produced no node_modules' }) };
   }
+  const missing = missingInstalled(path.join(cwd, 'node_modules'), keyed.lock);
+  if (missing) return { exitCode, record: done('skip', { key, reason: 'incomplete-optional', missing }) };
   const installPaths = [...new Set([workDir, fs.realpathSync(workDir)])];
   const embedded = findInstallPathReference(path.join(cwd, 'node_modules'), installPaths);
   if (embedded) return { exitCode, record: done('skip', { key, reason: 'absolute-install-path', file: embedded }) };
@@ -204,6 +217,15 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
     // the tree is installed and usable for this run whatever happened to the store
     return { exitCode, record: done('miss', { key, published: false, reason: `publish failed: ${err.message}` }) };
   }
+}
+
+/** Lock entries for this platform that npm's own record says it did not install (or `['.package-lock.json']` if it left no record). */
+function missingInstalled(tree, lock) {
+  const hidden = readJsonSafe(path.join(tree, '.package-lock.json'));
+  if (!hidden?.packages) return ['.package-lock.json'];
+  const { libc } = currentSystem();
+  const missing = findMissingInstalled(lock, hidden.packages, { platform: process.platform, arch: process.arch, libc });
+  return missing.length > 0 ? missing : null;
 }
 
 function aggregateDepsOutcome(records) {
@@ -277,6 +299,12 @@ export async function remotePipelineCommand(ticketDir) {
     const code = await runPhaseCommand(argv, cmdCwd, process.env);
     return { exitCode: code };
   } finally {
-    for (const release of releaseLeases) release();
+    for (const release of releaseLeases) {
+      try {
+        await release();
+      } catch (err) {
+        process.stderr.write(`deps-cache lease release skipped: ${err.message}\n`);
+      }
+    }
   }
 }

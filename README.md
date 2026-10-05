@@ -369,6 +369,9 @@ gate usually does) or declares them (below).
   `npm ci --no-audit --no-fund`, or from the runner's installed-deps cache
   when it has seen the same lockfile and environment before (below).
 - `remoteDepsCache`: `false` opts this lane out of that cache.
+- `remoteDepsCacheRootScriptsSafe`: `true` declares that the repo's root
+  install/prepare scripts leave `node_modules` alone, so a cached tree is
+  safe despite them.
 - `remoteSetup`: argv arrays run in the repo root after deps, before the
   command.
 
@@ -403,50 +406,71 @@ network failure on <runner>`.
 
 `npm ci` costs 25-45 s on every remote run, which dwarfs a short lane. The
 runner keeps each installed `node_modules` under
-`<root>/deps-cache/<key>/` and a later run with the same key gets that tree
-back instead of installing.
+`<root>/deps-cache/<key>/` and a later run with the same key gets a copy of
+that tree instead of installing. The cache must never hand a run a different
+tree than a fresh `npm ci` would, so it fails closed: anything it cannot
+prove reproducible is installed normally and logged as `skip` with the
+reason.
 
-- **Key**, per `remoteDeps` dir: sha256 of the lockfile (`package-lock.json`,
-  or `npm-shrinkwrap.json` when present) and `package.json` bytes, the
-  `.npmrc` of that dir and of the repo root, the node version, platform and
-  arch, the npm version, the exact `npm ci` argv, and every `npm_config_*`
-  value of the deps environment (plus the bytes of the runner's user/global
-  npmrc). Any change is a miss. A dir with no lockfile, or whose lockfile
-  links local packages (workspaces, `file:` dirs, whose content the key does
-  not cover), is never cached.
-- **Hit**: the tree is rebuilt as a hardlink farm. Directories are real and
-  writable; files are hardlinks to read-only store files. A tool that
-  writes a file in place gets `EACCES` instead of silently corrupting the
-  cache; creating files and renaming over them works. A `chmod` on such a
-  file changes the shared store inode, so do not run one in a lane. As a
-  guard, every hit first samples the store's files (the first 200 plus 200
-  at random); if any is writable the entry is treated as corrupt, evicted,
-  and the run installs with `npm ci` instead.
+- **Eligibility**, per `remoteDeps` dir. The lockfile (`package-lock.json`,
+  or `npm-shrinkwrap.json` when present) must be v2 or v3 with a `packages`
+  map, and every non-root entry must be an `https://registry.npmjs.org/`
+  tarball with `integrity`, a `git+...#<40-hex sha>`, or a `file:*.tgz` with
+  `integrity`. `file:` dirs, links, workspaces, unresolved entries and
+  anything else are refused (an `inBundle` entry rides in its parent's
+  tarball and is allowed). Root `preinstall`, `install`, `postinstall`,
+  `prepare`, `preprepare` and `postprepare` scripts must each be an exact
+  command on the allowlist (today only
+  `git config core.hooksPath .githooks || true`), or the lane must declare
+  `remoteDepsCacheRootScriptsSafe: true` ("these scripts do not touch
+  `node_modules`").
+- **Key**: sha256 of the lockfile and `package.json` bytes, the `.npmrc` of
+  that dir and of the repo root, the bytes of every `file:` tarball the
+  lockfile names, the node version, platform and arch, the glibc runtime
+  version and `/etc/os-release` `ID` and `VERSION_ID`, the npm version, the
+  exact `npm ci` argv, and the WHOLE deps-phase environment (plus the bytes
+  of the runner's user/global npmrc). When any lock entry has an install
+  script, the first line of `cc --version` and `python3 --version` too (a
+  missing tool is a value). Excluded as volatile: `TMPDIR`, `TMP`, `TEMP`,
+  `PWD`, `OLDPWD`, `SHLVL`, `_`, `GIT_CEILING_DIRECTORIES`, and any `SSH_*`
+  or `LANE_*` variable. Any other change is a miss.
+- **Hit**: the stored tree is COPIED into the work dir (a reflink where the
+  filesystem has them), as private writable files, so nothing a lane does to
+  its tree can reach the store. The store itself is read-only. The copy is
+  slower than a hardlink farm and is the price of that isolation.
 - **Miss**: `npm ci` runs exactly as before, then the result is copied into
   the store and published with an atomic rename. Two runs missing on the same
-  key at once both install; one publish wins and the other is discarded. If
-  the install changed any file outside `node_modules` (a postinstall script
-  that generates files, say), that key is not cached, because a hit would
-  skip the script; the run still uses its own tree, and the log says why. The same holds when
-  the installed `node_modules` contains the absolute work-dir path (text
-  files up to 2 MB, symlink targets, `.bin` shims): the tree would only work
-  where it was installed, so it logs `deps-cache skip ...
-  reason=absolute-install-path file=<rel>` and is not published.
-- **Eviction**: least recently used first, whenever a publish leaves the
-  store over `remoteDepsCacheMaxBytes` (runner global config, default
-  10 GiB). It runs under the broker lock and never evicts a key a live run
-  holds a lease on.
+  key at once both install; one publish wins and the other is discarded. The
+  tree is NOT published when
+  - the install changed a file outside `node_modules` (a hit would skip
+    whatever wrote it; the snapshot's top-level `.git` is ignored);
+  - npm's own record (`node_modules/.package-lock.json`) lacks a lock entry
+    that applies to this platform (`os`, `cpu`, `libc`), as when npm skips an
+    optional dependency: `reason=incomplete-optional missing=<names>`;
+  - any installed file or symlink target contains the absolute work-dir path
+    (every file is scanned, large ones in chunks): the tree would only work
+    where it was installed. `reason=absolute-install-path file=<rel>`.
+
+  The run still uses its own tree in every case, and the log says why.
+- **Leases and eviction**: least recently used first, whenever a publish or a
+  lease release leaves the store over `remoteDepsCacheMaxBytes` (runner
+  global config, default 10 GiB). A run holds a lease on its key until its
+  pipeline ends; taking and dropping a lease, and choosing and quarantining
+  eviction victims, each happen under the broker lock, so a lease either
+  protects its key or finds it already gone (a miss). An unreadable lease
+  counts as live; one left by a dead process is ignored.
 - **Config** (runner machine's global config): `remoteDepsCache` (default
   `true`) and `remoteDepsCacheMaxBytes`. A lane's `remoteDepsCache: false`
   opts that lane out.
 - **Observability**: the run logs `deps-cache hit|miss key=<12 hex> dir=<d>
-  ms=<n>` (`skip` when caching is off or impossible, with a reason), and the
+  ms=<n>` (`skip` when caching is off or refused, with a reason), and the
   result and history row carry `depsCache` (`hit`, `miss` or `skip`) and
   `depsMs` for the whole deps phase.
 
-Not in the key: the runner's system libraries and `PATH`. A lockfile whose
-packages compile native code against them is cached as built; clear
-`<root>/deps-cache` after a runner OS or toolchain upgrade.
+Not covered: native code that links against system libraries beyond glibc,
+the compiler and python versions (a toolchain or library upgrade that keeps
+the same versions); clear `<root>/deps-cache` after a runner OS or toolchain
+change that those do not reflect.
 
 ### Queue timeout
 

@@ -161,6 +161,9 @@ function validateHeaderFields(header) {
   if (header.remoteDepsCache !== undefined && (header.protocol !== 2 || header.remoteDepsCache !== false)) {
     return { ok: false, reason: 'invalid remoteDepsCache' };
   }
+  if (header.remoteDepsCacheRootScriptsSafe !== undefined && (header.protocol !== 2 || header.remoteDepsCacheRootScriptsSafe !== true)) {
+    return { ok: false, reason: 'invalid remoteDepsCacheRootScriptsSafe' };
+  }
   // BRAIN-320 S1d: opt-in on both protocols -- an old runner simply ignores
   // an unknown field, which is fine (the feature is opt-in), but THIS
   // runner, once it understands the field at all, validates it the same way
@@ -437,6 +440,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
       // BRAIN-389: the runner's own config decides whether and how far to cache; the lane can only opt out.
       depsCache: {
         enabled: header.remoteDepsCache !== false && runnerCfg.remoteDepsCache,
+        rootScriptsSafe: header.remoteDepsCacheRootScriptsSafe === true,
         root: path.join(remoteRootAbs, 'deps-cache'),
         maxBytes: runnerCfg.remoteDepsCacheMaxBytes,
       },
