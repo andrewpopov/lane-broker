@@ -388,6 +388,64 @@ test('optional completeness: lock entries for this platform that npm did not ins
   assert.deepEqual(findMissingInstalled(lock, { 'node_modules/a': {}, 'node_modules/@s/b': {} }, { platform: 'darwin', arch: 'arm64', libc: undefined }), ['arm-only', 'mac-only', 'not-linux'], 'on macOS: mac-only and arm-only apply, the linux ones do not');
 });
 
+// Shape of rouge's lockfile: dmg-license is darwin-only and optional, its own dependencies are optional with no `os`.
+const dmgLicenseLock = () => ({
+  packages: {
+    '': { dependencies: { app: '1' } },
+    'node_modules/app': { version: '1', dependencies: { xmlbuilder: '*' } },
+    'node_modules/xmlbuilder': { version: '1' },
+    'node_modules/dmg-license': {
+      version: '1',
+      dev: true,
+      optional: true,
+      os: ['darwin'],
+      dependencies: { '@types/plist': '^3', 'assert-plus': '^1', 'cli-truncate': '^2' },
+    },
+    'node_modules/@types/plist': { version: '3', dev: true, optional: true, dependencies: { xmlbuilder: '>=11' } },
+    'node_modules/assert-plus': { version: '1', dev: true, optional: true },
+    'node_modules/cli-truncate': { version: '2', dev: true, optional: true, dependencies: { 'slice-ansi': '^3' } },
+    'node_modules/slice-ansi': { version: '3', dev: true, optional: true },
+  },
+});
+const linuxHost = { platform: 'linux', arch: 'x64', libc: 'glibc' };
+
+test('optional completeness: the dependencies of a platform-skipped optional package are not missing (BRAIN-402)', () => {
+  const installed = { 'node_modules/app': {}, 'node_modules/xmlbuilder': {} };
+  assert.deepEqual(findMissingInstalled(dmgLicenseLock(), installed, linuxHost), []);
+  assert.deepEqual(
+    findMissingInstalled(dmgLicenseLock(), installed, { platform: 'darwin', arch: 'arm64', libc: undefined }),
+    ['@types/plist', 'assert-plus', 'cli-truncate', 'dmg-license', 'slice-ansi'],
+    'on macOS the chain applies, so its absence is real',
+  );
+});
+
+test('optional completeness: an absent optional package with an installed dependent is still missing', () => {
+  const lock = dmgLicenseLock();
+  lock.packages['node_modules/shared-opt'] = { version: '1', optional: true };
+  lock.packages['node_modules/dmg-license'].dependencies['shared-opt'] = '*';
+  lock.packages['node_modules/app'].dependencies['shared-opt'] = '*';
+  const installed = { 'node_modules/app': {}, 'node_modules/xmlbuilder': {} };
+  assert.deepEqual(findMissingInstalled(lock, installed, linuxHost), ['shared-opt']);
+  lock.packages['node_modules/shared-opt'].optional = false;
+  delete lock.packages['node_modules/app'].dependencies['shared-opt'];
+  assert.deepEqual(findMissingInstalled(lock, installed, linuxHost), ['shared-opt'], 'a required package is missing even when only skipped packages depend on it');
+});
+
+test('optional completeness: only dependents that resolve to the exact lock path count', () => {
+  const lock = {
+    packages: {
+      '': { dependencies: { app: '1', 'mac-tool': '1' } },
+      'node_modules/app': { version: '1', dependencies: { dep: '2' } },
+      'node_modules/app/node_modules/dep': { version: '2', optional: true },
+      'node_modules/mac-tool': { version: '1', optional: true, os: ['darwin'], dependencies: { dep: '1' } },
+      'node_modules/dep': { version: '1', optional: true },
+    },
+  };
+  const installed = { 'node_modules/app': {} };
+  assert.deepEqual(findMissingInstalled(lock, installed, linuxHost), ['app/node_modules/dep'], 'app resolves its nested dep; the hoisted copy only serves the skipped mac-tool');
+  assert.deepEqual(findMissingInstalled(lock, { ...installed, 'node_modules/app/node_modules/dep': {} }, linuxHost), []);
+});
+
 // ---- publish / materialize ----
 
 test('materialize reproduces the stored tree, including the .bin symlink, and the linked tool runs', () => {

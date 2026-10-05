@@ -405,20 +405,75 @@ function listAllows(list, value) {
   return positive.length === 0 || positive.includes(value);
 }
 
+function platformSkips(entry, { platform, arch, libc }) {
+  if (!listAllows(entry.os, platform) || !listAllows(entry.cpu, arch)) return true;
+  return libc !== undefined && !listAllows(entry.libc, libc);
+}
+
+/** Names a lock entry asks npm to resolve; the root also lists its devDependencies, other entries' are never installed. */
+function requestedNames(path, entry) {
+  const peers = Object.keys(entry.peerDependencies ?? {}).filter((n) => !entry.peerDependenciesMeta?.[n]?.optional);
+  const dev = path === '' ? Object.keys(entry.devDependencies ?? {}) : [];
+  return [...Object.keys(entry.dependencies ?? {}), ...Object.keys(entry.optionalDependencies ?? {}), ...peers, ...dev];
+}
+
+/** The lock path node's resolution (own `node_modules`, then each parent's, up to the root) gives `name` from `fromPath`. */
+function resolveLockPath(packages, fromPath, name) {
+  let base = fromPath;
+  for (;;) {
+    const candidate = `${base ? `${base}/` : ''}node_modules/${name}`;
+    if (candidate in packages) return candidate;
+    if (base === '') return null;
+    const cut = base.lastIndexOf('/node_modules/');
+    base = cut < 0 ? '' : base.slice(0, cut);
+  }
+}
+
+/** lock path -> the lock paths whose dependency lists resolve to it. */
+function dependentsByPath(packages) {
+  const dependents = new Map();
+  for (const [from, entry] of Object.entries(packages)) {
+    if (!entry) continue;
+    for (const name of requestedNames(from, entry)) {
+      const target = resolveLockPath(packages, from, name);
+      if (target === null) continue;
+      if (!dependents.has(target)) dependents.set(target, new Set());
+      dependents.get(target).add(from);
+    }
+  }
+  return dependents;
+}
+
 /**
  * Lock entries that apply to this platform (honouring `os`, `cpu` and `libc`) but are absent from
  * `installed`, npm's own record (`node_modules/.package-lock.json`'s `packages`) of what it put on disk.
  * npm skips an optional dependency it cannot install without failing; a tree missing one must not be cached.
+ * An absent optional entry is still expected when everything that depends on it is itself skipped for this
+ * platform or expected-absent (the transitive dependencies of a platform-skipped optional package, which
+ * npm never fetches), so those are found as a fixpoint grown from the platform-skipped set.
  */
-export function findMissingInstalled(lock, installed, { platform, arch, libc }) {
-  const missing = [];
-  for (const [name, entry] of Object.entries(lock.packages)) {
+export function findMissingInstalled(lock, installed, system) {
+  const { packages } = lock;
+  const gone = new Set(); // platform-skipped, then expected-absent
+  const absent = [];
+  for (const [name, entry] of Object.entries(packages)) {
     if (name === '' || !entry) continue;
-    if (!listAllows(entry.os, platform) || !listAllows(entry.cpu, arch)) continue;
-    if (libc !== undefined && !listAllows(entry.libc, libc)) continue;
-    if (!(name in installed)) missing.push(name.slice('node_modules/'.length));
+    if (platformSkips(entry, system)) gone.add(name);
+    else if (!(name in installed)) absent.push(name);
   }
-  return missing.sort();
+  const dependents = dependentsByPath(packages);
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const name of absent) {
+      if (gone.has(name) || !packages[name].optional) continue;
+      const parents = [...(dependents.get(name) ?? [])];
+      if (parents.length > 0 && parents.every((d) => gone.has(d))) {
+        gone.add(name);
+        grew = true;
+      }
+    }
+  }
+  return absent.filter((name) => !gone.has(name)).map((name) => name.slice('node_modules/'.length)).sort();
 }
 
 export function entryDir(cacheRoot, key) {
