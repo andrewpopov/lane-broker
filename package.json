@@ -25,7 +25,8 @@
   },
   "files": [
     "bin",
-    "src"
+    "src",
+    "sql"
   ],
   "engines": {
     "node": ">=20"
@@ -36,5 +37,7 @@
     "verify": "npm run lint && sh scripts/verify-suite.sh",
     "prepare": "git config core.hooksPath .githooks || true"
   },
-  "dependencies": {}
+  "dependencies": {
+    "pg": "^8.23.1"
+  }
 }
