@@ -16,6 +16,10 @@ import {
   snapshotOutsideNodeModules,
   snapshotChanges,
   findInstallPathReference,
+  scrubDepsEnv,
+  allowlistedRootEvents,
+  unexplainedChanges,
+  PER_RUN_PATH_ENV_NAMES,
 } from './deps-cache.js';
 
 /**
@@ -53,7 +57,9 @@ function ensureNpmrcFile(file) {
  * process itself was started with, then pin the cache/userconfig/
  * globalconfig this runner owns. The repo's own tracked `.npmrc`, if any,
  * still applies underneath this -- npm reads that from the deps dir itself,
- * not from anything here.
+ * not from anything here. BRAIN-389: the per-run variables that reach no cache
+ * key (shell bookkeeping, ssh, lane's own ids) are removed too, so nothing an
+ * install reads can differ between two runs that share a key.
  */
 function buildDepsEnv(npmCacheDir, npmUserConfig, npmGlobalConfig) {
   const env = { ...process.env };
@@ -64,7 +70,7 @@ function buildDepsEnv(npmCacheDir, npmUserConfig, npmGlobalConfig) {
   env.npm_config_cache = npmCacheDir;
   env.npm_config_userconfig = npmUserConfig;
   env.npm_config_globalconfig = npmGlobalConfig;
-  return env;
+  return scrubDepsEnv(env);
 }
 
 /**
@@ -120,6 +126,25 @@ function logDepsCache(outcome, dir, ms, { key, published, reason, file, missing 
   process.stderr.write(`deps-cache ${outcome} ${fields.join(' ')}\n`);
 }
 
+/** What an install in `cwd` could change outside node_modules: `cwd` itself, and the work dir's `.git` (shared by every dir). */
+function snapshotInstallSurface(cwd, workDir) {
+  const surface = snapshotOutsideNodeModules(cwd);
+  if (cwd === workDir) return surface;
+  const gitDir = path.join(workDir, '.git');
+  const st = fs.lstatSync(gitDir);
+  surface.set('.git', `d:${st.size}:${st.mtimeMs}`);
+  for (const [rel, sig] of snapshotOutsideNodeModules(gitDir)) surface.set(`.git/${rel}`, sig);
+  return surface;
+}
+
+function readTextOrNull(file) {
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
 /** Leases and eviction serialize on the broker's own lock, the same one admission uses. */
 const brokerLock = (fn) => withLock(ensureStateDirs().root, fn);
 
@@ -138,6 +163,20 @@ async function materializeHit(depsCache, key, cwd, releaseLeases) {
     fs.rmSync(tree, { recursive: true, force: true });
     return false;
   }
+}
+
+/**
+ * A hit skips `npm ci`, and with it the allowlisted root scripts whose effect (the work dir's `.git/config`)
+ * lives outside the cached tree. Run each of them, in npm's order, through `npm run <event> --ignore-scripts`
+ * (which runs exactly that script with npm's lifecycle environment, and no pre/post hooks of its own).
+ * The one difference from `npm ci` is `npm_command`, which npm sets to `run-script`.
+ */
+async function replayRootScripts(cwd, scripts, depsEnv) {
+  for (const event of allowlistedRootEvents(scripts)) {
+    const code = await runPhaseCommand(['npm', 'run', event, '--ignore-scripts'], cwd, depsEnv);
+    if (code !== 0) return false;
+  }
+  return true;
 }
 
 /** Copy the freshly installed tree into the store, then trim the store to its bound under the broker lock. */
@@ -190,14 +229,20 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
   }
   const { key } = keyed;
 
-  if (key && (await materializeHit(depsCache, key, cwd, releaseLeases))) return { exitCode: 0, record: done('hit', { key }) };
+  if (key && (await materializeHit(depsCache, key, cwd, releaseLeases))) {
+    if (await replayRootScripts(cwd, keyed.scripts, depsEnv)) return { exitCode: 0, record: done('hit', { key }) };
+    process.stderr.write('deps-cache replay of the root scripts failed, installing instead\n');
+    fs.rmSync(path.join(cwd, 'node_modules'), { recursive: true, force: true });
+  }
 
-  const before = key ? snapshotOutsideNodeModules(cwd) : null;
+  const before = key ? snapshotInstallSurface(cwd, workDir) : null;
+  const configBefore = key ? readTextOrNull(path.join(workDir, '.git', 'config')) : null;
   const exitCode = await runPhaseCommand(DEPS_INSTALL_ARGV, cwd, depsEnv);
   if (!key) return { exitCode, record: done('skip', { reason: keyed.reason }) };
   if (exitCode !== 0) return { exitCode, record: done('miss', { key, published: false, reason: 'install failed' }) };
 
-  const outside = snapshotChanges(before, snapshotOutsideNodeModules(cwd));
+  const configAfter = readTextOrNull(path.join(workDir, '.git', 'config'));
+  const outside = unexplainedChanges(snapshotChanges(before, snapshotInstallSurface(cwd, workDir)), { scripts: keyed.scripts, configBefore, configAfter });
   if (outside.length > 0) {
     const shown = outside.slice(0, 3).join(', ');
     return { exitCode, record: done('miss', { key, published: false, reason: `install changed files outside node_modules: ${shown}${outside.length > 3 ? ', ...' : ''}` }) };
@@ -207,7 +252,8 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
   }
   const missing = missingInstalled(path.join(cwd, 'node_modules'), keyed.lock);
   if (missing) return { exitCode, record: done('skip', { key, reason: 'incomplete-optional', missing }) };
-  const installPaths = [...new Set([workDir, fs.realpathSync(workDir)])];
+  const runPaths = PER_RUN_PATH_ENV_NAMES.map((name) => depsEnv[name]).filter(Boolean);
+  const installPaths = [...new Set([workDir, fs.realpathSync(workDir), ...runPaths])];
   const embedded = findInstallPathReference(path.join(cwd, 'node_modules'), installPaths);
   if (embedded) return { exitCode, record: done('skip', { key, reason: 'absolute-install-path', file: embedded }) };
   try {

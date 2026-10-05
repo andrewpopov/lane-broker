@@ -22,6 +22,10 @@ import {
   lockEligibility,
   SCAN_CHUNK_BYTES,
   ALLOWED_ROOT_SCRIPTS,
+  ROOT_SCRIPT_NAMES,
+  scrubDepsEnv,
+  unexplainedChanges,
+  allowlistedRootEvents,
   snapshotOutsideNodeModules,
   snapshotChanges,
 } from '../src/deps-cache.js';
@@ -239,7 +243,6 @@ test('eligibility: only a pinned v2/v3 lock is cached; every other source is ref
       'node_modules/reg': REGISTRY_ENTRY('1.0.0'),
       'node_modules/git': { version: '1.0.0', resolved: 'git+ssh://git@github.com/o/r.git#0123456789abcdef0123456789abcdef01234567' },
       'node_modules/tgz': { version: '1.0.0', resolved: 'file:vendor/jun-client/jun-1.0.0.tgz', integrity: 'sha512-t' },
-      'node_modules/bundled': { version: '1.0.0', inBundle: true },
     },
   };
   const verdict = lockEligibility(ok);
@@ -267,6 +270,42 @@ test('eligibility: only a pinned v2/v3 lock is cached; every other source is ref
   }
 });
 
+test('eligibility: a bundled entry with no resolved needs an enclosing package that bundles it and itself passes', () => {
+  const lockOf = (packages) => ({ lockfileVersion: 3, packages: { '': {}, ...packages } });
+  const parent = { version: '1.0.0', resolved: 'https://registry.npmjs.org/p/-/p-1.0.0.tgz', integrity: 'sha512-p', bundleDependencies: ['c', '@s/d'] };
+
+  assert.equal(lockEligibility(lockOf({ 'node_modules/p': parent, 'node_modules/p/node_modules/c': { version: '1.0.0', inBundle: true } })).ok, true, 'named in the parent\'s bundleDependencies');
+  assert.equal(lockEligibility(lockOf({ 'node_modules/p': parent, 'node_modules/p/node_modules/@s/d': { version: '1.0.0', inBundle: true } })).ok, true, 'scoped child');
+  assert.equal(lockEligibility(lockOf({ 'node_modules/p': { ...parent, bundleDependencies: undefined }, 'node_modules/p/node_modules/c': { version: '1', inBundle: true, inDepBundle: true } })).ok, true, 'inDepBundle');
+
+  const refused = {
+    'top-level inBundle with no resolved (a root-bundled dep gets the normal checks)': { 'node_modules/r': { version: '1.0.0', inBundle: true } },
+    'root-bundled local tarball without integrity': { 'node_modules/r': { version: '1.0.0', inBundle: true, resolved: 'file:r.tgz' } },
+    'child of a parent that does not bundle it': { 'node_modules/p': { ...parent, bundleDependencies: ['other'] }, 'node_modules/p/node_modules/c': { version: '1', inBundle: true } },
+    'child of a parent that fails the source checks': {
+      'node_modules/p': { ...parent, resolved: 'file:../p' },
+      'node_modules/p/node_modules/c': { version: '1', inBundle: true },
+    },
+    'child with no parent entry at all': { 'node_modules/p/node_modules/c': { version: '1', inBundle: true } },
+    'child that is not marked inBundle': { 'node_modules/p': parent, 'node_modules/p/node_modules/c': { version: '1' } },
+  };
+  for (const [name, packages] of Object.entries(refused)) assert.equal(lockEligibility(lockOf(packages)).ok, false, name);
+
+  const withResolved = lockEligibility(lockOf({ 'node_modules/r': { version: '1', inBundle: true, resolved: 'file:r.tgz', integrity: 'sha512-r' } }));
+  assert.deepEqual(withResolved.tarballs, ['r.tgz'], 'a root-bundled local tarball is checked like any other, so its bytes are hashed');
+});
+
+test('key: the bytes of a root-bundled local tarball are part of the key', () => {
+  const f = makeKeyFixture({
+    lockPackages: { '': {}, 'node_modules/r': { version: '1.0.0', inBundle: true, resolved: 'file:x-1.0.0.tgz', integrity: 'sha512-r' } },
+    tarball: 'one',
+  });
+  const a = computeDepsKey(f.inputs()).key;
+  assert.ok(a);
+  fs.writeFileSync(path.join(f.root, 'x-1.0.0.tgz'), 'two');
+  assert.notEqual(computeDepsKey(f.inputs()).key, a);
+});
+
 test('key: an ineligible lock or a missing tarball is not cacheable and says why', () => {
   const f = makeKeyFixture({ lockPackages: { '': {}, 'node_modules/d': { version: '1.0.0', resolved: 'file:../d' } } });
   const refused = computeDepsKey(f.inputs());
@@ -288,7 +327,10 @@ test('key: a root lifecycle script outside the allowlist is not cacheable unless
   const allowed = makeKeyFixture({ scripts: { prepare: 'git config core.hooksPath .githooks || true', test: 'node --test' } });
   assert.ok(computeDepsKey(allowed.inputs()).key, 'the known prepare script and non-install scripts are fine');
 
-  for (const name of ['preinstall', 'install', 'postinstall', 'prepare', 'preprepare', 'postprepare']) {
+  // every root script `npm ci` can run (npm 11.9.0: arborist reify.js, then lib/commands/ci.js), spelled out here on purpose
+  const EVERY_NPM_CI_ROOT_SCRIPT = ['predependencies', 'dependencies', 'postdependencies', 'preinstall', 'install', 'postinstall', 'prepublish', 'preprepare', 'prepare', 'postprepare'];
+  assert.deepEqual(ROOT_SCRIPT_NAMES, EVERY_NPM_CI_ROOT_SCRIPT, 'the gate covers the complete set, in npm\'s order');
+  for (const name of EVERY_NPM_CI_ROOT_SCRIPT) {
     const f = makeKeyFixture({ scripts: { [name]: 'husky install' } });
     const result = computeDepsKey(f.inputs());
     assert.equal(result.key, null, name);
@@ -619,7 +661,7 @@ test('removeTree removes a read-only store entry', () => {
 
 // ---- postinstall safety ----
 
-test('the outside-node_modules snapshot sees added, changed and removed files and ignores node_modules and the top-level .git', () => {
+test('the outside-node_modules snapshot sees added, changed and removed files and ignores node_modules and sees .git', () => {
   const dir = tmpDir('deps-cache-outside');
   fs.writeFileSync(path.join(dir, 'package.json'), '{}');
   fs.mkdirSync(path.join(dir, 'src'));
@@ -628,14 +670,34 @@ test('the outside-node_modules snapshot sees added, changed and removed files an
 
   fs.mkdirSync(path.join(dir, 'node_modules', 'x'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'node_modules', 'x', 'index.js'), 'ignored');
-  fs.mkdirSync(path.join(dir, '.git'));
-  fs.writeFileSync(path.join(dir, '.git', 'config'), 'the prepare script rewrites this');
+
   assert.deepEqual(snapshotChanges(before, snapshotOutsideNodeModules(dir)), []);
 
   fs.writeFileSync(path.join(dir, 'generated.txt'), 'new');
   fs.writeFileSync(path.join(dir, 'src', 'a.js'), 'changed size');
   fs.rmSync(path.join(dir, 'package.json'));
   assert.deepEqual(snapshotChanges(before, snapshotOutsideNodeModules(dir)), ['generated.txt', 'package.json', 'src/a.js']);
+});
+
+test('the allowlisted git-config script explains exactly its own .git/config line, and nothing else under .git', () => {
+  const scripts = { prepare: 'git config core.hooksPath .githooks || true' };
+  const base = '[core]\n\trepositoryformatversion = 0\n\tbare = false\n';
+  const withHooks = `${base}\thooksPath = .githooks\n`;
+  const changes = ['.git', '.git/config'];
+  assert.deepEqual(unexplainedChanges(changes, { scripts, configBefore: base, configAfter: withHooks }), []);
+  assert.deepEqual(unexplainedChanges(changes, { scripts, configBefore: withHooks, configAfter: `${base}\thooksPath = .githooks\n` }), [], 'rewriting the same value');
+
+  assert.deepEqual(unexplainedChanges([...changes, '.git/hooks', '.git/hooks/pre-commit'], { scripts, configBefore: base, configAfter: withHooks }), ['.git/hooks', '.git/hooks/pre-commit'], 'a new hook file is not explained');
+  assert.deepEqual(unexplainedChanges(changes, { scripts, configBefore: base, configAfter: `${withHooks}\tsshCommand = evil\n` }), changes, 'another config line is not explained');
+  assert.deepEqual(unexplainedChanges(changes, { scripts, configBefore: base, configAfter: `${base}\thooksPath = /tmp/evil\n` }), changes, 'a different hooksPath is not explained');
+  assert.deepEqual(unexplainedChanges(changes, { scripts: {}, configBefore: base, configAfter: withHooks }), changes, 'without the allowlisted script nothing under .git is explained');
+  assert.deepEqual(unexplainedChanges(['generated.txt', '.git/config'], { scripts, configBefore: base, configAfter: withHooks }), ['generated.txt']);
+  assert.deepEqual(allowlistedRootEvents({ prepare: scripts.prepare, postinstall: 'husky install', prepublish: scripts.prepare }), ['prepublish', 'prepare']);
+});
+
+test('scrubDepsEnv removes shell, ssh and lane variables, and keeps the rest including the temp dirs', () => {
+  const scrubbed = scrubDepsEnv({ PATH: '/bin', HOME: '/h', TMPDIR: '/var/tmp/lb-1', TMP: '/t', TEMP: '/t', PWD: '/p', OLDPWD: '/o', SHLVL: '2', _: '/x', GIT_CEILING_DIRECTORIES: '/c', SSH_CONNECTION: 'x', SSH_AUTH_SOCK: 'y', LANE_BROKER_LEASE: 'z', LANE_OMIT: 'dev', npm_config_cache: '/c' });
+  assert.deepEqual(Object.keys(scrubbed).sort(), ['HOME', 'PATH', 'TEMP', 'TMP', 'TMPDIR', 'npm_config_cache']);
 });
 
 // ---- absolute install path ----

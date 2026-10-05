@@ -49,6 +49,8 @@ const POSTINSTALLS = {
   'embed-big': "require('fs').writeFileSync('node_modules/hello-tool/native.bin', Buffer.concat([Buffer.alloc(3 * 1024 * 1024, 65), Buffer.from(process.cwd())]))",
   'drop-installed-record': "const f = 'node_modules/.package-lock.json'; const l = JSON.parse(require('fs').readFileSync(f, 'utf8')); delete l.packages['node_modules/hello-tool']; require('fs').writeFileSync(f, JSON.stringify(l))",
   harmless: "process.exit(0)",
+  'hook-file': "require('fs').mkdirSync('.git/hooks', { recursive: true }); require('fs').writeFileSync('.git/hooks/pre-commit', '#!/bin/sh\\n')",
+  'embed-tmpdir': "require('fs').writeFileSync('node_modules/hello-tool/tmp.txt', process.env.TMPDIR)",
 };
 
 /**
@@ -56,7 +58,7 @@ const POSTINSTALLS = {
  * root script from POSTINSTALLS; `prepare` sets a root prepare script. A lane declaring a postinstall also
  * declares root scripts safe, unless `rootScriptsSafe` says otherwise.
  */
-function repoFiles({ lockEdit, postinstall = null, prepare = null, rootScriptsSafe = postinstall !== null, tarball, laneExtra = {} } = {}) {
+function repoFiles({ lockEdit, postinstall = null, prepare = null, scripts = {}, npmrcExtra = '', dev = false, rootScriptsSafe = postinstall !== null, tarball, laneExtra = {} } = {}) {
   const base = fixtureBase();
   const pkg = JSON.parse(base.packageJson);
   const lock = JSON.parse(base.lock);
@@ -65,12 +67,20 @@ function repoFiles({ lockEdit, postinstall = null, prepare = null, rootScriptsSa
     lock.packages[''].hasInstallScript = true;
   }
   if (prepare) pkg.scripts = { ...pkg.scripts, prepare };
+  if (Object.keys(scripts).length > 0) pkg.scripts = { ...pkg.scripts, ...scripts };
+  if (dev) {
+    pkg.devDependencies = pkg.dependencies;
+    delete pkg.dependencies;
+    lock.packages[''].devDependencies = lock.packages[''].dependencies;
+    delete lock.packages[''].dependencies;
+    lock.packages['node_modules/hello-tool'].dev = true;
+  }
   if (lockEdit) lockEdit(lock);
   return {
     'package.json': JSON.stringify(pkg),
     'package-lock.json': JSON.stringify(lock),
     'hello-tool-1.0.0.tgz': tarball ?? base.tarball,
-    '.npmrc': NPMRC,
+    '.npmrc': NPMRC + npmrcExtra,
     '.lane-broker.json': JSON.stringify({
       version: 1,
       lanes: { default: { weight: 1, remote: true, remoteDeps: ['.'], ...(rootScriptsSafe ? { remoteDepsCacheRootScriptsSafe: true } : {}), ...laneExtra } },
@@ -104,7 +114,9 @@ function probeCommand(marker) {
     let inPlace = 'wrote';
     try { fs.appendFileSync('node_modules/hello-tool/package.json', ' '); } catch (e) { inPlace = e.code; }
     fs.writeFileSync('node_modules/hello-tool/new-file.txt', 'creating a file works');
-    fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ out, inPlace }));
+    let hooksPath = null;
+    try { hooksPath = execFileSync('git', ['config', '--get', 'core.hooksPath'], { encoding: 'utf8' }).trim(); } catch {}
+    fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ out, inPlace, hooksPath }));
   `;
   return [process.execPath, '-e', script];
 }
@@ -338,5 +350,60 @@ test('an install npm did not fully record (a simulated missing optional dependen
   assert.equal(run.code, 0, run.stderr);
   assert.equal(run.row.depsCache, 'skip');
   assert.match(run.stderr, /deps-cache skip key=[0-9a-f]{12} dir=\. ms=\d+ reason=incomplete-optional missing=hello-tool/);
+  assert.equal(s.storedKeys().length, 0);
+});
+
+test('every hit replays the allowlisted root script: core.hooksPath is set in the work dir whether the tree was installed or copied', async () => {
+  const s = setupWithNpmSpy();
+  const repoDir = makeGitWorktree(repoFiles({ prepare: 'git config core.hooksPath .githooks || true' }));
+  const miss = await runLane(s, repoDir);
+  assert.equal(miss.row.depsCache, 'miss');
+  assert.equal(miss.probe.hooksPath, '.githooks', 'npm ci ran the script');
+
+  const hit = await runLane(s, repoDir);
+  assert.equal(hit.row.depsCache, 'hit');
+  assert.equal(s.npmCiCalls(), 1);
+  assert.equal(hit.probe.hooksPath, '.githooks', 'the hit replayed it, since npm ci did not run');
+  assert.match(hit.stdout + hit.stderr, /prepare/, 'npm run showed which script it replayed');
+});
+
+test('a root script that writes anything else under .git (a hook file) is not published', async () => {
+  const s = setupWithNpmSpy();
+  const run = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'hook-file' })));
+  assert.equal(run.code, 0, run.stderr);
+  assert.equal(run.row.depsCache, 'miss');
+  assert.match(run.stderr, /published=no reason="install changed files outside node_modules: .*\.git\/hooks/);
+  assert.equal(s.storedKeys().length, 0);
+});
+
+test('a prepublish root script (which npm ci runs) is not cached unless the lane declares it safe', async () => {
+  const s = setupWithNpmSpy();
+  const run = await runLane(s, makeGitWorktree(repoFiles({ scripts: { prepublish: 'node -e 0' } })));
+  assert.equal(run.code, 0, run.stderr);
+  assert.equal(run.row.depsCache, 'skip');
+  assert.match(run.stderr, /reason="root lifecycle script not known to leave node_modules alone \(prepublish: node -e 0\)"/);
+  assert.equal(s.storedKeys().length, 0);
+});
+
+test('a variable an .npmrc reads from a scrubbed name (LANE_OMIT) never reaches npm, so two values can not produce a false hit', async () => {
+  const s = setupWithNpmSpy();
+  const repoDir = makeGitWorktree(repoFiles({ dev: true, npmrcExtra: 'omit=${LANE_OMIT}\n' }));
+  // if LANE_OMIT=dev reached npm it would leave the (dev) tool out of the tree and the command would fail
+  const omitDev = await runLane(s, repoDir, { env: { ...s.env, LANE_OMIT: 'dev' } });
+  assert.equal(omitDev.code, 0, omitDev.stderr);
+  assert.equal(omitDev.probe.out, 'hello from the bin', 'the tree is the one a run without LANE_OMIT gets');
+  const other = await runLane(s, repoDir, { env: { ...s.env, LANE_OMIT: 'optional' } });
+  assert.equal(other.code, 0, other.stderr);
+  assert.equal(other.probe.out, 'hello from the bin');
+  assert.equal(other.row.depsCache, 'hit', 'same effective environment, same key');
+  assert.equal(s.storedKeys().length, 1);
+});
+
+test('the per-run TMPDIR path is part of the relocatability scan', async () => {
+  const s = setupWithNpmSpy();
+  const run = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'embed-tmpdir' })));
+  assert.equal(run.code, 0, run.stderr);
+  assert.equal(run.row.depsCache, 'skip');
+  assert.match(run.stderr, /reason=absolute-install-path file=hello-tool\/tmp\.txt/);
   assert.equal(s.storedKeys().length, 0);
 });

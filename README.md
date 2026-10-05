@@ -417,10 +417,14 @@ reason.
   map, and every non-root entry must be an `https://registry.npmjs.org/`
   tarball with `integrity`, a `git+...#<40-hex sha>`, or a `file:*.tgz` with
   `integrity`. `file:` dirs, links, workspaces, unresolved entries and
-  anything else are refused (an `inBundle` entry rides in its parent's
-  tarball and is allowed). Root `preinstall`, `install`, `postinstall`,
-  `prepare`, `preprepare` and `postprepare` scripts must each be an exact
-  command on the allowlist (today only
+  anything else are refused. An entry with no `resolved` is allowed only when
+  an enclosing package bundles it (the parent's `bundleDependencies`, or
+  `inDepBundle`) and that parent passes the same checks; a top-level
+  bundled entry gets the normal checks. Every root script `npm ci` can run
+  (`predependencies`, `dependencies`, `postdependencies`, `preinstall`,
+  `install`, `postinstall`, `prepublish`, `preprepare`, `prepare`,
+  `postprepare`; from npm 11.9.0's `arborist/reify.js` and `lib/commands/ci.js`)
+  must be an exact command on the allowlist (today only
   `git config core.hooksPath .githooks || true`), or the lane must declare
   `remoteDepsCacheRootScriptsSafe: true` ("these scripts do not touch
   `node_modules`").
@@ -431,19 +435,28 @@ reason.
   exact `npm ci` argv, and the WHOLE deps-phase environment (plus the bytes
   of the runner's user/global npmrc). When any lock entry has an install
   script, the first line of `cc --version` and `python3 --version` too (a
-  missing tool is a value). Excluded as volatile: `TMPDIR`, `TMP`, `TEMP`,
-  `PWD`, `OLDPWD`, `SHLVL`, `_`, `GIT_CEILING_DIRECTORIES`, and any `SSH_*`
-  or `LANE_*` variable. Any other change is a miss.
+  missing tool is a value). The variables that differ on every run are REMOVED
+  from the environment npm and every script see, not just left out of the
+  key: `PWD`, `OLDPWD`, `SHLVL`, `_`, `GIT_CEILING_DIRECTORIES`, and any
+  `SSH_*` or `LANE_*`. `TMPDIR`, `TMP` and `TEMP` stay (tools need a temp
+  dir) but are not hashed, and their paths join the relocatability scan.
+  Any other change is a miss.
 - **Hit**: the stored tree is COPIED into the work dir (a reflink where the
   filesystem has them), as private writable files, so nothing a lane does to
   its tree can reach the store. The store itself is read-only. The copy is
-  slower than a hardlink farm and is the price of that isolation.
+  slower than a hardlink farm and is the price of that isolation. `npm ci`
+  is skipped, so the allowlisted root scripts (whose effect is on the work
+  dir's `.git/config`, not on `node_modules`) are REPLAYED, in npm's order,
+  as `npm run <event> --ignore-scripts`; `npm_command` is the one lifecycle
+  variable that differs from a real `npm ci`.
 - **Miss**: `npm ci` runs exactly as before, then the result is copied into
   the store and published with an atomic rename. Two runs missing on the same
   key at once both install; one publish wins and the other is discarded. The
   tree is NOT published when
   - the install changed a file outside `node_modules` (a hit would skip
-    whatever wrote it; the snapshot's top-level `.git` is ignored);
+    whatever wrote it). The only exception is the one `.git/config` line the
+    allowlisted script writes (`hooksPath = .githooks`); a new hook file or
+    any other `.git` write is not cached;
   - npm's own record (`node_modules/.package-lock.json`) lacks a lock entry
     that applies to this platform (`os`, `cpu`, `libc`), as when npm skips an
     optional dependency: `reason=incomplete-optional missing=<names>`;

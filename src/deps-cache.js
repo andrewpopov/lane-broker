@@ -38,17 +38,50 @@ const NPM_CONFIG_FILE_ENVS = ['npm_config_userconfig', 'npm_config_globalconfig'
 
 /**
  * The deps environment is hashed whole (an install can read any variable: PATH, CC, HOME, proxy
- * settings...) except these, which differ on every run without changing what an install produces:
- * per-ticket temp dirs, shell bookkeeping, the ssh session, and lane's own ticket/id variables.
+ * settings...), so the variables that differ on every run without meaning anything to an install are
+ * REMOVED from it before npm or any script sees them (`scrubDepsEnv`), not merely left out of the key:
+ * a variable that reaches the install but not the key would let two different installs share an entry.
+ * Removed: shell bookkeeping, the ssh session, git's ceiling (the work dir has its own `.git`), and lane's
+ * own ticket/id variables. A few tools do need a temp dir, so TMPDIR/TMP/TEMP stay in the environment, are
+ * not hashed, and their (per-run) paths join the relocatability scan instead.
  */
-export const VOLATILE_ENV_NAMES = new Set(['TMPDIR', 'TMP', 'TEMP', 'PWD', 'OLDPWD', 'SHLVL', '_', 'GIT_CEILING_DIRECTORIES']);
-export const VOLATILE_ENV_PREFIXES = ['SSH_', 'LANE_'];
+export const SCRUBBED_ENV_NAMES = new Set(['PWD', 'OLDPWD', 'SHLVL', '_', 'GIT_CEILING_DIRECTORIES']);
+export const SCRUBBED_ENV_PREFIXES = ['SSH_', 'LANE_'];
+export const PER_RUN_PATH_ENV_NAMES = ['TMPDIR', 'TMP', 'TEMP'];
 
-/** Root lifecycle scripts npm runs on `npm ci`. Their commands are not covered by the lockfile. */
-export const ROOT_SCRIPT_NAMES = ['preinstall', 'install', 'postinstall', 'prepare', 'preprepare', 'postprepare'];
+const isScrubbed = (name) => SCRUBBED_ENV_NAMES.has(name) || SCRUBBED_ENV_PREFIXES.some((p) => name.startsWith(p));
 
-/** Exact root-script commands known not to touch `node_modules`; any other needs the lane's explicit say-so. */
-export const ALLOWED_ROOT_SCRIPTS = new Set(['git config core.hooksPath .githooks || true']);
+export function scrubDepsEnv(env) {
+  return Object.fromEntries(Object.entries(env).filter(([name]) => !isScrubbed(name)));
+}
+
+/**
+ * Every root lifecycle script `npm ci` can run, in the order npm runs them. Derived from npm 11.9.0's source:
+ *  - `predependencies`, `dependencies`, `postdependencies`: `@npmcli/arborist/lib/arborist/reify.js`
+ *    (run after the tree is saved, whenever reification changed any dependency, which `npm ci` always does);
+ *  - `preinstall`, `install`, `postinstall`, `prepublish`, `preprepare`, `prepare`, `postprepare`:
+ *    `lib/commands/ci.js` (its `scripts` list, run after reify).
+ * A root script outside this list is never run by `npm ci`, so it cannot matter here.
+ */
+export const ROOT_SCRIPT_NAMES = [
+  'predependencies',
+  'dependencies',
+  'postdependencies',
+  'preinstall',
+  'install',
+  'postinstall',
+  'prepublish',
+  'preprepare',
+  'prepare',
+  'postprepare',
+];
+
+/**
+ * Exact root-script commands known not to touch `node_modules`, each with the one `.git/config` line it
+ * is expected to write in the work dir's synthetic repo (or null for none). Any other command needs the
+ * lane's explicit say-so. These are REPLAYED on every hit, since their side effect lives outside the cache.
+ */
+export const ALLOWED_ROOT_SCRIPTS = new Map([['git config core.hooksPath .githooks || true', /^hookspath = \.githooks$/i]]);
 
 /** A lock `resolved` pinned to content: an npmjs.org tarball with integrity, a git commit, or a local tarball with integrity. */
 const REGISTRY_RE = /^https:\/\/registry\.npmjs\.org\//;
@@ -104,33 +137,62 @@ export function currentSystem() {
  * Whether every lock entry is pinned to content, so `npm ci` from this lock is reproducible. Fails closed:
  * lock v2/v3 with a `packages` map only, and every non-root entry must be an npmjs.org tarball with
  * integrity, a git commit pin, or a `file:*.tgz` with integrity (returned in `tarballs`, which the key
- * hashes). `file:` dirs, links, workspaces and unresolved entries are refused. An `inBundle` entry has no
- * `resolved` of its own: its bytes ride inside its parent's integrity-checked tarball.
+ * hashes). `file:` dirs, links, workspaces and unresolved entries are refused.
+ *
+ * An entry with no `resolved` of its own is accepted only when its bytes ride inside an enclosing package's
+ * tarball: it is `inBundle`, nested under a package that bundles it (the parent's `bundleDependencies` names
+ * it, or the entry is `inDepBundle`), and that parent itself passed these checks. A top-level entry has no
+ * enclosing package (root-bundled deps are fetched like any other), so it gets the normal checks.
  */
 export function lockEligibility(lock) {
   if (!lock || ![2, 3].includes(lock.lockfileVersion) || !lock.packages || typeof lock.packages !== 'object') {
     return { ok: false, reason: 'lockfile is not v2 or v3 with a packages map' };
   }
+  const packages = lock.packages;
   const tarballs = [];
+  const verdicts = new Map();
+
+  const check = (name) => {
+    if (verdicts.has(name)) return verdicts.get(name);
+    verdicts.set(name, 'in progress'); // a cycle is not a pass
+    const verdict = checkEntry(name);
+    verdicts.set(name, verdict);
+    return verdict;
+  };
+  const checkEntry = (name) => {
+    const entry = packages[name];
+    if (!entry || typeof entry !== 'object') return `lock entry ${name} is malformed`;
+    if (entry.link === true) return `lock entry ${name} is a link`;
+    if (!name.startsWith('node_modules/')) return `lock entry ${name} is not under node_modules (workspace or local package)`;
+    const { resolved, integrity } = entry;
+    if (typeof resolved === 'string') {
+      if (REGISTRY_RE.test(resolved) && typeof integrity === 'string') return null;
+      if (GIT_PINNED_RE.test(resolved)) return null;
+      if (FILE_TARBALL_RE.test(resolved) && typeof integrity === 'string') {
+        tarballs.push(resolved.slice('file:'.length));
+        return null;
+      }
+      return `lock entry ${name} resolves to an unpinned source: ${resolved.slice(0, 80)}`;
+    }
+    const nested = name.lastIndexOf('/node_modules/');
+    if (entry.inBundle !== true || nested === -1) return `lock entry ${name} has no resolved`;
+    const parentName = name.slice(0, nested);
+    const parent = packages[parentName];
+    const childName = name.slice(nested + '/node_modules/'.length);
+    const bundles = Array.isArray(parent?.bundleDependencies) && parent.bundleDependencies.includes(childName);
+    if (!parent || (!bundles && entry.inDepBundle !== true)) return `lock entry ${name} has no resolved and no enclosing package bundles it`;
+    const parentVerdict = check(parentName);
+    return parentVerdict === null ? null : `lock entry ${name} is bundled by ${parentName}, which fails: ${parentVerdict}`;
+  };
+
   let hasInstallScript = false;
-  for (const [name, entry] of Object.entries(lock.packages)) {
+  for (const [name, entry] of Object.entries(packages)) {
     if (entry?.hasInstallScript) hasInstallScript = true;
     if (name === '') continue;
-    if (!entry || typeof entry !== 'object') return { ok: false, reason: `lock entry ${name} is malformed` };
-    if (entry.link === true) return { ok: false, reason: `lock entry ${name} is a link` };
-    if (!name.startsWith('node_modules/')) return { ok: false, reason: `lock entry ${name} is not under node_modules (workspace or local package)` };
-    if (entry.inBundle === true) continue;
-    const { resolved, integrity } = entry;
-    if (typeof resolved !== 'string') return { ok: false, reason: `lock entry ${name} has no resolved` };
-    if (REGISTRY_RE.test(resolved) && typeof integrity === 'string') continue;
-    if (GIT_PINNED_RE.test(resolved)) continue;
-    if (FILE_TARBALL_RE.test(resolved) && typeof integrity === 'string') {
-      tarballs.push(resolved.slice('file:'.length));
-      continue;
-    }
-    return { ok: false, reason: `lock entry ${name} resolves to an unpinned source: ${resolved.slice(0, 80)}` };
+    const verdict = check(name);
+    if (verdict !== null) return { ok: false, reason: verdict };
   }
-  return { ok: true, tarballs: tarballs.sort(), hasInstallScript };
+  return { ok: true, tarballs: [...new Set(tarballs)].sort(), hasInstallScript };
 }
 
 /** The first root lifecycle script that is neither allowlisted nor declared safe, as "<name>: <command>"; else null. */
@@ -143,9 +205,32 @@ function unsafeRootScript(packageJson, rootScriptsSafe) {
   return null;
 }
 
+/** The root scripts npm would run for this package that are on the allowlist, in npm's order (what a hit must replay). */
+export function allowlistedRootEvents(scripts) {
+  return ROOT_SCRIPT_NAMES.filter((name) => name in scripts && ALLOWED_ROOT_SCRIPTS.has(scripts[name]));
+}
+
+const configLines = (text) => (text ?? '').split('\n').map((l) => l.trim()).filter((l) => l !== '');
+
+/**
+ * Of the outside-`node_modules` `changes` an install made, those the allowlisted root scripts do NOT explain.
+ * The scripts' only expected effect is rewriting the work dir's `.git/config` (and so `.git`'s own entry);
+ * that is explained only if the config differs by exactly the lines those scripts write. A new hook file, or
+ * any other `.git` write, stays unexplained.
+ */
+export function unexplainedChanges(changes, { scripts, configBefore, configAfter }) {
+  const expected = allowlistedRootEvents(scripts).map((e) => ALLOWED_ROOT_SCRIPTS.get(scripts[e])).filter(Boolean);
+  const before = configLines(configBefore);
+  const after = configLines(configAfter);
+  const added = after.filter((l) => !before.includes(l));
+  const removed = before.filter((l) => !after.includes(l));
+  const configExplained = expected.length > 0 && added.every((l) => expected.some((re) => re.test(l))) && removed.every((l) => expected.some((re) => re.test(l)));
+  return changes.filter((c) => !(configExplained && (c === '.git' || c === '.git/config')));
+}
+
 /**
  * The cache key for one `remoteDeps` dir: a sha256 over everything that can change what `npm ci` produces
- * there. Returns `{ key, lock }`, or `{ key: null, reason }` when the dir must not be cached at all
+ * there. Returns `{ key, lock, scripts }`, or `{ key: null, reason }` when the dir must not be cached at all
  * (lockfile not pinned, or a root lifecycle script that is not known to leave `node_modules` alone).
  *
  *  - the lockfile (name and bytes), `package.json`, the `.npmrc` of the dir and of the repo root, and the
@@ -153,8 +238,8 @@ function unsafeRootScript(packageJson, rootScriptsSafe) {
  *  - node version/platform/arch (`runtime`), the glibc runtime and distro (`system`), the npm version;
  *  - when any lock entry has an install script, the first line of `cc --version` and `python3 --version`;
  *  - the exact install argv;
- *  - the whole `env` minus VOLATILE_ENV_NAMES / VOLATILE_ENV_PREFIXES, plus the bytes of the user/global
- *    npmrc files it points at.
+ *  - the whole `env` (already scrubbed by `scrubDepsEnv`; TMPDIR/TMP/TEMP are also left out), plus the
+ *    bytes of the user/global npmrc files it points at.
  */
 export function computeDepsKey({
   dir,
@@ -215,8 +300,8 @@ export function computeDepsKey({
     if (!bytes) return { key: null, reason: `file: tarball ${rel} is not in the snapshot` };
     parts.push([`tarball:${rel}`, bytes]);
   }
-  const volatile = (name) => VOLATILE_ENV_NAMES.has(name) || VOLATILE_ENV_PREFIXES.some((p) => name.startsWith(p));
-  for (const name of Object.keys(env).filter((k) => !volatile(k)).sort()) parts.push([`env:${name}`, String(env[name])]);
+  const unhashed = (name) => isScrubbed(name) || PER_RUN_PATH_ENV_NAMES.includes(name);
+  for (const name of Object.keys(env).filter((k) => !unhashed(k)).sort()) parts.push([`env:${name}`, String(env[name])]);
   for (const name of NPM_CONFIG_FILE_ENVS) {
     if (env[name]) parts.push([`file:${name}`, readIfExists(env[name]) ?? '']);
   }
@@ -227,7 +312,7 @@ export function computeDepsKey({
     hash.update(`${label}:${bytes.length}:`);
     hash.update(bytes);
   }
-  return { key: hash.digest('hex'), lock };
+  return { key: hash.digest('hex'), lock, scripts: pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {} };
 }
 
 function listAllows(list, value) {
@@ -550,8 +635,7 @@ export function findInstallPathReference(tree, needles) {
 }
 
 /**
- * Everything under `dir` except `node_modules` trees (and the snapshot's own top-level `.git`, which the
- * allowlisted `git config core.hooksPath` root script legitimately rewrites), as path -> "type:size:mtimeMs".
+ * Everything under `dir` except `node_modules` trees, `.git` included, as path -> "type:size:mtimeMs".
  * Taken before and after an install: any difference means a lifecycle script wrote outside `node_modules`,
  * which a cached `node_modules` could never reproduce.
  */
@@ -559,7 +643,7 @@ export function snapshotOutsideNodeModules(dir) {
   const out = new Map();
   const walk = (abs, rel) => {
     for (const ent of fs.readdirSync(abs, { withFileTypes: true })) {
-      if (ent.name === 'node_modules' || (rel === '' && ent.name === '.git')) continue;
+      if (ent.name === 'node_modules') continue;
       const childRel = rel ? `${rel}/${ent.name}` : ent.name;
       const st = fs.lstatSync(path.join(abs, ent.name));
       out.set(childRel, `${ent.isDirectory() ? 'd' : ent.isSymbolicLink() ? 'l' : 'f'}:${st.size}:${st.mtimeMs}`);
