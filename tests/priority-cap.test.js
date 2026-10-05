@@ -6,6 +6,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, laneRun, laneSpawn, waitFor, gitFixture } from './helpers.js';
 import { enqueue, tryStart, dequeueSync, listQueue } from '../src/scheduler.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
+import { fenceLegacyQueue } from '../src/migrate.js';
 import { readLease } from '../src/lease.js';
 import { paths, atomicWriteJson, readJsonSafe } from '../src/state.js';
 
@@ -52,12 +53,18 @@ async function withClock(fn) {
   }
 }
 
+const writeFence = (state) => {
+  atomicWriteJson(paths(state).schedFence, { version: 2, migratedAt: T0 });
+  atomicWriteJson(paths(state).fairness, { version: 2, tickets: {} });
+  fenceLegacyQueue(state, 'test');
+};
+
 // ---- the cap, in legacy and in fenced mode ----
 
 for (const mode of ['legacy', 'fenced']) {
   test(`cap (${mode}): the first high of a repo is admitted high, the second is demoted to medium with the flags persisted`, async () => {
     const { state } = freshEnv();
-    if (mode === 'fenced') atomicWriteJson(paths(state).schedFence, { version: 2, migratedAt: T0 });
+    if (mode === 'fenced') writeFence(state);
     const first = await enqueue(state, ticket('a', 'r1', 'high'), cfgWith());
     const second = await enqueue(state, ticket('b', 'r1', 'high'), cfgWith());
     assert.deepEqual([first.priorityRequested, first.priorityAdmitted, first.priorityDemoted], ['high', 'high', false]);
@@ -101,13 +108,13 @@ test('cap: a demoted ticket is not itself a queued high, and the slot frees when
   assert.equal((await enqueue(state, ticket('d', 'r1', 'high'), cfgWith())).priorityAdmitted, 'high', 'demoted tickets never held the slot');
 });
 
-test('cap: a queued high whose supervisor died is cleaned up first and does not hold the slot', async () => {
+test('cap: a queued high whose supervisor died does not hold the slot, and enqueue does not reap it', async () => {
   const { state } = freshEnv();
   const dead = spawnSync(process.execPath, ['-e', '0']).pid;
   await enqueue(state, ticket('ghost', 'r1', 'high', { supervisorPid: dead }), cfgWith());
   const next = await enqueue(state, ticket('live', 'r1', 'high'), cfgWith());
   assert.deepEqual([next.priorityAdmitted, next.priorityDemoted], ['high', false]);
-  assert.equal(queued(state).ghost, undefined, 'the dead supervisor ticket was dequeued');
+  assert.ok(queued(state).ghost, 'enqueue counts liveness without mutating other tickets: reaping is tryStart\'s job');
 });
 
 test('cap: two real processes racing on the state-root lock admit exactly one high', async () => {
@@ -230,7 +237,7 @@ test('audit: the lease carries requested/admitted/demoted, rank and score at sta
 test('audit: the admission decision line carries the head tier, effective rank and score; a not-head poll writes nothing', async () => {
   await withClock(async (clock) => {
     const { state } = freshEnv();
-    atomicWriteJson(paths(state).schedFence, { version: 2, migratedAt: T0 });
+    writeFence(state);
     const a = ticket('a', 'r1', 'low', { prioOriginAt: T0 });
     const b = ticket('b', 'r2', 'high', { prioOriginAt: T0 });
     await enqueue(state, a, cfgWith());

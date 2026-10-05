@@ -10,7 +10,7 @@ import { reconcileSimArm, touchSimArmFor } from './sim-arm.js';
 import { advanceHwm } from './priority-clock.js';
 import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, effectiveRank, score } from './priority.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
-import { resolveScheduler, legacyStore, fairnessStore, effectiveView } from './fairness.js';
+import { resolveScheduler, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
 import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, resolveTicketResources } from './resources.js';
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
@@ -47,10 +47,32 @@ export function listQueueStrict(root) {
   return listJsonRecordsStrict(paths(root).queue);
 }
 
+/** Thrown when a valid scheduler fence coexists with a non-empty legacy `queue/` directory: a crash or tampering, never a state to guess about. */
+export class LegacyQueueAfterFenceError extends Error {
+  constructor(dir) {
+    super(`lane-broker: the scheduler fence is present but the legacy queue directory ${dir} still holds tickets; refusing admission. Drain it by hand, or remove sched-v2.json to run the legacy scheduler`);
+    this.name = 'LegacyQueueAfterFenceError';
+  }
+}
+
+/** Caller holds the lock. New code never queues into a legacy `queue/` directory behind the fence. */
+function assertQueueLayout(root) {
+  if (readSchedulerFence(root).status !== 'valid') return;
+  const legacy = path.join(root, 'queue');
+  let names;
+  try {
+    names = fs.readdirSync(legacy);
+  } catch {
+    return; // the fence file (ENOTDIR) or nothing at all: the intended layout
+  }
+  if (names.length > 0) throw new LegacyQueueAfterFenceError(legacy);
+}
+
 /**
  * BRAIN-380: behind the fence, a queue record that does not carry `schedVersion` 2 can only come from a process that
  * escaped the migration's quiescence checks. It is contained, never adopted: moved to `queue-quarantine/` and logged,
  * so it is never selected, and its supervisor then finds its queue file gone and exits as cancelled. Caller holds the lock.
+ * A record whose rename fails is not quarantined, so the caller must treat it as an unreadable barrier: see `fenceLegacy`.
  */
 function quarantineLegacyRecords(root) {
   const dir = paths(root).queue;
@@ -67,11 +89,14 @@ function quarantineLegacyRecords(root) {
       fs.mkdirSync(paths(root).queueQuarantine, { recursive: true });
       fs.renameSync(path.join(dir, name), path.join(paths(root).queueQuarantine, name));
       logResourceEvent(root, 'legacy-record-after-fence', { ticket: record.id ?? 'unknown', file: name, action: 'quarantined' });
-    } catch {
-      // best-effort; the next evaluation retries
+    } catch (err) {
+      logResourceEvent(root, 'legacy-record-after-fence', { ticket: record.id ?? 'unknown', file: name, action: 'quarantine-failed', error: err.code ?? 'error' });
     }
   }
 }
+
+/** Behind the fence a record without `schedVersion` 2 is never selectable, whatever became of its quarantine: it reads as a barrier. */
+const fenceLegacy = (rawQueue) => rawQueue.map((t) => (t !== null && t.schedVersion !== 2 ? null : t));
 
 function findQueueFile(root, id) {
   const dir = paths(root).queue;
@@ -92,15 +117,21 @@ function findQueueFile(root, id) {
 export async function enqueue(root, ticket, { maxQueuedHighPerRepo } = DEFAULT_GLOBAL_CONFIG) {
   return withLock(root, () => {
     assertNotMigrating(root);
+    assertQueueLayout(root);
     const nowEff = advanceHwm(root);
     const priorityRequested = isPriorityTier(ticket.priorityRequested) ? ticket.priorityRequested : DEFAULT_PRIORITY;
     // BRAIN-380 §7: the high cap, per broker. It shares this lock with the seq allocation and the queue write below,
-    // so two racing enqueues cannot both read "no high queued". Counted after stale cleanup, across lanes and worktrees.
+    // so two racing enqueues cannot both read "no high queued". Across lanes and worktrees. A queued high whose supervisor
+    // is dead does not hold the slot, but is not reaped here: enqueue must not mutate other tickets' state (tryStart reaps).
     let demoted = false;
     if (priorityRequested === 'high') {
-      reapStale(root, ticket.id);
       const queuedHigh = listQueue(root).filter(
-        (t) => t && t.repoId === ticket.repoId && t.priorityRequested === 'high' && t.priorityAdmitted === 'high',
+        (t) =>
+          t &&
+          t.repoId === ticket.repoId &&
+          t.priorityRequested === 'high' &&
+          t.priorityAdmitted === 'high' &&
+          isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart }),
       ).length;
       demoted = queuedHigh >= maxQueuedHighPerRepo;
     }
@@ -698,10 +729,14 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // BRAIN-380: behind a valid scheduler fence this evaluation is priority-ordered, over per-ticket fairness
     // records; otherwise it is the legacy FIFO over the singleton files, untouched. `queue` is the ONE array
     // every selector, the safe-backfill predicate and the shadow snapshot below receive.
+    assertQueueLayout(root);
     const sched = resolveScheduler(root);
     const store = sched.v2 ? fairnessStore(root, sched.tickets) : legacyStore(root);
     if (sched.v2) quarantineLegacyRecords(root);
-    const rawQueue = listQueue(root);
+    const rawQueue = sched.v2 ? fenceLegacy(listQueue(root)) : listQueue(root);
+    // A reservation exists only while resource backfill does: when it is off, release every latch, so turning it back
+    // on makes a ticket earn its reservation again.
+    if (sched.v2 && !(cfg.schedulerMode === 'active' && cfg.resourceSkipLimit > 0)) store.releaseReservations();
     store.prune(rawQueue);
     const { queue, ownerId: reservationOwnerId } = sched.v2 ? effectiveView(rawQueue, nowEff, cfg, store) : { queue: rawQueue, ownerId: null };
     const position = queue.findIndex((t) => t && t.id === ticket.id);

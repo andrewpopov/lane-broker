@@ -8,11 +8,28 @@ export function stateHome() {
   return process.env.LANE_BROKER_STATE || path.join(os.homedir(), '.cache', 'lane-broker');
 }
 
+/** What the migration leaves where old code expects the queue DIRECTORY, so old code fails on its own: `mkdir` and every
+ *  queue write underneath it hit ENOTDIR/EEXIST. New code then keeps its queue in `queue-v2/`. */
+export const QUEUE_FENCE_NOTE = 'lane-broker scheduler migrated to v2; upgrade lane-broker\n';
+
+/** Has `lane migrate-scheduler` replaced the legacy `queue/` directory with the fence file? */
+export function queueFenced(root) {
+  try {
+    return !fs.lstatSync(path.join(root, 'queue')).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 export function paths(root = stateHome()) {
   return {
     root,
     leases: path.join(root, 'leases'),
-    queue: path.join(root, 'queue'),
+    // A getter, not a value: every queue read and write goes through it, and the answer (legacy `queue/` or `queue-v2/`)
+    // is whatever the state root says at the moment of use.
+    get queue() {
+      return path.join(root, queueFenced(root) ? 'queue-v2' : 'queue');
+    },
     logs: path.join(root, 'logs'),
     results: path.join(root, 'results'),
     cancel: path.join(root, 'cancel'),
@@ -133,13 +150,16 @@ export function atomicWriteFile(file, data, { fsync = false } = {}) {
     fs.writeFileSync(tmp, data, { flag: 'wx' });
   }
   fs.renameSync(tmp, file);
-  if (fsync) {
-    const dirFd = fs.openSync(dir, 'r');
-    try {
-      fs.fsyncSync(dirFd);
-    } finally {
-      fs.closeSync(dirFd);
-    }
+  if (fsync) fsyncDirectory(dir);
+}
+
+/** Make a rename, create or unlink inside `dir` durable. */
+export function fsyncDirectory(dir) {
+  const dirFd = fs.openSync(dir, 'r');
+  try {
+    fs.fsyncSync(dirFd);
+  } finally {
+    fs.closeSync(dirFd);
   }
 }
 

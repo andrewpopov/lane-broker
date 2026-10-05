@@ -1,6 +1,7 @@
 import fs from 'node:fs';
+import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { paths, stateHome, withLock, atomicWriteJson, readJsonSafe, isPidAlive, UnreadableRecordError } from './state.js';
+import { paths, stateHome, withLock, atomicWriteJson, atomicWriteFile, fsyncDirectory, readJsonSafe, isPidAlive, UnreadableRecordError, QUEUE_FENCE_NOTE } from './state.js';
 import { listLeasesStrict, LEASE_STATE } from './lease.js';
 import { listAttemptsStrict } from './attempts.js';
 import { listQueueStrict } from './scheduler.js';
@@ -22,7 +23,6 @@ import { logResourceEvent } from './admission.js';
 
 /** Scripts a lane-broker process runs. `bin/lane.js` also covers the `remote-exec` and `remote-pipeline` subcommands. */
 const LANE_SCRIPT = /(^|\/)(bin\/lane\.js|src\/supervisor\.js|src\/remote-pipeline\.js)$/;
-const NODE_EXECUTABLE = /(^|\/)(node|nodejs|bun)$/;
 const COMMAND_PREVIEW_CHARS = 160;
 
 /** The process table as `{pid, ppid, command}` rows. Throws if it cannot be read (the caller fails closed). */
@@ -37,21 +37,25 @@ export function readProcessTable() {
 }
 
 /**
- * Does this command line run lane-broker, whatever its version or install path? The script is the executable itself
- * (a `lane` symlink or `lane.js`) or the first non-flag argument of node. A `lane` symlink is resolved to its target;
- * one that cannot be resolved counts as lane-broker (unknown is treated as old).
+ * Does this command line run lane-broker, whatever its version or install path? EVERY argv token is examined, so
+ * `node --require x.js /old/bin/lane.js` and a wrapper script are caught as well as `node bin/lane.js`. A token counts
+ * when it, or the file it resolves to through symlinks, ends in one of the lane scripts; a `lane` token that cannot be
+ * resolved counts too (unknown is treated as old). This is defence in depth: the queue fence (see `fenceLegacyQueue`)
+ * is what actually stops old code, including a process launched after this table was read.
  */
 export function runsLaneBroker(command) {
-  const [exe, ...args] = command.trim().split(/\s+/);
-  const script = NODE_EXECUTABLE.test(exe) ? args.find((a) => !a.startsWith('-')) : exe;
-  if (!script) return false;
-  if (LANE_SCRIPT.test(script)) return true;
-  if (!/(^|\/)lane$/.test(script)) return false;
-  try {
-    return LANE_SCRIPT.test(fs.realpathSync(script));
-  } catch {
-    return true;
-  }
+  return command
+    .trim()
+    .split(/\s+/)
+    .some((token) => {
+      if (LANE_SCRIPT.test(token)) return true;
+      if (!token.includes('/') && token !== 'lane') return false;
+      try {
+        return LANE_SCRIPT.test(fs.realpathSync(token));
+      } catch {
+        return /(^|\/)lane$/.test(token);
+      }
+    });
 }
 
 /** Pids of `pid` and every ancestor, from the table itself. */
@@ -108,6 +112,37 @@ function liveMigrator(root, pid) {
   return fs.existsSync(paths(root).migrating) && Number.isInteger(marker?.pid) && marker.pid !== pid && isPidAlive(marker.pid) ? marker.pid : null;
 }
 
+/**
+ * The fence OLD code fails on by itself. Called under the lock at a drained point, after fairness-v2.json is durable:
+ * the (empty) legacy `queue/` directory is renamed to `queue.legacy-<ts>/` and a regular FILE named `queue` takes its
+ * place. Old code's `mkdir queue` and every queue write beneath it then fail (EEXIST/ENOTDIR), and its `listQueue` sees
+ * nothing, so an old process can never get a ticket into the queue and therefore never be admitted (old `tryStart`
+ * starts only a ticket it finds in the queue). New code keeps its queue in `queue-v2/` (`paths().queue`). `seq` stays
+ * shared. Idempotent: a `queue` that is already the file means an earlier run got this far.
+ */
+export function fenceLegacyQueue(root, stamp) {
+  const legacy = path.join(root, 'queue');
+  let isDirectory = false;
+  try {
+    isDirectory = fs.lstatSync(legacy).isDirectory();
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+  fs.mkdirSync(path.join(root, 'queue-v2'), { recursive: true });
+  if (isDirectory) {
+    fs.renameSync(legacy, `${legacy}.legacy-${stamp}`);
+    fsyncDirectory(root);
+  }
+  if (isDirectory || !fs.existsSync(legacy)) atomicWriteFile(legacy, QUEUE_FENCE_NOTE, { fsync: true });
+  fsyncDirectory(root);
+}
+
+/** Remove the `migrating` marker durably. */
+function removeMarker(root) {
+  fs.rmSync(paths(root).migrating, { force: true });
+  fsyncDirectory(root);
+}
+
 function archiveSingletons(root, stamp) {
   const p = paths(root);
   const archived = [];
@@ -122,13 +157,18 @@ function archiveSingletons(root, stamp) {
 /**
  * Core of the command. Resolves `{status, checks}` where status is `already-migrated`, `fairness-invalid` (a valid
  * fence over an invalid fairness file: the broker is running legacy), `refused`, `ready` (dry run, all preconditions
- * hold) or `migrated`. `afterFairness` is a test seam that runs between the two durable writes.
+ * hold) or `migrated`. `afterFairness` (before the queue fence) and `afterFence` are test seams.
  */
-export async function migrateScheduler(root, { dryRun = false, readProcesses = readProcessTable, afterFairness = () => {}, pid = process.pid, now = Date.now } = {}) {
+export async function migrateScheduler(root, { dryRun = false, readProcesses = readProcessTable, afterFairness = () => {}, afterFence = () => {}, pid = process.pid, now = Date.now } = {}) {
   const p = paths(root);
   return withLock(root, async () => {
     if (readSchedulerFence(root).status === 'valid') {
-      return { status: resolveScheduler(root, { log: false }).v2 ? 'already-migrated' : 'fairness-invalid', checks: [] };
+      const v2 = resolveScheduler(root, { log: false }).v2;
+      // A migrator that crashed after the fence (the commit point) leaves its marker behind, which would refuse every
+      // admission for ever. The fence is durable, so the migration is done: finish the cleanup.
+      const recovered = !dryRun && fs.existsSync(p.migrating);
+      if (recovered) removeMarker(root);
+      return { status: v2 ? (recovered ? 'recovered' : 'already-migrated') : 'fairness-invalid', checks: [] };
     }
     const other = liveMigrator(root, pid);
     if (other !== null) return { status: 'refused', checks: [{ name: 'migrator', failures: [`another lane migrate-scheduler is running (pid ${other})`] }] };
@@ -139,13 +179,16 @@ export async function migrateScheduler(root, { dryRun = false, readProcesses = r
       if (dryRun) return { status: 'ready', checks };
       // Nothing is queued, leased or attempting, so the new store starts empty: the legacy singleton files are archived, not converted.
       atomicWriteJson(p.fairness, { version: SCHEDULER_V2_VERSION, tickets: {} }, { fsync: true });
-      afterFairness();
+      const stamp = new Date(now()).toISOString().replace(/[:.]/g, '-');
+      await afterFairness();
+      fenceLegacyQueue(root, stamp);
       atomicWriteJson(p.schedFence, { version: SCHEDULER_V2_VERSION, migratedAt: now() }, { fsync: true });
-      const archived = archiveSingletons(root, new Date(now()).toISOString().replace(/[:.]/g, '-'));
+      await afterFence();
+      const archived = archiveSingletons(root, stamp);
       logResourceEvent(root, 'scheduler-migrated', { archived: archived.length });
       return { status: 'migrated', checks, archived };
     } finally {
-      if (!dryRun) fs.rmSync(p.migrating, { force: true });
+      if (!dryRun) removeMarker(root);
     }
   });
 }
@@ -162,6 +205,9 @@ export async function migrateSchedulerCommand({ dryRun = false, root = stateHome
   switch (result.status) {
     case 'already-migrated':
       out('lane migrate-scheduler: already migrated (valid scheduler fence present); nothing to do');
+      return { exitCode: 0 };
+    case 'recovered':
+      out('lane migrate-scheduler: already migrated (recovered): a valid scheduler fence was present and the stale migrating marker is removed');
       return { exitCode: 0 };
     case 'fairness-invalid':
       err('lane migrate-scheduler: a valid fence is present but fairness-v2.json is invalid, so the broker is running the legacy scheduler; repair or remove fairness-v2.json by hand');

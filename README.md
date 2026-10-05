@@ -711,7 +711,10 @@ process). `lane migrate-scheduler` (below) writes the fence.
   `nowEff = max(wall clock, hwm)`: `(score desc, seq asc)` within each run of
   readable records, never across an unreadable record. The active reservation
   owner, if any, is then moved to index 0 (never across an unreadable record,
-  which suspends its reservation for that evaluation). Every selector (conflict,
+  which suspends its reservation for that evaluation, nor while the owner is
+  class-ineligible: `effectiveView` takes an `eligible(ticket)` filter that defaults
+  to allow-all because BRAIN-379 allocation is shadow-only, and is to be wired to
+  its enforcement when that goes live). Every selector (conflict,
   capacity and resource walks, BRAIN-365's conflict backfill, BRAIN-355's safe
   backfill) and the allocation shadow snapshot receive that one array, so
   "head" means index 0 of it. "Smallest fitting claim" ties go to the earlier
@@ -760,9 +763,12 @@ Under one hold of the broker lock the command writes a `migrating` marker, then 
 - no lease is `RUNNING` or `ORPHANED`;
 - no attempt record is left in `attempts/` (a supervisor still probing or dispatching a remote attempt is invisible
   to the queue);
-- no live process runs lane-broker's `bin/lane.js`, `src/supervisor.js` or `remote-pipeline`, whatever its version.
+- no live process runs lane-broker's `bin/lane.js`, `src/supervisor.js` or `src/remote-pipeline.js`, whatever its
+  version. Every argv token of every process is examined (so `node --require x.js /old/bin/lane.js` is caught) and
+  symlinks are resolved; a process that merely mentions one of those paths, an editor for instance, blocks it too.
   The check reads the machine's process table, so a lane process serving a different state root blocks it too.
-  The migrator and its ancestors are excluded.
+  The migrator and its ancestors are excluded. It is a snapshot, taken once, so it is defence in depth: the queue
+  fence below is what stops an old process that starts after it.
 
 Lease, attempt and queue records are read strictly: an unreadable record refuses the migration instead of being
 skipped. On any failure the marker is removed, the broker stays paused, and the command exits 1 naming every failed
@@ -770,20 +776,39 @@ check with its ids or pids. While the marker exists, `lane run`, remote dispatch
 `remote-exec` on a runner all refuse with exit 75 and "scheduler migration in progress".
 
 If everything holds, it writes `fairness-v2.json` (`{"version": 2, "tickets": {}}`, all there is at a drained
-point), then `sched-v2.json` (the commit point), each fsynced along with its directory, then renames the legacy
+point), then fences the queue (below), then writes `sched-v2.json` (the commit point), each fsynced along with its
+directory, then renames the legacy
 `conflict-skip-state.json`, `capacity-skip-state.json` and `resource-skip-state.json` to `*.migrated-<timestamp>`
 and removes the marker. Re-running is safe: `fairness-v2.json` without a fence redoes the cutover, and a valid fence
 prints "already migrated" and exits 0. A marker left by a crashed migrator is taken over by the next run.
 
+**The queue fence.** Old code ignores `migrating` and the scheduler fence, so the migration also makes old code fail by
+itself. It renames the (empty) `queue/` directory to `queue.legacy-<timestamp>/` and creates a regular FILE named
+`queue` holding "lane-broker scheduler migrated to v2; upgrade lane-broker". New code keeps its queue in `queue-v2/`
+(every queue read and write goes through `paths().queue`; `seq` stays shared). An old `lane run` then fails at its
+first `mkdir queue`, and an old supervisor that was already past it fails at its first queue write (ENOTDIR). Old
+`tryStart` starts only a ticket it finds in the queue, so no old process can be admitted. If a valid fence is found
+together with a non-empty legacy `queue/` directory (a crash or manual tampering), new code refuses admission with an
+error naming the directory rather than guessing.
+
+A migrator that dies after the fence leaves its `migrating` marker behind. Re-running `lane migrate-scheduler` sees the
+valid fence, removes the marker (fsyncing the directory) and reports "already migrated (recovered)".
+
 Behind the fence, a queue record without `schedVersion` (only an escaped pre-migration process can write one) is
 moved to `queue-quarantine/`, logged as `lane-broker-head-block event=legacy-record-after-fence`, and never
-selected. Its supervisor finds its queue file gone and exits as cancelled.
+selected. Its supervisor finds its queue file gone and exits as cancelled. If the quarantine rename itself fails, the
+record is still never selectable: it reads as an unreadable-record barrier for that evaluation and the failure is
+logged as `action=quarantine-failed`. A valid fence over a missing or malformed `fairness-v2.json` (every field a
+selector reads is type-checked) runs the legacy scheduler and logs `scheduler-fence-invalid`. Turning resource
+backfill off (`resourceSkipLimit` 0, or shadow mode) releases every reservation latch; turning it back on makes a
+ticket earn one again.
 
 ### The high cap, the remote hop and the audit (BRAIN-380 slice 4)
 
 **The high cap.** At most `maxQueuedHighPerRepo` (default `1`) tickets of one repo can sit in the queue as `high`.
 `enqueue` counts them under the same state-root lock that allocates the sequence number and writes the queue record
-(so two racing `lane run`s cannot both see "none queued"), across lanes and worktrees, after dead-supervisor cleanup.
+(so two racing `lane run`s cannot both see "none queued"), across lanes and worktrees. A queued high whose supervisor
+is dead (pid plus start time, a read-only check) does not count; `enqueue` never reaps or otherwise changes other tickets.
 A high at or over the cap is admitted as `medium`: the record keeps `priorityRequested: high` and gets
 `priorityAdmitted: medium`, `priorityDemoted: true`, and `lane run` prints
 `lane run: priority high demoted to medium (repo already has a queued high ticket)` to stderr. A demoted ticket does

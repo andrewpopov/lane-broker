@@ -7,7 +7,7 @@ import { ensureStateDirs, paths, readJsonSafe, LockTimeoutError, MigrationInProg
 import { resolveTicketConfig, reloadGlobalConfig, resolvePriority, ConfigError } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
-import { stampPriorityOrigin, effectiveNow } from './priority-clock.js';
+import { stampPriorityOrigin } from './priority-clock.js';
 import { detectResourceCapacity, leaseResources, resolveTicketResources, checkResourceBudget, localSimRefusal } from './resources.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
 
@@ -344,9 +344,10 @@ export async function runCommand({
 
   const root = ensureStateDirs().root;
   // BRAIN-380: the priority origin is `nowEff`, stamped under the broker lock in the same transaction that
-  // advances the high-water mark. Under lock contention it degrades to an unlocked read, which can only
-  // UNDER-state nowEff (never invents age) and must not make `lane run` fail where it never used to.
-  let prioOriginAt;
+  // advances the high-water mark. Under lock contention there is no trustworthy `nowEff` to read: an unlocked read
+  // can be BEHIND the mark, which would back-date the origin and invent age. The origin is left null instead, and
+  // `enqueue` assigns `nowEff` under the lock, so the ticket starts with zero age. `lane run` must not fail here.
+  let prioOriginAt = null;
   try {
     prioOriginAt = await stampPriorityOrigin(root);
   } catch (err) {
@@ -359,9 +360,8 @@ export async function runCommand({
       if (migrating instanceof MigrationInProgressError) return refuseForMigration();
       throw migrating;
     }
-    prioOriginAt = effectiveNow(root);
   }
-  prioOriginAt -= priorityAccruedMs;
+  if (prioOriginAt !== null) prioOriginAt -= priorityAccruedMs;
   const id = idOverride || crypto.randomUUID();
   if (onTicketCreated) {
     const proceed = await onTicketCreated(id);

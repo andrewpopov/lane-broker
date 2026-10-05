@@ -162,14 +162,15 @@ test('a live lane process blocks the migration whatever its version, but the mig
     { pid: 60, ppid: 50, command: `node ${BIN} migrate-scheduler` }, // the migrator itself
     { pid: 70, ppid: 1, command: 'node /old/0.9.0/lane-broker/src/supervisor.js' },
     { pid: 71, ppid: 1, command: 'node --no-warnings /new/lane-broker/bin/lane.js remote-pipeline /tickets/abc' },
-    { pid: 72, ppid: 1, command: 'vim /new/lane-broker/src/supervisor.js' }, // an editor, not a process running it
-    { pid: 73, ppid: 1, command: 'tail -f /x/bin/lane.js' },
+    { pid: 72, ppid: 1, command: 'node --require /x/hook.js /old/lane-broker/bin/lane.js run -- x' }, // the script is not node's first non-flag argument
+    { pid: 73, ppid: 1, command: 'vim /new/lane-broker/src/supervisor.js' }, // not running it, but every token is scanned: fail closed
+    { pid: 74, ppid: 1, command: 'node /a/server.js --port 1' },
   ];
   const result = await migrateScheduler(state, { readProcesses: () => table, pid: 60 });
   assert.equal(result.status, 'refused');
   assert.deepEqual(
     failuresOf(result).map((f) => f.match(/^lane process pid (\d+) is alive/)?.[1]),
-    ['70', '71'],
+    ['70', '71', '72', '73'],
   );
   assert.match(failuresOf(result)[0], /supervisor\.js$/);
   assert.equal(migratingExists(state), false);

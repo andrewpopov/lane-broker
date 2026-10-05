@@ -9,6 +9,7 @@ import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { writeLease, removeLease, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths, atomicWriteJson, readJsonSafe } from '../src/state.js';
 import { resolveScheduler, fairnessStore, effectiveView } from '../src/fairness.js';
+import { fenceLegacyQueue } from '../src/migrate.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
 
 /**
@@ -58,7 +59,12 @@ async function withClock(fn) {
   }
 }
 
-const writeFence = (state, overrides = {}) => atomicWriteJson(paths(state).schedFence, { version: 2, migratedAt: T0, ...overrides });
+// the migrator always writes both files, and a valid fence over a missing fairness file is invalid
+const writeFence = (state, overrides = {}) => {
+  atomicWriteJson(paths(state).schedFence, { version: 2, migratedAt: T0, ...overrides });
+  fenceLegacyQueue(state, 'test'); // the real layout: old code's queue/ is now a file, new code queues in queue-v2/
+  if (!fs.existsSync(paths(state).fairness)) atomicWriteJson(paths(state).fairness, { version: 2, tickets: {} });
+};
 const writeFairness = (state, tickets) => atomicWriteJson(paths(state).fairness, { version: 2, tickets });
 const readFairness = (state) => JSON.parse(fs.readFileSync(paths(state).fairness, 'utf8')).tickets;
 const fenced = (cfg = baseCfg()) => {
@@ -110,6 +116,10 @@ test('an invalid fence or fairness file runs legacy mode and logs scheduler-fenc
     'malformed fairness file': (state) => {
       writeFence(state);
       atomicWriteJson(paths(state).fairness, { version: 2, tickets: { x: { conflict: { reason: 'capacity', skipsCharged: 1 } } } });
+    },
+    'missing fairness file': (state) => {
+      writeFence(state);
+      fs.rmSync(paths(state).fairness);
     },
     'wrong fairness version': (state) => {
       writeFence(state);
@@ -347,6 +357,60 @@ test('disabling the resource limit releases the reservation', async () => {
     assert.equal(viewOf(state, activeCfg({ resourceSkipLimit: 0 })).ownerId, null);
     assert.deepEqual(viewOf(state, activeCfg({ resourceSkipLimit: 0 })).ids, ['high', 'owner']);
   });
+});
+
+test('disabling the limit RELEASES the reservation latch, and re-enabling it requires earning one again', async () => {
+  await withClock(async () => {
+    const { state } = fenced(activeCfg());
+    await enqueue(state, ticket('owner', { weight: 4 }));
+    await enqueue(state, ticket('high', { priorityRequested: 'high' }));
+    writeFairness(state, { owner: { resource: reservedRec(3) } });
+    assert.equal(viewOf(state, activeCfg()).ownerId, 'owner');
+    fs.writeFileSync(paths(state).pause, 'test');
+    await poll(state, ticket('high', { priorityRequested: 'high' }), activeCfg({ resourceSkipLimit: 0 }));
+    const released = readFairness(state).owner.resource;
+    assert.equal(released.reserved, false, 'the latch is deleted from the store, not merely ignored');
+    assert.equal(released.reservationSeq, undefined);
+    assert.equal(viewOf(state, activeCfg()).ownerId, null, 'turning the limit back on does not resurrect it');
+  });
+});
+
+test('class eligibility: an ineligible owner\'s reservation is suspended, and the next eligible one is active', async () => {
+  await withClock(async () => {
+    const { state } = fenced(activeCfg());
+    await enqueue(state, ticket('a', { weight: 4 }));
+    await enqueue(state, ticket('b', { weight: 4 }));
+    writeFairness(state, { a: { resource: reservedRec(3) }, b: { resource: reservedRec(5) } });
+    const sched = resolveScheduler(state, { log: false });
+    const store = fairnessStore(state, sched.tickets);
+    const raw = listQueue(state);
+    assert.equal(effectiveView(raw, T0, activeCfg(), store).ownerId, 'a', 'allow-all by default');
+    assert.equal(effectiveView(raw, T0, activeCfg(), store, (t) => t.id !== 'a').ownerId, 'b', 'a is suspended, the older eligible reservation takes over');
+    assert.equal(effectiveView(raw, T0, activeCfg(), store, () => false).ownerId, null);
+  });
+});
+
+test('fairness validation: every field a selector reads is type-checked, and a reserved latch needs its seq', async () => {
+  const bad = {
+    'conflict blockedSince': { conflict: { ...conflictRec(1, T0), blockedSince: 'soon' } },
+    'conflict graceStartedAt': { conflict: { ...conflictRec(1, T0), graceStartedAt: {} } },
+    'conflict loggedPhase': { conflict: { ...conflictRec(1, T0), loggedPhase: 5 } },
+    'capacity loggedPhase': { capacity: { reason: 'capacity', skipsCharged: 1, loggedPhase: [] } },
+    'resource reserved': { resource: { ...reservedRec(3), reserved: 'yes' } },
+    'resource reservationSeq': { resource: { ...reservedRec(3), reservationSeq: '3' } },
+    'resource reserved without a seq': { resource: { ...reservedRec(3), reservationSeq: undefined } },
+    'resource inScope': { resource: { ...reservedRec(3), inScope: 1 } },
+    'resource deniedAt': { resource: { ...reservedRec(3), deniedAt: null } },
+    'resource budget': { resource: { ...reservedRec(3), budget: 'big' } },
+  };
+  for (const [name, record] of Object.entries(bad)) {
+    const { state } = fenced();
+    writeFairness(state, { x: record });
+    assert.equal(resolveScheduler(state, { log: false }).v2, false, `${name}: not trusted`);
+  }
+  const { state } = fenced();
+  writeFairness(state, { x: { conflict: conflictRec(1, T0), resource: reservedRec(3) } });
+  assert.equal(resolveScheduler(state, { log: false }).v2, true, 'a well-formed file is');
 });
 
 test('a ticket\'s fairness record is deleted when the ticket departs: start, cancel, expiry or reap', async () => {

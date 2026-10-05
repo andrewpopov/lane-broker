@@ -36,8 +36,33 @@ export function readSchedulerFence(root) {
   return { status: 'valid' };
 }
 
+const absent = (value) => value === undefined || value === null;
+const optional = (test) => (value) => absent(value) || test(value);
+const finite = (value) => Number.isFinite(value);
+const bool = (value) => typeof value === 'boolean';
+const str = (value) => typeof value === 'string';
+
+// The field types each selector reads (scheduler.js readSkipState/readCapacitySkipState/readResourceSkipState and
+// fairness.js reservations). A present field of the wrong type invalidates the whole file rather than being half-read.
+const FIELD_TYPES = {
+  conflict: { blockedSince: optional(finite), graceStartedAt: optional(finite), loggedPhase: optional(str) },
+  capacity: { loggedPhase: optional(str) },
+  resource: {
+    reserved: bool,
+    reservationSeq: optional((v) => Number.isInteger(v) && v >= 0),
+    inScope: optional(bool),
+    behindConflict: optional(bool),
+    deniedAt: finite,
+    budget: finite,
+    externalBusy: finite,
+  },
+};
+
 function validRecord(reason, rec) {
-  return isPlainObject(rec) && rec.reason === reason && Number.isInteger(rec.skipsCharged) && rec.skipsCharged >= 0;
+  if (!isPlainObject(rec) || rec.reason !== reason || !Number.isInteger(rec.skipsCharged) || rec.skipsCharged < 0) return false;
+  if (!Object.entries(FIELD_TYPES[reason]).every(([field, ok]) => ok(rec[field]))) return false;
+  // a latched reservation is ordered by its seq, so one without it can't be placed
+  return !(reason === 'resource' && rec.reserved === true && !Number.isInteger(rec.reservationSeq));
 }
 
 function validFairness(raw) {
@@ -52,13 +77,13 @@ function validFairness(raw) {
   return null;
 }
 
-/** A missing file is an empty store (a migrated root with no counters yet); a present-but-invalid one is not trusted. */
+/** The migrator writes the fairness file before the fence, so a valid fence over a missing file is damage, not an empty store. */
 function loadFairness(root) {
   let text;
   try {
     text = fs.readFileSync(paths(root).fairness, 'utf8');
   } catch (err) {
-    return err.code === 'ENOENT' ? { tickets: {} } : { invalid: 'fairness-unreadable' };
+    return { invalid: err.code === 'ENOENT' ? 'fairness-missing' : 'fairness-unreadable' };
   }
   let raw;
   try {
@@ -196,6 +221,22 @@ export function fairnessStore(root, tickets) {
         // best-effort
       }
     },
+    /** The reservation limit is off: every latch is released, so re-enabling it makes a ticket earn one again. */
+    releaseReservations: () => {
+      const held = Object.entries(tickets).filter(([, perReason]) => perReason.resource?.reserved === true);
+      if (held.length === 0) return;
+      const next = { ...tickets };
+      for (const [id, perReason] of held) {
+        const { reservationSeq: _seq, ...resource } = perReason.resource;
+        next[id] = { ...perReason, resource: { ...resource, reserved: false } };
+      }
+      try {
+        persist(next);
+        Object.assign(tickets, next);
+      } catch {
+        // best-effort: nothing reads a latch while the limit is off, and the next evaluation retries
+      }
+    },
     reservations: () =>
       Object.entries(tickets)
         .filter(([, perReason]) => perReason.resource?.reserved === true && Number.isInteger(perReason.resource.reservationSeq))
@@ -206,11 +247,14 @@ export function fairnessStore(root, tickets) {
 /**
  * The ONE array every selector walks in a priority evaluation (R4-2): the raw queue ordered by score within each
  * run of readable records, then the active reservation owner, if any, moved to index 0. `ownerId` is that owner.
- * A reservation exists only while resource backfill does (active mode, `resourceSkipLimit` > 0): disabling the
- * limit releases it.
+ * A reservation exists only while resource backfill does (active mode, `resourceSkipLimit` > 0); `tryStart` releases the
+ * latches when it is off. `eligible(ticket)` is the class-eligibility filter (R4-3): an owner it rejects has its
+ * reservation suspended for this evaluation. It defaults to allow-all because BRAIN-379 allocation is shadow-only; wire
+ * it to BRAIN-379's enforcement when that goes live.
  */
-export function effectiveView(rawQueue, nowEff, cfg, store) {
+export function effectiveView(rawQueue, nowEff, cfg, store, eligible = () => true) {
   const ordered = orderQueue(rawQueue, nowEff, cfg);
   const reservable = cfg.schedulerMode === 'active' && cfg.resourceSkipLimit > 0;
-  return promoteReservationOwner(ordered, reservable ? store.reservations() : []);
+  const live = reservable ? store.reservations().filter(({ id }) => rawQueue.some((t) => t !== null && t.id === id && eligible(t))) : [];
+  return promoteReservationOwner(ordered, live);
 }
