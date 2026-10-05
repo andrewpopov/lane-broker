@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, assertNotMigrating, MigrationInProgressError } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, loadGlobalConfig } from './config.js';
 import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores, ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
@@ -241,6 +241,15 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   // `cwd:` in the runCommand call below), so a relative `root` must never
   // reach any of those derivations un-resolved.
   root = path.resolve(root);
+  // BRAIN-380: a runner mid-`lane migrate-scheduler` takes no new work. Exit 75 before reading the header or making a
+  // ticket directory, so nothing is left behind for the client to reconcile. (`root` is the remote ticket root, not the broker's.)
+  try {
+    assertNotMigrating(stateHome());
+  } catch (err) {
+    if (!(err instanceof MigrationInProgressError)) throw err;
+    process.stderr.write(`lane remote-exec: ${err.message}\n`);
+    return { exitCode: 75 };
+  }
   // BRAIN-319 I4: this process is invoked by ssh as a fresh node process
   // after any login-shell startup already ran, so scrubbing here — rather
   // than relying on `env -u` upstream — satisfies "after shell startup":

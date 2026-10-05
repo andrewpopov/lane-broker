@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, assertNotMigrating, listJsonRecordsStrict } from './state.js';
 import { isPidAlive, processStartTime } from './lease.js';
 
 /**
@@ -51,6 +51,11 @@ export function listAttempts(root) {
     .filter((n) => n.endsWith('.json'))
     .map((n) => readJsonSafe(path.join(dir, n)))
     .filter(Boolean);
+}
+
+/** Every attempt record, or a thrown `UnreadableRecordError`: for decisions that must not proceed past a record they cannot read. */
+export function listAttemptsStrict(root) {
+  return listJsonRecordsStrict(paths(root).attempts);
 }
 
 /**
@@ -117,6 +122,7 @@ export async function createAttempt(root, id, { runner = null } = {}) {
     },
   };
   await withLock(root, () => {
+    assertNotMigrating(root);
     atomicWriteJson(attemptFile(root, id), attempt);
   });
   return attempt;

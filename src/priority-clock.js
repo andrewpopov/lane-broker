@@ -1,4 +1,4 @@
-import { paths, atomicWriteJson, readJsonSafe, withLock } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, withLock, assertNotMigrating } from './state.js';
 
 /**
  * BRAIN-380 priority clock. `hwm` is a broker-wide high-water mark of wall time, persisted in
@@ -36,8 +36,12 @@ export function advanceHwm(root, wallNow = Date.now()) {
 
 /**
  * Ticket creation: take the broker lock briefly, advance the mark and return `nowEff`, the
- * ticket's `prioOriginAt`, in one transaction. Caller must NOT hold the lock.
+ * ticket's `prioOriginAt`, in one transaction. Caller must NOT hold the lock. Throws `MigrationInProgressError`
+ * while `lane migrate-scheduler` is running: ticket creation is a new-code admission entry point.
  */
 export async function stampPriorityOrigin(root) {
-  return withLock(root, () => advanceHwm(root));
+  return withLock(root, () => {
+    assertNotMigrating(root);
+    return advanceHwm(root);
+  });
 }

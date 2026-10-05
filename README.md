@@ -43,6 +43,7 @@ lane suggest [--repo <name>] [--days 7] [--json]
 lane cancel <id>
 lane wait <id> [--timeout 5m]
 lane pause "reason" | lane resume
+lane migrate-scheduler [--dry-run]
 ```
 
 `lane status` adds `  log file unchanged for <duration>` to a RUNNING line once the
@@ -704,7 +705,7 @@ Everything here runs only while a **valid** `sched-v2.json` (`{"version": 2,
 legacy FIFO over the three singleton skip files, unchanged. An unreadable,
 malformed or wrong-version fence or `fairness-v2.json` also runs legacy mode and
 logs `lane-broker-head-block event=scheduler-fence-invalid reason=...` (once per
-process). The command that writes the fence is a later slice.
+process). `lane migrate-scheduler` (below) writes the fence.
 
 - **One ordered view.** Each locked evaluation orders the queue once, with
   `nowEff = max(wall clock, hwm)`: `(score desc, seq asc)` within each run of
@@ -738,6 +739,46 @@ process). The command that writes the fence is a later slice.
   polls and proves it cannot delay the effective head may start, an exception to
   priority order that makes no promise about other queued tickets.
 
+### Migrating to the priority scheduler (BRAIN-380 slice 3)
+
+Priority ordering stays off until `lane migrate-scheduler` writes the fence. The cutover is explicit, drained and
+fail-closed, and it is **per broker**: it migrates the state root of the machine it runs on (`$LANE_BROKER_STATE`), so
+the Mac and each runner are migrated separately, each in its own drained window. Upgrade the Mac and both runners
+together, and migrate each (a mixed-version fleet is "no worse than today", see Scheduling).
+
+1. `lane pause`.
+2. Wait for running lanes to finish and the queue to empty (`lane status`). A lease left by a crashed run still
+   counts until an admission poll reaps it; if one blocks, `lane resume`, let one poll run, and pause again.
+3. `lane migrate-scheduler --dry-run`. It reports every precondition as `ok:` or `refused:` and changes nothing.
+4. `lane migrate-scheduler`.
+5. `lane resume`. The broker stays paused after migrating, on purpose.
+
+Under one hold of the broker lock the command writes a `migrating` marker, then checks (all of them, fail-closed):
+
+- the broker is paused;
+- the queue is empty;
+- no lease is `RUNNING` or `ORPHANED`;
+- no attempt record is left in `attempts/` (a supervisor still probing or dispatching a remote attempt is invisible
+  to the queue);
+- no live process runs lane-broker's `bin/lane.js`, `src/supervisor.js` or `remote-pipeline`, whatever its version.
+  The check reads the machine's process table, so a lane process serving a different state root blocks it too.
+  The migrator and its ancestors are excluded.
+
+Lease, attempt and queue records are read strictly: an unreadable record refuses the migration instead of being
+skipped. On any failure the marker is removed, the broker stays paused, and the command exits 1 naming every failed
+check with its ids or pids. While the marker exists, `lane run`, remote dispatch, `enqueue`, attempt creation and
+`remote-exec` on a runner all refuse with exit 75 and "scheduler migration in progress".
+
+If everything holds, it writes `fairness-v2.json` (`{"version": 2, "tickets": {}}`, all there is at a drained
+point), then `sched-v2.json` (the commit point), each fsynced along with its directory, then renames the legacy
+`conflict-skip-state.json`, `capacity-skip-state.json` and `resource-skip-state.json` to `*.migrated-<timestamp>`
+and removes the marker. Re-running is safe: `fairness-v2.json` without a fence redoes the cutover, and a valid fence
+prints "already migrated" and exits 0. A marker left by a crashed migrator is taken over by the next run.
+
+Behind the fence, a queue record without `schedVersion` (only an escaped pre-migration process can write one) is
+moved to `queue-quarantine/`, logged as `lane-broker-head-block event=legacy-record-after-fence`, and never
+selected. Its supervisor finds its queue file gone and exits as cancelled.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -748,7 +789,7 @@ process). The command that writes the fence is a later slice.
 | `2` | Bad CLI usage (missing command / argument). |
 | `64` | Nested `lane run` would widen the inherited lease — refused; or an invalid `--priority` / `LANE_BROKER_PRIORITY` / lane `priority`. |
 | `69` | Local-sim lane refused (fleet-offload message); use `--allow-local-sim`. |
-| `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. |
+| `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. Also `lane run` / `remote-exec` refused with "scheduler migration in progress" while `lane migrate-scheduler` runs. |
 | `130` | Cancelled (SIGINT/SIGTERM) while still queued, before the lane ever started. |
 
 ## ORPHANED handling
@@ -787,7 +828,7 @@ the queue so you know what's waiting and why.
 ## State
 
 `$LANE_BROKER_STATE` (default `~/.cache/lane-broker`): `leases/`, `queue/`,
-`priority-hwm.json` (the priority clock's high-water mark), `sched-v2.json` and `fairness-v2.json` (the priority scheduler fence and its per-ticket fairness records), `logs/` (per-run, capped at 50MB with a truncation notice), `results/`,
+`priority-hwm.json` (the priority clock's high-water mark), `migrating` (present only while `lane migrate-scheduler` runs), `queue-quarantine/` (see below), `sched-v2.json` and `fairness-v2.json` (the priority scheduler fence and its per-ticket fairness records), `logs/` (per-run, capped at 50MB with a truncation notice), `results/`,
 `history.jsonl` (one line per completed run, plus one `dequeuedDeadSupervisor: true`
 row `{id, key, error, supervisorPid, endedAt, executor}` (`error: "supervisor died while queued"`, so a history reader counts it as an error, not a failed run) when a queued ticket whose
 supervisor died is dropped from the queue; it is written only once the queue

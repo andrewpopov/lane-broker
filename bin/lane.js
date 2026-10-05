@@ -5,6 +5,7 @@ import { suggestCommand } from '../src/suggest.js';
 import { cancelCommand } from '../src/cancel.js';
 import { waitCommand } from '../src/wait.js';
 import { pauseCommand, resumeCommand } from '../src/pause.js';
+import { migrateSchedulerCommand } from '../src/migrate.js';
 import { parseByteSize } from '../src/resources.js';
 import {
   remoteExecCommand,
@@ -25,6 +26,7 @@ function usage() {
   lane wait <id> [--timeout <duration>]
   lane pause ["reason"]
   lane resume
+  lane migrate-scheduler [--dry-run]
 `;
 }
 
@@ -183,6 +185,15 @@ async function main() {
     }
     case 'resume': {
       const result = await resumeCommand();
+      return result.exitCode;
+    }
+    case 'migrate-scheduler': {
+      const unknown = rest.filter((a) => a !== '--dry-run');
+      if (unknown.length > 0) {
+        process.stderr.write(`lane migrate-scheduler: unknown argument "${unknown[0]}"\n`);
+        return 2;
+      }
+      const result = await migrateSchedulerCommand({ dryRun: rest.includes('--dry-run') });
       return result.exitCode;
     }
     // BRAIN-319 T2: hidden runner-side subcommands, invoked by a client Mac

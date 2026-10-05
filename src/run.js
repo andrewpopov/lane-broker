@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { ensureStateDirs, paths, readJsonSafe, LockTimeoutError } from './state.js';
+import { ensureStateDirs, paths, readJsonSafe, LockTimeoutError, MigrationInProgressError, assertNotMigrating } from './state.js';
 import { resolveTicketConfig, reloadGlobalConfig, resolvePriority, ConfigError } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
@@ -139,6 +139,11 @@ async function describeLaneState(root, id, resultPath) {
     }
     await sleep(50);
   }
+}
+
+function refuseForMigration() {
+  process.stderr.write('lane run: scheduler migration in progress; try again once `lane migrate-scheduler` has finished\n');
+  return { exitCode: 75 };
 }
 
 /**
@@ -342,7 +347,15 @@ export async function runCommand({
   try {
     prioOriginAt = await stampPriorityOrigin(root);
   } catch (err) {
+    if (err instanceof MigrationInProgressError) return refuseForMigration();
     if (!(err instanceof LockTimeoutError)) throw err;
+    // The migrator holds the lock for its whole run, so contention is the likely moment to see its marker; it can be read without the lock.
+    try {
+      assertNotMigrating(root);
+    } catch (migrating) {
+      if (migrating instanceof MigrationInProgressError) return refuseForMigration();
+      throw migrating;
+    }
     prioOriginAt = effectiveNow(root);
   }
   const id = idOverride || crypto.randomUUID();

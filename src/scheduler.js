@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, writeExpireMarkerFile, appendHistory } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, writeExpireMarkerFile, appendHistory, assertNotMigrating, listJsonRecordsStrict } from './state.js';
 import { sampleAndUpdateGate, readGateState } from './load.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
 import { evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, projectBusy, ticketCpuEstimate } from './admission.js';
@@ -41,6 +41,37 @@ export function listQueue(root) {
   return names.filter((n) => n.endsWith('.json')).map((n) => readJsonSafe(path.join(dir, n)));
 }
 
+/** Every queue record in FIFO order, or a thrown `UnreadableRecordError` (where `listQueue` yields `null` for it). */
+export function listQueueStrict(root) {
+  return listJsonRecordsStrict(paths(root).queue);
+}
+
+/**
+ * BRAIN-380: behind the fence, a queue record that does not carry `schedVersion` 2 can only come from a process that
+ * escaped the migration's quiescence checks. It is contained, never adopted: moved to `queue-quarantine/` and logged,
+ * so it is never selected, and its supervisor then finds its queue file gone and exits as cancelled. Caller holds the lock.
+ */
+function quarantineLegacyRecords(root) {
+  const dir = paths(root).queue;
+  let names;
+  try {
+    names = fs.readdirSync(dir).sort();
+  } catch {
+    return;
+  }
+  for (const name of names.filter((n) => n.endsWith('.json'))) {
+    const record = readJsonSafe(path.join(dir, name));
+    if (record === null || typeof record !== 'object' || record.schedVersion === 2) continue;
+    try {
+      fs.mkdirSync(paths(root).queueQuarantine, { recursive: true });
+      fs.renameSync(path.join(dir, name), path.join(paths(root).queueQuarantine, name));
+      logResourceEvent(root, 'legacy-record-after-fence', { ticket: record.id ?? 'unknown', file: name, action: 'quarantined' });
+    } catch {
+      // best-effort; the next evaluation retries
+    }
+  }
+}
+
 function findQueueFile(root, id) {
   const dir = paths(root).queue;
   let names;
@@ -56,6 +87,7 @@ function findQueueFile(root, id) {
 /** Enqueue a ticket at the tail of the global FIFO. Caller must NOT hold the lock. */
 export async function enqueue(root, ticket) {
   return withLock(root, () => {
+    assertNotMigrating(root);
     const nowEff = advanceHwm(root);
     const seq = nextSeq(root);
     const priorityRequested = isPriorityTier(ticket.priorityRequested) ? ticket.priorityRequested : DEFAULT_PRIORITY;
@@ -654,6 +686,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // every selector, the safe-backfill predicate and the shadow snapshot below receive.
     const sched = resolveScheduler(root);
     const store = sched.v2 ? fairnessStore(root, sched.tickets) : legacyStore(root);
+    if (sched.v2) quarantineLegacyRecords(root);
     const rawQueue = listQueue(root);
     store.prune(rawQueue);
     const { queue, ownerId: reservationOwnerId } = sched.v2 ? effectiveView(rawQueue, nowEff, cfg, store) : { queue: rawQueue, ownerId: null };

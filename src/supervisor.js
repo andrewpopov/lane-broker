@@ -12,6 +12,8 @@ import {
   expireMarkerPath,
   writeCancelMarkerFile,
   LockTimeoutError,
+  MigrationInProgressError,
+  assertNotMigrating,
 } from './state.js';
 import { enqueue, tryStart, dequeueSync, couldAdmitNow } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
@@ -372,6 +374,11 @@ function historyRow(ticket, result, { fallbackReason } = {}) {
   };
 }
 
+/** BRAIN-380: what a supervisor publishes when `lane migrate-scheduler` refuses its admission; `lane run` returns the 75. */
+function migrationRefusalResult(ticket) {
+  return { id: ticket.id, exit: 75, signal: null, startedAt: null, endedAt: Date.now(), waitedMs: null, cancelled: false, reason: 'scheduler-migration' };
+}
+
 /**
  * Attempt a remote runner for a remote-eligible ticket (`ticket.remote`,
  * BRAIN-319 T3b-1's payload), BEFORE the ticket is ever handed to the local
@@ -550,6 +557,16 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     writeBrokerLog(root, line);
   }
 
+  // BRAIN-380: remote dispatch is an admission entry point; refuse before anything is sent to a runner.
+  try {
+    assertNotMigrating(root);
+  } catch (err) {
+    if (!(err instanceof MigrationInProgressError)) throw err;
+    process.stderr.write(`lane: ${err.message}\n`);
+    await publishAndExit(0, () => migrationRefusalResult(enriched));
+    return { fallback: false };
+  }
+
   selectedRunner = runner.name;
   await updateAttempt(root, enriched.id, 0, { phase: 'running', runner: runner.name, ...(queuedAt ? { queuedAt } : {}) });
   // Printed only now that eligibility is settled and a usable runner is
@@ -673,8 +690,24 @@ async function main() {
 
   let attemptGeneration = null;
   let fallbackReason;
+  // BRAIN-380: createAttempt and enqueue refuse under the lock while `lane migrate-scheduler` runs. The ticket never
+  // started, so publish exit 75 (through the attempt, if a fallback one exists) rather than die with no result.
+  async function exitMigrating() {
+    process.stderr.write('lane: scheduler migration in progress\n');
+    const publish = () => atomicWriteJson(ticket.resultPath, migrationRefusalResult(ticket));
+    if (attemptGeneration !== null) await publishTerminal(root, ticket.id, attemptGeneration, publish);
+    else publish();
+    clearTicketMarkers(root, ticket.id);
+    process.exit(75);
+  }
   if (ticket.remote) {
-    const outcome = await runRemoteAttempt(root, enriched, globalCfg, abortController.signal);
+    let outcome;
+    try {
+      outcome = await runRemoteAttempt(root, enriched, globalCfg, abortController.signal);
+    } catch (err) {
+      if (!(err instanceof MigrationInProgressError)) throw err;
+      return exitMigrating();
+    }
     if (!outcome.fallback) return; // terminal outcome: runRemoteAttempt already called process.exit()
     attemptGeneration = outcome.attemptGeneration;
     fallbackReason = outcome.fallbackReason;
@@ -744,7 +777,12 @@ async function main() {
     process.exit(isTimeout ? 75 : 0);
   }
 
-  await enqueue(root, enriched);
+  try {
+    await enqueue(root, enriched);
+  } catch (err) {
+    if (!(err instanceof MigrationInProgressError)) throw err;
+    return exitMigrating();
+  }
 
   let started;
   for (;;) {

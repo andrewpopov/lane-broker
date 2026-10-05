@@ -47,6 +47,10 @@ export function paths(root = stateHome()) {
     fairness: path.join(root, 'fairness-v2.json'),
     // BRAIN-380: broker-wide high-water mark of wall time (the priority clock); see src/priority-clock.js.
     hwm: path.join(root, 'priority-hwm.json'),
+    // BRAIN-380 slice 3: present only while `lane migrate-scheduler` runs; every new-code admission entry point refuses on it.
+    migrating: path.join(root, 'migrating'),
+    // BRAIN-380 slice 3: a queue record without `schedVersion` found behind the fence is moved here and never selected.
+    queueQuarantine: path.join(root, 'queue-quarantine'),
     // BRAIN-319 T3b-2 (C3): one durable attempt record per remote-eligible
     // ticket, keyed by ticket id -- see src/attempts.js.
     attempts: path.join(root, 'attempts'),
@@ -108,17 +112,91 @@ export function ensureStateDirs(root = stateHome()) {
   return p;
 }
 
-/** Write `data` to `file` atomically: write to a temp file in the same dir, then rename. Never follows symlinks. */
-export function atomicWriteFile(file, data) {
+/**
+ * Write `data` to `file` atomically: write to a temp file in the same dir, then rename. Never follows symlinks.
+ * `fsync` (BRAIN-380's migration writes only) makes the result durable across power loss: the file is fsynced before
+ * the rename and the directory after it, so neither the bytes nor the rename can be lost behind a later write.
+ */
+export function atomicWriteFile(file, data, { fsync = false } = {}) {
   const dir = path.dirname(file);
   fs.mkdirSync(dir, { recursive: true });
   const tmp = path.join(dir, `.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
-  fs.writeFileSync(tmp, data, { flag: 'wx' });
+  if (fsync) {
+    const fd = fs.openSync(tmp, 'wx');
+    try {
+      fs.writeFileSync(fd, data);
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } else {
+    fs.writeFileSync(tmp, data, { flag: 'wx' });
+  }
   fs.renameSync(tmp, file);
+  if (fsync) {
+    const dirFd = fs.openSync(dir, 'r');
+    try {
+      fs.fsyncSync(dirFd);
+    } finally {
+      fs.closeSync(dirFd);
+    }
+  }
 }
 
-export function atomicWriteJson(file, obj) {
-  atomicWriteFile(file, `${JSON.stringify(obj, null, 2)}\n`);
+export function atomicWriteJson(file, obj, opts) {
+  atomicWriteFile(file, `${JSON.stringify(obj, null, 2)}\n`, opts);
+}
+
+/** Thrown by `assertNotMigrating`; callers map it to exit 75 ("try again later", the same convention as a lock timeout). */
+export class MigrationInProgressError extends Error {
+  constructor() {
+    super('scheduler migration in progress');
+    this.name = 'MigrationInProgressError';
+    this.code = 'LANE_MIGRATION_IN_PROGRESS';
+  }
+}
+
+/** The one guard every new-code admission entry point calls. Existence-only: the marker's contents are the migrator's own business. */
+export function assertNotMigrating(root) {
+  if (fs.existsSync(paths(root).migrating)) throw new MigrationInProgressError();
+}
+
+/** An unreadable record found by a strict listing; `file` names it. */
+export class UnreadableRecordError extends Error {
+  constructor(file, cause) {
+    super(`${file}: ${cause}`);
+    this.name = 'UnreadableRecordError';
+    this.file = file;
+  }
+}
+
+/**
+ * Fail-closed counterpart of `readJsonSafe` + `.filter(Boolean)`: every `*.json` in `dir`, sorted by name, THROWING
+ * `UnreadableRecordError` for any file that cannot be read or is not a JSON object. Only a file that vanishes between
+ * the listing and the read (a benign removal race) is skipped, as is a directory that does not exist.
+ */
+export function listJsonRecordsStrict(dir) {
+  let names;
+  try {
+    names = fs.readdirSync(dir).sort();
+  } catch (err) {
+    if (err.code === 'ENOENT') return [];
+    throw new UnreadableRecordError(dir, err.message);
+  }
+  const records = [];
+  for (const name of names.filter((n) => n.endsWith('.json'))) {
+    const file = path.join(dir, name);
+    let record;
+    try {
+      record = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch (err) {
+      if (err.code === 'ENOENT') continue;
+      throw new UnreadableRecordError(file, err.message);
+    }
+    if (record === null || typeof record !== 'object' || Array.isArray(record)) throw new UnreadableRecordError(file, 'not a JSON object');
+    records.push(record);
+  }
+  return records;
 }
 
 /**
