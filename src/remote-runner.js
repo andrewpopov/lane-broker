@@ -518,7 +518,8 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     cpuOverride: header.cpuCores,
     minCpuOverride: header.minCpuCores,
     memoryOverride: header.memoryBytes,
-    noProgressTimeoutOverride: header.noProgressTimeoutMs,
+    // An older submitter sends no timeout: the kill is opt-in, so absent means disabled, never this runner's own default.
+    noProgressTimeoutOverride: Number.isFinite(header.noProgressTimeoutMs) ? header.noProgressTimeoutMs : 0,
     // Unchanged by protocol: `.lane-broker.json` resolution (via
     // `configRoot` below) walks from this same cwd, and a protocol-2
     // pipeline resolves its own phase cwds from `pipeline.json`'s absolute
