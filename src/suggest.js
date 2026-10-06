@@ -18,7 +18,8 @@ function percentile(sorted, p) {
   return sorted[Math.max(0, Math.ceil(p * sorted.length) - 1)];
 }
 
-function readRows(file) {
+/** Tolerant history.jsonl reader: a torn or partial line is skipped, never fatal. */
+export function readRows(file) {
   let text;
   try {
     text = fs.readFileSync(file, 'utf8');
