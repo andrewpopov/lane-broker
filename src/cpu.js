@@ -3,7 +3,7 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { paths, atomicWriteJson, readJsonSafe } from './state.js';
 import { detectResourceCapacity } from './resources.js';
-import { readProcCpuRows, procSnapshot, preemptibleCores } from './preemptible.js';
+import { readProcCpuRows, procSnapshot, withDeltas, preemptibleCores } from './preemptible.js';
 
 /**
  * Test-only override, the CPU-gate equivalent of load.js's readLoadAvg /
@@ -172,9 +172,12 @@ export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0, preem
   // about to become the persisted baseline, and carrying the old measurement over it would let a
   // repeat of the same bad counters match `countersUnchanged` and reuse a pre-fault figure.
   const unchanged = stale && countersUnchanged(prev, snapshot);
-  const preemptibleRaw = !stale && preemptible ? preemptibleCores({ rows: procRows, prevProcs: prev?.procs, windowMs: now - prev.at, ...preemptible }) : 0;
-  const preemptibleBusyCores = Number.isFinite(measured) ? Math.min(preemptibleRaw, measured) : 0;
-  const lastValid = !stale && Number.isFinite(measured) ? { hostBusyCores: measured, preemptibleBusyCores, cores: capacity.cpuCores, at: now } : unchanged ? prev.lastValid : undefined;
+  // What is cached is the per-process DELTAS (rows, nice, interval CPU, window), never the computed discount: the
+  // discount depends on the candidate's laneNice, the threshold and the held leases, so it is recomputed per caller.
+  const procWindow = !stale && preemptible && procRows && prev?.procs ? { rows: withDeltas(procRows, prev.procs), windowMs: now - prev.at } : null;
+  const discount = (window, opts, busy) => (window && opts && Number.isFinite(busy) ? Math.min(preemptibleCores({ ...window, ...opts }), busy) : 0);
+  const preemptibleBusyCores = discount(procWindow, preemptible, measured);
+  const lastValid = !stale && Number.isFinite(measured) ? { hostBusyCores: measured, cores: capacity.cpuCores, at: now, ...(procWindow ? { procWindow } : {}) } : unchanged ? prev.lastValid : undefined;
   if (lastValid) snapshot.lastValid = lastValid;
   try {
     const latest = readJsonSafe(file);
@@ -193,7 +196,7 @@ export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0, preem
     now - prev.lastValid.at >= 0 &&
     now - prev.lastValid.at < reuseWindowMs;
   if (reusable) {
-    return { hostBusyCores: prev.lastValid.hostBusyCores, preemptibleBusyCores: prev.lastValid.preemptibleBusyCores ?? 0, cores: capacity.cpuCores, stale: false, reused: true, sampledAt: now, source: capacity.source };
+    return { hostBusyCores: prev.lastValid.hostBusyCores, preemptibleBusyCores: discount(prev.lastValid.procWindow, preemptible, prev.lastValid.hostBusyCores), cores: capacity.cpuCores, stale: false, reused: true, sampledAt: now, source: capacity.source };
   }
   return {
     hostBusyCores: measured,

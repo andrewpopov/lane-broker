@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneSpawn, laneRun, waitFor } from './helpers.js';
 import { sampleHostCpu } from '../src/cpu.js';
-import { parseProcCpuStat, parsePsCpuTable, parsePsCpuTime } from '../src/preemptible.js';
+import { parseProcCpuStat, parsePsCpuTable, parsePsCpuTime, readLeaseMarkers } from '../src/preemptible.js';
 import { sampleAndUpdateCpuGate, evaluateCpuAdmission, nonPreemptibleBusy } from '../src/admission.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { paths, readJsonSafe } from '../src/state.js';
@@ -85,6 +85,53 @@ test('a process with no previous reading, a reused pid, or one that just went id
     proc(13, 10, 51.5), // the only real contributor: 1.5 cores
   ];
   assert.ok(Math.abs(sampleWindow(t, state, before, after, lane(0)).preemptibleBusyCores - 1.5) < 1e-9);
+});
+
+test('a reused sample is recomputed per candidate: the nice-0 discount never crosses to a nice-10 candidate', (t) => {
+  const { state } = freshEnv();
+  let clock = 1000;
+  t.mock.method(Date, 'now', () => clock);
+  const [before, after] = pair(10);
+  const read = (rows) => ({ readProcs: () => rows, reuseWindowMs: 60_000 });
+  sampleHostCpu(state, cpus(0, 0), { ...read(before), preemptible: lane(0) });
+  clock = 2000;
+  const first = sampleHostCpu(state, cpus(95, 5), { ...read(after), preemptible: lane(0) });
+  assert.equal(first.reused, undefined);
+  assert.ok(Math.abs(first.preemptibleBusyCores - 8.5) < 1e-9);
+  assert.equal(sampleAndUpdateCpuGate(state, cfg, first).closed, false);
+  clock = 2100; // counters unchanged: both candidates below get the REUSED measurement
+  const nice0 = sampleHostCpu(state, cpus(95, 5), { ...read(after), preemptible: lane(0) });
+  const nice10 = sampleHostCpu(state, cpus(95, 5), { ...read(after), preemptible: lane(10) });
+  assert.equal(nice0.reused, true);
+  assert.equal(nice10.reused, true);
+  assert.ok(Math.abs(nice0.preemptibleBusyCores - 8.5) < 1e-9);
+  assert.equal(nice10.preemptibleBusyCores, 0);
+  assert.equal(sampleAndUpdateCpuGate(state, cfg, nice10).closed, true, 'the nice-10 candidate is gated on its own reading, not the nice-0 one');
+});
+
+test('a detached niced lane descendant carrying the lease marker is excluded; one with an unreadable environment fails closed', (t) => {
+  const { state } = freshEnv();
+  const lease = { id: 'L3', childPgid: 100, descendants: [] };
+  const rows = (cpu) => [proc(100, 0, 0), proc(500, 10, cpu), proc(600, 10, cpu)]; // 500/600: own pgid, ppid 1, not recorded
+  const run = (markers) => {
+    const dir = freshEnv().state;
+    return sampleWindow(t, dir, rows(0), rows(4), lane(0, { heldLeases: [lease], readMarkers: () => new Map(markers) }));
+  };
+  assert.ok(Math.abs(run([[500, false], [600, false]]).preemptibleBusyCores - 8) < 1e-9, 'no marker: genuinely external');
+  assert.ok(Math.abs(run([[500, true], [600, false]]).preemptibleBusyCores - 4) < 1e-9, 'marker: a lane worker, excluded');
+  assert.ok(Math.abs(run([[500, null], [600, false]]).preemptibleBusyCores - 4) < 1e-9, 'unreadable environment: contributes 0');
+  void state;
+});
+
+test('marker readers: Linux /proc/<pid>/environ and macOS ps -E with the argv prefix stripped', () => {
+  const env = { '/proc/7/environ': 'A=1\0LANE_BROKER_LEASE=L9\0', '/proc/8/environ': 'A=1\0' };
+  const fsApi = { readFileSync: (f) => { if (f in env) return env[f]; throw Object.assign(new Error('x'), { code: 'EACCES' }); } };
+  assert.deepEqual([...readLeaseMarkers([7, 8, 9], ['L9'], { platform: 'linux', fsApi })], [[7, true], [8, false], [9, null]]);
+  const exec = (_cmd, args) =>
+    args.includes('-E')
+      ? ' 7 /bin/node server.js HOME=/h LANE_BROKER_LEASE=L9\n 8 /bin/node LANE_BROKER_LEASE=L9\n'
+      : ' 7 /bin/node server.js\n 8 /bin/node LANE_BROKER_LEASE=L9\n';
+  assert.deepEqual([...readLeaseMarkers([7, 8, 9], ['L9'], { platform: 'darwin', exec })], [[7, true], [8, false], [9, null]], 'an argument spelling the marker is not a member');
 });
 
 test('preemptibleNiceMin 0 disables the feature', (t) => {

@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { DescendantTracker, procUnits } from './descendants.js';
+import { DescendantTracker, procUnits, leaseMarker, parseCommandMap, envSuffix } from './descendants.js';
 
 /**
  * BRAIN-428: CPU that yields to an admitted lane, measured per process BY IDENTITY over the same window as the host
@@ -82,6 +82,54 @@ export function procSnapshot(rows) {
   return rows ? Object.fromEntries(rows.map((r) => [keyOf(r), r.cpuSec])) : {};
 }
 
+/** Rows plus `deltaSec`: CPU seconds since the previous reading of the SAME identity (pid + start token); null when there is none. */
+export function withDeltas(rows, prevProcs) {
+  return rows.map((r) => {
+    const before = prevProcs[keyOf(r)];
+    return { pid: r.pid, ppid: r.ppid, pgid: r.pgid, nice: r.nice, token: r.token, deltaSec: Number.isFinite(before) ? Math.max(0, r.cpuSec - before) : null };
+  });
+}
+
+/**
+ * Which of `pids` carry `LANE_BROKER_LEASE=<one of leaseIds>` in their environment: Map pid -> true | false | null
+ * (null = environment unreadable, e.g. another uid: callers fail closed). Linux reads /proc/<pid>/environ; macOS runs
+ * two `ps` listings limited to those pids and strips the plain command from the `-E` one (descendants.js).
+ */
+export function readLeaseMarkers(pids, leaseIds, { platform = process.platform, exec = execFileSync, fsApi = fs } = {}) {
+  const wanted = leaseIds.map(leaseMarker);
+  const result = new Map();
+  if (pids.length === 0) return result;
+  if (platform === 'linux') {
+    for (const pid of pids) {
+      try {
+        result.set(pid, fsApi.readFileSync(`/proc/${pid}/environ`, 'utf8').split('\0').some((e) => wanted.includes(e)));
+      } catch {
+        result.set(pid, null);
+      }
+    }
+    return result;
+  }
+  try {
+    const ps = (flags) =>
+      exec('ps', [...flags, '-ww', '-p', pids.join(','), '-o', 'pid=,command='], {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 2000,
+        maxBuffer: 64 * 1024 * 1024,
+        env: { ...process.env, TZ: 'UTC0', LC_ALL: 'C', LC_TIME: 'C' },
+      });
+    const plain = parseCommandMap(ps([]));
+    const withEnv = parseCommandMap(ps(['-E']));
+    for (const pid of pids) {
+      const command = plain.get(pid);
+      result.set(pid, command === undefined || !withEnv.has(pid) ? null : envSuffix(command, withEnv.get(pid)).split(/\s+/).some((e) => wanted.includes(e)));
+    }
+  } catch {
+    for (const pid of pids) result.set(pid, null);
+  }
+  return result;
+}
+
 /** pids belonging to held leases' trees (process group, ppid descendants, recorded descendants); null = cannot tell. */
 function leasePids(rows, heldLeases) {
   const members = new Set();
@@ -101,16 +149,18 @@ function leasePids(rows, heldLeases) {
  * Cores of preemptible CPU over the window since `prevProcs` was taken: the summed CPU-time delta of every
  * qualifying process divided by the wall-clock window. `rows` null (unreadable table) or an unknown lease tree gives 0.
  */
-export function preemptibleCores({ rows, prevProcs, windowMs, laneNice, niceMin = 1, heldLeases = [] }) {
-  if (!rows || !prevProcs || !(windowMs > 0) || !(niceMin > 0)) return 0;
+export function preemptibleCores({ rows, windowMs, laneNice, niceMin = 1, heldLeases = [], readMarkers = readLeaseMarkers }) {
+  if (!rows || !(windowMs > 0) || !(niceMin > 0)) return 0;
   const members = leasePids(rows, heldLeases);
   if (members === null) return 0;
+  // Only a process that would otherwise count is checked for a lease marker (a lane worker that left its tree via
+  // setsid and was not recorded yet): a marker, or an unreadable environment, means it contributes nothing.
+  const candidates = rows.filter((r) => r.nice > laneNice && r.nice >= niceMin && r.deltaSec > 0 && !members.has(r.pid));
+  const marked = heldLeases.length > 0 ? readMarkers(candidates.map((r) => r.pid), heldLeases.map((l) => l.id)) : new Map();
   let cpuSec = 0;
-  for (const row of rows) {
-    if (row.nice <= laneNice || row.nice < niceMin || members.has(row.pid)) continue;
-    const before = prevProcs[keyOf(row)];
-    if (!Number.isFinite(before)) continue; // new or pid-reused process: no previous reading, contributes nothing
-    cpuSec += Math.max(0, row.cpuSec - before);
+  for (const row of candidates) {
+    if (heldLeases.length > 0 && marked.get(row.pid) !== false) continue;
+    cpuSec += row.deltaSec; // a null delta (new or pid-reused process) never reaches here: null > 0 is false
   }
   return cpuSec / (windowMs / 1000);
 }

@@ -163,7 +163,12 @@ export function sampleAndUpdateCpuGate(root, cfg, cpuSample) {
   const prev = sanitizeGateState(readJsonSafe(file));
   // BRAIN-346: a reused measurement is the SAME observation again — hysteresis advances once per
   // new observation, never once per poll that happened to re-read it.
-  if (cpuSample?.reused) return prev;
+  // The gate STATE is not advanced by a re-read, but this caller's own reading (its discount is candidate-specific)
+  // is still checked against the close threshold, so another candidate's more generous discount cannot hold it open.
+  if (cpuSample?.reused) {
+    const overClose = Number.isFinite(cpuSample.hostBusyCores) && cpuSample.cores > 0 && (nonPreemptibleBusy(cpuSample, cfg) / cpuSample.cores) * 100 >= cfg.cpuClosePercent;
+    return overClose ? { ...prev, closed: true } : prev;
+  }
   if (
     !cpuSample ||
     cpuSample.stale ||

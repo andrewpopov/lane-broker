@@ -41,7 +41,7 @@ export function resetProcUnitsCache() {
   cachedUnits = null;
 }
 
-function leaseMarker(leaseId) {
+export function leaseMarker(leaseId) {
   return `LANE_BROKER_LEASE=${leaseId}`;
 }
 
@@ -63,6 +63,21 @@ export function parseProcStat(pid, text, uptimeSec = 0, { pageKib, clkTck } = pr
 const PS_LINE = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+([\d.]+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+[\d:]{8}\s+\d{4})\s*(.*)$/;
 const PS_COMMAND_LINE = /^\s*(\d+)\s*(.*)$/;
 
+/** `ps -o pid=,command=` text -> pid -> command (with `-E`, argv followed by the environment). */
+export function parseCommandMap(text) {
+  const map = new Map();
+  for (const line of String(text ?? '').split('\n')) {
+    const m = PS_COMMAND_LINE.exec(line);
+    if (m) map.set(Number(m[1]), m[2].trim());
+  }
+  return map;
+}
+
+/** The environment part of a `-E` command line: what follows the plain command as an exact prefix, else '' (it changed between reads). */
+export function envSuffix(command, withEnv) {
+  return withEnv !== undefined && withEnv.startsWith(command) ? withEnv.slice(command.length) : '';
+}
+
 /**
  * macOS: `ps -A -ww -o pid=,ppid=,pgid=,pcpu=,rss=,lstart=,command=` (`text`) plus, when a lease marker is wanted,
  * `ps -A -E -ww -o pid=,command=` (`envText`). With -E the command column is the argv FOLLOWED BY the environment, so
@@ -71,11 +86,7 @@ const PS_COMMAND_LINE = /^\s*(\d+)\s*(.*)$/;
  * command (it changed between the two reads) is unmarked.
  */
 export function parsePsTable(text, leaseId, envText = '') {
-  const envOf = new Map();
-  for (const line of String(envText ?? '').split('\n')) {
-    const m = PS_COMMAND_LINE.exec(line);
-    if (m) envOf.set(Number(m[1]), m[2].trim());
-  }
+  const envOf = parseCommandMap(envText);
   const rows = [];
   for (const line of String(text ?? '').split('\n')) {
     const m = PS_LINE.exec(line);
@@ -83,7 +94,7 @@ export function parsePsTable(text, leaseId, envText = '') {
     const pid = Number(m[1]);
     const command = m[7].trim();
     const withEnv = envOf.get(pid);
-    const env = withEnv !== undefined && withEnv.startsWith(command) ? withEnv.slice(command.length) : '';
+    const env = envSuffix(command, withEnv);
     rows.push({
       pid,
       ppid: Number(m[2]),
