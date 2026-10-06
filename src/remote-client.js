@@ -184,7 +184,8 @@ function neverFits(reservation, probe) {
  * Probe every configured runner SEQUENTIALLY (BRAIN-319 C8), returning the best usable one -- exit 0, protocol usable, not
  * `paused`, `queued === 0`, (1e) statically able to fit the ticket, and (BRAIN-405) with real headroom now (`runnerRoom`) --
  * as `{runner, probe, skipped}`, or `{runner: null, skipped}` naming why every candidate was passed over. Among usable
- * runners the earliest `estimatedFinish` wins, then the most free CPU, then config order. `opts.deadlineMs` (default 6000) bounds each individual probe; a
+ * runners the earliest `estimatedFinish` wins, then the most free CPU, then config order. With none usable, `busy`
+ * (hotfix 0.22.1) names the best runner that failed only the headroom check, for a lane that has no local queue to wait in. `opts.deadlineMs` (default 6000) bounds each individual probe; a
  * probe that hangs past it is SIGKILLed and counted as a skip, never as a
  * hang for the whole selection.
  *
@@ -220,6 +221,7 @@ export async function selectRunner(runners, opts = {}) {
   // free CPU, then config order). A runner with an empty queue but no headroom is not idle, however empty its queue.
   let idleBest = null;
   let queuedBest = null;
+  let busyBest = null; // passed every check except headroom, empty queue: its own broker would hold the ticket until it has room
   const better = (cand, best) => !best || cand.finish < best.finish || (cand.finish === best.finish && cand.cpuFree > best.cpuFree);
   for (const runner of runners) {
     const cmd = buildRemoteCommand(runner, 'remote-probe');
@@ -273,6 +275,8 @@ export async function selectRunner(runners, opts = {}) {
     const { room, cpuFree, reason } = reservation ? runnerRoom(reservation, probe) : { room: true, cpuFree: 0 };
     if (!room) {
       skipped.push({ name: runner.name, reason });
+      const cand = { runner, probe, finish: estimatedFinish(reservation, probe, runner), cpuFree };
+      if (better(cand, busyBest)) busyBest = cand;
       continue;
     }
     const cand = { runner, probe, finish: estimatedFinish(reservation, probe, runner), cpuFree };
@@ -280,7 +284,7 @@ export async function selectRunner(runners, opts = {}) {
   }
   if (idleBest) return { runner: idleBest.runner, probe: idleBest.probe, skipped };
   if (queuedBest) return { runner: queuedBest.runner, probe: queuedBest.probe, skipped, queuedChoice: true };
-  return { runner: null, skipped };
+  return { runner: null, skipped, ...(busyBest ? { busy: { runner: busyBest.runner, probe: busyBest.probe } } : {}) };
 }
 
 /**
