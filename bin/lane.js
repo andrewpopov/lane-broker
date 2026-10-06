@@ -2,6 +2,7 @@
 import { runCommand } from '../src/run.js';
 import { statusCommand } from '../src/status.js';
 import { suggestCommand } from '../src/suggest.js';
+import { estimatesCommand } from '../src/estimates-history.js';
 import { cancelCommand } from '../src/cancel.js';
 import { waitCommand } from '../src/wait.js';
 import { pauseCommand, resumeCommand } from '../src/pause.js';
@@ -26,6 +27,7 @@ function usage() {
   lane status [--json]
   lane capabilities --json
   lane suggest [--repo <name>] [--days <n>] [--json]
+  lane estimates [--json] [--root <stateHome>]
   lane cancel <id>
   lane wait <id> [--timeout <duration>]
   lane pause ["reason"]
@@ -160,6 +162,11 @@ async function main() {
         return 2;
       }
       const result = await suggestCommand({ repo: flag('--repo'), days, json: rest.includes('--json') });
+      return result.exitCode;
+    }
+    case 'estimates': {
+      const rootAt = rest.indexOf('--root');
+      const result = await estimatesCommand({ root: rootAt === -1 ? undefined : rest[rootAt + 1], json: rest.includes('--json') });
       return result.exitCode;
     }
     case 'cancel': {

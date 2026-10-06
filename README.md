@@ -1069,6 +1069,24 @@ selection does not change. If the remote attempt falls back to local, the local 
 logged. Tier and rank describe what the scheduler saw. They cannot show how much time a tier saved anyone, and
 nothing here claims it: compare wait distributions by tier, and do not read a causal effect into them.
 
+### Estimates engine and `lane estimates` (BRAIN-408 slice A)
+
+`src/estimates.js` is the pure estimates engine of the unified queue (spec 5.7): per-key EWMA
+(alpha 0.1, ratio winsorised to [0.2, 5]) over `ln(ref-s)`, censored runs (signal kills,
+timeouts) that can only raise an estimate, the cold-start chain (exact, no-code-family,
+no-arm-set, no-through-act, runner-wide, class-default; sigma x1.5 per step), speed factors
+per host, work class and bucket (mac-grandy pinned at 1.00; `rebaseAnchor` moves the anchor
+after 30 days uncalibrated), overrun residuals and per-bucket remaining-work conversion.
+The first observation's sigma is 0.6 (p90 about 2.2x p50). It does no I/O and nothing reads
+it yet.
+
+`lane estimates [--json] [--root <stateHome>]` folds `history.jsonl` through it, read-only,
+keyed by (repo, lane): n, censored count, p50/p90 (seconds), `est_source` and the p90 of
+`observedRssPeakBytes`. A row that never started, was cancelled or failed on its own is
+skipped (counted); a run killed by an unrequested signal is censored. History rows carry no
+class, so a lane named like a sim (`sim`, `sims`, `sim-*`) is a sim, else a test. The host
+factor is 1.0 (no calibration) and is printed.
+
 ## Exit codes
 
 | Code | Meaning |
