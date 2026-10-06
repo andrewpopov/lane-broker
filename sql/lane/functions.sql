@@ -385,6 +385,28 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, lane, pg_temp AS $$
                     AND (pc.requires_capability IS NULL OR coalesce((to_jsonb(me) ->> pc.requires_capability)::boolean, false)))
 $$;
 
+-- Provisioning triggers (migration 003 creates the triggers; these bodies are the live ones). Principal and class changes take ONE
+-- lock before scanning, so the later of two overlapping transactions scans after the earlier committed and sees its rows: neither
+-- can miss the (account, class) pair the other creates. The key is its own, not lane_sched. The scan is a new statement after the
+-- lock, so under Read Committed it gets a fresh snapshot.
+CREATE OR REPLACE FUNCTION lane.provision_account_parents() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane, pg_temp AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtext('lane_provision'));
+  INSERT INTO lane.sched_parents (account, prio_class)
+    SELECT a, c.name FROM unnest(NEW.allowed_accounts) AS a CROSS JOIN lane.priority_classes c
+    ON CONFLICT (account, prio_class) DO NOTHING;
+  RETURN NULL;
+END $$;
+
+CREATE OR REPLACE FUNCTION lane.provision_class_parents() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane, pg_temp AS $$
+BEGIN
+  PERFORM pg_advisory_xact_lock(hashtext('lane_provision'));
+  INSERT INTO lane.sched_parents (account, prio_class)
+    SELECT DISTINCT a, NEW.name FROM lane.principals p, unnest(p.allowed_accounts) AS a
+    ON CONFLICT (account, prio_class) DO NOTHING;
+  RETURN NULL;
+END $$;
+
 -- The scheduling parent for (account, class). It was provisioned with the account (migration 003 triggers), so this only READS:
 -- submit takes no scheduling lock, and a missing parent is an error, never created on the fly.
 CREATE OR REPLACE FUNCTION lane.parent_of(p_account text, p_class text) RETURNS uuid
@@ -428,6 +450,11 @@ BEGIN
   END IF;
   IF NOT lane.class_allowed(v_me, p_class) THEN
     RAISE EXCEPTION 'class % not allowed for %', p_class, session_user USING ERRCODE = '42501';
+  END IF;
+  IF EXISTS (SELECT 1 FROM jsonb_to_recordset(p_jobs) AS x(cpu_req real, cpu_min real)
+              WHERE NOT coalesce(x.cpu_req > 0 AND x.cpu_req < 'Infinity' AND coalesce(x.cpu_min, x.cpu_req) > 0
+                                 AND coalesce(x.cpu_min, x.cpu_req) <= x.cpu_req, false)) THEN
+    RAISE EXCEPTION 'job cpu_req and cpu_min must be finite, positive and cpu_min <= cpu_req' USING ERRCODE = '22023';
   END IF;
   INSERT INTO lane.groups (id, submit_uuid, kind, account, owner, parent_id, prio_class, snapshot, aggregator, deadline_at)
     VALUES (gen_random_uuid(), p_submit_uuid, p_kind, p_account, session_user, lane.parent_of(p_account, p_class), p_class,

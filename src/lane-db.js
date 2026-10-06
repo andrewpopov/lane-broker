@@ -39,7 +39,7 @@ async function schemaVersion(client, migrations) {
             (SELECT count(*)::int FROM (
                SELECT 1 FROM pg_class WHERE relnamespace = to_regnamespace('lane')
                UNION ALL SELECT 1 FROM pg_proc WHERE pronamespace = to_regnamespace('lane')
-               UNION ALL SELECT 1 FROM pg_type WHERE typnamespace = to_regnamespace('lane') AND typtype <> 'c' AND typcategory <> 'A'   -- enums, domains, ranges: no pg_class row
+               UNION ALL SELECT 1 FROM pg_type WHERE typnamespace = to_regnamespace('lane') AND true   -- every type: enums and domains have no pg_class row; table rowtypes count twice, which is harmless
                UNION ALL SELECT 1 FROM pg_operator WHERE oprnamespace = to_regnamespace('lane')
                UNION ALL SELECT 1 FROM pg_opclass WHERE opcnamespace = to_regnamespace('lane')
                UNION ALL SELECT 1 FROM pg_opfamily WHERE opfnamespace = to_regnamespace('lane')
