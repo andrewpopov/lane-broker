@@ -20,6 +20,7 @@ import { enqueue, tryStart, dequeueSync, couldAdmitNow, withdrawQueued, restoreQ
 import { touchSimArmFor } from './sim-arm.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { observeLeaseTree } from './cpu.js';
+import { DescendantTracker } from './descendants.js';
 import { reloadGlobalConfig } from './config.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
@@ -1081,16 +1082,26 @@ async function main() {
   let cancelling = false;
   let killPromise = null;
 
+  // BRAIN-419: processes that left the leader's group (setsid/setpgid) are invisible to killGroup, so track the tree.
+  const descendants = new DescendantTracker(child.pid, { protectedPids: [process.pid, process.ppid] });
+  descendants.scan();
+  async function killTree() {
+    descendants.scan(); // the leader may still be alive: catches anything spawned since the last heartbeat
+    const [, reaped] = await Promise.all([killGroup(child.pid), descendants.reap({ graceMs: CANCEL_GRACE_MS })]);
+    writeBrokerLog(root, `lane-broker-reap id=${ticket.id} descendants-reaped=${reaped}\n`);
+  }
+
   const heartbeat = setInterval(() => {
     if (finished) return;
     try {
       const lease = readLease(root, ticket.id);
       if (lease) {
+        descendants.scan();
         const tree = observeLeaseTree(child.pid, otherLeaseStops(root, ticket.id));
         const observed = tree?.cores ?? null;
         const observedMemory = tree?.memoryBytes ?? null;
         // a gap of more than two heartbeats between good readings ends an overrun streak
-        writeLease(root, applyHeartbeatObservation(lease, observed, Date.now(), observedMemory, 2 * globalCfg.sampleMs));
+        writeLease(root, { ...applyHeartbeatObservation(lease, observed, Date.now(), observedMemory, 2 * globalCfg.sampleMs), descendants: descendants.snapshot() });
       }
     } catch {
       // observation is telemetry: nothing in it may take the supervisor down while its child runs
@@ -1101,14 +1112,14 @@ async function main() {
     // race ahead of `finalizeAndExit`'s own check and publish green.
     if (!cancelling && cancelRequested(root, ticket.id)) {
       cancelling = true;
-      killPromise = killGroup(child.pid);
+      killPromise = killTree();
     }
   }, globalCfg.sampleMs);
 
   const onCancelSignal = () => {
     if (!cancelling && !finished) {
       cancelling = true;
-      killPromise = killGroup(child.pid);
+      killPromise = killTree();
     }
   };
   process.on('SIGTERM', onCancelSignal);
@@ -1223,10 +1234,18 @@ async function main() {
   // released. 'close' cannot be the trigger: a survivor holding the stdio pipes delays it until the survivor is
   // gone. So reap on 'exit'; finalizeAndExit awaits killPromise before the result is written or the lease released.
   let groupReaped = false;
+  function hasLiveDescendants() {
+    try {
+      return descendants.live().length > 0;
+    } catch {
+      return false;
+    }
+  }
   child.on('exit', () => {
-    if (finished || cancelling || !isGroupAlive(child.pid)) return;
+    if (finished || cancelling) return;
+    if (!isGroupAlive(child.pid) && !hasLiveDescendants()) return;
     groupReaped = true;
-    killPromise = killGroup(child.pid);
+    killPromise = killTree();
   });
 }
 
