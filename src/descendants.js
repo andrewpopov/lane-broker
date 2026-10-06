@@ -132,10 +132,11 @@ export function readProcRow(name, leaseId, uptimeSec, fsApi = fs, units) {
 export function readProcessTable(leaseId) {
   if (process.platform === 'linux') {
     const uptimeSec = Number(fs.readFileSync('/proc/uptime', 'utf8').split(' ')[0]);
+    const units = procUnits(); // once per scan: a failed getconf is retried next scan, never once per pid
     return fs
       .readdirSync('/proc')
       .filter((name) => /^\d+$/.test(name))
-      .map((name) => readProcRow(name, leaseId, uptimeSec))
+      .map((name) => readProcRow(name, leaseId, uptimeSec, fs, units))
       .filter(Boolean);
   }
   const ps = (args) =>
