@@ -32,6 +32,7 @@ import { observedLeaseFields, summarizeObservedCpu, sanitizeObservedCpu, sanitiz
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
 const CANCEL_GRACE_MS = 10_000;
+const GROUP_REAPED_REASON = 'leader-exited-group-reaped';
 
 function readTicketFromEnv() {
   const raw = process.env.LANE_BROKER_TICKET;
@@ -1114,7 +1115,18 @@ async function main() {
       endedAt,
       waitedMs: startedAt - enriched.createdAt || 0,
     };
+    if (groupReaped) result.reason = GROUP_REAPED_REASON;
     finalizeAndExit(result, 0);
+  });
+
+  // ROG-2181 T1b: a leader that exits on its own can leave descendants running unleased once the lease is
+  // released. 'close' cannot be the trigger: a survivor holding the stdio pipes delays it until the survivor is
+  // gone. So reap on 'exit'; finalizeAndExit awaits killPromise before the result is written or the lease released.
+  let groupReaped = false;
+  child.on('exit', () => {
+    if (finished || cancelling || !isGroupAlive(child.pid)) return;
+    groupReaped = true;
+    killPromise = killGroup(child.pid);
   });
 }
 

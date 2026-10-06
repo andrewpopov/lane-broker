@@ -61,6 +61,11 @@ export function waitedMs(ticket, nowEff) {
   return Math.max(0, nowEff - originOrNow(ticket?.prioOriginAt, nowEff));
 }
 
+/** ROG-2181: age that counts toward rank and score. A ticket from an `aging: false` lane never accrues any. */
+function creditedWaitMs(ticket, nowEff) {
+  return ticket?.aging === false ? 0 : waitedMs(ticket, nowEff);
+}
+
 /**
  * Slurm-style multifactor score: `min(W_tier, W_tier * tierFactor + W_age * ageFactor)`.
  * The ceiling means aging can tie a fresh high but never pass it; at a tie, seq decides.
@@ -68,13 +73,13 @@ export function waitedMs(ticket, nowEff) {
 export function score(ticket, nowEff, cfg) {
   const { tier, age } = cfg.priorityWeights;
   const tierFactor = TIER_BASE[priorityOf(ticket)] / MAX_BASE;
-  const ageFactor = Math.min(1, waitedMs(ticket, nowEff) / cfg.priorityAgeMaxMs);
+  const ageFactor = Math.min(1, creditedWaitMs(ticket, nowEff) / cfg.priorityAgeMaxMs);
   return Math.min(tier, tier * tierFactor + age * ageFactor);
 }
 
 /** Display-only rank (0 low, 1 medium, 2 high): one tier gained per `priorityAgingMs` waited, capped at high. */
 export function effectiveRank(ticket, nowEff, cfg) {
-  return Math.min(MAX_BASE, TIER_BASE[priorityOf(ticket)] + Math.floor(waitedMs(ticket, nowEff) / cfg.priorityAgingMs));
+  return Math.min(MAX_BASE, TIER_BASE[priorityOf(ticket)] + Math.floor(creditedWaitMs(ticket, nowEff) / cfg.priorityAgingMs));
 }
 
 export function tierName(rank) {
@@ -112,6 +117,7 @@ export function orderQueue(raw, nowEff, cfg) {
  * BRAIN-346 reservation latch, `seq` being its `reservationSeq`. Exactly one is ACTIVE: the lowest `seq`
  * whose owner is queued and not behind an unreadable (`null`) record. The owner is moved to index 0 and
  * everything else keeps its relative order; the other reservations are dormant (they reserve nothing).
+ * A sim-class owner with a non-sim ticket ahead of it in `ordered` is dormant too (ROG-2181).
  * Never a timestamp: equal wall times or a clock rollback cannot reorder reservations.
  */
 export function promoteReservationOwner(ordered, reservations) {
@@ -121,6 +127,8 @@ export function promoteReservationOwner(ordered, reservations) {
   for (const { id } of byAge) {
     const index = ordered.findIndex((t) => t !== null && t.id === id);
     if (index === -1 || index >= reach) continue;
+    // ROG-2181: a sim reservation owner never overrides a test ticket that ranks ahead of it; its reservation stays dormant.
+    if (ordered[index].class === 'sim' && ordered.slice(0, index).some((t) => t !== null && t.class !== 'sim')) continue;
     const queue = index === 0 ? ordered : [ordered[index], ...ordered.slice(0, index), ...ordered.slice(index + 1)];
     return { queue, ownerId: id };
   }

@@ -39,6 +39,7 @@ exits with `supervisor exited unexpectedly with no result`. Wait until
 lane run --repo rouge --lane default -- npm test
 lane run --repo rouge --lane lint    -- npm run lint
 lane status [--json]
+lane capabilities --json
 lane suggest [--repo <name>] [--days 7] [--json]
 lane cancel <id>
 lane wait <id> [--timeout 5m]
@@ -165,6 +166,21 @@ for the head's poll or a poll that actually starts a ticket (to keep the log
 small); every queued candidate's verdict (claim, effective and clamped claim,
 reservation, and the existing guards that deny it) is in the head record's
 `candidates=` list. A lane of class `sim` must resolve to at most 2 CPU cores.
+Live enforcement (ROG-2181): the guarantee is that a `sim`-class ticket never delays
+a waiting test ticket, not a literal start order. Behind a head that is not class
+`sim`, a sim starts only through BRAIN-355's safe backfill, which is available on
+every path (not just after a conflict-blocked head's skips are exhausted, and it
+counts no skip): it must not conflict with the head or anything held, and held
+weight + the head's weight + its own must fit capacity. Admission reserves the
+head's CPU and memory claim while it is evaluated. A sim is never admitted by the
+conflict, capacity or resource skip walks (they step over it, so a later test
+ticket still backfills), and `conflictSafeBackfill: false` therefore turns every
+sim pass off. A sim reservation owner never overrides a test ticket ranked ahead
+of it: its reservation stays dormant until no test ranks above it. Test tickets,
+and a sim behind a sim head, behave as before. The shadow snapshot above is
+unchanged. `maxConcurrent` stays a ceiling only: a pool lane with a high ceiling
+(e.g. 20 `fleet` tickets) is bounded by CPU and memory admission.
+
 The sim arm stamp (`lastSimDemandAt`) lives in `sim-arm.json` in the
 state root; a missing or unreadable file means unarmed.
 
@@ -234,6 +250,14 @@ lane's `maxConcurrent`. Omit it (the default, `1`) for today's exact
 behaviour — a lane never declaring it is unconditionally exclusive against
 itself, exactly as before this field existed. This is the shape a worker
 pool needs (N sim runs at once), not a test lane (which wants exactly one).
+
+A lane's `aging` (boolean, default `true`, ROG-2181) set to `false` stops its
+tickets accruing priority age: score and effective rank use the tier alone, so an
+old low ticket on that lane can never tie a fresh medium or high one (without it,
+aging lets a low ticket tie a fresh high after `priorityAgeMaxMs`, and the older
+ticket wins the tie). An undeclared lane resolved via `undeclaredLanes.as`
+inherits its template's `aging`. Use it for a long-running `class: "sim"` lane
+that must always queue behind test lanes. Lanes that omit it age exactly as before.
 
 A lane with `localRefused: true` (the `sim` lane by default, matching the
 rouge fleet split) is refused on `lane run` unless `--allow-local-sim` is
@@ -1057,6 +1081,22 @@ nothing here claims it: compare wait distributions by tier, and do not read a ca
 | `69` | Local-sim lane refused (fleet-offload message); use `--allow-local-sim`. |
 | `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. Also `lane run` / `remote-exec` refused with "scheduler migration in progress" while `lane migrate-scheduler` runs, or "scheduler migration pending (draining)" while `--when-idle` waits. |
 | `130` | Cancelled (SIGINT/SIGTERM) while still queued, before the lane ever started. |
+
+### Group reap on leader exit (ROG-2181 T1b)
+
+When a lease's leader process (the command `lane run` spawned) exits on its own, the supervisor checks whether
+anything is still alive in its process group. If so it TERMs the group, waits the cancel grace period, KILLs and
+verifies the group is gone, and only then writes the result and releases the lease, so a surviving descendant never
+runs unleased. The result and the history row carry `reason: "leader-exited-group-reaped"`. A run whose group is
+already empty at exit is unchanged. Advertised as `group-reap/1`.
+
+## `lane capabilities --json`
+
+Prints one JSON line: `{"version", "capabilities": [...], "schedulerMode", "admissionMode"}`. `capabilities` is the
+same list `lane remote-probe` advertises (`elastic-claims/1`, `priority/1`, `artifacts/1`, `sim-safe-backfill/1`,
+`lane-aging/1`, `group-reap/1`). `schedulerMode` is `priority` when a valid `sched-v2.json` fence is present and
+`legacy` otherwise; `admissionMode` is the global config's `schedulerMode` (`active` or `shadow`). A caller that needs
+a feature (for example a pool gate that requires `group-reap/1`) checks this before relying on it.
 
 ## ORPHANED handling
 

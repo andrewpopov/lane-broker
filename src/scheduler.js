@@ -6,6 +6,7 @@ import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from 
 import { evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, projectBusy, ticketCpuEstimate } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
 import { captureShadowInputs, recordAllocationShadow } from './allocation-shadow.js';
+import { classOf } from './allocation.js';
 import { reconcileSimArm, touchSimArmFor } from './sim-arm.js';
 import { advanceHwm } from './priority-clock.js';
 import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, effectiveRank, score } from './priority.js';
@@ -848,31 +849,41 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       !blockedBy([{ key: headTicket.key }], t) &&
       runningWeight + headTicket.weight + t.weight <= weightCapacity;
     const safeBackfillEnabled = skipExhausted && cfg.conflictSafeBackfill;
+    // ROG-2181: behind a non-sim head a sim-class ticket may only start through safe backfill, on EVERY path
+    // (not only once a conflict-blocked head's skips are exhausted): the proof below is what guarantees a sim never
+    // delays a waiting test. Every skip walk (conflict, capacity, resource) is blind to a sim, so a long sim never
+    // overtakes a test head by a skip that merely spends a bounded allowance. `conflictSafeBackfill: false` turns
+    // safe backfill off, and with it every sim pass.
+    const simHoldsBack = classOf(headTicket) !== 'sim';
+    const simEligibleForSafeBackfill = (t) => simHoldsBack && cfg.conflictSafeBackfill && classOf(t) === 'sim';
     const safeBackfill =
-      safeBackfillEnabled &&
+      (safeBackfillEnabled || simEligibleForSafeBackfill(ticket)) &&
       ticket.id !== headTicket.id &&
       // an unreadable (null) ticket ahead of this one stops backfill, as it stops every selector's walk
       queue.slice(0, position).every(Boolean) &&
       cannotDelayHead(ticket);
+    const walkQueue = simHoldsBack ? queue.filter((t, i) => i === 0 || t === null || classOf(t) !== 'sim') : queue;
     // BRAIN-365: the first non-conflicting ticket behind a conflicted head may be one that admission
     // keeps denying projected-over-budget, which would pin every smaller ticket behind it. That
     // denial leaves a behind-conflict record (below); while it stands, the walk prefers the smallest
     // ticket that fits, with the head's claim reserved, and falls back to the first non-conflicting
     // ticket (so the denied one is still re-evaluated, refreshing the record).
     const conflictRecord = headConflicted && !skipExhausted ? resourceRecordFor(root, store, cfg, headTicket.id, true) : null;
-    const conflictPick = conflictRecord ? selectResourceCandidate(queue, held, runningWeight, weightCapacity, conflictRecord, cfg, now, true) : null;
+    const conflictPick = conflictRecord ? selectResourceCandidate(walkQueue, held, runningWeight, weightCapacity, conflictRecord, cfg, now, true) : null;
     // A pick that is denied for anything but the CPU projection invalidates the record it was picked
     // from (the record has no allowance worth keeping, unlike the head's own), so the next poll
     // falls back to re-evaluating the first non-conflicting ticket instead of re-picking it.
     const dropPickRecord = () => {
       if (conflictPick && ticket.id === conflictPick.id) store.dropResourceRecord(headTicket.id);
     };
-    const candidate = headConflicted
-      ? (skipExhausted ? (safeBackfill ? ticket : null) : conflictPick ?? selectCandidate(queue, held))
+    const candidate = safeBackfill
+      ? ticket
+      : headConflicted
+      ? (skipExhausted ? (safeBackfill ? ticket : null) : conflictPick ?? selectCandidate(walkQueue, held))
       : headCapacityBlocked
-        ? (capacitySkipExhausted || capacityReserved ? null : selectCapacityCandidate(queue, held, runningWeight, weightCapacity))
+        ? (capacitySkipExhausted || capacityReserved ? null : selectCapacityCandidate(walkQueue, held, runningWeight, weightCapacity))
         : resourceBackfill && ticket.id !== headTicket.id
-          ? selectResourceCandidate(queue, held, runningWeight, weightCapacity, resourceRecord, cfg, now)
+          ? selectResourceCandidate(walkQueue, held, runningWeight, weightCapacity, resourceRecord, cfg, now)
           : headTicket;
     // BRAIN-379 shadow: a cheap snapshot, taken under the lock before anything below can write, of exactly what
     // the live selection saw. Evaluation and logging happen after the lock is released (see the end of tryStart).
@@ -1084,7 +1095,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
         // changes nothing. Any other out-of-scope denial pauses backfill but keeps the allowance.
         if (resourceDenied) recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState);
         else if (cpuDecision.cpuReason !== 'cooldown') markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
-      } else if (headConflicted && !skipExhausted && resourceDenied) {
+      } else if (headConflicted && !skipExhausted && resourceDenied && !safeBackfill) {
         recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState, true);
       } else if (cpuDecision.cpuReason !== 'cooldown') {
         dropPickRecord();
@@ -1118,7 +1129,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       if (!recordCapacitySkip(root, store, headTicket.id)) {
         return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
       }
-    } else if (ticket.id !== headTicket.id && resourceBackfill) {
+    } else if (ticket.id !== headTicket.id && !safeBackfill && resourceBackfill) {
       // BRAIN-346: same event, same fail-CLOSED discipline; a refused write never restarts the allowance.
       recorded = recordResourceBackfill(root, store, cfg, resourceRecord, writeResourceState);
       if (!recorded) {
@@ -1189,12 +1200,12 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
         event: 'safe-backfill',
         headId: headTicket.id,
         candidateId: ticket.id,
-        blockingLeaseId: blocker.id,
-        blockingKey: blocker.key,
+        blockingLeaseId: blocker?.id ?? 'none',
+        blockingKey: blocker?.key ?? 'none',
         skipCount,
         skipLimit: cfg.conflictSkipLimit,
         graceMs: cfg.headBlockGraceMs,
-        blockedMs: headBlock.blockedMs,
+        blockedMs: headBlock?.blockedMs ?? 0,
       });
     }
     const events = [];

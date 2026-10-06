@@ -513,7 +513,14 @@ test('remote-probe advertises elastic-claims/1', () => {
   const { env } = freshEnv();
   const res = spawnSync(process.execPath, [BIN, 'remote-probe'], { env, encoding: 'utf8' });
   assert.equal(res.status, 0, res.stderr);
-  assert.deepEqual(JSON.parse(res.stdout).capabilities, [ELASTIC_CLAIMS_CAPABILITY, PRIORITY_CAPABILITY, ARTIFACTS_CAPABILITY]);
+  assert.deepEqual(JSON.parse(res.stdout).capabilities, [
+    ELASTIC_CLAIMS_CAPABILITY,
+    PRIORITY_CAPABILITY,
+    ARTIFACTS_CAPABILITY,
+    'sim-safe-backfill/1',
+    'lane-aging/1',
+    'group-reap/1',
+  ]);
 });
 
 test('remote run: the runner-side grant reaches BOTH the runner history and the submitter result and history', async () => {
