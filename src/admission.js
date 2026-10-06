@@ -465,6 +465,7 @@ export function formatAdmissionLog(f) {
     `headTier=${f.headTier ?? 'n/a'}`,
     `headRank=${f.headRank ?? 'n/a'}`,
     `headScore=${fmt(f.headScore)}`,
+    ...(f.reservation ? [`reservation=${f.reservation}`, `futileCause=${f.futileCause}`, `headCpu=${fmt(f.headCpu)}`] : []),
     `bias=${KNOWN_BIAS_NOTE}`,
   ].join(' ');
 }

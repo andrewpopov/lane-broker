@@ -3,7 +3,7 @@ import path from 'node:path';
 import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, writeExpireMarkerFile, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
 import { sampleAndUpdateGate, readGateState } from './load.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
-import { evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, projectBusy, ticketCpuEstimate } from './admission.js';
+import { evaluateCpuAdmission, freshObservedCores, evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, projectBusy, ticketCpuEstimate } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
 import { captureShadowInputs, recordAllocationShadow } from './allocation-shadow.js';
 import { classOf } from './allocation.js';
@@ -12,7 +12,7 @@ import { advanceHwm } from './priority-clock.js';
 import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, effectiveRank, score } from './priority.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
-import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, resolveTicketResources } from './resources.js';
+import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, leaseResources, resolveTicketResources } from './resources.js';
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
  *  possibly-running work and must count against both conflicts and capacity. */
@@ -549,6 +549,7 @@ export function readResourceSkipState(root, store = legacyStore(root), headId = 
     deniedAt: raw.deniedAt,
     budget: raw.budget,
     externalBusy: raw.externalBusy,
+    ...(typeof raw.futile === 'string' ? { futile: raw.futile, headCpu: raw.headCpu, futileAt: Number.isFinite(raw.futileAt) ? raw.futileAt : 0 } : {}),
     ...(Number.isInteger(raw.reservationSeq) ? { reservationSeq: raw.reservationSeq } : {}),
   };
 }
@@ -561,29 +562,85 @@ function resourceRecordFor(root, store, cfg, headId, behindConflict = false) {
   return record && record.headId === headId && record.behindConflict === behindConflict ? record : null;
 }
 
-const resourceBackfillOpen = (record, cfg) => record !== null && record.inScope && !record.reserved && record.count < cfg.resourceSkipLimit;
-const resourceReserved = (record) => record !== null && record.reserved;
+// BRAIN-418: a futile head (see headFutility) holds no reservation and spends no skip budget: nothing the lanes
+// do could let it start, so backfill stays open for as long as its latest denial says so.
+// A verdict is only as good as the CPU sample it was computed from: once that sample is older than twice the sample
+// interval (a cooldown, or any poll that did not recompute it, leaves it behind) backfill reverts to normal skip
+// accounting and the head regains its reservation when the budget is spent.
+export const futileFresh = (record, cfg, now) =>
+  record !== null && record.inScope && record.futile !== undefined && now - record.futileAt <= 2 * cfg.sampleMs;
+const resourceFutile = futileFresh;
+const resourceBackfillOpen = (record, cfg, now) => record !== null && record.inScope && (resourceFutile(record, cfg, now) || (!record.reserved && record.count < cfg.resourceSkipLimit));
+const resourceReserved = (record, cfg, now) => record !== null && record.reserved && !resourceFutile(record, cfg, now);
+
+/**
+ * BRAIN-418 (Slurm backfill: reserve only for a start the reservation can bring about): would the head still be
+ * denied if every lane lease drained? Answered by the SAME predicates live admission uses, over a hypothetical state
+ * with zero held leases: evaluateCpuAdmission plus the idle exemption, and evaluateMemoryAdmission with the memory
+ * the held leases occupy handed back (observed RSS when fresh, else the reservation). Returns the cause or null.
+ *
+ * Futility needs every held lease's CPU observed: `externalBusy` is host busy minus OBSERVED lane CPU, so an
+ * unobserved lease is indistinguishable from external load, and declaring futility on it would let backfill sustain
+ * the very load that makes the head look unfit. Without full attribution the old reservation behaviour stands.
+ */
+function headFutility(cfg, headTicket, held, cpuSample, cpuDecision, memInfo, now) {
+  if (held.some((lease) => freshObservedCores(lease, now) === null)) return null;
+  const headCpu = ticketCpuFloor(headTicket, cfg);
+  const sampledAt = Number.isFinite(cpuSample?.sampledAt) ? cpuSample.sampledAt : now;
+  const resources = resolveTicketResources({
+    weight: headTicket.weight,
+    cpuCores: headTicket.resources?.cpuCores,
+    memoryBytes: headTicket.resources?.memoryBytes,
+    defaultMemoryBytesPerWeight: cfg.defaultMemoryBytesPerWeight,
+  });
+  if (memInfo && Number.isFinite(memInfo.availableBytes)) {
+    const occupied = held.reduce((sum, lease) => {
+      const fresh = Number.isFinite(lease.observedAt) && now - lease.observedAt <= 30_000;
+      return sum + (fresh && Number.isFinite(lease.observedMemoryBytes) ? lease.observedMemoryBytes : leaseResources(lease, cfg).memoryBytes);
+    }, 0);
+    const drainedMemory = evaluateMemoryAdmission({ memoryInfo: { ...memInfo, availableBytes: memInfo.availableBytes + occupied }, heldLeases: [], candidateResources: resources, cfg, now });
+    if (!drainedMemory.admit) return { cause: 'memory', headCpu, sampledAt };
+  }
+  if (cpuSample && Number.isFinite(cpuDecision.externalBusy)) {
+    const drainedCpu = evaluateCpuAdmission({
+      cpuSample: { ...cpuSample, hostBusyCores: cpuDecision.externalBusy },
+      heldLeases: [],
+      candidateWeight: headTicket.weight,
+      candidateResources: { ...resources, cpuCores: headCpu },
+      cpuGateState: { closed: false },
+      cooldownBlocked: false,
+      cfg,
+      now,
+    });
+    const idleExempt = cfg.resourceIdleOvershootCores > 0 && drainedCpu.projectedBusy - drainedCpu.budget <= cfg.resourceIdleOvershootCores;
+    if (drainedCpu.reason === 'projected-over-budget' && !idleExempt) return { cause: 'cpu', headCpu, sampledAt };
+  }
+  return null;
+}
 
 /** The head's own in-scope denial (projected-over-budget, memory ok): create the record for a new
  *  head, or refresh the budget/externalBusy snapshot while carrying count/reserved forward for
  *  the same head. Best-effort: a failed write leaves the old record (or none), never an allowance.
  *  `behindConflict` (BRAIN-365) marks the snapshot as a conflict-backfill candidate's denial, not
  *  the head's: only a conflicted head reads it, and the head's own next denial overwrites it. */
-function recordResourceDenial(root, store, cfg, headId, cpuDecision, now, write, behindConflict = false) {
+function recordResourceDenial(root, store, cfg, headId, cpuDecision, now, write, behindConflict = false, futility = null) {
   if (!(cfg.resourceSkipLimit > 0)) return;
   const prev = readResourceSkipState(root, store, headId);
   const same = prev !== null && prev.headId === headId;
   try {
     store.write('resource', headId, {
       headId,
-      count: same ? prev.count : 0,
-      reserved: same ? prev.reserved : false,
-      ...(same && prev.reservationSeq !== undefined ? { reservationSeq: prev.reservationSeq } : {}),
+      // BRAIN-418: a futile head keeps no reservation (so effectiveView can promote the next dormant owner) and its
+      // allowance restarts if it stops being futile, earned again through the normal skip accounting.
+      count: same && !futility ? prev.count : 0,
+      reserved: same && !futility ? prev.reserved : false,
+      ...(same && !futility && prev.reservationSeq !== undefined ? { reservationSeq: prev.reservationSeq } : {}),
       inScope: true,
       ...(behindConflict ? { behindConflict } : {}),
       deniedAt: now,
       budget: cpuDecision.budget,
       externalBusy: cpuDecision.externalBusy,
+      ...(futility ? { futile: futility.cause, headCpu: futility.headCpu, futileAt: futility.sampledAt } : {}),
     }, write);
   } catch {
     // best-effort — see doc comment
@@ -874,8 +931,8 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     const headRecord = headConflicted ? null : resourceRecordFor(root, store, cfg, headTicket.id);
     // A reservation that is not the ACTIVE one is dormant: kept with its counters, reserving nothing (R4-3).
     const resourceRecord = sched.v2 && headRecord?.reserved && headTicket.id !== reservationOwnerId ? { ...headRecord, reserved: false } : headRecord;
-    const capacityReserved = headCapacityBlocked && resourceReserved(resourceRecord);
-    const resourceBackfill = !headConflicted && !headCapacityBlocked && resourceBackfillOpen(resourceRecord, cfg);
+    const capacityReserved = headCapacityBlocked && resourceReserved(resourceRecord, cfg, now);
+    const resourceBackfill = !headConflicted && !headCapacityBlocked && resourceBackfillOpen(resourceRecord, cfg, now);
     // BRAIN-355: an exhausted conflict-blocked head still admits a ticket that provably cannot
     // delay it. The ticket polling decides for itself (admission below reserves the head's
     // resources); it is never counted as a skip.
@@ -938,7 +995,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
             : headCapacityBlocked
               ? { kind: 'capacity', limit: cfg.conflictSkipLimit, used: capacitySkipCount }
               : { kind: resourceRecord ? 'resource' : 'none', limit: cfg.resourceSkipLimit, used: resourceRecord ? resourceRecord.count : 0 },
-          reservation: { reserved: capacityReserved || resourceReserved(resourceRecord) },
+          reservation: { reserved: capacityReserved || resourceReserved(resourceRecord, cfg, now) },
           conflicted: queue.map((t) => (t ? blockedBy(held, t) !== null : false)),
           safeBackfill: safeBackfillFlags(queue, headTicket, safeBackfillEnabled, cannotDelayHead),
           conflictPickId: conflictPick?.id ?? null,
@@ -1023,6 +1080,14 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // only: shadow never denies, so there is nothing to relax.
     const elastic = cfg.schedulerMode === 'active' ? evaluateElasticAdmission(cfg, ticket, admissionHeld, cpuSample, memInfo, fullDecision) : null;
     const cpuDecision = elastic ? { ...elastic.decision, declaredCpuCores: fullDecision.candidateCpuCores } : fullDecision;
+    // BRAIN-418: only the head's own denial can declare its reservation futile; a candidate's poll reads the verdict
+    // the head's latest denial recorded. Only a CPU-projection or memory denial is judged: a closed gate, a cooldown or an unavailable sample is not the
+    // head's own arithmetic, so those keep today's handling.
+    const headFutile =
+      cfg.schedulerMode === 'active' && ticket.id === headTicket.id && !headConflicted && !cpuDecision.admit && (cpuDecision.cpuReason === 'projected-over-budget' || cpuDecision.cpuReason === 'ok')
+        ? headFutility(cfg, headTicket, held, cpuSample, cpuDecision, memInfo, now)
+        : null;
+    const futileView = headFutile ?? (resourceFutile(resourceRecord, cfg, now) ? { cause: resourceRecord.futile, headCpu: resourceRecord.headCpu } : null);
     if (shadow.inputs) {
       // what the LIVE evaluation that decided the outcome produced (after any elastic retry: same clock reads,
       // same charges), copied out, with the memory observation and its time, for the post-lock evaluator
@@ -1056,6 +1121,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       headScore: score(headTicket, nowEff, cfg),
       loadGateIgnored,
       ...cpuDecision,
+      ...(futileView ? { reservation: 'futile', futileCause: futileView.cause, headCpu: futileView.headCpu } : {}),
       // Provenance for the memory fields above: cpuDecision carries the byte
       // arithmetic but not where the available-memory figure came from or
       // what the OS reported about pressure, which is exactly what made the
@@ -1129,7 +1195,8 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       if (headPolling) {
         // Cooldown is the head's own backfill echoing back (each admission starts one), so it
         // changes nothing. Any other out-of-scope denial pauses backfill but keeps the allowance.
-        if (resourceDenied) recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState);
+        if (headFutile) recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState, false, headFutile);
+        else if (resourceDenied) recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState);
         else if (cpuDecision.cpuReason !== 'cooldown') markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
       } else if (headConflicted && !skipExhausted && resourceDenied && !safeBackfill) {
         recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState, true);
@@ -1165,7 +1232,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       if (!recordCapacitySkip(root, store, headTicket.id)) {
         return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
       }
-    } else if (ticket.id !== headTicket.id && !safeBackfill && resourceBackfill) {
+    } else if (ticket.id !== headTicket.id && !safeBackfill && resourceBackfill && !resourceFutile(resourceRecord, cfg, now)) {
       // BRAIN-346: same event, same fail-CLOSED discipline; a refused write never restarts the allowance.
       recorded = recordResourceBackfill(root, store, cfg, resourceRecord, writeResourceState);
       if (!recorded) {
