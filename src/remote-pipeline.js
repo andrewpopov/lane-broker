@@ -5,6 +5,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { atomicWriteFile, atomicWriteJson, readJsonSafe, withLock, ensureStateDirs } from './state.js';
 import {
   computeDepsKey,
+  pinInstallLocale,
   entryTree,
   materializeFromStore,
   publishToStore,
@@ -74,7 +75,7 @@ function buildDepsEnv(npmCacheDir, npmUserConfig, npmGlobalConfig) {
   env.npm_config_cache = npmCacheDir;
   env.npm_config_userconfig = npmUserConfig;
   env.npm_config_globalconfig = npmGlobalConfig;
-  return scrubDepsEnv(env);
+  return pinInstallLocale(scrubDepsEnv(env));
 }
 
 /**

@@ -63,6 +63,33 @@ export const PER_RUN_PATH_ENV_NAMES = ['TMPDIR', 'TMP', 'TEMP'];
 
 const isScrubbed = (name) => SCRUBBED_ENV_NAMES.has(name) || SCRUBBED_ENV_PREFIXES.some((p) => name.startsWith(p));
 
+const isLocaleName = (name) => name === 'LANG' || name.startsWith('LC_');
+
+let installLocaleMemo = null;
+/** `C.UTF-8` where the host has it (glibc spells it `C.utf8` in `locale -a`), else plain `C`; decided once per process. */
+export function resolveInstallLocale() {
+  if (installLocaleMemo) return installLocaleMemo;
+  let available = '';
+  try {
+    available = execFileSync('locale', ['-a'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  } catch {
+    // no `locale` binary: fall through to C
+  }
+  installLocaleMemo = available.split('\n').some((l) => /^C\.utf-?8$/i.test(l.trim())) ? 'C.UTF-8' : 'C';
+  return installLocaleMemo;
+}
+
+/**
+ * The install runs under ONE locale whatever the submitter's shell had (BRAIN-429): every `LC_*` and `LANG` is
+ * removed and `LC_ALL` is set, so two submitters with different locales share a key. `computeDepsKey` hashes the
+ * pinned value as `install-locale` instead of hashing the locale variables. The user's command keeps its own env.
+ */
+export function pinInstallLocale(env, locale = resolveInstallLocale()) {
+  const out = Object.fromEntries(Object.entries(env).filter(([name]) => !isLocaleName(name)));
+  out.LC_ALL = locale;
+  return out;
+}
+
 export function scrubDepsEnv(env) {
   return Object.fromEntries(Object.entries(env).filter(([name]) => !isScrubbed(name)));
 }
@@ -377,6 +404,7 @@ export function computeDepsKey({
     ['npm-script-shell', npmConfig.scriptShell],
     ['temp-fs', tempFsProps()],
     ['install-argv', JSON.stringify(installArgv)],
+    ['install-locale', env.LC_ALL ?? ''],
   ];
   if (eligibility.hasInstallScript) parts.push(['cc-version', toolVersion('cc')], ['python3-version', toolVersion('python3')]);
   for (const rel of eligibility.tarballs) {
@@ -385,7 +413,7 @@ export function computeDepsKey({
     parts.push([`tarball:${rel}`, bytes]);
   }
   const unhashed = (name) =>
-    isScrubbed(name) || PER_RUN_PATH_ENV_NAMES.includes(name) || AUTH_ENV_NAMES.has(name) || SESSION_ENV_NAMES.has(name);
+    isScrubbed(name) || isLocaleName(name) || PER_RUN_PATH_ENV_NAMES.includes(name) || AUTH_ENV_NAMES.has(name) || SESSION_ENV_NAMES.has(name);
   for (const name of Object.keys(env).filter((k) => !unhashed(k)).sort()) parts.push([`env:${name}`, String(env[name])]);
   for (const name of NPM_CONFIG_FILE_ENVS) {
     if (env[name]) parts.push([`file:${name}`, readIfExists(env[name]) ?? '']);

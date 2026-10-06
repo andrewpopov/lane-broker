@@ -23,6 +23,7 @@ import {
   ALLOWED_ROOT_SCRIPTS,
   ROOT_SCRIPT_NAMES,
   scrubDepsEnv,
+  pinInstallLocale,
   parseMountInfo,
   parseMountOutput,
   tempDirFsProperties,
@@ -863,6 +864,13 @@ test('the allowlisted git-config script explains exactly its own .git/config lin
 test('scrubDepsEnv removes shell and lane variables, and keeps the ssh/auth and temp-dir ones the install needs', () => {
   const scrubbed = scrubDepsEnv({ PATH: '/bin', HOME: '/h', TMPDIR: '/var/tmp/lb-1', TMP: '/t', TEMP: '/t', PWD: '/p', OLDPWD: '/o', SHLVL: '2', _: '/x', GIT_CEILING_DIRECTORIES: '/c', SSH_CONNECTION: 'x', SSH_AUTH_SOCK: '/agent', GIT_SSH_COMMAND: 'ssh -i k', LANE_BROKER_LEASE: 'z', LANE_OMIT: 'dev', npm_config_cache: '/c' });
   assert.deepEqual(Object.keys(scrubbed).sort(), ['GIT_SSH_COMMAND', 'HOME', 'PATH', 'SSH_AUTH_SOCK', 'SSH_CONNECTION', 'TEMP', 'TMP', 'TMPDIR', 'npm_config_cache']);
+});
+
+test('pinInstallLocale leaves only the pinned LC_ALL; the submitter env it was derived from is untouched (BRAIN-429)', () => {
+  const submitter = { PATH: '/bin', LC_ALL: 'en_US.UTF-8', LC_CTYPE: 'C', LC_TIME: 'fr_FR', LANG: 'de_DE', LANGUAGE: 'de' };
+  const install = pinInstallLocale(submitter, 'C.UTF-8');
+  assert.deepEqual(install, { PATH: '/bin', LANGUAGE: 'de', LC_ALL: 'C.UTF-8' });
+  assert.equal(submitter.LC_CTYPE, 'C', 'the command env keeps the submitter locale');
 });
 
 const MOUNTINFO = [

@@ -641,6 +641,11 @@ reason.
 - **Config** (runner machine's global config): `remoteDepsCache` (default
   `true`) and `remoteDepsCacheMaxBytes`. A lane's `remoteDepsCache: false`
   opts that lane out.
+- **Install locale** (BRAIN-429): the dependency install (`npm ci` and the
+  install-time checks) runs with every `LC_*` and `LANG` removed and `LC_ALL`
+  pinned to `C.UTF-8` (plain `C` on a host whose `locale -a` lacks it), and the
+  pinned value is hashed as `install-locale`, so submitters with different
+  locales share a key. The lane's own command still gets the submitter's locale.
 - **Observability**: the run logs `deps-cache hit|miss key=<12 hex> dir=<d>
   ms=<n>` (`skip` when caching is off or refused, with a reason), and the
   result and history row carry `depsCache` (`hit`, `miss` or `skip`) and
