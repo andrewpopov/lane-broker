@@ -32,7 +32,9 @@ const RM = { recursive: true, force: true, maxRetries: 20, retryDelay: 100 };
 
 export function removeTmpDir(dir) {
   try {
-    fs.rmSync(dir, RM);
+    // No retries on the first pass: a read-only tree fails with EPERM, which rmSync retries for the
+    // full maxRetries x retryDelay (2s a dir) before makeWritable below could ever help.
+    fs.rmSync(dir, { recursive: true, force: true });
   } catch {
     try {
       makeWritable(dir);
@@ -47,7 +49,7 @@ export function removeTmpDir(dir) {
 // writes history/results into its state dir after the dir is gone, resurrecting it. A child's
 // environment carries the dir path (LANE_BROKER_HOME/STATE, cwd args), so wait until no other
 // process mentions any of our dirs, then remove. Bounded: a stuck child must not hang the suite.
-const SETTLE_MS = 15000;
+const SETTLE_MS = 2000;
 const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 function processesMentioning(dirs) {
