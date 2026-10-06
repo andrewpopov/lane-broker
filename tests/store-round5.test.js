@@ -7,6 +7,10 @@ import { readJournal } from '../src/store/journal.js';
 import { Replicator } from '../src/store/replicate.js';
 import { sweep } from '../src/store/retention.js';
 import { blobRelPath, manifestRelPath } from '../src/store/ids.js';
+import { lockMode } from '../src/store/lock.js';
+
+// The fence guards the macOS file-lock fallback only; on Linux the kernel-held lock has no path to displace.
+const fileLockOnly = { skip: lockMode() === 'file' ? false : 'macOS file-lock fallback; Linux uses the kernel-held lock (see the N11 (Linux) tests)' };
 
 const DAY = 24 * 3600 * 1000;
 const replicator = (p) => new Replicator({ store: p.primary.store, root: p.primary.root, replica: p.replica.replicaPeer, now: p.clock.now });
@@ -19,7 +23,7 @@ async function pair({ replicaGraceHours } = {}) {
 }
 
 // ---- N11: fence by self-check ----
-test('N11 a displaced owner (its lock path now names another file) throws LockLostError on the next append and writes nothing', async (t) => {
+test('N11 a displaced owner (its lock path now names another file) throws LockLostError on the next append and writes nothing', fileLockOnly, async (t) => {
   const srv = await startStore();
   t.after(() => srv.close());
   await srv.submit.putBlob(sha('before'), Buffer.from('before'));
@@ -36,7 +40,7 @@ test('N11 a displaced owner (its lock path now names another file) throws LockLo
   assert.equal(fs.statSync(journalFile).size, sizeBefore);
 });
 
-test('N11 a vanished lock path also fences the owner, and the replication watermark is not written', async (t) => {
+test('N11 a vanished lock path also fences the owner, and the replication watermark is not written', fileLockOnly, async (t) => {
   const p = await pair();
   t.after(() => p.close());
   await p.primary.submit.putBlob(sha('x'), Buffer.from('x'));
@@ -45,7 +49,7 @@ test('N11 a vanished lock path also fences the owner, and the replication waterm
   assert.equal(fs.existsSync(path.join(p.primary.root, 'replication.json')), false, 'no watermark write from a displaced owner');
 });
 
-test('N11 the fence invokes onLockLost so the server can shut down', async (t) => {
+test('N11 the fence invokes onLockLost so the server can shut down', fileLockOnly, async (t) => {
   let lost = null;
   const srv = await startStore({ onLockLost: (e) => { lost = e; } });
   t.after(() => srv.close());
