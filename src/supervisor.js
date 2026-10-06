@@ -24,13 +24,13 @@ import { DescendantTracker, hasLiveMembers, reapLogLine } from './descendants.js
 import { reloadGlobalConfig } from './config.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
-import { detectResourceCapacity, checkResourceBudget, localSimRefusal, leaseCpuCores } from './resources.js';
+import { detectResourceCapacity, checkResourceBudget, localSimRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { selectRunner, dispatchRemote, needsProtocol2 } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
 import { createAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX } from './admission.js';
-import { observedLeaseFields, summarizeObservedCpu, sanitizeObservedCpu, sanitizeRssPeak } from './observed.js';
+import { observedLeaseFields, summarizeObservedCpu, sanitizeObservedCpu, sanitizeRssPeak, integratedCpuSeconds, sanitizeCpuSeconds } from './observed.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
 const CANCEL_GRACE_MS = 10_000;
@@ -338,11 +338,32 @@ export function applyHeartbeatObservation(lease, observed, now = Date.now(), obs
   return update;
 }
 
+/** BRAIN-425: the first CPU sample is taken this long after spawn (capped at sampleMs), so a short run is still observed. */
+const EARLY_SAMPLE_MS = 1000;
+
 /** BRAIN-361: a runner's usage fields, each kept only when well-formed; a malformed one is dropped, never thrown on. */
 function relayedUsage(result) {
   const observedCpu = sanitizeObservedCpu(result?.observedCpu);
   const rssPeak = sanitizeRssPeak(result?.observedRssPeakBytes);
-  return { ...(observedCpu ? { observedCpu } : {}), ...(rssPeak !== undefined ? { observedRssPeakBytes: rssPeak } : {}) };
+  const cpuSeconds = sanitizeCpuSeconds(result?.cpuSeconds);
+  return {
+    ...(observedCpu ? { observedCpu } : {}),
+    ...(rssPeak !== undefined ? { observedRssPeakBytes: rssPeak } : {}),
+    ...(cpuSeconds !== undefined ? { cpuSeconds } : {}),
+  };
+}
+
+/**
+ * BRAIN-425: `remotePhasesMs`, the remote run's phase wall times. The runner's own (`snapshotMs` receive+verify, `setupMs`
+ * deps+setup, `commandMs`, `artifactsMs` collection) ride in its result; the submitter adds `uploadMs` (writing the snapshot
+ * to ssh) and `artifactReturnMs` (fetching the artifacts back). Each is kept only when a finite non-negative number.
+ */
+const REMOTE_PHASE_KEYS = ['snapshotMs', 'setupMs', 'commandMs', 'artifactsMs'];
+function relayedPhases(dispatch) {
+  const own = { uploadMs: dispatch.uploadMs, artifactReturnMs: dispatch.artifactReturnMs };
+  for (const key of REMOTE_PHASE_KEYS) own[key] = dispatch.result?.phasesMs?.[key];
+  const phases = Object.fromEntries(Object.entries(own).filter(([, v]) => Number.isFinite(v) && v >= 0));
+  return Object.keys(phases).length > 0 ? { remotePhasesMs: phases } : {};
 }
 
 /** BRAIN-389: the runner's deps-phase outcome (hit|miss|skip) and wall time, each kept only when well-formed. */
@@ -422,6 +443,8 @@ function historyRow(ticket, result, { fallbackReason, lease } = {}) {
     headTree: ticket.headTree,
     // BRAIN-380 §8: only a ticket that was admitted has a lease, so only its row carries the admission audit
     ...priorityAuditOf(lease),
+    // BRAIN-425: every row states what the lane was granted and how it ended; a grant or exit in `result` wins
+    ...terminalRowDefaults({ resources: ticket.resources, grantedCpuCores: lease?.grantedCpuCores }),
     ...result,
     executor,
     ...(localReason ? { localReason } : {}),
@@ -467,7 +490,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // the attempt generation every fence below acts on: 0 for a first attempt, the fallback's generation for a rebind
   const gen = rebind ? rebind.generation : 0;
   let withdrawn = null;
-  if (!rebind) await createAttempt(root, enriched.id, { runner: null });
+  if (!rebind) await createAttempt(root, enriched.id, { runner: null, resources: enriched.resources });
 
   // Reuses the SAME two writers a local child's output goes through
   // (CappedLogWriter/ForwardWriter, defined above) -- no second relay.
@@ -770,6 +793,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       ...(Number.isFinite(dispatch.result.grantedCpuCores) ? { grantedCpuCores: dispatch.result.grantedCpuCores } : {}),
       ...relayedUsage(dispatch.result),
       ...relayedDeps(dispatch.result),
+      ...relayedPhases(dispatch),
       ...artifactFields,
       remoteKind: dispatch.result.kind,
       remotePhase: dispatch.phase ?? null,
@@ -1092,8 +1116,9 @@ async function main() {
     writeBrokerLog(root, reapLogLine(ticket.id, result));
   }
 
-  const heartbeat = setInterval(() => {
-    if (finished) return;
+  // BRAIN-425: one observation, shared by the heartbeat and an early sample, so a run shorter than sampleMs still gets a
+  // CPU reading. Never taken on the exit path: reap and lease release must not wait on telemetry.
+  function observeLease() {
     try {
       const lease = readLease(root, ticket.id);
       if (lease) {
@@ -1108,6 +1133,14 @@ async function main() {
     } catch {
       // observation is telemetry: nothing in it may take the supervisor down while its child runs
     }
+  }
+  const earlySample = setTimeout(() => {
+    if (!finished) observeLease();
+  }, Math.min(EARLY_SAMPLE_MS, globalCfg.sampleMs));
+
+  const heartbeat = setInterval(() => {
+    if (finished) return;
+    observeLease();
     // Codex pre-merge BLOCKER #1: the marker must survive until AFTER the
     // terminal write below decides on it -- clearing it here (as this used
     // to, the instant it was observed) let a child that exits 0 on TERM
@@ -1130,6 +1163,7 @@ async function main() {
   async function finalizeAndExit(result, exitCode) {
     finished = true;
     clearInterval(heartbeat);
+    clearTimeout(earlySample);
     // killGroup must be awaited on every path: if the group leader exited
     // but a TERM-resistant descendant is still alive, we must not write the
     // result / release the lease until the whole group is confirmed gone.
@@ -1171,6 +1205,8 @@ async function main() {
       if (observedCpu) finalResult = { ...finalResult, observedCpu };
       const rssPeak = sanitizeRssPeak(finalLease?.observedRssPeakBytes);
       if (rssPeak !== undefined) finalResult = { ...finalResult, observedRssPeakBytes: rssPeak };
+      const cpuSeconds = integratedCpuSeconds(finalLease?.observedCpuStats, startedAt, finalResult.endedAt);
+      if (cpuSeconds !== undefined) finalResult = { ...finalResult, cpuSeconds };
       atomicWriteJson(ticket.resultPath, finalResult);
       appendHistory(root, historyRow(ticket, finalResult, { fallbackReason, lease: started.lease }));
       removeLease(root, ticket.id); // release always comes last

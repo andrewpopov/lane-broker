@@ -184,6 +184,22 @@ export function leaseCpuCores(lease) {
   return Number.isFinite(lease.grantedCpuCores) ? lease.grantedCpuCores : lease.resources?.cpuCores;
 }
 
+/**
+ * BRAIN-425: the fields EVERY terminal history row carries, whichever path wrote it: what the run was charged
+ * (the elastic grant, else the declaration; read from a lease, ticket or attempt record, anything with `resources`)
+ * and `exit`/`signal`, null until the caller's own result says otherwise. Spread it BEFORE the row's own fields.
+ */
+export function terminalRowDefaults(source) {
+  const cpu = leaseCpuCores(source ?? {});
+  const memory = source?.resources?.memoryBytes;
+  return {
+    ...(Number.isFinite(cpu) ? { grantedCpuCores: cpu } : {}),
+    ...(Number.isFinite(memory) ? { grantedMemoryBytes: memory } : {}),
+    exit: null,
+    signal: null,
+  };
+}
+
 /** remote-probe capability: this runner resolves `minCpuCores` itself and admits at a partial claim. */
 export const ELASTIC_CLAIMS_CAPABILITY = 'elastic-claims/1';
 

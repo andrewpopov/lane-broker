@@ -13,7 +13,7 @@ import { advanceHwm } from './priority-clock.js';
 import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, effectiveRank, score } from './priority.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
-import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, leaseResources, resolveTicketResources } from './resources.js';
+import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, leaseResources, resolveTicketResources, terminalRowDefaults } from './resources.js';
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
  *  possibly-running work and must count against both conflicts and capacity. */
@@ -356,7 +356,7 @@ export function reapStale(root, keepTicketId) {
       // trace of the drop (BRAIN-202). Same row conventions as cancel.js.
       if (dequeueSync(root, t.id)) {
         touchSimArmFor(root, t);
-        appendHistory(root, { id: t.id, key: t.key, dequeuedDeadSupervisor: true, error: 'supervisor died while queued', supervisorPid: t.supervisorPid, endedAt: Date.now(), executor: 'local' });
+        appendHistory(root, { ...terminalRowDefaults(t), id: t.id, key: t.key, dequeuedDeadSupervisor: true, error: 'supervisor died while queued', supervisorPid: t.supervisorPid, endedAt: Date.now(), executor: 'local' });
       }
     }
   }

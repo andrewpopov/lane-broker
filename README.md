@@ -851,9 +851,8 @@ declaration. Everything that charges a lease's CPU uses the grant: the CPU
 projection (including settled demand, BRAIN-354), safe-backfill head
 reservations (BRAIN-355), `lane status`, and `history.jsonl`
 (`grantedCpuCores`, additive beside `resources`) and on the result
-(`result.json`). These fields exist only for leases of lanes that declare
-`minCpuCores`; every other lease, status entry, history row and result is
-unchanged. The child gets the grant in
+(`result.json`). The lease, status entry and `result.json` carry the grant only for lanes that declare
+`minCpuCores`; since BRAIN-425 every history row records `grantedCpuCores` (the declaration for a non-elastic lane). The child gets the grant in
 `LANE_BROKER_CPU_CORES`, so a test runner sizing its workers from it uses what
 it was actually given. `lane status` marks a short grant on its RUNNING line
 (`cpu=2/4 (elastic)`), and the admission log line gains `declaredCpu=` and an
@@ -877,6 +876,29 @@ judged on the FULL claim, since it would be dispatched the full claim and refuse
 it terminally (exit 64) if its budget is smaller. Upgrade runners before relying
 on elasticity.
 
+### `history.jsonl` record schema (BRAIN-425)
+
+One JSON object per line, appended when a run reaches a terminal outcome. Every field except the identity and timing ones is
+additive: readers must ignore unknown keys and tolerate absent ones.
+
+| Field | Meaning |
+|---|---|
+| `id`, `key`, `repo`, `lane`, `configLane`, `weight`, `resources`, `command`, `headTree` | identity and the declaration (`configLane` only for an ad-hoc lane inheriting a template) |
+| `executor`, `runner`, `localReason`, `remoteKind`, `remotePhase` | where it ran (`local`/`remote`), which runner, why local, and the runner's result kind/last phase |
+| `exit`, `signal` | present on **every** finished row: `exit` is the code (130 for a cancel, `null` when killed by a signal or never run), `signal` the terminating signal or `null` |
+| `cancelled`, `reason`, `error` | cancel flag; refusal/reap reason; supervisor-level error text |
+| `startedAt`, `endedAt`, `waitedMs`, `queuedAt` | epoch ms; `waitedMs` is queue wait (`null` when unknown) |
+| `grantedCpuCores`, `grantedMemoryBytes` | what the lane was charged: the elastic grant, else the declared reservation |
+| `observedCpu` `{peak, mean, samples}`, `observedRssPeakBytes` | heartbeat observations (see above) |
+| `cpuSeconds` | CPU seconds of the lease's process tree, an **estimate**: the heartbeat core samples integrated over time, the first reading held back to the start and the last forward to the end. Not rusage: `ps` pcpu is a decayed average and a supervisor cannot read reaped grandchildren's rusage |
+| `depsCache`, `depsMs` | remote deps phase outcome (`hit`/`miss`/`skip`) and wall time |
+| `remotePhasesMs` | remote runs: `uploadMs` (submitter writing the snapshot), `snapshotMs` (runner receive + verify), `setupMs` (deps + setup), `commandMs`, `artifactsMs` (runner collection), `artifactReturnMs` (submitter fetching them back). Each present only when measured |
+| `remoteArtifacts`, `remoteArtifactsWarning` | returned artifact names / why they were not |
+| `priorityRequested`, `priorityAdmitted`, `priorityDemoted`, `effectiveRankAtStart`, `scoreAtStart` | priority audit (admitted tickets only) |
+| `dequeuedDeadSupervisor` | marks a row for a queued ticket whose supervisor died (`exit: null`, `signal: null`) |
+
+A runner's `result.json` carries the same `cpuSeconds` and a `phasesMs` object; the submitter folds them into its own row.
+
 ### Observed CPU, the OVERRUN flag and `lane suggest` (BRAIN-361)
 
 Every heartbeat already observes a lease's whole process tree (CPU and RSS). Two
@@ -887,7 +909,7 @@ things are now kept from it, report-only: **nothing here is read by admission**.
   `observedRssPeakBytes`. `peak` is the highest heartbeat reading; `mean` is
   **time-weighted** (each reading is held until the next, so a long quiet stretch
   outweighs a short spike); `samples` is the reading count. Additive: old readers
-  ignore the fields, and a run shorter than one heartbeat has none. A remote run
+  ignore the fields. Since BRAIN-425 the supervisor also samples once ~1s after spawn and once when the leader exits, so a run shorter than one heartbeat still has a reading (only a run that ends before that first sample has none). A remote run
   carries them back on the remote result (like `grantedCpuCores`), so the
   submitter's history has them too.
 - **`OVERRUN` in `lane status`.** A RUNNING lease whose observed cores stay above

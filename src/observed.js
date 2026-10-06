@@ -30,10 +30,11 @@ const validStats = (s) =>
  * `lastAt` never moves backwards, so no interval is counted twice when time catches up.
  */
 export function foldObservedCpu(stats, cores, now) {
-  if (!validStats(stats)) return { peak: cores, area: 0, spanMs: 0, samples: 1, lastAt: now, lastCores: cores };
+  if (!validStats(stats)) return { peak: cores, area: 0, spanMs: 0, samples: 1, lastAt: now, lastCores: cores, firstAt: now, firstCores: cores };
   if (now <= stats.lastAt) return { ...stats, peak: Math.max(stats.peak, cores), samples: stats.samples + 1 };
   const dt = now - stats.lastAt;
   return {
+    ...stats,
     peak: Math.max(stats.peak, cores),
     area: stats.area + stats.lastCores * dt,
     spanMs: stats.spanMs + dt,
@@ -55,6 +56,23 @@ export function sanitizeObservedCpu(o) {
   if (o === null || typeof o !== 'object' || !isNum(o.peak) || !isNum(o.mean) || !isNum(o.samples)) return null;
   return { peak: o.peak, mean: o.mean, samples: o.samples };
 }
+
+/**
+ * BRAIN-425: CPU seconds the lease's process tree consumed, ESTIMATED by integrating the heartbeat samples
+ * (core-ms area) and closing both ends: the first reading is held back to `startedAt` and the last forward to
+ * `endedAt`. Not exact rusage: the supervisor cannot read reaped grandchildren's rusage, and `ps` pcpu is itself
+ * a decayed average. Undefined with no valid observation (never a fabricated zero).
+ */
+export function integratedCpuSeconds(stats, startedAt, endedAt) {
+  if (!validStats(stats)) return undefined;
+  // the first reading's own time and cores (BRAIN-425), never a whole-span average: stats from before they were kept get no head
+  const head = isNum(stats.firstAt) && isNum(stats.firstCores) && isNum(startedAt) && startedAt < stats.firstAt ? stats.firstCores * (stats.firstAt - startedAt) : 0;
+  const tail = isNum(endedAt) && endedAt > stats.lastAt ? stats.lastCores * (endedAt - stats.lastAt) : 0;
+  return round3((stats.area + head + tail) / 1000);
+}
+
+/** A relayed CPU-seconds figure, or undefined when it is not a finite non-negative number. */
+export const sanitizeCpuSeconds = (v) => (isNum(v) && v >= 0 ? v : undefined);
 
 /** A relayed RSS peak, or undefined when it is not a finite number. */
 export const sanitizeRssPeak = (v) => (isNum(v) ? v : undefined);
