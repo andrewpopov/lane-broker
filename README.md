@@ -736,13 +736,25 @@ as soon as the ticket dir exists, and `queued` vs `running` is only a
 label. The client gives up (and falls back to local) as soon as the
 runner reports `gone` (no such ticket, a dead publisher, or a ticket from
 a runner version that writes no `publisher.json`), or after `remoteResultWaitMs` in the
-client's global config (default 3 hours). A runner too old to report a
+client's global config (default 3 hours); on that expiry it first sends a
+bounded best-effort `remote-cancel`, so the runner's copy does not keep running
+beside the local rerun, and the fallback reason says whether the remote copy was
+cancelled or the cancel could not be confirmed. A runner too old to report a
 state gets the previous behaviour: three back-to-back fetches, then local.
 A cancel during the wait still sends `remote-cancel` and exits `130`.
 Stale never-started ticket directories on the runner are not garbage
 collected. `remote-exec` ignores SIGHUP, so a dropped ssh
 session does not stop it. If `remote-exec` is killed some other way, the
 ticket reads `gone` and the client reruns locally.
+
+For a remote run, the history row's `waitedMs` is the time before the command
+started, never the run and never the time the result took to reach the client
+(poll backoff, an ssh-drop recovery). The runner reports its own pre-start wait
+as `queuedMs` in the result (a duration on its clock, so host clock skew cannot
+matter) and the client adds the local part it measured itself (enqueue until the
+snapshot was handed to the runner); `startedAt` is `createdAt + waitedMs`. A
+result from a runner that predates `queuedMs` falls back to receipt time minus
+enqueue minus `runMs`, which also counts the delivery delay as wait.
 
 ## Scheduling
 

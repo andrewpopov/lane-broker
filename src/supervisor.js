@@ -732,6 +732,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // BRAIN-320 S1c: `enriched.remote.remoteDeps`/`remoteSetup` ride along in
   // this spread and are what `dispatchRemote` derives its protocol-2 exec
   // header from (see its own `needsProtocol2` call).
+  const dispatchedAt = Date.now();
   const dispatch = await dispatchRemote({
     ...enriched.remote,
     remoteArtifacts: artifactsSupported ? declaredArtifacts : null,
@@ -788,10 +789,18 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       : artifactsUnsupportedWarning
         ? { remoteArtifactsWarning: artifactsUnsupportedWarning }
         : {};
-    // BRAIN-341: queue wait = enqueue -> the moment the command started, i.e.
-    // everything before the runner-reported run. Never the run itself.
-    const runMs = dispatch.result.runMs;
-    const remoteWaitedMs = Number.isFinite(runMs) && runMs >= 0 ? Math.max(0, endedAt - enriched.createdAt - runMs) : null;
+    // BRAIN-341/363: queue wait = everything before the command started, never the run and never the time the result
+    // took to reach us (poll backoff, an ssh-drop recovery). The runner reports its own pre-start wait (`queuedMs`, a
+    // duration on its clock); we add the local portion we measured ourselves (enqueue -> handed to the runner), so no
+    // cross-host clock is compared. An older runner reports no `queuedMs`: fall back to the BRAIN-341 formula
+    // (receipt time - enqueue - runMs), which also counts the result-delivery delay as wait.
+    const { queuedMs, runMs } = dispatch.result;
+    let remoteWaitedMs = null;
+    if (Number.isFinite(queuedMs) && queuedMs >= 0) {
+      remoteWaitedMs = Math.max(0, dispatchedAt - enriched.createdAt) + queuedMs;
+    } else if (Number.isFinite(runMs) && runMs >= 0) {
+      remoteWaitedMs = Math.max(0, endedAt - enriched.createdAt - runMs);
+    }
     await publishAndExit(gen, () => ({
       id: enriched.id,
       exit: dispatch.exitCode,

@@ -900,6 +900,20 @@ test('dispatchRemote: still running past remoteResultWaitMs is unconfirmed with 
   assert.ok(clock.slept.reduce((a, b) => a + b, 0) >= 60_000);
 });
 
+test('dispatchRemote: result-wait expiry sends remote-cancel before returning unconfirmed, and says so (BRAIN-363)', async () => {
+  const { result, calls } = await dispatchWithScript([{ protocol: 1, missing: true, state: 'running' }], {
+    extra: { resultWaitMs: 60_000 },
+  });
+  assert.equal(result.outcome, 'unconfirmed');
+  assert.ok(calls.includes('cancel'), `expected a remote-cancel call before the outcome returned, saw ${calls.join(',')}`);
+  assert.match(result.reason, /still running after waiting 60000ms for its result; remote copy cancelled/);
+});
+
+test('dispatchRemote: a state-gone or no-state runner is not sent a remote-cancel (nothing is running)', async () => {
+  const { calls } = await dispatchWithScript([{ protocol: 1, missing: true, state: 'gone' }]);
+  assert.ok(!calls.includes('cancel'), `unexpected remote-cancel: ${calls.join(',')}`);
+});
+
 test('dispatchRemote: abort during the result wait is cancelled and remote-cancel is attempted', async () => {
   const ac = new AbortController();
   const clock = makeFakeClock();

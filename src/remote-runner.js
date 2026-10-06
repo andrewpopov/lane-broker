@@ -217,7 +217,7 @@ function readPhasesMs(ticketDir, own) {
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
-function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, noProgressTimeoutMs, runMs, grantedCpuCores, observedCpu, observedRssPeakBytes, cpuSeconds, phasesMs, artifacts }) {
+function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, noProgressTimeoutMs, runMs, queuedMs, grantedCpuCores, observedCpu, observedRssPeakBytes, cpuSeconds, phasesMs, artifacts }) {
   const isProtocol2 = header.protocol === 2;
   return {
     protocol: isProtocol2 ? 2 : 1,
@@ -242,6 +242,9 @@ function buildResult(header, ticketDir, { kind, exit = null, signal = null, remo
     // time, so clock skew cannot matter). Omitted when unknown or for an
     // older runner, so the client records waitedMs null instead of a guess.
     runMs,
+    // BRAIN-363: how long this exec waited on the runner (receiving the snapshot, then the runner's queue and any deps/setup
+    // phase) before the command started, also a duration on the runner's own clock. Additive; omitted by an older runner.
+    queuedMs,
     // BRAIN-360: additive; only an elastic lane's runner-side grant (an old submitter ignores it)
     grantedCpuCores,
     // BRAIN-361: additive; what the lane actually used on the runner, relayed to the submitter's history
@@ -299,6 +302,7 @@ function cleanupWork(workDir, tmpDir) {
  * nonzero) -- see the module-level comment on kind derivation below.
  */
 export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = process.stdin } = {}) {
+  const execStartedAt = Date.now();
   // BRAIN-320 review fix A: resolve once, up front -- every path derived
   // below (ticketDir, workDir, and the protocol-2 pipeline argv) is passed
   // to a child that runs with a DIFFERENT cwd (the extracted work dir, see
@@ -580,6 +584,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   let reason = null;
   let noProgressTimeoutMs;
   let runMs;
+  let queuedMs;
   let grantedCpuCores;
   let observedCpu;
   let observedRssPeakBytes;
@@ -608,6 +613,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     if (Number.isFinite(structured.startedAt) && Number.isFinite(structured.endedAt)) {
       runMs = Math.max(0, structured.endedAt - structured.startedAt);
     }
+    if (Number.isFinite(structured.startedAt)) queuedMs = Math.max(0, structured.startedAt - execStartedAt);
     kind = cancelled ? 'cancelled' : 'completed';
   } else if (cancelled) {
     kind = 'cancelled';
@@ -629,7 +635,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   const artifacts = storeArtifacts(header, ticketDir, workDir, { kind, exit, signal });
   if (artifacts !== undefined) ownPhasesMs.artifactsMs = Date.now() - artifactsStartedAt;
   try {
-    writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, noProgressTimeoutMs, runMs, grantedCpuCores, observedCpu, observedRssPeakBytes, cpuSeconds, phasesMs: readPhasesMs(ticketDir, ownPhasesMs), artifacts }));
+    writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, noProgressTimeoutMs, runMs, queuedMs, grantedCpuCores, observedCpu, observedRssPeakBytes, cpuSeconds, phasesMs: readPhasesMs(ticketDir, ownPhasesMs), artifacts }));
   } finally {
     cleanupWork(workDir, tmpDir);
   }

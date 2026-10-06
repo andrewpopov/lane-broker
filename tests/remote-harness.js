@@ -142,6 +142,29 @@ if (destination === 'die-midstream') {
     process.stdout.write(\`\${JSON.stringify(probe)}\\n\`);
     exitNow(0);
   });
+} else if ((destination === 'slow-result' || destination === 'legacy-result') && commandString.includes('remote-result')) {
+  // BRAIN-363: 'slow-result' lands the result well after the run ended (a recovery / poll delay); 'legacy-result' relays a
+  // result from a runner that predates \`queuedMs\`.
+  const child = spawn('sh', ['-c', commandString], { stdio: ['ignore', 'pipe', 'inherit'] });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  child.on('close', () => {
+    let record;
+    try {
+      record = JSON.parse(out.trim());
+    } catch {
+      process.stdout.write(out);
+      exitNow(0);
+      return;
+    }
+    if (destination === 'legacy-result') delete record.queuedMs;
+    const relay = () => {
+      process.stdout.write(\`\${JSON.stringify(record)}\\n\`);
+      exitNow(0);
+    };
+    if (destination === 'slow-result' && record && !record.missing) setTimeout(relay, 6000);
+    else relay();
+  });
 } else if (destination === 'result-tamper' && commandString.includes('remote-result')) {
   const child = spawn('sh', ['-c', commandString], { stdio: ['ignore', 'pipe', 'inherit'] });
   let out = '';

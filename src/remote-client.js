@@ -558,10 +558,12 @@ async function readRemoteArtifacts(runner, ticketId, { patterns, limits, sshBin,
 }
 
 /** `lane remote-cancel <ticketId>` over ssh, best-effort: failures are swallowed since this
- *  only ever runs alongside an abort the caller has already decided to honour regardless. */
+ *  only ever runs alongside an abort the caller has already decided to honour regardless.
+ *  Resolves true only when the runner acknowledged the cancel (exit 0 within the deadline). */
 async function remoteCancelBestEffort(runner, ticketId, sshBin, deadlineMs, env) {
   const cmd = buildRemoteCommand(runner, 'remote-cancel', [ticketId]);
-  await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
+  const res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
+  return res.code === 0 && !res.timedOut;
 }
 
 /** Public entry point for `remoteCancelBestEffort`, for a caller with no `dispatchRemote` of
@@ -785,14 +787,17 @@ export async function dispatchRemote(opts) {
     return { outcome: 'cancelled' };
   }
 
-  if (!record) {
+  if (!record && waitExpired) {
+    // BRAIN-363: the caller falls back to running locally, so the runner's copy must not keep running beside it.
+    const cancelAcknowledged = await remoteCancelBestEffort(runner, ticketId, sshBin, cancelDeadlineMs, env);
     return {
       outcome: 'unconfirmed',
-      reason: waitExpired
-        ? `remote job still running after waiting ${resultWaitMs}ms for its result`
-        : 'result not available after retries',
+      reason: `remote job still running after waiting ${resultWaitMs}ms for its result; ${
+        cancelAcknowledged ? 'remote copy cancelled' : 'remote cancel could not be confirmed'
+      }`,
     };
   }
+  if (!record) return { outcome: 'unconfirmed', reason: 'result not available after retries' };
 
   // BRAIN-320 S1c: classification (bound? kind? green?) all happens in ONE
   // place, `classifyRemoteResult`, shared with `isGreen` -- see its own doc

@@ -604,3 +604,29 @@ test('remote run: waitedMs records the wait before the command started, not the 
   assert.ok(result.waitedMs < runMs - 500, `waitedMs ${result.waitedMs} must not include the ${runMs}ms run`);
   assert.ok(result.endedAt - result.startedAt >= runMs - 100, 'startedAt must still mean "command started"');
 });
+
+// ---- BRAIN-363: queue wait is measured on the runner's clock, never the result-delivery delay ----
+
+test('remote run: a result that lands 6s after the run ended does not count the fetch delay as queue wait', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'slow-result' });
+  const cmd = [process.execPath, '-e', 'process.exit(0)'];
+  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...cmd], env, repoDir);
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+  assert.ok(Number.isFinite(result.waitedMs), `waitedMs should be a number, got ${result.waitedMs}`);
+  assert.ok(result.waitedMs < 3000, `waitedMs ${result.waitedMs} must not include the 6000ms result delay`);
+  assert.ok(result.endedAt - result.startedAt >= 5500, 'the delivery delay sits between startedAt and endedAt, not before startedAt');
+});
+
+test('remote run: a result from a runner that reports no queuedMs still gets a waitedMs (the BRAIN-341 formula)', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'legacy-result' });
+  const runMs = 2500;
+  const cmd = [process.execPath, '-e', `setTimeout(() => process.exit(0), ${runMs});`];
+  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...cmd], env, repoDir);
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+  assert.ok(Number.isFinite(result.waitedMs), `waitedMs should be a number, got ${result.waitedMs}`);
+  assert.ok(result.waitedMs < runMs - 500, `waitedMs ${result.waitedMs} must not include the ${runMs}ms run`);
+});
