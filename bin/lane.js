@@ -16,6 +16,7 @@ import {
   remoteArtifactsReleaseCommand,
   defaultRemoteRoot,
 } from '../src/remote-runner.js';
+import { capabilitiesCommand } from '../src/capabilities.js';
 import { remotePipelineCommand } from '../src/remote-pipeline.js';
 
 function usage() {
@@ -23,6 +24,7 @@ function usage() {
   lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--detach]
            [--timeout <duration>] [--allow-local-sim] [--local] [--log <path>] -- <command...>
   lane status [--json]
+  lane capabilities --json
   lane suggest [--repo <name>] [--days <n>] [--json]
   lane cancel <id>
   lane wait <id> [--timeout <duration>]
@@ -214,6 +216,13 @@ async function main() {
       }
       const result = await migrateSchedulerCommand({ dryRun, whenIdle, ...(timeoutMs === undefined ? {} : { timeoutMs }) });
       return result.exitCode;
+    }
+    case 'capabilities': {
+      if (!rest.includes('--json')) {
+        process.stderr.write('lane capabilities: only --json is supported\n');
+        return 2;
+      }
+      return capabilitiesCommand().exitCode;
     }
     // BRAIN-319 T2: hidden runner-side subcommands, invoked by a client Mac
     // over ssh — deliberately not listed in usage() above.

@@ -8,9 +8,10 @@ import { pipeline } from 'node:stream/promises';
 import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, loadGlobalConfig } from './config.js';
-import { ARTIFACTS_CAPABILITY, artifactLimitsOf, collectArtifacts, encodeArtifacts, pruneStaleArtifacts } from './remote-artifacts.js';
-import { remotePriorityFrom, PRIORITY_CAPABILITY } from './priority.js';
-import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores, ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
+import { CAPABILITIES } from './capabilities.js';
+import { artifactLimitsOf, collectArtifacts, encodeArtifacts, pruneStaleArtifacts } from './remote-artifacts.js';
+import { remotePriorityFrom } from './priority.js';
+import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores } from './resources.js';
 import { makeReader, readHeaderLine, extractFrames, MAX_HEADER_BYTES } from './remote-stream.js';
 import { runCommand } from './run.js';
 import { cancelCommand } from './cancel.js';
@@ -624,7 +625,7 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot() } = {}) {
     protocol: 1,
     protocols: [1, 2],
     // BRAIN-360: this runner resolves minCpuCores itself, so a submitter may judge fit by the floor
-    capabilities: [ELASTIC_CLAIMS_CAPABILITY, PRIORITY_CAPABILITY, ARTIFACTS_CAPABILITY],
+    capabilities: CAPABILITIES,
     version: pkg.version,
     // BRAIN-380 slice 4: a draining runner takes no new work. `draining` names why; `paused` is also set so a client
     // built before this field skips the runner the way it skips a paused one.

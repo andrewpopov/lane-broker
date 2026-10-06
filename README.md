@@ -39,6 +39,7 @@ exits with `supervisor exited unexpectedly with no result`. Wait until
 lane run --repo rouge --lane default -- npm test
 lane run --repo rouge --lane lint    -- npm run lint
 lane status [--json]
+lane capabilities --json
 lane suggest [--repo <name>] [--days 7] [--json]
 lane cancel <id>
 lane wait <id> [--timeout 5m]
@@ -1080,6 +1081,22 @@ nothing here claims it: compare wait distributions by tier, and do not read a ca
 | `69` | Local-sim lane refused (fleet-offload message); use `--allow-local-sim`. |
 | `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. Also `lane run` / `remote-exec` refused with "scheduler migration in progress" while `lane migrate-scheduler` runs, or "scheduler migration pending (draining)" while `--when-idle` waits. |
 | `130` | Cancelled (SIGINT/SIGTERM) while still queued, before the lane ever started. |
+
+### Group reap on leader exit (ROG-2181 T1b)
+
+When a lease's leader process (the command `lane run` spawned) exits on its own, the supervisor checks whether
+anything is still alive in its process group. If so it TERMs the group, waits the cancel grace period, KILLs and
+verifies the group is gone, and only then writes the result and releases the lease, so a surviving descendant never
+runs unleased. The result and the history row carry `reason: "leader-exited-group-reaped"`. A run whose group is
+already empty at exit is unchanged. Advertised as `group-reap/1`.
+
+## `lane capabilities --json`
+
+Prints one JSON line: `{"version", "capabilities": [...], "schedulerMode", "admissionMode"}`. `capabilities` is the
+same list `lane remote-probe` advertises (`elastic-claims/1`, `priority/1`, `artifacts/1`, `sim-safe-backfill/1`,
+`lane-aging/1`, `group-reap/1`). `schedulerMode` is `priority` when a valid `sched-v2.json` fence is present and
+`legacy` otherwise; `admissionMode` is the global config's `schedulerMode` (`active` or `shadow`). A caller that needs
+a feature (for example a pool gate that requires `group-reap/1`) checks this before relying on it.
 
 ## ORPHANED handling
 
