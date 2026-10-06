@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import {
@@ -14,6 +13,7 @@ import {
   entryDir,
   removeTree,
 } from '../src/deps-cache.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 /** BRAIN-402: a tree naming its install path is stored with a record of where, and rewritten to the new path on restore. */
 
@@ -22,7 +22,7 @@ test.after(() => {
   for (const d of made) removeTree(d);
 });
 const tmpDir = () => {
-  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'deps-relocate-'));
+  const d = makeTmpDir('deps-relocate-');
   made.push(d);
   return d;
 };

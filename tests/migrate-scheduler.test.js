@@ -14,6 +14,7 @@ import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { migrateScheduler, migrateSchedulerCommand, runsLaneBroker } from '../src/migrate.js';
 import { resolveScheduler, readSchedulerFence } from '../src/fairness.js';
 import { bootId, paths, atomicWriteFile, atomicWriteJson, readJsonSafe, MigrationInProgressError } from '../src/state.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 /**
  * BRAIN-380 slice 3: `lane migrate-scheduler`. Every test uses a temporary state root; none touches ~/.cache/lane-broker.
@@ -188,7 +189,7 @@ test('an unreadable process table refuses rather than assuming no lane process i
 });
 
 test('runsLaneBroker recognises the script as the executable or as node\'s first argument, including a `lane` symlink', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-bin-'));
+  const dir = makeTmpDir('lane-bin-');
   fs.mkdirSync(path.join(dir, 'pkg', 'bin'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'pkg', 'bin', 'lane.js'), '');
   fs.symlinkSync(path.join(dir, 'pkg', 'bin', 'lane.js'), path.join(dir, 'lane'));

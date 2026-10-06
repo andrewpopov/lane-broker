@@ -1,13 +1,13 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { Readable } from 'node:stream';
 import { freshEnv, writeGlobalConfig, BIN, laneRun, sleep, waitFor } from './helpers.js';
 import { encodeSnapshot } from '../src/remote-stream.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 /**
  * BRAIN-320 S1b (1b/1h): end-to-end pipeline tests against REAL `npm`, no
@@ -19,7 +19,7 @@ import { encodeSnapshot } from '../src/remote-stream.js';
  */
 
 function tmpDir(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
+  return makeTmpDir(`${prefix}-`);
 }
 
 function freshShadowEnv(extra) {

@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { SECRET, sha, token } from './store-harness.js';
 import { StoreClient } from '../src/store/client.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 const BIN = fileURLToPath(new URL('../bin/lane-store.js', import.meta.url));
 const env = { ...process.env, LANE_STORE_SECRET: SECRET, LANE_STORE_REPLICA_TOKEN: token({ role: 'replica' }) };
@@ -26,7 +26,7 @@ function serve(root, ...extra) {
 }
 
 test('lane-store CLI: in-process replication (serve --replicate-to), compare via the running primary, offline lock', async (t) => {
-  const dirs = [0, 1].map(() => fs.mkdtempSync(path.join(os.tmpdir(), 'lane-store-cli-')));
+  const dirs = [0, 1].map(() => makeTmpDir('lane-store-cli-'));
   const replica = serve(dirs[1], '--replica');
   t.after(() => replica.child.kill('SIGTERM'));
   const rUrl = await replica.ready;
@@ -51,7 +51,7 @@ test('lane-store CLI: in-process replication (serve --replicate-to), compare via
   assert.notEqual(locked.status, 0);
   assert.match(locked.stderr, /in use/);
 
-  const wild = spawnSync(process.execPath, [BIN, 'serve', '--root', fs.mkdtempSync(path.join(os.tmpdir(), 'ls-w-')), '--listen', '0.0.0.0:0'], { env, encoding: 'utf8' });
+  const wild = spawnSync(process.execPath, [BIN, 'serve', '--root', makeTmpDir('ls-w-'), '--listen', '0.0.0.0:0'], { env, encoding: 'utf8' });
   assert.notEqual(wild.status, 0);
   assert.match(wild.stderr, /wildcard/);
 });

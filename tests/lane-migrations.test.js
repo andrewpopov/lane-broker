@@ -1,11 +1,11 @@
 import { describe, test, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { applyMigrations, LANE_SQL_DIR } from '../src/lane-db.js';
 import { PgCluster, PG_SKIP_REASON } from './lane-db-harness.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 /**
  * BRAIN-400 (review finding F2): the lane schema is versioned. sql/lane/migrations/NNN-*.sql are table migrations, each applied once in
@@ -31,7 +31,7 @@ describe('lane schema versioning', { skip: PG_SKIP_REASON ?? false, timeout: 120
 
   /** A copy of sql/lane with extra migrations, e.g. { '900-sample.sql': 'ALTER TABLE ...' }. */
   function fixtureDir(extra = {}) {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-mig-'));
+    const dir = makeTmpDir('lane-mig-');
     tmp.push(dir);
     fs.cpSync(LANE_SQL_DIR, dir, { recursive: true });
     for (const [name, sql] of Object.entries(extra)) fs.writeFileSync(path.join(dir, 'migrations', name), sql);

@@ -1,8 +1,8 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { makeTmpDir } from './helpers/tmp.js';
 
 export const BIN = fileURLToPath(new URL('../bin/lane.js', import.meta.url));
 
@@ -41,7 +41,7 @@ function scrubbedProcessEnv() {
 
 export function freshEnv(extra = {}) {
   counter += 1;
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), `lane-broker-test-${counter}-`));
+  const base = makeTmpDir(`lane-broker-test-${counter}-`);
   const home = path.join(base, 'home');
   const state = path.join(base, 'state');
   fs.mkdirSync(home, { recursive: true });

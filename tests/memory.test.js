@@ -12,6 +12,7 @@ import {
   AVAILABLE_TIGHT_PCT,
   AVAILABLE_EXHAUSTED_PCT,
 } from '../src/memory.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 test('parseSwapUsage reads total/used out of real sysctl-shaped text', () => {
   const parsed = parseSwapUsage('total = 2048.00M  used = 512.00M  free = 1536.00M  (encrypted)');
@@ -152,7 +153,7 @@ test('classifyMemorySample: null sample yields null classification, never a fabr
 });
 
 test('readMemorySample honors LANE_BROKER_MEMORY_FILE, with values a real sampler would not plausibly produce', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-broker-memtest-'));
+  const dir = makeTmpDir('lane-broker-memtest-');
   const file = path.join(dir, 'memory');
   // A distinctive, implausible fixture -- these exact byte counts could not
   // come from a real sysctl/vm_stat call, so a sampler that silently ignores
@@ -228,7 +229,7 @@ test('readMemorySample: a throwing exec degrades to null, never a crash', { skip
 // would let a future test pass for entirely the wrong reason.
 test('readMemorySample does not accept blank override fields as a zeroed sample', () => {
   const prev = process.env.LANE_BROKER_MEMORY_FILE;
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-broker-memblank-'));
+  const dir = makeTmpDir('lane-broker-memblank-');
   try {
     for (const blank of [',,', ' , , ', '1,,3']) {
       const file = path.join(dir, 'memory');

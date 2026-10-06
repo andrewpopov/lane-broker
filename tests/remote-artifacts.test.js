@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -18,10 +17,11 @@ import {
 import { makeReader } from '../src/remote-stream.js';
 import { freshEnv, writeRepoConfig } from './helpers.js';
 import { makeGitWorktree } from './remote-harness.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 const LIMITS = { maxFileBytes: 1024, maxTotalBytes: 4096, maxCount: 10 };
 const sha = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
-const tmp = (prefix) => fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
+const tmp = (prefix) => makeTmpDir(`${prefix}-`);
 
 function workDirWith(files) {
   const dir = tmp('artifacts-work');

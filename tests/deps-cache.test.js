@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
@@ -35,6 +34,7 @@ import {
 import { resolveTicketConfig, loadGlobalConfig, ConfigError, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { freshEnv, writeRepoConfig, writeGlobalConfig } from './helpers.js';
 import { withLock } from '../src/state.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 /**
  * BRAIN-389: the installed-deps store. Everything here runs on synthetic trees (no npm, no network);
@@ -45,7 +45,7 @@ const DEPS_CACHE_URL = new URL('../src/deps-cache.js', import.meta.url).href;
 const IS_ROOT = typeof process.getuid === 'function' && process.getuid() === 0;
 
 function tmpDir(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
+  return makeTmpDir(`${prefix}-`);
 }
 
 /** A stand-in node_modules: nested packages, a `.bin` symlink to an executable, a file big enough to count. */

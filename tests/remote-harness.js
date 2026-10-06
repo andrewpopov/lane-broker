@@ -1,11 +1,11 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, gitFixture, laneRun, BIN } from './helpers.js';
 import { paths, readJsonSafe } from '../src/state.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 /**
  * The fake-ssh transport harness shared by tests/remote-client.test.js
@@ -15,7 +15,7 @@ import { paths, readJsonSafe } from '../src/state.js';
  */
 
 export function tmpDir(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
+  return makeTmpDir(`${prefix}-`);
 }
 
 /** freshEnv() + shadow scheduler config: these tests exercise the client/protocol

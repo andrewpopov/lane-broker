@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { gitFixture } from './helpers.js';
 import {
@@ -13,9 +12,10 @@ import {
   validateRemoteDeps,
   checkRemoteDepsDirsOnDisk,
 } from '../src/remote-manifest.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 function tmpRepo() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-manifest-test-'));
+  const dir = makeTmpDir('remote-manifest-test-');
   gitFixture(['init', '-q'], dir);
   return dir;
 }
@@ -228,7 +228,7 @@ test('verifyManifestNoGit passes on a directory matching the manifest exactly', 
   gitFixture(['commit', '-q', '-m', 'init'], dir);
   const manifest = buildManifest(dir);
 
-  const plainDir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-manifest-verify-'));
+  const plainDir = makeTmpDir('remote-manifest-verify-');
   fs.writeFileSync(path.join(plainDir, 'a.txt'), 'hello');
 
   const result = verifyManifestNoGit(plainDir, manifest);
@@ -242,7 +242,7 @@ test('verifyManifestNoGit reports a missing entry', () => {
   gitFixture(['commit', '-q', '-m', 'init'], dir);
   const manifest = buildManifest(dir);
 
-  const plainDir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-manifest-verify-'));
+  const plainDir = makeTmpDir('remote-manifest-verify-');
 
   const result = verifyManifestNoGit(plainDir, manifest);
   assert.equal(result.ok, false);
@@ -256,7 +256,7 @@ test('verifyManifestNoGit reports an extra file', () => {
   gitFixture(['commit', '-q', '-m', 'init'], dir);
   const manifest = buildManifest(dir);
 
-  const plainDir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-manifest-verify-'));
+  const plainDir = makeTmpDir('remote-manifest-verify-');
   fs.writeFileSync(path.join(plainDir, 'a.txt'), 'hello');
   fs.writeFileSync(path.join(plainDir, 'extra.txt'), 'oops');
 
@@ -272,7 +272,7 @@ test('verifyManifestNoGit reports a hash mismatch', () => {
   gitFixture(['commit', '-q', '-m', 'init'], dir);
   const manifest = buildManifest(dir);
 
-  const plainDir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-manifest-verify-'));
+  const plainDir = makeTmpDir('remote-manifest-verify-');
   fs.writeFileSync(path.join(plainDir, 'a.txt'), 'HELLO'); // same length as 'hello', different bytes
 
   const result = verifyManifestNoGit(plainDir, manifest);
@@ -350,14 +350,14 @@ test('validateRemoteDeps: valid non-overlapping sibling dirs pass', () => {
 // ---- checkRemoteDepsDirsOnDisk (BRAIN-320 S1b 1c) ----
 
 test('checkRemoteDepsDirsOnDisk: a real directory tree passes', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-deps-disk-'));
+  const dir = makeTmpDir('remote-deps-disk-');
   fs.mkdirSync(path.join(dir, 'web'), { recursive: true });
   const result = checkRemoteDepsDirsOnDisk(dir, ['web', '.']);
   assert.deepEqual(result, { ok: true });
 });
 
 test('checkRemoteDepsDirsOnDisk: a symlinked path component is rejected', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-deps-disk-'));
+  const dir = makeTmpDir('remote-deps-disk-');
   const real = path.join(dir, 'real-web');
   fs.mkdirSync(real, { recursive: true });
   fs.symlinkSync(real, path.join(dir, 'web'));
@@ -367,7 +367,7 @@ test('checkRemoteDepsDirsOnDisk: a symlinked path component is rejected', () => 
 });
 
 test('checkRemoteDepsDirsOnDisk: a symlinked ANCESTOR component is rejected', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-deps-disk-'));
+  const dir = makeTmpDir('remote-deps-disk-');
   const real = path.join(dir, 'real-a');
   fs.mkdirSync(path.join(real, 'b'), { recursive: true });
   fs.symlinkSync(real, path.join(dir, 'a'));
@@ -377,14 +377,14 @@ test('checkRemoteDepsDirsOnDisk: a symlinked ANCESTOR component is rejected', ()
 });
 
 test('checkRemoteDepsDirsOnDisk: a missing dir is rejected', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-deps-disk-'));
+  const dir = makeTmpDir('remote-deps-disk-');
   const result = checkRemoteDepsDirsOnDisk(dir, ['nope']);
   assert.equal(result.ok, false);
   assert.match(result.reason, /does not exist/);
 });
 
 test('checkRemoteDepsDirsOnDisk: a path component that is a plain file (not a directory) is rejected', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'remote-deps-disk-'));
+  const dir = makeTmpDir('remote-deps-disk-');
   fs.writeFileSync(path.join(dir, 'notadir'), 'x');
   const result = checkRemoteDepsDirsOnDisk(dir, ['notadir']);
   assert.equal(result.ok, false);

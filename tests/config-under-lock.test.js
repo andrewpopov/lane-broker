@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { freshEnv } from './helpers.js';
@@ -9,6 +8,7 @@ import { paths, atomicWriteJson, readJsonSafe, fingerprintOf, bootId } from '../
 import { enqueue, tryStart } from '../src/scheduler.js';
 import { writeLease, LEASE_STATE } from '../src/lease.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 const srcDir = fileURLToPath(new URL('../src', import.meta.url));
 
@@ -130,7 +130,7 @@ test('MUTATION: tryStart ignoring reloadCfg (using globalCfg instead) makes the 
   // Copy the whole src/ tree so relative imports keep working, then mutate
   // ONLY the copy's scheduler.js to ignore reloadCfg — proving the guard in
   // the real scheduler.js is load-bearing, not decoration.
-  const mutantSrcDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'lane-broker-mutant-src-'));
+  const mutantSrcDir = fs.realpathSync(makeTmpDir('lane-broker-mutant-src-'));
   fs.cpSync(srcDir, mutantSrcDir, { recursive: true });
 
   const schedulerPath = path.join(mutantSrcDir, 'scheduler.js');

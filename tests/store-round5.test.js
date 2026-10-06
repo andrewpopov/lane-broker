@@ -1,7 +1,6 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { startStore, fakeClock, snapshotOf, publish, sha } from './store-harness.js';
 import { readJournal } from '../src/store/journal.js';
@@ -9,6 +8,7 @@ import { Replicator } from '../src/store/replicate.js';
 import { sweep } from '../src/store/retention.js';
 import { blobRelPath, manifestRelPath } from '../src/store/ids.js';
 import { lockMode } from '../src/store/lock.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 // The fence guards the macOS file-lock fallback only; on Linux the kernel-held lock has no path to displace.
 const fileLockOnly = { skip: lockMode() === 'file' ? false : 'macOS file-lock fallback; Linux uses the kernel-held lock (see the N11 (Linux) tests)' };
@@ -145,7 +145,7 @@ test('N19b if the blob is gone on the primary too, the path blocks as before', a
 
 test('N11 only ObjectStore.open builds a store: a bare constructor (which would take no platform lock) is refused', async () => {
   const { ObjectStore } = await import('../src/store/objects.js');
-  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'lane-store-ctor-'));
+  const root = fs.realpathSync(makeTmpDir('lane-store-ctor-'));
   try {
     assert.throws(() => new ObjectStore(root), /ObjectStore\.open/);
   } finally {
@@ -155,7 +155,7 @@ test('N11 only ObjectStore.open builds a store: a bare constructor (which would 
 
 test('N11 the file lock refuses on Linux, so a hand-made file lock cannot sit beside the kernel-held lock', { skip: process.platform === 'linux' ? false : 'Linux-only; run on wintop' }, async () => {
   const { acquireStoreLock } = await import('../src/store/lock.js');
-  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'lane-store-flock-'));
+  const root = fs.realpathSync(makeTmpDir('lane-store-flock-'));
   try {
     assert.throws(() => acquireStoreLock(root), /fallback only/);
     assert.equal(fs.existsSync(path.join(root, 'store.lock')), false);

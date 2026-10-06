@@ -1,15 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { Readable } from 'node:stream';
 import { gitFixture } from './helpers.js';
 import { buildManifest, manifestHashOf } from '../src/remote-manifest.js';
 import { encodeSnapshot, extractSnapshot, serializeHeader } from '../src/remote-stream.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 function tmpDir(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
+  return makeTmpDir(`${prefix}-`);
 }
 
 function tmpRepo() {
