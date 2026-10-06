@@ -11,17 +11,33 @@ import { execFileSync } from 'node:child_process';
  * `LANE_BROKER_LEASE=<lease id>` in its environment (inherited from the leader, so it survives reparenting to init).
  */
 
-const CLK_TCK = 100; // USER_HZ: fixed at 100 on every Linux ABI userspace sees
-const PAGE_KIB = 4;
 const READ_ATTEMPTS = 3;
 const KILL_WAIT_MS = 3000;
+
+let cachedUnits = null;
+
+/** Kernel units /proc reports in: page size (statm/stat rss) and clock ticks (utime/stime/starttime). Read once per
+ *  process from getconf; 4096 / 100 only when getconf itself fails. */
+export function procUnits() {
+  if (cachedUnits) return cachedUnits;
+  const conf = (name, fallback) => {
+    try {
+      const value = Number(execFileSync('getconf', [name], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 }).trim());
+      return Number.isFinite(value) && value > 0 ? value : fallback;
+    } catch {
+      return fallback;
+    }
+  };
+  cachedUnits = { pageKib: conf('PAGESIZE', 4096) / 1024, clkTck: conf('CLK_TCK', 100) };
+  return cachedUnits;
+}
 
 function leaseMarker(leaseId) {
   return `LANE_BROKER_LEASE=${leaseId}`;
 }
 
 /** Linux: /proc/<pid>/stat. comm may hold spaces/parens, so split after the last ')'. `uptimeSec` turns starttime into pcpu like ps does. */
-export function parseProcStat(pid, text, uptimeSec = 0) {
+export function parseProcStat(pid, text, uptimeSec = 0, { pageKib, clkTck } = procUnits()) {
   const close = text.lastIndexOf(')');
   if (close < 0) return null;
   const f = text.slice(close + 2).split(' '); // f[0] is state (field 3)
@@ -29,55 +45,80 @@ export function parseProcStat(pid, text, uptimeSec = 0) {
   const pgid = Number(f[2]);
   const token = f[19]; // field 22, starttime in ticks
   if (![ppid, pgid].every(Number.isFinite) || !token) return null;
-  const cpuSec = (Number(f[11]) + Number(f[12])) / CLK_TCK; // utime + stime
-  const elapsed = uptimeSec - Number(token) / CLK_TCK;
+  const cpuSec = (Number(f[11]) + Number(f[12])) / clkTck; // utime + stime
+  const elapsed = uptimeSec - Number(token) / clkTck;
   const pcpu = elapsed > 0 && Number.isFinite(cpuSec) ? (cpuSec / elapsed) * 100 : 0;
-  return { pid, ppid, pgid, pcpu, rss: (Number(f[21]) || 0) * PAGE_KIB, token, marked: false };
+  return { pid, ppid, pgid, pcpu, rss: (Number(f[21]) || 0) * pageKib, token, marked: false };
 }
 
 const PS_LINE = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+([\d.]+)\s+(\d+)\s+(\w{3}\s+\w{3}\s+\d+\s+[\d:]{8}\s+\d{4})\s*(.*)$/;
+const PS_COMMAND_LINE = /^\s*(\d+)\s*(.*)$/;
 
-/** macOS: `ps -A -E -ww -o pid=,ppid=,pgid=,pcpu=,rss=,lstart=,command=`; with -E the command column carries the environment. */
-export function parsePsTable(text, leaseId) {
+/**
+ * macOS: `ps -A -ww -o pid=,ppid=,pgid=,pcpu=,rss=,lstart=,command=` (`text`) plus, when a lease marker is wanted,
+ * `ps -A -E -ww -o pid=,command=` (`envText`). With -E the command column is the argv FOLLOWED BY the environment, so
+ * each pid's plain command from the first listing is stripped as an exact prefix and only the remainder is matched:
+ * an argument that merely spells the marker is not a member. A pid whose -E command does not start with its plain
+ * command (it changed between the two reads) is unmarked.
+ */
+export function parsePsTable(text, leaseId, envText = '') {
+  const envOf = new Map();
+  for (const line of String(envText ?? '').split('\n')) {
+    const m = PS_COMMAND_LINE.exec(line);
+    if (m) envOf.set(Number(m[1]), m[2].trim());
+  }
   const rows = [];
   for (const line of String(text ?? '').split('\n')) {
     const m = PS_LINE.exec(line);
     if (!m) continue;
+    const pid = Number(m[1]);
+    const command = m[7].trim();
+    const withEnv = envOf.get(pid);
+    const env = withEnv !== undefined && withEnv.startsWith(command) ? withEnv.slice(command.length) : '';
     rows.push({
-      pid: Number(m[1]),
+      pid,
       ppid: Number(m[2]),
       pgid: Number(m[3]),
       pcpu: Number(m[4]),
       rss: Number(m[5]),
       token: m[6].replace(/\s+/g, ' '),
-      marked: leaseId !== undefined && m[7].split(/\s+/).includes(leaseMarker(leaseId)),
+      marked: leaseId !== undefined && env.split(/\s+/).includes(leaseMarker(leaseId)),
     });
   }
   return rows;
 }
 
-function readProcRow(name, leaseId, uptimeSec) {
+const GONE = new Set(['ENOENT', 'ESRCH']);
+
+/** A process we know exists but could not read: never counted as exited, never signalled (its token is unverifiable). */
+const unknownRow = (pid) => ({ pid, ppid: -1, pgid: -1, pcpu: 0, rss: 0, token: null, marked: false, unknown: true });
+
+/** One /proc entry. Only ENOENT/ESRCH mean "gone"; any other read error (EACCES, EIO, ...) is an unknown row. */
+export function readProcRow(name, leaseId, uptimeSec, fsApi = fs, units) {
+  const pid = Number(name);
+  let text;
   try {
-    const row = parseProcStat(Number(name), fs.readFileSync(`/proc/${name}/stat`, 'utf8'), uptimeSec);
-    if (!row) return null;
-    if (leaseId !== undefined) {
-      try {
-        row.marked = fs.readFileSync(`/proc/${name}/environ`, 'utf8').split('\0').includes(leaseMarker(leaseId));
-      } catch {
-        // not ours to read (other uid) or exited: not marked
-      }
-    }
-    return row;
-  } catch {
-    return null; // exited between readdir and read
+    text = fsApi.readFileSync(`/proc/${name}/stat`, 'utf8');
+  } catch (err) {
+    return GONE.has(err?.code) ? null : unknownRow(pid);
   }
+  const row = parseProcStat(pid, text, uptimeSec, units);
+  if (!row) return unknownRow(pid);
+  if (leaseId !== undefined) {
+    try {
+      row.marked = fsApi.readFileSync(`/proc/${name}/environ`, 'utf8').split('\0').includes(leaseMarker(leaseId));
+    } catch {
+      // another uid's environ is unreadable by design; such a process is found by the ppid walk, not the marker
+    }
+  }
+  return row;
 }
 
 /**
  * The whole process table as one read: [{ pid, ppid, pgid, pcpu, rss, token, marked }]. `marked` is true when the
  * process's environment carries this lease's marker. Throws when the table cannot be read (callers treat that as
- * "unknown", never "empty"). Note macOS hides the environment of SIP-protected binaries (e.g. /bin/sleep) even from
- * `ps -E`; those are still found by the ppid walk.
+ * "unknown", never "empty". Note macOS hides the environment of SIP-protected binaries (e.g. /bin/sleep) even from
+ * `ps -E`; those are found only by the ppid walk, and only if a scan saw them before their parent exited.
  */
 export function readProcessTable(leaseId) {
   if (process.platform === 'linux') {
@@ -88,14 +129,17 @@ export function readProcessTable(leaseId) {
       .map((name) => readProcRow(name, leaseId, uptimeSec))
       .filter(Boolean);
   }
-  const out = execFileSync('ps', ['-A', '-E', '-ww', '-o', 'pid=,ppid=,pgid=,pcpu=,rss=,lstart=,command='], {
-    encoding: 'utf8',
-    stdio: ['ignore', 'pipe', 'ignore'],
-    timeout: 2000,
-    maxBuffer: 256 * 1024 * 1024,
-    env: { ...process.env, TZ: 'UTC0', LC_ALL: 'C', LC_TIME: 'C' },
-  });
-  return parsePsTable(out, leaseId);
+  const ps = (args) =>
+    execFileSync('ps', args, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2000,
+      maxBuffer: 256 * 1024 * 1024,
+      env: { ...process.env, TZ: 'UTC0', LC_ALL: 'C', LC_TIME: 'C' },
+    });
+  const out = ps(['-A', '-ww', '-o', 'pid=,ppid=,pgid=,pcpu=,rss=,lstart=,command=']);
+  const envOut = leaseId === undefined ? '' : ps(['-A', '-E', '-ww', '-o', 'pid=,command=']);
+  return parsePsTable(out, leaseId, envOut);
 }
 
 const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -165,11 +209,12 @@ export class DescendantTracker {
     return rows;
   }
 
-  /** Recorded pids still running with the token they were recorded under. */
+  /** Recorded pids still running with the token they were recorded under, plus any whose row is unreadable
+   *  (unknown is never "exited"). */
   live(rows) {
-    const tokenOf = new Map(rows.map((r) => [r.pid, r.token]));
+    const rowOf = new Map(rows.map((r) => [r.pid, r]));
     return [...this.recorded]
-      .filter(([pid, token]) => !this.protectedPids.has(pid) && tokenOf.get(pid) === token)
+      .filter(([pid, token]) => !this.protectedPids.has(pid) && (rowOf.get(pid)?.token === token || rowOf.get(pid)?.unknown === true))
       .map(([pid]) => pid);
   }
 
@@ -178,10 +223,16 @@ export class DescendantTracker {
     return [...this.recorded].map(([pid, token]) => ({ pid, token }));
   }
 
-  /** Send `signal` once, synchronously, to every live member in `rows`; returns the pids signalled. */
-  signalLive(rows, signal, kill = process.kill.bind(process)) {
-    const pids = this.live(rows).filter((pid) => pid > 1);
-    for (const pid of pids) {
+  /** Send `signal` to every live member in `rows` that is not already in `sent` (a Set of "pid:token" keys, updated);
+   *  returns the pids signalled. An unreadable (unknown) member is never signalled: its token cannot be verified. */
+  signalLive(rows, signal, kill = process.kill.bind(process), sent = new Set()) {
+    const unknown = new Set(rows.filter((r) => r.unknown).map((r) => r.pid));
+    const pids = [];
+    for (const pid of this.live(rows)) {
+      const key = `${pid}:${this.recorded.get(pid)}`;
+      if (!(pid > 1) || unknown.has(pid) || sent.has(key)) continue;
+      sent.add(key);
+      pids.push(pid);
       try {
         kill(pid, signal);
       } catch {
@@ -204,19 +255,8 @@ export class DescendantTracker {
     const sweep = (signal) => {
       const rows = this.scan();
       if (!rows) return null;
-      const live = this.live(rows);
-      for (const pid of live) {
-        const key = `${pid}:${this.recorded.get(pid)}`;
-        if (sent[signal].has(key) || !(pid > 1)) continue;
-        sent[signal].add(key);
-        signalled.add(pid);
-        try {
-          kill(pid, signal);
-        } catch {
-          // gone
-        }
-      }
-      return live;
+      for (const pid of this.signalLive(rows, signal, kill, sent[signal])) signalled.add(pid);
+      return this.live(rows);
     };
     const run = async (signal, deadline) => {
       let live = null;
@@ -236,8 +276,8 @@ export class DescendantTracker {
 
 /** The tracker for a lease whose supervisor is gone: its last recorded snapshot plus the lease marker. Shared by
  *  `lane cancel` (to reap) and the stale-lease check (to see that evidence is still alive). */
-export function trackerForLease(lease) {
-  return DescendantTracker.fromSnapshot(null, lease.descendants, { leaseId: lease.id });
+export function trackerForLease(lease, options = {}) {
+  return DescendantTracker.fromSnapshot(null, lease.descendants, { leaseId: lease.id, ...options });
 }
 
 /** Does a lease whose supervisor is gone still have live recorded/marked members? Fails closed: unreadable = yes. */

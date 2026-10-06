@@ -20,7 +20,7 @@ import { enqueue, tryStart, dequeueSync, couldAdmitNow, withdrawQueued, restoreQ
 import { touchSimArmFor } from './sim-arm.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { selectLeaseTree } from './cpu.js';
-import { DescendantTracker, reapLogLine } from './descendants.js';
+import { DescendantTracker, hasLiveMembers, reapLogLine } from './descendants.js';
 import { reloadGlobalConfig } from './config.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
@@ -1236,13 +1236,9 @@ async function main() {
   // released. 'close' cannot be the trigger: a survivor holding the stdio pipes delays it until the survivor is
   // gone. So reap on 'exit'; finalizeAndExit awaits killPromise before the result is written or the lease released.
   let groupReaped = false;
-  function hasLiveDescendants() {
-    const rows = descendants.scan(); // finds members reparented to init by the leader's exit, via the lease marker
-    return rows ? descendants.live(rows).length > 0 : descendants.recorded.size > 0;
-  }
   child.on('exit', () => {
     if (finished || cancelling) return;
-    if (!isGroupAlive(child.pid) && !hasLiveDescendants()) return;
+    if (!isGroupAlive(child.pid) && !hasLiveMembers(descendants)) return;
     groupReaped = true;
     killPromise = killTree();
   });

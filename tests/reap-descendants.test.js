@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneSpawn, laneRun, waitFor, sleep } from './helpers.js';
 import { paths, bootId } from '../src/state.js';
 import { readLease, writeLease, reapIfStale } from '../src/lease.js';
-import { DescendantTracker, parsePsTable, parseProcStat, readProcessTable } from '../src/descendants.js';
+import { DescendantTracker, parsePsTable, parseProcStat, readProcessTable, readProcRow, hasLiveMembers } from '../src/descendants.js';
 
 /** BRAIN-419: cancel and leader exit must reap descendants that left the leader's process group. */
 
@@ -282,18 +282,62 @@ test('signalling itself refuses a protected pid even if one was recorded', async
   assert.deepEqual([...killed], [40]);
 });
 
-test('process table parsers read ps lstart/env and /proc stat starttime', () => {
+test('process table parsers read ps lstart and /proc stat starttime', () => {
   const ps = [
-    '  12     1    12   0.5  1024 Mon Oct  6 12:00:00 2026 /usr/bin/node a.js LANE_BROKER_LEASE=abc LANE_BROKER_KEY=k',
-    '  13     1    13   0.0    10 Mon Oct  6 12:00:01 2026 /bin/sleep 5 XLANE_BROKER_LEASE=abc',
+    '  12     1    12   0.5  1024 Mon Oct  6 12:00:00 2026 /usr/bin/node a.js',
+    '  13     1    13   0.0    10 Mon Oct  6 12:00:01 2026 /bin/grep LANE_BROKER_LEASE=abc',
+    '  14     1    14   0.0    10 Mon Oct  6 12:00:02 2026 /bin/sleep 5',
     'bad',
   ].join('\n');
-  assert.deepEqual(parsePsTable(ps, 'abc'), [
+  const envPs = [
+    '  12 /usr/bin/node a.js HOME=/h LANE_BROKER_LEASE=abc LANE_BROKER_KEY=k',
+    '  13 /bin/grep LANE_BROKER_LEASE=abc HOME=/h', // the marker is only an ARGUMENT here
+    '  14 /bin/sleep 5',
+  ].join('\n');
+  assert.deepEqual(parsePsTable(ps, 'abc', envPs), [
     { pid: 12, ppid: 1, pgid: 12, pcpu: 0.5, rss: 1024, token: 'Mon Oct 6 12:00:00 2026', marked: true },
     { pid: 13, ppid: 1, pgid: 13, pcpu: 0, rss: 10, token: 'Mon Oct 6 12:00:01 2026', marked: false },
+    { pid: 14, ppid: 1, pgid: 14, pcpu: 0, rss: 10, token: 'Mon Oct 6 12:00:02 2026', marked: false },
   ]);
   const stat = '77 (we ird) name)) S 5 66 77 0 -1 4194560 1 0 0 0 100 100 0 0 20 0 1 0 987654 1 25 18446744073709551615';
-  assert.deepEqual(parseProcStat(77, stat, 9876.54 + 20), { pid: 77, ppid: 5, pgid: 66, pcpu: 10, rss: 100, token: '987654', marked: false });
+  assert.deepEqual(parseProcStat(77, stat, 9876.54 + 20, { pageKib: 4, clkTck: 100 }), { pid: 77, ppid: 5, pgid: 66, pcpu: 10, rss: 100, token: '987654', marked: false });
+});
+
+test('/proc units come from the injected page size and tick rate, not 4096 / 100', () => {
+  const stat = '77 (x) S 5 66 77 0 -1 4194560 1 0 0 0 100 100 0 0 20 0 1 0 1000 1 25 18446744073709551615';
+  // 16 KiB pages (arm64), 250 ticks: rss 25 pages = 400 KiB; cpu 200/250 s over (20 s - 4 s)
+  assert.deepEqual(parseProcStat(77, stat, 20, { pageKib: 16, clkTck: 250 }), { pid: 77, ppid: 5, pgid: 66, pcpu: 5, rss: 400, token: '1000', marked: false });
+});
+
+test('only ENOENT/ESRCH mean a /proc entry is gone; any other read error is an unknown row', () => {
+  const fail = (code) => ({ readFileSync: () => { throw Object.assign(new Error(code), { code }); } });
+  assert.equal(readProcRow('5', undefined, 0, fail('ENOENT')), null);
+  assert.equal(readProcRow('5', undefined, 0, fail('ESRCH')), null);
+  assert.deepEqual(readProcRow('5', undefined, 0, fail('EACCES')), { pid: 5, ppid: -1, pgid: -1, pcpu: 0, rss: 0, token: null, marked: false, unknown: true });
+  const stat = '5 (x) S 1 5 5 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 900 1 1 0';
+  const noEnviron = { readFileSync: (f) => { if (f.endsWith('environ')) throw Object.assign(new Error('x'), { code: 'EACCES' }); return stat; } };
+  const row = readProcRow('5', 'abc', 0, noEnviron, { pageKib: 4, clkTck: 100 });
+  assert.equal(row.pid, 5);
+  assert.equal(row.ppid, 1);
+  assert.equal(row.marked, false);
+});
+
+test('an unknown row still counts as alive, is never signalled, and keeps the reap incomplete', async () => {
+  const rows = [row(20, 10, 'L'), row(40, 20, 'd')];
+  const tracker = new DescendantTracker(20, { readTable: () => rows });
+  tracker.scan();
+  rows[1] = { ...row(40, -1, null), unknown: true };
+  assert.deepEqual(tracker.live(rows), [40]);
+  const killed = [];
+  const result = await tracker.reap({ graceMs: 20, killWaitMs: 20, kill: (pid) => killed.push(pid), sleep: () => sleep(5) });
+  assert.deepEqual(killed, []);
+  assert.deepEqual(result, { signalled: 0, survivors: [40], complete: false });
+});
+
+test('an unreadable table at leader exit counts as "members may be alive", not "none"', () => {
+  const tracker = new DescendantTracker(20, { readTable: () => { throw new Error('ps cannot fork'); } });
+  assert.equal(hasLiveMembers(tracker), true);
+  assert.equal(hasLiveMembers(new DescendantTracker(20, { readTable: () => [row(20, 10, 'L')] })), false);
 });
 
 async function staleLeaseWithLiveMember(t) {
@@ -356,4 +400,52 @@ test('an unreadable table does not hold a stale lease forever', async (t) => {
   }
   assert.equal(readLease(state, 'stale-1'), null);
   assert.match(fs.readFileSync(paths(state).admissionLog, 'utf8'), /descendants-reap-incomplete survivors=unknown/);
+});
+
+// ---- orphan state machine, driven with an injected table, clock and kill ----
+
+function orphanHarness(t, members = [row(40, 1, 'a')]) {
+  const { state } = freshEnv();
+  let rows = members;
+  const signals = [];
+  const lease = { id: 'orph-1', bootId: bootId(), supervisorPid: 2 ** 22 - 3, childPgid: 2 ** 22 - 3, state: 'RUNNING', descendants: members.map((r) => ({ pid: r.pid, token: r.token })) };
+  writeLease(state, lease);
+  return {
+    state,
+    signals,
+    setRows: (next) => { rows = next; },
+    pass: (now) => reapIfStale(state, readLease(state, 'orph-1'), bootId(), { now, kill: (pid, sig) => signals.push([pid, sig]), readTable: () => rows }),
+  };
+}
+
+test('a stale lease never gives up before a KILL was sent: late first KILL, release only after the bound or death', () => {
+  const h = orphanHarness();
+  assert.equal(h.pass(1000), 'orphaned');
+  assert.equal(h.pass(62_000), 'orphaned'); // far past 60 s, but no KILL has gone out yet
+  assert.deepEqual(h.signals, [[40, 'SIGTERM'], [40, 'SIGKILL']]);
+  assert.ok(readLease(h.state, 'orph-1'), 'the lease is held');
+  assert.equal(h.pass(80_000), 'orphaned');
+  assert.equal(h.pass(92_500), 'reaped'); // 30 s after killAt, the member being unkillable
+  assert.match(fs.readFileSync(paths(h.state).admissionLog, 'utf8'), /descendants-reap-incomplete survivors=40/);
+});
+
+test('a stale lease persists and signals members found on any later pass, including reparented ones', () => {
+  const h = orphanHarness();
+  h.pass(1000); // TERM 40
+  h.setRows([row(40, 1, 'a'), row(41, 40, 'b')]); // 41 appears mid-grace as 40's child
+  h.pass(5000);
+  assert.deepEqual(h.signals.at(-1), [41, 'SIGTERM']);
+  assert.ok(readLease(h.state, 'orph-1').descendants.some((d) => d.pid === 41), 'the discovery is persisted');
+  h.setRows([row(41, 1, 'b')]); // 40 died, 41 reparented to init
+  h.pass(11_000);
+  assert.deepEqual(h.signals.at(-1), [41, 'SIGKILL']);
+});
+
+test('a marked replacement that appears after KILL was sent is KILLed on its own pass', () => {
+  const h = orphanHarness();
+  h.pass(1000);
+  h.pass(11_000); // killAt
+  h.setRows([row(40, 1, 'a'), row(90, 1, 'fresh', true)]);
+  h.pass(12_000);
+  assert.deepEqual(h.signals.at(-1), [90, 'SIGKILL']);
 });

@@ -80,43 +80,58 @@ export function isSupervisorAlive(lease) {
 }
 
 const ORPHAN_REAP_GRACE_MS = 10_000;
-const ORPHAN_REAP_GIVE_UP_MS = 60_000;
+const ORPHAN_KILL_GIVE_UP_MS = 30_000;
+const ORPHAN_UNREADABLE_GIVE_UP_MS = 60_000;
 
 /**
  * Dead supervisor, dead group: the lease is the only record of descendants that left the group (BRAIN-419), so it is
  * kept ORPHANED while any are alive, and every call advances a synchronous, non-blocking state machine so the lease
- * heals itself instead of waiting for `lane cancel`: first pass TERMs the live members and records `orphanReap`;
- * once the grace period has passed a later pass KILLs the survivors; any pass that finds none removes the lease.
- * Past ORPHAN_REAP_GIVE_UP_MS from the TERM (members unkillable, or the process table unreadable) the lease is
- * released anyway, with the incomplete-reap log line, so it can never block its lane forever.
- * Returns 'released' (lease removed) or 'held'. `clock.now`/`clock.kill` are injectable for tests.
+ * heals itself instead of waiting for `lane cancel`. Each pass rescans and persists what it found. Before `killAt` it
+ * TERMs every newly found live member (the first pass records `termAt`); the first pass past the grace period sets
+ * `killAt` and from then on every live member is KILLed once. A pass that finds none removes the lease.
+ * It never gives up before a KILL was sent: it releases (with the incomplete-reap log line) only
+ * ORPHAN_KILL_GIVE_UP_MS after `killAt`, or ORPHAN_UNREADABLE_GIVE_UP_MS after `termAt` while the process table is
+ * unreadable (no KILL can be sent then), so a lease never blocks its lane forever.
+ * Returns 'released' (lease removed) or 'held'. `clock.now`/`kill`/`readTable` are injectable for tests.
  */
-function stepOrphanReap(root, lease, { now = Date.now(), kill } = {}) {
+function stepOrphanReap(root, lease, { now = Date.now(), kill, readTable } = {}) {
+  const state = lease.orphanReap ?? { termAt: now, signalled: 0, termed: [], killed: [] };
   const release = (result) => {
     if (lease.orphanReap || !result.complete) writeBrokerLog(root, reapLogLine(lease.id, result));
     removeLease(root, lease.id);
     return 'released';
   };
-  const tracker = trackerForLease(lease);
+  const tracker = trackerForLease(lease, { readTable });
   const rows = tracker.scan();
   const live = rows ? tracker.live(rows) : null;
-  if (live && live.length === 0) return release({ signalled: lease.orphanReap?.signalled ?? 0, survivors: [], complete: true });
-  const orphanReap = lease.orphanReap ?? { termAt: now, signalled: 0 };
-  if (now - orphanReap.termAt >= ORPHAN_REAP_GIVE_UP_MS) {
-    return release({ signalled: orphanReap.signalled, survivors: live ?? [], complete: false });
+  if (live && live.length === 0) return release({ signalled: state.signalled, survivors: [], complete: true });
+  if (live === null && now - state.termAt >= ORPHAN_UNREADABLE_GIVE_UP_MS) {
+    return release({ signalled: state.signalled, survivors: [], complete: false });
   }
-  const advance = (patch, signal) => {
-    const signalled = signal && rows ? tracker.signalLive(rows, signal, kill) : [];
-    if (signalled.length > 0) writeBrokerLog(root, reapLogLine(lease.id, { signalled: signalled.length, survivors: [], complete: true }));
-    writeLease(root, {
-      ...lease,
-      state: LEASE_STATE.ORPHANED,
-      descendants: tracker.snapshot(),
-      orphanReap: { ...orphanReap, ...patch, signalled: orphanReap.signalled + signalled.length },
-    });
-  };
-  if (!lease.orphanReap) advance({ termAt: now }, 'SIGTERM');
-  else if (rows && !orphanReap.killAt && now - orphanReap.termAt >= ORPHAN_REAP_GRACE_MS) advance({ killAt: now }, 'SIGKILL');
+  if (state.killAt !== undefined && now - state.killAt >= ORPHAN_KILL_GIVE_UP_MS) {
+    return release({ signalled: state.signalled, survivors: live ?? [], complete: false });
+  }
+  const killAt = state.killAt ?? (rows && lease.orphanReap && now - state.termAt >= ORPHAN_REAP_GRACE_MS ? now : undefined);
+  const termed = new Set(state.termed);
+  const killed = new Set(state.killed);
+  const signalled = rows
+    ? killAt === undefined
+      ? tracker.signalLive(rows, 'SIGTERM', kill, termed)
+      : tracker.signalLive(rows, 'SIGKILL', kill, killed)
+    : [];
+  if (signalled.length > 0) writeBrokerLog(root, reapLogLine(lease.id, { signalled: signalled.length, survivors: [], complete: true }));
+  writeLease(root, {
+    ...lease,
+    state: LEASE_STATE.ORPHANED,
+    descendants: tracker.snapshot(),
+    orphanReap: {
+      termAt: state.termAt,
+      ...(killAt !== undefined ? { killAt } : {}),
+      signalled: state.signalled + signalled.length,
+      termed: [...termed],
+      killed: [...killed],
+    },
+  });
   return 'held';
 }
 

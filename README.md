@@ -1197,14 +1197,17 @@ does), which a group kill never reaches. While a lease runs, each heartbeat read
 every member of the lease's tree, with a start token, on the lease (`descendants`). A process is a member when it
 descends from the leader or from a recorded member (ppid walk), or when its environment carries
 `LANE_BROKER_LEASE=<lease id>`, which the leader's descendants inherit even after being reparented to init (read from
-`/proc/<pid>/environ` on Linux, `ps -E` on macOS, which hides the environment of SIP-protected binaries; the ppid
-walk covers those). `lane cancel` and a leader exit TERM the group plus every live member, rescanning each
+`/proc/<pid>/environ` on Linux; on macOS a second `ps -E` listing with each pid's plain command stripped as a
+prefix, so an argument that merely spells the marker never matches). macOS hides the environment of SIP-protected
+binaries, so one of those, detached by a short-lived leader and reparented before any scan saw it, cannot be found;
+the ppid walk covers it only if a scan observed it first. `lane cancel` and a leader exit TERM the group plus every live member, rescanning each
 iteration so a replacement spawned in a TERM handler is caught, wait the cancel grace period, KILL what remains for
 up to 3 s more, and log `descendants-reaped=<n>` to the admission log. A member whose pid now has a different start
 token is never signalled, and neither are the supervisor, its parent or processes outside the lease. If the table
 cannot be read, or members survive the KILL, the log also carries `descendants-reap-incomplete survivors=<pids>` and
-the lease is still released. A lease whose supervisor and group are gone but whose members are alive stays ORPHANED
-until `lane cancel` reaps them. The residual window between validating a pid and signalling it is accepted: Node has
+the lease is still released. A lease whose supervisor and group are gone but whose members are alive stays ORPHANED and heals itself on
+the admission polls: TERM on the first pass, KILL after the grace period, release once none are alive (or 30 s after
+the KILL, or 60 s after the TERM if the table is unreadable, with the incomplete-reap line); `lane cancel` does the same synchronously. The residual window between validating a pid and signalling it is accepted: Node has
 no pidfd signalling, and macOS pids climb to 99999 before wrapping.
 
 ## `lane capabilities --json`
