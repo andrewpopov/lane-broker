@@ -238,7 +238,9 @@ test('REAL process table: a nice-15 busy-loop child is preemptible for a nice-0 
   assert.ok(first.length > 5, `the real table has rows, got ${first.length}`);
   const mine = first.find((r) => r.pid === child.pid);
   assert.ok(mine, 'the child is in the real table');
-  assert.equal(mine.nice, 15);
+  // nice -n 15 adds to the runner's own niceness (a gate run inside a lane already sits at laneNice 10, and
+  // the kernel caps at 19/20), so compare against the child's ACTUAL nice, never the literal 15.
+  assert.ok(mine.nice > 0, `the child runs niced, got ${mine.nice}`);
   const prev = procSnapshot(first);
   const started = Date.now();
   let own = [];
@@ -249,7 +251,7 @@ test('REAL process table: a nice-15 busy-loop child is preemptible for a nice-0 
   if (!(own[0]?.deltaSec > 0)) return t.skip('host saturated: the nice-15 child never got CPU');
   const windowMs = Date.now() - started;
   assert.ok(preemptibleCores({ rows: own, windowMs, laneNice: 0, heldLeases: [] }) > 0, 'preemptible for a nice-0 lane');
-  assert.equal(preemptibleCores({ rows: own, windowMs, laneNice: 15, heldLeases: [] }), 0, 'a peer for a nice-15 lane');
+  assert.equal(preemptibleCores({ rows: own, windowMs, laneNice: mine.nice, heldLeases: [] }), 0, 'a peer for a lane at the same nice');
   assert.throws(() => preemptibleCores({ rows: readProcCpuRows(), windowMs, laneNice: 0 }), /withDeltas/);
 });
 
