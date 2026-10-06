@@ -15,7 +15,7 @@ describe('lane schema, roles and claim bookkeeping', { skip: PG_SKIP_REASON ?? f
     const db = await cluster.freshDb();
     const su = await cluster.client(db);
     await addGroup(su, { n: 1 });
-    assert.deepEqual(await applyMigrations(su), ['001-schema.sql', '002-claim.sql']);
+    assert.deepEqual((await applyMigrations(su)).applied, []);
     const { rows } = await su.query('SELECT count(*)::int AS n FROM lane.jobs');
     assert.equal(rows[0].n, 1);
   });

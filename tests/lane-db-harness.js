@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { LANE_SQL_DIR, connect, claimNext } from '../src/lane-db.js';
+import { connect, claimNext, applyMigrations } from '../src/lane-db.js';
 
 /**
  * Disposable Postgres for the lane-db tests. initdb into a temp dir, listen on a Unix socket only, in a SHORT
@@ -128,18 +128,17 @@ export class PgCluster {
     return name;
   }
 
-  /** Apply sql/lane in order, as `user`. `mutate` is [from, to]: it must match, so a canary can never silently no-op. */
+  /** Apply sql/lane as `user`. `mutate` is [from, to]: it must match, so a canary can never silently no-op. */
   async applySql(database, mutate, user = 'postgres') {
     const c = await this.client(database, user);
     let mutated = !mutate;
-    for (const file of fs.readdirSync(LANE_SQL_DIR).filter((f) => f.endsWith('.sql')).sort()) {
-      let text = fs.readFileSync(path.join(LANE_SQL_DIR, file), 'utf8');
-      if (mutate && text.includes(mutate[0])) {
-        text = text.replace(mutate[0], mutate[1]);
+    await applyMigrations(c, {
+      transform: (text) => {
+        if (!mutate || !text.includes(mutate[0])) return text;
         mutated = true;
-      }
-      await c.query(text);
-    }
+        return text.replace(mutate[0], mutate[1]);
+      },
+    });
     if (!mutated) throw new Error(`mutation target not found in sql/lane: ${mutate[0]}`);
     await c.end();
     this.clients.delete(c);

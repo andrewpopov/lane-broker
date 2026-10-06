@@ -173,6 +173,9 @@ describe('lane.claim_next ordering', { skip: PG_SKIP_REASON ?? false, timeout: 2
   async function lateCommitWinner(opts) {
     const { su } = await open(opts);
     await su.query("UPDATE lane.principals SET allowed_accounts = '{acct,acct2}' WHERE kind = 'submit'");
+    // A first-ever submit into a parent holds lane_sched until it commits (parent_for), which would serialise the two submits this
+    // test overlaps on purpose. Parents that already exist take no lock, as they do in steady state.
+    await su.query("SELECT lane.parent_for('acct', 'normal'), lane.parent_for('acct2', 'normal')");
     const submitJobs = JSON.stringify(jobsJson(1));
     const submit = (c, id, account) => c.query("SELECT lane.submit_group($1::uuid, 'single', $3, 'normal', '{}'::jsonb, 'x', $2::jsonb) AS id", [id, submitJobs, account]);
     const late = await cluster.client(su.database, roleNames.submit);

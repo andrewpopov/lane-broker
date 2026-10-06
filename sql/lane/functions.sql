@@ -1,12 +1,8 @@
--- BRAIN-400: claim path (spec rev11 sections 5.1-5.5). Lock order: (1) lane_sched, (3) hosts, (4) groups,
+-- BRAIN-400: claim path (spec rev11 sections 5.1-5.5), re-applied after the table migrations. Lock order: (1) lane_sched, (3) hosts, (4) groups,
 -- (5) jobs, then outbox rows. Candidates are chosen with plain reads; the winner is locked group-then-job and
 -- re-validated; a failed re-validation returns no claim. Every function derives the caller from session_user.
--- Signatures changed from rev6 (rooms, tiers, stage_open), so the old ones are dropped first.
-DROP FUNCTION IF EXISTS lane.claim_next(bigint, jsonb, bigint, text[], uuid);
-DROP FUNCTION IF EXISTS lane.job_eligible(lane.jobs, lane.hosts, jsonb, bigint, text[], timestamptz);
-DROP FUNCTION IF EXISTS lane.revalidate_claim(lane.jobs, uuid, lane.hosts, jsonb, bigint, text[], timestamptz);
-DROP FUNCTION IF EXISTS lane.stage_open(uuid, smallint);
-DROP FUNCTION IF EXISTS lane.submit_group(uuid, text, text, smallint, jsonb, text, jsonb);
+-- Re-applied after every migration run (src/lane-db.js). A function whose signature changes needs a DROP of the old one here.
+DROP FUNCTION IF EXISTS lane.refresh_rem_ref();
 
 CREATE OR REPLACE FUNCTION lane.require_generation(p_gen bigint) RETURNS void
 LANGUAGE plpgsql SET search_path = pg_catalog, lane, pg_temp AS $$
@@ -84,6 +80,19 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, lane, pg_temp AS $$
   SELECT p.running_cpu + lane.decayed(p, p_now) / 1800
 $$;
 
+-- Change the cores a parent holds, first settling what it held until now into decayed usage: the integral of the decayed
+-- contribution over the interval, rate x (H / ln 2) x (1 - 2^(-dt / H)) with H = 30 min, added after decaying the old total. The result
+-- does not depend on how often it is settled.
+CREATE OR REPLACE FUNCTION lane.add_running(p_parent uuid, p_delta real, p_now timestamptz) RETURNS void
+LANGUAGE sql SET search_path = pg_catalog, lane, pg_temp AS $$
+  UPDATE lane.sched_parents p
+     SET usage_decayed = lane.decayed(p, p_now)
+           + p.running_cpu::double precision * (1800 / ln(2::double precision))
+             * (1 - power(0.5, greatest(0, extract(epoch FROM p_now - coalesce(p.usage_at, p_now))) / 1800)),
+         usage_at = p_now, running_cpu = greatest(0, p.running_cpu + p_delta)
+   WHERE p.id = p_parent
+$$;
+
 -- R_p: the parent's remaining work in slot-minutes on this host, each (work class, bucket) with its own factor (5.7).
 CREATE OR REPLACE FUNCTION lane.rem_min(p lane.sched_parents, p_host text) RETURNS double precision
 LANGUAGE sql STABLE SET search_path = pg_catalog, lane, pg_temp AS $$
@@ -129,7 +138,7 @@ $$;
 
 -- Deadlines (5.8). The scheduler never reads deadline_at, only these two, by the runtime precedence: invalid -> nothing;
 -- missed -> urgency 75 and no EDF; valid -> urgency from slack against the frozen ETA (x 0.5 when low-confidence), EDF on.
--- A group with no forecast yet is treated as having nothing left to run.
+-- A group with no forecast yet is treated as having nothing left to run, and its urgency is undamped.
 CREATE OR REPLACE FUNCTION lane.deadline_eff(g lane.groups, p_now timestamptz) RETURNS timestamptz
 LANGUAGE sql STABLE SET search_path = pg_catalog, lane, pg_temp AS $$
   SELECT CASE WHEN cfg.deadlines_enabled AND g.deadline_valid AND g.deadline_at >= p_now THEN g.deadline_at END FROM lane.config cfg
@@ -140,6 +149,7 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, lane, pg_temp AS $$
   SELECT CASE
            WHEN NOT cfg.deadlines_enabled OR g.deadline_at IS NULL OR NOT g.deadline_valid THEN 0
            WHEN g.deadline_at < p_now THEN 75
+           WHEN e.group_id IS NOT NULL THEN coalesce(e.urgency, 0)         -- damped by record_eta (hysteresis, dwell, slew)
            ELSE (CASE WHEN coalesce(e.low_confidence, false) THEN 0.5 ELSE 1 END)
                 * 150 * least(1, greatest(0, 1 - x.slack / x.s0))
          END
@@ -148,6 +158,36 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, lane, pg_temp AS $$
    CROSS JOIN LATERAL (SELECT greatest(900, 0.5 * coalesce(e.eta_p90_s, 0)) AS s0,
                               extract(epoch FROM g.deadline_at - p_now) - coalesce(e.eta_p90_s, 0) AS slack) x
 $$;
+
+-- One forecast cycle for a group (the ETA timer's write, spec 5.8): stores the frozen forecast and the DAMPED urgency that
+-- lane.urgency reads. Hysteresis (on at slack < S0, off only at slack > 1.25 S0), a dwell of one on/off change per 3 cycles
+-- (so 7 changes in any 20 cycles), and a slew limit of 25 points per cycle. No scheduling lock: this is the outbox tier.
+CREATE OR REPLACE FUNCTION lane.record_eta(p_group uuid, p_eta_p90_s real, p_low_confidence boolean, p_now timestamptz) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane, pg_temp AS $$
+DECLARE
+  g lane.groups; e lane.group_eta; v_s0 double precision; v_slack double precision; v_raw double precision;
+  v_on boolean; v_cycle bigint; v_prev double precision;
+BEGIN
+  SELECT * INTO g FROM lane.groups WHERE id = p_group;
+  IF NOT FOUND OR g.deadline_at IS NULL THEN RETURN; END IF;
+  SELECT * INTO e FROM lane.group_eta WHERE group_id = p_group;
+  v_cycle := coalesce(e.cycle, 0) + 1;
+  v_prev := coalesce(e.urgency, 0);
+  v_s0 := greatest(900, 0.5 * p_eta_p90_s);
+  v_slack := extract(epoch FROM g.deadline_at - p_now) - p_eta_p90_s;
+  v_raw := (CASE WHEN p_low_confidence THEN 0.5 ELSE 1 END) * 150 * least(1, greatest(0, 1 - v_slack / v_s0));
+  v_on := CASE WHEN coalesce(e.boost_on, false) THEN NOT (v_slack > 1.25 * v_s0) ELSE v_slack < v_s0 END;
+  IF v_on <> coalesce(e.boost_on, false) AND e.last_flip_cycle IS NOT NULL AND v_cycle - e.last_flip_cycle < 3 THEN
+    v_on := e.boost_on;                                                         -- dwell: too soon to change state again
+  END IF;
+  INSERT INTO lane.group_eta (group_id, eta_p90_s, low_confidence, cycle, urgency, boost_on, last_flip_cycle)
+    VALUES (p_group, p_eta_p90_s, p_low_confidence, v_cycle,
+            v_prev + least(25, greatest(-25, CASE WHEN v_on THEN v_raw ELSE 0 END - v_prev)),
+            v_on, CASE WHEN v_on <> coalesce(e.boost_on, false) THEN v_cycle ELSE e.last_flip_cycle END)
+    ON CONFLICT (group_id) DO UPDATE
+      SET eta_p90_s = EXCLUDED.eta_p90_s, low_confidence = EXCLUDED.low_confidence, cycle = EXCLUDED.cycle,
+          urgency = EXCLUDED.urgency, boost_on = EXCLUDED.boost_on, last_flip_cycle = EXCLUDED.last_flip_cycle;
+END $$;
 
 -- Floors (5.2). The CPU reserved against a candidate of work class p_class and rank p_rank: each OTHER work class w with waiting
 -- work of rank rho_w >= p_rank reserves its unmet floor; the candidate's OWN class reserves only against lower rank.
@@ -251,17 +291,21 @@ BEGIN
            (c.p_overdue AND NOT j.exclusive) AS overdue,                       -- A1: an exclusive job is never promoted by the overdue rule
            j.floor_room, c.score_base + max(c.urg_g) OVER (PARTITION BY c.pid) AS score   -- urg_p = max over the parent's fitting groups
       FROM cand c
-      JOIN LATERAL (SELECT j.id, j.est_p50_s, j.seq, j.exclusive,
-                           lane.job_floor_room(c.p_overdue, j.exclusive, p_free, c.floor_room_held) AS floor_room
-                      FROM lane.jobs j
-                     WHERE j.group_id = c.gid AND j.stage = c.open_stage AND j.class = c.class AND j.state = 'queued'
-                       AND lane.job_eligible(j, v_host, c.open_stage, p_held_keys, v_now)
-                       AND j.cpu_min <= least(lane.job_floor_room(c.p_overdue, j.exclusive, p_free, c.floor_room_held), c.cap_room)
-                       AND j.mem_bytes <= p_mem
-                     ORDER BY j.est_p50_s DESC, j.seq LIMIT 1) j ON true),
+      JOIN LATERAL (SELECT x.*                   -- one probe per kind (ordinary, exclusive), then the choice: A1 must never hide an overdue ordinary job
+                      FROM unnest(ARRAY[false, true]) AS ex(v)
+                     CROSS JOIN LATERAL (SELECT j.id, j.est_p50_s, j.seq, j.exclusive,
+                                                lane.job_floor_room(c.p_overdue, j.exclusive, p_free, c.floor_room_held) AS floor_room
+                                           FROM lane.jobs j
+                                          WHERE j.group_id = c.gid AND j.stage = c.open_stage AND j.class = c.class AND j.state = 'queued'
+                                            AND j.exclusive = ex.v
+                                            AND lane.job_eligible(j, v_host, c.open_stage, p_held_keys, v_now)
+                                            AND j.cpu_min <= least(lane.job_floor_room(c.p_overdue, j.exclusive, p_free, c.floor_room_held), c.cap_room)
+                                            AND j.mem_bytes <= p_mem
+                                          ORDER BY j.est_p50_s DESC, j.seq LIMIT 1) x
+                     ORDER BY (c.p_overdue AND x.exclusive), x.est_p50_s DESC, x.seq LIMIT 1) j ON true),
   rep AS (                        -- ONE representative group per (parent, work class): sibling order only (5.3)
     SELECT DISTINCT ON (pid, class) * FROM fit
-     ORDER BY pid, class, g_overdue DESC, CASE WHEN g_overdue THEN g_since END ASC, urg_g DESC, g_since ASC,
+     ORDER BY pid, class, (p_overdue AND exclusive), g_overdue DESC, CASE WHEN g_overdue THEN g_since END ASC, urg_g DESC, g_since ASC,
               dl NULLS LAST, g_last NULLS FIRST, est_p50_s DESC, seq, gid),
   floored AS (
     SELECT rep.*, min(vtime) FILTER (WHERE was_active) OVER () AS active_floor, array_agg(class) OVER () AS present
@@ -298,11 +342,9 @@ BEGIN
       SELECT DISTINCT k, v_job.id, v_job.epoch, v_host.host_id FROM unnest(v_job.conflict_keys) AS k;
   END IF;
   UPDATE lane.groups SET last_claim_at = v_now WHERE id = v_pick.gid;
-  -- A parent's turn is claimed once, whichever sibling was served: it takes the service stamp and the running cores, and
-  -- first settles the cores it already held into decayed usage.
-  UPDATE lane.sched_parents p SET last_claim_at = v_now, running_cpu = p.running_cpu + v_grant, usage_at = v_now,
-         usage_decayed = lane.decayed(p, v_now) + p.running_cpu * greatest(0, extract(epoch FROM v_now - coalesce(p.usage_at, v_now)))
-   WHERE p.id = v_pick.pid;
+  -- A parent's turn is claimed once, whichever sibling was served: it takes the service stamp and the running cores.
+  UPDATE lane.sched_parents SET last_claim_at = v_now WHERE id = v_pick.pid;
+  PERFORM lane.add_running(v_pick.pid, v_grant, v_now);
   -- Activity bookkeeping for the next claim: classes with eligible work now are active, the rest are idle. A class
   -- that was idle is raised to the active floor before this grant is charged to it. Same lock as the claim, so no race.
   INSERT INTO lane.class_vtime AS v (host_id, class, vtime, active)
@@ -333,13 +375,20 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, lane, pg_temp AS $$
                     AND (pc.requires_capability IS NULL OR coalesce((to_jsonb(me) ->> pc.requires_capability)::boolean, false)))
 $$;
 
--- The scheduling parent for (account, class): derived here, never client-chosen. DO NOTHING takes no lock on an existing row.
+-- The scheduling parent for (account, class): derived here, never client-chosen. Creating one takes lane_sched FIRST: an
+-- uncommitted parent row blocks any scheduler-locked function that wants the same (account, class), and that function would then
+-- wait inside lane_sched for a submitter who is itself about to ask for it (a deadlock). Only the first-ever submit for a pair
+-- pays this; every later one finds the row and takes no lock.
 CREATE OR REPLACE FUNCTION lane.parent_for(p_account text, p_class text) RETURNS uuid
 LANGUAGE plpgsql SET search_path = pg_catalog, lane, pg_temp AS $$
 DECLARE v_pid uuid;
 BEGIN
-  INSERT INTO lane.sched_parents (account, prio_class) VALUES (p_account, p_class) ON CONFLICT (account, prio_class) DO NOTHING;
   SELECT id INTO v_pid FROM lane.sched_parents WHERE account = p_account AND prio_class = p_class;
+  IF v_pid IS NULL THEN
+    PERFORM pg_advisory_xact_lock(hashtext('lane_sched'));                       -- (1)
+    INSERT INTO lane.sched_parents (account, prio_class) VALUES (p_account, p_class) ON CONFLICT (account, prio_class) DO NOTHING;
+    SELECT id INTO v_pid FROM lane.sched_parents WHERE account = p_account AND prio_class = p_class;
+  END IF;
   RETURN v_pid;
 END $$;
 
@@ -352,7 +401,14 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, lane, pg_temp AS $$
                                                     * coalesce((SELECT min(factor) FROM lane.host_factors), 1))
 $$;
 
--- p_jobs: JSON array of {idem_key, stage, class, template_id, template_version, params, est_p50_s, est_p90_s, exclusive, cpu_req,
+-- The server's estimate for a job with no usable history (spec 5.7 cold start: 300 s test, 900 s sim). The seam for the real
+-- estimator (BRAIN-408): a submitter's est_* values are only hints, never trusted below this.
+CREATE OR REPLACE FUNCTION lane.class_default_est(p_class text) RETURNS real
+LANGUAGE sql IMMUTABLE SET search_path = pg_catalog, lane, pg_temp AS $$
+  SELECT CASE p_class WHEN 'sim' THEN 900 ELSE 300 END::real
+$$;
+
+-- p_jobs: JSON array of {idem_key, stage, class, template_id, template_version, params, est_p50_s, est_p90_s (hints), exclusive, max_ms, cpu_req,
 -- cpu_min, mem_bytes, conflict_keys, conflict_scope, dup_safe, host_pin, host_tags_req, max_infra, max_work}.
 -- No scheduling lock: the group is inserted `open` and only activate_group makes it visible.
 CREATE OR REPLACE FUNCTION lane.submit_group(p_submit_uuid uuid, p_kind text, p_account text, p_class text,
@@ -378,19 +434,21 @@ BEGIN
   END IF;
   INSERT INTO lane.jobs (group_id, seq, idem_key, stage, class, template_id, template_version, params, est_p50_s, est_p90_s, est_source,
                          exclusive, cpu_req, cpu_min, mem_bytes, conflict_keys, conflict_scope, dup_safe, host_pin,
-                         host_tags_req, max_infra, max_work)
+                         host_tags_req, max_infra, max_work, max_ms)
     SELECT v_gid, r.ord, r.idem_key, coalesce(r.stage, 0), r.class, r.template_id, r.template_version,
-           coalesce(r.params, '{}'), coalesce(r.est_p50_s, 300), coalesce(r.est_p90_s, 2 * coalesce(r.est_p50_s, 300)),
-           CASE WHEN r.est_p50_s IS NULL THEN 'default' ELSE 'hint' END,
+           coalesce(r.params, '{}'), e.p50, greatest(coalesce(r.est_p90_s, 0), 2 * e.p50),
+           CASE WHEN coalesce(r.est_p50_s, 0) >= d.v THEN 'hint' ELSE 'default' END,
            coalesce(r.exclusive, false),
            r.cpu_req, coalesce(r.cpu_min, r.cpu_req), coalesce(r.mem_bytes, 0),
            coalesce(r.conflict_keys, '{}'), coalesce(r.conflict_scope, 'host'), coalesce(r.dup_safe, false), r.host_pin,
-           coalesce(r.host_tags_req, '{}'), coalesce(r.max_infra, 3), coalesce(r.max_work, 2)
+           coalesce(r.host_tags_req, '{}'), coalesce(r.max_infra, 3), coalesce(r.max_work, 2), r.max_ms
       FROM (SELECT x.*, row_number() OVER () AS ord
               FROM jsonb_to_recordset(p_jobs) AS x(idem_key text, stage smallint, class text, template_id text,
                    template_version int, params jsonb, est_p50_s real, est_p90_s real, exclusive boolean, cpu_req real, cpu_min real, mem_bytes bigint,
                    conflict_keys text[], conflict_scope text, dup_safe boolean, host_pin text, host_tags_req text[],
-                   max_infra smallint, max_work smallint)) r;
+                   max_infra smallint, max_work smallint, max_ms int)) r
+      CROSS JOIN LATERAL (SELECT lane.class_default_est(r.class) AS v) d
+      CROSS JOIN LATERAL (SELECT greatest(coalesce(r.est_p50_s, 0), d.v) AS p50) e;
   UPDATE lane.groups SET deadline_valid = lane.judge_deadline(v_gid, p_deadline, v_me.can_deadline, clock_timestamp()) WHERE id = v_gid;
   RETURN v_gid;
 END $$;
@@ -415,16 +473,17 @@ BEGIN
   IF v_owner <> session_user AND NOT EXISTS (SELECT 1 FROM lane.principals WHERE login_role = session_user AND kind = 'admin') THEN
     RAISE EXCEPTION 'not the group owner' USING ERRCODE = '42501';
   END IF;
-  PERFORM lane.start_parent_clock(v_pid, p_group, v_now);                      -- before the group turns active, so it is not its own sibling
   UPDATE lane.groups SET state = 'active', aging_anchor = v_now WHERE id = p_group AND state = 'open';   -- (4)
-  RETURN FOUND;
+  IF NOT FOUND THEN RETURN false; END IF;                                      -- a retry is not an activation: no clock moves
+  PERFORM lane.start_parent_clock(v_pid, p_group, v_now);
+  RETURN true;
 END $$;
 
 -- `lane reclass`: the only way to a higher class. The OWNER's capability decides (an admin cannot escalate), the group is
 -- re-parented and its deadline re-judged.
 CREATE OR REPLACE FUNCTION lane.reclass(p_group uuid, p_class text) RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane, pg_temp AS $$
-DECLARE v_now timestamptz; g lane.groups; v_owner lane.principals; v_pid uuid;
+DECLARE v_now timestamptz; g lane.groups; v_owner lane.principals; v_pid uuid; v_held real;
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtext('lane_sched'));                       -- (1)
   v_now := clock_timestamp();
@@ -438,22 +497,37 @@ BEGIN
     RAISE EXCEPTION 'class % not allowed for %', p_class, g.owner USING ERRCODE = '42501';
   END IF;
   v_pid := lane.parent_for(g.account, p_class);
-  IF g.state = 'active' THEN PERFORM lane.start_parent_clock(v_pid, p_group, v_now); END IF;
   UPDATE lane.groups SET prio_class = p_class, parent_id = v_pid,
          deadline_valid = lane.judge_deadline(p_group, g.deadline_at, v_owner.can_deadline, v_now)
    WHERE id = p_group;                                                          -- (4)
+  IF v_pid <> g.parent_id THEN                                                  -- a real parent change; a same-class reclass moves nothing
+    IF g.state = 'active' THEN PERFORM lane.start_parent_clock(v_pid, p_group, v_now); END IF;
+    -- The cores the group holds right now follow it, so the new parent's effective rank sees them. Decayed usage is per parent
+    -- and not attributable to one group, so it stays where it was earned.
+    SELECT coalesce(sum(grant_cpu), 0) INTO v_held FROM lane.jobs WHERE group_id = p_group AND state IN ('claimed','preparing','running');
+    PERFORM lane.add_running(g.parent_id, -v_held, v_now);
+    PERFORM lane.add_running(v_pid, v_held, v_now);
+  END IF;
   RETURN true;
 END $$;
 
 -- The 15 s timer's job: remaining work of each parent by (work class, ref-s bucket), from the unfinished jobs of its active groups.
-CREATE OR REPLACE FUNCTION lane.refresh_rem_ref() RETURNS void
+CREATE OR REPLACE FUNCTION lane.refresh_rem_ref(p_now timestamptz DEFAULT clock_timestamp()) RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane, pg_temp AS $$
 BEGIN
   PERFORM pg_advisory_xact_lock(hashtext('lane_sched'));                       -- (1)
   WITH b AS (
-    SELECT g.parent_id AS pid, j.class,
-           CASE WHEN j.est_p50_s < 120 THEN 'short' WHEN j.est_p50_s <= 600 THEN 'mid' ELSE 'long' END AS bucket, sum(j.est_p50_s) AS s
+    SELECT g.parent_id AS pid, j.class, w.bucket, sum(r.rem) AS s
       FROM lane.jobs j JOIN lane.groups g ON g.id = j.group_id
+     CROSS JOIN LATERAL (SELECT CASE WHEN j.est_p50_s < 120 THEN 'short' WHEN j.est_p50_s <= 600 THEN 'mid' ELSE 'long' END AS bucket) w
+     CROSS JOIN LATERAL (SELECT extract(epoch FROM p_now - coalesce(j.started_at, p_now)) AS wall,
+                                coalesce((SELECT f.factor FROM lane.host_factors f WHERE f.host_id = j.host AND f.class = j.class AND f.bucket = w.bucket), 1) AS factor) t
+     -- Remaining work (5.7): a job not yet running counts in full; a running one counts what is left of its p50, or, past its p90,
+     -- half its elapsed reference time capped by what max_ms still allows (max_ms is milliseconds, converted once).
+     CROSS JOIN LATERAL (SELECT CASE WHEN j.state <> 'running' THEN j.est_p50_s::double precision
+                                     WHEN t.wall / t.factor > j.est_p90_s
+                                       THEN least(0.5 * t.wall / t.factor, greatest(0, (coalesce(j.max_ms::double precision / 1000, 'Infinity') - t.wall) / t.factor))
+                                     ELSE greatest(0, j.est_p50_s - t.wall / t.factor) END AS rem) r
      WHERE g.state = 'active' AND j.state IN ('queued','claimed','preparing','running')
      GROUP BY 1, 2, 3),
   c AS (SELECT pid, class, jsonb_object_agg(bucket, s) AS v FROM b GROUP BY pid, class),
@@ -487,4 +561,5 @@ GRANT EXECUTE ON FUNCTION lane.claim_next(bigint, real, jsonb, text[], bigint, t
 GRANT EXECUTE ON FUNCTION lane.submit_group(uuid, text, text, text, jsonb, text, jsonb, timestamptz) TO lane_submit, lane_admin;
 GRANT EXECUTE ON FUNCTION lane.activate_group(uuid) TO lane_submit, lane_admin;
 GRANT EXECUTE ON FUNCTION lane.reclass(uuid, text) TO lane_submit, lane_admin;
-GRANT EXECUTE ON FUNCTION lane.refresh_rem_ref() TO lane_admin;
+GRANT EXECUTE ON FUNCTION lane.refresh_rem_ref(timestamptz) TO lane_admin;
+GRANT EXECUTE ON FUNCTION lane.record_eta(uuid, real, boolean, timestamptz) TO lane_admin;

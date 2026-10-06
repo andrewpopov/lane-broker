@@ -41,7 +41,7 @@ describe('applying sql/lane as a non-superuser database owner', { skip: PG_SKIP_
   test('a CREATEROLE owner creates the roles, hands objects to lane_definer, and the agent can claim', async () => {
     const db = await ownedDb('lane_owner', 'CREATEROLE');
     const owner = await cluster.client(db, 'lane_owner');
-    assert.deepEqual(await applyMigrations(owner), ['001-schema.sql', '002-claim.sql']);
+    assert.equal((await applyMigrations(owner)).applied.length, 2);
     const su = await notSuper(db, 'lane_owner');
     await assertDefinerOwnsEverything(su);
     await cluster.seed(db);
@@ -56,8 +56,8 @@ describe('applying sql/lane as a non-superuser database owner', { skip: PG_SKIP_
     const db = await ownedDb('lane_owner_plain', 'NOCREATEROLE');
     await (await cluster.admin()).query('GRANT lane_definer TO lane_owner_plain WITH SET TRUE');
     const owner = await cluster.client(db, 'lane_owner_plain');
-    assert.deepEqual(await applyMigrations(owner), ['001-schema.sql', '002-claim.sql']);
-    assert.deepEqual(await applyMigrations(owner), ['001-schema.sql', '002-claim.sql']);
+    assert.equal((await applyMigrations(owner)).applied.length, 2);
+    assert.deepEqual((await applyMigrations(owner)).applied, []);
     await assertDefinerOwnsEverything(await notSuper(db, 'lane_owner_plain'));
   });
 });

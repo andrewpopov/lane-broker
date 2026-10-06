@@ -1,6 +1,8 @@
--- BRAIN-400: the `lane` schema for the unified work queue (spec rev11 sections 3, 4.2, 5, 11.1).
--- Idempotent: every statement is safe to re-apply. Functions live in 002-claim.sql, which also hands
--- ownership to lane_definer and sets every grant, so a partial apply never leaves a role with table access.
+-- BRAIN-400: the `lane` schema for the unified work queue, baseline v1 (spec rev11 sections 3, 4.2, 5, 11.1).
+-- A versioned migration: applyMigrations (src/lane-db.js) runs it once, in its own transaction, and records it in
+-- lane.schema_version. A schema change is a NEW numbered file in this directory, never an edit to an applied one.
+-- Functions live in ../functions.sql, which is re-applied after every run and also hands ownership to lane_definer
+-- and sets every grant, so a partial apply never leaves a role with table access.
 
 -- Roles are cluster-level. lane_definer owns the schema objects and every SECURITY DEFINER function; the
 -- four group roles carry grants, and per-host / per-identity login roles are made members of them.
@@ -22,6 +24,8 @@ BEGIN
 END $$;
 
 CREATE SCHEMA IF NOT EXISTS lane;
+
+CREATE TABLE lane.schema_version (version int PRIMARY KEY CHECK (version > 0), applied_at timestamptz NOT NULL DEFAULT now());
 
 CREATE TABLE IF NOT EXISTS lane.cluster (
   singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
@@ -86,7 +90,6 @@ CREATE TABLE IF NOT EXISTS lane.class_vtime (
   vtime double precision NOT NULL DEFAULT 0,
   active boolean NOT NULL DEFAULT false,
   PRIMARY KEY (host_id, class));
-ALTER TABLE lane.class_vtime ADD COLUMN IF NOT EXISTS active boolean NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS lane.command_templates (
   template_id text NOT NULL, version int NOT NULL,
