@@ -546,7 +546,7 @@ test('remote run: the runner-side grant reaches BOTH the runner history and the 
   assert.equal(runnerRow.grantedCpuCores, 2, 'runner history');
 });
 
-test('non-elastic: no history row or result carries a grant field', async () => {
+test('non-elastic: the result carries no grant field and the history row records the declaration as the grant (BRAIN-425)', async () => {
   const { base, home, state, env } = freshEnv();
   writeGlobalConfig(home, { version: 1, capacity: 100, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
   const repoDir = path.join(base, 'repo');
@@ -554,7 +554,7 @@ test('non-elastic: no history row or result carries a grant field', async () => 
   const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'true'], { env, cwd: repoDir });
   assert.equal(result.code, 0, result.stderr);
   const row = JSON.parse(fs.readFileSync(paths(state).history, 'utf8').trim().split('\n').at(-1));
-  assert.equal('grantedCpuCores' in row, false);
+  assert.equal(row.grantedCpuCores, 2, 'a non-elastic lane is charged exactly its declaration');
   assert.deepEqual(row.resources.cpuCores, 2);
   const res = JSON.parse(fs.readFileSync(path.join(paths(state).results, `${row.id}.json`), 'utf8'));
   assert.equal('grantedCpuCores' in res, false);

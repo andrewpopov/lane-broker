@@ -716,7 +716,9 @@ export async function dispatchRemote(opts) {
   // sent, so the runner cannot plausibly hold a matching result yet -- go
   // straight to unconfirmed instead of burning up to resultAttempts *
   // resultDeadlineMs retrying a fetch that was never going to bind.
+  const uploadStartedAt = Date.now();
   const pipeResult = await pipeSnapshot(child, snapshotStream, transferDeadlineMs, abortSignal);
+  const uploadMs = Date.now() - uploadStartedAt;
   // The ssh session IS the remote job; wait for it to close (unbounded here
   // -- an outer --timeout is the caller's concern), killable by abort.
   await waitClosed(child, abortSignal);
@@ -796,10 +798,11 @@ export async function dispatchRemote(opts) {
   if (classification.outcome === 'unconfirmed') {
     return { outcome: 'unconfirmed', reason: classification.reason };
   }
-  const confirmed = { outcome: 'confirmed', result: record, exitCode: classification.exitCode, phase: classification.phase };
+  const confirmed = { outcome: 'confirmed', result: record, exitCode: classification.exitCode, phase: classification.phase, uploadMs };
   // BRAIN-398: only a runner that stored files for this result is asked for them; a failure here is reported, never
   // allowed to change the confirmed outcome.
   if (header.remoteArtifacts && record.artifacts?.ok === true && record.artifacts.count > 0) {
+    const artifactFetchStartedAt = Date.now();
     confirmed.artifacts = await fetchRemoteArtifacts(runner, ticketId, {
       patterns: remoteArtifacts,
       limits: artifactLimits ?? artifactLimitsOf(DEFAULT_GLOBAL_CONFIG),
@@ -807,6 +810,7 @@ export async function dispatchRemote(opts) {
       deadlineMs: deadlines.artifactsMs ?? 2 * 60_000,
       env,
     });
+    confirmed.artifactReturnMs = Date.now() - artifactFetchStartedAt;
   }
   return confirmed;
 }

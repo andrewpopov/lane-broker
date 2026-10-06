@@ -104,7 +104,7 @@ async function cancelAttempt(root, id, attempt) {
   const resultPath = path.join(paths(root).results, `${id}.json`);
   const published = await publishTerminal(root, id, attempt.generation, () => {
     atomicWriteJson(resultPath, remoteCancelledResult(id, attempt.startedAt));
-    appendHistory(root, { id, cancelled: true, endedAt: Date.now(), executor: 'remote', runner: attempt.runner });
+    appendHistory(root, { id, exit: 130, signal: null, cancelled: true, endedAt: Date.now(), executor: 'remote', runner: attempt.runner });
   });
   if (!published.ok) {
     process.stderr.write(`lane cancel: could not reconcile orphaned remote attempt ${id}\n`);
@@ -202,7 +202,7 @@ export async function cancelCommand(id) {
   if (attempt) {
     const published = await publishTerminal(root, id, attempt.generation, () => {
       atomicWriteJson(lease.resultPath, { ...remoteCancelledResult(id, attempt.startedAt), executor: attempt.executor });
-      appendHistory(root, { id, key: lease.key, cancelled: true, endedAt: Date.now(), executor: attempt.executor });
+      appendHistory(root, { id, key: lease.key, exit: 130, signal: null, cancelled: true, endedAt: Date.now(), executor: attempt.executor });
     });
     if (!published.ok) {
       process.stderr.write(`lane cancel: could not reconcile orphaned lease ${id} against its own attempt record\n`);
@@ -212,7 +212,7 @@ export async function cancelCommand(id) {
     // Plain lease-only ticket (no attempt record) -- unchanged behaviour.
     const endedAt = Date.now();
     atomicWriteJson(lease.resultPath, { id, exit: null, signal: 'SIGKILL', startedAt: null, endedAt, waitedMs: null, cancelled: true });
-    appendHistory(root, { id, key: lease.key, cancelled: true, endedAt, executor: 'local' });
+    appendHistory(root, { id, key: lease.key, exit: null, signal: 'SIGKILL', cancelled: true, endedAt, executor: 'local' });
   }
   removeLease(root, id);
   touchSimArmFor(root, lease);

@@ -401,6 +401,10 @@ export async function remotePipelineCommand(ticketDir) {
 
   // A materialized tree is leased until the whole pipeline ends, so eviction never takes a key a running lane holds.
   const releaseLeases = [];
+  // BRAIN-425: wall time of the setup stage (deps + setup) and of the command, written to `phases.json` for `remote-exec`
+  const phasesMs = {};
+  const pipelineStart = Date.now();
+  let commandStart = null;
   try {
     if (remoteDeps.length > 0) {
       writePhase(ticketDir, 'deps');
@@ -417,11 +421,16 @@ export async function remotePipelineCommand(ticketDir) {
       }
     }
 
+    commandStart = Date.now();
+    phasesMs.setupMs = commandStart - pipelineStart;
     writePhase(ticketDir, 'command');
     const cmdCwd = path.join(workDir, relCwd || '');
     const code = await runPhaseCommand(argv, cmdCwd, process.env);
     return { exitCode: code };
   } finally {
+    if (commandStart === null) phasesMs.setupMs = Date.now() - pipelineStart;
+    else phasesMs.commandMs = Date.now() - commandStart;
+    atomicWriteJson(path.join(ticketDir, 'phases.json'), phasesMs);
     for (const release of releaseLeases) {
       try {
         await release();

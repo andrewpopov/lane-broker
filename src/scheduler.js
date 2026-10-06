@@ -356,7 +356,7 @@ export function reapStale(root, keepTicketId) {
       // trace of the drop (BRAIN-202). Same row conventions as cancel.js.
       if (dequeueSync(root, t.id)) {
         touchSimArmFor(root, t);
-        appendHistory(root, { id: t.id, key: t.key, dequeuedDeadSupervisor: true, error: 'supervisor died while queued', supervisorPid: t.supervisorPid, endedAt: Date.now(), executor: 'local' });
+        appendHistory(root, { id: t.id, key: t.key, dequeuedDeadSupervisor: true, exit: null, signal: null, error: 'supervisor died while queued', supervisorPid: t.supervisorPid, endedAt: Date.now(), executor: 'local' });
       }
     }
   }

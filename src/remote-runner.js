@@ -19,7 +19,7 @@ import { collectStatus } from './status.js';
 import { readLease, isSupervisorAlive } from './lease.js';
 import { readAttempt } from './attempts.js';
 import { listQueue } from './scheduler.js';
-import { sanitizeObservedCpu, sanitizeRssPeak } from './observed.js';
+import { sanitizeObservedCpu, sanitizeRssPeak, sanitizeCpuSeconds } from './observed.js';
 
 // BRAIN-320 S1b (1b): the absolute path to `bin/lane.js`, so a protocol-2
 // pipeline's argv (`[node, lane.js, 'remote-pipeline', ticketDir]`) is
@@ -205,7 +205,14 @@ function readDeps(ticketDir) {
   return readJsonSafe(path.join(ticketDir, 'deps.json')) ?? undefined;
 }
 
-function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, runMs, grantedCpuCores, observedCpu, observedRssPeakBytes, artifacts }) {
+/** BRAIN-425: the runner-side phase timings: the pipeline's `phases.json` (setup, command) plus what remote-exec measured itself. */
+function readPhasesMs(ticketDir, own) {
+  const fromPipeline = readJsonSafe(path.join(ticketDir, 'phases.json')) ?? {};
+  const merged = { ...own, ...fromPipeline };
+  return Object.keys(merged).length > 0 ? merged : undefined;
+}
+
+function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, runMs, grantedCpuCores, observedCpu, observedRssPeakBytes, cpuSeconds, phasesMs, artifacts }) {
   const isProtocol2 = header.protocol === 2;
   return {
     protocol: isProtocol2 ? 2 : 1,
@@ -233,6 +240,9 @@ function buildResult(header, ticketDir, { kind, exit = null, signal = null, remo
     // BRAIN-361: additive; what the lane actually used on the runner, relayed to the submitter's history
     observedCpu,
     observedRssPeakBytes,
+    // BRAIN-425: additive; CPU seconds and phase wall times measured on the runner
+    cpuSeconds,
+    phasesMs,
     // BRAIN-398: additive summary of the stored artifacts; the bytes travel separately (`lane remote-artifacts`)
     artifacts,
   };
@@ -388,6 +398,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   process.env.TMPDIR = tmpDir;
   process.env.TMP = tmpDir;
   process.env.TEMP = tmpDir;
+  const snapshotStartedAt = Date.now();
   const extractResult = await extractFrames(reader, workDir, header.manifest, {
     maxFileBytes: MAX_FILE_BYTES,
     maxTotalBytes: MAX_TOTAL_BYTES,
@@ -443,6 +454,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     }
   }
 
+  const ownPhasesMs = { snapshotMs: Date.now() - snapshotStartedAt };
   const cancelledMarker = path.join(ticketDir, 'cancelled');
   const remoteLaneId = crypto.randomUUID();
 
@@ -561,6 +573,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   let grantedCpuCores;
   let observedCpu;
   let observedRssPeakBytes;
+  let cpuSeconds;
   // A user cancel that landed after the expiry still wins (kind cancelled below).
   if (structured && structured.reason === 'queue-timeout' && !cancelled) {
     // BRAIN-320 S1d: the LOCAL broker's own scheduler expired this ticket
@@ -577,6 +590,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     if (Number.isFinite(structured.grantedCpuCores)) grantedCpuCores = structured.grantedCpuCores;
     observedCpu = sanitizeObservedCpu(structured.observedCpu) ?? undefined;
     observedRssPeakBytes = sanitizeRssPeak(structured.observedRssPeakBytes);
+    cpuSeconds = sanitizeCpuSeconds(structured.cpuSeconds);
     if (Number.isFinite(structured.startedAt) && Number.isFinite(structured.endedAt)) {
       runMs = Math.max(0, structured.endedAt - structured.startedAt);
     }
@@ -595,9 +609,13 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     kind = 'unfinished';
   }
 
+  // a protocol-1 run has no pipeline to time its phases: the whole run is the command
+  if (header.protocol !== 2 && runMs !== undefined) ownPhasesMs.commandMs = runMs;
+  const artifactsStartedAt = Date.now();
   const artifacts = storeArtifacts(header, ticketDir, workDir, { kind, exit, signal });
+  if (artifacts !== undefined) ownPhasesMs.artifactsMs = Date.now() - artifactsStartedAt;
   try {
-    writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, runMs, grantedCpuCores, observedCpu, observedRssPeakBytes, artifacts }));
+    writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, runMs, grantedCpuCores, observedCpu, observedRssPeakBytes, cpuSeconds, phasesMs: readPhasesMs(ticketDir, ownPhasesMs), artifacts }));
   } finally {
     cleanupWork(workDir, tmpDir);
   }

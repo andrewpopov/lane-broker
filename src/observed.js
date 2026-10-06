@@ -56,6 +56,24 @@ export function sanitizeObservedCpu(o) {
   return { peak: o.peak, mean: o.mean, samples: o.samples };
 }
 
+/**
+ * BRAIN-425: CPU seconds the lease's process tree consumed, ESTIMATED by integrating the heartbeat samples
+ * (core-ms area) and closing both ends: the first reading is held back to `startedAt` and the last forward to
+ * `endedAt`. Not exact rusage: the supervisor cannot read reaped grandchildren's rusage, and `ps` pcpu is itself
+ * a decayed average. Undefined with no valid observation (never a fabricated zero).
+ */
+export function integratedCpuSeconds(stats, startedAt, endedAt) {
+  if (!validStats(stats)) return undefined;
+  const firstAt = stats.lastAt - stats.spanMs;
+  const firstCores = stats.spanMs > 0 ? stats.area / stats.spanMs : stats.lastCores;
+  const head = isNum(startedAt) && startedAt < firstAt ? firstCores * (firstAt - startedAt) : 0;
+  const tail = isNum(endedAt) && endedAt > stats.lastAt ? stats.lastCores * (endedAt - stats.lastAt) : 0;
+  return round3((stats.area + head + tail) / 1000);
+}
+
+/** A relayed CPU-seconds figure, or undefined when it is not a finite non-negative number. */
+export const sanitizeCpuSeconds = (v) => (isNum(v) && v >= 0 ? v : undefined);
+
 /** A relayed RSS peak, or undefined when it is not a finite number. */
 export const sanitizeRssPeak = (v) => (isNum(v) ? v : undefined);
 
