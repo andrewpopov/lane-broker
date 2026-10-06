@@ -712,6 +712,21 @@ test('BRAIN-362: an elastic ticket whose floor no longer fits floor(budget) is d
   if (HOST_CORES >= 4) assert.equal(grown.started, true, 'once the budget holds the floor again it is admitted');
 });
 
+test('BRAIN-362: a below-floor elastic head does not block backfill', async () => {
+  const { state } = freshEnv();
+  const cfg = tightCfg();
+  const head = ticket('head', { key: 'r:head', resources: { cpuCores: 16, minCpuCores: 3.2, memoryBytes: GIB } }); // budget 3: floor 3 < ceil(3.2) = 4
+  const small = ticket('small', { key: 'r:small', resources: { cpuCores: 1, memoryBytes: GIB } });
+  await enqueue(state, head, cfg);
+  await enqueue(state, small, cfg);
+  const denied = await tryStart(state, head, cfg, undefined, hostSampler(0), undefined, memory());
+  assert.equal(denied.reason, 'elastic-below-floor');
+  const result = await tryStart(state, small, cfg, undefined, hostSampler(0), undefined, memory());
+  assert.equal(result.started, true, `the small ticket backfills past the futile head, got ${result.reason}`);
+  const queued = listQueueCapped(state, cfg).map((t) => t.id);
+  assert.deepEqual(queued, ['head'], 'the head is still queued');
+});
+
 test('BRAIN-362: the queue keeps the declared claim; the cap follows the current budget for the queue view and admission alike', async () => {
   const { state } = freshEnv();
   const t = hugeElastic('grow');

@@ -1262,8 +1262,10 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // BRAIN-362: before any exemption (cold sample, idle overshoot) can admit it at its full claim, an elastic ticket whose
     // floor no longer fits the current budget keeps waiting: the budget may grow back.
     if (elasticBelowFloor(ticket, cfg)) {
-      if (ticket.id === headTicket.id) markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
-      dropPickRecord();
+      // The head cannot start until the budget itself changes, whatever leases are held: record it futile so backfill can pass it.
+      if (ticket.id === headTicket.id) {
+        recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState, false, { cause: 'elastic-below-floor', headCpu: ticketCpuFloor(headTicket, cfg), sampledAt: now });
+      } else dropPickRecord();
       return {
         result: { started: false, reason: 'elastic-below-floor' },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'elastic-below-floor' },
