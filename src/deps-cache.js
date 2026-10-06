@@ -553,21 +553,26 @@ export function publishToStore(cacheRoot, key, srcTree, relocation = null) {
     let bytes = 0;
     const pairs = relocation ? placeholderPairs(relocation) : [];
     const recorded = new Map((relocation?.entries ?? []).map((e) => [e.relPath, e.kind]));
-    const anywhere = () => true;
+    const template = (buf, rel, accept = strictOccurrence) => {
+      const out = rewritePrefixes(buf, pairs, accept);
+      if (out === null) throw new Error(`relocation: ${rel} changed since collection and now has an ambiguous install path`);
+      return out;
+    };
     cloneTree(srcTree, path.join(tmp, 'node_modules'), {
       onFile: (s, d, rel) => {
         if (recorded.get(rel) !== 'text') {
           bytes += copyFileAs(s, d, (mode) => mode & 0o7555);
           return;
         }
-        const templated = rewritePrefixes(fs.readFileSync(s), pairs, anywhere);
+        const templated = template(fs.readFileSync(s), rel);
         fs.writeFileSync(d, templated);
         fs.chmodSync(d, fs.statSync(s).mode & 0o7555);
         bytes += templated.length;
       },
-      linkTarget: (target, rel) => (recorded.get(rel) === 'symlink' ? rewritePrefixes(Buffer.from(target, 'utf8'), pairs, anywhere).toString('utf8') : target),
+      linkTarget: (target, rel) => (recorded.get(rel) === 'symlink' ? template(Buffer.from(target, 'utf8'), rel, anchoredOccurrence).toString('utf8') : target),
       dirMode: (mode) => mode & 0o7555,
     });
+    if (relocation) verifyTemplatedCopy(path.join(tmp, 'node_modules'), relocation);
     fs.writeFileSync(path.join(tmp, 'meta.json'), JSON.stringify({ bytes, createdAt: Date.now(), ...(relocation ? { relocation } : {}) }));
     fs.writeFileSync(path.join(tmp, '.last-used'), '');
     fs.mkdirSync(path.join(tmp, 'leases'));
@@ -833,15 +838,22 @@ const REWRITABLE_EXTENSIONS = new Set(['.js', '.cjs', '.mjs', '.ts', '.json', '.
 
 const UTF8 = new TextDecoder('utf-8', { fatal: true });
 
-/** Bytes that may follow an install path: `/ " ' \` ) ] } , ; : \ =`, whitespace, or the end. Anything else might be a longer name. */
-const PATH_TERMINATORS = new Set(Buffer.from('/"\'`)]},;:\\= \t\n\r\v\f', 'latin1'));
+/**
+ * Bytes that may follow an install path: `/ " ' \` ) ] }`, whitespace, or the end. Every other byte (`: ; = , \` included)
+ * is legal in a file name, so it might continue a longer, unrelated path: such a tree is ambiguous, never guessed.
+ */
+const PATH_FOLLOWERS = new Set(Buffer.from('/"\'`)]} \t\n\r\v\f', 'latin1'));
 
-/** Bytes that make a preceding path glued to a longer name: ASCII name characters and anything non-ASCII. */
-const isNameByte = (b) => (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5a) || (b >= 0x61 && b <= 0x7a) || '_-.+~@%'.includes(String.fromCharCode(b)) || b >= 0x80;
+/** Bytes that may precede an install path: start of file, `" ' \` ( [ {`, or whitespace. Anything else (`/`, `:`, `=`, a name character) may make it the tail of a longer path. */
+const PATH_LEADERS = new Set(Buffer.from('"\'`([{ \t\n\r\v\f', 'latin1'));
 
-const strictOccurrence = (buf, start, end) => (start === 0 || !isNameByte(buf[start - 1])) && (end === buf.length || PATH_TERMINATORS.has(buf[end]));
+const strictOccurrence = (buf, start, end) => (start === 0 || PATH_LEADERS.has(buf[start - 1])) && (end === buf.length || PATH_FOLLOWERS.has(buf[end]));
+
+/** A symlink target is a path, not text: an install path counts only as the whole target or its leading directories. */
+const anchoredOccurrence = (buf, start, end) => start === 0 && (end === buf.length || buf[end] === 0x2f);
 
 const tokenFor = (roles, nonce) => Buffer.from(`${TOKEN_MARKER}${roles.join('+')}_${nonce}@@`);
+/** The end of every token of this nonce: what a collision check and a leftover check search for. */
 const tokenTail = (nonce) => Buffer.from(`_${nonce}@@`);
 const placeholderPairs = ({ nonce, prefixes }) => prefixes.map(({ roles, path: p }) => ({ from: Buffer.from(p, 'utf8'), to: tokenFor(roles, nonce) }));
 
@@ -906,13 +918,13 @@ export function collectInstallPathReferences(tree, roles, { newNonce = () => cry
   const pairs = groups.map((g) => ({ from: Buffer.from(g.path, 'utf8'), to: Buffer.alloc(0) }));
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const nonce = newNonce();
-    const marker = Buffer.from(`${TOKEN_MARKER}${nonce}`);
+    const marker = tokenTail(nonce);
     const outcome = scanTree(tree, groups, pairs, marker);
     if (outcome.collision) continue;
     if (outcome.binary) return { binary: outcome.binary };
     if (outcome.ambiguous) return { ambiguous: outcome.ambiguous };
     const found = groups.filter((_, i) => outcome.found.has(i));
-    return { relocation: { nonce, prefixes: found.map(({ roles: r, path: p }) => ({ roles: r, path: p })), entries: outcome.entries } };
+    return { relocation: { nonce, candidates: groups.map((g) => g.path), prefixes: found.map(({ roles: r, path: p }) => ({ roles: r, path: p })), entries: outcome.entries } };
   }
   return { ambiguous: TOKEN_MARKER };
 }
@@ -932,7 +944,7 @@ function scanTree(tree, groups, pairs, marker) {
         const target = Buffer.from(fs.readlinkSync(p), 'utf8');
         if (target.includes(marker)) return { collision: true };
         const hit = pairs.some((pr) => target.includes(pr.from));
-        if (hit && rewritePrefixes(target, pairs, strictOccurrence) === null) return { ambiguous: r };
+        if (hit && rewritePrefixes(target, pairs, anchoredOccurrence) === null) return { ambiguous: r };
         if (hit) {
           pairs.forEach((pr, i) => target.includes(pr.from) && found.add(i));
           entries.push({ relPath: r, kind: 'symlink' });
@@ -954,13 +966,53 @@ function scanTree(tree, groups, pairs, marker) {
   return walk(tree, '') ?? { found, entries };
 }
 
+/** The first file or symlink under `tree` (rel path, none in `skip`) holding any of `needles`, scanning files in chunks. Null when clean. */
+function findNeedleInTree(tree, needles, skip = new Set()) {
+  const walk = (abs, rel) => {
+    for (const ent of fs.readdirSync(abs, { withFileTypes: true })) {
+      const p = path.join(abs, ent.name);
+      const r = rel ? `${rel}/${ent.name}` : ent.name;
+      if (ent.isDirectory()) {
+        const found = walk(p, r);
+        if (found) return found;
+      } else if (skip.has(r)) {
+        continue;
+      } else if (ent.isSymbolicLink()) {
+        const target = Buffer.from(fs.readlinkSync(p), 'utf8');
+        if (needles.some((n) => target.includes(n))) return r;
+      } else if (ent.isFile() && fileContains(p, needles)) {
+        return r;
+      }
+    }
+    return null;
+  };
+  return walk(tree, '');
+}
+
+/**
+ * Check the cached copy of a tree before it is published: each recorded entry holds a token and no raw install
+ * path, and nothing else holds a raw install path or a token (a file created or changed after collection).
+ */
+function verifyTemplatedCopy(copy, { nonce, candidates, entries }) {
+  const raw = candidates.map((p) => Buffer.from(p, 'utf8'));
+  const tail = tokenTail(nonce);
+  for (const { relPath, kind } of entries) {
+    const file = path.join(copy, relPath);
+    const content = kind === 'symlink' ? Buffer.from(fs.readlinkSync(file), 'utf8') : fs.readFileSync(file);
+    if (!content.includes(tail)) throw new Error(`relocation: cached ${relPath} holds no placeholder`);
+    if (raw.some((r) => content.includes(r))) throw new Error(`relocation: cached ${relPath} still names an install path`);
+  }
+  const stray = findNeedleInTree(copy, [...raw, tail], new Set(entries.map((e) => e.relPath)));
+  if (stray) throw new Error(`relocation: unrecorded ${stray} names an install path or holds a placeholder`);
+}
+
 /** The relocation record of a stored entry: empty when the tree names no install path. Throws on a malformed record. */
 export function readRelocation(cacheRoot, key) {
   const meta = JSON.parse(fs.readFileSync(path.join(entryDir(cacheRoot, key), 'meta.json'), 'utf8'));
-  const rec = meta.relocation ?? { nonce: '0'.repeat(32), prefixes: [], entries: [] };
+  const rec = meta.relocation ?? { nonce: '0'.repeat(32), candidates: [], prefixes: [], entries: [] };
   const okPrefix = (p) => p && Array.isArray(p.roles) && p.roles.length > 0 && p.roles.every((r) => typeof r === 'string') && typeof p.path === 'string' && p.path.length > 0;
   const okEntry = (e) => e && typeof e.relPath === 'string' && (e.kind === 'text' || e.kind === 'symlink');
-  if (!/^[0-9a-f]{32}$/.test(rec.nonce) || !Array.isArray(rec.prefixes) || !Array.isArray(rec.entries) || !rec.prefixes.every(okPrefix) || !rec.entries.every(okEntry)) {
+  if (!/^[0-9a-f]{32}$/.test(rec.nonce) || !Array.isArray(rec.candidates) || !rec.candidates.every((c) => typeof c === 'string' && c.length > 0) || !Array.isArray(rec.prefixes) || !Array.isArray(rec.entries) || !rec.prefixes.every(okPrefix) || !rec.entries.every(okEntry)) {
     throw new Error('relocation record is malformed');
   }
   return rec;
@@ -969,11 +1021,11 @@ export function readRelocation(cacheRoot, key) {
 /**
  * Make a restored tree name the NEW run's install paths: substitute each recorded entry's placeholder tokens with
  * the new path of the token's role (exact bytes, via a temp file renamed over the original with its mode kept; a
- * symlink is re-created with the substituted target), then verify that no token of this entry's nonce is left in
- * any recorded entry. Throws on any failure (roles that now differ, a missing role, an entry with no token, a
+ * symlink is re-created with the substituted target), then verify that no token of this entry's nonce is left anywhere in
+ * the tree (a file the record omits included). Throws on any failure (roles that now differ, a missing role, an entry with no token, a
  * leftover token); the caller discards the tree.
  */
-export function relocateRestoredTree(tree, { nonce, prefixes, entries }, newPaths) {
+export function relocateRestoredTree(tree, { nonce, candidates, prefixes, entries }, newPaths) {
   const pairs = prefixes.map(({ roles }) => {
     const targets = roles.map((role) => {
       if (!newPaths[role]) throw new Error(`relocation: no new path for ${role}`);
@@ -1003,11 +1055,10 @@ export function relocateRestoredTree(tree, { nonce, prefixes, entries }, newPath
     }
   }
 
-  for (const { relPath, kind } of entries) {
-    const file = path.join(tree, relPath);
-    const content = kind === 'symlink' ? Buffer.from(fs.readlinkSync(file), 'utf8') : fs.readFileSync(file);
-    if (content.includes(tail)) throw new Error(`relocation: ${relPath} still holds a placeholder`);
-  }
+  const destinations = Object.values(newPaths);
+  const stale = candidates.filter((c) => !destinations.some((d) => d.includes(c))).map((c) => Buffer.from(c, 'utf8'));
+  const leftover = findNeedleInTree(tree, [tail, ...stale]);
+  if (leftover) throw new Error(`relocation: ${leftover} still holds a placeholder or an old install path`);
 }
 
 /**

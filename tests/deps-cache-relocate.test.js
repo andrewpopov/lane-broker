@@ -121,7 +121,7 @@ test('a NUL byte anywhere in the file makes it binary, even past the first chunk
 });
 
 test('P1 ambiguous: an occurrence followed by anything but a path terminator refuses the tree', () => {
-  for (const [name, text] of [['+archive', '/runs/job+archive/data'], ['digit', '/runs/job2/file'], ['unicode', '/runs/jobé'], ['preceded by a name', 'x/runs/job/file']]) {
+  for (const [name, text] of [['+archive', '/runs/job+archive/data'], ['digit', '/runs/job2/file'], ['unicode', '/runs/jobé'], ['preceded by a name', 'x/runs/job/file'], ['preceded by a slash', '/backup/runs/job/file'], ['preceded by a second slash', '//runs/job/file']]) {
     const t = tree();
     write(t, 'ok.json', '{"p":"/runs/job/ok"}');
     write(t, 'a.js', `"${text}"`);
@@ -131,10 +131,25 @@ test('P1 ambiguous: an occurrence followed by anything but a path terminator ref
   fs.mkdirSync(link, { recursive: true });
   fs.symlinkSync('/runs/job+archive/x', path.join(link, 'l'));
   assert.deepEqual(collectInstallPathReferences(link, rolesFor('/runs/job')), { ambiguous: 'l' });
-  for (const end of ['"', "'", '`', ' ', '\n', ')', ']', '}', ',', ';', ':', '\\', '=', '/', '']) {
+  const leadingSlash = tree();
+  fs.mkdirSync(leadingSlash, { recursive: true });
+  fs.symlinkSync('//runs/job/x', path.join(leadingSlash, 'l'));
+  assert.deepEqual(collectInstallPathReferences(leadingSlash, rolesFor('/runs/job')), { ambiguous: 'l' }, 'a symlink target that is the tail of a longer path');
+  for (const lead of ['"', "'", '`', ' ', '\n', '(', '[', '{', '']) {
     const t = tree();
-    write(t, 'a.js', `p=${'/runs/job'}${end}`);
+    write(t, 'a.js', `${lead}/runs/job/x`);
+    assert.ok(collectInstallPathReferences(t, rolesFor('/runs/job')).relocation, `leader ${JSON.stringify(lead)}`);
+  }
+  for (const end of ['"', "'", '`', ' ', '\n', ')', ']', '}', '/', '']) {
+    const t = tree();
+    write(t, 'a.js', `"${'/runs/job'}${end}`);
     assert.ok(collectInstallPathReferences(t, rolesFor('/runs/job')).relocation, `terminator ${JSON.stringify(end)}`);
+  }
+  // Legal file-name bytes are never boundaries: "/backup:/runs/job/file" names an unrelated path (Codex round 4).
+  for (const glued of ['"/backup:/runs/job/file"', '"/x=/runs/job/file"', '"a;/runs/job"', '"a,/runs/job"', '"/runs/job:x"', '"/runs/job=x"', '"/runs/job,x"', '"/runs/job;x"', '"/runs/job\\x"']) {
+    const t = tree();
+    write(t, 'a.js', glued);
+    assert.deepEqual(collectInstallPathReferences(t, rolesFor('/runs/job')), { ambiguous: 'a.js' }, `glued ${glued}`);
   }
 });
 
@@ -167,11 +182,15 @@ test('two install paths where one extends the other are templated longest first'
 
 test('byte for byte: the prefix twice, inside a longer string, next to non-ASCII text', () => {
   const t = tree();
-  const original = `// é ${OLD}/a ${OLD}\n--cwd=${OLD}/node_modules/.bin:${OLD}\n`;
+  const original = `// é ${OLD}/a ${OLD}\nexec "${OLD}/node_modules/.bin/x" '${OLD}'\n`;
   write(t, 'mixed.sh', original);
   const { restored, run } = roundTrip(t, ...one(OLD, NEW));
   run();
   assert.ok(fs.readFileSync(path.join(restored, 'mixed.sh')).equals(Buffer.from(original.replaceAll(OLD, NEW))));
+  // PATH-style text (`=` and `:` are legal file-name bytes) is ambiguous: such a tree is installed, never cached.
+  const pathStyle = tree();
+  write(pathStyle, 'env.sh', `--cwd=${OLD}/node_modules/.bin:${OLD}\n`);
+  assert.deepEqual(collectInstallPathReferences(pathStyle, rolesFor(OLD)), { ambiguous: 'env.sh' });
 });
 
 test('P1 roles: roles sharing a path at store are one group; restoring them onto different paths falls back', () => {
@@ -214,7 +233,7 @@ test('the token never leaks: a restored entry that still holds one, or holds non
 
 test('a nonce that already occurs in the tree is replaced by a fresh one', () => {
   const t = tree();
-  write(t, 'a.js', `"${OLD}" @@LANE_PREFIX_aaaa`);
+  write(t, 'a.js', `"${OLD}" @@LANE_PREFIX_workDir_aaaa@@`);
   const nonces = ['aaaa', 'bbbb', 'cccc'];
   const { relocation } = collectInstallPathReferences(t, rolesFor(OLD), { newNonce: () => nonces.shift() });
   assert.equal(relocation.nonce, 'bbbb');
@@ -248,4 +267,79 @@ test('installPathRoles names the work dir, its real path and each per-run temp d
     { role: 'TMPDIR', path: '/t/a' },
     { role: 'TEMP', path: '/t/b' },
   ]);
+});
+
+test('restore scans the whole tree: a file the record omits that still holds a token fails', () => {
+  const t = tree();
+  write(t, 'a.js', `"${OLD}"`);
+  write(t, 'b.js', `"${OLD}/b"`);
+  const { run } = roundTrip(t, ...one(OLD, NEW), {
+    tamper: (_stored, meta) => {
+      const m = JSON.parse(fs.readFileSync(meta, 'utf8'));
+      m.relocation.entries = m.relocation.entries.filter((e) => e.relPath !== 'b.js');
+      fs.chmodSync(meta, 0o644);
+      fs.writeFileSync(meta, JSON.stringify(m));
+    },
+  });
+  assert.throws(run, /b\.js still holds a placeholder/);
+});
+
+test('publish verifies the cached copy: a file that changed or appeared after collection publishes nothing', () => {
+  const cases = {
+    'a recorded file gained an ambiguous occurrence': (t) => fs.writeFileSync(path.join(t, 'a.js'), `"${OLD}" "${OLD}+archive/x"`),
+    'a new path-bearing file appeared': (t) => write(t, 'late.js', `"${OLD}"`),
+    'a new binary file naming the path appeared': (t) => write(t, 'late.node', Buffer.concat([Buffer.from([0]), Buffer.from(OLD)])),
+    'a recorded file lost its path': (t) => fs.writeFileSync(path.join(t, 'a.js'), 'nothing here'),
+  };
+  for (const [name, mutate] of Object.entries(cases)) {
+    const t = tree();
+    write(t, 'a.js', `"${OLD}"`);
+    const { relocation } = collectInstallPathReferences(t, rolesFor(OLD));
+    mutate(t);
+    const cacheRoot = tmpDir();
+    assert.throws(() => publishToStore(cacheRoot, newKey(), t, relocation), /relocation:/, name);
+    assert.deepEqual(fs.readdirSync(cacheRoot), [], `${name}: nothing published, no temp left`);
+  }
+});
+
+test('symlink targets are anchored: only the whole target or its leading directories relocate', () => {
+  const bad = tree();
+  fs.mkdirSync(bad, { recursive: true });
+  fs.symlinkSync('/backup:/runs/job/file', path.join(bad, 'link'));
+  assert.deepEqual(collectInstallPathReferences(bad, rolesFor('/runs/job')), { ambiguous: 'link' });
+
+  const good = tree();
+  fs.mkdirSync(good, { recursive: true });
+  fs.symlinkSync('/runs/job/node_modules/x', path.join(good, 'link'));
+  fs.symlinkSync('/runs/job', path.join(good, 'whole'));
+  const { restored, run } = roundTrip(good, ...one('/runs/job', '/runs/new'));
+  run();
+  assert.equal(fs.readlinkSync(path.join(restored, 'link')), '/runs/new/node_modules/x');
+  assert.equal(fs.readlinkSync(path.join(restored, 'whole')), '/runs/new');
+});
+
+test('publish verifies against every install path of the run, not only the ones collection saw', () => {
+  const t = tree();
+  write(t, 'a.js', '"/runs/job/file"');
+  const roles = [{ role: 'workDir', path: '/runs/job' }, { role: 'TMPDIR', path: '/tmp/job' }];
+  const { relocation } = collectInstallPathReferences(t, roles);
+  assert.deepEqual(relocation.prefixes.map((p) => p.path), ['/runs/job'], 'collection saw only the work dir');
+  assert.deepEqual(relocation.candidates, ['/runs/job', '/tmp/job']);
+  write(t, 'late.js', '"/tmp/job/generated"');
+  const cacheRoot = tmpDir();
+  assert.throws(() => publishToStore(cacheRoot, newKey(), t, relocation), /unrecorded late\.js/);
+  assert.deepEqual(fs.readdirSync(cacheRoot), []);
+});
+
+test('restore also looks for every old install path, except one the new paths contain', () => {
+  const t = tree();
+  write(t, 'a.js', '"/runs/job/file"');
+  const roles = [{ role: 'workDir', path: '/runs/job' }, { role: 'TMPDIR', path: '/tmp/job' }];
+  const stray = roundTrip(t, roles, { workDir: '/runs/new', TMPDIR: '/tmp/new' }, {
+    tamper: (stored) => {
+      fs.chmodSync(stored, 0o755);
+      write(stored, 'late.js', '"/tmp/job/x"');
+    },
+  });
+  assert.throws(stray.run, /late\.js still holds a placeholder or an old install path/);
 });
