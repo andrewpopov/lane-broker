@@ -616,6 +616,7 @@ test('remote run: a result that lands 6s after the run ended does not count the 
   assert.equal(result.executor, 'remote');
   assert.ok(Number.isFinite(result.waitedMs), `waitedMs should be a number, got ${result.waitedMs}`);
   assert.ok(result.waitedMs < 3000, `waitedMs ${result.waitedMs} must not include the 6000ms result delay`);
+  assert.ok(Number.isFinite(result.runMs) && result.runMs < 3000, `the runner-measured runMs must be recorded, got ${result.runMs}`);
   assert.ok(result.endedAt - result.startedAt >= 5500, 'the delivery delay sits between startedAt and endedAt, not before startedAt');
 });
 
@@ -629,4 +630,19 @@ test('remote run: a result from a runner that reports no queuedMs still gets a w
   assert.equal(result.executor, 'remote');
   assert.ok(Number.isFinite(result.waitedMs), `waitedMs should be a number, got ${result.waitedMs}`);
   assert.ok(result.waitedMs < runMs - 500, `waitedMs ${result.waitedMs} must not include the ${runMs}ms run`);
+});
+
+// ---- BRAIN-363: an unconfirmed expiry cancel must never lead to a second (local) execution ----
+
+test('remote run: result-wait expiry with an unconfirmed cancel fails the ticket and never runs it locally', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'stuck-running', remoteResultWaitMs: 1 });
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], env, repoDir);
+  assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
+  assert.equal(fs.existsSync(marker), false, 'the job must not have been re-run locally');
+  const result = resultOf(state, id);
+  assert.notEqual(result.executor, 'local');
+  assert.match(result.error, /may still be running and was not re-run/);
+  const history = fs.readFileSync(path.join(state, 'history.jsonl'), 'utf8');
+  assert.match(history, /was not re-run/);
 });

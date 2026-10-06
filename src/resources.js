@@ -231,6 +231,9 @@ export function capElasticClaim(ticket, cfg, host = detectResourceCapacity()) {
   if (cfg.schedulerMode !== 'active' || !Number.isFinite(min)) return ticket;
   const cap = Math.floor(cpuBudgetCores(host, cfg));
   if (!(ticket.resources.cpuCores > cap)) return ticket;
+  // A budget that shrank below the floor (or to zero) must never produce a grant under the minimum: leave the ticket as declared,
+  // so it waits like any over-budget claim instead of being admitted below what it asked to run with.
+  if (cap < 1 || cap < Math.ceil(min)) return ticket;
   const { minCpuCores, ...claim } = ticket.resources;
   return { ...ticket, resources: { ...claim, cpuCores: cap, ...(minCpuCores < cap ? { minCpuCores } : {}) } };
 }

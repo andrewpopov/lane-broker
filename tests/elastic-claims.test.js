@@ -6,13 +6,13 @@ import { spawnSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneRun, gitFixture, BIN } from './helpers.js';
 import { tmpDir, setup, markerCmd, makeFakeSshBin, clientEnv, makeRunner } from './remote-harness.js';
 import { selectRunner } from '../src/remote-client.js';
-import { enqueue, tryStart } from '../src/scheduler.js';
+import { enqueue, tryStart, listQueueCapped } from '../src/scheduler.js';
 import { DEFAULT_GLOBAL_CONFIG, resolveTicketConfig } from '../src/config.js';
 import { writeLease, readLease, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths, atomicWriteJson } from '../src/state.js';
 import { childEnv } from '../src/supervisor.js';
 import { leaseDemand, projectBusy } from '../src/admission.js';
-import { elasticClaimRange, resolveTicketResources, leaseCpuCores, leaseResources, ELASTIC_CLAIMS_CAPABILITY, checkResourceBudget, cpuBudgetCores, detectResourceCapacity } from '../src/resources.js';
+import { elasticClaimRange, resolveTicketResources, leaseCpuCores, leaseResources, ELASTIC_CLAIMS_CAPABILITY, checkResourceBudget, cpuBudgetCores, capElasticClaim, detectResourceCapacity } from '../src/resources.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
 import { PRIORITY_CAPABILITY } from '../src/priority.js';
 import { ARTIFACTS_CAPABILITY } from '../src/remote-artifacts.js';
@@ -645,4 +645,46 @@ test('BRAIN-362: end to end, a fractional floor above floor(budget) exits 64 at 
   const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'true'], { env, cwd: repoDir });
   assert.equal(result.code, 64, `stderr: ${result.stderr}`);
   assert.match(result.stderr, /exceed this environment's budget/);
+});
+
+test('BRAIN-362: a queue record written with an over-budget elastic claim is read at the capped size (loader and status)', async () => {
+  const { state } = freshEnv();
+  const t = hugeElastic('legacy');
+  await enqueue(state, t, tightCfg({ schedulerMode: 'shadow' })); // shadow never caps: the record keeps the 16-core claim
+  const fileOf = () => path.join(paths(state).queue, fs.readdirSync(paths(state).queue).find((n) => n.endsWith('.json')));
+  assert.equal(JSON.parse(fs.readFileSync(fileOf(), 'utf8')).resources.cpuCores, 16);
+  const [capped] = listQueueCapped(state, tightCfg());
+  assert.equal(capped.resources.cpuCores, 3);
+  assert.equal(capped.resources.minCpuCores, 2);
+  assert.equal(listQueueCapped(state, tightCfg({ schedulerMode: 'shadow' }))[0].resources.cpuCores, 16, 'shadow mode never caps');
+});
+
+test('BRAIN-362: the cap never goes below the floor or to zero when the budget shrank after preflight', () => {
+  const host = { cpuCores: 4, memoryBytes: 64 * GIB };
+  const t = ticket('shrunk', { resources: { cpuCores: 16, minCpuCores: 3.2, memoryBytes: GIB } });
+  const kept = capElasticClaim(t, baseCfg({ cpuReserveCores: 0.6 }), host); // budget 3.4: floor 3 < ceil(3.2) = 4
+  assert.equal(kept, t, 'left as declared: it waits like any over-budget claim');
+  const zero = capElasticClaim(t, baseCfg({ cpuReserveCores: 3.5 }), host); // budget 0.5: floor 0
+  assert.equal(zero.resources.cpuCores, 16, 'never capped to zero');
+  const ok = capElasticClaim(t, baseCfg({ cpuReserveCores: 0 }), host); // budget 4: floor 4 >= ceil(3.2)
+  assert.equal(ok.resources.cpuCores, 4);
+});
+
+test('BRAIN-362: lane status reads a stale over-budget queue record at the capped size too', async () => {
+  const { state, home } = freshEnv();
+  const cfg = tightCfg();
+  await enqueue(state, hugeElastic('legacy'), { ...cfg, schedulerMode: 'shadow' });
+  writeGlobalConfig(home, { version: 1, capacity: 10, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100, schedulerMode: 'active', cpuAdmissionPercent: 100, cpuReserveCores: cfg.cpuReserveCores });
+  const prev = { state: process.env.LANE_BROKER_STATE, home: process.env.LANE_BROKER_HOME };
+  process.env.LANE_BROKER_STATE = state;
+  process.env.LANE_BROKER_HOME = home;
+  try {
+    const entry = (await collectStatus()).queued.find((q) => q.id === 'legacy');
+    assert.equal(entry.resources.cpuCores, 3);
+  } finally {
+    for (const [k, v] of [['LANE_BROKER_STATE', prev.state], ['LANE_BROKER_HOME', prev.home]]) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
 });

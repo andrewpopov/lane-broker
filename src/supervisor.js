@@ -793,7 +793,9 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     // took to reach us (poll backoff, an ssh-drop recovery). The runner reports its own pre-start wait (`queuedMs`, a
     // duration on its clock); we add the local portion we measured ourselves (enqueue -> handed to the runner), so no
     // cross-host clock is compared. An older runner reports no `queuedMs`: fall back to the BRAIN-341 formula
-    // (receipt time - enqueue - runMs), which also counts the result-delivery delay as wait.
+    // (receipt time - enqueue - runMs), which also counts the result-delivery delay as wait. Known underestimate: the
+    // remote-exec protocol sends the client no early signal, so the ssh connect and the runner process's startup (seconds)
+    // fall between `dispatchedAt` and the runner's own clock start and are counted as neither wait nor run.
     const { queuedMs, runMs } = dispatch.result;
     let remoteWaitedMs = null;
     if (Number.isFinite(queuedMs) && queuedMs >= 0) {
@@ -817,6 +819,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       remoteKind: dispatch.result.kind,
       remotePhase: dispatch.phase ?? null,
       startedAt: remoteWaitedMs === null ? attemptStartedAt : enriched.createdAt + remoteWaitedMs,
+      // the runner-measured run duration: endedAt is the local receipt time, so `endedAt - startedAt` also holds the delivery delay
+      ...(Number.isFinite(runMs) && runMs >= 0 ? { runMs } : {}),
       endedAt,
       waitedMs: remoteWaitedMs,
     }));
@@ -827,6 +831,16 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     await publishAndExit(gen, () => {
       throw new Error('unreachable: dispatchRemote reported cancelled');
     });
+    return { fallback: false };
+  }
+
+  // BRAIN-363: the runner's copy may still be running (its cancel was not confirmed). Running it locally too could execute
+  // the job twice, so this ticket ends here as a failure instead of falling back; a rebind is refused the same way by abandonRebind.
+  if (dispatch.mayStillBeRunning && !rebind) {
+    const line = `lane: remote: ${enriched.id}: ${runner.name}: ${dispatch.reason}\n`;
+    process.stderr.write(line);
+    writeBrokerLog(root, line);
+    await publishAndExit(gen, () => localRefusalResult(enriched, { exitCode: 1, message: line }));
     return { fallback: false };
   }
 

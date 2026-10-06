@@ -44,6 +44,15 @@ export function listQueue(root) {
   return names.filter((n) => n.endsWith('.json')).map((n) => readJsonSafe(path.join(dir, n)));
 }
 
+/**
+ * BRAIN-362: the queue as admission math sees it. A record written before the cap existed (or before a budget change) can
+ * carry a claim above this host's budget, so every consumer of reservations, backfill, the shadow snapshot and status reads
+ * it through here and sees the same capped claim. An unreadable record stays `null`.
+ */
+export function listQueueCapped(root, cfg) {
+  return listQueue(root).map((t) => (t === null ? null : capElasticClaim(t, cfg)));
+}
+
 /** Every queue record in FIFO order, or a thrown `UnreadableRecordError` (where `listQueue` yields `null` for it). */
 export function listQueueStrict(root) {
   return listJsonRecordsStrict(paths(root).queue);
@@ -932,7 +941,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     const sched = resolveScheduler(root);
     const store = sched.v2 ? fairnessStore(root, sched.tickets) : legacyStore(root);
     if (sched.v2) quarantineLegacyRecords(root);
-    const rawQueue = sched.v2 ? fenceLegacy(listQueue(root)) : listQueue(root);
+    const rawQueue = sched.v2 ? fenceLegacy(listQueueCapped(root, cfg)) : listQueueCapped(root, cfg);
     // A reservation exists only while resource backfill does: when it is off, release every latch, so turning it back
     // on makes a ticket earn its reservation again.
     if (sched.v2 && !(cfg.schedulerMode === 'active' && cfg.resourceSkipLimit > 0)) store.releaseReservations();

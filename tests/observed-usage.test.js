@@ -288,6 +288,17 @@ test('suggest math: p50/p90 of MEAN (peak shown), ceil, under/over-booked, too-f
   assert.match(text, /3 finished run\(s\) without observedCpu/);
 });
 
+test('suggest: a remote row\'s runner-measured runMs decides "short", not endedAt - startedAt (BRAIN-363)', () => {
+  const remoteShort = (i) => row('prepush', 4, { declared: 4, extra: { executor: 'remote', runMs: 10_000, endedAt: NOW - i + 3 * MIN } });
+  const rows = [...Array(5)].map((_, i) => remoteShort(i));
+  rows.forEach((r) => assert.ok(r.endedAt - r.startedAt >= 2 * MIN, 'the receipt span alone would pass the filter'));
+  const g = buildSuggestions(rows, { repo: 'r', days: 7, now: NOW }).groups[0];
+  assert.equal(g.shortRunsExcluded, 5);
+  assert.equal(g.verdict, 'insufficient');
+  const legacy = buildSuggestions([...Array(5)].map(() => row('old', 4, { declared: 4 })), { repo: 'r', days: 7, now: NOW }).groups[0];
+  assert.equal(legacy.shortRunsExcluded, 0, 'a row with no runMs keeps the endedAt - startedAt span');
+});
+
 test('suggest: sizes from the sustained MEAN, not brief peaks (jun prepush shape: booked 4, mean ~2, peak ~8)', () => {
   const means = [1.9, 1.9, 2, 2, 2, 2.1, 2.1, 2.2, 2.3, 2.3];
   const peaks = [7, 7.5, 7.5, 7.5, 8, 8, 8.5, 8.9, 8.9, 9];
