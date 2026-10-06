@@ -838,11 +838,14 @@ const REWRITABLE_EXTENSIONS = new Set(['.js', '.cjs', '.mjs', '.ts', '.json', '.
 
 const UTF8 = new TextDecoder('utf-8', { fatal: true });
 
-/** Bytes that may follow an install path: `/ " ' \` ) ] } , ; : \ =`, whitespace, or the end. Anything else might be a longer name. */
-const PATH_FOLLOWERS = new Set(Buffer.from('/"\'`)]},;:\\= \t\n\r\v\f', 'latin1'));
+/**
+ * Bytes that may follow an install path: `/ " ' \` ) ] }`, whitespace, or the end. Every other byte (`: ; = , \` included)
+ * is legal in a file name, so it might continue a longer, unrelated path: such a tree is ambiguous, never guessed.
+ */
+const PATH_FOLLOWERS = new Set(Buffer.from('/"\'`)]} \t\n\r\v\f', 'latin1'));
 
-/** Bytes that may precede an install path: start of file, `" ' \` = : ( [ { , ; \`, or whitespace. A `/` or a name character means it is the tail of a longer path. */
-const PATH_LEADERS = new Set(Buffer.from('"\'`=:([{,;\\ \t\n\r\v\f', 'latin1'));
+/** Bytes that may precede an install path: start of file, `" ' \` ( [ {`, or whitespace. Anything else (`/`, `:`, `=`, a name character) may make it the tail of a longer path. */
+const PATH_LEADERS = new Set(Buffer.from('"\'`([{ \t\n\r\v\f', 'latin1'));
 
 const strictOccurrence = (buf, start, end) => (start === 0 || PATH_LEADERS.has(buf[start - 1])) && (end === buf.length || PATH_FOLLOWERS.has(buf[end]));
 

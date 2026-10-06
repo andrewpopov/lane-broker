@@ -135,15 +135,21 @@ test('P1 ambiguous: an occurrence followed by anything but a path terminator ref
   fs.mkdirSync(leadingSlash, { recursive: true });
   fs.symlinkSync('//runs/job/x', path.join(leadingSlash, 'l'));
   assert.deepEqual(collectInstallPathReferences(leadingSlash, rolesFor('/runs/job')), { ambiguous: 'l' }, 'a symlink target that is the tail of a longer path');
-  for (const lead of ['"', "'", '`', ' ', '\n', '=', ':', '(', '[', '{', ',', ';', '\\', '']) {
+  for (const lead of ['"', "'", '`', ' ', '\n', '(', '[', '{', '']) {
     const t = tree();
     write(t, 'a.js', `${lead}/runs/job/x`);
     assert.ok(collectInstallPathReferences(t, rolesFor('/runs/job')).relocation, `leader ${JSON.stringify(lead)}`);
   }
-  for (const end of ['"', "'", '`', ' ', '\n', ')', ']', '}', ',', ';', ':', '\\', '=', '/', '']) {
+  for (const end of ['"', "'", '`', ' ', '\n', ')', ']', '}', '/', '']) {
     const t = tree();
-    write(t, 'a.js', `p=${'/runs/job'}${end}`);
+    write(t, 'a.js', `"${'/runs/job'}${end}`);
     assert.ok(collectInstallPathReferences(t, rolesFor('/runs/job')).relocation, `terminator ${JSON.stringify(end)}`);
+  }
+  // Legal file-name bytes are never boundaries: "/backup:/runs/job/file" names an unrelated path (Codex round 4).
+  for (const glued of ['"/backup:/runs/job/file"', '"/x=/runs/job/file"', '"a;/runs/job"', '"a,/runs/job"', '"/runs/job:x"', '"/runs/job=x"', '"/runs/job,x"', '"/runs/job;x"', '"/runs/job\\x"']) {
+    const t = tree();
+    write(t, 'a.js', glued);
+    assert.deepEqual(collectInstallPathReferences(t, rolesFor('/runs/job')), { ambiguous: 'a.js' }, `glued ${glued}`);
   }
 });
 
@@ -176,11 +182,15 @@ test('two install paths where one extends the other are templated longest first'
 
 test('byte for byte: the prefix twice, inside a longer string, next to non-ASCII text', () => {
   const t = tree();
-  const original = `// é ${OLD}/a ${OLD}\n--cwd=${OLD}/node_modules/.bin:${OLD}\n`;
+  const original = `// é ${OLD}/a ${OLD}\nexec "${OLD}/node_modules/.bin/x" '${OLD}'\n`;
   write(t, 'mixed.sh', original);
   const { restored, run } = roundTrip(t, ...one(OLD, NEW));
   run();
   assert.ok(fs.readFileSync(path.join(restored, 'mixed.sh')).equals(Buffer.from(original.replaceAll(OLD, NEW))));
+  // PATH-style text (`=` and `:` are legal file-name bytes) is ambiguous: such a tree is installed, never cached.
+  const pathStyle = tree();
+  write(pathStyle, 'env.sh', `--cwd=${OLD}/node_modules/.bin:${OLD}\n`);
+  assert.deepEqual(collectInstallPathReferences(pathStyle, rolesFor(OLD)), { ambiguous: 'env.sh' });
 });
 
 test('P1 roles: roles sharing a path at store are one group; restoring them onto different paths falls back', () => {
