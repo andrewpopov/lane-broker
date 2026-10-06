@@ -87,6 +87,17 @@ test('selectRunner: an unmeasured runner (older probe) still counts as having ro
   assert.equal(res.runner.name, 'old');
 });
 
+test('selectRunner: an empty-queue runner without headroom is reported as `busy`, while `runner` stays null', async () => {
+  const sshBin = makeProbeMapSsh({ slow: probe(room(0)), fast: probe(room(0.5)) });
+  const res = await selectRunner([runner('slow', 1), runner('fast', 4)], { sshBin, deadlineMs: 3000, reservation });
+  assert.equal(res.runner, null);
+  assert.equal(res.busy.runner.name, 'fast', 'the best busy runner by estimated finish');
+  assert.ok(res.busy.probe);
+  const withRoom = await selectRunner([runner('slow', 1), runner('fast', 4)], { sshBin: makeProbeMapSsh({ slow: probe(room(8)), fast: probe(room(0)) }), deadlineMs: 3000, reservation });
+  assert.equal(withRoom.runner.name, 'slow');
+  assert.equal(withRoom.busy, undefined);
+});
+
 test('selectRunner: a runner with room is preferred over any runner queue', async () => {
   const sshBin = makeProbeMapSsh({ queued: probe({ queued: 1, ...room(64) }), idle: probe(room(8)) });
   const res = await selectRunner([runner('queued', 100), runner('idle')], { sshBin, deadlineMs: 3000, maxRemoteQueue: 2, reservation });
@@ -622,4 +633,31 @@ test('a supervisor killed between withdraw and dispatch leaves a parked ticket t
   assert.deepEqual(linesOf(ran), [], 'nothing ran');
   hold.release();
   await hold.done;
+});
+
+test('a localRefused remote lane with every runner full goes to the best runner as a queued remote attempt: no exit 69, never runs locally', async () => {
+  const ctx = controllableRunner();
+  writeRepoConfig(ctx.repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, localRefused: true } } });
+  ctx.setMode('full');
+  const ran = path.join(tmpDir('rebind-ran'), 'ran');
+  const id = await detach(ctx, recordingCmd(ran));
+  const result = await waitResult(ctx, id);
+  assert.equal(result.exit, 0);
+  assert.equal(result.executor, 'remote');
+  assert.equal(result.runner, 'skybox');
+  assert.equal(result.queuedAt, 'skybox(0)');
+  assert.deepEqual(linesOf(ran), ['remote'], 'ran once, on the runner');
+  assert.match(ctx.admissionLog(), /lane: waiting on skybox: every runner is busy/);
+});
+
+test('an ordinary remote lane with every runner full still waits in the local queue (no busy-runner dispatch)', async () => {
+  const ctx = controllableRunner();
+  const hold = await holdLaneLocally(ctx);
+  ctx.setMode('full');
+  const id = await detach(ctx, recordingCmd(path.join(tmpDir('rebind-ran'), 'ran')));
+  await waitFor(() => queuedIds(ctx.state).includes(id), { timeoutMs: 30_000 });
+  assert.doesNotMatch(ctx.admissionLog(), /waiting on skybox/);
+  hold.release();
+  await hold.done;
+  assert.equal((await waitResult(ctx, id)).executor, 'local');
 });

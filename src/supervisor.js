@@ -630,9 +630,19 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // own protocol (inside dispatchRemote) still derives from
   // `needsProtocol2(enriched.remote)` alone, so an optionless lane still
   // sends a protocol-1 header even when this is true.
-  const { runner, skipped, queuedChoice, probe } = rebind
+  let { runner, skipped, queuedChoice, probe, busy } = rebind
     ? { runner: rebind.runner, skipped: [], queuedChoice: false, probe: rebind.probe }
     : await selectRunner(globalCfg.runners || [], remoteSelectOptions(enriched, globalCfg));
+  // A `localRefused` lane has no local queue to wait in, so with every runner busy it waits on the best one: that runner's own
+  // broker holds the ticket until it has room (what every empty-queue runner did before headroom ranking).
+  let busyQueuedAt;
+  if (!runner && busy && !rebind && enriched.localRefused && !enriched.allowLocalSim) {
+    ({ runner, probe } = busy);
+    busyQueuedAt = `${runner.name}(0)`;
+    const line = `lane: waiting on ${runner.name}: every runner is busy and this lane cannot run locally (${skipped.map((s) => `${s.name}: ${s.reason}`).join('; ')})\n`;
+    process.stderr.write(line);
+    writeBrokerLog(root, line);
+  }
   if (!runner) {
     const reason = skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : 'no runners configured';
     return fallbackOrRefuse(null, reason, { rebindable: true });
@@ -641,7 +651,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // BRAIN-338: every runner has a queue. Queue on the least-loaded one only
   // when this machine could not start the ticket right now either;
   // otherwise run locally, exactly as when no runner was idle.
-  let queuedAt;
+  let queuedAt = busyQueuedAt;
   if (queuedChoice) {
     queuedAt = `${runner.name}(${probe.queued})`;
     const local = await couldAdmitNow(root, globalCfg, enriched);
