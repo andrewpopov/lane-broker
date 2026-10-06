@@ -4,6 +4,14 @@ import crypto from 'node:crypto';
 
 export const LOCK_FILE = 'store.lock';
 
+/** The lock path no longer names the file this process linked: another process owns (or reclaimed) the store. */
+export class LockLostError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'LockLostError';
+  }
+}
+
 function alive(pid) {
   try {
     process.kill(pid, 0);
@@ -23,6 +31,35 @@ function readLock(file) {
 }
 
 /**
+ * The owner keeps an open fd on its lock file. `assertHeld()` compares that fd's inode/device with whatever `store.lock`
+ * names NOW and throws LockLostError on a mismatch or a missing path: a displaced owner (whose lock was reclaimed out from
+ * under it) is fenced from writing, whatever happened during the reclaim race.
+ */
+function holder(file, mine) {
+  const fd = fs.openSync(file, 'r');
+  const held = fs.fstatSync(fd);
+  return {
+    assertHeld() {
+      let now;
+      try {
+        now = fs.statSync(file);
+      } catch (err) {
+        if (err.code === 'ENOENT') throw new LockLostError(`store lock ${file} is gone`);
+        throw err;
+      }
+      if (now.ino !== held.ino || now.dev !== held.dev) throw new LockLostError(`store lock ${file} now belongs to another process`);
+    },
+    release() {
+      try {
+        if (readLock(file)?.token === mine.token) fs.rmSync(file, { force: true });
+      } finally {
+        fs.closeSync(fd);
+      }
+    },
+  };
+}
+
+/**
  * Exclusive ownership of a store root, taken atomically WITH its content: `{pid, token}` is written to a private temp file
  * and hard-linked to `store.lock` (`link` fails with EEXIST if the lock exists), so the lock file never exists empty or
  * partial. A lock whose pid is dead is reclaimed by renaming it aside (exactly one reclaimer's rename succeeds), re-reading
@@ -38,7 +75,7 @@ export function acquireStoreLock(root) {
     for (let attempt = 0; attempt < 5; attempt += 1) {
       try {
         fs.linkSync(temp, file);
-        return { release: () => { if (readLock(file)?.token === mine.token) fs.rmSync(file, { force: true }); } };
+        return holder(file, mine);
       } catch (err) {
         if (err.code !== 'EEXIST') throw err;
       }

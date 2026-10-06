@@ -67,6 +67,10 @@ export async function storeCli(argv, env = process.env) {
       capBytes: byteOption(values['cap-bytes'], '--cap-bytes'),
       sweepIntervalMs: Number(values['sweep-interval-s'] ?? 3600) * 1000,
       maintenanceIntervalMs: Number(values['maintenance-interval-s'] ?? 30) * 1000,
+      onLockLost: (err) => {
+        console.error(`lane-store: ${err.message}; another process owns this store, shutting down`);
+        s.close().finally(() => process.exit(70));
+      },
       replicateTo: target ? new StoreClient({ baseUrl: target, token: need(env.LANE_STORE_REPLICA_TOKEN, 'LANE_STORE_REPLICA_TOKEN') }) : undefined,
       replicateIntervalMs: Number(values['replicate-interval-s'] ?? 300) * 1000,
     });

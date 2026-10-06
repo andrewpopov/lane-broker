@@ -18,10 +18,10 @@ const BIN = fileURLToPath(new URL('../bin/lane-store.js', import.meta.url));
 const put = (srv, text) => srv.submit.putBlob(sha(text), Buffer.from(text));
 const replicator = (p, replica = p.replica.replicaPeer) => new Replicator({ store: p.primary.store, root: p.primary.root, replica, now: p.clock.now });
 
-async function pair() {
+async function pair({ replicaGraceHours = 168 } = {}) { // explicit: these tests never depend on the production default
   const clock = fakeClock();
   const primary = await startStore({ clock });
-  const replica = await startStore({ clock, replicaMode: true });
+  const replica = await startStore({ clock, replicaMode: true, replicaGraceHours });
   return { clock, primary, replica, close: () => Promise.all([primary.close(), replica.close()]) };
 }
 
@@ -40,7 +40,7 @@ test('R1 the replica is never told to delete: a primary-side deletion leaves the
 });
 
 test('R2 a replica stall shorter than the grace deletes nothing; a terminal manifest older than the grace is swept on the replica only', async (t) => {
-  const p = await pair();
+  const p = await pair({ replicaGraceHours: 168 });
   t.after(() => p.close());
   const snap = snapshotOf({ 'a.txt': 'replicated input' });
   await publish(p.primary, 'job-1', snap);
@@ -50,8 +50,9 @@ test('R2 a replica stall shorter than the grace deletes nothing; a terminal mani
   assert.ok(p.replica.store.readManifest('job-1'), 'non-terminal manifests are never swept');
   await p.primary.admin.json('PUT', '/jobs/job-1/terminal');
   assert.equal((await replicator(p).runOnce()).ok, true);
+  p.clock.advance(6 * DAY);
   sweep(p.replica.store);
-  assert.ok(p.replica.store.readManifest('job-1'), 'terminal but not yet past the grace');
+  assert.ok(p.replica.store.readManifest('job-1'), 'terminal for 6 days, grace is 7');
   p.clock.advance(2 * DAY);
   sweep(p.replica.store);
   assert.equal(p.replica.store.readManifest('job-1'), null);
@@ -93,18 +94,29 @@ test('R3 the lock file never exists empty: it is created complete by a hard link
   assert.ok(fs.existsSync(lockPath), 'a release never removes a lock it does not own');
 });
 
-test('R3 two concurrent reclaimers of a stale lock produce exactly one owner', async () => {
+test('R3 concurrent reclaimers of a stale lock: exactly one process still HOLDS it once the race settles (the rest are fenced)', async () => {
   const root = tmpDir('stale');
   const dead = spawnSync(process.execPath, ['-e', '0']).pid;
   fs.writeFileSync(path.join(root, 'store.lock'), JSON.stringify({ pid: dead, token: 'stale' }));
-  const script = `import('${new URL('../src/store/lock.js', import.meta.url).href}').then(({acquireStoreLock})=>{try{const l=acquireStoreLock(${JSON.stringify(root)});console.log('OWNER');setTimeout(()=>{l.release()},900)}catch(e){console.log('REFUSED')}})`;
-  const outs = await Promise.all(Array.from({ length: 6 }, () => new Promise((resolve) => {
+  // Rename-based reclaim can transiently let two processes believe they own the lock (B renames A's fresh lock aside while C
+  // links a new one). The guarantee is the self-check fence: after the race settles only one passes assertHeld(), and a
+  // displaced owner throws LockLostError before it can write. Children hold until the parent has heard from all of them, so a
+  // slow start under machine load cannot masquerade as a second owner.
+  const script = `import('${new URL('../src/store/lock.js', import.meta.url).href}').then(({acquireStoreLock})=>{let l=null;try{l=acquireStoreLock(${JSON.stringify(root)});console.log('OWNER')}catch(e){console.log('REFUSED')}let step=0;process.stdin.on('data',()=>{step+=1;if(step===1){let r='NONE';if(l){try{l.assertHeld();r='HELD'}catch(e){r=e.name}}console.log(r)}else{l?.release();process.exit(0)}})})`;
+  const children = Array.from({ length: 6 }, () => {
     const c = spawn(process.execPath, ['-e', script]);
-    let out = '';
-    c.stdout.on('data', (d) => { out += d; });
-    c.on('close', () => resolve(out.trim()));
-  })));
-  assert.equal(outs.filter((o) => o === 'OWNER').length, 1, outs.join(','));
+    const lines = [];
+    const waiters = [];
+    c.stdout.on('data', (d) => String(d).split('\n').filter(Boolean).forEach((l) => { const w = waiters.shift(); if (w) w(l); else lines.push(l); }));
+    const next = () => (lines.length ? Promise.resolve(lines.shift()) : new Promise((r) => waiters.push(r)));
+    return { c, next };
+  });
+  const verdicts = await Promise.all(children.map((x) => x.next()));
+  children.forEach((x) => x.c.stdin.write('check\n'));
+  const held = await Promise.all(children.map((x) => x.next()));
+  children.forEach((x) => { x.c.stdin.write('release\n'); setTimeout(() => x.c.kill(), 2000).unref(); });
+  assert.equal(held.filter((h) => h === 'HELD').length, 1, `verdicts ${verdicts.join(',')} held ${held.join(',')}`);
+  for (const h of held) assert.ok(['HELD', 'LockLostError', 'NONE'].includes(h), h);
 });
 
 // ---- 4: cancel, and per-path exclusion ----

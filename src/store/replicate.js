@@ -2,6 +2,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { iterateJournal, DEFAULT_CHUNK_BYTES } from './journal.js';
 import { acquireStoreLock } from './lock.js';
+import { StoreHttpError } from './client.js';
+import { blobRelPath } from './ids.js';
+import { hashFile } from './objects.js';
 import { readReplicationState, writeReplicationState, REPLICATION_STATE_FILE } from './replication-state.js';
 import { manifestRelPath } from './ids.js';
 
@@ -70,6 +73,11 @@ export class Replicator {
     Object.assign(this, { store, root: store.root, replica, now, chunkBytes, onShipped, running: false, current: null, stopped: false });
   }
 
+  writeState(state) {
+    this.store.assertOwner(); // a displaced owner must never move the watermark
+    writeReplicationState(this.root, state);
+  }
+
   /** A COMMITTED delete record for `rel` after this record. */
   committedDeletion(rel, fromOffset) {
     for (const rec of this.store.journal.iterate(fromOffset, { maxBytes: this.chunkBytes })) {
@@ -84,12 +92,32 @@ export class Replicator {
       if (this.committedDeletion(entry.path, entry.end)) return 'skipped'; // retention removed it; the replica deletes nothing for us
       throw new Error(`seq ${entry.seq} ${entry.path} is missing on the primary and no committed deletion explains it`);
     }
-    await this.replica.putObject(entry, file);
+    try {
+      await this.replica.putObject(entry, file);
+    } catch (err) {
+      if (!(entry.kind === 'manifest' && err instanceof StoreHttpError && err.status === 409 && Array.isArray(err.body?.missing))) throw err;
+      await this.restoreBlobs(err.body.missing); // the replica lost blobs this manifest needs (its own retention): re-ship them
+      await this.replica.putObject(entry, file);
+    }
     const seen = await this.replica.verifyObject(entry.path);
     if (!seen || seen.sha256 !== entry.sha256 || seen.size !== entry.size) {
       throw new Error(`replica verification failed for seq ${entry.seq} ${entry.path}`);
     }
     return 'shipped';
+  }
+
+  /** Out-of-band re-ship of blobs the replica reports missing: each is verified against its address on the primary first. */
+  async restoreBlobs(shas) {
+    for (const sha of shas) {
+      const rel = blobRelPath(sha);
+      const file = path.join(this.root, ...rel.split('/'));
+      if (!fs.existsSync(file)) throw new Error(`replica needs blob ${sha} and the primary no longer has it`);
+      const { sha256, size } = await hashFile(file);
+      if (sha256 !== sha) throw new Error(`primary copy of blob ${sha} is corrupt; not shipping it`);
+      await this.replica.putObject({ kind: 'blob', path: rel }, file);
+      const seen = await this.replica.verifyObject(rel);
+      if (!seen || seen.sha256 !== sha || seen.size !== size) throw new Error(`replica verification failed for restored blob ${sha}`);
+    }
   }
 
   async shipState(entry) {
@@ -147,15 +175,15 @@ export class Replicator {
           else gone += outcome === 'skipped' ? 1 : 0;
           state.replicatedSeq = entry.seq;
           state.replicatedOffset = entry.end;
-          writeReplicationState(this.root, state);
+          this.writeState(state);
           if (this.onShipped) await this.onShipped(entry);
         }
       }
     } catch (err) {
-      writeReplicationState(this.root, { ...state, failedRounds: state.failedRounds + 1, lastRoundAt: this.now() });
+      this.writeState({ ...state, failedRounds: state.failedRounds + 1, lastRoundAt: this.now() });
       return { ok: false, shipped, gone, error: err.message, replicatedSeq: state.replicatedSeq };
     }
-    writeReplicationState(this.root, { ...state, failedRounds: 0, lastRoundAt: this.now() });
+    this.writeState({ ...state, failedRounds: 0, lastRoundAt: this.now() });
     return { ok: true, shipped, gone, replicatedSeq: state.replicatedSeq };
   }
 }

@@ -58,9 +58,10 @@ function gate(limit) {
  * `async (bearerToken) => claims | null` (see auth.js). Reads are job-scoped: a `read` token may fetch only the
  * manifest of `claims.job` and the blobs that manifest references.
  */
-export function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, downloadIdleMs = 30_000, sweepIntervalMs = 0, maintenanceIntervalMs = 30_000, replicateTo, replicateIntervalMs = 300_000, ...storeOpts }) {
+export function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, downloadIdleMs = 30_000, sweepIntervalMs = 0, maintenanceIntervalMs = 30_000, onLockLost, replicateTo, replicateIntervalMs = 300_000, ...storeOpts }) {
   if (replicateTo && storeOpts.replicaMode) throw new Error('a replica does not replicate onward (--replica and --replicate-to are exclusive)');
   const store = new ObjectStore(root, storeOpts);
+  store.onLockLost = onLockLost ?? null;
   const upload = gate(maxUploads);
   const download = gate(maxDownloads);
 
