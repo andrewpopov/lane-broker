@@ -79,6 +79,9 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // running locally -- only when this machine could not admit it right now
   // either. 0 disables (a runner with any queue is skipped).
   maxRemoteQueue: 2,
+  // BRAIN-405: how often a remote-eligible ticket that fell back to this machine's queue (no runner had room) re-probes the
+  // runners and moves to one that now has real headroom. 0 disables rebinding.
+  remoteRebindIntervalMs: 30_000,
   // BRAIN-207 (forgiving admission): whether the load gate is allowed to
   // deny a start at all. Default false — the gate is informational-only
   // (still sampled every poll, still logged) until an operator opts back
@@ -207,6 +210,10 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isInteger(cfg.maxRemoteQueue) && cfg.maxRemoteQueue >= 0,
     `${sourcePath}: "maxRemoteQueue" must be a non-negative integer`,
   );
+  assert(
+    Number.isInteger(cfg.remoteRebindIntervalMs) && cfg.remoteRebindIntervalMs >= 0,
+    `${sourcePath}: "remoteRebindIntervalMs" must be a non-negative integer`,
+  );
   assert(typeof cfg.admissionLoadGate === 'boolean', `${sourcePath}: "admissionLoadGate" must be a boolean`);
   assert(typeof cfg.allocationShadow === 'boolean', `${sourcePath}: "allocationShadow" must be a boolean`);
   assert(Number.isInteger(cfg.simArmWindowMs) && cfg.simArmWindowMs > 0, `${sourcePath}: "simArmWindowMs" must be a positive integer`);
@@ -300,6 +307,12 @@ function validateRunners(runners, sourcePath) {
     }
     if (runner.shell !== undefined) {
       assert(typeof runner.shell === 'string' && runner.shell.length > 0, `${sourcePath}: runner "${runner.name}".shell must be a non-empty string`);
+    }
+    if (runner.speedFactor !== undefined) {
+      assert(
+        Number.isFinite(runner.speedFactor) && runner.speedFactor > 0,
+        `${sourcePath}: runner "${runner.name}".speedFactor must be a positive number`,
+      );
     }
   }
 }

@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, writeExpireMarkerFile, appendHistory, assertNotMigrating, listJsonRecordsStrict } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, writeExpireMarkerFile, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
 import { sampleAndUpdateGate, readGateState } from './load.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
 import { evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, projectBusy, ticketCpuEstimate } from './admission.js';
@@ -170,6 +170,42 @@ export function dequeueSync(root, id) {
   } catch (err) {
     return err.code === 'ENOENT';
   }
+}
+
+/**
+ * BRAIN-405: take a still-queued ticket out of the queue so the caller can run it elsewhere. One locked step shared with
+ * `tryStart`'s own dequeue-and-lease-write, so for any one ticket exactly one of the two wins: the record is returned only if
+ * it was still queued (never started, not cancelled, not gone, no migration in progress); otherwise null and nothing changed.
+ * The returned record carries its original `seq`, which `restoreQueued` needs.
+ */
+export async function withdrawQueued(root, id) {
+  return withLock(root, () => {
+    try {
+      assertNotMigrating(root);
+    } catch (err) {
+      if (err instanceof MigrationInProgressError) return null;
+      throw err;
+    }
+    if (isCancelled(root, id)) return null;
+    const file = findQueueFile(root, id);
+    if (!file) return null;
+    const record = readJsonSafe(file);
+    if (!record || record.id !== id) return null;
+    try {
+      fs.unlinkSync(file);
+    } catch {
+      return null;
+    }
+    return record;
+  });
+}
+
+/** BRAIN-405: put a withdrawn record back at its ORIGINAL sequence, so a refused rebind never costs the ticket its place. */
+export async function restoreQueued(root, record) {
+  return withLock(root, () => {
+    if (findQueueFile(root, record.id)) return;
+    atomicWriteJson(queueFile(root, record.seq, record.id), record);
+  });
 }
 
 /**
