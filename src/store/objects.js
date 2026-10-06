@@ -5,7 +5,7 @@ import { atomicWriteFile, atomicWriteJson, fsyncDirectory } from '../state.js';
 import { manifestHashOf, isCanonicalRelPath } from '../remote-manifest.js';
 import { MAX_HEADER_BYTES } from '../remote-stream.js';
 import { Journal } from './journal.js';
-import { acquireStoreLock, LockLostError } from './lock.js';
+import { acquireStoreLock, acquireStoreLockAsync, LockLostError } from './lock.js';
 import { RETENTION_DEFAULTS } from './retention.js';
 import { isSha256, isJobId, blobRelPath, manifestRelPath, parseObjectPath } from './ids.js';
 
@@ -116,16 +116,23 @@ function parseManifestDoc(bytes) {
  * Nothing under the root may be a symlink: ancestors are lstat-checked and leaves opened with O_NOFOLLOW.
  */
 export class ObjectStore {
-  constructor(root, { now = Date.now, maxBlobBytes = DEFAULT_MAX_BLOB_BYTES, capBytes = Infinity, replicaMode = false, replicaGraceHours = RETENTION_DEFAULTS.manifestAfterTerminalMs / 3_600_000 } = {}) {
+  constructor(root, { now = Date.now, maxBlobBytes = DEFAULT_MAX_BLOB_BYTES, capBytes = Infinity, replicaMode = false, replicaGraceHours = RETENTION_DEFAULTS.manifestAfterTerminalMs / 3_600_000, lock } = {}) {
     fs.mkdirSync(root, { recursive: true });
     this.root = fs.realpathSync(root); // confine to the real directory; every later path is checked against symlinks below it
-    this.lock = acquireStoreLock(this.root);
+    this.lock = lock ?? acquireStoreLock(this.root); // `ObjectStore.open` passes the platform lock (kernel-held on Linux)
     try {
       this.init({ now, maxBlobBytes, capBytes, replicaMode, replicaGraceHours });
     } catch (err) {
       this.lock.release();
       throw err;
     }
+  }
+
+  /** Open a store holding the platform's lock (the kernel-held abstract socket on Linux, the file lock elsewhere). */
+  static async open(root, opts = {}) {
+    fs.mkdirSync(root, { recursive: true });
+    const lock = await acquireStoreLockAsync(fs.realpathSync(root));
+    return new ObjectStore(root, { ...opts, lock }); // the constructor releases the lock itself if initialisation fails
   }
 
   init({ now, maxBlobBytes, capBytes, replicaMode, replicaGraceHours }) {
@@ -172,9 +179,10 @@ export class ObjectStore {
     }
   }
 
+  /** Returns the lock release (a promise on Linux): await it before re-opening the same root. */
   close() {
     this.journal.close();
-    this.lock.release();
+    return this.lock.release();
   }
 
   /** Absolute path of a store-relative path, refusing a symlink at any existing component. */
@@ -510,6 +518,18 @@ export class ObjectStore {
     return this.setJobState(job, 'pinned', !!pinned);
   }
 
+  /** True while a pinned or non-terminal manifest references the blob: nobody, whoever they are, may delete it. */
+  isProtectedBlob(sha) {
+    for (const name of fs.readdirSync(path.join(this.root, 'manifests'))) {
+      const parsed = parseObjectPath(`manifests/${name}`);
+      if (!parsed) continue;
+      const m = this.meta(parsed.job);
+      if (!m.pinned && m.terminalAt != null) continue;
+      if (this.jobBlobs(parsed.job)?.has(sha)) return true;
+    }
+    return false;
+  }
+
   journalDelete(rel) {
     this.journal.append({ kind: 'delete', path: rel, createdAt: this.now() });
     this.pendingDeletes.delete(rel);
@@ -534,6 +554,7 @@ export class ObjectStore {
   deleteObject(rel) {
     const parsed = parseObjectPath(rel);
     if (!parsed) throw new StoreError(400, 'not an object path');
+    if (parsed.kind === 'blob' && this.isProtectedBlob(parsed.sha)) throw new StoreError(409, 'blob is still referenced by a pinned or non-terminal manifest');
     if (this.verifying.get(rel) > 0) return false; // rejournal is hashing it right now: deferred to the next sweep
     this.flushPendingDeletes();
     const file = this.abs(rel);

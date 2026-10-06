@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { iterateJournal, DEFAULT_CHUNK_BYTES } from './journal.js';
-import { acquireStoreLock } from './lock.js';
+import { acquireStoreLockAsync } from './lock.js';
 import { StoreHttpError } from './client.js';
 import { blobRelPath } from './ids.js';
 import { hashFile } from './objects.js';
@@ -28,12 +28,12 @@ export function replicationLag(store, now = Date.now()) {
  * Recompute the watermark for operators: find the end offset of journal record `seq` with one scan and write a format-2
  * state. Used after an unrecognised watermark file is refused.
  */
-export function rebuildWatermark(root, seq) {
-  const lock = acquireStoreLock(root); // offline only: refuses while a server holds the store
+export async function rebuildWatermark(root, seq) {
+  const lock = await acquireStoreLockAsync(fs.realpathSync(root)); // offline only: refuses while a server holds the store
   try {
     return rebuildLocked(root, seq);
   } finally {
-    lock.release();
+    await lock.release();
   }
 }
 

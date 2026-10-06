@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import net from 'node:net';
 
 export const LOCK_FILE = 'store.lock';
 
@@ -38,6 +39,7 @@ function readLock(file) {
 function holder(file, mine) {
   const fd = fs.openSync(file, 'r');
   const held = fs.fstatSync(fd);
+  let closed = false;
   return {
     assertHeld() {
       let now;
@@ -50,6 +52,8 @@ function holder(file, mine) {
       if (now.ino !== held.ino || now.dev !== held.dev) throw new LockLostError(`store lock ${file} now belongs to another process`);
     },
     release() {
+      if (closed) return;
+      closed = true;
       try {
         if (readLock(file)?.token === mine.token) fs.rmSync(file, { force: true });
       } finally {
@@ -106,4 +110,36 @@ export function acquireStoreLock(root) {
   } finally {
     fs.rmSync(temp, { force: true });
   }
+}
+
+/** `abstract-socket` on Linux (the production hosts), the best-effort `file` lock everywhere else (macOS dev and tests). */
+export function lockMode(platform = process.platform) {
+  return platform === 'linux' ? 'abstract-socket' : 'file';
+}
+
+/**
+ * Linux: the kernel holds the lock. A process binds a Linux ABSTRACT Unix socket named after the store root; `bind` is atomic,
+ * EADDRINUSE means a live owner, and the kernel releases the name the instant the process dies (even SIGKILL). No stale
+ * state, no reclaim, no check-then-write race, so `assertHeld` has nothing to check. Abstract sockets exist only on Linux.
+ */
+export function acquireKernelLock(root) {
+  const name = `\0lane-store:${crypto.createHash('sha256').update(fs.realpathSync(root)).digest('hex').slice(0, 32)}`;
+  return new Promise((resolve, reject) => {
+    const server = net.createServer((conn) => conn.destroy());
+    server.once('error', (err) => {
+      reject(err.code === 'EADDRINUSE' ? new Error(`store ${root} is in use by another live process`) : err);
+    });
+    server.listen(name, () => {
+      server.unref();
+      resolve({
+        assertHeld() {},
+        release: () => (server.listening ? new Promise((done) => server.close(() => done())) : Promise.resolve()),
+      });
+    });
+  });
+}
+
+/** Take the platform's store lock. The handle's `release()` may return a promise: await it before re-opening the root. */
+export async function acquireStoreLockAsync(root) {
+  return lockMode() === 'abstract-socket' ? acquireKernelLock(root) : acquireStoreLock(root);
 }

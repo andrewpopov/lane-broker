@@ -51,9 +51,9 @@ test('N7 opening a store fsyncs the journal before anything can read it', async 
 test('a second ObjectStore on a held root is refused, and an offline tool cannot take it either', async (t) => {
   const srv = await startStore();
   t.after(() => srv.close());
-  assert.throws(() => new ObjectStore(srv.root), /in use/);
+  await assert.rejects(ObjectStore.open(srv.root), /in use/);
   const { rebuildWatermark } = await import('../src/store/replicate.js');
-  assert.throws(() => rebuildWatermark(srv.root, 0), /in use/);
+  await assert.rejects(rebuildWatermark(srv.root, 0), /in use/);
 });
 
 // ---- N8 ----

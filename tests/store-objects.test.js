@@ -114,7 +114,7 @@ test('a manifest must match its hash, reference only stored blobs, and is immuta
 
 test('the store refuses to bind a wildcard address', async () => {
   const { createStore } = await import('../src/store/server.js');
-  const s = createStore({ root: fs.mkdtempSync(path.join((await import('node:os')).tmpdir(), 'ls-')), verifier: createHmacVerifier(SECRET) });
+  const s = await createStore({ root: fs.mkdtempSync(path.join((await import('node:os')).tmpdir(), 'ls-')), verifier: createHmacVerifier(SECRET) });
   await assert.rejects(s.listen('0.0.0.0', 0), /wildcard/);
   await assert.rejects(s.listen('::', 0), /wildcard/);
   await s.close();
