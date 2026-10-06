@@ -204,7 +204,7 @@ export async function withdrawQueued(root, id) {
 export async function restoreQueued(root, record) {
   return withLock(root, () => {
     if (findQueueFile(root, record.id)) return;
-    atomicWriteJson(queueFile(root, nextSeq(root), record.id), record);
+    atomicWriteJson(queueFile(root, record.seq, record.id), record);
   });
 }
 
