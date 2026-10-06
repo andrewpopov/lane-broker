@@ -431,6 +431,19 @@ test('a runtime file under build/ (build/deps/runtime.json) survives the prune a
     fs.symlinkSync(target.replace('ABS', linked), path.join(linked, 'link'));
     assert.deepEqual(collectInstallPathReferences(linked, rolesFor(OLD)), { prunedLink: 'link' }, target);
   }
+  const aliased = tree();
+  plantNodeGypBuild(aliased, OLD);
+  fs.symlinkSync('better-sqlite3/build', path.join(aliased, 'alias'));
+  fs.symlinkSync('alias/Release/obj.target/addon', path.join(aliased, 'addon'));
+  assert.deepEqual(collectInstallPathReferences(aliased, rolesFor(OLD)), { prunedLink: 'addon' }, 'a link through a directory symlink into a pruned path is refused');
+  const dangling = tree();
+  plantNodeGypBuild(dangling, OLD);
+  fs.symlinkSync('nowhere/at/all', path.join(dangling, 'broken'));
+  assert.deepEqual(collectInstallPathReferences(dangling, rolesFor(OLD)), { prunedLink: 'broken' }, 'a link that does not resolve is refused');
+  const escaping = tree();
+  plantNodeGypBuild(escaping, OLD);
+  fs.symlinkSync(tmpDir(), path.join(escaping, 'out'));
+  assert.deepEqual(collectInstallPathReferences(escaping, rolesFor(OLD)), { prunedLink: 'out' }, 'a link that leaves the tree is refused');
   const fine = tree();
   plantNodeGypBuild(fine, OLD);
   fs.symlinkSync('better-sqlite3/build/Release/addon.node', path.join(fine, 'ok-link'));

@@ -32,7 +32,6 @@ import {
   snapshotChanges,
   diffAgainstNewestEntry,
   readKeyPartsSecret,
-  gitRefState,
 } from '../src/deps-cache.js';
 import { resolveTicketConfig, loadGlobalConfig, ConfigError, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { freshEnv, writeRepoConfig, writeGlobalConfig } from './helpers.js';
@@ -180,6 +179,7 @@ test('key parts: digests are keyed with a host-local 0600 secret, never a plain 
   assert.equal(secret.length, 32);
   assert.ok(readKeyPartsSecret(root).equals(secret), 'created once, then reused');
   assert.equal(fs.statSync(path.join(root, '.keyparts.key')).mode & 0o777, 0o600);
+  assert.deepEqual(fs.readdirSync(root), ['.keyparts.key'], 'no temp file left behind');
   const fx = makeKeyFixture();
   const env = { ...fx.inputs().env, API_TOKEN: 'hunter2' };
   const withKey = computeDepsKey({ ...fx.inputs(), env, keyPartsSecret: secret });
@@ -192,20 +192,22 @@ test('key parts: digests are keyed with a host-local 0600 secret, never a plain 
   assert.deepEqual(computeDepsKey({ ...fx.inputs(), env }).keyParts, {}, 'no secret, no digests');
 });
 
-test('git refs: the logical ref state moves on a tag but not on a gc that repacks refs', () => {
-  const repo = tmpDir('deps-cache-refs');
-  const g = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: repo, stdio: 'pipe' });
-  g('init', '-q');
-  fs.writeFileSync(path.join(repo, 'f'), '1');
-  g('add', '-A');
-  g('commit', '-q', '-m', 'one');
-  const before = gitRefState(repo);
-  assert.ok(before);
-  g('gc', '-q');
-  assert.equal(gitRefState(repo), before, 'repacking refs is not a change');
-  g('tag', 'installed');
-  assert.notEqual(gitRefState(repo), before);
-  assert.equal(gitRefState(tmpDir('deps-cache-norepo')), null, 'no repo: unknown');
+test('key parts: a key file that is empty, short, a symlink or the wrong mode yields no secret, so no digests', () => {
+  const plant = (make) => {
+    const root = tmpDir('deps-cache-badkey');
+    make(path.join(root, '.keyparts.key'), root);
+    return readKeyPartsSecret(root);
+  };
+  assert.equal(plant((f) => fs.writeFileSync(f, '', { mode: 0o600 })), null, 'empty');
+  assert.equal(plant((f) => fs.writeFileSync(f, Buffer.alloc(16, 1), { mode: 0o600 })), null, 'short');
+  assert.equal(plant((f) => fs.writeFileSync(f, Buffer.alloc(33, 1), { mode: 0o600 })), null, 'long');
+  assert.equal(plant((f) => fs.writeFileSync(f, Buffer.alloc(32, 1), { mode: 0o644 })), null, 'wrong mode');
+  assert.equal(plant((f, root) => {
+    fs.writeFileSync(path.join(root, 'real'), Buffer.alloc(32, 1), { mode: 0o600 });
+    fs.symlinkSync('real', f);
+  }), null, 'symlink');
+  assert.equal(plant((f) => fs.symlinkSync('/nonexistent/key', f)), null, 'dangling symlink');
+  assert.ok(plant((f) => fs.writeFileSync(f, Buffer.alloc(32, 1), { mode: 0o600 })), 'a valid one is accepted');
 });
 
 test('key parts: a lookup names the labels that differ from the newest published entry', () => {
@@ -851,18 +853,11 @@ test('the allowlisted git-config script explains exactly its own .git/config lin
   assert.deepEqual(unexplainedChanges(changes, { scripts, configBefore: withHooks, configAfter: `${base}\thooksPath = .githooks\n` }), [], 'rewriting the same value');
 
   assert.deepEqual(unexplainedChanges([...changes, '.git/hooks', '.git/hooks/pre-commit'], { scripts, configBefore: base, configAfter: withHooks }), ['.git/hooks', '.git/hooks/pre-commit'], 'a new hook file is not explained');
-  assert.deepEqual(unexplainedChanges(changes, { scripts, configBefore: base, configAfter: `${withHooks}\tsshCommand = evil\n` }), ['.git/config'], 'another config line is not explained');
-  assert.deepEqual(unexplainedChanges(changes, { scripts, configBefore: base, configAfter: `${base}\thooksPath = /tmp/evil\n` }), ['.git/config'], 'a different hooksPath is not explained');
-  assert.deepEqual(unexplainedChanges(changes, { scripts: {}, configBefore: base, configAfter: withHooks }), ['.git/config'], 'without the allowlisted script the config change is not explained');
+  assert.deepEqual(unexplainedChanges(changes, { scripts, configBefore: base, configAfter: `${withHooks}\tsshCommand = evil\n` }), changes, 'another config line is not explained');
+  assert.deepEqual(unexplainedChanges(changes, { scripts, configBefore: base, configAfter: `${base}\thooksPath = /tmp/evil\n` }), changes, 'a different hooksPath is not explained');
+  assert.deepEqual(unexplainedChanges(changes, { scripts: {}, configBefore: base, configAfter: withHooks }), changes, 'without the allowlisted script nothing under .git is explained');
   assert.deepEqual(unexplainedChanges(['generated.txt', '.git/config'], { scripts, configBefore: base, configAfter: withHooks }), ['generated.txt']);
   assert.deepEqual(allowlistedRootEvents({ prepare: scripts.prepare, postinstall: 'husky install', prepublish: scripts.prepare }), ['prepublish', 'prepare']);
-});
-
-test('git bookkeeping a background gc rewrites never counts as an install write; behaviour-changing .git files still do (BRAIN-423)', () => {
-  const gcNoise = ['.git', '.git/gc.pid', '.git/info', '.git/info/refs', '.git/objects', '.git/objects/pack', '.git/objects/pack/tmp_pack_aB3x', '.git/packed-refs', '.git/refs/heads/master', '.git/logs/HEAD'];
-  assert.deepEqual(unexplainedChanges(gcNoise, { scripts: {}, configBefore: null, configAfter: null }), []);
-  const behaviour = ['.git/config', '.git/HEAD', '.git/index', '.git/hooks', '.git/hooks/pre-push', '.git/info/exclude'];
-  assert.deepEqual(unexplainedChanges([...gcNoise, ...behaviour, 'generated.txt'], { scripts: {}, configBefore: null, configAfter: null }), [...behaviour, 'generated.txt']);
 });
 
 test('scrubDepsEnv removes shell and lane variables, and keeps the ssh/auth and temp-dir ones the install needs', () => {

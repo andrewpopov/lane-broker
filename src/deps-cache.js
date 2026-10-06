@@ -29,7 +29,7 @@ import { isProcessAlive, processStartTime } from './process-liveness.js';
 export const DEFAULT_DEPS_CACHE_MAX_BYTES = 10 * 1024 ** 3;
 
 /** Bumping this invalidates every existing entry. */
-const KEY_VERSION = 'v4';
+const KEY_VERSION = 'v5';
 
 /** npm reads npm-shrinkwrap.json in preference to package-lock.json. */
 const LOCKFILES = ['npm-shrinkwrap.json', 'package-lock.json'];
@@ -286,33 +286,13 @@ export function allowlistedRootEvents(scripts) {
   return ROOT_SCRIPT_NAMES.filter((name) => name in scripts && ALLOWED_ROOT_SCRIPTS.has(scripts[name]));
 }
 
-/**
- * Under `.git`, only these files can change what a later command in the work dir does (config, HEAD, the index,
- * hooks, the local ignore/attributes files). Everything else is storage churn a background `git gc --auto` rewrites
- * during any install (objects, `gc.pid`, `gc.log`, `info/refs`, `packed-refs`, loose ref files, logs), so it says
- * nothing about what the install did. What refs POINT AT is semantic and is compared separately, as the logical ref
- * state before and after (`gitRefState`), so a gc that only repacks them never counts and a new tag always does.
- * The `.git` directory entry itself only reflects its children.
- */
-const GIT_BEHAVIOUR_RE = /^\.git\/(?:config|HEAD|index|hooks(?:\/|$)|info\/(?:exclude|attributes)$|attributes$)/;
-const isGitBookkeeping = (change) => change === '.git' || (change.startsWith('.git/') && !GIT_BEHAVIOUR_RE.test(change));
-
-/** The work dir's logical refs: every ref and its object (`git for-each-ref`) plus HEAD's target. Null when git cannot say. */
-export function gitRefState(workDir) {
-  const run = (args) => execFileSync('git', args, { cwd: workDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-  try {
-    return `${run(['symbolic-ref', '-q', 'HEAD']).trim()}\n${run(['for-each-ref', '--format=%(refname) %(objectname)'])}`;
-  } catch {
-    return null;
-  }
-}
-
 const configLines = (text) => (text ?? '').split('\n').map((l) => l.trim()).filter((l) => l !== '');
 
 /**
  * Of the outside-`node_modules` `changes` an install made, those the allowlisted root scripts do NOT explain.
- * The scripts' only expected effect is rewriting the work dir's `.git/config`; that is explained only if the config differs by exactly the lines those scripts write. A new hook file, or
- * any other write to a `.git` file that changes behaviour (`GIT_BEHAVIOUR_RE`), stays unexplained.
+ * The scripts' only expected effect is rewriting the work dir's `.git/config` (and so `.git`'s own entry);
+ * that is explained only if the config differs by exactly the lines those scripts write. A new hook file, or
+ * any other `.git` write, stays unexplained.
  */
 export function unexplainedChanges(changes, { scripts, configBefore, configAfter }) {
   const expected = allowlistedRootEvents(scripts).map((e) => ALLOWED_ROOT_SCRIPTS.get(scripts[e])).filter(Boolean);
@@ -321,7 +301,7 @@ export function unexplainedChanges(changes, { scripts, configBefore, configAfter
   const added = after.filter((l) => !before.includes(l));
   const removed = before.filter((l) => !after.includes(l));
   const configExplained = expected.length > 0 && added.every((l) => expected.some((re) => re.test(l))) && removed.every((l) => expected.some((re) => re.test(l)));
-  return changes.filter((c) => !(configExplained && c === '.git/config') && !isGitBookkeeping(c));
+  return changes.filter((c) => !(configExplained && (c === '.git' || c === '.git/config')));
 }
 
 /**
@@ -506,19 +486,51 @@ export function findMissingInstalled(lock, installed, system) {
  * should share a key but do not name the leaking input here.
  */
 /**
- * The host-local secret that keys the diagnostic digests in `meta.json`, created 0600 on first use. A plain hash of
- * an env value would let anyone who can read `meta.json` test guesses for a low-entropy secret; the cache key itself
- * is never derived from this.
+ * The host-local secret that keys the diagnostic digests in `meta.json`: 32 random bytes in a 0600 file in the
+ * store root, created atomically (temp file, fsync, rename; a concurrent creator that wins is read instead). A plain
+ * hash of an env value would let anyone who can read `meta.json` test guesses for a low-entropy secret; the cache key
+ * itself is never derived from this. Null when the file is not exactly what we wrote (a symlink, someone else's,
+ * another mode, another length): diagnostics are optional, so nothing is ever HMAC'd under a doubtful key.
  */
+const KEY_PARTS_SECRET_BYTES = 32;
+
 export function readKeyPartsSecret(cacheRoot) {
   const file = path.join(cacheRoot, '.keyparts.key');
-  fs.mkdirSync(cacheRoot, { recursive: true });
   try {
-    fs.writeFileSync(file, crypto.randomBytes(32), { flag: 'wx', mode: 0o600 });
-  } catch (err) {
-    if (err.code !== 'EEXIST') throw err;
+    fs.mkdirSync(cacheRoot, { recursive: true });
+    if (!fs.existsSync(file) && !pathIsLink(file)) {
+      const tmp = path.join(cacheRoot, `.tmp-keyparts-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
+      const fd = fs.openSync(tmp, 'wx', 0o600);
+      try {
+        fs.writeSync(fd, crypto.randomBytes(KEY_PARTS_SECRET_BYTES));
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      try {
+        fs.linkSync(tmp, file); // fails if a concurrent creator already won, so theirs is never replaced
+      } catch (err) {
+        if (err.code !== 'EEXIST') throw err;
+      } finally {
+        fs.rmSync(tmp, { force: true });
+      }
+    }
+    const st = fs.lstatSync(file);
+    const ours = typeof process.getuid !== 'function' || st.uid === process.getuid();
+    if (!st.isFile() || !ours || (st.mode & 0o777) !== 0o600 || st.size !== KEY_PARTS_SECRET_BYTES) return null;
+    const secret = fs.readFileSync(file);
+    return secret.length === KEY_PARTS_SECRET_BYTES ? secret : null;
+  } catch {
+    return null;
   }
-  return fs.readFileSync(file);
+}
+
+function pathIsLink(file) {
+  try {
+    return fs.lstatSync(file).isSymbolicLink();
+  } catch {
+    return false;
+  }
 }
 
 export function diffAgainstNewestEntry(cacheRoot, keyParts) {
@@ -923,7 +935,7 @@ const PATH_LEADERS = new Set(Buffer.from('"\'`([{ \t\n\r\v\f', 'latin1'));
  *     `build/` (`build/deps/`, `build/Release/*.node`, anything a package reads at run time) is touched;
  *   - `__pycache__` under `node-gyp/.../pylib/` where every `.pyc` has its `.py` source beside the cache.
  * `npm rebuild` still works: it runs `node-gyp rebuild`, which configures from `binding.gyp` again. A symlink that
- * points into a pruned path makes the tree uncacheable (`pointsIntoPruned`) rather than dangling.
+ * points into a pruned path makes the tree uncacheable (`refusesLink`) rather than dangling.
  */
 const NODE_GYP_INTERMEDIATE_RE = /^(.*\/)?build\/(?:Makefile|binding\.Makefile|[^/]+\.target\.mk|config\.gypi|gyp-mac-tool|(?:Release|Debug)\/(?:\.deps|obj\.target))$/;
 const GYP_PYCACHE_RE = /(?:^|\/)node-gyp\/(?:.*\/)?pylib\/(?:.*\/)?__pycache__$/;
@@ -945,16 +957,33 @@ function isRegenerableBuildArtifact(tree, rel) {
   return match !== null && fs.existsSync(path.join(tree, match[1] ?? '', 'binding.gyp'));
 }
 
-/** Does the symlink at `linkAbs` (text `target`) point at, or inside, a pruned path of `tree`? */
-function pointsIntoPruned(tree, linkAbs, target) {
-  const resolved = path.resolve(path.dirname(linkAbs), target);
-  for (const base of new Set([tree, fs.realpathSync(tree)])) {
-    const rel = path.relative(base, resolved);
-    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) continue;
-    const parts = rel.split(path.sep);
-    if (parts.some((_, i) => isRegenerableBuildArtifact(tree, parts.slice(0, i + 1).join('/')))) return true;
+/**
+ * Does the symlink at `linkAbs` lead to, or into, a pruned path of `tree`, or somewhere we cannot vouch for? It is
+ * resolved fully (`realpath`, through any intermediate directory symlinks) and the landing spot tested against the
+ * pruned set. A link that escapes the tree or cannot be resolved answers true (the tree is refused, not guessed at),
+ * except a link whose text names an install path (`namesInstallPath`): that is relocation's business and may well not
+ * resolve here, so it is only tested lexically.
+ */
+function refusesLink(tree, linkAbs, target, namesInstallPath) {
+  const root = fs.realpathSync(tree);
+  const prunedUnder = (abs) => {
+    for (const base of new Set([tree, root])) {
+      const rel = path.relative(base, abs);
+      if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) continue;
+      const parts = rel.split(path.sep);
+      if (parts.some((_, i) => isRegenerableBuildArtifact(tree, parts.slice(0, i + 1).join('/')))) return true;
+    }
+    return false;
+  };
+  let real;
+  try {
+    real = fs.realpathSync(linkAbs);
+  } catch {
+    return namesInstallPath ? prunedUnder(path.resolve(path.dirname(linkAbs), target)) : true;
   }
-  return false;
+  const rel = path.relative(root, real);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return !namesInstallPath;
+  return prunedUnder(real);
 }
 
 const strictOccurrence = (buf, start, end) => (start === 0 || PATH_LEADERS.has(buf[start - 1])) && (end === buf.length || PATH_FOLLOWERS.has(buf[end]));
@@ -1055,7 +1084,7 @@ function scanTree(tree, groups, pairs, marker) {
       if (ent.isDirectory()) outcome = walk(p, r);
       else if (ent.isSymbolicLink()) {
         const target = Buffer.from(fs.readlinkSync(p), 'utf8');
-        if (pointsIntoPruned(tree, p, target.toString('utf8'))) return { prunedLink: r };
+        if (refusesLink(tree, p, target.toString('utf8'), pairs.some((pr) => target.includes(pr.from)))) return { prunedLink: r };
         if (target.includes(marker)) return { collision: true };
         const hit = pairs.some((pr) => target.includes(pr.from));
         if (hit && rewritePrefixes(target, pairs, anchoredOccurrence) === null) return { ambiguous: r };

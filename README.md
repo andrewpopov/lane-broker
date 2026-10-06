@@ -561,13 +561,9 @@ reason.
   - the install changed a file outside `node_modules` (a hit would skip
     whatever wrote it). The only exception is the one `.git/config` line the
     allowlisted script writes (`hooksPath = .githooks`); a new hook file or
-    any other `.git` file that changes behaviour (`config`, `HEAD`, `index`,
-    `hooks/`, `info/exclude`, `info/attributes`, `attributes`) is not cached.
-    Storage churn (objects, `gc.pid`, `info/refs`, `packed-refs`, loose ref
-    files) never counts, but the logical refs (`git for-each-ref` plus HEAD's
-    target) are compared before and after, so a new tag or moved branch does. The synthetic snapshot commit also runs with
-    `gc.auto=0`, because a snapshot of a few thousand files made git start a
-    detached `gc --auto` that rewrote `.git` into the deps phase;
+    any other `.git` write is not cached. The synthetic snapshot commit runs
+    with `gc.auto=0` and `maintenance.auto=false`, because a snapshot of a few
+    thousand files made git start a detached `gc --auto` that rewrote `.git` into the deps phase;
   - npm's own record (`node_modules/.package-lock.json`) lacks a lock entry
     that applies to this platform (`os`, `cpu`, `libc`), as when npm skips an
     optional dependency: `reason=incomplete-optional missing=<names>`;
@@ -597,7 +593,7 @@ reason.
   `Release|Debug/obj.target` (`build/deps/`, `build/Release/*.node` and the
   rest stay); and node-gyp's own `__pycache__` under `pylib/` where each
   `.pyc` has its `.py` beside it. A symlink pointing into a pruned path
-  skips the cache (`reason=symlink-into-pruned-build-path`). `npm rebuild`
+  skips the cache (`reason=symlink-into-pruned-or-unresolvable`); every symlink is resolved with `realpath`, and one that leaves the tree or does not resolve is refused too (unless its text names an install path, which relocation handles). `npm rebuild`
   still works, as it runs `node-gyp rebuild`, which configures again.
 
   Every other tree that names an install path in text files or symlinks is

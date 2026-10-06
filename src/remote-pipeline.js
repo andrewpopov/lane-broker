@@ -20,7 +20,6 @@ import {
   readRelocation,
   diffAgainstNewestEntry,
   readKeyPartsSecret,
-  gitRefState,
   relocateRestoredTree,
   scrubDepsEnv,
   allowlistedRootEvents,
@@ -312,7 +311,6 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
   }
 
   const before = key ? snapshotInstallSurface(cwd, workDir) : null;
-  const refsBefore = key ? gitRefState(workDir) : null;
   const configBefore = key ? readTextOrNull(path.join(workDir, '.git', 'config')) : null;
   const exitCode = await runPhaseCommand(DEPS_INSTALL_ARGV, cwd, depsEnv);
   if (!key) return { exitCode, record: done('skip', { reason: keyed.reason }) };
@@ -320,7 +318,6 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
 
   const configAfter = readTextOrNull(path.join(workDir, '.git', 'config'));
   const outside = unexplainedChanges(snapshotChanges(before, snapshotInstallSurface(cwd, workDir)), { scripts: keyed.scripts, configBefore, configAfter });
-  if (gitRefState(workDir) !== refsBefore) outside.push('.git (a ref or HEAD target changed)');
   if (outside.length > 0) {
     const shown = outside.slice(0, 3).join(', ');
     return { exitCode, record: done('miss', { key, published: false, reason: `install changed files outside node_modules: ${shown}${outside.length > 3 ? ', ...' : ''}` }) };
@@ -331,7 +328,7 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
   const missing = missingInstalled(path.join(cwd, 'node_modules'), keyed.lock);
   if (missing) return { exitCode, record: done('skip', { key, reason: 'incomplete-optional', missing }) };
   const references = collectInstallPathReferences(path.join(cwd, 'node_modules'), installPathRoles(workDir, depsEnv));
-  if (references.prunedLink) return { exitCode, record: done('skip', { key, reason: 'symlink-into-pruned-build-path', file: references.prunedLink }) };
+  if (references.prunedLink) return { exitCode, record: done('skip', { key, reason: 'symlink-into-pruned-or-unresolvable', file: references.prunedLink }) };
   if (references.binary) return { exitCode, record: done('skip', { key, reason: 'absolute-install-path-binary', file: references.binary }) };
   if (references.ambiguous) return { exitCode, record: done('skip', { key, reason: 'absolute-install-path-ambiguous', file: references.ambiguous }) };
   try {
