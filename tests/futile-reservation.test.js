@@ -2,11 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { freshEnv, writeGlobalConfig } from './helpers.js';
-import { enqueue, tryStart, readResourceSkipState } from '../src/scheduler.js';
+import { enqueue, tryStart, listQueue, readResourceSkipState } from '../src/scheduler.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { writeLease, removeLease, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths, atomicWriteJson } from '../src/state.js';
+import { resolveScheduler, fairnessStore, effectiveView } from '../src/fairness.js';
+import { fenceLegacyQueue } from '../src/migrate.js';
 
 /**
  * BRAIN-418: a head whose reservation is futile (it would still be denied with every lane lease drained, because
@@ -32,7 +34,7 @@ const cfg = {
 
 const sampler = (hostBusyCores) => () => ({ hostBusyCores, cores: 10, stale: false, sampledAt: Date.now() });
 const memory = (overrides = {}) => () => ({ availableBytes: 64 * GIB, totalBytes: 64 * GIB, macPressure: 'normal', source: 'test', ...overrides });
-const poll = (state, t, { ext, mem = memory() }) => tryStart(state, t, cfg, undefined, sampler(ext), undefined, mem);
+const poll = (state, t, { ext, mem = memory(), cfg: c = cfg }) => tryStart(state, t, c, undefined, sampler(ext), undefined, mem);
 const readLog = (state) => fs.readFileSync(paths(state).admissionLog, 'utf8');
 
 function ticket(id, overrides = {}) {
@@ -52,8 +54,8 @@ async function statusText(home, state) {
   }
 }
 
-function holdLease(state, id, weight) {
-  writeLease(state, { id, key: `held:${id}`, bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight, state: LEASE_STATE.RUNNING });
+function holdLease(state, id, weight, extra = {}) {
+  writeLease(state, { ...extra, id, key: `held:${id}`, bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight, state: LEASE_STATE.RUNNING });
 }
 
 test('futile: external load alone rules the head out, so a ticket behind it is admitted without spending the skip budget', async () => {
@@ -129,4 +131,60 @@ test('when external load drops the head starts, ahead of tickets that queued aft
   const queueIds = fs.readdirSync(paths(state).queue).filter((f) => f.includes('later') || f.includes('head'));
   assert.ok(queueIds.every((f) => !f.includes('head')), 'head left the queue');
   assert.ok(queueIds.some((f) => f.includes('later')), 'the later ticket is still waiting behind it');
+});
+
+// Codex review of BRAIN-418: futility must mean "denied even if every lane lease drained", by the live predicates.
+const observed = (cores, memoryBytes) => ({ observedCpuCores: cores, observedAt: Date.now(), observedMemoryBytes: memoryBytes });
+
+test('P1 memory: RAM the running lanes occupy is handed back before judging, so a head that fits once they drain is not futile', async () => {
+  const { state } = freshEnv();
+  const head = ticket('head', { weight: 1, resources: { cpuCores: 1, memoryBytes: 8 * GIB } });
+  await enqueue(state, head);
+  holdLease(state, 'lane-a', 1, observed(0.1, 3 * GIB));
+  holdLease(state, 'lane-b', 1, observed(0.1, 3 * GIB));
+  const denied = await poll(state, head, { ext: 0.2, mem: memory({ availableBytes: 6 * GIB }) }); // 6 + 6 - 8 >= 2 reserve once drained
+  assert.equal(denied.reason, 'memory-admission');
+  assert.equal(readResourceSkipState(state)?.futile, undefined);
+});
+
+test('P1 idle exemption: a head the exemption would start on a drained broker is not futile', async () => {
+  const { state } = freshEnv();
+  const head = ticket('head', { weight: 8 });
+  await enqueue(state, head);
+  holdLease(state, 'lane-a', 1, observed(0.1));
+  // external 2 + head 8 = 10 > 9 but within the 1-core overshoot the idle exemption grants
+  const denied = await poll(state, head, { ext: 2.1, cfg: { ...cfg, resourceIdleOvershootCores: 1 } });
+  assert.equal(denied.cpuReason, 'projected-over-budget');
+  assert.equal(readResourceSkipState(state).futile, undefined);
+});
+
+test('P2 attribution: a lane with no fresh CPU observation is indistinguishable from external load, so no futility', async () => {
+  const { state } = freshEnv();
+  const head = ticket('head', { weight: 4 });
+  await enqueue(state, head);
+  holdLease(state, 'unobserved', 1);
+  const denied = await poll(state, head, { ext: 7 }); // 7 "external" + 4 > 9, but part of the 7 may be the lane
+  assert.equal(denied.cpuReason, 'projected-over-budget');
+  assert.equal(readResourceSkipState(state).futile, undefined);
+});
+
+test('P2 v2: a futile head drops its persisted reservation so the next dormant owner is promoted', async () => {
+  const { state } = freshEnv();
+  atomicWriteJson(paths(state).schedFence, { version: 2, migratedAt: Date.now() });
+  fenceLegacyQueue(state, 'test');
+  const rec = (seq) => ({ reason: 'resource', skipsCharged: 3, reserved: true, reservationSeq: seq, inScope: true, behindConflict: false, deniedAt: Date.now(), budget: 9, externalBusy: 7 });
+  atomicWriteJson(paths(state).fairness, { version: 2, tickets: { a: { resource: rec(10) }, b: { resource: rec(11) } } });
+  const a = ticket('a', { weight: 4 });
+  await enqueue(state, a);
+  await enqueue(state, ticket('b', { weight: 4 }));
+  const owner = () => {
+    const sched = resolveScheduler(state, { log: false });
+    return effectiveView(listQueue(state), Date.now(), cfg, fairnessStore(state, sched.tickets)).ownerId;
+  };
+  assert.equal(owner(), 'a');
+  await poll(state, a, { ext: 7 }); // futile: 7 + 4 > 9 with nothing running
+  const stored = JSON.parse(fs.readFileSync(paths(state).fairness, 'utf8')).tickets.a.resource;
+  assert.equal(stored.reserved, false);
+  assert.equal(stored.reservationSeq, undefined);
+  assert.equal(owner(), 'b', 'B\'s dormant reservation becomes the active one');
 });
