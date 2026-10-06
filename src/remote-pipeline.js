@@ -18,6 +18,8 @@ import {
   collectInstallPathReferences,
   installPathRoles,
   readRelocation,
+  diffAgainstNewestEntry,
+  readKeyPartsSecret,
   relocateRestoredTree,
   scrubDepsEnv,
   allowlistedRootEvents,
@@ -115,7 +117,7 @@ async function runPhaseCommand(argv, cwd, env) {
 }
 
 /** BRAIN-389: the one log line per deps dir, on the pipeline's stderr, which flows to the submitter. */
-function logDepsCache(outcome, dir, ms, { key, published, reason, file, missing } = {}) {
+function logDepsCache(outcome, dir, ms, { key, published, reason, file, missing, keyDiff } = {}) {
   const fields = [
     key ? `key=${key.slice(0, 12)}` : null,
     `dir=${dir}`,
@@ -123,6 +125,7 @@ function logDepsCache(outcome, dir, ms, { key, published, reason, file, missing 
     published === undefined ? null : `published=${published ? 'yes' : 'no'}`,
     reason ? `reason=${/^[\w-]+$/.test(reason) ? reason : JSON.stringify(reason)}` : null,
     file ? `file=${file}` : null,
+    keyDiff && keyDiff.length > 0 ? `keydiff=${keyDiff.slice(0, 8).join(',')}${keyDiff.length > 8 ? ',...' : ''}` : null,
     missing ? `missing=${missing.slice(0, 5).join(',')}${missing.length > 5 ? ',...' : ''}` : null,
   ].filter(Boolean);
   process.stderr.write(`deps-cache ${outcome} ${fields.join(' ')}\n`);
@@ -247,8 +250,8 @@ async function replayRootScripts(cwd, scripts, depsEnv, npmConfig) {
 }
 
 /** Copy the freshly installed tree into the store, then trim the store to its bound under the broker lock. */
-async function publishAndEvict(depsCache, key, cwd, releaseLeases, relocation) {
-  const result = publishToStore(depsCache.root, key, path.join(cwd, 'node_modules'), relocation);
+async function publishAndEvict(depsCache, key, cwd, releaseLeases, relocation, keyParts) {
+  const result = publishToStore(depsCache.root, key, path.join(cwd, 'node_modules'), relocation, keyParts);
   if (!result.published) return result;
   touchLastUsed(depsCache.root, key);
   try {
@@ -276,6 +279,7 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
       ...(fields.reason ? { reason: fields.reason } : {}),
       ...(fields.file ? { file: fields.file } : {}),
       ...(fields.missing ? { missing: fields.missing } : {}),
+      ...(fields.keyDiff?.length ? { keyDiff: fields.keyDiff } : {}),
     };
   };
 
@@ -292,6 +296,7 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
         env: depsEnv,
         npmVersion: npmVersion(),
         rootScriptsSafe: depsCache.rootScriptsSafe === true,
+        keyPartsSecret: readKeyPartsSecret(depsCache.root),
       });
     } catch (err) {
       keyed = { key: null, reason: `key not computed: ${err.message}` };
@@ -323,11 +328,13 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
   const missing = missingInstalled(path.join(cwd, 'node_modules'), keyed.lock);
   if (missing) return { exitCode, record: done('skip', { key, reason: 'incomplete-optional', missing }) };
   const references = collectInstallPathReferences(path.join(cwd, 'node_modules'), installPathRoles(workDir, depsEnv));
+  if (references.prunedLink) return { exitCode, record: done('skip', { key, reason: 'symlink-into-pruned-or-unresolvable', file: references.prunedLink }) };
   if (references.binary) return { exitCode, record: done('skip', { key, reason: 'absolute-install-path-binary', file: references.binary }) };
   if (references.ambiguous) return { exitCode, record: done('skip', { key, reason: 'absolute-install-path-ambiguous', file: references.ambiguous }) };
   try {
-    const result = await publishAndEvict(depsCache, key, cwd, releaseLeases, references.relocation);
-    return { exitCode, record: done('miss', { key, published: result.published, ...(result.published ? {} : { reason: 'another run published this key first' }) }) };
+    const keyDiff = diffAgainstNewestEntry(depsCache.root, keyed.keyParts);
+    const result = await publishAndEvict(depsCache, key, cwd, releaseLeases, references.relocation, keyed.keyParts);
+    return { exitCode, record: done('miss', { key, keyDiff, published: result.published, ...(result.published ? {} : { reason: 'another run published this key first' }) }) };
   } catch (err) {
     // the tree is installed and usable for this run whatever happened to the store
     return { exitCode, record: done('miss', { key, published: false, reason: `publish failed: ${err.message}` }) };

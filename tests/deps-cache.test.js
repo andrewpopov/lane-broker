@@ -30,6 +30,8 @@ import {
   allowlistedRootEvents,
   snapshotOutsideNodeModules,
   snapshotChanges,
+  diffAgainstNewestEntry,
+  readKeyPartsSecret,
 } from '../src/deps-cache.js';
 import { resolveTicketConfig, loadGlobalConfig, ConfigError, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { freshEnv, writeRepoConfig, writeGlobalConfig } from './helpers.js';
@@ -154,6 +156,67 @@ test('key: identical inputs give the same key; volatile variables do not matter,
     Object.assign(i.env, change);
     assert.notEqual(computeDepsKey(i).key, a.key, `${Object.keys(change)[0]} is part of the key`);
   }
+});
+
+test('key: per-run variables never change the key; any other value, path-bearing or not, does (BRAIN-423)', () => {
+  const fx = makeKeyFixture();
+  const keyFor = (extra) => computeDepsKey({ ...fx.inputs(), env: { ...fx.inputs().env, ...extra } }).key;
+  const base = keyFor({});
+  const perRun = [
+    { INVOCATION_ID: 'a'.repeat(32) }, { JOURNAL_STREAM: '8:123' }, { SYSTEMD_EXEC_PID: '99' },
+    { MEMORY_PRESSURE_WATCH: '/sys/fs/cgroup/x/memory.pressure' }, { XDG_SESSION_ID: '42' }, { LISTEN_PID: '7' },
+    { LANE_BROKER_CPU_CORES: '3' }, { TMPDIR: '/var/tmp/lb-xyz' },
+  ];
+  for (const extra of perRun) assert.equal(keyFor(extra), base, `${Object.keys(extra)[0]} is not an input`);
+  assert.notEqual(keyFor({ CFLAGS: '-O0' }), base, 'a real install input still is');
+
+  assert.notEqual(keyFor({ CFLAGS: '-I/r/a/work-extra' }), keyFor({ CFLAGS: '-I/r/b/work-extra' }), 'values stay verbatim: different directories are different inputs');
+});
+
+test('key parts: digests are keyed with a host-local 0600 secret, never a plain sha256 of the value', () => {
+  const root = tmpDir('deps-cache-parts');
+  const secret = readKeyPartsSecret(root);
+  assert.equal(secret.length, 32);
+  assert.ok(readKeyPartsSecret(root).equals(secret), 'created once, then reused');
+  assert.equal(fs.statSync(path.join(root, '.keyparts.key')).mode & 0o777, 0o600);
+  assert.deepEqual(fs.readdirSync(root), ['.keyparts.key'], 'no temp file left behind');
+  const fx = makeKeyFixture();
+  const env = { ...fx.inputs().env, API_TOKEN: 'hunter2' };
+  const withKey = computeDepsKey({ ...fx.inputs(), env, keyPartsSecret: secret });
+  const plain = crypto.createHash('sha256').update('hunter2').digest('hex');
+  assert.ok(withKey.keyParts['env:API_TOKEN'], 'a keyed digest is recorded');
+  assert.ok(!plain.startsWith(withKey.keyParts['env:API_TOKEN']), 'and it is not the plain sha256');
+  const key2 = computeDepsKey({ ...fx.inputs(), env, keyPartsSecret: crypto.randomBytes(32) });
+  assert.equal(key2.key, withKey.key, 'the cache key does not depend on the secret');
+  assert.notEqual(key2.keyParts['env:API_TOKEN'], withKey.keyParts['env:API_TOKEN']);
+  assert.deepEqual(computeDepsKey({ ...fx.inputs(), env }).keyParts, {}, 'no secret, no digests');
+});
+
+test('key parts: a key file that is empty, short, a symlink or the wrong mode yields no secret, so no digests', () => {
+  const plant = (make) => {
+    const root = tmpDir('deps-cache-badkey');
+    make(path.join(root, '.keyparts.key'), root);
+    return readKeyPartsSecret(root);
+  };
+  assert.equal(plant((f) => fs.writeFileSync(f, '', { mode: 0o600 })), null, 'empty');
+  assert.equal(plant((f) => fs.writeFileSync(f, Buffer.alloc(16, 1), { mode: 0o600 })), null, 'short');
+  assert.equal(plant((f) => fs.writeFileSync(f, Buffer.alloc(33, 1), { mode: 0o600 })), null, 'long');
+  assert.equal(plant((f) => fs.writeFileSync(f, Buffer.alloc(32, 1), { mode: 0o644 })), null, 'wrong mode');
+  assert.equal(plant((f, root) => {
+    fs.writeFileSync(path.join(root, 'real'), Buffer.alloc(32, 1), { mode: 0o600 });
+    fs.symlinkSync('real', f);
+  }), null, 'symlink');
+  assert.equal(plant((f) => fs.symlinkSync('/nonexistent/key', f)), null, 'dangling symlink');
+  assert.ok(plant((f) => fs.writeFileSync(f, Buffer.alloc(32, 1), { mode: 0o600 })), 'a valid one is accepted');
+});
+
+test('key parts: a lookup names the labels that differ from the newest published entry', () => {
+  const root = tmpDir('deps-cache-diff');
+  assert.equal(diffAgainstNewestEntry(root, { a: '1' }), null, 'no entry');
+  const src = makeTree(tmpDir('deps-cache-src'));
+  publishToStore(root, newKey(), src, null, { 'env:A': 'aaa', 'env:B': 'bbb', same: 's' });
+  assert.deepEqual(diffAgainstNewestEntry(root, { 'env:A': 'aaa', 'env:B': 'xxx', 'env:C': 'ccc', same: 's' }), ['env:B', 'env:C']);
+  assert.deepEqual(diffAgainstNewestEntry(root, { 'env:A': 'aaa', 'env:B': 'bbb', same: 's' }), []);
 });
 
 test('key: every key input changes the key', () => {
@@ -444,6 +507,22 @@ test('optional completeness: only dependents that resolve to the exact lock path
   const installed = { 'node_modules/app': {} };
   assert.deepEqual(findMissingInstalled(lock, installed, linuxHost), ['app/node_modules/dep'], 'app resolves its nested dep; the hoisted copy only serves the skipped mac-tool');
   assert.deepEqual(findMissingInstalled(lock, { ...installed, 'node_modules/app/node_modules/dep': {} }, linuxHost), []);
+});
+
+test('optional completeness: a multi-level chain under a platform-skipped package (rouge: dmg-license > verror > assert-plus) is expected, and a required one is not', () => {
+  const lock = dmgLicenseLock();
+  Object.assign(lock.packages['node_modules/dmg-license'].dependencies, { verror: '^1' });
+  Object.assign(lock.packages, {
+    'node_modules/verror': { version: '1', dev: true, optional: true, dependencies: { 'assert-plus': '^1', 'core-util-is': '1' } },
+    'node_modules/core-util-is': { version: '1', dev: true, optional: true },
+    'node_modules/@img/sharp-wasm32': { version: '1', optional: true, cpu: ['wasm32'], dependencies: { '@emnapi/runtime': '^1' } },
+    'node_modules/@emnapi/runtime': { version: '1', optional: true },
+  });
+  lock.packages['node_modules/app'].optionalDependencies = { '@img/sharp-wasm32': '1' };
+  const installed = { 'node_modules/app': {}, 'node_modules/xmlbuilder': {} };
+  assert.deepEqual(findMissingInstalled(lock, installed, linuxHost), []);
+  lock.packages['node_modules/core-util-is'].optional = false;
+  assert.deepEqual(findMissingInstalled(lock, installed, linuxHost), ['core-util-is'], 'a required package absent is still missing');
 });
 
 // ---- publish / materialize ----

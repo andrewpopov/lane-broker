@@ -50,7 +50,9 @@ const SYNTHETIC_GIT_ENV = {
  * status --porcelain`, a test's `git check-ignore`, ...) sees a working
  * tree rather than "not a git repository". Runs with git's repo-local env
  * scrubbed (same helper `buildManifest` uses) plus a fixed author/committer
- * identity, hooks disabled, and gpg signing off. Returns `{ok:true}` or
+ * identity, hooks disabled, and gpg signing off. Auto-gc is off: a snapshot of
+ * a few thousand files makes `git commit` start a detached `gc --auto` that keeps
+ * rewriting `.git` (gc.pid, tmp_pack_*, info/refs) into the deps phase. Returns `{ok:true}` or
  * `{ok:false, reason}` -- never throws.
  */
 function gitInitSnapshot(workDir) {
@@ -60,7 +62,7 @@ function gitInitSnapshot(workDir) {
     env,
     stdio: ['ignore', 'ignore', 'pipe'],
   };
-  const gitArgs = ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'core.autocrlf=false', '-c', 'core.fileMode=true'];
+  const gitArgs = ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'core.autocrlf=false', '-c', 'core.fileMode=true', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false'];
   try {
     execFileSync('git', [...gitArgs, 'init', '-q'], common);
     execFileSync('git', [...gitArgs, 'add', '-A'], common);

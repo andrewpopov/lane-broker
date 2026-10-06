@@ -50,6 +50,8 @@ const POSTINSTALLS = {
   'drop-installed-record': "const f = 'node_modules/.package-lock.json'; const l = JSON.parse(require('fs').readFileSync(f, 'utf8')); delete l.packages['node_modules/hello-tool']; require('fs').writeFileSync(f, JSON.stringify(l))",
   harmless: "process.exit(0)",
   'hook-file': "require('fs').mkdirSync('.git/hooks', { recursive: true }); require('fs').writeFileSync('.git/hooks/pre-commit', '#!/bin/sh\\n')",
+  'node-gyp': "const fs = require('fs'); const d = 'node_modules/hello-tool/'; fs.mkdirSync(d + 'build/Release', { recursive: true }); fs.writeFileSync(d + 'binding.gyp', '{}'); fs.writeFileSync(d + 'build/Makefile', 'srcdir := ' + process.cwd() + '/node_modules\\n'); fs.writeFileSync(d + 'build/config.gypi', '{\\\"d\\\": \\\"' + process.cwd() + '\\\"}'); fs.writeFileSync(d + 'build/Release/hello.node', 'loadable')",
+  'git-tag': "require('child_process').execFileSync('git', ['tag', 'installed'])",
   'embed-tmpdir': "require('fs').writeFileSync('node_modules/hello-tool/tmp.txt', process.env.TMPDIR)",
 };
 
@@ -118,7 +120,7 @@ function probeCommand(marker) {
     fs.writeFileSync('node_modules/hello-tool/new-file.txt', 'creating a file works');
     let hooksPath = null;
     try { hooksPath = execFileSync('git', ['config', '--get', 'core.hooksPath'], { encoding: 'utf8' }).trim(); } catch {}
-    fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ out, inPlace, hooksPath }));
+    fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ out, inPlace, hooksPath, cwd: process.cwd(), tmpdir: process.env.TMPDIR }));
   `;
   return [process.execPath, '-e', script];
 }
@@ -283,6 +285,46 @@ test('an install that embeds its own absolute path in a text file is cached, and
   assert.equal(second.row.depsCache, 'hit');
   assert.equal(s.npmCiCalls(), 1, 'a hit runs no npm ci');
   assert.equal(second.probe.out, 'hello from the bin');
+});
+
+test('a node-gyp build tree (Makefile and config.gypi naming the work dir) is cached without its intermediates, and the next run hits (BRAIN-423)', async () => {
+  const s = setupWithNpmSpy();
+  const repoDir = makeGitWorktree(repoFiles({ postinstall: 'node-gyp' }));
+
+  const first = await runLane(s, repoDir);
+  assert.equal(first.code, 0, first.stderr);
+  assert.equal(first.row.depsCache, 'miss');
+  assert.match(first.stderr, /deps-cache miss key=[0-9a-f]{12} dir=\. ms=\d+ published=yes/);
+  const stored = path.join(s.storeDir, s.storedKeys()[0], 'node_modules', 'hello-tool');
+  assert.deepEqual(fs.readdirSync(path.join(stored, 'build')), ['Release']);
+  assert.ok(fs.existsSync(path.join(stored, 'build', 'Release', 'hello.node')));
+
+  const second = await runLane(s, repoDir);
+  assert.equal(second.row.depsCache, 'hit');
+  assert.equal(s.npmCiCalls(), 1, 'a hit runs no npm ci');
+  assert.equal(second.probe.out, 'hello from the bin');
+});
+
+test('a snapshot with more than ~6,700 loose objects (the trigger of git gc --auto) still publishes: the snapshot commit starts no gc (BRAIN-423)', async () => {
+  const s = setupWithNpmSpy();
+  const files = repoFiles();
+  for (let i = 0; i < 7200; i += 1) files[`many/f${i}.txt`] = `file ${i}\n`;
+  const repoDir = makeGitWorktree(files);
+
+  const first = await runLane(s, repoDir);
+  assert.equal(first.code, 0, first.stderr);
+  assert.match(first.stderr, /deps-cache miss key=[0-9a-f]{12} dir=\. ms=\d+ published=yes/);
+  assert.equal(s.storedKeys().length, 1);
+  const second = await runLane(s, repoDir);
+  assert.equal(second.row.depsCache, 'hit');
+});
+
+test('an install script that creates a git tag (a ref change) is not published (BRAIN-423)', async () => {
+  const s = setupWithNpmSpy();
+  const run = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'git-tag' })));
+  assert.equal(run.code, 0, run.stderr);
+  assert.match(run.stderr, /published=no reason="install changed files outside node_modules: .*\.git/);
+  assert.equal(s.storedKeys().length, 0);
 });
 
 test('a hit whose relocation cannot be verified is discarded and installed normally, with the reason logged', async () => {

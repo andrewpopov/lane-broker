@@ -311,11 +311,28 @@ test('symlink targets are anchored: only the whole target or its leading directo
   const good = tree();
   fs.mkdirSync(good, { recursive: true });
   fs.symlinkSync('/runs/job/node_modules/x', path.join(good, 'link'));
-  fs.symlinkSync('/runs/job', path.join(good, 'whole'));
   const { restored, run } = roundTrip(good, ...one('/runs/job', '/runs/new'));
   run();
   assert.equal(fs.readlinkSync(path.join(restored, 'link')), '/runs/new/node_modules/x');
-  assert.equal(fs.readlinkSync(path.join(restored, 'whole')), '/runs/new');
+});
+
+test('an install-path symlink relocates only into the work dir\'s node_modules; a link into TMPDIR, the work dir root or its other files is refused', () => {
+  const roles = [{ role: 'workDir', path: '/runs/job' }, { role: 'TMPDIR', path: '/var/tmp/lb-tmp' }];
+  for (const [name, target] of Object.entries({
+    'TMPDIR file': '/var/tmp/lb-tmp/generated.js',
+    'TMPDIR itself': '/var/tmp/lb-tmp',
+    'work dir root': '/runs/job',
+    'work dir source file': '/runs/job/src/index.js',
+  })) {
+    const t = tree();
+    fs.mkdirSync(t, { recursive: true });
+    fs.symlinkSync(target, path.join(t, 'l'));
+    assert.deepEqual(collectInstallPathReferences(t, roles), { prunedLink: 'l' }, name);
+  }
+  const ok = tree();
+  fs.mkdirSync(ok, { recursive: true });
+  fs.symlinkSync('/runs/job/web/node_modules/x', path.join(ok, 'l'));
+  assert.ok(collectInstallPathReferences(ok, roles).relocation, 'a link into a node_modules under the work dir is kept');
 });
 
 test('publish verifies against every install path of the run, not only the ones collection saw', () => {
@@ -342,4 +359,127 @@ test('restore also looks for every old install path, except one the new paths co
     },
   });
   assert.throws(stray.run, /late\.js still holds a placeholder or an old install path/);
+});
+
+// BRAIN-423: what node-gyp and its python leave behind names the install path but is never loaded.
+/** better-sqlite3 as a source build leaves it: binding.gyp, a loadable .node, and build bookkeeping naming `work`. */
+function plantNodeGypBuild(t, work, pkg = 'better-sqlite3') {
+  write(t, `${pkg}/binding.gyp`, '{}');
+  write(t, `${pkg}/lib/index.js`, 'module.exports = require("bindings")("addon");\n');
+  write(t, `${pkg}/build/Release/addon.node`, Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0]));
+  write(t, `${pkg}/build/Makefile`, `srcdir := ${work}/node_modules/${pkg}/build\nCFLAGS += -I${work}/node_modules/node-gyp/include\n`);
+  write(t, `${pkg}/build/binding.Makefile`, `# ${work}\n`);
+  write(t, `${pkg}/build/addon.target.mk`, `TOOLSET := target\nobj := ${work}/obj\n`);
+  write(t, `${pkg}/build/config.gypi`, `{"variables": {"node_gyp_dir": "${work}/node_modules/node-gyp"}}\n`);
+  write(t, `${pkg}/build/Release/.deps/a.intermediate.d`, `cmd_x := cc ${work}/src/a.c\n`);
+  write(t, `${pkg}/build/Release/obj.target/addon/src/a.o`, Buffer.concat([Buffer.from([0xcf, 0xfa, 0, 0]), Buffer.from(work)]));
+}
+
+test('node-gyp build intermediates are neither a reason to refuse the tree nor part of the stored copy; the .node stays', () => {
+  const t = tree();
+  plantNodeGypBuild(t, OLD);
+  const collected = collectInstallPathReferences(t, rolesFor(OLD));
+  assert.deepEqual([collected.relocation?.prefixes, collected.relocation?.entries], [[], []], `got ${JSON.stringify(collected)}`);
+
+  const cacheRoot = tmpDir();
+  const key = newKey();
+  publishToStore(cacheRoot, key, t, collected.relocation);
+  const stored = path.join(entryDir(cacheRoot, key), 'node_modules', 'better-sqlite3');
+  assert.deepEqual(fs.readdirSync(path.join(stored, 'build')), ['Release'], 'Makefile, *.mk, config.gypi are not stored');
+  assert.deepEqual(fs.readdirSync(path.join(stored, 'build', 'Release')), ['addon.node'], '.deps and obj.target are not stored');
+  assert.ok(fs.existsSync(path.join(stored, 'binding.gyp')), 'binding.gyp stays, so npm rebuild can configure again');
+  assert.ok(fs.existsSync(path.join(t, 'better-sqlite3', 'build', 'Makefile')), 'the live tree is untouched');
+});
+
+test('node-gyp exemption guards: no binding.gyp, a path in a runtime file, or a path in the loadable .node still refuse the tree', () => {
+  const lookalike = tree();
+  write(lookalike, 'dist-pkg/build/Makefile', `X = ${OLD}/y\n`);
+  assert.deepEqual(collectInstallPathReferences(lookalike, rolesFor(OLD)), { binary: 'dist-pkg/build/Makefile' }, 'a build/ dir with no binding.gyp beside it is not node-gyp output');
+
+  const runtimeJs = tree();
+  plantNodeGypBuild(runtimeJs, OLD);
+  write(runtimeJs, 'better-sqlite3/lib/index.js', `module.exports = require("${OLD}/node_modules/better-sqlite3/build/Release/addon.node");\n`);
+  assert.ok(collectInstallPathReferences(runtimeJs, rolesFor(OLD)).relocation, 'a quoted path in a .js file is relocatable');
+  write(runtimeJs, 'better-sqlite3/lib/index.js', `const root=${OLD}/node_modules;\n`);
+  assert.deepEqual(collectInstallPathReferences(runtimeJs, rolesFor(OLD)), { ambiguous: 'better-sqlite3/lib/index.js' });
+
+  const addon = tree();
+  plantNodeGypBuild(addon, OLD);
+  write(addon, 'better-sqlite3/build/Release/addon.node', Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0]), Buffer.from(OLD)]));
+  assert.deepEqual(collectInstallPathReferences(addon, rolesFor(OLD)), { binary: 'better-sqlite3/build/Release/addon.node' });
+});
+
+test('only node-gyp\'s own python bytecode (sources beside it) is dropped; any other __pycache__ naming the path refuses the tree', () => {
+  const pyc = (work) => Buffer.concat([Buffer.from([0x2b, 0x0e, 0, 0]), Buffer.from(`${work}/node_modules/node-gyp/gyp/MSVSUtil.py`)]);
+  const t = tree();
+  write(t, 'node-gyp/gyp/pylib/gyp/__pycache__/MSVSUtil.cpython-314.pyc', pyc(OLD));
+  write(t, 'node-gyp/gyp/pylib/gyp/MSVSUtil.py', 'x = 1\n');
+  const collected = collectInstallPathReferences(t, rolesFor(OLD));
+  assert.deepEqual(collected.relocation.entries, []);
+  const cacheRoot = tmpDir();
+  const key = newKey();
+  publishToStore(cacheRoot, key, t, collected.relocation);
+  assert.deepEqual(fs.readdirSync(path.join(entryDir(cacheRoot, key), 'node_modules', 'node-gyp/gyp/pylib/gyp')), ['MSVSUtil.py']);
+
+  const elsewhere = tree();
+  write(elsewhere, 'other-tool/__pycache__/x.cpython-314.pyc', pyc(OLD));
+  write(elsewhere, 'other-tool/x.py', 'x = 1\n');
+  assert.deepEqual(collectInstallPathReferences(elsewhere, rolesFor(OLD)), { binary: 'other-tool/__pycache__/x.cpython-314.pyc' });
+
+  const noSource = tree();
+  write(noSource, 'node-gyp/gyp/pylib/gyp/__pycache__/Gone.cpython-314.pyc', pyc(OLD));
+  assert.deepEqual(collectInstallPathReferences(noSource, rolesFor(OLD)), { binary: 'node-gyp/gyp/pylib/gyp/__pycache__/Gone.cpython-314.pyc' });
+});
+
+test('a runtime file under build/ (build/deps/runtime.json) survives the prune and a hit; a symlink into a pruned path refuses the tree', () => {
+  const t = tree();
+  plantNodeGypBuild(t, OLD);
+  write(t, 'better-sqlite3/build/deps/runtime.json', '{"needed": true}');
+  write(t, 'better-sqlite3/build/deps/sqlite3.mk', 'kept: yes\n');
+  const { restored, run } = roundTrip(t, ...one(OLD, NEW));
+  run();
+  assert.equal(fs.readFileSync(path.join(restored, 'better-sqlite3/build/deps/runtime.json'), 'utf8'), '{"needed": true}');
+  assert.ok(fs.existsSync(path.join(restored, 'better-sqlite3/build/deps/sqlite3.mk')));
+  assert.deepEqual(fs.readdirSync(path.join(restored, 'better-sqlite3/build')).sort(), ['Release', 'deps']);
+
+  for (const target of ['better-sqlite3/build/Makefile', 'better-sqlite3/build/Release/obj.target/addon', 'ABS/better-sqlite3/build/config.gypi']) {
+    const linked = tree();
+    plantNodeGypBuild(linked, OLD);
+    fs.symlinkSync(target.replace('ABS', linked), path.join(linked, 'link'));
+    assert.deepEqual(collectInstallPathReferences(linked, rolesFor(OLD)), { prunedLink: 'link' }, target);
+  }
+  const pruneIsLink = tree();
+  plantNodeGypBuild(pruneIsLink, OLD);
+  fs.rmSync(path.join(pruneIsLink, 'better-sqlite3/build/config.gypi'));
+  write(pruneIsLink, 'better-sqlite3/runtime.json', '{"kept": true}');
+  fs.symlinkSync('../runtime.json', path.join(pruneIsLink, 'better-sqlite3/build/config.gypi'));
+  fs.symlinkSync('build/config.gypi', path.join(pruneIsLink, 'better-sqlite3/config.json'));
+  const refused = collectInstallPathReferences(pruneIsLink, rolesFor(OLD));
+  assert.ok(refused.prunedLink, `a pruned entry that is itself a link (and a link through it) is refused, got ${JSON.stringify(refused)}`);
+  const aliased = tree();
+  plantNodeGypBuild(aliased, OLD);
+  fs.symlinkSync('better-sqlite3/build', path.join(aliased, 'alias'));
+  fs.symlinkSync('alias/Release/obj.target/addon', path.join(aliased, 'addon'));
+  assert.deepEqual(collectInstallPathReferences(aliased, rolesFor(OLD)), { prunedLink: 'addon' }, 'a link through a directory symlink into a pruned path is refused');
+  const dangling = tree();
+  plantNodeGypBuild(dangling, OLD);
+  fs.symlinkSync('nowhere/at/all', path.join(dangling, 'broken'));
+  assert.deepEqual(collectInstallPathReferences(dangling, rolesFor(OLD)), { prunedLink: 'broken' }, 'a link that does not resolve is refused');
+  const escaping = tree();
+  plantNodeGypBuild(escaping, OLD);
+  fs.symlinkSync(tmpDir(), path.join(escaping, 'out'));
+  assert.deepEqual(collectInstallPathReferences(escaping, rolesFor(OLD)), { prunedLink: 'out' }, 'a link that leaves the tree is refused');
+  const fine = tree();
+  plantNodeGypBuild(fine, OLD);
+  fs.symlinkSync('better-sqlite3/build/Release/addon.node', path.join(fine, 'ok-link'));
+  assert.ok(collectInstallPathReferences(fine, rolesFor(OLD)).relocation, 'a link to the kept .node is fine');
+});
+
+test('the real Prisma 6 generated-client shape (output value, sourceFilePath) is relocated', () => {
+  const t = tree();
+  const edge = `const config = {\n  "generator": {\n    "output": {\n      "value": "${OLD}/node_modules/@prisma/client",\n      "fromEnvVar": null\n    }\n  },\n  "sourceFilePath": "${OLD}/prisma/schema.prisma"\n}\n`;
+  for (const f of ['edge.js', 'index.js', 'wasm.js']) write(t, `.prisma/client/${f}`, edge);
+  const { restored, run } = roundTrip(t, ...one(OLD, NEW));
+  run();
+  assert.equal(fs.readFileSync(path.join(restored, '.prisma/client/edge.js'), 'utf8'), edge.replaceAll(OLD, NEW));
 });

@@ -513,8 +513,14 @@ reason.
   dir. The paths themselves differ per run and are not hashed; they join the
   relocatability scan instead. The variables that differ on every run are
   REMOVED from the environment npm and every script see, not just left out of
-  the key: `PWD`, `OLDPWD`, `SHLVL`, `_`, `GIT_CEILING_DIRECTORIES` and any
-  `LANE_*`. Only these named variables reach the install without being
+  the key: `PWD`, `OLDPWD`, `SHLVL`, `_`, `GIT_CEILING_DIRECTORIES`, systemd's
+  per-invocation `INVOCATION_ID`, `JOURNAL_STREAM`, `SYSTEMD_EXEC_PID`,
+  `NOTIFY_SOCKET` and `MEMORY_PRESSURE_*`/`LISTEN_*`, logind's `XDG_SESSION_*`,
+  and any `LANE_*` (BRAIN-423: left in, they gave every run its own key).
+  Every other value is hashed verbatim. Each entry's `meta.json` records a
+  digest per key input (`keyParts`, an HMAC under a host-local 0600 secret in
+  the store root, never a plain hash), and a miss logs `keydiff=<labels>`
+  against the newest entry, so a still-unstable input names itself. Only these named variables reach the install without being
   hashed: authentication (`SSH_AUTH_SOCK`, `SSH_AGENT_PID`, `GIT_SSH`,
   `GIT_SSH_COMMAND`) and ssh per-connection info (`SSH_CONNECTION`,
   `SSH_CLIENT`, `SSH_TTY`). Credentials decide whether a pinned git
@@ -555,7 +561,9 @@ reason.
   - the install changed a file outside `node_modules` (a hit would skip
     whatever wrote it). The only exception is the one `.git/config` line the
     allowlisted script writes (`hooksPath = .githooks`); a new hook file or
-    any other `.git` write is not cached;
+    any other `.git` write is not cached. The synthetic snapshot commit runs
+    with `gc.auto=0` and `maintenance.auto=false`, because a snapshot of a few
+    thousand files made git start a detached `gc --auto` that rewrote `.git` into the deps phase;
   - npm's own record (`node_modules/.package-lock.json`) lacks a lock entry
     that applies to this platform (`os`, `cpu`, `libc`), as when npm skips an
     optional dependency: `reason=incomplete-optional missing=<names>`;
@@ -577,6 +585,16 @@ reason.
     `backup ` (trailing space). The prefixes matched are the run's own per-ticket paths
     (`.../remote/tickets/<id>/work` and its temp dirs), which text only contains when it was
     generated from that path, so this case cannot arise from content not written for that run.
+
+  Build leftovers that name the install path but are never loaded are
+  neither scanned nor stored, and only these exact ones: under `<pkg>/build/`
+  with `<pkg>/binding.gyp` beside it, `Makefile`, `binding.Makefile`,
+  `*.target.mk`, `config.gypi`, `gyp-mac-tool`, `Release|Debug/.deps` and
+  `Release|Debug/obj.target` (`build/deps/`, `build/Release/*.node` and the
+  rest stay); and node-gyp's own `__pycache__` under `pylib/` where each
+  `.pyc` has its `.py` beside it. A symlink pointing into a pruned path
+  skips the cache (`reason=symlink-into-pruned-or-unresolvable`); every symlink is resolved with `realpath`, and one that leaves the tree or does not resolve is refused too (unless its text names an install path, which relocation handles). `npm rebuild`
+  still works, as it runs `node-gyp rebuild`, which configures again.
 
   Every other tree that names an install path in text files or symlinks is
   published anyway (conda-style relocation, what Prisma's generated client

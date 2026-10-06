@@ -29,7 +29,7 @@ import { isProcessAlive, processStartTime } from './process-liveness.js';
 export const DEFAULT_DEPS_CACHE_MAX_BYTES = 10 * 1024 ** 3;
 
 /** Bumping this invalidates every existing entry. */
-const KEY_VERSION = 'v4';
+const KEY_VERSION = 'v5';
 
 /** npm reads npm-shrinkwrap.json in preference to package-lock.json. */
 const LOCKFILES = ['npm-shrinkwrap.json', 'package-lock.json'];
@@ -42,12 +42,13 @@ const NPM_CONFIG_FILE_ENVS = ['npm_config_userconfig', 'npm_config_globalconfig'
  * settings...), so the variables that differ on every run without meaning anything to an install are
  * REMOVED from it before npm or any script sees them (`scrubDepsEnv`), not merely left out of the key:
  * a variable that reaches the install but not the key would let two different installs share an entry.
- * Removed: shell bookkeeping, git's ceiling (the work dir has its own `.git`), and lane's own ticket/id
- * variables. A few tools do need a temp dir, so TMPDIR/TMP/TEMP stay in the environment, are
+ * Removed: shell bookkeeping, git's ceiling (the work dir has its own `.git`), lane's own ticket/id
+ * variables, and what systemd/logind stamp on every invocation or login session (`INVOCATION_ID`,
+ * `XDG_SESSION_ID`, `MEMORY_PRESSURE_*`...), which made every run's key different (BRAIN-423). A few tools do need a temp dir, so TMPDIR/TMP/TEMP stay in the environment, are
  * not hashed, and their (per-run) paths join the relocatability scan instead.
  */
-export const SCRUBBED_ENV_NAMES = new Set(['PWD', 'OLDPWD', 'SHLVL', '_', 'GIT_CEILING_DIRECTORIES']);
-export const SCRUBBED_ENV_PREFIXES = ['LANE_'];
+export const SCRUBBED_ENV_NAMES = new Set(['PWD', 'OLDPWD', 'SHLVL', '_', 'GIT_CEILING_DIRECTORIES', 'INVOCATION_ID', 'JOURNAL_STREAM', 'SYSTEMD_EXEC_PID', 'NOTIFY_SOCKET']);
+export const SCRUBBED_ENV_PREFIXES = ['LANE_', 'XDG_SESSION_', 'MEMORY_PRESSURE_', 'LISTEN_'];
 
 /**
  * Authentication inputs reach the install (a git+ssh dependency needs SSH_AUTH_SOCK, GIT_SSH or GIT_SSH_COMMAND)
@@ -305,7 +306,7 @@ export function unexplainedChanges(changes, { scripts, configBefore, configAfter
 
 /**
  * The cache key for one `remoteDeps` dir: a sha256 over everything that can change what `npm ci` produces
- * there. Returns `{ key, lock, scripts }`, or `{ key: null, reason }` when the dir must not be cached at all
+ * there. Returns `{ key, keyParts, lock, scripts }` (`keyParts`: a keyed digest per labelled input, for diagnosis, only when `keyPartsSecret` is given), or `{ key: null, reason }` when the dir must not be cached at all
  * (lockfile not pinned, or a root lifecycle script that is not known to leave `node_modules` alone).
  *
  *  - the lockfile (name and bytes), `package.json`, the `.npmrc` of the dir and of the repo root, and the
@@ -330,6 +331,7 @@ export function computeDepsKey({
   toolVersion = (cmd) => firstLineOfCommand(cmd, env),
   npmConfig = { ignoreScripts: 'false', scriptShell: 'null' },
   tempFsProps = () => tempDirFsProperties(env),
+  keyPartsSecret = null,
 }) {
   let lockfileName = null;
   let lockfile = null;
@@ -390,12 +392,14 @@ export function computeDepsKey({
   }
 
   const hash = crypto.createHash('sha256');
+  const keyParts = {};
   for (const [label, value] of parts) {
     const bytes = Buffer.isBuffer(value) ? value : Buffer.from(String(value), 'utf8');
     hash.update(`${label}:${bytes.length}:`);
     hash.update(bytes);
+    if (keyPartsSecret) keyParts[label] = crypto.createHmac('sha256', keyPartsSecret).update(bytes).digest('hex').slice(0, 12);
   }
-  return { key: hash.digest('hex'), lock, scripts: pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {} };
+  return { key: hash.digest('hex'), keyParts, lock, scripts: pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {} };
 }
 
 function listAllows(list, value) {
@@ -476,6 +480,80 @@ export function findMissingInstalled(lock, installed, system) {
   return absent.filter((name) => !gone.has(name)).map((name) => name.slice('node_modules/'.length)).sort();
 }
 
+/**
+ * The labelled key inputs that differ between `keyParts` (a lookup that missed) and the newest published entry
+ * that recorded its own, as a sorted label list; null when there is no such entry. Two runs of one repo that
+ * should share a key but do not name the leaking input here.
+ */
+/**
+ * The host-local secret that keys the diagnostic digests in `meta.json`: 32 random bytes in a 0600 file in the
+ * store root, created atomically (temp file, fsync, rename; a concurrent creator that wins is read instead). A plain
+ * hash of an env value would let anyone who can read `meta.json` test guesses for a low-entropy secret; the cache key
+ * itself is never derived from this. Null when the file is not exactly what we wrote (a symlink, someone else's,
+ * another mode, another length): diagnostics are optional, so nothing is ever HMAC'd under a doubtful key.
+ */
+const KEY_PARTS_SECRET_BYTES = 32;
+
+export function readKeyPartsSecret(cacheRoot) {
+  const file = path.join(cacheRoot, '.keyparts.key');
+  try {
+    fs.mkdirSync(cacheRoot, { recursive: true });
+    if (!fs.existsSync(file) && !pathIsLink(file)) {
+      const tmp = path.join(cacheRoot, `.tmp-keyparts-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
+      const fd = fs.openSync(tmp, 'wx', 0o600);
+      try {
+        fs.writeSync(fd, crypto.randomBytes(KEY_PARTS_SECRET_BYTES));
+        fs.fsyncSync(fd);
+      } finally {
+        fs.closeSync(fd);
+      }
+      try {
+        fs.linkSync(tmp, file); // fails if a concurrent creator already won, so theirs is never replaced
+      } catch (err) {
+        if (err.code !== 'EEXIST') throw err;
+      } finally {
+        fs.rmSync(tmp, { force: true });
+      }
+    }
+    const st = fs.lstatSync(file);
+    const ours = typeof process.getuid !== 'function' || st.uid === process.getuid();
+    if (!st.isFile() || !ours || (st.mode & 0o777) !== 0o600 || st.size !== KEY_PARTS_SECRET_BYTES) return null;
+    const secret = fs.readFileSync(file);
+    return secret.length === KEY_PARTS_SECRET_BYTES ? secret : null;
+  } catch {
+    return null;
+  }
+}
+
+function pathIsLink(file) {
+  try {
+    return fs.lstatSync(file).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+export function diffAgainstNewestEntry(cacheRoot, keyParts) {
+  let newest = null;
+  let names = [];
+  try {
+    names = fs.readdirSync(cacheRoot).filter((n) => KEY_RE.test(n));
+  } catch {
+    return null;
+  }
+  for (const name of names) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(path.join(cacheRoot, name, 'meta.json'), 'utf8'));
+      if (meta.keyParts && (!newest || meta.createdAt > newest.createdAt)) newest = meta;
+    } catch {
+      // unreadable entry: not a comparison base
+    }
+  }
+  if (!newest) return null;
+  const labels = new Set([...Object.keys(newest.keyParts), ...Object.keys(keyParts)]);
+  return [...labels].filter((l) => newest.keyParts[l] !== keyParts[l]).sort();
+}
+
 export function entryDir(cacheRoot, key) {
   return path.join(cacheRoot, key);
 }
@@ -488,16 +566,17 @@ export function entryTree(cacheRoot, key) {
  * Recreate `src` as `dst`, directory by directory: real directories, symlinks re-created with their
  * target text (through `linkTarget(target, rel)`, identity by default), regular files handed to
  * `onFile(srcFile, dstFile, rel)`. Each directory is created owner-writable so its entries can be added,
- * then given `dirMode(srcMode)` once it is complete.
+ * then given `dirMode(srcMode)` once it is complete. An entry for which `skip(rel)` is true is left out.
  */
 function cloneTree(src, dst, hooks, rel = '') {
-  const { onFile, dirMode, linkTarget = (target) => target } = hooks;
+  const { onFile, dirMode, linkTarget = (target) => target, skip = () => false } = hooks;
   const srcMode = fs.statSync(src).mode & 0o7777;
   fs.mkdirSync(dst, { mode: 0o700 });
   for (const ent of fs.readdirSync(src, { withFileTypes: true })) {
     const s = path.join(src, ent.name);
     const d = path.join(dst, ent.name);
     const r = rel ? `${rel}/${ent.name}` : ent.name;
+    if (skip(r)) continue;
     if (ent.isDirectory()) cloneTree(s, d, hooks, r);
     else if (ent.isSymbolicLink()) fs.symlinkSync(linkTarget(fs.readlinkSync(s), r), d);
     else if (ent.isFile()) onFile(s, d, r);
@@ -545,7 +624,7 @@ export function materializeFromStore(cacheRoot, key, destTree) {
  * `collectInstallPathReferences` found: the stored COPY of each recorded file or symlink has its install paths
  * replaced by placeholder tokens (the source tree is untouched), and the record goes into `meta.json`.
  */
-export function publishToStore(cacheRoot, key, srcTree, relocation = null) {
+export function publishToStore(cacheRoot, key, srcTree, relocation = null, keyParts = null) {
   fs.mkdirSync(cacheRoot, { recursive: true });
   const tmp = path.join(cacheRoot, `.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
   fs.mkdirSync(tmp);
@@ -571,9 +650,10 @@ export function publishToStore(cacheRoot, key, srcTree, relocation = null) {
       },
       linkTarget: (target, rel) => (recorded.get(rel) === 'symlink' ? template(Buffer.from(target, 'utf8'), rel, anchoredOccurrence).toString('utf8') : target),
       dirMode: (mode) => mode & 0o7555,
+      skip: (rel) => isRegenerableBuildArtifact(srcTree, rel),
     });
     if (relocation) verifyTemplatedCopy(path.join(tmp, 'node_modules'), relocation);
-    fs.writeFileSync(path.join(tmp, 'meta.json'), JSON.stringify({ bytes, createdAt: Date.now(), ...(relocation ? { relocation } : {}) }));
+    fs.writeFileSync(path.join(tmp, 'meta.json'), JSON.stringify({ bytes, createdAt: Date.now(), ...(relocation ? { relocation } : {}), ...(keyParts ? { keyParts } : {}) }));
     fs.writeFileSync(path.join(tmp, '.last-used'), '');
     fs.mkdirSync(path.join(tmp, 'leases'));
     try {
@@ -847,6 +927,99 @@ const PATH_FOLLOWERS = new Set(Buffer.from('/"\'`)]} \t\n\r\v\f', 'latin1'));
 /** Bytes that may precede an install path: start of file, `" ' \` ( [ {`, or whitespace. Anything else (`/`, `:`, `=`, a name character) may make it the tail of a longer path. */
 const PATH_LEADERS = new Set(Buffer.from('"\'`([{ \t\n\r\v\f', 'latin1'));
 
+/**
+ * Build leftovers that name the install path but are never loaded at run time, and that the tool which made them
+ * regenerates. Exactly these are neither scanned nor stored, so a cached tree lacks them:
+ *   - under `<pkg>/build/` when `<pkg>/binding.gyp` exists: `Makefile`, `binding.Makefile`, `*.target.mk`,
+ *     `config.gypi`, `gyp-mac-tool`, and `Release|Debug/.deps`, `Release|Debug/obj.target`. Nothing else under
+ *     `build/` (`build/deps/`, `build/Release/*.node`, anything a package reads at run time) is touched;
+ *   - `__pycache__` under `node-gyp/.../pylib/` where every `.pyc` has its `.py` source beside the cache.
+ * `npm rebuild` still works: it runs `node-gyp rebuild`, which configures from `binding.gyp` again. A symlink that
+ * points into or through a pruned path, or is itself pruned, makes the tree uncacheable (`refusesLink`).
+ */
+const NODE_GYP_INTERMEDIATE_RE = /^(.*\/)?build\/(?:Makefile|binding\.Makefile|[^/]+\.target\.mk|config\.gypi|gyp-mac-tool|(?:Release|Debug)\/(?:\.deps|obj\.target))$/;
+const GYP_PYCACHE_RE = /(?:^|\/)node-gyp\/(?:.*\/)?pylib\/(?:.*\/)?__pycache__$/;
+
+function isGypPycache(tree, rel) {
+  if (!GYP_PYCACHE_RE.test(rel)) return false;
+  try {
+    const sources = path.join(tree, rel, '..');
+    const caches = fs.readdirSync(path.join(tree, rel));
+    return caches.every((f) => f.endsWith('.pyc') && fs.existsSync(path.join(sources, `${f.split('.')[0]}.py`)));
+  } catch {
+    return false;
+  }
+}
+
+function isRegenerableBuildArtifact(tree, rel) {
+  if (isGypPycache(tree, rel)) return true;
+  const match = NODE_GYP_INTERMEDIATE_RE.exec(rel);
+  return match !== null && fs.existsSync(path.join(tree, match[1] ?? '', 'binding.gyp'));
+}
+
+/**
+ * Every path a symlink passes through on its way to its target: each component of each hop, following intermediate
+ * symlinks (bounded). A pruned entry anywhere on that chain is as bad as one at the end.
+ */
+function symlinkChain(linkAbs) {
+  const visited = [];
+  let current = path.dirname(linkAbs);
+  const pending = [fs.readlinkSync(linkAbs)];
+  for (let hops = 0; pending.length > 0; hops += 1) {
+    if (hops > 64) throw new Error('too many symlink hops');
+    const segments = pending.shift().split('/');
+    if (segments[0] === '') current = path.parse(linkAbs).root;
+    for (let i = 0; i < segments.length; i += 1) {
+      const seg = segments[i];
+      if (seg === '' || seg === '.') continue;
+      const next = seg === '..' ? path.dirname(current) : path.join(current, seg);
+      visited.push(next);
+      if (seg !== '..' && fs.lstatSync(next).isSymbolicLink()) {
+        pending.unshift([fs.readlinkSync(next), ...segments.slice(i + 1)].join('/'));
+        break;
+      }
+      current = next;
+    }
+  }
+  return visited;
+}
+
+/**
+ * Does the symlink at `linkAbs` lead to, or through, a pruned path of `tree`, or somewhere we cannot vouch for? Its
+ * whole chain (`symlinkChain`) and its final `realpath` are tested against the pruned set. A link that escapes the
+ * tree or cannot be resolved answers true (the tree is refused, not guessed at), except a link `relocatable` says
+ * relocation will point back into the work dir's own `node_modules`: that may not resolve here, so it is tested
+ * lexically only.
+ */
+function refusesLink(tree, linkAbs, relocatable) {
+  const root = fs.realpathSync(tree);
+  const prunedUnder = (abs) => {
+    for (const base of new Set([tree, root])) {
+      const rel = path.relative(base, abs);
+      if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) continue;
+      const parts = rel.split(path.sep);
+      if (parts.some((_, i) => isRegenerableBuildArtifact(tree, parts.slice(0, i + 1).join('/')))) return true;
+    }
+    return false;
+  };
+  let chain;
+  try {
+    chain = symlinkChain(linkAbs);
+  } catch {
+    return !relocatable;
+  }
+  if (chain.some(prunedUnder)) return true;
+  let real;
+  try {
+    real = fs.realpathSync(linkAbs);
+  } catch {
+    return !relocatable;
+  }
+  const rel = path.relative(root, real);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return !relocatable;
+  return prunedUnder(real);
+}
+
 const strictOccurrence = (buf, start, end) => (start === 0 || PATH_LEADERS.has(buf[start - 1])) && (end === buf.length || PATH_FOLLOWERS.has(buf[end]));
 
 /** A symlink target is a path, not text: an install path counts only as the whole target or its leading directories. */
@@ -903,6 +1076,7 @@ function isRewritableText(relPath, content) {
 /**
  * Every file or symlink under `tree` that names an install path in `roles` (see `installPathRoles`). Returns
  *   { binary: <rel> }      a file naming a path that is not allowlisted, valid UTF-8 text: refuse the tree;
+ *   { prunedLink: <rel> }  a symlink pointing into a path left out of the cached tree (`isRegenerableBuildArtifact`): refuse;
  *   { ambiguous: <rel> }   an occurrence not followed by a path terminator (or glued to a longer name before it): refuse;
  *   { relocation }         else: `{ nonce, prefixes: [{ roles, path }], entries: [{ relPath, kind: 'text' | 'symlink' }] }`,
  *                          roles sharing one path being ONE group; `publishToStore` templates the entries.
@@ -921,12 +1095,25 @@ export function collectInstallPathReferences(tree, roles, { newNonce = () => cry
     const marker = tokenTail(nonce);
     const outcome = scanTree(tree, groups, pairs, marker);
     if (outcome.collision) continue;
+    if (outcome.prunedLink) return { prunedLink: outcome.prunedLink };
     if (outcome.binary) return { binary: outcome.binary };
     if (outcome.ambiguous) return { ambiguous: outcome.ambiguous };
     const found = groups.filter((_, i) => outcome.found.has(i));
     return { relocation: { nonce, candidates: groups.map((g) => g.path), prefixes: found.map(({ roles: r, path: p }) => ({ roles: r, path: p })), entries: outcome.entries } };
   }
   return { ambiguous: TOKEN_MARKER };
+}
+
+/**
+ * A symlink whose text starts with an install path: may relocation keep it? Only when that path is the work dir
+ * (`workDir`/`realWorkDir`) and the target lies inside a `node_modules` under it; a link into a temp dir, another
+ * role, or elsewhere in the work dir is not ours to vouch for (false). Null when the text names no install path as
+ * a leading directory (the ambiguity checks decide that).
+ */
+function relocatableInstallLink(groups, text) {
+  const group = groups.find((g) => text === g.path || text.startsWith(`${g.path}/`));
+  if (!group) return null;
+  return group.roles.some((role) => role === 'workDir' || role === 'realWorkDir') && /^\/(?:[^/]+\/)*node_modules(?:\/|$)/.test(text.slice(group.path.length));
 }
 
 function scanTree(tree, groups, pairs, marker) {
@@ -938,10 +1125,20 @@ function scanTree(tree, groups, pairs, marker) {
     for (const ent of fs.readdirSync(abs, { withFileTypes: true })) {
       const p = path.join(abs, ent.name);
       const r = rel ? `${rel}/${ent.name}` : ent.name;
+      if (isRegenerableBuildArtifact(tree, r)) {
+        if (ent.isSymbolicLink()) return { prunedLink: r };
+        continue;
+      }
       let outcome = null;
       if (ent.isDirectory()) outcome = walk(p, r);
       else if (ent.isSymbolicLink()) {
         const target = Buffer.from(fs.readlinkSync(p), 'utf8');
+        const text = target.toString('utf8');
+        const keeps = relocatableInstallLink(groups, text);
+        if (keeps === false) return { prunedLink: r };
+        if (keeps !== null || !pairs.some((pr) => target.includes(pr.from))) {
+          if (refusesLink(tree, p, keeps === true)) return { prunedLink: r };
+        }
         if (target.includes(marker)) return { collision: true };
         const hit = pairs.some((pr) => target.includes(pr.from));
         if (hit && rewritePrefixes(target, pairs, anchoredOccurrence) === null) return { ambiguous: r };
