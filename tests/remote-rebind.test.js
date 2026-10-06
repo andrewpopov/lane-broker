@@ -1,14 +1,17 @@
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, laneSpawn, waitFor, sleep } from './helpers.js';
 import { tmpDir, makeRunner, setup, probeCount } from './remote-harness.js';
 import { selectRunner } from '../src/remote-client.js';
-import { enqueue, tryStart, listQueue, withdrawQueued, restoreQueued } from '../src/scheduler.js';
+import { spawn } from 'node:child_process';
+import { enqueue, tryStart, listQueue, withdrawQueued, restoreQueued, recoverRebinding } from '../src/scheduler.js';
+import { createAttempt, readAttempt, patchAttemptLocked } from '../src/attempts.js';
+import { fenceLegacyQueue } from '../src/migrate.js';
 import { listLeases } from '../src/lease.js';
 import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig, ConfigError } from '../src/config.js';
-import { paths, readJsonSafe } from '../src/state.js';
+import { paths, readJsonSafe, withLock, atomicWriteJson } from '../src/state.js';
 
 /**
  * BRAIN-405: a remote-eligible ticket that fell back to the local queue is moved to a runner that later has real room,
@@ -188,12 +191,152 @@ test('restore: a withdrawn ticket goes back at its ORIGINAL position, ahead of t
   assert.deepEqual(queuedIds(state), ['a', 'b', 'c', 'd']);
 });
 
+async function deadPid() {
+  const child = spawn(process.execPath, ['-e', '0'], { stdio: 'ignore' });
+  await new Promise((resolve) => child.on('exit', resolve));
+  return child.pid;
+}
+const parkedFiles = (state) => fs.readdirSync(paths(state).queue).filter((n) => n.endsWith('.rebinding'));
+
+test('withdraw is two-phase: the parked record leaves every queue listing but stays on disk, and the attempt says so', async () => {
+  const { state } = freshEnv();
+  const record = await enqueue(state, ticketOf('a'));
+  await createAttempt(state, 'a');
+  await withdrawQueued(state, 'a');
+  assert.deepEqual(queuedIds(state), []);
+  assert.equal(parkedFiles(state).length, 1);
+  assert.match(parkedFiles(state)[0], new RegExp(`^${String(record.seq).padStart(12, '0')}-a\\.json\\.rebinding$`));
+  assert.equal(readAttempt(state, 'a').rebinding.supervisorPid, process.pid);
+  await restoreQueued(state, record);
+  assert.deepEqual(queuedIds(state), ['a']);
+  assert.deepEqual(parkedFiles(state), []);
+  assert.equal(readAttempt(state, 'a').rebinding, undefined);
+});
+
+test('a supervisor that dies between withdraw and dispatch (no dispatch evidence): recovery restores the ticket at its ORIGINAL seq', async () => {
+  const { state } = freshEnv();
+  await enqueue(state, ticketOf('a'));
+  // a dead supervisor is also exactly what an updateAttempt lock timeout leaves behind: parked, attempt not yet `running`
+  const before = await enqueue(state, { ...ticketOf('b'), supervisorPid: await deadPid() });
+  await enqueue(state, ticketOf('c'));
+  await createAttempt(state, 'b');
+  await withdrawQueued(state, 'b');
+  assert.deepEqual(queuedIds(state), ['a', 'c']);
+  await withLock(state, () => recoverRebinding(state));
+  assert.deepEqual(queuedIds(state), ['a', 'b', 'c']);
+  assert.equal(listQueue(state)[1].seq, before.seq);
+  assert.deepEqual(parkedFiles(state), []);
+  assert.equal(readAttempt(state, 'b').rebinding, undefined);
+});
+
+test('recovery leaves a withdrawal alone while its supervisor is alive', async () => {
+  const { state } = freshEnv();
+  await enqueue(state, ticketOf('a'));
+  await createAttempt(state, 'a');
+  await withdrawQueued(state, 'a');
+  await withLock(state, () => recoverRebinding(state));
+  assert.equal(parkedFiles(state).length, 1);
+  assert.deepEqual(queuedIds(state), []);
+});
+
+test('a dead supervisor WITH dispatch evidence is a remote attempt to reconcile: the ticket is not restored to the local queue', async () => {
+  const { state } = freshEnv();
+  const record = await enqueue(state, { ...ticketOf('a'), supervisorPid: await deadPid() });
+  await createAttempt(state, 'a');
+  await withdrawQueued(state, 'a');
+  await withLock(state, () => patchAttemptLocked(state, 'a', { executor: 'remote', phase: 'running', runner: 'skybox' }));
+  await withLock(state, () => recoverRebinding(state));
+  assert.deepEqual(queuedIds(state), [], 'never restored: it may be running on the runner');
+  assert.deepEqual(parkedFiles(state), []);
+  const attempt = readAttempt(state, 'a');
+  assert.equal(attempt.runner, 'skybox');
+  assert.equal(attempt.executor, 'remote');
+  assert.ok(record.seq);
+});
+
+// ---- fairness state survives a provisional withdrawal ----
+
+const T0 = 1_700_000_000_000;
+// reservations exist only while resource backfill is on (active mode, resourceSkipLimit > 0)
+const activeCfg = { ...cfg, schedulerMode: 'active', cpuAdmissionPercent: 100, cpuReserveCores: 1, admissionCooldownMs: 0, resourceSkipLimit: 3, capacity: 10, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1 };
+function fencedState() {
+  const { state } = freshEnv();
+  atomicWriteJson(paths(state).schedFence, { version: 2, migratedAt: T0 });
+  fenceLegacyQueue(state, 'test');
+  atomicWriteJson(paths(state).fairness, { version: 2, tickets: {} });
+  return state;
+}
+const readFairness = (state) => JSON.parse(fs.readFileSync(paths(state).fairness, 'utf8')).tickets;
+
+test('fairness records (reservation, skip counters, conflict grace) survive a withdrawal that is later restored', async () => {
+  const state = fencedState();
+  const a = ticketOf('a', 'r:a');
+  await enqueue(state, a);
+  await enqueue(state, ticketOf('b', 'r:b'));
+  const records = {
+    resource: { reason: 'resource', skipsCharged: 3, reserved: true, reservationSeq: 1, inScope: true, behindConflict: false, deniedAt: T0, budget: 9, externalBusy: 5 },
+    conflict: { reason: 'conflict', skipsCharged: 2, blockedSince: T0, graceStartedAt: T0, loggedPhase: null },
+  };
+  atomicWriteJson(paths(state).fairness, { version: 2, tickets: { a: records } });
+  const taken = await withdrawQueued(state, 'a');
+  assert.ok(taken);
+  await tryStart(state, ticketOf('b', 'r:b'), activeCfg, undefined, () => ({ hostBusyCores: 0, cores: 10, stale: false, sampledAt: Date.now() }), undefined, () => ({ availableBytes: 64 * 1024 ** 3, totalBytes: 64 * 1024 ** 3, macPressure: 'normal', source: 'test' })); // another ticket's poll prunes the fairness store
+  assert.deepEqual(readFairness(state).a, records, 'A is only provisionally gone, so its records stay');
+  await restoreQueued(state, taken);
+  assert.deepEqual(readFairness(state).a, records);
+});
+
+test('legacy scheduler: the head\'s earned reservation and skip count survive a withdrawal that another head overwrote the singleton during', async () => {
+  const { state } = freshEnv(); // no scheduler fence: the legacy singleton files
+  await enqueue(state, ticketOf('a'));
+  await enqueue(state, ticketOf('b'));
+  const earned = { headId: 'a', count: 3, reserved: true, inScope: true, deniedAt: T0, budget: 9, externalBusy: 5 };
+  const conflict = { headId: 'a', count: 2, blockedSince: T0, loggedPhase: null };
+  atomicWriteJson(paths(state).resourceSkipState, earned);
+  atomicWriteJson(paths(state).conflictSkipState, conflict);
+  const taken = await withdrawQueued(state, 'a');
+  assert.equal('legacyFairness' in taken, false, 'the snapshot is not part of the ticket');
+  // B becomes head and is denied: it takes over the singletons
+  atomicWriteJson(paths(state).resourceSkipState, { headId: 'b', count: 1, reserved: false });
+  atomicWriteJson(paths(state).conflictSkipState, { headId: 'b', count: 1, blockedSince: T0 + 1 });
+  await restoreQueued(state, taken);
+  assert.deepEqual(queuedIds(state), ['a', 'b']);
+  assert.deepEqual(readJsonSafe(paths(state).resourceSkipState), earned);
+  assert.deepEqual(readJsonSafe(paths(state).conflictSkipState), conflict);
+  assert.equal('legacyFairness' in listQueue(state)[0], false, 'the restored queue record is clean');
+});
+
+test('legacy scheduler: a failed snapshot write rolls the withdrawal back, so the ticket stays queued at its seq', async () => {
+  const { state } = freshEnv();
+  await enqueue(state, ticketOf('a'));
+  await enqueue(state, ticketOf('b'));
+  atomicWriteJson(paths(state).resourceSkipState, { headId: 'a', count: 3, reserved: true, inScope: true, deniedAt: T0, budget: 9, externalBusy: 5 });
+  const before = listQueue(state).map((r) => [r.id, r.seq]);
+  const queueDir = path.dirname(listQueue(state)[0].file ?? path.join(paths(state).queue, 'x'));
+  const realWrite = fs.writeFileSync;
+  // Fail only the snapshot's temp-file write in the queue dir (the broker lock and everything else still write).
+  const write = mock.method(fs, 'writeFileSync', function (target, ...rest) {
+    if (typeof target === 'string' && path.dirname(target) === queueDir && path.basename(target).startsWith('.tmp-')) {
+      throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+    }
+    return realWrite.call(this, target, ...rest);
+  });
+  let taken;
+  try {
+    taken = await withdrawQueued(state, 'a');
+  } finally {
+    write.mock.restore();
+  }
+  assert.equal(taken, null, 'the withdrawal reports failure');
+  assert.deepEqual(listQueue(state).map((r) => [r.id, r.seq]), before, 'the ticket is back in the queue at its original seq');
+});
+
 // ---- end to end over the fake-ssh transport ----
 
 /**
  * Wrap the harness's fake ssh in a switch driven by a control file, so one test can change what the runner looks like while
- * a ticket sits in the queue: `down` (unreachable), `full` (reachable, no CPU headroom), `ok`, or `fail-exec` (probe fine,
- * every remote-exec dies, so a dispatch is refused).
+ * a ticket sits in the queue: `down` (unreachable), `full` (reachable, no CPU headroom), `ok`, or
+ * `drop-after-start:<file>` (the job starts, then ssh drops and result queries fail).
  */
 function controllableRunner() {
   const ctx = setup({ ssh: 'normal' });
@@ -211,6 +354,17 @@ const real = ${JSON.stringify(path.join(binDir, 'ssh-real'))};
 const argv = process.argv.slice(2);
 const command = argv[argv.length - 1] || '';
 if (mode === 'down') process.exit(255);
+// 'drop-after-start:<file>': the job really starts on the runner, then the ssh session drops and every result query fails
+if (mode.startsWith('drop-after-start:')) {
+  if (command.includes('remote-result')) process.exit(255);
+  if (command.includes('remote-exec')) {
+    const started = mode.slice('drop-after-start:'.length);
+    const job = spawn(real, argv, { stdio: ['inherit', 'ignore', 'ignore'], detached: true });
+    job.unref();
+    const poll = setInterval(() => { if (fs.existsSync(started)) process.exit(255); }, 50);
+    return;
+  }
+}
 if (command.includes('remote-probe')) {
   const res = spawnSync(real, argv, { encoding: 'utf8' });
   const p = JSON.parse(res.stdout.trim());
@@ -221,7 +375,6 @@ if (command.includes('remote-probe')) {
   process.stdout.write(JSON.stringify(p) + '\\n');
   process.exit(res.status == null ? 1 : res.status);
 }
-if (mode === 'fail-exec' && command.includes('remote-exec')) process.exit(255);
 const child = spawn(real, argv, { stdio: 'inherit' });
 child.on('close', (code) => process.exit(code == null ? 1 : code));
 `,
@@ -232,6 +385,10 @@ child.on('close', (code) => process.exit(code == null ? 1 : code));
   fs.writeFileSync(globalPath, JSON.stringify({ ...base, remoteRebindIntervalMs: 300 }));
   return { ...ctx, setMode: (mode) => fs.writeFileSync(control, mode), admissionLog: () => fs.readFileSync(paths(ctx.state).admissionLog, 'utf8').toString() };
 }
+
+/** The runner's own broker (a separate home) refuses every job at preflight: its memory reserve leaves no budget. */
+const refuseEverythingOnRunner = (ctx) =>
+  fs.writeFileSync(path.join(ctx.runnerHome, 'config.json'), JSON.stringify({ schedulerMode: 'active', sampleMs: 50, capacity: 4, memoryReserveBytes: 1e15 }));
 
 /** `lane run` of a command that appends where it ran to `file` (a line per execution), and holds until `release` exists if given. */
 const recordingCmd = (file, release = null) => [
@@ -303,6 +460,7 @@ test('a runner with no CPU headroom does not take the ticket; it waits locally u
 
 test('a refused rebind keeps the ticket\'s original queue position', async () => {
   const ctx = controllableRunner();
+  refuseEverythingOnRunner(ctx);
   const hold = await holdLaneLocally(ctx);
   const ran = path.join(tmpDir('rebind-ran'), 'ran');
   const first = await detach(ctx, recordingCmd(ran));
@@ -313,14 +471,14 @@ test('a refused rebind keeps the ticket\'s original queue position', async () =>
   assert.deepEqual(original, [first, second]);
   const originalSeqs = queuedSeqs(ctx.state);
 
-  ctx.setMode('fail-exec');
+  ctx.setMode('ok');
   await waitFor(() => (ctx.admissionLog().match(/remote-rebind: .* stays in the local queue at seq/g) ?? []).length >= 2, { timeoutMs: 60_000 });
   // every restore puts a ticket back at its own seq; sample until both are back, then compare the order
   await waitFor(() => queuedIds(ctx.state).length === 2, { timeoutMs: 30_000 });
   assert.deepEqual(queuedIds(ctx.state), original, 'the first ticket is still ahead of the second after being refused');
   assert.deepEqual(queuedSeqs(ctx.state), originalSeqs, 'each ticket kept its own sequence number');
 
-  ctx.setMode('down');
+  ctx.setMode('full'); // no more rebinds; a dispatch already in flight is still refused, never left unknown
   hold.release();
   await hold.done;
   assert.equal((await waitResult(ctx, first)).executor, 'local');
@@ -378,4 +536,90 @@ test('remoteRebindIntervalMs 0 disables rebinding', async () => {
   hold.release();
   await hold.done;
   assert.equal((await waitResult(ctx, id)).executor, 'local');
+});
+
+test('a confirmed preflight refusal by the runner restores the ticket to its place; nothing terminal is published', async () => {
+  const ctx = controllableRunner();
+  refuseEverythingOnRunner(ctx);
+  const hold = await holdLaneLocally(ctx);
+  const ran = path.join(tmpDir('rebind-ran'), 'ran');
+  const id = await detach(ctx, recordingCmd(ran));
+  await waitFor(() => queuedIds(ctx.state).includes(id), { timeoutMs: 30_000 });
+  const seq = queuedSeqs(ctx.state)[id];
+
+  ctx.setMode('ok');
+  await waitFor(() => /remote-rebind: .*runner refused the job \(exit 64\) — stays in the local queue at seq/.test(ctx.admissionLog()), { timeoutMs: 60_000 });
+  await waitFor(() => queuedIds(ctx.state).includes(id), { timeoutMs: 30_000 });
+  assert.equal(queuedSeqs(ctx.state)[id], seq, 'back at its original seq');
+  assert.equal(readJsonSafe(path.join(paths(ctx.state).results, `${id}.json`)), null, 'no terminal result was published');
+  assert.deepEqual(linesOf(ran), []);
+
+  ctx.setMode('full'); // no more rebinds; a dispatch already in flight is still refused, never left unknown
+  hold.release();
+  await hold.done;
+  assert.equal((await waitResult(ctx, id)).exit, 0);
+  assert.deepEqual(linesOf(ran), ['local']);
+});
+
+test('runner starts the job, ssh drops and result queries fail: NOT restored locally (no second execution) and cancel still reaches the runner', async () => {
+  const ctx = controllableRunner();
+  const dir = tmpDir('rebind-drop');
+  const ran = path.join(dir, 'ran');
+  const pidFile = path.join(dir, 'pid');
+  const release = path.join(dir, 'release');
+  const cmd = [
+    process.execPath,
+    '-e',
+    `const fs = require('fs');
+fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+fs.appendFileSync(${JSON.stringify(ran)}, (process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local') + '\\n');
+setInterval(() => { if (fs.existsSync(${JSON.stringify(release)})) process.exit(0); }, 50);`,
+  ];
+  const hold = await holdLaneLocally(ctx);
+  const id = await detach(ctx, cmd);
+  await waitFor(() => queuedIds(ctx.state).includes(id), { timeoutMs: 30_000 });
+
+  ctx.setMode(`drop-after-start:${ran}`);
+  await waitFor(() => /remote-rebind: .*the job may be running there/.test(ctx.admissionLog()), { timeoutMs: 90_000 });
+  assert.deepEqual(linesOf(ran), ['remote'], 'started once, on the runner');
+  assert.deepEqual(queuedIds(ctx.state), [], 'not put back in the local queue');
+  const attempt = readAttempt(ctx.state, id);
+  assert.equal(attempt.runner, 'skybox', 'the attempt still names the runner, so cancel can target it');
+  assert.equal(attempt.executor, 'remote');
+
+  hold.release();
+  await hold.done;
+  await sleep(1000);
+  assert.deepEqual(linesOf(ran), ['remote'], 'never executed locally either');
+
+  ctx.setMode('ok');
+  const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+  await laneRun(['cancel', id], { env: ctx.env });
+  await waitFor(() => { try { process.kill(pid, 0); return false; } catch { return true; } }, { timeoutMs: 30_000 });
+});
+
+test('a supervisor killed between withdraw and dispatch leaves a parked ticket that recovery restores at its original seq', async () => {
+  const ctx = controllableRunner();
+  const hold = await holdLaneLocally(ctx);
+  const dir = tmpDir('rebind-crash');
+  const ready = path.join(dir, 'ready');
+  const go = path.join(dir, 'go');
+  const ran = path.join(dir, 'ran');
+  const id = await detach(ctx, recordingCmd(ran), { env: { ...ctx.env, LANE_BROKER_TEST_HOLD_AT: 'rebind-withdrawn', LANE_BROKER_TEST_HOLD_READY: ready, LANE_BROKER_TEST_HOLD_GO: go } });
+  await waitFor(() => queuedIds(ctx.state).includes(id), { timeoutMs: 30_000 });
+  const seq = queuedSeqs(ctx.state)[id];
+
+  ctx.setMode('ok');
+  await waitFor(() => fs.existsSync(ready), { timeoutMs: 60_000 });
+  assert.deepEqual(queuedIds(ctx.state), [], 'withdrawn');
+  assert.equal(parkedFiles(ctx.state).length, 1);
+  process.kill(readAttempt(ctx.state, id).rebinding.supervisorPid, 'SIGKILL');
+  await waitFor(() => { try { process.kill(readAttempt(ctx.state, id).rebinding.supervisorPid, 0); return false; } catch { return true; } }, { timeoutMs: 10_000 });
+
+  await withLock(ctx.state, () => recoverRebinding(ctx.state));
+  assert.deepEqual(parkedFiles(ctx.state), []);
+  assert.equal(queuedSeqs(ctx.state)[id], seq, 'restored at its original seq');
+  assert.deepEqual(linesOf(ran), [], 'nothing ran');
+  hold.release();
+  await hold.done;
 });

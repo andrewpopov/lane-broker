@@ -14,8 +14,9 @@ import {
   LockTimeoutError,
   MigrationInProgressError,
   testDrainAt,
+  testHoldAt,
 } from './state.js';
-import { enqueue, tryStart, dequeueSync, couldAdmitNow, withdrawQueued, restoreQueued } from './scheduler.js';
+import { enqueue, tryStart, dequeueSync, couldAdmitNow, withdrawQueued, restoreQueued, discardRebinding } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { observeLeaseTree } from './cpu.js';
@@ -87,6 +88,7 @@ function cancelRequested(root, id) {
 }
 
 function clearTicketMarkers(root, id) {
+  discardRebinding(root, id);
   for (const marker of [cancelMarkerPath(root, id), expireMarkerPath(root, id)]) {
     try {
       fs.unlinkSync(marker);
@@ -526,12 +528,27 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     process.exit(Number.isInteger(finalResult.exit) ? finalResult.exit : 1);
   }
 
-  async function abandonRebind(runner, reason) {
+  /**
+   * A rebind that did not take. Only an outcome that PROVES the runner never began the job (`neverStarted`, or a confirmed
+   * preflight refusal) puts the ticket back in the local queue, at its original seq. Anything else after the dispatch may have
+   * begun leaves a remote attempt (it keeps its runner and its `running` phase) for the usual reconciliation -- `lane wait`
+   * names it ORPHANED-REMOTE and `lane cancel` cancels it on the runner -- because running it locally too could execute it twice.
+   */
+  async function abandonRebind(runner, reason, { neverStarted = false } = {}) {
+    const where = runner ? runner.name : 'no runner';
+    if (withdrawn && !neverStarted) {
+      const line = `lane: remote-rebind: ${enriched.id}: ${where}: ${reason} — outcome unknown, the job may be running there; not re-running it locally (see lane status, lane cancel)\n`;
+      process.stderr.write(line);
+      writeBrokerLog(root, line);
+      await logWriter.finish();
+      process.exit(1);
+      return { fallback: false };
+    }
     if (withdrawn) {
       await updateAttempt(root, enriched.id, gen, { executor: 'local', phase: 'queued', runner: null });
       await restoreQueued(root, withdrawn);
     }
-    const line = `lane: remote-rebind: ${enriched.id}: ${runner ? runner.name : 'no runner'}: ${reason} — stays in the local queue${withdrawn ? ` at seq ${withdrawn.seq}` : ''}\n`;
+    const line = `lane: remote-rebind: ${enriched.id}: ${where}: ${reason} — stays in the local queue${withdrawn ? ` at seq ${withdrawn.seq}` : ''}\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);
     await logWriter.finish();
@@ -539,8 +556,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   }
 
   /** `rebindable`: this fallback is only "no runner had room right now", so a later probe may still find one. */
-  async function fallbackOrRefuse(runner, reason, { rebindable = false } = {}) {
-    if (rebind) return abandonRebind(runner, reason);
+  async function fallbackOrRefuse(runner, reason, { rebindable = false, neverStarted = false } = {}) {
+    if (rebind) return abandonRebind(runner, reason, { neverStarted: neverStarted || withdrawn === null });
     const fb = await fallbackToLocal(root, enriched.id, reason);
     if (!fb.ok) {
       if (fb.cancelled) {
@@ -648,6 +665,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       await logWriter.finish();
       return { fallback: true, rebindLost: true, attemptGeneration: gen };
     }
+    await testHoldAt('rebind-withdrawn');
     const line = `lane: remote-rebind: ${enriched.id}: seq ${withdrawn.seq} -> ${runner.name} (queued locally ${Math.round((Date.now() - withdrawn.createdAt) / 1000)}s)\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);
@@ -703,6 +721,11 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     abortSignal,
   });
 
+  // BRAIN-405: a confirmed preflight refusal means the runner never started the job, so a rebound ticket goes back to its place
+  if (rebind && dispatch.outcome === 'confirmed' && dispatch.result.kind === 'refused') {
+    return abandonRebind(runner, `runner refused the job (exit ${dispatch.exitCode})`, { neverStarted: true });
+  }
+
   if (dispatch.outcome === 'confirmed') {
     const endedAt = Date.now();
     // BRAIN-320 S1c (1b/1g): a deps/setup failure is a TERMINAL red -- it is
@@ -754,7 +777,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   }
 
   // 'ineligible' or 'unconfirmed'
-  return fallbackOrRefuse(runner, dispatch.reason);
+  return fallbackOrRefuse(runner, dispatch.reason, { neverStarted: dispatch.neverStarted === true });
 }
 
 async function main() {

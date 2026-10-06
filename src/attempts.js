@@ -123,6 +123,15 @@ export async function createAttempt(root, id, { runner = null } = {}) {
   return attempt;
 }
 
+/** BRAIN-405: patch the stored record with no generation fence, for a caller that already holds the broker lock. `undefined` drops a key. */
+export function patchAttemptLocked(root, id, patch) {
+  const current = readAttempt(root, id);
+  if (!current) return null;
+  const next = { ...current, ...patch };
+  atomicWriteJson(attemptFile(root, id), next);
+  return next;
+}
+
 /** Apply `patch` to the stored record, but only if its generation is still
  *  exactly `expectedGeneration` -- the fence against a stale writer acting
  *  on state that has since moved on (e.g. already fell back to local). */

@@ -363,16 +363,28 @@ What a remote run does:
    in one locked step shared with the scheduler's own admission, so exactly
    one of the two takes it (a started, cancelled or already-gone ticket is
    never withdrawn), then dispatches as above, logging
-   `lane: remote-rebind: <id>: seq <n> -> <runner>` to the admission log. If the runner then
-   refuses or the transport fails, the ticket goes back into the local queue
-   **at its original sequence number** and logs `remote-rebind: … stays in the
-   local queue at seq <n>`. A running ticket never moves. Never rebound:
+   `lane: remote-rebind: <id>: seq <n> -> <runner>` to the admission log.
+   The withdrawal is two-phase: the queue file is renamed to
+   `<seq>-<id>.json.rebinding` (no listing reads it, and the scheduler keeps
+   the ticket's fairness records for it) and the attempt records
+   `rebinding`. If the supervisor dies before the dispatch is recorded in the
+   attempt, the next stale-record reap puts the ticket back at its original
+   seq; if it dies after, the attempt is the remote attempt to reconcile
+   (ORPHANED-REMOTE) and the parked record is dropped.
+   Only a proof that the runner never started the job puts the ticket back
+   in the local queue **at its original sequence number** (`remote-rebind: …
+   stays in the local queue at seq <n>`): a snapshot never completely sent,
+   or the runner's confirmed preflight refusal (exit 64). Any other outcome
+   that may have started it (ssh dropped and the result cannot be fetched)
+   is **not** re-run locally, unlike a first dispatch: the supervisor logs
+   `outcome unknown`, exits 1, and leaves the attempt with its runner so
+   `lane status` shows it, `lane wait` names it and `lane cancel` cancels it
+   on the runner. A running ticket never moves. Never rebound:
    `--local`, `LANE_BROKER_LOCAL=1`, an inherited lease, a lane that is not
    `remote`, and a ticket that fell back for any reason other than "no runner
    had room" (an ineligible tree, a `remoteDeps` failure, a dispatch that
-   failed after sending). A withdrawn ticket's fairness counters (conflict and
-   resource skips) may restart, since the scheduler prunes the records of a
-   ticket that left the queue.
+   failed after sending).
+
 3. **Send a snapshot**, not history: a framed stream of exactly the listed
    files. Each file is re-read without following symlinks and its sha256
    checked before its bytes are sent. The runner validates every frame
