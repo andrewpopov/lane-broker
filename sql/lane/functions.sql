@@ -389,8 +389,18 @@ $$;
 -- lock before scanning, so the later of two overlapping transactions scans after the earlier committed and sees its rows: neither
 -- can miss the (account, class) pair the other creates. The key is its own, not lane_sched. The scan is a new statement after the
 -- lock, so under Read Committed it gets a fresh snapshot.
+-- Only READ COMMITTED gives the scan after the lock a fresh snapshot; at a stronger level it would keep the transaction's first snapshot
+-- and could still miss the other transaction's committed rows.
+CREATE OR REPLACE FUNCTION lane.require_read_committed() RETURNS void LANGUAGE plpgsql SET search_path = pg_catalog, lane, pg_temp AS $$
+BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'lane provisioning must run at READ COMMITTED, not %', current_setting('transaction_isolation') USING ERRCODE = '25000';
+  END IF;
+END $$;
+
 CREATE OR REPLACE FUNCTION lane.provision_account_parents() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane, pg_temp AS $$
 BEGIN
+  PERFORM lane.require_read_committed();
   PERFORM pg_advisory_xact_lock(hashtext('lane_provision'));
   INSERT INTO lane.sched_parents (account, prio_class)
     SELECT a, c.name FROM unnest(NEW.allowed_accounts) AS a CROSS JOIN lane.priority_classes c
@@ -400,6 +410,7 @@ END $$;
 
 CREATE OR REPLACE FUNCTION lane.provision_class_parents() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane, pg_temp AS $$
 BEGIN
+  PERFORM lane.require_read_committed();
   PERFORM pg_advisory_xact_lock(hashtext('lane_provision'));
   INSERT INTO lane.sched_parents (account, prio_class)
     SELECT DISTINCT a, NEW.name FROM lane.principals p, unnest(p.allowed_accounts) AS a

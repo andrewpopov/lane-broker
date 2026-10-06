@@ -37,7 +37,7 @@ describe('lane review round 3', { skip: PG_SKIP_REASON ?? false, timeout: 120000
   });
   test('N6 canary: without the shared lock in the class trigger the parent is permanently missed', async () => {
     const lock = "  PERFORM pg_advisory_xact_lock(hashtext('lane_provision'));\n";
-    const target = `BEGIN\n${lock}  INSERT INTO lane.sched_parents (account, prio_class)\n    SELECT DISTINCT a, NEW.name`;
+    const target = `BEGIN\n  PERFORM lane.require_read_committed();\n${lock}  INSERT INTO lane.sched_parents (account, prio_class)\n    SELECT DISTINCT a, NEW.name`;
     assert.equal(await overlappingProvisioning({ mutate: [target, target.replace(lock, '')] }), 0);
   });
 
@@ -64,5 +64,24 @@ describe('lane review round 3', { skip: PG_SKIP_REASON ?? false, timeout: 120000
   test('N7 canary: dropping cpu_min <= cpu_req from the constraint lets an inverted job in', async () => {
     const { su } = await open({ mutate: [' AND cpu_min <= cpu_req', ''] });
     await addGroup(su, { n: 1, jobs: [{ cpu: 1, cpuMin: 2 }] });
+  });
+
+  // N6 residual: the lock only helps if the scan after it gets a fresh snapshot, which only Read Committed gives.
+  async function classInsertAt(opts, isolation) {
+    const { db } = await open(opts);
+    const c = await cluster.client(db);
+    await c.query(`BEGIN ISOLATION LEVEL ${isolation}`);
+    const outcome = await c.query("INSERT INTO lane.priority_classes (name, rank, cod_per_min) VALUES ('archive', -1, 0.01)").then(() => 'inserted', (e) => e.message);
+    await c.query('ROLLBACK');
+    return outcome;
+  }
+  test('N6: provisioning at REPEATABLE READ or SERIALIZABLE is refused with a clear error; READ COMMITTED is accepted', async () => {
+    assert.match(await classInsertAt(undefined, 'REPEATABLE READ'), /lane provisioning must run at READ COMMITTED/);
+    assert.match(await classInsertAt(undefined, 'SERIALIZABLE'), /lane provisioning must run at READ COMMITTED/);
+    assert.equal(await classInsertAt(undefined, 'READ COMMITTED'), 'inserted');
+  });
+  test('N6 canary: without the isolation check a REPEATABLE READ insert goes through', async () => {
+    const m = ["  IF current_setting('transaction_isolation') <> 'read committed' THEN", '  IF false THEN'];
+    assert.equal(await classInsertAt({ mutate: m }, 'REPEATABLE READ'), 'inserted');
   });
 });
