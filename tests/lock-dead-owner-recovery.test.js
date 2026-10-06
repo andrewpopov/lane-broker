@@ -1,12 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { freshEnv } from './helpers.js';
 import { paths } from '../src/state.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 const stateJsPath = fileURLToPath(new URL('../src/state.js', import.meta.url));
 
@@ -166,7 +166,7 @@ test('MUTATION: the pre-fix blind rmSync reintroduces overlap on the same dead-o
   );
   assert.notEqual(mutated, source, 'mutation must actually change the source');
 
-  const mutantDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'lane-broker-mutant-state-'));
+  const mutantDir = fs.realpathSync(makeTmpDir('lane-broker-mutant-state-'));
   const mutantPath = path.join(mutantDir, 'state.js');
   fs.writeFileSync(mutantPath, mutated);
   fs.copyFileSync(fileURLToPath(new URL('../src/process-liveness.js', import.meta.url)), path.join(mutantDir, 'process-liveness.js')); // state.js imports it

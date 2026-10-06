@@ -1,9 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { CappedLogWriter } from '../src/supervisor.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 /**
  * If the log stream errors while a source (the child's stdout/stderr) is
@@ -13,7 +13,7 @@ import { CappedLogWriter } from '../src/supervisor.js';
  * failing.
  */
 test('a log stream error while a source is paused resumes it immediately and switches to discard mode', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-broker-log-writer-'));
+  const dir = makeTmpDir('lane-broker-log-writer-');
   const logPath = path.join(dir, 'out.log');
   const writer = new CappedLogWriter(logPath);
 

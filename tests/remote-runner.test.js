@@ -14,9 +14,10 @@ import { paths, readJsonSafe, processStartTime } from '../src/state.js';
 import { writeLease } from '../src/lease.js';
 import { enqueue } from '../src/scheduler.js';
 import { remoteResultCommand } from '../src/remote-runner.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 function tmpDir(prefix) {
-  return fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
+  return makeTmpDir(`${prefix}-`);
 }
 
 /** Build a fresh source dir on disk matching `files` (relPath -> utf8 content), and the

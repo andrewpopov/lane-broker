@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { gitFixture } from './helpers.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 /**
  * Proves the incident this suite hit for real cannot recur: git exports its
@@ -15,7 +15,7 @@ import { gitFixture } from './helpers.js';
  * that inherited environment before shelling out to git.
  */
 test('a leaked GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE does not redirect a git fixture', () => {
-  const victimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'git-env-isolation-victim-'));
+  const victimDir = makeTmpDir('git-env-isolation-victim-');
   gitFixture(['init', '-q'], victimDir);
   fs.writeFileSync(path.join(victimDir, 'README.md'), 'victim');
   gitFixture(['add', '.'], victimDir);
@@ -25,7 +25,7 @@ test('a leaked GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE does not redirect a git fixt
   const victimBareBefore = execFileSync('git', ['config', '--get', 'core.bare'], { cwd: victimDir, encoding: 'utf8' }).trim();
   const victimWorktreesBefore = execFileSync('git', ['worktree', 'list'], { cwd: victimDir, encoding: 'utf8' });
 
-  const fixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), 'git-env-isolation-fixture-'));
+  const fixtureDir = makeTmpDir('git-env-isolation-fixture-');
   const originalEnv = {
     GIT_DIR: process.env.GIT_DIR,
     GIT_WORK_TREE: process.env.GIT_WORK_TREE,

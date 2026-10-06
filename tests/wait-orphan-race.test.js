@@ -2,11 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
-import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { freshEnv } from './helpers.js';
 import { waitCommand } from '../src/wait.js';
 import { paths, ensureStateDirs, atomicWriteJson, bootId } from '../src/state.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 /** A pid that is guaranteed to be dead right now -- same technique
  *  attempts.test.js uses for `supervisorAlive` coverage. */
@@ -43,7 +43,7 @@ test('BRAIN-319 orphan race: a result published in the gap between the "no resul
   process.env.LANE_BROKER_STATE = state;
   delete process.env.LANE_BROKER_HOME;
 
-  const pauseFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'wait-orphan-race-')), 'release');
+  const pauseFile = path.join(makeTmpDir('wait-orphan-race-'), 'release');
   process.env.LANE_BROKER_TEST_PAUSE_BEFORE_WAIT_ORPHAN = pauseFile;
 
   try {
@@ -86,7 +86,7 @@ test('BRAIN-319 orphan race: a genuinely dead supervisor with no result ever sho
   process.env.LANE_BROKER_STATE = state;
   delete process.env.LANE_BROKER_HOME;
 
-  const pauseFile = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'wait-orphan-race-')), 'release');
+  const pauseFile = path.join(makeTmpDir('wait-orphan-race-'), 'release');
   process.env.LANE_BROKER_TEST_PAUSE_BEFORE_WAIT_ORPHAN = pauseFile;
 
   try {

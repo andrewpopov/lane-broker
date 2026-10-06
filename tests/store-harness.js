@@ -1,11 +1,11 @@
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { createStore } from '../src/store/server.js';
 import { createHmacVerifier, signToken } from '../src/store/auth.js';
 import { StoreClient } from '../src/store/client.js';
 import { manifestHashOf } from '../src/remote-manifest.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 export const SECRET = 'test-secret-not-for-production';
 export const sha = (data) => crypto.createHash('sha256').update(data).digest('hex');
@@ -23,7 +23,7 @@ export function token(claims, { clock } = {}) {
 
 /** One in-process lane-store on a disposable dir, bound to loopback. Tests run two of these (primary + replica). */
 export async function startStore({ clock = fakeClock(), root, ...opts } = {}) {
-  const dir = root ?? fs.mkdtempSync(path.join(os.tmpdir(), 'lane-store-test-'));
+  const dir = root ?? makeTmpDir('lane-store-test-');
   const s = await createStore({ root: dir, verifier: createHmacVerifier(SECRET, { now: clock.now }), now: clock.now, ...opts });
   const addr = await s.listen('127.0.0.1', 0);
   const url = `http://127.0.0.1:${addr.port}`;
@@ -60,5 +60,5 @@ export async function publish(srv, job, snap) {
 }
 
 export function tmpDir(prefix = 'lane-store-dest') {
-  return fs.mkdtempSync(path.join(os.tmpdir(), `${prefix}-`));
+  return makeTmpDir(`${prefix}-`);
 }

@@ -1,7 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { spawn, spawnSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +12,7 @@ import { readSchedulerFence } from '../src/fairness.js';
 import { withLock, paths, atomicWriteFile, atomicWriteJson, queueFenced, MigrationInProgressError, QUEUE_FENCE_NOTE } from '../src/state.js';
 import { readHwm, effectiveNow } from '../src/priority-clock.js';
 import { waitedMs } from '../src/priority.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 /**
  * BRAIN-380: the cutover fence OLD code fails on by itself. `lane migrate-scheduler` replaces the legacy `queue/`
@@ -46,7 +46,7 @@ function migratedRoot() {
  */
 const OLD_CODE_TAG = 'v0.17.0';
 function extractOldCode() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-broker-old-'));
+  const dir = makeTmpDir('lane-broker-old-');
   // Archive to a file, then extract it: piping the archive into tar's stdin hit EPIPE under heavy host load.
   const tarball = path.join(dir, 'old.tar');
   const archive = spawnSync('git', ['-C', REPO, 'archive', '-o', tarball, OLD_CODE_TAG]);
@@ -141,7 +141,7 @@ test('REAL old code launched AFTER the process snapshot (the migrator holds the 
 // ---- process matching, every token ----
 
 test('runsLaneBroker scans every argv token and resolves symlinks', () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-match-'));
+  const dir = makeTmpDir('lane-match-');
   assert.equal(runsLaneBroker('node --require /x/hook.js /old/lane-broker/bin/lane.js run -- x'), true, 'script is not the first non-flag token');
   assert.equal(runsLaneBroker('node --import file:///x/y.mjs --inspect /old/src/supervisor.js'), true);
   assert.equal(runsLaneBroker('node /a/b/src/remote-pipeline.js /t'), true);

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { makeTmpDir } from './helpers/tmp.js';
 
 /**
  * BRAIN-379 slice 2: scripted admission scenarios, driven against ANY copy of the broker's modules. The
@@ -152,7 +153,7 @@ const normalize = (value) => JSON.parse(JSON.stringify(value, (k, v) => (VOLATIL
  * `liveOnly` drops fields only a later slice adds (a lease's `class`, a queue record's priority fields), so a main run and a branch run compare.
  */
 export async function runScript(m, script, { allocationShadow, freshState, seams } = {}) {
-  const state = freshState ?? fs.mkdtempSync(path.join(os.tmpdir(), 'lane-broker-scenario-'));
+  const state = freshState ?? makeTmpDir('lane-broker-scenario-');
   fs.mkdirSync(state, { recursive: true });
   let clock = 1_700_000_000_000;
   const realNow = Date.now;

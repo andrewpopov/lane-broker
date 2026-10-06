@@ -2,15 +2,15 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
-import os from 'node:os';
 import { repoIdentity } from '../src/config.js';
 import { gitFixture } from './helpers.js';
+import { makeTmpDir } from './helpers/tmp.js';
 
 let counter = 0;
 
 function freshDir() {
   counter += 1;
-  return fs.mkdtempSync(path.join(os.tmpdir(), `repo-identity-nosub-${counter}-`));
+  return makeTmpDir(`repo-identity-nosub-${counter}-`);
 }
 
 function initRepo(dir) {
