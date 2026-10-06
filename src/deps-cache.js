@@ -935,7 +935,7 @@ const PATH_LEADERS = new Set(Buffer.from('"\'`([{ \t\n\r\v\f', 'latin1'));
  *     `build/` (`build/deps/`, `build/Release/*.node`, anything a package reads at run time) is touched;
  *   - `__pycache__` under `node-gyp/.../pylib/` where every `.pyc` has its `.py` source beside the cache.
  * `npm rebuild` still works: it runs `node-gyp rebuild`, which configures from `binding.gyp` again. A symlink that
- * points into a pruned path makes the tree uncacheable (`refusesLink`) rather than dangling.
+ * points into or through a pruned path, or is itself pruned, makes the tree uncacheable (`refusesLink`).
  */
 const NODE_GYP_INTERMEDIATE_RE = /^(.*\/)?build\/(?:Makefile|binding\.Makefile|[^/]+\.target\.mk|config\.gypi|gyp-mac-tool|(?:Release|Debug)\/(?:\.deps|obj\.target))$/;
 const GYP_PYCACHE_RE = /(?:^|\/)node-gyp\/(?:.*\/)?pylib\/(?:.*\/)?__pycache__$/;
@@ -958,13 +958,40 @@ function isRegenerableBuildArtifact(tree, rel) {
 }
 
 /**
- * Does the symlink at `linkAbs` lead to, or into, a pruned path of `tree`, or somewhere we cannot vouch for? It is
- * resolved fully (`realpath`, through any intermediate directory symlinks) and the landing spot tested against the
- * pruned set. A link that escapes the tree or cannot be resolved answers true (the tree is refused, not guessed at),
- * except a link whose text names an install path (`namesInstallPath`): that is relocation's business and may well not
- * resolve here, so it is only tested lexically.
+ * Every path a symlink passes through on its way to its target: each component of each hop, following intermediate
+ * symlinks (bounded). A pruned entry anywhere on that chain is as bad as one at the end.
  */
-function refusesLink(tree, linkAbs, target, namesInstallPath) {
+function symlinkChain(linkAbs) {
+  const visited = [];
+  let current = path.dirname(linkAbs);
+  const pending = [fs.readlinkSync(linkAbs)];
+  for (let hops = 0; pending.length > 0; hops += 1) {
+    if (hops > 64) throw new Error('too many symlink hops');
+    const segments = pending.shift().split('/');
+    if (segments[0] === '') current = path.parse(linkAbs).root;
+    for (let i = 0; i < segments.length; i += 1) {
+      const seg = segments[i];
+      if (seg === '' || seg === '.') continue;
+      const next = seg === '..' ? path.dirname(current) : path.join(current, seg);
+      visited.push(next);
+      if (seg !== '..' && fs.lstatSync(next).isSymbolicLink()) {
+        pending.unshift([fs.readlinkSync(next), ...segments.slice(i + 1)].join('/'));
+        break;
+      }
+      current = next;
+    }
+  }
+  return visited;
+}
+
+/**
+ * Does the symlink at `linkAbs` lead to, or through, a pruned path of `tree`, or somewhere we cannot vouch for? Its
+ * whole chain (`symlinkChain`) and its final `realpath` are tested against the pruned set. A link that escapes the
+ * tree or cannot be resolved answers true (the tree is refused, not guessed at), except a link `relocatable` says
+ * relocation will point back into the work dir's own `node_modules`: that may not resolve here, so it is tested
+ * lexically only.
+ */
+function refusesLink(tree, linkAbs, relocatable) {
   const root = fs.realpathSync(tree);
   const prunedUnder = (abs) => {
     for (const base of new Set([tree, root])) {
@@ -975,14 +1002,21 @@ function refusesLink(tree, linkAbs, target, namesInstallPath) {
     }
     return false;
   };
+  let chain;
+  try {
+    chain = symlinkChain(linkAbs);
+  } catch {
+    return !relocatable;
+  }
+  if (chain.some(prunedUnder)) return true;
   let real;
   try {
     real = fs.realpathSync(linkAbs);
   } catch {
-    return namesInstallPath ? prunedUnder(path.resolve(path.dirname(linkAbs), target)) : true;
+    return !relocatable;
   }
   const rel = path.relative(root, real);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) return !namesInstallPath;
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return !relocatable;
   return prunedUnder(real);
 }
 
@@ -1070,6 +1104,18 @@ export function collectInstallPathReferences(tree, roles, { newNonce = () => cry
   return { ambiguous: TOKEN_MARKER };
 }
 
+/**
+ * A symlink whose text starts with an install path: may relocation keep it? Only when that path is the work dir
+ * (`workDir`/`realWorkDir`) and the target lies inside a `node_modules` under it; a link into a temp dir, another
+ * role, or elsewhere in the work dir is not ours to vouch for (false). Null when the text names no install path as
+ * a leading directory (the ambiguity checks decide that).
+ */
+function relocatableInstallLink(groups, text) {
+  const group = groups.find((g) => text === g.path || text.startsWith(`${g.path}/`));
+  if (!group) return null;
+  return group.roles.some((role) => role === 'workDir' || role === 'realWorkDir') && /^\/(?:[^/]+\/)*node_modules(?:\/|$)/.test(text.slice(group.path.length));
+}
+
 function scanTree(tree, groups, pairs, marker) {
   const bufs = [...pairs.map((p) => p.from), marker];
   const markerIdx = bufs.length - 1;
@@ -1079,12 +1125,20 @@ function scanTree(tree, groups, pairs, marker) {
     for (const ent of fs.readdirSync(abs, { withFileTypes: true })) {
       const p = path.join(abs, ent.name);
       const r = rel ? `${rel}/${ent.name}` : ent.name;
-      if (isRegenerableBuildArtifact(tree, r)) continue;
+      if (isRegenerableBuildArtifact(tree, r)) {
+        if (ent.isSymbolicLink()) return { prunedLink: r };
+        continue;
+      }
       let outcome = null;
       if (ent.isDirectory()) outcome = walk(p, r);
       else if (ent.isSymbolicLink()) {
         const target = Buffer.from(fs.readlinkSync(p), 'utf8');
-        if (refusesLink(tree, p, target.toString('utf8'), pairs.some((pr) => target.includes(pr.from)))) return { prunedLink: r };
+        const text = target.toString('utf8');
+        const keeps = relocatableInstallLink(groups, text);
+        if (keeps === false) return { prunedLink: r };
+        if (keeps !== null || !pairs.some((pr) => target.includes(pr.from))) {
+          if (refusesLink(tree, p, keeps === true)) return { prunedLink: r };
+        }
         if (target.includes(marker)) return { collision: true };
         const hit = pairs.some((pr) => target.includes(pr.from));
         if (hit && rewritePrefixes(target, pairs, anchoredOccurrence) === null) return { ambiguous: r };

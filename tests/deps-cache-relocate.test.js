@@ -311,11 +311,28 @@ test('symlink targets are anchored: only the whole target or its leading directo
   const good = tree();
   fs.mkdirSync(good, { recursive: true });
   fs.symlinkSync('/runs/job/node_modules/x', path.join(good, 'link'));
-  fs.symlinkSync('/runs/job', path.join(good, 'whole'));
   const { restored, run } = roundTrip(good, ...one('/runs/job', '/runs/new'));
   run();
   assert.equal(fs.readlinkSync(path.join(restored, 'link')), '/runs/new/node_modules/x');
-  assert.equal(fs.readlinkSync(path.join(restored, 'whole')), '/runs/new');
+});
+
+test('an install-path symlink relocates only into the work dir\'s node_modules; a link into TMPDIR, the work dir root or its other files is refused', () => {
+  const roles = [{ role: 'workDir', path: '/runs/job' }, { role: 'TMPDIR', path: '/var/tmp/lb-tmp' }];
+  for (const [name, target] of Object.entries({
+    'TMPDIR file': '/var/tmp/lb-tmp/generated.js',
+    'TMPDIR itself': '/var/tmp/lb-tmp',
+    'work dir root': '/runs/job',
+    'work dir source file': '/runs/job/src/index.js',
+  })) {
+    const t = tree();
+    fs.mkdirSync(t, { recursive: true });
+    fs.symlinkSync(target, path.join(t, 'l'));
+    assert.deepEqual(collectInstallPathReferences(t, roles), { prunedLink: 'l' }, name);
+  }
+  const ok = tree();
+  fs.mkdirSync(ok, { recursive: true });
+  fs.symlinkSync('/runs/job/web/node_modules/x', path.join(ok, 'l'));
+  assert.ok(collectInstallPathReferences(ok, roles).relocation, 'a link into a node_modules under the work dir is kept');
 });
 
 test('publish verifies against every install path of the run, not only the ones collection saw', () => {
@@ -431,6 +448,14 @@ test('a runtime file under build/ (build/deps/runtime.json) survives the prune a
     fs.symlinkSync(target.replace('ABS', linked), path.join(linked, 'link'));
     assert.deepEqual(collectInstallPathReferences(linked, rolesFor(OLD)), { prunedLink: 'link' }, target);
   }
+  const pruneIsLink = tree();
+  plantNodeGypBuild(pruneIsLink, OLD);
+  fs.rmSync(path.join(pruneIsLink, 'better-sqlite3/build/config.gypi'));
+  write(pruneIsLink, 'better-sqlite3/runtime.json', '{"kept": true}');
+  fs.symlinkSync('../runtime.json', path.join(pruneIsLink, 'better-sqlite3/build/config.gypi'));
+  fs.symlinkSync('build/config.gypi', path.join(pruneIsLink, 'better-sqlite3/config.json'));
+  const refused = collectInstallPathReferences(pruneIsLink, rolesFor(OLD));
+  assert.ok(refused.prunedLink, `a pruned entry that is itself a link (and a link through it) is refused, got ${JSON.stringify(refused)}`);
   const aliased = tree();
   plantNodeGypBuild(aliased, OLD);
   fs.symlinkSync('better-sqlite3/build', path.join(aliased, 'alias'));
