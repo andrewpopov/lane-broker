@@ -521,10 +521,18 @@ reason.
     .prisma .txt .md .sh .yml .yaml` (or a `#!` script under `.bin/`):
     `reason=absolute-install-path-binary file=<rel>`;
   - an occurrence of an install path is not followed by a path terminator
-    (a slash, a quote, a backtick, `) ] } , ; : = \`, whitespace, or the end), or is not
-    preceded by a path start (start of file, a quote, a backtick, whitespace, `= : ( [ { , ; \`;
-    so `/backup/runs/job` never counts as `/runs/job`): `reason=absolute-install-path-ambiguous
-    file=<rel>`. Nothing is guessed.
+    (`/`, a quote, a backtick, `) ] }`, whitespace, or the end), or is not preceded by a path
+    start (start of file, a quote, a backtick, whitespace, `( [ {`), so `/backup/runs/job` and
+    `/backup:/runs/job` never count as `/runs/job`; file-name-legal bytes such as `: = ; , \`
+    on either side make the tree ambiguous: `reason=absolute-install-path-ambiguous
+    file=<rel>`. A symlink target counts only when it is the install path or starts with it
+    plus `/`.
+
+    **Accepted residual:** only `/` and NUL are illegal in file names, so no byte rule can
+    prove that `"/backup /runs/job/x"` names the install path rather than a directory called
+    `backup ` (trailing space). The prefixes matched are the run's own per-ticket paths
+    (`.../remote/tickets/<id>/work` and its temp dirs), which text only contains when it was
+    generated from that path, so this case cannot arise from content not written for that run.
 
   Every other tree that names an install path in text files or symlinks is
   published anyway (conda-style relocation, what Prisma's generated client
