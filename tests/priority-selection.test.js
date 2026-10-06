@@ -328,13 +328,14 @@ test('a reservation earned by backfill takes its reservationSeq from the monoton
   await withClock(async () => {
     const cfg = activeCfg();
     const { state } = fenced(cfg);
+    writeLease(state, heldLease('lane-load', 'lane:load', 2)); // lane load, not ambient load alone, blocks the head (else it is futile and reserves nothing)
     const head = ticket('head', { weight: 4 });
     await enqueue(state, head);
-    await poll(state, head, cfg);
+    await poll(state, head, cfg, 3.4);
     for (let i = 0; i < 3; i += 1) {
       const small = ticket(`s${i}`);
       await enqueue(state, small);
-      assert.equal((await poll(state, small, cfg)).started, true);
+      assert.equal((await poll(state, small, cfg, 3.4)).started, true);
       removeLease(state, small.id);
     }
     const rec = readFairness(state).head.resource;
@@ -377,21 +378,22 @@ test('after a release, re-enabling the limit lets the ticket earn a reservation 
   await withClock(async () => {
     const cfg = activeCfg();
     const { state } = fenced(cfg);
+    writeLease(state, heldLease('lane-load', 'lane:load', 2)); // lane load, not ambient load alone, blocks the head (else it is futile and reserves nothing)
     const head = ticket('head', { weight: 4 });
     await enqueue(state, head);
     const earn = async (prefix) => {
-      await poll(state, head, cfg);
+      await poll(state, head, cfg, 3.4);
       for (let i = 0; i < 3; i += 1) {
         const small = ticket(`${prefix}${i}`);
         await enqueue(state, small);
-        assert.equal((await poll(state, small, cfg)).started, true, `${prefix}${i}`);
+        assert.equal((await poll(state, small, cfg, 3.4)).started, true, `${prefix}${i}`);
         removeLease(state, small.id);
       }
       return readFairness(state).head.resource;
     };
     const first = await earn('a');
     assert.equal(first.reserved, true);
-    await poll(state, head, activeCfg({ resourceSkipLimit: 0 })); // disabled: released
+    await poll(state, head, activeCfg({ resourceSkipLimit: 0 }), 3.4); // disabled: released
     assert.equal(readFairness(state).head.resource, undefined);
     const second = await earn('b'); // re-enabled: counter and latch start over, and are earned the ordinary way
     assert.equal(second.reserved, true, 'earned again');
