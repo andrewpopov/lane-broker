@@ -231,11 +231,23 @@ export function capElasticClaim(ticket, cfg, host = detectResourceCapacity()) {
   if (cfg.schedulerMode !== 'active' || !Number.isFinite(min)) return ticket;
   const cap = Math.floor(cpuBudgetCores(host, cfg));
   if (!(ticket.resources.cpuCores > cap)) return ticket;
-  // A budget that shrank below the floor (or to zero) must never produce a grant under the minimum: leave the ticket as declared,
-  // so it waits like any over-budget claim instead of being admitted below what it asked to run with.
+  // A budget that shrank below the floor (or to zero) must never produce a grant under the minimum: leave the ticket as declared;
+  // admission denies it (elasticBelowFloor) so it waits like any over-budget claim instead of being admitted below what it asked to run with.
   if (cap < 1 || cap < Math.ceil(min)) return ticket;
   const { minCpuCores, ...claim } = ticket.resources;
   return { ...ticket, resources: { ...claim, cpuCores: cap, ...(minCpuCores < cap ? { minCpuCores } : {}) } };
+}
+
+/**
+ * BRAIN-362: an elastic ticket whose floor, rounded up, no longer fits floor(current CPU budget) (the budget shrank after
+ * preflight). Admission denies it before any exemption (cold sample, idle overshoot) could grant it its full claim;
+ * it keeps waiting, since the budget may grow back. Active mode only, like the cap.
+ */
+export function elasticBelowFloor(ticket, cfg, host = detectResourceCapacity()) {
+  const min = ticket.resources?.minCpuCores;
+  if (cfg.schedulerMode !== 'active' || !Number.isFinite(min)) return false;
+  const cap = Math.floor(cpuBudgetCores(host, cfg));
+  return cap < 1 || cap < Math.ceil(min);
 }
 
 export function leaseResources(lease, cfg) {

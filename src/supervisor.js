@@ -840,7 +840,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     const line = `lane: remote: ${enriched.id}: ${runner.name}: ${dispatch.reason}\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);
-    await publishAndExit(gen, () => localRefusalResult(enriched, { exitCode: 1, message: line }));
+    await publishAndExit(gen, () => ({ ...localRefusalResult(enriched, { exitCode: 1, message: line }), executor: 'remote', runner: runner.name }));
     return { fallback: false };
   }
 

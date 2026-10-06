@@ -793,13 +793,18 @@ export async function dispatchRemote(opts) {
     return { outcome: 'cancelled' };
   }
 
+  // BRAIN-363: set when the expiry cancel was not confirmed: whatever the late record turns out to be, the job may still be running.
+  let unconfirmedCancel = false;
   if (!record && waitExpired) {
     // BRAIN-363: the caller falls back to running locally, so the runner's copy must not keep running beside it.
     const cancelConfirmed = await remoteCancelBestEffort(runner, ticketId, sshBin, cancelDeadlineMs, env);
+    if (abortSignal && abortSignal.aborted) return { outcome: 'cancelled' };
     // The result may have landed while the cancel was in flight; a finished remote run is used, never discarded for a re-run.
     const late = await fetchRemoteResult(runner, ticketId, sshBin, resultDeadlineMs, env);
+    if (abortSignal && abortSignal.aborted) return { outcome: 'cancelled' };
     if (late && !late.missing) {
       record = late;
+      unconfirmedCancel = !cancelConfirmed;
     } else if (cancelConfirmed) {
       return {
         outcome: 'unconfirmed',
@@ -821,7 +826,8 @@ export async function dispatchRemote(opts) {
   // comment for the phase rules (I7: green only from phase 'command').
   const classification = classifyRemoteResult(record, expected);
   if (classification.outcome === 'unconfirmed') {
-    return { outcome: 'unconfirmed', reason: classification.reason };
+    // Only a valid classified result may lift the unconfirmed-cancel hold: an unusable late record leaves the job possibly alive.
+    return { outcome: 'unconfirmed', reason: classification.reason, ...(unconfirmedCancel ? { mayStillBeRunning: true } : {}) };
   }
   const confirmed = { outcome: 'confirmed', result: record, exitCode: classification.exitCode, phase: classification.phase, uploadMs };
   // BRAIN-398: only a runner that stored files for this result is asked for them; a failure here is reported, never

@@ -688,3 +688,41 @@ test('BRAIN-362: lane status reads a stale over-budget queue record at the cappe
     }
   }
 });
+
+test('BRAIN-362: an elastic ticket whose floor no longer fits floor(budget) is denied, even on a cold sample or the idle exemption', async () => {
+  const belowFloor = (id) => ticket(id, { resources: { cpuCores: 16, minCpuCores: 3.2, memoryBytes: GIB } }); // budget 3: floor 3 < ceil(3.2) = 4
+  const cold = freshEnv().state;
+  const c = belowFloor('cold');
+  await enqueue(cold, c, tightCfg());
+  const coldResult = await tryStart(cold, c, tightCfg(), undefined, () => null, undefined, memory());
+  assert.equal(coldResult.started, false, 'a cold sample must not admit it at the full claim');
+  assert.equal(coldResult.reason, 'elastic-below-floor');
+  assert.match(readLog(cold), /elastic-below-floor/);
+  assert.deepEqual(fs.readdirSync(paths(cold).queue).filter((n) => n.endsWith('.json')).length, 1, 'it keeps waiting, not dequeued');
+
+  const idle = freshEnv().state;
+  const i = belowFloor('idle');
+  const cfg = tightCfg({ resourceIdleOvershootCores: 100 });
+  await enqueue(idle, i, cfg);
+  const idleResult = await tryStart(idle, i, cfg, undefined, hostSampler(2), undefined, memory());
+  assert.equal(idleResult.started, false, 'the idle exemption must not admit it either');
+  assert.equal(idleResult.reason, 'elastic-below-floor');
+
+  const grown = await tryStart(idle, i, tightCfg({ resourceIdleOvershootCores: 100, cpuReserveCores: HOST_CORES - 4 }), undefined, hostSampler(0), undefined, memory());
+  if (HOST_CORES >= 4) assert.equal(grown.started, true, 'once the budget holds the floor again it is admitted');
+});
+
+test('BRAIN-362: the queue keeps the declared claim; the cap follows the current budget for the queue view and admission alike', async () => {
+  const { state } = freshEnv();
+  const t = hugeElastic('grow');
+  const small = tightCfg({ cpuReserveCores: HOST_CORES - 2 });
+  await enqueue(state, t, small);
+  const file = path.join(paths(state).queue, fs.readdirSync(paths(state).queue).find((n) => n.endsWith('.json')));
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).resources.cpuCores, 16, 'stored as declared');
+  assert.equal(listQueueCapped(state, small)[0].resources.cpuCores, 2);
+  const grown = tightCfg(); // budget raised 2 -> 3
+  assert.equal(listQueueCapped(state, grown)[0].resources.cpuCores, 3);
+  const result = await tryStart(state, t, grown, undefined, () => null, undefined, memory());
+  assert.equal(result.started, true);
+  assert.equal(result.lease.grantedCpuCores, 3, 'admission agrees with the queue view');
+});

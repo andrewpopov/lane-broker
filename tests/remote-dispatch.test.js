@@ -641,8 +641,12 @@ test('remote run: result-wait expiry with an unconfirmed cancel fails the ticket
   assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
   assert.equal(fs.existsSync(marker), false, 'the job must not have been re-run locally');
   const result = resultOf(state, id);
-  assert.notEqual(result.executor, 'local');
+  assert.equal(result.executor, 'remote');
+  assert.equal(result.runner, 'skybox');
   assert.match(result.error, /may still be running and was not re-run/);
   const history = fs.readFileSync(path.join(state, 'history.jsonl'), 'utf8');
   assert.match(history, /was not re-run/);
+  const row = JSON.parse(history.trim().split('\n').at(-1));
+  assert.equal(row.executor, 'remote');
+  assert.equal(row.runner, 'skybox');
 });

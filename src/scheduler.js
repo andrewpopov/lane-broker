@@ -13,7 +13,7 @@ import { advanceHwm } from './priority-clock.js';
 import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, effectiveRank, score } from './priority.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
-import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, leaseResources, resolveTicketResources, terminalRowDefaults, capElasticClaim } from './resources.js';
+import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, leaseResources, resolveTicketResources, terminalRowDefaults, capElasticClaim, elasticBelowFloor } from './resources.js';
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
  *  possibly-running work and must count against both conflicts and capacity. */
@@ -149,8 +149,8 @@ export async function enqueue(root, ticket, cfg = DEFAULT_GLOBAL_CONFIG) {
     }
     const seq = nextSeq(root);
     const record = {
-      // BRAIN-362: the queue record carries the claim capped to this host's budget, so reservations and backfill see what the ticket can really get
-      ...capElasticClaim(ticket, cfg),
+      // BRAIN-362: the record keeps the DECLARED claim; the cap is derived at read time (listQueueCapped, tryStart) against the current budget
+      ...ticket,
       seq,
       createdAt: ticket.createdAt || Date.now(),
       priorityRequested,
@@ -1259,6 +1259,16 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // informational-only, every start is an ordinary 'ok', idle or not.
     const baselineReason = cfg.admissionLoadGate && gate.closed && brokerIdle ? 'idle-exempt' : 'ok';
 
+    // BRAIN-362: before any exemption (cold sample, idle overshoot) can admit it at its full claim, an elastic ticket whose
+    // floor no longer fits the current budget keeps waiting: the budget may grow back.
+    if (elasticBelowFloor(ticket, cfg)) {
+      if (ticket.id === headTicket.id) markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
+      dropPickRecord();
+      return {
+        result: { started: false, reason: 'elastic-below-floor' },
+        logFields: { ...logBase, currentDecision: 'deny', currentReason: 'elastic-below-floor' },
+      };
+    }
     if (cfg.admissionLoadGate && gate.closed && !brokerIdle) {
       if (ticket.id === headTicket.id) markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
       dropPickRecord();
