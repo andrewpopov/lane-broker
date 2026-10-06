@@ -209,9 +209,10 @@ export function fairnessStore(root, tickets) {
     },
     /** Drop the records of every ticket no longer queued (cancelled, expired, reaped). An unreadable queue record has no
      *  id, so with one present nothing can be proven departed and nothing is dropped. */
-    prune: (rawQueue) => {
+    prune: (rawQueue, provisional = []) => {
       if (rawQueue.includes(null)) return;
-      const queued = new Set(rawQueue.map((t) => t.id));
+      // a ticket provisionally withdrawn for a remote dispatch (BRAIN-405) may be restored: it keeps its records
+      const queued = new Set([...rawQueue.map((t) => t.id), ...provisional]);
       const next = Object.fromEntries(Object.entries(tickets).filter(([id]) => queued.has(id)));
       if (Object.keys(next).length === Object.keys(tickets).length) return;
       try {

@@ -570,7 +570,8 @@ export async function remoteCancel(runner, ticketId, { sshBin = 'ssh', deadlineM
 /**
  * Dispatch one lane run to `runner` over ssh and resolve to exactly one of
  * `{outcome:'ineligible'|'confirmed'|'unconfirmed'|'cancelled', ...}`
- * (BRAIN-319 I1/C6). Never throws for a remote/transport failure -- only a
+ * (BRAIN-319 I1/C6). `neverStarted: true` (BRAIN-405) marks an ineligible/unconfirmed outcome that proves the runner never
+ * began the job (nothing, or only part of the snapshot, was sent); any other unconfirmed outcome may have a live job behind it. Never throws for a remote/transport failure -- only a
  * genuinely unexpected local error (not `RemoteIneligibleError`) from
  * `buildManifest` propagates.
  *
@@ -648,7 +649,7 @@ export async function dispatchRemote(opts) {
     try {
       manifest = buildManifest(worktreeRoot);
     } catch (err) {
-      if (err instanceof RemoteIneligibleError) return { outcome: 'ineligible', reason: err.message };
+      if (err instanceof RemoteIneligibleError) return { outcome: 'ineligible', reason: err.message, neverStarted: true };
       throw err;
     }
   }
@@ -693,6 +694,7 @@ export async function dispatchRemote(opts) {
     return {
       outcome: 'ineligible',
       reason: `snapshot header is ${headerBytes} bytes, over the runner limit of ${MAX_HEADER_BYTES} (too many files)`,
+      neverStarted: true,
     };
   }
 
@@ -721,7 +723,8 @@ export async function dispatchRemote(opts) {
   }
 
   if (!pipeResult.ok) {
-    return { outcome: 'unconfirmed', reason: pipeResult.reason };
+    // BRAIN-405: the snapshot was never completely sent, and a runner runs nothing before it has received and verified all of it
+    return { outcome: 'unconfirmed', reason: pipeResult.reason, neverStarted: true };
   }
 
   const expected = { protocol, ticketId, generation, manifestHash: manifest.manifestHash };

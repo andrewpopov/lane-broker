@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, writeExpireMarkerFile, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
 import { sampleAndUpdateGate, readGateState } from './load.js';
+import { patchAttemptLocked, readAttempt } from './attempts.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
 import { evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, projectBusy, ticketCpuEstimate } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
@@ -172,11 +173,34 @@ export function dequeueSync(root, id) {
   }
 }
 
+const REBINDING_SUFFIX = '.json.rebinding';
+const SEQ_PREFIX_LENGTH = 13; // 12 padded digits and the dash
+
+function rebindingNames(root) {
+  try {
+    return fs.readdirSync(paths(root).queue).filter((n) => n.endsWith(REBINDING_SUFFIX));
+  } catch {
+    return [];
+  }
+}
+
+const rebindingFile = (root, id) => {
+  const name = rebindingNames(root).find((n) => n.endsWith(`-${id}${REBINDING_SUFFIX}`));
+  return name ? path.join(paths(root).queue, name) : null;
+};
+
+/** Ids of tickets provisionally withdrawn from the queue (BRAIN-405); the queue listing never shows them. */
+export function listRebindingIds(root) {
+  return rebindingNames(root).map((n) => n.slice(SEQ_PREFIX_LENGTH, -REBINDING_SUFFIX.length));
+}
+
 /**
- * BRAIN-405: take a still-queued ticket out of the queue so the caller can run it elsewhere. One locked step shared with
- * `tryStart`'s own dequeue-and-lease-write, so for any one ticket exactly one of the two wins: the record is returned only if
- * it was still queued (never started, not cancelled, not gone, no migration in progress); otherwise null and nothing changed.
- * The returned record carries its original `seq`, which `restoreQueued` needs.
+ * BRAIN-405: provisionally withdraw a still-queued ticket so the caller can dispatch it to a runner. Two-phase and one locked
+ * step shared with `tryStart`'s own dequeue-and-lease-write: the queue file is RENAMED to `<seq>-<id>.json.rebinding` (which
+ * no queue listing reads, but which keeps the record and its seq on disk) and the attempt is marked `rebinding`, so a crash
+ * from here on is recoverable (`recoverRebinding`). The record is returned only if the ticket was still queued (never started,
+ * not cancelled, not gone, no migration in progress); otherwise null and nothing changed, so for any one ticket exactly one of
+ * the scheduler and this wins. `restoreQueued` or `discardRebinding` ends the withdrawal.
  */
 export async function withdrawQueued(root, id) {
   return withLock(root, () => {
@@ -191,21 +215,63 @@ export async function withdrawQueued(root, id) {
     if (!file) return null;
     const record = readJsonSafe(file);
     if (!record || record.id !== id) return null;
+    const parked = file.replace(/\.json$/, REBINDING_SUFFIX);
     try {
-      fs.unlinkSync(file);
+      fs.renameSync(file, parked);
     } catch {
       return null;
+    }
+    try {
+      patchAttemptLocked(root, id, { rebinding: { rebindingSince: Date.now(), supervisorPid: process.pid } });
+    } catch (err) {
+      fs.renameSync(parked, file);
+      throw err;
     }
     return record;
   });
 }
 
-/** BRAIN-405: put a withdrawn record back at its ORIGINAL sequence, so a refused rebind never costs the ticket its place. */
+/** BRAIN-405: end a withdrawal that provably never started a remote run: the ticket is queued again at its ORIGINAL seq. */
 export async function restoreQueued(root, record) {
-  return withLock(root, () => {
-    if (findQueueFile(root, record.id)) return;
-    atomicWriteJson(queueFile(root, record.seq, record.id), record);
-  });
+  return withLock(root, () => restoreLocked(root, record));
+}
+
+function restoreLocked(root, record) {
+  if (!findQueueFile(root, record.id)) {
+    const parked = rebindingFile(root, record.id);
+    if (parked) fs.renameSync(parked, parked.slice(0, -'.rebinding'.length));
+    else atomicWriteJson(queueFile(root, record.seq, record.id), record);
+  }
+  patchAttemptLocked(root, record.id, { rebinding: undefined });
+}
+
+/** BRAIN-405: the withdrawal is over because the ticket reached a terminal outcome (or is now only a remote attempt). */
+export function discardRebinding(root, id) {
+  const parked = rebindingFile(root, id);
+  if (!parked) return;
+  try {
+    fs.unlinkSync(parked);
+  } catch {
+    // already gone
+  }
+}
+
+/**
+ * BRAIN-405: a withdrawal whose supervisor died. Without dispatch evidence in the attempt (it never reached `running` on a
+ * runner) nothing was sent, so the ticket goes back at its original seq. With evidence the run may be live on the runner: the
+ * attempt is left as the remote attempt to reconcile (ORPHANED-REMOTE) and the parked record is dropped. Caller holds the lock.
+ */
+export function recoverRebinding(root) {
+  for (const name of rebindingNames(root)) {
+    const file = path.join(paths(root).queue, name);
+    const record = readJsonSafe(file);
+    if (!record || isSupervisorAlive({ supervisorPid: record.supervisorPid, supervisorStart: record.supervisorStart })) continue;
+    const attempt = readAttempt(root, record.id);
+    const dispatched = attempt?.executor === 'remote' && attempt.phase === 'running';
+    if (dispatched) discardRebinding(root, record.id);
+    else restoreLocked(root, record);
+    logResourceEvent(root, 'rebind-recovered', { ticket: record.id, action: dispatched ? 'remote-attempt' : 'restored', seq: record.seq });
+  }
 }
 
 /**
@@ -247,6 +313,7 @@ export function blockedBy(held, ticket) {
  */
 export function reapStale(root, keepTicketId) {
   reapAll(root, bootId());
+  recoverRebinding(root);
   for (const t of listQueue(root)) {
     if (t && t.id !== keepTicketId && !isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart })) {
       // Only a real dequeue is recorded: a failed unlink leaves the ticket
@@ -774,7 +841,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // A reservation exists only while resource backfill does: when it is off, release every latch, so turning it back
     // on makes a ticket earn its reservation again.
     if (sched.v2 && !(cfg.schedulerMode === 'active' && cfg.resourceSkipLimit > 0)) store.releaseReservations();
-    store.prune(rawQueue);
+    store.prune(rawQueue, listRebindingIds(root));
     const { queue, ownerId: reservationOwnerId } = sched.v2 ? effectiveView(rawQueue, nowEff, cfg, store) : { queue: rawQueue, ownerId: null };
     const position = queue.findIndex((t) => t && t.id === ticket.id);
     if (position === -1) {
