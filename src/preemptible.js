@@ -122,7 +122,11 @@ export function readLeaseMarkers(pids, leaseIds, { platform = process.platform, 
     const withEnv = parseCommandMap(ps(['-E']));
     for (const pid of pids) {
       const command = plain.get(pid);
-      result.set(pid, command === undefined || !withEnv.has(pid) ? null : envSuffix(command, withEnv.get(pid)).split(/\s+/).some((e) => wanted.includes(e)));
+      // Unknown (null, fail closed) unless the -E line extends this pid's plain command with a visible environment:
+      // a changed argv between the two reads, or an environment ps hides (SIP), must not read as "no marker".
+      const full = withEnv.get(pid);
+      const env = command !== undefined && full !== undefined && full.startsWith(command) ? envSuffix(command, full).trim() : '';
+      result.set(pid, env.includes('=') ? env.split(/\s+/).some((e) => wanted.includes(e)) : null);
     }
   } catch {
     for (const pid of pids) result.set(pid, null);

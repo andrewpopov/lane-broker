@@ -136,11 +136,17 @@ test('marker readers: Linux /proc/<pid>/environ and macOS ps -E with the argv pr
   const env = { '/proc/7/environ': 'A=1\0LANE_BROKER_LEASE=L9\0', '/proc/8/environ': 'A=1\0' };
   const fsApi = { readFileSync: (f) => { if (f in env) return env[f]; throw Object.assign(new Error('x'), { code: 'EACCES' }); } };
   assert.deepEqual([...readLeaseMarkers([7, 8, 9], ['L9'], { platform: 'linux', fsApi })], [[7, true], [8, false], [9, null]]);
+  // 7: marker in the environment. 8: an argument spells the marker but ps shows no environment (SIP-hidden) -> unknown.
+  // 10: environment visible, no marker -> genuinely external. 11: argv changed between the two reads -> unknown.
   const exec = (_cmd, args) =>
     args.includes('-E')
-      ? ' 7 /bin/node server.js HOME=/h LANE_BROKER_LEASE=L9\n 8 /bin/node LANE_BROKER_LEASE=L9\n'
-      : ' 7 /bin/node server.js\n 8 /bin/node LANE_BROKER_LEASE=L9\n';
-  assert.deepEqual([...readLeaseMarkers([7, 8, 9], ['L9'], { platform: 'darwin', exec })], [[7, true], [8, false], [9, null]], 'an argument spelling the marker is not a member');
+      ? ' 7 /bin/node server.js HOME=/h LANE_BROKER_LEASE=L9\n 8 /bin/node LANE_BROKER_LEASE=L9\n 10 /bin/sim HOME=/h\n 11 /bin/sim --phase=2 LANE_BROKER_LEASE=L9\n'
+      : ' 7 /bin/node server.js\n 8 /bin/node LANE_BROKER_LEASE=L9\n 10 /bin/sim\n 11 /bin/sim --phase=1\n';
+  assert.deepEqual(
+    [...readLeaseMarkers([7, 8, 9, 10, 11], ['L9'], { platform: 'darwin', exec })],
+    [[7, true], [8, null], [9, null], [10, false], [11, null]],
+    'an argument spelling the marker is not a member, and a hidden or changed environment is unknown, never "no marker"',
+  );
 });
 
 test('preemptibleNiceMin 0 disables the feature', (t) => {
