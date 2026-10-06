@@ -117,7 +117,7 @@ never told to forward to it — both still get the `--log` file.
   "resourceIdleOvershootCores": 1,
   "admissionLoadGate": false,
   "laneNice": 10,
-  "noProgressTimeoutMs": 900000
+  "noProgressTimeoutMs": 0
 }
 ```
 
@@ -1257,23 +1257,35 @@ factor is 1.0 (no calibration) and is printed.
 ### No-progress watchdog (BRAIN-431)
 
 A run that hangs holds its slot indefinitely (a vitest pool that stopped mid-run once sat silent for 100 minutes and
-blocked a push). A run is killed when, over a whole `noProgressTimeoutMs` window, BOTH hold: its output (stdout +
-stderr) grew by 0 bytes, AND its process tree used under 0.05 CPU-seconds per minute. CPU is the per-process
-cumulative-time delta of the lease's tree (not `ps` pcpu, a lifetime average that stays high long after a process
-goes idle), so a silent but busy command (a long compile or a quiet test) is never killed, nor is a command that
-prints. An unreadable process table counts as progress. The check rides the supervisor heartbeat (`sampleMs`), local
-and runner-side alike.
+blocked a push). Every supervisor heartbeat observes the lease's tree, and an interval is **idle** when the command wrote
+no output (stdout + stderr), no process joined or left the tree, and the tree's CPU delta stayed under 0.05 CPU-seconds
+per minute (scaled to the interval). CPU is the per-process cumulative-time delta by identity (on Linux including reaped
+children's `cutime`/`cstime`), not `ps` pcpu, a lifetime average that stays high long after a process goes idle. Anything
+else is progress and restarts the streak, and so is anything the supervisor could not observe (a failed descendant scan,
+an unreadable process table, a member with no row); the first observation only sets the baseline. Timing is monotonic.
+
+**The stall is always recorded; the kill is opt-in.** The idle streak is stamped on the lease as `noProgressSinceMs`
+(`lane status` shows `no-progress=<t>` from a minute on, `--json` carries the field), and the history row records the
+longest streak as `maxNoProgressMs`, for every lane, so monitoring can alert on a stall without anything being killed.
+The kill is off by default (global `noProgressTimeoutMs: 0`) because legitimate work can look idle to a process-tree
+observer: slow network I/O, a daemon-backed `docker` build whose CPU lives outside the tree, output buffered until the end,
+work written only to other files. Opt a lane in by setting `noProgressTimeoutMs` in `.lane-broker.json`; the right lanes
+are test or verify lanes whose output streams (a vitest/jest run, a `verify` script), with a timeout well above their
+longest legitimate quiet stretch. Do not opt in a lane that builds images, downloads, or buffers its output.
 
 | Setting | Where | Default | Meaning |
 |---|---|---|---|
-| `noProgressTimeoutMs` | global `config.json` | `900000` (15 min) | Window length in ms; `0` disables. |
-| `noProgressTimeoutMs` | a lane in `.lane-broker.json` | the global value | Per-lane override (an undeclared lane inherits its `as` template's); `0` disables for the lane. |
+| `noProgressTimeoutMs` | global `config.json` | `0` | Consecutive idle time that triggers the kill; `0` never kills (the stall is still recorded). |
+| `noProgressTimeoutMs` | a lane in `.lane-broker.json` | the global value | Per-lane value (an undeclared lane inherits its `as` template's); `0` disables for the lane. |
 
-On trigger the tree is reaped as for a cancel (TERM, grace, KILL, descendants), the result and history row carry
-`exit: 124`, `reason: "no-progress"` and `noProgressTimeoutMs`, and the admission log gets `lane-broker-reap id=<id>
-descendants-reaped=<n> reason=no-progress`. The submitter sees `lane run: no progress for 15m (no output, no CPU) —
-killed` (also appended to the lease log); for a remote run the runner relays the reason and window in its result, so the
-submitter's history row is `executor: "remote"`, exit 124, `reason: "no-progress"`.
+On trigger the tree is reaped as for a cancel (TERM, grace, KILL, descendants) through the one reap a cancel or leader
+exit also uses (a cancel arriving mid-reap starts no second one and its `exit: 130` result wins). The result and history
+row carry `exit: 124`, `reason: "no-progress"` and `noProgressTimeoutMs`, and the admission log gets
+`lane-broker-reap id=<id> descendants-reaped=<n> reason=no-progress`. The submitter sees `lane run: no progress for 15m
+(no output, no CPU) — killed` (also appended to the lease log). A remote run uses the **submitter's** resolved timeout
+(its lane, else its global value), sent to the runner in the dispatch header, so a runner's own config never changes it;
+the runner relays the reason and window back, and the submitter's history row is `executor: "remote"`, exit 124,
+`reason: "no-progress"`.
 
 ### Group reap on leader exit (ROG-2181 T1b)
 

@@ -178,6 +178,10 @@ function validateHeaderFields(header) {
   if (header.queueTimeoutMs !== undefined && !(Number.isInteger(header.queueTimeoutMs) && header.queueTimeoutMs > 0)) {
     return { ok: false, reason: 'invalid queueTimeoutMs' };
   }
+  // BRAIN-431: the submitter's resolved no-progress timeout (0 = kill off); additive, an older runner ignores it
+  if (header.noProgressTimeoutMs !== undefined && !(Number.isInteger(header.noProgressTimeoutMs) && header.noProgressTimeoutMs >= 0)) {
+    return { ok: false, reason: 'invalid noProgressTimeoutMs' };
+  }
   // BRAIN-398: additive on both protocols (an older runner ignores them; the submitter checks the probe capability first).
   if (header.remoteArtifacts !== undefined && !isValidRemoteArtifactsShape(header.remoteArtifacts)) {
     return { ok: false, reason: 'invalid remoteArtifacts' };
@@ -514,6 +518,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     cpuOverride: header.cpuCores,
     minCpuOverride: header.minCpuCores,
     memoryOverride: header.memoryBytes,
+    noProgressTimeoutOverride: header.noProgressTimeoutMs,
     // Unchanged by protocol: `.lane-broker.json` resolution (via
     // `configRoot` below) walks from this same cwd, and a protocol-2
     // pipeline resolves its own phase cwds from `pipeline.json`'s absolute

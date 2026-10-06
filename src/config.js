@@ -97,9 +97,10 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // niceing (spawns the bare command). A `.lane-broker.json` lane's own
   // `nice` overrides this per-lane.
   laneNice: 10,
-  // BRAIN-431: a run with no output and no CPU for this long is killed (exit 124, reason 'no-progress'). 0 disables;
-  // a lane's own `noProgressTimeoutMs` overrides it.
-  noProgressTimeoutMs: 900_000,
+  // BRAIN-431: a run idle (no output, no CPU, no process churn) for this long is killed (exit 124, reason 'no-progress').
+  // 0 (the default) never kills: quiet work is legitimate, so the kill is opted into per lane (`noProgressTimeoutMs`).
+  // The stall is recorded either way.
+  noProgressTimeoutMs: 0,
   // BRAIN-379 (balancer P2, slice 2): record, in admission-decisions.log and `lane status`, what
   // class-aware test/sim allocation WOULD decide. Never changes a live admission decision.
   allocationShadow: false,

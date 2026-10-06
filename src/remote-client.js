@@ -617,6 +617,8 @@ export async function dispatchRemote(opts) {
     // Rides on both protocol 1 and 2: an older runner simply ignores an
     // unknown field, which is fine, since the whole feature is opt-in.
     queueTimeoutMs = null,
+    // BRAIN-431: the submitter's resolved no-progress timeout; the runner applies it instead of its own config
+    noProgressTimeoutMs = null,
     // BRAIN-380 §6: the tier the submitter resolved BEFORE any cap, and the wait it has accrued on its own priority
     // clock. Additive header fields: an older runner ignores them, so its ticket is simply medium.
     priorityRequested,
@@ -681,6 +683,7 @@ export async function dispatchRemote(opts) {
   }
   if (Number.isFinite(minCpuCores)) header.minCpuCores = minCpuCores;
   if (Number.isInteger(queueTimeoutMs) && queueTimeoutMs > 0) header.queueTimeoutMs = queueTimeoutMs;
+  if (Number.isInteger(noProgressTimeoutMs) && noProgressTimeoutMs >= 0) header.noProgressTimeoutMs = noProgressTimeoutMs;
   if (isPriorityTier(priorityRequested)) header.priorityRequested = priorityRequested;
   if (Number.isInteger(priorityAccruedMs) && priorityAccruedMs >= 0) header.priorityAccruedMs = priorityAccruedMs;
 

@@ -1,29 +1,35 @@
+import { performance } from 'node:perf_hooks';
 import { readProcCpuRows } from './preemptible.js';
 
 /**
- * BRAIN-431: a run that makes no progress holds its slot forever (a vitest worker pool that hung mid-run sat 100 minutes).
- * "No progress" means BOTH hold over the whole timeout window: the command wrote 0 bytes of output, and its process tree
- * used under NO_PROGRESS_CPU_SECONDS_PER_MINUTE of CPU. CPU is read as per-process cumulative-time deltas
- * (src/preemptible.js), never `ps` pcpu, which is a lifetime average that stays high long after a process went idle.
+ * BRAIN-431: a run that makes no progress holds its slot indefinitely (a vitest pool that hung mid-run sat 100 minutes).
+ * Every heartbeat is one observation of the lease's tree; an interval is IDLE when the command wrote no output, no process
+ * joined or left the tree, and the tree's CPU delta stayed under NO_PROGRESS_CPU_SECONDS_PER_MINUTE scaled to the interval.
+ * Anything else, and anything we could not observe, is progress and restarts the streak. The streak's length is the stall
+ * signal (always recorded); the kill is opt-in (`noProgressTimeoutMs` > 0) and needs the streak itself to reach it.
+ * CPU is per-process cumulative time by identity (src/preemptible.js; on Linux including reaped children's cutime/cstime),
+ * never `ps` pcpu, a lifetime average that stays high long after a process went idle. Timing is monotonic.
  */
 export const NO_PROGRESS_REASON = 'no-progress';
 export const NO_PROGRESS_EXIT = 124;
 export const NO_PROGRESS_CPU_SECONDS_PER_MINUTE = 0.05;
 
 const identity = (row) => `${row.pid}:${row.token}`;
+const cpuOf = (row) => row.cpuSec + (row.childCpuSec ?? 0);
 
 export class NoProgressWatchdog {
-  /** @param timeoutMs window length; 0 (or less) disables the watchdog */
-  constructor({ timeoutMs, now = Date.now(), readRows = readProcCpuRows }) {
+  /** @param timeoutMs streak length that triggers the kill; 0 (or less) records the stall signal but never kills */
+  constructor({ timeoutMs, readRows = readProcCpuRows, clock = () => performance.now() }) {
     this.timeoutMs = timeoutMs;
     this.readRows = readRows;
+    this.clock = clock;
     this.outputBytes = 0;
-    this.samples = [{ at: now, cpuSeconds: 0, outputBytes: 0 }];
-    this.cumulativeCpu = 0;
-    this.previous = null; // identity -> cumulative CPU seconds at the previous read
+    this.baseline = null; // { at, outputBytes, cpu: identity -> cumulative CPU seconds } of the previous observation
+    this.idleSince = null;
+    this.maxIdleMs = 0;
   }
 
-  get enabled() {
+  get killEnabled() {
     return this.timeoutMs > 0;
   }
 
@@ -32,44 +38,58 @@ export class NoProgressWatchdog {
   }
 
   /**
-   * One heartbeat tick. `treePids` are the lease's live processes (leader included). True when the run has shown no
-   * output and negligible CPU for at least `timeoutMs`. An unreadable process table is never "idle".
+   * One observation. `treePids` is the lease's live process set (leader included), or null when the descendant scan
+   * failed. Returns the current idle streak in ms (0 after any progress or unobserved gap); the first observation only
+   * establishes the baseline and is never idle.
    */
-  stalled(treePids, now = Date.now()) {
-    if (!this.enabled) return false;
-    const last = this.samples[this.samples.length - 1];
-    if (this.outputBytes !== last.outputBytes) return this.#restart(now);
+  observe(treePids) {
+    const now = this.clock();
+    const current = this.#snapshot(treePids);
+    const previous = this.baseline;
+    this.baseline = current ? { at: now, outputBytes: this.outputBytes, cpu: current } : null;
+    if (!current || !previous || !this.#idleBetween(previous, current, now)) {
+      this.idleSince = now;
+      return 0;
+    }
+    const idleMs = now - this.idleSince;
+    this.maxIdleMs = Math.max(this.maxIdleMs, idleMs);
+    return idleMs;
+  }
+
+  /** True when the streak has reached the opt-in timeout. */
+  shouldKill(idleMs) {
+    return this.killEnabled && idleMs >= this.timeoutMs;
+  }
+
+  /** identity -> cumulative CPU of every tree member, or null when any of it could not be read. */
+  #snapshot(treePids) {
+    if (!treePids) return null;
     let rows;
     try {
       rows = this.readRows();
     } catch {
-      return this.#restart(now);
+      return null;
     }
-    const members = new Set(treePids);
-    const current = new Map();
-    let delta = 0;
-    for (const row of rows) {
-      if (!members.has(row.pid)) continue;
-      const key = identity(row);
-      current.set(key, row.cpuSec);
-      if (this.previous) delta += Math.max(0, row.cpuSec - (this.previous.get(key) ?? 0));
+    const byPid = new Map(rows.map((r) => [r.pid, r]));
+    const cpu = new Map();
+    for (const pid of treePids) {
+      const row = byPid.get(pid);
+      if (!row) return null; // a member we know of has no row: unobserved, not idle
+      cpu.set(identity(row), cpuOf(row));
     }
-    this.previous = current;
-    this.cumulativeCpu += delta;
-    this.samples.push({ at: now, cpuSeconds: this.cumulativeCpu, outputBytes: this.outputBytes });
-    // keep exactly one sample at or before the window start: the baseline the window is measured against
-    while (this.samples.length > 1 && this.samples[1].at <= now - this.timeoutMs) this.samples.shift();
-    const base = this.samples[0];
-    if (base.at > now - this.timeoutMs) return false;
-    const minutes = (now - base.at) / 60_000;
-    return this.cumulativeCpu - base.cpuSeconds < NO_PROGRESS_CPU_SECONDS_PER_MINUTE * minutes;
+    return cpu;
   }
 
-  /** Output or an unreadable table: begin a fresh window; always "not stalled". */
-  #restart(now) {
-    this.samples = [{ at: now, cpuSeconds: this.cumulativeCpu, outputBytes: this.outputBytes }];
-    this.previous = null;
-    return false;
+  #idleBetween(previous, current, now) {
+    if (previous.outputBytes !== this.outputBytes) return false;
+    if (previous.cpu.size !== current.size) return false;
+    let delta = 0;
+    for (const [key, cpu] of current) {
+      const before = previous.cpu.get(key);
+      if (before === undefined) return false; // a new process in the tree is activity
+      delta += Math.max(0, cpu - before);
+    }
+    return delta <= (NO_PROGRESS_CPU_SECONDS_PER_MINUTE / 60) * ((now - previous.at) / 1000);
   }
 }
 

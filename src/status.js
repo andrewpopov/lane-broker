@@ -181,6 +181,8 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       bookedCpuCores: leaseCpuCores(l) ?? null,
       overrun: leaseOverrun(l),
       observedMemoryBytes: l.observedMemoryBytes ?? null,
+      // BRAIN-431: how long the run has shown no output, CPU or process churn (null before the first heartbeat observation)
+      noProgressSinceMs: Number.isFinite(l.noProgressSinceMs) ? l.noProgressSinceMs : null,
     }));
 
   const runningWeight = leases.filter((l) => HELD_STATES.has(l.state)).reduce((s, l) => s + (l.weight || 0), 0);
@@ -316,6 +318,11 @@ function elasticNote(r) {
 function observedNote(r) {
   if (!Number.isFinite(r.observedCpuCores) || !Number.isFinite(r.bookedCpuCores)) return '';
   return `  cpu ${r.observedCpuCores.toFixed(2)}/${r.bookedCpuCores}`;
+}
+
+/** BRAIN-431: `  no-progress=7m` once a run has been idle for a minute or more. */
+function noProgressNote(r) {
+  return r.noProgressSinceMs >= 60_000 ? `  no-progress=${fmtMs(r.noProgressSinceMs)}` : '';
 }
 
 function fmtMs(ms) {
@@ -462,7 +469,7 @@ export function renderStatusText(status) {
       const logFlag = r.logAgeMs != null && r.logAgeMs >= LOG_STALE_MS ? `  log file unchanged for ${fmtMs(r.logAgeMs)}` : '';
       lines.push(
         `  ${r.id}  key=${r.key}  pid=${r.pid ?? '-'}  elapsed=${fmtMs(r.elapsedMs)}  ` +
-          `heartbeat-age=${fmtMs(r.heartbeatAgeMs)}  log=${r.log}${logFlag}${flag}${ceiling}${elasticNote(r)}${observedNote(r)}`,
+          `heartbeat-age=${fmtMs(r.heartbeatAgeMs)}  log=${r.log}${logFlag}${flag}${ceiling}${elasticNote(r)}${observedNote(r)}${noProgressNote(r)}`,
       );
     }
   }

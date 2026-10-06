@@ -158,6 +158,7 @@ export async function runCommand({
   cpuOverride,
   minCpuOverride,
   memoryOverride,
+  noProgressTimeoutOverride,
   detach,
   timeoutMs,
   allowLocalSim,
@@ -382,7 +383,8 @@ export async function runCommand({
     weight,
     resources,
     nice,
-    noProgressTimeoutMs: resolved.noProgressTimeoutMs ?? globalCfg.noProgressTimeoutMs,
+    // BRAIN-431: a remote runner's value is the submitter's own resolved one, never this host's config
+    noProgressTimeoutMs: noProgressTimeoutOverride ?? resolved.noProgressTimeoutMs ?? globalCfg.noProgressTimeoutMs,
     maxConcurrent: resolved.maxConcurrent,
     class: resolved.class,
     aging: resolved.aging,
