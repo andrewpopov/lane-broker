@@ -343,3 +343,72 @@ test('restore also looks for every old install path, except one the new paths co
   });
   assert.throws(stray.run, /late\.js still holds a placeholder or an old install path/);
 });
+
+// BRAIN-423: what node-gyp and its python leave behind names the install path but is never loaded.
+/** better-sqlite3 as a source build leaves it: binding.gyp, a loadable .node, and build bookkeeping naming `work`. */
+function plantNodeGypBuild(t, work, pkg = 'better-sqlite3') {
+  write(t, `${pkg}/binding.gyp`, '{}');
+  write(t, `${pkg}/lib/index.js`, 'module.exports = require("bindings")("addon");\n');
+  write(t, `${pkg}/build/Release/addon.node`, Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0]));
+  write(t, `${pkg}/build/Makefile`, `srcdir := ${work}/node_modules/${pkg}/build\nCFLAGS += -I${work}/node_modules/node-gyp/include\n`);
+  write(t, `${pkg}/build/binding.Makefile`, `# ${work}\n`);
+  write(t, `${pkg}/build/addon.target.mk`, `TOOLSET := target\nobj := ${work}/obj\n`);
+  write(t, `${pkg}/build/config.gypi`, `{"variables": {"node_gyp_dir": "${work}/node_modules/node-gyp"}}\n`);
+  write(t, `${pkg}/build/Release/.deps/a.intermediate.d`, `cmd_x := cc ${work}/src/a.c\n`);
+  write(t, `${pkg}/build/Release/obj.target/addon/src/a.o`, Buffer.concat([Buffer.from([0xcf, 0xfa, 0, 0]), Buffer.from(work)]));
+}
+
+test('node-gyp build intermediates are neither a reason to refuse the tree nor part of the stored copy; the .node stays', () => {
+  const t = tree();
+  plantNodeGypBuild(t, OLD);
+  const collected = collectInstallPathReferences(t, rolesFor(OLD));
+  assert.deepEqual([collected.relocation?.prefixes, collected.relocation?.entries], [[], []], `got ${JSON.stringify(collected)}`);
+
+  const cacheRoot = tmpDir();
+  const key = newKey();
+  publishToStore(cacheRoot, key, t, collected.relocation);
+  const stored = path.join(entryDir(cacheRoot, key), 'node_modules', 'better-sqlite3');
+  assert.deepEqual(fs.readdirSync(path.join(stored, 'build')), ['Release'], 'Makefile, *.mk, config.gypi are not stored');
+  assert.deepEqual(fs.readdirSync(path.join(stored, 'build', 'Release')), ['addon.node'], '.deps and obj.target are not stored');
+  assert.ok(fs.existsSync(path.join(stored, 'binding.gyp')), 'binding.gyp stays, so npm rebuild can configure again');
+  assert.ok(fs.existsSync(path.join(t, 'better-sqlite3', 'build', 'Makefile')), 'the live tree is untouched');
+});
+
+test('node-gyp exemption guards: no binding.gyp, a path in a runtime file, or a path in the loadable .node still refuse the tree', () => {
+  const lookalike = tree();
+  write(lookalike, 'dist-pkg/build/Makefile', `X = ${OLD}/y\n`);
+  assert.deepEqual(collectInstallPathReferences(lookalike, rolesFor(OLD)), { binary: 'dist-pkg/build/Makefile' }, 'a build/ dir with no binding.gyp beside it is not node-gyp output');
+
+  const runtimeJs = tree();
+  plantNodeGypBuild(runtimeJs, OLD);
+  write(runtimeJs, 'better-sqlite3/lib/index.js', `module.exports = require("${OLD}/node_modules/better-sqlite3/build/Release/addon.node");\n`);
+  assert.ok(collectInstallPathReferences(runtimeJs, rolesFor(OLD)).relocation, 'a quoted path in a .js file is relocatable');
+  write(runtimeJs, 'better-sqlite3/lib/index.js', `const root=${OLD}/node_modules;\n`);
+  assert.deepEqual(collectInstallPathReferences(runtimeJs, rolesFor(OLD)), { ambiguous: 'better-sqlite3/lib/index.js' });
+
+  const addon = tree();
+  plantNodeGypBuild(addon, OLD);
+  write(addon, 'better-sqlite3/build/Release/addon.node', Buffer.concat([Buffer.from([0x7f, 0x45, 0x4c, 0x46, 0]), Buffer.from(OLD)]));
+  assert.deepEqual(collectInstallPathReferences(addon, rolesFor(OLD)), { binary: 'better-sqlite3/build/Release/addon.node' });
+});
+
+test('python bytecode caches (they embed the source path) are not scanned or stored', () => {
+  const t = tree();
+  write(t, 'node-gyp/gyp/pylib/gyp/__pycache__/MSVSUtil.cpython-314.pyc', Buffer.concat([Buffer.from([0x2b, 0x0e, 0, 0]), Buffer.from(`${OLD}/node_modules/node-gyp/gyp/MSVSUtil.py`)]));
+  write(t, 'node-gyp/gyp/pylib/gyp/MSVSUtil.py', 'x = 1\n');
+  const collected = collectInstallPathReferences(t, rolesFor(OLD));
+  assert.deepEqual(collected.relocation.entries, []);
+  const cacheRoot = tmpDir();
+  const key = newKey();
+  publishToStore(cacheRoot, key, t, collected.relocation);
+  assert.deepEqual(fs.readdirSync(path.join(entryDir(cacheRoot, key), 'node_modules', 'node-gyp/gyp/pylib/gyp')), ['MSVSUtil.py']);
+});
+
+test('the real Prisma 6 generated-client shape (output value, sourceFilePath) is relocated', () => {
+  const t = tree();
+  const edge = `const config = {\n  "generator": {\n    "output": {\n      "value": "${OLD}/node_modules/@prisma/client",\n      "fromEnvVar": null\n    }\n  },\n  "sourceFilePath": "${OLD}/prisma/schema.prisma"\n}\n`;
+  for (const f of ['edge.js', 'index.js', 'wasm.js']) write(t, `.prisma/client/${f}`, edge);
+  const { restored, run } = roundTrip(t, ...one(OLD, NEW));
+  run();
+  assert.equal(fs.readFileSync(path.join(restored, '.prisma/client/edge.js'), 'utf8'), edge.replaceAll(OLD, NEW));
+});

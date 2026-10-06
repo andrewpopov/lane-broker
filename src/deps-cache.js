@@ -42,12 +42,14 @@ const NPM_CONFIG_FILE_ENVS = ['npm_config_userconfig', 'npm_config_globalconfig'
  * settings...), so the variables that differ on every run without meaning anything to an install are
  * REMOVED from it before npm or any script sees them (`scrubDepsEnv`), not merely left out of the key:
  * a variable that reaches the install but not the key would let two different installs share an entry.
- * Removed: shell bookkeeping, git's ceiling (the work dir has its own `.git`), and lane's own ticket/id
- * variables. A few tools do need a temp dir, so TMPDIR/TMP/TEMP stay in the environment, are
+ * Removed: shell bookkeeping, git's ceiling (the work dir has its own `.git`), lane's own ticket/id
+ * variables, and what systemd/logind stamp on every invocation or login session (`INVOCATION_ID`,
+ * `XDG_SESSION_ID`, `MEMORY_PRESSURE_*`...), which made every run's key different (BRAIN-423). Any other
+ * value that names the run's work dir or temp dir is hashed with that path replaced by its role (`runPaths`). A few tools do need a temp dir, so TMPDIR/TMP/TEMP stay in the environment, are
  * not hashed, and their (per-run) paths join the relocatability scan instead.
  */
-export const SCRUBBED_ENV_NAMES = new Set(['PWD', 'OLDPWD', 'SHLVL', '_', 'GIT_CEILING_DIRECTORIES']);
-export const SCRUBBED_ENV_PREFIXES = ['LANE_'];
+export const SCRUBBED_ENV_NAMES = new Set(['PWD', 'OLDPWD', 'SHLVL', '_', 'GIT_CEILING_DIRECTORIES', 'INVOCATION_ID', 'JOURNAL_STREAM', 'SYSTEMD_EXEC_PID', 'NOTIFY_SOCKET']);
+export const SCRUBBED_ENV_PREFIXES = ['LANE_', 'XDG_SESSION_', 'MEMORY_PRESSURE_', 'LISTEN_'];
 
 /**
  * Authentication inputs reach the install (a git+ssh dependency needs SSH_AUTH_SOCK, GIT_SSH or GIT_SSH_COMMAND)
@@ -285,13 +287,22 @@ export function allowlistedRootEvents(scripts) {
   return ROOT_SCRIPT_NAMES.filter((name) => name in scripts && ALLOWED_ROOT_SCRIPTS.has(scripts[name]));
 }
 
+/**
+ * Under `.git`, only these can change what a later command in the work dir does (config, HEAD, the index, hooks,
+ * the local ignore/attributes files). Everything else is repository bookkeeping -- objects, refs, packed-refs,
+ * `gc.pid`, `info/refs`, logs -- which a background `git gc --auto` (the synthetic snapshot commit can start one)
+ * rewrites during any install, so it says nothing about what the install did. The `.git` directory entry itself
+ * only reflects its children.
+ */
+const GIT_BEHAVIOUR_RE = /^\.git\/(?:config|HEAD|index|hooks(?:\/|$)|info\/(?:exclude|attributes)$|attributes$)/;
+const isGitBookkeeping = (change) => change === '.git' || (change.startsWith('.git/') && !GIT_BEHAVIOUR_RE.test(change));
+
 const configLines = (text) => (text ?? '').split('\n').map((l) => l.trim()).filter((l) => l !== '');
 
 /**
  * Of the outside-`node_modules` `changes` an install made, those the allowlisted root scripts do NOT explain.
- * The scripts' only expected effect is rewriting the work dir's `.git/config` (and so `.git`'s own entry);
- * that is explained only if the config differs by exactly the lines those scripts write. A new hook file, or
- * any other `.git` write, stays unexplained.
+ * The scripts' only expected effect is rewriting the work dir's `.git/config`; that is explained only if the config differs by exactly the lines those scripts write. A new hook file, or
+ * any other write to a `.git` file that changes behaviour (`GIT_BEHAVIOUR_RE`), stays unexplained.
  */
 export function unexplainedChanges(changes, { scripts, configBefore, configAfter }) {
   const expected = allowlistedRootEvents(scripts).map((e) => ALLOWED_ROOT_SCRIPTS.get(scripts[e])).filter(Boolean);
@@ -300,12 +311,17 @@ export function unexplainedChanges(changes, { scripts, configBefore, configAfter
   const added = after.filter((l) => !before.includes(l));
   const removed = before.filter((l) => !after.includes(l));
   const configExplained = expected.length > 0 && added.every((l) => expected.some((re) => re.test(l))) && removed.every((l) => expected.some((re) => re.test(l)));
-  return changes.filter((c) => !(configExplained && (c === '.git' || c === '.git/config')));
+  return changes.filter((c) => !(configExplained && c === '.git/config') && !isGitBookkeeping(c));
+}
+
+/** `value` with each run path (`{ role, path }`, the work dir and its real path) replaced by `@@role@@`, longest path first. */
+function rolesForPaths(value, runPaths) {
+  return [...runPaths].sort((a, b) => b.path.length - a.path.length).reduce((v, { role, path: p }) => v.split(p).join(`@@${role}@@`), value);
 }
 
 /**
  * The cache key for one `remoteDeps` dir: a sha256 over everything that can change what `npm ci` produces
- * there. Returns `{ key, lock, scripts }`, or `{ key: null, reason }` when the dir must not be cached at all
+ * there. Returns `{ key, keyParts, lock, scripts }` (`keyParts`: a short digest per labelled input, for diagnosis), or `{ key: null, reason }` when the dir must not be cached at all
  * (lockfile not pinned, or a root lifecycle script that is not known to leave `node_modules` alone).
  *
  *  - the lockfile (name and bytes), `package.json`, the `.npmrc` of the dir and of the repo root, and the
@@ -330,6 +346,7 @@ export function computeDepsKey({
   toolVersion = (cmd) => firstLineOfCommand(cmd, env),
   npmConfig = { ignoreScripts: 'false', scriptShell: 'null' },
   tempFsProps = () => tempDirFsProperties(env),
+  runPaths = [],
 }) {
   let lockfileName = null;
   let lockfile = null;
@@ -384,18 +401,20 @@ export function computeDepsKey({
   }
   const unhashed = (name) =>
     isScrubbed(name) || PER_RUN_PATH_ENV_NAMES.includes(name) || AUTH_ENV_NAMES.has(name) || SESSION_ENV_NAMES.has(name);
-  for (const name of Object.keys(env).filter((k) => !unhashed(k)).sort()) parts.push([`env:${name}`, String(env[name])]);
+  for (const name of Object.keys(env).filter((k) => !unhashed(k)).sort()) parts.push([`env:${name}`, rolesForPaths(String(env[name]), runPaths)]);
   for (const name of NPM_CONFIG_FILE_ENVS) {
     if (env[name]) parts.push([`file:${name}`, readIfExists(env[name]) ?? '']);
   }
 
   const hash = crypto.createHash('sha256');
+  const keyParts = {};
   for (const [label, value] of parts) {
     const bytes = Buffer.isBuffer(value) ? value : Buffer.from(String(value), 'utf8');
     hash.update(`${label}:${bytes.length}:`);
     hash.update(bytes);
+    keyParts[label] = crypto.createHash('sha256').update(bytes).digest('hex').slice(0, 12);
   }
-  return { key: hash.digest('hex'), lock, scripts: pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {} };
+  return { key: hash.digest('hex'), keyParts, lock, scripts: pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {} };
 }
 
 function listAllows(list, value) {
@@ -476,6 +495,32 @@ export function findMissingInstalled(lock, installed, system) {
   return absent.filter((name) => !gone.has(name)).map((name) => name.slice('node_modules/'.length)).sort();
 }
 
+/**
+ * The labelled key inputs that differ between `keyParts` (a lookup that missed) and the newest published entry
+ * that recorded its own, as a sorted label list; null when there is no such entry. Two runs of one repo that
+ * should share a key but do not name the leaking input here.
+ */
+export function diffAgainstNewestEntry(cacheRoot, keyParts) {
+  let newest = null;
+  let names = [];
+  try {
+    names = fs.readdirSync(cacheRoot).filter((n) => KEY_RE.test(n));
+  } catch {
+    return null;
+  }
+  for (const name of names) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(path.join(cacheRoot, name, 'meta.json'), 'utf8'));
+      if (meta.keyParts && (!newest || meta.createdAt > newest.createdAt)) newest = meta;
+    } catch {
+      // unreadable entry: not a comparison base
+    }
+  }
+  if (!newest) return null;
+  const labels = new Set([...Object.keys(newest.keyParts), ...Object.keys(keyParts)]);
+  return [...labels].filter((l) => newest.keyParts[l] !== keyParts[l]).sort();
+}
+
 export function entryDir(cacheRoot, key) {
   return path.join(cacheRoot, key);
 }
@@ -488,16 +533,17 @@ export function entryTree(cacheRoot, key) {
  * Recreate `src` as `dst`, directory by directory: real directories, symlinks re-created with their
  * target text (through `linkTarget(target, rel)`, identity by default), regular files handed to
  * `onFile(srcFile, dstFile, rel)`. Each directory is created owner-writable so its entries can be added,
- * then given `dirMode(srcMode)` once it is complete.
+ * then given `dirMode(srcMode)` once it is complete. An entry for which `skip(rel)` is true is left out.
  */
 function cloneTree(src, dst, hooks, rel = '') {
-  const { onFile, dirMode, linkTarget = (target) => target } = hooks;
+  const { onFile, dirMode, linkTarget = (target) => target, skip = () => false } = hooks;
   const srcMode = fs.statSync(src).mode & 0o7777;
   fs.mkdirSync(dst, { mode: 0o700 });
   for (const ent of fs.readdirSync(src, { withFileTypes: true })) {
     const s = path.join(src, ent.name);
     const d = path.join(dst, ent.name);
     const r = rel ? `${rel}/${ent.name}` : ent.name;
+    if (skip(r)) continue;
     if (ent.isDirectory()) cloneTree(s, d, hooks, r);
     else if (ent.isSymbolicLink()) fs.symlinkSync(linkTarget(fs.readlinkSync(s), r), d);
     else if (ent.isFile()) onFile(s, d, r);
@@ -545,7 +591,7 @@ export function materializeFromStore(cacheRoot, key, destTree) {
  * `collectInstallPathReferences` found: the stored COPY of each recorded file or symlink has its install paths
  * replaced by placeholder tokens (the source tree is untouched), and the record goes into `meta.json`.
  */
-export function publishToStore(cacheRoot, key, srcTree, relocation = null) {
+export function publishToStore(cacheRoot, key, srcTree, relocation = null, keyParts = null) {
   fs.mkdirSync(cacheRoot, { recursive: true });
   const tmp = path.join(cacheRoot, `.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
   fs.mkdirSync(tmp);
@@ -571,9 +617,10 @@ export function publishToStore(cacheRoot, key, srcTree, relocation = null) {
       },
       linkTarget: (target, rel) => (recorded.get(rel) === 'symlink' ? template(Buffer.from(target, 'utf8'), rel, anchoredOccurrence).toString('utf8') : target),
       dirMode: (mode) => mode & 0o7555,
+      skip: (rel) => isRegenerableBuildArtifact(srcTree, rel),
     });
     if (relocation) verifyTemplatedCopy(path.join(tmp, 'node_modules'), relocation);
-    fs.writeFileSync(path.join(tmp, 'meta.json'), JSON.stringify({ bytes, createdAt: Date.now(), ...(relocation ? { relocation } : {}) }));
+    fs.writeFileSync(path.join(tmp, 'meta.json'), JSON.stringify({ bytes, createdAt: Date.now(), ...(relocation ? { relocation } : {}), ...(keyParts ? { keyParts } : {}) }));
     fs.writeFileSync(path.join(tmp, '.last-used'), '');
     fs.mkdirSync(path.join(tmp, 'leases'));
     try {
@@ -847,6 +894,23 @@ const PATH_FOLLOWERS = new Set(Buffer.from('/"\'`)]} \t\n\r\v\f', 'latin1'));
 /** Bytes that may precede an install path: start of file, `" ' \` ( [ {`, or whitespace. Anything else (`/`, `:`, `=`, a name character) may make it the tail of a longer path. */
 const PATH_LEADERS = new Set(Buffer.from('"\'`([{ \t\n\r\v\f', 'latin1'));
 
+/**
+ * Build leftovers that name the install path but are never loaded at run time, and that the tool which made them
+ * regenerates: a node-gyp package's `build/` bookkeeping (`Makefile`, `*.mk`, `config.gypi`, `Release/.deps`,
+ * `Release/obj*`; only `build/Release/*.node` is required), recognised by a `binding.gyp` beside `build/`, and
+ * Python's `__pycache__` (node-gyp's own gyp). They are neither scanned nor stored, so a cached tree lacks them.
+ * `npm rebuild` still works: it runs `node-gyp rebuild`, which configures from `binding.gyp` again. Only a bare
+ * `node-gyp build` (no configure) needs the Makefile.
+ */
+const NODE_GYP_INTERMEDIATE_RE = /^(.*\/)?build\/(?:Makefile|binding\.Makefile|config\.gypi|gyp-mac-tool|[^/]+\.mk|deps|node_gyp_bins|(?:Release|Debug)\/(?:\.deps|obj|obj\.target))$/;
+const PYCACHE_RE = /(^|\/)__pycache__$/;
+
+function isRegenerableBuildArtifact(tree, rel) {
+  if (PYCACHE_RE.test(rel)) return true;
+  const match = NODE_GYP_INTERMEDIATE_RE.exec(rel);
+  return match !== null && fs.existsSync(path.join(tree, match[1] ?? '', 'binding.gyp'));
+}
+
 const strictOccurrence = (buf, start, end) => (start === 0 || PATH_LEADERS.has(buf[start - 1])) && (end === buf.length || PATH_FOLLOWERS.has(buf[end]));
 
 /** A symlink target is a path, not text: an install path counts only as the whole target or its leading directories. */
@@ -938,6 +1002,7 @@ function scanTree(tree, groups, pairs, marker) {
     for (const ent of fs.readdirSync(abs, { withFileTypes: true })) {
       const p = path.join(abs, ent.name);
       const r = rel ? `${rel}/${ent.name}` : ent.name;
+      if (isRegenerableBuildArtifact(tree, r)) continue;
       let outcome = null;
       if (ent.isDirectory()) outcome = walk(p, r);
       else if (ent.isSymbolicLink()) {

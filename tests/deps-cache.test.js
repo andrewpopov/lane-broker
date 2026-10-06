@@ -30,6 +30,7 @@ import {
   allowlistedRootEvents,
   snapshotOutsideNodeModules,
   snapshotChanges,
+  diffAgainstNewestEntry,
 } from '../src/deps-cache.js';
 import { resolveTicketConfig, loadGlobalConfig, ConfigError, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { freshEnv, writeRepoConfig, writeGlobalConfig } from './helpers.js';
@@ -154,6 +155,34 @@ test('key: identical inputs give the same key; volatile variables do not matter,
     Object.assign(i.env, change);
     assert.notEqual(computeDepsKey(i).key, a.key, `${Object.keys(change)[0]} is part of the key`);
   }
+});
+
+test('key: per-run values never change the key; a value that is not per-run does (BRAIN-423)', () => {
+  const fx = makeKeyFixture();
+  const keyFor = (extra, runPaths = []) => computeDepsKey({ ...fx.inputs(), env: { ...fx.inputs().env, ...extra }, runPaths }).key;
+  const base = keyFor({});
+  const perRun = [
+    { INVOCATION_ID: 'a'.repeat(32) }, { JOURNAL_STREAM: '8:123' }, { SYSTEMD_EXEC_PID: '99' },
+    { MEMORY_PRESSURE_WATCH: '/sys/fs/cgroup/x/memory.pressure' }, { XDG_SESSION_ID: '42' }, { LISTEN_PID: '7' },
+    { LANE_BROKER_CPU_CORES: '3' }, { TMPDIR: '/var/tmp/lb-xyz' },
+  ];
+  for (const extra of perRun) assert.equal(keyFor(extra), base, `${Object.keys(extra)[0]} is not an input`);
+  assert.notEqual(keyFor({ CFLAGS: '-O0' }), base, 'a real install input still is');
+
+  const runA = [{ role: 'workDir', path: '/r/tickets/aaa/work' }];
+  const runB = [{ role: 'workDir', path: '/r/tickets/bbb/work' }];
+  const withPath = (work) => ({ INIT_CWD: work, CUSTOM_HOME: `${work}/home` });
+  assert.equal(keyFor(withPath('/r/tickets/aaa/work'), runA), keyFor(withPath('/r/tickets/bbb/work'), runB), 'a value naming the work dir is hashed by role');
+  assert.notEqual(keyFor(withPath('/r/tickets/aaa/work'), runA), keyFor(withPath('/elsewhere/work'), runB), 'a value naming some other path is not');
+});
+
+test('key parts: a lookup names the labels that differ from the newest published entry', () => {
+  const root = tmpDir('deps-cache-diff');
+  assert.equal(diffAgainstNewestEntry(root, { a: '1' }), null, 'no entry');
+  const src = makeTree(tmpDir('deps-cache-src'));
+  publishToStore(root, newKey(), src, null, { 'env:A': 'aaa', 'env:B': 'bbb', same: 's' });
+  assert.deepEqual(diffAgainstNewestEntry(root, { 'env:A': 'aaa', 'env:B': 'xxx', 'env:C': 'ccc', same: 's' }), ['env:B', 'env:C']);
+  assert.deepEqual(diffAgainstNewestEntry(root, { 'env:A': 'aaa', 'env:B': 'bbb', same: 's' }), []);
 });
 
 test('key: every key input changes the key', () => {
@@ -444,6 +473,22 @@ test('optional completeness: only dependents that resolve to the exact lock path
   const installed = { 'node_modules/app': {} };
   assert.deepEqual(findMissingInstalled(lock, installed, linuxHost), ['app/node_modules/dep'], 'app resolves its nested dep; the hoisted copy only serves the skipped mac-tool');
   assert.deepEqual(findMissingInstalled(lock, { ...installed, 'node_modules/app/node_modules/dep': {} }, linuxHost), []);
+});
+
+test('optional completeness: a multi-level chain under a platform-skipped package (rouge: dmg-license > verror > assert-plus) is expected, and a required one is not', () => {
+  const lock = dmgLicenseLock();
+  Object.assign(lock.packages['node_modules/dmg-license'].dependencies, { verror: '^1' });
+  Object.assign(lock.packages, {
+    'node_modules/verror': { version: '1', dev: true, optional: true, dependencies: { 'assert-plus': '^1', 'core-util-is': '1' } },
+    'node_modules/core-util-is': { version: '1', dev: true, optional: true },
+    'node_modules/@img/sharp-wasm32': { version: '1', optional: true, cpu: ['wasm32'], dependencies: { '@emnapi/runtime': '^1' } },
+    'node_modules/@emnapi/runtime': { version: '1', optional: true },
+  });
+  lock.packages['node_modules/app'].optionalDependencies = { '@img/sharp-wasm32': '1' };
+  const installed = { 'node_modules/app': {}, 'node_modules/xmlbuilder': {} };
+  assert.deepEqual(findMissingInstalled(lock, installed, linuxHost), []);
+  lock.packages['node_modules/core-util-is'].optional = false;
+  assert.deepEqual(findMissingInstalled(lock, installed, linuxHost), ['core-util-is'], 'a required package absent is still missing');
 });
 
 // ---- publish / materialize ----
@@ -774,11 +819,18 @@ test('the allowlisted git-config script explains exactly its own .git/config lin
   assert.deepEqual(unexplainedChanges(changes, { scripts, configBefore: withHooks, configAfter: `${base}\thooksPath = .githooks\n` }), [], 'rewriting the same value');
 
   assert.deepEqual(unexplainedChanges([...changes, '.git/hooks', '.git/hooks/pre-commit'], { scripts, configBefore: base, configAfter: withHooks }), ['.git/hooks', '.git/hooks/pre-commit'], 'a new hook file is not explained');
-  assert.deepEqual(unexplainedChanges(changes, { scripts, configBefore: base, configAfter: `${withHooks}\tsshCommand = evil\n` }), changes, 'another config line is not explained');
-  assert.deepEqual(unexplainedChanges(changes, { scripts, configBefore: base, configAfter: `${base}\thooksPath = /tmp/evil\n` }), changes, 'a different hooksPath is not explained');
-  assert.deepEqual(unexplainedChanges(changes, { scripts: {}, configBefore: base, configAfter: withHooks }), changes, 'without the allowlisted script nothing under .git is explained');
+  assert.deepEqual(unexplainedChanges(changes, { scripts, configBefore: base, configAfter: `${withHooks}\tsshCommand = evil\n` }), ['.git/config'], 'another config line is not explained');
+  assert.deepEqual(unexplainedChanges(changes, { scripts, configBefore: base, configAfter: `${base}\thooksPath = /tmp/evil\n` }), ['.git/config'], 'a different hooksPath is not explained');
+  assert.deepEqual(unexplainedChanges(changes, { scripts: {}, configBefore: base, configAfter: withHooks }), ['.git/config'], 'without the allowlisted script the config change is not explained');
   assert.deepEqual(unexplainedChanges(['generated.txt', '.git/config'], { scripts, configBefore: base, configAfter: withHooks }), ['generated.txt']);
   assert.deepEqual(allowlistedRootEvents({ prepare: scripts.prepare, postinstall: 'husky install', prepublish: scripts.prepare }), ['prepublish', 'prepare']);
+});
+
+test('git bookkeeping a background gc rewrites never counts as an install write; behaviour-changing .git files still do (BRAIN-423)', () => {
+  const gcNoise = ['.git', '.git/gc.pid', '.git/info', '.git/info/refs', '.git/objects', '.git/objects/pack', '.git/objects/pack/tmp_pack_aB3x', '.git/packed-refs', '.git/refs/heads/master', '.git/logs/HEAD'];
+  assert.deepEqual(unexplainedChanges(gcNoise, { scripts: {}, configBefore: null, configAfter: null }), []);
+  const behaviour = ['.git/config', '.git/HEAD', '.git/index', '.git/hooks', '.git/hooks/pre-push', '.git/info/exclude'];
+  assert.deepEqual(unexplainedChanges([...gcNoise, ...behaviour, 'generated.txt'], { scripts: {}, configBefore: null, configAfter: null }), [...behaviour, 'generated.txt']);
 });
 
 test('scrubDepsEnv removes shell and lane variables, and keeps the ssh/auth and temp-dir ones the install needs', () => {
