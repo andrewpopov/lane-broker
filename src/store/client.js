@@ -88,6 +88,38 @@ export class StoreClient {
     }
   }
 
+  async deleteObject(relPath) {
+    return this.json('DELETE', `/objects/${relPath}`);
+  }
+
+  /** Apply a terminal mark at the peer; false when the peer has no such job. */
+  async setTerminal(job, at) {
+    return this.state('PUT', `/jobs/${job}/terminal?at=${at}`);
+  }
+
+  async setPin(job, pinned) {
+    return this.state(pinned ? 'PUT' : 'DELETE', `/pins/${job}`);
+  }
+
+  async state(method, pathname) {
+    try {
+      await this.json(method, pathname);
+      return true;
+    } catch (err) {
+      if (err instanceof StoreHttpError && err.status === 404) return false;
+      throw err;
+    }
+  }
+
+  async jobMeta(job) {
+    try {
+      return await this.json('GET', `/jobs/${job}/meta`);
+    } catch (err) {
+      if (err instanceof StoreHttpError && err.status === 404) return null;
+      throw err;
+    }
+  }
+
   async list({ deep = false } = {}) {
     return (await this.json('GET', `/list${deep ? '?deep=1' : ''}`)).objects;
   }

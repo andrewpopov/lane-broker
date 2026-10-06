@@ -53,9 +53,9 @@ test('a fresh unreferenced blob survives the 24 h grace window, and a re-upload 
 
 test('above 80% of the cap the oldest terminal, unpinned groups are evicted first', async (t) => {
   const clock = fakeClock();
-  const srv = await startStore({ clock, capBytes: 1000 });
+  const srv = await startStore({ clock, capBytes: 3000 });
   t.after(() => srv.close());
-  const mk = (name, fill) => snapshotOf({ [name]: String(fill).repeat(300) });
+  const mk = (name, fill) => snapshotOf({ [name]: String(fill).repeat(700) });
   const [a, b, c] = [mk('a', 1), mk('b', 2), mk('c', 3)];
   await publish(srv, 'old', a);
   await publish(srv, 'mid', b);
@@ -68,5 +68,5 @@ test('above 80% of the cap the oldest terminal, unpinned groups are evicted firs
   assert.deepEqual(result.evictedManifests, ['old']);
   assert.equal(srv.store.readManifest('mid') !== null, true);
   assert.equal(srv.store.readManifest('live') !== null, true);
-  assert.ok(srv.store.bytes < 800);
+  assert.ok(srv.store.bytes < 2400);
 });

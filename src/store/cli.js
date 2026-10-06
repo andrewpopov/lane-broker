@@ -7,7 +7,7 @@ import { compareStores } from './compare.js';
 import { StoreClient } from './client.js';
 
 const USAGE = `usage: lane-store <command> [options]
-  serve      --root DIR --listen HOST:PORT [--max-blob-bytes N] [--cap-bytes N] [--sweep-interval-s N]
+  serve      --root DIR --listen HOST:PORT [--replica] [--max-blob-bytes N] [--cap-bytes N] [--sweep-interval-s N]
              secret: LANE_STORE_SECRET
   replicate  --root DIR --replica-url URL            one journal-ordered round; token: LANE_STORE_REPLICA_TOKEN
   compare    --root DIR --replica-url URL [--deep] [--repair --primary-url URL]
@@ -44,6 +44,7 @@ export async function storeCli(argv, env = process.env) {
       'replica-url': { type: 'string' },
       'primary-url': { type: 'string' },
       deep: { type: 'boolean' },
+      replica: { type: 'boolean' },
       repair: { type: 'boolean' },
     },
   });
@@ -54,6 +55,7 @@ export async function storeCli(argv, env = process.env) {
     const [host, port] = splitListen(values.listen);
     const s = createStore({
       root,
+      replicaMode: !!values.replica,
       verifier: createHmacVerifier(secret),
       maxBlobBytes: byteOption(values['max-blob-bytes'], '--max-blob-bytes'),
       capBytes: byteOption(values['cap-bytes'], '--cap-bytes'),

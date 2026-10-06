@@ -1,9 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { atomicWriteFile, atomicWriteJson, fsyncDirectory, readJsonSafe } from '../state.js';
+import { atomicWriteFile, atomicWriteJson, fsyncDirectory } from '../state.js';
 import { manifestHashOf, isCanonicalRelPath } from '../remote-manifest.js';
-import { Journal } from './journal.js';
+import { MAX_HEADER_BYTES } from '../remote-stream.js';
+import { Journal, lastKindByPath } from './journal.js';
 import { isSha256, isJobId, blobRelPath, manifestRelPath, parseObjectPath } from './ids.js';
 
 export class StoreError extends Error {
@@ -16,8 +17,13 @@ export class StoreError extends Error {
 }
 
 export const DEFAULT_MAX_BLOB_BYTES = 512 * 1024 * 1024;
-export const MAX_MANIFEST_BYTES = 16 * 1024 * 1024; // same bound as the snapshot header (remote-stream MAX_HEADER_BYTES)
+/** The ONE manifest limit: the snapshot header line a receiver must read is the manifest plus a few bytes of framing. */
+export const MAX_MANIFEST_BYTES = MAX_HEADER_BYTES - 4096;
+const ADMIT_FRACTION = 0.95; // spec 8.2: refuse new data at 95% of the cap
 
+const READ_NOFOLLOW = fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW;
+
+/** Regular files under `dir` (never following symlinks; a symlink is simply not listed). */
 function walkFiles(dir, out = []) {
   let names;
   try {
@@ -35,24 +41,25 @@ function walkFiles(dir, out = []) {
   return out;
 }
 
-async function hashFile(file) {
+async function hashStream(stream) {
   const hash = crypto.createHash('sha256');
   let size = 0;
-  for await (const chunk of fs.createReadStream(file)) {
+  for await (const chunk of stream) {
     hash.update(chunk);
     size += chunk.length;
   }
   return { sha256: hash.digest('hex'), size };
 }
 
-/** Every committed object under `root` as `{path, size, sha256?}`, sorted by path. `deep` re-hashes blobs from disk. */
+const hashFile = (file) => hashStream(fs.createReadStream(file));
+
+/** Every committed object under `root` as `{path, size, sha256?}`, sorted by path. `deep` re-hashes from disk. */
 export async function listObjects(root, { deep = false } = {}) {
   const out = [];
   for (const sub of ['blobs', 'manifests']) {
     for (const f of walkFiles(path.join(root, sub))) {
       const rel = path.relative(root, f.full).split(path.sep).join('/');
-      const parsed = parseObjectPath(rel);
-      if (!parsed) continue;
+      if (!parseObjectPath(rel)) continue;
       const entry = { path: rel, size: f.size };
       if (deep) entry.sha256 = (await hashFile(f.full)).sha256;
       out.push(entry);
@@ -61,7 +68,14 @@ export async function listObjects(root, { deep = false } = {}) {
   return out.sort((a, b) => (a.path < b.path ? -1 : 1));
 }
 
-/** Shape check for a registered manifest. Path/symlink safety is NOT judged here: that is the receiver's job (materialize.js). */
+function exactKeys(obj, allowed, required, what) {
+  const keys = Object.keys(obj);
+  const extra = keys.filter((k) => !allowed.includes(k));
+  if (extra.length) throw new StoreError(400, `${what} has unknown field(s): ${extra.join(', ')}`);
+  for (const k of required) if (!(k in obj)) throw new StoreError(400, `${what} is missing ${k}`);
+}
+
+/** Strict shape check for a registered manifest. Path/symlink safety is NOT judged here: that is the receiver's job (materialize.js). */
 function parseManifestDoc(bytes) {
   let doc;
   try {
@@ -69,12 +83,19 @@ function parseManifestDoc(bytes) {
   } catch {
     throw new StoreError(400, 'manifest is not JSON');
   }
-  if (!doc || !isSha256(doc.manifestHash) || !Array.isArray(doc.entries)) throw new StoreError(400, 'manifest needs {manifestHash, entries}');
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc)) throw new StoreError(400, 'manifest must be an object');
+  exactKeys(doc, ['manifestHash', 'entries'], ['manifestHash', 'entries'], 'manifest');
+  if (!isSha256(doc.manifestHash) || !Array.isArray(doc.entries)) throw new StoreError(400, 'manifest needs {manifestHash, entries}');
   for (const e of doc.entries) {
-    if (!e || !isCanonicalRelPath(e.path)) throw new StoreError(400, `manifest entry has a non-canonical path: ${e && e.path}`);
+    if (!e || typeof e !== 'object' || !isCanonicalRelPath(e.path)) throw new StoreError(400, `manifest entry has a non-canonical path: ${e && e.path}`);
     if (e.type === 'file') {
+      exactKeys(e, ['path', 'type', 'exec', 'size', 'sha256'], ['path', 'type', 'size', 'sha256'], `entry ${e.path}`);
       if (!isSha256(e.sha256) || !Number.isInteger(e.size) || e.size < 0) throw new StoreError(400, `bad file entry: ${e.path}`);
-    } else if (e.type !== 'symlink' || typeof e.target !== 'string') {
+      if ('exec' in e && typeof e.exec !== 'boolean') throw new StoreError(400, `bad exec flag: ${e.path}`);
+    } else if (e.type === 'symlink') {
+      exactKeys(e, ['path', 'type', 'target'], ['path', 'type', 'target'], `entry ${e.path}`);
+      if (typeof e.target !== 'string') throw new StoreError(400, `bad symlink entry: ${e.path}`);
+    } else {
       throw new StoreError(400, `bad entry type: ${e.path}`);
     }
   }
@@ -84,106 +105,231 @@ function parseManifestDoc(bytes) {
 
 /**
  * The on-disk store: content-addressed blobs (`blobs/ab/cd/<sha256>`), immutable job manifests
- * (`manifests/<job>.json`, journaled and replicated) and mutable per-job state (`meta/<job>.json`: pin, terminal
- * mark; not journaled). Every committed blob/manifest is appended to the journal after it is durable.
+ * (`manifests/<job>.json`) and mutable per-job state (`meta/<job>.json`: pin, terminal mark). Every state change
+ * (object commit, terminal mark, pin, deletion) is a journal record, so a replica can mirror retention exactly.
+ * Nothing under the root may be a symlink: ancestors are lstat-checked and leaves opened with O_NOFOLLOW.
  */
 export class ObjectStore {
-  constructor(root, { now = Date.now, maxBlobBytes = DEFAULT_MAX_BLOB_BYTES, capBytes = Infinity } = {}) {
-    this.root = path.resolve(root);
+  constructor(root, { now = Date.now, maxBlobBytes = DEFAULT_MAX_BLOB_BYTES, capBytes = Infinity, replicaMode = false } = {}) {
+    fs.mkdirSync(root, { recursive: true });
+    this.root = fs.realpathSync(root); // confine to the real directory; every later path is checked against symlinks below it
     this.now = now;
     this.maxBlobBytes = maxBlobBytes;
     this.capBytes = capBytes;
-    fs.mkdirSync(path.join(this.root, 'tmp'), { recursive: true });
-    this.journal = new Journal(this.root);
-    this.bytes = walkFiles(path.join(this.root, 'blobs')).reduce((n, f) => n + f.size, 0);
-    this.jobBlobCache = new Map();
+    this.replicaMode = replicaMode;
+    for (const d of ['tmp', 'blobs', 'manifests', 'meta']) fs.mkdirSync(path.join(this.root, d), { recursive: true });
     for (const f of walkFiles(path.join(this.root, 'tmp'))) fs.unlinkSync(f.full); // leftovers of a crash mid-upload
+    this.journal = new Journal(this.root);
+    this.bytes = [...walkFiles(path.join(this.root, 'blobs')), ...walkFiles(path.join(this.root, 'manifests'))].reduce((n, f) => n + f.size, 0);
+    this.reserved = 0; // bytes admitted but not yet committed
+    this.unjournaled = new Set(); // blobs on disk whose journal append failed AND whose rollback failed
+    this.jobBlobCache = new Map();
+    this.reconcileReport = this.reconcile();
   }
 
   close() {
     this.journal.close();
   }
 
+  /** Absolute path of a store-relative path, refusing a symlink at any existing component. */
   abs(rel) {
-    return path.join(this.root, ...rel.split('/'));
+    const segs = rel.split('/');
+    let cur = this.root;
+    for (const seg of segs) {
+      cur = path.join(cur, seg);
+      let st;
+      try {
+        st = fs.lstatSync(cur);
+      } catch (err) {
+        if (err.code === 'ENOENT') break;
+        throw err;
+      }
+      if (st.isSymbolicLink()) throw new StoreError(500, `store integrity: symlink at ${rel}`);
+    }
+    return path.join(this.root, ...segs);
   }
 
-  hasBlob(sha) {
-    return fs.existsSync(this.abs(blobRelPath(sha)));
+  /** Open a store file read-only without following a symlink; null when absent. */
+  openRead(rel) {
+    const file = this.abs(rel);
+    let fd;
+    try {
+      fd = fs.openSync(file, READ_NOFOLLOW);
+    } catch (err) {
+      if (err.code === 'ENOENT') return null;
+      if (err.code === 'ELOOP') throw new StoreError(500, `store integrity: symlink at ${rel}`);
+      throw err;
+    }
+    const st = fs.fstatSync(fd);
+    if (!st.isFile()) {
+      fs.closeSync(fd);
+      throw new StoreError(500, `store integrity: not a regular file: ${rel}`);
+    }
+    return { fd, size: st.size };
+  }
+
+  readFileSafe(rel) {
+    const f = this.openRead(rel);
+    if (!f) return null;
+    try {
+      return fs.readFileSync(f.fd);
+    } finally {
+      fs.closeSync(f.fd);
+    }
+  }
+
+  /** Journal every object on disk that has no live record (a crash between commit and append): blobs first, then manifests. */
+  reconcile() {
+    const last = lastKindByPath(this.root);
+    const report = { journaled: [], corrupt: [] };
+    const orphans = [];
+    for (const sub of ['blobs', 'manifests']) {
+      for (const f of walkFiles(path.join(this.root, sub))) {
+        const rel = path.relative(this.root, f.full).split(path.sep).join('/');
+        const parsed = parseObjectPath(rel);
+        if (!parsed) continue;
+        const kind = last.get(rel);
+        if (kind === 'blob' || kind === 'manifest') continue;
+        orphans.push({ rel, parsed, size: f.size });
+      }
+    }
+    orphans.sort((a, b) => (a.parsed.kind === b.parsed.kind ? 0 : a.parsed.kind === 'blob' ? -1 : 1));
+    for (const o of orphans) {
+      const seen = hashFileSync(this.abs(o.rel));
+      if (o.parsed.kind === 'blob' && seen.sha256 !== o.parsed.sha) {
+        report.corrupt.push(o.rel);
+        continue;
+      }
+      this.journal.append({ kind: o.parsed.kind, path: o.rel, sha256: seen.sha256, size: seen.size, createdAt: this.now() });
+      report.journaled.push(o.rel);
+    }
+    return report;
   }
 
   blobSize(sha) {
     try {
-      return fs.statSync(this.abs(blobRelPath(sha))).size;
-    } catch {
-      return null;
-    }
-  }
-
-  /** True when a NEW blob of `incoming` bytes may be accepted: spec 8.2 refuses submits at 95% of the cap. */
-  hasRoom(incoming) {
-    return this.bytes + incoming < this.capBytes * 0.95;
-  }
-
-  /**
-   * Whole-file immutable upload: stream into tmp/, hash while writing, refuse a mismatch or oversize, fsync, then
-   * rename into place and journal. A blob that already exists is verified against the same bytes and deduplicated
-   * (its mtime is refreshed, restarting the unreferenced-blob grace window). Returns `{stored}`.
-   */
-  async putBlob(sha, readable, declaredSize) {
-    if (!isSha256(sha)) throw new StoreError(400, 'bad sha256');
-    if (declaredSize > this.maxBlobBytes) throw new StoreError(413, `blob exceeds the ${this.maxBlobBytes}-byte cap`);
-    const final = this.abs(blobRelPath(sha));
-    if (!fs.existsSync(final) && !this.hasRoom(declaredSize)) throw new StoreError(507, 'store is above 95% of its cap');
-    const tmp = path.join(this.root, 'tmp', `${sha}.${crypto.randomBytes(6).toString('hex')}`);
-    const fh = await fs.promises.open(tmp, 'wx', 0o640);
-    const hash = crypto.createHash('sha256');
-    let size = 0;
-    try {
-      for await (const chunk of readable) {
-        size += chunk.length;
-        if (size > this.maxBlobBytes) throw new StoreError(413, `blob exceeds the ${this.maxBlobBytes}-byte cap`);
-        hash.update(chunk);
-        await fh.write(chunk);
-      }
-      await fh.sync();
-    } catch (err) {
-      await fh.close();
-      fs.rmSync(tmp, { force: true });
-      throw err;
-    }
-    await fh.close();
-    if (hash.digest('hex') !== sha) {
-      fs.rmSync(tmp, { force: true });
-      throw new StoreError(422, 'sha256 of the body does not match the address');
-    }
-    if (fs.existsSync(final)) {
-      fs.rmSync(tmp, { force: true });
-      const t = new Date(this.now());
-      fs.utimesSync(final, t, t);
-      return { stored: false };
-    }
-    fs.mkdirSync(path.dirname(final), { recursive: true });
-    fs.renameSync(tmp, final);
-    const stamped = new Date(this.now());
-    fs.utimesSync(final, stamped, stamped); // retention reads mtime as "last uploaded", on the store's clock
-    fsyncDirectory(path.dirname(final));
-    this.bytes += size;
-    this.journal.append({ kind: 'blob', path: blobRelPath(sha), sha256: sha, size, createdAt: this.now() });
-    return { stored: true };
-  }
-
-  readManifest(job) {
-    if (!isJobId(job)) return null;
-    try {
-      return JSON.parse(fs.readFileSync(this.abs(manifestRelPath(job)), 'utf8'));
+      return fs.lstatSync(this.abs(blobRelPath(sha))).size;
     } catch (err) {
       if (err.code === 'ENOENT') return null;
       throw err;
     }
   }
 
-  /** Register `bytes` (a `{manifestHash, entries}` document) as the immutable manifest of `job`. */
+  hasBlob(sha) {
+    return this.blobSize(sha) !== null;
+  }
+
+  /** Reserve `n` bytes against the admission threshold (95% of the cap); throws 507 when they do not fit. */
+  reserve(n) {
+    if (this.bytes + this.reserved + n >= this.capBytes * ADMIT_FRACTION) throw new StoreError(507, 'store is above 95% of its cap');
+    this.reserved += n;
+  }
+
+  release(n) {
+    this.reserved -= n;
+  }
+
+  journalBlob(sha) {
+    const rel = blobRelPath(sha);
+    this.journal.append({ kind: 'blob', path: rel, sha256: sha, size: this.blobSize(sha), createdAt: this.now() });
+    this.unjournaled.delete(sha);
+  }
+
+  /**
+   * Whole-file immutable upload. Admission reserves the declared bytes; the body is streamed to tmp/ (every byte
+   * accounted for through `bytesWritten`), fsynced, then the bytes ON DISK are re-hashed and sized before the rename.
+   * A blob that already exists is verified the same way and deduplicated (its mtime is refreshed, restarting the
+   * unreferenced-blob grace window). Commit rechecks the cap, then journals; a failed append rolls the blob back.
+   */
+  async putBlob(sha, readable, declaredSize) {
+    if (!isSha256(sha)) throw new StoreError(400, 'bad sha256');
+    if (declaredSize > this.maxBlobBytes) throw new StoreError(413, `blob exceeds the ${this.maxBlobBytes}-byte cap`);
+    const final = this.abs(blobRelPath(sha));
+    let held = 0;
+    if (!this.hasBlob(sha)) {
+      this.reserve(declaredSize);
+      held = declaredSize;
+    }
+    const tmp = path.join(this.root, 'tmp', `${sha}.${crypto.randomBytes(6).toString('hex')}`);
+    try {
+      const fh = await fs.promises.open(tmp, 'wx', 0o640);
+      let size = 0;
+      try {
+        for await (const chunk of readable) {
+          size += chunk.length;
+          if (size > this.maxBlobBytes) throw new StoreError(413, `blob exceeds the ${this.maxBlobBytes}-byte cap`);
+          let off = 0;
+          while (off < chunk.length) {
+            const { bytesWritten } = await fh.write(chunk, off, chunk.length - off);
+            if (!(bytesWritten > 0)) throw new Error('blob write made no progress');
+            off += bytesWritten;
+          }
+        }
+        await fh.sync();
+      } finally {
+        await fh.close();
+      }
+      const onDisk = await hashFile(tmp);
+      if (onDisk.size !== size || onDisk.sha256 !== sha) {
+        throw new StoreError(422, 'the bytes on disk do not hash to the address');
+      }
+      if (this.hasBlob(sha)) {
+        const t = new Date(this.now());
+        fs.utimesSync(final, t, t);
+        if (this.unjournaled.has(sha)) this.journalBlob(sha);
+        return { stored: false };
+      }
+      fs.mkdirSync(path.dirname(final), { recursive: true });
+      this.abs(blobRelPath(sha)); // re-check the ancestors now that they exist
+      fs.renameSync(tmp, final);
+      const stamped = new Date(this.now());
+      fs.utimesSync(final, stamped, stamped); // retention reads mtime as "last uploaded", on the store's clock
+      fsyncDirectory(path.dirname(final));
+      this.release(held);
+      held = 0;
+      if (this.bytes + size > this.capBytes) {
+        fs.unlinkSync(final);
+        throw new StoreError(507, 'store is at its cap');
+      }
+      this.bytes += size;
+      try {
+        this.journalBlob(sha);
+      } catch (err) {
+        try {
+          fs.unlinkSync(final);
+          this.bytes -= size;
+        } catch {
+          this.unjournaled.add(sha); // still on disk without a record: the dedupe path and manifest registration journal it
+        }
+        throw err;
+      }
+      return { stored: true };
+    } finally {
+      this.release(held);
+      fs.rmSync(tmp, { force: true });
+    }
+  }
+
+  readManifest(job) {
+    if (!isJobId(job)) return null;
+    const bytes = this.readFileSafe(manifestRelPath(job));
+    return bytes ? JSON.parse(bytes.toString('utf8')) : null;
+  }
+
+  manifestSize(job) {
+    try {
+      return fs.lstatSync(this.abs(manifestRelPath(job))).size;
+    } catch (err) {
+      if (err.code === 'ENOENT') return 0;
+      throw err;
+    }
+  }
+
+  /**
+   * Register `bytes` (a strict `{manifestHash, entries}` document) as the immutable manifest of `job`. Every
+   * referenced blob must be stored AND journaled (an unjournaled one is journaled here first), so no journal prefix
+   * ever contains a manifest without the blobs it needs. Manifest bytes count toward the cap.
+   */
   registerManifest(job, bytes) {
     if (!isJobId(job)) throw new StoreError(400, 'bad job id');
     if (bytes.length > MAX_MANIFEST_BYTES) throw new StoreError(413, 'manifest too large');
@@ -199,10 +345,21 @@ export class ObjectStore {
       if (this.blobSize(e.sha256) !== e.size) missing.push(e.sha256);
     }
     if (missing.length) throw new StoreError(409, 'manifest references blobs the store does not have', { missing: [...new Set(missing)] });
+    if (this.bytes + this.reserved + bytes.length >= this.capBytes * ADMIT_FRACTION) throw new StoreError(507, 'store is above 95% of its cap');
+    for (const e of doc.entries) if (e.type === 'file' && this.unjournaled.has(e.sha256)) this.journalBlob(e.sha256);
     const rel = manifestRelPath(job);
+    const metaRel = `meta/${job}.json`;
     atomicWriteFile(this.abs(rel), bytes, { fsync: true });
-    atomicWriteJson(this.abs(`meta/${job}.json`), { registeredAt: this.now(), terminalAt: null, pinned: false }, { fsync: true });
-    this.journal.append({ kind: 'manifest', path: rel, sha256: crypto.createHash('sha256').update(bytes).digest('hex'), size: bytes.length, createdAt: this.now() });
+    this.bytes += bytes.length;
+    try {
+      atomicWriteJson(this.abs(metaRel), { registeredAt: this.now(), terminalAt: null, pinned: false }, { fsync: true });
+      this.journal.append({ kind: 'manifest', path: rel, sha256: crypto.createHash('sha256').update(bytes).digest('hex'), size: bytes.length, createdAt: this.now() });
+    } catch (err) {
+      fs.rmSync(this.abs(rel), { force: true });
+      fs.rmSync(this.abs(metaRel), { force: true });
+      this.bytes -= bytes.length;
+      throw err;
+    }
     return { stored: true };
   }
 
@@ -218,26 +375,66 @@ export class ObjectStore {
   }
 
   meta(job) {
-    return readJsonSafe(this.abs(`meta/${job}.json`)) ?? { registeredAt: null, terminalAt: null, pinned: false };
+    const bytes = isJobId(job) ? this.readFileSafe(`meta/${job}.json`) : null;
+    return bytes ? JSON.parse(bytes.toString('utf8')) : { registeredAt: null, terminalAt: null, pinned: false };
   }
 
-  updateMeta(job, patch) {
+  /** Change one retention field of a job and journal it; undone if the journal append fails. Idempotent: a no-op is not journaled. */
+  setJobState(job, field, value) {
     if (!this.readManifest(job)) throw new StoreError(404, 'no such job');
-    atomicWriteJson(this.abs(`meta/${job}.json`), { ...this.meta(job), ...patch }, { fsync: true });
-  }
-
-  /** Re-read an object from disk and hash it: what a replica reports so the replicator can compare against the journal. */
-  async verifyObject(rel) {
-    if (!parseObjectPath(rel)) throw new StoreError(400, 'not an object path');
+    const before = this.meta(job);
+    if (before[field] === value) return false;
+    const metaRel = `meta/${job}.json`;
+    atomicWriteJson(this.abs(metaRel), { ...before, [field]: value }, { fsync: true });
     try {
-      return await hashFile(this.abs(rel));
+      const kind = field === 'pinned' ? 'pin' : 'terminal';
+      this.journal.append({ kind, path: manifestRelPath(job), job, [field]: value, createdAt: this.now() });
     } catch (err) {
-      if (err.code === 'ENOENT') return null;
+      atomicWriteJson(this.abs(metaRel), before, { fsync: true });
       throw err;
     }
+    return true;
   }
 
-  /** Append journal records for committed objects that have none (recovery from a crash between commit and append, or journal loss). */
+  markTerminal(job, at = this.now()) {
+    return this.setJobState(job, 'terminalAt', at);
+  }
+
+  setPinned(job, pinned) {
+    return this.setJobState(job, 'pinned', !!pinned);
+  }
+
+  /** Retention/replication delete: journal the deletion first, then remove (a failed removal is re-journaled as a put by reconcile). */
+  deleteObject(rel) {
+    const parsed = parseObjectPath(rel);
+    if (!parsed) throw new StoreError(400, 'not an object path');
+    const file = this.abs(rel);
+    let st;
+    try {
+      st = fs.lstatSync(file);
+    } catch (err) {
+      if (err.code === 'ENOENT') return false;
+      throw err;
+    }
+    this.journal.append({ kind: 'delete', path: rel, createdAt: this.now() });
+    fs.unlinkSync(file);
+    this.bytes -= st.size;
+    if (parsed.kind === 'manifest') {
+      fs.rmSync(this.abs(`meta/${parsed.job}.json`), { force: true });
+      this.jobBlobCache.delete(parsed.job);
+    }
+    return true;
+  }
+
+  /** Re-read an object from disk and hash it: what a peer reports so the replicator can compare against the journal. */
+  async verifyObject(rel) {
+    if (!parseObjectPath(rel)) throw new StoreError(400, 'not an object path');
+    const f = this.openRead(rel);
+    if (!f) return null;
+    return hashStream(fs.createReadStream(null, { fd: f.fd }));
+  }
+
+  /** Append journal records for committed objects that have none (journal loss, or a crash the startup reconcile has not seen yet). */
   async rejournal(paths) {
     const added = [];
     for (const rel of paths) {
@@ -247,4 +444,9 @@ export class ObjectStore {
     }
     return added;
   }
+}
+
+function hashFileSync(file) {
+  const buf = fs.readFileSync(file);
+  return { sha256: crypto.createHash('sha256').update(buf).digest('hex'), size: buf.length };
 }

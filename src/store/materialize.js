@@ -1,5 +1,5 @@
 import { manifestHashOf } from '../remote-manifest.js';
-import { encodeSnapshot, extractSnapshot } from '../remote-stream.js';
+import { encodeSnapshot, extractSnapshot, MAX_HEADER_BYTES } from '../remote-stream.js';
 
 /**
  * Receiver side of a detached submit (spec 4.2/8.1): turn a registered manifest plus its blobs into a working
@@ -17,5 +17,6 @@ export async function materializeSnapshot({ manifest, destDir, readBlob, limits 
     if (bytes.length !== entry.size) throw new Error(`blob size differs from manifest: ${entry.path}`); // keeps the frame length honest; the hash is checked by extractSnapshot
     return bytes;
   });
-  return extractSnapshot(stream, destDir, manifest, limits);
+  // MAX_HEADER_BYTES is also what the store's manifest cap derives from (objects.js), so one limit governs both.
+  return extractSnapshot(stream, destDir, manifest, { maxLineBytes: MAX_HEADER_BYTES, ...limits });
 }

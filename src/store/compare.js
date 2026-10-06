@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { listObjects } from './objects.js';
-import { readJournal } from './journal.js';
+import { lastKindByPath } from './journal.js';
 
 /**
  * Weekly backstop (spec 8.2): compare the primary's on-disk objects with the replica's listing and with the
@@ -11,7 +11,8 @@ import { readJournal } from './journal.js';
 export async function compareStores({ root, replica, deep = false }) {
   const local = await listObjects(path.resolve(root), { deep });
   const remote = new Map((await replica.list({ deep })).map((o) => [o.path, o]));
-  const journaled = new Set(readJournal(root).map((r) => r.path));
+  const last = lastKindByPath(path.resolve(root));
+  const journaled = { has: (p) => last.get(p) === 'blob' || last.get(p) === 'manifest' };
   const diff = { missingAtReplica: [], mismatched: [], extraAtReplica: [], notInJournal: [] };
   for (const o of local) {
     const r = remote.get(o.path);

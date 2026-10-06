@@ -1,5 +1,6 @@
 import http from 'node:http';
 import fs from 'node:fs';
+import { pipeline } from 'node:stream/promises';
 import { ObjectStore, StoreError, MAX_MANIFEST_BYTES, listObjects } from './objects.js';
 import { ROLES } from './auth.js';
 import { sweep } from './retention.js';
@@ -55,7 +56,7 @@ function gate(limit) {
  * `async (bearerToken) => claims | null` (see auth.js). Reads are job-scoped: a `read` token may fetch only the
  * manifest of `claims.job` and the blobs that manifest references.
  */
-export function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, sweepIntervalMs = 0, ...storeOpts }) {
+export function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, downloadIdleMs = 30_000, sweepIntervalMs = 0, ...storeOpts }) {
   const store = new ObjectStore(root, storeOpts);
   const upload = gate(maxUploads);
   const download = gate(maxDownloads);
@@ -101,16 +102,13 @@ export function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, 
           const allowed = claims.job === undefined ? null : store.jobBlobs(claims.job);
           if (!allowed || !allowed.has(sha)) throw new StoreError(403, 'blob is not part of this job');
         }
-        const size = store.blobSize(sha);
-        if (size === null) throw new StoreError(404, 'no such blob');
         return download(async () => {
-          res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': size });
-          await new Promise((resolve, reject) => {
-            const s = fs.createReadStream(store.abs(blobRelPath(sha)));
-            s.on('error', reject).on('end', resolve);
-            res.on('close', resolve);
-            s.pipe(res);
-          });
+          const file = store.openRead(blobRelPath(sha));
+          if (!file) throw new StoreError(404, 'no such blob');
+          const src = fs.createReadStream(null, { fd: file.fd });
+          res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': file.size });
+          res.setTimeout(downloadIdleMs, () => res.destroy()); // a client that stops reading is evicted, freeing its slot
+          await pipeline(src, res).catch(() => {}); // pipeline destroys src (closing the fd) when res closes or errors
         });
       }
     }
@@ -144,14 +142,23 @@ export function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, 
     }
 
     if (parts[0] === 'jobs' && parts[2] === 'terminal' && method === 'PUT') {
-      await authorize(req, [ADMIN]);
-      store.updateMeta(parts[1], { terminalAt: store.now() });
-      return send(res, 200, { ok: true });
+      const claims = await authorize(req, PEERS);
+      const at = claims.role === REPLICA && url.searchParams.has('at') ? Number(url.searchParams.get('at')) : store.now();
+      if (!Number.isFinite(at)) throw new StoreError(400, 'bad at');
+      return send(res, 200, { changed: store.markTerminal(parts[1], at) });
+    }
+    if (parts[0] === 'jobs' && parts[2] === 'meta' && method === 'GET') {
+      await authorize(req, PEERS);
+      if (!store.readManifest(parts[1])) throw new StoreError(404, 'no such job');
+      return send(res, 200, store.meta(parts[1]));
     }
     if (parts[0] === 'pins' && parts.length === 2 && (method === 'PUT' || method === 'DELETE')) {
-      await authorize(req, [ADMIN]);
-      store.updateMeta(parts[1], { pinned: method === 'PUT' });
-      return send(res, 200, { ok: true });
+      await authorize(req, PEERS);
+      return send(res, 200, { changed: store.setPinned(parts[1], method === 'PUT') });
+    }
+    if (method === 'DELETE' && parts[0] === 'objects') {
+      await authorize(req, PEERS);
+      return send(res, 200, { deleted: store.deleteObject(decodeURIComponent(url.pathname.slice('/objects/'.length))) });
     }
     if (method === 'POST' && url.pathname === '/admin/rejournal') {
       await authorize(req, [ADMIN]);
@@ -183,7 +190,7 @@ export function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, 
   });
 
   let timer = null;
-  if (sweepIntervalMs > 0) {
+  if (sweepIntervalMs > 0 && !store.replicaMode) {
     timer = setInterval(() => sweep(store), sweepIntervalMs);
     timer.unref();
   }

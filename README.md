@@ -1196,7 +1196,12 @@ symlinks.
   (plus `lane_store_replicated_seq`, `_journal_head_seq`, `_replication_failed_rounds`, `_blob_bytes`) is served live at
   `GET /metrics`, computed from the journal and watermark so it keeps growing if the replicator dies.
   `lane-store compare [--deep] [--repair]` is the weekly backstop (exit 2 on divergence).
-- **Retention.** `POST /admin/sweep` (and `--sweep-interval-s`): manifests expire 14 d after `PUT /jobs/<job>/terminal`,
+- **Retention runs on the primary only.** Terminal marks, pins and every deletion are journal records (`terminal`, `pin`,
+  `delete`) that the replica applies in order, so it mirrors the primary and never sweeps on its own (`serve --replica`
+  makes `sweep` a no-op there). An object missing on the primary blocks the watermark unless a later `delete` record explains it.
+  Store-wide: nothing under the root may be a symlink (ancestors lstat-checked, leaves opened `O_NOFOLLOW`, root `realpath`ed);
+  manifests count toward `--cap-bytes`, and admission reserves declared bytes atomically.
+  `POST /admin/sweep` (and `--sweep-interval-s`): manifests expire 14 d after `PUT /jobs/<job>/terminal`,
   pinned jobs (`PUT /pins/<job>`) never expire, unreferenced blobs go after 24 h, above 80% of `--cap-bytes` the oldest
   terminal unpinned groups are evicted, and uploads are refused (507) at 95%.
 
