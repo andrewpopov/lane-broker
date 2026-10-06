@@ -297,7 +297,7 @@ test('a hit whose relocation cannot be verified is discarded and installed norma
 
   const second = await runLane(s, repoDir);
   assert.equal(second.code, 0, second.stderr);
-  assert.match(second.stderr, /deps-cache materialize failed, installing instead: relocation: hello-tool\/package\.json no longer names an install path/);
+  assert.match(second.stderr, /deps-cache materialize failed, installing instead: relocation: hello-tool\/package\.json holds no placeholder/);
   assert.equal(s.npmCiCalls(), 2, 'it installed');
   assert.equal(second.probe.out, 'hello from the bin');
 });
@@ -426,7 +426,7 @@ test('the per-run TMPDIR path is recorded for relocation too', async () => {
   assert.equal(run.row.depsCache, 'miss');
   const recorded = JSON.parse(fs.readFileSync(path.join(s.storeDir, s.storedKeys()[0], 'meta.json'), 'utf8')).relocation;
   assert.deepEqual(recorded.entries, [{ relPath: 'hello-tool/tmp.txt', kind: 'text' }]);
-  assert.deepEqual(recorded.prefixes.map((p) => p.role), ['TMPDIR']);
+  assert.deepEqual(recorded.prefixes.map((p) => p.roles), [['TMPDIR', 'TMP', 'TEMP']]);
 });
 
 test('SSH_AUTH_SOCK reaches the install (a git+ssh dependency needs it) but is not part of the key', async () => {

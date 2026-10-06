@@ -324,6 +324,7 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
   if (missing) return { exitCode, record: done('skip', { key, reason: 'incomplete-optional', missing }) };
   const references = collectInstallPathReferences(path.join(cwd, 'node_modules'), installPathRoles(workDir, depsEnv));
   if (references.binary) return { exitCode, record: done('skip', { key, reason: 'absolute-install-path-binary', file: references.binary }) };
+  if (references.ambiguous) return { exitCode, record: done('skip', { key, reason: 'absolute-install-path-ambiguous', file: references.ambiguous }) };
   try {
     const result = await publishAndEvict(depsCache, key, cwd, releaseLeases, references.relocation);
     return { exitCode, record: done('miss', { key, published: result.published, ...(result.published ? {} : { reason: 'another run published this key first' }) }) };
