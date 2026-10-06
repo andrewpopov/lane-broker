@@ -188,3 +188,39 @@ test('P2 v2: a futile head drops its persisted reservation so the next dormant o
   assert.equal(stored.reservationSeq, undefined);
   assert.equal(owner(), 'b', 'B\'s dormant reservation becomes the active one');
 });
+
+test('P1 expiry: a futile verdict not recomputed (cooldown) stops excusing backfill, so skips count again and the head starts', async () => {
+  const realNow = Date.now;
+  let t = 1_700_000_000_000;
+  Date.now = () => t;
+  try {
+    const { state } = freshEnv();
+    const head = ticket('head', { weight: 4 });
+    await enqueue(state, head);
+    await poll(state, head, { ext: 7 });
+    assert.equal(readResourceSkipState(state).futile, 'cpu');
+
+    // fresh verdict: backfill is free
+    const first = ticket('s0');
+    await enqueue(state, first);
+    assert.equal((await poll(state, first, { ext: 7 })).started, true);
+    removeLease(state, 's0');
+    assert.equal(readResourceSkipState(state).count, 0);
+
+    // external load drops, but the head only ever polls inside cooldown, so the verdict is never recomputed
+    t += 3 * cfg.sampleMs; // older than 2 x the sample interval
+    for (let i = 1; i <= 3; i += 1) {
+      const s = ticket(`s${i}`);
+      await enqueue(state, s);
+      assert.equal((await poll(state, s, { ext: 7 })).started, true, `backfill ${i} fits the allowance`);
+      removeLease(state, s.id);
+    }
+    assert.deepEqual({ count: readResourceSkipState(state).count, reserved: readResourceSkipState(state).reserved }, { count: 3, reserved: true }, 'skips count again and the reservation latches');
+    const extra = ticket('extra');
+    await enqueue(state, extra);
+    assert.equal((await poll(state, extra, { ext: 0 })).reason, 'not-head', 'the reservation holds against further backfill');
+    assert.equal((await poll(state, head, { ext: 0 })).started, true, 'the head starts');
+  } finally {
+    Date.now = realNow;
+  }
+});
