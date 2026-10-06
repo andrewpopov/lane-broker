@@ -5,36 +5,21 @@ import { readReplicationState } from './replication-state.js';
 
 /**
  * `journal.log`: one JSON line `{seq, kind, path, sha256, size, createdAt, ...}` per committed state change, appended
- * and fsynced AFTER the change itself is durable (spec 8.2). Kinds: `blob`, `manifest` (objects), `terminal`, `pin`
- * (job retention state) and `delete` (retention removed an object). seq is 1-based and gapless.
+ * and fsynced AFTER the change itself is durable (spec 8.2). Kinds: `blob`, `manifest` (objects), `terminal`, `pin` (job
+ * retention state), `delete-intent` (retention is about to unlink an object) and `delete` (it has). seq is 1-based, gapless.
  *
- * DURABLE-COMMIT BOUNDARY: a record is visible to readers only once it is committed. The writer keeps `committedSeq` /
- * `committedOffset` in memory and publishes the offset to `journal.committed` (for readers in other processes) only AFTER
- * the write and the file fsync succeeded. Every reader stops at that offset, so a record that is later rolled back
- * (truncate + fsync, before the next append) was never visible to anyone and its seq/offset can be reused safely.
+ * DURABLE-COMMIT BOUNDARY: only the serving process ever reads this file while the store runs (the replicator is a loop
+ * inside it). The writer keeps `committedSeq` / `committedOffset` in memory, advances them only after write and fsync
+ * succeed, and every reader (`read`, `iterate`, `objectState`) stops at `committedOffset`, so a record that is rolled back
+ * (truncate + fsync before the next append) was never visible and its seq/offset can be reused. There is no file-published
+ * marker: nothing outside the process can observe the journal. At open the whole file is fsynced before `committedOffset`
+ * is set, so a complete-but-unsynced tail left by a crash is made durable before anything reads it.
  */
-export const COMMITTED_FILE = 'journal.committed';
 export const JOURNAL_FILE = 'journal.log';
 export const DEFAULT_CHUNK_BYTES = 256 * 1024;
 
 export function journalPath(root) {
   return path.join(root, JOURNAL_FILE);
-}
-
-/** Byte offset below which the journal is committed: the published marker, or the file size if no writer ever published one. */
-export function committedOffset(root) {
-  try {
-    const n = Number.parseInt(fs.readFileSync(path.join(root, COMMITTED_FILE), 'utf8'), 10);
-    if (Number.isInteger(n) && n >= 0) return n;
-  } catch (err) {
-    if (err.code !== 'ENOENT') throw err;
-  }
-  try {
-    return fs.statSync(journalPath(root)).size;
-  } catch (err) {
-    if (err.code === 'ENOENT') return 0;
-    throw err;
-  }
 }
 
 function writeAll(fd, buf, position) {
@@ -51,7 +36,7 @@ function writeAll(fd, buf, position) {
  * record carries `offset` (its start) and `end`. `expectSeq`, when given, must be the first record's seq: a watermark
  * that no longer matches the file is a hard error, never silently resynchronised.
  */
-export function readJournalFrom(root, offset = 0, { maxBytes = DEFAULT_CHUNK_BYTES, expectSeq } = {}) {
+export function readJournalFrom(root, offset = 0, { maxBytes = DEFAULT_CHUNK_BYTES, expectSeq, limit = Infinity } = {}) {
   let fd;
   try {
     fd = fs.openSync(journalPath(root), 'r');
@@ -60,7 +45,7 @@ export function readJournalFrom(root, offset = 0, { maxBytes = DEFAULT_CHUNK_BYT
     throw err;
   }
   try {
-    const size = Math.min(fs.fstatSync(fd).size, committedOffset(root));
+    const size = Math.min(fs.fstatSync(fd).size, limit);
     if (offset >= size) return [];
     const buf = Buffer.alloc(Math.min(maxBytes, size - offset));
     let got = 0;
@@ -113,13 +98,14 @@ export function readJournal(root, afterSeq = 0, limit = Infinity) {
 }
 
 /**
- * path -> 'put' | 'delete': the last OBJECT record (blob/manifest/delete) naming each path. Retention-state records
- * (pin, terminal) are a separate dimension and never overwrite it.
+ * path -> 'put' | 'intent' | 'delete': the last OBJECT record naming each path (`intent` is a delete-intent after a put).
+ * Retention-state records (pin, terminal) are a separate dimension and never overwrite it. `limit` bounds the scan.
  */
-export function objectStateByPath(root) {
+export function objectStateByPath(root, limit = Infinity) {
   const state = new Map();
-  for (const rec of iterateJournal(root)) {
+  for (const rec of iterateJournal(root, 0, { limit })) {
     if (rec.kind === 'blob' || rec.kind === 'manifest') state.set(rec.path, 'put');
+    else if (rec.kind === 'delete-intent') state.set(rec.path, 'intent');
     else if (rec.kind === 'delete') state.set(rec.path, 'delete');
   }
   return state;
@@ -131,7 +117,7 @@ export function journalHeadSeq(root) {
   return seq;
 }
 
-/** The single in-process writer. Appends are synchronous, so they are serialised by the event loop. */
+/** The single in-process writer and (via `read`/`iterate`) the only reader while the store is running. */
 export class Journal {
   /** `trackPending: false` for a store with no downstream replica target: it keeps no per-record tail at all. */
   constructor(root, { trackPending = true } = {}) {
@@ -141,19 +127,18 @@ export class Journal {
     fs.mkdirSync(root, { recursive: true });
     const existed = fs.existsSync(this.file);
     if (existed) this.dropTornTail();
+    this.fd = fs.openSync(this.file, 'a', 0o640);
+    fs.fsyncSync(this.fd); // make any complete-but-unsynced tail durable BEFORE it becomes readable
     this.committedOffset = existed ? fs.statSync(this.file).size : 0;
     this.committedSeq = existed ? this.tailSeq() : 0;
-    this.markerFd = fs.openSync(path.join(root, COMMITTED_FILE), 'w', 0o640);
-    this.publish(this.committedOffset);
     this.pending = []; // {seq, createdAt} above the watermark: all /metrics needs, so it never reads the file
     const mark = readReplicationState(root);
     if (mark.replicatedOffset > this.committedOffset) throw new Error('replication watermark is beyond the end of the journal');
     if (trackPending) {
-      for (const rec of iterateJournal(root, mark.replicatedOffset)) {
+      for (const rec of this.iterate(mark.replicatedOffset)) {
         if (rec.seq > mark.replicatedSeq) this.pending.push({ seq: rec.seq, createdAt: rec.createdAt });
       }
     }
-    this.fd = fs.openSync(this.file, 'a', 0o640);
     this.broken = false;
     if (!existed) fsyncDirectory(root);
   }
@@ -166,9 +151,17 @@ export class Journal {
     return this.committedOffset;
   }
 
-  publish(offset) {
-    const line = Buffer.from(`${String(offset).padStart(20, '0')}\n`);
-    writeAll(this.markerFd, line, 0);
+  /** Committed records from byte `offset`, at most `maxBytes` of them. */
+  read(offset, opts = {}) {
+    return readJournalFrom(this.root, offset, { ...opts, limit: this.committedOffset });
+  }
+
+  *iterate(offset = 0, opts = {}) {
+    yield* iterateJournal(this.root, offset, { ...opts, limit: this.committedOffset });
+  }
+
+  objectState() {
+    return objectStateByPath(this.root, this.committedOffset);
   }
 
   tailSeq() {
@@ -210,12 +203,10 @@ export class Journal {
     try {
       writeAll(this.fd, buf);
       fs.fsyncSync(this.fd);
-      this.publish(start + buf.length); // visible to other processes only now
     } catch (err) {
       try {
         fs.ftruncateSync(this.fd, start);
         fs.fsyncSync(this.fd); // the rollback itself must be durable before the next append reuses these bytes
-        this.publish(start);
       } catch {
         this.broken = true;
       }
@@ -242,6 +233,5 @@ export class Journal {
 
   close() {
     fs.closeSync(this.fd);
-    fs.closeSync(this.markerFd);
   }
 }

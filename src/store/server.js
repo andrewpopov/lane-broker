@@ -5,6 +5,8 @@ import { ObjectStore, StoreError, MAX_MANIFEST_BYTES, listObjects } from './obje
 import { ROLES } from './auth.js';
 import { sweep } from './retention.js';
 import { renderMetrics } from './metrics.js';
+import { compareStores } from './compare.js';
+import { startReplication } from './replicate.js';
 import { isSha256, isJobId, blobRelPath, parseObjectPath } from './ids.js';
 
 const { SUBMIT, READ, REPLICA, ADMIN } = ROLES;
@@ -56,7 +58,8 @@ function gate(limit) {
  * `async (bearerToken) => claims | null` (see auth.js). Reads are job-scoped: a `read` token may fetch only the
  * manifest of `claims.job` and the blobs that manifest references.
  */
-export function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, downloadIdleMs = 30_000, sweepIntervalMs = 0, ...storeOpts }) {
+export function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, downloadIdleMs = 30_000, sweepIntervalMs = 0, maintenanceIntervalMs = 30_000, replicateTo, replicateIntervalMs = 300_000, ...storeOpts }) {
+  if (replicateTo && storeOpts.replicaMode) throw new Error('a replica does not replicate onward (--replica and --replicate-to are exclusive)');
   const store = new ObjectStore(root, storeOpts);
   const upload = gate(maxUploads);
   const download = gate(maxDownloads);
@@ -166,6 +169,16 @@ export function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, 
       if (!Array.isArray(paths) || !paths.every((p) => parseObjectPath(p))) throw new StoreError(400, 'paths must be object paths');
       return send(res, 200, { added: (await store.rejournal(paths)).length });
     }
+    if (method === 'POST' && url.pathname === '/admin/compare') {
+      await authorize(req, [ADMIN]);
+      if (!replicateTo) throw new StoreError(400, 'no replica target is configured (--replicate-to)');
+      const diff = await compareStores({ store, replica: replicateTo, deep: url.searchParams.get('deep') === '1' });
+      if (!diff.ok && url.searchParams.get('repair') === '1') {
+        const paths = [...new Set([...diff.notInJournal, ...diff.missingAtReplica, ...diff.mismatched])];
+        diff.rejournaled = (await store.rejournal(paths)).length;
+      }
+      return send(res, 200, diff);
+    }
     if (method === 'POST' && url.pathname === '/admin/sweep') {
       await authorize(req, [ADMIN]);
       return send(res, 200, sweep(store));
@@ -189,15 +202,24 @@ export function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, 
     }
   });
 
-  let timer = null;
-  if (sweepIntervalMs > 0 && !store.replicaMode) {
-    timer = setInterval(() => sweep(store), sweepIntervalMs);
-    timer.unref();
+  const timers = [];
+  if (sweepIntervalMs > 0 && !store.replicaMode) timers.push(setInterval(() => sweep(store), sweepIntervalMs));
+  if (maintenanceIntervalMs > 0) {
+    timers.push(setInterval(() => {
+      try {
+        store.maintain();
+      } catch (err) {
+        console.error(`lane-store: maintenance failed: ${err.message}`);
+      }
+    }, maintenanceIntervalMs));
   }
+  timers.forEach((t) => t.unref());
+  const replication = replicateTo ? startReplication({ store, replica: replicateTo, intervalMs: replicateIntervalMs, now: store.now }) : null;
 
   return {
     store,
     server,
+    replicator: replication?.replicator,
     /** Bind exactly one interface; a wildcard address is refused so the store can never listen on every NIC. */
     listen(host, port = 0) {
       if (!host || host === '0.0.0.0' || host === '::' || host === '::0') {
@@ -209,7 +231,8 @@ export function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, 
       });
     },
     close() {
-      if (timer) clearInterval(timer);
+      timers.forEach((t) => clearInterval(t));
+      replication?.stop();
       return new Promise((resolve) => {
         server.close(() => {
           store.close();

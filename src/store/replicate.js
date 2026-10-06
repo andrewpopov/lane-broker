@@ -1,18 +1,19 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { readJournalFrom, iterateJournal, DEFAULT_CHUNK_BYTES } from './journal.js';
+import { iterateJournal, DEFAULT_CHUNK_BYTES } from './journal.js';
+import { acquireStoreLock } from './lock.js';
 import { readReplicationState, writeReplicationState, REPLICATION_STATE_FILE } from './replication-state.js';
 import { manifestRelPath } from './ids.js';
 
 export { readReplicationState, REPLICATION_STATE_FILE };
 
 /**
- * The monitored recovery point (spec 8.2) computed from files, for tools and tests: age of the first journal record
- * above the watermark, 0 when none. The running store computes the same number from its in-memory tail.
+ * The monitored recovery point (spec 8.2): age of the first committed journal record above the watermark, 0 when none.
+ * (The running store computes the same number from its in-memory tail for /metrics.)
  */
-export function replicationLag(root, now = Date.now()) {
-  const state = readReplicationState(root);
-  const [first] = readJournalFrom(root, state.replicatedOffset, { expectSeq: state.replicatedSeq + 1 });
+export function replicationLag(store, now = Date.now()) {
+  const state = readReplicationState(store.root);
+  const [first] = store.journal.read(state.replicatedOffset, { expectSeq: state.replicatedSeq + 1 });
   return {
     oldestUnreplicatedAgeSeconds: first ? Math.max(0, (now - first.createdAt) / 1000) : 0,
     replicatedSeq: state.replicatedSeq,
@@ -25,6 +26,15 @@ export function replicationLag(root, now = Date.now()) {
  * state. Used after an unrecognised watermark file is refused.
  */
 export function rebuildWatermark(root, seq) {
+  const lock = acquireStoreLock(root); // offline only: refuses while a server holds the store
+  try {
+    return rebuildLocked(root, seq);
+  } finally {
+    lock.release();
+  }
+}
+
+function rebuildLocked(root, seq) {
   let offset = 0;
   if (seq > 0) {
     let found = false;
@@ -53,13 +63,15 @@ export function rebuildWatermark(root, seq) {
  * `delete` record after it. Anything else (disk loss, an operator rm) blocks the watermark and the age keeps growing.
  */
 export class Replicator {
-  constructor({ root, replica, now = Date.now, chunkBytes = DEFAULT_CHUNK_BYTES, onShipped }) {
-    Object.assign(this, { root: path.resolve(root), replica, now, chunkBytes, onShipped });
+  /** `store` is the serving ObjectStore: the replicator is a loop INSIDE that process and reads the journal only through
+   *  `store.journal`, which stops at the committed offset. */
+  constructor({ store, replica, now = Date.now, chunkBytes = DEFAULT_CHUNK_BYTES, onShipped }) {
+    Object.assign(this, { store, root: store.root, replica, now, chunkBytes, onShipped, running: false });
   }
 
   /** A COMMITTED delete record for `rel` after this record (the journal reader never sees uncommitted bytes). */
   committedDeletion(rel, fromOffset) {
-    for (const rec of iterateJournal(this.root, fromOffset, { maxBytes: this.chunkBytes })) {
+    for (const rec of this.store.journal.iterate(fromOffset, { maxBytes: this.chunkBytes })) {
       if (rec.kind === 'delete' && rec.path === rel) return rec;
     }
     return null;
@@ -112,6 +124,7 @@ export class Replicator {
   }
 
   ship(entry) {
+    if (entry.kind === 'delete-intent') return 'shipped'; // an intent changes nothing until its `delete` record
     if (entry.kind === 'blob' || entry.kind === 'manifest') return this.shipObject(entry);
     if (entry.kind === 'delete') return this.shipDelete(entry);
     if (entry.kind === 'terminal' || entry.kind === 'pin') return this.shipState(entry);
@@ -120,12 +133,22 @@ export class Replicator {
 
   /** Drain the journal to its current end. Records committed while this runs have higher seq and are picked up by the same loop. */
   async runOnce() {
+    if (this.running) return { ok: true, skipped: true };
+    this.running = true;
+    try {
+      return await this.round();
+    } finally {
+      this.running = false;
+    }
+  }
+
+  async round() {
     const state = readReplicationState(this.root);
     let shipped = 0;
     let gone = 0;
     try {
       for (;;) {
-        const entries = readJournalFrom(this.root, state.replicatedOffset, { maxBytes: this.chunkBytes, expectSeq: state.replicatedSeq + 1 });
+        const entries = this.store.journal.read(state.replicatedOffset, { maxBytes: this.chunkBytes, expectSeq: state.replicatedSeq + 1 });
         if (!entries.length) break;
         for (const entry of entries) {
           if ((await this.ship(entry)) === 'gone') gone += 1;
@@ -143,4 +166,16 @@ export class Replicator {
     writeReplicationState(this.root, { ...state, failedRounds: 0, lastRoundAt: this.now() });
     return { ok: true, shipped, gone, replicatedSeq: state.replicatedSeq };
   }
+}
+
+/** The primary's replication loop: one round every `intervalMs`, in the serving process. Returns `{replicator, stop}`. */
+export function startReplication({ store, replica, intervalMs, now = Date.now, log = console.error }) {
+  const replicator = new Replicator({ store, replica, now });
+  const timer = setInterval(() => {
+    replicator.runOnce().then((r) => {
+      if (!r.ok) log(`lane-store: replication round failed: ${r.error}`);
+    }, (err) => log(`lane-store: replication round crashed: ${err.message}`));
+  }, intervalMs);
+  timer.unref();
+  return { replicator, stop: () => clearInterval(timer) };
 }

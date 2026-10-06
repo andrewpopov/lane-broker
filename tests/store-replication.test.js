@@ -31,13 +31,13 @@ test('replicates in journal order and verifies every object at the replica', asy
   const snap = snapshotOf({ 'a.txt': 'aaa', 'b.txt': 'bbb' });
   await publish(p.primary, 'job-1', snap);
   const shipped = [];
-  const r = new Replicator({ root: p.primary.root, replica: p.replica.replicaPeer, now: p.clock.now, onShipped: (e) => shipped.push(e.seq) });
+  const r = new Replicator({ store: p.primary.store, replica: p.replica.replicaPeer, now: p.clock.now, onShipped: (e) => shipped.push(e.seq) });
   const result = await r.runOnce();
   assert.deepEqual({ ok: result.ok, shipped: result.shipped, seq: result.replicatedSeq }, { ok: true, shipped: 3, seq: 3 });
   assert.deepEqual(shipped, [1, 2, 3]);
   for (const h of snap.blobs.keys()) assert.equal(p.replica.store.hasBlob(h), true);
   assert.deepEqual((await p.replica.replicaPeer.getManifest('job-1')).manifestHash, snap.manifest.manifestHash);
-  assert.equal(replicationLag(p.primary.root, p.clock.now()).oldestUnreplicatedAgeSeconds, 0);
+  assert.equal(replicationLag(p.primary.store, p.clock.now()).oldestUnreplicatedAgeSeconds, 0);
 });
 
 test('the age metric is the age of the first unreplicated entry, 0 once drained, and is served at /metrics', async (t) => {
@@ -47,12 +47,12 @@ test('the age metric is the age of the first unreplicated entry, 0 once drained,
   p.clock.advance(600_000);
   await put(p.primary, 'two');
   p.clock.advance(60_000);
-  assert.equal(replicationLag(p.primary.root, p.clock.now()).oldestUnreplicatedAgeSeconds, 660);
+  assert.equal(replicationLag(p.primary.store, p.clock.now()).oldestUnreplicatedAgeSeconds, 660);
   const metrics = async () => (await (await fetch(`${p.primary.url}/metrics`)).text());
   assert.match(await metrics(), /^oldest_unreplicated_object_age_seconds 660$/m);
-  await new Replicator({ root: p.primary.root, replica: p.replica.replicaPeer, now: p.clock.now }).runOnce();
+  await new Replicator({ store: p.primary.store, replica: p.replica.replicaPeer, now: p.clock.now }).runOnce();
   assert.match(await metrics(), /^oldest_unreplicated_object_age_seconds 0$/m);
-  assert.equal(replicationLag(p.primary.root, p.clock.now()).oldestUnreplicatedAgeSeconds, 0);
+  assert.equal(replicationLag(p.primary.store, p.clock.now()).oldestUnreplicatedAgeSeconds, 0);
 });
 
 test('the journal resumes after a crash mid-replication: the persisted watermark is where the next round starts', async (t) => {
@@ -67,14 +67,14 @@ test('the journal resumes after a crash mid-replication: the persisted watermark
       return p.replica.replicaPeer.verifyObject(rel);
     },
   });
-  const first = await new Replicator({ root: p.primary.root, replica: crashing, now: p.clock.now }).runOnce();
+  const first = await new Replicator({ store: p.primary.store, replica: crashing, now: p.clock.now }).runOnce();
   assert.equal(first.ok, false);
   assert.equal(readReplicationState(p.primary.root).replicatedSeq, 2);
   assert.equal(readReplicationState(p.primary.root).failedRounds, 1);
 
   const puts = [];
   const resumed = wrap(p.replica.replicaPeer, { putObject: (e, f) => { puts.push(e.seq); return p.replica.replicaPeer.putObject(e, f); } });
-  const second = await new Replicator({ root: p.primary.root, replica: resumed, now: p.clock.now }).runOnce();
+  const second = await new Replicator({ store: p.primary.store, replica: resumed, now: p.clock.now }).runOnce();
   assert.equal(second.ok, true);
   assert.deepEqual(puts, [3, 4], 'seq 1-2 are not re-shipped; seq 3 (stored but unconfirmed) is');
   assert.equal(readReplicationState(p.primary.root).replicatedSeq, 4);
@@ -89,15 +89,15 @@ test('the watermark never advances past an object the replica could not verify',
   const liar = wrap(p.replica.replicaPeer, {
     verifyObject: async (rel) => (rel.endsWith(sha('b')) ? { sha256: sha('corrupted'), size: 1 } : p.replica.replicaPeer.verifyObject(rel)),
   });
-  const result = await new Replicator({ root: p.primary.root, replica: liar, now: p.clock.now }).runOnce();
+  const result = await new Replicator({ store: p.primary.store, replica: liar, now: p.clock.now }).runOnce();
   assert.equal(result.ok, false);
   assert.match(result.error, /replica verification failed for seq 2/);
   assert.equal(readReplicationState(p.primary.root).replicatedSeq, 1, 'stops before seq 2 and never skips ahead to seq 3');
   p.clock.advance(120_000);
-  assert.ok(replicationLag(p.primary.root, p.clock.now()).oldestUnreplicatedAgeSeconds >= 120, 'the recovery point keeps ageing');
+  assert.ok(replicationLag(p.primary.store, p.clock.now()).oldestUnreplicatedAgeSeconds >= 120, 'the recovery point keeps ageing');
 
   const missing = wrap(p.replica.replicaPeer, { verifyObject: async () => null });
-  const again = await new Replicator({ root: p.primary.root, replica: missing, now: p.clock.now }).runOnce();
+  const again = await new Replicator({ store: p.primary.store, replica: missing, now: p.clock.now }).runOnce();
   assert.equal(again.ok, false);
   assert.equal(readReplicationState(p.primary.root).replicatedSeq, 1);
   assert.equal(readReplicationState(p.primary.root).failedRounds, 2);
@@ -110,10 +110,9 @@ test('an object created mid-replication is a higher seq and is not missed', asyn
   await put(p.primary, 'second');
   let injected = false;
   const r = new Replicator({
-    root: p.primary.root,
+    store: p.primary.store,
     replica: p.replica.replicaPeer,
     now: p.clock.now,
-    batch: 1,
     onShipped: async (entry) => {
       if (entry.seq === 1 && !injected) {
         injected = true;
@@ -131,9 +130,9 @@ test('full compare finds a planted divergence: missing, corrupted and unjournale
   const p = await pair();
   t.after(() => p.close());
   for (const x of ['keep', 'lost', 'rotted']) await put(p.primary, x);
-  const r = new Replicator({ root: p.primary.root, replica: p.replica.replicaPeer, now: p.clock.now });
+  const r = new Replicator({ store: p.primary.store, replica: p.replica.replicaPeer, now: p.clock.now });
   await r.runOnce();
-  const cmp = () => compareStores({ root: p.primary.root, replica: p.replica.replicaPeer, deep: true });
+  const cmp = () => compareStores({ store: p.primary.store, replica: p.replica.replicaPeer, deep: true });
   assert.equal((await cmp()).ok, true);
 
   fs.rmSync(path.join(p.replica.root, blobRelPath(sha('lost'))));

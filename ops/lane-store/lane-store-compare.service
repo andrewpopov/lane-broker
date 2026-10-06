@@ -1,5 +1,6 @@
 # TEMPLATE, not installed. pitelite: weekly full compare of the store against the replica (exit 2 = divergence).
-# /etc/lane-store/replicate.env as for the replicate unit; add LANE_STORE_ADMIN_TOKEN only if --repair is wanted.
+# Asks the RUNNING primary (which holds the store lock and is the only reader of the journal) to compare itself with the
+# replica. /etc/lane-store/compare.env (0600, root): LANE_STORE_ADMIN_TOKEN=<role=admin token>.
 [Unit]
 Description=lane-store: weekly full compare against the replica
 
@@ -7,8 +8,8 @@ Description=lane-store: weekly full compare against the replica
 Type=oneshot
 User=lane-store
 Group=lane-store
-EnvironmentFile=/etc/lane-store/replicate.env
-ExecStart=/usr/bin/node /opt/lane-broker/bin/lane-store.js compare --root /data/lane-store --replica-url http://@REPLICA_TAILNET_IP@:7480 --deep
+EnvironmentFile=/etc/lane-store/compare.env
+ExecStart=/usr/bin/node /opt/lane-broker/bin/lane-store.js compare --url http://@TAILNET_IP@:7480 --deep
 Nice=10
 CPUQuota=100%
 IOWeight=10

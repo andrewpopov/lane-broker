@@ -22,8 +22,8 @@ async function pair(opts = {}) {
   const replica = await startStore({ clock, replicaMode: true });
   return { clock, primary, replica, close: () => Promise.all([primary.close(), replica.close()]) };
 }
-const replicator = (p, replica = p.replica.replicaPeer) => new Replicator({ root: p.primary.root, replica, now: p.clock.now });
-const sameAsReplica = async (p) => (await compareStores({ root: p.primary.root, replica: p.replica.replicaPeer, deep: true })).ok;
+const replicator = (p, replica = p.replica.replicaPeer) => new Replicator({ store: p.primary.store, replica, now: p.clock.now });
+const sameAsReplica = async (p) => (await compareStores({ store: p.primary.store, replica: p.replica.replicaPeer, deep: true })).ok;
 
 // ---- A ----
 test('A a reader that starts during an append whose fsync fails never sees the record, and the replica ends equal to the journal', async (t) => {
@@ -36,7 +36,7 @@ test('A a reader that starts during an append whose fsync fails never sees the r
   let seenDuringAppend = null;
   const m = mock.method(fs, 'fsyncSync', (fd) => {
     if (fd === journal.fd && seenDuringAppend === null) {
-      seenDuringAppend = readJournal(p.primary.root).map((r) => r.path);
+      seenDuringAppend = journal.read(0).map((r) => r.path); // the only reader there is: the in-process one, bounded by committedOffset
       throw new Error('EIO');
     }
     return real(fd);
@@ -44,7 +44,7 @@ test('A a reader that starts during an append whose fsync fails never sees the r
   await assert.rejects(put(p.primary, 'Y'), (e) => e instanceof StoreHttpError && e.status >= 500);
   m.mock.restore();
   assert.deepEqual(seenDuringAppend, [blobRelPath(sha('X'))], 'the uncommitted record was invisible to the reader');
-  assert.equal(readJournalFrom(p.primary.root, 0).length, 1);
+  assert.equal(journal.read(0).length, 1);
   await put(p.primary, 'Y'); // reuses the rolled-back seq and offset
   assert.equal((await replicator(p).runOnce()).ok, true);
   assert.equal(await sameAsReplica(p), true);
@@ -61,7 +61,7 @@ test('B a delete whose unlink fails journals nothing, so a later manifest can st
   const m = mock.method(fs, 'unlinkSync', () => { throw new Error('EBUSY'); }, { times: 1 });
   assert.throws(() => p.primary.store.deleteObject(blobRelPath(h)), /EBUSY/);
   m.mock.restore();
-  assert.deepEqual(readJournal(p.primary.root).map((r) => r.kind), ['blob'], 'no delete record for an object that is still there');
+  assert.deepEqual(readJournal(p.primary.root).map((r) => r.kind), ['blob', 'delete-intent'], 'an intent, but no delete record for an object that is still there');
   await p.primary.submit.putManifest('job-1', snap.manifest);
   const r = await replicator(p).runOnce();
   assert.equal(r.ok, true, r.error);
@@ -73,7 +73,7 @@ test('B a put whose object is gone and whose delete is committed later is not sk
   const p = await pair();
   t.after(() => p.close());
   await put(p.primary, 'doomed');
-  assert.equal(p.primary.store.deleteObject(blobRelPath(sha('doomed'))), true); // put (seq 1) then committed delete (seq 2)
+  assert.equal(p.primary.store.deleteObject(blobRelPath(sha('doomed'))), true); // put (1), intent (2), committed delete (3)
   const stuck = Object.create(p.replica.replicaPeer);
   stuck.deleteObject = async () => { throw new Error('replica delete failed'); };
   const failed = await replicator(p, stuck).runOnce();
@@ -81,26 +81,29 @@ test('B a put whose object is gone and whose delete is committed later is not sk
   assert.equal(readReplicationState(p.primary.root).replicatedSeq, 0, 'never advanced past an unverified put');
   const ok = await replicator(p).runOnce();
   assert.equal(ok.ok, true, ok.error);
-  assert.equal(readReplicationState(p.primary.root).replicatedSeq, 2);
+  assert.equal(readReplicationState(p.primary.root).replicatedSeq, 3);
   assert.equal(p.replica.store.hasBlob(sha('doomed')), false);
 });
 
-test('B crash between unlink and journal: startup reconcile journals a delete for the missing object and the replica converges', async (t) => {
+test('B interrupted retention (intent journaled, unlinked, no delete) completes at startup and the replica converges', async (t) => {
   const clock = fakeClock();
   let primary = await startStore({ clock });
   const replica = await startStore({ clock, replicaMode: true });
   t.after(() => replica.close());
-  await put(primary, 'lost to a crash');
+  await put(primary, 'retired');
   const root = primary.root;
-  assert.equal((await new Replicator({ root, replica: replica.replicaPeer, now: clock.now }).runOnce()).ok, true);
-  await primary.close();
-  fs.rmSync(path.join(root, blobRelPath(sha('lost to a crash')))); // the crash: unlinked, delete record never appended
+  assert.equal((await new Replicator({ store: primary.store, replica: replica.replicaPeer, now: clock.now }).runOnce()).ok, true);
+  const real = primary.store.journal.append.bind(primary.store.journal);
+  const m = mock.method(primary.store.journal, 'append', (f) => { if (f.kind === 'delete') throw new Error('EIO'); return real(f); });
+  assert.throws(() => primary.store.deleteObject(blobRelPath(sha('retired'))), /EIO/);
+  m.mock.restore();
+  await primary.close(); // crash: intent durable, object unlinked, delete never journaled
   primary = await startStore({ clock, root });
   t.after(() => primary.close());
-  assert.deepEqual(primary.store.reconcileReport.deleted, [blobRelPath(sha('lost to a crash'))]);
-  assert.equal(readJournal(root).at(-1).kind, 'delete');
-  assert.equal((await new Replicator({ root, replica: replica.replicaPeer, now: clock.now }).runOnce()).ok, true);
-  assert.equal(replica.store.hasBlob(sha('lost to a crash')), false);
+  assert.deepEqual(readJournal(root).map((r) => r.kind), ['blob', 'delete-intent', 'delete']);
+  assert.deepEqual(primary.store.reconcileReport.deleted, [blobRelPath(sha('retired'))]);
+  assert.equal((await new Replicator({ store: primary.store, replica: replica.replicaPeer, now: clock.now }).runOnce()).ok, true);
+  assert.equal(replica.store.hasBlob(sha('retired')), false);
 });
 
 // ---- C ----
@@ -141,7 +144,7 @@ test('D a watermark that is not format 2 refuses to start, and --rebuild-waterma
   await first.close();
   fs.writeFileSync(path.join(root, 'replication.json'), JSON.stringify({ replicatedSeq: 2, failedRounds: 0 }));
   await assert.rejects(startStore({ clock, root }), /rebuild-watermark/);
-  const rebuilt = spawnSync(process.execPath, [BIN, 'replicate', '--rebuild-watermark', '--seq', '2', '--root', root], { encoding: 'utf8' });
+  const rebuilt = spawnSync(process.execPath, [BIN, 'rebuild-watermark', '--seq', '2', '--root', root], { encoding: 'utf8' });
   assert.equal(rebuilt.status, 0, rebuilt.stderr);
   const file = JSON.parse(fs.readFileSync(path.join(root, 'replication.json'), 'utf8'));
   assert.equal(file.format, 2);
@@ -151,7 +154,7 @@ test('D a watermark that is not format 2 refuses to start, and --rebuild-waterma
   t.after(() => again.close());
   const replica = await startStore({ clock, replicaMode: true });
   t.after(() => replica.close());
-  const r = await new Replicator({ root, replica: replica.replicaPeer, now: clock.now }).runOnce();
+  const r = await new Replicator({ store: again.store, replica: replica.replicaPeer, now: clock.now }).runOnce();
   assert.deepEqual({ ok: r.ok, shipped: r.shipped, seq: r.replicatedSeq }, { ok: true, shipped: 1, seq: 3 });
   assert.equal(replica.store.hasBlob(sha('c')), true);
   assert.equal(replica.store.hasBlob(sha('a')), false, 'records at or below the rebuilt watermark are not re-shipped');
@@ -166,8 +169,8 @@ test('E a manifest followed by a pin stays a journaled manifest: compare reports
   await publish(primary, 'job-1', snapshotOf({ 'a.txt': 'a' }));
   await primary.admin.json('PUT', '/pins/job-1');
   const root = primary.root;
-  assert.equal((await new Replicator({ root, replica: replica.replicaPeer, now: clock.now }).runOnce()).ok, true);
-  const diff = await compareStores({ root, replica: replica.replicaPeer });
+  assert.equal((await new Replicator({ store: primary.store, replica: replica.replicaPeer, now: clock.now }).runOnce()).ok, true);
+  const diff = await compareStores({ store: primary.store, replica: replica.replicaPeer });
   assert.deepEqual(diff.notInJournal, []);
   const before = readJournal(root).length;
   await primary.close();
@@ -178,7 +181,7 @@ test('E a manifest followed by a pin stays a journaled manifest: compare reports
 });
 
 // ---- F ----
-test('F a deduplicated upload reserves capacity, so a delete and re-upload interleaving cannot overshoot the admission threshold', async (t) => {
+test('F an upload whose blob is deleted mid-flight never overshoots the admission threshold and is told to retry', async (t) => {
   const srv = await startStore({ capBytes: 1000 });
   t.after(() => srv.close());
   await srv.submit.putBlob(sha(Buffer.alloc(860, 9)), Buffer.alloc(860, 9));
@@ -187,17 +190,15 @@ test('F a deduplicated upload reserves capacity, so a delete and re-upload inter
   let open;
   const gate = new Promise((r) => { open = r; });
   const slow = Readable.from((async function* () { await gate; yield d; })());
-  const inflight = srv.store.putBlob(sha(d), slow, d.length); // dedupe path at admission
+  const inflight = srv.store.putBlob(sha(d), slow, d.length); // intact duplicate at admission: no reservation
+  const outcome = inflight.then((v) => ({ v }), (err) => ({ err }));
+  await new Promise((r) => setTimeout(r, 50));
   srv.store.deleteObject(blobRelPath(sha(d))); // retention removes it mid-upload
   const e = Buffer.alloc(40, 2);
-  const f = Buffer.alloc(40, 3);
-  try {
-    await srv.submit.putBlob(sha(e), e);
-    await assert.rejects(srv.submit.putBlob(sha(f), f), (err) => err instanceof StoreHttpError && err.status === 507);
-  } finally {
-    open();
-    await inflight;
-  }
+  await srv.submit.putBlob(sha(e), e);
+  open();
+  const res = await outcome;
+  assert.equal(res.err?.status, 503, 'told to retry rather than acknowledged for a blob that is gone');
   assert.ok(srv.store.bytes <= 950, `bytes ${srv.store.bytes}`);
   assert.equal(srv.store.reserved, 0);
 });

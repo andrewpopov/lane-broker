@@ -25,7 +25,7 @@ async function pair(opts = {}) {
   const replica = await startStore({ clock, replicaMode: true });
   return { clock, primary, replica, close: () => Promise.all([primary.close(), replica.close()]) };
 }
-const replicator = (p, extra = {}) => new Replicator({ root: p.primary.root, replica: p.replica.replicaPeer, now: p.clock.now, ...extra });
+const replicator = (p, extra = {}) => new Replicator({ store: p.primary.store, replica: p.replica.replicaPeer, now: p.clock.now, ...extra });
 
 // ---- #1 ----
 test('#1 an object gone from the primary before it shipped blocks the watermark and the age keeps growing', async (t) => {
@@ -37,7 +37,7 @@ test('#1 an object gone from the primary before it shipped blocks the watermark 
   assert.equal(result.ok, false);
   assert.equal(readReplicationState(p.primary.root).replicatedSeq, 1);
   p.clock.advance(300_000);
-  assert.ok(replicationLag(p.primary.root, p.clock.now()).oldestUnreplicatedAgeSeconds >= 300);
+  assert.ok(replicationLag(p.primary.store, p.clock.now()).oldestUnreplicatedAgeSeconds >= 300);
 });
 
 // ---- #2 ----
@@ -136,9 +136,9 @@ test('#4 crash after blob rename, restart, retry, manifest, replicate: the orpha
   const blobSeq = journal.find((r) => r.path === blobRelPath(h))?.seq;
   const manifestSeq = journal.find((r) => r.path === manifestRelPath('job-1'))?.seq;
   assert.ok(blobSeq && manifestSeq && blobSeq < manifestSeq, 'blob journaled before the manifest that references it');
-  const result = await new Replicator({ root, replica: replica.replicaPeer, now: clock.now }).runOnce();
+  const result = await new Replicator({ store: primary.store, replica: replica.replicaPeer, now: clock.now }).runOnce();
   assert.equal(result.ok, true, result.error);
-  assert.equal((await compareStores({ root, replica: replica.replicaPeer, deep: true })).ok, true);
+  assert.equal((await compareStores({ store: primary.store, replica: replica.replicaPeer, deep: true })).ok, true);
 });
 
 test('#4 a failed journal append rolls the blob back, so the retry stores and journals it', async (t) => {

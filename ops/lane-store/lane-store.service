@@ -1,6 +1,8 @@
 # TEMPLATE, not installed. pitelite primary: install as /etc/systemd/system/lane-store.service.
 # Replace @TAILNET_IP@ with pitelite's tailnet address (the store binds exactly one interface and refuses wildcards).
-# /etc/lane-store/env (0600, root) holds LANE_STORE_SECRET=<hmac secret>.
+# Replication runs INSIDE this process (--replicate-to, one round every 300 s); there is no separate replicate unit or timer.
+# Replace @REPLICA_TAILNET_IP@ with the wintop replica's address.
+# /etc/lane-store/env (0600, root) holds LANE_STORE_SECRET=<hmac secret> and LANE_STORE_REPLICA_TOKEN=<role=replica token>.
 [Unit]
 Description=lane-store: content-addressed snapshot store (primary)
 After=network-online.target tailscaled.service
@@ -11,7 +13,7 @@ Type=simple
 User=lane-store
 Group=lane-store
 EnvironmentFile=/etc/lane-store/env
-ExecStart=/usr/bin/node /opt/lane-broker/bin/lane-store.js serve --root /data/lane-store --listen @TAILNET_IP@:7480 --max-blob-bytes 512MiB --cap-bytes 100GB
+ExecStart=/usr/bin/node /opt/lane-broker/bin/lane-store.js serve --root /data/lane-store --listen @TAILNET_IP@:7480 --max-blob-bytes 512MiB --cap-bytes 100GB --replicate-to http://@REPLICA_TAILNET_IP@:7480 --replicate-interval-s 300
 Restart=on-failure
 RestartSec=5
 Nice=10

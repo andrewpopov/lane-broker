@@ -9,10 +9,10 @@ import { SECRET, sha, token } from './store-harness.js';
 import { StoreClient } from '../src/store/client.js';
 
 const BIN = fileURLToPath(new URL('../bin/lane-store.js', import.meta.url));
-const env = { ...process.env, LANE_STORE_SECRET: SECRET };
+const env = { ...process.env, LANE_STORE_SECRET: SECRET, LANE_STORE_REPLICA_TOKEN: token({ role: 'replica' }) };
 
-function serve(root) {
-  const child = spawn(process.execPath, [BIN, 'serve', '--root', root, '--listen', '127.0.0.1:0'], { env });
+function serve(root, ...extra) {
+  const child = spawn(process.execPath, [BIN, 'serve', '--root', root, '--listen', '127.0.0.1:0', ...extra], { env });
   const ready = new Promise((resolve, reject) => {
     let out = '';
     child.stdout.on('data', (d) => {
@@ -25,27 +25,33 @@ function serve(root) {
   return { child, ready };
 }
 
-test('lane-store CLI: serve, replicate (exit 0) and compare (exit 0, then 2 on a planted divergence)', async (t) => {
+test('lane-store CLI: in-process replication (serve --replicate-to), compare via the running primary, offline lock', async (t) => {
   const dirs = [0, 1].map(() => fs.mkdtempSync(path.join(os.tmpdir(), 'lane-store-cli-')));
-  const [p, r] = dirs.map(serve);
-  t.after(() => [p, r].forEach((s) => s.child.kill('SIGTERM')));
-  const [pUrl, rUrl] = await Promise.all([p.ready, r.ready]);
+  const replica = serve(dirs[1], '--replica');
+  t.after(() => replica.child.kill('SIGTERM'));
+  const rUrl = await replica.ready;
+  const primary = serve(dirs[0], '--replicate-to', rUrl, '--replicate-interval-s', '1');
+  t.after(() => primary.child.kill('SIGTERM'));
+  const pUrl = await primary.ready;
   const submit = new StoreClient({ baseUrl: pUrl, token: token({ role: 'submit' }) });
   await submit.putBlob(sha('cli blob'), Buffer.from('cli blob'));
+  const admin = new StoreClient({ baseUrl: rUrl, token: token({ role: 'admin' }) });
+  for (let i = 0; i < 60 && (await admin.has([sha('cli blob')])).length; i += 1) await new Promise((r) => setTimeout(r, 200));
+  assert.deepEqual(await admin.has([sha('cli blob')]), [], 'the primary replicated by itself, with no timer or second process');
 
-  const replEnv = { ...env, LANE_STORE_REPLICA_TOKEN: token({ role: 'replica' }) };
-  const run = (...args) => spawnSync(process.execPath, [BIN, ...args], { env: replEnv, encoding: 'utf8' });
-  const rep = run('replicate', '--root', dirs[0], '--replica-url', rUrl);
-  assert.equal(rep.status, 0, rep.stderr);
-  assert.equal(JSON.parse(rep.stdout).replicatedSeq, 1);
-  assert.equal(run('compare', '--root', dirs[0], '--replica-url', rUrl, '--deep').status, 0);
-
+  const adminEnv = { ...env, LANE_STORE_ADMIN_TOKEN: token({ role: 'admin' }) };
+  const run = (...args) => spawnSync(process.execPath, [BIN, ...args], { env: adminEnv, encoding: 'utf8' });
+  assert.equal(run('compare', '--url', pUrl, '--deep').status, 0);
   fs.rmSync(path.join(dirs[1], 'blobs'), { recursive: true });
-  const cmp = run('compare', '--root', dirs[0], '--replica-url', rUrl);
+  const cmp = run('compare', '--url', pUrl);
   assert.equal(cmp.status, 2);
   assert.equal(JSON.parse(cmp.stdout).missingAtReplica.length, 1);
 
-  const wild = spawnSync(process.execPath, [BIN, 'serve', '--root', dirs[0], '--listen', '0.0.0.0:0'], { env, encoding: 'utf8' });
+  const locked = run('rebuild-watermark', '--root', dirs[0], '--seq', '0');
+  assert.notEqual(locked.status, 0);
+  assert.match(locked.stderr, /in use/);
+
+  const wild = spawnSync(process.execPath, [BIN, 'serve', '--root', fs.mkdtempSync(path.join(os.tmpdir(), 'ls-w-')), '--listen', '0.0.0.0:0'], { env, encoding: 'utf8' });
   assert.notEqual(wild.status, 0);
   assert.match(wild.stderr, /wildcard/);
 });

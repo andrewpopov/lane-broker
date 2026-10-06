@@ -13,6 +13,7 @@ export function renderMetrics(store, now = Date.now()) {
     ['lane_store_replicated_seq', 'Journal seq up to which every record is verified at the replica.', mark.replicatedSeq],
     ['lane_store_journal_head_seq', 'Highest committed journal seq.', store.journal.seq],
     ['lane_store_replication_failed_rounds', 'Consecutive failed replication rounds.', mark.failedRounds],
+    ['lane_store_lost_objects', 'Journaled objects missing from disk with no delete intent (never tombstoned; operator recovery).', store.lost.size],
     ['lane_store_bytes', 'Bytes held in blobs/ and manifests/.', store.bytes],
   ];
   return `${lines.map(([name, help, v]) => `# HELP ${name} ${help}\n# TYPE ${name} gauge\n${name} ${v}`).join('\n')}\n`;

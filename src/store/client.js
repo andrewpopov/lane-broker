@@ -124,6 +124,10 @@ export class StoreClient {
     return (await this.json('GET', `/list${deep ? '?deep=1' : ''}`)).objects;
   }
 
+  compare({ deep = false, repair = false } = {}) {
+    return this.json('POST', `/admin/compare?deep=${deep ? 1 : 0}&repair=${repair ? 1 : 0}`);
+  }
+
   rejournal(paths) {
     return this.json('POST', '/admin/rejournal', { body: JSON.stringify({ paths }) });
   }
