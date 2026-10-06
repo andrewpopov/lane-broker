@@ -137,21 +137,26 @@ CPU core per weight unit and `defaultMemoryBytesPerWeight` bytes per weight
 unit. Set `schedulerMode` to `"shadow"` to log resource decisions without
 enforcing them.
 
-`preemptibleNiceMin` (default `1`, integer `0`-`19`; `0` disables) and
-`preemptibleShare` (default `0.8`, `0`-`1`): CPU spent by processes at `nice >=
-preemptibleNiceMin` is *preemptible*, because the kernel runs a nice-0 lane
-ahead of it, so it should not stop a lane from starting. Admission (the CPU
-gate's busy percent, `externalBusy`, and the projected-over-budget check) uses
-`hostBusy - preemptibleShare * preemptibleBusy`. The share is a safety floor:
-at 0.8, one fifth of niced load still counts as busy, so a truly saturated
-host is never read as empty. Normal-priority external load counts in full.
-Linux reads the `nice` column of `/proc/stat` (via `os.cpus()`); macOS has no
-such counter, so it sums the `%CPU` of processes at that nice level from a
-`ps` read. Lanes are themselves niced (`laneNice`), so their own observed CPU
-is removed from the preemptible figure before discounting, never discounted
-twice; when lanes are not niced this under-credits, the safe direction.
-`lane status` shows `host CPU: <busy> busy cores, <n> preemptible (niced)` from
-the last sample, and the admission log line carries `preemptibleBusy=` beside
+`preemptibleNiceMin` (default `1`; `0` disables) and `preemptibleShare`
+(default `0.8`, `0`-`1`): CPU spent by *lower-priority* processes does not stop
+a lane from starting, because the kernel runs the lane ahead of them. A
+process is preemptible only when its nice is STRICTLY GREATER than the nice the
+candidate lane will run at (its ticket's `nice`, else this host's `laneNice`)
+and at least `preemptibleNiceMin`; equal-nice load is a peer and counts in
+full. Each is measured by identity over the same window as the host busy
+sample: the sampler diffs every process's cumulative CPU time (Linux
+`/proc/<pid>/stat` utime+stime, macOS `ps time=`) against the previous reading
+keyed by pid plus start time, kept in the `cpu-sample.json` sidecar. A process
+with no previous reading, or a reused pid, contributes 0. Processes in a held
+lease's tree (process group, descendants, the BRAIN-419 recorded set) are never
+preemptible whatever their nice; if a held lease's tree is not known yet or the
+process table is unreadable, nothing is preemptible (fail closed). Admission
+(the CPU gate's busy percent, `externalBusy`, and the projected-over-budget
+check) uses `hostBusy - preemptibleShare * preemptibleBusy`, clamped to the
+busy figure; the share is a safety floor, so at 0.8 a fifth of lower-priority
+load still counts and a truly saturated host is never read as empty.
+`lane status` shows `host CPU: <busy> busy cores, <n> preemptible` from the
+last sample, and the admission log line carries `preemptibleBusy=` beside
 `hostBusyCores=` and `externalBusy=`. `LANE_BROKER_CPU_BUSY_FILE` accepts an
 optional third field, `hostBusy,cores,preemptibleBusy`.
 

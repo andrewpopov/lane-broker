@@ -3,6 +3,7 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { paths, atomicWriteJson, readJsonSafe } from './state.js';
 import { detectResourceCapacity } from './resources.js';
+import { readProcCpuRows, procSnapshot, preemptibleCores } from './preemptible.js';
 
 /**
  * Test-only override, the CPU-gate equivalent of load.js's readLoadAvg /
@@ -37,8 +38,8 @@ function cpuTimes(cpu) {
   // computeBusyCores below rejects any non-finite entry before using it, so
   // this never fabricates a number, it just can't produce a real one.
   const t = cpu && cpu.times;
-  if (!t) return { idle: NaN, total: NaN, nice: NaN };
-  return { idle: t.idle, total: t.user + t.nice + t.sys + t.idle + t.irq, nice: t.nice };
+  if (!t) return { idle: NaN, total: NaN };
+  return { idle: t.idle, total: t.user + t.nice + t.sys + t.idle + t.irq };
 }
 
 // A delta averaged over more than this masks a real, live spike (or a dip)
@@ -83,7 +84,6 @@ export function computeBusyCores(prev, snapshot) {
     return { hostBusyCores: null, stale: true };
   }
   let busySum = 0;
-  let niceSum = 0;
   let sawDelta = false;
   for (let i = 0; i < snapshot.cpus.length; i += 1) {
     const p = prev.cpus[i];
@@ -96,14 +96,9 @@ export function computeBusyCores(prev, snapshot) {
     if (totalDelta <= 0) continue; // clock skew, or no progress since the last sample
     sawDelta = true;
     busySum += (totalDelta - idleDelta) / totalDelta;
-    // BRAIN-428: the kernel's `nice` column (Linux /proc/stat) is time spent by nice > 0 processes,
-    // already inside `total - idle`. A snapshot without it (a bare fixture, an older sidecar)
-    // contributes 0 -- never a fabricated figure.
-    const niceDelta = s.nice - p.nice;
-    if (Number.isFinite(niceDelta) && niceDelta > 0) niceSum += Math.min(niceDelta, totalDelta - idleDelta) / totalDelta;
   }
   if (!sawDelta) return { hostBusyCores: null, stale: true };
-  return { hostBusyCores: busySum, preemptibleBusyCores: niceSum, stale: false };
+  return { hostBusyCores: busySum, stale: false };
 }
 
 /**
@@ -145,35 +140,26 @@ function countersUnchanged(prev, snapshot) {
 }
 
 /**
- * BRAIN-428: cores the host spends on processes at nice >= niceMin, from one `ps` read. macOS has no
- * separate system counter for niced time, so this sums those processes' observed %CPU. Null (never a
- * fabricated zero, never a throw) when the probe fails.
+ * `preemptible` (BRAIN-428, src/preemptible.js): `{ laneNice, niceMin, heldLeases }`, absent = nothing preemptible.
+ * The per-process readings ride in the same sidecar as the host counters, so both deltas cover the SAME window.
  */
-export function observePreemptibleCores(niceMin, exec = execFileSync) {
-  try {
-    const out = exec('ps', ['-A', '-o', 'pid=,ppid=,pgid=,pcpu=,rss=,nice='], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      timeout: 2000,
-    });
-    return preemptibleCoresFromRows(parseProcessTable(out), niceMin);
-  } catch {
-    return null;
-  }
-}
-
-export function preemptibleCoresFromRows(rows, niceMin) {
-  return rows.reduce((sum, r) => (r.nice >= niceMin ? sum + Math.max(0, r.pcpu) / 100 : sum), 0);
-}
-
-export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0, preemptibleNiceMin = 1, platform = process.platform, exec = execFileSync } = {}) {
+export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0, preemptible = null, readProcs = readProcCpuRows } = {}) {
   const override = readCpuBusyOverride();
   if (override) return override;
   const file = paths(root).cpuSample;
   const prev = readJsonSafe(file);
   const now = Date.now();
   const snapshot = { at: now, cpus: cpus.map(cpuTimes) };
-  const { hostBusyCores, stale, preemptibleBusyCores: niceColumnCores } = computeBusyCores(prev, snapshot);
+  const { hostBusyCores, stale } = computeBusyCores(prev, snapshot);
+  let procRows = null;
+  if (preemptible && preemptible.niceMin > 0) {
+    try {
+      procRows = readProcs();
+    } catch {
+      procRows = null; // unreadable table: nothing is counted as preemptible
+    }
+    snapshot.procs = procSnapshot(procRows);
+  }
   const capacity = detectResourceCapacity({ parallelism: cpus.length });
   const measured = Number.isFinite(hostBusyCores) ? Math.min(hostBusyCores, capacity.cpuCores) : hostBusyCores;
   // BRAIN-346: the head and a backfill candidate now sample back to back, and os.cpus() counters
@@ -186,10 +172,8 @@ export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0, preem
   // about to become the persisted baseline, and carrying the old measurement over it would let a
   // repeat of the same bad counters match `countersUnchanged` and reuse a pre-fault figure.
   const unchanged = stale && countersUnchanged(prev, snapshot);
-  // BRAIN-428: preemptible = niced load. Linux: the /proc/stat nice-column delta. macOS: per-process nice from ps.
-  // Disabled (preemptibleNiceMin 0) or unmeasurable reads as 0 -- niced load then counts as ordinary busy.
-  const preemptibleRaw = !(preemptibleNiceMin > 0) || stale ? 0 : platform === 'darwin' ? observePreemptibleCores(preemptibleNiceMin, exec) : niceColumnCores;
-  const preemptibleBusyCores = Number.isFinite(measured) ? Math.min(Number.isFinite(preemptibleRaw) ? preemptibleRaw : 0, measured) : 0;
+  const preemptibleRaw = !stale && preemptible ? preemptibleCores({ rows: procRows, prevProcs: prev?.procs, windowMs: now - prev.at, ...preemptible }) : 0;
+  const preemptibleBusyCores = Number.isFinite(measured) ? Math.min(preemptibleRaw, measured) : 0;
   const lastValid = !stale && Number.isFinite(measured) ? { hostBusyCores: measured, preemptibleBusyCores, cores: capacity.cpuCores, at: now } : unchanged ? prev.lastValid : undefined;
   if (lastValid) snapshot.lastValid = lastValid;
   try {
@@ -254,14 +238,14 @@ export function readMemoryInfo(exec = execFileSync) {
   return { availableBytes, totalBytes: capacity.memoryBytes, macPressure, source: capacity.source };
 }
 
-/** Parse `ps -A -o pid=,ppid=,pgid=,pcpu=,rss=[,nice=]` text into rows; unparseable lines are dropped. `nice` is only present when the column is. */
+/** Parse `ps -A -o pid=,ppid=,pgid=,pcpu=,rss=` text into rows; unparseable lines are dropped. */
 export function parseProcessTable(text) {
   const rows = [];
   for (const line of String(text ?? '').split('\n')) {
     const f = line.trim().split(/\s+/).map(Number);
-    if ((f.length !== 5 && f.length !== 6) || !f.every(Number.isFinite)) continue;
-    const [pid, ppid, pgid, pcpu, rss, nice] = f;
-    rows.push(nice === undefined ? { pid, ppid, pgid, pcpu, rss } : { pid, ppid, pgid, pcpu, rss, nice });
+    if (f.length !== 5 || !f.every(Number.isFinite)) continue;
+    const [pid, ppid, pgid, pcpu, rss] = f;
+    rows.push({ pid, ppid, pgid, pcpu, rss });
   }
   return rows;
 }

@@ -364,7 +364,7 @@ export function renderStatusText(status) {
         `${fmtMB(status.resources.availableMemoryBytes)} currently available (${status.resources.source}, ${status.resources.mode})`,
     );
     if (status.resources.hostBusyCores != null) {
-      lines.push(`host CPU: ${status.resources.hostBusyCores.toFixed(2)} busy cores, ${(status.resources.preemptibleBusyCores ?? 0).toFixed(2)} preemptible (niced)`);
+      lines.push(`host CPU: ${status.resources.hostBusyCores.toFixed(2)} busy cores, ${(status.resources.preemptibleBusyCores ?? 0).toFixed(2)} preemptible`);
     }
   }
   const informationalSuffix = status.loadGate.admission ? '' : ' [informational]';
