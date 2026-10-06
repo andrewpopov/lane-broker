@@ -46,7 +46,7 @@ const fixtureBase = (() => {
 const POSTINSTALLS = {
   outside: "require('fs').writeFileSync('generated-by-postinstall.txt', process.cwd())",
   embed: "require('fs').writeFileSync('node_modules/hello-tool/where.txt', process.cwd())",
-  'embed-big': "require('fs').writeFileSync('node_modules/hello-tool/native.bin', Buffer.concat([Buffer.alloc(3 * 1024 * 1024, 65), Buffer.from(process.cwd())]))",
+  'embed-big': "require('fs').writeFileSync('node_modules/hello-tool/native.bin', Buffer.concat([Buffer.alloc(3 * 1024 * 1024, 65), Buffer.from([0]), Buffer.from(process.cwd())]))",
   'drop-installed-record': "const f = 'node_modules/.package-lock.json'; const l = JSON.parse(require('fs').readFileSync(f, 'utf8')); delete l.packages['node_modules/hello-tool']; require('fs').writeFileSync(f, JSON.stringify(l))",
   harmless: "process.exit(0)",
   'hook-file': "require('fs').mkdirSync('.git/hooks', { recursive: true }); require('fs').writeFileSync('.git/hooks/pre-commit', '#!/bin/sh\\n')",
@@ -267,28 +267,47 @@ test('two real runs missing on the same key at once both succeed and leave one i
 });
 
 
-test('an install that embeds its own absolute path under node_modules is not cached, and the run still succeeds', async () => {
+test('an install that embeds its own absolute path in a text file is cached, and the next run (another work dir) gets it rewritten', async () => {
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(repoFiles({ postinstall: 'embed' }));
 
   const first = await runLane(s, repoDir);
   assert.equal(first.code, 0, first.stderr);
-  assert.equal(first.row.depsCache, 'skip');
-  assert.match(first.stderr, /deps-cache skip key=[0-9a-f]{12} dir=\. ms=\d+ reason=absolute-install-path file=hello-tool\/where\.txt/);
-  assert.equal(first.probe.out, 'hello from the bin');
-  assert.equal(s.storedKeys().length, 0);
+  assert.equal(first.row.depsCache, 'miss');
+  assert.match(first.stderr, /deps-cache miss key=[0-9a-f]{12} dir=\. ms=\d+ published=yes/);
+  assert.equal(s.storedKeys().length, 1);
+  const recorded = JSON.parse(fs.readFileSync(path.join(s.storeDir, s.storedKeys()[0], 'meta.json'), 'utf8')).relocation;
+  assert.deepEqual(recorded.entries, [{ relPath: 'hello-tool/where.txt', kind: 'text' }]);
 
   const second = await runLane(s, repoDir);
-  assert.equal(second.row.depsCache, 'skip');
-  assert.equal(s.npmCiCalls(), 2, 'never a hit: the baked-in path would be wrong in the next work dir');
+  assert.equal(second.row.depsCache, 'hit');
+  assert.equal(s.npmCiCalls(), 1, 'a hit runs no npm ci');
+  assert.equal(second.probe.out, 'hello from the bin');
 });
 
-test('a large file (over any size cap) that embeds the install path is not cached', async () => {
+test('a hit whose relocation cannot be verified is discarded and installed normally, with the reason logged', async () => {
+  const s = setupWithNpmSpy();
+  const repoDir = makeGitWorktree(repoFiles({ postinstall: 'embed' }));
+  await runLane(s, repoDir);
+  const meta = path.join(s.storeDir, s.storedKeys()[0], 'meta.json');
+  const record = JSON.parse(fs.readFileSync(meta, 'utf8'));
+  record.relocation.entries.push({ relPath: 'hello-tool/package.json', kind: 'text' }); // names no install path
+  fs.chmodSync(meta, 0o644);
+  fs.writeFileSync(meta, JSON.stringify(record));
+
+  const second = await runLane(s, repoDir);
+  assert.equal(second.code, 0, second.stderr);
+  assert.match(second.stderr, /deps-cache materialize failed, installing instead: relocation: hello-tool\/package\.json holds no placeholder/);
+  assert.equal(s.npmCiCalls(), 2, 'it installed');
+  assert.equal(second.probe.out, 'hello from the bin');
+});
+
+test('a binary file that embeds the install path keeps the tree out of the cache', async () => {
   const s = setupWithNpmSpy();
   const first = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'embed-big' })));
   assert.equal(first.code, 0, first.stderr);
   assert.equal(first.row.depsCache, 'skip');
-  assert.match(first.stderr, /reason=absolute-install-path file=hello-tool\/native\.bin/);
+  assert.match(first.stderr, /reason=absolute-install-path-binary file=hello-tool\/native\.bin/);
   assert.equal(s.storedKeys().length, 0);
 });
 
@@ -400,13 +419,14 @@ test('a variable an .npmrc reads from a scrubbed name (LANE_OMIT) never reaches 
   assert.equal(s.storedKeys().length, 1);
 });
 
-test('the per-run TMPDIR path is part of the relocatability scan', async () => {
+test('the per-run TMPDIR path is recorded for relocation too', async () => {
   const s = setupWithNpmSpy();
   const run = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'embed-tmpdir' })));
   assert.equal(run.code, 0, run.stderr);
-  assert.equal(run.row.depsCache, 'skip');
-  assert.match(run.stderr, /reason=absolute-install-path file=hello-tool\/tmp\.txt/);
-  assert.equal(s.storedKeys().length, 0);
+  assert.equal(run.row.depsCache, 'miss');
+  const recorded = JSON.parse(fs.readFileSync(path.join(s.storeDir, s.storedKeys()[0], 'meta.json'), 'utf8')).relocation;
+  assert.deepEqual(recorded.entries, [{ relPath: 'hello-tool/tmp.txt', kind: 'text' }]);
+  assert.deepEqual(recorded.prefixes.map((p) => p.roles), [['TMPDIR', 'TMP', 'TEMP']]);
 });
 
 test('SSH_AUTH_SOCK reaches the install (a git+ssh dependency needs it) but is not part of the key', async () => {

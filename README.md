@@ -480,7 +480,18 @@ reason.
 - **Hit**: the stored tree is COPIED into the work dir (a reflink where the
   filesystem has them), as private writable files, so nothing a lane does to
   its tree can reach the store. The store itself is read-only. The copy is
-  slower than a hardlink farm and is the price of that isolation. `npm ci`
+  slower than a hardlink farm and is the price of that isolation. Recorded
+  install paths are then substituted: the stored copy of each recorded
+  file holds placeholder tokens (`@@LANE_PREFIX_<roles>_<nonce>@@`, the
+  nonce per entry in `meta.json`) where the install path was, and a restore
+  replaces each token, as exact bytes, with the new path of its role (via a
+  temp file renamed over the original with its mode kept; symlinks
+  re-created with the substituted target). It then verifies that no
+  recorded entry holds a token of that nonce, and that each held one. Roles
+  that shared a path at store time must still map to one path (else
+  `relocation: ambiguous roles`), and every recorded role must exist. A
+  failure discards the tree and installs normally, logging
+  `deps-cache materialize failed, installing instead: relocation: ...`. `npm ci`
   is skipped, so the allowlisted root scripts (whose effect is on the work
   dir's `.git/config`, not on `node_modules`) are REPLAYED, in npm's order,
   by calling npm's own `@npmcli/run-script` the way `lib/commands/ci.js`
@@ -501,9 +512,24 @@ reason.
   - npm's own record (`node_modules/.package-lock.json`) lacks a lock entry
     that applies to this platform (`os`, `cpu`, `libc`), as when npm skips an
     optional dependency: `reason=incomplete-optional missing=<names>`;
-  - any installed file or symlink target contains the absolute work-dir path
-    (every file is scanned, large ones in chunks): the tree would only work
-    where it was installed. `reason=absolute-install-path file=<rel>`.
+  - a file names an install path (the work dir, its real path or a per-run
+    temp dir) and is not rewritable text: it has a NUL byte, is not valid
+    UTF-8, or its extension is not one of `.js .cjs .mjs .ts .json .map
+    .prisma .txt .md .sh .yml .yaml` (or a `#!` script under `.bin/`):
+    `reason=absolute-install-path-binary file=<rel>`;
+  - an occurrence of an install path is not followed by a path terminator
+    (a slash, a quote, a backtick, `) ] } , ; : = \`, whitespace, or the end), or is glued to a
+    longer name before it: `reason=absolute-install-path-ambiguous
+    file=<rel>`. Nothing is guessed.
+
+  Every other tree that names an install path in text files or symlinks is
+  published anyway (conda-style relocation, what Prisma's generated client
+  needs): the decision is made once, here, against the original tree. Each
+  occurrence in the stored copy becomes a placeholder token, and the places
+  are recorded in `meta.json` (`relocation`: `nonce`, `prefixes` as
+  `{ roles, path }` with roles sharing a path in one group, `entries` as
+  `{ relPath, kind: text | symlink }`). Every file is scanned, large ones in
+  chunks; a fresh nonce is drawn if the tree already holds the token text.
 
   The run still uses its own tree in every case, and the log says why.
 - **Leases and eviction**: least recently used first, whenever a publish or a
