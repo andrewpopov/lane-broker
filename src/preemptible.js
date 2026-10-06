@@ -13,7 +13,7 @@ import { DescendantTracker, procUnits, leaseMarker, parseCommandMap, envSuffix }
 
 const GONE = new Set(['ENOENT', 'ESRCH']);
 
-/** Linux /proc/<pid>/stat -> { pid, ppid, pgid, nice, cpuSec, token }. comm may hold spaces/parens: split after the last ')'. */
+/** Linux /proc/<pid>/stat -> { pid, ppid, pgid, nice, cpuSec, childCpuSec, token } (childCpuSec: reaped children's CPU, cutime+cstime). comm may hold spaces/parens: split after the last ')'. */
 export function parseProcCpuStat(pid, text, clkTck) {
   const close = text.lastIndexOf(')');
   if (close < 0) return null;
@@ -21,10 +21,11 @@ export function parseProcCpuStat(pid, text, clkTck) {
   const ppid = Number(f[1]);
   const pgid = Number(f[2]);
   const cpuSec = (Number(f[11]) + Number(f[12])) / clkTck; // utime + stime (fields 14/15)
+  const childCpuSec = (Number(f[13]) + Number(f[14])) / clkTck; // cutime + cstime (fields 16/17)
   const nice = Number(f[16]); // field 19
   const token = f[19]; // field 22, starttime in ticks -- the same token descendants.js records
-  if (![ppid, pgid, cpuSec, nice].every(Number.isFinite) || !token) return null;
-  return { pid, ppid, pgid, nice, cpuSec, token };
+  if (![ppid, pgid, cpuSec, childCpuSec, nice].every(Number.isFinite) || !token) return null;
+  return { pid, ppid, pgid, nice, cpuSec, childCpuSec, token };
 }
 
 /** macOS `ps` cumulative CPU time: [[dd-]hh:]mm:ss[.cc] -> seconds, or null. */

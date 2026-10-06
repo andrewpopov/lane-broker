@@ -202,7 +202,7 @@ test('no minCpuCores: the status entry has no elastic fields (BRAIN-361 adds boo
   try {
     writeLease(state, heldLease('l', 'r:l', { resources: { cpuCores: 4, memoryBytes: GIB }, childPgid: process.pid, startedAt: Date.now() }));
     const entry = (await collectStatus()).running.find((r) => r.id === 'l');
-    assert.deepEqual(Object.keys(entry), ['id', 'key', 'state', 'pid', 'elapsedMs', 'heartbeatAgeMs', 'logAgeMs', 'log', 'weight', 'maxConcurrent', 'resources', 'observedCpuCores', 'bookedCpuCores', 'overrun', 'observedMemoryBytes']);
+    assert.deepEqual(Object.keys(entry), ['id', 'key', 'state', 'pid', 'elapsedMs', 'heartbeatAgeMs', 'logAgeMs', 'log', 'weight', 'maxConcurrent', 'resources', 'observedCpuCores', 'bookedCpuCores', 'overrun', 'observedMemoryBytes', 'noProgressSinceMs']); // BRAIN-431 stall signal, always present
     assert.doesNotMatch(renderStatusText(await collectStatus()), /elastic/);
   } finally {
     if (prev === undefined) delete process.env.LANE_BROKER_STATE;

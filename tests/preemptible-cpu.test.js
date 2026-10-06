@@ -157,7 +157,8 @@ test('preemptibleNiceMin 0 disables the feature', (t) => {
 test('Linux parser: nice, CPU ticks and start token come from /proc/<pid>/stat, comm may hold parens and spaces', () => {
   const line = (utime, stime, nice) => `4242 (we ird) name) S 1 4242 4242 0 -1 4194560 10 0 0 0 ${utime} ${stime} 0 0 30 ${nice} 1 0 98765 1000 100`;
   const a = parseProcCpuStat(4242, line(300, 100, 10), 100);
-  assert.deepEqual(a, { pid: 4242, ppid: 1, pgid: 4242, nice: 10, cpuSec: 4, token: '98765' });
+  assert.deepEqual(a, { pid: 4242, ppid: 1, pgid: 4242, nice: 10, cpuSec: 4, childCpuSec: 0, token: '98765' });
+  assert.equal(parseProcCpuStat(4242, `4242 (x) S 1 4242 4242 0 -1 0 0 0 0 0 1 1 250 50 30 10 1 0 98765 1 1`, 100).childCpuSec, 3, 'reaped children (cutime + cstime) are parsed');
   assert.equal(parseProcCpuStat(4242, line(300, 100, 10), 100).cpuSec - a.cpuSec, 0, 'an idle process has a zero interval delta');
   assert.equal(parseProcCpuStat(1, 'garbage', 100), null);
 });

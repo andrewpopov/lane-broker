@@ -116,7 +116,8 @@ never told to forward to it — both still get the `--log` file.
   "resourceSkipLimit": 3,
   "resourceIdleOvershootCores": 1,
   "admissionLoadGate": false,
-  "laneNice": 10
+  "laneNice": 10,
+  "noProgressTimeoutMs": 0
 }
 ```
 
@@ -1250,7 +1251,41 @@ factor is 1.0 (no calibration) and is printed.
 | `64` | Nested `lane run` would widen the inherited lease — refused; or an invalid `--priority` / `LANE_BROKER_PRIORITY` / lane `priority`. |
 | `69` | Local-sim lane refused (fleet-offload message); use `--allow-local-sim`. |
 | `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. Also `lane run` / `remote-exec` refused with "scheduler migration in progress" while `lane migrate-scheduler` runs, or "scheduler migration pending (draining)" while `--when-idle` waits. |
+| `124` | Killed by the no-progress watchdog (`reason: "no-progress"`, see below). |
 | `130` | Cancelled (SIGINT/SIGTERM) while still queued, before the lane ever started. |
+
+### No-progress watchdog (BRAIN-431)
+
+A run that hangs holds its slot indefinitely (a vitest pool that stopped mid-run once sat silent for 100 minutes and
+blocked a push). Every supervisor heartbeat observes the lease's tree, and an interval is **idle** when the command wrote
+no output (stdout + stderr), no process joined or left the tree, and the tree's CPU delta stayed under 0.05 CPU-seconds
+per minute (scaled to the interval). CPU is the per-process cumulative-time delta by identity (on Linux including reaped
+children's `cutime`/`cstime`), not `ps` pcpu, a lifetime average that stays high long after a process goes idle. Anything
+else is progress and restarts the streak, and so is anything the supervisor could not observe (a failed descendant scan,
+an unreadable process table, a member with no row); the first observation only sets the baseline. Timing is monotonic.
+
+**The stall is always recorded; the kill is opt-in.** The idle streak is stamped on the lease as `noProgressSinceMs`
+(`lane status` shows `no-progress=<t>` from a minute on, `--json` carries the field), and the history row records the
+longest streak as `maxNoProgressMs`, for every lane, so monitoring can alert on a stall without anything being killed.
+The kill is off by default (global `noProgressTimeoutMs: 0`) because legitimate work can look idle to a process-tree
+observer: slow network I/O, a daemon-backed `docker` build whose CPU lives outside the tree, output buffered until the end,
+work written only to other files. Opt a lane in by setting `noProgressTimeoutMs` in `.lane-broker.json`; the right lanes
+are test or verify lanes whose output streams (a vitest/jest run, a `verify` script), with a timeout well above their
+longest legitimate quiet stretch. Do not opt in a lane that builds images, downloads, or buffers its output.
+
+| Setting | Where | Default | Meaning |
+|---|---|---|---|
+| `noProgressTimeoutMs` | global `config.json` | `0` | Consecutive idle time that triggers the kill; `0` never kills (the stall is still recorded). |
+| `noProgressTimeoutMs` | a lane in `.lane-broker.json` | the global value | Per-lane value (an undeclared lane inherits its `as` template's); `0` disables for the lane. |
+
+On trigger the tree is reaped as for a cancel (TERM, grace, KILL, descendants) through the one reap a cancel or leader
+exit also uses (a cancel arriving mid-reap starts no second one and its `exit: 130` result wins). The result and history
+row carry `exit: 124`, `reason: "no-progress"` and `noProgressTimeoutMs`, and the admission log gets
+`lane-broker-reap id=<id> descendants-reaped=<n> reason=no-progress`. The submitter sees `lane run: no progress for 15m
+(no output, no CPU) — killed` (also appended to the lease log). A remote run uses the **submitter's** resolved timeout
+(its lane, else its global value), sent to the runner in the dispatch header, so a runner's own config never changes it;
+the runner relays the reason and window back, and the submitter's history row is `executor: "remote"`, exit 124,
+`reason: "no-progress"`.
 
 ### Group reap on leader exit (ROG-2181 T1b)
 

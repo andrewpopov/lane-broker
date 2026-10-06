@@ -97,6 +97,10 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // niceing (spawns the bare command). A `.lane-broker.json` lane's own
   // `nice` overrides this per-lane.
   laneNice: 10,
+  // BRAIN-431: a run idle (no output, no CPU, no process churn) for this long is killed (exit 124, reason 'no-progress').
+  // 0 (the default) never kills: quiet work is legitimate, so the kill is opted into per lane (`noProgressTimeoutMs`).
+  // The stall is recorded either way.
+  noProgressTimeoutMs: 0,
   // BRAIN-379 (balancer P2, slice 2): record, in admission-decisions.log and `lane status`, what
   // class-aware test/sim allocation WOULD decide. Never changes a live admission decision.
   allocationShadow: false,
@@ -227,6 +231,7 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isInteger(cfg.laneNice) && cfg.laneNice >= 0 && cfg.laneNice <= 19,
     `${sourcePath}: "laneNice" must be an integer in [0, 19]`,
   );
+  assert(Number.isInteger(cfg.noProgressTimeoutMs) && cfg.noProgressTimeoutMs >= 0, `${sourcePath}: "noProgressTimeoutMs" must be a non-negative integer`);
   // BRAIN-320 S1a: how long a remote ticket may sit queued on the runner
   // before it is cancelled and treated as unconfirmed (fallback to local).
   // Absent by default (not read yet -- that is a later slice) so a config
@@ -417,6 +422,12 @@ function validateRepoConfig(cfg, sourcePath) {
       assert(
         Number.isInteger(lane.nice) && lane.nice >= 0 && lane.nice <= 19,
         `${sourcePath}: lane "${name}".nice must be an integer in [0, 19]`,
+      );
+    }
+    if (lane.noProgressTimeoutMs !== undefined) {
+      assert(
+        Number.isInteger(lane.noProgressTimeoutMs) && lane.noProgressTimeoutMs >= 0,
+        `${sourcePath}: lane "${name}".noProgressTimeoutMs must be a non-negative integer (0 disables)`,
       );
     }
     if (lane.class !== undefined) {
@@ -755,7 +766,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   if (isDeclaredLane) {
     laneCfg = repoConfig.lanes[laneName];
   } else if (undeclaredTemplateName) {
-    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteArtifacts/remoteArtifactsOn/class/priority/aging
+    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/noProgressTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteArtifacts/remoteArtifactsOn/class/priority/aging
     // from the named declared lane, keeping this lane's OWN key/name. Not
     // inherited: `localRefused` (stays default false), the template's named
     // conflicts (only the `*` wildcard universe below reaches this lane, same
@@ -768,6 +779,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       minCpuCores: templateCfg.minCpuCores,
       memoryBytes: templateCfg.memoryBytes,
       nice: templateCfg.nice,
+      noProgressTimeoutMs: templateCfg.noProgressTimeoutMs,
       remote: templateCfg.remote,
       remoteDeps: templateCfg.remoteDeps,
       remoteSetup: templateCfg.remoteSetup,
@@ -808,6 +820,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     // the caller (run.js) applies the global `laneNice` fallback, the same
     // "per-lane overrides global" shape as everything else in this file.
     nice: Number.isInteger(laneCfg.nice) ? laneCfg.nice : null,
+    // BRAIN-431: null falls through to the global `noProgressTimeoutMs`; 0 disables the watchdog for this lane.
+    noProgressTimeoutMs: Number.isInteger(laneCfg.noProgressTimeoutMs) ? laneCfg.noProgressTimeoutMs : null,
     // BRAIN-255: how many same-key holders may run at once. Defaulted HERE
     // (not left null for a caller fallback like `nice` above) because 1 is
     // the load-bearing compatibility default for every lane that predates

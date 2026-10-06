@@ -307,9 +307,9 @@ export function hasLiveMembers(tracker) {
   return rows === null ? true : tracker.live(rows).length > 0;
 }
 
-/** Log fragment for a reap result: `descendants-reaped=N`, plus `descendants-reap-incomplete survivors=…` when not complete. */
-export function reapLogLine(id, result) {
-  const base = `lane-broker-reap id=${id} descendants-reaped=${result.signalled}`;
+/** Log fragment for a reap result: `descendants-reaped=N` (then `reason=<why>` when the reap was not a cancel), plus `descendants-reap-incomplete survivors=…` when not complete. */
+export function reapLogLine(id, result, reason) {
+  const base = `lane-broker-reap id=${id} descendants-reaped=${result.signalled}${reason ? ` reason=${reason}` : ''}`;
   if (result.complete) return `${base}\n`;
   const survivors = result.survivors.length > 0 ? result.survivors.join(',') : 'unknown';
   return `${base}\nlane-broker-reap id=${id} descendants-reap-incomplete survivors=${survivors}\n`;
