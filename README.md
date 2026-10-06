@@ -480,7 +480,15 @@ reason.
 - **Hit**: the stored tree is COPIED into the work dir (a reflink where the
   filesystem has them), as private writable files, so nothing a lane does to
   its tree can reach the store. The store itself is read-only. The copy is
-  slower than a hardlink farm and is the price of that isolation. `npm ci`
+  slower than a hardlink farm and is the price of that isolation. Recorded
+  install paths are then rewritten to this run's (each role onto the same
+  role of the new run; byte-level, whole occurrences only, longest path
+  first, via a temp file renamed over the original with its mode kept;
+  symlinks re-created with the rewritten target), and verified: every
+  recorded entry must have named an old path and no longer do, and no
+  unrecorded file (the first 64 MiB read) may name one. A failure discards
+  the tree and installs normally, logging
+  `deps-cache materialize failed, installing instead: relocation: ...`. `npm ci`
   is skipped, so the allowlisted root scripts (whose effect is on the work
   dir's `.git/config`, not on `node_modules`) are REPLAYED, in npm's order,
   by calling npm's own `@npmcli/run-script` the way `lib/commands/ci.js`
@@ -501,9 +509,15 @@ reason.
   - npm's own record (`node_modules/.package-lock.json`) lacks a lock entry
     that applies to this platform (`os`, `cpu`, `libc`), as when npm skips an
     optional dependency: `reason=incomplete-optional missing=<names>`;
-  - any installed file or symlink target contains the absolute work-dir path
-    (every file is scanned, large ones in chunks): the tree would only work
-    where it was installed. `reason=absolute-install-path file=<rel>`.
+  - a regular file that names an install path (the work dir, its real path
+    or a per-run temp dir) has a NUL byte, so it cannot be safely rewritten
+    as bytes: `reason=absolute-install-path-binary file=<rel>`.
+
+  A tree whose TEXT files and symlinks name an install path is published
+  anyway, with the places recorded in `meta.json` (`relocation`:
+  `prefixes` as `{ role, path }` and `entries` as `{ relPath, kind: text |
+  symlink }`; every file is scanned, large ones in chunks), the way conda
+  relocates an install prefix. This is what Prisma's generated client needs.
 
   The run still uses its own tree in every case, and the log says why.
 - **Leases and eviction**: least recently used first, whenever a publish or a

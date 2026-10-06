@@ -15,11 +15,13 @@ import {
   currentSystem,
   snapshotOutsideNodeModules,
   snapshotChanges,
-  findInstallPathReference,
+  collectInstallPathReferences,
+  installPathRoles,
+  readRelocation,
+  relocateRestoredTree,
   scrubDepsEnv,
   allowlistedRootEvents,
   unexplainedChanges,
-  PER_RUN_PATH_ENV_NAMES,
 } from './deps-cache.js';
 
 /**
@@ -148,14 +150,16 @@ function readTextOrNull(file) {
 /** Leases and eviction serialize on the broker's own lock, the same one admission uses. */
 const brokerLock = (fn) => withLock(ensureStateDirs().root, fn);
 
-/** Hit: copy the stored tree into place. False (with the partial tree removed) means install instead. */
-async function materializeHit(depsCache, key, cwd, releaseLeases) {
+/** Hit: copy the stored tree into place and relocate it to this run's install paths. False (with the partial tree removed) means install instead. */
+async function materializeHit(depsCache, key, cwd, releaseLeases, { workDir, depsEnv }) {
   const tree = path.join(cwd, 'node_modules');
   if (!fs.existsSync(entryTree(depsCache.root, key))) return false;
   try {
     const release = await acquireLease(depsCache.root, key, depsCache.maxBytes, brokerLock);
     releaseLeases.push(release);
     materializeFromStore(depsCache.root, key, tree);
+    const newPaths = Object.fromEntries(installPathRoles(workDir, depsEnv).map((r) => [r.role, r.path]));
+    relocateRestoredTree(tree, readRelocation(depsCache.root, key), newPaths);
     touchLastUsed(depsCache.root, key);
     return true;
   } catch (err) {
@@ -243,8 +247,8 @@ async function replayRootScripts(cwd, scripts, depsEnv, npmConfig) {
 }
 
 /** Copy the freshly installed tree into the store, then trim the store to its bound under the broker lock. */
-async function publishAndEvict(depsCache, key, cwd, releaseLeases) {
-  const result = publishToStore(depsCache.root, key, path.join(cwd, 'node_modules'));
+async function publishAndEvict(depsCache, key, cwd, releaseLeases, relocation) {
+  const result = publishToStore(depsCache.root, key, path.join(cwd, 'node_modules'), relocation);
   if (!result.published) return result;
   touchLastUsed(depsCache.root, key);
   try {
@@ -295,7 +299,7 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
   }
   const { key } = keyed;
 
-  if (key && (await materializeHit(depsCache, key, cwd, releaseLeases))) {
+  if (key && (await materializeHit(depsCache, key, cwd, releaseLeases, { workDir, depsEnv }))) {
     if (await replayRootScripts(cwd, keyed.scripts, depsEnv, npmConfig)) return { exitCode: 0, record: done('hit', { key }) };
     process.stderr.write('deps-cache replay of the root scripts failed, installing instead\n');
     fs.rmSync(path.join(cwd, 'node_modules'), { recursive: true, force: true });
@@ -318,12 +322,10 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
   }
   const missing = missingInstalled(path.join(cwd, 'node_modules'), keyed.lock);
   if (missing) return { exitCode, record: done('skip', { key, reason: 'incomplete-optional', missing }) };
-  const runPaths = PER_RUN_PATH_ENV_NAMES.map((name) => depsEnv[name]).filter(Boolean);
-  const installPaths = [...new Set([workDir, fs.realpathSync(workDir), ...runPaths])];
-  const embedded = findInstallPathReference(path.join(cwd, 'node_modules'), installPaths);
-  if (embedded) return { exitCode, record: done('skip', { key, reason: 'absolute-install-path', file: embedded }) };
+  const references = collectInstallPathReferences(path.join(cwd, 'node_modules'), installPathRoles(workDir, depsEnv));
+  if (references.binary) return { exitCode, record: done('skip', { key, reason: 'absolute-install-path-binary', file: references.binary }) };
   try {
-    const result = await publishAndEvict(depsCache, key, cwd, releaseLeases);
+    const result = await publishAndEvict(depsCache, key, cwd, releaseLeases, references.relocation);
     return { exitCode, record: done('miss', { key, published: result.published, ...(result.published ? {} : { reason: 'another run published this key first' }) }) };
   } catch (err) {
     // the tree is installed and usable for this run whatever happened to the store

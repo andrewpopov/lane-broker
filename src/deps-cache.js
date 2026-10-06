@@ -11,7 +11,7 @@ import { isProcessAlive, processStartTime } from './process-liveness.js';
  * seen before gets a copy of an installed tree instead of running `npm ci`.
  *
  *   <cacheRoot>/<key>/node_modules   the tree, every file and dir read-only
- *   <cacheRoot>/<key>/meta.json      { bytes, createdAt }
+ *   <cacheRoot>/<key>/meta.json      { bytes, createdAt, relocation? } (relocation: see `collectInstallPathReferences`)
  *   <cacheRoot>/<key>/.last-used     mtime = last use, the LRU clock
  *   <cacheRoot>/<key>/leases/<id>    one file per live run holding the key
  *   <cacheRoot>/.tmp-*, .trash-*     unpublished / evicted trees awaiting removal
@@ -29,7 +29,7 @@ import { isProcessAlive, processStartTime } from './process-liveness.js';
 export const DEFAULT_DEPS_CACHE_MAX_BYTES = 10 * 1024 ** 3;
 
 /** Bumping this invalidates every existing entry. */
-const KEY_VERSION = 'v2';
+const KEY_VERSION = 'v3';
 
 /** npm reads npm-shrinkwrap.json in preference to package-lock.json. */
 const LOCKFILES = ['npm-shrinkwrap.json', 'package-lock.json'];
@@ -538,9 +538,10 @@ export function materializeFromStore(cacheRoot, key, destTree) {
 /**
  * Copy an installed tree into the store, read-only, and publish it atomically (build under `.tmp-*`,
  * then rename onto `<key>`). Returns `{ published: true, bytes }`, or `{ published: false }` when another
- * run published the same key first (that run's tree is equally valid; ours is discarded).
+ * run published the same key first (that run's tree is equally valid; ours is discarded). `relocation` is what
+ * `collectInstallPathReferences` found: recorded in `meta.json` so a restore can rewrite the install path.
  */
-export function publishToStore(cacheRoot, key, srcTree) {
+export function publishToStore(cacheRoot, key, srcTree, relocation = null) {
   fs.mkdirSync(cacheRoot, { recursive: true });
   const tmp = path.join(cacheRoot, `.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
   fs.mkdirSync(tmp);
@@ -552,7 +553,7 @@ export function publishToStore(cacheRoot, key, srcTree) {
       },
       dirMode: (mode) => mode & 0o7555,
     });
-    fs.writeFileSync(path.join(tmp, 'meta.json'), JSON.stringify({ bytes, createdAt: Date.now() }));
+    fs.writeFileSync(path.join(tmp, 'meta.json'), JSON.stringify({ bytes, createdAt: Date.now(), ...(relocation ? { relocation } : {}) }));
     fs.writeFileSync(path.join(tmp, '.last-used'), '');
     fs.mkdirSync(path.join(tmp, 'leases'));
     try {
@@ -719,14 +720,13 @@ export function purgeTrash(cacheRoot) {
   }
 }
 
-/** Does the file hold any of `needles`? Files over SCAN_CHUNK_BYTES are read in chunks overlapping by the longest needle. */
-function fileContains(file, needles) {
+/**
+ * Call `visit(window)` over `file` in windows of at most SCAN_CHUNK_BYTES plus `overlap` carried-over bytes, so
+ * a sequence of up to `overlap + 1` bytes straddling a chunk boundary is seen whole. `visit` returning true stops.
+ */
+function forEachWindow(file, overlap, visit) {
   const size = fs.statSync(file).size;
-  if (size <= SCAN_CHUNK_BYTES) {
-    const content = fs.readFileSync(file);
-    return needles.some((n) => content.includes(n));
-  }
-  const overlap = Math.max(...needles.map((n) => n.length)) - 1;
+  if (size <= SCAN_CHUNK_BYTES) return visit(fs.readFileSync(file));
   const buf = Buffer.alloc(SCAN_CHUNK_BYTES + overlap);
   const fd = fs.openSync(file, 'r');
   try {
@@ -735,7 +735,7 @@ function fileContains(file, needles) {
       const n = fs.readSync(fd, buf, carry, SCAN_CHUNK_BYTES, pos);
       if (n === 0) break;
       const window = buf.subarray(0, carry + n);
-      if (needles.some((needle) => window.includes(needle))) return true;
+      if (visit(window)) return true;
       carry = Math.min(overlap, window.length);
       window.copy(buf, 0, window.length - carry);
       pos += n;
@@ -744,6 +744,27 @@ function fileContains(file, needles) {
     fs.closeSync(fd);
   }
   return false;
+}
+
+const longest = (needles) => Math.max(...needles.map((n) => n.length)) - 1;
+
+/** Does the file hold any of `needles`? */
+function fileContains(file, needles) {
+  return forEachWindow(file, longest(needles), (window) => needles.some((n) => window.includes(n)));
+}
+
+/** Which of `needles` (by index) the file holds, and whether it has a NUL byte anywhere (so is not text). The whole file is read. */
+function fileNeedleHits(file, needles) {
+  const hits = new Set();
+  let binary = false;
+  forEachWindow(file, longest(needles), (window) => {
+    needles.forEach((n, i) => {
+      if (window.includes(n)) hits.add(i);
+    });
+    if (window.includes(0)) binary = true;
+    return false;
+  });
+  return { hits, binary };
 }
 
 /**
@@ -770,6 +791,177 @@ export function findInstallPathReference(tree, needles) {
     return null;
   };
   return walk(tree, '');
+}
+
+/**
+ * The places an install path can be named in a run: the work dir, its real path and each per-run temp dir, as
+ * `{ role, path }`. A restore maps each recorded role onto the same role of the NEW run.
+ */
+export function installPathRoles(workDir, env) {
+  return [
+    { role: 'workDir', path: workDir },
+    { role: 'realWorkDir', path: fs.realpathSync(workDir) },
+    ...PER_RUN_PATH_ENV_NAMES.filter((name) => env[name]).map((name) => ({ role: name, path: env[name] })),
+  ];
+}
+
+/**
+ * Every file or symlink under `tree` that names an install path in `roles` (see `installPathRoles`), so the tree
+ * can be relocated (as conda rewrites an install prefix) instead of refused. Returns
+ *   { binary: <rel path> }                        a regular file with a NUL byte names it: no safe byte rewrite, refuse the tree;
+ *   { relocation: { prefixes, entries } }         else: `prefixes` = [{ role, path }] actually found (the first role
+ *                                                 for a path two roles share), `entries` = [{ relPath, kind: 'text' | 'symlink' }].
+ */
+export function collectInstallPathReferences(tree, roles) {
+  const paths = [...new Set(roles.map((r) => r.path))];
+  const bufs = paths.map((p) => Buffer.from(p, 'utf8'));
+  const found = new Set();
+  const entries = [];
+  let binary = null;
+  const walk = (abs, rel) => {
+    for (const ent of fs.readdirSync(abs, { withFileTypes: true })) {
+      if (binary) return;
+      const p = path.join(abs, ent.name);
+      const r = rel ? `${rel}/${ent.name}` : ent.name;
+      if (ent.isDirectory()) {
+        walk(p, r);
+      } else if (ent.isSymbolicLink()) {
+        const target = Buffer.from(fs.readlinkSync(p), 'utf8');
+        const hits = bufs.map((b, i) => (target.includes(b) ? i : -1)).filter((i) => i >= 0);
+        if (hits.length > 0) {
+          hits.forEach((i) => found.add(i));
+          entries.push({ relPath: r, kind: 'symlink' });
+        }
+      } else if (ent.isFile()) {
+        const { hits, binary: isBinary } = fileNeedleHits(p, bufs);
+        if (hits.size === 0) continue;
+        if (isBinary) binary = r;
+        else {
+          hits.forEach((i) => found.add(i));
+          entries.push({ relPath: r, kind: 'text' });
+        }
+      }
+    }
+  };
+  walk(tree, '');
+  if (binary) return { binary };
+  const prefixes = [...found].sort((a, b) => a - b).map((i) => roles.find((r) => r.path === paths[i]));
+  return { relocation: { prefixes: prefixes.map(({ role, path: p }) => ({ role, path: p })), entries } };
+}
+
+/** The relocation record of a stored entry: empty when the tree names no install path. Throws on a malformed record. */
+export function readRelocation(cacheRoot, key) {
+  const meta = JSON.parse(fs.readFileSync(path.join(entryDir(cacheRoot, key), 'meta.json'), 'utf8'));
+  const rec = meta.relocation ?? { prefixes: [], entries: [] };
+  const okPrefix = (p) => p && typeof p.role === 'string' && typeof p.path === 'string' && p.path.length > 0;
+  const okEntry = (e) => e && typeof e.relPath === 'string' && (e.kind === 'text' || e.kind === 'symlink');
+  if (!Array.isArray(rec.prefixes) || !Array.isArray(rec.entries) || !rec.prefixes.every(okPrefix) || !rec.entries.every(okEntry)) {
+    throw new Error('relocation record is malformed');
+  }
+  return rec;
+}
+
+const isNameByte = (b) => (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5a) || (b >= 0x61 && b <= 0x7a) || b === 0x5f || b === 0x2d || b === 0x2e;
+
+/**
+ * Replace each whole occurrence of a `from` in `buf` by its `to`, as bytes, in one left-to-right pass (replaced
+ * text is never rescanned, so a `to` that extends its `from` cannot be replaced again) and longest `from` first
+ * where two start at the same byte. An occurrence is whole when it is not glued to a longer path name:
+ * `/a/work` is not `/a/work2` or `x/a/work`. (`whole: false` drops that test.)
+ */
+function replacePrefixes(buf, pairs, { whole = true } = {}) {
+  const ordered = [...pairs].sort((a, b) => b.from.length - a.from.length);
+  const parts = [];
+  let last = 0;
+  let at = 0;
+  while (at <= buf.length) {
+    let best = null;
+    let bestIdx = -1;
+    for (const pair of ordered) {
+      const idx = buf.indexOf(pair.from, at);
+      if (idx >= 0 && (bestIdx < 0 || idx < bestIdx)) {
+        best = pair;
+        bestIdx = idx;
+      }
+    }
+    if (!best) break;
+    const end = bestIdx + best.from.length;
+    const glued = whole && ((bestIdx > 0 && isNameByte(buf[bestIdx - 1])) || (end < buf.length && best.from[best.from.length - 1] !== 0x2f && isNameByte(buf[end])));
+    if (glued) {
+      at = bestIdx + 1;
+      continue;
+    }
+    parts.push(buf.subarray(last, bestIdx), best.to);
+    last = end;
+    at = end;
+  }
+  parts.push(buf.subarray(last));
+  return Buffer.concat(parts);
+}
+
+/** Bytes of unrecorded files `relocateRestoredTree` reads when checking that nothing else names the old path. */
+export const RELOCATE_VERIFY_BYTES = 64 * 1024 * 1024;
+
+/**
+ * Rewrite a restored tree so it names the NEW run's install paths where the stored one named the old ones.
+ * `entries` are rewritten as byte-level whole-occurrence replacement (a text file through a temp file renamed
+ * over it, mode kept; a symlink re-created with the rewritten target), then verified: no recorded entry still
+ * names an old path (not counting the new path, which may extend the old one), every recorded entry named one
+ * before, and no unrecorded file within RELOCATE_VERIFY_BYTES does. Throws on any failure; the caller discards the tree.
+ */
+export function relocateRestoredTree(tree, { prefixes, entries }, newPaths) {
+  const pairs = prefixes.map(({ role, path: old }) => {
+    if (!newPaths[role]) throw new Error(`relocation: no new path for ${role}`);
+    return { from: Buffer.from(old, 'utf8'), to: Buffer.from(newPaths[role], 'utf8') };
+  });
+  const moved = pairs.filter((p) => !p.from.equals(p.to));
+  if (moved.length === 0) return;
+  const named = (buf) => pairs.some((p) => buf.includes(p.from));
+  const stripNew = (buf) => replacePrefixes(buf, pairs.map((p) => ({ from: p.to, to: Buffer.alloc(0) })), { whole: false });
+  const stillOld = (buf) => moved.some((p) => stripNew(buf).includes(p.from));
+  const recorded = new Set(entries.map((e) => e.relPath));
+
+  for (const { relPath, kind } of entries) {
+    const file = path.join(tree, relPath);
+    if (kind === 'symlink') {
+      const target = Buffer.from(fs.readlinkSync(file), 'utf8');
+      if (!named(target)) throw new Error(`relocation: ${relPath} no longer names an install path`);
+      fs.rmSync(file);
+      fs.symlinkSync(replacePrefixes(target, pairs).toString('utf8'), file);
+    } else {
+      const content = fs.readFileSync(file);
+      if (!named(content)) throw new Error(`relocation: ${relPath} no longer names an install path`);
+      const tmp = `${file}.relocate-${crypto.randomBytes(4).toString('hex')}`;
+      fs.writeFileSync(tmp, replacePrefixes(content, pairs), { mode: fs.statSync(file).mode & 0o7777 });
+      fs.chmodSync(tmp, fs.statSync(file).mode & 0o7777);
+      fs.renameSync(tmp, file);
+    }
+  }
+
+  for (const { relPath, kind } of entries) {
+    const file = path.join(tree, relPath);
+    const content = kind === 'symlink' ? Buffer.from(fs.readlinkSync(file), 'utf8') : fs.readFileSync(file);
+    if (stillOld(content)) throw new Error(`relocation: ${relPath} still names the old install path`);
+  }
+
+  const bufs = moved.map((p) => p.from);
+  let budget = RELOCATE_VERIFY_BYTES;
+  const walk = (abs, rel) => {
+    for (const ent of fs.readdirSync(abs, { withFileTypes: true })) {
+      const p = path.join(abs, ent.name);
+      const r = rel ? `${rel}/${ent.name}` : ent.name;
+      if (ent.isDirectory()) walk(p, r);
+      else if (recorded.has(r)) continue;
+      else if (ent.isSymbolicLink()) {
+        const target = Buffer.from(fs.readlinkSync(p), 'utf8');
+        if (bufs.some((b) => target.includes(b))) throw new Error(`relocation: unrecorded ${r} names the old install path`);
+      } else if (ent.isFile() && budget > 0) {
+        budget -= fs.statSync(p).size;
+        if (fileContains(p, bufs)) throw new Error(`relocation: unrecorded ${r} names the old install path`);
+      }
+    }
+  };
+  walk(tree, '');
 }
 
 /**
