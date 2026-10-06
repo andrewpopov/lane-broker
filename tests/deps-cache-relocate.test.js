@@ -291,3 +291,45 @@ test('publish verifies the cached copy: a file that changed or appeared after co
     assert.deepEqual(fs.readdirSync(cacheRoot), [], `${name}: nothing published, no temp left`);
   }
 });
+
+test('symlink targets are anchored: only the whole target or its leading directories relocate', () => {
+  const bad = tree();
+  fs.mkdirSync(bad, { recursive: true });
+  fs.symlinkSync('/backup:/runs/job/file', path.join(bad, 'link'));
+  assert.deepEqual(collectInstallPathReferences(bad, rolesFor('/runs/job')), { ambiguous: 'link' });
+
+  const good = tree();
+  fs.mkdirSync(good, { recursive: true });
+  fs.symlinkSync('/runs/job/node_modules/x', path.join(good, 'link'));
+  fs.symlinkSync('/runs/job', path.join(good, 'whole'));
+  const { restored, run } = roundTrip(good, ...one('/runs/job', '/runs/new'));
+  run();
+  assert.equal(fs.readlinkSync(path.join(restored, 'link')), '/runs/new/node_modules/x');
+  assert.equal(fs.readlinkSync(path.join(restored, 'whole')), '/runs/new');
+});
+
+test('publish verifies against every install path of the run, not only the ones collection saw', () => {
+  const t = tree();
+  write(t, 'a.js', '"/runs/job/file"');
+  const roles = [{ role: 'workDir', path: '/runs/job' }, { role: 'TMPDIR', path: '/tmp/job' }];
+  const { relocation } = collectInstallPathReferences(t, roles);
+  assert.deepEqual(relocation.prefixes.map((p) => p.path), ['/runs/job'], 'collection saw only the work dir');
+  assert.deepEqual(relocation.candidates, ['/runs/job', '/tmp/job']);
+  write(t, 'late.js', '"/tmp/job/generated"');
+  const cacheRoot = tmpDir();
+  assert.throws(() => publishToStore(cacheRoot, newKey(), t, relocation), /unrecorded late\.js/);
+  assert.deepEqual(fs.readdirSync(cacheRoot), []);
+});
+
+test('restore also looks for every old install path, except one the new paths contain', () => {
+  const t = tree();
+  write(t, 'a.js', '"/runs/job/file"');
+  const roles = [{ role: 'workDir', path: '/runs/job' }, { role: 'TMPDIR', path: '/tmp/job' }];
+  const stray = roundTrip(t, roles, { workDir: '/runs/new', TMPDIR: '/tmp/new' }, {
+    tamper: (stored) => {
+      fs.chmodSync(stored, 0o755);
+      write(stored, 'late.js', '"/tmp/job/x"');
+    },
+  });
+  assert.throws(stray.run, /late\.js still holds a placeholder or an old install path/);
+});
