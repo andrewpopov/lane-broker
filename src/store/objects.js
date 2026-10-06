@@ -5,7 +5,7 @@ import { atomicWriteFile, atomicWriteJson, fsyncDirectory } from '../state.js';
 import { manifestHashOf, isCanonicalRelPath } from '../remote-manifest.js';
 import { MAX_HEADER_BYTES } from '../remote-stream.js';
 import { Journal } from './journal.js';
-import { acquireStoreLock, acquireStoreLockAsync, LockLostError } from './lock.js';
+import { acquireStoreLockAsync, LockLostError } from './lock.js';
 import { RETENTION_DEFAULTS } from './retention.js';
 import { isSha256, isJobId, blobRelPath, manifestRelPath, parseObjectPath } from './ids.js';
 
@@ -119,7 +119,10 @@ export class ObjectStore {
   constructor(root, { now = Date.now, maxBlobBytes = DEFAULT_MAX_BLOB_BYTES, capBytes = Infinity, replicaMode = false, replicaGraceHours = RETENTION_DEFAULTS.manifestAfterTerminalMs / 3_600_000, lock } = {}) {
     fs.mkdirSync(root, { recursive: true });
     this.root = fs.realpathSync(root); // confine to the real directory; every later path is checked against symlinks below it
-    this.lock = lock ?? acquireStoreLock(this.root); // `ObjectStore.open` passes the platform lock (kernel-held on Linux)
+    // Only `ObjectStore.open` constructs a store: it takes the platform lock (kernel-held on Linux) first. A constructor that
+    // took its own lock would let a file-lock holder and a socket holder both write the journal on Linux.
+    if (!lock) throw new Error('construct an ObjectStore with `await ObjectStore.open(root)`, which takes the platform lock');
+    this.lock = lock;
     try {
       this.init({ now, maxBlobBytes, capBytes, replicaMode, replicaGraceHours });
     } catch (err) {

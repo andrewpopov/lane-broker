@@ -1,6 +1,7 @@
 import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { startStore, fakeClock, snapshotOf, publish, sha } from './store-harness.js';
 import { readJournal } from '../src/store/journal.js';
@@ -140,4 +141,14 @@ test('N19b if the blob is gone on the primary too, the path blocks as before', a
   const r = await replicator(p).runOnce();
   assert.equal(r.ok, false);
   assert.match(r.error, /no longer has it/);
+});
+
+test('N11 only ObjectStore.open builds a store: a bare constructor (which would take no platform lock) is refused', async () => {
+  const { ObjectStore } = await import('../src/store/objects.js');
+  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'lane-store-ctor-'));
+  try {
+    assert.throws(() => new ObjectStore(root), /ObjectStore\.open/);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
