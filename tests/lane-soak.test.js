@@ -31,4 +31,11 @@ describe('lane lock-order soak harness', { skip: PG_SKIP_REASON ?? false, timeou
     assert.ok(r.lostJobs > 0, `expected lost jobs, got ${JSON.stringify(r)}`);
     assert.equal(soakPassed(r), false);
   });
+
+  test('soakPassed fails a clean-looking result in which the group closer or the submitter did nothing', () => {
+    const clean = { deadlocks: 0, doubleClaims: 0, lostJobs: 0, anomalies: 0, otherErrors: 0, claims: 100, groupsClosed: 3, submittedGroups: 3 };
+    assert.equal(soakPassed(clean), true);
+    assert.equal(soakPassed({ ...clean, groupsClosed: 0 }), false);
+    assert.equal(soakPassed({ ...clean, submittedGroups: 0 }), false);
+  });
 });

@@ -301,7 +301,9 @@ export async function runSoak({ minutes, claimers = 8, injectBadOrder = false, m
   }
 }
 
-export const soakPassed = (r) => r.deadlocks === 0 && r.doubleClaims === 0 && r.lostJobs === 0 && r.anomalies === 0 && r.otherErrors === 0 && r.claims > 0;
+// Coverage counts: a run in which the group closer or the submitter did nothing never exercised the group-lock path, so it cannot pass.
+export const soakPassed = (r) => r.deadlocks === 0 && r.doubleClaims === 0 && r.lostJobs === 0 && r.anomalies === 0 && r.otherErrors === 0 && r.claims > 0
+  && r.groupsClosed > 0 && r.submittedGroups > 0;
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const arg = (name, fallback) => { const i = process.argv.indexOf(`--${name}`); return i === -1 ? fallback : process.argv[i + 1]; };
