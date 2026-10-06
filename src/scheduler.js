@@ -704,7 +704,7 @@ function headFutility(cfg, headTicket, held, cpuSample, cpuDecision, memInfo, no
   }
   if (cpuSample && Number.isFinite(cpuDecision.externalBusy)) {
     const drainedCpu = evaluateCpuAdmission({
-      cpuSample: { ...cpuSample, hostBusyCores: cpuDecision.externalBusy },
+      cpuSample: { ...cpuSample, hostBusyCores: cpuDecision.externalBusy, preemptibleBusyCores: 0 },
       heldLeases: [],
       candidateWeight: headTicket.weight,
       candidateResources: { ...resources, cpuCores: headCpu },
@@ -1144,7 +1144,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       const reason = fs.readFileSync(paths(root).pause, 'utf8').trim();
       return { result: { started: false, reason: 'paused', pauseReason: reason } };
     }
-    const cpuSample = sampleCpuSafe(root, cpuSampler, cfg.sampleMs / 2);
+    const cpuSample = sampleCpuSafe(root, cpuSampler, cfg.sampleMs / 2, cfg.preemptibleNiceMin);
     // The gate must still be SAMPLED unconditionally (its hysteresis
     // countdown depends on every poll observing a sample, closed broker or
     // not), but a gate closed by load the broker itself never generated

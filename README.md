@@ -105,6 +105,8 @@ never told to forward to it — both still get the `--log` file.
   "schedulerMode": "active",
   "cpuAdmissionPercent": 75,
   "cpuReserveCores": 1,
+  "preemptibleNiceMin": 1,
+  "preemptibleShare": 0.8,
   "memoryReserveBytes": 2147483648,
   "defaultMemoryBytesPerWeight": 1073741824,
   "loadClose": 15,
@@ -134,6 +136,24 @@ available memory. Legacy lanes without explicit resource values reserve one
 CPU core per weight unit and `defaultMemoryBytesPerWeight` bytes per weight
 unit. Set `schedulerMode` to `"shadow"` to log resource decisions without
 enforcing them.
+
+`preemptibleNiceMin` (default `1`, integer `0`-`19`; `0` disables) and
+`preemptibleShare` (default `0.8`, `0`-`1`): CPU spent by processes at `nice >=
+preemptibleNiceMin` is *preemptible*, because the kernel runs a nice-0 lane
+ahead of it, so it should not stop a lane from starting. Admission (the CPU
+gate's busy percent, `externalBusy`, and the projected-over-budget check) uses
+`hostBusy - preemptibleShare * preemptibleBusy`. The share is a safety floor:
+at 0.8, one fifth of niced load still counts as busy, so a truly saturated
+host is never read as empty. Normal-priority external load counts in full.
+Linux reads the `nice` column of `/proc/stat` (via `os.cpus()`); macOS has no
+such counter, so it sums the `%CPU` of processes at that nice level from a
+`ps` read. Lanes are themselves niced (`laneNice`), so their own observed CPU
+is removed from the preemptible figure before discounting, never discounted
+twice; when lanes are not niced this under-credits, the safe direction.
+`lane status` shows `host CPU: <busy> busy cores, <n> preemptible (niced)` from
+the last sample, and the admission log line carries `preemptibleBusy=` beside
+`hostBusyCores=` and `externalBusy=`. `LANE_BROKER_CPU_BUSY_FILE` accepts an
+optional third field, `hostBusy,cores,preemptibleBusy`.
 
 `settledDemandEnabled` (default `true`): once a lease is settled (admitted at
 least `settledDemandSettleMs`, default 120000, ago, with a fresh observation

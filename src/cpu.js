@@ -7,7 +7,7 @@ import { detectResourceCapacity } from './resources.js';
 /**
  * Test-only override, the CPU-gate equivalent of load.js's readLoadAvg /
  * LANE_BROKER_LOADAVG_FILE: when LANE_BROKER_CPU_BUSY_FILE is set, its first
- * line is "hostBusyCores,cores" and sampleHostCpu returns that directly
+ * line is "hostBusyCores,cores[,preemptibleBusyCores]" and sampleHostCpu returns that directly
  * instead of diffing real os.cpus() snapshots. Real integration tests spawn
  * an actual detached supervisor (a separate process), so there is no way to
  * inject a fake cpuSampler function across that boundary — this lets the
@@ -19,11 +19,12 @@ function readCpuBusyOverride() {
   if (!file) return null;
   try {
     const first = fs.readFileSync(file, 'utf8').split('\n')[0].trim();
-    const [busyStr, coresStr] = first.split(',');
+    const [busyStr, coresStr, preemptibleStr] = first.split(',');
     const hostBusyCores = Number(busyStr);
     const cores = Number(coresStr);
-    if (Number.isFinite(hostBusyCores) && Number.isFinite(cores) && cores > 0) {
-      return { hostBusyCores, cores, stale: false, sampledAt: Date.now() };
+    const preemptibleBusyCores = preemptibleStr === undefined ? 0 : Number(preemptibleStr);
+    if (Number.isFinite(hostBusyCores) && Number.isFinite(cores) && cores > 0 && Number.isFinite(preemptibleBusyCores)) {
+      return { hostBusyCores, preemptibleBusyCores, cores, stale: false, sampledAt: Date.now() };
     }
   } catch {
     // fall through to the real sampler
@@ -36,8 +37,8 @@ function cpuTimes(cpu) {
   // computeBusyCores below rejects any non-finite entry before using it, so
   // this never fabricates a number, it just can't produce a real one.
   const t = cpu && cpu.times;
-  if (!t) return { idle: NaN, total: NaN };
-  return { idle: t.idle, total: t.user + t.nice + t.sys + t.idle + t.irq };
+  if (!t) return { idle: NaN, total: NaN, nice: NaN };
+  return { idle: t.idle, total: t.user + t.nice + t.sys + t.idle + t.irq, nice: t.nice };
 }
 
 // A delta averaged over more than this masks a real, live spike (or a dip)
@@ -82,6 +83,7 @@ export function computeBusyCores(prev, snapshot) {
     return { hostBusyCores: null, stale: true };
   }
   let busySum = 0;
+  let niceSum = 0;
   let sawDelta = false;
   for (let i = 0; i < snapshot.cpus.length; i += 1) {
     const p = prev.cpus[i];
@@ -94,9 +96,14 @@ export function computeBusyCores(prev, snapshot) {
     if (totalDelta <= 0) continue; // clock skew, or no progress since the last sample
     sawDelta = true;
     busySum += (totalDelta - idleDelta) / totalDelta;
+    // BRAIN-428: the kernel's `nice` column (Linux /proc/stat) is time spent by nice > 0 processes,
+    // already inside `total - idle`. A snapshot without it (a bare fixture, an older sidecar)
+    // contributes 0 -- never a fabricated figure.
+    const niceDelta = s.nice - p.nice;
+    if (Number.isFinite(niceDelta) && niceDelta > 0) niceSum += Math.min(niceDelta, totalDelta - idleDelta) / totalDelta;
   }
   if (!sawDelta) return { hostBusyCores: null, stale: true };
-  return { hostBusyCores: busySum, stale: false };
+  return { hostBusyCores: busySum, preemptibleBusyCores: niceSum, stale: false };
 }
 
 /**
@@ -137,14 +144,36 @@ function countersUnchanged(prev, snapshot) {
   return snapshot.cpus.every((s, i) => prev.cpus[i] && prev.cpus[i].total === s.total && prev.cpus[i].idle === s.idle);
 }
 
-export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0 } = {}) {
+/**
+ * BRAIN-428: cores the host spends on processes at nice >= niceMin, from one `ps` read. macOS has no
+ * separate system counter for niced time, so this sums those processes' observed %CPU. Null (never a
+ * fabricated zero, never a throw) when the probe fails.
+ */
+export function observePreemptibleCores(niceMin, exec = execFileSync) {
+  try {
+    const out = exec('ps', ['-A', '-o', 'pid=,ppid=,pgid=,pcpu=,rss=,nice='], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2000,
+    });
+    return preemptibleCoresFromRows(parseProcessTable(out), niceMin);
+  } catch {
+    return null;
+  }
+}
+
+export function preemptibleCoresFromRows(rows, niceMin) {
+  return rows.reduce((sum, r) => (r.nice >= niceMin ? sum + Math.max(0, r.pcpu) / 100 : sum), 0);
+}
+
+export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0, preemptibleNiceMin = 1, platform = process.platform, exec = execFileSync } = {}) {
   const override = readCpuBusyOverride();
   if (override) return override;
   const file = paths(root).cpuSample;
   const prev = readJsonSafe(file);
   const now = Date.now();
   const snapshot = { at: now, cpus: cpus.map(cpuTimes) };
-  const { hostBusyCores, stale } = computeBusyCores(prev, snapshot);
+  const { hostBusyCores, stale, preemptibleBusyCores: niceColumnCores } = computeBusyCores(prev, snapshot);
   const capacity = detectResourceCapacity({ parallelism: cpus.length });
   const measured = Number.isFinite(hostBusyCores) ? Math.min(hostBusyCores, capacity.cpuCores) : hostBusyCores;
   // BRAIN-346: the head and a backfill candidate now sample back to back, and os.cpus() counters
@@ -157,7 +186,11 @@ export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0 } = {}
   // about to become the persisted baseline, and carrying the old measurement over it would let a
   // repeat of the same bad counters match `countersUnchanged` and reuse a pre-fault figure.
   const unchanged = stale && countersUnchanged(prev, snapshot);
-  const lastValid = !stale && Number.isFinite(measured) ? { hostBusyCores: measured, cores: capacity.cpuCores, at: now } : unchanged ? prev.lastValid : undefined;
+  // BRAIN-428: preemptible = niced load. Linux: the /proc/stat nice-column delta. macOS: per-process nice from ps.
+  // Disabled (preemptibleNiceMin 0) or unmeasurable reads as 0 -- niced load then counts as ordinary busy.
+  const preemptibleRaw = !(preemptibleNiceMin > 0) || stale ? 0 : platform === 'darwin' ? observePreemptibleCores(preemptibleNiceMin, exec) : niceColumnCores;
+  const preemptibleBusyCores = Number.isFinite(measured) ? Math.min(Number.isFinite(preemptibleRaw) ? preemptibleRaw : 0, measured) : 0;
+  const lastValid = !stale && Number.isFinite(measured) ? { hostBusyCores: measured, preemptibleBusyCores, cores: capacity.cpuCores, at: now } : unchanged ? prev.lastValid : undefined;
   if (lastValid) snapshot.lastValid = lastValid;
   try {
     const latest = readJsonSafe(file);
@@ -176,10 +209,11 @@ export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0 } = {}
     now - prev.lastValid.at >= 0 &&
     now - prev.lastValid.at < reuseWindowMs;
   if (reusable) {
-    return { hostBusyCores: prev.lastValid.hostBusyCores, cores: capacity.cpuCores, stale: false, reused: true, sampledAt: now, source: capacity.source };
+    return { hostBusyCores: prev.lastValid.hostBusyCores, preemptibleBusyCores: prev.lastValid.preemptibleBusyCores ?? 0, cores: capacity.cpuCores, stale: false, reused: true, sampledAt: now, source: capacity.source };
   }
   return {
     hostBusyCores: measured,
+    preemptibleBusyCores,
     cores: capacity.cpuCores,
     stale,
     sampledAt: now,
@@ -220,14 +254,14 @@ export function readMemoryInfo(exec = execFileSync) {
   return { availableBytes, totalBytes: capacity.memoryBytes, macPressure, source: capacity.source };
 }
 
-/** Parse `ps -A -o pid=,ppid=,pgid=,pcpu=,rss=` text into rows; unparseable lines are dropped. */
+/** Parse `ps -A -o pid=,ppid=,pgid=,pcpu=,rss=[,nice=]` text into rows; unparseable lines are dropped. `nice` is only present when the column is. */
 export function parseProcessTable(text) {
   const rows = [];
   for (const line of String(text ?? '').split('\n')) {
     const f = line.trim().split(/\s+/).map(Number);
-    if (f.length !== 5 || !f.every(Number.isFinite)) continue;
-    const [pid, ppid, pgid, pcpu, rss] = f;
-    rows.push({ pid, ppid, pgid, pcpu, rss });
+    if ((f.length !== 5 && f.length !== 6) || !f.every(Number.isFinite)) continue;
+    const [pid, ppid, pgid, pcpu, rss, nice] = f;
+    rows.push(nice === undefined ? { pid, ppid, pgid, pcpu, rss } : { pid, ppid, pgid, pcpu, rss, nice });
   }
   return rows;
 }
