@@ -116,7 +116,8 @@ never told to forward to it — both still get the `--log` file.
   "resourceSkipLimit": 3,
   "resourceIdleOvershootCores": 1,
   "admissionLoadGate": false,
-  "laneNice": 10
+  "laneNice": 10,
+  "noProgressTimeoutMs": 900000
 }
 ```
 
@@ -1250,7 +1251,29 @@ factor is 1.0 (no calibration) and is printed.
 | `64` | Nested `lane run` would widen the inherited lease — refused; or an invalid `--priority` / `LANE_BROKER_PRIORITY` / lane `priority`. |
 | `69` | Local-sim lane refused (fleet-offload message); use `--allow-local-sim`. |
 | `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. Also `lane run` / `remote-exec` refused with "scheduler migration in progress" while `lane migrate-scheduler` runs, or "scheduler migration pending (draining)" while `--when-idle` waits. |
+| `124` | Killed by the no-progress watchdog (`reason: "no-progress"`, see below). |
 | `130` | Cancelled (SIGINT/SIGTERM) while still queued, before the lane ever started. |
+
+### No-progress watchdog (BRAIN-431)
+
+A run that hangs holds its slot indefinitely (a vitest pool that stopped mid-run once sat silent for 100 minutes and
+blocked a push). A run is killed when, over a whole `noProgressTimeoutMs` window, BOTH hold: its output (stdout +
+stderr) grew by 0 bytes, AND its process tree used under 0.05 CPU-seconds per minute. CPU is the per-process
+cumulative-time delta of the lease's tree (not `ps` pcpu, a lifetime average that stays high long after a process
+goes idle), so a silent but busy command (a long compile or a quiet test) is never killed, nor is a command that
+prints. An unreadable process table counts as progress. The check rides the supervisor heartbeat (`sampleMs`), local
+and runner-side alike.
+
+| Setting | Where | Default | Meaning |
+|---|---|---|---|
+| `noProgressTimeoutMs` | global `config.json` | `900000` (15 min) | Window length in ms; `0` disables. |
+| `noProgressTimeoutMs` | a lane in `.lane-broker.json` | the global value | Per-lane override (an undeclared lane inherits its `as` template's); `0` disables for the lane. |
+
+On trigger the tree is reaped as for a cancel (TERM, grace, KILL, descendants), the result and history row carry
+`exit: 124`, `reason: "no-progress"` and `noProgressTimeoutMs`, and the admission log gets `lane-broker-reap id=<id>
+descendants-reaped=<n> reason=no-progress`. The submitter sees `lane run: no progress for 15m (no output, no CPU) —
+killed` (also appended to the lease log); for a remote run the runner relays the reason and window in its result, so the
+submitter's history row is `executor: "remote"`, exit 124, `reason: "no-progress"`.
 
 ### Group reap on leader exit (ROG-2181 T1b)
 

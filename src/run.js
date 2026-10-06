@@ -382,6 +382,7 @@ export async function runCommand({
     weight,
     resources,
     nice,
+    noProgressTimeoutMs: resolved.noProgressTimeoutMs ?? globalCfg.noProgressTimeoutMs,
     maxConcurrent: resolved.maxConcurrent,
     class: resolved.class,
     aging: resolved.aging,

@@ -30,6 +30,7 @@ import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remo
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
 import { createAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX } from './admission.js';
+import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, noProgressMessage } from './no-progress.js';
 import { observedLeaseFields, summarizeObservedCpu, sanitizeObservedCpu, sanitizeRssPeak, integratedCpuSeconds, sanitizeCpuSeconds } from './observed.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
@@ -773,6 +774,13 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       process.stderr.write(phaseLine);
       writeBrokerLog(root, phaseLine);
     }
+    // BRAIN-431: the runner killed the command for making no progress; say so, not just "exit 124"
+    const noProgress = dispatch.result.reason === NO_PROGRESS_REASON && Number.isFinite(dispatch.result.noProgressTimeoutMs);
+    if (noProgress) {
+      const message = noProgressMessage(dispatch.result.noProgressTimeoutMs);
+      process.stderr.write(message);
+      writeBrokerLog(root, message);
+    }
     await updateAttempt(root, enriched.id, gen, { remotePhase: dispatch.phase ?? null });
     const artifactFields = artifactsSupported
       ? returnRemoteArtifacts(root, enriched, dispatch)
@@ -795,6 +803,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       ...relayedDeps(dispatch.result),
       ...relayedPhases(dispatch),
       ...artifactFields,
+      ...(noProgress ? { reason: NO_PROGRESS_REASON, noProgressTimeoutMs: dispatch.result.noProgressTimeoutMs } : {}),
       remoteKind: dispatch.result.kind,
       remotePhase: dispatch.phase ?? null,
       startedAt: remoteWaitedMs === null ? attemptStartedAt : enriched.createdAt + remoteWaitedMs,
@@ -1087,13 +1096,17 @@ async function main() {
   const stderrForward = forwardOutput ? new ForwardWriter(process.stderr) : null;
   const stdoutGate = backpressureGate(child.stdout);
   const stderrGate = backpressureGate(child.stderr);
+  // BRAIN-431: bytes the command wrote, one of the two progress signals the heartbeat watches
+  const watchdog = new NoProgressWatchdog({ timeoutMs: ticket.noProgressTimeoutMs ?? globalCfg.noProgressTimeoutMs });
   child.stdout.on('data', (c) => {
+    watchdog.noteOutput(c.length);
     const loggedOk = logWriter.write(c);
     const forwardedOk = stdoutForward ? stdoutForward.write(c) : true;
     if (!loggedOk) logWriter.pauseUntilDrain(stdoutGate);
     if (!forwardedOk) stdoutForward.pauseUntilDrain(stdoutGate);
   });
   child.stderr.on('data', (c) => {
+    watchdog.noteOutput(c.length);
     const loggedOk = logWriter.write(c);
     const forwardedOk = stderrForward ? stderrForward.write(c) : true;
     if (!loggedOk) logWriter.pauseUntilDrain(stderrGate);
@@ -1104,26 +1117,28 @@ async function main() {
 
   let finished = false;
   let cancelling = false;
+  let noProgressKilled = false;
   let killPromise = null;
 
   // BRAIN-419: processes that left the leader's group (setsid/setpgid) are invisible to killGroup, so track the tree.
   const descendants = new DescendantTracker(child.pid, { leaseId: ticket.id });
   descendants.scan();
-  async function killTree() {
+  async function killTree(reason) {
     descendants.scan(); // the leader may still be alive: catches anything spawned since the last heartbeat
     const [, result] = await Promise.all([killGroup(child.pid), descendants.reap({ graceMs: CANCEL_GRACE_MS })]);
     // an incomplete reap is logged but never wedges the lease: the lease is still released
-    writeBrokerLog(root, reapLogLine(ticket.id, result));
+    writeBrokerLog(root, reapLogLine(ticket.id, result, reason));
   }
 
   // BRAIN-425: one observation, shared by the heartbeat and an early sample, so a run shorter than sampleMs still gets a
   // CPU reading. Never taken on the exit path: reap and lease release must not wait on telemetry.
   function observeLease() {
+    let rows = null;
     try {
       const lease = readLease(root, ticket.id);
       if (lease) {
         // ONE process-table read per heartbeat feeds both the descendant record and the CPU/RSS observation
-        const rows = descendants.scan();
+        rows = descendants.scan();
         const tree = rows ? selectLeaseTree(rows, child.pid, otherLeaseStops(root, ticket.id)) : null;
         const observed = tree?.cores ?? null;
         const observedMemory = tree?.memoryBytes ?? null;
@@ -1133,6 +1148,21 @@ async function main() {
     } catch {
       // observation is telemetry: nothing in it may take the supervisor down while its child runs
     }
+    return rows;
+  }
+
+  /** BRAIN-431: kill a run that has shown no output and no CPU for the whole window. Rides the heartbeat's own scan. */
+  function enforceNoProgress(rows) {
+    if (noProgressKilled || cancelling || !watchdog.enabled) return;
+    let stalled = false;
+    try {
+      stalled = rows !== null && watchdog.stalled([child.pid, ...descendants.live(rows)]);
+    } catch {
+      return; // a watchdog failure must never take the supervisor down: the run just keeps its slot
+    }
+    if (!stalled) return;
+    noProgressKilled = true;
+    killPromise = killTree(NO_PROGRESS_REASON);
   }
   const earlySample = setTimeout(() => {
     if (!finished) observeLease();
@@ -1140,7 +1170,7 @@ async function main() {
 
   const heartbeat = setInterval(() => {
     if (finished) return;
-    observeLease();
+    enforceNoProgress(observeLease());
     // Codex pre-merge BLOCKER #1: the marker must survive until AFTER the
     // terminal write below decides on it -- clearing it here (as this used
     // to, the instant it was observed) let a child that exits 0 on TERM
@@ -1174,6 +1204,12 @@ async function main() {
     if (cancelling) {
       result = { ...result, exit: 130, signal: null, cancelled: true };
       exitCode = 130;
+    } else if (noProgressKilled) {
+      // BRAIN-431: the kill's own signal is not the story; it is `timeout`'s 124, with the window that elapsed
+      result = { ...result, exit: NO_PROGRESS_EXIT, signal: null, reason: NO_PROGRESS_REASON, noProgressTimeoutMs: watchdog.timeoutMs };
+      const message = noProgressMessage(watchdog.timeoutMs);
+      logWriter.write(message);
+      stderrForward?.write(message);
     }
     await logWriter.finish();
     // Flush the forward pipes before exiting (BRAIN-308) -- process.exit()
@@ -1273,7 +1309,7 @@ async function main() {
   // gone. So reap on 'exit'; finalizeAndExit awaits killPromise before the result is written or the lease released.
   let groupReaped = false;
   child.on('exit', () => {
-    if (finished || cancelling) return;
+    if (finished || cancelling || noProgressKilled) return;
     if (!isGroupAlive(child.pid) && !hasLiveMembers(descendants)) return;
     groupReaped = true;
     killPromise = killTree();
