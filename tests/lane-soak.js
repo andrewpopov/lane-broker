@@ -20,7 +20,7 @@ const TERMINAL = "('succeeded','failed','cancelled','skipped','lost')";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rand = (n) => Math.floor(Math.random() * n);
 
-export async function runSoak({ minutes, claimers = 8, injectBadOrder = false, mutate, groups = 40, jobs = 8000, queuedTarget = 6000, log = console.log }) {
+export async function runSoak({ minutes, claimers = 8, injectBadOrder = false, mutate, groups = 40, jobs = 8000, queuedTarget = 12000, finishedGroups = 10, log = console.log }) {
   const cluster = PgCluster.start();
   const stats = {
     claims: 0, nullClaims: 0, completed: 0, released: 0, started: 0, cancelled: 0, policyEdits: 0, groupsClosed: 0, submittedGroups: 0,
@@ -38,6 +38,18 @@ export async function runSoak({ minutes, claimers = 8, injectBadOrder = false, m
     const agents = await seedScale(seedClient, { jobs, groups, hosts: 5 });
     await seedClient.query('CREATE TABLE public.soak_fleet (k int NOT NULL, tier int NOT NULL, PRIMARY KEY (k, tier))');
     await seedClient.query('INSERT INTO public.soak_fleet SELECT k, t FROM generate_series(0, 15) k, generate_series(1, 3) t');
+    // Groups that are already finished, so the group closer has real work from the first second and a run that never closes or submits
+    // a group (a silent no-op actor) shows as zero in the result. Their succeeded jobs are part of the baseline, not of the run's tally.
+    await seedClient.query(
+      `INSERT INTO lane.groups (id, submit_uuid, kind, account, owner, parent_id, prio_class, snapshot, aggregator, state, aging_anchor)
+       SELECT ('00000000-0000-0000-1000-' || lpad(g::text, 12, '0'))::uuid, ('00000000-0000-0000-1000-' || lpad(g::text, 12, '0'))::uuid,
+              'single', 'acct', '${roleNames.submit}', p.id, 'normal', '{}', 'x', 'active', now()
+         FROM generate_series(1, $1::int) g, lane.sched_parents p WHERE p.account = 'acct' AND p.prio_class = 'normal'`, [finishedGroups]);
+    await seedClient.query(
+      `INSERT INTO lane.jobs (group_id, seq, idem_key, class, template_id, template_version, params, est_p50_s, est_p90_s, cpu_req, cpu_min, mem_bytes, dup_safe, max_infra, max_work, state)
+       SELECT ('00000000-0000-0000-1000-' || lpad(g::text, 12, '0'))::uuid, n, 'k' || n, 'test', 't', 1, '{}', 300, 600, 1, 1, 0, true, 3, 2, 'succeeded'
+         FROM generate_series(1, $1::int) g, generate_series(1, 2) n`, [finishedGroups]);
+    const baseSucceeded = finishedGroups * 2;
     const baseJobs = (await seedClient.query('SELECT count(*)::int AS n FROM lane.jobs')).rows[0].n;
     let submittedJobs = baseJobs;
     const deadline = Date.now() + minutes * 60000;
@@ -230,7 +242,11 @@ export async function runSoak({ minutes, claimers = 8, injectBadOrder = false, m
       while (!stopping) {
         await sleep(2);
         await tx(client, 'bad order', async (c) => {
-          const { rows } = await c.query("SELECT id, group_id FROM lane.jobs WHERE state = 'queued' ORDER BY id LIMIT 1");
+          // The longest queued job of a random active group: exactly the head a claimer picks for that group, so the two meet.
+          const { rows } = await c.query(
+            `SELECT j.id, j.group_id FROM lane.jobs j
+              WHERE j.group_id = (SELECT id FROM lane.groups WHERE state = 'active' ORDER BY random() LIMIT 1) AND j.state = 'queued'
+              ORDER BY j.est_p50_s DESC, j.seq LIMIT 1`);
           if (!rows.length) return;
           await c.query('SELECT 1 FROM lane.jobs WHERE id = $1 FOR UPDATE', [rows[0].id]);
           await sleep(15);
@@ -264,7 +280,7 @@ export async function runSoak({ minutes, claimers = 8, injectBadOrder = false, m
               (SELECT count(*)::int FROM lane.jobs j WHERE j.epoch <> (SELECT count(*) FROM lane.transition_events e WHERE e.job_id = j.id AND e.kind = 'claimed')) AS epoch_mismatch,
               (SELECT count(*)::int FROM (SELECT 1 FROM lane.transition_events WHERE kind = 'claimed' GROUP BY job_id, epoch HAVING count(*) > 1) d) AS duplicate_claim_events`);
     const a = audit.rows[0];
-    const lost = Math.abs(a.total - submittedJobs) + a.stranded + Math.abs(a.succeeded - stats.completed) + Math.abs(a.cancelled - stats.cancelled)
+    const lost = Math.abs(a.total - submittedJobs) + a.stranded + Math.abs(a.succeeded - baseSucceeded - stats.completed) + Math.abs(a.cancelled - stats.cancelled)
       + Math.abs(a.total - a.queued - a.succeeded - a.cancelled);
     const doubles = stats.doubleClaims + a.epoch_mismatch + a.duplicate_claim_events;
     stats.claimMs.sort((x, y) => x - y);

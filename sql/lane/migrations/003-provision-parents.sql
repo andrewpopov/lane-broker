@@ -2,7 +2,7 @@
 -- the scheduling lock to create one. A parent is (account, class) and there are a handful of classes, so every principal's accounts
 -- get one parent per class when the principal is created or gains an account, and every account gets one when a class is added.
 -- Backfilled here for principals that already exist.
-CREATE FUNCTION lane.provision_account_parents() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane, pg_temp AS $$
+CREATE OR REPLACE FUNCTION lane.provision_account_parents() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane, pg_temp AS $$
 BEGIN
   INSERT INTO lane.sched_parents (account, prio_class)
     SELECT a, c.name FROM unnest(NEW.allowed_accounts) AS a CROSS JOIN lane.priority_classes c
@@ -10,7 +10,7 @@ BEGIN
   RETURN NULL;
 END $$;
 
-CREATE FUNCTION lane.provision_class_parents() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane, pg_temp AS $$
+CREATE OR REPLACE FUNCTION lane.provision_class_parents() RETURNS trigger LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane, pg_temp AS $$
 BEGIN
   INSERT INTO lane.sched_parents (account, prio_class)
     SELECT DISTINCT a, NEW.name FROM lane.principals p, unnest(p.allowed_accounts) AS a

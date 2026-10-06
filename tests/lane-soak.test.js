@@ -8,6 +8,7 @@ describe('lane lock-order soak harness', { skip: PG_SKIP_REASON ?? false, timeou
   test('eight claimers alongside completions, cancels, policy edits and a fleet tier show no deadlock, double claim or lost job', async () => {
     const r = await runSoak({ minutes: 0.15, claimers: 8, log: () => {} });
     assert.ok(r.claims > 100 && r.completed > 50 && r.cancelled > 0 && r.started > 0 && r.policyEdits > 0, `actors did too little: ${JSON.stringify(r)}`);
+    assert.ok(r.groupsClosed > 0 && r.submittedGroups > 0, `the group closer or the submitter did nothing, so the group-lock path was not exercised: ${JSON.stringify({ groupsClosed: r.groupsClosed, submittedGroups: r.submittedGroups })}`);
     assert.deepEqual({ deadlocks: r.deadlocks, doubleClaims: r.doubleClaims, lostJobs: r.lostJobs, anomalies: r.anomalies, otherErrors: r.otherErrors },
       { deadlocks: 0, doubleClaims: 0, lostJobs: 0, anomalies: 0, otherErrors: 0 }, JSON.stringify(r.samples));
     assert.ok(soakPassed(r));
