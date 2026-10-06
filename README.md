@@ -1177,6 +1177,29 @@ symlinks.
   (BRAIN-320 review fix B: a cancel that lands in that window must still win
   over the expiry).
 
+## `lane-store` (BRAIN-407, unified queue P0b)
+
+`bin/lane-store.js` is the content-addressed snapshot store behind detached submit (spec `.spec/unified-queue-spec-rev11.md`
+8.1-8.3, 9.3). Zero dependencies (`http`, `crypto`); code in `src/store/`; systemd templates (not installed) in `ops/lane-store/`.
+
+- **Objects.** Blobs live at `blobs/ab/cd/<sha256>`: streamed to `tmp/`, hashed while written, refused on mismatch or over
+  `--max-blob-bytes`, fsynced, renamed, then journaled. A re-upload is hash-checked and deduplicated, never overwritten.
+  Job manifests (`manifests/<job>.json`, immutable per job, every referenced blob must already be stored) register the file list.
+- **Reads are job-scoped.** A `read` token carries `job`; it may fetch only that job's manifest and the blobs it references.
+  Tokens are verified by a pluggable `verifier` (`createStore({verifier})`); `src/store/auth.js` is an HMAC stand-in
+  (`LANE_STORE_SECRET`) until the DB-backed principal check lands. Roles: `submit`, `read`, `replica`, `admin`.
+- **Receiver.** `materializeSnapshot` (`src/store/materialize.js`) replays the blobs as the same framed stream a remote runner
+  gets, so path/symlink/hash refusal is `remote-manifest.js` / `remote-stream.js`, not a second implementation.
+- **Replication.** `lane-store replicate` ships `journal.log` entries in `seq` order over HTTP (the replica is a second
+  lane-store; it hash-verifies on write and again on `GET /verify/<path>`, which re-reads its own disk). `replicated_seq`
+  (`replication.json`) advances only after that verify matches the journal. Metric `oldest_unreplicated_object_age_seconds`
+  (plus `lane_store_replicated_seq`, `_journal_head_seq`, `_replication_failed_rounds`, `_blob_bytes`) is served live at
+  `GET /metrics`, computed from the journal and watermark so it keeps growing if the replicator dies.
+  `lane-store compare [--deep] [--repair]` is the weekly backstop (exit 2 on divergence).
+- **Retention.** `POST /admin/sweep` (and `--sweep-interval-s`): manifests expire 14 d after `PUT /jobs/<job>/terminal`,
+  pinned jobs (`PUT /pins/<job>`) never expire, unreferenced blobs go after 24 h, above 80% of `--cap-bytes` the oldest
+  terminal unpinned groups are evicted, and uploads are refused (507) at 95%.
+
 ## Verify locally
 
 ```bash
