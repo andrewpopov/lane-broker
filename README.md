@@ -284,7 +284,7 @@ without `remote: true`, nothing changes.
 // ~/.config/lane-broker/config.json (the client machine)
 "runners": [
   { "name": "skybox", "ssh": "skybox-runner" },
-  { "name": "grandy", "ssh": "mac-grandy", "shell": "zsh -lc" }
+  { "name": "grandy", "ssh": "mac-grandy", "shell": "zsh -lc", "speedFactor": 0.5 }
 ]
 ```
 
@@ -307,7 +307,8 @@ is also passed.
 `ssh` is an ssh destination (an alias from `~/.ssh/config`, or
 `ssh://user@host:port`); it may not start with `-`. `shell` (default
 `bash -lc`) wraps every remote command so a non-interactive ssh finds
-`node` and `lane`. `root` (default `~/.cache/lane-broker/remote` on the
+`node` and `lane`. `speedFactor` (BRAIN-405, positive number, default `1`, higher is
+faster) scales this runner's estimated finish when several runners have room. `root` (default `~/.cache/lane-broker/remote` on the
 runner) holds per-ticket work dirs. A runner has no `runners` of its own.
 
 What a remote run does:
@@ -321,17 +322,28 @@ What a remote run does:
    serialized file list (the snapshot's header line) is capped at ~16 MB —
    roughly 90k files — checked locally before dialing ssh; a larger tree
    stays local with that reason.
-2. **Pick a runner**: probe each in config order (`lane remote-probe`, 6 s
-   hard deadline) and take the first that is reachable, speaks the protocol
-   the lane needs (below), is not paused, has no queue, and could ever fit
-   the lane's reservation (weight, CPU budget, memory plus its reserve, from
-   the runner's static capacity — never its momentary load). None → local.
+2. **Pick a runner**: probe every runner (`lane remote-probe`, 6 s hard
+   deadline each) and keep those that are reachable, speak the protocol the
+   lane needs (below), are not paused, have no queue, could ever fit the
+   lane's reservation (weight, CPU budget, memory plus its reserve, from the
+   runner's static capacity) **and have real room right now**: the probe's
+   `headroom` (its CPU budget minus the larger of the cores its leases reserve
+   and its 1-minute load average, so load the broker did not admit counts;
+   available memory minus the memory reserve) covers the ticket's CPU (its
+   elastic floor on a runner that admits below the declared claim) and memory.
+   A figure the probe does not report never counts against a runner. A runner
+   with an empty queue and no headroom is not chosen. Among the rest the
+   earliest estimated finish wins: `(queued + 1) × the ticket's cpuCores ÷
+   the runner's speedFactor` (a `runners[]` field, positive number, default
+   `1`, higher is faster); a tie goes to the runner with more free CPU, then
+   config order. None → local.
    If no runner is idle, the usable runner with the fewest queued tickets
-   (ties: config order) is taken **only if** it has at most `maxRemoteQueue`
+   (ties: estimated finish, then config order) is taken **only if** it has at most `maxRemoteQueue`
    queued (global config, integer >= 0, default `2`; `0` = never queue on a
    runner) **and** this machine could not start the ticket right now either
    (its queue is non-empty, or a conflict, capacity, pause, load-gate,
    cooldown or memory check refuses it); otherwise the run stays local.
+   A runner with room always beats any runner queue.
    A run queued this way records `queuedAt: "<runner>(<queued at pick time>)"`
    in its result and attempt record and logs `lane: queuing on ...`. The
    local check reaps stale records like every admission poll but never
@@ -341,6 +353,26 @@ What a remote run does:
    the persisted gate without sampling, so a gate one low-load sample from
    reopening reads closed and the ticket may queue remotely instead of
    starting locally.
+
+   **Late rebinding (BRAIN-405).** A ticket that falls back to this
+   machine's queue only because no runner had room keeps its eligibility
+   (`remote.fallback: {reason, at}` on its queue record). While it is still
+   queued, its own supervisor re-probes the runners every
+   `remoteRebindIntervalMs` (global config, integer >= 0, default `30000`; `0`
+   disables). When one has room it withdraws the ticket from the local queue
+   in one locked step shared with the scheduler's own admission, so exactly
+   one of the two takes it (a started, cancelled or already-gone ticket is
+   never withdrawn), then dispatches as above, logging
+   `lane: remote-rebind: <id>: seq <n> -> <runner>` to the admission log. If the runner then
+   refuses or the transport fails, the ticket goes back into the local queue
+   **at its original sequence number** and logs `remote-rebind: … stays in the
+   local queue at seq <n>`. A running ticket never moves. Never rebound:
+   `--local`, `LANE_BROKER_LOCAL=1`, an inherited lease, a lane that is not
+   `remote`, and a ticket that fell back for any reason other than "no runner
+   had room" (an ineligible tree, a `remoteDeps` failure, a dispatch that
+   failed after sending). A withdrawn ticket's fairness counters (conflict and
+   resource skips) may restart, since the scheduler prunes the records of a
+   ticket that left the queue.
 3. **Send a snapshot**, not history: a framed stream of exactly the listed
    files. Each file is re-read without following symlinks and its sha256
    checked before its bytes are sent. The runner validates every frame

@@ -15,7 +15,7 @@ import {
   MigrationInProgressError,
   testDrainAt,
 } from './state.js';
-import { enqueue, tryStart, dequeueSync, couldAdmitNow } from './scheduler.js';
+import { enqueue, tryStart, dequeueSync, couldAdmitNow, withdrawQueued, restoreQueued } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { observeLeaseTree } from './cpu.js';
@@ -430,6 +430,20 @@ function migrationRefusalResult(ticket) {
   return { id: ticket.id, exit: 75, signal: null, startedAt: null, endedAt: Date.now(), waitedMs: null, cancelled: false, reason: 'scheduler-migration' };
 }
 
+/** What `selectRunner` needs to judge a ticket: its protocol, and its reservation (shared by a first attempt and a rebind). */
+function remoteSelectOptions(enriched, globalCfg) {
+  return {
+    maxRemoteQueue: globalCfg.maxRemoteQueue,
+    requireProtocol2: needsProtocol2(enriched.remote) || Boolean(globalCfg.remoteQueueTimeoutMs),
+    reservation: {
+      weight: enriched.weight,
+      cpuCores: enriched.resources.cpuCores,
+      minCpuCores: enriched.resources.minCpuCores,
+      memoryBytes: enriched.resources.memoryBytes,
+    },
+  };
+}
+
 /**
  * Attempt a remote runner for a remote-eligible ticket (`ticket.remote`,
  * BRAIN-319 T3b-1's payload), BEFORE the ticket is ever handed to the local
@@ -439,10 +453,18 @@ function migrationRefusalResult(ticket) {
  * has reached a terminal outcome here (confirmed, cancelled, or refused) --
  * `process.exit()` has already been called on that path, matching every
  * other terminal path in this file.
+ *
+ * BRAIN-405: `rebind` (`{ generation, runner, probe }`) runs the same attempt for a ticket that already fell back and sits in
+ * the local queue: the caller has chosen the runner, this withdraws the ticket from the queue (only if it is still queued)
+ * right before dispatch, and any failure after that puts it back at its original queue position and resolves
+ * `{ fallback: true, rebindFailed: true }` -- a rebind never terminates a ticket by refusing it.
  */
-async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
+async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind = null) {
   const attemptStartedAt = Date.now();
-  await createAttempt(root, enriched.id, { runner: null });
+  // the attempt generation every fence below acts on: 0 for a first attempt, the fallback's generation for a rebind
+  const gen = rebind ? rebind.generation : 0;
+  let withdrawn = null;
+  if (!rebind) await createAttempt(root, enriched.id, { runner: null });
 
   // Reuses the SAME two writers a local child's output goes through
   // (CappedLogWriter/ForwardWriter, defined above) -- no second relay.
@@ -504,7 +526,21 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     process.exit(Number.isInteger(finalResult.exit) ? finalResult.exit : 1);
   }
 
-  async function fallbackOrRefuse(runner, reason) {
+  async function abandonRebind(runner, reason) {
+    if (withdrawn) {
+      await updateAttempt(root, enriched.id, gen, { executor: 'local', phase: 'queued', runner: null });
+      await restoreQueued(root, withdrawn);
+    }
+    const line = `lane: remote-rebind: ${enriched.id}: ${runner ? runner.name : 'no runner'}: ${reason} — stays in the local queue${withdrawn ? ` at seq ${withdrawn.seq}` : ''}\n`;
+    process.stderr.write(line);
+    writeBrokerLog(root, line);
+    await logWriter.finish();
+    return { fallback: true, rebindFailed: true, attemptGeneration: gen };
+  }
+
+  /** `rebindable`: this fallback is only "no runner had room right now", so a later probe may still find one. */
+  async function fallbackOrRefuse(runner, reason, { rebindable = false } = {}) {
+    if (rebind) return abandonRebind(runner, reason);
     const fb = await fallbackToLocal(root, enriched.id, reason);
     if (!fb.ok) {
       if (fb.cancelled) {
@@ -541,7 +577,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
       return { fallback: false };
     }
 
-    return { fallback: true, attemptGeneration: fb.attempt.generation, fallbackReason: reason };
+    return { fallback: true, attemptGeneration: fb.attempt.generation, fallbackReason: reason, rebindable };
   }
 
   // Codex pre-merge finding #5: decide ELIGIBILITY before ever probing a
@@ -577,19 +613,12 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
   // own protocol (inside dispatchRemote) still derives from
   // `needsProtocol2(enriched.remote)` alone, so an optionless lane still
   // sends a protocol-1 header even when this is true.
-  const { runner, skipped, queuedChoice, probe } = await selectRunner(globalCfg.runners || [], {
-    maxRemoteQueue: globalCfg.maxRemoteQueue,
-    requireProtocol2: needsProtocol2(enriched.remote) || Boolean(globalCfg.remoteQueueTimeoutMs),
-    reservation: {
-      weight: enriched.weight,
-      cpuCores: enriched.resources.cpuCores,
-      minCpuCores: enriched.resources.minCpuCores,
-      memoryBytes: enriched.resources.memoryBytes,
-    },
-  });
+  const { runner, skipped, queuedChoice, probe } = rebind
+    ? { runner: rebind.runner, skipped: [], queuedChoice: false, probe: rebind.probe }
+    : await selectRunner(globalCfg.runners || [], remoteSelectOptions(enriched, globalCfg));
   if (!runner) {
     const reason = skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : 'no runners configured';
-    return fallbackOrRefuse(null, reason);
+    return fallbackOrRefuse(null, reason, { rebindable: true });
   }
 
   // BRAIN-338: every runner has a queue. Queue on the least-loaded one only
@@ -601,7 +630,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     const local = await couldAdmitNow(root, globalCfg, enriched);
     if (local.admit) {
       const reason = skipped.map((s) => `${s.name}: ${s.reason}`).join('; ');
-      return fallbackOrRefuse(null, `${reason}; local can admit now, not queuing on ${queuedAt}`);
+      return fallbackOrRefuse(null, `${reason}; local can admit now, not queuing on ${queuedAt}`, { rebindable: true });
     }
     const line = `lane: queuing on ${queuedAt}: local cannot admit now (${local.reason})\n`;
     process.stderr.write(line);
@@ -611,12 +640,24 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
   // BRAIN-380: remote dispatch is an admission entry point. The marker check and the attempt write are ONE locked step
   // (`refuseWhileMigrating`), so a migration or drain cannot start between them; refuse before anything is sent to a runner.
   testDrainAt(root, 'dispatch');
+  if (rebind) {
+    // BRAIN-405: the last step before the ticket leaves the local queue. `withdrawQueued` shares tryStart's lock and its
+    // dequeue, so either this takes the ticket or the scheduler already did (or it was cancelled): never both, never neither.
+    withdrawn = await withdrawQueued(root, enriched.id);
+    if (!withdrawn) {
+      await logWriter.finish();
+      return { fallback: true, rebindLost: true, attemptGeneration: gen };
+    }
+    const line = `lane: remote-rebind: ${enriched.id}: seq ${withdrawn.seq} -> ${runner.name} (queued locally ${Math.round((Date.now() - withdrawn.createdAt) / 1000)}s)\n`;
+    process.stderr.write(line);
+    writeBrokerLog(root, line);
+  }
   try {
-    await updateAttempt(root, enriched.id, 0, { phase: 'running', runner: runner.name, ...(queuedAt ? { queuedAt } : {}) }, { refuseWhileMigrating: true });
+    await updateAttempt(root, enriched.id, gen, { phase: 'running', runner: runner.name, ...(rebind ? { executor: 'remote' } : {}), ...(queuedAt ? { queuedAt } : {}) }, { refuseWhileMigrating: true });
   } catch (err) {
     if (!(err instanceof MigrationInProgressError)) throw err;
     process.stderr.write(`lane: ${err.message}\n`);
-    await publishAndExit(0, () => migrationRefusalResult(enriched));
+    await publishAndExit(gen, () => migrationRefusalResult(enriched));
     return { fallback: false };
   }
   selectedRunner = runner.name;
@@ -647,7 +688,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     argv: enriched.cmd,
     lane: enriched.lane,
     ticketId: enriched.id,
-    generation: 0,
+    generation: gen,
     // BRAIN-320 S1d: opt-in, from THIS (client) machine's own global config
     // -- never the runner's -- so an unset value here means the header
     // carries no queueTimeoutMs at all (I6).
@@ -675,7 +716,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
       process.stderr.write(phaseLine);
       writeBrokerLog(root, phaseLine);
     }
-    await updateAttempt(root, enriched.id, 0, { remotePhase: dispatch.phase ?? null });
+    await updateAttempt(root, enriched.id, gen, { remotePhase: dispatch.phase ?? null });
     const artifactFields = artifactsSupported
       ? returnRemoteArtifacts(root, enriched, dispatch)
       : artifactsUnsupportedWarning
@@ -685,7 +726,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
     // everything before the runner-reported run. Never the run itself.
     const runMs = dispatch.result.runMs;
     const remoteWaitedMs = Number.isFinite(runMs) && runMs >= 0 ? Math.max(0, endedAt - enriched.createdAt - runMs) : null;
-    await publishAndExit(0, () => ({
+    await publishAndExit(gen, () => ({
       id: enriched.id,
       exit: dispatch.exitCode,
       signal: null,
@@ -706,7 +747,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal) {
   }
 
   if (dispatch.outcome === 'cancelled') {
-    await publishAndExit(0, () => {
+    await publishAndExit(gen, () => {
       throw new Error('unreachable: dispatchRemote reported cancelled');
     });
     return { fallback: false };
@@ -765,6 +806,7 @@ async function main() {
 
   let attemptGeneration = null;
   let fallbackReason;
+  let rebindable = false;
   // BRAIN-380: createAttempt and enqueue refuse under the lock while `lane migrate-scheduler` runs. The ticket never
   // started, so publish exit 75 (through the attempt, if a fallback one exists) rather than die with no result.
   async function exitMigrating(err) {
@@ -786,6 +828,9 @@ async function main() {
     if (!outcome.fallback) return; // terminal outcome: runRemoteAttempt already called process.exit()
     attemptGeneration = outcome.attemptGeneration;
     fallbackReason = outcome.fallbackReason;
+    // BRAIN-405: only a fallback for want of a runner with room stays rebindable; the marker rides in the queue record.
+    rebindable = outcome.rebindable === true;
+    if (rebindable) enriched.remote = { ...enriched.remote, fallback: { reason: fallbackReason, at: Date.now() } };
   }
 
   /**
@@ -859,6 +904,19 @@ async function main() {
     if (!(err instanceof MigrationInProgressError)) throw err;
     return exitMigrating(err);
   }
+
+  /**
+   * BRAIN-405: this ticket fell back to the local queue only because no runner had room then. Re-probe the runners and, if one
+   * has real room now, move the ticket there. A runner is chosen BEFORE the ticket leaves the queue, so a probe that finds
+   * nothing costs nothing; `runRemoteAttempt` then withdraws it atomically and, on any failure, puts it back where it was. It
+   * only returns when the ticket is still queued locally -- a dispatched ticket ends in the process exiting, as ever.
+   */
+  async function tryRebind() {
+    const { runner, probe } = await selectRunner(globalCfg.runners || [], { ...remoteSelectOptions(enriched, globalCfg), maxRemoteQueue: 0 });
+    if (!runner) return;
+    await runRemoteAttempt(root, enriched, globalCfg, abortController.signal, { generation: attemptGeneration, runner, probe });
+  }
+  let nextRebindAt = Date.now() + (globalCfg.remoteRebindIntervalMs || 0);
 
   let started;
   for (;;) {
@@ -940,6 +998,15 @@ async function main() {
       dequeueSync(root, ticket.id);
       touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit(outcome, { forcePublish: cancelWon });
+    }
+    if (rebindable && globalCfg.remoteRebindIntervalMs > 0 && Date.now() >= nextRebindAt && (globalCfg.runners || []).length > 0) {
+      nextRebindAt = Date.now() + globalCfg.remoteRebindIntervalMs;
+      try {
+        await tryRebind();
+      } catch (err) {
+        if (!(err instanceof MigrationInProgressError)) throw err;
+        return exitMigrating(err);
+      }
     }
     await sleep(globalCfg.sampleMs);
   }
