@@ -1,10 +1,11 @@
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { spawn } from 'node:child_process';
 import path from 'node:path';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneSpawn, laneRun, waitFor } from './helpers.js';
 import { sampleHostCpu } from '../src/cpu.js';
-import { parseProcCpuStat, parsePsCpuTable, parsePsCpuTime, readLeaseMarkers } from '../src/preemptible.js';
+import { parseProcCpuStat, parsePsCpuTable, parsePsCpuTime, readLeaseMarkers, readProcCpuRows, procSnapshot, withDeltas, preemptibleCores } from '../src/preemptible.js';
 import { sampleAndUpdateCpuGate, evaluateCpuAdmission, nonPreemptibleBusy } from '../src/admission.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { paths, readJsonSafe } from '../src/state.js';
@@ -16,12 +17,20 @@ import { paths, readJsonSafe } from '../src/state.js';
 const CORES = 10;
 const cpus = (user, idle) => Array.from({ length: CORES }, () => ({ model: 't', speed: 0, times: { user, nice: 0, sys: 0, idle, irq: 0 } }));
 const cfg = { ...DEFAULT_GLOBAL_CONFIG, cpuClosePercent: 90, cpuOpenPercent: 70, cpuOpenSamples: 1, cpuAdmissionPercent: 90, cpuReserveCores: 0 };
+/** Fixture clocks replace Date.now; afterEach puts the real one back (t.mock/t.after left it mocked for later tests). */
+const realNow = Date.now;
+afterEach(() => {
+  Date.now = realNow;
+});
+function fakeClock(now) {
+  Date.now = now;
+}
 const proc = (pid, nice, cpuSec, extra = {}) => ({ pid, ppid: 1, pgid: pid, nice, cpuSec, token: `t${pid}`, ...extra });
 
 /** Baseline sample at t=1000, then a second 1000 ms later. `before`/`after` are the process tables at the two instants. */
 function sampleWindow(t, state, before, after, preemptible) {
   let clock = 1000;
-  t.mock.method(Date, 'now', () => clock);
+  fakeClock(() => clock);
   const opts = (rows) => ({ preemptible, readProcs: () => rows });
   sampleHostCpu(state, cpus(0, 0), opts(before));
   clock = 2000;
@@ -68,7 +77,7 @@ test('fail closed: a held lease whose tree is not known yet, or an unreadable pr
   assert.equal(sampleWindow(t, state, ...pair(10), lane(0, { heldLeases: [spawning] })).preemptibleBusyCores, 0);
   const s2 = freshEnv().state;
   let clock = 1000;
-  t.mock.method(Date, 'now', () => clock);
+  fakeClock(() => clock);
   const broken = { preemptible: lane(0), readProcs: () => { throw new Error('ps failed'); } };
   sampleHostCpu(s2, cpus(0, 0), broken);
   clock = 2000;
@@ -90,7 +99,7 @@ test('a process with no previous reading, a reused pid, or one that just went id
 test('a reused sample is recomputed per candidate: the nice-0 discount never crosses to a nice-10 candidate', (t) => {
   const { state } = freshEnv();
   let clock = 1000;
-  t.mock.method(Date, 'now', () => clock);
+  fakeClock(() => clock);
   const [before, after] = pair(10);
   const read = (rows) => ({ readProcs: () => rows, reuseWindowMs: 60_000 });
   sampleHostCpu(state, cpus(0, 0), { ...read(before), preemptible: lane(0) });
@@ -199,4 +208,42 @@ test('integration: a lane is admitted while a fake niced load is present, and no
   fs.writeFileSync(busyFile, '9.5,10,8.5'); // same total, 8.5 cores of it niced
   assert.ok(await waitFor(() => fs.existsSync(path.join(paths(state).leases, `${blocked}.json`)), { timeoutMs: 15000 }), 'the lane starts once the load is niced');
   await laneRun(['cancel', blocked], { env, cwd: repoDir });
+});
+
+test('fixture clocks do not leak: Date.now is real again after the mocked tests', () => {
+  const a = Date.now();
+  assert.ok(a > 1_700_000_000_000, `Date.now() returned ${a}`);
+});
+
+test('REAL process table: a nice-15 busy-loop child counts as preemptible for a nice-0 lane, and not for a nice-15 lane', async (t) => {
+  const child = spawn('/usr/bin/nice', ['-n', '15', process.execPath, '-e', 'for(;;){}'], { stdio: 'ignore' });
+  t.after(() => child.kill('SIGKILL'));
+  await new Promise((r) => setTimeout(r, 300)); // let nice exec into node
+  const first = readProcCpuRows();
+  assert.ok(first.length > 5, `the real table has rows, got ${first.length}`);
+  const mine = first.find((r) => r.pid === child.pid);
+  assert.ok(mine, 'the child is in the real table');
+  assert.equal(mine.nice, 15);
+  const prev = procSnapshot(first);
+  const started = Date.now();
+  await new Promise((r) => setTimeout(r, 2000));
+  const rows = withDeltas(readProcCpuRows(), prev);
+  const windowMs = Date.now() - started;
+  const cores = preemptibleCores({ rows, windowMs, laneNice: 0, heldLeases: [] });
+  assert.ok(cores > 0.2, `the busy child must be found as preemptible, got ${cores}`);
+  assert.equal(preemptibleCores({ rows, windowMs, laneNice: 15, heldLeases: [] }), 0);
+  assert.throws(() => preemptibleCores({ rows: readProcCpuRows(), windowMs, laneNice: 0 }), /withDeltas/);
+});
+
+test('REAL sampler path: sampleHostCpu with a real busy nice-15 child reports preemptible cores', async (t) => {
+  const { state } = freshEnv();
+  const child = spawn('/usr/bin/nice', ['-n', '15', process.execPath, '-e', 'for(;;){}'], { stdio: 'ignore' });
+  t.after(() => child.kill('SIGKILL'));
+  await new Promise((r) => setTimeout(r, 300));
+  const opts = { preemptible: lane(0) };
+  sampleHostCpu(state, undefined, opts);
+  await new Promise((r) => setTimeout(r, 2000));
+  const sample = sampleHostCpu(state, undefined, opts);
+  assert.equal(sample.stale, false);
+  assert.ok(sample.preemptibleBusyCores > 0.2, `got ${sample.preemptibleBusyCores} of ${sample.hostBusyCores} busy`);
 });

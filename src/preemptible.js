@@ -151,6 +151,9 @@ function leasePids(rows, heldLeases) {
  */
 export function preemptibleCores({ rows, windowMs, laneNice, niceMin = 1, heldLeases = [], readMarkers = readLeaseMarkers }) {
   if (!rows || !(windowMs > 0) || !(niceMin > 0)) return 0;
+  // Raw readProcCpuRows output has no per-process delta: callers must pass withDeltas(rows, prevProcs). Reading it as
+  // "nothing moved" would silently report 0 preemptible, so a misuse is loud instead.
+  if (rows.length > 0 && !rows.some((r) => 'deltaSec' in r)) throw new TypeError('preemptibleCores needs rows from withDeltas(rows, prevProcs)');
   const members = leasePids(rows, heldLeases);
   if (members === null) return 0;
   // Only a process that would otherwise count is checked for a lease marker (a lane worker that left its tree via
