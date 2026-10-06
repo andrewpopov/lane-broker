@@ -739,13 +739,15 @@ a runner version that writes no `publisher.json`), or after `remoteResultWaitMs`
 client's global config (default 3 hours); on that expiry it first sends a
 bounded best-effort `remote-cancel`, so the runner's copy does not keep running
 beside the local rerun, then fetches the result once more: a result that landed
-during the cancel is used as the run's outcome. Otherwise the runner must have
+during the cancel is used as the run's outcome (only a valid one: after an
+unconfirmed cancel, a late record from another generation or an incomplete one keeps
+the ticket failed as below). Otherwise the runner must have
 CONFIRMED the cancel (`cancelConfirmed: true` in its reply; an older runner that
 prints no reply is unconfirmed) before the ticket falls back to local. If it did
 not, the remote job may still be running, so the ticket ends as a failure (exit
 `1`) naming the runner and saying it was not re-run, never a second execution. A runner too old to report a
 state gets the previous behaviour: three back-to-back fetches, then local.
-A cancel during the wait still sends `remote-cancel` and exits `130`.
+A cancel during the wait still sends `remote-cancel` and exits `130`, as does one during the expiry cancel or the late fetch.
 Stale never-started ticket directories on the runner are not garbage
 collected. `remote-exec` ignores SIGHUP, so a dropped ssh
 session does not stop it. If `remote-exec` is killed some other way, the
@@ -871,8 +873,8 @@ backfill, reservation and idle-exemption behaviour, which judge the full
 claim). Active `schedulerMode` only; shadow never denies, so it never relaxes.
 
 An elastic grant never exceeds this host's CPU budget (BRAIN-362). In active mode the
-claim an elastic ticket is queued, evaluated and charged at is capped at
-`floor(budget)` up front (`capElasticClaim`), so every admission path that admits
+claim an elastic ticket is evaluated and charged at is capped at `floor(budget)`
+(`capElasticClaim`), so every admission path that admits
 the full claim (a cold sample, the idle exemption, a plain fit) grants at most that,
 and the lease, history and the child's `LANE_BROKER_CPU_CORES` report it. The
 lease keeps the declared `cpuCores` beside the grant. Because grants are whole
@@ -882,10 +884,13 @@ elastic lane whose smallest grant, `ceil(minCpuCores)`, exceeds `floor(budget)`
 non-elastic claim over the budget is refused as before, never capped; a
 non-elastic fractional claim is charged as-is and is unaffected. A budget that
 shrinks after `lane run` accepted the ticket, below its floor or to under one
-core, never caps the claim below `ceil(minCpuCores)` (or to zero): the ticket stays
-as declared and waits like any over-budget claim. Queue records are capped where the
-scheduler and `lane status` read them, so a record written before the cap existed
-is reserved at the capped size too.
+core, never caps the claim below `ceil(minCpuCores)` (or to zero): the ticket is
+denied `elastic-below-floor` before any exemption (cold sample, idle overshoot)
+could admit its full claim, and keeps waiting in case the budget grows back. As the
+queue head it is recorded futile (BRAIN-418), so it holds no reservation and smaller
+tickets backfill past it. The queue record keeps the declared claim; the cap is
+applied where the scheduler and `lane status` read it, against the budget at that
+moment, so a budget that grows back raises the grant too.
 
 The lease records `grantedCpuCores` and keeps `resources.cpuCores` as the
 declaration. Everything that charges a lease's CPU uses the grant: the CPU
