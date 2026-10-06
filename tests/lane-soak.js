@@ -19,7 +19,6 @@ import { PgCluster, PG_SKIP_REASON, roleNames, seedScale, SCALE_CLASSES } from '
 const TERMINAL = "('succeeded','failed','cancelled','skipped','lost')";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const rand = (n) => Math.floor(Math.random() * n);
-const ROOM = Object.fromEntries(SCALE_CLASSES.map((cls) => [cls, 4]));
 
 export async function runSoak({ minutes, claimers = 8, injectBadOrder = false, mutate, groups = 40, jobs = 8000, queuedTarget = 6000, log = console.log }) {
   const cluster = PgCluster.start();
@@ -69,7 +68,7 @@ export async function runSoak({ minutes, claimers = 8, injectBadOrder = false, m
         const started = process.hrtime.bigint();
         let got;
         try {
-          got = await claimNext(client, { generation: 1, room: ROOM, memBytes: 1e12, token: randomUUID() });
+          got = await claimNext(client, { generation: 1, free: 8, memBytes: 1e12, token: randomUUID() });
         } catch (err) {
           await client.query('ROLLBACK').catch(() => {});
           if (err.code === '40P01') { stats.deadlocks++; note('deadlock', `claim: ${err.message}`); } else { stats.otherErrors++; note('error', `claim: ${err.message}`); }
@@ -188,10 +187,10 @@ export async function runSoak({ minutes, claimers = 8, injectBadOrder = false, m
         if (n >= queuedTarget) continue;
         const batch = Array.from({ length: 200 }, (_, i) => ({
           idem_key: `s${i}`, class: SCALE_CLASSES[i % SCALE_CLASSES.length], template_id: 't', template_version: 1,
-          est_ref_ms: 100 + rand(60000), cpu_req: 1, dup_safe: true,
+          est_p50_s: 100 + rand(60000), cpu_req: 1, dup_safe: true,
         }));
         try {
-          const { rows: [{ id }] } = await submit.query("SELECT lane.submit_group($1::uuid, 'single', 'acct', $2::smallint, '{}'::jsonb, 'x', $3::jsonb) AS id", [randomUUID(), rand(3), JSON.stringify(batch)]);
+          const { rows: [{ id }] } = await submit.query("SELECT lane.submit_group($1::uuid, 'single', 'acct', $2::text, '{}'::jsonb, 'x', $3::jsonb) AS id", [randomUUID(), ['batch', 'normal', 'gate'][rand(3)], JSON.stringify(batch)]);
           await submit.query('SELECT lane.activate_group($1)', [id]);
           submittedJobs += batch.length;
           stats.submittedGroups++;

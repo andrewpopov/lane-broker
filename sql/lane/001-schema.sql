@@ -1,4 +1,4 @@
--- BRAIN-400 task 1: the `lane` schema for the unified work queue (spec rev6 sections 3, 4.2, 5, 11.1).
+-- BRAIN-400: the `lane` schema for the unified work queue (spec rev11 sections 3, 4.2, 5, 11.1).
 -- Idempotent: every statement is safe to re-apply. Functions live in 002-claim.sql, which also hands
 -- ownership to lane_definer and sets every grant, so a partial apply never leaves a role with table access.
 
@@ -34,7 +34,25 @@ CREATE TABLE IF NOT EXISTS lane.hosts (
   can_compute boolean NOT NULL DEFAULT true,
   state text NOT NULL DEFAULT 'active' CHECK (state IN ('active','draining','disabled','fenced')),
   breaker_until timestamptz,
+  budget real NOT NULL DEFAULT 8 CHECK (budget > 0),          -- B: the CPU the host offers the queue; floors and caps are fractions of it
   tags text[] NOT NULL DEFAULT '{}');
+
+-- Five strict bands (spec 5.1): band = rank, and nothing but the overdue rule crosses a class boundary.
+-- requires_capability names a boolean column of lane.principals that a submitter must hold for the class.
+CREATE TABLE IF NOT EXISTS lane.priority_classes (
+  name text PRIMARY KEY, rank smallint NOT NULL UNIQUE, cod_per_min real NOT NULL CHECK (cod_per_min >= 0), requires_capability text);
+INSERT INTO lane.priority_classes (name, rank, cod_per_min, requires_capability) VALUES
+  ('interactive', 4, 10, 'can_interactive'), ('gate', 3, 4, NULL), ('normal', 2, 2, NULL),
+  ('batch', 1, 0.5, 'can_batch'), ('scavenger', 0, 0.05, 'can_scavenge')
+  ON CONFLICT DO NOTHING;
+
+-- Tunables and the two flags that stay off until the ETA gate passes (spec 5.5, 13). interactive_max_cores NULL means
+-- half the fleet's admission budget (5.3).
+CREATE TABLE IF NOT EXISTS lane.config (
+  singleton boolean PRIMARY KEY DEFAULT true CHECK (singleton),
+  wsjf_enabled boolean NOT NULL DEFAULT false, deadlines_enabled boolean NOT NULL DEFAULT false,
+  interactive_max_cores real);
+INSERT INTO lane.config (singleton) VALUES (true) ON CONFLICT DO NOTHING;
 
 -- login_role is the Postgres login (session_user); every function derives host/owner/account from it.
 CREATE TABLE IF NOT EXISTS lane.principals (
@@ -43,7 +61,15 @@ CREATE TABLE IF NOT EXISTS lane.principals (
   kind text NOT NULL CHECK (kind IN ('agent','submit','reader','admin')),
   allowed_accounts text[] NOT NULL DEFAULT '{}',
   allowed_repos text[] NOT NULL DEFAULT '{}',
-  allowed_dest_hosts text[] NOT NULL DEFAULT '{}');
+  allowed_dest_hosts text[] NOT NULL DEFAULT '{}',
+  max_class text NOT NULL DEFAULT 'gate' REFERENCES lane.priority_classes(name),       -- agents get at most `gate` by default (5.1)
+  can_interactive boolean NOT NULL DEFAULT false, can_batch boolean NOT NULL DEFAULT true,
+  can_scavenge boolean NOT NULL DEFAULT false, can_deadline boolean NOT NULL DEFAULT false);
+
+-- Speed factors, time multipliers (>1 slower), by host, work class and ref-s bucket (short < 120 s, mid <= 600 s, long); 1 when absent.
+CREATE TABLE IF NOT EXISTS lane.host_factors (
+  host_id text NOT NULL REFERENCES lane.hosts(host_id), class text NOT NULL, bucket text NOT NULL CHECK (bucket IN ('short','mid','long')),
+  factor real NOT NULL CHECK (factor > 0), PRIMARY KEY (host_id, class, bucket));
 
 CREATE TABLE IF NOT EXISTS lane.host_class_policy (
   host_id text NOT NULL REFERENCES lane.hosts(host_id), class text NOT NULL,
@@ -67,22 +93,41 @@ CREATE TABLE IF NOT EXISTS lane.command_templates (
   revoked boolean NOT NULL DEFAULT false,
   PRIMARY KEY (template_id, version));
 
--- activated_at is the aging origin: assigned by activate_group under the lane_sched lock from the
--- post-lock clock, never from created_at (a late-committing earlier transaction would sort ahead).
+-- One scheduling parent per (account, class), derived server-side from the principal's account and the group's class
+-- (spec 5.3). Aging, fair share, decayed usage and remaining work live here, so splitting a submission buys nothing.
+-- aging_anchor is set by activate_group under lane_sched from the post-lock clock. demoted is the interactive
+-- over-limit hysteresis state, rewritten under lane_sched before each selection.
+CREATE TABLE IF NOT EXISTS lane.sched_parents (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(), account text NOT NULL,
+  prio_class text NOT NULL REFERENCES lane.priority_classes(name), UNIQUE (account, prio_class),
+  aging_anchor timestamptz, last_claim_at timestamptz,
+  running_cpu real NOT NULL DEFAULT 0, usage_decayed double precision NOT NULL DEFAULT 0, usage_at timestamptz,   -- core-seconds, half-life 30 min
+  demoted boolean NOT NULL DEFAULT false,
+  rem_ref jsonb);                                -- remaining ref-s by work class and bucket: {"sim": {"short": 120, "long": 4000}}
+
+-- aging_anchor is the group's own service origin, used only to order siblings inside one parent; it is assigned by
+-- activate_group under the lane_sched lock, never from created_at (a late-committing earlier transaction would sort ahead).
 CREATE TABLE IF NOT EXISTS lane.groups (
   id uuid PRIMARY KEY, submit_uuid uuid NOT NULL UNIQUE,
   kind text NOT NULL CHECK (kind IN ('gate','experiment','single')), account text NOT NULL, owner text NOT NULL,
-  tier smallint NOT NULL DEFAULT 1 CHECK (tier BETWEEN 0 AND 2),
+  parent_id uuid NOT NULL REFERENCES lane.sched_parents(id),
+  prio_class text NOT NULL DEFAULT 'normal' REFERENCES lane.priority_classes(name),
   created_at timestamptz NOT NULL DEFAULT now(),
-  activated_at timestamptz, last_claim_at timestamptz,
+  aging_anchor timestamptz, last_claim_at timestamptz,
   cancel_requested boolean NOT NULL DEFAULT false,
   snapshot jsonb NOT NULL, aggregator text NOT NULL, expected_jobs int, shard_digest text,
   on_stage_failure text NOT NULL DEFAULT 'skip_later' CHECK (on_stage_failure IN ('skip_later','continue')),
   spec jsonb NOT NULL DEFAULT '{}',
   state text NOT NULL DEFAULT 'open'
     CHECK (state IN ('open','active','aggregating','done','failed','cancelled','held')),
-  result jsonb, deadline_at timestamptz,
-  CHECK (state <> 'active' OR activated_at IS NOT NULL));
+  result jsonb,
+  deadline_at timestamptz,                       -- as requested; the scheduler reads only lane.deadline_eff (5.8)
+  deadline_valid boolean NOT NULL DEFAULT false, -- judged once at submit and on reclass
+  CHECK (state <> 'active' OR aging_anchor IS NOT NULL));
+
+-- The latest frozen forecast per group (spec 5.7); urgency reads only this, never its own output.
+CREATE TABLE IF NOT EXISTS lane.group_eta (
+  group_id uuid PRIMARY KEY REFERENCES lane.groups(id), eta_p90_s real NOT NULL, low_confidence boolean NOT NULL DEFAULT false);
 
 CREATE TABLE IF NOT EXISTS lane.jobs (
   id bigserial PRIMARY KEY, group_id uuid NOT NULL REFERENCES lane.groups(id), seq bigint NOT NULL,
@@ -90,7 +135,9 @@ CREATE TABLE IF NOT EXISTS lane.jobs (
   class text NOT NULL, template_id text NOT NULL, template_version int NOT NULL,
   FOREIGN KEY (template_id, template_version) REFERENCES lane.command_templates(template_id, version),
   params jsonb NOT NULL,
-  est_ref_ms int NOT NULL, cpu_req real NOT NULL, cpu_min real NOT NULL, mem_bytes bigint NOT NULL,
+  est_p50_s real NOT NULL, est_p90_s real NOT NULL, est_source text NOT NULL DEFAULT 'default',
+  exclusive boolean NOT NULL DEFAULT false,                 -- calibration (5.9): runs alone on its host behind a reservation
+  cpu_req real NOT NULL, cpu_min real NOT NULL, mem_bytes bigint NOT NULL,
   conflict_keys text[] NOT NULL DEFAULT '{}', conflict_scope text NOT NULL DEFAULT 'host' CHECK (conflict_scope IN ('host','global')),
   dup_safe boolean NOT NULL, host_pin text, host_tags_req text[] NOT NULL DEFAULT '{}',
   state text NOT NULL DEFAULT 'queued' CHECK (state IN
@@ -101,16 +148,21 @@ CREATE TABLE IF NOT EXISTS lane.jobs (
   retries_work smallint NOT NULL DEFAULT 0, max_work smallint NOT NULL,
   grant_cpu real, started_at timestamptz, finished_at timestamptz, exit_code int, permanent boolean, wedged boolean,
   result jsonb, log_ref text, log_tail text);
-CREATE INDEX IF NOT EXISTS jobs_queued_head ON lane.jobs (group_id, class, est_ref_ms DESC, seq) WHERE state = 'queued';
--- lane.stage_open asks "is any earlier-stage job of this group still unfinished?" once per candidate job. Without this
--- partial index it scanned every job of the group (about 1,400 buffers, 5 ms per group and class at 60k queued jobs).
-CREATE INDEX IF NOT EXISTS jobs_unfinished_stage ON lane.jobs (group_id, stage) WHERE state NOT IN ('succeeded','failed','cancelled','skipped','lost');
--- claim_next's per-group lookup has two indexes that can serve it (this one and jobs_queued_head); only the second
--- avoids evaluating eligibility on every queued job of the group, and the planner picks it only from fresh statistics.
--- PostgreSQL 17 chose the wrong one (about 200 ms per claim) on a 400-job table nobody had analysed yet. Keep the
--- statistics fresh on this hot table instead of hoping.
-ALTER TABLE lane.jobs SET (autovacuum_analyze_scale_factor = 0.01, autovacuum_analyze_threshold = 200, autovacuum_vacuum_scale_factor = 0.02);
+-- Two indexes with DISJOINT predicates, so no lookup has a choice between them and the plan cannot depend on table statistics
+-- (PostgreSQL 17 once picked a 200 ms plan on a never-analysed table when two indexes could serve the same lookup).
+-- jobs_queued_head serves the head lookup (equality on group, open stage, work class; longest-first order is the index order, so the
+-- longest fitting job is the first row that passes the filter) AND the queued half of lane.open_stage (the group's smallest queued stage).
+CREATE INDEX IF NOT EXISTS jobs_queued_head ON lane.jobs (group_id, stage, class, est_p50_s DESC, seq) WHERE state = 'queued';
+-- jobs_inflight_stage serves the other half of lane.open_stage: the smallest stage among a group's jobs that are unfinished but not queued.
+CREATE INDEX IF NOT EXISTS jobs_inflight_stage ON lane.jobs (group_id, stage) WHERE state IN ('claimed','preparing','running','held');
 CREATE INDEX IF NOT EXISTS groups_active ON lane.groups (id) WHERE state = 'active';
+
+-- The host exclusion fence (spec 5.9): while a row exists every claim on the host admits only owner_job_id.
+-- Release (terminal event of the owner, crash expiry, drain timeout) belongs to the dispatcher and reaper, which are not built yet.
+CREATE TABLE IF NOT EXISTS lane.host_reservations (
+  host_id text PRIMARY KEY REFERENCES lane.hosts(host_id), owner_job_id bigint NOT NULL REFERENCES lane.jobs(id),
+  state text NOT NULL CHECK (state IN ('draining','active')), window_id text NOT NULL, created_at timestamptz NOT NULL,
+  drain_deadline timestamptz NOT NULL, active_deadline timestamptz NOT NULL);
 
 CREATE TABLE IF NOT EXISTS lane.exclusions (
   key text NOT NULL, job_id bigint NOT NULL, epoch int NOT NULL, host text NOT NULL,

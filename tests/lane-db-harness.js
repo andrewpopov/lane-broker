@@ -2,11 +2,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { LANE_SQL_DIR, connect } from '../src/lane-db.js';
+import { LANE_SQL_DIR, connect, claimNext } from '../src/lane-db.js';
 
 /**
  * Disposable Postgres for the lane-db tests. initdb into a temp dir, listen on a Unix socket only, in a SHORT
  * /tmp path (sun_path is ~104 bytes on macOS; os.tmpdir() overflows it, see BRAIN-376), tear down on exit.
+ * autovacuum is OFF so no table ever gets background statistics: the claim must hold its plan without them (BRAIN-400).
  */
 // LANE_TEST_PG_BIN pins the Postgres under test (e.g. /usr/lib/postgresql/17/bin); when set, nothing else is tried,
 // so a run meant for PG17 can never silently test whatever else is installed.
@@ -53,7 +54,8 @@ INSERT INTO lane.principals (login_role, kind, allowed_accounts, allowed_dest_ho
 INSERT INTO lane.principals (login_role, kind) VALUES ('${roleNames.admin}', 'admin');
 INSERT INTO lane.host_class_policy (host_id, class, weight) VALUES ('h1', 'test', 1), ('h1', 'sim', 1);
 INSERT INTO lane.command_templates (template_id, version) VALUES ('t', 1);
-UPDATE lane.cluster SET claims_enabled = true;`;
+UPDATE lane.cluster SET claims_enabled = true;
+UPDATE lane.config SET wsjf_enabled = true, deadlines_enabled = true;`;
 
 export class PgCluster {
   constructor(dir, port) {
@@ -71,7 +73,7 @@ export class PgCluster {
     try {
       run('initdb', ['-D', data, '-U', 'postgres', '-A', 'trust', '-E', 'UTF8', '--no-sync']);
       run('pg_ctl', ['-D', data, '-w', '-l', path.join(dir, 'pg.log'), '-o',
-        `-c listen_addresses='' -c unix_socket_directories=${dir} -c port=${port} -c fsync=off -c max_connections=60`, 'start']);
+        `-c listen_addresses='' -c unix_socket_directories=${dir} -c port=${port} -c fsync=off -c autovacuum=off -c max_connections=60`, 'start']);
     } catch (err) {
       cluster.stop();
       throw err;
@@ -170,36 +172,58 @@ export const ago = (seconds) => new Date(Date.now() - seconds * 1000);
 export const gid = (n) => `00000000-0000-0000-0000-${String(n).padStart(12, '0')}`;
 
 /** The jobs JSON `lane.submit_group` takes. */
-export function jobsJson(n, { cls = 'test', est = 1000, cpu = 1, extra = {} } = {}) {
+export function jobsJson(n, { cls = 'test', est = 100, cpu = 1, extra = {} } = {}) {
   return Array.from({ length: n }, (_, i) => ({
-    idem_key: `k${i}`, class: cls, template_id: 't', template_version: 1, est_ref_ms: est, cpu_req: cpu, dup_safe: true, ...extra,
+    idem_key: `k${i}`, class: cls, template_id: 't', template_version: 1, est_p50_s: est, cpu_req: cpu, dup_safe: true, ...extra,
   }));
 }
 
 /**
- * Insert an ACTIVE group with its jobs directly (superuser), so a test controls activated_at / last_claim_at.
- * `jobs` is [{cls, est, cpu, n}]; est may differ per job to exercise the job-order keys.
+ * Insert an ACTIVE group with its jobs directly (superuser), so a test controls aging_anchor / last_claim_at, creating its
+ * scheduling parent (account, prio) on first use. `parentAnchor` / `parentLastClaim` only apply when that call creates the parent.
+ * `jobs` is [{cls, est (ref-s), cpu, cpuMin, count, stage, mem, exclusive}]; est may differ per job to exercise the job-order keys.
+ * No ANALYZE: a live queue is not guaranteed statistics and the claim must not depend on them.
  */
-export async function addGroup(c, { n, tier = 1, activatedAt = ago(60), lastClaimAt = null, jobs = [{}], state = 'active' }) {
+export async function addGroup(c, {
+  n, prio = 'normal', account = 'acct', activatedAt = ago(60), lastClaimAt = null, parentAnchor = activatedAt, parentLastClaim = lastClaimAt,
+  deadline = null, deadlineValid = deadline !== null, jobs = [{}], state = 'active',
+}) {
   await c.query(
-    `INSERT INTO lane.groups (id, submit_uuid, kind, account, owner, tier, snapshot, aggregator, state, activated_at, last_claim_at)
-     VALUES ($1, $1, 'single', 'acct', 'lane_test_submit', $2, '{}', 'x', $3, $4, $5)`,
-    [gid(n), tier, state, activatedAt, lastClaimAt]);
+    'INSERT INTO lane.sched_parents (account, prio_class, aging_anchor, last_claim_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+    [account, prio, parentAnchor, parentLastClaim]);
+  const { rows: [{ id: parentId }] } = await c.query('SELECT id FROM lane.sched_parents WHERE account = $1 AND prio_class = $2', [account, prio]);
+  await c.query(
+    `INSERT INTO lane.groups (id, submit_uuid, kind, account, owner, parent_id, prio_class, snapshot, aggregator, state, aging_anchor, last_claim_at,
+                              deadline_at, deadline_valid)
+     VALUES ($1, $1, 'single', $2, 'lane_test_submit', $3, $4, '{}', 'x', $5, $6, $7, $8, $9)`,
+    [gid(n), account, parentId, prio, state, activatedAt, lastClaimAt, deadline, deadlineValid]);
   let seq = 0;
-  for (const { cls = 'test', est = 1000, cpu = 1, count = 1 } of jobs) {
+  for (const { cls = 'test', est = 100, cpu = 1, cpuMin = cpu, count = 1, stage = 0, mem = 0, exclusive = false } of jobs) {
     await c.query(
-      `INSERT INTO lane.jobs (group_id, seq, idem_key, class, template_id, template_version, params, est_ref_ms, cpu_req, cpu_min,
-                              mem_bytes, dup_safe, max_infra, max_work)
-       SELECT $1, $2::bigint + g, 'k' || ($2::bigint + g), $3, 't', 1, '{}', $4, $5, $5, 0, true, 3, 2 FROM generate_series(1, $6::int) g`,
-      [gid(n), seq, cls, est, cpu, count]);
+      `INSERT INTO lane.jobs (group_id, seq, idem_key, stage, class, template_id, template_version, params, est_p50_s, est_p90_s, cpu_req, cpu_min,
+                              mem_bytes, dup_safe, max_infra, max_work, exclusive)
+       SELECT $1, $2::bigint + g, 'k' || ($2::bigint + g), $7, $3, 't', 1, '{}', $4::real, 2 * $4::real, $5, $6, $8, true, 3, 2, $10 FROM generate_series(1, $9::int) g`,
+      [gid(n), seq, cls, est, cpu, cpuMin, stage, mem, count, exclusive]);
     seq += count;
   }
-  await c.query('ANALYZE lane.jobs');   // a live queue always has statistics; without them PostgreSQL 17 picks a 200 ms plan
+  return parentId;
 }
 
-export const ROOM = { test: 1, sim: 1 };
+/** Overwrite fields of a scheduling parent (superuser). */
+export async function setParent(c, account, prio, fields) {
+  const keys = Object.keys(fields);
+  await c.query(`UPDATE lane.sched_parents SET ${keys.map((k, i) => `${k} = $${i + 3}`).join(', ')} WHERE account = $1 AND prio_class = $2`,
+    [account, prio, ...keys.map((k) => fields[k])]);
+}
+
+/** One claim as the given agent, with `extra` overriding free / used / closed / memBytes. */
+export const claimAs = (agent, extra = {}) => claimNext(agent, { generation: 1, free: FREE, memBytes: 1e12, token: randomUUID(), ...extra });
+
+/** CPU the agent reports free in the ordering tests: room for every unit job, so size never decides the order. */
+export const FREE = 8;
 
 export const SCALE_CLASSES = ['test', 'sim', 'build'];
+const SCALE_PRIOS = ['batch', 'normal', 'gate'];
 
 /**
  * A realistic fleet on top of the standard seed: `hosts` agents (lane_agent_h1..hN) each with a policy row per class,
@@ -218,15 +242,17 @@ export async function seedScale(c, { jobs, groups, hosts }) {
   }
   await c.query('UPDATE lane.principals SET allowed_dest_hosts = $1 WHERE kind = \'submit\'', [agents.map((a) => a.host)]);
   await c.query(
-    `INSERT INTO lane.groups (id, submit_uuid, kind, account, owner, tier, snapshot, aggregator, state, activated_at)
-     SELECT ('00000000-0000-0000-0000-' || lpad(g::text, 12, '0'))::uuid, ('00000000-0000-0000-0000-' || lpad(g::text, 12, '0'))::uuid,
-            'single', 'acct', '${roleNames.submit}', g % 3, '{}', 'x', 'active', now() - (g || ' minutes')::interval
-       FROM generate_series(1, $1::int) g`, [groups]);
+    `INSERT INTO lane.sched_parents (account, prio_class, aging_anchor) SELECT 'acct', p, now() - interval '5 minutes' FROM unnest($1::text[]) p`, [SCALE_PRIOS]);
   await c.query(
-    `INSERT INTO lane.jobs (group_id, seq, idem_key, class, template_id, template_version, params, est_ref_ms, cpu_req, cpu_min, mem_bytes, dup_safe, max_infra, max_work)
+    `INSERT INTO lane.groups (id, submit_uuid, kind, account, owner, parent_id, prio_class, snapshot, aggregator, state, aging_anchor)
+     SELECT ('00000000-0000-0000-0000-' || lpad(g::text, 12, '0'))::uuid, ('00000000-0000-0000-0000-' || lpad(g::text, 12, '0'))::uuid,
+            'single', 'acct', '${roleNames.submit}', p.id, p.prio_class, '{}', 'x', 'active', now() - (g || ' minutes')::interval
+       FROM generate_series(1, $1::int) g JOIN lane.sched_parents p ON p.account = 'acct' AND p.prio_class = ($2::text[])[1 + g % ${SCALE_PRIOS.length}]`, [groups, SCALE_PRIOS]);
+  await c.query(
+    `INSERT INTO lane.jobs (group_id, seq, idem_key, class, template_id, template_version, params, est_p50_s, est_p90_s, cpu_req, cpu_min, mem_bytes, dup_safe, max_infra, max_work)
      SELECT ('00000000-0000-0000-0000-' || lpad((1 + n % $1::int)::text, 12, '0'))::uuid, n, 'k' || n, ($3::text[])[1 + n % ${SCALE_CLASSES.length}], 't', 1, '{}',
-            100 + (n * 7919) % 60000, 1, 1, 0, true, 3, 2
+            100 + (n * 7919) % 60000, 2 * (100 + (n * 7919) % 60000), 1, 1, 0, true, 3, 2
        FROM generate_series(1, $2::int) n`, [groups, jobs, SCALE_CLASSES]);
-  await c.query('ANALYZE');
+  // Deliberately NO ANALYZE: the claim has to hold its plan on a table nobody has analysed.
   return agents;
 }

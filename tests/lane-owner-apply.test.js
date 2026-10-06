@@ -2,7 +2,7 @@ import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { applyMigrations, claimNext } from '../src/lane-db.js';
-import { PgCluster, PG_SKIP_REASON, roleNames, addGroup, gid, ROOM } from './lane-db-harness.js';
+import { PgCluster, PG_SKIP_REASON, roleNames, addGroup, gid, FREE } from './lane-db-harness.js';
 
 /**
  * BRAIN-400: on pitelite an ordinary admin role (not a superuser) owns the database and applies the migrations.
@@ -47,7 +47,7 @@ describe('applying sql/lane as a non-superuser database owner', { skip: PG_SKIP_
     await cluster.seed(db);
     await addGroup(su, { n: 1 });
     const agent = await cluster.client(db, roleNames.agent1);
-    const got = await claimNext(agent, { generation: 1, room: ROOM, memBytes: 1e12, token: randomUUID() });
+    const got = await claimNext(agent, { generation: 1, free: FREE, memBytes: 1e12, token: randomUUID() });
     assert.equal(got.group_id, gid(1));
     await assert.rejects(agent.query('SELECT 1 FROM lane.jobs'), /permission denied/);
   });

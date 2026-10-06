@@ -2,14 +2,14 @@ import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { applyMigrations, claimNext } from '../src/lane-db.js';
-import { PgCluster, PG_SKIP_REASON, roleNames, addGroup, gid, ROOM } from './lane-db-harness.js';
+import { PgCluster, PG_SKIP_REASON, roleNames, addGroup, gid, FREE } from './lane-db-harness.js';
 
 describe('lane schema, roles and claim bookkeeping', { skip: PG_SKIP_REASON ?? false, timeout: 60000 }, () => {
   let cluster;
   before(() => { cluster = PgCluster.start(); });
   after(async () => { await cluster?.closeClients(); cluster?.stop(); });
 
-  const claim = (agent, gen = 1) => claimNext(agent, { generation: gen, room: ROOM, memBytes: 1e12, token: randomUUID() });
+  const claim = (agent, gen = 1) => claimNext(agent, { generation: gen, free: FREE, memBytes: 1e12, token: randomUUID() });
 
   test('re-applying the migrations is idempotent and keeps data', async () => {
     const db = await cluster.freshDb();
@@ -32,7 +32,7 @@ describe('lane schema, roles and claim bookkeeping', { skip: PG_SKIP_REASON ?? f
     await assert.rejects(agent.query("SELECT lane.activate_group('00000000-0000-0000-0000-000000000001')"), /permission denied/);
     const reader = await cluster.client(db, roleNames.reader);
     assert.deepEqual((await reader.query('SELECT * FROM lane.job_state_counts')).rows, []);
-    await assert.rejects(reader.query('SELECT lane.claim_next(1, \'{}\', 0, \'{}\', gen_random_uuid())'), /permission denied/);
+    await assert.rejects(reader.query('SELECT lane.claim_next(1, 8, \'{}\', \'{}\', 0, \'{}\', gen_random_uuid())'), /permission denied/);
   });
 
   test('a claim stamps the job, the group, the stride and the outbox from one post-lock clock', async () => {
@@ -45,9 +45,10 @@ describe('lane schema, roles and claim bookkeeping', { skip: PG_SKIP_REASON ?? f
     assert.equal(got.epoch, 1);
     assert.equal(got.grant_cpu, 1);
     const { rows: [r] } = await su.query(
-      `SELECT j.state, j.host, j.lease_until - g.last_claim_at AS lease, v.vtime, e.kind, e.created_at = g.last_claim_at AS same_clock
-         FROM lane.jobs j JOIN lane.groups g ON g.id = j.group_id, lane.class_vtime v, lane.transition_events e`);
-    assert.deepEqual({ ...r, lease: r.lease.seconds }, { state: 'claimed', host: 'h1', lease: 30, vtime: 1, kind: 'claimed', same_clock: true });
+      `SELECT j.state, j.host, j.lease_until - g.last_claim_at AS lease, v.vtime, e.kind, e.created_at = g.last_claim_at AS same_clock,
+              p.last_claim_at = g.last_claim_at AS parent_same_clock, p.running_cpu
+         FROM lane.jobs j JOIN lane.groups g ON g.id = j.group_id JOIN lane.sched_parents p ON p.id = g.parent_id, lane.class_vtime v, lane.transition_events e`);
+    assert.deepEqual({ ...r, lease: r.lease.seconds }, { state: 'claimed', host: 'h1', lease: 30, vtime: 1, kind: 'claimed', same_clock: true, parent_same_clock: true, running_cpu: 1 });
   });
 
   test('a stale generation is refused, and a disabled cluster hands out nothing', async () => {

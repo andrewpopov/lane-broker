@@ -23,11 +23,14 @@ export async function applyMigrations(client, dir = LANE_SQL_DIR) {
   return files;
 }
 
-/** One claim attempt. Returns the claim row, or null when nothing was claimed. */
-export async function claimNext(client, { generation, room, memBytes, heldKeys = [], token }) {
+/**
+ * One claim attempt. `free` is the CPU free before floors, `used` the CPU in use per work class and `closed` the work
+ * classes shut by local gates (idle gate, exhausted cap); floors and caps are applied server-side. Returns the claim row, or null.
+ */
+export async function claimNext(client, { generation, free, used = {}, closed = [], memBytes, heldKeys = [], token }) {
   const { rows } = await client.query(
-    'SELECT * FROM lane.claim_next($1::bigint, $2::jsonb, $3::bigint, $4::text[], $5::uuid)',
-    [generation, JSON.stringify(room), memBytes, heldKeys, token],
+    'SELECT * FROM lane.claim_next($1::bigint, $2::real, $3::jsonb, $4::text[], $5::bigint, $6::text[], $7::uuid)',
+    [generation, free, JSON.stringify(used), closed, memBytes, heldKeys, token],
   );
   return rows[0] ?? null;
 }
