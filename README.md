@@ -1207,9 +1207,15 @@ symlinks.
   it is never tombstoned (that would delete the replica's intact copy), replication of that path blocks, and it is counted
   in `lane_store_lost_objects` and compare's `lostAtPrimary`. Recovery is an operator step: re-upload the blob
   (`PUT /blobs/<sha>`), or fetch it from the replica (`GET /blobs/<sha>` with a replica token) and PUT it to the primary.
-- **Retention runs on the primary only.** Terminal marks, pins and every deletion are journal records (`terminal`, `pin`,
-  `delete`) that the replica applies in order, so it mirrors the primary and never sweeps on its own (`serve --replica`
-  makes `sweep` a no-op there). An object missing on the primary blocks the watermark unless a later `delete` record explains it.
+- **Deletions are never replicated.** Replication ships puts (blobs, manifests) and pin/terminal state only; `delete-intent`,
+  `delete` and `delete-cancel` records stay local. A put whose object is gone from the primary is skipped only if the journal
+  holds a committed `delete` for it later; otherwise replication blocks there. The replica runs its own time-based retention
+  (`serve --replica [--replica-grace-hours N]`, default 336 = the primary's 14-day terminal retention, so `compare` never reports a replica sweep as missing): it sweeps a manifest only when the replicated state says terminal and
+  unpinned and it received it more than the grace ago, and a blob only when no remaining manifest references it and it is
+  older than the grace, so a manifest still in flight keeps its blobs. A stall longer than the grace is already alerting via
+  `oldest_unreplicated_object_age_seconds`. (`compare` can therefore report `missingAtReplica` for primary objects the replica
+  already swept; the primary keeps terminal manifests 14 d.) Registering a manifest or a duplicate upload cancels a pending
+  delete-intent for the blobs it needs (`delete-cancel`).
   Store-wide: nothing under the root may be a symlink (ancestors lstat-checked, leaves opened `O_NOFOLLOW`, root `realpath`ed);
   manifests count toward `--cap-bytes`, and admission reserves declared bytes atomically.
   Accepted residual risk: `O_NOFOLLOW` protects only the final path component, so an ancestor directory swapped for a symlink

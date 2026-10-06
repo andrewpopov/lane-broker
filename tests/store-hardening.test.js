@@ -191,7 +191,7 @@ test('#5 a replica sweep between blob verification and manifest delivery deletes
   assert.ok(p.replica.store.readManifest('job-1'));
 });
 
-test('#9 repeated complete-and-expire cycles keep replica storage bounded and equal to the primary', async (t) => {
+test('#9 repeated complete-and-expire cycles keep replica storage bounded: its own local retention, deletions are never shipped', async (t) => {
   const p = await pair();
   t.after(() => p.close());
   for (let i = 0; i < 4; i += 1) {
@@ -202,9 +202,10 @@ test('#9 repeated complete-and-expire cycles keep replica storage bounded and eq
     sweep(p.primary.store);
     const r = await replicator(p).runOnce();
     assert.equal(r.ok, true, r.error);
+    sweep(p.replica.store); // the replica's own time-based retention (7-day grace; everything here is older)
     const mine = (await listObjects(p.primary.root)).map((o) => o.path);
     const theirs = (await listObjects(p.replica.root)).map((o) => o.path);
-    assert.deepEqual(theirs, mine, `cycle ${i}: replica mirrors the primary's retention`);
+    assert.deepEqual(theirs, mine, `cycle ${i}: both stores swept`);
     assert.ok(theirs.length <= 2, `cycle ${i}: bounded (${theirs.length} objects)`);
   }
   assert.equal(p.replica.store.bytes, p.primary.store.bytes);

@@ -6,6 +6,7 @@ import { manifestHashOf, isCanonicalRelPath } from '../remote-manifest.js';
 import { MAX_HEADER_BYTES } from '../remote-stream.js';
 import { Journal } from './journal.js';
 import { acquireStoreLock } from './lock.js';
+import { RETENTION_DEFAULTS } from './retention.js';
 import { isSha256, isJobId, blobRelPath, manifestRelPath, parseObjectPath } from './ids.js';
 
 export class StoreError extends Error {
@@ -115,20 +116,21 @@ function parseManifestDoc(bytes) {
  * Nothing under the root may be a symlink: ancestors are lstat-checked and leaves opened with O_NOFOLLOW.
  */
 export class ObjectStore {
-  constructor(root, { now = Date.now, maxBlobBytes = DEFAULT_MAX_BLOB_BYTES, capBytes = Infinity, replicaMode = false } = {}) {
+  constructor(root, { now = Date.now, maxBlobBytes = DEFAULT_MAX_BLOB_BYTES, capBytes = Infinity, replicaMode = false, replicaGraceHours = RETENTION_DEFAULTS.manifestAfterTerminalMs / 3_600_000 } = {}) {
     fs.mkdirSync(root, { recursive: true });
     this.root = fs.realpathSync(root); // confine to the real directory; every later path is checked against symlinks below it
     this.lock = acquireStoreLock(this.root);
     try {
-      this.init({ now, maxBlobBytes, capBytes, replicaMode });
+      this.init({ now, maxBlobBytes, capBytes, replicaMode, replicaGraceHours });
     } catch (err) {
       this.lock.release();
       throw err;
     }
   }
 
-  init({ now, maxBlobBytes, capBytes, replicaMode }) {
+  init({ now, maxBlobBytes, capBytes, replicaMode, replicaGraceHours }) {
     this.now = now;
+    this.replicaGraceMs = replicaGraceHours * 3600 * 1000;
     this.maxBlobBytes = maxBlobBytes;
     this.capBytes = capBytes;
     this.replicaMode = replicaMode;
@@ -147,8 +149,11 @@ export class ObjectStore {
     this.reserved = 0; // bytes admitted but not yet committed
     this.unjournaled = new Set(); // blobs on disk without a journal record (append or post-rename step failed AND the rollback failed)
     this.pendingDeletes = new Set(); // objects unlinked whose delete record is not yet journaled
+    this.verifying = new Set(); // paths being re-hashed by rejournal: retention defers them (per-path exclusion)
+    this.intents = new Set(); // paths with a journaled delete-intent not yet completed or cancelled
     this.lost = new Set(); // journaled objects missing on disk with no delete intent: accidental loss, never tombstoned
     this.jobBlobCache = new Map();
+    for (const [rel, st] of this.journal.objectState()) if (st === 'intent') this.intents.add(rel);
     this.reconcileReport = this.reconcile();
   }
 
@@ -298,7 +303,15 @@ export class ObjectStore {
     const t = new Date(this.now());
     fs.utimesSync(this.abs(blobRelPath(sha)), t, t);
     if (this.unjournaled.has(sha)) this.journalBlob(sha);
+    this.cancelIntent(blobRelPath(sha));
     return { stored: false };
+  }
+
+  /** The object is needed again: void a pending delete-intent so startup will never complete it into a tombstone. */
+  cancelIntent(rel) {
+    if (!this.intents.has(rel)) return;
+    this.journal.append({ kind: 'delete-cancel', path: rel, createdAt: this.now() });
+    this.intents.delete(rel);
   }
 
   assertRealTmp() {
@@ -365,6 +378,7 @@ export class ObjectStore {
         fs.utimesSync(final, stamped, stamped); // retention reads mtime as "last uploaded", on the store's clock
         fsyncDirectory(path.dirname(final));
         this.journalBlob(sha);
+        this.intents.delete(blobRelPath(sha));
         this.lost.delete(blobRelPath(sha));
       } catch (err) {
         try {
@@ -421,6 +435,7 @@ export class ObjectStore {
     if (this.bytes + this.reserved + bytes.length >= this.capBytes * ADMIT_FRACTION) throw new StoreError(507, 'store is above 95% of its cap');
     this.flushPendingDeletes();
     for (const e of doc.entries) if (e.type === 'file' && this.unjournaled.has(e.sha256)) this.journalBlob(e.sha256);
+    for (const e of doc.entries) if (e.type === 'file') this.cancelIntent(blobRelPath(e.sha256));
     const rel = manifestRelPath(job);
     const metaRel = `meta/${job}.json`;
     atomicWriteFile(this.abs(rel), bytes, { fsync: true });
@@ -504,6 +519,7 @@ export class ObjectStore {
   deleteObject(rel) {
     const parsed = parseObjectPath(rel);
     if (!parsed) throw new StoreError(400, 'not an object path');
+    if (this.verifying.has(rel)) return false; // rejournal is hashing it right now: deferred to the next sweep
     this.flushPendingDeletes();
     const file = this.abs(rel);
     let st;
@@ -514,14 +530,18 @@ export class ObjectStore {
       throw err;
     }
     this.journal.append({ kind: 'delete-intent', path: rel, createdAt: this.now() });
+    this.intents.add(rel);
     fs.unlinkSync(file);
+    fsyncDirectory(path.dirname(file)); // the unlink must be durable before the delete record, or a crash resurrects the file
     this.bytes -= st.size;
     this.pendingDeletes.add(rel);
     if (parsed.kind === 'manifest') {
       fs.rmSync(this.abs(`meta/${parsed.job}.json`), { force: true });
+      fsyncDirectory(path.join(this.root, 'meta'));
       this.jobBlobCache.delete(parsed.job);
     }
     this.journalDelete(rel);
+    this.intents.delete(rel);
     return true;
   }
 
@@ -538,9 +558,16 @@ export class ObjectStore {
     this.flushPendingDeletes();
     const added = [];
     for (const rel of paths) {
-      const v = await this.verifyObject(rel);
-      if (!v) continue;
-      added.push(this.journal.append({ kind: parseObjectPath(rel).kind, path: rel, sha256: v.sha256, size: v.size, createdAt: this.now() }));
+      if (!parseObjectPath(rel)) throw new StoreError(400, 'not an object path');
+      this.verifying.add(rel);
+      try {
+        const v = await this.verifyObject(rel);
+        if (!v) continue;
+        this.abs(rel); // still there and still not a symlink; no await between this check and the append
+        added.push(this.journal.append({ kind: parseObjectPath(rel).kind, path: rel, sha256: v.sha256, size: v.size, createdAt: this.now() }));
+      } finally {
+        this.verifying.delete(rel);
+      }
     }
     return added;
   }

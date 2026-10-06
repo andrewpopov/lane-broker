@@ -6,7 +6,7 @@ import { rebuildWatermark } from './replicate.js';
 import { StoreClient } from './client.js';
 
 const USAGE = `usage: lane-store <command> [options]
-  serve      --root DIR --listen HOST:PORT [--replica | --replicate-to URL [--replicate-interval-s N]]
+  serve      --root DIR --listen HOST:PORT [--replica [--replica-grace-hours N] | --replicate-to URL [--replicate-interval-s N]]
              [--max-blob-bytes N] [--cap-bytes N] [--sweep-interval-s N] [--maintenance-interval-s N]
              secret: LANE_STORE_SECRET; with --replicate-to also LANE_STORE_REPLICA_TOKEN (role=replica)
              replication runs INSIDE this process, one round every --replicate-interval-s (default 300)
@@ -47,6 +47,7 @@ export async function storeCli(argv, env = process.env) {
       'replicate-to': { type: 'string' },
       'replicate-interval-s': { type: 'string' },
       replica: { type: 'boolean' },
+      'replica-grace-hours': { type: 'string' },
       deep: { type: 'boolean' },
       repair: { type: 'boolean' },
       seq: { type: 'string' },
@@ -60,6 +61,7 @@ export async function storeCli(argv, env = process.env) {
     const s = createStore({
       root: need(values.root, '--root'),
       replicaMode: !!values.replica,
+      replicaGraceHours: values['replica-grace-hours'] === undefined ? undefined : Number(values['replica-grace-hours']),
       verifier: createHmacVerifier(secret),
       maxBlobBytes: byteOption(values['max-blob-bytes'], '--max-blob-bytes'),
       capBytes: byteOption(values['cap-bytes'], '--cap-bytes'),

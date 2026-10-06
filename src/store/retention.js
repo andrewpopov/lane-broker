@@ -36,16 +36,18 @@ function sweepBlobs(store, now, graceMs) {
 }
 
 /**
- * One retention pass, PRIMARY ONLY. Every deletion goes through `store.deleteObject`, which journals it, so a replica
- * mirrors retention by applying records in order and never decides anything itself (a replica sweeping on its own
- * could delete a blob whose manifest is still in flight). A pinned job is never expired or evicted.
+ * One retention pass. Every deletion goes through `store.deleteObject` (intent, unlink, delete). A pinned job is never
+ * expired or evicted; a non-terminal job's manifest and blobs are always kept.
  */
 export function sweep(store, { now = store.now(), ...overrides } = {}) {
-  if (store.replicaMode) return { skipped: 'replica', expiredManifests: [], evictedManifests: [], blobsDeleted: 0, bytes: store.bytes };
-  const cfg = { ...RETENTION_DEFAULTS, ...overrides };
+  // A replica's retention is local and time-based: it never applies the primary's deletions. It sweeps a manifest only when
+  // the replicated state says terminal and unpinned AND the replica received it more than the grace ago, and an
+  // unreferenced blob only after the same grace, so a manifest still in flight can never lose its blobs.
+  const cfg = { ...RETENTION_DEFAULTS, ...(store.replicaMode ? { manifestAfterTerminalMs: store.replicaGraceMs, unreferencedBlobMs: store.replicaGraceMs } : {}), ...overrides };
   const expired = jobs(store).filter((job) => {
     const m = store.meta(job);
-    return !m.pinned && m.terminalAt != null && now - m.terminalAt >= cfg.manifestAfterTerminalMs;
+    if (m.pinned || m.terminalAt == null) return false;
+    return now - (store.replicaMode ? m.registeredAt : m.terminalAt) >= cfg.manifestAfterTerminalMs;
   });
   expired.forEach((job) => store.deleteObject(manifestRelPath(job)));
   let blobsDeleted = sweepBlobs(store, now, cfg.unreferencedBlobMs);

@@ -53,23 +53,24 @@ function rebuildLocked(root, seq) {
 }
 
 /**
- * Ships journal records to a replica in `seq` order, reading forward from the watermark's byte offset in bounded
- * chunks. Every record kind is applied and then CHECKED at the replica (objects: the replica re-reads its disk and must
- * report the journal's sha256/size; deletions: the object must be absent; terminal/pin: the replica's job state must
- * match) before the watermark moves past it. `replica` is a StoreClient. Shipping is idempotent, so a crash anywhere just
- * re-ships from the persisted watermark.
+ * Ships journal records to a replica in `seq` order, reading forward from the watermark's byte offset in bounded chunks.
+ * Only information is shipped: puts (blobs, manifests) and pin/terminal state. Deletions are NEVER replicated (the replica
+ * runs its own time-based retention), so nothing the replica holds can be destroyed on the primary's say-so. Each shipped
+ * record is CHECKED at the replica (objects: the replica re-reads its disk and must report the journal's sha256/size;
+ * state: the replica's job state must match) before the watermark moves past it. Shipping is idempotent, so a crash
+ * anywhere just re-ships from the persisted watermark.
  *
- * An object missing on the primary is NOT a skip: the only legitimate absence is retention, which leaves a journaled
- * `delete` record after it. Anything else (disk loss, an operator rm) blocks the watermark and the age keeps growing.
+ * A put whose object is missing on the primary is skipped only when retention committed a `delete` for it later in the
+ * journal; otherwise it is a loss (or an unexplained absence) and the watermark blocks there.
  */
 export class Replicator {
   /** `store` is the serving ObjectStore: the replicator is a loop INSIDE that process and reads the journal only through
    *  `store.journal`, which stops at the committed offset. */
   constructor({ store, replica, now = Date.now, chunkBytes = DEFAULT_CHUNK_BYTES, onShipped }) {
-    Object.assign(this, { store, root: store.root, replica, now, chunkBytes, onShipped, running: false });
+    Object.assign(this, { store, root: store.root, replica, now, chunkBytes, onShipped, running: false, current: null, stopped: false });
   }
 
-  /** A COMMITTED delete record for `rel` after this record (the journal reader never sees uncommitted bytes). */
+  /** A COMMITTED delete record for `rel` after this record. */
   committedDeletion(rel, fromOffset) {
     for (const rec of this.store.journal.iterate(fromOffset, { maxBytes: this.chunkBytes })) {
       if (rec.kind === 'delete' && rec.path === rel) return rec;
@@ -77,23 +78,12 @@ export class Replicator {
     return null;
   }
 
-  /**
-   * `rel` is absent on the primary. That is only legitimate when retention committed a delete for it; the replica is
-   * then brought to the same state NOW (the delete applied and checked absent there), so the watermark moves past this
-   * record only over a replica state that has been verified. No committed delete, or a replica that cannot delete: block.
-   */
-  async confirmAbsent(entry, rel) {
-    if (!this.committedDeletion(rel, entry.end)) {
-      throw new Error(`seq ${entry.seq} ${rel} is absent on the primary and no committed deletion explains it`);
-    }
-    await this.replica.deleteObject(rel);
-    if (await this.replica.verifyObject(rel)) throw new Error(`replica still holds ${rel} (seq ${entry.seq})`);
-    return 'gone';
-  }
-
   async shipObject(entry) {
     const file = path.join(this.root, ...entry.path.split('/'));
-    if (!fs.existsSync(file)) return this.confirmAbsent(entry, entry.path);
+    if (!fs.existsSync(file)) {
+      if (this.committedDeletion(entry.path, entry.end)) return 'skipped'; // retention removed it; the replica deletes nothing for us
+      throw new Error(`seq ${entry.seq} ${entry.path} is missing on the primary and no committed deletion explains it`);
+    }
     await this.replica.putObject(entry, file);
     const seen = await this.replica.verifyObject(entry.path);
     if (!seen || seen.sha256 !== entry.sha256 || seen.size !== entry.size) {
@@ -107,39 +97,40 @@ export class Replicator {
     const manifestRel = manifestRelPath(entry.job);
     const applied = entry.kind === 'pin' ? await this.replica.setPin(entry.job, entry.pinned) : await this.replica.setTerminal(entry.job, entry.terminalAt);
     if (!applied) {
-      if (fs.existsSync(path.join(this.root, ...manifestRel.split('/')))) {
-        throw new Error(`replica has no job ${entry.job} for seq ${entry.seq} but the primary does`);
-      }
-      return this.confirmAbsent(entry, manifestRel);
+      // the replica has no such job: its own retention swept it (only possible once terminal), or it never arrived
+      const here = fs.existsSync(path.join(this.root, ...manifestRel.split('/')));
+      if (here && this.store.meta(entry.job).terminalAt != null) return 'skipped';
+      if (!here && this.committedDeletion(manifestRel, entry.end)) return 'skipped';
+      throw new Error(`replica has no job ${entry.job} for seq ${entry.seq} ${entry.kind} and nothing explains it`);
     }
     const meta = await this.replica.jobMeta(entry.job);
     if (!meta || meta[field] !== entry[field]) throw new Error(`replica job state differs for seq ${entry.seq} ${entry.kind} ${entry.job}`);
     return 'shipped';
   }
 
-  async shipDelete(entry) {
-    await this.replica.deleteObject(entry.path);
-    if (await this.replica.verifyObject(entry.path)) throw new Error(`replica still holds ${entry.path} (seq ${entry.seq})`);
-    return 'shipped';
-  }
-
   ship(entry) {
-    if (entry.kind === 'delete-intent') return 'shipped'; // an intent changes nothing until its `delete` record
     if (entry.kind === 'blob' || entry.kind === 'manifest') return this.shipObject(entry);
-    if (entry.kind === 'delete') return this.shipDelete(entry);
     if (entry.kind === 'terminal' || entry.kind === 'pin') return this.shipState(entry);
+    if (entry.kind === 'delete' || entry.kind === 'delete-intent' || entry.kind === 'delete-cancel') return 'local'; // never shipped
     throw new Error(`unknown journal record kind ${entry.kind} at seq ${entry.seq}`);
   }
 
   /** Drain the journal to its current end. Records committed while this runs have higher seq and are picked up by the same loop. */
   async runOnce() {
-    if (this.running) return { ok: true, skipped: true };
+    if (this.running || this.stopped) return { ok: true, skipped: true };
     this.running = true;
+    this.current = this.round();
     try {
-      return await this.round();
+      return await this.current;
     } finally {
       this.running = false;
     }
+  }
+
+  /** Refuse new rounds and wait for the one in flight (bounded by the client's request deadline). */
+  async stop() {
+    this.stopped = true;
+    await this.current?.catch(() => {});
   }
 
   async round() {
@@ -151,8 +142,9 @@ export class Replicator {
         const entries = this.store.journal.read(state.replicatedOffset, { maxBytes: this.chunkBytes, expectSeq: state.replicatedSeq + 1 });
         if (!entries.length) break;
         for (const entry of entries) {
-          if ((await this.ship(entry)) === 'gone') gone += 1;
-          else shipped += 1;
+          const outcome = await this.ship(entry);
+          if (outcome === 'shipped') shipped += 1;
+          else gone += outcome === 'skipped' ? 1 : 0;
           state.replicatedSeq = entry.seq;
           state.replicatedOffset = entry.end;
           writeReplicationState(this.root, state);
@@ -177,5 +169,11 @@ export function startReplication({ store, replica, intervalMs, now = Date.now, l
     }, (err) => log(`lane-store: replication round crashed: ${err.message}`));
   }, intervalMs);
   timer.unref();
-  return { replicator, stop: () => clearInterval(timer) };
+  return {
+    replicator,
+    stop: async () => {
+      clearInterval(timer);
+      await replicator.stop();
+    },
+  };
 }

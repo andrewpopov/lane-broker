@@ -98,13 +98,13 @@ export function readJournal(root, afterSeq = 0, limit = Infinity) {
 }
 
 /**
- * path -> 'put' | 'intent' | 'delete': the last OBJECT record naming each path (`intent` is a delete-intent after a put).
+ * path -> 'put' | 'intent' | 'delete': the last OBJECT record naming each path (`intent` is a delete-intent after a put; a `delete-cancel` returns it to `put`).
  * Retention-state records (pin, terminal) are a separate dimension and never overwrite it. `limit` bounds the scan.
  */
 export function objectStateByPath(root, limit = Infinity) {
   const state = new Map();
   for (const rec of iterateJournal(root, 0, { limit })) {
-    if (rec.kind === 'blob' || rec.kind === 'manifest') state.set(rec.path, 'put');
+    if (rec.kind === 'blob' || rec.kind === 'manifest' || rec.kind === 'delete-cancel') state.set(rec.path, 'put');
     else if (rec.kind === 'delete-intent') state.set(rec.path, 'intent');
     else if (rec.kind === 'delete') state.set(rec.path, 'delete');
   }

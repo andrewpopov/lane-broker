@@ -13,9 +13,11 @@ export class StoreHttpError extends Error {
 
 /** Minimal client over `http` (zero dependencies). `baseUrl` is `http://host:port`; `token` is a bearer token. */
 export class StoreClient {
-  constructor({ baseUrl, token }) {
+  /** `timeoutMs` is a whole-request deadline: a peer that stops answering is cut off and the call rejects. */
+  constructor({ baseUrl, token, timeoutMs = 60_000 }) {
     this.baseUrl = new URL(baseUrl);
     this.token = token;
+    this.timeoutMs = timeoutMs;
   }
 
   request(method, pathname, { body, contentLength } = {}) {
@@ -28,7 +30,9 @@ export class StoreClient {
         res.on('end', () => resolve({ status: res.statusCode, body: Buffer.concat(chunks) }));
         res.on('error', reject);
       });
+      const deadline = setTimeout(() => req.destroy(new Error(`request to ${this.baseUrl.host} timed out after ${this.timeoutMs} ms`)), this.timeoutMs);
       req.on('error', reject);
+      req.on('close', () => clearTimeout(deadline));
       if (body && typeof body.pipe === 'function') body.pipe(req);
       else req.end(body);
     });

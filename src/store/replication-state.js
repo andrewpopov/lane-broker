@@ -26,7 +26,7 @@ export function readReplicationState(root) {
     // falls through to the refusal below
   }
   if (!s || s.format !== REPLICATION_STATE_FORMAT || !Number.isInteger(s.seq) || !Number.isInteger(s.offset)) {
-    throw new Error(`${file} is not a format-${REPLICATION_STATE_FORMAT} watermark; recompute it with: lane-store replicate --rebuild-watermark --seq <last verified seq> --root ${root}`);
+    throw new Error(`${file} is not a format-${REPLICATION_STATE_FORMAT} watermark; recompute it with: lane-store rebuild-watermark --seq <last verified seq> --root ${root}`);
   }
   return { replicatedSeq: s.seq, replicatedOffset: s.offset, failedRounds: s.failedRounds ?? 0, lastRoundAt: s.lastRoundAt ?? null };
 }

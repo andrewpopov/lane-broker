@@ -203,7 +203,7 @@ export function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, 
   });
 
   const timers = [];
-  if (sweepIntervalMs > 0 && !store.replicaMode) timers.push(setInterval(() => sweep(store), sweepIntervalMs));
+  if (sweepIntervalMs > 0) timers.push(setInterval(() => sweep(store), sweepIntervalMs));
   if (maintenanceIntervalMs > 0) {
     timers.push(setInterval(() => {
       try {
@@ -230,9 +230,9 @@ export function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, 
         server.listen(port, host, () => resolve(server.address()));
       });
     },
-    close() {
+    async close() {
       timers.forEach((t) => clearInterval(t));
-      replication?.stop();
+      await replication?.stop(); // drain the in-flight round BEFORE the journal closes and the lock is released
       return new Promise((resolve) => {
         server.close(() => {
           store.close();

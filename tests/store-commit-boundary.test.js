@@ -69,23 +69,20 @@ test('B a delete whose unlink fails journals nothing, so a later manifest can st
   assert.ok(p.replica.store.readManifest('job-1'));
 });
 
-test('B a put whose object is gone and whose delete is committed later is not skipped: the replica is brought to the deleted state and verified, or the watermark stays', async (t) => {
+test('B a put whose object is gone and whose delete is committed later is skipped, and the replica is never asked to delete anything', async (t) => {
   const p = await pair();
   t.after(() => p.close());
   await put(p.primary, 'doomed');
   assert.equal(p.primary.store.deleteObject(blobRelPath(sha('doomed'))), true); // put (1), intent (2), committed delete (3)
-  const stuck = Object.create(p.replica.replicaPeer);
-  stuck.deleteObject = async () => { throw new Error('replica delete failed'); };
-  const failed = await replicator(p, stuck).runOnce();
-  assert.equal(failed.ok, false);
-  assert.equal(readReplicationState(p.primary.root).replicatedSeq, 0, 'never advanced past an unverified put');
-  const ok = await replicator(p).runOnce();
+  const spy = Object.create(p.replica.replicaPeer);
+  spy.deleteObject = async () => { throw new Error('the replica must never be told to delete'); };
+  const ok = await replicator(p, spy).runOnce();
   assert.equal(ok.ok, true, ok.error);
   assert.equal(readReplicationState(p.primary.root).replicatedSeq, 3);
-  assert.equal(p.replica.store.hasBlob(sha('doomed')), false);
+  assert.equal(p.replica.store.hasBlob(sha('doomed')), false, 'never shipped');
 });
 
-test('B interrupted retention (intent journaled, unlinked, no delete) completes at startup and the replica converges', async (t) => {
+test('B interrupted retention (intent journaled, unlinked, no delete) completes at startup, and the replica keeps its copy', async (t) => {
   const clock = fakeClock();
   let primary = await startStore({ clock });
   const replica = await startStore({ clock, replicaMode: true });
@@ -103,7 +100,7 @@ test('B interrupted retention (intent journaled, unlinked, no delete) completes 
   assert.deepEqual(readJournal(root).map((r) => r.kind), ['blob', 'delete-intent', 'delete']);
   assert.deepEqual(primary.store.reconcileReport.deleted, [blobRelPath(sha('retired'))]);
   assert.equal((await new Replicator({ store: primary.store, replica: replica.replicaPeer, now: clock.now }).runOnce()).ok, true);
-  assert.equal(replica.store.hasBlob(sha('retired')), false);
+  assert.equal(replica.store.hasBlob(sha('retired')), true, 'the replica keeps it until its own retention decides');
 });
 
 // ---- C ----
