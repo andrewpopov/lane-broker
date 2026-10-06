@@ -104,9 +104,10 @@ export function serializeHeader(header, entries, manifestHash) {
  * per entry a frame-header line followed by exactly `size` raw bytes for a
  * file (no body for a symlink), then a `{end:true}` terminator line. Reads
  * file bytes off disk at encode time (re-verified against the manifest via
- * `readVerifiedFile`), in path-sorted order.
+ * `readVerifiedFile`), in path-sorted order. `readFile(entry)` replaces that
+ * disk read when the bytes come from somewhere else (lane-store's blobs).
  */
-export function encodeSnapshot(worktreeRoot, header, entries) {
+export function encodeSnapshot(worktreeRoot, header, entries, readFile = (entry) => readVerifiedFile(worktreeRoot, entry)) {
   const manifestHash = manifestHashOf(entries);
   const ordered = sortEntries(entries);
   const headerLine = serializeHeader(header, entries, manifestHash);
@@ -116,7 +117,7 @@ export function encodeSnapshot(worktreeRoot, header, entries) {
     for (const entry of ordered) {
       if (entry.type === 'file') {
         yield Buffer.from(`${JSON.stringify({ path: entry.path, type: 'file', exec: !!entry.exec, size: entry.size })}\n`, 'utf8');
-        yield readVerifiedFile(worktreeRoot, entry);
+        yield await readFile(entry);
       } else {
         yield Buffer.from(`${JSON.stringify({ path: entry.path, type: 'symlink', target: entry.target })}\n`, 'utf8');
       }

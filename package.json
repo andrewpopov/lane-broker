@@ -21,19 +21,21 @@
     "cli"
   ],
   "bin": {
-    "lane": "bin/lane.js"
+    "lane": "bin/lane.js",
+    "lane-store": "bin/lane-store.js"
   },
   "files": [
     "bin",
-    "src",
-    "sql"
+    "ops",
+    "sql",
+    "src"
   ],
   "engines": {
     "node": ">=20"
   },
   "scripts": {
     "test": "node --test --test-concurrency=1 tests/*.test.js",
-    "lint": "node --check bin/lane.js && for f in src/*.js scripts/*.sh; do case \"$f\" in *.sh) sh -n \"$f\" || exit 1 ;; *) node --check \"$f\" || exit 1 ;; esac; done",
+    "lint": "node --check bin/lane.js && node --check bin/lane-store.js && for f in src/*.js src/store/*.js scripts/*.sh; do case \"$f\" in *.sh) sh -n \"$f\" || exit 1 ;; *) node --check \"$f\" || exit 1 ;; esac; done",
     "verify": "npm run lint && sh scripts/verify-suite.sh",
     "prepare": "git config core.hooksPath .githooks || true"
   },

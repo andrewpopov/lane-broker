@@ -1221,6 +1221,54 @@ symlinks.
   (BRAIN-320 review fix B: a cancel that lands in that window must still win
   over the expiry).
 
+## `lane-store` (BRAIN-407, unified queue P0b)
+
+`bin/lane-store.js` is the content-addressed snapshot store behind detached submit (spec `.spec/unified-queue-spec-rev11.md`
+8.1-8.3, 9.3). Zero dependencies (`http`, `crypto`); code in `src/store/`; systemd templates (not installed) in `ops/lane-store/`.
+
+- **Objects.** Blobs live at `blobs/ab/cd/<sha256>`: streamed to `tmp/`, hashed while written, refused on mismatch or over
+  `--max-blob-bytes`, fsynced, renamed, then journaled. A re-upload is hash-checked and deduplicated, never overwritten.
+  Job manifests (`manifests/<job>.json`, immutable per job, every referenced blob must already be stored) register the file list.
+- **Reads are job-scoped.** A `read` token carries `job`; it may fetch only that job's manifest and the blobs it references.
+  Tokens are verified by a pluggable `verifier` (`createStore({verifier})`); `src/store/auth.js` is an HMAC stand-in
+  (`LANE_STORE_SECRET`) until the DB-backed principal check lands. Roles: `submit`, `read`, `replica`, `admin`.
+- **Receiver.** `materializeSnapshot` (`src/store/materialize.js`) replays the blobs as the same framed stream a remote runner
+  gets, so path/symlink/hash refusal is `remote-manifest.js` / `remote-stream.js`, not a second implementation.
+- **Replication runs inside the primary.** `serve --replicate-to URL` (token `LANE_STORE_REPLICA_TOKEN`, role `replica`)
+  starts a loop in the serving process, one round every `--replicate-interval-s` (default 300). It ships `journal.log`
+  records in `seq` order over HTTP (the replica is a second lane-store; it hash-verifies on write and again on
+  `GET /verify/<path>`, which re-reads its own disk), reading the journal only through the in-memory committed view.
+  Nothing outside the serving process reads the journal while it runs (no marker file); an offline tool takes
+  `store.lock` and refuses while a server holds it. At open the journal is fsynced before it becomes readable.
+  `replicated_seq` (`replication.json`, `{format: 2, seq, offset, ...}`) advances only after the replica's own check matches.
+  Metric `oldest_unreplicated_object_age_seconds` (plus `lane_store_replicated_seq`, `_journal_head_seq`,
+  `_replication_failed_rounds`, `_lost_objects`, `_bytes`) is served live at `GET /metrics`. `lane-store compare [--deep]
+  [--repair] --url URL` (weekly timer) asks the running primary to compare itself with its replica (`POST /admin/compare`);
+  exit 2 on divergence or a lost object. An unrecognised `replication.json` refuses to start: recompute it offline with
+  `lane-store rebuild-watermark --root DIR --seq N`.
+- **Lost objects.** Retention deletes in three durable steps: `delete-intent`, unlink, `delete`. At startup an object that is
+  missing with an intent gets its `delete` journaled (interrupted retention). An object missing with NO intent is a loss:
+  it is never tombstoned (that would delete the replica's intact copy), replication of that path blocks, and it is counted
+  in `lane_store_lost_objects` and compare's `lostAtPrimary`. Recovery is an operator step: re-upload the blob
+  (`PUT /blobs/<sha>`), or fetch it from the replica (`GET /blobs/<sha>` with a replica token) and PUT it to the primary.
+- **Deletions are never replicated.** Replication ships puts (blobs, manifests) and pin/terminal state only; `delete-intent`,
+  `delete` and `delete-cancel` records stay local. A put whose object is gone from the primary is skipped only if the journal
+  holds a committed `delete` for it later; otherwise replication blocks there. The replica runs its own time-based retention
+  (`serve --replica [--replica-grace-hours N]`, default 336 = the primary's 14-day terminal retention, so `compare` never reports a replica sweep as missing): it sweeps a manifest only when the replicated state says terminal and
+  unpinned and it received it more than the grace ago, and a blob only when no remaining manifest references it and it is
+  older than the grace, so a manifest still in flight keeps its blobs. A stall longer than the grace is already alerting via
+  `oldest_unreplicated_object_age_seconds`. (`compare` can therefore report `missingAtReplica` for primary objects the replica
+  already swept; the primary keeps terminal manifests 14 d.) Registering a manifest or a duplicate upload cancels a pending
+  delete-intent for the blobs it needs (`delete-cancel`).
+  Store-wide: nothing under the root may be a symlink (ancestors lstat-checked, leaves opened `O_NOFOLLOW`, root `realpath`ed);
+  manifests count toward `--cap-bytes`, and admission reserves declared bytes atomically.
+  Accepted residual risk: `O_NOFOLLOW` protects only the final path component, so an ancestor directory swapped for a symlink
+  between the lstat check and the open is not caught; exploiting it needs a local actor with write access to the store root.
+  A store started with `--replica` keeps no in-memory journal tail.
+  `POST /admin/sweep` (and `--sweep-interval-s`): manifests expire 14 d after `PUT /jobs/<job>/terminal`,
+  pinned jobs (`PUT /pins/<job>`) never expire, unreferenced blobs go after 24 h, above 80% of `--cap-bytes` the oldest
+  terminal unpinned groups are evicted, and uploads are refused (507) at 95%.
+
 ## Verify locally
 
 ```bash
