@@ -736,13 +736,38 @@ as soon as the ticket dir exists, and `queued` vs `running` is only a
 label. The client gives up (and falls back to local) as soon as the
 runner reports `gone` (no such ticket, a dead publisher, or a ticket from
 a runner version that writes no `publisher.json`), or after `remoteResultWaitMs` in the
-client's global config (default 3 hours). A runner too old to report a
+client's global config (default 3 hours); on that expiry it first sends a
+bounded best-effort `remote-cancel`, so the runner's copy does not keep running
+beside the local rerun, then fetches the result once more: a result that landed
+during the cancel is used as the run's outcome (only a valid one: after an
+unconfirmed cancel, a late record from another generation or an incomplete one keeps
+the ticket failed as below). Otherwise the runner must have
+CONFIRMED the cancel (`cancelConfirmed: true` in its reply; an older runner that
+prints no reply is unconfirmed) before the ticket falls back to local. If it did
+not, the remote job may still be running, so the ticket ends as a failure (exit
+`1`) naming the runner and saying it was not re-run, never a second execution. A runner too old to report a
 state gets the previous behaviour: three back-to-back fetches, then local.
-A cancel during the wait still sends `remote-cancel` and exits `130`.
+A cancel during the wait still sends `remote-cancel` and exits `130`, as does one during the expiry cancel or the late fetch.
 Stale never-started ticket directories on the runner are not garbage
 collected. `remote-exec` ignores SIGHUP, so a dropped ssh
 session does not stop it. If `remote-exec` is killed some other way, the
 ticket reads `gone` and the client reruns locally.
+
+For a remote run, the history row's `waitedMs` is the time before the command
+started, never the run and never the time the result took to reach the client
+(poll backoff, an ssh-drop recovery). The runner reports its own pre-start wait
+as `queuedMs` in the result (a duration on its clock, so host clock skew cannot
+matter) and the client adds the local part it measured itself (enqueue until the
+snapshot was handed to the runner); `startedAt` is `createdAt + waitedMs`. A
+result from a runner that predates `queuedMs` falls back to receipt time minus
+enqueue minus `runMs`, which also counts the delivery delay as wait. The runner's
+`queuedMs` starts when its `remote-exec` starts and ends when the command starts,
+so a protocol-2 run's deps and setup time counts in `runMs` (as it always has),
+not in the wait. Known underestimate: `remote-exec` sends the client no early
+signal, so the ssh connect and the runner process's startup (seconds) are counted
+as neither wait nor run. The history row also records the runner-measured `runMs`,
+which `lane suggest` uses for a run's duration instead of `endedAt - startedAt`
+(`endedAt` is when the result reached the client).
 
 ## Scheduling
 
@@ -846,6 +871,26 @@ exclusivity unit and not a CPU measure). If even `minCpuCores` does not fit, the
 lane waits with the same `projected-over-budget` denial (and the existing
 backfill, reservation and idle-exemption behaviour, which judge the full
 claim). Active `schedulerMode` only; shadow never denies, so it never relaxes.
+
+An elastic grant never exceeds this host's CPU budget (BRAIN-362). In active mode the
+claim an elastic ticket is evaluated and charged at is capped at `floor(budget)`
+(`capElasticClaim`), so every admission path that admits
+the full claim (a cold sample, the idle exemption, a plain fit) grants at most that,
+and the lease, history and the child's `LANE_BROKER_CPU_CORES` report it. The
+lease keeps the declared `cpuCores` beside the grant. Because grants are whole
+cores, `lane run` also refuses at once (exit 64, the usual budget message) an
+elastic lane whose smallest grant, `ceil(minCpuCores)`, exceeds `floor(budget)`
+(e.g. a floor of 3.2 on a 3.4-core budget), since it could never start. A
+non-elastic claim over the budget is refused as before, never capped; a
+non-elastic fractional claim is charged as-is and is unaffected. A budget that
+shrinks after `lane run` accepted the ticket, below its floor or to under one
+core, never caps the claim below `ceil(minCpuCores)` (or to zero): the ticket is
+denied `elastic-below-floor` before any exemption (cold sample, idle overshoot)
+could admit its full claim, and keeps waiting in case the budget grows back. As the
+queue head it is recorded futile (BRAIN-418), so it holds no reservation and smaller
+tickets backfill past it. The queue record keeps the declared claim; the cap is
+applied where the scheduler and `lane status` read it, against the budget at that
+moment, so a budget that grows back raises the grant too.
 
 The lease records `grantedCpuCores` and keeps `resources.cpuCores` as the
 declaration. Everything that charges a lease's CPU uses the grant: the CPU

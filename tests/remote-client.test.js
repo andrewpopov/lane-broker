@@ -775,6 +775,9 @@ function makeScriptedSsh(results) {
   const logPath = path.join(dir, 'calls.log');
   const scriptPath = path.join(dir, 'script.json');
   const countPath = path.join(dir, 'result-count');
+  const cancelReplyPath = path.join(dir, 'cancel-reply.json');
+  const afterCancelPath = path.join(dir, 'after-cancel.json');
+  fs.writeFileSync(cancelReplyPath, JSON.stringify({ protocol: 1, cancelConfirmed: true }));
   fs.writeFileSync(scriptPath, JSON.stringify(results));
   fs.writeFileSync(countPath, '0');
   const sshBin = path.join(dir, 'ssh');
@@ -790,6 +793,10 @@ if (cmd.includes('remote-exec')) {
 } else if (cmd.includes('remote-result')) {
   fs.appendFileSync(${JSON.stringify(logPath)}, 'result\\n');
   const script = JSON.parse(fs.readFileSync(${JSON.stringify(scriptPath)}, 'utf8'));
+  if (fs.existsSync(${JSON.stringify(afterCancelPath)}) && fs.readFileSync(${JSON.stringify(logPath)}, 'utf8').includes('cancel')) {
+    process.stdout.write(fs.readFileSync(${JSON.stringify(afterCancelPath)}, 'utf8') + '\\n');
+    process.exit(0);
+  }
   const n = Number(fs.readFileSync(${JSON.stringify(countPath)}, 'utf8'));
   fs.writeFileSync(${JSON.stringify(countPath)}, String(n + 1));
   const entry = script[Math.min(n, script.length - 1)];
@@ -797,13 +804,14 @@ if (cmd.includes('remote-exec')) {
   process.stdout.write(JSON.stringify(entry) + '\\n');
 } else if (cmd.includes('remote-cancel')) {
   fs.appendFileSync(${JSON.stringify(logPath)}, 'cancel\\n');
-  process.stdout.write('{}\\n');
+  const reply = fs.readFileSync(${JSON.stringify(cancelReplyPath)}, 'utf8');
+  if (reply !== 'NONE') process.stdout.write(reply + '\\n');
 }
 `,
   );
   fs.chmodSync(sshBin, 0o755);
   const calls = () => fs.readFileSync(logPath, 'utf8').split('\n').filter(Boolean);
-  return { sshBin, calls, scriptPath };
+  return { sshBin, calls, scriptPath, cancelReplyPath, afterCancelPath };
 }
 
 /** A fake clock: `sleep` advances `now` instead of waiting; `slept` records every wait. */
@@ -825,7 +833,7 @@ function boundResult(args, { manifestHash }) {
   return { protocol: 1, ticketId: args.ticketId, generation: args.generation, kind: 'completed', exit: 0, signal: null, phase: 'command', manifestHash };
 }
 
-async function dispatchWithScript(script, { abortSignal, clock = makeFakeClock(), extra = {}, deadlines } = {}) {
+async function dispatchWithScript(script, { abortSignal, clock = makeFakeClock(), extra = {}, deadlines, cancelReply, afterCancel, abortWhen } = {}) {
   const scripted = makeScriptedSsh([]);
   const src = makeGitWorktree({ 'a.txt': 'hello' });
   const args = makeDispatchArgs();
@@ -834,6 +842,8 @@ async function dispatchWithScript(script, { abortSignal, clock = makeFakeClock()
     scripted.scriptPath,
     JSON.stringify(script.map((r) => (r === 'RESULT' ? boundResult(args, { manifestHash }) : r))),
   );
+  if (cancelReply !== undefined) fs.writeFileSync(scripted.cancelReplyPath, cancelReply === 'NONE' ? 'NONE' : JSON.stringify(cancelReply));
+  if (afterCancel) fs.writeFileSync(scripted.afterCancelPath, JSON.stringify(afterCancel === 'RESULT' ? boundResult(args, { manifestHash }) : afterCancel));
   const result = await dispatchRemote({
     ...args,
     runner: makeRunner({ ssh: 'scripted', root: tmpDir('scripted-runner-root') }),
@@ -842,7 +852,7 @@ async function dispatchWithScript(script, { abortSignal, clock = makeFakeClock()
     env: process.env,
     now: clock.now,
     sleep: clock.sleep,
-    abortSignal,
+    abortSignal: abortWhen ? { get aborted() { return fs.existsSync(path.join(path.dirname(scripted.sshBin), 'calls.log')) && abortWhen(scripted.calls()); }, addEventListener() {}, removeEventListener() {} } : abortSignal,
     deadlines: { resultMs: 5000, resultAttempts: 3, ...deadlines },
     ...extra,
   });
@@ -898,6 +908,67 @@ test('dispatchRemote: still running past remoteResultWaitMs is unconfirmed with 
   assert.equal(result.outcome, 'unconfirmed');
   assert.match(result.reason, /still running after waiting 60000ms/);
   assert.ok(clock.slept.reduce((a, b) => a + b, 0) >= 60_000);
+});
+
+test('dispatchRemote: result-wait expiry sends remote-cancel before returning unconfirmed, and says so (BRAIN-363)', async () => {
+  const { result, calls } = await dispatchWithScript([{ protocol: 1, missing: true, state: 'running' }], {
+    extra: { resultWaitMs: 60_000 },
+  });
+  assert.equal(result.outcome, 'unconfirmed');
+  assert.ok(calls.includes('cancel'), `expected a remote-cancel call before the outcome returned, saw ${calls.join(',')}`);
+  assert.match(result.reason, /still running after waiting 60000ms for its result; remote copy cancelled/);
+});
+
+test('dispatchRemote: an unconfirmed remote-cancel (cancelConfirmed false, or an old runner with no reply) must not be re-run locally (BRAIN-363)', async () => {
+  for (const cancelReply of [{ protocol: 1, cancelConfirmed: false }, 'NONE']) {
+    const { result } = await dispatchWithScript([{ protocol: 1, missing: true, state: 'running' }], { extra: { resultWaitMs: 60_000 }, cancelReply });
+    assert.equal(result.outcome, 'unconfirmed');
+    assert.equal(result.mayStillBeRunning, true, JSON.stringify(cancelReply));
+    assert.match(result.reason, /may still be running and was not re-run/);
+  }
+  const { result } = await dispatchWithScript([{ protocol: 1, missing: true, state: 'running' }], { extra: { resultWaitMs: 60_000 } });
+  assert.equal(result.mayStillBeRunning, undefined, 'a confirmed cancel is safe to fall back from');
+});
+
+test('dispatchRemote: an unconfirmed expiry cancel keeps mayStillBeRunning for an invalid late record (stale generation, manifest mismatch, incomplete) (BRAIN-363)', async () => {
+  const stale = { protocol: 1, ticketId: 'someone-else', generation: 999, kind: 'completed', exit: 0, signal: null, phase: 'command', manifestHash: 'nope' };
+  for (const afterCancel of [stale, { protocol: 1, kind: 'completed', exit: 0 }]) {
+    const { result } = await dispatchWithScript([{ protocol: 1, missing: true, state: 'running' }], {
+      extra: { resultWaitMs: 60_000 },
+      cancelReply: { protocol: 1, cancelConfirmed: false },
+      afterCancel,
+    });
+    assert.equal(result.outcome, 'unconfirmed');
+    assert.equal(result.mayStillBeRunning, true, JSON.stringify(afterCancel));
+  }
+  const confirmedCancel = await dispatchWithScript([{ protocol: 1, missing: true, state: 'running' }], { extra: { resultWaitMs: 60_000 }, afterCancel: stale });
+  assert.equal(confirmedCancel.result.outcome, 'unconfirmed');
+  assert.equal(confirmedCancel.result.mayStillBeRunning, undefined, 'a confirmed cancel stays safe to fall back from');
+});
+
+test('dispatchRemote: an abort during the expiry cancel or the late fetch is cancelled, not unconfirmed (BRAIN-363)', async () => {
+  const running = [{ protocol: 1, missing: true, state: 'running' }];
+  const duringCancel = await dispatchWithScript(running, { extra: { resultWaitMs: 60_000 }, cancelReply: { protocol: 1, cancelConfirmed: false }, abortWhen: (c) => c.includes('cancel') });
+  assert.equal(duringCancel.result.outcome, 'cancelled');
+  assert.equal(duringCancel.calls.at(-1), 'cancel', 'no late fetch after the abort');
+  const duringFetch = await dispatchWithScript(running, { extra: { resultWaitMs: 60_000 }, cancelReply: { protocol: 1, cancelConfirmed: false }, abortWhen: (c) => c.includes('cancel') && c.at(-1) === 'result' });
+  assert.equal(duringFetch.result.outcome, 'cancelled');
+});
+
+test('dispatchRemote: a result that lands during the expiry cancel is used, not discarded (BRAIN-363)', async () => {
+  const { result, calls } = await dispatchWithScript([{ protocol: 1, missing: true, state: 'running' }], {
+    extra: { resultWaitMs: 60_000 },
+    cancelReply: { protocol: 1, cancelConfirmed: false },
+    afterCancel: 'RESULT',
+  });
+  assert.ok(calls.includes('cancel'));
+  assert.equal(result.outcome, 'confirmed');
+  assert.equal(result.exitCode, 0);
+});
+
+test('dispatchRemote: a state-gone or no-state runner is not sent a remote-cancel (nothing is running)', async () => {
+  const { calls } = await dispatchWithScript([{ protocol: 1, missing: true, state: 'gone' }]);
+  assert.ok(!calls.includes('cancel'), `unexpected remote-cancel: ${calls.join(',')}`);
 });
 
 test('dispatchRemote: abort during the result wait is cancelled and remote-cancel is attempted', async () => {

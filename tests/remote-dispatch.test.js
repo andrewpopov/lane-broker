@@ -604,3 +604,49 @@ test('remote run: waitedMs records the wait before the command started, not the 
   assert.ok(result.waitedMs < runMs - 500, `waitedMs ${result.waitedMs} must not include the ${runMs}ms run`);
   assert.ok(result.endedAt - result.startedAt >= runMs - 100, 'startedAt must still mean "command started"');
 });
+
+// ---- BRAIN-363: queue wait is measured on the runner's clock, never the result-delivery delay ----
+
+test('remote run: a result that lands 6s after the run ended does not count the fetch delay as queue wait', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'slow-result' });
+  const cmd = [process.execPath, '-e', 'process.exit(0)'];
+  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...cmd], env, repoDir);
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+  assert.ok(Number.isFinite(result.waitedMs), `waitedMs should be a number, got ${result.waitedMs}`);
+  assert.ok(result.waitedMs < 3000, `waitedMs ${result.waitedMs} must not include the 6000ms result delay`);
+  assert.ok(Number.isFinite(result.runMs) && result.runMs < 3000, `the runner-measured runMs must be recorded, got ${result.runMs}`);
+  assert.ok(result.endedAt - result.startedAt >= 5500, 'the delivery delay sits between startedAt and endedAt, not before startedAt');
+});
+
+test('remote run: a result from a runner that reports no queuedMs still gets a waitedMs (the BRAIN-341 formula)', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'legacy-result' });
+  const runMs = 2500;
+  const cmd = [process.execPath, '-e', `setTimeout(() => process.exit(0), ${runMs});`];
+  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...cmd], env, repoDir);
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+  assert.ok(Number.isFinite(result.waitedMs), `waitedMs should be a number, got ${result.waitedMs}`);
+  assert.ok(result.waitedMs < runMs - 500, `waitedMs ${result.waitedMs} must not include the ${runMs}ms run`);
+});
+
+// ---- BRAIN-363: an unconfirmed expiry cancel must never lead to a second (local) execution ----
+
+test('remote run: result-wait expiry with an unconfirmed cancel fails the ticket and never runs it locally', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'stuck-running', remoteResultWaitMs: 1 });
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], env, repoDir);
+  assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
+  assert.equal(fs.existsSync(marker), false, 'the job must not have been re-run locally');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+  assert.equal(result.runner, 'skybox');
+  assert.match(result.error, /may still be running and was not re-run/);
+  const history = fs.readFileSync(path.join(state, 'history.jsonl'), 'utf8');
+  assert.match(history, /was not re-run/);
+  const row = JSON.parse(history.trim().split('\n').at(-1));
+  assert.equal(row.executor, 'remote');
+  assert.equal(row.runner, 'skybox');
+});

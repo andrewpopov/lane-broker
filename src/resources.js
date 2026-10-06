@@ -218,6 +218,38 @@ export function elasticClaimRange({ cpuCores, minCpuCores, headroom }) {
   return hi >= lo ? { hi, lo } : null;
 }
 
+/**
+ * BRAIN-362: an elastic ticket (`resources.minCpuCores`) is never evaluated, charged or granted above
+ * what this host's CPU budget can hold: its claim is capped at floor(budget) up front, so every admission
+ * path (full fit, a cold sample, the idle exemption, ...) sees the same capped claim and the grant,
+ * lease, history and the child's LANE_BROKER_CPU_CORES can never exceed it. A cap that reaches the floor
+ * leaves no floor (the claim is then simply that many cores). Only in active mode, where the budget is
+ * enforced (checkResourceBudget); a non-elastic claim over budget is refused up front, never capped.
+ */
+export function capElasticClaim(ticket, cfg, host = detectResourceCapacity()) {
+  const min = ticket.resources?.minCpuCores;
+  if (cfg.schedulerMode !== 'active' || !Number.isFinite(min)) return ticket;
+  const cap = Math.floor(cpuBudgetCores(host, cfg));
+  if (!(ticket.resources.cpuCores > cap)) return ticket;
+  // A budget that shrank below the floor (or to zero) must never produce a grant under the minimum: leave the ticket as declared;
+  // admission denies it (elasticBelowFloor) so it waits like any over-budget claim instead of being admitted below what it asked to run with.
+  if (cap < 1 || cap < Math.ceil(min)) return ticket;
+  const { minCpuCores, ...claim } = ticket.resources;
+  return { ...ticket, resources: { ...claim, cpuCores: cap, ...(minCpuCores < cap ? { minCpuCores } : {}) } };
+}
+
+/**
+ * BRAIN-362: an elastic ticket whose floor, rounded up, no longer fits floor(current CPU budget) (the budget shrank after
+ * preflight). Admission denies it before any exemption (cold sample, idle overshoot) could grant it its full claim;
+ * it keeps waiting, since the budget may grow back. Active mode only, like the cap.
+ */
+export function elasticBelowFloor(ticket, cfg, host = detectResourceCapacity()) {
+  const min = ticket.resources?.minCpuCores;
+  if (cfg.schedulerMode !== 'active' || !Number.isFinite(min)) return false;
+  const cap = Math.floor(cpuBudgetCores(host, cfg));
+  return cap < 1 || cap < Math.ceil(min);
+}
+
 export function leaseResources(lease, cfg) {
   return resolveTicketResources({
     weight: lease.weight,
@@ -257,13 +289,18 @@ export function cpuBudgetCores(host, globalCfg) {
 export function checkResourceBudget({ resources, globalCfg, host }) {
   const cpuBudget = cpuBudgetCores(host, globalCfg);
   const memoryBudget = Math.max(0, host.memoryBytes - globalCfg.memoryReserveBytes);
-  if (globalCfg.schedulerMode === 'active' && ((resources.minCpuCores ?? resources.cpuCores) > cpuBudget || resources.memoryBytes > memoryBudget)) {
+  // An elastic claim is granted in whole cores, so its smallest grant is ceil(minCpuCores) and the most it can
+  // ever get is floor(budget): a fractional floor whose ceiling passes the budget could never start (BRAIN-362).
+  const elasticFloor = Number.isFinite(resources.minCpuCores);
+  const smallestClaim = elasticFloor ? Math.ceil(resources.minCpuCores) : resources.cpuCores;
+  const grantableBudget = elasticFloor ? Math.floor(cpuBudget) : cpuBudget;
+  if (globalCfg.schedulerMode === 'active' && (smallestClaim > grantableBudget || resources.memoryBytes > memoryBudget)) {
     return {
       ok: false,
       exitCode: 64,
       message:
         `lane run: requested resources exceed this environment's budget (` +
-        `${resources.minCpuCores ?? resources.cpuCores}/${cpuBudget.toFixed(2)} CPU cores, ` +
+        `${smallestClaim}/${cpuBudget.toFixed(2)} CPU cores, ` +
         `${resources.memoryBytes}/${memoryBudget} memory bytes).\n`,
     };
   }

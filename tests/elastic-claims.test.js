@@ -6,13 +6,13 @@ import { spawnSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneRun, gitFixture, BIN } from './helpers.js';
 import { tmpDir, setup, markerCmd, makeFakeSshBin, clientEnv, makeRunner } from './remote-harness.js';
 import { selectRunner } from '../src/remote-client.js';
-import { enqueue, tryStart } from '../src/scheduler.js';
+import { enqueue, tryStart, listQueueCapped } from '../src/scheduler.js';
 import { DEFAULT_GLOBAL_CONFIG, resolveTicketConfig } from '../src/config.js';
 import { writeLease, readLease, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths, atomicWriteJson } from '../src/state.js';
 import { childEnv } from '../src/supervisor.js';
 import { leaseDemand, projectBusy } from '../src/admission.js';
-import { elasticClaimRange, resolveTicketResources, leaseCpuCores, leaseResources, ELASTIC_CLAIMS_CAPABILITY } from '../src/resources.js';
+import { elasticClaimRange, resolveTicketResources, leaseCpuCores, leaseResources, ELASTIC_CLAIMS_CAPABILITY, checkResourceBudget, cpuBudgetCores, capElasticClaim, detectResourceCapacity } from '../src/resources.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
 import { PRIORITY_CAPABILITY } from '../src/priority.js';
 import { ARTIFACTS_CAPABILITY } from '../src/remote-artifacts.js';
@@ -558,4 +558,186 @@ test('non-elastic: the result carries no grant field and the history row records
   assert.deepEqual(row.resources.cpuCores, 2);
   const res = JSON.parse(fs.readFileSync(path.join(paths(state).results, `${row.id}.json`), 'utf8'));
   assert.equal('grantedCpuCores' in res, false);
+});
+
+// BRAIN-362: the budget caps every elastic grant. Budget is pinned to 3 cores on THIS host (reserve = cores - 3),
+// and the sampler reports the host's real core count so the sample budget agrees with it.
+const HOST_CORES = detectResourceCapacity().cpuCores;
+const tightCfg = (overrides = {}) => baseCfg({ cpuReserveCores: HOST_CORES - 3, ...overrides });
+const hostSampler = (hostBusyCores) => () => ({ hostBusyCores, cores: HOST_CORES, stale: false, sampledAt: Date.now() });
+const hugeElastic = (id) => ticket(id, { resources: { cpuCores: 16, minCpuCores: 2, memoryBytes: GIB } });
+
+test('BRAIN-362: a cold CPU sample admits the full claim, but the grant is capped at floor(budget)', async () => {
+  const { state } = freshEnv();
+  const t = hugeElastic('cold');
+  await enqueue(state, t, tightCfg());
+  const result = await tryStart(state, t, tightCfg(), undefined, () => null, undefined, memory());
+  assert.equal(result.started, true);
+  assert.match(readLog(state), /sample-unavailable-empty/);
+  assert.equal(result.lease.grantedCpuCores, 3);
+  assert.equal(leaseCpuCores(result.lease), 3);
+  assert.equal(result.lease.resources.cpuCores, 16, 'the declaration is kept beside the grant');
+  assert.equal(childEnv(t, { PATH: '/bin' }, leaseCpuCores(result.lease)).LANE_BROKER_CPU_CORES, '3');
+  assert.match(readLog(state), /elastic-grant/);
+});
+
+test('BRAIN-362: the idle exemption admits an over-projection elastic head, still capped at floor(budget)', async () => {
+  const { state } = freshEnv();
+  const t = hugeElastic('idle');
+  const cfg = tightCfg({ resourceIdleOvershootCores: 100 });
+  await enqueue(state, t, cfg);
+  // ambient 2 + any claim >= 2 exceeds the 3-core budget, so only the idle exemption can start it
+  const result = await tryStart(state, t, cfg, undefined, hostSampler(2), undefined, memory());
+  assert.equal(result.started, true);
+  assert.match(readLog(state), /resource-idle-exempt/);
+  assert.equal(result.lease.grantedCpuCores, 3);
+  assert.equal(leaseCpuCores(result.lease), 3);
+});
+
+test('BRAIN-362: end to end, a lane declaring more cpuCores than the budget runs with LANE_BROKER_CPU_CORES <= floor(budget)', async () => {
+  const { base, home, state, env } = freshEnv();
+  writeGlobalConfig(home, {
+    version: 1, capacity: 100, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100, schedulerMode: 'active',
+    cpuAdmissionPercent: 100, cpuReserveCores: HOST_CORES - 3, admissionCooldownMs: 0,
+  });
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, cpuCores: 16, minCpuCores: 2, memoryBytes: 1048576 } } });
+  const busy = writeCpuBusyFile(base, 0, HOST_CORES);
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'sh', '-c', 'echo "grant=$LANE_BROKER_CPU_CORES"'], {
+    env: { ...env, LANE_BROKER_CPU_BUSY_FILE: busy },
+    cwd: repoDir,
+  });
+  assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+  assert.match(result.stdout, /grant=3\b/);
+  const rows = fs.readFileSync(paths(state).history, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.equal(rows.at(-1).grantedCpuCores, 3);
+});
+
+test('BRAIN-362: a non-elastic claim over the budget is still refused (exit 64), not capped', () => {
+  const host = { cpuCores: 4, memoryBytes: 64 * GIB };
+  const globalCfg = baseCfg({ cpuReserveCores: 1 });
+  const refused = checkResourceBudget({ resources: { cpuCores: 16, memoryBytes: GIB }, globalCfg, host });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.exitCode, 64);
+  assert.equal(checkResourceBudget({ resources: { cpuCores: 16, minCpuCores: 2, memoryBytes: GIB }, globalCfg, host }).ok, true, 'an elastic one is capped instead');
+});
+
+test('BRAIN-362: a fractional floor whose ceiling exceeds floor(budget) is refused immediately (exit 64)', () => {
+  const host = { cpuCores: 4, memoryBytes: 64 * GIB };
+  const globalCfg = baseCfg({ cpuReserveCores: 0.6 }); // budget 3.4: ceil(3.2) = 4 > floor(3.4) = 3
+  assert.equal(cpuBudgetCores(host, globalCfg).toFixed(1), '3.4');
+  const refused = checkResourceBudget({ resources: { cpuCores: 6, minCpuCores: 3.2, memoryBytes: GIB }, globalCfg, host });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.exitCode, 64);
+  assert.match(refused.message, /requested resources exceed this environment's budget \(4\/3\.40 CPU cores/);
+  assert.equal(checkResourceBudget({ resources: { cpuCores: 6, minCpuCores: 3, memoryBytes: GIB }, globalCfg, host }).ok, true);
+  assert.equal(checkResourceBudget({ resources: { cpuCores: 3.2, memoryBytes: GIB }, globalCfg, host }).ok, true, 'a non-elastic fractional claim is charged as-is and fits');
+});
+
+test('BRAIN-362: end to end, a fractional floor above floor(budget) exits 64 at once instead of queueing', async () => {
+  const { base, home, env } = freshEnv();
+  writeGlobalConfig(home, {
+    version: 1, capacity: 100, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100, schedulerMode: 'active',
+    cpuAdmissionPercent: 100, cpuReserveCores: HOST_CORES - 3.4, admissionCooldownMs: 0,
+  });
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, cpuCores: 6, minCpuCores: 3.2, memoryBytes: 1048576 } } });
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'true'], { env, cwd: repoDir });
+  assert.equal(result.code, 64, `stderr: ${result.stderr}`);
+  assert.match(result.stderr, /exceed this environment's budget/);
+});
+
+test('BRAIN-362: a queue record written with an over-budget elastic claim is read at the capped size (loader and status)', async () => {
+  const { state } = freshEnv();
+  const t = hugeElastic('legacy');
+  await enqueue(state, t, tightCfg({ schedulerMode: 'shadow' })); // shadow never caps: the record keeps the 16-core claim
+  const fileOf = () => path.join(paths(state).queue, fs.readdirSync(paths(state).queue).find((n) => n.endsWith('.json')));
+  assert.equal(JSON.parse(fs.readFileSync(fileOf(), 'utf8')).resources.cpuCores, 16);
+  const [capped] = listQueueCapped(state, tightCfg());
+  assert.equal(capped.resources.cpuCores, 3);
+  assert.equal(capped.resources.minCpuCores, 2);
+  assert.equal(listQueueCapped(state, tightCfg({ schedulerMode: 'shadow' }))[0].resources.cpuCores, 16, 'shadow mode never caps');
+});
+
+test('BRAIN-362: the cap never goes below the floor or to zero when the budget shrank after preflight', () => {
+  const host = { cpuCores: 4, memoryBytes: 64 * GIB };
+  const t = ticket('shrunk', { resources: { cpuCores: 16, minCpuCores: 3.2, memoryBytes: GIB } });
+  const kept = capElasticClaim(t, baseCfg({ cpuReserveCores: 0.6 }), host); // budget 3.4: floor 3 < ceil(3.2) = 4
+  assert.equal(kept, t, 'left as declared: it waits like any over-budget claim');
+  const zero = capElasticClaim(t, baseCfg({ cpuReserveCores: 3.5 }), host); // budget 0.5: floor 0
+  assert.equal(zero.resources.cpuCores, 16, 'never capped to zero');
+  const ok = capElasticClaim(t, baseCfg({ cpuReserveCores: 0 }), host); // budget 4: floor 4 >= ceil(3.2)
+  assert.equal(ok.resources.cpuCores, 4);
+});
+
+test('BRAIN-362: lane status reads a stale over-budget queue record at the capped size too', async () => {
+  const { state, home } = freshEnv();
+  const cfg = tightCfg();
+  await enqueue(state, hugeElastic('legacy'), { ...cfg, schedulerMode: 'shadow' });
+  writeGlobalConfig(home, { version: 1, capacity: 10, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100, schedulerMode: 'active', cpuAdmissionPercent: 100, cpuReserveCores: cfg.cpuReserveCores });
+  const prev = { state: process.env.LANE_BROKER_STATE, home: process.env.LANE_BROKER_HOME };
+  process.env.LANE_BROKER_STATE = state;
+  process.env.LANE_BROKER_HOME = home;
+  try {
+    const entry = (await collectStatus()).queued.find((q) => q.id === 'legacy');
+    assert.equal(entry.resources.cpuCores, 3);
+  } finally {
+    for (const [k, v] of [['LANE_BROKER_STATE', prev.state], ['LANE_BROKER_HOME', prev.home]]) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});
+
+test('BRAIN-362: an elastic ticket whose floor no longer fits floor(budget) is denied, even on a cold sample or the idle exemption', async () => {
+  const belowFloor = (id) => ticket(id, { resources: { cpuCores: 16, minCpuCores: 3.2, memoryBytes: GIB } }); // budget 3: floor 3 < ceil(3.2) = 4
+  const cold = freshEnv().state;
+  const c = belowFloor('cold');
+  await enqueue(cold, c, tightCfg());
+  const coldResult = await tryStart(cold, c, tightCfg(), undefined, () => null, undefined, memory());
+  assert.equal(coldResult.started, false, 'a cold sample must not admit it at the full claim');
+  assert.equal(coldResult.reason, 'elastic-below-floor');
+  assert.match(readLog(cold), /elastic-below-floor/);
+  assert.deepEqual(fs.readdirSync(paths(cold).queue).filter((n) => n.endsWith('.json')).length, 1, 'it keeps waiting, not dequeued');
+
+  const idle = freshEnv().state;
+  const i = belowFloor('idle');
+  const cfg = tightCfg({ resourceIdleOvershootCores: 100 });
+  await enqueue(idle, i, cfg);
+  const idleResult = await tryStart(idle, i, cfg, undefined, hostSampler(2), undefined, memory());
+  assert.equal(idleResult.started, false, 'the idle exemption must not admit it either');
+  assert.equal(idleResult.reason, 'elastic-below-floor');
+
+  const grown = await tryStart(idle, i, tightCfg({ resourceIdleOvershootCores: 100, cpuReserveCores: HOST_CORES - 4 }), undefined, hostSampler(0), undefined, memory());
+  if (HOST_CORES >= 4) assert.equal(grown.started, true, 'once the budget holds the floor again it is admitted');
+});
+
+test('BRAIN-362: a below-floor elastic head does not block backfill', async () => {
+  const { state } = freshEnv();
+  const cfg = tightCfg();
+  const head = ticket('head', { key: 'r:head', resources: { cpuCores: 16, minCpuCores: 3.2, memoryBytes: GIB } }); // budget 3: floor 3 < ceil(3.2) = 4
+  const small = ticket('small', { key: 'r:small', resources: { cpuCores: 1, memoryBytes: GIB } });
+  await enqueue(state, head, cfg);
+  await enqueue(state, small, cfg);
+  const denied = await tryStart(state, head, cfg, undefined, hostSampler(0), undefined, memory());
+  assert.equal(denied.reason, 'elastic-below-floor');
+  const result = await tryStart(state, small, cfg, undefined, hostSampler(0), undefined, memory());
+  assert.equal(result.started, true, `the small ticket backfills past the futile head, got ${result.reason}`);
+  const queued = listQueueCapped(state, cfg).map((t) => t.id);
+  assert.deepEqual(queued, ['head'], 'the head is still queued');
+});
+
+test('BRAIN-362: the queue keeps the declared claim; the cap follows the current budget for the queue view and admission alike', async () => {
+  const { state } = freshEnv();
+  const t = hugeElastic('grow');
+  const small = tightCfg({ cpuReserveCores: HOST_CORES - 2 });
+  await enqueue(state, t, small);
+  const file = path.join(paths(state).queue, fs.readdirSync(paths(state).queue).find((n) => n.endsWith('.json')));
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).resources.cpuCores, 16, 'stored as declared');
+  assert.equal(listQueueCapped(state, small)[0].resources.cpuCores, 2);
+  const grown = tightCfg(); // budget raised 2 -> 3
+  assert.equal(listQueueCapped(state, grown)[0].resources.cpuCores, 3);
+  const result = await tryStart(state, t, grown, undefined, () => null, undefined, memory());
+  assert.equal(result.started, true);
+  assert.equal(result.lease.grantedCpuCores, 3, 'admission agrees with the queue view');
 });

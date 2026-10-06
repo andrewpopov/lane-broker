@@ -91,7 +91,8 @@ export function buildSuggestions(rows, { repo, days = 7, now = Date.now() } = {}
     const scalable = finished.filter((r) => !isElastic(r) || (Number.isFinite(rowDeclared(r)) && rowDeclared(r) > 0));
     const malformedRuns = finished.length - scalable.length;
     // Runs under OVERRUN_MIN_MS are mostly process startup, so their mean says nothing about sustained need.
-    const sustained = scalable.filter((r) => r.endedAt - r.startedAt >= OVERRUN_MIN_MS);
+    // a remote row's endedAt is the local receipt time, so its runner-measured runMs is the run; a local row's span is
+    const sustained = scalable.filter((r) => (Number.isFinite(r.runMs) ? r.runMs : r.endedAt - r.startedAt) >= OVERRUN_MIN_MS);
     const shortRunsExcluded = scalable.length - sustained.length;
     const elastic = sustained.filter(isElastic);
     const grantedBelowDeclaredPct = sustained.length === 0 ? 0 : Math.round((100 * elastic.filter((r) => r.grantedCpuCores < rowDeclared(r)).length) / sustained.length);

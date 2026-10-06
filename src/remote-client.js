@@ -558,10 +558,18 @@ async function readRemoteArtifacts(runner, ticketId, { patterns, limits, sshBin,
 }
 
 /** `lane remote-cancel <ticketId>` over ssh, best-effort: failures are swallowed since this
- *  only ever runs alongside an abort the caller has already decided to honour regardless. */
+ *  only ever runs alongside an abort the caller has already decided to honour regardless.
+ *  Resolves true only when the runner CONFIRMED the cancel: exit 0 within the deadline AND its JSON reply says
+ *  `cancelConfirmed: true` (exit 0 alone also covers a cancel that was only requested; an older runner prints no JSON). */
 async function remoteCancelBestEffort(runner, ticketId, sshBin, deadlineMs, env) {
   const cmd = buildRemoteCommand(runner, 'remote-cancel', [ticketId]);
-  await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
+  const res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
+  if (res.code !== 0 || res.timedOut) return false;
+  try {
+    return JSON.parse(String(res.stdout).trim().split('\n').pop()).cancelConfirmed === true;
+  } catch {
+    return false;
+  }
 }
 
 /** Public entry point for `remoteCancelBestEffort`, for a caller with no `dispatchRemote` of
@@ -575,7 +583,7 @@ export async function remoteCancel(runner, ticketId, { sshBin = 'ssh', deadlineM
  * Dispatch one lane run to `runner` over ssh and resolve to exactly one of
  * `{outcome:'ineligible'|'confirmed'|'unconfirmed'|'cancelled', ...}`
  * (BRAIN-319 I1/C6). `neverStarted: true` (BRAIN-405) marks an ineligible/unconfirmed outcome that proves the runner never
- * began the job (nothing, or only part of the snapshot, was sent); any other unconfirmed outcome may have a live job behind it. Never throws for a remote/transport failure -- only a
+ * began the job (nothing, or only part of the snapshot, was sent); any other unconfirmed outcome may have a live job behind it, and `mayStillBeRunning: true` (BRAIN-363) marks one whose remote cancel was not confirmed, which the caller must not re-run locally. Never throws for a remote/transport failure -- only a
  * genuinely unexpected local error (not `RemoteIneligibleError`) from
  * `buildManifest` propagates.
  *
@@ -785,21 +793,41 @@ export async function dispatchRemote(opts) {
     return { outcome: 'cancelled' };
   }
 
-  if (!record) {
-    return {
-      outcome: 'unconfirmed',
-      reason: waitExpired
-        ? `remote job still running after waiting ${resultWaitMs}ms for its result`
-        : 'result not available after retries',
-    };
+  // BRAIN-363: set when the expiry cancel was not confirmed: whatever the late record turns out to be, the job may still be running.
+  let unconfirmedCancel = false;
+  if (!record && waitExpired) {
+    // BRAIN-363: the caller falls back to running locally, so the runner's copy must not keep running beside it.
+    const cancelConfirmed = await remoteCancelBestEffort(runner, ticketId, sshBin, cancelDeadlineMs, env);
+    if (abortSignal && abortSignal.aborted) return { outcome: 'cancelled' };
+    // The result may have landed while the cancel was in flight; a finished remote run is used, never discarded for a re-run.
+    const late = await fetchRemoteResult(runner, ticketId, sshBin, resultDeadlineMs, env);
+    if (abortSignal && abortSignal.aborted) return { outcome: 'cancelled' };
+    if (late && !late.missing) {
+      record = late;
+      unconfirmedCancel = !cancelConfirmed;
+    } else if (cancelConfirmed) {
+      return {
+        outcome: 'unconfirmed',
+        reason: `remote job still running after waiting ${resultWaitMs}ms for its result; remote copy cancelled`,
+      };
+    } else {
+      // An unconfirmed cancel leaves the remote job possibly alive: the caller must not run it a second time.
+      return {
+        outcome: 'unconfirmed',
+        reason: `remote job on ${runner.name} still running after waiting ${resultWaitMs}ms for its result; remote cancel could not be confirmed, so it may still be running and was not re-run`,
+        mayStillBeRunning: true,
+      };
+    }
   }
+  if (!record) return { outcome: 'unconfirmed', reason: 'result not available after retries' };
 
   // BRAIN-320 S1c: classification (bound? kind? green?) all happens in ONE
   // place, `classifyRemoteResult`, shared with `isGreen` -- see its own doc
   // comment for the phase rules (I7: green only from phase 'command').
   const classification = classifyRemoteResult(record, expected);
   if (classification.outcome === 'unconfirmed') {
-    return { outcome: 'unconfirmed', reason: classification.reason };
+    // Only a valid classified result may lift the unconfirmed-cancel hold: an unusable late record leaves the job possibly alive.
+    return { outcome: 'unconfirmed', reason: classification.reason, ...(unconfirmedCancel ? { mayStillBeRunning: true } : {}) };
   }
   const confirmed = { outcome: 'confirmed', result: record, exitCode: classification.exitCode, phase: classification.phase, uploadMs };
   // BRAIN-398: only a runner that stored files for this result is asked for them; a failure here is reported, never

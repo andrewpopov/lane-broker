@@ -142,6 +142,41 @@ if (destination === 'die-midstream') {
     process.stdout.write(\`\${JSON.stringify(probe)}\\n\`);
     exitNow(0);
   });
+} else if ((destination === 'slow-result' || destination === 'legacy-result') && commandString.includes('remote-result')) {
+  // BRAIN-363: 'slow-result' lands the result well after the run ended (a recovery / poll delay); 'legacy-result' relays a
+  // result from a runner that predates \`queuedMs\`.
+  const child = spawn('sh', ['-c', commandString], { stdio: ['ignore', 'pipe', 'inherit'] });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  child.on('close', () => {
+    let record;
+    try {
+      record = JSON.parse(out.trim());
+    } catch {
+      process.stdout.write(out);
+      exitNow(0);
+      return;
+    }
+    if (destination === 'legacy-result') delete record.queuedMs;
+    const relay = () => {
+      process.stdout.write(\`\${JSON.stringify(record)}\\n\`);
+      exitNow(0);
+    };
+    if (destination === 'slow-result' && record && !record.missing) setTimeout(relay, 6000);
+    else relay();
+  });
+} else if (destination === 'stuck-running' && /remote-(exec|result|cancel)/.test(commandString)) {
+  // BRAIN-363: a runner whose job never finishes and whose remote-cancel replies without confirming it.
+  if (commandString.includes('remote-exec')) {
+    process.stdin.resume();
+    process.stdin.on('end', () => exitNow(255));
+  } else if (commandString.includes('remote-result')) {
+    process.stdout.write(\`\${JSON.stringify({ protocol: 1, missing: true, state: 'running' })}\\n\`);
+    exitNow(0);
+  } else {
+    process.stdout.write(\`\${JSON.stringify({ protocol: 1, cancelConfirmed: false })}\\n\`);
+    exitNow(0);
+  }
 } else if (destination === 'result-tamper' && commandString.includes('remote-result')) {
   const child = spawn('sh', ['-c', commandString], { stdio: ['ignore', 'pipe', 'inherit'] });
   let out = '';
@@ -253,7 +288,7 @@ export function makeDispatchArgs(overrides = {}) {
 
 /** One global config (runners + admission knobs) and one repo config (lane
  *  `remote: true`) per test, sharing a fresh fake-ssh binDir. */
-export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1, remoteQueueTimeoutMs } = {}) {
+export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1, remoteQueueTimeoutMs, remoteResultWaitMs } = {}) {
   const { binDir, probeLogPath, runnerHome, runnerState } = makeFakeSshBin();
   const runnerRoot = tmpDir('remote-dispatch-runner-root');
   const { home, state, env } = freshEnv();
@@ -277,6 +312,7 @@ export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1, remoteQ
   // queueTimeoutMs here doesn't just wait out the runner's 5s default
   // sampleMs before ever observing the expiry.
   if (remoteQueueTimeoutMs !== undefined) cfg.remoteQueueTimeoutMs = remoteQueueTimeoutMs;
+  if (remoteResultWaitMs !== undefined) cfg.remoteResultWaitMs = remoteResultWaitMs;
   writeGlobalConfig(home, cfg);
   writeGlobalConfig(runnerHome, { sampleMs: 50, capacity: 4 });
   const repoDir = tmpDir('remote-dispatch-repo');

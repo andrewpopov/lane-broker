@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ensureStateDirs, paths, withLock, bootId, readJsonSafe, readDrainMarker } from './state.js';
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
-import { listQueue, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState, readResourceSkipState, futileFresh } from './scheduler.js';
+import { listQueueCapped, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState, readResourceSkipState, futileFresh } from './scheduler.js';
 import { cpuBudget, projectBusy, ticketCpuEstimate } from './admission.js';
 import { classLocks, simArmed, usedByClass } from './allocation.js';
 import { queuedClaimsByClass } from './allocation-shadow.js';
@@ -150,7 +150,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
   // that one array, and the skip/reservation views read the per-ticket store, never the singleton files.
   const sched = resolveScheduler(root, { log: false });
   const store = sched.v2 ? fairnessStore(root, sched.tickets) : legacyStore(root);
-  const rawQueue = listQueue(root);
+  const rawQueue = listQueueCapped(root, cfg);
   const gate = readGateState(root);
   const p = paths(root);
   const paused = fs.existsSync(p.pause) ? fs.readFileSync(p.pause, 'utf8').trim() : null;

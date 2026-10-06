@@ -13,7 +13,7 @@ import { advanceHwm } from './priority-clock.js';
 import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, effectiveRank, score } from './priority.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
-import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, leaseResources, resolveTicketResources, terminalRowDefaults } from './resources.js';
+import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, leaseResources, resolveTicketResources, terminalRowDefaults, capElasticClaim, elasticBelowFloor } from './resources.js';
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
  *  possibly-running work and must count against both conflicts and capacity. */
@@ -42,6 +42,15 @@ export function listQueue(root) {
     return [];
   }
   return names.filter((n) => n.endsWith('.json')).map((n) => readJsonSafe(path.join(dir, n)));
+}
+
+/**
+ * BRAIN-362: the queue as admission math sees it. A record written before the cap existed (or before a budget change) can
+ * carry a claim above this host's budget, so every consumer of reservations, backfill, the shadow snapshot and status reads
+ * it through here and sees the same capped claim. An unreadable record stays `null`.
+ */
+export function listQueueCapped(root, cfg) {
+  return listQueue(root).map((t) => (t === null ? null : capElasticClaim(t, cfg)));
 }
 
 /** Every queue record in FIFO order, or a thrown `UnreadableRecordError` (where `listQueue` yields `null` for it). */
@@ -116,7 +125,8 @@ function findQueueFile(root, id) {
  * Enqueue a ticket at the tail of the global FIFO. Caller must NOT hold the lock. Returns the persisted record, whose
  * `priorityRequested`/`priorityAdmitted`/`priorityDemoted` tell the caller whether the per-repo high cap demoted it.
  */
-export async function enqueue(root, ticket, { maxQueuedHighPerRepo } = DEFAULT_GLOBAL_CONFIG) {
+export async function enqueue(root, ticket, cfg = DEFAULT_GLOBAL_CONFIG) {
+  const { maxQueuedHighPerRepo } = cfg;
   return withLock(root, () => {
     assertNotMigrating(root);
     assertQueueLayout(root);
@@ -139,6 +149,7 @@ export async function enqueue(root, ticket, { maxQueuedHighPerRepo } = DEFAULT_G
     }
     const seq = nextSeq(root);
     const record = {
+      // BRAIN-362: the record keeps the DECLARED claim; the cap is derived at read time (listQueueCapped, tryStart) against the current budget
       ...ticket,
       seq,
       createdAt: ticket.createdAt || Date.now(),
@@ -912,12 +923,14 @@ function safeBackfillFlags(queue, headTicket, enabled, cannotDelayHead) {
  * become a stale, already-superseded transition of the load/CPU gate — only
  * a transition the config in effect at decision time would actually produce.
  */
-export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler, reloadCfg = () => globalCfg, memoryReader = readMemoryInfo, writeResourceState = atomicWriteJson, shadowSeams = {}) {
+export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampler, reloadCfg = () => globalCfg, memoryReader = readMemoryInfo, writeResourceState = atomicWriteJson, shadowSeams = {}) {
   // `shadow` is what the live evaluation below hands the BRAIN-379 shadow recorder; it is only ever
   // filled with copies and flags, never read back by the live decision.
   const shadow = {};
   const decide = () => {
     const cfg = reloadCfg() || globalCfg;
+    // BRAIN-362: every evaluation below sees the claim capped to this host's budget; the submitted ticket keeps the declaration.
+    const ticket = capElasticClaim(submitted, cfg);
     const now = Date.now();
     const nowEff = advanceHwm(root, now);
     reapStale(root, ticket.id);
@@ -928,7 +941,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     const sched = resolveScheduler(root);
     const store = sched.v2 ? fairnessStore(root, sched.tickets) : legacyStore(root);
     if (sched.v2) quarantineLegacyRecords(root);
-    const rawQueue = sched.v2 ? fenceLegacy(listQueue(root)) : listQueue(root);
+    const rawQueue = sched.v2 ? fenceLegacy(listQueueCapped(root, cfg)) : listQueueCapped(root, cfg);
     // A reservation exists only while resource backfill does: when it is off, release every latch, so turning it back
     // on makes a ticket earn its reservation again.
     if (sched.v2 && !(cfg.schedulerMode === 'active' && cfg.resourceSkipLimit > 0)) store.releaseReservations();
@@ -1184,7 +1197,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // head reservation), so the grant can never delay what the full claim could not. Active mode
     // only: shadow never denies, so there is nothing to relax.
     const elastic = cfg.schedulerMode === 'active' ? evaluateElasticAdmission(cfg, ticket, admissionHeld, cpuSample, memInfo, fullDecision) : null;
-    const cpuDecision = elastic ? { ...elastic.decision, declaredCpuCores: fullDecision.candidateCpuCores } : fullDecision;
+    const cpuDecision = elastic ? { ...elastic.decision, declaredCpuCores: submitted.resources?.cpuCores ?? fullDecision.candidateCpuCores } : fullDecision;
     // BRAIN-418: only the head's own denial can declare its reservation futile; a candidate's poll reads the verdict
     // the head's latest denial recorded. Only a CPU-projection or memory denial is judged: a closed gate, a cooldown or an unavailable sample is not the
     // head's own arithmetic, so those keep today's handling.
@@ -1246,6 +1259,18 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // informational-only, every start is an ordinary 'ok', idle or not.
     const baselineReason = cfg.admissionLoadGate && gate.closed && brokerIdle ? 'idle-exempt' : 'ok';
 
+    // BRAIN-362: before any exemption (cold sample, idle overshoot) can admit it at its full claim, an elastic ticket whose
+    // floor no longer fits the current budget keeps waiting: the budget may grow back.
+    if (elasticBelowFloor(ticket, cfg)) {
+      // The head cannot start until the budget itself changes, whatever leases are held: record it futile so backfill can pass it.
+      if (ticket.id === headTicket.id) {
+        recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState, false, { cause: 'elastic-below-floor', headCpu: ticketCpuFloor(headTicket, cfg), sampledAt: now });
+      } else dropPickRecord();
+      return {
+        result: { started: false, reason: 'elastic-below-floor' },
+        logFields: { ...logBase, currentDecision: 'deny', currentReason: 'elastic-below-floor' },
+      };
+    }
     if (cfg.admissionLoadGate && gate.closed && !brokerIdle) {
       if (ticket.id === headTicket.id) markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
       dropPickRecord();
@@ -1387,9 +1412,9 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       cwd: ticket.cwd,
       cmd: ticket.cmd,
       weight: ticket.weight,
-      resources: ticket.resources,
+      resources: submitted.resources,
       // BRAIN-360: elastic lanes only; what admission actually charged. `resources.cpuCores` stays the declaration.
-      ...(ticket.resources?.minCpuCores !== undefined ? { grantedCpuCores } : {}),
+      ...(submitted.resources?.minCpuCores !== undefined ? { grantedCpuCores } : {}),
       // BRAIN-255: carried onto the lease (not just the ticket) so a
       // held-lease-only view — status.js's report, or a later poll's
       // `blockedBy` call against a DIFFERENT ticket of the same key — can
@@ -1421,8 +1446,8 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       events.push(['resource-backfill-start', { skipPast: headTicket.id, count: recorded.count }]);
       if (recorded.reserved) events.push(['resource-reserved', { headId: headTicket.id, count: recorded.count, limit: cfg.resourceSkipLimit }]);
     }
-    if (elastic) {
-      events.push(['elastic-grant', { candidateId: ticket.id, declared: fullDecision.candidateCpuCores, granted: grantedCpuCores, min: ticket.resources.minCpuCores }]);
+    if (submitted.resources?.minCpuCores !== undefined && grantedCpuCores < submitted.resources.cpuCores) {
+      events.push(['elastic-grant', { candidateId: ticket.id, declared: submitted.resources.cpuCores, granted: grantedCpuCores, min: submitted.resources.minCpuCores }]);
     }
     if (idleExempt) {
       events.push(['resource-idle-exempt', { headId: headTicket.id, overshoot: (cpuDecision.projectedBusy - cpuDecision.budget).toFixed(2) }]);
@@ -1442,8 +1467,8 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
   // BRAIN-379: evaluated and logged after the lock is released, so shadow never lengthens a live admission or release.
   // One record per poll cycle (the head's poll) plus one per real admission; a non-head poll that starts nothing adds
   // no information (its verdict is in the head record's candidate list).
-  if ((shadow.inputs && (shadow.inputs.queue[0]?.id === ticket.id || result.started === true)) || shadow.captureError) {
-    recordAllocationShadow({ root, shadow, result, pollerId: ticket.id, evaluator: shadowSeams.evaluator });
+  if ((shadow.inputs && (shadow.inputs.queue[0]?.id === submitted.id || result.started === true)) || shadow.captureError) {
+    recordAllocationShadow({ root, shadow, result, pollerId: submitted.id, evaluator: shadowSeams.evaluator });
   }
 
   // Pure telemetry: nothing reads this back to make a decision, so it never
