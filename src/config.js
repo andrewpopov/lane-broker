@@ -41,6 +41,10 @@ export const DEFAULT_GLOBAL_CONFIG = {
   settledDemandWindowMs: 180_000,
   settledDemandHeadroom: 1.25,
   settledDemandFloorFraction: 0.5,
+  // BRAIN-433: charge a lane its history-informed CPU (p90 of its recent runs' mean cores, capped at its
+  // declaration) instead of the declaration, once it has historyDemandMinRuns successful runs.
+  historyDemandEnabled: true,
+  historyDemandMinRuns: 5,
   // Second, separate body of work (conflict-skip starvation bound — see
   // selectCandidate() in src/scheduler.js): how many times a conflict-blocked
   // FIFO head may be skipped in favor of a later, non-conflicting ticket
@@ -199,6 +203,8 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isFinite(cfg.settledDemandFloorFraction) && cfg.settledDemandFloorFraction >= 0 && cfg.settledDemandFloorFraction <= 1,
     `${sourcePath}: "settledDemandFloorFraction" must be a number in [0, 1]`,
   );
+  assert(typeof cfg.historyDemandEnabled === 'boolean', `${sourcePath}: "historyDemandEnabled" must be a boolean`);
+  assert(Number.isInteger(cfg.historyDemandMinRuns) && cfg.historyDemandMinRuns >= 1, `${sourcePath}: "historyDemandMinRuns" must be a positive integer`);
   assert(
     Number.isInteger(cfg.conflictSkipLimit) && cfg.conflictSkipLimit >= 0,
     `${sourcePath}: "conflictSkipLimit" must be a non-negative integer`,

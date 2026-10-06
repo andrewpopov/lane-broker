@@ -171,6 +171,24 @@ cores but uses 1 stops starving the queue. Unsettled leases are charged as
 before; `false` restores that for every lease. The admission log's
 `leaseDemand=<id8>:<cores>(settled|cold)` field shows the basis per held lease.
 
+`historyDemandEnabled` (default `true`) and `historyDemandMinRuns` (default 5): a lane
+with at least that many successful runs in `history.jsonl` (the last 50 runs, no
+older than 14 days) is charged its history estimate instead of its declared
+cores, both as an admission candidate and as the cold demand of a just-admitted
+lease. The estimate is the p90 of the per-run mean cores (`cpuSeconds` / wall
+when recorded, else the sampled `observedCpu.mean`), floored at 0.25 and capped at
+the declaration; `history.jsonl` is re-read at most once a minute. The settled
+floor above becomes `settledDemandFloorFraction` x the estimate, and a lease
+observed above its estimate is still charged what it is observed using. The lookup is hierarchical, using the first level with at least
+`historyDemandMinRuns` runs: the exact (repo, lane); the (repo, `configLane`) an ad-hoc
+lane name resolved to (so per-ticket lanes like `qwen-552a` inherit their declared
+lane's history); then the whole repo, pooling only runs that declared the same cores
+as the candidate. Sources are `history:exact`, `history:configLane`, `history:repo`,
+`declared`. `history.jsonl` is re-read before the admission lock is taken, never
+under it. A lane with no level that qualifies is charged its declaration. The admission log shows
+`candidateEstimate=<n>(<source>)`, and `lane status --json` gives each
+queued ticket `cpuEstimate: { cores, source }`. `false` charges declarations only.
+
 `admissionLoadGate` (default `false`): whether the load gate is allowed to
 deny a start at all. With the default, the gate is still sampled and reported
 every poll (`lane status` shows it, `[informational]` suffixed), but it never

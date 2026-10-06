@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import { paths, atomicWriteJson, readJsonSafe, fingerprintOf } from './state.js';
 import { sampleHostCpu } from './cpu.js';
+import { peekCpuEstimates, lookupEstimate, clampEstimate } from './cpu-estimates.js';
 import { evaluateMemoryAdmission, resolveTicketResources, leaseCpuCores, elasticClaimRange } from './resources.js';
 
 /**
@@ -16,6 +17,18 @@ import { evaluateMemoryAdmission, resolveTicketResources, leaseCpuCores, elastic
  */
 export function coldStartEstimate(weight) {
   return Math.max(0, Number(weight) || 0);
+}
+
+/**
+ * BRAIN-433: the CPU a claim of `declared` cores is charged for, and where that figure came from. The lane's
+ * history estimate (cpu-estimates.js, capped at the declaration) when enabled and the lane has enough runs,
+ * otherwise the declaration itself. The lookup is hierarchical (cpu-estimates.js) and never reads the file: callers refreshCpuEstimates before taking the lock. `cfg.cpuEstimateSource(now, minRuns)` replaces the cache in tests.
+ */
+export function cpuEstimateBasis(ref, declared, cfg, now = Date.now()) {
+  const cold = coldStartEstimate(declared);
+  if (cfg?.historyDemandEnabled !== true || !ref?.key) return { cores: cold, source: 'declared' };
+  const found = lookupEstimate((cfg.cpuEstimateSource ?? peekCpuEstimates)(now, cfg.historyDemandMinRuns ?? 5), { ...ref, declared: cold });
+  return found ? { cores: clampEstimate(found.p90, cold), source: `history:${found.level}` } : { cores: cold, source: 'declared' };
 }
 
 /**
@@ -73,7 +86,7 @@ function recentObservedCores(lease, now, windowMs, current) {
  * observedCpuHistory — keeps max(observed, cold) / cold.
  */
 export function leaseDemandBasis(lease, now = Date.now(), cfg) {
-  const cold = coldStartEstimate(leaseCpuCores(lease) ?? lease.weight);
+  const cold = cpuEstimateBasis(lease, leaseCpuCores(lease) ?? lease.weight, cfg, now).cores;
   const observed = freshObservedCores(lease, now);
   if (observed === null) return { demand: cold, basis: 'cold' };
   const unsettled = { demand: Math.max(observed, cold), basis: 'cold' };
@@ -250,15 +263,19 @@ export function cpuBudget(cpuSample, cfg) {
   return Math.min(percentBudget, reserveBudget);
 }
 
-/** A ticket's CPU claim as admission computes it (resolved resources, cold-start estimate). */
-export function ticketCpuEstimate(ticket, cfg) {
+/** A ticket's CPU claim as admission computes it (resolved resources, history-or-declared estimate), with its source. */
+export function ticketCpuEstimateBasis(ticket, cfg, now = Date.now()) {
   const resources = resolveTicketResources({
     weight: ticket.weight,
     cpuCores: ticket.resources?.cpuCores,
     memoryBytes: ticket.resources?.memoryBytes,
     defaultMemoryBytesPerWeight: cfg.defaultMemoryBytesPerWeight,
   });
-  return coldStartEstimate(resources.cpuCores);
+  return cpuEstimateBasis(ticket, resources.cpuCores, cfg, now);
+}
+
+export function ticketCpuEstimate(ticket, cfg, now = Date.now()) {
+  return ticketCpuEstimateBasis(ticket, cfg, now).cores;
 }
 
 /**
@@ -276,7 +293,7 @@ export function ticketCpuEstimate(ticket, cfg) {
  * otherwise until a valid sample arrives. See KNOWN_BIAS_NOTE above for a
  * bias this does NOT correct.
  */
-export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, candidateResources, cpuGateState, cooldownBlocked, cfg, now = Date.now() }) {
+export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, candidateRef, candidateResources, cpuGateState, cooldownBlocked, cfg, now = Date.now() }) {
   if (!cpuSample || cpuSample.stale || !Number.isFinite(cpuSample.hostBusyCores)) {
     if (heldLeases.length === 0) {
       return { admit: true, reason: 'sample-unavailable-empty', externalBusy: null, projectedBusy: null, budget: null };
@@ -286,22 +303,22 @@ export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, c
 
   const brokerObserved = heldLeases.reduce((sum, l) => sum + (freshObservedCores(l, now) ?? 0), 0);
   const externalBusy = Math.max(0, nonPreemptibleBusy(cpuSample, cfg) - brokerObserved);
-  const candidateEstimate = coldStartEstimate(candidateResources?.cpuCores ?? candidateWeight);
+  const { cores: candidateEstimate, source: candidateEstimateSource } = cpuEstimateBasis(candidateRef, candidateResources?.cpuCores ?? candidateWeight, cfg, now);
   const projectedBusy = projectBusy(externalBusy, heldLeases, candidateEstimate, now, cfg);
   const budget = cpuBudget(cpuSample, cfg);
   const leaseCharges = heldLeases.map((l) => ({ id: l.id, ...leaseDemandBasis(l, now, cfg) }));
   const leaseDemands = leaseCharges.map(({ id, demand, basis }) => `${String(id).slice(0, 8)}:${fmt(demand)}(${basis})`);
 
   if (cpuGateState.closed) {
-    return { admit: false, reason: 'cpu-gate-closed', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges };
+    return { admit: false, reason: 'cpu-gate-closed', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, candidateEstimate, candidateEstimateSource };
   }
   if (cooldownBlocked) {
-    return { admit: false, reason: 'cooldown', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges };
+    return { admit: false, reason: 'cooldown', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, candidateEstimate, candidateEstimateSource };
   }
   if (projectedBusy > budget) {
-    return { admit: false, reason: 'projected-over-budget', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges };
+    return { admit: false, reason: 'projected-over-budget', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, candidateEstimate, candidateEstimateSource };
   }
-  return { admit: true, reason: 'ok', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges };
+  return { admit: true, reason: 'ok', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, candidateEstimate, candidateEstimateSource };
 }
 
 /** The "nothing usable is known" fallback shared by a missing/stale sample
@@ -371,6 +388,7 @@ function decideAdmission(cfg, ticket, heldLeases, cpuSample, memoryInfo, cpuGate
     cpuSample,
     heldLeases,
     candidateWeight: ticket.weight,
+    candidateRef: ticket,
     candidateResources,
     cpuGateState,
     cooldownBlocked: blocked,
@@ -422,7 +440,7 @@ export function evaluateElasticAdmission(cfg, ticket, heldLeases, cpuSample, mem
     if (!isCpuOnlyDenial(fullDecision)) return null;
     const declared = resolveTicketResources({ weight: ticket.weight, cpuCores: ticket.resources?.cpuCores });
     // headroom: what the budget has left once everything but this ticket's own claim is counted
-    const headroom = fullDecision.budget - (fullDecision.projectedBusy - fullDecision.candidateCpuCores);
+    const headroom = fullDecision.budget - (fullDecision.projectedBusy - fullDecision.candidateEstimate);
     const range = elasticClaimRange({ cpuCores: declared.cpuCores, minCpuCores: ticket.resources?.minCpuCores, headroom });
     if (!range) return null;
     for (let claim = range.hi; claim >= range.lo; claim -= 1) {
@@ -474,6 +492,7 @@ export function formatAdmissionLog(f) {
     `budget=${fmt(f.budget)}`,
     `candidateCpu=${fmt(f.candidateCpuCores)}`,
     ...(f.declaredCpuCores !== undefined ? [`declaredCpu=${fmt(f.declaredCpuCores)}`] : []),
+    `candidateEstimate=${fmt(f.candidateEstimate)}(${f.candidateEstimateSource ?? 'declared'})`,
     `candidateMemoryBytes=${f.candidateMemoryBytes ?? 'n/a'}`,
     `projectedAvailableBytes=${f.projectedAvailableBytes ?? 'n/a'}`,
     `memoryBudgetBytes=${f.memoryBudgetBytes ?? 'n/a'}`,
