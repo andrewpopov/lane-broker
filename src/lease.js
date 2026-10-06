@@ -1,6 +1,8 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { paths, atomicWriteJson, readJsonSafe, bootId, listJsonRecordsStrict } from './state.js';
+import { trackerForLease, reapLogLine } from './descendants.js';
+import { writeBrokerLog } from './admission.js';
 import { isPidAlive, processStartTime, isProcessAlive } from './process-liveness.js';
 import { touchSimArmFor } from './sim-arm.js';
 
@@ -77,13 +79,54 @@ export function isSupervisorAlive(lease) {
   return isProcessAlive(lease.supervisorPid, lease.supervisorStart);
 }
 
+const ORPHAN_REAP_GRACE_MS = 10_000;
+const ORPHAN_REAP_GIVE_UP_MS = 60_000;
+
+/**
+ * Dead supervisor, dead group: the lease is the only record of descendants that left the group (BRAIN-419), so it is
+ * kept ORPHANED while any are alive, and every call advances a synchronous, non-blocking state machine so the lease
+ * heals itself instead of waiting for `lane cancel`: first pass TERMs the live members and records `orphanReap`;
+ * once the grace period has passed a later pass KILLs the survivors; any pass that finds none removes the lease.
+ * Past ORPHAN_REAP_GIVE_UP_MS from the TERM (members unkillable, or the process table unreadable) the lease is
+ * released anyway, with the incomplete-reap log line, so it can never block its lane forever.
+ * Returns 'released' (lease removed) or 'held'. `clock.now`/`clock.kill` are injectable for tests.
+ */
+function stepOrphanReap(root, lease, { now = Date.now(), kill } = {}) {
+  const release = (result) => {
+    if (lease.orphanReap || !result.complete) writeBrokerLog(root, reapLogLine(lease.id, result));
+    removeLease(root, lease.id);
+    return 'released';
+  };
+  const tracker = trackerForLease(lease);
+  const rows = tracker.scan();
+  const live = rows ? tracker.live(rows) : null;
+  if (live && live.length === 0) return release({ signalled: lease.orphanReap?.signalled ?? 0, survivors: [], complete: true });
+  const orphanReap = lease.orphanReap ?? { termAt: now, signalled: 0 };
+  if (now - orphanReap.termAt >= ORPHAN_REAP_GIVE_UP_MS) {
+    return release({ signalled: orphanReap.signalled, survivors: live ?? [], complete: false });
+  }
+  const advance = (patch, signal) => {
+    const signalled = signal && rows ? tracker.signalLive(rows, signal, kill) : [];
+    if (signalled.length > 0) writeBrokerLog(root, reapLogLine(lease.id, { signalled: signalled.length, survivors: [], complete: true }));
+    writeLease(root, {
+      ...lease,
+      state: LEASE_STATE.ORPHANED,
+      descendants: tracker.snapshot(),
+      orphanReap: { ...orphanReap, ...patch, signalled: orphanReap.signalled + signalled.length },
+    });
+  };
+  if (!lease.orphanReap) advance({ termAt: now }, 'SIGTERM');
+  else if (rows && !orphanReap.killAt && now - orphanReap.termAt >= ORPHAN_REAP_GRACE_MS) advance({ killAt: now }, 'SIGKILL');
+  return 'held';
+}
+
 /**
  * Apply the exact reap rule to one lease. Returns one of:
  *  - 'kept'    the lease is untouched
- *  - 'reaped'  removed: boot changed, or (supervisor dead AND group gone)
- *  - 'orphaned' marked ORPHANED: supervisor dead but the child group is alive (never auto-removed)
+ *  - 'reaped'  removed: boot changed, or (supervisor dead AND group gone AND no recorded/marked descendant alive)
+ *  - 'orphaned' marked ORPHANED: supervisor dead but the child group or a descendant is alive (never auto-removed)
  */
-export function reapIfStale(root, lease, currentBootId = bootId()) {
+export function reapIfStale(root, lease, currentBootId = bootId(), clock = {}) {
   if (lease.bootId !== currentBootId) {
     removeLease(root, lease.id);
     touchSimArmFor(root, lease);
@@ -91,9 +134,9 @@ export function reapIfStale(root, lease, currentBootId = bootId()) {
   }
   if (isSupervisorAlive(lease)) return 'kept';
   if (!isGroupAlive(lease.childPgid)) {
-    removeLease(root, lease.id);
+    const outcome = stepOrphanReap(root, lease, clock); // when held, it has already written the ORPHANED lease
     touchSimArmFor(root, lease);
-    return 'reaped';
+    return outcome === 'released' ? 'reaped' : 'orphaned';
   }
   if (lease.state !== LEASE_STATE.ORPHANED) {
     writeLease(root, { ...lease, state: LEASE_STATE.ORPHANED });

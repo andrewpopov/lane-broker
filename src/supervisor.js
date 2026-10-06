@@ -19,8 +19,8 @@ import {
 import { enqueue, tryStart, dequeueSync, couldAdmitNow, withdrawQueued, restoreQueued, discardRebinding } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
-import { observeLeaseTree } from './cpu.js';
-import { DescendantTracker } from './descendants.js';
+import { selectLeaseTree } from './cpu.js';
+import { DescendantTracker, reapLogLine } from './descendants.js';
 import { reloadGlobalConfig } from './config.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
@@ -1083,12 +1083,13 @@ async function main() {
   let killPromise = null;
 
   // BRAIN-419: processes that left the leader's group (setsid/setpgid) are invisible to killGroup, so track the tree.
-  const descendants = new DescendantTracker(child.pid, { protectedPids: [process.pid, process.ppid] });
+  const descendants = new DescendantTracker(child.pid, { leaseId: ticket.id });
   descendants.scan();
   async function killTree() {
     descendants.scan(); // the leader may still be alive: catches anything spawned since the last heartbeat
-    const [, reaped] = await Promise.all([killGroup(child.pid), descendants.reap({ graceMs: CANCEL_GRACE_MS })]);
-    writeBrokerLog(root, `lane-broker-reap id=${ticket.id} descendants-reaped=${reaped}\n`);
+    const [, result] = await Promise.all([killGroup(child.pid), descendants.reap({ graceMs: CANCEL_GRACE_MS })]);
+    // an incomplete reap is logged but never wedges the lease: the lease is still released
+    writeBrokerLog(root, reapLogLine(ticket.id, result));
   }
 
   const heartbeat = setInterval(() => {
@@ -1096,8 +1097,9 @@ async function main() {
     try {
       const lease = readLease(root, ticket.id);
       if (lease) {
-        descendants.scan();
-        const tree = observeLeaseTree(child.pid, otherLeaseStops(root, ticket.id));
+        // ONE process-table read per heartbeat feeds both the descendant record and the CPU/RSS observation
+        const rows = descendants.scan();
+        const tree = rows ? selectLeaseTree(rows, child.pid, otherLeaseStops(root, ticket.id)) : null;
         const observed = tree?.cores ?? null;
         const observedMemory = tree?.memoryBytes ?? null;
         // a gap of more than two heartbeats between good readings ends an overrun streak
@@ -1235,11 +1237,8 @@ async function main() {
   // gone. So reap on 'exit'; finalizeAndExit awaits killPromise before the result is written or the lease released.
   let groupReaped = false;
   function hasLiveDescendants() {
-    try {
-      return descendants.live().length > 0;
-    } catch {
-      return false;
-    }
+    const rows = descendants.scan(); // finds members reparented to init by the leader's exit, via the lease marker
+    return rows ? descendants.live(rows).length > 0 : descendants.recorded.size > 0;
   }
   child.on('exit', () => {
     if (finished || cancelling) return;
