@@ -1190,6 +1190,27 @@ verifies the group is gone, and only then writes the result and releases the lea
 runs unleased. The result and the history row carry `reason: "leader-exited-group-reaped"`. A run whose group is
 already empty at exit is unchanged. Advertised as `group-reap/1`.
 
+### Descendant reap (BRAIN-419)
+
+A command can start processes in their own session or process group (Playwright's `webServer` through turbo/pnpm
+does), which a group kill never reaches. While a lease runs, each heartbeat reads the process table once and records
+every member of the lease's tree, with a start token, on the lease (`descendants`). A process is a member when it
+descends from the leader or from a recorded member (ppid walk), or when its environment carries
+`LANE_BROKER_LEASE=<lease id>`, which the leader's descendants inherit even after being reparented to init (read from
+`/proc/<pid>/environ` on Linux; on macOS a second `ps -E` listing with each pid's plain command stripped as a
+prefix, so an argument that merely spells the marker never matches). macOS hides the environment of SIP-protected
+binaries, so one of those, detached by a short-lived leader and reparented before any scan saw it, cannot be found;
+the ppid walk covers it only if a scan observed it first. `lane cancel` and a leader exit TERM the group plus every live member, rescanning each
+iteration so a replacement spawned in a TERM handler is caught, wait the cancel grace period, KILL what remains for
+up to 3 s more, and log `descendants-reaped=<n>` to the admission log. A member whose pid now has a different start
+token is never signalled, and neither are the supervisor, its parent or processes outside the lease. If the table
+cannot be read, or members survive the KILL, the log also carries `descendants-reap-incomplete survivors=<pids>` and
+the lease is still released. A lease whose supervisor and group are gone but whose members are alive stays ORPHANED and heals itself on
+the admission polls: TERM on the first pass, KILL after the grace period, release once none are alive (or 30 s after
+the KILL, or 60 s after the TERM if the table is unreadable, with the incomplete-reap line); `lane cancel` does the same synchronously. The residual window between validating a pid and signalling it is accepted: Node has
+no pidfd signalling, and macOS pids climb to 99999 before wrapping. Likewise, on macOS a process whose argv changes between the
+two `ps` reads, keeping its old command as a prefix and appending this lease's exact random id, would be misread as a member.
+
 ## `lane capabilities --json`
 
 Prints one JSON line: `{"version", "capabilities": [...], "schedulerMode", "admissionMode"}`. `capabilities` is the
@@ -1201,7 +1222,7 @@ a feature (for example a pool gate that requires `group-reap/1`) checks this bef
 ## ORPHANED handling
 
 A lease is reaped (removed) only when **(the supervisor is dead AND its child
-process group is dead) OR the machine's boot id has changed** (a reboot). PID
+process group is dead AND no recorded descendant is alive) OR the machine's boot id has changed** (a reboot). PID
 existence alone never decides this — process start-time is compared against
 what was recorded at spawn time, to defeat PID reuse.
 

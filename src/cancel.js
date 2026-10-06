@@ -6,6 +6,8 @@ import { touchSimArmFor } from './sim-arm.js';
 import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { remoteCancel } from './remote-client.js';
 import { loadGlobalConfig } from './config.js';
+import { writeBrokerLog } from './admission.js';
+import { trackerForLease, reapLogLine } from './descendants.js';
 
 const GRACE_MS = 10_000;
 
@@ -13,9 +15,19 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** TERM the group, wait a grace period, KILL, verify gone. Used when there is no supervisor left to do it. */
-async function killGroupDirectly(pgid) {
-  if (!pgid) return;
+/** TERM the group, wait a grace period, KILL, verify gone. Used when there is no supervisor left to do it.
+ *  Also reaps the descendants the dead supervisor last recorded on the lease (BRAIN-419), token-checked. */
+async function killGroupDirectly(lease, root) {
+  const reaping = trackerForLease(lease).reap({ graceMs: GRACE_MS });
+  try {
+    if (lease.childPgid) await killGroupOnly(lease.childPgid);
+  } finally {
+    const result = await reaping;
+    writeBrokerLog(root, reapLogLine(lease.id, result));
+  }
+}
+
+async function killGroupOnly(pgid) {
   try {
     process.kill(-pgid, 'SIGTERM');
   } catch {
@@ -167,7 +179,7 @@ export async function cancelCommand(id) {
 
   // ORPHANED: no supervisor left to react to the cancel request. Do the kill
   // sequence ourselves, then release.
-  await killGroupDirectly(lease.childPgid);
+  await killGroupDirectly(lease, root);
 
   // BRAIN-319 (older bug, fixed alongside P1/P2/P3): a ticket that fell back
   // to local and was ADMITTED (leased) still has its attempt record --

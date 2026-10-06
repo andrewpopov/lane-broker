@@ -1,6 +1,8 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { paths, atomicWriteJson, readJsonSafe, bootId, listJsonRecordsStrict } from './state.js';
+import { trackerForLease, reapLogLine } from './descendants.js';
+import { writeBrokerLog } from './admission.js';
 import { isPidAlive, processStartTime, isProcessAlive } from './process-liveness.js';
 import { touchSimArmFor } from './sim-arm.js';
 
@@ -77,13 +79,72 @@ export function isSupervisorAlive(lease) {
   return isProcessAlive(lease.supervisorPid, lease.supervisorStart);
 }
 
+const ORPHAN_REAP_GRACE_MS = 10_000;
+const ORPHAN_KILL_GIVE_UP_MS = 30_000;
+const ORPHAN_UNREADABLE_GIVE_UP_MS = 60_000;
+
+/**
+ * Dead supervisor, dead group: the lease is the only record of descendants that left the group (BRAIN-419), so it is
+ * kept ORPHANED while any are alive, and every call advances a synchronous, non-blocking state machine so the lease
+ * heals itself instead of waiting for `lane cancel`. Each pass rescans and persists what it found. Before `killAt` it
+ * TERMs every newly found live member (the first pass records `termAt`); the first pass past the grace period sets
+ * `killAt` and from then on every live member is KILLed once. A pass that finds none removes the lease.
+ * It never gives up before a KILL was sent: it releases (with the incomplete-reap log line) only
+ * ORPHAN_KILL_GIVE_UP_MS after `killAt`, or ORPHAN_UNREADABLE_GIVE_UP_MS after `termAt` while the process table is
+ * unreadable (no KILL can be sent then), so a lease never blocks its lane forever.
+ * Returns 'released' (lease removed) or 'held'. `clock.now`/`kill`/`readTable` are injectable for tests.
+ */
+function stepOrphanReap(root, lease, { now = Date.now(), kill, readTable } = {}) {
+  const state = lease.orphanReap ?? { termAt: now, signalled: 0, termed: [], killed: [] };
+  const release = (result) => {
+    if (lease.orphanReap || !result.complete) writeBrokerLog(root, reapLogLine(lease.id, result));
+    removeLease(root, lease.id);
+    return 'released';
+  };
+  const tracker = trackerForLease(lease, { readTable });
+  const rows = tracker.scan();
+  const live = rows ? tracker.live(rows) : null;
+  if (live && live.length === 0) return release({ signalled: state.signalled, survivors: [], complete: true });
+  if (live === null && now - state.termAt >= ORPHAN_UNREADABLE_GIVE_UP_MS) {
+    return release({ signalled: state.signalled, survivors: [], complete: false });
+  }
+  if (state.killAt !== undefined && now - state.killAt >= ORPHAN_KILL_GIVE_UP_MS) {
+    return release({ signalled: state.signalled, survivors: live ?? [], complete: false });
+  }
+  const pastGrace = rows !== null && lease.orphanReap !== undefined && now - state.termAt >= ORPHAN_REAP_GRACE_MS;
+  const termed = new Set(state.termed);
+  const killed = new Set(state.killed);
+  const phaseKill = state.killAt !== undefined || pastGrace;
+  const signalled = rows ? tracker.signalLive(rows, phaseKill ? 'SIGKILL' : 'SIGTERM', kill, phaseKill ? killed : termed) : [];
+  // killAt records a KILL actually sent: unknown/unreadable members are skipped by signalLive and must not start the clock
+  const killAt = state.killAt ?? (pastGrace && signalled.length > 0 ? now : undefined);
+  if (killAt === undefined && now - state.termAt >= ORPHAN_UNREADABLE_GIVE_UP_MS) {
+    // the final scan signalled whatever it could see; nothing could be killed, so release rather than wedge the lane
+    return release({ signalled: state.signalled + signalled.length, survivors: live ?? [], complete: false });
+  }
+  if (signalled.length > 0) writeBrokerLog(root, reapLogLine(lease.id, { signalled: signalled.length, survivors: [], complete: true }));
+  writeLease(root, {
+    ...lease,
+    state: LEASE_STATE.ORPHANED,
+    descendants: tracker.snapshot(),
+    orphanReap: {
+      termAt: state.termAt,
+      ...(killAt !== undefined ? { killAt } : {}),
+      signalled: state.signalled + signalled.length,
+      termed: [...termed],
+      killed: [...killed],
+    },
+  });
+  return 'held';
+}
+
 /**
  * Apply the exact reap rule to one lease. Returns one of:
  *  - 'kept'    the lease is untouched
- *  - 'reaped'  removed: boot changed, or (supervisor dead AND group gone)
- *  - 'orphaned' marked ORPHANED: supervisor dead but the child group is alive (never auto-removed)
+ *  - 'reaped'  removed: boot changed, or (supervisor dead AND group gone AND no recorded/marked descendant alive)
+ *  - 'orphaned' marked ORPHANED: supervisor dead but the child group or a descendant is alive (never auto-removed)
  */
-export function reapIfStale(root, lease, currentBootId = bootId()) {
+export function reapIfStale(root, lease, currentBootId = bootId(), clock = {}) {
   if (lease.bootId !== currentBootId) {
     removeLease(root, lease.id);
     touchSimArmFor(root, lease);
@@ -91,9 +152,9 @@ export function reapIfStale(root, lease, currentBootId = bootId()) {
   }
   if (isSupervisorAlive(lease)) return 'kept';
   if (!isGroupAlive(lease.childPgid)) {
-    removeLease(root, lease.id);
+    const outcome = stepOrphanReap(root, lease, clock); // when held, it has already written the ORPHANED lease
     touchSimArmFor(root, lease);
-    return 'reaped';
+    return outcome === 'released' ? 'reaped' : 'orphaned';
   }
   if (lease.state !== LEASE_STATE.ORPHANED) {
     writeLease(root, { ...lease, state: LEASE_STATE.ORPHANED });
