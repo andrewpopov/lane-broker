@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   INITIAL_SIGMA, Z90, emptyEstimator, observeCompleted, observeCensored, p50Of, p90Of, sigmaOf, recordObservation, estimateFor, classDefault,
-  bucketOf, seedFactor, factorFor, observeFactor, rebaseAnchor, rescaleEstimator, runningResidual, addRemaining, remainingMinutes, ANCHOR_STALE_MS,
+  bucketOf, BUCKETS, seedFactor, factorFor, observeFactor, rebaseAnchor, rescaleEstimator, runningResidual, addRemaining, remainingMinutes, ANCHOR_STALE_MS,
 } from '../src/estimates.js';
 
 const near = (a, b, eps = 1e-6) => assert.ok(Math.abs(a - b) < eps, `${a} !~ ${b}`);
@@ -123,6 +123,12 @@ test('5. factors: seeded from calibration, refined by EWMA of wall / est_p50 per
   assert.equal(factorFor(f, 'skybox', 'sim', 'short'), 1);
 });
 
+test('5. factors: a censored observation into a MISSING cell cannot lower it below the default 1', () => {
+  const f = observeFactor({}, 'skybox', 'test', 100, 20, { censored: true });
+  assert.ok(factorFor(f, 'skybox', 'test', 'short') >= 1);
+  assert.equal(factorFor(observeFactor({}, 'skybox', 'test', 100, 300, { censored: true }), 'skybox', 'test', 'short'), 3);
+});
+
 test('5. factors: censored runs only raise a factor', () => {
   let f = seedFactor({}, 'skybox', 'test', 'short', 2);
   f = observeFactor(f, 'skybox', 'test', 60, 70, { censored: true }); // 1.17 < 2
@@ -150,21 +156,74 @@ test('5. anchor: a calibrated mac-grandy keeps the anchor and rescales nothing',
   assert.equal(r.factors, factors);
 });
 
-test('5. anchor: 30 days without calibration moves it to the median host and rescales every factor once', () => {
+const OLD_ANCHOR_STALE = { 'mac-grandy': NOW - ANCHOR_STALE_MS - 1 };
+
+test('5. anchor: 30 days without calibration moves it to the median host, rescaling per (class, bucket) cell', () => {
   const factors = { a: { test: { short: cell(1.5) } }, b: { test: { short: cell(2) } }, c: { test: { short: cell(4) } } };
-  const calibratedAt = { 'mac-grandy': NOW - ANCHOR_STALE_MS - 1, a: NOW, b: NOW, c: NOW };
+  const calibratedAt = { ...OLD_ANCHOR_STALE, a: NOW, b: NOW, c: NOW };
   const r = rebaseAnchor({ factors, calibratedAt, now: NOW });
   assert.equal(r.moved, true);
   assert.equal(r.anchor, 'b');
-  near(r.refScale, 2);
+  assert.deepEqual(r.refScales, { test: { short: 2 } });
+  assert.deepEqual(r.unanchored, []);
   near(r.factors.a.test.short.factor, 0.75);
   near(r.factors.c.test.short.factor, 2);
-  near(r.factors['mac-grandy'].all.all.factor, 0.5);
   assert.equal(r.factors.b, undefined);
-  // a wall time is preserved: 100 ref-s on the old scale = 200 s on b = 100 new ref-s... ref scales by refScale
-  near(p50Of(rescaleEstimator(observeCompleted(emptyEstimator(), 100), r.refScale)), 200);
-  // idempotent for the new anchor once calibrated
+  near(p50Of(rescaleEstimator(observeCompleted(emptyEstimator(), 100), 'test', r.refScales)), 200);
   assert.equal(rebaseAnchor({ factors: r.factors, calibratedAt: { ...calibratedAt, b: NOW }, anchor: 'b', now: NOW }).moved, false);
+});
+
+test('5. anchor: the old anchor stays readable after the rebase (real per-cell value, not an unreadable aggregate)', () => {
+  const factors = { b: { test: { short: cell(2), long: cell(4) } } };
+  const r = rebaseAnchor({ factors, calibratedAt: { ...OLD_ANCHOR_STALE, b: NOW }, now: NOW });
+  assert.equal(r.anchor, 'b');
+  assert.equal(factorFor(r.factors, 'mac-grandy', 'test', 'short', { anchor: 'b' }), 0.5);
+  assert.equal(factorFor(r.factors, 'mac-grandy', 'test', 'long', { anchor: 'b' }), 0.25);
+  assert.equal(factorFor(r.factors, 'b', 'test', 'long', { anchor: 'b' }), 1);
+});
+
+test('5. anchor: new-anchor bucket differences are preserved, not collapsed to one scalar (short 1, long 4)', () => {
+  const factors = { b: { test: { short: cell(1), long: cell(4) } } };
+  const r = rebaseAnchor({ factors, calibratedAt: { ...OLD_ANCHOR_STALE, b: NOW }, now: NOW });
+  // 100 ref-s short job on mac-grandy: 100 s before; after, its ref is 100 x 1 and the factor 1
+  near(100 * r.refScales.test.short * factorFor(r.factors, 'mac-grandy', 'test', 'short', { anchor: 'b' }), 100);
+  // 1000 ref-s long job on mac-grandy: 1000 s before; after, 4000 ref-s x 0.25
+  near(1000 * r.refScales.test.long * factorFor(r.factors, 'mac-grandy', 'test', 'long', { anchor: 'b' }), 1000);
+});
+
+test('5. anchor: a cell the new anchor lacks is left unscaled and reported as unanchored', () => {
+  const factors = { a: { test: { short: cell(2) }, sim: { long: cell(3) } }, z: { test: { short: cell(5) } } };
+  const r = rebaseAnchor({ factors, calibratedAt: { ...OLD_ANCHOR_STALE, a: NOW, z: NOW }, now: NOW });
+  assert.equal(r.anchor, 'a');
+  assert.deepEqual(r.unanchored, []);
+  const r2 = rebaseAnchor({ factors: { a: { test: { short: cell(2) } }, z: { test: { short: cell(5) }, sim: { long: cell(3) } } }, calibratedAt: { ...OLD_ANCHOR_STALE, a: NOW, z: NOW }, now: NOW });
+  assert.equal(r2.anchor, 'a');
+  assert.deepEqual(r2.unanchored, [['sim', 'long']]);
+  assert.equal(r2.factors.z.sim.long.factor, 3);
+  assert.equal(r2.refScales.sim, undefined);
+});
+
+test('5. anchor: UNIT PRESERVATION over random factor tables: predicted wall seconds unchanged on every host', () => {
+  let seed = 12345;
+  const rnd = () => ((seed = (seed * 1664525 + 1013904223) % 4294967296) / 4294967296);
+  const hosts = ['a', 'b', 'c', 'd'];
+  const classes = ['test', 'sim'];
+  for (let trial = 0; trial < 200; trial += 1) {
+    const factors = {};
+    for (const h of hosts) for (const c of classes) for (const b of BUCKETS) if (rnd() < 0.8) factors[h] = { ...factors[h], [c]: { ...factors[h]?.[c], [b]: cell(0.3 + rnd() * 5) } };
+    const calibratedAt = { ...OLD_ANCHOR_STALE, ...Object.fromEntries(hosts.map((h) => [h, NOW])) };
+    const r = rebaseAnchor({ factors, calibratedAt, now: NOW });
+    if (!r.moved) continue;
+    const own = factors[r.anchor];
+    for (const h of ['mac-grandy', ...hosts]) {
+      for (const [c, b] of Object.entries(own).flatMap(([cc, bb]) => Object.keys(bb).map((x) => [cc, x]))) {
+        const refOld = 10 + rnd() * 1000;
+        const wallOld = refOld * factorFor(factors, h, c, b);
+        const wallNew = refOld * r.refScales[c][b] * factorFor(r.factors, h, c, b, { anchor: r.anchor });
+        near(wallNew, wallOld, 1e-9 * Math.max(1, wallOld));
+      }
+    }
+  }
 });
 
 test('5. anchor: a host stale for more than 30 days is not a candidate; with none left nothing moves', () => {
