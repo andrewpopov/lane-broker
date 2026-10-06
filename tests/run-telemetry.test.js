@@ -4,8 +4,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, laneSpawn, gitFixture, waitFor } from './helpers.js';
 import { tmpDir, setup } from './remote-harness.js';
-import { paths } from '../src/state.js';
-import { readLease } from '../src/lease.js';
+import { spawn } from 'node:child_process';
+import { paths, withLock, bootId } from '../src/state.js';
+import { enqueue, tryStart } from '../src/scheduler.js';
+import { loadGlobalConfig } from '../src/config.js';
+import { createAttempt, patchAttemptLocked } from '../src/attempts.js';
+import { cancelCommand } from '../src/cancel.js';
+import { readLease, writeLease } from '../src/lease.js';
 import { foldObservedCpu, integratedCpuSeconds } from '../src/observed.js';
 
 /** BRAIN-425: the shape of a finished run's history.jsonl row, per kind of run. */
@@ -108,4 +113,96 @@ test('remote run: submitter row carries exit, grant, cpuSeconds and remotePhases
     assert.ok(Number.isFinite(row.remotePhasesMs?.[key]), `remotePhasesMs.${key}: ${JSON.stringify(row.remotePhasesMs)}`);
   }
   assert.ok(row.remotePhasesMs.commandMs >= 1000, JSON.stringify(row.remotePhasesMs));
+});
+
+test('firstCores is the first reading, not the whole-span average (4 -> 0 -> 0 cores)', () => {
+  let s;
+  for (const [at, cores] of [[1000, 4], [2000, 0], [3000, 0]]) s = foldObservedCpu(s, cores, at);
+  // head 4 cores x 1s before the first sample + area 4 cores x 1s; the span average (2 cores) would give 6
+  assert.equal(integratedCpuSeconds(s, 0, 3000), 8);
+});
+
+test('the exit path takes no process-table scan of its own: only the constructor, the early sample and the reap check', async () => {
+  const f = localEnv(60_000);
+  const shimDir = tmpDir('ps-shim');
+  const log = path.join(shimDir, 'ps.log');
+  const realPs = '/bin/ps';
+  fs.writeFileSync(path.join(shimDir, 'ps'), `#!/bin/sh\necho "$PPID $*" >> ${JSON.stringify(log)}\nexec ${realPs} "$@"\n`, { mode: 0o755 });
+  const env = { ...f.env, PATH: `${shimDir}${path.delimiter}${f.env.PATH}` };
+  const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', ...busyCmd(2500)], { env, cwd: f.repoDir });
+  const closed = new Promise((resolve) => child.on('close', resolve));
+  const supervisorPid = await waitFor(() => {
+    try {
+      const name = fs.readdirSync(paths(f.state).leases).find((n) => n.endsWith('.json'));
+      return (name && readLease(f.state, name.replace(/\.json$/, ''))?.supervisorPid) || null;
+    } catch {
+      return null;
+    }
+  });
+  await closed;
+  const calls = fs.readFileSync(log, 'utf8').split('\n').filter((l) => Number(l.split(' ')[0]) === supervisorPid && l.includes('pcpu=,rss=,lstart=,command=')).length;
+  assert.equal(calls, 3, `supervisor process-table scans: ${calls}\n${fs.readFileSync(log, 'utf8')}`);
+});
+
+/** Run `body` with this process's broker root pointed at `state` (the in-process cancel/scheduler paths read it from the env). */
+async function withState(state, body) {
+  const prev = process.env.LANE_BROKER_STATE;
+  process.env.LANE_BROKER_STATE = state;
+  try {
+    return await body();
+  } finally {
+    if (prev === undefined) delete process.env.LANE_BROKER_STATE;
+    else process.env.LANE_BROKER_STATE = prev;
+  }
+}
+async function deadPid() {
+  const child = spawn(process.execPath, ['-e', 'process.exit(0)']);
+  const pid = child.pid;
+  await new Promise((resolve) => child.on('exit', resolve));
+  return pid;
+}
+const declared = { cpuCores: 3, memoryBytes: GIB };
+
+test('dead-supervisor dequeue row carries the grant and exit/signal', async () => {
+  const f = localEnv(100);
+  await withState(f.state, async () => {
+    const dead = await deadPid();
+    const ticket = (id, supervisorPid, createdAt) => ({ id, key: 'r:default', conflicts: [], weight: 1, resources: declared, supervisorPid, supervisorStart: null, cwd: f.repoDir, cmd: ['true'], logPath: path.join(f.base, `${id}.log`), resultPath: path.join(f.base, `${id}.json`), createdAt });
+    await enqueue(f.state, ticket('dead-head', dead, Date.now()));
+    const live = ticket('live-second', process.pid, Date.now() + 1);
+    await enqueue(f.state, live);
+    await tryStart(f.state, live, loadGlobalConfig());
+  });
+  const row = rows(f.state).find((r) => r.id === 'dead-head');
+  assert.equal(row.dequeuedDeadSupervisor, true);
+  assert.equal(row.grantedCpuCores, 3);
+  assert.equal(row.grantedMemoryBytes, GIB);
+  assert.equal(row.exit, null);
+  assert.equal(row.signal, null);
+});
+
+test('orphan-cancel rows (attempt only, lease + attempt, lease only) carry the grant and exit/signal', async () => {
+  const f = localEnv(100);
+  await withState(f.state, async () => {
+    const dead = await deadPid();
+    const orphanAttempt = async (id) => {
+      await createAttempt(f.state, id, { resources: declared });
+      await withLock(f.state, () => patchAttemptLocked(f.state, id, { supervisor: { pid: dead, startTime: null, bootId: bootId() } }));
+    };
+    const lease = (id) => ({ id, key: `r:${id}`, resultPath: path.join(f.base, `${id}.json`), bootId: bootId(), supervisorPid: dead, supervisorStart: null, childPgid: null, weight: 1, resources: declared, state: 'running' });
+    await orphanAttempt('attempt-only');
+    assert.equal((await cancelCommand('attempt-only')).exitCode, 0);
+    await orphanAttempt('lease-attempt');
+    writeLease(f.state, lease('lease-attempt'));
+    assert.equal((await cancelCommand('lease-attempt')).exitCode, 0);
+    writeLease(f.state, lease('lease-only'));
+    assert.equal((await cancelCommand('lease-only')).exitCode, 0);
+  });
+  for (const id of ['attempt-only', 'lease-attempt', 'lease-only']) {
+    const row = rows(f.state).find((r) => r.id === id);
+    assert.equal(row.grantedCpuCores, 3, id);
+    assert.equal(row.grantedMemoryBytes, GIB, id);
+    assert.ok('exit' in row && 'signal' in row, id);
+    assert.equal(row.cancelled, true, id);
+  }
 });

@@ -30,10 +30,11 @@ const validStats = (s) =>
  * `lastAt` never moves backwards, so no interval is counted twice when time catches up.
  */
 export function foldObservedCpu(stats, cores, now) {
-  if (!validStats(stats)) return { peak: cores, area: 0, spanMs: 0, samples: 1, lastAt: now, lastCores: cores };
+  if (!validStats(stats)) return { peak: cores, area: 0, spanMs: 0, samples: 1, lastAt: now, lastCores: cores, firstAt: now, firstCores: cores };
   if (now <= stats.lastAt) return { ...stats, peak: Math.max(stats.peak, cores), samples: stats.samples + 1 };
   const dt = now - stats.lastAt;
   return {
+    ...stats,
     peak: Math.max(stats.peak, cores),
     area: stats.area + stats.lastCores * dt,
     spanMs: stats.spanMs + dt,
@@ -64,9 +65,8 @@ export function sanitizeObservedCpu(o) {
  */
 export function integratedCpuSeconds(stats, startedAt, endedAt) {
   if (!validStats(stats)) return undefined;
-  const firstAt = stats.lastAt - stats.spanMs;
-  const firstCores = stats.spanMs > 0 ? stats.area / stats.spanMs : stats.lastCores;
-  const head = isNum(startedAt) && startedAt < firstAt ? firstCores * (firstAt - startedAt) : 0;
+  // the first reading's own time and cores (BRAIN-425), never a whole-span average: stats from before they were kept get no head
+  const head = isNum(stats.firstAt) && isNum(stats.firstCores) && isNum(startedAt) && startedAt < stats.firstAt ? stats.firstCores * (stats.firstAt - startedAt) : 0;
   const tail = isNum(endedAt) && endedAt > stats.lastAt ? stats.lastCores * (endedAt - stats.lastAt) : 0;
   return round3((stats.area + head + tail) / 1000);
 }

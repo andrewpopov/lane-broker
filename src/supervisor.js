@@ -24,7 +24,7 @@ import { DescendantTracker, hasLiveMembers, reapLogLine } from './descendants.js
 import { reloadGlobalConfig } from './config.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
-import { detectResourceCapacity, checkResourceBudget, localSimRefusal, leaseCpuCores } from './resources.js';
+import { detectResourceCapacity, checkResourceBudget, localSimRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { selectRunner, dispatchRemote, needsProtocol2 } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
@@ -443,11 +443,8 @@ function historyRow(ticket, result, { fallbackReason, lease } = {}) {
     headTree: ticket.headTree,
     // BRAIN-380 §8: only a ticket that was admitted has a lease, so only its row carries the admission audit
     ...priorityAuditOf(lease),
-    // BRAIN-425: every row states what the lane was granted and how it ended; an elastic or relayed grant in `result` wins
-    ...(Number.isFinite(ticket.resources?.cpuCores) ? { grantedCpuCores: ticket.resources.cpuCores } : {}),
-    ...(Number.isFinite(ticket.resources?.memoryBytes) ? { grantedMemoryBytes: ticket.resources.memoryBytes } : {}),
-    exit: null,
-    signal: null,
+    // BRAIN-425: every row states what the lane was granted and how it ended; a grant or exit in `result` wins
+    ...terminalRowDefaults({ resources: ticket.resources, grantedCpuCores: lease?.grantedCpuCores }),
     ...result,
     executor,
     ...(localReason ? { localReason } : {}),
@@ -493,7 +490,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // the attempt generation every fence below acts on: 0 for a first attempt, the fallback's generation for a rebind
   const gen = rebind ? rebind.generation : 0;
   let withdrawn = null;
-  if (!rebind) await createAttempt(root, enriched.id, { runner: null });
+  if (!rebind) await createAttempt(root, enriched.id, { runner: null, resources: enriched.resources });
 
   // Reuses the SAME two writers a local child's output goes through
   // (CappedLogWriter/ForwardWriter, defined above) -- no second relay.
@@ -1119,8 +1116,8 @@ async function main() {
     writeBrokerLog(root, reapLogLine(ticket.id, result));
   }
 
-  // BRAIN-425: one observation, shared by the heartbeat, an early sample and an exit sample, so a run shorter than
-  // sampleMs still gets a CPU reading instead of none.
+  // BRAIN-425: one observation, shared by the heartbeat and an early sample, so a run shorter than sampleMs still gets a
+  // CPU reading. Never taken on the exit path: reap and lease release must not wait on telemetry.
   function observeLease() {
     try {
       const lease = readLease(root, ticket.id);
@@ -1276,9 +1273,7 @@ async function main() {
   // gone. So reap on 'exit'; finalizeAndExit awaits killPromise before the result is written or the lease released.
   let groupReaped = false;
   child.on('exit', () => {
-    if (finished) return;
-    observeLease(); // BRAIN-425: last look at any survivors (a leader that has already exited reads as nothing)
-    if (cancelling) return;
+    if (finished || cancelling) return;
     if (!isGroupAlive(child.pid) && !hasLiveMembers(descendants)) return;
     groupReaped = true;
     killPromise = killTree();

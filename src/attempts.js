@@ -102,13 +102,15 @@ export function remoteCancelledResult(id, startedAt) {
  *  phase 'probe'), stamped with THIS process's own identity as the owning
  *  supervisor. `runner` is not yet known at this point in the real dispatch
  *  flow (selection happens after), so it defaults to null. */
-export async function createAttempt(root, id, { runner = null } = {}) {
+export async function createAttempt(root, id, { runner = null, resources } = {}) {
   const attempt = {
     id,
     generation: 0,
     executor: 'remote',
     phase: 'probe',
     runner,
+    // BRAIN-425: kept so an orphan-cancel history row can still say what the run was charged
+    ...(resources ? { resources } : {}),
     startedAt: Date.now(),
     supervisor: {
       pid: process.pid,

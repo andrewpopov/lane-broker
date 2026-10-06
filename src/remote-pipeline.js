@@ -430,7 +430,12 @@ export async function remotePipelineCommand(ticketDir) {
   } finally {
     if (commandStart === null) phasesMs.setupMs = Date.now() - pipelineStart;
     else phasesMs.commandMs = Date.now() - commandStart;
-    atomicWriteJson(path.join(ticketDir, 'phases.json'), phasesMs);
+    try {
+      atomicWriteJson(path.join(ticketDir, 'phases.json'), phasesMs);
+    } catch (err) {
+      // telemetry only: a failed write must never fail a finished pipeline or skip the lease release below
+      process.stderr.write(`remote-pipeline: phase timings not recorded: ${err.message}\n`);
+    }
     for (const release of releaseLeases) {
       try {
         await release();
