@@ -216,8 +216,10 @@ export async function withdrawQueued(root, id) {
     const record = readJsonSafe(file);
     if (!record || record.id !== id) return null;
     const parked = file.replace(/\.json$/, REBINDING_SUFFIX);
+    const legacyFairness = legacyFairnessOf(root, id);
     try {
       fs.renameSync(file, parked);
+      if (legacyFairness) atomicWriteJson(parked, { ...record, legacyFairness });
     } catch {
       return null;
     }
@@ -231,18 +233,44 @@ export async function withdrawQueued(root, id) {
   });
 }
 
+/**
+ * BRAIN-405: the legacy (unfenced) scheduler keeps ONE singleton file per fairness kind, keyed by the head it describes. A
+ * ticket's earned count and reservation live there only while it is the head, and the next head overwrites them, so a ticket
+ * provisionally withdrawn would come back with nothing. The singletons that describe `id` are snapshotted into its parked file.
+ */
+function legacyFairnessOf(root, id) {
+  if (resolveScheduler(root, { log: false }).v2) return null;
+  const files = legacyStore(root).files;
+  const held = {};
+  for (const [kind, file] of Object.entries(files)) {
+    const raw = readJsonSafe(file);
+    if (raw && raw.headId === id) held[kind] = raw;
+  }
+  return Object.keys(held).length > 0 ? held : null;
+}
+
 /** BRAIN-405: end a withdrawal that provably never started a remote run: the ticket is queued again at its ORIGINAL seq. */
 export async function restoreQueued(root, record) {
   return withLock(root, () => restoreLocked(root, record));
 }
 
 function restoreLocked(root, record) {
+  let legacyFairness = null;
   if (!findQueueFile(root, record.id)) {
     const parked = rebindingFile(root, record.id);
-    if (parked) fs.renameSync(parked, parked.slice(0, -'.rebinding'.length));
-    else atomicWriteJson(queueFile(root, record.seq, record.id), record);
+    if (parked) {
+      const { legacyFairness: snapshot, ...parkedRecord } = readJsonSafe(parked) ?? record;
+      legacyFairness = snapshot ?? null;
+      atomicWriteJson(parked.slice(0, -'.rebinding'.length), parkedRecord);
+      fs.unlinkSync(parked);
+    } else atomicWriteJson(queueFile(root, record.seq, record.id), record);
   }
   patchAttemptLocked(root, record.id, { rebinding: undefined });
+  // it keeps its original seq, so it is the head again; what another head wrote meanwhile was only valid while it was away
+  if (legacyFairness && listQueue(root)[0]?.id === record.id && !resolveScheduler(root, { log: false }).v2) {
+    const files = legacyStore(root).files;
+    for (const [kind, raw] of Object.entries(legacyFairness)) if (files[kind]) atomicWriteJson(files[kind], raw);
+  }
 }
 
 /** BRAIN-405: the withdrawal is over because the ticket reached a terminal outcome (or is now only a remote attempt). */

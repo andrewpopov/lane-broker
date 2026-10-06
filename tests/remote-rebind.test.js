@@ -286,6 +286,26 @@ test('fairness records (reservation, skip counters, conflict grace) survive a wi
   assert.deepEqual(readFairness(state).a, records);
 });
 
+test('legacy scheduler: the head\'s earned reservation and skip count survive a withdrawal that another head overwrote the singleton during', async () => {
+  const { state } = freshEnv(); // no scheduler fence: the legacy singleton files
+  await enqueue(state, ticketOf('a'));
+  await enqueue(state, ticketOf('b'));
+  const earned = { headId: 'a', count: 3, reserved: true, inScope: true, deniedAt: T0, budget: 9, externalBusy: 5 };
+  const conflict = { headId: 'a', count: 2, blockedSince: T0, loggedPhase: null };
+  atomicWriteJson(paths(state).resourceSkipState, earned);
+  atomicWriteJson(paths(state).conflictSkipState, conflict);
+  const taken = await withdrawQueued(state, 'a');
+  assert.equal('legacyFairness' in taken, false, 'the snapshot is not part of the ticket');
+  // B becomes head and is denied: it takes over the singletons
+  atomicWriteJson(paths(state).resourceSkipState, { headId: 'b', count: 1, reserved: false });
+  atomicWriteJson(paths(state).conflictSkipState, { headId: 'b', count: 1, blockedSince: T0 + 1 });
+  await restoreQueued(state, taken);
+  assert.deepEqual(queuedIds(state), ['a', 'b']);
+  assert.deepEqual(readJsonSafe(paths(state).resourceSkipState), earned);
+  assert.deepEqual(readJsonSafe(paths(state).conflictSkipState), conflict);
+  assert.equal('legacyFairness' in listQueue(state)[0], false, 'the restored queue record is clean');
+});
+
 // ---- end to end over the fake-ssh transport ----
 
 /**

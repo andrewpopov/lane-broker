@@ -128,6 +128,7 @@ export function legacyStore(root) {
   return {
     v2: false,
     root,
+    files: file,
     read: (kind) => readJsonSafe(file[kind]),
     write: (kind, headId, raw, write = atomicWriteJson) => write(file[kind], raw),
     dropResourceRecord: () => {
