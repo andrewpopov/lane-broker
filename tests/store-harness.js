@@ -24,7 +24,7 @@ export function token(claims, { clock } = {}) {
 /** One in-process lane-store on a disposable dir, bound to loopback. Tests run two of these (primary + replica). */
 export async function startStore({ clock = fakeClock(), root, ...opts } = {}) {
   const dir = root ?? fs.mkdtempSync(path.join(os.tmpdir(), 'lane-store-test-'));
-  const s = createStore({ root: dir, verifier: createHmacVerifier(SECRET, { now: clock.now }), now: clock.now, ...opts });
+  const s = await createStore({ root: dir, verifier: createHmacVerifier(SECRET, { now: clock.now }), now: clock.now, ...opts });
   const addr = await s.listen('127.0.0.1', 0);
   const url = `http://127.0.0.1:${addr.port}`;
   const client = (claims) => new StoreClient({ baseUrl: url, token: token(claims, { clock }) });

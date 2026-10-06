@@ -58,7 +58,7 @@ export async function storeCli(argv, env = process.env) {
     const secret = need(env.LANE_STORE_SECRET, 'LANE_STORE_SECRET');
     const [host, port] = splitListen(values.listen);
     const target = values['replicate-to'];
-    const s = createStore({
+    const s = await createStore({
       root: need(values.root, '--root'),
       replicaMode: !!values.replica,
       replicaGraceHours: values['replica-grace-hours'] === undefined ? undefined : Number(values['replica-grace-hours']),
@@ -67,6 +67,10 @@ export async function storeCli(argv, env = process.env) {
       capBytes: byteOption(values['cap-bytes'], '--cap-bytes'),
       sweepIntervalMs: Number(values['sweep-interval-s'] ?? 3600) * 1000,
       maintenanceIntervalMs: Number(values['maintenance-interval-s'] ?? 30) * 1000,
+      onLockLost: (err) => {
+        console.error(`lane-store: ${err.message}; another process owns this store, shutting down`);
+        s.close().finally(() => process.exit(70));
+      },
       replicateTo: target ? new StoreClient({ baseUrl: target, token: need(env.LANE_STORE_REPLICA_TOKEN, 'LANE_STORE_REPLICA_TOKEN') }) : undefined,
       replicateIntervalMs: Number(values['replicate-interval-s'] ?? 300) * 1000,
     });
@@ -88,7 +92,7 @@ export async function storeCli(argv, env = process.env) {
   if (command === 'rebuild-watermark') {
     const seq = Number(need(values.seq, '--seq'));
     if (!Number.isInteger(seq) || seq < 0) throw new Error('--seq must be a non-negative integer');
-    console.log(JSON.stringify(rebuildWatermark(need(values.root, '--root'), seq)));
+    console.log(JSON.stringify(await rebuildWatermark(need(values.root, '--root'), seq)));
     return 0;
   }
 

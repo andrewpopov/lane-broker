@@ -5,7 +5,7 @@ import { atomicWriteFile, atomicWriteJson, fsyncDirectory } from '../state.js';
 import { manifestHashOf, isCanonicalRelPath } from '../remote-manifest.js';
 import { MAX_HEADER_BYTES } from '../remote-stream.js';
 import { Journal } from './journal.js';
-import { acquireStoreLock } from './lock.js';
+import { acquireStoreLockAsync, LockLostError } from './lock.js';
 import { RETENTION_DEFAULTS } from './retention.js';
 import { isSha256, isJobId, blobRelPath, manifestRelPath, parseObjectPath } from './ids.js';
 
@@ -116,16 +116,26 @@ function parseManifestDoc(bytes) {
  * Nothing under the root may be a symlink: ancestors are lstat-checked and leaves opened with O_NOFOLLOW.
  */
 export class ObjectStore {
-  constructor(root, { now = Date.now, maxBlobBytes = DEFAULT_MAX_BLOB_BYTES, capBytes = Infinity, replicaMode = false, replicaGraceHours = RETENTION_DEFAULTS.manifestAfterTerminalMs / 3_600_000 } = {}) {
+  constructor(root, { now = Date.now, maxBlobBytes = DEFAULT_MAX_BLOB_BYTES, capBytes = Infinity, replicaMode = false, replicaGraceHours = RETENTION_DEFAULTS.manifestAfterTerminalMs / 3_600_000, lock } = {}) {
     fs.mkdirSync(root, { recursive: true });
     this.root = fs.realpathSync(root); // confine to the real directory; every later path is checked against symlinks below it
-    this.lock = acquireStoreLock(this.root);
+    // Only `ObjectStore.open` constructs a store: it takes the platform lock (kernel-held on Linux) first. A constructor that
+    // took its own lock would let a file-lock holder and a socket holder both write the journal on Linux.
+    if (!lock) throw new Error('construct an ObjectStore with `await ObjectStore.open(root)`, which takes the platform lock');
+    this.lock = lock;
     try {
       this.init({ now, maxBlobBytes, capBytes, replicaMode, replicaGraceHours });
     } catch (err) {
       this.lock.release();
       throw err;
     }
+  }
+
+  /** Open a store holding the platform's lock (the kernel-held abstract socket on Linux, the file lock elsewhere). */
+  static async open(root, opts = {}) {
+    fs.mkdirSync(root, { recursive: true });
+    const lock = await acquireStoreLockAsync(fs.realpathSync(root));
+    return new ObjectStore(root, { ...opts, lock }); // the constructor releases the lock itself if initialisation fails
   }
 
   init({ now, maxBlobBytes, capBytes, replicaMode, replicaGraceHours }) {
@@ -144,12 +154,14 @@ export class ObjectStore {
       }
     }
     for (const f of walkFiles(path.join(this.root, 'tmp'))) fs.unlinkSync(f.full); // leftovers of a crash mid-upload
-    this.journal = new Journal(this.root, { trackPending: !replicaMode });
+    this.journal = new Journal(this.root, { trackPending: !replicaMode, guard: () => this.assertOwner() });
     this.bytes = [...walkFiles(path.join(this.root, 'blobs')), ...walkFiles(path.join(this.root, 'manifests'))].reduce((n, f) => n + f.size, 0);
     this.reserved = 0; // bytes admitted but not yet committed
     this.unjournaled = new Set(); // blobs on disk without a journal record (append or post-rename step failed AND the rollback failed)
     this.pendingDeletes = new Set(); // objects unlinked whose delete record is not yet journaled
-    this.verifying = new Set(); // paths being re-hashed by rejournal: retention defers them (per-path exclusion)
+    this.verifying = new Map(); // path -> number of in-flight rejournal hashes; retention defers a path until the count is 0
+    this.fenced = false;
+    this.onLockLost = null;
     this.intents = new Set(); // paths with a journaled delete-intent not yet completed or cancelled
     this.lost = new Set(); // journaled objects missing on disk with no delete intent: accidental loss, never tombstoned
     this.jobBlobCache = new Map();
@@ -157,9 +169,23 @@ export class ObjectStore {
     this.reconcileReport = this.reconcile();
   }
 
+  /** Fence: every journal append and replication-state write calls this first. A displaced owner never writes again. */
+  assertOwner() {
+    try {
+      this.lock.assertHeld();
+    } catch (err) {
+      if (err instanceof LockLostError && !this.fenced) {
+        this.fenced = true;
+        this.onLockLost?.(err);
+      }
+      throw err;
+    }
+  }
+
+  /** Returns the lock release (a promise on Linux): await it before re-opening the same root. */
   close() {
     this.journal.close();
-    this.lock.release();
+    return this.lock.release();
   }
 
   /** Absolute path of a store-relative path, refusing a symlink at any existing component. */
@@ -495,6 +521,18 @@ export class ObjectStore {
     return this.setJobState(job, 'pinned', !!pinned);
   }
 
+  /** True while a pinned or non-terminal manifest references the blob: nobody, whoever they are, may delete it. */
+  isProtectedBlob(sha) {
+    for (const name of fs.readdirSync(path.join(this.root, 'manifests'))) {
+      const parsed = parseObjectPath(`manifests/${name}`);
+      if (!parsed) continue;
+      const m = this.meta(parsed.job);
+      if (!m.pinned && m.terminalAt != null) continue;
+      if (this.jobBlobs(parsed.job)?.has(sha)) return true;
+    }
+    return false;
+  }
+
   journalDelete(rel) {
     this.journal.append({ kind: 'delete', path: rel, createdAt: this.now() });
     this.pendingDeletes.delete(rel);
@@ -519,7 +557,8 @@ export class ObjectStore {
   deleteObject(rel) {
     const parsed = parseObjectPath(rel);
     if (!parsed) throw new StoreError(400, 'not an object path');
-    if (this.verifying.has(rel)) return false; // rejournal is hashing it right now: deferred to the next sweep
+    if (parsed.kind === 'blob' && this.isProtectedBlob(parsed.sha)) throw new StoreError(409, 'blob is still referenced by a pinned or non-terminal manifest');
+    if (this.verifying.get(rel) > 0) return false; // rejournal is hashing it right now: deferred to the next sweep
     this.flushPendingDeletes();
     const file = this.abs(rel);
     let st;
@@ -559,14 +598,16 @@ export class ObjectStore {
     const added = [];
     for (const rel of paths) {
       if (!parseObjectPath(rel)) throw new StoreError(400, 'not an object path');
-      this.verifying.add(rel);
+      this.verifying.set(rel, (this.verifying.get(rel) ?? 0) + 1);
       try {
         const v = await this.verifyObject(rel);
         if (!v) continue;
         this.abs(rel); // still there and still not a symlink; no await between this check and the append
         added.push(this.journal.append({ kind: parseObjectPath(rel).kind, path: rel, sha256: v.sha256, size: v.size, createdAt: this.now() }));
       } finally {
-        this.verifying.delete(rel);
+        const left = this.verifying.get(rel) - 1;
+        if (left > 0) this.verifying.set(rel, left);
+        else this.verifying.delete(rel);
       }
     }
     return added;

@@ -41,13 +41,13 @@ function sweepBlobs(store, now, graceMs) {
  */
 export function sweep(store, { now = store.now(), ...overrides } = {}) {
   // A replica's retention is local and time-based: it never applies the primary's deletions. It sweeps a manifest only when
-  // the replicated state says terminal and unpinned AND the replica received it more than the grace ago, and an
+  // the replicated state says terminal and unpinned AND the terminal mark (the primary's own timestamp, replicated) is older than the grace, and an
   // unreferenced blob only after the same grace, so a manifest still in flight can never lose its blobs.
   const cfg = { ...RETENTION_DEFAULTS, ...(store.replicaMode ? { manifestAfterTerminalMs: store.replicaGraceMs, unreferencedBlobMs: store.replicaGraceMs } : {}), ...overrides };
   const expired = jobs(store).filter((job) => {
     const m = store.meta(job);
     if (m.pinned || m.terminalAt == null) return false;
-    return now - (store.replicaMode ? m.registeredAt : m.terminalAt) >= cfg.manifestAfterTerminalMs;
+    return now - m.terminalAt >= cfg.manifestAfterTerminalMs; // both stores age from the replicated terminal mark
   });
   expired.forEach((job) => store.deleteObject(manifestRelPath(job)));
   let blobsDeleted = sweepBlobs(store, now, cfg.unreferencedBlobMs);

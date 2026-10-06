@@ -58,9 +58,10 @@ function gate(limit) {
  * `async (bearerToken) => claims | null` (see auth.js). Reads are job-scoped: a `read` token may fetch only the
  * manifest of `claims.job` and the blobs that manifest references.
  */
-export function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, downloadIdleMs = 30_000, sweepIntervalMs = 0, maintenanceIntervalMs = 30_000, replicateTo, replicateIntervalMs = 300_000, ...storeOpts }) {
+export async function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, downloadIdleMs = 30_000, sweepIntervalMs = 0, maintenanceIntervalMs = 30_000, onLockLost, replicateTo, replicateIntervalMs = 300_000, ...storeOpts }) {
   if (replicateTo && storeOpts.replicaMode) throw new Error('a replica does not replicate onward (--replica and --replicate-to are exclusive)');
-  const store = new ObjectStore(root, storeOpts);
+  const store = await ObjectStore.open(root, storeOpts);
+  store.onLockLost = onLockLost ?? null;
   const upload = gate(maxUploads);
   const download = gate(maxDownloads);
 
@@ -160,7 +161,7 @@ export function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, 
       return send(res, 200, { changed: store.setPinned(parts[1], method === 'PUT') });
     }
     if (method === 'DELETE' && parts[0] === 'objects') {
-      await authorize(req, PEERS);
+      await authorize(req, [ADMIN]); // the replica role never deletes (replication ships no deletions)
       return send(res, 200, { deleted: store.deleteObject(decodeURIComponent(url.pathname.slice('/objects/'.length))) });
     }
     if (method === 'POST' && url.pathname === '/admin/rejournal') {
@@ -235,8 +236,7 @@ export function createStore({ root, verifier, maxUploads = 3, maxDownloads = 4, 
       await replication?.stop(); // drain the in-flight round BEFORE the journal closes and the lock is released
       return new Promise((resolve) => {
         server.close(() => {
-          store.close();
-          resolve();
+          Promise.resolve(store.close()).then(resolve);
         });
         server.closeAllConnections();
       });

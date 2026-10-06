@@ -120,8 +120,9 @@ export function journalHeadSeq(root) {
 /** The single in-process writer and (via `read`/`iterate`) the only reader while the store is running. */
 export class Journal {
   /** `trackPending: false` for a store with no downstream replica target: it keeps no per-record tail at all. */
-  constructor(root, { trackPending = true } = {}) {
+  constructor(root, { trackPending = true, guard } = {}) {
     this.root = root;
+    this.guard = guard; // called before every append: throws if this process no longer owns the store
     this.file = journalPath(root);
     this.trackPending = trackPending;
     fs.mkdirSync(root, { recursive: true });
@@ -197,6 +198,7 @@ export class Journal {
 
   append(fields) {
     if (this.broken) throw new Error('journal is unusable after a failed rollback; restart the store');
+    this.guard?.();
     const start = this.committedOffset;
     const rec = { seq: this.committedSeq + 1, ...fields };
     const buf = Buffer.from(`${JSON.stringify(rec)}\n`, 'utf8');
