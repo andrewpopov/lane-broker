@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -304,6 +304,31 @@ test('legacy scheduler: the head\'s earned reservation and skip count survive a 
   assert.deepEqual(readJsonSafe(paths(state).resourceSkipState), earned);
   assert.deepEqual(readJsonSafe(paths(state).conflictSkipState), conflict);
   assert.equal('legacyFairness' in listQueue(state)[0], false, 'the restored queue record is clean');
+});
+
+test('legacy scheduler: a failed snapshot write rolls the withdrawal back, so the ticket stays queued at its seq', async () => {
+  const { state } = freshEnv();
+  await enqueue(state, ticketOf('a'));
+  await enqueue(state, ticketOf('b'));
+  atomicWriteJson(paths(state).resourceSkipState, { headId: 'a', count: 3, reserved: true, inScope: true, deniedAt: T0, budget: 9, externalBusy: 5 });
+  const before = listQueue(state).map((r) => [r.id, r.seq]);
+  const queueDir = path.dirname(listQueue(state)[0].file ?? path.join(paths(state).queue, 'x'));
+  const realWrite = fs.writeFileSync;
+  // Fail only the snapshot's temp-file write in the queue dir (the broker lock and everything else still write).
+  const write = mock.method(fs, 'writeFileSync', function (target, ...rest) {
+    if (typeof target === 'string' && path.dirname(target) === queueDir && path.basename(target).startsWith('.tmp-')) {
+      throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
+    }
+    return realWrite.call(this, target, ...rest);
+  });
+  let taken;
+  try {
+    taken = await withdrawQueued(state, 'a');
+  } finally {
+    write.mock.restore();
+  }
+  assert.equal(taken, null, 'the withdrawal reports failure');
+  assert.deepEqual(listQueue(state).map((r) => [r.id, r.seq]), before, 'the ticket is back in the queue at its original seq');
 });
 
 // ---- end to end over the fake-ssh transport ----

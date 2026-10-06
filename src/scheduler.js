@@ -219,8 +219,14 @@ export async function withdrawQueued(root, id) {
     const legacyFairness = legacyFairnessOf(root, id);
     try {
       fs.renameSync(file, parked);
+    } catch {
+      return null;
+    }
+    try {
       if (legacyFairness) atomicWriteJson(parked, { ...record, legacyFairness });
     } catch {
+      // The snapshot is written atomically, so the parked file still holds the original record: put it back in the queue.
+      fs.renameSync(parked, file);
       return null;
     }
     try {
