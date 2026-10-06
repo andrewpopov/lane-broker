@@ -1,0 +1,132 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import { freshEnv, writeGlobalConfig } from './helpers.js';
+import { enqueue, tryStart, readResourceSkipState } from '../src/scheduler.js';
+import { collectStatus, renderStatusText } from '../src/status.js';
+import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
+import { writeLease, removeLease, LEASE_STATE } from '../src/lease.js';
+import { bootId, paths, atomicWriteJson } from '../src/state.js';
+
+/**
+ * BRAIN-418: a head whose reservation is futile (it would still be denied with every lane lease drained, because
+ * external load or memory alone rule it out) holds no reservation and spends no skip budget.
+ * Fixture machine as in resource-backfill.test.js: 10 cores, reserve 1 -> CPU budget 9.
+ */
+
+const GIB = 1024 ** 3;
+
+const cfg = {
+  ...DEFAULT_GLOBAL_CONFIG,
+  schedulerMode: 'active',
+  capacity: 10,
+  loadClose: 1000,
+  loadOpen: 900,
+  loadOpenSamples: 1,
+  cpuAdmissionPercent: 100,
+  cpuReserveCores: 1,
+  admissionCooldownMs: 0,
+  resourceSkipLimit: 3,
+  resourceIdleOvershootCores: 0,
+};
+
+const sampler = (hostBusyCores) => () => ({ hostBusyCores, cores: 10, stale: false, sampledAt: Date.now() });
+const memory = (overrides = {}) => () => ({ availableBytes: 64 * GIB, totalBytes: 64 * GIB, macPressure: 'normal', source: 'test', ...overrides });
+const poll = (state, t, { ext, mem = memory() }) => tryStart(state, t, cfg, undefined, sampler(ext), undefined, mem);
+const readLog = (state) => fs.readFileSync(paths(state).admissionLog, 'utf8');
+
+function ticket(id, overrides = {}) {
+  return { id, key: `r:${id}`, weight: 1, cwd: process.cwd(), cmd: ['true'], supervisorPid: process.pid, supervisorStart: null, logPath: '/dev/null', resultPath: '/dev/null', ...overrides };
+}
+
+async function statusText(home, state) {
+  writeGlobalConfig(home, { version: 1, capacity: 10, resourceSkipLimit: 3, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1 });
+  const prev = { h: process.env.LANE_BROKER_HOME, s: process.env.LANE_BROKER_STATE };
+  process.env.LANE_BROKER_HOME = home;
+  process.env.LANE_BROKER_STATE = state;
+  try {
+    return renderStatusText(await collectStatus());
+  } finally {
+    process.env.LANE_BROKER_HOME = prev.h;
+    process.env.LANE_BROKER_STATE = prev.s;
+  }
+}
+
+function holdLease(state, id, weight) {
+  writeLease(state, { id, key: `held:${id}`, bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight, state: LEASE_STATE.RUNNING });
+}
+
+test('futile: external load alone rules the head out, so a ticket behind it is admitted without spending the skip budget', async () => {
+  const { home, state } = freshEnv();
+  const head = ticket('head', { weight: 4 });
+  await enqueue(state, head);
+  const denied = await poll(state, head, { ext: 7 }); // 7 + 4 = 11 > 9 even with no lane running
+  assert.equal(denied.reason, 'cpu-admission');
+  assert.equal(readResourceSkipState(state).futile, 'cpu');
+
+  for (let i = 0; i < 5; i += 1) {
+    const small = ticket(`s${i}`);
+    await enqueue(state, small);
+    const result = await poll(state, small, { ext: 7 }); // 7 + 1 = 8 <= 9
+    assert.equal(result.started, true, `backfill ${i} past a futile head is never refused, even past resourceSkipLimit`);
+    removeLease(state, small.id);
+  }
+  const record = readResourceSkipState(state);
+  assert.deepEqual({ count: record.count, reserved: record.reserved }, { count: 0, reserved: false }, 'the skip budget is untouched');
+  assert.equal(record.headId, 'head', 'the head keeps its place');
+  assert.match(readLog(state), /candidate=s0 .*reservation=futile futileCause=cpu headCpu=4\.00/);
+
+  const status = await statusText(home, state);
+  assert.match(status, /resource-blocked: head head .*\(futile: external load alone exceeds budget; backfilling\)/);
+  assert.doesNotMatch(status, /RESERVED/);
+});
+
+test('not futile: lane load is what blocks the head, so the reservation holds once the skip budget is exhausted', async () => {
+  const { home, state } = freshEnv();
+  const head = ticket('head', { weight: 4 });
+  const small = ticket('small');
+  await enqueue(state, head);
+  await enqueue(state, small);
+  holdLease(state, 'busy', 6); // 2 + 6 + 4 > 9, but 2 + 4 fits once the lane drains
+  const denied = await poll(state, head, { ext: 2 });
+  assert.equal(denied.reason, 'cpu-admission');
+  assert.equal(readResourceSkipState(state).futile, undefined, 'draining the lanes would let it start');
+
+  atomicWriteJson(paths(state).resourceSkipState, { ...readResourceSkipState(state), count: 3, reserved: true });
+  const refused = await poll(state, small, { ext: 2 });
+  assert.equal(refused.started, false);
+  assert.equal(refused.reason, 'not-head', 'the reservation holds');
+  assert.match(await statusText(home, state), /RESERVED/);
+});
+
+test('memory-futile: CPU fits but memory cannot fit even with zero lane reservations', async () => {
+  const { state } = freshEnv();
+  const head = ticket('head', { weight: 1, resources: { cpuCores: 1, memoryBytes: 8 * GIB } });
+  const small = ticket('small');
+  await enqueue(state, head);
+  await enqueue(state, small);
+  const mem = memory({ availableBytes: 6 * GIB }); // 6 - 8 < the 2 GiB reserve
+  const denied = await poll(state, head, { ext: 1, mem });
+  assert.equal(denied.reason, 'memory-admission');
+  assert.equal(readResourceSkipState(state).futile, 'memory');
+  assert.equal((await poll(state, small, { ext: 1, mem })).started, true, 'a 1 GiB ticket fits and backfills');
+  assert.match(readLog(state), /reservation=futile futileCause=memory/);
+});
+
+test('when external load drops the head starts, ahead of tickets that queued after it', async () => {
+  const { state } = freshEnv();
+  const head = ticket('head', { weight: 4 });
+  const first = ticket('first');
+  const later = ticket('later');
+  await enqueue(state, head);
+  await poll(state, head, { ext: 7 });
+  await enqueue(state, first);
+  assert.equal((await poll(state, first, { ext: 7 })).started, true);
+  await enqueue(state, later);
+
+  assert.equal((await poll(state, head, { ext: 2 })).started, true, 'the head starts as soon as external load allows');
+  assert.equal(readResourceSkipState(state), null);
+  const queueIds = fs.readdirSync(paths(state).queue).filter((f) => f.includes('later') || f.includes('head'));
+  assert.ok(queueIds.every((f) => !f.includes('head')), 'head left the queue');
+  assert.ok(queueIds.some((f) => f.includes('later')), 'the later ticket is still waiting behind it');
+});

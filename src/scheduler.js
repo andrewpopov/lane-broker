@@ -549,6 +549,7 @@ export function readResourceSkipState(root, store = legacyStore(root), headId = 
     deniedAt: raw.deniedAt,
     budget: raw.budget,
     externalBusy: raw.externalBusy,
+    ...(typeof raw.futile === 'string' ? { futile: raw.futile, headCpu: raw.headCpu } : {}),
     ...(Number.isInteger(raw.reservationSeq) ? { reservationSeq: raw.reservationSeq } : {}),
   };
 }
@@ -561,15 +562,41 @@ function resourceRecordFor(root, store, cfg, headId, behindConflict = false) {
   return record && record.headId === headId && record.behindConflict === behindConflict ? record : null;
 }
 
-const resourceBackfillOpen = (record, cfg) => record !== null && record.inScope && !record.reserved && record.count < cfg.resourceSkipLimit;
-const resourceReserved = (record) => record !== null && record.reserved;
+// BRAIN-418: a futile head (see headFutility) holds no reservation and spends no skip budget: nothing the lanes
+// do could let it start, so backfill stays open for as long as its latest denial says so.
+const resourceFutile = (record) => record !== null && record.inScope && record.futile !== undefined;
+const resourceBackfillOpen = (record, cfg) => record !== null && record.inScope && (resourceFutile(record) || (!record.reserved && record.count < cfg.resourceSkipLimit));
+const resourceReserved = (record) => record !== null && record.reserved && !resourceFutile(record);
+
+/**
+ * BRAIN-418 (Slurm backfill: reserve only for a start the reservation can bring about): would the head still be
+ * denied if every lane lease drained? CPU: the SAME ambient reading admission just computed (`externalBusy`) plus the
+ * head's claim over budget. Memory: admission's own predicate over zero held leases. Returns the cause or null.
+ */
+function headFutility(cfg, headTicket, cpuDecision, memInfo, now) {
+  const headCpu = ticketCpuFloor(headTicket, cfg);
+  if (Number.isFinite(cpuDecision.externalBusy) && Number.isFinite(cpuDecision.budget) && projectBusy(cpuDecision.externalBusy, [], headCpu, now, cfg) > cpuDecision.budget) {
+    return { cause: 'cpu', headCpu };
+  }
+  if (memInfo) {
+    const resources = resolveTicketResources({
+      weight: headTicket.weight,
+      cpuCores: headTicket.resources?.cpuCores,
+      memoryBytes: headTicket.resources?.memoryBytes,
+      defaultMemoryBytesPerWeight: cfg.defaultMemoryBytesPerWeight,
+    });
+    const memory = evaluateMemoryAdmission({ memoryInfo: memInfo, heldLeases: [], candidateResources: resources, cfg });
+    if (!memory.admit && memory.reason !== 'memory-unavailable') return { cause: 'memory', headCpu };
+  }
+  return null;
+}
 
 /** The head's own in-scope denial (projected-over-budget, memory ok): create the record for a new
  *  head, or refresh the budget/externalBusy snapshot while carrying count/reserved forward for
  *  the same head. Best-effort: a failed write leaves the old record (or none), never an allowance.
  *  `behindConflict` (BRAIN-365) marks the snapshot as a conflict-backfill candidate's denial, not
  *  the head's: only a conflicted head reads it, and the head's own next denial overwrites it. */
-function recordResourceDenial(root, store, cfg, headId, cpuDecision, now, write, behindConflict = false) {
+function recordResourceDenial(root, store, cfg, headId, cpuDecision, now, write, behindConflict = false, futility = null) {
   if (!(cfg.resourceSkipLimit > 0)) return;
   const prev = readResourceSkipState(root, store, headId);
   const same = prev !== null && prev.headId === headId;
@@ -584,6 +611,7 @@ function recordResourceDenial(root, store, cfg, headId, cpuDecision, now, write,
       deniedAt: now,
       budget: cpuDecision.budget,
       externalBusy: cpuDecision.externalBusy,
+      ...(futility ? { futile: futility.cause, headCpu: futility.headCpu } : {}),
     }, write);
   } catch {
     // best-effort — see doc comment
@@ -1023,6 +1051,14 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
     // only: shadow never denies, so there is nothing to relax.
     const elastic = cfg.schedulerMode === 'active' ? evaluateElasticAdmission(cfg, ticket, admissionHeld, cpuSample, memInfo, fullDecision) : null;
     const cpuDecision = elastic ? { ...elastic.decision, declaredCpuCores: fullDecision.candidateCpuCores } : fullDecision;
+    // BRAIN-418: only the head's own denial can declare its reservation futile; a candidate's poll reads the verdict
+    // the head's latest denial recorded. Only a CPU-projection or memory denial is judged: a closed gate, a cooldown or an unavailable sample is not the
+    // head's own arithmetic, so those keep today's handling.
+    const headFutile =
+      cfg.schedulerMode === 'active' && ticket.id === headTicket.id && !headConflicted && !cpuDecision.admit && (cpuDecision.cpuReason === 'projected-over-budget' || cpuDecision.cpuReason === 'ok')
+        ? headFutility(cfg, headTicket, cpuDecision, memInfo, now)
+        : null;
+    const futileView = headFutile ?? (resourceFutile(resourceRecord) ? { cause: resourceRecord.futile, headCpu: resourceRecord.headCpu } : null);
     if (shadow.inputs) {
       // what the LIVE evaluation that decided the outcome produced (after any elastic retry: same clock reads,
       // same charges), copied out, with the memory observation and its time, for the post-lock evaluator
@@ -1056,6 +1092,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       headScore: score(headTicket, nowEff, cfg),
       loadGateIgnored,
       ...cpuDecision,
+      ...(futileView ? { reservation: 'futile', futileCause: futileView.cause, headCpu: futileView.headCpu } : {}),
       // Provenance for the memory fields above: cpuDecision carries the byte
       // arithmetic but not where the available-memory figure came from or
       // what the OS reported about pressure, which is exactly what made the
@@ -1129,7 +1166,8 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       if (headPolling) {
         // Cooldown is the head's own backfill echoing back (each admission starts one), so it
         // changes nothing. Any other out-of-scope denial pauses backfill but keeps the allowance.
-        if (resourceDenied) recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState);
+        if (headFutile) recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState, false, headFutile);
+        else if (resourceDenied) recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState);
         else if (cpuDecision.cpuReason !== 'cooldown') markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
       } else if (headConflicted && !skipExhausted && resourceDenied && !safeBackfill) {
         recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState, true);
@@ -1165,7 +1203,7 @@ export async function tryStart(root, ticket, globalCfg, loadSampler, cpuSampler,
       if (!recordCapacitySkip(root, store, headTicket.id)) {
         return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
       }
-    } else if (ticket.id !== headTicket.id && !safeBackfill && resourceBackfill) {
+    } else if (ticket.id !== headTicket.id && !safeBackfill && resourceBackfill && !resourceFutile(resourceRecord)) {
       // BRAIN-346: same event, same fail-CLOSED discipline; a refused write never restarts the allowance.
       recorded = recordResourceBackfill(root, store, cfg, resourceRecord, writeResourceState);
       if (!recorded) {

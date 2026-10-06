@@ -102,7 +102,8 @@ function computeResourceBlock(root, store, cfg, head, held, now) {
     headId: head.id,
     count: record.count,
     limit: cfg.resourceSkipLimit,
-    reserved: record.reserved,
+    reserved: record.reserved && !(record.inScope && record.futile !== undefined),
+    futile: record.inScope && record.futile !== undefined,
     projectedBusy: projectBusy(record.externalBusy, held, ticketCpuEstimate(head, cfg), now, cfg),
     budget: record.budget,
     deniedAgeMs: now - record.deniedAt,
@@ -410,6 +411,7 @@ export function renderStatusText(status) {
     lines.push(
       `resource-blocked: head ${rb.headId} projects ${rb.projectedBusy.toFixed(2)} > budget ${rb.budget.toFixed(2)} cores ` +
         `(denied ${fmtMs(rb.deniedAgeMs)} ago); backfill ${rb.count}/${rb.limit}` +
+        (rb.futile ? ' (futile: external load alone exceeds budget; backfilling)' : '') +
         (rb.reserved ? ', RESERVED — nothing else is admitted past it' : ''),
     );
   }
