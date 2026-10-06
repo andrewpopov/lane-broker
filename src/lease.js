@@ -111,14 +111,17 @@ function stepOrphanReap(root, lease, { now = Date.now(), kill, readTable } = {})
   if (state.killAt !== undefined && now - state.killAt >= ORPHAN_KILL_GIVE_UP_MS) {
     return release({ signalled: state.signalled, survivors: live ?? [], complete: false });
   }
-  const killAt = state.killAt ?? (rows && lease.orphanReap && now - state.termAt >= ORPHAN_REAP_GRACE_MS ? now : undefined);
+  const pastGrace = rows !== null && lease.orphanReap !== undefined && now - state.termAt >= ORPHAN_REAP_GRACE_MS;
   const termed = new Set(state.termed);
   const killed = new Set(state.killed);
-  const signalled = rows
-    ? killAt === undefined
-      ? tracker.signalLive(rows, 'SIGTERM', kill, termed)
-      : tracker.signalLive(rows, 'SIGKILL', kill, killed)
-    : [];
+  const phaseKill = state.killAt !== undefined || pastGrace;
+  const signalled = rows ? tracker.signalLive(rows, phaseKill ? 'SIGKILL' : 'SIGTERM', kill, phaseKill ? killed : termed) : [];
+  // killAt records a KILL actually sent: unknown/unreadable members are skipped by signalLive and must not start the clock
+  const killAt = state.killAt ?? (pastGrace && signalled.length > 0 ? now : undefined);
+  if (killAt === undefined && now - state.termAt >= ORPHAN_UNREADABLE_GIVE_UP_MS) {
+    // the final scan signalled whatever it could see; nothing could be killed, so release rather than wedge the lane
+    return release({ signalled: state.signalled + signalled.length, survivors: live ?? [], complete: false });
+  }
   if (signalled.length > 0) writeBrokerLog(root, reapLogLine(lease.id, { signalled: signalled.length, survivors: [], complete: true }));
   writeLease(root, {
     ...lease,

@@ -1208,7 +1208,8 @@ cannot be read, or members survive the KILL, the log also carries `descendants-r
 the lease is still released. A lease whose supervisor and group are gone but whose members are alive stays ORPHANED and heals itself on
 the admission polls: TERM on the first pass, KILL after the grace period, release once none are alive (or 30 s after
 the KILL, or 60 s after the TERM if the table is unreadable, with the incomplete-reap line); `lane cancel` does the same synchronously. The residual window between validating a pid and signalling it is accepted: Node has
-no pidfd signalling, and macOS pids climb to 99999 before wrapping.
+no pidfd signalling, and macOS pids climb to 99999 before wrapping. Likewise, on macOS a process whose argv changes between the
+two `ps` reads, keeping its old command as a prefix and appending this lease's exact random id, would be misread as a member.
 
 ## `lane capabilities --json`
 

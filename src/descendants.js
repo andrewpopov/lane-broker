@@ -16,20 +16,29 @@ const KILL_WAIT_MS = 3000;
 
 let cachedUnits = null;
 
-/** Kernel units /proc reports in: page size (statm/stat rss) and clock ticks (utime/stime/starttime). Read once per
- *  process from getconf; 4096 / 100 only when getconf itself fails. */
-export function procUnits() {
+/** Kernel units /proc reports in: page size (statm/stat rss) and clock ticks (utime/stime/starttime). Read from getconf
+ *  and cached once BOTH reads succeed; a failure returns 4096 / 100 for that call only, so the next call retries. */
+export function procUnits(run = execFileSync) {
   if (cachedUnits) return cachedUnits;
+  let ok = true;
   const conf = (name, fallback) => {
     try {
-      const value = Number(execFileSync('getconf', [name], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 }).trim());
-      return Number.isFinite(value) && value > 0 ? value : fallback;
+      const value = Number(run('getconf', [name], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 }).trim());
+      if (Number.isFinite(value) && value > 0) return value;
     } catch {
-      return fallback;
+      // fall through
     }
+    ok = false;
+    return fallback;
   };
-  cachedUnits = { pageKib: conf('PAGESIZE', 4096) / 1024, clkTck: conf('CLK_TCK', 100) };
-  return cachedUnits;
+  const units = { pageKib: conf('PAGESIZE', 4096) / 1024, clkTck: conf('CLK_TCK', 100) };
+  if (ok) cachedUnits = units;
+  return units;
+}
+
+/** Test seam: forget the cached units. */
+export function resetProcUnitsCache() {
+  cachedUnits = null;
 }
 
 function leaseMarker(leaseId) {

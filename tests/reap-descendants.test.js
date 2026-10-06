@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneSpawn, laneRun, waitFor, sleep } from './helpers.js';
 import { paths, bootId } from '../src/state.js';
 import { readLease, writeLease, reapIfStale } from '../src/lease.js';
-import { DescendantTracker, parsePsTable, parseProcStat, readProcessTable, readProcRow, hasLiveMembers } from '../src/descendants.js';
+import { DescendantTracker, parsePsTable, parseProcStat, readProcessTable, readProcRow, hasLiveMembers, procUnits, resetProcUnitsCache } from '../src/descendants.js';
 
 /** BRAIN-419: cancel and leader exit must reap descendants that left the leader's process group. */
 
@@ -448,4 +448,38 @@ test('a marked replacement that appears after KILL was sent is KILLed on its own
   h.setRows([row(40, 1, 'a'), row(90, 1, 'fresh', true)]);
   h.pass(12_000);
   assert.deepEqual(h.signals.at(-1), [90, 'SIGKILL']);
+});
+
+test('members unknown at 1 s and 11 s but readable at 42 s are signalled before the lease is ever released', () => {
+  const h = orphanHarness();
+  h.setRows([{ ...row(40, -1, null), unknown: true }]);
+  assert.equal(h.pass(1000), 'orphaned');
+  assert.equal(h.pass(11_000), 'orphaned'); // past grace, but nothing could be KILLed: no killAt
+  assert.equal(readLease(h.state, 'orph-1').orphanReap.killAt, undefined);
+  h.setRows([row(40, 1, 'a')]);
+  assert.equal(h.pass(42_000), 'orphaned');
+  assert.deepEqual(h.signals, [[40, 'SIGKILL']]);
+  assert.equal(readLease(h.state, 'orph-1').orphanReap.killAt, 42_000);
+});
+
+test('a member that stays unknown past the deadline releases the lease, logged incomplete, with no signal sent', () => {
+  const h = orphanHarness();
+  h.setRows([{ ...row(40, -1, null), unknown: true }]);
+  h.pass(1000);
+  assert.equal(h.pass(62_000), 'reaped');
+  assert.deepEqual(h.signals, []);
+  assert.match(fs.readFileSync(paths(h.state).admissionLog, 'utf8'), /descendants-reap-incomplete survivors=40/);
+});
+
+test('procUnits caches only a successful getconf: a transient failure is retried on the next call', () => {
+  resetProcUnitsCache();
+  try {
+    const failing = () => { throw new Error('getconf cannot fork'); };
+    assert.deepEqual(procUnits(failing), { pageKib: 4, clkTck: 100 });
+    const ok = (_cmd, [name]) => (name === 'PAGESIZE' ? '16384\n' : '250\n');
+    assert.deepEqual(procUnits(ok), { pageKib: 16, clkTck: 250 });
+    assert.deepEqual(procUnits(failing), { pageKib: 16, clkTck: 250 }, 'a successful read stays cached');
+  } finally {
+    resetProcUnitsCache();
+  }
 });
