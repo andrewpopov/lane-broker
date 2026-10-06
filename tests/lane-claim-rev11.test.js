@@ -335,10 +335,10 @@ describe('lane.claim_next rev11 counterexamples', { skip: PG_SKIP_REASON ?? fals
     const { su } = await open();
     await addGroup(su, { n: 1, jobs: [{ cls: 'test', est: 60 }, { cls: 'test', est: 300 }, { cls: 'sim', est: 700, count: 2 }] });
     await su.query('SELECT lane.refresh_rem_ref()');
-    const { rows: [p] } = await su.query('SELECT rem_ref FROM lane.sched_parents');
+    const { rows: [p] } = await su.query("SELECT rem_ref FROM lane.sched_parents WHERE account = 'acct' AND prio_class = 'normal'");
     assert.deepEqual(p.rem_ref, { test: { short: 60, mid: 300 }, sim: { long: 1400 } });
     await su.query("INSERT INTO lane.host_factors (host_id, class, bucket, factor) VALUES ('h1', 'sim', 'long', 2)");
-    const { rows: [r] } = await su.query("SELECT lane.rem_min(p, 'h1') AS m FROM lane.sched_parents p");
+    const { rows: [r] } = await su.query("SELECT lane.rem_min(p, 'h1') AS m FROM lane.sched_parents p WHERE p.account = 'acct' AND p.prio_class = 'normal'");
     assert.equal(r.m, (60 + 300 + 1400 * 2) / 60);
   });
 });

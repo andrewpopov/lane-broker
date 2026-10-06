@@ -36,8 +36,20 @@ function listMigrations(dir) {
 async function schemaVersion(client, migrations) {
   const { rows: [s] } = await client.query(
     `SELECT to_regnamespace('lane') IS NOT NULL AS has_schema, to_regclass('lane.schema_version') IS NOT NULL AS has_version,
-            (SELECT count(*)::int FROM pg_class WHERE relnamespace = to_regnamespace('lane'))
-              + (SELECT count(*)::int FROM pg_proc WHERE pronamespace = to_regnamespace('lane')) AS objects`);
+            (SELECT count(*)::int FROM (
+               SELECT 1 FROM pg_class WHERE relnamespace = to_regnamespace('lane')
+               UNION ALL SELECT 1 FROM pg_proc WHERE pronamespace = to_regnamespace('lane')
+               UNION ALL SELECT 1 FROM pg_type WHERE typnamespace = to_regnamespace('lane') AND typtype <> 'c' AND typcategory <> 'A'   -- enums, domains, ranges: no pg_class row
+               UNION ALL SELECT 1 FROM pg_operator WHERE oprnamespace = to_regnamespace('lane')
+               UNION ALL SELECT 1 FROM pg_opclass WHERE opcnamespace = to_regnamespace('lane')
+               UNION ALL SELECT 1 FROM pg_opfamily WHERE opfnamespace = to_regnamespace('lane')
+               UNION ALL SELECT 1 FROM pg_collation WHERE collnamespace = to_regnamespace('lane')
+               UNION ALL SELECT 1 FROM pg_conversion WHERE connamespace = to_regnamespace('lane')
+               UNION ALL SELECT 1 FROM pg_statistic_ext WHERE stxnamespace = to_regnamespace('lane')
+               UNION ALL SELECT 1 FROM pg_ts_config WHERE cfgnamespace = to_regnamespace('lane')
+               UNION ALL SELECT 1 FROM pg_ts_dict WHERE dictnamespace = to_regnamespace('lane')
+               UNION ALL SELECT 1 FROM pg_ts_parser WHERE prsnamespace = to_regnamespace('lane')
+               UNION ALL SELECT 1 FROM pg_ts_template WHERE tmplnamespace = to_regnamespace('lane')) o) AS objects`);
   if (!s.has_schema || (!s.has_version && s.objects === 0)) return 0;
   if (!s.has_version) throw new Error(`${TERMINAL_VERSION_ERROR} exists but is unversioned (no lane.schema_version): refusing to merge into it; migrate or drop it by hand`);
   const { rows } = await client.query('SELECT version FROM lane.schema_version ORDER BY version');

@@ -179,7 +179,7 @@ export function jobsJson(n, { cls = 'test', est = 100, cpu = 1, extra = {} } = {
 
 /**
  * Insert an ACTIVE group with its jobs directly (superuser), so a test controls aging_anchor / last_claim_at, creating its
- * scheduling parent (account, prio) on first use. `parentAnchor` / `parentLastClaim` only apply when that call creates the parent.
+ * scheduling parent (account, prio) on first use. `parentAnchor` / `parentLastClaim` only apply to a parent that has not been anchored yet (provisioned parents start unanchored).
  * `jobs` is [{cls, est (ref-s), cpu, cpuMin, count, stage, mem, exclusive}]; est may differ per job to exercise the job-order keys.
  * No ANALYZE: a live queue is not guaranteed statistics and the claim must not depend on them.
  */
@@ -188,7 +188,9 @@ export async function addGroup(c, {
   deadline = null, deadlineValid = deadline !== null, jobs = [{}], state = 'active',
 }) {
   await c.query(
-    'INSERT INTO lane.sched_parents (account, prio_class, aging_anchor, last_claim_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING',
+    `INSERT INTO lane.sched_parents (account, prio_class, aging_anchor, last_claim_at) VALUES ($1, $2, $3, $4)
+     ON CONFLICT (account, prio_class) DO UPDATE SET aging_anchor = EXCLUDED.aging_anchor, last_claim_at = EXCLUDED.last_claim_at
+      WHERE lane.sched_parents.aging_anchor IS NULL`,
     [account, prio, parentAnchor, parentLastClaim]);
   const { rows: [{ id: parentId }] } = await c.query('SELECT id FROM lane.sched_parents WHERE account = $1 AND prio_class = $2', [account, prio]);
   await c.query(
@@ -241,7 +243,8 @@ export async function seedScale(c, { jobs, groups, hosts }) {
   }
   await c.query('UPDATE lane.principals SET allowed_dest_hosts = $1 WHERE kind = \'submit\'', [agents.map((a) => a.host)]);
   await c.query(
-    `INSERT INTO lane.sched_parents (account, prio_class, aging_anchor) SELECT 'acct', p, now() - interval '5 minutes' FROM unnest($1::text[]) p`, [SCALE_PRIOS]);
+    `INSERT INTO lane.sched_parents (account, prio_class, aging_anchor) SELECT 'acct', p, now() - interval '5 minutes' FROM unnest($1::text[]) p
+     ON CONFLICT (account, prio_class) DO UPDATE SET aging_anchor = EXCLUDED.aging_anchor`, [SCALE_PRIOS]);
   await c.query(
     `INSERT INTO lane.groups (id, submit_uuid, kind, account, owner, parent_id, prio_class, snapshot, aggregator, state, aging_anchor)
      SELECT ('00000000-0000-0000-0000-' || lpad(g::text, 12, '0'))::uuid, ('00000000-0000-0000-0000-' || lpad(g::text, 12, '0'))::uuid,

@@ -173,9 +173,6 @@ describe('lane.claim_next ordering', { skip: PG_SKIP_REASON ?? false, timeout: 2
   async function lateCommitWinner(opts) {
     const { su } = await open(opts);
     await su.query("UPDATE lane.principals SET allowed_accounts = '{acct,acct2}' WHERE kind = 'submit'");
-    // A first-ever submit into a parent holds lane_sched until it commits (parent_for), which would serialise the two submits this
-    // test overlaps on purpose. Parents that already exist take no lock, as they do in steady state.
-    await su.query("SELECT lane.parent_for('acct', 'normal'), lane.parent_for('acct2', 'normal')");
     const submitJobs = JSON.stringify(jobsJson(1));
     const submit = (c, id, account) => c.query("SELECT lane.submit_group($1::uuid, 'single', $3, 'normal', '{}'::jsonb, 'x', $2::jsonb) AS id", [id, submitJobs, account]);
     const late = await cluster.client(su.database, roleNames.submit);
@@ -226,8 +223,8 @@ describe('lane.claim_next ordering', { skip: PG_SKIP_REASON ?? false, timeout: 2
     await canceller.query('COMMIT');
     assert.equal(await pending, null);
     const { rows: [after] } = await su.query(
-      `SELECT j.state, j.epoch, (SELECT last_claim_at FROM lane.groups) AS last_claim_at, (SELECT last_claim_at FROM lane.sched_parents) AS parent_last_claim,
-              (SELECT running_cpu FROM lane.sched_parents) AS running_cpu,
+      `SELECT j.state, j.epoch, (SELECT last_claim_at FROM lane.groups) AS last_claim_at, (SELECT last_claim_at FROM lane.sched_parents WHERE account = 'acct' AND prio_class = 'normal') AS parent_last_claim,
+              (SELECT running_cpu FROM lane.sched_parents WHERE account = 'acct' AND prio_class = 'normal') AS running_cpu,
               (SELECT count(*)::int FROM lane.class_vtime) AS vtimes, (SELECT count(*)::int FROM lane.transition_events) AS events FROM lane.jobs j`);
     assert.deepEqual(after, { state: 'cancelled', epoch: 0, last_claim_at: null, parent_last_claim: null, running_cpu: 0, vtimes: 0, events: 0 });
   });

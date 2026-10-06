@@ -7,8 +7,6 @@ import { PgCluster, PG_SKIP_REASON, roleNames, ago, gid, addGroup, setParent, jo
  * BRAIN-400: the Codex review of task 3 (findings F1, F3-F9; F2 is lane-migrations.test.js). Each test was written first and watched
  * failing on the reviewed commit, then the fix landed. Numbers in the names are the review's finding numbers.
  */
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
 describe('lane review findings', { skip: PG_SKIP_REASON ?? false, timeout: 300000 }, () => {
   let cluster;
   before(() => { cluster = PgCluster.start(); });
@@ -111,7 +109,7 @@ describe('lane review findings', { skip: PG_SKIP_REASON ?? false, timeout: 30000
       await su.query("SELECT lane.add_running(id, 0, $1::timestamptz + make_interval(secs => 1800.0 * $2 / $3)) FROM lane.sched_parents",
         [t0, i, steps]);
     }
-    const { rows: [r] } = await su.query("SELECT lane.decayed(p, $1::timestamptz + interval '30 minutes') AS u FROM lane.sched_parents p", [t0]);
+    const { rows: [r] } = await su.query("SELECT lane.decayed(p, $1::timestamptz + interval '30 minutes') AS u FROM lane.sched_parents p WHERE p.account = 'acct' AND p.prio_class = 'normal'", [t0]);
     return r.u;
   }
   test('F5: 4 cores for 30 minutes settle to about 5194 core-seconds, and 1 step agrees with 30 steps within 1%', async () => {
@@ -129,7 +127,7 @@ describe('lane review findings', { skip: PG_SKIP_REASON ?? false, timeout: 30000
     await addGroup(su, { n: 1, account: 'acct', prio: 'normal', jobs: [{}] });
     await setParent(su, 'acct', 'normal', { running_cpu: 4, usage_decayed: 0, usage_at: ago(1800) });
     await claimAs(agent);
-    const { rows: [r] } = await su.query('SELECT usage_decayed FROM lane.sched_parents');
+    const { rows: [r] } = await su.query("SELECT usage_decayed FROM lane.sched_parents WHERE account = 'acct' AND prio_class = 'normal'");
     assert.ok(Math.abs(r.usage_decayed - 5194) < 60, `got ${r.usage_decayed}`);
   });
 
@@ -158,7 +156,7 @@ describe('lane review findings', { skip: PG_SKIP_REASON ?? false, timeout: 30000
     await addGroup(su, { n: 1, account: 'acct', prio: 'normal', jobs: [{ cls: 'test', est: 600 }] });
     const rem = async () => {
       await su.query('SELECT lane.refresh_rem_ref($1)', [NOW]);
-      return (await su.query('SELECT rem_ref FROM lane.sched_parents')).rows[0].rem_ref.test;
+      return (await su.query("SELECT rem_ref FROM lane.sched_parents WHERE account = 'acct' AND prio_class = 'normal'")).rows[0].rem_ref.test;
     };
     const out = {};
     await su.query("UPDATE lane.jobs SET state = 'running', host = 'h1', started_at = $1", [at(590)]);
@@ -210,37 +208,5 @@ describe('lane review findings', { skip: PG_SKIP_REASON ?? false, timeout: 30000
     assert.ok(r.flips > 7, `got ${r.flips}`);
   });
 
-  // F9: parent creation and the scheduling lock.
-  async function parentRace(opts) {
-    const { db, su, submit } = await open(opts);
-    const setup = await cluster.client(db, roleNames.submit);
-    const { rows: [{ id: existing }] } = await setup.query(
-      "SELECT lane.submit_group($1::uuid, 'single', 'acct', 'normal', '{}'::jsonb, 'x', $2::jsonb) AS id", [randomUUID(), JSON.stringify(jobsJson(1))]);
-    await setup.query('SELECT lane.activate_group($1)', [existing]);
-    const a = submit;
-    const b = await cluster.client(db, roleNames.submit);
-    await a.query('BEGIN');
-    const { rows: [{ id: fresh }] } = await a.query(
-      "SELECT lane.submit_group($1::uuid, 'single', 'acct', 'gate', '{}'::jsonb, 'x', $2::jsonb) AS id", [randomUUID(), JSON.stringify(jobsJson(1))]);
-    await b.query('BEGIN');
-    const { rows: [{ pid }] } = await b.query('SELECT pg_backend_pid() AS pid');
-    const outcome = (p) => p.then(() => null, (e) => e.code);
-    const reclass = outcome(b.query("SELECT lane.reclass($1, 'gate')", [existing]));
-    for (let i = 0; i < 200; i++) {
-      if ((await su.query("SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock'", [pid])).rows.length) break;
-      await sleep(25);
-    }
-    const activate = await outcome(a.query('SELECT lane.activate_group($1)', [fresh]));
-    await a.query('COMMIT').catch(() => {});
-    const reclassed = await reclass;
-    await b.query('COMMIT').catch(() => {});
-    return [activate, reclassed];
-  }
-  test('F9: a first-ever submit into a parent and a reclass into that parent, interleaved with an activate, do not deadlock', async () => {
-    assert.deepEqual(await parentRace(), [null, null]);
-  });
-  test('F9 canary: creating the parent without the scheduling lock deadlocks the same interleaving', async () => {
-    const outcome = await parentRace({ mutate: ["    PERFORM pg_advisory_xact_lock(hashtext('lane_sched'));                       -- (1)\n    INSERT INTO lane.sched_parents", '    INSERT INTO lane.sched_parents'] });
-    assert.ok(outcome.includes('40P01'), JSON.stringify(outcome));
-  });
+  // F9 (parent creation vs the scheduling lock) was superseded by N4: parents are provisioned, see lane-claim-round2.test.js.
 });

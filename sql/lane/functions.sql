@@ -3,6 +3,7 @@
 -- re-validated; a failed re-validation returns no claim. Every function derives the caller from session_user.
 -- Re-applied after every migration run (src/lane-db.js). A function whose signature changes needs a DROP of the old one here.
 DROP FUNCTION IF EXISTS lane.refresh_rem_ref();
+DROP FUNCTION IF EXISTS lane.parent_for(text, text);
 
 CREATE OR REPLACE FUNCTION lane.require_generation(p_gen bigint) RETURNS void
 LANGUAGE plpgsql SET search_path = pg_catalog, lane, pg_temp AS $$
@@ -74,21 +75,27 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, lane, pg_temp AS $$
   SELECT p.usage_decayed * power(0.5, greatest(0, extract(epoch FROM p_now - coalesce(p.usage_at, p_now))) / 1800)
 $$;
 
--- U_p: cores-equivalent held recently (Slurm-style decayed usage).
-CREATE OR REPLACE FUNCTION lane.usage_cores(p lane.sched_parents, p_now timestamptz) RETURNS double precision
+-- Usage as of p_now: the decayed history PLUS what the cores held since usage_at have accrued, the integral of their decayed
+-- contribution, rate x (H / ln 2) x (1 - 2^(-dt / H)) with H = 30 min. Reads (demotion, scoring) and settlement both use this one
+-- function, so a read before a settlement and the value the settlement stores are the same number, counted once.
+CREATE OR REPLACE FUNCTION lane.usage_now(p lane.sched_parents, p_now timestamptz) RETURNS double precision
 LANGUAGE sql STABLE SET search_path = pg_catalog, lane, pg_temp AS $$
-  SELECT p.running_cpu + lane.decayed(p, p_now) / 1800
+  SELECT lane.decayed(p, p_now)
+       + p.running_cpu::double precision * (1800 / ln(2::double precision))
+         * (1 - power(0.5, greatest(0, extract(epoch FROM p_now - coalesce(p.usage_at, p_now))) / 1800))
 $$;
 
--- Change the cores a parent holds, first settling what it held until now into decayed usage: the integral of the decayed
--- contribution over the interval, rate x (H / ln 2) x (1 - 2^(-dt / H)) with H = 30 min, added after decaying the old total. The result
--- does not depend on how often it is settled.
+-- U_p: cores-equivalent held recently (Slurm-style decayed usage), including the unsettled interval.
+CREATE OR REPLACE FUNCTION lane.usage_cores(p lane.sched_parents, p_now timestamptz) RETURNS double precision
+LANGUAGE sql STABLE SET search_path = pg_catalog, lane, pg_temp AS $$
+  SELECT p.running_cpu + lane.usage_now(p, p_now) / 1800
+$$;
+
+-- Change the cores a parent holds, first settling usage up to p_now (usage_now), so the result does not depend on how often it runs.
 CREATE OR REPLACE FUNCTION lane.add_running(p_parent uuid, p_delta real, p_now timestamptz) RETURNS void
 LANGUAGE sql SET search_path = pg_catalog, lane, pg_temp AS $$
   UPDATE lane.sched_parents p
-     SET usage_decayed = lane.decayed(p, p_now)
-           + p.running_cpu::double precision * (1800 / ln(2::double precision))
-             * (1 - power(0.5, greatest(0, extract(epoch FROM p_now - coalesce(p.usage_at, p_now))) / 1800)),
+     SET usage_decayed = lane.usage_now(p, p_now),
          usage_at = p_now, running_cpu = greatest(0, p.running_cpu + p_delta)
    WHERE p.id = p_parent
 $$;
@@ -149,7 +156,7 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, lane, pg_temp AS $$
   SELECT CASE
            WHEN NOT cfg.deadlines_enabled OR g.deadline_at IS NULL OR NOT g.deadline_valid THEN 0
            WHEN g.deadline_at < p_now THEN 75
-           WHEN e.group_id IS NOT NULL THEN coalesce(e.urgency, 0)         -- damped by record_eta (hysteresis, dwell, slew)
+           WHEN e.urgency IS NOT NULL THEN e.urgency                      -- damped by record_eta (hysteresis, dwell, slew)
            ELSE (CASE WHEN coalesce(e.low_confidence, false) THEN 0.5 ELSE 1 END)
                 * 150 * least(1, greatest(0, 1 - x.slack / x.s0))
          END
@@ -170,20 +177,23 @@ DECLARE
 BEGIN
   SELECT * INTO g FROM lane.groups WHERE id = p_group;
   IF NOT FOUND OR g.deadline_at IS NULL THEN RETURN; END IF;
-  SELECT * INTO e FROM lane.group_eta WHERE group_id = p_group;
-  v_cycle := coalesce(e.cycle, 0) + 1;
-  v_prev := coalesce(e.urgency, 0);
+  -- One writer at a time per group: make sure the row exists (an ETA-0 placeholder equals "no forecast yet"), then lock it, so a
+  -- concurrent forecast computes from this one's result and the 25-point slew holds across writers.
+  INSERT INTO lane.group_eta (group_id, eta_p90_s) VALUES (p_group, 0) ON CONFLICT (group_id) DO NOTHING;
+  SELECT * INTO e FROM lane.group_eta WHERE group_id = p_group FOR UPDATE;
+  v_cycle := e.cycle + 1;
+  v_prev := coalesce(e.urgency, lane.urgency(g, p_now));      -- bootstrap: what the scheduler is using right now (undamped ETA-0 fallback)
   v_s0 := greatest(900, 0.5 * p_eta_p90_s);
   v_slack := extract(epoch FROM g.deadline_at - p_now) - p_eta_p90_s;
   v_raw := (CASE WHEN p_low_confidence THEN 0.5 ELSE 1 END) * 150 * least(1, greatest(0, 1 - v_slack / v_s0));
-  v_on := CASE WHEN coalesce(e.boost_on, false) THEN NOT (v_slack > 1.25 * v_s0) ELSE v_slack < v_s0 END;
-  IF v_on <> coalesce(e.boost_on, false) AND e.last_flip_cycle IS NOT NULL AND v_cycle - e.last_flip_cycle < 3 THEN
+  v_on := CASE WHEN e.boost_on THEN NOT (v_slack > 1.25 * v_s0) ELSE v_slack < v_s0 END;
+  IF v_on <> e.boost_on AND e.last_flip_cycle IS NOT NULL AND v_cycle - e.last_flip_cycle < 3 THEN
     v_on := e.boost_on;                                                         -- dwell: too soon to change state again
   END IF;
   INSERT INTO lane.group_eta (group_id, eta_p90_s, low_confidence, cycle, urgency, boost_on, last_flip_cycle)
     VALUES (p_group, p_eta_p90_s, p_low_confidence, v_cycle,
             v_prev + least(25, greatest(-25, CASE WHEN v_on THEN v_raw ELSE 0 END - v_prev)),
-            v_on, CASE WHEN v_on <> coalesce(e.boost_on, false) THEN v_cycle ELSE e.last_flip_cycle END)
+            v_on, CASE WHEN v_on <> e.boost_on THEN v_cycle ELSE e.last_flip_cycle END)
     ON CONFLICT (group_id) DO UPDATE
       SET eta_p90_s = EXCLUDED.eta_p90_s, low_confidence = EXCLUDED.low_confidence, cycle = EXCLUDED.cycle,
           urgency = EXCLUDED.urgency, boost_on = EXCLUDED.boost_on, last_flip_cycle = EXCLUDED.last_flip_cycle;
@@ -375,19 +385,15 @@ LANGUAGE sql STABLE SET search_path = pg_catalog, lane, pg_temp AS $$
                     AND (pc.requires_capability IS NULL OR coalesce((to_jsonb(me) ->> pc.requires_capability)::boolean, false)))
 $$;
 
--- The scheduling parent for (account, class): derived here, never client-chosen. Creating one takes lane_sched FIRST: an
--- uncommitted parent row blocks any scheduler-locked function that wants the same (account, class), and that function would then
--- wait inside lane_sched for a submitter who is itself about to ask for it (a deadlock). Only the first-ever submit for a pair
--- pays this; every later one finds the row and takes no lock.
-CREATE OR REPLACE FUNCTION lane.parent_for(p_account text, p_class text) RETURNS uuid
-LANGUAGE plpgsql SET search_path = pg_catalog, lane, pg_temp AS $$
+-- The scheduling parent for (account, class). It was provisioned with the account (migration 003 triggers), so this only READS:
+-- submit takes no scheduling lock, and a missing parent is an error, never created on the fly.
+CREATE OR REPLACE FUNCTION lane.parent_of(p_account text, p_class text) RETURNS uuid
+LANGUAGE plpgsql STABLE SET search_path = pg_catalog, lane, pg_temp AS $$
 DECLARE v_pid uuid;
 BEGIN
   SELECT id INTO v_pid FROM lane.sched_parents WHERE account = p_account AND prio_class = p_class;
   IF v_pid IS NULL THEN
-    PERFORM pg_advisory_xact_lock(hashtext('lane_sched'));                       -- (1)
-    INSERT INTO lane.sched_parents (account, prio_class) VALUES (p_account, p_class) ON CONFLICT (account, prio_class) DO NOTHING;
-    SELECT id INTO v_pid FROM lane.sched_parents WHERE account = p_account AND prio_class = p_class;
+    RAISE EXCEPTION 'no scheduling parent for (%, %): parents are provisioned with the account, never created at submit', p_account, p_class USING ERRCODE = 'LN003';
   END IF;
   RETURN v_pid;
 END $$;
@@ -424,7 +430,7 @@ BEGIN
     RAISE EXCEPTION 'class % not allowed for %', p_class, session_user USING ERRCODE = '42501';
   END IF;
   INSERT INTO lane.groups (id, submit_uuid, kind, account, owner, parent_id, prio_class, snapshot, aggregator, deadline_at)
-    VALUES (gen_random_uuid(), p_submit_uuid, p_kind, p_account, session_user, lane.parent_for(p_account, p_class), p_class,
+    VALUES (gen_random_uuid(), p_submit_uuid, p_kind, p_account, session_user, lane.parent_of(p_account, p_class), p_class,
             p_snapshot, p_aggregator, p_deadline)
     ON CONFLICT (submit_uuid) DO NOTHING RETURNING id INTO v_gid;
   IF v_gid IS NULL THEN
@@ -496,7 +502,7 @@ BEGIN
   IF NOT FOUND OR NOT lane.class_allowed(v_owner, p_class) THEN
     RAISE EXCEPTION 'class % not allowed for %', p_class, g.owner USING ERRCODE = '42501';
   END IF;
-  v_pid := lane.parent_for(g.account, p_class);
+  v_pid := lane.parent_of(g.account, p_class);
   UPDATE lane.groups SET prio_class = p_class, parent_id = v_pid,
          deadline_valid = lane.judge_deadline(p_group, g.deadline_at, v_owner.can_deadline, v_now)
    WHERE id = p_group;                                                          -- (4)

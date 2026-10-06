@@ -105,4 +105,25 @@ describe('lane schema versioning', { skip: PG_SKIP_REASON ?? false, timeout: 120
     await c.query('INSERT INTO lane.schema_version (version) VALUES (999)');
     await assert.rejects(applyMigrations(c), /unknown|newer/);
   });
+
+  test('a lane schema holding only a standalone type (an enum, a domain) is still unversioned and refused', async () => {
+    for (const ddl of ["CREATE TYPE lane.claim_result AS ENUM ('legacy')", 'CREATE DOMAIN lane.pct AS int']) {
+      const c = await emptyDb();
+      await c.query(`CREATE SCHEMA lane; ${ddl}`);
+      await assert.rejects(applyMigrations(c), /unversioned/, ddl);
+    }
+  });
+
+  test('migration 003 backfills the scheduling parents of principals that already existed', async () => {
+    const c = await emptyDb();
+    const dir = fixtureDir();
+    for (const f of fs.readdirSync(path.join(dir, 'migrations')).filter((x) => x.startsWith('003-'))) fs.rmSync(path.join(dir, 'migrations', f));
+    // functions.sql must not reference what 003 adds, so the pre-003 state is applied with the schema as of version 2.
+    await applyMigrations(c, { dir });
+    await c.query("INSERT INTO lane.principals (login_role, kind, allowed_accounts) VALUES ('old_submit', 'submit', '{a1,a2}')");
+    assert.equal((await c.query('SELECT count(*)::int AS n FROM lane.sched_parents')).rows[0].n, 0);
+    const r = await applyMigrations(c);
+    assert.equal(r.applied.length, 1);
+    assert.deepEqual((await c.query('SELECT account, count(*)::int AS n FROM lane.sched_parents GROUP BY account ORDER BY account')).rows, [{ account: 'a1', n: 5 }, { account: 'a2', n: 5 }]);
+  });
 });
