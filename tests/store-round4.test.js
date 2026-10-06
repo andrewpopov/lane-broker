@@ -9,7 +9,10 @@ import { startStore, fakeClock, snapshotOf, publish, sha, token, tmpDir } from '
 import { readJournal } from '../src/store/journal.js';
 import { Replicator, readReplicationState } from '../src/store/replicate.js';
 import { sweep } from '../src/store/retention.js';
-import { acquireStoreLock } from '../src/store/lock.js';
+import { acquireStoreLock, lockMode } from '../src/store/lock.js';
+
+// The R3 cases exercise the macOS file lock; on Linux it refuses by design (the kernel-held lock is used instead).
+const fileLockOnly = { skip: lockMode() === 'file' ? false : 'macOS file-lock fallback; Linux uses the kernel-held lock' };
 import { StoreClient } from '../src/store/client.js';
 import { blobRelPath, manifestRelPath } from '../src/store/ids.js';
 
@@ -73,7 +76,7 @@ test('R2 a pinned manifest is never swept on the replica', async (t) => {
 });
 
 // ---- 3: lock ----
-test('R3 the lock file never exists empty: it is created complete by a hard link', () => {
+test('R3 the lock file never exists empty: it is created complete by a hard link', fileLockOnly, () => {
   const root = tmpDir('lock');
   const lockPath = path.join(root, 'store.lock');
   let sawEmpty = false;
@@ -94,7 +97,7 @@ test('R3 the lock file never exists empty: it is created complete by a hard link
   assert.ok(fs.existsSync(lockPath), 'a release never removes a lock it does not own');
 });
 
-test('R3 concurrent reclaimers of a stale lock: exactly one process still HOLDS it once the race settles (the rest are fenced)', async () => {
+test('R3 concurrent reclaimers of a stale lock: exactly one process still HOLDS it once the race settles (the rest are fenced)', fileLockOnly, async () => {
   const root = tmpDir('stale');
   const dead = spawnSync(process.execPath, ['-e', '0']).pid;
   fs.writeFileSync(path.join(root, 'store.lock'), JSON.stringify({ pid: dead, token: 'stale' }));
