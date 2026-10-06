@@ -171,22 +171,19 @@ cores but uses 1 stops starving the queue. Unsettled leases are charged as
 before; `false` restores that for every lease. The admission log's
 `leaseDemand=<id8>:<cores>(settled|cold)` field shows the basis per held lease.
 
-`historyDemandEnabled` (default `true`) and `historyDemandMinRuns` (default 5): a lane
-with at least that many successful runs in `history.jsonl` (the last 50 runs, no
-older than 14 days) is charged its history estimate instead of its declared
-cores, both as an admission candidate and as the cold demand of a just-admitted
-lease. The estimate is the p90 of the per-run mean cores (`cpuSeconds` / wall
-when recorded, else the sampled `observedCpu.mean`), floored at 0.25 and capped at
-the declaration; `history.jsonl` is re-read at most once a minute. The settled
-floor above becomes `settledDemandFloorFraction` x the estimate, and a lease
-observed above its estimate is still charged what it is observed using. The lookup is hierarchical, using the first level with at least
-`historyDemandMinRuns` runs: the exact (repo, lane); the (repo, `configLane`) an ad-hoc
-lane name resolved to (so per-ticket lanes like `qwen-552a` inherit their declared
-lane's history); then the whole repo, pooling only runs that declared the same cores
-as the candidate. Sources are `history:exact`, `history:configLane`, `history:repo`,
-`declared`. `history.jsonl` is re-read before the admission lock is taken, never
-under it. A lane with no level that qualifies is charged its declaration. The admission log shows
-`candidateEstimate=<n>(<source>)`, and `lane status --json` gives each
+`historyDemandEnabled` (default `true`) and `historyDemandMinRuns` (default 5): a workload with at
+least that many compatible runs in `history.jsonl` (the last 50, no older than 14 days) is charged its
+history estimate instead of its declared cores, as an admission candidate and as the cold demand of a
+just-admitted lease. A workload is (repo, lane, command fingerprint), the fingerprint being a hash of the
+whitespace-normalized command as `history.jsonl` records it, with only a checkout root (primary, worktree or remote work dir) rewritten to `<repo>` and a temp dir to `<tmp>` (test-file arguments, flags, SHAs and numbers are untouched, so a focused run is its own workload); an ad-hoc lane name may also match the runs of
+its declared `configLane`, but only with the same command. A run counts only if it succeeded, ran on the
+local executor, and was granted its full declared cores (a throttled run understates the need). The estimate
+is the p90 of the per-run PEAK observed cores, floored at 0.5 and capped at the declaration, so a bursty
+lane is charged its burst. There is no repo-wide pool, and no compatible history means the declaration.
+The settled-demand allowance above is unchanged and never capped by the estimate. The snapshot is built
+before the admission lock is taken (never under it), carries the config it was built under, and is used only
+while it matches the locked config and is under 5 minutes old. The admission log shows
+`candidateEstimate=<n>(history:exact|history:configLane|declared)`, and `lane status --json` gives each
 queued ticket `cpuEstimate: { cores, source }`. `false` charges declarations only.
 
 `admissionLoadGate` (default `false`): whether the load gate is allowed to

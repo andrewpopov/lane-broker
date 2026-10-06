@@ -20,14 +20,15 @@ export function coldStartEstimate(weight) {
 }
 
 /**
- * BRAIN-433: the CPU a claim of `declared` cores is charged for, and where that figure came from. The lane's
- * history estimate (cpu-estimates.js, capped at the declaration) when enabled and the lane has enough runs,
- * otherwise the declaration itself. The lookup is hierarchical (cpu-estimates.js) and never reads the file: callers refreshCpuEstimates before taking the lock. `cfg.cpuEstimateSource(now, minRuns)` replaces the cache in tests.
+ * BRAIN-433: the CPU a NEW claim of `declared` cores is charged for, and where that figure came from: the workload's
+ * history estimate (cpu-estimates.js: p90 peak of compatible runs, capped at the declaration) when enabled and the
+ * snapshot is fresh and matches `cfg`, otherwise the declaration. Never reads the history file (callers
+ * refreshCpuEstimates before taking the lock). Used for a candidate and for a lease's cold demand ONLY.
  */
 export function cpuEstimateBasis(ref, declared, cfg, now = Date.now()) {
   const cold = coldStartEstimate(declared);
-  if (cfg?.historyDemandEnabled !== true || !ref?.key) return { cores: cold, source: 'declared' };
-  const found = lookupEstimate((cfg.cpuEstimateSource ?? peekCpuEstimates)(now, cfg.historyDemandMinRuns ?? 5), { ...ref, declared: cold });
+  if (cfg?.historyDemandEnabled !== true) return { cores: cold, source: 'declared' };
+  const found = lookupEstimate(peekCpuEstimates(cfg, now), ref);
   return found ? { cores: clampEstimate(found.p90, cold), source: `history:${found.level}` } : { cores: cold, source: 'declared' };
 }
 
@@ -86,10 +87,12 @@ function recentObservedCores(lease, now, windowMs, current) {
  * observedCpuHistory — keeps max(observed, cold) / cold.
  */
 export function leaseDemandBasis(lease, now = Date.now(), cfg) {
-  const cold = cpuEstimateBasis(lease, leaseCpuCores(lease) ?? lease.weight, cfg, now).cores;
+  const cold = coldStartEstimate(leaseCpuCores(lease) ?? lease.weight);
+  // BRAIN-433: only the cold charge (no observation, or an unsettled one) uses the history estimate; the settled peak allowance below is main's, uncapped by it.
+  const estimated = cpuEstimateBasis(lease, cold, cfg, now).cores;
   const observed = freshObservedCores(lease, now);
-  if (observed === null) return { demand: cold, basis: 'cold' };
-  const unsettled = { demand: Math.max(observed, cold), basis: 'cold' };
+  if (observed === null) return { demand: estimated, basis: 'cold' };
+  const unsettled = { demand: Math.max(observed, estimated), basis: 'cold' };
   if (cfg?.settledDemandEnabled !== true) return unsettled;
   if (!Number.isFinite(lease.admittedAt) || now - lease.admittedAt < cfg.settledDemandSettleMs) return unsettled;
   const { count, peak } = recentObservedCores(lease, now, cfg.settledDemandWindowMs, observed);
