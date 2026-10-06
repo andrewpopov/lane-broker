@@ -847,6 +847,18 @@ lane waits with the same `projected-over-budget` denial (and the existing
 backfill, reservation and idle-exemption behaviour, which judge the full
 claim). Active `schedulerMode` only; shadow never denies, so it never relaxes.
 
+An elastic grant never exceeds this host's CPU budget (BRAIN-362). In active mode the
+claim an elastic ticket is queued, evaluated and charged at is capped at
+`floor(budget)` up front (`capElasticClaim`), so every admission path that admits
+the full claim (a cold sample, the idle exemption, a plain fit) grants at most that,
+and the lease, history and the child's `LANE_BROKER_CPU_CORES` report it. The
+lease keeps the declared `cpuCores` beside the grant. Because grants are whole
+cores, `lane run` also refuses at once (exit 64, the usual budget message) an
+elastic lane whose smallest grant, `ceil(minCpuCores)`, exceeds `floor(budget)`
+(e.g. a floor of 3.2 on a 3.4-core budget), since it could never start. A
+non-elastic claim over the budget is refused as before, never capped; a
+non-elastic fractional claim is charged as-is and is unaffected.
+
 The lease records `grantedCpuCores` and keeps `resources.cpuCores` as the
 declaration. Everything that charges a lease's CPU uses the grant: the CPU
 projection (including settled demand, BRAIN-354), safe-backfill head

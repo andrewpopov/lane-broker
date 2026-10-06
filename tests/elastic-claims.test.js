@@ -12,7 +12,7 @@ import { writeLease, readLease, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths, atomicWriteJson } from '../src/state.js';
 import { childEnv } from '../src/supervisor.js';
 import { leaseDemand, projectBusy } from '../src/admission.js';
-import { elasticClaimRange, resolveTicketResources, leaseCpuCores, leaseResources, ELASTIC_CLAIMS_CAPABILITY } from '../src/resources.js';
+import { elasticClaimRange, resolveTicketResources, leaseCpuCores, leaseResources, ELASTIC_CLAIMS_CAPABILITY, checkResourceBudget, cpuBudgetCores, detectResourceCapacity } from '../src/resources.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
 import { PRIORITY_CAPABILITY } from '../src/priority.js';
 import { ARTIFACTS_CAPABILITY } from '../src/remote-artifacts.js';
@@ -558,4 +558,91 @@ test('non-elastic: the result carries no grant field and the history row records
   assert.deepEqual(row.resources.cpuCores, 2);
   const res = JSON.parse(fs.readFileSync(path.join(paths(state).results, `${row.id}.json`), 'utf8'));
   assert.equal('grantedCpuCores' in res, false);
+});
+
+// BRAIN-362: the budget caps every elastic grant. Budget is pinned to 3 cores on THIS host (reserve = cores - 3),
+// and the sampler reports the host's real core count so the sample budget agrees with it.
+const HOST_CORES = detectResourceCapacity().cpuCores;
+const tightCfg = (overrides = {}) => baseCfg({ cpuReserveCores: HOST_CORES - 3, ...overrides });
+const hostSampler = (hostBusyCores) => () => ({ hostBusyCores, cores: HOST_CORES, stale: false, sampledAt: Date.now() });
+const hugeElastic = (id) => ticket(id, { resources: { cpuCores: 16, minCpuCores: 2, memoryBytes: GIB } });
+
+test('BRAIN-362: a cold CPU sample admits the full claim, but the grant is capped at floor(budget)', async () => {
+  const { state } = freshEnv();
+  const t = hugeElastic('cold');
+  await enqueue(state, t, tightCfg());
+  const result = await tryStart(state, t, tightCfg(), undefined, () => null, undefined, memory());
+  assert.equal(result.started, true);
+  assert.match(readLog(state), /sample-unavailable-empty/);
+  assert.equal(result.lease.grantedCpuCores, 3);
+  assert.equal(leaseCpuCores(result.lease), 3);
+  assert.equal(result.lease.resources.cpuCores, 16, 'the declaration is kept beside the grant');
+  assert.equal(childEnv(t, { PATH: '/bin' }, leaseCpuCores(result.lease)).LANE_BROKER_CPU_CORES, '3');
+  assert.match(readLog(state), /elastic-grant/);
+});
+
+test('BRAIN-362: the idle exemption admits an over-projection elastic head, still capped at floor(budget)', async () => {
+  const { state } = freshEnv();
+  const t = hugeElastic('idle');
+  const cfg = tightCfg({ resourceIdleOvershootCores: 100 });
+  await enqueue(state, t, cfg);
+  // ambient 2 + any claim >= 2 exceeds the 3-core budget, so only the idle exemption can start it
+  const result = await tryStart(state, t, cfg, undefined, hostSampler(2), undefined, memory());
+  assert.equal(result.started, true);
+  assert.match(readLog(state), /resource-idle-exempt/);
+  assert.equal(result.lease.grantedCpuCores, 3);
+  assert.equal(leaseCpuCores(result.lease), 3);
+});
+
+test('BRAIN-362: end to end, a lane declaring more cpuCores than the budget runs with LANE_BROKER_CPU_CORES <= floor(budget)', async () => {
+  const { base, home, state, env } = freshEnv();
+  writeGlobalConfig(home, {
+    version: 1, capacity: 100, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100, schedulerMode: 'active',
+    cpuAdmissionPercent: 100, cpuReserveCores: HOST_CORES - 3, admissionCooldownMs: 0,
+  });
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, cpuCores: 16, minCpuCores: 2, memoryBytes: 1048576 } } });
+  const busy = writeCpuBusyFile(base, 0, HOST_CORES);
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'sh', '-c', 'echo "grant=$LANE_BROKER_CPU_CORES"'], {
+    env: { ...env, LANE_BROKER_CPU_BUSY_FILE: busy },
+    cwd: repoDir,
+  });
+  assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+  assert.match(result.stdout, /grant=3\b/);
+  const rows = fs.readFileSync(paths(state).history, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.equal(rows.at(-1).grantedCpuCores, 3);
+});
+
+test('BRAIN-362: a non-elastic claim over the budget is still refused (exit 64), not capped', () => {
+  const host = { cpuCores: 4, memoryBytes: 64 * GIB };
+  const globalCfg = baseCfg({ cpuReserveCores: 1 });
+  const refused = checkResourceBudget({ resources: { cpuCores: 16, memoryBytes: GIB }, globalCfg, host });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.exitCode, 64);
+  assert.equal(checkResourceBudget({ resources: { cpuCores: 16, minCpuCores: 2, memoryBytes: GIB }, globalCfg, host }).ok, true, 'an elastic one is capped instead');
+});
+
+test('BRAIN-362: a fractional floor whose ceiling exceeds floor(budget) is refused immediately (exit 64)', () => {
+  const host = { cpuCores: 4, memoryBytes: 64 * GIB };
+  const globalCfg = baseCfg({ cpuReserveCores: 0.6 }); // budget 3.4: ceil(3.2) = 4 > floor(3.4) = 3
+  assert.equal(cpuBudgetCores(host, globalCfg).toFixed(1), '3.4');
+  const refused = checkResourceBudget({ resources: { cpuCores: 6, minCpuCores: 3.2, memoryBytes: GIB }, globalCfg, host });
+  assert.equal(refused.ok, false);
+  assert.equal(refused.exitCode, 64);
+  assert.match(refused.message, /requested resources exceed this environment's budget \(4\/3\.40 CPU cores/);
+  assert.equal(checkResourceBudget({ resources: { cpuCores: 6, minCpuCores: 3, memoryBytes: GIB }, globalCfg, host }).ok, true);
+  assert.equal(checkResourceBudget({ resources: { cpuCores: 3.2, memoryBytes: GIB }, globalCfg, host }).ok, true, 'a non-elastic fractional claim is charged as-is and fits');
+});
+
+test('BRAIN-362: end to end, a fractional floor above floor(budget) exits 64 at once instead of queueing', async () => {
+  const { base, home, env } = freshEnv();
+  writeGlobalConfig(home, {
+    version: 1, capacity: 100, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100, schedulerMode: 'active',
+    cpuAdmissionPercent: 100, cpuReserveCores: HOST_CORES - 3.4, admissionCooldownMs: 0,
+  });
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, cpuCores: 6, minCpuCores: 3.2, memoryBytes: 1048576 } } });
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'true'], { env, cwd: repoDir });
+  assert.equal(result.code, 64, `stderr: ${result.stderr}`);
+  assert.match(result.stderr, /exceed this environment's budget/);
 });
