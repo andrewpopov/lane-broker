@@ -8,7 +8,11 @@ import { LANE_SQL_DIR, connect } from '../src/lane-db.js';
  * Disposable Postgres for the lane-db tests. initdb into a temp dir, listen on a Unix socket only, in a SHORT
  * /tmp path (sun_path is ~104 bytes on macOS; os.tmpdir() overflows it, see BRAIN-376), tear down on exit.
  */
-const BIN_DIRS = [process.env.LANE_PG_BIN, '/opt/homebrew/bin', '/opt/homebrew/opt/postgresql@16/bin', '/usr/lib/postgresql/16/bin', '/usr/lib/postgresql/17/bin'].filter(Boolean);
+// LANE_TEST_PG_BIN pins the Postgres under test (e.g. /usr/lib/postgresql/17/bin); when set, nothing else is tried,
+// so a run meant for PG17 can never silently test whatever else is installed.
+const BIN_DIRS = process.env.LANE_TEST_PG_BIN
+  ? [process.env.LANE_TEST_PG_BIN]
+  : ['/opt/homebrew/bin', '/opt/homebrew/opt/postgresql@16/bin', '/usr/lib/postgresql/16/bin', '/usr/lib/postgresql/17/bin'];
 
 function findBin() {
   for (const dir of BIN_DIRS) {
@@ -18,7 +22,7 @@ function findBin() {
 }
 
 /** Why the Postgres tests cannot run here, or null when they can. Tests skip with this message. */
-export const PG_SKIP_REASON = findBin() ? null : 'postgres binaries (initdb, pg_ctl, postgres) not found; set LANE_PG_BIN or install PostgreSQL';
+export const PG_SKIP_REASON = findBin() ? null : 'postgres binaries (initdb, pg_ctl, postgres) not found; set LANE_TEST_PG_BIN or install PostgreSQL';
 
 /** The environment for every child: git's exported repo-local vars must never reach a test process. */
 function cleanEnv() {
@@ -77,6 +81,15 @@ export class PgCluster {
     return cluster;
   }
 
+  /** The server's version, e.g. "17.11", so a run can prove which Postgres it exercised. */
+  async serverVersion() {
+    const c = await this.admin();
+    const { rows: [{ server_version: version }] } = await c.query('SHOW server_version');
+    await c.end();
+    this.clients.delete(c);
+    return version;
+  }
+
   conn(database, user = 'postgres') {
     return { host: this.dir, port: this.port, user, database };
   }
@@ -113,9 +126,9 @@ export class PgCluster {
     return name;
   }
 
-  /** Apply sql/lane in order. `mutate` is [from, to]: it must match, so a canary can never silently no-op. */
-  async applySql(database, mutate) {
-    const c = await this.client(database);
+  /** Apply sql/lane in order, as `user`. `mutate` is [from, to]: it must match, so a canary can never silently no-op. */
+  async applySql(database, mutate, user = 'postgres') {
+    const c = await this.client(database, user);
     let mutated = !mutate;
     for (const file of fs.readdirSync(LANE_SQL_DIR).filter((f) => f.endsWith('.sql')).sort()) {
       let text = fs.readFileSync(path.join(LANE_SQL_DIR, file), 'utf8');
@@ -181,6 +194,39 @@ export async function addGroup(c, { n, tier = 1, activatedAt = ago(60), lastClai
       [gid(n), seq, cls, est, cpu, count]);
     seq += count;
   }
+  await c.query('ANALYZE lane.jobs');   // a live queue always has statistics; without them PostgreSQL 17 picks a 200 ms plan
 }
 
 export const ROOM = { test: 1, sim: 1 };
+
+export const SCALE_CLASSES = ['test', 'sim', 'build'];
+
+/**
+ * A realistic fleet on top of the standard seed: `hosts` agents (lane_agent_h1..hN) each with a policy row per class,
+ * and `jobs` queued jobs spread over `groups` active groups and the three classes, with varied estimates.
+ * Returns the agent login for each host.
+ */
+export async function seedScale(c, { jobs, groups, hosts }) {
+  const agents = Array.from({ length: hosts }, (_, i) => ({ host: `h${i + 1}`, login: `lane_agent_h${i + 1}` }));
+  for (const { host, login } of agents) {
+    await c.query(`DO $do$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '${login}') THEN CREATE ROLE ${login} LOGIN IN ROLE lane_agent; END IF; END $do$`);
+    await c.query('INSERT INTO lane.hosts (host_id) VALUES ($1) ON CONFLICT DO NOTHING', [host]);
+    await c.query("INSERT INTO lane.principals (login_role, host_id, kind) VALUES ($1, $2, 'agent') ON CONFLICT DO NOTHING", [login, host]);
+    for (const [i, cls] of SCALE_CLASSES.entries()) {
+      await c.query('INSERT INTO lane.host_class_policy (host_id, class, weight) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING', [host, cls, i + 1]);
+    }
+  }
+  await c.query('UPDATE lane.principals SET allowed_dest_hosts = $1 WHERE kind = \'submit\'', [agents.map((a) => a.host)]);
+  await c.query(
+    `INSERT INTO lane.groups (id, submit_uuid, kind, account, owner, tier, snapshot, aggregator, state, activated_at)
+     SELECT ('00000000-0000-0000-0000-' || lpad(g::text, 12, '0'))::uuid, ('00000000-0000-0000-0000-' || lpad(g::text, 12, '0'))::uuid,
+            'single', 'acct', '${roleNames.submit}', g % 3, '{}', 'x', 'active', now() - (g || ' minutes')::interval
+       FROM generate_series(1, $1::int) g`, [groups]);
+  await c.query(
+    `INSERT INTO lane.jobs (group_id, seq, idem_key, class, template_id, template_version, params, est_ref_ms, cpu_req, cpu_min, mem_bytes, dup_safe, max_infra, max_work)
+     SELECT ('00000000-0000-0000-0000-' || lpad((1 + n % $1::int)::text, 12, '0'))::uuid, n, 'k' || n, ($3::text[])[1 + n % ${SCALE_CLASSES.length}], 't', 1, '{}',
+            100 + (n * 7919) % 60000, 1, 1, 0, true, 3, 2
+       FROM generate_series(1, $2::int) n`, [groups, jobs, SCALE_CLASSES]);
+  await c.query('ANALYZE');
+  return agents;
+}

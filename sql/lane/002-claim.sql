@@ -77,13 +77,13 @@ BEGIN
      OR NOT (SELECT claims_enabled FROM lane.cluster) THEN RETURN; END IF;
 
   WITH pol AS (
-    SELECT c.class, c.weight, coalesce(v.vtime, 0) AS vtime
+    SELECT c.class, c.weight, coalesce(v.vtime, 0) AS vtime, coalesce(v.active, false) AS was_active
       FROM lane.host_class_policy c
       LEFT JOIN lane.class_vtime v ON v.host_id = c.host_id AND v.class = c.class
      WHERE c.host_id = v_host.host_id AND c.enabled AND c.weight > 0
        AND coalesce((p_room ->> c.class)::real, 0) > 0),
   cand AS (                       -- one row per (group, class): that group's best eligible head job; no locks
-    SELECT g.id AS gid, g.last_claim_at, pol.class, pol.weight, pol.vtime, j.id AS job_id, j.est_ref_ms, j.seq,
+    SELECT g.id AS gid, g.last_claim_at, pol.class, pol.weight, pol.vtime, pol.was_active, j.id AS job_id, j.est_ref_ms, j.seq,
            coalesce(g.last_claim_at, g.activated_at) AS since,
            (v_now - coalesce(g.last_claim_at, g.activated_at) >= interval '20 minutes') AS overdue,
            least(2, g.tier + floor(extract(epoch FROM v_now - coalesce(g.last_claim_at, g.activated_at)) / 600))::int AS band
@@ -92,12 +92,18 @@ BEGIN
       JOIN LATERAL (SELECT j.* FROM lane.jobs j
                      WHERE j.group_id = g.id AND j.class = pol.class AND j.state = 'queued'
                        AND lane.job_eligible(j, v_host, p_room, p_mem, p_held_keys, v_now)
-                     ORDER BY j.est_ref_ms DESC, j.seq LIMIT 1) j ON true)
-  SELECT * INTO v_pick FROM cand
+                     ORDER BY j.est_ref_ms DESC, j.seq LIMIT 1) j ON true),
+  floored AS (
+    SELECT cand.*, min(vtime) FILTER (WHERE was_active) OVER () AS active_floor, array_agg(class) OVER () AS present
+      FROM cand),
+  stride AS (                     -- 5.2 catch-up: a class returning from idle starts at the minimum of the active classes
+    SELECT floored.*, CASE WHEN was_active THEN vtime ELSE greatest(vtime, coalesce(active_floor, vtime)) END AS eff_vtime
+      FROM floored)
+  SELECT * INTO v_pick FROM stride
    ORDER BY overdue DESC,
             CASE WHEN overdue THEN since END ASC, CASE WHEN overdue THEN gid END ASC,   -- 1. overdue: total order (since, gid)
             band DESC,                                  -- 2. else the highest eligible band
-            round(vtime::numeric, 9) ASC,               -- 3. class stride (rounded: float noise must not break true ties)
+            round(eff_vtime::numeric, 9) ASC,           -- 3. class stride (rounded: float noise must not break true ties)
             last_claim_at NULLS FIRST,                  -- 4. group rotation
             est_ref_ms DESC, seq,                       -- 5. longest first, then arrival
             gid                                         -- 6. deterministic fallback LAST
@@ -119,6 +125,13 @@ BEGIN
       SELECT DISTINCT k, v_job.id, v_job.epoch, v_host.host_id FROM unnest(v_job.conflict_keys) AS k;
   END IF;
   UPDATE lane.groups SET last_claim_at = v_now WHERE id = v_pick.gid;
+  -- Activity bookkeeping for the next claim: classes with eligible work now are active, the rest are idle. A class
+  -- that was idle is raised to the active floor before this grant is charged to it. Same lock as the claim, so no race.
+  INSERT INTO lane.class_vtime AS v (host_id, class, vtime, active)
+    SELECT v_host.host_id, c, coalesce(v_pick.active_floor, 0), true FROM unnest(v_pick.present) AS c GROUP BY c
+    ON CONFLICT (host_id, class) DO UPDATE
+      SET vtime = CASE WHEN v.active THEN v.vtime ELSE greatest(v.vtime, coalesce(v_pick.active_floor, v.vtime)) END, active = true;
+  UPDATE lane.class_vtime SET active = false WHERE host_id = v_host.host_id AND active AND class <> ALL (v_pick.present);
   IF NOT v_pick.overdue THEN               -- overdue claims are excluded from share accounting (5.2)
     INSERT INTO lane.class_vtime (host_id, class, vtime)
       VALUES (v_host.host_id, v_job.class, v_grant::double precision / v_pick.weight)

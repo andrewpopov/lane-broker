@@ -62,9 +62,33 @@ describe('lane.claim_next ordering', { skip: PG_SKIP_REASON ?? false, timeout: 1
   });
 
   test('the old double-weight comparator (vtime/weight) would give about 9:1, so the fixture catches it', async () => {
-    const counts = await strideCounts({ mutate: ['round(vtime::numeric, 9) ASC,', 'round((vtime / weight)::numeric, 9) ASC,'] });
+    const counts = await strideCounts({ mutate: ['round(eff_vtime::numeric, 9) ASC,', 'round((eff_vtime / weight)::numeric, 9) ASC,'] });
     assert.ok(counts.test / counts.sim >= 8 && counts.test / counts.sim <= 10, `expected ~9:1, got ${counts.test}:${counts.sim}`);
     assert.notDeepEqual(counts, { test: 300, sim: 100 });
+  });
+
+  // Class `test` (weight 3) runs alone for 1000 grants, then `sim` (weight 1) gets work. Without the 5.2 catch-up sim's
+  // vtime is still 0 against test's ~333, so sim would win every claim until it had banked the whole idle period.
+  async function simShareAfterIdle(opts, selections = 400) {
+    const { su, agent } = await open(opts);
+    await su.query("UPDATE lane.host_class_policy SET weight = 3 WHERE class = 'test'");
+    await addGroup(su, { n: 1, jobs: [{ cls: 'test', count: 1000 + selections }] });
+    await addGroup(su, { n: 2, state: 'open', jobs: [{ cls: 'sim', count: selections }] });
+    for (let i = 0; i < 1000; i++) assert.equal((await claim(agent)).class, 'test');
+    await su.query("UPDATE lane.groups SET state = 'active', activated_at = now() WHERE id = $1", [gid(2)]);
+    const counts = { test: 0, sim: 0 };
+    for (let i = 0; i < selections; i++) counts[(await claim(agent)).class]++;
+    return counts;
+  }
+
+  test('a class idle for 1000 grants returns at the active minimum and wins no more than its weight share', async () => {
+    const counts = await simShareAfterIdle();
+    assert.ok(counts.sim >= 95 && counts.sim <= 105, `expected sim ~100 of 400 (weights 3:1), got ${JSON.stringify(counts)}`);
+  });
+
+  test('without the catch-up the returning class would take every claim, so the fixture catches it', async () => {
+    const counts = await simShareAfterIdle({ mutate: ['min(vtime) FILTER (WHERE was_active) OVER () AS active_floor', 'NULL::double precision AS active_floor'] });
+    assert.ok(counts.sim > 300, `expected a banked burst, got ${JSON.stringify(counts)}`);
   });
 
   test('the older-served group wins over a group with a longer job and a smaller gid', async () => {

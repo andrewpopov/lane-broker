@@ -4,6 +4,9 @@
 
 -- Roles are cluster-level. lane_definer owns the schema objects and every SECURITY DEFINER function; the
 -- four group roles carry grants, and per-host / per-identity login roles are made members of them.
+-- The applier need not be a superuser: it must own the database, and have CREATEROLE when a role below does not
+-- exist yet. Roles that already exist are never touched. Without CREATEROLE an administrator grants it
+-- lane_definer once: GRANT lane_definer TO <applier> WITH SET TRUE. Needs PostgreSQL 16 or later.
 DO $$
 DECLARE r text;
 BEGIN
@@ -12,6 +15,10 @@ BEGIN
       EXECUTE format('CREATE ROLE %I NOLOGIN', r);
     END IF;
   END LOOP;
+  -- Handing ownership to lane_definer needs the applier to be able to SET ROLE to it (a superuser always can).
+  IF NOT pg_has_role(session_user, 'lane_definer', 'SET') THEN
+    EXECUTE format('GRANT lane_definer TO %I WITH INHERIT TRUE, SET TRUE', session_user);
+  END IF;
 END $$;
 
 CREATE SCHEMA IF NOT EXISTS lane;
@@ -46,10 +53,14 @@ CREATE TABLE IF NOT EXISTS lane.host_class_policy (
   enabled boolean NOT NULL DEFAULT true,
   PRIMARY KEY (host_id, class));
 
+-- active: the class had eligible work at the last claim on this host. A class that returns from inactive is
+-- caught up to the minimum vtime of the active classes (spec 5.2) so an idle class cannot bank a burst.
 CREATE TABLE IF NOT EXISTS lane.class_vtime (
   host_id text NOT NULL REFERENCES lane.hosts(host_id), class text NOT NULL,
   vtime double precision NOT NULL DEFAULT 0,
+  active boolean NOT NULL DEFAULT false,
   PRIMARY KEY (host_id, class));
+ALTER TABLE lane.class_vtime ADD COLUMN IF NOT EXISTS active boolean NOT NULL DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS lane.command_templates (
   template_id text NOT NULL, version int NOT NULL,
@@ -91,6 +102,14 @@ CREATE TABLE IF NOT EXISTS lane.jobs (
   grant_cpu real, started_at timestamptz, finished_at timestamptz, exit_code int, permanent boolean, wedged boolean,
   result jsonb, log_ref text, log_tail text);
 CREATE INDEX IF NOT EXISTS jobs_queued_head ON lane.jobs (group_id, class, est_ref_ms DESC, seq) WHERE state = 'queued';
+-- lane.stage_open asks "is any earlier-stage job of this group still unfinished?" once per candidate job. Without this
+-- partial index it scanned every job of the group (about 1,400 buffers, 5 ms per group and class at 60k queued jobs).
+CREATE INDEX IF NOT EXISTS jobs_unfinished_stage ON lane.jobs (group_id, stage) WHERE state NOT IN ('succeeded','failed','cancelled','skipped','lost');
+-- claim_next's per-group lookup has two indexes that can serve it (this one and jobs_queued_head); only the second
+-- avoids evaluating eligibility on every queued job of the group, and the planner picks it only from fresh statistics.
+-- PostgreSQL 17 chose the wrong one (about 200 ms per claim) on a 400-job table nobody had analysed yet. Keep the
+-- statistics fresh on this hot table instead of hoping.
+ALTER TABLE lane.jobs SET (autovacuum_analyze_scale_factor = 0.01, autovacuum_analyze_threshold = 200, autovacuum_vacuum_scale_factor = 0.02);
 CREATE INDEX IF NOT EXISTS groups_active ON lane.groups (id) WHERE state = 'active';
 
 CREATE TABLE IF NOT EXISTS lane.exclusions (
