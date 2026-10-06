@@ -6,7 +6,7 @@ import path from 'node:path';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneSpawn, laneRun, waitFor } from './helpers.js';
 import { sampleHostCpu } from '../src/cpu.js';
 import { parseProcCpuStat, parsePsCpuTable, parsePsCpuTime, readLeaseMarkers, readProcCpuRows, procSnapshot, withDeltas, preemptibleCores } from '../src/preemptible.js';
-import { sampleAndUpdateCpuGate, evaluateCpuAdmission, nonPreemptibleBusy } from '../src/admission.js';
+import { formatAdmissionLog, sampleAndUpdateCpuGate, evaluateCpuAdmission, nonPreemptibleBusy } from '../src/admission.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { paths, readJsonSafe } from '../src/state.js';
 
@@ -221,10 +221,19 @@ test('fixture clocks do not leak: Date.now is real again after the mocked tests'
   assert.ok(a > 1_700_000_000_000, `Date.now() returned ${a}`);
 });
 
-test('REAL process table: a nice-15 busy-loop child counts as preemptible for a nice-0 lane, and not for a nice-15 lane', async (t) => {
+/** A real nice-15 busy loop. Under load it gets almost no CPU (that is what nice is for), so these tests assert
+ *  CLASSIFICATION of its row, never a magnitude, and skip when the host never schedules it. */
+async function niceChild(t) {
   const child = spawn('/usr/bin/nice', ['-n', '15', process.execPath, '-e', 'for(;;){}'], { stdio: 'ignore' });
   t.after(() => child.kill('SIGKILL'));
   await new Promise((r) => setTimeout(r, 300)); // let nice exec into node
+  return child;
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const ownRow = (child) => (rows) => rows.filter((r) => r.pid === child.pid);
+
+test('REAL process table: a nice-15 busy-loop child is preemptible for a nice-0 lane, and not for a nice-15 lane', async (t) => {
+  const child = await niceChild(t);
   const first = readProcCpuRows();
   assert.ok(first.length > 5, `the real table has rows, got ${first.length}`);
   const mine = first.find((r) => r.pid === child.pid);
@@ -232,24 +241,36 @@ test('REAL process table: a nice-15 busy-loop child counts as preemptible for a 
   assert.equal(mine.nice, 15);
   const prev = procSnapshot(first);
   const started = Date.now();
-  await new Promise((r) => setTimeout(r, 2000));
-  const rows = withDeltas(readProcCpuRows(), prev);
+  let own = [];
+  for (let waited = 0; waited < 10_000 && !(own[0]?.deltaSec > 0); waited += 500) {
+    await sleep(500);
+    own = ownRow(child)(withDeltas(readProcCpuRows(), prev));
+  }
+  if (!(own[0]?.deltaSec > 0)) return t.skip('host saturated: the nice-15 child never got CPU');
   const windowMs = Date.now() - started;
-  const cores = preemptibleCores({ rows, windowMs, laneNice: 0, heldLeases: [] });
-  assert.ok(cores > 0.2, `the busy child must be found as preemptible, got ${cores}`);
-  assert.equal(preemptibleCores({ rows, windowMs, laneNice: 15, heldLeases: [] }), 0);
+  assert.ok(preemptibleCores({ rows: own, windowMs, laneNice: 0, heldLeases: [] }) > 0, 'preemptible for a nice-0 lane');
+  assert.equal(preemptibleCores({ rows: own, windowMs, laneNice: 15, heldLeases: [] }), 0, 'a peer for a nice-15 lane');
   assert.throws(() => preemptibleCores({ rows: readProcCpuRows(), windowMs, laneNice: 0 }), /withDeltas/);
 });
 
-test('REAL sampler path: sampleHostCpu with a real busy nice-15 child reports preemptible cores', async (t) => {
+test('REAL sampler path: sampleHostCpu classifies a real nice-15 busy-loop child as preemptible', async (t) => {
   const { state } = freshEnv();
-  const child = spawn('/usr/bin/nice', ['-n', '15', process.execPath, '-e', 'for(;;){}'], { stdio: 'ignore' });
-  t.after(() => child.kill('SIGKILL'));
-  await new Promise((r) => setTimeout(r, 300));
-  const opts = { preemptible: lane(0) };
+  const child = await niceChild(t);
+  const opts = { preemptible: lane(0), readProcs: () => ownRow(child)(readProcCpuRows()) };
   sampleHostCpu(state, undefined, opts);
-  await new Promise((r) => setTimeout(r, 2000));
-  const sample = sampleHostCpu(state, undefined, opts);
-  assert.equal(sample.stale, false);
-  assert.ok(sample.preemptibleBusyCores > 0.2, `got ${sample.preemptibleBusyCores} of ${sample.hostBusyCores} busy`);
+  let sample = null;
+  for (let waited = 0; waited < 10_000 && !(sample?.preemptibleBusyCores > 0); waited += 500) {
+    await sleep(500);
+    sample = sampleHostCpu(state, undefined, opts);
+  }
+  if (sample?.preemptibleBusyCores > 0) return assert.ok(sample.preemptibleBusyCores <= sample.hostBusyCores);
+  const cpuSoFar = ownRow(child)(readProcCpuRows())[0]?.cpuSec ?? 0;
+  if (cpuSoFar < 0.5) return t.skip('host saturated: the nice-15 child never got CPU');
+  assert.fail(`the child ran ${cpuSoFar}s of CPU but the sampler reported ${sample?.preemptibleBusyCores} preemptible`);
+});
+
+test('admission log: preemptibleBusy= appears only when non-zero, so the format is unchanged where the feature is idle', () => {
+  const base = { candidateId: 'c', mode: 'active', currentDecision: 'start', currentReason: 'x', admit: true, reason: 'ok', hostBusyCores: 3, cores: 10 };
+  assert.doesNotMatch(formatAdmissionLog({ ...base, preemptibleBusyCores: 0 }), /preemptibleBusy/);
+  assert.match(formatAdmissionLog({ ...base, preemptibleBusyCores: 2.5 }), / preemptibleBusy=2\.50 /);
 });

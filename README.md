@@ -157,7 +157,7 @@ busy figure; the share is a safety floor, so at 0.8 a fifth of lower-priority
 load still counts and a truly saturated host is never read as empty.
 `lane status` shows `host CPU: <busy> busy cores, <n> preemptible` from the
 last sample, and the admission log line carries `preemptibleBusy=` beside
-`hostBusyCores=` and `externalBusy=`. `LANE_BROKER_CPU_BUSY_FILE` accepts an
+`hostBusyCores=` and `externalBusy=` whenever it is non-zero. `LANE_BROKER_CPU_BUSY_FILE` accepts an
 optional third field, `hostBusy,cores,preemptibleBusy`.
 
 `settledDemandEnabled` (default `true`): once a lease is settled (admitted at

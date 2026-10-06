@@ -468,7 +468,8 @@ export function formatAdmissionLog(f) {
     `hostBusyCores=${fmt(f.hostBusyCores)}`,
     `cores=${f.cores ?? 'n/a'}`,
     `externalBusy=${fmt(f.externalBusy)}`,
-    `preemptibleBusy=${fmt(f.preemptibleBusyCores)}`,
+    // only when the feature contributes, so the line is byte-identical to before wherever it does not
+    ...(f.preemptibleBusyCores > 0 ? [`preemptibleBusy=${fmt(f.preemptibleBusyCores)}`] : []),
     `projectedBusy=${fmt(f.projectedBusy)}`,
     `budget=${fmt(f.budget)}`,
     `candidateCpu=${fmt(f.candidateCpuCores)}`,
