@@ -163,7 +163,12 @@ export function sampleAndUpdateCpuGate(root, cfg, cpuSample) {
   const prev = sanitizeGateState(readJsonSafe(file));
   // BRAIN-346: a reused measurement is the SAME observation again — hysteresis advances once per
   // new observation, never once per poll that happened to re-read it.
-  if (cpuSample?.reused) return prev;
+  // The gate STATE is not advanced by a re-read, but this caller's own reading (its discount is candidate-specific)
+  // is still checked against the close threshold, so another candidate's more generous discount cannot hold it open.
+  if (cpuSample?.reused) {
+    const overClose = Number.isFinite(cpuSample.hostBusyCores) && cpuSample.cores > 0 && (nonPreemptibleBusy(cpuSample, cfg) / cpuSample.cores) * 100 >= cfg.cpuClosePercent;
+    return overClose ? { ...prev, closed: true } : prev;
+  }
   if (
     !cpuSample ||
     cpuSample.stale ||
@@ -173,7 +178,7 @@ export function sampleAndUpdateCpuGate(root, cfg, cpuSample) {
   ) {
     return prev;
   }
-  const busyPercent = (cpuSample.hostBusyCores / cpuSample.cores) * 100;
+  const busyPercent = (nonPreemptibleBusy(cpuSample, cfg) / cpuSample.cores) * 100;
   const next = updateCpuGateState(prev, busyPercent, cfg);
   try {
     atomicWriteJson(file, next);
@@ -215,6 +220,18 @@ export function cooldownActive(heldLeases, cfg, now = Date.now()) {
  * `bias=self-subtracted-when-observed` so the remaining cold-start gap can't
  * be missed.
  */
+/**
+ * BRAIN-428: host busy cores with preemptible load discounted. cpu.js reports `preemptibleBusyCores` per process,
+ * by identity, for processes the candidate lane outranks (strictly higher nice) and that are not lane processes.
+ * The kernel runs the lane ahead of them, so they yield; only `preemptibleShare` (default 0.8) of it is counted as
+ * available, so a truly saturated host is never read as empty. Everything else counts in full.
+ */
+export function nonPreemptibleBusy(cpuSample, cfg) {
+  const preemptible = Math.min(Math.max(0, cpuSample.preemptibleBusyCores ?? 0), cpuSample.hostBusyCores);
+  const share = (cfg.preemptibleNiceMin ?? 0) > 0 ? (cfg.preemptibleShare ?? 0) : 0;
+  return Math.max(0, cpuSample.hostBusyCores - share * preemptible);
+}
+
 export const KNOWN_BIAS_NOTE = 'self-subtracted-when-observed';
 
 /**
@@ -268,7 +285,7 @@ export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, c
   }
 
   const brokerObserved = heldLeases.reduce((sum, l) => sum + (freshObservedCores(l, now) ?? 0), 0);
-  const externalBusy = Math.max(0, cpuSample.hostBusyCores - brokerObserved);
+  const externalBusy = Math.max(0, nonPreemptibleBusy(cpuSample, cfg) - brokerObserved);
   const candidateEstimate = coldStartEstimate(candidateResources?.cpuCores ?? candidateWeight);
   const projectedBusy = projectBusy(externalBusy, heldLeases, candidateEstimate, now, cfg);
   const budget = cpuBudget(cpuSample, cfg);
@@ -311,9 +328,9 @@ function unavailableDecision(heldLeases, reason) {
  * while holding the global lock because sampleHostCpu updates shared sample
  * state used by an active admission decision.
  */
-export function sampleCpuSafe(root, cpuSampler = sampleHostCpu, reuseWindowMs = 0) {
+export function sampleCpuSafe(root, cpuSampler = sampleHostCpu, reuseWindowMs = 0, preemptible = null) {
   try {
-    return cpuSampler(root, undefined, { reuseWindowMs }) || null;
+    return cpuSampler(root, undefined, { reuseWindowMs, preemptible }) || null;
   } catch {
     return null; // sampler failure: treated identically to a missing sample
   }
@@ -373,6 +390,7 @@ function decideAdmission(cfg, ticket, heldLeases, cpuSample, memoryInfo, cpuGate
     projectedAvailableBytes: memoryResult.projectedAvailableBytes,
     memoryBudgetBytes: memoryResult.memoryBudgetBytes,
     hostBusyCores: cpuSample ? cpuSample.hostBusyCores : null,
+    preemptibleBusyCores: cpuSample ? cpuSample.preemptibleBusyCores ?? 0 : null,
     cores: cpuSample ? cpuSample.cores : null,
     sampleStale: cpuSample ? cpuSample.stale : true,
     cpuGateClosed: cpuGateState.closed,
@@ -450,6 +468,8 @@ export function formatAdmissionLog(f) {
     `hostBusyCores=${fmt(f.hostBusyCores)}`,
     `cores=${f.cores ?? 'n/a'}`,
     `externalBusy=${fmt(f.externalBusy)}`,
+    // only when the feature contributes, so the line is byte-identical to before wherever it does not
+    ...(f.preemptibleBusyCores > 0 ? [`preemptibleBusy=${fmt(f.preemptibleBusyCores)}`] : []),
     `projectedBusy=${fmt(f.projectedBusy)}`,
     `budget=${fmt(f.budget)}`,
     `candidateCpu=${fmt(f.candidateCpuCores)}`,

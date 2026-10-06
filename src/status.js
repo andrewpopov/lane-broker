@@ -208,6 +208,8 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
     };
   });
 
+  const lastCpuSample = readJsonSafe(paths(root).cpuSample)?.lastValid ?? null;
+
   // BRAIN-319 T3b-4 (C4): an attempt still mid remote-dispatch (executor
   // 'remote') is neither a lease nor a queue entry -- `used`/`reservedCpu
   // Cores`/`reservedMemoryBytes` above are derived from `leases` alone, so
@@ -241,6 +243,9 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
         ),
       ),
       reservedCpuCores,
+      // BRAIN-428: the last valid host sample, read from the sidecar (status never samples: that would perturb the baseline)
+      hostBusyCores: lastCpuSample?.hostBusyCores ?? null,
+      preemptibleBusyCores: lastCpuSample ? lastCpuSample.preemptibleBusyCores ?? 0 : null,
       memoryBytes: resourceCapacity.memoryBytes,
       availableMemoryBytes: resourceCapacity.availableMemoryBytes,
       memoryBudgetBytes: Math.max(0, resourceCapacity.memoryBytes - cfg.memoryReserveBytes),
@@ -358,6 +363,9 @@ export function renderStatusText(status) {
         `memory ${fmtMB(status.resources.reservedMemoryBytes)}/${fmtMB(status.resources.memoryBudgetBytes)} reserved, ` +
         `${fmtMB(status.resources.availableMemoryBytes)} currently available (${status.resources.source}, ${status.resources.mode})`,
     );
+    if (status.resources.hostBusyCores != null) {
+      lines.push(`host CPU: ${status.resources.hostBusyCores.toFixed(2)} busy cores, ${(status.resources.preemptibleBusyCores ?? 0).toFixed(2)} preemptible`);
+    }
   }
   const informationalSuffix = status.loadGate.admission ? '' : ' [informational]';
   if (status.loadGate.lastLoad == null && status.loadGate.sampleAgeMs == null) {

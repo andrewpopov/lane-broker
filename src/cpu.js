@@ -3,11 +3,12 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { paths, atomicWriteJson, readJsonSafe } from './state.js';
 import { detectResourceCapacity } from './resources.js';
+import { readProcCpuRows, procSnapshot, withDeltas, preemptibleCores } from './preemptible.js';
 
 /**
  * Test-only override, the CPU-gate equivalent of load.js's readLoadAvg /
  * LANE_BROKER_LOADAVG_FILE: when LANE_BROKER_CPU_BUSY_FILE is set, its first
- * line is "hostBusyCores,cores" and sampleHostCpu returns that directly
+ * line is "hostBusyCores,cores[,preemptibleBusyCores]" and sampleHostCpu returns that directly
  * instead of diffing real os.cpus() snapshots. Real integration tests spawn
  * an actual detached supervisor (a separate process), so there is no way to
  * inject a fake cpuSampler function across that boundary — this lets the
@@ -19,11 +20,12 @@ function readCpuBusyOverride() {
   if (!file) return null;
   try {
     const first = fs.readFileSync(file, 'utf8').split('\n')[0].trim();
-    const [busyStr, coresStr] = first.split(',');
+    const [busyStr, coresStr, preemptibleStr] = first.split(',');
     const hostBusyCores = Number(busyStr);
     const cores = Number(coresStr);
-    if (Number.isFinite(hostBusyCores) && Number.isFinite(cores) && cores > 0) {
-      return { hostBusyCores, cores, stale: false, sampledAt: Date.now() };
+    const preemptibleBusyCores = preemptibleStr === undefined ? 0 : Number(preemptibleStr);
+    if (Number.isFinite(hostBusyCores) && Number.isFinite(cores) && cores > 0 && Number.isFinite(preemptibleBusyCores)) {
+      return { hostBusyCores, preemptibleBusyCores, cores, stale: false, sampledAt: Date.now() };
     }
   } catch {
     // fall through to the real sampler
@@ -137,7 +139,11 @@ function countersUnchanged(prev, snapshot) {
   return snapshot.cpus.every((s, i) => prev.cpus[i] && prev.cpus[i].total === s.total && prev.cpus[i].idle === s.idle);
 }
 
-export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0 } = {}) {
+/**
+ * `preemptible` (BRAIN-428, src/preemptible.js): `{ laneNice, niceMin, heldLeases }`, absent = nothing preemptible.
+ * The per-process readings ride in the same sidecar as the host counters, so both deltas cover the SAME window.
+ */
+export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0, preemptible = null, readProcs = readProcCpuRows } = {}) {
   const override = readCpuBusyOverride();
   if (override) return override;
   const file = paths(root).cpuSample;
@@ -145,6 +151,15 @@ export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0 } = {}
   const now = Date.now();
   const snapshot = { at: now, cpus: cpus.map(cpuTimes) };
   const { hostBusyCores, stale } = computeBusyCores(prev, snapshot);
+  let procRows = null;
+  if (preemptible && preemptible.niceMin > 0) {
+    try {
+      procRows = readProcs();
+    } catch {
+      procRows = null; // unreadable table: nothing is counted as preemptible
+    }
+    snapshot.procs = procSnapshot(procRows);
+  }
   const capacity = detectResourceCapacity({ parallelism: cpus.length });
   const measured = Number.isFinite(hostBusyCores) ? Math.min(hostBusyCores, capacity.cpuCores) : hostBusyCores;
   // BRAIN-346: the head and a backfill candidate now sample back to back, and os.cpus() counters
@@ -157,7 +172,12 @@ export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0 } = {}
   // about to become the persisted baseline, and carrying the old measurement over it would let a
   // repeat of the same bad counters match `countersUnchanged` and reuse a pre-fault figure.
   const unchanged = stale && countersUnchanged(prev, snapshot);
-  const lastValid = !stale && Number.isFinite(measured) ? { hostBusyCores: measured, cores: capacity.cpuCores, at: now } : unchanged ? prev.lastValid : undefined;
+  // What is cached is the per-process DELTAS (rows, nice, interval CPU, window), never the computed discount: the
+  // discount depends on the candidate's laneNice, the threshold and the held leases, so it is recomputed per caller.
+  const procWindow = !stale && preemptible && procRows && prev?.procs ? { rows: withDeltas(procRows, prev.procs), windowMs: now - prev.at } : null;
+  const discount = (window, opts, busy) => (window && opts && Number.isFinite(busy) ? Math.min(preemptibleCores({ ...window, ...opts }), busy) : 0);
+  const preemptibleBusyCores = discount(procWindow, preemptible, measured);
+  const lastValid = !stale && Number.isFinite(measured) ? { hostBusyCores: measured, cores: capacity.cpuCores, at: now, ...(procWindow ? { procWindow } : {}) } : unchanged ? prev.lastValid : undefined;
   if (lastValid) snapshot.lastValid = lastValid;
   try {
     const latest = readJsonSafe(file);
@@ -176,10 +196,11 @@ export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0 } = {}
     now - prev.lastValid.at >= 0 &&
     now - prev.lastValid.at < reuseWindowMs;
   if (reusable) {
-    return { hostBusyCores: prev.lastValid.hostBusyCores, cores: capacity.cpuCores, stale: false, reused: true, sampledAt: now, source: capacity.source };
+    return { hostBusyCores: prev.lastValid.hostBusyCores, preemptibleBusyCores: discount(prev.lastValid.procWindow, preemptible, prev.lastValid.hostBusyCores), cores: capacity.cpuCores, stale: false, reused: true, sampledAt: now, source: capacity.source };
   }
   return {
     hostBusyCores: measured,
+    preemptibleBusyCores,
     cores: capacity.cpuCores,
     stale,
     sampledAt: now,

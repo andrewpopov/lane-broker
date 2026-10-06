@@ -414,7 +414,7 @@ function cpus10(base, busy) {
     return { model: 'test', speed: 0, times: { user: total - idle, nice: 0, sys: 0, idle, irq: 0 } };
   });
 }
-const realSampler = (cpus) => (root, _cpus, opts) => sampleHostCpu(root, cpus, opts);
+const realSampler = (cpus) => (root, _cpus, opts) => sampleHostCpu(root, cpus, { ...opts, preemptible: null }); // hermetic: no real process table
 
 test('13: a back-to-back sample reuses the last valid measurement (real sampler path) and never becomes unavailable-then-admit', async () => {
   const { state } = freshEnv();

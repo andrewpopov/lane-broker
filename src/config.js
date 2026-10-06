@@ -24,6 +24,10 @@ export const DEFAULT_GLOBAL_CONFIG = {
   memoryCloseBytes: 4294967296,
   memoryOpenBytes: 8589934592,
   cpuReserveCores: 1,
+  // BRAIN-428: processes at nice >= preemptibleNiceMin are preemptible (the kernel runs a nice-0 lane ahead
+  // of them), so admission counts preemptibleShare of that load as available. 0 disables the feature.
+  preemptibleNiceMin: 1,
+  preemptibleShare: 0.8,
   memoryReserveBytes: 2147483648,
   defaultMemoryBytesPerWeight: 1073741824,
   schedulerMode: 'active',
@@ -172,6 +176,8 @@ function validateGlobalConfig(cfg, sourcePath) {
   assert(Number.isFinite(cfg.memoryOpenBytes) && cfg.memoryOpenBytes > 0, `${sourcePath}: "memoryOpenBytes" must be a positive number`);
   assert(cfg.memoryCloseBytes < cfg.memoryOpenBytes, `${sourcePath}: "memoryCloseBytes" must be less than "memoryOpenBytes"`);
   assert(Number.isFinite(cfg.cpuReserveCores) && cfg.cpuReserveCores >= 0, `${sourcePath}: "cpuReserveCores" must be a non-negative number`);
+  assert(Number.isInteger(cfg.preemptibleNiceMin) && cfg.preemptibleNiceMin >= 0 && cfg.preemptibleNiceMin <= 19, `${sourcePath}: "preemptibleNiceMin" must be an integer in [0, 19]`);
+  assert(Number.isFinite(cfg.preemptibleShare) && cfg.preemptibleShare >= 0 && cfg.preemptibleShare <= 1, `${sourcePath}: "preemptibleShare" must be a number in [0, 1]`);
   assert(Number.isFinite(cfg.memoryReserveBytes) && cfg.memoryReserveBytes >= 0, `${sourcePath}: "memoryReserveBytes" must be a non-negative number`);
   assert(
     Number.isFinite(cfg.defaultMemoryBytesPerWeight) && cfg.defaultMemoryBytesPerWeight > 0,

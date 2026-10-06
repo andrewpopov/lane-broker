@@ -105,6 +105,8 @@ never told to forward to it — both still get the `--log` file.
   "schedulerMode": "active",
   "cpuAdmissionPercent": 75,
   "cpuReserveCores": 1,
+  "preemptibleNiceMin": 1,
+  "preemptibleShare": 0.8,
   "memoryReserveBytes": 2147483648,
   "defaultMemoryBytesPerWeight": 1073741824,
   "loadClose": 15,
@@ -134,6 +136,29 @@ available memory. Legacy lanes without explicit resource values reserve one
 CPU core per weight unit and `defaultMemoryBytesPerWeight` bytes per weight
 unit. Set `schedulerMode` to `"shadow"` to log resource decisions without
 enforcing them.
+
+`preemptibleNiceMin` (default `1`; `0` disables) and `preemptibleShare`
+(default `0.8`, `0`-`1`): CPU spent by *lower-priority* processes does not stop
+a lane from starting, because the kernel runs the lane ahead of them. A
+process is preemptible only when its nice is STRICTLY GREATER than the nice the
+candidate lane will run at (its ticket's `nice`, else this host's `laneNice`)
+and at least `preemptibleNiceMin`; equal-nice load is a peer and counts in
+full. Each is measured by identity over the same window as the host busy
+sample: the sampler diffs every process's cumulative CPU time (Linux
+`/proc/<pid>/stat` utime+stime, macOS `ps time=`) against the previous reading
+keyed by pid plus start time, kept in the `cpu-sample.json` sidecar. A process
+with no previous reading, or a reused pid, contributes 0. Processes in a held
+lease's tree (process group, descendants, the BRAIN-419 recorded set) are never
+preemptible whatever their nice; if a held lease's tree is not known yet or the
+process table is unreadable, nothing is preemptible (fail closed). Admission
+(the CPU gate's busy percent, `externalBusy`, and the projected-over-budget
+check) uses `hostBusy - preemptibleShare * preemptibleBusy`, clamped to the
+busy figure; the share is a safety floor, so at 0.8 a fifth of lower-priority
+load still counts and a truly saturated host is never read as empty.
+`lane status` shows `host CPU: <busy> busy cores, <n> preemptible` from the
+last sample, and the admission log line carries `preemptibleBusy=` beside
+`hostBusyCores=` and `externalBusy=` whenever it is non-zero. `LANE_BROKER_CPU_BUSY_FILE` accepts an
+optional third field, `hostBusy,cores,preemptibleBusy`.
 
 `settledDemandEnabled` (default `true`): once a lease is settled (admitted at
 least `settledDemandSettleMs`, default 120000, ago, with a fresh observation
@@ -616,6 +641,11 @@ reason.
 - **Config** (runner machine's global config): `remoteDepsCache` (default
   `true`) and `remoteDepsCacheMaxBytes`. A lane's `remoteDepsCache: false`
   opts that lane out.
+- **Install locale** (BRAIN-429): the dependency install (`npm ci` and the
+  install-time checks) runs with every `LC_*` and `LANG` removed and `LC_ALL`
+  pinned to `C.UTF-8` (plain `C` on a host whose `locale -a` lacks it), and the
+  pinned value is hashed as `install-locale`, so submitters with different
+  locales share a key. The lane's own command still gets the submitter's locale.
 - **Observability**: the run logs `deps-cache hit|miss key=<12 hex> dir=<d>
   ms=<n>` (`skip` when caching is off or refused, with a reason), and the
   result and history row carry `depsCache` (`hit`, `miss` or `skip`) and

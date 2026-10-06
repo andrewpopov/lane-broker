@@ -471,6 +471,17 @@ test('the per-run TMPDIR path is recorded for relocation too', async () => {
   assert.deepEqual(recorded.prefixes.map((p) => p.roles), [['TMPDIR', 'TMP', 'TEMP']]);
 });
 
+test('runs submitted with different LC_ALL / LC_CTYPE / LANG share one key: the second is a hit (BRAIN-429)', async () => {
+  const s = setupWithNpmSpy();
+  const repoDir = makeGitWorktree(repoFiles());
+  const first = await runLane(s, repoDir, { env: { ...s.env, LC_ALL: 'en_US.UTF-8', LANG: 'en_US.UTF-8' } });
+  assert.equal(first.row.depsCache, 'miss');
+  const second = await runLane(s, repoDir, { env: { ...s.env, LC_ALL: undefined, LC_CTYPE: 'C', LANG: 'fr_FR.UTF-8' } });
+  assert.equal(second.code, 0, second.stderr);
+  assert.match(second.stderr, /deps-cache hit key=/);
+  assert.equal(s.storedKeys().length, 1);
+});
+
 test('SSH_AUTH_SOCK reaches the install (a git+ssh dependency needs it) but is not part of the key', async () => {
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(repoFiles());
