@@ -486,8 +486,11 @@ reason.
   nonce per entry in `meta.json`) where the install path was, and a restore
   replaces each token, as exact bytes, with the new path of its role (via a
   temp file renamed over the original with its mode kept; symlinks
-  re-created with the substituted target). It then verifies that no
-  recorded entry holds a token of that nonce, and that each held one. Roles
+  re-created with the substituted target). It then verifies that each
+  recorded entry held a token and that no file or symlink target anywhere in
+  the restored tree still holds a token of that nonce. At store time the
+  published copy is verified the same way before it is committed (each
+  recorded entry templated, no raw install path or token in any other file). Roles
   that shared a path at store time must still map to one path (else
   `relocation: ambiguous roles`), and every recorded role must exist. A
   failure discards the tree and installs normally, logging
@@ -518,8 +521,9 @@ reason.
     .prisma .txt .md .sh .yml .yaml` (or a `#!` script under `.bin/`):
     `reason=absolute-install-path-binary file=<rel>`;
   - an occurrence of an install path is not followed by a path terminator
-    (a slash, a quote, a backtick, `) ] } , ; : = \`, whitespace, or the end), or is glued to a
-    longer name before it: `reason=absolute-install-path-ambiguous
+    (a slash, a quote, a backtick, `) ] } , ; : = \`, whitespace, or the end), or is not
+    preceded by a path start (start of file, a quote, a backtick, whitespace, `= : ( [ { , ; \`;
+    so `/backup/runs/job` never counts as `/runs/job`): `reason=absolute-install-path-ambiguous
     file=<rel>`. Nothing is guessed.
 
   Every other tree that names an install path in text files or symlinks is
