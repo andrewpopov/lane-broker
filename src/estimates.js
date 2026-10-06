@@ -61,8 +61,15 @@ export function observeCensored(state, elapsedRefS) {
   return { ...state, n: state.n + 1, mu: Math.max(state.mu, Math.log(elapsedRefS)), censored: state.censored + 1 };
 }
 
-/** Re-express an estimator after the anchor moved (ref-s multiplied by `refScale`). */
-export const rescaleEstimator = (state, refScale) => (state.n === 0 ? state : { ...state, mu: state.mu + Math.log(refScale) });
+/**
+ * Re-express a work class's estimator after the anchor moved: multiply its ref-s by the rebase's `refScales[class][bucket]`
+ * for the bucket its CURRENT p50 falls in; a bucket the rebase left unanchored is not scaled.
+ */
+export function rescaleEstimator(state, workClass, refScales) {
+  if (state.n === 0) return state;
+  const scale = refScales[workClass]?.[bucketOf(p50Of(state))] ?? 1;
+  return { ...state, mu: state.mu + Math.log(scale) };
+}
 
 /* ---------- keys, cold start ---------- */
 
@@ -148,40 +155,52 @@ export function observeFactor(factors, host, workClass, estP50RefS, wallS, { cen
   const bucket = bucketOf(estP50RefS);
   const cell = factors[host]?.[workClass]?.[bucket];
   const observed = wallS / estP50RefS;
-  if (!cell) return setCell(factors, host, workClass, bucket, { factor: observed, n: 1 });
+  // a missing cell reads as the default 1, so a censored lower bound may only raise it
+  if (!cell) return setCell(factors, host, workClass, bucket, { factor: censored ? Math.max(1, observed) : observed, n: 1 });
   const bounded = clamp(observed, cell.factor * RATIO_MIN, cell.factor * RATIO_MAX);
   const next = censored ? Math.max(cell.factor, observed) : cell.factor + ALPHA * (bounded - cell.factor);
   return setCell(factors, host, workClass, bucket, { factor: next, n: cell.n + 1 });
 }
 
-const geoMean = (xs) => Math.exp(xs.reduce((s, x) => s + Math.log(x), 0) / xs.length);
+const geoMean = (xs) => Math.exp(xs.reduce((sum, x) => sum + Math.log(x), 0) / xs.length);
 const hostCells = (hostFactors) => Object.values(hostFactors ?? {}).flatMap((byBucket) => Object.values(byBucket).map((c) => c.factor));
+const cellsOf = (hostFactors) => Object.entries(hostFactors ?? {}).flatMap(([wc, byBucket]) => Object.keys(byBucket).map((b) => [wc, b]));
 
 /**
  * The 30-day anchor rule, pure. `calibratedAt` is { [host]: ms of its last calibration }. While the anchor has a
- * calibration within 30 days nothing changes. Otherwise the anchor becomes the median host (by geometric-mean factor,
- * among hosts calibrated within 30 days; the lower middle on a tie of counts) and every factor is rescaled ONCE so
- * that host reads 1.00. `refScale` is what stored ref-s estimates multiply by (see rescaleEstimator).
+ * calibration within 30 days nothing changes. Otherwise the anchor becomes the median host A (by geometric-mean factor,
+ * among hosts calibrated within 30 days) and, PER (class, bucket) cell A has: every host's factor is divided by
+ * factor_old[A] (a host with no cell there counts as the default 1, so the old anchor reads 1 / factor_old[A]), A's own
+ * cells become exactly 1 (A is pinned, so they are dropped), and `refScales[class][bucket] = factor_old[A]` is what stored
+ * ref-s estimates of that class and bucket multiply by (see rescaleEstimator). Predicted wall time ref-s x factor is
+ * thereby preserved cell by cell. A cell A lacks is left alone and listed in `unanchored` as [class, bucket]: no value is guessed.
  */
 export function rebaseAnchor({ factors, calibratedAt, anchor = ANCHOR_HOST, now }) {
+  const unchanged = { anchor, factors, refScales: {}, unanchored: [], moved: false };
   const fresh = (h) => isNum(calibratedAt[h]) && now - calibratedAt[h] <= ANCHOR_STALE_MS;
-  if (fresh(anchor)) return { anchor, factors, refScale: 1, moved: false };
+  if (fresh(anchor)) return unchanged;
   const candidates = Object.keys(factors)
     .filter((h) => h !== anchor && fresh(h) && hostCells(factors[h]).length > 0)
-    .map((h) => ({ host: h, scale: geoMean(hostCells(factors[h])) }))
-    .sort((a, b) => a.scale - b.scale || (a.host < b.host ? -1 : 1));
-  if (candidates.length === 0) return { anchor, factors, refScale: 1, moved: false };
-  const median = candidates[Math.floor((candidates.length - 1) / 2)];
-  const rescaled = {};
-  for (const [host, byClass] of Object.entries(factors)) {
-    if (host === anchor || host === median.host) continue;
-    rescaled[host] = Object.fromEntries(
-      Object.entries(byClass).map(([wc, byBucket]) => [wc, Object.fromEntries(Object.entries(byBucket).map(([b, c]) => [b, { ...c, factor: c.factor / median.scale }]))]),
-    );
+    .map((h) => ({ host: h, rank: geoMean(hostCells(factors[h])) }))
+    .sort((a, b) => a.rank - b.rank || (a.host < b.host ? -1 : 1));
+  if (candidates.length === 0) return unchanged;
+  const newAnchor = candidates[Math.floor((candidates.length - 1) / 2)].host;
+  const own = factors[newAnchor];
+  const refScales = {};
+  for (const [wc, byBucket] of Object.entries(own)) refScales[wc] = Object.fromEntries(Object.entries(byBucket).map(([b, c]) => [b, c.factor]));
+  const hosts = new Set([...Object.keys(factors), anchor]);
+  hosts.delete(newAnchor);
+  const rebased = {};
+  for (const host of hosts) {
+    let next = { ...factors[host] };
+    for (const [wc, b] of cellsOf(own)) {
+      const cur = factors[host]?.[wc]?.[b];
+      next = { ...next, [wc]: { ...next[wc], [b]: { factor: (cur?.factor ?? 1) / refScales[wc][b], n: cur?.n ?? 0 } } };
+    }
+    rebased[host] = next;
   }
-  // the old anchor was 1.00 on the old scale, so it is 1 / scale on the new one
-  rescaled[anchor] = { all: { all: { factor: 1 / median.scale, n: 0 } } };
-  return { anchor: median.host, factors: rescaled, refScale: median.scale, moved: true };
+  const unanchored = [...new Set([...hosts].flatMap((h) => cellsOf(factors[h]).filter(([wc, b]) => !own[wc]?.[b]).map(([wc, b]) => `${wc}/${b}`)))].sort().map((k) => k.split('/'));
+  return { anchor: newAnchor, factors: rebased, refScales, unanchored, moved: true };
 }
 
 /* ---------- overrun, remaining work ---------- */

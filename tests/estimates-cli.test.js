@@ -33,6 +33,10 @@ test('classifyRow: completed, censored (unrequested signal), and the ignored kin
   assert.equal(classifyRow(row({ startedAt: null })).why, 'never-started');
   assert.equal(classifyRow(row({ cancelled: true })).why, 'cancelled');
   assert.equal(classifyRow(row({ exit: 2 })).why, 'failed');
+  assert.equal(classifyRow(row({ exit: 124, command: 'npm test' })).why, 'failed');
+  for (const command of ['timeout 300 npm test', 'gtimeout -k 5 300 npm test', 'env CI=1 timeout 300 npm test']) {
+    assert.deepEqual(classifyRow(row({ exit: 124, command })), { kind: 'censored', wallS: 100 }, command);
+  }
   assert.equal(classifyRow(row({ runMs: 7000 })).wallS, 7);
 });
 

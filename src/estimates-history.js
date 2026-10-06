@@ -12,9 +12,12 @@ import { readRows } from './suggest.js';
 export const workClassOf = (row) => (row.class === 'sim' || (row.class === undefined && /(^|[-_:.])sims?($|[-_:.0-9])/i.test(row.lane ?? '')) ? 'sim' : 'test');
 
 
+/** `timeout`/`gtimeout` (optionally after `env [VAR=x ...]`) exits 124 when it kills its child: a timeout with no signal on the row. */
+const TIMEOUT_WRAPPER = /^\s*(?:env\s+(?:-\S+\s+|\w+=\S*\s+)*)?g?timeout\b/;
+
 /**
  * How a row counts: `ignored` (never started, cancelled, or failed on its own: a fast failure says nothing about
- * duration), `censored` (killed by a signal it did not ask for: a lower bound), `completed` (exit 0), with its wall seconds.
+ * duration), `censored` (killed by a signal it did not ask for, or a `timeout` wrapper's exit 124: a lower bound), `completed` (exit 0), with its wall seconds.
  */
 export function classifyRow(row) {
   if (!row || typeof row !== 'object' || !row.repo || !row.lane) return { kind: 'ignored', why: 'malformed' };
@@ -22,7 +25,7 @@ export function classifyRow(row) {
   if (row.cancelled === true) return { kind: 'ignored', why: 'cancelled' };
   const wallS = Number.isFinite(row.runMs) && row.runMs > 0 ? row.runMs / 1000 : (row.endedAt - row.startedAt) / 1000;
   if (!(wallS > 0)) return { kind: 'ignored', why: 'no-duration' };
-  if (row.signal) return { kind: 'censored', wallS };
+  if (row.signal || (row.exit === 124 && TIMEOUT_WRAPPER.test(row.command ?? ''))) return { kind: 'censored', wallS };
   if (row.exit === 0) return { kind: 'completed', wallS };
   return { kind: 'ignored', why: 'failed' };
 }
