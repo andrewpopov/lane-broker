@@ -1198,6 +1198,10 @@ symlinks.
   kernel-held on Linux (the production hosts): the process binds an abstract Unix socket named after the store root, so a
   second owner gets `EADDRINUSE` and a dead process (even SIGKILL) frees it instantly, with no stale state. On macOS
   (dev and tests only) it is a best-effort link-created `store.lock` plus a per-write self-check fence (`LockLostError`).
+  The file lock refuses to run on Linux, and only `ObjectStore.open` constructs a store, so each platform has one lock
+  mechanism. The lock guards against concurrent processes using the entry points (`lane-store serve`, the CLI); the
+  internal classes (`ObjectStore` with a hand-built lock, `Journal`) are not a security boundary against code that sets
+  out to bypass it.
   An offline tool (`rebuild-watermark`) takes the same lock and refuses while a server holds it. At open the journal is fsynced before it becomes readable.
   `replicated_seq` (`replication.json`, `{format: 2, seq, offset, ...}`) advances only after the replica's own check matches.
   Metric `oldest_unreplicated_object_age_seconds` (plus `lane_store_replicated_seq`, `_journal_head_seq`,

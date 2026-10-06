@@ -153,11 +153,11 @@ test('N11 only ObjectStore.open builds a store: a bare constructor (which would 
   }
 });
 
-test('N11 the file lock refuses on Linux, so a hand-made file lock cannot sit beside the kernel-held lock', async () => {
+test('N11 the file lock refuses on Linux, so a hand-made file lock cannot sit beside the kernel-held lock', { skip: process.platform === 'linux' ? false : 'Linux-only; run on wintop' }, async () => {
   const { acquireStoreLock } = await import('../src/store/lock.js');
   const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'lane-store-flock-'));
   try {
-    assert.throws(() => acquireStoreLock(root, 'linux'), /fallback only/);
+    assert.throws(() => acquireStoreLock(root), /fallback only/);
     assert.equal(fs.existsSync(path.join(root, 'store.lock')), false);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
