@@ -89,19 +89,22 @@ export function scenarios(m) {
   return {
     // A resource-denied head backfilled past (resource skip counter + reservation latch), mixed classes.
     resource: [
+      // BRAIN-418: lane load (an unobserved 2-core lease) plus 3.4 ambient reproduces the old 5.4 arithmetic, but now the
+      // head is blocked by LANE load and its reservation can matter; with ambient load alone it would be futile.
+      { lease: heldLease(m, 'lane', 'r:lane', 2) },
       { enqueue: head },
       { enqueue: sim('s1') },
       { enqueue: ticket('t1') },
       { enqueue: sim('s2', 2) },
       { enqueue: ticket('t2', { weight: 2 }) },
-      { poll: sim('s1'), ext: 5.4 },
-      { poll: head, ext: 5.4 },
-      { poll: sim('s1'), ext: 5.4 },
-      { poll: ticket('t1'), ext: 5.4 },
-      { poll: head, ext: 5.4 },
-      { poll: sim('s2', 2), ext: 5.4 },
-      { poll: ticket('t2', { weight: 2 }), ext: 5.4 },
-      { poll: head, ext: 5.4 },
+      { poll: sim('s1'), ext: 3.4 },
+      { poll: head, ext: 3.4 },
+      { poll: sim('s1'), ext: 3.4 },
+      { poll: ticket('t1'), ext: 3.4 },
+      { poll: head, ext: 3.4 },
+      { poll: sim('s2', 2), ext: 3.4 },
+      { poll: ticket('t2', { weight: 2 }), ext: 3.4 },
+      { poll: head, ext: 3.4 },
       { release: 't1' },
       { poll: head, ext: 0 },
     ],

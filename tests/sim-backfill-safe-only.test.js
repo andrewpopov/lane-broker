@@ -97,15 +97,33 @@ test('capacity skip: a sim ticket is stepped over so a LATER test ticket still b
 test('resource skip: a test ticket backfills a CPU-denied head, a sim ticket does not and spends no allowance', async () => {
   for (const [klass, expected] of [['test', true], ['sim', false]]) {
     const { state } = freshEnv();
+    // BRAIN-418: the head must be blocked by LANE load (2-core lease + 3.4 ambient + 4-core head = 9.4 > 9); blocked by
+    // ambient load alone it would be futile, and a futile head spends no allowance.
+    writeLease(state, heldLease('lane-load', 'lane:load', 2));
     const head = ticket('head', { weight: 4 });
     const behind = ticket('behind', { class: klass });
     await enqueue(state, head);
     await enqueue(state, behind);
-    const denied = await poll(state, head, baseCfg(), 5.4);
+    const denied = await poll(state, head, baseCfg(), 3.4);
     assert.equal(denied.cpuReason, 'projected-over-budget', 'the head is denied and records the allowance');
-    const result = await poll(state, behind, baseCfg(), 5.4);
+    const result = await poll(state, behind, baseCfg(), 3.4);
     assert.equal(result.started, expected, `${klass}: ${JSON.stringify(result)}`);
     assert.equal(readResourceSkipState(state).count, expected ? 1 : 0);
+  }
+});
+
+test('futile resource head (ambient 7 + 4-core head > budget 9): a test ticket backfills, a sim ticket stays safe-only', async () => {
+  for (const [klass, expected] of [['test', true], ['sim', false]]) {
+    const { state } = freshEnv();
+    const head = ticket('head', { weight: 4 });
+    const behind = ticket('behind', { class: klass });
+    await enqueue(state, head);
+    await enqueue(state, behind);
+    await poll(state, head, baseCfg(), 7);
+    assert.equal(readResourceSkipState(state).futile, 'cpu', 'the head is futile');
+    const result = await poll(state, behind, baseCfg(), 7);
+    assert.equal(result.started, expected, `${klass}: ${JSON.stringify(result)}`);
+    if (!expected) assert.equal(result.reason, 'cpu-admission', 'a sim only ever goes through safe backfill, which reserves the head\'s claim: 7 + 4 + 1 > 9');
   }
 });
 

@@ -602,6 +602,21 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   return { exitCode: 0 };
 }
 
+/**
+ * BRAIN-405: this host's real free CPU and memory. CPU is the budget minus the larger of the cores its leases reserve and its
+ * 1-minute load average (which also sees load the broker did not admit); read-only, so it never disturbs admission's CPU
+ * baseline. Memory is what the OS reports available minus the broker's reserve. Null when the budgets are not enforced
+ * (shadow mode) or the measurement is missing: the client then treats the runner as having room, as it does for capacity.
+ */
+export function probeHeadroom(resources, cfg, enforced, loadAvg1 = os.loadavg()[0]) {
+  if (!enforced || !resources) return null;
+  const busy = Math.max(Number.isFinite(resources.reservedCpuCores) ? resources.reservedCpuCores : 0, Number.isFinite(loadAvg1) ? loadAvg1 : 0);
+  return {
+    cpuCores: Math.max(0, resources.cpuBudgetCores - busy),
+    memoryBytes: Number.isFinite(resources.availableMemoryBytes) ? Math.max(0, resources.availableMemoryBytes - cfg.memoryReserveBytes) : null,
+  };
+}
+
 /** `lane remote-probe`: one JSON line describing this host's local broker,
  *  reusing status.js's own reader rather than a second implementation. */
 export async function remoteProbeCommand({ root = defaultRemoteRoot() } = {}) {
@@ -635,6 +650,8 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot() } = {}) {
     running: status.running.length,
     // BRAIN-360: additive; the CPU the runner's leases are charged (grants, not declarations)
     reservedCpuCores: status.resources?.reservedCpuCores,
+    // BRAIN-405: what a new ticket could be given RIGHT NOW (unlike `capacity`, which is static); null where unmeasurable
+    headroom: probeHeadroom(status.resources, globalCfg, enforced),
     capacity: {
       weight: effectiveWeightCapacity(globalCfg, host.cpuCores),
       cpuCores: enforced ? cpuBudgetCores(host, globalCfg) : null,

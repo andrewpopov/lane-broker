@@ -113,6 +113,45 @@ export function runWithDeadline(cmdBin, argv, deadlineMs, env, maxCaptureBytes =
   });
 }
 
+/** The CPU a runner must be able to give this ticket: the elastic floor only on a runner that admits below the declared claim. */
+function cpuNeedOf(reservation, probe) {
+  const elastic = Array.isArray(probe.capabilities) && probe.capabilities.includes(ELASTIC_CLAIMS_CAPABILITY);
+  return elastic && Number.isFinite(reservation.minCpuCores) ? reservation.minCpuCores : reservation.cpuCores;
+}
+
+/**
+ * BRAIN-405: true iff the runner has REAL room for this ticket right now: free CPU (the probe's measured `headroom`, else its
+ * CPU budget minus reserved) covers the ticket's CPU (its elastic floor on an elastic runner) and available memory covers its
+ * memory. An unmeasured figure never counts against a runner (an older probe or shadow mode degrades to "assume room").
+ * Returns `{ room, cpuFree }`; `cpuFree` ranks runners that tie.
+ */
+export function runnerRoom(reservation, probe) {
+  const headroom = probe.headroom && typeof probe.headroom === 'object' ? probe.headroom : null;
+  let cpuFree = headroom && Number.isFinite(headroom.cpuCores) ? headroom.cpuCores : null;
+  if (cpuFree === null && Number.isFinite(probe.capacity?.cpuCores) && Number.isFinite(probe.reservedCpuCores)) {
+    cpuFree = Math.max(0, probe.capacity.cpuCores - probe.reservedCpuCores);
+  }
+  const cpuNeed = cpuNeedOf(reservation, probe);
+  if (cpuFree !== null && Number.isFinite(cpuNeed) && cpuNeed > cpuFree) return { room: false, cpuFree, reason: `no CPU headroom (${cpuFree.toFixed(2)} free, need ${cpuNeed})` };
+  const memFree = headroom && Number.isFinite(headroom.memoryBytes) ? headroom.memoryBytes : null;
+  if (memFree !== null && Number.isFinite(reservation.memoryBytes) && reservation.memoryBytes > memFree) {
+    return { room: false, cpuFree, reason: `no memory headroom (${memFree} bytes available, need ${reservation.memoryBytes})` };
+  }
+  return { room: true, cpuFree };
+}
+
+/**
+ * BRAIN-405: estimated finish on this runner, in cpu-core-units of work: the ticket's own cores, once for each ticket already
+ * queued ahead of it and once for itself, divided by the runner's configured `speedFactor` (higher is faster, default 1).
+ * Deliberately simple: it orders runners, it is not a prediction.
+ */
+export function estimatedFinish(reservation, probe, runner) {
+  const work = Number.isFinite(reservation?.cpuCores) && reservation.cpuCores > 0 ? reservation.cpuCores : 1;
+  const queued = Number.isInteger(probe.queued) && probe.queued > 0 ? probe.queued : 0;
+  const speed = Number.isFinite(runner.speedFactor) && runner.speedFactor > 0 ? runner.speedFactor : 1;
+  return ((queued + 1) * work) / speed;
+}
+
 /**
  * BRAIN-320 S1e: true iff `probe.capacity` proves this ticket can NEVER be
  * admitted on this runner -- a STATIC impossibility check using the same
@@ -127,8 +166,7 @@ function neverFits(reservation, probe) {
   const { weight, memoryBytes } = reservation;
   // BRAIN-360: only a runner that advertises elastic claims will admit below the declared claim; any
   // other runner is dispatched the full claim and refuses it (exit 64) if its budget is smaller.
-  const elastic = Array.isArray(probe.capabilities) && probe.capabilities.includes(ELASTIC_CLAIMS_CAPABILITY);
-  const cpuCores = elastic && Number.isFinite(reservation.minCpuCores) ? reservation.minCpuCores : reservation.cpuCores;
+  const cpuCores = cpuNeedOf(reservation, probe);
   if (Number.isFinite(capacity.weight) && Number.isFinite(weight) && weight > capacity.weight) return true;
   if (Number.isFinite(capacity.cpuCores) && Number.isFinite(cpuCores) && cpuCores > capacity.cpuCores) return true;
   if (
@@ -143,12 +181,10 @@ function neverFits(reservation, probe) {
 }
 
 /**
- * Probe every configured runner SEQUENTIALLY, in preference order (BRAIN-319
- * C8), returning the first usable one -- exit 0, protocol usable, not
- * `paused`, `queued === 0`, and (1e) statically able to fit the ticket -- as
- * `{runner, probe, skipped}` (any earlier candidates passed over on the way
- * to it), or `{runner: null, skipped}` naming why every candidate was passed
- * over. `opts.deadlineMs` (default 6000) bounds each individual probe; a
+ * Probe every configured runner SEQUENTIALLY (BRAIN-319 C8), returning the best usable one -- exit 0, protocol usable, not
+ * `paused`, `queued === 0`, (1e) statically able to fit the ticket, and (BRAIN-405) with real headroom now (`runnerRoom`) --
+ * as `{runner, probe, skipped}`, or `{runner: null, skipped}` naming why every candidate was passed over. Among usable
+ * runners the earliest `estimatedFinish` wins, then the most free CPU, then config order. `opts.deadlineMs` (default 6000) bounds each individual probe; a
  * probe that hangs past it is SIGKILLed and counted as a skip, never as a
  * hang for the whole selection.
  *
@@ -180,7 +216,11 @@ export async function selectRunner(runners, opts = {}) {
   const sshBin = opts.sshBin ?? 'ssh';
   const { env, requireProtocol2 = false, reservation, maxRemoteQueue = 0 } = opts;
   const skipped = [];
+  // BRAIN-405: every runner is probed, then the idle one with real room and the earliest estimated finish wins (ties: more
+  // free CPU, then config order). A runner with an empty queue but no headroom is not idle, however empty its queue.
+  let idleBest = null;
   let queuedBest = null;
+  const better = (cand, best) => !best || cand.finish < best.finish || (cand.finish === best.finish && cand.cpuFree > best.cpuFree);
   for (const runner of runners) {
     const cmd = buildRemoteCommand(runner, 'remote-probe');
     const res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
@@ -220,16 +260,26 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason: `queued: ${probe.queued}${overCap ? ` (over maxRemoteQueue ${maxRemoteQueue})` : ''}` });
       const fits = !(reservation && neverFits(reservation, probe));
       const queueable = Number.isInteger(probe.queued) && probe.queued > 0 && probe.queued <= maxRemoteQueue;
-      if (fits && queueable && (!queuedBest || probe.queued < queuedBest.probe.queued)) queuedBest = { runner, probe };
+      if (fits && queueable) {
+        const cand = { runner, probe, finish: estimatedFinish(reservation, probe, runner), cpuFree: 0 };
+        if (!queuedBest || cand.probe.queued < queuedBest.probe.queued || (cand.probe.queued === queuedBest.probe.queued && better(cand, queuedBest))) queuedBest = cand;
+      }
       continue;
     }
     if (reservation && neverFits(reservation, probe)) {
       skipped.push({ name: runner.name, reason: 'runner capacity can never fit this ticket' });
       continue;
     }
-    return { runner, probe, skipped };
+    const { room, cpuFree, reason } = reservation ? runnerRoom(reservation, probe) : { room: true, cpuFree: 0 };
+    if (!room) {
+      skipped.push({ name: runner.name, reason });
+      continue;
+    }
+    const cand = { runner, probe, finish: estimatedFinish(reservation, probe, runner), cpuFree };
+    if (better(cand, idleBest)) idleBest = cand;
   }
-  if (queuedBest) return { ...queuedBest, skipped, queuedChoice: true };
+  if (idleBest) return { runner: idleBest.runner, probe: idleBest.probe, skipped };
+  if (queuedBest) return { runner: queuedBest.runner, probe: queuedBest.probe, skipped, queuedChoice: true };
   return { runner: null, skipped };
 }
 
@@ -520,7 +570,8 @@ export async function remoteCancel(runner, ticketId, { sshBin = 'ssh', deadlineM
 /**
  * Dispatch one lane run to `runner` over ssh and resolve to exactly one of
  * `{outcome:'ineligible'|'confirmed'|'unconfirmed'|'cancelled', ...}`
- * (BRAIN-319 I1/C6). Never throws for a remote/transport failure -- only a
+ * (BRAIN-319 I1/C6). `neverStarted: true` (BRAIN-405) marks an ineligible/unconfirmed outcome that proves the runner never
+ * began the job (nothing, or only part of the snapshot, was sent); any other unconfirmed outcome may have a live job behind it. Never throws for a remote/transport failure -- only a
  * genuinely unexpected local error (not `RemoteIneligibleError`) from
  * `buildManifest` propagates.
  *
@@ -598,7 +649,7 @@ export async function dispatchRemote(opts) {
     try {
       manifest = buildManifest(worktreeRoot);
     } catch (err) {
-      if (err instanceof RemoteIneligibleError) return { outcome: 'ineligible', reason: err.message };
+      if (err instanceof RemoteIneligibleError) return { outcome: 'ineligible', reason: err.message, neverStarted: true };
       throw err;
     }
   }
@@ -643,6 +694,7 @@ export async function dispatchRemote(opts) {
     return {
       outcome: 'ineligible',
       reason: `snapshot header is ${headerBytes} bytes, over the runner limit of ${MAX_HEADER_BYTES} (too many files)`,
+      neverStarted: true,
     };
   }
 
@@ -671,7 +723,8 @@ export async function dispatchRemote(opts) {
   }
 
   if (!pipeResult.ok) {
-    return { outcome: 'unconfirmed', reason: pipeResult.reason };
+    // BRAIN-405: the snapshot was never completely sent, and a runner runs nothing before it has received and verified all of it
+    return { outcome: 'unconfirmed', reason: pipeResult.reason, neverStarted: true };
   }
 
   const expected = { protocol, ticketId, generation, manifestHash: manifest.manifestHash };

@@ -284,7 +284,7 @@ without `remote: true`, nothing changes.
 // ~/.config/lane-broker/config.json (the client machine)
 "runners": [
   { "name": "skybox", "ssh": "skybox-runner" },
-  { "name": "grandy", "ssh": "mac-grandy", "shell": "zsh -lc" }
+  { "name": "grandy", "ssh": "mac-grandy", "shell": "zsh -lc", "speedFactor": 0.5 }
 ]
 ```
 
@@ -307,7 +307,8 @@ is also passed.
 `ssh` is an ssh destination (an alias from `~/.ssh/config`, or
 `ssh://user@host:port`); it may not start with `-`. `shell` (default
 `bash -lc`) wraps every remote command so a non-interactive ssh finds
-`node` and `lane`. `root` (default `~/.cache/lane-broker/remote` on the
+`node` and `lane`. `speedFactor` (BRAIN-405, positive number, default `1`, higher is
+faster) scales this runner's estimated finish when several runners have room. `root` (default `~/.cache/lane-broker/remote` on the
 runner) holds per-ticket work dirs. A runner has no `runners` of its own.
 
 What a remote run does:
@@ -321,17 +322,28 @@ What a remote run does:
    serialized file list (the snapshot's header line) is capped at ~16 MB —
    roughly 90k files — checked locally before dialing ssh; a larger tree
    stays local with that reason.
-2. **Pick a runner**: probe each in config order (`lane remote-probe`, 6 s
-   hard deadline) and take the first that is reachable, speaks the protocol
-   the lane needs (below), is not paused, has no queue, and could ever fit
-   the lane's reservation (weight, CPU budget, memory plus its reserve, from
-   the runner's static capacity — never its momentary load). None → local.
+2. **Pick a runner**: probe every runner (`lane remote-probe`, 6 s hard
+   deadline each) and keep those that are reachable, speak the protocol the
+   lane needs (below), are not paused, have no queue, could ever fit the
+   lane's reservation (weight, CPU budget, memory plus its reserve, from the
+   runner's static capacity) **and have real room right now**: the probe's
+   `headroom` (its CPU budget minus the larger of the cores its leases reserve
+   and its 1-minute load average, so load the broker did not admit counts;
+   available memory minus the memory reserve) covers the ticket's CPU (its
+   elastic floor on a runner that admits below the declared claim) and memory.
+   A figure the probe does not report never counts against a runner. A runner
+   with an empty queue and no headroom is not chosen. Among the rest the
+   earliest estimated finish wins: `(queued + 1) × the ticket's cpuCores ÷
+   the runner's speedFactor` (a `runners[]` field, positive number, default
+   `1`, higher is faster); a tie goes to the runner with more free CPU, then
+   config order. None → local.
    If no runner is idle, the usable runner with the fewest queued tickets
-   (ties: config order) is taken **only if** it has at most `maxRemoteQueue`
+   (ties: estimated finish, then config order) is taken **only if** it has at most `maxRemoteQueue`
    queued (global config, integer >= 0, default `2`; `0` = never queue on a
    runner) **and** this machine could not start the ticket right now either
    (its queue is non-empty, or a conflict, capacity, pause, load-gate,
    cooldown or memory check refuses it); otherwise the run stays local.
+   A runner with room always beats any runner queue.
    A run queued this way records `queuedAt: "<runner>(<queued at pick time>)"`
    in its result and attempt record and logs `lane: queuing on ...`. The
    local check reaps stale records like every admission poll but never
@@ -341,6 +353,38 @@ What a remote run does:
    the persisted gate without sampling, so a gate one low-load sample from
    reopening reads closed and the ticket may queue remotely instead of
    starting locally.
+
+   **Late rebinding (BRAIN-405).** A ticket that falls back to this
+   machine's queue only because no runner had room keeps its eligibility
+   (`remote.fallback: {reason, at}` on its queue record). While it is still
+   queued, its own supervisor re-probes the runners every
+   `remoteRebindIntervalMs` (global config, integer >= 0, default `30000`; `0`
+   disables). When one has room it withdraws the ticket from the local queue
+   in one locked step shared with the scheduler's own admission, so exactly
+   one of the two takes it (a started, cancelled or already-gone ticket is
+   never withdrawn), then dispatches as above, logging
+   `lane: remote-rebind: <id>: seq <n> -> <runner>` to the admission log.
+   The withdrawal is two-phase: the queue file is renamed to
+   `<seq>-<id>.json.rebinding` (no listing reads it, and the scheduler keeps
+   the ticket's fairness records for it) and the attempt records
+   `rebinding`. If the supervisor dies before the dispatch is recorded in the
+   attempt, the next stale-record reap puts the ticket back at its original
+   seq; if it dies after, the attempt is the remote attempt to reconcile
+   (ORPHANED-REMOTE) and the parked record is dropped.
+   Only a proof that the runner never started the job puts the ticket back
+   in the local queue **at its original sequence number** (`remote-rebind: …
+   stays in the local queue at seq <n>`): a snapshot never completely sent,
+   or the runner's confirmed preflight refusal (exit 64). Any other outcome
+   that may have started it (ssh dropped and the result cannot be fetched)
+   is **not** re-run locally, unlike a first dispatch: the supervisor logs
+   `outcome unknown`, exits 1, and leaves the attempt with its runner so
+   `lane status` shows it, `lane wait` names it and `lane cancel` cancels it
+   on the runner. A running ticket never moves. Never rebound:
+   `--local`, `LANE_BROKER_LOCAL=1`, an inherited lease, a lane that is not
+   `remote`, and a ticket that fell back for any reason other than "no runner
+   had room" (an ineligible tree, a `remoteDeps` failure, a dispatch that
+   failed after sending).
+
 3. **Send a snapshot**, not history: a framed stream of exactly the listed
    files. Each file is re-read without following symlinks and its sha256
    checked before its bytes are sent. The runner validates every frame
@@ -480,7 +524,21 @@ reason.
 - **Hit**: the stored tree is COPIED into the work dir (a reflink where the
   filesystem has them), as private writable files, so nothing a lane does to
   its tree can reach the store. The store itself is read-only. The copy is
-  slower than a hardlink farm and is the price of that isolation. `npm ci`
+  slower than a hardlink farm and is the price of that isolation. Recorded
+  install paths are then substituted: the stored copy of each recorded
+  file holds placeholder tokens (`@@LANE_PREFIX_<roles>_<nonce>@@`, the
+  nonce per entry in `meta.json`) where the install path was, and a restore
+  replaces each token, as exact bytes, with the new path of its role (via a
+  temp file renamed over the original with its mode kept; symlinks
+  re-created with the substituted target). It then verifies that each
+  recorded entry held a token and that no file or symlink target anywhere in
+  the restored tree still holds a token of that nonce. At store time the
+  published copy is verified the same way before it is committed (each
+  recorded entry templated, no raw install path or token in any other file). Roles
+  that shared a path at store time must still map to one path (else
+  `relocation: ambiguous roles`), and every recorded role must exist. A
+  failure discards the tree and installs normally, logging
+  `deps-cache materialize failed, installing instead: relocation: ...`. `npm ci`
   is skipped, so the allowlisted root scripts (whose effect is on the work
   dir's `.git/config`, not on `node_modules`) are REPLAYED, in npm's order,
   by calling npm's own `@npmcli/run-script` the way `lib/commands/ci.js`
@@ -501,9 +559,33 @@ reason.
   - npm's own record (`node_modules/.package-lock.json`) lacks a lock entry
     that applies to this platform (`os`, `cpu`, `libc`), as when npm skips an
     optional dependency: `reason=incomplete-optional missing=<names>`;
-  - any installed file or symlink target contains the absolute work-dir path
-    (every file is scanned, large ones in chunks): the tree would only work
-    where it was installed. `reason=absolute-install-path file=<rel>`.
+  - a file names an install path (the work dir, its real path or a per-run
+    temp dir) and is not rewritable text: it has a NUL byte, is not valid
+    UTF-8, or its extension is not one of `.js .cjs .mjs .ts .json .map
+    .prisma .txt .md .sh .yml .yaml` (or a `#!` script under `.bin/`):
+    `reason=absolute-install-path-binary file=<rel>`;
+  - an occurrence of an install path is not followed by a path terminator
+    (`/`, a quote, a backtick, `) ] }`, whitespace, or the end), or is not preceded by a path
+    start (start of file, a quote, a backtick, whitespace, `( [ {`), so `/backup/runs/job` and
+    `/backup:/runs/job` never count as `/runs/job`; file-name-legal bytes such as `: = ; , \`
+    on either side make the tree ambiguous: `reason=absolute-install-path-ambiguous
+    file=<rel>`. A symlink target counts only when it is the install path or starts with it
+    plus `/`.
+
+    **Accepted residual:** only `/` and NUL are illegal in file names, so no byte rule can
+    prove that `"/backup /runs/job/x"` names the install path rather than a directory called
+    `backup ` (trailing space). The prefixes matched are the run's own per-ticket paths
+    (`.../remote/tickets/<id>/work` and its temp dirs), which text only contains when it was
+    generated from that path, so this case cannot arise from content not written for that run.
+
+  Every other tree that names an install path in text files or symlinks is
+  published anyway (conda-style relocation, what Prisma's generated client
+  needs): the decision is made once, here, against the original tree. Each
+  occurrence in the stored copy becomes a placeholder token, and the places
+  are recorded in `meta.json` (`relocation`: `nonce`, `prefixes` as
+  `{ roles, path }` with roles sharing a path in one group, `entries` as
+  `{ relPath, kind: text | symlink }`). Every file is scanned, large ones in
+  chunks; a fresh nonce is drawn if the tree already holds the token text.
 
   The run still uses its own tree in every case, and the log says why.
 - **Leases and eviction**: least recently used first, whenever a publish or a
@@ -1069,6 +1151,24 @@ selection does not change. If the remote attempt falls back to local, the local 
 logged. Tier and rank describe what the scheduler saw. They cannot show how much time a tier saved anyone, and
 nothing here claims it: compare wait distributions by tier, and do not read a causal effect into them.
 
+### Estimates engine and `lane estimates` (BRAIN-408 slice A)
+
+`src/estimates.js` is the pure estimates engine of the unified queue (spec 5.7): per-key EWMA
+(alpha 0.1, ratio winsorised to [0.2, 5]) over `ln(ref-s)`, censored runs (signal kills,
+timeouts) that can only raise an estimate, the cold-start chain (exact, no-code-family,
+no-arm-set, no-through-act, runner-wide, class-default; sigma x1.5 per step), speed factors
+per host, work class and bucket (mac-grandy pinned at 1.00; `rebaseAnchor` moves the anchor
+after 30 days uncalibrated), overrun residuals and per-bucket remaining-work conversion.
+The first observation's sigma is 0.6 (p90 about 2.2x p50). It does no I/O and nothing reads
+it yet.
+
+`lane estimates [--json] [--root <stateHome>]` folds `history.jsonl` through it, read-only,
+keyed by (repo, lane): n, censored count, p50/p90 (seconds), `est_source` and the p90 of
+`observedRssPeakBytes`. A row that never started, was cancelled or failed on its own is
+skipped (counted); a run killed by an unrequested signal is censored. History rows carry no
+class, so a lane named like a sim (`sim`, `sims`, `sim-*`) is a sim, else a test. The host
+factor is 1.0 (no calibration) and is printed.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -1176,6 +1276,61 @@ symlinks.
   window between an expiry being recorded and the expiry being finalized
   (BRAIN-320 review fix B: a cancel that lands in that window must still win
   over the expiry).
+
+## `lane-store` (BRAIN-407, unified queue P0b)
+
+`bin/lane-store.js` is the content-addressed snapshot store behind detached submit (spec `.spec/unified-queue-spec-rev11.md`
+8.1-8.3, 9.3). Zero dependencies (`http`, `crypto`); code in `src/store/`; systemd templates (not installed) in `ops/lane-store/`.
+
+- **Objects.** Blobs live at `blobs/ab/cd/<sha256>`: streamed to `tmp/`, hashed while written, refused on mismatch or over
+  `--max-blob-bytes`, fsynced, renamed, then journaled. A re-upload is hash-checked and deduplicated, never overwritten.
+  Job manifests (`manifests/<job>.json`, immutable per job, every referenced blob must already be stored) register the file list.
+- **Reads are job-scoped.** A `read` token carries `job`; it may fetch only that job's manifest and the blobs it references.
+  Tokens are verified by a pluggable `verifier` (`createStore({verifier})`); `src/store/auth.js` is an HMAC stand-in
+  (`LANE_STORE_SECRET`) until the DB-backed principal check lands. Roles: `submit`, `read`, `replica`, `admin`.
+- **Receiver.** `materializeSnapshot` (`src/store/materialize.js`) replays the blobs as the same framed stream a remote runner
+  gets, so path/symlink/hash refusal is `remote-manifest.js` / `remote-stream.js`, not a second implementation.
+- **Replication runs inside the primary.** `serve --replicate-to URL` (token `LANE_STORE_REPLICA_TOKEN`, role `replica`)
+  starts a loop in the serving process, one round every `--replicate-interval-s` (default 300). It ships `journal.log`
+  records in `seq` order over HTTP (the replica is a second lane-store; it hash-verifies on write and again on
+  `GET /verify/<path>`, which re-reads its own disk), reading the journal only through the in-memory committed view.
+  Nothing outside the serving process reads the journal while it runs (no marker file). Exclusive ownership is
+  kernel-held on Linux (the production hosts): the process binds an abstract Unix socket named after the store root, so a
+  second owner gets `EADDRINUSE` and a dead process (even SIGKILL) frees it instantly, with no stale state. On macOS
+  (dev and tests only) it is a best-effort link-created `store.lock` plus a per-write self-check fence (`LockLostError`).
+  The file lock refuses to run on Linux, and only `ObjectStore.open` constructs a store, so each platform has one lock
+  mechanism. The lock guards against concurrent processes using the entry points (`lane-store serve`, the CLI); the
+  internal classes (`ObjectStore` with a hand-built lock, `Journal`) are not a security boundary against code that sets
+  out to bypass it.
+  An offline tool (`rebuild-watermark`) takes the same lock and refuses while a server holds it. At open the journal is fsynced before it becomes readable.
+  `replicated_seq` (`replication.json`, `{format: 2, seq, offset, ...}`) advances only after the replica's own check matches.
+  Metric `oldest_unreplicated_object_age_seconds` (plus `lane_store_replicated_seq`, `_journal_head_seq`,
+  `_replication_failed_rounds`, `_lost_objects`, `_bytes`) is served live at `GET /metrics`. `lane-store compare [--deep]
+  [--repair] --url URL` (weekly timer) asks the running primary to compare itself with its replica (`POST /admin/compare`);
+  exit 2 on divergence or a lost object. An unrecognised `replication.json` refuses to start: recompute it offline with
+  `lane-store rebuild-watermark --root DIR --seq N`.
+- **Lost objects.** Retention deletes in three durable steps: `delete-intent`, unlink, `delete`. At startup an object that is
+  missing with an intent gets its `delete` journaled (interrupted retention). An object missing with NO intent is a loss:
+  it is never tombstoned (that would delete the replica's intact copy), replication of that path blocks, and it is counted
+  in `lane_store_lost_objects` and compare's `lostAtPrimary`. Recovery is an operator step: re-upload the blob
+  (`PUT /blobs/<sha>`), or fetch it from the replica (`GET /blobs/<sha>` with a replica token) and PUT it to the primary.
+- **Deletions are never replicated.** Replication ships puts (blobs, manifests) and pin/terminal state only; `delete-intent`,
+  `delete` and `delete-cancel` records stay local. A put whose object is gone from the primary is skipped only if the journal
+  holds a committed `delete` for it later; otherwise replication blocks there. The replica runs its own time-based retention
+  (`serve --replica [--replica-grace-hours N]`, default 336 = the primary's 14-day terminal retention, so `compare` never reports a replica sweep as missing): it sweeps a manifest only when the replicated state says terminal and
+  unpinned and it received it more than the grace ago, and a blob only when no remaining manifest references it and it is
+  older than the grace, so a manifest still in flight keeps its blobs. A stall longer than the grace is already alerting via
+  `oldest_unreplicated_object_age_seconds`. (`compare` can therefore report `missingAtReplica` for primary objects the replica
+  already swept; the primary keeps terminal manifests 14 d.) Registering a manifest or a duplicate upload cancels a pending
+  delete-intent for the blobs it needs (`delete-cancel`).
+  Store-wide: nothing under the root may be a symlink (ancestors lstat-checked, leaves opened `O_NOFOLLOW`, root `realpath`ed);
+  manifests count toward `--cap-bytes`, and admission reserves declared bytes atomically.
+  Accepted residual risk: `O_NOFOLLOW` protects only the final path component, so an ancestor directory swapped for a symlink
+  between the lstat check and the open is not caught; exploiting it needs a local actor with write access to the store root.
+  A store started with `--replica` keeps no in-memory journal tail.
+  `POST /admin/sweep` (and `--sweep-interval-s`): manifests expire 14 d after `PUT /jobs/<job>/terminal`,
+  pinned jobs (`PUT /pins/<job>`) never expire, unreferenced blobs go after 24 h, above 80% of `--cap-bytes` the oldest
+  terminal unpinned groups are evicted, and uploads are refused (507) at 95%.
 
 ## Verify locally
 

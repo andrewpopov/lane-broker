@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ensureStateDirs, paths, withLock, bootId, readJsonSafe, readDrainMarker } from './state.js';
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
-import { listQueue, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState, readResourceSkipState } from './scheduler.js';
+import { listQueue, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState, readResourceSkipState, futileFresh } from './scheduler.js';
 import { cpuBudget, projectBusy, ticketCpuEstimate } from './admission.js';
 import { classLocks, simArmed, usedByClass } from './allocation.js';
 import { queuedClaimsByClass } from './allocation-shadow.js';
@@ -102,7 +102,8 @@ function computeResourceBlock(root, store, cfg, head, held, now) {
     headId: head.id,
     count: record.count,
     limit: cfg.resourceSkipLimit,
-    reserved: record.reserved,
+    reserved: record.reserved && !futileFresh(record, cfg, now),
+    futile: futileFresh(record, cfg, now),
     projectedBusy: projectBusy(record.externalBusy, held, ticketCpuEstimate(head, cfg), now, cfg),
     budget: record.budget,
     deniedAgeMs: now - record.deniedAt,
@@ -410,6 +411,7 @@ export function renderStatusText(status) {
     lines.push(
       `resource-blocked: head ${rb.headId} projects ${rb.projectedBusy.toFixed(2)} > budget ${rb.budget.toFixed(2)} cores ` +
         `(denied ${fmtMs(rb.deniedAgeMs)} ago); backfill ${rb.count}/${rb.limit}` +
+        (rb.futile ? ' (futile: external load alone exceeds budget; backfilling)' : '') +
         (rb.reserved ? ', RESERVED — nothing else is admitted past it' : ''),
     );
   }
