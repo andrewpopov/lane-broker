@@ -44,8 +44,7 @@ const NPM_CONFIG_FILE_ENVS = ['npm_config_userconfig', 'npm_config_globalconfig'
  * a variable that reaches the install but not the key would let two different installs share an entry.
  * Removed: shell bookkeeping, git's ceiling (the work dir has its own `.git`), lane's own ticket/id
  * variables, and what systemd/logind stamp on every invocation or login session (`INVOCATION_ID`,
- * `XDG_SESSION_ID`, `MEMORY_PRESSURE_*`...), which made every run's key different (BRAIN-423). Any other
- * value that names the run's work dir or temp dir is hashed with that path replaced by its role (`runPaths`). A few tools do need a temp dir, so TMPDIR/TMP/TEMP stay in the environment, are
+ * `XDG_SESSION_ID`, `MEMORY_PRESSURE_*`...), which made every run's key different (BRAIN-423). A few tools do need a temp dir, so TMPDIR/TMP/TEMP stay in the environment, are
  * not hashed, and their (per-run) paths join the relocatability scan instead.
  */
 export const SCRUBBED_ENV_NAMES = new Set(['PWD', 'OLDPWD', 'SHLVL', '_', 'GIT_CEILING_DIRECTORIES', 'INVOCATION_ID', 'JOURNAL_STREAM', 'SYSTEMD_EXEC_PID', 'NOTIFY_SOCKET']);
@@ -288,14 +287,25 @@ export function allowlistedRootEvents(scripts) {
 }
 
 /**
- * Under `.git`, only these can change what a later command in the work dir does (config, HEAD, the index, hooks,
- * the local ignore/attributes files). Everything else is repository bookkeeping -- objects, refs, packed-refs,
- * `gc.pid`, `info/refs`, logs -- which a background `git gc --auto` (the synthetic snapshot commit can start one)
- * rewrites during any install, so it says nothing about what the install did. The `.git` directory entry itself
- * only reflects its children.
+ * Under `.git`, only these files can change what a later command in the work dir does (config, HEAD, the index,
+ * hooks, the local ignore/attributes files). Everything else is storage churn a background `git gc --auto` rewrites
+ * during any install (objects, `gc.pid`, `gc.log`, `info/refs`, `packed-refs`, loose ref files, logs), so it says
+ * nothing about what the install did. What refs POINT AT is semantic and is compared separately, as the logical ref
+ * state before and after (`gitRefState`), so a gc that only repacks them never counts and a new tag always does.
+ * The `.git` directory entry itself only reflects its children.
  */
 const GIT_BEHAVIOUR_RE = /^\.git\/(?:config|HEAD|index|hooks(?:\/|$)|info\/(?:exclude|attributes)$|attributes$)/;
 const isGitBookkeeping = (change) => change === '.git' || (change.startsWith('.git/') && !GIT_BEHAVIOUR_RE.test(change));
+
+/** The work dir's logical refs: every ref and its object (`git for-each-ref`) plus HEAD's target. Null when git cannot say. */
+export function gitRefState(workDir) {
+  const run = (args) => execFileSync('git', args, { cwd: workDir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+  try {
+    return `${run(['symbolic-ref', '-q', 'HEAD']).trim()}\n${run(['for-each-ref', '--format=%(refname) %(objectname)'])}`;
+  } catch {
+    return null;
+  }
+}
 
 const configLines = (text) => (text ?? '').split('\n').map((l) => l.trim()).filter((l) => l !== '');
 
@@ -314,14 +324,9 @@ export function unexplainedChanges(changes, { scripts, configBefore, configAfter
   return changes.filter((c) => !(configExplained && c === '.git/config') && !isGitBookkeeping(c));
 }
 
-/** `value` with each run path (`{ role, path }`, the work dir and its real path) replaced by `@@role@@`, longest path first. */
-function rolesForPaths(value, runPaths) {
-  return [...runPaths].sort((a, b) => b.path.length - a.path.length).reduce((v, { role, path: p }) => v.split(p).join(`@@${role}@@`), value);
-}
-
 /**
  * The cache key for one `remoteDeps` dir: a sha256 over everything that can change what `npm ci` produces
- * there. Returns `{ key, keyParts, lock, scripts }` (`keyParts`: a short digest per labelled input, for diagnosis), or `{ key: null, reason }` when the dir must not be cached at all
+ * there. Returns `{ key, keyParts, lock, scripts }` (`keyParts`: a keyed digest per labelled input, for diagnosis, only when `keyPartsSecret` is given), or `{ key: null, reason }` when the dir must not be cached at all
  * (lockfile not pinned, or a root lifecycle script that is not known to leave `node_modules` alone).
  *
  *  - the lockfile (name and bytes), `package.json`, the `.npmrc` of the dir and of the repo root, and the
@@ -346,7 +351,7 @@ export function computeDepsKey({
   toolVersion = (cmd) => firstLineOfCommand(cmd, env),
   npmConfig = { ignoreScripts: 'false', scriptShell: 'null' },
   tempFsProps = () => tempDirFsProperties(env),
-  runPaths = [],
+  keyPartsSecret = null,
 }) {
   let lockfileName = null;
   let lockfile = null;
@@ -401,7 +406,7 @@ export function computeDepsKey({
   }
   const unhashed = (name) =>
     isScrubbed(name) || PER_RUN_PATH_ENV_NAMES.includes(name) || AUTH_ENV_NAMES.has(name) || SESSION_ENV_NAMES.has(name);
-  for (const name of Object.keys(env).filter((k) => !unhashed(k)).sort()) parts.push([`env:${name}`, rolesForPaths(String(env[name]), runPaths)]);
+  for (const name of Object.keys(env).filter((k) => !unhashed(k)).sort()) parts.push([`env:${name}`, String(env[name])]);
   for (const name of NPM_CONFIG_FILE_ENVS) {
     if (env[name]) parts.push([`file:${name}`, readIfExists(env[name]) ?? '']);
   }
@@ -412,7 +417,7 @@ export function computeDepsKey({
     const bytes = Buffer.isBuffer(value) ? value : Buffer.from(String(value), 'utf8');
     hash.update(`${label}:${bytes.length}:`);
     hash.update(bytes);
-    keyParts[label] = crypto.createHash('sha256').update(bytes).digest('hex').slice(0, 12);
+    if (keyPartsSecret) keyParts[label] = crypto.createHmac('sha256', keyPartsSecret).update(bytes).digest('hex').slice(0, 12);
   }
   return { key: hash.digest('hex'), keyParts, lock, scripts: pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {} };
 }
@@ -500,6 +505,22 @@ export function findMissingInstalled(lock, installed, system) {
  * that recorded its own, as a sorted label list; null when there is no such entry. Two runs of one repo that
  * should share a key but do not name the leaking input here.
  */
+/**
+ * The host-local secret that keys the diagnostic digests in `meta.json`, created 0600 on first use. A plain hash of
+ * an env value would let anyone who can read `meta.json` test guesses for a low-entropy secret; the cache key itself
+ * is never derived from this.
+ */
+export function readKeyPartsSecret(cacheRoot) {
+  const file = path.join(cacheRoot, '.keyparts.key');
+  fs.mkdirSync(cacheRoot, { recursive: true });
+  try {
+    fs.writeFileSync(file, crypto.randomBytes(32), { flag: 'wx', mode: 0o600 });
+  } catch (err) {
+    if (err.code !== 'EEXIST') throw err;
+  }
+  return fs.readFileSync(file);
+}
+
 export function diffAgainstNewestEntry(cacheRoot, keyParts) {
   let newest = null;
   let names = [];
@@ -896,19 +917,44 @@ const PATH_LEADERS = new Set(Buffer.from('"\'`([{ \t\n\r\v\f', 'latin1'));
 
 /**
  * Build leftovers that name the install path but are never loaded at run time, and that the tool which made them
- * regenerates: a node-gyp package's `build/` bookkeeping (`Makefile`, `*.mk`, `config.gypi`, `Release/.deps`,
- * `Release/obj*`; only `build/Release/*.node` is required), recognised by a `binding.gyp` beside `build/`, and
- * Python's `__pycache__` (node-gyp's own gyp). They are neither scanned nor stored, so a cached tree lacks them.
- * `npm rebuild` still works: it runs `node-gyp rebuild`, which configures from `binding.gyp` again. Only a bare
- * `node-gyp build` (no configure) needs the Makefile.
+ * regenerates. Exactly these are neither scanned nor stored, so a cached tree lacks them:
+ *   - under `<pkg>/build/` when `<pkg>/binding.gyp` exists: `Makefile`, `binding.Makefile`, `*.target.mk`,
+ *     `config.gypi`, `gyp-mac-tool`, and `Release|Debug/.deps`, `Release|Debug/obj.target`. Nothing else under
+ *     `build/` (`build/deps/`, `build/Release/*.node`, anything a package reads at run time) is touched;
+ *   - `__pycache__` under `node-gyp/.../pylib/` where every `.pyc` has its `.py` source beside the cache.
+ * `npm rebuild` still works: it runs `node-gyp rebuild`, which configures from `binding.gyp` again. A symlink that
+ * points into a pruned path makes the tree uncacheable (`pointsIntoPruned`) rather than dangling.
  */
-const NODE_GYP_INTERMEDIATE_RE = /^(.*\/)?build\/(?:Makefile|binding\.Makefile|config\.gypi|gyp-mac-tool|[^/]+\.mk|deps|node_gyp_bins|(?:Release|Debug)\/(?:\.deps|obj|obj\.target))$/;
-const PYCACHE_RE = /(^|\/)__pycache__$/;
+const NODE_GYP_INTERMEDIATE_RE = /^(.*\/)?build\/(?:Makefile|binding\.Makefile|[^/]+\.target\.mk|config\.gypi|gyp-mac-tool|(?:Release|Debug)\/(?:\.deps|obj\.target))$/;
+const GYP_PYCACHE_RE = /(?:^|\/)node-gyp\/(?:.*\/)?pylib\/(?:.*\/)?__pycache__$/;
+
+function isGypPycache(tree, rel) {
+  if (!GYP_PYCACHE_RE.test(rel)) return false;
+  try {
+    const sources = path.join(tree, rel, '..');
+    const caches = fs.readdirSync(path.join(tree, rel));
+    return caches.every((f) => f.endsWith('.pyc') && fs.existsSync(path.join(sources, `${f.split('.')[0]}.py`)));
+  } catch {
+    return false;
+  }
+}
 
 function isRegenerableBuildArtifact(tree, rel) {
-  if (PYCACHE_RE.test(rel)) return true;
+  if (isGypPycache(tree, rel)) return true;
   const match = NODE_GYP_INTERMEDIATE_RE.exec(rel);
   return match !== null && fs.existsSync(path.join(tree, match[1] ?? '', 'binding.gyp'));
+}
+
+/** Does the symlink at `linkAbs` (text `target`) point at, or inside, a pruned path of `tree`? */
+function pointsIntoPruned(tree, linkAbs, target) {
+  const resolved = path.resolve(path.dirname(linkAbs), target);
+  for (const base of new Set([tree, fs.realpathSync(tree)])) {
+    const rel = path.relative(base, resolved);
+    if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) continue;
+    const parts = rel.split(path.sep);
+    if (parts.some((_, i) => isRegenerableBuildArtifact(tree, parts.slice(0, i + 1).join('/')))) return true;
+  }
+  return false;
 }
 
 const strictOccurrence = (buf, start, end) => (start === 0 || PATH_LEADERS.has(buf[start - 1])) && (end === buf.length || PATH_FOLLOWERS.has(buf[end]));
@@ -967,6 +1013,7 @@ function isRewritableText(relPath, content) {
 /**
  * Every file or symlink under `tree` that names an install path in `roles` (see `installPathRoles`). Returns
  *   { binary: <rel> }      a file naming a path that is not allowlisted, valid UTF-8 text: refuse the tree;
+ *   { prunedLink: <rel> }  a symlink pointing into a path left out of the cached tree (`isRegenerableBuildArtifact`): refuse;
  *   { ambiguous: <rel> }   an occurrence not followed by a path terminator (or glued to a longer name before it): refuse;
  *   { relocation }         else: `{ nonce, prefixes: [{ roles, path }], entries: [{ relPath, kind: 'text' | 'symlink' }] }`,
  *                          roles sharing one path being ONE group; `publishToStore` templates the entries.
@@ -985,6 +1032,7 @@ export function collectInstallPathReferences(tree, roles, { newNonce = () => cry
     const marker = tokenTail(nonce);
     const outcome = scanTree(tree, groups, pairs, marker);
     if (outcome.collision) continue;
+    if (outcome.prunedLink) return { prunedLink: outcome.prunedLink };
     if (outcome.binary) return { binary: outcome.binary };
     if (outcome.ambiguous) return { ambiguous: outcome.ambiguous };
     const found = groups.filter((_, i) => outcome.found.has(i));
@@ -1007,6 +1055,7 @@ function scanTree(tree, groups, pairs, marker) {
       if (ent.isDirectory()) outcome = walk(p, r);
       else if (ent.isSymbolicLink()) {
         const target = Buffer.from(fs.readlinkSync(p), 'utf8');
+        if (pointsIntoPruned(tree, p, target.toString('utf8'))) return { prunedLink: r };
         if (target.includes(marker)) return { collision: true };
         const hit = pairs.some((pr) => target.includes(pr.from));
         if (hit && rewritePrefixes(target, pairs, anchoredOccurrence) === null) return { ambiguous: r };

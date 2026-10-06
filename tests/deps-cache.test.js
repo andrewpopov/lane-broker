@@ -31,6 +31,8 @@ import {
   snapshotOutsideNodeModules,
   snapshotChanges,
   diffAgainstNewestEntry,
+  readKeyPartsSecret,
+  gitRefState,
 } from '../src/deps-cache.js';
 import { resolveTicketConfig, loadGlobalConfig, ConfigError, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { freshEnv, writeRepoConfig, writeGlobalConfig } from './helpers.js';
@@ -157,9 +159,9 @@ test('key: identical inputs give the same key; volatile variables do not matter,
   }
 });
 
-test('key: per-run values never change the key; a value that is not per-run does (BRAIN-423)', () => {
+test('key: per-run variables never change the key; any other value, path-bearing or not, does (BRAIN-423)', () => {
   const fx = makeKeyFixture();
-  const keyFor = (extra, runPaths = []) => computeDepsKey({ ...fx.inputs(), env: { ...fx.inputs().env, ...extra }, runPaths }).key;
+  const keyFor = (extra) => computeDepsKey({ ...fx.inputs(), env: { ...fx.inputs().env, ...extra } }).key;
   const base = keyFor({});
   const perRun = [
     { INVOCATION_ID: 'a'.repeat(32) }, { JOURNAL_STREAM: '8:123' }, { SYSTEMD_EXEC_PID: '99' },
@@ -169,11 +171,41 @@ test('key: per-run values never change the key; a value that is not per-run does
   for (const extra of perRun) assert.equal(keyFor(extra), base, `${Object.keys(extra)[0]} is not an input`);
   assert.notEqual(keyFor({ CFLAGS: '-O0' }), base, 'a real install input still is');
 
-  const runA = [{ role: 'workDir', path: '/r/tickets/aaa/work' }];
-  const runB = [{ role: 'workDir', path: '/r/tickets/bbb/work' }];
-  const withPath = (work) => ({ INIT_CWD: work, CUSTOM_HOME: `${work}/home` });
-  assert.equal(keyFor(withPath('/r/tickets/aaa/work'), runA), keyFor(withPath('/r/tickets/bbb/work'), runB), 'a value naming the work dir is hashed by role');
-  assert.notEqual(keyFor(withPath('/r/tickets/aaa/work'), runA), keyFor(withPath('/elsewhere/work'), runB), 'a value naming some other path is not');
+  assert.notEqual(keyFor({ CFLAGS: '-I/r/a/work-extra' }), keyFor({ CFLAGS: '-I/r/b/work-extra' }), 'values stay verbatim: different directories are different inputs');
+});
+
+test('key parts: digests are keyed with a host-local 0600 secret, never a plain sha256 of the value', () => {
+  const root = tmpDir('deps-cache-parts');
+  const secret = readKeyPartsSecret(root);
+  assert.equal(secret.length, 32);
+  assert.ok(readKeyPartsSecret(root).equals(secret), 'created once, then reused');
+  assert.equal(fs.statSync(path.join(root, '.keyparts.key')).mode & 0o777, 0o600);
+  const fx = makeKeyFixture();
+  const env = { ...fx.inputs().env, API_TOKEN: 'hunter2' };
+  const withKey = computeDepsKey({ ...fx.inputs(), env, keyPartsSecret: secret });
+  const plain = crypto.createHash('sha256').update('hunter2').digest('hex');
+  assert.ok(withKey.keyParts['env:API_TOKEN'], 'a keyed digest is recorded');
+  assert.ok(!plain.startsWith(withKey.keyParts['env:API_TOKEN']), 'and it is not the plain sha256');
+  const key2 = computeDepsKey({ ...fx.inputs(), env, keyPartsSecret: crypto.randomBytes(32) });
+  assert.equal(key2.key, withKey.key, 'the cache key does not depend on the secret');
+  assert.notEqual(key2.keyParts['env:API_TOKEN'], withKey.keyParts['env:API_TOKEN']);
+  assert.deepEqual(computeDepsKey({ ...fx.inputs(), env }).keyParts, {}, 'no secret, no digests');
+});
+
+test('git refs: the logical ref state moves on a tag but not on a gc that repacks refs', () => {
+  const repo = tmpDir('deps-cache-refs');
+  const g = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...args], { cwd: repo, stdio: 'pipe' });
+  g('init', '-q');
+  fs.writeFileSync(path.join(repo, 'f'), '1');
+  g('add', '-A');
+  g('commit', '-q', '-m', 'one');
+  const before = gitRefState(repo);
+  assert.ok(before);
+  g('gc', '-q');
+  assert.equal(gitRefState(repo), before, 'repacking refs is not a change');
+  g('tag', 'installed');
+  assert.notEqual(gitRefState(repo), before);
+  assert.equal(gitRefState(tmpDir('deps-cache-norepo')), null, 'no repo: unknown');
 });
 
 test('key parts: a lookup names the labels that differ from the newest published entry', () => {

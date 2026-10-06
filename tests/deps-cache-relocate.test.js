@@ -392,9 +392,10 @@ test('node-gyp exemption guards: no binding.gyp, a path in a runtime file, or a 
   assert.deepEqual(collectInstallPathReferences(addon, rolesFor(OLD)), { binary: 'better-sqlite3/build/Release/addon.node' });
 });
 
-test('python bytecode caches (they embed the source path) are not scanned or stored', () => {
+test('only node-gyp\'s own python bytecode (sources beside it) is dropped; any other __pycache__ naming the path refuses the tree', () => {
+  const pyc = (work) => Buffer.concat([Buffer.from([0x2b, 0x0e, 0, 0]), Buffer.from(`${work}/node_modules/node-gyp/gyp/MSVSUtil.py`)]);
   const t = tree();
-  write(t, 'node-gyp/gyp/pylib/gyp/__pycache__/MSVSUtil.cpython-314.pyc', Buffer.concat([Buffer.from([0x2b, 0x0e, 0, 0]), Buffer.from(`${OLD}/node_modules/node-gyp/gyp/MSVSUtil.py`)]));
+  write(t, 'node-gyp/gyp/pylib/gyp/__pycache__/MSVSUtil.cpython-314.pyc', pyc(OLD));
   write(t, 'node-gyp/gyp/pylib/gyp/MSVSUtil.py', 'x = 1\n');
   const collected = collectInstallPathReferences(t, rolesFor(OLD));
   assert.deepEqual(collected.relocation.entries, []);
@@ -402,6 +403,38 @@ test('python bytecode caches (they embed the source path) are not scanned or sto
   const key = newKey();
   publishToStore(cacheRoot, key, t, collected.relocation);
   assert.deepEqual(fs.readdirSync(path.join(entryDir(cacheRoot, key), 'node_modules', 'node-gyp/gyp/pylib/gyp')), ['MSVSUtil.py']);
+
+  const elsewhere = tree();
+  write(elsewhere, 'other-tool/__pycache__/x.cpython-314.pyc', pyc(OLD));
+  write(elsewhere, 'other-tool/x.py', 'x = 1\n');
+  assert.deepEqual(collectInstallPathReferences(elsewhere, rolesFor(OLD)), { binary: 'other-tool/__pycache__/x.cpython-314.pyc' });
+
+  const noSource = tree();
+  write(noSource, 'node-gyp/gyp/pylib/gyp/__pycache__/Gone.cpython-314.pyc', pyc(OLD));
+  assert.deepEqual(collectInstallPathReferences(noSource, rolesFor(OLD)), { binary: 'node-gyp/gyp/pylib/gyp/__pycache__/Gone.cpython-314.pyc' });
+});
+
+test('a runtime file under build/ (build/deps/runtime.json) survives the prune and a hit; a symlink into a pruned path refuses the tree', () => {
+  const t = tree();
+  plantNodeGypBuild(t, OLD);
+  write(t, 'better-sqlite3/build/deps/runtime.json', '{"needed": true}');
+  write(t, 'better-sqlite3/build/deps/sqlite3.mk', 'kept: yes\n');
+  const { restored, run } = roundTrip(t, ...one(OLD, NEW));
+  run();
+  assert.equal(fs.readFileSync(path.join(restored, 'better-sqlite3/build/deps/runtime.json'), 'utf8'), '{"needed": true}');
+  assert.ok(fs.existsSync(path.join(restored, 'better-sqlite3/build/deps/sqlite3.mk')));
+  assert.deepEqual(fs.readdirSync(path.join(restored, 'better-sqlite3/build')).sort(), ['Release', 'deps']);
+
+  for (const target of ['better-sqlite3/build/Makefile', 'better-sqlite3/build/Release/obj.target/addon', 'ABS/better-sqlite3/build/config.gypi']) {
+    const linked = tree();
+    plantNodeGypBuild(linked, OLD);
+    fs.symlinkSync(target.replace('ABS', linked), path.join(linked, 'link'));
+    assert.deepEqual(collectInstallPathReferences(linked, rolesFor(OLD)), { prunedLink: 'link' }, target);
+  }
+  const fine = tree();
+  plantNodeGypBuild(fine, OLD);
+  fs.symlinkSync('better-sqlite3/build/Release/addon.node', path.join(fine, 'ok-link'));
+  assert.ok(collectInstallPathReferences(fine, rolesFor(OLD)).relocation, 'a link to the kept .node is fine');
 });
 
 test('the real Prisma 6 generated-client shape (output value, sourceFilePath) is relocated', () => {

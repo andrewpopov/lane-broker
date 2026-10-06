@@ -52,6 +52,7 @@ const POSTINSTALLS = {
   'hook-file': "require('fs').mkdirSync('.git/hooks', { recursive: true }); require('fs').writeFileSync('.git/hooks/pre-commit', '#!/bin/sh\\n')",
   'node-gyp': "const fs = require('fs'); const d = 'node_modules/hello-tool/'; fs.mkdirSync(d + 'build/Release', { recursive: true }); fs.writeFileSync(d + 'binding.gyp', '{}'); fs.writeFileSync(d + 'build/Makefile', 'srcdir := ' + process.cwd() + '/node_modules\\n'); fs.writeFileSync(d + 'build/config.gypi', '{\\\"d\\\": \\\"' + process.cwd() + '\\\"}'); fs.writeFileSync(d + 'build/Release/hello.node', 'loadable')",
   'git-bookkeeping': "const fs = require('fs'); fs.writeFileSync('.git/gc.pid', '1'); fs.mkdirSync('.git/objects/pack', { recursive: true }); fs.writeFileSync('.git/objects/pack/tmp_pack_x', ''); fs.mkdirSync('.git/info', { recursive: true }); fs.writeFileSync('.git/info/refs', '')",
+  'git-tag': "require('child_process').execFileSync('git', ['tag', 'installed'])",
   'embed-tmpdir': "require('fs').writeFileSync('node_modules/hello-tool/tmp.txt', process.env.TMPDIR)",
 };
 
@@ -343,6 +344,14 @@ test('two dispatches that differ in every per-run value (ticket, work dir, TMPDI
   assert.match(second.stderr, /deps-cache hit key=[0-9a-f]{12} /);
   assert.equal(s.storedKeys().length, 1, 'one entry, not one per run');
   assert.equal(s.npmCiCalls(), 1, 'the second run ran no npm ci');
+});
+
+test('an install script that creates a git tag (a ref change) is not published (BRAIN-423)', async () => {
+  const s = setupWithNpmSpy();
+  const run = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'git-tag' })));
+  assert.equal(run.code, 0, run.stderr);
+  assert.match(run.stderr, /published=no reason="install changed files outside node_modules: .*\.git \(a ref or HEAD target changed\)/);
+  assert.equal(s.storedKeys().length, 0);
 });
 
 test('a hit whose relocation cannot be verified is discarded and installed normally, with the reason logged', async () => {
