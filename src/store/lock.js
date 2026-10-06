@@ -70,7 +70,9 @@ function holder(file, mine) {
  * the renamed file to confirm it really was the stale lock, and retrying the link. The serving process holds the lock for
  * its life; an offline tool that must read the journal directly takes it too, so it refuses while a server runs.
  */
-export function acquireStoreLock(root) {
+export function acquireStoreLock(root, platform = process.platform) {
+  // One lock mechanism per platform: a file lock beside a kernel-held socket would admit two journal writers on Linux.
+  if (lockMode(platform) !== 'file') throw new Error(`the file lock is the ${platform === 'linux' ? 'macOS' : 'non-Linux'} fallback only; use ObjectStore.open`);
   const file = path.join(root, LOCK_FILE);
   const mine = { pid: process.pid, token: crypto.randomBytes(8).toString('hex') };
   const temp = `${file}.tmp.${process.pid}.${mine.token}`;
