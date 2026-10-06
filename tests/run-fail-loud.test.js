@@ -26,6 +26,7 @@ test('--detach prints the id and the --log path exists immediately, before the c
   assert.match(result.stdout, /^[0-9a-f-]{36}\n$/, 'stdout must be exactly the id');
   assert.match(result.stderr, /detached [0-9a-f-]{36}; log .*detached\.log; reattach with: lane wait/);
   assert.equal(fs.existsSync(logPath), true, 'the --log file must exist immediately after --detach returns');
+  await laneRun(['cancel', result.stdout.trim()], { env, cwd: repoDir });
 });
 
 test('a supervisor that fails to spawn synchronously never prints an id and exits 1', async () => {

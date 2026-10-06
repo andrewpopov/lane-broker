@@ -118,5 +118,7 @@ test('capacity raise control: without the raise, queued heads stay capacity-bloc
   assert.equal(leaseExists(state, idB), false, 'control: B must remain blocked without a capacity raise');
   assert.equal(leaseExists(state, idC), false, 'control: C must remain blocked without a capacity raise');
 
+  await laneRun(['cancel', idB], { env, cwd: repoBDir });
+  await laneRun(['cancel', idC], { env, cwd: repoCDir });
   await laneRun(['cancel', idA], { env, cwd: repoADir });
 });

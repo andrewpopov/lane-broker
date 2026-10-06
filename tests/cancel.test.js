@@ -46,6 +46,16 @@ test('lane cancel on a lease whose supervisor cannot act (SIGSTOPped) exits non-
     if (child.exitCode === null && child.signalCode === null) {
       await new Promise((resolve) => child.on('exit', resolve));
     }
+    // The supervisor (the test's own descendant) wakes, notices its child died and writes its
+    // result into the state dir; let it finish before the dir is removed.
+    await waitFor(() => {
+      try {
+        process.kill(lease.supervisorPid, 0);
+        return false;
+      } catch {
+        return true;
+      }
+    });
   });
 
   const result = await laneRun(['cancel', leaseId], { env, cwd: repoDir });

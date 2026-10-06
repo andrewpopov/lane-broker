@@ -64,6 +64,7 @@ test('load gate: refuses to start while closed, starts once it reopens after eno
   fs.writeFileSync(loadFile, '2');
   const lease = await waitFor(() => fs.existsSync(path.join(paths(state).leases, `${id}.json`)), { timeoutMs: 5000 });
   assert.ok(lease, 'should eventually start once the gate reopens');
+  await laneRun(['cancel', id], { env, cwd: repoDir });
 });
 
 test('load gate: a config edit raising loadOpen mid-flight lets a stuck gate reopen, matching the real incident', async () => {
@@ -119,6 +120,7 @@ test('load gate: a config edit raising loadOpen mid-flight lets a stuck gate reo
 
   const lease = await waitFor(() => fs.existsSync(path.join(paths(state).leases, `${id}.json`)), { timeoutMs: 5000 });
   assert.ok(lease, 'should start once the reloaded config raises loadOpen above the current load');
+  await laneRun(['cancel', id], { env, cwd: repoDir });
 });
 
 test('BRAIN-197: an idle broker (no held leases) starts its head immediately even while the load gate is closed', async () => {
@@ -147,4 +149,5 @@ test('BRAIN-197: an idle broker (no held leases) starts its head immediately eve
 
   const gateState = readJsonSafe(paths(state).loadGate);
   assert.equal(gateState?.closed, true, 'the gate itself must still read closed: the exemption bypasses it, it does not reopen it');
+  await laneRun(['cancel', id], { env, cwd: repoDir });
 });

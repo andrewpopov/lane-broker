@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneSpawn, sleep, waitFor } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneSpawn, laneRun, sleep, waitFor } from './helpers.js';
 import { paths, readJsonSafe } from '../src/state.js';
 
 /**
@@ -90,4 +90,5 @@ test('cpu gate: a config edit raising cpuOpenPercent mid-flight lets a stuck gat
 
   const lease = await waitFor(() => fs.existsSync(path.join(paths(state).leases, `${id}.json`)), { timeoutMs: 10000 });
   assert.ok(lease, 'should start once the reloaded config raises cpuOpenPercent above the current busy%');
+  await laneRun(['cancel', id], { env, cwd: repoDir });
 });
