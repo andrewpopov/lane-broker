@@ -8,9 +8,12 @@ import { readReplicationState } from './replication-state.js';
  * and fsynced AFTER the change itself is durable (spec 8.2). Kinds: `blob`, `manifest` (objects), `terminal`, `pin`
  * (job retention state) and `delete` (retention removed an object). seq is 1-based and gapless.
  *
- * A sequence number is allocated only once the write and fsync both succeeded; a failed append is truncated back to
- * the pre-append offset, so a retry reuses the same seq and no line is ever torn or duplicated.
+ * DURABLE-COMMIT BOUNDARY: a record is visible to readers only once it is committed. The writer keeps `committedSeq` /
+ * `committedOffset` in memory and publishes the offset to `journal.committed` (for readers in other processes) only AFTER
+ * the write and the file fsync succeeded. Every reader stops at that offset, so a record that is later rolled back
+ * (truncate + fsync, before the next append) was never visible to anyone and its seq/offset can be reused safely.
  */
+export const COMMITTED_FILE = 'journal.committed';
 export const JOURNAL_FILE = 'journal.log';
 export const DEFAULT_CHUNK_BYTES = 256 * 1024;
 
@@ -18,10 +21,26 @@ export function journalPath(root) {
   return path.join(root, JOURNAL_FILE);
 }
 
-function writeAll(fd, buf) {
+/** Byte offset below which the journal is committed: the published marker, or the file size if no writer ever published one. */
+export function committedOffset(root) {
+  try {
+    const n = Number.parseInt(fs.readFileSync(path.join(root, COMMITTED_FILE), 'utf8'), 10);
+    if (Number.isInteger(n) && n >= 0) return n;
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+  try {
+    return fs.statSync(journalPath(root)).size;
+  } catch (err) {
+    if (err.code === 'ENOENT') return 0;
+    throw err;
+  }
+}
+
+function writeAll(fd, buf, position) {
   let off = 0;
   while (off < buf.length) {
-    const n = fs.writeSync(fd, buf, off, buf.length - off);
+    const n = fs.writeSync(fd, buf, off, buf.length - off, position === undefined ? undefined : position + off);
     if (!(n > 0)) throw new Error('journal write made no progress');
     off += n;
   }
@@ -41,7 +60,7 @@ export function readJournalFrom(root, offset = 0, { maxBytes = DEFAULT_CHUNK_BYT
     throw err;
   }
   try {
-    const size = fs.fstatSync(fd).size;
+    const size = Math.min(fs.fstatSync(fd).size, committedOffset(root));
     if (offset >= size) return [];
     const buf = Buffer.alloc(Math.min(maxBytes, size - offset));
     let got = 0;
@@ -93,11 +112,17 @@ export function readJournal(root, afterSeq = 0, limit = Infinity) {
   return out;
 }
 
-/** path -> kind of the LAST record naming it. An object is journaled iff that kind is `blob` or `manifest`. */
-export function lastKindByPath(root) {
-  const last = new Map();
-  for (const rec of iterateJournal(root)) if (rec.path) last.set(rec.path, rec.kind);
-  return last;
+/**
+ * path -> 'put' | 'delete': the last OBJECT record (blob/manifest/delete) naming each path. Retention-state records
+ * (pin, terminal) are a separate dimension and never overwrite it.
+ */
+export function objectStateByPath(root) {
+  const state = new Map();
+  for (const rec of iterateJournal(root)) {
+    if (rec.kind === 'blob' || rec.kind === 'manifest') state.set(rec.path, 'put');
+    else if (rec.kind === 'delete') state.set(rec.path, 'delete');
+  }
+  return state;
 }
 
 export function journalHeadSeq(root) {
@@ -108,31 +133,50 @@ export function journalHeadSeq(root) {
 
 /** The single in-process writer. Appends are synchronous, so they are serialised by the event loop. */
 export class Journal {
-  constructor(root) {
+  /** `trackPending: false` for a store with no downstream replica target: it keeps no per-record tail at all. */
+  constructor(root, { trackPending = true } = {}) {
     this.root = root;
     this.file = journalPath(root);
+    this.trackPending = trackPending;
     fs.mkdirSync(root, { recursive: true });
     const existed = fs.existsSync(this.file);
     if (existed) this.dropTornTail();
-    this.offset = existed ? fs.statSync(this.file).size : 0;
-    this.seq = existed ? this.tailSeq() : 0;
-    this.pending = []; // {seq, createdAt} of records above the watermark: all /metrics needs, so it never reads the file
+    this.committedOffset = existed ? fs.statSync(this.file).size : 0;
+    this.committedSeq = existed ? this.tailSeq() : 0;
+    this.markerFd = fs.openSync(path.join(root, COMMITTED_FILE), 'w', 0o640);
+    this.publish(this.committedOffset);
+    this.pending = []; // {seq, createdAt} above the watermark: all /metrics needs, so it never reads the file
     const mark = readReplicationState(root);
-    if (mark.replicatedOffset > this.offset) throw new Error('replication watermark is beyond the end of the journal');
-    for (const rec of iterateJournal(root, mark.replicatedOffset)) {
-      if (rec.seq > mark.replicatedSeq) this.pending.push({ seq: rec.seq, createdAt: rec.createdAt });
+    if (mark.replicatedOffset > this.committedOffset) throw new Error('replication watermark is beyond the end of the journal');
+    if (trackPending) {
+      for (const rec of iterateJournal(root, mark.replicatedOffset)) {
+        if (rec.seq > mark.replicatedSeq) this.pending.push({ seq: rec.seq, createdAt: rec.createdAt });
+      }
     }
     this.fd = fs.openSync(this.file, 'a', 0o640);
     this.broken = false;
     if (!existed) fsyncDirectory(root);
   }
 
+  get seq() {
+    return this.committedSeq;
+  }
+
+  get offset() {
+    return this.committedOffset;
+  }
+
+  publish(offset) {
+    const line = Buffer.from(`${String(offset).padStart(20, '0')}\n`);
+    writeAll(this.markerFd, line, 0);
+  }
+
   tailSeq() {
-    if (this.offset === 0) return 0;
+    if (this.committedOffset === 0) return 0;
     const fd = fs.openSync(this.file, 'r');
     try {
-      const probe = Buffer.alloc(Math.min(this.offset, DEFAULT_CHUNK_BYTES));
-      fs.readSync(fd, probe, 0, probe.length, this.offset - probe.length);
+      const probe = Buffer.alloc(Math.min(this.committedOffset, DEFAULT_CHUNK_BYTES));
+      fs.readSync(fd, probe, 0, probe.length, this.committedOffset - probe.length);
       const lines = probe.toString('utf8').split('\n');
       return JSON.parse(lines[lines.length - 2]).seq;
     } finally {
@@ -151,6 +195,7 @@ export class Journal {
         if (nl < 0 && probe.length === size) fs.ftruncateSync(fd, 0);
         else if (nl < 0) throw new Error('journal tail has no newline within the probe window');
         else fs.ftruncateSync(fd, size - probe.length + nl + 1);
+        fs.fsyncSync(fd);
       }
     } finally {
       fs.closeSync(fd);
@@ -159,28 +204,35 @@ export class Journal {
 
   append(fields) {
     if (this.broken) throw new Error('journal is unusable after a failed rollback; restart the store');
-    const rec = { seq: this.seq + 1, ...fields };
+    const start = this.committedOffset;
+    const rec = { seq: this.committedSeq + 1, ...fields };
     const buf = Buffer.from(`${JSON.stringify(rec)}\n`, 'utf8');
     try {
       writeAll(this.fd, buf);
       fs.fsyncSync(this.fd);
+      this.publish(start + buf.length); // visible to other processes only now
     } catch (err) {
       try {
-        fs.ftruncateSync(this.fd, this.offset);
+        fs.ftruncateSync(this.fd, start);
+        fs.fsyncSync(this.fd); // the rollback itself must be durable before the next append reuses these bytes
+        this.publish(start);
       } catch {
         this.broken = true;
       }
       throw err;
     }
-    this.seq = rec.seq;
-    this.offset += buf.length;
-    this.pending.push({ seq: rec.seq, createdAt: rec.createdAt });
-    if (this.pending.length % 8192 === 0) this.oldestPendingCreatedAt();
-    return { ...rec, offset: this.offset - buf.length, end: this.offset };
+    this.committedSeq = rec.seq;
+    this.committedOffset = start + buf.length;
+    if (this.trackPending) {
+      this.pending.push({ seq: rec.seq, createdAt: rec.createdAt });
+      if (this.pending.length % 8192 === 0) this.oldestPendingCreatedAt();
+    }
+    return { ...rec, offset: start, end: this.committedOffset };
   }
 
-  /** `createdAt` of the first record above the watermark (re-read from replication.json), or null when fully replicated. */
+  /** `createdAt` of the first record above the watermark (re-read from replication.json), or null when fully replicated or untracked. */
   oldestPendingCreatedAt() {
+    if (!this.trackPending) return null;
     const { replicatedSeq } = readReplicationState(this.root);
     let drop = 0;
     while (drop < this.pending.length && this.pending[drop].seq <= replicatedSeq) drop += 1;
@@ -190,5 +242,6 @@ export class Journal {
 
   close() {
     fs.closeSync(this.fd);
+    fs.closeSync(this.markerFd);
   }
 }

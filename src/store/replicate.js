@@ -21,6 +21,28 @@ export function replicationLag(root, now = Date.now()) {
 }
 
 /**
+ * Recompute the watermark for operators: find the end offset of journal record `seq` with one scan and write a format-2
+ * state. Used after an unrecognised watermark file is refused.
+ */
+export function rebuildWatermark(root, seq) {
+  let offset = 0;
+  if (seq > 0) {
+    let found = false;
+    for (const rec of iterateJournal(root)) {
+      if (rec.seq === seq) {
+        offset = rec.end;
+        found = true;
+        break;
+      }
+    }
+    if (!found) throw new Error(`journal has no record with seq ${seq}`);
+  }
+  const state = { replicatedSeq: seq, replicatedOffset: offset, failedRounds: 0, lastRoundAt: null };
+  writeReplicationState(root, state);
+  return state;
+}
+
+/**
  * Ships journal records to a replica in `seq` order, reading forward from the watermark's byte offset in bounded
  * chunks. Every record kind is applied and then CHECKED at the replica (objects: the replica re-reads its disk and must
  * report the journal's sha256/size; deletions: the object must be absent; terminal/pin: the replica's job state must
@@ -35,19 +57,31 @@ export class Replicator {
     Object.assign(this, { root: path.resolve(root), replica, now, chunkBytes, onShipped });
   }
 
-  deletedLater(entry) {
-    for (const rec of iterateJournal(this.root, entry.end, { maxBytes: this.chunkBytes })) {
-      if (rec.kind === 'delete' && rec.path === entry.path) return true;
+  /** A COMMITTED delete record for `rel` after this record (the journal reader never sees uncommitted bytes). */
+  committedDeletion(rel, fromOffset) {
+    for (const rec of iterateJournal(this.root, fromOffset, { maxBytes: this.chunkBytes })) {
+      if (rec.kind === 'delete' && rec.path === rel) return rec;
     }
-    return false;
+    return null;
+  }
+
+  /**
+   * `rel` is absent on the primary. That is only legitimate when retention committed a delete for it; the replica is
+   * then brought to the same state NOW (the delete applied and checked absent there), so the watermark moves past this
+   * record only over a replica state that has been verified. No committed delete, or a replica that cannot delete: block.
+   */
+  async confirmAbsent(entry, rel) {
+    if (!this.committedDeletion(rel, entry.end)) {
+      throw new Error(`seq ${entry.seq} ${rel} is absent on the primary and no committed deletion explains it`);
+    }
+    await this.replica.deleteObject(rel);
+    if (await this.replica.verifyObject(rel)) throw new Error(`replica still holds ${rel} (seq ${entry.seq})`);
+    return 'gone';
   }
 
   async shipObject(entry) {
     const file = path.join(this.root, ...entry.path.split('/'));
-    if (!fs.existsSync(file)) {
-      if (this.deletedLater(entry)) return 'gone';
-      throw new Error(`seq ${entry.seq} ${entry.path} is missing on the primary and no journaled deletion explains it`);
-    }
+    if (!fs.existsSync(file)) return this.confirmAbsent(entry, entry.path);
     await this.replica.putObject(entry, file);
     const seen = await this.replica.verifyObject(entry.path);
     if (!seen || seen.sha256 !== entry.sha256 || seen.size !== entry.size) {
@@ -58,12 +92,16 @@ export class Replicator {
 
   async shipState(entry) {
     const field = entry.kind === 'pin' ? 'pinned' : 'terminalAt';
+    const manifestRel = manifestRelPath(entry.job);
     const applied = entry.kind === 'pin' ? await this.replica.setPin(entry.job, entry.pinned) : await this.replica.setTerminal(entry.job, entry.terminalAt);
-    const meta = await this.replica.jobMeta(entry.job);
-    const jobGoneHere = !fs.existsSync(path.join(this.root, ...manifestRelPath(entry.job).split('/')));
-    if (meta ? meta[field] !== entry[field] : !(jobGoneHere && !applied)) {
-      throw new Error(`replica job state differs for seq ${entry.seq} ${entry.kind} ${entry.job}`);
+    if (!applied) {
+      if (fs.existsSync(path.join(this.root, ...manifestRel.split('/')))) {
+        throw new Error(`replica has no job ${entry.job} for seq ${entry.seq} but the primary does`);
+      }
+      return this.confirmAbsent(entry, manifestRel);
     }
+    const meta = await this.replica.jobMeta(entry.job);
+    if (!meta || meta[field] !== entry[field]) throw new Error(`replica job state differs for seq ${entry.seq} ${entry.kind} ${entry.job}`);
     return 'shipped';
   }
 

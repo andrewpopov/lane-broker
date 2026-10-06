@@ -1201,6 +1201,10 @@ symlinks.
   makes `sweep` a no-op there). An object missing on the primary blocks the watermark unless a later `delete` record explains it.
   Store-wide: nothing under the root may be a symlink (ancestors lstat-checked, leaves opened `O_NOFOLLOW`, root `realpath`ed);
   manifests count toward `--cap-bytes`, and admission reserves declared bytes atomically.
+  Accepted residual risk: `O_NOFOLLOW` protects only the final path component, so an ancestor directory swapped for a symlink
+  between the lstat check and the open is not caught; exploiting it needs a local actor with write access to the store root.
+  Journal visibility: a record is readable by the replicator/compare only after its fsync (`journal.committed` marker), and
+  a store without a downstream replica (`--replica`) keeps no in-memory tail.
   `POST /admin/sweep` (and `--sweep-interval-s`): manifests expire 14 d after `PUT /jobs/<job>/terminal`,
   pinned jobs (`PUT /pins/<job>`) never expire, unreferenced blobs go after 24 h, above 80% of `--cap-bytes` the oldest
   terminal unpinned groups are evicted, and uploads are refused (507) at 95%.

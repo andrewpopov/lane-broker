@@ -2,7 +2,7 @@ import { parseArgs } from 'node:util';
 import { parseByteSize } from '../resources.js';
 import { createStore } from './server.js';
 import { createHmacVerifier } from './auth.js';
-import { Replicator } from './replicate.js';
+import { Replicator, rebuildWatermark } from './replicate.js';
 import { compareStores } from './compare.js';
 import { StoreClient } from './client.js';
 
@@ -10,6 +10,7 @@ const USAGE = `usage: lane-store <command> [options]
   serve      --root DIR --listen HOST:PORT [--replica] [--max-blob-bytes N] [--cap-bytes N] [--sweep-interval-s N]
              secret: LANE_STORE_SECRET
   replicate  --root DIR --replica-url URL            one journal-ordered round; token: LANE_STORE_REPLICA_TOKEN
+             replicate --rebuild-watermark --seq N --root DIR   recompute replication.json (format 2) for seq N
   compare    --root DIR --replica-url URL [--deep] [--repair --primary-url URL]
              weekly backstop; exit 2 on divergence; --repair re-journals objects the journal lacks (tokens: LANE_STORE_REPLICA_TOKEN, LANE_STORE_ADMIN_TOKEN)`;
 
@@ -46,6 +47,8 @@ export async function storeCli(argv, env = process.env) {
       deep: { type: 'boolean' },
       replica: { type: 'boolean' },
       repair: { type: 'boolean' },
+      'rebuild-watermark': { type: 'boolean' },
+      seq: { type: 'string' },
     },
   });
   const root = need(values.root, '--root');
@@ -66,6 +69,13 @@ export async function storeCli(argv, env = process.env) {
     const stop = () => s.close().then(() => process.exit(0));
     process.on('SIGTERM', stop);
     process.on('SIGINT', stop);
+    return 0;
+  }
+
+  if (command === 'replicate' && values['rebuild-watermark']) {
+    const seq = Number(need(values.seq, '--seq'));
+    if (!Number.isInteger(seq) || seq < 0) throw new Error('--seq must be a non-negative integer');
+    console.log(JSON.stringify(rebuildWatermark(root, seq)));
     return 0;
   }
 

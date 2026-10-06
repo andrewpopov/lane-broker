@@ -4,7 +4,7 @@ import crypto from 'node:crypto';
 import { atomicWriteFile, atomicWriteJson, fsyncDirectory } from '../state.js';
 import { manifestHashOf, isCanonicalRelPath } from '../remote-manifest.js';
 import { MAX_HEADER_BYTES } from '../remote-stream.js';
-import { Journal, lastKindByPath } from './journal.js';
+import { Journal, objectStateByPath } from './journal.js';
 import { isSha256, isJobId, blobRelPath, manifestRelPath, parseObjectPath } from './ids.js';
 
 export class StoreError extends Error {
@@ -51,7 +51,11 @@ async function hashStream(stream) {
   return { sha256: hash.digest('hex'), size };
 }
 
-const hashFile = (file) => hashStream(fs.createReadStream(file));
+/** Hash a regular file opened with O_NOFOLLOW: a symlink at the leaf is refused, never followed. */
+export function hashFile(file) {
+  const fd = fs.openSync(file, READ_NOFOLLOW);
+  return hashStream(fs.createReadStream(null, { fd }));
+}
 
 /** Every committed object under `root` as `{path, size, sha256?}`, sorted by path. `deep` re-hashes from disk. */
 export async function listObjects(root, { deep = false } = {}) {
@@ -117,12 +121,21 @@ export class ObjectStore {
     this.maxBlobBytes = maxBlobBytes;
     this.capBytes = capBytes;
     this.replicaMode = replicaMode;
-    for (const d of ['tmp', 'blobs', 'manifests', 'meta']) fs.mkdirSync(path.join(this.root, d), { recursive: true });
+    for (const d of ['tmp', 'blobs', 'manifests', 'meta']) {
+      const dir = path.join(this.root, d);
+      try {
+        if (!fs.lstatSync(dir).isDirectory()) throw new Error(`${dir} is not a real directory: symlinks under the store root are refused`);
+      } catch (err) {
+        if (err.code !== 'ENOENT') throw err;
+        fs.mkdirSync(dir);
+      }
+    }
     for (const f of walkFiles(path.join(this.root, 'tmp'))) fs.unlinkSync(f.full); // leftovers of a crash mid-upload
-    this.journal = new Journal(this.root);
+    this.journal = new Journal(this.root, { trackPending: !replicaMode });
     this.bytes = [...walkFiles(path.join(this.root, 'blobs')), ...walkFiles(path.join(this.root, 'manifests'))].reduce((n, f) => n + f.size, 0);
     this.reserved = 0; // bytes admitted but not yet committed
-    this.unjournaled = new Set(); // blobs on disk whose journal append failed AND whose rollback failed
+    this.unjournaled = new Set(); // blobs on disk without a journal record (append or post-rename step failed AND the rollback failed)
+    this.pendingDeletes = new Set(); // objects unlinked whose delete record is not yet journaled
     this.jobBlobCache = new Map();
     this.reconcileReport = this.reconcile();
   }
@@ -178,19 +191,23 @@ export class ObjectStore {
     }
   }
 
-  /** Journal every object on disk that has no live record (a crash between commit and append): blobs first, then manifests. */
+  /**
+   * Startup reconcile, both directions, before serving. (1) Every object on disk with no live put record is journaled
+   * (blobs before manifests). (2) Every journaled object missing on disk with no later delete gets a delete record, so
+   * the replica converges instead of blocking on a put that can never be shipped.
+   */
   reconcile() {
-    const last = lastKindByPath(this.root);
-    const report = { journaled: [], corrupt: [] };
+    const state = objectStateByPath(this.root);
+    const report = { journaled: [], corrupt: [], deleted: [] };
     const orphans = [];
+    const onDisk = new Set();
     for (const sub of ['blobs', 'manifests']) {
       for (const f of walkFiles(path.join(this.root, sub))) {
         const rel = path.relative(this.root, f.full).split(path.sep).join('/');
         const parsed = parseObjectPath(rel);
         if (!parsed) continue;
-        const kind = last.get(rel);
-        if (kind === 'blob' || kind === 'manifest') continue;
-        orphans.push({ rel, parsed, size: f.size });
+        onDisk.add(rel);
+        if (state.get(rel) !== 'put') orphans.push({ rel, parsed });
       }
     }
     orphans.sort((a, b) => (a.parsed.kind === b.parsed.kind ? 0 : a.parsed.kind === 'blob' ? -1 : 1));
@@ -202,6 +219,11 @@ export class ObjectStore {
       }
       this.journal.append({ kind: o.parsed.kind, path: o.rel, sha256: seen.sha256, size: seen.size, createdAt: this.now() });
       report.journaled.push(o.rel);
+    }
+    for (const [rel, st] of state) {
+      if (st !== 'put' || onDisk.has(rel)) continue;
+      this.journal.append({ kind: 'delete', path: rel, createdAt: this.now() });
+      report.deleted.push(rel);
     }
     return report;
   }
@@ -236,23 +258,22 @@ export class ObjectStore {
   }
 
   /**
-   * Whole-file immutable upload. Admission reserves the declared bytes; the body is streamed to tmp/ (every byte
-   * accounted for through `bytesWritten`), fsynced, then the bytes ON DISK are re-hashed and sized before the rename.
-   * A blob that already exists is verified the same way and deduplicated (its mtime is refreshed, restarting the
-   * unreferenced-blob grace window). Commit rechecks the cap, then journals; a failed append rolls the blob back.
+   * Whole-file immutable upload. Admission reserves the declared bytes (dedupe included, since retention can remove the
+   * blob mid-upload); the body is streamed to tmp/ (every byte accounted for through `bytesWritten`), fsynced, then the
+   * bytes ON DISK are re-hashed and sized. A blob that already exists is deduplicated (mtime refreshed). Commit checks the
+   * admission threshold plus live reservations BEFORE the rename; any failure after the rename rolls the blob back, and if
+   * that fails too the blob is counted and recorded in `unjournaled` so a retry or a manifest journals it first.
    */
   async putBlob(sha, readable, declaredSize) {
     if (!isSha256(sha)) throw new StoreError(400, 'bad sha256');
     if (declaredSize > this.maxBlobBytes) throw new StoreError(413, `blob exceeds the ${this.maxBlobBytes}-byte cap`);
     const final = this.abs(blobRelPath(sha));
-    let held = 0;
-    if (!this.hasBlob(sha)) {
-      this.reserve(declaredSize);
-      held = declaredSize;
-    }
-    const tmp = path.join(this.root, 'tmp', `${sha}.${crypto.randomBytes(6).toString('hex')}`);
+    this.reserve(declaredSize);
+    let held = declaredSize;
+    let tmp;
     try {
-      const fh = await fs.promises.open(tmp, 'wx', 0o640);
+      tmp = path.join(this.root, 'tmp', `${sha}.${crypto.randomBytes(6).toString('hex')}`);
+      const fh = await fs.promises.open(tmp, fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_WRONLY | fs.constants.O_NOFOLLOW, 0o640);
       let size = 0;
       try {
         for await (const chunk of readable) {
@@ -279,20 +300,16 @@ export class ObjectStore {
         if (this.unjournaled.has(sha)) this.journalBlob(sha);
         return { stored: false };
       }
+      if (this.bytes + size + (this.reserved - held) >= this.capBytes * ADMIT_FRACTION) throw new StoreError(507, 'store is above 95% of its cap');
+      this.flushPendingDeletes();
       fs.mkdirSync(path.dirname(final), { recursive: true });
       this.abs(blobRelPath(sha)); // re-check the ancestors now that they exist
       fs.renameSync(tmp, final);
-      const stamped = new Date(this.now());
-      fs.utimesSync(final, stamped, stamped); // retention reads mtime as "last uploaded", on the store's clock
-      fsyncDirectory(path.dirname(final));
-      this.release(held);
-      held = 0;
-      if (this.bytes + size > this.capBytes) {
-        fs.unlinkSync(final);
-        throw new StoreError(507, 'store is at its cap');
-      }
-      this.bytes += size;
+      this.bytes += size; // counted from the moment it exists, whatever happens next
       try {
+        const stamped = new Date(this.now());
+        fs.utimesSync(final, stamped, stamped); // retention reads mtime as "last uploaded", on the store's clock
+        fsyncDirectory(path.dirname(final));
         this.journalBlob(sha);
       } catch (err) {
         try {
@@ -306,7 +323,8 @@ export class ObjectStore {
       return { stored: true };
     } finally {
       this.release(held);
-      fs.rmSync(tmp, { force: true });
+      held = 0;
+      if (tmp) fs.rmSync(tmp, { force: true });
     }
   }
 
@@ -346,6 +364,7 @@ export class ObjectStore {
     }
     if (missing.length) throw new StoreError(409, 'manifest references blobs the store does not have', { missing: [...new Set(missing)] });
     if (this.bytes + this.reserved + bytes.length >= this.capBytes * ADMIT_FRACTION) throw new StoreError(507, 'store is above 95% of its cap');
+    this.flushPendingDeletes();
     for (const e of doc.entries) if (e.type === 'file' && this.unjournaled.has(e.sha256)) this.journalBlob(e.sha256);
     const rel = manifestRelPath(job);
     const metaRel = `meta/${job}.json`;
@@ -404,10 +423,25 @@ export class ObjectStore {
     return this.setJobState(job, 'pinned', !!pinned);
   }
 
-  /** Retention/replication delete: journal the deletion first, then remove (a failed removal is re-journaled as a put by reconcile). */
+  journalDelete(rel) {
+    this.journal.append({ kind: 'delete', path: rel, createdAt: this.now() });
+    this.pendingDeletes.delete(rel);
+  }
+
+  /** Retry delete records whose append failed after the unlink (nothing may be journaled ahead of them). */
+  flushPendingDeletes() {
+    for (const rel of [...this.pendingDeletes]) this.journalDelete(rel);
+  }
+
+  /**
+   * Retention/replication delete, unlink THEN journal: a delete record exists only for an object that is really gone. If
+   * the unlink fails nothing is journaled; if the append fails after a successful unlink the delete stays pending (retried
+   * before any later record, and by the startup reconcile), and the caller sees the error.
+   */
   deleteObject(rel) {
     const parsed = parseObjectPath(rel);
     if (!parsed) throw new StoreError(400, 'not an object path');
+    this.flushPendingDeletes();
     const file = this.abs(rel);
     let st;
     try {
@@ -416,13 +450,14 @@ export class ObjectStore {
       if (err.code === 'ENOENT') return false;
       throw err;
     }
-    this.journal.append({ kind: 'delete', path: rel, createdAt: this.now() });
     fs.unlinkSync(file);
     this.bytes -= st.size;
+    this.pendingDeletes.add(rel);
     if (parsed.kind === 'manifest') {
       fs.rmSync(this.abs(`meta/${parsed.job}.json`), { force: true });
       this.jobBlobCache.delete(parsed.job);
     }
+    this.journalDelete(rel);
     return true;
   }
 
