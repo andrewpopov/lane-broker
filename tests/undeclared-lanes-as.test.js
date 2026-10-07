@@ -168,3 +168,73 @@ test('"undeclaredLanes": {"as": ...} rejects a template lane that is localRefuse
     },
   );
 });
+
+// BRAIN-448: the built-in `default` lane must not bypass the template.
+function templateRepoNoDefault(base, extra = {}) {
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, {
+    version: 1,
+    undeclaredLanes: { as: 'prepush' },
+    lanes: {
+      prepush: { weight: 4, cpuCores: 2, memoryBytes: 1073741824, remote: true, remoteDeps: ['.', 'web'] },
+      ...extra,
+    },
+  });
+  return repoDir;
+}
+
+for (const [label, lane] of [['an explicit default', 'default'], ['an omitted lane', undefined]]) {
+  test(`${label} inherits the template when the file does not declare default`, () => {
+    const { base } = freshEnv();
+    const repoDir = templateRepoNoDefault(base);
+    const resolved = resolveTicketConfig({ cwd: repoDir, repo: 'r', lane });
+    assert.equal(resolved.weight, 4);
+    assert.equal(resolved.cpuCores, 2);
+    assert.equal(resolved.memoryBytes, 1073741824);
+    assert.equal(resolved.remote, true);
+    assert.deepEqual(resolved.remoteDeps, ['.', 'web']);
+    assert.equal(resolved.lane, 'default');
+    assert.equal(resolved.key, 'r:default');
+    assert.equal(resolved.configLane, 'prepush');
+  });
+}
+
+test('a file that declares default uses its own declaration, not the template', () => {
+  const { base } = freshEnv();
+  const repoDir = templateRepoNoDefault(base, { default: { weight: 3 } });
+  const resolved = resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' });
+  assert.equal(resolved.weight, 3);
+  assert.equal(resolved.remote, false);
+  assert.equal(resolved.configLane, undefined);
+});
+
+test('without a template, default stays the built-in (weight 2, not remote)', () => {
+  const { base } = freshEnv();
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, { version: 1, lanes: { other: { weight: 5, remote: true } } });
+  const resolved = resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' });
+  assert.equal(resolved.weight, 2);
+  assert.equal(resolved.remote, false);
+  assert.equal(resolved.configLane, undefined);
+});
+
+test('with no config file, default is the built-in', () => {
+  const { base } = freshEnv();
+  const resolved = resolveTicketConfig({ cwd: path.join(base, 'norepo'), repo: 'r', lane: 'default' });
+  assert.equal(resolved.weight, 2);
+  assert.equal(resolved.remote, false);
+  assert.equal(resolved.key, 'r:default');
+});
+
+for (const [label, lane] of [['an explicit default', 'default'], ['an omitted lane', undefined]]) {
+  test(`${label} under "as": "default" with no file-declared default resolves exactly as before`, () => {
+    const { base } = freshEnv();
+    const repoDir = path.join(base, 'repo');
+    writeRepoConfig(repoDir, { version: 1, undeclaredLanes: { as: 'default' }, lanes: { other: { weight: 5, remote: true } } });
+    const resolved = resolveTicketConfig({ cwd: repoDir, repo: 'r', lane });
+    assert.equal(resolved.weight, 2);
+    assert.equal(resolved.remote, false);
+    assert.equal(resolved.key, 'r:default');
+    assert.equal(resolved.configLane, undefined);
+  });
+}

@@ -285,7 +285,10 @@ inherit that lane's own named `conflicts` entries or its `maxConcurrent`
 `"allow"`. The named lane must be declared and must not be `localRefused`.
 This is for a repo where every ad-hoc per-ticket lane (e.g. `zirk812`) should
 run at the same size and remote eligibility as one canonical template lane,
-without an operator hand-declaring each one.
+without an operator hand-declaring each one. That includes `default` (a bare
+`lane run`) when the file does not declare `default` itself (BRAIN-448):
+before 0.25.1 the built-in `default` always counted as declared, so it ran
+local at weight 2 and ignored the template.
 
 A lane's own `maxConcurrent` (integer >= 1, e.g. `"fleet": { "weight": 1,
 "maxConcurrent": 4 }`) relaxes ONLY the same-key rule above: up to that many
