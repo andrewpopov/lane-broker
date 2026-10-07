@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, loadGlobalConfig } from './config.js';
 import { CAPABILITIES } from './capabilities.js';
@@ -20,6 +20,7 @@ import { collectStatus } from './status.js';
 import { readLease, isSupervisorAlive } from './lease.js';
 import { readAttempt } from './attempts.js';
 import { listQueue, dequeueSync } from './scheduler.js';
+import { REMOTE_TMP_BASE, gcRemoteTickets, removeDetached } from './gc.js';
 import { sanitizeObservedCpu, sanitizeRssPeak, sanitizeCpuSeconds } from './observed.js';
 
 // BRAIN-320 S1b (1b): the absolute path to `bin/lane.js`, so a protocol-2
@@ -31,7 +32,6 @@ const laneBinPath = fileURLToPath(new URL('../bin/lane.js', import.meta.url));
 // FHS (/tmp is tmpfs on the runners) and short enough that a Unix socket bound
 // under os.tmpdir() stays inside sun_path's 107 bytes, which a path under the
 // ticket directory (86 bytes before the socket name) does not.
-const REMOTE_TMP_BASE = '/var/tmp';
 
 // BRAIN-319 T3: fixed, deterministic author/committer identity for the
 // synthetic snapshot commit -- this is never a real authored change, just a
@@ -75,7 +75,6 @@ function gitInitSnapshot(workDir) {
   return { ok: true };
 }
 
-const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const REPO_KEY_RE = /^[A-Za-z0-9._:-]{1,200}$/;
 
 // BRAIN-319: kept well under the platform arg/exec limits, generous for any
@@ -90,10 +89,6 @@ const PREFLIGHT_REFUSAL_EXIT_CODES = new Set([64, 69, 2]);
 
 export function defaultRemoteRoot() {
   return path.join(os.homedir(), '.cache', 'lane-broker', 'remote');
-}
-
-function isUuid(v) {
-  return typeof v === 'string' && UUID_RE.test(v);
 }
 
 function isPositiveFiniteOrAbsent(v) {
@@ -293,6 +288,20 @@ function cleanupWork(workDir, tmpDir) {
 }
 
 /**
+ * BRAIN-438: reclaim what earlier tickets left on this runner before taking a new one. Bounded per run and removed in a
+ * detached `rm`, so the submitter's ssh session never waits on it; a failure here (lock timeout, bad config) is never a
+ * reason to refuse the ticket.
+ */
+async function collectGarbage(root) {
+  try {
+    const cfg = loadGlobalConfig();
+    await gcRemoteTickets({ remoteRoot: root, retentionMs: cfg.remoteTicketRetentionMs, maxTickets: cfg.remoteGcMaxTicketsPerRun, remove: removeDetached });
+  } catch {
+    // best-effort
+  }
+}
+
+/**
  * `lane remote-exec` (BRAIN-319 T2): read a framed snapshot stream (header +
  * body, see remote-stream.js) off `stdin`, extract and verify it into a
  * fresh per-ticket work dir, then run the requested argv through THIS
@@ -341,6 +350,8 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   for (const name of Object.keys(process.env)) {
     if (!(name in scrubbed)) delete process.env[name];
   }
+
+  await collectGarbage(root);
 
   const reader = makeReader(stdin);
   const headerResult = await readHeaderLine(reader, MAX_HEADER_BYTES);
@@ -412,6 +423,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   // pipeline's setup/command children, and a protocol-1 argv via runCommand),
   // so setting it once here covers them all.
   const tmpDir = fs.mkdtempSync(path.join(REMOTE_TMP_BASE, 'lb-'));
+  atomicWriteFile(path.join(ticketDir, 'tmp-dir'), tmpDir);
   process.env.TMPDIR = tmpDir;
   process.env.TMP = tmpDir;
   process.env.TEMP = tmpDir;
@@ -782,7 +794,6 @@ export async function withdrawLane(brokerRoot, laneId, { dequeue = dequeueSync }
 
 /** BRAIN-436: a cancel or withdraw for a ticket this runner has never heard of (its exec is still in flight, or never came). */
 class TombstonedError extends Error {}
-const tombstonePath = (root, ticketId) => path.join(path.resolve(root), 'tombstones', ticketId);
 
 /**
  * Record, under the broker lock `remote-exec` creates tickets under, that `ticketId` must never be created -- unless its ticket

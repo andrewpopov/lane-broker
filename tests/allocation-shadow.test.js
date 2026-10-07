@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, stripLogTimestamps } from './helpers.js';
 import { enqueue, tryStart } from '../src/scheduler.js';
 import { writeLease } from '../src/lease.js';
 import { paths, atomicWriteJson, bootId } from '../src/state.js';
@@ -29,7 +29,7 @@ const poll = (state, t, cfg, { ext = 0, evaluator, capture, mem = memory } = {})
 
 const readLog = (state) => {
   try {
-    return fs.readFileSync(paths(state).admissionLog, 'utf8');
+    return stripLogTimestamps(fs.readFileSync(paths(state).admissionLog, 'utf8'));
   } catch {
     return '';
   }

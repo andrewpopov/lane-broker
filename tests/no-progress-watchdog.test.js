@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, laneSpawn, waitFor, sleep } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, laneSpawn, waitFor, sleep, stripLogTimestamps } from './helpers.js';
 import { setup, resultOf } from './remote-harness.js';
 import { paths } from '../src/state.js';
 import { readLease } from '../src/lease.js';
@@ -99,7 +99,7 @@ test('config: noProgressTimeoutMs defaults to 0 (kill off) and is validated glob
   assert.throws(() => loadGlobalConfig(), /noProgressTimeoutMs/);
 });
 
-const logAllReaps = (state, id) => fs.readFileSync(paths(state).admissionLog, 'utf8').split('\n').filter((l) => l.startsWith(`lane-broker-reap id=${id} descendants-reaped=`));
+const logAllReaps = (state, id) => stripLogTimestamps(fs.readFileSync(paths(state).admissionLog, 'utf8')).split('\n').filter((l) => l.startsWith(`lane-broker-reap id=${id} descendants-reaped=`));
 
 const QUIET_THEN_EXIT = node(`process.stdout.write('started\\n'); setTimeout(() => {}, 3500);`);
 // idle 1.2s, a CPU burst, idle 1.2s: no idle streak reaches the 2s window, though the silent total does

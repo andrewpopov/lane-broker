@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { makeTmpDir } from './helpers/tmp.js';
+import { stripLogTimestamps } from './helpers.js';
 
 /**
  * BRAIN-379 slice 2: scripted admission scenarios, driven against ANY copy of the broker's modules. The
@@ -190,7 +191,7 @@ export async function runScript(m, script, { allocationShadow, freshState, seams
             return [n, normalize(parsed)];
           }),
       );
-    const log = raw(p.admissionLog) ?? '';
+    const log = stripLogTimestamps(raw(p.admissionLog) ?? '');
     return {
       state,
       results,

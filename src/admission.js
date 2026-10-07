@@ -512,6 +512,19 @@ export function formatAdmissionLog(f) {
   ].join(' ');
 }
 
+/** The admission log is rotated to `<file>.1` (replacing the previous one) once it reaches this size. */
+export const ADMISSION_LOG_MAX_BYTES = 10 * 1024 * 1024;
+
+/** Append `line` (already newline-terminated) to `file`, ISO-timestamped, rotating first when `file` is at `maxBytes`. */
+export function appendRotatingLog(file, line, { maxBytes = ADMISSION_LOG_MAX_BYTES, now = Date.now() } = {}) {
+  try {
+    if (fs.statSync(file).size >= maxBytes) fs.renameSync(file, `${file}.1`);
+  } catch {
+    // no log yet, or a concurrent writer rotated it first
+  }
+  fs.appendFileSync(file, `${new Date(now).toISOString()} ${line}`);
+}
+
 /**
  * Shared low-level writer for every broker-side log line, admission
  * decisions and BRAIN-249's head-block lines alike: append to a real file
@@ -524,20 +537,43 @@ export function formatAdmissionLog(f) {
  */
 export function writeBrokerLog(root, line) {
   try {
-    fs.appendFileSync(paths(root).admissionLog, line);
+    appendRotatingLog(paths(root).admissionLog, line);
   } catch {
     // best-effort — disk-full or similar must never affect scheduling, same tolerance as appendHistory in state.js
   }
 }
 
+// More candidates than this can never be waiting at once on a real host; the oldest entry is forgotten past it.
+const LAST_DECISION_MAX_ENTRIES = 256;
+
+/** The (decision, reason) pair a candidate's log line reports, current rule and phase-1 predicate both. */
+function decisionSignature(f) {
+  return `${f.currentDecision}:${f.currentReason}|${f.admit ? 'admit' : 'deny'}:${f.reason}`;
+}
+
 /**
- * Write one admission-decision line. Pure telemetry — nothing reads it back
- * to make a decision — so the caller (scheduler.js) calls this AFTER
- * releasing the global lock, on both the admit and deny paths, never from
- * inside it.
+ * Write one admission-decision line, but only when this candidate's (decision, reason) differs from the last one
+ * written for it (BRAIN-438: the line used to be appended per poll per candidate, ~200k lines of repeats). The last
+ * decision per candidate lives in `admission-last.json`, shared by every supervisor, since any of them may evaluate
+ * the same head. A candidate that is admitted is forgotten, its id never recurs. Pure telemetry -- nothing reads it
+ * back to make a decision -- so the caller (scheduler.js) calls this AFTER releasing the global lock, on both the
+ * admit and deny paths, never from inside it. A lost read-modify-write race costs one repeated line, nothing more.
  */
 export function logAdmissionDecision(root, fields) {
+  const file = paths(root).admissionLast;
+  const signature = decisionSignature(fields);
+  const last = readJsonSafe(file) ?? {};
+  if (last[fields.candidateId] === signature) return;
   writeBrokerLog(root, `${formatAdmissionLog(fields)}\n`);
+  try {
+    delete last[fields.candidateId];
+    if (!fields.admit) last[fields.candidateId] = signature;
+    const ids = Object.keys(last);
+    for (const id of ids.slice(0, Math.max(0, ids.length - LAST_DECISION_MAX_ENTRIES))) delete last[id];
+    atomicWriteJson(file, last);
+  } catch {
+    // best-effort, same as the log line itself
+  }
 }
 
 /**

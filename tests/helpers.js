@@ -187,3 +187,8 @@ export async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 20 } =
     await sleep(intervalMs);
   }
 }
+
+/** The admission log prefixes every line with an ISO timestamp (BRAIN-438); tests that match on a line's start read it without. */
+export function stripLogTimestamps(text) {
+  return text.replace(/^\d{4}-\d\d-\d\dT[\d:.]+Z /gm, '');
+}

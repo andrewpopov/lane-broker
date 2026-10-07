@@ -18,6 +18,8 @@ import {
   remoteArtifactsReleaseCommand,
   defaultRemoteRoot,
 } from '../src/remote-runner.js';
+import { gcCommand } from '../src/gc.js';
+import { loadGlobalConfig } from '../src/config.js';
 import { capabilitiesCommand } from '../src/capabilities.js';
 import { remotePipelineCommand } from '../src/remote-pipeline.js';
 
@@ -34,6 +36,7 @@ function usage() {
   lane pause ["reason"]
   lane resume
   lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
+  lane gc [--dry-run] [--max <n>] [--root <remoteRoot>]
 `;
 }
 
@@ -223,6 +226,10 @@ async function main() {
         }
       }
       const result = await migrateSchedulerCommand({ dryRun, whenIdle, ...(timeoutMs === undefined ? {} : { timeoutMs }) });
+      return result.exitCode;
+    }
+    case 'gc': {
+      const result = await gcCommand(rest, { remoteRoot: parseRootFlag(rest) || defaultRemoteRoot(), cfg: loadGlobalConfig() });
       return result.exitCode;
     }
     case 'capabilities': {

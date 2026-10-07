@@ -33,6 +33,7 @@ import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remo
 import { REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
 import { createAttempt, readAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX } from './admission.js';
+import { maybeDailyGc } from './gc.js';
 import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, noProgressMessage } from './no-progress.js';
 import { observedLeaseFields, summarizeObservedCpu, sanitizeObservedCpu, sanitizeRssPeak, integratedCpuSeconds, sanitizeCpuSeconds } from './observed.js';
 
@@ -973,6 +974,8 @@ async function main() {
   // on defaults rather than crash before it ever reaches the resilient
   // polling loop below — the exact torn-read window this fix exists for.
   let globalCfg = reloadGlobalConfig(undefined, { onError: (err) => recordConfigReloadError(root, err) });
+  // BRAIN-438: not awaited, so it never delays the first admission; at most once a day per broker (see maybeDailyGc).
+  void maybeDailyGc(root, globalCfg);
   const supervisorStart = processStartTime(process.pid);
   const enriched = {
     ...ticket,

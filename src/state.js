@@ -63,6 +63,10 @@ export function paths(root = stateHome()) {
     cpuSample: path.join(root, 'cpu-sample.json'),
     cpuGate: path.join(root, 'cpu-gate.json'),
     admissionLog: path.join(root, 'admission-decisions.log'),
+    // BRAIN-438: the last admission decision written per candidate, so an unchanged one is not written again.
+    admissionLast: path.join(root, 'admission-last.json'),
+    // BRAIN-438: when the opportunistic logs/results sweep last ran (src/gc.js).
+    gcLastRun: path.join(root, 'gc-last-run'),
     conflictSkipState: path.join(root, 'conflict-skip-state.json'),
     // BRAIN-249 part 2: the capacity-blocked head's own skip counter — kept
     // separate from conflictSkipState (see readCapacitySkipState's doc
@@ -93,6 +97,18 @@ export function paths(root = stateHome()) {
     // ticket, keyed by ticket id -- see src/attempts.js.
     attempts: path.join(root, 'attempts'),
   };
+}
+
+const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
+export function isUuid(v) {
+  return typeof v === 'string' && UUID_RE.test(v);
+}
+
+/** BRAIN-436: the runner-side record that a ticket id was cancelled or withdrawn before its `remote-exec` arrived (one file
+ *  per id under the REMOTE root, not the broker root). `remote-exec` refuses an id that has one; src/gc.js decides how long it lives. */
+export function tombstonePath(remoteRoot, ticketId) {
+  return path.join(path.resolve(remoteRoot), 'tombstones', ticketId);
 }
 
 /** Deterministic path of a ticket's cancel marker: one file per id under

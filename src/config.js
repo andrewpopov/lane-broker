@@ -136,6 +136,15 @@ export const DEFAULT_GLOBAL_CONFIG = {
   remoteArtifactMaxFileBytes: 16 * 1024 * 1024,
   remoteArtifactMaxTotalBytes: 64 * 1024 * 1024,
   remoteArtifactMaxCount: 200,
+  // BRAIN-438: garbage collection of what a run leaves behind (src/gc.js). A runner's whole ticket directory (and a
+  // tombstone) is kept this long, so it also bounds how late a `remote-exec` for a cancelled id can still be refused.
+  remoteTicketRetentionMs: 7 * 24 * 3_600_000,
+  // At most this many ticket directories are cleaned per run, so `remote-exec` startup stays fast.
+  remoteGcMaxTicketsPerRun: 10,
+  // logs/ and results/ files older than this are pruned (never a live lease's or a queued ticket's), at most
+  // logGcMaxFilesPerRun per run.
+  logRetentionMs: 14 * 24 * 3_600_000,
+  logGcMaxFilesPerRun: 5000,
 };
 
 export const DEFAULT_REPO_CONFIG = {
@@ -159,6 +168,9 @@ function assert(cond, msg) {
 }
 
 export class ConfigError extends Error {}
+
+// A retention below a day could expire a tombstone while its submitter's dispatch is still in flight (see src/gc.js).
+const MIN_RETENTION_MS = 86_400_000;
 
 function validateGlobalConfig(cfg, sourcePath) {
   assert(cfg && typeof cfg === 'object', `${sourcePath}: config must be an object`);
@@ -274,6 +286,12 @@ function validateGlobalConfig(cfg, sourcePath) {
     `${sourcePath}: "remoteDepsCacheMaxBytes" must be a positive integer`,
   );
   for (const field of ['remoteArtifactMaxFileBytes', 'remoteArtifactMaxTotalBytes', 'remoteArtifactMaxCount']) {
+    assert(Number.isInteger(cfg[field]) && cfg[field] > 0, `${sourcePath}: "${field}" must be a positive integer`);
+  }
+  for (const field of ['remoteTicketRetentionMs', 'logRetentionMs']) {
+    assert(Number.isInteger(cfg[field]) && cfg[field] >= MIN_RETENTION_MS, `${sourcePath}: "${field}" must be an integer of at least ${MIN_RETENTION_MS} (one day)`);
+  }
+  for (const field of ['remoteGcMaxTicketsPerRun', 'logGcMaxFilesPerRun']) {
     assert(Number.isInteger(cfg[field]) && cfg[field] > 0, `${sourcePath}: "${field}" must be a positive integer`);
   }
   if (cfg.runners !== undefined) validateRunners(cfg.runners, sourcePath);
