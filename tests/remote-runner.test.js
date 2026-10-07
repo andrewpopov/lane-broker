@@ -799,35 +799,110 @@ test('remote-cancel against a stopped (SIGSTOP) supervisor reports cancelRequest
   assert.equal(result.kind, 'cancelled');
 });
 
-test('remote-cancel against a not-yet-registered id reports cancelRequested true, cancelConfirmed false, registered false (BRAIN-319 P3 follow-up)', async () => {
+test('remote-cancel after remote-id but before the ticket is registered is confirmed, and the ticket never runs (BRAIN-319 P3 follow-up, BRAIN-438 window)', async () => {
   const { env } = freshShadowEnv();
   const root = tmpDir('remote-exec-root');
   const pauseFile = path.join(tmpDir('remote-exec-pause'), 'go');
+  const ranFile = path.join(tmpDir('remote-exec-ran'), 'ran');
   const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
-  const header = makeHeader({ argv: [process.execPath, '-e', 'process.exit(0)'] });
+  const header = makeHeader({ argv: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(ranFile)}, 'x')`] });
 
   const stream = encodeSnapshot(src, header, entries);
   const spawnEnv = { ...env, LANE_BROKER_TEST_PAUSE_AFTER_TICKET_ID: pauseFile };
   const { child } = spawnRemoteExec(stream, { env: spawnEnv, root });
 
-  // remote-id exists, but onTicketCreated is paused (pauseFile doesn't exist
-  // yet) -- run.js has not spawned the supervisor, so this id is registered
-  // NOWHERE in the local broker (no queue entry, no lease, no attempt
-  // record) at the moment remote-cancel runs.
+  // remote-id exists, but onTicketCreated is paused (pauseFile doesn't exist yet) -- run.js has not spawned the supervisor, so
+  // this id is registered NOWHERE in the local broker (no queue entry, no lease, no attempt record) at the moment remote-cancel runs.
   const remoteIdPath = path.join(root, 'tickets', header.ticketId, 'remote-id');
   await waitFor(() => fs.existsSync(remoteIdPath));
 
   const cancelResult = await laneRun(['remote-cancel', header.ticketId, '--root', root], { env });
   assert.equal(cancelResult.code, 0, `stderr: ${cancelResult.stderr}`);
   const parsed = JSON.parse(cancelResult.stdout.trim());
-  assert.equal(parsed.cancelRequested, true, 'the marker write itself always succeeds');
-  assert.equal(parsed.cancelConfirmed, false, 'cancelCommand had nothing registered to act on yet');
-  assert.equal(parsed.registered, false, 'the (unlocked, informational) read saw no queue/lease/attempt entry');
+  assert.equal(parsed.cancelRequested, true);
+  assert.equal(parsed.registered, false);
+  assert.equal(parsed.cancelConfirmed, true, 'nothing is registered and the broker marker refuses any later start');
 
   fs.mkdirSync(path.dirname(pauseFile), { recursive: true });
   fs.writeFileSync(pauseFile, '1');
   const code = await waitClose(child);
   assert.equal(code, 0);
+  assert.equal((await getResult(header.ticketId, root, env)).kind, 'cancelled');
+  assert.equal(fs.existsSync(ranFile), false, 'the command never ran');
+});
+
+test('remote-cancel after the ticket dir exists but BEFORE remote-id is written is confirmed, the exec refuses to enqueue, and nothing runs', async () => {
+  const { env, base } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const ready = path.join(base, 'hold-ready');
+  const go = path.join(base, 'hold-go');
+  const ranFile = path.join(tmpDir('remote-exec-ran'), 'ran');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ argv: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(ranFile)}, 'x')`] });
+
+  const stream = encodeSnapshot(src, header, entries);
+  const spawnEnv = { ...env, LANE_BROKER_TEST_HOLD_AT: 'remote-exec-before-id', LANE_BROKER_TEST_HOLD_READY: ready, LANE_BROKER_TEST_HOLD_GO: go };
+  const { child } = spawnRemoteExec(stream, { env: spawnEnv, root });
+  await waitFor(() => fs.existsSync(ready), { timeoutMs: 30_000 });
+  const ticketDir = path.join(root, 'tickets', header.ticketId);
+  assert.ok(fs.existsSync(ticketDir), 'the ticket dir exists');
+  assert.equal(fs.existsSync(path.join(ticketDir, 'remote-id')), false, 'but remote-id does not yet');
+
+  const cancelResult = await laneRun(['remote-cancel', header.ticketId, '--root', root], { env });
+  assert.equal(cancelResult.code, 0, `stderr: ${cancelResult.stderr}`);
+  const parsed = JSON.parse(cancelResult.stdout.trim());
+  assert.equal(parsed.cancelConfirmed, true, 'the exec will see the marker under the same lock and refuse');
+  assert.equal(parsed.registered, false);
+
+  fs.writeFileSync(go, 'x');
+  const code = await waitClose(child);
+  assert.equal(code, 0);
+  assert.equal((await getResult(header.ticketId, root, env)).kind, 'cancelled');
+  assert.equal(fs.existsSync(ranFile), false, 'the command never ran');
+});
+
+// A read that FAILS is an unknown, never a proof of absence: it must leave the cancel unconfirmed.
+async function remoteCancelWith(arrange) {
+  const { env, state } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const header = makeHeader();
+  const ticketDir = path.join(root, 'tickets', header.ticketId);
+  fs.mkdirSync(ticketDir, { recursive: true });
+  const laneId = crypto.randomUUID();
+  arrange({ ticketDir, state, laneId });
+  const out = await laneRun(['remote-cancel', header.ticketId, '--root', root], { env });
+  assert.equal(out.code, 0, out.stderr);
+  return JSON.parse(out.stdout.trim());
+}
+
+test('remote-cancel: a remote-id that exists but cannot be read is UNCONFIRMED, not "no remote-id"', async () => {
+  const parsed = await remoteCancelWith(({ ticketDir, laneId }) => {
+    fs.writeFileSync(path.join(ticketDir, 'remote-id'), laneId);
+    fs.chmodSync(path.join(ticketDir, 'remote-id'), 0o000);
+  });
+  assert.equal(parsed.cancelConfirmed, false);
+});
+
+test('remote-cancel: a genuinely absent remote-id is still confirmed', async () => {
+  const parsed = await remoteCancelWith(() => {});
+  assert.equal(parsed.cancelConfirmed, true);
+});
+
+test('remote-cancel: an unreadable lease record leaves the cancel unconfirmed (both the first check and the post-failure re-check)', async () => {
+  const parsed = await remoteCancelWith(({ ticketDir, state, laneId }) => {
+    fs.writeFileSync(path.join(ticketDir, 'remote-id'), laneId);
+    fs.mkdirSync(paths(state).leases, { recursive: true });
+    const lease = path.join(paths(state).leases, `${laneId}.json`);
+    fs.writeFileSync(lease, JSON.stringify({ id: laneId, supervisorPid: process.pid }));
+    fs.chmodSync(lease, 0o000);
+  });
+  assert.equal(parsed.cancelConfirmed, false);
+  assert.equal(parsed.cancelRequested, true, 'the broker marker is still written');
+});
+
+test('remote-cancel: a ticket with a remote-id and no broker records at all is confirmed', async () => {
+  const parsed = await remoteCancelWith(({ ticketDir, laneId }) => fs.writeFileSync(path.join(ticketDir, 'remote-id'), laneId));
+  assert.equal(parsed.cancelConfirmed, true);
 });
 
 // BRAIN-320 review fix B: a direct runner-side `lane cancel <id>` (the

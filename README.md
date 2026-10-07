@@ -45,6 +45,7 @@ lane cancel <id>
 lane wait <id> [--timeout 5m]
 lane pause "reason" | lane resume
 lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
+lane gc [--dry-run] [--max <n>]
 ```
 
 `lane status` adds `  log file unchanged for <duration>` to a RUNNING line once the
@@ -430,6 +431,20 @@ What a remote run does:
    `remote`, and a ticket that fell back for any reason other than "no runner
    had room" (an ineligible tree, a `remoteDeps` failure, a dispatch that
    failed after sending).
+
+   **Local-first lanes (BRAIN-442).** A lane with `"remotePolicy": "local-first"`
+   (default `"remote-first"`, today's behaviour) skips the initial dispatch and
+   enqueues locally, keeping its remote eligibility (`remote.fallback.reason`
+   is `local-first`). If this machine admits it, it simply runs here. Only once
+   it has waited `localFirstWaitMs` in the local queue (lane key, else the global
+   `localFirstWaitMs`, default `90000`) does late rebinding above apply to it,
+   so it moves to a runner only when it would otherwise keep waiting. It needs
+   `remoteRebindIntervalMs` > 0 to ever move. History rows and queue records carry
+   `localFirst: true`, and the rebind log line ends `, local-first`.
+
+   ```json
+   "lanes": { "prepush": { "remote": true, "remotePolicy": "local-first", "localFirstWaitMs": 60000 } }
+   ```
 
 3. **Send a snapshot**, not history: a framed stream of exactly the listed
    files. Each file is re-read without following symlinks and its sha256
@@ -1483,12 +1498,54 @@ the queue so you know what's waiting and why.
 ## State
 
 `$LANE_BROKER_STATE` (default `~/.cache/lane-broker`): `leases/`, `queue/`,
-`priority-hwm.json` (the priority clock's high-water mark), `migrating` (present only while `lane migrate-scheduler` runs), `draining` (present only while `lane migrate-scheduler --when-idle` waits for the broker to go idle), `queue-quarantine/` (see below), `sched-v2.json` and `fairness-v2.json` (the priority scheduler fence and its per-ticket fairness records), `logs/` (per-run, capped at 50MB with a truncation notice), `results/`,
+`priority-hwm.json` (the priority clock's high-water mark), `migrating` (present only while `lane migrate-scheduler` runs), `draining` (present only while `lane migrate-scheduler --when-idle` waits for the broker to go idle), `queue-quarantine/` (see below), `sched-v2.json` and `fairness-v2.json` (the priority scheduler fence and its per-ticket fairness records), `logs/` (per-run, capped at 50MB with a truncation notice), `results/` (both pruned, see Garbage collection),
 `history.jsonl` (one line per completed run, plus one `dequeuedDeadSupervisor: true`
 row `{id, key, error, supervisorPid, endedAt, executor}` (`error: "supervisor died while queued"`, so a history reader counts it as an error, not a failed run) when a queued ticket whose
 supervisor died is dropped from the queue; it is written only once the queue
 record is actually removed), and `PAUSE` (present while paused). All writes are atomic (temp file + rename) and never follow
 symlinks.
+
+## Garbage collection (BRAIN-438)
+
+What a run leaves behind is collected; what a live one owns never is. Everything here is also available on demand as
+`lane gc [--dry-run] [--max <n>] [--root <remoteRoot>]` (both sweeps, unbounded unless `--max`, one JSON summary line;
+`--dry-run` reports and removes nothing).
+
+- **Runner ticket GC** (global config `remoteTicketRetentionMs`, default 7 days; `remoteGcMaxTicketsPerRun`, default 10).
+  Runs at the start of every `lane remote-exec` and from `lane gc`. A ticket's `work/` and tmp dir (recorded in its
+  `tmp-dir` file) are removed once it has a terminal `result.json`; the whole ticket directory is removed once it is older
+  than the retention. Either way only if all of these hold, checked under the broker lock: its `publisher.json` pid is
+  dead, its broker ticket (`remote-id`) has no lease and no queue entry, no cancel/withdraw/expiry marker is pending for
+  it, and its id has no tombstone. A directory is first renamed into `<remoteRoot>/gc-trash` inside the lock and deleted
+  afterwards (detached from `remote-exec`, so the submitter's ssh session never waits on it). `tickets/` and `gc-trash/` must
+  be real directories inside the runner root (a symlink is refused, and only real directories inside `gc-trash` are ever
+  deleted). At most `remoteGcMaxTicketsPerRun` directories are acted on and `remoteGcMaxExaminedPerRun` (default 50) even
+  looked at per `remote-exec`, resuming from a persisted cursor (`gc-cursor`) so all are eventually visited.
+- **Tombstones are never pruned.** A tombstone (BRAIN-436) is the only thing refusing an exec for an id that was cancelled
+  before it arrived, and nothing bounds how late that exec can be (a suspended process or long-lived ssh session is not
+  covered by `ConnectTimeout`). Expiring one would let it recreate and run a cancelled ticket. They are tiny files. GC also
+  never touches a tombstoned id's ticket directory.
+- **Logs and results** (`logRetentionMs`, default 14 days; `logGcMaxFilesPerRun`, default 5000). Only broker-generated names
+  are pruned: `logs/<uuid>.log` and `results/<uuid>.json` older than the retention, whose uuid has no lease, queue entry or
+  attempt record. A custom `lane run --log <path>` file is never touched, so no alias or new-user race exists. `logs/` and
+  `results/` must be real directories inside the state root; otherwise that sweep is skipped with one
+  `lane-broker-gc warning` line in the admission log. Runs from `lane gc` and, at most once a day (marker `gc-last-run`), at a
+  supervisor's start, never on the admission path. A sweep that stops at its bound leaves the marker unclaimed so the next
+  supervisor continues.
+- **Tmp dirs.** `remote-exec` writes `.lane-broker-owner` (the ticket id) inside each ticket's tmp dir. GC deletes a recorded
+  tmp dir only if it is a real `lb-*` directory directly under `/var/tmp` carrying a marker naming that ticket; a legacy
+  dir without a marker, or with another ticket's, is left and reported as `tmpSkipped`.
+- **Threat model.** Accidental configuration (a symlinked directory, a stale recorded path, a custom log path) and ordinary
+  concurrency between broker processes. A same-uid adversary swapping directories for symlinks during a sweep is out of scope:
+  they can already delete anything that uid owns.
+- **Off the dispatch path.** `remote-exec` schedules ticket GC after it has read its header and created its ticket (a later
+  event-loop turn), so dispatch latency never includes it; failures go to the broker log.
+- **`admission-decisions.log`.** Each line starts with an ISO-8601 UTC timestamp. A `lane-broker-admission` line is written
+  only when a candidate's (current decision:reason, new decision:reason) differs from the last one written for it (kept in
+  `admission-last.json`; an admitted candidate is forgotten). The log rotates to `admission-decisions.log.1` at 10 MiB,
+  replacing the previous `.1`. Readers that match a line by content (`candidate=...`) are unaffected by the prefix; one
+  an unchanged decision is written again every 60 seconds (`ADMISSION_LOG_REFRESH_MS`, 60 s; polls are every 5 s, so dedup still
+  cuts ~12x), so a waiting candidate's line in the tail is never more than 60 s stale.
 
 ## Testing hooks
 

@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, loadGlobalConfig } from './config.js';
 import { CAPABILITIES } from './capabilities.js';
@@ -17,9 +17,11 @@ import { makeReader, readHeaderLine, extractFrames, MAX_HEADER_BYTES } from './r
 import { runCommand } from './run.js';
 import { cancelCommand } from './cancel.js';
 import { collectStatus } from './status.js';
-import { readLease, isSupervisorAlive } from './lease.js';
-import { readAttempt } from './attempts.js';
-import { listQueue, dequeueSync } from './scheduler.js';
+import { readLease, isSupervisorAlive, listLeasesStrict } from './lease.js';
+import { readAttempt, listAttemptsStrict } from './attempts.js';
+import { listQueue, listQueueStrict, dequeueSync } from './scheduler.js';
+import { REMOTE_TMP_BASE, TMP_OWNER_FILE, gcRemoteTickets, removeDetached } from './gc.js';
+import { writeBrokerLog } from './admission.js';
 import { sanitizeObservedCpu, sanitizeRssPeak, sanitizeCpuSeconds } from './observed.js';
 
 // BRAIN-320 S1b (1b): the absolute path to `bin/lane.js`, so a protocol-2
@@ -31,7 +33,6 @@ const laneBinPath = fileURLToPath(new URL('../bin/lane.js', import.meta.url));
 // FHS (/tmp is tmpfs on the runners) and short enough that a Unix socket bound
 // under os.tmpdir() stays inside sun_path's 107 bytes, which a path under the
 // ticket directory (86 bytes before the socket name) does not.
-const REMOTE_TMP_BASE = '/var/tmp';
 
 // BRAIN-319 T3: fixed, deterministic author/committer identity for the
 // synthetic snapshot commit -- this is never a real authored change, just a
@@ -75,7 +76,6 @@ function gitInitSnapshot(workDir) {
   return { ok: true };
 }
 
-const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const REPO_KEY_RE = /^[A-Za-z0-9._:-]{1,200}$/;
 
 // BRAIN-319: kept well under the platform arg/exec limits, generous for any
@@ -90,10 +90,6 @@ const PREFLIGHT_REFUSAL_EXIT_CODES = new Set([64, 69, 2]);
 
 export function defaultRemoteRoot() {
   return path.join(os.homedir(), '.cache', 'lane-broker', 'remote');
-}
-
-function isUuid(v) {
-  return typeof v === 'string' && UUID_RE.test(v);
 }
 
 function isPositiveFiniteOrAbsent(v) {
@@ -293,6 +289,41 @@ function cleanupWork(workDir, tmpDir) {
 }
 
 /**
+ * BRAIN-438: reclaim what earlier tickets left on this runner. Scheduled after this exec has its ticket, never on the
+ * dispatch path; bounded per run and removed in a detached `rm`, so the submitter's ssh session never waits on it. A failure
+ * (lock timeout, bad config) is logged to the broker log and never affects the ticket.
+ */
+/**
+ * Is `id` queued, leased or attempted in the broker at `brokerRoot`? Call under the broker lock for an answer that cannot change
+ * under you. For a CONFIRMATION proof: a record that cannot be read (anything but a vanished file) THROWS rather than reading as
+ * absent, so a caller never concludes "not registered" from a read it could not make.
+ */
+function isRegisteredInBroker(brokerRoot, id) {
+  const has = (records) => records.some((r) => r.id === id);
+  return has(listLeasesStrict(brokerRoot)) || has(listAttemptsStrict(brokerRoot)) || has(listQueueStrict(brokerRoot));
+}
+
+/** The text of `file`, or null only when it genuinely does not exist (ENOENT/ENOTDIR). Any other read error throws. */
+function readIfExists(file) {
+  try {
+    return fs.readFileSync(file, 'utf8').trim();
+  } catch (err) {
+    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return null;
+    throw err;
+  }
+}
+
+async function collectGarbage(root) {
+  try {
+    await testHoldAt('remote-gc');
+    const cfg = loadGlobalConfig();
+    await gcRemoteTickets({ remoteRoot: root, retentionMs: cfg.remoteTicketRetentionMs, maxTickets: cfg.remoteGcMaxTicketsPerRun, maxExamined: cfg.remoteGcMaxExaminedPerRun, remove: removeDetached });
+  } catch (err) {
+    writeBrokerLog(ensureStateDirs().root, `lane-broker-gc error: ${err.message}\n`);
+  }
+}
+
+/**
  * `lane remote-exec` (BRAIN-319 T2): read a framed snapshot stream (header +
  * body, see remote-stream.js) off `stdin`, extract and verify it into a
  * fresh per-ticket work dir, then run the requested argv through THIS
@@ -389,6 +420,8 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     throw err;
   }
   pruneStaleArtifacts(ticketsDir);
+  // Off the dispatch path: after the header is read and the ticket exists, in a later turn of the event loop.
+  setImmediate(() => void collectGarbage(root));
   await testHoldAt('remote-exec-committed');
   // Node's default for SIGHUP is to exit, but this process must outlive a dropped ssh session
   // to publish result.json; explicit cancellation goes through remote-cancel.
@@ -412,6 +445,8 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   // pipeline's setup/command children, and a protocol-1 argv via runCommand),
   // so setting it once here covers them all.
   const tmpDir = fs.mkdtempSync(path.join(REMOTE_TMP_BASE, 'lb-'));
+  atomicWriteFile(path.join(tmpDir, TMP_OWNER_FILE), header.ticketId);
+  atomicWriteFile(path.join(ticketDir, 'tmp-dir'), tmpDir);
   process.env.TMPDIR = tmpDir;
   process.env.TMP = tmpDir;
   process.env.TEMP = tmpDir;
@@ -551,8 +586,14 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     // is ever spawned (run.js's own hook point) -- this is what makes
     // "remote-id exists" and "the child could have started" the same fact.
     onTicketCreated: async (id) => {
-      atomicWriteFile(path.join(ticketDir, 'remote-id'), id);
-      if (fs.existsSync(cancelledMarker)) return false;
+      await testHoldAt('remote-exec-before-id');
+      // Under the broker lock, the same one `remote-cancel` writes its `cancelled` marker and reads `remote-id` under: either
+      // that cancel sees this id (and takes the broker path), or this check sees its marker and refuses. Neither can miss the other.
+      const cancelledEarly = await withLock(stateHome(), () => {
+        atomicWriteFile(path.join(ticketDir, 'remote-id'), id);
+        return fs.existsSync(cancelledMarker);
+      });
+      if (cancelledEarly) return false;
       // Test-only seam (BRAIN-319): hold here, right after the ticket-local
       // `cancelled` check above has already come back false, until the named
       // file appears -- lets a test deterministically land `lane
@@ -782,7 +823,6 @@ export async function withdrawLane(brokerRoot, laneId, { dequeue = dequeueSync }
 
 /** BRAIN-436: a cancel or withdraw for a ticket this runner has never heard of (its exec is still in flight, or never came). */
 class TombstonedError extends Error {}
-const tombstonePath = (root, ticketId) => path.join(path.resolve(root), 'tombstones', ticketId);
 
 /**
  * Record, under the broker lock `remote-exec` creates tickets under, that `ticketId` must never be created -- unless its ticket
@@ -910,49 +950,58 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
     }
   }
 
-  atomicWriteFile(path.join(ticketDir, 'cancelled'), String(Date.now()));
-
-  // BRAIN-319 P3 (Codex re-review, then a focused follow-up pass): report
-  // three separate facts instead of one overclaiming `cancelledBroker`.
-  // `cancelRequested` is "did we durably record this cancellation at the
-  // broker level" (the marker write below, gated on a broker ticket id
-  // actually existing yet) -- that marker is re-checked, INSIDE the same
-  // admission lock, by scheduler.js's tryStart right before this ticket
-  // would ever be admitted (see its own comment), so it alone is what
-  // actually governs the outcome for a not-yet-registered ticket.
-  // `cancelConfirmed` is ONLY true when `cancelCommand` itself reports a
-  // real, already-completed action (exit 0) -- never inferred from
-  // `registered`, which is read WITHOUT the admission lock: admission can
-  // dequeue a ticket (moving it from "queued" to "about to be leased")
-  // between that unlocked read and `cancelCommand`'s own attempt, so
-  // "unregistered at read time" is not proof of anything by the time
-  // `cancelCommand` actually runs. `registered` is reported purely as
-  // informational context for a human reading the JSON, never something a
-  // caller may act on.
+  // BRAIN-319 P3 (Codex re-review, then a focused follow-up pass), reworked for the cancel windows a ticket passes through:
+  // the ticket dir exists, then `remote-id` is written (onTicketCreated), then the supervisor enqueues, then admission leases it.
+  // The marker write, the `remote-id` read, the broker's own cancel marker and the "is it registered" read all happen under the
+  // broker admission lock (the one `tryStart` admits under and `onTicketCreated` writes `remote-id` under), so:
+  //  - no `remote-id` yet: `onTicketCreated` will see the `cancelled` marker under the same lock and refuse, so nothing is ever
+  //    enqueued -> confirmed (the unseen-id tombstone case, one step later);
+  //  - `remote-id` but nothing registered (not queued, leased or attempted): nothing is running and `tryStart` refuses a marked
+  //    ticket under this same lock, so it can never start -> confirmed;
+  //  - registered: `cancelCommand` (which takes the lock itself, so it runs after this block) dequeues it or signals the lease,
+  //    and only its own exit 0 confirms. `registered` is informational.
   let cancelRequested = false;
   let cancelConfirmed = false;
   let registered = false;
-  const remoteIdPath = path.join(ticketDir, 'remote-id');
-  if (fs.existsSync(remoteIdPath)) {
-    const remoteLaneId = fs.readFileSync(remoteIdPath, 'utf8').trim();
-    if (isUuid(remoteLaneId)) {
-      // Write the LOCAL broker's own cancel marker for this id BEFORE
-      // calling cancelCommand. onTicketCreated (above) can write `remote-id`
-      // well before the supervisor has enqueued or leased that same id --
-      // cancelCommand only knows how to act on a queued ticket, a held
-      // lease, or an attempt record, so calling it first can find none of
-      // those and do nothing, silently losing the cancellation.
-      const brokerRoot = ensureStateDirs().root;
-      writeCancelMarkerFile(brokerRoot, remoteLaneId);
-      cancelRequested = true;
-      // Informational only (see comment above) -- NOT part of the
-      // cancelConfirmed decision.
-      registered =
-        Boolean(readLease(brokerRoot, remoteLaneId)) ||
-        Boolean(readAttempt(brokerRoot, remoteLaneId)) ||
-        listQueue(brokerRoot).some((t) => t && t.id === remoteLaneId);
-      const result = await cancelCommand(remoteLaneId);
-      cancelConfirmed = result.exitCode === 0;
+  let remoteLaneId = null;
+  // Only a genuine absence (ENOENT) is a proof of "no remote-id" / "not registered". A read that FAILS is an unknown, never a
+  // confirmation: the ticket may exist and may run, so it stays unconfirmed (and registered-or-unknown goes through cancelCommand).
+  await withLock(stateHome(), () => {
+    atomicWriteFile(path.join(ticketDir, 'cancelled'), String(Date.now()));
+    let recorded;
+    try {
+      recorded = readIfExists(path.join(ticketDir, 'remote-id'));
+    } catch {
+      return;
+    }
+    if (recorded === null) {
+      cancelConfirmed = true;
+      return;
+    }
+    if (!isUuid(recorded)) return;
+    remoteLaneId = recorded;
+    const brokerRoot = ensureStateDirs().root;
+    writeCancelMarkerFile(brokerRoot, remoteLaneId);
+    cancelRequested = true;
+    try {
+      registered = isRegisteredInBroker(brokerRoot, remoteLaneId);
+    } catch {
+      registered = true;
+    }
+    if (!registered) cancelConfirmed = true;
+  });
+  if (registered) {
+    cancelConfirmed = (await cancelCommand(remoteLaneId)).exitCode === 0;
+    // The marker written above makes a queued ticket's own supervisor dequeue itself, which can happen before `cancelCommand` takes
+    // the lock; it then finds nothing and exits 1. Not registered any more, with the marker in place, means it can never start.
+    if (!cancelConfirmed) {
+      cancelConfirmed = await withLock(stateHome(), () => {
+        try {
+          return !isRegisteredInBroker(ensureStateDirs().root, remoteLaneId);
+        } catch {
+          return false;
+        }
+      });
     }
   }
   // A ticket that has already published its result is not running: a retried cancel is confirmed, not forever unconfirmed.

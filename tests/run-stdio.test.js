@@ -178,7 +178,7 @@ test('a queued foreground caller\'s stderr carries only its own child\'s output,
   assert.match(waiterResult.stderr, new RegExp(errMark), 'caller stderr must contain its own child\'s marker');
   assert.doesNotMatch(
     waiterResult.stderr,
-    /^lane-broker-admission/m,
+    /^\S+Z lane-broker-admission/m,
     `queued caller's stderr must not carry broker admission telemetry: ${waiterResult.stderr}`,
   );
   assert.doesNotMatch(
@@ -193,5 +193,5 @@ test('a queued foreground caller\'s stderr carries only its own child\'s output,
   );
 
   const admissionLogged = fs.readFileSync(paths(state).admissionLog, 'utf8');
-  assert.match(admissionLogged, /^lane-broker-admission/m, 'the admission-decisions log file must still receive telemetry');
+  assert.match(admissionLogged, /^\S+Z lane-broker-admission/m, 'the admission-decisions log file must still receive telemetry');
 });

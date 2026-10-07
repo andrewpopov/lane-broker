@@ -90,6 +90,9 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // BRAIN-405: how often a remote-eligible ticket that fell back to this machine's queue (no runner had room) re-probes the
   // runners and moves to one that now has real headroom. 0 disables rebinding.
   remoteRebindIntervalMs: 30_000,
+  // BRAIN-442: a `remotePolicy: "local-first"` lane queues locally and becomes rebind-eligible only after waiting this long
+  // there (a lane may override it with its own `localFirstWaitMs`). Rebinding still needs `remoteRebindIntervalMs` > 0.
+  localFirstWaitMs: 90_000,
   // BRAIN-436: a remote ticket that has sat QUEUED on its runner this long is withdrawn and moved to another runner that has
   // real headroom now (needs the runner's `remote-withdraw/1`). 0 disables. The interval is how often the submitter looks, the
   // cooldown is the minimum gap between two moves of one ticket, and the cap is how many times one ticket may move.
@@ -136,6 +139,17 @@ export const DEFAULT_GLOBAL_CONFIG = {
   remoteArtifactMaxFileBytes: 16 * 1024 * 1024,
   remoteArtifactMaxTotalBytes: 64 * 1024 * 1024,
   remoteArtifactMaxCount: 200,
+  // BRAIN-438: garbage collection of what a run leaves behind (src/gc.js). A runner's whole ticket directory (and a
+  // tombstone) is kept this long, so it also bounds how late a `remote-exec` for a cancelled id can still be refused.
+  remoteTicketRetentionMs: 7 * 24 * 3_600_000,
+  // At most this many ticket directories are cleaned per run, so `remote-exec` startup stays fast.
+  remoteGcMaxTicketsPerRun: 10,
+  // ... and at most this many are even examined per run, so the scan under the broker lock stays short.
+  remoteGcMaxExaminedPerRun: 50,
+  // logs/ and results/ files older than this are pruned (never a live lease's or a queued ticket's), at most
+  // logGcMaxFilesPerRun per run.
+  logRetentionMs: 14 * 24 * 3_600_000,
+  logGcMaxFilesPerRun: 5000,
 };
 
 export const DEFAULT_REPO_CONFIG = {
@@ -159,6 +173,9 @@ function assert(cond, msg) {
 }
 
 export class ConfigError extends Error {}
+
+// A retention below a day could expire a tombstone while its submitter's dispatch is still in flight (see src/gc.js).
+const MIN_RETENTION_MS = 86_400_000;
 
 function validateGlobalConfig(cfg, sourcePath) {
   assert(cfg && typeof cfg === 'object', `${sourcePath}: config must be an object`);
@@ -237,6 +254,10 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isInteger(cfg.remoteRebindIntervalMs) && cfg.remoteRebindIntervalMs >= 0,
     `${sourcePath}: "remoteRebindIntervalMs" must be a non-negative integer`,
   );
+  assert(
+    Number.isInteger(cfg.localFirstWaitMs) && cfg.localFirstWaitMs >= 0,
+    `${sourcePath}: "localFirstWaitMs" must be a non-negative integer`,
+  );
   for (const field of ['remoteRebalanceMinQueuedMs', 'remoteRebalanceCooldownMs', 'remoteRebalanceMaxMoves']) {
     assert(Number.isInteger(cfg[field]) && cfg[field] >= 0, `${sourcePath}: "${field}" must be a non-negative integer`);
   }
@@ -274,6 +295,12 @@ function validateGlobalConfig(cfg, sourcePath) {
     `${sourcePath}: "remoteDepsCacheMaxBytes" must be a positive integer`,
   );
   for (const field of ['remoteArtifactMaxFileBytes', 'remoteArtifactMaxTotalBytes', 'remoteArtifactMaxCount']) {
+    assert(Number.isInteger(cfg[field]) && cfg[field] > 0, `${sourcePath}: "${field}" must be a positive integer`);
+  }
+  for (const field of ['remoteTicketRetentionMs', 'logRetentionMs']) {
+    assert(Number.isInteger(cfg[field]) && cfg[field] >= MIN_RETENTION_MS, `${sourcePath}: "${field}" must be an integer of at least ${MIN_RETENTION_MS} (one day)`);
+  }
+  for (const field of ['remoteGcMaxTicketsPerRun', 'remoteGcMaxExaminedPerRun', 'logGcMaxFilesPerRun']) {
     assert(Number.isInteger(cfg[field]) && cfg[field] > 0, `${sourcePath}: "${field}" must be a positive integer`);
   }
   if (cfg.runners !== undefined) validateRunners(cfg.runners, sourcePath);
@@ -390,6 +417,7 @@ export function literalDirPrefix(pattern) {
 }
 
 export const REMOTE_ARTIFACTS_ON = ['success', 'always'];
+const REMOTE_POLICIES = ['remote-first', 'local-first'];
 export const MAX_REMOTE_ARTIFACT_PATTERNS = 50;
 
 /**
@@ -494,6 +522,12 @@ function validateRepoConfig(cfg, sourcePath) {
     }
     if (lane.remoteArtifactsOn !== undefined) {
       assert(REMOTE_ARTIFACTS_ON.includes(lane.remoteArtifactsOn), `${sourcePath}: lane "${name}".remoteArtifactsOn must be "success" or "always"`);
+    }
+    if (lane.remotePolicy !== undefined) {
+      assert(REMOTE_POLICIES.includes(lane.remotePolicy), `${sourcePath}: lane "${name}".remotePolicy must be "remote-first" or "local-first"`);
+    }
+    if (lane.localFirstWaitMs !== undefined) {
+      assert(Number.isInteger(lane.localFirstWaitMs) && lane.localFirstWaitMs >= 0, `${sourcePath}: lane "${name}".localFirstWaitMs must be a non-negative integer`);
     }
     for (const field of ['remoteDepsCache', 'remoteDepsCacheRootScriptsSafe']) {
       if (lane[field] !== undefined) assert(typeof lane[field] === 'boolean', `${sourcePath}: lane "${name}".${field} must be a boolean`);
@@ -806,6 +840,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       remoteDeps: templateCfg.remoteDeps,
       remoteSetup: templateCfg.remoteSetup,
       remoteDepsCache: templateCfg.remoteDepsCache,
+      remotePolicy: templateCfg.remotePolicy,
+      localFirstWaitMs: templateCfg.localFirstWaitMs,
       remoteDepsCacheRootScriptsSafe: templateCfg.remoteDepsCacheRootScriptsSafe,
       remoteArtifacts: templateCfg.remoteArtifacts,
       remoteArtifactsOn: templateCfg.remoteArtifactsOn,
@@ -860,6 +896,9 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     // BRAIN-319 T3a: opt-in per lane, defaulted false so a repo config
     // written before this field exists resolves identically (I6).
     remote: laneCfg.remote === true,
+    // BRAIN-442: "local-first" queues locally and goes remote only after `localFirstWaitMs`; anything else is today's remote-first.
+    remotePolicy: laneCfg.remotePolicy === 'local-first' ? 'local-first' : 'remote-first',
+    localFirstWaitMs: Number.isInteger(laneCfg.localFirstWaitMs) ? laneCfg.localFirstWaitMs : null,
     // BRAIN-320 S1a: honoured only when this lane runs remotely (1a); a lane
     // with neither declared behaves exactly as in 0.6.0 (I6), including the
     // protocol it speaks (1d).

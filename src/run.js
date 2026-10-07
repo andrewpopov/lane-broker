@@ -437,6 +437,8 @@ export async function runCommand({
     ...(cmdFingerprint ? { cmdFingerprint } : {}),
     ...(headTree ? { headTree } : {}),
     ...(localReason ? { localReason } : {}),
+    // BRAIN-442: a local-first lane enqueues locally and only becomes rebind-eligible after its wait (lane value, else global)
+    ...(remoteEligible && resolved.remotePolicy === 'local-first' ? { localFirst: true, localFirstWaitMs: resolved.localFirstWaitMs ?? globalCfg.localFirstWaitMs } : {}),
   };
 
   // BRAIN-320 S1d: stamped once, here, from the same Date.now() this
