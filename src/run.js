@@ -12,6 +12,7 @@ import { stampPriorityOrigin } from './priority-clock.js';
 import { detectResourceCapacity, leaseResources, resolveTicketResources, checkResourceBudget, localSimRefusal } from './resources.js';
 import { argvFingerprint } from './cpu-estimates.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
+import { isExclusive } from './exclusive.js';
 
 const supervisorPath = fileURLToPath(new URL('./supervisor.js', import.meta.url));
 
@@ -309,9 +310,13 @@ export async function runCommand({
     if (inheritedLeaseRecord) {
       const inheritedRepoId = inheritedKey && inheritedKey.includes(':') ? inheritedKey.slice(0, inheritedKey.indexOf(':')) : null;
       const sameKey = inheritedKey === resolved.key;
-      // BRAIN-403: an exclusive nested under any other lane would wait on its own parent forever
-      if (exclusive && !sameKey) {
-        process.stderr.write(`lane run: refusing an exclusive lane nested under "${inheritedKey}" (it would wait on its own parent); run it outside any lane\n`);
+      // BRAIN-403: an exclusive nested under another lane would wait on its own parent forever, and one nested under
+      // its own non-exclusive key would run directly under an ordinary lease (no exclusivity at all). Only a run
+      // reentering an already-exclusive lease may nest.
+      if (exclusive && !(sameKey && isExclusive(inheritedLeaseRecord))) {
+        process.stderr.write(
+          `lane run: refusing an exclusive lane nested under "${inheritedKey}" (it would wait on its own parent, or run under a non-exclusive lease); run it outside any lane\n`,
+        );
         return { exitCode: 64 };
       }
       // Reentrancy allows the exact same key, or a "prepush" lane run under
@@ -376,7 +381,8 @@ export async function runCommand({
   // refusal to make. The supervisor (T3b-2) re-applies this exact check via
   // `checkResourceBudget` if the run ends up falling back to local.
   const host = detectResourceCapacity();
-  if (!remoteEligible) {
+  // An exclusive is admitted on the whole budget whatever it declares, so its declared size is not a refusal reason.
+  if (!remoteEligible && !exclusive) {
     const budget = checkResourceBudget({ resources, globalCfg, host });
     if (!budget.ok) {
       process.stderr.write(budget.message);

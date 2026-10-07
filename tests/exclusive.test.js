@@ -522,10 +522,25 @@ test('an exclusive nested under another lane exits 64 before enqueue; a same-key
   const viaPrepush = await submit({ env: prepushRepo.env, cwd: prepushRepo.repoDir, lane: 'prepush', extraEnv: { LANE_BROKER_LEASE: 'parent', LANE_BROKER_KEY: `${repoId}:default` } });
   assert.equal(viaPrepush.result.exitCode, 64, viaPrepush.stderr);
 
+  // same key under an ORDINARY lease: running directly would be no exclusivity at all
   parent(ownKey);
+  const underOrdinary = await submit({ env, cwd: repoDir, extraEnv: { LANE_BROKER_LEASE: 'parent', LANE_BROKER_KEY: ownKey } });
+  assert.equal(underOrdinary.result.exitCode, 64, underOrdinary.stderr);
+  assert.equal(underOrdinary.spawnCalled, false);
+  assert.match(underOrdinary.stderr, /run under a non-exclusive lease/);
+
+  // same key under an EXCLUSIVE lease: reentrant as today
+  writeLease(state, heldLease('parent', ownKey, 4, { exclusive: true, resources: { cpuCores: 4, memoryBytes: GIB } }));
   const reentrant = await submit({ env, cwd: repoDir, extraEnv: { LANE_BROKER_LEASE: 'parent', LANE_BROKER_KEY: ownKey } });
   assert.equal(reentrant.result.exitCode, 0, reentrant.stderr);
-  assert.equal(reentrant.spawnCalled, false, 'same-key nesting runs directly under the inherited lease');
+  assert.equal(reentrant.spawnCalled, false, 'same-key nesting runs directly under the inherited exclusive lease');
+});
+
+test('an exclusive declaring more than the host budget is still accepted at submission (it is admitted on the whole budget)', async () => {
+  const { env, repoDir } = setup({ lane: { exclusive: true, cpuCores: 1000, memoryBytes: 512 * GIB }, host: { schedulerMode: 'active' } });
+  const { result, spawnCalled, stderr } = await submit({ env, cwd: repoDir });
+  assert.notEqual(result.exitCode, 64, stderr);
+  assert.equal(spawnCalled, true, stderr);
 });
 
 test('host config carrying exclusiveHooks (or acquire/release) is refused at lane run submission, not swallowed by the reload fallback', async () => {
