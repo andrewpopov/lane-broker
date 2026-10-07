@@ -77,10 +77,15 @@ async function cancelAttempt(root, id, attempt) {
       // race: supervisor just exited
     }
     const deadline = Date.now() + GRACE_MS + 5000;
-    while (Date.now() < deadline && readAttempt(root, id)) {
+    while (Date.now() < deadline && readAttempt(root, id) && supervisorAlive(readAttempt(root, id))) {
       await sleep(100);
     }
     const stillHeld = readAttempt(root, id);
+    if (stillHeld && !supervisorAlive(stillHeld)) {
+      // The supervisor exited on purpose and kept the record: the runner never confirmed the cancel.
+      process.stderr.write(`lane cancel: ${id} is still held: ${stillHeld.unresolved ?? 'its remote cancel was not confirmed'}; retry lane cancel once the runner is reachable\n`);
+      return { exitCode: 1 };
+    }
     if (stillHeld) {
       process.stderr.write(
         `lane cancel: supervisor ${attempt.supervisor.pid} did not release ${id} within the grace period; ` +

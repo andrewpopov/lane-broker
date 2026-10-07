@@ -927,6 +927,19 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     return { fallback: false };
   }
 
+  if (dispatch.outcome === 'cancelled' && dispatch.remoteCancelConfirmed === false) {
+    // The runner did not confirm the cancel, so the command may still be alive: the attempt stays (unresolved, reported), and
+    // `lane cancel` fails until a cancel is confirmed -- it is not told the ticket is gone.
+    const reason = `remote cancel on ${runner.name} was not confirmed; the command may still be running`;
+    const line = `lane: remote: ${enriched.id}: ${reason} (see lane status, lane cancel)\n`;
+    process.stderr.write(line);
+    writeBrokerLog(root, line);
+    await updateAttempt(root, enriched.id, gen, { unresolved: reason });
+    await logWriter.finish();
+    process.exit(1);
+    return { fallback: false };
+  }
+
   if (dispatch.outcome === 'cancelled') {
     await publishAndExit(gen, () => {
       throw new Error('unreachable: dispatchRemote reported cancelled');

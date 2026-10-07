@@ -9,6 +9,7 @@ import { readAttempt, patchAttemptLocked } from '../src/attempts.js';
 import { dispatchRemote } from '../src/remote-client.js';
 import { makeGitWorktree } from './remote-harness.js';
 import crypto from 'node:crypto';
+import { listQueue } from '../src/scheduler.js';
 import { withLock } from '../src/state.js';
 import { loadGlobalConfig, ConfigError } from '../src/config.js';
 import { CAPABILITIES } from '../src/capabilities.js';
@@ -55,6 +56,7 @@ if (sub === 'probe') {
   if (!r) done(255);
   const flag = ${JSON.stringify(path.join(dir, 'withdrew-'))} + dest;
   if (sub === 'exec' && r.execFails) done(255);
+  if (sub === 'cancel' && r.cancelFails) done(1);
   if (sub === 'result' && r.resultDownAfterWithdraw && fs.existsSync(flag)) done(1);
   if (sub === 'withdraw' && r.withdrawReplyLost) fs.writeFileSync(flag, '1');
   const lost = sub === 'withdraw' && r.withdrawReplyLost;
@@ -398,4 +400,50 @@ test('config: a runner\'s rebalanceTarget must be a boolean', () => {
   } finally {
     process.env.LANE_BROKER_HOME = prev;
   }
+});
+
+test('a live cancel the runner does not confirm keeps the attempt and fails `lane cancel`; once confirmed it clears', T, async () => {
+  const ctx = rebalanceSetup({ runnerOpts: { a: { cancelFails: true } }, rebalance: { remoteRebalanceMinQueuedMs: 0 } });
+  const id = await ctx.start();
+  await waitFor(() => ctx.fake.count('exec a') === 1, { timeoutMs: 30_000 });
+  await waitFor(() => listQueue(ctx.runners.a.state).length === 1, { timeoutMs: 30_000 }); // queued on A, so its cancel is a real, confirmable one
+  const cancelled = await laneRun(['cancel', id], { env: ctx.env });
+  assert.equal(cancelled.code, 1, cancelled.stderr);
+  assert.match(cancelled.stderr, /still held/);
+  const attempt = readAttempt(ctx.state, id);
+  assert.ok(attempt?.unresolved, 'the attempt is kept and marked');
+  const waited = await ctx.finish(id, '10s');
+  assert.match(waited.stderr, /ORPHANED-REMOTE/);
+  const runnersPath = path.join(path.dirname(ctx.fake.probesPath), 'runners.json');
+  const all = JSON.parse(fs.readFileSync(runnersPath, 'utf8'));
+  delete all.a.cancelFails;
+  fs.writeFileSync(runnersPath, JSON.stringify(all));
+  const again = await laneRun(['cancel', id], { env: ctx.env });
+  assert.equal(again.code, 0, again.stderr);
+  assert.equal(readAttempt(ctx.state, id), null);
+  assert.equal(resultOf(ctx.state, id).exit, 130);
+});
+
+test('a confirmed live cancel is unchanged: exit 0, attempt gone, result 130', T, async () => {
+  const ctx = rebalanceSetup({ rebalance: { remoteRebalanceMinQueuedMs: 0 } });
+  const id = await ctx.start();
+  await waitFor(() => ctx.fake.count('exec a') === 1, { timeoutMs: 30_000 });
+  const cancelled = await laneRun(['cancel', id], { env: ctx.env });
+  assert.equal(cancelled.code, 0, cancelled.stderr);
+  assert.equal(readAttempt(ctx.state, id), null);
+  assert.equal(resultOf(ctx.state, id).exit, 130);
+});
+
+test('P2: a ticket rejected before its remote-id exists answers cancelConfirmed, so cancelling its unresolved attempt completes', T, async () => {
+  const ctx = rebalanceSetup({ rebalance: { remoteRebalanceMinQueuedMs: 0 } });
+  const id = crypto.randomUUID();
+  const { createAttempt } = await import('../src/attempts.js');
+  await createAttempt(ctx.state, id, { runner: 'b' });
+  await withLock(ctx.state, () => patchAttemptLocked(ctx.state, id, { supervisor: { pid: 2 ** 22 + 9, startTime: null, bootId: 'dead' }, unresolved: 'test' }));
+  const bRoot = ctx.globalRunners.find((r) => r.name === 'b').root;
+  fs.mkdirSync(path.join(bRoot, 'tickets', id), { recursive: true });
+  fs.writeFileSync(path.join(bRoot, 'tickets', id, 'result.json'), JSON.stringify({ protocol: 1, ticketId: id, kind: 'rejected', reason: 'bad header' })); // no remote-id, ever
+  const cancelled = await laneRun(['cancel', id], { env: ctx.env });
+  assert.equal(cancelled.code, 0, cancelled.stderr);
+  assert.equal(readAttempt(ctx.state, id), null);
 });

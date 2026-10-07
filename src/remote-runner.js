@@ -953,10 +953,11 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
         listQueue(brokerRoot).some((t) => t && t.id === remoteLaneId);
       const result = await cancelCommand(remoteLaneId);
       cancelConfirmed = result.exitCode === 0;
-      // A ticket that has already published its result is not running: a retried cancel is confirmed, not forever unconfirmed.
-      if (!cancelConfirmed && fs.existsSync(path.join(ticketDir, 'result.json'))) cancelConfirmed = true;
     }
   }
+  // A ticket that has already published its result is not running: a retried cancel is confirmed, not forever unconfirmed.
+  // That holds with or without a `remote-id` -- a ticket rejected or refused before it was enqueued never had one.
+  if (!cancelConfirmed && fs.existsSync(path.join(ticketDir, 'result.json'))) cancelConfirmed = true;
 
   process.stdout.write(`${JSON.stringify({ protocol: 1, ticketId, markedCancelled: true, cancelRequested, cancelConfirmed, registered })}\n`);
   return { exitCode: 0 };

@@ -783,6 +783,8 @@ export async function dispatchRemote(opts) {
   const resultDeadlineMs = deadlines.resultMs ?? 30_000;
   const resultAttempts = deadlines.resultAttempts ?? 3;
   const cancelDeadlineMs = deadlines.cancelMs ?? 15_000;
+  // A cancel the runner did not confirm leaves the command possibly alive; the caller keeps the attempt (and reports it) until it is.
+  const cancelledOutcome = async () => ({ outcome: 'cancelled', remoteCancelConfirmed: await remoteCancelBestEffort(runner, ticketId, sshBin, cancelDeadlineMs, env) });
 
   let manifest = prebuiltManifest;
   if (!manifest) {
@@ -906,8 +908,7 @@ export async function dispatchRemote(opts) {
   }
 
   if (abortSignal && abortSignal.aborted) {
-    await remoteCancelBestEffort(runner, ticketId, sshBin, cancelDeadlineMs, env);
-    return { outcome: 'cancelled' };
+    return cancelledOutcome();
   }
 
   if (move) return { outcome: 'moved', from: move.from, to: move.to, queuedMs: move.queuedMs, waitedOnRunnerMs: Math.max(0, move.withdrawnAt - dispatchedAt), neverStarted: true };
@@ -924,8 +925,7 @@ export async function dispatchRemote(opts) {
   let waitExpired = false;
   while (true) {
     if (abortSignal && abortSignal.aborted) {
-      await remoteCancelBestEffort(runner, ticketId, sshBin, cancelDeadlineMs, env);
-      return { outcome: 'cancelled' };
+      return cancelledOutcome();
     }
     const fetched = await fetchRemoteResult(runner, ticketId, sshBin, resultDeadlineMs, env);
     if (fetched && !fetched.missing) {
@@ -961,8 +961,7 @@ export async function dispatchRemote(opts) {
   }
 
   if (abortSignal && abortSignal.aborted) {
-    await remoteCancelBestEffort(runner, ticketId, sshBin, cancelDeadlineMs, env);
-    return { outcome: 'cancelled' };
+    return cancelledOutcome();
   }
 
   // BRAIN-363: set when the expiry cancel was not confirmed: whatever the late record turns out to be, the job may still be running.
@@ -1000,8 +999,11 @@ export async function dispatchRemote(opts) {
     const withdraw = withdrawCapable ? await remoteWithdraw(runner, ticketId, { sshBin, deadlineMs: deadlines.withdrawMs ?? 15_000, env }) : { action: 'unknown' };
     if (abortSignal && abortSignal.aborted) {
       // The cancel arrived while the withdraw was in flight; unless the runner gave the ticket up, it must still be told.
-      await remoteCancelBestEffort(runner, ticketId, sshBin, cancelDeadlineMs, env);
-      return { outcome: 'cancelled' };
+      return cancelledOutcome();
+    }
+    if (withdraw.action === 'withdrawn' && state.attemptedTarget) {
+      // The move's own withdraw reply was lost and the session closed: this retry is the proof, and the chosen target is where it goes.
+      return { outcome: 'moved', from: runner, to: state.attemptedTarget, queuedMs: state.queuedSince === null ? 0 : now() - state.queuedSince, waitedOnRunnerMs: Math.max(0, now() - dispatchedAt), neverStarted: true };
     }
     if (withdraw.action === 'withdrawn') return { outcome: 'unconfirmed', reason: 'result not available after retries; the runner confirmed it never started the ticket', neverStarted: true };
     return {
