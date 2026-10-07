@@ -1360,7 +1360,7 @@ async function main() {
   };
   process.on('SIGTERM', onCancelSignal);
   process.on('SIGINT', onCancelSignal);
-  // BRAIN-364: no `await` runs between the queue loop's last check and here, so a cancel that landed during admission
+  // BRAIN-364: no `await` runs between the queue loop's successful `break` and here, so a cancel that landed during admission
   // (`cancelledBeforeStart` from a signal, or the marker) is seen exactly once, now, and handled like any cancel of a
   // running child: reaped, then finalized as 130 by finalizeAndExit. Without it a fast child published success.
   if (cancelledBeforeStart || cancelRequested(root, ticket.id)) {
