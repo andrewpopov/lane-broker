@@ -1043,7 +1043,7 @@ if (cmd.includes('remote-exec')) {
 const phaseRecord = (phase) => ({ protocol: 1, missing: true, state: phase === 'queued' ? 'queued' : 'running', phase });
 const TARGET = { name: 'B', ssh: 'b' };
 
-async function dispatchRebalance({ results, withdraws, execMs, rebalance, canWithdraw = true, clock = makeFakeClock(), abortSignal, src = makeGitWorktree({ 'a.txt': 'hello' }) }) {
+async function dispatchRebalance({ results, withdraws, execMs, rebalance, canWithdraw = true, clock = makeFakeClock(), abortSignal, abortWhen, src = makeGitWorktree({ 'a.txt': 'hello' }) }) {
   const ssh = makeRebalanceSsh({ results: [], withdraws, execMs });
   const args = makeDispatchArgs();
   const { manifestHash } = buildManifest(src);
@@ -1058,7 +1058,7 @@ async function dispatchRebalance({ results, withdraws, execMs, rebalance, canWit
     env: process.env,
     now: clock.now,
     sleep: clock.sleep,
-    abortSignal,
+    abortSignal: abortWhen ? { get aborted() { return abortWhen(ssh.calls()); }, addEventListener() {}, removeEventListener() {} } : abortSignal,
     canWithdraw,
     deadlines: { resultMs: 5000, resultAttempts: 3 },
     rebalance: rebalance && { minQueuedMs: 30_000, intervalMs: 10_000, pickTarget: () => TARGET, ...rebalance },
@@ -1181,4 +1181,33 @@ test('BRAIN-437: the same dropped dispatch with a `withdrawn` answer is neverSta
   assert.equal(result.outcome, 'unconfirmed');
   assert.equal(result.neverStarted, true);
   assert.equal(result.mayStillBeRunning, undefined);
+});
+
+test('rebalance: an async pickTarget resolving null never withdraws (the target is awaited)', { timeout: 60_000 }, async () => {
+  const { result, calls } = await dispatchRebalance({ results: [queued, queued, queued, queued, queued, 'RESULT'], withdraws: [{ action: 'withdrawn' }], execMs: 1500, rebalance: { minQueuedMs: 5_000, pickTarget: async () => null } });
+  assert.equal(result.outcome, 'confirmed', JSON.stringify(result));
+  assert.ok(!calls.includes('withdraw'), `unexpected withdraw: ${calls.join(',')}`);
+});
+
+test('rebalance: an async pickTarget resolves to the runner itself in `moved.to`, not a Promise', { timeout: 60_000 }, async () => {
+  const { result } = await dispatchRebalance({ results: [queued], withdraws: [{ action: 'withdrawn' }], execMs: 20_000, rebalance: { pickTarget: async () => TARGET } });
+  assert.equal(result.outcome, 'moved', JSON.stringify(result));
+  assert.equal(result.to, TARGET);
+});
+
+test('rebalance: pickTarget throwing or beforeWithdraw rejecting is a failed tick -- no move, and dispatchRemote still resolves from the runner', { timeout: 60_000 }, async () => {
+  for (const rebalance of [{ pickTarget: () => { throw new Error('boom'); } }, { beforeWithdraw: async () => { throw new Error('boom'); } }]) {
+    const { result, calls } = await dispatchRebalance({ results: [queued, queued, queued, queued, queued, 'RESULT'], withdraws: [{ action: 'withdrawn' }], execMs: 1500, rebalance: { minQueuedMs: 5_000, ...rebalance } });
+    assert.equal(result.outcome, 'confirmed', JSON.stringify(result));
+    assert.ok(!calls.includes('withdraw'), calls.join(','));
+    assert.equal(calls.filter((c) => c === 'exec').length, 1);
+  }
+});
+
+test('BRAIN-437: a cancel arriving during the post-drop withdraw still sends remote-cancel', { timeout: 60_000 }, async () => {
+  for (const action of ['started', 'not-queued', null]) {
+    const { result, calls } = await dispatchRebalance({ results: [null], withdraws: [action === null ? null : { action }], execMs: 0, rebalance: null, abortWhen: (c) => c.includes('withdraw') });
+    assert.equal(result.outcome, 'cancelled', JSON.stringify(result));
+    assert.ok(calls.includes('cancel'), `${action}: ${calls.join(',')}`);
+  }
 });

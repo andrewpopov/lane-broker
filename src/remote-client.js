@@ -639,9 +639,15 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
     if (phase === 'preparing') continue;
     queuedSince ??= now();
     if (now() - queuedSince < minQueuedMs) continue;
-    const to = pickTarget();
-    if (!to) continue;
-    if (beforeWithdraw && (await beforeWithdraw({ from: runner, to, queuedMs: now() - queuedSince })) === false) continue;
+    // A callback that throws or rejects is a failed tick: no move, keep watching. The target is awaited (the real picker is async).
+    let to;
+    try {
+      to = await pickTarget();
+      if (!to || !watching()) continue;
+      if (beforeWithdraw && (await beforeWithdraw({ from: runner, to, queuedMs: now() - queuedSince })) === false) continue;
+    } catch {
+      continue;
+    }
     if (!watching()) return null;
     attemptedTarget = to;
     const { action } = await remoteWithdraw(runner, expected.ticketId, { sshBin, deadlineMs: withdrawDeadlineMs, env });
@@ -839,11 +845,14 @@ export async function dispatchRemote(opts) {
       return m;
     });
     // Only a move ends the wait early; a watcher that stopped for good (admitted, terminal) leaves the session to close on its own.
-    await Promise.race([closed, settled.then((m) => m ?? closed)]);
-    sessionClosed = true;
-    watchAbort.abort();
-    move = await settled;
-    await closed;
+    try {
+      await Promise.race([closed, settled.then((m) => m ?? closed)]);
+    } finally {
+      sessionClosed = true;
+      watchAbort.abort();
+      move = await settled.catch(() => null);
+      await closed;
+    }
   } else {
     await closed;
   }
@@ -939,7 +948,11 @@ export async function dispatchRemote(opts) {
     // local here can run the job twice, so the runner is asked to give up the ticket; only a `withdrawn` answer proves it never
     // ran. Anything else (or a runner that cannot withdraw) leaves it possibly running, which the caller must not re-run.
     const withdraw = withdrawCapable ? await remoteWithdraw(runner, ticketId, { sshBin, deadlineMs: deadlines.withdrawMs ?? 15_000, env }) : { action: 'unknown' };
-    if (abortSignal && abortSignal.aborted) return { outcome: 'cancelled' };
+    if (abortSignal && abortSignal.aborted) {
+      // The cancel arrived while the withdraw was in flight; unless the runner gave the ticket up, it must still be told.
+      await remoteCancelBestEffort(runner, ticketId, sshBin, cancelDeadlineMs, env);
+      return { outcome: 'cancelled' };
+    }
     if (withdraw.action === 'withdrawn') return { outcome: 'unconfirmed', reason: 'result not available after retries; the runner confirmed it never started the ticket', neverStarted: true };
     return {
       outcome: 'unconfirmed',
