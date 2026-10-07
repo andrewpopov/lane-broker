@@ -31,7 +31,7 @@ import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeas
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
 import { REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
-import { createAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
+import { createAttempt, readAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX } from './admission.js';
 import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, noProgressMessage } from './no-progress.js';
 import { observedLeaseFields, summarizeObservedCpu, sanitizeObservedCpu, sanitizeRssPeak, integratedCpuSeconds, sanitizeCpuSeconds } from './observed.js';
@@ -569,6 +569,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       const line = `lane: remote-rebind: ${enriched.id}: ${where}: ${reason} — outcome unknown, the job may be running there; not re-running it locally (see lane status, lane cancel)\n`;
       process.stderr.write(line);
       writeBrokerLog(root, line);
+      await updateAttempt(root, enriched.id, gen, { unresolved: reason });
       await logWriter.finish();
       process.exit(1);
       return { fallback: false };
@@ -730,11 +731,13 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // runner has not started it) and dispatched to a runner that has real room now. Each dispatch is an epoch: output and records
   // from an earlier one are ignored. A runner a ticket has left is never revisited.
   const rebalanceOn = globalCfg.remoteRebalanceMinQueuedMs > 0;
-  const visited = [runner.name];
-  const moves = [];
-  let epoch = 1;
+  // A rebind retry continues the ticket's earlier moves (they live on the attempt), so the cap and the no-revisit rule hold across it.
+  const priorAttempt = rebind ? readAttempt(root, enriched.id) : null;
+  const moves = Array.isArray(priorAttempt?.moves) ? [...priorAttempt.moves] : [];
+  const visited = [...new Set([...moves.flatMap((m) => [m.from, m.to]), runner.name])];
+  let epoch = Number.isInteger(priorAttempt?.dispatchEpoch) ? priorAttempt.dispatchEpoch : 1;
   let priorRemoteQueuedMs = 0;
-  let lastMoveAt = null;
+  let lastMoveAt = moves.length > 0 ? moves.at(-1).at : null;
   let movingSet = false;
   const clearMoving = async () => {
     movingSet = false;
@@ -794,7 +797,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
         intervalMs: globalCfg.remoteRebalanceIntervalMs,
         pickTarget: async () => {
           if (rebalanceBlocked({ moves: moves.length, maxMoves: globalCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: globalCfg.remoteRebalanceCooldownMs })) return null;
-          const candidates = (globalCfg.runners || []).filter((r) => !visited.includes(r.name));
+          const candidates = (globalCfg.runners || []).filter((r) => !visited.includes(r.name) && r.rebalanceTarget !== false);
           if (candidates.length === 0) return null;
           const picked = await selectRunner(candidates, { ...remoteSelectOptions(enriched, globalCfg), maxRemoteQueue: 0 });
           target = picked.runner && hasMeasuredHeadroom(picked.probe) ? { runner: picked.runner, probe: picked.probe } : null;
@@ -826,7 +829,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     epoch += 1;
     visited.push(to.runner.name);
     lastMoveAt = Date.now();
-    priorRemoteQueuedMs += dispatch.queuedMs;
+    priorRemoteQueuedMs += dispatch.waitedOnRunnerMs;
     const move = { from: from.name, to: to.runner.name, at: lastMoveAt, queuedMs: dispatch.queuedMs, reason: 'queued-too-long' };
     moves.push(move);
     runner = to.runner;
@@ -851,7 +854,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     process.stderr.write(`lane: running on ${runner.name}\n`);
   }
   // A move that never completed (or one whose second dispatch ended before a snapshot went out) must not outlive this attempt's record.
-  if (movingSet) await clearMoving();
+  if (movingSet && !dispatch.mayStillBeRunning) await clearMoving();
   const rebalanceFields = () => (moves.length ? { rebalancedFrom: moves.at(-1).from, rebalancedAt: moves.at(-1).at, rebalanceReason: `queued ${Math.round(moves.at(-1).queuedMs / 1000)}s on ${moves.at(-1).from}`, moves: moves.length } : {});
 
   // BRAIN-405: a confirmed preflight refusal means the runner never started the job, so a rebound ticket goes back to its place
@@ -933,11 +936,15 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
 
   // BRAIN-363: the runner's copy may still be running (its cancel was not confirmed). Running it locally too could execute
   // the job twice, so this ticket ends here as a failure instead of falling back; a rebind is refused the same way by abandonRebind.
+  // The attempt is KEPT, marked `unresolved`: the possibly-live ticket stays visible (`lane status`/`wait` report it ORPHANED-REMOTE,
+  // or MOVE-INTERRUPTED while a move is recorded) and `lane cancel` can still reach it on the runner.
   if (dispatch.mayStillBeRunning && !rebind) {
-    const line = `lane: remote: ${enriched.id}: ${runner.name}: ${dispatch.reason}\n`;
+    const line = `lane: remote: ${enriched.id}: ${runner.name}: ${dispatch.reason} (see lane status, lane cancel)\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);
-    await publishAndExit(gen, () => ({ ...localRefusalResult(enriched, { exitCode: 1, message: line }), executor: 'remote', runner: runner.name }));
+    await updateAttempt(root, enriched.id, gen, { unresolved: dispatch.reason });
+    await logWriter.finish();
+    process.exit(1);
     return { fallback: false };
   }
 
@@ -1102,7 +1109,11 @@ async function main() {
    * only returns when the ticket is still queued locally -- a dispatched ticket ends in the process exiting, as ever.
    */
   async function tryRebind() {
-    const { runner, probe } = await selectRunner(globalCfg.runners || [], { ...remoteSelectOptions(enriched, globalCfg), maxRemoteQueue: 0 });
+    // A ticket that has already moved never goes back to a runner it left (nor to one it is on).
+    const left = new Set((readAttempt(root, ticket.id)?.moves ?? []).flatMap((m) => [m.from, m.to]));
+    const candidates = (globalCfg.runners || []).filter((r) => !left.has(r.name));
+    if (candidates.length === 0) return;
+    const { runner, probe } = await selectRunner(candidates, { ...remoteSelectOptions(enriched, globalCfg), maxRemoteQueue: 0 });
     if (!runner) return;
     await runRemoteAttempt(root, enriched, globalCfg, abortController.signal, { generation: attemptGeneration, runner, probe });
   }

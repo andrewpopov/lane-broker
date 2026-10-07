@@ -994,7 +994,7 @@ test('dispatchRemote: abort during the result wait is cancelled and remote-cance
  * in) unless it is killed; `remote-result` replays `results` (last repeats; an entry may be `{delayMs, record}`; null is a failed
  * fetch); `remote-withdraw` replays `withdraws` the same way (null: a lost reply). Every subcommand is logged.
  */
-function makeRebalanceSsh({ results, withdraws = [], execMs = 0 }) {
+function makeRebalanceSsh({ results, withdraws = [], execMs = 0, closeExecOnWithdraw = false }) {
   const dir = tmpDir('rebalance-ssh');
   const logPath = path.join(dir, 'calls.log');
   const scriptPath = path.join(dir, 'script.json');
@@ -1019,6 +1019,7 @@ if (cmd.includes('remote-exec')) {
   log('exec');
   process.stdin.resume();
   process.stdin.on('end', () => setTimeout(() => process.exit(255), ${execMs}));
+  if (${closeExecOnWithdraw}) setInterval(() => { if (fs.existsSync(${JSON.stringify(path.join(dir, 'withdrew'))})) process.exit(255); }, 30);
 } else if (cmd.includes('remote-result')) {
   log('result');
   const entry = next(results, ${JSON.stringify(path.join(dir, 'result-count'))});
@@ -1027,6 +1028,7 @@ if (cmd.includes('remote-exec')) {
   if (entry.delayMs) setTimeout(send, entry.delayMs); else send();
 } else if (cmd.includes('remote-withdraw')) {
   log('withdraw');
+  fs.writeFileSync(${JSON.stringify(path.join(dir, 'withdrew'))}, '1');
   const entry = next(withdraws, ${JSON.stringify(path.join(dir, 'withdraw-count'))});
   if (entry === undefined || entry === null) process.exit(1);
   process.stdout.write(JSON.stringify({ protocol: 1, ticketId, action: entry.action }) + '\\n');
@@ -1043,12 +1045,12 @@ if (cmd.includes('remote-exec')) {
 const phaseRecord = (phase) => ({ protocol: 1, missing: true, state: phase === 'queued' ? 'queued' : 'running', phase });
 const TARGET = { name: 'B', ssh: 'b' };
 
-async function dispatchRebalance({ results, withdraws, execMs, rebalance, canWithdraw = true, clock = makeFakeClock(), abortSignal, abortWhen, src = makeGitWorktree({ 'a.txt': 'hello' }) }) {
-  const ssh = makeRebalanceSsh({ results: [], withdraws, execMs });
+async function dispatchRebalance({ results, withdraws, execMs, rebalance, canWithdraw = true, clock = makeFakeClock(), abortSignal, abortWhen, onSnapshotSent, closeExecOnWithdraw, src = makeGitWorktree({ 'a.txt': 'hello' }) }) {
+  const ssh = makeRebalanceSsh({ results: [], withdraws, execMs, closeExecOnWithdraw });
   const args = makeDispatchArgs();
   const { manifestHash } = buildManifest(src);
   const bound = boundResult(args, { manifestHash });
-  const expand = (r) => (r === 'RESULT' ? bound : r === 'WITHDRAWN' ? { ...bound, kind: 'unfinished', reason: 'withdrawn' } : r?.record === 'WITHDRAWN' ? { ...r, record: { ...bound, kind: 'unfinished', reason: 'withdrawn' } } : r);
+  const expand = (r) => (r === 'RESULT' ? bound : r === 'REJECTED' ? { ...bound, kind: 'rejected', reason: 'bad header' } : r === 'QUEUE_TIMEOUT' ? { ...bound, kind: 'unfinished', reason: 'queue-timeout' } : r === 'UNFINISHED' ? { ...bound, kind: 'unfinished' } : r === 'UNBOUND' ? { ...bound, ticketId: 'someone-else' } : r === 'WITHDRAWN' ? { ...bound, kind: 'unfinished', reason: 'withdrawn' } : r?.record === 'WITHDRAWN' ? { ...r, record: { ...bound, kind: 'unfinished', reason: 'withdrawn' } } : r);
   fs.writeFileSync(path.join(path.dirname(ssh.sshBin), 'script.json'), JSON.stringify({ results: results.map(expand), withdraws: withdraws ?? [] }));
   const result = await dispatchRemote({
     ...args,
@@ -1060,6 +1062,7 @@ async function dispatchRebalance({ results, withdraws, execMs, rebalance, canWit
     sleep: clock.sleep,
     abortSignal: abortWhen ? { get aborted() { return abortWhen(ssh.calls()); }, addEventListener() {}, removeEventListener() {} } : abortSignal,
     canWithdraw,
+    onSnapshotSent,
     deadlines: { resultMs: 5000, resultAttempts: 3 },
     rebalance: rebalance && { minQueuedMs: 30_000, intervalMs: 10_000, pickTarget: () => TARGET, ...rebalance },
   });
@@ -1224,4 +1227,43 @@ test('rebalance: afterWithdraw hears every withdraw that did not take (unknown i
     assert.deepEqual(actions.slice(0, heard.length), heard, JSON.stringify(reply));
     if (!heard.length) assert.deepEqual(actions, []);
   }
+});
+
+// ---- review fixes: P1-1 cancel during onSnapshotSent, P1-4 unusable record, P2-6 lost reply + closed session, P2-7 timing ----
+
+test('P1-1: a cancel that lands while onSnapshotSent is awaited still ends the session and reaches the runner', { timeout: 60_000 }, async () => {
+  const ac = new AbortController();
+  const started = Date.now();
+  const { result, calls } = await dispatchRebalance({ results: [queued], withdraws: [], execMs: 20_000, abortSignal: ac.signal, onSnapshotSent: async () => ac.abort(), rebalance: null });
+  assert.equal(result.outcome, 'cancelled', JSON.stringify(result));
+  assert.ok(calls.includes('cancel'), calls.join(','));
+  assert.ok(Date.now() - started < 10_000, 'the open ssh session was killed, not waited out');
+});
+
+test('P1-4: an unusable record proves nothing -- only a bound rejected/queue-timeout/withdrawn record is neverStarted', { timeout: 60_000 }, async () => {
+  for (const [record, never] of [['REJECTED', true], ['QUEUE_TIMEOUT', true], ['WITHDRAWN', true], ['UNFINISHED', false], ['UNBOUND', false]]) {
+    const { result } = await dispatchRebalance({ results: [record], withdraws: [], execMs: 0, canWithdraw: false, rebalance: null });
+    assert.equal(result.outcome, 'unconfirmed', `${record}: ${JSON.stringify(result)}`);
+    assert.equal(result.neverStarted === true, never, record);
+    assert.equal(result.mayStillBeRunning === true, !never, record);
+  }
+});
+
+test('P2-6: a lost withdraw reply plus a session that closed before the watcher saw anything is still a move to the chosen target', { timeout: 60_000 }, async () => {
+  const clock = makeFakeClock();
+  clock.sleep = async (ms) => {
+    clock.slept.push(ms);
+    await sleep(250); // real time, so the exec closes (it exits once a withdraw was asked) between the watcher's ticks
+  };
+  const { result } = await dispatchRebalance({ results: [queued, queued, queued, 'WITHDRAWN'], withdraws: [null], execMs: 60_000, closeExecOnWithdraw: true, clock, rebalance: { minQueuedMs: 0, intervalMs: 10 } });
+  assert.equal(result.outcome, 'moved', JSON.stringify(result));
+  assert.equal(result.to, TARGET, 'dispatched to B, not local');
+  assert.equal(result.neverStarted, true);
+});
+
+test('P2-7: the wait counted for the first runner runs from its dispatch to the withdraw, preparing included', { timeout: 60_000 }, async () => {
+  const { result } = await dispatchRebalance({ results: [preparing, preparing, preparing, queued], withdraws: [{ action: 'withdrawn' }], execMs: 20_000, rebalance: { minQueuedMs: 20_000 } });
+  assert.equal(result.outcome, 'moved', JSON.stringify(result));
+  assert.ok(result.waitedOnRunnerMs > result.queuedMs, `${result.waitedOnRunnerMs} should include the preparing ticks, not just ${result.queuedMs} queued`);
+  assert.ok(result.waitedOnRunnerMs >= 60_000, String(result.waitedOnRunnerMs));
 });

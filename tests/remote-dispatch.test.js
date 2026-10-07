@@ -5,6 +5,7 @@ import path from 'node:path';
 import { gitFixture, laneRun, laneSpawn, waitFor, sleep, writeRepoConfig } from './helpers.js';
 import { tmpDir, setup, markerCmd, detachAndWait, resultOf, probeCount } from './remote-harness.js';
 import { paths, readJsonSafe } from '../src/state.js';
+import { readAttempt } from '../src/attempts.js';
 
 /**
  * BRAIN-319 T3b-3: end-to-end coverage of the supervisor's remote-dispatch
@@ -87,16 +88,19 @@ test('die-midstream: falls back to local and reports the LOCAL exit', async () =
   assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
 });
 
-test('result-tamper: falls back to local and reports the LOCAL exit', async () => {
-  const { env, repoDir } = setup({ ssh: 'result-tamper' });
+test('result-tamper: a record that does not bind proves nothing, so the ticket is NOT run locally (it may be live) and stays reported', { timeout: 120_000 }, async () => {
+  const { env, state, repoDir } = setup({ ssh: 'result-tamper' });
   const marker = path.join(tmpDir('marker'), 'where');
-  const { waited } = await detachAndWait(
+  const { id, waited } = await detachAndWait(
     ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 9)],
     env,
     repoDir,
+    '60s',
   );
-  assert.equal(waited.code, 9, `stderr: ${waited.stderr}`);
-  assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
+  assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
+  assert.match(waited.stderr, /ORPHANED-REMOTE/);
+  assert.equal(readAttempt(state, id)?.executor, 'remote', 'the attempt is kept');
+  assert.ok(readAttempt(state, id)?.unresolved);
 });
 
 // ---- ineligible: tracked .env ----
@@ -634,34 +638,38 @@ test('remote run: a result from a runner that reports no queuedMs still gets a w
 
 // ---- BRAIN-363: an unconfirmed expiry cancel must never lead to a second (local) execution ----
 
-test('remote run: result-wait expiry with an unconfirmed cancel fails the ticket and never runs it locally', async () => {
+test('remote run: result-wait expiry with an unconfirmed cancel is never re-run locally, and the attempt stays reported and cancellable', { timeout: 120_000 }, async () => {
   const { env, state, repoDir } = setup({ ssh: 'stuck-running', remoteResultWaitMs: 1 });
   const marker = path.join(tmpDir('marker'), 'where');
-  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], env, repoDir);
+  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], env, repoDir, '60s');
   assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
   assert.equal(fs.existsSync(marker), false, 'the job must not have been re-run locally');
-  const result = resultOf(state, id);
-  assert.equal(result.executor, 'remote');
-  assert.equal(result.runner, 'skybox');
-  assert.match(result.error, /may still be running and was not re-run/);
-  const history = fs.readFileSync(path.join(state, 'history.jsonl'), 'utf8');
-  assert.match(history, /was not re-run/);
-  const row = JSON.parse(history.trim().split('\n').at(-1));
-  assert.equal(row.executor, 'remote');
-  assert.equal(row.runner, 'skybox');
+  assert.match(waited.stderr, /ORPHANED-REMOTE/);
+  const attempt = readAttempt(state, id);
+  assert.equal(attempt.executor, 'remote');
+  assert.equal(attempt.runner, 'skybox');
+  assert.match(attempt.unresolved, /may still be running and was not re-run/);
+  // the runner never confirms its cancel, so cancel keeps the record rather than forgetting a possibly-live ticket
+  const cancelled = await laneRun(['cancel', id], { env });
+  assert.equal(cancelled.code, 1, cancelled.stderr);
+  assert.match(cancelled.stderr, /not confirmed on skybox/);
+  assert.ok(readAttempt(state, id), 'still held');
 });
 
 // ---- BRAIN-437: a dispatch the runner may have accepted is never re-run locally without proof it never started ----
 
-test('BRAIN-437: ssh dropped after the runner took the job, fetches all failing, withdraw not confirmed: not re-run locally', { timeout: 120_000 }, async () => {
+test('BRAIN-437: ssh dropped after the runner took the job, fetches all failing, withdraw not confirmed: not re-run locally, attempt kept and cancellable', { timeout: 120_000 }, async () => {
   const { env, state, repoDir } = setup({ ssh: 'drop-stuck' });
   const marker = path.join(tmpDir('marker'), 'where');
   const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], env, repoDir, '90s');
   assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
   assert.equal(fs.existsSync(marker), false, 'the job must not have been run locally');
-  const result = resultOf(state, id);
-  assert.equal(result.executor, 'remote');
-  assert.match(result.error, /may still be running and was not re-run/);
+  assert.match(waited.stderr, /ORPHANED-REMOTE/);
+  assert.equal(readAttempt(state, id).executor, 'remote');
+  // this runner can prove the ticket absent (it tombstones it), so cancel completes
+  const cancelled = await laneRun(['cancel', id], { env });
+  assert.equal(cancelled.code, 0, cancelled.stderr);
+  assert.equal(readAttempt(state, id), null);
 });
 
 test('BRAIN-437: the same drop with a runner that confirms `withdrawn` falls back to local, once', { timeout: 120_000 }, async () => {

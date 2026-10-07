@@ -709,6 +709,19 @@ the wait on the first runner, and the result and history row carry `rebalancedFr
 `lane status` report `MOVE-INTERRUPTED <id> withdrawn from <A>` instead of a generic orphan, and `lane cancel` cancels on every
 runner the move names and clears it. Nothing resumes a stranded move automatically.
 
+**Which runners are destinations.** A runner entry may set `"rebalanceTarget": false` (boolean, default `true`) to opt out of
+receiving moved tickets. Free cores are a poor measure of lane capacity on a runner whose other workloads outweigh lanes (a
+runner that runs simulations at a higher `CPUWeight` than lanes, deliberately), so such a runner should not look like the idle
+one. It still runs tickets dispatched to it normally.
+
+**A dispatch that may be live is never forgotten, and never re-run.** If the connection drops after a runner may have accepted
+the job and nothing proves it never started (no `withdrawn` answer, no bound `unfinished`/`rejected` record), the ticket is not
+run locally either. Its attempt is kept (`unresolved`) and reported by `lane status`/`lane wait` as `ORPHANED-REMOTE`, or
+`MOVE-INTERRUPTED` while a move is recorded. `lane cancel` removes it only once every runner it names has confirmed the cancel
+(or proven the ticket absent: a `remote-cancel`/`remote-withdraw` for a ticket the runner has not seen leaves a tombstone, and a
+later `remote-exec` for that id is refused). The one exception is the result-wait expiry (BRAIN-363, `remoteResultWaitMs`): it
+cancels the remote command and confirms that before any local retry, so the retry is sequential, not a concurrent second run.
+
 **Herd avoidance is best-effort.** Several tickets can still choose the same idle runner in the same interval: the destination is
 not reserved, only the runner's probe (which counts reserved cores at once) limits the pile-up. The cap, the cooldown and
 the no-revisit rule keep a ticket from bouncing.

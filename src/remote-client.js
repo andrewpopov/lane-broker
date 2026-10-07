@@ -465,6 +465,14 @@ function waitClosed(child, abortSignal) {
       resolve();
       return;
     }
+    // An abort that fired before this wait began (no listener existed to hear it) must still end the session.
+    if (abortSignal && abortSignal.aborted) {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // already gone
+      }
+    }
     const onClose = () => {
       if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
       resolve();
@@ -572,11 +580,11 @@ async function remoteCancelBestEffort(runner, ticketId, sshBin, deadlineMs, env)
   }
 }
 
-/** Public entry point for `remoteCancelBestEffort`, for a caller with no `dispatchRemote` of
+/** Public entry point for `remoteCancelBestEffort` (resolves whether the runner CONFIRMED the cancel), for a caller with no `dispatchRemote` of
  *  its own in flight -- BRAIN-319 T3b-4's ORPHANED-REMOTE reconciliation (`lane cancel`, no
  *  live supervisor left to have done this itself). Same best-effort contract: never throws. */
 export async function remoteCancel(runner, ticketId, { sshBin = 'ssh', deadlineMs = 15_000, env } = {}) {
-  await remoteCancelBestEffort(runner, ticketId, sshBin, deadlineMs, env);
+  return remoteCancelBestEffort(runner, ticketId, sshBin, deadlineMs, env);
 }
 
 /**
@@ -600,6 +608,15 @@ export async function remoteWithdraw(runner, ticketId, { sshBin = 'ssh', deadlin
 /** True iff `record` binds to `expected` AND is the runner's own proof that nothing ran: the ticket was withdrawn while queued. */
 function isWithdrawnRecord(record, expected) {
   return matchesTicket(record, expected) && record.kind === 'unfinished' && record.reason === 'withdrawn';
+}
+
+/** True iff `record` binds to `expected` and is the runner's own statement that nothing ran: rejected before running, expired
+ *  in its queue, or withdrawn while queued. */
+function provesNeverStarted(record, expected) {
+  return (
+    matchesTicket(record, expected) &&
+    (record.kind === 'rejected' || (record.kind === 'unfinished' && (record.reason === 'queue-timeout' || record.reason === 'withdrawn')))
+  );
 }
 
 const DEFAULT_REBALANCE_INTERVAL_MS = 30_000;
@@ -632,12 +649,11 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
   const fence = { runner, epoch: state.epoch };
   const current = () => state.runner === fence.runner && state.epoch === fence.epoch;
   const watching = () => current() && !isClosed() && !signal.aborted && !abortSignal?.aborted;
-  const moved = (to, queuedSince) => {
+  const moved = (to, since) => {
     state.epoch += 1;
-    return { from: runner, to, queuedMs: now() - queuedSince };
+    return { from: runner, to, queuedMs: now() - since, withdrawnAt: now() };
   };
   let queuedSince = null;
-  let attemptedTarget = null; // set before a withdraw is sent, so a lost reply can still be resolved from the record
   while (true) {
     await sleep(intervalMs, signal);
     if (!watching()) return null;
@@ -646,7 +662,7 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
     if (!fetched) continue;
     if (!fetched.missing) {
       // A record is terminal. Only a bound `withdrawn` one (from A, this epoch) proves a lost withdraw reply took effect.
-      if (attemptedTarget && isWithdrawnRecord(fetched, expected)) return moved(attemptedTarget, queuedSince);
+      if (state.attemptedTarget && isWithdrawnRecord(fetched, expected)) return moved(state.attemptedTarget, state.queuedSince);
       return null;
     }
     const phase = fetched.phase ?? fetched.state;
@@ -654,6 +670,7 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
     if (phase !== 'preparing' && phase !== 'queued' && phase !== 'gone') return null;
     if (phase !== 'queued') continue;
     queuedSince ??= now();
+    state.queuedSince = queuedSince;
     if (now() - queuedSince < minQueuedMs) continue;
     // A callback that throws or rejects is a failed tick: no move, keep watching. The target is awaited (the real picker is async).
     let to;
@@ -665,7 +682,7 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
       continue;
     }
     if (!watching()) return null;
-    attemptedTarget = to;
+    state.attemptedTarget = to; // kept on the dispatch's own state: a lost reply plus a closed session is resolved from the record by the caller
     const { action } = await remoteWithdraw(runner, expected.ticketId, { sshBin, deadlineMs: withdrawDeadlineMs, env });
     // The runner decided; a cancel or an ssh close that raced it is the caller's to resolve, not ours to undo.
     if (!current()) return null;
@@ -836,6 +853,7 @@ export async function dispatchRemote(opts) {
   // sent, so the runner cannot plausibly hold a matching result yet -- go
   // straight to unconfirmed instead of burning up to resultAttempts *
   // resultDeadlineMs retrying a fetch that was never going to bind.
+  const dispatchedAt = now();
   const uploadStartedAt = Date.now();
   const pipeResult = await pipeSnapshot(child, snapshotStream, transferDeadlineMs, abortSignal);
   const uploadMs = Date.now() - uploadStartedAt;
@@ -851,10 +869,10 @@ export async function dispatchRemote(opts) {
   const expected = { protocol, ticketId, generation, manifestHash: manifest.manifestHash };
   const closed = waitClosed(child, abortSignal);
   let move = null;
+  const state = { runner, epoch: 1, attemptedTarget: null, queuedSince: null };
   if (rebalance && withdrawCapable && pipeResult.ok) {
     // One serial watcher beside the open ssh session; it is stopped and JOINED before anything below looks at the outcome.
     const watchAbort = new AbortController();
-    const state = { runner, epoch: 1 };
     let sessionClosed = false;
     const watcher = watchQueuedTicket({
       runner, expected, state, rebalance, signal: watchAbort.signal, abortSignal, now, sleep,
@@ -892,7 +910,7 @@ export async function dispatchRemote(opts) {
     return { outcome: 'cancelled' };
   }
 
-  if (move) return { outcome: 'moved', from: move.from, to: move.to, queuedMs: move.queuedMs, neverStarted: true };
+  if (move) return { outcome: 'moved', from: move.from, to: move.to, queuedMs: move.queuedMs, waitedOnRunnerMs: Math.max(0, move.withdrawnAt - dispatchedAt), neverStarted: true };
 
   if (!pipeResult.ok) {
     // BRAIN-405: the snapshot was never completely sent, and a runner runs nothing before it has received and verified all of it
@@ -949,6 +967,7 @@ export async function dispatchRemote(opts) {
 
   // BRAIN-363: set when the expiry cancel was not confirmed: whatever the late record turns out to be, the job may still be running.
   let unconfirmedCancel = false;
+  let confirmedExpiryCancel = false; // BRAIN-363: the remote command was cancelled (confirmed) before a late record arrived
   if (!record && waitExpired) {
     // BRAIN-363: the caller falls back to running locally, so the runner's copy must not keep running beside it.
     const cancelConfirmed = await remoteCancelBestEffort(runner, ticketId, sshBin, cancelDeadlineMs, env);
@@ -959,6 +978,7 @@ export async function dispatchRemote(opts) {
     if (late && !late.missing) {
       record = late;
       unconfirmedCancel = !cancelConfirmed;
+      confirmedExpiryCancel = cancelConfirmed;
     } else if (cancelConfirmed) {
       return {
         outcome: 'unconfirmed',
@@ -996,14 +1016,17 @@ export async function dispatchRemote(opts) {
   // comment for the phase rules (I7: green only from phase 'command').
   const classification = classifyRemoteResult(record, expected);
   if (classification.outcome === 'unconfirmed') {
-    // Only a valid classified result may lift the unconfirmed-cancel hold: an unusable late record leaves the job possibly alive.
-    // A bound `unfinished/withdrawn` record is the runner's own proof that nothing ran.
-    return {
-      outcome: 'unconfirmed',
-      reason: classification.reason,
-      ...(unconfirmedCancel ? { mayStillBeRunning: true } : {}),
-      ...(isWithdrawnRecord(record, expected) ? { neverStarted: true } : {}),
-    };
+    // A withdraw whose reply was lost and whose session closed before the watcher saw it: the runner's own bound record
+    // proves the withdrawal, and the target the watcher had chosen is where the ticket goes.
+    if (state.attemptedTarget && isWithdrawnRecord(record, expected)) {
+      return { outcome: 'moved', from: runner, to: state.attemptedTarget, queuedMs: state.queuedSince === null ? 0 : now() - state.queuedSince, waitedOnRunnerMs: Math.max(0, now() - dispatchedAt), neverStarted: true };
+    }
+    // Only a record that BINDS to this ticket and says nothing ran proves it never started. Any other unusable record leaves
+    // the job possibly running (a mismatched or contradictory record says nothing about the runner), and so does an
+    // unconfirmed expiry cancel: the caller must not run it a second time.
+    if (confirmedExpiryCancel) return { outcome: 'unconfirmed', reason: classification.reason };
+    if (provesNeverStarted(record, expected) && !unconfirmedCancel) return { outcome: 'unconfirmed', reason: classification.reason, neverStarted: true };
+    return { outcome: 'unconfirmed', reason: classification.reason, mayStillBeRunning: true };
   }
   const confirmed = { outcome: 'confirmed', result: record, exitCode: classification.exitCode, phase: classification.phase, uploadMs };
   // BRAIN-398: only a runner that stored files for this result is asked for them; a failure here is reported, never

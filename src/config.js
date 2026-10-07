@@ -336,6 +336,11 @@ function validateRunners(runners, sourcePath) {
     if (runner.shell !== undefined) {
       assert(typeof runner.shell === 'string' && runner.shell.length > 0, `${sourcePath}: runner "${runner.name}".shell must be a non-empty string`);
     }
+    // BRAIN-436: whether a ticket withdrawn from another runner may be sent here. Free cores say little about a runner whose
+    // other workloads outweigh lanes (e.g. sims running at a higher CPUWeight), so such a runner opts out.
+    if (runner.rebalanceTarget !== undefined) {
+      assert(typeof runner.rebalanceTarget === 'boolean', `${sourcePath}: runner "${runner.name}".rebalanceTarget must be a boolean`);
+    }
     if (runner.speedFactor !== undefined) {
       assert(
         Number.isFinite(runner.speedFactor) && runner.speedFactor > 0,

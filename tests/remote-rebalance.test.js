@@ -6,6 +6,9 @@ import { laneRun, waitFor, sleep, writeGlobalConfig, gitFixture } from './helper
 import { tmpDir, setup, resultOf } from './remote-harness.js';
 import { rebalanceBlocked, hasMeasuredHeadroom } from '../src/remote-client.js';
 import { readAttempt, patchAttemptLocked } from '../src/attempts.js';
+import { dispatchRemote } from '../src/remote-client.js';
+import { makeGitWorktree } from './remote-harness.js';
+import crypto from 'node:crypto';
 import { withLock } from '../src/state.js';
 import { loadGlobalConfig, ConfigError } from '../src/config.js';
 import { CAPABILITIES } from '../src/capabilities.js';
@@ -50,11 +53,16 @@ if (sub === 'probe') {
 } else {
   const r = JSON.parse(fs.readFileSync(${JSON.stringify(path.join(dir, 'runners.json'))}, 'utf8'))[dest];
   if (!r) done(255);
-  const child = spawn('sh', ['-c', cmd], { stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, LANE_FAKE_RUNNER: dest, LANE_BROKER_HOME: r.home, LANE_BROKER_STATE: r.state } });
+  const flag = ${JSON.stringify(path.join(dir, 'withdrew-'))} + dest;
+  if (sub === 'exec' && r.execFails) done(255);
+  if (sub === 'result' && r.resultDownAfterWithdraw && fs.existsSync(flag)) done(1);
+  if (sub === 'withdraw' && r.withdrawReplyLost) fs.writeFileSync(flag, '1');
+  const lost = sub === 'withdraw' && r.withdrawReplyLost;
+  const child = spawn('sh', ['-c', cmd], { stdio: ['pipe', lost ? 'ignore' : 'pipe', 'pipe'], env: { ...process.env, LANE_FAKE_RUNNER: dest, LANE_BROKER_HOME: r.home, LANE_BROKER_STATE: r.state } });
   process.stdin.pipe(child.stdin);
-  child.stdout.pipe(process.stdout);
+  if (!lost) child.stdout.pipe(process.stdout);
   child.stderr.pipe(process.stderr);
-  child.on('close', (code) => done(code == null ? 1 : code));
+  child.on('close', (code) => done(lost ? 1 : code == null ? 1 : code));
   child.on('error', () => done(1));
 }
 `,
@@ -63,6 +71,7 @@ if (sub === 'probe') {
   return {
     calls: () => fs.readFileSync(logPath, 'utf8').split('\n').filter(Boolean),
     count: (entry) => fs.readFileSync(logPath, 'utf8').split('\n').filter((l) => l === entry).length,
+    probesPath,
     setProbe: (name, probe) => {
       const all = JSON.parse(fs.readFileSync(probesPath, 'utf8'));
       all[name] = probe;
@@ -72,7 +81,7 @@ if (sub === 'probe') {
 }
 
 /** Runners `names` (each a real broker) under the harness `setup()`; every runner in `paused` keeps any ticket queued. */
-function rebalanceSetup({ names = ['a', 'b'], paused = ['a'], rebalance = {} } = {}) {
+function rebalanceSetup({ names = ['a', 'b'], paused = ['a'], rebalance = {}, runnerOpts = {}, configOpts = {}, localPaused = false } = {}) {
   const base = setup();
   const binDir = base.env.PATH.split(path.delimiter)[0];
   const runners = {};
@@ -82,8 +91,8 @@ function rebalanceSetup({ names = ['a', 'b'], paused = ['a'], rebalance = {} } =
     const state = tmpDir(`rb-${name}-state`);
     writeGlobalConfig(home, { sampleMs: 50, capacity: 4 });
     if (paused.includes(name)) fs.writeFileSync(path.join(state, 'PAUSE'), 'kept queued for the test');
-    runners[name] = { home, state, pause: path.join(state, 'PAUSE') };
-    globalRunners.push({ name, ssh: name, shell: 'sh -c', root: tmpDir(`rb-${name}-root`) });
+    runners[name] = { home, state, pause: path.join(state, 'PAUSE'), ...(runnerOpts[name] ?? {}) };
+    globalRunners.push({ name, ssh: name, shell: 'sh -c', root: tmpDir(`rb-${name}-root`), ...(configOpts[name] ?? {}) });
   }
   const fake = installTwoRunnerSsh(binDir, runners);
   writeGlobalConfig(base.home, {
@@ -95,8 +104,10 @@ function rebalanceSetup({ names = ['a', 'b'], paused = ['a'], rebalance = {} } =
     remoteRebalanceMaxMoves: 1,
     ...rebalance,
   });
+  if (localPaused) fs.writeFileSync(path.join(base.state, 'PAUSE'), 'keep the local queue closed');
   const runsFile = path.join(tmpDir('rb-runs'), 'runs');
   const cmd = [process.execPath, '-e', `require('fs').appendFileSync(${JSON.stringify(runsFile)}, process.env.LANE_FAKE_RUNNER + '\\n')`];
+  const cmdArgv = cmd;
   const runs = () => (fs.existsSync(runsFile) ? fs.readFileSync(runsFile, 'utf8').split('\n').filter(Boolean) : []);
   const unpause = (name) => fs.rmSync(runners[name].pause, { force: true });
   const start = async () => {
@@ -105,7 +116,7 @@ function rebalanceSetup({ names = ['a', 'b'], paused = ['a'], rebalance = {} } =
     return started.stdout.trim();
   };
   const finish = (id, timeout = '60s') => laneRun(['wait', id, '--timeout', timeout], { env: base.env });
-  return { ...base, fake, runs, unpause, start, finish, runners };
+  return { ...base, fake, runs, unpause, start, finish, runners, globalRunners, binDir, cmdArgv };
 }
 
 const T = { timeout: 180_000 };
@@ -292,4 +303,99 @@ test('rebalance: a supervisor killed with `moving` recorded is MOVE-INTERRUPTED 
   assert.ok(sent.includes('cancel a') && sent.includes('cancel b'), `remote-cancel on both runners, saw ${sent.join(',')}`);
   assert.equal(readAttempt(ctx.state, id), null, 'the move record is gone with the attempt');
   assert.equal(resultOf(ctx.state, id).exit, 130);
+});
+
+// ---- review fixes ----
+
+test('P1-3: a cancel that overtakes a runner\'s pending exec leaves a tombstone, and the exec that arrives afterwards is refused -- nothing runs', T, async () => {
+  const ctx = rebalanceSetup({ rebalance: { remoteRebalanceMinQueuedMs: 0 } });
+  const id = crypto.randomUUID();
+  const { createAttempt } = await import('../src/attempts.js');
+  await createAttempt(ctx.state, id, { runner: 'b' });
+  await withLock(ctx.state, () => patchAttemptLocked(ctx.state, id, { supervisor: { pid: 2 ** 22 + 7, startTime: null, bootId: 'dead' }, moving: { from: 'a', to: 'b', phase: 'dispatching', at: Date.now() } }));
+  const cancelled = await laneRun(['cancel', id], { env: ctx.env });
+  assert.equal(cancelled.code, 0, cancelled.stderr);
+  const bRunner = ctx.globalRunners.find((r) => r.name === 'b');
+  assert.ok(fs.existsSync(path.join(bRunner.root, 'tombstones', id)), 'b recorded that this ticket must never be created');
+  // the exec that was still in flight now arrives
+  const src = makeGitWorktree({ 'a.txt': 'hello' });
+  const arrived = await dispatchRemote({
+    ticketId: id, generation: 0, repoKey: 'r', lane: 'default', relCwd: '', argv: ctx.cmdArgv, runner: bRunner, worktreeRoot: src,
+    sshBin: path.join(ctx.binDir, 'ssh'), env: ctx.env, deadlines: { resultMs: 5000, resultAttempts: 1 },
+  });
+  assert.notEqual(arrived.outcome, 'confirmed', JSON.stringify(arrived));
+  assert.deepEqual(ctx.runs(), [], 'nothing ran');
+  assert.equal(fs.existsSync(path.join(bRunner.root, 'tickets', id)), false, 'the ticket directory was never created');
+});
+
+test('P1-3: cancelling a stranded move keeps the attempt while a named runner has not confirmed', T, async () => {
+  const ctx = rebalanceSetup({ rebalance: { remoteRebalanceMinQueuedMs: 0 } });
+  const id = await ctx.start();
+  await waitFor(() => ctx.fake.count('exec a') === 1, { timeoutMs: 30_000 });
+  const attempt = readAttempt(ctx.state, id);
+  process.kill(attempt.supervisor.pid, 'SIGKILL');
+  await sleep(300);
+  await withLock(ctx.state, () => patchAttemptLocked(ctx.state, id, { runner: 'b', moving: { from: 'a', to: 'b', phase: 'dispatching', at: Date.now() } }));
+  const runnersPath = path.join(path.dirname(ctx.fake.probesPath), 'runners.json');
+  const all = JSON.parse(fs.readFileSync(runnersPath, 'utf8'));
+  const keep = all.b;
+  delete all.b; // b is unreachable: its cancel cannot be confirmed
+  fs.writeFileSync(runnersPath, JSON.stringify(all));
+  const held = await laneRun(['cancel', id], { env: ctx.env });
+  assert.equal(held.code, 1, held.stderr);
+  assert.match(held.stderr, /not confirmed on b/);
+  assert.ok(readAttempt(ctx.state, id), 'the attempt is still there');
+  all.b = keep;
+  fs.writeFileSync(runnersPath, JSON.stringify(all));
+  const done = await laneRun(['cancel', id], { env: ctx.env });
+  assert.equal(done.code, 0, done.stderr);
+  assert.equal(readAttempt(ctx.state, id), null);
+});
+
+test('P1-2: an unknown withdraw keeps `moving`, and the possibly-live ticket stays reported (MOVE-INTERRUPTED), not run, not forgotten', T, async () => {
+  const ctx = rebalanceSetup({ runnerOpts: { a: { withdrawReplyLost: true, resultDownAfterWithdraw: true } }, rebalance: { remoteRebalanceMinQueuedMs: 300 } });
+  const id = await ctx.start();
+  const waited = await ctx.finish(id, '60s');
+  assert.equal(waited.code, 1, waited.stderr);
+  assert.match(waited.stderr, /MOVE-INTERRUPTED/);
+  const attempt = readAttempt(ctx.state, id);
+  assert.ok(attempt, 'the attempt is kept');
+  assert.equal(attempt.moving?.from, 'a');
+  assert.ok(attempt.unresolved);
+  assert.equal(ctx.fake.count('exec b'), 0, 'never dispatched without proof');
+  assert.deepEqual(ctx.runs(), []);
+});
+
+test('P2-5: after A -> B fails before starting, the rebind never goes back to A and the cap is not reset', T, async () => {
+  const ctx = rebalanceSetup({ runnerOpts: { b: { execFails: true } }, localPaused: true, rebalance: { remoteRebalanceMinQueuedMs: 300, remoteRebindIntervalMs: 200 } });
+  const id = await ctx.start();
+  await waitFor(() => ctx.fake.count('exec b') >= 1, { timeoutMs: 30_000 });
+  await sleep(3000);
+  assert.equal(ctx.fake.count('exec a'), 1, 'A was never dispatched to again');
+  assert.equal(ctx.fake.count('exec b'), 1);
+  assert.equal(readAttempt(ctx.state, id)?.moves?.length, 1);
+  await laneRun(['cancel', id], { env: ctx.env });
+});
+
+test('P2-8: a runner with rebalanceTarget false is never a destination', T, async () => {
+  const ctx = rebalanceSetup({ configOpts: { b: { rebalanceTarget: false } }, rebalance: { remoteRebalanceMinQueuedMs: 300 } });
+  const id = await ctx.start();
+  await waitFor(() => ctx.fake.count('exec a') === 1, { timeoutMs: 30_000 });
+  await sleep(2500);
+  assert.equal(ctx.fake.count('withdraw a'), 0);
+  ctx.unpause('a');
+  assert.equal((await ctx.finish(id)).code, 0);
+  assert.deepEqual(ctx.runs(), ['a']);
+});
+
+test('config: a runner\'s rebalanceTarget must be a boolean', () => {
+  const { home } = setup();
+  writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 15, loadOpen: 11, loadOpenSamples: 3, sampleMs: 5000, runners: [{ name: 'w', ssh: 'w', rebalanceTarget: 'no' }] });
+  const prev = process.env.LANE_BROKER_HOME;
+  process.env.LANE_BROKER_HOME = home;
+  try {
+    assert.throws(() => loadGlobalConfig(), ConfigError);
+  } finally {
+    process.env.LANE_BROKER_HOME = prev;
+  }
 });

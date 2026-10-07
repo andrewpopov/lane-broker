@@ -97,13 +97,21 @@ async function cancelAttempt(root, id, attempt) {
   const globalCfg = loadGlobalConfig();
   // BRAIN-436: a move that was in flight may have left the ticket on either runner, so every runner it names is cancelled.
   const involved = [...new Set([attempt.runner, attempt.moving?.from, attempt.moving?.to].filter(Boolean))];
+  const unconfirmed = [];
   for (const name of involved) {
     const runnerCfg = (globalCfg.runners || []).find((r) => r.name === name);
-    if (runnerCfg) {
-      await remoteCancel(runnerCfg, id);
-    } else {
+    if (!runnerCfg) {
       process.stderr.write(`lane cancel: runner "${name}" is no longer configured; skipping remote-cancel\n`);
+      unconfirmed.push(name);
+    } else if (!(await remoteCancel(runnerCfg, id))) {
+      unconfirmed.push(name);
     }
+  }
+  // A possibly-live ticket (a stranded move, or one that could not be proven unstarted) is only forgotten once every runner it
+  // names has confirmed -- or proven the ticket absent and tombstoned it. Otherwise the record stays, so it can be cancelled again.
+  if ((attempt.moving || attempt.unresolved) && unconfirmed.length > 0) {
+    process.stderr.write(`lane cancel: ${id} is still held: remote-cancel not confirmed on ${unconfirmed.join(', ')}; retry lane cancel once reachable\n`);
+    return { exitCode: 1 };
   }
 
   const resultPath = path.join(paths(root).results, `${id}.json`);

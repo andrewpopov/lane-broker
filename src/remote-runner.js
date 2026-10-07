@@ -368,10 +368,16 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   try {
     await withLock(stateHome(), () => {
       assertNotMigrating(stateHome());
+      // BRAIN-436: a cancel/withdraw that overtook this exec left a tombstone under this same lock, so it loses the race.
+      if (fs.existsSync(tombstonePath(root, header.ticketId))) throw new TombstonedError();
       fs.mkdirSync(ticketsDir, { recursive: true });
       fs.mkdirSync(ticketDir);
     });
   } catch (err) {
+    if (err instanceof TombstonedError) {
+      process.stderr.write(`lane remote-exec: ticket ${header.ticketId} was cancelled before it arrived; not creating it\n`);
+      return { exitCode: 1 };
+    }
     if (err instanceof MigrationInProgressError) {
       process.stderr.write(`lane remote-exec: ${err.message}\n`);
       return { exitCode: 75 };
@@ -774,6 +780,23 @@ export async function withdrawLane(brokerRoot, laneId, { dequeue = dequeueSync }
   });
 }
 
+/** BRAIN-436: a cancel or withdraw for a ticket this runner has never heard of (its exec is still in flight, or never came). */
+class TombstonedError extends Error {}
+const tombstonePath = (root, ticketId) => path.join(path.resolve(root), 'tombstones', ticketId);
+
+/**
+ * Record, under the broker lock `remote-exec` creates tickets under, that `ticketId` must never be created -- unless its ticket
+ * directory already exists by the time the lock is held (then the caller handles it as an ordinary ticket). Resolves true iff
+ * the tombstone was written, which is the proof a later `remote-exec` for that id is refused.
+ */
+async function tombstoneAbsentTicket(root, ticketId) {
+  return withLock(stateHome(), () => {
+    if (fs.existsSync(path.join(path.resolve(root), 'tickets', ticketId))) return false;
+    atomicWriteFile(tombstonePath(root, ticketId), String(Date.now()));
+    return true;
+  });
+}
+
 /**
  * `lane remote-withdraw <ticketId>` (BRAIN-436): take a ticket that is still QUEUED on this runner back, irreversibly, so
  * its submitter can run it elsewhere. Prints `{protocol, ticketId, action}` and exits 0 for every decided action; the
@@ -789,7 +812,13 @@ export async function remoteWithdrawCommand(ticketId, { root = defaultRemoteRoot
     process.stdout.write(`${JSON.stringify({ protocol: 1, ticketId, action })}\n`);
     return { exitCode: 0 };
   };
-  if (!fs.existsSync(ticketDir)) return reply('no-such-ticket');
+  if (!fs.existsSync(ticketDir)) {
+    // The exec for this id may still be on its way: make it lose the race. (A ticket that appeared meanwhile is handled below.)
+    if (await tombstoneAbsentTicket(root, ticketId)) {
+      process.stdout.write(`${JSON.stringify({ protocol: 1, ticketId, action: 'no-such-ticket', tombstoned: true })}\n`);
+      return { exitCode: 0 };
+    }
+  }
   let laneId = null;
   try {
     laneId = fs.readFileSync(path.join(ticketDir, 'remote-id'), 'utf8').trim();
@@ -873,8 +902,12 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
   root = path.resolve(root);
   const ticketDir = path.join(root, 'tickets', ticketId);
   if (!fs.existsSync(ticketDir)) {
-    process.stdout.write(`${JSON.stringify({ protocol: 1, ticketId, action: 'no-such-ticket' })}\n`);
-    return { exitCode: 0 };
+    // BRAIN-436: the exec may still be in flight. The tombstone makes it refuse to create the ticket, so this cancel is a real
+    // one (`cancelConfirmed`): the job can no longer start here. A ticket that appeared meanwhile falls through as an ordinary one.
+    if (await tombstoneAbsentTicket(root, ticketId)) {
+      process.stdout.write(`${JSON.stringify({ protocol: 1, ticketId, action: 'no-such-ticket', cancelConfirmed: true, tombstoned: true })}\n`);
+      return { exitCode: 0 };
+    }
   }
 
   atomicWriteFile(path.join(ticketDir, 'cancelled'), String(Date.now()));
@@ -920,6 +953,8 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
         listQueue(brokerRoot).some((t) => t && t.id === remoteLaneId);
       const result = await cancelCommand(remoteLaneId);
       cancelConfirmed = result.exitCode === 0;
+      // A ticket that has already published its result is not running: a retried cancel is confirmed, not forever unconfirmed.
+      if (!cancelConfirmed && fs.existsSync(path.join(ticketDir, 'result.json'))) cancelConfirmed = true;
     }
   }
 

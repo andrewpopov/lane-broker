@@ -222,7 +222,8 @@ for (const protocol of [1, 2]) {
 test('remote-withdraw: an unknown ticket id answers no-such-ticket', { timeout: 60_000 }, async () => {
   const f = pausedRunner();
   const header = headerOf();
-  assert.deepEqual(await withdrawCli(f, header), { protocol: 1, ticketId: header.ticketId, action: 'no-such-ticket' });
+  // the exec for this id may still be on its way: the answer leaves a tombstone so it loses that race
+  assert.deepEqual(await withdrawCli(f, header), { protocol: 1, ticketId: header.ticketId, action: 'no-such-ticket', tombstoned: true });
 });
 
 test('Race (c): a ticket with a remote-id but not yet enqueued answers not-queued, and then runs normally', { timeout: 60_000 }, async () => {
