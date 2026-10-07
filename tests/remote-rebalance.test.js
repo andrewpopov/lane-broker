@@ -123,6 +123,17 @@ function rebalanceSetup({ names = ['a', 'b'], paused = ['a'], rebalance = {}, ru
 
 const T = { timeout: 180_000 };
 
+/**
+ * Wait until the exec on runner `name` has started AND enqueued its ticket (recorded `remote-id`). The ssh call starting is not the
+ * ticket existing: runner a can only confirm a cancel once its exec has enqueued the ticket, and under load that lagged the
+ * cancel, so `remote-cancel` answered "not confirmed on a" (a race in these tests, not in the broker).
+ */
+async function execArrived(ctx, name) {
+  await waitFor(() => ctx.fake.count(`exec ${name}`) === 1, { timeoutMs: 30_000 });
+  const tickets = path.join(ctx.globalRunners.find((r) => r.name === name).root, 'tickets');
+  await waitFor(() => fs.existsSync(tickets) && fs.readdirSync(tickets).some((t) => fs.existsSync(path.join(tickets, t, 'remote-id'))), { timeoutMs: 60_000 });
+}
+
 // ---- the pure policy ----
 
 test('rebalanceBlocked: the cap and the cooldown, on a fake clock', () => {
@@ -230,7 +241,7 @@ test('rebalance: a changed worktree is never moved (the snapshot would be stale)
   gitFixture(['add', '-f', '.lane-broker.json'], ctx.repoDir);
   gitFixture(['commit', '-q', '-m', 'x'], ctx.repoDir);
   const id = await ctx.start();
-  await waitFor(() => ctx.fake.count('exec a') === 1, { timeoutMs: 30_000 });
+  await execArrived(ctx, 'a');
   fs.appendFileSync(path.join(ctx.repoDir, '.lane-broker.json'), '\n');
   await sleep(2500);
   assert.equal(ctx.fake.count('withdraw a'), 0, 'no withdraw once the tree changed');
@@ -246,7 +257,7 @@ test('rebalance: a B whose probe has no measured headroom is not a destination',
   const ctx = rebalanceSetup({ rebalance: { remoteRebalanceMinQueuedMs: 300 } });
   ctx.fake.setProbe('b', { ...unmeasured, capacity: { cpuCores: 8 }, reservedCpuCores: 0 });
   const id = await ctx.start();
-  await waitFor(() => ctx.fake.count('exec a') === 1, { timeoutMs: 30_000 });
+  await execArrived(ctx, 'a');
   await sleep(2500);
   assert.equal(ctx.fake.count('withdraw a'), 0);
   ctx.unpause('a');
@@ -257,7 +268,7 @@ test('rebalance: a B whose probe has no measured headroom is not a destination',
 test('rebalance: remoteRebalanceMinQueuedMs 0 disables it entirely -- nothing watches the runner', T, async () => {
   const ctx = rebalanceSetup({ rebalance: { remoteRebalanceMinQueuedMs: 0 } });
   const id = await ctx.start();
-  await waitFor(() => ctx.fake.count('exec a') === 1, { timeoutMs: 30_000 });
+  await execArrived(ctx, 'a');
   await sleep(2500);
   assert.equal(ctx.fake.count('result a'), 0, 'no watcher poll');
   assert.equal(ctx.fake.count('withdraw a'), 0);
@@ -269,7 +280,7 @@ test('rebalance: remoteRebalanceMinQueuedMs 0 disables it entirely -- nothing wa
 test('rebalance: a cancel that lands while the destination is being chosen stops the move before any withdraw', T, async () => {
   const ctx = rebalanceSetup({ rebalance: { remoteRebalanceMinQueuedMs: 300 } });
   const id = await ctx.start();
-  await waitFor(() => ctx.fake.count('exec a') === 1, { timeoutMs: 30_000 });
+  await execArrived(ctx, 'a');
   const probesBefore = ctx.fake.count('probe b');
   ctx.fake.setProbe('b', { ...IDLE, delayMs: 3000 });
   await waitFor(() => ctx.fake.count('probe b') > probesBefore, { timeoutMs: 30_000 });
@@ -285,7 +296,7 @@ test('rebalance: a cancel that lands while the destination is being chosen stops
 test('rebalance: a supervisor killed with `moving` recorded is MOVE-INTERRUPTED in wait and status, and cancel clears it on every runner', T, async () => {
   const ctx = rebalanceSetup({ rebalance: { remoteRebalanceMinQueuedMs: 0 } });
   const id = await ctx.start();
-  await waitFor(() => ctx.fake.count('exec a') === 1, { timeoutMs: 30_000 });
+  await execArrived(ctx, 'a');
   const attempt = readAttempt(ctx.state, id);
   process.kill(attempt.supervisor.pid, 'SIGKILL');
   await sleep(300);
@@ -333,7 +344,7 @@ test('P1-3: a cancel that overtakes a runner\'s pending exec leaves a tombstone,
 test('P1-3: cancelling a stranded move keeps the attempt while a named runner has not confirmed', T, async () => {
   const ctx = rebalanceSetup({ rebalance: { remoteRebalanceMinQueuedMs: 0 } });
   const id = await ctx.start();
-  await waitFor(() => ctx.fake.count('exec a') === 1, { timeoutMs: 30_000 });
+  await execArrived(ctx, 'a');
   const attempt = readAttempt(ctx.state, id);
   process.kill(attempt.supervisor.pid, 'SIGKILL');
   await sleep(300);
@@ -382,7 +393,7 @@ test('P2-5: after A -> B fails before starting, the rebind never goes back to A 
 test('P2-8: a runner with rebalanceTarget false is never a destination', T, async () => {
   const ctx = rebalanceSetup({ configOpts: { b: { rebalanceTarget: false } }, rebalance: { remoteRebalanceMinQueuedMs: 300 } });
   const id = await ctx.start();
-  await waitFor(() => ctx.fake.count('exec a') === 1, { timeoutMs: 30_000 });
+  await execArrived(ctx, 'a');
   await sleep(2500);
   assert.equal(ctx.fake.count('withdraw a'), 0);
   ctx.unpause('a');
@@ -405,7 +416,7 @@ test('config: a runner\'s rebalanceTarget must be a boolean', () => {
 test('a live cancel the runner does not confirm keeps the attempt and fails `lane cancel`; once confirmed it clears', T, async () => {
   const ctx = rebalanceSetup({ runnerOpts: { a: { cancelFails: true } }, rebalance: { remoteRebalanceMinQueuedMs: 0 } });
   const id = await ctx.start();
-  await waitFor(() => ctx.fake.count('exec a') === 1, { timeoutMs: 30_000 });
+  await execArrived(ctx, 'a');
   await waitFor(() => listQueue(ctx.runners.a.state).length === 1, { timeoutMs: 30_000 }); // queued on A, so its cancel is a real, confirmable one
   const cancelled = await laneRun(['cancel', id], { env: ctx.env });
   assert.equal(cancelled.code, 1, cancelled.stderr);
@@ -427,7 +438,7 @@ test('a live cancel the runner does not confirm keeps the attempt and fails `lan
 test('a confirmed live cancel is unchanged: exit 0, attempt gone, result 130', T, async () => {
   const ctx = rebalanceSetup({ rebalance: { remoteRebalanceMinQueuedMs: 0 } });
   const id = await ctx.start();
-  await waitFor(() => ctx.fake.count('exec a') === 1, { timeoutMs: 30_000 });
+  await execArrived(ctx, 'a');
   const cancelled = await laneRun(['cancel', id], { env: ctx.env });
   assert.equal(cancelled.code, 0, cancelled.stderr);
   assert.equal(readAttempt(ctx.state, id), null);

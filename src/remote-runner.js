@@ -20,7 +20,8 @@ import { collectStatus } from './status.js';
 import { readLease, isSupervisorAlive } from './lease.js';
 import { readAttempt } from './attempts.js';
 import { listQueue, dequeueSync } from './scheduler.js';
-import { REMOTE_TMP_BASE, gcRemoteTickets, removeDetached } from './gc.js';
+import { REMOTE_TMP_BASE, TMP_OWNER_FILE, gcRemoteTickets, removeDetached } from './gc.js';
+import { writeBrokerLog } from './admission.js';
 import { sanitizeObservedCpu, sanitizeRssPeak, sanitizeCpuSeconds } from './observed.js';
 
 // BRAIN-320 S1b (1b): the absolute path to `bin/lane.js`, so a protocol-2
@@ -288,16 +289,17 @@ function cleanupWork(workDir, tmpDir) {
 }
 
 /**
- * BRAIN-438: reclaim what earlier tickets left on this runner before taking a new one. Bounded per run and removed in a
- * detached `rm`, so the submitter's ssh session never waits on it; a failure here (lock timeout, bad config) is never a
- * reason to refuse the ticket.
+ * BRAIN-438: reclaim what earlier tickets left on this runner. Scheduled after this exec has its ticket, never on the
+ * dispatch path; bounded per run and removed in a detached `rm`, so the submitter's ssh session never waits on it. A failure
+ * (lock timeout, bad config) is logged to the broker log and never affects the ticket.
  */
 async function collectGarbage(root) {
   try {
+    await testHoldAt('remote-gc');
     const cfg = loadGlobalConfig();
     await gcRemoteTickets({ remoteRoot: root, retentionMs: cfg.remoteTicketRetentionMs, maxTickets: cfg.remoteGcMaxTicketsPerRun, maxExamined: cfg.remoteGcMaxExaminedPerRun, remove: removeDetached });
-  } catch {
-    // best-effort
+  } catch (err) {
+    writeBrokerLog(ensureStateDirs().root, `lane-broker-gc error: ${err.message}\n`);
   }
 }
 
@@ -351,8 +353,6 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     if (!(name in scrubbed)) delete process.env[name];
   }
 
-  await collectGarbage(root);
-
   const reader = makeReader(stdin);
   const headerResult = await readHeaderLine(reader, MAX_HEADER_BYTES);
   if (!headerResult.ok) {
@@ -400,6 +400,8 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     throw err;
   }
   pruneStaleArtifacts(ticketsDir);
+  // Off the dispatch path: after the header is read and the ticket exists, in a later turn of the event loop.
+  setImmediate(() => void collectGarbage(root));
   await testHoldAt('remote-exec-committed');
   // Node's default for SIGHUP is to exit, but this process must outlive a dropped ssh session
   // to publish result.json; explicit cancellation goes through remote-cancel.
@@ -423,6 +425,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   // pipeline's setup/command children, and a protocol-1 argv via runCommand),
   // so setting it once here covers them all.
   const tmpDir = fs.mkdtempSync(path.join(REMOTE_TMP_BASE, 'lb-'));
+  atomicWriteFile(path.join(tmpDir, TMP_OWNER_FILE), header.ticketId);
   atomicWriteFile(path.join(ticketDir, 'tmp-dir'), tmpDir);
   process.env.TMPDIR = tmpDir;
   process.env.TMP = tmpDir;

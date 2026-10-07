@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { atomicWriteFile, isCancelled, isExpired, isUuid, isWithdrawn, listJsonRecordsStrict, paths, readJsonSafe, stateHome, tombstonePath, withLock } from './state.js';
 import { isSupervisorAlive } from './lease.js';
+import { writeBrokerLog } from './admission.js';
 
 /**
  * BRAIN-438: garbage collection of what runs leave behind. Two sweeps, both of which only ever remove what nothing can
@@ -24,13 +25,24 @@ import { isSupervisorAlive } from './lease.js';
  * ssh session: `ConnectTimeout` covers neither). Expiring one by age would let that exec recreate and run a cancelled
  * ticket. They are tiny files, so the leak is cheap; a ticket directory whose id is tombstoned is never touched either.
  *
- * Nothing outside the runner root is ever deleted: `gc-trash` and `tickets` must be real directories (a symlink is
- * refused), and only real directories inside a verified `gc-trash` are removed.
+ * Nothing outside the runner root is ever deleted: `gc-trash`, `tickets`, and the state root's `logs` and `results` must be real
+ * directories inside their root (a symlink is refused; a refused logs/results sweep is skipped with one warning line), and
+ * only real directories inside a verified `gc-trash` are removed. A recorded tmp dir is deleted only if it is a real `lb-*`
+ * directory directly under the tmp base AND carries an `.lane-broker-owner` marker naming this very ticket (a ticket id is
+ * unique, so no other live ticket can own the same path); legacy tmp dirs without a marker are never deleted. Only
+ * broker-generated names (`logs/<uuid>.log`, `results/<uuid>.json`) are ever pruned: a custom `--log` path is never touched.
+ *
+ * THREAT MODEL: accidental configuration (a symlinked directory, a stale or wrong recorded path, a custom log path) and
+ * ordinary concurrency between broker processes. A same-uid adversary who swaps a directory for a symlink DURING a sweep is out
+ * of scope: they can already delete anything that uid owns. `lstat` / no-follow is used wherever it is cheap, no further.
  */
 
 /** Per-ticket TMPDIR base of a runner (BRAIN-374/376): /var/tmp is disk-backed, unlike a possibly RAM-backed /tmp. */
 export const REMOTE_TMP_BASE = '/var/tmp';
 const TMP_DIR_FILE = 'tmp-dir';
+/** Written inside a ticket's tmp dir by `remote-exec`; its content is the ticket id that owns the directory. */
+export const TMP_OWNER_FILE = '.lane-broker-owner';
+const GENERATED_NAME = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const DAY_MS = 86_400_000;
 
 const lockOptions = { timeoutMs: 2000 };
@@ -83,15 +95,10 @@ function ids(records) {
   return new Set(records.map((r) => r.id));
 }
 
-/**
- * Every id that has a lease, a queue entry, or (for the logs sweep) an attempt record, plus the resolved log and result
- * paths those live tickets name (`lane run --log <path>` can put a log under any name). Throws if any record is unreadable.
- */
+/** Every id that has a lease, a queue entry, or (for the logs sweep) an attempt record. Throws if any record is unreadable. */
 function liveIds(root, { withAttempts = false } = {}) {
   const p = paths(root);
-  const records = [...listJsonRecordsStrict(p.leases), ...listJsonRecordsStrict(p.queue)];
-  const live = ids(records);
-  live.paths = new Set(records.flatMap((r) => [r.logPath, r.resultPath]).filter((f) => typeof f === 'string').map((f) => path.resolve(f)));
+  const live = ids([...listJsonRecordsStrict(p.leases), ...listJsonRecordsStrict(p.queue)]);
   if (withAttempts) for (const id of ids(listJsonRecordsStrict(p.attempts))) live.add(id);
   return live;
 }
@@ -118,11 +125,22 @@ function liveReason(ticketDir, brokerRoot, live) {
   return null;
 }
 
-/** The tmp dir `remote-exec` recorded for this ticket, if it is the shape `remote-exec` creates. */
-function recordedTmpDir(ticketDir) {
+/**
+ * The tmp dir `remote-exec` recorded for this ticket, only if it provably belongs to it: a real (non-symlink) `lb-*`
+ * directory directly under the tmp base whose owner marker names `ticketId`. Null otherwise (the caller counts it skipped).
+ */
+function ownedTmpDir(ticketDir, ticketId) {
   const recorded = readTrimmed(path.join(ticketDir, TMP_DIR_FILE));
-  if (!recorded || !path.isAbsolute(recorded)) return null;
-  return path.dirname(recorded) === REMOTE_TMP_BASE && path.basename(recorded).startsWith('lb-') ? recorded : null;
+  if (!recorded || !path.isAbsolute(recorded) || !path.basename(recorded).startsWith('lb-')) return null;
+  try {
+    if (!fs.lstatSync(recorded).isDirectory()) return null;
+    if (path.dirname(fs.realpathSync(recorded)) !== fs.realpathSync(REMOTE_TMP_BASE)) return null;
+    const marker = path.join(recorded, TMP_OWNER_FILE);
+    if (!fs.lstatSync(marker).isFile()) return null;
+    return readTrimmed(marker) === ticketId ? recorded : null;
+  } catch {
+    return null;
+  }
 }
 
 function isTerminal(ticketDir) {
@@ -145,7 +163,7 @@ function exists(file) {
  *   - else, a terminal `result.json`: its `work/` and tmp dir go (the result and artifacts stay for the submitter).
  */
 export async function gcRemoteTickets({ remoteRoot, brokerRoot = stateHome(), retentionMs, maxTickets = Infinity, maxExamined = Infinity, now = Date.now(), dryRun = false, remove = removeNow }) {
-  const summary = { tickets: 0, work: 0, examined: 0, skippedLive: 0, bounded: false };
+  const summary = { tickets: 0, work: 0, examined: 0, skippedLive: 0, tmpSkipped: 0, bounded: false };
   const ticketsDir = path.join(remoteRoot, 'tickets');
   const cursorFile = path.join(remoteRoot, 'gc-cursor');
   const trashDir = trashDirOf(remoteRoot);
@@ -186,12 +204,14 @@ export async function gcRemoteTickets({ remoteRoot, brokerRoot = stateHome(), re
         }
         const expired = now - stat.mtimeMs >= retentionMs;
         const workDir = path.join(ticketDir, 'work');
-        const tmpDir = recordedTmpDir(ticketDir);
+        const recordedTmp = exists(path.join(ticketDir, TMP_DIR_FILE));
+        const tmpDir = recordedTmp ? ownedTmpDir(ticketDir, name) : null;
         if (!expired && !(isTerminal(ticketDir) && (exists(workDir) || tmpDir))) continue;
         acted += 1;
         if (expired) summary.tickets += 1;
         else summary.work += 1;
         if (tmpDir) doomedTmpDirs.push(tmpDir);
+        else if (recordedTmp) summary.tmpSkipped += 1;
         if (dryRun) continue;
         fs.mkdirSync(trashDir, { recursive: true });
         const doomed = expired ? ticketDir : workDir;
@@ -228,12 +248,16 @@ export async function gcLogsAndResults(root, { retentionMs, maxFiles = Infinity,
   for (const [kind, dir] of [['logs', p.logs], ['results', p.results]]) {
     let entries = [];
     try {
+      assertRealDirUnder(root, dir);
       entries = fs.readdirSync(dir, { withFileTypes: true });
-    } catch {
+    } catch (err) {
+      if (err instanceof UnsafeGcPathError) writeBrokerLog(root, `lane-broker-gc warning: ${err.message}\n`);
       continue;
     }
+    const generated = kind === 'logs' ? '.log' : '.json';
     for (const entry of entries) {
-      if (!entry.isFile()) continue;
+      // Dirent comes from the directory listing without following links: a symlink is not a file here.
+      if (!entry.isFile() || path.extname(entry.name) !== generated || !GENERATED_NAME.test(path.parse(entry.name).name)) continue;
       if (summary.logs + summary.results >= maxFiles) {
         summary.bounded = true;
         return summary;
@@ -241,7 +265,7 @@ export async function gcLogsAndResults(root, { retentionMs, maxFiles = Infinity,
       const file = path.join(dir, entry.name);
       const stat = fs.statSync(file, { throwIfNoEntry: false });
       if (!stat || now - stat.mtimeMs < retentionMs) continue;
-      if (live.has(path.parse(entry.name).name) || live.paths.has(path.resolve(file))) {
+      if (live.has(path.parse(entry.name).name)) {
         summary.skippedLive += 1;
         continue;
       }

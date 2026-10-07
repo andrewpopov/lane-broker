@@ -6,13 +6,13 @@ import crypto from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, laneRun, BIN, stripLogTimestamps } from './helpers.js';
 import { makeTmpDir } from './helpers/tmp.js';
-import { gcRemoteTickets, gcLogsAndResults, maybeDailyGc, REMOTE_TMP_BASE } from '../src/gc.js';
+import { gcRemoteTickets, gcLogsAndResults, maybeDailyGc, REMOTE_TMP_BASE, TMP_OWNER_FILE } from '../src/gc.js';
 import { enqueue } from '../src/scheduler.js';
 import { writeLease } from '../src/lease.js';
 import { paths, atomicWriteFile, processStartTime, tombstonePath, writeCancelMarkerFile, writeWithdrawMarkerFile, writeExpireMarkerFile } from '../src/state.js';
-import { appendRotatingLog, logAdmissionDecision, ADMISSION_LOG_MAX_BYTES, ADMISSION_LOG_REFRESH_MS } from '../src/admission.js';
+import { appendRotatingLog, logAdmissionDecision, ADMISSION_LOG_MAX_BYTES } from '../src/admission.js';
 import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig } from '../src/config.js';
-import { serializeHeader } from '../src/remote-stream.js';
+import { serializeHeader, encodeSnapshot } from '../src/remote-stream.js';
 
 /**
  * BRAIN-438: what a finished run leaves behind is collected, what a live one owns never is, and the admission log stops
@@ -51,7 +51,7 @@ function deadPid() {
  * A ticket directory as `remote-exec` leaves it. `publisher`: 'alive' (this test process), 'dead', or 'none'.
  * `laneId` is the broker-side ticket it enqueued (written as `remote-id`).
  */
-function makeTicket(remoteRoot, { id = crypto.randomUUID(), publisher = 'dead', result = true, laneId, work = true, tmp = false, ageMs = 0 } = {}) {
+function makeTicket(remoteRoot, { id = crypto.randomUUID(), publisher = 'dead', result = true, laneId, work = true, tmp = false, tmpOwner, ageMs = 0 } = {}) {
   const dir = path.join(remoteRoot, 'tickets', id);
   fs.mkdirSync(dir, { recursive: true });
   if (publisher !== 'none') {
@@ -70,6 +70,7 @@ function makeTicket(remoteRoot, { id = crypto.randomUUID(), publisher = 'dead', 
     fs.mkdirSync(tmpDir);
     leakedTmpDirs.add(tmpDir);
     fs.writeFileSync(path.join(tmpDir, 'scratch'), 'y');
+    if (tmpOwner !== null) fs.writeFileSync(path.join(tmpDir, TMP_OWNER_FILE), tmpOwner ?? id);
     fs.writeFileSync(path.join(dir, 'tmp-dir'), tmpDir);
   }
   setAge(dir, ageMs);
@@ -282,23 +283,80 @@ test('logs and results older than the retention are pruned; a live lease or queu
   }
 });
 
-test('a live lease or queued ticket keeps the custom log path it names, whatever its filename', async () => {
+test('a custom-named old log is never deleted, live or not; a generated name with no live ticket is', async () => {
   const { state } = setup();
   const p = paths(state);
   fs.mkdirSync(p.logs, { recursive: true });
-  const shared = path.join(p.logs, 'shared.log');
-  const queuedLog = path.join(p.logs, 'queued-custom.log');
-  const orphan = path.join(p.logs, 'orphan.log');
-  for (const f of [shared, queuedLog, orphan]) {
+  const custom = [path.join(p.logs, 'shared.log'), path.join(p.logs, 'queued-custom.log'), path.join(p.logs, 'orphan.log')];
+  const generated = path.join(p.logs, `${crypto.randomUUID()}.log`);
+  for (const f of [...custom, generated]) {
     fs.writeFileSync(f, 'x');
     setAge(f, 30 * DAY);
   }
-  writeLease(state, { ...ticketOf(crypto.randomUUID()), logPath: shared });
-  await enqueue(state, { ...ticketOf(crypto.randomUUID()), logPath: queuedLog });
+  writeLease(state, { ...ticketOf(crypto.randomUUID()), logPath: custom[0] });
   const summary = await gcLogsAndResults(state, { retentionMs: DEFAULT_GLOBAL_CONFIG.logRetentionMs, now: NOW });
   assert.equal(summary.logs, 1);
-  assert.ok(fs.existsSync(shared) && fs.existsSync(queuedLog));
-  assert.equal(fs.existsSync(orphan), false);
+  for (const f of custom) assert.ok(fs.existsSync(f), `${path.basename(f)} kept`);
+  assert.equal(fs.existsSync(generated), false);
+});
+
+test('a symlinked logs/ or results/ directory is skipped with a warning and the outside files survive', async () => {
+  const { state } = setup();
+  const p = paths(state);
+  const outside = makeTmpDir('gc-outside-');
+  const victim = path.join(outside, `${crypto.randomUUID()}.log`);
+  const victimResult = path.join(outside, `${crypto.randomUUID()}.json`);
+  for (const f of [victim, victimResult]) {
+    fs.writeFileSync(f, 'keep');
+    setAge(f, 30 * DAY);
+  }
+  fs.rmSync(p.logs, { recursive: true, force: true });
+  fs.rmSync(p.results, { recursive: true, force: true });
+  fs.symlinkSync(outside, p.logs);
+  fs.symlinkSync(outside, p.results);
+  const summary = await gcLogsAndResults(state, { retentionMs: DEFAULT_GLOBAL_CONFIG.logRetentionMs, now: NOW });
+  assert.deepEqual([summary.logs, summary.results], [0, 0]);
+  assert.ok(fs.existsSync(victim) && fs.existsSync(victimResult));
+  assert.match(fs.readFileSync(p.admissionLog, 'utf8'), /lane-broker-gc warning: .*logs/);
+});
+
+test('a recorded tmp dir is deleted only with this ticket\'s owner marker', async () => {
+  const { state, remoteRoot } = setup();
+  const owned = makeTicket(remoteRoot, { tmp: true });
+  const noMarker = makeTicket(remoteRoot, { tmp: true, tmpOwner: null });
+  const otherMarker = makeTicket(remoteRoot, { tmp: true, tmpOwner: crypto.randomUUID() });
+  const summary = await gc(remoteRoot, state);
+  assert.equal(fs.existsSync(owned.tmpDir), false, 'owned tmp removed');
+  assert.ok(fs.existsSync(noMarker.tmpDir), 'legacy tmp without a marker is kept');
+  assert.ok(fs.existsSync(otherMarker.tmpDir), "another ticket's tmp is kept");
+  assert.equal(summary.tmpSkipped, 2);
+  for (const t of [noMarker, otherMarker]) assert.equal(fs.existsSync(t.workDir), false, 'its work dir still goes');
+});
+
+// ---- remote-exec never waits on GC ----
+
+test('remote-exec does not wait on GC: a GC held open does not delay the ticket or its result', async () => {
+  const f = setup();
+  writeGlobalConfig(f.home, {});
+  const ready = path.join(f.base, 'gc-ready');
+  const go = path.join(f.base, 'gc-go');
+  const src = makeTmpDir('gc-src-');
+  const body = Buffer.from('hello');
+  fs.writeFileSync(path.join(src, 'a.txt'), body);
+  const entries = [{ path: 'a.txt', type: 'file', exec: false, size: body.length, sha256: crypto.createHash('sha256').update(body).digest('hex') }];
+  const ticketId = crypto.randomUUID();
+  const header = { ticketId, generation: 0, repoKey: 'gc-test', lane: 'default', argv: [process.execPath, '-e', 'process.exit(0)'], relCwd: '' };
+  const env = { ...f.env, LANE_BROKER_TEST_HOLD_AT: 'remote-gc', LANE_BROKER_TEST_HOLD_READY: ready, LANE_BROKER_TEST_HOLD_GO: go };
+  const child = spawn(process.execPath, [BIN, 'remote-exec', '--root', f.remoteRoot], { env });
+  const closed = new Promise((resolve) => child.on('close', resolve));
+  encodeSnapshot(src, header, entries).pipe(child.stdin);
+  const result = path.join(f.remoteRoot, 'tickets', ticketId, 'result.json');
+  const deadline = Date.now() + 45_000;
+  while (!fs.existsSync(result) && Date.now() < deadline) await new Promise((r) => setTimeout(r, 100));
+  const published = fs.existsSync(result);
+  fs.writeFileSync(go, 'x');
+  await closed;
+  assert.ok(published, 'the result was published while GC was still held');
 });
 
 test('the daily sweep runs once, is not due again within a day, and is due after one', async () => {
@@ -358,14 +416,14 @@ test('the admission log writes a candidate only when its decision changes, and p
   for (const l of raw) assert.match(l, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z lane-broker-admission candidate=/);
 });
 
-test('an unchanged decision is suppressed within five minutes and written again after', () => {
+test('an unchanged decision is suppressed within the 60 s refresh window and written again after', () => {
   const { state } = setup();
   logAdmissionDecision(state, decision('a'), NOW);
-  logAdmissionDecision(state, decision('a'), NOW + ADMISSION_LOG_REFRESH_MS - 1000);
+  logAdmissionDecision(state, decision('a'), NOW + 59_000);
   assert.equal(logLines(state).length, 1);
-  logAdmissionDecision(state, decision('a'), NOW + ADMISSION_LOG_REFRESH_MS + 1000);
+  logAdmissionDecision(state, decision('a'), NOW + 61_000);
   assert.equal(logLines(state).length, 2);
-  logAdmissionDecision(state, decision('a'), NOW + ADMISSION_LOG_REFRESH_MS + 2000);
+  logAdmissionDecision(state, decision('a'), NOW + 62_000);
   assert.equal(logLines(state).length, 2, 'the refresh restarts the window');
 });
 

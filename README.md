@@ -1505,17 +1505,27 @@ What a run leaves behind is collected; what a live one owns never is. Everything
   before it arrived, and nothing bounds how late that exec can be (a suspended process or long-lived ssh session is not
   covered by `ConnectTimeout`). Expiring one would let it recreate and run a cancelled ticket. They are tiny files. GC also
   never touches a tombstoned id's ticket directory.
-- **Logs and results** (`logRetentionMs`, default 14 days; `logGcMaxFilesPerRun`, default 5000). `logs/*` and `results/*`
-  older than the retention are removed, except files of an id that has a lease, a queue entry or an attempt record, and the `logPath`/`resultPath` named by a live
-  lease or queued ticket (`lane run --log <path>`). Runs
-  from `lane gc` and, at most once a day (marker `gc-last-run`), at a supervisor's start, never on the admission path. A
-  sweep that stops at its bound leaves the marker unclaimed so the next supervisor continues.
+- **Logs and results** (`logRetentionMs`, default 14 days; `logGcMaxFilesPerRun`, default 5000). Only broker-generated names
+  are pruned: `logs/<uuid>.log` and `results/<uuid>.json` older than the retention, whose uuid has no lease, queue entry or
+  attempt record. A custom `lane run --log <path>` file is never touched, so no alias or new-user race exists. `logs/` and
+  `results/` must be real directories inside the state root; otherwise that sweep is skipped with one
+  `lane-broker-gc warning` line in the admission log. Runs from `lane gc` and, at most once a day (marker `gc-last-run`), at a
+  supervisor's start, never on the admission path. A sweep that stops at its bound leaves the marker unclaimed so the next
+  supervisor continues.
+- **Tmp dirs.** `remote-exec` writes `.lane-broker-owner` (the ticket id) inside each ticket's tmp dir. GC deletes a recorded
+  tmp dir only if it is a real `lb-*` directory directly under `/var/tmp` carrying a marker naming that ticket; a legacy
+  dir without a marker, or with another ticket's, is left and reported as `tmpSkipped`.
+- **Threat model.** Accidental configuration (a symlinked directory, a stale recorded path, a custom log path) and ordinary
+  concurrency between broker processes. A same-uid adversary swapping directories for symlinks during a sweep is out of scope:
+  they can already delete anything that uid owns.
+- **Off the dispatch path.** `remote-exec` schedules ticket GC after it has read its header and created its ticket (a later
+  event-loop turn), so dispatch latency never includes it; failures go to the broker log.
 - **`admission-decisions.log`.** Each line starts with an ISO-8601 UTC timestamp. A `lane-broker-admission` line is written
   only when a candidate's (current decision:reason, new decision:reason) differs from the last one written for it (kept in
   `admission-last.json`; an admitted candidate is forgotten). The log rotates to `admission-decisions.log.1` at 10 MiB,
   replacing the previous `.1`. Readers that match a line by content (`candidate=...`) are unaffected by the prefix; one
-  an unchanged decision is written again every 5 minutes (`ADMISSION_LOG_REFRESH_MS`), so the tail of the log always holds a
-  current line for every waiting candidate.
+  an unchanged decision is written again every 60 seconds (`ADMISSION_LOG_REFRESH_MS`, 60 s; polls are every 5 s, so dedup still
+  cuts ~12x), so a waiting candidate's line in the tail is never more than 60 s stale.
 
 ## Testing hooks
 

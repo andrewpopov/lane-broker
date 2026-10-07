@@ -543,8 +543,8 @@ export function writeBrokerLog(root, line, now = Date.now()) {
   }
 }
 
-/** An unchanged decision is written again after this long, so the tail of the log always holds a current line for every waiting candidate (readers only look at the tail). */
-export const ADMISSION_LOG_REFRESH_MS = 5 * 60 * 1000;
+/** An unchanged decision is written again after this long (polls are every 5 s, so dedup still cuts ~12x): a waiting candidate's line is never more than this stale in the log's tail, which is all readers look at. */
+export const ADMISSION_LOG_REFRESH_MS = 60 * 1000;
 
 // More candidates than this can never be waiting at once on a real host; the oldest entry is forgotten past it.
 const LAST_DECISION_MAX_ENTRIES = 256;
