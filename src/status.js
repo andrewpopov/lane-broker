@@ -8,7 +8,7 @@ import { cpuBudget, projectBusy, ticketCpuEstimate, ticketCpuEstimateBasis } fro
 import { classLocks, simArmed, usedByClass } from './allocation.js';
 import { queuedClaimsByClass } from './allocation-shadow.js';
 import { readLastSimDemandAt } from './sim-arm.js';
-import { listAttempts, supervisorAlive } from './attempts.js';
+import { listAttempts, supervisorAlive, moveInterruptedLabel } from './attempts.js';
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfig } from './config.js';
@@ -232,6 +232,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       phase: a.phase,
       elapsedMs: a.startedAt ? now - a.startedAt : null,
       orphaned: !supervisorAlive(a),
+      moveInterrupted: !supervisorAlive(a) ? moveInterruptedLabel(a.id, a) : null,
     }));
 
   return {
@@ -493,7 +494,7 @@ export function renderStatusText(status) {
       lines.push('  (none)');
     } else {
       for (const r of status.remote) {
-        const flag = r.orphaned ? `  [ORPHANED-REMOTE] — reconcile with: lane cancel ${r.id}` : '';
+        const flag = r.moveInterrupted ? `  [${r.moveInterrupted}] — reconcile with: lane cancel ${r.id}` : r.orphaned ? `  [ORPHANED-REMOTE] — reconcile with: lane cancel ${r.id}` : '';
         lines.push(`  ${r.id}  runner=${r.runner ?? '-'}  phase=${r.phase}  elapsed=${fmtMs(r.elapsedMs)}${flag}`);
       }
     }

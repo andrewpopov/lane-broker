@@ -90,6 +90,13 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // BRAIN-405: how often a remote-eligible ticket that fell back to this machine's queue (no runner had room) re-probes the
   // runners and moves to one that now has real headroom. 0 disables rebinding.
   remoteRebindIntervalMs: 30_000,
+  // BRAIN-436: a remote ticket that has sat QUEUED on its runner this long is withdrawn and moved to another runner that has
+  // real headroom now (needs the runner's `remote-withdraw/1`). 0 disables. The interval is how often the submitter looks, the
+  // cooldown is the minimum gap between two moves of one ticket, and the cap is how many times one ticket may move.
+  remoteRebalanceMinQueuedMs: 300_000,
+  remoteRebalanceIntervalMs: 60_000,
+  remoteRebalanceCooldownMs: 600_000,
+  remoteRebalanceMaxMoves: 1,
   // BRAIN-207 (forgiving admission): whether the load gate is allowed to
   // deny a start at all. Default false — the gate is informational-only
   // (still sampled every poll, still logged) until an operator opts back
@@ -230,6 +237,10 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isInteger(cfg.remoteRebindIntervalMs) && cfg.remoteRebindIntervalMs >= 0,
     `${sourcePath}: "remoteRebindIntervalMs" must be a non-negative integer`,
   );
+  for (const field of ['remoteRebalanceMinQueuedMs', 'remoteRebalanceCooldownMs', 'remoteRebalanceMaxMoves']) {
+    assert(Number.isInteger(cfg[field]) && cfg[field] >= 0, `${sourcePath}: "${field}" must be a non-negative integer`);
+  }
+  assert(Number.isInteger(cfg.remoteRebalanceIntervalMs) && cfg.remoteRebalanceIntervalMs > 0, `${sourcePath}: "remoteRebalanceIntervalMs" must be a positive integer`);
   assert(typeof cfg.admissionLoadGate === 'boolean', `${sourcePath}: "admissionLoadGate" must be a boolean`);
   assert(typeof cfg.allocationShadow === 'boolean', `${sourcePath}: "allocationShadow" must be a boolean`);
   assert(Number.isInteger(cfg.simArmWindowMs) && cfg.simArmWindowMs > 0, `${sourcePath}: "simArmWindowMs" must be a positive integer`);

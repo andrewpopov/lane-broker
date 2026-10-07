@@ -605,6 +605,21 @@ function isWithdrawnRecord(record, expected) {
 const DEFAULT_REBALANCE_INTERVAL_MS = 30_000;
 
 /**
+ * BRAIN-436: why a ticket may not move right now (null: it may). Pure, so the cooldown is testable on a fake clock: a ticket
+ * moves at most `maxMoves` times, and not again until `cooldownMs` after its last move.
+ */
+export function rebalanceBlocked({ moves, maxMoves, lastMoveAt, now, cooldownMs }) {
+  if (moves >= maxMoves) return 'max-moves';
+  if (lastMoveAt !== null && now - lastMoveAt < cooldownMs) return 'cooldown';
+  return null;
+}
+
+/** BRAIN-436: a move needs a POSITIVE measurement -- unlike dispatch (`runnerRoom`), a probe with no measured free CPU is not room. */
+export function hasMeasuredHeadroom(probe) {
+  return Boolean(probe?.headroom) && typeof probe.headroom === 'object' && Number.isFinite(probe.headroom.cpuCores);
+}
+
+/**
  * BRAIN-436: while the exec ssh session is open (the ticket is on runner A), observe A and, once the ticket has sat `queued`
  * for `minQueuedMs` with a better runner on offer, withdraw it. ONE serial loop: every step is awaited in turn, so there is
  * never more than one move in flight, and every await is followed by a re-check that this dispatch is still current (same
@@ -613,7 +628,7 @@ const DEFAULT_REBALANCE_INTERVAL_MS = 30_000;
  * anything else keeps waiting on A. Stops for good once the ticket is `admitted` or terminal. Resolves null when it did not move.
  */
 async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed, signal, abortSignal, now, sleep, fetchDeadlineMs, withdrawDeadlineMs, sshBin, env }) {
-  const { minQueuedMs, intervalMs = DEFAULT_REBALANCE_INTERVAL_MS, pickTarget, beforeWithdraw } = rebalance;
+  const { minQueuedMs, intervalMs = DEFAULT_REBALANCE_INTERVAL_MS, pickTarget, beforeWithdraw, afterWithdraw } = rebalance;
   const fence = { runner, epoch: state.epoch };
   const current = () => state.runner === fence.runner && state.epoch === fence.epoch;
   const watching = () => current() && !isClosed() && !signal.aborted && !abortSignal?.aborted;
@@ -635,8 +650,9 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
       return null;
     }
     const phase = fetched.phase ?? fetched.state;
-    if (phase !== 'preparing' && phase !== 'queued') return null;
-    if (phase === 'preparing') continue;
+    // `gone` is read before the runner has written its publisher record (the snapshot may still be landing), so it is not final here.
+    if (phase !== 'preparing' && phase !== 'queued' && phase !== 'gone') return null;
+    if (phase !== 'queued') continue;
     queuedSince ??= now();
     if (now() - queuedSince < minQueuedMs) continue;
     // A callback that throws or rejects is a failed tick: no move, keep watching. The target is awaited (the real picker is async).
@@ -654,6 +670,11 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
     // The runner decided; a cancel or an ssh close that raced it is the caller's to resolve, not ours to undo.
     if (!current()) return null;
     if (action === 'withdrawn') return moved(to, queuedSince);
+    try {
+      await afterWithdraw?.(action);
+    } catch {
+      // a failed notification is not a move
+    }
   }
 }
 
@@ -732,10 +753,12 @@ export async function dispatchRemote(opts) {
     // BRAIN-436: whether `runner` advertises `remote-withdraw/1`. Without it a dispatch the runner may have accepted can
     // never be proven unstarted, so a lost connection leaves it `mayStillBeRunning` instead of falling back.
     canWithdraw = false,
-    // BRAIN-436: `{minQueuedMs, intervalMs, pickTarget, beforeWithdraw, canWithdraw}` -- take the ticket back from `runner`
+    // BRAIN-436: `{minQueuedMs, intervalMs, pickTarget, beforeWithdraw, afterWithdraw(action), canWithdraw}` -- take the ticket back from `runner`
     // once it has sat queued for `minQueuedMs` and `pickTarget()` names a better runner; resolves `{outcome:'moved'}`.
     // `rebalance.canWithdraw` overrides the top-level one; with no capability nothing is watched and nothing is withdrawn.
     rebalance = null,
+    // BRAIN-436: called once the whole snapshot has been handed to `runner` (it holds the job from here on).
+    onSnapshotSent,
   } = opts;
   const withdrawCapable = (rebalance?.canWithdraw ?? canWithdraw) === true;
 
@@ -818,6 +841,13 @@ export async function dispatchRemote(opts) {
   const uploadMs = Date.now() - uploadStartedAt;
   // The ssh session IS the remote job; wait for it to close (unbounded here
   // -- an outer --timeout is the caller's concern), killable by abort.
+  if (pipeResult.ok && onSnapshotSent) {
+    try {
+      await onSnapshotSent();
+    } catch {
+      // a bookkeeping failure never changes the dispatch
+    }
+  }
   const expected = { protocol, ticketId, generation, manifestHash: manifest.manifestHash };
   const closed = waitClosed(child, abortSignal);
   let move = null;

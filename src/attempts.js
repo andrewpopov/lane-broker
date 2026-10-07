@@ -98,6 +98,18 @@ export function remoteCancelledResult(id, startedAt) {
   };
 }
 
+/**
+ * BRAIN-436: the label for an attempt whose supervisor died with a runner-to-runner move recorded (`moving`), or null. Once
+ * `dispatching` the ticket was withdrawn from `from` and may be on `to`; `withdrawing` is the same move before the withdraw's
+ * outcome was known. Nothing resumes it: `lane cancel` cancels on every runner involved and clears the record.
+ */
+export function moveInterruptedLabel(id, attempt) {
+  const m = attempt?.moving;
+  if (!m) return null;
+  const state = m.phase === 'dispatching' ? `withdrawn from ${m.from}, may be on ${m.to}` : `withdrawing from ${m.from} (outcome unknown, may have been withdrawn)`;
+  return `MOVE-INTERRUPTED ${id} ${state}`;
+}
+
 /** Create the initial attempt record for `id` (generation 0, executor 'remote',
  *  phase 'probe'), stamped with THIS process's own identity as the owning
  *  supervisor. `runner` is not yet known at this point in the real dispatch

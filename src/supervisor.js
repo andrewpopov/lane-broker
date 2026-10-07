@@ -27,7 +27,7 @@ import { reloadGlobalConfig } from './config.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
 import { detectResourceCapacity, checkResourceBudget, localSimRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
-import { selectRunner, dispatchRemote, needsProtocol2 } from './remote-client.js';
+import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
 import { REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
@@ -722,47 +722,137 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // about to actually be dialed for the transfer -- see finding #5 above.
   process.stderr.write(`lane: running on ${runner.name}\n`);
 
-  // BRAIN-398: a runner without `artifacts/1` would run the command and silently return nothing, so say so up front.
   const declaredArtifacts = enriched.remote.remoteArtifacts;
-  const artifactsSupported = Boolean(declaredArtifacts) && Array.isArray(probe?.capabilities) && probe.capabilities.includes(ARTIFACTS_CAPABILITY);
+  let artifactsSupported = false;
   let artifactsUnsupportedWarning;
-  if (declaredArtifacts && !artifactsSupported) {
-    artifactsUnsupportedWarning = `runner ${runner.name} does not support ${ARTIFACTS_CAPABILITY}; nothing will be returned`;
-    const line = `lane: warning: remote artifacts: ${artifactsUnsupportedWarning}\n`;
+
+  // BRAIN-436: a ticket still QUEUED on its runner past `remoteRebalanceMinQueuedMs` is withdrawn (irreversibly, only if the
+  // runner has not started it) and dispatched to a runner that has real room now. Each dispatch is an epoch: output and records
+  // from an earlier one are ignored. A runner a ticket has left is never revisited.
+  const rebalanceOn = globalCfg.remoteRebalanceMinQueuedMs > 0;
+  const visited = [runner.name];
+  const moves = [];
+  let epoch = 1;
+  let priorRemoteQueuedMs = 0;
+  let lastMoveAt = null;
+  let movingSet = false;
+  const clearMoving = async () => {
+    movingSet = false;
+    await updateAttempt(root, enriched.id, gen, { moving: undefined });
+  };
+  const dispatchedAt = Date.now(); // the FIRST dispatch: waitedMs includes the time spent queued on every runner before the last
+  let dispatch;
+  while (true) {
+    // BRAIN-398: a runner without `artifacts/1` would run the command and silently return nothing, so say so up front.
+    artifactsSupported = Boolean(declaredArtifacts) && Array.isArray(probe?.capabilities) && probe.capabilities.includes(ARTIFACTS_CAPABILITY);
+    artifactsUnsupportedWarning = undefined;
+    if (declaredArtifacts && !artifactsSupported) {
+      artifactsUnsupportedWarning = `runner ${runner.name} does not support ${ARTIFACTS_CAPABILITY}; nothing will be returned`;
+      const line = `lane: warning: remote artifacts: ${artifactsUnsupportedWarning}\n`;
+      process.stderr.write(line);
+      writeBrokerLog(root, line);
+    }
+    const thisEpoch = epoch;
+    const current = (write) => (chunk) => {
+      if (thisEpoch === epoch) write(chunk);
+    };
+    const canWithdraw = Array.isArray(probe?.capabilities) && probe.capabilities.includes(REMOTE_WITHDRAW_CAPABILITY);
+    let target = null;
+
+    // BRAIN-320 S1c: `enriched.remote.remoteDeps`/`remoteSetup` ride along in
+    // this spread and are what `dispatchRemote` derives its protocol-2 exec
+    // header from (see its own `needsProtocol2` call).
+    dispatch = await dispatchRemote({
+      ...enriched.remote,
+      remoteArtifacts: artifactsSupported ? declaredArtifacts : null,
+      artifactLimits: artifactLimitsOf(globalCfg),
+      manifest,
+      runner,
+      argv: enriched.cmd,
+      lane: enriched.lane,
+      ticketId: enriched.id,
+      generation: gen,
+      // BRAIN-320 S1d: opt-in, from THIS (client) machine's own global config
+      // -- never the runner's -- so an unset value here means the header
+      // carries no queueTimeoutMs at all (I6).
+      queueTimeoutMs: globalCfg.remoteQueueTimeoutMs,
+      noProgressTimeoutMs: enriched.noProgressTimeoutMs ?? globalCfg.noProgressTimeoutMs,
+      // BRAIN-380 §6: the tier BEFORE any cap, and the wait this ticket has accrued on THIS host's priority clock. The
+      // runner re-anchors from the wait, never from our timestamps, so clock skew between hosts cannot matter.
+      priorityRequested: enriched.priorityRequested,
+      priorityAccruedMs: waitedMs(enriched, effectiveNow(root)),
+      resultWaitMs: globalCfg.remoteResultWaitMs,
+      // BRAIN-437: a runner that can withdraw lets a dropped connection prove the job never started; one that cannot leaves it possibly running
+      canWithdraw,
+      onStdout: current(onStdout),
+      onStderr: current(onStderr),
+      abortSignal,
+      // The second runner holds the job once it has the snapshot: from there the move is no longer in flight.
+      onSnapshotSent: moves.length > 0 && movingSet ? clearMoving : undefined,
+      rebalance: rebalanceOn && canWithdraw ? {
+        minQueuedMs: globalCfg.remoteRebalanceMinQueuedMs,
+        intervalMs: globalCfg.remoteRebalanceIntervalMs,
+        pickTarget: async () => {
+          if (rebalanceBlocked({ moves: moves.length, maxMoves: globalCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: globalCfg.remoteRebalanceCooldownMs })) return null;
+          const candidates = (globalCfg.runners || []).filter((r) => !visited.includes(r.name));
+          if (candidates.length === 0) return null;
+          const picked = await selectRunner(candidates, { ...remoteSelectOptions(enriched, globalCfg), maxRemoteQueue: 0 });
+          target = picked.runner && hasMeasuredHeadroom(picked.probe) ? { runner: picked.runner, probe: picked.probe } : null;
+          return target;
+        },
+        // The worktree must still be what was snapshotted, then the intent is made durable BEFORE the irreversible withdraw.
+        beforeWithdraw: async ({ from, to }) => {
+          let unchanged = false;
+          try {
+            unchanged = buildManifest(enriched.remote.worktreeRoot).manifestHash === manifest.manifestHash;
+          } catch {
+            // ineligible now: it changed
+          }
+          if (!unchanged) return false;
+          const written = await updateAttempt(root, enriched.id, gen, { moving: { from: from.name, to: to.runner.name, phase: 'withdrawing', at: Date.now() } });
+          movingSet = written.ok;
+          return written.ok;
+        },
+        // A withdraw that was refused (the ticket started, was cancelled, ...) ends the move; an unknown reply may have taken effect, so `moving` stays.
+        afterWithdraw: async (action) => {
+          if (action !== 'unknown' && movingSet) await clearMoving();
+        },
+      } : null,
+    });
+    if (dispatch.outcome !== 'moved') break;
+
+    const from = runner;
+    const to = dispatch.to;
+    epoch += 1;
+    visited.push(to.runner.name);
+    lastMoveAt = Date.now();
+    priorRemoteQueuedMs += dispatch.queuedMs;
+    const move = { from: from.name, to: to.runner.name, at: lastMoveAt, queuedMs: dispatch.queuedMs, reason: 'queued-too-long' };
+    moves.push(move);
+    runner = to.runner;
+    probe = to.probe;
+    selectedRunner = runner.name;
+    try {
+      await updateAttempt(
+        root, enriched.id, gen,
+        { runner: runner.name, dispatchEpoch: epoch, moves: [...moves], moving: { from: from.name, to: runner.name, phase: 'dispatching', at: lastMoveAt } },
+        { refuseWhileMigrating: true },
+      );
+      movingSet = true;
+    } catch (err) {
+      if (!(err instanceof MigrationInProgressError)) throw err;
+      process.stderr.write(`lane: ${err.message}\n`);
+      await publishAndExit(gen, () => migrationRefusalResult(enriched));
+      return { fallback: false };
+    }
+    const line = `lane: remote-rebalance: ${enriched.id}: ${from.name} -> ${runner.name} (queued ${Math.round(dispatch.queuedMs / 1000)}s on ${from.name}; ${runner.name} ${probe.headroom.cpuCores} cores free)\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);
+    process.stderr.write(`lane: running on ${runner.name}\n`);
   }
-
-  // BRAIN-320 S1c: `enriched.remote.remoteDeps`/`remoteSetup` ride along in
-  // this spread and are what `dispatchRemote` derives its protocol-2 exec
-  // header from (see its own `needsProtocol2` call).
-  const dispatchedAt = Date.now();
-  const dispatch = await dispatchRemote({
-    ...enriched.remote,
-    remoteArtifacts: artifactsSupported ? declaredArtifacts : null,
-    artifactLimits: artifactLimitsOf(globalCfg),
-    manifest,
-    runner,
-    argv: enriched.cmd,
-    lane: enriched.lane,
-    ticketId: enriched.id,
-    generation: gen,
-    // BRAIN-320 S1d: opt-in, from THIS (client) machine's own global config
-    // -- never the runner's -- so an unset value here means the header
-    // carries no queueTimeoutMs at all (I6).
-    queueTimeoutMs: globalCfg.remoteQueueTimeoutMs,
-    noProgressTimeoutMs: enriched.noProgressTimeoutMs ?? globalCfg.noProgressTimeoutMs,
-    // BRAIN-380 §6: the tier BEFORE any cap, and the wait this ticket has accrued on THIS host's priority clock. The
-    // runner re-anchors from the wait, never from our timestamps, so clock skew between hosts cannot matter.
-    priorityRequested: enriched.priorityRequested,
-    priorityAccruedMs: waitedMs(enriched, effectiveNow(root)),
-    resultWaitMs: globalCfg.remoteResultWaitMs,
-    // BRAIN-437: a runner that can withdraw lets a dropped connection prove the job never started; one that cannot leaves it possibly running
-    canWithdraw: Array.isArray(probe?.capabilities) && probe.capabilities.includes(REMOTE_WITHDRAW_CAPABILITY),
-    onStdout,
-    onStderr,
-    abortSignal,
-  });
+  // A move that never completed (or one whose second dispatch ended before a snapshot went out) must not outlive this attempt's record.
+  if (movingSet) await clearMoving();
+  const rebalanceFields = () => (moves.length ? { rebalancedFrom: moves.at(-1).from, rebalancedAt: moves.at(-1).at, rebalanceReason: `queued ${Math.round(moves.at(-1).queuedMs / 1000)}s on ${moves.at(-1).from}`, moves: moves.length } : {});
 
   // BRAIN-405: a confirmed preflight refusal means the runner never started the job, so a rebound ticket goes back to its place
   if (rebind && dispatch.outcome === 'confirmed' && dispatch.result.kind === 'refused') {
@@ -805,7 +895,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     const { queuedMs, runMs } = dispatch.result;
     let remoteWaitedMs = null;
     if (Number.isFinite(queuedMs) && queuedMs >= 0) {
-      remoteWaitedMs = Math.max(0, dispatchedAt - enriched.createdAt) + queuedMs;
+      remoteWaitedMs = Math.max(0, dispatchedAt - enriched.createdAt) + priorRemoteQueuedMs + queuedMs;
     } else if (Number.isFinite(runMs) && runMs >= 0) {
       remoteWaitedMs = Math.max(0, endedAt - enriched.createdAt - runMs);
     }
@@ -820,6 +910,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       ...relayedUsage(dispatch.result),
       ...relayedDeps(dispatch.result),
       ...relayedPhases(dispatch),
+      ...rebalanceFields(),
       ...artifactFields,
       ...(noProgress ? { reason: NO_PROGRESS_REASON, noProgressTimeoutMs: dispatch.result.noProgressTimeoutMs } : {}),
       remoteKind: dispatch.result.kind,

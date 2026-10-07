@@ -1211,3 +1211,17 @@ test('BRAIN-437: a cancel arriving during the post-drop withdraw still sends rem
     assert.ok(calls.includes('cancel'), `${action}: ${calls.join(',')}`);
   }
 });
+
+test('rebalance: a runner that reads `gone` before its publisher record exists is still watched, and then moves', { timeout: 60_000 }, async () => {
+  const { result } = await dispatchRebalance({ results: [phaseRecord('gone'), phaseRecord('gone'), queued], withdraws: [{ action: 'withdrawn' }], execMs: 20_000, rebalance: { minQueuedMs: 10_000 } });
+  assert.equal(result.outcome, 'moved', JSON.stringify(result));
+});
+
+test('rebalance: afterWithdraw hears every withdraw that did not take (unknown included), and none that did', { timeout: 60_000 }, async () => {
+  for (const [reply, heard] of [[{ action: 'started' }, ['started']], [null, ['unknown', 'unknown']], [{ action: 'withdrawn' }, []]]) {
+    const actions = [];
+    await dispatchRebalance({ results: [queued, queued, queued, 'RESULT'], withdraws: [reply], execMs: reply?.action === 'withdrawn' ? 20_000 : 2500, rebalance: { minQueuedMs: 5_000, afterWithdraw: (a) => actions.push(a) } });
+    assert.deepEqual(actions.slice(0, heard.length), heard, JSON.stringify(reply));
+    if (!heard.length) assert.deepEqual(actions, []);
+  }
+});

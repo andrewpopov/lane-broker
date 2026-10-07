@@ -95,11 +95,15 @@ async function cancelAttempt(root, id, attempt) {
   // ORPHANED-REMOTE: reconcile directly, no supervisor left to do it.
   writeCancelMarkerFile(root, id);
   const globalCfg = loadGlobalConfig();
-  const runnerCfg = (globalCfg.runners || []).find((r) => r.name === attempt.runner);
-  if (runnerCfg) {
-    await remoteCancel(runnerCfg, id);
-  } else if (attempt.runner) {
-    process.stderr.write(`lane cancel: runner "${attempt.runner}" is no longer configured; skipping remote-cancel\n`);
+  // BRAIN-436: a move that was in flight may have left the ticket on either runner, so every runner it names is cancelled.
+  const involved = [...new Set([attempt.runner, attempt.moving?.from, attempt.moving?.to].filter(Boolean))];
+  for (const name of involved) {
+    const runnerCfg = (globalCfg.runners || []).find((r) => r.name === name);
+    if (runnerCfg) {
+      await remoteCancel(runnerCfg, id);
+    } else {
+      process.stderr.write(`lane cancel: runner "${name}" is no longer configured; skipping remote-cancel\n`);
+    }
   }
 
   const resultPath = path.join(paths(root).results, `${id}.json`);
