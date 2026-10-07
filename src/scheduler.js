@@ -11,10 +11,11 @@ import { captureShadowInputs, recordAllocationShadow } from './allocation-shadow
 import { classOf } from './allocation.js';
 import { reconcileSimArm, touchSimArmFor } from './sim-arm.js';
 import { advanceHwm } from './priority-clock.js';
+import { isExclusive, exclusiveDeny, isExclusiveHead, exclusiveLeaseFields, withoutBackfillExclusives } from './exclusive.js';
 import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, effectiveRank, score } from './priority.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
-import { detectResourceCapacity, effectiveWeightCapacity, evaluateMemoryAdmission, leaseResources, resolveTicketResources, terminalRowDefaults, capElasticClaim, elasticBelowFloor } from './resources.js';
+import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores, evaluateMemoryAdmission, leaseResources, resolveTicketResources, terminalRowDefaults, capElasticClaim, elasticBelowFloor } from './resources.js';
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
  *  possibly-running work and must count against both conflicts and capacity. */
@@ -403,6 +404,7 @@ function couldAdmitLocked(root, cfg, ticket, memoryReader) {
   if (listQueue(root).length > 0) return { admit: false, reason: 'queue-ahead' };
   if (fs.existsSync(paths(root).pause)) return { admit: false, reason: 'paused' };
   const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
+  if (held.some(isExclusive)) return { admit: false, reason: 'exclusive-held' };
   if (blockedBy(held, ticket)) return { admit: false, reason: 'conflict' };
   const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
   if (runningWeight + ticket.weight > effectiveWeightCapacity(cfg, detectResourceCapacity().cpuCores)) {
@@ -902,6 +904,12 @@ function safeBackfillFlags(queue, headTicket, enabled, cannotDelayHead) {
   });
 }
 
+/** BRAIN-403: the whole admission budget an exclusive lease claims (the same two formulas status and admission report). */
+function exclusiveBudget(cfg) {
+  const host = detectResourceCapacity();
+  return { cpuBudget: cpuBudgetCores(host, cfg), memoryBudgetBytes: Math.max(0, host.memoryBytes - cfg.memoryReserveBytes) };
+}
+
 /**
  * The single atomic transaction: a ticket starts only when it is selected
  * AND fits capacity AND the load gate is open AND the broker is not paused.
@@ -989,6 +997,10 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       // head (a null record has no id to have matched `position` above).
       return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
     }
+    // BRAIN-403: after the terminal checks above and the held collection, before any selector or backfill.
+    const exclusiveDenied = exclusiveDeny(queue, ticket, held);
+    if (exclusiveDenied) return { result: { started: false, ...exclusiveDenied } };
+    const exclusiveHolder = isExclusiveHead(queue, ticket);
     // Computed early (moved up from the real capacity check further below)
     // because BRAIN-249 part 2 needs to know whether the HEAD itself fits
     // before selection can even be decided, not just whether the eventual
@@ -1035,7 +1047,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // comment) and, deliberately, with NO headBlockGraceMs equivalent (see
     // resolveCapacityBlock's doc comment for why that would be actively
     // wrong here).
-    const headCapacityBlocked = !headConflicted && runningWeight + headTicket.weight > weightCapacity;
+    const headCapacityBlocked = !headConflicted && !exclusiveHolder && runningWeight + headTicket.weight > weightCapacity;
     const capacitySkipState = headCapacityBlocked ? readCapacitySkipState(root, store, headTicket.id) : null;
     const capacitySameHead = headCapacityBlocked && capacitySkipState.headId === headTicket.id;
     const capacitySkipCount = capacitySameHead ? capacitySkipState.count : 0;
@@ -1057,6 +1069,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // delay it. The ticket polling decides for itself (admission below reserves the head's
     // resources); it is never counted as a skip.
     const cannotDelayHead = (t) =>
+      !isExclusive(t) &&
       !blockedBy(held, t) &&
       !blockedBy([{ key: t.key }], headTicket) &&
       !blockedBy([{ key: headTicket.key }], t) &&
@@ -1075,7 +1088,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       // an unreadable (null) ticket ahead of this one stops backfill, as it stops every selector's walk
       queue.slice(0, position).every(Boolean) &&
       cannotDelayHead(ticket);
-    const walkQueue = simHoldsBack ? queue.filter((t, i) => i === 0 || t === null || classOf(t) !== 'sim') : queue;
+    const walkQueue = withoutBackfillExclusives(simHoldsBack ? queue.filter((t, i) => i === 0 || t === null || classOf(t) !== 'sim') : queue);
     // BRAIN-365: the first non-conflicting ticket behind a conflicted head may be one that admission
     // keeps denying projected-over-budget, which would pin every smaller ticket behind it. That
     // denial leaves a behind-conflict record (below); while it stands, the walk prefers the smallest
@@ -1267,7 +1280,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
 
     // BRAIN-362: before any exemption (cold sample, idle overshoot) can admit it at its full claim, an elastic ticket whose
     // floor no longer fits the current budget keeps waiting: the budget may grow back.
-    if (elasticBelowFloor(ticket, cfg)) {
+    if (!exclusiveHolder && elasticBelowFloor(ticket, cfg)) {
       // The head cannot start until the budget itself changes, whatever leases are held: record it futile so backfill can pass it.
       if (ticket.id === headTicket.id) {
         recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState, false, { cause: 'elastic-below-floor', headCpu: ticketCpuFloor(headTicket, cfg), sampledAt: now });
@@ -1277,7 +1290,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'elastic-below-floor' },
       };
     }
-    if (cfg.admissionLoadGate && gate.closed && !brokerIdle) {
+    if (cfg.admissionLoadGate && gate.closed && !brokerIdle && !exclusiveHolder) {
       if (ticket.id === headTicket.id) markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
       dropPickRecord();
       return {
@@ -1285,7 +1298,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'load-gate-closed' },
       };
     }
-    if (runningWeight + ticket.weight > weightCapacity) {
+    if (!exclusiveHolder && runningWeight + ticket.weight > weightCapacity) {
       if (ticket.id === headTicket.id) markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
       dropPickRecord();
       return {
@@ -1327,7 +1340,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       cfg.resourceIdleOvershootCores > 0 &&
       cpuDecision.projectedBusy - cpuDecision.budget <= cfg.resourceIdleOvershootCores;
     if (shadow.live) shadow.live.idleExempt = idleExempt;
-    if (cfg.schedulerMode === 'active' && !cpuDecision.admit && !idleExempt) {
+    if (cfg.schedulerMode === 'active' && !cpuDecision.admit && !idleExempt && !exclusiveHolder) {
       if (headPolling) {
         // Cooldown is the head's own backfill echoing back (each admission starts one), so it
         // changes nothing. Any other out-of-scope denial pauses backfill but keeps the allowance.
@@ -1432,6 +1445,8 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       class: ticket.class,
       logPath: ticket.logPath,
       resultPath: ticket.resultPath,
+      // BRAIN-403: an exclusive run claims the whole admission budget (every capacity and resource path then refuses the rest)
+      ...(exclusiveHolder ? exclusiveLeaseFields({ ...exclusiveBudget(cfg), weightCapacity, declaredResources: submitted.resources }) : {}),
       state: LEASE_STATE.RUNNING,
     };
     writeLease(root, lease);

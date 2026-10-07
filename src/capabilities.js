@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
 import { PRIORITY_CAPABILITY } from './priority.js';
 import { ARTIFACTS_CAPABILITY } from './remote-artifacts.js';
+import { EXCLUSIVE_CAPABILITY } from './exclusive.js';
 import { stateHome } from './state.js';
 import { readSchedulerFence } from './fairness.js';
 import { loadGlobalConfig } from './config.js';
@@ -22,6 +23,7 @@ export const CAPABILITIES = [
   LANE_AGING_CAPABILITY,
   GROUP_REAP_CAPABILITY,
   REMOTE_WITHDRAW_CAPABILITY,
+  EXCLUSIVE_CAPABILITY,
 ];
 
 /** `lane capabilities --json`: what this install can do and which scheduler/admission mode it is in. */

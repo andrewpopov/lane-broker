@@ -444,6 +444,7 @@ function historyRow(ticket, result, { fallbackReason, lease } = {}) {
     lane: ticket.lane,
     ...(ticket.configLane ? { configLane: ticket.configLane } : {}),
     ...(ticket.localFirst ? { localFirst: true } : {}),
+    ...(ticket.exclusive === true ? { exclusive: true } : {}),
     weight: ticket.weight,
     resources: ticket.resources,
     command: ticket.command,

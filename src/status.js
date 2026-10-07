@@ -14,6 +14,7 @@ import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfig } from './config.js';
 import { effectiveNow } from './priority-clock.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView } from './fairness.js';
+import { exclusiveHoldView } from './exclusive.js';
 import { priorityOf, effectiveRank, tierName } from './priority.js';
 import { leaseOverrun } from './observed.js';
 import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores } from './resources.js';
@@ -173,6 +174,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       logAgeMs: logMtimeAgeMs(l.logPath),
       log: l.logPath,
       weight: l.weight,
+      ...(l.exclusive === true ? { exclusive: true } : {}),
       // BRAIN-255: default 1 for a lease written before this field existed,
       // matching resolveTicketConfig's own compatibility default.
       maxConcurrent: l.maxConcurrent ?? 1,
@@ -207,6 +209,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       waitedMs: now - t.createdAt,
       priority: tier,
       ...(t.id === reservationOwnerId ? { reservationOwner: true } : {}),
+      ...(t.exclusive === true ? { exclusive: true } : {}),
       ...(tierName(rank) !== tier ? { effectiveRank: tierName(rank) } : {}),
       resources: leaseResources(t, cfg),
       cpuEstimate: ticketCpuEstimateBasis(t, cfg, now),
@@ -260,6 +263,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
     },
     paused,
     draining,
+    exclusiveHold: exclusiveHoldView(queue, held),
     priority: sched.v2 ? { active: true, mode: 'v2', nowEff, reservationOwner: reservationOwnerId } : { active: false, mode: 'legacy', nowEff },
     ...(cfg.allocationShadow ? { allocation: computeAllocation(root, cfg, queue.filter(Boolean), held, resourceCapacity.cpuCores, now) } : {}),
     // BRAIN-249: null unless the queue is genuinely stalled (a conflict-
@@ -452,6 +456,10 @@ export function renderStatusText(status) {
   } else if (status.draining) {
     lines.push(`drain marker is stale (pid ${status.draining.pid} is gone); the next lane run or lane migrate-scheduler clears it`);
   }
+  if (status.exclusiveHold) {
+    const h = status.exclusiveHold;
+    lines.push(`HOLD (exclusive) ${h.id} (${h.key}) waiting for ${h.waitingFor} running lane(s)`);
+  }
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
   if (status.configWarning) {
     lines.push(
@@ -465,7 +473,7 @@ export function renderStatusText(status) {
     lines.push('  (none)');
   } else {
     for (const r of status.running) {
-      const flag = (r.state === 'ORPHANED' ? ' [ORPHANED]' : '') + (r.overrun ? ` [OVERRUN peak ${r.overrun.observedPeak} for ${fmtMs(r.overrun.sinceMs)}]` : '');
+      const flag = (r.exclusive ? ' [exclusive]' : '') + (r.state === 'ORPHANED' ? ' [ORPHANED]' : '') + (r.overrun ? ` [OVERRUN peak ${r.overrun.observedPeak} for ${fmtMs(r.overrun.sinceMs)}]` : '');
       // BRAIN-255: only shown once it's non-default, so "2 running" reads
       // differently against a maxConcurrent: 8 lane than a plain exclusive
       // one, without cluttering the common (ceiling 1) case.
@@ -484,7 +492,7 @@ export function renderStatusText(status) {
   } else {
     for (const q of status.queued) {
       const tier = q.priority ? `  priority=${q.priority}${q.effectiveRank ? ` (aged to ${q.effectiveRank})` : ''}` : '';
-      lines.push(`  #${q.position} ${q.id}  key=${q.key}${q.cpuEstimate ? `  cpu~${q.cpuEstimate.cores.toFixed(2)}(${q.cpuEstimate.source})` : ''}  waited=${fmtMs(q.waitedMs)}${tier}${q.reservationOwner ? '  [reservation owner]' : ''}`);
+      lines.push(`  #${q.position} ${q.id}  key=${q.key}${q.cpuEstimate ? `  cpu~${q.cpuEstimate.cores.toFixed(2)}(${q.cpuEstimate.source})` : ''}  waited=${fmtMs(q.waitedMs)}${tier}${q.reservationOwner ? '  [reservation owner]' : ''}${q.exclusive ? '  [exclusive]' : ''}`);
     }
   }
   if (status.remote) {

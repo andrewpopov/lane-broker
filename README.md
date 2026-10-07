@@ -38,6 +38,7 @@ exits with `supervisor exited unexpectedly with no result`. Wait until
 ```
 lane run --repo rouge --lane default -- npm test
 lane run --repo rouge --lane lint    -- npm run lint
+lane run --exclusive --lane release  -- ./deploy.sh      # whole-host exclusive lane (BRAIN-403 v1)
 lane status [--json]
 lane capabilities --json
 lane suggest [--repo <name>] [--days 7] [--json]
@@ -68,6 +69,7 @@ features like pipes or globbing.
 | `--cpu <cores>` | Override the lane's CPU reservation; fractional cores are supported. |
 | `--memory <size>` | Override the lane's memory reservation, e.g. `768MiB` or `4GiB`. |
 | `--priority high\|medium\|low` | BRAIN-380 priority tier (default `medium`). Beats env `LANE_BROKER_PRIORITY`, which beats the lane's `priority` in `.lane-broker.json` (an `undeclaredLanes.as` template passes its tier on), which beats `medium`. Any invalid value from any of the three exits `64`. See "Priority (foundations)" below. |
+| `--exclusive` | BRAIN-403 v1: claim the whole host for this run. See "Exclusive lanes (BRAIN-403 v1)" below. The lane config key `lanes.<name>.exclusive: true` does the same. |
 | `--detach` | Print the run id and return immediately instead of waiting. |
 | `--timeout <duration>` | e.g. `30s`, `5m`, `500ms`. Exit `75` if not finished in time — see below. |
 | `--allow-local-sim` | Override a lane's `localRefused: true`. |
@@ -1395,6 +1397,56 @@ skipped (counted); a run killed by an unrequested signal is censored. History ro
 class, so a lane named like a sim (`sim`, `sims`, `sim-*`) is a sim, else a test. The host
 factor is 1.0 (no calibration) and is printed.
 
+### Exclusive lanes (BRAIN-403 v1)
+
+`lane run --exclusive`, or `"exclusive": true` on a lane in `.lane-broker.json`, runs the command with the
+whole host to itself. v1 is deliberately stateless and hookless: there is no hold file and nothing to wedge, and
+the only durable facts are the ticket's `exclusive` flag and the full-budget lease it is admitted with.
+
+Semantics:
+
+- **While it is the head of the queue, nothing else is admitted.** The queue's effective head (after priority
+  ordering and reservation promotion) being exclusive denies every other ticket with `exclusive-head` before any
+  selector runs, so no backfill of any kind (conflict skip, capacity skip, resource backfill, conflict-safe or
+  sim-safe backfill) gets past it. The running lanes finish and are never killed; the exclusive head reports
+  `exclusive-draining` until the last one leaves. A non-holder still gets its own queue-timeout and withdrawal
+  result: those checks run before the gate.
+- **It starts only as the effective head**, never as a skip or backfill candidate.
+- **It claims the whole admission budget.** Once admitted, its lease carries `exclusive: true`,
+  `weight` = the effective weight capacity and `resources` = the whole CPU budget and memory budget (the
+  declared claim is kept as `declaredResources`). Every ordinary candidate is then denied `exclusive-held` by an
+  explicit check, independent of the capacity arithmetic (a `1e-20` weight cannot slip in beside it), and
+  `couldAdmitNow` refuses too. It skips the load gate, the CPU projection, `externalBusy`, the idle-overshoot
+  rule and class caps. A critical memory reading still denies it: there is no acquire hook to clear one.
+- **Priority is `high` by default.** `--priority` > `LANE_BROKER_PRIORITY` > the lane's `priority` > `high` (instead of
+  `medium`). The per-repo high cap can still demote it. An exclusive earns **no age credit**, so aging never promotes
+  one past a higher-priority arrival.
+- **Local only.** An exclusive is never dispatched or rebound to a runner. A runner (`lane remote-exec`) ignores a
+  lane-config `exclusive` in an incoming snapshot, with a note on stderr, so a snapshot can never hold a runner.
+- **No nesting.** An `--exclusive` run under an inherited lease of any other lane exits `64` before enqueue (it
+  would wait on its own parent forever). A same-key nested run is reentrant as it is today.
+- **`exclusive` is a boolean on the lane** and is not inherited through an `undeclaredLanes.as` template.
+- `lane status` shows `HOLD (exclusive) <id> (<key>) waiting for N running lane(s)` while it drains, `[exclusive]` on
+  its QUEUE line and on its RUNNING entry once admitted; `--json` adds `exclusiveHold` and `exclusive: true`. The
+  history row carries `exclusive: true`. `exclusive/1` is in the capability list.
+
+Hooks are **not supported yet**. `exclusiveHooks` (or `acquire` / `release`) in the host config is refused at `lane run`
+submission (exit `64`: "not supported yet (BRAIN-403 follow-up)"), and the same keys in a repo config are refused
+through the ordinary config exit-`64` path. Acquire/release hooks and their crash-safe lifecycle are a follow-up.
+
+Documented limits, not bugs:
+
+- **Not a durable latch.** The head is recomputed each decision. A NEWER ticket cannot displace a queued high
+  exclusive (equal score, and the older sequence wins), but an OLDER queued medium that has aged to the ceiling, or a
+  BRAIN-346 reservation owner, can still go first.
+- **Starvation.** An explicitly `low` exclusive, or one demoted by the high cap, can starve behind sustained
+  higher-priority arrivals.
+- **Mixed versions.** During an upgrade, supervisors still running older code do not see the gate; it holds only for
+  tickets admitted by code at or after this release.
+- **A capacity raise mid-run** leaves room beside the full-budget lease for the capacity arithmetic, but the explicit
+  held-exclusive check still refuses everything else; raising the capacity is an operator action either way.
+- `drainMs` (time from becoming head to admission) is not recorded in v1.
+
 ## Exit codes
 
 | Code | Meaning |
@@ -1403,7 +1455,7 @@ factor is 1.0 (no calibration) and is printed.
 | the child's exit code | Passed straight through on completion. |
 | `1` | The command errored, was signalled, or the supervisor died unexpectedly. |
 | `2` | Bad CLI usage (missing command / argument). |
-| `64` | Nested `lane run` would widen the inherited lease — refused; or an invalid `--priority` / `LANE_BROKER_PRIORITY` / lane `priority`. |
+| `64` | Nested `lane run` would widen the inherited lease — refused; or an invalid `--priority` / `LANE_BROKER_PRIORITY` / lane `priority`; or an `--exclusive` lane nested under another lane; or `exclusiveHooks` in host or repo config (not supported yet). |
 | `69` | Local-sim lane refused (fleet-offload message); use `--allow-local-sim`. |
 | `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. Also `lane run` / `remote-exec` refused with "scheduler migration in progress" while `lane migrate-scheduler` runs, or "scheduler migration pending (draining)" while `--when-idle` waits. |
 | `124` | Killed by the no-progress watchdog (`reason: "no-progress"`, see below). |
@@ -1475,7 +1527,7 @@ two `ps` reads, keeping its old command as a prefix and appending this lease's e
 
 Prints one JSON line: `{"version", "capabilities": [...], "schedulerMode", "admissionMode"}`. `capabilities` is the
 same list `lane remote-probe` advertises (`elastic-claims/1`, `priority/1`, `artifacts/1`, `sim-safe-backfill/1`,
-`lane-aging/1`, `group-reap/1`). `schedulerMode` is `priority` when a valid `sched-v2.json` fence is present and
+`lane-aging/1`, `group-reap/1`, `remote-withdraw/1`, `exclusive/1`). `schedulerMode` is `priority` when a valid `sched-v2.json` fence is present and
 `legacy` otherwise; `admissionMode` is the global config's `schedulerMode` (`active` or `shadow`). A caller that needs
 a feature (for example a pool gate that requires `group-reap/1`) checks this before relying on it.
 

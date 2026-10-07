@@ -63,7 +63,8 @@ export function waitedMs(ticket, nowEff) {
 
 /** ROG-2181: age that counts toward rank and score. A ticket from an `aging: false` lane never accrues any. */
 function creditedWaitMs(ticket, nowEff) {
-  return ticket?.aging === false ? 0 : waitedMs(ticket, nowEff);
+  // BRAIN-403 A1: an exclusive never ages, so aging cannot promote it past a higher-priority arrival
+  return ticket?.aging === false || ticket?.exclusive === true ? 0 : waitedMs(ticket, nowEff);
 }
 
 /**
