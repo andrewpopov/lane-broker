@@ -969,7 +969,7 @@ function deadPid() {
 
 test('remote-result state: a live publisher that is not queued is running', async () => {
   const f = await stateFixture();
-  assert.deepEqual(await getResult(f.ticketId, f.root, f.env), { protocol: 1, missing: true, state: 'running' });
+  assert.deepEqual(await getResult(f.ticketId, f.root, f.env), { protocol: 1, missing: true, state: 'running', phase: 'preparing' });
 });
 
 test('remote-result state: a live publisher whose lane is queued is queued', async () => {

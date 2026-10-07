@@ -10,6 +10,8 @@ import {
   isCancelled,
   cancelMarkerPath,
   expireMarkerPath,
+  withdrawMarkerPath,
+  isWithdrawn,
   writeCancelMarkerFile,
   LockTimeoutError,
   MigrationInProgressError,
@@ -91,7 +93,7 @@ function cancelRequested(root, id) {
 
 function clearTicketMarkers(root, id) {
   discardRebinding(root, id);
-  for (const marker of [cancelMarkerPath(root, id), expireMarkerPath(root, id)]) {
+  for (const marker of [cancelMarkerPath(root, id), expireMarkerPath(root, id), withdrawMarkerPath(root, id)]) {
     try {
       fs.unlinkSync(marker);
     } catch {
@@ -953,7 +955,9 @@ async function main() {
    * 'unfinished'.
    */
   async function finalizeQueuedAndExit(outcome = 'cancelled', { forcePublish = false } = {}) {
-    const isTimeout = outcome === 'queue-timeout';
+    // BRAIN-436: 'withdrawn' (a submitter took the queued ticket back to move it) finalizes exactly like a queue timeout:
+    // a structured, unconditionally published exit-75 result that says the command never started.
+    const isTimeout = outcome === 'queue-timeout' || outcome === 'withdrawn';
     const buildResult = () =>
       isTimeout
         ? {
@@ -964,7 +968,7 @@ async function main() {
             endedAt: Date.now(),
             waitedMs: null,
             cancelled: false,
-            reason: 'queue-timeout',
+            reason: outcome,
           }
         : { ...remoteCancelledResult(enriched.id, null), executor: 'local', fallbackReason };
     const publish = (result) => {
@@ -1056,6 +1060,15 @@ async function main() {
       continue;
     }
     if (started.started) break;
+    // BRAIN-436: the withdraw marker is the commit, but the queue file may still be there (the runner's best-effort
+    // dequeue failed, or it crashed after the marker). Dequeue it here -- retrying the unlink -- BEFORE publishing, so the
+    // published result never contradicts a ticket that is still queued. A cancel that is already pending wins.
+    if (started.reason === 'withdrawn' || (started.reason === 'not-head' && started.position === null && isWithdrawn(root, ticket.id))) {
+      const cancelWon = cancelRequested(root, ticket.id);
+      while (!dequeueSync(root, ticket.id)) await sleep(100);
+      touchSimArmFor(root, ticket);
+      await finalizeQueuedAndExit(cancelWon ? 'cancelled' : 'withdrawn', { forcePublish: cancelWon });
+    }
     if (started.reason === 'not-head' && started.position === null) {
       // Our own ticket is no longer in the queue without ever having
       // started: it was cancelled out from under us (by `lane cancel`,

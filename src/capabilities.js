@@ -10,6 +10,8 @@ import { loadGlobalConfig } from './config.js';
 export const SIM_SAFE_BACKFILL_CAPABILITY = 'sim-safe-backfill/1';
 export const LANE_AGING_CAPABILITY = 'lane-aging/1';
 export const GROUP_REAP_CAPABILITY = 'group-reap/1';
+// BRAIN-436: `lane remote-withdraw`, the irreversible take-back of a ticket still queued on this runner.
+export const REMOTE_WITHDRAW_CAPABILITY = 'remote-withdraw/1';
 
 /** The ONE list: `lane remote-probe` advertises it and `lane capabilities --json` prints it. */
 export const CAPABILITIES = [
@@ -19,6 +21,7 @@ export const CAPABILITIES = [
   SIM_SAFE_BACKFILL_CAPABILITY,
   LANE_AGING_CAPABILITY,
   GROUP_REAP_CAPABILITY,
+  REMOTE_WITHDRAW_CAPABILITY,
 ];
 
 /** `lane capabilities --json`: what this install can do and which scheduler/admission mode it is in. */

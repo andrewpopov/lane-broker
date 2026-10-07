@@ -13,6 +13,7 @@ import {
   remoteProbeCommand,
   remoteResultCommand,
   remoteCancelCommand,
+  remoteWithdrawCommand,
   remoteArtifactsCommand,
   remoteArtifactsReleaseCommand,
   defaultRemoteRoot,
@@ -271,6 +272,16 @@ async function main() {
       }
       const root = parseRootFlag(rest.slice(1)) || defaultRemoteRoot();
       const result = await remoteCancelCommand(id, { root });
+      return result.exitCode;
+    }
+    case 'remote-withdraw': {
+      const id = rest[0];
+      if (!id) {
+        process.stderr.write('lane remote-withdraw: missing <ticketId>\n');
+        return 2;
+      }
+      const root = parseRootFlag(rest.slice(1)) || defaultRemoteRoot();
+      const result = await remoteWithdrawCommand(id, { root });
       return result.exitCode;
     }
     // BRAIN-320 S1b: hidden -- the pipeline `remote-exec` spawns as a

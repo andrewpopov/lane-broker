@@ -53,6 +53,8 @@ export function paths(root = stateHome()) {
     // reader can always tell a runner-side queue-timeout expiry apart from a
     // user cancel, even though both end a queued ticket without a lease.
     expire: path.join(root, 'expire'),
+    // BRAIN-436: a runner-side withdraw marker (see `writeWithdrawMarkerFile`).
+    withdraw: path.join(root, 'withdraw'),
     history: path.join(root, 'history.jsonl'),
     pause: path.join(root, 'PAUSE'),
     lock: path.join(root, 'lock'),
@@ -138,6 +140,24 @@ export function isExpired(root, id) {
 export function writeExpireMarkerFile(root, id) {
   fs.mkdirSync(paths(root).expire, { recursive: true });
   atomicWriteFile(expireMarkerPath(root, id), String(Date.now()));
+}
+
+/** Deterministic path of a ticket's withdraw marker (BRAIN-436): a queued remote ticket its submitter has taken back to
+ *  move it to another runner. A DISTINCT directory from cancel/expire so the three can never be confused. */
+export function withdrawMarkerPath(root, id) {
+  return path.join(paths(root).withdraw, id);
+}
+
+/** Does a withdraw marker exist for `id`? Existence-only, same contract as `isCancelled`. */
+export function isWithdrawn(root, id) {
+  return fs.existsSync(withdrawMarkerPath(root, id));
+}
+
+/** Write the withdraw marker for `id`, fsynced. It is the irreversible commit of a withdrawal: written under the
+ *  admission lock, never removed except with the ticket's other markers, and `tryStart` refuses a ticket that has it. */
+export function writeWithdrawMarkerFile(root, id) {
+  fs.mkdirSync(paths(root).withdraw, { recursive: true });
+  atomicWriteFile(withdrawMarkerPath(root, id), String(Date.now()), { fsync: true });
 }
 
 export function ensureStateDirs(root = stateHome()) {

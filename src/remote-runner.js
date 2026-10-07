@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, loadGlobalConfig } from './config.js';
 import { CAPABILITIES } from './capabilities.js';
@@ -19,7 +19,7 @@ import { cancelCommand } from './cancel.js';
 import { collectStatus } from './status.js';
 import { readLease, isSupervisorAlive } from './lease.js';
 import { readAttempt } from './attempts.js';
-import { listQueue } from './scheduler.js';
+import { listQueue, dequeueSync } from './scheduler.js';
 import { sanitizeObservedCpu, sanitizeRssPeak, sanitizeCpuSeconds } from './observed.js';
 
 // BRAIN-320 S1b (1b): the absolute path to `bin/lane.js`, so a protocol-2
@@ -590,7 +590,12 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   let observedRssPeakBytes;
   let cpuSeconds;
   // A user cancel that landed after the expiry still wins (kind cancelled below).
-  if (structured && structured.reason === 'queue-timeout' && !cancelled) {
+  if (structured && structured.reason === 'withdrawn' && !cancelled) {
+    // BRAIN-436: the submitter took this QUEUED ticket back to move it to another runner. Nothing ran (no deps, no
+    // setup, no command), so `unfinished` + `reason` is the positive proof of that the client binds to.
+    kind = 'unfinished';
+    reason = 'withdrawn';
+  } else if (structured && structured.reason === 'queue-timeout' && !cancelled) {
     // BRAIN-320 S1d: the LOCAL broker's own scheduler expired this ticket
     // before it was ever admitted -- never 'completed' (it never ran), so
     // this check comes BEFORE the general `structured` branch below. The
@@ -723,7 +728,75 @@ export function remoteTicketState(ticketDir, brokerRoot) {
   } catch {
     // pre-admission phases: no lane yet
   }
-  return laneId && listQueue(brokerRoot).some((t) => t && t.id === laneId) ? 'queued' : 'running';
+  if (!laneId) return 'preparing';
+  if (readLease(brokerRoot, laneId)) return 'admitted';
+  return listQueue(brokerRoot).some((t) => t && t.id === laneId) ? 'queued' : 'preparing';
+}
+
+/** The `state` a client built before BRAIN-436 understands: alive is `queued` or `running`, so the two phases it has no
+ *  word for (`preparing`, `admitted`) both read `running`, exactly as before. The precise label travels as `phase`, present only where it differs from `state`. */
+const legacyState = (phase) => (phase === 'preparing' || phase === 'admitted' ? 'running' : phase);
+
+/**
+ * BRAIN-436: the whole withdrawal decision, made UNDER the broker admission lock (the one `tryStart` admits under), so a
+ * ticket is withdrawn XOR admitted, never both. In order: an existing withdraw marker answers `withdrawn` (idempotent),
+ * then cancelled, then a lease (`started`), then not-in-the-queue (`not-queued`). The marker write is the commit -- it is
+ * fsynced, NEVER removed or rolled back, and `tryStart` refuses any ticket that has it. The dequeue after it is best-effort
+ * cleanup: if it fails, the runner supervisor's own finalize dequeues (retrying) before it publishes.
+ */
+export async function withdrawLane(brokerRoot, laneId, { dequeue = dequeueSync } = {}) {
+  return withLock(brokerRoot, async () => {
+    if (isWithdrawn(brokerRoot, laneId)) return 'withdrawn';
+    try {
+      assertNotMigrating(brokerRoot);
+    } catch (err) {
+      if (err instanceof MigrationInProgressError) return 'not-queued';
+      throw err;
+    }
+    if (isCancelled(brokerRoot, laneId)) return 'cancelled';
+    if (readLease(brokerRoot, laneId)) return 'started';
+    if (!listQueue(brokerRoot).some((t) => t && t.id === laneId)) return 'not-queued';
+    await testHoldAt('remote-withdraw-checked');
+    writeWithdrawMarkerFile(brokerRoot, laneId);
+    try {
+      dequeue(brokerRoot, laneId);
+    } catch {
+      // the marker already decided it; the supervisor's finalize removes the file
+    }
+    return 'withdrawn';
+  });
+}
+
+/**
+ * `lane remote-withdraw <ticketId>` (BRAIN-436): take a ticket that is still QUEUED on this runner back, irreversibly, so
+ * its submitter can run it elsewhere. Prints `{protocol, ticketId, action}` and exits 0 for every decided action; the
+ * action is `withdrawn` only once the withdraw marker is durable. Anything else means the ticket stays here.
+ */
+export async function remoteWithdrawCommand(ticketId, { root = defaultRemoteRoot(), brokerRoot, dequeue } = {}) {
+  if (!isUuid(ticketId)) {
+    process.stderr.write('lane remote-withdraw: missing or invalid ticketId\n');
+    return { exitCode: 2 };
+  }
+  const ticketDir = path.join(path.resolve(root), 'tickets', ticketId);
+  const reply = (action) => {
+    process.stdout.write(`${JSON.stringify({ protocol: 1, ticketId, action })}\n`);
+    return { exitCode: 0 };
+  };
+  if (!fs.existsSync(ticketDir)) return reply('no-such-ticket');
+  let laneId = null;
+  try {
+    laneId = fs.readFileSync(path.join(ticketDir, 'remote-id'), 'utf8').trim();
+  } catch {
+    // not enqueued yet
+  }
+  if (!isUuid(laneId)) return reply(readJsonSafe(path.join(ticketDir, 'result.json')) ? 'finished' : 'not-queued');
+  const action = await withdrawLane(brokerRoot ?? ensureStateDirs().root, laneId, { dequeue });
+  if (action !== 'not-queued') return reply(action);
+  // Not queued: either the ticket is done, or it has not been enqueued yet. A finished ticket's withdraw marker is gone
+  // with its other markers, so a retry still reads `withdrawn` off the published result.
+  const result = readJsonSafe(path.join(ticketDir, 'result.json'));
+  if (!result) return reply('not-queued');
+  return reply(result.reason === 'withdrawn' && result.kind === 'unfinished' ? 'withdrawn' : 'finished');
 }
 
 /** `lane remote-result <ticketId>`: print result.json, or {missing:true, state} where state is
@@ -738,10 +811,11 @@ export async function remoteResultCommand(ticketId, { root = defaultRemoteRoot()
   const resultPath = path.join(ticketDir, 'result.json');
   let record = readResult(resultPath);
   if (!record) {
-    const state = remoteTicketState(ticketDir, stateHome());
+    const phase = remoteTicketState(ticketDir, stateHome());
+    const state = legacyState(phase);
     // The publisher may have written result.json and exited between the read above and the
     // liveness check; re-read once before concluding it died with nothing to show (as run.js does).
-    record = (state === 'gone' && readResult(resultPath)) || { protocol: 1, missing: true, state };
+    record = (state === 'gone' && readResult(resultPath)) || { protocol: 1, missing: true, state, ...(phase !== state ? { phase } : {}) };
   }
   process.stdout.write(`${JSON.stringify(record)}\n`);
   return { exitCode: 0 };
