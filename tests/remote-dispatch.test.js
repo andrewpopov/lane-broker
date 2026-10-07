@@ -650,3 +650,24 @@ test('remote run: result-wait expiry with an unconfirmed cancel fails the ticket
   assert.equal(row.executor, 'remote');
   assert.equal(row.runner, 'skybox');
 });
+
+// ---- BRAIN-437: a dispatch the runner may have accepted is never re-run locally without proof it never started ----
+
+test('BRAIN-437: ssh dropped after the runner took the job, fetches all failing, withdraw not confirmed: not re-run locally', { timeout: 120_000 }, async () => {
+  const { env, state, repoDir } = setup({ ssh: 'drop-stuck' });
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], env, repoDir, '90s');
+  assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
+  assert.equal(fs.existsSync(marker), false, 'the job must not have been run locally');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+  assert.match(result.error, /may still be running and was not re-run/);
+});
+
+test('BRAIN-437: the same drop with a runner that confirms `withdrawn` falls back to local, once', { timeout: 120_000 }, async () => {
+  const { env, repoDir } = setup({ ssh: 'drop-withdrawn' });
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 7)], env, repoDir, '90s');
+  assert.equal(waited.code, 7, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
+});

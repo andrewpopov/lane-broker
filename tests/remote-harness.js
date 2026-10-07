@@ -177,6 +177,19 @@ if (destination === 'die-midstream') {
     process.stdout.write(\`\${JSON.stringify({ protocol: 1, cancelConfirmed: false })}\\n\`);
     exitNow(0);
   }
+} else if ((destination === 'drop-withdrawn' || destination === 'drop-stuck') && /remote-(exec|result|withdraw)/.test(commandString)) {
+  // BRAIN-437: a runner that took the snapshot and then lost the connection, and whose result fetches all fail. Its
+  // remote-withdraw answers 'withdrawn' (drop-withdrawn: it never started) or 'not-queued' (drop-stuck: it may have).
+  if (commandString.includes('remote-exec')) {
+    process.stdin.resume();
+    process.stdin.on('end', () => exitNow(255));
+  } else if (commandString.includes('remote-result')) {
+    exitNow(1);
+  } else {
+    const ticketId = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/.exec(commandString)[0];
+    process.stdout.write(\`\${JSON.stringify({ protocol: 1, ticketId, action: destination === 'drop-withdrawn' ? 'withdrawn' : 'not-queued' })}\\n\`);
+    exitNow(0);
+  }
 } else if (destination === 'result-tamper' && commandString.includes('remote-result')) {
   const child = spawn('sh', ['-c', commandString], { stdio: ['ignore', 'pipe', 'inherit'] });
   let out = '';

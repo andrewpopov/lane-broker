@@ -30,6 +30,7 @@ import { detectResourceCapacity, checkResourceBudget, localSimRefusal, leaseCpuC
 import { selectRunner, dispatchRemote, needsProtocol2 } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
+import { REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
 import { createAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX } from './admission.js';
 import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, noProgressMessage } from './no-progress.js';
@@ -756,6 +757,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     priorityRequested: enriched.priorityRequested,
     priorityAccruedMs: waitedMs(enriched, effectiveNow(root)),
     resultWaitMs: globalCfg.remoteResultWaitMs,
+    // BRAIN-437: a runner that can withdraw lets a dropped connection prove the job never started; one that cannot leaves it possibly running
+    canWithdraw: Array.isArray(probe?.capabilities) && probe.capabilities.includes(REMOTE_WITHDRAW_CAPABILITY),
     onStdout,
     onStderr,
     abortSignal,
