@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { gitFixture, laneRun, laneSpawn, waitFor, sleep, writeRepoConfig } from './helpers.js';
 import { tmpDir, setup, markerCmd, detachAndWait, resultOf, probeCount } from './remote-harness.js';
-import { paths, readJsonSafe } from '../src/state.js';
+import { paths, readJsonSafe, isCancelled } from '../src/state.js';
 import { readAttempt } from '../src/attempts.js';
 
 /**
@@ -177,6 +177,31 @@ setInterval(() => {}, 1000);
   child.kill('SIGINT');
   const exitCode = await new Promise((resolve) => child.on('close', resolve));
   assert.equal(exitCode, 130, `stderr: ${stderr}`);
+});
+
+// BRAIN-364: same race as the plain local path (tests/cancel-exit-zero.test.js): a cancel that lands after the fallback
+// child ended was never acted on, so the child's own outcome stands. Previously publishTerminal's cancel-wins rule gave 130.
+test('BRAIN-364: a cancel landing after a fallback child exited 0 leaves the result exit 0 with executor local', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'down' });
+  const dir = tmpDir('b364');
+  const ready = path.join(dir, 'ready');
+  const go = path.join(dir, 'go');
+  const holdEnv = { ...env, LANE_BROKER_TEST_HOLD_AT: 'local-finalize', LANE_BROKER_TEST_HOLD_READY: ready, LANE_BROKER_TEST_HOLD_GO: go };
+  const marker = path.join(dir, 'where');
+  const started = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], { env: holdEnv, cwd: repoDir });
+  assert.equal(started.code, 0, started.stderr);
+  const id = started.stdout.trim();
+  await waitFor(() => fs.existsSync(ready), { timeoutMs: 30_000 });
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
+  const cancel = laneRun(['cancel', id], { env, cwd: repoDir });
+  await waitFor(() => isCancelled(state, id), { timeoutMs: 15_000 });
+  fs.writeFileSync(go, 'x');
+  await cancel;
+  const result = resultOf(state, id);
+  assert.equal(result.exit, 0);
+  assert.equal(result.executor, 'local');
+  assert.equal(result.cancelled, undefined);
+  assert.equal(isCancelled(state, id), false, 'marker cleaned up');
 });
 
 // ---- Codex pre-merge BLOCKER #2: drain-then-publish, real async drain ----

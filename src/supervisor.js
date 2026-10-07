@@ -1387,6 +1387,8 @@ async function main() {
     // reading would just wait out its own bounded timeout for nothing.
     if (stdoutForward) await stdoutForward.drain();
     if (stderrForward) await stderrForward.drain();
+    // Test seam: lets a test land a `lane cancel` after the child ended, before the result is written (BRAIN-364).
+    await testHoldAt('local-finalize');
 
     // BRAIN-319 P2 (Codex re-review): `writeResult` only WRITES -- no
     // `process.exit` in here. The old `writeAndExit` called `process.exit`
@@ -1424,21 +1426,22 @@ async function main() {
 
     // BRAIN-319 T3b-2: this ticket started life as a remote attempt that fell
     // back to local (`attemptGeneration` non-null) -- go through the SAME
-    // one terminal writer every remote-side path uses, so a cancel racing
-    // this exact finish is decided the same way (C5), and the attempt
+    // one terminal writer every remote-side path uses, so the attempt
     // record is removed once this local run's outcome is actually published.
+    // BRAIN-364: the outcome follows `cancelling` (folded into `result`/
+    // `exitCode` above), exactly as on the plain local path -- NOT
+    // `publishTerminal`'s own `cancelled` flag, which is true for a cancel
+    // that landed after the child had already ended and was never acted on.
     if (attemptGeneration !== null) {
-      let finalExitCode = exitCode;
-      const published = await publishTerminal(root, ticket.id, attemptGeneration, ({ cancelled }) => {
-        if (cancelled) {
-          finalExitCode = 130;
+      const published = await publishTerminal(root, ticket.id, attemptGeneration, () => {
+        if (cancelling) {
           writeResult({ ...remoteCancelledResult(enriched.id, startedAt), executor: 'local' });
         } else {
           writeResult({ ...result, executor: 'local', fallbackReason });
         }
       });
       if (published.ok) {
-        process.exit(finalExitCode);
+        process.exit(exitCode);
         return;
       }
       // Generation mismatch: unreachable today (this supervisor is the sole

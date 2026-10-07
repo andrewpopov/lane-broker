@@ -452,6 +452,11 @@ running locally`. Re-running costs CPU; reporting an unverified green would
 cost the gate. A cancelled run is the one exception: it is never re-run,
 and always reports `130`, whatever the command exited with.
 
+The same rule decides a local run, including one that fell back from a runner:
+a cancel the supervisor acted on (it saw the marker or a signal while the child
+ran) reports `130`; a `lane cancel` that lands after the child has ended does
+not change its result.
+
 A remote run takes no local capacity or resource reservation. `lane status`
 lists it under REMOTE; if its supervisor dies it shows as ORPHANED-REMOTE
 (it survives a reboot), `lane wait` exits `1` naming it, and `lane cancel`
@@ -1519,6 +1524,10 @@ symlinks.
   window between an expiry being recorded and the expiry being finalized
   (BRAIN-320 review fix B: a cancel that lands in that window must still win
   over the expiry).
+- `LANE_BROKER_TEST_HOLD_AT=local-finalize` (with `LANE_BROKER_TEST_HOLD_READY` and
+  `LANE_BROKER_TEST_HOLD_GO`) — a local supervisor pauses after its child has ended and its
+  output is drained, before writing the result, so a test can land a `lane cancel` in that
+  window (BRAIN-364: it must not change the child's own outcome).
 
 ## `lane-store` (BRAIN-407, unified queue P0b)
 
