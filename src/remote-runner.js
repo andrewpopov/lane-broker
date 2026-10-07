@@ -295,7 +295,7 @@ function cleanupWork(workDir, tmpDir) {
 async function collectGarbage(root) {
   try {
     const cfg = loadGlobalConfig();
-    await gcRemoteTickets({ remoteRoot: root, retentionMs: cfg.remoteTicketRetentionMs, maxTickets: cfg.remoteGcMaxTicketsPerRun, remove: removeDetached });
+    await gcRemoteTickets({ remoteRoot: root, retentionMs: cfg.remoteTicketRetentionMs, maxTickets: cfg.remoteGcMaxTicketsPerRun, maxExamined: cfg.remoteGcMaxExaminedPerRun, remove: removeDetached });
   } catch {
     // best-effort
   }

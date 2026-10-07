@@ -535,13 +535,16 @@ export function appendRotatingLog(file, line, { maxBytes = ADMISSION_LOG_MAX_BYT
  * line fires once per poll while a candidate waits. Never throws, since a
  * logging failure must never affect scheduling.
  */
-export function writeBrokerLog(root, line) {
+export function writeBrokerLog(root, line, now = Date.now()) {
   try {
-    appendRotatingLog(paths(root).admissionLog, line);
+    appendRotatingLog(paths(root).admissionLog, line, { now });
   } catch {
     // best-effort — disk-full or similar must never affect scheduling, same tolerance as appendHistory in state.js
   }
 }
+
+/** An unchanged decision is written again after this long, so the tail of the log always holds a current line for every waiting candidate (readers only look at the tail). */
+export const ADMISSION_LOG_REFRESH_MS = 5 * 60 * 1000;
 
 // More candidates than this can never be waiting at once on a real host; the oldest entry is forgotten past it.
 const LAST_DECISION_MAX_ENTRIES = 256;
@@ -559,15 +562,16 @@ function decisionSignature(f) {
  * back to make a decision -- so the caller (scheduler.js) calls this AFTER releasing the global lock, on both the
  * admit and deny paths, never from inside it. A lost read-modify-write race costs one repeated line, nothing more.
  */
-export function logAdmissionDecision(root, fields) {
+export function logAdmissionDecision(root, fields, now = Date.now()) {
   const file = paths(root).admissionLast;
   const signature = decisionSignature(fields);
   const last = readJsonSafe(file) ?? {};
-  if (last[fields.candidateId] === signature) return;
-  writeBrokerLog(root, `${formatAdmissionLog(fields)}\n`);
+  const previous = last[fields.candidateId];
+  if (previous?.signature === signature && now - previous.at < ADMISSION_LOG_REFRESH_MS) return;
+  writeBrokerLog(root, `${formatAdmissionLog(fields)}\n`, now);
   try {
     delete last[fields.candidateId];
-    if (!fields.admit) last[fields.candidateId] = signature;
+    if (!fields.admit) last[fields.candidateId] = { signature, at: now };
     const ids = Object.keys(last);
     for (const id of ids.slice(0, Math.max(0, ids.length - LAST_DECISION_MAX_ENTRIES))) delete last[id];
     atomicWriteJson(file, last);

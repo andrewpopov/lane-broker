@@ -1497,21 +1497,25 @@ What a run leaves behind is collected; what a live one owns never is. Everything
   than the retention. Either way only if all of these hold, checked under the broker lock: its `publisher.json` pid is
   dead, its broker ticket (`remote-id`) has no lease and no queue entry, no cancel/withdraw/expiry marker is pending for
   it, and its id has no tombstone. A directory is first renamed into `<remoteRoot>/gc-trash` inside the lock and deleted
-  afterwards (detached from `remote-exec`, so the submitter's ssh session never waits on it). At most
-  `remoteGcMaxTicketsPerRun` directories are acted on per `remote-exec`; scanning 500 tickets takes ~20 ms.
-- **Tombstones outlive any late `remote-exec`.** A tombstone (BRAIN-436) is the only thing refusing an exec for an id that was
-  cancelled before it arrived. GC never touches a tombstoned id's ticket directory, and deletes a tombstone only when its
-  own file is older than `remoteTicketRetentionMs`. A late exec is an ssh session still streaming a snapshot for a
-  submitter that has since given up, which lasts minutes; the retention is validated to be at least one day.
+  afterwards (detached from `remote-exec`, so the submitter's ssh session never waits on it). `tickets/` and `gc-trash/` must
+  be real directories inside the runner root (a symlink is refused, and only real directories inside `gc-trash` are ever
+  deleted). At most `remoteGcMaxTicketsPerRun` directories are acted on and `remoteGcMaxExaminedPerRun` (default 50) even
+  looked at per `remote-exec`, resuming from a persisted cursor (`gc-cursor`) so all are eventually visited.
+- **Tombstones are never pruned.** A tombstone (BRAIN-436) is the only thing refusing an exec for an id that was cancelled
+  before it arrived, and nothing bounds how late that exec can be (a suspended process or long-lived ssh session is not
+  covered by `ConnectTimeout`). Expiring one would let it recreate and run a cancelled ticket. They are tiny files. GC also
+  never touches a tombstoned id's ticket directory.
 - **Logs and results** (`logRetentionMs`, default 14 days; `logGcMaxFilesPerRun`, default 5000). `logs/*` and `results/*`
-  older than the retention are removed, except files of an id that has a lease, a queue entry or an attempt record. Runs
+  older than the retention are removed, except files of an id that has a lease, a queue entry or an attempt record, and the `logPath`/`resultPath` named by a live
+  lease or queued ticket (`lane run --log <path>`). Runs
   from `lane gc` and, at most once a day (marker `gc-last-run`), at a supervisor's start, never on the admission path. A
   sweep that stops at its bound leaves the marker unclaimed so the next supervisor continues.
 - **`admission-decisions.log`.** Each line starts with an ISO-8601 UTC timestamp. A `lane-broker-admission` line is written
   only when a candidate's (current decision:reason, new decision:reason) differs from the last one written for it (kept in
   `admission-last.json`; an admitted candidate is forgotten). The log rotates to `admission-decisions.log.1` at 10 MiB,
   replacing the previous `.1`. Readers that match a line by content (`candidate=...`) are unaffected by the prefix; one
-  that needs "the latest decision per queued candidate" now sees it for as long as it stays in the log, not once per poll.
+  an unchanged decision is written again every 5 minutes (`ADMISSION_LOG_REFRESH_MS`), so the tail of the log always holds a
+  current line for every waiting candidate.
 
 ## Testing hooks
 

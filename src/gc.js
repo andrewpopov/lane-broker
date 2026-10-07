@@ -10,7 +10,7 @@ import { isSupervisorAlive } from './lease.js';
  * still be using:
  *
  *  - `gcRemoteTickets`: on a runner, the `work/` and tmp dirs of finished tickets (a ticket whose `remote-exec` was killed
- *    never reached `cleanupWork`), whole ticket directories past retention, and expired tombstones. Run at the start of
+ *    never reached `cleanupWork`), and whole ticket directories past retention. Run at the start of
  *    every `remote-exec` and from `lane gc`.
  *  - `gcLogsAndResults`: `logs/` and `results/` files past `logRetentionMs`. Run from `lane gc` and, at most once a day,
  *    from a supervisor's start (`maybeDailyGc`).
@@ -19,14 +19,13 @@ import { isSupervisorAlive } from './lease.js';
  * removes anything while holding it: a doomed directory is first RENAMED into `<remoteRoot>/gc-trash` (one atomic, fast
  * step inside the lock) and deleted afterwards, so a multi-GB `rm` never blocks admission.
  *
- * TOMBSTONES (BRAIN-436) must outlive any possible late `remote-exec` for that id. A tombstone is written only when the
- * ticket directory does NOT exist, and `remote-exec` refuses an id that has one. So there are two ways GC could re-open an
- * id to a late exec: delete the tombstone, or delete a ticket directory whose id is tombstoned. It does neither before
- * `remoteTicketRetentionMs`: a tombstoned id's ticket directory is never touched while the tombstone exists, and the
- * tombstone is removed only once its own file is older than the retention. A late exec is a submitter's ssh session
- * still streaming a snapshot; the cancel that wrote the tombstone came from that same submitter giving up, and
- * `ConnectTimeout` plus the submitter process's own lifetime bound that session to minutes. Config validation floors the
- * retention at one day so no setting can shrink the margin to anything near that.
+ * TOMBSTONES (BRAIN-436) are NEVER pruned in this version. A tombstone is the only thing refusing a `remote-exec` for an id
+ * that was cancelled before it arrived, and nothing bounds how late such an exec can be (a suspended process, a long-lived
+ * ssh session: `ConnectTimeout` covers neither). Expiring one by age would let that exec recreate and run a cancelled
+ * ticket. They are tiny files, so the leak is cheap; a ticket directory whose id is tombstoned is never touched either.
+ *
+ * Nothing outside the runner root is ever deleted: `gc-trash` and `tickets` must be real directories (a symlink is
+ * refused), and only real directories inside a verified `gc-trash` are removed.
  */
 
 /** Per-ticket TMPDIR base of a runner (BRAIN-374/376): /var/tmp is disk-backed, unlike a possibly RAM-backed /tmp. */
@@ -38,6 +37,27 @@ const lockOptions = { timeoutMs: 2000 };
 
 function trashDirOf(remoteRoot) {
   return path.join(remoteRoot, 'gc-trash');
+}
+
+class UnsafeGcPathError extends Error {}
+
+/** Throws unless `dir` is absent or a real directory (not a symlink) whose realpath is under the realpath of `root`. */
+function assertRealDirUnder(root, dir) {
+  const stat = fs.lstatSync(dir, { throwIfNoEntry: false });
+  if (!stat) return;
+  if (!stat.isDirectory()) throw new UnsafeGcPathError(`${dir} is a symlink or not a directory; refusing to collect under it`);
+  const rootReal = fs.realpathSync(root);
+  const real = fs.realpathSync(dir);
+  if (!real.startsWith(rootReal + path.sep)) throw new UnsafeGcPathError(`${dir} resolves outside ${root}; refusing to collect under it`);
+}
+
+/** The real directories inside a verified trash dir: what is left to delete from earlier runs. Symlinks and files are never listed. */
+function trashLeftovers(trashDir) {
+  try {
+    return fs.readdirSync(trashDir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => path.join(trashDir, e.name));
+  } catch {
+    return [];
+  }
 }
 
 /** Delete synchronously; for `lane gc`, where the operator is waiting for the result anyway. */
@@ -63,11 +83,15 @@ function ids(records) {
   return new Set(records.map((r) => r.id));
 }
 
-/** Every id that has a lease, a queue entry, or (for the logs sweep) an attempt record. Throws if any record is unreadable. */
+/**
+ * Every id that has a lease, a queue entry, or (for the logs sweep) an attempt record, plus the resolved log and result
+ * paths those live tickets name (`lane run --log <path>` can put a log under any name). Throws if any record is unreadable.
+ */
 function liveIds(root, { withAttempts = false } = {}) {
   const p = paths(root);
-  const live = ids(listJsonRecordsStrict(p.leases));
-  for (const id of ids(listJsonRecordsStrict(p.queue))) live.add(id);
+  const records = [...listJsonRecordsStrict(p.leases), ...listJsonRecordsStrict(p.queue)];
+  const live = ids(records);
+  live.paths = new Set(records.flatMap((r) => [r.logPath, r.resultPath]).filter((f) => typeof f === 'string').map((f) => path.resolve(f)));
   if (withAttempts) for (const id of ids(listJsonRecordsStrict(p.attempts))) live.add(id);
   return live;
 }
@@ -111,7 +135,8 @@ function exists(file) {
 }
 
 /**
- * Sweep a runner's `<remoteRoot>/tickets` and `<remoteRoot>/tombstones`. At most `maxTickets` ticket directories are
+ * Sweep a runner's `<remoteRoot>/tickets`. At most `maxExamined` directories are looked at and `maxTickets` acted on per call,
+ * resuming after the previous call's last-examined directory (`gc-cursor`) so all are eventually visited;
  * acted on per call (`bounded` reports that more may remain). Never throws except where the lock cannot be taken or a
  * broker record is unreadable; callers on a hot path catch that and carry on.
  *
@@ -119,29 +144,38 @@ function exists(file) {
  *   - older than `retentionMs`: the whole directory goes;
  *   - else, a terminal `result.json`: its `work/` and tmp dir go (the result and artifacts stay for the submitter).
  */
-export async function gcRemoteTickets({ remoteRoot, brokerRoot = stateHome(), retentionMs, maxTickets = Infinity, now = Date.now(), dryRun = false, remove = removeNow }) {
-  const summary = { tickets: 0, work: 0, tombstones: 0, skippedLive: 0, bounded: false };
+export async function gcRemoteTickets({ remoteRoot, brokerRoot = stateHome(), retentionMs, maxTickets = Infinity, maxExamined = Infinity, now = Date.now(), dryRun = false, remove = removeNow }) {
+  const summary = { tickets: 0, work: 0, examined: 0, skippedLive: 0, bounded: false };
   const ticketsDir = path.join(remoteRoot, 'tickets');
-  const tombstonesDir = path.join(remoteRoot, 'tombstones');
+  const cursorFile = path.join(remoteRoot, 'gc-cursor');
   const trashDir = trashDirOf(remoteRoot);
   const doomedTmpDirs = [];
+  assertRealDirUnder(remoteRoot, ticketsDir);
+  assertRealDirUnder(remoteRoot, trashDir);
+  let lastExamined = null;
 
   await withLock(
     brokerRoot,
     () => {
       let names = [];
       try {
-        names = fs.readdirSync(ticketsDir).filter(isUuid);
+        names = fs.readdirSync(ticketsDir).filter(isUuid).sort();
       } catch {
         // no tickets yet
       }
+      // Resume after the last directory the previous run examined, so every directory is eventually visited.
+      const cursor = readTrimmed(cursorFile);
+      const resumeAt = names.findIndex((n) => n > (cursor ?? ''));
+      if (resumeAt > 0) names = [...names.slice(resumeAt), ...names.slice(0, resumeAt)];
       const live = names.length > 0 ? liveIds(brokerRoot) : new Set();
       let acted = 0;
       for (const name of names) {
-        if (acted >= maxTickets) {
+        if (acted >= maxTickets || summary.examined >= maxExamined) {
           summary.bounded = true;
           break;
         }
+        summary.examined += 1;
+        lastExamined = name;
         const ticketDir = path.join(ticketsDir, name);
         const stat = fs.lstatSync(ticketDir, { throwIfNoEntry: false });
         if (!stat?.isDirectory()) continue;
@@ -164,32 +198,19 @@ export async function gcRemoteTickets({ remoteRoot, brokerRoot = stateHome(), re
         if (exists(doomed)) fs.renameSync(doomed, path.join(trashDir, `${name}-${crypto.randomBytes(4).toString('hex')}`));
         if (!expired) fs.rmSync(path.join(ticketDir, TMP_DIR_FILE), { force: true });
       }
-
-      let tombstones = [];
-      try {
-        tombstones = fs.readdirSync(tombstonesDir);
-      } catch {
-        // none written
-      }
-      for (const name of tombstones) {
-        const file = path.join(tombstonesDir, name);
-        const stat = fs.statSync(file, { throwIfNoEntry: false });
-        if (!stat || now - stat.mtimeMs < retentionMs) continue;
-        summary.tombstones += 1;
-        if (!dryRun) fs.rmSync(file, { force: true });
-      }
     },
     lockOptions,
   );
 
   if (!dryRun) {
-    let trashed = [];
+    // Only real directories inside the verified trash dir (this sweep's renames plus earlier leftovers) are deleted.
+    remove([...trashLeftovers(trashDir), ...doomedTmpDirs]);
     try {
-      trashed = fs.readdirSync(trashDir).map((n) => path.join(trashDir, n));
+      if (summary.bounded && lastExamined) atomicWriteFile(cursorFile, lastExamined);
+      else fs.rmSync(cursorFile, { force: true });
     } catch {
-      // nothing renamed yet
+      // the cursor is an optimisation: without it the next run starts from the top
     }
-    remove([...trashed, ...doomedTmpDirs]);
   }
   return summary;
 }
@@ -220,7 +241,7 @@ export async function gcLogsAndResults(root, { retentionMs, maxFiles = Infinity,
       const file = path.join(dir, entry.name);
       const stat = fs.statSync(file, { throwIfNoEntry: false });
       if (!stat || now - stat.mtimeMs < retentionMs) continue;
-      if (live.has(path.parse(entry.name).name)) {
+      if (live.has(path.parse(entry.name).name) || live.paths.has(path.resolve(file))) {
         summary.skippedLive += 1;
         continue;
       }

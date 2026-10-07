@@ -10,7 +10,7 @@ import { gcRemoteTickets, gcLogsAndResults, maybeDailyGc, REMOTE_TMP_BASE } from
 import { enqueue } from '../src/scheduler.js';
 import { writeLease } from '../src/lease.js';
 import { paths, atomicWriteFile, processStartTime, tombstonePath, writeCancelMarkerFile, writeWithdrawMarkerFile, writeExpireMarkerFile } from '../src/state.js';
-import { appendRotatingLog, logAdmissionDecision, ADMISSION_LOG_MAX_BYTES } from '../src/admission.js';
+import { appendRotatingLog, logAdmissionDecision, ADMISSION_LOG_MAX_BYTES, ADMISSION_LOG_REFRESH_MS } from '../src/admission.js';
 import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig } from '../src/config.js';
 import { serializeHeader } from '../src/remote-stream.js';
 
@@ -182,28 +182,46 @@ function execHeaderOnly(env, remoteRoot, ticketId) {
   return new Promise((resolve) => child.on('close', (code) => resolve({ code, stderr })));
 }
 
-test('a tombstoned id still refuses a late remote-exec after a GC inside the retention', async () => {
+test('a tombstone older than every retention value survives GC, and a late exec is still refused', async () => {
   const f = setup();
   writeGlobalConfig(f.home, {});
   const id = crypto.randomUUID();
   atomicWriteFile(tombstonePath(f.remoteRoot, id), String(NOW));
-  setAge(tombstonePath(f.remoteRoot, id), RETENTION - DAY);
-  const summary = await gc(f.remoteRoot, f.state);
-  assert.equal(summary.tombstones, 0, 'a tombstone inside the retention is kept');
+  setAge(tombstonePath(f.remoteRoot, id), 10 * RETENTION);
+  await gc(f.remoteRoot, f.state);
+  await gc(f.remoteRoot, f.state, { retentionMs: DAY });
+  assert.ok(fs.existsSync(tombstonePath(f.remoteRoot, id)), 'never pruned');
   const { code, stderr } = await execHeaderOnly(f.env, f.remoteRoot, id);
   assert.equal(code, 1, stderr);
   assert.match(stderr, /was cancelled before it arrived/);
-  assert.equal(fs.existsSync(path.join(f.remoteRoot, 'tickets', id)), false, 'the ticket was never created');
 });
 
-test('a tombstone older than the retention is removed', async () => {
+// ---- GC never deletes outside its root ----
+
+test('a gc-trash that is a symlink to an outside directory is refused and the outside files survive', async () => {
   const { state, remoteRoot } = setup();
-  const id = crypto.randomUUID();
-  atomicWriteFile(tombstonePath(remoteRoot, id), String(NOW));
-  setAge(tombstonePath(remoteRoot, id), RETENTION + DAY);
-  const summary = await gc(remoteRoot, state);
-  assert.equal(summary.tombstones, 1);
-  assert.equal(fs.existsSync(tombstonePath(remoteRoot, id)), false);
+  const outside = makeTmpDir('gc-outside-');
+  fs.mkdirSync(path.join(outside, 'victim'));
+  fs.writeFileSync(path.join(outside, 'victim', 'sentinel'), 'keep');
+  fs.symlinkSync(outside, path.join(remoteRoot, 'gc-trash'));
+  makeTicket(remoteRoot);
+  await assert.rejects(() => gc(remoteRoot, state), /refusing to collect/);
+  await assert.rejects(() => gc(remoteRoot, state, { maxTickets: 1 }), /refusing to collect/);
+  assert.equal(fs.readFileSync(path.join(outside, 'victim', 'sentinel'), 'utf8'), 'keep');
+});
+
+test('a symlinked tickets directory is refused, and symlinks inside gc-trash are never followed', async () => {
+  const a = setup();
+  const outside = makeTmpDir('gc-outside-');
+  fs.writeFileSync(path.join(outside, 'sentinel'), 'keep');
+  fs.symlinkSync(outside, path.join(a.remoteRoot, 'tickets'));
+  await assert.rejects(() => gc(a.remoteRoot, a.state), /refusing to collect/);
+  const b = setup();
+  fs.mkdirSync(path.join(b.remoteRoot, 'gc-trash'));
+  fs.symlinkSync(outside, path.join(b.remoteRoot, 'gc-trash', 'link'));
+  makeTicket(b.remoteRoot);
+  await gc(b.remoteRoot, b.state);
+  assert.equal(fs.readFileSync(path.join(outside, 'sentinel'), 'utf8'), 'keep');
 });
 
 // ---- the per-run bound ----
@@ -221,14 +239,16 @@ test('at most maxTickets ticket directories are acted on per run, and repeated r
   assert.equal(all.filter((t) => fs.existsSync(t.workDir)).length, 0);
 });
 
-test('the scan of many tickets is quick (bounded work per run)', async () => {
+test('at most maxExamined directories are examined per run, and repeated runs cover all of them', async () => {
   const { state, remoteRoot } = setup();
-  for (let i = 0; i < 500; i += 1) makeTicket(remoteRoot, { work: false, ageMs: 0 });
-  const started = process.hrtime.bigint();
-  const summary = await gc(remoteRoot, state, { maxTickets: 10 });
-  const ms = Number(process.hrtime.bigint() - started) / 1e6;
-  assert.equal(summary.bounded, false, 'nothing to collect in these tickets');
-  assert.ok(ms < 2000, `scanning 500 tickets took ${ms.toFixed(0)}ms`);
+  const all = Array.from({ length: 500 }, () => makeTicket(remoteRoot));
+  let runs = 0;
+  for (; runs < 20 && all.some((t) => fs.existsSync(t.workDir)); runs += 1) {
+    const summary = await gc(remoteRoot, state, { maxExamined: 50 });
+    assert.ok(summary.examined <= 50, `examined ${summary.examined}`);
+  }
+  assert.equal(all.filter((t) => fs.existsSync(t.workDir)).length, 0);
+  assert.ok(runs >= 10, 'it took at least ten bounded runs');
 });
 
 // ---- logs and results ----
@@ -260,6 +280,25 @@ test('logs and results older than the retention are pruned; a live lease or queu
     assert.ok(fs.existsSync(path.join(p.logs, `${id}.log`)), `${id} log kept`);
     assert.ok(fs.existsSync(path.join(p.results, `${id}.json`)), `${id} result kept`);
   }
+});
+
+test('a live lease or queued ticket keeps the custom log path it names, whatever its filename', async () => {
+  const { state } = setup();
+  const p = paths(state);
+  fs.mkdirSync(p.logs, { recursive: true });
+  const shared = path.join(p.logs, 'shared.log');
+  const queuedLog = path.join(p.logs, 'queued-custom.log');
+  const orphan = path.join(p.logs, 'orphan.log');
+  for (const f of [shared, queuedLog, orphan]) {
+    fs.writeFileSync(f, 'x');
+    setAge(f, 30 * DAY);
+  }
+  writeLease(state, { ...ticketOf(crypto.randomUUID()), logPath: shared });
+  await enqueue(state, { ...ticketOf(crypto.randomUUID()), logPath: queuedLog });
+  const summary = await gcLogsAndResults(state, { retentionMs: DEFAULT_GLOBAL_CONFIG.logRetentionMs, now: NOW });
+  assert.equal(summary.logs, 1);
+  assert.ok(fs.existsSync(shared) && fs.existsSync(queuedLog));
+  assert.equal(fs.existsSync(orphan), false);
 });
 
 test('the daily sweep runs once, is not due again within a day, and is due after one', async () => {
@@ -319,6 +358,17 @@ test('the admission log writes a candidate only when its decision changes, and p
   for (const l of raw) assert.match(l, /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z lane-broker-admission candidate=/);
 });
 
+test('an unchanged decision is suppressed within five minutes and written again after', () => {
+  const { state } = setup();
+  logAdmissionDecision(state, decision('a'), NOW);
+  logAdmissionDecision(state, decision('a'), NOW + ADMISSION_LOG_REFRESH_MS - 1000);
+  assert.equal(logLines(state).length, 1);
+  logAdmissionDecision(state, decision('a'), NOW + ADMISSION_LOG_REFRESH_MS + 1000);
+  assert.equal(logLines(state).length, 2);
+  logAdmissionDecision(state, decision('a'), NOW + ADMISSION_LOG_REFRESH_MS + 2000);
+  assert.equal(logLines(state).length, 2, 'the refresh restarts the window');
+});
+
 test('an admitted candidate is forgotten, so a later denial of the same id is written again', () => {
   const { state } = setup();
   logAdmissionDecision(state, decision('a'));
@@ -346,7 +396,7 @@ test('the retention and bound keys are validated', () => {
   const saved = process.env.LANE_BROKER_HOME;
   process.env.LANE_BROKER_HOME = f.home;
   try {
-    for (const bad of [{ remoteTicketRetentionMs: 3_600_000 }, { logRetentionMs: 'soon' }, { remoteGcMaxTicketsPerRun: 0 }, { logGcMaxFilesPerRun: 1.5 }]) {
+    for (const bad of [{ remoteTicketRetentionMs: 3_600_000 }, { logRetentionMs: 'soon' }, { remoteGcMaxTicketsPerRun: 0 }, { remoteGcMaxExaminedPerRun: 0 }, { logGcMaxFilesPerRun: 1.5 }]) {
       writeGlobalConfig(f.home, bad);
       assert.throws(() => loadGlobalConfig(), new RegExp(Object.keys(bad)[0]), JSON.stringify(bad));
     }

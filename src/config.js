@@ -141,6 +141,8 @@ export const DEFAULT_GLOBAL_CONFIG = {
   remoteTicketRetentionMs: 7 * 24 * 3_600_000,
   // At most this many ticket directories are cleaned per run, so `remote-exec` startup stays fast.
   remoteGcMaxTicketsPerRun: 10,
+  // ... and at most this many are even examined per run, so the scan under the broker lock stays short.
+  remoteGcMaxExaminedPerRun: 50,
   // logs/ and results/ files older than this are pruned (never a live lease's or a queued ticket's), at most
   // logGcMaxFilesPerRun per run.
   logRetentionMs: 14 * 24 * 3_600_000,
@@ -291,7 +293,7 @@ function validateGlobalConfig(cfg, sourcePath) {
   for (const field of ['remoteTicketRetentionMs', 'logRetentionMs']) {
     assert(Number.isInteger(cfg[field]) && cfg[field] >= MIN_RETENTION_MS, `${sourcePath}: "${field}" must be an integer of at least ${MIN_RETENTION_MS} (one day)`);
   }
-  for (const field of ['remoteGcMaxTicketsPerRun', 'logGcMaxFilesPerRun']) {
+  for (const field of ['remoteGcMaxTicketsPerRun', 'remoteGcMaxExaminedPerRun', 'logGcMaxFilesPerRun']) {
     assert(Number.isInteger(cfg[field]) && cfg[field] > 0, `${sourcePath}: "${field}" must be a positive integer`);
   }
   if (cfg.runners !== undefined) validateRunners(cfg.runners, sourcePath);
