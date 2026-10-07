@@ -3,22 +3,25 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeTmpDir } from './helpers/tmp.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, gitFixture } from './helpers.js';
+import { paths } from '../src/state.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { evaluateNewAdmission, leaseDemand, leaseDemandBasis, ticketCpuEstimateBasis, formatAdmissionLog, freshObservedCores, coldStartEstimate } from '../src/admission.js';
 import { leaseCpuCores } from '../src/resources.js';
-import { computeCpuEstimates, refreshCpuEstimates, peekCpuEstimates, commandFingerprint, REFRESH_MS, SNAPSHOT_MAX_AGE_MS } from '../src/cpu-estimates.js';
+import { computeCpuEstimates, refreshCpuEstimates, peekCpuEstimates, argvFingerprint, REFRESH_MS, SNAPSHOT_MAX_AGE_MS } from '../src/cpu-estimates.js';
 
 // BRAIN-433: admission charges a workload's history-informed PEAK CPU, not its declaration. Every test here goes through
 // the production signatures: a real history.jsonl in a state root, refreshCpuEstimates, then the real admission functions.
 const REPO = '_Volumes_Lexar_proj_cairn_.git';
 const KEY = `${REPO}:qwen-552a`;
-const CMD = 'npm run verify';
+const fpOf = (argv) => argvFingerprint(argv, { root: '/w/root', tmp: '/w/tmp' });
+const FP = fpOf(['npm', 'run', 'verify']);
 const baseCfg = (over = {}) => ({ ...DEFAULT_GLOBAL_CONFIG, cpuAdmissionPercent: 90, cpuReserveCores: 1, admissionCooldownMs: 0, ...over });
 const now0 = Date.now();
 
 function row(key, peak, over = {}) {
   const [repo, lane] = [key.slice(0, key.lastIndexOf(':')), key.slice(key.lastIndexOf(':') + 1)];
-  return { key, repo, lane, command: CMD, executor: 'local', resources: { cpuCores: 4 }, exit: 0, startedAt: now0 - 70_000, endedAt: now0 - 10_000, runMs: 60_000, observedCpu: { peak, mean: peak / 4, samples: 10 }, ...over };
+  return { key, repo, lane, cmdFingerprint: FP, executor: 'local', resources: { cpuCores: 4 }, exit: 0, startedAt: now0 - 70_000, endedAt: now0 - 10_000, runMs: 60_000, observedCpu: { peak, mean: peak / 4, samples: 10 }, ...over };
 }
 const rows = (key, n, peak, over = {}) => Array.from({ length: n }, (_, i) => row(key, peak, { endedAt: now0 - 10_000 - i * 1000, ...over }));
 
@@ -30,7 +33,7 @@ function primed(history, cfg = baseCfg()) {
   refreshCpuEstimates(cfg, now0);
   return root;
 }
-const ticket = (over = {}) => ({ id: 'cand0000', key: KEY, command: CMD, weight: 4, resources: { cpuCores: 4, memoryBytes: 1 }, ...over });
+const ticket = (over = {}) => ({ id: 'cand0000', key: KEY, cmdFingerprint: FP, weight: 4, resources: { cpuCores: 4, memoryBytes: 1 }, ...over });
 
 test('history present: 5+ runs peaking ~0.8 on a 4-core declaration is charged ~0.8', () => {
   primed(rows(KEY, 6, 0.8));
@@ -58,7 +61,7 @@ test('a bursty lane (peak 4, mean 1) is charged ~4, not its mean', () => {
 
 test('a different command under the same lane gets no relief', () => {
   primed(rows(KEY, 8, 0.8));
-  assert.deepEqual(ticketCpuEstimateBasis(ticket({ command: 'npm run e2e' }), baseCfg(), now0), { cores: 4, source: 'declared' });
+  assert.deepEqual(ticketCpuEstimateBasis(ticket({ cmdFingerprint: fpOf(['npm', 'run', 'e2e']) }), baseCfg(), now0), { cores: 4, source: 'declared' });
 });
 
 test('there is no repo-level pool: other lanes of the repo with the same declaration and command give no relief', () => {
@@ -71,7 +74,7 @@ test('configLane level: sibling ad-hoc runs of the same declared lane AND the sa
   primed([...sib('qwen-111a', 3, 0.8, { configLane: 'default' }), ...sib('default', 3, 0.8)]);
   const adhoc = ticket({ key: `${REPO}:qwen-999z`, configLane: 'default' });
   assert.deepEqual(ticketCpuEstimateBasis(adhoc, baseCfg(), now0), { cores: 0.8, source: 'history:configLane' });
-  primed([...sib('qwen-111a', 3, 0.8, { configLane: 'default', command: 'other cmd' }), ...sib('default', 3, 0.8)]);
+  primed([...sib('qwen-111a', 3, 0.8, { configLane: 'default', cmdFingerprint: fpOf(['other']) }), ...sib('default', 3, 0.8)]);
   assert.equal(ticketCpuEstimateBasis(adhoc, baseCfg(), now0).source, 'declared', 'siblings that ran another command do not count');
   primed([...sib('qwen-111a', 3, 0.8, { configLane: 'default' }), ...sib('default', 3, 0.8), ...sib('qwen-999z', 5, 0.6)]);
   assert.equal(ticketCpuEstimateBasis(adhoc, baseCfg(), now0).source, 'history:exact');
@@ -121,12 +124,6 @@ test('refresh reads history.jsonl (torn line tolerated) at most once a REFRESH_M
   assert.equal(peekCpuEstimates(cfg, now0 + REFRESH_MS + 1).size, 0, 'refreshed');
 });
 
-test('fingerprint: whitespace-normalized, argv or string alike, null when empty', () => {
-  assert.equal(commandFingerprint(['npm', 'run', 'verify']), commandFingerprint('npm  run   verify'));
-  assert.notEqual(commandFingerprint('npm run verify'), commandFingerprint('npm run e2e'));
-  assert.equal(commandFingerprint(''), null);
-});
-
 // the 14:26 situation: external 3, a cold lease (2.00), a settled lease (2.75), a 4-core candidate, budget 9
 const settledLease = () => ({
   id: 'settled00000', key: 'x:settled', weight: 4, admittedAt: now0 - 300_000, observedCpuCores: 2.2, observedAt: now0,
@@ -159,7 +156,7 @@ test('admission log line shows candidateEstimate and its source', () => {
 
 test('a just-admitted lease is charged its estimate cold; observed above it is charged observed', () => {
   primed(rows(KEY, 6, 0.8));
-  const lease = { id: 'abcdef123456', key: KEY, cmd: ['npm', 'run', 'verify'], weight: 4, resources: { cpuCores: 4 }, admittedAt: now0 - 10_000 };
+  const lease = { id: 'abcdef123456', key: KEY, cmdFingerprint: FP, weight: 4, resources: { cpuCores: 4 }, admittedAt: now0 - 10_000 };
   assert.equal(leaseDemand(lease, now0, baseCfg()), 0.8);
   assert.equal(leaseDemand({ ...lease, observedCpuCores: 2.5, observedAt: now0 }, now0, baseCfg()), 2.5);
 });
@@ -199,7 +196,7 @@ test('settled demand is main\'s, uncapped by an estimate: golden grid against ma
   for (const l of leases) assert.deepEqual(leaseDemandBasis(l, now0, cfg), mainLeaseDemandBasis(l, now0, cfg), JSON.stringify(l));
   // with a LOW estimate present for the very same workload, a settled lease is still charged main's trailing-peak allowance
   primed(rows(KEY, 8, 0.5));
-  const keyed = leases.map((l) => ({ ...l, key: KEY, cmd: CMD }));
+  const keyed = leases.map((l) => ({ ...l, key: KEY, cmdFingerprint: FP }));
   for (const l of keyed) {
     const got = leaseDemandBasis(l, now0, cfg);
     const main = mainLeaseDemandBasis(l, now0, cfg);
@@ -207,36 +204,69 @@ test('settled demand is main\'s, uncapped by an estimate: golden grid against ma
   }
 });
 
-test('fingerprint: the same script from two worktrees, the primary checkout and a remote work dir is ONE workload', () => {
-  const fp = (root) => commandFingerprint(`bash ${root}/.githooks/pre-push --gate-body`);
-  const one = fp('/Volumes/Lexar/worktrees/agent_brain/librarian-sweep-355');
-  assert.equal(one, fp('/Volumes/Lexar/worktrees/agent_brain/budget-answers'));
-  assert.equal(one, fp('/Users/andrew/proj/agent_brain'));
-  assert.equal(one, fp('/Volumes/Lexar/proj/agent_brain'));
-  assert.equal(one, fp('/Users/andrew/proj/zirkbot/.worktree/zirk-1'));
-  assert.equal(one, fp('/Users/andrew/.cache/lane-broker/remote/tickets/0b5e3c1e-5a4f-4f3a-9c1d-2a7e3f4d5b6c/work'));
-  assert.equal(one, fp('~/.cache/lane-broker/remote/tickets/0b5e3c1e-5a4f-4f3a-9c1d-2a7e3f4d5b6c/work'));
+const fpAt = (argv, root, tmp = '/var/folders/ab/cd/T') => argvFingerprint(argv, { root, tmp });
+
+test('fingerprint: the same command from two worktrees of one repo is ONE workload (each run normalises its own root)', () => {
+  const script = (root) => ['bash', `${root}/.githooks/pre-push`, '--gate-body', `--root=${root}`];
+  const a = '/Volumes/Lexar/worktrees/agent_brain/slug-a';
+  const b = '/Volumes/Lexar/worktrees/agent_brain/slug-b';
+  assert.equal(fpAt(script(a), a), fpAt(script(b), b));
+  assert.equal(fpAt(script(a), a), fpAt(script('/Users/andrew/proj/agent_brain'), '/Users/andrew/proj/agent_brain'));
+  assert.notEqual(fpAt(script(a), a), fpAt(script(a), '/elsewhere'), 'a root that is not the run\'s own is not rewritten');
 });
 
-test('fingerprint: different test-file args, flags, and numbers stay different workloads', () => {
-  const wt = '/Volumes/Lexar/worktrees/zirkbot/zirk1';
-  const fp = (args) => commandFingerprint(`npx vitest run ${args} --root ${wt}`);
-  assert.notEqual(fp('src/a.test.ts'), fp('src/b.test.ts'));
-  assert.notEqual(fp('src/a.test.ts'), fp(''));
-  assert.notEqual(fp('src/a.test.ts --retry 1'), fp('src/a.test.ts --retry 2'));
-  assert.notEqual(commandFingerprint('git checkout 9afe0c19'), commandFingerprint('git checkout f2e7b325'));
+test('fingerprint: another repo\'s path in argv is not normalised, so small and large differ', () => {
+  const root = '/Users/andrew/proj/zirkbot';
+  assert.notEqual(fpAt(['node', '/Users/andrew/proj/small/scripts/verify.js'], root), fpAt(['node', '/Users/andrew/proj/large/scripts/verify.js'], root));
+  assert.notEqual(fpAt(['node', '/Users/andrew/proj/zirkbot-other/x.js'], root), fpAt(['node', '<repo>-other/x.js'], root), 'a sibling that merely shares the prefix text is not the root');
 });
 
-test('fingerprint: a path under the run\'s TMPDIR is normalised, the rest of the name is not', () => {
-  const fp = (t) => commandFingerprint(`node run.js --out ${t}/lane-out`);
-  assert.equal(fp('/private/var/folders/ab/cd1234/T'), fp('/var/folders/zz/yy9999/T'));
-  assert.equal(fp('/private/var/folders/ab/cd1234/T'), fp('/tmp'));
-  assert.notEqual(commandFingerprint('node run.js --out /tmp/a'), commandFingerprint('node run.js --out /tmp/b'));
+test('fingerprint: argv boundaries survive, and a long common prefix with a different suffix differs', () => {
+  assert.notEqual(fpAt(['bash', '-c', 'true', ';', 'node', 'heavy.js'], '/r'), fpAt(['bash', '-c', 'true ; node heavy.js'], '/r'));
+  const prefix = 'x'.repeat(400);
+  assert.notEqual(fpAt(['vitest', prefix, 'a.test.ts'], '/r'), fpAt(['vitest', prefix, 'b.test.ts'], '/r'));
+  assert.notEqual(fpAt(['run', '--workers', '1'], '/r'), fpAt(['run', '--workers', '8'], '/r'));
 });
 
-test('history from different worktrees pools into one workload for the estimate', () => {
-  const at = (slug) => (i) => row(KEY, 0.8, { command: `bash /Volumes/Lexar/worktrees/cairn/${slug}/scripts/verify.sh`, endedAt: now0 - 10_000 - i });
-  primed([0, 1, 2].map(at('a')).concat([3, 4, 5].map(at('b'))));
-  const t = ticket({ command: 'bash /Users/andrew/proj/cairn/scripts/verify.sh' });
+test('fingerprint: test-file args and numbers stay distinct; the run\'s own TMPDIR is normalised', () => {
+  assert.notEqual(fpAt(['vitest', 'src/a.test.ts'], '/r'), fpAt(['vitest', 'src/b.test.ts'], '/r'));
+  assert.notEqual(fpAt(['vitest'], '/r'), fpAt(['vitest', 'src/a.test.ts'], '/r'));
+  assert.equal(fpAt(['node', 'x.js', '--out', '/var/folders/ab/cd/T/out'], '/r', '/var/folders/ab/cd/T'), fpAt(['node', 'x.js', '--out', '/tmp/q/out'], '/r', '/tmp/q'));
+  assert.equal(fpAt([], '/r'), null);
+});
+
+test('grant is part of the key: 1-core history gives an 8-core candidate no relief', () => {
+  primed(rows(KEY, 8, 0.8, { resources: { cpuCores: 1 } }));
+  assert.deepEqual(ticketCpuEstimateBasis(ticket({ resources: { cpuCores: 8, memoryBytes: 1 }, weight: 8 }), baseCfg(), now0), { cores: 8, source: 'declared' });
+  assert.deepEqual(ticketCpuEstimateBasis(ticket({ resources: { cpuCores: 1, memoryBytes: 1 }, weight: 1 }), baseCfg(), now0), { cores: 0.8, source: 'history:exact' });
+});
+
+test('a legacy row without cmdFingerprint is ignored', () => {
+  primed(rows(KEY, 8, 0.8).map(({ cmdFingerprint, ...legacy }) => ({ ...legacy, command: 'npm run verify' })));
+  assert.deepEqual(ticketCpuEstimateBasis(ticket(), baseCfg(), now0), { cores: 4, source: 'declared' });
+  assert.deepEqual(ticketCpuEstimateBasis({ key: KEY, weight: 4, resources: { cpuCores: 4 } }, baseCfg(), now0), { cores: 4, source: 'declared' }, 'a ticket without one never matches');
+});
+
+test('history from different worktrees pools: rows fingerprinted by their own root match a ticket from another worktree', () => {
+  const run = (root) => (i) => row(KEY, 0.8, { cmdFingerprint: fpAt(['bash', `${root}/scripts/verify.sh`], root), endedAt: now0 - 10_000 - i });
+  primed([0, 1, 2].map(run('/Volumes/Lexar/worktrees/cairn/a')).concat([3, 4, 5].map(run('/Users/andrew/proj/cairn'))));
+  const t = ticket({ cmdFingerprint: fpAt(['bash', '/Volumes/Lexar/worktrees/cairn/c/scripts/verify.sh'], '/Volumes/Lexar/worktrees/cairn/c') });
   assert.deepEqual(ticketCpuEstimateBasis(t, baseCfg(), now0), { cores: 0.8, source: 'history:exact' });
+});
+
+test('end to end: a real `lane run` records the persisted fingerprint, normalised against its own checkout root', async () => {
+  const { base, home, state, env } = freshEnv();
+  writeGlobalConfig(home, { version: 1, capacity: 100, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
+  const repoDir = path.join(base, 'repo');
+  fs.mkdirSync(repoDir, { recursive: true });
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
+  gitFixture(['init', '-q'], repoDir);
+  gitFixture(['add', '-A'], repoDir);
+  gitFixture(['commit', '-q', '-m', 'x'], repoDir);
+  const root = fs.realpathSync(repoDir);
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'sh', '-c', 'true', `${root}/x.sh`], { env, cwd: repoDir });
+  assert.equal(result.code, 0, result.stderr);
+  const [hist] = fs.readFileSync(paths(state).history, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.equal(hist.cmdFingerprint, argvFingerprint(['sh', '-c', 'true', `${root}/x.sh`], { root, tmp: env.TMPDIR ?? '/tmp' }));
+  assert.match(hist.cmdFingerprint, /^[0-9a-f]{64}$/);
 });

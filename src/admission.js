@@ -28,7 +28,7 @@ export function coldStartEstimate(weight) {
 export function cpuEstimateBasis(ref, declared, cfg, now = Date.now()) {
   const cold = coldStartEstimate(declared);
   if (cfg?.historyDemandEnabled !== true) return { cores: cold, source: 'declared' };
-  const found = lookupEstimate(peekCpuEstimates(cfg, now), ref);
+  const found = lookupEstimate(peekCpuEstimates(cfg, now), ref, cold);
   return found ? { cores: clampEstimate(found.p90, cold), source: `history:${found.level}` } : { cores: cold, source: 'declared' };
 }
 
