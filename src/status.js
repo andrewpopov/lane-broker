@@ -3,7 +3,8 @@ import path from 'node:path';
 import { ensureStateDirs, paths, withLock, bootId, readJsonSafe, readDrainMarker } from './state.js';
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
 import { listQueueCapped, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState, readResourceSkipState, futileFresh } from './scheduler.js';
-import { cpuBudget, projectBusy, ticketCpuEstimate } from './admission.js';
+import { refreshCpuEstimates } from './cpu-estimates.js';
+import { cpuBudget, projectBusy, ticketCpuEstimate, ticketCpuEstimateBasis } from './admission.js';
 import { classLocks, simArmed, usedByClass } from './allocation.js';
 import { queuedClaimsByClass } from './allocation-shadow.js';
 import { readLastSimDemandAt } from './sim-arm.js';
@@ -134,6 +135,7 @@ function logMtimeAgeMs(logPath) {
 export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
   const root = ensureStateDirs().root;
   const cfg = loadGlobalConfig();
+  refreshCpuEstimates(cfg);
   let lockError = null;
   try {
     await withLock(root, () => reapAll(root, bootId()), { timeoutMs: lockTimeoutMs });
@@ -207,6 +209,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       ...(t.id === reservationOwnerId ? { reservationOwner: true } : {}),
       ...(tierName(rank) !== tier ? { effectiveRank: tierName(rank) } : {}),
       resources: leaseResources(t, cfg),
+      cpuEstimate: ticketCpuEstimateBasis(t, cfg, now),
     };
   });
 
@@ -480,7 +483,7 @@ export function renderStatusText(status) {
   } else {
     for (const q of status.queued) {
       const tier = q.priority ? `  priority=${q.priority}${q.effectiveRank ? ` (aged to ${q.effectiveRank})` : ''}` : '';
-      lines.push(`  #${q.position} ${q.id}  key=${q.key}  waited=${fmtMs(q.waitedMs)}${tier}${q.reservationOwner ? '  [reservation owner]' : ''}`);
+      lines.push(`  #${q.position} ${q.id}  key=${q.key}${q.cpuEstimate ? `  cpu~${q.cpuEstimate.cores.toFixed(2)}(${q.cpuEstimate.source})` : ''}  waited=${fmtMs(q.waitedMs)}${tier}${q.reservationOwner ? '  [reservation owner]' : ''}`);
     }
   }
   if (status.remote) {

@@ -4,6 +4,7 @@ import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, wr
 import { sampleAndUpdateGate, readGateState } from './load.js';
 import { patchAttemptLocked, readAttempt } from './attempts.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
+import { refreshCpuEstimates } from './cpu-estimates.js';
 import { evaluateCpuAdmission, freshObservedCores, evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, projectBusy, ticketCpuEstimate } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
 import { captureShadowInputs, recordAllocationShadow } from './allocation-shadow.js';
@@ -818,7 +819,7 @@ function ticketCpuFloor(ticket, cfg) {
  */
 export function selectResourceCandidate(queue, held, runningWeight, weightCapacity, record, cfg, now = Date.now(), headReserved = false) {
   const headTicket = queue[0];
-  const view = headReserved ? [...held, { id: headTicket.id, key: headTicket.key, weight: headTicket.weight, resources: headTicket.resources }] : held;
+  const view = headReserved ? [...held, { id: headTicket.id, key: headTicket.key, configLane: headTicket.configLane, cmdFingerprint: headTicket.cmdFingerprint, weight: headTicket.weight, resources: headTicket.resources }] : held;
   const viewWeight = headReserved ? runningWeight + headTicket.weight : runningWeight;
   let best = null;
   let bestClaim = Infinity;
@@ -1189,7 +1190,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     }
     // BRAIN-355: a safe backfill must leave room for the blocked head once its conflict clears, so
     // the head's claim joins the held leases for the CPU projection and memory admission.
-    const headReservation = { id: headTicket.id, key: headTicket.key, weight: headTicket.weight, resources: headTicket.resources };
+    const headReservation = { id: headTicket.id, key: headTicket.key, configLane: headTicket.configLane, cmdFingerprint: headTicket.cmdFingerprint, weight: headTicket.weight, resources: headTicket.resources };
     const admissionHeld = safeBackfill || conflictPick ? [...held, headReservation] : held;
     const fullDecision = evaluateNewAdmission(root, cfg, ticket, admissionHeld, cpuSample, memInfo);
     // BRAIN-360: an elastic ticket (resources.minCpuCores) denied ONLY by the CPU projection is
@@ -1399,6 +1400,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       effectiveRankAtStart: effectiveRank(queued, nowEff, cfg),
       scoreAtStart: score(queued, nowEff, cfg),
       key: ticket.key,
+      ...(ticket.configLane ? { configLane: ticket.configLane } : {}),
       bootId: bootId(),
       supervisorPid: ticket.supervisorPid,
       supervisorStart: ticket.supervisorStart,
@@ -1411,6 +1413,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       admittedAt: now,
       cwd: ticket.cwd,
       cmd: ticket.cmd,
+      ...(ticket.cmdFingerprint ? { cmdFingerprint: ticket.cmdFingerprint } : {}),
       weight: ticket.weight,
       resources: submitted.resources,
       // BRAIN-360: elastic lanes only; what admission actually charged. `resources.cpuCores` stays the declaration.
@@ -1462,6 +1465,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       events,
     };
   };
+  refreshCpuEstimates(globalCfg);
   const { result, logFields, events } = await withLock(root, decide);
 
   // BRAIN-379: evaluated and logged after the lock is released, so shadow never lengthens a live admission or release.

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
@@ -9,6 +10,7 @@ import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.
 import { listQueue } from './scheduler.js';
 import { stampPriorityOrigin } from './priority-clock.js';
 import { detectResourceCapacity, leaseResources, resolveTicketResources, checkResourceBudget, localSimRefusal } from './resources.js';
+import { argvFingerprint } from './cpu-estimates.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
 
 const supervisorPath = fileURLToPath(new URL('./supervisor.js', import.meta.url));
@@ -52,7 +54,7 @@ function waitForStreamEnd(stream, timeoutMs = 2000) {
  */
 function gitRevParse(cwd, arg) {
   try {
-    return execFileSync('git', ['rev-parse', arg], {
+    return execFileSync('git', ['rev-parse', ...[].concat(arg)], {
       cwd,
       encoding: 'utf8',
       env: scrubbedGitEnv(),
@@ -61,6 +63,21 @@ function gitRevParse(cwd, arg) {
     }).trim();
   } catch {
     return null;
+  }
+}
+
+/** One git call for the two facts every ticket needs: HEAD's tree (history provenance) and the checkout root (command fingerprint). Both null outside git or on an unborn HEAD. */
+function gitTreeAndRoot(cwd) {
+  const lines = gitRevParse(cwd, ['HEAD^{tree}', '--show-toplevel'])?.split('\n');
+  return { headTree: lines?.[0] || null, checkoutRoot: lines?.[1] || null };
+}
+
+/** git's toplevel is realpath'd, so the fingerprint's cwd must be too; a vanished cwd keeps its given path. */
+function realpathOr(dir) {
+  try {
+    return fs.realpathSync(dir);
+  } catch {
+    return dir;
   }
 }
 
@@ -257,7 +274,13 @@ export async function runCommand({
   const remoteWorktreeRoot = remoteWanted ? resolveWorktreeRoot(cwd) : null;
   const remoteEligible = remoteWanted && remoteWorktreeRoot !== null;
   const localReason = localReasonFor(resolved, remoteEligible, local);
-  const headTree = gitRevParse(cwd, 'HEAD^{tree}');
+  const { headTree, checkoutRoot } = gitTreeAndRoot(cwd);
+  // No fingerprint (so no history relief, charge declared) when the checkout root is
+  // unknown: falling back to cwd would fold a sub-package into the repo-root workload.
+  const fingerprintRoot = checkoutRoot ?? remoteWorktreeRoot;
+  const cmdFingerprint = fingerprintRoot
+    ? argvFingerprint(cmd, { root: fingerprintRoot, cwd: realpathOr(cwd), tmp: process.env.TMPDIR || os.tmpdir() })
+    : undefined;
   const resources = resolveTicketResources({
     weight,
     cpuCores: cpuOverride ?? resolved.cpuCores,
@@ -411,6 +434,7 @@ export async function runCommand({
     // supervisor's single history-row builder. `headTree` is omitted outside
     // a git repo; it must never fail the run.
     command: cmd.join(' ').slice(0, HISTORY_COMMAND_MAX),
+    ...(cmdFingerprint ? { cmdFingerprint } : {}),
     ...(headTree ? { headTree } : {}),
     ...(localReason ? { localReason } : {}),
   };

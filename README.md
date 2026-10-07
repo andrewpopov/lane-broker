@@ -171,6 +171,26 @@ cores but uses 1 stops starving the queue. Unsettled leases are charged as
 before; `false` restores that for every lease. The admission log's
 `leaseDemand=<id8>:<cores>(settled|cold)` field shows the basis per held lease.
 
+`historyDemandEnabled` (default `true`) and `historyDemandMinRuns` (default 5): a workload with at
+least that many compatible runs in `history.jsonl` (the last 50, no older than 14 days) is charged its
+history estimate instead of its declared cores, as an admission candidate and as the cold demand of a
+just-admitted lease. A workload is (repo, lane, `cmdFingerprint`, granted cores). `cmdFingerprint` is
+recorded on the ticket, lease and history row when the run starts: the sha256 of the JSON of the full
+argv, each element with the run's OWN checkout root (git toplevel) rewritten to `<repo>` and its own
+`TMPDIR` to `<tmp>`, and nothing else, so the same command from another worktree of the repo is one
+workload while another repo's path, a test-file argument, a flag or a number never merges. History rows
+written before 0.23.1 have no fingerprint and are ignored, so relief starts from new history. An ad-hoc lane
+name may also match the runs of its declared `configLane`, with the same fingerprint. A run counts only if it
+succeeded, ran on the local executor, and was granted exactly the candidate's declared cores (a 1-core run
+says nothing about an 8-worker candidate). The estimate is the p90 of the per-run PEAK observed cores,
+floored at 0.5 and capped at the declaration, so a bursty lane is charged its burst. There is no repo-wide
+pool, and no compatible history means the declaration. The settled-demand allowance above is unchanged and
+never capped by the estimate. The snapshot is built before the admission lock is taken (never under it),
+carries the config it was built under, and is used only while it matches the locked config and is under 5
+minutes old. The admission log shows `candidateEstimate=<n>(history:exact|history:configLane|declared)`, and
+`lane status --json` gives each queued ticket `cpuEstimate: { cores, source }`. `false` charges
+declarations only.
+
 `admissionLoadGate` (default `false`): whether the load gate is allowed to
 deny a start at all. With the default, the gate is still sampled and reported
 every poll (`lane status` shows it, `[informational]` suffixed), but it never

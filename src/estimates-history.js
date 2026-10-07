@@ -30,7 +30,7 @@ export function classifyRow(row) {
   return { kind: 'ignored', why: 'failed' };
 }
 
-const percentile = (sorted, q) => sorted[Math.max(0, Math.ceil(q * sorted.length) - 1)];
+export const percentile = (sorted, q) => sorted[Math.max(0, Math.ceil(q * sorted.length) - 1)];
 
 /** Pure: rows -> { keys, skipped }. `hostFactor` converts wall to ref-s (1.0: the host has no calibration). */
 export function backfillEstimates(rows, { hostFactor = 1 } = {}) {

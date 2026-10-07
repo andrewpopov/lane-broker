@@ -439,7 +439,7 @@ test('a pathological declared claim returns promptly with a bounded grant (child
     const cfg = { ...DEFAULT_GLOBAL_CONFIG, schedulerMode: 'active', cpuAdmissionPercent: 100, cpuReserveCores: 1, admissionCooldownMs: 0 };
     const sample = { hostBusyCores: 5, cores: 10, stale: false };
     const ticket = { id: 't', weight: 1, resources: { cpuCores: 1e20, minCpuCores: 1, memoryBytes: 1 } };
-    const full = { admit: false, cpuReason: 'projected-over-budget', memoryReason: 'ok', budget: 9, projectedBusy: 5 + 1e20, candidateCpuCores: 1e20, cpuGateClosed: false, cooldownBlocked: false };
+    const full = { admit: false, cpuReason: 'projected-over-budget', memoryReason: 'ok', budget: 9, projectedBusy: 5 + 1e20, candidateCpuCores: 1e20, candidateEstimate: 1e20, cpuGateClosed: false, cooldownBlocked: false };
     const r = evaluateElasticAdmission(cfg, ticket, [], sample, null, full);
     console.log(JSON.stringify(r && r.grantedCpuCores));
   `;

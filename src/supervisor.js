@@ -441,6 +441,7 @@ function historyRow(ticket, result, { fallbackReason, lease } = {}) {
     weight: ticket.weight,
     resources: ticket.resources,
     command: ticket.command,
+    ...(ticket.cmdFingerprint ? { cmdFingerprint: ticket.cmdFingerprint } : {}),
     headTree: ticket.headTree,
     // BRAIN-380 §8: only a ticket that was admitted has a lease, so only its row carries the admission audit
     ...priorityAuditOf(lease),
