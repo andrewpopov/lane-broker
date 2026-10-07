@@ -275,7 +275,12 @@ export async function runCommand({
   const remoteEligible = remoteWanted && remoteWorktreeRoot !== null;
   const localReason = localReasonFor(resolved, remoteEligible, local);
   const { headTree, checkoutRoot } = gitTreeAndRoot(cwd);
-  const cmdFingerprint = argvFingerprint(cmd, { root: checkoutRoot ?? remoteWorktreeRoot ?? cwd, cwd: realpathOr(cwd), tmp: process.env.TMPDIR || os.tmpdir() });
+  // No fingerprint (so no history relief, charge declared) when the checkout root is
+  // unknown: falling back to cwd would fold a sub-package into the repo-root workload.
+  const fingerprintRoot = checkoutRoot ?? remoteWorktreeRoot;
+  const cmdFingerprint = fingerprintRoot
+    ? argvFingerprint(cmd, { root: fingerprintRoot, cwd: realpathOr(cwd), tmp: process.env.TMPDIR || os.tmpdir() })
+    : undefined;
   const resources = resolveTicketResources({
     weight,
     cpuCores: cpuOverride ?? resolved.cpuCores,

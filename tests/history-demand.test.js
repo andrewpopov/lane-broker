@@ -271,6 +271,18 @@ test('end to end: a real `lane run` records the persisted fingerprint, normalise
   assert.match(hist.cmdFingerprint, /^[0-9a-f]{64}$/);
 });
 
+test('end to end: a run whose checkout root is unknown (not a git repo) records no fingerprint, so it is charged declared', async () => {
+  const { base, home, state, env } = freshEnv();
+  writeGlobalConfig(home, { version: 1, capacity: 100, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
+  const dir = path.join(base, 'not-a-repo', 'packages', 'heavy');
+  fs.mkdirSync(dir, { recursive: true });
+  writeRepoConfig(dir, { version: 1, lanes: { default: { weight: 1 } } });
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'sh', '-c', 'true'], { env, cwd: dir });
+  assert.equal(result.code, 0, result.stderr);
+  const [hist] = fs.readFileSync(paths(state).history, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  assert.equal(hist.cmdFingerprint, undefined);
+});
+
 test('fingerprint: the execution directory is part of the workload (packages/small vs packages/heavy), pooled across worktrees', () => {
   const a = '/Volumes/Lexar/worktrees/mono/slug-a';
   const b = '/Volumes/Lexar/worktrees/mono/slug-b';
