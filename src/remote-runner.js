@@ -17,9 +17,9 @@ import { makeReader, readHeaderLine, extractFrames, MAX_HEADER_BYTES } from './r
 import { runCommand } from './run.js';
 import { cancelCommand } from './cancel.js';
 import { collectStatus } from './status.js';
-import { readLease, isSupervisorAlive } from './lease.js';
-import { readAttempt } from './attempts.js';
-import { listQueue, dequeueSync } from './scheduler.js';
+import { readLease, isSupervisorAlive, listLeasesStrict } from './lease.js';
+import { readAttempt, listAttemptsStrict } from './attempts.js';
+import { listQueue, listQueueStrict, dequeueSync } from './scheduler.js';
 import { REMOTE_TMP_BASE, TMP_OWNER_FILE, gcRemoteTickets, removeDetached } from './gc.js';
 import { writeBrokerLog } from './admission.js';
 import { sanitizeObservedCpu, sanitizeRssPeak, sanitizeCpuSeconds } from './observed.js';
@@ -293,16 +293,23 @@ function cleanupWork(workDir, tmpDir) {
  * dispatch path; bounded per run and removed in a detached `rm`, so the submitter's ssh session never waits on it. A failure
  * (lock timeout, bad config) is logged to the broker log and never affects the ticket.
  */
-/** Is `id` queued, leased or attempted in the broker at `brokerRoot`? Call under the broker lock for an answer that cannot change under you. */
+/**
+ * Is `id` queued, leased or attempted in the broker at `brokerRoot`? Call under the broker lock for an answer that cannot change
+ * under you. For a CONFIRMATION proof: a record that cannot be read (anything but a vanished file) THROWS rather than reading as
+ * absent, so a caller never concludes "not registered" from a read it could not make.
+ */
 function isRegisteredInBroker(brokerRoot, id) {
-  return Boolean(readLease(brokerRoot, id)) || Boolean(readAttempt(brokerRoot, id)) || listQueue(brokerRoot).some((t) => t && t.id === id);
+  const has = (records) => records.some((r) => r.id === id);
+  return has(listLeasesStrict(brokerRoot)) || has(listAttemptsStrict(brokerRoot)) || has(listQueueStrict(brokerRoot));
 }
 
-function readTrimmed(file) {
+/** The text of `file`, or null only when it genuinely does not exist (ENOENT/ENOTDIR). Any other read error throws. */
+function readIfExists(file) {
   try {
     return fs.readFileSync(file, 'utf8').trim();
-  } catch {
-    return null;
+  } catch (err) {
+    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return null;
+    throw err;
   }
 }
 
@@ -957,9 +964,16 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
   let cancelConfirmed = false;
   let registered = false;
   let remoteLaneId = null;
+  // Only a genuine absence (ENOENT) is a proof of "no remote-id" / "not registered". A read that FAILS is an unknown, never a
+  // confirmation: the ticket may exist and may run, so it stays unconfirmed (and registered-or-unknown goes through cancelCommand).
   await withLock(stateHome(), () => {
     atomicWriteFile(path.join(ticketDir, 'cancelled'), String(Date.now()));
-    const recorded = readTrimmed(path.join(ticketDir, 'remote-id'));
+    let recorded;
+    try {
+      recorded = readIfExists(path.join(ticketDir, 'remote-id'));
+    } catch {
+      return;
+    }
     if (recorded === null) {
       cancelConfirmed = true;
       return;
@@ -969,14 +983,26 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
     const brokerRoot = ensureStateDirs().root;
     writeCancelMarkerFile(brokerRoot, remoteLaneId);
     cancelRequested = true;
-    registered = isRegisteredInBroker(brokerRoot, remoteLaneId);
+    try {
+      registered = isRegisteredInBroker(brokerRoot, remoteLaneId);
+    } catch {
+      registered = true;
+    }
     if (!registered) cancelConfirmed = true;
   });
   if (registered) {
     cancelConfirmed = (await cancelCommand(remoteLaneId)).exitCode === 0;
     // The marker written above makes a queued ticket's own supervisor dequeue itself, which can happen before `cancelCommand` takes
     // the lock; it then finds nothing and exits 1. Not registered any more, with the marker in place, means it can never start.
-    if (!cancelConfirmed) cancelConfirmed = await withLock(stateHome(), () => !isRegisteredInBroker(ensureStateDirs().root, remoteLaneId));
+    if (!cancelConfirmed) {
+      cancelConfirmed = await withLock(stateHome(), () => {
+        try {
+          return !isRegisteredInBroker(ensureStateDirs().root, remoteLaneId);
+        } catch {
+          return false;
+        }
+      });
+    }
   }
   // A ticket that has already published its result is not running: a retried cancel is confirmed, not forever unconfirmed.
   // That holds with or without a `remote-id` -- a ticket rejected or refused before it was enqueued never had one.

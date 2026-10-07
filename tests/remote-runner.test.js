@@ -861,6 +861,50 @@ test('remote-cancel after the ticket dir exists but BEFORE remote-id is written 
   assert.equal(fs.existsSync(ranFile), false, 'the command never ran');
 });
 
+// A read that FAILS is an unknown, never a proof of absence: it must leave the cancel unconfirmed.
+async function remoteCancelWith(arrange) {
+  const { env, state } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const header = makeHeader();
+  const ticketDir = path.join(root, 'tickets', header.ticketId);
+  fs.mkdirSync(ticketDir, { recursive: true });
+  const laneId = crypto.randomUUID();
+  arrange({ ticketDir, state, laneId });
+  const out = await laneRun(['remote-cancel', header.ticketId, '--root', root], { env });
+  assert.equal(out.code, 0, out.stderr);
+  return JSON.parse(out.stdout.trim());
+}
+
+test('remote-cancel: a remote-id that exists but cannot be read is UNCONFIRMED, not "no remote-id"', async () => {
+  const parsed = await remoteCancelWith(({ ticketDir, laneId }) => {
+    fs.writeFileSync(path.join(ticketDir, 'remote-id'), laneId);
+    fs.chmodSync(path.join(ticketDir, 'remote-id'), 0o000);
+  });
+  assert.equal(parsed.cancelConfirmed, false);
+});
+
+test('remote-cancel: a genuinely absent remote-id is still confirmed', async () => {
+  const parsed = await remoteCancelWith(() => {});
+  assert.equal(parsed.cancelConfirmed, true);
+});
+
+test('remote-cancel: an unreadable lease record leaves the cancel unconfirmed (both the first check and the post-failure re-check)', async () => {
+  const parsed = await remoteCancelWith(({ ticketDir, state, laneId }) => {
+    fs.writeFileSync(path.join(ticketDir, 'remote-id'), laneId);
+    fs.mkdirSync(paths(state).leases, { recursive: true });
+    const lease = path.join(paths(state).leases, `${laneId}.json`);
+    fs.writeFileSync(lease, JSON.stringify({ id: laneId, supervisorPid: process.pid }));
+    fs.chmodSync(lease, 0o000);
+  });
+  assert.equal(parsed.cancelConfirmed, false);
+  assert.equal(parsed.cancelRequested, true, 'the broker marker is still written');
+});
+
+test('remote-cancel: a ticket with a remote-id and no broker records at all is confirmed', async () => {
+  const parsed = await remoteCancelWith(({ ticketDir, laneId }) => fs.writeFileSync(path.join(ticketDir, 'remote-id'), laneId));
+  assert.equal(parsed.cancelConfirmed, true);
+});
+
 // BRAIN-320 review fix B: a direct runner-side `lane cancel <id>` (the
 // BROKER-level cancel, never touching the ticket-local `cancelled` marker
 // remote-cancel writes) landing between tryStart's expiry and the
