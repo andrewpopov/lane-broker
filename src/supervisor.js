@@ -441,6 +441,7 @@ function historyRow(ticket, result, { fallbackReason, lease } = {}) {
     repo: ticket.repoId,
     lane: ticket.lane,
     ...(ticket.configLane ? { configLane: ticket.configLane } : {}),
+    ...(ticket.localFirst ? { localFirst: true } : {}),
     weight: ticket.weight,
     resources: ticket.resources,
     command: ticket.command,
@@ -627,6 +628,9 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     return { fallback: true, attemptGeneration: fb.attempt.generation, fallbackReason: reason, rebindable };
   }
 
+  // BRAIN-442: a local-first ticket skips the initial dispatch and queues locally; only `tryRebind` may move it, after its wait.
+  if (enriched.localFirst && !rebind) return fallbackOrRefuse(null, 'local-first', { rebindable: true });
+
   // Codex pre-merge finding #5: decide ELIGIBILITY before ever probing a
   // runner. `buildManifest` used to run only inside `dispatchRemote`, AFTER
   // `selectRunner` had already dialed a runner and this function had
@@ -706,7 +710,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       return { fallback: true, rebindLost: true, attemptGeneration: gen };
     }
     await testHoldAt('rebind-withdrawn');
-    const line = `lane: remote-rebind: ${enriched.id}: seq ${withdrawn.seq} -> ${runner.name} (queued locally ${Math.round((Date.now() - withdrawn.createdAt) / 1000)}s)\n`;
+    const line = `lane: remote-rebind: ${enriched.id}: seq ${withdrawn.seq} -> ${runner.name} (queued locally ${Math.round((Date.now() - withdrawn.createdAt) / 1000)}s${enriched.localFirst ? ', local-first' : ''})\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);
   }
@@ -1131,6 +1135,8 @@ async function main() {
     await runRemoteAttempt(root, enriched, globalCfg, abortController.signal, { generation: attemptGeneration, runner, probe });
   }
   let nextRebindAt = Date.now() + (globalCfg.remoteRebindIntervalMs || 0);
+  // BRAIN-442: a local-first ticket is not rebind-eligible until it has waited in the local queue this long
+  const rebindNotBefore = enriched.localFirst ? enriched.createdAt + (enriched.localFirstWaitMs ?? globalCfg.localFirstWaitMs) : 0;
 
   let started;
   for (;;) {
@@ -1227,7 +1233,7 @@ async function main() {
       touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit(outcome, { forcePublish: cancelWon });
     }
-    if (rebindable && globalCfg.remoteRebindIntervalMs > 0 && Date.now() >= nextRebindAt && (globalCfg.runners || []).length > 0) {
+    if (rebindable && globalCfg.remoteRebindIntervalMs > 0 && Date.now() >= nextRebindAt && Date.now() >= rebindNotBefore && (globalCfg.runners || []).length > 0) {
       nextRebindAt = Date.now() + globalCfg.remoteRebindIntervalMs;
       try {
         await tryRebind();

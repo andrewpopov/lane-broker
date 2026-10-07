@@ -431,6 +431,20 @@ What a remote run does:
    had room" (an ineligible tree, a `remoteDeps` failure, a dispatch that
    failed after sending).
 
+   **Local-first lanes (BRAIN-442).** A lane with `"remotePolicy": "local-first"`
+   (default `"remote-first"`, today's behaviour) skips the initial dispatch and
+   enqueues locally, keeping its remote eligibility (`remote.fallback.reason`
+   is `local-first`). If this machine admits it, it simply runs here. Only once
+   it has waited `localFirstWaitMs` in the local queue (lane key, else the global
+   `localFirstWaitMs`, default `90000`) does late rebinding above apply to it,
+   so it moves to a runner only when it would otherwise keep waiting. It needs
+   `remoteRebindIntervalMs` > 0 to ever move. History rows and queue records carry
+   `localFirst: true`, and the rebind log line ends `, local-first`.
+
+   ```json
+   "lanes": { "prepush": { "remote": true, "remotePolicy": "local-first", "localFirstWaitMs": 60000 } }
+   ```
+
 3. **Send a snapshot**, not history: a framed stream of exactly the listed
    files. Each file is re-read without following symlinks and its sha256
    checked before its bytes are sent. The runner validates every frame
