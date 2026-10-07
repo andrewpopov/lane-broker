@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, loadGlobalConfig } from './config.js';
 import { CAPABILITIES } from './capabilities.js';
@@ -746,7 +746,14 @@ const legacyState = (phase) => (phase === 'preparing' || phase === 'admitted' ? 
  */
 export async function withdrawLane(brokerRoot, laneId, { dequeue = dequeueSync } = {}) {
   return withLock(brokerRoot, async () => {
-    if (isWithdrawn(brokerRoot, laneId)) return 'withdrawn';
+    if (isWithdrawn(brokerRoot, laneId)) {
+      syncWithdrawMarkers(brokerRoot);
+      return 'withdrawn';
+    }
+    // The supervisor clears the marker once it has published this result, which can be before the remote-exec result
+    // exists; the published broker result is the same fact, so a retry in that window still answers `withdrawn`.
+    const published = readJsonSafe(path.join(paths(brokerRoot).results, `${laneId}.json`));
+    if (published?.reason === 'withdrawn' && published.cancelled === false) return 'withdrawn';
     try {
       assertNotMigrating(brokerRoot);
     } catch (err) {

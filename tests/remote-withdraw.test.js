@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -11,7 +11,7 @@ import { listLeases } from '../src/lease.js';
 import { withdrawLane, remoteTicketState } from '../src/remote-runner.js';
 import { encodeSnapshot } from '../src/remote-stream.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
-import { paths, readJsonSafe, isWithdrawn, writeWithdrawMarkerFile, writeCancelMarkerFile, processStartTime } from '../src/state.js';
+import { paths, readJsonSafe, isWithdrawn, writeWithdrawMarkerFile, writeCancelMarkerFile, processStartTime, atomicWriteJson } from '../src/state.js';
 import { CAPABILITIES } from '../src/capabilities.js';
 
 /**
@@ -268,4 +268,89 @@ test('a crash after the marker but before the dequeue: the runner supervisor deq
   assert.equal(listLeases(f.state).length, 0);
   assert.equal(resultOf(f, header).reason, 'withdrawn');
   assert.equal(isWithdrawn(f.state, laneId), false, 'finalize cleared the marker');
+});
+
+// ---- Codex S1 review fixes ----
+
+/** Make unlinks in the runner's queue directory fail (EACCES), so a supervisor's dequeue has to retry. */
+const blockQueue = (state) => fs.chmodSync(paths(state).queue, 0o555);
+const unblockQueue = (state) => fs.chmodSync(paths(state).queue, 0o755);
+
+test('a cancel landing while the supervisor retries the dequeue still wins', { timeout: 60_000 }, async () => {
+  const f = pausedRunner();
+  const header = headerOf();
+  const run = startRemoteExec({ env: f.env, root: f.root, header });
+  const laneId = await queuedLaneId({ ...f, header });
+  blockQueue(f.state);
+  try {
+    writeWithdrawMarkerFile(f.state, laneId);
+    await sleep(500);
+    assert.deepEqual(queuedIds(f.state), [laneId], 'the supervisor is stuck retrying the unlink');
+    writeCancelMarkerFile(f.state, laneId);
+  } finally {
+    unblockQueue(f.state);
+  }
+  assert.equal(await run.closed, 0);
+  const structured = readJsonSafe(path.join(paths(f.state).results, `${laneId}.json`));
+  assert.notEqual(structured?.reason, 'withdrawn');
+  assert.equal(structured?.cancelled, true);
+  assert.deepEqual(queuedIds(f.state), []);
+});
+
+test('cancel wins over a withdraw while the unlink fails: the queue entry is still removed and a result published', { timeout: 60_000 }, async () => {
+  const f = pausedRunner();
+  const header = headerOf();
+  const run = startRemoteExec({ env: f.env, root: f.root, header });
+  const laneId = await queuedLaneId({ ...f, header });
+  blockQueue(f.state);
+  try {
+    writeCancelMarkerFile(f.state, laneId);
+    writeWithdrawMarkerFile(f.state, laneId);
+    await sleep(500);
+    assert.deepEqual(queuedIds(f.state), [laneId], 'still stuck, and the withdraw marker is still holding admission off');
+    assert.ok(isWithdrawn(f.state, laneId));
+  } finally {
+    unblockQueue(f.state);
+  }
+  assert.equal(await run.closed, 0);
+  assert.deepEqual(queuedIds(f.state), []);
+  assert.equal(listLeases(f.state).length, 0);
+  const structured = readJsonSafe(path.join(paths(f.state).results, `${laneId}.json`));
+  assert.equal(structured?.cancelled, true, 'a cancelled result was published');
+});
+
+test('a retry between the broker result and the remote result still answers withdrawn', async () => {
+  const { state } = freshEnv();
+  // the supervisor published the broker result and cleared the marker; remote-exec has not published yet
+  fs.mkdirSync(paths(state).results, { recursive: true });
+  atomicWriteJson(path.join(paths(state).results, 'a.json'), { id: 'a', exit: 75, reason: 'withdrawn', cancelled: false });
+  assert.equal(isWithdrawn(state, 'a'), false);
+  assert.equal(await withdrawLane(state, 'a'), 'withdrawn');
+  atomicWriteJson(path.join(paths(state).results, 'b.json'), { id: 'b', exit: 130, cancelled: true });
+  assert.equal(await withdrawLane(state, 'b'), 'not-queued', 'any other published result is not a withdrawal');
+});
+
+test('durability: the idempotent answer fsyncs the marker directory, and creating withdraw/ fsyncs its parent', async () => {
+  const { state } = freshEnv();
+  await enqueue(state, ticketOf('a'));
+  const opened = new Map();
+  const synced = [];
+  const open = fs.openSync;
+  mock.method(fs, 'openSync', (p, ...rest) => {
+    const fd = open(p, ...rest);
+    opened.set(fd, String(p));
+    return fd;
+  });
+  mock.method(fs, 'fsyncSync', (fd) => {
+    synced.push(opened.get(fd));
+  });
+  try {
+    assert.equal(await withdrawLane(state, 'a'), 'withdrawn');
+    assert.ok(synced.includes(state), `creating withdraw/ fsyncs the state root; synced: ${synced.join(', ')}`);
+    synced.length = 0;
+    assert.equal(await withdrawLane(state, 'a'), 'withdrawn');
+    assert.deepEqual(synced, [paths(state).withdraw], 'the idempotent path fsyncs the marker directory before answering');
+  } finally {
+    mock.restoreAll();
+  }
 });

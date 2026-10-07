@@ -1034,9 +1034,13 @@ async function main() {
     });
     if (!reloadFailed) clearConfigReloadWarning(root);
     if (cancelledBeforeStart || cancelRequested(root, ticket.id)) {
-      dequeueSync(root, ticket.id);
+      // BRAIN-436: a withdrawn ticket that is also cancelled must still leave the queue (retrying) and publish its
+      // cancelled result BEFORE the withdraw marker goes: that marker is what keeps `tryStart` from admitting it.
+      const alsoWithdrawn = isWithdrawn(root, ticket.id);
+      if (alsoWithdrawn) while (!dequeueSync(root, ticket.id)) await sleep(100);
+      else dequeueSync(root, ticket.id);
       touchSimArmFor(root, ticket);
-      await finalizeQueuedAndExit('cancelled');
+      await finalizeQueuedAndExit('cancelled', { forcePublish: alsoWithdrawn });
     }
     // tryStart re-reads the config again inside its lock (BRAIN-182): the
     // outer reload above can be superseded by an edit that lands in the gap
@@ -1067,8 +1071,9 @@ async function main() {
     // dequeue failed, or it crashed after the marker). Dequeue it here -- retrying the unlink -- BEFORE publishing, so the
     // published result never contradicts a ticket that is still queued. A cancel that is already pending wins.
     if (started.reason === 'withdrawn' || (started.reason === 'not-head' && started.position === null && isWithdrawn(root, ticket.id))) {
-      const cancelWon = cancelRequested(root, ticket.id);
       while (!dequeueSync(root, ticket.id)) await sleep(100);
+      // read AFTER the dequeue: the retry above can wait, and a cancel landing meanwhile must still win
+      const cancelWon = cancelRequested(root, ticket.id);
       touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit(cancelWon ? 'cancelled' : 'withdrawn', { forcePublish: cancelWon });
     }

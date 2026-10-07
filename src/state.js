@@ -156,8 +156,17 @@ export function isWithdrawn(root, id) {
 /** Write the withdraw marker for `id`, fsynced. It is the irreversible commit of a withdrawal: written under the
  *  admission lock, never removed except with the ticket's other markers, and `tryStart` refuses a ticket that has it. */
 export function writeWithdrawMarkerFile(root, id) {
-  fs.mkdirSync(paths(root).withdraw, { recursive: true });
+  const dir = paths(root).withdraw;
+  const created = !fs.existsSync(dir);
+  fs.mkdirSync(dir, { recursive: true });
+  if (created) fsyncDirectory(root);
   atomicWriteFile(withdrawMarkerPath(root, id), String(Date.now()), { fsync: true });
+}
+
+/** Make every withdraw marker's directory entry durable. A marker that exists may have been renamed in by a process that
+ *  died before its own directory fsync, so an answer that relies on one existing must call this first. */
+export function syncWithdrawMarkers(root) {
+  fsyncDirectory(paths(root).withdraw);
 }
 
 export function ensureStateDirs(root = stateHome()) {
