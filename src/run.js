@@ -72,6 +72,15 @@ function gitTreeAndRoot(cwd) {
   return { headTree: lines?.[0] || null, checkoutRoot: lines?.[1] || null };
 }
 
+/** git's toplevel is realpath'd, so the fingerprint's cwd must be too; a vanished cwd keeps its given path. */
+function realpathOr(dir) {
+  try {
+    return fs.realpathSync(dir);
+  } catch {
+    return dir;
+  }
+}
+
 function resolveWorktreeRoot(cwd) {
   return gitRevParse(cwd, '--show-toplevel');
 }
@@ -266,7 +275,7 @@ export async function runCommand({
   const remoteEligible = remoteWanted && remoteWorktreeRoot !== null;
   const localReason = localReasonFor(resolved, remoteEligible, local);
   const { headTree, checkoutRoot } = gitTreeAndRoot(cwd);
-  const cmdFingerprint = argvFingerprint(cmd, { root: checkoutRoot ?? remoteWorktreeRoot ?? cwd, tmp: process.env.TMPDIR || os.tmpdir() });
+  const cmdFingerprint = argvFingerprint(cmd, { root: checkoutRoot ?? remoteWorktreeRoot ?? cwd, cwd: realpathOr(cwd), tmp: process.env.TMPDIR || os.tmpdir() });
   const resources = resolveTicketResources({
     weight,
     cpuCores: cpuOverride ?? resolved.cpuCores,

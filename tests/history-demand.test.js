@@ -270,3 +270,13 @@ test('end to end: a real `lane run` records the persisted fingerprint, normalise
   assert.equal(hist.cmdFingerprint, argvFingerprint(['sh', '-c', 'true', `${root}/x.sh`], { root, tmp: env.TMPDIR ?? '/tmp' }));
   assert.match(hist.cmdFingerprint, /^[0-9a-f]{64}$/);
 });
+
+test('fingerprint: the execution directory is part of the workload (packages/small vs packages/heavy), pooled across worktrees', () => {
+  const a = '/Volumes/Lexar/worktrees/mono/slug-a';
+  const b = '/Volumes/Lexar/worktrees/mono/slug-b';
+  const fp = (root, rel) => argvFingerprint(['npm', 'test'], { root, cwd: rel ? `${root}/${rel}` : root });
+  assert.notEqual(fp(a, 'packages/small'), fp(a, 'packages/heavy'));
+  assert.notEqual(fp(a, 'packages/small'), fp(a, ''));
+  assert.equal(fp(a, 'packages/small'), fp(b, 'packages/small'));
+  assert.notEqual(argvFingerprint(['npm', 'test'], { root: a, cwd: '/elsewhere/x' }), argvFingerprint(['npm', 'test'], { root: a, cwd: '/elsewhere/y' }), 'outside the root keeps its path');
+});

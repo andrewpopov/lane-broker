@@ -30,14 +30,15 @@ function replacePrefix(value, prefix, token) {
 
 /**
  * The persisted command fingerprint (recorded on the ticket, lease and history row at run start): sha256 of the
- * JSON of the argv, each element with ITS OWN run's checkout root rewritten to `<repo>` and its own TMPDIR to `<tmp>`,
+ * JSON of the run's cwd (`<repo>`-relative inside the checkout, so `packages/small` and `packages/heavy` differ) and the argv, each element with ITS OWN run's checkout root rewritten to `<repo>` and its own TMPDIR to `<tmp>`,
  * and nothing else. No truncation, no join (argv boundaries survive), no pattern guessing: another repo's path, a
  * test-file argument, a flag or a number is never touched, so a focused run and a full run stay distinct workloads.
  */
-export function argvFingerprint(argv, { root, tmp }) {
+export function argvFingerprint(argv, { root, tmp, cwd = root }) {
   if (!Array.isArray(argv) || argv.length === 0 || !argv.every((a) => typeof a === 'string')) return null;
   const normalized = argv.map((a) => replacePrefix(replacePrefix(a, root, '<repo>'), tmp?.replace(/\/+$/, ''), '<tmp>'));
-  return crypto.createHash('sha256').update(JSON.stringify(normalized)).digest('hex');
+  const normalizeDir = (d) => replacePrefix(replacePrefix(d, root, '<repo>'), tmp?.replace(/\/+$/, ''), '<tmp>');
+  return crypto.createHash('sha256').update(JSON.stringify({ cwd: normalizeDir(cwd), argv: normalized })).digest('hex');
 }
 
 const repoOfKey = (key) => key.slice(0, key.lastIndexOf(':'));
