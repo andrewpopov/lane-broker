@@ -193,7 +193,9 @@ test('runner: absent fields mean medium, and the runner shell\'s own LANE_BROKER
 // ---- fallback to local: the origin is the local one, nothing added ----
 
 test('fallback to local: the local ticket enqueues with its OWN origin, the remote wait is not added on top', async () => {
-  const ctx = remoteSetup({ ssh: 'result-tamper', probeDelayMs: 1500 });
+  // A fallback needs positive never-started proof (BRAIN-437): the runner drops the session, its results are unreadable,
+  // and its remote-withdraw answers 'withdrawn' -- so the ticket falls back to the local queue.
+  const ctx = remoteSetup({ ssh: 'drop-withdrawn', probeDelayMs: 1500 });
   // hold the LOCAL queue with a full-capacity lease (a pause would also make the probe report the runner paused: the harness shares state)
   writeLease(ctx.state, { id: 'held', key: 'x:held', bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight: 4, state: LEASE_STATE.RUNNING });
   const started = await laneRun(['run', '--detach', '--lane', 'default', '--priority', 'low', '--', ...noopCmd], { env: ctx.env, cwd: ctx.repoDir });
