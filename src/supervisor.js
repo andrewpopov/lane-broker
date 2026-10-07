@@ -629,7 +629,24 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   }
 
   // BRAIN-442: a local-first ticket skips the initial dispatch and queues locally; only `tryRebind` may move it, after its wait.
-  if (enriched.localFirst && !rebind) return fallbackOrRefuse(null, 'local-first', { rebindable: true });
+  // A ticket this machine would refuse (local-refused lane, over the local budget) can never run here, so it ignores the policy.
+  if (enriched.localFirst && !rebind) {
+    const localRefusal =
+      enriched.localRefused && !enriched.allowLocalSim
+        ? localSimRefusal(enriched.lane)
+        : (() => {
+            const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host: detectResourceCapacity() });
+            return budget.ok ? null : budget;
+          })();
+    if (localRefusal) {
+      enriched.localFirst = false;
+      const line = `lane: local-first: not locally eligible (${localRefusal.message.trim()}); dispatching remote\n`;
+      process.stderr.write(line);
+      writeBrokerLog(root, line);
+    } else {
+      return fallbackOrRefuse(null, 'local-first', { rebindable: true });
+    }
+  }
 
   // Codex pre-merge finding #5: decide ELIGIBILITY before ever probing a
   // runner. `buildManifest` used to run only inside `dispatchRemote`, AFTER

@@ -17,8 +17,8 @@ const TIMEOUT = { timeout: 120_000 };
  * The harness's fake runner shares the client's broker state, so its probe would report the client's own held lease as runner
  * load. Wrap ssh so a probe always reports an idle runner with plenty of headroom (the same trick remote-rebind.test.js uses).
  */
-function localFirstSetup({ lane = { remotePolicy: 'local-first' }, rebindMs = 200 } = {}) {
-  const ctx = setup({ ssh: 'normal' });
+function localFirstSetup({ lane = { remotePolicy: 'local-first' }, rebindMs = 200, cpuAdmissionPercent } = {}) {
+  const ctx = setup({ ssh: 'normal', cpuAdmissionPercent });
   const binDir = ctx.env.PATH.split(path.delimiter)[0];
   fs.renameSync(path.join(binDir, 'ssh'), path.join(binDir, 'ssh-real'));
   fs.writeFileSync(
@@ -33,6 +33,7 @@ if ((argv[argv.length - 1] || '').includes('remote-probe')) {
   p.queued = 0;
   p.running = 0;
   p.headroom = { cpuCores: 64, memoryBytes: 1e12 };
+  p.capacity = { ...p.capacity, cpuCores: 64, memoryBytes: 1e12 };
   process.stdout.write(JSON.stringify(p) + '\\n');
   process.exit(res.status == null ? 1 : res.status);
 }
@@ -125,6 +126,27 @@ test('a lane without remotePolicy still dispatches remote-first', TIMEOUT, async
   assert.equal(result.executor, 'remote');
   assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
   assert.ok(probeCount(ctx.probeLogPath) > 0);
+});
+
+test('a local-first lane the machine refuses (localRefused) dispatches remote at once, not exit 69', TIMEOUT, async () => {
+  const ctx = localFirstSetup({ lane: { remotePolicy: 'local-first', localRefused: true } });
+  const marker = path.join(tmpDir('lf-marker'), 'm');
+  const id = await submit(ctx, marker);
+  const result = await finish(ctx, id);
+  assert.equal(result.executor, 'remote');
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
+  assert.match(admissionLog(ctx), /local-first: not locally eligible .*dispatching remote/);
+});
+
+test('a local-first ticket over the local resource budget dispatches remote at once, not exit 64', TIMEOUT, async () => {
+  // the client's own CPU budget is ~0.1 core; the runner's broker (a separate home) has no such cap
+  const ctx = localFirstSetup({ lane: { remotePolicy: 'local-first', cpuCores: 2 }, cpuAdmissionPercent: 1 });
+  const marker = path.join(tmpDir('lf-marker'), 'm');
+  const id = await submit(ctx, marker);
+  const result = await finish(ctx, id);
+  assert.equal(result.executor, 'remote');
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
+  assert.match(admissionLog(ctx), /local-first: not locally eligible/);
 });
 
 test('config: remotePolicy and localFirstWaitMs validate, and the global default is 90000', () => {
