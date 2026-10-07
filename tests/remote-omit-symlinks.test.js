@@ -71,6 +71,13 @@ test('the ancestor-is-a-symlink refusal is not an escape the flag can omit', () 
   );
 });
 
+test('an absolute-target link under a symlinked ancestor still refuses as an ancestor, never as an omittable absolute', () => {
+  assert.throws(
+    () => checkSymlinkEscape('d/link', '/outside', new Set(['d', 'd/link'])),
+    (e) => e instanceof RemoteIneligibleError && e.reason === 'symlink target escapes root (ancestor is a symlink)',
+  );
+});
+
 test('runner side: extraction rejects an escaping symlink that arrives in a manifest, flag or no flag', async () => {
   const entries = [{ path: 'evil', type: 'symlink', target: '../../../../etc/passwd' }];
   const manifest = { entries, manifestHash: manifestHashOf(entries) };

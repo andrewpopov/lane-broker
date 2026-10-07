@@ -135,8 +135,6 @@ const OMITTABLE_REASONS = new Set([ABSOLUTE_TARGET_REASON, ESCAPES_ROOT_REASON])
  * an out-of-root escape OR a walk that passes through another symlink entry.
  */
 export function checkSymlinkEscape(relPath, target, symlinkPaths) {
-  if (path.isAbsolute(target)) throw new RemoteIneligibleError(ABSOLUTE_TARGET_REASON, relPath);
-
   const dirSegs = path.posix.dirname(relPath) === '.' ? [] : path.posix.dirname(relPath).split('/');
 
   // "the path walked to reach it": relPath's own ancestor directories.
@@ -147,6 +145,8 @@ export function checkSymlinkEscape(relPath, target, symlinkPaths) {
       throw new RemoteIneligibleError('symlink target escapes root (ancestor is a symlink)', relPath);
     }
   }
+  // After the ancestor check (BRAIN-334 review): an absolute target is omittable, a symlinked ancestor never is.
+  if (path.isAbsolute(target)) throw new RemoteIneligibleError(ABSOLUTE_TARGET_REASON, relPath);
 
   const stack = [...dirSegs];
   for (const part of target.split('/')) {
