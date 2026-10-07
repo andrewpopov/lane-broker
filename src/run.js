@@ -492,6 +492,7 @@ export async function runCommand({
       remoteSetup: resolved.remoteSetup,
       remoteDepsCache: resolved.remoteDepsCache,
       remoteDepsCacheRootScriptsSafe: resolved.remoteDepsCacheRootScriptsSafe,
+      remoteOmitEscapingSymlinks: resolved.remoteOmitEscapingSymlinks,
       remoteArtifacts: resolved.remoteArtifacts,
       remoteArtifactsOn: resolved.remoteArtifactsOn,
     };

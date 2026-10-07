@@ -112,6 +112,15 @@ function validatePathShape(relPath) {
 }
 
 /**
+ * BRAIN-334: the two refusals that only say "this link points outside the snapshot". They are the ONLY ones a lane's
+ * `remoteOmitEscapingSymlinks` may turn into an omission; the ancestor / passes-through refusals below are
+ * protocol-safety checks and always refuse.
+ */
+const ABSOLUTE_TARGET_REASON = 'symlink target is absolute';
+const ESCAPES_ROOT_REASON = 'symlink target escapes root';
+const OMITTABLE_REASONS = new Set([ABSOLUTE_TARGET_REASON, ESCAPES_ROOT_REASON]);
+
+/**
  * Lexical (no realpath) escape check: walk `target`, resolved relative to the
  * directory containing `relPath`, one component at a time (rather than a
  * single `path.normalize`), so a `..` cannot silently cancel out a component
@@ -125,8 +134,8 @@ function validatePathShape(relPath) {
  * walked target are checked against it). Throws `RemoteIneligibleError` for
  * an out-of-root escape OR a walk that passes through another symlink entry.
  */
-function checkSymlinkEscape(relPath, target, symlinkPaths) {
-  if (path.isAbsolute(target)) throw new RemoteIneligibleError('symlink target is absolute', relPath);
+export function checkSymlinkEscape(relPath, target, symlinkPaths) {
+  if (path.isAbsolute(target)) throw new RemoteIneligibleError(ABSOLUTE_TARGET_REASON, relPath);
 
   const dirSegs = path.posix.dirname(relPath) === '.' ? [] : path.posix.dirname(relPath).split('/');
 
@@ -143,7 +152,7 @@ function checkSymlinkEscape(relPath, target, symlinkPaths) {
   for (const part of target.split('/')) {
     if (part === '' || part === '.') continue;
     if (part === '..') {
-      if (stack.length === 0) throw new RemoteIneligibleError('symlink target escapes root', relPath);
+      if (stack.length === 0) throw new RemoteIneligibleError(ESCAPES_ROOT_REASON, relPath);
       stack.pop();
       continue;
     }
@@ -197,8 +206,13 @@ function parsePathList(buf) {
  * disk, each hashed/typed. Throws `RemoteIneligibleError` for anything a
  * caller must treat as "fall back to local" (gitlinks, escaping symlinks,
  * special files, denylisted secret paths, malformed paths).
+ *
+ * `omitEscapingSymlinks` (BRAIN-334, a lane's `remoteOmitEscapingSymlinks`): a symlink whose target points outside
+ * the root (relative escape, or absolute) is left out of the manifest instead of making the tree ineligible; the
+ * omitted paths come back as `omittedSymlinks` (present only when something was omitted). Nothing else is relaxed.
+ * The runner's extraction re-validates whatever arrives and never learns of this option.
  */
-export function buildManifest(worktreeRoot) {
+export function buildManifest(worktreeRoot, { omitEscapingSymlinks = false } = {}) {
   const root = path.resolve(worktreeRoot);
   const env = scrubbedGitEnv();
   const common = { cwd: root, env, encoding: 'buffer', maxBuffer: 1024 * 1024 * 256 };
@@ -245,12 +259,23 @@ export function buildManifest(worktreeRoot) {
   // against the FULL set of symlink paths, not path-by-path as each is
   // discovered in `git ls-files` order.
   const symlinkPaths = new Set(rawEntries.filter((e) => e.type === 'symlink').map((e) => e.path));
+  const kept = [];
+  const omittedSymlinks = [];
   for (const e of rawEntries) {
-    if (e.type === 'symlink') checkSymlinkEscape(e.path, e.target, symlinkPaths);
+    if (e.type === 'symlink') {
+      try {
+        checkSymlinkEscape(e.path, e.target, symlinkPaths);
+      } catch (err) {
+        if (!(omitEscapingSymlinks && err instanceof RemoteIneligibleError && OMITTABLE_REASONS.has(err.reason))) throw err;
+        omittedSymlinks.push(e.path);
+        continue;
+      }
+    }
+    kept.push(e);
   }
 
-  const entries = sortEntries(rawEntries).map(canonicalizeEntry);
-  return { entries, manifestHash: manifestHashOf(entries) };
+  const entries = sortEntries(kept).map(canonicalizeEntry);
+  return { entries, manifestHash: manifestHashOf(entries), ...(omittedSymlinks.length > 0 ? { omittedSymlinks: omittedSymlinks.sort(comparePaths) } : {}) };
 }
 
 function walkDir(root, ignoreRootGit) {

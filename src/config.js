@@ -529,7 +529,7 @@ function validateRepoConfig(cfg, sourcePath) {
     if (lane.localFirstWaitMs !== undefined) {
       assert(Number.isInteger(lane.localFirstWaitMs) && lane.localFirstWaitMs >= 0, `${sourcePath}: lane "${name}".localFirstWaitMs must be a non-negative integer`);
     }
-    for (const field of ['remoteDepsCache', 'remoteDepsCacheRootScriptsSafe']) {
+    for (const field of ['remoteDepsCache', 'remoteDepsCacheRootScriptsSafe', 'remoteOmitEscapingSymlinks']) {
       if (lane[field] !== undefined) assert(typeof lane[field] === 'boolean', `${sourcePath}: lane "${name}".${field} must be a boolean`);
     }
   }
@@ -827,7 +827,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   if (isDeclaredLane) {
     laneCfg = repoConfig.lanes[laneName];
   } else if (undeclaredTemplateName) {
-    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/noProgressTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteArtifacts/remoteArtifactsOn/class/priority/aging
+    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/noProgressTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteOmitEscapingSymlinks/remoteArtifacts/remoteArtifactsOn/class/priority/aging
     // from the named declared lane, keeping this lane's OWN key/name. Not
     // inherited: `localRefused` (stays default false), the template's named
     // conflicts (only the `*` wildcard universe below reaches this lane, same
@@ -848,6 +848,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       remotePolicy: templateCfg.remotePolicy,
       localFirstWaitMs: templateCfg.localFirstWaitMs,
       remoteDepsCacheRootScriptsSafe: templateCfg.remoteDepsCacheRootScriptsSafe,
+      remoteOmitEscapingSymlinks: templateCfg.remoteOmitEscapingSymlinks,
       remoteArtifacts: templateCfg.remoteArtifacts,
       remoteArtifactsOn: templateCfg.remoteArtifactsOn,
       class: templateCfg.class,
@@ -913,6 +914,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     remoteDepsCache: laneCfg.remoteDepsCache !== false,
     // BRAIN-389: true declares this lane's root install/prepare scripts leave node_modules alone, so a cached tree is safe.
     remoteDepsCacheRootScriptsSafe: laneCfg.remoteDepsCacheRootScriptsSafe === true,
+    // BRAIN-334: true leaves a tracked symlink that points outside the repo out of the remote snapshot instead of making the lane ineligible.
+    remoteOmitEscapingSymlinks: laneCfg.remoteOmitEscapingSymlinks === true,
     // BRAIN-398: files a remote run returns to the submitter's worktree; ignored by a local run (they are already there).
     remoteArtifacts: Array.isArray(laneCfg.remoteArtifacts) ? laneCfg.remoteArtifacts : null,
     remoteArtifactsOn: laneCfg.remoteArtifactsOn === 'always' ? 'always' : 'success',

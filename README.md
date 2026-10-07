@@ -279,7 +279,7 @@ form: an undeclared `--lane` name still keeps its own key and name (the
 same-key exclusivity rule above is unaffected — two sessions using the same
 ad-hoc name still conflict with each other), but instead of the no-config-file
 default it inherits `weight`, `cpuCores`, `minCpuCores`, `memoryBytes`, `nice`, `remote`,
-`remoteDeps`, `remoteSetup`, `remoteArtifacts` and `remoteArtifactsOn` from the named declared lane. It does NOT
+`remoteDeps`, `remoteSetup`, `remoteOmitEscapingSymlinks`, `remoteArtifacts` and `remoteArtifactsOn` from the named declared lane. It does NOT
 inherit that lane's own named `conflicts` entries or its `maxConcurrent`
 (stays `1`) — only the `*` wildcard universe still reaches it, same as plain
 `"allow"`. The named lane must be declared and must not be `localRefused`.
@@ -512,6 +512,19 @@ gate usually does) or declares them (below).
   safe despite them.
 - `remoteSetup`: argv arrays run in the repo root after deps, before the
   command.
+- `remoteOmitEscapingSymlinks` (BRAIN-334): `true` leaves a tracked symlink
+  whose target points outside the repo root (a relative target that climbs
+  above it, or any absolute target) out of the snapshot instead of making the
+  lane ineligible. Default `false`: such a link keeps the lane local, exactly
+  as before. Only those two plain escapes are omitted; a link whose ancestor is
+  a symlink, or whose target walks through another symlink entry, still
+  refuses. Use it only when the lane's command tolerates the links being absent
+  (an agent-brain-style repo whose `projects/*` mirrors point at sibling
+  repos). The omission is submitter-side only: the runner never sees the flag
+  and still rejects any escaping symlink that arrives in a manifest. Omitted
+  paths are logged (`lane: remote snapshot omits N symlink(s) ...`, first 10
+  names) and recorded on the history row as `remoteOmittedSymlinks` (count) and
+  `remoteOmittedSymlinkNames`. Inherited through `undeclaredLanes.as`.
 
 Both apply only when the lane runs remotely; a local run (including a
 fallback) uses the local worktree as it is. A lane with either option
@@ -1036,6 +1049,7 @@ additive: readers must ignore unknown keys and tolerate absent ones.
 | `depsCache`, `depsMs` | remote deps phase outcome (`hit`/`miss`/`skip`) and wall time |
 | `remotePhasesMs` | remote runs: `uploadMs` (submitter writing the snapshot), `snapshotMs` (runner receive + verify), `setupMs` (deps + setup), `commandMs`, `artifactsMs` (runner collection), `artifactReturnMs` (submitter fetching them back). Each present only when measured |
 | `remoteArtifacts`, `remoteArtifactsWarning` | returned artifact names / why they were not |
+| `remoteOmittedSymlinks`, `remoteOmittedSymlinkNames` | remote runs with `remoteOmitEscapingSymlinks`: how many escaping symlinks the snapshot left out, and the first 10 paths |
 | `priorityRequested`, `priorityAdmitted`, `priorityDemoted`, `effectiveRankAtStart`, `scoreAtStart` | priority audit (admitted tickets only) |
 | `dequeuedDeadSupervisor` | marks a row for a queued ticket whose supervisor died (`exit: null`, `signal: null`) |
 

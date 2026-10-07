@@ -40,6 +40,7 @@ import { observedLeaseFields, summarizeObservedCpu, sanitizeObservedCpu, sanitiz
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
 const CANCEL_GRACE_MS = 10_000;
 const GROUP_REAPED_REASON = 'leader-exited-group-reaped';
+const MAX_OMITTED_SYMLINKS_LISTED = 10;
 
 function readTicketFromEnv() {
   const raw = process.env.LANE_BROKER_TICKET;
@@ -659,10 +660,18 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // comment).
   let manifest;
   try {
-    manifest = buildManifest(enriched.remote.worktreeRoot);
+    manifest = buildManifest(enriched.remote.worktreeRoot, { omitEscapingSymlinks: enriched.remote.remoteOmitEscapingSymlinks === true });
   } catch (err) {
     if (!(err instanceof RemoteIneligibleError)) throw err;
     return fallbackOrRefuse(null, err.message);
+  }
+  const omittedSymlinks = manifest.omittedSymlinks ?? [];
+  if (omittedSymlinks.length > 0) {
+    const shown = omittedSymlinks.slice(0, MAX_OMITTED_SYMLINKS_LISTED);
+    const more = omittedSymlinks.length > shown.length ? `, +${omittedSymlinks.length - shown.length} more` : '';
+    const line = `lane: remote snapshot omits ${omittedSymlinks.length} symlink(s) pointing outside the repo: ${shown.join(', ')}${more}\n`;
+    process.stderr.write(line);
+    writeBrokerLog(root, line);
   }
 
   // BRAIN-320 S1a: client-side remoteDeps eligibility (1c), run right
@@ -829,7 +838,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
         beforeWithdraw: async ({ from, to }) => {
           let unchanged = false;
           try {
-            unchanged = buildManifest(enriched.remote.worktreeRoot).manifestHash === manifest.manifestHash;
+            unchanged = buildManifest(enriched.remote.worktreeRoot, { omitEscapingSymlinks: enriched.remote.remoteOmitEscapingSymlinks === true }).manifestHash === manifest.manifestHash;
           } catch {
             // ineligible now: it changed
           }
@@ -937,6 +946,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       ...relayedPhases(dispatch),
       ...rebalanceFields(),
       ...artifactFields,
+      ...(omittedSymlinks.length > 0 ? { remoteOmittedSymlinks: omittedSymlinks.length, remoteOmittedSymlinkNames: omittedSymlinks.slice(0, MAX_OMITTED_SYMLINKS_LISTED) } : {}),
       ...(noProgress ? { reason: NO_PROGRESS_REASON, noProgressTimeoutMs: dispatch.result.noProgressTimeoutMs } : {}),
       remoteKind: dispatch.result.kind,
       remotePhase: dispatch.phase ?? null,

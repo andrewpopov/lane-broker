@@ -733,6 +733,7 @@ export async function dispatchRemote(opts) {
     // BRAIN-398: the lane's declared artifact paths/globs and policy (null: none, or the runner cannot return them),
     // and the submitter's own caps on what it will accept back.
     remoteArtifacts = null,
+    remoteOmitEscapingSymlinks = false,
     remoteArtifactsOn = 'success',
     artifactLimits,
     // BRAIN-320 S1d: opt-in, from the CLIENT machine's global config
@@ -789,7 +790,7 @@ export async function dispatchRemote(opts) {
   let manifest = prebuiltManifest;
   if (!manifest) {
     try {
-      manifest = buildManifest(worktreeRoot);
+      manifest = buildManifest(worktreeRoot, { omitEscapingSymlinks: remoteOmitEscapingSymlinks });
     } catch (err) {
       if (err instanceof RemoteIneligibleError) return { outcome: 'ineligible', reason: err.message, neverStarted: true };
       throw err;
