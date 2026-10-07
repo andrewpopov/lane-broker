@@ -455,7 +455,8 @@ and always reports `130`, whatever the command exited with.
 The same rule decides a local run, including one that fell back from a runner:
 a cancel the supervisor acted on (it saw the marker or a signal while the child
 ran) reports `130`; a `lane cancel` that lands after the child has ended does
-not change its result.
+not change its result. A cancel that lands between admission and the child's start counts as acted on: the child is
+reaped at once and the run reports `130`.
 
 A remote run takes no local capacity or resource reservation. `lane status`
 lists it under REMOTE; if its supervisor dies it shows as ORPHANED-REMOTE
@@ -1527,7 +1528,8 @@ symlinks.
 - `LANE_BROKER_TEST_HOLD_AT=local-finalize` (with `LANE_BROKER_TEST_HOLD_READY` and
   `LANE_BROKER_TEST_HOLD_GO`) — a local supervisor pauses after its child has ended and its
   output is drained, before writing the result, so a test can land a `lane cancel` in that
-  window (BRAIN-364: it must not change the child's own outcome).
+  window (BRAIN-364: it must not change the child's own outcome). `local-admitted` pauses after admission,
+  before the spawn, to land a cancel there instead.
 
 ## `lane-store` (BRAIN-407, unified queue P0b)
 

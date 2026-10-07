@@ -116,3 +116,25 @@ test('BRAIN-364: a cancel landing after the child exited 0 leaves the result exi
   assert.equal(result.cancelled, undefined);
   assert.equal(isCancelled(ctx.state, id), false, 'marker cleaned up');
 });
+
+test('BRAIN-364: a cancel landing between admission and spawn publishes 130, releases the lease and clears the marker', async () => {
+  const ctx = setup();
+  const dir = path.dirname(ctx.state);
+  const ready = path.join(dir, 'b364a-ready');
+  const go = path.join(dir, 'b364a-go');
+  const env = { ...ctx.env, LANE_BROKER_TEST_HOLD_AT: 'local-admitted', LANE_BROKER_TEST_HOLD_READY: ready, LANE_BROKER_TEST_HOLD_GO: go };
+  const detached = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', 'bash', '-c', 'exit 0'], { env, cwd: ctx.repoDir });
+  assert.equal(detached.code, 0, detached.stderr);
+  const id = detached.stderr.match(/detached (\S+?);/)?.[1];
+  assert.ok(id, `no id in: ${detached.stderr}`);
+  await waitFor(() => fs.existsSync(ready), { timeoutMs: 15_000 });
+  const cancel = laneRun(['cancel', id], { env: ctx.env, cwd: ctx.repoDir });
+  await waitFor(() => isCancelled(ctx.state, id), { timeoutMs: 15_000 });
+  fs.writeFileSync(go, 'x');
+  await cancel;
+  const result = readJsonSafe(path.join(paths(ctx.state).results, `${id}.json`));
+  assert.equal(result.exit, 130);
+  assert.equal(result.cancelled, true);
+  assert.equal(readLease(ctx.state, id), null, 'lease released');
+  assert.equal(isCancelled(ctx.state, id), false, 'marker cleaned up');
+});

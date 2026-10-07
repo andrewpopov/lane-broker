@@ -204,6 +204,28 @@ test('BRAIN-364: a cancel landing after a fallback child exited 0 leaves the res
   assert.equal(isCancelled(state, id), false, 'marker cleaned up');
 });
 
+test('BRAIN-364: a cancel landing between admission and spawn of a fallback ticket publishes 130 and removes the attempt record', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'down' });
+  const dir = tmpDir('b364a');
+  const ready = path.join(dir, 'ready');
+  const go = path.join(dir, 'go');
+  const holdEnv = { ...env, LANE_BROKER_TEST_HOLD_AT: 'local-admitted', LANE_BROKER_TEST_HOLD_READY: ready, LANE_BROKER_TEST_HOLD_GO: go };
+  const started = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(path.join(dir, 'where'), 0)], { env: holdEnv, cwd: repoDir });
+  assert.equal(started.code, 0, started.stderr);
+  const id = started.stdout.trim();
+  await waitFor(() => fs.existsSync(ready), { timeoutMs: 30_000 });
+  const cancel = laneRun(['cancel', id], { env, cwd: repoDir });
+  await waitFor(() => isCancelled(state, id), { timeoutMs: 15_000 });
+  fs.writeFileSync(go, 'x');
+  await cancel;
+  const result = resultOf(state, id);
+  assert.equal(result.exit, 130);
+  assert.equal(result.cancelled, true);
+  assert.equal(result.executor, 'local');
+  assert.equal(readAttempt(state, id), null, 'attempt record removed');
+  assert.equal(isCancelled(state, id), false, 'marker cleaned up');
+});
+
 // ---- Codex pre-merge BLOCKER #2: drain-then-publish, real async drain ----
 
 test('SIGINT during the post-completion drain of a remote success still reports 130, never the child\'s own 0', async () => {
