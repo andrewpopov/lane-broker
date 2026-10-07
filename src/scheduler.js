@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, writeExpireMarkerFile, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, writeExpireMarkerFile, isWithdrawn, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
 import { sampleAndUpdateGate, readGateState } from './load.js';
 import { patchAttemptLocked, readAttempt } from './attempts.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
@@ -951,6 +951,11 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     const position = queue.findIndex((t) => t && t.id === ticket.id);
     if (position === -1) {
       return { result: { started: false, reason: 'not-head', position: null, queueLength: queue.length } };
+    }
+    // BRAIN-436: a withdrawn ticket is never admitted, even if its queue file is still on disk (the withdraw marker, not
+    // the dequeue, is the commit). Under the same lock the withdraw decides in.
+    if (isWithdrawn(root, ticket.id)) {
+      return { result: { started: false, reason: 'withdrawn' } };
     }
     // BRAIN-320 S1d: opt-in queue timeout for a remote ticket -- decided here,
     // right after `position` is resolved and BEFORE any selection/gate logic,

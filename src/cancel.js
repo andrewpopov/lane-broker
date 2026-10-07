@@ -77,10 +77,15 @@ async function cancelAttempt(root, id, attempt) {
       // race: supervisor just exited
     }
     const deadline = Date.now() + GRACE_MS + 5000;
-    while (Date.now() < deadline && readAttempt(root, id)) {
+    while (Date.now() < deadline && readAttempt(root, id) && supervisorAlive(readAttempt(root, id))) {
       await sleep(100);
     }
     const stillHeld = readAttempt(root, id);
+    if (stillHeld && !supervisorAlive(stillHeld)) {
+      // The supervisor exited on purpose and kept the record: the runner never confirmed the cancel.
+      process.stderr.write(`lane cancel: ${id} is still held: ${stillHeld.unresolved ?? 'its remote cancel was not confirmed'}; retry lane cancel once the runner is reachable\n`);
+      return { exitCode: 1 };
+    }
     if (stillHeld) {
       process.stderr.write(
         `lane cancel: supervisor ${attempt.supervisor.pid} did not release ${id} within the grace period; ` +
@@ -95,11 +100,23 @@ async function cancelAttempt(root, id, attempt) {
   // ORPHANED-REMOTE: reconcile directly, no supervisor left to do it.
   writeCancelMarkerFile(root, id);
   const globalCfg = loadGlobalConfig();
-  const runnerCfg = (globalCfg.runners || []).find((r) => r.name === attempt.runner);
-  if (runnerCfg) {
-    await remoteCancel(runnerCfg, id);
-  } else if (attempt.runner) {
-    process.stderr.write(`lane cancel: runner "${attempt.runner}" is no longer configured; skipping remote-cancel\n`);
+  // BRAIN-436: a move that was in flight may have left the ticket on either runner, so every runner it names is cancelled.
+  const involved = [...new Set([attempt.runner, attempt.moving?.from, attempt.moving?.to].filter(Boolean))];
+  const unconfirmed = [];
+  for (const name of involved) {
+    const runnerCfg = (globalCfg.runners || []).find((r) => r.name === name);
+    if (!runnerCfg) {
+      process.stderr.write(`lane cancel: runner "${name}" is no longer configured; skipping remote-cancel\n`);
+      unconfirmed.push(name);
+    } else if (!(await remoteCancel(runnerCfg, id))) {
+      unconfirmed.push(name);
+    }
+  }
+  // A possibly-live ticket (a stranded move, or one that could not be proven unstarted) is only forgotten once every runner it
+  // names has confirmed -- or proven the ticket absent and tombstoned it. Otherwise the record stays, so it can be cancelled again.
+  if ((attempt.moving || attempt.unresolved) && unconfirmed.length > 0) {
+    process.stderr.write(`lane cancel: ${id} is still held: remote-cancel not confirmed on ${unconfirmed.join(', ')}; retry lane cancel once reachable\n`);
+    return { exitCode: 1 };
   }
 
   const resultPath = path.join(paths(root).results, `${id}.json`);

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { ensureStateDirs, paths, readJsonSafe } from './state.js';
 import { readLease, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
-import { readAttempt, supervisorAlive } from './attempts.js';
+import { readAttempt, supervisorAlive, moveInterruptedLabel } from './attempts.js';
 import { cancelCommand } from './cancel.js';
 
 function sleep(ms) {
@@ -106,7 +106,8 @@ export async function waitCommand(id, { timeoutMs } = {}) {
         // if it's genuinely gone from everywhere).
         const settledAttempt = readAttempt(root, id);
         if (settledAttempt && !supervisorAlive(settledAttempt)) {
-          const label = settledAttempt.executor === 'remote' ? 'ORPHANED-REMOTE' : 'ORPHANED (post-fallback)';
+          const moveLabel = moveInterruptedLabel(id, settledAttempt);
+          const label = moveLabel ?? (settledAttempt.executor === 'remote' ? 'ORPHANED-REMOTE' : 'ORPHANED (post-fallback)');
           process.stderr.write(
             `lane wait: ${id} is ${label} (runner ${settledAttempt.runner ?? 'unknown'}) -- its supervisor is gone and nothing ` +
               `will ever produce a result; reconcile with: lane cancel ${id}\n`,

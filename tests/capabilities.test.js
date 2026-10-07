@@ -14,7 +14,7 @@ test('lane capabilities --json: legacy scheduler, shadow admission by default fi
   assert.equal(res.status, 0, res.stderr);
   const out = JSON.parse(res.stdout);
   assert.match(out.version, /^\d+\.\d+\.\d+$/);
-  for (const c of ['elastic-claims/1', 'priority/1', 'artifacts/1', 'sim-safe-backfill/1', 'lane-aging/1', 'group-reap/1']) {
+  for (const c of ['elastic-claims/1', 'priority/1', 'artifacts/1', 'sim-safe-backfill/1', 'lane-aging/1', 'group-reap/1', 'remote-withdraw/1']) {
     assert.ok(out.capabilities.includes(c), `missing ${c}`);
   }
   assert.equal(out.schedulerMode, 'legacy');

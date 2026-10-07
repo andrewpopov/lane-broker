@@ -677,6 +677,58 @@ the compiler and python versions (a toolchain or library upgrade that keeps
 the same versions); clear `<root>/deps-cache` after a runner OS or toolchain
 change that those do not reflect.
 
+### Cross-runner rebalance (BRAIN-436)
+
+A ticket that has sat **queued** on its runner past `remoteRebalanceMinQueuedMs` is taken back and sent to a runner that has
+room now. Only a ticket the runner has not admitted moves: nothing has run, so no deps, setup or command ran on the first
+runner, and an admitted ticket never moves. It needs the runner's `remote-withdraw/1` capability (a runner without it is
+never asked, and `remote-cancel` is never used in its place).
+
+Global config (the submitter's), all integers in milliseconds except the cap:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `remoteRebalanceMinQueuedMs` | `300000` | queued this long on the runner before a move is considered; `0` disables rebalancing |
+| `remoteRebalanceIntervalMs` | `60000` | how often the submitter looks at the runner while it waits (> 0) |
+| `remoteRebalanceCooldownMs` | `600000` | the minimum gap between two moves of one ticket |
+| `remoteRebalanceMaxMoves` | `1` | how many times one ticket may move |
+
+**How a move goes.** The submitter picks the destination with the same probe dispatch uses, excluding the current runner and
+every runner the ticket already left, and requires an empty queue and a *measured* free-CPU figure for the ticket (an unknown
+measurement is no room). It then checks the worktree is still what was snapshotted (a changed tree is never moved),
+records `moving: {from, to, phase: 'withdrawing'}` on the attempt, and runs `lane remote-withdraw` on the runner. That is one
+irreversible decision taken under the runner's admission lock, so the ticket is withdrawn **or** admitted, never both. Only a
+`withdrawn` answer, or the runner's own bound `unfinished/withdrawn` record fetched after a lost reply, counts as proof; every
+other answer (started, cancelled, unknown) leaves the ticket where it is. On proof the attempt becomes
+`moving.phase: 'dispatching'`, the dispatch is repeated to the new runner with the same ticket id and generation, and
+`lane: remote-rebalance: <id>: A -> B (queued Ns on A; B X cores free)` goes to stderr and the admission log. `waitedMs` includes
+the wait on the first runner, and the result and history row carry `rebalancedFrom`, `rebalancedAt`, `rebalanceReason` and
+`moves` (the count).
+
+**Guarantees.** The job never runs twice. If the submitter dies mid-move the attempt keeps its `moving` record: `lane wait` and
+`lane status` report `MOVE-INTERRUPTED <id> withdrawn from <A>` instead of a generic orphan, and `lane cancel` cancels on every
+runner the move names and clears it. Nothing resumes a stranded move automatically.
+
+**Which runners are destinations.** A runner entry may set `"rebalanceTarget": false` (boolean, default `true`) to opt out of
+receiving moved tickets. Free cores are a poor measure of lane capacity on a runner whose other workloads outweigh lanes (a
+runner that runs simulations at a higher `CPUWeight` than lanes, deliberately), so such a runner should not look like the idle
+one. It still runs tickets dispatched to it normally.
+
+**A dispatch that may be live is never forgotten, and never re-run.** If the connection drops after a runner may have accepted
+the job and nothing proves it never started (no `withdrawn` answer, no bound `unfinished`/`rejected` record), the ticket is not
+run locally either. Its attempt is kept (`unresolved`) and reported by `lane status`/`lane wait` as `ORPHANED-REMOTE`, or
+`MOVE-INTERRUPTED` while a move is recorded. `lane cancel` removes it only once every runner it names has confirmed the cancel
+(or proven the ticket absent: a `remote-cancel`/`remote-withdraw` for a ticket the runner has not seen leaves a tombstone, and a
+later `remote-exec` for that id is refused). The one exception is the result-wait expiry (BRAIN-363, `remoteResultWaitMs`): it
+cancels the remote command and confirms that before any local retry, so the retry is sequential, not a concurrent second run.
+
+**Herd avoidance is best-effort.** Several tickets can still choose the same idle runner in the same interval: the destination is
+not reserved, only the runner's probe (which counts reserved cores at once) limits the pile-up. The cap, the cooldown and
+the no-revisit rule keep a ticket from bouncing.
+
+Lineage: this is requeueing of *pending* work as in Slurm (a requeue only for a job that has not started) and Kueue, and
+work-stealing restricted to tasks that have not started; a started task is never stolen.
+
 ### Returning files from a remote run (BRAIN-398)
 
 A gate that leaves a stamp for a later check (a lane stamp, a report) writes it on the runner, not in your worktree. List

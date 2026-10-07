@@ -520,6 +520,7 @@ test('remote-probe advertises elastic-claims/1', () => {
     'sim-safe-backfill/1',
     'lane-aging/1',
     'group-reap/1',
+    'remote-withdraw/1',
   ]);
 });
 
