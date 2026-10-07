@@ -747,7 +747,7 @@ export function findRepoConfigPath(cwd, gitCommonDir, configRoot) {
 export function loadRepoConfig(cwd, configRoot) {
   const commonDir = repoIdentity(cwd);
   const configPath = findRepoConfigPath(cwd, commonDir, configRoot);
-  if (!configPath) return { ...DEFAULT_REPO_CONFIG, declared: false };
+  if (!configPath) return { ...DEFAULT_REPO_CONFIG, fileLanes: DEFAULT_REPO_CONFIG.lanes, declared: false };
   let parsed;
   try {
     parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
@@ -762,7 +762,8 @@ export function loadRepoConfig(cwd, configRoot) {
     lanes: { ...DEFAULT_REPO_CONFIG.lanes, ...(parsed.lanes || {}) },
   };
   validateRepoConfig(cfg, configPath);
-  return { ...cfg, declared: true };
+  // `lanes` has the built-in `default` merged in; `fileLanes` is only what the file itself declared (BRAIN-448).
+  return { ...cfg, fileLanes: parsed.lanes || {}, declared: true };
 }
 
 /** Expand conflict pairs (with `*` wildcard) into a symmetric adjacency map of laneName -> Set<laneName>. */
@@ -806,7 +807,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   // that the same repo+lane always maps to the same lease key.
   const repoId = repoIdentityOverride ? sanitizeKey(repoIdentityOverride) : sanitizeKey(commonDir || repo || cwd);
   const laneName = lane || 'default';
-  const isDeclaredLane = Object.prototype.hasOwnProperty.call(repoConfig.lanes, laneName);
+  const hasLane = (lanes) => Object.prototype.hasOwnProperty.call(lanes, laneName);
   // BRAIN-325: {"as": "<declared lane>"} is an allow form that additionally
   // names a template lane to inherit sizing/remote settings from.
   const undeclaredTemplateName =
@@ -814,6 +815,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       ? repoConfig.undeclaredLanes.as
       : null;
   const undeclaredAllowed = repoConfig.undeclaredLanes === 'allow' || undeclaredTemplateName !== null;
+  // BRAIN-448: the built-in `default` counts as declared unless the file has a template to resolve it through.
+  const isDeclaredLane = hasLane(repoConfig.fileLanes) || (hasLane(repoConfig.lanes) && undeclaredTemplateName === null);
   if (repoConfig.declared && !isDeclaredLane && !undeclaredAllowed) {
     const declared = Object.keys(repoConfig.lanes).sort().join(', ');
     throw new ConfigError(`unknown lane "${laneName}"; declared: ${declared}`);
