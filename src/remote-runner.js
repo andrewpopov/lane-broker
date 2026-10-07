@@ -293,6 +293,19 @@ function cleanupWork(workDir, tmpDir) {
  * dispatch path; bounded per run and removed in a detached `rm`, so the submitter's ssh session never waits on it. A failure
  * (lock timeout, bad config) is logged to the broker log and never affects the ticket.
  */
+/** Is `id` queued, leased or attempted in the broker at `brokerRoot`? Call under the broker lock for an answer that cannot change under you. */
+function isRegisteredInBroker(brokerRoot, id) {
+  return Boolean(readLease(brokerRoot, id)) || Boolean(readAttempt(brokerRoot, id)) || listQueue(brokerRoot).some((t) => t && t.id === id);
+}
+
+function readTrimmed(file) {
+  try {
+    return fs.readFileSync(file, 'utf8').trim();
+  } catch {
+    return null;
+  }
+}
+
 async function collectGarbage(root) {
   try {
     await testHoldAt('remote-gc');
@@ -566,8 +579,14 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     // is ever spawned (run.js's own hook point) -- this is what makes
     // "remote-id exists" and "the child could have started" the same fact.
     onTicketCreated: async (id) => {
-      atomicWriteFile(path.join(ticketDir, 'remote-id'), id);
-      if (fs.existsSync(cancelledMarker)) return false;
+      await testHoldAt('remote-exec-before-id');
+      // Under the broker lock, the same one `remote-cancel` writes its `cancelled` marker and reads `remote-id` under: either
+      // that cancel sees this id (and takes the broker path), or this check sees its marker and refuses. Neither can miss the other.
+      const cancelledEarly = await withLock(stateHome(), () => {
+        atomicWriteFile(path.join(ticketDir, 'remote-id'), id);
+        return fs.existsSync(cancelledMarker);
+      });
+      if (cancelledEarly) return false;
       // Test-only seam (BRAIN-319): hold here, right after the ticket-local
       // `cancelled` check above has already come back false, until the named
       // file appears -- lets a test deterministically land `lane
@@ -924,50 +943,40 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
     }
   }
 
-  atomicWriteFile(path.join(ticketDir, 'cancelled'), String(Date.now()));
-
-  // BRAIN-319 P3 (Codex re-review, then a focused follow-up pass): report
-  // three separate facts instead of one overclaiming `cancelledBroker`.
-  // `cancelRequested` is "did we durably record this cancellation at the
-  // broker level" (the marker write below, gated on a broker ticket id
-  // actually existing yet) -- that marker is re-checked, INSIDE the same
-  // admission lock, by scheduler.js's tryStart right before this ticket
-  // would ever be admitted (see its own comment), so it alone is what
-  // actually governs the outcome for a not-yet-registered ticket.
-  // `cancelConfirmed` is ONLY true when `cancelCommand` itself reports a
-  // real, already-completed action (exit 0) -- never inferred from
-  // `registered`, which is read WITHOUT the admission lock: admission can
-  // dequeue a ticket (moving it from "queued" to "about to be leased")
-  // between that unlocked read and `cancelCommand`'s own attempt, so
-  // "unregistered at read time" is not proof of anything by the time
-  // `cancelCommand` actually runs. `registered` is reported purely as
-  // informational context for a human reading the JSON, never something a
-  // caller may act on.
+  // BRAIN-319 P3 (Codex re-review, then a focused follow-up pass), reworked for the cancel windows a ticket passes through:
+  // the ticket dir exists, then `remote-id` is written (onTicketCreated), then the supervisor enqueues, then admission leases it.
+  // The marker write, the `remote-id` read, the broker's own cancel marker and the "is it registered" read all happen under the
+  // broker admission lock (the one `tryStart` admits under and `onTicketCreated` writes `remote-id` under), so:
+  //  - no `remote-id` yet: `onTicketCreated` will see the `cancelled` marker under the same lock and refuse, so nothing is ever
+  //    enqueued -> confirmed (the unseen-id tombstone case, one step later);
+  //  - `remote-id` but nothing registered (not queued, leased or attempted): nothing is running and `tryStart` refuses a marked
+  //    ticket under this same lock, so it can never start -> confirmed;
+  //  - registered: `cancelCommand` (which takes the lock itself, so it runs after this block) dequeues it or signals the lease,
+  //    and only its own exit 0 confirms. `registered` is informational.
   let cancelRequested = false;
   let cancelConfirmed = false;
   let registered = false;
-  const remoteIdPath = path.join(ticketDir, 'remote-id');
-  if (fs.existsSync(remoteIdPath)) {
-    const remoteLaneId = fs.readFileSync(remoteIdPath, 'utf8').trim();
-    if (isUuid(remoteLaneId)) {
-      // Write the LOCAL broker's own cancel marker for this id BEFORE
-      // calling cancelCommand. onTicketCreated (above) can write `remote-id`
-      // well before the supervisor has enqueued or leased that same id --
-      // cancelCommand only knows how to act on a queued ticket, a held
-      // lease, or an attempt record, so calling it first can find none of
-      // those and do nothing, silently losing the cancellation.
-      const brokerRoot = ensureStateDirs().root;
-      writeCancelMarkerFile(brokerRoot, remoteLaneId);
-      cancelRequested = true;
-      // Informational only (see comment above) -- NOT part of the
-      // cancelConfirmed decision.
-      registered =
-        Boolean(readLease(brokerRoot, remoteLaneId)) ||
-        Boolean(readAttempt(brokerRoot, remoteLaneId)) ||
-        listQueue(brokerRoot).some((t) => t && t.id === remoteLaneId);
-      const result = await cancelCommand(remoteLaneId);
-      cancelConfirmed = result.exitCode === 0;
+  let remoteLaneId = null;
+  await withLock(stateHome(), () => {
+    atomicWriteFile(path.join(ticketDir, 'cancelled'), String(Date.now()));
+    const recorded = readTrimmed(path.join(ticketDir, 'remote-id'));
+    if (recorded === null) {
+      cancelConfirmed = true;
+      return;
     }
+    if (!isUuid(recorded)) return;
+    remoteLaneId = recorded;
+    const brokerRoot = ensureStateDirs().root;
+    writeCancelMarkerFile(brokerRoot, remoteLaneId);
+    cancelRequested = true;
+    registered = isRegisteredInBroker(brokerRoot, remoteLaneId);
+    if (!registered) cancelConfirmed = true;
+  });
+  if (registered) {
+    cancelConfirmed = (await cancelCommand(remoteLaneId)).exitCode === 0;
+    // The marker written above makes a queued ticket's own supervisor dequeue itself, which can happen before `cancelCommand` takes
+    // the lock; it then finds nothing and exits 1. Not registered any more, with the marker in place, means it can never start.
+    if (!cancelConfirmed) cancelConfirmed = await withLock(stateHome(), () => !isRegisteredInBroker(ensureStateDirs().root, remoteLaneId));
   }
   // A ticket that has already published its result is not running: a retried cancel is confirmed, not forever unconfirmed.
   // That holds with or without a `remote-id` -- a ticket rejected or refused before it was enqueued never had one.
