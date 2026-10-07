@@ -1207,6 +1207,8 @@ async function main() {
       await sleep(globalCfg.sampleMs);
       continue;
     }
+    // Test seam: lets a test land a cancel between admission and spawn (BRAIN-364).
+    await testHoldAt('local-admitted');
     if (started.started) break;
     // BRAIN-436: the withdraw marker is the commit, but the queue file may still be there (the runner's best-effort
     // dequeue failed, or it crashed after the marker). Dequeue it here -- retrying the unlink -- BEFORE publishing, so the
@@ -1384,6 +1386,13 @@ async function main() {
   };
   process.on('SIGTERM', onCancelSignal);
   process.on('SIGINT', onCancelSignal);
+  // BRAIN-364: no `await` runs between the queue loop's successful `break` and here, so a cancel that landed during admission
+  // (`cancelledBeforeStart` from a signal, or the marker) is seen exactly once, now, and handled like any cancel of a
+  // running child: reaped, then finalized as 130 by finalizeAndExit. Without it a fast child published success.
+  if (cancelledBeforeStart || cancelRequested(root, ticket.id)) {
+    cancelling = true;
+    reap();
+  }
 
   async function finalizeAndExit(result, exitCode) {
     finished = true;
@@ -1413,6 +1422,8 @@ async function main() {
     // reading would just wait out its own bounded timeout for nothing.
     if (stdoutForward) await stdoutForward.drain();
     if (stderrForward) await stderrForward.drain();
+    // Test seam: lets a test land a `lane cancel` after the child ended, before the result is written (BRAIN-364).
+    await testHoldAt('local-finalize');
 
     // BRAIN-319 P2 (Codex re-review): `writeResult` only WRITES -- no
     // `process.exit` in here. The old `writeAndExit` called `process.exit`
@@ -1450,21 +1461,22 @@ async function main() {
 
     // BRAIN-319 T3b-2: this ticket started life as a remote attempt that fell
     // back to local (`attemptGeneration` non-null) -- go through the SAME
-    // one terminal writer every remote-side path uses, so a cancel racing
-    // this exact finish is decided the same way (C5), and the attempt
+    // one terminal writer every remote-side path uses, so the attempt
     // record is removed once this local run's outcome is actually published.
+    // BRAIN-364: the outcome follows `cancelling` (folded into `result`/
+    // `exitCode` above), exactly as on the plain local path -- NOT
+    // `publishTerminal`'s own `cancelled` flag, which is true for a cancel
+    // that landed after the child had already ended and was never acted on.
     if (attemptGeneration !== null) {
-      let finalExitCode = exitCode;
-      const published = await publishTerminal(root, ticket.id, attemptGeneration, ({ cancelled }) => {
-        if (cancelled) {
-          finalExitCode = 130;
+      const published = await publishTerminal(root, ticket.id, attemptGeneration, () => {
+        if (cancelling) {
           writeResult({ ...remoteCancelledResult(enriched.id, startedAt), executor: 'local' });
         } else {
           writeResult({ ...result, executor: 'local', fallbackReason });
         }
       });
       if (published.ok) {
-        process.exit(finalExitCode);
+        process.exit(exitCode);
         return;
       }
       // Generation mismatch: unreachable today (this supervisor is the sole
