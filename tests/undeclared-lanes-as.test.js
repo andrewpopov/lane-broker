@@ -225,3 +225,16 @@ test('with no config file, default is the built-in', () => {
   assert.equal(resolved.remote, false);
   assert.equal(resolved.key, 'r:default');
 });
+
+for (const [label, lane] of [['an explicit default', 'default'], ['an omitted lane', undefined]]) {
+  test(`${label} under "as": "default" with no file-declared default resolves exactly as before`, () => {
+    const { base } = freshEnv();
+    const repoDir = path.join(base, 'repo');
+    writeRepoConfig(repoDir, { version: 1, undeclaredLanes: { as: 'default' }, lanes: { other: { weight: 5, remote: true } } });
+    const resolved = resolveTicketConfig({ cwd: repoDir, repo: 'r', lane });
+    assert.equal(resolved.weight, 2);
+    assert.equal(resolved.remote, false);
+    assert.equal(resolved.key, 'r:default');
+    assert.equal(resolved.configLane, undefined);
+  });
+}

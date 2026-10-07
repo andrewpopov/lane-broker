@@ -815,8 +815,10 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       ? repoConfig.undeclaredLanes.as
       : null;
   const undeclaredAllowed = repoConfig.undeclaredLanes === 'allow' || undeclaredTemplateName !== null;
-  // BRAIN-448: the built-in `default` counts as declared unless the file has a template to resolve it through.
-  const isDeclaredLane = hasLane(repoConfig.fileLanes) || (hasLane(repoConfig.lanes) && undeclaredTemplateName === null);
+  // BRAIN-448: the built-in `default` counts as declared unless the file has a (different) template to resolve it through.
+  const isDeclaredLane =
+    hasLane(repoConfig.fileLanes) ||
+    (hasLane(repoConfig.lanes) && (undeclaredTemplateName === null || undeclaredTemplateName === laneName));
   if (repoConfig.declared && !isDeclaredLane && !undeclaredAllowed) {
     const declared = Object.keys(repoConfig.lanes).sort().join(', ');
     throw new ConfigError(`unknown lane "${laneName}"; declared: ${declared}`);
