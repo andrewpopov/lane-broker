@@ -114,7 +114,7 @@ export function moveInterruptedLabel(id, attempt) {
  *  phase 'probe'), stamped with THIS process's own identity as the owning
  *  supervisor. `runner` is not yet known at this point in the real dispatch
  *  flow (selection happens after), so it defaults to null. */
-export async function createAttempt(root, id, { runner = null, resources } = {}) {
+export async function createAttempt(root, id, { runner = null, resources, logPath, cwd } = {}) {
   const attempt = {
     id,
     generation: 0,
@@ -123,6 +123,10 @@ export async function createAttempt(root, id, { runner = null, resources } = {})
     runner,
     // BRAIN-425: kept so an orphan-cancel history row can still say what the run was charged
     ...(resources ? { resources } : {}),
+    // BRAIN-462: the submitter's handle on a remote attempt (its --log path) and where it was launched from, so a
+    // caller that crashed between `lane run --detach` and learning the id can still find the attempt.
+    ...(logPath ? { logPath } : {}),
+    ...(cwd ? { cwd } : {}),
     startedAt: Date.now(),
     supervisor: {
       pid: process.pid,

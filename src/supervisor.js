@@ -500,7 +500,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // the attempt generation every fence below acts on: 0 for a first attempt, the fallback's generation for a rebind
   const gen = rebind ? rebind.generation : 0;
   let withdrawn = null;
-  if (!rebind) await createAttempt(root, enriched.id, { runner: null, resources: enriched.resources });
+  if (!rebind) await createAttempt(root, enriched.id, { runner: null, resources: enriched.resources, logPath: enriched.logPath, cwd: enriched.cwd });
 
   // Reuses the SAME two writers a local child's output goes through
   // (CappedLogWriter/ForwardWriter, defined above) -- no second relay.

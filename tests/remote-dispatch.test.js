@@ -101,6 +101,9 @@ test('result-tamper: a record that does not bind proves nothing, so the ticket i
   assert.match(waited.stderr, /ORPHANED-REMOTE/);
   assert.equal(readAttempt(state, id)?.executor, 'remote', 'the attempt is kept');
   assert.ok(readAttempt(state, id)?.unresolved);
+  // BRAIN-462: the remote attempt carries the submitter's --log path and cwd, so a caller can find it without the id
+  assert.match(readAttempt(state, id)?.logPath ?? '', new RegExp(`${id}\\.log$`));
+  assert.equal(fs.realpathSync(readAttempt(state, id)?.cwd ?? '/nonexistent'), fs.realpathSync(repoDir));
 });
 
 // ---- ineligible: tracked .env ----
