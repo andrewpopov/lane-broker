@@ -733,11 +733,11 @@ test('BRAIN-437: the same drop with a runner that confirms `withdrawn` falls bac
 });
 
 test('BRAIN-452: a fresh oversized weight is refused with exit 64 even for a remote-eligible lane, before anything is enqueued', async () => {
-  const { env, state, repoDir } = setup({ weight: 3 }); // capacity 4: 3 > 2
+  const { env, state, repoDir } = setup({ weight: 5 }); // maxLaneWeight 4
   const marker = path.join(tmpDir('marker'), 'where');
   const res = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...markerCmd(marker, 0)], { env, cwd: repoDir });
   assert.equal(res.code, 64, res.stderr);
-  assert.match(res.stderr, /weight 3 would hold most of this machine's capacity.*BRAIN-452/);
+  assert.match(res.stderr, /weight 5 would hold most of this machine's capacity.*BRAIN-452/);
   assert.equal(fs.existsSync(marker), false, 'never ran, remotely or locally');
   assert.deepEqual(fs.existsSync(paths(state).queue) ? fs.readdirSync(paths(state).queue) : [], [], 'nothing enqueued');
 });

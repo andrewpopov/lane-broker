@@ -15,7 +15,7 @@ import { isExclusive, exclusiveDeny, isExclusiveHead, exclusiveLeaseFields, with
 import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, effectiveRank, score } from './priority.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
-import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores, evaluateMemoryAdmission, leaseResources, resolveTicketResources, terminalRowDefaults, capElasticClaim, elasticBelowFloor } from './resources.js';
+import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores, evaluateMemoryAdmission, leaseResources, resolveTicketResources, terminalRowDefaults, capElasticClaim, elasticBelowFloor, elasticClaimRange } from './resources.js';
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
  *  possibly-running work and must count against both conflicts and capacity. */
@@ -805,17 +805,19 @@ function logWeightClamp(root, ticket) {
  * (history is keyed by the granted cores and may RAISE a charge, BRAIN-454), and the cheapest wins. `budget` is the decision
  * budget admission compares against; the raise applies only with it and only while other leases are held.
  */
-function ticketCpuFloor(ticket, cfg, budget, held = []) {
+function ticketCpuFloor(ticket, cfg, budget, held = [], headroom) {
   const raiseBudget = held.length > 0 ? budget : undefined;
   const estimate = ticketCpuEstimate(ticket, cfg, undefined, raiseBudget);
   const min = ticket.resources?.minCpuCores;
   if (!Number.isFinite(min)) return estimate;
-  const declared = ticket.resources?.cpuCores;
-  let floor = Math.min(estimate, Math.ceil(min));
-  if (raiseBudget === undefined || !Number.isFinite(declared)) return floor;
-  floor = estimate;
-  for (let grant = Math.ceil(min); grant < declared && grant <= Math.ceil(min) + 256; grant += 1) {
-    floor = Math.min(floor, ticketCpuEstimate({ ...ticket, resources: { ...ticket.resources, cpuCores: grant } }, cfg, undefined, raiseBudget));
+  if (raiseBudget === undefined || !Number.isFinite(headroom)) return Math.min(estimate, Math.ceil(min));
+  // only the grants admission would try (elasticClaimRange: capped at floor(headroom)), each charged by its own history
+  const range = elasticClaimRange({ cpuCores: ticket.resources?.cpuCores, minCpuCores: min, headroom });
+  let floor = estimate;
+  if (range) {
+    for (let grant = range.lo; grant <= range.hi; grant += 1) {
+      floor = Math.min(floor, ticketCpuEstimate({ ...ticket, resources: { ...ticket.resources, cpuCores: grant } }, cfg, undefined, raiseBudget));
+    }
   }
   return floor;
 }
@@ -853,7 +855,7 @@ export function selectResourceCandidate(queue, held, runningWeight, weightCapaci
     if (blockedBy(held, t)) continue;
     if (viewWeight + t.weight > weightCapacity) continue;
     if (headReserved ? blockedBy([{ key: t.key }], headTicket) || blockedBy([{ key: headTicket.key }], t) : blockedBy([...held, { key: t.key }], headTicket)) continue;
-    const claim = ticketCpuFloor(t, cfg, record.budget, held);
+    const claim = ticketCpuFloor(t, cfg, record.budget, held, record.budget - projectBusy(record.externalBusy, view, 0, now, cfg, record.budget));
     if (projectBusy(record.externalBusy, view, claim, now, cfg, record.budget) > record.budget) continue;
     if (claim < bestClaim) {
       best = t;
@@ -965,7 +967,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     const cpuCores = detectResourceCapacity().cpuCores;
     const weightCapacity = effectiveWeightCapacity(cfg, cpuCores);
     // BRAIN-452: a ticket an older config enqueued with a near-capacity weight is admitted at half the capacity instead.
-    const ticket = clampQueuedWeight(capElasticClaim(submitted, cfg), weightCapacity);
+    const ticket = clampQueuedWeight(capElasticClaim(submitted, cfg), cfg, weightCapacity);
     const now = Date.now();
     const nowEff = advanceHwm(root, now);
     reapStale(root, ticket.id);
@@ -976,7 +978,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     const sched = resolveScheduler(root);
     const store = sched.v2 ? fairnessStore(root, sched.tickets) : legacyStore(root);
     if (sched.v2) quarantineLegacyRecords(root);
-    const rawQueue = (sched.v2 ? fenceLegacy(listQueueCapped(root, cfg)) : listQueueCapped(root, cfg)).map((t) => clampQueuedWeight(t, weightCapacity));
+    const rawQueue = (sched.v2 ? fenceLegacy(listQueueCapped(root, cfg)) : listQueueCapped(root, cfg)).map((t) => clampQueuedWeight(t, cfg, weightCapacity));
     logWeightClamp(root, ticket);
     // A reservation exists only while resource backfill does: when it is off, release every latch, so turning it back
     // on makes a ticket earn its reservation again.

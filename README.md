@@ -1408,10 +1408,11 @@ factor is 1.0 (no calibration) and is printed.
 whole host to itself. v1 is deliberately stateless and hookless: there is no hold file and nothing to wedge, and
 the only durable facts are the ticket's `exclusive` flag and the full-budget lease it is admitted with.
 
-A non-exclusive lane whose `weight` exceeds half of the broker's effective weight capacity is refused by `lane run`
-with exit 64 (BRAIN-452: declare `exclusive: true`, or use `cpuCores` for size). A ticket queued earlier by an older
-config is admitted clamped to half the capacity (logged as `event=weight-clamped`), and `lane status`'s
-`queue stalled` line names the oversized weight when it is why the head does not fit.
+A non-exclusive lane whose `weight` exceeds the global `maxLaneWeight` (integer, default 4, the same on every host) is refused
+with exit 64 at every submission, a runner's intake included (BRAIN-452: declare `exclusive: true`, or use `cpuCores` for size),
+so a submission valid on one host is valid on all of them. A ticket queued earlier by an older config is admitted clamped to
+`min(maxLaneWeight, floor(capacity / 2))` (logged as `event=weight-clamped`), and `lane status`'s `queue stalled` line names the
+oversized weight when it is why the head does not fit.
 
 Semantics:
 

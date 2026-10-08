@@ -22,6 +22,7 @@ const cfg = {
   ...DEFAULT_GLOBAL_CONFIG,
   schedulerMode: 'active',
   capacity: 10,
+  maxLaneWeight: 5, // BRAIN-452: weights up to half the capacity
   loadClose: 1000,
   loadOpen: 900,
   loadOpenSamples: 1,

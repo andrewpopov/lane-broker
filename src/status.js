@@ -73,7 +73,7 @@ function computeHeadBlock(root, store, cfg, queue, leases, now, weightCapacity) 
   // The EFFECTIVE capacity, never raw cfg.capacity: with `capacity: 'auto'` the raw value is a
   // string, the comparison is always false, and a capacity-blocked head was never reported.
   // BRAIN-452: the weight admission will actually use (an oversized queued ticket is clamped), and the cause when it differs.
-  const admitted = clampQueuedWeight(head, weightCapacity);
+  const admitted = clampQueuedWeight(head, cfg, weightCapacity);
   if (runningWeight + admitted.weight > weightCapacity) {
     const capState = readCapacitySkipState(root, store, head.id);
     const sameHead = capState.headId === head.id;
@@ -420,7 +420,7 @@ export function renderStatusText(status) {
         `queue stalled: head ${hb.headId} (weight ${hb.headWeight}) does not fit capacity ` +
           `(${hb.runningWeight}/${hb.capacity} running); skip allowance exhausted (${hb.skipCount}/${hb.skipLimit}), ` +
           `backfill refused until running work drains` +
-          (hb.oversizedWeight ? `; cause: declared weight ${hb.oversizedWeight} is over half the capacity, admitted at ${hb.headWeight} (BRAIN-452: declare exclusive: true or use cpuCores)` : ''),
+          (hb.oversizedWeight ? `; cause: declared weight ${hb.oversizedWeight} is over this host's queued-weight limit (maxLaneWeight / half the capacity), admitted at ${hb.headWeight} (BRAIN-452: declare exclusive: true or use cpuCores)` : ''),
       );
     } else {
       lines.push(

@@ -6,7 +6,7 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, gitFixture } from './helpers.js';
 import { enqueue, tryStart, couldAdmitNow, listQueue } from '../src/scheduler.js';
-import { DEFAULT_GLOBAL_CONFIG, resolveTicketConfig, resolvePriority, ConfigError } from '../src/config.js';
+import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig, resolveTicketConfig, resolvePriority, ConfigError } from '../src/config.js';
 import { writeLease, removeLease, listLeases, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths, atomicWriteJson, writeCancelMarkerFile, writeWithdrawMarkerFile } from '../src/state.js';
 import { fenceLegacyQueue } from '../src/migrate.js';
@@ -577,32 +577,52 @@ test('the exclusive/1 capability is advertised and --exclusive is in the lane us
 
 // ---- BRAIN-452: a near-capacity weight is refused, or clamped for an already-queued ticket ----
 
-test('BRAIN-452: lane run refuses a non-exclusive weight over half the capacity with exit 64 and the named message', async () => {
-  const { env, repoDir } = setup({ lane: { weight: 3 } }); // capacity 4: 3 > 2
+test('BRAIN-452: lane run refuses a non-exclusive weight over maxLaneWeight with exit 64 and the named message', async () => {
+  const { env, repoDir } = setup({ lane: { weight: 5 } }); // maxLaneWeight defaults to 4
   const { result, spawnCalled, stderr } = await submit({ env, cwd: repoDir });
   assert.equal(result.exitCode, 64, stderr);
   assert.equal(spawnCalled, false);
-  assert.match(stderr, /weight 3 would hold most of this machine's capacity; declare `exclusive: true` or use `cpuCores` for size \(BRAIN-452\)/);
+  assert.match(stderr, /weight 5 would hold most of this machine's capacity; declare `exclusive: true` or use `cpuCores` for size \(BRAIN-452; maxLaneWeight is 4\)/);
 });
 
-test('BRAIN-452: exactly half the capacity is allowed; an exclusive lane is exempt whatever it weighs', async () => {
-  const half = setup({ lane: { weight: 2 } });
-  assert.equal((await submit({ env: half.env, cwd: half.repoDir })).result.exitCode, 0);
-  const exclusive = setup({ lane: { weight: 4, exclusive: true } });
+test('BRAIN-452: a runner\'s intake refuses the same weight, so a submission valid on one host is valid on all', async () => {
+  const { env, repoDir } = setup({ lane: { weight: 1 }, host: { capacity: 100 } });
+  const refused = await submit({ env, cwd: repoDir, configRoot: repoDir, weightOverride: 5 });
+  assert.equal(refused.result.exitCode, 64, refused.stderr);
+  assert.equal(refused.spawnCalled, false);
+  assert.match(refused.stderr, /maxLaneWeight is 4/);
+});
+
+test('BRAIN-452: a submission at exactly maxLaneWeight is accepted locally and on runner intake; an exclusive lane is exempt', async () => {
+  const local = setup({ lane: { weight: 4 }, host: { capacity: 100 } });
+  assert.equal((await submit({ env: local.env, cwd: local.repoDir })).result.exitCode, 0);
+  const intake = setup({ lane: { weight: 1 }, host: { capacity: 100 } });
+  const accepted = await submit({ env: intake.env, cwd: intake.repoDir, configRoot: intake.repoDir, weightOverride: 4 });
+  assert.equal(accepted.result.exitCode, 0, accepted.stderr);
+  const exclusive = setup({ lane: { weight: 9, exclusive: true }, host: { capacity: 100 } });
   const { result, stderr } = await submit({ env: exclusive.env, cwd: exclusive.repoDir });
   assert.equal(result.exitCode, 0, stderr);
 });
 
-test('BRAIN-452: an already-queued oversized ticket is admitted clamped to half the capacity, with a logged reason', async () => {
+test('BRAIN-452: a maxLaneWeight below 1 or not an integer is a config error', () => {
+  for (const bad of [0, 2.5, '4']) {
+    const { home } = freshEnv();
+    writeGlobalConfig(home, { version: 1, maxLaneWeight: bad });
+    process.env.LANE_BROKER_HOME = home;
+    assert.throws(() => loadGlobalConfig(), /maxLaneWeight/);
+  }
+});
+
+test('BRAIN-452: an already-queued oversized ticket is admitted clamped to min(maxLaneWeight, half the capacity), with a logged reason', async () => {
   const state = stateFor('legacy');
-  const cfg = baseCfg(); // capacity 10 -> limit 5
+  const cfg = baseCfg(); // capacity 10, maxLaneWeight 4 -> limit 4
   writeLease(state, heldLease('holder', 'r:holder', 3));
-  const t = ticket('big', { weight: 8 }); // 3 + 8 > 10 unclamped; 3 + 5 fits
+  const t = ticket('big', { weight: 8 }); // 3 + 8 > 10 unclamped; 3 + 4 fits
   await enqueue(state, t);
   const out = await poll(state, t, cfg);
   assert.equal(out.started, true, JSON.stringify(out));
-  assert.equal(listLeases(state).find((l) => l.id === 'big').weight, 5);
-  assert.match(fs.readFileSync(paths(state).admissionLog, 'utf8'), /event=weight-clamped headId=big weight=8 clampedTo=5 reason=near-capacity-weight\(BRAIN-452\)/);
+  assert.equal(listLeases(state).find((l) => l.id === 'big').weight, 4);
+  assert.match(fs.readFileSync(paths(state).admissionLog, 'utf8'), /event=weight-clamped headId=big weight=8 clampedTo=4 reason=near-capacity-weight\(BRAIN-452\)/);
 });
 
 test('BRAIN-452: an oversized queued HEAD is judged at its clamped weight, so it does not stall the ticket behind it', async () => {
@@ -631,16 +651,16 @@ test('BRAIN-452: lane status names an oversized weight as the cause of a capacit
   process.env.LANE_BROKER_HOME = home;
   process.env.LANE_BROKER_STATE = state;
   try {
-    writeLease(state, heldLease('holder', 'r:holder', 6));
-    await enqueue(state, ticket('big', { weight: 8 })); // clamped to 5: 6 + 5 > 10
+    writeLease(state, heldLease('holder', 'r:holder', 7));
+    await enqueue(state, ticket('big', { weight: 8 })); // clamped to 4: 7 + 4 > 10
     atomicWriteJson(paths(state).capacitySkipState, { headId: 'big', count: 1, loggedPhase: 'exhausted' });
     const status = await collectStatus();
     assert.equal(status.headBlock?.kind, 'capacity', JSON.stringify(status.headBlock));
     const text = renderStatusText(status);
     removeLease(state, 'holder');
-    writeLease(state, heldLease('holder', 'r:holder', 3)); // 3 + 8 > 10 raw, but 3 + 5 fits once clamped: not stalled
+    writeLease(state, heldLease('holder', 'r:holder', 3)); // 3 + 8 > 10 raw, but 3 + 4 fits once clamped: not stalled
     assert.equal((await collectStatus()).headBlock, null, 'status judges the head by the weight admission will use');
-    assert.match(text, /head big \(weight 5\) does not fit capacity \(6\/10 running\).*cause: declared weight 8 is over half the capacity, admitted at 5 \(BRAIN-452/);
+    assert.match(text, /head big \(weight 4\) does not fit capacity \(7\/10 running\).*cause: declared weight 8 is over this host's queued-weight limit.*admitted at 4 \(BRAIN-452/);
   } finally {
     for (const [name, value] of [['LANE_BROKER_HOME', prev.home], ['LANE_BROKER_STATE', prev.state]]) {
       if (value === undefined) delete process.env[name];

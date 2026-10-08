@@ -93,6 +93,19 @@ test('BRAIN-454: backfill selection charges an elastic ticket as admission does,
   assert.equal(picked?.id, 'ordinary', 'p90 9 at every grant means the elastic ticket is charged 9 and cannot fit 3 free cores');
 });
 
+test('BRAIN-454: selection ranks an elastic ticket only over the grants admission tries (capped at floor(headroom))', async () => {
+  const { selectResourceCandidate } = await import('../src/scheduler.js');
+  const KEY_E = `${REPO}:elastic`;
+  const at = (cores, peak) => rows(KEY_E, 6, peak, { resources: { cpuCores: cores } });
+  primed([...at(6, 9), ...at(3, 9), ...at(2, 9), ...at(4, 1)]);
+  const held = [{ id: 'held00000000', key: 'x:held', weight: 3, admittedAt: now0 }]; // headroom = 9 - (3 external + 3 held) = 3
+  const head = { id: 'head', key: 'x:head', weight: 1, resources: { cpuCores: 8, memoryBytes: 1 } };
+  const elastic = ticket({ id: 'elastic', key: KEY_E, weight: 1, resources: { cpuCores: 6, minCpuCores: 2, memoryBytes: 1 } });
+  const ordinary = ticket({ id: 'ordinary', key: 'x:ordinary', cmdFingerprint: undefined, weight: 3, resources: { cpuCores: 3, memoryBytes: 1 } });
+  const picked = selectResourceCandidate([head, elastic, ordinary], held, 3, 10, { headId: 'head', budget: 9, externalBusy: 3 }, baseCfg(), now0);
+  assert.equal(picked?.id, 'ordinary', 'grant 4 (charge 1) is above floor(headroom) = 3, so admission never tries it');
+});
+
 test('BRAIN-454: with historyDemandRaise false the charge is byte-identical to the lowering-only behaviour', () => {
   primed(rows(KEY, 6, 7));
   const off = baseCfg({ historyDemandRaise: false });

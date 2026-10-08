@@ -16,23 +16,27 @@ export function isExclusive(ticket) {
 }
 
 /**
- * BRAIN-452: a non-exclusive lane may not weigh more than half the weight capacity (a near-capacity weight silently serializes
- * the machine; `exclusive: true` says so honestly and `cpuCores` sizes a lane). `limit` is the largest weight it may hold.
+ * BRAIN-452: a non-exclusive lane may not weigh more than the global `maxLaneWeight` (default 4, the same on every host so a
+ * submission valid on one is valid on all): a near-capacity weight silently serializes the machine. `exclusive: true` says so
+ * honestly and `cpuCores` sizes a lane.
  */
-export function oversizedWeight(weight, capacity, exclusive) {
-  const limit = Math.max(1, Math.floor(capacity / 2)); // a weight of 1 is the smallest a lane can be, so it is never oversized
-  if (exclusive === true || !(Number(weight) > Math.max(1, capacity / 2))) return null;
-  return { weight, limit };
+export function oversizedWeight(weight, maxLaneWeight, exclusive) {
+  return exclusive !== true && Number(weight) > maxLaneWeight ? { weight, limit: maxLaneWeight } : null;
 }
 
-export function oversizedWeightMessage(weight) {
-  return `weight ${weight} would hold most of this machine's capacity; declare \`exclusive: true\` or use \`cpuCores\` for size (BRAIN-452)`;
+export function oversizedWeightMessage(weight, maxLaneWeight) {
+  return `weight ${weight} would hold most of this machine's capacity; declare \`exclusive: true\` or use \`cpuCores\` for size (BRAIN-452; maxLaneWeight is ${maxLaneWeight})`;
 }
 
-/** A queued ticket with its weight clamped to the shared limit (an older config enqueued it); same object when it is not oversized. */
-export function clampQueuedWeight(ticket, capacity) {
-  const over = ticket && oversizedWeight(ticket.weight, capacity, ticket.exclusive);
-  return over ? { ...ticket, weight: over.limit, weightClampedFrom: ticket.weight } : ticket;
+/** The heaviest weight an ALREADY QUEUED ticket is admitted at on this host: min(maxLaneWeight, floor(capacity / 2)), at least 1. */
+export function queuedWeightLimit(maxLaneWeight, capacity) {
+  return Math.max(1, Math.min(maxLaneWeight, Math.floor(capacity / 2)));
+}
+
+/** A queued ticket (enqueued under an older config) with its weight clamped to this host's limit; the same object when it is within it. */
+export function clampQueuedWeight(ticket, cfg, capacity) {
+  const limit = queuedWeightLimit(cfg.maxLaneWeight, capacity);
+  return ticket && ticket.exclusive !== true && Number(ticket.weight) > limit ? { ...ticket, weight: limit, weightClampedFrom: ticket.weight } : ticket;
 }
 
 /** The hook keys present at the top level of a parsed config object, in `UNSUPPORTED_HOOK_KEYS` order. */

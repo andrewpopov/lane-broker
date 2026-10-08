@@ -41,6 +41,7 @@ export function baseCfg(m, overrides = {}) {
     ...m.DEFAULT_GLOBAL_CONFIG,
     schedulerMode: 'active',
     capacity: 10,
+    maxLaneWeight: 5, // BRAIN-452: scenarios use weights up to half the capacity
     loadClose: 1000,
     loadOpen: 900,
     loadOpenSamples: 1,

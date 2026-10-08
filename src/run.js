@@ -9,7 +9,7 @@ import { resolveTicketConfig, reloadGlobalConfig, resolvePriority, assertHostCon
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
 import { stampPriorityOrigin } from './priority-clock.js';
-import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, resolveTicketResources, checkResourceBudget, localSimRefusal } from './resources.js';
+import { detectResourceCapacity, leaseResources, resolveTicketResources, checkResourceBudget, localSimRefusal } from './resources.js';
 import { argvFingerprint } from './cpu-estimates.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
 import { isExclusive, oversizedWeight, oversizedWeightMessage } from './exclusive.js';
@@ -404,10 +404,10 @@ export async function runCommand({
       return { exitCode: budget.exitCode };
     }
   }
-  // BRAIN-452: needs this host's capacity, so it is checked here rather than in repo-config parsing. Every fresh submission is validated, remote-eligible or not (a
-  // remote lane may fall back to local); clamping is only for tickets an older config already queued. A runner's own intake takes the submitter's weight.
-  if (!runnerIntake && oversizedWeight(weight, effectiveWeightCapacity(globalCfg, host.cpuCores), exclusive)) {
-    process.stderr.write(`lane run: ${oversizedWeightMessage(weight)}\n`);
+  // BRAIN-452: every fresh submission is refused over the host-independent `maxLaneWeight`, a runner's intake included, so a weight valid
+  // on one host is valid on all of them; clamping is only for tickets an older config already queued.
+  if (oversizedWeight(weight, globalCfg.maxLaneWeight, exclusive)) {
+    process.stderr.write(`lane run: ${oversizedWeightMessage(weight, globalCfg.maxLaneWeight)}\n`);
     return { exitCode: 64 };
   }
 
