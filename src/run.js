@@ -5,13 +5,14 @@ import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { ensureStateDirs, paths, readJsonSafe, LockTimeoutError, MigrationInProgressError, assertNotMigrating } from './state.js';
-import { resolveTicketConfig, reloadGlobalConfig, resolvePriority, ConfigError } from './config.js';
+import { resolveTicketConfig, reloadGlobalConfig, resolvePriority, assertHostConfigHookless, ConfigError } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
 import { stampPriorityOrigin } from './priority-clock.js';
 import { detectResourceCapacity, leaseResources, resolveTicketResources, checkResourceBudget, localSimRefusal } from './resources.js';
 import { argvFingerprint } from './cpu-estimates.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
+import { isExclusive, oversizedWeight, oversizedWeightMessage } from './exclusive.js';
 
 const supervisorPath = fileURLToPath(new URL('./supervisor.js', import.meta.url));
 
@@ -28,17 +29,32 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Await a readable stream reaching 'end'/'close', bounded so a stream that
- *  never ends (shouldn't happen -- the supervisor has already exited by the
- *  time this is called) can't hang `lane run` forever (BRAIN-308). */
-function waitForStreamEnd(stream, timeoutMs = 2000) {
+/** Await a readable stream reaching 'end'/'close'. Bounded by IDLE time, not total time: a stream that never ends
+ *  (shouldn't happen -- the supervisor has already exited by the time this is called) can't hang `lane run` forever
+ *  (BRAIN-308), but one still delivering bytes -- a big tail, a slow reader, a loaded machine -- is never cut off
+ *  with output unread in the pipe (BRAIN-453). Only time spent readable and flowing counts as idle: a stream paused by
+ *  its destination's backpressure is waiting on the consumer, not quiet. */
+export function waitForStreamEnd(stream, idleMs = 2000) {
   if (!stream || stream.readableEnded || stream.destroyed) return Promise.resolve();
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, timeoutMs);
+    const tickMs = Math.max(1, Math.min(50, Math.floor(idleMs / 4)));
+    let idle = 0;
+    let last = Date.now();
     const done = () => {
-      clearTimeout(timer);
+      clearInterval(ticker);
+      stream.off('data', onData);
       resolve();
     };
+    const onData = () => {
+      idle = 0;
+    };
+    const ticker = setInterval(() => {
+      const now = Date.now();
+      if (stream.readableFlowing === true && stream.readableLength === 0) idle += now - last;
+      last = now;
+      if (idle >= idleMs) done();
+    }, tickMs);
+    stream.on('data', onData);
     stream.once('end', done);
     stream.once('close', done);
     stream.once('error', done);
@@ -90,8 +106,9 @@ const HISTORY_COMMAND_MAX = 300;
 /** Why a run of a remote-capable lane (`remote: true`) is executing locally,
  *  decided at ticket creation. A remote attempt that later falls back is
  *  recorded by the supervisor as `fallback:<reason>` instead. */
-function localReasonFor(resolved, eligible, local) {
+function localReasonFor(resolved, eligible, local, exclusive) {
   if (resolved.remote !== true || eligible) return undefined;
+  if (exclusive) return 'exclusive';
   if (local) return 'forced-flag';
   if (process.env.LANE_BROKER_LOCAL === '1') return 'forced-env';
   return 'not-eligible';
@@ -176,6 +193,8 @@ export async function runCommand({
   minCpuOverride,
   memoryOverride,
   noProgressTimeoutOverride,
+  // BRAIN-403: `--exclusive`; the lane config's `exclusive` is the other way in
+  exclusive: exclusiveOverride,
   detach,
   timeoutMs,
   allowLocalSim,
@@ -229,6 +248,7 @@ export async function runCommand({
 
   let resolved;
   try {
+    assertHostConfigHookless();
     resolved = resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityOverride });
   } catch (err) {
     if (err instanceof ConfigError) {
@@ -237,10 +257,17 @@ export async function runCommand({
     }
     throw err;
   }
+  // BRAIN-403: exclusive lanes are local only. A runner (configRoot is set only by `lane remote-exec`) never honours an
+  // exclusive from a snapshot's lane config or a flag, so an incoming snapshot can never hold the runner.
+  const runnerIntake = configRoot !== undefined;
+  const exclusive = !runnerIntake && (exclusiveOverride === true || resolved.exclusive === true);
+  if (runnerIntake && (exclusiveOverride === true || resolved.exclusive === true)) {
+    process.stderr.write('lane run: exclusive ignored on runner intake (exclusive lanes are local only)\n');
+  }
   // BRAIN-380: resolved and validated before the reentrancy check below, so a bad value exits 64 on every path.
   let priority;
   try {
-    priority = resolvePriority({ cli: priorityOverride, env: process.env.LANE_BROKER_PRIORITY, configTier: resolved.priority });
+    priority = resolvePriority({ cli: priorityOverride, env: process.env.LANE_BROKER_PRIORITY, configTier: resolved.priority, exclusive });
   } catch (err) {
     if (err instanceof ConfigError) {
       process.stderr.write(`lane run: ${err.message}\n`);
@@ -265,6 +292,7 @@ export async function runCommand({
     Array.isArray(globalCfg.runners) &&
     globalCfg.runners.length > 0 &&
     !local &&
+    !exclusive &&
     process.env.LANE_BROKER_LOCAL !== '1' &&
     !process.env.LANE_BROKER_LEASE;
   // Resolved eagerly (not deferred to ticket construction) so the
@@ -273,7 +301,7 @@ export async function runCommand({
   // re-enable the local budget check, not just omit `ticket.remote`.
   const remoteWorktreeRoot = remoteWanted ? resolveWorktreeRoot(cwd) : null;
   const remoteEligible = remoteWanted && remoteWorktreeRoot !== null;
-  const localReason = localReasonFor(resolved, remoteEligible, local);
+  const localReason = localReasonFor(resolved, remoteEligible, local, exclusive);
   const { headTree, checkoutRoot } = gitTreeAndRoot(cwd);
   // No fingerprint (so no history relief, charge declared) when the checkout root is
   // unknown: falling back to cwd would fold a sub-package into the repo-root workload.
@@ -284,7 +312,8 @@ export async function runCommand({
   const resources = resolveTicketResources({
     weight,
     cpuCores: cpuOverride ?? resolved.cpuCores,
-    minCpuCores: minCpuOverride ?? resolved.minCpuCores ?? undefined,
+    // an exclusive claims the whole budget, so an elastic floor means nothing
+    minCpuCores: exclusive ? undefined : minCpuOverride ?? resolved.minCpuCores ?? undefined,
     memoryBytes: memoryOverride ?? resolved.memoryBytes,
     defaultMemoryBytesPerWeight: globalCfg.defaultMemoryBytesPerWeight,
   });
@@ -296,6 +325,15 @@ export async function runCommand({
     if (inheritedLeaseRecord) {
       const inheritedRepoId = inheritedKey && inheritedKey.includes(':') ? inheritedKey.slice(0, inheritedKey.indexOf(':')) : null;
       const sameKey = inheritedKey === resolved.key;
+      // BRAIN-403: an exclusive nested under another lane would wait on its own parent forever, and one nested under
+      // its own non-exclusive key would run directly under an ordinary lease (no exclusivity at all). Only a run
+      // reentering an already-exclusive lease may nest.
+      if (exclusive && !(sameKey && isExclusive(inheritedLeaseRecord))) {
+        process.stderr.write(
+          `lane run: refusing an exclusive lane nested under "${inheritedKey}" (it would wait on its own parent, or run under a non-exclusive lease); run it outside any lane\n`,
+        );
+        return { exitCode: 64 };
+      }
       // Reentrancy allows the exact same key, or a "prepush" lane run under
       // an inherited lease of the same repo (so the pre-push hook works
       // under any lane, not just the one it happens to nest inside).
@@ -358,12 +396,19 @@ export async function runCommand({
   // refusal to make. The supervisor (T3b-2) re-applies this exact check via
   // `checkResourceBudget` if the run ends up falling back to local.
   const host = detectResourceCapacity();
-  if (!remoteEligible) {
+  // An exclusive is admitted on the whole budget whatever it declares, so its declared size is not a refusal reason.
+  if (!remoteEligible && !exclusive) {
     const budget = checkResourceBudget({ resources, globalCfg, host });
     if (!budget.ok) {
       process.stderr.write(budget.message);
       return { exitCode: budget.exitCode };
     }
+  }
+  // BRAIN-452: every fresh submission is refused over the host-independent `maxLaneWeight`, a runner's intake included, so a weight valid
+  // on one host is valid on all of them; clamping is only for tickets an older config already queued.
+  if (oversizedWeight(weight, globalCfg.maxLaneWeight, exclusive)) {
+    process.stderr.write(`lane run: ${oversizedWeightMessage(weight, globalCfg.maxLaneWeight)}\n`);
+    return { exitCode: 64 };
   }
 
   const root = ensureStateDirs().root;
@@ -411,6 +456,7 @@ export async function runCommand({
     maxConcurrent: resolved.maxConcurrent,
     class: resolved.class,
     aging: resolved.aging,
+    ...(exclusive ? { exclusive: true } : {}),
     conflicts: resolved.conflicts,
     // BRAIN-320: carried so the supervisor's remote-fallback path
     // (`fallbackOrRefuse` in supervisor.js) can re-apply the local-sim
@@ -492,6 +538,7 @@ export async function runCommand({
       remoteSetup: resolved.remoteSetup,
       remoteDepsCache: resolved.remoteDepsCache,
       remoteDepsCacheRootScriptsSafe: resolved.remoteDepsCacheRootScriptsSafe,
+      remoteOmitEscapingSymlinks: resolved.remoteOmitEscapingSymlinks,
       remoteArtifacts: resolved.remoteArtifacts,
       remoteArtifactsOn: resolved.remoteArtifactsOn,
     };
@@ -613,12 +660,12 @@ export async function runCommand({
     for (;;) {
       const result = readJsonSafe(resultPath);
       if (result) {
-        return finishedReturn(resultExit('lane run', result));
+        return await finishedReturn(resultExit('lane run', result));
       }
       if (deadline && Date.now() > deadline) {
         const state = await describeLaneState(root, id, resultPath);
         if (state.finished) {
-          return finishedReturn(resultExit('lane run', state.result));
+          return await finishedReturn(resultExit('lane run', state.result));
         }
         process.stderr.write(`lane run: waited ${timeoutMs}ms, not failed — ${state.text}\n`);
         return abortReturn(75);
@@ -629,7 +676,7 @@ export async function runCommand({
         // before concluding it died with nothing to show for it.
         const finalResult = readJsonSafe(resultPath);
         if (finalResult) {
-          return finishedReturn(resultExit('lane run', finalResult));
+          return await finishedReturn(resultExit('lane run', finalResult));
         }
         // The supervisor exited without ever writing a result: it was cancelled
         // while still queued (or crashed) before the child ever ran.

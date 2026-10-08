@@ -19,6 +19,20 @@ const CALLS = Number(process.env.LANE_SCALE_CALLS ?? 1000);
 const P99_BOUND_MS = Number(process.env.LANE_SCALE_P99_MS ?? 300);
 const percentile = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * p) - 1)];
 
+/** BRAIN-453: host noise allowance. The p99 of a trivial query on the same connection, measured BEFORE the workload and capped, so a
+ *  saturated host widens the bound by what its round trips already cost, while a later load spike can never excuse a regression. */
+const NOISE_CAP_MS = 100;
+async function noiseAllowanceMs(client) {
+  const times = [];
+  for (let i = 0; i < 100; i += 1) {
+    const start = process.hrtime.bigint();
+    await client.query('SELECT 1');
+    times.push(Number(process.hrtime.bigint() - start) / 1e6);
+  }
+  times.sort((a, b) => a - b);
+  return Math.min(percentile(times, 0.99), NOISE_CAP_MS);
+}
+
 async function assertNeverAnalysed(su) {
   const { rows: [r] } = await su.query("SELECT last_analyze, last_autoanalyze FROM pg_stat_user_tables WHERE relid = 'lane.jobs'::regclass");
   assert.deepEqual(r, { last_analyze: null, last_autoanalyze: null }, 'the fixture must not have statistics for lane.jobs');
@@ -35,6 +49,7 @@ describe('lane.claim_next at scale', { skip: PG_SKIP_REASON ?? false, timeout: 6
     const agents = await seedScale(su, { jobs: 60000, groups: 40, hosts: 5 });
         await assertNeverAnalysed(su);
     const clients = await Promise.all(agents.map((a) => cluster.client(db, a.login)));
+    const noise = await noiseAllowanceMs(clients[0]);
     const times = [];
     for (let i = 0; i < CALLS; i++) {
       const start = process.hrtime.bigint();
@@ -45,8 +60,9 @@ describe('lane.claim_next at scale', { skip: PG_SKIP_REASON ?? false, timeout: 6
     times.sort((a, b) => a - b);
     const p50 = percentile(times, 0.5);
     const p99 = percentile(times, 0.99);
+    const bound = P99_BOUND_MS + noise;
     console.log(`claim_next at 60k queued jobs: p50 ${p50.toFixed(2)} ms, p99 ${p99.toFixed(2)} ms, max ${times.at(-1).toFixed(2)} ms over ${CALLS} calls (PostgreSQL ${await cluster.serverVersion()})`);
-    assert.ok(p99 < P99_BOUND_MS, `p99 ${p99.toFixed(1)} ms is not under ${P99_BOUND_MS} ms`);
+    assert.ok(p99 < bound, `p99 ${p99.toFixed(1)} ms is not under ${bound.toFixed(1)} ms (${P99_BOUND_MS} + ${noise.toFixed(1)} ms pre-measured host noise)`);
     const { rows: [{ n }] } = await su.query("SELECT count(*)::int AS n FROM lane.jobs WHERE state = 'claimed'");
     assert.equal(n, CALLS);
   });
@@ -57,6 +73,7 @@ describe('lane.claim_next at scale', { skip: PG_SKIP_REASON ?? false, timeout: 6
     const agents = await seedScale(su, { jobs: 400, groups: 8, hosts: 1 });
     await assertNeverAnalysed(su);
     const agent = await cluster.client(db, agents[0].login);
+    const noise = await noiseAllowanceMs(agent);
     const times = [];
     for (let i = 0; i < 300; i++) {
       const start = process.hrtime.bigint();
@@ -64,7 +81,8 @@ describe('lane.claim_next at scale', { skip: PG_SKIP_REASON ?? false, timeout: 6
       times.push(Number(process.hrtime.bigint() - start) / 1e6);
     }
     times.sort((a, b) => a - b);
+    const bound = 50 + noise;
     console.log(`claim_next on a never-analysed 400-job table: p50 ${percentile(times, 0.5).toFixed(2)} ms, p99 ${percentile(times, 0.99).toFixed(2)} ms (PostgreSQL ${await cluster.serverVersion()})`);
-    assert.ok(percentile(times, 0.99) < 50, `p99 ${percentile(times, 0.99).toFixed(1)} ms`);
+    assert.ok(percentile(times, 0.99) < bound, `p99 ${percentile(times, 0.99).toFixed(1)} ms is not under ${bound.toFixed(1)} ms (50 + ${noise.toFixed(1)} ms pre-measured host noise)`);
   });
 });

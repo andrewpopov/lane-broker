@@ -97,6 +97,9 @@ export function lookupEstimate(estimates, ref, cores) {
 /** Pure: the charge for a claim of `declared` cores: the p90 peak, floored at MIN_ESTIMATE_CORES, capped at the declaration. */
 export const clampEstimate = (p90, declared) => Math.min(declared, Math.max(MIN_ESTIMATE_CORES, p90));
 
+/** BRAIN-454: the charge when history may also RAISE it: the p90 peak, floored at MIN_ESTIMATE_CORES, capped at the host CPU budget (never the declaration). */
+export const raiseEstimate = (p90, ceiling) => Math.min(ceiling, Math.max(MIN_ESTIMATE_CORES, p90));
+
 const snapshots = new Map();
 
 /**

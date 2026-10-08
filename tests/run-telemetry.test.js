@@ -52,11 +52,16 @@ test('local success: exit 0, signal null, the grant, cpuSeconds', async () => {
 
 test('short run (shorter than sampleMs) still gets observedCpu from the early sample', async () => {
   const f = localEnv(60_000);
-  const result = await run(f, busyCmd(1800));
+  // The early sample fires a fixed second after the child is spawned. A `node -e` busy loop only starts burning once V8 has
+  // booted, which under a saturated machine can take longer than that second (observed peak 0, BRAIN-453); a shell loop burns
+  // from the first millisecond, so the sample lands inside the busy span whatever the load.
+  const result = await run(f, ['sh', '-c', 'while :; do :; done & p=$!; sleep 2.5; kill $p']);
   assert.equal(result.code, 0, result.stderr);
   const row = lastRow(f.state);
   assert.ok(row.observedCpu, 'a run shorter than one heartbeat interval must still be observed');
-  assert.ok(row.observedCpu.peak > 0.3, JSON.stringify(row.observedCpu));
+  // The property is that the early sample happened and saw the busy tree; its magnitude is the kernel's decayed per-process figure,
+  // which on a saturated host reads a few percent for a loop that has only just started (observed 0.031, BRAIN-453).
+  assert.ok(row.observedCpu.samples >= 1 && row.observedCpu.peak > 0, JSON.stringify(row.observedCpu));
   assert.ok(row.cpuSeconds > 0, `cpuSeconds ${row.cpuSeconds}`);
 });
 

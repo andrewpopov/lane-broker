@@ -14,6 +14,7 @@ import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfig } from './config.js';
 import { effectiveNow } from './priority-clock.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView } from './fairness.js';
+import { exclusiveHoldView, clampQueuedWeight } from './exclusive.js';
 import { priorityOf, effectiveRank, tierName } from './priority.js';
 import { leaseOverrun } from './observed.js';
 import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores } from './resources.js';
@@ -71,7 +72,9 @@ function computeHeadBlock(root, store, cfg, queue, leases, now, weightCapacity) 
   }
   // The EFFECTIVE capacity, never raw cfg.capacity: with `capacity: 'auto'` the raw value is a
   // string, the comparison is always false, and a capacity-blocked head was never reported.
-  if (runningWeight + head.weight > weightCapacity) {
+  // BRAIN-452: the weight admission will actually use (an oversized queued ticket is clamped), and the cause when it differs.
+  const admitted = clampQueuedWeight(head, cfg, weightCapacity);
+  if (runningWeight + admitted.weight > weightCapacity) {
     const capState = readCapacitySkipState(root, store, head.id);
     const sameHead = capState.headId === head.id;
     const skipCount = sameHead ? capState.count : 0;
@@ -79,7 +82,8 @@ function computeHeadBlock(root, store, cfg, queue, leases, now, weightCapacity) 
     return {
       kind: 'capacity',
       headId: head.id,
-      headWeight: head.weight,
+      headWeight: admitted.weight,
+      ...(admitted.weightClampedFrom ? { oversizedWeight: admitted.weightClampedFrom } : {}),
       runningWeight,
       capacity: weightCapacity,
       skipCount,
@@ -105,7 +109,7 @@ function computeResourceBlock(root, store, cfg, head, held, now) {
     limit: cfg.resourceSkipLimit,
     reserved: record.reserved && !futileFresh(record, cfg, now),
     futile: futileFresh(record, cfg, now),
-    projectedBusy: projectBusy(record.externalBusy, held, ticketCpuEstimate(head, cfg), now, cfg),
+    projectedBusy: projectBusy(record.externalBusy, held, ticketCpuEstimate(head, cfg, now, held.length > 0 ? record.budget : undefined), now, cfg, record.budget),
     budget: record.budget,
     deniedAgeMs: now - record.deniedAt,
   };
@@ -173,6 +177,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       logAgeMs: logMtimeAgeMs(l.logPath),
       log: l.logPath,
       weight: l.weight,
+      ...(l.exclusive === true ? { exclusive: true } : {}),
       // BRAIN-255: default 1 for a lease written before this field existed,
       // matching resolveTicketConfig's own compatibility default.
       maxConcurrent: l.maxConcurrent ?? 1,
@@ -207,9 +212,10 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       waitedMs: now - t.createdAt,
       priority: tier,
       ...(t.id === reservationOwnerId ? { reservationOwner: true } : {}),
+      ...(t.exclusive === true ? { exclusive: true } : {}),
       ...(tierName(rank) !== tier ? { effectiveRank: tierName(rank) } : {}),
       resources: leaseResources(t, cfg),
-      cpuEstimate: ticketCpuEstimateBasis(t, cfg, now),
+      cpuEstimate: ticketCpuEstimateBasis(t, cfg, now, held.length > 0 ? cpuBudget({ cores: resourceCapacity.cpuCores }, cfg) : undefined),
     };
   });
 
@@ -260,6 +266,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
     },
     paused,
     draining,
+    exclusiveHold: exclusiveHoldView(queue, held),
     priority: sched.v2 ? { active: true, mode: 'v2', nowEff, reservationOwner: reservationOwnerId } : { active: false, mode: 'legacy', nowEff },
     ...(cfg.allocationShadow ? { allocation: computeAllocation(root, cfg, queue.filter(Boolean), held, resourceCapacity.cpuCores, now) } : {}),
     // BRAIN-249: null unless the queue is genuinely stalled (a conflict-
@@ -412,7 +419,8 @@ export function renderStatusText(status) {
       lines.push(
         `queue stalled: head ${hb.headId} (weight ${hb.headWeight}) does not fit capacity ` +
           `(${hb.runningWeight}/${hb.capacity} running); skip allowance exhausted (${hb.skipCount}/${hb.skipLimit}), ` +
-          `backfill refused until running work drains`,
+          `backfill refused until running work drains` +
+          (hb.oversizedWeight ? `; cause: declared weight ${hb.oversizedWeight} is over this host's queued-weight limit (maxLaneWeight / half the capacity), admitted at ${hb.headWeight} (BRAIN-452: declare exclusive: true or use cpuCores)` : ''),
       );
     } else {
       lines.push(
@@ -452,6 +460,10 @@ export function renderStatusText(status) {
   } else if (status.draining) {
     lines.push(`drain marker is stale (pid ${status.draining.pid} is gone); the next lane run or lane migrate-scheduler clears it`);
   }
+  if (status.exclusiveHold) {
+    const h = status.exclusiveHold;
+    lines.push(`HOLD (exclusive) ${h.id} (${h.key}) waiting for ${h.waitingFor} running lane(s)`);
+  }
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
   if (status.configWarning) {
     lines.push(
@@ -465,7 +477,7 @@ export function renderStatusText(status) {
     lines.push('  (none)');
   } else {
     for (const r of status.running) {
-      const flag = (r.state === 'ORPHANED' ? ' [ORPHANED]' : '') + (r.overrun ? ` [OVERRUN peak ${r.overrun.observedPeak} for ${fmtMs(r.overrun.sinceMs)}]` : '');
+      const flag = (r.exclusive ? ' [exclusive]' : '') + (r.state === 'ORPHANED' ? ' [ORPHANED]' : '') + (r.overrun ? ` [OVERRUN peak ${r.overrun.observedPeak} for ${fmtMs(r.overrun.sinceMs)}]` : '');
       // BRAIN-255: only shown once it's non-default, so "2 running" reads
       // differently against a maxConcurrent: 8 lane than a plain exclusive
       // one, without cluttering the common (ceiling 1) case.
@@ -484,7 +496,7 @@ export function renderStatusText(status) {
   } else {
     for (const q of status.queued) {
       const tier = q.priority ? `  priority=${q.priority}${q.effectiveRank ? ` (aged to ${q.effectiveRank})` : ''}` : '';
-      lines.push(`  #${q.position} ${q.id}  key=${q.key}${q.cpuEstimate ? `  cpu~${q.cpuEstimate.cores.toFixed(2)}(${q.cpuEstimate.source})` : ''}  waited=${fmtMs(q.waitedMs)}${tier}${q.reservationOwner ? '  [reservation owner]' : ''}`);
+      lines.push(`  #${q.position} ${q.id}  key=${q.key}${q.cpuEstimate ? `  cpu~${q.cpuEstimate.cores.toFixed(2)}(${q.cpuEstimate.source})` : ''}  waited=${fmtMs(q.waitedMs)}${tier}${q.reservationOwner ? '  [reservation owner]' : ''}${q.exclusive ? '  [exclusive]' : ''}`);
     }
   }
   if (status.remote) {

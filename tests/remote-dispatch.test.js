@@ -88,14 +88,14 @@ test('die-midstream: falls back to local and reports the LOCAL exit', async () =
   assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
 });
 
-test('result-tamper: a record that does not bind proves nothing, so the ticket is NOT run locally (it may be live) and stays reported', { timeout: 120_000 }, async () => {
+test('result-tamper: a record that does not bind proves nothing, so the ticket is NOT run locally (it may be live) and stays reported', { timeout: 300_000 }, async () => {
   const { env, state, repoDir } = setup({ ssh: 'result-tamper' });
   const marker = path.join(tmpDir('marker'), 'where');
   const { id, waited } = await detachAndWait(
     ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 9)],
     env,
     repoDir,
-    '60s',
+    '180s',
   );
   assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
   assert.match(waited.stderr, /ORPHANED-REMOTE/);
@@ -172,7 +172,7 @@ setInterval(() => {}, 1000);
   child.stderr.on('data', (d) => {
     stderr += d;
   });
-  await waitFor(() => fs.existsSync(startedMarker), { timeoutMs: 15_000 });
+  await waitFor(() => fs.existsSync(startedMarker), { timeoutMs: 120_000 });
   await sleep(300);
   child.kill('SIGINT');
   const exitCode = await new Promise((resolve) => child.on('close', resolve));
@@ -191,10 +191,10 @@ test('BRAIN-364: a cancel landing after a fallback child exited 0 leaves the res
   const started = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], { env: holdEnv, cwd: repoDir });
   assert.equal(started.code, 0, started.stderr);
   const id = started.stdout.trim();
-  await waitFor(() => fs.existsSync(ready), { timeoutMs: 30_000 });
+  await waitFor(() => fs.existsSync(ready), { timeoutMs: 120_000 });
   assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
   const cancel = laneRun(['cancel', id], { env, cwd: repoDir });
-  await waitFor(() => isCancelled(state, id), { timeoutMs: 15_000 });
+  await waitFor(() => isCancelled(state, id), { timeoutMs: 120_000 });
   fs.writeFileSync(go, 'x');
   await cancel;
   const result = resultOf(state, id);
@@ -213,9 +213,9 @@ test('BRAIN-364: a cancel landing between admission and spawn of a fallback tick
   const started = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(path.join(dir, 'where'), 0)], { env: holdEnv, cwd: repoDir });
   assert.equal(started.code, 0, started.stderr);
   const id = started.stdout.trim();
-  await waitFor(() => fs.existsSync(ready), { timeoutMs: 30_000 });
+  await waitFor(() => fs.existsSync(ready), { timeoutMs: 120_000 });
   const cancel = laneRun(['cancel', id], { env, cwd: repoDir });
-  await waitFor(() => isCancelled(state, id), { timeoutMs: 15_000 });
+  await waitFor(() => isCancelled(state, id), { timeoutMs: 120_000 });
   fs.writeFileSync(go, 'x');
   await cancel;
   const result = resultOf(state, id);
@@ -228,7 +228,7 @@ test('BRAIN-364: a cancel landing between admission and spawn of a fallback tick
 
 // ---- Codex pre-merge BLOCKER #2: drain-then-publish, real async drain ----
 
-test('SIGINT during the post-completion drain of a remote success still reports 130, never the child\'s own 0', async () => {
+test('SIGINT during the post-completion drain of a remote success still reports 130, never the child\'s own 0', { timeout: 360_000 }, async () => {
   const { env, repoDir } = setup();
   const logPath = path.join(tmpDir('log'), 'out.log');
   // Deliberately large + a slow reader: the goal is to make the SUPERVISOR's
@@ -243,13 +243,16 @@ test('SIGINT during the post-completion drain of a remote success still reports 
     { env, cwd: repoDir },
   );
   let sentSignal = false;
-  child.stdout.on('data', async (chunk) => {
+  child.stdout.on('data', (chunk) => {
     if (!sentSignal) {
       sentSignal = true;
       child.kill('SIGINT');
     }
     void chunk;
-    await sleep(40);
+    // Pause for real: an async handler does not slow a flowing stream, so under load the drain could finish before the
+    // SIGINT was even delivered. Backpressure keeps 24MB in flight for >= 40ms per chunk whatever the CPU is doing.
+    child.stdout.pause();
+    setTimeout(() => child.stdout.resume(), 40);
   });
   let stderr = '';
   child.stderr.on('data', (d) => {
@@ -257,7 +260,7 @@ test('SIGINT during the post-completion drain of a remote success still reports 
   });
 
   const exitCode = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('timed out -- likely hung')), 90_000);
+    const timer = setTimeout(() => reject(new Error('timed out -- likely hung')), 300_000);
     child.on('close', (code) => {
       clearTimeout(timer);
       resolve(code);
@@ -291,7 +294,7 @@ setInterval(() => {}, 1000);
       stderr += d;
     });
 
-    await waitFor(() => fs.existsSync(startedMarker), { timeoutMs: 15_000 });
+    await waitFor(() => fs.existsSync(startedMarker), { timeoutMs: 120_000 });
     await sleep(300);
     child.kill('SIGINT');
 
@@ -313,7 +316,7 @@ setInterval(() => {}, 1000);
       }
     });
     const resultPath = path.join(ticketsDir, remoteTicketId, 'result.json');
-    const record = await waitFor(() => readJsonSafe(resultPath), { timeoutMs: 15_000 });
+    const record = await waitFor(() => readJsonSafe(resultPath), { timeoutMs: 120_000 });
     assert.equal(record.kind, 'cancelled');
   },
 );
@@ -344,11 +347,11 @@ test('oversize resources + a usable runner: BRAIN-320 S1e catches the impossible
   // T3b-1) and dialed the runner regardless, which refused on its OWN
   // admission once dispatched (`kind: 'refused'`). Now the client's fit
   // check (1e) is a STATIC impossibility check using that same probe
-  // capacity: weight 1000 can never fit a runner whose reported capacity
-  // weight is 4, so selectRunner skips it without ever dialing -- same
+  // capacity: 1000 cores can never fit a runner whose reported CPU
+  // budget is tiny, so selectRunner skips it without ever dialing -- same
   // "no runners usable" fallback shape as the runner-down case below, and
   // the LOCAL preflight (this same restrictive config) then refuses it too.
-  const { env, state, repoDir } = setup({ cpuAdmissionPercent: 1, weight: 1000 });
+  const { env, state, repoDir } = setup({ cpuAdmissionPercent: 1, cpuCores: 1000 }) // BRAIN-452: a 1000 weight is refused at submission now, so the oversize is CPU;
   const marker = path.join(tmpDir('marker'), 'where');
   const { id, waited } = await detachAndWait(
     ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
@@ -369,7 +372,7 @@ test('oversize resources + a usable runner: BRAIN-320 S1e catches the impossible
 });
 
 test('oversize resources + the runner down: refused exactly as today, once it falls back', async () => {
-  const { env, state, repoDir } = setup({ ssh: 'down', cpuAdmissionPercent: 1, weight: 1000 });
+  const { env, state, repoDir } = setup({ ssh: 'down', cpuAdmissionPercent: 1, cpuCores: 1000 });
   const marker = path.join(tmpDir('marker'), 'where');
   const { id, waited } = await detachAndWait(
     ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
@@ -383,7 +386,7 @@ test('oversize resources + the runner down: refused exactly as today, once it fa
 
 // ---- large output under a slow foreground reader ----
 
-test('~5MB of remote stdout under a slowly-draining foreground caller completes, passes the exit through, and caps --log like the local path', async () => {
+test('~5MB of remote stdout under a slowly-draining foreground caller completes, passes the exit through, and caps --log like the local path', { timeout: 360_000 }, async () => {
   const { env, repoDir } = setup();
   const logPath = path.join(tmpDir('log'), 'out.log');
   const bytes = 5 * 1024 * 1024;
@@ -393,12 +396,12 @@ test('~5MB of remote stdout under a slowly-draining foreground caller completes,
     cwd: repoDir,
   });
   let total = 0;
-  child.stdout.on('data', async (chunk) => {
+  child.stdout.on('data', (chunk) => {
     total += chunk.length;
-    // Deliberately slow: yield past several backpressure-relevant ticks
-    // before consuming the next chunk, so the writer side (ForwardWriter)
-    // is exercised under real drain pressure rather than draining instantly.
-    await sleep(5);
+    // Deliberately slow: pause the stream (real backpressure, which an async handler does not apply) before consuming the
+    // next chunk, so the writer side (ForwardWriter) is exercised under real drain pressure rather than draining instantly.
+    child.stdout.pause();
+    setTimeout(() => child.stdout.resume(), 5);
   });
   let stderr = '';
   child.stderr.on('data', (d) => {
@@ -406,7 +409,7 @@ test('~5MB of remote stdout under a slowly-draining foreground caller completes,
   });
 
   const exitCode = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error('timed out -- likely hung')), 60_000);
+    const timer = setTimeout(() => reject(new Error('timed out -- likely hung')), 300_000);
     child.on('close', (code) => {
       clearTimeout(timer);
       resolve(code);
@@ -485,7 +488,7 @@ test('protocol 2: remoteDeps (npm ci) fails -> exit is npm ci\'s exit, the local
     ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
     env,
     repoDir,
-    '60s',
+    '180s',
   );
   assert.notEqual(waited.code, 0, `stderr: ${waited.stderr}`);
   assert.equal(fs.existsSync(marker), false, 'the local command must never have run');
@@ -572,7 +575,7 @@ test('queue timeout: a user cancel while queued (deadline still pending) exits 1
         return null;
       }
     },
-    { timeoutMs: 15_000 },
+    { timeoutMs: 120_000 },
   );
   child.kill('SIGINT');
 
@@ -582,7 +585,7 @@ test('queue timeout: a user cancel while queued (deadline still pending) exits 1
 
   const [remoteTicketId] = fs.readdirSync(ticketsDir);
   const resultPath = path.join(ticketsDir, remoteTicketId, 'result.json');
-  const record = await waitFor(() => readJsonSafe(resultPath), { timeoutMs: 15_000 });
+  const record = await waitFor(() => readJsonSafe(resultPath), { timeoutMs: 120_000 });
   assert.equal(record.kind, 'cancelled');
   assert.notEqual(record.reason, 'queue-timeout');
 });
@@ -604,7 +607,7 @@ test('queue timeout: with no remoteQueueTimeoutMs configured, a busy runner brok
     ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
     env,
     repoDir,
-    '30s',
+    '180s',
   );
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'remote', 'no queueTimeoutMs was configured, so the ticket must never have expired');
@@ -645,14 +648,15 @@ test('mixed versions: a v1 (optionless) lane still dispatches remotely against t
 
 test('remote run: waitedMs records the wait before the command started, not the ~2.5s the command ran', async () => {
   const { env, state, repoDir } = setup();
-  const runMs = 2500;
+  // Long enough that the ssh connect + runner startup the formula counts as wait (seconds under load) stays well under the run.
+  const runMs = 8000;
   const cmd = [process.execPath, '-e', `setTimeout(() => process.exit(0), ${runMs});`];
   const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...cmd], env, repoDir);
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
   const result = resultOf(state, id);
   assert.equal(result.executor, 'remote');
   assert.ok(Number.isFinite(result.waitedMs), `waitedMs should be a number, got ${result.waitedMs}`);
-  assert.ok(result.waitedMs < runMs - 500, `waitedMs ${result.waitedMs} must not include the ${runMs}ms run`);
+  assert.ok(result.waitedMs < runMs, `waitedMs ${result.waitedMs} must not include the ${runMs}ms run`);
   assert.ok(result.endedAt - result.startedAt >= runMs - 100, 'startedAt must still mean "command started"');
 });
 
@@ -671,24 +675,25 @@ test('remote run: a result that lands 6s after the run ended does not count the 
   assert.ok(result.endedAt - result.startedAt >= 5500, 'the delivery delay sits between startedAt and endedAt, not before startedAt');
 });
 
-test('remote run: a result from a runner that reports no queuedMs still gets a waitedMs (the BRAIN-341 formula)', async () => {
+test('remote run: a result from a runner that reports no queuedMs still gets a waitedMs (the BRAIN-341 formula)', { timeout: 240_000 }, async () => {
   const { env, state, repoDir } = setup({ ssh: 'legacy-result' });
-  const runMs = 2500;
+  // Long enough that the ssh connect + runner startup the formula counts as wait (seconds under load) stays well under the run.
+  const runMs = 8000;
   const cmd = [process.execPath, '-e', `setTimeout(() => process.exit(0), ${runMs});`];
   const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...cmd], env, repoDir);
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
   const result = resultOf(state, id);
   assert.equal(result.executor, 'remote');
   assert.ok(Number.isFinite(result.waitedMs), `waitedMs should be a number, got ${result.waitedMs}`);
-  assert.ok(result.waitedMs < runMs - 500, `waitedMs ${result.waitedMs} must not include the ${runMs}ms run`);
+  assert.ok(result.waitedMs < runMs, `waitedMs ${result.waitedMs} must not include the ${runMs}ms run`);
 });
 
 // ---- BRAIN-363: an unconfirmed expiry cancel must never lead to a second (local) execution ----
 
-test('remote run: result-wait expiry with an unconfirmed cancel is never re-run locally, and the attempt stays reported and cancellable', { timeout: 120_000 }, async () => {
+test('remote run: result-wait expiry with an unconfirmed cancel is never re-run locally, and the attempt stays reported and cancellable', { timeout: 300_000 }, async () => {
   const { env, state, repoDir } = setup({ ssh: 'stuck-running', remoteResultWaitMs: 1 });
   const marker = path.join(tmpDir('marker'), 'where');
-  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], env, repoDir, '60s');
+  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], env, repoDir, '180s');
   assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
   assert.equal(fs.existsSync(marker), false, 'the job must not have been re-run locally');
   assert.match(waited.stderr, /ORPHANED-REMOTE/);
@@ -705,7 +710,7 @@ test('remote run: result-wait expiry with an unconfirmed cancel is never re-run 
 
 // ---- BRAIN-437: a dispatch the runner may have accepted is never re-run locally without proof it never started ----
 
-test('BRAIN-437: ssh dropped after the runner took the job, fetches all failing, withdraw not confirmed: not re-run locally, attempt kept and cancellable', { timeout: 120_000 }, async () => {
+test('BRAIN-437: ssh dropped after the runner took the job, fetches all failing, withdraw not confirmed: not re-run locally, attempt kept and cancellable', { timeout: 300_000 }, async () => {
   const { env, state, repoDir } = setup({ ssh: 'drop-stuck' });
   const marker = path.join(tmpDir('marker'), 'where');
   const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], env, repoDir, '90s');
@@ -719,10 +724,20 @@ test('BRAIN-437: ssh dropped after the runner took the job, fetches all failing,
   assert.equal(readAttempt(state, id), null);
 });
 
-test('BRAIN-437: the same drop with a runner that confirms `withdrawn` falls back to local, once', { timeout: 120_000 }, async () => {
+test('BRAIN-437: the same drop with a runner that confirms `withdrawn` falls back to local, once', { timeout: 300_000 }, async () => {
   const { env, repoDir } = setup({ ssh: 'drop-withdrawn' });
   const marker = path.join(tmpDir('marker'), 'where');
   const { waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 7)], env, repoDir, '90s');
   assert.equal(waited.code, 7, `stderr: ${waited.stderr}`);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
+});
+
+test('BRAIN-452: a fresh oversized weight is refused with exit 64 even for a remote-eligible lane, before anything is enqueued', async () => {
+  const { env, state, repoDir } = setup({ weight: 5 }); // maxLaneWeight 4
+  const marker = path.join(tmpDir('marker'), 'where');
+  const res = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...markerCmd(marker, 0)], { env, cwd: repoDir });
+  assert.equal(res.code, 64, res.stderr);
+  assert.match(res.stderr, /weight 5 would hold most of this machine's capacity.*BRAIN-452/);
+  assert.equal(fs.existsSync(marker), false, 'never ran, remotely or locally');
+  assert.deepEqual(fs.existsSync(paths(state).queue) ? fs.readdirSync(paths(state).queue) : [], [], 'nothing enqueued');
 });

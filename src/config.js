@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { isCanonicalRelPath } from './remote-manifest.js';
+import { unsupportedHookKeys, hookRefusalMessage } from './exclusive.js';
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
 import { DEFAULT_DEPS_CACHE_MAX_BYTES } from './deps-cache.js';
 
@@ -45,6 +46,10 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // declaration) instead of the declaration, once it has historyDemandMinRuns successful runs.
   historyDemandEnabled: true,
   historyDemandMinRuns: 5,
+  // BRAIN-454: history may also RAISE a charge for an under-declared lane (p90 above its declaration), capped at the host CPU budget.
+  historyDemandRaise: true,
+  // BRAIN-452: the heaviest weight a non-exclusive lane may declare; identical on every host so a submission valid on one is valid on all.
+  maxLaneWeight: 4,
   // Second, separate body of work (conflict-skip starvation bound — see
   // selectCandidate() in src/scheduler.js): how many times a conflict-blocked
   // FIFO head may be skipped in favor of a later, non-conflicting ticket
@@ -228,6 +233,8 @@ function validateGlobalConfig(cfg, sourcePath) {
     `${sourcePath}: "settledDemandFloorFraction" must be a number in [0, 1]`,
   );
   assert(typeof cfg.historyDemandEnabled === 'boolean', `${sourcePath}: "historyDemandEnabled" must be a boolean`);
+  assert(Number.isInteger(cfg.maxLaneWeight) && cfg.maxLaneWeight >= 1, `${sourcePath}: "maxLaneWeight" must be a positive integer`);
+  assert(typeof cfg.historyDemandRaise === 'boolean', `${sourcePath}: "historyDemandRaise" must be a boolean`);
   assert(Number.isInteger(cfg.historyDemandMinRuns) && cfg.historyDemandMinRuns >= 1, `${sourcePath}: "historyDemandMinRuns" must be a positive integer`);
   assert(
     Number.isInteger(cfg.conflictSkipLimit) && cfg.conflictSkipLimit >= 0,
@@ -444,10 +451,16 @@ export const LANE_CLASSES = ['test', 'sim'];
 /** BRAIN-379: the largest CPU claim a sim lane may resolve to (an unset cpuCores resolves to weight). */
 export const MAX_SIM_CPU_CORES = 2;
 
+function assertNoHookKeys(config, where) {
+  const keys = unsupportedHookKeys(config);
+  assert(keys.length === 0, hookRefusalMessage(where, keys));
+}
+
 function validateRepoConfig(cfg, sourcePath) {
   assert(cfg && typeof cfg === 'object', `${sourcePath}: config must be an object`);
   assert(Number.isInteger(cfg.version), `${sourcePath}: "version" must be an integer`);
   assert(cfg.lanes && typeof cfg.lanes === 'object' && !Array.isArray(cfg.lanes), `${sourcePath}: "lanes" must be an object`);
+  assertNoHookKeys(cfg, sourcePath);
   for (const [name, lane] of Object.entries(cfg.lanes)) {
     assert(lane && typeof lane === 'object', `${sourcePath}: lane "${name}" must be an object`);
     assert(Number.isFinite(lane.weight) && lane.weight > 0, `${sourcePath}: lane "${name}".weight must be a positive number`);
@@ -493,6 +506,11 @@ function validateRepoConfig(cfg, sourcePath) {
     if (lane.aging !== undefined) {
       assert(typeof lane.aging === 'boolean', `${sourcePath}: lane "${name}".aging must be a boolean`);
     }
+    if (lane.exclusive !== undefined) {
+      assert(typeof lane.exclusive === 'boolean', `${sourcePath}: lane "${name}".exclusive must be a boolean`);
+    }
+    // BRAIN-403: hooks are host-only and not supported yet; a lane carrying them is refused rather than silently ignored
+    assertNoHookKeys(lane, `${sourcePath}: lane "${name}"`);
     if (lane.maxConcurrent !== undefined) {
       assert(
         Number.isInteger(lane.maxConcurrent) && lane.maxConcurrent >= 1,
@@ -529,7 +547,7 @@ function validateRepoConfig(cfg, sourcePath) {
     if (lane.localFirstWaitMs !== undefined) {
       assert(Number.isInteger(lane.localFirstWaitMs) && lane.localFirstWaitMs >= 0, `${sourcePath}: lane "${name}".localFirstWaitMs must be a non-negative integer`);
     }
-    for (const field of ['remoteDepsCache', 'remoteDepsCacheRootScriptsSafe']) {
+    for (const field of ['remoteDepsCache', 'remoteDepsCacheRootScriptsSafe', 'remoteOmitEscapingSymlinks']) {
       if (lane[field] !== undefined) assert(typeof lane[field] === 'boolean', `${sourcePath}: lane "${name}".${field} must be a boolean`);
     }
   }
@@ -578,14 +596,15 @@ function validateRepoConfig(cfg, sourcePath) {
  * then medium. A value is validated only when it is the one that applies; an invalid one throws
  * ConfigError, which `lane run` maps to exit 64.
  */
-export function resolvePriority({ cli, env, configTier }) {
+export function resolvePriority({ cli, env, configTier, exclusive = false }) {
   const choose = (value, source) => {
     assert(isPriorityTier(value), `${source} must be one of ${PRIORITY_TIERS.join(', ')} (got "${value}")`);
     return value;
   };
   if (cli !== undefined) return choose(cli, '--priority');
   if (env !== undefined) return choose(env, 'LANE_BROKER_PRIORITY');
-  return configTier ?? DEFAULT_PRIORITY;
+  // BRAIN-403: an exclusive defaults to high, still under cli > env > lane config
+  return configTier ?? (exclusive ? 'high' : DEFAULT_PRIORITY);
 }
 
 export function loadGlobalConfig() {
@@ -629,6 +648,23 @@ export function reloadGlobalConfig(previous, { onError } = {}) {
     if (onError) onError(err);
     return fallback;
   }
+}
+
+/**
+ * BRAIN-403: `lane run` refuses a host config that carries the unsupported exclusive-hook keys. This reads the file
+ * itself rather than going through `reloadGlobalConfig`, whose fallback turns every validation failure into the previous
+ * or default configuration and so would swallow the refusal. A missing or unparseable file is not this check's concern.
+ */
+export function assertHostConfigHookless() {
+  const file = path.join(brokerHome(), 'config.json');
+  let parsed;
+  try {
+    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return;
+  }
+  const keys = unsupportedHookKeys(parsed);
+  if (keys.length > 0) throw new ConfigError(hookRefusalMessage(file, keys));
 }
 
 const repoIdentityCache = new Map();
@@ -827,7 +863,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   if (isDeclaredLane) {
     laneCfg = repoConfig.lanes[laneName];
   } else if (undeclaredTemplateName) {
-    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/noProgressTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteArtifacts/remoteArtifactsOn/class/priority/aging
+    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/noProgressTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteOmitEscapingSymlinks/remoteArtifacts/remoteArtifactsOn/class/priority/aging
     // from the named declared lane, keeping this lane's OWN key/name. Not
     // inherited: `localRefused` (stays default false), the template's named
     // conflicts (only the `*` wildcard universe below reaches this lane, same
@@ -848,6 +884,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       remotePolicy: templateCfg.remotePolicy,
       localFirstWaitMs: templateCfg.localFirstWaitMs,
       remoteDepsCacheRootScriptsSafe: templateCfg.remoteDepsCacheRootScriptsSafe,
+      remoteOmitEscapingSymlinks: templateCfg.remoteOmitEscapingSymlinks,
       remoteArtifacts: templateCfg.remoteArtifacts,
       remoteArtifactsOn: templateCfg.remoteArtifactsOn,
       class: templateCfg.class,
@@ -897,6 +934,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     priority: isPriorityTier(laneCfg.priority) ? laneCfg.priority : null,
     // ROG-2181: false stops this lane's tickets accruing priority age; every lane predating the field ages.
     aging: laneCfg.aging !== false,
+    // BRAIN-403: never inherited through an undeclaredLanes template (the template literal above does not copy it)
+    exclusive: laneCfg.exclusive === true,
     conflicts,
     // BRAIN-319 T3a: opt-in per lane, defaulted false so a repo config
     // written before this field exists resolves identically (I6).
@@ -913,6 +952,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     remoteDepsCache: laneCfg.remoteDepsCache !== false,
     // BRAIN-389: true declares this lane's root install/prepare scripts leave node_modules alone, so a cached tree is safe.
     remoteDepsCacheRootScriptsSafe: laneCfg.remoteDepsCacheRootScriptsSafe === true,
+    // BRAIN-334: true leaves a tracked symlink that points outside the repo out of the remote snapshot instead of making the lane ineligible.
+    remoteOmitEscapingSymlinks: laneCfg.remoteOmitEscapingSymlinks === true,
     // BRAIN-398: files a remote run returns to the submitter's worktree; ignored by a local run (they are already there).
     remoteArtifacts: Array.isArray(laneCfg.remoteArtifacts) ? laneCfg.remoteArtifacts : null,
     remoteArtifactsOn: laneCfg.remoteArtifactsOn === 'always' ? 'always' : 'success',

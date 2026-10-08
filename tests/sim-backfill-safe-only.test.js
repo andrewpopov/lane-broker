@@ -24,6 +24,7 @@ const baseCfg = (overrides = {}) => ({
   ...DEFAULT_GLOBAL_CONFIG,
   schedulerMode: 'active',
   capacity: 10,
+  maxLaneWeight: 5, // BRAIN-452: weights up to half the capacity
   loadClose: 1000,
   loadOpen: 900,
   loadOpenSamples: 1,
@@ -56,17 +57,17 @@ const ticket = (id, overrides = {}) => ({
 const heldLease = (id, key, weight = 1) => ({ id, key, bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight, state: LEASE_STATE.RUNNING });
 
 // a conflict-blocked head: weight 3, conflicting with the running rouge:sim lease
-async function conflictedHead(state, skipCount) {
+async function conflictedHead(state, skipCount, headWeight = 3) {
   writeLease(state, heldLease('holder', 'rouge:sim'));
-  await enqueue(state, ticket('head', { key: 'rouge:default', weight: 3, conflicts: ['rouge:sim'] }));
+  await enqueue(state, ticket('head', { key: 'rouge:default', weight: headWeight, conflicts: ['rouge:sim'] }));
   atomicWriteJson(paths(state).conflictSkipState, { headId: 'head', count: skipCount, blockedSince: Date.now(), loggedPhase: skipCount >= LIMIT ? 'exhausted' : 'blocked' });
 }
 
 test('capacity skip: a test ticket passes a head that does not fit capacity, a sim ticket does not', async () => {
   for (const [klass, expected] of [['test', true], ['sim', false]]) {
     const { state } = freshEnv();
-    writeLease(state, heldLease('holder', 'r:holder', 5));
-    await enqueue(state, ticket('head', { weight: 8 }));
+    writeLease(state, heldLease('holder', 'r:holder', 7));
+    await enqueue(state, ticket('head', { weight: 4 }));
     const behind = ticket('behind', { class: klass });
     await enqueue(state, behind);
     const result = await poll(state, behind, baseCfg());
@@ -77,8 +78,8 @@ test('capacity skip: a test ticket passes a head that does not fit capacity, a s
 
 test('capacity skip: a sim ticket behind a SIM head keeps today\'s skip', async () => {
   const { state } = freshEnv();
-  writeLease(state, heldLease('holder', 'r:holder', 5));
-  await enqueue(state, ticket('head', { weight: 8, class: 'sim' }));
+  writeLease(state, heldLease('holder', 'r:holder', 7));
+  await enqueue(state, ticket('head', { weight: 4, class: 'sim' }));
   const behind = ticket('behind', { class: 'sim' });
   await enqueue(state, behind);
   assert.equal((await poll(state, behind, baseCfg())).started, true);
@@ -86,8 +87,8 @@ test('capacity skip: a sim ticket behind a SIM head keeps today\'s skip', async 
 
 test('capacity skip: a sim ticket is stepped over so a LATER test ticket still backfills', async () => {
   const { state } = freshEnv();
-  writeLease(state, heldLease('holder', 'r:holder', 5));
-  await enqueue(state, ticket('head', { weight: 8 }));
+  writeLease(state, heldLease('holder', 'r:holder', 7));
+  await enqueue(state, ticket('head', { weight: 4 }));
   await enqueue(state, ticket('sim', { class: 'sim' }));
   const test1 = ticket('test1');
   await enqueue(state, test1);
@@ -152,8 +153,8 @@ test('safe backfill: an exhausted conflict-blocked head still admits a sim ticke
 
 test('safe backfill: a sim ticket that WOULD delay the exhausted head is refused', async () => {
   const { state } = freshEnv();
-  await conflictedHead(state, LIMIT);
-  const sim = ticket('sim', { key: 'jun:default', weight: 9, class: 'sim' }); // 1 held + 3 head + 9 > 10
+  await conflictedHead(state, LIMIT, 5); // BRAIN-452: 5 is the heaviest weight capacity 10 allows
+  const sim = ticket('sim', { key: 'jun:default', weight: 5, class: 'sim' }); // 1 held + 5 head + 5 > 10
   await enqueue(state, sim);
   assert.equal((await poll(state, sim, baseCfg())).reason, 'not-head');
 });
@@ -172,15 +173,15 @@ test('conflict grace expiry: backfill resumes for tests, but a sim behind the te
   const run = async (klass, weight) => {
     const { state } = freshEnv();
     writeLease(state, heldLease('holder', 'rouge:sim'));
-    await enqueue(state, ticket('head', { key: 'rouge:default', weight: 3, conflicts: ['rouge:sim'] }));
+    await enqueue(state, ticket('head', { key: 'rouge:default', weight: 5, conflicts: ['rouge:sim'] })); // BRAIN-452: heaviest weight capacity 10 allows
     const longAgo = Date.now() - 2 * baseCfg().headBlockGraceMs;
     atomicWriteJson(paths(state).conflictSkipState, { headId: 'head', count: LIMIT, blockedSince: longAgo, loggedPhase: 'exhausted' });
     const behind = ticket('behind', { key: 'jun:default', weight, class: klass });
     await enqueue(state, behind);
     return { state, result: await poll(state, behind, baseCfg()) };
   };
-  assert.equal((await run('test', 7)).result.started, true, 'control: an ordinary skip after the grace expired');
-  const unsafe = await run('sim', 7);
+  assert.equal((await run('test', 5)).result.started, true, 'control: an ordinary skip after the grace expired');
+  const unsafe = await run('sim', 5);
   assert.equal(unsafe.result.reason, 'not-head', 'a sim that could delay the head is refused after grace expiry');
   assert.equal(readSkipState(unsafe.state).count, LIMIT, 'and spends nothing');
   assert.equal((await run('sim', 2)).result.started, true, 'a provably harmless sim still passes');
@@ -202,9 +203,9 @@ test('safe backfill preserves the head\'s CPU claim: a sim that fits CPU alone b
 
 test('safe backfill preserves the head\'s weight: a sim that fits capacity alone but not beside the head is refused', async () => {
   const { state } = freshEnv();
-  await conflictedHead(state, LIMIT);
-  const sim = ticket('sim', { key: 'jun:default', weight: 6, class: 'sim' }); // 1 held + 6 = 7 fits; + head 3 = 10 fits exactly
-  const tooBig = ticket('too-big', { key: 'jun:big', weight: 7, class: 'sim' }); // 1 + 7 = 8 fits; + head 3 = 11 > 10
+  await conflictedHead(state, LIMIT, 5); // BRAIN-452: weights cap at half of capacity 10
+  const sim = ticket('sim', { key: 'jun:default', weight: 4, class: 'sim' }); // 1 held + 4 = 5 fits; + head 5 = 10 fits exactly
+  const tooBig = ticket('too-big', { key: 'jun:big', weight: 5, class: 'sim' }); // 1 + 5 = 6 fits; + head 5 = 11 > 10
   await enqueue(state, sim);
   await enqueue(state, tooBig);
   assert.equal((await poll(state, tooBig, baseCfg())).reason, 'not-head');

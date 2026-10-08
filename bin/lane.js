@@ -25,7 +25,7 @@ import { remotePipelineCommand } from '../src/remote-pipeline.js';
 
 function usage() {
   return `Usage:
-  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--detach]
+  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--exclusive] [--detach]
            [--timeout <duration>] [--allow-local-sim] [--local] [--log <path>] -- <command...>
   lane status [--json]
   lane capabilities --json
@@ -80,6 +80,9 @@ function parseRunArgs(args) {
       // Validated (exit 64) by runCommand, together with the env and config sources; a missing value is invalid, not absent.
       case '--priority':
         opts.priority = flagArgs[++i] ?? '';
+        break;
+      case '--exclusive':
+        opts.exclusive = true;
         break;
       case '--detach':
         opts.detach = true;
@@ -144,6 +147,7 @@ async function main() {
         cpuOverride: opts.cpuOverride,
         memoryOverride: opts.memoryOverride,
         priority: opts.priority,
+        exclusive: opts.exclusive,
         detach: opts.detach,
         timeoutMs: opts.timeout ? parseDurationMs(opts.timeout) : undefined,
         allowLocalSim: opts.allowLocalSim,

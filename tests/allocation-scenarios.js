@@ -41,6 +41,7 @@ export function baseCfg(m, overrides = {}) {
     ...m.DEFAULT_GLOBAL_CONFIG,
     schedulerMode: 'active',
     capacity: 10,
+    maxLaneWeight: 5, // BRAIN-452: scenarios use weights up to half the capacity
     loadClose: 1000,
     loadOpen: 900,
     loadOpenSamples: 1,
@@ -87,7 +88,7 @@ export const heldLease = (m, id, key, weight, extra = {}) => ({
 export function scenarios(m) {
   const head = ticket('head', { weight: 4 });
   const chead = ticket('chead', { key: 'r:lock', conflicts: [] });
-  const khead = ticket('khead', { weight: 6 });
+  const khead = ticket('khead', { weight: 5 }); // BRAIN-452: heaviest weight capacity 10 allows; the holder below is 6 so 6 + 5 > 10
   return {
     // A resource-denied head backfilled past (resource skip counter + reservation latch), mixed classes.
     resource: [
@@ -127,7 +128,7 @@ export function scenarios(m) {
     ],
     // A head that does not fit weight capacity (capacity skip counter), tests holding most of B so sim locks bite.
     capacity: [
-      { lease: heldLease(m, 'big', 'r:big', 5, { resources: { cpuCores: 5, memoryBytes: GIB } }) },
+      { lease: heldLease(m, 'big', 'r:big', 6, { resources: { cpuCores: 6, memoryBytes: GIB } }) },
       { enqueue: khead },
       { enqueue: sim('ks1') },
       { enqueue: ticket('kt1', { weight: 2 }) },

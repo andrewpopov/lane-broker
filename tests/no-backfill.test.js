@@ -64,29 +64,24 @@ function heldLease(id, key, weight = 1) {
 
 test('a still-running lease denies a head that does not fit capacity, and the head starts once it is released', async () => {
   const { state } = freshEnv();
-  const globalCfg = baseCfg();
+  const globalCfg = baseCfg({ capacity: 4 });
 
-  // Capacity 2: the heavy (weight 2) ticket uses the whole thing once
-  // running, so a weight-1 ticket enqueued after it (and now the sole,
-  // literal head of the remaining queue) does not fit under capacity
-  // either. This is the base case BRAIN-249 part 2 does NOT change: a
-  // ticket that is itself the head, with nothing behind it to backfill,
+  // Capacity 4: a running weight-4 holder (BRAIN-452: no single lane may weigh over half the capacity, so it is
+  // written as a lease, the way a reloaded older config would have left it) uses the whole thing, so a weight-1
+  // ticket (the sole, literal head of the queue) does not fit under capacity either. This is the base case
+  // BRAIN-249 part 2 does NOT change: a ticket that is itself the head, with nothing behind it to backfill,
   // is denied exactly as before.
-  const heavy = baseTicket('heavy', { key: 'r:heavy', weight: 2 });
+  writeLease(state, heldLease('heavy', 'r:heavy', 4));
   const light = baseTicket('light', { key: 'r:light', weight: 1 });
-  await enqueue(state, heavy);
   await enqueue(state, light);
 
-  const heavyResult = await tryStart(state, heavy, globalCfg);
-  assert.equal(heavyResult.started, true, 'the heavy ticket is the head and fits capacity, so it starts');
-
   const lightResult = await tryStart(state, light, globalCfg);
-  assert.equal(lightResult.started, false, 'light is now the sole, literal head and still does not fit capacity');
+  assert.equal(lightResult.started, false, 'light is the sole, literal head and does not fit capacity');
   assert.equal(lightResult.reason, 'capacity');
 
-  const heavyLease = readLease(state, heavy.id);
+  const heavyLease = readLease(state, 'heavy');
   assert.ok(heavyLease && heavyLease.state === LEASE_STATE.RUNNING, 'heavy should hold a running lease');
-  removeLease(state, heavy.id);
+  removeLease(state, 'heavy');
 
   const lightResultAfterRelease = await tryStart(state, light, globalCfg);
   assert.equal(lightResultAfterRelease.started, true, 'light must start only after heavy releases and capacity is free');
@@ -97,17 +92,16 @@ test('BRAIN-249 part 2: a capacity-blocked head backfills a later, non-conflicti
   const limit = 2;
   const globalCfg = baseCfg({ capacity: 8, conflictSkipLimit: limit });
 
-  // The live incident's shape: a running weight-2 lane leaves no room for a
-  // weight-8 head (2 + 8 = 10 > 8) -- a weight-8 lane only ever fits on a
-  // completely empty machine.
-  writeLease(state, heldLease('other-holder', 'rouge:sim', 2));
+  // The live incident's shape, scaled to what BRAIN-452 allows (a weight over half of capacity 8 is clamped to 4): a running
+  // weight-5 lane leaves no room for a weight-4 head (5 + 4 = 9 > 8).
+  writeLease(state, heldLease('other-holder', 'rouge:sim', 5));
 
-  const head = baseTicket('savoro-prepush', { key: 'savoro:prepush', weight: 8 });
+  const head = baseTicket('savoro-prepush', { key: 'savoro:prepush', weight: 4 });
   await enqueue(state, head);
 
   const headResult = await tryStart(state, head, globalCfg);
   assert.equal(headResult.started, false);
-  assert.equal(headResult.reason, 'capacity', 'the weight-8 head does not fit alongside the running weight-2 lease');
+  assert.equal(headResult.reason, 'capacity', 'the weight-4 head does not fit alongside the running weight-5 lease');
 
   // Backfill up to `limit` times: each round enqueues a fresh, lighter,
   // non-conflicting ticket behind the still-queued head, proves it starts

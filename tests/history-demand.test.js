@@ -8,6 +8,8 @@ import { paths } from '../src/state.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { evaluateNewAdmission, leaseDemand, leaseDemandBasis, ticketCpuEstimateBasis, formatAdmissionLog, freshObservedCores, coldStartEstimate } from '../src/admission.js';
 import { leaseCpuCores } from '../src/resources.js';
+import { writeLease, LEASE_STATE } from '../src/lease.js';
+import { bootId } from '../src/state.js';
 import { computeCpuEstimates, refreshCpuEstimates, peekCpuEstimates, argvFingerprint, REFRESH_MS, SNAPSHOT_MAX_AGE_MS } from '../src/cpu-estimates.js';
 
 // BRAIN-433: admission charges a workload's history-informed PEAK CPU, not its declaration. Every test here goes through
@@ -40,11 +42,90 @@ test('history present: 5+ runs peaking ~0.8 on a 4-core declaration is charged ~
   assert.deepEqual(ticketCpuEstimateBasis(ticket(), baseCfg(), now0), { cores: 0.8, source: 'history:exact' });
 });
 
-test('cap at the declaration, floor at 0.5', () => {
+test('historyDemandRaise off: cap at the declaration, floor at 0.5', () => {
   primed(rows(KEY, 6, 7));
-  assert.equal(ticketCpuEstimateBasis(ticket(), baseCfg(), now0).cores, 4);
+  assert.equal(ticketCpuEstimateBasis(ticket(), baseCfg({ historyDemandRaise: false }), now0, 9).cores, 4);
+  assert.equal(ticketCpuEstimateBasis(ticket(), baseCfg({ historyDemandRaise: false }), now0, 9).source, 'history:exact');
   primed(rows(KEY, 6, 0.05));
   assert.equal(ticketCpuEstimateBasis(ticket(), baseCfg(), now0).cores, 0.5);
+});
+
+// BRAIN-454: history may RAISE a charge for an under-declared lane, capped at the budget the admission predicate uses.
+test('BRAIN-454: an under-declared lane whose p90 exceeds its declaration is charged the p90 (history:raised)', () => {
+  primed(rows(KEY, 6, 7));
+  assert.deepEqual(ticketCpuEstimateBasis(ticket(), baseCfg(), now0, 9), { cores: 7, source: 'history:raised' });
+  assert.equal(leaseDemandBasis({ ...coldLease(), key: KEY, cmdFingerprint: FP, weight: 4, resources: { cpuCores: 4, memoryBytes: 1 } }, now0, baseCfg(), 9).demand, 7, 'a lease cold charge uses the same raised value');
+});
+
+test('BRAIN-454: the raised charge is capped at the budget, so it can never be unadmittable', () => {
+  primed(rows(KEY, 6, 12));
+  assert.deepEqual(ticketCpuEstimateBasis(ticket(), baseCfg(), now0, 9), { cores: 9, source: 'history:raised' });
+  const cpuSample = { hostBusyCores: 0, cores: 10, stale: false }; // budget = min(0.9 * 10, 10 - 1) = 9
+  const decision = evaluateNewAdmission(primed(rows(KEY, 6, 12)), baseCfg(), ticket(), [{ ...coldLease(), observedCpuCores: 0, observedAt: now0 }], cpuSample, null);
+  assert.equal(decision.candidateEstimate, 9, 'charged the budget, not the 12-core p90');
+  assert.equal(decision.budget, 9);
+});
+
+test('BRAIN-454: with NO held lease the raise never applies, so persistent ambient load cannot make a lane unadmittable', () => {
+  const cpuSample = { hostBusyCores: 2, cores: 10, stale: false }; // budget 9, ambient 2
+  const root = primed(rows(KEY, 6, 12)); // declared 4, p90 12
+  const idle = evaluateNewAdmission(root, baseCfg(), ticket(), [], cpuSample, null);
+  assert.equal(idle.candidateEstimate, 4, 'declared, exactly as before 454');
+  assert.equal(idle.candidateEstimateSource, 'history:exact');
+  assert.equal(idle.projectedBusy, 6);
+  assert.equal(idle.admit, true, JSON.stringify(idle));
+  const concurrent = evaluateNewAdmission(root, baseCfg(), ticket(), [coldLease()], cpuSample, null);
+  assert.equal(concurrent.candidateEstimateSource, 'history:raised', 'with another lease held the raise applies');
+});
+
+test('BRAIN-454: backfill selection charges an elastic ticket as admission does, so a ticket that cannot fit never keeps winning', async () => {
+  const { selectResourceCandidate } = await import('../src/scheduler.js');
+  const KEY_E = `${REPO}:elastic`;
+  primed([...rows(KEY_E, 6, 9, { resources: { cpuCores: 3 } }), ...rows(KEY_E, 6, 9, { resources: { cpuCores: 2 } })]);
+  const cfg = baseCfg();
+  const budget = 9;
+  const held = [{ id: 'held00000000', key: 'x:held', weight: 3, admittedAt: now0 }]; // charged 3: 3 external + 3 held = 6, so 3 cores free
+  const head = { id: 'head', key: 'x:head', weight: 1, resources: { cpuCores: 8, memoryBytes: 1 } };
+  const elastic = ticket({ id: 'elastic', key: KEY_E, weight: 1, resources: { cpuCores: 3, minCpuCores: 2, memoryBytes: 1 } });
+  const ordinary = ticket({ id: 'ordinary', key: 'x:ordinary', cmdFingerprint: undefined, weight: 3, resources: { cpuCores: 3, memoryBytes: 1 } });
+  const record = { headId: 'head', budget, externalBusy: 3 };
+  const picked = selectResourceCandidate([head, elastic, ordinary], held, 3, 10, record, cfg, now0);
+  assert.equal(picked?.id, 'ordinary', 'p90 9 at every grant means the elastic ticket is charged 9 and cannot fit 3 free cores');
+});
+
+test('BRAIN-454: selection ranks an elastic ticket only over the grants admission tries (capped at floor(headroom))', async () => {
+  const { selectResourceCandidate } = await import('../src/scheduler.js');
+  const KEY_E = `${REPO}:elastic`;
+  const at = (cores, peak) => rows(KEY_E, 6, peak, { resources: { cpuCores: cores } });
+  primed([...at(6, 9), ...at(3, 9), ...at(2, 9), ...at(4, 1)]);
+  const held = [{ id: 'held00000000', key: 'x:held', weight: 3, admittedAt: now0 }]; // headroom = 9 - (3 external + 3 held) = 3
+  const head = { id: 'head', key: 'x:head', weight: 1, resources: { cpuCores: 8, memoryBytes: 1 } };
+  const elastic = ticket({ id: 'elastic', key: KEY_E, weight: 1, resources: { cpuCores: 6, minCpuCores: 2, memoryBytes: 1 } });
+  const ordinary = ticket({ id: 'ordinary', key: 'x:ordinary', cmdFingerprint: undefined, weight: 3, resources: { cpuCores: 3, memoryBytes: 1 } });
+  const picked = selectResourceCandidate([head, elastic, ordinary], held, 3, 10, { headId: 'head', budget: 9, externalBusy: 3 }, baseCfg(), now0);
+  assert.equal(picked?.id, 'ordinary', 'grant 4 (charge 1) is above floor(headroom) = 3, so admission never tries it');
+});
+
+test('BRAIN-454: with historyDemandRaise false the charge is byte-identical to the lowering-only behaviour', () => {
+  primed(rows(KEY, 6, 7));
+  const off = baseCfg({ historyDemandRaise: false });
+  assert.deepEqual(ticketCpuEstimateBasis(ticket(), off, now0, 9), { cores: 4, source: 'history:exact' });
+  primed(rows(KEY, 6, 0.8));
+  assert.deepEqual(ticketCpuEstimateBasis(ticket(), off, now0, 9), { cores: 0.8, source: 'history:exact' });
+});
+
+test('BRAIN-454: lane status shows the raised value and source for a queued ticket', async () => {
+  const { collectStatus, renderStatusText } = await import('../src/status.js');
+  const { enqueue } = await import('../src/scheduler.js');
+  const { home } = freshEnv();
+  writeGlobalConfig(home, { version: 1, capacity: 4, cpuAdmissionPercent: 100, cpuReserveCores: 0, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
+  process.env.LANE_BROKER_HOME = home;
+  const root = primed(rows(KEY, 6, 1.5, { resources: { cpuCores: 1 } }));
+  writeLease(root, { id: 'h454', key: 'x:held', bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight: 1, state: LEASE_STATE.RUNNING });
+  await enqueue(root, { id: 'q454', key: KEY, cmdFingerprint: FP, weight: 1, resources: { cpuCores: 1, memoryBytes: 1 }, supervisorPid: process.pid, supervisorStart: null });
+  const status = await collectStatus();
+  assert.deepEqual(status.queued[0].cpuEstimate, { cores: 1.5, source: 'history:raised' });
+  assert.match(renderStatusText(status), /cpu~1\.50\(history:raised\)/);
 });
 
 test('no history: fewer than 5 runs, or the switch off, is charged the declaration', () => {

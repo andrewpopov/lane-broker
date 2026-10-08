@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process';
 import { freshEnv } from './helpers.js';
 import { paths, atomicWriteJson, readJsonSafe, fingerprintOf, bootId } from '../src/state.js';
 import { enqueue, tryStart } from '../src/scheduler.js';
-import { writeLease, LEASE_STATE } from '../src/lease.js';
+import { writeLease, listLeases, LEASE_STATE } from '../src/lease.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 
 // BRAIN-197: a load gate closed by CPU load the broker never generated must
@@ -214,17 +214,17 @@ test('a closed gate does not exempt a paused broker: pause is checked before the
   assert.equal(result.reason, 'paused');
 });
 
-test('a closed gate does not exempt an over-capacity candidate: capacity is still enforced after the exemption', async () => {
+test('a closed gate exempts an idle broker, and an oversize weight is clamped to the capacity limit, not refused for capacity (BRAIN-452)', async () => {
   const { state } = freshEnv();
   const cfg = makeCfg({ capacity: 1, loadClose: 10, loadOpen: 5, loadOpenSamples: 1 });
-  const ticket = await enqueueTicket(state, { weight: 2 }); // exceeds capacity even with nothing else held
+  const ticket = await enqueueTicket(state, { weight: 2 }); // over capacity: admitted at the limit (1) instead
   persistClosedGate(state, cfg, 0);
 
   const loadSampler = () => 20;
   const result = await tryStart(state, ticket, cfg, loadSampler);
 
-  assert.equal(result.started, false, 'the idle exemption only skips the gate check, never the capacity check');
-  assert.equal(result.reason, 'capacity');
+  assert.equal(result.started, true, JSON.stringify(result));
+  assert.equal(listLeases(state).find((l) => l.id === ticket.id).weight, 1);
 });
 
 test('active mode: the CPU admission predicate can still veto an idle, gate-exempt start', async () => {

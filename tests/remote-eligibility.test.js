@@ -117,7 +117,7 @@ test('an allowed undeclared lane is never remote-eligible even when runners are 
   const { base, home, env } = freshEnv();
   writeGlobalConfig(home, {
     version: 1,
-    capacity: 2,
+    capacity: 4,
     loadClose: 1000,
     loadOpen: 900,
     loadOpenSamples: 1,
@@ -148,7 +148,7 @@ test('an "as"-resolved undeclared lane inherits remote eligibility (weight, cpuC
   const { base, home, env } = freshEnv();
   writeGlobalConfig(home, {
     version: 1,
-    capacity: 2,
+    capacity: 4,
     loadClose: 1000,
     loadOpen: 900,
     loadOpenSamples: 1,
@@ -216,7 +216,7 @@ test('oversize resource request is NOT refused at preflight when remote-eligible
     runners: RUNNERS,
   });
   const repoDir = path.join(base, 'repo');
-  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1000, remote: true } } });
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, cpuCores: 1000, remote: true } } }); // BRAIN-452: oversize via CPU, a 1000 weight is refused at submission
   gitFixture(['init', '-q'], repoDir);
 
   const { result, ticket, stderr } = await captureTicket({ env, cwd: repoDir });

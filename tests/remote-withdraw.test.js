@@ -304,9 +304,18 @@ test('cancel wins over a withdraw while the unlink fails: the queue entry is sti
   const run = startRemoteExec({ env: f.env, root: f.root, header });
   const laneId = await queuedLaneId({ ...f, header });
   blockQueue(f.state);
+  // The supervisor polls the markers on its own clock. Written back to back, a loaded machine can let it see the cancel
+  // marker alone, take its single-attempt dequeue (which fails here) and publish without ever seeing the withdraw
+  // marker: the queue entry then stays, and this is not the case under test. Freezing it makes both markers land as one.
+  const supervisorPid = listQueue(f.state).find((t) => t.id === laneId).supervisorPid;
+  process.kill(supervisorPid, 'SIGSTOP');
   try {
     writeCancelMarkerFile(f.state, laneId);
     writeWithdrawMarkerFile(f.state, laneId);
+  } finally {
+    process.kill(supervisorPid, 'SIGCONT');
+  }
+  try {
     await sleep(500);
     assert.deepEqual(queuedIds(f.state), [laneId], 'still stuck, and the withdraw marker is still holding admission off');
     assert.ok(isWithdrawn(f.state, laneId));
