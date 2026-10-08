@@ -14,7 +14,7 @@ import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfig } from './config.js';
 import { effectiveNow } from './priority-clock.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView } from './fairness.js';
-import { exclusiveHoldView } from './exclusive.js';
+import { exclusiveHoldView, clampQueuedWeight } from './exclusive.js';
 import { priorityOf, effectiveRank, tierName } from './priority.js';
 import { leaseOverrun } from './observed.js';
 import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores } from './resources.js';
@@ -72,7 +72,9 @@ function computeHeadBlock(root, store, cfg, queue, leases, now, weightCapacity) 
   }
   // The EFFECTIVE capacity, never raw cfg.capacity: with `capacity: 'auto'` the raw value is a
   // string, the comparison is always false, and a capacity-blocked head was never reported.
-  if (runningWeight + head.weight > weightCapacity) {
+  // BRAIN-452: the weight admission will actually use (an oversized queued ticket is clamped), and the cause when it differs.
+  const admitted = clampQueuedWeight(head, weightCapacity);
+  if (runningWeight + admitted.weight > weightCapacity) {
     const capState = readCapacitySkipState(root, store, head.id);
     const sameHead = capState.headId === head.id;
     const skipCount = sameHead ? capState.count : 0;
@@ -80,7 +82,8 @@ function computeHeadBlock(root, store, cfg, queue, leases, now, weightCapacity) 
     return {
       kind: 'capacity',
       headId: head.id,
-      headWeight: head.weight,
+      headWeight: admitted.weight,
+      ...(admitted.weightClampedFrom ? { oversizedWeight: admitted.weightClampedFrom } : {}),
       runningWeight,
       capacity: weightCapacity,
       skipCount,
@@ -106,7 +109,7 @@ function computeResourceBlock(root, store, cfg, head, held, now) {
     limit: cfg.resourceSkipLimit,
     reserved: record.reserved && !futileFresh(record, cfg, now),
     futile: futileFresh(record, cfg, now),
-    projectedBusy: projectBusy(record.externalBusy, held, ticketCpuEstimate(head, cfg), now, cfg),
+    projectedBusy: projectBusy(record.externalBusy, held, ticketCpuEstimate(head, cfg, now, record.budget), now, cfg, record.budget),
     budget: record.budget,
     deniedAgeMs: now - record.deniedAt,
   };
@@ -416,7 +419,8 @@ export function renderStatusText(status) {
       lines.push(
         `queue stalled: head ${hb.headId} (weight ${hb.headWeight}) does not fit capacity ` +
           `(${hb.runningWeight}/${hb.capacity} running); skip allowance exhausted (${hb.skipCount}/${hb.skipLimit}), ` +
-          `backfill refused until running work drains`,
+          `backfill refused until running work drains` +
+          (hb.oversizedWeight ? `; cause: declared weight ${hb.oversizedWeight} is over half the capacity, admitted at ${hb.headWeight} (BRAIN-452: declare exclusive: true or use cpuCores)` : ''),
       );
     } else {
       lines.push(

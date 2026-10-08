@@ -32,28 +32,30 @@ test('two runs on the same key serialize: the second waits until the first relea
   assert.equal(fs.existsSync(viol), false, 'the second run must never see the first run\'s marker still present');
 });
 
-test('capacity holds: two keys whose combined weight exceeds capacity do not run concurrently', async () => {
+test('capacity holds: lanes whose combined weight exceeds capacity do not all run concurrently', async () => {
   const { base, home, env } = freshEnv();
-  writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
+  // BRAIN-452: a lane may weigh at most half the capacity, so capacity 4 holds two weight-2 lanes and a third must wait.
+  writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
   const repoDir = path.join(base, 'repo');
-  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 2 }, lint: { weight: 2 } } });
+  writeRepoConfig(repoDir, { version: 1, lanes: { a: { weight: 2 }, b: { weight: 2 }, c: { weight: 2 } } });
 
-  const mark = path.join(base, 'marker');
-  const viol = path.join(base, 'violations');
+  const events = path.join(base, 'events');
+  const script = ['sh', '-c', `echo S >> "${events}"; sleep 0.6; echo E >> "${events}"`];
+  const results = await Promise.all(['a', 'b', 'c'].map((lane) => laneRun(['run', '--repo', 'r', '--lane', lane, '--', ...script], { env, cwd: repoDir })));
+  for (const r of results) assert.equal(r.code, 0);
 
-  const [r1, r2] = await Promise.all([
-    laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...markerScript(mark, viol, 0.4)], { env, cwd: repoDir }),
-    laneRun(['run', '--repo', 'r', '--lane', 'lint', '--', ...markerScript(mark, viol, 0.4)], { env, cwd: repoDir }),
-  ]);
-
-  assert.equal(r1.code, 0);
-  assert.equal(r2.code, 0);
-  assert.equal(fs.existsSync(viol), false, 'combined weight 4 > capacity 2 must serialize');
+  let running = 0;
+  let peak = 0;
+  for (const e of fs.readFileSync(events, 'utf8').trim().split('\n')) {
+    running += e === 'S' ? 1 : -1;
+    peak = Math.max(peak, running);
+  }
+  assert.equal(peak, 2, 'combined weight 6 > capacity 4: at most two weight-2 lanes at once');
 });
 
 test('capacity allows: two different keys whose combined weight fits capacity run concurrently', async () => {
   const { base, home, env } = freshEnv();
-  writeGlobalConfig(home, { version: 1, capacity: 3, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
+  writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
   const repoDir = path.join(base, 'repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 2 }, lint: { weight: 1 } } });
 

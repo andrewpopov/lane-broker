@@ -174,6 +174,11 @@ cores but uses 1 stops starving the queue. Unsettled leases are charged as
 before; `false` restores that for every lease. The admission log's
 `leaseDemand=<id8>:<cores>(settled|cold)` field shows the basis per held lease.
 
+`historyDemandRaise` (default `true`, BRAIN-454): history may also RAISE a charge. A workload whose p90 peak
+exceeds its declared cores is charged `min(host CPU budget, p90)` (source `history:raised`), so an under-declared
+lane stops looking cheap; the budget is the one the admission predicate compares against, so a raised charge is
+never unadmittable. `false` restores lowering-only.
+
 `historyDemandEnabled` (default `true`) and `historyDemandMinRuns` (default 5): a workload with at
 least that many compatible runs in `history.jsonl` (the last 50, no older than 14 days) is charged its
 history estimate instead of its declared cores, as an admission candidate and as the cold demand of a
@@ -1402,6 +1407,11 @@ factor is 1.0 (no calibration) and is printed.
 `lane run --exclusive`, or `"exclusive": true` on a lane in `.lane-broker.json`, runs the command with the
 whole host to itself. v1 is deliberately stateless and hookless: there is no hold file and nothing to wedge, and
 the only durable facts are the ticket's `exclusive` flag and the full-budget lease it is admitted with.
+
+A non-exclusive lane whose `weight` exceeds half of the broker's effective weight capacity is refused by `lane run`
+with exit 64 (BRAIN-452: declare `exclusive: true`, or use `cpuCores` for size). A ticket queued earlier by an older
+config is admitted clamped to half the capacity (logged as `event=weight-clamped`), and `lane status`'s
+`queue stalled` line names the oversized weight when it is why the head does not fit.
 
 Semantics:
 

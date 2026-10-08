@@ -1,8 +1,9 @@
 import fs from 'node:fs';
 import { paths, atomicWriteJson, readJsonSafe, fingerprintOf } from './state.js';
 import { sampleHostCpu } from './cpu.js';
-import { peekCpuEstimates, lookupEstimate, clampEstimate } from './cpu-estimates.js';
-import { evaluateMemoryAdmission, resolveTicketResources, leaseCpuCores, elasticClaimRange } from './resources.js';
+import os from 'node:os';
+import { peekCpuEstimates, lookupEstimate, clampEstimate, raiseEstimate } from './cpu-estimates.js';
+import { evaluateMemoryAdmission, resolveTicketResources, leaseCpuCores, elasticClaimRange, cpuBudgetCores } from './resources.js';
 
 /**
  * Cold-start CPU-core estimate for a lease with no observed measurement yet.
@@ -25,11 +26,19 @@ export function coldStartEstimate(weight) {
  * snapshot is fresh and matches `cfg`, otherwise the declaration. Never reads the history file (callers
  * refreshCpuEstimates before taking the lock). Used for a candidate and for a lease's cold demand ONLY.
  */
-export function cpuEstimateBasis(ref, declared, cfg, now = Date.now()) {
+export function cpuEstimateBasis(ref, declared, cfg, now = Date.now(), budget) {
   const cold = coldStartEstimate(declared);
   if (cfg?.historyDemandEnabled !== true) return { cores: cold, source: 'declared' };
   const found = lookupEstimate(peekCpuEstimates(cfg, now), ref, cold);
-  return found ? { cores: clampEstimate(found.p90, cold), source: `history:${found.level}` } : { cores: cold, source: 'declared' };
+  if (!found) return { cores: cold, source: 'declared' };
+  // BRAIN-454: history may also raise the charge (an under-declared lane), but never past the budget the admission predicate compares against.
+  if (cfg.historyDemandRaise !== false && found.p90 > cold) return { cores: raiseEstimate(found.p90, budget ?? hostCpuBudget(cfg)), source: 'history:raised' };
+  return { cores: clampEstimate(found.p90, cold), source: `history:${found.level}` };
+}
+
+/** The CPU budget on this host for callers with no sample in hand; same formula (and core count) as cpuBudget(sample). */
+function hostCpuBudget(cfg) {
+  return cpuBudgetCores({ cpuCores: typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length }, cfg);
 }
 
 /**
@@ -86,10 +95,10 @@ function recentObservedCores(lease, now, windowMs, current) {
  * booking; everything else — including cfg without the settledDemand knobs, and old leases with no
  * observedCpuHistory — keeps max(observed, cold) / cold.
  */
-export function leaseDemandBasis(lease, now = Date.now(), cfg) {
+export function leaseDemandBasis(lease, now = Date.now(), cfg, budget) {
   const cold = coldStartEstimate(leaseCpuCores(lease) ?? lease.weight);
   // BRAIN-433: only the cold charge (no observation, or an unsettled one) uses the history estimate; the settled peak allowance below is main's, uncapped by it.
-  const estimated = cpuEstimateBasis(lease, cold, cfg, now).cores;
+  const estimated = cpuEstimateBasis(lease, cold, cfg, now, budget).cores;
   const observed = freshObservedCores(lease, now);
   if (observed === null) return { demand: estimated, basis: 'cold' };
   const unsettled = { demand: Math.max(observed, estimated), basis: 'cold' };
@@ -101,8 +110,8 @@ export function leaseDemandBasis(lease, now = Date.now(), cfg) {
   return { demand: Math.max(observed, padded), basis: 'settled' };
 }
 
-export function leaseDemand(lease, now = Date.now(), cfg) {
-  return leaseDemandBasis(lease, now, cfg).demand;
+export function leaseDemand(lease, now = Date.now(), cfg, budget) {
+  return leaseDemandBasis(lease, now, cfg, budget).demand;
 }
 
 /**
@@ -255,8 +264,8 @@ export const KNOWN_BIAS_NOTE = 'self-subtracted-when-observed';
  * selection (scheduler.js's selectResourceCandidate), so the two can never disagree about what
  * "fits" means: busy = ambient load + every held lease's demand + the candidate's claim.
  */
-export function projectBusy(externalBusy, heldLeases, candidateEstimate, now = Date.now(), cfg) {
-  return externalBusy + heldLeases.reduce((sum, l) => sum + leaseDemand(l, now, cfg), 0) + candidateEstimate;
+export function projectBusy(externalBusy, heldLeases, candidateEstimate, now = Date.now(), cfg, budget) {
+  return externalBusy + heldLeases.reduce((sum, l) => sum + leaseDemand(l, now, cfg, budget), 0) + candidateEstimate;
 }
 
 /** The CPU-core budget for one sample: the smaller of the percent budget and all-cores-minus-reserve. */
@@ -267,18 +276,18 @@ export function cpuBudget(cpuSample, cfg) {
 }
 
 /** A ticket's CPU claim as admission computes it (resolved resources, history-or-declared estimate), with its source. */
-export function ticketCpuEstimateBasis(ticket, cfg, now = Date.now()) {
+export function ticketCpuEstimateBasis(ticket, cfg, now = Date.now(), budget) {
   const resources = resolveTicketResources({
     weight: ticket.weight,
     cpuCores: ticket.resources?.cpuCores,
     memoryBytes: ticket.resources?.memoryBytes,
     defaultMemoryBytesPerWeight: cfg.defaultMemoryBytesPerWeight,
   });
-  return cpuEstimateBasis(ticket, resources.cpuCores, cfg, now);
+  return cpuEstimateBasis(ticket, resources.cpuCores, cfg, now, budget);
 }
 
-export function ticketCpuEstimate(ticket, cfg, now = Date.now()) {
-  return ticketCpuEstimateBasis(ticket, cfg, now).cores;
+export function ticketCpuEstimate(ticket, cfg, now = Date.now(), budget) {
+  return ticketCpuEstimateBasis(ticket, cfg, now, budget).cores;
 }
 
 /**
@@ -306,10 +315,10 @@ export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, c
 
   const brokerObserved = heldLeases.reduce((sum, l) => sum + (freshObservedCores(l, now) ?? 0), 0);
   const externalBusy = Math.max(0, nonPreemptibleBusy(cpuSample, cfg) - brokerObserved);
-  const { cores: candidateEstimate, source: candidateEstimateSource } = cpuEstimateBasis(candidateRef, candidateResources?.cpuCores ?? candidateWeight, cfg, now);
-  const projectedBusy = projectBusy(externalBusy, heldLeases, candidateEstimate, now, cfg);
   const budget = cpuBudget(cpuSample, cfg);
-  const leaseCharges = heldLeases.map((l) => ({ id: l.id, ...leaseDemandBasis(l, now, cfg) }));
+  const { cores: candidateEstimate, source: candidateEstimateSource } = cpuEstimateBasis(candidateRef, candidateResources?.cpuCores ?? candidateWeight, cfg, now, budget);
+  const projectedBusy = projectBusy(externalBusy, heldLeases, candidateEstimate, now, cfg, budget);
+  const leaseCharges = heldLeases.map((l) => ({ id: l.id, ...leaseDemandBasis(l, now, cfg, budget) }));
   const leaseDemands = leaseCharges.map(({ id, demand, basis }) => `${String(id).slice(0, 8)}:${fmt(demand)}(${basis})`);
 
   if (cpuGateState.closed) {

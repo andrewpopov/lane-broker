@@ -117,7 +117,7 @@ test('an allowed undeclared lane is never remote-eligible even when runners are 
   const { base, home, env } = freshEnv();
   writeGlobalConfig(home, {
     version: 1,
-    capacity: 2,
+    capacity: 4,
     loadClose: 1000,
     loadOpen: 900,
     loadOpenSamples: 1,

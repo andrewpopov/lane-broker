@@ -15,6 +15,26 @@ export function isExclusive(ticket) {
   return ticket?.exclusive === true;
 }
 
+/**
+ * BRAIN-452: a non-exclusive lane may not weigh more than half the weight capacity (a near-capacity weight silently serializes
+ * the machine; `exclusive: true` says so honestly and `cpuCores` sizes a lane). `limit` is the largest weight it may hold.
+ */
+export function oversizedWeight(weight, capacity, exclusive) {
+  const limit = Math.max(1, Math.floor(capacity / 2)); // a weight of 1 is the smallest a lane can be, so it is never oversized
+  if (exclusive === true || !(Number(weight) > Math.max(1, capacity / 2))) return null;
+  return { weight, limit };
+}
+
+export function oversizedWeightMessage(weight) {
+  return `weight ${weight} would hold most of this machine's capacity; declare \`exclusive: true\` or use \`cpuCores\` for size (BRAIN-452)`;
+}
+
+/** A queued ticket with its weight clamped to the shared limit (an older config enqueued it); same object when it is not oversized. */
+export function clampQueuedWeight(ticket, capacity) {
+  const over = ticket && oversizedWeight(ticket.weight, capacity, ticket.exclusive);
+  return over ? { ...ticket, weight: over.limit, weightClampedFrom: ticket.weight } : ticket;
+}
+
 /** The hook keys present at the top level of a parsed config object, in `UNSUPPORTED_HOOK_KEYS` order. */
 export function unsupportedHookKeys(config) {
   if (!config || typeof config !== 'object' || Array.isArray(config)) return [];

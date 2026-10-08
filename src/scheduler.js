@@ -5,13 +5,13 @@ import { sampleAndUpdateGate, readGateState } from './load.js';
 import { patchAttemptLocked, readAttempt } from './attempts.js';
 import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
 import { refreshCpuEstimates } from './cpu-estimates.js';
-import { evaluateCpuAdmission, freshObservedCores, evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, projectBusy, ticketCpuEstimate } from './admission.js';
+import { evaluateCpuAdmission, freshObservedCores, evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, writeBrokerLog, projectBusy, ticketCpuEstimate } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
 import { captureShadowInputs, recordAllocationShadow } from './allocation-shadow.js';
 import { classOf } from './allocation.js';
 import { reconcileSimArm, touchSimArmFor } from './sim-arm.js';
 import { advanceHwm } from './priority-clock.js';
-import { isExclusive, exclusiveDeny, isExclusiveHead, exclusiveLeaseFields, withoutBackfillExclusives } from './exclusive.js';
+import { isExclusive, exclusiveDeny, isExclusiveHead, exclusiveLeaseFields, withoutBackfillExclusives, clampQueuedWeight } from './exclusive.js';
 import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, effectiveRank, score } from './priority.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
@@ -790,9 +790,17 @@ function recordResourceBackfill(root, store, cfg, record, write) {
   }
 }
 
+const loggedClamps = new Set();
+/** BRAIN-452: say once per ticket why it is admitted lighter than it was enqueued. */
+function logWeightClamp(root, ticket) {
+  if (!ticket.weightClampedFrom || loggedClamps.has(ticket.id)) return;
+  loggedClamps.add(ticket.id);
+  writeBrokerLog(root, `lane-broker-head-block event=weight-clamped headId=${ticket.id} weight=${ticket.weightClampedFrom} clampedTo=${ticket.weight} reason=near-capacity-weight(BRAIN-452)\n`);
+}
+
 /** The smallest CPU claim a ticket can be admitted at: its estimate, or for an elastic ticket its floor. */
-function ticketCpuFloor(ticket, cfg) {
-  const estimate = ticketCpuEstimate(ticket, cfg);
+function ticketCpuFloor(ticket, cfg, budget) {
+  const estimate = ticketCpuEstimate(ticket, cfg, undefined, budget);
   const min = ticket.resources?.minCpuCores;
   return Number.isFinite(min) ? Math.min(estimate, Math.ceil(min)) : estimate;
 }
@@ -830,8 +838,8 @@ export function selectResourceCandidate(queue, held, runningWeight, weightCapaci
     if (blockedBy(held, t)) continue;
     if (viewWeight + t.weight > weightCapacity) continue;
     if (headReserved ? blockedBy([{ key: t.key }], headTicket) || blockedBy([{ key: headTicket.key }], t) : blockedBy([...held, { key: t.key }], headTicket)) continue;
-    const claim = ticketCpuFloor(t, cfg);
-    if (projectBusy(record.externalBusy, view, claim, now, cfg) > record.budget) continue;
+    const claim = ticketCpuFloor(t, cfg, record.budget);
+    if (projectBusy(record.externalBusy, view, claim, now, cfg, record.budget) > record.budget) continue;
     if (claim < bestClaim) {
       best = t;
       bestClaim = claim;
@@ -939,7 +947,10 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
   const decide = () => {
     const cfg = reloadCfg() || globalCfg;
     // BRAIN-362: every evaluation below sees the claim capped to this host's budget; the submitted ticket keeps the declaration.
-    const ticket = capElasticClaim(submitted, cfg);
+    const cpuCores = detectResourceCapacity().cpuCores;
+    const weightCapacity = effectiveWeightCapacity(cfg, cpuCores);
+    // BRAIN-452: a ticket an older config enqueued with a near-capacity weight is admitted at half the capacity instead.
+    const ticket = clampQueuedWeight(capElasticClaim(submitted, cfg), weightCapacity);
     const now = Date.now();
     const nowEff = advanceHwm(root, now);
     reapStale(root, ticket.id);
@@ -950,7 +961,8 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     const sched = resolveScheduler(root);
     const store = sched.v2 ? fairnessStore(root, sched.tickets) : legacyStore(root);
     if (sched.v2) quarantineLegacyRecords(root);
-    const rawQueue = sched.v2 ? fenceLegacy(listQueueCapped(root, cfg)) : listQueueCapped(root, cfg);
+    const rawQueue = (sched.v2 ? fenceLegacy(listQueueCapped(root, cfg)) : listQueueCapped(root, cfg)).map((t) => clampQueuedWeight(t, weightCapacity));
+    logWeightClamp(root, ticket);
     // A reservation exists only while resource backfill does: when it is off, release every latch, so turning it back
     // on makes a ticket earn its reservation again.
     if (sched.v2 && !(cfg.schedulerMode === 'active' && cfg.resourceSkipLimit > 0)) store.releaseReservations();
@@ -1006,8 +1018,6 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // before selection can even be decided, not just whether the eventual
     // candidate fits.
     const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
-    const cpuCores = detectResourceCapacity().cpuCores;
-    const weightCapacity = effectiveWeightCapacity(cfg, cpuCores);
     const blocker = blockedBy(held, headTicket);
     const headConflicted = blocker !== null;
     // Starvation bound (Codex review finding #6): a conflict-blocked head

@@ -98,10 +98,11 @@ test('flag-false + closed gate + one held non-conflicting lease + spare capacity
   assert.equal(result.started, true, 'BRAIN-197 idle-exempt would have refused this (broker is not idle); the flag now admits it anyway');
 });
 
-test('flag-false + over-capacity: still denied capacity (the hard bound is unaffected)', async () => {
+test('flag-false + over-capacity: an oversize weight is clamped to the capacity limit and the hard bound holds against what is held (BRAIN-452)', async () => {
   const { state } = freshEnv();
   const cfg = makeCfg({ capacity: 1, loadClose: 10, loadOpen: 5, loadOpenSamples: 1 });
-  const ticket = await enqueueTicket(state, { weight: 2 }); // exceeds capacity even with nothing else held
+  writeLease(state, { id: 'held', key: 'r:held', bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight: 1, state: LEASE_STATE.RUNNING });
+  const ticket = await enqueueTicket(state, { weight: 2 });
   persistClosedGate(state, cfg, 0);
   const loadSampler = () => 20;
 

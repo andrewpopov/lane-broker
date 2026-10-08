@@ -149,11 +149,11 @@ test('P1 memory: RAM the running lanes occupy is handed back before judging, so 
 
 test('P1 idle exemption: a head the exemption would start on a drained broker is not futile', async () => {
   const { state } = freshEnv();
-  const head = ticket('head', { weight: 8 });
+  const head = ticket('head', { weight: 5 }); // BRAIN-452: 5 is the heaviest weight capacity 10 allows
   await enqueue(state, head);
   holdLease(state, 'lane-a', 1, observed(0.1));
-  // external 2 + head 8 = 10 > 9 but within the 1-core overshoot the idle exemption grants
-  const denied = await poll(state, head, { ext: 2.1, cfg: { ...cfg, resourceIdleOvershootCores: 1 } });
+  // external 5 + head 5 = 10 > 9 but within the 1-core overshoot the idle exemption grants
+  const denied = await poll(state, head, { ext: 5.1, cfg: { ...cfg, resourceIdleOvershootCores: 1 } });
   assert.equal(denied.cpuReason, 'projected-over-budget');
   assert.equal(readResourceSkipState(state).futile, undefined);
 });

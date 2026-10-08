@@ -337,10 +337,11 @@ test('the hypothetical admission includes the existing guards: weight capacity, 
     return { live, line, head: candidateOf(line, 'head') };
   };
 
-  const capacity = await headAt(null, { capacity: 2 });
+  // BRAIN-452: a weight-3 head is allowed at capacity 6, so capacity is exhausted by a held weight-4 lease instead
+  const capacity = await headAt((state) => writeLease(state, heldLease('held', 'r:held', 4, { resources: { cpuCores: 1, memoryBytes: GIB } })), { capacity: 6 });
   assert.equal(capacity.live.reason, 'capacity');
   assert.match(capacity.head, /:capacity:guards=capacity$/);
-  assert.equal(field(capacity.line, 'select'), 'none', 'a weight-3 candidate is not selectable at capacity 2');
+  assert.equal(field(capacity.line, 'select'), 'none', 'a weight-3 candidate is not selectable beside a weight-4 lease at capacity 6');
 
   const memoryCritical = await headAt(null, {}, { mem: () => ({ availableBytes: GIB, totalBytes: 64 * GIB, macPressure: 'critical', source: 'test' }) });
   assert.equal(memoryCritical.live.reason, 'memory-critical');
@@ -389,7 +390,7 @@ test('the record carries the evaluation timestamp, config values, per-candidate 
   const { state } = freshEnv();
   const cfg = baseCfg({ allocationShadow: true, simArmWindowMs: 120_000 });
   await enqueue(state, ticket('head', { weight: 3 }));
-  await enqueue(state, ticket('big', { weight: 8 }));
+  await enqueue(state, ticket('big', { weight: 5, resources: { cpuCores: 8, memoryBytes: GIB } })); // BRAIN-452: weight capped at 5; the 8-core claim stays
   await poll(state, ticket('head', { weight: 3 }), cfg);
   const [line] = shadowLines(state);
   assert.ok(Number.isFinite(Number(field(line, 'ts'))));

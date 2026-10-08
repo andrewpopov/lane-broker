@@ -9,10 +9,10 @@ import { resolveTicketConfig, reloadGlobalConfig, resolvePriority, assertHostCon
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
 import { stampPriorityOrigin } from './priority-clock.js';
-import { detectResourceCapacity, leaseResources, resolveTicketResources, checkResourceBudget, localSimRefusal } from './resources.js';
+import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, resolveTicketResources, checkResourceBudget, localSimRefusal } from './resources.js';
 import { argvFingerprint } from './cpu-estimates.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
-import { isExclusive } from './exclusive.js';
+import { isExclusive, oversizedWeight, oversizedWeightMessage } from './exclusive.js';
 
 const supervisorPath = fileURLToPath(new URL('./supervisor.js', import.meta.url));
 
@@ -29,17 +29,25 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Await a readable stream reaching 'end'/'close', bounded so a stream that
- *  never ends (shouldn't happen -- the supervisor has already exited by the
- *  time this is called) can't hang `lane run` forever (BRAIN-308). */
-function waitForStreamEnd(stream, timeoutMs = 2000) {
+/** Await a readable stream reaching 'end'/'close'. Bounded by IDLE time, not total time: a stream that never ends
+ *  (shouldn't happen -- the supervisor has already exited by the time this is called) can't hang `lane run` forever
+ *  (BRAIN-308), but one still delivering bytes -- a big tail, a slow reader, a loaded machine -- is never cut off
+ *  with output unread in the pipe (BRAIN-453). */
+export function waitForStreamEnd(stream, idleMs = 2000) {
   if (!stream || stream.readableEnded || stream.destroyed) return Promise.resolve();
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, timeoutMs);
+    let timer;
     const done = () => {
       clearTimeout(timer);
+      stream.off('data', arm);
       resolve();
     };
+    const arm = () => {
+      clearTimeout(timer);
+      timer = setTimeout(done, idleMs);
+    };
+    arm();
+    stream.on('data', arm);
     stream.once('end', done);
     stream.once('close', done);
     stream.once('error', done);
@@ -388,6 +396,11 @@ export async function runCommand({
       process.stderr.write(budget.message);
       return { exitCode: budget.exitCode };
     }
+  }
+  // BRAIN-452: needs this host's capacity, so it is checked here rather than in repo-config parsing. A remote-eligible lane's weight is relative to the runner.
+  if (!remoteEligible && !runnerIntake && oversizedWeight(weight, effectiveWeightCapacity(globalCfg, host.cpuCores), exclusive)) {
+    process.stderr.write(`lane run: ${oversizedWeightMessage(weight)}\n`);
+    return { exitCode: 64 };
   }
 
   const root = ensureStateDirs().root;

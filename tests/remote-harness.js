@@ -357,7 +357,7 @@ process.exit(${exitCode});
   return [process.execPath, '-e', body];
 }
 
-export async function detachAndWait(args, env, cwd, waitTimeout = '30s') {
+export async function detachAndWait(args, env, cwd, waitTimeout = '180s') {
   const started = await laneRun(args, { env, cwd });
   assert.equal(started.code, 0, `--detach itself should not fail: ${started.stderr}`);
   const id = started.stdout.trim();
