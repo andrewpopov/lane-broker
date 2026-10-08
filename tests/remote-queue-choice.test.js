@@ -150,7 +150,7 @@ async function deadPid() {
 
 test('couldAdmitNow: a queued record whose supervisor is dead is reaped, not counted as queue-ahead', async () => {
   const { state } = freshEnv();
-  await enqueue(state, { ...ticket, id: 'ghost', supervisorPid: await deadPid(), supervisorStart: null });
+  await enqueue(state, { ...ticket, id: 'ghost', supervisorPid: await deadPid(), supervisorStart: null, resultPath: path.join(state, 'ghost-result.json') });
   assert.deepEqual(await couldAdmitNow(state, cfg, ticket, () => null), { admit: true, reason: 'ok' });
   assert.equal(fs.readdirSync(paths(state).queue).length, 0, 'the dead record was dequeued');
 });

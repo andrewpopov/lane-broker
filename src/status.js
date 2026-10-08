@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { ensureStateDirs, paths, withLock, bootId, readJsonSafe, readDrainMarker } from './state.js';
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
-import { listQueueCapped, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState, readResourceSkipState, futileFresh } from './scheduler.js';
+import { listQueueCapped, reapOrphanedQueue, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState, readResourceSkipState, futileFresh } from './scheduler.js';
 import { refreshCpuEstimates } from './cpu-estimates.js';
 import { cpuBudget, projectBusy, ticketCpuEstimate, ticketCpuEstimateBasis } from './admission.js';
 import { classLocks, simArmed, usedByClass } from './allocation.js';
@@ -142,7 +142,14 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
   refreshCpuEstimates(cfg);
   let lockError = null;
   try {
-    await withLock(root, () => reapAll(root, bootId()), { timeoutMs: lockTimeoutMs });
+    await withLock(
+      root,
+      () => {
+        reapAll(root, bootId());
+        reapOrphanedQueue(root);
+      },
+      { timeoutMs: lockTimeoutMs },
+    );
   } catch (err) {
     // The lock is only needed to reap stale leases before reporting; the
     // leases/queue/gate files underneath are readable without it. A timeout
