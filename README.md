@@ -318,7 +318,8 @@ that must always queue behind test lanes. Lanes that omit it age exactly as befo
 
 A lane with `localRefused: true` (the `sim` lane by default, matching the
 rouge fleet split) is refused on `lane run` unless `--allow-local-sim` is
-passed — print a fleet-offload message and exit `69` instead.
+passed — print a refusal message and exit `69` instead. The message points at
+`ROUGE_FLEET_SUBMIT_DSN` (never its value) only for a `class: "sim"` lane.
 
 A lane's own `nice` (integer `0`-`19`) overrides the global `laneNice` for
 that lane only; omit it to use the global default.
@@ -359,7 +360,13 @@ refused as undeclared.
 
 A `localRefused: true` lane (BRAIN-320) marked `remote` tries runners first;
 only a *fallback to local execution* is refused, unless `--allow-local-sim`
-is also passed.
+is also passed. Such a lane never runs here by default, so it never takes the
+"run locally because this machine could admit it" path (BRAIN-338): when every
+runner is queued it queues on the least-loaded one regardless of local
+capacity. When no runner can take it at all (every probe failed, or every
+runner is paused/draining/over `maxRemoteQueue`) it exits `76` — retry later —
+rather than the policy refusal `69`. A lane that is not remote-eligible, or
+whose tree is ineligible for a snapshot, still exits `69`.
 
 `ssh` is an ssh destination (an alias from `~/.ssh/config`, or
 `ssh://user@host:port`); it may not start with `-`. `shell` (default
@@ -1468,6 +1475,7 @@ Documented limits, not bugs:
 | `2` | Bad CLI usage (missing command / argument). |
 | `64` | Nested `lane run` would widen the inherited lease — refused; or an invalid `--priority` / `LANE_BROKER_PRIORITY` / lane `priority`; or an `--exclusive` lane nested under another lane; or `exclusiveHooks` in host or repo config (not supported yet). |
 | `69` | Local-sim lane refused (fleet-offload message); use `--allow-local-sim`. |
+| `76` | A remote-only (`localRefused` + `remote`) lane found no runner able to take it right now (BRAIN-455). Retryable, unlike `69`; `--allow-local-sim` runs it here. |
 | `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. Also `lane run` / `remote-exec` refused with "scheduler migration in progress" while `lane migrate-scheduler` runs, or "scheduler migration pending (draining)" while `--when-idle` waits. |
 | `124` | Killed by the no-progress watchdog (`reason: "no-progress"`, see below). |
 | `130` | Cancelled (SIGINT/SIGTERM) while still queued, before the lane ever started. |

@@ -224,6 +224,23 @@ test('supervisor: runner has a queue and local cannot admit -> the ticket is que
   await Promise.all([blocker, queued]);
 });
 
+test('supervisor: a localRefused lane queues on a queued runner even when local could admit it (BRAIN-455)', async () => {
+  const { env, state, repoDir } = setup({ ssh: 'queued-one' });
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, localRefused: true } } });
+
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(
+    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
+    env,
+    repoDir,
+  );
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+  assert.equal(result.queuedAt, 'skybox(1)');
+});
+
 test('supervisor: maxRemoteQueue 0 -> a queued runner is skipped and the ticket runs locally (today\'s behaviour)', async () => {
   const { env, state, repoDir } = setup();
   const globalPath = path.join(env.LANE_BROKER_HOME, 'config.json');

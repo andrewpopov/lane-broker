@@ -307,6 +307,11 @@ export function checkResourceBudget({ resources, globalCfg, host }) {
   return { ok: true };
 }
 
+/** Exit code of every `localRefused` policy refusal (BRAIN-320). */
+export const LOCAL_REFUSED_EXIT_CODE = 69;
+/** BRAIN-455: a remote-only lane found no usable runner right now. Retryable, unlike the policy refusal above. */
+export const NO_RUNNER_EXIT_CODE = 76;
+
 /**
  * The "this lane is refused for local runs by default" refusal, extracted
  * (BRAIN-320) so `run.js`'s immediate refusal and the supervisor's
@@ -314,19 +319,37 @@ export function checkResourceBudget({ resources, globalCfg, host }) {
  * back to local, and `--allow-local-sim` was never passed) apply the exact
  * same message and exit code -- one refusal path per reason, same pattern
  * as `checkResourceBudget` above.
+ *
+ * `laneClass` gates the DSN hint: ROUGE_FLEET_SUBMIT_DSN is rouge's sim-fleet
+ * submit DSN, so only a `sim` lane is pointed at it.
  */
-export function localSimRefusal(lane) {
+export function localSimRefusal(lane, laneClass) {
   // BRAIN-382: name the variable, never print its value -- it is a DSN with a password, and this
   // message lands in agent transcripts.
-  const submitHint = process.env.ROUGE_FLEET_SUBMIT_DSN
-    ? 'submit to the fleet instead, via the DSN in ROUGE_FLEET_SUBMIT_DSN'
-    : 'submit to the fleet instead (set ROUGE_FLEET_SUBMIT_DSN, or pass --allow-local-sim to run here)';
+  let submitHint = '';
+  if (laneClass === 'sim') {
+    submitHint = process.env.ROUGE_FLEET_SUBMIT_DSN
+      ? ' (submit to the fleet instead, via the DSN in ROUGE_FLEET_SUBMIT_DSN)'
+      : ' (submit to the fleet instead: set ROUGE_FLEET_SUBMIT_DSN, or pass --allow-local-sim to run here)';
+  }
   return {
     ok: false,
-    exitCode: 69,
+    exitCode: LOCAL_REFUSED_EXIT_CODE,
+    message: `lane run: lane "${lane}" is refused for local runs by default${submitHint}. Pass --allow-local-sim to override.\n`,
+  };
+}
+
+/**
+ * BRAIN-455: a `localRefused` lane that is remote-eligible runs only on a runner, so "no runner can take it right now" is
+ * a retryable fleet condition, not the policy refusal `localSimRefusal` reports.
+ */
+export function noRunnerRefusal(lane, reason) {
+  return {
+    ok: false,
+    exitCode: NO_RUNNER_EXIT_CODE,
     message:
-      `lane run: lane "${lane}" is refused for local runs by default (${submitHint}). ` +
-      `Pass --allow-local-sim to override.\n`,
+      `lane run: lane "${lane}" runs only on a remote runner and none can take it now (${reason}). ` +
+      `Retry later, or pass --allow-local-sim to run here.\n`,
   };
 }
 
