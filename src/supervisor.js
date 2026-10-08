@@ -26,7 +26,7 @@ import { DescendantTracker, hasLiveMembers, reapLogLine } from './descendants.js
 import { reloadGlobalConfig } from './config.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
-import { detectResourceCapacity, checkResourceBudget, localSimRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
+import { detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
@@ -589,8 +589,17 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     return { fallback: true, rebindFailed: true, attemptGeneration: gen };
   }
 
-  /** `rebindable`: this fallback is only "no runner had room right now", so a later probe may still find one. */
-  async function fallbackOrRefuse(runner, reason, { rebindable = false, neverStarted = false } = {}) {
+  /** Why this machine can never run the ticket (a refusal result), or null: a `localRefused` lane without --allow-local-sim,
+   *  else a claim over the local budget. The one definition behind local-first, the queued-runner choice and the fallback. */
+  function localIneligibility() {
+    if (enriched.localRefused && !enriched.allowLocalSim) return localSimRefusal(enriched.lane, enriched.class);
+    const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host: detectResourceCapacity() });
+    return budget.ok ? null : budget;
+  }
+
+  /** `rebindable`: this fallback is only "no runner had room right now", so a later probe may still find one.
+   *  `noRunner`: the fallback is "the fleet had no usable runner", which a `localRefused` lane reports as retryable. */
+  async function fallbackOrRefuse(runner, reason, { rebindable = false, neverStarted = false, noRunner = false } = {}) {
     if (rebind) return abandonRebind(runner, reason, { neverStarted: neverStarted || withdrawn === null });
     const fb = await fallbackToLocal(root, enriched.id, reason);
     if (!fb.ok) {
@@ -603,7 +612,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       throw new Error(`lane-broker supervisor: could not fall back to local for ${enriched.id} (attempt record missing)`);
     }
 
-    const skipLine = `lane: remote-skip: ${runner ? runner.name : 'none'}: ${reason} — running locally\n`;
+    const refusedHere = enriched.localRefused && !enriched.allowLocalSim;
+    const skipLine = `lane: remote-skip: ${runner ? runner.name : 'none'}: ${reason} — ${refusedHere ? 'not running locally (localRefused)' : 'running locally'}\n`;
     process.stderr.write(skipLine);
     writeBrokerLog(root, skipLine);
 
@@ -613,8 +623,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     // exactly this lane/eligibility combination, so it must be re-applied
     // now, before the resource-budget check below (mirroring run.js's own
     // ordering: local-sim refusal, then budget).
-    if (enriched.localRefused && !enriched.allowLocalSim) {
-      const refusal = localSimRefusal(enriched.lane);
+    if (refusedHere) {
+      const refusal = noRunner ? noRunnerRefusal(enriched.lane, reason) : localSimRefusal(enriched.lane, enriched.class);
       process.stderr.write(refusal.message);
       await publishAndExit(fb.attempt.generation, () => localRefusalResult(enriched, refusal));
       return { fallback: false };
@@ -634,13 +644,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // BRAIN-442: a local-first ticket skips the initial dispatch and queues locally; only `tryRebind` may move it, after its wait.
   // A ticket this machine would refuse (local-refused lane, over the local budget) can never run here, so it ignores the policy.
   if (enriched.localFirst && !rebind) {
-    const localRefusal =
-      enriched.localRefused && !enriched.allowLocalSim
-        ? localSimRefusal(enriched.lane)
-        : (() => {
-            const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host: detectResourceCapacity() });
-            return budget.ok ? null : budget;
-          })();
+    const localRefusal = localIneligibility();
     if (localRefusal) {
       enriched.localFirst = false;
       const line = `lane: local-first: not locally eligible (${localRefusal.message.trim()}); dispatching remote\n`;
@@ -695,10 +699,10 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   let { runner, skipped, queuedChoice, probe, busy } = rebind
     ? { runner: rebind.runner, skipped: [], queuedChoice: false, probe: rebind.probe }
     : await selectRunner(globalCfg.runners || [], remoteSelectOptions(enriched, globalCfg));
-  // A `localRefused` lane has no local queue to wait in, so with every runner busy it waits on the best one: that runner's own
-  // broker holds the ticket until it has room (what every empty-queue runner did before headroom ranking).
+  // A ticket this machine would refuse has no local queue to wait in, so with every runner busy it waits on the best one: that
+  // runner's own broker holds the ticket until it has room (what every empty-queue runner did before headroom ranking).
   let busyQueuedAt;
-  if (!runner && busy && !rebind && enriched.localRefused && !enriched.allowLocalSim) {
+  if (!runner && busy && !rebind && localIneligibility()) {
     ({ runner, probe } = busy);
     busyQueuedAt = `${runner.name}(0)`;
     const line = `lane: waiting on ${runner.name}: every runner is busy and this lane cannot run locally (${skipped.map((s) => `${s.name}: ${s.reason}`).join('; ')})\n`;
@@ -707,21 +711,24 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   }
   if (!runner) {
     const reason = skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : 'no runners configured';
-    return fallbackOrRefuse(null, reason, { rebindable: true });
+    return fallbackOrRefuse(null, reason, { rebindable: true, noRunner: true });
   }
 
   // BRAIN-338: every runner has a queue. Queue on the least-loaded one only
   // when this machine could not start the ticket right now either;
-  // otherwise run locally, exactly as when no runner was idle.
+  // otherwise run locally, exactly as when no runner was idle. A ticket this machine would refuse queues regardless.
   let queuedAt = busyQueuedAt;
   if (queuedChoice) {
     queuedAt = `${runner.name}(${probe.queued})`;
-    const local = await couldAdmitNow(root, globalCfg, enriched);
-    if (local.admit) {
+    const ineligible = localIneligibility();
+    const local = ineligible ? null : await couldAdmitNow(root, globalCfg, enriched);
+    if (local?.admit) {
       const reason = skipped.map((s) => `${s.name}: ${s.reason}`).join('; ');
       return fallbackOrRefuse(null, `${reason}; local can admit now, not queuing on ${queuedAt}`, { rebindable: true });
     }
-    const line = `lane: queuing on ${queuedAt}: local cannot admit now (${local.reason})\n`;
+    const line = ineligible
+      ? `lane: queuing on ${queuedAt}: not locally eligible (${ineligible.message.trim()})\n`
+      : `lane: queuing on ${queuedAt}: local cannot admit now (${local.reason})\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);
   }

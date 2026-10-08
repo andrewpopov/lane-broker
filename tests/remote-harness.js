@@ -131,14 +131,16 @@ if (destination === 'die-midstream') {
   });
   process.stdin.on('end', finish);
   process.stdin.on('error', finish);
-} else if (destination === 'no-artifacts' && commandString.includes('remote-probe')) {
+} else if ((destination === 'no-artifacts' || destination === 'queued-one') && commandString.includes('remote-probe')) {
   // BRAIN-398: a runner built before artifacts/1 -- its probe simply lacks the capability.
+  // BRAIN-455: 'queued-one' reports one queued ticket whatever the client's own queue holds, so local admission stays free.
   const child = spawn('sh', ['-c', commandString], { stdio: ['ignore', 'pipe', 'inherit'] });
   let out = '';
   child.stdout.on('data', (d) => { out += d; });
   child.on('close', () => {
     const probe = JSON.parse(out.trim());
-    probe.capabilities = probe.capabilities.filter((c) => !c.startsWith('artifacts/'));
+    if (destination === 'no-artifacts') probe.capabilities = probe.capabilities.filter((c) => !c.startsWith('artifacts/'));
+    else probe.queued = 1;
     process.stdout.write(\`\${JSON.stringify(probe)}\\n\`);
     exitNow(0);
   });

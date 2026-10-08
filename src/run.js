@@ -381,7 +381,7 @@ export async function runCommand({
   // remote attempt actually falls back, mirroring how the resource-budget
   // refusal below is skipped here and re-applied on that same fallback path.
   if (resolved.localRefused && !allowLocalSim && !remoteEligible) {
-    const refusal = localSimRefusal(resolved.lane);
+    const refusal = localSimRefusal(resolved.lane, resolved.class);
     process.stderr.write(refusal.message);
     return { exitCode: refusal.exitCode };
   }

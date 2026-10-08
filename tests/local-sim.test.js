@@ -7,7 +7,7 @@ function setup() {
   const { base, home, env } = freshEnv();
   writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
   const repoDir = path.join(base, 'repo');
-  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 2 }, sim: { weight: 2, localRefused: true } } });
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 2 }, sim: { weight: 2, localRefused: true, class: 'sim' }, remoteOnly: { weight: 2, localRefused: true } } });
   return { repoDir, env };
 }
 
@@ -37,6 +37,19 @@ test('with ROUGE_FLEET_SUBMIT_DSN set, the refusal names the variable but never 
   assert.match(result.stderr, /ROUGE_FLEET_SUBMIT_DSN/);
   assert.doesNotMatch(result.stderr, /planted-secret-7f3a/, 'the DSN password must never reach stderr');
   assert.doesNotMatch(result.stderr, /db\.example\.invalid/, 'no part of the DSN value is printed');
+});
+
+test('a localRefused lane that is not class sim never mentions ROUGE_FLEET_SUBMIT_DSN (BRAIN-455)', async () => {
+  const { repoDir, env } = setup();
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'remoteOnly', '--', 'true'], {
+    env: { ...env, ROUGE_FLEET_SUBMIT_DSN: 'postgres://fleet_submit:planted-secret-7f3a@db.example.invalid:5432/rouge_sim' },
+    cwd: repoDir,
+  });
+  assert.equal(result.code, 69);
+  assert.match(result.stderr, /refused for local runs by default/);
+  assert.match(result.stderr, /--allow-local-sim/);
+  assert.doesNotMatch(result.stderr, /ROUGE_FLEET_SUBMIT_DSN/);
+  assert.doesNotMatch(result.stderr, /planted-secret-7f3a/);
 });
 
 test('--allow-local-sim overrides the refusal and runs the command', async () => {
