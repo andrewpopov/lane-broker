@@ -42,6 +42,17 @@ test('createAttempt writes a readable record with generation 0, phase probe, exe
   assert.deepEqual(read, attempt);
 });
 
+test('createAttempt records the submitter logPath and cwd (BRAIN-462: a crashed caller finds its remote attempt by --log path)', async () => {
+  const { state } = freshEnv();
+  await createAttempt(state, 'with-log', { logPath: '/tmp/x/shard-2.log', cwd: '/repo' });
+  const read = readAttempt(state, 'with-log');
+  assert.equal(read.logPath, '/tmp/x/shard-2.log');
+  assert.equal(read.cwd, '/repo');
+  await createAttempt(state, 'without-log', {});
+  const bare = readAttempt(state, 'without-log');
+  assert.equal(Object.hasOwn(bare, 'logPath'), false, 'absent when not supplied');
+});
+
 test('listAttempts lists every record present, and an empty state dir lists none', async () => {
   const { state } = freshEnv();
   assert.deepEqual(listAttempts(state), []);

@@ -13,6 +13,8 @@ export const LANE_AGING_CAPABILITY = 'lane-aging/1';
 export const GROUP_REAP_CAPABILITY = 'group-reap/1';
 // BRAIN-436: `lane remote-withdraw`, the irreversible take-back of a ticket still queued on this runner.
 export const REMOTE_WITHDRAW_CAPABILITY = 'remote-withdraw/1';
+// BRAIN-462: attempt records carry the submitter's logPath and cwd.
+export const ATTEMPT_LOGPATH_CAPABILITY = 'attempt-logpath/1';
 
 /** The ONE list: `lane remote-probe` advertises it and `lane capabilities --json` prints it. */
 export const CAPABILITIES = [
@@ -24,6 +26,7 @@ export const CAPABILITIES = [
   GROUP_REAP_CAPABILITY,
   REMOTE_WITHDRAW_CAPABILITY,
   EXCLUSIVE_CAPABILITY,
+  ATTEMPT_LOGPATH_CAPABILITY,
 ];
 
 /** `lane capabilities --json`: what this install can do and which scheduler/admission mode it is in. */

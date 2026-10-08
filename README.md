@@ -1551,7 +1551,7 @@ two `ps` reads, keeping its old command as a prefix and appending this lease's e
 
 Prints one JSON line: `{"version", "capabilities": [...], "schedulerMode", "admissionMode"}`. `capabilities` is the
 same list `lane remote-probe` advertises (`elastic-claims/1`, `priority/1`, `artifacts/1`, `sim-safe-backfill/1`,
-`lane-aging/1`, `group-reap/1`, `remote-withdraw/1`, `exclusive/1`). `schedulerMode` is `priority` when a valid `sched-v2.json` fence is present and
+`lane-aging/1`, `group-reap/1`, `remote-withdraw/1`, `exclusive/1`, `attempt-logpath/1`: a remote attempt record carries the submitter's `logPath` and `cwd`, so a caller that crashed between `lane run --detach` and learning the id can find its attempt by `--log` path, BRAIN-462). `schedulerMode` is `priority` when a valid `sched-v2.json` fence is present and
 `legacy` otherwise; `admissionMode` is the global config's `schedulerMode` (`active` or `shadow`). A caller that needs
 a feature (for example a pool gate that requires `group-reap/1`) checks this before relying on it.
 
