@@ -148,3 +148,37 @@ test('indeterminate liveness (ps cannot run) is not reaped', () => {
     process.env.PATH = prevPath;
   }
 });
+
+test('a just-enqueued ticket with no recorded supervisor identity is not reaped by lane status', async () => {
+  const fx = setup();
+  try {
+    const t = fx.ticket('handoff', {});
+    delete t.supervisorStart;
+    await enqueue(fx.state, t);
+    await laneRun(['status', '--json'], { env: fx.env });
+    assert.ok(listQueue(fx.state).find((q) => q && q.id === 'handoff'), 'still queued');
+    assert.equal(fs.existsSync(path.join(fx.base, 'handoff.json')), false);
+  } finally {
+    fx.restore();
+  }
+});
+
+test('a differing bootId is dead only when the current bootId is known too', () => {
+  const t = { supervisorPid: process.pid, supervisorStart: processStartTime(process.pid), bootId: 'old' };
+  assert.equal(isQueuedSupervisorGone(t, 'new'), true);
+  assert.equal(isQueuedSupervisorGone(t, ''), false, 'unknown current boot is indeterminate');
+  assert.equal(isQueuedSupervisorGone(t, undefined === null ? 'x' : null), false);
+});
+
+test('a result that cannot be published leaves the ticket queued for a retry', async () => {
+  const fx = setup();
+  try {
+    const t = fx.ticket('stuck', { supervisorPid: await deadPid() });
+    t.resultPath = '/dev/null';
+    await enqueue(fx.state, t);
+    await laneRun(['status', '--json'], { env: fx.env });
+    assert.ok(listQueue(fx.state).find((q) => q && q.id === 'stuck'), 'not dequeued without a published result');
+  } finally {
+    fx.restore();
+  }
+});

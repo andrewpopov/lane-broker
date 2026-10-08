@@ -583,7 +583,7 @@ test('5-minute tail after a sim lease is reaped', async () => {
 
 test('5-minute tail after a queued sim whose supervisor died is dequeued', async () => {
   await assertTailAfter(async (state) => {
-    await enqueue(state, sim('ghost', 1, { supervisorPid: DEAD_PID }));
+    await enqueue(state, sim('ghost', 1, { supervisorPid: DEAD_PID, resultPath: path.join(state, 'ghost-result.json') }));
     clearStamp(state);
     await poll(state, ticket('other'), baseCfg()); // any locked evaluation reaps the dead queued supervisor
   });

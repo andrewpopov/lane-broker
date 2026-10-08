@@ -370,7 +370,9 @@ export function reapStale(root, keepTicketId) {
  * one -- a different boot means the supervisor died with the old one. Anything indeterminate is NOT gone.
  */
 export function isQueuedSupervisorGone(t, currentBootId = bootId()) {
-  if (t.bootId && t.bootId !== currentBootId) return true;
+  // No recorded identity (e.g. mid-handoff, before the supervisor wrote it) is never evidence of death.
+  if (!Number.isInteger(t.supervisorPid)) return false;
+  if (t.bootId && currentBootId && t.bootId !== currentBootId) return true;
   return !isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart });
 }
 
@@ -383,19 +385,21 @@ export function reapOrphanedQueue(root, keepTicketId) {
   const current = bootId();
   for (const t of listQueue(root)) {
     if (!t || t.id === keepTicketId || !isQueuedSupervisorGone(t, current)) continue;
+    const endedAt = Date.now();
+    // Publish first: a ticket whose result cannot be written stays queued and is retried on the next pass, so a submitter
+    // reconciling later never finds neither.
+    try {
+      atomicWriteJson(t.resultPath, { id: t.id, exit: 75, signal: null, startedAt: null, endedAt, waitedMs: null, cancelled: false, reason: 'supervisor gone before admission (host restart?)' });
+    } catch (err) {
+      writeBrokerLog(root, `reap ${t.id}: could not publish result, leaving it queued: ${err.message}\n`);
+      continue;
+    }
     // Only a real dequeue is recorded: a failed unlink leaves the ticket
     // queued, and logging it would repeat the false event on every poll.
     // The queue record is gone afterwards, so history is the only durable
     // trace of the drop (BRAIN-202). Same row conventions as cancel.js.
     if (!dequeueSync(root, t.id)) continue;
     touchSimArmFor(root, t);
-    const endedAt = Date.now();
-    try {
-      atomicWriteJson(t.resultPath, { id: t.id, exit: 75, signal: null, startedAt: null, endedAt, waitedMs: null, cancelled: false, reason: 'supervisor gone before admission (host restart?)' });
-    } catch (err) {
-      // An unwritable result path must not abort the admission poll or status that triggered the reap.
-      writeBrokerLog(root, `reap ${t.id}: could not publish result: ${err.message}\n`);
-    }
     appendHistory(root, { ...terminalRowDefaults(t), id: t.id, key: t.key, dequeuedDeadSupervisor: true, error: 'supervisor died while queued', supervisorPid: t.supervisorPid, endedAt, executor: 'local' });
   }
 }

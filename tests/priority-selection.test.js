@@ -443,7 +443,7 @@ test('a ticket\'s fairness record is deleted when the ticket departs: start, can
   const seed = (state) => writeFairness(state, { gone: { conflict: conflictRec(2, T0) }, stay: { conflict: conflictRec(1, T0) } });
   const setup = async (goneOverrides = {}) => {
     const { state, cfg } = fenced();
-    const gone = ticket('gone', goneOverrides);
+    const gone = ticket('gone', { resultPath: path.join(state, 'gone-result.json'), ...goneOverrides });
     const stay = ticket('stay');
     await enqueue(state, gone);
     await enqueue(state, stay);
