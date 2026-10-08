@@ -109,7 +109,7 @@ function computeResourceBlock(root, store, cfg, head, held, now) {
     limit: cfg.resourceSkipLimit,
     reserved: record.reserved && !futileFresh(record, cfg, now),
     futile: futileFresh(record, cfg, now),
-    projectedBusy: projectBusy(record.externalBusy, held, ticketCpuEstimate(head, cfg, now, record.budget), now, cfg, record.budget),
+    projectedBusy: projectBusy(record.externalBusy, held, ticketCpuEstimate(head, cfg, now, held.length > 0 ? record.budget : undefined), now, cfg, record.budget),
     budget: record.budget,
     deniedAgeMs: now - record.deniedAt,
   };
@@ -215,7 +215,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
       ...(t.exclusive === true ? { exclusive: true } : {}),
       ...(tierName(rank) !== tier ? { effectiveRank: tierName(rank) } : {}),
       resources: leaseResources(t, cfg),
-      cpuEstimate: ticketCpuEstimateBasis(t, cfg, now),
+      cpuEstimate: ticketCpuEstimateBasis(t, cfg, now, held.length > 0 ? cpuBudget({ cores: resourceCapacity.cpuCores }, cfg) : undefined),
     };
   });
 

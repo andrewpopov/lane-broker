@@ -301,7 +301,7 @@ export function makeDispatchArgs(overrides = {}) {
 
 /** One global config (runners + admission knobs) and one repo config (lane
  *  `remote: true`) per test, sharing a fresh fake-ssh binDir. */
-export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1, remoteQueueTimeoutMs, remoteResultWaitMs } = {}) {
+export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1, cpuCores, remoteQueueTimeoutMs, remoteResultWaitMs } = {}) {
   const { binDir, probeLogPath, runnerHome, runnerState } = makeFakeSshBin();
   const runnerRoot = tmpDir('remote-dispatch-runner-root');
   const { home, state, env } = freshEnv();
@@ -329,7 +329,7 @@ export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1, remoteQ
   writeGlobalConfig(home, cfg);
   writeGlobalConfig(runnerHome, { sampleMs: 50, capacity: 4 });
   const repoDir = tmpDir('remote-dispatch-repo');
-  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight, remote: true } } });
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight, ...(cpuCores !== undefined ? { cpuCores } : {}), remote: true } } });
   gitFixture(['init', '-q'], repoDir);
   return { env: { ...env, PATH: `${binDir}${path.delimiter}${env.PATH}` }, home, state, repoDir, runnerRoot, probeLogPath, runnerHome, runnerState };
 }

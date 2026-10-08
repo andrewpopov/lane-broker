@@ -1,9 +1,8 @@
 import fs from 'node:fs';
 import { paths, atomicWriteJson, readJsonSafe, fingerprintOf } from './state.js';
 import { sampleHostCpu } from './cpu.js';
-import os from 'node:os';
 import { peekCpuEstimates, lookupEstimate, clampEstimate, raiseEstimate } from './cpu-estimates.js';
-import { evaluateMemoryAdmission, resolveTicketResources, leaseCpuCores, elasticClaimRange, cpuBudgetCores } from './resources.js';
+import { evaluateMemoryAdmission, resolveTicketResources, leaseCpuCores, elasticClaimRange } from './resources.js';
 
 /**
  * Cold-start CPU-core estimate for a lease with no observed measurement yet.
@@ -31,14 +30,10 @@ export function cpuEstimateBasis(ref, declared, cfg, now = Date.now(), budget) {
   if (cfg?.historyDemandEnabled !== true) return { cores: cold, source: 'declared' };
   const found = lookupEstimate(peekCpuEstimates(cfg, now), ref, cold);
   if (!found) return { cores: cold, source: 'declared' };
-  // BRAIN-454: history may also raise the charge (an under-declared lane), but never past the budget the admission predicate compares against.
-  if (cfg.historyDemandRaise !== false && found.p90 > cold) return { cores: raiseEstimate(found.p90, budget ?? hostCpuBudget(cfg)), source: 'history:raised' };
+  // BRAIN-454: history may also raise the charge (an under-declared lane), but only when the caller passes the decision budget, which it does
+  // only while other leases are held: an idle broker charges the declaration as it always did, so a raise can never make a lane unadmittable.
+  if (cfg.historyDemandRaise !== false && Number.isFinite(budget) && found.p90 > cold) return { cores: raiseEstimate(found.p90, budget), source: 'history:raised' };
   return { cores: clampEstimate(found.p90, cold), source: `history:${found.level}` };
-}
-
-/** The CPU budget on this host for callers with no sample in hand; same formula (and core count) as cpuBudget(sample). */
-function hostCpuBudget(cfg) {
-  return cpuBudgetCores({ cpuCores: typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length }, cfg);
 }
 
 /**
@@ -316,7 +311,7 @@ export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, c
   const brokerObserved = heldLeases.reduce((sum, l) => sum + (freshObservedCores(l, now) ?? 0), 0);
   const externalBusy = Math.max(0, nonPreemptibleBusy(cpuSample, cfg) - brokerObserved);
   const budget = cpuBudget(cpuSample, cfg);
-  const { cores: candidateEstimate, source: candidateEstimateSource } = cpuEstimateBasis(candidateRef, candidateResources?.cpuCores ?? candidateWeight, cfg, now, budget);
+  const { cores: candidateEstimate, source: candidateEstimateSource } = cpuEstimateBasis(candidateRef, candidateResources?.cpuCores ?? candidateWeight, cfg, now, heldLeases.length > 0 ? budget : undefined);
   const projectedBusy = projectBusy(externalBusy, heldLeases, candidateEstimate, now, cfg, budget);
   const leaseCharges = heldLeases.map((l) => ({ id: l.id, ...leaseDemandBasis(l, now, cfg, budget) }));
   const leaseDemands = leaseCharges.map(({ id, demand, basis }) => `${String(id).slice(0, 8)}:${fmt(demand)}(${basis})`);

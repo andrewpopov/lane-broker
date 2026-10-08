@@ -347,11 +347,11 @@ test('oversize resources + a usable runner: BRAIN-320 S1e catches the impossible
   // T3b-1) and dialed the runner regardless, which refused on its OWN
   // admission once dispatched (`kind: 'refused'`). Now the client's fit
   // check (1e) is a STATIC impossibility check using that same probe
-  // capacity: weight 1000 can never fit a runner whose reported capacity
-  // weight is 4, so selectRunner skips it without ever dialing -- same
+  // capacity: 1000 cores can never fit a runner whose reported CPU
+  // budget is tiny, so selectRunner skips it without ever dialing -- same
   // "no runners usable" fallback shape as the runner-down case below, and
   // the LOCAL preflight (this same restrictive config) then refuses it too.
-  const { env, state, repoDir } = setup({ cpuAdmissionPercent: 1, weight: 1000 });
+  const { env, state, repoDir } = setup({ cpuAdmissionPercent: 1, cpuCores: 1000 }) // BRAIN-452: a 1000 weight is refused at submission now, so the oversize is CPU;
   const marker = path.join(tmpDir('marker'), 'where');
   const { id, waited } = await detachAndWait(
     ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
@@ -372,7 +372,7 @@ test('oversize resources + a usable runner: BRAIN-320 S1e catches the impossible
 });
 
 test('oversize resources + the runner down: refused exactly as today, once it falls back', async () => {
-  const { env, state, repoDir } = setup({ ssh: 'down', cpuAdmissionPercent: 1, weight: 1000 });
+  const { env, state, repoDir } = setup({ ssh: 'down', cpuAdmissionPercent: 1, cpuCores: 1000 });
   const marker = path.join(tmpDir('marker'), 'where');
   const { id, waited } = await detachAndWait(
     ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
@@ -730,4 +730,14 @@ test('BRAIN-437: the same drop with a runner that confirms `withdrawn` falls bac
   const { waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 7)], env, repoDir, '90s');
   assert.equal(waited.code, 7, `stderr: ${waited.stderr}`);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
+});
+
+test('BRAIN-452: a fresh oversized weight is refused with exit 64 even for a remote-eligible lane, before anything is enqueued', async () => {
+  const { env, state, repoDir } = setup({ weight: 3 }); // capacity 4: 3 > 2
+  const marker = path.join(tmpDir('marker'), 'where');
+  const res = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...markerCmd(marker, 0)], { env, cwd: repoDir });
+  assert.equal(res.code, 64, res.stderr);
+  assert.match(res.stderr, /weight 3 would hold most of this machine's capacity.*BRAIN-452/);
+  assert.equal(fs.existsSync(marker), false, 'never ran, remotely or locally');
+  assert.deepEqual(fs.existsSync(paths(state).queue) ? fs.readdirSync(paths(state).queue) : [], [], 'nothing enqueued');
 });

@@ -25,7 +25,28 @@ test('a stream that goes quiet without ending is abandoned after the idle bound'
   const stream = new PassThrough();
   stream.resume();
   const started = Date.now();
-  await waitForStreamEnd(stream, 100);
-  assert.ok(Date.now() - started < 2000);
+  let resolved = false;
+  const pending = waitForStreamEnd(stream, 300).then(() => {
+    resolved = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.equal(resolved, false, 'still inside the idle window: an immediate return must not pass');
+  await pending;
+  assert.ok(Date.now() - started >= 280, 'waited out the idle bound');
   assert.equal(stream.readableEnded, false);
+});
+
+test('time spent paused under backpressure is not idle time', async () => {
+  const stream = new PassThrough();
+  stream.resume();
+  stream.pause();
+  let resolved = false;
+  const pending = waitForStreamEnd(stream, 100).then(() => {
+    resolved = true;
+  });
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  assert.equal(resolved, false, 'a paused stream is waiting on its consumer, not quiet');
+  stream.resume();
+  await pending;
+  assert.equal(resolved, true, 'once flowing and quiet it is abandoned');
 });

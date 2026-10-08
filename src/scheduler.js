@@ -700,6 +700,7 @@ const resourceReserved = (record, cfg, now) => record !== null && record.reserve
  */
 function headFutility(cfg, headTicket, held, cpuSample, cpuDecision, memInfo, now) {
   if (held.some((lease) => freshObservedCores(lease, now) === null)) return null;
+  // Futile = does not fit even on a DRAINED broker, where nothing is held and so (BRAIN-454) no history raise applies.
   const headCpu = ticketCpuFloor(headTicket, cfg);
   const sampledAt = Number.isFinite(cpuSample?.sampledAt) ? cpuSample.sampledAt : now;
   const resources = resolveTicketResources({
@@ -798,11 +799,25 @@ function logWeightClamp(root, ticket) {
   writeBrokerLog(root, `lane-broker-head-block event=weight-clamped headId=${ticket.id} weight=${ticket.weightClampedFrom} clampedTo=${ticket.weight} reason=near-capacity-weight(BRAIN-452)\n`);
 }
 
-/** The smallest CPU claim a ticket can be admitted at: its estimate, or for an elastic ticket its floor. */
-function ticketCpuFloor(ticket, cfg, budget) {
-  const estimate = ticketCpuEstimate(ticket, cfg, undefined, budget);
+/**
+ * The smallest CPU claim a ticket can be admitted at, charged exactly as admission charges it: an elastic ticket is judged at
+ * every integer grant admission would try (ceil(minCpuCores) up to its declaration), each with its own history estimate
+ * (history is keyed by the granted cores and may RAISE a charge, BRAIN-454), and the cheapest wins. `budget` is the decision
+ * budget admission compares against; the raise applies only with it and only while other leases are held.
+ */
+function ticketCpuFloor(ticket, cfg, budget, held = []) {
+  const raiseBudget = held.length > 0 ? budget : undefined;
+  const estimate = ticketCpuEstimate(ticket, cfg, undefined, raiseBudget);
   const min = ticket.resources?.minCpuCores;
-  return Number.isFinite(min) ? Math.min(estimate, Math.ceil(min)) : estimate;
+  if (!Number.isFinite(min)) return estimate;
+  const declared = ticket.resources?.cpuCores;
+  let floor = Math.min(estimate, Math.ceil(min));
+  if (raiseBudget === undefined || !Number.isFinite(declared)) return floor;
+  floor = estimate;
+  for (let grant = Math.ceil(min); grant < declared && grant <= Math.ceil(min) + 256; grant += 1) {
+    floor = Math.min(floor, ticketCpuEstimate({ ...ticket, resources: { ...ticket.resources, cpuCores: grant } }, cfg, undefined, raiseBudget));
+  }
+  return floor;
 }
 
 /**
@@ -838,7 +853,7 @@ export function selectResourceCandidate(queue, held, runningWeight, weightCapaci
     if (blockedBy(held, t)) continue;
     if (viewWeight + t.weight > weightCapacity) continue;
     if (headReserved ? blockedBy([{ key: t.key }], headTicket) || blockedBy([{ key: headTicket.key }], t) : blockedBy([...held, { key: t.key }], headTicket)) continue;
-    const claim = ticketCpuFloor(t, cfg, record.budget);
+    const claim = ticketCpuFloor(t, cfg, record.budget, held);
     if (projectBusy(record.externalBusy, view, claim, now, cfg, record.budget) > record.budget) continue;
     if (claim < bestClaim) {
       best = t;

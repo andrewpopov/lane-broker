@@ -19,9 +19,10 @@ const CALLS = Number(process.env.LANE_SCALE_CALLS ?? 1000);
 const P99_BOUND_MS = Number(process.env.LANE_SCALE_P99_MS ?? 300);
 const percentile = (sorted, p) => sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * p) - 1)];
 
-/** BRAIN-453: the p99 of a trivial query on the same connection, now. A bound measured in wall-clock ms is only meaningful
- *  next to what the machine is doing: on a saturated host every round trip slows, not just the claim. */
-async function roundTripP99(client) {
+/** BRAIN-453: host noise allowance. The p99 of a trivial query on the same connection, measured BEFORE the workload and capped, so a
+ *  saturated host widens the bound by what its round trips already cost, while a later load spike can never excuse a regression. */
+const NOISE_CAP_MS = 100;
+async function noiseAllowanceMs(client) {
   const times = [];
   for (let i = 0; i < 100; i += 1) {
     const start = process.hrtime.bigint();
@@ -29,7 +30,7 @@ async function roundTripP99(client) {
     times.push(Number(process.hrtime.bigint() - start) / 1e6);
   }
   times.sort((a, b) => a - b);
-  return percentile(times, 0.99);
+  return Math.min(percentile(times, 0.99), NOISE_CAP_MS);
 }
 
 async function assertNeverAnalysed(su) {
@@ -48,6 +49,7 @@ describe('lane.claim_next at scale', { skip: PG_SKIP_REASON ?? false, timeout: 6
     const agents = await seedScale(su, { jobs: 60000, groups: 40, hosts: 5 });
         await assertNeverAnalysed(su);
     const clients = await Promise.all(agents.map((a) => cluster.client(db, a.login)));
+    const noise = await noiseAllowanceMs(clients[0]);
     const times = [];
     for (let i = 0; i < CALLS; i++) {
       const start = process.hrtime.bigint();
@@ -58,19 +60,20 @@ describe('lane.claim_next at scale', { skip: PG_SKIP_REASON ?? false, timeout: 6
     times.sort((a, b) => a - b);
     const p50 = percentile(times, 0.5);
     const p99 = percentile(times, 0.99);
-    const bound = P99_BOUND_MS + (await roundTripP99(clients[0]));
+    const bound = P99_BOUND_MS + noise;
     console.log(`claim_next at 60k queued jobs: p50 ${p50.toFixed(2)} ms, p99 ${p99.toFixed(2)} ms, max ${times.at(-1).toFixed(2)} ms over ${CALLS} calls (PostgreSQL ${await cluster.serverVersion()})`);
-    assert.ok(p99 < bound, `p99 ${p99.toFixed(1)} ms is not under ${bound.toFixed(1)} ms (${P99_BOUND_MS} + the host's own round-trip p99)`);
+    assert.ok(p99 < bound, `p99 ${p99.toFixed(1)} ms is not under ${bound.toFixed(1)} ms (${P99_BOUND_MS} + ${noise.toFixed(1)} ms pre-measured host noise)`);
     const { rows: [{ n }] } = await su.query("SELECT count(*)::int AS n FROM lane.jobs WHERE state = 'claimed'");
     assert.equal(n, CALLS);
   });
 
-  test('a never-analysed 400-job table claims in under 50 ms at p90 (the PostgreSQL 17 plan flip)', async () => {
+  test('a never-analysed 400-job table claims in under 50 ms at p99 (the PostgreSQL 17 plan flip)', async () => {
     const db = await cluster.freshDb();
     const su = await cluster.client(db);
     const agents = await seedScale(su, { jobs: 400, groups: 8, hosts: 1 });
     await assertNeverAnalysed(su);
     const agent = await cluster.client(db, agents[0].login);
+    const noise = await noiseAllowanceMs(agent);
     const times = [];
     for (let i = 0; i < 300; i++) {
       const start = process.hrtime.bigint();
@@ -78,9 +81,8 @@ describe('lane.claim_next at scale', { skip: PG_SKIP_REASON ?? false, timeout: 6
       times.push(Number(process.hrtime.bigint() - start) / 1e6);
     }
     times.sort((a, b) => a - b);
-    const bound = 50 + (await roundTripP99(agent));
+    const bound = 50 + noise;
     console.log(`claim_next on a never-analysed 400-job table: p50 ${percentile(times, 0.5).toFixed(2)} ms, p99 ${percentile(times, 0.99).toFixed(2)} ms (PostgreSQL ${await cluster.serverVersion()})`);
-    // The flip made EVERY claim slow (~200 ms), so p90 catches it; the 3 slowest of 300 on a saturated host are scheduling noise, not a plan.
-    assert.ok(percentile(times, 0.9) < bound, `p90 ${percentile(times, 0.9).toFixed(1)} ms is not under ${bound.toFixed(1)} ms (50 + the host's own round-trip p99)`);
+    assert.ok(percentile(times, 0.99) < bound, `p99 ${percentile(times, 0.99).toFixed(1)} ms is not under ${bound.toFixed(1)} ms (50 + ${noise.toFixed(1)} ms pre-measured host noise)`);
   });
 });

@@ -32,22 +32,29 @@ function sleep(ms) {
 /** Await a readable stream reaching 'end'/'close'. Bounded by IDLE time, not total time: a stream that never ends
  *  (shouldn't happen -- the supervisor has already exited by the time this is called) can't hang `lane run` forever
  *  (BRAIN-308), but one still delivering bytes -- a big tail, a slow reader, a loaded machine -- is never cut off
- *  with output unread in the pipe (BRAIN-453). */
+ *  with output unread in the pipe (BRAIN-453). Only time spent readable and flowing counts as idle: a stream paused by
+ *  its destination's backpressure is waiting on the consumer, not quiet. */
 export function waitForStreamEnd(stream, idleMs = 2000) {
   if (!stream || stream.readableEnded || stream.destroyed) return Promise.resolve();
   return new Promise((resolve) => {
-    let timer;
+    const tickMs = Math.max(1, Math.min(50, Math.floor(idleMs / 4)));
+    let idle = 0;
+    let last = Date.now();
     const done = () => {
-      clearTimeout(timer);
-      stream.off('data', arm);
+      clearInterval(ticker);
+      stream.off('data', onData);
       resolve();
     };
-    const arm = () => {
-      clearTimeout(timer);
-      timer = setTimeout(done, idleMs);
+    const onData = () => {
+      idle = 0;
     };
-    arm();
-    stream.on('data', arm);
+    const ticker = setInterval(() => {
+      const now = Date.now();
+      if (stream.readableFlowing === true && stream.readableLength === 0) idle += now - last;
+      last = now;
+      if (idle >= idleMs) done();
+    }, tickMs);
+    stream.on('data', onData);
     stream.once('end', done);
     stream.once('close', done);
     stream.once('error', done);
@@ -397,8 +404,9 @@ export async function runCommand({
       return { exitCode: budget.exitCode };
     }
   }
-  // BRAIN-452: needs this host's capacity, so it is checked here rather than in repo-config parsing. A remote-eligible lane's weight is relative to the runner.
-  if (!remoteEligible && !runnerIntake && oversizedWeight(weight, effectiveWeightCapacity(globalCfg, host.cpuCores), exclusive)) {
+  // BRAIN-452: needs this host's capacity, so it is checked here rather than in repo-config parsing. Every fresh submission is validated, remote-eligible or not (a
+  // remote lane may fall back to local); clamping is only for tickets an older config already queued. A runner's own intake takes the submitter's weight.
+  if (!runnerIntake && oversizedWeight(weight, effectiveWeightCapacity(globalCfg, host.cpuCores), exclusive)) {
     process.stderr.write(`lane run: ${oversizedWeightMessage(weight)}\n`);
     return { exitCode: 64 };
   }
@@ -652,12 +660,12 @@ export async function runCommand({
     for (;;) {
       const result = readJsonSafe(resultPath);
       if (result) {
-        return finishedReturn(resultExit('lane run', result));
+        return await finishedReturn(resultExit('lane run', result));
       }
       if (deadline && Date.now() > deadline) {
         const state = await describeLaneState(root, id, resultPath);
         if (state.finished) {
-          return finishedReturn(resultExit('lane run', state.result));
+          return await finishedReturn(resultExit('lane run', state.result));
         }
         process.stderr.write(`lane run: waited ${timeoutMs}ms, not failed — ${state.text}\n`);
         return abortReturn(75);
@@ -668,7 +676,7 @@ export async function runCommand({
         // before concluding it died with nothing to show for it.
         const finalResult = readJsonSafe(resultPath);
         if (finalResult) {
-          return finishedReturn(resultExit('lane run', finalResult));
+          return await finishedReturn(resultExit('lane run', finalResult));
         }
         // The supervisor exited without ever writing a result: it was cancelled
         // while still queued (or crashed) before the child ever ran.
