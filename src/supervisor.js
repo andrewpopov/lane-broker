@@ -4,6 +4,7 @@ import { pathToFileURL } from 'node:url';
 import {
   paths,
   ensureStateDirs,
+  bootId,
   appendHistory,
   atomicWriteJson,
   readJsonSafe,
@@ -1020,6 +1021,7 @@ async function main() {
     ...ticket,
     supervisorPid: process.pid,
     supervisorStart: supervisorStart === undefined ? null : supervisorStart,
+    bootId: bootId(),
   };
 
   let cancelledBeforeStart = false;

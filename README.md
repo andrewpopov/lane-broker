@@ -408,6 +408,11 @@ What a remote run does:
    (its queue is non-empty, or a conflict, capacity, pause, load-gate,
    cooldown or memory check refuses it); otherwise the run stays local.
    A runner with room always beats any runner queue.
+   A queued ticket whose supervisor is provably dead (pid gone, start time changed, or a different boot; an
+   indeterminate probe counts as alive) is an orphan, e.g. after a runner reboot. It is reaped under the broker
+   lock by every admission poll, `lane status` and `remote-probe`, so it never holds a `maxRemoteQueue` slot: it
+   is dequeued, its result is published as exit 75 (`supervisor gone before admission (host restart?)`) and a
+   history row is written. Leases are not touched here; the lease reaper owns them.
    A run queued this way records `queuedAt: "<runner>(<queued at pick time>)"`
    in its result and attempt record and logs `lane: queuing on ...`. The
    local check reaps stale records like every admission poll but never

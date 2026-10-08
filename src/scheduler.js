@@ -361,17 +361,42 @@ export function blockedBy(held, ticket) {
 export function reapStale(root, keepTicketId) {
   reapAll(root, bootId());
   recoverRebinding(root);
+  reapOrphanedQueue(root, keepTicketId);
+}
+
+/**
+ * BRAIN-457: is the supervisor that queued this ticket provably gone? Same rule as a lease (`isSupervisorAlive`: pid absent, or
+ * its start time differs from the recorded one; an unreadable probe counts as alive), plus the boot id when the record stores
+ * one -- a different boot means the supervisor died with the old one. Anything indeterminate is NOT gone.
+ */
+export function isQueuedSupervisorGone(t, currentBootId = bootId()) {
+  if (t.bootId && t.bootId !== currentBootId) return true;
+  return !isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart });
+}
+
+/**
+ * BRAIN-457: dequeue every queued ticket whose supervisor is gone, nothing else (leases are `reapAll`'s). Nothing polls for
+ * such a ticket any more, so it would hold queue slots (`maxRemoteQueue`) forever. Publishes the terminal exit-75 result a
+ * submitter reconciles against, and a history row. Caller must hold the global lock. `keepTicketId` is the caller's own ticket.
+ */
+export function reapOrphanedQueue(root, keepTicketId) {
+  const current = bootId();
   for (const t of listQueue(root)) {
-    if (t && t.id !== keepTicketId && !isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart })) {
-      // Only a real dequeue is recorded: a failed unlink leaves the ticket
-      // queued, and logging it would repeat the false event on every poll.
-      // The queue record is gone afterwards, so history is the only durable
-      // trace of the drop (BRAIN-202). Same row conventions as cancel.js.
-      if (dequeueSync(root, t.id)) {
-        touchSimArmFor(root, t);
-        appendHistory(root, { ...terminalRowDefaults(t), id: t.id, key: t.key, dequeuedDeadSupervisor: true, error: 'supervisor died while queued', supervisorPid: t.supervisorPid, endedAt: Date.now(), executor: 'local' });
-      }
+    if (!t || t.id === keepTicketId || !isQueuedSupervisorGone(t, current)) continue;
+    // Only a real dequeue is recorded: a failed unlink leaves the ticket
+    // queued, and logging it would repeat the false event on every poll.
+    // The queue record is gone afterwards, so history is the only durable
+    // trace of the drop (BRAIN-202). Same row conventions as cancel.js.
+    if (!dequeueSync(root, t.id)) continue;
+    touchSimArmFor(root, t);
+    const endedAt = Date.now();
+    try {
+      atomicWriteJson(t.resultPath, { id: t.id, exit: 75, signal: null, startedAt: null, endedAt, waitedMs: null, cancelled: false, reason: 'supervisor gone before admission (host restart?)' });
+    } catch (err) {
+      // An unwritable result path must not abort the admission poll or status that triggered the reap.
+      writeBrokerLog(root, `reap ${t.id}: could not publish result: ${err.message}\n`);
     }
+    appendHistory(root, { ...terminalRowDefaults(t), id: t.id, key: t.key, dequeuedDeadSupervisor: true, error: 'supervisor died while queued', supervisorPid: t.supervisorPid, endedAt, executor: 'local' });
   }
 }
 
