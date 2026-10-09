@@ -17,11 +17,14 @@ import { makeReader, readHeaderLine, extractFrames, MAX_HEADER_BYTES } from './r
 import { runCommand } from './run.js';
 import { cancelCommand } from './cancel.js';
 import { collectStatus } from './status.js';
-import { readLease, isSupervisorAlive, listLeasesStrict } from './lease.js';
+import { readLease, isSupervisorAlive, listLeasesStrict, listLeases } from './lease.js';
 import { readAttempt, listAttemptsStrict } from './attempts.js';
-import { listQueue, listQueueStrict, dequeueSync } from './scheduler.js';
+import { listQueue, listQueueStrict, dequeueSync, HELD_STATES } from './scheduler.js';
 import { REMOTE_TMP_BASE, TMP_OWNER_FILE, gcRemoteTickets, removeDetached } from './gc.js';
-import { writeBrokerLog } from './admission.js';
+import { writeBrokerLog, cpuHeadroomCores } from './admission.js';
+import { measureHostCpuReadOnly } from './cpu.js';
+import { preemptibleCores } from './preemptible.js';
+import { starvedStaleMs } from './external-cpu.js';
 import { sanitizeObservedCpu, sanitizeRssPeak, sanitizeCpuSeconds } from './observed.js';
 
 // BRAIN-320 S1b (1b): the absolute path to `bin/lane.js`, so a protocol-2
@@ -705,23 +708,48 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
 }
 
 /**
- * BRAIN-405: this host's real free CPU and memory. CPU is the budget minus the larger of the cores its leases reserve and its
- * 1-minute load average (which also sees load the broker did not admit); read-only, so it never disturbs admission's CPU
- * baseline. Memory is what the OS reports available minus the broker's reserve. Null when the budgets are not enforced
- * (shadow mode) or the measurement is missing: the client then treats the runner as having room, as it does for capacity.
+ * BRAIN-405: this host's real free CPU and memory. CPU is `cpuHeadroom` (admission's own projection, see probeCpuHeadroom) when
+ * it could be measured, else the budget minus the larger of the cores its leases reserve and its 1-minute load average
+ * (which counts niced sims in full, so it is only the fallback). Memory is what the OS reports available minus the broker's
+ * reserve. Null when the budgets are not enforced (shadow mode) or the measurement is missing: the client then treats the
+ * runner as having room, as it does for capacity.
  */
-export function probeHeadroom(resources, cfg, enforced, loadAvg1 = os.loadavg()[0]) {
+export function probeHeadroom(resources, cfg, enforced, loadAvg1 = os.loadavg()[0], cpuHeadroom = null) {
   if (!enforced || !resources) return null;
-  const busy = Math.max(Number.isFinite(resources.reservedCpuCores) ? resources.reservedCpuCores : 0, Number.isFinite(loadAvg1) ? loadAvg1 : 0);
+  const measured = cpuHeadroom && Number.isFinite(cpuHeadroom.cpuCores);
+  const reserved = Number.isFinite(resources.reservedCpuCores) ? resources.reservedCpuCores : 0;
+  const cpuCores = measured ? Math.max(0, cpuHeadroom.cpuCores) : Math.max(0, resources.cpuBudgetCores - Math.max(reserved, Number.isFinite(loadAvg1) ? loadAvg1 : 0));
   return {
-    cpuCores: Math.max(0, resources.cpuBudgetCores - busy),
+    cpuCores,
+    // BRAIN-506: the nice the discount assumed, and the same projection with no discount, so a client whose ticket runs at a higher nice
+    // than laneNice (which admission would discount less) can judge room without the discount. Absent when CPU was not measured.
+    ...(measured ? { laneNice: cfg.laneNice, cpuCoresUndiscounted: Math.max(0, cpuHeadroom.cpuCoresUndiscounted) } : {}),
     memoryBytes: Number.isFinite(resources.availableMemoryBytes) ? Math.max(0, resources.availableMemoryBytes - cfg.memoryReserveBytes) : null,
   };
 }
 
+/**
+ * BRAIN-506: the cores a new ticket would still fit on this runner, by the same predicate its admission applies
+ * (admission.js cpuHeadroomCores): host busy counters, the preemptible discount recomputed at cfg.laneNice (the default a
+ * remote ticket runs at; the stored discount belongs to whichever candidate was sampled last), held leases charged by
+ * leaseDemand. The sample is the supervisor's when fresh (an idle runner has no polling supervisor, so it goes stale) else
+ * `measure`, a read-only window that never writes cpu-sample.json. Null when no host-counter sample exists. Returns the discounted and the undiscounted figure.
+ */
+export async function probeCpuHeadroom(root, cfg, heldLeases, { now = Date.now(), measure = measureHostCpuReadOnly, capacityCores = detectResourceCapacity().cpuCores } = {}) {
+  const stored = readJsonSafe(paths(root).cpuSample)?.lastValid;
+  const storedFresh = Number.isFinite(stored?.at) && now - stored.at <= starvedStaleMs(cfg) && Number.isFinite(stored.hostBusyCores) && stored.cores === capacityCores; // the supervisor's own guard: a sample taken at another capacity is not reused
+  const base = storedFresh ? stored : await measure();
+  if (!base || !Number.isFinite(base.hostBusyCores)) return null;
+  const discountable = base.procWindow && cfg.preemptibleNiceMin > 0;
+  // a partial process table can only shrink the discount; the busy baseline is always the host counters
+  const preemptible = discountable ? Math.min(preemptibleCores({ ...base.procWindow, laneNice: cfg.laneNice, niceMin: cfg.preemptibleNiceMin, heldLeases }), base.hostBusyCores) : 0;
+  const headroomAt = (preemptibleBusyCores) => cpuHeadroomCores({ hostBusyCores: base.hostBusyCores, preemptibleBusyCores, cores: base.cores }, heldLeases, cfg, now);
+  return { cpuCores: headroomAt(preemptible), cpuCoresUndiscounted: headroomAt(0) };
+}
+
 /** `lane remote-probe`: one JSON line describing this host's local broker,
  *  reusing status.js's own reader rather than a second implementation. */
-export async function remoteProbeCommand({ root = defaultRemoteRoot() } = {}) {
+export async function remoteProbeCommand({ root = defaultRemoteRoot(), measure } = {}) {
   pruneStaleArtifacts(path.join(path.resolve(root), 'tickets'));
   const status = await collectStatus();
   const pkgPath = fileURLToPath(new URL('../package.json', import.meta.url));
@@ -740,6 +768,9 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot() } = {}) {
   // in shadow mode they are reported as null so the client never skips on them.
   const enforced = globalCfg.schedulerMode === 'active';
   const draining = drainBlocksIntake(status.draining);
+  // BRAIN-506: measured after the lock wait inside collectStatus (which the probe always paid), plus one ~250 ms window only when the stored sample is stale
+  const brokerRoot = ensureStateDirs().root;
+  const cpuHeadroom = enforced ? await probeCpuHeadroom(brokerRoot, globalCfg, listLeases(brokerRoot).filter((l) => HELD_STATES.has(l.state)), measure ? { measure } : {}) : null;
   const payload = {
     protocol: 1,
     protocols: [1, 2],
@@ -756,7 +787,7 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot() } = {}) {
     // BRAIN-360: additive; the CPU the runner's leases are charged (grants, not declarations)
     reservedCpuCores: status.resources?.reservedCpuCores,
     // BRAIN-405: what a new ticket could be given RIGHT NOW (unlike `capacity`, which is static); null where unmeasurable
-    headroom: probeHeadroom(status.resources, globalCfg, enforced),
+    headroom: probeHeadroom(status.resources, globalCfg, enforced, undefined, enforced ? cpuHeadroom : null),
     capacity: {
       weight: effectiveWeightCapacity(globalCfg, host.cpuCores),
       cpuCores: enforced ? cpuBudgetCores(host, globalCfg) : null,

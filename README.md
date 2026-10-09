@@ -423,9 +423,17 @@ What a remote run does:
    lane needs (below), are not paused, have no queue, could ever fit the
    lane's reservation (weight, CPU budget, memory plus its reserve, from the
    runner's static capacity) **and have real room right now**: the probe's
-   `headroom` (its CPU budget minus the larger of the cores its leases reserve
-   and its 1-minute load average, so load the broker did not admit counts;
-   available memory minus the memory reserve) covers the ticket's CPU (its
+   `headroom` (BRAIN-506: the room this runner's own admission would see for
+   a ticket at the default `laneNice`, `budget − projectBusy` over its held
+   leases with the same `leaseDemand` charges and preemptible discount, via
+   admission's `cpuHeadroomCores`; from the supervisor's stored sample when it
+   is fresh, else from a read-only host measurement taken by the probe; the
+   larger of reserved and the 1-minute load average only when no sample can be
+   taken; available memory minus the memory reserve; the probe also reports
+   `headroom.laneNice`, the nice that discount assumed, and
+   `headroom.cpuCoresUndiscounted`, and a submitter whose lane sets its own
+   `nice` above that uses the undiscounted figure, since the runner runs it at
+   the lane's nice rather than its own `laneNice`) covers the ticket's CPU (its
    elastic floor on a runner that admits below the declared claim) and memory.
    A figure the probe does not report never counts against a runner. A runner
    with an empty queue and no headroom is not chosen. Among the rest the
