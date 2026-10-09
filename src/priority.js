@@ -67,20 +67,44 @@ function creditedWaitMs(ticket, nowEff) {
   return ticket?.aging === false || ticket?.exclusive === true ? 0 : waitedMs(ticket, nowEff);
 }
 
+/** BRAIN-504: how far below a fresh high's score an aged non-high is held, as a fraction of `W_tier`. */
+const AGED_CEILING_EPSILON = 0.01;
+/** BRAIN-504: a non-high that has waited this many `priorityAgeMaxMs` periods may tie a fresh high again. */
+const STARVATION_HORIZON_FACTOR = 3;
+
+/** Credited wait at which a non-high ticket's score ceiling rises to a high's (default 3 x 20 min = 60 min). */
+export function starvationHorizonMs(cfg) {
+  return STARVATION_HORIZON_FACTOR * cfg.priorityAgeMaxMs;
+}
+
 /**
- * Slurm-style multifactor score: `min(W_tier, W_tier * tierFactor + W_age * ageFactor)`.
- * The ceiling means aging can tie a fresh high but never pass it; at a tie, seq decides.
+ * Slurm-style multifactor score: `min(ceiling, W_tier * tierFactor + W_age * ageFactor)`.
+ * The ceiling is `W_tier` for an admitted high and for a non-high whose credited wait has reached
+ * `starvationHorizonMs` (then it ties a fresh high and seq decides, so nothing starves past that bound).
+ * Any other non-high is held at `W_tier * (1 - AGED_CEILING_EPSILON)`, strictly below a fresh high.
+ * Exclusive and `aging: false` tickets credit no wait, so they never reach the horizon.
+ * This is a guarantee about SCORE ordering only: reservation promotion (`promoteReservationOwner`),
+ * backfill (smallest fitting claim), unreadable-record barriers and `simRank` (which sorts before seq
+ * when `simsAfterTests`) are applied outside the score and can still start a non-high before a high.
  */
 export function score(ticket, nowEff, cfg) {
   const { tier, age } = cfg.priorityWeights;
   const tierFactor = TIER_BASE[priorityOf(ticket)] / MAX_BASE;
-  const ageFactor = Math.min(1, creditedWaitMs(ticket, nowEff) / cfg.priorityAgeMaxMs);
-  return Math.min(tier, tier * tierFactor + age * ageFactor);
+  const creditedMs = creditedWaitMs(ticket, nowEff);
+  const ageFactor = Math.min(1, creditedMs / cfg.priorityAgeMaxMs);
+  const reachesTop = priorityOf(ticket) === 'high' || creditedMs >= starvationHorizonMs(cfg);
+  const ceiling = reachesTop ? tier : tier * (1 - AGED_CEILING_EPSILON);
+  return Math.min(ceiling, tier * tierFactor + age * ageFactor);
 }
 
-/** Display-only rank (0 low, 1 medium, 2 high): one tier gained per `priorityAgingMs` waited, capped at high. */
+/**
+ * Display-only rank (0 low, 1 medium, 2 high), the band of the ticket's `score`: 2 at the full-tier
+ * ceiling (a high, or a non-high past the starvation horizon), 1 from half of `W_tier`, otherwise 0.
+ */
 export function effectiveRank(ticket, nowEff, cfg) {
-  return Math.min(MAX_BASE, TIER_BASE[priorityOf(ticket)] + Math.floor(creditedWaitMs(ticket, nowEff) / cfg.priorityAgingMs));
+  const s = score(ticket, nowEff, cfg);
+  const { tier } = cfg.priorityWeights;
+  return s >= tier ? 2 : s >= tier / 2 ? 1 : 0;
 }
 
 export function tierName(rank) {

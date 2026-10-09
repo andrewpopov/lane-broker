@@ -69,12 +69,12 @@ for (const tier of ['medium', 'high']) {
   });
 }
 
-test('control: an aged low ticket on an ordinary aging lane still ages past a fresh medium and ties a fresh high', async () => {
+test('control: an aged low ticket on an ordinary aging lane still ages past a fresh medium, and ties a fresh high once it has waited the 60-minute starvation horizon', async () => {
   await withClock(async () => {
     const medium = await agedLowVersus('medium', {});
     assert.equal((await tryStart(medium.state, medium.aged, cfg())).started, true, 'aged low beats a fresh medium');
     const high = await agedLowVersus('high', { aging: true });
-    assert.equal((await tryStart(high.state, high.aged, cfg())).started, true, 'at the ceiling tie the older seq wins');
+    assert.equal((await tryStart(high.state, high.aged, cfg())).started, true, 'at the horizon tie the older seq wins');
   });
 });
 
@@ -82,7 +82,7 @@ test('score and effective rank credit no age to an aging:false ticket', () => {
   const aged = { priorityAdmitted: 'low', prioOriginAt: T0 - 60 * MIN };
   assert.equal(score({ ...aged, aging: false }, T0, cfg()), 0);
   assert.equal(effectiveRank({ ...aged, aging: false }, T0, cfg()), 0);
-  assert.equal(score(aged, T0, cfg()), 2, 'an aging lane (field absent) is at the ceiling');
+  assert.equal(score(aged, T0, cfg()), 2, 'an aging lane (field absent) is at the ceiling once past the starvation horizon');
   assert.equal(effectiveRank(aged, T0, cfg()), 2);
 });
 

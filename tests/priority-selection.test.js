@@ -157,14 +157,23 @@ test('a high ticket queued behind medium and low tickets starts first when capac
   });
 });
 
-test('a low ticket aged 20 minutes starts before a fresh high with a higher seq', async () => {
+test('a low ticket aged 20 minutes waits behind a fresh high with a higher seq (BRAIN-504); at the 60-minute horizon it starts first', async () => {
   await withClock(async () => {
     const { state, cfg } = fenced();
     const aged = ticket('aged-low', { priorityRequested: 'low', prioOriginAt: T0 - 20 * MIN });
     const high = ticket('fresh-high', { priorityRequested: 'high' });
     await enqueue(state, aged);
     await enqueue(state, high);
-    assert.equal((await poll(state, high, cfg)).reason, 'not-head', 'a tie at the ceiling goes to the lower seq');
+    assert.equal((await poll(state, aged, cfg)).reason, 'not-head', 'an aged low is held below a fresh high');
+    assert.equal((await poll(state, high, cfg)).started, true);
+  });
+  await withClock(async () => {
+    const { state, cfg } = fenced();
+    const aged = ticket('aged-low', { priorityRequested: 'low', prioOriginAt: T0 - 60 * MIN });
+    const high = ticket('fresh-high', { priorityRequested: 'high' });
+    await enqueue(state, aged);
+    await enqueue(state, high);
+    assert.equal((await poll(state, high, cfg)).reason, 'not-head', 'at the horizon the tie goes to the lower seq');
     assert.equal((await poll(state, aged, cfg)).started, true);
   });
 });
