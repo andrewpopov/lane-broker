@@ -138,11 +138,12 @@ export async function createAttempt(root, id, { runner = null, resources, logPat
   // queued, leased, finished or mid-attempt is the same ticket, and nothing is written (so nothing is dispatched).
   let existing = null;
   await withLock(root, () => {
-    assertNotMigrating(root);
+    // dedup first: an id some ticket already owns is deduped even during a migration (see `enqueue`)
     if (refuseIf) {
       existing = refuseIf();
       if (existing) return;
     }
+    assertNotMigrating(root);
     atomicWriteJson(attemptFile(root, id), attempt);
   });
   return existing ? { existing } : attempt;

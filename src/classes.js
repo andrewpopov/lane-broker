@@ -92,6 +92,17 @@ export function smallestSimGrant(ticket, cfg, host) {
   return { cores: Number.isFinite(min) ? Math.min(declared.cpuCores, Math.ceil(min)) : declared.cpuCores, memoryBytes: declared.memoryBytes };
 }
 
+/** Why this runner's own resolution of a lane is LAXER than what the submitter sent, or null. Stricter on the runner is fine. */
+export function classTransportMismatch(expected, resolved) {
+  if (expected.classEnforcement === 'required' && resolved.classEnforcement !== 'required') {
+    return `lane "${resolved.lane}" requires class enforcement on the submitter but this runner's .lane-broker.json does not; refusing to run it unenforced`;
+  }
+  if (expected.laneClass === 'sim' && resolved.class !== 'sim') {
+    return `lane "${resolved.lane}" is a sim lane on the submitter but this runner resolves it as "${resolved.class}"; refusing to run it outside the sim caps`;
+  }
+  return null;
+}
+
 /** A lane that declares `classEnforcement: "required"` is only granted under live caps. */
 export const isEnforcementRequired = (ticket) => ticket?.classEnforcement === 'required';
 

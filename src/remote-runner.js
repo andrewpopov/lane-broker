@@ -185,6 +185,9 @@ function validateHeaderFields(header) {
   if (header.remoteArtifactsOn !== undefined && !REMOTE_ARTIFACTS_ON.includes(header.remoteArtifactsOn)) {
     return { ok: false, reason: 'invalid remoteArtifactsOn' };
   }
+  // BRAIN-321: additive; an older submitter sends neither, an older runner ignores both
+  if (header.laneClass !== undefined && header.laneClass !== 'sim') return { ok: false, reason: 'invalid laneClass' };
+  if (header.classEnforcement !== undefined && header.classEnforcement !== 'required') return { ok: false, reason: 'invalid classEnforcement' };
   return { ok: true };
 }
 
@@ -557,6 +560,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     // BRAIN-380 §6: priority comes ONLY from the validated header, never this shell's LANE_BROKER_PRIORITY. The tier is
     // what the submitter asked for; this runner's own enqueue applies its own cap. The accrued wait is anchored on this
     // runner's own priority clock in runCommand, so the submitter's timestamps are never read.
+    expectClass: { laneClass: header.laneClass, classEnforcement: header.classEnforcement },
     priority: remotePriority.priority,
     priorityAccruedMs: remotePriority.accruedMs,
     weightOverride: header.weight,

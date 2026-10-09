@@ -152,12 +152,13 @@ export function existingTicket(root, id, { ownerGeneration = null } = {}) {
 export async function enqueue(root, ticket, cfg = DEFAULT_GLOBAL_CONFIG, { ownerGeneration = null } = {}) {
   const { maxQueuedHighPerRepo } = cfg;
   return withLock(root, () => {
-    assertNotMigrating(root);
-    assertQueueLayout(root);
-    // BRAIN-321: a client-supplied id is idempotent. One that is already queued, rebinding, leased or finished is the SAME
-    // ticket: return it, and allocate no sequence (a retried submission must not take a second place in the queue).
+    // BRAIN-321: a client-supplied id is idempotent. One that is already queued, rebinding, leased, finished or owned by an
+    // attempt is the SAME ticket: return it, and allocate no sequence. This runs BEFORE the migration refusal, so a duplicate
+    // is deduped (never refused as if it were a new ticket that could publish a result over the original's).
     const existing = existingTicket(root, ticket.id, { ownerGeneration });
     if (existing) return existing;
+    assertNotMigrating(root);
+    assertQueueLayout(root);
     const nowEff = advanceHwm(root);
     const priorityRequested = isPriorityTier(ticket.priorityRequested) ? ticket.priorityRequested : DEFAULT_PRIORITY;
     // BRAIN-380 §7: the high cap, per broker. It shares this lock with the seq allocation and the queue write below,

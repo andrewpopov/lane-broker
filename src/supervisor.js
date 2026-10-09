@@ -832,6 +832,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       // BRAIN-380 §6: the tier BEFORE any cap, and the wait this ticket has accrued on THIS host's priority clock. The
       // runner re-anchors from the wait, never from our timestamps, so clock skew between hosts cannot matter.
       priorityRequested: enriched.priorityRequested,
+      laneClass: enriched.class,
+      classEnforcement: enriched.classEnforcement,
       priorityAccruedMs: waitedMs(enriched, effectiveNow(root)),
       resultWaitMs: globalCfg.remoteResultWaitMs,
       // BRAIN-437: a runner that can withdraw lets a dropped connection prove the job never started; one that cannot leaves it possibly running

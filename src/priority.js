@@ -89,11 +89,11 @@ export function tierName(rank) {
 
 /**
  * BRAIN-321: with class caps in force, at an equal score a test goes before a sim, whichever was enqueued first. A sim that
- * has waited its full `priorityAgeMaxMs` is exempt, so it is ordered by seq like anything else: only tests enqueued
+ * has waited its full `priorityAgeMaxMs` (elapsed queue wait, so an exclusive or `aging: false` sim, whose score never ages, counts too) is exempt, so it is ordered by seq like anything else: only tests enqueued
  * BEFORE it can stay ahead, so a cap-eligible sim cannot be overtaken forever by newer tests of the same score.
  */
 const simRank = (ticket, nowEff, cfg, simsAfterTests) =>
-  simsAfterTests && ticket.class === 'sim' && creditedWaitMs(ticket, nowEff) < cfg.priorityAgeMaxMs ? 1 : 0;
+  simsAfterTests && ticket.class === 'sim' && waitedMs(ticket, nowEff) < cfg.priorityAgeMaxMs ? 1 : 0;
 
 /**
  * The order every selector walks: (score desc, test before a not-fully-aged sim when `simsAfterTests`, seq asc) within each maximal run of readable

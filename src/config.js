@@ -666,11 +666,12 @@ export function loadGlobalConfig() {
     text = fs.readFileSync(file, 'utf8');
   } catch (err) {
     // BRAIN-321: only a genuinely ABSENT file is "no config". An inaccessible one (EACCES, a parent dir we cannot enter, ...) leaves the
-    // class policy unknown, and a file that disappeared after a `classes` block was in force keeps the fence; either way sims are denied.
+    // class policy unknown (`ConfigError`), and a file that disappeared after a `classes` block was in force keeps the fence; either way sims are denied.
     if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
       return classesFenceHeld() ? { ...DEFAULT_GLOBAL_CONFIG, classesInvalid: `${file} is gone but a classes block was in force; restore it (or remove ${paths(stateHome()).classesConfigured})` } : { ...DEFAULT_GLOBAL_CONFIG };
     }
-    return { ...DEFAULT_GLOBAL_CONFIG, classesInvalid: `${file}: unreadable (${err.code ?? err.message})` };
+    // thrown, so `reloadGlobalConfig` keeps the PREVIOUS config's other settings (capacity, reserves, runners) and marks only the class policy invalid
+    throw new ConfigError(`${file}: unreadable (${err.code ?? err.message})`);
   }
   let parsed;
   try {

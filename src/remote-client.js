@@ -757,6 +757,9 @@ export async function dispatchRemote(opts) {
     // clock. Additive header fields: an older runner ignores them, so its ticket is simply medium.
     priorityRequested,
     priorityAccruedMs,
+    // BRAIN-321: the class the submitter resolved; only a sim / a required lane ever sends them (absent = byte-identical header)
+    laneClass,
+    classEnforcement,
     // BRAIN-339: from the CLIENT's global config (`remoteResultWaitMs`); how long to keep
     // polling a runner that reports the job still queued/running after ssh dropped.
     resultWaitMs = DEFAULT_RESULT_WAIT_MS,
@@ -830,6 +833,8 @@ export async function dispatchRemote(opts) {
   if (Number.isFinite(minCpuCores)) header.minCpuCores = minCpuCores;
   if (Number.isInteger(queueTimeoutMs) && queueTimeoutMs > 0) header.queueTimeoutMs = queueTimeoutMs;
   if (Number.isInteger(noProgressTimeoutMs) && noProgressTimeoutMs >= 0) header.noProgressTimeoutMs = noProgressTimeoutMs;
+  if (laneClass === 'sim') header.laneClass = 'sim';
+  if (classEnforcement === 'required') header.classEnforcement = 'required';
   if (isPriorityTier(priorityRequested)) header.priorityRequested = priorityRequested;
   if (Number.isInteger(priorityAccruedMs) && priorityAccruedMs >= 0) header.priorityAccruedMs = priorityAccruedMs;
 

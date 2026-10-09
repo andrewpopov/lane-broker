@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { ensureStateDirs, paths, readJsonSafe, LockTimeoutError, MigrationInProgressError, assertNotMigrating, isUuid } from './state.js';
+import { classTransportMismatch } from './classes.js';
 import { resolveTicketConfig, reloadGlobalConfig, resolvePriority, assertHostConfigHookless, ConfigError } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
@@ -219,6 +220,9 @@ export async function runCommand({
   // BRAIN-380 §6: wait a submitter already accrued (`lane remote-exec` only; validated there). The origin is anchored
   // on THIS host's priority clock, minus that wait, so the other host's wall clock never enters.
   priorityAccruedMs = 0,
+  // BRAIN-321: what a remote SUBMITTER resolved (`{laneClass, classEnforcement}`, `lane remote-exec` only). This runner re-resolves the
+  // lane from its own snapshot and refuses when that is laxer, so a changed or gitignored `.lane-broker.json` never runs unenforced.
+  expectClass,
   cwd = process.cwd(),
   cmd,
   log,
@@ -259,6 +263,11 @@ export async function runCommand({
       return { exitCode: 64 };
     }
     throw err;
+  }
+  const classMismatch = expectClass && classTransportMismatch(expectClass, resolved);
+  if (classMismatch) {
+    process.stderr.write(`lane run: ${classMismatch}\n`);
+    return { exitCode: 64 };
   }
   // BRAIN-403: exclusive lanes are local only. A runner (configRoot is set only by `lane remote-exec`) never honours an
   // exclusive from a snapshot's lane config or a flag, so an incoming snapshot can never hold the runner.

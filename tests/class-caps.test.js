@@ -5,7 +5,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, BIN } from './helpers.js';
-import { enqueue, tryStart } from '../src/scheduler.js';
+import { enqueue, tryStart, existingTicket } from '../src/scheduler.js';
+import { runCommand } from '../src/run.js';
 import { DEFAULT_GLOBAL_CONFIG, resolveTicketConfig, ConfigError, loadGlobalConfig, reloadGlobalConfig, validateClasses, ClassesConfigError } from '../src/config.js';
 import { writeLease, readLease, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths, atomicWriteJson } from '../src/state.js';
@@ -16,7 +17,7 @@ import { childEnv, remoteSelectOptions } from '../src/supervisor.js';
 import { createAttempt, fallbackToLocal, readAttempt } from '../src/attempts.js';
 import { selectRunner } from '../src/remote-client.js';
 import { makeFakeSshBin, makeRunner, clientEnv } from './remote-harness.js';
-import { CLASS_ENFORCEMENT_ENV, resolveClasses } from '../src/classes.js';
+import { CLASS_ENFORCEMENT_ENV, resolveClasses, classTransportMismatch } from '../src/classes.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
 import { loadModules, scenarios, runScript, liveTrace } from './allocation-scenarios.js';
 
@@ -324,12 +325,34 @@ test('P2: only an ABSENT global config means no classes; unreadable or vanished-
     assert.equal(fs.existsSync(paths(state).classesConfigured), false, 'a valid file without classes clears the fence');
     fs.rmSync(file);
     assert.equal(resolveClasses(loadGlobalConfig(), state).valid, true, 'absent again, nothing was in force');
-    fs.writeFileSync(file, JSON.stringify({ version: 1 }));
+  } finally {
+    process.env.LANE_BROKER_HOME = prev.home;
+    process.env.LANE_BROKER_STATE = prev.state;
+  }
+});
+
+test('P2: an unreadable global config keeps the previous settings and marks only the class policy invalid (sims denied)', async () => {
+  const { home, state } = freshEnv();
+  const prev = { home: process.env.LANE_BROKER_HOME, state: process.env.LANE_BROKER_STATE };
+  Object.assign(process.env, { LANE_BROKER_HOME: home, LANE_BROKER_STATE: state });
+  const file = path.join(home, 'config.json');
+  try {
+    fs.writeFileSync(file, JSON.stringify({ version: 1, capacity: 7, classes: classes('active') }));
+    const loaded = reloadGlobalConfig(undefined);
+    assert.equal(loaded.capacity, 7);
     fs.chmodSync(home, 0o000);
     try {
-      const blocked = resolveClasses(loadGlobalConfig(), state);
-      assert.equal(blocked.valid, false, 'an inaccessible parent is not an absent file');
-      assert.match(blocked.error, /unreadable/);
+      assert.throws(() => loadGlobalConfig(), ConfigError, 'a non-ENOENT read error is not "no config"');
+      const kept = reloadGlobalConfig(loaded);
+      assert.equal(kept.capacity, 7, 'the previous non-class settings survive');
+      const r = resolveClasses(kept, state);
+      assert.equal(r.valid, false);
+      assert.match(r.error, /unreadable/);
+      const first = reloadGlobalConfig(undefined);
+      assert.equal(resolveClasses(first, state).valid, false, 'a first load that cannot read the file: defaults plus invalid classes');
+      assert.equal(first.capacity, DEFAULT_GLOBAL_CONFIG.capacity);
+      const cfg = { ...kept, schedulerMode: 'active', capacity: 64, cpuAdmissionPercent: 100, cpuReserveCores: HOST_CORES - POOL, admissionCooldownMs: 0, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1 };
+      assert.equal((await admit(state, simTicket('s', 1), cfg)).reason, 'class-config-invalid');
     } finally {
       fs.chmodSync(home, 0o755);
     }
@@ -338,6 +361,52 @@ test('P2: only an ABSENT global config means no classes; unreadable or vanished-
     process.env.LANE_BROKER_HOME = prev.home;
     process.env.LANE_BROKER_STATE = prev.state;
   }
+});
+
+test('P1: a duplicate of an existing id is deduped even while a migration is draining, never refused as a new ticket', async () => {
+  const { state } = freshEnv();
+  const id = '22222222-2222-4222-8222-222222222222';
+  const original = await enqueue(state, testTicket(id));
+  await createAttempt(state, 'att-owned', { runner: null });
+  fs.writeFileSync(paths(state).migrating, 'drain');
+  const dup = await enqueue(state, testTicket(id));
+  assert.equal(dup.existing, true, 'deduped, not MigrationInProgressError');
+  assert.equal(dup.seq, original.seq);
+  const dupAttempt = await createAttempt(state, 'att-owned', { runner: null, refuseIf: () => existingTicket(state, 'att-owned') });
+  assert.equal(dupAttempt.existing.state, 'attempt');
+  await assert.rejects(() => enqueue(state, testTicket('brand-new')), /migrat/i, 'a genuinely new id is still refused');
+});
+
+test('P1: a runner refuses a dispatch whose class/enforcement is stricter than its own resolution of the lane', async () => {
+  const { base, home, state } = freshEnv();
+  const repoDir = path.join(base, 'repo');
+  writeGlobalConfig(home, { version: 1 });
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 }, sim: { weight: 1, class: 'sim', classEnforcement: 'required' } } });
+  const prev = { home: process.env.LANE_BROKER_HOME, state: process.env.LANE_BROKER_STATE };
+  Object.assign(process.env, { LANE_BROKER_HOME: home, LANE_BROKER_STATE: state });
+  const marker = path.join(base, 'ran');
+  const run = (lane, expectClass) => runCommand({ repo: 'r', lane, cmd: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, 'x')`], cwd: repoDir, configRoot: repoDir, repoIdentityOverride: 'r', allowLocalSim: true, expectClass });
+  try {
+    const enforced = await run('default', { laneClass: 'sim', classEnforcement: 'required' });
+    assert.equal(enforced.exitCode, 64);
+    assert.equal(fs.existsSync(marker), false, 'never ran unenforced');
+    assert.equal(classTransportMismatch({ classEnforcement: 'required' }, { lane: 'x', class: 'sim', classEnforcement: 'required' }), null);
+    assert.equal(classTransportMismatch({ laneClass: 'sim' }, { lane: 'x', class: 'test' }) !== null, true);
+    assert.equal(classTransportMismatch({}, { lane: 'x', class: 'sim', classEnforcement: 'required' }), null, 'a stricter runner is fine');
+  } finally {
+    process.env.LANE_BROKER_HOME = prev.home;
+    process.env.LANE_BROKER_STATE = prev.state;
+  }
+});
+
+test('P2: an old exclusive (or aging:false) sim, whose score never ages, is still not overtaken forever', () => {
+  const now = 1_700_000_000_000;
+  const cfg = DEFAULT_GLOBAL_CONFIG;
+  const mk = (id, seq, origin, extra) => ({ id, seq, priorityAdmitted: 'high', priorityRequested: 'high', prioOriginAt: origin, ...extra });
+  const young = orderQueue([mk('xsim', 1, now, { class: 'sim', exclusive: true }), mk('newer-test', 2, now)], now, cfg, true);
+  assert.deepEqual(young.map((t) => t.id), ['newer-test', 'xsim']);
+  const old = orderQueue([mk('xsim', 1, now - cfg.priorityAgeMaxMs, { class: 'sim', exclusive: true }), mk('newer-test', 2, now)], now, cfg, true);
+  assert.deepEqual(old.map((t) => t.id), ['xsim', 'newer-test']);
 });
 
 test('P2: lane status reports the same reservation owner and head as admission, with the cap-denied sim listed last', async () => {
