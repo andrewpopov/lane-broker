@@ -1088,12 +1088,14 @@ test('workspace key: the paths, lock entries and package.json dependency fields 
 
   fs.writeFileSync(path.join(f.root, 'packages', 'api', 'index.js'), 'module.exports = "edited source";');
   assert.equal(computeDepsKey(f.inputs()).key, base.key, 'editing workspace source does not change the key');
-  fs.writeFileSync(path.join(f.root, 'packages', 'api', 'package.json'), JSON.stringify({ name: '@x/api', version: '9.9.9', description: 'unrelated field', dependencies: { dotenv: '^16.0.0' } }));
-  assert.equal(computeDepsKey(f.inputs()).key, base.key, 'fields that do not shape an install do not change the key');
+  fs.writeFileSync(path.join(f.root, 'packages', 'api', 'package.json'), JSON.stringify({ name: '@x/api', version: '1.0.0', engines: { node: '>=99' }, dependencies: { dotenv: '^16.0.0' } }));
+  assert.notEqual(computeDepsKey(f.inputs()).key, base.key, 'any package.json field (engines here) is in the key');
+  fs.writeFileSync(path.join(f.root, 'packages', 'api', 'package.json'), JSON.stringify({ dependencies: { dotenv: '^16.0.0' }, version: '1.0.0', name: '@x/api' }));
+  assert.equal(computeDepsKey(f.inputs()).key, base.key, 'key order inside package.json does not matter');
 
-  fs.writeFileSync(path.join(f.root, 'packages', 'api', 'package.json'), JSON.stringify({ name: '@x/api', dependencies: { dotenv: '^17.0.0' } }));
+  fs.writeFileSync(path.join(f.root, 'packages', 'api', 'package.json'), JSON.stringify({ name: '@x/api', version: '1.0.0', dependencies: { dotenv: '^17.0.0' } }));
   assert.notEqual(computeDepsKey(f.inputs()).key, base.key, 'a changed workspace package.json dependency changes the key');
-  fs.writeFileSync(path.join(f.root, 'packages', 'api', 'package.json'), JSON.stringify({ name: '@x/api', dependencies: { dotenv: '^16.0.0' } }));
+  fs.writeFileSync(path.join(f.root, 'packages', 'api', 'package.json'), JSON.stringify({ name: '@x/api', version: '1.0.0', dependencies: { dotenv: '^16.0.0' } }));
   assert.equal(computeDepsKey(f.inputs()).key, base.key);
 
   const lockFile = path.join(f.root, 'package-lock.json');
@@ -1203,34 +1205,30 @@ const writeWorkspaceFile = (f, rel, content) => {
   fs.writeFileSync(path.join(f.root, rel), content);
 };
 
-test('workspace lifecycle: a workspace script or binding.gyp makes the dir ineligible unless the lane declares scripts safe, and then its script files are in the key', () => {
+test('workspace lifecycle: a workspace lifecycle script, binding.gyp or lock install script makes the dir ineligible, even when the lane declares scripts safe', () => {
   const f = makeWorkspaceKeyFixture();
   const manifest = (extra) => writeWorkspaceFile(f, 'packages/api/package.json', JSON.stringify({ name: '@x/api', dependencies: { dotenv: '^16.0.0' }, ...extra }));
-  manifest({ scripts: { prepare: 'node prepare.cjs' } });
-  writeWorkspaceFile(f, 'packages/api/prepare.cjs', 'console.log("one")');
-  for (const [label, scripts] of [['prepare', { prepare: 'node prepare.cjs' }], ['postinstall', { postinstall: 'node prepare.cjs' }], ['prepublish', { prepublish: 'node prepare.cjs' }]]) {
-    manifest({ scripts });
-    const refused = computeDepsKey(f.inputs());
-    assert.equal(refused.key, null, label);
-    assert.match(refused.reason, /workspace packages\/api has lifecycle inputs/, label);
+  for (const name of ['prepare', 'postinstall', 'prepublish', 'preinstall', 'install']) {
+    manifest({ scripts: { [name]: 'node prepare.cjs' } });
+    for (const rootScriptsSafe of [false, true]) {
+      const refused = computeDepsKey({ ...f.inputs(), rootScriptsSafe });
+      assert.equal(refused.key, null, `${name} safe=${rootScriptsSafe}`);
+      assert.match(refused.reason, /workspace packages\/api has lifecycle inputs/, name);
+    }
   }
   manifest({ scripts: { test: 'node --test' } });
   assert.ok(computeDepsKey(f.inputs()).key, 'a non-lifecycle script does not matter');
 
-  manifest({ scripts: { prepare: 'node prepare.cjs' } });
-  const safe = () => computeDepsKey({ ...f.inputs(), rootScriptsSafe: true });
-  const base = safe().key;
-  assert.ok(base);
-  writeWorkspaceFile(f, 'packages/api/prepare.cjs', 'console.log("two")');
-  assert.notEqual(safe().key, base, 'changing the file a workspace prepare script runs is a different key');
-  writeWorkspaceFile(f, 'packages/api/prepare.cjs', 'console.log("one")');
-  assert.equal(safe().key, base);
-  manifest({ scripts: { prepare: 'node other.cjs' } });
-  assert.notEqual(safe().key, base, 'the scripts themselves are in the key');
-
   manifest({});
   writeWorkspaceFile(f, 'packages/api/binding.gyp', '{}');
-  assert.match(computeDepsKey(f.inputs()).reason, /binding.gyp/);
+  assert.match(computeDepsKey({ ...f.inputs(), rootScriptsSafe: true }).reason, /binding.gyp/);
+  fs.rmSync(path.join(f.root, 'packages/api/binding.gyp'));
+
+  const lockFile = path.join(f.root, 'package-lock.json');
+  const lock = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+  lock.packages['packages/api'].hasInstallScript = true;
+  fs.writeFileSync(lockFile, JSON.stringify(lock));
+  assert.match(computeDepsKey({ ...f.inputs(), rootScriptsSafe: true }).reason, /hasInstallScript/);
 });
 
 test('workspace discovery: the workspaces package.json selects now must equal the lock links, with unique names', () => {
@@ -1252,7 +1250,9 @@ test('workspace discovery: the workspaces package.json selects now must equal th
   fs.writeFileSync(path.join(f.root, 'package.json'), JSON.stringify({ name: 'a', workspaces: ['packages/{api,shared}'] }));
   assert.match(computeDepsKey(f.inputs()).reason, /not one this cache understands/);
   fs.writeFileSync(path.join(f.root, 'package.json'), JSON.stringify({ name: 'a', workspaces: ['packages/*', '!packages/shared'] }));
-  assert.match(computeDepsKey(f.inputs()).reason, /differ from the lock's links/, 'a negated pattern removes a workspace the lock still links');
+  assert.match(computeDepsKey(f.inputs()).reason, /not one this cache understands/, 'any negated pattern is refused');
+  fs.writeFileSync(path.join(f.root, 'package.json'), JSON.stringify({ name: 'a', workspaces: { packages: ['packages/*'] } }));
+  assert.match(computeDepsKey(f.inputs()).reason, /not a plain array/, 'the object form is refused');
   fs.writeFileSync(path.join(f.root, 'package.json'), JSON.stringify({ name: 'a' }));
   assert.match(computeDepsKey(f.inputs()).reason, /differ from the lock's links/, 'links with no workspaces declared');
 });
@@ -1323,7 +1323,7 @@ test('workspace inventory: an unexpected nested node_modules, a missing stored t
   assert.throws(() => readWorkspaceTrees(bare, plainKey), /no workspace inventory/);
 });
 
-test('snapshot: directory mtime changes are detected as in 0.28.2, so an atomic same-size same-mtime replacement outside node_modules shows; only exact workspace roots ignore their node_modules', () => {
+test('snapshot: directory mtime changes are detected as in 0.28.2, so an atomic same-size same-mtime replacement outside node_modules shows in the directory; only exact workspace roots ignore their node_modules', () => {
   const dir = tmpDir('deps-cache-outside');
   fs.mkdirSync(path.join(dir, 'src'));
   const file = path.join(dir, 'src', 'a.js');
@@ -1335,7 +1335,7 @@ test('snapshot: directory mtime changes are detected as in 0.28.2, so an atomic 
   fs.writeFileSync(path.join(dir, 'src', 'tmp'), 'bbbb');
   fs.utimesSync(path.join(dir, 'src', 'tmp'), when, when);
   fs.renameSync(path.join(dir, 'src', 'tmp'), file);
-  assert.deepEqual(snapshotChanges(before, snapshotOutsideNodeModules(dir)), ['src'], 'the parent directory changed');
+  assert.deepEqual(snapshotChanges(before, snapshotOutsideNodeModules(dir)), ['src', 'src/a.js'], 'the parent directory changed, and now the replaced file (new inode) too');
 
   fs.mkdirSync(path.join(dir, 'packages', 'api'), { recursive: true });
   const rooted = () => snapshotOutsideNodeModules(dir, ['packages/api']);
@@ -1349,4 +1349,35 @@ test('snapshot: directory mtime changes are detected as in 0.28.2, so an atomic 
   const plainBase = snapshotOutsideNodeModules(dir);
   fs.mkdirSync(path.join(dir, 'packages', 'other', 'node_modules'));
   assert.deepEqual(snapshotChanges(plainBase, snapshotOutsideNodeModules(dir)), ['packages/other'], 'without workspace roots the directory change is reported, exactly as before');
+});
+
+test('workspace discovery with zero lock links: a root workspaces field whose globs find a package is ineligible, one that finds none is fine', () => {
+  const f = makeKeyFixture();
+  fs.writeFileSync(path.join(f.root, 'package.json'), JSON.stringify({ name: 'a', workspaces: ['packages/*'] }));
+  const none = computeDepsKey(f.inputs());
+  assert.ok(none.key, none.reason);
+  writeWorkspaceFile(f, 'packages/new/package.json', JSON.stringify({ name: '@x/new' }));
+  const found = computeDepsKey(f.inputs());
+  assert.equal(found.key, null);
+  assert.match(found.reason, /packages\/new\) differ from the lock's links \(none\)/);
+});
+
+test('snapshot: an atomic replacement that keeps size and mtime changes the file signature (inode), for files and symlinks, with or without workspace roots', () => {
+  const dir = tmpDir('deps-cache-outside');
+  fs.mkdirSync(path.join(dir, 'packages', 'api'), { recursive: true });
+  const when = new Date('2020-01-01T00:00:00Z');
+  for (const rel of ['packages/api/a.js', 'top.js']) {
+    fs.writeFileSync(path.join(dir, rel), 'aaaa');
+    fs.utimesSync(path.join(dir, rel), when, when);
+  }
+  for (const roots of [[], ['packages/api']]) {
+    const before = snapshotOutsideNodeModules(dir, roots);
+    for (const rel of ['packages/api/a.js', 'top.js']) {
+      fs.writeFileSync(`${path.join(dir, rel)}.new`, 'bbbb');
+      fs.utimesSync(`${path.join(dir, rel)}.new`, when, when);
+      fs.renameSync(`${path.join(dir, rel)}.new`, path.join(dir, rel));
+    }
+    const changed = snapshotChanges(before, snapshotOutsideNodeModules(dir, roots));
+    assert.ok(changed.includes('top.js') && changed.includes('packages/api/a.js'), JSON.stringify(roots));
+  }
 });

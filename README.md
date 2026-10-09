@@ -852,11 +852,13 @@ reason.
   `.`/`..`/empty segment, case alias) or whose real path passes through a
   symlink (checked before every read, copy, move and delete). The
   `workspaces` globs of the root `package.json` are re-discovered on every run
-  and must equal the lock's links exactly, with unique package names. A
-  workspace with a lifecycle script or `binding.gyp` is ineligible unless the
-  lane declares `remoteDepsCacheRootScriptsSafe`; then its scripts and the
-  digest of its whole directory join the key. The key also covers the
-  discovered set and each workspace's path, lock entry and dependency fields.
+  and must equal the lock's links exactly (empty included, whenever the root
+  declares `workspaces`), with unique package names. Only plain segments, `*`
+  and `**` are understood: a `!` pattern, any other glob syntax or the object
+  form is refused. A workspace with a lifecycle script, `binding.gyp` or lock
+  install script is always ineligible, even with `remoteDepsCacheRootScriptsSafe`.
+  The key covers the discovered set and each workspace's path, lock entry and
+  whole `package.json` (canonical JSON).
   The store holds only installed packages, never the workspace symlinks or
   sources, and records which workspaces had a nested `node_modules`: a hit
   recreates each `node_modules/<name>` link (relative, as `npm ci` makes it)

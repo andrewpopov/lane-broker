@@ -409,19 +409,24 @@ export function unexplainedChanges(changes, { scripts, configBefore, configAfter
   return changes.filter((c) => !(configExplained && (c === '.git' || c === '.git/config')));
 }
 
-const MANIFEST_DEPENDENCY_FIELDS = ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies', 'peerDependenciesMeta', 'bundleDependencies', 'bundledDependencies', 'bin', 'os', 'cpu', 'libc'];
+/** JSON with every object's keys sorted, so equal manifests hash equal whatever their key order. */
+const canonicalJson = (value) =>
+  JSON.stringify(value, (_, v) => (v && typeof v === 'object' && !Array.isArray(v) ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, v[k]])) : v));
 
 /** Glob segment -> regex, for the only wildcard supported: `*` within a segment. */
 const segmentPattern = (seg) => new RegExp(`^${seg.split('*').map((x) => x.replace(/[.]/g, '\\.')).join('[^/]*')}$`);
 
 /**
  * The directories (relative, sorted, each with a package.json) the root `workspaces` globs select in `dir`, as npm's
- * workspace discovery would. Only plain segments, `*` and `**` are understood; anything else (braces, `?`, classes,
- * a symlinked entry on the way) throws, and the caller treats the dir as ineligible.
+ * workspace discovery would. Only plain segments, `*` and `**` are understood; anything else (negation, braces, `?`, classes,
+ * the object form, a symlinked entry on the way) throws, and the caller treats the dir as ineligible.
  */
 export function discoverWorkspaceDirs(dir, rootPackage) {
-  const declared = rootPackage.workspaces;
-  const patterns = Array.isArray(declared) ? declared : Array.isArray(declared?.packages) ? declared.packages : [];
+  const patterns = rootPackage.workspaces;
+  if (!Array.isArray(patterns)) {
+    if (patterns === undefined) return [];
+    throw new Error('workspaces is not a plain array of patterns');
+  }
   const skip = new Set(['node_modules', '.git']);
   const children = (rel) =>
     fs.readdirSync(path.join(dir, rel), { withFileTypes: true }).filter((e) => !skip.has(e.name)).map((e) => {
@@ -447,52 +452,27 @@ export function discoverWorkspaceDirs(dir, rootPackage) {
     return out;
   };
   const selected = new Set();
-  const excluded = new Set();
   for (const raw of patterns) {
     if (typeof raw !== 'string') throw new Error('workspaces entry is not a string');
-    const negated = raw.startsWith('!');
-    const pattern = (negated ? raw.slice(1) : raw).replace(/^\.\//, '').replace(/\/+$/, '');
+    const pattern = raw.replace(/^\.\//, '').replace(/\/+$/, '');
     if (!/^[A-Za-z0-9_.@\-/*]+$/.test(pattern) || pattern.split('/').some((seg) => seg === '' || seg === '.' || seg === '..' || (seg.includes('**') && seg !== '**'))) {
       throw new Error(`workspaces pattern ${JSON.stringify(raw)} is not one this cache understands`);
     }
-    expand(pattern.split('/'), '', negated ? excluded : selected);
+    expand(pattern.split('/'), '', selected);
   }
-  return [...selected].filter((rel) => rel !== '' && !excluded.has(rel) && fs.existsSync(path.join(dir, rel, 'package.json'))).sort();
-}
-
-/** Every file under `absDir` except `node_modules` trees, as one digest over path, type and bytes (a symlink by its target text). */
-function digestTreeExcludingNodeModules(absDir) {
-  const hash = crypto.createHash('sha256');
-  const walk = (abs, rel) => {
-    for (const ent of fs.readdirSync(abs, { withFileTypes: true }).sort((x, y) => (x.name < y.name ? -1 : 1))) {
-      if (ent.name === 'node_modules') continue;
-      const p = path.join(abs, ent.name);
-      const r = rel ? `${rel}/${ent.name}` : ent.name;
-      if (ent.isDirectory()) {
-        hash.update(`d:${r}\n`);
-        walk(p, r);
-      } else if (ent.isSymbolicLink()) hash.update(`l:${r}:${fs.readlinkSync(p)}\n`);
-      else if (ent.isFile()) {
-        const bytes = fs.readFileSync(p);
-        hash.update(`f:${r}:${bytes.length}:`);
-        hash.update(bytes);
-      } else throw new Error(`unsupported entry type at ${p}`);
-    }
-  };
-  walk(absDir, '');
-  return hash.digest('hex');
+  return [...selected].filter((rel) => rel !== '' && fs.existsSync(path.join(dir, rel, 'package.json'))).sort();
 }
 
 /**
- * The key parts for an npm-workspace dir (BRAIN-466), or `{ reason }` when it must not be cached. Fails closed:
- *  - the workspaces the root `package.json` globs select NOW must be exactly the lock's links, with unique names,
- *    each link named after its package; the sorted discovered set is in the key;
+ * The key parts for an npm-workspace dir (BRAIN-466), or `{ reason }` when it must not be cached. Anything not fully
+ * modelled is refused:
+ *  - run whenever the root `package.json` has a `workspaces` field or the lock has links: the workspaces its globs select NOW
+ *    must be exactly the lock's links (empty included), with unique names, each link named after its package;
  *  - every workspace path is checked for real containment before anything is read;
- *  - a workspace with a lifecycle script (any npm runs), a `binding.gyp` or a lock `hasInstallScript` is cached only
- *    when the lane declares root scripts safe, and then its `scripts` and the digest of its whole directory (every file a
- *    script could reference) join the key. A hit skips those scripts, so a change to any of that must miss.
+ *  - a workspace with a lifecycle script (any npm runs), a `binding.gyp` or a lock `hasInstallScript` is never cached;
+ *  - the key covers the discovered set and, per workspace, its path, links, lock entry and its whole package.json (canonical JSON).
  */
-function workspaceKeyParts({ dir, lock, rootPackage, workspaces, rootScriptsSafe }) {
+function workspaceKeyParts({ dir, lock, rootPackage, workspaces }) {
   const parts = [];
   let discovered;
   try {
@@ -503,7 +483,7 @@ function workspaceKeyParts({ dir, lock, rootPackage, workspaces, rootScriptsSafe
   }
   const linked = workspaces.map((w) => w.resolved);
   if (JSON.stringify(discovered) !== JSON.stringify(linked)) {
-    return { reason: `workspaces in package.json (${discovered.join(', ') || 'none'}) differ from the lock's links (${linked.join(', ')})` };
+    return { reason: `workspaces in package.json (${discovered.join(', ') || 'none'}) differ from the lock's links (${linked.join(', ') || 'none'})` };
   }
   const names = new Set();
   const identities = [];
@@ -522,12 +502,8 @@ function workspaceKeyParts({ dir, lock, rootPackage, workspaces, rootScriptsSafe
     const lifecycle = ROOT_SCRIPT_NAMES.filter((n) => n in scripts);
     if (fs.existsSync(path.join(dir, resolved, 'binding.gyp'))) lifecycle.push('binding.gyp');
     if (lock.packages[resolved]?.hasInstallScript) lifecycle.push('lock hasInstallScript');
-    const fields = Object.fromEntries(MANIFEST_DEPENDENCY_FIELDS.filter((f) => f in manifest).map((f) => [f, manifest[f]]));
-    parts.push([`workspace:${resolved}`, JSON.stringify({ links, lock: lock.packages[resolved], manifest: fields })]);
-    if (lifecycle.length > 0) {
-      if (!rootScriptsSafe) return { reason: `workspace ${resolved} has lifecycle inputs not known to leave node_modules alone (${lifecycle.join(', ')})` };
-      parts.push([`workspace-scripts:${resolved}`, JSON.stringify(scripts)], [`workspace-files:${resolved}`, digestTreeExcludingNodeModules(path.join(dir, resolved))]);
-    }
+    if (lifecycle.length > 0) return { reason: `workspace ${resolved} has lifecycle inputs (${lifecycle.join(', ')})` };
+    parts.push([`workspace:${resolved}`, canonicalJson({ links, lock: lock.packages[resolved], manifest })]);
   }
   parts.push(['workspace-set', JSON.stringify(identities)]);
   return { parts };
@@ -539,7 +515,7 @@ function workspaceKeyParts({ dir, lock, rootPackage, workspaces, rootScriptsSafe
  * (lockfile not pinned, or a root lifecycle script that is not known to leave `node_modules` alone).
  *
  *  - for npm workspaces (BRAIN-466, `workspaceKeyParts`): the discovered set, and each one's path, links, lock entry and
- *    package.json dependency fields, but not its source unless it has lifecycle scripts;
+ *    whole package.json (never its source; a workspace with lifecycle inputs is refused);
  *  - the lockfile (name and bytes), `package.json`, the `.npmrc` of the dir and of the repo root, and the
  *    bytes of every `file:` tarball the lockfile names;
  *  - node version/platform/arch (`runtime`), the glibc runtime and distro (`system`), the npm version;
@@ -611,8 +587,8 @@ export function computeDepsKey({
     ['install-locale', env.LC_ALL ?? ''],
   ];
   if (eligibility.hasInstallScript) parts.push(['cc-version', toolVersion('cc')], ['python3-version', toolVersion('python3')]);
-  if (eligibility.workspaces.length > 0) {
-    const ws = workspaceKeyParts({ dir, lock, rootPackage: pkg, workspaces: eligibility.workspaces, rootScriptsSafe });
+  if (eligibility.workspaces.length > 0 || 'workspaces' in pkg) {
+    const ws = workspaceKeyParts({ dir, lock, rootPackage: pkg, workspaces: eligibility.workspaces });
     if (ws.reason) return { key: null, reason: ws.reason };
     parts.push(...ws.parts);
   }
@@ -1634,7 +1610,7 @@ export function relocateRestoredTree(tree, { nonce, candidates, prefixes, entrie
 }
 
 /**
- * Everything under `dir` except `node_modules` trees, `.git` included, as path -> "type:size:mtimeMs" (an exact workspace root: its child names).
+ * Everything under `dir` except `node_modules` trees, `.git` included, as path -> "type:size:mtimeMs" (files and symlinks add dev:ino, so an atomic replacement that keeps size and mtime still shows) (an exact workspace root: its child names).
  * Taken before and after an install: any difference means a lifecycle script wrote outside `node_modules`,
  * which a cached `node_modules` could never reproduce.
  */
@@ -1650,7 +1626,9 @@ export function snapshotOutsideNodeModules(dir, workspaceRoots = []) {
       // it is compared by its child names without `node_modules` instead (BRAIN-466). Every other directory keeps size and mtime.
       const signature = roots.has(childRel)
         ? `d:names:${fs.readdirSync(path.join(abs, ent.name)).filter((n) => n !== 'node_modules').sort().join('/')}`
-        : `${ent.isDirectory() ? 'd' : ent.isSymbolicLink() ? 'l' : 'f'}:${st.size}:${st.mtimeMs}`;
+        : ent.isDirectory()
+          ? `d:${st.size}:${st.mtimeMs}`
+          : `${ent.isSymbolicLink() ? 'l' : 'f'}:${st.size}:${st.mtimeMs}:${st.dev}:${st.ino}`;
       out.set(childRel, signature);
       if (ent.isDirectory()) walk(path.join(abs, ent.name), childRel);
     }
