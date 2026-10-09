@@ -4,7 +4,8 @@ import { fileURLToPath } from 'node:url';
 import { paths } from './state.js';
 import { readSchedulerFence } from './fairness.js';
 import { classOf } from './allocation.js';
-import { cpuBudgetCores, leaseResources, resolveTicketResources } from './resources.js';
+import { cpuBudgetCores, exclusiveBudget, leaseResources, resolveTicketResources } from './resources.js';
+import { isExclusive } from './exclusive.js';
 
 /** BRAIN-321: per-machine, per-class reservation caps. `lane capabilities --json` advertises this string. */
 export const CLASSES_CAPABILITY = 'classes/1';
@@ -80,7 +81,12 @@ export function simCapReason(classes, booked, grant, host, cfg) {
  * The smallest grant this queued sim could ever get: its elastic floor, else its declared claim. A sim that breaches a cap
  * even at that is cap-ineligible, whatever else is running.
  */
-export function smallestSimGrant(ticket, cfg) {
+export function smallestSimGrant(ticket, cfg, host) {
+  // an exclusive run's lease is rewritten to the whole admission budget, so that is the grant the caps judge
+  if (isExclusive(ticket)) {
+    const whole = exclusiveBudget(host, cfg);
+    return { cores: whole.cpuBudget, memoryBytes: whole.memoryBudgetBytes };
+  }
   const declared = resolveTicketResources({ weight: ticket.weight, cpuCores: ticket.resources?.cpuCores, memoryBytes: ticket.resources?.memoryBytes, defaultMemoryBytesPerWeight: cfg.defaultMemoryBytesPerWeight });
   const min = ticket.resources?.minCpuCores;
   return { cores: Number.isFinite(min) ? Math.min(declared.cpuCores, Math.ceil(min)) : declared.cpuCores, memoryBytes: declared.memoryBytes };
@@ -109,7 +115,7 @@ export function capDeniedSims(rawQueue, classes, held, host, cfg) {
     else if (classOf(t) !== 'sim') continue;
     else if (!classes.valid) denied.set(t.id, 'config-invalid');
     else if (booked) {
-      const reason = simCapReason(classes, booked, smallestSimGrant(t, cfg), host, cfg);
+      const reason = simCapReason(classes, booked, smallestSimGrant(t, cfg, host), host, cfg);
       if (reason) denied.set(t.id, reason);
     }
   }
@@ -127,4 +133,15 @@ export function capSimClaim(ticket, classes, booked, host, cfg) {
   if (!(ticket.resources.cpuCores > ceiling) || ceiling < Math.ceil(min)) return ticket;
   const { minCpuCores, ...claim } = ticket.resources;
   return { ...ticket, resources: { ...claim, cpuCores: ceiling, ...(minCpuCores < ceiling ? { minCpuCores } : {}) } };
+}
+
+/**
+ * What admission and `lane status` must agree on for the queue: the resolved classes, the tickets the class policy forbids to
+ * start right now (`capEnforced`, enforced reasons only), and whether the tests-before-sims tie-break is on (only under
+ * ACTIVE, valid caps; with none configured the order is the plain sequence order).
+ */
+export function classQueuePolicy(rawQueue, classes, held, host, cfg) {
+  const capVerdicts = capDeniedSims(rawQueue, classes, held, host, cfg);
+  const capEnforced = new Map([...capVerdicts].filter(([, reason]) => classes.mode === 'active' || ALWAYS_ENFORCED_REASONS.has(reason)));
+  return { capEnforced, eligible: (t) => !capEnforced.has(t.id), simsAfterTests: classes.valid && classes.mode === 'active' };
 }

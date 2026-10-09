@@ -12,7 +12,10 @@ import { bootId, paths, atomicWriteJson } from '../src/state.js';
 import { fenceLegacyQueue } from '../src/migrate.js';
 import { detectResourceCapacity } from '../src/resources.js';
 import { orderQueue } from '../src/priority.js';
-import { childEnv } from '../src/supervisor.js';
+import { childEnv, remoteSelectOptions } from '../src/supervisor.js';
+import { createAttempt, fallbackToLocal, readAttempt } from '../src/attempts.js';
+import { selectRunner } from '../src/remote-client.js';
+import { makeFakeSshBin, makeRunner, clientEnv } from './remote-harness.js';
 import { CLASS_ENFORCEMENT_ENV, resolveClasses } from '../src/classes.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
 import { loadModules, scenarios, runScript, liveTrace } from './allocation-scenarios.js';
@@ -228,11 +231,137 @@ test('shadow mode logs what active would deny and still grants', async () => {
   assert.match(fs.readFileSync(paths(state).admissionLog, 'utf8'), /classCap=class-cap\(shadow\):cap-cores/);
 });
 
-test('at equal effective score a test goes before a sim, whichever was enqueued first', () => {
+test('with active caps, at equal effective score a test goes before a sim; with none configured the order is plain sequence order', () => {
   const now = 1_700_000_000_000;
   const mk = (id, seq, extra) => ({ id, seq, priorityAdmitted: 'medium', priorityRequested: 'medium', prioOriginAt: now, ...extra });
-  const ordered = orderQueue([mk('sim-first', 1, { class: 'sim' }), mk('test-second', 2, {}), mk('sim-third', 3, { class: 'sim' }), mk('test-fourth', 4, {})], now, DEFAULT_GLOBAL_CONFIG);
-  assert.deepEqual(ordered.map((t) => t.id), ['test-second', 'test-fourth', 'sim-first', 'sim-third']);
+  const queue = [mk('sim-first', 1, { class: 'sim' }), mk('test-second', 2, {}), mk('sim-third', 3, { class: 'sim' }), mk('test-fourth', 4, {})];
+  assert.deepEqual(orderQueue(queue, now, DEFAULT_GLOBAL_CONFIG, true).map((t) => t.id), ['test-second', 'test-fourth', 'sim-first', 'sim-third']);
+  assert.deepEqual(orderQueue(queue, now, DEFAULT_GLOBAL_CONFIG).map((t) => t.id), ['sim-first', 'test-second', 'sim-third', 'test-fourth'], '0.28.2 order: seq only');
+});
+
+test('a fully aged sim is exempt from the tests-before-sims tie-break, so newer tests cannot overtake it forever', () => {
+  const now = 1_700_000_000_000;
+  const cfg = DEFAULT_GLOBAL_CONFIG;
+  const mk = (id, seq, origin, extra) => ({ id, seq, priorityAdmitted: 'high', priorityRequested: 'high', prioOriginAt: origin, ...extra });
+  const fresh = orderQueue([mk('sim', 1, now, { class: 'sim' }), mk('newer-test', 2, now)], now, cfg, true);
+  assert.deepEqual(fresh.map((t) => t.id), ['newer-test', 'sim'], 'a young sim still yields to a test of equal score');
+  const aged = orderQueue([mk('sim', 1, now - cfg.priorityAgeMaxMs, { class: 'sim' }), mk('newer-test', 2, now)], now, cfg, true);
+  assert.deepEqual(aged.map((t) => t.id), ['sim', 'newer-test'], 'once fully aged the older sim goes first by seq');
+});
+
+test('P1: an exclusive sim is judged at its WHOLE-BUDGET lease, not its declared claim', async () => {
+  const { state } = freshEnv();
+  const cfg = cfgWith(classes('active', { capCores: 2 }));
+  const excl = simTicket('xs', 1, { exclusive: true, priorityRequested: 'high' });
+  const denied = await admit(state, excl, cfg);
+  assert.equal(denied.started, false);
+  assert.equal(denied.reason, 'class-cap', `declared 1 core fits a 2-core cap but the exclusive lease claims the whole budget (got ${JSON.stringify(denied)})`);
+  assert.equal(readLease(state, 'xs'), null);
+  const roomy = cfgWith(classes('active', { capCores: 1000, maxTickets: 8, capMemoryBytes: 1024 ** 5 }));
+  const ok = await poll(state, excl, roomy);
+  assert.equal(ok.started, true, JSON.stringify(ok));
+  assert.equal(readLease(state, 'xs').exclusive, true);
+});
+
+test('P1: one ownership check: a remote attempt owns its id against a local enqueue, except for its own fallback', async () => {
+  const { state } = freshEnv();
+  const id = '11111111-1111-4111-8111-111111111111';
+  await createAttempt(state, id, { runner: null });
+  const dup = await enqueue(state, testTicket(id));
+  assert.equal(dup.existing, true);
+  assert.equal(dup.state, 'attempt');
+  assert.deepEqual(fs.existsSync(paths(state).queue) ? fs.readdirSync(paths(state).queue) : [], [], 'nothing was queued: no second execution');
+  const stranger = await enqueue(state, testTicket(id), DEFAULT_GLOBAL_CONFIG, { ownerGeneration: 7 });
+  assert.equal(stranger.existing, true, 'a different generation does not own the attempt');
+  const fb = await fallbackToLocal(state, id, 'no-runner');
+  assert.equal(fb.ok, true);
+  const own = await enqueue(state, testTicket(id), DEFAULT_GLOBAL_CONFIG, { ownerGeneration: fb.attempt.generation });
+  assert.equal(own.existing, undefined, "the owning attempt's own local fallback proceeds");
+  assert.equal(readAttempt(state, id).generation, fb.attempt.generation);
+  assert.equal(fs.readdirSync(paths(state).queue).length, 1);
+});
+
+test('P1: a ticket that requires class enforcement only goes to a runner advertising classes/1', async () => {
+  const { binDir } = makeFakeSshBin();
+  const probe = (capabilities) => ({ protocol: 1, protocols: [1, 2], version: '0.0.0', paused: false, queued: 0, running: 0, capabilities });
+  const ssh = (name, payload) => {
+    const bin = path.join(binDir, name);
+    fs.writeFileSync(bin, `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(JSON.stringify(payload))} + '\\n');\nprocess.exit(0);\n`);
+    fs.chmodSync(bin, 0o755);
+    return bin;
+  };
+  const { env } = clientEnv(binDir);
+  const runners = [makeRunner({ ssh: 'normal' })];
+  const cfg = DEFAULT_GLOBAL_CONFIG;
+  const enriched = (extra) => ({ weight: 1, resources: { cpuCores: 1, memoryBytes: GIB }, ...extra });
+  const old = await selectRunner(runners, { ...remoteSelectOptions(enriched({ classEnforcement: 'required' }), cfg), sshBin: ssh('ssh-old', probe(['elastic-claims/1'])), env, deadlineMs: 3000 });
+  assert.equal(old.runner, null);
+  assert.match(old.skipped[0].reason, /classes\/1/);
+  const newer = await selectRunner(runners, { ...remoteSelectOptions(enriched({ classEnforcement: 'required' }), cfg), sshBin: ssh('ssh-new', probe(['classes/1'])), env, deadlineMs: 3000 });
+  assert.equal(newer.runner.name, runners[0].name);
+  const plain = await selectRunner(runners, { ...remoteSelectOptions(enriched({}), cfg), sshBin: ssh('ssh-old2', probe(['elastic-claims/1'])), env, deadlineMs: 3000 });
+  assert.equal(plain.runner.name, runners[0].name, 'a ticket without classEnforcement is unchanged on an old runner');
+});
+
+test('P2: only an ABSENT global config means no classes; unreadable or vanished-after-use fails the sim class closed', () => {
+  const { home, state } = freshEnv();
+  const prev = { home: process.env.LANE_BROKER_HOME, state: process.env.LANE_BROKER_STATE };
+  Object.assign(process.env, { LANE_BROKER_HOME: home, LANE_BROKER_STATE: state });
+  const file = path.join(home, 'config.json');
+  try {
+    assert.equal(resolveClasses(loadGlobalConfig(), state).valid, true, 'never configured: no classes, valid');
+    fs.writeFileSync(file, JSON.stringify({ version: 1, classes: classes('active') }));
+    assert.equal(resolveClasses(loadGlobalConfig(), state).mode, 'active');
+    assert.equal(fs.existsSync(paths(state).classesConfigured), true, 'the fence is durable in the state dir');
+    fs.rmSync(file);
+    const gone = resolveClasses(loadGlobalConfig(), state);
+    assert.equal(gone.valid, false, 'the file with the caps vanished: keep the fence');
+    assert.match(gone.error, /classes block was in force/);
+    fs.writeFileSync(file, JSON.stringify({ version: 1, classes: classes('active') }));
+    assert.equal(resolveClasses(loadGlobalConfig(), state).valid, true, 'a valid file returns');
+    fs.writeFileSync(file, JSON.stringify({ version: 1 }));
+    assert.equal(resolveClasses(loadGlobalConfig(), state).valid, true);
+    assert.equal(fs.existsSync(paths(state).classesConfigured), false, 'a valid file without classes clears the fence');
+    fs.rmSync(file);
+    assert.equal(resolveClasses(loadGlobalConfig(), state).valid, true, 'absent again, nothing was in force');
+    fs.writeFileSync(file, JSON.stringify({ version: 1 }));
+    fs.chmodSync(home, 0o000);
+    try {
+      const blocked = resolveClasses(loadGlobalConfig(), state);
+      assert.equal(blocked.valid, false, 'an inaccessible parent is not an absent file');
+      assert.match(blocked.error, /unreadable/);
+    } finally {
+      fs.chmodSync(home, 0o755);
+    }
+  } finally {
+    fs.chmodSync(home, 0o755);
+    process.env.LANE_BROKER_HOME = prev.home;
+    process.env.LANE_BROKER_STATE = prev.state;
+  }
+});
+
+test('P2: lane status reports the same reservation owner and head as admission, with the cap-denied sim listed last', async () => {
+  const T0 = Date.now();
+  const { home, state } = freshEnv();
+  writeGlobalConfig(home, { version: 1, schedulerMode: 'active', resourceSkipLimit: 3, classes: classes('active', { capCores: 1 }) });
+  atomicWriteJson(paths(state).schedFence, { version: 2, migratedAt: T0 });
+  fenceLegacyQueue(state, 'test');
+  const reserved = (seq) => ({ reason: 'resource', skipsCharged: 3, reserved: true, reservationSeq: seq, inScope: true, behindConflict: false, deniedAt: T0, budget: POOL, externalBusy: 2.5 });
+  await enqueue(state, simTicket('S', 2, { priorityRequested: 'high' }));
+  await enqueue(state, testTicket('T', POOL));
+  atomicWriteJson(paths(state).fairness, { version: 2, tickets: { S: { resource: reserved(3) }, T: { resource: reserved(5) } } });
+  const prev = { home: process.env.LANE_BROKER_HOME, state: process.env.LANE_BROKER_STATE };
+  Object.assign(process.env, { LANE_BROKER_HOME: home, LANE_BROKER_STATE: state });
+  try {
+    const status = await collectStatus();
+    assert.deepEqual(status.queued.map((q) => q.id), ['T', 'S'], 'the test is the head; the cap-denied sim is not');
+    assert.equal(status.queued[0].reservationOwner, true);
+    assert.equal(status.queued[1].reservationOwner, undefined);
+    assert.equal(status.queued[1].classDenied, 'cap-cores');
+  } finally {
+    process.env.LANE_BROKER_HOME = prev.home;
+    process.env.LANE_BROKER_STATE = prev.state;
+  }
 });
 
 test('enqueueing the same client id twice gives one ticket and one sequence', async () => {

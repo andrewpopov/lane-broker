@@ -6,7 +6,7 @@ import { listQueueCapped, reapOrphanedQueue, HELD_STATES, blockedBy, readSkipSta
 import { refreshCpuEstimates } from './cpu-estimates.js';
 import { cpuBudget, projectBusy, ticketCpuEstimate, ticketCpuEstimateBasis } from './admission.js';
 import { classLocks, classOf, simArmed, usedByClass } from './allocation.js';
-import { resolveClasses, bookedSims } from './classes.js';
+import { resolveClasses, bookedSims, classQueuePolicy } from './classes.js';
 import { queuedClaimsByClass } from './allocation-shadow.js';
 import { readLastSimDemandAt } from './sim-arm.js';
 import { listAttempts, supervisorAlive, moveInterruptedLabel } from './attempts.js';
@@ -228,7 +228,13 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
   // a valid scheduler fence the broker runs the legacy FIFO scheduler, so the queue below
   // stays FIFO and the rank is informational: what the ticket's age would be worth.
   const nowEff = effectiveNow(root, now);
-  const { queue, ownerId: reservationOwnerId } = sched.v2 ? effectiveView(rawQueue, nowEff, cfg, store) : { queue: rawQueue, ownerId: null };
+  // BRAIN-321: the same class policy admission uses, so the head, the reservation owner and the blocking reports agree with it.
+  // A sim the caps forbid to start leaves the order (as in admission) and is listed after it, tagged with why.
+  const classPolicy = classQueuePolicy(rawQueue, resolveClasses(cfg, root), held, resourceCapacity, cfg);
+  const { queue: fullQueue, ownerId: reservationOwnerId } = sched.v2
+    ? effectiveView(rawQueue, nowEff, cfg, store, classPolicy.eligible, { simsAfterTests: classPolicy.simsAfterTests })
+    : { queue: rawQueue, ownerId: null };
+  const queue = [...fullQueue.filter((t) => t === null || classPolicy.eligible(t)), ...fullQueue.filter((t) => t !== null && !classPolicy.eligible(t))];
   const queued = queue.map((t, i) => {
     const rank = effectiveRank(t, nowEff, cfg);
     const tier = priorityOf(t);
@@ -239,6 +245,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       waitedMs: now - t.createdAt,
       priority: tier,
       ...(t.id === reservationOwnerId ? { reservationOwner: true } : {}),
+      ...(classPolicy.capEnforced.has(t.id) ? { classDenied: classPolicy.capEnforced.get(t.id) } : {}),
       ...(t.exclusive === true ? { exclusive: true } : {}),
       ...(tierName(rank) !== tier ? { effectiveRank: tierName(rank) } : {}),
       resources: leaseResources(t, cfg),

@@ -10,14 +10,14 @@ import { readMemoryInfo } from './cpu.js';
 import { recordExternalDenial, clearExternalStarved } from './external-cpu.js';
 import { captureShadowInputs, recordAllocationShadow } from './allocation-shadow.js';
 import { classOf } from './allocation.js';
-import { resolveClasses, classEnforcementOf, bookedSims, capDeniedSims, capSimClaim, simCapReason, isEnforcementRequired, ALWAYS_ENFORCED_REASONS } from './classes.js';
+import { resolveClasses, classEnforcementOf, bookedSims, classQueuePolicy, capSimClaim, simCapReason, isEnforcementRequired } from './classes.js';
 import { reconcileSimArm, touchSimArmFor } from './sim-arm.js';
 import { advanceHwm } from './priority-clock.js';
 import { isExclusive, exclusiveDeny, isExclusiveHead, exclusiveLeaseFields, withoutBackfillExclusives, clampQueuedWeight } from './exclusive.js';
 import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, effectiveRank, score } from './priority.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
-import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores, evaluateMemoryAdmission, leaseResources, resolveTicketResources, terminalRowDefaults, capElasticClaim, elasticBelowFloor, elasticClaimRange } from './resources.js';
+import { detectResourceCapacity, effectiveWeightCapacity, exclusiveBudget, cpuBudgetCores, evaluateMemoryAdmission, leaseResources, resolveTicketResources, terminalRowDefaults, capElasticClaim, elasticBelowFloor, elasticClaimRange } from './resources.js';
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
  *  possibly-running work and must count against both conflicts and capacity. */
@@ -126,8 +126,13 @@ function findQueueFile(root, id) {
   return match ? path.join(dir, match) : null;
 }
 
-/** The ticket already known under `id` (queued, withdrawn for a rebind, leased, or finished), flagged `existing`; else null. */
-export function existingTicket(root, id) {
+/**
+ * The ONE ownership check for a ticket id, shared by both entry paths (`createAttempt` for a remote dispatch, `enqueue` for a
+ * local queue): the ticket already known under `id` (queued, withdrawn for a rebind, leased, finished, or owned by a remote
+ * attempt), flagged `existing`; else null. `ownerGeneration` is the caller's own attempt generation: only that attempt's
+ * local fallback may enqueue the id its attempt already holds.
+ */
+export function existingTicket(root, id, { ownerGeneration = null } = {}) {
   const queued = findQueueFile(root, id);
   if (queued) return { ...(readJsonSafe(queued) ?? { id }), existing: true, state: 'queued' };
   if (listRebindingIds(root).includes(id)) return { id, existing: true, state: 'rebinding' };
@@ -135,6 +140,8 @@ export function existingTicket(root, id) {
   if (lease) return { ...lease, existing: true, state: 'leased' };
   const result = readJsonSafe(path.join(paths(root).results, `${id}.json`));
   if (result) return { ...result, id, existing: true, state: 'finished' };
+  const attempt = readAttempt(root, id);
+  if (attempt && !(ownerGeneration !== null && attempt.generation === ownerGeneration)) return { id, existing: true, state: 'attempt' };
   return null;
 }
 
@@ -142,14 +149,14 @@ export function existingTicket(root, id) {
  * Enqueue a ticket at the tail of the global FIFO. Caller must NOT hold the lock. Returns the persisted record, whose
  * `priorityRequested`/`priorityAdmitted`/`priorityDemoted` tell the caller whether the per-repo high cap demoted it.
  */
-export async function enqueue(root, ticket, cfg = DEFAULT_GLOBAL_CONFIG) {
+export async function enqueue(root, ticket, cfg = DEFAULT_GLOBAL_CONFIG, { ownerGeneration = null } = {}) {
   const { maxQueuedHighPerRepo } = cfg;
   return withLock(root, () => {
     assertNotMigrating(root);
     assertQueueLayout(root);
     // BRAIN-321: a client-supplied id is idempotent. One that is already queued, rebinding, leased or finished is the SAME
     // ticket: return it, and allocate no sequence (a retried submission must not take a second place in the queue).
-    const existing = existingTicket(root, ticket.id);
+    const existing = existingTicket(root, ticket.id, { ownerGeneration });
     if (existing) return existing;
     const nowEff = advanceHwm(root);
     const priorityRequested = isPriorityTier(ticket.priorityRequested) ? ticket.priorityRequested : DEFAULT_PRIORITY;
@@ -977,12 +984,6 @@ function safeBackfillFlags(queue, headTicket, enabled, cannotDelayHead) {
   });
 }
 
-/** BRAIN-403: the whole admission budget an exclusive lease claims (the same two formulas status and admission report). */
-function exclusiveBudget(cfg) {
-  const host = detectResourceCapacity();
-  return { cpuBudget: cpuBudgetCores(host, cfg), memoryBudgetBytes: Math.max(0, host.memoryBytes - cfg.memoryReserveBytes) };
-}
-
 /**
  * The single atomic transaction: a ticket starts only when it is selected
  * AND fits capacity AND the load gate is open AND the broker is not paused.
@@ -1040,10 +1041,9 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // the head and never blocks anything, and it cannot hold a reservation-owner promotion either.
     const classes = resolveClasses(cfg, root);
     const classHost = classes.mode === 'off' && classes.valid ? null : detectResourceCapacity();
-    const capVerdicts = capDeniedSims(rawQueue, classes, held, classHost, cfg);
-    const capEnforced = new Map([...capVerdicts].filter(([, reason]) => classes.mode === 'active' || ALWAYS_ENFORCED_REASONS.has(reason)));
+    const { capEnforced, eligible, simsAfterTests } = classQueuePolicy(rawQueue, classes, held, classHost, cfg);
     const { queue: fullQueue, ownerId: reservationOwnerId } = sched.v2
-      ? effectiveView(rawQueue, nowEff, cfg, store, (t) => !capEnforced.has(t.id))
+      ? effectiveView(rawQueue, nowEff, cfg, store, eligible, { simsAfterTests })
       : { queue: rawQueue, ownerId: null };
     if (!fullQueue.some((t) => t && t.id === submitted.id)) {
       return { result: { started: false, reason: 'not-head', position: null, queueLength: fullQueue.length } };
@@ -1355,8 +1355,12 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // chance to matter" from "gate genuinely never closed".
     const loadGateIgnored = !cfg.admissionLoadGate && gate.closed;
     // BRAIN-321: the caps judged at this sim's ACTUAL final grant. `active` denies below; `shadow` only says what it would.
+    // An exclusive run's lease is rewritten to the whole admission budget (`exclusiveLeaseFields`), so THAT is what the cap judges.
+    const exclusiveGrant = exclusiveHolder ? exclusiveBudget(detectResourceCapacity(), cfg) : null;
     const simGrant = classOf(ticket) === 'sim' && classes.valid && classes.mode !== 'off'
-      ? { cores: grantedCpuCores, memoryBytes: resolveTicketResources({ weight: ticket.weight, memoryBytes: ticket.resources?.memoryBytes, defaultMemoryBytesPerWeight: cfg.defaultMemoryBytesPerWeight }).memoryBytes }
+      ? exclusiveGrant
+        ? { cores: exclusiveGrant.cpuBudget, memoryBytes: exclusiveGrant.memoryBudgetBytes }
+        : { cores: grantedCpuCores, memoryBytes: resolveTicketResources({ weight: ticket.weight, memoryBytes: ticket.resources?.memoryBytes, defaultMemoryBytesPerWeight: cfg.defaultMemoryBytesPerWeight }).memoryBytes }
       : null;
     const grantCapReason = simGrant ? simCapReason(classes, booked, simGrant, classHost, cfg) : null;
     const logBase = {
@@ -1569,7 +1573,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       logPath: ticket.logPath,
       resultPath: ticket.resultPath,
       // BRAIN-403: an exclusive run claims the whole admission budget (every capacity and resource path then refuses the rest)
-      ...(exclusiveHolder ? exclusiveLeaseFields({ ...exclusiveBudget(cfg), weightCapacity, declaredResources: submitted.resources }) : {}),
+      ...(exclusiveHolder ? exclusiveLeaseFields({ ...exclusiveBudget(detectResourceCapacity(), cfg), weightCapacity, declaredResources: submitted.resources }) : {}),
       state: LEASE_STATE.RUNNING,
     };
     writeLease(root, lease);

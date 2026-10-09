@@ -200,6 +200,8 @@ function neverFits(reservation, probe) {
  * alone (see `dispatchRemote`), so an optionless lane still sends a
  * protocol-1 header even when `remoteQueueTimeoutMs` made this true.
  *
+ * `opts.requireCapabilities` (BRAIN-321): capability strings the runner's probe must advertise, else it is skipped.
+ *
  * `opts.reservation` (BRAIN-320 S1e): the ticket's resolved
  * `{weight, cpuCores, memoryBytes}`, checked against each probe's static
  * `capacity` (1e). The existing `queued > 0` skip is unchanged.
@@ -215,7 +217,7 @@ function neverFits(reservation, probe) {
 export async function selectRunner(runners, opts = {}) {
   const deadlineMs = opts.deadlineMs ?? 6000;
   const sshBin = opts.sshBin ?? 'ssh';
-  const { env, requireProtocol2 = false, reservation, maxRemoteQueue = 0 } = opts;
+  const { env, requireProtocol2 = false, requireCapabilities = [], reservation, maxRemoteQueue = 0 } = opts;
   const skipped = [];
   // BRAIN-405: every runner is probed, then the idle one with real room and the earliest estimated finish wins (ties: more
   // free CPU, then config order). A runner with an empty queue but no headroom is not idle, however empty its queue.
@@ -247,6 +249,13 @@ export async function selectRunner(runners, opts = {}) {
     }
     if (requireProtocol2 && !(Array.isArray(probe.protocols) && probe.protocols.includes(2))) {
       skipped.push({ name: runner.name, reason: 'runner does not support protocol 2 (remoteDeps/remoteSetup/remoteQueueTimeoutMs)' });
+      continue;
+    }
+    // BRAIN-321: a ticket whose lane REQUIRES a feature (class enforcement) never goes to a runner that cannot enforce it; an older
+    // runner would ignore the unknown lane key and run it unenforced. A ticket with no requirement is unchanged.
+    const missing = requireCapabilities.filter((c) => !(Array.isArray(probe.capabilities) && probe.capabilities.includes(c)));
+    if (missing.length) {
+      skipped.push({ name: runner.name, reason: `runner does not advertise ${missing.join(', ')} (required by the lane)` });
       continue;
     }
     if (probe.draining) {

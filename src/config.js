@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { paths, stateHome } from './state.js';
 import { isCanonicalRelPath } from './remote-manifest.js';
 import { unsupportedHookKeys, hookRefusalMessage } from './exclusive.js';
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
@@ -660,10 +661,20 @@ export function resolvePriority({ cli, env, configTier, exclusive = false }) {
 export function loadGlobalConfig() {
   const home = brokerHome();
   const file = path.join(home, 'config.json');
-  if (!fs.existsSync(file)) return { ...DEFAULT_GLOBAL_CONFIG };
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    // BRAIN-321: only a genuinely ABSENT file is "no config". An inaccessible one (EACCES, a parent dir we cannot enter, ...) leaves the
+    // class policy unknown, and a file that disappeared after a `classes` block was in force keeps the fence; either way sims are denied.
+    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
+      return classesFenceHeld() ? { ...DEFAULT_GLOBAL_CONFIG, classesInvalid: `${file} is gone but a classes block was in force; restore it (or remove ${paths(stateHome()).classesConfigured})` } : { ...DEFAULT_GLOBAL_CONFIG };
+    }
+    return { ...DEFAULT_GLOBAL_CONFIG, classesInvalid: `${file}: unreadable (${err.code ?? err.message})` };
+  }
   let parsed;
   try {
-    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    parsed = JSON.parse(text);
   } catch (err) {
     throw new ConfigError(`${file}: invalid JSON (${err.message})`);
   }
@@ -687,7 +698,24 @@ export function loadGlobalConfig() {
       cfg.classesInvalid = err.message;
     }
   }
+  setClassesFence(cfg.classes !== undefined || cfg.classesInvalid !== undefined);
   return cfg;
+}
+
+const classesFenceFile = () => paths(stateHome()).classesConfigured;
+const classesFenceHeld = () => fs.existsSync(classesFenceFile());
+
+/** Durably record (in the broker's state dir) whether a config with a `classes` block has been loaded; written only on change. */
+function setClassesFence(inForce) {
+  if (inForce === classesFenceHeld()) return;
+  try {
+    if (inForce) {
+      fs.mkdirSync(path.dirname(classesFenceFile()), { recursive: true });
+      fs.writeFileSync(classesFenceFile(), `${new Date().toISOString()}\n`);
+    } else fs.rmSync(classesFenceFile(), { force: true });
+  } catch {
+    // an unwritable state dir cannot hold a fence; admission fails there on its own
+  }
 }
 
 /**

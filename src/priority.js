@@ -87,20 +87,25 @@ export function tierName(rank) {
   return PRIORITY_TIERS[rank];
 }
 
-/** BRAIN-321: at an equal score a test goes before a sim, whichever was enqueued first. */
-const simRank = (ticket) => (ticket.class === 'sim' ? 1 : 0);
+/**
+ * BRAIN-321: with class caps in force, at an equal score a test goes before a sim, whichever was enqueued first. A sim that
+ * has waited its full `priorityAgeMaxMs` is exempt, so it is ordered by seq like anything else: only tests enqueued
+ * BEFORE it can stay ahead, so a cap-eligible sim cannot be overtaken forever by newer tests of the same score.
+ */
+const simRank = (ticket, nowEff, cfg, simsAfterTests) =>
+  simsAfterTests && ticket.class === 'sim' && creditedWaitMs(ticket, nowEff) < cfg.priorityAgeMaxMs ? 1 : 0;
 
 /**
- * The order every selector walks: (score desc, test before sim, seq asc) within each maximal run of readable
+ * The order every selector walks: (score desc, test before a not-fully-aged sim when `simsAfterTests`, seq asc) within each maximal run of readable
  * records. An unreadable (`null`) record is a barrier: nothing moves across it, so the
  * scheduler's protection against an unreadable head survives.
  */
-export function orderQueue(raw, nowEff, cfg) {
+export function orderQueue(raw, nowEff, cfg, simsAfterTests = false) {
   const ordered = [];
   let run = [];
   const flush = () => {
     const scored = run.map((ticket, index) => ({ ticket, index, score: score(ticket, nowEff, cfg) }));
-    scored.sort((a, b) => b.score - a.score || simRank(a.ticket) - simRank(b.ticket) || (a.ticket.seq ?? 0) - (b.ticket.seq ?? 0) || a.index - b.index);
+    scored.sort((a, b) => b.score - a.score || simRank(a.ticket, nowEff, cfg, simsAfterTests) - simRank(b.ticket, nowEff, cfg, simsAfterTests) || (a.ticket.seq ?? 0) - (b.ticket.seq ?? 0) || a.index - b.index);
     for (const { ticket } of scored) ordered.push(ticket);
     run = [];
   };

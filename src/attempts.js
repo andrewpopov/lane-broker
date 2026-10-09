@@ -140,7 +140,7 @@ export async function createAttempt(root, id, { runner = null, resources, logPat
   await withLock(root, () => {
     assertNotMigrating(root);
     if (refuseIf) {
-      existing = refuseIf() ?? (readAttempt(root, id) ? { id, existing: true, state: 'attempt' } : null);
+      existing = refuseIf();
       if (existing) return;
     }
     atomicWriteJson(attemptFile(root, id), attempt);

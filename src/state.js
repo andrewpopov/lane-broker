@@ -80,6 +80,8 @@ export function paths(root = stateHome()) {
     // BRAIN-379: when sim demand last existed (arms the sim soft lock); see src/sim-arm.js.
     simArm: path.join(root, 'sim-arm.json'),
     simArmLock: path.join(root, 'sim-arm.lock'),
+    // BRAIN-321: present while a global config carrying a `classes` block has been loaded; its file vanishing then fails the sim class closed.
+    classesConfigured: path.join(root, 'classes-configured'),
     seq: path.join(root, 'seq'),
     // BRAIN-380: the scheduler fence (its presence, valid, switches priority ordering on) and the per-ticket
     // fairness records that replace the three singleton skip files behind it; see src/fairness.js.

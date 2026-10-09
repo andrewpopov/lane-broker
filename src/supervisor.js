@@ -27,7 +27,7 @@ import { DescendantTracker, hasLiveMembers, reapLogLine } from './descendants.js
 import { reloadGlobalConfig } from './config.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
-import { CLASS_ENFORCEMENT_ENV } from './classes.js';
+import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired } from './classes.js';
 import { detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
@@ -471,10 +471,11 @@ function migrationRefusalResult(ticket) {
 }
 
 /** What `selectRunner` needs to judge a ticket: its protocol, and its reservation (shared by a first attempt and a rebind). */
-function remoteSelectOptions(enriched, globalCfg) {
+export function remoteSelectOptions(enriched, globalCfg) {
   return {
     maxRemoteQueue: globalCfg.maxRemoteQueue,
     requireProtocol2: needsProtocol2(enriched.remote) || Boolean(globalCfg.remoteQueueTimeoutMs),
+    requireCapabilities: isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : [],
     reservation: {
       weight: enriched.weight,
       cpuCores: enriched.resources.cpuCores,
@@ -1160,7 +1161,7 @@ async function main() {
   }
 
   try {
-    const queued = await enqueue(root, enriched, globalCfg);
+    const queued = await enqueue(root, enriched, globalCfg, { ownerGeneration: attemptGeneration });
     // BRAIN-321: this id was already submitted (a retried `lane run --detach --id`); its first supervisor owns it.
     if (queued.existing) process.exit(0);
     if (queued.priorityDemoted) process.stderr.write('lane run: priority high demoted to medium (repo already has a queued high ticket)\n');

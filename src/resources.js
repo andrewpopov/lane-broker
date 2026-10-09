@@ -377,3 +377,8 @@ export function evaluateMemoryAdmission({ memoryInfo, heldLeases, candidateResou
   }
   return { admit: true, reason: 'ok', projectedAvailableBytes, memoryBudgetBytes };
 }
+
+/** BRAIN-403: the whole admission budget an exclusive lease claims (the same two formulas status and admission report). */
+export function exclusiveBudget(host, cfg) {
+  return { cpuBudget: cpuBudgetCores(host, cfg), memoryBudgetBytes: Math.max(0, host.memoryBytes - cfg.memoryReserveBytes) };
+}
