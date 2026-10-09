@@ -710,9 +710,12 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
  * baseline. Memory is what the OS reports available minus the broker's reserve. Null when the budgets are not enforced
  * (shadow mode) or the measurement is missing: the client then treats the runner as having room, as it does for capacity.
  */
-export function probeHeadroom(resources, cfg, enforced, loadAvg1 = os.loadavg()[0]) {
+export function probeHeadroom(resources, cfg, enforced, loadAvg1 = os.loadavg()[0], externalBusy = null) {
   if (!enforced || !resources) return null;
-  const busy = Math.max(Number.isFinite(resources.reservedCpuCores) ? resources.reservedCpuCores : 0, Number.isFinite(loadAvg1) ? loadAvg1 : 0);
+  const reserved = Number.isFinite(resources.reservedCpuCores) ? resources.reservedCpuCores : 0;
+  // BRAIN-506: with a fresh sample, busy is what this runner's admission counts (leases + non-preemptible external busy, niced
+  // sims discounted); loadavg counts every reniced process at full weight, so it is only the fallback when there is no sample.
+  const busy = Number.isFinite(externalBusy) ? reserved + Math.max(0, externalBusy) : Math.max(reserved, Number.isFinite(loadAvg1) ? loadAvg1 : 0);
   return {
     cpuCores: Math.max(0, resources.cpuBudgetCores - busy),
     memoryBytes: Number.isFinite(resources.availableMemoryBytes) ? Math.max(0, resources.availableMemoryBytes - cfg.memoryReserveBytes) : null,
@@ -721,9 +724,11 @@ export function probeHeadroom(resources, cfg, enforced, loadAvg1 = os.loadavg()[
 
 /** `lane remote-probe`: one JSON line describing this host's local broker,
  *  reusing status.js's own reader rather than a second implementation. */
-export async function remoteProbeCommand({ root = defaultRemoteRoot() } = {}) {
+export async function remoteProbeCommand({ root = defaultRemoteRoot(), scan } = {}) {
   pruneStaleArtifacts(path.join(path.resolve(root), 'tickets'));
-  const status = await collectStatus();
+  // BRAIN-506: an idle runner has no polling supervisor, so its stored CPU sample is stale; measure one short window here (~250 ms,
+  // well inside the client's 6 s probe deadline) rather than fall back to loadavg, which counts niced sims in full.
+  const status = await collectStatus({ scanExternal: true, ...(scan ? { scan } : {}) });
   const pkgPath = fileURLToPath(new URL('../package.json', import.meta.url));
   const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
   // BRAIN-320 S1a (1d/1e): `protocols` is the new negotiation field ([1, 2]
@@ -756,7 +761,7 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot() } = {}) {
     // BRAIN-360: additive; the CPU the runner's leases are charged (grants, not declarations)
     reservedCpuCores: status.resources?.reservedCpuCores,
     // BRAIN-405: what a new ticket could be given RIGHT NOW (unlike `capacity`, which is static); null where unmeasurable
-    headroom: probeHeadroom(status.resources, globalCfg, enforced),
+    headroom: probeHeadroom(status.resources, globalCfg, enforced, undefined, status.externalCpu?.busyCores),
     capacity: {
       weight: effectiveWeightCapacity(globalCfg, host.cpuCores),
       cpuCores: enforced ? cpuBudgetCores(host, globalCfg) : null,
