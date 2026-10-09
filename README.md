@@ -891,6 +891,10 @@ If the runner's broker has not started it by then, the runner expires it
 (a ticket that has started always runs to completion) and the client runs
 it locally instead. A user cancel still wins: exit `130`, no local run.
 
+A ticket this machine can never run locally (a `localRefused` lane without `--allow-local-sim`, or a claim over the
+local budget) carries no queue timeout: there is nothing to fall back to, so it waits in the runner's queue until it
+starts instead of expiring into a refusal.
+
 ### When the ssh session drops mid-job
 
 ssh keepalive (15 s x 4) ends a session after about a minute of silence
