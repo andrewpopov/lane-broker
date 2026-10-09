@@ -152,8 +152,7 @@ export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0, preem
   const snapshot = { at: now, cpus: cpus.map(cpuTimes) };
   const { hostBusyCores, stale } = computeBusyCores(prev, snapshot);
   let procRows = null;
-  if (preemptible) {
-    // BRAIN-463: read even when the discount is off (niceMin 0), so `lane status` can name external CPU burners
+  if (preemptible && preemptible.niceMin > 0) {
     try {
       procRows = readProcs();
     } catch {
@@ -178,7 +177,7 @@ export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0, preem
   const procWindow = !stale && preemptible && procRows && prev?.procs ? { rows: withDeltas(procRows, prev.procs), windowMs: now - prev.at } : null;
   const discount = (window, opts, busy) => (window && opts && Number.isFinite(busy) ? Math.min(preemptibleCores({ ...window, ...opts }), busy) : 0);
   const preemptibleBusyCores = discount(procWindow, preemptible, measured);
-  const lastValid = !stale && Number.isFinite(measured) ? { hostBusyCores: measured, cores: capacity.cpuCores, at: now, ...(procWindow ? { procWindow } : {}) } : unchanged ? prev.lastValid : undefined;
+  const lastValid = !stale && Number.isFinite(measured) ? { hostBusyCores: measured, preemptibleBusyCores, cores: capacity.cpuCores, at: now, ...(procWindow ? { procWindow } : {}) } : unchanged ? prev.lastValid : undefined;
   if (lastValid) snapshot.lastValid = lastValid;
   try {
     const latest = readJsonSafe(file);

@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import assert from 'node:assert/strict';
 import { freshEnv, writeGlobalConfig } from './helpers.js';
 import { topExternalCpu, readCommands } from '../src/external-cpu.js';
+import { sampleHostCpu } from '../src/cpu.js';
 import { enqueue, tryStart } from '../src/scheduler.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
@@ -93,8 +94,12 @@ test('starved-since is set by a high-external projected-over-budget denial, pers
   await new Promise((r) => setTimeout(r, 20));
   await poll(state, head, 7);
   const second = JSON.parse(fs.readFileSync(starvedFile(state), 'utf8'));
-  assert.equal(second.since, first.since, 'the start of the episode survives later denials');
-  assert.ok(second.lastAt > first.lastAt);
+  assert.deepEqual(second, first, 'a denial inside one sample interval does not rewrite the record');
+  atomicWriteJson(starvedFile(state), { ...first, lastAt: first.lastAt - cfg.sampleMs - 1 });
+  await poll(state, head, 7);
+  const third = JSON.parse(fs.readFileSync(starvedFile(state), 'utf8'));
+  assert.equal(third.since, first.since, 'the start of the episode survives later denials');
+  assert.ok(third.lastAt > first.lastAt - 1, 'an older record is refreshed');
 
   await withEnv(home, state, async () => {
     const a = await collectStatus();
@@ -148,5 +153,44 @@ test('status --json shape: externalCpu {busyCores, top[{pid,cores,cmd,cwd?}], st
     assert.match(text, /external CPU: 12\.00 busy cores outside any lease, top process trees:/);
     assert.match(text, /12\.00 cores  pid 4242/);
     assert.doesNotMatch(text, /starved/);
+  });
+});
+
+test('niceMin=0: the admission sampler never reads the process table', () => {
+  const { state } = freshEnv();
+  let reads = 0;
+  const cpus = (user, idle) => Array.from({ length: 4 }, () => ({ model: 't', speed: 0, times: { user, nice: 0, sys: 0, idle, irq: 0 } }));
+  const readProcs = () => {
+    reads += 1;
+    return [];
+  };
+  sampleHostCpu(state, cpus(0, 0), { preemptible: { laneNice: 0, niceMin: 0, heldLeases: [] }, readProcs });
+  sampleHostCpu(state, cpus(50, 50), { preemptible: { laneNice: 0, niceMin: 0, heldLeases: [] }, readProcs });
+  assert.equal(reads, 0);
+  sampleHostCpu(state, cpus(90, 90), { preemptible: { laneNice: 0, niceMin: 1, heldLeases: [] }, readProcs });
+  assert.equal(reads, 1, 'control: with discounting on the table is read');
+});
+
+test('a stale stored window is not shown as current: status measures afresh only when asked', async () => {
+  const { home, state } = freshEnv();
+  const old = Date.now() - 600_000;
+  atomicWriteJson(paths(state).cpuSample, { at: old, cpus: [], lastValid: { hostBusyCores: 12, cores: 10, at: old, procWindow: { rows: [row(1, 0, 0), row(4242, 1, 12)], windowMs: 1000 } } });
+  const fresh = { rows: [row(1, 0, 0), row(7777, 1, 3)], windowMs: 1000 };
+  await withEnv(home, state, async () => {
+    const quiet = await collectStatus();
+    assert.deepEqual(quiet.externalCpu.top, [], 'programmatic callers (remote-probe) never scan, and never see the old window');
+    assert.equal(quiet.externalCpu.busyCores, null);
+    const asked = await collectStatus({ scanExternal: true, scan: async () => fresh });
+    assert.deepEqual(asked.externalCpu.top.map((t) => t.pid), [7777]);
+    assert.equal(asked.externalCpu.busyCores, 3);
+  });
+});
+
+test('status external busy matches admission: 8 busy cores, all preemptible, share 0.8 -> 1.6', async () => {
+  const { home, state } = freshEnv();
+  atomicWriteJson(paths(state).cpuSample, { at: Date.now(), cpus: [], lastValid: { hostBusyCores: 8, preemptibleBusyCores: 8, cores: 10, at: Date.now(), procWindow: { rows: [row(1, 0, 0), row(4242, 1, 8)], windowMs: 1000 } } });
+  await withEnv(home, state, async () => {
+    const status = await collectStatus();
+    assert.ok(Math.abs(status.externalCpu.busyCores - 1.6) < 1e-9, `got ${status.externalCpu.busyCores}`);
   });
 });

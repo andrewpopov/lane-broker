@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { paths, atomicWriteJson, readJsonSafe } from './state.js';
-import { leasePids, readLeaseMarkers } from './preemptible.js';
+import { leasePids, readLeaseMarkers, readProcCpuRows, procSnapshot, withDeltas } from './preemptible.js';
 import { freshObservedCores, nonPreemptibleBusy } from './admission.js';
 import { parseCommandMap } from './descendants.js';
 
@@ -102,7 +102,33 @@ export function topExternalCpu({ procWindow, heldLeases = [], limit = TOP_N, rea
   });
 }
 
-/** Host cores in use that no held lease observably accounts for, as admission's `externalBusy` computes it. */
+/**
+ * Status-side window for when the sampler stored none (discounting off) or its window is old: two process-table
+ * reads `gapMs` apart. This runs only in `lane status`, outside the broker lock, never on an admission path.
+ * Null when the table cannot be read.
+ */
+export async function scanProcWindow({ readRows = readProcCpuRows, gapMs = 250, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), clock = Date.now } = {}) {
+  try {
+    const first = readRows();
+    const t0 = clock();
+    await sleep(gapMs);
+    const second = readRows();
+    return { rows: withDeltas(second, procSnapshot(first)), windowMs: clock() - t0 };
+  } catch {
+    return null;
+  }
+}
+
+/** Cores the window's non-lease processes burned (this process excluded): a direct measure of external CPU. Null when a lease tree is unknown. */
+export function windowExternalCores(procWindow, heldLeases, selfPid = process.pid) {
+  if (!procWindow?.rows || !(procWindow.windowMs > 0)) return null;
+  const members = leasePids(procWindow.rows, heldLeases);
+  if (members === null) return null;
+  const sec = procWindow.rows.reduce((sum, r) => sum + (r.deltaSec > 0 && !members.has(r.pid) && r.pid !== selfPid ? r.deltaSec : 0), 0);
+  return sec / (procWindow.windowMs / 1000);
+}
+
+/** Host cores in use that no held lease observably accounts for, as admission's `externalBusy` computes it (preemptible discount included, from the sample's stored `preemptibleBusyCores`). */
 export function externalBusyCores(cpuSample, heldLeases, cfg, now = Date.now()) {
   if (!cpuSample || !Number.isFinite(cpuSample.hostBusyCores)) return null;
   const brokerObserved = heldLeases.reduce((sum, l) => sum + (freshObservedCores(l, now) ?? 0), 0);
@@ -127,6 +153,7 @@ export function recordExternalDenial(root, cfg, cpuDecision, now) {
     }
     const prev = readJsonSafe(file);
     const continuing = Number.isFinite(prev?.since) && Number.isFinite(prev?.lastAt) && now - prev.lastAt <= starvedStaleMs(cfg);
+    if (continuing && now - prev.lastAt < cfg.sampleMs) return; // refreshed at most once per sample interval, not on every denial
     atomicWriteJson(file, { since: continuing ? prev.since : now, lastAt: now, externalBusy: external, budget: cpuDecision.budget });
   } catch {
     // best-effort

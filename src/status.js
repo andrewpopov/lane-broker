@@ -17,7 +17,7 @@ import { resolveScheduler, legacyStore, fairnessStore, effectiveView } from './f
 import { exclusiveHoldView, clampQueuedWeight } from './exclusive.js';
 import { priorityOf, effectiveRank, tierName } from './priority.js';
 import { leaseOverrun } from './observed.js';
-import { topExternalCpu, externalBusyCores, starvedForMs } from './external-cpu.js';
+import { topExternalCpu, externalBusyCores, windowExternalCores, scanProcWindow, starvedStaleMs, starvedForMs } from './external-cpu.js';
 import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores } from './resources.js';
 
 /** Holder pid of the global lock, read directly off disk — used to name the
@@ -117,16 +117,21 @@ function computeResourceBlock(root, store, cfg, head, held, now) {
 }
 
 /**
- * BRAIN-463: CPU burned outside every lease, read from the sidecar's last sampled window (status never samples).
+ * BRAIN-463: CPU burned outside every lease, read from the sidecar's last sampled window when it is fresh, else (lane status only) from a short status-side scan.
  * `top` is [] when the host was quiet, the sample carries no per-process window, or a held lease's tree is not
  * known yet (null from topExternalCpu: naming a lane's own process as external would be worse than saying nothing).
  * `starvedSinceMs` is a DURATION (like noProgressSinceMs): how long admission has been denied projected-over-budget
  * with external CPU at least STARVED_BUSY_SHARE of the budget.
  */
-function computeExternalCpu(root, cfg, lastCpuSample, held, now) {
-  const busyCores = externalBusyCores(lastCpuSample, held, cfg, now);
-  const top = (busyCores ?? 0) > 0 ? topExternalCpu({ procWindow: lastCpuSample?.procWindow, heldLeases: held }) ?? [] : [];
-  return { busyCores, top, starvedSinceMs: starvedForMs(root, cfg, now) };
+async function computeExternalCpu(root, cfg, lastCpuSample, held, now, scanExternal, scan) {
+  const fresh = Number.isFinite(lastCpuSample?.at) && now - lastCpuSample.at <= starvedStaleMs(cfg);
+  const stored = fresh ? lastCpuSample.procWindow : undefined;
+  // No usable stored window (discounting off, or the sample is old): measure one here, only when the caller asked
+  // (`lane status`), never for programmatic callers such as remote-probe.
+  const window = stored ?? (scanExternal ? await scan() : null);
+  const busyCores = stored ? externalBusyCores(lastCpuSample, held, cfg, now) : window ? windowExternalCores(window, held) : null;
+  const top = (busyCores ?? 0) > 0 ? topExternalCpu({ procWindow: window, heldLeases: held }) ?? [] : [];
+  return { busyCores, top, sampleAgeMs: stored ? now - lastCpuSample.at : window ? 0 : null, starvedSinceMs: starvedForMs(root, cfg, now) };
 }
 
 /** Report-only (BRAIN-202): five minutes without a change to a lane's own log
@@ -150,7 +155,7 @@ function logMtimeAgeMs(logPath) {
   }
 }
 
-export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
+export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false, scan = scanProcWindow } = {}) {
   const root = ensureStateDirs().root;
   const cfg = loadGlobalConfig();
   refreshCpuEstimates(cfg);
@@ -241,7 +246,7 @@ export async function collectStatus({ lockTimeoutMs = 5000 } = {}) {
   });
 
   const lastCpuSample = readJsonSafe(paths(root).cpuSample)?.lastValid ?? null;
-  const externalCpu = computeExternalCpu(root, cfg, lastCpuSample, held, now);
+  const externalCpu = await computeExternalCpu(root, cfg, lastCpuSample, held, now, scanExternal, scan);
 
   // BRAIN-319 T3b-4 (C4): an attempt still mid remote-dispatch (executor
   // 'remote') is neither a lease nor a queue entry -- `used`/`reservedCpu
@@ -408,7 +413,7 @@ export function renderStatusText(status) {
       lines.push(`host CPU: ${status.resources.hostBusyCores.toFixed(2)} busy cores, ${(status.resources.preemptibleBusyCores ?? 0).toFixed(2)} preemptible`);
     }
   }
-  if (status.externalCpu?.top.length > 0 || status.externalCpu?.starvedSinceMs != null) {
+  if (status.externalCpu && (status.externalCpu.starvedSinceMs != null || (status.externalCpu.top.length > 0 && (status.externalCpu.busyCores ?? 0) >= 1))) {
     const ex = status.externalCpu;
     lines.push(`external CPU: ${(ex.busyCores ?? 0).toFixed(2)} busy cores outside any lease${ex.top.length > 0 ? ', top process trees:' : ''}`);
     for (const t of ex.top) lines.push(`  ${t.cores.toFixed(2)} cores  pid ${t.pid}  ${t.cmd}${t.cwd ? `  (cwd ${t.cwd})` : ''}`);
@@ -562,7 +567,7 @@ function writeAndFlush(stream, text) {
 
 export async function statusCommand({ json } = {}) {
   const root = ensureStateDirs().root;
-  const status = await collectStatus();
+  const status = await collectStatus({ scanExternal: true });
 
   // The lock diagnostic goes to stderr in BOTH modes, before either branch:
   // a --json caller that only reads stdout still gets `lockError` in the
