@@ -5,6 +5,7 @@ import { sampleAndUpdateGate, readGateState } from './load.js';
 import { patchAttemptLocked, readAttempt } from './attempts.js';
 import { listLeases, readLease, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
 import { refreshCpuEstimates } from './cpu-estimates.js';
+import { recordTicketWait, pruneTicketWaits } from './ticket-wait.js';
 import { evaluateCpuAdmission, freshObservedCores, evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, writeBrokerLog, projectBusy, ticketCpuEstimate } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
 import { recordExternalDenial, clearExternalStarved } from './external-cpu.js';
@@ -1033,7 +1034,9 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // A reservation exists only while resource backfill does: when it is off, release every latch, so turning it back
     // on makes a ticket earn its reservation again.
     if (sched.v2 && !(cfg.schedulerMode === 'active' && cfg.resourceSkipLimit > 0)) store.releaseReservations();
-    store.prune(rawQueue, listRebindingIds(root));
+    const rebindingIds = listRebindingIds(root);
+    store.prune(rawQueue, rebindingIds);
+    pruneTicketWaits(root, [...rawQueue.filter(Boolean).map((t) => t.id), ...rebindingIds]);
     // Selection depends only on the queue and who currently holds a key (see below); read the holders first, since the
     // BRAIN-321 class caps are counted against what is BOOKED now.
     const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
@@ -1628,6 +1631,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
   // needs to be atomic with anything above — write it after the lock has
   // already been released, on both the admit and deny paths.
   if (logFields) logAdmissionDecision(root, logFields);
+  recordTicketWait(root, submitted.id, result);
   for (const [event, fields] of events || []) logResourceEvent(root, event, fields);
   return result;
 }

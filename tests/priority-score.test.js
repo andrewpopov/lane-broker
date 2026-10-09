@@ -10,37 +10,72 @@ const cfg = DEFAULT_GLOBAL_CONFIG;
 const ticket = (id, seq, tier, origin = 0) => ({ id, seq, priorityAdmitted: tier, prioOriginAt: origin });
 const ids = (queue) => queue.map((t) => (t === null ? null : t.id));
 
-test('defaults: score is tier plus age, one tier per 10 minutes, capped at the high-tier weight', () => {
+test('defaults: score is tier plus age, capped at 0.99 x the tier weight for a non-high until the starvation horizon', () => {
   const fresh = (tier) => score(ticket('t', 1, tier), 0, cfg);
   assert.deepEqual([fresh('low'), fresh('medium'), fresh('high')], [0, 1, 2]);
   assert.equal(score(ticket('t', 1, 'low'), 10 * MIN, cfg), 1);
-  assert.equal(score(ticket('t', 1, 'low'), 20 * MIN, cfg), 2);
+  assert.equal(score(ticket('t', 1, 'low'), 20 * MIN, cfg), 1.98, 'an aged low is held just under a fresh high');
+  assert.equal(score(ticket('t', 1, 'low'), 59 * MIN + 59_000, cfg), 1.98, 'it stays there until the horizon');
+  assert.equal(score(ticket('t', 1, 'low'), 60 * MIN, cfg), 2, 'at the horizon its ceiling rises to the tier weight');
   assert.equal(score(ticket('t', 1, 'low'), 90 * MIN, cfg), 2, 'aging stops at the ceiling');
   assert.equal(score(ticket('t', 1, 'high'), 20 * MIN, cfg), 2, 'a high never scores above the ceiling');
 });
 
-test('boundary 9:59 / 10:00 / 20:00: a low ticket reaches medium, then high, and seq decides each tie', () => {
+test('boundary 9:59 / 10:00 / 20:00: a low ticket ties a fresh medium at 10:00 but stays behind a fresh high', () => {
   const order = (nowEff, fresh) => ids(orderQueue([ticket('low', 1, 'low', 0), { ...ticket('fresh', 2, fresh, nowEff) }], nowEff, cfg));
   assert.deepEqual(order(9 * MIN + 59_000, 'medium'), ['fresh', 'low'], 'at 9:59 the low ticket is still behind a fresh medium');
   assert.deepEqual(order(10 * MIN, 'medium'), ['low', 'fresh'], 'at 10:00 it ties a fresh medium and wins on its lower seq');
   assert.deepEqual(order(19 * MIN + 59_000, 'high'), ['fresh', 'low'], 'at 19:59 it is still behind a fresh high');
-  assert.deepEqual(order(20 * MIN, 'high'), ['low', 'fresh'], 'at 20:00 it ties a fresh high and wins on its lower seq');
+  assert.deepEqual(order(20 * MIN, 'high'), ['fresh', 'low'], 'at 20:00 it is still behind a fresh high');
   const rank = (nowEff) => effectiveRank(ticket('low', 1, 'low', 0), nowEff, cfg);
-  assert.deepEqual([rank(9 * MIN + 59_000), rank(10 * MIN), rank(20 * MIN), rank(80 * MIN)], [0, 1, 2, 2], 'display rank steps once per aging period and caps at high');
+  assert.deepEqual([rank(9 * MIN + 59_000), rank(10 * MIN), rank(20 * MIN), rank(60 * MIN)], [0, 1, 1, 2], 'display rank is the score band: high only from the horizon');
 });
 
-test('the ceiling tie: a low aged 20 minutes against a fresh high is decided by seq, in either direction', () => {
+test('a fresh high orders before a low or medium aged 20, 40 and 59:59, whatever the seq', () => {
+  for (const tier of ['low', 'medium']) {
+    for (const aged of [20 * MIN, 40 * MIN, 60 * MIN - 1000]) {
+      assert.deepEqual(ids(orderQueue([ticket('old', 1, tier, 0), ticket('high', 2, 'high', aged)], aged, cfg)), ['high', 'old'], `${tier} aged ${aged}ms, lower seq`);
+      assert.deepEqual(ids(orderQueue([ticket('high', 1, 'high', aged), ticket('old', 2, tier, 0)], aged, cfg)), ['high', 'old'], `${tier} aged ${aged}ms, higher seq`);
+    }
+  }
+});
+
+test('at exactly the starvation horizon an aged low ties a fresh high and wins on lower seq; one second earlier it does not', () => {
+  const order = (nowEff) => ids(orderQueue([ticket('low', 1, 'low', 0), ticket('high', 2, 'high', nowEff)], nowEff, cfg));
+  assert.deepEqual(order(60 * MIN - 1000), ['high', 'low']);
+  assert.deepEqual(order(60 * MIN), ['low', 'high']);
+  assert.deepEqual(ids(orderQueue([ticket('high', 1, 'high', 60 * MIN), ticket('low', 2, 'low', 0)], 60 * MIN, cfg)), ['high', 'low'], 'at the tie seq decides in either direction');
+});
+
+test('a fully aged low still orders before a fresh medium; two fully aged non-highs order by seq', () => {
   const nowEff = 20 * MIN;
-  assert.deepEqual(ids(orderQueue([ticket('low', 1, 'low', 0), ticket('high', 2, 'high', nowEff)], nowEff, cfg)), ['low', 'high']);
-  assert.deepEqual(ids(orderQueue([ticket('high', 1, 'high', nowEff), ticket('low', 2, 'low', 0)], nowEff, cfg)), ['high', 'low']);
+  assert.deepEqual(ids(orderQueue([ticket('med', 1, 'medium', nowEff), ticket('low', 2, 'low', 0)], nowEff, cfg)), ['low', 'med']);
+  assert.deepEqual(ids(orderQueue([ticket('b', 2, 'medium', 0), ticket('a', 1, 'low', 0)], nowEff, cfg)), ['a', 'b']);
+  assert.deepEqual(ids(orderQueue([ticket('b', 1, 'medium', 0), ticket('a', 2, 'low', 0)], nowEff, cfg)), ['b', 'a']);
 });
 
-test('sustained high arrivals never pass an aged low that has the lowest seq', () => {
+test('effectiveRank equals the score band across tiers and ages; an aging:false or exclusive non-high never reaches rank 2', () => {
+  const W = cfg.priorityWeights.tier;
+  const band = (s) => (s >= W ? 2 : s >= W / 2 ? 1 : 0);
+  for (const tier of ['low', 'medium', 'high']) {
+    for (const age of [0, 10, 20, 59, 60, 90]) {
+      const t = ticket('t', 1, tier, 0);
+      assert.equal(effectiveRank(t, age * MIN, cfg), band(score(t, age * MIN, cfg)), `${tier} aged ${age}m`);
+    }
+  }
+  for (const flag of [{ aging: false }, { exclusive: true }]) {
+    for (const tier of ['low', 'medium']) {
+      assert.ok(effectiveRank({ ...ticket('t', 1, tier, 0), ...flag }, 90 * MIN, cfg) < 2, `${tier} ${JSON.stringify(flag)}`);
+    }
+  }
+});
+
+test('sustained high arrivals starve an aged low only until the starvation horizon', () => {
   // Two highs arrive every minute and one ticket starts every minute, so a backlog of aged highs builds up.
   let queue = [ticket('low', 1, 'low', 0)];
   let seq = 1;
   let startedLowAt = null;
-  for (let minute = 1; minute <= 40 && startedLowAt === null; minute += 1) {
+  for (let minute = 1; minute <= 90 && startedLowAt === null; minute += 1) {
     const nowEff = minute * MIN;
     for (let i = 0; i < 2; i += 1) {
       seq += 1;
@@ -50,7 +85,7 @@ test('sustained high arrivals never pass an aged low that has the lowest seq', (
     queue = rest;
     if (head.id === 'low') startedLowAt = minute;
   }
-  assert.equal(startedLowAt, 20, 'the low ticket starts the minute it reaches the ceiling, not later and not earlier');
+  assert.equal(startedLowAt, 60, 'the low ticket starts the minute it reaches the starvation horizon, not later and not earlier');
 });
 
 test('a ticket without a trustworthy origin starts at zero age; an origin ahead of the clock is not trusted', () => {

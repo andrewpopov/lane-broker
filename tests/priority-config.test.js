@@ -58,6 +58,7 @@ const REJECTED = [
   ['weights an array', { priorityWeights: [2, 2, 0] }, /priorityWeights/],
   ['weights null', { priorityWeights: null }, /priorityWeights/],
   ['tier weight zero', { priorityWeights: { tier: 0 } }, /priorityWeights\.tier/],
+  ['tier weight below 0.01', { priorityWeights: { tier: 0.001 } }, /priorityWeights\.tier/],
   ['tier weight negative', { priorityWeights: { tier: -1 } }, /priorityWeights\.tier/],
   ['tier weight above 100', { priorityWeights: { tier: 100.5, age: 100.5 } }, /priorityWeights\.tier/],
   ['tier weight not finite', { priorityWeights: { tier: 'x' } }, /priorityWeights\.tier/],
@@ -74,6 +75,10 @@ for (const [name, extra, pattern] of REJECTED) {
     assert.throws(() => loadWith(extra), (err) => err instanceof ConfigError && pattern.test(err.message));
   });
 }
+
+test('global config accepts a tier weight of exactly 0.01', () => {
+  assert.equal(loadWith({ priorityWeights: { tier: 0.01 } }).priorityWeights.tier, 0.01);
+});
 
 test('global config accepts the exact bounds, and maxQueuedHighPerRepo 0 (high disabled)', () => {
   const cfg = loadWith({

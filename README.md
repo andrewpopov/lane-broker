@@ -55,6 +55,17 @@ describes the file, not the child (a capped log stops changing while the child
 keeps writing; a quiet build looks identical to a wedged one), and never
 triggers a cancel.
 
+`lane status` says what each queued ticket is waiting on, taken from the scheduler's
+own `tryStart` outcome rather than re-derived: a line `head <id8>: waiting on <label>
+for <duration> (checked <duration> ago)` (or `no recorded wait yet`), and a
+`  waiting: <label>` suffix on each QUEUE line (`wait: { reason, label, since, at }`
+per queued entry in `--json`). The record is one file per ticket,
+`<state root>/waits/<id>.json`, written by the supervisor polling that ticket after it
+releases the lock, only when the reason changes or the record is a minute old. It is
+removed when the ticket starts or ends, and files of tickets no longer queued are
+pruned by the next admission pass; status ignores them. Telemetry only: admission
+never reads it.
+
 Everything after `--` is the command, passed as `argv` (not through a shell —
 `spawn(cmd[0], cmd.slice(1))`). Use `sh -c '...'` explicitly if you need shell
 features like pipes or globbing.
@@ -343,7 +354,7 @@ pool needs (N sim runs at once), not a test lane (which wants exactly one).
 A lane's `aging` (boolean, default `true`, ROG-2181) set to `false` stops its
 tickets accruing priority age: score and effective rank use the tier alone, so an
 old low ticket on that lane can never tie a fresh medium or high one (without it,
-aging lets a low ticket tie a fresh high after `priorityAgeMaxMs`, and the older
+aging lets a low ticket tie a fresh high after 3 x `priorityAgeMaxMs`, and the older
 ticket wins the tie). An undeclared lane resolved via `undeclaredLanes.as`
 inherits its template's `aging`. Use it for a long-running `class: "sim"` lane
 that must always queue behind test lanes. Lanes that omit it age exactly as before.
@@ -1250,11 +1261,15 @@ each queued ticket's tier plus its effective rank once it has aged a step.
 Global config (all optional): `priorityAgingMs` (integer in `[60000, 3600000]`,
 default `600000`: one tier of age per period), `priorityAgeMaxMs` (integer in
 `[priorityAgingMs, 86400000]`, default `2 x priorityAgingMs`),
-`priorityWeights` `{tier, age, fairshare}` (`tier` and `age` in `(0, 100]`,
+`priorityWeights` `{tier, age, fairshare}` (`tier` and `age` in `[0.01, 100]`,
 `age >= tier`, `fairshare` exactly `0`; defaults `2/2/0`) and
 `maxQueuedHighPerRepo` (non-negative integer, default `1`; `0` demotes every high).
-`src/priority.js` holds the pure score (`min(W_tier, W_tier*tierFactor +
-W_age*ageFactor)`) and `orderQueue`; see "Priority (ordered selection)" for where they are live.
+`src/priority.js` holds the pure score (`min(ceiling, W_tier*tierFactor +
+W_age*ageFactor)`, where the ceiling is `W_tier` for a high and `0.99 * W_tier` for a
+non-high until it has waited 3 x `priorityAgeMaxMs`, the starvation horizon, default 60 min,
+so a fresh high strictly outranks an aged medium/low until then; this is score order only,
+since reservation promotion, backfill, unreadable-record barriers and the sim-after-test rule
+can still start a non-high first) and `orderQueue`; see "Priority (ordered selection)" for where they are live.
 
 ### Priority (ordered selection, BRAIN-380 slice 2)
 
@@ -1504,7 +1519,7 @@ through the ordinary config exit-`64` path. Acquire/release hooks and their cras
 Documented limits, not bugs:
 
 - **Not a durable latch.** The head is recomputed each decision. A NEWER ticket cannot displace a queued high
-  exclusive (equal score, and the older sequence wins), but an OLDER queued medium that has aged to the ceiling, or a
+  exclusive (equal score, and the older sequence wins), but an OLDER queued medium or low that has waited past the starvation horizon (3 x `priorityAgeMaxMs`), or a
   BRAIN-346 reservation owner, can still go first.
 - **Starvation.** An explicitly `low` exclusive, or one demoted by the high cap, can starve behind sustained
   higher-priority arrivals.

@@ -15,6 +15,7 @@ import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfigOrError } from './config.js';
 import { effectiveNow } from './priority-clock.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView } from './fairness.js';
+import { readTicketWait, waitLabel } from './ticket-wait.js';
 import { exclusiveHoldView, clampQueuedWeight } from './exclusive.js';
 import { priorityOf, effectiveRank, tierName } from './priority.js';
 import { leaseOverrun } from './observed.js';
@@ -238,8 +239,10 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
   const queued = queue.map((t, i) => {
     const rank = effectiveRank(t, nowEff, cfg);
     const tier = priorityOf(t);
+    const recorded = readTicketWait(root, t.id);
     return {
       id: t.id,
+      wait: recorded ? { reason: recorded.reason, label: waitLabel(recorded.reason, recorded.detail), since: recorded.since, at: recorded.at } : null,
       key: t.key,
       position: i + 1,
       waitedMs: now - t.createdAt,
@@ -504,6 +507,16 @@ export function renderStatusText(status) {
         (rb.reserved ? ', RESERVED — nothing else is admitted past it' : ''),
     );
   }
+  if (status.queued.length > 0) {
+    const head = status.queued[0];
+    const id8 = head.id.slice(0, 8);
+    const nowMs = Date.now();
+    lines.push(
+      head.wait
+        ? `head ${id8}: waiting on ${head.wait.label} for ${fmtMs(nowMs - head.wait.since)} (checked ${fmtMs(nowMs - head.wait.at)} ago)`
+        : `head ${id8}: no recorded wait yet`,
+    );
+  }
   if (status.allocation) {
     const a = status.allocation;
     const cls = (name, c) => `${name} used ${c.used.toFixed(2)}/target ${c.target.toFixed(2)} queued ${c.queued.toFixed(2)}`;
@@ -567,7 +580,7 @@ export function renderStatusText(status) {
   } else {
     for (const q of status.queued) {
       const tier = q.priority ? `  priority=${q.priority}${q.effectiveRank ? ` (aged to ${q.effectiveRank})` : ''}` : '';
-      lines.push(`  #${q.position} ${q.id}  key=${q.key}${q.cpuEstimate ? `  cpu~${q.cpuEstimate.cores.toFixed(2)}(${q.cpuEstimate.source})` : ''}  waited=${fmtMs(q.waitedMs)}${tier}${q.reservationOwner ? '  [reservation owner]' : ''}${q.exclusive ? '  [exclusive]' : ''}`);
+      lines.push(`  #${q.position} ${q.id}  key=${q.key}${q.cpuEstimate ? `  cpu~${q.cpuEstimate.cores.toFixed(2)}(${q.cpuEstimate.source})` : ''}  waited=${fmtMs(q.waitedMs)}${tier}${q.reservationOwner ? '  [reservation owner]' : ''}${q.exclusive ? '  [exclusive]' : ''}${q.wait ? `  waiting: ${q.wait.label}` : ''}`);
     }
   }
   if (status.remote) {

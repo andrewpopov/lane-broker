@@ -127,9 +127,11 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // BRAIN-379: how long after the last sim demand (a sim ticket queued or a sim lease charged) the
   // sim soft lock stays armed.
   simArmWindowMs: 300_000,
-  // BRAIN-380: priority tiers. Each `priorityAgingMs` of waiting is worth one tier, and aging stops at
-  // `priorityAgeMaxMs` (default 2 x agingMs, derived at load when unset). Score = min(W_tier,
-  // W_tier*tierFactor + W_age*ageFactor); `fairshare` is a reserved slot and must stay 0.
+  // BRAIN-380: priority tiers; aging stops at `priorityAgeMaxMs` (default 2 x agingMs, derived at load
+  // when unset). Score = min(ceiling, W_tier*tierFactor + W_age*ageFactor). BRAIN-504: the ceiling is
+  // W_tier for a high, but W_tier*0.99 for a non-high until it has waited 3 x `priorityAgeMaxMs` (the
+  // starvation horizon), so a fresh high strictly outranks an aged medium/low until then.
+  // `fairshare` is a reserved slot and must stay 0.
   priorityAgingMs: 600_000,
   priorityAgeMaxMs: 1_200_000,
   priorityWeights: { tier: 2, age: 2, fairshare: 0 },
@@ -244,16 +246,16 @@ function validateGlobalConfig(cfg, sourcePath) {
   assert(Number.isFinite(cfg.sampleMs) && cfg.sampleMs > 0, `${sourcePath}: "sampleMs" must be a positive number`);
   assert(
     Number.isFinite(cfg.cpuClosePercent) && cfg.cpuClosePercent > 0 && cfg.cpuClosePercent <= 100,
-    `${sourcePath}: "cpuClosePercent" must be a number in (0, 100]`,
+    `${sourcePath}: "cpuClosePercent" must be a number in [0.01, 100]`,
   );
   assert(
     Number.isFinite(cfg.cpuOpenPercent) && cfg.cpuOpenPercent > 0 && cfg.cpuOpenPercent <= 100,
-    `${sourcePath}: "cpuOpenPercent" must be a number in (0, 100]`,
+    `${sourcePath}: "cpuOpenPercent" must be a number in [0.01, 100]`,
   );
   assert(cfg.cpuOpenPercent < cfg.cpuClosePercent, `${sourcePath}: "cpuOpenPercent" must be less than "cpuClosePercent"`);
   assert(
     Number.isFinite(cfg.cpuAdmissionPercent) && cfg.cpuAdmissionPercent > 0 && cfg.cpuAdmissionPercent <= 100,
-    `${sourcePath}: "cpuAdmissionPercent" must be a number in (0, 100]`,
+    `${sourcePath}: "cpuAdmissionPercent" must be a number in [0.01, 100]`,
   );
   assert(Number.isInteger(cfg.cpuOpenSamples) && cfg.cpuOpenSamples > 0, `${sourcePath}: "cpuOpenSamples" must be a positive integer`);
   assert(Number.isFinite(cfg.admissionCooldownMs) && cfg.admissionCooldownMs >= 0, `${sourcePath}: "admissionCooldownMs" must be a non-negative number`);
@@ -375,8 +377,8 @@ function validatePriorityConfig(cfg, sourcePath) {
   assert(weights && typeof weights === 'object' && !Array.isArray(weights), `${sourcePath}: "priorityWeights" must be an object`);
   for (const name of ['tier', 'age']) {
     assert(
-      Number.isFinite(weights[name]) && weights[name] > 0 && weights[name] <= 100,
-      `${sourcePath}: "priorityWeights.${name}" must be a number in (0, 100]`,
+      Number.isFinite(weights[name]) && weights[name] >= 0.01 && weights[name] <= 100,
+      `${sourcePath}: "priorityWeights.${name}" must be a number in [0.01, 100]`,
     );
   }
   assert(weights.age >= weights.tier, `${sourcePath}: "priorityWeights.age" must be >= "priorityWeights.tier" (a low ticket must be able to reach the ceiling)`);
