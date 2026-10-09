@@ -129,7 +129,7 @@ async function computeExternalCpu(root, cfg, lastCpuSample, held, now, scanExter
   // No usable stored window (discounting off, or the sample is old): measure one here, only when the caller asked
   // (`lane status`), never for programmatic callers such as remote-probe.
   const window = stored ?? (scanExternal ? await scan() : null);
-  const busyCores = stored ? externalBusyCores(lastCpuSample, held, cfg, now) : window ? windowExternalCores(window, held) : null;
+  const busyCores = stored ? externalBusyCores(lastCpuSample, held, cfg, now) : window ? windowExternalCores(window, held, cfg) : null;
   const top = (busyCores ?? 0) > 0 ? topExternalCpu({ procWindow: window, heldLeases: held }) ?? [] : [];
   return { busyCores, top, sampleAgeMs: stored ? now - lastCpuSample.at : window ? 0 : null, starvedSinceMs: starvedForMs(root, cfg, now) };
 }

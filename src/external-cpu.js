@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { paths, atomicWriteJson, readJsonSafe } from './state.js';
-import { leasePids, readLeaseMarkers, readProcCpuRows, procSnapshot, withDeltas } from './preemptible.js';
+import { leasePids, preemptibleCores, readLeaseMarkers, readProcCpuRows, procSnapshot, withDeltas } from './preemptible.js';
 import { freshObservedCores, nonPreemptibleBusy } from './admission.js';
 import { parseCommandMap } from './descendants.js';
 
@@ -119,13 +119,16 @@ export async function scanProcWindow({ readRows = readProcCpuRows, gapMs = 250, 
   }
 }
 
-/** Cores the window's non-lease processes burned (this process excluded): a direct measure of external CPU. Null when a lease tree is unknown. */
-export function windowExternalCores(procWindow, heldLeases, selfPid = process.pid) {
+/** Cores the window's non-lease processes burned (this process excluded), preemptible-discounted as admission does. Null when a lease tree is unknown. */
+export function windowExternalCores(procWindow, heldLeases, cfg, selfPid = process.pid) {
   if (!procWindow?.rows || !(procWindow.windowMs > 0)) return null;
   const members = leasePids(procWindow.rows, heldLeases);
   if (members === null) return null;
   const sec = procWindow.rows.reduce((sum, r) => sum + (r.deltaSec > 0 && !members.has(r.pid) && r.pid !== selfPid ? r.deltaSec : 0), 0);
-  return sec / (procWindow.windowMs / 1000);
+  const raw = sec / (procWindow.windowMs / 1000);
+  // the same discount admission applies (nice classification in preemptibleCores, share in nonPreemptibleBusy)
+  const preemptible = Math.min(preemptibleCores({ ...procWindow, laneNice: cfg.laneNice, niceMin: cfg.preemptibleNiceMin, heldLeases }), raw);
+  return nonPreemptibleBusy({ hostBusyCores: raw, preemptibleBusyCores: preemptible }, cfg);
 }
 
 /** Host cores in use that no held lease observably accounts for, as admission's `externalBusy` computes it (preemptible discount included, from the sample's stored `preemptibleBusyCores`). */

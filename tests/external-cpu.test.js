@@ -2,7 +2,7 @@ import test from 'node:test';
 import fs from 'node:fs';
 import assert from 'node:assert/strict';
 import { freshEnv, writeGlobalConfig } from './helpers.js';
-import { topExternalCpu, readCommands } from '../src/external-cpu.js';
+import { topExternalCpu, readCommands, windowExternalCores } from '../src/external-cpu.js';
 import { sampleHostCpu } from '../src/cpu.js';
 import { enqueue, tryStart } from '../src/scheduler.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
@@ -193,4 +193,12 @@ test('status external busy matches admission: 8 busy cores, all preemptible, sha
     const status = await collectStatus();
     assert.ok(Math.abs(status.externalCpu.busyCores - 1.6) < 1e-9, `got ${status.externalCpu.busyCores}`);
   });
+});
+
+test('fallback scan applies the preemptible discount: 8 cores at nice 10, share 0.8 -> 1.6', () => {
+  const rows = [row(1, 0, 0), { ...row(4242, 1, 8), nice: 10 }];
+  const got = windowExternalCores({ rows, windowMs: 1000 }, [], { ...DEFAULT_GLOBAL_CONFIG, laneNice: 0, preemptibleNiceMin: 1, preemptibleShare: 0.8 });
+  assert.ok(Math.abs(got - 1.6) < 1e-9, `got ${got}`);
+  const peer = windowExternalCores({ rows: [row(1, 0, 0), row(4242, 1, 8)], windowMs: 1000 }, [], { ...DEFAULT_GLOBAL_CONFIG, laneNice: 0, preemptibleNiceMin: 1, preemptibleShare: 0.8 });
+  assert.equal(peer, 8, 'a nice-0 peer counts in full');
 });
