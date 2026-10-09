@@ -11,6 +11,7 @@ import {
   entryTree,
   materializeFromStore,
   placeWorkspaces,
+  readWorkspaceTrees,
   removeWorkspaceTrees,
   publishToStore,
   touchLastUsed,
@@ -146,8 +147,8 @@ function logDepsCache(outcome, dir, ms, { key, published, reason, file, missing,
 }
 
 /** What an install in `cwd` could change outside node_modules: `cwd` itself, and the work dir's `.git` (shared by every dir). */
-function snapshotInstallSurface(cwd, workDir) {
-  const surface = snapshotOutsideNodeModules(cwd);
+function snapshotInstallSurface(cwd, workDir, workspaces) {
+  const surface = snapshotOutsideNodeModules(cwd, workspaces.map((w) => w.resolved));
   if (cwd === workDir) return surface;
   const gitDir = path.join(workDir, '.git');
   const st = fs.lstatSync(gitDir);
@@ -177,7 +178,7 @@ async function materializeHit(depsCache, key, cwd, releaseLeases, { workDir, dep
     materializeFromStore(depsCache.root, key, tree);
     const newPaths = Object.fromEntries(installPathRoles(workDir, depsEnv).map((r) => [r.role, r.path]));
     relocateRestoredTree(tree, readRelocation(depsCache.root, key), newPaths);
-    placeWorkspaces(tree, workspaces);
+    placeWorkspaces(tree, workspaces, workspaces.length > 0 ? readWorkspaceTrees(depsCache.root, key) : []);
     touchLastUsed(depsCache.root, key);
     return true;
   } catch (err) {
@@ -327,14 +328,14 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
     removeWorkspaceTrees(cwd, keyed.workspaces);
   }
 
-  const before = key ? snapshotInstallSurface(cwd, workDir) : null;
+  const before = key ? snapshotInstallSurface(cwd, workDir, keyed.workspaces) : null;
   const configBefore = key ? readTextOrNull(path.join(workDir, '.git', 'config')) : null;
   const exitCode = await runPhaseCommand(DEPS_INSTALL_ARGV, cwd, depsEnv);
   if (!key) return { exitCode, record: done('skip', { reason: keyed.reason }) };
   if (exitCode !== 0) return { exitCode, record: done('miss', { key, published: false, reason: 'install failed' }) };
 
   const configAfter = readTextOrNull(path.join(workDir, '.git', 'config'));
-  const outside = unexplainedChanges(snapshotChanges(before, snapshotInstallSurface(cwd, workDir)), { scripts: keyed.scripts, configBefore, configAfter });
+  const outside = unexplainedChanges(snapshotChanges(before, snapshotInstallSurface(cwd, workDir, keyed.workspaces)), { scripts: keyed.scripts, configBefore, configAfter });
   if (outside.length > 0) {
     const shown = outside.slice(0, 3).join(', ');
     return { exitCode, record: done('miss', { key, published: false, reason: `install changed files outside node_modules: ${shown}${outside.length > 3 ? ', ...' : ''}` }) };

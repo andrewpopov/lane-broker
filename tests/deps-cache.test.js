@@ -34,6 +34,9 @@ import {
   diffAgainstNewestEntry,
   readKeyPartsSecret,
   placeWorkspaces,
+  readWorkspaceTrees,
+  removeWorkspaceTrees,
+  assertContained,
   collectInstallPathReferences,
 } from '../src/deps-cache.js';
 import { resolveTicketConfig, loadGlobalConfig, ConfigError, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
@@ -1065,13 +1068,20 @@ test('workspace eligibility: in-repo relative links with their own lock entries 
   assert.match(lockEligibility(lockOf(workspaceLockPackages({ 'node_modules/@x/api': { resolved: '../outside/api', link: true } }))).reason, /node_modules\/@x\/api is a link/);
 });
 
-test('workspace key: the paths, lock entries and package.json dependency fields are in the key, workspace source code is not', () => {
-  const f = makeKeyFixture({ lockPackages: workspaceLockPackages() });
+/** A key fixture for `workspaceLockPackages()`: the root package.json declares `packages/*`, both workspaces exist with matching names. */
+function makeWorkspaceKeyFixture({ lockPackages = workspaceLockPackages(), scripts } = {}) {
+  const f = makeKeyFixture({ lockPackages, scripts });
+  fs.writeFileSync(path.join(f.root, 'package.json'), JSON.stringify({ name: 'a', workspaces: ['packages/*'], ...(scripts ? { scripts } : {}) }));
   for (const ws of ['api', 'shared']) {
     fs.mkdirSync(path.join(f.root, 'packages', ws), { recursive: true });
     fs.writeFileSync(path.join(f.root, 'packages', ws, 'package.json'), JSON.stringify({ name: `@x/${ws}`, version: '1.0.0', dependencies: ws === 'api' ? { dotenv: '^16.0.0' } : {} }));
     fs.writeFileSync(path.join(f.root, 'packages', ws, 'index.js'), 'module.exports = 1;');
   }
+  return f;
+}
+
+test('workspace key: the paths, lock entries and package.json dependency fields are in the key, workspace source code is not', () => {
+  const f = makeWorkspaceKeyFixture();
   const base = computeDepsKey(f.inputs());
   assert.match(base.key, /^[0-9a-f]{64}$/, base.reason);
   assert.equal(base.workspaces.length, 2);
@@ -1093,11 +1103,11 @@ test('workspace key: the paths, lock entries and package.json dependency fields 
   assert.notEqual(computeDepsKey(f.inputs()).key, base.key, 'a changed workspace lock entry changes the key');
 
   fs.rmSync(path.join(f.root, 'packages', 'shared', 'package.json'));
-  assert.match(computeDepsKey(f.inputs()).reason, /workspace packages\/shared has no readable package.json/);
+  assert.match(computeDepsKey(f.inputs()).reason, /differ from the lock's links/);
 });
 
 test('workspace key: a link that escapes the repo gives no key, with the link reason', () => {
-  const f = makeKeyFixture({ lockPackages: workspaceLockPackages({ 'node_modules/@x/api': { resolved: '../api', link: true }, '../api': { version: '1.0.0' } }) });
+  const f = makeWorkspaceKeyFixture({ lockPackages: workspaceLockPackages({ 'node_modules/@x/api': { resolved: '../api', link: true }, '../api': { version: '1.0.0' } }) });
   const result = computeDepsKey(f.inputs());
   assert.equal(result.key, null);
   assert.match(result.reason, /node_modules\/@x\/api is a link/);
@@ -1151,7 +1161,7 @@ test('workspace store: only real packages are stored (no links, no sources); a r
     fs.rmSync(path.join(dest, 'packages', ws, 'node_modules'), { recursive: true, force: true });
   }
   materializeFromStore(cacheRoot, key, path.join(dest, 'node_modules'));
-  placeWorkspaces(path.join(dest, 'node_modules'), WORKSPACES);
+  placeWorkspaces(path.join(dest, 'node_modules'), WORKSPACES, readWorkspaceTrees(cacheRoot, key));
 
   assert.equal(fs.readlinkSync(path.join(dest, 'node_modules', '@x', 'api')), '../../packages/api');
   assert.equal(fs.readlinkSync(path.join(dest, 'node_modules', '@x', 'shared')), '../../packages/shared');
@@ -1170,13 +1180,13 @@ test('workspace restore fails closed: a missing workspace dir or an existing nes
 
   const missing = tmpDir('deps-cache-ws-dest');
   materializeFromStore(cacheRoot, key, path.join(missing, 'node_modules'));
-  assert.throws(() => placeWorkspaces(path.join(missing, 'node_modules'), WORKSPACES), /ENOENT/);
+  assert.throws(() => placeWorkspaces(path.join(missing, 'node_modules'), WORKSPACES, readWorkspaceTrees(cacheRoot, key)), /ENOENT/);
 
   const occupied = tmpDir('deps-cache-ws-dest');
   for (const ws of ['api', 'shared']) fs.mkdirSync(path.join(occupied, 'packages', ws), { recursive: true });
   fs.mkdirSync(path.join(occupied, 'packages', 'api', 'node_modules'));
   materializeFromStore(cacheRoot, key, path.join(occupied, 'node_modules'));
-  assert.throws(() => placeWorkspaces(path.join(occupied, 'node_modules'), WORKSPACES), /already exists/);
+  assert.throws(() => placeWorkspaces(path.join(occupied, 'node_modules'), WORKSPACES, readWorkspaceTrees(cacheRoot, key)), /already exists/);
   assert.equal(fs.existsSync(path.join(occupied, 'packages', 'shared', 'node_modules')), false);
 });
 
@@ -1186,4 +1196,157 @@ test('workspace publish refuses a workspace link that is not the relative symlin
   fs.rmSync(path.join(src, 'node_modules', '@x', 'api'));
   fs.symlinkSync(path.join(src, 'packages', 'api'), path.join(src, 'node_modules', '@x', 'api'));
   assert.throws(() => publishToStore(cacheRoot, newKey(), path.join(src, 'node_modules'), null, null, WORKSPACES), /workspace link @x\/api/);
+});
+
+const writeWorkspaceFile = (f, rel, content) => {
+  fs.mkdirSync(path.dirname(path.join(f.root, rel)), { recursive: true });
+  fs.writeFileSync(path.join(f.root, rel), content);
+};
+
+test('workspace lifecycle: a workspace script or binding.gyp makes the dir ineligible unless the lane declares scripts safe, and then its script files are in the key', () => {
+  const f = makeWorkspaceKeyFixture();
+  const manifest = (extra) => writeWorkspaceFile(f, 'packages/api/package.json', JSON.stringify({ name: '@x/api', dependencies: { dotenv: '^16.0.0' }, ...extra }));
+  manifest({ scripts: { prepare: 'node prepare.cjs' } });
+  writeWorkspaceFile(f, 'packages/api/prepare.cjs', 'console.log("one")');
+  for (const [label, scripts] of [['prepare', { prepare: 'node prepare.cjs' }], ['postinstall', { postinstall: 'node prepare.cjs' }], ['prepublish', { prepublish: 'node prepare.cjs' }]]) {
+    manifest({ scripts });
+    const refused = computeDepsKey(f.inputs());
+    assert.equal(refused.key, null, label);
+    assert.match(refused.reason, /workspace packages\/api has lifecycle inputs/, label);
+  }
+  manifest({ scripts: { test: 'node --test' } });
+  assert.ok(computeDepsKey(f.inputs()).key, 'a non-lifecycle script does not matter');
+
+  manifest({ scripts: { prepare: 'node prepare.cjs' } });
+  const safe = () => computeDepsKey({ ...f.inputs(), rootScriptsSafe: true });
+  const base = safe().key;
+  assert.ok(base);
+  writeWorkspaceFile(f, 'packages/api/prepare.cjs', 'console.log("two")');
+  assert.notEqual(safe().key, base, 'changing the file a workspace prepare script runs is a different key');
+  writeWorkspaceFile(f, 'packages/api/prepare.cjs', 'console.log("one")');
+  assert.equal(safe().key, base);
+  manifest({ scripts: { prepare: 'node other.cjs' } });
+  assert.notEqual(safe().key, base, 'the scripts themselves are in the key');
+
+  manifest({});
+  writeWorkspaceFile(f, 'packages/api/binding.gyp', '{}');
+  assert.match(computeDepsKey(f.inputs()).reason, /binding.gyp/);
+});
+
+test('workspace discovery: the workspaces package.json selects now must equal the lock links, with unique names', () => {
+  const f = makeWorkspaceKeyFixture();
+  const base = computeDepsKey(f.inputs());
+  assert.ok(base.key, base.reason);
+
+  writeWorkspaceFile(f, 'packages/new/package.json', JSON.stringify({ name: '@x/new' }));
+  const added = computeDepsKey(f.inputs());
+  assert.equal(added.key, null, 'a workspace added without updating the lock is not a hit');
+  assert.match(added.reason, /differ from the lock's links/);
+  fs.rmSync(path.join(f.root, 'packages', 'new'), { recursive: true });
+  assert.equal(computeDepsKey(f.inputs()).key, base.key);
+
+  writeWorkspaceFile(f, 'packages/shared/package.json', JSON.stringify({ name: '@x/api' }));
+  assert.match(computeDepsKey(f.inputs()).reason, /duplicate package name|not as its package name/);
+
+  writeWorkspaceFile(f, 'packages/shared/package.json', JSON.stringify({ name: '@x/shared' }));
+  fs.writeFileSync(path.join(f.root, 'package.json'), JSON.stringify({ name: 'a', workspaces: ['packages/{api,shared}'] }));
+  assert.match(computeDepsKey(f.inputs()).reason, /not one this cache understands/);
+  fs.writeFileSync(path.join(f.root, 'package.json'), JSON.stringify({ name: 'a', workspaces: ['packages/*', '!packages/shared'] }));
+  assert.match(computeDepsKey(f.inputs()).reason, /differ from the lock's links/, 'a negated pattern removes a workspace the lock still links');
+  fs.writeFileSync(path.join(f.root, 'package.json'), JSON.stringify({ name: 'a' }));
+  assert.match(computeDepsKey(f.inputs()).reason, /differ from the lock's links/, 'links with no workspaces declared');
+});
+
+test('workspace containment: lexical variants of a workspace path are refused, and a symlinked ancestor refuses every read, move and delete', () => {
+  const lockOf = (resolved, extra = {}) => ({ lockfileVersion: 3, packages: workspaceLockPackages({ 'node_modules/@x/api': { resolved, link: true }, [resolved]: { name: '@x/api', version: '1.0.0' }, ...extra }) });
+  for (const bad of ['packages/api/', 'packages\\api', 'packages//api', './packages/api', 'packages/./api', 'packages/api/..', '', '.', '..', '/abs/api', 'packages/node_modules/api']) {
+    assert.equal(lockEligibility(lockOf(bad)).ok, false, JSON.stringify(bad));
+  }
+  const alias = lockEligibility({ lockfileVersion: 3, packages: workspaceLockPackages({ 'node_modules/@x/Shared': { resolved: 'packages/Shared', link: true }, 'packages/Shared': { name: '@x/Shared' } }) });
+  assert.equal(alias.ok, false);
+  assert.match(alias.reason, /only by case/);
+
+  const outside = tmpDir('deps-cache-outside');
+  fs.mkdirSync(path.join(outside, 'api'));
+  const work = tmpDir('deps-cache-ws-escape');
+  fs.symlinkSync(outside, path.join(work, 'packages'));
+  assert.throws(() => assertContained(work, 'packages/api'), /symlink/);
+
+  const cacheRoot = tmpDir('deps-cache-store');
+  const src = makeWorkspaceInstall();
+  const key = newKey();
+  publishToStore(cacheRoot, key, path.join(src, 'node_modules'), null, null, WORKSPACES);
+  materializeFromStore(cacheRoot, key, path.join(work, 'node_modules'));
+  assert.throws(() => placeWorkspaces(path.join(work, 'node_modules'), WORKSPACES, readWorkspaceTrees(cacheRoot, key)), /symlink/);
+  assert.deepEqual(fs.readdirSync(path.join(outside, 'api')), [], 'nothing was written outside the work dir');
+
+  fs.mkdirSync(path.join(outside, 'api', 'node_modules'));
+  removeWorkspaceTrees(work, WORKSPACES);
+  assert.equal(fs.existsSync(path.join(outside, 'api', 'node_modules')), true, 'cleanup did not delete through the symlink');
+
+  const escaping = makeWorkspaceInstall();
+  fs.rmSync(path.join(escaping, 'packages'), { recursive: true });
+  fs.symlinkSync(outside, path.join(escaping, 'packages'));
+  assert.throws(() => publishToStore(tmpDir('deps-cache-store'), newKey(), path.join(escaping, 'node_modules'), null, null, WORKSPACES), /symlink/);
+});
+
+test('workspace inventory: an unexpected nested node_modules, a missing stored tree, or no recorded inventory is a miss, never a hit', () => {
+  const cacheRoot = tmpDir('deps-cache-store');
+  const src = makeWorkspaceInstall();
+  const key = newKey();
+  publishToStore(cacheRoot, key, path.join(src, 'node_modules'), null, null, WORKSPACES);
+  assert.deepEqual(readWorkspaceTrees(cacheRoot, key), ['packages/api'], 'only api had a nested tree');
+
+  const fresh = () => {
+    const dest = tmpDir('deps-cache-ws-dest');
+    for (const ws of ['api', 'shared']) fs.mkdirSync(path.join(dest, 'packages', ws), { recursive: true });
+    materializeFromStore(cacheRoot, key, path.join(dest, 'node_modules'));
+    return dest;
+  };
+  const unexpected = fresh();
+  fs.mkdirSync(path.join(unexpected, 'packages', 'shared', 'node_modules'));
+  assert.throws(() => placeWorkspaces(path.join(unexpected, 'node_modules'), WORKSPACES, readWorkspaceTrees(cacheRoot, key)), /already exists/);
+  assert.equal(fs.existsSync(path.join(unexpected, 'packages', 'api', 'node_modules')), false, 'nothing else was moved');
+
+  const dangling = fresh();
+  fs.symlinkSync('/nonexistent', path.join(dangling, 'packages', 'shared', 'node_modules'));
+  assert.throws(() => placeWorkspaces(path.join(dangling, 'node_modules'), WORKSPACES, readWorkspaceTrees(cacheRoot, key)), /already exists/, 'even a dangling symlink');
+
+  const missing = fresh();
+  fs.rmSync(path.join(missing, 'node_modules', '.lane-workspaces', 'packages', 'api', 'node_modules'), { recursive: true });
+  assert.throws(() => placeWorkspaces(path.join(missing, 'node_modules'), WORKSPACES, readWorkspaceTrees(cacheRoot, key)), /does not match the entry's inventory/);
+
+  const bare = tmpDir('deps-cache-store');
+  const plain = makeTree(tmpDir('deps-cache-src'));
+  const plainKey = newKey();
+  publishToStore(bare, plainKey, plain);
+  assert.throws(() => readWorkspaceTrees(bare, plainKey), /no workspace inventory/);
+});
+
+test('snapshot: directory mtime changes are detected as in 0.28.2, so an atomic same-size same-mtime replacement outside node_modules shows; only exact workspace roots ignore their node_modules', () => {
+  const dir = tmpDir('deps-cache-outside');
+  fs.mkdirSync(path.join(dir, 'src'));
+  const file = path.join(dir, 'src', 'a.js');
+  fs.writeFileSync(file, 'aaaa');
+  const when = new Date('2020-01-01T00:00:00Z');
+  fs.utimesSync(file, when, when);
+  fs.utimesSync(path.join(dir, 'src'), when, when);
+  const before = snapshotOutsideNodeModules(dir);
+  fs.writeFileSync(path.join(dir, 'src', 'tmp'), 'bbbb');
+  fs.utimesSync(path.join(dir, 'src', 'tmp'), when, when);
+  fs.renameSync(path.join(dir, 'src', 'tmp'), file);
+  assert.deepEqual(snapshotChanges(before, snapshotOutsideNodeModules(dir)), ['src'], 'the parent directory changed');
+
+  fs.mkdirSync(path.join(dir, 'packages', 'api'), { recursive: true });
+  const rooted = () => snapshotOutsideNodeModules(dir, ['packages/api']);
+  const base = rooted();
+  fs.mkdirSync(path.join(dir, 'packages', 'api', 'node_modules', 'x'), { recursive: true });
+  assert.deepEqual(snapshotChanges(base, rooted()), [], 'a workspace root gaining node_modules is not an outside write');
+  fs.writeFileSync(path.join(dir, 'packages', 'api', 'generated.txt'), 'x');
+  assert.deepEqual(snapshotChanges(base, rooted()), ['packages/api', 'packages/api/generated.txt']);
+
+  fs.mkdirSync(path.join(dir, 'packages', 'other'), { recursive: true });
+  const plainBase = snapshotOutsideNodeModules(dir);
+  fs.mkdirSync(path.join(dir, 'packages', 'other', 'node_modules'));
+  assert.deepEqual(snapshotChanges(plainBase, snapshotOutsideNodeModules(dir)), ['packages/other'], 'without workspace roots the directory change is reported, exactly as before');
 });

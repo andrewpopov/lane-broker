@@ -848,11 +848,20 @@ reason.
   refused. An npm-workspace repo (BRAIN-466) is eligible: a `link: true` entry
   whose `resolved` is a plain relative path inside the repo, with a lock entry
   of its own, is accepted; one that is absolute or escapes the repo with `..`
-  is refused. The key then also covers each workspace's path, lock entry and
-  the dependency fields of its `package.json` (not its source). The store
-  holds only installed packages, never the workspace symlinks or sources: a
-  hit recreates each `node_modules/<name>` link, relative to the work dir as
-  `npm ci` makes it, and restores each workspace's own nested `node_modules`. An entry with no `resolved` is allowed only when
+  is refused, as is any path that is not plain (trailing slash, backslash,
+  `.`/`..`/empty segment, case alias) or whose real path passes through a
+  symlink (checked before every read, copy, move and delete). The
+  `workspaces` globs of the root `package.json` are re-discovered on every run
+  and must equal the lock's links exactly, with unique package names. A
+  workspace with a lifecycle script or `binding.gyp` is ineligible unless the
+  lane declares `remoteDepsCacheRootScriptsSafe`; then its scripts and the
+  digest of its whole directory join the key. The key also covers the
+  discovered set and each workspace's path, lock entry and dependency fields.
+  The store holds only installed packages, never the workspace symlinks or
+  sources, and records which workspaces had a nested `node_modules`: a hit
+  recreates each `node_modules/<name>` link (relative, as `npm ci` makes it)
+  and restores exactly those trees, and it is refused (so `npm ci` runs) if any
+  workspace already has a `node_modules` or a stored tree is missing. An entry with no `resolved` is allowed only when
   an enclosing package bundles it (the parent's `bundleDependencies`, or
   `inDepBundle`) and that parent passes the same checks; a top-level
   bundled entry gets the normal checks. Every root script `npm ci` can run
