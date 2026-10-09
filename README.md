@@ -1617,7 +1617,13 @@ cores a test needs:
 - **Fail closed.** A `classes` block that fails validation is set aside (the rest of the config still loads) and every sim is
   denied `class-config-invalid` until it is fixed; it never reads as "no caps". Any unreadable or invalid global config (a reload that fails,
   or a fresh supervisor starting on a malformed file) marks the class policy unknown the same way, rather than reading as `off` or
-  keeping stale caps. `lane status` and
+  keeping stale caps, but only on a host where classes were ever configured (a durable `classes-configured` marker in the state
+  dir, or a block in the previous config); elsewhere an unreadable config behaves as before. A config file that VANISHES after
+  a `classes` block was in force keeps the fence until a valid file returns. An inaccessible config (EACCES, an unsearchable
+  parent directory) is no longer read as "no file, use defaults": a running supervisor keeps its PREVIOUS settings (an
+  intentional difference from 0.28.x, which silently reset them), `lane status` reports `config: global config unreadable`, an
+  orphaned-remote `lane cancel` keeps the attempt and exits 1 (it cannot reach the runner), and a runner's `remote-probe` answers
+  with `configError` and `paused` so submitters skip it ("runner config unreadable"). `lane status` and
   `lane capabilities --json` show `valid: false`.
 - `lane status` prints `classes (<mode>): sim booked/cap cores, tickets, memory; test booked/budget` in `shadow` and `active`.
 

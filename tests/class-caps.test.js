@@ -15,7 +15,8 @@ import { fenceLegacyQueue } from '../src/migrate.js';
 import { detectResourceCapacity } from '../src/resources.js';
 import { orderQueue } from '../src/priority.js';
 import { childEnv, remoteSelectOptions } from '../src/supervisor.js';
-import { createAttempt, fallbackToLocal, readAttempt } from '../src/attempts.js';
+import { createAttempt, fallbackToLocal, readAttempt, patchAttemptLocked } from '../src/attempts.js';
+import { cancelCommand } from '../src/cancel.js';
 import { selectRunner } from '../src/remote-client.js';
 import { makeFakeSshBin, makeRunner, clientEnv } from './remote-harness.js';
 import { CLASS_ENFORCEMENT_ENV, resolveClasses, classTransportMismatch, classTransport } from '../src/classes.js';
@@ -731,4 +732,64 @@ test('P2: lane status keeps going on an unreadable global config and reports why
     process.env.LANE_BROKER_HOME = prev.home;
     process.env.LANE_BROKER_STATE = prev.state;
   }
+});
+
+test('P2: orphan-remote cancel with an unreadable config keeps the attempt and publishes nothing', async () => {
+  const { home, state } = freshEnv();
+  writeGlobalConfig(home, { version: 1 });
+  const id = '33333333-3333-4333-8333-333333333333';
+  await createAttempt(state, id, { runner: null });
+  patchAttemptLocked(state, id, { runner: 'skybox', supervisor: { pid: 2 ** 22 + 12345, startTime: null, bootId: 'dead' } });
+  const prev = { home: process.env.LANE_BROKER_HOME, state: process.env.LANE_BROKER_STATE };
+  Object.assign(process.env, { LANE_BROKER_HOME: home, LANE_BROKER_STATE: state });
+  try {
+    fs.chmodSync(home, 0o000);
+    let res;
+    try {
+      res = await cancelCommand(id);
+    } finally {
+      fs.chmodSync(home, 0o755);
+    }
+    assert.equal(res.exitCode, 1);
+    assert.ok(readAttempt(state, id), 'the attempt is kept');
+    assert.equal(fs.existsSync(path.join(paths(state).results, `${id}.json`)), false, 'no cancelled result was published');
+  } finally {
+    fs.chmodSync(home, 0o755);
+    process.env.LANE_BROKER_HOME = prev.home;
+    process.env.LANE_BROKER_STATE = prev.state;
+  }
+});
+
+test('P2: a required lane always carries its class, even when the submitter has no active caps; the runner compares against it', () => {
+  const none = resolveClasses(DEFAULT_GLOBAL_CONFIG, '/x');
+  assert.deepEqual(classTransport({ class: 'sim', classEnforcement: 'required' }, none), { laneClass: 'sim', classEnforcement: 'required' });
+  assert.deepEqual(classTransport({ class: 'test', classEnforcement: 'required' }, none), { laneClass: 'test', classEnforcement: 'required' });
+  assert.deepEqual(classTransport({ class: 'sim' }, none), { laneClass: undefined, classEnforcement: undefined }, 'a legacy lane is unchanged');
+  assert.match(classTransportMismatch({ laneClass: 'sim', classEnforcement: 'required' }, { lane: 'x', class: 'test', classEnforcement: 'required' }), /sim lane on the submitter/);
+});
+
+test('P2: a runner with an unreadable config answers its probe but is skipped by the submitter', async () => {
+  const { home, state, env } = freshEnv();
+  writeGlobalConfig(home, { version: 1 });
+  fs.chmodSync(home, 0o000);
+  let probe;
+  try {
+    const res = spawnSync(process.execPath, [BIN, 'remote-probe'], { env, encoding: 'utf8' });
+    assert.equal(res.status, 0, res.stderr);
+    probe = JSON.parse(res.stdout.trim());
+  } finally {
+    fs.chmodSync(home, 0o755);
+  }
+  assert.match(probe.configError, /unreadable/);
+  assert.equal(probe.paused, true);
+  const { binDir } = makeFakeSshBin();
+  const bin = path.join(binDir, 'ssh-badcfg');
+  fs.writeFileSync(bin, `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(JSON.stringify(probe))} + '\\n');\nprocess.exit(0);\n`);
+  fs.chmodSync(bin, 0o755);
+  const { env: cenv } = clientEnv(binDir);
+  const runners = [makeRunner({ ssh: 'normal' })];
+  const picked = await selectRunner(runners, { sshBin: bin, env: cenv, deadlineMs: 3000 });
+  assert.equal(picked.runner, null);
+  assert.match(picked.skipped[0].reason, /runner config unreadable/);
+  void state;
 });

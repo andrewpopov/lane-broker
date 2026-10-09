@@ -100,9 +100,13 @@ async function cancelAttempt(root, id, attempt) {
   // ORPHANED-REMOTE: reconcile directly, no supervisor left to do it.
   writeCancelMarkerFile(root, id);
   const { config: globalCfg, error: configError } = loadGlobalConfigOrError();
-  if (configError) process.stderr.write(`lane cancel: global config unreadable (${configError}); reconciling with defaults\n`);
   // BRAIN-436: a move that was in flight may have left the ticket on either runner, so every runner it names is cancelled.
   const involved = [...new Set([attempt.runner, attempt.moving?.from, attempt.moving?.to].filter(Boolean))];
+  // BRAIN-321: with the config unreadable the runner cannot be reached, so "cancelled" must not be published nor the attempt deleted.
+  if (configError && involved.length > 0) {
+    process.stderr.write(`lane cancel: cannot confirm remote cancel: global config unreadable (${configError}); attempt kept\n`);
+    return { exitCode: 1 };
+  }
   const unconfirmed = [];
   for (const name of involved) {
     const runnerCfg = (globalCfg.runners || []).find((r) => r.name === name);

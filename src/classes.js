@@ -92,10 +92,10 @@ export function smallestSimGrant(ticket, cfg, host) {
   return { cores: Number.isFinite(min) ? Math.min(declared.cpuCores, Math.ceil(min)) : declared.cpuCores, memoryBytes: declared.memoryBytes };
 }
 
-/** What a dispatch carries of the lane's class: the sim class only under active caps, enforcement only where the lane requires it. */
+/** What a dispatch carries of the lane's class: the sim class under active caps, and always for a lane that requires enforcement (with `classEnforcement`). */
 export function classTransport(ticket, classes) {
   return {
-    laneClass: classes.mode === 'active' && classes.valid && ticket.class === 'sim' ? 'sim' : undefined,
+    laneClass: classes.mode === 'active' && classes.valid && ticket.class === 'sim' ? 'sim' : isEnforcementRequired(ticket) ? (ticket.class === 'sim' ? 'sim' : 'test') : undefined,
     classEnforcement: isEnforcementRequired(ticket) ? 'required' : undefined,
   };
 }

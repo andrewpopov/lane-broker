@@ -258,6 +258,10 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason: `runner does not advertise ${missing.join(', ')} (required by the lane)` });
       continue;
     }
+    if (probe.configError) {
+      skipped.push({ name: runner.name, reason: `runner config unreadable: ${probe.configError}` });
+      continue;
+    }
     if (probe.draining) {
       skipped.push({ name: runner.name, reason: 'draining' });
       continue;
@@ -833,7 +837,7 @@ export async function dispatchRemote(opts) {
   if (Number.isFinite(minCpuCores)) header.minCpuCores = minCpuCores;
   if (Number.isInteger(queueTimeoutMs) && queueTimeoutMs > 0) header.queueTimeoutMs = queueTimeoutMs;
   if (Number.isInteger(noProgressTimeoutMs) && noProgressTimeoutMs >= 0) header.noProgressTimeoutMs = noProgressTimeoutMs;
-  if (laneClass === 'sim') header.laneClass = 'sim';
+  if (laneClass === 'sim' || laneClass === 'test') header.laneClass = laneClass;
   if (classEnforcement === 'required') header.classEnforcement = 'required';
   if (isPriorityTier(priorityRequested)) header.priorityRequested = priorityRequested;
   if (Number.isInteger(priorityAccruedMs) && priorityAccruedMs >= 0) header.priorityAccruedMs = priorityAccruedMs;
