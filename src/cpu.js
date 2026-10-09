@@ -140,6 +140,39 @@ function countersUnchanged(prev, snapshot) {
 }
 
 /**
+ * BRAIN-506: one host-counter window and one process window, measured by sleeping `gapMs` between two reads. Unlike
+ * sampleHostCpu it writes nothing, so it can never move admission's baseline in cpu-sample.json. Null when the counters
+ * cannot give a valid delta; `procWindow` is null when the process table is unreadable (nothing then counts as preemptible).
+ */
+export async function measureHostCpuReadOnly({ readCpus = os.cpus, readRows = readProcCpuRows, gapMs = 250, sleep = (ms) => new Promise((r) => setTimeout(r, ms)), clock = Date.now } = {}) {
+  try {
+    const firstCpus = readCpus();
+    const first = { at: clock(), cpus: firstCpus.map(cpuTimes) };
+    let firstRows = null;
+    try {
+      firstRows = readRows();
+    } catch {
+      firstRows = null;
+    }
+    await sleep(gapMs);
+    const second = { at: clock(), cpus: readCpus().map(cpuTimes) };
+    let secondRows = null;
+    try {
+      secondRows = readRows();
+    } catch {
+      secondRows = null;
+    }
+    const { hostBusyCores, stale } = computeBusyCores(first, second);
+    if (stale || !Number.isFinite(hostBusyCores)) return null;
+    const cores = detectResourceCapacity({ parallelism: firstCpus.length }).cpuCores;
+    const procWindow = firstRows && secondRows ? { rows: withDeltas(secondRows, procSnapshot(firstRows)), windowMs: second.at - first.at } : null;
+    return { hostBusyCores: Math.min(hostBusyCores, cores), cores, procWindow };
+  } catch {
+    return null;
+  }
+}
+
+/**
  * `preemptible` (BRAIN-428, src/preemptible.js): `{ laneNice, niceMin, heldLeases }`, absent = nothing preemptible.
  * The per-process readings ride in the same sidecar as the host counters, so both deltas cover the SAME window.
  */

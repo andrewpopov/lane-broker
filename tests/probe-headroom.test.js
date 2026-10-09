@@ -1,57 +1,102 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { probeHeadroom, remoteProbeCommand } from '../src/remote-runner.js';
+import { probeHeadroom, probeCpuHeadroom, remoteProbeCommand } from '../src/remote-runner.js';
+import { evaluateCpuAdmission } from '../src/admission.js';
+import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { freshEnv, writeGlobalConfig } from './helpers.js';
 import { paths, atomicWriteJson } from '../src/state.js';
-import { externalBusyCores } from '../src/external-cpu.js';
 
-// BRAIN-506: the probe's free CPU must agree with this runner's own admission measure.
-const cfg = { memoryReserveBytes: 0, preemptibleNiceMin: 10, preemptibleShare: 0.8 };
-const resources = { cpuBudgetCores: 14.4, reservedCpuCores: 8, availableMemoryBytes: 8e9 };
+// BRAIN-506: the probe's free CPU is admission's own projection, not a parallel estimate.
+const cfg = { ...DEFAULT_GLOBAL_CONFIG, cpuAdmissionPercent: 75, cpuReserveCores: 1, laneNice: 10, preemptibleNiceMin: 1, preemptibleShare: 0.8 };
+const CORES = 16;
+const BUDGET = 12; // min(0.75 * 16, 16 - 1)
+const row = (pid, nice, deltaSec) => ({ pid, ppid: 1, pgid: pid, nice, token: `t${pid}`, deltaSec });
+const window = (...rows) => ({ rows: [row(1, 0, 0), ...rows], windowMs: 1000 });
+const measuring = (hostBusyCores, procWindow = null) => async () => ({ hostBusyCores, cores: CORES, procWindow });
+const never = async () => assert.fail('a fresh stored sample must not be re-measured');
+const headroom = async (root, held, measure, now = Date.now()) => probeCpuHeadroom(root, cfg, held, { now, measure });
 
-test('a runner loaded with preemptible processes reports positive headroom', () => {
-  // loadavg 20.5 would read as zero headroom; 11 of 14 busy cores are niced sims, so only 20% of those count
-  const external = externalBusyCores({ hostBusyCores: 14, preemptibleBusyCores: 11 }, [], cfg); // 14 - 0.8 * 11 = 5.2
-  const room = probeHeadroom(resources, cfg, true, 20.5, external);
-  assert.ok(room.cpuCores > 0);
-  assert.ok(Math.abs(room.cpuCores - (14.4 - 8 - 5.2)) < 1e-9);
+test('a runner loaded with preemptible processes reports positive headroom', async () => {
+  const { state } = freshEnv();
+  // 14 busy cores, 11 of them niced sims (nice 15 > laneNice 10): 14 - 0.8 * 11 = 5.2 counts
+  const got = await headroom(state, [], measuring(14, window(row(4242, 15, 11))));
+  assert.ok(got > 0);
+  assert.ok(Math.abs(got - (BUDGET - 5.2)) < 1e-9, `got ${got}`);
 });
 
-test('a runner loaded with non-preemptible processes still reports zero headroom', () => {
-  const external = externalBusyCores({ hostBusyCores: 20, preemptibleBusyCores: 0 }, [], cfg);
-  assert.equal(probeHeadroom(resources, cfg, true, 20.5, external).cpuCores, 0);
+test('a runner loaded with non-preemptible processes still reports zero headroom', async () => {
+  const { state } = freshEnv();
+  assert.equal(await headroom(state, [], measuring(20, window(row(4242, 0, 20)))), 0);
 });
 
-test('with no CPU sample the probe falls back to loadavg', () => {
-  assert.equal(probeHeadroom(resources, cfg, true, 20.5, null).cpuCores, 0);
-  assert.ok(Math.abs(probeHeadroom(resources, cfg, true, 3, null).cpuCores - 6.4) < 1e-9);
-  assert.ok(Math.abs(probeHeadroom(resources, cfg, true, 3).cpuCores - 6.4) < 1e-9);
+test('with no CPU sample the probe falls back to loadavg', async () => {
+  const { state } = freshEnv();
+  assert.equal(await headroom(state, [], async () => null), null);
+  const resources = { cpuBudgetCores: 14.4, reservedCpuCores: 8, availableMemoryBytes: 8e9 };
+  const fallback = { memoryReserveBytes: 0 };
+  assert.equal(probeHeadroom(resources, fallback, true, 20.5, null).cpuCores, 0);
+  assert.ok(Math.abs(probeHeadroom(resources, fallback, true, 3, null).cpuCores - 6.4) < 1e-9);
+  assert.ok(Math.abs(probeHeadroom(resources, fallback, true, 3).cpuCores - 6.4) < 1e-9);
+});
+
+test('(a) a lease reserving 2 but observing 8 gives the headroom admission computes', async () => {
+  const { state } = freshEnv();
+  const now = Date.now();
+  const lease = { id: 'lease-a', key: 'k:a', weight: 2, resources: { cpuCores: 2 }, observedCpuCores: 8, observedAt: now };
+  const got = await headroom(state, [lease], measuring(8), now);
+  const decision = evaluateCpuAdmission({ cpuSample: { hostBusyCores: 8, preemptibleBusyCores: 0, cores: CORES }, heldLeases: [lease], candidateWeight: 1, candidateResources: { cpuCores: 1 }, cpuGateState: { closed: false }, cooldownBlocked: false, cfg, now });
+  assert.equal(got, decision.budget - (decision.projectedBusy - decision.candidateEstimate));
+  assert.equal(got, 4);
+  assert.notEqual(got, BUDGET - 2, 'reserved cores (2) would show 6 phantom free cores');
+  // an unobserved lease is charged its booking on top of the host busy baseline, exactly as admission charges it
+  const unobserved = { id: 'lease-b', key: 'k:b', weight: 2, resources: { cpuCores: 2 } };
+  const gotUnobserved = await headroom(state, [unobserved], measuring(8), now);
+  const decisionUnobserved = evaluateCpuAdmission({ cpuSample: { hostBusyCores: 8, preemptibleBusyCores: 0, cores: CORES }, heldLeases: [unobserved], candidateWeight: 1, candidateResources: { cpuCores: 1 }, cpuGateState: { closed: false }, cooldownBlocked: false, cfg, now });
+  assert.equal(gotUnobserved, decisionUnobserved.budget - (decisionUnobserved.projectedBusy - decisionUnobserved.candidateEstimate));
+  assert.equal(gotUnobserved, 2);
+});
+
+test('(b) a partial process table never reports more room than the host counters allow', async () => {
+  const { state } = freshEnv();
+  // host says 10 busy; the table only showed one 2-core sim (the rest unreadable, new or exited)
+  const partial = await headroom(state, [], measuring(10, window(row(4242, 15, 2))));
+  assert.ok(Math.abs(partial - (BUDGET - (10 - 0.8 * 2))) < 1e-9, `got ${partial}`);
+  const none = await headroom(state, [], measuring(10, window()));
+  assert.equal(none, BUDGET - 10);
+  const full = await headroom(state, [], measuring(10, window(row(4242, 15, 8))));
+  assert.ok(partial <= full && none <= partial);
+});
+
+test('(c) a stored discount computed for another candidate nice does not leak', async () => {
+  const { state } = freshEnv();
+  const now = Date.now();
+  // stored for a nice-0 candidate: the nice-5 sim counted as 11 preemptible cores. A default remote ticket runs at laneNice 10, so it is not preemptible.
+  atomicWriteJson(paths(state).cpuSample, { at: now, cpus: [], lastValid: { hostBusyCores: 12, preemptibleBusyCores: 11, cores: CORES, at: now, procWindow: window(row(4242, 5, 11)) } });
+  assert.equal(await headroom(state, [], never, now), 0);
 });
 
 test('remote-probe on an idle runner with a stale sample measures a window and reports headroom', async () => {
   const { home, state } = freshEnv();
-  writeGlobalConfig(home, { version: 1, schedulerMode: 'active', cpuReserveCores: 1, cpuAdmissionPercent: 100, preemptibleNiceMin: 1, preemptibleShare: 0.8 });
+  writeGlobalConfig(home, { version: 1, schedulerMode: 'active', cpuReserveCores: 1, cpuAdmissionPercent: 75, preemptibleNiceMin: 1, preemptibleShare: 0.8 });
   const old = Date.now() - 600_000;
-  atomicWriteJson(paths(state).cpuSample, { at: old, cpus: [], lastValid: { hostBusyCores: 99, cores: 10, at: old } });
-  const sims = (cores, nice) => ({ rows: [{ pid: 1, ppid: 0, pgid: 1, nice: 0, token: 't1', deltaSec: 0 }, { pid: 4242, ppid: 1, pgid: 4242, nice, token: 't4242', deltaSec: cores }], windowMs: 1000 });
-  const probe = async (window) => {
+  atomicWriteJson(paths(state).cpuSample, { at: old, cpus: [], lastValid: { hostBusyCores: 99, cores: CORES, at: old } });
+  const probe = async (measure) => {
     const prev = { home: process.env.LANE_BROKER_HOME, state: process.env.LANE_BROKER_STATE, write: process.stdout.write };
     process.env.LANE_BROKER_HOME = home;
     process.env.LANE_BROKER_STATE = state;
     let out = '';
     process.stdout.write = (chunk) => { out += chunk; return true; };
     try {
-      await remoteProbeCommand({ root: path.join(state, 'remote'), scan: async () => window });
+      await remoteProbeCommand({ root: path.join(state, 'remote'), measure });
     } finally {
       process.stdout.write = prev.write;
       for (const [k, v] of [['LANE_BROKER_HOME', prev.home], ['LANE_BROKER_STATE', prev.state]]) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     }
     return JSON.parse(out);
   };
-  const niced = await probe(sims(6, 15)); // 6 niced cores count as 1.2
-  const hot = await probe(sims(6, 0)); // 6 nice-0 cores count in full
-  const budget = niced.capacity.cpuCores;
-  assert.ok(Math.abs(niced.headroom.cpuCores - (budget - 1.2)) < 1e-9, `niced headroom ${niced.headroom.cpuCores} of budget ${budget}`);
-  assert.ok(Math.abs(hot.headroom.cpuCores - Math.max(0, budget - 6)) < 1e-9);
+  const niced = await probe(measuring(6, window(row(4242, 15, 6)))); // 6 - 0.8 * 6 = 1.2 counts
+  const hot = await probe(measuring(6, window(row(4242, 0, 6)))); // all 6 count
+  assert.ok(Math.abs(niced.headroom.cpuCores - (BUDGET - 1.2)) < 1e-9, `niced headroom ${niced.headroom.cpuCores}`);
+  assert.ok(Math.abs(hot.headroom.cpuCores - (BUDGET - 6)) < 1e-9);
 });

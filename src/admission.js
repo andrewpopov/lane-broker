@@ -252,6 +252,18 @@ export function nonPreemptibleBusy(cpuSample, cfg) {
   return Math.max(0, cpuSample.hostBusyCores - share * preemptible);
 }
 
+/** What admission sees of the host before any candidate: CPU burned outside every lease (preemptible-discounted, minus what the leases observably use) and the budget. */
+export function hostCpuLoad(cpuSample, heldLeases, cfg, now = Date.now()) {
+  const brokerObserved = heldLeases.reduce((sum, l) => sum + (freshObservedCores(l, now) ?? 0), 0);
+  return { externalBusy: Math.max(0, nonPreemptibleBusy(cpuSample, cfg) - brokerObserved), budget: cpuBudget(cpuSample, cfg) };
+}
+
+/** BRAIN-506: the cores a zero-claim candidate would still fit, by admission's own projection (the runner's headroom probe reports this). */
+export function cpuHeadroomCores(cpuSample, heldLeases, cfg, now = Date.now()) {
+  const { externalBusy, budget } = hostCpuLoad(cpuSample, heldLeases, cfg, now);
+  return Math.max(0, budget - projectBusy(externalBusy, heldLeases, 0, now, cfg, budget));
+}
+
 export const KNOWN_BIAS_NOTE = 'self-subtracted-when-observed';
 
 /**
@@ -308,9 +320,7 @@ export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, c
     return { admit: false, reason: 'sample-unavailable-held', externalBusy: null, projectedBusy: null, budget: null };
   }
 
-  const brokerObserved = heldLeases.reduce((sum, l) => sum + (freshObservedCores(l, now) ?? 0), 0);
-  const externalBusy = Math.max(0, nonPreemptibleBusy(cpuSample, cfg) - brokerObserved);
-  const budget = cpuBudget(cpuSample, cfg);
+  const { externalBusy, budget } = hostCpuLoad(cpuSample, heldLeases, cfg, now);
   const { cores: candidateEstimate, source: candidateEstimateSource } = cpuEstimateBasis(candidateRef, candidateResources?.cpuCores ?? candidateWeight, cfg, now, heldLeases.length > 0 ? budget : undefined);
   const projectedBusy = projectBusy(externalBusy, heldLeases, candidateEstimate, now, cfg, budget);
   const leaseCharges = heldLeases.map((l) => ({ id: l.id, ...leaseDemandBasis(l, now, cfg, budget) }));
