@@ -164,6 +164,37 @@ last sample, and the admission log line carries `preemptibleBusy=` beside
 `hostBusyCores=` and `externalBusy=` whenever it is non-zero. `LANE_BROKER_CPU_BUSY_FILE` accepts an
 optional third field, `hostBusy,cores,preemptibleBusy`.
 
+**Reading status: external CPU (BRAIN-463).** When `host CPU` is high but few slots
+are used, `lane status` names the culprit instead of leaving you to trace `ps`:
+
+```
+external CPU: 12.00 busy cores outside any lease, top process trees:
+  4.10 cores  pid 4821  xargs -P4 -n1 node --test  (cwd /work/tree)
+admission starved by external CPU for 3h12m
+```
+
+The list is the top 5 process trees outside every held lease, ranked by cores over
+the last sample window. A tree is reported against its topmost ancestor that is
+not init/launchd, a shell or a terminal (so `zsh -> xargs -> timeout -> node
+--test` with four workers is one entry with the summed cores). Lease trees, lease
+supervisors, the status process and kernel threads are excluded; if a held lease's
+tree is not known yet the list is empty rather than guessed. It reads the
+per-process window the CPU sampler already stores (`cpu-sample.json`), so status
+runs no extra scan, plus one command lookup for the few pids shown. `cwd` appears on
+Linux only (`/proc/<pid>/cwd`); on macOS `lsof` costs seconds, so it is omitted. The
+window is as old as the last admission poll, so an idle broker shows an old picture.
+
+`admission starved by external CPU for <duration>` appears while admission denials
+are `projected-over-budget` and external busy is at least 25% of the CPU budget. The
+start is kept in `external-starved.json`, refreshed by each such denial, cleared by
+any admission or by a denial the lanes themselves explain, and ignored once it has
+gone unrefreshed for `max(30s, 6 * sampleMs)`.
+
+`lane status --json` carries `externalCpu: { busyCores, top: [{ pid, cores, cmd,
+cwd? }], starvedSinceMs | null }` (`starvedSinceMs` is a duration in ms, like
+`noProgressSinceMs`). Exporting it as a metric and alerting on it is a zirkbot
+(ops/worker-stats) follow-up and not done here.
+
 `settledDemandEnabled` (default `true`): once a lease is settled (admitted at
 least `settledDemandSettleMs`, default 120000, ago, with a fresh observation
 and at least two observations in the last `settledDemandWindowMs`, default
