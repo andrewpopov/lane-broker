@@ -24,7 +24,9 @@ const heldLease = (id, weight) => ({ id, key: `r:${id}`, bootId: bootId(), super
 test('waitLabel: every reason has its label, and an unknown reason is returned raw', () => {
   const cases = [
     ['capacity', { runningWeight: 7, capacity: 10 }, 'weight (7/10 slots in use)'],
-    ['cpu-admission', { cpuReason: 'projected-over-budget', projectedBusy: 5.456, budget: 4 }, 'CPU budget (projected-over-budget: projected 5.46 > budget 4.00 cores)'],
+    ['cpu-admission', { cpuReason: 'projected-over-budget', projectedBusy: 5.456, budget: 4 }, 'CPU budget (projected 5.46 > budget 4.00 cores)'],
+    ['cpu-admission', { cpuReason: 'cooldown', projectedBusy: 2, budget: 8 }, 'CPU admission (cooldown)'],
+    ['cpu-admission', { cpuReason: 'sample-unavailable', projectedBusy: null, budget: null }, 'CPU admission (sample-unavailable)'],
     ['memory-admission', { memoryReason: 'insufficient-memory' }, 'memory budget (insufficient-memory)'],
     ['load-gate-closed', { load: 12.5 }, 'the load gate (load 12.5)'],
     ['memory-critical', { macPressure: 'critical' }, 'memory pressure (critical)'],
@@ -118,6 +120,17 @@ test('refresh: an unchanged reason is not rewritten inside ADMISSION_LOG_REFRESH
   assert.equal(rec.since, 1000, 'since survives the refresh');
   recordTicketWait(state, 't', { started: false, reason: 'paused', pauseReason: 'x' }, 1001);
   assert.equal(readTicketWait(state, 't').reason, 'paused', 'a changed reason writes immediately');
+});
+
+test('a changed sub-reason under the same reason (over budget -> cooldown) is a new wait: written at once, since reset', () => {
+  const { state } = freshEnv();
+  recordTicketWait(state, 't', { started: false, reason: 'cpu-admission', cpuReason: 'projected-over-budget', projectedBusy: 12, budget: 10 }, 1000);
+  recordTicketWait(state, 't', { started: false, reason: 'cpu-admission', cpuReason: 'projected-over-budget', projectedBusy: 13, budget: 10 }, 2000);
+  assert.equal(readTicketWait(state, 't').at, 1000, 'a numeric change alone is throttled');
+  recordTicketWait(state, 't', { started: false, reason: 'cpu-admission', cpuReason: 'cooldown', projectedBusy: 3, budget: 10 }, 3000);
+  const rec = readTicketWait(state, 't');
+  assert.equal(rec.detail.cpuReason, 'cooldown');
+  assert.equal(rec.since, 3000, 'the new cause starts its own wait');
 });
 
 test('a write failure never throws', () => {

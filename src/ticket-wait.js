@@ -14,6 +14,14 @@ const ENDED = new Set(['withdrawn', 'queue-timeout', 'cancelled']);
 
 const waitFile = (root, id) => path.join(paths(root).waits, `${id}.json`);
 
+/**
+ * The categorical sub-reason a wait is keyed on besides `reason` (a CPU wait that turns from over-budget into a cooldown is a
+ * new wait, not the same one); numeric details such as the projected load are not part of it, so they never reset `since`.
+ */
+function causeOf(result) {
+  return [result.cpuReason, result.memoryReason, result.capReason, result.key, result.pauseReason].filter((v) => v != null).join('/') || null;
+}
+
 /** The record's `detail`: the result's own fields minus `started` and `reason`. */
 function detailOf(result) {
   const { started, reason, ...detail } = result;
@@ -44,11 +52,13 @@ export function recordTicketWait(root, ticketId, result, now = Date.now()) {
       return;
     }
     const previous = readTicketWait(root, ticketId);
-    const sameReason = previous?.reason === result.reason;
+    const cause = causeOf(result);
+    const sameReason = previous?.reason === result.reason && previous?.cause === cause;
     if (sameReason && Number.isFinite(previous.at) && now - previous.at < ADMISSION_LOG_REFRESH_MS) return;
     atomicWriteJson(waitFile(root, ticketId), {
       ticketId,
       reason: result.reason,
+      cause,
       detail: detailOf(result),
       since: sameReason && Number.isFinite(previous.since) ? previous.since : now,
       at: now,
@@ -80,7 +90,9 @@ export function waitLabel(reason, detail = {}) {
     case 'capacity':
       return `weight (${detail.runningWeight}/${detail.capacity} slots in use)`;
     case 'cpu-admission':
-      return `CPU budget (${detail.cpuReason}: projected ${num2(detail.projectedBusy)} > budget ${num2(detail.budget)} cores)`;
+      return detail.cpuReason === 'projected-over-budget'
+        ? `CPU budget (projected ${num2(detail.projectedBusy)} > budget ${num2(detail.budget)} cores)`
+        : `CPU admission (${detail.cpuReason})`;
     case 'memory-admission':
       return `memory budget (${detail.memoryReason})`;
     case 'load-gate-closed':
