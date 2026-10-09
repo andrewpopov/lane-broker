@@ -470,6 +470,8 @@ export async function runCommand({
     weight,
     resources,
     nice,
+    // BRAIN-506: only the lane's own override; a remote ticket runs at it, else at the RUNNER's laneNice (never this host's), which the runner-room check needs to know
+    ...(resolved.nice !== undefined && resolved.nice !== null ? { niceOverride: resolved.nice } : {}),
     // BRAIN-431: a remote runner's value is the submitter's own resolved one, never this host's config
     noProgressTimeoutMs: noProgressTimeoutOverride ?? resolved.noProgressTimeoutMs ?? globalCfg.noProgressTimeoutMs,
     maxConcurrent: resolved.maxConcurrent,

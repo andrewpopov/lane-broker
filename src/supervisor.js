@@ -481,6 +481,7 @@ export function remoteSelectOptions(enriched, globalCfg) {
       cpuCores: enriched.resources.cpuCores,
       minCpuCores: enriched.resources.minCpuCores,
       memoryBytes: enriched.resources.memoryBytes,
+      niceOverride: enriched.niceOverride,
     },
   };
 }

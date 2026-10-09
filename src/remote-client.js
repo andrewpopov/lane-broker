@@ -128,6 +128,12 @@ function cpuNeedOf(reservation, probe) {
 export function runnerRoom(reservation, probe) {
   const headroom = probe.headroom && typeof probe.headroom === 'object' ? probe.headroom : null;
   let cpuFree = headroom && Number.isFinite(headroom.cpuCores) ? headroom.cpuCores : null;
+  // BRAIN-506: the probe discounted preemptible load at `headroom.laneNice`; a lane whose own nice override is higher is discounted less by
+  // the runner's admission, so it is judged on the undiscounted figure. With no override the ticket runs at the runner's laneNice (the discounted figure);
+  // a runner without the fields is judged as before.
+  if (cpuFree !== null && Number.isFinite(headroom.laneNice) && Number.isFinite(headroom.cpuCoresUndiscounted) && Number.isInteger(reservation.niceOverride) && reservation.niceOverride > headroom.laneNice) {
+    cpuFree = headroom.cpuCoresUndiscounted;
+  }
   if (cpuFree === null && Number.isFinite(probe.capacity?.cpuCores) && Number.isFinite(probe.reservedCpuCores)) {
     cpuFree = Math.max(0, probe.capacity.cpuCores - probe.reservedCpuCores);
   }

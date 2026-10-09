@@ -716,10 +716,14 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
  */
 export function probeHeadroom(resources, cfg, enforced, loadAvg1 = os.loadavg()[0], cpuHeadroom = null) {
   if (!enforced || !resources) return null;
+  const measured = cpuHeadroom && Number.isFinite(cpuHeadroom.cpuCores);
   const reserved = Number.isFinite(resources.reservedCpuCores) ? resources.reservedCpuCores : 0;
-  const cpuCores = Number.isFinite(cpuHeadroom) ? Math.max(0, cpuHeadroom) : Math.max(0, resources.cpuBudgetCores - Math.max(reserved, Number.isFinite(loadAvg1) ? loadAvg1 : 0));
+  const cpuCores = measured ? Math.max(0, cpuHeadroom.cpuCores) : Math.max(0, resources.cpuBudgetCores - Math.max(reserved, Number.isFinite(loadAvg1) ? loadAvg1 : 0));
   return {
     cpuCores,
+    // BRAIN-506: the nice the discount assumed, and the same projection with no discount, so a client whose ticket runs at a higher nice
+    // than laneNice (which admission would discount less) can judge room without the discount. Absent when CPU was not measured.
+    ...(measured ? { laneNice: cfg.laneNice, cpuCoresUndiscounted: Math.max(0, cpuHeadroom.cpuCoresUndiscounted) } : {}),
     memoryBytes: Number.isFinite(resources.availableMemoryBytes) ? Math.max(0, resources.availableMemoryBytes - cfg.memoryReserveBytes) : null,
   };
 }
@@ -729,17 +733,18 @@ export function probeHeadroom(resources, cfg, enforced, loadAvg1 = os.loadavg()[
  * (admission.js cpuHeadroomCores): host busy counters, the preemptible discount recomputed at cfg.laneNice (the default a
  * remote ticket runs at; the stored discount belongs to whichever candidate was sampled last), held leases charged by
  * leaseDemand. The sample is the supervisor's when fresh (an idle runner has no polling supervisor, so it goes stale) else
- * `measure`, a read-only window that never writes cpu-sample.json. Null when no host-counter sample exists.
+ * `measure`, a read-only window that never writes cpu-sample.json. Null when no host-counter sample exists. Returns the discounted and the undiscounted figure.
  */
-export async function probeCpuHeadroom(root, cfg, heldLeases, { now = Date.now(), measure = measureHostCpuReadOnly } = {}) {
+export async function probeCpuHeadroom(root, cfg, heldLeases, { now = Date.now(), measure = measureHostCpuReadOnly, capacityCores = detectResourceCapacity().cpuCores } = {}) {
   const stored = readJsonSafe(paths(root).cpuSample)?.lastValid;
-  const storedFresh = Number.isFinite(stored?.at) && now - stored.at <= starvedStaleMs(cfg) && Number.isFinite(stored.hostBusyCores) && stored.cores > 0;
+  const storedFresh = Number.isFinite(stored?.at) && now - stored.at <= starvedStaleMs(cfg) && Number.isFinite(stored.hostBusyCores) && stored.cores === capacityCores; // the supervisor's own guard: a sample taken at another capacity is not reused
   const base = storedFresh ? stored : await measure();
   if (!base || !Number.isFinite(base.hostBusyCores)) return null;
   const discountable = base.procWindow && cfg.preemptibleNiceMin > 0;
   // a partial process table can only shrink the discount; the busy baseline is always the host counters
   const preemptible = discountable ? Math.min(preemptibleCores({ ...base.procWindow, laneNice: cfg.laneNice, niceMin: cfg.preemptibleNiceMin, heldLeases }), base.hostBusyCores) : 0;
-  return cpuHeadroomCores({ hostBusyCores: base.hostBusyCores, preemptibleBusyCores: preemptible, cores: base.cores }, heldLeases, cfg, now);
+  const headroomAt = (preemptibleBusyCores) => cpuHeadroomCores({ hostBusyCores: base.hostBusyCores, preemptibleBusyCores, cores: base.cores }, heldLeases, cfg, now);
+  return { cpuCores: headroomAt(preemptible), cpuCoresUndiscounted: headroomAt(0) };
 }
 
 /** `lane remote-probe`: one JSON line describing this host's local broker,

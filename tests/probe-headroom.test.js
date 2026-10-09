@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import { runnerRoom } from '../src/remote-client.js';
 import { probeHeadroom, probeCpuHeadroom, remoteProbeCommand } from '../src/remote-runner.js';
 import { evaluateCpuAdmission } from '../src/admission.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
@@ -15,7 +16,8 @@ const row = (pid, nice, deltaSec) => ({ pid, ppid: 1, pgid: pid, nice, token: `t
 const window = (...rows) => ({ rows: [row(1, 0, 0), ...rows], windowMs: 1000 });
 const measuring = (hostBusyCores, procWindow = null) => async () => ({ hostBusyCores, cores: CORES, procWindow });
 const never = async () => assert.fail('a fresh stored sample must not be re-measured');
-const headroom = async (root, held, measure, now = Date.now()) => probeCpuHeadroom(root, cfg, held, { now, measure });
+const headroomBoth = async (root, held, measure, now = Date.now(), capacityCores = CORES) => probeCpuHeadroom(root, cfg, held, { now, measure, capacityCores });
+const headroom = async (root, held, measure, now, capacityCores) => (await headroomBoth(root, held, measure, now, capacityCores))?.cpuCores ?? null;
 
 test('a runner loaded with preemptible processes reports positive headroom', async () => {
   const { state } = freshEnv();
@@ -99,4 +101,50 @@ test('remote-probe on an idle runner with a stale sample measures a window and r
   const hot = await probe(measuring(6, window(row(4242, 0, 6)))); // all 6 count
   assert.ok(Math.abs(niced.headroom.cpuCores - (BUDGET - 1.2)) < 1e-9, `niced headroom ${niced.headroom.cpuCores}`);
   assert.ok(Math.abs(hot.headroom.cpuCores - (BUDGET - 6)) < 1e-9);
+});
+
+test('(d) a lane nice override above headroom.laneNice is judged on the undiscounted figure', async () => {
+  const { state } = freshEnv();
+  const both = await headroomBoth(state, [], measuring(14, window(row(4242, 15, 11)))); // discounted 6.8, undiscounted 12 - 14 -> 0
+  assert.ok(Math.abs(both.cpuCores - 6.8) < 1e-9);
+  assert.equal(both.cpuCoresUndiscounted, 0);
+  const probe = { headroom: probeHeadroom({ cpuBudgetCores: BUDGET, reservedCpuCores: 0 }, cfg, true, 0, both) };
+  assert.equal(probe.headroom.laneNice, 10);
+  const need = { cpuCores: 2 };
+  assert.equal(runnerRoom({ ...need, niceOverride: 10 }, probe).room, true, 'at laneNice: discounted figure');
+  assert.equal(runnerRoom({ ...need, niceOverride: 0 }, probe).room, true, 'below laneNice: discounted figure');
+  assert.equal(runnerRoom({ ...need, niceOverride: 15 }, probe).room, false, 'above laneNice: undiscounted figure');
+  assert.equal(runnerRoom(need, probe).room, true, 'no override: the ticket runs at the runner laneNice, discounted figure');
+});
+
+test('(e) a probe from a runner without the new fields behaves as before, and an old client ignores them', () => {
+  const old = { headroom: { cpuCores: 3, memoryBytes: 1e9 } };
+  assert.equal(runnerRoom({ cpuCores: 2, niceOverride: 19 }, old).room, true);
+  assert.equal(runnerRoom({ cpuCores: 4, niceOverride: 19 }, old).room, false);
+  const fresh = probeHeadroom({ cpuBudgetCores: BUDGET, reservedCpuCores: 0, availableMemoryBytes: 1e9 }, { ...cfg, memoryReserveBytes: 0 }, true, 0, { cpuCores: 3, cpuCoresUndiscounted: 1 });
+  // an old client reads only cpuCores and memoryBytes
+  assert.equal(fresh.cpuCores, 3);
+  assert.equal(fresh.memoryBytes, 1e9);
+  assert.equal(probeHeadroom({ cpuBudgetCores: BUDGET, reservedCpuCores: 0 }, cfg, true, 0, null).laneNice, undefined, 'unmeasured CPU adds no fields');
+});
+
+test('(f) a stored sample taken at another capacity is not used', async () => {
+  const { state } = freshEnv();
+  const now = Date.now();
+  atomicWriteJson(paths(state).cpuSample, { at: now, cpus: [], lastValid: { hostBusyCores: 12, preemptibleBusyCores: 0, cores: CORES, at: now } });
+  assert.equal(await headroom(state, [], never, now, CORES), 0, 'same capacity: stored sample used');
+  let measured = false;
+  const got = await headroom(state, [], async () => { measured = true; return { hostBusyCores: 2, cores: 8, procWindow: null }; }, now, 8);
+  assert.equal(measured, true);
+  assert.equal(got, 4, 'measured at the shrunken capacity 8: budget min(6, 7) - 2');
+});
+
+test('(g) the submitter global laneNice never travels: no lane override is judged at the runner laneNice', async () => {
+  const { state } = freshEnv();
+  const runnerCfg = { ...cfg, laneNice: 0 }; // wintop
+  const both = await probeCpuHeadroom(state, runnerCfg, [], { measure: measuring(14, window(row(4242, 15, 11))), capacityCores: CORES });
+  const probe = { headroom: probeHeadroom({ cpuBudgetCores: BUDGET, reservedCpuCores: 0 }, runnerCfg, true, 0, both) };
+  assert.equal(probe.headroom.laneNice, 0);
+  assert.equal(runnerRoom({ cpuCores: 2 }, probe).room, true, 'no lane override (submitter nice 10 is not sent): discounted figure');
+  assert.equal(runnerRoom({ cpuCores: 2, niceOverride: 15 }, probe).room, false, 'lane override 15 > runner laneNice 0: undiscounted figure');
 });
