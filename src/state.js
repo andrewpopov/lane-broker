@@ -55,6 +55,8 @@ export function paths(root = stateHome()) {
     expire: path.join(root, 'expire'),
     // BRAIN-436: a runner-side withdraw marker (see `writeWithdrawMarkerFile`).
     withdraw: path.join(root, 'withdraw'),
+    // BRAIN-504: what each queued ticket is waiting on, one file per ticket (src/ticket-wait.js).
+    waits: path.join(root, 'waits'),
     history: path.join(root, 'history.jsonl'),
     pause: path.join(root, 'PAUSE'),
     lock: path.join(root, 'lock'),

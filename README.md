@@ -55,6 +55,17 @@ describes the file, not the child (a capped log stops changing while the child
 keeps writing; a quiet build looks identical to a wedged one), and never
 triggers a cancel.
 
+`lane status` says what each queued ticket is waiting on, taken from the scheduler's
+own `tryStart` outcome rather than re-derived: a line `head <id8>: waiting on <label>
+for <duration> (checked <duration> ago)` (or `no recorded wait yet`), and a
+`  waiting: <label>` suffix on each QUEUE line (`wait: { reason, label, since, at }`
+per queued entry in `--json`). The record is one file per ticket,
+`<state root>/waits/<id>.json`, written by the supervisor polling that ticket after it
+releases the lock, only when the reason changes or the record is a minute old. It is
+removed when the ticket starts or ends, and files of tickets no longer queued are
+pruned by the next admission pass; status ignores them. Telemetry only: admission
+never reads it.
+
 Everything after `--` is the command, passed as `argv` (not through a shell —
 `spawn(cmd[0], cmd.slice(1))`). Use `sh -c '...'` explicitly if you need shell
 features like pipes or globbing.
