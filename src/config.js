@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { paths, stateHome } from './state.js';
 import { isCanonicalRelPath } from './remote-manifest.js';
 import { unsupportedHookKeys, hookRefusalMessage } from './exclusive.js';
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
@@ -178,6 +179,53 @@ function assert(cond, msg) {
 }
 
 export class ConfigError extends Error {}
+
+/** A broken `classes` block (thrown by validateClasses; loadGlobalConfig turns it into `classesInvalid`). */
+export class ClassesConfigError extends ConfigError {}
+
+export const CLASS_MODES = ['off', 'shadow', 'active'];
+const CLASSES_KEYS = ['mode', 'test', 'sim'];
+const CLASSES_TEST_KEYS = ['reserveCores'];
+const CLASSES_SIM_KEYS = ['capCores', 'maxTickets', 'capMemoryBytes'];
+
+/**
+ * BRAIN-321: the per-machine, per-class reservation caps. Absent = today's behaviour. `shadow` and `active` need every
+ * number spelled out: a cap that silently defaults is a cap the operator never chose. Unknown keys are refused (a typo'd
+ * cap must not read as "no cap").
+ */
+export function validateClasses(classes, sourcePath) {
+  const fail = (msg) => {
+    throw new ClassesConfigError(`${sourcePath}: "classes" ${msg}`);
+  };
+  const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+  if (!isObject(classes)) fail('must be an object');
+  for (const key of Object.keys(classes)) if (!CLASSES_KEYS.includes(key)) fail(`has unknown key "${key}"`);
+  if (!CLASS_MODES.includes(classes.mode)) fail(`"mode" must be one of ${CLASS_MODES.join(', ')}`);
+  const needed = classes.mode !== 'off';
+  const group = (name, allowed, check) => {
+    const value = classes[name];
+    if (value === undefined) {
+      if (needed) fail(`"${name}" is required when mode is "${classes.mode}"`);
+      return;
+    }
+    if (!isObject(value)) fail(`"${name}" must be an object`);
+    for (const key of Object.keys(value)) if (!allowed.includes(key)) fail(`"${name}" has unknown key "${key}"`);
+    for (const key of allowed) {
+      if (value[key] === undefined) {
+        if (needed) fail(`"${name}.${key}" is required when mode is "${classes.mode}"`);
+      } else check(key, value[key]);
+    }
+  };
+  const nonNegative = (name) => (key, v) => {
+    if (!(Number.isFinite(v) && v >= 0)) fail(`"${name}.${key}" must be a non-negative number`);
+  };
+  group('test', CLASSES_TEST_KEYS, nonNegative('test'));
+  group('sim', CLASSES_SIM_KEYS, (key, v) => {
+    if (key === 'maxTickets' ? !(Number.isInteger(v) && v >= 0) : !(Number.isFinite(v) && v >= 0)) {
+      fail(`"sim.${key}" must be a non-negative ${key === 'maxTickets' ? 'integer' : 'number'}`);
+    }
+  });
+}
 
 // A retention below a day could expire a tombstone while its submitter's dispatch is still in flight (see src/gc.js).
 const MIN_RETENTION_MS = 86_400_000;
@@ -511,6 +559,9 @@ function validateRepoConfig(cfg, sourcePath) {
     }
     // BRAIN-403: hooks are host-only and not supported yet; a lane carrying them is refused rather than silently ignored
     assertNoHookKeys(lane, `${sourcePath}: lane "${name}"`);
+    if (lane.classEnforcement !== undefined) {
+      assert(lane.classEnforcement === 'required', `${sourcePath}: lane "${name}".classEnforcement must be "required"`);
+    }
     if (lane.maxConcurrent !== undefined) {
       assert(
         Number.isInteger(lane.maxConcurrent) && lane.maxConcurrent >= 1,
@@ -610,10 +661,21 @@ export function resolvePriority({ cli, env, configTier, exclusive = false }) {
 export function loadGlobalConfig() {
   const home = brokerHome();
   const file = path.join(home, 'config.json');
-  if (!fs.existsSync(file)) return { ...DEFAULT_GLOBAL_CONFIG };
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (err) {
+    // BRAIN-321: only a genuinely ABSENT file is "no config". An inaccessible one (EACCES, a parent dir we cannot enter, ...) leaves the
+    // class policy unknown (`ConfigError`), and a file that disappeared after a `classes` block was in force keeps the fence; either way sims are denied.
+    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
+      return classesFenceHeld() ? { ...DEFAULT_GLOBAL_CONFIG, classesInvalid: `${file} is gone but a classes block was in force; restore it (or remove ${paths(stateHome()).classesConfigured})` } : { ...DEFAULT_GLOBAL_CONFIG };
+    }
+    // thrown, so `reloadGlobalConfig` keeps the PREVIOUS config's other settings (capacity, reserves, runners) and marks only the class policy invalid
+    throw new ConfigError(`${file}: unreadable (${err.code ?? err.message})`);
+  }
   let parsed;
   try {
-    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    parsed = JSON.parse(text);
   } catch (err) {
     throw new ConfigError(`${file}: invalid JSON (${err.message})`);
   }
@@ -626,7 +688,35 @@ export function loadGlobalConfig() {
     cfg.priorityAgeMaxMs = 2 * cfg.priorityAgingMs;
   }
   validateGlobalConfig(cfg, file);
+  // BRAIN-321: a broken `classes` block must not take the whole config (and every lane) down with it, nor read as "no caps":
+  // it is set aside and the sim class is ineligible until it is fixed (see resolveClasses).
+  if (cfg.classes !== undefined) {
+    try {
+      validateClasses(cfg.classes, file);
+    } catch (err) {
+      if (!(err instanceof ClassesConfigError)) throw err;
+      delete cfg.classes;
+      cfg.classesInvalid = err.message;
+    }
+  }
+  setClassesFence(cfg.classes !== undefined || cfg.classesInvalid !== undefined);
   return cfg;
+}
+
+const classesFenceFile = () => paths(stateHome()).classesConfigured;
+const classesFenceHeld = () => fs.existsSync(classesFenceFile());
+
+/** Durably record (in the broker's state dir) whether a config with a `classes` block has been loaded; written only on change. */
+function setClassesFence(inForce) {
+  if (inForce === classesFenceHeld()) return;
+  try {
+    if (inForce) {
+      fs.mkdirSync(path.dirname(classesFenceFile()), { recursive: true });
+      fs.writeFileSync(classesFenceFile(), `${new Date().toISOString()}\n`);
+    } else fs.rmSync(classesFenceFile(), { force: true });
+  } catch {
+    // an unwritable state dir cannot hold a fence; admission fails there on its own
+  }
 }
 
 /**
@@ -640,13 +730,34 @@ export function loadGlobalConfig() {
  * any read/parse/validation failure here falls back to `previous` (or
  * `DEFAULT_GLOBAL_CONFIG` if there is no previous yet) instead of throwing.
  */
+/**
+ * `loadGlobalConfig` for a caller that must not die on an unreadable or invalid config: `{config, error}`, where `config` is the
+ * defaults (class policy marked unknown only where classes were ever configured) and `error` the reason, else null.
+ */
+export function loadGlobalConfigOrError() {
+  try {
+    return { config: loadGlobalConfig(), error: null };
+  } catch (err) {
+    if (!(err instanceof ConfigError)) throw err;
+    return { config: withClassPolicyUnknown({ ...DEFAULT_GLOBAL_CONFIG }, err.message), error: err.message };
+  }
+}
+
+/** A config that could not be (re)read leaves the class policy unknown ONLY where classes were ever configured; elsewhere it is 0.28.2 behaviour. */
+function withClassPolicyUnknown(cfg, reason) {
+  return cfg.classes !== undefined || cfg.classesInvalid !== undefined || classesFenceHeld() ? { ...cfg, classesInvalid: reason } : cfg;
+}
+
 export function reloadGlobalConfig(previous, { onError } = {}) {
   const fallback = previous === undefined ? { ...DEFAULT_GLOBAL_CONFIG } : previous;
   try {
     return loadGlobalConfig();
   } catch (err) {
     if (onError) onError(err);
-    return fallback;
+    // BRAIN-321: an unreadable or invalid config leaves the class policy UNKNOWN wherever classes were ever configured (the durable
+    // marker, or a block in the previous config): a fresh supervisor must not read it as "off" and admit sims, nor keep old caps. The fallback keeps everything else but marks the
+    // sim class ineligible until a good reload.
+    return withClassPolicyUnknown(fallback, err.message);
   }
 }
 
@@ -890,6 +1001,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       class: templateCfg.class,
       priority: templateCfg.priority,
       aging: templateCfg.aging,
+      classEnforcement: templateCfg.classEnforcement,
     };
   } else {
     laneCfg = { weight: DEFAULT_REPO_CONFIG.lanes.default.weight };
@@ -936,6 +1048,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     aging: laneCfg.aging !== false,
     // BRAIN-403: never inherited through an undeclaredLanes template (the template literal above does not copy it)
     exclusive: laneCfg.exclusive === true,
+    // BRAIN-321: "required" = granted only under live class caps (`classes.mode` active and valid); absent for every other lane
+    ...(laneCfg.classEnforcement === 'required' ? { classEnforcement: 'required' } : {}),
     conflicts,
     // BRAIN-319 T3a: opt-in per lane, defaulted false so a repo config
     // written before this field exists resolves identically (I6).

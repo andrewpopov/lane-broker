@@ -5,20 +5,21 @@ import { listLeases, reapAll, LEASE_STATE } from './lease.js';
 import { listQueueCapped, reapOrphanedQueue, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState, readResourceSkipState, futileFresh } from './scheduler.js';
 import { refreshCpuEstimates } from './cpu-estimates.js';
 import { cpuBudget, projectBusy, ticketCpuEstimate, ticketCpuEstimateBasis } from './admission.js';
-import { classLocks, simArmed, usedByClass } from './allocation.js';
+import { classLocks, classOf, simArmed, usedByClass } from './allocation.js';
+import { resolveClasses, bookedSims, classQueuePolicy } from './classes.js';
 import { queuedClaimsByClass } from './allocation-shadow.js';
 import { readLastSimDemandAt } from './sim-arm.js';
 import { listAttempts, supervisorAlive, moveInterruptedLabel } from './attempts.js';
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
-import { loadGlobalConfig } from './config.js';
+import { loadGlobalConfigOrError } from './config.js';
 import { effectiveNow } from './priority-clock.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView } from './fairness.js';
 import { exclusiveHoldView, clampQueuedWeight } from './exclusive.js';
 import { priorityOf, effectiveRank, tierName } from './priority.js';
 import { leaseOverrun } from './observed.js';
 import { topExternalCpu, externalBusyCores, windowExternalCores, scanProcWindow, starvedStaleMs, starvedForMs } from './external-cpu.js';
-import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores } from './resources.js';
+import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores, cpuBudgetCores } from './resources.js';
 
 /** Holder pid of the global lock, read directly off disk — used to name the
  *  holder in the "couldn't take the lock" diagnostic without re-taking it. */
@@ -157,7 +158,7 @@ function logMtimeAgeMs(logPath) {
 
 export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false, scan = scanProcWindow } = {}) {
   const root = ensureStateDirs().root;
-  const cfg = loadGlobalConfig();
+  const { config: cfg, error: configError } = loadGlobalConfigOrError();
   refreshCpuEstimates(cfg);
   let lockError = null;
   try {
@@ -227,7 +228,13 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
   // a valid scheduler fence the broker runs the legacy FIFO scheduler, so the queue below
   // stays FIFO and the rank is informational: what the ticket's age would be worth.
   const nowEff = effectiveNow(root, now);
-  const { queue, ownerId: reservationOwnerId } = sched.v2 ? effectiveView(rawQueue, nowEff, cfg, store) : { queue: rawQueue, ownerId: null };
+  // BRAIN-321: the same class policy admission uses, so the head, the reservation owner and the blocking reports agree with it.
+  // A sim the caps forbid to start leaves the order (as in admission) and is listed after it, tagged with why.
+  const classPolicy = classQueuePolicy(rawQueue, resolveClasses(cfg, root), held, resourceCapacity, cfg);
+  const { queue: fullQueue, ownerId: reservationOwnerId } = sched.v2
+    ? effectiveView(rawQueue, nowEff, cfg, store, classPolicy.eligible, { simsAfterTests: classPolicy.simsAfterTests })
+    : { queue: rawQueue, ownerId: null };
+  const queue = [...fullQueue.filter((t) => t === null || classPolicy.eligible(t)), ...fullQueue.filter((t) => t !== null && !classPolicy.eligible(t))];
   const queued = queue.map((t, i) => {
     const rank = effectiveRank(t, nowEff, cfg);
     const tier = priorityOf(t);
@@ -238,6 +245,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       waitedMs: now - t.createdAt,
       priority: tier,
       ...(t.id === reservationOwnerId ? { reservationOwner: true } : {}),
+      ...(classPolicy.capEnforced.has(t.id) ? { classDenied: classPolicy.capEnforced.get(t.id) } : {}),
       ...(t.exclusive === true ? { exclusive: true } : {}),
       ...(tierName(rank) !== tier ? { effectiveRank: tierName(rank) } : {}),
       resources: leaseResources(t, cfg),
@@ -296,12 +304,14 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     draining,
     exclusiveHold: exclusiveHoldView(queue, held),
     priority: sched.v2 ? { active: true, mode: 'v2', nowEff, reservationOwner: reservationOwnerId } : { active: false, mode: 'legacy', nowEff },
+    classes: computeClasses(cfg, root, held, resourceCapacity),
     ...(cfg.allocationShadow ? { allocation: computeAllocation(root, cfg, queue.filter(Boolean), held, resourceCapacity.cpuCores, now) } : {}),
     // BRAIN-249: null unless the queue is genuinely stalled (a conflict-
     // blocked head whose skip allowance is exhausted) — see computeHeadBlock.
     headBlock: computeHeadBlock(root, store, cfg, queue, leases, now, effectiveWeightCapacity(cfg, resourceCapacity.cpuCores)),
     // BRAIN-346: the projected-over-budget head's backfill allowance / reservation, if any.
     resourceBlock: computeResourceBlock(root, store, cfg, queue[0], held, now),
+    ...(configError ? { configError } : {}),
     configWarning: configWarning ? { message: configWarning.message, firstAt: configWarning.firstAt, lastAt: configWarning.lastAt } : null,
     loadGate: {
       closed: gate.closed,
@@ -346,6 +356,24 @@ function computeAllocation(root, cfg, queue, held, cpuCores, now) {
   const armed = simArmed({ now, lastSimDemandAt, simQueued: queued.sim > 0, simCharged: held.some((l) => l.class === 'sim'), simArmWindowMs: cfg.simArmWindowMs });
   const target = classLocks({ B, armed });
   return { shadow: true, budgetCores: B, armed, lastSimDemandAt, test: { used: used.test, target: target.L_t, queued: queued.test }, sim: { used: used.sim, target: target.L_s, queued: queued.sim } };
+}
+
+/** BRAIN-321: the work-class caps and what is booked against them; null with no `classes` block (or an off one) and nothing wrong. */
+function computeClasses(cfg, root, held, host) {
+  const classes = resolveClasses(cfg, root);
+  if (classes.mode === 'off' && classes.valid) return null;
+  const B = cpuBudgetCores(host, cfg);
+  const booked = bookedSims(held, cfg);
+  const testHeld = held.filter((l) => classOf(l) === 'test');
+  const testBooked = testHeld.reduce((sum, l) => sum + (leaseResources(l, cfg).cpuCores || 0), 0);
+  return {
+    mode: classes.mode,
+    valid: classes.valid,
+    ...(classes.valid ? {} : { error: classes.error }),
+    configHash: classes.configHash,
+    sim: { bookedCores: booked.cores, capCores: classes.sim?.capCores ?? null, tickets: booked.count, maxTickets: classes.sim?.maxTickets ?? null, bookedMemoryBytes: booked.memoryBytes, capMemoryBytes: classes.sim?.capMemoryBytes ?? null },
+    test: { bookedCores: testBooked, reserveCores: classes.test?.reserveCores ?? null, budgetCores: B },
+  };
 }
 
 /** BRAIN-360: shown only when admission granted less CPU than the lane declared. */
@@ -481,6 +509,14 @@ export function renderStatusText(status) {
     const cls = (name, c) => `${name} used ${c.used.toFixed(2)}/target ${c.target.toFixed(2)} queued ${c.queued.toFixed(2)}`;
     lines.push(`allocation (shadow): ${cls('test', a.test)}; ${cls('sim', a.sim)}; sims ${a.armed ? 'armed' : 'unarmed'}`);
   }
+  if (status.classes) {
+    const c = status.classes;
+    lines.push(
+      c.valid
+        ? `classes (${c.mode}): sim ${c.sim.bookedCores}/${c.sim.capCores} cores, ${c.sim.tickets}/${c.sim.maxTickets} tickets, ${fmtMB(c.sim.bookedMemoryBytes)}/${fmtMB(c.sim.capMemoryBytes)}; test ${c.test.bookedCores}/${c.test.budgetCores.toFixed(2)} cores (${c.test.reserveCores} reserved from sims)`
+        : `classes: INVALID (${c.error}); no sim is granted`,
+    );
+  }
   lines.push(renderMemoryLine(status.memory));
   if (status.priority && !status.priority.active) {
     lines.push('priority: inactive (legacy scheduler; run lane migrate-scheduler)');
@@ -499,6 +535,7 @@ export function renderStatusText(status) {
     lines.push(`HOLD (exclusive) ${h.id} (${h.key}) waiting for ${h.waitingFor} running lane(s)`);
   }
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
+  if (status.configError) lines.push(`config: global config unreadable: ${status.configError}`);
   if (status.configWarning) {
     lines.push(
       `config: WARNING — some supervisor(s) cannot read the global config and are running on their last known-good ` +

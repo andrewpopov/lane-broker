@@ -337,6 +337,29 @@ test('a protocol-2 header with remoteDeps whose dir has a shrinkwrap alongside t
   assert.equal(fs.existsSync(markerFile), false, 'the command must never have run');
 });
 
+// BRAIN-321: an unreadable runner global config must not kill protocol-2 intake mid-flight: a refused result, exit 64, cleaned up.
+test('protocol-2 intake with an unreadable global config publishes a refused result (exit 64) and never runs the command', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const markerFile = path.join(tmpDir('remote-exec-marker'), 'marker');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ protocol: 2, argv: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(markerFile)}, '1')`] });
+  fs.writeFileSync(path.join(env.LANE_BROKER_HOME, 'config.json'), JSON.stringify({ version: 1 }));
+  fs.chmodSync(env.LANE_BROKER_HOME, 0o000);
+  try {
+    const { code } = await runOne(header, entries, { env, root, src });
+    assert.equal(code, 0);
+    fs.chmodSync(env.LANE_BROKER_HOME, 0o755);
+    const result = await getResult(header.ticketId, root, env);
+    assert.equal(result.kind, 'refused');
+    assert.equal(result.exit, 64);
+    assert.match(result.reason, /unreadable/);
+    assert.equal(fs.existsSync(markerFile), false);
+  } finally {
+    fs.chmodSync(env.LANE_BROKER_HOME, 0o755);
+  }
+});
+
 // BRAIN-320 S1b: a plain protocol-2 header (no remoteDeps/remoteSetup) still
 // runs the caller's argv, through the pipeline, ending at phase "command".
 test('a plain protocol-2 header (no remoteDeps/remoteSetup) runs the command and reports phase command', async () => {

@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
 import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
-import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, loadGlobalConfig } from './config.js';
+import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
 import { CAPABILITIES } from './capabilities.js';
 import { NO_PROGRESS_REASON } from './no-progress.js';
 import { artifactLimitsOf, collectArtifacts, encodeArtifacts, pruneStaleArtifacts } from './remote-artifacts.js';
@@ -185,6 +185,9 @@ function validateHeaderFields(header) {
   if (header.remoteArtifactsOn !== undefined && !REMOTE_ARTIFACTS_ON.includes(header.remoteArtifactsOn)) {
     return { ok: false, reason: 'invalid remoteArtifactsOn' };
   }
+  // BRAIN-321: additive; an older submitter sends neither, an older runner ignores both
+  if (header.laneClass !== undefined && header.laneClass !== 'sim' && header.laneClass !== 'test') return { ok: false, reason: 'invalid laneClass' };
+  if (header.classEnforcement !== undefined && header.classEnforcement !== 'required') return { ok: false, reason: 'invalid classEnforcement' };
   return { ok: true };
 }
 
@@ -525,7 +528,13 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   let pipelineCmd = header.argv;
   if (header.protocol === 2) {
     const remoteRootAbs = path.resolve(root);
-    const runnerCfg = loadGlobalConfig();
+    const { config: runnerCfg, error: configError } = loadGlobalConfigOrError();
+    if (configError) {
+      writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'refused', exit: 64, reason: `runner global config unreadable: ${configError}` }));
+      process.stderr.write(`lane remote-exec: runner global config unreadable: ${configError}\n`);
+      cleanupWork(workDir, tmpDir);
+      return { exitCode: 0 };
+    }
     atomicWriteJson(path.join(ticketDir, 'pipeline.json'), {
       workDir,
       relCwd: header.relCwd || '',
@@ -557,6 +566,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     // BRAIN-380 §6: priority comes ONLY from the validated header, never this shell's LANE_BROKER_PRIORITY. The tier is
     // what the submitter asked for; this runner's own enqueue applies its own cap. The accrued wait is anchored on this
     // runner's own priority clock in runCommand, so the submitter's timestamps are never read.
+    expectClass: { laneClass: header.laneClass, classEnforcement: header.classEnforcement },
     priority: remotePriority.priority,
     priorityAccruedMs: remotePriority.accruedMs,
     weightOverride: header.weight,
@@ -722,7 +732,9 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot() } = {}) {
   // host's budget, not current load) and reuses the broker's own
   // capacity/budget math -- never re-derived here -- so the client's fit
   // check (1e) agrees with what admission would actually apply.
-  const globalCfg = loadGlobalConfig();
+  // An unreadable config must not fail the probe, but this runner is then NOT dispatchable: it answers for diagnostics with `configError`
+  // and `paused` (so a client built before this field skips it too), and the submitter skips it by name.
+  const { config: globalCfg, error: configError } = loadGlobalConfigOrError();
   const host = detectResourceCapacity();
   // CPU/memory budgets are only enforced in active mode (checkResourceBudget);
   // in shadow mode they are reported as null so the client never skips on them.
@@ -737,7 +749,8 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot() } = {}) {
     // BRAIN-380 slice 4: a draining runner takes no new work. `draining` names why; `paused` is also set so a client
     // built before this field skips the runner the way it skips a paused one.
     draining,
-    paused: Boolean(status.paused) || draining,
+    paused: Boolean(status.paused) || draining || Boolean(configError),
+    ...(configError ? { configError } : {}),
     queued: status.queued.length,
     running: status.running.length,
     // BRAIN-360: additive; the CPU the runner's leases are charged (grants, not declarations)

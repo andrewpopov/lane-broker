@@ -25,7 +25,7 @@ import { remotePipelineCommand } from '../src/remote-pipeline.js';
 
 function usage() {
   return `Usage:
-  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--exclusive] [--detach]
+  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--exclusive] [--detach [--id <ticket-id>]]
            [--timeout <duration>] [--allow-local-sim] [--local] [--log <path>] -- <command...>
   lane status [--json]
   lane capabilities --json
@@ -100,10 +100,17 @@ function parseRunArgs(args) {
       case '--log':
         opts.log = flagArgs[++i];
         break;
+      case '--id': {
+        const raw = flagArgs[++i];
+        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(raw ?? '')) throw new Error(`--id must be 1-128 characters of [A-Za-z0-9._-] (got "${raw}")`);
+        opts.ticketId = raw;
+        break;
+      }
       default:
         throw new Error(`lane run: unknown flag "${a}"`);
     }
   }
+  if (opts.ticketId !== undefined && !opts.detach) throw new Error('--id requires --detach');
   return { opts, cmd };
 }
 
@@ -153,6 +160,7 @@ async function main() {
         allowLocalSim: opts.allowLocalSim,
         local: opts.local,
         log: opts.log,
+        ticketId: opts.ticketId,
         cmd,
       });
       return result.exitCode;

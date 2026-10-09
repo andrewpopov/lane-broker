@@ -200,6 +200,8 @@ function neverFits(reservation, probe) {
  * alone (see `dispatchRemote`), so an optionless lane still sends a
  * protocol-1 header even when `remoteQueueTimeoutMs` made this true.
  *
+ * `opts.requireCapabilities` (BRAIN-321): capability strings the runner's probe must advertise, else it is skipped.
+ *
  * `opts.reservation` (BRAIN-320 S1e): the ticket's resolved
  * `{weight, cpuCores, memoryBytes}`, checked against each probe's static
  * `capacity` (1e). The existing `queued > 0` skip is unchanged.
@@ -215,7 +217,7 @@ function neverFits(reservation, probe) {
 export async function selectRunner(runners, opts = {}) {
   const deadlineMs = opts.deadlineMs ?? 6000;
   const sshBin = opts.sshBin ?? 'ssh';
-  const { env, requireProtocol2 = false, reservation, maxRemoteQueue = 0 } = opts;
+  const { env, requireProtocol2 = false, requireCapabilities = [], reservation, maxRemoteQueue = 0 } = opts;
   const skipped = [];
   // BRAIN-405: every runner is probed, then the idle one with real room and the earliest estimated finish wins (ties: more
   // free CPU, then config order). A runner with an empty queue but no headroom is not idle, however empty its queue.
@@ -247,6 +249,17 @@ export async function selectRunner(runners, opts = {}) {
     }
     if (requireProtocol2 && !(Array.isArray(probe.protocols) && probe.protocols.includes(2))) {
       skipped.push({ name: runner.name, reason: 'runner does not support protocol 2 (remoteDeps/remoteSetup/remoteQueueTimeoutMs)' });
+      continue;
+    }
+    // BRAIN-321: a ticket whose lane REQUIRES a feature (class enforcement) never goes to a runner that cannot enforce it; an older
+    // runner would ignore the unknown lane key and run it unenforced. A ticket with no requirement is unchanged.
+    const missing = requireCapabilities.filter((c) => !(Array.isArray(probe.capabilities) && probe.capabilities.includes(c)));
+    if (missing.length) {
+      skipped.push({ name: runner.name, reason: `runner does not advertise ${missing.join(', ')} (required by the lane)` });
+      continue;
+    }
+    if (probe.configError) {
+      skipped.push({ name: runner.name, reason: `runner config unreadable: ${probe.configError}` });
       continue;
     }
     if (probe.draining) {
@@ -748,6 +761,9 @@ export async function dispatchRemote(opts) {
     // clock. Additive header fields: an older runner ignores them, so its ticket is simply medium.
     priorityRequested,
     priorityAccruedMs,
+    // BRAIN-321: the class the submitter resolved; only a sim / a required lane ever sends them (absent = byte-identical header)
+    laneClass,
+    classEnforcement,
     // BRAIN-339: from the CLIENT's global config (`remoteResultWaitMs`); how long to keep
     // polling a runner that reports the job still queued/running after ssh dropped.
     resultWaitMs = DEFAULT_RESULT_WAIT_MS,
@@ -821,6 +837,8 @@ export async function dispatchRemote(opts) {
   if (Number.isFinite(minCpuCores)) header.minCpuCores = minCpuCores;
   if (Number.isInteger(queueTimeoutMs) && queueTimeoutMs > 0) header.queueTimeoutMs = queueTimeoutMs;
   if (Number.isInteger(noProgressTimeoutMs) && noProgressTimeoutMs >= 0) header.noProgressTimeoutMs = noProgressTimeoutMs;
+  if (laneClass === 'sim' || laneClass === 'test') header.laneClass = laneClass;
+  if (classEnforcement === 'required') header.classEnforcement = 'required';
   if (isPriorityTier(priorityRequested)) header.priorityRequested = priorityRequested;
   if (Number.isInteger(priorityAccruedMs) && priorityAccruedMs >= 0) header.priorityAccruedMs = priorityAccruedMs;
 

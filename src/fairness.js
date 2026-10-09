@@ -255,8 +255,8 @@ export function fairnessStore(root, tickets) {
  * reservation suspended for this evaluation. It defaults to allow-all because BRAIN-379 allocation is shadow-only; wire
  * it to BRAIN-379's enforcement when that goes live.
  */
-export function effectiveView(rawQueue, nowEff, cfg, store, eligible = () => true) {
-  const ordered = orderQueue(rawQueue, nowEff, cfg);
+export function effectiveView(rawQueue, nowEff, cfg, store, eligible = () => true, { simsAfterTests = false } = {}) {
+  const ordered = orderQueue(rawQueue, nowEff, cfg, simsAfterTests);
   const reservable = cfg.schedulerMode === 'active' && cfg.resourceSkipLimit > 0;
   const live = reservable ? store.reservations().filter(({ id }) => rawQueue.some((t) => t !== null && t.id === id && eligible(t))) : [];
   return promoteReservationOwner(ordered, live);

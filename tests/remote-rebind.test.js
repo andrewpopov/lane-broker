@@ -579,6 +579,12 @@ test('a confirmed preflight refusal by the runner restores the ticket to its pla
   assert.equal(queuedSeqs(ctx.state)[id], seq, 'back at its original seq');
   assert.equal(readJsonSafe(path.join(paths(ctx.state).results, `${id}.json`)), null, 'no terminal result was published');
   assert.deepEqual(linesOf(ran), []);
+  // BRAIN-321: the refusing runner is excluded for this ticket (durably, on the attempt), so the rebind loop does not retry it forever
+  assert.deepEqual(readAttempt(ctx.state, id).refusedRunners, ['skybox']);
+  const refusals = () => (ctx.admissionLog().match(new RegExp(`remote-rebind: ${id}: skybox: runner refused`, 'g')) ?? []).length;
+  assert.equal(refusals(), 1);
+  await sleep(3000);
+  assert.equal(refusals(), 1, 'a refused ticket is not re-dispatched to the same runner');
 
   ctx.setMode('full'); // no more rebinds; a dispatch already in flight is still refused, never left unknown
   hold.release();
