@@ -95,3 +95,71 @@ test('localRefused + remote:true, but forced local via --local: refused immediat
   assert.equal(result.code, 69);
   assert.match(result.stderr, /refused for local runs/);
 });
+
+// ---- BRAIN-509: a ticket with no local fallback carries no queue timeout ----
+
+/** Park a ticket in the paused runner's queue and return its runner-side queue entry (where the header's queueTimeoutMs lands as `startDeadline`). */
+async function queuedOnPausedRunner(ctx, extraRunArgs = []) {
+  fs.mkdirSync(ctx.runnerState, { recursive: true });
+  fs.writeFileSync(path.join(ctx.runnerState, 'PAUSE'), 'kept busy for the test');
+  const started = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', ...extraRunArgs, '--', ...markerCmd(path.join(tmpDir('marker'), 'where'), 0)], {
+    env: ctx.env,
+    cwd: ctx.repoDir,
+  });
+  assert.equal(started.code, 0, `stderr: ${started.stderr}`);
+  const queueDir = path.join(ctx.runnerState, 'queue');
+  for (let i = 0; i < 100; i++) {
+    const entry = fs.existsSync(queueDir) ? fs.readdirSync(queueDir).find((f) => f.endsWith('.json')) : undefined;
+    if (entry) {
+      try {
+        const queued = JSON.parse(fs.readFileSync(path.join(queueDir, entry), 'utf8'));
+        await laneRun(['cancel', started.stdout.trim()], { env: ctx.env });
+        return queued;
+      } catch {
+        // mid-write; retry
+      }
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  await laneRun(['cancel', started.stdout.trim()], { env: ctx.env });
+  assert.fail('the ticket never reached the runner queue');
+}
+
+test('BRAIN-509: localRefused + remote sends no queueTimeoutMs even with remoteQueueTimeoutMs configured', async () => {
+  const queued = await queuedOnPausedRunner(setupLocalRefusedRemote({ remoteQueueTimeoutMs: 30_000 }));
+  assert.equal(queued.startDeadline, undefined);
+});
+
+test('BRAIN-509: localRefused + remote + --allow-local-sim DOES send queueTimeoutMs (it can fall back locally)', async () => {
+  const queued = await queuedOnPausedRunner(setupLocalRefusedRemote({ remoteQueueTimeoutMs: 30_000 }), ['--allow-local-sim']);
+  assert.ok(Number.isFinite(queued.startDeadline), 'the queue timeout must reach the runner');
+});
+
+test('BRAIN-509: an ordinary local-eligible remote lane DOES send queueTimeoutMs', async () => {
+  const queued = await queuedOnPausedRunner(remoteSetup({ remoteQueueTimeoutMs: 30_000 }));
+  assert.ok(Number.isFinite(queued.startDeadline), 'the queue timeout must reach the runner');
+});
+
+test('BRAIN-509: a localRefused ticket outlasting remoteQueueTimeoutMs in a busy runner keeps waiting and completes remotely, not exit 69', async () => {
+  const ctx = setupLocalRefusedRemote({ remoteQueueTimeoutMs: 300 });
+  fs.mkdirSync(ctx.runnerState, { recursive: true });
+  const pauseFile = path.join(ctx.runnerState, 'PAUSE');
+  fs.writeFileSync(pauseFile, 'kept busy for the test');
+  const marker = path.join(tmpDir('marker'), 'where');
+  const started = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], { env: ctx.env, cwd: ctx.repoDir });
+  assert.equal(started.code, 0, `stderr: ${started.stderr}`);
+  const id = started.stdout.trim();
+  // Only once the ticket is in the runner's queue does the clock that would have expired it run: hold it paused well
+  // past the 300 ms timeout from THAT point, so the test cannot pass by the runner merely starting late.
+  const queueDir = path.join(ctx.runnerState, 'queue');
+  for (let i = 0; i < 100 && !(fs.existsSync(queueDir) && fs.readdirSync(queueDir).some((f) => f.endsWith('.json'))); i++) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(fs.readdirSync(queueDir).some((f) => f.endsWith('.json')), 'the ticket never reached the runner queue');
+  await new Promise((r) => setTimeout(r, 1500));
+  fs.rmSync(pauseFile, { force: true });
+  const waited = await laneRun(['wait', id, '--timeout', '60s'], { env: ctx.env });
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
+  assert.equal(resultOf(ctx.state, id).executor, 'remote');
+});

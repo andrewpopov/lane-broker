@@ -470,11 +470,25 @@ function migrationRefusalResult(ticket) {
   return { id: ticket.id, exit: 75, signal: null, startedAt: null, endedAt: Date.now(), waitedMs: null, cancelled: false, reason: 'scheduler-migration' };
 }
 
+/** Why this machine can never run the ticket (a refusal result), or null: a `localRefused` lane without --allow-local-sim,
+ *  else a claim over the local budget. The one definition behind local-first, the queued-runner choice, the fallback and
+ *  whether the ticket carries a queue timeout (which exists only to enable a local fallback). */
+function localIneligibilityOf(enriched, globalCfg) {
+  if (enriched.localRefused && !enriched.allowLocalSim) return localSimRefusal(enriched.lane, enriched.class);
+  const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host: detectResourceCapacity() });
+  return budget.ok ? null : budget;
+}
+
+/** The client's `remoteQueueTimeoutMs` for this ticket: none when it has no local fallback to expire into (BRAIN-509). */
+function queueTimeoutFor(enriched, globalCfg) {
+  return localIneligibilityOf(enriched, globalCfg) ? undefined : globalCfg.remoteQueueTimeoutMs;
+}
+
 /** What `selectRunner` needs to judge a ticket: its protocol, and its reservation (shared by a first attempt and a rebind). */
 export function remoteSelectOptions(enriched, globalCfg) {
   return {
     maxRemoteQueue: globalCfg.maxRemoteQueue,
-    requireProtocol2: needsProtocol2(enriched.remote) || Boolean(globalCfg.remoteQueueTimeoutMs),
+    requireProtocol2: needsProtocol2(enriched.remote) || Boolean(queueTimeoutFor(enriched, globalCfg)),
     requireCapabilities: isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : [],
     reservation: {
       weight: enriched.weight,
@@ -600,13 +614,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     return { fallback: true, rebindFailed: true, attemptGeneration: gen };
   }
 
-  /** Why this machine can never run the ticket (a refusal result), or null: a `localRefused` lane without --allow-local-sim,
-   *  else a claim over the local budget. The one definition behind local-first, the queued-runner choice and the fallback. */
-  function localIneligibility() {
-    if (enriched.localRefused && !enriched.allowLocalSim) return localSimRefusal(enriched.lane, enriched.class);
-    const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host: detectResourceCapacity() });
-    return budget.ok ? null : budget;
-  }
+  const localIneligibility = () => localIneligibilityOf(enriched, globalCfg);
 
   /** `rebindable`: this fallback is only "no runner had room right now", so a later probe may still find one.
    *  `noRunner`: the fallback is "the fleet had no usable runner", which a `localRefused` lane reports as retryable. */
@@ -703,7 +711,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
 
   // BRAIN-320 review fix D: runner SELECTION requires protocol 2 whenever
   // the lane itself needs it OR the client has a queue timeout configured
-  // (only a 0.7.0+ runner honours `queueTimeoutMs`) -- but the exec header's
+  // (only a 0.7.0+ runner honours `queueTimeoutMs`; a locally-ineligible ticket carries none, BRAIN-509) -- but the exec header's
   // own protocol (inside dispatchRemote) still derives from
   // `needsProtocol2(enriched.remote)` alone, so an optionless lane still
   // sends a protocol-1 header even when this is true.
@@ -827,8 +835,9 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       generation: gen,
       // BRAIN-320 S1d: opt-in, from THIS (client) machine's own global config
       // -- never the runner's -- so an unset value here means the header
-      // carries no queueTimeoutMs at all (I6).
-      queueTimeoutMs: globalCfg.remoteQueueTimeoutMs,
+      // carries no queueTimeoutMs at all (I6). The timeout only exists to enable a local fallback, so a ticket this
+      // machine can never run carries none either: it waits in the runner's queue instead of expiring into a refusal (BRAIN-509).
+      queueTimeoutMs: queueTimeoutFor(enriched, globalCfg),
       noProgressTimeoutMs: enriched.noProgressTimeoutMs ?? globalCfg.noProgressTimeoutMs,
       // BRAIN-380 §6: the tier BEFORE any cap, and the wait this ticket has accrued on THIS host's priority clock. The
       // runner re-anchors from the wait, never from our timestamps, so clock skew between hosts cannot matter.
