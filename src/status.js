@@ -5,7 +5,8 @@ import { listLeases, reapAll, LEASE_STATE } from './lease.js';
 import { listQueueCapped, reapOrphanedQueue, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState, readResourceSkipState, futileFresh } from './scheduler.js';
 import { refreshCpuEstimates } from './cpu-estimates.js';
 import { cpuBudget, projectBusy, ticketCpuEstimate, ticketCpuEstimateBasis } from './admission.js';
-import { classLocks, simArmed, usedByClass } from './allocation.js';
+import { classLocks, classOf, simArmed, usedByClass } from './allocation.js';
+import { resolveClasses, bookedSims } from './classes.js';
 import { queuedClaimsByClass } from './allocation-shadow.js';
 import { readLastSimDemandAt } from './sim-arm.js';
 import { listAttempts, supervisorAlive, moveInterruptedLabel } from './attempts.js';
@@ -18,7 +19,7 @@ import { exclusiveHoldView, clampQueuedWeight } from './exclusive.js';
 import { priorityOf, effectiveRank, tierName } from './priority.js';
 import { leaseOverrun } from './observed.js';
 import { topExternalCpu, externalBusyCores, windowExternalCores, scanProcWindow, starvedStaleMs, starvedForMs } from './external-cpu.js';
-import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores } from './resources.js';
+import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores, cpuBudgetCores } from './resources.js';
 
 /** Holder pid of the global lock, read directly off disk — used to name the
  *  holder in the "couldn't take the lock" diagnostic without re-taking it. */
@@ -296,6 +297,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     draining,
     exclusiveHold: exclusiveHoldView(queue, held),
     priority: sched.v2 ? { active: true, mode: 'v2', nowEff, reservationOwner: reservationOwnerId } : { active: false, mode: 'legacy', nowEff },
+    classes: computeClasses(cfg, root, held, resourceCapacity),
     ...(cfg.allocationShadow ? { allocation: computeAllocation(root, cfg, queue.filter(Boolean), held, resourceCapacity.cpuCores, now) } : {}),
     // BRAIN-249: null unless the queue is genuinely stalled (a conflict-
     // blocked head whose skip allowance is exhausted) — see computeHeadBlock.
@@ -346,6 +348,24 @@ function computeAllocation(root, cfg, queue, held, cpuCores, now) {
   const armed = simArmed({ now, lastSimDemandAt, simQueued: queued.sim > 0, simCharged: held.some((l) => l.class === 'sim'), simArmWindowMs: cfg.simArmWindowMs });
   const target = classLocks({ B, armed });
   return { shadow: true, budgetCores: B, armed, lastSimDemandAt, test: { used: used.test, target: target.L_t, queued: queued.test }, sim: { used: used.sim, target: target.L_s, queued: queued.sim } };
+}
+
+/** BRAIN-321: the work-class caps and what is booked against them; null with no `classes` block (or an off one) and nothing wrong. */
+function computeClasses(cfg, root, held, host) {
+  const classes = resolveClasses(cfg, root);
+  if (classes.mode === 'off' && classes.valid) return null;
+  const B = cpuBudgetCores(host, cfg);
+  const booked = bookedSims(held, cfg);
+  const testHeld = held.filter((l) => classOf(l) === 'test');
+  const testBooked = testHeld.reduce((sum, l) => sum + (leaseResources(l, cfg).cpuCores || 0), 0);
+  return {
+    mode: classes.mode,
+    valid: classes.valid,
+    ...(classes.valid ? {} : { error: classes.error }),
+    configHash: classes.configHash,
+    sim: { bookedCores: booked.cores, capCores: classes.sim?.capCores ?? null, tickets: booked.count, maxTickets: classes.sim?.maxTickets ?? null, bookedMemoryBytes: booked.memoryBytes, capMemoryBytes: classes.sim?.capMemoryBytes ?? null },
+    test: { bookedCores: testBooked, reserveCores: classes.test?.reserveCores ?? null, budgetCores: B },
+  };
 }
 
 /** BRAIN-360: shown only when admission granted less CPU than the lane declared. */
@@ -480,6 +500,14 @@ export function renderStatusText(status) {
     const a = status.allocation;
     const cls = (name, c) => `${name} used ${c.used.toFixed(2)}/target ${c.target.toFixed(2)} queued ${c.queued.toFixed(2)}`;
     lines.push(`allocation (shadow): ${cls('test', a.test)}; ${cls('sim', a.sim)}; sims ${a.armed ? 'armed' : 'unarmed'}`);
+  }
+  if (status.classes) {
+    const c = status.classes;
+    lines.push(
+      c.valid
+        ? `classes (${c.mode}): sim ${c.sim.bookedCores}/${c.sim.capCores} cores, ${c.sim.tickets}/${c.sim.maxTickets} tickets, ${fmtMB(c.sim.bookedMemoryBytes)}/${fmtMB(c.sim.capMemoryBytes)}; test ${c.test.bookedCores}/${c.test.budgetCores.toFixed(2)} cores (${c.test.reserveCores} reserved from sims)`
+        : `classes: INVALID (${c.error}); no sim is granted`,
+    );
   }
   lines.push(renderMemoryLine(status.memory));
   if (status.priority && !status.priority.active) {

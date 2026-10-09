@@ -68,6 +68,7 @@ features like pipes or globbing.
 | `--weight <n>` | Override the configured weight for this run; must be a positive number (validated before enqueueing, exit `2` otherwise). |
 | `--cpu <cores>` | Override the lane's CPU reservation; fractional cores are supported. |
 | `--memory <size>` | Override the lane's memory reservation, e.g. `768MiB` or `4GiB`. |
+| `--id <ticket-id>` | With `--detach` only: a client-supplied ticket id (`[A-Za-z0-9._-]`, up to 128 chars) that makes the submission idempotent. An id the broker already knows (queued, leased, finished or mid remote attempt) is returned as the same ticket: no new queue sequence and, for a remote-eligible lane, no second dispatch (the check runs before any probe). A remote-eligible lane needs a UUID id. |
 | `--priority high\|medium\|low` | BRAIN-380 priority tier (default `medium`). Beats env `LANE_BROKER_PRIORITY`, which beats the lane's `priority` in `.lane-broker.json` (an `undeclaredLanes.as` template passes its tier on), which beats `medium`. Any invalid value from any of the three exits `64`. See "Priority (foundations)" below. |
 | `--exclusive` | BRAIN-403 v1: claim the whole host for this run. See "Exclusive lanes (BRAIN-403 v1)" below. The lane config key `lanes.<name>.exclusive: true` does the same. |
 | `--detach` | Print the run id and return immediately instead of waiting. |
@@ -1578,11 +1579,53 @@ the KILL, or 60 s after the TERM if the table is unreadable, with the incomplete
 no pidfd signalling, and macOS pids climb to 99999 before wrapping. Likewise, on macOS a process whose argv changes between the
 two `ps` reads, keeping its old command as a prefix and appending this lease's exact random id, would be misread as a member.
 
+## Work classes and per-machine caps (BRAIN-321)
+
+A lane's `class` (`test`, the default, or `sim`) already keeps a sim from passing a waiting test. The optional global
+`classes` block adds per-machine RESERVATION caps on the sim class, so a fleet of long sim shards can never take the
+cores a test needs:
+
+```json
+"classes": {
+  "mode": "active",
+  "test": { "reserveCores": 4 },
+  "sim":  { "capCores": 8, "maxTickets": 8, "capMemoryBytes": 10737418240 }
+}
+```
+
+- `mode` is `off`, `shadow` or `active`. An absent block is today's behaviour, byte for byte. `shadow` and `active` need
+  every number spelled out; unknown keys are refused.
+- Caps are counted against BOOKED grants: the claims of the live `class:sim` leases (an elastic lease at its grant) plus the
+  candidate's own final grant, never demand estimates or observed CPU. In `active` mode a sim is denied `class-cap` when
+  booked sim cores + grant exceed `capCores`, the sim count is at `maxTickets`, booked sim memory + grant exceed
+  `capMemoryBytes`, or booked sim cores + grant exceed `cpuBudget - test.reserveCores` (sims never book into the test
+  reserve). An elastic sim is lowered to what the caps leave but never below its `minCpuCores`; an immutable claim is
+  never shrunk, only denied.
+- A `class-cap` denial is skip-free: the sim leaves every selection, so it is never the head, never blocks a test or any
+  other ticket, and cannot hold a reservation-owner promotion. At an equal effective score a test is ordered before a sim.
+- `shadow` computes the same verdict and writes `classCap=class-cap(shadow):<reason>` on the admission-log line, without
+  denying anything.
+- **Grant fence.** Only `active` mode with a valid block stamps `classEnforcement: {mode, generation, stateRoot, configHash}`
+  on a sim lease, and exports it to the leased child as JSON in `LANE_BROKER_CLASS_ENFORCEMENT`. `generation` is
+  `sched-v2@<migratedAt>` of the scheduler fence when the root has one, else `pkg-<version>`. A pool gate that must only
+  claim work under live caps checks that (and `lane capabilities --json`'s `classes`) before claiming.
+- **`classEnforcement: "required"` (lane key in `.lane-broker.json`).** A ticket from such a lane (the rouge `fleet` lane) is
+  granted ONLY when `classes.mode` is `active` and the global config loaded cleanly; otherwise it is denied
+  `class-enforcement-unavailable`, skip-free (never the head, never blocks anything), and switching to `off` or `shadow`
+  stops new grants for it at the next pass. A sim lane WITHOUT the key keeps today's behaviour in `off`, `shadow` or absent
+  mode, so `shadow` stays useful for measuring. The granted lease carries `classEnforcement` for any required ticket.
+- **Fail closed.** A `classes` block that fails validation is set aside (the rest of the config still loads) and every sim is
+  denied `class-config-invalid` until it is fixed; it never reads as "no caps". Any unreadable or invalid global config (a reload that fails,
+  or a fresh supervisor starting on a malformed file) marks the class policy unknown the same way, rather than reading as `off` or
+  keeping stale caps. `lane status` and
+  `lane capabilities --json` show `valid: false`.
+- `lane status` prints `classes (<mode>): sim booked/cap cores, tickets, memory; test booked/budget` in `shadow` and `active`.
+
 ## `lane capabilities --json`
 
-Prints one JSON line: `{"version", "capabilities": [...], "schedulerMode", "admissionMode"}`. `capabilities` is the
+Prints one JSON line: `{"version", "capabilities": [...], "schedulerMode", "admissionMode", "classes": {"mode", "configHash", "stateRoot", "valid"}}`. `capabilities` is the
 same list `lane remote-probe` advertises (`elastic-claims/1`, `priority/1`, `artifacts/1`, `sim-safe-backfill/1`,
-`lane-aging/1`, `group-reap/1`, `remote-withdraw/1`, `exclusive/1`, `attempt-logpath/1`: a remote attempt record carries the submitter's `logPath` and `cwd`, so a caller that crashed between `lane run --detach` and learning the id can find its attempt by `--log` path, BRAIN-462). `schedulerMode` is `priority` when a valid `sched-v2.json` fence is present and
+`lane-aging/1`, `group-reap/1`, `remote-withdraw/1`, `exclusive/1`, `attempt-logpath/1`: a remote attempt record carries the submitter's `logPath` and `cwd`, so a caller that crashed between `lane run --detach` and learning the id can find its attempt by `--log` path, BRAIN-462, `classes/1`). `classes` reports the work-class caps in force (see "Work classes and per-machine caps"). `schedulerMode` is `priority` when a valid `sched-v2.json` fence is present and
 `legacy` otherwise; `admissionMode` is the global config's `schedulerMode` (`active` or `shadow`). A caller that needs
 a feature (for example a pool gate that requires `group-reap/1`) checks this before relying on it.
 

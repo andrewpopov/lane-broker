@@ -114,7 +114,7 @@ export function moveInterruptedLabel(id, attempt) {
  *  phase 'probe'), stamped with THIS process's own identity as the owning
  *  supervisor. `runner` is not yet known at this point in the real dispatch
  *  flow (selection happens after), so it defaults to null. */
-export async function createAttempt(root, id, { runner = null, resources, logPath, cwd } = {}) {
+export async function createAttempt(root, id, { runner = null, resources, logPath, cwd, refuseIf } = {}) {
   const attempt = {
     id,
     generation: 0,
@@ -134,11 +134,18 @@ export async function createAttempt(root, id, { runner = null, resources, logPat
       bootId: bootId(),
     },
   };
+  // BRAIN-321: a client-supplied id (`refuseIf` given) is claimed here, under the same lock as the write: an id that is already
+  // queued, leased, finished or mid-attempt is the same ticket, and nothing is written (so nothing is dispatched).
+  let existing = null;
   await withLock(root, () => {
     assertNotMigrating(root);
+    if (refuseIf) {
+      existing = refuseIf() ?? (readAttempt(root, id) ? { id, existing: true, state: 'attempt' } : null);
+      if (existing) return;
+    }
     atomicWriteJson(attemptFile(root, id), attempt);
   });
-  return attempt;
+  return existing ? { existing } : attempt;
 }
 
 /** BRAIN-405: patch the stored record with no generation fence, for a caller that already holds the broker lock. `undefined` drops a key. */

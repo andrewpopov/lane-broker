@@ -62,6 +62,8 @@ test('an invalid global config throws ConfigError with a clear message', () => {
   }
 });
 
+const withoutClassPolicyMark = ({ classesInvalid: _mark, ...rest }) => rest;
+
 test('reloadGlobalConfig picks up a changed value from disk', () => {
   const { home } = freshEnv();
   writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 40, loadOpen: 11, loadOpenSamples: 3, sampleMs: 5000 });
@@ -87,7 +89,8 @@ test('reloadGlobalConfig returns previous when the file becomes invalid JSON', (
     const first = loadGlobalConfig();
     fs.writeFileSync(path.join(home, 'config.json'), '{ not valid json');
     const reloaded = reloadGlobalConfig(first);
-    assert.deepEqual(reloaded, first);
+    assert.deepEqual(withoutClassPolicyMark(reloaded), first);
+    assert.ok(reloaded.classesInvalid, 'the class policy is marked unknown (BRAIN-321)');
   } finally {
     process.env.LANE_BROKER_HOME = prevHome;
   }
@@ -103,7 +106,8 @@ test('reloadGlobalConfig returns previous when the file fails validation', () =>
     // loadOpen >= loadClose is rejected by validateGlobalConfig.
     writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 15, loadOpen: 20, loadOpenSamples: 3, sampleMs: 5000 });
     const reloaded = reloadGlobalConfig(first);
-    assert.deepEqual(reloaded, first);
+    assert.deepEqual(withoutClassPolicyMark(reloaded), first);
+    assert.ok(reloaded.classesInvalid, 'the class policy is marked unknown (BRAIN-321)');
   } finally {
     process.env.LANE_BROKER_HOME = prevHome;
   }
@@ -116,7 +120,8 @@ test('reloadGlobalConfig falls back to defaults when there is no previous', () =
   try {
     writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 15, loadOpen: 20, loadOpenSamples: 3, sampleMs: 5000 }); // invalid
     const reloaded = reloadGlobalConfig(undefined);
-    assert.deepEqual(reloaded, DEFAULT_GLOBAL_CONFIG);
+    assert.deepEqual(withoutClassPolicyMark(reloaded), DEFAULT_GLOBAL_CONFIG);
+    assert.ok(reloaded.classesInvalid, 'a fresh supervisor on an unreadable config has an unknown class policy, not an off one');
   } finally {
     process.env.LANE_BROKER_HOME = prevHome;
   }

@@ -19,7 +19,7 @@ import {
   testDrainAt,
   testHoldAt,
 } from './state.js';
-import { enqueue, tryStart, dequeueSync, couldAdmitNow, withdrawQueued, restoreQueued, discardRebinding } from './scheduler.js';
+import { enqueue, existingTicket, tryStart, dequeueSync, couldAdmitNow, withdrawQueued, restoreQueued, discardRebinding } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { selectLeaseTree } from './cpu.js';
@@ -27,6 +27,7 @@ import { DescendantTracker, hasLiveMembers, reapLogLine } from './descendants.js
 import { reloadGlobalConfig } from './config.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
+import { CLASS_ENFORCEMENT_ENV } from './classes.js';
 import { detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
@@ -312,7 +313,7 @@ export function resolveNicedSpawn(ticket) {
  * pool to what the broker reserved (BRAIN-318): an unsized vitest spawns
  * cores-1 workers and was measured averaging 4.2 cores on a 2-core lease.
  */
-export function childEnv(ticket, baseEnv = process.env, grantedCpuCores = ticket.resources?.cpuCores) {
+export function childEnv(ticket, baseEnv = process.env, grantedCpuCores = ticket.resources?.cpuCores, classEnforcement = null) {
   const env = { ...baseEnv, LANE_BROKER_LEASE: ticket.id, LANE_BROKER_KEY: ticket.key };
   const cpuCores = grantedCpuCores;
   const memoryBytes = ticket.resources?.memoryBytes;
@@ -323,6 +324,9 @@ export function childEnv(ticket, baseEnv = process.env, grantedCpuCores = ticket
   // BRAIN-380: nested `lane run` calls inherit the tier this ticket was ADMITTED at, never the caller's own shell value.
   if (isPriorityTier(ticket.priorityAdmitted)) env.LANE_BROKER_PRIORITY = ticket.priorityAdmitted;
   else delete env.LANE_BROKER_PRIORITY;
+  // BRAIN-321: a sim lease granted under live caps says so; any other child never inherits the claim.
+  if (classEnforcement) env[CLASS_ENFORCEMENT_ENV] = JSON.stringify(classEnforcement);
+  else delete env[CLASS_ENFORCEMENT_ENV];
   return env;
 }
 
@@ -500,7 +504,11 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // the attempt generation every fence below acts on: 0 for a first attempt, the fallback's generation for a rebind
   const gen = rebind ? rebind.generation : 0;
   let withdrawn = null;
-  if (!rebind) await createAttempt(root, enriched.id, { runner: null, resources: enriched.resources, logPath: enriched.logPath, cwd: enriched.cwd });
+  if (!rebind) {
+    // BRAIN-321: a retried `--id` submission is the same ticket: dedup BEFORE any probe or dispatch, under the attempt's lock.
+    const created = await createAttempt(root, enriched.id, { runner: null, resources: enriched.resources, logPath: enriched.logPath, cwd: enriched.cwd, ...(enriched.clientId ? { refuseIf: () => existingTicket(root, enriched.id) } : {}) });
+    if (created.existing) process.exit(0);
+  }
 
   // Reuses the SAME two writers a local child's output goes through
   // (CappedLogWriter/ForwardWriter, defined above) -- no second relay.
@@ -1153,6 +1161,8 @@ async function main() {
 
   try {
     const queued = await enqueue(root, enriched, globalCfg);
+    // BRAIN-321: this id was already submitted (a retried `lane run --detach --id`); its first supervisor owns it.
+    if (queued.existing) process.exit(0);
     if (queued.priorityDemoted) process.stderr.write('lane run: priority high demoted to medium (repo already has a queued high ticket)\n');
   } catch (err) {
     if (!(err instanceof MigrationInProgressError)) throw err;
@@ -1293,7 +1303,7 @@ async function main() {
     cwd: ticket.cwd,
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: childEnv({ ...ticket, priorityAdmitted: started.lease.priorityAdmitted }, process.env, leaseCpuCores(started.lease)),
+    env: childEnv({ ...ticket, priorityAdmitted: started.lease.priorityAdmitted }, process.env, leaseCpuCores(started.lease), started.lease.classEnforcement),
   });
 
   const logWriter = new CappedLogWriter(ticket.logPath);

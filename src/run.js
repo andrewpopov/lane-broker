@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { ensureStateDirs, paths, readJsonSafe, LockTimeoutError, MigrationInProgressError, assertNotMigrating } from './state.js';
+import { ensureStateDirs, paths, readJsonSafe, LockTimeoutError, MigrationInProgressError, assertNotMigrating, isUuid } from './state.js';
 import { resolveTicketConfig, reloadGlobalConfig, resolvePriority, assertHostConfigHookless, ConfigError } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
@@ -236,6 +236,9 @@ export async function runCommand({
   // child can start) use that same id here, instead of one generated fresh
   // inside this function that the caller could never have learned in time.
   idOverride,
+  // BRAIN-321: `lane run --detach --id <id>`: a client-supplied ticket id, so a retried submission is idempotent
+  // (the broker's enqueue returns the existing ticket for an id it already knows). Same use as idOverride below.
+  ticketId,
   // BRAIN-319: called with the ticket id as soon as it exists (before the
   // supervisor is spawned, so before any child can start). Returning
   // `false` aborts the run without ever spawning the supervisor.
@@ -431,7 +434,13 @@ export async function runCommand({
     }
   }
   if (prioOriginAt !== null) prioOriginAt -= priorityAccruedMs;
-  const id = idOverride || crypto.randomUUID();
+  // The remote protocol addresses a ticket by UUID (`remote-exec`/`remote-result` refuse anything else), so a client-supplied
+  // id on a lane that may dispatch remotely must be one, or the dispatch would hang with no runner-side ticket.
+  if (ticketId && remoteEligible && !isUuid(ticketId)) {
+    process.stderr.write(`lane run: --id "${ticketId}" must be a UUID for a remote-eligible lane\n`);
+    return { exitCode: 64 };
+  }
+  const id = ticketId || idOverride || crypto.randomUUID();
   if (onTicketCreated) {
     const proceed = await onTicketCreated(id);
     if (proceed === false) {
@@ -444,6 +453,7 @@ export async function runCommand({
 
   const ticket = {
     id,
+    ...(ticketId ? { clientId: true } : {}),
     key: resolved.key,
     repoId: resolved.repoId,
     lane: resolved.lane,
@@ -457,6 +467,7 @@ export async function runCommand({
     class: resolved.class,
     aging: resolved.aging,
     ...(exclusive ? { exclusive: true } : {}),
+    ...(resolved.classEnforcement ? { classEnforcement: resolved.classEnforcement } : {}),
     conflicts: resolved.conflicts,
     // BRAIN-320: carried so the supervisor's remote-fallback path
     // (`fallbackOrRefuse` in supervisor.js) can re-apply the local-sim

@@ -3,13 +3,14 @@ import path from 'node:path';
 import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, writeExpireMarkerFile, isWithdrawn, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
 import { sampleAndUpdateGate, readGateState } from './load.js';
 import { patchAttemptLocked, readAttempt } from './attempts.js';
-import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
+import { listLeases, readLease, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
 import { refreshCpuEstimates } from './cpu-estimates.js';
 import { evaluateCpuAdmission, freshObservedCores, evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, writeBrokerLog, projectBusy, ticketCpuEstimate } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
 import { recordExternalDenial, clearExternalStarved } from './external-cpu.js';
 import { captureShadowInputs, recordAllocationShadow } from './allocation-shadow.js';
 import { classOf } from './allocation.js';
+import { resolveClasses, classEnforcementOf, bookedSims, capDeniedSims, capSimClaim, simCapReason, isEnforcementRequired, ALWAYS_ENFORCED_REASONS } from './classes.js';
 import { reconcileSimArm, touchSimArmFor } from './sim-arm.js';
 import { advanceHwm } from './priority-clock.js';
 import { isExclusive, exclusiveDeny, isExclusiveHead, exclusiveLeaseFields, withoutBackfillExclusives, clampQueuedWeight } from './exclusive.js';
@@ -120,8 +121,21 @@ function findQueueFile(root, id) {
   } catch {
     return null;
   }
-  const match = names.find((n) => n.endsWith(`-${id}.json`));
+  // exact id after the `<12-digit seq>-` prefix: `--id job` must not match the queued `prefix-job`
+  const match = names.find((n) => n.length > SEQ_PREFIX_LENGTH && n[SEQ_PREFIX_LENGTH - 1] === '-' && n.slice(SEQ_PREFIX_LENGTH) === `${id}.json`);
   return match ? path.join(dir, match) : null;
+}
+
+/** The ticket already known under `id` (queued, withdrawn for a rebind, leased, or finished), flagged `existing`; else null. */
+export function existingTicket(root, id) {
+  const queued = findQueueFile(root, id);
+  if (queued) return { ...(readJsonSafe(queued) ?? { id }), existing: true, state: 'queued' };
+  if (listRebindingIds(root).includes(id)) return { id, existing: true, state: 'rebinding' };
+  const lease = readLease(root, id);
+  if (lease) return { ...lease, existing: true, state: 'leased' };
+  const result = readJsonSafe(path.join(paths(root).results, `${id}.json`));
+  if (result) return { ...result, id, existing: true, state: 'finished' };
+  return null;
 }
 
 /**
@@ -133,6 +147,10 @@ export async function enqueue(root, ticket, cfg = DEFAULT_GLOBAL_CONFIG) {
   return withLock(root, () => {
     assertNotMigrating(root);
     assertQueueLayout(root);
+    // BRAIN-321: a client-supplied id is idempotent. One that is already queued, rebinding, leased or finished is the SAME
+    // ticket: return it, and allocate no sequence (a retried submission must not take a second place in the queue).
+    const existing = existingTicket(root, ticket.id);
+    if (existing) return existing;
     const nowEff = advanceHwm(root);
     const priorityRequested = isPriorityTier(ticket.priorityRequested) ? ticket.priorityRequested : DEFAULT_PRIORITY;
     // BRAIN-380 §7: the high cap, per broker. It shares this lock with the seq allocation and the queue write below,
@@ -199,7 +217,7 @@ function rebindingNames(root) {
 }
 
 const rebindingFile = (root, id) => {
-  const name = rebindingNames(root).find((n) => n.endsWith(`-${id}${REBINDING_SUFFIX}`));
+  const name = rebindingNames(root).find((n) => n.slice(SEQ_PREFIX_LENGTH) === `${id}${REBINDING_SUFFIX}`);
   return name ? path.join(paths(root).queue, name) : null;
 };
 
@@ -997,10 +1015,10 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     const cpuCores = detectResourceCapacity().cpuCores;
     const weightCapacity = effectiveWeightCapacity(cfg, cpuCores);
     // BRAIN-452: a ticket an older config enqueued with a near-capacity weight is admitted at half the capacity instead.
-    const ticket = clampQueuedWeight(capElasticClaim(submitted, cfg), cfg, weightCapacity);
+    const budgetCapped = clampQueuedWeight(capElasticClaim(submitted, cfg), cfg, weightCapacity);
     const now = Date.now();
     const nowEff = advanceHwm(root, now);
-    reapStale(root, ticket.id);
+    reapStale(root, submitted.id);
     // BRAIN-380: behind a valid scheduler fence this evaluation is priority-ordered, over per-ticket fairness
     // records; otherwise it is the legacy FIFO over the singleton files, untouched. `queue` is the ONE array
     // every selector, the safe-backfill predicate and the shadow snapshot below receive.
@@ -1009,16 +1027,31 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     const store = sched.v2 ? fairnessStore(root, sched.tickets) : legacyStore(root);
     if (sched.v2) quarantineLegacyRecords(root);
     const rawQueue = (sched.v2 ? fenceLegacy(listQueueCapped(root, cfg)) : listQueueCapped(root, cfg)).map((t) => clampQueuedWeight(t, cfg, weightCapacity));
-    logWeightClamp(root, ticket);
+    logWeightClamp(root, budgetCapped);
     // A reservation exists only while resource backfill does: when it is off, release every latch, so turning it back
     // on makes a ticket earn its reservation again.
     if (sched.v2 && !(cfg.schedulerMode === 'active' && cfg.resourceSkipLimit > 0)) store.releaseReservations();
     store.prune(rawQueue, listRebindingIds(root));
-    const { queue, ownerId: reservationOwnerId } = sched.v2 ? effectiveView(rawQueue, nowEff, cfg, store) : { queue: rawQueue, ownerId: null };
-    const position = queue.findIndex((t) => t && t.id === ticket.id);
-    if (position === -1) {
-      return { result: { started: false, reason: 'not-head', position: null, queueLength: queue.length } };
+    // Selection depends only on the queue and who currently holds a key (see below); read the holders first, since the
+    // BRAIN-321 class caps are counted against what is BOOKED now.
+    const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
+    // BRAIN-321: `active` enforces the sim caps; a broken `classes` block makes every sim ineligible (fail closed); `shadow`
+    // only reports what `active` would deny. A cap-denied sim is skip-free: it leaves every selection below, so it is never
+    // the head and never blocks anything, and it cannot hold a reservation-owner promotion either.
+    const classes = resolveClasses(cfg, root);
+    const classHost = classes.mode === 'off' && classes.valid ? null : detectResourceCapacity();
+    const capVerdicts = capDeniedSims(rawQueue, classes, held, classHost, cfg);
+    const capEnforced = new Map([...capVerdicts].filter(([, reason]) => classes.mode === 'active' || ALWAYS_ENFORCED_REASONS.has(reason)));
+    const { queue: fullQueue, ownerId: reservationOwnerId } = sched.v2
+      ? effectiveView(rawQueue, nowEff, cfg, store, (t) => !capEnforced.has(t.id))
+      : { queue: rawQueue, ownerId: null };
+    if (!fullQueue.some((t) => t && t.id === submitted.id)) {
+      return { result: { started: false, reason: 'not-head', position: null, queueLength: fullQueue.length } };
     }
+    const queue = capEnforced.size ? fullQueue.filter((t) => t === null || !capEnforced.has(t.id)) : fullQueue;
+    const booked = classes.valid && classHost ? bookedSims(held, cfg) : null;
+    const ticket = classes.valid && classes.mode === 'active' ? capSimClaim(budgetCapped, classes, booked, classHost, cfg) : budgetCapped;
+    const position = queue.findIndex((t) => t && t.id === ticket.id);
     // BRAIN-436: a withdrawn ticket is never admitted, even if its queue file is still on disk (the withdraw marker, not
     // the dequeue, is the commit). Under the same lock the withdraw decides in.
     if (isWithdrawn(root, ticket.id)) {
@@ -1040,13 +1073,28 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       writeExpireMarkerFile(root, ticket.id);
       return { result: { started: false, reason: 'queue-timeout' } };
     }
+    if (capEnforced.has(ticket.id)) {
+      const capReason = capEnforced.get(ticket.id);
+      const deniedAs = capReason === 'config-invalid' ? 'class-config-invalid' : capReason === 'enforcement-unavailable' ? 'class-enforcement-unavailable' : 'class-cap';
+      return {
+        result: { started: false, reason: deniedAs, capReason },
+        logFields: {
+          candidateId: ticket.id,
+          mode: cfg.schedulerMode,
+          currentDecision: 'deny',
+          currentReason: deniedAs,
+          admit: false,
+          reason: deniedAs,
+          classCap: `${deniedAs}:${capReason}`,
+        },
+      };
+    }
     // Selection depends only on the queue and who currently holds a key —
     // resolve it BEFORE touching the load/CPU gates (both of which persist a
     // sample and advance their hysteresis as a side effect) or the pause
     // flag, so a ticket that isn't going anywhere this poll costs exactly
     // what it did before this ticket existed: one cheap read, no side
     // effects. Only the selected candidate pays for a real gate evaluation.
-    const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
     const lastSimDemandAt = reconcileSimArm(root, queue, held, now, cfg.simArmWindowMs);
     const headTicket = queue[0];
     if (!headTicket) {
@@ -1306,6 +1354,11 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // flag suppressed), so shadow telemetry can tell "gate never got the
     // chance to matter" from "gate genuinely never closed".
     const loadGateIgnored = !cfg.admissionLoadGate && gate.closed;
+    // BRAIN-321: the caps judged at this sim's ACTUAL final grant. `active` denies below; `shadow` only says what it would.
+    const simGrant = classOf(ticket) === 'sim' && classes.valid && classes.mode !== 'off'
+      ? { cores: grantedCpuCores, memoryBytes: resolveTicketResources({ weight: ticket.weight, memoryBytes: ticket.resources?.memoryBytes, defaultMemoryBytesPerWeight: cfg.defaultMemoryBytesPerWeight }).memoryBytes }
+      : null;
+    const grantCapReason = simGrant ? simCapReason(classes, booked, simGrant, classHost, cfg) : null;
     const logBase = {
       candidateId: ticket.id,
       mode: cfg.schedulerMode,
@@ -1314,6 +1367,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       headRank: effectiveRank(headTicket, nowEff, cfg),
       headScore: score(headTicket, nowEff, cfg),
       loadGateIgnored,
+      ...(grantCapReason && classes.mode === 'shadow' ? { classCap: `class-cap(shadow):${grantCapReason}` } : {}),
       ...cpuDecision,
       ...(futileView ? { reservation: 'futile', futileCause: futileView.cause, headCpu: futileView.headCpu } : {}),
       // Provenance for the memory fields above: cpuDecision carries the byte
@@ -1345,6 +1399,14 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       return {
         result: { started: false, reason: 'elastic-below-floor' },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'elastic-below-floor' },
+      };
+    }
+    if (grantCapReason && classes.mode === 'active') {
+      if (ticket.id === headTicket.id) markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
+      dropPickRecord();
+      return {
+        result: { started: false, reason: 'class-cap', capReason: grantCapReason },
+        logFields: { ...logBase, currentDecision: 'deny', currentReason: 'class-cap', classCap: `class-cap:${grantCapReason}` },
       };
     }
     if (cfg.admissionLoadGate && gate.closed && !brokerIdle && !exclusiveHolder) {
@@ -1502,6 +1564,8 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       maxConcurrent: ticket.maxConcurrent,
       // BRAIN-379: allocation class, so a held-lease-only view can charge the lease to its class.
       class: ticket.class,
+      // BRAIN-321: the proof a sim was granted under live caps; only an active, valid `classes` block writes it.
+      ...((classOf(ticket) === 'sim' || isEnforcementRequired(ticket)) && classEnforcementOf(classes, root) ? { classEnforcement: classEnforcementOf(classes, root) } : {}),
       logPath: ticket.logPath,
       resultPath: ticket.resultPath,
       // BRAIN-403: an exclusive run claims the whole admission budget (every capacity and resource path then refuses the rest)

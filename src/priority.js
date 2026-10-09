@@ -87,8 +87,11 @@ export function tierName(rank) {
   return PRIORITY_TIERS[rank];
 }
 
+/** BRAIN-321: at an equal score a test goes before a sim, whichever was enqueued first. */
+const simRank = (ticket) => (ticket.class === 'sim' ? 1 : 0);
+
 /**
- * The order every selector walks: (score desc, seq asc) within each maximal run of readable
+ * The order every selector walks: (score desc, test before sim, seq asc) within each maximal run of readable
  * records. An unreadable (`null`) record is a barrier: nothing moves across it, so the
  * scheduler's protection against an unreadable head survives.
  */
@@ -97,7 +100,7 @@ export function orderQueue(raw, nowEff, cfg) {
   let run = [];
   const flush = () => {
     const scored = run.map((ticket, index) => ({ ticket, index, score: score(ticket, nowEff, cfg) }));
-    scored.sort((a, b) => b.score - a.score || (a.ticket.seq ?? 0) - (b.ticket.seq ?? 0) || a.index - b.index);
+    scored.sort((a, b) => b.score - a.score || simRank(a.ticket) - simRank(b.ticket) || (a.ticket.seq ?? 0) - (b.ticket.seq ?? 0) || a.index - b.index);
     for (const { ticket } of scored) ordered.push(ticket);
     run = [];
   };

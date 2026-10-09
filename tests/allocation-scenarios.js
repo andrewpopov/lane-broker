@@ -154,14 +154,14 @@ const normalize = (value) => JSON.parse(JSON.stringify(value, (k, v) => (VOLATIL
  * admission produced: each poll's result, the skip/reservation files, lease and queue files, the live log lines.
  * `liveOnly` drops fields only a later slice adds (a lease's `class`, a queue record's priority fields), so a main run and a branch run compare.
  */
-export async function runScript(m, script, { allocationShadow, freshState, seams } = {}) {
+export async function runScript(m, script, { allocationShadow, freshState, seams, cfgOverrides = {} } = {}) {
   const state = freshState ?? makeTmpDir('lane-broker-scenario-');
   fs.mkdirSync(state, { recursive: true });
   let clock = 1_700_000_000_000;
   const realNow = Date.now;
   Date.now = () => clock;
   try {
-    const cfg = baseCfg(m, { allocationShadow: allocationShadow === true });
+    const cfg = baseCfg(m, { allocationShadow: allocationShadow === true, ...cfgOverrides });
     const results = [];
     for (const step of script) {
       clock += 1000;

@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { gitFixture, laneRun, laneSpawn, waitFor, sleep, writeRepoConfig } from './helpers.js';
 import { tmpDir, setup, markerCmd, detachAndWait, resultOf, probeCount } from './remote-harness.js';
@@ -743,4 +744,38 @@ test('BRAIN-452: a fresh oversized weight is refused with exit 64 even for a rem
   assert.match(res.stderr, /weight 5 would hold most of this machine's capacity.*BRAIN-452/);
   assert.equal(fs.existsSync(marker), false, 'never ran, remotely or locally');
   assert.deepEqual(fs.existsSync(paths(state).queue) ? fs.readdirSync(paths(state).queue) : [], [], 'nothing enqueued');
+});
+
+// ---- BRAIN-321: a client-supplied --id is deduped BEFORE any remote dispatch ----
+
+test('a concurrent double submit of the same --id dispatches once and runs once; a finished id resubmitted dispatches nothing', async () => {
+  const { env, state, repoDir, probeLogPath } = setup();
+  const marker = path.join(tmpDir('marker'), 'runs');
+  const ID = crypto.randomUUID();
+  const body = `require('fs').appendFileSync(${JSON.stringify(marker)}, process.env.LANE_FAKE_RUNNER === '1' ? 'R' : 'L'); setTimeout(() => {}, 1500);`;
+  const args = ['run', '--repo', 'r', '--lane', 'default', '--detach', '--id', ID, '--', process.execPath, '-e', body];
+  const [a, b] = await Promise.all([laneRun(args, { env, cwd: repoDir }), laneRun(args, { env, cwd: repoDir })]);
+  assert.equal(a.code, 0, a.stderr);
+  assert.equal(b.code, 0, b.stderr);
+  assert.equal(a.stdout.trim(), ID);
+  assert.equal(b.stdout.trim(), ID);
+  const waited = await laneRun(['wait', ID, '--timeout', '30s'], { env });
+  assert.equal(waited.code, 0, waited.stderr);
+  await sleep(500);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'R', 'exactly one run, on the runner');
+  assert.equal(probeCount(probeLogPath), 1, 'exactly one dispatch (one probe of the runner)');
+  assert.ok(resultOf(state, ID));
+
+  const again = await laneRun(args, { env, cwd: repoDir });
+  assert.equal(again.code, 0, again.stderr);
+  await sleep(1500);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'R', 'a finished id is not run again');
+  assert.equal(probeCount(probeLogPath), 1, 'and not dispatched again');
+});
+
+test('a non-UUID --id on a remote-eligible lane is refused (the remote protocol addresses tickets by UUID)', async () => {
+  const { env, repoDir } = setup();
+  const res = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', '--id', 'not-a-uuid', '--', 'true'], { env, cwd: repoDir });
+  assert.equal(res.code, 64);
+  assert.match(res.stderr, /must be a UUID/);
 });

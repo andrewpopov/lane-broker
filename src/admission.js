@@ -512,6 +512,7 @@ export function formatAdmissionLog(f) {
     `headRank=${f.headRank ?? 'n/a'}`,
     `headScore=${fmt(f.headScore)}`,
     ...(f.reservation ? [`reservation=${f.reservation}`, `futileCause=${f.futileCause}`, `headCpu=${fmt(f.headCpu)}`] : []),
+    ...(f.classCap ? [`classCap=${f.classCap}`] : []),
     `bias=${KNOWN_BIAS_NOTE}`,
   ].join(' ');
 }
@@ -555,7 +556,7 @@ const LAST_DECISION_MAX_ENTRIES = 256;
 
 /** The (decision, reason) pair a candidate's log line reports, current rule and phase-1 predicate both. */
 function decisionSignature(f) {
-  return `${f.currentDecision}:${f.currentReason}|${f.admit ? 'admit' : 'deny'}:${f.reason}`;
+  return `${f.currentDecision}:${f.currentReason}|${f.admit ? 'admit' : 'deny'}:${f.reason}${f.classCap ? `|${f.classCap}` : ''}`;
 }
 
 /**
