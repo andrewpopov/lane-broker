@@ -152,7 +152,8 @@ export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0, preem
   const snapshot = { at: now, cpus: cpus.map(cpuTimes) };
   const { hostBusyCores, stale } = computeBusyCores(prev, snapshot);
   let procRows = null;
-  if (preemptible && preemptible.niceMin > 0) {
+  if (preemptible) {
+    // BRAIN-463: read even when the discount is off (niceMin 0), so `lane status` can name external CPU burners
     try {
       procRows = readProcs();
     } catch {

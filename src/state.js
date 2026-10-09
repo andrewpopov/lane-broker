@@ -75,6 +75,8 @@ export function paths(root = stateHome()) {
     capacitySkipState: path.join(root, 'capacity-skip-state.json'),
     // BRAIN-346: the projected-over-budget head's backfill allowance and reservation latch.
     resourceSkipState: path.join(root, 'resource-skip-state.json'),
+    // BRAIN-463: since when admission has been starved by CPU burned outside any lease; see src/external-cpu.js.
+    externalStarved: path.join(root, 'external-starved.json'),
     // BRAIN-379: when sim demand last existed (arms the sim soft lock); see src/sim-arm.js.
     simArm: path.join(root, 'sim-arm.json'),
     simArmLock: path.join(root, 'sim-arm.lock'),

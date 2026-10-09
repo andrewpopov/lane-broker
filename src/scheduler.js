@@ -7,6 +7,7 @@ import { listLeases, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from 
 import { refreshCpuEstimates } from './cpu-estimates.js';
 import { evaluateCpuAdmission, freshObservedCores, evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, writeBrokerLog, projectBusy, ticketCpuEstimate } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
+import { recordExternalDenial, clearExternalStarved } from './external-cpu.js';
 import { captureShadowInputs, recordAllocationShadow } from './allocation-shadow.js';
 import { classOf } from './allocation.js';
 import { reconcileSimArm, touchSimArmFor } from './sim-arm.js';
@@ -1397,6 +1398,8 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       cpuDecision.projectedBusy - cpuDecision.budget <= cfg.resourceIdleOvershootCores;
     if (shadow.live) shadow.live.idleExempt = idleExempt;
     if (cfg.schedulerMode === 'active' && !cpuDecision.admit && !idleExempt && !exclusiveHolder) {
+      // BRAIN-463: remember how long projected-over-budget denials have been mostly external CPU
+      if (resourceDenied) recordExternalDenial(root, cfg, cpuDecision, now);
       if (headPolling) {
         // Cooldown is the head's own backfill echoing back (each admission starts one), so it
         // changes nothing. Any other out-of-scope denial pauses backfill but keeps the allowance.
@@ -1507,6 +1510,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     };
     writeLease(root, lease);
     touchSimArmFor(root, lease, now);
+    clearExternalStarved(root);
     if (safeBackfill) {
       logHeadBlock(root, {
         event: 'safe-backfill',

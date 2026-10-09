@@ -136,7 +136,7 @@ export function readLeaseMarkers(pids, leaseIds, { platform = process.platform, 
 }
 
 /** pids belonging to held leases' trees (process group, ppid descendants, recorded descendants); null = cannot tell. */
-function leasePids(rows, heldLeases) {
+export function leasePids(rows, heldLeases) {
   const members = new Set();
   for (const lease of heldLeases) {
     if (!Number.isFinite(lease.childPgid)) return null; // tree not known yet (still spawning): fail closed
