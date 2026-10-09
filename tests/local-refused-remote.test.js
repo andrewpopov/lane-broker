@@ -145,9 +145,20 @@ test('BRAIN-509: a localRefused ticket outlasting remoteQueueTimeoutMs in a busy
   fs.mkdirSync(ctx.runnerState, { recursive: true });
   const pauseFile = path.join(ctx.runnerState, 'PAUSE');
   fs.writeFileSync(pauseFile, 'kept busy for the test');
-  setTimeout(() => fs.rmSync(pauseFile, { force: true }), 2000);
   const marker = path.join(tmpDir('marker'), 'where');
-  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], ctx.env, ctx.repoDir, '60s');
+  const started = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], { env: ctx.env, cwd: ctx.repoDir });
+  assert.equal(started.code, 0, `stderr: ${started.stderr}`);
+  const id = started.stdout.trim();
+  // Only once the ticket is in the runner's queue does the clock that would have expired it run: hold it paused well
+  // past the 300 ms timeout from THAT point, so the test cannot pass by the runner merely starting late.
+  const queueDir = path.join(ctx.runnerState, 'queue');
+  for (let i = 0; i < 100 && !(fs.existsSync(queueDir) && fs.readdirSync(queueDir).some((f) => f.endsWith('.json'))); i++) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.ok(fs.readdirSync(queueDir).some((f) => f.endsWith('.json')), 'the ticket never reached the runner queue');
+  await new Promise((r) => setTimeout(r, 1500));
+  fs.rmSync(pauseFile, { force: true });
+  const waited = await laneRun(['wait', id, '--timeout', '60s'], { env: ctx.env });
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
   assert.equal(resultOf(ctx.state, id).executor, 'remote');
