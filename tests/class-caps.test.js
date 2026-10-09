@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, BIN } from './helpers.js';
 import { enqueue, tryStart, existingTicket } from '../src/scheduler.js';
 import { runCommand } from '../src/run.js';
+import { loadGlobalConfigOrError } from '../src/config.js';
 import { DEFAULT_GLOBAL_CONFIG, resolveTicketConfig, ConfigError, loadGlobalConfig, reloadGlobalConfig, validateClasses, ClassesConfigError } from '../src/config.js';
 import { writeLease, readLease, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths, atomicWriteJson } from '../src/state.js';
@@ -17,7 +18,7 @@ import { childEnv, remoteSelectOptions } from '../src/supervisor.js';
 import { createAttempt, fallbackToLocal, readAttempt } from '../src/attempts.js';
 import { selectRunner } from '../src/remote-client.js';
 import { makeFakeSshBin, makeRunner, clientEnv } from './remote-harness.js';
-import { CLASS_ENFORCEMENT_ENV, resolveClasses, classTransportMismatch } from '../src/classes.js';
+import { CLASS_ENFORCEMENT_ENV, resolveClasses, classTransportMismatch, classTransport } from '../src/classes.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
 import { loadModules, scenarios, runScript, liveTrace } from './allocation-scenarios.js';
 
@@ -612,16 +613,19 @@ test('an id is matched exactly after the sequence prefix: `job` is a new ticket 
 
 test('a fresh supervisor on a malformed global config has an unknown class policy: sims are denied, a test still runs', async () => {
   const { home, state } = freshEnv();
+  fs.mkdirSync(state, { recursive: true });
+  fs.writeFileSync(paths(state).classesConfigured, 'configured\n'); // classes were configured on this host before the file broke
   fs.writeFileSync(path.join(home, 'config.json'), '{ half written');
-  const prev = process.env.LANE_BROKER_HOME;
-  process.env.LANE_BROKER_HOME = home;
+  const prev = { home: process.env.LANE_BROKER_HOME, state: process.env.LANE_BROKER_STATE };
+  Object.assign(process.env, { LANE_BROKER_HOME: home, LANE_BROKER_STATE: state });
   try {
     const cfg = { ...reloadGlobalConfig(undefined), schedulerMode: 'active', capacity: 64, cpuAdmissionPercent: 100, cpuReserveCores: HOST_CORES - POOL, admissionCooldownMs: 0, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1 };
     assert.equal(resolveClasses(cfg, state).valid, false);
     assert.equal((await admit(state, simTicket('s', 1), cfg)).reason, 'class-config-invalid');
     assert.equal((await admit(state, testTicket('t', 1), cfg)).started, true);
   } finally {
-    process.env.LANE_BROKER_HOME = prev;
+    process.env.LANE_BROKER_HOME = prev.home;
+    process.env.LANE_BROKER_STATE = prev.state;
   }
 });
 
@@ -675,4 +679,56 @@ test('an unavailable required ticket is skip-free: it never heads the queue or b
   await enqueue(state, t);
   assert.equal((await poll(state, head, cfg)).reason, 'class-enforcement-unavailable');
   assert.equal((await poll(state, t, cfg)).started, true);
+});
+
+test('compat: on a host that never configured classes an unreadable or broken config leaves sims allowed, as in 0.28.2', async () => {
+  const { home, state } = freshEnv();
+  const prev = { home: process.env.LANE_BROKER_HOME, state: process.env.LANE_BROKER_STATE };
+  Object.assign(process.env, { LANE_BROKER_HOME: home, LANE_BROKER_STATE: state });
+  try {
+    fs.writeFileSync(path.join(home, 'config.json'), '{ half written');
+    const cfg = reloadGlobalConfig({ ...DEFAULT_GLOBAL_CONFIG, capacity: 9 });
+    assert.equal(cfg.capacity, 9, 'previous settings kept');
+    assert.equal(resolveClasses(cfg, state).valid, true, 'no classes were ever configured: no invalid class policy');
+    assert.equal(resolveClasses(cfg, state).mode, 'off');
+    assert.equal(resolveClasses(loadGlobalConfigOrError().config, state).valid, true);
+    // and once classes were configured on this host, the same breakage denies sims
+    fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify({ version: 1, classes: classes('active') }));
+    loadGlobalConfig();
+    fs.writeFileSync(path.join(home, 'config.json'), '{ half written');
+    assert.equal(resolveClasses(reloadGlobalConfig({ ...DEFAULT_GLOBAL_CONFIG }), state).valid, false);
+  } finally {
+    process.env.LANE_BROKER_HOME = prev.home;
+    process.env.LANE_BROKER_STATE = prev.state;
+  }
+});
+
+test('compat: with no active caps nothing about the class is transported, so no snapshot can be refused for it', async () => {
+  const sim = { class: 'sim' };
+  assert.deepEqual(classTransport(sim, resolveClasses(DEFAULT_GLOBAL_CONFIG, '/x')), { laneClass: undefined, classEnforcement: undefined });
+  assert.deepEqual(classTransport(sim, resolveClasses({ ...DEFAULT_GLOBAL_CONFIG, classes: classes('shadow') }, '/x')), { laneClass: undefined, classEnforcement: undefined });
+  assert.deepEqual(classTransport(sim, resolveClasses({ ...DEFAULT_GLOBAL_CONFIG, classes: classes('active') }, '/x')), { laneClass: 'sim', classEnforcement: undefined });
+  assert.deepEqual(classTransport({ ...sim, classEnforcement: 'required' }, resolveClasses({ ...DEFAULT_GLOBAL_CONFIG, classes: classes('active') }, '/x')), { laneClass: 'sim', classEnforcement: 'required' });
+  assert.equal(classTransportMismatch({}, { lane: 'x', class: 'test' }), null, 'a header without class fields refuses nothing');
+});
+
+test('P2: lane status keeps going on an unreadable global config and reports why', async () => {
+  const { home, state } = freshEnv();
+  writeGlobalConfig(home, { version: 1 });
+  const prev = { home: process.env.LANE_BROKER_HOME, state: process.env.LANE_BROKER_STATE };
+  Object.assign(process.env, { LANE_BROKER_HOME: home, LANE_BROKER_STATE: state });
+  try {
+    fs.chmodSync(home, 0o000);
+    try {
+      const status = await collectStatus();
+      assert.match(status.configError, /unreadable/);
+      assert.match(renderStatusText(status), /global config unreadable/);
+    } finally {
+      fs.chmodSync(home, 0o755);
+    }
+  } finally {
+    fs.chmodSync(home, 0o755);
+    process.env.LANE_BROKER_HOME = prev.home;
+    process.env.LANE_BROKER_STATE = prev.state;
+  }
 });

@@ -12,7 +12,7 @@ import { readLastSimDemandAt } from './sim-arm.js';
 import { listAttempts, supervisorAlive, moveInterruptedLabel } from './attempts.js';
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
-import { loadGlobalConfig } from './config.js';
+import { loadGlobalConfigOrError } from './config.js';
 import { effectiveNow } from './priority-clock.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView } from './fairness.js';
 import { exclusiveHoldView, clampQueuedWeight } from './exclusive.js';
@@ -158,7 +158,7 @@ function logMtimeAgeMs(logPath) {
 
 export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false, scan = scanProcWindow } = {}) {
   const root = ensureStateDirs().root;
-  const cfg = loadGlobalConfig();
+  const { config: cfg, error: configError } = loadGlobalConfigOrError();
   refreshCpuEstimates(cfg);
   let lockError = null;
   try {
@@ -311,6 +311,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     headBlock: computeHeadBlock(root, store, cfg, queue, leases, now, effectiveWeightCapacity(cfg, resourceCapacity.cpuCores)),
     // BRAIN-346: the projected-over-budget head's backfill allowance / reservation, if any.
     resourceBlock: computeResourceBlock(root, store, cfg, queue[0], held, now),
+    ...(configError ? { configError } : {}),
     configWarning: configWarning ? { message: configWarning.message, firstAt: configWarning.firstAt, lastAt: configWarning.lastAt } : null,
     loadGate: {
       closed: gate.closed,
@@ -534,6 +535,7 @@ export function renderStatusText(status) {
     lines.push(`HOLD (exclusive) ${h.id} (${h.key}) waiting for ${h.waitingFor} running lane(s)`);
   }
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
+  if (status.configError) lines.push(`config: global config unreadable: ${status.configError}`);
   if (status.configWarning) {
     lines.push(
       `config: WARNING — some supervisor(s) cannot read the global config and are running on their last known-good ` +

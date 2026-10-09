@@ -6,7 +6,7 @@ import { touchSimArmFor } from './sim-arm.js';
 import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { terminalRowDefaults } from './resources.js';
 import { remoteCancel } from './remote-client.js';
-import { loadGlobalConfig } from './config.js';
+import { loadGlobalConfigOrError } from './config.js';
 import { writeBrokerLog } from './admission.js';
 import { trackerForLease, reapLogLine } from './descendants.js';
 
@@ -99,7 +99,8 @@ async function cancelAttempt(root, id, attempt) {
 
   // ORPHANED-REMOTE: reconcile directly, no supervisor left to do it.
   writeCancelMarkerFile(root, id);
-  const globalCfg = loadGlobalConfig();
+  const { config: globalCfg, error: configError } = loadGlobalConfigOrError();
+  if (configError) process.stderr.write(`lane cancel: global config unreadable (${configError}); reconciling with defaults\n`);
   // BRAIN-436: a move that was in flight may have left the ticket on either runner, so every runner it names is cancelled.
   const involved = [...new Set([attempt.runner, attempt.moving?.from, attempt.moving?.to].filter(Boolean))];
   const unconfirmed = [];

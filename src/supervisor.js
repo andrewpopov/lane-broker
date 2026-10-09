@@ -27,7 +27,7 @@ import { DescendantTracker, hasLiveMembers, reapLogLine } from './descendants.js
 import { reloadGlobalConfig } from './config.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
-import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired } from './classes.js';
+import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
 import { detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
@@ -832,8 +832,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       // BRAIN-380 §6: the tier BEFORE any cap, and the wait this ticket has accrued on THIS host's priority clock. The
       // runner re-anchors from the wait, never from our timestamps, so clock skew between hosts cannot matter.
       priorityRequested: enriched.priorityRequested,
-      laneClass: enriched.class,
-      classEnforcement: enriched.classEnforcement,
+      ...classTransport(enriched, resolveClasses(globalCfg, root)),
       priorityAccruedMs: waitedMs(enriched, effectiveNow(root)),
       resultWaitMs: globalCfg.remoteResultWaitMs,
       // BRAIN-437: a runner that can withdraw lets a dropped connection prove the job never started; one that cannot leaves it possibly running
@@ -910,6 +909,10 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
 
   // BRAIN-405: a confirmed preflight refusal means the runner never started the job, so a rebound ticket goes back to its place
   if (rebind && dispatch.outcome === 'confirmed' && dispatch.result.kind === 'refused') {
+    // BRAIN-321: a runner that refused this ticket (a class mismatch among other preflight refusals) is never picked for it again,
+    // durably on the attempt, or the rebind loop would re-dispatch to it forever.
+    const refusedRunners = [...new Set([...(readAttempt(root, enriched.id)?.refusedRunners ?? []), runner.name])];
+    await updateAttempt(root, enriched.id, gen, { refusedRunners });
     return abandonRebind(runner, `runner refused the job (exit ${dispatch.exitCode})`, { neverStarted: true });
   }
 
@@ -1180,7 +1183,8 @@ async function main() {
    */
   async function tryRebind() {
     // A ticket that has already moved never goes back to a runner it left (nor to one it is on).
-    const left = new Set((readAttempt(root, ticket.id)?.moves ?? []).flatMap((m) => [m.from, m.to]));
+    const attempt = readAttempt(root, ticket.id);
+    const left = new Set([...(attempt?.moves ?? []).flatMap((m) => [m.from, m.to]), ...(attempt?.refusedRunners ?? [])]);
     const candidates = (globalCfg.runners || []).filter((r) => !left.has(r.name));
     if (candidates.length === 0) return;
     const { runner, probe } = await selectRunner(candidates, { ...remoteSelectOptions(enriched, globalCfg), maxRemoteQueue: 0 });

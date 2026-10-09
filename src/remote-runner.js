@@ -7,7 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
 import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
-import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, loadGlobalConfig } from './config.js';
+import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
 import { CAPABILITIES } from './capabilities.js';
 import { NO_PROGRESS_REASON } from './no-progress.js';
 import { artifactLimitsOf, collectArtifacts, encodeArtifacts, pruneStaleArtifacts } from './remote-artifacts.js';
@@ -528,7 +528,13 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   let pipelineCmd = header.argv;
   if (header.protocol === 2) {
     const remoteRootAbs = path.resolve(root);
-    const runnerCfg = loadGlobalConfig();
+    const { config: runnerCfg, error: configError } = loadGlobalConfigOrError();
+    if (configError) {
+      writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'refused', exit: 64, reason: `runner global config unreadable: ${configError}` }));
+      process.stderr.write(`lane remote-exec: runner global config unreadable: ${configError}\n`);
+      cleanupWork(workDir, tmpDir);
+      return { exitCode: 0 };
+    }
     atomicWriteJson(path.join(ticketDir, 'pipeline.json'), {
       workDir,
       relCwd: header.relCwd || '',
@@ -726,7 +732,7 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot() } = {}) {
   // host's budget, not current load) and reuses the broker's own
   // capacity/budget math -- never re-derived here -- so the client's fit
   // check (1e) agrees with what admission would actually apply.
-  const globalCfg = loadGlobalConfig();
+  const { config: globalCfg } = loadGlobalConfigOrError(); // an unreadable config must not fail the probe; capabilities reports it
   const host = detectResourceCapacity();
   // CPU/memory budgets are only enforced in active mode (checkResourceBudget);
   // in shadow mode they are reported as null so the client never skips on them.

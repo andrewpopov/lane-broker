@@ -730,16 +730,34 @@ function setClassesFence(inForce) {
  * any read/parse/validation failure here falls back to `previous` (or
  * `DEFAULT_GLOBAL_CONFIG` if there is no previous yet) instead of throwing.
  */
+/**
+ * `loadGlobalConfig` for a caller that must not die on an unreadable or invalid config: `{config, error}`, where `config` is the
+ * defaults (class policy marked unknown only where classes were ever configured) and `error` the reason, else null.
+ */
+export function loadGlobalConfigOrError() {
+  try {
+    return { config: loadGlobalConfig(), error: null };
+  } catch (err) {
+    if (!(err instanceof ConfigError)) throw err;
+    return { config: withClassPolicyUnknown({ ...DEFAULT_GLOBAL_CONFIG }, err.message), error: err.message };
+  }
+}
+
+/** A config that could not be (re)read leaves the class policy unknown ONLY where classes were ever configured; elsewhere it is 0.28.2 behaviour. */
+function withClassPolicyUnknown(cfg, reason) {
+  return cfg.classes !== undefined || cfg.classesInvalid !== undefined || classesFenceHeld() ? { ...cfg, classesInvalid: reason } : cfg;
+}
+
 export function reloadGlobalConfig(previous, { onError } = {}) {
   const fallback = previous === undefined ? { ...DEFAULT_GLOBAL_CONFIG } : previous;
   try {
     return loadGlobalConfig();
   } catch (err) {
     if (onError) onError(err);
-    // BRAIN-321: an unreadable or invalid config leaves the class policy UNKNOWN, whether or not a block was ever loaded: a fresh
-    // supervisor must not read it as "off" and admit sims, nor keep old caps. The fallback keeps everything else but marks the
+    // BRAIN-321: an unreadable or invalid config leaves the class policy UNKNOWN wherever classes were ever configured (the durable
+    // marker, or a block in the previous config): a fresh supervisor must not read it as "off" and admit sims, nor keep old caps. The fallback keeps everything else but marks the
     // sim class ineligible until a good reload.
-    return { ...fallback, classesInvalid: err.message };
+    return withClassPolicyUnknown(fallback, err.message);
   }
 }
 

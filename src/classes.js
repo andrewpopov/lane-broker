@@ -92,6 +92,14 @@ export function smallestSimGrant(ticket, cfg, host) {
   return { cores: Number.isFinite(min) ? Math.min(declared.cpuCores, Math.ceil(min)) : declared.cpuCores, memoryBytes: declared.memoryBytes };
 }
 
+/** What a dispatch carries of the lane's class: the sim class only under active caps, enforcement only where the lane requires it. */
+export function classTransport(ticket, classes) {
+  return {
+    laneClass: classes.mode === 'active' && classes.valid && ticket.class === 'sim' ? 'sim' : undefined,
+    classEnforcement: isEnforcementRequired(ticket) ? 'required' : undefined,
+  };
+}
+
 /** Why this runner's own resolution of a lane is LAXER than what the submitter sent, or null. Stricter on the runner is fine. */
 export function classTransportMismatch(expected, resolved) {
   if (expected.classEnforcement === 'required' && resolved.classEnforcement !== 'required') {
