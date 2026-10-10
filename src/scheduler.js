@@ -127,6 +127,12 @@ function findQueueFile(root, id) {
   return match ? path.join(dir, match) : null;
 }
 
+/** The queue record for `id` (null when it is not queued), for a caller that only reads it. */
+export function readQueuedRecord(root, id) {
+  const file = findQueueFile(root, id);
+  return file ? readJsonSafe(file) : null;
+}
+
 /**
  * The ONE ownership check for a ticket id, shared by both entry paths (`createAttempt` for a remote dispatch, `enqueue` for a
  * local queue): the ticket already known under `id` (queued, withdrawn for a rebind, leased, finished, or owned by a remote
@@ -183,6 +189,9 @@ export async function enqueue(root, ticket, cfg = DEFAULT_GLOBAL_CONFIG, { owner
       ...ticket,
       seq,
       createdAt: ticket.createdAt || Date.now(),
+      // BRAIN-509 follow-up: when this ticket entered the LOCAL queue (reset on a restore). `createdAt` also counts time spent
+      // queued on runners, so it cannot say how long the ticket has been stuck here.
+      localSince: Date.now(),
       priorityRequested,
       priorityAdmitted: demoted ? 'medium' : priorityRequested,
       priorityDemoted: demoted,
@@ -244,40 +253,58 @@ export function listRebindingIds(root) {
  * the scheduler and this wins. `restoreQueued` or `discardRebinding` ends the withdrawal.
  */
 export async function withdrawQueued(root, id) {
+  return withLock(root, () => withdrawLocked(root, id));
+}
+
+/**
+ * Remote-fallback rebind to a QUEUED runner: the same withdrawal as `withdrawQueued`, but the admission decision and the
+ * withdrawal are ONE locked step. Local capacity may have freed while the runners were probed, so this ticket's own normal
+ * local admission is evaluated first (as if it were being started now, with only the tickets queued AHEAD of it in the way);
+ * when it would be admitted it is left in the queue for `tryStart` and `{ admissible: true }` is returned. Otherwise it is
+ * withdrawn exactly as `withdrawQueued` does (the record, or null when it is no longer withdrawable).
+ */
+export async function withdrawUnlessAdmissible(root, id, cfg, ticket, memoryReader = readMemoryInfo) {
   return withLock(root, () => {
-    try {
-      assertNotMigrating(root);
-    } catch (err) {
-      if (err instanceof MigrationInProgressError) return null;
-      throw err;
-    }
-    if (isCancelled(root, id)) return null;
-    const file = findQueueFile(root, id);
-    if (!file) return null;
-    const record = readJsonSafe(file);
-    if (!record || record.id !== id) return null;
-    const parked = file.replace(/\.json$/, REBINDING_SUFFIX);
-    const legacyFairness = legacyFairnessOf(root, id);
-    try {
-      fs.renameSync(file, parked);
-    } catch {
-      return null;
-    }
-    try {
-      if (legacyFairness) atomicWriteJson(parked, { ...record, legacyFairness });
-    } catch {
-      // The snapshot is written atomically, so the parked file still holds the original record: put it back in the queue.
-      fs.renameSync(parked, file);
-      return null;
-    }
-    try {
-      patchAttemptLocked(root, id, { rebinding: { rebindingSince: Date.now(), supervisorPid: process.pid } });
-    } catch (err) {
-      fs.renameSync(parked, file);
-      throw err;
-    }
-    return record;
+    advanceHwm(root);
+    reapStale(root, id);
+    if (couldAdmitLocked(root, cfg, ticket, memoryReader, { selfId: id }).admit) return { admissible: true };
+    return { record: withdrawLocked(root, id) };
   });
+}
+
+function withdrawLocked(root, id) {
+  try {
+    assertNotMigrating(root);
+  } catch (err) {
+    if (err instanceof MigrationInProgressError) return null;
+    throw err;
+  }
+  if (isCancelled(root, id)) return null;
+  const file = findQueueFile(root, id);
+  if (!file) return null;
+  const record = readJsonSafe(file);
+  if (!record || record.id !== id) return null;
+  const parked = file.replace(/\.json$/, REBINDING_SUFFIX);
+  const legacyFairness = legacyFairnessOf(root, id);
+  try {
+    fs.renameSync(file, parked);
+  } catch {
+    return null;
+  }
+  try {
+    if (legacyFairness) atomicWriteJson(parked, { ...record, legacyFairness });
+  } catch {
+    // The snapshot is written atomically, so the parked file still holds the original record: put it back in the queue.
+    fs.renameSync(parked, file);
+    return null;
+  }
+  try {
+    patchAttemptLocked(root, id, { rebinding: { rebindingSince: Date.now(), supervisorPid: process.pid } });
+  } catch (err) {
+    fs.renameSync(parked, file);
+    throw err;
+  }
+  return record;
 }
 
 /**
@@ -308,9 +335,9 @@ function restoreLocked(root, record) {
     if (parked) {
       const { legacyFairness: snapshot, ...parkedRecord } = readJsonSafe(parked) ?? record;
       legacyFairness = snapshot ?? null;
-      atomicWriteJson(parked.slice(0, -'.rebinding'.length), parkedRecord);
+      atomicWriteJson(parked.slice(0, -'.rebinding'.length), { ...parkedRecord, localSince: Date.now() });
       fs.unlinkSync(parked);
-    } else atomicWriteJson(queueFile(root, record.seq, record.id), record);
+    } else atomicWriteJson(queueFile(root, record.seq, record.id), { ...record, localSince: Date.now() });
   }
   patchAttemptLocked(root, record.id, { rebinding: undefined });
   // it keeps its original seq, so it is the head again; what another head wrote meanwhile was only valid while it was away
@@ -457,8 +484,11 @@ export async function couldAdmitNow(root, cfg, ticket, memoryReader = readMemory
   });
 }
 
-function couldAdmitLocked(root, cfg, ticket, memoryReader) {
-  if (listQueue(root).length > 0) return { admit: false, reason: 'queue-ahead' };
+/** `selfId`: the ticket is already in the queue, so only a record queued BEFORE it is "ahead" (none queued, or it is not queued at all, otherwise). */
+function couldAdmitLocked(root, cfg, ticket, memoryReader, { selfId = null } = {}) {
+  const queue = listQueue(root);
+  const ahead = selfId === null ? queue.length : queue.findIndex((t) => t?.id === selfId);
+  if (ahead !== 0) return { admit: false, reason: 'queue-ahead' };
   if (fs.existsSync(paths(root).pause)) return { admit: false, reason: 'paused' };
   const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
   if (held.some(isExclusive)) return { admit: false, reason: 'exclusive-held' };

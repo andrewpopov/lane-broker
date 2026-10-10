@@ -502,8 +502,33 @@ What a remote run does:
    on the runner. A running ticket never moves. Never rebound:
    `--local`, `LANE_BROKER_LOCAL=1`, an inherited lease, a lane that is not
    `remote`, and a ticket that fell back for any reason other than "no runner
-   had room" (an ineligible tree, a `remoteDeps` failure, a dispatch that
-   failed after sending).
+   had room" or a provable never-started dispatch failure (below): an
+   ineligible tree, a `remoteDeps` failure, a runner's rejection, or a
+   dispatch that may have run.
+
+   **Queued-runner rebind and dispatch history.** A dispatch that failed with
+   proof the runner never started the job and that says nothing about other
+   runners (the runner's queue timeout expired, the runner gave the ticket
+   up, or the snapshot was never completely sent) also leaves the local
+   fallback rebindable. By default only an idle runner takes a stranded
+   ticket. Once the ticket has sat in this machine's queue for
+   `remoteRebindMinLocalWaitMs` (global config, integer >= 0, default
+   `120000`; `0` disables this path) it may also move to a runner that is
+   itself queued, `1 <= queued <= maxRemoteQueue` deep (the same boundary a
+   fresh dispatch uses; an idle runner is still preferred). The clock is the
+   queue record's `localSince`, set when the ticket enters this machine's
+   queue and reset when a failed rebind puts it back; its `seq`, priority age
+   and fairness are untouched, and `createdAt` (which also counts time spent
+   queued on runners) is not the clock. For a queued runner the decision to
+   withdraw is taken in the same locked step as the withdrawal: if this
+   ticket would be admitted locally right now (it is the head and capacity
+   or its conflicting lease freed during the probe) it stays queued and
+   starts here (`local capacity freed during the probe`); otherwise it is
+   withdrawn and dispatched. This is a bounded policy for long-stranded
+   tickets, not a finish-time prediction. Every runner a ticket is ever
+   dispatched to is recorded on its attempt (`dispatchedRunners`, kept across
+   fallback, restore and rebalance) and is never dispatched to again, so a
+   ticket whose runners have all expired it stays in the local queue.
 
    **Local-first lanes (BRAIN-442).** A lane with `"remotePolicy": "local-first"`
    (default `"remote-first"`, today's behaviour) skips the initial dispatch and

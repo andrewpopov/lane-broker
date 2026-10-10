@@ -1288,3 +1288,38 @@ test('P2: a lost withdraw reply, a closed session, failing fetches, then a retry
   assert.equal(result.to, TARGET);
   assert.equal(result.neverStarted, true);
 });
+
+// ---- retryElsewhere: which never-started outcomes leave a local fallback rebindable to ANOTHER runner ----
+
+test('retryElsewhere: a queue expiry or a withdrawal in the runner\'s queue may be retried on another runner; a rejection or a possibly-run outcome may not', { timeout: 60_000 }, async () => {
+  const cases = [
+    { results: ['QUEUE_TIMEOUT'], retryElsewhere: true, neverStarted: true },
+    { results: ['WITHDRAWN'], retryElsewhere: true, neverStarted: true },
+    { results: ['REJECTED'], retryElsewhere: undefined, neverStarted: true },
+    { results: ['UNFINISHED'], retryElsewhere: undefined, neverStarted: undefined },
+    { results: ['UNBOUND'], retryElsewhere: undefined, neverStarted: undefined },
+  ];
+  for (const { results, retryElsewhere, neverStarted } of cases) {
+    const { result } = await dispatchRebalance({ results, rebalance: null });
+    assert.equal(result.outcome, 'unconfirmed', `${results}: ${JSON.stringify(result)}`);
+    assert.equal(result.retryElsewhere, retryElsewhere, `${results}: ${JSON.stringify(result)}`);
+    assert.equal(result.neverStarted, neverStarted, `${results}: ${JSON.stringify(result)}`);
+    if (retryElsewhere === undefined && neverStarted === undefined) assert.equal(result.mayStillBeRunning, true, `${results}`);
+  }
+});
+
+test('retryElsewhere: a runner-confirmed withdrawal after lost results may be retried; an incomplete snapshot transfer may; an ineligible tree may not', { timeout: 60_000 }, async () => {
+  const lost = await dispatchRebalance({ results: [null], withdraws: [{ action: 'withdrawn' }], rebalance: null });
+  assert.equal(lost.result.outcome, 'unconfirmed', JSON.stringify(lost.result));
+  assert.equal(lost.result.retryElsewhere, true);
+  assert.equal(lost.result.neverStarted, true);
+
+  const unknown = await dispatchRebalance({ results: [null], withdraws: [{ action: 'unknown' }], rebalance: null });
+  assert.equal(unknown.result.mayStillBeRunning, true, JSON.stringify(unknown.result));
+  assert.equal(unknown.result.retryElsewhere, undefined);
+
+  const { binDir, sshBin } = makeFakeSshBin();
+  const ineligible = await dispatchRemote({ ...makeDispatchArgs(), runner: makeRunner({ ssh: 'unused', root: tmpDir('retry-root') }), worktreeRoot: makeGitWorktree({ '.env': 'SECRET=1' }), sshBin, env: clientEnv(binDir).env });
+  assert.equal(ineligible.outcome, 'ineligible', JSON.stringify(ineligible));
+  assert.equal(ineligible.retryElsewhere, undefined);
+});

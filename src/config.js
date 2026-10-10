@@ -99,6 +99,9 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // BRAIN-442: a `remotePolicy: "local-first"` lane queues locally and becomes rebind-eligible only after waiting this long
   // there (a lane may override it with its own `localFirstWaitMs`). Rebinding still needs `remoteRebindIntervalMs` > 0.
   localFirstWaitMs: 90_000,
+  // A ticket stuck in this machine's queue this long (continuously, since it entered or was last restored to it) may rebind to a
+  // runner that is itself queued, up to `maxRemoteQueue` deep (otherwise only an idle runner qualifies). 0 disables that path.
+  remoteRebindMinLocalWaitMs: 120_000,
   // BRAIN-436: a remote ticket that has sat QUEUED on its runner this long is withdrawn and moved to another runner that has
   // real headroom now (needs the runner's `remote-withdraw/1`). 0 disables. The interval is how often the submitter looks, the
   // cooldown is the minimum gap between two moves of one ticket, and the cap is how many times one ticket may move.
@@ -314,6 +317,10 @@ function validateGlobalConfig(cfg, sourcePath) {
   assert(
     Number.isInteger(cfg.localFirstWaitMs) && cfg.localFirstWaitMs >= 0,
     `${sourcePath}: "localFirstWaitMs" must be a non-negative integer`,
+  );
+  assert(
+    Number.isInteger(cfg.remoteRebindMinLocalWaitMs) && cfg.remoteRebindMinLocalWaitMs >= 0,
+    `${sourcePath}: "remoteRebindMinLocalWaitMs" must be a non-negative integer`,
   );
   for (const field of ['remoteRebalanceMinQueuedMs', 'remoteRebalanceCooldownMs', 'remoteRebalanceMaxMoves']) {
     assert(Number.isInteger(cfg[field]) && cfg[field] >= 0, `${sourcePath}: "${field}" must be a non-negative integer`);
