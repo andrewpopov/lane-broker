@@ -793,3 +793,20 @@ test('P2: a runner with an unreadable config answers its probe but is skipped by
   assert.match(picked.skipped[0].reason, /runner config unreadable/);
   void state;
 });
+
+test('a sim that can never fit the host sim cap: shadow admits it and logs the verdict, active denies it class-cap every poll', async () => {
+  const shadow = freshEnv().state;
+  const started = await admit(shadow, simTicket('huge', 3), cfgWith(classes('shadow', { capCores: 2 })));
+  assert.equal(started.started, true, 'shadow behaves exactly as before');
+  assert.match(fs.readFileSync(paths(shadow).admissionLog, 'utf8'), /classCap=class-cap\(shadow\):cap-cores/);
+
+  const { state } = freshEnv();
+  const cfg = cfgWith(classes('active', { capCores: 2 }));
+  const huge = simTicket('huge', 3);
+  for (let i = 0; i < 2; i += 1) {
+    const denied = i === 0 ? await admit(state, huge, cfg) : await poll(state, huge, cfg);
+    assert.equal(denied.started, false);
+    assert.equal(denied.reason, 'class-cap');
+    assert.equal(denied.capReason, 'cap-cores');
+  }
+});

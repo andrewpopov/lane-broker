@@ -262,7 +262,12 @@ reservation. The record is written after the broker lock is released, and only
 for the head's poll or a poll that actually starts a ticket (to keep the log
 small); every queued candidate's verdict (claim, effective and clamped claim,
 reservation, and the existing guards that deny it) is in the head record's
-`candidates=` list. A lane of class `sim` must resolve to at most 2 CPU cores.
+`candidates=` list. A `sim` lane's CPU claim is bounded by the host's `classes.sim.capCores`, not
+by a per-lane limit (only the general 1024-core bound applies). A sim whose
+smallest possible grant (its `minCpuCores` floor, else its claim) exceeds a
+host's `capCores` is reported `classCap=class-cap(shadow):cap-cores` and still
+starts in `shadow`; in `active` it is denied `class-cap` and, because that never
+changes, stays listed as such in `lane status` rather than waiting silently.
 Live enforcement (ROG-2181): the guarantee is that a `sim`-class ticket never delays
 a waiting test ticket, not a literal start order. Behind a head that is not class
 `sim`, a sim starts only through BRAIN-355's safe backfill, which is available on

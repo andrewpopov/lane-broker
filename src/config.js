@@ -505,8 +505,6 @@ export function isValidRemoteArtifactsShape(patterns) {
 /** BRAIN-379: a lane's allocation class; an undeclared class is 'test'. */
 export const LANE_CLASSES = ['test', 'sim'];
 
-/** BRAIN-379: the largest CPU claim a sim lane may resolve to (an unset cpuCores resolves to weight). */
-export const MAX_SIM_CPU_CORES = 2;
 
 function assertNoHookKeys(config, where) {
   const keys = unsupportedHookKeys(config);
@@ -552,10 +550,6 @@ function validateRepoConfig(cfg, sourcePath) {
     }
     if (lane.class !== undefined) {
       assert(LANE_CLASSES.includes(lane.class), `${sourcePath}: lane "${name}".class must be "test" or "sim"`);
-      if (lane.class === 'sim') {
-        const simClaim = lane.cpuCores ?? lane.weight;
-        assert(simClaim <= MAX_SIM_CPU_CORES, `${sourcePath}: lane "${name}" is class "sim", so its CPU claim (${simClaim}) must be <= ${MAX_SIM_CPU_CORES} cores`);
-      }
     }
     if (lane.priority !== undefined) {
       assert(isPriorityTier(lane.priority), `${sourcePath}: lane "${name}".priority must be one of ${PRIORITY_TIERS.join(', ')}`);
