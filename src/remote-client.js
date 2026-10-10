@@ -717,7 +717,7 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
 /**
  * Dispatch one lane run to `runner` over ssh and resolve to exactly one of
  * `{outcome:'ineligible'|'confirmed'|'unconfirmed'|'cancelled', ...}`
- * (BRAIN-319 I1/C6). `neverStarted: true` (BRAIN-405) marks an ineligible/unconfirmed outcome that proves the runner never
+ * (BRAIN-319 I1/C6). `retryElsewhere: true` marks the never-started subset where another runner may do better (a queue expiry or withdrawal in the runner's queue, an incomplete snapshot transfer; not a rejection or ineligibility). `neverStarted: true` (BRAIN-405) marks an ineligible/unconfirmed outcome that proves the runner never
  * began the job (nothing, or only part of the snapshot, was sent); any other unconfirmed outcome may have a live job behind it, and `mayStillBeRunning: true` (BRAIN-363) marks one whose remote cancel was not confirmed, which the caller must not re-run locally. Never throws for a remote/transport failure -- only a
  * genuinely unexpected local error (not `RemoteIneligibleError`) from
  * `buildManifest` propagates.
@@ -940,7 +940,7 @@ export async function dispatchRemote(opts) {
 
   if (!pipeResult.ok) {
     // BRAIN-405: the snapshot was never completely sent, and a runner runs nothing before it has received and verified all of it
-    return { outcome: 'unconfirmed', reason: pipeResult.reason, neverStarted: true };
+    return { outcome: 'unconfirmed', reason: pipeResult.reason, neverStarted: true, retryElsewhere: true };
   }
 
   let record = null;
@@ -1030,7 +1030,7 @@ export async function dispatchRemote(opts) {
       // The move's own withdraw reply was lost and the session closed: this retry is the proof, and the chosen target is where it goes.
       return { outcome: 'moved', from: runner, to: state.attemptedTarget, queuedMs: state.queuedSince === null ? 0 : now() - state.queuedSince, waitedOnRunnerMs: Math.max(0, now() - dispatchedAt), neverStarted: true };
     }
-    if (withdraw.action === 'withdrawn') return { outcome: 'unconfirmed', reason: 'result not available after retries; the runner confirmed it never started the ticket', neverStarted: true };
+    if (withdraw.action === 'withdrawn') return { outcome: 'unconfirmed', reason: 'result not available after retries; the runner confirmed it never started the ticket', neverStarted: true, retryElsewhere: true };
     return {
       outcome: 'unconfirmed',
       reason: `result not available after retries from ${runner.name}; the dispatch may have been accepted and ${withdrawCapable ? `could not be withdrawn (${withdraw.action})` : 'the runner cannot withdraw it'}, so it may still be running and was not re-run`,
@@ -1052,7 +1052,10 @@ export async function dispatchRemote(opts) {
     // the job possibly running (a mismatched or contradictory record says nothing about the runner), and so does an
     // unconfirmed expiry cancel: the caller must not run it a second time.
     if (confirmedExpiryCancel) return { outcome: 'unconfirmed', reason: classification.reason };
-    if (provesNeverStarted(record, expected) && !unconfirmedCancel) return { outcome: 'unconfirmed', reason: classification.reason, neverStarted: true };
+    if (provesNeverStarted(record, expected) && !unconfirmedCancel) {
+      // a runner that rejected the ticket on its merits would reject it again elsewhere; one that expired or gave it up in its queue says nothing about another runner
+      return { outcome: 'unconfirmed', reason: classification.reason, neverStarted: true, ...(record.kind === 'unfinished' ? { retryElsewhere: true } : {}) };
+    }
     return { outcome: 'unconfirmed', reason: classification.reason, mayStillBeRunning: true };
   }
   const confirmed = { outcome: 'confirmed', result: record, exitCode: classification.exitCode, phase: classification.phase, uploadMs };

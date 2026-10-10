@@ -124,7 +124,8 @@
         "resultPath": "/dev/null",
         "class": "sim",
         "seq": 2,
-        "createdAt": 1700000003000
+        "createdAt": 1700000003000,
+        "localSince": 1700000003000
       },
       "000000000004-s2.json": {
         "id": "s2",
@@ -140,7 +141,8 @@
         "resultPath": "/dev/null",
         "class": "sim",
         "seq": 4,
-        "createdAt": 1700000005000
+        "createdAt": 1700000005000,
+        "localSince": 1700000005000
       }
     },
     "liveLog": [
@@ -297,7 +299,8 @@
         "resultPath": "/dev/null",
         "conflicts": [],
         "seq": 1,
-        "createdAt": 1700000002000
+        "createdAt": 1700000002000,
+        "localSince": 1700000002000
       }
     },
     "liveLog": [
@@ -390,7 +393,8 @@
         "logPath": "/dev/null",
         "resultPath": "/dev/null",
         "seq": 1,
-        "createdAt": 1700000002000
+        "createdAt": 1700000002000,
+        "localSince": 1700000002000
       },
       "000000000002-ks1.json": {
         "id": "ks1",
@@ -406,7 +410,8 @@
         "resultPath": "/dev/null",
         "class": "sim",
         "seq": 2,
-        "createdAt": 1700000003000
+        "createdAt": 1700000003000,
+        "localSince": 1700000003000
       }
     },
     "liveLog": [

@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, gitFixture, laneRun, BIN } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, gitFixture, laneRun, laneSpawn, waitFor, BIN } from './helpers.js';
 import { paths, readJsonSafe } from '../src/state.js';
 import { makeTmpDir } from './helpers/tmp.js';
 
@@ -373,3 +373,37 @@ export async function detachAndWait(args, env, cwd, waitTimeout = '180s') {
 export function resultOf(state, id) {
   return readJsonSafe(path.join(paths(state).results, `${id}.json`));
 }
+
+// ---- shared by tests/remote-rebind*.test.js: a ticket held in the local queue behind a local-only holder ----
+
+/** `lane run` of a command that appends where it ran to `file` (a line per execution), and holds until `release` exists if given. */
+export const recordingCmd = (file, release = null) => [
+  process.execPath,
+  '-e',
+  `const fs = require('fs');
+fs.appendFileSync(${JSON.stringify(file)}, (process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local') + '\\n');
+${release ? `const t = setInterval(() => { if (fs.existsSync(${JSON.stringify(release)})) { clearInterval(t); process.exit(0); } }, 50);` : ''}`,
+];
+
+export const linesOf = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split('\n').filter(Boolean) : []);
+export const hasLease = (state) => fs.existsSync(paths(state).leases) && fs.readdirSync(paths(state).leases).some((n) => n.endsWith('.json'));
+
+/** A local-only holder of the lane's key, so every later ticket on that lane waits in the local queue. */
+export async function holdLaneLocally(ctx) {
+  const dir = tmpDir('rebind-hold');
+  const release = path.join(dir, 'release');
+  const holder = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--local', '--', ...recordingCmd(path.join(dir, 'ran'), release)], { env: ctx.env, cwd: ctx.repoDir });
+  await waitFor(() => hasLease(ctx.state), { timeoutMs: 60_000 });
+  return { release: () => fs.writeFileSync(release, ''), holder, done: new Promise((resolve) => holder.on('close', resolve)) };
+}
+
+export const detach = async (ctx, cmd, { env = ctx.env, extra = [] } = {}) => {
+  const started = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', ...extra, '--', ...cmd], { env, cwd: ctx.repoDir });
+  assert.equal(started.code, 0, started.stderr);
+  return started.stdout.trim();
+};
+export const waitResult = async (ctx, id) => {
+  const waited = await laneRun(['wait', id, '--timeout', '60s'], { env: ctx.env });
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}\nadmission log:\n${fs.readFileSync(paths(ctx.state).admissionLog, 'utf8')}`);
+  return readJsonSafe(path.join(paths(ctx.state).results, `${id}.json`));
+};

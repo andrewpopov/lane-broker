@@ -2,8 +2,8 @@ import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, laneSpawn, waitFor, sleep } from './helpers.js';
-import { tmpDir, makeRunner, setup, probeCount } from './remote-harness.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor, sleep } from './helpers.js';
+import { tmpDir, makeRunner, setup, probeCount, recordingCmd, linesOf, hasLease, holdLaneLocally, detach, waitResult } from './remote-harness.js';
 import { selectRunner } from '../src/remote-client.js';
 import { spawn } from 'node:child_process';
 import { enqueue, tryStart, listQueue, withdrawQueued, restoreQueued, recoverRebinding } from '../src/scheduler.js';
@@ -415,38 +415,6 @@ child.on('close', (code) => process.exit(code == null ? 1 : code));
 /** The runner's own broker (a separate home) refuses every job at preflight: its memory reserve leaves no budget. */
 const refuseEverythingOnRunner = (ctx) =>
   fs.writeFileSync(path.join(ctx.runnerHome, 'config.json'), JSON.stringify({ schedulerMode: 'active', sampleMs: 50, capacity: 4, memoryReserveBytes: 1e15 }));
-
-/** `lane run` of a command that appends where it ran to `file` (a line per execution), and holds until `release` exists if given. */
-const recordingCmd = (file, release = null) => [
-  process.execPath,
-  '-e',
-  `const fs = require('fs');
-fs.appendFileSync(${JSON.stringify(file)}, (process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local') + '\\n');
-${release ? `const t = setInterval(() => { if (fs.existsSync(${JSON.stringify(release)})) { clearInterval(t); process.exit(0); } }, 50);` : ''}`,
-];
-
-const linesOf = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split('\n').filter(Boolean) : []);
-const hasLease = (state) => fs.existsSync(paths(state).leases) && fs.readdirSync(paths(state).leases).some((n) => n.endsWith('.json'));
-
-/** A local-only holder of the lane's key, so every later ticket on that lane waits in the local queue. */
-async function holdLaneLocally(ctx) {
-  const dir = tmpDir('rebind-hold');
-  const release = path.join(dir, 'release');
-  const holder = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--local', '--', ...recordingCmd(path.join(dir, 'ran'), release)], { env: ctx.env, cwd: ctx.repoDir });
-  await waitFor(() => hasLease(ctx.state), { timeoutMs: 60_000 });
-  return { release: () => fs.writeFileSync(release, ''), holder, done: new Promise((resolve) => holder.on('close', resolve)) };
-}
-
-const detach = async (ctx, cmd, { env = ctx.env, extra = [] } = {}) => {
-  const started = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', ...extra, '--', ...cmd], { env, cwd: ctx.repoDir });
-  assert.equal(started.code, 0, started.stderr);
-  return started.stdout.trim();
-};
-const waitResult = async (ctx, id) => {
-  const waited = await laneRun(['wait', id, '--timeout', '60s'], { env: ctx.env });
-  assert.equal(waited.code, 0, `stderr: ${waited.stderr}\nadmission log:\n${fs.readFileSync(paths(ctx.state).admissionLog, 'utf8')}`);
-  return readJsonSafe(path.join(paths(ctx.state).results, `${id}.json`));
-};
 
 test('a ticket that fell back to the local queue is rebound once a runner frees up, and runs remotely exactly once', async () => {
   const ctx = controllableRunner();

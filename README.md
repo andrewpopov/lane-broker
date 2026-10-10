@@ -262,7 +262,12 @@ reservation. The record is written after the broker lock is released, and only
 for the head's poll or a poll that actually starts a ticket (to keep the log
 small); every queued candidate's verdict (claim, effective and clamped claim,
 reservation, and the existing guards that deny it) is in the head record's
-`candidates=` list. A lane of class `sim` must resolve to at most 2 CPU cores.
+`candidates=` list. A `sim` lane's CPU claim is bounded by the host's `classes.sim.capCores`, not
+by a per-lane limit (only the general 1024-core bound applies). A sim whose
+smallest possible grant (its `minCpuCores` floor, else its claim) exceeds a
+host's `capCores` is reported `classCap=class-cap(shadow):cap-cores` and still
+starts in `shadow`; in `active` it is denied `class-cap` and, because that never
+changes, stays listed as such in `lane status` rather than waiting silently.
 Live enforcement (ROG-2181): the guarantee is that a `sim`-class ticket never delays
 a waiting test ticket, not a literal start order. Behind a head that is not class
 `sim`, a sim starts only through BRAIN-355's safe backfill, which is available on
@@ -502,8 +507,28 @@ What a remote run does:
    on the runner. A running ticket never moves. Never rebound:
    `--local`, `LANE_BROKER_LOCAL=1`, an inherited lease, a lane that is not
    `remote`, and a ticket that fell back for any reason other than "no runner
-   had room" (an ineligible tree, a `remoteDeps` failure, a dispatch that
-   failed after sending).
+   had room" or a provable never-started dispatch failure (below): an
+   ineligible tree, a `remoteDeps` failure, a runner's rejection, or a
+   dispatch that may have run.
+
+   **Queued-runner rebind and dispatch history.** A dispatch that failed with
+   proof the runner never started the job and that says nothing about other
+   runners (the runner's queue timeout expired, the runner gave the ticket
+   up, or the snapshot was never completely sent) also leaves the local
+   fallback rebindable. By default only an idle runner takes a stranded
+   ticket. Once the ticket has sat in this machine's queue for
+   `remoteRebindMinLocalWaitMs` (global config, integer >= 0, default
+   `120000`; `0` disables this path) it may also move to a runner that is
+   itself queued, `1 <= queued <= maxRemoteQueue` deep (the same boundary a
+   fresh dispatch uses; an idle runner is still preferred). The clock is the
+   queue record's `localSince`, set when the ticket enters this machine's
+   queue and reset when a failed rebind puts it back; its `seq`, priority age
+   and fairness are untouched, and `createdAt` (which also counts time spent
+   queued on runners) is not the clock. A queued-runner rebind withdraws the ticket exactly as an idle-runner rebind does (no extra local-admission check), so a ticket whose lane frees during the probe still moves. This is a bounded policy for long-stranded
+   tickets, not a finish-time prediction. Every runner a ticket is ever
+   dispatched to is recorded on its attempt (`dispatchedRunners`, kept across
+   fallback, restore and rebalance) and is never dispatched to again, so a
+   ticket whose runners have all expired it stays in the local queue. The rebalance of a ticket queued on a runner (`remoteRebalanceMinQueuedMs`) excludes the same history.
 
    **Local-first lanes (BRAIN-442).** A lane with `"remotePolicy": "local-first"`
    (default `"remote-first"`, today's behaviour) skips the initial dispatch and

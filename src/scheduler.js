@@ -127,6 +127,12 @@ function findQueueFile(root, id) {
   return match ? path.join(dir, match) : null;
 }
 
+/** The queue record for `id` (null when it is not queued), for a caller that only reads it. */
+export function readQueuedRecord(root, id) {
+  const file = findQueueFile(root, id);
+  return file ? readJsonSafe(file) : null;
+}
+
 /**
  * The ONE ownership check for a ticket id, shared by both entry paths (`createAttempt` for a remote dispatch, `enqueue` for a
  * local queue): the ticket already known under `id` (queued, withdrawn for a rebind, leased, finished, or owned by a remote
@@ -183,6 +189,9 @@ export async function enqueue(root, ticket, cfg = DEFAULT_GLOBAL_CONFIG, { owner
       ...ticket,
       seq,
       createdAt: ticket.createdAt || Date.now(),
+      // BRAIN-509 follow-up: when this ticket entered the LOCAL queue (reset on a restore). `createdAt` also counts time spent
+      // queued on runners, so it cannot say how long the ticket has been stuck here.
+      localSince: Date.now(),
       priorityRequested,
       priorityAdmitted: demoted ? 'medium' : priorityRequested,
       priorityDemoted: demoted,
@@ -308,9 +317,9 @@ function restoreLocked(root, record) {
     if (parked) {
       const { legacyFairness: snapshot, ...parkedRecord } = readJsonSafe(parked) ?? record;
       legacyFairness = snapshot ?? null;
-      atomicWriteJson(parked.slice(0, -'.rebinding'.length), parkedRecord);
+      atomicWriteJson(parked.slice(0, -'.rebinding'.length), { ...parkedRecord, localSince: Date.now() });
       fs.unlinkSync(parked);
-    } else atomicWriteJson(queueFile(root, record.seq, record.id), record);
+    } else atomicWriteJson(queueFile(root, record.seq, record.id), { ...record, localSince: Date.now() });
   }
   patchAttemptLocked(root, record.id, { rebinding: undefined });
   // it keeps its original seq, so it is the head again; what another head wrote meanwhile was only valid while it was away

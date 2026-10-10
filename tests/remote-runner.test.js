@@ -618,20 +618,41 @@ test('git status --porcelain inside the synthetic repo is clean right after the 
   assert.equal(out().trim(), '');
 });
 
-test('a .gitignore in the snapshot still applies inside the synthetic repo (git check-ignore)', async () => {
+test('a .gitignore in the snapshot still applies inside the synthetic repo to a file the run creates (git check-ignore)', async () => {
   const { env } = freshShadowEnv();
   const root = tmpDir('remote-exec-root');
   const { dir: src, entries } = makeSnapshotSource({
-    '.gitignore': 'ignored.txt\n',
-    'ignored.txt': 'x',
+    '.gitignore': 'build-out/\n',
     'a.txt': 'hello',
   });
-  const header = makeHeader({ argv: ['git', 'check-ignore', 'ignored.txt'] });
+  const header = makeHeader({ argv: ['sh', '-c', 'mkdir -p build-out && echo x > build-out/o.txt && git check-ignore build-out/o.txt'] });
 
   const stream = encodeSnapshot(src, header, entries);
   const { child } = spawnRemoteExec(stream, { env, root });
   const code = await waitClose(child);
-  assert.equal(code, 0, 'git check-ignore exits 0 exactly when the path is ignored');
+  assert.equal(code, 0);
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.kind, 'completed');
+  assert.equal(result.exit, 0, 'git check-ignore exits 0 exactly when the path is ignored');
+});
+
+test('a snapshot file that matches .gitignore (tracked in the source repo anyway) is tracked in the synthetic repo', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({
+    '.gitignore': 'art/generated/*\n',
+    'art/generated/a.png': 'png',
+    'b.txt': 'world',
+  });
+  const header = makeHeader({ argv: ['git', 'ls-files', '--error-unmatch', 'art/generated/a.png'] });
+
+  const stream = encodeSnapshot(src, header, entries);
+  const { child } = spawnRemoteExec(stream, { env, root });
+  const code = await waitClose(child);
+  assert.equal(code, 0);
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.kind, 'completed');
+  assert.equal(result.exit, 0, 'git ls-files lists the force-tracked file, as the source repo does');
 });
 
 // Least-invasive coverage for "a tree mutation between the synthetic commit

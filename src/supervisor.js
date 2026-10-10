@@ -19,7 +19,7 @@ import {
   testDrainAt,
   testHoldAt,
 } from './state.js';
-import { enqueue, existingTicket, tryStart, dequeueSync, couldAdmitNow, withdrawQueued, restoreQueued, discardRebinding } from './scheduler.js';
+import { enqueue, existingTicket, tryStart, dequeueSync, couldAdmitNow, withdrawQueued, restoreQueued, discardRebinding, readQueuedRecord } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { selectLeaseTree } from './cpu.js';
@@ -736,7 +736,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // BRAIN-338: every runner has a queue. Queue on the least-loaded one only
   // when this machine could not start the ticket right now either;
   // otherwise run locally, exactly as when no runner was idle. A ticket this machine would refuse queues regardless.
-  let queuedAt = busyQueuedAt;
+  let queuedAt = busyQueuedAt ?? (rebind?.queued ? `${runner.name}(${probe.queued})` : undefined);
   if (queuedChoice) {
     queuedAt = `${runner.name}(${probe.queued})`;
     const ineligible = localIneligibility();
@@ -769,7 +769,10 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     writeBrokerLog(root, line);
   }
   try {
-    await updateAttempt(root, enriched.id, gen, { phase: 'running', runner: runner.name, ...(rebind ? { executor: 'remote' } : {}), ...(queuedAt ? { queuedAt } : {}) }, { refuseWhileMigrating: true });
+    // Every runner this ticket is ever dispatched to is remembered for good (it survives fallback, restore and rebalance): a runner
+    // keeps a ticket dir for this id, so dispatching to it a second time would meet the first dispatch's stale state.
+    const dispatchedRunners = [...new Set([...(readAttempt(root, enriched.id)?.dispatchedRunners ?? []), runner.name])];
+    await updateAttempt(root, enriched.id, gen, { phase: 'running', runner: runner.name, dispatchedRunners, ...(rebind ? { executor: 'remote' } : {}), ...(queuedAt ? { queuedAt } : {}) }, { refuseWhileMigrating: true });
   } catch (err) {
     if (!(err instanceof MigrationInProgressError)) throw err;
     process.stderr.write(`lane: ${err.message}\n`);
@@ -792,7 +795,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // A rebind retry continues the ticket's earlier moves (they live on the attempt), so the cap and the no-revisit rule hold across it.
   const priorAttempt = rebind ? readAttempt(root, enriched.id) : null;
   const moves = Array.isArray(priorAttempt?.moves) ? [...priorAttempt.moves] : [];
-  const visited = [...new Set([...moves.flatMap((m) => [m.from, m.to]), runner.name])];
+  // the same durable history tryRebind excludes: a runner this ticket was dispatched to or refused by is not a rebalance target either
+  const visited = [...new Set([...moves.flatMap((m) => [m.from, m.to]), ...(priorAttempt?.refusedRunners ?? []), ...(priorAttempt?.dispatchedRunners ?? []), runner.name])];
   let epoch = Number.isInteger(priorAttempt?.dispatchEpoch) ? priorAttempt.dispatchEpoch : 1;
   let priorRemoteQueuedMs = 0;
   let lastMoveAt = moves.length > 0 ? moves.at(-1).at : null;
@@ -898,7 +902,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     try {
       await updateAttempt(
         root, enriched.id, gen,
-        { runner: runner.name, dispatchEpoch: epoch, moves: [...moves], moving: { from: from.name, to: runner.name, phase: 'dispatching', at: lastMoveAt } },
+        { runner: runner.name, dispatchedRunners: [...new Set([...(readAttempt(root, enriched.id)?.dispatchedRunners ?? []), runner.name])], dispatchEpoch: epoch, moves: [...moves], moving: { from: from.name, to: runner.name, phase: 'dispatching', at: lastMoveAt } },
         { refuseWhileMigrating: true },
       );
       movingSet = true;
@@ -1027,7 +1031,9 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   }
 
   // 'ineligible' or 'unconfirmed'
-  return fallbackOrRefuse(runner, dispatch.reason, { neverStarted: dispatch.neverStarted === true });
+  // Only a runner that provably never started it AND says nothing about other runners (a queue expiry or withdrawal, an incomplete
+  // transfer) leaves the fallback rebindable; ineligible, rejected and possibly-run outcomes stay local for good.
+  return fallbackOrRefuse(runner, dispatch.reason, { neverStarted: dispatch.neverStarted === true, rebindable: dispatch.outcome === 'unconfirmed' && dispatch.neverStarted === true && dispatch.retryElsewhere === true });
 }
 
 async function main() {
@@ -1192,14 +1198,16 @@ async function main() {
    * only returns when the ticket is still queued locally -- a dispatched ticket ends in the process exiting, as ever.
    */
   async function tryRebind() {
-    // A ticket that has already moved never goes back to a runner it left (nor to one it is on).
+    // A ticket never goes back to a runner it left, was refused by, or was ever dispatched to (nor to one it is on).
     const attempt = readAttempt(root, ticket.id);
-    const left = new Set([...(attempt?.moves ?? []).flatMap((m) => [m.from, m.to]), ...(attempt?.refusedRunners ?? [])]);
+    const left = new Set([...(attempt?.moves ?? []).flatMap((m) => [m.from, m.to]), ...(attempt?.refusedRunners ?? []), ...(attempt?.dispatchedRunners ?? [])]);
     const candidates = (globalCfg.runners || []).filter((r) => !left.has(r.name));
     if (candidates.length === 0) return;
-    const { runner, probe } = await selectRunner(candidates, { ...remoteSelectOptions(enriched, globalCfg), maxRemoteQueue: 0 });
+    // An idle runner is always taken; a runner that is itself queued (up to maxRemoteQueue) only for a ticket stuck locally long enough.
+    const stuckLocally = globalCfg.remoteRebindMinLocalWaitMs > 0 && Date.now() - (readQueuedRecord(root, ticket.id)?.localSince ?? Date.now()) >= globalCfg.remoteRebindMinLocalWaitMs;
+    const { runner, probe, queuedChoice } = await selectRunner(candidates, { ...remoteSelectOptions(enriched, globalCfg), maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0 });
     if (!runner) return;
-    await runRemoteAttempt(root, enriched, globalCfg, abortController.signal, { generation: attemptGeneration, runner, probe });
+    await runRemoteAttempt(root, enriched, globalCfg, abortController.signal, { generation: attemptGeneration, runner, probe, queued: queuedChoice === true });
   }
   let nextRebindAt = Date.now() + (globalCfg.remoteRebindIntervalMs || 0);
   // BRAIN-442: a local-first ticket is not rebind-eligible until it has waited in the local queue this long
