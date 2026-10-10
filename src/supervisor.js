@@ -19,7 +19,7 @@ import {
   testDrainAt,
   testHoldAt,
 } from './state.js';
-import { enqueue, existingTicket, tryStart, dequeueSync, couldAdmitNow, withdrawQueued, withdrawUnlessAdmissible, restoreQueued, discardRebinding, readQueuedRecord } from './scheduler.js';
+import { enqueue, existingTicket, tryStart, dequeueSync, couldAdmitNow, withdrawQueued, restoreQueued, discardRebinding, readQueuedRecord } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { selectLeaseTree } from './cpu.js';
@@ -758,16 +758,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   if (rebind) {
     // BRAIN-405: the last step before the ticket leaves the local queue. `withdrawQueued` shares tryStart's lock and its
     // dequeue, so either this takes the ticket or the scheduler already did (or it was cancelled): never both, never neither.
-    // A rebind to a QUEUED runner decides admit-or-withdraw in the same locked step; capacity may have freed during the probe.
-    if (rebind.queued) {
-      const decision = await withdrawUnlessAdmissible(root, enriched.id, globalCfg, enriched);
-      withdrawn = decision.record ?? null;
-      if (decision.admissible) {
-        const line = `lane: remote-rebind: ${enriched.id}: ${runner.name}: local capacity freed during the probe — staying in the local queue\n`;
-        process.stderr.write(line);
-        writeBrokerLog(root, line);
-      }
-    } else withdrawn = await withdrawQueued(root, enriched.id);
+    withdrawn = await withdrawQueued(root, enriched.id);
     if (!withdrawn) {
       await logWriter.finish();
       return { fallback: true, rebindLost: true, attemptGeneration: gen };
@@ -804,7 +795,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // A rebind retry continues the ticket's earlier moves (they live on the attempt), so the cap and the no-revisit rule hold across it.
   const priorAttempt = rebind ? readAttempt(root, enriched.id) : null;
   const moves = Array.isArray(priorAttempt?.moves) ? [...priorAttempt.moves] : [];
-  const visited = [...new Set([...moves.flatMap((m) => [m.from, m.to]), runner.name])];
+  // the same durable history tryRebind excludes: a runner this ticket was dispatched to or refused by is not a rebalance target either
+  const visited = [...new Set([...moves.flatMap((m) => [m.from, m.to]), ...(priorAttempt?.refusedRunners ?? []), ...(priorAttempt?.dispatchedRunners ?? []), runner.name])];
   let epoch = Number.isInteger(priorAttempt?.dispatchEpoch) ? priorAttempt.dispatchEpoch : 1;
   let priorRemoteQueuedMs = 0;
   let lastMoveAt = moves.length > 0 ? moves.at(-1).at : null;

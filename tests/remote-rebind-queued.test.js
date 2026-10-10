@@ -4,17 +4,17 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, waitFor, sleep } from './helpers.js';
 import { tmpDir, setup, recordingCmd, linesOf, hasLease, holdLaneLocally, detach, waitResult } from './remote-harness.js';
-import { enqueue, tryStart, listQueue, withdrawQueued, restoreQueued, withdrawUnlessAdmissible } from '../src/scheduler.js';
-import { readAttempt, createAttempt } from '../src/attempts.js';
+import { enqueue, listQueue, withdrawQueued, restoreQueued } from '../src/scheduler.js';
+import { readAttempt } from '../src/attempts.js';
 import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig, ConfigError } from '../src/config.js';
 import { paths } from '../src/state.js';
 
 /**
  * A ticket stranded in the local queue rebinds to a runner that is itself queued (after `remoteRebindMinLocalWaitMs` of local
- * residency), through one locked admit-or-withdraw decision; a runner it was ever dispatched to is never revisited.
+ * residency), withdrawing exactly like an idle-runner rebind; a runner it was ever dispatched to is never revisited (the rebalance side is in remote-rebalance.test.js).
  */
 
-// ---- scheduler: the local-residency clock and the locked admit-or-withdraw decision ----
+// ---- scheduler: the local-residency clock ----
 
 const cfg = { ...DEFAULT_GLOBAL_CONFIG, capacity: 4, schedulerMode: 'shadow' };
 const ticketOf = (id, key = `r:${id}`) => ({ id, key, weight: 1, resources: {}, conflicts: [], supervisorPid: process.pid, supervisorStart: null });
@@ -33,41 +33,6 @@ test('localSince is stamped on enqueue and reset by a restore, which keeps seq, 
   assert.equal(restored.seq, record.seq);
   assert.equal(restored.createdAt, 1000);
   assert.equal(restored.prioOriginAt, record.prioOriginAt);
-});
-
-test('withdrawUnlessAdmissible: a head that local capacity can take now stays queued', async () => {
-  const { state } = freshEnv();
-  await enqueue(state, ticketOf('a'));
-  assert.deepEqual(await withdrawUnlessAdmissible(state, 'a', cfg, ticketOf('a')), { admissible: true });
-  assert.deepEqual(queuedIds(state), ['a']);
-});
-
-test('withdrawUnlessAdmissible: a head blocked by a held conflicting lease is withdrawn, and admissible once that lease is gone', async () => {
-  const { state } = freshEnv();
-  await enqueue(state, ticketOf('holder', 'r:same'));
-  assert.equal((await tryStart(state, ticketOf('holder', 'r:same'), cfg)).started, true);
-  await enqueue(state, ticketOf('a', 'r:same'));
-  const decision = await withdrawUnlessAdmissible(state, 'a', cfg, ticketOf('a', 'r:same'));
-  assert.equal(decision.record.id, 'a');
-  assert.deepEqual(queuedIds(state), []);
-  await restoreQueued(state, decision.record);
-  fs.rmSync(path.join(paths(state).leases, 'holder.json'), { force: true });
-  assert.deepEqual(await withdrawUnlessAdmissible(state, 'a', cfg, ticketOf('a', 'r:same')), { admissible: true });
-  assert.deepEqual(queuedIds(state), ['a']);
-});
-
-test('withdrawUnlessAdmissible: a ticket with another queued ahead of it is withdrawn; a cancelled one is left alone', async () => {
-  const { state } = freshEnv();
-  await enqueue(state, ticketOf('a'));
-  await enqueue(state, ticketOf('b'));
-  const behind = await withdrawUnlessAdmissible(state, 'b', cfg, ticketOf('b'));
-  assert.equal(behind.record.id, 'b');
-  fs.mkdirSync(paths(state).cancel, { recursive: true });
-  fs.writeFileSync(path.join(paths(state).cancel, 'a'), '');
-  assert.deepEqual(await withdrawUnlessAdmissible(state, 'a', cfg, ticketOf('a')), { admissible: true }, 'admission is evaluated first');
-  assert.deepEqual(queuedIds(state), ['a']);
-  const missing = await withdrawUnlessAdmissible(state, 'nobody', cfg, ticketOf('nobody'));
-  assert.equal(missing.record, null);
 });
 
 test('remoteRebindMinLocalWaitMs defaults to 120000, accepts 0, rejects negative and non-integers', () => {
@@ -205,7 +170,7 @@ test('queued-runner rebind: an idle runner still takes the ticket at once, whate
   await hold.done;
 });
 
-test('queued-runner rebind: capacity that frees during the probe wins the locked decision; the ticket runs locally and is not withdrawn', { timeout: 120_000 }, async () => {
+test('queued-runner rebind: withdraws like an idle-runner rebind, even when the lane frees during the probe; the ticket runs once, on the runner', { timeout: 120_000 }, async () => {
   const ctx = queuedRunnerCtx({ config: { remoteRebindMinLocalWaitMs: 300 } });
   const ran = path.join(tmpDir('queued-ran'), 'ran');
   const { hold, id } = await strandedTicket(ctx, ran);
@@ -220,11 +185,10 @@ test('queued-runner rebind: capacity that frees during the probe wins the locked
   await waitFor(() => !hasLease(ctx.state), { timeoutMs: 30_000 });
   fs.writeFileSync(go, '');
   const result = await waitResult(ctx, id);
-  assert.equal(result.executor, 'local');
-  assert.deepEqual(linesOf(ran), ['local']);
-  assert.match(ctx.admissionLog(), /local capacity freed during the probe/);
-  assert.doesNotMatch(ctx.admissionLog(), new RegExp(`remote-rebind: ${id}: seq \\d+ ->`));
-  assert.deepEqual(ctx.execCommands(), [], 'nothing was ever dispatched');
+  assert.equal(result.executor, 'remote');
+  assert.deepEqual(linesOf(ran), ['remote'], 'ran once, on the runner');
+  assert.match(ctx.admissionLog(), new RegExp(`remote-rebind: ${id}: seq \\d+ -> `));
+  assert.equal(ctx.execCommands().length, 1);
 });
 
 test('a runner that timed out the ticket is never revisited: A then B each time out, neither is dispatched twice, and the command runs once, locally', { timeout: 180_000 }, async () => {

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { laneRun, waitFor, sleep, writeGlobalConfig, gitFixture } from './helpers.js';
-import { tmpDir, setup, resultOf } from './remote-harness.js';
+import { tmpDir, setup, resultOf, holdLaneLocally } from './remote-harness.js';
 import { rebalanceBlocked, hasMeasuredHeadroom } from '../src/remote-client.js';
 import { readAttempt, patchAttemptLocked } from '../src/attempts.js';
 import { dispatchRemote } from '../src/remote-client.js';
@@ -457,4 +457,27 @@ test('P2: a ticket rejected before its remote-id exists answers cancelConfirmed,
   const cancelled = await laneRun(['cancel', id], { env: ctx.env });
   assert.equal(cancelled.code, 0, cancelled.stderr);
   assert.equal(readAttempt(ctx.state, id), null);
+});
+
+test('rebalance never picks a runner the ticket was already dispatched to: A times out, the ticket rebinds to B, and B does not rebalance it back to A', T, async () => {
+  const ctx = rebalanceSetup({ paused: ['a', 'b'], rebalance: { remoteRebalanceMinQueuedMs: 0, remoteQueueTimeoutMs: 800, remoteRebindIntervalMs: 300 } });
+  const hold = await holdLaneLocally(ctx);
+  const id = await ctx.start();
+  const queuedLocally = () => listQueue(ctx.state).some((t) => t.id === id);
+  await waitFor(() => queuedLocally() && readAttempt(ctx.state, id)?.dispatchedRunners?.length === 1, { timeoutMs: 60_000 });
+  // A's timeout is behind us; from here a ticket queued on B is eligible to be rebalanced, and it outlives the threshold on B
+  const globalPath = path.join(ctx.home, 'config.json');
+  fs.writeFileSync(globalPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(globalPath, 'utf8')), remoteRebalanceMinQueuedMs: 300, remoteQueueTimeoutMs: 6000 }));
+  await waitFor(() => ctx.fake.count('exec b') === 1, { timeoutMs: 60_000 });
+  await sleep(2500); // many rebalance ticks while it sits queued on B, with A idle in every probe
+  assert.equal(ctx.fake.count('withdraw b'), 0, 'never withdrawn from B back to A');
+  assert.equal(ctx.fake.count('exec a'), 1, 'A was dispatched to once');
+  assert.deepEqual(readAttempt(ctx.state, id).dispatchedRunners, ['a', 'b']);
+  await waitFor(() => queuedLocally() && !ctx.runs().length, { timeoutMs: 60_000 });
+  hold.release();
+  await hold.done;
+  const waited = await ctx.finish(id);
+  assert.equal(waited.code, 0, waited.stderr);
+  assert.deepEqual(ctx.runs().filter((r) => r === 'a' || r === 'b'), [], 'never ran on a runner');
+  assert.equal(ctx.runs().length, 1, 'the command ran exactly once, locally');
 });

@@ -524,16 +524,11 @@ What a remote run does:
    queue record's `localSince`, set when the ticket enters this machine's
    queue and reset when a failed rebind puts it back; its `seq`, priority age
    and fairness are untouched, and `createdAt` (which also counts time spent
-   queued on runners) is not the clock. For a queued runner the decision to
-   withdraw is taken in the same locked step as the withdrawal: if this
-   ticket would be admitted locally right now (it is the head and capacity
-   or its conflicting lease freed during the probe) it stays queued and
-   starts here (`local capacity freed during the probe`); otherwise it is
-   withdrawn and dispatched. This is a bounded policy for long-stranded
+   queued on runners) is not the clock. A queued-runner rebind withdraws the ticket exactly as an idle-runner rebind does (no extra local-admission check), so a ticket whose lane frees during the probe still moves. This is a bounded policy for long-stranded
    tickets, not a finish-time prediction. Every runner a ticket is ever
    dispatched to is recorded on its attempt (`dispatchedRunners`, kept across
    fallback, restore and rebalance) and is never dispatched to again, so a
-   ticket whose runners have all expired it stays in the local queue.
+   ticket whose runners have all expired it stays in the local queue. The rebalance of a ticket queued on a runner (`remoteRebalanceMinQueuedMs`) excludes the same history.
 
    **Local-first lanes (BRAIN-442).** A lane with `"remotePolicy": "local-first"`
    (default `"remote-first"`, today's behaviour) skips the initial dispatch and
