@@ -49,6 +49,7 @@ lane pause "reason" | lane resume
 lane drain ["reason"] | lane undrain       # take a runner out of remote rotation (BRAIN-520)
 lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
 lane gc [--dry-run] [--max <n>]
+lane reconcile [--now] [--json]                             # settle ORPHANED-REMOTE attempts from their runners (BRAIN-515)
 ```
 
 `lane status` adds `  log file unchanged for <duration>` to a RUNNING line once the
@@ -578,8 +579,9 @@ reaped at once and the run reports `130`.
 
 A remote run takes no local capacity or resource reservation. `lane status`
 lists it under REMOTE; if its supervisor dies it shows as ORPHANED-REMOTE
-(it survives a reboot), `lane wait` exits `1` naming it, and `lane cancel`
-reconciles it (best-effort cancel on the runner, then a `130` result).
+(it survives a reboot) until the runner settles it (see "Reconciling an
+ORPHANED-REMOTE attempt" below), and `lane cancel` cancels it on the runner
+(then a `130` result) once the runner confirms.
 
 Runner setup: install this package (same release as the client), make
 `lane` resolvable through the runner's `shell`, and install whatever the
@@ -857,8 +859,30 @@ the job and nothing proves it never started (no `withdrawn` answer, no bound `un
 run locally either. Its attempt is kept (`unresolved`) and reported by `lane status`/`lane wait` as `ORPHANED-REMOTE`, or
 `MOVE-INTERRUPTED` while a move is recorded. `lane cancel` removes it only once every runner it names has confirmed the cancel
 (or proven the ticket absent: a `remote-cancel`/`remote-withdraw` for a ticket the runner has not seen leaves a tombstone, and a
-later `remote-exec` for that id is refused). The one exception is the result-wait expiry (BRAIN-363, `remoteResultWaitMs`): it
-cancels the remote command and confirms that before any local retry, so the retry is sequential, not a concurrent second run.
+later `remote-exec` for that id is refused), whether or not the attempt recorded why it was kept: a supervisor killed outright
+records nothing, yet its job may still be running (BRAIN-515). The one exception is the result-wait expiry (BRAIN-363,
+`remoteResultWaitMs`): it cancels the remote command and confirms that before any local retry, so the retry is sequential, not a
+concurrent second run.
+
+**Reconciling an ORPHANED-REMOTE attempt (BRAIN-515).** A runner that went away (a reboot, a nightly power-off, a dropped
+network) usually comes back knowing what happened to the job, so an orphan is settled from the runner's own answer and never run
+again:
+
+- a result the runner holds is adopted (its exit kept, `reconciled: true`), but only when `classifyRemoteResult` confirms it
+  against the dispatch binding (`protocol`, `generation`, `manifestHash`) the supervisor stored on the attempt before spawning
+  ssh. An `unfinished`, mismatched or unbound record (an attempt from a client older than 0.33.0) is left alone;
+- a job the runner reports `gone` with no result is settled as lost (exit `75`, `reason: runner-lost`) only after the runner
+  confirms a `remote-cancel`, so it can no longer be running or start there;
+- a job the runner still runs is left alone; so is anything when the runner cannot be reached.
+
+`lane wait` asks the runner inline: it returns the settled exit, keeps waiting while the runner reports the job running (asking
+again every 30 s, `--timeout` still honoured, though one reconcile may overrun it by its ssh deadlines), and exits `1` naming
+the reason otherwise. `lane status` starts `lane reconcile` detached whenever it lists an orphan and never waits on ssh itself.
+`lane reconcile [--now] [--json]` runs the sweep by hand: one sweep per 5 minutes per broker (claimed under the broker lock;
+`--now` skips the interval), oldest attempt first, and a runner whose first answer is a transport failure is skipped for the rest
+of that sweep. Every publish goes through `publishTerminal`, which settles an attempt exactly once: a second publisher (a racing
+`lane cancel`, another sweep, the supervisor) finds no record and writes nothing. A confirmed `remote-cancel` trusts the runner's
+own cancel, whose descendant reap reports survivors without failing.
 
 **Herd avoidance is best-effort.** Several tickets can still choose the same idle runner in the same interval: the destination is
 not reserved, only the runner's probe (which counts reserved cores at once) limits the pile-up. The cap, the cooldown and
