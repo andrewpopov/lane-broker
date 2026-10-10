@@ -593,7 +593,13 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       // else advances this attempt's generation while this supervisor is
       // its sole writer), but a real terminal outcome must never be
       // silently dropped -- fail loud rather than hang or exit 0.
-      process.stderr.write(`lane-broker supervisor: could not publish a result for ${enriched.id}\n`);
+      // `alreadyPublished` is the same shape of problem from the other side:
+      // another publisher settled the attempt first, so its result stands.
+      process.stderr.write(
+        published.alreadyPublished
+          ? `lane-broker supervisor: ${enriched.id} was already settled by another publisher; not overwriting its result\n`
+          : `lane-broker supervisor: could not publish a result for ${enriched.id}\n`,
+      );
       process.exit(1);
       return;
     }
@@ -1562,6 +1568,14 @@ async function main() {
           writeResult({ ...result, executor: 'local', fallbackReason });
         }
       });
+      if (published.alreadyPublished) {
+        // Another publisher settled this attempt first; its result stands. This lease is still ours to release.
+        removeLease(root, ticket.id);
+        touchSimArmFor(root, ticket);
+        clearTicketMarkers(root, ticket.id);
+        process.exit(exitCode);
+        return;
+      }
       if (published.ok) {
         process.exit(exitCode);
         return;

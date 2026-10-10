@@ -144,6 +144,36 @@ test('SIGKILLing the supervisor mid-remote-dispatch: status shows ORPHANED-REMOT
   assert.equal(resultOf(state, id).exit, 130, 'the already-published result must be untouched');
 });
 
+test('BRAIN-515: lane cancel of an abruptly killed supervisor (no `unresolved`, no `moving`) whose runner cannot confirm the cancel keeps the attempt and exits 1', async () => {
+  const { env, home, state, runnerRoot, repoDir } = setup();
+  const { id } = await startSleepingRemote(env, repoDir);
+  const attempt = readAttempt(state, id);
+  assert.equal(attempt.unresolved, undefined, 'a SIGKILLed supervisor never got to record why');
+  assert.equal(attempt.moving, undefined);
+  process.kill(attempt.supervisor.pid, 'SIGKILL');
+  await sleep(300);
+
+  const globalCfg = JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8'));
+  const reachable = globalCfg.runners;
+  writeGlobalConfig(home, { ...globalCfg, runners: reachable.map((r) => ({ ...r, ssh: 'down' })) });
+  try {
+    const cancelled = await laneRun(['cancel', id], { env });
+    assert.equal(cancelled.code, 1, `stderr: ${cancelled.stderr}`);
+    assert.match(cancelled.stderr, /still held: remote-cancel not confirmed on skybox/);
+    assert.ok(readAttempt(state, id), 'the attempt record must survive an unconfirmed remote cancel');
+    assert.equal(resultOf(state, id), null, 'no result may be published while the runner may still run the job');
+    assert.equal(fs.existsSync(paths(state).history) ? fs.readFileSync(paths(state).history, 'utf8').trim() : '', '', 'no history row either');
+  } finally {
+    // The runner is reachable again: the retry confirms the cancel and settles the record.
+    writeGlobalConfig(home, { ...globalCfg, runners: reachable });
+    const retried = await laneRun(['cancel', id], { env });
+    assert.equal(retried.code, 0, `stderr: ${retried.stderr}`);
+  }
+  assert.equal(readAttempt(state, id), null, 'once the runner confirms, the record is settled');
+  assert.equal(resultOf(state, id).cancelled, true);
+  assert.ok(fs.readdirSync(path.join(runnerRoot, 'tickets')).length > 0);
+});
+
 test('an attempt record survives a changed boot id and still reports ORPHANED-REMOTE', async () => {
   const { env, state, repoDir } = setup();
   const { id } = await startSleepingRemote(env, repoDir);

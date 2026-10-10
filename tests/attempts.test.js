@@ -145,6 +145,81 @@ test('publishTerminal with a stale generation refuses and never calls resultWrit
   assert.ok(readAttempt(state, 'id7'), 'a refused publish must never remove the attempt record');
 });
 
+test('publishTerminal on an absent attempt with a cancel marker present never calls the writer and reports alreadyPublished', async () => {
+  const { state } = freshEnv();
+  writeCancelMarker(state, 'gone1');
+  let called = false;
+  const result = await publishTerminal(state, 'gone1', 0, () => {
+    called = true;
+  });
+  assert.deepEqual(result, { ok: false, alreadyPublished: true });
+  assert.equal(called, false);
+});
+
+test('publishTerminal on an absent attempt without a cancel marker reports alreadyPublished and never calls the writer', async () => {
+  const { state } = freshEnv();
+  let called = false;
+  const result = await publishTerminal(state, 'gone2', 0, () => {
+    called = true;
+  });
+  assert.deepEqual(result, { ok: false, alreadyPublished: true });
+  assert.equal(called, false);
+});
+
+for (const order of [['cancelled', 'plain'], ['plain', 'cancelled']]) {
+  test(`two publishTerminal calls for one id (${order.join(' then ')}) call the writer exactly once`, async () => {
+    const { state } = freshEnv();
+    const id = `twice-${order[0]}`;
+    await createAttempt(state, id, {});
+    const writes = [];
+    const publish = async (kind) => {
+      // The cancel marker is durable, so it is already visible to whichever publisher comes second.
+      if (kind === 'cancelled') writeCancelMarker(state, id);
+      return publishTerminal(state, id, 0, (outcome) => {
+        writes.push({ kind, outcome });
+      });
+    };
+    const first = await publish(order[0]);
+    const second = await publish(order[1]);
+    assert.equal(first.ok, true);
+    assert.deepEqual(second, { ok: false, alreadyPublished: true });
+    assert.equal(writes.length, 1, 'the second publisher must not overwrite the first result');
+    assert.equal(writes[0].kind, order[0]);
+  });
+}
+
+test('publishTerminal: expect returning false on either branch writes nothing and keeps the attempt', async () => {
+  const { state } = freshEnv();
+  await createAttempt(state, 'exp1', {});
+  let called = false;
+  const plain = await publishTerminal(state, 'exp1', 0, () => {
+    called = true;
+  }, { expect: () => false });
+  assert.deepEqual(plain, { ok: false, stale: true });
+  writeCancelMarker(state, 'exp1');
+  const cancelled = await publishTerminal(state, 'exp1', 0, () => {
+    called = true;
+  }, { expect: () => false });
+  assert.deepEqual(cancelled, { ok: false, stale: true });
+  assert.equal(called, false);
+  assert.ok(readAttempt(state, 'exp1'), 'a stale publish must never remove the attempt record');
+});
+
+test('publishTerminal: expect is evaluated against the record read under the lock, and true publishes as before', async () => {
+  const { state } = freshEnv();
+  await createAttempt(state, 'exp2', { runner: 'skybox' });
+  let seen = null;
+  const result = await publishTerminal(state, 'exp2', 0, () => {}, {
+    expect: (current) => {
+      seen = current;
+      return current.runner === 'skybox';
+    },
+  });
+  assert.equal(result.ok, true);
+  assert.equal(seen.id, 'exp2');
+  assert.equal(readAttempt(state, 'exp2'), null);
+});
+
 test('supervisorAlive is false for a dead pid', async () => {
   const { state } = freshEnv();
   const pid = await deadPid();
