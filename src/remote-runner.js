@@ -70,7 +70,10 @@ function gitInitSnapshot(workDir) {
   const gitArgs = ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false', '-c', 'core.autocrlf=false', '-c', 'core.fileMode=true', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false'];
   try {
     execFileSync('git', [...gitArgs, 'init', '-q'], common);
-    execFileSync('git', [...gitArgs, 'add', '-A'], common);
+    // --force: every file in the work dir right now IS the snapshot (verified against the manifest just after), and a
+    // snapshot never carries an untracked ignored file, so an ignored path here is one the source repo tracks anyway
+    // (force-added art, fixtures). Without it `git ls-files` on the runner omitted them (towerpower: 776 such files).
+    execFileSync('git', [...gitArgs, 'add', '-A', '--force'], common);
     execFileSync('git', [...gitArgs, 'commit', '-q', '-m', 'snapshot'], common);
   } catch (err) {
     const stderr = err.stderr ? err.stderr.toString('utf8').trim() : err.message;
