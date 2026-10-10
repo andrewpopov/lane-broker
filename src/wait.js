@@ -4,6 +4,22 @@ import { readLease, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
 import { readAttempt, supervisorAlive, moveInterruptedLabel } from './attempts.js';
 import { cancelCommand } from './cancel.js';
+import { loadGlobalConfigOrError } from './config.js';
+import { reconcileRemoteAttempt } from './remote-reconcile.js';
+
+const RECONCILE_SSH_DEADLINE_MS = 30_000;
+const RECONCILE_MIN_SSH_DEADLINE_MS = 1_000;
+// Test-only seam (README "Testing hooks"): how long a runner-reported-running orphan waits before asking the runner again.
+const reconcileIntervalMs = () => Number(process.env.LANE_BROKER_TEST_RECONCILE_INTERVAL_MS) || 30_000;
+
+/** BRAIN-515: ask the runner about an ORPHANED-REMOTE attempt. An unreadable global config means the runner cannot be reached. */
+async function reconcileOrphan(root, id, deadline) {
+  const { config, error } = loadGlobalConfigOrError();
+  if (error) return { settled: false, state: 'unreachable', reason: `global config unreadable (${error})` };
+  const remaining = deadline ? deadline - Date.now() : Infinity;
+  const deadlineMs = Math.max(RECONCILE_MIN_SSH_DEADLINE_MS, Math.min(RECONCILE_SSH_DEADLINE_MS, remaining));
+  return reconcileRemoteAttempt(root, id, { globalCfg: config, deadlineMs });
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -43,6 +59,7 @@ export async function waitCommand(id, { timeoutMs } = {}) {
   // enqueueing yet. NOT_FOUND_GRACE_MS is shared with run.js's
   // describeLaneState (src/lease.js) -- one tolerance for this race, not two.
   let notFoundSince = null;
+  let lastReconcileAt = null;
   try {
     for (;;) {
       const result = readJsonSafe(resultPath);
@@ -107,12 +124,31 @@ export async function waitCommand(id, { timeoutMs } = {}) {
         const settledAttempt = readAttempt(root, id);
         if (settledAttempt && !supervisorAlive(settledAttempt)) {
           const moveLabel = moveInterruptedLabel(id, settledAttempt);
-          const label = moveLabel ?? (settledAttempt.executor === 'remote' ? 'ORPHANED-REMOTE' : 'ORPHANED (post-fallback)');
-          process.stderr.write(
-            `lane wait: ${id} is ${label} (runner ${settledAttempt.runner ?? 'unknown'}) -- its supervisor is gone and nothing ` +
-              `will ever produce a result; reconcile with: lane cancel ${id}\n`,
-          );
-          return { exitCode: 1 };
+          if (moveLabel || settledAttempt.executor !== 'remote') {
+            const label = moveLabel ?? 'ORPHANED (post-fallback)';
+            process.stderr.write(
+              `lane wait: ${id} is ${label} (runner ${settledAttempt.runner ?? 'unknown'}) -- its supervisor is gone and nothing ` +
+                `will ever produce a result; reconcile with: lane cancel ${id}\n`,
+            );
+            return { exitCode: 1 };
+          }
+          // ORPHANED-REMOTE: the runner knows what happened to the job, so ask it (never re-runs anything). A settled
+          // outcome is read back by the top of the loop; a job the runner still has keeps polling like any in-flight
+          // ticket, asking again at most every reconcileIntervalMs().
+          if (lastReconcileAt === null || Date.now() - lastReconcileAt >= reconcileIntervalMs()) {
+            const outcome = await reconcileOrphan(root, id, deadline);
+            if (outcome.settled) continue;
+            if (outcome.state === 'running') lastReconcileAt = Date.now();
+            else if (outcome.state !== 'skipped') {
+              const runnerName = settledAttempt.runner ?? 'unknown';
+              process.stderr.write(
+                `lane wait: ${id} is ORPHANED-REMOTE (runner ${runnerName}) -- its supervisor is gone and the runner could not settle it ` +
+                  `(${outcome.state}${outcome.reason ? `: ${outcome.reason}` : ''}); it will be reconciled automatically once ${runnerName} ` +
+                  `answers (lane status); or: lane cancel ${id}\n`,
+              );
+              return { exitCode: 1 };
+            }
+          }
         }
       }
       const found = lease || listQueue(root).some((t) => t && t.id === id) || Boolean(attempt);

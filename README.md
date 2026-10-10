@@ -1890,6 +1890,9 @@ What a run leaves behind is collected; what a live one owns never is. Everything
   inside the exact gap between wait's own unlocked reads of result.json and
   the attempt's liveness, the race BRAIN-319 fixed (a completed run
   observed mid-publish must never be reported as ORPHANED-REMOTE).
+- `LANE_BROKER_TEST_RECONCILE_INTERVAL_MS` — overrides the 30 s minimum gap between
+  `lane wait`'s re-asks of a runner that still reports an ORPHANED-REMOTE ticket's
+  job running (BRAIN-515), so a test can watch the re-ask without waiting 30 s.
 - `LANE_BROKER_TEST_PAUSE_AFTER_QUEUE_TIMEOUT` — if set, a queued supervisor
   pauses right after `tryStart` returns `reason: 'queue-timeout'`, before its
   own recheck of the durable cancel marker, until the named file appears --
