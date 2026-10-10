@@ -9,6 +9,7 @@ import { readAttempt } from '../src/attempts.js';
 import { cancelAttempt } from '../src/cancel.js';
 import { paths, atomicWriteJson, writeCancelMarkerFile, ensureStateDirs } from '../src/state.js';
 import { reconcileRemoteAttempt } from '../src/remote-reconcile.js';
+import { relayedUsage } from '../src/remote-relay.js';
 
 /**
  * BRAIN-515: `reconcileRemoteAttempt` settles an ORPHANED-REMOTE attempt from the runner's own answer, and never runs anything
@@ -148,7 +149,9 @@ test('a completed runner result matching the dispatch binding is adopted: exit k
   assert.equal(result.executor, 'remote');
   assert.equal(result.runner, 'skybox');
   assert.equal(result.remoteKind, 'completed');
-  assert.ok(result.observedCpu, 'the runner usage is relayed');
+  // A short job may finish before the runner's first CPU sample, so compare against what the runner actually recorded.
+  const usageOf = (r) => Object.fromEntries(['observedCpu', 'observedRssPeakBytes', 'cpuSeconds'].filter((k) => k in r).map((k) => [k, r[k]]));
+  assert.deepEqual(usageOf(result), relayedUsage(record), 'the runner usage is relayed exactly');
   const rows = historyRows(ctx.state);
   assert.equal(rows.length, 1);
   assert.equal(rows[0].reconciled, true);

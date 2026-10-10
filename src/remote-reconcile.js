@@ -17,7 +17,8 @@ import { writeBrokerLog } from './admission.js';
  * Anything else leaves the attempt untouched, with the state saying why: `running` (the runner still has it), `unreachable`
  * (no usable answer), `ambiguous` (a record that cannot be trusted), `skipped` (not an orphan, or already settled).
  *
- * Returns `{ settled, state, exit?, reason? }`; never throws.
+ * Returns `{ settled, state, exit?, reason?, transport? }` (`transport: true`: the runner gave no usable answer at all, so asking it
+ * about another attempt would fail the same way); never throws.
  */
 export async function reconcileRemoteAttempt(root, id, { globalCfg, sshBin = 'ssh', env, deadlineMs = 30_000 } = {}) {
   try {
@@ -42,7 +43,7 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs }) {
   if (!runner) return { settled: false, state: 'unreachable', reason: 'runner not configured' };
 
   const fetched = await fetchRemoteResult(runner, id, sshBin, deadlineMs, env);
-  if (fetched === null) return { settled: false, state: 'unreachable', reason: `no usable answer from ${runner.name}` };
+  if (fetched === null) return { settled: false, state: 'unreachable', transport: true, reason: `no usable answer from ${runner.name}` };
 
   const publish = (kind, build) => publishSettled(root, id, attempt, runner, resultPath, kind, build);
 

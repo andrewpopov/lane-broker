@@ -1,5 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { ensureStateDirs, paths, withLock, bootId, readJsonSafe, readDrainMarker, readRemoteDrain } from './state.js';
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
 import { listQueueCapped, reapOrphanedQueue, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState, readResourceSkipState, futileFresh } from './scheduler.js';
@@ -23,6 +25,8 @@ import { priorityOf, effectiveRank, tierName } from './priority.js';
 import { leaseOverrun } from './observed.js';
 import { topExternalCpu, externalBusyCores, windowExternalCores, scanProcWindow, starvedStaleMs, starvedForMs } from './external-cpu.js';
 import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores, cpuBudgetCores } from './resources.js';
+
+const LANE_BIN = fileURLToPath(new URL('../bin/lane.js', import.meta.url));
 
 /** Holder pid of the global lock, read directly off disk — used to name the
  *  holder in the "couldn't take the lock" diagnostic without re-taking it. */
@@ -606,7 +610,7 @@ export function renderStatusText(status) {
       lines.push('  (none)');
     } else {
       for (const r of status.remote) {
-        const flag = r.moveInterrupted ? `  [${r.moveInterrupted}] — reconcile with: lane cancel ${r.id}` : r.orphaned ? `  [ORPHANED-REMOTE] — reconcile with: lane cancel ${r.id}` : '';
+        const flag = r.moveInterrupted ? `  [${r.moveInterrupted}] — reconcile with: lane cancel ${r.id}` : r.orphaned ? `  [ORPHANED-REMOTE] — reconciles automatically when ${r.runner ?? 'its runner'} answers (or: lane cancel ${r.id})` : '';
         lines.push(`  ${r.id}  runner=${r.runner ?? '-'}  phase=${r.phase}  elapsed=${fmtMs(r.elapsedMs)}${flag}`);
       }
     }
@@ -631,9 +635,24 @@ function writeAndFlush(stream, text) {
   });
 }
 
+/** BRAIN-515: an ORPHANED-REMOTE row means a runner may be able to settle it now. Start `lane reconcile` detached and never wait
+ *  on it (status does no ssh itself); the sweep's own 5-minute claim rate-limits it, so every status call may spawn one. */
+function spawnReconcileSweep(status) {
+  if (process.env.LANE_BROKER_TEST_NO_STATUS_RECONCILE === '1') return;
+  if (!status.remote?.some((r) => r.orphaned && !r.moveInterrupted)) return;
+  try {
+    const child = spawn(process.execPath, [LANE_BIN, 'reconcile'], { detached: true, stdio: 'ignore', env: process.env });
+    child.on('error', () => {});
+    child.unref();
+  } catch {
+    // best effort: the next status call tries again
+  }
+}
+
 export async function statusCommand({ json } = {}) {
   const root = ensureStateDirs().root;
   const status = await collectStatus({ scanExternal: true });
+  spawnReconcileSweep(status);
 
   // The lock diagnostic goes to stderr in BOTH modes, before either branch:
   // a --json caller that only reads stdout still gets `lockError` in the

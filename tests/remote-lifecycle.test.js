@@ -99,7 +99,7 @@ test('lane cancel on a live remote ticket exits 130, never runs locally, and the
   assert.equal(record.kind, 'cancelled');
 });
 
-test('SIGKILLing the supervisor mid-remote-dispatch: status shows ORPHANED-REMOTE, wait exits 1 naming it, cancel reconciles, and a second cancel is a no-op', async () => {
+test('SIGKILLing the supervisor mid-remote-dispatch: status shows ORPHANED-REMOTE, wait keeps waiting on the still-running job, cancel reconciles, and a second cancel is a no-op', async () => {
   const { env, state, runnerRoot, repoDir } = setup();
   const { id } = await startSleepingRemote(env, repoDir);
 
@@ -117,10 +117,12 @@ test('SIGKILLing the supervisor mid-remote-dispatch: status shows ORPHANED-REMOT
   const statusText = (await laneRun(['status'], { env })).stdout;
   assert.match(statusText, /ORPHANED-REMOTE/);
 
+  // BRAIN-515: the runner still has the job running, so wait asks it and keeps waiting rather than giving up; its
+  // --timeout ends the wait (75, not failed) and nothing is settled while the job runs.
   const waited = await laneRun(['wait', id, '--timeout', '5s'], { env });
-  assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
-  assert.match(waited.stderr, /ORPHANED-REMOTE/);
-  assert.match(waited.stderr, new RegExp(`lane cancel ${id}`));
+  assert.equal(waited.code, 75, `stderr: ${waited.stderr}`);
+  assert.ok(readAttempt(state, id), 'a job the runner still runs must not be settled');
+  assert.equal(resultOf(state, id), null);
 
   const cancelResult = await laneRun(['cancel', id], { env });
   assert.equal(cancelResult.code, 0, `stderr: ${cancelResult.stderr}`);
