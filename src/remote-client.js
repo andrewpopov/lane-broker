@@ -535,7 +535,7 @@ function sleepUnlessAborted(ms, abortSignal) {
 
 /** `lane remote-result <ticketId>` over ssh, bounded by `deadlineMs`. Returns the parsed
  *  record, `{missing:true}`, or `null` on any transport/parse failure (never throws). */
-async function fetchRemoteResult(runner, ticketId, sshBin, deadlineMs, env) {
+export async function fetchRemoteResult(runner, ticketId, sshBin, deadlineMs, env) {
   const cmd = buildRemoteCommand(runner, 'remote-result', [ticketId]);
   const res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
   if (res.timedOut || res.code !== 0) return null;
@@ -816,6 +816,9 @@ export async function dispatchRemote(opts) {
     rebalance = null,
     // BRAIN-436: called once the whole snapshot has been handed to `runner` (it holds the job from here on).
     onSnapshotSent,
+    // BRAIN-515: called with `{protocol, ticketId, generation, manifestHash}` BEFORE ssh is spawned, so the caller can persist the
+    // binding a later reconcile needs to trust a result record fetched for this dispatch.
+    onBinding,
   } = opts;
   const withdrawCapable = (rebalance?.canWithdraw ?? canWithdraw) === true;
 
@@ -885,6 +888,15 @@ export async function dispatchRemote(opts) {
 
   const snapshotStream = encodeSnapshot(worktreeRoot, header, manifest.entries);
 
+  const expected = { protocol, ticketId, generation, manifestHash: manifest.manifestHash };
+  if (onBinding) {
+    try {
+      await onBinding(expected);
+    } catch {
+      // a bookkeeping failure never changes the dispatch
+    }
+  }
+
   const execCommand = buildRemoteCommand(runner, 'remote-exec');
   const child = spawn(sshBin, sshArgv(runner, execCommand), { stdio: ['pipe', 'pipe', 'pipe'], env });
   if (onStdout) child.stdout.on('data', onStdout);
@@ -910,7 +922,6 @@ export async function dispatchRemote(opts) {
       // a bookkeeping failure never changes the dispatch
     }
   }
-  const expected = { protocol, ticketId, generation, manifestHash: manifest.manifestHash };
   const closed = waitClosed(child, abortSignal);
   let move = null;
   const state = { runner, epoch: 1, attemptedTarget: null, attemptedReason: null, queuedSince: null };

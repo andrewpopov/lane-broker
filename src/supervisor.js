@@ -36,9 +36,10 @@ import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remo
 import { REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
 import { createAttempt, readAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX } from './admission.js';
+import { relayedUsage, relayedDeps } from './remote-relay.js';
 import { maybeDailyGc } from './gc.js';
 import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, noProgressMessage } from './no-progress.js';
-import { observedLeaseFields, summarizeObservedCpu, sanitizeObservedCpu, sanitizeRssPeak, integratedCpuSeconds, sanitizeCpuSeconds } from './observed.js';
+import { observedLeaseFields, summarizeObservedCpu, sanitizeRssPeak, integratedCpuSeconds } from './observed.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
 const CANCEL_GRACE_MS = 10_000;
@@ -368,18 +369,6 @@ export function applyHeartbeatObservation(lease, observed, now = Date.now(), obs
 /** BRAIN-425: the first CPU sample is taken this long after spawn (capped at sampleMs), so a short run is still observed. */
 const EARLY_SAMPLE_MS = 1000;
 
-/** BRAIN-361: a runner's usage fields, each kept only when well-formed; a malformed one is dropped, never thrown on. */
-function relayedUsage(result) {
-  const observedCpu = sanitizeObservedCpu(result?.observedCpu);
-  const rssPeak = sanitizeRssPeak(result?.observedRssPeakBytes);
-  const cpuSeconds = sanitizeCpuSeconds(result?.cpuSeconds);
-  return {
-    ...(observedCpu ? { observedCpu } : {}),
-    ...(rssPeak !== undefined ? { observedRssPeakBytes: rssPeak } : {}),
-    ...(cpuSeconds !== undefined ? { cpuSeconds } : {}),
-  };
-}
-
 /**
  * BRAIN-425: `remotePhasesMs`, the remote run's phase wall times. The runner's own (`snapshotMs` receive+verify, `setupMs`
  * deps+setup, `commandMs`, `artifactsMs` collection) ride in its result; the submitter adds `uploadMs` (writing the snapshot
@@ -391,13 +380,6 @@ function relayedPhases(dispatch) {
   for (const key of REMOTE_PHASE_KEYS) own[key] = dispatch.result?.phasesMs?.[key];
   const phases = Object.fromEntries(Object.entries(own).filter(([, v]) => Number.isFinite(v) && v >= 0));
   return Object.keys(phases).length > 0 ? { remotePhasesMs: phases } : {};
-}
-
-/** BRAIN-389: the runner's deps-phase outcome (hit|miss|skip) and wall time, each kept only when well-formed. */
-function relayedDeps(result) {
-  const deps = result?.deps;
-  if (!deps || !['hit', 'miss', 'skip'].includes(deps.outcome)) return {};
-  return { depsCache: deps.outcome, ...(Number.isFinite(deps.ms) && deps.ms >= 0 ? { depsMs: deps.ms } : {}) };
 }
 
 /**
@@ -880,6 +862,11 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       abortSignal,
       // The second runner holds the job once it has the snapshot: from there the move is no longer in flight.
       onSnapshotSent: moves.length > 0 && movingSet ? clearMoving : undefined,
+      // BRAIN-515: every dispatch (a rebalance move's second one too) re-persists which runner the snapshot goes to and the
+      // identity a result fetched from it must carry; `lane`'s orphan reconcile trusts a runner record only against this.
+      onBinding: async ({ protocol, generation, manifestHash }) => {
+        await updateAttempt(root, enriched.id, gen, { binding: { protocol, generation, manifestHash, runner: runner.name } });
+      },
       rebalance: rebalanceOn && canWithdraw ? {
         minQueuedMs: globalCfg.remoteRebalanceMinQueuedMs,
         intervalMs: globalCfg.remoteRebalanceIntervalMs,
