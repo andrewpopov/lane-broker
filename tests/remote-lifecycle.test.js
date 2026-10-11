@@ -99,7 +99,7 @@ test('lane cancel on a live remote ticket exits 130, never runs locally, and the
   assert.equal(record.kind, 'cancelled');
 });
 
-test('SIGKILLing the supervisor mid-remote-dispatch: status shows ORPHANED-REMOTE, wait exits 1 naming it, cancel reconciles, and a second cancel is a no-op', async () => {
+test('SIGKILLing the supervisor mid-remote-dispatch: status shows ORPHANED-REMOTE, wait keeps waiting on the still-running job, cancel reconciles, and a second cancel is a no-op', async () => {
   const { env, state, runnerRoot, repoDir } = setup();
   const { id } = await startSleepingRemote(env, repoDir);
 
@@ -117,10 +117,12 @@ test('SIGKILLing the supervisor mid-remote-dispatch: status shows ORPHANED-REMOT
   const statusText = (await laneRun(['status'], { env })).stdout;
   assert.match(statusText, /ORPHANED-REMOTE/);
 
+  // BRAIN-515: the runner still has the job running, so wait asks it and keeps waiting rather than giving up; its
+  // --timeout ends the wait (75, not failed) and nothing is settled while the job runs.
   const waited = await laneRun(['wait', id, '--timeout', '5s'], { env });
-  assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
-  assert.match(waited.stderr, /ORPHANED-REMOTE/);
-  assert.match(waited.stderr, new RegExp(`lane cancel ${id}`));
+  assert.equal(waited.code, 75, `stderr: ${waited.stderr}`);
+  assert.ok(readAttempt(state, id), 'a job the runner still runs must not be settled');
+  assert.equal(resultOf(state, id), null);
 
   const cancelResult = await laneRun(['cancel', id], { env });
   assert.equal(cancelResult.code, 0, `stderr: ${cancelResult.stderr}`);
@@ -142,6 +144,36 @@ test('SIGKILLing the supervisor mid-remote-dispatch: status shows ORPHANED-REMOT
   const secondCancel = await laneRun(['cancel', id], { env });
   assert.equal(secondCancel.code, 1);
   assert.equal(resultOf(state, id).exit, 130, 'the already-published result must be untouched');
+});
+
+test('BRAIN-515: lane cancel of an abruptly killed supervisor (no `unresolved`, no `moving`) whose runner cannot confirm the cancel keeps the attempt and exits 1', async () => {
+  const { env, home, state, runnerRoot, repoDir } = setup();
+  const { id } = await startSleepingRemote(env, repoDir);
+  const attempt = readAttempt(state, id);
+  assert.equal(attempt.unresolved, undefined, 'a SIGKILLed supervisor never got to record why');
+  assert.equal(attempt.moving, undefined);
+  process.kill(attempt.supervisor.pid, 'SIGKILL');
+  await sleep(300);
+
+  const globalCfg = JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8'));
+  const reachable = globalCfg.runners;
+  writeGlobalConfig(home, { ...globalCfg, runners: reachable.map((r) => ({ ...r, ssh: 'down' })) });
+  try {
+    const cancelled = await laneRun(['cancel', id], { env });
+    assert.equal(cancelled.code, 1, `stderr: ${cancelled.stderr}`);
+    assert.match(cancelled.stderr, /still held: remote-cancel not confirmed on skybox/);
+    assert.ok(readAttempt(state, id), 'the attempt record must survive an unconfirmed remote cancel');
+    assert.equal(resultOf(state, id), null, 'no result may be published while the runner may still run the job');
+    assert.equal(fs.existsSync(paths(state).history) ? fs.readFileSync(paths(state).history, 'utf8').trim() : '', '', 'no history row either');
+  } finally {
+    // The runner is reachable again: the retry confirms the cancel and settles the record.
+    writeGlobalConfig(home, { ...globalCfg, runners: reachable });
+    const retried = await laneRun(['cancel', id], { env });
+    assert.equal(retried.code, 0, `stderr: ${retried.stderr}`);
+  }
+  assert.equal(readAttempt(state, id), null, 'once the runner confirms, the record is settled');
+  assert.equal(resultOf(state, id).cancelled, true);
+  assert.ok(fs.readdirSync(path.join(runnerRoot, 'tickets')).length > 0);
 });
 
 test('an attempt record survives a changed boot id and still reports ORPHANED-REMOTE', async () => {

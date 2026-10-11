@@ -21,6 +21,7 @@ import {
 } from '../src/remote-runner.js';
 import { gcCommand } from '../src/gc.js';
 import { loadGlobalConfig } from '../src/config.js';
+import { reconcileCommand } from '../src/reconcile-sweep.js';
 import { capabilitiesCommand } from '../src/capabilities.js';
 import { remotePipelineCommand } from '../src/remote-pipeline.js';
 
@@ -41,6 +42,7 @@ function usage() {
   lane undrain
   lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
   lane gc [--dry-run] [--max <n>] [--root <remoteRoot>]
+  lane reconcile [--now] [--json]
 `;
 }
 
@@ -280,6 +282,10 @@ async function main() {
     }
     case 'gc': {
       const result = await gcCommand(rest, { remoteRoot: parseRootFlag(rest) || defaultRemoteRoot(), cfg: loadGlobalConfig() });
+      return result.exitCode;
+    }
+    case 'reconcile': {
+      const result = await reconcileCommand({ force: rest.includes('--now'), json: rest.includes('--json') });
       return result.exitCode;
     }
     case 'capabilities': {

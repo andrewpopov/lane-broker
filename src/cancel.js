@@ -68,7 +68,7 @@ async function killGroupOnly(pgid) {
  *    ordinary "nothing to cancel" branch above -- same as re-cancelling any
  *    already-finished ticket today.
  */
-async function cancelAttempt(root, id, attempt) {
+export async function cancelAttempt(root, id, attempt) {
   if (supervisorAlive(attempt)) {
     writeCancelMarkerFile(root, id);
     try {
@@ -117,9 +117,10 @@ async function cancelAttempt(root, id, attempt) {
       unconfirmed.push(name);
     }
   }
-  // A possibly-live ticket (a stranded move, or one that could not be proven unstarted) is only forgotten once every runner it
-  // names has confirmed -- or proven the ticket absent and tombstoned it. Otherwise the record stays, so it can be cancelled again.
-  if ((attempt.moving || attempt.unresolved) && unconfirmed.length > 0) {
+  // A dead supervisor says nothing about the runner: the job may still be running there (a killed supervisor leaves neither
+  // `moving` nor `unresolved`). The record is only forgotten once every runner it names has confirmed -- or proven the ticket
+  // absent and tombstoned it. Otherwise the record stays, so it can be cancelled again.
+  if (unconfirmed.length > 0) {
     process.stderr.write(`lane cancel: ${id} is still held: remote-cancel not confirmed on ${unconfirmed.join(', ')}; retry lane cancel once reachable\n`);
     return { exitCode: 1 };
   }
@@ -129,6 +130,10 @@ async function cancelAttempt(root, id, attempt) {
     atomicWriteJson(resultPath, remoteCancelledResult(id, attempt.startedAt));
     appendHistory(root, { ...terminalRowDefaults(attempt), id, exit: 130, cancelled: true, endedAt: Date.now(), executor: 'remote', runner: attempt.runner });
   });
+  if (published.alreadyPublished) {
+    process.stdout.write(`lane cancel: ${id} was already settled; nothing to cancel\n`);
+    return { exitCode: 0 };
+  }
   if (!published.ok) {
     process.stderr.write(`lane cancel: could not reconcile orphaned remote attempt ${id}\n`);
     return { exitCode: 1 };
@@ -227,7 +232,9 @@ export async function cancelCommand(id) {
       atomicWriteJson(lease.resultPath, { ...remoteCancelledResult(id, attempt.startedAt), executor: attempt.executor });
       appendHistory(root, { ...terminalRowDefaults(lease), id, key: lease.key, exit: 130, cancelled: true, endedAt: Date.now(), executor: attempt.executor });
     });
-    if (!published.ok) {
+    // `alreadyPublished`: the attempt was settled between the read above and this publish, so its result and history row
+    // stand. Fall through to release the lease; the plain-lease branch below must not write a second result.
+    if (!published.ok && !published.alreadyPublished) {
       process.stderr.write(`lane cancel: could not reconcile orphaned lease ${id} against its own attempt record\n`);
       return { exitCode: 1 };
     }

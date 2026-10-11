@@ -535,7 +535,7 @@ function sleepUnlessAborted(ms, abortSignal) {
 
 /** `lane remote-result <ticketId>` over ssh, bounded by `deadlineMs`. Returns the parsed
  *  record, `{missing:true}`, or `null` on any transport/parse failure (never throws). */
-async function fetchRemoteResult(runner, ticketId, sshBin, deadlineMs, env) {
+export async function fetchRemoteResult(runner, ticketId, sshBin, deadlineMs, env) {
   const cmd = buildRemoteCommand(runner, 'remote-result', [ticketId]);
   const res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
   if (res.timedOut || res.code !== 0) return null;
@@ -816,6 +816,10 @@ export async function dispatchRemote(opts) {
     rebalance = null,
     // BRAIN-436: called once the whole snapshot has been handed to `runner` (it holds the job from here on).
     onSnapshotSent,
+    // BRAIN-515: called with `{protocol, ticketId, generation, manifestHash}` BEFORE ssh is spawned, so the caller can persist the
+    // binding a later reconcile needs to trust a result record fetched for this dispatch. Resolving `false` or throwing means it
+    // is not durable: the dispatch does not start (`unconfirmed`, `neverStarted`).
+    onBinding,
   } = opts;
   const withdrawCapable = (rebalance?.canWithdraw ?? canWithdraw) === true;
 
@@ -883,6 +887,19 @@ export async function dispatchRemote(opts) {
     };
   }
 
+  // BRAIN-515: the binding must be durable before anything is sent; a reconcile trusts a runner record only against it. A caller
+  // that cannot persist it (`false` or a throw) gets nothing dispatched, which the existing never-started fallback rules handle.
+  const expected = { protocol, ticketId, generation, manifestHash: manifest.manifestHash };
+  if (onBinding) {
+    let persisted = false;
+    try {
+      persisted = (await onBinding(expected)) !== false;
+    } catch {
+      // reported below as the same refusal
+    }
+    if (!persisted) return { outcome: 'unconfirmed', reason: 'could not persist the dispatch binding', neverStarted: true };
+  }
+
   const snapshotStream = encodeSnapshot(worktreeRoot, header, manifest.entries);
 
   const execCommand = buildRemoteCommand(runner, 'remote-exec');
@@ -910,7 +927,6 @@ export async function dispatchRemote(opts) {
       // a bookkeeping failure never changes the dispatch
     }
   }
-  const expected = { protocol, ticketId, generation, manifestHash: manifest.manifestHash };
   const closed = waitClosed(child, abortSignal);
   let move = null;
   const state = { runner, epoch: 1, attemptedTarget: null, attemptedReason: null, queuedSince: null };

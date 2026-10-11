@@ -69,6 +69,8 @@ export function paths(root = stateHome()) {
     admissionLast: path.join(root, 'admission-last.json'),
     // BRAIN-438: when the opportunistic logs/results sweep last ran (src/gc.js).
     gcLastRun: path.join(root, 'gc-last-run'),
+    // BRAIN-515: when the ORPHANED-REMOTE reconcile sweep last claimed a run (src/reconcile-sweep.js).
+    reconcileLastRun: path.join(root, 'reconcile-last-run'),
     conflictSkipState: path.join(root, 'conflict-skip-state.json'),
     // BRAIN-249 part 2: the capacity-blocked head's own skip counter — kept
     // separate from conflictSkipState (see readCapacitySkipState's doc

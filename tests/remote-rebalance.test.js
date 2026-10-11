@@ -90,6 +90,20 @@ test('rebalance: a ticket queued on A moves to B and runs exactly once, on B, wi
   assert.equal(readAttempt(ctx.state, id), null);
 });
 
+test('rebalance: the second dispatch has re-persisted the attempt\'s binding to the new runner before the job is sent there (BRAIN-515)', T, async () => {
+  const ctx = rebalanceSetup({ paused: ['a', 'b'] }); // B is paused too, so the ticket stays queued there while we look
+  const id = await ctx.start();
+  await execArrived(ctx, 'b');
+  const moved = readAttempt(ctx.state, id);
+  assert.equal(moved.runner, 'b');
+  assert.equal(moved.binding.runner, 'b', 'the binding follows the move: a result fetched from B is trusted only against B\'s binding');
+  assert.equal(moved.binding.generation, moved.generation);
+  assert.match(moved.binding.manifestHash, /^[0-9a-f]{64}$/);
+  ctx.unpause('b');
+  assert.equal((await ctx.finish(id)).code, 0);
+  assert.deepEqual(ctx.runs(), ['b']);
+});
+
 test('rebalance: no ping-pong -- with B queued too and A idle again, the ticket stays on B (and MaxMoves 1 holds with a third runner)', T, async () => {
   const ctx = rebalanceSetup({ names: ['a', 'b', 'c'], paused: ['a', 'b'], rebalance: { remoteRebalanceMaxMoves: 3, remoteRebalanceMinQueuedMs: 300 } });
   const id = await ctx.start();
@@ -309,8 +323,10 @@ test('a live cancel the runner does not confirm keeps the attempt and fails `lan
   assert.match(cancelled.stderr, /still held/);
   const attempt = readAttempt(ctx.state, id);
   assert.ok(attempt?.unresolved, 'the attempt is kept and marked');
-  const waited = await ctx.finish(id, '10s');
-  assert.match(waited.stderr, /ORPHANED-REMOTE/);
+  // BRAIN-515: `lane wait` asks the runner, which still holds the ticket queued, so it keeps waiting (75) instead of giving up
+  const waited = await ctx.finish(id, '3s');
+  assert.equal(waited.code, 75, waited.stderr);
+  assert.match(waited.stderr, /still queued or running/);
   const runnersPath = path.join(path.dirname(ctx.fake.probesPath), 'runners.json');
   const all = JSON.parse(fs.readFileSync(runnersPath, 'utf8'));
   delete all.a.cancelFails;

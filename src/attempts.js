@@ -199,16 +199,24 @@ export async function fallbackToLocal(root, id, reason) {
 /**
  * The ONE function every terminal path (remote confirmed/cancelled, local
  * fallback finished) must go through, under the mutex, in this order (C5):
- *  1. Cancel marker present -> call `resultWriterFn({ cancelled: true })`
+ *  0. The attempt record is read FIRST. Absent -> `{ ok: false,
+ *     alreadyPublished: true }` and the writer is never called: the record is
+ *     removed only by a publish, so a missing one means another publisher
+ *     already settled this attempt, and a second writer must not overwrite its
+ *     result or append a second history row. This holds even when the cancel
+ *     marker exists.
+ *  1. `expect(current)`, when given, is evaluated against that record; false
+ *     -> `{ ok: false, stale: true }`, nothing written, the attempt kept.
+ *  2. Cancel marker present -> call `resultWriterFn({ cancelled: true })`
  *     instead of whatever outcome the caller actually observed -- a
  *     cancelled ticket's result is exit 130 regardless of the remote
  *     outcome, and the caller (owning the real result.json shape, which
  *     this module has no opinion on) is what actually renders that.
- *  2. Generation mismatch -> refuse ({ ok: false }); some other writer has
+ *  3. Generation mismatch -> refuse ({ ok: false }); some other writer has
  *     already moved this attempt on, so nothing here may be published.
- *  3. Otherwise -> call `resultWriterFn({ cancelled: false })`, the caller's
+ *  4. Otherwise -> call `resultWriterFn({ cancelled: false })`, the caller's
  *     real terminal outcome.
- * Either way (steps 1 or 3), the attempt record is removed once
+ * Either way (steps 2 or 4), the attempt record is removed once
  * `resultWriterFn` returns -- the attempt is over.
  */
 /**
@@ -233,15 +241,21 @@ function assertSyncWriter(returned) {
   }
 }
 
-export async function publishTerminal(root, id, generation, resultWriterFn) {
+export async function publishTerminal(root, id, generation, resultWriterFn, { expect } = {}) {
   return withLock(root, () => {
+    const current = readAttempt(root, id);
+    if (!current) {
+      return { ok: false, alreadyPublished: true };
+    }
+    if (expect && !expect(current)) {
+      return { ok: false, stale: true };
+    }
     if (isCancelled(root, id)) {
       assertSyncWriter(resultWriterFn({ cancelled: true }));
       removeAttempt(root, id);
       return { ok: true, cancelled: true };
     }
-    const current = readAttempt(root, id);
-    if (!current || current.generation !== generation) {
+    if (current.generation !== generation) {
       return { ok: false };
     }
     assertSyncWriter(resultWriterFn({ cancelled: false }));
