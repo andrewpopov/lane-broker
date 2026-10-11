@@ -42,6 +42,7 @@ lane run --exclusive --lane release  -- ./deploy.sh      # whole-host exclusive 
 lane status [--json]
 lane capabilities --json
 lane suggest [--repo <name>] [--days 7] [--json]
+lane report cost --repo zirkbot,jun --since 2026-10-01 --until 2026-10-08 --prs zirkbot=z.json,jun=j.json [--json]   # gate-cost scorecard (BRAIN-529)
 lane cancel <id>
 lane priority <id> high|medium|low       # re-tier a queued ticket in place (BRAIN-518)
 lane wait <id> [--timeout 5m]
@@ -2051,3 +2052,18 @@ for a lease that a scheduled-out CLI has not written yet, on a machine where it
 passes standalone in under two seconds. A test suite for a tool that exists to
 stop parallel processes from starving each other should not itself be a
 thundering herd.
+
+### Gate-cost scorecard: `lane report cost` (BRAIN-529)
+
+Per repo and window `[since, until)` (UTC, one frozen cutoff for history rows by `startedAt`, the
+merge-train journal `~/.cache/merge-train/<repo>/journal.jsonl` and PRs): testing cost per landed PR by
+spend class (`gate` = lane `prepush`; `train-batch`; `master-verify` = lane ids of journal `lane-start`
+events whose `runId` starts `master-`; `ad-hoc` = the rest, plus TOTAL), reported as reserved core-min
+(run x granted cores, else declared, else weight), measured CPU-seconds (rows that carry `cpuSeconds`),
+wall-min and wait-min. A remote row's run time is `runMs` (`endedAt - startedAt` includes result
+delivery). The PR denominator is the union of GitHub merged PRs, GitHub closed PRs labelled
+`train-landed`, and journal `landed` events, with the reconciliation counts printed. Latency is first
+journal `enqueue` (an eject keeps it; `remove`/`drop` resets it) to `landed`: p50/p90/max, unfinished PRs
+listed apart. `--prs` takes `gh pr list --json number,mergedAt,closedAt,labels` output: run it with
+`--state merged --search 'merged:>=<since>'` and again with `--state closed --label train-landed
+--search 'closed:>=<since>'`, concatenate the arrays, and pass one file per repo (`repo=file,...`).

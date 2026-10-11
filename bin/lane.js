@@ -24,6 +24,7 @@ import { loadGlobalConfig } from '../src/config.js';
 import { reconcileCommand } from '../src/reconcile-sweep.js';
 import { capabilitiesCommand } from '../src/capabilities.js';
 import { remotePipelineCommand } from '../src/remote-pipeline.js';
+import { costReportCommand } from '../src/cost-report.js';
 
 function usage() {
   return `Usage:
@@ -43,6 +44,7 @@ function usage() {
   lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
   lane gc [--dry-run] [--max <n>] [--root <remoteRoot>]
   lane reconcile [--now] [--json]
+  lane report cost --repo <a[,b]> --since <iso> --until <iso> [--prs <file | repo=file,...>] [--journal-root <dir>] [--history <file>] [--json]
 `;
 }
 
@@ -287,6 +289,13 @@ async function main() {
     case 'reconcile': {
       const result = await reconcileCommand({ force: rest.includes('--now'), json: rest.includes('--json') });
       return result.exitCode;
+    }
+    case 'report': {
+      if (rest[0] !== 'cost') {
+        process.stderr.write('lane report: only `cost` is supported\n');
+        return 2;
+      }
+      return (await costReportCommand(rest.slice(1))).exitCode;
     }
     case 'capabilities': {
       if (!rest.includes('--json')) {
