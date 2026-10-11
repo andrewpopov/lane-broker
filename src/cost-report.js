@@ -32,7 +32,7 @@ function percentile(sorted, p) {
   return sorted[Math.max(0, Math.ceil(p * sorted.length) - 1)];
 }
 
-const stats = (xs) => {
+export const stats = (xs) => {
   const s = [...xs].sort((a, b) => a - b);
   return { n: s.length, p50: percentile(s, 0.5), p90: percentile(s, 0.9), max: s.length ? s[s.length - 1] : null };
 };
@@ -242,7 +242,7 @@ export function renderCostText(report) {
   return out.join('\n');
 }
 
-const parseTime = (flag, v) => {
+export const parseTime = (flag, v) => {
   const ms = Date.parse(v);
   if (!Number.isFinite(ms)) throw new Error(`${flag} must be an ISO date/time (got "${v}")`);
   return ms;
