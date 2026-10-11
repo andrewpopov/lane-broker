@@ -151,6 +151,16 @@ test('refusal 85: the queued ticket\'s supervisor is dead', async () => {
   await assertRefusal(fx, ['a', 'high'], 85, /supervisor is gone/);
 });
 
+test('lane priority <id> --bogus is an unknown option: exit 2 and nothing changes', async () => {
+  const fx = fenced();
+  await enqueue(fx.state, ticket('a', 'r1', 'medium'), cfgWith());
+  const before = snapshot(fx.state);
+  const r = await priority(fx.env, 'a', '--bogus');
+  assert.equal(r.code, 2, r.stdout + r.stderr);
+  assert.match(r.stderr, /unknown option "--bogus"/);
+  assert.deepEqual(snapshot(fx.state), before);
+});
+
 test('refusal 81: a remote attempt with nothing queued here says to cancel and resubmit, never to run lane priority on the runner (A4)', async () => {
   const fx = fenced();
   await createAttempt(fx.state, 'a', { runner: 'r', cwd: process.cwd() });

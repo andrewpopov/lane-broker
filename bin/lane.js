@@ -199,6 +199,11 @@ async function main() {
       return result.exitCode;
     }
     case 'priority': {
+      const unknownOption = rest.find((arg) => arg.startsWith('-'));
+      if (unknownOption !== undefined) {
+        process.stderr.write(`lane priority: unknown option "${unknownOption}"\n${usage()}`);
+        return 2;
+      }
       if (rest.length !== 2) {
         process.stderr.write('lane priority: usage: lane priority <id> high|medium|low (missing <id>|<tier>, or extra arguments)\n');
         return 2;
@@ -227,6 +232,11 @@ async function main() {
       return result.exitCode;
     }
     case 'drain': {
+      const unknownOption = rest.find((arg) => arg.startsWith('-'));
+      if (unknownOption !== undefined) {
+        process.stderr.write(`lane drain: unknown option "${unknownOption}"\n${usage()}`);
+        return 2;
+      }
       if (rest.length > 1) {
         process.stderr.write(`lane drain: unexpected argument "${rest[1]}" (quote a multi-word reason)\n${usage()}`);
         return 2;

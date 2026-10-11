@@ -884,8 +884,13 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
           if (!draining && rebalanceBlocked({ moves: countedMoves, maxMoves: globalCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: globalCfg.remoteRebalanceCooldownMs })) return null;
           const candidates = (globalCfg.runners || []).filter((r) => !visited.includes(r.name) && r.rebalanceTarget !== false);
           if (candidates.length === 0) return null;
-          const picked = await selectRunner(candidates, { ...remoteSelectOptions(enriched, globalCfg), maxRemoteQueue: 0 });
-          const eligible = picked.runner && hasMeasuredHeadroom(picked.probe) && (!draining || (Array.isArray(picked.probe.capabilities) && picked.probe.capabilities.includes(REMOTE_WITHDRAW_CAPABILITY)));
+          const selectOptions = remoteSelectOptions(enriched, globalCfg);
+          const picked = await selectRunner(candidates, {
+            ...selectOptions,
+            maxRemoteQueue: 0,
+            requireCapabilities: draining ? [...selectOptions.requireCapabilities, REMOTE_WITHDRAW_CAPABILITY] : selectOptions.requireCapabilities,
+          });
+          const eligible = picked.runner && hasMeasuredHeadroom(picked.probe);
           target = eligible ? { runner: picked.runner, probe: picked.probe } : null;
           return target;
         },
@@ -1322,14 +1327,18 @@ async function main() {
       // durable cancel marker here -- if a cancel was ALSO requested, it
       // wins: publish 'cancelled', never let the expiry silently overwrite
       // an explicit cancel that arrived after it.
-      const cancelWon = cancelRequested(root, ticket.id);
-      const outcome = cancelWon ? 'cancelled' : 'queue-timeout';
       // BRAIN-320 S1d: tryStart already wrote the durable expiry marker
       // (distinct from a cancel marker) under its own lock before returning
       // this reason -- dequeue and publish the queue-timeout result the same
       // way a queued cancel is finalized, so `remote-exec`'s own kind
-      // derivation (reading this ticket's result.json) sees it.
-      await underLock(root, () => dequeueSync(root, ticket.id));
+      // derivation (reading this ticket's result.json) sees it. The cancel
+      // marker is read INSIDE the lock, after the dequeue: waiting for the
+      // lock can take a while, and a cancel landing meanwhile must still win.
+      const cancelWon = await underLock(root, () => {
+        dequeueSync(root, ticket.id);
+        return cancelRequested(root, ticket.id);
+      });
+      const outcome = cancelWon ? 'cancelled' : 'queue-timeout';
       touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit(outcome, { forcePublish: cancelWon });
     }

@@ -103,6 +103,14 @@ test('lane undrain exits 1 naming the path when the marker cannot be removed', a
   assert.ok(r.stderr.includes(paths(state).remoteDrain), r.stderr);
 });
 
+test('lane drain --bogus is an unknown option: exit 2 and no drain marker is written', async () => {
+  const { state, env } = freshEnv();
+  const r = await laneRun(['drain', '--bogus'], { env });
+  assert.equal(r.code, 2, r.stdout + r.stderr);
+  assert.match(r.stderr, /unknown option "--bogus"/);
+  assert.equal(readRemoteDrain(state), null);
+});
+
 test('the capability list advertises remote-drain/1', () => {
   assert.ok(CAPABILITIES.includes('remote-drain/1'));
 });

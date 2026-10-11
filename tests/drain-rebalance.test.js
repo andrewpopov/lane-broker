@@ -129,6 +129,20 @@ test('drain (B1): a destination that cannot withdraw is not chosen for a drain m
   assert.deepEqual(heuristic.runs(), ['b'], 'the queued-too-long rule still moves to such a runner');
 });
 
+test('drain (B1): an incompatible runner ranked first is skipped during selection, so the ticket moves to the compatible runner behind it', T, async () => {
+  const noWithdraw = { ...IDLE, capabilities: CAPABILITIES.filter((c) => c !== REMOTE_WITHDRAW_CAPABILITY) };
+  const ctx = rebalanceSetup({ names: ['a', 'b', 'c'], paused: ['a', 'c'], rebalance: { remoteRebalanceMinQueuedMs: 60_000 } });
+  ctx.fake.setProbe('b', noWithdraw);
+  const id = await ctx.start();
+  await execArrived(ctx, 'a');
+  await drainRunner(ctx, 'a');
+  await waitFor(() => ctx.fake.count('exec c') === 1, { timeoutMs: 20_000 });
+  assert.equal(ctx.fake.count('exec b'), 0, 'B cannot withdraw, so it is never a drain destination');
+  ctx.unpause('c');
+  assert.equal((await ctx.finish(id)).code, 0);
+  assert.deepEqual(ctx.runs(), ['c']);
+});
+
 test('drain: remoteRebalanceMinQueuedMs 0 still disables every move, drain moves included', T, async () => {
   const ctx = rebalanceSetup({ rebalance: { remoteRebalanceMinQueuedMs: 0 } });
   const id = await ctx.start();
