@@ -5,6 +5,7 @@ import { receiveArtifacts, artifactLimitsOf } from './remote-artifacts.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
 import { isPriorityTier } from './priority.js';
+import { runnerAvailability } from './runner-schedule.js';
 import { sanitizeDrainReason } from './state.js';
 
 /**
@@ -207,6 +208,9 @@ function neverFits(reservation, probe) {
  * alone (see `dispatchRemote`), so an optionless lane still sends a
  * protocol-1 header even when `remoteQueueTimeoutMs` made this true.
  *
+ * `opts.now` (ms, default the clock) and `opts.expectedRunMs` (BRAIN-533): a runner outside its `schedule` window is skipped before it is
+ * probed, as is one whose window closes before `now + expectedRunMs`; no `expectedRunMs` places normally.
+ *
  * `opts.requireCapabilities` (BRAIN-321): capability strings the runner's probe must advertise, else it is skipped.
  *
  * `opts.reservation` (BRAIN-320 S1e): the ticket's resolved
@@ -232,7 +236,18 @@ export async function selectRunner(runners, opts = {}) {
   let queuedBest = null;
   let busyBest = null; // passed every check except headroom, empty queue: its own broker would hold the ticket until it has room
   const better = (cand, best) => !best || cand.finish < best.finish || (cand.finish === best.finish && cand.cpuFree > best.cpuFree);
+  const now = opts.now ?? Date.now();
   for (const runner of runners) {
+    // BRAIN-533: a runner scheduled to be off is not probed at all, and one whose window closes before this ticket is expected to finish is not given it.
+    const window = runnerAvailability(runner.schedule, now);
+    if (!window.available) {
+      skipped.push({ name: runner.name, reason: 'outside schedule' });
+      continue;
+    }
+    if (window.closesAt !== null && Number.isFinite(opts.expectedRunMs) && now + opts.expectedRunMs > window.closesAt) {
+      skipped.push({ name: runner.name, reason: `schedule window closes at ${new Date(window.closesAt).toISOString()}, before the expected ${Math.round(opts.expectedRunMs / 1000)}s run` });
+      continue;
+    }
     const cmd = buildRemoteCommand(runner, 'remote-probe');
     const res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
     if (res.timedOut) {

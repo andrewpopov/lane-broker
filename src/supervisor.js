@@ -26,6 +26,9 @@ import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processSt
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine } from './descendants.js';
 import { reloadGlobalConfig } from './config.js';
+import { stateHome } from './state.js';
+import { readRows } from './suggest.js';
+import { expectedRunMs } from './estimates-history.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
@@ -483,8 +486,12 @@ function queueTimeoutFor(enriched, globalCfg) {
 }
 
 /** What `selectRunner` needs to judge a ticket: its protocol, and its reservation (shared by a first attempt and a rebind). */
-export function remoteSelectOptions(enriched, globalCfg) {
+export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
+  // BRAIN-533: history is read only when some runner has a schedule that could make the expected run time matter.
+  const scheduled = (globalCfg.runners || []).some((r) => r.schedule);
+  const expectedMs = scheduled ? expectedRunMs(readRows(paths(root).history), enriched.repoId, enriched.lane) : null;
   return {
+    ...(expectedMs !== null ? { expectedRunMs: expectedMs } : {}),
     maxRemoteQueue: globalCfg.maxRemoteQueue,
     requireProtocol2: needsProtocol2(enriched.remote) || Boolean(queueTimeoutFor(enriched, globalCfg)),
     requireCapabilities: isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : [],

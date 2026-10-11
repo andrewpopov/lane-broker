@@ -71,6 +71,15 @@ export function backfillEstimates(rows, { hostFactor = 1 } = {}) {
   return { keys, skipped };
 }
 
+/**
+ * BRAIN-533: the p90 wall time (ms) a (repo, lane) has taken, from the same fold `lane estimates` prints, or null when history
+ * has no usable run of it. Placement uses it to avoid a runner whose schedule window closes mid-run.
+ */
+export function expectedRunMs(rows, repo, lane) {
+  const key = backfillEstimates(rows.filter((r) => r?.repo === repo && r?.lane === lane)).keys.find((k) => k.repo === repo && k.lane === lane);
+  return key && key.n > 0 ? Math.round(key.p90 * 1000) : null;
+}
+
 export async function estimatesCommand({ root = stateHome(), json = false } = {}) {
   const hostFactor = 1;
   const report = { root, hostFactor, hostFactorSource: 'none: no calibration, factor 1.0', ...backfillEstimates(readRows(paths(root).history), { hostFactor }) };

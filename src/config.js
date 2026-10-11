@@ -3,6 +3,7 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { paths, stateHome } from './state.js';
+import { scheduleProblem } from './runner-schedule.js';
 import { isCanonicalRelPath } from './remote-manifest.js';
 import { unsupportedHookKeys, hookRefusalMessage } from './exclusive.js';
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
@@ -437,6 +438,11 @@ function validateRunners(runners, sourcePath) {
         Number.isFinite(runner.speedFactor) && runner.speedFactor > 0,
         `${sourcePath}: runner "${runner.name}".speedFactor must be a positive number`,
       );
+    }
+    // BRAIN-533: when the runner is powered on; absent means always available.
+    if (runner.schedule !== undefined) {
+      const problem = scheduleProblem(runner.schedule);
+      assert(problem === null, `${sourcePath}: runner "${runner.name}": ${problem}`);
     }
   }
 }
