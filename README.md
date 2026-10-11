@@ -46,6 +46,7 @@ lane cancel <id>
 lane priority <id> high|medium|low       # re-tier a queued ticket in place (BRAIN-518)
 lane wait <id> [--timeout 5m]
 lane pause "reason" | lane resume
+lane drain ["reason"] | lane undrain       # take a runner out of remote rotation (BRAIN-520)
 lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
 lane gc [--dry-run] [--max <n>]
 ```
@@ -823,8 +824,8 @@ Global config (the submitter's), all integers in milliseconds except the cap:
 |---|---|---|
 | `remoteRebalanceMinQueuedMs` | `300000` | queued this long on the runner before a move is considered; `0` disables rebalancing |
 | `remoteRebalanceIntervalMs` | `60000` | how often the submitter looks at the runner while it waits (> 0) |
-| `remoteRebalanceCooldownMs` | `600000` | the minimum gap between two moves of one ticket |
-| `remoteRebalanceMaxMoves` | `1` | how many times one ticket may move |
+| `remoteRebalanceCooldownMs` | `600000` | the minimum gap between two queued-too-long moves of one ticket (a drain move ignores it) |
+| `remoteRebalanceMaxMoves` | `1` | how many times one ticket may move for queueing too long (drain moves are not counted) |
 
 **How a move goes.** The submitter picks the destination with the same probe dispatch uses, excluding the current runner and
 every runner the ticket already left, and requires an empty queue and a *measured* free-CPU figure for the ticket (an unknown
@@ -834,7 +835,8 @@ irreversible decision taken under the runner's admission lock, so the ticket is 
 `withdrawn` answer, or the runner's own bound `unfinished/withdrawn` record fetched after a lost reply, counts as proof; every
 other answer (started, cancelled, unknown) leaves the ticket where it is. On proof the attempt becomes
 `moving.phase: 'dispatching'`, the dispatch is repeated to the new runner with the same ticket id and generation, and
-`lane: remote-rebalance: <id>: A -> B (queued Ns on A; B X cores free)` goes to stderr and the admission log. `waitedMs` includes
+`lane: remote-rebalance: <id>: A -> B (queued Ns on A; B X cores free)` goes to stderr and the admission log (a move off a drained runner says
+`A draining: <reason>` instead of `queued Ns on A`, see below). `waitedMs` includes
 the wait on the first runner, and the result and history row carry `rebalancedFrom`, `rebalancedAt`, `rebalanceReason` and
 `moves` (the count).
 
@@ -861,6 +863,47 @@ the no-revisit rule keep a ticket from bouncing.
 
 Lineage: this is requeueing of *pending* work as in Slurm (a requeue only for a job that has not started) and Kueue, and
 work-stealing restricted to tasks that have not started; a started task is never stolen.
+
+### Taking a runner out of rotation (BRAIN-520)
+
+```
+lane drain ["reason"]    # on the runner: stop sending it remote work
+lane undrain             # put it back
+```
+
+Run these on the runner itself (the machine whose `lane remote-exec` receives the work). `lane drain` writes
+`remote-drain.json` under the runner's state root, so it survives restarts and reboots; `lane status` shows `drain: draining
+(<reason>) since <time>` with how much is still running and queued there, and `lane undrain` removes it. Re-draining keeps the
+original `since` and replaces the reason. A marker that cannot be read counts as draining (`drain marker unreadable`), and
+`lane undrain` still removes it. Pause and drain are independent: `lane resume` does not undrain, `lane undrain` does not
+resume, and each prints a hint when the other is still set.
+
+**What drain does.** The runner's probe reports `remoteDrain` (and sets `draining` and `paused`, so a submitter older than 0.33
+skips it too), so no submitter sends it new remote work. Submitters that hold a ticket queued on it move that ticket away
+(below).
+
+**What drain does not do.** It does not refuse anything already on the runner or arriving locally: leases keep running, queued
+local and remote tickets are still admitted there, `lane run` on the runner itself works, and a `remote-exec` that was already
+on its way when the drain started is accepted, then moved on the next tick. A queued remote ticket moves away only when an
+eligible destination exists; otherwise it stays queued on the drained runner and runs there. Drain never itself triggers a
+local fallback or a failure: the existing remote queue timeout, cancellation, transport and admission rules still apply to
+the ticket exactly as without a drain.
+
+**Move policy for a drain move.**
+- It skips `remoteRebalanceMinQueuedMs`: the next watcher tick (`remoteRebalanceIntervalMs`) moves a ticket queued on a drained
+  runner, however briefly it has waited. `remoteRebalanceMinQueuedMs: 0` still disables **every** move, drain moves included.
+- It skips `remoteRebalanceCooldownMs` and `remoteRebalanceMaxMoves`, and does not count toward the cap: only
+  `queued-too-long` moves do. Every move still sets the time the cooldown is measured from.
+- It never returns to a runner the ticket already left, so a ticket moves at most once per other runner.
+- The destination must be idle with a measured free-CPU figure, must not set `"rebalanceTarget": false`, and (unlike a
+  queued-too-long move) must itself advertise `remote-withdraw/1`.
+- The attempt's `moves` record carries `reason: 'runner-draining'` and `drainReason`; the result carries
+  `rebalanceReason: "<A> draining (<reason>)"`, and stderr says `lane: remote-rebalance: <id>: A -> B (A draining: <reason>; B X cores free)`.
+
+**Limitation.** Moves are made only while the submitter still holds the exec ssh session open. A ticket whose session has
+already dropped (the submitter is polling `remote-result`) waits on the drained runner and runs there. A submitter older than
+0.33 does not move queued tickets early: it skips the drained runner for new work but waits the usual minimum before moving
+anything queued.
 
 ### Returning files from a remote run (BRAIN-398)
 
@@ -1767,7 +1810,7 @@ the queue so you know what's waiting and why.
 ## State
 
 `$LANE_BROKER_STATE` (default `~/.cache/lane-broker`): `leases/`, `queue/`,
-`priority-hwm.json` (the priority clock's high-water mark), `migrating` (present only while `lane migrate-scheduler` runs), `draining` (present only while `lane migrate-scheduler --when-idle` waits for the broker to go idle), `queue-quarantine/` (see below), `sched-v2.json` and `fairness-v2.json` (the priority scheduler fence and its per-ticket fairness records), `logs/` (per-run, capped at 50MB with a truncation notice), `results/` (both pruned, see Garbage collection),
+`priority-hwm.json` (the priority clock's high-water mark), `remote-drain.json` (present only while `lane drain` is in effect; survives reboots, removed by `lane undrain`), `migrating` (present only while `lane migrate-scheduler` runs), `draining` (present only while `lane migrate-scheduler --when-idle` waits for the broker to go idle), `queue-quarantine/` (see below), `sched-v2.json` and `fairness-v2.json` (the priority scheduler fence and its per-ticket fairness records), `logs/` (per-run, capped at 50MB with a truncation notice), `results/` (both pruned, see Garbage collection),
 `history.jsonl` (one line per completed run, plus one `dequeuedDeadSupervisor: true`
 row `{id, key, error, supervisorPid, endedAt, executor}` (`error: "supervisor died while queued"`, so a history reader counts it as an error, not a failed run) when a queued ticket whose
 supervisor died is dropped from the queue; it is written only once the queue

@@ -30,7 +30,7 @@ import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
 import { detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
-import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom } from './remote-client.js';
+import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
 import { REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
@@ -877,12 +877,16 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       rebalance: rebalanceOn && canWithdraw ? {
         minQueuedMs: globalCfg.remoteRebalanceMinQueuedMs,
         intervalMs: globalCfg.remoteRebalanceIntervalMs,
-        pickTarget: async () => {
-          if (rebalanceBlocked({ moves: moves.length, maxMoves: globalCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: globalCfg.remoteRebalanceCooldownMs })) return null;
+        // BRAIN-520: a drain move is an operator fact, so it skips the cooldown and the max-moves damping (the no-revisit rule still
+        // bounds it), and its destination must itself be able to withdraw.
+        pickTarget: async ({ draining } = {}) => {
+          const countedMoves = moves.filter((m) => m.reason !== DRAIN_MOVE_REASON).length;
+          if (!draining && rebalanceBlocked({ moves: countedMoves, maxMoves: globalCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: globalCfg.remoteRebalanceCooldownMs })) return null;
           const candidates = (globalCfg.runners || []).filter((r) => !visited.includes(r.name) && r.rebalanceTarget !== false);
           if (candidates.length === 0) return null;
           const picked = await selectRunner(candidates, { ...remoteSelectOptions(enriched, globalCfg), maxRemoteQueue: 0 });
-          target = picked.runner && hasMeasuredHeadroom(picked.probe) ? { runner: picked.runner, probe: picked.probe } : null;
+          const eligible = picked.runner && hasMeasuredHeadroom(picked.probe) && (!draining || (Array.isArray(picked.probe.capabilities) && picked.probe.capabilities.includes(REMOTE_WITHDRAW_CAPABILITY)));
+          target = eligible ? { runner: picked.runner, probe: picked.probe } : null;
           return target;
         },
         // The worktree must still be what was snapshotted, then the intent is made durable BEFORE the irreversible withdraw.
@@ -912,7 +916,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     visited.push(to.runner.name);
     lastMoveAt = Date.now();
     priorRemoteQueuedMs += dispatch.waitedOnRunnerMs;
-    const move = { from: from.name, to: to.runner.name, at: lastMoveAt, queuedMs: dispatch.queuedMs, reason: 'queued-too-long' };
+    const move = { from: from.name, to: to.runner.name, at: lastMoveAt, queuedMs: dispatch.queuedMs, reason: dispatch.reason ?? QUEUED_TOO_LONG_REASON, ...(dispatch.drainReason === undefined ? {} : { drainReason: dispatch.drainReason }) };
     moves.push(move);
     runner = to.runner;
     probe = to.probe;
@@ -930,14 +934,15 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       await publishAndExit(gen, () => migrationRefusalResult(enriched));
       return { fallback: false };
     }
-    const line = `lane: remote-rebalance: ${enriched.id}: ${from.name} -> ${runner.name} (queued ${Math.round(dispatch.queuedMs / 1000)}s on ${from.name}; ${runner.name} ${probe.headroom.cpuCores} cores free)\n`;
+    const why = move.reason === DRAIN_MOVE_REASON ? `${from.name} draining: ${move.drainReason}` : `queued ${Math.round(dispatch.queuedMs / 1000)}s on ${from.name}`;
+    const line = `lane: remote-rebalance: ${enriched.id}: ${from.name} -> ${runner.name} (${why}; ${runner.name} ${probe.headroom.cpuCores} cores free)\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);
     process.stderr.write(`lane: running on ${runner.name}\n`);
   }
   // A move that never completed (or one whose second dispatch ended before a snapshot went out) must not outlive this attempt's record.
   if (movingSet && !dispatch.mayStillBeRunning) await clearMoving();
-  const rebalanceFields = () => (moves.length ? { rebalancedFrom: moves.at(-1).from, rebalancedAt: moves.at(-1).at, rebalanceReason: `queued ${Math.round(moves.at(-1).queuedMs / 1000)}s on ${moves.at(-1).from}`, moves: moves.length } : {});
+  const rebalanceFields = () => (moves.length ? { rebalancedFrom: moves.at(-1).from, rebalancedAt: moves.at(-1).at, rebalanceReason: moves.at(-1).reason === DRAIN_MOVE_REASON ? `${moves.at(-1).from} draining (${moves.at(-1).drainReason})` : `queued ${Math.round(moves.at(-1).queuedMs / 1000)}s on ${moves.at(-1).from}`, moves: moves.length } : {});
 
   // BRAIN-405: a confirmed preflight refusal means the runner never started the job, so a rebound ticket goes back to its place
   if (rebind && dispatch.outcome === 'confirmed' && dispatch.result.kind === 'refused') {
