@@ -1626,6 +1626,8 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       priorityRequested: isPriorityTier(queued.priorityRequested) ? queued.priorityRequested : DEFAULT_PRIORITY,
       priorityAdmitted: priorityOf(queued),
       priorityDemoted: queued.priorityDemoted === true,
+      // BRAIN-518: a ticket re-tiered while queued says so on its lease and history row; an un-retiered one has no such keys
+      ...(queued.priorityRetiered === true ? { priorityRetiered: true, priorityRetieredAt: queued.priorityRetieredAt } : {}),
       effectiveRankAtStart: effectiveRank(queued, nowEff, cfg),
       scoreAtStart: score(queued, nowEff, cfg),
       key: ticket.key,

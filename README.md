@@ -43,6 +43,7 @@ lane status [--json]
 lane capabilities --json
 lane suggest [--repo <name>] [--days 7] [--json]
 lane cancel <id>
+lane priority <id> high|medium|low       # re-tier a queued ticket in place (BRAIN-518)
 lane wait <id> [--timeout 5m]
 lane pause "reason" | lane resume
 lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
@@ -1480,6 +1481,45 @@ selection does not change. If the remote attempt falls back to local, the local 
 logged. Tier and rank describe what the scheduler saw. They cannot show how much time a tier saved anyone, and
 nothing here claims it: compare wait distributions by tier, and do not read a causal effect into them.
 
+### Re-tiering a queued ticket (BRAIN-518)
+
+`lane priority <id> high|medium|low` changes the tier of a ticket that is still waiting in this broker's queue, without
+a cancel and resubmit. It rewrites the queue record in place, under the same lock `enqueue` and admission use, and logs
+`lane-broker-priority event=retier ticket=<id> repo=<repo> seq=<n> from=<req>/<adm> requested=<t> admitted=<t> demoted=<bool>`
+to `admission-decisions.log`. It prints `lane priority: <id> <old> -> <new>` (or `already <tier>; nothing changed` with
+exit 0 and no write when the tier would not change).
+
+**What it keeps.** The record is rewritten at the same path, so the sequence number and filename, `prioOriginAt` (the
+age it has earned, so an aged low moved to medium keeps that age), `createdAt`, `localSince` and `exclusive` are
+untouched. The fairness counters and the reservation records are not touched either: a ticket keeps its earned count
+and a held reservation across a re-tier. An exclusive ticket never ages, whatever tier it is moved to.
+
+**The per-repo cap still applies.** The new tier goes through the same check as `lane run --priority`
+(`maxQueuedHighPerRepo`, counted under the lock), except that the ticket itself is never counted against the cap. A
+re-tier to `high` over the cap is recorded as `priorityRequested: high`, `priorityAdmitted: medium`,
+`priorityDemoted: true`, and the command says so. Nothing cascades: moving one high down does not promote a ticket that
+was demoted earlier, which has to be re-tiered again. Racing a `lane run --priority high` for the last slot admits exactly one.
+
+**Audit.** A re-tiered record carries `priorityRetiered: true` and `priorityRetieredAt`; the lease and the terminal
+`history.jsonl` row copy both. A ticket that was never re-tiered has neither key.
+
+**Refusals.** It acts only on a ticket in the queue of a v2 (fenced) scheduler, and refuses, changing nothing, when the
+ticket is running or has finished (result, cancel, expire or withdraw marker), is queued on a runner or owned by a
+submitter, is mid-rebind, has a dead supervisor, or has a queue record from before the priority scheduler or one that
+cannot be read. Exit codes are in the table below. **A remote ticket is refused (81): `lane cancel` it and resubmit with
+`--priority`.** Do not re-tier on the runner: a rebalance re-dispatches from the submitter's tier and would silently undo it.
+
+**Rollout.** A waiting supervisor from an older version caches the tier it was submitted with and puts that tier in
+the header of a later rebind or rebalance dispatch, so a ticket re-tiered while such a supervisor waits can still go to a
+runner at its old tier. Current supervisors re-read the tier from the queue record at the moment they withdraw it.
+Local admission always reads the record, so ordering here is correct either way. An older supervisor also removes a
+cancelled ticket's queue file without the broker lock; a re-tier racing that can leave a record behind whose supervisor
+is dead, which the next admission poll reaps.
+
+Re-tiering reorders the queue; it is not a guarantee against starvation. A reservation owner is promoted by its reservation
+order, but that promotion has eligibility, unreadable-record and sim-class exceptions (see the selection rules above), so
+do not read "re-tier to high" as "it will start next".
+
 ### Estimates engine and `lane estimates` (BRAIN-408 slice A)
 
 `src/estimates.js` is the pure estimates engine of the unified queue (spec 5.7): per-key EWMA
@@ -1562,10 +1602,14 @@ Documented limits, not bugs:
 | the child's exit code | Passed straight through on completion. |
 | `1` | The command errored, was signalled, or the supervisor died unexpectedly. |
 | `2` | Bad CLI usage (missing command / argument). |
-| `64` | Nested `lane run` would widen the inherited lease — refused; or an invalid `--priority` / `LANE_BROKER_PRIORITY` / lane `priority`; or an `--exclusive` lane nested under another lane; or `exclusiveHooks` in host or repo config (not supported yet). |
+| `64` | Nested `lane run` would widen the inherited lease — refused; or an invalid `--priority` / `LANE_BROKER_PRIORITY` / lane `priority`; or an invalid tier given to `lane priority`; or an `--exclusive` lane nested under another lane; or `exclusiveHooks` in host or repo config (not supported yet). |
 | `69` | Local-sim lane refused (fleet-offload message); use `--allow-local-sim`. |
 | `76` | A remote-only (`localRefused` + `remote`) lane found no runner able to take it right now (BRAIN-455). Retryable, unlike `69`; `--allow-local-sim` runs it here. |
-| `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. Also `lane run` / `remote-exec` refused with "scheduler migration in progress" while `lane migrate-scheduler` runs, or "scheduler migration pending (draining)" while `--when-idle` waits. |
+| `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. Also `lane run` / `remote-exec` refused with "scheduler migration in progress" while `lane migrate-scheduler` runs, or "scheduler migration pending (draining)" while `--when-idle` waits. `lane priority` also exits `75` (nothing changed, retry) on a lock timeout, a migration in progress, or a ticket mid-rebind to a runner. |
+| `80` | `lane priority`: no such ticket, or it already finished (result, cancel, expire or withdraw marker). |
+| `81` | `lane priority`: the ticket is in the wrong state: running, or queued on a runner / owned by a submitter (cancel and resubmit with `--priority`). |
+| `85` | `lane priority`: the queued ticket's supervisor is no longer alive. |
+| `89` | `lane priority`: legacy scheduler (no valid fence or `fairness-v2.json`); priority reorders nothing until `lane migrate-scheduler`. |
 | `124` | Killed by the no-progress watchdog (`reason: "no-progress"`, see below). |
 | `130` | Cancelled (SIGINT/SIGTERM) while still queued, before the lane ever started. |
 

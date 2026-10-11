@@ -3,12 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { freshEnv, laneRun, waitFor } from './helpers.js';
+import { freshEnv, laneRun, laneSpawn, waitFor, writeGlobalConfig, writeRepoConfig } from './helpers.js';
 import { enqueue, tryStart, dequeueSync, listQueue, retierQueued, withdrawQueued } from '../src/scheduler.js';
 import { createAttempt } from '../src/attempts.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { fenceLegacyQueue } from '../src/migrate.js';
 import { readLease } from '../src/lease.js';
+import { effectiveRank, priorityAuditOf, score } from '../src/priority.js';
 import { paths, atomicWriteJson, readJsonSafe, withLock, writeCancelMarkerFile, writeExpireMarkerFile, writeWithdrawMarkerFile } from '../src/state.js';
 
 /**
@@ -410,4 +411,94 @@ test('A1: a locked dequeue (the supervisor\'s) waits for the broker lock a re-ti
   assert.equal(result.outcome, 'retiered');
   assert.deepEqual(order, ['retier-writing', 'dequeue', 'done']);
   assert.deepEqual(queueNames(fx.state), [], 'the dequeue then removed the re-tiered record');
+});
+
+// ---- age, exclusivity, status and audit (slice 2) ----
+
+test('age: an aged low re-tiered to medium keeps its age, so it outranks a fresh medium by exactly the credit it earned', async () => {
+  const fx = fenced();
+  const cfg = cfgWith();
+  const later = T0 + 10 * 60_000;
+  await enqueue(fx.state, ticket('a', 'r1', 'low', { prioOriginAt: T0 }), cfg);
+  const agedLow = queued(fx.state).a;
+  assert.equal(effectiveRank(agedLow, later, cfg), 1, 'ten minutes: a low has aged to medium');
+  assert.equal((await retierQueued(fx.state, 'a', 'medium', cfg)).outcome, 'retiered');
+  const record = queued(fx.state).a;
+  assert.equal(record.prioOriginAt, T0, 'the age origin did not restart');
+  const freshMedium = { ...record, prioOriginAt: later };
+  assert.ok(score(record, later, cfg) > score(freshMedium, later, cfg), 'the earned age still counts');
+  assert.ok(effectiveRank(record, later, cfg) >= effectiveRank(freshMedium, later, cfg));
+});
+
+test('exclusive: re-tiered to low it keeps exclusive and never ages, however long it waits', async () => {
+  const fx = fenced();
+  const cfg = cfgWith();
+  await enqueue(fx.state, ticket('a', 'r1', 'high', { exclusive: true, prioOriginAt: T0 }), cfg);
+  assert.equal((await retierQueued(fx.state, 'a', 'low', cfg)).outcome, 'retiered');
+  const record = queued(fx.state).a;
+  assert.equal(record.exclusive, true);
+  const day = T0 + 24 * 3_600_000;
+  assert.equal(score(record, day, cfg), score(record, T0, cfg), 'no credit accrues');
+  assert.equal(effectiveRank(record, day, cfg), 0);
+});
+
+test('lane status --json shows the new tier', async () => {
+  const fx = fenced();
+  await enqueue(fx.state, ticket('a', 'r1', 'low'), cfgWith());
+  assert.equal((await priority(fx.env, 'a', 'high')).code, 0);
+  const status = JSON.parse((await laneRun(['status', '--json'], { env: fx.env })).stdout);
+  assert.equal(status.queued.find((q) => q.id === 'a').priority, 'high');
+});
+
+test('audit: priorityAuditOf carries the re-tier pair, and a lease that never was re-tiered carries neither key', () => {
+  assert.deepEqual(priorityAuditOf({ priorityRequested: 'high', priorityRetiered: true, priorityRetieredAt: 7 }), { priorityRequested: 'high', priorityRetiered: true, priorityRetieredAt: 7 });
+  assert.deepEqual(priorityAuditOf({ priorityRequested: 'high', priorityAdmitted: 'high', priorityDemoted: false }), { priorityRequested: 'high', priorityAdmitted: 'high', priorityDemoted: false });
+});
+
+test('audit (A3): the lease of a re-tiered ticket carries priorityRetiered, an untouched one does not', async () => {
+  const fx = fenced();
+  const cfg = cfgWith();
+  const a = ticket('a', 'r1', 'medium');
+  const b = ticket('b', 'r2', 'medium');
+  await enqueue(fx.state, a, cfg);
+  await enqueue(fx.state, b, cfg);
+  await retierQueued(fx.state, 'b', 'high', cfg);
+  const stamped = queued(fx.state).b.priorityRetieredAt;
+  assert.equal((await poll(fx.state, b, tryCfg())).started, true);
+  const lease = readLease(fx.state, 'b');
+  assert.deepEqual([lease.priorityRetiered, lease.priorityRetieredAt], [true, stamped]);
+  assert.equal((await poll(fx.state, a, tryCfg())).started, true);
+  const plain = readLease(fx.state, 'a');
+  assert.equal('priorityRetiered' in plain, false);
+  assert.equal('priorityRetieredAt' in plain, false);
+});
+
+test('audit (A3): the history row of a ticket re-tiered while queued carries priorityRetiered; an untouched ticket\'s row does not', async () => {
+  const fx = fenced();
+  writeGlobalConfig(fx.home, { version: 1, capacity: 1, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
+  const repoDir = path.join(fx.base, 'repo');
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
+  const release = path.join(fx.base, 'release');
+  const blocker = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', 'sh', '-c', `while [ ! -f ${release} ]; do sleep 0.1; done`], { env: fx.env, cwd: repoDir });
+  const blockerDone = new Promise((resolve) => blocker.on('close', resolve));
+  await waitFor(() => fs.existsSync(paths(fx.state).leases) && fs.readdirSync(paths(fx.state).leases).some((n) => n.endsWith('.json')), { timeoutMs: 60_000 });
+  const detach = async () => {
+    const started = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', '--priority', 'low', '--', 'true'], { env: fx.env, cwd: repoDir });
+    assert.equal(started.code, 0, started.stderr);
+    const id = started.stdout.trim();
+    await waitFor(() => fs.readdirSync(paths(fx.state).queue).some((n) => n.includes(id)), { timeoutMs: 60_000 });
+    return id;
+  };
+  const retiered = await detach();
+  const untouched = await detach();
+  assert.equal((await priority(fx.env, retiered, 'high')).code, 0);
+  fs.writeFileSync(release, '');
+  await blockerDone;
+  for (const id of [retiered, untouched]) assert.equal((await laneRun(['wait', id, '--timeout', '60s'], { env: fx.env })).code, 0);
+  const rows = fs.readFileSync(paths(fx.state).history, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const row = rows.find((r) => r.id === retiered);
+  assert.deepEqual([row.priorityRequested, row.priorityRetiered], ['high', true]);
+  assert.ok(Number.isFinite(row.priorityRetieredAt));
+  const other = rows.find((r) => r.id === untouched);
+  assert.equal('priorityRetiered' in other, false);
 });

@@ -779,6 +779,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       await logWriter.finish();
       return { fallback: true, rebindLost: true, attemptGeneration: gen };
     }
+    // BRAIN-518: `lane priority` re-tiers the queue record; this supervisor's cached copy predates it, and the dispatch header reads the cache
+    if (isPriorityTier(withdrawn.priorityRequested)) enriched.priorityRequested = withdrawn.priorityRequested;
     await testHoldAt('rebind-withdrawn');
     const line = `lane: remote-rebind: ${enriched.id}: seq ${withdrawn.seq} -> ${runner.name} (queued locally ${Math.round((Date.now() - withdrawn.createdAt) / 1000)}s${enriched.localFirst ? ', local-first' : ''})\n`;
     process.stderr.write(line);
