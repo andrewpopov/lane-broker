@@ -876,10 +876,11 @@ again:
 - a job the runner still runs is left alone; so is anything when the runner cannot be reached.
 
 `lane wait` asks the runner inline: it returns the settled exit, keeps waiting while the runner reports the job running (asking
-again every 30 s, `--timeout` still honoured, though one reconcile may overrun it by its ssh deadlines), and exits `1` naming
-the reason otherwise. `lane status` starts `lane reconcile` detached whenever it lists an orphan and never waits on ssh itself.
+again every 30 s), and exits `1` naming the reason otherwise. `--timeout` is an absolute deadline for the reconcile too: its ssh
+calls never run past it, and out of time `lane wait` exits `75`, not `1`. A signal during the wait asks the runner to cancel; one it
+cannot confirm makes `lane wait` exit `1` (`cancel of <id> not confirmed (attempt kept)`) rather than poll on. `lane status` starts `lane reconcile` detached whenever it lists an orphan and never waits on ssh itself.
 `lane reconcile [--now] [--json]` runs the sweep by hand: one sweep per 5 minutes per broker (claimed under the broker lock;
-`--now` skips the interval), oldest attempt first, and a runner whose first answer is a transport failure is skipped for the rest
+`--now` skips the interval), oldest attempt first, and a runner whose first answer is a transport failure (or whose cancel it cannot confirm) is skipped for the rest
 of that sweep. Every publish goes through `publishTerminal`, which settles an attempt exactly once: a second publisher (a racing
 `lane cancel`, another sweep, the supervisor) finds no record and writes nothing. A confirmed `remote-cancel` trusts the runner's
 own cancel, whose descendant reap reports survivors without failing.

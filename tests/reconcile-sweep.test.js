@@ -121,6 +121,51 @@ test('runner A down, runner B up: only A\'s first attempt is asked (no ssh for t
   assert.equal(resultOf(ctx.state, b2).exit, 75);
 });
 
+/** An `ssh` that logs each call's subcommand, answers like the fake runner, but fails every `remote-cancel` (exit 255). */
+function cancelFailingSsh(ctx) {
+  const real = path.join(ctx.env.PATH.split(path.delimiter)[0], 'ssh');
+  const log = path.join(tmpDir('sweep-cancel-log'), 'calls.log');
+  const bin = path.join(path.dirname(log), 'ssh');
+  fs.writeFileSync(
+    bin,
+    `#!/usr/bin/env node
+const { spawnSync } = require('child_process');
+const a = process.argv.slice(2);
+const sub = (/remote-(probe|exec|result|cancel|withdraw)/.exec(a[a.length - 1]) || [])[1];
+require('fs').appendFileSync(${JSON.stringify(log)}, sub + '\\n');
+if (sub === 'cancel') process.exit(255);
+const r = spawnSync(${JSON.stringify(real)}, a, { stdio: 'inherit' });
+process.exit(r.status == null ? 1 : r.status);
+`,
+  );
+  fs.chmodSync(bin, 0o755);
+  return { bin, calls: () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean) : []) };
+}
+
+test('a runner that answers gone but cannot confirm the cancel is treated as down: its first attempt is unreachable, the rest skip with no further ssh', async () => {
+  const ctx = context();
+  const first = seedOrphan(ctx, { attempt: { startedAt: Date.now() - 300_000 } });
+  const second = seedOrphan(ctx, { attempt: { startedAt: Date.now() - 200_000 } });
+  const third = seedOrphan(ctx, { attempt: { startedAt: Date.now() - 100_000 } });
+  const ssh = cancelFailingSsh(ctx);
+
+  const out = await sweep(ctx, { sshBin: ssh.bin });
+  assert.deepEqual(
+    out.results.map(({ id, state }) => ({ id, state })),
+    [
+      { id: first, state: 'unreachable' },
+      { id: second, state: 'skipped-runner-down' },
+      { id: third, state: 'skipped-runner-down' },
+    ],
+  );
+  assert.match(out.results[0].reason, /remote cancel not confirmed/);
+  assert.deepEqual(ssh.calls(), ['result', 'cancel'], 'one result fetch and one cancel for the whole runner, nothing for the other two');
+  for (const id of [first, second, third]) {
+    assert.ok(readAttempt(ctx.state, id), 'every attempt is kept');
+    assert.equal(resultOf(ctx.state, id), null);
+  }
+});
+
 test('claim: concurrent in-process sweeps run exactly one; a second call within 5 min is recently swept; force bypasses', async () => {
   const ctx = context();
   const outs = await Promise.all([sweep(ctx), sweep(ctx), sweep(ctx)]);

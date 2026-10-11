@@ -864,9 +864,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       onSnapshotSent: moves.length > 0 && movingSet ? clearMoving : undefined,
       // BRAIN-515: every dispatch (a rebalance move's second one too) re-persists which runner the snapshot goes to and the
       // identity a result fetched from it must carry; `lane`'s orphan reconcile trusts a runner record only against this.
-      onBinding: async ({ protocol, generation, manifestHash }) => {
-        await updateAttempt(root, enriched.id, gen, { binding: { protocol, generation, manifestHash, runner: runner.name } });
-      },
+      onBinding: async ({ protocol, generation, manifestHash }) =>
+        (await updateAttempt(root, enriched.id, gen, { binding: { protocol, generation, manifestHash, runner: runner.name } })).ok,
       rebalance: rebalanceOn && canWithdraw ? {
         minQueuedMs: globalCfg.remoteRebalanceMinQueuedMs,
         intervalMs: globalCfg.remoteRebalanceIntervalMs,

@@ -4,10 +4,12 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { laneRun, waitFor, sleep } from './helpers.js';
-import { tmpDir, setup, resultOf } from './remote-harness.js';
+import { tmpDir, setup, resultOf, linesOf, makeFakeSshBin, makeRunner, clientEnv, makeGitWorktree, makeDispatchArgs } from './remote-harness.js';
 import { readAttempt } from '../src/attempts.js';
 import { cancelAttempt } from '../src/cancel.js';
-import { paths, atomicWriteJson, writeCancelMarkerFile, ensureStateDirs } from '../src/state.js';
+import { paths, atomicWriteJson, writeCancelMarkerFile, ensureStateDirs, withLock } from '../src/state.js';
+import { reapStale } from '../src/scheduler.js';
+import { dispatchRemote } from '../src/remote-client.js';
 import { reconcileRemoteAttempt } from '../src/remote-reconcile.js';
 import { relayedUsage } from '../src/remote-relay.js';
 
@@ -69,21 +71,35 @@ function assertKept(ctx, id) {
   assert.deepEqual(historyRows(ctx.state), [], 'no history row may be written');
 }
 
-/** A real dispatch of a job that holds until `release()`; returns once it is running on the runner. */
+/** A real dispatch of a job that holds until `release()`; returns once it is running on the runner. The job appends one line
+ *  ('remote' or 'local') to `executions()`'s counter file on EVERY execution, so a second run anywhere is measurable. */
 async function startHeldRemote(ctx) {
   const dir = tmpDir('reconcile-hold');
   const started = path.join(dir, 'started');
   const releaseFile = path.join(dir, 'release');
+  const counter = path.join(dir, 'executions');
   const cmd = [
     process.execPath,
     '-e',
-    `const fs = require('fs'); fs.writeFileSync(${JSON.stringify(started)}, 'x'); const t = setInterval(() => { if (fs.existsSync(${JSON.stringify(releaseFile)})) { clearInterval(t); process.exit(3); } }, 50);`,
+    `const fs = require('fs'); fs.appendFileSync(${JSON.stringify(counter)}, (process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local') + '\\n'); fs.writeFileSync(${JSON.stringify(started)}, 'x'); const t = setInterval(() => { if (fs.existsSync(${JSON.stringify(releaseFile)})) { clearInterval(t); process.exit(3); } }, 50);`,
   ];
   const run = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...cmd], { env: ctx.env, cwd: ctx.repoDir });
   assert.equal(run.code, 0, run.stderr);
   const id = run.stdout.trim();
   await waitFor(() => fs.existsSync(started), { timeoutMs: 15_000 });
-  return { id, release: () => fs.writeFileSync(releaseFile, '') };
+  return { id, release: () => fs.writeFileSync(releaseFile, ''), executions: () => linesOf(counter) };
+}
+
+/** What the scheduler does at the start of every admission decision, under the lock. */
+const schedulerPass = (ctx) => withLock(ctx.state, () => reapStale(ctx.state));
+
+/** The job has executed exactly once, on the runner: right after the reconcile AND after a following scheduler pass. */
+async function assertRanOnce(ctx, held, when) {
+  assert.deepEqual(held.executions(), ['remote'], `${when}: one execution, on the runner`);
+  await schedulerPass(ctx);
+  await sleep(500);
+  assert.deepEqual(held.executions(), ['remote'], `${when}, after a scheduler pass: still one execution`);
+  assertNothingRan(ctx);
 }
 
 const killSupervisor = async (ctx, id) => {
@@ -132,7 +148,8 @@ test('a real dispatch persists its binding on the attempt before the run finishe
 
 test('a completed runner result matching the dispatch binding is adopted: exit kept, attempt removed, one reconciled history row', async () => {
   const ctx = context();
-  const { id, release } = await startHeldRemote(ctx);
+  const held = await startHeldRemote(ctx);
+  const { id, release } = held;
   const bound = readAttempt(ctx.state, id).binding;
   await killSupervisor(ctx, id);
   release();
@@ -157,7 +174,9 @@ test('a completed runner result matching the dispatch binding is adopted: exit k
   assert.equal(rows[0].reconciled, true);
   assert.equal(rows[0].exit, 3);
   assert.match(fs.readFileSync(paths(ctx.state).admissionLog, 'utf8'), new RegExp(`lane: reconcile: ${id}: skybox: adopted exit 3`));
-  assertNothingRan(ctx);
+  await assertRanOnce(ctx, held, 'after adopting');
+  assert.equal(resultOf(ctx.state, id).exit, 3, 'the adopted result is unchanged by the scheduler pass');
+  assert.equal(historyRows(ctx.state).length, 1);
 
   const again = await reconcile(ctx, id);
   assert.equal(again.state, 'skipped', 'a second reconcile finds nothing to do');
@@ -237,7 +256,8 @@ for (const mode of ['down', 'unconfirmed']) {
 
 test('a job still running on the runner keeps the attempt (and a live supervisor is skipped)', async () => {
   const ctx = context();
-  const { id, release } = await startHeldRemote(ctx);
+  const held = await startHeldRemote(ctx);
+  const { id, release } = held;
   try {
     const live = await reconcile(ctx, id);
     assert.equal(live.state, 'skipped');
@@ -246,6 +266,8 @@ test('a job still running on the runner keeps the attempt (and a live supervisor
     await killSupervisor(ctx, id);
     const outcome = await reconcile(ctx, id);
     assert.deepEqual(outcome, { settled: false, state: 'running' });
+    assertKept(ctx, id);
+    await assertRanOnce(ctx, held, 'while the runner still has it');
     assertKept(ctx, id);
   } finally {
     release();
@@ -351,3 +373,52 @@ test('reconcile racing lane cancel, in every order, leaves exactly one result an
     assert.equal(jsonFiles(paths(ctx.state).results).filter((n) => n === `${id}.json`).length, 1, order);
   }
 });
+
+/** An `ssh` that logs every call it receives, then delegates to the harness's fake transport. */
+function countingSsh(real) {
+  const dir = tmpDir('binding-ssh');
+  const log = path.join(dir, 'calls.log');
+  const bin = path.join(dir, 'ssh');
+  fs.writeFileSync(
+    bin,
+    `#!/usr/bin/env node
+const { spawnSync } = require('child_process');
+require('fs').appendFileSync(${JSON.stringify(log)}, 'call\\n');
+const res = spawnSync(${JSON.stringify(real)}, process.argv.slice(2), { stdio: 'inherit', env: process.env });
+process.exit(res.status == null ? 1 : res.status);
+`,
+  );
+  fs.chmodSync(bin, 0o755);
+  return { bin, calls: () => linesOf(log).length };
+}
+
+for (const [name, onBinding] of [
+  ['resolves false (the attempt write was refused)', async () => false],
+  ['throws (the lock or the write failed)', async () => {
+    throw new Error('lock timeout');
+  }],
+]) {
+  test(`a dispatch whose binding cannot be persisted (onBinding ${name}) never starts: nothing is sent, and it is a never-started unconfirmed outcome`, async () => {
+    const { binDir, sshBin } = makeFakeSshBin();
+    const { env } = clientEnv(binDir);
+    const counting = countingSsh(sshBin);
+    const root = tmpDir('binding-runner-root');
+    const src = makeGitWorktree({ 'a.txt': 'hello' });
+    const args = { ...makeDispatchArgs(), runner: makeRunner({ ssh: 'normal', root }), worktreeRoot: src, sshBin: counting.bin, env };
+
+    const outcome = await dispatchRemote({ ...args, onBinding });
+    assert.equal(outcome.outcome, 'unconfirmed');
+    assert.equal(outcome.reason, 'could not persist the dispatch binding');
+    assert.equal(outcome.neverStarted, true, 'nothing was sent, so the existing never-started fallback rules apply');
+    assert.equal(outcome.retryElsewhere, undefined, 'not a reason to try another runner');
+    assert.equal(counting.calls(), 0, 'no ssh was spawned');
+    assert.equal(fs.existsSync(path.join(root, 'tickets')), false, 'the runner never saw the ticket');
+
+    // the same dispatch with a persisting onBinding does reach the runner, so the assertions above can fail
+    const bindings = [];
+    const sent = await dispatchRemote({ ...args, ticketId: crypto.randomUUID(), onBinding: async (b) => (bindings.push(b), true) });
+    assert.equal(sent.outcome, 'confirmed');
+    assert.ok(counting.calls() > 0);
+    assert.equal(bindings.length, 1);
+  });
+}

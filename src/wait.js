@@ -8,17 +8,16 @@ import { loadGlobalConfigOrError } from './config.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
 
 const RECONCILE_SSH_DEADLINE_MS = 30_000;
-const RECONCILE_MIN_SSH_DEADLINE_MS = 1_000;
+// Under this much of --timeout left, asking the runner cannot finish in time: keep polling so the timeout path answers 75.
+const RECONCILE_MIN_REMAINING_MS = 1_000;
 // Test-only seam (README "Testing hooks"): how long a runner-reported-running orphan waits before asking the runner again.
 const reconcileIntervalMs = () => Number(process.env.LANE_BROKER_TEST_RECONCILE_INTERVAL_MS) || 30_000;
 
-/** BRAIN-515: ask the runner about an ORPHANED-REMOTE attempt. An unreadable global config means the runner cannot be reached. */
+/** BRAIN-515: ask the runner about an ORPHANED-REMOTE attempt, never past `deadline` (ms epoch, or null). An unreadable global config means the runner cannot be reached. */
 async function reconcileOrphan(root, id, deadline) {
   const { config, error } = loadGlobalConfigOrError();
   if (error) return { settled: false, state: 'unreachable', reason: `global config unreadable (${error})` };
-  const remaining = deadline ? deadline - Date.now() : Infinity;
-  const deadlineMs = Math.max(RECONCILE_MIN_SSH_DEADLINE_MS, Math.min(RECONCILE_SSH_DEADLINE_MS, remaining));
-  return reconcileRemoteAttempt(root, id, { globalCfg: config, deadlineMs });
+  return reconcileRemoteAttempt(root, id, { globalCfg: config, deadlineMs: RECONCILE_SSH_DEADLINE_MS, deadlineAt: deadline ?? undefined });
 }
 
 function sleep(ms) {
@@ -31,6 +30,7 @@ export async function waitCommand(id, { timeoutMs } = {}) {
   const resultPath = `${paths(root).results}/${id}.json`;
 
   let cancelling = false;
+  let cancelFailed = false;
   // BRAIN-319 T3b-5: delegate to the SAME attempt-aware cancel logic
   // `lane cancel` uses -- forwarding straight to a lease's supervisorPid (as
   // this used to) never even looks at an attempt record, so Ctrl-C on a
@@ -39,19 +39,28 @@ export async function waitCommand(id, { timeoutMs } = {}) {
   // queued/leased/attempt (live or ORPHANED-REMOTE) uniformly; fired here
   // without awaiting it (a signal handler can't usefully await), while this
   // function's own polling loop below observes the eventual result the same
-  // way it always does.
+  // way it always does. A cancel that did not succeed (nonzero exit, or a
+  // throw) is remembered and `cancelling` is cleared so a later signal tries
+  // again; the loop reports it rather than polling a job nobody can stop.
   const forwardCancel = () => {
     if (cancelling) return;
     cancelling = true;
-    cancelCommand(id).catch(() => {
-      // best-effort: any failure here still leaves the polling loop below to
-      // report whatever state actually results.
-    });
+    const failed = () => {
+      cancelling = false;
+      cancelFailed = true;
+    };
+    cancelCommand(id).then((res) => {
+      if (res?.exitCode !== 0) failed();
+    }, failed);
   };
   process.on('SIGINT', forwardCancel);
   process.on('SIGTERM', forwardCancel);
 
   const deadline = timeoutMs ? Date.now() + timeoutMs : null;
+  const timedOutResult = () => {
+    process.stderr.write(`lane wait: waited ${timeoutMs}ms, not failed — id ${id} is still queued or running\n`);
+    return { exitCode: 75 };
+  };
   // Same liveness check `lane run` uses: an id that is neither queued nor
   // leased nor resulted is not something we can ever wait for -- fail fast
   // instead of blocking forever on a typo. Tolerate a short grace window so
@@ -69,6 +78,10 @@ export async function waitCommand(id, { timeoutMs } = {}) {
           return { exitCode: 1 };
         }
         return { exitCode: result.exit ?? 1 };
+      }
+      if (cancelFailed) {
+        process.stderr.write(`lane wait: cancel of ${id} not confirmed (attempt kept); retry lane cancel ${id}\n`);
+        return { exitCode: 1 };
       }
       // BRAIN-319 T3b-4/T3b-5 (C4), fixed by P1 (Codex re-review): an attempt
       // record still mid remote-dispatch, still queued after a local
@@ -135,9 +148,11 @@ export async function waitCommand(id, { timeoutMs } = {}) {
           // ORPHANED-REMOTE: the runner knows what happened to the job, so ask it (never re-runs anything). A settled
           // outcome is read back by the top of the loop; a job the runner still has keeps polling like any in-flight
           // ticket, asking again at most every reconcileIntervalMs().
-          if (lastReconcileAt === null || Date.now() - lastReconcileAt >= reconcileIntervalMs()) {
+          if ((lastReconcileAt === null || Date.now() - lastReconcileAt >= reconcileIntervalMs()) && !(deadline && deadline - Date.now() < RECONCILE_MIN_REMAINING_MS)) {
             const outcome = await reconcileOrphan(root, id, deadline);
             if (outcome.settled) continue;
+            // out of time is not an orphan verdict: the ordinary timeout answer (75) applies
+            if (outcome.timedOut || (deadline && Date.now() > deadline)) return timedOutResult();
             if (outcome.state === 'running') lastReconcileAt = Date.now();
             else if (outcome.state !== 'skipped') {
               const runnerName = settledAttempt.runner ?? 'unknown';
@@ -161,10 +176,7 @@ export async function waitCommand(id, { timeoutMs } = {}) {
           return { exitCode: 1 };
         }
       }
-      if (deadline && Date.now() > deadline) {
-        process.stderr.write(`lane wait: waited ${timeoutMs}ms, not failed — id ${id} is still queued or running\n`);
-        return { exitCode: 75 };
-      }
+      if (deadline && Date.now() > deadline) return timedOutResult();
       await sleep(200);
     }
   } finally {

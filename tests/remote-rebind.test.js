@@ -6,7 +6,8 @@ import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor, sleep }
 import { tmpDir, makeRunner, setup, probeCount, recordingCmd, linesOf, hasLease, holdLaneLocally, detach, waitResult } from './remote-harness.js';
 import { selectRunner } from '../src/remote-client.js';
 import { spawn } from 'node:child_process';
-import { enqueue, tryStart, listQueue, withdrawQueued, restoreQueued, recoverRebinding } from '../src/scheduler.js';
+import { enqueue, tryStart, listQueue, withdrawQueued, restoreQueued, recoverRebinding, reapStale } from '../src/scheduler.js';
+import { reconcileRemoteAttempt } from '../src/remote-reconcile.js';
 import { createAttempt, readAttempt, patchAttemptLocked } from '../src/attempts.js';
 import { fenceLegacyQueue } from '../src/migrate.js';
 import { listLeases } from '../src/lease.js';
@@ -644,6 +645,90 @@ test('a supervisor killed between withdraw and dispatch leaves a parked ticket t
   assert.deepEqual(linesOf(ran), [], 'nothing ran');
   hold.release();
   await hold.done;
+});
+
+const rowsFor = (state, id) => (fs.existsSync(paths(state).history) ? fs.readFileSync(paths(state).history, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []).filter((r) => r.id === id);
+
+/** A rebound ticket running on the runner (held until `release()`), its supervisor then SIGKILLed: the parked `.rebinding` record and
+ *  the remote attempt both outlive it. `ran` counts every execution of the job, local or remote. */
+async function reboundThenSupervisorKilled(ctx) {
+  const hold = await holdLaneLocally(ctx);
+  const dir = tmpDir('rebind-settled');
+  const ran = path.join(dir, 'ran');
+  const releaseFile = path.join(dir, 'release');
+  const id = await detach(ctx, recordingCmd(ran, releaseFile));
+  await waitFor(() => queuedIds(ctx.state).includes(id), { timeoutMs: 30_000 });
+  ctx.setMode('ok');
+  await waitFor(() => linesOf(ran).length === 1, { timeoutMs: 60_000 });
+  const attempt = readAttempt(ctx.state, id);
+  assert.equal(attempt.executor, 'remote');
+  assert.equal(attempt.phase, 'running');
+  assert.equal(parkedFiles(ctx.state).length, 1, 'the withdrawal record is still parked while the job runs on the runner');
+  assert.equal(readJsonSafe(path.join(paths(ctx.state).queue, parkedFiles(ctx.state)[0])).supervisorPid, attempt.supervisor.pid);
+  process.kill(attempt.supervisor.pid, 'SIGKILL');
+  await waitFor(() => { try { process.kill(attempt.supervisor.pid, 0); return false; } catch { return true; } }, { timeoutMs: 10_000 });
+  return { id, ran, attempt, release: () => fs.writeFileSync(releaseFile, ''), hold };
+}
+
+for (const settledBy of ['reconcile', 'lane cancel']) {
+  test(`a parked rebind record never resurrects a ticket already settled by ${settledBy}: the result, the history and the execution count stay as settled (BRAIN-515)`, async () => {
+    const ctx = controllableRunner();
+    const { id, ran, release, hold } = await reboundThenSupervisorKilled(ctx);
+    const resultFile = path.join(paths(ctx.state).results, `${id}.json`);
+    try {
+      if (settledBy === 'reconcile') {
+        release();
+        await waitFor(() => fs.existsSync(path.join(ctx.runnerRoot, 'tickets', id, 'result.json')), { timeoutMs: 30_000 });
+        const globalCfg = JSON.parse(fs.readFileSync(path.join(ctx.home, 'config.json'), 'utf8'));
+        const outcome = await reconcileRemoteAttempt(ctx.state, id, { globalCfg, env: ctx.env, sshBin: 'ssh', deadlineMs: 20_000 });
+        assert.equal(outcome.state, 'adopted', JSON.stringify(outcome));
+      } else {
+        const cancelled = await laneRun(['cancel', id], { env: ctx.env });
+        assert.equal(cancelled.code, 0, cancelled.stderr);
+      }
+      assert.equal(readAttempt(ctx.state, id), null, 'settled: no attempt left');
+      assert.equal(parkedFiles(ctx.state).length, 1, 'the settle did not touch the parked record: the exact state a supervisor crash leaves');
+      const settled = fs.readFileSync(resultFile, 'utf8');
+      assert.equal(rowsFor(ctx.state, id).length, 1);
+      assert.deepEqual(linesOf(ran), ['remote']);
+
+      await withLock(ctx.state, () => reapStale(ctx.state));
+      await sleep(500);
+
+      assert.equal(fs.readFileSync(resultFile, 'utf8'), settled, 'the settled result is byte-for-byte unchanged (no exit-75 overwrite)');
+      assert.equal(rowsFor(ctx.state, id).length, 1, 'exactly one history row');
+      assert.deepEqual(queuedIds(ctx.state), [], 'not put back in the queue');
+      assert.deepEqual(parkedFiles(ctx.state), [], 'the parked record is dropped');
+      assert.deepEqual(linesOf(ran), ['remote'], 'the job executed exactly once, anywhere');
+    } finally {
+      release();
+      hold.release();
+      await hold.done;
+    }
+  });
+}
+
+test('a rebind dispatch persists the binding of the attempt generation it runs at (a nonzero generation after the local fallback)', async () => {
+  const ctx = controllableRunner();
+  const hold = await holdLaneLocally(ctx);
+  const dir = tmpDir('rebind-binding');
+  const ran = path.join(dir, 'ran');
+  const releaseFile = path.join(dir, 'release');
+  const id = await detach(ctx, recordingCmd(ran, releaseFile));
+  await waitFor(() => queuedIds(ctx.state).includes(id), { timeoutMs: 30_000 });
+  ctx.setMode('ok');
+  try {
+    await waitFor(() => linesOf(ran).length === 1, { timeoutMs: 60_000 });
+    const attempt = readAttempt(ctx.state, id);
+    assert.ok(attempt.generation >= 1, `a rebind runs at the fallback's generation, got ${attempt.generation}`);
+    assert.equal(attempt.binding.generation, attempt.generation);
+    assert.equal(attempt.binding.runner, 'skybox');
+    assert.match(attempt.binding.manifestHash, /^[0-9a-f]{64}$/);
+  } finally {
+    fs.writeFileSync(releaseFile, '');
+    hold.release();
+    await hold.done;
+  }
 });
 
 test('a localRefused remote lane with every runner full goes to the best runner as a queued remote attempt: no exit 69, never runs locally', async () => {

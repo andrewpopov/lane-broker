@@ -17,12 +17,15 @@ import { writeBrokerLog } from './admission.js';
  * Anything else leaves the attempt untouched, with the state saying why: `running` (the runner still has it), `unreachable`
  * (no usable answer), `ambiguous` (a record that cannot be trusted), `skipped` (not an orphan, or already settled).
  *
- * Returns `{ settled, state, exit?, reason?, transport? }` (`transport: true`: the runner gave no usable answer at all, so asking it
- * about another attempt would fail the same way); never throws.
+ * `deadlineMs` bounds each ssh call; `deadlineAt` (ms epoch, optional) bounds the whole reconcile: every call gets at most what is
+ * left of it, and the next call is not made when under `MIN_CALL_MS` remain (`{ state: 'unreachable', timedOut: true }`).
+ *
+ * Returns `{ settled, state, exit?, reason?, transport?, timedOut? }` (`transport: true`: the runner gave no usable answer at all, so
+ * asking it about another attempt would fail the same way); never throws.
  */
-export async function reconcileRemoteAttempt(root, id, { globalCfg, sshBin = 'ssh', env, deadlineMs = 30_000 } = {}) {
+export async function reconcileRemoteAttempt(root, id, { globalCfg, sshBin = 'ssh', env, deadlineMs = 30_000, deadlineAt } = {}) {
   try {
-    return await reconcile(root, id, { globalCfg, sshBin, env, deadlineMs });
+    return await reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt });
   } catch (err) {
     return { settled: false, state: 'error', reason: err.message };
   }
@@ -30,7 +33,10 @@ export async function reconcileRemoteAttempt(root, id, { globalCfg, sshBin = 'ss
 
 const skipped = (reason) => ({ settled: false, state: 'skipped', reason });
 
-async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs }) {
+const MIN_CALL_MS = 250;
+const waitTimedOut = () => ({ settled: false, state: 'unreachable', reason: 'wait timeout reached', timedOut: true });
+
+async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt }) {
   const resultPath = path.join(paths(root).results, `${id}.json`);
   const attempt = readAttempt(root, id);
   if (!attempt) return skipped('no attempt record');
@@ -42,7 +48,15 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs }) {
   const runner = (globalCfg?.runners ?? []).find((r) => r.name === attempt.runner);
   if (!runner) return { settled: false, state: 'unreachable', reason: 'runner not configured' };
 
-  const fetched = await fetchRemoteResult(runner, id, sshBin, deadlineMs, env);
+  /** The time the next ssh call may take, or null when too little of the overall deadline is left to make it. */
+  const callBudget = () => {
+    const ms = deadlineAt === undefined ? deadlineMs : Math.min(deadlineMs, deadlineAt - Date.now());
+    return ms < MIN_CALL_MS ? null : ms;
+  };
+
+  const firstBudget = callBudget();
+  if (firstBudget === null) return waitTimedOut();
+  const fetched = await fetchRemoteResult(runner, id, sshBin, firstBudget, env);
   if (fetched === null) return { settled: false, state: 'unreachable', transport: true, reason: `no usable answer from ${runner.name}` };
 
   const publish = (kind, build) => publishSettled(root, id, attempt, runner, resultPath, kind, build);
@@ -53,11 +67,16 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs }) {
 
   // The runner's job is gone with no result. Only a runner-confirmed cancel makes that safe to settle: the job can no longer
   // start or still be running there.
-  if (!(await remoteCancel(runner, id, { sshBin, deadlineMs, env }))) {
-    return { settled: false, state: 'unreachable', reason: 'remote cancel not confirmed' };
+  const cancelBudget = callBudget();
+  if (cancelBudget === null) return waitTimedOut();
+  if (!(await remoteCancel(runner, id, { sshBin, deadlineMs: cancelBudget, env }))) {
+    // an unconfirmed cancel is no answer to build on: the rest of a sweep treats this runner as down, like a failed fetch
+    return { settled: false, state: 'unreachable', transport: true, reason: 'remote cancel not confirmed' };
   }
   // The job may have published a result between the first fetch and the cancel; that real outcome wins over "lost".
-  const late = await fetchRemoteResult(runner, id, sshBin, deadlineMs, env);
+  const lateBudget = callBudget();
+  if (lateBudget === null) return waitTimedOut();
+  const late = await fetchRemoteResult(runner, id, sshBin, lateBudget, env);
   if (late && !late.missing) {
     const adopted = await adoptOrAmbiguous(attempt, id, late, publish);
     if (adopted.state !== 'ambiguous') return adopted;

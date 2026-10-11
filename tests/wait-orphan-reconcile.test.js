@@ -60,6 +60,9 @@ async function startOrphanedHeldRemote(ctx) {
   return { id, release: () => fs.writeFileSync(releaseFile, '') };
 }
 
+// process start-up and the 200 ms poll on top of --timeout
+const SLACK_MS = 1_500;
+
 const wait = (ctx, id, extra = [], env = {}) => laneRun(['wait', id, ...extra], { env: { ...ctx.env, ...env }, cwd: ctx.repoDir });
 
 test('orphan + runner reports the job gone: lane wait exits 75 (runner-lost) without any lane cancel', async () => {
@@ -139,7 +142,7 @@ test('--timeout is honoured while the runner reports the job running (exit 75 on
     const elapsed = Date.now() - t0;
     assert.equal(out.code, 75, out.stderr);
     assert.match(out.stderr, /waited 2000ms, not failed/);
-    assert.ok(elapsed < 10_000, `took ${elapsed}ms`);
+    assert.ok(elapsed < 2_000 + SLACK_MS, `took ${elapsed}ms`);
     assert.ok(readAttempt(ctx.state, id));
   } finally {
     release();
@@ -155,4 +158,47 @@ test('a post-fallback orphan (executor local) is still reported ORPHANED, never 
   assert.equal(out.code, 1);
   assert.match(out.stderr, /ORPHANED \(post-fallback\)/);
   assert.match(out.stderr, /reconcile with: lane cancel/);
+});
+
+/** A PATH entry whose `ssh` never answers: it sleeps far past any deadline (and dies with its parent's SIGKILL). */
+function unresponsiveSsh(ctx) {
+  const dir = tmpDir('wait-unresponsive-ssh');
+  fs.writeFileSync(path.join(dir, 'ssh'), '#!/usr/bin/env node\nsetTimeout(() => process.exit(255), 120_000);\n');
+  fs.chmodSync(path.join(dir, 'ssh'), 0o755);
+  return { ...ctx.env, PATH: `${dir}${path.delimiter}${ctx.env.PATH}` };
+}
+
+test('--timeout is honoured against a runner that never answers: exit 75 (not the exit-1 orphan message) within the timeout, attempt kept', async () => {
+  const ctx = setup();
+  const id = seedOrphan(ctx);
+  const t0 = Date.now();
+  const out = await laneRun(['wait', id, '--timeout', '2s'], { env: unresponsiveSsh(ctx), cwd: ctx.repoDir });
+  const elapsed = Date.now() - t0;
+  assert.equal(out.code, 75, out.stderr);
+  assert.match(out.stderr, /waited 2000ms, not failed/);
+  assert.doesNotMatch(out.stderr, /ORPHANED-REMOTE/);
+  assert.ok(elapsed < 2_000 + SLACK_MS, `took ${elapsed}ms`);
+  assert.ok(readAttempt(ctx.state, id), 'the attempt is kept');
+  assert.equal(resultOf(ctx.state, id), null);
+});
+
+test('a signal to lane wait on an orphan whose cancel cannot be confirmed: it exits 1 naming lane cancel, the attempt kept (no polling for ever)', async () => {
+  const ctx = setup({ ssh: 'stuck-running' }); // the runner always reports the job running, and never confirms a cancel
+  const id = seedOrphan(ctx);
+  const child = laneSpawn(['wait', id], { env: ctx.env, cwd: ctx.repoDir });
+  let stderr = '';
+  child.stderr.on('data', (d) => (stderr += d));
+  const closed = new Promise((resolve) => child.on('close', (code) => resolve(code)));
+  try {
+    const early = await Promise.race([closed, sleep(2_000).then(() => 'still-waiting')]);
+    assert.equal(early, 'still-waiting', `lane wait gave up early: ${stderr}`);
+    child.kill('SIGINT');
+    const code = await Promise.race([closed, sleep(30_000).then(() => 'hung')]);
+    assert.equal(code, 1, `lane wait did not exit after the unconfirmed cancel: ${stderr}`);
+    assert.match(stderr, new RegExp(`lane wait: cancel of ${id} not confirmed \\(attempt kept\\); retry lane cancel ${id}`));
+    assert.ok(readAttempt(ctx.state, id), 'the attempt is kept');
+    assert.equal(resultOf(ctx.state, id), null);
+  } finally {
+    child.kill('SIGKILL');
+  }
 });

@@ -354,7 +354,9 @@ export function discardRebinding(root, id) {
 /**
  * BRAIN-405: a withdrawal whose supervisor died. Without dispatch evidence in the attempt (it never reached `running` on a
  * runner) nothing was sent, so the ticket goes back at its original seq. With evidence the run may be live on the runner: the
- * attempt is left as the remote attempt to reconcile (ORPHANED-REMOTE) and the parked record is dropped. Caller holds the lock.
+ * attempt is left as the remote attempt to reconcile (ORPHANED-REMOTE) and the parked record is dropped. With no attempt left AND a
+ * result already published, the ticket is finished (a reconcile or `lane cancel` settled it after the crash): the parked record is
+ * dropped, never restored, or the ticket would run again and overwrite that result. Caller holds the lock.
  */
 export function recoverRebinding(root) {
   for (const name of rebindingNames(root)) {
@@ -363,9 +365,11 @@ export function recoverRebinding(root) {
     if (!record || isSupervisorAlive({ supervisorPid: record.supervisorPid, supervisorStart: record.supervisorStart })) continue;
     const attempt = readAttempt(root, record.id);
     const dispatched = attempt?.executor === 'remote' && attempt.phase === 'running';
-    if (dispatched) discardRebinding(root, record.id);
+    const settled = !attempt && fs.existsSync(record.resultPath ?? path.join(paths(root).results, `${record.id}.json`));
+    if (dispatched || settled) discardRebinding(root, record.id);
     else restoreLocked(root, record);
-    logResourceEvent(root, 'rebind-recovered', { ticket: record.id, action: dispatched ? 'remote-attempt' : 'restored', seq: record.seq });
+    const action = settled ? 'already-settled' : dispatched ? 'remote-attempt' : 'restored';
+    logResourceEvent(root, 'rebind-recovered', { ticket: record.id, action, seq: record.seq });
   }
 }
 
