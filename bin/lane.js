@@ -105,6 +105,13 @@ function parseRunArgs(args) {
       case '--local':
         opts.local = true;
         break;
+      // BRAIN-547: on a remote-eligible lane `--local` is honoured only with a reason; a reason alone implies local.
+      case '--local-reason': {
+        const raw = flagArgs[++i];
+        if (!raw || raw.startsWith('--')) throw new Error('--local-reason needs a non-empty text');
+        opts.localReason = raw;
+        break;
+      }
       case '--log':
         opts.log = flagArgs[++i];
         break;
@@ -167,6 +174,7 @@ async function main() {
         timeoutMs: opts.timeout ? parseDurationMs(opts.timeout) : undefined,
         allowLocalSim: opts.allowLocalSim,
         local: opts.local,
+        localReason: opts.localReason,
         log: opts.log,
         ticketId: opts.ticketId,
         cmd,

@@ -463,6 +463,7 @@ function historyRow(ticket, result, { fallbackReason, lease } = {}) {
     ...result,
     executor,
     ...(localReason ? { localReason } : {}),
+    ...(localReason && localReason === ticket.localReason && ticket.localReasonText ? { localReasonText: ticket.localReasonText } : {}),
   };
 }
 

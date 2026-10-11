@@ -19,7 +19,7 @@ const RUNNERS = [{ name: 'skybox', ssh: 'skybox-runner' }];
  * back to the caller (BRAIN-319 T3b-1's only observable seam onto the ticket
  * payload -- same pattern as tests/run-not-found-grace.test.js).
  */
-async function captureTicket({ env, cwd, local, lane = 'default', extraEnv = {} }) {
+async function captureTicket({ env, cwd, local, localReason, lane = 'default', extraEnv = {} }) {
   let capturedTicket = null;
   let spawnCalled = false;
   const spawnSupervisor = (execPath, args, opts) => {
@@ -41,12 +41,15 @@ async function captureTicket({ env, cwd, local, lane = 'default', extraEnv = {} 
   const prevState = process.env.LANE_BROKER_STATE;
   const prevLease = process.env.LANE_BROKER_LEASE;
   const prevLocal = process.env.LANE_BROKER_LOCAL;
+  const prevLocalReason = process.env.LANE_BROKER_LOCAL_REASON;
   process.env.LANE_BROKER_HOME = env.LANE_BROKER_HOME;
   process.env.LANE_BROKER_STATE = env.LANE_BROKER_STATE;
   if (extraEnv.LANE_BROKER_LEASE !== undefined) process.env.LANE_BROKER_LEASE = extraEnv.LANE_BROKER_LEASE;
   else delete process.env.LANE_BROKER_LEASE;
   if (extraEnv.LANE_BROKER_LOCAL !== undefined) process.env.LANE_BROKER_LOCAL = extraEnv.LANE_BROKER_LOCAL;
   else delete process.env.LANE_BROKER_LOCAL;
+  if (extraEnv.LANE_BROKER_LOCAL_REASON !== undefined) process.env.LANE_BROKER_LOCAL_REASON = extraEnv.LANE_BROKER_LOCAL_REASON;
+  else delete process.env.LANE_BROKER_LOCAL_REASON;
   let stderr = '';
   const origWrite = process.stderr.write.bind(process.stderr);
   process.stderr.write = (chunk, ...rest) => {
@@ -60,6 +63,7 @@ async function captureTicket({ env, cwd, local, lane = 'default', extraEnv = {} 
       cmd: ['true'],
       cwd,
       local,
+      localReason,
       spawnSupervisor,
     });
     return { result, ticket: capturedTicket, spawnCalled, stderr };
@@ -73,6 +77,8 @@ async function captureTicket({ env, cwd, local, lane = 'default', extraEnv = {} 
     else process.env.LANE_BROKER_LEASE = prevLease;
     if (prevLocal === undefined) delete process.env.LANE_BROKER_LOCAL;
     else process.env.LANE_BROKER_LOCAL = prevLocal;
+    if (prevLocalReason === undefined) delete process.env.LANE_BROKER_LOCAL_REASON;
+    else process.env.LANE_BROKER_LOCAL_REASON = prevLocalReason;
   }
 }
 
@@ -97,8 +103,8 @@ const NO_REMOTE_CASES = [
   ['no runners configured', { runners: undefined, remote: true }, {}],
   ['lane not opted into remote', { runners: RUNNERS, remote: false }, {}],
   ['lane has no remote field at all', { runners: RUNNERS, remote: undefined }, {}],
-  ['--local forces local', { runners: RUNNERS, remote: true }, { local: true }],
-  ['LANE_BROKER_LOCAL=1 forces local', { runners: RUNNERS, remote: true }, { extraEnv: { LANE_BROKER_LOCAL: '1' } }],
+  ['--local forces local', { runners: RUNNERS, remote: true }, { local: true, localReason: 'test' }],
+  ['LANE_BROKER_LOCAL=1 forces local', { runners: RUNNERS, remote: true }, { extraEnv: { LANE_BROKER_LOCAL: '1', LANE_BROKER_LOCAL_REASON: 'test' } }],
   ['an inherited LANE_BROKER_LEASE forces local', { runners: RUNNERS, remote: true }, { extraEnv: { LANE_BROKER_LEASE: 'some-ancestor-id' } }],
 ];
 
@@ -112,6 +118,53 @@ for (const [label, cfg, opts] of NO_REMOTE_CASES) {
     assert.equal(Object.prototype.hasOwnProperty.call(ticket, 'remote'), false, 'I6: ineligible ticket must carry no "remote" key at all');
   });
 }
+
+const IGNORED = /lane: --local ignored for remote-eligible lane default: pass --local-reason/;
+
+test('BRAIN-547: --local without a reason on a remote-eligible lane is ignored with a warning and stays remote', async () => {
+  const { env, repoDir } = setup({ runners: RUNNERS, remote: true });
+  const { result, ticket, stderr } = await captureTicket({ env, cwd: repoDir, local: true });
+  assert.equal(result.exitCode, 0, `stderr: ${stderr}`);
+  assert.match(stderr, IGNORED);
+  assert.ok(ticket.remote, 'ticket must still be remote-eligible');
+  assert.equal(ticket.localReason, undefined);
+});
+
+test('BRAIN-547: LANE_BROKER_LOCAL=1 without a reason is ignored the same way', async () => {
+  const { env, repoDir } = setup({ runners: RUNNERS, remote: true });
+  const { ticket, stderr } = await captureTicket({ env, cwd: repoDir, extraEnv: { LANE_BROKER_LOCAL: '1' } });
+  assert.match(stderr, IGNORED);
+  assert.ok(ticket.remote);
+});
+
+test('BRAIN-547: --local with a reason stays local and the ticket carries localReasonText', async () => {
+  const { env, repoDir } = setup({ runners: RUNNERS, remote: true });
+  const { ticket, stderr } = await captureTicket({ env, cwd: repoDir, local: true, localReason: 'needs ssh' });
+  assert.doesNotMatch(stderr, /ignored/);
+  assert.equal(Object.prototype.hasOwnProperty.call(ticket, 'remote'), false);
+  assert.equal(ticket.localReason, 'forced-flag');
+  assert.equal(ticket.localReasonText, 'needs ssh');
+});
+
+test('BRAIN-547: a reason alone (flag or env) implies local, env origin is forced-env', async () => {
+  const { env, repoDir } = setup({ runners: RUNNERS, remote: true });
+  const flag = await captureTicket({ env, cwd: repoDir, localReason: 'needs gh' });
+  assert.equal(Object.prototype.hasOwnProperty.call(flag.ticket, 'remote'), false);
+  assert.equal(flag.ticket.localReason, 'forced-flag');
+  const viaEnv = await captureTicket({ env, cwd: repoDir, extraEnv: { LANE_BROKER_LOCAL: '1', LANE_BROKER_LOCAL_REASON: 'needs gh' } });
+  assert.equal(Object.prototype.hasOwnProperty.call(viaEnv.ticket, 'remote'), false);
+  assert.equal(viaEnv.ticket.localReason, 'forced-env');
+  assert.equal(viaEnv.ticket.localReasonText, 'needs gh');
+  const envOnly = await captureTicket({ env, cwd: repoDir, extraEnv: { LANE_BROKER_LOCAL_REASON: 'needs gh' } });
+  assert.equal(Object.prototype.hasOwnProperty.call(envOnly.ticket, 'remote'), false);
+});
+
+test('BRAIN-547: --local on a lane that is not remote-eligible is unchanged and silent', async () => {
+  const { env, repoDir } = setup({ runners: RUNNERS, remote: false });
+  const { result, stderr } = await captureTicket({ env, cwd: repoDir, local: true });
+  assert.equal(result.exitCode, 0);
+  assert.doesNotMatch(stderr, /ignored/);
+});
 
 test('an allowed undeclared lane is never remote-eligible even when runners are configured', async () => {
   const { base, home, env } = freshEnv();

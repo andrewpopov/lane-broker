@@ -370,6 +370,8 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   // BRAIN-380: a remote-exec ticket's tier comes only from the dispatch header (none yet, so medium), never the runner shell.
   delete process.env.LANE_BROKER_PRIORITY;
   process.env.LANE_BROKER_LOCAL = '1';
+  // BRAIN-547: a runner never re-dispatches, so its forced-local is internal, not an agent's choice.
+  process.env.LANE_BROKER_LOCAL_REASON = 'remote-exec runner';
 
   // BRAIN-320 review fix C: also scrub git's own repo-local env vars
   // (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, ..., plus GIT_QUARANTINE_PATH)

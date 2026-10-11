@@ -107,12 +107,27 @@ const HISTORY_COMMAND_MAX = 300;
 /** Why a run of a remote-capable lane (`remote: true`) is executing locally,
  *  decided at ticket creation. A remote attempt that later falls back is
  *  recorded by the supervisor as `fallback:<reason>` instead. */
-function localReasonFor(resolved, eligible, local, exclusive) {
+function localReasonFor(resolved, eligible, forced, exclusive) {
   if (resolved.remote !== true || eligible) return undefined;
   if (exclusive) return 'exclusive';
-  if (local) return 'forced-flag';
-  if (process.env.LANE_BROKER_LOCAL === '1') return 'forced-env';
+  if (forced) return forced;
   return 'not-eligible';
+}
+
+/** BRAIN-547: `--local`/`LANE_BROKER_LOCAL=1` on a lane that would otherwise go remote is honoured only with a
+ *  reason (`--local-reason` / `LANE_BROKER_LOCAL_REASON`, either implies local). Returns how local was forced
+ *  (`forced-flag` | `forced-env`, undefined when it was not, or was ignored with a stderr line) and the reason text. */
+function resolveForcedLocal({ local, localReason, lane, remoteCapable }) {
+  const envReason = (process.env.LANE_BROKER_LOCAL_REASON ?? '').trim();
+  const flagReason = (localReason ?? '').trim();
+  const text = flagReason || envReason || undefined;
+  const origin = local || flagReason ? 'forced-flag' : text || process.env.LANE_BROKER_LOCAL === '1' ? 'forced-env' : undefined;
+  if (!origin) return {};
+  if (text || !remoteCapable) return { forced: origin, text };
+  process.stderr.write(
+    `lane: --local ignored for remote-eligible lane ${lane}: pass --local-reason "<why>" if this command needs this machine (ssh, gh, lane, paths outside the worktree)\n`,
+  );
+  return {};
 }
 
 function fmtAgo(ms) {
@@ -214,6 +229,8 @@ export async function runCommand({
   // LANE_BROKER_LOCAL=1 env var below (bin/lane.js's `--local` flag sets
   // this option; the env var lets a nested/scripted caller force it too).
   local,
+  // BRAIN-547: why `local` is needed (`--local-reason`); mirrored by LANE_BROKER_LOCAL_REASON. Without one, a remote-eligible lane ignores `local`.
+  localReason: localReasonOpt,
   // BRAIN-380: the raw `--priority` value (validated here, exit 64), or the tier a caller that must
   // not read this process's env pins (`lane remote-exec` passes 'medium').
   priority: priorityOverride,
@@ -299,21 +316,21 @@ export async function runCommand({
   // lane/config, since it either reuses the ancestor's lease below or is
   // itself the remote-exec child of an already-remote run (I5: a runner
   // never re-dispatches).
-  const remoteWanted =
+  const remoteCapable =
     resolved.remote === true &&
     Array.isArray(globalCfg.runners) &&
     globalCfg.runners.length > 0 &&
-    !local &&
     !exclusive &&
-    process.env.LANE_BROKER_LOCAL !== '1' &&
     !process.env.LANE_BROKER_LEASE;
+  const { forced, text: localReasonText } = resolveForcedLocal({ local, localReason: localReasonOpt, lane, remoteCapable });
+  const remoteWanted = remoteCapable && !forced;
   // Resolved eagerly (not deferred to ticket construction) so the
   // resource-budget skip below and the ticket payload agree on the exact
   // same eligibility -- a worktree root that fails to resolve must also
   // re-enable the local budget check, not just omit `ticket.remote`.
   const remoteWorktreeRoot = remoteWanted ? resolveWorktreeRoot(cwd) : null;
   const remoteEligible = remoteWanted && remoteWorktreeRoot !== null;
-  const localReason = localReasonFor(resolved, remoteEligible, local, exclusive);
+  const localReason = localReasonFor(resolved, remoteEligible, forced, exclusive);
   const { headTree, checkoutRoot } = gitTreeAndRoot(cwd);
   // No fingerprint (so no history relief, charge declared) when the checkout root is
   // unknown: falling back to cwd would fold a sub-package into the repo-root workload.
@@ -505,6 +522,7 @@ export async function runCommand({
     ...(cmdFingerprint ? { cmdFingerprint } : {}),
     ...(headTree ? { headTree } : {}),
     ...(localReason ? { localReason } : {}),
+    ...(localReason && localReason === forced && localReasonText ? { localReasonText } : {}),
     // BRAIN-442: a local-first lane enqueues locally and only becomes rebind-eligible after its wait (lane value, else global)
     ...(remoteEligible && resolved.remotePolicy === 'local-first' ? { localFirst: true, localFirstWaitMs: resolved.localFirstWaitMs ?? globalCfg.localFirstWaitMs } : {}),
   };
