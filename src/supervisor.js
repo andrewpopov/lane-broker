@@ -373,13 +373,14 @@ export function applyHeartbeatObservation(lease, observed, now = Date.now(), obs
 const EARLY_SAMPLE_MS = 1000;
 
 /**
- * BRAIN-425: `remotePhasesMs`, the remote run's phase wall times. The runner's own (`snapshotMs` receive+verify, `setupMs`
- * deps+setup, `commandMs`, `artifactsMs` collection) ride in its result; the submitter adds `uploadMs` (writing the snapshot
- * to ssh) and `artifactReturnMs` (fetching the artifacts back). Each is kept only when a finite non-negative number.
+ * BRAIN-425: `remotePhasesMs`, the remote run's phase wall times. The runner's own (`snapshotMs` receive+verify, `depsMs`,
+ * `setupMs` (remoteSetup only, since BRAIN-530), `commandMs`, `artifactsMs` collection) ride in its result; the submitter adds
+ * `uploadMs` (writing the snapshot to ssh) and `artifactReturnMs` (fetching them back). `queuedMs` is the runner's own admission
+ * wait. Each is kept only when a finite non-negative number; an older runner sends fewer, and the others are simply absent.
  */
-const REMOTE_PHASE_KEYS = ['snapshotMs', 'setupMs', 'commandMs', 'artifactsMs'];
-function relayedPhases(dispatch) {
-  const own = { uploadMs: dispatch.uploadMs, artifactReturnMs: dispatch.artifactReturnMs };
+const REMOTE_PHASE_KEYS = ['snapshotMs', 'depsMs', 'setupMs', 'commandMs', 'artifactsMs'];
+export function relayedPhases(dispatch) {
+  const own = { uploadMs: dispatch.uploadMs, artifactReturnMs: dispatch.artifactReturnMs, queuedMs: dispatch.result?.queuedMs };
   for (const key of REMOTE_PHASE_KEYS) own[key] = dispatch.result?.phasesMs?.[key];
   const phases = Object.fromEntries(Object.entries(own).filter(([, v]) => Number.isFinite(v) && v >= 0));
   return Object.keys(phases).length > 0 ? { remotePhasesMs: phases } : {};

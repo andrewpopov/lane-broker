@@ -55,3 +55,29 @@ test('a phases.json write failure neither fails a finished pipeline nor leaks de
   const leasesDir = path.join(store, keys[0], 'leases');
   assert.deepEqual(fs.existsSync(leasesDir) ? fs.readdirSync(leasesDir) : [], [], 'every lease released');
 });
+
+/** BRAIN-530: deps and setup are timed apart, so a run's overhead can be split into install versus remoteSetup. */
+test('phases.json times deps, setup and command separately, and a stage that did not run has no key', async () => {
+  const dir = tmpDir('pipeline-phases-split');
+  const workDir = appFixture(dir);
+  const ticketDir = path.join(dir, 'ticket');
+  fs.mkdirSync(ticketDir);
+  const sleep = (ms) => [process.execPath, '-e', `const e=Date.now()+${ms};while(Date.now()<e){}`];
+  const run = async (remoteDeps, remoteSetup) => {
+    fs.rmSync(ticketDir, { recursive: true, force: true });
+    fs.mkdirSync(ticketDir);
+    fs.writeFileSync(
+      path.join(ticketDir, 'pipeline.json'),
+      JSON.stringify({ workDir, relCwd: '', remoteDeps, remoteSetup, argv: sleep(300), npmCacheDir: path.join(dir, 'npm-cache'), npmUserConfig: path.join(dir, 'npmrc'), depsCache: { enabled: false } }),
+    );
+    assert.equal((await remotePipelineCommand(ticketDir)).exitCode, 0);
+    return JSON.parse(fs.readFileSync(path.join(ticketDir, 'phases.json'), 'utf8'));
+  };
+  const full = await run(['.'], [sleep(400)]);
+  assert.ok(full.depsMs > 0, JSON.stringify(full));
+  assert.ok(full.setupMs >= 400, `setup is its own stage, not folded into deps: ${JSON.stringify(full)}`);
+  assert.ok(full.commandMs >= 300, JSON.stringify(full));
+  fs.rmSync(path.join(workDir, 'node_modules'), { recursive: true, force: true });
+  const bare = await run([], []);
+  assert.deepEqual(Object.keys(bare), ['commandMs']);
+});

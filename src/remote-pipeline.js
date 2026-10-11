@@ -401,35 +401,44 @@ export async function remotePipelineCommand(ticketDir) {
 
   // A materialized tree is leased until the whole pipeline ends, so eviction never takes a key a running lane holds.
   const releaseLeases = [];
-  // BRAIN-425: wall time of the setup stage (deps + setup) and of the command, written to `phases.json` for `remote-exec`
+  // BRAIN-425/530: wall time of each stage that ran (deps, setup, command), written to `phases.json` for `remote-exec`.
+  // A stage that did not run has no key; one that failed is still timed, in `finally`.
   const phasesMs = {};
-  const pipelineStart = Date.now();
-  let commandStart = null;
+  let stage = null;
+  const startStage = (key) => {
+    stage = { key, startedAt: Date.now() };
+  };
+  const endStage = () => {
+    if (stage) phasesMs[stage.key] = Date.now() - stage.startedAt;
+    stage = null;
+  };
   try {
     if (remoteDeps.length > 0) {
       writePhase(ticketDir, 'deps');
+      startStage('depsMs');
       const depsEnv = buildDepsEnv(npmCacheDir, npmUserConfig, npmGlobalConfig);
       const code = await runDepsPhase({ ticketDir, workDir, remoteDeps, depsEnv, depsCache, releaseLeases });
+      endStage();
       if (code !== 0) return { exitCode: code };
     }
 
     if (remoteSetup.length > 0) {
       writePhase(ticketDir, 'setup');
+      startStage('setupMs');
       for (const setupArgv of remoteSetup) {
         const code = await runPhaseCommand(setupArgv, workDir, process.env);
         if (code !== 0) return { exitCode: code };
       }
+      endStage();
     }
 
-    commandStart = Date.now();
-    phasesMs.setupMs = commandStart - pipelineStart;
     writePhase(ticketDir, 'command');
+    startStage('commandMs');
     const cmdCwd = path.join(workDir, relCwd || '');
     const code = await runPhaseCommand(argv, cmdCwd, process.env);
     return { exitCode: code };
   } finally {
-    if (commandStart === null) phasesMs.setupMs = Date.now() - pipelineStart;
-    else phasesMs.commandMs = Date.now() - commandStart;
+    endStage();
     try {
       atomicWriteJson(path.join(ticketDir, 'phases.json'), phasesMs);
     } catch (err) {

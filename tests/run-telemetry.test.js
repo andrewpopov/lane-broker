@@ -118,6 +118,7 @@ test('remote run: submitter row carries exit, grant, cpuSeconds and remotePhases
     assert.ok(Number.isFinite(row.remotePhasesMs?.[key]), `remotePhasesMs.${key}: ${JSON.stringify(row.remotePhasesMs)}`);
   }
   assert.ok(row.remotePhasesMs.commandMs >= 1000, JSON.stringify(row.remotePhasesMs));
+  assert.equal(row.remotePhasesMs.depsMs, undefined, 'a lane with no remoteDeps has no deps stage');
 });
 
 test('firstCores is the first reading, not the whole-span average (4 -> 0 -> 0 cores)', () => {

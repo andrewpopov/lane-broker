@@ -25,6 +25,7 @@ import { reconcileCommand } from '../src/reconcile-sweep.js';
 import { capabilitiesCommand } from '../src/capabilities.js';
 import { remotePipelineCommand } from '../src/remote-pipeline.js';
 import { costReportCommand } from '../src/cost-report.js';
+import { phasesReportCommand } from '../src/phases-report.js';
 
 function usage() {
   return `Usage:
@@ -44,6 +45,7 @@ function usage() {
   lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
   lane gc [--dry-run] [--max <n>] [--root <remoteRoot>]
   lane reconcile [--now] [--json]
+  lane report phases --repo <a[,b]> --since <iso> --until <iso> [--history <file>] [--json]
   lane report cost --repo <a[,b]> --since <iso> --until <iso> [--prs <file | repo=file,...>] [--journal-root <dir>] [--history <file>] [--json]
 `;
 }
@@ -299,8 +301,9 @@ async function main() {
       return result.exitCode;
     }
     case 'report': {
+      if (rest[0] === 'phases') return (await phasesReportCommand(rest.slice(1))).exitCode;
       if (rest[0] !== 'cost') {
-        process.stderr.write('lane report: only `cost` is supported\n');
+        process.stderr.write('lane report: only `cost` and `phases` are supported\n');
         return 2;
       }
       return (await costReportCommand(rest.slice(1))).exitCode;

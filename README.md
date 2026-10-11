@@ -1253,7 +1253,7 @@ additive: readers must ignore unknown keys and tolerate absent ones.
 | `observedCpu` `{peak, mean, samples}`, `observedRssPeakBytes` | heartbeat observations (see above) |
 | `cpuSeconds` | CPU seconds of the lease's process tree, an **estimate**: the heartbeat core samples integrated over time, the first reading held back to the start and the last forward to the end. Not rusage: `ps` pcpu is a decayed average and a supervisor cannot read reaped grandchildren's rusage |
 | `depsCache`, `depsMs` | remote deps phase outcome (`hit`/`miss`/`skip`) and wall time |
-| `remotePhasesMs` | remote runs: `uploadMs` (submitter writing the snapshot), `snapshotMs` (runner receive + verify), `setupMs` (deps + setup), `commandMs`, `artifactsMs` (runner collection), `artifactReturnMs` (submitter fetching them back). Each present only when measured |
+| `remotePhasesMs` | remote runs: `uploadMs` (submitter writing the snapshot), `snapshotMs` (runner receive + verify), `depsMs` (install or deps-cache restore), `setupMs` (`remoteSetup` only; before 0.37.0 it also held deps), `commandMs`, `artifactsMs` (runner collection), `artifactReturnMs` (submitter fetching them back), `queuedMs` (the runner's own admission wait). Each present only when measured; a stage that did not run, or an older runner, leaves its key out |
 | `remoteArtifacts`, `remoteArtifactsWarning` | returned artifact names / why they were not |
 | `remoteOmittedSymlinks`, `remoteOmittedSymlinkNames` | remote runs with `remoteOmitEscapingSymlinks`: how many escaping symlinks the snapshot left out, and the first 10 paths |
 | `priorityRequested`, `priorityAdmitted`, `priorityDemoted`, `effectiveRankAtStart`, `scoreAtStart` | priority audit (admitted tickets only) |
@@ -2077,3 +2077,15 @@ journal `enqueue` (an eject keeps it; `remove`/`drop` resets it) to `landed`: p5
 listed apart. `--prs` takes `gh pr list --json number,mergedAt,closedAt,labels` output: run it with
 `--state merged --search 'merged:>=<since>'` and again with `--state closed --label train-landed
 --search 'closed:>=<since>'`, concatenate the arrays, and pass one file per repo (`repo=file,...`).
+
+### Where a remote run spends its time: `lane report phases` (BRAIN-530)
+
+`lane report phases --repo <a[,b]> --since <iso> --until <iso> [--history <file>] [--json]` reads the
+`remotePhasesMs` of every remote history row in `[since, until)` (by `startedAt`) and prints, per runner,
+the median and p90 of each phase (`uploadMs`, `queuedMs`, `snapshotMs`, `depsMs`, `setupMs`, `commandMs`,
+`artifactsMs`, `artifactReturnMs`), the deps-cache outcome counts (`hit`/`miss`/`skip`, from the row's
+`depsCache`), and the overhead share: (`snapshotMs` + `depsMs` + `setupMs`) / (that + `commandMs` +
+`artifactsMs`), summed over the runner's rows. Use it to tell cold setup (high share, `miss` outcomes) from
+a slow CPU (a large `commandMs` with a low share) from contention (a large `queuedMs`). A row from a
+runner that predates a phase is left out of that phase's stats (an old runner's `setupMs` holds deps and setup,
+so the share still counts it once); a row with no `remotePhasesMs` is not counted. `lane status` is unchanged.
