@@ -203,4 +203,7 @@ test('drain (B7): a submitter killed during a drain move is MOVE-INTERRUPTED, ex
   assert.equal(waited.code, 1, waited.stderr);
   assert.match(waited.stderr, new RegExp(`MOVE-INTERRUPTED ${id} withdrawn from a`));
   assert.doesNotMatch(waited.stderr, /ORPHANED-REMOTE/);
+
+  const cancelled = await laneRun(['cancel', id], { env: ctx.env });
+  assert.equal(cancelled.code, 0, cancelled.stderr);
 });
