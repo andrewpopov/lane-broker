@@ -61,6 +61,8 @@ test('remoteRebindMinLocalWaitMs defaults to 120000, accepts 0, rejects negative
  */
 function queuedRunnerCtx({ runners = 1, remoteQueueTimeoutMs, config = {} } = {}) {
   const ctx = setup({ ssh: 'normal', remoteQueueTimeoutMs });
+  // BRAIN-548: the lane-holding job leaves a local history row, which would make the default speed-aware policy judge these moves; this file tests the rebind mechanics
+  writeRepoConfig(ctx.repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, remotePolicy: 'remote-first' } } });
   const binDir = ctx.env.PATH.split(path.delimiter)[0];
   const control = path.join(tmpDir('queued-control'), 'mode.json');
   const execLog = path.join(tmpDir('queued-exec'), 'exec.log');

@@ -20,7 +20,7 @@ import {
   testDrainAt,
   testHoldAt,
 } from './state.js';
-import { enqueue, existingTicket, tryStart, dequeueSync, couldAdmitNow, withdrawQueued, restoreQueued, discardRebinding, readQueuedRecord } from './scheduler.js';
+import { enqueue, existingTicket, tryStart, dequeueSync, couldAdmitNow, listQueue, withdrawQueued, restoreQueued, discardRebinding, readQueuedRecord } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { selectLeaseTree } from './cpu.js';
@@ -29,10 +29,11 @@ import { reloadGlobalConfig } from './config.js';
 import { stateHome } from './state.js';
 import { readRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
+import { speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, DEFAULT_REMOTE_OVERHEAD_MS } from './speed-placement.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
-import { detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
+import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
@@ -487,6 +488,47 @@ function queueTimeoutFor(enriched, globalCfg) {
   return localIneligibilityOf(enriched, globalCfg) ? undefined : globalCfg.remoteQueueTimeoutMs;
 }
 
+/** BRAIN-548: history rows and this lane's local run estimate for a speed-aware ticket; null (today's behaviour) without an estimate. */
+function speedInputs(root, enriched) {
+  if (!enriched.speedAware) return null;
+  const rows = readRows(paths(root).history);
+  const estimateMs = localRunEstimateMs(rows, enriched.repoId, enriched.lane);
+  return estimateMs === null ? null : { rows, estimateMs };
+}
+
+/**
+ * BRAIN-548: where `enriched` finishes sooner when this machine cannot admit it now: waiting in the local queue (everything ahead
+ * of it, from history estimates, spread over the slots of its weight) then running here, or running on `runner` (the run scaled by
+ * its measured speed ratio, plus dispatch overhead and, if it too is queued, that queue). One decision, with both estimates.
+ */
+function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, probe, queuedChoice) {
+  const queue = listQueue(root).filter(Boolean);
+  const own = queue.findIndex((t) => t.id === enriched.id);
+  const ahead = own === -1 ? queue : queue.slice(0, own);
+  const slots = Math.floor(effectiveWeightCapacity(globalCfg, detectResourceCapacity().cpuCores) / Math.max(1, enriched.weight));
+  const ratio = speedRatio(rows, runner);
+  const runnerQueueMs = queuedChoice ? probe.queued * estimateMs * ratio : 0;
+  return {
+    ...chooseSpeedPlacement({
+      localAdmitsNow: false,
+      localWaitMs: localWaitMs({ aheadEstimatesMs: ahead.map((t) => localRunEstimateMs(rows, t.repoId, t.lane) ?? estimateMs), estimateMs, slots }),
+      estimateMs,
+      runnerRatio: ratio,
+      overheadMs: DEFAULT_REMOTE_OVERHEAD_MS + runnerQueueMs,
+    }),
+    ratio,
+  };
+}
+
+/** One admission-decisions line per speed-aware decision, timestamped, carrying both estimates. */
+function logSpeedDecision(root, enriched, choice, detail) {
+  const line = `lane: speed-placement: ts=${new Date().toISOString()} ${enriched.id}: ${choice}: ${detail}\n`;
+  process.stderr.write(line);
+  writeBrokerLog(root, line);
+}
+
+const seconds = (ms) => `${Math.round(ms / 1000)}s`;
+
 /** What `selectRunner` needs to judge a ticket: its protocol, and its reservation (shared by a first attempt and a rebind). */
 export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
   // BRAIN-533: history is read only when some runner has a schedule that could make the expected run time matter.
@@ -722,6 +764,16 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     }
   }
 
+  // BRAIN-548: a speed-aware ticket this machine can start right now runs here, without probing a (slower) runner.
+  const speed = rebind || localIneligibility() ? null : speedInputs(root, enriched);
+  if (speed) {
+    const local = await couldAdmitNow(root, globalCfg, enriched);
+    if (local.admit) {
+      logSpeedDecision(root, enriched, 'local', `admits now, local estimate ${seconds(speed.estimateMs)}`);
+      return fallbackOrRefuse(null, 'speed-aware: local admits now', { rebindable: true });
+    }
+  }
+
   // BRAIN-320 review fix D: runner SELECTION requires protocol 2 whenever
   // the lane itself needs it OR the client has a queue timeout configured
   // (only a 0.7.0+ runner honours `queueTimeoutMs`; a locally-ineligible ticket carries none, BRAIN-509) -- but the exec header's
@@ -744,6 +796,12 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   if (!runner) {
     const reason = skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : 'no runners configured';
     return fallbackOrRefuse(null, reason, { rebindable: true, noRunner: true });
+  }
+
+  if (speed && !busyQueuedAt) {
+    const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true);
+    logSpeedDecision(root, enriched, decision.choice, `local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)})`);
+    if (decision.choice === 'local') return fallbackOrRefuse(null, 'speed-aware: local finishes sooner', { rebindable: true });
   }
 
   // BRAIN-338: every runner has a queue. Queue on the least-loaded one only
@@ -1256,6 +1314,13 @@ async function main() {
     const stuckLocally = globalCfg.remoteRebindMinLocalWaitMs > 0 && Date.now() - (readQueuedRecord(root, ticket.id)?.localSince ?? Date.now()) >= globalCfg.remoteRebindMinLocalWaitMs;
     const { runner, probe, queuedChoice } = await selectRunner(candidates, { ...remoteSelectOptions(enriched, globalCfg), maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0 });
     if (!runner) return;
+    // BRAIN-548: a speed-aware ticket moves only when the runner is now expected to finish it sooner than waiting here does.
+    const speed = speedInputs(root, enriched);
+    if (speed) {
+      const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true);
+      if (decision.choice === 'local') return;
+      logSpeedDecision(root, enriched, 'remote', `rebind: local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)})`);
+    }
     await runRemoteAttempt(root, enriched, globalCfg, abortController.signal, { generation: attemptGeneration, runner, probe, queued: queuedChoice === true });
   }
   let nextRebindAt = Date.now() + (globalCfg.remoteRebindIntervalMs || 0);

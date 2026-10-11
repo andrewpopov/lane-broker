@@ -439,6 +439,10 @@ function validateRunners(runners, sourcePath) {
         `${sourcePath}: runner "${runner.name}".speedFactor must be a positive number`,
       );
     }
+    // BRAIN-548: how many times slower this runner is than this machine, used until history has enough paired runs to measure it.
+    if (runner.speedRatio !== undefined) {
+      assert(Number.isFinite(runner.speedRatio) && runner.speedRatio >= 1, `${sourcePath}: runner "${runner.name}".speedRatio must be a number >= 1`);
+    }
     // BRAIN-533: when the runner is powered on; absent means always available.
     if (runner.schedule !== undefined) {
       const problem = scheduleProblem(runner.schedule);
@@ -487,7 +491,7 @@ export function literalDirPrefix(pattern) {
 }
 
 export const REMOTE_ARTIFACTS_ON = ['success', 'always'];
-const REMOTE_POLICIES = ['remote-first', 'local-first'];
+const REMOTE_POLICIES = ['remote-first', 'local-first', 'speed-aware'];
 export const MAX_REMOTE_ARTIFACT_PATTERNS = 50;
 
 /**
@@ -602,7 +606,7 @@ function validateRepoConfig(cfg, sourcePath) {
       assert(REMOTE_ARTIFACTS_ON.includes(lane.remoteArtifactsOn), `${sourcePath}: lane "${name}".remoteArtifactsOn must be "success" or "always"`);
     }
     if (lane.remotePolicy !== undefined) {
-      assert(REMOTE_POLICIES.includes(lane.remotePolicy), `${sourcePath}: lane "${name}".remotePolicy must be "remote-first" or "local-first"`);
+      assert(REMOTE_POLICIES.includes(lane.remotePolicy), `${sourcePath}: lane "${name}".remotePolicy must be "remote-first", "local-first" or "speed-aware"`);
     }
     if (lane.localFirstWaitMs !== undefined) {
       assert(Number.isInteger(lane.localFirstWaitMs) && lane.localFirstWaitMs >= 0, `${sourcePath}: lane "${name}".localFirstWaitMs must be a non-negative integer`);
@@ -1063,8 +1067,9 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     // BRAIN-319 T3a: opt-in per lane, defaulted false so a repo config
     // written before this field exists resolves identically (I6).
     remote: laneCfg.remote === true,
-    // BRAIN-442: "local-first" queues locally and goes remote only after `localFirstWaitMs`; anything else is today's remote-first.
-    remotePolicy: laneCfg.remotePolicy === 'local-first' ? 'local-first' : 'remote-first',
+    // BRAIN-442: "local-first" queues locally and goes remote only after `localFirstWaitMs`; "remote-first" is the pre-BRAIN-548
+    // behaviour; anything else is speed-aware (BRAIN-548): wherever the ticket is expected to finish soonest.
+    remotePolicy: laneCfg.remotePolicy === 'local-first' || laneCfg.remotePolicy === 'remote-first' ? laneCfg.remotePolicy : 'speed-aware',
     localFirstWaitMs: Number.isInteger(laneCfg.localFirstWaitMs) ? laneCfg.localFirstWaitMs : null,
     // BRAIN-320 S1a: honoured only when this lane runs remotely (1a); a lane
     // with neither declared behaves exactly as in 0.6.0 (I6), including the

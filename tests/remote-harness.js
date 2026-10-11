@@ -332,7 +332,9 @@ export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1, cpuCore
   writeGlobalConfig(home, cfg);
   writeGlobalConfig(runnerHome, { sampleMs: 50, capacity: 4 });
   const repoDir = tmpDir('remote-dispatch-repo');
-  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight, ...(cpuCores !== undefined ? { cpuCores } : {}), remote: true } } });
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight, ...(cpuCores !== undefined ? { cpuCores } : {}), remote: true, remotePolicy: 'remote-first' } } });
+  // remote-first: this harness exercises remote mechanics; speed-aware placement (BRAIN-548) has its own tests
+  // and would otherwise keep a ticket local once the lane has local history.
   gitFixture(['init', '-q'], repoDir);
   return { env: { ...env, PATH: `${binDir}${path.delimiter}${env.PATH}` }, home, state, repoDir, runnerRoot, probeLogPath, runnerHome, runnerState };
 }

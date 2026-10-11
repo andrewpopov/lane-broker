@@ -548,7 +548,7 @@ What a remote run does:
    ticket whose runners have all expired it stays in the local queue. The rebalance of a ticket queued on a runner (`remoteRebalanceMinQueuedMs`) excludes the same history.
 
    **Local-first lanes (BRAIN-442).** A lane with `"remotePolicy": "local-first"`
-   (default `"remote-first"`, today's behaviour) skips the initial dispatch and
+   (see below for the default) skips the initial dispatch and
    enqueues locally, keeping its remote eligibility (`remote.fallback.reason`
    is `local-first`). If this machine admits it, it simply runs here. Only once
    it has waited `localFirstWaitMs` in the local queue (lane key, else the global
@@ -559,6 +559,34 @@ What a remote run does:
 
    ```json
    "lanes": { "prepush": { "remote": true, "remotePolicy": "local-first", "localFirstWaitMs": 60000 } }
+   ```
+
+   **Speed-aware placement (BRAIN-548, the default).** A remote-eligible lane
+   without `remotePolicy` (or with `"speed-aware"`) goes wherever the ticket is
+   expected to finish soonest, not to any runner that admits it. `"remote-first"`
+   forces the older behaviour (a runner that admits it wins). With no local
+   history for the lane's repo and lane, nothing changes. Otherwise, with E the
+   p50 run time of that lane on this machine:
+   - if this machine can admit it now, it runs here and no runner is probed;
+   - else it compares the local finish, `(sum of E of the tickets queued ahead
+     + E) / slots + E` (`slots` = capacity / the ticket's weight; the extra E is
+     the run in flight, unknown in length, assumed to need a full run), with the
+     selected runner's finish, `E x speedRatio + 60 s` dispatch overhead (plus
+     `queued x E x speedRatio` when that runner is itself queued). The earlier
+     wins; a tie stays local.
+
+   A runner's `speedRatio` is the median, over commands (`cmdFingerprint`) with a
+   successful run both here and on that runner, of remote run / local run, once
+   at least 5 such commands exist. Until then it is the runner's configured
+   `speedRatio` (a number >= 1), else 1. Every decision writes a
+   `lane: speed-placement: ts=... <id>: local|remote: ...` line, with both
+   estimates, to `admission-decisions.log`. A ticket that stays local is
+   re-evaluated at every late rebind probe and moves to a runner once waiting
+   here is expected to take longer; only the selected runner is compared, and the
+   rebalance of a ticket already on a runner is unchanged.
+
+   ```json
+   "runners": [{ "name": "skybox", "ssh": "skybox", "speedRatio": 2.9 }]
    ```
 
 3. **Send a snapshot**, not history: a framed stream of exactly the listed

@@ -180,7 +180,7 @@ test('config: a lane remotePolicy/localFirstWaitMs is validated, resolved, and i
     lanes: { default: { weight: 1 }, prepush: { weight: 1, remote: true, remotePolicy: 'local-first', localFirstWaitMs: 5 } },
   });
   const plain = resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' });
-  assert.deepEqual([plain.remotePolicy, plain.localFirstWaitMs], ['remote-first', null]);
+  assert.deepEqual([plain.remotePolicy, plain.localFirstWaitMs], ['speed-aware', null]); // BRAIN-548: speed-aware is the default
   const adHoc = resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'zirk1' });
   assert.deepEqual([adHoc.remotePolicy, adHoc.localFirstWaitMs], ['local-first', 5]);
 });
