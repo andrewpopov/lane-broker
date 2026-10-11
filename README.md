@@ -204,6 +204,9 @@ start is kept in `external-starved.json`, refreshed by each such denial, cleared
 any admission or by a denial the lanes themselves explain, and ignored once it has
 gone unrefreshed for `max(30s, 6 * sampleMs)`.
 
+`lane status --json` gives every queued and running entry `remoteOwner`: the submitter's ticket id when this broker is a
+runner holding a remote-exec ticket for someone else, otherwise `null`.
+
 `lane status --json` carries `externalCpu: { busyCores, top: [{ pid, cores, cmd,
 cwd? }], starvedSinceMs | null }` (`starvedSinceMs` is a duration in ms, like
 `noProgressSinceMs`). Exporting it as a metric and alerting on it is a zirkbot
@@ -1770,7 +1773,7 @@ cores a test needs:
 
 Prints one JSON line: `{"version", "capabilities": [...], "schedulerMode", "admissionMode", "classes": {"mode", "configHash", "stateRoot", "valid"}}`. `capabilities` is the
 same list `lane remote-probe` advertises (`elastic-claims/1`, `priority/1`, `artifacts/1`, `sim-safe-backfill/1`,
-`lane-aging/1`, `group-reap/1`, `remote-withdraw/1`, `exclusive/1`, `attempt-logpath/1`: a remote attempt record carries the submitter's `logPath` and `cwd`, so a caller that crashed between `lane run --detach` and learning the id can find its attempt by `--log` path, BRAIN-462, `classes/1`). `classes` reports the work-class caps in force (see "Work classes and per-machine caps"). `schedulerMode` is `priority` when a valid `sched-v2.json` fence is present and
+`lane-aging/1`, `group-reap/1`, `remote-withdraw/1`, `exclusive/1`, `attempt-logpath/1`: a remote attempt record carries the submitter's `logPath` and `cwd`, so a caller that crashed between `lane run --detach` and learning the id can find its attempt by `--log` path, BRAIN-462, `classes/1`, `remote-drain/1`, `queue-retier/1`: `lane priority` works on a ticket queued here). `classes` reports the work-class caps in force (see "Work classes and per-machine caps"). `schedulerMode` is `priority` when a valid `sched-v2.json` fence is present and
 `legacy` otherwise; `admissionMode` is the global config's `schedulerMode` (`active` or `shadow`). A caller that needs
 a feature (for example a pool gate that requires `group-reap/1`) checks this before relying on it.
 

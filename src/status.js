@@ -13,6 +13,8 @@ import { listAttempts, supervisorAlive, moveInterruptedLabel } from './attempts.
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfigOrError } from './config.js';
+import { remoteOwnerMap } from './retier.js';
+import { defaultRemoteRoot } from './remote-runner.js';
 import { effectiveNow } from './priority-clock.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView } from './fairness.js';
 import { readTicketWait, waitLabel } from './ticket-wait.js';
@@ -164,7 +166,7 @@ export function renderRemoteDrainLine(remoteDrain, { running, queued }) {
   return `drain: draining (${remoteDrain.reason}) since ${since}; remaining here: ${running} running, ${queued} queued`;
 }
 
-export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false, scan = scanProcWindow } = {}) {
+export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false, scan = scanProcWindow, remoteRoot = defaultRemoteRoot() } = {}) {
   const root = ensureStateDirs().root;
   const { config: cfg, error: configError } = loadGlobalConfigOrError();
   refreshCpuEstimates(cfg);
@@ -199,6 +201,8 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
   const remoteDrain = readRemoteDrain(root);
   const configWarning = readJsonSafe(p.configWarning);
 
+  // BRAIN-518: one scan of the runner's remote tickets, shared by every running and queued entry.
+  const remoteOwners = remoteOwnerMap(remoteRoot);
   const now = Date.now();
   const resourceCapacity = detectResourceCapacity();
   const running = leases
@@ -226,6 +230,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       observedMemoryBytes: l.observedMemoryBytes ?? null,
       // BRAIN-431: how long the run has shown no output, CPU or process churn (null before the first heartbeat observation)
       noProgressSinceMs: Number.isFinite(l.noProgressSinceMs) ? l.noProgressSinceMs : null,
+      remoteOwner: remoteOwners.get(l.id) ?? null,
     }));
 
   const runningWeight = leases.filter((l) => HELD_STATES.has(l.state)).reduce((s, l) => s + (l.weight || 0), 0);
@@ -261,6 +266,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       ...(tierName(rank) !== tier ? { effectiveRank: tierName(rank) } : {}),
       resources: leaseResources(t, cfg),
       cpuEstimate: ticketCpuEstimateBasis(t, cfg, now, held.length > 0 ? cpuBudget({ cores: resourceCapacity.cpuCores }, cfg) : undefined),
+      remoteOwner: remoteOwners.get(t.id) ?? null,
     };
   });
 

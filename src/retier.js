@@ -54,20 +54,31 @@ function refusalText(reason, detail) {
  * `<remote root>/tickets/<submitter ticket id>/remote-id`. Returns that submitter ticket id, or null for a ticket of this host.
  */
 export function remoteOwnerOf(id, remoteRoot = defaultRemoteRoot()) {
+  return remoteOwnerMap(remoteRoot).get(id) ?? null;
+}
+
+/** Most submitter ticket dirs one status call will read; a runner's remote root is pruned long before this. */
+const MAX_OWNER_SCAN = 5000;
+
+/** broker ticket id -> submitter ticket id, from one scan of `<remote root>/tickets/*\/remote-id`. An unreadable dir is skipped, never thrown. */
+export function remoteOwnerMap(remoteRoot = defaultRemoteRoot()) {
   const ticketsDir = path.join(remoteRoot, 'tickets');
+  const owners = new Map();
   let names;
   try {
-    names = fs.readdirSync(ticketsDir);
+    names = fs.readdirSync(ticketsDir).slice(0, MAX_OWNER_SCAN);
   } catch {
-    return null;
+    return owners;
   }
-  return names.find((name) => {
+  for (const name of names) {
     try {
-      return fs.readFileSync(path.join(ticketsDir, name, 'remote-id'), 'utf8').trim() === id;
+      const id = fs.readFileSync(path.join(ticketsDir, name, 'remote-id'), 'utf8').trim();
+      if (id && !owners.has(id)) owners.set(id, name);
     } catch {
-      return false;
+      // unreadable ticket dir: no owner for it
     }
-  }) ?? null;
+  }
+  return owners;
 }
 
 /** `lane priority <id> high|medium|low`: re-tier a ticket that is still queued on this host, keeping its place and age. */
