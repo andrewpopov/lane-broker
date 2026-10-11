@@ -16,6 +16,8 @@ export const GROUP_REAP_CAPABILITY = 'group-reap/1';
 export const REMOTE_WITHDRAW_CAPABILITY = 'remote-withdraw/1';
 // BRAIN-462: attempt records carry the submitter's logPath and cwd.
 export const ATTEMPT_LOGPATH_CAPABILITY = 'attempt-logpath/1';
+// BRAIN-520: `lane drain`/`undrain`; a probe may carry `remoteDrain`. Informational: selection keys off the probe field.
+export const REMOTE_DRAIN_CAPABILITY = 'remote-drain/1';
 
 /** The ONE list: `lane remote-probe` advertises it and `lane capabilities --json` prints it. */
 export const CAPABILITIES = [
@@ -29,6 +31,7 @@ export const CAPABILITIES = [
   EXCLUSIVE_CAPABILITY,
   ATTEMPT_LOGPATH_CAPABILITY,
   CLASSES_CAPABILITY,
+  REMOTE_DRAIN_CAPABILITY,
 ];
 
 /** `lane capabilities --json`: what this install can do and which scheduler/admission mode it is in. */

@@ -10,7 +10,7 @@ import { freshEnv, writeGlobalConfig, BIN, laneRun, sleep, waitFor } from './hel
 import { manifestHashOf, verifyManifestNoGit } from '../src/remote-manifest.js';
 import { encodeSnapshot, serializeHeader, MAX_HEADER_BYTES } from '../src/remote-stream.js';
 import { sanitizeKey } from '../src/config.js';
-import { paths, readJsonSafe, processStartTime } from '../src/state.js';
+import { paths, readJsonSafe, processStartTime, withLock, writeCancelMarkerFile } from '../src/state.js';
 import { writeLease } from '../src/lease.js';
 import { enqueue } from '../src/scheduler.js';
 import { remoteResultCommand } from '../src/remote-runner.js';
@@ -997,6 +997,41 @@ test('a broker-level lane cancel landing after a queue-timeout expiry, before fi
 
   const structured = readJsonSafe(path.join(paths(state).results, `${remoteLaneId}.json`));
   assert.ok(structured, 'the local broker must have published a result for the raced ticket');
+  assert.equal(structured.cancelled, true);
+  assert.notEqual(structured.reason, 'queue-timeout');
+});
+
+// BRAIN-518 review: the supervisor decides cancelled-vs-queue-timeout INSIDE the lock, after its dequeue. A cancel marker that lands
+// while it waits for that lock must still win (remote-exec treats a published queue-timeout as retryable elsewhere).
+test('a cancel marker written while the supervisor waits for the broker lock after a queue-timeout still wins: the published result is cancelled', async () => {
+  const { env: baseEnv, home, state } = freshEnv();
+  writeGlobalConfig(home, { schedulerMode: 'shadow', sampleMs: 30 });
+  fs.mkdirSync(state, { recursive: true });
+  fs.writeFileSync(path.join(state, 'PAUSE'), 'kept busy for the test');
+
+  const pauseFile = path.join(tmpDir('remote-exec-pause'), 'go');
+  const env = { ...baseEnv, LANE_BROKER_TEST_PAUSE_AFTER_QUEUE_TIMEOUT: pauseFile };
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ protocol: 2, queueTimeoutMs: 200, argv: [process.execPath, '-e', 'process.exit(0)'] });
+  const { child } = spawnRemoteExec(encodeSnapshot(src, header, entries), { env, root });
+
+  const remoteIdPath = path.join(root, 'tickets', header.ticketId, 'remote-id');
+  await waitFor(() => fs.existsSync(remoteIdPath));
+  const remoteLaneId = fs.readFileSync(remoteIdPath, 'utf8').trim();
+  await sleep(500);
+
+  // Hold the broker lock, release the supervisor from its pause so it blocks on that lock, and only then write the marker.
+  await withLock(state, async () => {
+    fs.mkdirSync(path.dirname(pauseFile), { recursive: true });
+    fs.writeFileSync(pauseFile, '1');
+    await sleep(400);
+    writeCancelMarkerFile(state, remoteLaneId);
+  });
+
+  assert.equal(await waitClose(child), 0);
+  const structured = readJsonSafe(path.join(paths(state).results, `${remoteLaneId}.json`));
+  assert.ok(structured, 'the local broker must have published a result');
   assert.equal(structured.cancelled, true);
   assert.notEqual(structured.reason, 'queue-timeout');
 });

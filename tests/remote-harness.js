@@ -6,6 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, gitFixture, laneRun, laneSpawn, waitFor, BIN } from './helpers.js';
 import { paths, readJsonSafe } from '../src/state.js';
 import { makeTmpDir } from './helpers/tmp.js';
+import { CAPABILITIES } from '../src/capabilities.js';
 
 /**
  * The fake-ssh transport harness shared by tests/remote-client.test.js
@@ -407,3 +408,118 @@ export const waitResult = async (ctx, id) => {
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}\nadmission log:\n${fs.readFileSync(paths(ctx.state).admissionLog, 'utf8')}`);
   return readJsonSafe(path.join(paths(ctx.state).results, `${id}.json`));
 };
+
+// ---- BRAIN-436/520: several named real-broker runners behind one fake ssh ----
+
+export const IDLE = { protocol: 1, protocols: [1, 2], paused: false, queued: 0, running: 0, version: 'test', capacity: {}, capabilities: CAPABILITIES, headroom: { cpuCores: 8, memoryBytes: 1e12 } };
+
+/**
+ * Replace the harness's single fake ssh with one that fronts several named runners. Each runner is a real broker with its own
+ * state (so `remote-result` on A reports A's real queue). Probes are synthetic, read from `probes.json` on every call (a test may
+ * rewrite it, or add `delayMs`). Every call is logged as `<subcommand> <runner>`.
+ */
+export function installTwoRunnerSsh(binDir, runners) {
+  const dir = tmpDir('rebalance-fake');
+  const logPath = path.join(dir, 'calls.log');
+  const probesPath = path.join(dir, 'probes.json');
+  fs.writeFileSync(logPath, '');
+  fs.writeFileSync(probesPath, JSON.stringify(Object.fromEntries(Object.keys(runners).map((n) => [n, IDLE]))));
+  fs.writeFileSync(path.join(dir, 'runners.json'), JSON.stringify(runners));
+  fs.writeFileSync(
+    path.join(binDir, 'ssh'),
+    `#!/usr/bin/env node
+const fs = require('fs');
+const { spawn } = require('child_process');
+const argv = process.argv.slice(2);
+const rest = [];
+for (let i = 0; i < argv.length; i += 1) { if (argv[i] === '-o') { i += 1; continue; } rest.push(argv[i]); }
+const [dest, cmd] = rest;
+const sub = (/remote-(probe|exec|result|cancel|withdraw|artifacts-release|artifacts)/.exec(cmd) || [])[1];
+fs.appendFileSync(${JSON.stringify(logPath)}, sub + ' ' + dest + '\\n');
+const done = (code) => { fs.appendFileSync(${JSON.stringify(logPath)}, 'end-' + sub + ' ' + dest + ' ' + code + '\\n'); process.exitCode = code; process.exit(code); };
+if (sub === 'probe') {
+  const probe = JSON.parse(fs.readFileSync(${JSON.stringify(probesPath)}, 'utf8'))[dest];
+  if (!probe) done(255);
+  setTimeout(() => { process.stdout.write(JSON.stringify(probe) + '\\n'); done(0); }, probe.delayMs || 0);
+} else {
+  const r = JSON.parse(fs.readFileSync(${JSON.stringify(path.join(dir, 'runners.json'))}, 'utf8'))[dest];
+  if (!r) done(255);
+  const flag = ${JSON.stringify(path.join(dir, 'withdrew-'))} + dest;
+  if (sub === 'exec' && r.execFails) done(255);
+  if (sub === 'cancel' && r.cancelFails) done(1);
+  if (sub === 'result' && r.resultDownAfterWithdraw && fs.existsSync(flag)) done(1);
+  if (sub === 'withdraw' && r.withdrawReplyLost) fs.writeFileSync(flag, '1');
+  const lost = sub === 'withdraw' && r.withdrawReplyLost;
+  const child = spawn('sh', ['-c', cmd], { stdio: ['pipe', lost ? 'ignore' : 'pipe', 'pipe'], env: { ...process.env, LANE_FAKE_RUNNER: dest, LANE_BROKER_HOME: r.home, LANE_BROKER_STATE: r.state } });
+  process.stdin.pipe(child.stdin);
+  if (!lost) child.stdout.pipe(process.stdout);
+  child.stderr.pipe(process.stderr);
+  child.on('close', (code) => done(lost ? 1 : code == null ? 1 : code));
+  child.on('error', () => done(1));
+}
+`,
+  );
+  fs.chmodSync(path.join(binDir, 'ssh'), 0o755);
+  return {
+    calls: () => fs.readFileSync(logPath, 'utf8').split('\n').filter(Boolean),
+    count: (entry) => fs.readFileSync(logPath, 'utf8').split('\n').filter((l) => l === entry).length,
+    probesPath,
+    setProbe: (name, probe) => {
+      const all = JSON.parse(fs.readFileSync(probesPath, 'utf8'));
+      all[name] = probe;
+      fs.writeFileSync(probesPath, JSON.stringify(all));
+    },
+  };
+}
+
+/** Runners `names` (each a real broker) under the harness `setup()`; every runner in `paused` keeps any ticket queued. */
+export function rebalanceSetup({ names = ['a', 'b'], paused = ['a'], rebalance = {}, runnerOpts = {}, configOpts = {}, localPaused = false } = {}) {
+  const base = setup();
+  const binDir = base.env.PATH.split(path.delimiter)[0];
+  const runners = {};
+  const globalRunners = [];
+  for (const name of names) {
+    const home = tmpDir(`rb-${name}-home`);
+    const state = tmpDir(`rb-${name}-state`);
+    writeGlobalConfig(home, { sampleMs: 50, capacity: 4 });
+    if (paused.includes(name)) fs.writeFileSync(path.join(state, 'PAUSE'), 'kept queued for the test');
+    runners[name] = { home, state, pause: path.join(state, 'PAUSE'), ...(runnerOpts[name] ?? {}) };
+    globalRunners.push({ name, ssh: name, shell: 'sh -c', root: tmpDir(`rb-${name}-root`), ...(configOpts[name] ?? {}) });
+  }
+  const fake = installTwoRunnerSsh(binDir, runners);
+  writeGlobalConfig(base.home, {
+    version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100,
+    runners: globalRunners,
+    remoteRebalanceMinQueuedMs: 400,
+    remoteRebalanceIntervalMs: 150,
+    remoteRebalanceCooldownMs: 0,
+    remoteRebalanceMaxMoves: 1,
+    ...rebalance,
+  });
+  if (localPaused) fs.writeFileSync(path.join(base.state, 'PAUSE'), 'keep the local queue closed');
+  const runsFile = path.join(tmpDir('rb-runs'), 'runs');
+  const cmd = [process.execPath, '-e', `require('fs').appendFileSync(${JSON.stringify(runsFile)}, process.env.LANE_FAKE_RUNNER + '\\n')`];
+  const cmdArgv = cmd;
+  const runs = () => (fs.existsSync(runsFile) ? fs.readFileSync(runsFile, 'utf8').split('\n').filter(Boolean) : []);
+  const unpause = (name) => fs.rmSync(runners[name].pause, { force: true });
+  const start = async () => {
+    const started = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...cmd], { env: base.env, cwd: base.repoDir });
+    assert.equal(started.code, 0, started.stderr);
+    return started.stdout.trim();
+  };
+  const finish = (id, timeout = '60s') => laneRun(['wait', id, '--timeout', timeout], { env: base.env });
+  return { ...base, fake, runs, unpause, start, finish, runners, globalRunners, binDir, cmdArgv };
+}
+
+export const T = { timeout: 180_000 };
+
+/**
+ * Wait until the exec on runner `name` has started AND enqueued its ticket (recorded `remote-id`). The ssh call starting is not the
+ * ticket existing: runner a can only confirm a cancel once its exec has enqueued the ticket, and under load that lagged the
+ * cancel, so `remote-cancel` answered "not confirmed on a" (a race in these tests, not in the broker).
+ */
+export async function execArrived(ctx, name) {
+  await waitFor(() => ctx.fake.count(`exec ${name}`) === 1, { timeoutMs: 30_000 });
+  const tickets = path.join(ctx.globalRunners.find((r) => r.name === name).root, 'tickets');
+  await waitFor(() => fs.existsSync(tickets) && fs.readdirSync(tickets).some((t) => fs.existsSync(path.join(tickets, t, 'remote-id'))), { timeoutMs: 60_000 });
+}

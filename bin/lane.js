@@ -4,8 +4,9 @@ import { statusCommand } from '../src/status.js';
 import { suggestCommand } from '../src/suggest.js';
 import { estimatesCommand } from '../src/estimates-history.js';
 import { cancelCommand } from '../src/cancel.js';
+import { priorityCommand } from '../src/retier.js';
 import { waitCommand } from '../src/wait.js';
-import { pauseCommand, resumeCommand } from '../src/pause.js';
+import { pauseCommand, resumeCommand, drainCommand, undrainCommand } from '../src/pause.js';
 import { migrateSchedulerCommand } from '../src/migrate.js';
 import { parseByteSize } from '../src/resources.js';
 import {
@@ -32,9 +33,12 @@ function usage() {
   lane suggest [--repo <name>] [--days <n>] [--json]
   lane estimates [--json] [--root <stateHome>]
   lane cancel <id>
+  lane priority <id> high|medium|low
   lane wait <id> [--timeout <duration>]
   lane pause ["reason"]
   lane resume
+  lane drain ["reason"]
+  lane undrain
   lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
   lane gc [--dry-run] [--max <n>] [--root <remoteRoot>]
 `;
@@ -194,6 +198,19 @@ async function main() {
       const result = await cancelCommand(id);
       return result.exitCode;
     }
+    case 'priority': {
+      const unknownOption = rest.find((arg) => arg.startsWith('-'));
+      if (unknownOption !== undefined) {
+        process.stderr.write(`lane priority: unknown option "${unknownOption}"\n${usage()}`);
+        return 2;
+      }
+      if (rest.length !== 2) {
+        process.stderr.write('lane priority: usage: lane priority <id> high|medium|low (missing <id>|<tier>, or extra arguments)\n');
+        return 2;
+      }
+      const result = await priorityCommand(rest[0], rest[1]);
+      return result.exitCode;
+    }
     case 'wait': {
       const id = rest[0];
       if (!id) {
@@ -212,6 +229,27 @@ async function main() {
     }
     case 'resume': {
       const result = await resumeCommand();
+      return result.exitCode;
+    }
+    case 'drain': {
+      const unknownOption = rest.find((arg) => arg.startsWith('-'));
+      if (unknownOption !== undefined) {
+        process.stderr.write(`lane drain: unknown option "${unknownOption}"\n${usage()}`);
+        return 2;
+      }
+      if (rest.length > 1) {
+        process.stderr.write(`lane drain: unexpected argument "${rest[1]}" (quote a multi-word reason)\n${usage()}`);
+        return 2;
+      }
+      const result = await drainCommand(rest[0] ?? '');
+      return result.exitCode;
+    }
+    case 'undrain': {
+      if (rest.length > 0) {
+        process.stderr.write(`lane undrain: unexpected argument "${rest[0]}"\n${usage()}`);
+        return 2;
+      }
+      const result = await undrainCommand();
       return result.exitCode;
     }
     case 'migrate-scheduler': {

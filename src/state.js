@@ -97,6 +97,9 @@ export function paths(root = stateHome()) {
     // NEW intake entry point refuses on it (like `migrating`); already-queued tickets keep being admitted. Holds
     // `{pid, startTime, startedAt}` of the waiting command, so a SIGKILLed one is recognisably stale.
     draining: path.join(root, 'draining'),
+    // BRAIN-520: the operator's `lane drain` marker (`{version, reason, since, host}`). Unrelated to `draining` above: this one
+    // only takes the runner out of REMOTE selection, is owned by no pid, and outlives processes and reboots.
+    remoteDrain: path.join(root, 'remote-drain.json'),
     // BRAIN-380 slice 3: a queue record without `schedVersion` found behind the fence is moved here and never selected.
     queueQuarantine: path.join(root, 'queue-quarantine'),
     // BRAIN-319 T3b-2 (C3): one durable attempt record per remote-eligible
@@ -433,6 +436,80 @@ export function readJsonSafe(file) {
   } catch {
     return null;
   }
+}
+
+const DRAIN_MARKER_VERSION = 1;
+const DRAIN_REASON_MAX = 200;
+export const DRAIN_UNREADABLE_REASON = 'drain marker unreadable';
+const DEFAULT_DRAIN_REASON = 'drained by operator';
+
+/** A drain reason is shown to operators and in submitter logs: no ANSI/control characters, one line, at most 200 chars. */
+export function sanitizeDrainReason(raw) {
+  const clean = String(raw ?? '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?/g, '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/\x1b\[[0-?]*[ -/]*[@-~]?/g, '')
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f-\u009f]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return clean.slice(0, DRAIN_REASON_MAX);
+}
+
+/**
+ * BRAIN-520: the operator's remote-drain marker. null = not draining (no file). Anything present that is not a well-formed
+ * marker (unparseable, null, array, wrong version, non-string reason, non-finite since) FAILS CLOSED: draining, with the
+ * `drain marker unreadable` reason and an unknown `since` -- shape is checked here, not via readJsonSafe, which cannot tell
+ * a parse failure from a JSON `null`.
+ */
+export function readRemoteDrain(root = stateHome()) {
+  let text;
+  try {
+    text = fs.readFileSync(paths(root).remoteDrain, 'utf8');
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    return { reason: DRAIN_UNREADABLE_REASON, since: null, unreadable: true };
+  }
+  let m;
+  try {
+    m = JSON.parse(text);
+  } catch {
+    m = undefined;
+  }
+  const ok = m && typeof m === 'object' && !Array.isArray(m) && m.version === DRAIN_MARKER_VERSION && typeof m.reason === 'string' && Number.isFinite(m.since);
+  if (!ok) return { reason: DRAIN_UNREADABLE_REASON, since: null, unreadable: true };
+  return { reason: sanitizeDrainReason(m.reason) || DEFAULT_DRAIN_REASON, since: m.since, unreadable: false };
+}
+
+/** Write the drain marker under the state lock. A re-drain keeps the original `since` and replaces the reason. Returns the marker. */
+export async function writeRemoteDrain(root, reason) {
+  return withLock(root, () => {
+    const prev = readRemoteDrain(root);
+    const marker = {
+      version: DRAIN_MARKER_VERSION,
+      reason: sanitizeDrainReason(reason) || DEFAULT_DRAIN_REASON,
+      since: prev && !prev.unreadable ? prev.since : Date.now(),
+      host: os.hostname(),
+    };
+    atomicWriteJson(paths(root).remoteDrain, marker, { fsync: true });
+    return { reason: marker.reason, since: marker.since, unreadable: false };
+  });
+}
+
+/** Remove the drain marker under the state lock and make the removal durable. Idempotent; any other failure throws (naming the path). */
+export async function clearRemoteDrain(root) {
+  const file = paths(root).remoteDrain;
+  return withLock(root, () => {
+    try {
+      fs.unlinkSync(file);
+    } catch (err) {
+      if (err.code === 'ENOENT') return false;
+      throw new Error(`cannot remove drain marker ${file}: ${err.message}`);
+    }
+    fsyncDirectory(root);
+    return true;
+  });
 }
 
 export function appendHistory(root, record) {

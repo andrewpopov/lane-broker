@@ -51,7 +51,7 @@ export function remotePriorityFrom(header) {
 /** The audit fields a lease and its terminal history row carry (BRAIN-380 §8); only those the lease actually has. */
 export function priorityAuditOf(record) {
   const audit = {};
-  for (const key of ['priorityRequested', 'priorityAdmitted', 'priorityDemoted', 'effectiveRankAtStart', 'scoreAtStart']) {
+  for (const key of ['priorityRequested', 'priorityAdmitted', 'priorityDemoted', 'priorityRetiered', 'priorityRetieredAt', 'effectiveRankAtStart', 'scoreAtStart']) {
     if (record?.[key] !== undefined) audit[key] = record[key];
   }
   return audit;

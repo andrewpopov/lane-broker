@@ -5,6 +5,7 @@ import { receiveArtifacts, artifactLimitsOf } from './remote-artifacts.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
 import { isPriorityTier } from './priority.js';
+import { sanitizeDrainReason } from './state.js';
 
 /**
  * BRAIN-319 T3a: the CLIENT side of the remote runner protocol implemented
@@ -266,6 +267,10 @@ export async function selectRunner(runners, opts = {}) {
     }
     if (probe.configError) {
       skipped.push({ name: runner.name, reason: `runner config unreadable: ${probe.configError}` });
+      continue;
+    }
+    if (probe.remoteDrain) {
+      skipped.push({ name: runner.name, reason: `draining: ${sanitizeDrainReason(probe.remoteDrain.reason) || 'drained by operator'}` });
       continue;
     }
     if (probe.draining) {
@@ -639,6 +644,14 @@ function provesNeverStarted(record, expected) {
 }
 
 const DEFAULT_REBALANCE_INTERVAL_MS = 30_000;
+export const DRAIN_MOVE_REASON = 'runner-draining';
+export const QUEUED_TOO_LONG_REASON = 'queued-too-long';
+
+/** BRAIN-520: the `reason` (and, for a drain move, `drainReason`) a move carries, from what the watcher recorded when it chose the target. */
+function moveReasonOf(state) {
+  const { reason = QUEUED_TOO_LONG_REASON, drainReason } = state.attemptedReason ?? {};
+  return drainReason === undefined ? { reason } : { reason, drainReason };
+}
 
 /**
  * BRAIN-436: why a ticket may not move right now (null: it may). Pure, so the cooldown is testable on a fake clock: a ticket
@@ -670,7 +683,7 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
   const watching = () => current() && !isClosed() && !signal.aborted && !abortSignal?.aborted;
   const moved = (to, since) => {
     state.epoch += 1;
-    return { from: runner, to, queuedMs: now() - since, withdrawnAt: now() };
+    return { from: runner, to, queuedMs: now() - since, withdrawnAt: now(), ...moveReasonOf(state) };
   };
   let queuedSince = null;
   while (true) {
@@ -690,17 +703,21 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
     if (phase !== 'queued') continue;
     queuedSince ??= now();
     state.queuedSince = queuedSince;
-    if (now() - queuedSince < minQueuedMs) continue;
+    // BRAIN-520: a draining runner is an operator fact, so its queued tickets skip the minimum-queued wait. `minQueuedMs: 0` is
+    // still the off switch for every move.
+    const draining = fetched.remoteDrain ? { reason: sanitizeDrainReason(fetched.remoteDrain.reason) || 'drained by operator' } : null;
+    if (!(draining && minQueuedMs > 0) && now() - queuedSince < minQueuedMs) continue;
     // A callback that throws or rejects is a failed tick: no move, keep watching. The target is awaited (the real picker is async).
     let to;
     try {
-      to = await pickTarget();
+      to = await pickTarget(draining ? { draining } : undefined);
       if (!to || !watching()) continue;
       if (beforeWithdraw && (await beforeWithdraw({ from: runner, to, queuedMs: now() - queuedSince })) === false) continue;
     } catch {
       continue;
     }
     if (!watching()) return null;
+    state.attemptedReason = draining ? { reason: DRAIN_MOVE_REASON, drainReason: draining.reason } : { reason: QUEUED_TOO_LONG_REASON };
     state.attemptedTarget = to; // kept on the dispatch's own state: a lost reply plus a closed session is resolved from the record by the caller
     const { action } = await remoteWithdraw(runner, expected.ticketId, { sshBin, deadlineMs: withdrawDeadlineMs, env });
     // The runner decided; a cancel or an ssh close that raced it is the caller's to resolve, not ours to undo.
@@ -896,7 +913,7 @@ export async function dispatchRemote(opts) {
   const expected = { protocol, ticketId, generation, manifestHash: manifest.manifestHash };
   const closed = waitClosed(child, abortSignal);
   let move = null;
-  const state = { runner, epoch: 1, attemptedTarget: null, queuedSince: null };
+  const state = { runner, epoch: 1, attemptedTarget: null, attemptedReason: null, queuedSince: null };
   if (rebalance && withdrawCapable && pipeResult.ok) {
     // One serial watcher beside the open ssh session; it is stopped and JOINED before anything below looks at the outcome.
     const watchAbort = new AbortController();
@@ -936,7 +953,7 @@ export async function dispatchRemote(opts) {
     return cancelledOutcome();
   }
 
-  if (move) return { outcome: 'moved', from: move.from, to: move.to, queuedMs: move.queuedMs, waitedOnRunnerMs: Math.max(0, move.withdrawnAt - dispatchedAt), neverStarted: true };
+  if (move) return { outcome: 'moved', from: move.from, to: move.to, queuedMs: move.queuedMs, waitedOnRunnerMs: Math.max(0, move.withdrawnAt - dispatchedAt), neverStarted: true, reason: move.reason, ...(move.drainReason === undefined ? {} : { drainReason: move.drainReason }) };
 
   if (!pipeResult.ok) {
     // BRAIN-405: the snapshot was never completely sent, and a runner runs nothing before it has received and verified all of it
@@ -1028,7 +1045,7 @@ export async function dispatchRemote(opts) {
     }
     if (withdraw.action === 'withdrawn' && state.attemptedTarget) {
       // The move's own withdraw reply was lost and the session closed: this retry is the proof, and the chosen target is where it goes.
-      return { outcome: 'moved', from: runner, to: state.attemptedTarget, queuedMs: state.queuedSince === null ? 0 : now() - state.queuedSince, waitedOnRunnerMs: Math.max(0, now() - dispatchedAt), neverStarted: true };
+      return { outcome: 'moved', from: runner, to: state.attemptedTarget, queuedMs: state.queuedSince === null ? 0 : now() - state.queuedSince, waitedOnRunnerMs: Math.max(0, now() - dispatchedAt), neverStarted: true, ...moveReasonOf(state) };
     }
     if (withdraw.action === 'withdrawn') return { outcome: 'unconfirmed', reason: 'result not available after retries; the runner confirmed it never started the ticket', neverStarted: true, retryElsewhere: true };
     return {
@@ -1046,7 +1063,7 @@ export async function dispatchRemote(opts) {
     // A withdraw whose reply was lost and whose session closed before the watcher saw it: the runner's own bound record
     // proves the withdrawal, and the target the watcher had chosen is where the ticket goes.
     if (state.attemptedTarget && isWithdrawnRecord(record, expected)) {
-      return { outcome: 'moved', from: runner, to: state.attemptedTarget, queuedMs: state.queuedSince === null ? 0 : now() - state.queuedSince, waitedOnRunnerMs: Math.max(0, now() - dispatchedAt), neverStarted: true };
+      return { outcome: 'moved', from: runner, to: state.attemptedTarget, queuedMs: state.queuedSince === null ? 0 : now() - state.queuedSince, waitedOnRunnerMs: Math.max(0, now() - dispatchedAt), neverStarted: true, ...moveReasonOf(state) };
     }
     // Only a record that BINDS to this ticket and says nothing ran proves it never started. Any other unusable record leaves
     // the job possibly running (a mismatched or contradictory record says nothing about the runner), and so does an

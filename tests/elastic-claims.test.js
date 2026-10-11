@@ -524,6 +524,7 @@ test('remote-probe advertises elastic-claims/1', () => {
     'exclusive/1',
     'attempt-logpath/1',
     'classes/1',
+    'remote-drain/1',
   ]);
 });
 

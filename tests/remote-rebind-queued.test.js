@@ -2,12 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, waitFor, sleep } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, waitFor, sleep, laneRun } from './helpers.js';
 import { tmpDir, setup, recordingCmd, linesOf, hasLease, holdLaneLocally, detach, waitResult } from './remote-harness.js';
 import { enqueue, listQueue, withdrawQueued, restoreQueued } from '../src/scheduler.js';
 import { readAttempt } from '../src/attempts.js';
 import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig, ConfigError } from '../src/config.js';
-import { paths } from '../src/state.js';
+import { paths, atomicWriteJson } from '../src/state.js';
+import { fenceLegacyQueue } from '../src/migrate.js';
 
 /**
  * A ticket stranded in the local queue rebinds to a runner that is itself queued (after `remoteRebindMinLocalWaitMs` of local
@@ -222,4 +223,53 @@ test('BRAIN-509: a localRefused ticket never falls back to the local queue, so t
   assert.equal(result.executor, 'remote');
   assert.deepEqual(linesOf(ran), ['remote']);
   assert.doesNotMatch(ctx.admissionLog(), /remote-rebind/);
+});
+
+test('BRAIN-518: a locally queued ticket re-tiered with lane priority sends the NEW tier in its rebind dispatch header', { timeout: 120_000 }, async () => {
+  const ctx = queuedRunnerCtx({ config: { remoteRebindMinLocalWaitMs: 300 } });
+  // `lane priority` needs the v2 scheduler
+  atomicWriteJson(paths(ctx.state).schedFence, { version: 2, migratedAt: Date.now() });
+  atomicWriteJson(paths(ctx.state).fairness, { version: 2, tickets: {} });
+  fenceLegacyQueue(ctx.state, 'test');
+  const binDir = ctx.env.PATH.split(path.delimiter)[0];
+  const captureFile = path.join(tmpDir('rebind-header'), 'exec-header.json');
+  const wrapperDir = tmpDir('rebind-header-ssh');
+  fs.writeFileSync(
+    path.join(wrapperDir, 'ssh'),
+    `#!/usr/bin/env node
+const fs = require('fs');
+const { spawn } = require('child_process');
+const argv = process.argv.slice(2);
+const cmd = argv[argv.length - 1] || '';
+(async () => {
+  const chunks = [];
+  if (cmd.includes('remote-exec')) for await (const c of process.stdin) chunks.push(c);
+  const buf = Buffer.concat(chunks);
+  if (cmd.includes('remote-exec')) fs.writeFileSync(${JSON.stringify(captureFile)}, buf.subarray(0, buf.indexOf(10)));
+  const child = spawn(${JSON.stringify(path.join(binDir, 'ssh'))}, argv, { stdio: [cmd.includes('remote-exec') ? 'pipe' : 'inherit', 'inherit', 'inherit'] });
+  if (cmd.includes('remote-exec')) child.stdin.end(buf);
+  child.on('close', (code) => process.exit(code == null ? 1 : code));
+})();
+`,
+  );
+  fs.chmodSync(path.join(wrapperDir, 'ssh'), 0o755);
+  ctx.env = { ...ctx.env, PATH: `${wrapperDir}${path.delimiter}${ctx.env.PATH}` };
+
+  const ran = path.join(tmpDir('queued-ran'), 'ran');
+  ctx.setConfig({ maxRemoteQueue: 0 });
+  ctx.setMode({ queued: 1 });
+  const hold = await holdLaneLocally(ctx);
+  const id = await detach(ctx, recordingCmd(ran), { extra: ['--priority', 'low'] });
+  await waitFor(() => queuedIds(ctx.state).includes(id), { timeoutMs: 30_000 });
+  try {
+    const retier = await laneRun(['priority', id, 'high'], { env: ctx.env });
+    assert.equal(retier.code, 0, retier.stderr);
+    ctx.setConfig({ maxRemoteQueue: 1 });
+    const result = await waitResult(ctx, id);
+    assert.equal(result.executor, 'remote');
+    assert.equal(JSON.parse(fs.readFileSync(captureFile, 'utf8')).priorityRequested, 'high', 'the header carries the re-tiered tier, not the one the supervisor cached at submit');
+  } finally {
+    hold.release();
+    await hold.done;
+  }
 });

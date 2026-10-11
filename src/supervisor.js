@@ -15,6 +15,7 @@ import {
   isWithdrawn,
   writeCancelMarkerFile,
   LockTimeoutError,
+  withLock,
   MigrationInProgressError,
   testDrainAt,
   testHoldAt,
@@ -29,7 +30,7 @@ import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
 import { detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
-import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom } from './remote-client.js';
+import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
 import { REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
@@ -94,6 +95,21 @@ function clearConfigReloadWarning(root) {
 
 function cancelRequested(root, id) {
   return isCancelled(root, id);
+}
+
+/**
+ * BRAIN-518 A1: run `fn` under the broker lock, retrying on a lock timeout (contention, not a fault: the caller has nothing else to
+ * do). A queued supervisor's dequeue and marker clearing take the lock so `lane priority` (read, classify, rename under the lock)
+ * can never rewrite a queue record this supervisor has just removed. Only for the polling loop and the finalizer, never a signal handler.
+ */
+async function underLock(root, fn) {
+  for (;;) {
+    try {
+      return await withLock(root, fn);
+    } catch (err) {
+      if (!(err instanceof LockTimeoutError)) throw err;
+    }
+  }
 }
 
 function clearTicketMarkers(root, id) {
@@ -763,6 +779,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       await logWriter.finish();
       return { fallback: true, rebindLost: true, attemptGeneration: gen };
     }
+    // BRAIN-518: `lane priority` re-tiers the queue record; this supervisor's cached copy predates it, and the dispatch header reads the cache
+    if (isPriorityTier(withdrawn.priorityRequested)) enriched.priorityRequested = withdrawn.priorityRequested;
     await testHoldAt('rebind-withdrawn');
     const line = `lane: remote-rebind: ${enriched.id}: seq ${withdrawn.seq} -> ${runner.name} (queued locally ${Math.round((Date.now() - withdrawn.createdAt) / 1000)}s${enriched.localFirst ? ', local-first' : ''})\n`;
     process.stderr.write(line);
@@ -859,12 +877,21 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       rebalance: rebalanceOn && canWithdraw ? {
         minQueuedMs: globalCfg.remoteRebalanceMinQueuedMs,
         intervalMs: globalCfg.remoteRebalanceIntervalMs,
-        pickTarget: async () => {
-          if (rebalanceBlocked({ moves: moves.length, maxMoves: globalCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: globalCfg.remoteRebalanceCooldownMs })) return null;
+        // BRAIN-520: a drain move is an operator fact, so it skips the cooldown and the max-moves damping (the no-revisit rule still
+        // bounds it), and its destination must itself be able to withdraw.
+        pickTarget: async ({ draining } = {}) => {
+          const countedMoves = moves.filter((m) => m.reason !== DRAIN_MOVE_REASON).length;
+          if (!draining && rebalanceBlocked({ moves: countedMoves, maxMoves: globalCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: globalCfg.remoteRebalanceCooldownMs })) return null;
           const candidates = (globalCfg.runners || []).filter((r) => !visited.includes(r.name) && r.rebalanceTarget !== false);
           if (candidates.length === 0) return null;
-          const picked = await selectRunner(candidates, { ...remoteSelectOptions(enriched, globalCfg), maxRemoteQueue: 0 });
-          target = picked.runner && hasMeasuredHeadroom(picked.probe) ? { runner: picked.runner, probe: picked.probe } : null;
+          const selectOptions = remoteSelectOptions(enriched, globalCfg);
+          const picked = await selectRunner(candidates, {
+            ...selectOptions,
+            maxRemoteQueue: 0,
+            requireCapabilities: draining ? [...selectOptions.requireCapabilities, REMOTE_WITHDRAW_CAPABILITY] : selectOptions.requireCapabilities,
+          });
+          const eligible = picked.runner && hasMeasuredHeadroom(picked.probe);
+          target = eligible ? { runner: picked.runner, probe: picked.probe } : null;
           return target;
         },
         // The worktree must still be what was snapshotted, then the intent is made durable BEFORE the irreversible withdraw.
@@ -894,7 +921,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     visited.push(to.runner.name);
     lastMoveAt = Date.now();
     priorRemoteQueuedMs += dispatch.waitedOnRunnerMs;
-    const move = { from: from.name, to: to.runner.name, at: lastMoveAt, queuedMs: dispatch.queuedMs, reason: 'queued-too-long' };
+    const move = { from: from.name, to: to.runner.name, at: lastMoveAt, queuedMs: dispatch.queuedMs, reason: dispatch.reason ?? QUEUED_TOO_LONG_REASON, ...(dispatch.drainReason === undefined ? {} : { drainReason: dispatch.drainReason }) };
     moves.push(move);
     runner = to.runner;
     probe = to.probe;
@@ -912,14 +939,15 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       await publishAndExit(gen, () => migrationRefusalResult(enriched));
       return { fallback: false };
     }
-    const line = `lane: remote-rebalance: ${enriched.id}: ${from.name} -> ${runner.name} (queued ${Math.round(dispatch.queuedMs / 1000)}s on ${from.name}; ${runner.name} ${probe.headroom.cpuCores} cores free)\n`;
+    const why = move.reason === DRAIN_MOVE_REASON ? `${from.name} draining: ${move.drainReason}` : `queued ${Math.round(dispatch.queuedMs / 1000)}s on ${from.name}`;
+    const line = `lane: remote-rebalance: ${enriched.id}: ${from.name} -> ${runner.name} (${why}; ${runner.name} ${probe.headroom.cpuCores} cores free)\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);
     process.stderr.write(`lane: running on ${runner.name}\n`);
   }
   // A move that never completed (or one whose second dispatch ended before a snapshot went out) must not outlive this attempt's record.
   if (movingSet && !dispatch.mayStillBeRunning) await clearMoving();
-  const rebalanceFields = () => (moves.length ? { rebalancedFrom: moves.at(-1).from, rebalancedAt: moves.at(-1).at, rebalanceReason: `queued ${Math.round(moves.at(-1).queuedMs / 1000)}s on ${moves.at(-1).from}`, moves: moves.length } : {});
+  const rebalanceFields = () => (moves.length ? { rebalancedFrom: moves.at(-1).from, rebalancedAt: moves.at(-1).at, rebalanceReason: moves.at(-1).reason === DRAIN_MOVE_REASON ? `${moves.at(-1).from} draining (${moves.at(-1).drainReason})` : `queued ${Math.round(moves.at(-1).queuedMs / 1000)}s on ${moves.at(-1).from}`, moves: moves.length } : {});
 
   // BRAIN-405: a confirmed preflight refusal means the runner never started the job, so a rebound ticket goes back to its place
   if (rebind && dispatch.outcome === 'confirmed' && dispatch.result.kind === 'refused') {
@@ -1177,7 +1205,7 @@ async function main() {
       // touches that marker).
       publish(buildResult());
     }
-    clearTicketMarkers(root, ticket.id);
+    await underLock(root, () => clearTicketMarkers(root, ticket.id));
     process.exit(isTimeout ? 75 : 0);
   }
 
@@ -1233,8 +1261,8 @@ async function main() {
       // BRAIN-436: a withdrawn ticket that is also cancelled must still leave the queue (retrying) and publish its
       // cancelled result BEFORE the withdraw marker goes: that marker is what keeps `tryStart` from admitting it.
       const alsoWithdrawn = isWithdrawn(root, ticket.id);
-      if (alsoWithdrawn) while (!dequeueSync(root, ticket.id)) await sleep(100);
-      else dequeueSync(root, ticket.id);
+      if (alsoWithdrawn) while (!(await underLock(root, () => dequeueSync(root, ticket.id)))) await sleep(100);
+      else await underLock(root, () => dequeueSync(root, ticket.id));
       touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit('cancelled', { forcePublish: alsoWithdrawn });
     }
@@ -1269,7 +1297,7 @@ async function main() {
     // dequeue failed, or it crashed after the marker). Dequeue it here -- retrying the unlink -- BEFORE publishing, so the
     // published result never contradicts a ticket that is still queued. A cancel that is already pending wins.
     if (started.reason === 'withdrawn' || (started.reason === 'not-head' && started.position === null && isWithdrawn(root, ticket.id))) {
-      while (!dequeueSync(root, ticket.id)) await sleep(100);
+      while (!(await underLock(root, () => dequeueSync(root, ticket.id)))) await sleep(100);
       // read AFTER the dequeue: the retry above can wait, and a cancel landing meanwhile must still win
       const cancelWon = cancelRequested(root, ticket.id);
       touchSimArmFor(root, ticket);
@@ -1299,14 +1327,18 @@ async function main() {
       // durable cancel marker here -- if a cancel was ALSO requested, it
       // wins: publish 'cancelled', never let the expiry silently overwrite
       // an explicit cancel that arrived after it.
-      const cancelWon = cancelRequested(root, ticket.id);
-      const outcome = cancelWon ? 'cancelled' : 'queue-timeout';
       // BRAIN-320 S1d: tryStart already wrote the durable expiry marker
       // (distinct from a cancel marker) under its own lock before returning
       // this reason -- dequeue and publish the queue-timeout result the same
       // way a queued cancel is finalized, so `remote-exec`'s own kind
-      // derivation (reading this ticket's result.json) sees it.
-      dequeueSync(root, ticket.id);
+      // derivation (reading this ticket's result.json) sees it. The cancel
+      // marker is read INSIDE the lock, after the dequeue: waiting for the
+      // lock can take a while, and a cancel landing meanwhile must still win.
+      const cancelWon = await underLock(root, () => {
+        dequeueSync(root, ticket.id);
+        return cancelRequested(root, ticket.id);
+      });
+      const outcome = cancelWon ? 'cancelled' : 'queue-timeout';
       touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit(outcome, { forcePublish: cancelWon });
     }
