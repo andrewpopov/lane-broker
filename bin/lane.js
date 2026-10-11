@@ -6,7 +6,7 @@ import { estimatesCommand } from '../src/estimates-history.js';
 import { cancelCommand } from '../src/cancel.js';
 import { priorityCommand } from '../src/retier.js';
 import { waitCommand } from '../src/wait.js';
-import { pauseCommand, resumeCommand } from '../src/pause.js';
+import { pauseCommand, resumeCommand, drainCommand, undrainCommand } from '../src/pause.js';
 import { migrateSchedulerCommand } from '../src/migrate.js';
 import { parseByteSize } from '../src/resources.js';
 import {
@@ -37,6 +37,8 @@ function usage() {
   lane wait <id> [--timeout <duration>]
   lane pause ["reason"]
   lane resume
+  lane drain ["reason"]
+  lane undrain
   lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
   lane gc [--dry-run] [--max <n>] [--root <remoteRoot>]
 `;
@@ -222,6 +224,22 @@ async function main() {
     }
     case 'resume': {
       const result = await resumeCommand();
+      return result.exitCode;
+    }
+    case 'drain': {
+      if (rest.length > 1) {
+        process.stderr.write(`lane drain: unexpected argument "${rest[1]}" (quote a multi-word reason)\n${usage()}`);
+        return 2;
+      }
+      const result = await drainCommand(rest[0] ?? '');
+      return result.exitCode;
+    }
+    case 'undrain': {
+      if (rest.length > 0) {
+        process.stderr.write(`lane undrain: unexpected argument "${rest[0]}"\n${usage()}`);
+        return 2;
+      }
+      const result = await undrainCommand();
       return result.exitCode;
     }
     case 'migrate-scheduler': {

@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, readRemoteDrain, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
 import { CAPABILITIES } from './capabilities.js';
@@ -770,7 +770,9 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot(), measure }
   // CPU/memory budgets are only enforced in active mode (checkResourceBudget);
   // in shadow mode they are reported as null so the client never skips on them.
   const enforced = globalCfg.schedulerMode === 'active';
-  const draining = drainBlocksIntake(status.draining);
+  // BRAIN-520: the operator's `lane drain` takes this runner out of REMOTE selection only; local admission is untouched.
+  const remoteDrain = status.remoteDrain ? { reason: status.remoteDrain.reason, since: status.remoteDrain.since } : null;
+  const draining = drainBlocksIntake(status.draining) || remoteDrain !== null;
   // BRAIN-506: measured after the lock wait inside collectStatus (which the probe always paid), plus one ~250 ms window only when the stored sample is stale
   const brokerRoot = ensureStateDirs().root;
   const cpuHeadroom = enforced ? await probeCpuHeadroom(brokerRoot, globalCfg, listLeases(brokerRoot).filter((l) => HELD_STATES.has(l.state)), measure ? { measure } : {}) : null;
@@ -783,6 +785,7 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot(), measure }
     // BRAIN-380 slice 4: a draining runner takes no new work. `draining` names why; `paused` is also set so a client
     // built before this field skips the runner the way it skips a paused one.
     draining,
+    ...(remoteDrain ? { remoteDrain } : {}),
     paused: Boolean(status.paused) || draining || Boolean(configError),
     ...(configError ? { configError } : {}),
     queued: status.queued.length,
@@ -938,7 +941,8 @@ export async function remoteResultCommand(ticketId, { root = defaultRemoteRoot()
     const state = legacyState(phase);
     // The publisher may have written result.json and exited between the read above and the
     // liveness check; re-read once before concluding it died with nothing to show (as run.js does).
-    record = (state === 'gone' && readResult(resultPath)) || { protocol: 1, missing: true, state, ...(phase !== state ? { phase } : {}) };
+    const drain = readRemoteDrain(stateHome());
+    record = (state === 'gone' && readResult(resultPath)) || { protocol: 1, missing: true, state, ...(phase !== state ? { phase } : {}), ...(drain ? { remoteDrain: { reason: drain.reason, since: drain.since } } : {}) };
   }
   process.stdout.write(`${JSON.stringify(record)}\n`);
   return { exitCode: 0 };

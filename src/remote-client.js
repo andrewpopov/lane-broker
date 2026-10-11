@@ -5,6 +5,7 @@ import { receiveArtifacts, artifactLimitsOf } from './remote-artifacts.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
 import { isPriorityTier } from './priority.js';
+import { sanitizeDrainReason } from './state.js';
 
 /**
  * BRAIN-319 T3a: the CLIENT side of the remote runner protocol implemented
@@ -266,6 +267,10 @@ export async function selectRunner(runners, opts = {}) {
     }
     if (probe.configError) {
       skipped.push({ name: runner.name, reason: `runner config unreadable: ${probe.configError}` });
+      continue;
+    }
+    if (probe.remoteDrain) {
+      skipped.push({ name: runner.name, reason: `draining: ${sanitizeDrainReason(probe.remoteDrain.reason) || 'drained by operator'}` });
       continue;
     }
     if (probe.draining) {

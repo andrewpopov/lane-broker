@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { ensureStateDirs, paths, withLock, bootId, readJsonSafe, readDrainMarker } from './state.js';
+import { ensureStateDirs, paths, withLock, bootId, readJsonSafe, readDrainMarker, readRemoteDrain } from './state.js';
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
 import { listQueueCapped, reapOrphanedQueue, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState, readResourceSkipState, futileFresh } from './scheduler.js';
 import { refreshCpuEstimates } from './cpu-estimates.js';
@@ -157,6 +157,13 @@ function logMtimeAgeMs(logPath) {
   }
 }
 
+/** BRAIN-520: the `drain:` line shared by `lane status` and `lane drain`. A drained host keeps admitting its own queued and local work, hence the counts. */
+export function renderRemoteDrainLine(remoteDrain, { running, queued }) {
+  if (!remoteDrain) return 'drain: not draining';
+  const since = Number.isFinite(remoteDrain.since) ? new Date(remoteDrain.since).toISOString() : 'unknown';
+  return `drain: draining (${remoteDrain.reason}) since ${since}; remaining here: ${running} running, ${queued} queued`;
+}
+
 export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false, scan = scanProcWindow } = {}) {
   const root = ensureStateDirs().root;
   const { config: cfg, error: configError } = loadGlobalConfigOrError();
@@ -189,6 +196,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
   const p = paths(root);
   const paused = fs.existsSync(p.pause) ? fs.readFileSync(p.pause, 'utf8').trim() : null;
   const draining = readDrainMarker(root);
+  const remoteDrain = readRemoteDrain(root);
   const configWarning = readJsonSafe(p.configWarning);
 
   const now = Date.now();
@@ -305,6 +313,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     externalCpu,
     paused,
     draining,
+    remoteDrain,
     exclusiveHold: exclusiveHoldView(queue, held),
     priority: sched.v2 ? { active: true, mode: 'v2', nowEff, reservationOwner: reservationOwnerId } : { active: false, mode: 'legacy', nowEff },
     classes: computeClasses(cfg, root, held, resourceCapacity),
@@ -548,6 +557,7 @@ export function renderStatusText(status) {
     lines.push(`HOLD (exclusive) ${h.id} (${h.key}) waiting for ${h.waitingFor} running lane(s)`);
   }
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
+  lines.push(renderRemoteDrainLine(status.remoteDrain, { running: status.running.length, queued: status.queued.length }));
   if (status.configError) lines.push(`config: global config unreadable: ${status.configError}`);
   if (status.configWarning) {
     lines.push(
