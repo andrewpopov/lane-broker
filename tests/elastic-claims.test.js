@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneRun, gitFixture, BIN } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneRun, laneSpawn, gitFixture, BIN } from './helpers.js';
 import { tmpDir, setup, markerCmd, makeFakeSshBin, clientEnv, makeRunner } from './remote-harness.js';
 import { selectRunner } from '../src/remote-client.js';
 import { enqueue, tryStart, listQueueCapped } from '../src/scheduler.js';
@@ -746,4 +746,43 @@ test('BRAIN-362: the queue keeps the declared claim; the cap follows the current
   const result = await tryStart(state, t, grown, undefined, () => null, undefined, memory());
   assert.equal(result.started, true);
   assert.equal(result.lease.grantedCpuCores, 3, 'admission agrees with the queue view');
+});
+
+// BRAIN-531: a queued claim the budget later shrank below is refused fast (exit 64) instead of waiting forever.
+async function queueBehindBlocker({ secondLane, shrinkTo }) {
+  const { base, home, env } = freshEnv();
+  const cfg = (reserveLeft) => ({
+    version: 1, capacity: 1, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100, schedulerMode: 'active',
+    cpuAdmissionPercent: 100, cpuReserveCores: HOST_CORES - reserveLeft, admissionCooldownMs: 0,
+  });
+  writeGlobalConfig(home, cfg(4));
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, { version: 1, lanes: { blocker: { weight: 1, cpuCores: 1, memoryBytes: 1048576 }, second: secondLane } });
+  const busy = writeCpuBusyFile(base, 0, HOST_CORES);
+  const opts = { env: { ...env, LANE_BROKER_CPU_BUSY_FILE: busy }, cwd: repoDir };
+  const blocker = laneSpawn(['run', '--repo', 'r', '--lane', 'blocker', '--', 'sleep', '3'], opts);
+  await new Promise((r) => setTimeout(r, 800));
+  const second = laneRun(['run', '--repo', 'r', '--lane', 'second', '--', 'true'], opts);
+  await new Promise((r) => setTimeout(r, 800));
+  writeGlobalConfig(home, cfg(shrinkTo));
+  const result = await second;
+  blocker.kill();
+  return result;
+}
+
+test('BRAIN-531: a non-elastic queued claim the budget shrank below is refused (exit 64) naming the lane, not left queued', async () => {
+  const result = await queueBehindBlocker({ secondLane: { weight: 1, cpuCores: 3, memoryBytes: 1048576 }, shrinkTo: 2 });
+  assert.equal(result.code, 64, `stderr: ${result.stderr}`);
+  assert.match(result.stderr, /exceed this environment's budget \(3\/2\.00 CPU cores/);
+  assert.match(result.stderr, /Lane "second" can never start here/);
+});
+
+test('BRAIN-531: a queued claim that still fits after the config edit waits and then runs (no regression)', async () => {
+  const result = await queueBehindBlocker({ secondLane: { weight: 1, cpuCores: 3, memoryBytes: 1048576 }, shrinkTo: 3 });
+  assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+});
+
+test('BRAIN-531: a queued elastic claim is capped, not refused, while its floor still fits', async () => {
+  const result = await queueBehindBlocker({ secondLane: { weight: 1, cpuCores: 3, minCpuCores: 2, memoryBytes: 1048576 }, shrinkTo: 2 });
+  assert.equal(result.code, 0, `stderr: ${result.stderr}`);
 });
