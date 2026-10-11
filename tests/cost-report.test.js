@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { makeTmpDir } from './helpers/tmp.js';
 import { buildRepoReport, buildCostReport, costReportCommand, renderCostText } from '../src/cost-report.js';
 
 const SINCE = Date.parse('2026-10-09T00:00:00Z'); // Friday
@@ -85,8 +86,8 @@ test('executor mix and weekday split', () => {
   assert.equal(report.weekday.landedWeekend, 1); // PR 2, Saturday
 });
 
-test('CLI reads files, honours --json, and rejects a missing cutoff', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cost-report-'));
+test('CLI reads files, honours --json, and rejects a missing cutoff', async (t) => {
+  const dir = makeTmpDir('cost-report-', t);
   fs.mkdirSync(path.join(dir, 'j', 'foo'), { recursive: true });
   fs.writeFileSync(path.join(dir, 'h.jsonl'), `${rows.map((r) => JSON.stringify(r)).join('\n')}\n{torn`);
   fs.writeFileSync(path.join(dir, 'j', 'foo', 'journal.jsonl'), `${events.map((e) => JSON.stringify(e)).join('\n')}\n`);
