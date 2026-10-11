@@ -49,7 +49,7 @@ lane pause "reason" | lane resume
 lane drain ["reason"] | lane undrain       # take a runner out of remote rotation (BRAIN-520)
 lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
 lane gc [--dry-run] [--max <n>]
-lane reconcile [--now] [--json]                             # settle ORPHANED-REMOTE attempts from their runners (BRAIN-515)
+lane reconcile [--now] [--json]          # settle ORPHANED-REMOTE attempts from their runners (BRAIN-515)
 ```
 
 `lane status` adds `  log file unchanged for <duration>` to a RUNNING line once the
@@ -870,7 +870,7 @@ again:
 
 - a result the runner holds is adopted (its exit kept, `reconciled: true`), but only when `classifyRemoteResult` confirms it
   against the dispatch binding (`protocol`, `generation`, `manifestHash`) the supervisor stored on the attempt before spawning
-  ssh. An `unfinished`, mismatched or unbound record (an attempt from a client older than 0.33.0) is left alone;
+  ssh. An `unfinished`, mismatched or unbound record (an attempt from a client older than 0.34.0) is left alone;
 - a job the runner reports `gone` with no result is settled as lost (exit `75`, `reason: runner-lost`) only after the runner
   confirms a `remote-cancel`, so it can no longer be running or start there;
 - a job the runner still runs is left alone; so is anything when the runner cannot be reached.
