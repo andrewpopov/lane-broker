@@ -1201,6 +1201,26 @@ async function main() {
     process.exit(isTimeout ? 75 : 0);
   }
 
+  /**
+   * BRAIN-531: a queued claim that no longer fits the host budget at all (the budget shrank after submit: reserve cores raised,
+   * cpuAdmissionPercent lowered) is denied projected-over-budget on every poll even on an idle host. Refuse it with the submit-time
+   * refusal (same message prefix, exit 64) naming the lane, rather than leave it queued forever. An exclusive takes the whole budget.
+   */
+  async function refuseQueuedOverBudgetAndExit(budget) {
+    const refusal = { exitCode: budget.exitCode, message: `${budget.message.trim()} Lane "${enriched.lane}" can never start here: the budget shrank while it was queued.\n` };
+    process.stderr.write(refusal.message);
+    await underLock(root, () => dequeueSync(root, ticket.id));
+    const result = localRefusalResult(enriched, refusal);
+    const publish = () => {
+      atomicWriteJson(ticket.resultPath, result);
+      appendHistory(root, historyRow(ticket, result, { fallbackReason }));
+    };
+    if (attemptGeneration !== null) await publishTerminal(root, ticket.id, attemptGeneration, publish);
+    else publish();
+    await underLock(root, () => clearTicketMarkers(root, ticket.id));
+    process.exit(refusal.exitCode);
+  }
+
   try {
     const queued = await enqueue(root, enriched, globalCfg, { ownerGeneration: attemptGeneration });
     // BRAIN-321: this id was already submitted (a retried `lane run --detach --id`); its first supervisor owns it.
@@ -1257,6 +1277,10 @@ async function main() {
       else await underLock(root, () => dequeueSync(root, ticket.id));
       touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit('cancelled', { forcePublish: alsoWithdrawn });
+    }
+    if (!enriched.exclusive) {
+      const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host: detectResourceCapacity() });
+      if (!budget.ok) await refuseQueuedOverBudgetAndExit(budget);
     }
     // tryStart re-reads the config again inside its lock (BRAIN-182): the
     // outer reload above can be superseded by an edit that lands in the gap
