@@ -892,6 +892,30 @@ the no-revisit rule keep a ticket from bouncing.
 Lineage: this is requeueing of *pending* work as in Slurm (a requeue only for a job that has not started) and Kueue, and
 work-stealing restricted to tasks that have not started; a started task is never stolen.
 
+### Runners that are scheduled to be off (BRAIN-533)
+
+A runner that is powered down on a timetable (a workstation shut down every night) takes an optional `schedule` in the client's
+`runners[]`:
+
+```json
+{ "name": "skybox", "ssh": "skybox-runner",
+  "schedule": { "timezone": "America/Los_Angeles",
+                "available": [ { "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"], "from": "06:00", "to": "22:30" } ] } }
+```
+
+- `timezone` is an IANA name (DST is followed by the wall clock, via `Intl`). `available` is a non-empty list of windows; `days`
+  are `mon`..`sun`, `from`/`to` are 24-hour `HH:MM`. A window whose `to` is not after its `from` crosses midnight and belongs to
+  the day it starts on (`fri` `20:00`-`04:00` runs until Saturday 04:00). `from` equal to `to` is refused.
+- No `schedule` means always available, exactly as before. A bad timezone, time, day, or an empty list refuses the config by name.
+- Outside every window the runner is skipped **before it is probed**: no ssh, no 3 s timeout, and the reason `outside schedule`
+  shows in the skipped list (the fallback line, `lane status`). This applies to every placement: first dispatch, rebind of a
+  locally queued ticket, and rebalance.
+- Cutoff-aware placement: when the lane has history, its p90 wall time (the figure `lane estimates` prints for `repo:lane`) is
+  the expected run time, and a runner whose window closes before `now + expected` is skipped with a reason naming the closing
+  time. A lane with no usable history is placed normally.
+
+Not covered: work already running when a window closes is left to the existing orphan handling (BRAIN-515); nothing requeues it.
+
 ### Taking a runner out of rotation (BRAIN-520)
 
 ```
