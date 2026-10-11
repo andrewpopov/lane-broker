@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, writeExpireMarkerFile, isWithdrawn, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, isExpired, writeExpireMarkerFile, isWithdrawn, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
 import { sampleAndUpdateGate, readGateState } from './load.js';
 import { patchAttemptLocked, readAttempt } from './attempts.js';
 import { listLeases, readLease, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
@@ -17,7 +17,7 @@ import { advanceHwm } from './priority-clock.js';
 import { isExclusive, exclusiveDeny, isExclusiveHead, exclusiveLeaseFields, withoutBackfillExclusives, clampQueuedWeight } from './exclusive.js';
 import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, effectiveRank, score } from './priority.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
-import { resolveScheduler, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
+import { resolveScheduler, resolveSchedulerDetailed, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
 import { detectResourceCapacity, effectiveWeightCapacity, exclusiveBudget, cpuBudgetCores, evaluateMemoryAdmission, leaseResources, resolveTicketResources, terminalRowDefaults, capElasticClaim, elasticBelowFloor, elasticClaimRange } from './resources.js';
 
 /** Leases that hold their key: RUNNING and ORPHANED both represent real,
@@ -153,11 +153,33 @@ export function existingTicket(root, id, { ownerGeneration = null } = {}) {
 }
 
 /**
+ * BRAIN-380 §7: the per-repo high cap, the ONE place it is decided (enqueue and `retierQueued` both call it). A `requested`
+ * high is admitted high while fewer than `maxQueuedHighPerRepo` tickets of `repoId` are queued admitted-high with a live
+ * supervisor, else it is demoted to medium. `excludeId` is the ticket being re-tiered: it must not count against itself.
+ * Caller holds the lock, so two racing callers cannot both read "no high queued".
+ */
+export function admitTier(root, repoId, requested, cfg, excludeId = null) {
+  let demoted = false;
+  if (requested === 'high') {
+    const queuedHigh = listQueue(root).filter(
+      (t) =>
+        t &&
+        t.id !== excludeId &&
+        t.repoId === repoId &&
+        t.priorityRequested === 'high' &&
+        t.priorityAdmitted === 'high' &&
+        isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart }),
+    ).length;
+    demoted = queuedHigh >= cfg.maxQueuedHighPerRepo;
+  }
+  return { priorityAdmitted: demoted ? 'medium' : requested, priorityDemoted: demoted };
+}
+
+/**
  * Enqueue a ticket at the tail of the global FIFO. Caller must NOT hold the lock. Returns the persisted record, whose
  * `priorityRequested`/`priorityAdmitted`/`priorityDemoted` tell the caller whether the per-repo high cap demoted it.
  */
 export async function enqueue(root, ticket, cfg = DEFAULT_GLOBAL_CONFIG, { ownerGeneration = null } = {}) {
-  const { maxQueuedHighPerRepo } = cfg;
   return withLock(root, () => {
     // BRAIN-321: a client-supplied id is idempotent. One that is already queued, rebinding, leased, finished or owned by an
     // attempt is the SAME ticket: return it, and allocate no sequence. This runs BEFORE the migration refusal, so a duplicate
@@ -171,18 +193,7 @@ export async function enqueue(root, ticket, cfg = DEFAULT_GLOBAL_CONFIG, { owner
     // BRAIN-380 §7: the high cap, per broker. It shares this lock with the seq allocation and the queue write below,
     // so two racing enqueues cannot both read "no high queued". Across lanes and worktrees. A queued high whose supervisor
     // is dead does not hold the slot, but is not reaped here: enqueue must not mutate other tickets' state (tryStart reaps).
-    let demoted = false;
-    if (priorityRequested === 'high') {
-      const queuedHigh = listQueue(root).filter(
-        (t) =>
-          t &&
-          t.repoId === ticket.repoId &&
-          t.priorityRequested === 'high' &&
-          t.priorityAdmitted === 'high' &&
-          isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart }),
-      ).length;
-      demoted = queuedHigh >= maxQueuedHighPerRepo;
-    }
+    const { priorityAdmitted, priorityDemoted } = admitTier(root, ticket.repoId, priorityRequested, cfg);
     const seq = nextSeq(root);
     const record = {
       // BRAIN-362: the record keeps the DECLARED claim; the cap is derived at read time (listQueueCapped, tryStart) against the current budget
@@ -193,8 +204,8 @@ export async function enqueue(root, ticket, cfg = DEFAULT_GLOBAL_CONFIG, { owner
       // queued on runners, so it cannot say how long the ticket has been stuck here.
       localSince: Date.now(),
       priorityRequested,
-      priorityAdmitted: demoted ? 'medium' : priorityRequested,
-      priorityDemoted: demoted,
+      priorityAdmitted,
+      priorityDemoted,
       // An origin from `lane run` was stamped under this same lock; one that is missing or ahead of the clock starts at zero age.
       prioOriginAt: originOrNow(ticket.prioOriginAt, nowEff),
       schedVersion: 2,
@@ -411,6 +422,68 @@ export function isQueuedSupervisorGone(t, currentBootId = bootId()) {
   if (!Number.isInteger(t.supervisorPid)) return false;
   if (t.bootId && currentBootId && t.bootId !== currentBootId) return true;
   return !isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart });
+}
+
+const refuse = (reason, detail) => ({ outcome: 'refused', reason, ...(detail === undefined ? {} : { detail }) });
+
+/**
+ * BRAIN-518: re-tier a ticket that is still queued LOCALLY, in place. Caller must NOT hold the lock. Returns
+ * `{outcome: 'retiered' | 'unchanged', reason: null, before, after}` or `{outcome: 'refused', reason, detail?}`, where `reason` is one of
+ * `legacy-scheduler` (`detail`: the fence/fairness resolution reason), `unknown`, `running`, `finished` (`detail`: result | cancelled |
+ * expired | withdrawn | gone), `rebinding`, `remote` (an attempt, nothing queued here), `remote-owned` (`detail`: the submitter's ticket id),
+ * `supervisor-gone`, `unreadable-record`, `record-mismatch`, `legacy-record`. A migration in progress, a legacy queue behind the fence
+ * and a lock timeout THROW (their own error classes). Nothing is written unless the outcome is `retiered`.
+ *
+ * Only the three tier fields and the audit pair change, in the SAME file, so seq, filename, `prioOriginAt` (age), `localSince`,
+ * `exclusive` and the fairness/reservation records are untouched. Lease and result ownership are judged BEFORE the queue record is
+ * trusted (admission can leave a queue file next to its lease), and the file is re-checked immediately before the rename so a dequeue
+ * that raced in cannot be resurrected (BRAIN-518 A1; the supervisor's own dequeue takes this lock). `reloadConfig` re-reads the
+ * global config under the lock, `remoteOwnerOf(id)` names the submitter ticket of a runner-side remote-exec ticket, and
+ * `beforeWrite` is a test seam called after the record was read and classified.
+ */
+export async function retierQueued(root, id, tier, cfg, { reloadConfig = (c) => c, remoteOwnerOf = () => null, beforeWrite = null } = {}) {
+  return withLock(root, async () => {
+    assertNotMigrating(root);
+    const scheduler = resolveSchedulerDetailed(root, { log: false });
+    if (!scheduler.v2) return refuse('legacy-scheduler', scheduler.reason);
+    assertQueueLayout(root);
+
+    // lease and result ownership first: a queue record can coexist with either (admission writes the lease before it unlinks the queue file)
+    if (readLease(root, id)) return refuse('running');
+    if (readJsonSafe(path.join(paths(root).results, `${id}.json`))) return refuse('finished', 'result');
+    if (listRebindingIds(root).includes(id)) return refuse('rebinding');
+    const file = findQueueFile(root, id);
+    if (!file) {
+      if (readAttempt(root, id)) return refuse('remote');
+      return refuse(...(isCancelled(root, id) ? ['finished', 'cancelled'] : isExpired(root, id) ? ['finished', 'expired'] : isWithdrawn(root, id) ? ['finished', 'withdrawn'] : ['unknown']));
+    }
+    const record = readJsonSafe(file);
+    if (record === null || typeof record !== 'object') return refuse('unreadable-record');
+    if (record.id !== id) return refuse('record-mismatch');
+    if (record.schedVersion !== 2) return refuse('legacy-record');
+    if (isCancelled(root, id)) return refuse('finished', 'cancelled');
+    if (isExpired(root, id)) return refuse('finished', 'expired');
+    if (isWithdrawn(root, id)) return refuse('finished', 'withdrawn');
+    const submitterTicket = remoteOwnerOf(id);
+    if (submitterTicket) return refuse('remote-owned', submitterTicket);
+    if (isQueuedSupervisorGone(record)) return refuse('supervisor-gone');
+
+    const before = { priorityRequested: record.priorityRequested, priorityAdmitted: record.priorityAdmitted, priorityDemoted: record.priorityDemoted };
+    const after = { priorityRequested: tier, ...admitTier(root, record.repoId, tier, reloadConfig(cfg), id) };
+    if (before.priorityRequested === after.priorityRequested && before.priorityAdmitted === after.priorityAdmitted && before.priorityDemoted === after.priorityDemoted) {
+      return { outcome: 'unchanged', reason: null, before, after };
+    }
+
+    if (beforeWrite) await beforeWrite();
+    // A1: the file may have been removed (a cancel) while we classified; writing the record back would resurrect it.
+    if (findQueueFile(root, id) !== file || readJsonSafe(file)?.id !== id) return readLease(root, id) ? refuse('running') : refuse('finished', 'gone');
+    atomicWriteJson(file, { ...record, ...after, priorityRetiered: true, priorityRetieredAt: Date.now() });
+    writeBrokerLog(
+      root,
+      `lane-broker-priority event=retier ticket=${id} repo=${record.repoId} seq=${record.seq} from=${before.priorityRequested}/${before.priorityAdmitted} requested=${after.priorityRequested} admitted=${after.priorityAdmitted} demoted=${after.priorityDemoted} pid=${process.pid}\n`,
+    );
+    return { outcome: 'retiered', reason: null, before, after };
+  });
 }
 
 /**

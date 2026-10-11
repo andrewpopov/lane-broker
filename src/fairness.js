@@ -98,12 +98,12 @@ function loadFairness(root) {
 const loggedInvalid = new Set();
 
 /**
- * Which scheduler runs this evaluation: `{v2: false}` (no fence, or an invalid fence/fairness file, which also logs
- * `scheduler-fence-invalid` once per process and root) or `{v2: true, tickets}`. `log: false` is for `lane status`.
+ * `resolveScheduler` plus WHY it is not v2: `{v2: false, reason}` where `reason` is `fence-missing` or the one grep-able token
+ * of the invalid fence/fairness file. Same logging rule: an invalid file logs `scheduler-fence-invalid` once per process and root.
  */
-export function resolveScheduler(root, { log = true } = {}) {
+export function resolveSchedulerDetailed(root, { log = true } = {}) {
   const fence = readSchedulerFence(root);
-  if (fence.status === 'missing') return { v2: false };
+  if (fence.status === 'missing') return { v2: false, reason: 'fence-missing' };
   let reason = fence.reason;
   let tickets;
   if (fence.status === 'valid') {
@@ -116,9 +116,18 @@ export function resolveScheduler(root, { log = true } = {}) {
       loggedInvalid.add(`${root}\0${reason}`);
       logResourceEvent(root, 'scheduler-fence-invalid', { reason });
     }
-    return { v2: false };
+    return { v2: false, reason };
   }
   return { v2: true, tickets };
+}
+
+/**
+ * Which scheduler runs this evaluation: `{v2: false}` (no fence, or an invalid fence/fairness file, which also logs
+ * `scheduler-fence-invalid` once per process and root) or `{v2: true, tickets}`. `log: false` is for `lane status`.
+ */
+export function resolveScheduler(root, options) {
+  const resolved = resolveSchedulerDetailed(root, options);
+  return resolved.v2 ? resolved : { v2: false };
 }
 
 /** The singleton files, exactly as the legacy scheduler reads and writes them. */

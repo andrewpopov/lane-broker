@@ -4,6 +4,7 @@ import { statusCommand } from '../src/status.js';
 import { suggestCommand } from '../src/suggest.js';
 import { estimatesCommand } from '../src/estimates-history.js';
 import { cancelCommand } from '../src/cancel.js';
+import { priorityCommand } from '../src/retier.js';
 import { waitCommand } from '../src/wait.js';
 import { pauseCommand, resumeCommand } from '../src/pause.js';
 import { migrateSchedulerCommand } from '../src/migrate.js';
@@ -32,6 +33,7 @@ function usage() {
   lane suggest [--repo <name>] [--days <n>] [--json]
   lane estimates [--json] [--root <stateHome>]
   lane cancel <id>
+  lane priority <id> high|medium|low
   lane wait <id> [--timeout <duration>]
   lane pause ["reason"]
   lane resume
@@ -192,6 +194,14 @@ async function main() {
         return 2;
       }
       const result = await cancelCommand(id);
+      return result.exitCode;
+    }
+    case 'priority': {
+      if (rest.length !== 2) {
+        process.stderr.write('lane priority: usage: lane priority <id> high|medium|low (missing <id>|<tier>, or extra arguments)\n');
+        return 2;
+      }
+      const result = await priorityCommand(rest[0], rest[1]);
       return result.exitCode;
     }
     case 'wait': {

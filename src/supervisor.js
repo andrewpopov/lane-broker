@@ -15,6 +15,7 @@ import {
   isWithdrawn,
   writeCancelMarkerFile,
   LockTimeoutError,
+  withLock,
   MigrationInProgressError,
   testDrainAt,
   testHoldAt,
@@ -94,6 +95,21 @@ function clearConfigReloadWarning(root) {
 
 function cancelRequested(root, id) {
   return isCancelled(root, id);
+}
+
+/**
+ * BRAIN-518 A1: run `fn` under the broker lock, retrying on a lock timeout (contention, not a fault: the caller has nothing else to
+ * do). A queued supervisor's dequeue and marker clearing take the lock so `lane priority` (read, classify, rename under the lock)
+ * can never rewrite a queue record this supervisor has just removed. Only for the polling loop and the finalizer, never a signal handler.
+ */
+async function underLock(root, fn) {
+  for (;;) {
+    try {
+      return await withLock(root, fn);
+    } catch (err) {
+      if (!(err instanceof LockTimeoutError)) throw err;
+    }
+  }
 }
 
 function clearTicketMarkers(root, id) {
@@ -1177,7 +1193,7 @@ async function main() {
       // touches that marker).
       publish(buildResult());
     }
-    clearTicketMarkers(root, ticket.id);
+    await underLock(root, () => clearTicketMarkers(root, ticket.id));
     process.exit(isTimeout ? 75 : 0);
   }
 
@@ -1233,8 +1249,8 @@ async function main() {
       // BRAIN-436: a withdrawn ticket that is also cancelled must still leave the queue (retrying) and publish its
       // cancelled result BEFORE the withdraw marker goes: that marker is what keeps `tryStart` from admitting it.
       const alsoWithdrawn = isWithdrawn(root, ticket.id);
-      if (alsoWithdrawn) while (!dequeueSync(root, ticket.id)) await sleep(100);
-      else dequeueSync(root, ticket.id);
+      if (alsoWithdrawn) while (!(await underLock(root, () => dequeueSync(root, ticket.id)))) await sleep(100);
+      else await underLock(root, () => dequeueSync(root, ticket.id));
       touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit('cancelled', { forcePublish: alsoWithdrawn });
     }
@@ -1269,7 +1285,7 @@ async function main() {
     // dequeue failed, or it crashed after the marker). Dequeue it here -- retrying the unlink -- BEFORE publishing, so the
     // published result never contradicts a ticket that is still queued. A cancel that is already pending wins.
     if (started.reason === 'withdrawn' || (started.reason === 'not-head' && started.position === null && isWithdrawn(root, ticket.id))) {
-      while (!dequeueSync(root, ticket.id)) await sleep(100);
+      while (!(await underLock(root, () => dequeueSync(root, ticket.id)))) await sleep(100);
       // read AFTER the dequeue: the retry above can wait, and a cancel landing meanwhile must still win
       const cancelWon = cancelRequested(root, ticket.id);
       touchSimArmFor(root, ticket);
@@ -1306,7 +1322,7 @@ async function main() {
       // this reason -- dequeue and publish the queue-timeout result the same
       // way a queued cancel is finalized, so `remote-exec`'s own kind
       // derivation (reading this ticket's result.json) sees it.
-      dequeueSync(root, ticket.id);
+      await underLock(root, () => dequeueSync(root, ticket.id));
       touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit(outcome, { forcePublish: cancelWon });
     }
