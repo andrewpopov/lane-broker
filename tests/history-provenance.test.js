@@ -44,16 +44,26 @@ test('remote run: executor remote with the runner, no localReason', async () => 
 
 test('--local on a remote-capable lane: localReason forced-flag', async () => {
   const ctx = remoteSetup({ ssh: 'normal' });
-  const { row } = await runAndRead(ctx, ['--local']);
+  const { row } = await runAndRead(ctx, ['--local', '--local-reason', 'test']);
   assert.equal(row.executor, 'local');
   assert.equal(row.localReason, 'forced-flag');
 });
 
 test('LANE_BROKER_LOCAL=1 on a remote-capable lane: localReason forced-env', async () => {
   const ctx = remoteSetup({ ssh: 'normal' });
-  const { row } = await runAndRead(ctx, [], { ...ctx.env, LANE_BROKER_LOCAL: '1' });
+  const { row } = await runAndRead(ctx, [], { ...ctx.env, LANE_BROKER_LOCAL: '1', LANE_BROKER_LOCAL_REASON: 'test' });
   assert.equal(row.executor, 'local');
   assert.equal(row.localReason, 'forced-env');
+});
+
+test('--local with a reason: history row carries localReasonText; without one the run goes remote (BRAIN-547)', async () => {
+  const ctx = remoteSetup({ ssh: 'normal' });
+  const { row } = await runAndRead(ctx, ['--local', '--local-reason', 'needs ssh']);
+  assert.equal(row.localReason, 'forced-flag');
+  assert.equal(row.localReasonText, 'needs ssh');
+  const ignored = await runAndRead(ctx, ['--local']);
+  assert.equal(ignored.row.executor, 'remote');
+  assert.equal(ignored.row.localReasonText, undefined);
 });
 
 test('remote-capable lane with no runners configured: localReason not-eligible', async () => {
@@ -82,7 +92,7 @@ test('a lane that never opted into remote carries no localReason', async () => {
 
 test('command is recorded truncated; headTree is the HEAD tree sha, omitted when HEAD has none', async () => {
   const ctx = remoteSetup({ ssh: 'normal' });
-  const first = await runAndRead(ctx, ['--local'], ctx.env, 'y'.repeat(400));
+  const first = await runAndRead(ctx, ['--local', '--local-reason', 'test'], ctx.env, 'y'.repeat(400));
   assert.equal(first.row.headTree, undefined, 'a repo with no commits has no HEAD tree');
   assert.equal(first.row.command.length, 300, 'command must be truncated to 300 chars');
 
@@ -90,6 +100,6 @@ test('command is recorded truncated; headTree is the HEAD tree sha, omitted when
   gitFixture(['add', '-A'], ctx.repoDir);
   gitFixture(['commit', '-q', '-m', 'c'], ctx.repoDir);
   const tree = gitFixture(['rev-parse', 'HEAD^{tree}'], ctx.repoDir).trim();
-  const second = await runAndRead(ctx, ['--local']);
+  const second = await runAndRead(ctx, ['--local', '--local-reason', 'test']);
   assert.equal(second.row.headTree, tree);
 });

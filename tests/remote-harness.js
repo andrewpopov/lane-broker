@@ -393,7 +393,7 @@ export const hasLease = (state) => fs.existsSync(paths(state).leases) && fs.read
 export async function holdLaneLocally(ctx) {
   const dir = tmpDir('rebind-hold');
   const release = path.join(dir, 'release');
-  const holder = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--local', '--', ...recordingCmd(path.join(dir, 'ran'), release)], { env: ctx.env, cwd: ctx.repoDir });
+  const holder = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--local', '--local-reason', 'test', '--', ...recordingCmd(path.join(dir, 'ran'), release)], { env: ctx.env, cwd: ctx.repoDir });
   await waitFor(() => hasLease(ctx.state), { timeoutMs: 60_000 });
   return { release: () => fs.writeFileSync(release, ''), holder, done: new Promise((resolve) => holder.on('close', resolve)) };
 }

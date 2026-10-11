@@ -89,7 +89,17 @@ features like pipes or globbing.
 | `--timeout <duration>` | e.g. `30s`, `5m`, `500ms`. Exit `75` if not finished in time — see below. |
 | `--allow-local-sim` | Override a lane's `localRefused: true`. |
 | `--log <path>` | Override the default log path. |
-| `--local` | Never dispatch to a remote runner (same as `LANE_BROKER_LOCAL=1`). |
+| `--local` | Never dispatch to a remote runner (same as `LANE_BROKER_LOCAL=1`). On a remote-eligible lane it is **ignored with a stderr warning unless a reason is given** (BRAIN-547, below). |
+| `--local-reason "<why>"` | BRAIN-547: why this command needs this machine. Implies `--local`; same as env `LANE_BROKER_LOCAL_REASON`. |
+
+**`--local` needs a reason on a remote-eligible lane (BRAIN-547).** Pinning test work to the local machine
+defeats remote placement, so `--local` / `LANE_BROKER_LOCAL=1` alone on a lane that would otherwise run on a
+runner prints `lane: --local ignored for remote-eligible lane <lane>: ...` and the ticket is placed normally.
+Pass `--local-reason "<why>"` (or set `LANE_BROKER_LOCAL_REASON`) for a command that genuinely needs this
+machine (ssh, `gh`, `lane`, paths outside the worktree); it stays local and the history row records
+`localReason: "forced-flag"` (`"forced-env"` when only env vars were used) plus `localReasonText`. Lanes that
+are not remote-eligible are unchanged: `--local` is accepted silently. The runner side of `remote-exec` sets
+its own reason internally.
 
 **Every run gets a detached supervisor**, always. `lane run` spawns it, then
 only *waits* on the supervisor's result file. If the calling agent (or its

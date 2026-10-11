@@ -91,7 +91,7 @@ test('localRefused WITHOUT remote: refused immediately with exit 69, exactly as 
 
 test('localRefused + remote:true, but forced local via --local: refused immediately with exit 69', async () => {
   const { env, repoDir } = setupLocalRefusedRemote({ ssh: 'normal' });
-  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--local', '--', 'true'], { env, cwd: repoDir });
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--local', '--local-reason', 'test', '--', 'true'], { env, cwd: repoDir });
   assert.equal(result.code, 69);
   assert.match(result.stderr, /refused for local runs/);
 });
