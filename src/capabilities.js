@@ -18,6 +18,8 @@ export const REMOTE_WITHDRAW_CAPABILITY = 'remote-withdraw/1';
 export const ATTEMPT_LOGPATH_CAPABILITY = 'attempt-logpath/1';
 // BRAIN-520: `lane drain`/`undrain`; a probe may carry `remoteDrain`. Informational: selection keys off the probe field.
 export const REMOTE_DRAIN_CAPABILITY = 'remote-drain/1';
+// BRAIN-518: `lane priority` re-tiers a ticket still queued on this runner; a submitter checks this before sending one.
+export const QUEUE_RETIER_CAPABILITY = 'queue-retier/1';
 
 /** The ONE list: `lane remote-probe` advertises it and `lane capabilities --json` prints it. */
 export const CAPABILITIES = [
@@ -32,6 +34,7 @@ export const CAPABILITIES = [
   ATTEMPT_LOGPATH_CAPABILITY,
   CLASSES_CAPABILITY,
   REMOTE_DRAIN_CAPABILITY,
+  QUEUE_RETIER_CAPABILITY,
 ];
 
 /** `lane capabilities --json`: what this install can do and which scheduler/admission mode it is in. */
