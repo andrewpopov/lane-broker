@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { ensureStateDirs, paths, readJsonSafe, appendHistory, LockTimeoutError, MigrationInProgressError, assertNotMigrating, isUuid } from './state.js';
+import { ensureStateDirs, paths, stateHome, readJsonSafe, appendHistory, LockTimeoutError, MigrationInProgressError, assertNotMigrating, isUuid } from './state.js';
 import { classTransportMismatch } from './classes.js';
 import { resolveTicketConfig, reloadGlobalConfig, resolvePriority, assertHostConfigHookless, ConfigError } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
@@ -12,9 +12,10 @@ import { listQueue } from './scheduler.js';
 import { stampPriorityOrigin } from './priority-clock.js';
 import { detectResourceCapacity, leaseResources, resolveTicketResources, checkResourceBudget, localSimRefusal } from './resources.js';
 import { argvFingerprint } from './cpu-estimates.js';
+import { readRows } from './suggest.js';
+import { rightSizedCpuCores } from './right-size.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
 import { isExclusive, oversizedWeight, oversizedWeightMessage } from './exclusive.js';
-import { readRows } from './suggest.js';
 import { computeContentKey, findCachedPass } from './result-cache.js';
 
 const supervisorPath = fileURLToPath(new URL('./supervisor.js', import.meta.url));
@@ -342,7 +343,7 @@ export async function runCommand({
   const cmdFingerprint = fingerprintRoot
     ? argvFingerprint(cmd, { root: fingerprintRoot, cwd: realpathOr(cwd), tmp: process.env.TMPDIR || os.tmpdir() })
     : undefined;
-  const resources = resolveTicketResources({
+  const declaredResources = resolveTicketResources({
     weight,
     cpuCores: cpuOverride ?? resolved.cpuCores,
     // an exclusive claims the whole budget, so an elastic floor means nothing
@@ -350,6 +351,20 @@ export async function runCommand({
     memoryBytes: memoryOverride ?? resolved.memoryBytes,
     defaultMemoryBytesPerWeight: globalCfg.defaultMemoryBytesPerWeight,
   });
+  // BRAIN-550: an explicit --cpu is the caller's own claim, and an exclusive claims the whole budget; neither is right-sized
+  const rightSized =
+    globalCfg.rightSizeFromHistory && resolved.rightSize && !exclusive && cpuOverride === undefined
+      ? rightSizedCpuCores(readRows(paths(stateHome()).history), {
+          repoId: resolved.repoId,
+          lane: resolved.configLane ?? resolved.lane,
+          declared: declaredResources.cpuCores,
+          floor: declaredResources.minCpuCores ?? 1,
+        })
+      : null;
+  const resources =
+    rightSized && rightSized.cpuCores < declaredResources.cpuCores
+      ? resolveTicketResources({ weight, cpuCores: rightSized.cpuCores, minCpuCores: declaredResources.minCpuCores, memoryBytes: declaredResources.memoryBytes })
+      : declaredResources;
   const inheritedLease = process.env.LANE_BROKER_LEASE;
   const inheritedKey = process.env.LANE_BROKER_KEY;
   if (inheritedLease) {
@@ -521,6 +536,7 @@ export async function runCommand({
     ...(resolved.configLane ? { configLane: resolved.configLane } : {}),
     weight,
     resources,
+    ...(resources !== declaredResources ? { declaredCpuCores: declaredResources.cpuCores } : {}),
     nice,
     // BRAIN-506: only the lane's own override; a remote ticket runs at it, else at the RUNNER's laneNice (never this host's), which the runner-room check needs to know
     ...(resolved.nice !== undefined && resolved.nice !== null ? { niceOverride: resolved.nice } : {}),

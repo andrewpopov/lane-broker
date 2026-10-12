@@ -227,7 +227,9 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       // matching resolveTicketConfig's own compatibility default.
       maxConcurrent: l.maxConcurrent ?? 1,
       resources: leaseResources(l, cfg),
-      ...(Number.isFinite(l.grantedCpuCores) ? { declaredCpuCores: l.resources?.cpuCores ?? l.weight, grantedCpuCores: l.grantedCpuCores } : {}),
+      ...(Number.isFinite(l.grantedCpuCores) || l.declaredCpuCores !== undefined
+        ? { declaredCpuCores: l.declaredCpuCores ?? l.resources?.cpuCores ?? l.weight, grantedCpuCores: leaseCpuCores(l), ...(l.declaredCpuCores !== undefined ? { rightSized: true } : {}) }
+        : {}),
       observedCpuCores: l.observedCpuCores ?? null,
       // BRAIN-361: report-only; never read by admission
       bookedCpuCores: leaseCpuCores(l) ?? null,
@@ -402,8 +404,9 @@ function computeClasses(cfg, root, held, host) {
   };
 }
 
-/** BRAIN-360: shown only when admission granted less CPU than the lane declared. */
+/** BRAIN-360: shown only when admission granted less CPU than the lane declared; BRAIN-550: `declared\u2192granted` for a right-sized one. */
 function elasticNote(r) {
+  if (r.rightSized) return `  cpu ${r.declaredCpuCores}\u2192${r.grantedCpuCores} (right-sized)`;
   return r.grantedCpuCores < r.declaredCpuCores ? `  cpu=${r.grantedCpuCores}/${r.declaredCpuCores} (elastic)` : '';
 }
 

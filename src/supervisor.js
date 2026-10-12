@@ -456,6 +456,9 @@ function historyRow(ticket, result, { fallbackReason, lease, contentKey = isClea
     ...(ticket.exclusive === true ? { exclusive: true } : {}),
     weight: ticket.weight,
     resources: ticket.resources,
+    // BRAIN-550: what admission was asked for (right-sized from history), and the declaration it replaced when they differ
+    ...(Number.isFinite(ticket.resources?.cpuCores) ? { requestedCpuCores: ticket.resources.cpuCores } : {}),
+    ...(ticket.declaredCpuCores !== undefined ? { declaredCpuCores: ticket.declaredCpuCores } : {}),
     command: ticket.command,
     ...(ticket.cmdFingerprint ? { cmdFingerprint: ticket.cmdFingerprint } : {}),
     headTree: ticket.headTree,

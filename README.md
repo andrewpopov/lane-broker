@@ -1288,6 +1288,30 @@ judged on the FULL claim, since it would be dispatched the full claim and refuse
 it terminally (exit 64) if its budget is smaller. Upgrade runners before relying
 on elasticity.
 
+### Right-sized CPU requests (`rightSizeFromHistory`, BRAIN-550)
+
+A lane's declared `cpuCores` is usually a ceiling, not what it uses (24 h of runs: the median run used about 68% of its
+reserved cores), and a runner refuses work while the reservations, not the busy cores, fill its budget. So once a
+(repo, lane) has **5 finished runs with `observedCpu`** in the last 14 days (most recent 50; runs under 2 minutes are skipped, as in
+`lane suggest`), `lane run` requests
+
+    target = ceil(p90 of per-run mean cores x 1.2), clamped to [minCpuCores or 1, declared cpuCores]
+
+instead of the declaration. The request is what admission charges, what the lease and the history row record as
+`grantedCpuCores`, what a remote runner is asked to reserve, and what the child sees in `LANE_BROKER_CPU_CORES`. Elastic grants
+still apply below it, down to `minCpuCores`. A run granted less than it requested counts at its requested-equivalent
+(`mean / granted x requested`), so a throttled run cannot talk the lane down further. With fewer than 5 samples nothing changes.
+
+Never right-sized: an explicit `--cpu`, an `exclusive` lane, a lane with `rightSize: false`, and every lane when the global
+`rightSizeFromHistory` is `false` (default `true`). Memory and weight are untouched. Because the request follows the grant, a
+lane whose workers size from `LANE_BROKER_CPU_CORES` can only drift down while its p90 mean stays under the request divided by 1.2;
+set `rightSize: false` (or `--cpu`) on a lane that must keep its declared width.
+
+`lane status` shows `cpu <declared>→<granted> (right-sized)` on a running lease; `--json` carries `declaredCpuCores`,
+`grantedCpuCores` and `rightSized`. The history row records `requestedCpuCores` (what admission was asked for) and, only
+when it differs from the declaration, `declaredCpuCores`. `lane suggest` reads `resources.cpuCores`, which is now the right-sized
+request, so its `declared=` column shows that request once a lane is right-sized.
+
 ### `history.jsonl` record schema (BRAIN-425)
 
 One JSON object per line, appended when a run reaches a terminal outcome. Every field except the identity and timing ones is
@@ -1301,6 +1325,7 @@ additive: readers must ignore unknown keys and tolerate absent ones.
 | `cancelled`, `reason`, `error` | cancel flag; refusal/reap reason; supervisor-level error text |
 | `startedAt`, `endedAt`, `waitedMs`, `queuedAt` | epoch ms; `waitedMs` is queue wait (`null` when unknown) |
 | `grantedCpuCores`, `grantedMemoryBytes` | what the lane was charged: the elastic grant, else the declared reservation |
+| `requestedCpuCores`, `declaredCpuCores` | BRAIN-550: the CPU admission was asked for (right-sized from history; the declaration otherwise), and the declaration it replaced, present only when right-sizing lowered it |
 | `observedCpu` `{peak, mean, samples}`, `observedRssPeakBytes` | heartbeat observations (see above) |
 | `cpuSeconds` | CPU seconds of the lease's process tree, an **estimate**: the heartbeat core samples integrated over time, the first reading held back to the start and the last forward to the end. Not rusage: `ps` pcpu is a decayed average and a supervisor cannot read reaped grandchildren's rusage |
 | `depsCache`, `depsMs` | remote deps phase outcome (`hit`/`miss`/`skip`) and wall time |

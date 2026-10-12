@@ -1677,6 +1677,8 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       resources: submitted.resources,
       // BRAIN-360: elastic lanes only; what admission actually charged. `resources.cpuCores` stays the declaration.
       ...(submitted.resources?.minCpuCores !== undefined ? { grantedCpuCores } : {}),
+      // BRAIN-550: the declaration a right-sized request replaced, so a held-lease view can show declared -> granted
+      ...(submitted.declaredCpuCores !== undefined ? { declaredCpuCores: submitted.declaredCpuCores } : {}),
       // BRAIN-255: carried onto the lease (not just the ticket) so a
       // held-lease-only view — status.js's report, or a later poll's
       // `blockedBy` call against a DIFFERENT ticket of the same key — can
