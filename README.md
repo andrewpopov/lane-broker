@@ -1133,7 +1133,7 @@ starts only when **all** of:
 - the broker is not paused.
 
 **Fairness and backfill.** The queue is FIFO, and a head that cannot start may
-be overtaken only in three bounded ways, each with its own allowance and each
+be overtaken only in three bounded ways (plus express admission, below), each with its own allowance and each
 ending in strict FIFO for that head once spent:
 
 - *Conflict* (`conflictSkipLimit`, default 3): a head blocked by a lane-key
@@ -1178,6 +1178,28 @@ ending in strict FIFO for that head once spent:
   are dropped only when the ticket starts or leaves the queue, or the limit is 0). A backfill whose count cannot be written to disk is
   refused, never uncounted. `resourceSkipLimit: 0` restores strict FIFO for
   resource denials.
+
+**Express admission** (BRAIN-551). A ticket expected to run under `expressMaxMs`
+(default 30000) starts past a waiting head as soon as it fits *now*, so a
+10-second check does not queue behind a 30-minute job. Expected run time is the
+median (p50) of this machine's local history for the ticket's exact command
+(`cmdFingerprint`), else for its `(repo, lane)`, with at least 3 runs; no
+history means not express. The ticket still has to pass everything else:
+its own conflicts and key serialization (`maxConcurrent`), weight capacity, the
+CPU projection and memory. An express start is not counted against any skip
+allowance above, and a sim never uses it behind a test head. Two bounds keep the
+head from starving:
+
+- at most `expressPerMinute` (default 6) express starts per minute per host
+  (`express-admissions.json`);
+- once the head has waited `expressHeadMaxWaitMs` (default 15 minutes), an
+  express ticket starts only if it provably cannot delay the head: BRAIN-355's
+  test, with the head's claim reserved for CPU and memory.
+
+Each express start is logged in `admission-decisions.log` as
+`lane-broker-express event=express-admit`, and `lane status` marks queued
+express tickets `[express]` (JSON: `express: true`). The estimates are cached in
+`express-estimates.json` for 5 minutes. `expressMaxMs: 0` turns it off.
 
 **Bounded idle exemption** (`resourceIdleOvershootCores`, default 1; `0`
 disables): ambient load can make a large lane unsatisfiable even with nothing

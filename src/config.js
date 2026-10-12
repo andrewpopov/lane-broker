@@ -80,6 +80,12 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // together with the head's own claim. Such a start is not counted as a skip.
   // false restores the BRAIN-249 refusal of all backfill for headBlockGraceMs.
   conflictSafeBackfill: true,
+  // BRAIN-551: a ticket whose history p50 is under expressMaxMs (0 disables) may start past a waiting head as soon as it
+  // fits, uncounted against the skip allowances. At most expressPerMinute such starts per minute per host, and once the head
+  // has waited expressHeadMaxWaitMs an express ticket starts only if it provably cannot delay the head (BRAIN-355's test).
+  expressMaxMs: 30_000,
+  expressPerMinute: 6,
+  expressHeadMaxWaitMs: 900_000,
   // BRAIN-346: how many tickets may start behind a FIFO head denied only by
   // projected-over-budget CPU before the head is reserved (nothing else is
   // admitted past it). 0 restores strict FIFO for resource denials.
@@ -303,6 +309,9 @@ function validateGlobalConfig(cfg, sourcePath) {
     `${sourcePath}: "headBlockGraceMs" must be a non-negative integer`,
   );
   assert(typeof cfg.conflictSafeBackfill === 'boolean', `${sourcePath}: "conflictSafeBackfill" must be a boolean`);
+  for (const name of ['expressMaxMs', 'expressPerMinute', 'expressHeadMaxWaitMs']) {
+    assert(Number.isInteger(cfg[name]) && cfg[name] >= 0, `${sourcePath}: "${name}" must be a non-negative integer`);
+  }
   assert(
     Number.isInteger(cfg.resourceSkipLimit) && cfg.resourceSkipLimit >= 0,
     `${sourcePath}: "resourceSkipLimit" must be a non-negative integer`,
