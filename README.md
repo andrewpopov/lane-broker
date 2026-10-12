@@ -86,6 +86,7 @@ features like pipes or globbing.
 | `--id <ticket-id>` | With `--detach` only: a client-supplied ticket id (`[A-Za-z0-9._-]`, up to 128 chars) that makes the submission idempotent. An id the broker already knows (queued, leased, finished or mid remote attempt) is returned as the same ticket: no new queue sequence and, for a remote-eligible lane, no second dispatch (the check runs before any probe). A remote-eligible lane needs a UUID id. |
 | `--priority high\|medium\|low` | BRAIN-380 priority tier (default `medium`). Beats env `LANE_BROKER_PRIORITY`, which beats the lane's `priority` in `.lane-broker.json` (an `undeclaredLanes.as` template passes its tier on), which beats `medium`. Any invalid value from any of the three exits `64`. See "Priority (foundations)" below. |
 | `--exclusive` | BRAIN-403 v1: claim the whole host for this run. See "Exclusive lanes (BRAIN-403 v1)" below. The lane config key `lanes.<name>.exclusive: true` does the same. |
+| `--no-cache` | BRAIN-549: run even if the same command already passed on identical content (env `LANE_BROKER_NO_CACHE=1` does the same). See "Result cache" below. |
 | `--detach` | Print the run id and return immediately instead of waiting. |
 | `--timeout <duration>` | e.g. `30s`, `5m`, `500ms`. Exit `75` if not finished in time — see below. |
 | `--allow-local-sim` | Override a lane's `localRefused: true`. |
@@ -1285,6 +1286,7 @@ additive: readers must ignore unknown keys and tolerate absent ones.
 | `remoteArtifacts`, `remoteArtifactsWarning` | returned artifact names / why they were not |
 | `remoteOmittedSymlinks`, `remoteOmittedSymlinkNames` | remote runs with `remoteOmitEscapingSymlinks`: how many escaping symlinks the snapshot left out, and the first 10 paths |
 | `priorityRequested`, `priorityAdmitted`, `priorityDemoted`, `effectiveRankAtStart`, `scoreAtStart` | priority audit (admitted tickets only) |
+| `contentKey`, `cachedFrom` | BRAIN-549: the run's result-cache key (on every keyed run; a pass keeps it only if the worktree still matched at the end), and on a cache answer the id of the run it was served from (`runMs: 0`, no `contentKey`) |
 | `dequeuedDeadSupervisor` | marks a row for a queued ticket whose supervisor died (`exit: null`, `signal: null`) |
 
 A runner's `result.json` carries the same `cpuSeconds` and a `phasesMs` object; the submitter folds them into its own row.
@@ -1671,6 +1673,34 @@ keyed by (repo, lane): n, censored count, p50/p90 (seconds), `est_source` and th
 skipped (counted); a run killed by an unrequested signal is censored. History rows carry no
 class, so a lane named like a sim (`sim`, `sims`, `sim-*`) is a sim, else a test. The host
 factor is 1.0 (no calibration) and is printed.
+
+### Result cache (BRAIN-549)
+
+`lane run` answers from history when the same command already **passed** on byte-identical worktree content: it prints
+`lane: cached pass from <id> at <time> (pass --no-cache to re-run)` to stderr, exits `0` without running anything, and
+appends a history row with `cachedFrom: <id>` and `runMs: 0` (so `lane report cost` counts no work for it). The lookup
+happens before admission: no ticket, no queue, no lease.
+
+The content key is a sha256 over: the lane key (repo + lane), the command fingerprint (argv and cwd), HEAD's tree, the
+binary-safe `git diff HEAD` (every tracked edit, staged or not, deletions and mode changes) and the sorted path, mode
+and content hash of every untracked, non-ignored file. Only an exit-`0` run with the same key inside `resultCacheTtlSec`
+is served; a failed, signalled, cancelled or refused run never is, and a cached row never renews the pass it points to.
+Every keyed run stores `contentKey` on its history row; a pass keeps it only if the worktree still hashes to the same
+key when the run ends (a run that edits the tree, or an edit made while it queued or ran, leaves nothing to serve).
+
+It gives no key, so the run simply executes, when: the command has no fingerprint or the directory is not a git checkout
+with a HEAD; the checkout has a `.gitmodules`; a tracked file is flagged assume-unchanged or skip-worktree (git diff
+cannot see edits to it); there are more than 2000 untracked files or more than 64 MiB of them, or one is not a regular
+file or symlink; or any git call fails.
+
+**What is not in the key.** Ignored files (`node_modules`, build output, `.env`) and the environment are not. The key says
+"same source", not "same machine": a command whose result depends on an env var, the clock, the network or an ignored
+file should opt out (below), or its pass can be served when it would now fail.
+
+Opt-outs: `--no-cache`, env `LANE_BROKER_NO_CACHE=1`, `"cache": false` on a lane in `.lane-broker.json` (inherited by
+an `undeclaredLanes.as` template's lanes), and global `resultCacheTtlSec` (default `86400`; `0` turns it off, no keys are
+recorded either). Never cached: exclusive lanes, `--detach` runs (they return an id to wait on; they still record a key),
+nested runs under an inherited lease, and a runner's `remote-exec` intake.
 
 ### Exclusive lanes (BRAIN-403 v1)
 

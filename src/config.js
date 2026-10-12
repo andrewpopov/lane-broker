@@ -125,6 +125,9 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // 0 (the default) never kills: quiet work is legitimate, so the kill is opted into per lane (`noProgressTimeoutMs`).
   // The stall is recorded either way.
   noProgressTimeoutMs: 0,
+  // BRAIN-549: a command that already passed on the exact same worktree content within this many seconds is answered from
+  // history instead of re-run. 0 turns the result cache off.
+  resultCacheTtlSec: 86_400,
   // BRAIN-379 (balancer P2, slice 2): record, in admission-decisions.log and `lane status`, what
   // class-aware test/sim allocation WOULD decide. Never changes a live admission decision.
   allocationShadow: false,
@@ -286,6 +289,7 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isFinite(cfg.settledDemandFloorFraction) && cfg.settledDemandFloorFraction >= 0 && cfg.settledDemandFloorFraction <= 1,
     `${sourcePath}: "settledDemandFloorFraction" must be a number in [0, 1]`,
   );
+  assert(Number.isInteger(cfg.resultCacheTtlSec) && cfg.resultCacheTtlSec >= 0, `${sourcePath}: "resultCacheTtlSec" must be a non-negative integer (0 disables the result cache)`);
   assert(typeof cfg.historyDemandEnabled === 'boolean', `${sourcePath}: "historyDemandEnabled" must be a boolean`);
   assert(Number.isInteger(cfg.maxLaneWeight) && cfg.maxLaneWeight >= 1, `${sourcePath}: "maxLaneWeight" must be a positive integer`);
   assert(typeof cfg.historyDemandRaise === 'boolean', `${sourcePath}: "historyDemandRaise" must be a boolean`);
@@ -569,6 +573,9 @@ function validateRepoConfig(cfg, sourcePath) {
     }
     if (lane.exclusive !== undefined) {
       assert(typeof lane.exclusive === 'boolean', `${sourcePath}: lane "${name}".exclusive must be a boolean`);
+    }
+    if (lane.cache !== undefined) {
+      assert(typeof lane.cache === 'boolean', `${sourcePath}: lane "${name}".cache must be a boolean`);
     }
     // BRAIN-403: hooks are host-only and not supported yet; a lane carrying them is refused rather than silently ignored
     assertNoHookKeys(lane, `${sourcePath}: lane "${name}"`);
@@ -987,7 +994,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   if (isDeclaredLane) {
     laneCfg = repoConfig.lanes[laneName];
   } else if (undeclaredTemplateName) {
-    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/noProgressTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteOmitEscapingSymlinks/remoteArtifacts/remoteArtifactsOn/class/priority/aging
+    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/noProgressTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteOmitEscapingSymlinks/remoteArtifacts/remoteArtifactsOn/class/priority/aging/cache
     // from the named declared lane, keeping this lane's OWN key/name. Not
     // inherited: `localRefused` (stays default false), the template's named
     // conflicts (only the `*` wildcard universe below reaches this lane, same
@@ -1014,6 +1021,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       class: templateCfg.class,
       priority: templateCfg.priority,
       aging: templateCfg.aging,
+      cache: templateCfg.cache,
       classEnforcement: templateCfg.classEnforcement,
     };
   } else {
@@ -1061,6 +1069,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     aging: laneCfg.aging !== false,
     // BRAIN-403: never inherited through an undeclaredLanes template (the template literal above does not copy it)
     exclusive: laneCfg.exclusive === true,
+    // BRAIN-549: false opts this lane out of the result cache; inherited through an undeclaredLanes template
+    cache: laneCfg.cache !== false,
     // BRAIN-321: "required" = granted only under live class caps (`classes.mode` active and valid); absent for every other lane
     ...(laneCfg.classEnforcement === 'required' ? { classEnforcement: 'required' } : {}),
     conflicts,
