@@ -55,10 +55,12 @@ export function localRunEstimateMs(rows, repo, lane) {
  * How long a ticket expects to wait for this machine: the run time of everything queued ahead of it plus one run still in
  * flight (the work blocking admission, unknown in length, assumed to need a full run: conservative, it leans to remote), spread
  * over the `slots` lanes of this ticket's weight the machine can run at once.
+ * BRAIN-556: the model sees only the queue, not CPU load outside any lease. Time already waited is a lower bound on the wait still
+ * ahead once the prediction has visibly failed, so the result is never below `waitedMs`.
  */
-export function localWaitMs({ aheadEstimatesMs, estimateMs, slots }) {
+export function localWaitMs({ aheadEstimatesMs, estimateMs, slots, waitedMs = 0 }) {
   const work = aheadEstimatesMs.reduce((sum, ms) => sum + ms, 0) + estimateMs;
-  return work / Math.max(1, slots);
+  return Math.max(work / Math.max(1, slots), waitedMs);
 }
 
 /**
