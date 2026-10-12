@@ -1292,8 +1292,8 @@ on elasticity.
 
 A lane's declared `cpuCores` is usually a ceiling, not what it uses (24 h of runs: the median run used about 68% of its
 reserved cores), and a runner refuses work while the reservations, not the busy cores, fill its budget. So once a
-(repo, lane) has **5 finished runs with `observedCpu`** in the last 14 days (most recent 50; runs under 2 minutes are skipped, as in
-`lane suggest`), `lane run` requests
+(repo, lane) has **5 finished runs with `observedCpu`** in the last 14 days (most recent 50; a run counts once it has 3 heartbeat samples, so
+short ad-hoc runs count), `lane run` requests
 
     target = ceil(p90 of per-run mean cores x 1.2), clamped to [minCpuCores or 1, declared cpuCores]
 
@@ -1311,6 +1311,19 @@ set `rightSize: false` (or `--cpu`) on a lane that must keep its declared width.
 `grantedCpuCores` and `rightSized`. The history row records `requestedCpuCores` (what admission was asked for) and, only
 when it differs from the declaration, `declaredCpuCores`. `lane suggest` reads `resources.cpuCores`, which is now the right-sized
 request, so its `declared=` column shows that request once a lane is right-sized.
+
+### Unapproved CPU cap (`maxUnapprovedCpuCores`, BRAIN-552)
+
+A request is **approved** at its declared `cpuCores` only when that lane is explicitly declared under `lanes` in the repo's
+**committed** `.lane-broker.json` (`git show HEAD:.lane-broker.json` from the checkout root). Everything else is capped, client side, to
+`max(committed cpuCores for that lane, maxUnapprovedCpuCores)`: an undeclared or ad-hoc lane (an `undeclaredLanes.as` template's size is not
+approval for an ad-hoc name), `--cpu` above the committed declaration, a working-tree config that raises a lane above HEAD, and any run with no git
+or no committed file. `maxUnapprovedCpuCores` is a global config key (positive number, default 4). The cap applies to `cpuCores`, and to
+`minCpuCores` when it would exceed the capped claim, before right-sizing. Each cap writes one stderr line, for example
+`lane run: cpu 9 -> 4 (lane "zirk812": lane "zirk812" is not declared in the committed .lane-broker.json; maxUnapprovedCpuCores 4)`.
+
+An exclusive run is not capped (it claims the whole budget by design). A runner never re-caps: the cores in a `lane remote-exec` header were
+already capped by the submitting client, and the runner's snapshot has no git.
 
 ### `history.jsonl` record schema (BRAIN-425)
 

@@ -175,6 +175,17 @@ export function resolveTicketResources({ weight, cpuCores, minCpuCores, memoryBy
 }
 
 /**
+ * BRAIN-552: pure. No unapproved request reserves more than `max(approvedCeiling, maxUnapprovedCpuCores)` cores; `approvedCeiling` is
+ * the cpuCores the lane declares in the committed config (null when it is not approved at all). An elastic floor above the capped
+ * claim comes down with it. Returns the (possibly unchanged) claim and `capped` when it was lowered.
+ */
+export function capUnapprovedCpu({ cpuCores, minCpuCores, approvedCeiling, maxUnapprovedCpuCores }) {
+  const limit = Math.max(approvedCeiling ?? 0, maxUnapprovedCpuCores);
+  if (!(cpuCores > limit)) return { cpuCores, minCpuCores, capped: false };
+  return { cpuCores: limit, minCpuCores: Number.isFinite(minCpuCores) ? Math.min(minCpuCores, limit) : minCpuCores, capped: true };
+}
+
+/**
  * BRAIN-360: the CPU cores a held lease is CHARGED for -- the elastic grant when
  * admission gave it less than it declared, else its declared claim. Every place
  * that charges a lease's CPU (reservedSum, settled demand, status, a nested run's

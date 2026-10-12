@@ -46,9 +46,15 @@ test('a target below the floor is clamped to the floor, and to 1 without one', (
   assert.equal(size(tiny).cpuCores, 1);
 });
 
-test('runs under two minutes, other lanes and other repos are not samples', () => {
-  const noise = [...rows([1.5, 1.5, 1.5, 1.5], { runMs: 30_000 }), ...rows([1.5], { lane: 'other' }), ...rows([1.5], { repo: 'x' }), ...rows([1.5, 1.5, 1.5, 1.5])];
+test('other lanes and other repos are not samples', () => {
+  const noise = [...rows([1.5], { lane: 'other' }), ...rows([1.5], { repo: 'x' }), ...rows([1.5, 1.5, 1.5, 1.5])];
   assert.equal(size(noise), null);
+});
+
+test('BRAIN-552: a 40 second run with 6 samples counts; a run with 2 samples does not', () => {
+  const short = { runMs: 40_000, observedCpu: { peak: 2, mean: 1.5, samples: 6 } };
+  assert.deepEqual(size(rows([1.5, 1.5, 1.5, 1.5, 1.5], short)), { cpuCores: 2, runs: 5 });
+  assert.equal(size(rows([1.5, 1.5, 1.5, 1.5, 1.5], { ...short, observedCpu: { peak: 2, mean: 1.5, samples: 2 } })), null);
 });
 
 test('a run granted less than it requested counts at its requested-equivalent', () => {

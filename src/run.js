@@ -10,7 +10,7 @@ import { resolveTicketConfig, reloadGlobalConfig, resolvePriority, assertHostCon
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
 import { stampPriorityOrigin } from './priority-clock.js';
-import { detectResourceCapacity, leaseResources, resolveTicketResources, checkResourceBudget, localSimRefusal } from './resources.js';
+import { detectResourceCapacity, leaseResources, resolveTicketResources, capUnapprovedCpu, checkResourceBudget, localSimRefusal } from './resources.js';
 import { argvFingerprint } from './cpu-estimates.js';
 import { readRows } from './suggest.js';
 import { rightSizedCpuCores } from './right-size.js';
@@ -90,6 +90,26 @@ function gitRevParse(cwd, arg) {
 function gitTreeAndRoot(cwd) {
   const lines = gitRevParse(cwd, ['HEAD^{tree}', '--show-toplevel'])?.split('\n');
   return { headTree: lines?.[0] || null, checkoutRoot: lines?.[1] || null };
+}
+
+/**
+ * BRAIN-552: the cpuCores `lane` declares under `lanes` in the COMMITTED `.lane-broker.json` (`git show HEAD:`, never the working tree),
+ * or why it is not approved. An explicit lane with no cpuCores claims its weight, as resolveTicketResources does.
+ */
+function committedLaneApproval(checkoutRoot, lane) {
+  if (!checkoutRoot) return { ceiling: null, reason: 'there is no git checkout' };
+  let committed;
+  try {
+    committed = JSON.parse(
+      execFileSync('git', ['show', 'HEAD:.lane-broker.json'], { cwd: checkoutRoot, encoding: 'utf8', env: scrubbedGitEnv(), stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000 }),
+    );
+  } catch {
+    return { ceiling: null, reason: 'there is no committed .lane-broker.json' };
+  }
+  const declared = committed?.lanes && Object.prototype.hasOwnProperty.call(committed.lanes, lane) ? committed.lanes[lane] : null;
+  if (declared === null || typeof declared !== 'object') return { ceiling: null, reason: `lane "${lane}" is not declared in the committed .lane-broker.json` };
+  const ceiling = declared.cpuCores ?? declared.weight;
+  return Number.isFinite(ceiling) ? { ceiling, reason: `the committed .lane-broker.json declares lane "${lane}" at cpu ${ceiling}` } : { ceiling: null, reason: `lane "${lane}" declares no cpu in the committed .lane-broker.json` };
 }
 
 /** git's toplevel is realpath'd, so the fingerprint's cwd must be too; a vanished cwd keeps its given path. */
@@ -343,11 +363,32 @@ export async function runCommand({
   const cmdFingerprint = fingerprintRoot
     ? argvFingerprint(cmd, { root: fingerprintRoot, cwd: realpathOr(cwd), tmp: process.env.TMPDIR || os.tmpdir() })
     : undefined;
+  // an exclusive claims the whole budget, so an elastic floor means nothing
+  const requestedMinCpuCores = exclusive ? undefined : minCpuOverride ?? resolved.minCpuCores ?? undefined;
+  // BRAIN-552: client side only. A runner (configRoot) takes the cores the submitting client already capped, from a snapshot with no git;
+  // an exclusive claims the whole budget by design, so it is not capped here.
+  let requestedCpuCores = cpuOverride ?? resolved.cpuCores ?? weight;
+  let cappedMinCpuCores = requestedMinCpuCores;
+  if (!runnerIntake && !exclusive) {
+    const approval = committedLaneApproval(checkoutRoot, resolved.lane);
+    const cap = capUnapprovedCpu({
+      cpuCores: requestedCpuCores,
+      minCpuCores: requestedMinCpuCores,
+      approvedCeiling: approval.ceiling,
+      maxUnapprovedCpuCores: globalCfg.maxUnapprovedCpuCores,
+    });
+    if (cap.capped) {
+      process.stderr.write(
+        `lane run: cpu ${requestedCpuCores} -> ${cap.cpuCores} (lane "${resolved.lane}": ${approval.reason}; maxUnapprovedCpuCores ${globalCfg.maxUnapprovedCpuCores})\n`,
+      );
+      requestedCpuCores = cap.cpuCores;
+      cappedMinCpuCores = cap.minCpuCores;
+    }
+  }
   const declaredResources = resolveTicketResources({
     weight,
-    cpuCores: cpuOverride ?? resolved.cpuCores,
-    // an exclusive claims the whole budget, so an elastic floor means nothing
-    minCpuCores: exclusive ? undefined : minCpuOverride ?? resolved.minCpuCores ?? undefined,
+    cpuCores: requestedCpuCores,
+    minCpuCores: cappedMinCpuCores,
     memoryBytes: memoryOverride ?? resolved.memoryBytes,
     defaultMemoryBytesPerWeight: globalCfg.defaultMemoryBytesPerWeight,
   });
