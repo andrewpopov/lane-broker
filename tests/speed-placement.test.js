@@ -63,6 +63,21 @@ test('localWaitMs: queued-ahead estimates plus one in-flight run, over the slots
   assert.equal(localWaitMs({ aheadEstimatesMs: [], estimateMs: 100, slots: 0 }), 100);
 });
 
+test('localWaitMs waitedMs floor (BRAIN-556): a head ticket stays local until it has visibly waited longer than the runner takes', () => {
+  const place = (waitedMs) => {
+    const wait = localWaitMs({ aheadEstimatesMs: [], estimateMs: 61_000, slots: 1, waitedMs });
+    return chooseSpeedPlacement({ localAdmitsNow: false, localWaitMs: wait, estimateMs: 61_000, runnerRatio: 5, overheadMs: 60_000 });
+  };
+  assert.equal(place(0).choice, 'local');
+  assert.equal(place(10 * 60_000).choice, 'remote');
+});
+
+test('localWaitMs waitedMs floor never lowers the modelled wait', () => {
+  assert.equal(localWaitMs({ aheadEstimatesMs: [100, 200], estimateMs: 100, slots: 2, waitedMs: 50 }), 200);
+  assert.equal(localWaitMs({ aheadEstimatesMs: [100, 200], estimateMs: 100, slots: 2, waitedMs: 0 }), 200);
+  assert.equal(localWaitMs({ aheadEstimatesMs: [100, 200], estimateMs: 100, slots: 2, waitedMs: 900 }), 900);
+});
+
 test('config: runners[].speedRatio must be a number >= 1; remotePolicy accepts speed-aware', () => {
   const { home } = freshEnv();
   const load = (patch) => {

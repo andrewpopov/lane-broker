@@ -506,7 +506,7 @@ function speedInputs(root, enriched) {
  * of it, from history estimates, spread over the slots of its weight) then running here, or running on `runner` (the run scaled by
  * its measured speed ratio, plus dispatch overhead and, if it too is queued, that queue). One decision, with both estimates.
  */
-function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, probe, queuedChoice) {
+function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, probe, queuedChoice, waitedMs = 0) {
   const queue = listQueue(root).filter(Boolean);
   const own = queue.findIndex((t) => t.id === enriched.id);
   const ahead = own === -1 ? queue : queue.slice(0, own);
@@ -516,7 +516,7 @@ function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, pr
   return {
     ...chooseSpeedPlacement({
       localAdmitsNow: false,
-      localWaitMs: localWaitMs({ aheadEstimatesMs: ahead.map((t) => localRunEstimateMs(rows, t.repoId, t.lane) ?? estimateMs), estimateMs, slots }),
+      localWaitMs: localWaitMs({ aheadEstimatesMs: ahead.map((t) => localRunEstimateMs(rows, t.repoId, t.lane) ?? estimateMs), estimateMs, slots, waitedMs }),
       estimateMs,
       runnerRatio: ratio,
       overheadMs: DEFAULT_REMOTE_OVERHEAD_MS + runnerQueueMs,
@@ -1311,6 +1311,8 @@ async function main() {
    * nothing costs nothing; `runRemoteAttempt` then withdraws it atomically and, on any failure, puts it back where it was. It
    * only returns when the ticket is still queued locally -- a dispatched ticket ends in the process exiting, as ever.
    */
+  const LOCAL_LOG_INTERVAL_MS = 10 * 60_000;
+  let lastLocalLogAt = 0;
   async function tryRebind() {
     // A ticket never goes back to a runner it left, was refused by, or was ever dispatched to (nor to one it is on).
     const attempt = readAttempt(root, ticket.id);
@@ -1318,14 +1320,22 @@ async function main() {
     const candidates = (globalCfg.runners || []).filter((r) => !left.has(r.name));
     if (candidates.length === 0) return;
     // An idle runner is always taken; a runner that is itself queued (up to maxRemoteQueue) only for a ticket stuck locally long enough.
-    const stuckLocally = globalCfg.remoteRebindMinLocalWaitMs > 0 && Date.now() - (readQueuedRecord(root, ticket.id)?.localSince ?? Date.now()) >= globalCfg.remoteRebindMinLocalWaitMs;
+    const waitedMs = Date.now() - (readQueuedRecord(root, ticket.id)?.localSince ?? Date.now());
+    const stuckLocally = globalCfg.remoteRebindMinLocalWaitMs > 0 && waitedMs >= globalCfg.remoteRebindMinLocalWaitMs;
     const { runner, probe, queuedChoice } = await selectRunner(candidates, { ...remoteSelectOptions(enriched, globalCfg), maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0 });
     if (!runner) return;
     // BRAIN-548: a speed-aware ticket moves only when the runner is now expected to finish it sooner than waiting here does.
     const speed = speedInputs(root, enriched);
     if (speed) {
-      const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true);
-      if (decision.choice === 'local') return;
+      const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true, waitedMs);
+      if (decision.choice === 'local') {
+        // BRAIN-556: make a ticket that keeps staying local visible, at most once per 10 min
+        if (Date.now() - lastLocalLogAt >= LOCAL_LOG_INTERVAL_MS) {
+          lastLocalLogAt = Date.now();
+          logSpeedDecision(root, enriched, 'local', `rebind: stay local: local finish ${seconds(decision.localFinishMs)} (waited ${seconds(waitedMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)}`);
+        }
+        return;
+      }
       logSpeedDecision(root, enriched, 'remote', `rebind: local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)})`);
     }
     await runRemoteAttempt(root, enriched, globalCfg, abortController.signal, { generation: attemptGeneration, runner, probe, queued: queuedChoice === true });
