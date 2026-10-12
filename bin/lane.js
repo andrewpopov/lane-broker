@@ -9,6 +9,8 @@ import { waitCommand } from '../src/wait.js';
 import { pauseCommand, resumeCommand, drainCommand, undrainCommand } from '../src/pause.js';
 import { migrateSchedulerCommand } from '../src/migrate.js';
 import { parseByteSize } from '../src/resources.js';
+import { isTicketId } from '../src/state.js';
+import { leaseCheckCommand } from '../src/lease.js';
 import {
   remoteExecCommand,
   remoteProbeCommand,
@@ -36,6 +38,7 @@ function usage() {
   lane suggest [--repo <name>] [--days <n>] [--json]
   lane estimates [--json] [--root <stateHome>]
   lane cancel <id>
+  lane lease-check <id>
   lane priority <id> high|medium|low
   lane wait <id> [--timeout <duration>]
   lane pause ["reason"]
@@ -122,7 +125,7 @@ function parseRunArgs(args) {
         break;
       case '--id': {
         const raw = flagArgs[++i];
-        if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(raw ?? '')) throw new Error(`--id must be 1-128 characters of [A-Za-z0-9._-] (got "${raw}")`);
+        if (!isTicketId(raw)) throw new Error(`--id must be 1-128 characters of [A-Za-z0-9._-] (got "${raw}")`);
         opts.ticketId = raw;
         break;
       }
@@ -216,6 +219,8 @@ async function main() {
       const result = await cancelCommand(id);
       return result.exitCode;
     }
+    case 'lease-check':
+      return leaseCheckCommand(rest).exitCode;
     case 'priority': {
       const unknownOption = rest.find((arg) => arg.startsWith('-'));
       if (unknownOption !== undefined) {

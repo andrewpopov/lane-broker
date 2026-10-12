@@ -44,6 +44,7 @@ lane capabilities --json
 lane suggest [--repo <name>] [--days 7] [--json]
 lane report cost --repo zirkbot,jun --since 2026-10-01 --until 2026-10-08 --prs zirkbot=z.json,jun=j.json [--json]   # gate-cost scorecard (BRAIN-529)
 lane cancel <id>
+lane lease-check <id>                    # exit 0 only if <id> is a live lease on this host (BRAIN-553)
 lane priority <id> high|medium|low       # re-tier a queued ticket in place (BRAIN-518)
 lane wait <id> [--timeout 5m]
 lane pause "reason" | lane resume
@@ -1460,6 +1461,21 @@ or memory reservation. Any other nested key — a
 different repo, or a different lane that isn't `prepush` — is refused with
 exit `64`; v1 has no general lane hierarchy.
 
+**Checking an inherited lease (`lane lease-check <id>`, BRAIN-553).** A non-empty
+`LANE_BROKER_LEASE` proves nothing: anyone can set it, and a hook that runs its suite
+directly whenever it is set lets a made-up value skip the queue. `lane lease-check
+"$LANE_BROKER_LEASE"` exits `0`, printing nothing, only when the id names a live lease
+on this host: a lease record exists, it was written this boot, it is `RUNNING`, and its
+supervisor is the process that took it (start time compared, so a reused pid does not
+count). Anything else (no record, `ORPHANED`, a dead supervisor, an earlier boot, an
+empty or non-ticket-id argument, a missing or extra argument) exits `1` with one line
+on stderr: `lane lease-check: <id> is not a live lease on this host (<reason>)`. A job
+on a remote runner needs no special case: `remote-exec` scrubs the submitter's lease
+and admits the job through the runner's own broker, so the job's `LANE_BROKER_LEASE`
+is the runner-local ticket (`remoteLaneId`), leased in the runner's state dir. A nested
+reentrant `lane run` passes the outer lease id through, which checks as live. A hook
+feature-detects the command with `lease-check/1` in `lane capabilities --json`.
+
 ### Priority (foundations, BRAIN-380 slice 1)
 
 Without the scheduler fence (next section) the scheduler is strictly FIFO: tiers
@@ -1951,7 +1967,7 @@ cores a test needs:
 
 Prints one JSON line: `{"version", "capabilities": [...], "schedulerMode", "admissionMode", "classes": {"mode", "configHash", "stateRoot", "valid"}}`. `capabilities` is the
 same list `lane remote-probe` advertises (`elastic-claims/1`, `priority/1`, `artifacts/1`, `sim-safe-backfill/1`,
-`lane-aging/1`, `group-reap/1`, `remote-withdraw/1`, `exclusive/1`, `attempt-logpath/1`: a remote attempt record carries the submitter's `logPath` and `cwd`, so a caller that crashed between `lane run --detach` and learning the id can find its attempt by `--log` path, BRAIN-462, `classes/1`, `remote-drain/1`, `queue-retier/1`: `lane priority` works on a ticket queued here). `classes` reports the work-class caps in force (see "Work classes and per-machine caps"). `schedulerMode` is `priority` when a valid `sched-v2.json` fence is present and
+`lane-aging/1`, `group-reap/1`, `remote-withdraw/1`, `exclusive/1`, `attempt-logpath/1`: a remote attempt record carries the submitter's `logPath` and `cwd`, so a caller that crashed between `lane run --detach` and learning the id can find its attempt by `--log` path, BRAIN-462, `classes/1`, `remote-drain/1`, `queue-retier/1`: `lane priority` works on a ticket queued here, `lease-check/1`: `lane lease-check <id>` exists, BRAIN-553). `classes` reports the work-class caps in force (see "Work classes and per-machine caps"). `schedulerMode` is `priority` when a valid `sched-v2.json` fence is present and
 `legacy` otherwise; `admissionMode` is the global config's `schedulerMode` (`active` or `shadow`). A caller that needs
 a feature (for example a pool gate that requires `group-reap/1`) checks this before relying on it.
 
