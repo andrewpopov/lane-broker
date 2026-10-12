@@ -20,6 +20,7 @@ import { defaultRemoteRoot } from './remote-runner.js';
 import { effectiveNow } from './priority-clock.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView } from './fairness.js';
 import { readTicketWait, waitLabel } from './ticket-wait.js';
+import { loadExpressTable, expressVerdict } from './express.js';
 import { exclusiveHoldView, clampQueuedWeight } from './exclusive.js';
 import { priorityOf, effectiveRank, tierName } from './priority.js';
 import { leaseOverrun } from './observed.js';
@@ -226,7 +227,9 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       // matching resolveTicketConfig's own compatibility default.
       maxConcurrent: l.maxConcurrent ?? 1,
       resources: leaseResources(l, cfg),
-      ...(Number.isFinite(l.grantedCpuCores) ? { declaredCpuCores: l.resources?.cpuCores ?? l.weight, grantedCpuCores: l.grantedCpuCores } : {}),
+      ...(Number.isFinite(l.grantedCpuCores) || l.declaredCpuCores !== undefined
+        ? { declaredCpuCores: l.declaredCpuCores ?? l.resources?.cpuCores ?? l.weight, grantedCpuCores: leaseCpuCores(l), ...(l.declaredCpuCores !== undefined ? { rightSized: true } : {}) }
+        : {}),
       observedCpuCores: l.observedCpuCores ?? null,
       // BRAIN-361: report-only; never read by admission
       bookedCpuCores: leaseCpuCores(l) ?? null,
@@ -253,6 +256,8 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     ? effectiveView(rawQueue, nowEff, cfg, store, classPolicy.eligible, { simsAfterTests: classPolicy.simsAfterTests })
     : { queue: rawQueue, ownerId: null };
   const queue = [...fullQueue.filter((t) => t === null || classPolicy.eligible(t)), ...fullQueue.filter((t) => t !== null && !classPolicy.eligible(t))];
+  // BRAIN-551: built only for a non-empty queue, in memory (status never writes).
+  const expressTable = queue.some(Boolean) ? loadExpressTable(root, now, { write: false }) : null;
   const queued = queue.map((t, i) => {
     const rank = effectiveRank(t, nowEff, cfg);
     const tier = priorityOf(t);
@@ -267,6 +272,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       ...(t.id === reservationOwnerId ? { reservationOwner: true } : {}),
       ...(classPolicy.capEnforced.has(t.id) ? { classDenied: classPolicy.capEnforced.get(t.id) } : {}),
       ...(t.exclusive === true ? { exclusive: true } : {}),
+      ...(t.exclusive !== true && cfg.expressMaxMs > 0 && expressVerdict(expressTable, t, cfg) ? { express: true } : {}),
       ...(tierName(rank) !== tier ? { effectiveRank: tierName(rank) } : {}),
       resources: leaseResources(t, cfg),
       cpuEstimate: ticketCpuEstimateBasis(t, cfg, now, held.length > 0 ? cpuBudget({ cores: resourceCapacity.cpuCores }, cfg) : undefined),
@@ -398,8 +404,9 @@ function computeClasses(cfg, root, held, host) {
   };
 }
 
-/** BRAIN-360: shown only when admission granted less CPU than the lane declared. */
+/** BRAIN-360: shown only when admission granted less CPU than the lane declared; BRAIN-550: `declared\u2192granted` for a right-sized one. */
 function elasticNote(r) {
+  if (r.rightSized) return `  cpu ${r.declaredCpuCores}\u2192${r.grantedCpuCores} (right-sized)`;
   return r.grantedCpuCores < r.declaredCpuCores ? `  cpu=${r.grantedCpuCores}/${r.declaredCpuCores} (elastic)` : '';
 }
 
@@ -600,7 +607,7 @@ export function renderStatusText(status) {
   } else {
     for (const q of status.queued) {
       const tier = q.priority ? `  priority=${q.priority}${q.effectiveRank ? ` (aged to ${q.effectiveRank})` : ''}` : '';
-      lines.push(`  #${q.position} ${q.id}  key=${q.key}${q.cpuEstimate ? `  cpu~${q.cpuEstimate.cores.toFixed(2)}(${q.cpuEstimate.source})` : ''}  waited=${fmtMs(q.waitedMs)}${tier}${q.reservationOwner ? '  [reservation owner]' : ''}${q.exclusive ? '  [exclusive]' : ''}${q.wait ? `  waiting: ${q.wait.label}` : ''}`);
+      lines.push(`  #${q.position} ${q.id}  key=${q.key}${q.cpuEstimate ? `  cpu~${q.cpuEstimate.cores.toFixed(2)}(${q.cpuEstimate.source})` : ''}  waited=${fmtMs(q.waitedMs)}${tier}${q.reservationOwner ? '  [reservation owner]' : ''}${q.exclusive ? '  [exclusive]' : ''}${q.express ? '  [express]' : ''}${q.wait ? `  waiting: ${q.wait.label}` : ''}`);
     }
   }
   if (status.remote) {

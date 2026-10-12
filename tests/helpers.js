@@ -30,6 +30,7 @@ const INHERITED_BROKER_VARS = [
   'LANE_BROKER_LOCAL',
   'LANE_BROKER_LOCAL_REASON',
   'LANE_BROKER_PRIORITY',
+  'LANE_BROKER_NO_CACHE',
 ];
 
 /** `process.env` with every ambient broker variable removed, so a test's environment is decided by

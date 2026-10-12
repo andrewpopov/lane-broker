@@ -29,7 +29,7 @@ import { phasesReportCommand } from '../src/phases-report.js';
 
 function usage() {
   return `Usage:
-  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--exclusive] [--detach [--id <ticket-id>]]
+  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--exclusive] [--no-cache] [--detach [--id <ticket-id>]]
            [--timeout <duration>] [--allow-local-sim] [--local] [--log <path>] -- <command...>
   lane status [--json]
   lane capabilities --json
@@ -93,6 +93,9 @@ function parseRunArgs(args) {
         break;
       case '--exclusive':
         opts.exclusive = true;
+        break;
+      case '--no-cache':
+        opts.noCache = true;
         break;
       case '--detach':
         opts.detach = true;
@@ -172,6 +175,7 @@ async function main() {
         memoryOverride: opts.memoryOverride,
         priority: opts.priority,
         exclusive: opts.exclusive,
+        noCache: opts.noCache,
         detach: opts.detach,
         timeoutMs: opts.timeout ? parseDurationMs(opts.timeout) : undefined,
         allowLocalSim: opts.allowLocalSim,

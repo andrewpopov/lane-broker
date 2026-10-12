@@ -15,7 +15,8 @@ import { resolveClasses, classEnforcementOf, bookedSims, classQueuePolicy, capSi
 import { reconcileSimArm, touchSimArmFor } from './sim-arm.js';
 import { advanceHwm } from './priority-clock.js';
 import { isExclusive, exclusiveDeny, isExclusiveHead, exclusiveLeaseFields, withoutBackfillExclusives, clampQueuedWeight } from './exclusive.js';
-import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, effectiveRank, score } from './priority.js';
+import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, effectiveRank, score, waitedMs } from './priority.js';
+import { loadExpressTable, expressVerdict, expressAdmissionsLastMinute, recordExpressAdmission, logExpressAdmission } from './express.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { resolveScheduler, resolveSchedulerDetailed, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
 import { detectResourceCapacity, effectiveWeightCapacity, exclusiveBudget, cpuBudgetCores, evaluateMemoryAdmission, leaseResources, resolveTicketResources, terminalRowDefaults, capElasticClaim, elasticBelowFloor, elasticClaimRange } from './resources.js';
@@ -1283,6 +1284,25 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       // an unreadable (null) ticket ahead of this one stops backfill, as it stops every selector's walk
       queue.slice(0, position).every(Boolean) &&
       cannotDelayHead(ticket);
+    // BRAIN-551: a ticket expected to run under expressMaxMs starts past the head as soon as it fits NOW (its own conflicts,
+    // weight capacity, CPU and memory below), uncounted against every skip allowance and bounded to expressPerMinute starts
+    // per minute. Once the head has waited expressHeadMaxWaitMs it must also pass BRAIN-355's cannot-delay proof, with the
+    // head's claim reserved. Cheap tests first: the estimate table is read only for a ticket that could start.
+    const headWaitedMs = waitedMs(headTicket, nowEff);
+    const expressHeadProtected = headWaitedMs > cfg.expressHeadMaxWaitMs;
+    const expressEligible =
+      cfg.expressMaxMs > 0 &&
+      !safeBackfill &&
+      ticket.id !== headTicket.id &&
+      !isExclusive(ticket) &&
+      !(simHoldsBack && classOf(ticket) === 'sim') &&
+      queue.slice(0, position).every(Boolean) &&
+      !blockedBy(held, ticket) &&
+      runningWeight + ticket.weight <= weightCapacity &&
+      (!expressHeadProtected || cannotDelayHead(ticket)) &&
+      expressAdmissionsLastMinute(root, now) < cfg.expressPerMinute;
+    const express = expressEligible ? expressVerdict(loadExpressTable(root, now), ticket, cfg) : null;
+    const expressAdmit = express !== null;
     const walkQueue = withoutBackfillExclusives(simHoldsBack ? queue.filter((t, i) => i === 0 || t === null || classOf(t) !== 'sim') : queue);
     // BRAIN-365: the first non-conflicting ticket behind a conflicted head may be one that admission
     // keeps denying projected-over-budget, which would pin every smaller ticket behind it. That
@@ -1297,7 +1317,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     const dropPickRecord = () => {
       if (conflictPick && ticket.id === conflictPick.id) store.dropResourceRecord(headTicket.id);
     };
-    const candidate = safeBackfill
+    const candidate = safeBackfill || expressAdmit
       ? ticket
       : headConflicted
       ? (skipExhausted ? (safeBackfill ? ticket : null) : conflictPick ?? selectCandidate(walkQueue, held))
@@ -1404,7 +1424,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // BRAIN-355: a safe backfill must leave room for the blocked head once its conflict clears, so
     // the head's claim joins the held leases for the CPU projection and memory admission.
     const headReservation = { id: headTicket.id, key: headTicket.key, configLane: headTicket.configLane, cmdFingerprint: headTicket.cmdFingerprint, weight: headTicket.weight, resources: headTicket.resources };
-    const admissionHeld = safeBackfill || conflictPick ? [...held, headReservation] : held;
+    const admissionHeld = safeBackfill || conflictPick || (expressAdmit && expressHeadProtected) ? [...held, headReservation] : held;
     const fullDecision = evaluateNewAdmission(root, cfg, ticket, admissionHeld, cpuSample, memInfo);
     // BRAIN-360: an elastic ticket (resources.minCpuCores) denied ONLY by the CPU projection is
     // re-evaluated at smaller claims, over the same held leases (and, for a safe backfill, the same
@@ -1562,7 +1582,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
         if (headFutile) recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState, false, headFutile);
         else if (resourceDenied) recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState);
         else if (cpuDecision.cpuReason !== 'cooldown') markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
-      } else if (headConflicted && !skipExhausted && resourceDenied && !safeBackfill) {
+      } else if (headConflicted && !skipExhausted && resourceDenied && !safeBackfill && !expressAdmit) {
         recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState, true);
       } else if (cpuDecision.cpuReason !== 'cooldown') {
         dropPickRecord();
@@ -1580,7 +1600,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       };
     }
     let recorded = null;
-    if (ticket.id !== headTicket.id && headConflicted && !safeBackfill) {
+    if (ticket.id !== headTicket.id && headConflicted && !safeBackfill && !expressAdmit) {
       // This ticket is genuinely skipping ahead of the still-blocked head —
       // count it toward conflictSkipLimit above. Fail CLOSED: if the count
       // can't be durably recorded, refuse the skip rather than let it
@@ -1588,7 +1608,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       if (!recordSkip(root, store, headTicket.id, now)) {
         return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
       }
-    } else if (ticket.id !== headTicket.id && headCapacityBlocked) {
+    } else if (ticket.id !== headTicket.id && headCapacityBlocked && !expressAdmit) {
       // BRAIN-249 part 2: same event, same fail-CLOSED discipline as the
       // conflict branch above, for a ticket genuinely skipping ahead of a
       // head that doesn't fit capacity (see recordCapacitySkip's doc
@@ -1596,7 +1616,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       if (!recordCapacitySkip(root, store, headTicket.id)) {
         return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
       }
-    } else if (ticket.id !== headTicket.id && !safeBackfill && resourceBackfill && !resourceFutile(resourceRecord, cfg, now)) {
+    } else if (ticket.id !== headTicket.id && !safeBackfill && !expressAdmit && resourceBackfill && !resourceFutile(resourceRecord, cfg, now)) {
       // BRAIN-346: same event, same fail-CLOSED discipline; a refused write never restarts the allowance.
       recorded = recordResourceBackfill(root, store, cfg, resourceRecord, writeResourceState);
       if (!recorded) {
@@ -1620,6 +1640,10 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
         result: { started: false, reason: 'cancelled' },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'cancelled' },
       };
+    }
+    // Same fail-CLOSED discipline as the skips above: an express start whose count is not durable would escape the rate cap.
+    if (expressAdmit && !recordExpressAdmission(root, now)) {
+      return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
     }
     dequeueSync(root, ticket.id);
     // BRAIN-380 §8: what the scheduler saw at admission, from this ticket's own queue record (the supervisor's copy of
@@ -1653,6 +1677,8 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       resources: submitted.resources,
       // BRAIN-360: elastic lanes only; what admission actually charged. `resources.cpuCores` stays the declaration.
       ...(submitted.resources?.minCpuCores !== undefined ? { grantedCpuCores } : {}),
+      // BRAIN-550: the declaration a right-sized request replaced, so a held-lease view can show declared -> granted
+      ...(submitted.declaredCpuCores !== undefined ? { declaredCpuCores: submitted.declaredCpuCores } : {}),
       // BRAIN-255: carried onto the lease (not just the ticket) so a
       // held-lease-only view — status.js's report, or a later poll's
       // `blockedBy` call against a DIFFERENT ticket of the same key — can
@@ -1682,6 +1708,17 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
         skipLimit: cfg.conflictSkipLimit,
         graceMs: cfg.headBlockGraceMs,
         blockedMs: headBlock?.blockedMs ?? 0,
+      });
+    }
+    if (expressAdmit) {
+      logExpressAdmission(root, {
+        candidateId: ticket.id,
+        headId: headTicket.id,
+        expectedMs: express.ms,
+        source: express.source,
+        headWaitedMs,
+        inLastMinute: expressAdmissionsLastMinute(root, now),
+        limit: cfg.expressPerMinute,
       });
     }
     const events = [];

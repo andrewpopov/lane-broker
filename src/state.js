@@ -65,6 +65,9 @@ export function paths(root = stateHome()) {
     cpuSample: path.join(root, 'cpu-sample.json'),
     cpuGate: path.join(root, 'cpu-gate.json'),
     admissionLog: path.join(root, 'admission-decisions.log'),
+    // BRAIN-551: p50 run time per (repo, lane[, command]) from history, and this host's express admissions in the last minute.
+    expressEstimates: path.join(root, 'express-estimates.json'),
+    expressAdmissions: path.join(root, 'express-admissions.json'),
     // BRAIN-438: the last admission decision written per candidate, so an unchanged one is not written again.
     admissionLast: path.join(root, 'admission-last.json'),
     // BRAIN-438: when the opportunistic logs/results sweep last ran (src/gc.js).

@@ -86,6 +86,7 @@ features like pipes or globbing.
 | `--id <ticket-id>` | With `--detach` only: a client-supplied ticket id (`[A-Za-z0-9._-]`, up to 128 chars) that makes the submission idempotent. An id the broker already knows (queued, leased, finished or mid remote attempt) is returned as the same ticket: no new queue sequence and, for a remote-eligible lane, no second dispatch (the check runs before any probe). A remote-eligible lane needs a UUID id. |
 | `--priority high\|medium\|low` | BRAIN-380 priority tier (default `medium`). Beats env `LANE_BROKER_PRIORITY`, which beats the lane's `priority` in `.lane-broker.json` (an `undeclaredLanes.as` template passes its tier on), which beats `medium`. Any invalid value from any of the three exits `64`. See "Priority (foundations)" below. |
 | `--exclusive` | BRAIN-403 v1: claim the whole host for this run. See "Exclusive lanes (BRAIN-403 v1)" below. The lane config key `lanes.<name>.exclusive: true` does the same. |
+| `--no-cache` | BRAIN-549: run even if the same command already passed on identical content (env `LANE_BROKER_NO_CACHE=1` does the same). See "Result cache" below. |
 | `--detach` | Print the run id and return immediately instead of waiting. |
 | `--timeout <duration>` | e.g. `30s`, `5m`, `500ms`. Exit `75` if not finished in time — see below. |
 | `--allow-local-sim` | Override a lane's `localRefused: true`. |
@@ -1132,7 +1133,7 @@ starts only when **all** of:
 - the broker is not paused.
 
 **Fairness and backfill.** The queue is FIFO, and a head that cannot start may
-be overtaken only in three bounded ways, each with its own allowance and each
+be overtaken only in three bounded ways (plus express admission, below), each with its own allowance and each
 ending in strict FIFO for that head once spent:
 
 - *Conflict* (`conflictSkipLimit`, default 3): a head blocked by a lane-key
@@ -1177,6 +1178,28 @@ ending in strict FIFO for that head once spent:
   are dropped only when the ticket starts or leaves the queue, or the limit is 0). A backfill whose count cannot be written to disk is
   refused, never uncounted. `resourceSkipLimit: 0` restores strict FIFO for
   resource denials.
+
+**Express admission** (BRAIN-551). A ticket expected to run under `expressMaxMs`
+(default 30000) starts past a waiting head as soon as it fits *now*, so a
+10-second check does not queue behind a 30-minute job. Expected run time is the
+median (p50) of this machine's local history for the ticket's exact command
+(`cmdFingerprint`), else for its `(repo, lane)`, with at least 3 runs; no
+history means not express. The ticket still has to pass everything else:
+its own conflicts and key serialization (`maxConcurrent`), weight capacity, the
+CPU projection and memory. An express start is not counted against any skip
+allowance above, and a sim never uses it behind a test head. Two bounds keep the
+head from starving:
+
+- at most `expressPerMinute` (default 6) express starts per minute per host
+  (`express-admissions.json`);
+- once the head has waited `expressHeadMaxWaitMs` (default 15 minutes), an
+  express ticket starts only if it provably cannot delay the head: BRAIN-355's
+  test, with the head's claim reserved for CPU and memory.
+
+Each express start is logged in `admission-decisions.log` as
+`lane-broker-express event=express-admit`, and `lane status` marks queued
+express tickets `[express]` (JSON: `express: true`). The estimates are cached in
+`express-estimates.json` for 5 minutes. `expressMaxMs: 0` turns it off.
 
 **Bounded idle exemption** (`resourceIdleOvershootCores`, default 1; `0`
 disables): ambient load can make a large lane unsatisfiable even with nothing
@@ -1265,6 +1288,30 @@ judged on the FULL claim, since it would be dispatched the full claim and refuse
 it terminally (exit 64) if its budget is smaller. Upgrade runners before relying
 on elasticity.
 
+### Right-sized CPU requests (`rightSizeFromHistory`, BRAIN-550)
+
+A lane's declared `cpuCores` is usually a ceiling, not what it uses (24 h of runs: the median run used about 68% of its
+reserved cores), and a runner refuses work while the reservations, not the busy cores, fill its budget. So once a
+(repo, lane) has **5 finished runs with `observedCpu`** in the last 14 days (most recent 50; runs under 2 minutes are skipped, as in
+`lane suggest`), `lane run` requests
+
+    target = ceil(p90 of per-run mean cores x 1.2), clamped to [minCpuCores or 1, declared cpuCores]
+
+instead of the declaration. The request is what admission charges, what the lease and the history row record as
+`grantedCpuCores`, what a remote runner is asked to reserve, and what the child sees in `LANE_BROKER_CPU_CORES`. Elastic grants
+still apply below it, down to `minCpuCores`. A run granted less than it requested counts at its requested-equivalent
+(`mean / granted x requested`), so a throttled run cannot talk the lane down further. With fewer than 5 samples nothing changes.
+
+Never right-sized: an explicit `--cpu`, an `exclusive` lane, a lane with `rightSize: false`, and every lane when the global
+`rightSizeFromHistory` is `false` (default `true`). Memory and weight are untouched. Because the request follows the grant, a
+lane whose workers size from `LANE_BROKER_CPU_CORES` can only drift down while its p90 mean stays under the request divided by 1.2;
+set `rightSize: false` (or `--cpu`) on a lane that must keep its declared width.
+
+`lane status` shows `cpu <declared>→<granted> (right-sized)` on a running lease; `--json` carries `declaredCpuCores`,
+`grantedCpuCores` and `rightSized`. The history row records `requestedCpuCores` (what admission was asked for) and, only
+when it differs from the declaration, `declaredCpuCores`. `lane suggest` reads `resources.cpuCores`, which is now the right-sized
+request, so its `declared=` column shows that request once a lane is right-sized.
+
 ### `history.jsonl` record schema (BRAIN-425)
 
 One JSON object per line, appended when a run reaches a terminal outcome. Every field except the identity and timing ones is
@@ -1278,6 +1325,7 @@ additive: readers must ignore unknown keys and tolerate absent ones.
 | `cancelled`, `reason`, `error` | cancel flag; refusal/reap reason; supervisor-level error text |
 | `startedAt`, `endedAt`, `waitedMs`, `queuedAt` | epoch ms; `waitedMs` is queue wait (`null` when unknown) |
 | `grantedCpuCores`, `grantedMemoryBytes` | what the lane was charged: the elastic grant, else the declared reservation |
+| `requestedCpuCores`, `declaredCpuCores` | BRAIN-550: the CPU admission was asked for (right-sized from history; the declaration otherwise), and the declaration it replaced, present only when right-sizing lowered it |
 | `observedCpu` `{peak, mean, samples}`, `observedRssPeakBytes` | heartbeat observations (see above) |
 | `cpuSeconds` | CPU seconds of the lease's process tree, an **estimate**: the heartbeat core samples integrated over time, the first reading held back to the start and the last forward to the end. Not rusage: `ps` pcpu is a decayed average and a supervisor cannot read reaped grandchildren's rusage |
 | `depsCache`, `depsMs` | remote deps phase outcome (`hit`/`miss`/`skip`) and wall time |
@@ -1285,6 +1333,7 @@ additive: readers must ignore unknown keys and tolerate absent ones.
 | `remoteArtifacts`, `remoteArtifactsWarning` | returned artifact names / why they were not |
 | `remoteOmittedSymlinks`, `remoteOmittedSymlinkNames` | remote runs with `remoteOmitEscapingSymlinks`: how many escaping symlinks the snapshot left out, and the first 10 paths |
 | `priorityRequested`, `priorityAdmitted`, `priorityDemoted`, `effectiveRankAtStart`, `scoreAtStart` | priority audit (admitted tickets only) |
+| `contentKey`, `cachedFrom` | BRAIN-549: the run's result-cache key (on every keyed run; a pass keeps it only if the worktree still matched at the end), and on a cache answer the id of the run it was served from (`runMs: 0`, no `contentKey`) |
 | `dequeuedDeadSupervisor` | marks a row for a queued ticket whose supervisor died (`exit: null`, `signal: null`) |
 
 A runner's `result.json` carries the same `cpuSeconds` and a `phasesMs` object; the submitter folds them into its own row.
@@ -1671,6 +1720,34 @@ keyed by (repo, lane): n, censored count, p50/p90 (seconds), `est_source` and th
 skipped (counted); a run killed by an unrequested signal is censored. History rows carry no
 class, so a lane named like a sim (`sim`, `sims`, `sim-*`) is a sim, else a test. The host
 factor is 1.0 (no calibration) and is printed.
+
+### Result cache (BRAIN-549)
+
+`lane run` answers from history when the same command already **passed** on byte-identical worktree content: it prints
+`lane: cached pass from <id> at <time> (pass --no-cache to re-run)` to stderr, exits `0` without running anything, and
+appends a history row with `cachedFrom: <id>` and `runMs: 0` (so `lane report cost` counts no work for it). The lookup
+happens before admission: no ticket, no queue, no lease.
+
+The content key is a sha256 over: the lane key (repo + lane), the command fingerprint (argv and cwd), HEAD's tree, the
+binary-safe `git diff HEAD` (every tracked edit, staged or not, deletions and mode changes) and the sorted path, mode
+and content hash of every untracked, non-ignored file. Only an exit-`0` run with the same key inside `resultCacheTtlSec`
+is served; a failed, signalled, cancelled or refused run never is, and a cached row never renews the pass it points to.
+Every keyed run stores `contentKey` on its history row; a pass keeps it only if the worktree still hashes to the same
+key when the run ends (a run that edits the tree, or an edit made while it queued or ran, leaves nothing to serve).
+
+It gives no key, so the run simply executes, when: the command has no fingerprint or the directory is not a git checkout
+with a HEAD; the checkout has a `.gitmodules`; a tracked file is flagged assume-unchanged or skip-worktree (git diff
+cannot see edits to it); there are more than 2000 untracked files or more than 64 MiB of them, or one is not a regular
+file or symlink; or any git call fails.
+
+**What is not in the key.** Ignored files (`node_modules`, build output, `.env`) and the environment are not. The key says
+"same source", not "same machine": a command whose result depends on an env var, the clock, the network or an ignored
+file should opt out (below), or its pass can be served when it would now fail.
+
+Opt-outs: `--no-cache`, env `LANE_BROKER_NO_CACHE=1`, `"cache": false` on a lane in `.lane-broker.json` (inherited by
+an `undeclaredLanes.as` template's lanes), and global `resultCacheTtlSec` (default `86400`; `0` turns it off, no keys are
+recorded either). Never cached: exclusive lanes, `--detach` runs (they return an id to wait on; they still record a key),
+nested runs under an inherited lease, and a runner's `remote-exec` intake.
 
 ### Exclusive lanes (BRAIN-403 v1)
 

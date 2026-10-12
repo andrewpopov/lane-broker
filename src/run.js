@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { ensureStateDirs, paths, readJsonSafe, LockTimeoutError, MigrationInProgressError, assertNotMigrating, isUuid } from './state.js';
+import { ensureStateDirs, paths, stateHome, readJsonSafe, appendHistory, LockTimeoutError, MigrationInProgressError, assertNotMigrating, isUuid } from './state.js';
 import { classTransportMismatch } from './classes.js';
 import { resolveTicketConfig, reloadGlobalConfig, resolvePriority, assertHostConfigHookless, ConfigError } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
@@ -12,8 +12,11 @@ import { listQueue } from './scheduler.js';
 import { stampPriorityOrigin } from './priority-clock.js';
 import { detectResourceCapacity, leaseResources, resolveTicketResources, checkResourceBudget, localSimRefusal } from './resources.js';
 import { argvFingerprint } from './cpu-estimates.js';
+import { readRows } from './suggest.js';
+import { rightSizedCpuCores } from './right-size.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
 import { isExclusive, oversizedWeight, oversizedWeightMessage } from './exclusive.js';
+import { computeContentKey, findCachedPass } from './result-cache.js';
 
 const supervisorPath = fileURLToPath(new URL('./supervisor.js', import.meta.url));
 
@@ -211,6 +214,8 @@ export async function runCommand({
   noProgressTimeoutOverride,
   // BRAIN-403: `--exclusive`; the lane config's `exclusive` is the other way in
   exclusive: exclusiveOverride,
+  // BRAIN-549: `--no-cache` (env LANE_BROKER_NO_CACHE=1 is the other way): run even when a cached pass exists
+  noCache,
   detach,
   timeoutMs,
   allowLocalSim,
@@ -338,7 +343,7 @@ export async function runCommand({
   const cmdFingerprint = fingerprintRoot
     ? argvFingerprint(cmd, { root: fingerprintRoot, cwd: realpathOr(cwd), tmp: process.env.TMPDIR || os.tmpdir() })
     : undefined;
-  const resources = resolveTicketResources({
+  const declaredResources = resolveTicketResources({
     weight,
     cpuCores: cpuOverride ?? resolved.cpuCores,
     // an exclusive claims the whole budget, so an elastic floor means nothing
@@ -346,6 +351,20 @@ export async function runCommand({
     memoryBytes: memoryOverride ?? resolved.memoryBytes,
     defaultMemoryBytesPerWeight: globalCfg.defaultMemoryBytesPerWeight,
   });
+  // BRAIN-550: an explicit --cpu is the caller's own claim, and an exclusive claims the whole budget; neither is right-sized
+  const rightSized =
+    globalCfg.rightSizeFromHistory && resolved.rightSize && !exclusive && cpuOverride === undefined
+      ? rightSizedCpuCores(readRows(paths(stateHome()).history), {
+          repoId: resolved.repoId,
+          lane: resolved.configLane ?? resolved.lane,
+          declared: declaredResources.cpuCores,
+          floor: declaredResources.minCpuCores ?? 1,
+        })
+      : null;
+  const resources =
+    rightSized && rightSized.cpuCores < declaredResources.cpuCores
+      ? resolveTicketResources({ weight, cpuCores: rightSized.cpuCores, minCpuCores: declaredResources.minCpuCores, memoryBytes: declaredResources.memoryBytes })
+      : declaredResources;
   const inheritedLease = process.env.LANE_BROKER_LEASE;
   const inheritedKey = process.env.LANE_BROKER_KEY;
   if (inheritedLease) {
@@ -441,6 +460,37 @@ export async function runCommand({
   }
 
   const root = ensureStateDirs().root;
+  // BRAIN-549: a run gets a content key unless caching is off for it; a runner (snapshot intake) and an exclusive never cache.
+  const cacheTtlMs = globalCfg.resultCacheTtlSec * 1000;
+  const contentKey = !runnerIntake && !exclusive && resolved.cache && cacheTtlMs > 0 ? computeContentKey({ cwd, key: resolved.key, cmdFingerprint }) : null;
+  // A detached caller waits on a ticket id, which a cached answer has none of, so it always runs (and still records its key).
+  if (contentKey && !detach && !noCache && process.env.LANE_BROKER_NO_CACHE !== '1') {
+    const now = Date.now();
+    const hit = findCachedPass(readRows(paths(root).history), { contentKey, now, ttlMs: cacheTtlMs });
+    if (hit) {
+      process.stderr.write(`lane: cached pass from ${hit.id} at ${new Date(hit.endedAt).toISOString()} (pass --no-cache to re-run)\n`);
+      appendHistory(root, {
+        id: crypto.randomUUID(),
+        key: resolved.key,
+        repo: resolved.repoId,
+        lane: resolved.lane,
+        ...(resolved.configLane ? { configLane: resolved.configLane } : {}),
+        weight,
+        command: cmd.join(' ').slice(0, HISTORY_COMMAND_MAX),
+        cmdFingerprint,
+        headTree,
+        exit: 0,
+        signal: null,
+        startedAt: now,
+        endedAt: now,
+        waitedMs: 0,
+        runMs: 0,
+        executor: 'local',
+        cachedFrom: hit.id,
+      });
+      return { exitCode: 0 };
+    }
+  }
   // BRAIN-380: the priority origin is `nowEff`, stamped under the broker lock in the same transaction that
   // advances the high-water mark. Under lock contention there is no trustworthy `nowEff` to read: an unlocked read
   // can be BEHIND the mark, which would back-date the origin and invent age. The origin is left null instead, and
@@ -486,6 +536,7 @@ export async function runCommand({
     ...(resolved.configLane ? { configLane: resolved.configLane } : {}),
     weight,
     resources,
+    ...(resources !== declaredResources ? { declaredCpuCores: declaredResources.cpuCores } : {}),
     nice,
     // BRAIN-506: only the lane's own override; a remote ticket runs at it, else at the RUNNER's laneNice (never this host's), which the runner-room check needs to know
     ...(resolved.nice !== undefined && resolved.nice !== null ? { niceOverride: resolved.nice } : {}),
@@ -521,6 +572,7 @@ export async function runCommand({
     command: cmd.join(' ').slice(0, HISTORY_COMMAND_MAX),
     ...(cmdFingerprint ? { cmdFingerprint } : {}),
     ...(headTree ? { headTree } : {}),
+    ...(contentKey ? { contentKey } : {}),
     ...(localReason ? { localReason } : {}),
     ...(localReason && localReason === forced && localReasonText ? { localReasonText } : {}),
     // BRAIN-442: a local-first lane enqueues locally and only becomes rebind-eligible after its wait (lane value, else global)

@@ -43,6 +43,7 @@ import { writeBrokerLog, OBSERVED_HISTORY_MAX } from './admission.js';
 import { relayedUsage, relayedDeps } from './remote-relay.js';
 import { maybeDailyGc } from './gc.js';
 import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, noProgressMessage } from './no-progress.js';
+import { settledContentKey, isCleanPass } from './result-cache.js';
 import { observedLeaseFields, summarizeObservedCpu, sanitizeRssPeak, integratedCpuSeconds } from './observed.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
@@ -442,7 +443,7 @@ function localRefusalResult(ticket, refusal) {
  * the `result` spread); `localReason` is the ticket's creation-time reason, or
  * `fallback:<reason>` when a remote attempt fell back to local.
  */
-function historyRow(ticket, result, { fallbackReason, lease } = {}) {
+function historyRow(ticket, result, { fallbackReason, lease, contentKey = isCleanPass(result) ? undefined : ticket.contentKey } = {}) {
   const executor = result.executor ?? 'local';
   const localReason = executor === 'local' ? (fallbackReason === undefined ? ticket.localReason : `fallback:${fallbackReason}`) : undefined;
   return {
@@ -455,9 +456,13 @@ function historyRow(ticket, result, { fallbackReason, lease } = {}) {
     ...(ticket.exclusive === true ? { exclusive: true } : {}),
     weight: ticket.weight,
     resources: ticket.resources,
+    // BRAIN-550: what admission was asked for (right-sized from history), and the declaration it replaced when they differ
+    ...(Number.isFinite(ticket.resources?.cpuCores) ? { requestedCpuCores: ticket.resources.cpuCores } : {}),
+    ...(ticket.declaredCpuCores !== undefined ? { declaredCpuCores: ticket.declaredCpuCores } : {}),
     command: ticket.command,
     ...(ticket.cmdFingerprint ? { cmdFingerprint: ticket.cmdFingerprint } : {}),
     headTree: ticket.headTree,
+    ...(contentKey ? { contentKey } : {}),
     // BRAIN-380 §8: only a ticket that was admitted has a lease, so only its row carries the admission audit
     ...priorityAuditOf(lease),
     // BRAIN-425: every row states what the lane was granted and how it ended; a grant or exit in `result` wins
@@ -595,8 +600,10 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
 
   let selectedRunner = null;
   function writeResultSync(result) {
+    // BRAIN-549: settled before the result is published, so a caller that reads history once `lane run` returns finds the row
+    const contentKey = settledContentKey(enriched, result);
     atomicWriteJson(enriched.resultPath, result);
-    appendHistory(root, historyRow(enriched, { ...result, ...(selectedRunner ? { runner: selectedRunner } : {}) }));
+    appendHistory(root, historyRow(enriched, { ...result, ...(selectedRunner ? { runner: selectedRunner } : {}) }, { contentKey }));
   }
 
   /**
@@ -1628,8 +1635,10 @@ async function main() {
       if (cpuSeconds !== undefined) finalResult = { ...finalResult, cpuSeconds };
       // BRAIN-431: the longest stretch with no output and no CPU, whether or not the opt-in kill is on (monitoring reads it)
       finalResult = { ...finalResult, maxNoProgressMs: Math.round(watchdog.maxIdleMs) };
+      // BRAIN-549: settled before the result is published, so a caller that reads history once `lane run` returns finds the row
+      const contentKey = settledContentKey(ticket, finalResult);
       atomicWriteJson(ticket.resultPath, finalResult);
-      appendHistory(root, historyRow(ticket, finalResult, { fallbackReason, lease: started.lease }));
+      appendHistory(root, historyRow(ticket, finalResult, { fallbackReason, lease: started.lease, contentKey }));
       removeLease(root, ticket.id); // release always comes last
       touchSimArmFor(root, ticket); // after the release: the arm stamp's I/O never delays freeing the lease
       // Cleanup only, AFTER the terminal write above -- never before (BLOCKER #1).

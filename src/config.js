@@ -50,6 +50,9 @@ export const DEFAULT_GLOBAL_CONFIG = {
   historyDemandMinRuns: 5,
   // BRAIN-454: history may also RAISE a charge for an under-declared lane (p90 above its declaration), capped at the host CPU budget.
   historyDemandRaise: true,
+  // BRAIN-550: reserve a lane's CPU from its observed usage (ceil(p90 mean x 1.2), within [floor, declared]) once it has
+  // enough finished runs, instead of its declared cpuCores. A lane opts out with `rightSize: false`.
+  rightSizeFromHistory: true,
   // BRAIN-452: the heaviest weight a non-exclusive lane may declare; identical on every host so a submission valid on one is valid on all.
   maxLaneWeight: 4,
   // Second, separate body of work (conflict-skip starvation bound — see
@@ -80,6 +83,12 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // together with the head's own claim. Such a start is not counted as a skip.
   // false restores the BRAIN-249 refusal of all backfill for headBlockGraceMs.
   conflictSafeBackfill: true,
+  // BRAIN-551: a ticket whose history p50 is under expressMaxMs (0 disables) may start past a waiting head as soon as it
+  // fits, uncounted against the skip allowances. At most expressPerMinute such starts per minute per host, and once the head
+  // has waited expressHeadMaxWaitMs an express ticket starts only if it provably cannot delay the head (BRAIN-355's test).
+  expressMaxMs: 30_000,
+  expressPerMinute: 6,
+  expressHeadMaxWaitMs: 900_000,
   // BRAIN-346: how many tickets may start behind a FIFO head denied only by
   // projected-over-budget CPU before the head is reserved (nothing else is
   // admitted past it). 0 restores strict FIFO for resource denials.
@@ -125,6 +134,9 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // 0 (the default) never kills: quiet work is legitimate, so the kill is opted into per lane (`noProgressTimeoutMs`).
   // The stall is recorded either way.
   noProgressTimeoutMs: 0,
+  // BRAIN-549: a command that already passed on the exact same worktree content within this many seconds is answered from
+  // history instead of re-run. 0 turns the result cache off.
+  resultCacheTtlSec: 86_400,
   // BRAIN-379 (balancer P2, slice 2): record, in admission-decisions.log and `lane status`, what
   // class-aware test/sim allocation WOULD decide. Never changes a live admission decision.
   allocationShadow: false,
@@ -286,8 +298,10 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isFinite(cfg.settledDemandFloorFraction) && cfg.settledDemandFloorFraction >= 0 && cfg.settledDemandFloorFraction <= 1,
     `${sourcePath}: "settledDemandFloorFraction" must be a number in [0, 1]`,
   );
+  assert(Number.isInteger(cfg.resultCacheTtlSec) && cfg.resultCacheTtlSec >= 0, `${sourcePath}: "resultCacheTtlSec" must be a non-negative integer (0 disables the result cache)`);
   assert(typeof cfg.historyDemandEnabled === 'boolean', `${sourcePath}: "historyDemandEnabled" must be a boolean`);
   assert(Number.isInteger(cfg.maxLaneWeight) && cfg.maxLaneWeight >= 1, `${sourcePath}: "maxLaneWeight" must be a positive integer`);
+  assert(typeof cfg.rightSizeFromHistory === 'boolean', `${sourcePath}: "rightSizeFromHistory" must be a boolean`);
   assert(typeof cfg.historyDemandRaise === 'boolean', `${sourcePath}: "historyDemandRaise" must be a boolean`);
   assert(Number.isInteger(cfg.historyDemandMinRuns) && cfg.historyDemandMinRuns >= 1, `${sourcePath}: "historyDemandMinRuns" must be a positive integer`);
   assert(
@@ -299,6 +313,9 @@ function validateGlobalConfig(cfg, sourcePath) {
     `${sourcePath}: "headBlockGraceMs" must be a non-negative integer`,
   );
   assert(typeof cfg.conflictSafeBackfill === 'boolean', `${sourcePath}: "conflictSafeBackfill" must be a boolean`);
+  for (const name of ['expressMaxMs', 'expressPerMinute', 'expressHeadMaxWaitMs']) {
+    assert(Number.isInteger(cfg[name]) && cfg[name] >= 0, `${sourcePath}: "${name}" must be a non-negative integer`);
+  }
   assert(
     Number.isInteger(cfg.resourceSkipLimit) && cfg.resourceSkipLimit >= 0,
     `${sourcePath}: "resourceSkipLimit" must be a non-negative integer`,
@@ -564,11 +581,17 @@ function validateRepoConfig(cfg, sourcePath) {
     if (lane.priority !== undefined) {
       assert(isPriorityTier(lane.priority), `${sourcePath}: lane "${name}".priority must be one of ${PRIORITY_TIERS.join(', ')}`);
     }
+    if (lane.rightSize !== undefined) {
+      assert(typeof lane.rightSize === 'boolean', `${sourcePath}: lane "${name}".rightSize must be a boolean`);
+    }
     if (lane.aging !== undefined) {
       assert(typeof lane.aging === 'boolean', `${sourcePath}: lane "${name}".aging must be a boolean`);
     }
     if (lane.exclusive !== undefined) {
       assert(typeof lane.exclusive === 'boolean', `${sourcePath}: lane "${name}".exclusive must be a boolean`);
+    }
+    if (lane.cache !== undefined) {
+      assert(typeof lane.cache === 'boolean', `${sourcePath}: lane "${name}".cache must be a boolean`);
     }
     // BRAIN-403: hooks are host-only and not supported yet; a lane carrying them is refused rather than silently ignored
     assertNoHookKeys(lane, `${sourcePath}: lane "${name}"`);
@@ -987,7 +1010,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   if (isDeclaredLane) {
     laneCfg = repoConfig.lanes[laneName];
   } else if (undeclaredTemplateName) {
-    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/noProgressTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteOmitEscapingSymlinks/remoteArtifacts/remoteArtifactsOn/class/priority/aging
+    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/noProgressTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteOmitEscapingSymlinks/remoteArtifacts/remoteArtifactsOn/class/priority/aging/cache/rightSize
     // from the named declared lane, keeping this lane's OWN key/name. Not
     // inherited: `localRefused` (stays default false), the template's named
     // conflicts (only the `*` wildcard universe below reaches this lane, same
@@ -1014,6 +1037,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       class: templateCfg.class,
       priority: templateCfg.priority,
       aging: templateCfg.aging,
+      cache: templateCfg.cache,
+      rightSize: templateCfg.rightSize,
       classEnforcement: templateCfg.classEnforcement,
     };
   } else {
@@ -1059,8 +1084,12 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     priority: isPriorityTier(laneCfg.priority) ? laneCfg.priority : null,
     // ROG-2181: false stops this lane's tickets accruing priority age; every lane predating the field ages.
     aging: laneCfg.aging !== false,
+    // BRAIN-550: false keeps this lane's declared cpuCores whatever its history says
+    rightSize: laneCfg.rightSize !== false,
     // BRAIN-403: never inherited through an undeclaredLanes template (the template literal above does not copy it)
     exclusive: laneCfg.exclusive === true,
+    // BRAIN-549: false opts this lane out of the result cache; inherited through an undeclaredLanes template
+    cache: laneCfg.cache !== false,
     // BRAIN-321: "required" = granted only under live class caps (`classes.mode` active and valid); absent for every other lane
     ...(laneCfg.classEnforcement === 'required' ? { classEnforcement: 'required' } : {}),
     conflicts,
