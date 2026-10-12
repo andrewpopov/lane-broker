@@ -23,7 +23,7 @@ import { readTicketWait, waitLabel } from './ticket-wait.js';
 import { loadExpressTable, expressVerdict } from './express.js';
 import { exclusiveHoldView, clampQueuedWeight } from './exclusive.js';
 import { priorityOf, effectiveRank, tierName } from './priority.js';
-import { leaseOverrun } from './observed.js';
+import { leaseOverrun, leaseSilence } from './observed.js';
 import { topExternalCpu, externalBusyCores, windowExternalCores, scanProcWindow, starvedStaleMs, starvedForMs } from './external-cpu.js';
 import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores, cpuBudgetCores } from './resources.js';
 
@@ -237,6 +237,8 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       observedMemoryBytes: l.observedMemoryBytes ?? null,
       // BRAIN-431: how long the run has shown no output, CPU or process churn (null before the first heartbeat observation)
       noProgressSinceMs: Number.isFinite(l.noProgressSinceMs) ? l.noProgressSinceMs : null,
+      // BRAIN-532: silence and CPU-idle streaks (warning only; never read by admission)
+      ...leaseSilence(l, now, cfg),
       remoteOwner: remoteOwners.get(l.id) ?? null,
     }));
 
@@ -421,6 +423,15 @@ function noProgressNote(r) {
   return r.noProgressSinceMs >= 60_000 ? `  no-progress=${fmtMs(r.noProgressSinceMs)}` : '';
 }
 
+/** BRAIN-532: `[HUNG? ...]` (silent and CPU-idle), `[SILENT ...]` (silent only), or `[idle <dur>]` once CPU-idle for 10 minutes. */
+const IDLE_NOTE_MS = 10 * 60 * 1000;
+function silenceFlag(r) {
+  const cpu = Number.isFinite(r.cpu) ? r.cpu.toFixed(2) : '-';
+  if (r.hung) return ` [HUNG? silent ${fmtMs(r.silentMs)}, cpu ${cpu} — lane cancel ${r.id}]`;
+  if (r.silent) return ` [SILENT ${fmtMs(r.silentMs)}, cpu ${cpu}]`;
+  return r.idleMs >= IDLE_NOTE_MS ? ` idle ${fmtMs(r.idleMs)}` : '';
+}
+
 function fmtMs(ms) {
   if (ms == null) return '-';
   const s = Math.floor(ms / 1000);
@@ -588,7 +599,7 @@ export function renderStatusText(status) {
     lines.push('  (none)');
   } else {
     for (const r of status.running) {
-      const flag = (r.exclusive ? ' [exclusive]' : '') + (r.state === 'ORPHANED' ? ' [ORPHANED]' : '') + (r.overrun ? ` [OVERRUN peak ${r.overrun.observedPeak} for ${fmtMs(r.overrun.sinceMs)}]` : '');
+      const flag = (r.exclusive ? ' [exclusive]' : '') + (r.state === 'ORPHANED' ? ' [ORPHANED]' : '') + (r.overrun ? ` [OVERRUN peak ${r.overrun.observedPeak} for ${fmtMs(r.overrun.sinceMs)}]` : '') + silenceFlag(r);
       // BRAIN-255: only shown once it's non-default, so "2 running" reads
       // differently against a maxConcurrent: 8 lane than a plain exclusive
       // one, without cluttering the common (ceiling 1) case.

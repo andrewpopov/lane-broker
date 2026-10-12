@@ -352,7 +352,7 @@ export function childEnv(ticket, baseEnv = process.env, grantedCpuCores = ticket
   return env;
 }
 
-export function applyHeartbeatObservation(lease, observed, now = Date.now(), observedMemoryBytes = null, maxGapMs) {
+export function applyHeartbeatObservation(lease, observed, now = Date.now(), observedMemoryBytes = null, maxGapMs, idle = null) {
   const update = { ...lease, heartbeatAt: now };
   if (Number.isFinite(observed)) {
     update.observedCpuCores = observed;
@@ -365,7 +365,7 @@ export function applyHeartbeatObservation(lease, observed, now = Date.now(), obs
     update.observedAt = now;
   }
   // BRAIN-361: report-only usage telemetry, isolated so it can never cost the lease its heartbeat.
-  const { fields, drop } = observedLeaseFields(lease, observed, observedMemoryBytes, now, maxGapMs);
+  const { fields, drop } = observedLeaseFields(lease, observed, observedMemoryBytes, now, maxGapMs, idle);
   for (const key of drop) delete update[key];
   Object.assign(update, fields);
   return update;
@@ -1538,9 +1538,14 @@ async function main() {
         const observedMemory = tree?.memoryBytes ?? null;
         // a gap of more than two heartbeats between good readings ends an overrun streak
         writeLease(root, {
-          ...applyHeartbeatObservation(lease, observed, Date.now(), observedMemory, 2 * globalCfg.sampleMs),
+          ...applyHeartbeatObservation(lease, observed, Date.now(), observedMemory, 2 * globalCfg.sampleMs, {
+            intervalCores: watchdog.lastIntervalCores,
+            belowFraction: globalCfg.idleCreditBelowFraction,
+            hungCores: globalCfg.hungCpuCores,
+          }),
           descendants: descendants.snapshot(),
           noProgressSinceMs: Math.round(idleMs),
+          ...(watchdog.lastOutputAt === null ? {} : { lastOutputAt: watchdog.lastOutputAt }),
         });
       }
     } catch {

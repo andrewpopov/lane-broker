@@ -91,16 +91,69 @@ export function leaseOverrun(lease) {
   return { sinceMs, observedPeak: round3(isNum(lease.overrunPeak) ? lease.overrunPeak : isNum(lease.observedCpuCores) ? lease.observedCpuCores : 0) };
 }
 
+const IDLE_ANCHOR_FIELDS = ['cpuIntervalCores', 'cpuIdleSince', 'cpuIdleLastAt', 'cpuHungSince', 'cpuHungLastAt'];
+
+/**
+ * BRAIN-532: one continuous-streak anchor, the overrun pattern. The streak continues only from a strictly later reading
+ * within `maxGapMs` of the previous idle one; a non-idle reading drops it.
+ */
+function applyAnchor(lease, sinceKey, lastKey, isIdle, now, maxGapMs, fields, drop) {
+  if (!isIdle) {
+    drop.push(sinceKey, lastKey);
+    return;
+  }
+  const gap = isNum(lease[lastKey]) ? now - lease[lastKey] : NaN;
+  fields[sinceKey] = isNum(lease[sinceKey]) && gap > 0 && gap <= maxGapMs ? lease[sinceKey] : now;
+  fields[lastKey] = now;
+}
+
+/**
+ * BRAIN-532: the CPU-idle anchors, fed by the watchdog's per-interval cores (cumulative deltas, null on the first
+ * observation, a null reading, or any process joining or leaving the tree, so churn resets both). `cpuIdleSince` tracks
+ * intervals under `belowFraction` x the grant (credit candidates); `cpuHungSince` tracks intervals under the absolute `hungCores`.
+ */
+function applyIdleAnchors(lease, idle, now, maxGapMs, fields, drop) {
+  const cores = idle?.intervalCores;
+  const known = isNum(cores) && cores >= 0;
+  if (known) fields.cpuIntervalCores = round3(cores);
+  else drop.push('cpuIntervalCores');
+  const grant = leaseCpuCores(lease);
+  applyAnchor(lease, 'cpuIdleSince', 'cpuIdleLastAt', known && isNum(grant) && grant > 0 && cores < idle.belowFraction * grant, now, maxGapMs, fields, drop);
+  applyAnchor(lease, 'cpuHungSince', 'cpuHungLastAt', known && cores < idle.hungCores, now, maxGapMs, fields, drop);
+}
+
+/**
+ * BRAIN-532: what `lane status` says about a run's silence. `silentMs` is time since the command last wrote a byte
+ * (the watchdog's own counter, immune to the log writer's discard mode; falls back to startedAt before any output).
+ * HUNG? needs silence AND an unbroken CPU-idle streak, both >= hungAfterMs; SILENT is silence alone (a spinning hang).
+ * Anchors older than three heartbeats are stale and count for nothing.
+ */
+export function leaseSilence(lease, now, cfg) {
+  const silentSince = isNum(lease.lastOutputAt) ? lease.lastOutputAt : lease.startedAt;
+  const silentMs = isNum(silentSince) ? Math.max(0, now - silentSince) : 0;
+  const fresh = (lastKey) => isNum(lease[lastKey]) && now - lease[lastKey] <= 3 * cfg.sampleMs;
+  const streak = (sinceKey, lastKey) => (fresh(lastKey) && isNum(lease[sinceKey]) ? lease[lastKey] - lease[sinceKey] : 0);
+  const silent = silentMs >= cfg.hungAfterMs;
+  return {
+    silentMs,
+    cpu: isNum(lease.cpuIntervalCores) ? lease.cpuIntervalCores : isNum(lease.observedCpuCores) ? lease.observedCpuCores : null,
+    idleMs: streak('cpuIdleSince', 'cpuIdleLastAt'),
+    silent,
+    hung: silent && streak('cpuHungSince', 'cpuHungLastAt') >= cfg.hungAfterMs,
+  };
+}
+
 /**
  * The lease fields BRAIN-361 derives from one heartbeat: whole-run stats, the RSS peak and the overrun
  * anchor. Telemetry only, so it must never throw into the heartbeat: any failure drops every field.
  * `observed` null (a failed probe) resets the anchor; so does a gap since the last good reading longer
  * than `maxGapMs` (a stalled heartbeat or a clock jump), since the overrun must be continuous.
  */
-export function observedLeaseFields(lease, observed, observedMemoryBytes, now, maxGapMs = OVERRUN_MAX_GAP_MS) {
+export function observedLeaseFields(lease, observed, observedMemoryBytes, now, maxGapMs = OVERRUN_MAX_GAP_MS, idle = null) {
   try {
     const fields = {};
     const drop = [];
+    applyIdleAnchors(lease, isNum(observed) ? idle : null, now, maxGapMs, fields, drop);
     if (isNum(observed)) {
       fields.observedCpuStats = foldObservedCpu(lease.observedCpuStats, observed, now);
       // continuity is measured from the previous OVER-BOOKING reading's own time (not the stats' integration
@@ -116,6 +169,6 @@ export function observedLeaseFields(lease, observed, observedMemoryBytes, now, m
     if (isNum(observedMemoryBytes)) fields.observedRssPeakBytes = Math.max(isNum(lease.observedRssPeakBytes) ? lease.observedRssPeakBytes : 0, observedMemoryBytes);
     return { fields, drop };
   } catch {
-    return { fields: {}, drop: ['observedCpuStats', 'overrunSince', 'overrunPeak', 'overrunLastAt', 'observedRssPeakBytes'] };
+    return { fields: {}, drop: ['observedCpuStats', ...IDLE_ANCHOR_FIELDS, 'overrunSince', 'overrunPeak', 'overrunLastAt', 'observedRssPeakBytes'] };
   }
 }

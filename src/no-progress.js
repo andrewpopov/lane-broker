@@ -17,6 +17,19 @@ export const NO_PROGRESS_CPU_SECONDS_PER_MINUTE = 0.05;
 const identity = (row) => `${row.pid}:${row.token}`;
 const cpuOf = (row) => row.cpuSec + (row.childCpuSec ?? 0);
 
+/** Cores the tree used between two snapshots; null when a process joined or left (churn). Infinity for CPU spent in zero elapsed time. */
+function intervalCores(previous, current, now) {
+  const seconds = (now - previous.at) / 1000;
+  if (previous.cpu.size !== current.size) return null;
+  let delta = 0;
+  for (const [key, cpu] of current) {
+    const before = previous.cpu.get(key);
+    if (before === undefined) return null;
+    delta += Math.max(0, cpu - before);
+  }
+  return seconds > 0 ? delta / seconds : delta > 0 ? Infinity : 0;
+}
+
 export class NoProgressWatchdog {
   /** @param timeoutMs streak length that triggers the kill; 0 (or less) records the stall signal but never kills */
   constructor({ timeoutMs, readRows = readProcCpuRows, clock = () => performance.now() }) {
@@ -27,6 +40,8 @@ export class NoProgressWatchdog {
     this.baseline = null; // { at, outputBytes, cpu: identity -> cumulative CPU seconds } of the previous observation
     this.idleSince = null;
     this.maxIdleMs = 0;
+    this.lastOutputAt = null; // wall-clock ms of the last byte the command wrote (BRAIN-532)
+    this.lastIntervalCores = null; // CPU cores over the last interval; null when it could not be measured or the tree changed
   }
 
   get killEnabled() {
@@ -35,6 +50,7 @@ export class NoProgressWatchdog {
 
   noteOutput(byteCount) {
     this.outputBytes += byteCount;
+    this.lastOutputAt = Date.now();
   }
 
   /**
@@ -47,6 +63,7 @@ export class NoProgressWatchdog {
     const current = this.#snapshot(treePids);
     const previous = this.baseline;
     this.baseline = current ? { at: now, outputBytes: this.outputBytes, cpu: current } : null;
+    this.lastIntervalCores = current && previous ? intervalCores(previous, current, now) : null;
     if (!current || !previous || !this.#idleBetween(previous, current, now)) {
       this.idleSince = now;
       return 0;
@@ -82,14 +99,8 @@ export class NoProgressWatchdog {
 
   #idleBetween(previous, current, now) {
     if (previous.outputBytes !== this.outputBytes) return false;
-    if (previous.cpu.size !== current.size) return false;
-    let delta = 0;
-    for (const [key, cpu] of current) {
-      const before = previous.cpu.get(key);
-      if (before === undefined) return false; // a new process in the tree is activity
-      delta += Math.max(0, cpu - before);
-    }
-    return delta <= (NO_PROGRESS_CPU_SECONDS_PER_MINUTE / 60) * ((now - previous.at) / 1000);
+    const cores = intervalCores(previous, current, now);
+    return cores !== null && cores <= NO_PROGRESS_CPU_SECONDS_PER_MINUTE / 60;
   }
 }
 

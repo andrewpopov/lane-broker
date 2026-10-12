@@ -93,7 +93,8 @@ function recentObservedCores(lease, now, windowMs, current) {
 export function leaseDemandBasis(lease, now = Date.now(), cfg, budget) {
   const cold = coldStartEstimate(leaseCpuCores(lease) ?? lease.weight);
   // BRAIN-433: only the cold charge (no observation, or an unsettled one) uses the history estimate; the settled peak allowance below is main's, uncapped by it.
-  const estimated = cpuEstimateBasis(lease, cold, cfg, now, budget).cores;
+  // BRAIN-532: a held lease is never charged cold above its own grant: the history raise is for a NEW claim (jun prepush 2e327435: grant 2, charged 4.00 for 75 min)
+  const estimated = Math.min(cpuEstimateBasis(lease, cold, cfg, now, budget).cores, cold);
   const observed = freshObservedCores(lease, now);
   if (observed === null) return { demand: estimated, basis: 'cold' };
   const unsettled = { demand: Math.max(observed, estimated), basis: 'cold' };
