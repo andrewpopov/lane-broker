@@ -232,3 +232,18 @@ test('computeContentKey gives no key (never caches) past the untracked-file boun
   for (let i = 0; i <= MAX_UNTRACKED_FILES; i += 1) fs.writeFileSync(path.join(many, `f${i}`), '');
   assert.equal(computeContentKey(args), null, 'too many untracked files');
 });
+
+test('BRAIN-558: a cached answer writes a non-empty --log naming the source run', async () => {
+  const t = setup();
+  const first = await t.lane();
+  assert.equal(first.code, 0, first.stderr);
+  await t.settled(1);
+  const logFile = path.join(t.base, 'out', 'gate.log');
+  const second = await t.lane(['--log', logFile]);
+  assert.equal(second.code, 0, second.stderr);
+  assert.equal(t.runs(), 1, 'the child must not have run again');
+  const original = t.rows()[0];
+  const written = fs.readFileSync(logFile, 'utf8');
+  assert.ok(written.length > 0, 'the log must not be empty');
+  assert.match(written, new RegExp(`lane: cached pass from ${original.id} at `));
+});

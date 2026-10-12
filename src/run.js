@@ -509,7 +509,14 @@ export async function runCommand({
     const now = Date.now();
     const hit = findCachedPass(readRows(paths(root).history), { contentKey, now, ttlMs: cacheTtlMs });
     if (hit) {
-      process.stderr.write(`lane: cached pass from ${hit.id} at ${new Date(hit.endedAt).toISOString()} (pass --no-cache to re-run)\n`);
+      const cachedLine = `lane: cached pass from ${hit.id} at ${new Date(hit.endedAt).toISOString()} (pass --no-cache to re-run)\n`;
+      process.stderr.write(cachedLine);
+      // BRAIN-558: a gate that checks `--log` is non-empty after exit 0 must see a record of the cached answer too.
+      if (log) {
+        const sourceLog = path.join(paths(root).logs, `${hit.id}.log`);
+        fs.mkdirSync(path.dirname(log), { recursive: true });
+        fs.appendFileSync(log, cachedLine + (fs.existsSync(sourceLog) ? `source log: ${sourceLog}\n` : ''));
+      }
       appendHistory(root, {
         id: crypto.randomUUID(),
         key: resolved.key,
