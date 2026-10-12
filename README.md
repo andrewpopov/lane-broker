@@ -1886,6 +1886,23 @@ row carry `exit: 124`, `reason: "no-progress"` and `noProgressTimeoutMs`, and th
 the runner relays the reason and window back, and the submitter's history row is `executor: "remote"`, exit 124,
 `reason: "no-progress"`.
 
+**Hung and silent runs (BRAIN-532, warning only; nothing is ever cancelled).** The supervisor stamps `lastOutputAt` from the
+bytes the command writes (immune to the log writer's discard mode) and keeps CPU-idle anchors from per-interval cores
+(cumulative CPU deltas; a gap of more than 2x `sampleMs`, an unreadable tree or a process joining or leaving the tree
+resets them). `lane status` shows `[HUNG? silent <t>, cpu <x> — lane cancel <id>]` when a run has been silent and under
+`hungCpuCores` for `hungAfterMs`, `[SILENT <t>, cpu <x>]` when only silent (a hang that still spins CPU), and `idle <t>`
+once CPU-idle (under `idleCreditBelowFraction` x its grant) for 10 minutes. `--json` carries `silentMs`, `silent`, `hung`,
+`idleMs` and `cpu` per running lease.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `hungAfterMs` | `1800000` | Silence (and, for `HUNG?`, CPU-idle) this long raises the flag. |
+| `hungCpuCores` | `0.05` | CPU line under which a silent run counts as hung. |
+| `idleCreditBelowFraction` | `0.1` | Fraction of the grant under which an interval is CPU-idle. |
+| `idleCreditMode` | `shadow` | `off`, `shadow` or `active`; accepted now, unused until idle credit lands. |
+
+A held lease with no fresh CPU reading is charged its cold estimate capped at its own grant; the history raise applies only to a new claim.
+
 ### Group reap on leader exit (ROG-2181 T1b)
 
 When a lease's leader process (the command `lane run` spawned) exits on its own, the supervisor checks whether

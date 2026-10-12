@@ -54,7 +54,15 @@ test('historyDemandRaise off: cap at the declaration, floor at 0.5', () => {
 test('BRAIN-454: an under-declared lane whose p90 exceeds its declaration is charged the p90 (history:raised)', () => {
   primed(rows(KEY, 6, 7));
   assert.deepEqual(ticketCpuEstimateBasis(ticket(), baseCfg(), now0, 9), { cores: 7, source: 'history:raised' });
-  assert.equal(leaseDemandBasis({ ...coldLease(), key: KEY, cmdFingerprint: FP, weight: 4, resources: { cpuCores: 4, memoryBytes: 1 } }, now0, baseCfg(), 9).demand, 7, 'a lease cold charge uses the same raised value');
+});
+
+// BRAIN-532 (jun prepush 2e327435: grant 2, charged 4.00 cold for 75 min): a HELD lease's cold charge never exceeds its own grant.
+test('BRAIN-532: a held lease with no reading is charged at most its grant even when history raises the estimate', () => {
+  primed(rows(KEY, 6, 4, { resources: { cpuCores: 2 } }));
+  const held = { ...coldLease(), key: KEY, cmdFingerprint: FP, weight: 2, resources: { cpuCores: 2, memoryBytes: 1 } };
+  assert.deepEqual(ticketCpuEstimateBasis({ ...held, id: 'cand' }, baseCfg(), now0, 9), { cores: 4, source: 'history:raised' }, 'the NEW-claim estimate is still raised');
+  assert.deepEqual(leaseDemandBasis(held, now0, baseCfg(), 9), { demand: 2, basis: 'cold' });
+  assert.equal(leaseDemandBasis({ ...held, observedCpuCores: 3, observedAt: now0 }, now0, baseCfg(), 9).demand, 3, 'a real reading above the grant is still charged');
 });
 
 test('BRAIN-454: the raised charge is capped at the budget, so it can never be unadmittable', () => {

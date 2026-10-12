@@ -137,6 +137,13 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // 0 (the default) never kills: quiet work is legitimate, so the kill is opted into per lane (`noProgressTimeoutMs`).
   // The stall is recorded either way.
   noProgressTimeoutMs: 0,
+  // BRAIN-532: a run silent AND under `hungCpuCores` for `hungAfterMs` is flagged `HUNG?` in `lane status` (warning only, never a kill);
+  // silence alone is flagged `SILENT`. `idleCreditBelowFraction` x grant is the CPU-idle line the idle detector uses.
+  // `idleCreditMode` is accepted now and unused until the credit lands (shadow, then active).
+  hungAfterMs: 1_800_000,
+  hungCpuCores: 0.05,
+  idleCreditBelowFraction: 0.1,
+  idleCreditMode: 'shadow',
   // BRAIN-549: a command that already passed on the exact same worktree content within this many seconds is answered from
   // history instead of re-run. 0 turns the result cache off.
   resultCacheTtlSec: 86_400,
@@ -356,6 +363,13 @@ function validateGlobalConfig(cfg, sourcePath) {
     `${sourcePath}: "laneNice" must be an integer in [0, 19]`,
   );
   assert(Number.isInteger(cfg.noProgressTimeoutMs) && cfg.noProgressTimeoutMs >= 0, `${sourcePath}: "noProgressTimeoutMs" must be a non-negative integer`);
+  assert(Number.isInteger(cfg.hungAfterMs) && cfg.hungAfterMs > 0, `${sourcePath}: "hungAfterMs" must be a positive integer`);
+  assert(Number.isFinite(cfg.hungCpuCores) && cfg.hungCpuCores >= 0, `${sourcePath}: "hungCpuCores" must be a non-negative number`);
+  assert(
+    Number.isFinite(cfg.idleCreditBelowFraction) && cfg.idleCreditBelowFraction > 0 && cfg.idleCreditBelowFraction <= 1,
+    `${sourcePath}: "idleCreditBelowFraction" must be a number in (0, 1]`,
+  );
+  assert(['off', 'shadow', 'active'].includes(cfg.idleCreditMode), `${sourcePath}: "idleCreditMode" must be "off", "shadow" or "active"`);
   // BRAIN-320 S1a: how long a remote ticket may sit queued on the runner
   // before it is cancelled and treated as unconfirmed (fallback to local).
   // Absent by default (not read yet -- that is a later slice) so a config

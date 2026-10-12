@@ -278,3 +278,50 @@ test('formatting', () => {
   assert.equal(formatWindow(90_000), '2m');
   assert.equal(noProgressMessage(900_000), 'lane run: no progress for 15m (no output, no CPU) — killed\n');
 });
+
+/** BRAIN-532: the per-interval cores the idle anchors are fed from, driven with a fake process table and clock. */
+function fakeClockWatchdog() {
+  const state = { now: 0, rows: [] };
+  const w = new NoProgressWatchdog({ timeoutMs: 0, readRows: () => state.rows, clock: () => state.now });
+  return { state, w };
+}
+const row = (pid, cpuSec) => ({ pid, token: `t${pid}`, cpuSec, childCpuSec: 0 });
+
+test('lastIntervalCores: cumulative CPU delta over the interval, null on the first observation', () => {
+  const { state, w } = fakeClockWatchdog();
+  state.rows = [row(1, 10)];
+  w.observe([1]);
+  assert.equal(w.lastIntervalCores, null, 'a baseline is not an interval');
+  state.now = 5000;
+  state.rows = [row(1, 12.5)];
+  w.observe([1]);
+  assert.equal(w.lastIntervalCores, 0.5);
+});
+
+test('lastIntervalCores: null when a process joins or leaves the tree, or the scan failed', () => {
+  const { state, w } = fakeClockWatchdog();
+  state.rows = [row(1, 10)];
+  w.observe([1]);
+  state.now = 5000;
+  state.rows = [row(1, 10), row(2, 0)];
+  w.observe([1, 2]);
+  assert.equal(w.lastIntervalCores, null, 'joined');
+  state.now = 10_000;
+  w.observe([1, 2]);
+  assert.equal(w.lastIntervalCores, 0);
+  state.now = 15_000;
+  state.rows = [row(1, 10)];
+  w.observe([1]);
+  assert.equal(w.lastIntervalCores, null, 'left');
+  state.now = 20_000;
+  w.observe(null);
+  assert.equal(w.lastIntervalCores, null, 'unobserved');
+});
+
+test('lastOutputAt is stamped by noteOutput and stays null until the command writes', () => {
+  const { w } = fakeClockWatchdog();
+  assert.equal(w.lastOutputAt, null);
+  const before = Date.now();
+  w.noteOutput(3);
+  assert.ok(w.lastOutputAt >= before && w.lastOutputAt <= Date.now());
+});

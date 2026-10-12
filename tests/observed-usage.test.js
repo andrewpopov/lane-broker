@@ -478,3 +478,70 @@ test('lane suggest CLI: reads history.jsonl, --json shape, --repo / --days', () 
   assert.equal(run('--repo', 'nonexistent').stdout.includes('no lane has enough observed runs'), true);
   assert.equal(run('--days', 'x').status, 2);
 });
+
+// BRAIN-532: the CPU-idle anchors, fed by the watchdog's per-interval cores.
+const idleOpts = (intervalCores) => ({ intervalCores, belowFraction: 0.1, hungCores: 0.05 });
+function replayIdle(lease, readings, t0 = 1_000_000, maxGapMs = 10_000) {
+  let l = lease;
+  for (const [offset, cores] of readings) l = applyHeartbeatObservation(l, 0.5, t0 + offset, null, maxGapMs, idleOpts(cores));
+  return l;
+}
+const idleEvery5s = (from, to, cores) => {
+  const out = [];
+  for (let t = from; t <= to; t += 5_000) out.push([t, cores]);
+  return out;
+};
+
+test('idle anchor: continuous idle intervals keep the first anchor; hung anchor needs the absolute line', () => {
+  const t0 = 1_000_000;
+  const l = replayIdle(lease4(), idleEvery5s(0, 60_000, 0.02), t0); // grant 4: idle under 0.4, hung under 0.05
+  assert.equal(l.cpuIdleSince, t0);
+  assert.equal(l.cpuIdleLastAt, t0 + 60_000);
+  assert.equal(l.cpuHungSince, t0);
+  const between = replayIdle(lease4(), idleEvery5s(0, 60_000, 0.2), t0); // idle (< 0.4) but not hung (>= 0.05)
+  assert.equal(between.cpuIdleSince, t0);
+  assert.equal('cpuHungSince' in between, false);
+});
+
+test('idle anchor: a non-idle interval resets it, and the next idle one restarts it', () => {
+  const t0 = 1_000_000;
+  const l = replayIdle(lease4(), [...idleEvery5s(0, 30_000, 0.02), [35_000, 2], [40_000, 0.02]], t0);
+  assert.equal(l.cpuIdleSince, t0 + 40_000);
+  const burst = replayIdle(lease4(), [...idleEvery5s(0, 30_000, 0.02), [35_000, 2]], t0);
+  assert.equal('cpuIdleSince' in burst, false);
+  assert.equal('cpuIdleLastAt' in burst, false);
+});
+
+test('idle anchor: a null interval (process joined or left the tree, first observation) resets it', () => {
+  const t0 = 1_000_000;
+  const l = replayIdle(lease4(), [...idleEvery5s(0, 30_000, 0.02), [35_000, null]], t0);
+  assert.equal('cpuIdleSince' in l, false);
+  assert.equal('cpuIntervalCores' in l, false);
+});
+
+test('idle anchor: a null probe reading resets it even with an idle interval', () => {
+  const t0 = 1_000_000;
+  const idle = replayIdle(lease4(), idleEvery5s(0, 30_000, 0.02), t0);
+  const dropped = applyHeartbeatObservation(idle, null, t0 + 35_000, null, 10_000, idleOpts(0.02));
+  assert.equal('cpuIdleSince' in dropped, false);
+});
+
+test('idle anchor: a gap of more than 2x sampleMs restarts the streak; a normal one keeps it', () => {
+  const t0 = 1_000_000;
+  const idle = replayIdle(lease4(), idleEvery5s(0, 30_000, 0.02), t0);
+  const gap = applyHeartbeatObservation(idle, 0.5, t0 + 30_000 + 10_001, null, 10_000, idleOpts(0.02));
+  assert.equal(gap.cpuIdleSince, t0 + 40_001);
+  const kept = applyHeartbeatObservation(idle, 0.5, t0 + 30_000 + 10_000, null, 10_000, idleOpts(0.02));
+  assert.equal(kept.cpuIdleSince, t0);
+});
+
+test('idle anchor: an equal or rolled-back clock restarts the streak instead of bridging', () => {
+  const t0 = 1_000_000;
+  const idle = replayIdle(lease4(), idleEvery5s(0, 30_000, 0.02), t0);
+  assert.equal(applyHeartbeatObservation(idle, 0.5, t0 + 30_000, null, 10_000, idleOpts(0.02)).cpuIdleSince, t0 + 30_000);
+});
+
+test('idle anchor: no idle options (an old caller) records nothing', () => {
+  const l = applyHeartbeatObservation(lease4(), 0.5, 1_000_000);
+  assert.equal('cpuIdleSince' in l, false);
+});

@@ -277,3 +277,24 @@ test('brokerHome respects LANE_BROKER_HOME', () => {
     process.env.LANE_BROKER_HOME = prev;
   }
 });
+
+test('BRAIN-532: hung and idle-credit keys default sensibly and reject bad values', () => {
+  const base = { version: 1, capacity: 2, loadClose: 40, loadOpen: 11, loadOpenSamples: 3, sampleMs: 5000 };
+  const load = (extra) => {
+    const { home } = freshEnv();
+    writeGlobalConfig(home, { ...base, ...extra });
+    const prevHome = process.env.LANE_BROKER_HOME;
+    process.env.LANE_BROKER_HOME = home;
+    try {
+      return loadGlobalConfig();
+    } finally {
+      process.env.LANE_BROKER_HOME = prevHome;
+    }
+  };
+  const cfg = load({});
+  assert.deepEqual([cfg.hungAfterMs, cfg.hungCpuCores, cfg.idleCreditBelowFraction, cfg.idleCreditMode], [1_800_000, 0.05, 0.1, 'shadow']);
+  assert.equal(load({ idleCreditMode: 'active', hungAfterMs: 60_000 }).idleCreditMode, 'active');
+  for (const bad of [{ hungAfterMs: 0 }, { hungAfterMs: 1.5 }, { hungCpuCores: -1 }, { idleCreditBelowFraction: 0 }, { idleCreditBelowFraction: 1.5 }, { idleCreditMode: 'on' }]) {
+    assert.throws(() => load(bad), ConfigError, JSON.stringify(bad));
+  }
+});
