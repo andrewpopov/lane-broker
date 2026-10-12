@@ -1,22 +1,23 @@
-import { OVERRUN_MIN_MS } from './observed.js';
 import { classifyRow, percentile } from './estimates-history.js';
 import { WINDOW_RUNS, WINDOW_MS } from './cpu-estimates.js';
 
 /**
  * BRAIN-550: reserve a lane's CPU from what its finished runs actually used (their time-weighted mean cores), not
  * from its declared `cpuCores`. The target is ceil(p90 mean x headroom), within [floor, declared]; a lane with fewer than
- * RIGHT_SIZE_MIN_RUNS usable runs keeps its declaration. The sizing is `lane suggest`'s (BRAIN-361): runs under
- * OVERRUN_MIN_MS are mostly startup, and a run granted less than it requested is scaled back up to a requested-equivalent.
+ * RIGHT_SIZE_MIN_RUNS usable runs keeps its declaration. The sizing is `lane suggest`'s (BRAIN-361): a run granted less than it
+ * requested is scaled back up to a requested-equivalent. A run counts once it has RIGHT_SIZE_MIN_SAMPLES heartbeat readings (BRAIN-552),
+ * not a minimum duration: most ad-hoc runs are under two minutes, and the lanes that most need sizing down are exactly those.
  */
 export const RIGHT_SIZE_MIN_RUNS = 5;
 export const RIGHT_SIZE_HEADROOM = 1.2;
+export const RIGHT_SIZE_MIN_SAMPLES = 3;
 
 const rowTime = (r) => r.endedAt;
-const runMsOf = (r) => (Number.isFinite(r.runMs) ? r.runMs : r.endedAt - r.startedAt);
 
 /** What one finished run needed, as cores of the claim it was requested at; null when the run says nothing. */
 function needOf(row) {
-  if (classifyRow(row).kind === 'ignored' || !Number.isFinite(row.endedAt) || runMsOf(row) < OVERRUN_MIN_MS) return null;
+  if (classifyRow(row).kind === 'ignored' || !Number.isFinite(row.endedAt)) return null;
+  if (!(row.observedCpu?.samples >= RIGHT_SIZE_MIN_SAMPLES)) return null;
   const mean = row.observedCpu?.mean;
   if (!Number.isFinite(mean) || mean < 0) return null;
   const requested = row.resources?.cpuCores;

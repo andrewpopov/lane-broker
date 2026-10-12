@@ -119,6 +119,13 @@ export function isUuid(v) {
   return typeof v === 'string' && UUID_RE.test(v);
 }
 
+const TICKET_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+/** A ticket id `lane run` can create: a generated UUID or a caller's `--id`. Safe to use as a single path component. */
+export function isTicketId(v) {
+  return typeof v === 'string' && TICKET_ID_RE.test(v);
+}
+
 /** BRAIN-436: the runner-side record that a ticket id was cancelled or withdrawn before its `remote-exec` arrived (one file
  *  per id under the REMOTE root, not the broker root). `remote-exec` refuses an id that has one; src/gc.js decides how long it lives. */
 export function tombstonePath(remoteRoot, ticketId) {

@@ -44,6 +44,7 @@ lane capabilities --json
 lane suggest [--repo <name>] [--days 7] [--json]
 lane report cost --repo zirkbot,jun --since 2026-10-01 --until 2026-10-08 --prs zirkbot=z.json,jun=j.json [--json]   # gate-cost scorecard (BRAIN-529)
 lane cancel <id>
+lane lease-check <id>                    # exit 0 only if <id> is a live lease on this host (BRAIN-553)
 lane priority <id> high|medium|low       # re-tier a queued ticket in place (BRAIN-518)
 lane wait <id> [--timeout 5m]
 lane pause "reason" | lane resume
@@ -1292,8 +1293,8 @@ on elasticity.
 
 A lane's declared `cpuCores` is usually a ceiling, not what it uses (24 h of runs: the median run used about 68% of its
 reserved cores), and a runner refuses work while the reservations, not the busy cores, fill its budget. So once a
-(repo, lane) has **5 finished runs with `observedCpu`** in the last 14 days (most recent 50; runs under 2 minutes are skipped, as in
-`lane suggest`), `lane run` requests
+(repo, lane) has **5 finished runs with `observedCpu`** in the last 14 days (most recent 50; a run counts once it has 3 heartbeat samples, so
+short ad-hoc runs count), `lane run` requests
 
     target = ceil(p90 of per-run mean cores x 1.2), clamped to [minCpuCores or 1, declared cpuCores]
 
@@ -1311,6 +1312,19 @@ set `rightSize: false` (or `--cpu`) on a lane that must keep its declared width.
 `grantedCpuCores` and `rightSized`. The history row records `requestedCpuCores` (what admission was asked for) and, only
 when it differs from the declaration, `declaredCpuCores`. `lane suggest` reads `resources.cpuCores`, which is now the right-sized
 request, so its `declared=` column shows that request once a lane is right-sized.
+
+### Unapproved CPU cap (`maxUnapprovedCpuCores`, BRAIN-552)
+
+A request is **approved** at its declared `cpuCores` only when that lane is explicitly declared under `lanes` in the repo's
+**committed** `.lane-broker.json` (`git show HEAD:.lane-broker.json` from the checkout root). Everything else is capped, client side, to
+`max(committed cpuCores for that lane, maxUnapprovedCpuCores)`: an undeclared or ad-hoc lane (an `undeclaredLanes.as` template's size is not
+approval for an ad-hoc name), `--cpu` above the committed declaration, a working-tree config that raises a lane above HEAD, and any run with no git
+or no committed file. `maxUnapprovedCpuCores` is a global config key (positive number, default 4). The cap applies to `cpuCores`, and to
+`minCpuCores` when it would exceed the capped claim, before right-sizing. Each cap writes one stderr line, for example
+`lane run: cpu 9 -> 4 (lane "zirk812": lane "zirk812" is not declared in the committed .lane-broker.json; maxUnapprovedCpuCores 4)`.
+
+An exclusive run is not capped (it claims the whole budget by design). A runner never re-caps: the cores in a `lane remote-exec` header were
+already capped by the submitting client, and the runner's snapshot has no git.
 
 ### `history.jsonl` record schema (BRAIN-425)
 
@@ -1446,6 +1460,21 @@ A reentrant run may not *widen* the inherited lease's weight, CPU reservation,
 or memory reservation. Any other nested key — a
 different repo, or a different lane that isn't `prepush` — is refused with
 exit `64`; v1 has no general lane hierarchy.
+
+**Checking an inherited lease (`lane lease-check <id>`, BRAIN-553).** A non-empty
+`LANE_BROKER_LEASE` proves nothing: anyone can set it, and a hook that runs its suite
+directly whenever it is set lets a made-up value skip the queue. `lane lease-check
+"$LANE_BROKER_LEASE"` exits `0`, printing nothing, only when the id names a live lease
+on this host: a lease record exists, it was written this boot, it is `RUNNING`, and its
+supervisor is the process that took it (start time compared, so a reused pid does not
+count). Anything else (no record, `ORPHANED`, a dead supervisor, an earlier boot, an
+empty or non-ticket-id argument, a missing or extra argument) exits `1` with one line
+on stderr: `lane lease-check: <id> is not a live lease on this host (<reason>)`. A job
+on a remote runner needs no special case: `remote-exec` scrubs the submitter's lease
+and admits the job through the runner's own broker, so the job's `LANE_BROKER_LEASE`
+is the runner-local ticket (`remoteLaneId`), leased in the runner's state dir. A nested
+reentrant `lane run` passes the outer lease id through, which checks as live. A hook
+feature-detects the command with `lease-check/1` in `lane capabilities --json`.
 
 ### Priority (foundations, BRAIN-380 slice 1)
 
@@ -1938,7 +1967,7 @@ cores a test needs:
 
 Prints one JSON line: `{"version", "capabilities": [...], "schedulerMode", "admissionMode", "classes": {"mode", "configHash", "stateRoot", "valid"}}`. `capabilities` is the
 same list `lane remote-probe` advertises (`elastic-claims/1`, `priority/1`, `artifacts/1`, `sim-safe-backfill/1`,
-`lane-aging/1`, `group-reap/1`, `remote-withdraw/1`, `exclusive/1`, `attempt-logpath/1`: a remote attempt record carries the submitter's `logPath` and `cwd`, so a caller that crashed between `lane run --detach` and learning the id can find its attempt by `--log` path, BRAIN-462, `classes/1`, `remote-drain/1`, `queue-retier/1`: `lane priority` works on a ticket queued here). `classes` reports the work-class caps in force (see "Work classes and per-machine caps"). `schedulerMode` is `priority` when a valid `sched-v2.json` fence is present and
+`lane-aging/1`, `group-reap/1`, `remote-withdraw/1`, `exclusive/1`, `attempt-logpath/1`: a remote attempt record carries the submitter's `logPath` and `cwd`, so a caller that crashed between `lane run --detach` and learning the id can find its attempt by `--log` path, BRAIN-462, `classes/1`, `remote-drain/1`, `queue-retier/1`: `lane priority` works on a ticket queued here, `lease-check/1`: `lane lease-check <id>` exists, BRAIN-553). `classes` reports the work-class caps in force (see "Work classes and per-machine caps"). `schedulerMode` is `priority` when a valid `sched-v2.json` fence is present and
 `legacy` otherwise; `admissionMode` is the global config's `schedulerMode` (`active` or `shadow`). A caller that needs
 a feature (for example a pool gate that requires `group-reap/1`) checks this before relying on it.
 

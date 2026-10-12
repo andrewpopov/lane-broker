@@ -53,6 +53,9 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // BRAIN-550: reserve a lane's CPU from its observed usage (ceil(p90 mean x 1.2), within [floor, declared]) once it has
   // enough finished runs, instead of its declared cpuCores. A lane opts out with `rightSize: false`.
   rightSizeFromHistory: true,
+  // BRAIN-552: the most CPU an unapproved request may reserve (an ad-hoc lane, `--cpu` above the committed declaration, a working-tree
+  // `.lane-broker.json` raising a lane above HEAD). A lane is approved only at the cpuCores its committed `.lane-broker.json` declares.
+  maxUnapprovedCpuCores: 4,
   // BRAIN-452: the heaviest weight a non-exclusive lane may declare; identical on every host so a submission valid on one is valid on all.
   maxLaneWeight: 4,
   // Second, separate body of work (conflict-skip starvation bound — see
@@ -302,6 +305,7 @@ function validateGlobalConfig(cfg, sourcePath) {
   assert(typeof cfg.historyDemandEnabled === 'boolean', `${sourcePath}: "historyDemandEnabled" must be a boolean`);
   assert(Number.isInteger(cfg.maxLaneWeight) && cfg.maxLaneWeight >= 1, `${sourcePath}: "maxLaneWeight" must be a positive integer`);
   assert(typeof cfg.rightSizeFromHistory === 'boolean', `${sourcePath}: "rightSizeFromHistory" must be a boolean`);
+  assert(Number.isFinite(cfg.maxUnapprovedCpuCores) && cfg.maxUnapprovedCpuCores > 0, `${sourcePath}: "maxUnapprovedCpuCores" must be a positive number`);
   assert(typeof cfg.historyDemandRaise === 'boolean', `${sourcePath}: "historyDemandRaise" must be a boolean`);
   assert(Number.isInteger(cfg.historyDemandMinRuns) && cfg.historyDemandMinRuns >= 1, `${sourcePath}: "historyDemandMinRuns" must be a positive integer`);
   assert(

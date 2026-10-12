@@ -533,6 +533,29 @@ test('a real matching lease forwarded via LANE_BROKER_LEASE/KEY is NOT reused (I
   assert.equal(probe.local, '1');
 });
 
+// BRAIN-553: a hook running on a runner asks `lane lease-check` about the LANE_BROKER_LEASE it inherited. That id is the
+// runner's own local ticket (remoteLaneId), leased in the runner's broker, so it must check as live there.
+test('a protocol-2 job on a runner sees its local remoteLaneId as LANE_BROKER_LEASE, and lane lease-check accepts it', async () => {
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const probeFile = path.join(tmpDir('remote-exec-probe'), 'probe.json');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const script = [
+    "const r = require('child_process').spawnSync(process.execPath, [process.argv[1], 'lease-check', process.env.LANE_BROKER_LEASE || ''], { encoding: 'utf8' });",
+    "require('fs').writeFileSync(process.env.PROBE_FILE, JSON.stringify({ lease: process.env.LANE_BROKER_LEASE || null, status: r.status, stderr: r.stderr }));",
+    'process.exit(r.status ?? 1);',
+  ].join(' ');
+  const header = makeHeader({ protocol: 2, argv: [process.execPath, '-e', script, BIN] });
+
+  const { code, err } = await runOne(header, entries, { env: { ...env, PROBE_FILE: probeFile }, root, src });
+  assert.equal(code, 0, err);
+  const result = await getResult(header.ticketId, root, env);
+  const probe = JSON.parse(fs.readFileSync(probeFile, 'utf8'));
+  assert.equal(probe.lease, result.remoteLaneId, 'the job runs under the runner-local ticket id, not the submitter\'s');
+  assert.equal(probe.status, 0, probe.stderr);
+  assert.equal(result.exit, 0);
+});
+
 // BRAIN-380: a remote-exec ticket's tier comes only from the dispatch header (none yet, so medium). The runner shell's own
 // LANE_BROKER_PRIORITY -- valid or not -- must neither set the tier nor fail the run.
 for (const shellValue of ['high', 'low', 'not-a-tier']) {

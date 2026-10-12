@@ -1,6 +1,6 @@
 import path from 'node:path';
 import fs from 'node:fs';
-import { paths, atomicWriteJson, readJsonSafe, bootId, listJsonRecordsStrict } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, bootId, listJsonRecordsStrict, stateHome, isTicketId } from './state.js';
 import { trackerForLease, reapLogLine } from './descendants.js';
 import { writeBrokerLog } from './admission.js';
 import { isPidAlive, processStartTime, isProcessAlive } from './process-liveness.js';
@@ -77,6 +77,34 @@ export function isGroupAlive(pgid) {
  */
 export function isSupervisorAlive(lease) {
   return isProcessAlive(lease.supervisorPid, lease.supervisorStart);
+}
+
+// BRAIN-553: `lane lease-check`, so a hook can ask whether its LANE_BROKER_LEASE names a real lease before trusting it.
+export const LEASE_CHECK_CAPABILITY = 'lease-check/1';
+
+/**
+ * The lease `id` names, if it is live on this host: recorded this boot, RUNNING, and held by the supervisor that took
+ * it (start time compared, so a reused pid does not count). Otherwise `{ lease: null, reason }`. ORPHANED is never live:
+ * the reaper writes it only once the supervisor is confirmed dead. A remote runner's job is covered without a special
+ * case, because the runner admits it through its own broker and the job's LANE_BROKER_LEASE is that local lease.
+ */
+export function liveLease(root, id, currentBootId = bootId()) {
+  if (!isTicketId(id)) return { lease: null, reason: 'not a ticket id' };
+  const lease = readLease(root, id);
+  if (!lease) return { lease: null, reason: 'no lease record' };
+  if (lease.bootId !== currentBootId) return { lease: null, reason: 'recorded before this boot' };
+  if (lease.state !== LEASE_STATE.RUNNING) return { lease: null, reason: `lease is ${lease.state ?? 'in no state'}` };
+  if (!isSupervisorAlive(lease)) return { lease: null, reason: 'its supervisor has exited' };
+  return { lease, reason: null };
+}
+
+/** `lane lease-check <id>`: exit 0, silently, only for a live lease on this host; 1 with one stderr line otherwise. */
+export function leaseCheckCommand(args, root = stateHome()) {
+  const id = args.length === 1 ? args[0] : '';
+  const { lease, reason } = args.length === 1 ? liveLease(root, id) : { lease: null, reason: 'expected exactly one <id>' };
+  if (lease) return { exitCode: 0 };
+  process.stderr.write(`lane lease-check: ${id || '""'} is not a live lease on this host (${reason})\n`);
+  return { exitCode: 1 };
 }
 
 const ORPHAN_REAP_GRACE_MS = 10_000;
