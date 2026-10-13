@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { childExitSafeFlags } from './node-exit-safe.js';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
@@ -564,7 +565,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
         maxBytes: runnerCfg.remoteDepsCacheMaxBytes,
       },
     });
-    pipelineCmd = [process.execPath, laneBinPath, 'remote-pipeline', ticketDir];
+    pipelineCmd = [process.execPath, ...childExitSafeFlags(), laneBinPath, 'remote-pipeline', ticketDir];
   }
 
   const remotePriority = remotePriorityFrom(header);

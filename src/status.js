@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { childExitSafeFlags } from './node-exit-safe.js';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { ensureStateDirs, paths, withLock, bootId, readJsonSafe, readDrainMarker, readRemoteDrain } from './state.js';
@@ -681,7 +682,7 @@ function spawnReconcileSweep(status) {
   if (process.env.LANE_BROKER_TEST_NO_STATUS_RECONCILE === '1') return;
   if (!status.remote?.some((r) => r.orphaned && !r.moveInterrupted)) return;
   try {
-    const child = spawn(process.execPath, [LANE_BIN, 'reconcile'], { detached: true, stdio: 'ignore', env: process.env });
+    const child = spawn(process.execPath, [...childExitSafeFlags(), LANE_BIN, 'reconcile'], { detached: true, stdio: 'ignore', env: process.env });
     child.on('error', () => {});
     child.unref();
   } catch {

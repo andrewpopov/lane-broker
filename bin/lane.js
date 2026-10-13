@@ -1,4 +1,6 @@
 #!/usr/bin/env node
+// First import on purpose (ESM hoists imports): BRAIN-577, see src/node-exit-safe.js.
+import '../src/node-exit-safe-boot.js';
 import { runCommand } from '../src/run.js';
 import { statusCommand } from '../src/status.js';
 import { suggestCommand } from '../src/suggest.js';
