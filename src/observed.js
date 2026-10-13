@@ -134,10 +134,12 @@ export function leaseSilence(lease, now, cfg) {
   const fresh = (lastKey) => isNum(lease[lastKey]) && now - lease[lastKey] <= 3 * cfg.sampleMs;
   const streak = (sinceKey, lastKey) => (fresh(lastKey) && isNum(lease[sinceKey]) ? lease[lastKey] - lease[sinceKey] : 0);
   const silent = silentMs >= cfg.hungAfterMs;
+  const idleMs = streak('cpuIdleSince', 'cpuIdleLastAt');
   return {
     silentMs,
     cpu: isNum(lease.cpuIntervalCores) ? lease.cpuIntervalCores : isNum(lease.observedCpuCores) ? lease.observedCpuCores : null,
-    idleMs: streak('cpuIdleSince', 'cpuIdleLastAt'),
+    idleMs,
+    idle: idleMs >= cfg.idleCreditAfterMs,
     silent,
     hung: silent && streak('cpuHungSince', 'cpuHungLastAt') >= cfg.hungAfterMs,
   };

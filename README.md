@@ -1891,15 +1891,31 @@ bytes the command writes (immune to the log writer's discard mode) and keeps CPU
 (cumulative CPU deltas; a gap of more than 2x `sampleMs`, an unreadable tree or a process joining or leaving the tree
 resets them). `lane status` shows `[HUNG? silent <t>, cpu <x> — lane cancel <id>]` when a run has been silent and under
 `hungCpuCores` for `hungAfterMs`, `[SILENT <t>, cpu <x>]` when only silent (a hang that still spins CPU), and `idle <t>`
-once CPU-idle (under `idleCreditBelowFraction` x its grant) for 10 minutes. `--json` carries `silentMs`, `silent`, `hung`,
-`idleMs` and `cpu` per running lease.
+once CPU-idle (under `idleCreditBelowFraction` x its grant) for `idleCreditAfterMs`. `--json` carries `silentMs`, `silent`, `hung`,
+`idleMs`, `idle` and `cpu` per running lease.
 
 | Setting | Default | Meaning |
 |---|---|---|
 | `hungAfterMs` | `1800000` | Silence (and, for `HUNG?`, CPU-idle) this long raises the flag. |
 | `hungCpuCores` | `0.05` | CPU line under which a silent run counts as hung. |
 | `idleCreditBelowFraction` | `0.1` | Fraction of the grant under which an interval is CPU-idle. |
-| `idleCreditMode` | `shadow` | `off`, `shadow` or `active`; accepted now, unused until idle credit lands. |
+| `idleCreditAfterMs` | `600000` | How long a lease must stay CPU-idle before it is noted `idle` and counts toward the credit. |
+| `idleCreditMode` | `shadow` | `off` computes and shows nothing; `shadow` reports and logs the credit without changing any decision. `active` is rejected ("not implemented until BRAIN-532 step 3"). |
+
+**Idle credit, shadow (BRAIN-532 step 2).** A held lease that stays CPU-idle keeps its reserved cores, so the queue head waits
+behind cores nobody uses. In `shadow` mode the broker computes the credit admission *would* grant and records it; it never
+changes an admission decision (step 3 will apply it). A lease is credited once its interval CPU has stayed under
+`idleCreditBelowFraction` x its grant for `idleCreditAfterMs`; its credit is what admission charges it (never above its grant)
+minus the larger of what it uses and its elastic floor (`minCpuCores`). One busy interval revokes it at the next sample (no
+hysteresis). The total is capped at host cores minus the CPU budget, so a credited booking can never exceed the machine.
+CPU only: memory is never credited.
+
+`lane status` prints `idle credit (shadow): 6.80 cores from 1 lease(s); head would admit: yes|no`, where `yes` means the
+queue head is denied by the CPU projection (as of the last valid host sample) and would fit with the credit. `--json` carries
+`idleCredit: { mode, total, perLease: [{ ticketId, credit }], headWouldAdmit }`. The admission log
+(`admission-decisions.log`) gets one `lane-broker-head-block event=idle-credit-shadow ticket=<id> shadowWouldAdmit=true|false
+creditTotal=<cores> waitedMs=<ms>` line per transition for the head, and `event=idle-credit-shadow-admit ... earlierMs=<ms>`
+when that ticket really starts after a would-admit: the time the credit would have saved. Count the latter to measure the payoff.
 
 A held lease with no fresh CPU reading is charged its cold estimate capped at its own grant; the history raise applies only to a new claim.
 

@@ -292,9 +292,9 @@ test('BRAIN-532: hung and idle-credit keys default sensibly and reject bad value
     }
   };
   const cfg = load({});
-  assert.deepEqual([cfg.hungAfterMs, cfg.hungCpuCores, cfg.idleCreditBelowFraction, cfg.idleCreditMode], [1_800_000, 0.05, 0.1, 'shadow']);
-  assert.equal(load({ idleCreditMode: 'active', hungAfterMs: 60_000 }).idleCreditMode, 'active');
-  for (const bad of [{ hungAfterMs: 0 }, { hungAfterMs: 1.5 }, { hungCpuCores: -1 }, { idleCreditBelowFraction: 0 }, { idleCreditBelowFraction: 1.5 }, { idleCreditMode: 'on' }]) {
+  assert.deepEqual([cfg.hungAfterMs, cfg.hungCpuCores, cfg.idleCreditBelowFraction, cfg.idleCreditAfterMs, cfg.idleCreditMode], [1_800_000, 0.05, 0.1, 600_000, 'shadow']);
+  assert.equal(load({ idleCreditMode: 'off', hungAfterMs: 60_000 }).idleCreditMode, 'off');
+  for (const bad of [{ hungAfterMs: 0 }, { hungAfterMs: 1.5 }, { hungCpuCores: -1 }, { idleCreditBelowFraction: 0 }, { idleCreditBelowFraction: 1.5 }, { idleCreditMode: 'on' }, { idleCreditMode: 'active' }, { idleCreditAfterMs: 0 }]) {
     assert.throws(() => load(bad), ConfigError, JSON.stringify(bad));
   }
 });

@@ -8,6 +8,7 @@ import { refreshCpuEstimates } from './cpu-estimates.js';
 import { recordTicketWait, pruneTicketWaits } from './ticket-wait.js';
 import { evaluateCpuAdmission, freshObservedCores, evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, writeBrokerLog, projectBusy, ticketCpuEstimate } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
+import { idleCreditCores, wouldAdmitWithCredit, recordIdleCreditShadow } from './idle-credit.js';
 import { recordExternalDenial, clearExternalStarved } from './external-cpu.js';
 import { captureShadowInputs, recordAllocationShadow } from './allocation-shadow.js';
 import { classOf } from './allocation.js';
@@ -1426,6 +1427,11 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     const headReservation = { id: headTicket.id, key: headTicket.key, configLane: headTicket.configLane, cmdFingerprint: headTicket.cmdFingerprint, weight: headTicket.weight, resources: headTicket.resources };
     const admissionHeld = safeBackfill || conflictPick || (expressAdmit && expressHeadProtected) ? [...held, headReservation] : held;
     const fullDecision = evaluateNewAdmission(root, cfg, ticket, admissionHeld, cpuSample, memInfo);
+    // BRAIN-532 step 2: shadow idle credit. Computed from the finished decision and only recorded; nothing below reads it.
+    if (cfg.idleCreditMode !== 'off' && ticket.id === headTicket.id) {
+      const credit = idleCreditCores(held, cpuSample, cfg, now);
+      recordIdleCreditShadow(root, { ticket, wouldAdmit: wouldAdmitWithCredit(fullDecision, credit), creditTotal: credit.total, now });
+    }
     // BRAIN-360: an elastic ticket (resources.minCpuCores) denied ONLY by the CPU projection is
     // re-evaluated at smaller claims, over the same held leases (and, for a safe backfill, the same
     // head reservation), so the grant can never delay what the full claim could not. Active mode
@@ -1736,6 +1742,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // with it (a displaced ticket may start as a backfill), and with them any reservation it owned.
     if (sched.v2) store.depart(ticket.id);
     else if (headPolling) store.dropResourceRecord();
+    if (cfg.idleCreditMode !== 'off') recordIdleCreditShadow(root, { ticket, started: true, now });
     return {
       result: { started: true, lease },
       logFields: { ...logBase, currentDecision: 'start', currentReason: idleExempt ? 'resource-idle-exempt' : baselineReason },
