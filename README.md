@@ -914,6 +914,13 @@ again:
   ssh. An `unfinished`, mismatched or unbound record (an attempt from a client older than 0.34.0) is left alone;
 - a job the runner reports `gone` with no result is settled as lost (exit `75`, `reason: runner-lost`) only after the runner
   confirms a `remote-cancel`, so it can no longer be running or start there;
+- a runner record that binds to the dispatch and itself proves the job never started (`rejected`, `unfinished: queue-timeout`,
+  `unfinished: withdrawn`, the same proof the live supervisor trusts to retry elsewhere) is settled as lost (exit `75`,
+  `reason: runner-never-started`, `lostDetail` naming the record). A record that fails the binding match stays ambiguous;
+- a probe-phase orphan with no `runner`, no `dispatchedRunners` and no `binding` (the supervisor died while probing) is settled as
+  lost (exit `75`, `reason: never-dispatched`) without any ssh call. This is safe because the supervisor writes the runner,
+  `dispatchedRunners` and the binding to the attempt before it spawns the submit ssh, on first dispatch and on every
+  runner-to-runner move;
 - a job the runner still runs is left alone; so is anything when the runner cannot be reached.
 
 `lane wait` asks the runner inline: it returns the settled exit, keeps waiting while the runner reports the job running (asking

@@ -650,7 +650,7 @@ export function renderStatusText(status) {
       lines.push('  (none)');
     } else {
       for (const r of status.remote) {
-        const flag = r.moveInterrupted ? `  [${r.moveInterrupted}] — reconcile with: lane cancel ${r.id}` : r.orphaned ? `  [ORPHANED-REMOTE] — reconciles automatically when ${r.runner ?? 'its runner'} answers (or: lane cancel ${r.id})` : '';
+        const flag = r.moveInterrupted ? `  [${r.moveInterrupted}] — reconcile with: lane cancel ${r.id}` : r.orphaned ? `  [ORPHANED-REMOTE] — ${r.runner ? `reconciles automatically when ${r.runner} answers` : 'no runner recorded; settles on the next reconcile if it never dispatched'} (or: lane cancel ${r.id})` : '';
         lines.push(`  ${r.id}  runner=${r.runner ?? '-'}  phase=${r.phase}  elapsed=${fmtMs(r.elapsedMs)}${flag}`);
       }
     }

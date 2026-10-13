@@ -651,7 +651,7 @@ function isWithdrawnRecord(record, expected) {
 
 /** True iff `record` binds to `expected` and is the runner's own statement that nothing ran: rejected before running, expired
  *  in its queue, or withdrawn while queued. */
-function provesNeverStarted(record, expected) {
+export function provesNeverStarted(record, expected) {
   return (
     matchesTicket(record, expected) &&
     (record.kind === 'rejected' || (record.kind === 'unfinished' && (record.reason === 'queue-timeout' || record.reason === 'withdrawn')))
