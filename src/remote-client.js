@@ -796,6 +796,8 @@ export async function dispatchRemote(opts) {
     queueTimeoutMs = null,
     // BRAIN-431: the submitter's resolved no-progress timeout; the runner applies it instead of its own config
     noProgressTimeoutMs = null,
+    // BRAIN-576: likewise the submitter's resolved silence timeout
+    silenceTimeoutMs = null,
     // BRAIN-380 §6: the tier the submitter resolved BEFORE any cap, and the wait it has accrued on its own priority
     // clock. Additive header fields: an older runner ignores them, so its ticket is simply medium.
     priorityRequested,
@@ -880,6 +882,7 @@ export async function dispatchRemote(opts) {
   if (Number.isFinite(minCpuCores)) header.minCpuCores = minCpuCores;
   if (Number.isInteger(queueTimeoutMs) && queueTimeoutMs > 0) header.queueTimeoutMs = queueTimeoutMs;
   if (Number.isInteger(noProgressTimeoutMs) && noProgressTimeoutMs >= 0) header.noProgressTimeoutMs = noProgressTimeoutMs;
+  if (Number.isInteger(silenceTimeoutMs) && silenceTimeoutMs >= 0) header.silenceTimeoutMs = silenceTimeoutMs;
   if (laneClass === 'sim' || laneClass === 'test') header.laneClass = laneClass;
   if (classEnforcement === 'required') header.classEnforcement = 'required';
   if (isPriorityTier(priorityRequested)) header.priorityRequested = priorityRequested;

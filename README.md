@@ -1857,7 +1857,7 @@ Documented limits, not bugs:
 | `81` | `lane priority`: the ticket is in the wrong state: running, or queued on a runner / owned by a submitter (cancel and resubmit with `--priority`). |
 | `85` | `lane priority`: the queued ticket's supervisor is no longer alive. |
 | `89` | `lane priority`: legacy scheduler (no valid fence or `fairness-v2.json`); priority reorders nothing until `lane migrate-scheduler`. |
-| `124` | Killed by the no-progress watchdog (`reason: "no-progress"`, see below). |
+| `124` | Killed by the no-progress watchdog (`reason: "no-progress"`) or the silence watchdog (`reason: "silence"`), see below. |
 | `130` | Cancelled (SIGINT/SIGTERM) while still queued, before the lane ever started. |
 
 ### No-progress watchdog (BRAIN-431)
@@ -1892,6 +1892,30 @@ row carry `exit: 124`, `reason: "no-progress"` and `noProgressTimeoutMs`, and th
 (its lane, else its global value), sent to the runner in the dispatch header, so a runner's own config never changes it;
 the runner relays the reason and window back, and the submitter's history row is `executor: "remote"`, exit 124,
 `reason: "no-progress"`.
+
+#### Silence watchdog (BRAIN-576)
+
+The no-progress watchdog needs output, tree membership **and** CPU all idle, so a wedged process that still spins CPU
+(a rouge e2e run sat silent for 3.5 h while Chrome burned 24221 CPU-seconds) never trips it. The silence watchdog is the
+opt-in complement: a run that has written **no output** (stdout + stderr) for `silenceTimeoutMs` is killed whatever its
+CPU does. It reuses the same machinery: the output stamp behind `lastOutputAt` (measured on the monotonic clock; a run
+that never writes counts from its start), the single reap, and the same `exit: 124`. If both fire, the first one wins and
+nothing reaps twice; a cancel arriving mid-reap still wins with `130`.
+
+| Setting | Where | Default | Meaning |
+|---|---|---|---|
+| `silenceTimeoutMs` | global `config.json` | `0` | Time without any output that triggers the kill; `0` never kills. |
+| `silenceTimeoutMs` | a lane in `.lane-broker.json` | the global value | Per-lane value (an undeclared lane inherits its `as` template's); `0` disables for the lane. |
+
+The result and history row carry `exit: 124`, `reason: "silence"` and `silenceTimeoutMs`; the admission log gets
+`lane-broker-reap id=<id> descendants-reaped=<n> reason=silence`; the submitter sees `lane run: no output for 20m —
+killed (silence watchdog)` (also appended to the lease log). A remote run uses the submitter's resolved value, sent in
+the dispatch header (`silenceTimeoutMs`), and the runner relays the reason and window back.
+
+Do not opt in a lane that builds images, downloads, or buffers its output until the end: silence is legitimate there and
+the watchdog cannot tell. Pick `noProgressTimeoutMs` for a hang that goes idle (no output, no CPU); pick
+`silenceTimeoutMs` for a streaming lane (e2e, verify) that can hang while still burning CPU, with a window well above its
+longest legitimate quiet stretch. A lane may set both.
 
 **Hung and silent runs (BRAIN-532, warning only; nothing is ever cancelled).** The supervisor stamps `lastOutputAt` from the
 bytes the command writes (immune to the log writer's discard mode) and keeps CPU-idle anchors from per-interval cores

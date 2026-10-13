@@ -13,6 +13,8 @@ import { readProcCpuRows } from './preemptible.js';
 export const NO_PROGRESS_REASON = 'no-progress';
 export const NO_PROGRESS_EXIT = 124;
 export const NO_PROGRESS_CPU_SECONDS_PER_MINUTE = 0.05;
+// BRAIN-576: the silence watchdog shares this machinery (same output stamp, clock, reap path, exit) but ignores CPU entirely
+export const SILENCE_REASON = 'silence';
 
 const identity = (row) => `${row.pid}:${row.token}`;
 const cpuOf = (row) => row.cpuSec + (row.childCpuSec ?? 0);
@@ -32,14 +34,16 @@ function intervalCores(previous, current, now) {
 
 export class NoProgressWatchdog {
   /** @param timeoutMs streak length that triggers the kill; 0 (or less) records the stall signal but never kills */
-  constructor({ timeoutMs, readRows = readProcCpuRows, clock = () => performance.now() }) {
+  constructor({ timeoutMs, silenceTimeoutMs = 0, readRows = readProcCpuRows, clock = () => performance.now() }) {
     this.timeoutMs = timeoutMs;
+    this.silenceTimeoutMs = silenceTimeoutMs;
     this.readRows = readRows;
     this.clock = clock;
     this.outputBytes = 0;
     this.baseline = null; // { at, outputBytes, cpu: identity -> cumulative CPU seconds } of the previous observation
     this.idleSince = null;
     this.maxIdleMs = 0;
+    this.lastOutputMono = null; // monotonic: the last byte the command wrote, else the start() time (BRAIN-576)
     this.lastOutputAt = null; // wall-clock ms of the last byte the command wrote (BRAIN-532)
     this.lastIntervalCores = null; // CPU cores over the last interval; null when it could not be measured or the tree changed
   }
@@ -51,6 +55,22 @@ export class NoProgressWatchdog {
   noteOutput(byteCount) {
     this.outputBytes += byteCount;
     this.lastOutputAt = Date.now();
+    this.lastOutputMono = this.clock();
+  }
+
+  /** BRAIN-576: the command was just spawned; a run that never writes is silent from here. */
+  start() {
+    this.lastOutputMono ??= this.clock();
+  }
+
+  /** BRAIN-576: ms since the command last wrote a byte (since start when it never has), on the monotonic clock. */
+  silentMs() {
+    return this.lastOutputMono === null ? 0 : this.clock() - this.lastOutputMono;
+  }
+
+  /** BRAIN-576: true once the opt-in silence window has elapsed, whatever the CPU is doing. */
+  shouldKillSilent() {
+    return this.silenceTimeoutMs > 0 && this.silentMs() >= this.silenceTimeoutMs;
   }
 
   /**
@@ -114,3 +134,6 @@ export function formatWindow(ms) {
 
 /** The submitter-facing explanation, identical for a local run and a relayed remote one. */
 export const noProgressMessage = (timeoutMs) => `lane run: no progress for ${formatWindow(timeoutMs)} (no output, no CPU) — killed\n`;
+
+/** BRAIN-576: the submitter-facing explanation of a silence kill, identical for a local run and a relayed remote one. */
+export const silenceMessage = (timeoutMs) => `lane run: no output for ${formatWindow(timeoutMs)} — killed (silence watchdog)\n`;

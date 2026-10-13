@@ -232,6 +232,7 @@ export async function runCommand({
   minCpuOverride,
   memoryOverride,
   noProgressTimeoutOverride,
+  silenceTimeoutOverride,
   // BRAIN-403: `--exclusive`; the lane config's `exclusive` is the other way in
   exclusive: exclusiveOverride,
   // BRAIN-549: `--no-cache` (env LANE_BROKER_NO_CACHE=1 is the other way): run even when a cached pass exists
@@ -590,6 +591,7 @@ export async function runCommand({
     ...(resolved.nice !== undefined && resolved.nice !== null ? { niceOverride: resolved.nice } : {}),
     // BRAIN-431: a remote runner's value is the submitter's own resolved one, never this host's config
     noProgressTimeoutMs: noProgressTimeoutOverride ?? resolved.noProgressTimeoutMs ?? globalCfg.noProgressTimeoutMs,
+    silenceTimeoutMs: silenceTimeoutOverride ?? resolved.silenceTimeoutMs ?? globalCfg.silenceTimeoutMs,
     maxConcurrent: resolved.maxConcurrent,
     class: resolved.class,
     aging: resolved.aging,
