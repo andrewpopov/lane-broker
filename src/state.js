@@ -64,6 +64,8 @@ export function paths(root = stateHome()) {
     configWarning: path.join(root, 'config-warning.json'),
     cpuSample: path.join(root, 'cpu-sample.json'),
     cpuGate: path.join(root, 'cpu-gate.json'),
+    // BRAIN-532 step 2: the queue head's shadow idle-credit verdict, for transition-only logging
+    idleCreditShadow: path.join(root, 'idle-credit-shadow.json'),
     admissionLog: path.join(root, 'admission-decisions.log'),
     // BRAIN-551: p50 run time per (repo, lane[, command]) from history, and this host's express admissions in the last minute.
     expressEstimates: path.join(root, 'express-estimates.json'),

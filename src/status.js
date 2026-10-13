@@ -6,7 +6,7 @@ import { ensureStateDirs, paths, withLock, bootId, readJsonSafe, readDrainMarker
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
 import { listQueueCapped, reapOrphanedQueue, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState, readResourceSkipState, futileFresh } from './scheduler.js';
 import { refreshCpuEstimates } from './cpu-estimates.js';
-import { cpuBudget, projectBusy, ticketCpuEstimate, ticketCpuEstimateBasis } from './admission.js';
+import { cpuBudget, hostCpuLoad, projectBusy, ticketCpuEstimate, ticketCpuEstimateBasis } from './admission.js';
 import { classLocks, classOf, simArmed, usedByClass } from './allocation.js';
 import { resolveClasses, bookedSims, classQueuePolicy } from './classes.js';
 import { queuedClaimsByClass } from './allocation-shadow.js';
@@ -24,6 +24,7 @@ import { loadExpressTable, expressVerdict } from './express.js';
 import { exclusiveHoldView, clampQueuedWeight } from './exclusive.js';
 import { priorityOf, effectiveRank, tierName } from './priority.js';
 import { leaseOverrun, leaseSilence } from './observed.js';
+import { idleCreditCores } from './idle-credit.js';
 import { topExternalCpu, externalBusyCores, windowExternalCores, scanProcWindow, starvedStaleMs, starvedForMs } from './external-cpu.js';
 import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores, cpuBudgetCores } from './resources.js';
 
@@ -305,6 +306,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       moveInterrupted: !supervisorAlive(a) ? moveInterruptedLabel(a.id, a) : null,
     }));
 
+  const resourceBlock = computeResourceBlock(root, store, cfg, queue[0], held, now);
   return {
     capacity: effectiveWeightCapacity(cfg, resourceCapacity.cpuCores),
     used: runningWeight,
@@ -340,7 +342,8 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     // blocked head whose skip allowance is exhausted) — see computeHeadBlock.
     headBlock: computeHeadBlock(root, store, cfg, queue, leases, now, effectiveWeightCapacity(cfg, resourceCapacity.cpuCores)),
     // BRAIN-346: the projected-over-budget head's backfill allowance / reservation, if any.
-    resourceBlock: computeResourceBlock(root, store, cfg, queue[0], held, now),
+    resourceBlock,
+    ...(cfg.idleCreditMode === 'off' ? {} : { idleCredit: computeIdleCredit(cfg, held, queue[0], lastCpuSample, resourceCapacity.cpuCores, now) }),
     ...(configError ? { configError } : {}),
     configWarning: configWarning ? { message: configWarning.message, firstAt: configWarning.firstAt, lastAt: configWarning.lastAt } : null,
     loadGate: {
@@ -376,6 +379,22 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
  *  poll, so anything this many multiples older can only mean nothing has
  *  been selected in that whole span. */
 const STALE_SAMPLE_MS = 5 * 60 * 1000;
+
+/**
+ * BRAIN-532 step 2: the idle credit admission would grant (shadow: reported, never applied) and whether the queue head,
+ * denied by the CPU projection as of the last valid host sample, would admit with it. Same maths as admission (hostCpuLoad, projectBusy).
+ */
+function computeIdleCredit(cfg, held, head, lastCpuSample, hostCores, now) {
+  const sample = lastCpuSample ?? { cores: hostCores };
+  const credit = idleCreditCores(held, sample, cfg, now);
+  let headWouldAdmit = false;
+  if (head && lastCpuSample && credit.total > 0) {
+    const { externalBusy, budget } = hostCpuLoad(lastCpuSample, held, cfg, now);
+    const projected = projectBusy(externalBusy, held, ticketCpuEstimate(head, cfg, now, held.length > 0 ? budget : undefined), now, cfg, budget);
+    headWouldAdmit = projected > budget && projected - credit.total <= budget;
+  }
+  return { mode: cfg.idleCreditMode, total: credit.total, perLease: credit.perLease, headWouldAdmit };
+}
 
 /** BRAIN-379 (shadow): per-class CPU used, soft-lock target and queued claim. Report-only; read-only like the rest of status. */
 function computeAllocation(root, cfg, queue, held, cpuCores, now) {
@@ -423,13 +442,12 @@ function noProgressNote(r) {
   return r.noProgressSinceMs >= 60_000 ? `  no-progress=${fmtMs(r.noProgressSinceMs)}` : '';
 }
 
-/** BRAIN-532: `[HUNG? ...]` (silent and CPU-idle), `[SILENT ...]` (silent only), or `[idle <dur>]` once CPU-idle for 10 minutes. */
-const IDLE_NOTE_MS = 10 * 60 * 1000;
+/** BRAIN-532: `[HUNG? ...]` (silent and CPU-idle), `[SILENT ...]` (silent only), or `idle <dur>` once CPU-idle for `idleCreditAfterMs`. */
 function silenceFlag(r) {
   const cpu = Number.isFinite(r.cpu) ? r.cpu.toFixed(2) : '-';
   if (r.hung) return ` [HUNG? silent ${fmtMs(r.silentMs)}, cpu ${cpu} — lane cancel ${r.id}]`;
   if (r.silent) return ` [SILENT ${fmtMs(r.silentMs)}, cpu ${cpu}]`;
-  return r.idleMs >= IDLE_NOTE_MS ? ` idle ${fmtMs(r.idleMs)}` : '';
+  return r.idle ? ` idle ${fmtMs(r.idleMs)}` : '';
 }
 
 function fmtMs(ms) {
@@ -543,6 +561,10 @@ export function renderStatusText(status) {
         (rb.futile ? ' (futile: external load alone exceeds budget; backfilling)' : '') +
         (rb.reserved ? ', RESERVED — nothing else is admitted past it' : ''),
     );
+  }
+  if (status.idleCredit) {
+    const ic = status.idleCredit;
+    lines.push(`idle credit (${ic.mode}): ${ic.total.toFixed(2)} cores from ${ic.perLease.length} lease(s); head would admit: ${ic.headWouldAdmit ? 'yes' : 'no'}`);
   }
   if (status.queued.length > 0) {
     const head = status.queued[0];

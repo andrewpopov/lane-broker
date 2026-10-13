@@ -139,10 +139,13 @@ export const DEFAULT_GLOBAL_CONFIG = {
   noProgressTimeoutMs: 0,
   // BRAIN-532: a run silent AND under `hungCpuCores` for `hungAfterMs` is flagged `HUNG?` in `lane status` (warning only, never a kill);
   // silence alone is flagged `SILENT`. `idleCreditBelowFraction` x grant is the CPU-idle line the idle detector uses.
-  // `idleCreditMode` is accepted now and unused until the credit lands (shadow, then active).
+  // `idleCreditAfterMs` is how long a lease must stay CPU-idle before `lane status` notes `idle` and the credit counts it.
+  // `idleCreditMode`: 'shadow' computes, reports and logs the credit without changing any decision; 'off' computes nothing.
+  // 'active' is rejected until step 3 (BRAIN-532) applies the credit.
   hungAfterMs: 1_800_000,
   hungCpuCores: 0.05,
   idleCreditBelowFraction: 0.1,
+  idleCreditAfterMs: 600_000,
   idleCreditMode: 'shadow',
   // BRAIN-549: a command that already passed on the exact same worktree content within this many seconds is answered from
   // history instead of re-run. 0 turns the result cache off.
@@ -369,7 +372,9 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isFinite(cfg.idleCreditBelowFraction) && cfg.idleCreditBelowFraction > 0 && cfg.idleCreditBelowFraction <= 1,
     `${sourcePath}: "idleCreditBelowFraction" must be a number in (0, 1]`,
   );
-  assert(['off', 'shadow', 'active'].includes(cfg.idleCreditMode), `${sourcePath}: "idleCreditMode" must be "off", "shadow" or "active"`);
+  assert(Number.isInteger(cfg.idleCreditAfterMs) && cfg.idleCreditAfterMs > 0, `${sourcePath}: "idleCreditAfterMs" must be a positive integer`);
+  assert(cfg.idleCreditMode !== 'active', `${sourcePath}: "idleCreditMode" "active" is not implemented until BRAIN-532 step 3`);
+  assert(['off', 'shadow'].includes(cfg.idleCreditMode), `${sourcePath}: "idleCreditMode" must be "off" or "shadow"`);
   // BRAIN-320 S1a: how long a remote ticket may sit queued on the runner
   // before it is cancelled and treated as unconfirmed (fallback to local).
   // Absent by default (not read yet -- that is a later slice) so a config
