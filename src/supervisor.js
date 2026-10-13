@@ -24,7 +24,7 @@ import { enqueue, existingTicket, tryStart, dequeueSync, couldAdmitNow, listQueu
 import { touchSimArmFor } from './sim-arm.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { selectLeaseTree } from './cpu.js';
-import { DescendantTracker, hasLiveMembers, reapLogLine } from './descendants.js';
+import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
 import { reloadGlobalConfig } from './config.js';
 import { stateHome } from './state.js';
 import { readRows } from './suggest.js';
@@ -47,7 +47,6 @@ import { settledContentKey, isCleanPass } from './result-cache.js';
 import { observedLeaseFields, summarizeObservedCpu, sanitizeRssPeak, integratedCpuSeconds } from './observed.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
-const CANCEL_GRACE_MS = 10_000;
 const GROUP_REAPED_REASON = 'leader-exited-group-reaped';
 const MAX_OMITTED_SYMLINKS_LISTED = 10;
 
@@ -137,7 +136,7 @@ async function killGroup(pgid) {
   } catch {
     return; // already gone
   }
-  const deadline = Date.now() + CANCEL_GRACE_MS;
+  const deadline = Date.now() + cancelGraceMs();
   while (Date.now() < deadline) {
     if (!isGroupAlive(pgid)) return;
     await sleep(100);
@@ -1508,7 +1507,7 @@ async function main() {
   descendants.scan();
   async function killTree(reason) {
     descendants.scan(); // the leader may still be alive: catches anything spawned since the last heartbeat
-    const [, result] = await Promise.all([killGroup(child.pid), descendants.reap({ graceMs: CANCEL_GRACE_MS })]);
+    const [, result] = await Promise.all([killGroup(child.pid), descendants.reap({ graceMs: cancelGraceMs() })]);
     // an incomplete reap is logged but never wedges the lease: the lease is still released
     writeBrokerLog(root, reapLogLine(ticket.id, result, reason));
   }

@@ -18,7 +18,8 @@ const BUSY_SILENT = node(`const end = Date.now() + 5000; while (Date.now() < end
 const CHATTY = node(`let n = 0; const t = setInterval(() => { process.stdout.write('tick ' + n++ + '\\n'); if (n === 14) { clearInterval(t); } }, 300);`);
 
 function localSetup() {
-  const { base, home, state, env } = freshEnv();
+  // README "Testing hooks": 4 s TERM-to-KILL grace (production 10 s), still longer than the cancel's 1.5 s delay below
+  const { base, home, state, env } = freshEnv({ LANE_BROKER_TEST_CANCEL_GRACE_MS: '4000' });
   writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
   const repoDir = path.join(base, 'repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, noProgressTimeoutMs: WINDOW_MS } } });

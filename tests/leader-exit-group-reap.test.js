@@ -8,8 +8,10 @@ import { readLease, isGroupAlive } from '../src/lease.js';
 
 /** ROG-2181 T1b: a leader that dies on its own must not leave descendants running unleased. */
 
+const GRACE_MS = 3000; // production 10 s
+
 function setupRun(shellScript) {
-  const { base, home, state, env } = freshEnv();
+  const { base, home, state, env } = freshEnv({ LANE_BROKER_TEST_CANCEL_GRACE_MS: String(GRACE_MS) }); // README "Testing hooks"
   writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
   const repoDir = path.join(base, 'repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
@@ -68,7 +70,7 @@ test('SIGKILL of the leader alone reaps its surviving child before the lease is 
 test('a TERM-trapping grandchild of a dead leader is escalated to KILL before release', async () => {
   const started = Date.now();
   await killLeaderAlone("sh -c 'trap \"\" TERM; echo $$ > PIDFILE; sleep 30' & wait", { timeoutMs: 20000 });
-  assert.ok(Date.now() - started >= 5000, 'a TERM-ignoring member can only have been reaped after the grace period');
+  assert.ok(Date.now() - started >= GRACE_MS / 2, 'a TERM-ignoring member can only have been reaped after the grace period');
 });
 
 test('a normal exit with no survivors is unchanged (no reap reason)', async () => {

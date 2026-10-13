@@ -529,8 +529,9 @@ function waitClosed(child, abortSignal) {
 }
 
 const DEFAULT_RESULT_WAIT_MS = 3 * 60 * 60_000;
-const RESULT_POLL_START_MS = 5_000;
-const RESULT_POLL_MAX_MS = 30_000;
+// Test-only seam (README "Testing hooks"): the first result-poll backoff; the cap keeps the production 6x ratio.
+const resultPollStartMs = () => Number(process.env.LANE_BROKER_TEST_RESULT_POLL_MS) || 5_000;
+const resultPollMaxMs = () => resultPollStartMs() * 6;
 
 /** Sleep `ms`, resolving early (never rejecting) if `abortSignal` fires. */
 function sleepUnlessAborted(ms, abortSignal) {
@@ -994,7 +995,7 @@ export async function dispatchRemote(opts) {
   let record = null;
   let attemptsMade = 0;
   let waitedFrom = null;
-  let backoffMs = RESULT_POLL_START_MS;
+  let backoffMs = resultPollStartMs();
   let waitExpired = false;
   while (true) {
     if (abortSignal && abortSignal.aborted) {
@@ -1020,7 +1021,7 @@ export async function dispatchRemote(opts) {
       // A {missing:true} with no state (older runner) keeps the back-to-back retries.
       if (!fetched) {
         await sleep(backoffMs, abortSignal);
-        backoffMs = Math.min(backoffMs * 2, RESULT_POLL_MAX_MS);
+        backoffMs = Math.min(backoffMs * 2, resultPollMaxMs());
       }
       continue;
     }
@@ -1030,7 +1031,7 @@ export async function dispatchRemote(opts) {
       break;
     }
     await sleep(backoffMs, abortSignal);
-    backoffMs = Math.min(backoffMs * 2, RESULT_POLL_MAX_MS);
+    backoffMs = Math.min(backoffMs * 2, resultPollMaxMs());
   }
 
   if (abortSignal && abortSignal.aborted) {

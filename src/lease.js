@@ -1,7 +1,7 @@
 import path from 'node:path';
 import fs from 'node:fs';
 import { paths, atomicWriteJson, readJsonSafe, bootId, listJsonRecordsStrict, stateHome, isTicketId } from './state.js';
-import { trackerForLease, reapLogLine } from './descendants.js';
+import { trackerForLease, reapLogLine, cancelGraceMs } from './descendants.js';
 import { writeBrokerLog } from './admission.js';
 import { isPidAlive, processStartTime, isProcessAlive } from './process-liveness.js';
 import { touchSimArmFor } from './sim-arm.js';
@@ -107,7 +107,6 @@ export function leaseCheckCommand(args, root = stateHome()) {
   return { exitCode: 1 };
 }
 
-const ORPHAN_REAP_GRACE_MS = 10_000;
 const ORPHAN_KILL_GIVE_UP_MS = 30_000;
 const ORPHAN_UNREADABLE_GIVE_UP_MS = 60_000;
 
@@ -139,7 +138,7 @@ function stepOrphanReap(root, lease, { now = Date.now(), kill, readTable } = {})
   if (state.killAt !== undefined && now - state.killAt >= ORPHAN_KILL_GIVE_UP_MS) {
     return release({ signalled: state.signalled, survivors: live ?? [], complete: false });
   }
-  const pastGrace = rows !== null && lease.orphanReap !== undefined && now - state.termAt >= ORPHAN_REAP_GRACE_MS;
+  const pastGrace = rows !== null && lease.orphanReap !== undefined && now - state.termAt >= cancelGraceMs();
   const termed = new Set(state.termed);
   const killed = new Set(state.killed);
   const phaseKill = state.killAt !== undefined || pastGrace;

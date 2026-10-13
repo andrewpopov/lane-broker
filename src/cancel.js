@@ -8,9 +8,7 @@ import { terminalRowDefaults } from './resources.js';
 import { remoteCancel } from './remote-client.js';
 import { loadGlobalConfigOrError } from './config.js';
 import { writeBrokerLog } from './admission.js';
-import { trackerForLease, reapLogLine } from './descendants.js';
-
-const GRACE_MS = 10_000;
+import { trackerForLease, reapLogLine, cancelGraceMs } from './descendants.js';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -19,7 +17,7 @@ function sleep(ms) {
 /** TERM the group, wait a grace period, KILL, verify gone. Used when there is no supervisor left to do it.
  *  Also reaps the descendants the dead supervisor last recorded on the lease (BRAIN-419), token-checked. */
 async function killGroupDirectly(lease, root) {
-  const reaping = trackerForLease(lease).reap({ graceMs: GRACE_MS });
+  const reaping = trackerForLease(lease).reap({ graceMs: cancelGraceMs() });
   try {
     if (lease.childPgid) await killGroupOnly(lease.childPgid);
   } finally {
@@ -34,7 +32,7 @@ async function killGroupOnly(pgid) {
   } catch {
     return;
   }
-  const deadline = Date.now() + GRACE_MS;
+  const deadline = Date.now() + cancelGraceMs();
   while (Date.now() < deadline && isGroupAlive(pgid)) {
     await sleep(100);
   }
@@ -76,7 +74,7 @@ export async function cancelAttempt(root, id, attempt) {
     } catch {
       // race: supervisor just exited
     }
-    const deadline = Date.now() + GRACE_MS + 5000;
+    const deadline = Date.now() + cancelGraceMs() + 5000;
     while (Date.now() < deadline && readAttempt(root, id) && supervisorAlive(readAttempt(root, id))) {
       await sleep(100);
     }
@@ -186,7 +184,7 @@ export async function cancelCommand(id) {
     } catch {
       // race: supervisor just exited
     }
-    const deadline = Date.now() + GRACE_MS + 5000;
+    const deadline = Date.now() + cancelGraceMs() + 5000;
     while (Date.now() < deadline && readLease(root, id)) {
       await sleep(100);
     }

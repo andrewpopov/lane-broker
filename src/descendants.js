@@ -41,6 +41,9 @@ export function resetProcUnitsCache() {
   cachedUnits = null;
 }
 
+// Test-only seam (README "Testing hooks"): the grace between TERM and KILL when a cancel reaps a lease's group and descendants.
+export const cancelGraceMs = () => Number(process.env.LANE_BROKER_TEST_CANCEL_GRACE_MS) || 10_000;
+
 export function leaseMarker(leaseId) {
   return `LANE_BROKER_LEASE=${leaseId}`;
 }
