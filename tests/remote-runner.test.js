@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -99,6 +99,7 @@ function spawnRemoteExec(stream, { env, root, cwd }) {
     stderr += d;
   });
   stream.pipe(child.stdin);
+  spawned.push({ child, env });
   // Subscribe to 'close' at spawn time: a test that awaits something else
   // first (e.g. remote-cancel) can otherwise attach its listener after the
   // event already fired and wait forever.
@@ -107,6 +108,42 @@ function spawnRemoteExec(stream, { env, root, cwd }) {
 }
 
 const closed = new WeakMap();
+
+/** Every remote-exec this file spawns, with the env that locates its broker state (BRAIN-575). */
+const spawned = [];
+
+function signal(pid, sig) {
+  try {
+    process.kill(pid, sig);
+  } catch {
+    // already gone
+  }
+}
+
+/** Runs after every test, pass or fail: a failed assertion must never leave a live remote-exec, its
+ *  supervisor or the leased command behind, because the orphan keeps this file's event loop (and
+ *  `node --test`) alive forever. Stopped supervisors are resumed first so the kill is delivered. */
+afterEach(() => {
+  for (const { child, env } of spawned.splice(0)) {
+    // A remote-exec that already exited settled its own ticket; its lease pids may since belong to someone else.
+    if (child.exitCode !== null || child.signalCode !== null) continue;
+    let names = [];
+    const leasesDir = paths(env.LANE_BROKER_STATE).leases;
+    try {
+      names = fs.readdirSync(leasesDir);
+    } catch {
+      // no leases were ever written
+    }
+    for (const n of names) {
+      const lease = readJsonSafe(path.join(leasesDir, n));
+      if (!lease) continue;
+      if (lease.supervisorPid) signal(lease.supervisorPid, 'SIGCONT');
+      if (lease.childPgid) signal(-lease.childPgid, 'SIGKILL');
+      if (lease.supervisorPid) signal(lease.supervisorPid, 'SIGKILL');
+    }
+    signal(child.pid, 'SIGKILL');
+  }
+});
 const CLOSE_TIMEOUT_MS = 60_000;
 
 function waitClose(child) {
@@ -845,7 +882,11 @@ test('remote-cancel against a stopped (SIGSTOP) supervisor reports cancelRequest
   // though `cancelRequested` (the durable marker write) always succeeds.
   // `registered` reflects the (unlocked, informational-only) read that DID
   // see the lease.
-  process.kill(leaseRecord.supervisorPid, 'SIGSTOP');
+  // Stop it only while WE hold the global lock: the supervisor then cannot be holding it (the lock is
+  // exclusive), so remote-cancel below never waits on a frozen owner (BRAIN-575; withLock, src/state.js).
+  await withLock(state, async () => {
+    process.kill(leaseRecord.supervisorPid, 'SIGSTOP');
+  });
   try {
     const cancelResult = await laneRun(['remote-cancel', header.ticketId, '--root', root], { env });
     assert.equal(cancelResult.code, 0, `stderr: ${cancelResult.stderr}`);
