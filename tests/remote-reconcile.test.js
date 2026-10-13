@@ -194,7 +194,7 @@ test('a runner result of kind cancelled is adopted as exit 130', async () => {
 
 test('a runner result of kind unfinished is ambiguous: attempt kept, nothing written', async () => {
   const ctx = context();
-  const id = seedOrphan(ctx, { record: { kind: 'unfinished', reason: 'withdrawn' } });
+  const id = seedOrphan(ctx, { record: { kind: 'unfinished', reason: 'runner-restarted' } });
   const outcome = await reconcile(ctx, id);
   assert.equal(outcome.settled, false);
   assert.equal(outcome.state, 'ambiguous');
@@ -253,6 +253,130 @@ for (const mode of ['down', 'unconfirmed']) {
     assertNothingRan(ctx);
   });
 }
+
+// BRAIN-570: the runner's own record can prove the job never started; a probe-phase orphan never reached a runner at all.
+for (const record of [{ kind: 'unfinished', reason: 'queue-timeout' }, { kind: 'unfinished', reason: 'withdrawn' }, { kind: 'rejected', reason: 'truncated stream' }]) {
+  test(`a binding-matched ${record.kind}/${record.reason} runner record is settled as lost (exit 75, runner-never-started)`, async () => {
+    const ctx = context();
+    const id = seedOrphan(ctx, { record });
+    const outcome = await reconcile(ctx, id);
+    assert.deepEqual(outcome, { settled: true, state: 'lost', exit: 75 });
+    assert.equal(readAttempt(ctx.state, id), null);
+    const result = resultOf(ctx.state, id);
+    assert.equal(result.exit, 75);
+    assert.equal(result.reason, 'runner-never-started');
+    assert.equal(result.lostDetail, `runner skybox reported ${record.kind}: ${record.reason}`);
+    assert.equal(result.reconciled, true);
+    const rows = historyRows(ctx.state);
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].reason, 'runner-never-started');
+    assert.match(fs.readFileSync(paths(ctx.state).admissionLog, 'utf8'), new RegExp(`lane: reconcile: ${id}: skybox: lost \\(runner-never-started\\)`));
+    assertNothingRan(ctx);
+  });
+}
+
+test('a never-started runner record with a mismatched binding stays ambiguous: attempt kept', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { record: { kind: 'unfinished', reason: 'queue-timeout', manifestHash: 'x'.repeat(64) } });
+  const outcome = await reconcile(ctx, id);
+  assert.equal(outcome.state, 'ambiguous');
+  assert.match(outcome.reason, /did not bind/);
+  assertKept(ctx, id);
+});
+
+test('a never-started runner record on a legacy attempt (no binding) stays ambiguous', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { binding: null, record: { kind: 'unfinished', reason: 'queue-timeout' } });
+  assert.equal((await reconcile(ctx, id)).state, 'ambiguous');
+  assertKept(ctx, id);
+});
+
+test('a cancel marker wins over a never-started runner record', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { record: { kind: 'unfinished', reason: 'queue-timeout' } });
+  writeCancelMarkerFile(ctx.state, id);
+  assert.deepEqual(await reconcile(ctx, id), { settled: true, state: 'cancelled', exit: 130 });
+  assert.equal(resultOf(ctx.state, id).cancelled, true);
+});
+
+/** An ssh that records every invocation and fails: proves a reconcile made no ssh call. */
+function sshThatMustNotRun() {
+  const dir = tmpDir('reconcile-no-ssh');
+  const calls = path.join(dir, 'calls');
+  const bin = path.join(dir, 'ssh');
+  fs.writeFileSync(bin, `#!/bin/sh\necho "$@" >> ${JSON.stringify(calls)}\nexit 1\n`);
+  fs.chmodSync(bin, 0o755);
+  return { bin, calls: () => (fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8') : '') };
+}
+
+const probeOrphan = (ctx, attempt = {}) => seedOrphan(ctx, { binding: null, attempt: { phase: 'probe', runner: null, ...attempt } });
+
+test('a probe-phase orphan that never reached a runner is settled as lost (exit 75, never-dispatched) with no ssh call', async () => {
+  const ctx = context();
+  const ssh = sshThatMustNotRun();
+  const id = probeOrphan(ctx);
+  const outcome = await reconcile({ ...ctx, sshBin: ssh.bin }, id);
+  assert.deepEqual(outcome, { settled: true, state: 'lost', exit: 75 });
+  assert.equal(ssh.calls(), '', 'no ssh invocation');
+  assert.equal(readAttempt(ctx.state, id), null);
+  const result = resultOf(ctx.state, id);
+  assert.equal(result.exit, 75);
+  assert.equal(result.reason, 'never-dispatched');
+  assert.equal(result.runner, null);
+  assert.equal(historyRows(ctx.state).length, 1);
+  assert.match(fs.readFileSync(paths(ctx.state).admissionLog, 'utf8'), new RegExp(`lane: reconcile: ${id}: no runner: lost \\(never-dispatched\\)`));
+  assertNothingRan(ctx);
+});
+
+for (const [name, attempt] of [
+  ['dispatchedRunners', { dispatchedRunners: ['skybox'] }],
+  ['a binding', { binding: BINDING }],
+  ['a running phase', { phase: 'running' }],
+]) {
+  test(`a runner-less orphan with ${name} is NOT settled as never-dispatched`, async () => {
+    const ctx = context();
+    const id = probeOrphan(ctx, attempt);
+    const outcome = await reconcile(ctx, id);
+    assert.equal(outcome.settled, false);
+    assert.equal(outcome.state, 'unreachable');
+    assert.equal(resultOf(ctx.state, id), null);
+    assert.deepEqual(historyRows(ctx.state), []);
+  });
+}
+
+test('a never-dispatched orphan that gained a dispatch record before the publish is left alone (stale)', async () => {
+  const ctx = context();
+  const id = probeOrphan(ctx);
+  const attemptFile = path.join(paths(ctx.state).attempts, `${id}.json`);
+  // the supervisor persists a dispatch (runner still null in this window) after the read, before the publish fence
+  const realStat = fs.readFileSync;
+  const attemptBefore = JSON.parse(realStat(attemptFile, 'utf8'));
+  let flipped = false;
+  const original = fs.existsSync;
+  fs.existsSync = (p) => {
+    if (!flipped && p === path.join(paths(ctx.state).results, `${id}.json`)) {
+      flipped = true;
+      fs.writeFileSync(attemptFile, JSON.stringify({ ...attemptBefore, dispatchedRunners: ['skybox'], binding: BINDING }));
+    }
+    return original(p);
+  };
+  try {
+    const outcome = await reconcile(ctx, id);
+    assert.equal(outcome.settled, false);
+    assert.equal(resultOf(ctx.state, id), null);
+    assert.deepEqual(readAttempt(ctx.state, id).dispatchedRunners, ['skybox']);
+  } finally {
+    fs.existsSync = original;
+  }
+});
+
+test('a cancel marker wins over a never-dispatched orphan', async () => {
+  const ctx = context();
+  const id = probeOrphan(ctx);
+  writeCancelMarkerFile(ctx.state, id);
+  assert.deepEqual(await reconcile(ctx, id), { settled: true, state: 'cancelled', exit: 130 });
+  assert.equal(resultOf(ctx.state, id).cancelled, true);
+});
 
 test('a job still running on the runner keeps the attempt (and a live supervisor is skipped)', async () => {
   const ctx = context();

@@ -3,7 +3,7 @@ import path from 'node:path';
 import { paths, atomicWriteJson, appendHistory } from './state.js';
 import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { terminalRowDefaults } from './resources.js';
-import { fetchRemoteResult, classifyRemoteResult, remoteCancel } from './remote-client.js';
+import { fetchRemoteResult, classifyRemoteResult, provesNeverStarted, remoteCancel } from './remote-client.js';
 import { relayedUsage, relayedDeps } from './remote-relay.js';
 import { writeBrokerLog } from './admission.js';
 
@@ -13,7 +13,11 @@ import { writeBrokerLog } from './admission.js';
  * only on
  *  - a runner result record that `classifyRemoteResult` CONFIRMS against the binding stored at dispatch (adopted: the
  *    runner's exit is kept), or
- *  - a runner-CONFIRMED `remote-cancel` of a job the runner reports gone with no result (lost: exit 75, `runner-lost`).
+ *  - a runner-CONFIRMED `remote-cancel` of a job the runner reports gone with no result (lost: exit 75, `runner-lost`), or
+ *  - (BRAIN-570) a binding-matched runner record that itself proves the job never started (`provesNeverStarted`: rejected,
+ *    queue-timeout, withdrawn; lost: exit 75, `runner-never-started`), or
+ *  - a probe-phase attempt that never reached a runner (no runner, no dispatchedRunners, no binding: the supervisor persists all
+ *    three before its first ssh submit, so nothing was ever sent; lost: exit 75, `never-dispatched`, no ssh at all).
  * Anything else leaves the attempt untouched, with the state saying why: `running` (the runner still has it), `unreachable`
  * (no usable answer), `ambiguous` (a record that cannot be trusted), `skipped` (not an orphan, or already settled).
  *
@@ -45,6 +49,10 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
   if (attempt.moving) return skipped('a runner-to-runner move was interrupted');
   if (fs.existsSync(resultPath)) return skipped('already settled');
 
+  if (neverDispatched(attempt)) {
+    return publishSettled(root, id, attempt, resultPath, 'lost', () => lostResult(id, attempt, 'never-dispatched', 'supervisor died before dispatching to any runner'), neverDispatched);
+  }
+
   const runner = (globalCfg?.runners ?? []).find((r) => r.name === attempt.runner);
   if (!runner) return { settled: false, state: 'unreachable', reason: 'runner not configured' };
 
@@ -59,7 +67,7 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
   const fetched = await fetchRemoteResult(runner, id, sshBin, firstBudget, env);
   if (fetched === null) return { settled: false, state: 'unreachable', transport: true, reason: `no usable answer from ${runner.name}` };
 
-  const publish = (kind, build) => publishSettled(root, id, attempt, runner, resultPath, kind, build);
+  const publish = (kind, build) => publishSettled(root, id, attempt, resultPath, kind, build);
 
   if (!fetched.missing) return await adoptOrAmbiguous(attempt, id, fetched, publish);
   if (fetched.state === 'queued' || fetched.state === 'running') return { settled: false, state: 'running' };
@@ -81,26 +89,39 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
     const adopted = await adoptOrAmbiguous(attempt, id, late, publish);
     if (adopted.state !== 'ambiguous') return adopted;
   }
-  return publish('lost', () => ({
-    id,
-    exit: 75,
-    signal: null,
-    executor: 'remote',
-    runner: runner.name,
-    reason: 'runner-lost',
-    lostDetail: attempt.unresolved ?? 'supervisor gone; runner reported the job gone',
-    startedAt: attempt.startedAt,
-    endedAt: Date.now(),
-    reconciled: true,
-  }));
+  return publish('lost', () => lostResult(id, attempt, 'runner-lost', attempt.unresolved ?? 'supervisor gone; runner reported the job gone'));
 }
+
+const lostResult = (id, attempt, reason, lostDetail) => ({
+  id,
+  exit: 75,
+  signal: null,
+  executor: 'remote',
+  runner: attempt.runner ?? null,
+  reason,
+  lostDetail,
+  startedAt: attempt.startedAt,
+  endedAt: Date.now(),
+  reconciled: true,
+});
+
+/** A probe-phase attempt that nothing was ever sent for: the supervisor writes `runner`, `dispatchedRunners` and `binding` to the
+ *  attempt BEFORE the ssh submit (supervisor.js `updateAttempt` ahead of `dispatchRemote`, whose `onBinding` precedes its spawn). */
+const neverDispatched = (attempt) => attempt.phase === 'probe' && !attempt.runner && !attempt.binding && !(attempt.dispatchedRunners?.length > 0);
 
 /** A runner record is adopted only when it is confirmed against the binding stored at dispatch; a legacy attempt has none. */
 async function adoptOrAmbiguous(attempt, id, record, publish) {
   const { binding } = attempt;
   if (!binding) return { settled: false, state: 'ambiguous', reason: 'legacy attempt has no dispatch binding' };
   const classified = classifyRemoteResult(record, { protocol: binding.protocol, ticketId: id, generation: binding.generation, manifestHash: binding.manifestHash });
-  if (classified.outcome !== 'confirmed') return { settled: false, state: 'ambiguous', reason: classified.reason };
+  if (classified.outcome !== 'confirmed') {
+    const expected = { protocol: binding.protocol, ticketId: id, generation: binding.generation, manifestHash: binding.manifestHash };
+    if (provesNeverStarted(record, expected)) {
+      const kind = record.reason ? `${record.kind}: ${record.reason}` : record.kind;
+      return publish('lost', () => lostResult(id, attempt, 'runner-never-started', `runner ${attempt.runner} reported ${kind}`));
+    }
+    return { settled: false, state: 'ambiguous', reason: classified.reason };
+  }
   return publish('adopted', () => ({
     id,
     exit: classified.exitCode,
@@ -119,7 +140,7 @@ async function adoptOrAmbiguous(attempt, id, record, publish) {
 
 /** Publish through the shared exactly-once path. The fence ties the publish to the attempt this reconcile read: a record that
  *  changed hands (another runner, a restarted supervisor, a move) meanwhile is left alone. */
-async function publishSettled(root, id, attempt, runner, resultPath, kind, buildResult) {
+async function publishSettled(root, id, attempt, resultPath, kind, buildResult, stillEligible = () => true) {
   let written = null;
   const published = await publishTerminal(
     root,
@@ -144,7 +165,8 @@ async function publishSettled(root, id, attempt, runner, resultPath, kind, build
         cur.generation === attempt.generation &&
         cur.startedAt === attempt.startedAt &&
         !cur.moving &&
-        !supervisorAlive(cur),
+        !supervisorAlive(cur) &&
+        stillEligible(cur),
     },
   );
   if (published.alreadyPublished) return { settled: true, state: 'already-settled' };
@@ -152,7 +174,7 @@ async function publishSettled(root, id, attempt, runner, resultPath, kind, build
   if (published.cancelled) return { settled: true, state: 'cancelled', exit: written.exit };
   writeBrokerLog(
     root,
-    kind === 'adopted' ? `lane: reconcile: ${id}: ${runner.name}: adopted exit ${written.exit}\n` : `lane: reconcile: ${id}: ${runner.name}: lost (runner-lost)\n`,
+    kind === 'adopted' ? `lane: reconcile: ${id}: ${attempt.runner}: adopted exit ${written.exit}\n` : `lane: reconcile: ${id}: ${attempt.runner ?? 'no runner'}: lost (${written.reason})\n`,
   );
   return { settled: true, state: kind, exit: written.exit };
 }
