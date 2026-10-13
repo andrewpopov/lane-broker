@@ -19,11 +19,14 @@ export function tmpDir(prefix) {
   return makeTmpDir(`${prefix}-`);
 }
 
+/** README "Testing hooks": a 200 ms first result-poll backoff (production 5 s) and a 1 s cancel grace (production 10 s). */
+export const FAST_WAITS = { LANE_BROKER_TEST_RESULT_POLL_MS: '200', LANE_BROKER_TEST_CANCEL_GRACE_MS: '1000' };
+
 /** freshEnv() + shadow scheduler config: these tests exercise the client/protocol
  *  (or, in remote-dispatch.test.js, the supervisor's remote-dispatch wiring), not the
  *  host admission gate. */
 export function freshShadowEnv(extra) {
-  const f = freshEnv(extra);
+  const f = freshEnv({ ...FAST_WAITS, ...extra });
   writeGlobalConfig(f.home, {});
   return f;
 }
@@ -307,7 +310,7 @@ export function makeDispatchArgs(overrides = {}) {
 export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1, cpuCores, remoteQueueTimeoutMs, remoteResultWaitMs } = {}) {
   const { binDir, probeLogPath, runnerHome, runnerState } = makeFakeSshBin();
   const runnerRoot = tmpDir('remote-dispatch-runner-root');
-  const { home, state, env } = freshEnv();
+  const { home, state, env } = freshEnv(FAST_WAITS);
   const cfg = {
     version: 1,
     capacity: 4,

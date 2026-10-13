@@ -69,7 +69,7 @@ function makeHeader(overrides = {}) {
  * remote-exec's own logic, not the host admission gate.
  */
 function freshShadowEnv(extra) {
-  const f = freshEnv(extra);
+  const f = freshEnv({ LANE_BROKER_TEST_CANCEL_GRACE_MS: '1000', ...extra }); // README "Testing hooks"
   writeGlobalConfig(f.home, {});
   return f;
 }

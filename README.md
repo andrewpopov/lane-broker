@@ -2127,6 +2127,12 @@ What a run leaves behind is collected; what a live one owns never is. Everything
 - `LANE_BROKER_TEST_RECONCILE_INTERVAL_MS` — overrides the 30 s minimum gap between
   `lane wait`'s re-asks of a runner that still reports an ORPHANED-REMOTE ticket's
   job running (BRAIN-515), so a test can watch the re-ask without waiting 30 s.
+- `LANE_BROKER_TEST_RESULT_POLL_MS` — overrides the 5 s first backoff between result fetches
+  while a remote dispatch waits on a runner (`remote-client.js`); the doubling cap scales with it
+  (6x, production 30 s), so a test can walk the whole backoff without waiting out 5 s, 10 s, ....
+- `LANE_BROKER_TEST_CANCEL_GRACE_MS` — overrides the 10 s TERM-to-KILL grace shared by `lane cancel`
+  (`cancel.js`), the supervisor's reap of its child group and descendants (`supervisor.js`), and the
+  orphan reap's grace (`lease.js`), so a test of a TERM-ignoring or stopped process need not wait 10 s.
 - `LANE_BROKER_TEST_NO_STATUS_RECONCILE=1` — `lane status` does not spawn the detached `lane
   reconcile` sweep it otherwise starts whenever it lists an ORPHANED-REMOTE row (BRAIN-515), so a
   status test does not fork sweeps.

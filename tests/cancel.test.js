@@ -9,7 +9,7 @@ import { createAttempt, readAttempt, publishTerminal } from '../src/attempts.js'
 import { cancelAttempt } from '../src/cancel.js';
 
 test('lane cancel on a lease whose supervisor cannot act (SIGSTOPped) exits non-zero and reports the lease still held', async (t) => {
-  const { base, home, state, env } = freshEnv();
+  const { base, home, state, env } = freshEnv({ LANE_BROKER_TEST_CANCEL_GRACE_MS: '1000' }); // README "Testing hooks": cancel waits 1 s, not 10 s, for a supervisor that never acts
   writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
   const repoDir = path.join(base, 'repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });

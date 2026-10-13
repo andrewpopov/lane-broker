@@ -697,7 +697,7 @@ test('remote run: a result from a runner that reports no queuedMs still gets a w
 test('remote run: result-wait expiry with an unconfirmed cancel is never re-run locally, and the attempt stays reported and cancellable', { timeout: 300_000 }, async () => {
   const { env, state, repoDir } = setup({ ssh: 'stuck-running', remoteResultWaitMs: 1 });
   const marker = path.join(tmpDir('marker'), 'where');
-  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], env, repoDir, '20s');
+  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], env, repoDir, '4s');
   // BRAIN-515: `lane wait` asks the runner, which still reports the job running, so it keeps waiting (75) rather than giving up
   assert.equal(waited.code, 75, `stderr: ${waited.stderr}`);
   assert.match(waited.stderr, /still queued or running/);

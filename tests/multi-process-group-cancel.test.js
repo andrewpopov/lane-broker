@@ -7,7 +7,7 @@ import { paths } from '../src/state.js';
 import { readLease, isGroupAlive } from '../src/lease.js';
 
 test('SIGTERM to `lane run` still kills a TERM-ignoring grandchild before releasing the lease', async () => {
-  const { base, home, state, env } = freshEnv();
+  const { base, home, state, env } = freshEnv({ LANE_BROKER_TEST_CANCEL_GRACE_MS: '1000' }); // README "Testing hooks": TERM-to-KILL grace 1 s, not 10 s
   writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
   const repoDir = path.join(base, 'repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
