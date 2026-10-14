@@ -1290,7 +1290,8 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // per minute. Once the head has waited expressHeadMaxWaitMs it must also pass BRAIN-355's cannot-delay proof, with the
     // head's claim reserved. Cheap tests first: the estimate table is read only for a ticket that could start.
     const headWaitedMs = waitedMs(headTicket, nowEff);
-    const expressHeadProtected = headWaitedMs > cfg.expressHeadMaxWaitMs;
+    // BRAIN-578: a futile head (BRAIN-418) cannot start whatever the lanes do, so protecting it only idles the host.
+    const expressHeadProtected = headWaitedMs > cfg.expressHeadMaxWaitMs && !resourceFutile(resourceRecord, cfg, now);
     const expressEligible =
       cfg.expressMaxMs > 0 &&
       !safeBackfill &&

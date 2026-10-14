@@ -1202,7 +1202,10 @@ head from starving:
   (`express-admissions.json`);
 - once the head has waited `expressHeadMaxWaitMs` (default 15 minutes), an
   express ticket starts only if it provably cannot delay the head: BRAIN-355's
-  test, with the head's claim reserved for CPU and memory.
+  test, with the head's claim reserved for CPU and memory. A futile head (BRAIN-418,
+  below: external load alone rules it out) is not protected, since nothing the
+  lanes do could start it; reserving its claim would only idle the host
+  (BRAIN-578).
 
 Each express start is logged in `admission-decisions.log` as
 `lane-broker-express event=express-admit`, and `lane status` marks queued

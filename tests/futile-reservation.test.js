@@ -225,3 +225,37 @@ test('P1 expiry: a futile verdict not recomputed (cooldown) stops excusing backf
     Date.now = realNow;
   }
 });
+
+// BRAIN-578: an express candidate past a protected head (waited > expressHeadMaxWaitMs) is charged the head's claim,
+// unless the head is futile (nothing the lanes do could start it).
+async function protectedHeadWithExpressHistory(state) {
+  const head = ticket('head', { weight: 4, lane: 'default', prioOriginAt: Date.now() - 20 * 60_000 });
+  await enqueue(state, head);
+  const rows = Array.from({ length: 5 }, (_, i) => ({ id: `q-${i}`, repo: 'r', lane: 'quick', startedAt: 1000 + i, endedAt: 1000 + i + 10_000, runMs: 10_000, exit: 0 }));
+  fs.appendFileSync(paths(state).history, rows.map((r) => `${JSON.stringify(r)}\n`).join(''));
+  const candidate = ticket('cand', { repoId: 'r', lane: 'quick' });
+  await enqueue(state, candidate);
+  return { head, candidate };
+}
+
+test('BRAIN-578 futile protected head: an express candidate that fits without the head claim is admitted', async () => {
+  const { state } = freshEnv();
+  const { head, candidate } = await protectedHeadWithExpressHistory(state);
+  await poll(state, head, { ext: 7 }); // 7 + 4 = 11 > 9 with no lane running: futile
+  assert.equal(readResourceSkipState(state).futile, 'cpu');
+  const result = await poll(state, candidate, { ext: 7 }); // 7 + 1 = 8 <= 9, but 7 + 4 + 1 = 12 with the head charged
+  assert.equal(result.started, true);
+  assert.match(readLog(state), /event=express-admit candidateId=cand/);
+});
+
+test('BRAIN-578 non-futile protected head: an express candidate still reserves the head claim', async () => {
+  const { state } = freshEnv();
+  const { head, candidate } = await protectedHeadWithExpressHistory(state);
+  holdLease(state, 'busy', 3); // 3 + 3 + 4 = 10 > 9: the head waits on the running lane, but 3 + 4 = 7 <= 9 once it drains, so not futile
+  const headResult = await poll(state, head, { ext: 3 });
+  assert.equal(headResult.started, false);
+  assert.equal(readResourceSkipState(state)?.futile, undefined);
+  const result = await poll(state, candidate, { ext: 3 }); // 3 + 3 + 1 = 7 fits alone; 3 + 3 + 4 + 1 = 11 > 9 with the head charged
+  assert.equal(result.started, false);
+  assert.doesNotMatch(readLog(state), /event=express-admit candidateId=cand/);
+});
