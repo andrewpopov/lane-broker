@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { childExitSafeFlags } from './node-exit-safe.js';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { ensureStateDirs, paths, stateHome, readJsonSafe, appendHistory, LockTimeoutError, MigrationInProgressError, assertNotMigrating, isUuid } from './state.js';
@@ -700,7 +701,7 @@ export async function runCommand({
   try {
     supervisor = spawnSupervisor(
       process.execPath,
-      [supervisorPath],
+      [...childExitSafeFlags(), supervisorPath],
       {
         detached: true,
         // A detached caller must never hold the supervisor's pipes -- `ID=$(lane

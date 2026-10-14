@@ -2068,6 +2068,17 @@ did not start. Bringing load back down (stopping stray sessions, `pkill`ing
 runaway processes) is a human job; `lane status` shows the current load and
 the queue so you know what's waiting and why.
 
+## Node runtime flags (BRAIN-577)
+
+Every lane-broker node process (the CLI, the supervisor, spawned `lane` helpers) runs with
+`--no-maglev --no-concurrent-sparkplug`. Node 24 can deadlock in `process.exit()` while a concurrent
+Maglev or Sparkplug compile job is in flight, which left finished supervisors hung forever
+([nodejs/node#64274](https://github.com/nodejs/node/issues/64274); fix in
+[#66171](https://github.com/nodejs/node/pull/66171), not yet released). Self-spawned processes get the
+flags in argv; `bin/lane.js` and `bin/lane-store.js` set them at startup with `v8.setFlagsFromString`
+(`src/node-exit-safe.js`), so only node's own bootstrap code is not covered. A `--maglev`/`--no-maglev` (or
+sparkplug equivalent) in `execArgv` or `NODE_OPTIONS` is respected.
+
 ## State
 
 `$LANE_BROKER_STATE` (default `~/.cache/lane-broker`): `leases/`, `queue/`,
