@@ -137,6 +137,10 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // 0 (the default) never kills: quiet work is legitimate, so the kill is opted into per lane (`noProgressTimeoutMs`).
   // The stall is recorded either way.
   noProgressTimeoutMs: 0,
+  // BRAIN-576: a run that wrote NO output for this long is killed whatever its CPU does (exit 124, reason 'silence').
+  // 0 (the default) never kills; opt a lane in per lane (`silenceTimeoutMs`). Catches a spinning-but-wedged process the
+  // no-progress watchdog (which needs CPU idle too) never fires on.
+  silenceTimeoutMs: 0,
   // BRAIN-532: a run silent AND under `hungCpuCores` for `hungAfterMs` is flagged `HUNG?` in `lane status` (warning only, never a kill);
   // silence alone is flagged `SILENT`. `idleCreditBelowFraction` x grant is the CPU-idle line the idle detector uses.
   // `idleCreditAfterMs` is how long a lease must stay CPU-idle before `lane status` notes `idle` and the credit counts it.
@@ -366,6 +370,7 @@ function validateGlobalConfig(cfg, sourcePath) {
     `${sourcePath}: "laneNice" must be an integer in [0, 19]`,
   );
   assert(Number.isInteger(cfg.noProgressTimeoutMs) && cfg.noProgressTimeoutMs >= 0, `${sourcePath}: "noProgressTimeoutMs" must be a non-negative integer`);
+  assert(Number.isInteger(cfg.silenceTimeoutMs) && cfg.silenceTimeoutMs >= 0, `${sourcePath}: "silenceTimeoutMs" must be a non-negative integer`);
   assert(Number.isInteger(cfg.hungAfterMs) && cfg.hungAfterMs > 0, `${sourcePath}: "hungAfterMs" must be a positive integer`);
   assert(Number.isFinite(cfg.hungCpuCores) && cfg.hungCpuCores >= 0, `${sourcePath}: "hungCpuCores" must be a non-negative number`);
   assert(
@@ -596,6 +601,12 @@ function validateRepoConfig(cfg, sourcePath) {
       assert(
         Number.isInteger(lane.noProgressTimeoutMs) && lane.noProgressTimeoutMs >= 0,
         `${sourcePath}: lane "${name}".noProgressTimeoutMs must be a non-negative integer (0 disables)`,
+      );
+    }
+    if (lane.silenceTimeoutMs !== undefined) {
+      assert(
+        Number.isInteger(lane.silenceTimeoutMs) && lane.silenceTimeoutMs >= 0,
+        `${sourcePath}: lane "${name}".silenceTimeoutMs must be a non-negative integer (0 disables)`,
       );
     }
     if (lane.class !== undefined) {
@@ -1033,7 +1044,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   if (isDeclaredLane) {
     laneCfg = repoConfig.lanes[laneName];
   } else if (undeclaredTemplateName) {
-    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/noProgressTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteOmitEscapingSymlinks/remoteArtifacts/remoteArtifactsOn/class/priority/aging/cache/rightSize
+    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/noProgressTimeoutMs/silenceTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteOmitEscapingSymlinks/remoteArtifacts/remoteArtifactsOn/class/priority/aging/cache/rightSize
     // from the named declared lane, keeping this lane's OWN key/name. Not
     // inherited: `localRefused` (stays default false), the template's named
     // conflicts (only the `*` wildcard universe below reaches this lane, same
@@ -1047,6 +1058,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       memoryBytes: templateCfg.memoryBytes,
       nice: templateCfg.nice,
       noProgressTimeoutMs: templateCfg.noProgressTimeoutMs,
+      silenceTimeoutMs: templateCfg.silenceTimeoutMs,
       remote: templateCfg.remote,
       remoteDeps: templateCfg.remoteDeps,
       remoteSetup: templateCfg.remoteSetup,
@@ -1095,6 +1107,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     nice: Number.isInteger(laneCfg.nice) ? laneCfg.nice : null,
     // BRAIN-431: null falls through to the global `noProgressTimeoutMs`; 0 disables the watchdog for this lane.
     noProgressTimeoutMs: Number.isInteger(laneCfg.noProgressTimeoutMs) ? laneCfg.noProgressTimeoutMs : null,
+    // BRAIN-576: same shape for the silence watchdog
+    silenceTimeoutMs: Number.isInteger(laneCfg.silenceTimeoutMs) ? laneCfg.silenceTimeoutMs : null,
     // BRAIN-255: how many same-key holders may run at once. Defaulted HERE
     // (not left null for a caller fallback like `nice` above) because 1 is
     // the load-bearing compatibility default for every lane that predates

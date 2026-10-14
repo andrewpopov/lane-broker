@@ -42,7 +42,7 @@ import { createAttempt, readAttempt, updateAttempt, fallbackToLocal, publishTerm
 import { writeBrokerLog, OBSERVED_HISTORY_MAX } from './admission.js';
 import { relayedUsage, relayedDeps } from './remote-relay.js';
 import { maybeDailyGc } from './gc.js';
-import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, noProgressMessage } from './no-progress.js';
+import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, SILENCE_REASON, noProgressMessage, silenceMessage } from './no-progress.js';
 import { settledContentKey, isCleanPass } from './result-cache.js';
 import { observedLeaseFields, summarizeObservedCpu, sanitizeRssPeak, integratedCpuSeconds } from './observed.js';
 
@@ -922,6 +922,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       // machine can never run carries none either: it waits in the runner's queue instead of expiring into a refusal (BRAIN-509).
       queueTimeoutMs: queueTimeoutFor(enriched, globalCfg),
       noProgressTimeoutMs: enriched.noProgressTimeoutMs ?? globalCfg.noProgressTimeoutMs,
+      silenceTimeoutMs: enriched.silenceTimeoutMs ?? globalCfg.silenceTimeoutMs,
       // BRAIN-380 §6: the tier BEFORE any cap, and the wait this ticket has accrued on THIS host's priority clock. The
       // runner re-anchors from the wait, never from our timestamps, so clock skew between hosts cannot matter.
       priorityRequested: enriched.priorityRequested,
@@ -1043,6 +1044,13 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       process.stderr.write(message);
       writeBrokerLog(root, message);
     }
+    // BRAIN-576: likewise a silence kill
+    const silence = dispatch.result.reason === SILENCE_REASON && Number.isFinite(dispatch.result.silenceTimeoutMs);
+    if (silence) {
+      const message = silenceMessage(dispatch.result.silenceTimeoutMs);
+      process.stderr.write(message);
+      writeBrokerLog(root, message);
+    }
     await updateAttempt(root, enriched.id, gen, { remotePhase: dispatch.phase ?? null });
     const artifactFields = artifactsSupported
       ? returnRemoteArtifacts(root, enriched, dispatch)
@@ -1078,6 +1086,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       ...artifactFields,
       ...(omittedSymlinks.length > 0 ? { remoteOmittedSymlinks: omittedSymlinks.length, remoteOmittedSymlinkNames: omittedSymlinks.slice(0, MAX_OMITTED_SYMLINKS_LISTED) } : {}),
       ...(noProgress ? { reason: NO_PROGRESS_REASON, noProgressTimeoutMs: dispatch.result.noProgressTimeoutMs } : {}),
+      ...(silence ? { reason: SILENCE_REASON, silenceTimeoutMs: dispatch.result.silenceTimeoutMs } : {}),
       remoteKind: dispatch.result.kind,
       remotePhase: dispatch.phase ?? null,
       startedAt: remoteWaitedMs === null ? attemptStartedAt : enriched.createdAt + remoteWaitedMs,
@@ -1479,7 +1488,11 @@ async function main() {
   const stdoutGate = backpressureGate(child.stdout);
   const stderrGate = backpressureGate(child.stderr);
   // BRAIN-431: bytes the command wrote, one of the progress signals the heartbeat watches; the kill itself is opt-in
-  const watchdog = new NoProgressWatchdog({ timeoutMs: ticket.noProgressTimeoutMs ?? globalCfg.noProgressTimeoutMs });
+  const watchdog = new NoProgressWatchdog({
+    timeoutMs: ticket.noProgressTimeoutMs ?? globalCfg.noProgressTimeoutMs,
+    silenceTimeoutMs: ticket.silenceTimeoutMs ?? globalCfg.silenceTimeoutMs,
+  });
+  watchdog.start();
   child.stdout.on('data', (c) => {
     watchdog.noteOutput(c.length);
     const loggedOk = logWriter.write(c);
@@ -1499,7 +1512,7 @@ async function main() {
 
   let finished = false;
   let cancelling = false;
-  let noProgressKilled = false;
+  let watchdogKill = null; // BRAIN-431/576: the watchdog reason (no-progress | silence) that began the reap; the first one wins
   let killPromise = null;
 
   // BRAIN-419: processes that left the leader's group (setsid/setpgid) are invisible to killGroup, so track the tree.
@@ -1554,10 +1567,13 @@ async function main() {
   }
 
   /** BRAIN-431: opt-in kill once the idle streak reaches the timeout; never after a cancel or another reap has begun. */
-  function enforceNoProgress(idleMs) {
-    if (killPromise || cancelling || !watchdog.shouldKill(idleMs)) return;
-    noProgressKilled = true;
-    reap(NO_PROGRESS_REASON);
+  function enforceWatchdogs(idleMs) {
+    if (killPromise || cancelling) return;
+    // BRAIN-576: silence is checked off the output stamp alone, so it fires even when CPU makes the run look alive
+    const reason = watchdog.shouldKill(idleMs) ? NO_PROGRESS_REASON : watchdog.shouldKillSilent() ? SILENCE_REASON : null;
+    if (!reason) return;
+    watchdogKill = reason;
+    reap(reason);
   }
   const earlySample = setTimeout(() => {
     if (!finished) observeLease();
@@ -1565,7 +1581,7 @@ async function main() {
 
   const heartbeat = setInterval(() => {
     if (finished) return;
-    enforceNoProgress(observeLease());
+    enforceWatchdogs(observeLease());
     // Codex pre-merge BLOCKER #1: the marker must survive until AFTER the
     // terminal write below decides on it -- clearing it here (as this used
     // to, the instant it was observed) let a child that exits 0 on TERM
@@ -1606,10 +1622,17 @@ async function main() {
     if (cancelling) {
       result = { ...result, exit: 130, signal: null, cancelled: true };
       exitCode = 130;
-    } else if (noProgressKilled) {
+    } else if (watchdogKill) {
       // BRAIN-431: the kill's own signal is not the story; it is `timeout`'s 124, with the window that elapsed
-      result = { ...result, exit: NO_PROGRESS_EXIT, signal: null, reason: NO_PROGRESS_REASON, noProgressTimeoutMs: watchdog.timeoutMs };
-      const message = noProgressMessage(watchdog.timeoutMs);
+      const silent = watchdogKill === SILENCE_REASON;
+      result = {
+        ...result,
+        exit: NO_PROGRESS_EXIT,
+        signal: null,
+        reason: watchdogKill,
+        ...(silent ? { silenceTimeoutMs: watchdog.silenceTimeoutMs } : { noProgressTimeoutMs: watchdog.timeoutMs }),
+      };
+      const message = silent ? silenceMessage(watchdog.silenceTimeoutMs) : noProgressMessage(watchdog.timeoutMs);
       logWriter.write(message);
       stderrForward?.write(message);
     }
@@ -1726,7 +1749,7 @@ async function main() {
   // gone. So reap on 'exit'; finalizeAndExit awaits killPromise before the result is written or the lease released.
   let groupReaped = false;
   child.on('exit', () => {
-    if (finished || cancelling || noProgressKilled) return;
+    if (finished || cancelling || watchdogKill) return;
     if (!isGroupAlive(child.pid) && !hasLiveMembers(descendants)) return;
     groupReaped = true;
     reap();

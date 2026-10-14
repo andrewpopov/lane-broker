@@ -9,7 +9,7 @@ import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartT
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
 import { CAPABILITIES } from './capabilities.js';
-import { NO_PROGRESS_REASON } from './no-progress.js';
+import { NO_PROGRESS_REASON, SILENCE_REASON } from './no-progress.js';
 import { artifactLimitsOf, collectArtifacts, encodeArtifacts, pruneStaleArtifacts } from './remote-artifacts.js';
 import { remotePriorityFrom } from './priority.js';
 import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores } from './resources.js';
@@ -184,6 +184,10 @@ function validateHeaderFields(header) {
   if (header.noProgressTimeoutMs !== undefined && !(Number.isInteger(header.noProgressTimeoutMs) && header.noProgressTimeoutMs >= 0)) {
     return { ok: false, reason: 'invalid noProgressTimeoutMs' };
   }
+  // BRAIN-576: the submitter's resolved silence timeout, same additive shape
+  if (header.silenceTimeoutMs !== undefined && !(Number.isInteger(header.silenceTimeoutMs) && header.silenceTimeoutMs >= 0)) {
+    return { ok: false, reason: 'invalid silenceTimeoutMs' };
+  }
   // BRAIN-398: additive on both protocols (an older runner ignores them; the submitter checks the probe capability first).
   if (header.remoteArtifacts !== undefined && !isValidRemoteArtifactsShape(header.remoteArtifacts)) {
     return { ok: false, reason: 'invalid remoteArtifacts' };
@@ -222,7 +226,7 @@ function readPhasesMs(ticketDir, own) {
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
-function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, noProgressTimeoutMs, runMs, queuedMs, grantedCpuCores, observedCpu, observedRssPeakBytes, cpuSeconds, phasesMs, artifacts }) {
+function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, grantedCpuCores, observedCpu, observedRssPeakBytes, cpuSeconds, phasesMs, artifacts }) {
   const isProtocol2 = header.protocol === 2;
   return {
     protocol: isProtocol2 ? 2 : 1,
@@ -236,6 +240,7 @@ function buildResult(header, ticketDir, { kind, exit = null, signal = null, remo
     reason,
     // BRAIN-431: additive; the window a 'no-progress' kill elapsed, so the submitter can say how long
     noProgressTimeoutMs,
+    silenceTimeoutMs, // BRAIN-576: the window a 'silence' kill elapsed
     // Omitted entirely (not merely null) for a protocol-1 result -- JSON.stringify
     // drops an `undefined` value, so the shape stays byte-identical to before
     // this slice (I6).
@@ -583,6 +588,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     memoryOverride: header.memoryBytes,
     // An older submitter sends no timeout: the kill is opt-in, so absent means disabled, never this runner's own default.
     noProgressTimeoutOverride: Number.isFinite(header.noProgressTimeoutMs) ? header.noProgressTimeoutMs : 0,
+    silenceTimeoutOverride: Number.isFinite(header.silenceTimeoutMs) ? header.silenceTimeoutMs : 0,
     // Unchanged by protocol: `.lane-broker.json` resolution (via
     // `configRoot` below) walks from this same cwd, and a protocol-2
     // pipeline resolves its own phase cwds from `pipeline.json`'s absolute
@@ -648,6 +654,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   let signal = null;
   let reason = null;
   let noProgressTimeoutMs;
+  let silenceTimeoutMs;
   let runMs;
   let queuedMs;
   let grantedCpuCores;
@@ -675,6 +682,9 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     if (structured.reason === NO_PROGRESS_REASON && Number.isFinite(structured.noProgressTimeoutMs)) {
       reason = NO_PROGRESS_REASON;
       noProgressTimeoutMs = structured.noProgressTimeoutMs;
+    } else if (structured.reason === SILENCE_REASON && Number.isFinite(structured.silenceTimeoutMs)) {
+      reason = SILENCE_REASON;
+      silenceTimeoutMs = structured.silenceTimeoutMs;
     }
     if (Number.isFinite(structured.grantedCpuCores)) grantedCpuCores = structured.grantedCpuCores;
     observedCpu = sanitizeObservedCpu(structured.observedCpu) ?? undefined;
@@ -705,7 +715,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   const artifacts = storeArtifacts(header, ticketDir, workDir, { kind, exit, signal });
   if (artifacts !== undefined) ownPhasesMs.artifactsMs = Date.now() - artifactsStartedAt;
   try {
-    writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, noProgressTimeoutMs, runMs, queuedMs, grantedCpuCores, observedCpu, observedRssPeakBytes, cpuSeconds, phasesMs: readPhasesMs(ticketDir, ownPhasesMs), artifacts }));
+    writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, grantedCpuCores, observedCpu, observedRssPeakBytes, cpuSeconds, phasesMs: readPhasesMs(ticketDir, ownPhasesMs), artifacts }));
   } finally {
     cleanupWork(workDir, tmpDir);
   }
