@@ -20,7 +20,7 @@ import {
   testDrainAt,
   testHoldAt,
 } from './state.js';
-import { enqueue, existingTicket, tryStart, dequeueSync, couldAdmitNow, listQueue, withdrawQueued, restoreQueued, discardRebinding, readQueuedRecord } from './scheduler.js';
+import { enqueue, existingTicket, tryStart, dequeueSync, couldAdmitNow, listQueue, HELD_STATES, withdrawQueued, restoreQueued, discardRebinding, readQueuedRecord } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { selectLeaseTree } from './cpu.js';
@@ -29,7 +29,8 @@ import { reloadGlobalConfig } from './config.js';
 import { stateHome } from './state.js';
 import { readRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
-import { speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, DEFAULT_REMOTE_OVERHEAD_MS } from './speed-placement.js';
+import { speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, externalCpuSlots, DEFAULT_REMOTE_OVERHEAD_MS } from './speed-placement.js';
+import { starvedStaleMs } from './external-cpu.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
@@ -39,7 +40,7 @@ import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remo
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
 import { REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
 import { createAttempt, readAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
-import { writeBrokerLog, OBSERVED_HISTORY_MAX } from './admission.js';
+import { writeBrokerLog, OBSERVED_HISTORY_MAX, hostCpuLoad, ticketCpuEstimate } from './admission.js';
 import { relayedUsage, relayedDeps } from './remote-relay.js';
 import { maybeDailyGc } from './gc.js';
 import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, SILENCE_REASON, noProgressMessage, silenceMessage } from './no-progress.js';
@@ -501,26 +502,46 @@ function speedInputs(root, enriched) {
 }
 
 /**
+ * BRAIN-596: how many tickets like `enriched` the CPU budget admits beside load outside every lease, from the supervisor's last
+ * fresh host sample and the persisted CPU gate (the same files the runner's headroom probe reads); null without a fresh sample.
+ */
+function externalCpuSlotsFor(root, enriched, globalCfg) {
+  const sample = readJsonSafe(paths(root).cpuSample)?.lastValid;
+  const fresh = Number.isFinite(sample?.at) && Date.now() - sample.at <= starvedStaleMs(globalCfg) && Number.isFinite(sample.hostBusyCores) && sample.cores === detectResourceCapacity().cpuCores;
+  if (!fresh) return null;
+  const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
+  const { externalBusy, budget } = hostCpuLoad(sample, held, globalCfg);
+  return externalCpuSlots({ gateClosed: readJsonSafe(paths(root).cpuGate)?.closed === true, budget, externalBusy, claimCores: ticketCpuEstimate(enriched, globalCfg, Date.now(), budget) });
+}
+
+/**
  * BRAIN-548: where `enriched` finishes sooner when this machine cannot admit it now: waiting in the local queue (everything ahead
  * of it, from history estimates, spread over the slots of its weight) then running here, or running on `runner` (the run scaled by
  * its measured speed ratio, plus dispatch overhead and, if it too is queued, that queue). One decision, with both estimates.
+ * BRAIN-596: host load outside any lease that leaves no admissible slot makes the local wait unbounded, so an unqueued runner wins.
  */
 function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, probe, queuedChoice, waitedMs = 0) {
   const queue = listQueue(root).filter(Boolean);
   const own = queue.findIndex((t) => t.id === enriched.id);
   const ahead = own === -1 ? queue : queue.slice(0, own);
   const slots = Math.floor(effectiveWeightCapacity(globalCfg, detectResourceCapacity().cpuCores) / Math.max(1, enriched.weight));
-  const ratio = speedRatio(rows, runner);
+  const evidence = speedRatio(rows, runner, { job: { command: enriched.command, repo: enriched.repoId, lane: enriched.lane, estimateMs } });
+  const ratio = evidence.ratio;
   const runnerQueueMs = queuedChoice ? probe.queued * estimateMs * ratio : 0;
+  const localBlocked = !queuedChoice && externalCpuSlotsFor(root, enriched, globalCfg) === 0;
   return {
     ...chooseSpeedPlacement({
       localAdmitsNow: false,
       localWaitMs: localWaitMs({ aheadEstimatesMs: ahead.map((t) => localRunEstimateMs(rows, t.repoId, t.lane) ?? estimateMs), estimateMs, slots, waitedMs }),
+      localBlocked,
       estimateMs,
       runnerRatio: ratio,
       overheadMs: DEFAULT_REMOTE_OVERHEAD_MS + runnerQueueMs,
     }),
     ratio,
+    ratioTier: evidence.tier,
+    ratioPairs: evidence.pairs,
+    localBlocked,
   };
 }
 
@@ -531,7 +552,7 @@ function logSpeedDecision(root, enriched, choice, detail) {
   writeBrokerLog(root, line);
 }
 
-const seconds = (ms) => `${Math.round(ms / 1000)}s`;
+const seconds = (ms) => (ms === null ? 'unbounded' : `${Math.round(ms / 1000)}s`);
 
 /** What `selectRunner` needs to judge a ticket: its protocol, and its reservation (shared by a first attempt and a rebind). */
 export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
@@ -806,7 +827,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
 
   if (speed && !busyQueuedAt) {
     const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true);
-    logSpeedDecision(root, enriched, decision.choice, `local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)})`);
+    logSpeedDecision(root, enriched, decision.choice, `local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)}, ${decision.ratioTier} n=${decision.ratioPairs}${decision.localBlocked ? ', local blocked by host CPU load' : ''})`);
     if (decision.choice === 'local') return fallbackOrRefuse(null, 'speed-aware: local finishes sooner', { rebindable: true });
   }
 
@@ -1340,11 +1361,11 @@ async function main() {
         // BRAIN-556: make a ticket that keeps staying local visible, at most once per 10 min
         if (Date.now() - lastLocalLogAt >= LOCAL_LOG_INTERVAL_MS) {
           lastLocalLogAt = Date.now();
-          logSpeedDecision(root, enriched, 'local', `rebind: stay local: local finish ${seconds(decision.localFinishMs)} (waited ${seconds(waitedMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)}`);
+          logSpeedDecision(root, enriched, 'local', `rebind: stay local: local finish ${seconds(decision.localFinishMs)} (waited ${seconds(waitedMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)}, ${decision.ratioTier} n=${decision.ratioPairs})`);
         }
         return;
       }
-      logSpeedDecision(root, enriched, 'remote', `rebind: local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)})`);
+      logSpeedDecision(root, enriched, 'remote', `rebind: local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)}, ${decision.ratioTier} n=${decision.ratioPairs}${decision.localBlocked ? ', local blocked by host CPU load' : ''})`);
     }
     await runRemoteAttempt(root, enriched, globalCfg, abortController.signal, { generation: attemptGeneration, runner, probe, queued: queuedChoice === true });
   }
