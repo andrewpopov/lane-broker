@@ -3,12 +3,14 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { laneRun, writeGlobalConfig, waitFor, sleep } from './helpers.js';
+import { laneRun, writeGlobalConfig, waitFor, sleep, freshEnv } from './helpers.js';
 import { tmpDir, setup, resultOf } from './remote-harness.js';
 import { readAttempt } from '../src/attempts.js';
 import { paths, atomicWriteJson, ensureStateDirs, bootId } from '../src/state.js';
 import { processStartTime } from '../src/process-liveness.js';
 import { sweepOrphans } from '../src/reconcile-sweep.js';
+import { selectRunner } from '../src/remote-client.js';
+import { loadGlobalConfig, ConfigError, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 
 /**
  * BRAIN-515 step 4: the background sweep that settles ORPHANED-REMOTE attempts without a `lane cancel`. Same fake-ssh transport as
@@ -22,7 +24,7 @@ const NO_STATUS_SPAWN = { LANE_BROKER_TEST_NO_STATUS_RECONCILE: '1' };
 
 function context() {
   const ctx = setup();
-  const globalCfg = JSON.parse(fs.readFileSync(path.join(ctx.home, 'config.json'), 'utf8'));
+  const globalCfg = { ...DEFAULT_GLOBAL_CONFIG, ...JSON.parse(fs.readFileSync(path.join(ctx.home, 'config.json'), 'utf8')) };
   return { ...ctx, globalCfg };
 }
 
@@ -272,4 +274,153 @@ test('lane status without an orphan (or with only an interrupted move) spawns no
   assert.equal(out.code, 0, out.stderr);
   await sleep(2000);
   assert.equal(fs.existsSync(paths(ctx.state).reconcileLastRun), false, 'no sweep claimed');
+});
+
+// ---- BRAIN-594: a runner that stays down must not hold its orphans forever ----
+
+const HOUR = 3_600_000;
+const unreachableAt = (ctx) => JSON.parse(fs.readFileSync(paths(ctx.state).runnerUnreachable, 'utf8'));
+const historyRows = (ctx, id) => fs.readFileSync(paths(ctx.state).history, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((r) => r.id === id);
+
+test('offline flag: the attempt settles at once as runner-offline with a history row, without one ssh call, and a later runner result is ignored', async () => {
+  const ctx = context();
+  ctx.globalCfg.runners[0].offline = true;
+  const id = seedOrphan(ctx, { record: completed(0) }); // the runner holds a finished result for it
+  const ssh = loggingSsh(ctx);
+
+  const out = await sweep(ctx, { sshBin: ssh.bin });
+  assert.deepEqual(out.results.map(({ state, exit }) => ({ state, exit })), [{ state: 'lost', exit: 75 }]);
+  assert.equal(resultOf(ctx.state, id).reason, 'runner-offline');
+  assert.equal(resultOf(ctx.state, id).exit, 75);
+  assert.equal(readAttempt(ctx.state, id), null);
+  assert.equal(historyRows(ctx, id).length, 1);
+  assert.equal(historyRows(ctx, id)[0].exit, 75);
+  assert.equal(ssh.callsTo('normal'), 0, 'the offline runner is never contacted');
+
+  ctx.globalCfg.runners[0].offline = false; // back online: its old result for the settled attempt still changes nothing
+  await sweep(ctx, { force: true });
+  assert.equal(resultOf(ctx.state, id).exit, 75);
+  assert.equal(historyRows(ctx, id).length, 1);
+});
+
+test('offline flag: `lane cancel` settles the orphan as runner-offline (not cancelled) and `lane wait` returns 75 with the reason on stderr', async () => {
+  const ctx = context();
+  ctx.globalCfg.runners[0].offline = true;
+  writeGlobalConfig(ctx.home, ctx.globalCfg);
+  const id = seedOrphan(ctx);
+  const cancelled = await laneRun(['cancel', id], { env: ctx.env, cwd: ctx.repoDir });
+  assert.equal(cancelled.code, 0, cancelled.stderr);
+  assert.equal(resultOf(ctx.state, id).reason, 'runner-offline');
+  assert.equal(resultOf(ctx.state, id).exit, 75);
+  assert.equal(readAttempt(ctx.state, id), null);
+  const waited = await laneRun(['wait', id], { env: ctx.env, cwd: ctx.repoDir });
+  assert.equal(waited.code, 75);
+  assert.match(waited.stderr, /settled as lost \(runner-offline/);
+});
+
+test('`lane wait` on an orphan of an offline runner settles it inline and returns 75', async () => {
+  const ctx = context();
+  ctx.globalCfg.runners[0].offline = true;
+  writeGlobalConfig(ctx.home, ctx.globalCfg);
+  const id = seedOrphan(ctx);
+  const waited = await laneRun(['wait', id], { env: ctx.env, cwd: ctx.repoDir });
+  assert.equal(waited.code, 75, waited.stderr);
+  assert.match(waited.stderr, /runner-offline/);
+});
+
+test('placement never chooses an offline runner and does not probe it', async () => {
+  const ctx = context();
+  const ssh = loggingSsh(ctx);
+  const runners = [{ ...ctx.globalCfg.runners[0], offline: true }];
+  const picked = await selectRunner(runners, { sshBin: ssh.bin, env: ctx.env, deadlineMs: 3000 });
+  assert.equal(picked.runner, null);
+  assert.deepEqual(picked.skipped, [{ name: 'skybox', reason: 'marked offline' }]);
+  assert.equal(ssh.callsTo('normal'), 0);
+});
+
+test('config: runners[].offline must be a boolean; runnerLostAfterMs defaults to 2 h, accepts 0, rejects negatives and non-integers', () => {
+  const { home } = freshEnv();
+  const load = (patch, runner = {}) => {
+    writeGlobalConfig(home, { version: 1, runners: [{ name: 'a', ssh: 'a', ...runner }], ...patch });
+    const prev = process.env.LANE_BROKER_HOME;
+    process.env.LANE_BROKER_HOME = home;
+    try {
+      return loadGlobalConfig();
+    } finally {
+      process.env.LANE_BROKER_HOME = prev;
+    }
+  };
+  assert.equal(load({}, { offline: true }).runners[0].offline, true);
+  for (const bad of ['yes', 1, null]) assert.throws(() => load({}, { offline: bad }), ConfigError, String(bad));
+  assert.equal(load({}).runnerLostAfterMs, 2 * HOUR);
+  assert.equal(load({ runnerLostAfterMs: 0 }).runnerLostAfterMs, 0);
+  for (const bad of [-1, 1.5, '7200000']) assert.throws(() => load({ runnerLostAfterMs: bad }), ConfigError, String(bad));
+});
+
+test('down past runnerLostAfterMs: every attempt on the runner settles as runner-lost (injected clock); the first failure only starts the clock', async () => {
+  const ctx = context();
+  const aRoot = addRunner(ctx, 'a', 'down');
+  const t0 = Date.now();
+  const a1 = seedOrphan(ctx, { runner: 'a', runnerRoot: aRoot, attempt: { startedAt: t0 - 300_000 } });
+  const a2 = seedOrphan(ctx, { runner: 'a', runnerRoot: aRoot, attempt: { startedAt: t0 - 200_000 } });
+
+  const first = await sweep(ctx, { now: t0 });
+  assert.deepEqual(first.results.map((r) => r.state), ['unreachable', 'skipped-runner-down']);
+  assert.deepEqual(unreachableAt(ctx), { a: t0 }, 'the first failed fetch starts the clock');
+
+  const later = await sweep(ctx, { now: t0 + 2 * HOUR + 60_000, force: true });
+  assert.deepEqual(later.results.map(({ state, exit }) => ({ state, exit })), [{ state: 'lost', exit: 75 }, { state: 'lost', exit: 75 }]);
+  for (const id of [a1, a2]) {
+    assert.equal(resultOf(ctx.state, id).reason, 'runner-lost');
+    assert.equal(readAttempt(ctx.state, id), null);
+    assert.equal(historyRows(ctx, id).length, 1);
+  }
+  assert.equal(unreachableAt(ctx).a, t0, 'the streak is not restarted by settling');
+});
+
+test('down for less than runnerLostAfterMs: the attempt is untouched and the clock keeps its first time', async () => {
+  const ctx = context();
+  const aRoot = addRunner(ctx, 'a', 'down');
+  const t0 = Date.now();
+  const id = seedOrphan(ctx, { runner: 'a', runnerRoot: aRoot });
+  await sweep(ctx, { now: t0 });
+  const out = await sweep(ctx, { now: t0 + 2 * HOUR - 60_000, force: true });
+  assert.deepEqual(out.results.map((r) => r.state), ['unreachable']);
+  assert.ok(readAttempt(ctx.state, id));
+  assert.equal(resultOf(ctx.state, id), null);
+  assert.deepEqual(unreachableAt(ctx), { a: t0 });
+});
+
+test('a runner that answers running keeps its attempt even past the bound, and the answer clears the clock', async () => {
+  const ctx = context();
+  const aRoot = addRunner(ctx, 'a', 'stuck-running');
+  const now = Date.now();
+  const id = seedOrphan(ctx, { runner: 'a', runnerRoot: aRoot });
+  atomicWriteJson(paths(ctx.state).runnerUnreachable, { a: now - 5 * HOUR, other: now - HOUR });
+  const out = await sweep(ctx, { now });
+  assert.deepEqual(out.results.map((r) => r.state), ['running']);
+  assert.ok(readAttempt(ctx.state, id));
+  assert.equal(resultOf(ctx.state, id), null);
+  assert.deepEqual(unreachableAt(ctx), { other: now - HOUR }, 'only that runner\'s clock is cleared');
+});
+
+test('a successful answer resets firstUnreachableAt: down, then up (adopted), then down again starts a fresh clock', async () => {
+  const ctx = context();
+  const aRoot = addRunner(ctx, 'a', 'down');
+  const t0 = Date.now();
+  seedOrphan(ctx, { runner: 'a', runnerRoot: aRoot });
+  await sweep(ctx, { now: t0 });
+  assert.deepEqual(unreachableAt(ctx), { a: t0 });
+
+  ctx.globalCfg.runners = ctx.globalCfg.runners.map((r) => (r.name === 'a' ? { ...r, ssh: 'normal' } : r));
+  const done = seedOrphan(ctx, { runner: 'a', runnerRoot: aRoot, record: completed(0), attempt: { startedAt: t0 - 400_000 } });
+  await sweep(ctx, { now: t0 + HOUR, force: true });
+  assert.equal(resultOf(ctx.state, done).exit, 0);
+  assert.deepEqual(unreachableAt(ctx), {}, 'answering clears it');
+
+  ctx.globalCfg.runners = ctx.globalCfg.runners.map((r) => (r.name === 'a' ? { ...r, ssh: 'down' } : r));
+  const stranded = seedOrphan(ctx, { runner: 'a', runnerRoot: aRoot });
+  const out = await sweep(ctx, { now: t0 + 3 * HOUR, force: true });
+  assert.deepEqual(out.results.map(({ id, state }) => ({ id, state })), [{ id: stranded, state: 'unreachable' }], 'not lost: the old clock was cleared');
+  assert.deepEqual(unreachableAt(ctx), { a: t0 + 3 * HOUR });
 });

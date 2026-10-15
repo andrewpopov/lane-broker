@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths, atomicWriteJson, appendHistory } from './state.js';
+import { paths, atomicWriteJson, appendHistory, readJsonSafe } from './state.js';
 import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { terminalRowDefaults } from './resources.js';
 import { fetchRemoteResult, classifyRemoteResult, provesNeverStarted, remoteCancel } from './remote-client.js';
@@ -18,18 +18,24 @@ import { writeBrokerLog } from './admission.js';
  *    queue-timeout, withdrawn; lost: exit 75, `runner-never-started`), or
  *  - a probe-phase attempt that never reached a runner (no runner, no dispatchedRunners, no binding: the supervisor persists all
  *    three before its first ssh submit, so nothing was ever sent; lost: exit 75, `never-dispatched`, no ssh at all).
+ *  - (BRAIN-594) a runner the operator marked `offline: true` (lost: exit 75, `runner-offline`, settled WITHOUT contacting it), or a
+ *    runner that has given no usable answer for longer than `runnerLostAfterMs`, measured from the first failed fetch and persisted
+ *    in `runner-unreachable.json` (lost: exit 75, `runner-lost`). Any answer from the runner, `running` included, clears that clock.
  * Anything else leaves the attempt untouched, with the state saying why: `running` (the runner still has it), `unreachable`
  * (no usable answer), `ambiguous` (a record that cannot be trusted), `skipped` (not an orphan, or already settled).
  *
  * `deadlineMs` bounds each ssh call; `deadlineAt` (ms epoch, optional) bounds the whole reconcile: every call gets at most what is
  * left of it, and the next call is not made when under `MIN_CALL_MS` remain (`{ state: 'unreachable', timedOut: true }`).
  *
+ * `now` (ms epoch) is the clock for the unreachable bound; `assumeDown` skips contacting the runner because this sweep already found it
+ * unreachable (only the offline flag and the bound can settle then).
+ *
  * Returns `{ settled, state, exit?, reason?, transport?, timedOut? }` (`transport: true`: the runner gave no usable answer at all, so
  * asking it about another attempt would fail the same way); never throws.
  */
-export async function reconcileRemoteAttempt(root, id, { globalCfg, sshBin = 'ssh', env, deadlineMs = 30_000, deadlineAt } = {}) {
+export async function reconcileRemoteAttempt(root, id, { globalCfg, sshBin = 'ssh', env, deadlineMs = 30_000, deadlineAt, now = Date.now(), assumeDown = false } = {}) {
   try {
-    return await reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt });
+    return await reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt, now, assumeDown });
   } catch (err) {
     return { settled: false, state: 'error', reason: err.message };
   }
@@ -40,7 +46,24 @@ const skipped = (reason) => ({ settled: false, state: 'skipped', reason });
 const MIN_CALL_MS = 250;
 const waitTimedOut = () => ({ settled: false, state: 'unreachable', reason: 'wait timeout reached', timedOut: true });
 
-async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt }) {
+/** Runner name -> ms epoch of its first failed fetch in the current unreachable streak (BRAIN-594). */
+const readUnreachable = (root) => readJsonSafe(paths(root).runnerUnreachable) ?? {};
+
+/** Record that `name` gave no answer, keeping the streak's first time, and return that time. */
+function markUnreachable(root, name, now) {
+  const all = readUnreachable(root);
+  if (all[name] === undefined) atomicWriteJson(paths(root).runnerUnreachable, { ...all, [name]: now });
+  return all[name] ?? now;
+}
+
+function clearUnreachable(root, name) {
+  const all = readUnreachable(root);
+  if (all[name] === undefined) return;
+  delete all[name];
+  atomicWriteJson(paths(root).runnerUnreachable, all);
+}
+
+async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt, now, assumeDown }) {
   const resultPath = path.join(paths(root).results, `${id}.json`);
   const attempt = readAttempt(root, id);
   if (!attempt) return skipped('no attempt record');
@@ -56,6 +79,22 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
   const runner = (globalCfg?.runners ?? []).find((r) => r.name === attempt.runner);
   if (!runner) return { settled: false, state: 'unreachable', reason: 'runner not configured' };
 
+  if (runner.offline) {
+    return publishSettled(root, id, attempt, resultPath, 'lost', () => lostResult(id, attempt, 'runner-offline', `runner ${runner.name} is marked offline in the config; not contacted`));
+  }
+  const publishUnreachable = (since) => {
+    const unreachableMs = now - since;
+    if (!(globalCfg.runnerLostAfterMs > 0) || unreachableMs <= globalCfg.runnerLostAfterMs) return null;
+    return publishSettled(root, id, attempt, resultPath, 'lost', () =>
+      lostResult(id, attempt, 'runner-lost', `runner ${runner.name} unreachable for ${Math.round(unreachableMs / 60_000)} min (limit ${Math.round(globalCfg.runnerLostAfterMs / 60_000)} min)`),
+    );
+  };
+  const unreachable = async (outcome) => {
+    const since = readUnreachable(root)[runner.name];
+    return (since === undefined ? null : await publishUnreachable(since)) ?? outcome;
+  };
+  if (assumeDown) return unreachable({ settled: false, state: 'unreachable', transport: true, reason: `no usable answer from ${runner.name}` });
+
   /** The time the next ssh call may take, or null when too little of the overall deadline is left to make it. */
   const callBudget = () => {
     const ms = deadlineAt === undefined ? deadlineMs : Math.min(deadlineMs, deadlineAt - Date.now());
@@ -65,7 +104,11 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
   const firstBudget = callBudget();
   if (firstBudget === null) return waitTimedOut();
   const fetched = await fetchRemoteResult(runner, id, sshBin, firstBudget, env);
-  if (fetched === null) return { settled: false, state: 'unreachable', transport: true, reason: `no usable answer from ${runner.name}` };
+  if (fetched === null) {
+    const since = markUnreachable(root, runner.name, now);
+    return (await publishUnreachable(since)) ?? { settled: false, state: 'unreachable', transport: true, reason: `no usable answer from ${runner.name}` };
+  }
+  clearUnreachable(root, runner.name);
 
   const publish = (kind, build) => publishSettled(root, id, attempt, resultPath, kind, build);
 

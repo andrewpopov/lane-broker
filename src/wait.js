@@ -20,6 +20,18 @@ async function reconcileOrphan(root, id, deadline) {
   return reconcileRemoteAttempt(root, id, { globalCfg: config, deadlineMs: RECONCILE_SSH_DEADLINE_MS, deadlineAt: deadline ?? undefined });
 }
 
+/** The exit `lane wait` reports for a published result. A reconciled-as-lost result (exit 75) says why on stderr (BRAIN-594). */
+function resultExit(id, result) {
+  if (result.signal) {
+    process.stderr.write(`lane wait: command terminated by signal ${result.signal}\n`);
+    return { exitCode: 1 };
+  }
+  if (result.reconciled && result.reason) {
+    process.stderr.write(`lane wait: ${id} was settled as lost (${result.reason}${result.lostDetail ? `: ${result.lostDetail}` : ''}); the job's outcome is unknown\n`);
+  }
+  return { exitCode: result.exit ?? 1 };
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -72,13 +84,7 @@ export async function waitCommand(id, { timeoutMs } = {}) {
   try {
     for (;;) {
       const result = readJsonSafe(resultPath);
-      if (result) {
-        if (result.signal) {
-          process.stderr.write(`lane wait: command terminated by signal ${result.signal}\n`);
-          return { exitCode: 1 };
-        }
-        return { exitCode: result.exit ?? 1 };
-      }
+      if (result) return resultExit(id, result);
       if (cancelFailed) {
         process.stderr.write(`lane wait: cancel of ${id} not confirmed (attempt kept); retry lane cancel ${id}\n`);
         return { exitCode: 1 };
@@ -120,13 +126,7 @@ export async function waitCommand(id, { timeoutMs } = {}) {
           }
         }
         const settledResult = readJsonSafe(resultPath);
-        if (settledResult) {
-          if (settledResult.signal) {
-            process.stderr.write(`lane wait: command terminated by signal ${settledResult.signal}\n`);
-            return { exitCode: 1 };
-          }
-          return { exitCode: settledResult.exit ?? 1 };
-        }
+        if (settledResult) return resultExit(id, settledResult);
         // Still no result: re-read the attempt too, in case
         // `publishTerminal` removed it in the same gap without us having
         // observed the result yet (its own write is what we just missed).
