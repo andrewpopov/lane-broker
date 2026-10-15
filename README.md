@@ -577,12 +577,30 @@ What a remote run does:
      `queued x E x speedRatio` when that runner is itself queued). The earlier
      wins; a tie stays local.
 
-   A runner's `speedRatio` is the median, over commands (`cmdFingerprint`) with a
-   successful run both here and on that runner, of remote run / local run, once
-   at least 5 such commands exist. Until then it is the runner's configured
-   `speedRatio` (a number >= 1), else 1. Every decision writes a
+   A runner's `speedRatio` is remote run / local run, taken from the most
+   specific evidence that holds up (BRAIN-596). Commands are paired by
+   `cmdFingerprint`'s source text with per-run env assignments removed (a
+   `NAME=value` whose value is a sha of 7+ hex or an id of 6+ digits, such as
+   the train's `TRAIN_BASE_SHA`), so every release candidate pairs with the
+   history of the others; the stored fingerprint is unchanged. In order:
+   1. `exact`: this command, with at least 2 successful runs on each side;
+   2. `repo-lane`: median over the commands of the same repo and lane, with at
+      least 5 such commands;
+   3. `size-band`: median over commands whose local median is within 0.5x-2x of
+      this job's E, at least 5 (short jobs run 4-7x slower on a runner, long ones
+      2-3x, so a pair only speaks for a job of similar size; a factor of 2 keeps
+      the same order of magnitude yet is wide enough to find 5 pairs);
+   4. `global`: median over every command, at least 5;
+   5. `configured`: the runner's `speedRatio` (a number >= 1), else 1.
+
+   When this machine's admission is denied by host load outside any lease (the
+   persisted CPU gate is closed, or the last fresh CPU sample leaves no room for
+   the ticket's claim beside that load) there is no local slot to wait for: the
+   local finish is unbounded and a runner that is not itself queued wins. A
+   queued runner keeps the queue arithmetic above. Without a fresh CPU sample
+   the rule does not apply. Every decision writes a
    `lane: speed-placement: ts=... <id>: local|remote: ...` line, with both
-   estimates, to `admission-decisions.log`. A ticket that stays local is
+   estimates and the ratio's tier and pair count, to `admission-decisions.log`. A ticket that stays local is
    re-evaluated at every late rebind probe and moves to a runner once waiting
    here is expected to take longer; only the selected runner is compared, and the
    rebalance of a ticket already on a runner is unchanged.
