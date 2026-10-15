@@ -59,11 +59,13 @@ export async function sweepOrphans(root, { globalCfg, force = false, now = Date.
     const results = [];
     for (const attempt of orphans) {
       const entry = { id: attempt.id, runner: attempt.runner };
-      if (downRunners.has(attempt.runner)) {
+      // a runner already found down this sweep is not asked again, but the operator flag and the unreachable bound still settle (BRAIN-594)
+      const assumeDown = downRunners.has(attempt.runner);
+      const outcome = await reconcileRemoteAttempt(root, attempt.id, { globalCfg, sshBin, env, deadlineMs, now, assumeDown });
+      if (assumeDown && !outcome.settled) {
         results.push({ ...entry, state: 'skipped-runner-down' });
         continue;
       }
-      const outcome = await reconcileRemoteAttempt(root, attempt.id, { globalCfg, sshBin, env, deadlineMs });
       if (outcome.transport) downRunners.add(attempt.runner);
       results.push({
         ...entry,

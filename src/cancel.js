@@ -7,6 +7,7 @@ import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult } 
 import { terminalRowDefaults } from './resources.js';
 import { remoteCancel } from './remote-client.js';
 import { loadGlobalConfigOrError } from './config.js';
+import { reconcileRemoteAttempt } from './remote-reconcile.js';
 import { writeBrokerLog } from './admission.js';
 import { trackerForLease, reapLogLine, cancelGraceMs } from './descendants.js';
 
@@ -96,8 +97,21 @@ export async function cancelAttempt(root, id, attempt) {
   }
 
   // ORPHANED-REMOTE: reconcile directly, no supervisor left to do it.
-  writeCancelMarkerFile(root, id);
   const { config: globalCfg, error: configError } = loadGlobalConfigOrError();
+  // BRAIN-594: a runner the operator marked offline cannot confirm anything and is never contacted: the attempt settles as lost
+  // (exit 75, `runner-offline`) through the reconcile path, exactly as a sweep would. Ahead of the cancel marker, which would
+  // turn the settle into a cancelled result.
+  const offline = !configError && (globalCfg.runners || []).find((r) => r.name === attempt.runner)?.offline;
+  if (offline) {
+    const outcome = await reconcileRemoteAttempt(root, id, { globalCfg });
+    if (outcome.settled) {
+      process.stdout.write(`lane cancel: ${id} settled as lost (runner ${attempt.runner} is marked offline)\n`);
+      return { exitCode: 0 };
+    }
+    process.stderr.write(`lane cancel: could not settle ${id} for offline runner ${attempt.runner}: ${outcome.state}${outcome.reason ? ` (${outcome.reason})` : ''}\n`);
+    return { exitCode: 1 };
+  }
+  writeCancelMarkerFile(root, id);
   // BRAIN-436: a move that was in flight may have left the ticket on either runner, so every runner it names is cancelled.
   const involved = [...new Set([attempt.runner, attempt.moving?.from, attempt.moving?.to].filter(Boolean))];
   // BRAIN-321: with the config unreadable the runner cannot be reached, so "cancelled" must not be published nor the attempt deleted.

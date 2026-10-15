@@ -238,6 +238,10 @@ export async function selectRunner(runners, opts = {}) {
   const better = (cand, best) => !best || cand.finish < best.finish || (cand.finish === best.finish && cand.cpuFree > best.cpuFree);
   const now = opts.now ?? Date.now();
   for (const runner of runners) {
+    if (runner.offline) {
+      skipped.push({ name: runner.name, reason: 'marked offline' });
+      continue;
+    }
     // BRAIN-533: a runner scheduled to be off is not probed at all, and one whose window closes before this ticket is expected to finish is not given it.
     const window = runnerAvailability(runner.schedule, now);
     if (!window.available) {

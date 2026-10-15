@@ -921,7 +921,22 @@ again:
   lost (exit `75`, `reason: never-dispatched`) without any ssh call. This is safe because the supervisor writes the runner,
   `dispatchedRunners` and the binding to the attempt before it spawns the submit ssh, on first dispatch and on every
   runner-to-runner move;
-- a job the runner still runs is left alone; so is anything when the runner cannot be reached.
+- a job the runner still runs is left alone; so is anything when the runner cannot be reached, until one of the two bounds below.
+
+**A runner that stays down (BRAIN-594).** Without a bound, a runner that is off for days would hold its orphans (and the trains
+waiting on them) forever. Two ways to settle them as lost (exit `75`; a job's outcome is unknown, and it is never re-run by the broker):
+
+- `runners[].offline: true` in the global config (boolean): the operator says the runner is down. Placement never chooses it
+  (`marked offline` in the skipped list), and reconcile and `lane cancel` settle its unresolved attempts at once without contacting
+  it: `reason: runner-offline`, plus a history row, through the same publish path as every other reconcile. Remove the flag when
+  the runner is back. A result the runner produces later for a settled attempt is ignored. There is no `lane runner offline`
+  command: the config is hand-edited JSON and the flag is one line.
+- `runnerLostAfterMs` (global config, integer >= 0, default 7,200,000 = 2 h; 0 disables): a runner continuously unreachable longer
+  than this has its unresolved attempts settled with `reason: runner-lost`. The clock starts at the first failed fetch and is kept
+  in `runner-unreachable.json` in the state root (each reconcile is its own process); any answer from the runner, `running`
+  included, clears it, and a runner that answers `running` keeps its attempt (the no-rerun guarantee holds until the bound).
+
+`lane wait` on a settled-lost attempt exits `75` and prints the reason on stderr.
 
 `lane wait` asks the runner inline: it returns the settled exit, keeps waiting while the runner reports the job running (asking
 again every 30 s), and exits `1` naming the reason otherwise. `--timeout` is an absolute deadline for the reconcile too: its ssh

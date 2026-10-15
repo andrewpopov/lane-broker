@@ -76,6 +76,8 @@ export function paths(root = stateHome()) {
     gcLastRun: path.join(root, 'gc-last-run'),
     // BRAIN-515: when the ORPHANED-REMOTE reconcile sweep last claimed a run (src/reconcile-sweep.js).
     reconcileLastRun: path.join(root, 'reconcile-last-run'),
+    // BRAIN-594: `{ [runner]: firstUnreachableAt }`, persisted because each reconcile runs in its own process (src/remote-reconcile.js).
+    runnerUnreachable: path.join(root, 'runner-unreachable.json'),
     conflictSkipState: path.join(root, 'conflict-skip-state.json'),
     // BRAIN-249 part 2: the capacity-blocked head's own skip counter — kept
     // separate from conflictSkipState (see readCapacitySkipState's doc

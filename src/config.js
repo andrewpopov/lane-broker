@@ -115,6 +115,9 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // A ticket stuck in this machine's queue this long (continuously, since it entered or was last restored to it) may rebind to a
   // runner that is itself queued, up to `maxRemoteQueue` deep (otherwise only an idle runner qualifies). 0 disables that path.
   remoteRebindMinLocalWaitMs: 120_000,
+  // BRAIN-594: a runner continuously unreachable this long has its unresolved remote attempts settled as lost (exit 75,
+  // `runner-lost`) by reconcile. 0 disables the bound; `runners[].offline: true` settles at once instead.
+  runnerLostAfterMs: 7_200_000,
   // BRAIN-436: a remote ticket that has sat QUEUED on its runner this long is withdrawn and moved to another runner that has
   // real headroom now (needs the runner's `remote-withdraw/1`). 0 disables. The interval is how often the submitter looks, the
   // cooldown is the minimum gap between two moves of one ticket, and the cap is how many times one ticket may move.
@@ -358,6 +361,7 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isInteger(cfg.remoteRebindMinLocalWaitMs) && cfg.remoteRebindMinLocalWaitMs >= 0,
     `${sourcePath}: "remoteRebindMinLocalWaitMs" must be a non-negative integer`,
   );
+  assert(Number.isInteger(cfg.runnerLostAfterMs) && cfg.runnerLostAfterMs >= 0, `${sourcePath}: "runnerLostAfterMs" must be a non-negative integer`);
   for (const field of ['remoteRebalanceMinQueuedMs', 'remoteRebalanceCooldownMs', 'remoteRebalanceMaxMoves']) {
     assert(Number.isInteger(cfg[field]) && cfg[field] >= 0, `${sourcePath}: "${field}" must be a non-negative integer`);
   }
@@ -487,6 +491,10 @@ function validateRunners(runners, sourcePath) {
     // BRAIN-548: how many times slower this runner is than this machine, used until history has enough paired runs to measure it.
     if (runner.speedRatio !== undefined) {
       assert(Number.isFinite(runner.speedRatio) && runner.speedRatio >= 1, `${sourcePath}: runner "${runner.name}".speedRatio must be a number >= 1`);
+    }
+    // BRAIN-594: operator says this runner is down for a while: never chosen, its unresolved attempts settle as lost at once.
+    if (runner.offline !== undefined) {
+      assert(typeof runner.offline === 'boolean', `${sourcePath}: runner "${runner.name}".offline must be a boolean`);
     }
     // BRAIN-533: when the runner is powered on; absent means always available.
     if (runner.schedule !== undefined) {
