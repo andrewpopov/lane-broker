@@ -121,6 +121,8 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // BRAIN-597: a runner whose first failed contact (runner-unreachable.json, kept fresh by `lane runner watch`) is at least this old is
   // skipped by placement without being probed. 0 disables the skip.
   runnerDownAfterMs: 300_000,
+  // BRAIN-602: how long placement waits for one runner's `remote-probe` ssh call before skipping it as "probe timed out".
+  remoteProbeDeadlineMs: 10_000,
   // BRAIN-436: a remote ticket that has sat QUEUED on its runner this long is withdrawn and moved to another runner that has
   // real headroom now (needs the runner's `remote-withdraw/1`). 0 disables. The interval is how often the submitter looks, the
   // cooldown is the minimum gap between two moves of one ticket, and the cap is how many times one ticket may move.
@@ -366,6 +368,7 @@ function validateGlobalConfig(cfg, sourcePath) {
   );
   assert(Number.isInteger(cfg.runnerLostAfterMs) && cfg.runnerLostAfterMs >= 0, `${sourcePath}: "runnerLostAfterMs" must be a non-negative integer`);
   assert(Number.isInteger(cfg.runnerDownAfterMs) && cfg.runnerDownAfterMs >= 0, `${sourcePath}: "runnerDownAfterMs" must be a non-negative integer`);
+  assert(Number.isInteger(cfg.remoteProbeDeadlineMs) && cfg.remoteProbeDeadlineMs > 0, `${sourcePath}: "remoteProbeDeadlineMs" must be a positive integer`);
   for (const field of ['remoteRebalanceMinQueuedMs', 'remoteRebalanceCooldownMs', 'remoteRebalanceMaxMoves']) {
     assert(Number.isInteger(cfg[field]) && cfg[field] >= 0, `${sourcePath}: "${field}" must be a non-negative integer`);
   }

@@ -770,11 +770,17 @@ export async function probeCpuHeadroom(root, cfg, heldLeases, { now = Date.now()
   return { cpuCores: headroomAt(preemptible), cpuCoresUndiscounted: headroomAt(0) };
 }
 
+/** BRAIN-602: how long the probe waits for the broker lock before answering from a lock-free read instead. */
+export const PROBE_LOCK_WAIT_MS = 500;
+
 /** `lane remote-probe`: one JSON line describing this host's local broker,
- *  reusing status.js's own reader rather than a second implementation. */
+ *  reusing status.js's own reader rather than a second implementation.
+ *  BRAIN-602: the lock is only taken to reap stale leases, so a busy runner whose lock is held answers after PROBE_LOCK_WAIT_MS from
+ *  the lease/queue/gate files as they are (each written by atomic rename, so each file is consistent but the set may be a moment
+ *  apart, and dead leases are not reaped) and says so with `stale: true, snapshot: "lockless"`. */
 export async function remoteProbeCommand({ root = defaultRemoteRoot(), measure } = {}) {
   pruneStaleArtifacts(path.join(path.resolve(root), 'tickets'));
-  const status = await collectStatus();
+  const status = await collectStatus({ lockTimeoutMs: PROBE_LOCK_WAIT_MS });
   const pkgPath = fileURLToPath(new URL('../package.json', import.meta.url));
   const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
   // BRAIN-320 S1a (1d/1e): `protocols` is the new negotiation field ([1, 2]
@@ -799,6 +805,7 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot(), measure }
   const payload = {
     protocol: 1,
     protocols: [1, 2],
+    ...(status.lockError ? { stale: true, snapshot: 'lockless' } : {}),
     // BRAIN-360: this runner resolves minCpuCores itself, so a submitter may judge fit by the floor
     capabilities: CAPABILITIES,
     version: pkg.version,

@@ -112,6 +112,17 @@ export function downRunnerReasons(root, cfg, now = Date.now()) {
   return reasons;
 }
 
+/**
+ * BRAIN-602: names of the runners the heartbeat vouches for: the watcher is alive and pinged the runner successfully within
+ * HEARTBEAT_FRESH_MS. A probe timeout on one of these is load, not absence.
+ */
+export function heartbeatUpRunners(root, cfg, now = Date.now()) {
+  const beat = readHeartbeat(root);
+  const age = heartbeatAgeMs(beat, now);
+  if (age === null || age > HEARTBEAT_FRESH_MS) return [];
+  return (cfg?.runners ?? []).filter((r) => !r.offline && now - (beat.runners[r.name]?.lastOkAt ?? -Infinity) <= HEARTBEAT_FRESH_MS).map((r) => r.name);
+}
+
 /** One entry per configured runner, for `lane status`, `lane runner status` and the status JSON. */
 export function collectRunnerStates(root, cfg, now = Date.now()) {
   const runners = cfg?.runners ?? [];
