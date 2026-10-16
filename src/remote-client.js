@@ -193,7 +193,7 @@ function neverFits(reservation, probe) {
  * `paused`, `queued === 0`, (1e) statically able to fit the ticket, and (BRAIN-405) with real headroom now (`runnerRoom`) --
  * as `{runner, probe, skipped}`, or `{runner: null, skipped}` naming why every candidate was passed over. Among usable
  * runners the earliest `estimatedFinish` wins, then the most free CPU, then config order. With none usable, `busy`
- * (hotfix 0.22.1) names the best runner that failed only the headroom check, for a lane that has no local queue to wait in. `opts.deadlineMs` (default 6000) bounds each individual probe; a
+ * (hotfix 0.22.1) names the best runner that failed only the headroom check, for a lane that has no local queue to wait in. `opts.deadlineMs` (default the `remoteProbeDeadlineMs` default) bounds each individual probe; `opts.retryTimedOut` (BRAIN-602) names runners whose timed-out probe is retried once; a
  * probe that hangs past it is SIGKILLed and counted as a skip, never as a
  * hang for the whole selection.
  *
@@ -228,7 +228,8 @@ function neverFits(reservation, probe) {
  * nothing is dispatched here. 0 keeps the pre-BRAIN-338 behaviour exactly.
  */
 export async function selectRunner(runners, opts = {}) {
-  const deadlineMs = opts.deadlineMs ?? 6000;
+  const deadlineMs = opts.deadlineMs ?? DEFAULT_GLOBAL_CONFIG.remoteProbeDeadlineMs;
+  const retryTimedOut = new Set(opts.retryTimedOut ?? []);
   const sshBin = opts.sshBin ?? 'ssh';
   const { env, requireProtocol2 = false, requireCapabilities = [], reservation, maxRemoteQueue = 0, downRunners = {} } = opts;
   const skipped = [];
@@ -260,7 +261,9 @@ export async function selectRunner(runners, opts = {}) {
       continue;
     }
     const cmd = buildRemoteCommand(runner, 'remote-probe');
-    const res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
+    let res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
+    // BRAIN-602: a runner the heartbeat says is up that merely timed out is busy, not gone: a lane with nowhere else to go probes it once more
+    if (res.timedOut && retryTimedOut.has(runner.name)) res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
     if (res.timedOut) {
       skipped.push({ name: runner.name, reason: 'probe timed out' });
       continue;

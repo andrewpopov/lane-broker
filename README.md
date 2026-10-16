@@ -455,8 +455,8 @@ What a remote run does:
    serialized file list (the snapshot's header line) is capped at ~16 MB —
    roughly 90k files — checked locally before dialing ssh; a larger tree
    stays local with that reason.
-2. **Pick a runner**: probe every runner (`lane remote-probe`, 6 s hard
-   deadline each) and keep those that are reachable, speak the protocol the
+2. **Pick a runner**: probe every runner (`lane remote-probe`, `remoteProbeDeadlineMs`
+   hard deadline each, default 10 s) and keep those that are reachable, speak the protocol the
    lane needs (below), are not paused, have no queue, could ever fit the
    lane's reservation (weight, CPU budget, memory plus its reserve, from the
    runner's static capacity) **and have real room right now**: the probe's
@@ -973,6 +973,15 @@ launchd job; it adds no second ledger and builds on the BRAIN-594 clock:
   runner whose clock is at least that old without probing it (`skipped: unreachable since HH:MM`). The clock is trusted only
   while the last watcher tick is under 5 minutes old, so a dead watcher never keeps a runner out on an old reading. The runner
   is placed again on the first ok ping. This only stops placement; nothing is settled before `runnerLostAfterMs`.
+- `remoteProbeDeadlineMs` (global config, positive integer, default 10,000): the hard deadline on each runner's `lane remote-probe` ssh
+  call during placement, rebind and rebalance. A `localRefused` lane (it has no local fallback) probes a runner that timed out once
+  more, but only a runner the heartbeat vouches for (watcher tick under 5 minutes old and the runner's `lastOkAt` under 5 minutes old);
+  a runner the heartbeat has not seen answer is skipped as `probe timed out` straight away.
+- The probe contract: `lane remote-probe` must answer promptly on a busy runner. It waits at most 500 ms for the broker lock (the lock
+  only reaps stale leases). If the lock is held it answers from a lock-free read of the lease, queue and gate files and adds
+  `"stale": true, "snapshot": "lockless"`. Each file is written by atomic rename, so each is consistent on its own, but the set can be a
+  moment apart and a dead lease not yet reaped still counts as running. Headroom uses the supervisor's CPU sample when under 30 s old,
+  else one ~250 ms window. A submitter may treat a `stale` answer as slightly out of date, not as absent.
 - Lock order: the broker lock and the heartbeat locks (`runner-watch.lock`, `runner-unreachable.lock`) are never nested in either
   direction (a violation throws). Lock order is enforced within a process; a child process spawned while holding a lock must not take the other group.
 - `lane status` has a RUNNERS section (and `runners[]` in `--json`), also printed by `lane runner [status] [--json]`: per runner the

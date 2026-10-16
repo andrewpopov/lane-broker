@@ -35,7 +35,7 @@ import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
 import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
-import { downRunnerReasons } from './runner-unreachable.js';
+import { downRunnerReasons, heartbeatUpRunners } from './runner-unreachable.js';
 import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
@@ -572,6 +572,9 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
   return {
     ...(expectedMs !== null ? { expectedRunMs: expectedMs } : {}),
     ...(Object.keys(downRunners).length > 0 ? { downRunners } : {}),
+    deadlineMs: globalCfg.remoteProbeDeadlineMs,
+    // BRAIN-602: a lane this machine refuses has nowhere else to go, so a busy-but-up runner's timed-out probe is retried once
+    ...(enriched.localRefused && !enriched.allowLocalSim ? { retryTimedOut: heartbeatUpRunners(root, globalCfg) } : {}),
     maxRemoteQueue: globalCfg.maxRemoteQueue,
     requireProtocol2: needsProtocol2(enriched.remote) || Boolean(queueTimeoutFor(enriched, globalCfg)),
     requireCapabilities: isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : [],
