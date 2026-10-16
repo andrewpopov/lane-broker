@@ -973,6 +973,8 @@ launchd job; it adds no second ledger and builds on the BRAIN-594 clock:
   runner whose clock is at least that old without probing it (`skipped: unreachable since HH:MM`). The clock is trusted only
   while the last watcher tick is under 5 minutes old, so a dead watcher never keeps a runner out on an old reading. The runner
   is placed again on the first ok ping. This only stops placement; nothing is settled before `runnerLostAfterMs`.
+- Lock order: the broker lock and the heartbeat locks (`runner-watch.lock`, `runner-unreachable.lock`) are never nested in either
+  direction (a violation throws). Lock order is enforced within a process; a child process spawned while holding a lock must not take the other group.
 - `lane status` has a RUNNERS section (and `runners[]` in `--json`), also printed by `lane runner [status] [--json]`: per runner the
   state (`up`, `unreachable since HH:MM`, `down (placement skips)`, `offline`, `off-schedule`), the last-ok age, and the time its
   orphans settle as lost (`unreachable since + runnerLostAfterMs`). A stale heartbeat prints `watcher not running (state Nm old)`.

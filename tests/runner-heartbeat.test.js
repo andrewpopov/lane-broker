@@ -214,6 +214,19 @@ test('lock order: a heartbeat lock is never taken under the broker lock, nor the
   await withLock(root, async () => {});
 });
 
+test('lock order: a continuation created inside a heartbeat lock that runs after its release may take the broker lock', async () => {
+  const root = tmpDir('heartbeat-order-late');
+  let later;
+  await withLock(
+    root,
+    async () => {
+      later = new Promise((resolve, reject) => setTimeout(() => withLock(root, async () => 'broker').then(resolve, reject), 50));
+    },
+    { lockPath: paths(root).runnerUnreachableLock, group: 'heartbeat' },
+  );
+  assert.equal(await later, 'broker');
+});
+
 // ---- placement ---------------------------------------------------------------------------------------------------------
 
 const beat = (at, runners = {}) => ({ at, runners });
