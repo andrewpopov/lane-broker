@@ -35,6 +35,7 @@ import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
 import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
+import { downRunnerReasons } from './runner-unreachable.js';
 import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
@@ -337,6 +338,13 @@ export function resolveNicedSpawn(ticket) {
  */
 export function childEnv(ticket, baseEnv = process.env, grantedCpuCores = ticket.resources?.cpuCores, classEnforcement = null) {
   const env = { ...baseEnv, LANE_BROKER_LEASE: ticket.id, LANE_BROKER_KEY: ticket.key };
+  // BRAIN-597: where the command runs. A runner's own `remote-exec` marked itself (src/remote-runner.js) and keeps `remote` (+ the submitter's runner name);
+  // every other run is `local`, whatever a caller's shell exported.
+  if (baseEnv.LANE_BROKER_EXECUTOR === 'remote' && baseEnv.LANE_BROKER_LOCAL_REASON === 'remote-exec runner') env.LANE_BROKER_EXECUTOR = 'remote';
+  else {
+    env.LANE_BROKER_EXECUTOR = 'local';
+    delete env.LANE_BROKER_RUNNER;
+  }
   const cpuCores = grantedCpuCores;
   const memoryBytes = ticket.resources?.memoryBytes;
   if (Number.isFinite(cpuCores) && cpuCores > 0) env.LANE_BROKER_CPU_CORES = String(cpuCores);
@@ -559,8 +567,11 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
   // BRAIN-533: history is read only when some runner has a schedule that could make the expected run time matter.
   const scheduled = (globalCfg.runners || []).some((r) => r.schedule);
   const expectedMs = scheduled ? expectedRunMs(readRows(paths(root).history), enriched.repoId, enriched.lane) : null;
+  // BRAIN-597: first placement, rebind and rebalance all select through here, so a down runner is skipped by every one of them.
+  const downRunners = downRunnerReasons(root, globalCfg);
   return {
     ...(expectedMs !== null ? { expectedRunMs: expectedMs } : {}),
+    ...(Object.keys(downRunners).length > 0 ? { downRunners } : {}),
     maxRemoteQueue: globalCfg.maxRemoteQueue,
     requireProtocol2: needsProtocol2(enriched.remote) || Boolean(queueTimeoutFor(enriched, globalCfg)),
     requireCapabilities: isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : [],
@@ -572,6 +583,19 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
       niceOverride: enriched.niceOverride,
     },
   };
+}
+
+/**
+ * The ONE builder of `selectRunner` options for the three placement paths ('place' a first attempt, 'rebind' a locally queued
+ * ticket, 'rebalance' a queued remote one), so what every path must carry (BRAIN-597's `downRunners`) cannot be dropped by one.
+ */
+export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHome(), stuckLocally = false, draining = false } = {}) {
+  const base = remoteSelectOptions(enriched, globalCfg, root);
+  if (kind === 'rebind') return { ...base, maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0 };
+  if (kind === 'rebalance') {
+    return { ...base, maxRemoteQueue: 0, requireCapabilities: draining ? [...base.requireCapabilities, REMOTE_WITHDRAW_CAPABILITY] : base.requireCapabilities };
+  }
+  return base;
 }
 
 /**
@@ -809,7 +833,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // sends a protocol-1 header even when this is true.
   let { runner, skipped, queuedChoice, probe, busy } = rebind
     ? { runner: rebind.runner, skipped: [], queuedChoice: false, probe: rebind.probe }
-    : await selectRunner(globalCfg.runners || [], remoteSelectOptions(enriched, globalCfg));
+    : await selectRunner(globalCfg.runners || [], selectionOptionsFor('place', enriched, globalCfg));
   // A ticket this machine would refuse has no local queue to wait in, so with every runner busy it waits on the best one: that
   // runner's own broker holds the ticket until it has room (what every empty-queue runner did before headroom ranking).
   let busyQueuedAt;
@@ -971,12 +995,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
           if (!draining && rebalanceBlocked({ moves: countedMoves, maxMoves: globalCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: globalCfg.remoteRebalanceCooldownMs })) return null;
           const candidates = (globalCfg.runners || []).filter((r) => !visited.includes(r.name) && r.rebalanceTarget !== false);
           if (candidates.length === 0) return null;
-          const selectOptions = remoteSelectOptions(enriched, globalCfg);
-          const picked = await selectRunner(candidates, {
-            ...selectOptions,
-            maxRemoteQueue: 0,
-            requireCapabilities: draining ? [...selectOptions.requireCapabilities, REMOTE_WITHDRAW_CAPABILITY] : selectOptions.requireCapabilities,
-          });
+          const picked = await selectRunner(candidates, selectionOptionsFor('rebalance', enriched, globalCfg, { draining }));
           const eligible = picked.runner && hasMeasuredHeadroom(picked.probe);
           target = eligible ? { runner: picked.runner, probe: picked.probe } : null;
           return target;
@@ -1351,7 +1370,7 @@ async function main() {
     // An idle runner is always taken; a runner that is itself queued (up to maxRemoteQueue) only for a ticket stuck locally long enough.
     const waitedMs = Date.now() - (readQueuedRecord(root, ticket.id)?.localSince ?? Date.now());
     const stuckLocally = globalCfg.remoteRebindMinLocalWaitMs > 0 && waitedMs >= globalCfg.remoteRebindMinLocalWaitMs;
-    const { runner, probe, queuedChoice } = await selectRunner(candidates, { ...remoteSelectOptions(enriched, globalCfg), maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0 });
+    const { runner, probe, queuedChoice } = await selectRunner(candidates, selectionOptionsFor('rebind', enriched, globalCfg, { stuckLocally }));
     if (!runner) return;
     // BRAIN-548: a speed-aware ticket moves only when the runner is now expected to finish it sooner than waiting here does.
     const speed = speedInputs(root, enriched);

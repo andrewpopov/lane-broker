@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import crypto from 'node:crypto';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { execFileSync } from 'node:child_process';
 import { isPidAlive, processStartTime, isProcessAlive } from './process-liveness.js';
 
@@ -78,6 +79,9 @@ export function paths(root = stateHome()) {
     reconcileLastRun: path.join(root, 'reconcile-last-run'),
     // BRAIN-594: `{ [runner]: firstUnreachableAt }`, persisted because each reconcile runs in its own process (src/remote-reconcile.js).
     runnerUnreachable: path.join(root, 'runner-unreachable.json'),
+    // BRAIN-597: guards every read-modify-write of runner-unreachable.json; and the one-tick-at-a-time lock of `lane runner watch`.
+    runnerUnreachableLock: path.join(root, 'runner-unreachable.lock'),
+    runnerWatchLock: path.join(root, 'runner-watch.lock'),
     conflictSkipState: path.join(root, 'conflict-skip-state.json'),
     // BRAIN-249 part 2: the capacity-blocked head's own skip counter — kept
     // separate from conflictSkipState (see readCapacitySkipState's doc
@@ -729,6 +733,22 @@ function recoverDeadLock(root, lockDir, ownerFile, observedOwner) {
 }
 
 /**
+ * Lock order (BRAIN-597): `withLock` serves several locks by `lockPath` (the broker lock by default; `runner-watch.lock` and
+ * `runner-unreachable.lock`, group `heartbeat`). A lock of one group is never taken while holding one of another group, so a
+ * broker-lock holder cannot wait on the heartbeat files and the reverse (the sweep, which takes the broker lock, runs after the
+ * watch lock is released). The groups held by the current async context are tracked and a violation throws.
+ */
+// Each entry is a live handle `{ group, held }` that the release flips, because a timer or promise continuation created inside a
+// callback keeps the context it was created in after the lock is gone; only entries still held count. Enforced within a process: a
+// child process spawned while holding a lock does not inherit the held groups.
+const heldGroups = new AsyncLocalStorage();
+function assertLockOrder(group) {
+  const held = (heldGroups.getStore() ?? []).filter((h) => h.held);
+  const other = held.find((h) => h.group !== group)?.group;
+  if (other) throw new Error(`lane-broker: lock order violation: taking a ${group} lock while holding a ${other} lock`);
+}
+
+/**
  * Acquire the global mutex. Ownership is published atomically: the owner
  * file is written inside a staging directory first, then the whole staging
  * directory is renamed onto the lock dir path. A rename onto an existing
@@ -771,8 +791,10 @@ function recoverDeadLock(root, lockDir, ownerFile, observedOwner) {
  * (pid, token) it is acting on. "How long has this sat here" never enters a
  * takeover decision; only liveness does.
  */
-export async function withLock(root, fn, { timeoutMs = lockTimeoutMsDefault(), pollMs = 25 } = {}) {
-  const lockDir = paths(root).lock;
+export async function withLock(root, fn, { timeoutMs = lockTimeoutMsDefault(), pollMs = 25, lockPath = paths(root).lock, group = 'broker' } = {}) {
+  assertLockOrder(group);
+  const handle = { group, held: true };
+  const lockDir = lockPath;
   fs.mkdirSync(root, { recursive: true });
   const ownerFile = path.join(lockDir, 'owner.json');
   const deadline = Date.now() + timeoutMs;
@@ -855,8 +877,9 @@ export async function withLock(root, fn, { timeoutMs = lockTimeoutMsDefault(), p
   }
 
   try {
-    return await fn();
+    return await heldGroups.run([...(heldGroups.getStore() ?? []), handle], fn);
   } finally {
+    handle.held = false;
     const owner = readJsonSafe(ownerFile);
     if (owner && owner.token === token) {
       // A recursive rmSync on the live path is not atomic: it unlinks

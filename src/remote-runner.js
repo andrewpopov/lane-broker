@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
 import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, readRemoteDrain, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
-import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
+import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, RUNNER_NAME_RE, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
 import { CAPABILITIES } from './capabilities.js';
 import { NO_PROGRESS_REASON, SILENCE_REASON } from './no-progress.js';
 import { artifactLimitsOf, collectArtifacts, encodeArtifacts, pruneStaleArtifacts } from './remote-artifacts.js';
@@ -196,6 +196,8 @@ function validateHeaderFields(header) {
   if (header.remoteArtifactsOn !== undefined && !REMOTE_ARTIFACTS_ON.includes(header.remoteArtifactsOn)) {
     return { ok: false, reason: 'invalid remoteArtifactsOn' };
   }
+  // BRAIN-597: additive; absent from an older submitter, in which case only LANE_BROKER_EXECUTOR is exported
+  if (header.runnerName !== undefined && !(typeof header.runnerName === 'string' && RUNNER_NAME_RE.test(header.runnerName))) return { ok: false, reason: 'invalid runnerName' };
   // BRAIN-321: additive; an older submitter sends neither, an older runner ignores both
   if (header.laneClass !== undefined && header.laneClass !== 'sim' && header.laneClass !== 'test') return { ok: false, reason: 'invalid laneClass' };
   if (header.classEnforcement !== undefined && header.classEnforcement !== 'required') return { ok: false, reason: 'invalid classEnforcement' };
@@ -456,6 +458,11 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     process.stderr.write(`lane remote-exec: ${fieldCheck.reason}\n`);
     return { exitCode: 0 };
   }
+
+  // BRAIN-597: the documented executor contract. Every phase env (remoteDeps, remoteSetup, the command) derives from this process's env.
+  process.env.LANE_BROKER_EXECUTOR = 'remote';
+  if (header.runnerName !== undefined) process.env.LANE_BROKER_RUNNER = header.runnerName;
+  else delete process.env.LANE_BROKER_RUNNER;
 
   const workDir = path.join(ticketDir, 'work');
   // Every phase env is derived from this process's env (buildDepsEnv, the

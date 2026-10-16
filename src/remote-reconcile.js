@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths, atomicWriteJson, appendHistory, readJsonSafe } from './state.js';
+import { paths, atomicWriteJson, appendHistory, LockTimeoutError } from './state.js';
+import { readUnreachable, recordContact } from './runner-unreachable.js';
 import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { terminalRowDefaults } from './resources.js';
 import { fetchRemoteResult, classifyRemoteResult, provesNeverStarted, remoteCancel } from './remote-client.js';
@@ -37,6 +38,8 @@ export async function reconcileRemoteAttempt(root, id, { globalCfg, sshBin = 'ss
   try {
     return await reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt, now, assumeDown });
   } catch (err) {
+    // the clock lock stayed held past the caller's deadline: the same outcome as an ssh call that ran out of time
+    if (err instanceof LockTimeoutError && deadlineAt !== undefined) return waitTimedOut();
     return { settled: false, state: 'error', reason: err.message };
   }
 }
@@ -45,23 +48,6 @@ const skipped = (reason) => ({ settled: false, state: 'skipped', reason });
 
 const MIN_CALL_MS = 250;
 const waitTimedOut = () => ({ settled: false, state: 'unreachable', reason: 'wait timeout reached', timedOut: true });
-
-/** Runner name -> ms epoch of its first failed fetch in the current unreachable streak (BRAIN-594). */
-const readUnreachable = (root) => readJsonSafe(paths(root).runnerUnreachable) ?? {};
-
-/** Record that `name` gave no answer, keeping the streak's first time, and return that time. */
-function markUnreachable(root, name, now) {
-  const all = readUnreachable(root);
-  if (all[name] === undefined) atomicWriteJson(paths(root).runnerUnreachable, { ...all, [name]: now });
-  return all[name] ?? now;
-}
-
-function clearUnreachable(root, name) {
-  const all = readUnreachable(root);
-  if (all[name] === undefined) return;
-  delete all[name];
-  atomicWriteJson(paths(root).runnerUnreachable, all);
-}
 
 async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt, now, assumeDown }) {
   const resultPath = path.join(paths(root).results, `${id}.json`);
@@ -105,10 +91,10 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
   if (firstBudget === null) return waitTimedOut();
   const fetched = await fetchRemoteResult(runner, id, sshBin, firstBudget, env);
   if (fetched === null) {
-    const since = markUnreachable(root, runner.name, now);
+    const since = await recordContact(root, runner.name, false, now, { deadlineAt });
     return (await publishUnreachable(since)) ?? { settled: false, state: 'unreachable', transport: true, reason: `no usable answer from ${runner.name}` };
   }
-  clearUnreachable(root, runner.name);
+  await recordContact(root, runner.name, true, now, { deadlineAt });
 
   const publish = (kind, build) => publishSettled(root, id, attempt, resultPath, kind, build);
 

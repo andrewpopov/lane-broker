@@ -16,6 +16,7 @@ import { listAttempts, supervisorAlive, moveInterruptedLabel } from './attempts.
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfigOrError } from './config.js';
+import { collectRunnerStates, renderRunnersLines } from './runner-unreachable.js';
 import { remoteOwnerMap } from './retier.js';
 import { defaultRemoteRoot } from './remote-runner.js';
 import { effectiveNow } from './priority-clock.js';
@@ -368,6 +369,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     running,
     queued,
     remote,
+    runners: collectRunnerStates(root, cfg, now),
     lockError,
   };
 }
@@ -656,6 +658,8 @@ export function renderStatusText(status) {
       }
     }
   }
+  const runnerLines = renderRunnersLines(status.runners);
+  if (runnerLines.length > 0) lines.push('', ...runnerLines);
   return lines.join('\n');
 }
 
