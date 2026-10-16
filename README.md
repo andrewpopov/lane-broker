@@ -52,6 +52,8 @@ lane drain ["reason"] | lane undrain       # take a runner out of remote rotatio
 lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
 lane gc [--dry-run] [--max <n>]
 lane reconcile [--now] [--json]          # settle ORPHANED-REMOTE attempts from their runners (BRAIN-515)
+lane runner [status] [--json]            # each runner's state, last-ok age and lost-settle time (BRAIN-597)
+lane runner watch                        # one heartbeat tick (ping every runner, then one reconcile sweep); schedule it every 60 s
 ```
 
 `lane status` adds `  log file unchanged for <duration>` to a RUNNING line once the
@@ -956,6 +958,26 @@ waiting on them) forever. Two ways to settle them as lost (exit `75`; a job's ou
 
 `lane wait` on a settled-lost attempt exits `75` and prints the reason on stderr.
 
+**The runner heartbeat (BRAIN-597).** Reconcile only runs when someone asks, so a runner that died with nothing on it was never
+noticed, and placement re-probed it (about 6 s each) on every submission. `lane runner watch` is one tick, run every 60 s by a
+launchd job; it adds no second ledger and builds on the BRAIN-594 clock:
+
+- It takes `runner-watch.lock` (a held lock exits `0` doing nothing), pings every configured runner that is not `offline`, whatever
+  its schedule (`ssh -o BatchMode=yes -o ConnectTimeout=5 <ssh> true`, 10 s deadline), and records each result in
+  `runner-unreachable.json` through the same helper (and `runner-unreachable.lock`) reconcile uses: a failed ping starts the
+  clock if it is not running, an ok ping clears it. The file also carries `__heartbeat`: when the last tick ran and each runner's
+  `lastOkAt`/`lastPingAt`. The per-runner entries keep their BRAIN-594 shape.
+- It then runs the reconcile sweep once (rate-limited by the sweep's own 5-minute marker, so `runnerLostAfterMs` settles within
+  about 5 minutes of its deadline even when nobody runs `lane status`).
+- `runnerDownAfterMs` (global config, integer >= 0, default 300,000 = 5 min; 0 disables): placement, rebind and rebalance skip a
+  runner whose clock is at least that old without probing it (`skipped: unreachable since HH:MM`). The clock is trusted only
+  while the last watcher tick is under 5 minutes old, so a dead watcher never keeps a runner out on an old reading. The runner
+  is placed again on the first ok ping. This only stops placement; nothing is settled before `runnerLostAfterMs`.
+- `lane status` has a RUNNERS section (and `runners[]` in `--json`), also printed by `lane runner [status] [--json]`: per runner the
+  state (`up`, `unreachable since HH:MM`, `down (placement skips)`, `offline`, `off-schedule`), the last-ok age, and the time its
+  orphans settle as lost (`unreachable since + runnerLostAfterMs`). A stale heartbeat prints `watcher not running (state Nm old)`.
+  Advertised as capability `runner-heartbeat/1`.
+
 `lane wait` asks the runner inline: it returns the settled exit, keeps waiting while the runner reports the job running (asking
 again every 30 s), and exits `1` naming the reason otherwise. `--timeout` is an absolute deadline for the reconcile too: its ssh
 calls never run past it, and out of time `lane wait` exits `75`, not `1`. A signal during the wait asks the runner to cancel; one it
@@ -972,6 +994,16 @@ the no-revisit rule keep a ticket from bouncing.
 
 Lineage: this is requeueing of *pending* work as in Slurm (a requeue only for a job that has not started) and Kueue, and
 work-stealing restricted to tasks that have not started; a started task is never stolen.
+
+### Environment a lane command sees (BRAIN-597)
+
+| Variable | Value |
+|---|---|
+| `LANE_BROKER_EXECUTOR` | `remote` when the command (and `remoteDeps` / `remoteSetup`) runs on a runner; `local` otherwise. |
+| `LANE_BROKER_RUNNER` | On a runner: the runner's name as the submitter's `runners[]` config names it, carried in the dispatch header (`runnerName`). Never set for a local run; absent when the submitter is older than 0.45.0, in which case only `LANE_BROKER_EXECUTOR` is exported. |
+
+Both are set by the broker, so a value exported in the caller's shell is replaced. `LANE_BROKER_LOCAL_REASON` is unchanged. The two
+variables reach the `remoteDeps` install and so are part of its deps-cache key.
 
 ### Runners that are scheduled to be off (BRAIN-533)
 

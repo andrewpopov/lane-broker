@@ -22,6 +22,9 @@ export const REMOTE_DRAIN_CAPABILITY = 'remote-drain/1';
 // BRAIN-518: `lane priority` re-tiers a ticket still queued on this runner; a submitter checks this before sending one.
 export const QUEUE_RETIER_CAPABILITY = 'queue-retier/1';
 
+// BRAIN-597: `lane runner watch|status`, the runner heartbeat feeding runner-unreachable.json.
+export const RUNNER_HEARTBEAT_CAPABILITY = 'runner-heartbeat/1';
+
 /** The ONE list: `lane remote-probe` advertises it and `lane capabilities --json` prints it. */
 export const CAPABILITIES = [
   ELASTIC_CLAIMS_CAPABILITY,
@@ -37,6 +40,7 @@ export const CAPABILITIES = [
   REMOTE_DRAIN_CAPABILITY,
   QUEUE_RETIER_CAPABILITY,
   LEASE_CHECK_CAPABILITY,
+  RUNNER_HEARTBEAT_CAPABILITY,
 ];
 
 /** `lane capabilities --json`: what this install can do and which scheduler/admission mode it is in. */

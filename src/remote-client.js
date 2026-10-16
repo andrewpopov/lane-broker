@@ -47,13 +47,13 @@ export function buildRemoteCommand(runner, subcommand, args = []) {
  * element; ssh alone decides how the destination's default shell parses
  * `commandString` on the far end.
  */
-function sshArgv(runner, commandString) {
+export function sshArgv(runner, commandString, { connectTimeoutSec = 3 } = {}) {
   // The remote-exec session lasts as long as the remote job, so it has no
   // deadline of its own; keepalives are what end a silently dead connection
   // (~60 s) so it surfaces as unconfirmed and falls back instead of hanging.
   return [
     '-o', 'BatchMode=yes',
-    '-o', 'ConnectTimeout=3',
+    '-o', `ConnectTimeout=${connectTimeoutSec}`,
     '-o', 'ServerAliveInterval=15',
     '-o', 'ServerAliveCountMax=4',
     runner.ssh,
@@ -211,6 +211,8 @@ function neverFits(reservation, probe) {
  * `opts.now` (ms, default the clock) and `opts.expectedRunMs` (BRAIN-533): a runner outside its `schedule` window is skipped before it is
  * probed, as is one whose window closes before `now + expectedRunMs`; no `expectedRunMs` places normally.
  *
+ * `opts.downRunners` (BRAIN-597): `{ [runner name]: skip reason }` for runners unreachable long enough to be skipped without probing.
+ *
  * `opts.requireCapabilities` (BRAIN-321): capability strings the runner's probe must advertise, else it is skipped.
  *
  * `opts.reservation` (BRAIN-320 S1e): the ticket's resolved
@@ -228,7 +230,7 @@ function neverFits(reservation, probe) {
 export async function selectRunner(runners, opts = {}) {
   const deadlineMs = opts.deadlineMs ?? 6000;
   const sshBin = opts.sshBin ?? 'ssh';
-  const { env, requireProtocol2 = false, requireCapabilities = [], reservation, maxRemoteQueue = 0 } = opts;
+  const { env, requireProtocol2 = false, requireCapabilities = [], reservation, maxRemoteQueue = 0, downRunners = {} } = opts;
   const skipped = [];
   // BRAIN-405: every runner is probed, then the idle one with real room and the earliest estimated finish wins (ties: more
   // free CPU, then config order). A runner with an empty queue but no headroom is not idle, however empty its queue.
@@ -240,6 +242,11 @@ export async function selectRunner(runners, opts = {}) {
   for (const runner of runners) {
     if (runner.offline) {
       skipped.push({ name: runner.name, reason: 'marked offline' });
+      continue;
+    }
+    // BRAIN-597: a runner unreachable for `runnerDownAfterMs` (src/runner-unreachable.js) is not probed either; every other exclusion is unchanged.
+    if (Object.hasOwn(downRunners, runner.name)) {
+      skipped.push({ name: runner.name, reason: downRunners[runner.name] });
       continue;
     }
     // BRAIN-533: a runner scheduled to be off is not probed at all, and one whose window closes before this ticket is expected to finish is not given it.
@@ -873,6 +880,8 @@ export async function dispatchRemote(opts) {
   // remote-runner.js's `validateHeaderFields`).
   const protocol = needsProtocol2({ remoteDeps, remoteSetup }) ? 2 : 1;
   const header = { protocol, ticketId, generation, repoKey, lane, weight, cpuCores, memoryBytes, argv, relCwd };
+  // BRAIN-597: the runner's name in THIS submitter's config, exported to the command as LANE_BROKER_RUNNER (additive; an older runner ignores it).
+  header.runnerName = runner.name;
   if (protocol === 2) {
     if (Array.isArray(remoteDeps) && remoteDeps.length > 0) header.remoteDeps = remoteDeps;
     if (Array.isArray(remoteSetup) && remoteSetup.length > 0) header.remoteSetup = remoteSetup;

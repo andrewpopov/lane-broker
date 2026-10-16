@@ -36,12 +36,14 @@ function writeDeadAttempt(root, id, pid, executor = 'remote') {
 }
 
 test('BRAIN-319 orphan race: a result published in the gap between the "no result yet" read and the dead-supervisor check is honoured, not misreported as ORPHANED-REMOTE', async () => {
-  const { state } = freshEnv();
+  const { state, home } = freshEnv();
   const priorHome = process.env.LANE_BROKER_HOME;
   const priorState = process.env.LANE_BROKER_STATE;
   const priorPause = process.env.LANE_BROKER_TEST_PAUSE_BEFORE_WAIT_ORPHAN;
   process.env.LANE_BROKER_STATE = state;
-  delete process.env.LANE_BROKER_HOME;
+  // An isolated home: deleting LANE_BROKER_HOME read the real ~/.config/lane-broker, so a runner the operator marked
+  // offline there (skybox, 2026-10-15) settled this attempt as lost (75) and the test failed for a reason that is not its own.
+  process.env.LANE_BROKER_HOME = home;
 
   const pauseFile = path.join(makeTmpDir('wait-orphan-race-'), 'release');
   process.env.LANE_BROKER_TEST_PAUSE_BEFORE_WAIT_ORPHAN = pauseFile;
@@ -79,12 +81,14 @@ test('BRAIN-319 orphan race: a result published in the gap between the "no resul
 });
 
 test('BRAIN-319 orphan race: a genuinely dead supervisor with no result ever showing up during the gap still reports ORPHANED-REMOTE', async () => {
-  const { state } = freshEnv();
+  const { state, home } = freshEnv();
   const priorHome = process.env.LANE_BROKER_HOME;
   const priorState = process.env.LANE_BROKER_STATE;
   const priorPause = process.env.LANE_BROKER_TEST_PAUSE_BEFORE_WAIT_ORPHAN;
   process.env.LANE_BROKER_STATE = state;
-  delete process.env.LANE_BROKER_HOME;
+  // An isolated home: deleting LANE_BROKER_HOME read the real ~/.config/lane-broker, so a runner the operator marked
+  // offline there (skybox, 2026-10-15) settled this attempt as lost (75) and the test failed for a reason that is not its own.
+  process.env.LANE_BROKER_HOME = home;
 
   const pauseFile = path.join(makeTmpDir('wait-orphan-race-'), 'release');
   process.env.LANE_BROKER_TEST_PAUSE_BEFORE_WAIT_ORPHAN = pauseFile;

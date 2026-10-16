@@ -25,6 +25,7 @@ import {
 } from '../src/remote-runner.js';
 import { gcCommand } from '../src/gc.js';
 import { loadGlobalConfig } from '../src/config.js';
+import { runnerWatchCommand, runnerStatusCommand } from '../src/runner-watch.js';
 import { reconcileCommand } from '../src/reconcile-sweep.js';
 import { capabilitiesCommand } from '../src/capabilities.js';
 import { remotePipelineCommand } from '../src/remote-pipeline.js';
@@ -50,6 +51,8 @@ function usage() {
   lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
   lane gc [--dry-run] [--max <n>] [--root <remoteRoot>]
   lane reconcile [--now] [--json]
+  lane runner [status] [--json]
+  lane runner watch
   lane report phases --repo <a[,b]> --since <iso> --until <iso> [--history <file>] [--json]
   lane report cost --repo <a[,b]> --since <iso> --until <iso> [--prs <file | repo=file,...>] [--journal-root <dir>] [--history <file>] [--json]
 `;
@@ -306,6 +309,20 @@ async function main() {
     case 'gc': {
       const result = await gcCommand(rest, { remoteRoot: parseRootFlag(rest) || defaultRemoteRoot(), cfg: loadGlobalConfig() });
       return result.exitCode;
+    }
+    case 'runner': {
+      const [sub = 'status', ...args] = rest;
+      const bad = (msg) => {
+        process.stderr.write(`lane runner: ${msg}\n${usage()}`);
+        return 2;
+      };
+      if (sub === 'watch') return args.length === 0 ? (await runnerWatchCommand()).exitCode : bad(`unexpected argument "${args[0]}"`);
+      if (sub === 'status' || sub === '--json') {
+        const flags = sub === '--json' ? ['--json', ...args] : args;
+        const unknown = flags.find((a) => a !== '--json');
+        return unknown === undefined ? runnerStatusCommand({ json: flags.includes('--json') }).exitCode : bad(`unknown argument "${unknown}"`);
+      }
+      return bad(`unknown subcommand "${sub}"`);
     }
     case 'reconcile': {
       const result = await reconcileCommand({ force: rest.includes('--now'), json: rest.includes('--json') });

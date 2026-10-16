@@ -527,6 +527,7 @@ test('remote-probe advertises elastic-claims/1', () => {
     'remote-drain/1',
     'queue-retier/1',
     'lease-check/1',
+    'runner-heartbeat/1',
   ]);
 });
 
