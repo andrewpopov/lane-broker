@@ -67,7 +67,7 @@ test('remote-probe while another process holds the broker lock answers within ~1
   try {
     const res = await runProbe(env);
     assert.equal(res.code, 0, res.stderr);
-    assert.ok(res.ms < 2500, `probe took ${res.ms} ms behind a held lock`);
+    assert.ok(res.ms < 2000, `probe took ${res.ms} ms behind a held lock`);
     const probe = JSON.parse(res.stdout);
     assert.equal(probe.stale, true);
     assert.equal(probe.snapshot, 'lockless');
@@ -95,7 +95,7 @@ function slowSsh({ hangFirst, hangMs }) {
 const fs = require('fs');
 fs.appendFileSync(${JSON.stringify(counter)}, 'x');
 const n = fs.readFileSync(${JSON.stringify(counter)}, 'utf8').length;
-const answer = () => { process.stdout.write(JSON.stringify({ protocol: 1, protocols: [1, 2], paused: false, queued: 0, running: 0, capacity: {} }) + '\\n'); process.exit(0); };
+const answer = () => { process.stdout.write(JSON.stringify({ protocol: 1, protocols: [1, 2], paused: false, queued: 0, running: 0, capacity: {}, stale: true, snapshot: 'lockless' }) + '\\n'); process.exit(0); };
 if (n <= ${hangFirst}) setTimeout(answer, ${hangMs}); else answer();
 `,
   );
@@ -103,7 +103,7 @@ if (n <= ${hangFirst}) setTimeout(answer, ${hangMs}); else answer();
   return { bin, calls: () => fs.readFileSync(counter, 'utf8').length };
 }
 
-const beat = (root, lastOkAt, at = Date.now()) => atomicWriteJson(paths(root).runnerUnreachable, { __heartbeat: { at, runners: { wintop: { lastOkAt, lastPingAt: at } } } });
+const beat = (root, lastOkAt, at = Date.now(), unreachable = {}) => atomicWriteJson(paths(root).runnerUnreachable, { ...unreachable, __heartbeat: { at, runners: { wintop: { lastOkAt, lastPingAt: at } } } });
 const REFUSED = { repoId: 'r', lane: 'sim', remote: {}, resources: {}, weight: 1, localRefused: true };
 const CFG = { ...DEFAULT_GLOBAL_CONFIG, runners: [WINTOP] };
 
@@ -118,7 +118,8 @@ test('remoteProbeDeadlineMs: defaults to 10 s, is validated, and bounds the prob
   try {
     assert.equal(load({}).remoteProbeDeadlineMs, 10_000);
     assert.equal(load({ remoteProbeDeadlineMs: 20_000 }).remoteProbeDeadlineMs, 20_000);
-    for (const bad of [0, -1, 1.5, '10000']) assert.throws(() => load({ remoteProbeDeadlineMs: bad }), ConfigError, String(bad));
+    assert.equal(load({ remoteProbeDeadlineMs: 2_147_483_647 }).remoteProbeDeadlineMs, 2_147_483_647);
+    for (const bad of [0, -1, 1.5, '10000', 2_147_483_648]) assert.throws(() => load({ remoteProbeDeadlineMs: bad }), ConfigError, String(bad));
   } finally {
     if (prev === undefined) delete process.env.LANE_BROKER_HOME;
     else process.env.LANE_BROKER_HOME = prev;
@@ -171,6 +172,8 @@ test('no retry when the heartbeat does not vouch for the runner, or when the lan
   assert.equal(noWatcher.calls, 1, 'no heartbeat at all');
   const deadWatcher = await run(REFUSED, (root) => beat(root, Date.now() - MIN, Date.now() - 10 * MIN));
   assert.equal(deadWatcher.calls, 1, 'a watcher that stopped ticking cannot vouch');
+  const failedPing = await run(REFUSED, (root) => beat(root, Date.now() - MIN, Date.now(), { wintop: Date.now() - 30_000 }));
+  assert.equal(failedPing.calls, 1, 'a recent ok ping followed by a failed one (clock running) does not grant the retry');
   const local = await run({ ...REFUSED, localRefused: false }, (root) => beat(root, Date.now() - MIN));
   assert.equal(local.calls, 1, 'a lane with a local fallback does not wait for a second probe');
 });
@@ -184,4 +187,11 @@ test('a runner the heartbeat has marked down past runnerDownAfterMs gets no prob
   const res = await selectRunner(CFG.runners, { ...options, sshBin: ssh.bin });
   assert.equal(res.runner, null);
   assert.equal(ssh.calls(), 0);
+});
+
+test('with no deadline passed, the default 10 s applies: a probe answering after 8 s is accepted, and the answer may be lockless', async () => {
+  const ssh = slowSsh({ hangFirst: 1, hangMs: 8000 });
+  const res = await selectRunner([WINTOP], { sshBin: ssh.bin });
+  assert.equal(res.runner?.name, 'wintop');
+  assert.equal(res.probe.snapshot, 'lockless', 'a lockless answer is a usable answer');
 });

@@ -114,13 +114,14 @@ export function downRunnerReasons(root, cfg, now = Date.now()) {
 
 /**
  * BRAIN-602: names of the runners the heartbeat vouches for: the watcher is alive and pinged the runner successfully within
- * HEARTBEAT_FRESH_MS. A probe timeout on one of these is load, not absence.
+ * HEARTBEAT_FRESH_MS. A probe timeout on one of these is load, not absence. A runner whose last ping failed (its unreachable clock is running) is not vouched for.
  */
 export function heartbeatUpRunners(root, cfg, now = Date.now()) {
   const beat = readHeartbeat(root);
   const age = heartbeatAgeMs(beat, now);
   if (age === null || age > HEARTBEAT_FRESH_MS) return [];
-  return (cfg?.runners ?? []).filter((r) => !r.offline && now - (beat.runners[r.name]?.lastOkAt ?? -Infinity) <= HEARTBEAT_FRESH_MS).map((r) => r.name);
+  const unreachable = readUnreachable(root); // a running clock means the latest ping failed, whatever lastOkAt says
+  return (cfg?.runners ?? []).filter((r) => !r.offline && !Object.hasOwn(unreachable, r.name) && now - (beat.runners[r.name]?.lastOkAt ?? -Infinity) <= HEARTBEAT_FRESH_MS).map((r) => r.name);
 }
 
 /** One entry per configured runner, for `lane status`, `lane runner status` and the status JSON. */
