@@ -451,7 +451,7 @@ What a remote run does:
    disk (so staged, unstaged and deleted changes are all reflected). A tree
    with a submodule, special file, escaping symlink, or a secret-shaped path
    (`.env`, `.env.*` other than `*.example/.sample/.template/.dist`,
-   `*.pem`, `id_*`) stays local. Gitignored files are never sent. The
+   `*.pem`, SSH key names `id_{rsa,dsa,ecdsa,ed25519}[_sk][.pub]`) stays local. Gitignored files are never sent. The
    serialized file list (the snapshot's header line) is capped at ~16 MB —
    roughly 90k files — checked locally before dialing ssh; a larger tree
    stays local with that reason.

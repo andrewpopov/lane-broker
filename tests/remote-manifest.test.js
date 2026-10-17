@@ -103,6 +103,28 @@ test('a *.pem file and an id_rsa-shaped file are ineligible', () => {
   }
 });
 
+for (const name of ['id_dict', 'espeak-ng-data/id_dict', 'id_card.png']) {
+  test(`${name} (not an SSH key) is allowed`, () => {
+    const dir = tmpRepo();
+    fs.mkdirSync(path.dirname(path.join(dir, name)), { recursive: true });
+    fs.writeFileSync(path.join(dir, name), 'x');
+    gitFixture(['add', '-f', name], dir);
+    gitFixture(['commit', '-q', '-m', 'init'], dir);
+    assert.ok(entryFor(buildManifest(dir), name), `${name} should be included`);
+  });
+}
+
+for (const name of ['id_rsa', 'id_ed25519', 'id_rsa.pub', 'id_ecdsa_sk.pub', 'keys/id_dsa']) {
+  test(`${name} (an SSH key) stays denylisted`, () => {
+    const dir = tmpRepo();
+    fs.mkdirSync(path.dirname(path.join(dir, name)), { recursive: true });
+    fs.writeFileSync(path.join(dir, name), 'x');
+    gitFixture(['add', '-f', name], dir);
+    gitFixture(['commit', '-q', '-m', 'init'], dir);
+    assert.throws(() => buildManifest(dir), RemoteIneligibleError, name);
+  });
+}
+
 test('staged add, rename, delete and an unstaged delete are all reflected via the filesystem', () => {
   const dir = tmpRepo();
   fs.writeFileSync(path.join(dir, 'a.txt'), 'a');
