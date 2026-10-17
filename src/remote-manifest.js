@@ -68,14 +68,16 @@ export function manifestHashOf(entries) {
 /** Basenames whose trailing suffix marks a secret-shaped path as a template, not a real secret. */
 const ENV_TEMPLATE_SUFFIXES = ['.example', '.sample', '.template', '.dist'];
 
+/** SSH private/public key basenames (id_rsa, id_ed25519_sk.pub, ...); other `id_*` files such as espeak's `id_dict` are data. */
+const SSH_KEY_NAME = /^id_(rsa|dsa|ecdsa|ed25519)(_sk)?(\.pub)?$/;
+
 function isDenylistedPath(relPath) {
   const base = path.posix.basename(relPath);
   if (base === '.env' || base.startsWith('.env.')) {
     return !ENV_TEMPLATE_SUFFIXES.some((suffix) => base.endsWith(suffix));
   }
   if (base.endsWith('.pem')) return true;
-  if (base.startsWith('id_')) return true;
-  return false;
+  return SSH_KEY_NAME.test(base);
 }
 
 /**
