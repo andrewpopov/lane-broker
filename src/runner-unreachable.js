@@ -16,6 +16,8 @@ import { runnerAvailability } from './runner-schedule.js';
  */
 
 export const HEARTBEAT_KEY = '__heartbeat';
+/** BRAIN-623: `{ "<runner>": { check, missing, at } }`, the last readiness gap placement found on each runner (see src/runner-readiness.js). */
+export const READINESS_KEY = '__readiness';
 export const HEARTBEAT_FRESH_MS = 5 * 60_000;
 const LOCK_WAIT_MS = 5000;
 
@@ -26,6 +28,21 @@ export function readUnreachable(root) {
   const raw = readJsonSafe(paths(root).runnerUnreachable) ?? {};
   return Object.fromEntries(Object.entries(raw).filter(([key, value]) => key !== HEARTBEAT_KEY && Number.isFinite(value)));
 }
+
+export function readReadiness(root) {
+  const gaps = (readJsonSafe(paths(root).runnerUnreachable) ?? {})[READINESS_KEY];
+  return gaps && typeof gaps === 'object' ? gaps : {};
+}
+
+/** Record what a placement found: `gaps` (`{ [runner]: { check, missing } }`) are stored with the time; `clear` names runners now known ready. */
+export const recordReadiness = (root, gaps, clear, now) =>
+  updateFile(root, (file) => {
+    const stored = { ...(file[READINESS_KEY] ?? {}) };
+    for (const name of clear) delete stored[name];
+    for (const [name, gap] of Object.entries(gaps)) stored[name] = { ...gap, at: now };
+    if (Object.keys(stored).length > 0) file[READINESS_KEY] = stored;
+    else delete file[READINESS_KEY];
+  });
 
 export function readHeartbeat(root) {
   const beat = (readJsonSafe(paths(root).runnerUnreachable) ?? {})[HEARTBEAT_KEY];
@@ -131,6 +148,7 @@ export function collectRunnerStates(root, cfg, now = Date.now()) {
   const beat = readHeartbeat(root);
   const unreachable = readUnreachable(root);
   const down = downRunnerReasons(root, cfg, now);
+  const gaps = readReadiness(root);
   const ageMs = heartbeatAgeMs(beat, now);
   return runners.map((runner) => {
     const since = unreachable[runner.name] ?? null;
@@ -144,6 +162,7 @@ export function collectRunnerStates(root, cfg, now = Date.now()) {
       lastOkAt: beat.runners[runner.name]?.lastOkAt ?? null,
       lastPingAt: beat.runners[runner.name]?.lastPingAt ?? null,
       offSchedule,
+      readinessGap: gaps[runner.name] ?? null,
       watcherRunning: ageMs !== null && ageMs <= HEARTBEAT_FRESH_MS,
       stateAgeMs: ageMs,
     };
@@ -168,7 +187,8 @@ export function renderRunnersLines(runners, now = Date.now()) {
   for (const r of runners) {
     const lastOk = r.lastOkAt === null ? 'never' : `${ageOf(Math.max(0, now - r.lastOkAt))} ago`;
     const settle = r.lostSettleAt === null ? '' : `  lost-settle ${clock(r.lostSettleAt)}`;
-    lines.push(`  ${r.name}  ${STATE_TEXT[r.state](r)}${r.offSchedule && r.state !== 'off-schedule' ? ' (off-schedule)' : ''}  last-ok ${lastOk}${settle}`);
+    const gap = r.readinessGap ? `  not ready: missing ${r.readinessGap.missing.join(', ')} (${ageOf(Math.max(0, now - r.readinessGap.at))} ago)` : '';
+    lines.push(`  ${r.name}  ${STATE_TEXT[r.state](r)}${r.offSchedule && r.state !== 'off-schedule' ? ' (off-schedule)' : ''}  last-ok ${lastOk}${settle}${gap}`);
   }
   return lines;
 }

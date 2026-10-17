@@ -35,7 +35,8 @@ import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
 import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
-import { downRunnerReasons, heartbeatUpRunners } from './runner-unreachable.js';
+import { downRunnerReasons, heartbeatUpRunners, recordReadiness } from './runner-unreachable.js';
+import { readinessNeeds } from './runner-readiness.js';
 import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
@@ -578,6 +579,7 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
     maxRemoteQueue: globalCfg.maxRemoteQueue,
     requireProtocol2: needsProtocol2(enriched.remote) || Boolean(queueTimeoutFor(enriched, globalCfg)),
     requireCapabilities: isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : [],
+    readinessNeeds: readinessNeeds(enriched.remote),
     reservation: {
       weight: enriched.weight,
       cpuCores: enriched.resources.cpuCores,
@@ -834,9 +836,14 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // own protocol (inside dispatchRemote) still derives from
   // `needsProtocol2(enriched.remote)` alone, so an optionless lane still
   // sends a protocol-1 header even when this is true.
-  let { runner, skipped, queuedChoice, probe, busy } = rebind
+  const placeOptions = rebind ? null : selectionOptionsFor('place', enriched, globalCfg);
+  let { runner, skipped, queuedChoice, probe, busy, readiness } = rebind
     ? { runner: rebind.runner, skipped: [], queuedChoice: false, probe: rebind.probe }
-    : await selectRunner(globalCfg.runners || [], selectionOptionsFor('place', enriched, globalCfg));
+    : await selectRunner(globalCfg.runners || [], placeOptions);
+  // BRAIN-623: `lane status` names a runner that lacked what the lane needs; a runner that passed is ready again
+  if (placeOptions && Object.values(placeOptions.readinessNeeds).some((need) => need.length > 0)) {
+    await recordReadiness(root, readiness ?? {}, runner ? [runner.name] : [], Date.now()).catch(() => {});
+  }
   // A ticket this machine would refuse has no local queue to wait in, so with every runner busy it waits on the best one: that
   // runner's own broker holds the ticket until it has room (what every empty-queue runner did before headroom ranking).
   let busyQueuedAt;

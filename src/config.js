@@ -8,6 +8,7 @@ import { isCanonicalRelPath } from './remote-manifest.js';
 import { unsupportedHookKeys, hookRefusalMessage } from './exclusive.js';
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
 import { DEFAULT_DEPS_CACHE_MAX_BYTES } from './deps-cache.js';
+import { isValidRequiresShape } from './runner-readiness.js';
 
 /** The largest delay Node's setTimeout honours; above it the timer fires after 1 ms. */
 const MAX_TIMER_MS = 2_147_483_647;
@@ -584,11 +585,17 @@ function assertNoHookKeys(config, where) {
   assert(keys.length === 0, hookRefusalMessage(where, keys));
 }
 
+/** BRAIN-623: `requires` names executables a runner must have on PATH for the lane (repo level and lane level). */
+function assertRequires(requires, where) {
+  assert(isValidRequiresShape(requires), `${where} must be an array of executable names (letters, digits, "." "_" "+" "-"; no paths), e.g. ["rg", "poetry"]`);
+}
+
 function validateRepoConfig(cfg, sourcePath) {
   assert(cfg && typeof cfg === 'object', `${sourcePath}: config must be an object`);
   assert(Number.isInteger(cfg.version), `${sourcePath}: "version" must be an integer`);
   assert(cfg.lanes && typeof cfg.lanes === 'object' && !Array.isArray(cfg.lanes), `${sourcePath}: "lanes" must be an object`);
   assertNoHookKeys(cfg, sourcePath);
+  if (cfg.requires !== undefined) assertRequires(cfg.requires, `${sourcePath}: "requires"`);
   for (const [name, lane] of Object.entries(cfg.lanes)) {
     assert(lane && typeof lane === 'object', `${sourcePath}: lane "${name}" must be an object`);
     assert(Number.isFinite(lane.weight) && lane.weight > 0, `${sourcePath}: lane "${name}".weight must be a positive number`);
@@ -659,6 +666,7 @@ function validateRepoConfig(cfg, sourcePath) {
     if (lane.remote !== undefined) {
       assert(typeof lane.remote === 'boolean', `${sourcePath}: lane "${name}".remote must be a boolean`);
     }
+    if (lane.requires !== undefined) assertRequires(lane.requires, `${sourcePath}: lane "${name}".requires`);
     if (lane.remoteDeps !== undefined) {
       assert(
         isValidRemoteDepsShape(lane.remoteDeps),
@@ -1078,6 +1086,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       noProgressTimeoutMs: templateCfg.noProgressTimeoutMs,
       silenceTimeoutMs: templateCfg.silenceTimeoutMs,
       remote: templateCfg.remote,
+      requires: templateCfg.requires,
       remoteDeps: templateCfg.remoteDeps,
       remoteSetup: templateCfg.remoteSetup,
       remoteDepsCache: templateCfg.remoteDepsCache,
@@ -1158,6 +1167,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     // BRAIN-320 S1a: honoured only when this lane runs remotely (1a); a lane
     // with neither declared behaves exactly as in 0.6.0 (I6), including the
     // protocol it speaks (1d).
+    // BRAIN-623: executables a runner must have for this lane: the repo's `requires` plus the lane's own
+    requires: [...new Set([...(repoConfig.requires ?? []), ...(laneCfg.requires ?? [])])],
     remoteDeps: Array.isArray(laneCfg.remoteDeps) ? laneCfg.remoteDeps : null,
     remoteSetup: Array.isArray(laneCfg.remoteSetup) ? laneCfg.remoteSetup : null,
     // BRAIN-389: false opts this lane out of the runner's installed-deps cache; anything else leaves it on.

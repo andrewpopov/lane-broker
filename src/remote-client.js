@@ -7,6 +7,7 @@ import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
 import { isPriorityTier } from './priority.js';
 import { runnerAvailability } from './runner-schedule.js';
 import { sanitizeDrainReason } from './state.js';
+import { readinessProbeArgs, readinessGap } from './runner-readiness.js';
 
 /**
  * BRAIN-319 T3a: the CLIENT side of the remote runner protocol implemented
@@ -213,6 +214,9 @@ function neverFits(reservation, probe) {
  *
  * `opts.downRunners` (BRAIN-597): `{ [runner name]: skip reason }` for runners unreachable long enough to be skipped without probing.
  *
+ * `opts.readinessNeeds` (BRAIN-623, `{ <check id>: need }`, see src/runner-readiness.js): sent to each runner in its probe; a runner whose answer does not
+ * meet them (a missing tool, or no answer from an older runner) is skipped and named in `readiness` (`{ [runner]: { check, missing } }`).
+ *
  * `opts.requireCapabilities` (BRAIN-321): capability strings the runner's probe must advertise, else it is skipped.
  *
  * `opts.reservation` (BRAIN-320 S1e): the ticket's resolved
@@ -231,8 +235,9 @@ export async function selectRunner(runners, opts = {}) {
   const deadlineMs = opts.deadlineMs ?? DEFAULT_GLOBAL_CONFIG.remoteProbeDeadlineMs;
   const retryTimedOut = new Set(opts.retryTimedOut ?? []);
   const sshBin = opts.sshBin ?? 'ssh';
-  const { env, requireProtocol2 = false, requireCapabilities = [], reservation, maxRemoteQueue = 0, downRunners = {} } = opts;
+  const { env, requireProtocol2 = false, requireCapabilities = [], readinessNeeds = {}, reservation, maxRemoteQueue = 0, downRunners = {} } = opts;
   const skipped = [];
+  const readiness = {};
   // BRAIN-405: every runner is probed, then the idle one with real room and the earliest estimated finish wins (ties: more
   // free CPU, then config order). A runner with an empty queue but no headroom is not idle, however empty its queue.
   let idleBest = null;
@@ -260,7 +265,7 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason: `schedule window closes at ${new Date(window.closesAt).toISOString()}, before the expected ${Math.round(opts.expectedRunMs / 1000)}s run` });
       continue;
     }
-    const cmd = buildRemoteCommand(runner, 'remote-probe');
+    const cmd = buildRemoteCommand(runner, 'remote-probe', readinessProbeArgs(readinessNeeds));
     let res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
     // BRAIN-602: a runner the heartbeat says is up that merely timed out is busy, not gone: a lane with nowhere else to go probes it once more
     if (res.timedOut && retryTimedOut.has(runner.name)) res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
@@ -292,6 +297,12 @@ export async function selectRunner(runners, opts = {}) {
     const missing = requireCapabilities.filter((c) => !(Array.isArray(probe.capabilities) && probe.capabilities.includes(c)));
     if (missing.length) {
       skipped.push({ name: runner.name, reason: `runner does not advertise ${missing.join(', ')} (required by the lane)` });
+      continue;
+    }
+    const gap = readinessGap(probe, readinessNeeds);
+    if (gap) {
+      readiness[runner.name] = { check: gap.check, missing: gap.missing };
+      skipped.push({ name: runner.name, reason: gap.reason });
       continue;
     }
     if (probe.configError) {
@@ -335,9 +346,10 @@ export async function selectRunner(runners, opts = {}) {
     const cand = { runner, probe, finish: estimatedFinish(reservation, probe, runner), cpuFree };
     if (better(cand, idleBest)) idleBest = cand;
   }
-  if (idleBest) return { runner: idleBest.runner, probe: idleBest.probe, skipped };
-  if (queuedBest) return { runner: queuedBest.runner, probe: queuedBest.probe, skipped, queuedChoice: true };
-  return { runner: null, skipped, ...(busyBest ? { busy: { runner: busyBest.runner, probe: busyBest.probe } } : {}) };
+  const readinessField = Object.keys(readiness).length > 0 ? { readiness } : {};
+  if (idleBest) return { runner: idleBest.runner, probe: idleBest.probe, skipped, ...readinessField };
+  if (queuedBest) return { runner: queuedBest.runner, probe: queuedBest.probe, skipped, ...readinessField, queuedChoice: true };
+  return { runner: null, skipped, ...readinessField, ...(busyBest ? { busy: { runner: busyBest.runner, probe: busyBest.probe } } : {}) };
 }
 
 /**
