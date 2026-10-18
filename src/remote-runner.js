@@ -817,7 +817,7 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot(), measure, 
     paused: Boolean(status.paused) || draining || Boolean(configError),
     ...(configError ? { configError } : {}),
     // BRAIN-623: answers to the submitter's readiness needs (`--requires` ...); an older runner sends none, which the submitter reads as not ready
-    ...reportReadiness(needs),
+    ...reportReadiness(needs, { runnerTags: globalCfg.runnerTags }),
     queued: status.queued.length,
     running: status.running.length,
     // BRAIN-360: additive; the CPU the runner's leases are charged (grants, not declarations)

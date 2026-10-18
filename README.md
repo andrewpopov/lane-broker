@@ -54,6 +54,7 @@ lane gc [--dry-run] [--max <n>]
 lane reconcile [--now] [--json]          # settle ORPHANED-REMOTE attempts from their runners (BRAIN-515)
 lane runner [status] [--json]            # each runner's state, last-ok age and lost-settle time (BRAIN-597)
 lane runner watch                        # one heartbeat tick (ping every runner, then one reconcile sweep); schedule it every 60 s
+lane runner prewarm [--lane <n>] [--runner <n>] [--dry-run]   # warm a runner's per-machine caches with a lane's remoteSetup (BRAIN-649)
 ```
 
 `lane status` adds `  log file unchanged for <duration>` to a RUNNING line once the
@@ -715,6 +716,36 @@ Two more checks need nothing from the lane (BRAIN-623):
 - **Install integrity.** Every runner of this release reports `integrity.zeroLength`: the zero-length files under its own package's `bin/` and
   `src/` plus `package.json` (what an unclean shutdown leaves behind). A runner reporting any is skipped (`truncated install: 2 zero-length
   file(s) (src/a.js, src/b.js)`). A runner that reports no `integrity` (older) is not skipped for it; use the version floor to exclude those.
+
+### A lane that holds a whole runner (`remoteExclusive`, BRAIN-649)
+
+```json
+{ "version": 1, "lanes": { "train": { "weight": 4, "cpuCores": 9, "remote": true, "remoteExclusive": true } } }
+```
+
+`exclusive` stays local-only (a runner's intake suppresses it). `remoteExclusive` is the runner-side form: the submitter places the lane
+only on a runner that is **idle** (`running 0`, `queued 0` in its probe; never the queued or busy choice) and that advertises
+`remote-exclusive/1` (an older runner would ignore the flag, so it is skipped). On the runner the intake ticket is then an ordinary exclusive: it
+starts only when the runner holds no lease, and nothing else is admitted while it runs, so a load-sensitive suite (a Playwright RC) is
+not run on a runner that already has other lanes. `lane run --exclusive` and `exclusive` on the snapshot's lane are still ignored there. If no
+runner is idle the lane waits or falls back like any lane with no usable runner; it is not made exclusive locally.
+
+### Runner capability tags (`requiresTags` / `runnerTags`, BRAIN-649)
+
+A runner declares what it supports in its **own** global config, `"runnerTags": ["browser"]` (names as for `requires`; default none). A lane (or
+the repo) lists `"requiresTags": ["browser"]`; the sets merge like `requires`. It is one more readiness check (`tags`, `src/runner-readiness.js`):
+the submitter sends `--tags browser` in the probe it already makes, the runner answers `tags: { browser: true|false }`, and a runner that
+lacks a tag, or an older one that answers nothing, is **not ready** and shows `missing tag browser` in `lane status`. Use it to keep a lane off
+a runner whose OS or tooling the repo does not support (Playwright on an unsupported distro) by leaving the tag off that runner.
+
+### Prewarming a runner (`prewarm`, `lane runner prewarm`, BRAIN-649)
+
+`"prewarm": true` on a lane marks its `remoteDeps`/`remoteSetup` as worth warming (a cold `art:pull` is minutes). From a checkout of the repo,
+`lane runner prewarm [--lane <name>] [--runner <name>] [--dry-run]` sends that lane's snapshot to each online runner (or one) with the command
+`true` at `low` priority, so the runner's own broker runs the setup and leaves its per-machine caches warm for the first real ticket. The
+lane is `--lane`, else the repo's only `prewarm: true` lane. Give it a dedicated lane with the same setup (not a `remoteExclusive` one: that
+run would hold the runner). It exits 1 if any runner did not warm. It is manual: nothing schedules it yet, and a running prewarm is an
+ordinary low-priority ticket on the runner (not preempted by later work).
 
 ### Dependencies and setup on the runner (BRAIN-320)
 

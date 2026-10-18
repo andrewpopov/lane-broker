@@ -41,7 +41,7 @@ import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
-import { REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
+import { REMOTE_WITHDRAW_CAPABILITY, REMOTE_EXCLUSIVE_CAPABILITY } from './capabilities.js';
 import { createAttempt, readAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX, hostCpuLoad, ticketCpuEstimate } from './admission.js';
 import { relayedUsage, relayedDeps } from './remote-relay.js';
@@ -577,6 +577,8 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
   const expectedMs = scheduled ? expectedRunMs(readRows(paths(root).history), enriched.repoId, enriched.lane) : null;
   // BRAIN-597: first placement, rebind and rebalance all select through here, so a down runner is skipped by every one of them.
   const downRunners = downRunnerReasons(root, globalCfg);
+  // BRAIN-649: a `remoteExclusive` lane takes a whole runner, so it is placed only on an idle one that honours the flag
+  const exclusiveOnRunner = enriched.remote?.remoteExclusive === true;
   return {
     ...(expectedMs !== null ? { expectedRunMs: expectedMs } : {}),
     ...(Object.keys(downRunners).length > 0 ? { downRunners } : {}),
@@ -585,7 +587,8 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
     ...(isDispatchOnly(globalCfg) || locallyRefusedNow(enriched, globalCfg) ? { retryTimedOut: heartbeatUpRunners(root, globalCfg) } : {}),
     maxRemoteQueue: globalCfg.maxRemoteQueue,
     requireProtocol2: needsProtocol2(enriched.remote) || Boolean(queueTimeoutFor(enriched, globalCfg)),
-    requireCapabilities: isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : [],
+    requireCapabilities: [...(isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : []), ...(exclusiveOnRunner ? [REMOTE_EXCLUSIVE_CAPABILITY] : [])],
+    requireIdle: exclusiveOnRunner,
     readinessNeeds: readinessNeeds(enriched.remote, globalCfg),
     reservation: {
       weight: enriched.weight,
