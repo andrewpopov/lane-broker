@@ -1028,6 +1028,23 @@ launchd job; it adds no second ledger and builds on the BRAIN-594 clock:
   ticket and exits `66` with a one-line reason on stderr: that exit code, and nothing else (not a withdraw reply, not an absent
   ticket), is what lets the client treat the dispatch as never started and retry elsewhere. One that fails after the header is a
   `rejected` result with the reason.
+- Runner blob cache (BRAIN-642, `blob-cache/1`): a runner whose probe lists `blob-cache/1` keeps file bodies of 64 KiB and up
+  under `<root>/blobs`, keyed by sha256 and namespaced by a hash of the repo's git-common-dir path (that only prevents accidental
+  cross-repo reuse; it is not a security boundary). When the tree's cacheable files total at least 4 MiB the client runs `lane
+  remote-have` (one ssh round trip, 3 s deadline) and sends no body for a file the runner already holds; the client still reads and
+  hashes every file, so a file changed after the manifest still fails. A failed have-query sends every body, so the cache and gzip
+  capabilities are independent. Global config on the client: `remoteBlobCache` (boolean, default `true`). On the runner:
+  `remoteBlobCacheMaxBytes` (default 10 GiB, a soft target: nothing is published without free-space headroom) and
+  `remoteBlobCacheMaxAgeMs` (default 14 days). The runner verifies a blob's size and hash on every use and removes a bad one.
+  If the runner reports a cache miss or corrupt blob, the client retries exactly once on the same runner with a fresh ticket and full
+  bodies, never falling back to local for that reason.
+- Observability (BRAIN-642): each dispatch prints and logs one line, e.g. `lane: snapshot -> skybox: tree 238.1 MB, sent 41.0 MB
+  (gzip), cache 8730/8788 files (99.3%), excluded 0`. `(gzip)`, `cache` and `excluded` appear only when they apply. History rows
+  carry `snapshotRawBytes` (the tree size), `snapshotSentBytes` (bytes on the wire) and, from the runner, `blobHits`, `blobMisses`
+  and `blobCorrupt`; all are optional.
+- Rollout order: upgrade the runners first, check each with `ssh <alias> bash -lc 'lane remote-probe'` (version plus `snapshot-gzip/1`
+  and `blob-cache/1`), then upgrade the client machine. Capability gating makes any order safe; runners first starts the savings
+  at once. A runner without a capability gets the legacy stream, byte for byte.
 - The probe contract: `lane remote-probe` must answer promptly on a busy runner. It waits at most 500 ms for the broker lock (the lock
   only reaps stale leases). If the lock is held it answers from a lock-free read of the lease, queue and gate files and adds
   `"stale": true, "snapshot": "lockless"`. Each file is written by atomic rename, so each is consistent on its own, but the set can be a

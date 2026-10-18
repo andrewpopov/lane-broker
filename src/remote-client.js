@@ -889,7 +889,7 @@ async function dispatchOnce(opts) {
     blobCache = false,
     blobCacheMinBytes = BLOB_CACHE_MIN_BYTES,
     gzipLevel = DEFAULT_GLOBAL_CONFIG.remoteSnapshotGzipLevel,
-    // Called once the upload settles with { mode, rawBytes, sentBytes }; the log line and history fields are a later slice.
+    // Called once the upload settles with { mode, rawBytes, sentBytes, treeBytes, cacheFiles, cachedFiles }; the supervisor logs and records it.
     onTransferStats,
     remoteArtifactsOn = 'success',
     artifactLimits,
@@ -1047,7 +1047,7 @@ async function dispatchOnce(opts) {
 
   // BRAIN-642: pipeline() so an upstream encode error (a file mutated since the manifest) reaches pipeSnapshot and tears every
   // stage down. `transfer` is set only for a runner that lists `snapshot-gzip/1`; otherwise the stream is the legacy one.
-  const transferStats = { mode: transfer === TRANSFER_GZIP ? TRANSFER_GZIP : 'plain', rawBytes: 0, sentBytes: 0 };
+  const transferStats = { mode: transfer === TRANSFER_GZIP ? TRANSFER_GZIP : 'plain', rawBytes: 0, sentBytes: 0, treeBytes: manifest.entries.reduce((sum, e) => sum + (e.size || 0), 0), cacheFiles: transferCache ? manifest.entries.filter(isCacheable).length : 0, cachedFiles: cached.size };
   const sendStages = [encodeSnapshot(worktreeRoot, header, manifest.entries, undefined, { cached }), countBytes((n) => { transferStats.rawBytes += n; })];
   if (transfer === TRANSFER_GZIP) sendStages.push(zlib.createGzip({ level: gzipLevel }));
   sendStages.push(countBytes((n) => { transferStats.sentBytes += n; }));

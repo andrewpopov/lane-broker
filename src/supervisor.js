@@ -47,7 +47,7 @@ import { SNAPSHOT_GZIP_CAPABILITY, TRANSFER_GZIP } from './remote-gzip.js';
 import { BLOB_CACHE_CAPABILITY } from './remote-blobs.js';
 import { createAttempt, readAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX, hostCpuLoad, ticketCpuEstimate } from './admission.js';
-import { relayedUsage, relayedDeps } from './remote-relay.js';
+import { relayedUsage, relayedDeps, relayedTransfer, snapshotLine } from './remote-relay.js';
 import { maybeDailyGc } from './gc.js';
 import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, SILENCE_REASON, noProgressMessage, silenceMessage } from './no-progress.js';
 import { settledContentKey, isCleanPass } from './result-cache.js';
@@ -952,6 +952,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   };
   const dispatchedAt = Date.now(); // the FIRST dispatch: waitedMs includes the time spent queued on every runner before the last
   let dispatch;
+  let lastTransferStats = null;
   while (true) {
     // BRAIN-398: a runner without `artifacts/1` would run the command and silently return nothing, so say so up front.
     artifactsSupported = Boolean(declaredArtifacts) && Array.isArray(probe?.capabilities) && probe.capabilities.includes(ARTIFACTS_CAPABILITY);
@@ -971,6 +972,12 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     const snapshotGzip = Array.isArray(probe?.capabilities) && probe.capabilities.includes(SNAPSHOT_GZIP_CAPABILITY);
     const blobCache = globalCfg.remoteBlobCache === true && Array.isArray(probe?.capabilities) && probe.capabilities.includes(BLOB_CACHE_CAPABILITY);
     let target = null;
+    const onTransferStats = (stats) => {
+      lastTransferStats = stats;
+      const line = snapshotLine(runner.name, stats, manifest.excluded);
+      process.stderr.write(line);
+      writeBrokerLog(root, line);
+    };
 
     // BRAIN-320 S1c: `enriched.remote.remoteDeps`/`remoteSetup` ride along in
     // this spread and are what `dispatchRemote` derives its protocol-2 exec
@@ -980,6 +987,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       remoteArtifacts: artifactsSupported ? declaredArtifacts : null,
       transfer: snapshotGzip ? TRANSFER_GZIP : undefined,
       blobCache,
+      onTransferStats,
       gzipLevel: globalCfg.remoteSnapshotGzipLevel,
       artifactLimits: artifactLimitsOf(globalCfg),
       manifest,
@@ -1149,6 +1157,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       ...(Number.isFinite(dispatch.result.grantedCpuCores) ? { grantedCpuCores: dispatch.result.grantedCpuCores } : {}),
       ...relayedUsage(dispatch.result),
       ...relayedDeps(dispatch.result),
+      ...relayedTransfer(lastTransferStats, dispatch.result),
       ...relayedPhases(dispatch),
       ...rebalanceFields(),
       ...artifactFields,
