@@ -26,7 +26,7 @@ import { touchSimArmFor } from './sim-arm.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
-import { reloadGlobalConfig } from './config.js';
+import { reloadGlobalConfig, isDispatchOnly } from './config.js';
 import { stateHome } from './state.js';
 import { readRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
@@ -498,7 +498,7 @@ function migrationRefusalResult(ticket) {
 function localIneligibilityOf(enriched, globalCfg) {
   // BRAIN-634: a dispatch-only host can never run anything; every caller treats that as "no local fallback" (no queue timeout,
   // no local-first, no speed-aware local choice, wait on a busy runner).
-  if (globalCfg.localExecution === 'refused') return dispatchOnlyRefusal(enriched.lane);
+  if (isDispatchOnly(globalCfg)) return dispatchOnlyRefusal(enriched.lane);
   if (enriched.localRefused && !enriched.allowLocalSim) return localSimRefusal(enriched.lane, enriched.class);
   const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host: detectResourceCapacity() });
   return budget.ok ? null : budget;
@@ -749,7 +749,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       throw new Error(`lane-broker supervisor: could not fall back to local for ${enriched.id} (attempt record missing)`);
     }
 
-    const dispatchOnly = globalCfg.localExecution === 'refused';
+    const dispatchOnly = isDispatchOnly(globalCfg);
     const refusedHere = dispatchOnly || (enriched.localRefused && !enriched.allowLocalSim);
     const skipLine = `lane: remote-skip: ${runner ? runner.name : 'none'}: ${reason} — ${dispatchOnly ? 'not running locally (localExecution refused)' : refusedHere ? 'not running locally (localRefused)' : 'running locally'}\n`;
     process.stderr.write(skipLine);
@@ -868,7 +868,9 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   }
   if (!runner) {
     const reason = skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : 'no runners configured';
-    return fallbackOrRefuse(null, reason, { rebindable: true, noRunner: true });
+    // every configured runner is too small for this ticket for good: no retry will place it
+    const neverPlaceable = skipped.length > 0 && skipped.length === (globalCfg.runners || []).length && skipped.every((s) => s.neverFits === true);
+    return fallbackOrRefuse(null, reason, { rebindable: true, noRunner: true, retryable: !neverPlaceable });
   }
 
   if (speed && !busyQueuedAt) {
@@ -1197,7 +1199,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // 'ineligible' or 'unconfirmed'
   // Only a runner that provably never started it AND says nothing about other runners (a queue expiry or withdrawal, an incomplete
   // transfer) leaves the fallback rebindable; ineligible, rejected and possibly-run outcomes stay local for good.
-  return fallbackOrRefuse(runner, dispatch.reason, { neverStarted: dispatch.neverStarted === true, rebindable: dispatch.outcome === 'unconfirmed' && dispatch.neverStarted === true && dispatch.retryElsewhere === true, retryable: dispatch.outcome === 'unconfirmed' });
+  return fallbackOrRefuse(runner, dispatch.reason, { neverStarted: dispatch.neverStarted === true, rebindable: dispatch.outcome === 'unconfirmed' && dispatch.neverStarted === true && dispatch.retryElsewhere === true, retryable: dispatch.outcome === 'unconfirmed' && dispatch.rejected !== true });
 }
 
 async function main() {
@@ -1459,7 +1461,7 @@ async function main() {
       touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit('cancelled', { forcePublish: alsoWithdrawn });
     }
-    if (globalCfg.localExecution === 'refused') await refuseDispatchOnlyAndExit();
+    if (isDispatchOnly(globalCfg)) await refuseDispatchOnlyAndExit();
     if (!enriched.exclusive) {
       const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host: detectResourceCapacity() });
       if (!budget.ok) await refuseQueuedOverBudgetAndExit(budget);
@@ -1490,8 +1492,6 @@ async function main() {
     }
     // Test seam: lets a test land a cancel between admission and spawn (BRAIN-364).
     await testHoldAt('local-admitted');
-    // the config can flip inside tryStart's own lock: a lease granted to a dispatch-only host is released unused
-    if (started.started && globalCfg.localExecution === 'refused') await refuseDispatchOnlyAndExit({ lease: true });
     if (started.started) break;
     // BRAIN-436: the withdraw marker is the commit, but the queue file may still be there (the runner's best-effort
     // dequeue failed, or it crashed after the marker). Dequeue it here -- retrying the unlink -- BEFORE publishing, so the
@@ -1556,6 +1556,8 @@ async function main() {
 
   const startedAt = Date.now();
   const [cmd, args] = resolveNicedSpawn({ ...ticket, nice: started.lease.nice ?? ticket.nice }, os.getPriority(), resolveLaneNice(ticket, priorityOf(started.lease), globalCfg));
+  // the host may have turned dispatch-only since admission (config flip or marker): re-read it at the last moment, release the lease unused
+  if (isDispatchOnly(reloadGlobalConfig(globalCfg))) await refuseDispatchOnlyAndExit({ lease: true });
   const child = spawn(cmd, args, {
     cwd: ticket.cwd,
     detached: true,

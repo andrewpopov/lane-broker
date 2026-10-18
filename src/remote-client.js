@@ -327,7 +327,9 @@ export async function selectRunner(runners, opts = {}) {
     if (probe.queued !== 0) {
       const overCap = maxRemoteQueue > 0 && probe.queued > maxRemoteQueue;
       skipped.push({ name: runner.name, reason: `queued: ${probe.queued}${overCap ? ` (over maxRemoteQueue ${maxRemoteQueue})` : ''}` });
-      const fits = !(reservation && neverFits(reservation, probe));
+      const never = Boolean(reservation && neverFits(reservation, probe));
+      skipped[skipped.length - 1].neverFits = never;
+      const fits = !never;
       const queueable = Number.isInteger(probe.queued) && probe.queued > 0 && probe.queued <= maxRemoteQueue;
       if (fits && queueable) {
         const cand = { runner, probe, finish: estimatedFinish(reservation, probe, runner), cpuFree: 0 };
@@ -336,7 +338,7 @@ export async function selectRunner(runners, opts = {}) {
       continue;
     }
     if (reservation && neverFits(reservation, probe)) {
-      skipped.push({ name: runner.name, reason: 'runner capacity can never fit this ticket' });
+      skipped.push({ name: runner.name, reason: 'runner capacity can never fit this ticket', neverFits: true });
       continue;
     }
     const { room, cpuFree, reason } = reservation ? runnerRoom(reservation, probe) : { room: true, cpuFree: 0 };
@@ -1137,7 +1139,7 @@ export async function dispatchRemote(opts) {
     if (confirmedExpiryCancel) return { outcome: 'unconfirmed', reason: classification.reason };
     if (provesNeverStarted(record, expected) && !unconfirmedCancel) {
       // a runner that rejected the ticket on its merits would reject it again elsewhere; one that expired or gave it up in its queue says nothing about another runner
-      return { outcome: 'unconfirmed', reason: classification.reason, neverStarted: true, ...(record.kind === 'unfinished' ? { retryElsewhere: true } : {}) };
+      return { outcome: 'unconfirmed', reason: classification.reason, neverStarted: true, ...(record.kind === 'unfinished' ? { retryElsewhere: true } : { rejected: true }) };
     }
     return { outcome: 'unconfirmed', reason: classification.reason, mayStillBeRunning: true };
   }

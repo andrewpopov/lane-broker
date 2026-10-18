@@ -7,7 +7,7 @@ import { EXCLUSIVE_CAPABILITY } from './exclusive.js';
 import { LEASE_CHECK_CAPABILITY } from './lease.js';
 import { stateHome } from './state.js';
 import { readSchedulerFence } from './fairness.js';
-import { loadGlobalConfig, DEFAULT_GLOBAL_CONFIG } from './config.js';
+import { loadGlobalConfig, DEFAULT_GLOBAL_CONFIG, isDispatchOnly } from './config.js';
 import { CLASSES_CAPABILITY, resolveClasses } from './classes.js';
 
 export const SIM_SAFE_BACKFILL_CAPABILITY = 'sim-safe-backfill/1';
@@ -58,7 +58,7 @@ export function capabilitiesCommand({ root = stateHome() } = {}) {
   const { mode, configHash, stateRoot, valid } = resolveClasses(cfg, root);
   const payload = {
     version: pkg.version,
-    capabilities: cfg.localExecution === 'refused' ? [...CAPABILITIES, DISPATCH_ONLY_CAPABILITY] : CAPABILITIES,
+    capabilities: isDispatchOnly(cfg) ? [...CAPABILITIES, DISPATCH_ONLY_CAPABILITY] : CAPABILITIES,
     schedulerMode: readSchedulerFence(root).status === 'valid' ? 'priority' : 'legacy',
     admissionMode: cfg.schedulerMode,
     classes: { mode, configHash, stateRoot, valid },

@@ -15,7 +15,7 @@ import { readLastSimDemandAt } from './sim-arm.js';
 import { listAttempts, supervisorAlive, moveInterruptedLabel } from './attempts.js';
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
-import { loadGlobalConfigOrError } from './config.js';
+import { loadGlobalConfigOrError, isDispatchOnly } from './config.js';
 import { collectRunnerStates, renderRunnersLines } from './runner-unreachable.js';
 import { remoteOwnerMap } from './retier.js';
 import { defaultRemoteRoot } from './remote-runner.js';
@@ -334,7 +334,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     },
     externalCpu,
     paused,
-    ...(cfg.localExecution === 'refused' ? { localExecution: 'refused' } : {}),
+    ...(isDispatchOnly(cfg) ? { localExecution: 'refused' } : {}),
     draining,
     remoteDrain,
     exclusiveHold: exclusiveHoldView(queue, held),

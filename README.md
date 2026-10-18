@@ -1195,6 +1195,13 @@ never expires a ticket into a local run. Nothing ever falls back to local; inste
 - exit `69`, with a stderr line naming `localExecution is refused`, when it can never go remote from here (no runners
   configured, a tree that cannot be snapshotted, an exclusive lane, a nested run inside a lease, a runner intake).
 
+Fail-closed: the refusal is in force when the config says `refused`, **or** a file named `local-execution-refused` exists
+in the broker home (`$LANE_BROKER_HOME`, default `~/.config/lane-broker`), **or** `LANE_BROKER_LOCAL_EXECUTION=refused` is
+in the environment. The last two do not depend on parsing `config.json`, which loads as defaults when missing or invalid,
+so provision the marker on a controller host (the systemd unit can set the env var too). The host is re-checked right before
+a payload spawns and at every `lane remote-pipeline` phase (deps, cached-deps script replay, setup, command; exit `69`).
+A permanent rejection by a runner, or runners that can never fit the ticket, exit `69`; unavailable or busy runners `76`.
+
 A ticket already queued locally when the setting is turned on is refused on its next poll instead of started (`76`
 if it was remote-eligible, else `69`). `lane capabilities --json` then lists `dispatch-only/1`, and `lane status`
 prints `local execution: refused`.

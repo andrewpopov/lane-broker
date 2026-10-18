@@ -217,3 +217,90 @@ test('an invalid localExecution value is a config error naming the key', async (
   const res = await run(ctx, markerCmd(markerPath(), 0));
   assert.match(res.stderr + res.stdout, /"localExecution" must be "allowed" or "refused"/);
 });
+
+// ---- Codex review fixes ----
+
+const MARKER_FILE = 'local-execution-refused';
+
+test('P1-1 fail closed: the host marker file keeps an unparseable config refused; so does LANE_BROKER_LOCAL_EXECUTION', async () => {
+  const ctx = setup({ ssh: 'normal' });
+  fs.writeFileSync(path.join(ctx.home, 'config.json'), '{ this is not json');
+  fs.writeFileSync(path.join(ctx.home, MARKER_FILE), '');
+  const m1 = markerPath();
+  const res = await run(ctx, markerCmd(m1, 0));
+  assert.equal(res.code, 69, res.stderr);
+  assert.match(res.stderr, /localExecution is refused/);
+  ranNowhere(m1);
+  const caps = JSON.parse((await laneRun(['capabilities', '--json'], { env: ctx.env })).stdout).capabilities;
+  assert.ok(caps.includes('dispatch-only/1'));
+
+  fs.rmSync(path.join(ctx.home, MARKER_FILE));
+  fs.rmSync(path.join(ctx.home, 'config.json'));
+  const m2 = markerPath();
+  const viaEnv = await run(ctx, markerCmd(m2, 0), [], { ...ctx.env, LANE_BROKER_LOCAL_EXECUTION: 'refused' });
+  assert.equal(viaEnv.code, 69, viaEnv.stderr);
+  ranNowhere(m2);
+});
+
+const pipelineDir = (payload) => {
+  const dir = tmpDir('pipeline');
+  fs.writeFileSync(path.join(dir, 'pipeline.json'), JSON.stringify({ npmCacheDir: path.join(dir, 'c'), npmUserConfig: path.join(dir, 'npmrc'), ...payload }));
+  return dir;
+};
+const writer = (file) => [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(file)}, 'ran')`];
+
+test('P1-2 remote-pipeline refuses every phase (setup and command) on a dispatch-only host, and runs them otherwise', async () => {
+  const ctx = setup({ ssh: 'normal' });
+  const work = tmpDir('work');
+  const control = markerPath();
+  const ok = await laneRun(['remote-pipeline', pipelineDir({ workDir: work, argv: writer(control) })], { env: ctx.env });
+  assert.equal(ok.code, 0, ok.stderr);
+  assert.equal(fs.existsSync(control), true, 'the pipeline runs the payload when local execution is allowed');
+
+  fs.writeFileSync(path.join(ctx.home, MARKER_FILE), '');
+  const setupMarker = markerPath();
+  const cmdMarker = markerPath();
+  const refusedSetup = await laneRun(['remote-pipeline', pipelineDir({ workDir: work, remoteSetup: [writer(setupMarker)], argv: writer(cmdMarker) })], { env: ctx.env });
+  assert.equal(refusedSetup.code, 69, refusedSetup.stderr);
+  const refusedCmd = await laneRun(['remote-pipeline', pipelineDir({ workDir: work, argv: writer(cmdMarker) })], { env: ctx.env });
+  assert.equal(refusedCmd.code, 69, refusedCmd.stderr);
+  assert.match(refusedCmd.stderr, /localExecution is refused/);
+  ranNowhere(setupMarker);
+  ranNowhere(cmdMarker);
+});
+
+test('P1-3 a flip to refused between admission and spawn stops the spawn and releases the lease', async () => {
+  const ctx = setup({ ssh: 'normal' });
+  const dir = path.dirname(ctx.state);
+  const ready = path.join(dir, 'p13-ready');
+  const go = path.join(dir, 'p13-go');
+  const env = { ...ctx.env, LANE_BROKER_TEST_HOLD_AT: 'local-admitted', LANE_BROKER_TEST_HOLD_READY: ready, LANE_BROKER_TEST_HOLD_GO: go };
+  const marker = markerPath();
+  const pending = run(ctx, markerCmd(marker, 0), ['--local', '--local-reason', 'test'], env);
+  await waitFor(() => fs.existsSync(ready), { timeoutMs: 30_000, intervalMs: 50 });
+  fs.writeFileSync(path.join(ctx.home, MARKER_FILE), '');
+  fs.writeFileSync(go, 'x');
+  const res = await pending;
+  assert.equal(res.code, 69, res.stderr);
+  ranNowhere(marker);
+  assert.equal(hasLease(ctx.state), false, 'lease released');
+});
+
+test('P2-4/P2-5 a refused runner intake never redispatches; a permanent rejection is 69 on a refused client, not 76', async () => {
+  const ctx = setup({ ssh: 'normal' });
+  refuse(ctx);
+  fs.writeFileSync(path.join(ctx.runnerHome, MARKER_FILE), '');
+  const marker = markerPath();
+  const res = await run(ctx, markerCmd(marker, 0));
+  assert.equal(res.code, 69, res.stderr);
+  ranNowhere(marker);
+});
+
+test('P2-6 every runner too small for the ticket for good: 69, not a retryable 76', async () => {
+  const ctx = setup({ ssh: 'normal', weight: 8 });
+  refuse(ctx, { maxLaneWeight: 16 });
+  const marker = markerPath();
+  const res = await run(ctx, markerCmd(marker, 0));
+  assert.equal(res.code, 69, res.stderr);
+  ranNowhere(marker);
+});

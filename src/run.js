@@ -7,7 +7,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { ensureStateDirs, paths, stateHome, readJsonSafe, appendHistory, LockTimeoutError, MigrationInProgressError, assertNotMigrating, isUuid } from './state.js';
 import { classTransportMismatch } from './classes.js';
-import { resolveTicketConfig, reloadGlobalConfig, resolvePriority, assertHostConfigHookless, ConfigError } from './config.js';
+import { resolveTicketConfig, reloadGlobalConfig, isDispatchOnly, resolvePriority, assertHostConfigHookless, ConfigError } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
 import { stampPriorityOrigin } from './priority-clock.js';
@@ -350,9 +350,10 @@ export async function runCommand({
   // itself the remote-exec child of an already-remote run (I5: a runner
   // never re-dispatches).
   // BRAIN-634: on a dispatch-only host every ticket is remote-only whatever the repo config says (`--local` included).
-  const dispatchOnly = globalCfg.localExecution === 'refused';
+  const dispatchOnly = isDispatchOnly(globalCfg);
   const remoteCapable =
-    (resolved.remote === true || (dispatchOnly && !runnerIntake)) &&
+    (resolved.remote === true || dispatchOnly) &&
+    !runnerIntake &&
     Array.isArray(globalCfg.runners) &&
     globalCfg.runners.length > 0 &&
     !exclusive &&
