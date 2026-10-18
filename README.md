@@ -392,6 +392,28 @@ rouge fleet split) is refused on `lane run` unless `--allow-local-sim` is
 passed — print a refusal message and exit `69` instead. The message points at
 `ROUGE_FLEET_SUBMIT_DSN` (never its value) only for a `class: "sim"` lane.
 
+`localWindow` (global config, default `null`; BRAIN-629) lets named `localRefused`
+lanes run on this machine during a window, e.g. the Mac taking nightly
+release-candidate e2e. A dispatch-only host (`localExecution: "refused"`, BRAIN-634)
+ignores it: nothing runs locally there, window or not.
+
+```json
+"localWindow": {
+  "schedule": { "timezone": "America/Los_Angeles", "available": [{ "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"], "from": "01:00", "to": "06:00" }] },
+  "lanes": ["train", "e2e"]
+}
+```
+
+`schedule` has the same shape as a runner's `schedule`; `lanes` is a non-empty
+list of lane names. While the window is open, a listed lane is no longer refused
+locally and is placed like any remote-eligible lane that is not `localRefused`
+(runner or this machine, whichever placement picks; the window does not force
+local). It is evaluated at every placement attempt, so a ticket queued before the
+window opens can run here once it opens, and none starts here after it closes. An
+unlisted lane (rouge's `sim`) stays refused, and so does a listed lane outside the
+window. The placement log line reads `running locally (localWindow 01:00-06:00)`.
+`--allow-local-sim` still overrides per run.
+
 A lane's own `nice` (integer `0`-`19`) overrides the global `laneNice` for
 that lane only; omit it to use the global default.
 
