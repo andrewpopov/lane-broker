@@ -78,11 +78,17 @@ function validatedShardDir(root, ns, sha, { create = false } = {}) {
   let dir = root;
   for (const part of ['blobs', ns, sha.slice(0, 2)]) {
     dir = path.join(dir, part);
-    const st = fs.lstatSync(dir, { throwIfNoEntry: false });
+    let st = fs.lstatSync(dir, { throwIfNoEntry: false });
     if (!st) {
       if (!create) return null;
-      fs.mkdirSync(dir, { mode: 0o700 });
-    } else if (!st.isDirectory()) {
+      try {
+        fs.mkdirSync(dir, { mode: 0o700 });
+      } catch (err) {
+        if (err.code !== 'EEXIST') throw err;
+      }
+      st = fs.lstatSync(dir);
+    }
+    if (!st.isDirectory()) {
       throw new Error(`blob store ancestor is not a plain directory: ${dir}`);
     }
   }
