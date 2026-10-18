@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, isExpired, writeExpireMarkerFile, isWithdrawn, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
 import { sampleAndUpdateGate, readGateState } from './load.js';
@@ -16,7 +17,7 @@ import { resolveClasses, classEnforcementOf, bookedSims, classQueuePolicy, capSi
 import { reconcileSimArm, touchSimArmFor } from './sim-arm.js';
 import { advanceHwm } from './priority-clock.js';
 import { isExclusive, exclusiveDeny, isExclusiveHead, exclusiveLeaseFields, withoutBackfillExclusives, clampQueuedWeight } from './exclusive.js';
-import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, effectiveRank, score, waitedMs } from './priority.js';
+import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, resolveLaneNice, effectiveNice, effectiveRank, score, waitedMs } from './priority.js';
 import { loadExpressTable, expressVerdict, expressAdmissionsLastMinute, recordExpressAdmission, logExpressAdmission } from './express.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { resolveScheduler, resolveSchedulerDetailed, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
@@ -1393,8 +1394,12 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       const reason = fs.readFileSync(paths(root).pause, 'utf8').trim();
       return { result: { started: false, reason: 'paused', pauseReason: reason } };
     }
+    // BRAIN-627: the nice this ticket will run at (its lane's own, else its ADMITTED tier's, else laneNice), recorded on the lease below.
+    // Both the process discount here and the held-lease discount in admission judge the candidate at it.
+    const admittedTier = priorityOf(queue[position]);
+    const startNice = effectiveNice(resolveLaneNice(ticket, admittedTier, cfg), shadowSeams.currentNice ?? os.getPriority());
     const cpuSample = sampleCpuSafe(root, cpuSampler, cfg.sampleMs / 2, {
-      laneNice: Number.isInteger((candidate ?? ticket).nice) && (candidate ?? ticket).nice >= 0 ? (candidate ?? ticket).nice : cfg.laneNice,
+      laneNice: startNice,
       niceMin: cfg.preemptibleNiceMin,
       heldLeases: held,
     });
@@ -1427,7 +1432,11 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // the head's claim joins the held leases for the CPU projection and memory admission.
     const headReservation = { id: headTicket.id, key: headTicket.key, configLane: headTicket.configLane, cmdFingerprint: headTicket.cmdFingerprint, weight: headTicket.weight, resources: headTicket.resources };
     const admissionHeld = safeBackfill || conflictPick || (expressAdmit && expressHeadProtected) ? [...held, headReservation] : held;
-    const fullDecision = evaluateNewAdmission(root, cfg, ticket, admissionHeld, cpuSample, memInfo);
+    // Never discount held leases while protecting another ticket's reservation: the discount could admit a backfill that
+    // delays the reserved head, which would see these leases charged in full once it runs (no tier on the ref = no discount).
+    const protectingHead = admissionHeld !== held && ticket.id !== headTicket.id;
+    const admissionTicket = { ...ticket, nice: startNice, ...(protectingHead ? {} : { priorityAdmitted: admittedTier }) };
+    const fullDecision = evaluateNewAdmission(root, cfg, admissionTicket, admissionHeld, cpuSample, memInfo);
     // BRAIN-532 step 2: shadow idle credit. Computed from the finished decision and only recorded; nothing below reads it.
     if (cfg.idleCreditMode !== 'off' && ticket.id === headTicket.id) {
       const credit = idleCreditCores(held, cpuSample, cfg, now);
@@ -1437,7 +1446,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // re-evaluated at smaller claims, over the same held leases (and, for a safe backfill, the same
     // head reservation), so the grant can never delay what the full claim could not. Active mode
     // only: shadow never denies, so there is nothing to relax.
-    const elastic = cfg.schedulerMode === 'active' ? evaluateElasticAdmission(cfg, ticket, admissionHeld, cpuSample, memInfo, fullDecision) : null;
+    const elastic = cfg.schedulerMode === 'active' ? evaluateElasticAdmission(cfg, admissionTicket, admissionHeld, cpuSample, memInfo, fullDecision) : null;
     const cpuDecision = elastic ? { ...elastic.decision, declaredCpuCores: submitted.resources?.cpuCores ?? fullDecision.candidateCpuCores } : fullDecision;
     // BRAIN-418: only the head's own denial can declare its reservation futile; a candidate's poll reads the verdict
     // the head's latest denial recorded. Only a CPU-projection or memory denial is judged: a closed gate, a cooldown or an unavailable sample is not the
@@ -1660,6 +1669,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       id: ticket.id,
       priorityRequested: isPriorityTier(queued.priorityRequested) ? queued.priorityRequested : DEFAULT_PRIORITY,
       priorityAdmitted: priorityOf(queued),
+      nice: startNice,
       priorityDemoted: queued.priorityDemoted === true,
       // BRAIN-518: a ticket re-tiered while queued says so on its lease and history row; an un-retiered one has no such keys
       ...(queued.priorityRetiered === true ? { priorityRetiered: true, priorityRetieredAt: queued.priorityRetieredAt } : {}),

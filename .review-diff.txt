@@ -1,0 +1,257 @@
+diff --git a/README.md b/README.md
+index b59b671..4fa797e 100644
+--- a/README.md
++++ b/README.md
+@@ -150,6 +150,7 @@ never told to forward to it — both still get the `--log` file.
+   "resourceIdleOvershootCores": 1,
+   "admissionLoadGate": false,
+   "laneNice": 10,
++  "priorityNice": { "high": 5 },
+   "noProgressTimeoutMs": 0
+ }
+ ```
+@@ -393,6 +394,14 @@ passed — print a refusal message and exit `69` instead. The message points at
+ A lane's own `nice` (integer `0`-`19`) overrides the global `laneNice` for
+ that lane only; omit it to use the global default.
+ 
++`priorityNice` (default `{ "high": 5 }`; keys `high`/`medium`/`low`, values
++`0`-`19`, anything else refused by name; `{}` gives every tier `laneNice`):
++the nice a lane runs at, by the tier it was ADMITTED at (after the per-repo
++high cap). Precedence: the lane's own `nice` > `priorityNice[tier]` >
++`laneNice`. The nice a lease actually ran at is recorded as `nice` on the
++lease and its history row. A remote-exec ticket resolves it on the runner,
++from the runner's own `priorityNice` and the tier in the submitter's header.
++
+ A supervisor that is still waiting to start (queued behind capacity or a
+ closed load gate) re-reads the global config on every poll, so an edit to
+ `config.json` — e.g. raising `loadOpen` to reopen a stuck gate — takes effect
+@@ -1586,6 +1595,22 @@ is the runner-local ticket (`remoteLaneId`), leased in the runner's state dir. A
+ reentrant `lane run` passes the outer lease id through, which checks as live. A hook
+ feature-detects the command with `lease-check/1` in `lane capabilities --json`.
+ 
++### A higher tier is admitted past lower-tier leases (BRAIN-627)
++
++Tiers set the kernel priority (`priorityNice`, above), so a `high` lane (default
++nice 5, a human is waiting on it) runs ahead of `medium`/`low` leases (nice 10).
++Admission trusts that: when it judges a candidate, a held lease is charged
++`demand * (1 - preemptibleShare)` instead of in full if its recorded nice is
++STRICTLY greater than the candidate's, at least `preemptibleNiceMin`, AND its
++admitted tier ranks below the candidate's. The same two knobs as the process
++discount (BRAIN-428) apply; there is no second share. A lease with no recorded
++nice (written by an older broker) is charged in full, and so is any lease of an
++equal or higher tier. Memory, weight capacity, conflicts, exclusive lanes, the
++cooldown, pause and the load gate are unchanged. `preemptibleNiceMin: 0`
++disables it, and `priorityNice: {}` leaves nothing to discount. The admission
++log line carries `preemptibleLeaseCores=<n>` when the discount removed anything.
++The kernel does the yielding: nothing is reniced or stopped after it starts.
++
+ ### Priority (foundations, BRAIN-380 slice 1)
+ 
+ Without the scheduler fence (next section) the scheduler is strictly FIFO: tiers
+diff --git a/src/admission.js b/src/admission.js
+index 9416655..4f36715 100644
+--- a/src/admission.js
++++ b/src/admission.js
+@@ -2,6 +2,7 @@ import fs from 'node:fs';
+ import { paths, atomicWriteJson, readJsonSafe, fingerprintOf } from './state.js';
+ import { sampleHostCpu } from './cpu.js';
+ import { peekCpuEstimates, lookupEstimate, clampEstimate, raiseEstimate } from './cpu-estimates.js';
++import { isPriorityTier, priorityOf, tierRank } from './priority.js';
+ import { evaluateMemoryAdmission, resolveTicketResources, leaseCpuCores, elasticClaimRange } from './resources.js';
+ 
+ /**
+@@ -272,8 +273,26 @@ export const KNOWN_BIAS_NOTE = 'self-subtracted-when-observed';
+  * selection (scheduler.js's selectResourceCandidate), so the two can never disagree about what
+  * "fits" means: busy = ambient load + every held lease's demand + the candidate's claim.
+  */
+-export function projectBusy(externalBusy, heldLeases, candidateEstimate, now = Date.now(), cfg, budget) {
+-  return externalBusy + heldLeases.reduce((sum, l) => sum + leaseDemand(l, now, cfg, budget), 0) + candidateEstimate;
++export function projectBusy(externalBusy, heldLeases, candidateEstimate, now = Date.now(), cfg, budget, candidate = null) {
++  return externalBusy + heldLeases.reduce((sum, l) => sum + leaseCharge(l, leaseDemand(l, now, cfg, budget), candidate, cfg), 0) + candidateEstimate;
++}
++
++/**
++ * BRAIN-627: what the CPU projection charges for one held lease against `candidate` (`{ nice, tier }`, null = a
++ * candidate-less view, which charges in full). A lease the kernel runs behind the candidate yields to it, so only
++ * (1 - preemptibleShare) of its demand is charged: its recorded nice is STRICTLY greater than the candidate's and at
++ * least preemptibleNiceMin (the process rule of BRAIN-428), AND its admitted tier ranks below the candidate's. A lease
++ * with no recorded nice (written before the field existed) is charged in full.
++ */
++export function leaseCharge(lease, demand, candidate, cfg) {
++  if (!candidate || !((cfg.preemptibleNiceMin ?? 0) > 0)) return demand;
++  const outranked = Number.isInteger(lease.nice) && lease.nice > candidate.nice && lease.nice >= cfg.preemptibleNiceMin && tierRank(priorityOf(lease)) < tierRank(candidate.tier);
++  return outranked ? demand * (1 - (cfg.preemptibleShare ?? 0)) : demand;
++}
++
++/** The candidate side of leaseCharge, from a ticket carrying the nice it will run at and the tier it was admitted at. */
++function candidatePriorityOf(ref) {
++  return Number.isInteger(ref?.nice) && isPriorityTier(ref.priorityAdmitted) ? { nice: ref.nice, tier: ref.priorityAdmitted } : null;
+ }
+ 
+ /** The CPU-core budget for one sample: the smaller of the percent budget and all-cores-minus-reserve. */
+@@ -323,20 +342,23 @@ export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, c
+ 
+   const { externalBusy, budget } = hostCpuLoad(cpuSample, heldLeases, cfg, now);
+   const { cores: candidateEstimate, source: candidateEstimateSource } = cpuEstimateBasis(candidateRef, candidateResources?.cpuCores ?? candidateWeight, cfg, now, heldLeases.length > 0 ? budget : undefined);
+-  const projectedBusy = projectBusy(externalBusy, heldLeases, candidateEstimate, now, cfg, budget);
++  const candidatePriority = candidatePriorityOf(candidateRef);
++  const projectedBusy = projectBusy(externalBusy, heldLeases, candidateEstimate, now, cfg, budget, candidatePriority);
+   const leaseCharges = heldLeases.map((l) => ({ id: l.id, ...leaseDemandBasis(l, now, cfg, budget) }));
++  // cores the discount removed from the projection; leaseCharges stays the undiscounted demand (class accounting reads it)
++  const preemptibleLeaseCores = leaseCharges.reduce((sum, { demand }, i) => sum + demand - leaseCharge(heldLeases[i], demand, candidatePriority, cfg), 0);
+   const leaseDemands = leaseCharges.map(({ id, demand, basis }) => `${String(id).slice(0, 8)}:${fmt(demand)}(${basis})`);
+ 
+   if (cpuGateState.closed) {
+-    return { admit: false, reason: 'cpu-gate-closed', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, candidateEstimate, candidateEstimateSource };
++    return { admit: false, reason: 'cpu-gate-closed', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, preemptibleLeaseCores, candidateEstimate, candidateEstimateSource };
+   }
+   if (cooldownBlocked) {
+-    return { admit: false, reason: 'cooldown', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, candidateEstimate, candidateEstimateSource };
++    return { admit: false, reason: 'cooldown', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, preemptibleLeaseCores, candidateEstimate, candidateEstimateSource };
+   }
+   if (projectedBusy > budget) {
+-    return { admit: false, reason: 'projected-over-budget', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, candidateEstimate, candidateEstimateSource };
++    return { admit: false, reason: 'projected-over-budget', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, preemptibleLeaseCores, candidateEstimate, candidateEstimateSource };
+   }
+-  return { admit: true, reason: 'ok', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, candidateEstimate, candidateEstimateSource };
++  return { admit: true, reason: 'ok', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, preemptibleLeaseCores, candidateEstimate, candidateEstimateSource };
+ }
+ 
+ /** The "nothing usable is known" fallback shared by a missing/stale sample
+@@ -506,6 +528,7 @@ export function formatAdmissionLog(f) {
+     `externalBusy=${fmt(f.externalBusy)}`,
+     // only when the feature contributes, so the line is byte-identical to before wherever it does not
+     ...(f.preemptibleBusyCores > 0 ? [`preemptibleBusy=${fmt(f.preemptibleBusyCores)}`] : []),
++    ...(f.preemptibleLeaseCores > 0 ? [`preemptibleLeaseCores=${fmt(f.preemptibleLeaseCores)}`] : []),
+     `projectedBusy=${fmt(f.projectedBusy)}`,
+     `budget=${fmt(f.budget)}`,
+     `candidateCpu=${fmt(f.candidateCpuCores)}`,
+diff --git a/src/config.js b/src/config.js
+index 0af9ef3..f87da35 100644
+--- a/src/config.js
++++ b/src/config.js
+@@ -145,6 +145,10 @@ export const DEFAULT_GLOBAL_CONFIG = {
+   // niceing (spawns the bare command). A `.lane-broker.json` lane's own
+   // `nice` overrides this per-lane.
+   laneNice: 10,
++  // BRAIN-627: the nice a lane runs at, by the tier it was ADMITTED at; a tier not named uses laneNice, and a lane's own
++  // `nice` wins over both. A human-waiting `high` lane runs ahead of medium/low ones, so admission trusts the kernel to
++  // yield them (preemptibleNiceMin / preemptibleShare). `{}` gives every tier laneNice.
++  priorityNice: { high: 5 },
+   // BRAIN-431: a run idle (no output, no CPU, no process churn) for this long is killed (exit 124, reason 'no-progress').
+   // 0 (the default) never kills: quiet work is legitimate, so the kill is opted into per lane (`noProgressTimeoutMs`).
+   // The stall is recorded either way.
+@@ -384,6 +388,11 @@ function validateGlobalConfig(cfg, sourcePath) {
+     Number.isInteger(cfg.laneNice) && cfg.laneNice >= 0 && cfg.laneNice <= 19,
+     `${sourcePath}: "laneNice" must be an integer in [0, 19]`,
+   );
++  assert(cfg.priorityNice && typeof cfg.priorityNice === 'object' && !Array.isArray(cfg.priorityNice), `${sourcePath}: "priorityNice" must be an object`);
++  for (const [tier, value] of Object.entries(cfg.priorityNice)) {
++    assert(isPriorityTier(tier), `${sourcePath}: "priorityNice.${tier}" is not a tier (one of ${PRIORITY_TIERS.join(', ')})`);
++    assert(Number.isInteger(value) && value >= 0 && value <= 19, `${sourcePath}: "priorityNice.${tier}" must be an integer in [0, 19]`);
++  }
+   assert(Number.isInteger(cfg.noProgressTimeoutMs) && cfg.noProgressTimeoutMs >= 0, `${sourcePath}: "noProgressTimeoutMs" must be a non-negative integer`);
+   assert(Number.isInteger(cfg.silenceTimeoutMs) && cfg.silenceTimeoutMs >= 0, `${sourcePath}: "silenceTimeoutMs" must be a non-negative integer`);
+   assert(Number.isInteger(cfg.hungAfterMs) && cfg.hungAfterMs > 0, `${sourcePath}: "hungAfterMs" must be a positive integer`);
+diff --git a/src/priority.js b/src/priority.js
+index 92d62cf..970870a 100644
+--- a/src/priority.js
++++ b/src/priority.js
+@@ -21,6 +21,21 @@ export function isPriorityTier(value) {
+   return typeof value === 'string' && Object.hasOwn(TIER_BASE, value);
+ }
+ 
++/** Ordering of the tiers: a higher rank outranks a lower one. */
++export function tierRank(tier) {
++  return isPriorityTier(tier) ? TIER_BASE[tier] : TIER_BASE[DEFAULT_PRIORITY];
++}
++
++/**
++ * BRAIN-627: the nice a lane runs at. An explicit lane `nice` (the ticket's `niceOverride`) wins, then the config's
++ * `priorityNice` entry for the tier the ticket was ADMITTED at (after the high cap), then the global `laneNice`.
++ */
++export function resolveLaneNice(ticket, tier, cfg) {
++  if (Number.isInteger(ticket?.niceOverride)) return ticket.niceOverride;
++  const tiered = cfg.priorityNice?.[tier];
++  return Number.isInteger(tiered) ? tiered : cfg.laneNice;
++}
++
+ /** The tier a ticket was ADMITTED at; a record without a readable one is medium. */
+ export function priorityOf(ticket) {
+   return isPriorityTier(ticket?.priorityAdmitted) ? ticket.priorityAdmitted : DEFAULT_PRIORITY;
+@@ -51,7 +66,7 @@ export function remotePriorityFrom(header) {
+ /** The audit fields a lease and its terminal history row carry (BRAIN-380 §8); only those the lease actually has. */
+ export function priorityAuditOf(record) {
+   const audit = {};
+-  for (const key of ['priorityRequested', 'priorityAdmitted', 'priorityDemoted', 'priorityRetiered', 'priorityRetieredAt', 'effectiveRankAtStart', 'scoreAtStart']) {
++  for (const key of ['nice', 'priorityRequested', 'priorityAdmitted', 'priorityDemoted', 'priorityRetiered', 'priorityRetieredAt', 'effectiveRankAtStart', 'scoreAtStart']) {
+     if (record?.[key] !== undefined) audit[key] = record[key];
+   }
+   return audit;
+diff --git a/src/scheduler.js b/src/scheduler.js
+index 4f604d7..a54399c 100644
+--- a/src/scheduler.js
++++ b/src/scheduler.js
+@@ -16,7 +16,7 @@ import { resolveClasses, classEnforcementOf, bookedSims, classQueuePolicy, capSi
+ import { reconcileSimArm, touchSimArmFor } from './sim-arm.js';
+ import { advanceHwm } from './priority-clock.js';
+ import { isExclusive, exclusiveDeny, isExclusiveHead, exclusiveLeaseFields, withoutBackfillExclusives, clampQueuedWeight } from './exclusive.js';
+-import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, effectiveRank, score, waitedMs } from './priority.js';
++import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, resolveLaneNice, effectiveRank, score, waitedMs } from './priority.js';
+ import { loadExpressTable, expressVerdict, expressAdmissionsLastMinute, recordExpressAdmission, logExpressAdmission } from './express.js';
+ import { DEFAULT_GLOBAL_CONFIG } from './config.js';
+ import { resolveScheduler, resolveSchedulerDetailed, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
+@@ -1393,8 +1393,12 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
+       const reason = fs.readFileSync(paths(root).pause, 'utf8').trim();
+       return { result: { started: false, reason: 'paused', pauseReason: reason } };
+     }
++    // BRAIN-627: the nice this ticket will run at (its lane's own, else its ADMITTED tier's, else laneNice), recorded on the lease below.
++    // Both the process discount here and the held-lease discount in admission judge the candidate at it.
++    const admittedTier = priorityOf(queue[position]);
++    const startNice = resolveLaneNice(ticket, admittedTier, cfg);
+     const cpuSample = sampleCpuSafe(root, cpuSampler, cfg.sampleMs / 2, {
+-      laneNice: Number.isInteger((candidate ?? ticket).nice) && (candidate ?? ticket).nice >= 0 ? (candidate ?? ticket).nice : cfg.laneNice,
++      laneNice: startNice,
+       niceMin: cfg.preemptibleNiceMin,
+       heldLeases: held,
+     });
+@@ -1427,7 +1431,8 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
+     // the head's claim joins the held leases for the CPU projection and memory admission.
+     const headReservation = { id: headTicket.id, key: headTicket.key, configLane: headTicket.configLane, cmdFingerprint: headTicket.cmdFingerprint, weight: headTicket.weight, resources: headTicket.resources };
+     const admissionHeld = safeBackfill || conflictPick || (expressAdmit && expressHeadProtected) ? [...held, headReservation] : held;
+-    const fullDecision = evaluateNewAdmission(root, cfg, ticket, admissionHeld, cpuSample, memInfo);
++    const admissionTicket = { ...ticket, nice: startNice, priorityAdmitted: admittedTier };
++    const fullDecision = evaluateNewAdmission(root, cfg, admissionTicket, admissionHeld, cpuSample, memInfo);
+     // BRAIN-532 step 2: shadow idle credit. Computed from the finished decision and only recorded; nothing below reads it.
+     if (cfg.idleCreditMode !== 'off' && ticket.id === headTicket.id) {
+       const credit = idleCreditCores(held, cpuSample, cfg, now);
+@@ -1437,7 +1442,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
+     // re-evaluated at smaller claims, over the same held leases (and, for a safe backfill, the same
+     // head reservation), so the grant can never delay what the full claim could not. Active mode
+     // only: shadow never denies, so there is nothing to relax.
+-    const elastic = cfg.schedulerMode === 'active' ? evaluateElasticAdmission(cfg, ticket, admissionHeld, cpuSample, memInfo, fullDecision) : null;
++    const elastic = cfg.schedulerMode === 'active' ? evaluateElasticAdmission(cfg, admissionTicket, admissionHeld, cpuSample, memInfo, fullDecision) : null;
+     const cpuDecision = elastic ? { ...elastic.decision, declaredCpuCores: submitted.resources?.cpuCores ?? fullDecision.candidateCpuCores } : fullDecision;
+     // BRAIN-418: only the head's own denial can declare its reservation futile; a candidate's poll reads the verdict
+     // the head's latest denial recorded. Only a CPU-projection or memory denial is judged: a closed gate, a cooldown or an unavailable sample is not the
+@@ -1660,6 +1665,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
+       id: ticket.id,
+       priorityRequested: isPriorityTier(queued.priorityRequested) ? queued.priorityRequested : DEFAULT_PRIORITY,
+       priorityAdmitted: priorityOf(queued),
++      nice: startNice,
+       priorityDemoted: queued.priorityDemoted === true,
+       // BRAIN-518: a ticket re-tiered while queued says so on its lease and history row; an un-retiered one has no such keys
+       ...(queued.priorityRetiered === true ? { priorityRetiered: true, priorityRetieredAt: queued.priorityRetieredAt } : {}),
+diff --git a/src/supervisor.js b/src/supervisor.js
+index 74d70b9..5233306 100644
+--- a/src/supervisor.js
++++ b/src/supervisor.js
+@@ -1520,7 +1520,7 @@ async function main() {
+   }
+ 
+   const startedAt = Date.now();
+-  const [cmd, args] = resolveNicedSpawn(ticket);
++  const [cmd, args] = resolveNicedSpawn({ ...ticket, nice: started.lease.nice ?? ticket.nice });
+   const child = spawn(cmd, args, {
+     cwd: ticket.cwd,
+     detached: true,

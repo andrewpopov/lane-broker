@@ -150,6 +150,7 @@ never told to forward to it — both still get the `--log` file.
   "resourceIdleOvershootCores": 1,
   "admissionLoadGate": false,
   "laneNice": 10,
+  "priorityNice": { "high": 5 },
   "noProgressTimeoutMs": 0
 }
 ```
@@ -392,6 +393,14 @@ passed — print a refusal message and exit `69` instead. The message points at
 
 A lane's own `nice` (integer `0`-`19`) overrides the global `laneNice` for
 that lane only; omit it to use the global default.
+
+`priorityNice` (default `{ "high": 5 }`; keys `high`/`medium`/`low`, values
+`0`-`19`, anything else refused by name; `{}` gives every tier `laneNice`):
+the nice a lane runs at, by the tier it was ADMITTED at (after the per-repo
+high cap). Precedence: the lane's own `nice` > `priorityNice[tier]` >
+`laneNice`. The nice a lease actually ran at is recorded as `nice` on the
+lease and its history row. A remote-exec ticket resolves it on the runner,
+from the runner's own `priorityNice` and the tier in the submitter's header.
 
 A supervisor that is still waiting to start (queued behind capacity or a
 closed load gate) re-reads the global config on every poll, so an edit to
@@ -1585,6 +1594,22 @@ and admits the job through the runner's own broker, so the job's `LANE_BROKER_LE
 is the runner-local ticket (`remoteLaneId`), leased in the runner's state dir. A nested
 reentrant `lane run` passes the outer lease id through, which checks as live. A hook
 feature-detects the command with `lease-check/1` in `lane capabilities --json`.
+
+### A higher tier is admitted past lower-tier leases (BRAIN-627)
+
+Tiers set the kernel priority (`priorityNice`, above), so a `high` lane (default
+nice 5, a human is waiting on it) runs ahead of `medium`/`low` leases (nice 10).
+Admission trusts that: when it judges a candidate, a held lease is charged
+`demand * (1 - preemptibleShare)` instead of in full if its recorded nice is
+STRICTLY greater than the candidate's, at least `preemptibleNiceMin`, AND its
+admitted tier ranks below the candidate's. The same two knobs as the process
+discount (BRAIN-428) apply; there is no second share. A lease with no recorded
+nice (written by an older broker) is charged in full, and so is any lease of an
+equal or higher tier. Memory, weight capacity, conflicts, exclusive lanes, the
+cooldown, pause and the load gate are unchanged. `preemptibleNiceMin: 0`
+disables it, and `priorityNice: {}` leaves nothing to discount. The admission
+log line carries `preemptibleLeaseCores=<n>` when the discount removed anything.
+The kernel does the yielding: nothing is reniced or stopped after it starts.
 
 ### Priority (foundations, BRAIN-380 slice 1)
 

@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { paths, atomicWriteJson, readJsonSafe, fingerprintOf } from './state.js';
 import { sampleHostCpu } from './cpu.js';
 import { peekCpuEstimates, lookupEstimate, clampEstimate, raiseEstimate } from './cpu-estimates.js';
+import { isPriorityTier, priorityOf, tierRank } from './priority.js';
 import { evaluateMemoryAdmission, resolveTicketResources, leaseCpuCores, elasticClaimRange } from './resources.js';
 
 /**
@@ -272,8 +273,26 @@ export const KNOWN_BIAS_NOTE = 'self-subtracted-when-observed';
  * selection (scheduler.js's selectResourceCandidate), so the two can never disagree about what
  * "fits" means: busy = ambient load + every held lease's demand + the candidate's claim.
  */
-export function projectBusy(externalBusy, heldLeases, candidateEstimate, now = Date.now(), cfg, budget) {
-  return externalBusy + heldLeases.reduce((sum, l) => sum + leaseDemand(l, now, cfg, budget), 0) + candidateEstimate;
+export function projectBusy(externalBusy, heldLeases, candidateEstimate, now = Date.now(), cfg, budget, candidate = null) {
+  return externalBusy + heldLeases.reduce((sum, l) => sum + leaseCharge(l, leaseDemand(l, now, cfg, budget), candidate, cfg), 0) + candidateEstimate;
+}
+
+/**
+ * BRAIN-627: what the CPU projection charges for one held lease against `candidate` (`{ nice, tier }`, null = a
+ * candidate-less view, which charges in full). A lease the kernel runs behind the candidate yields to it, so only
+ * (1 - preemptibleShare) of its demand is charged: its recorded nice is STRICTLY greater than the candidate's and at
+ * least preemptibleNiceMin (the process rule of BRAIN-428), AND its admitted tier ranks below the candidate's. A lease
+ * with no recorded nice (written before the field existed) is charged in full.
+ */
+export function leaseCharge(lease, demand, candidate, cfg) {
+  if (!candidate || !((cfg.preemptibleNiceMin ?? 0) > 0)) return demand;
+  const outranked = Number.isInteger(lease.nice) && lease.nice > candidate.nice && lease.nice >= cfg.preemptibleNiceMin && tierRank(priorityOf(lease)) < tierRank(candidate.tier);
+  return outranked ? demand * (1 - (cfg.preemptibleShare ?? 0)) : demand;
+}
+
+/** The candidate side of leaseCharge, from a ticket carrying the nice it will run at and the tier it was admitted at. */
+function candidatePriorityOf(ref) {
+  return Number.isInteger(ref?.nice) && isPriorityTier(ref.priorityAdmitted) ? { nice: ref.nice, tier: ref.priorityAdmitted } : null;
 }
 
 /** The CPU-core budget for one sample: the smaller of the percent budget and all-cores-minus-reserve. */
@@ -323,20 +342,23 @@ export function evaluateCpuAdmission({ cpuSample, heldLeases, candidateWeight, c
 
   const { externalBusy, budget } = hostCpuLoad(cpuSample, heldLeases, cfg, now);
   const { cores: candidateEstimate, source: candidateEstimateSource } = cpuEstimateBasis(candidateRef, candidateResources?.cpuCores ?? candidateWeight, cfg, now, heldLeases.length > 0 ? budget : undefined);
-  const projectedBusy = projectBusy(externalBusy, heldLeases, candidateEstimate, now, cfg, budget);
+  const candidatePriority = candidatePriorityOf(candidateRef);
+  const projectedBusy = projectBusy(externalBusy, heldLeases, candidateEstimate, now, cfg, budget, candidatePriority);
   const leaseCharges = heldLeases.map((l) => ({ id: l.id, ...leaseDemandBasis(l, now, cfg, budget) }));
+  // cores the discount removed from the projection; leaseCharges stays the undiscounted demand (class accounting reads it)
+  const preemptibleLeaseCores = leaseCharges.reduce((sum, { demand }, i) => sum + demand - leaseCharge(heldLeases[i], demand, candidatePriority, cfg), 0);
   const leaseDemands = leaseCharges.map(({ id, demand, basis }) => `${String(id).slice(0, 8)}:${fmt(demand)}(${basis})`);
 
   if (cpuGateState.closed) {
-    return { admit: false, reason: 'cpu-gate-closed', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, candidateEstimate, candidateEstimateSource };
+    return { admit: false, reason: 'cpu-gate-closed', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, preemptibleLeaseCores, candidateEstimate, candidateEstimateSource };
   }
   if (cooldownBlocked) {
-    return { admit: false, reason: 'cooldown', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, candidateEstimate, candidateEstimateSource };
+    return { admit: false, reason: 'cooldown', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, preemptibleLeaseCores, candidateEstimate, candidateEstimateSource };
   }
   if (projectedBusy > budget) {
-    return { admit: false, reason: 'projected-over-budget', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, candidateEstimate, candidateEstimateSource };
+    return { admit: false, reason: 'projected-over-budget', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, preemptibleLeaseCores, candidateEstimate, candidateEstimateSource };
   }
-  return { admit: true, reason: 'ok', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, candidateEstimate, candidateEstimateSource };
+  return { admit: true, reason: 'ok', externalBusy, projectedBusy, budget, leaseDemands, leaseCharges, preemptibleLeaseCores, candidateEstimate, candidateEstimateSource };
 }
 
 /** The "nothing usable is known" fallback shared by a missing/stale sample
@@ -506,6 +528,7 @@ export function formatAdmissionLog(f) {
     `externalBusy=${fmt(f.externalBusy)}`,
     // only when the feature contributes, so the line is byte-identical to before wherever it does not
     ...(f.preemptibleBusyCores > 0 ? [`preemptibleBusy=${fmt(f.preemptibleBusyCores)}`] : []),
+    ...(f.preemptibleLeaseCores > 0 ? [`preemptibleLeaseCores=${fmt(f.preemptibleLeaseCores)}`] : []),
     `projectedBusy=${fmt(f.projectedBusy)}`,
     `budget=${fmt(f.budget)}`,
     `candidateCpu=${fmt(f.candidateCpuCores)}`,
