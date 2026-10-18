@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
 import { PRIORITY_CAPABILITY } from './priority.js';
 import { ARTIFACTS_CAPABILITY } from './remote-artifacts.js';
+import { SNAPSHOT_GZIP_CAPABILITY } from './remote-gzip.js';
 import { EXCLUSIVE_CAPABILITY } from './exclusive.js';
 import { LEASE_CHECK_CAPABILITY } from './lease.js';
 import { stateHome } from './state.js';
@@ -41,6 +42,7 @@ export const CAPABILITIES = [
   QUEUE_RETIER_CAPABILITY,
   LEASE_CHECK_CAPABILITY,
   RUNNER_HEARTBEAT_CAPABILITY,
+  SNAPSHOT_GZIP_CAPABILITY,
 ];
 
 /** `lane capabilities --json`: what this install can do and which scheduler/admission mode it is in. */

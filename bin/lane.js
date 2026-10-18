@@ -13,6 +13,7 @@ import { migrateSchedulerCommand } from '../src/migrate.js';
 import { parseByteSize } from '../src/resources.js';
 import { isTicketId } from '../src/state.js';
 import { leaseCheckCommand } from '../src/lease.js';
+import { parseTransferFlag } from '../src/remote-gzip.js';
 import {
   remoteExecCommand,
   remoteProbeCommand,
@@ -352,7 +353,12 @@ async function main() {
     }
     case 'remote-exec': {
       const root = parseRootFlag(rest) || defaultRemoteRoot();
-      const result = await remoteExecCommand({ root });
+      const flag = parseTransferFlag(rest);
+      if (!flag.ok) {
+        process.stderr.write(`lane remote-exec: ${flag.reason}\n`);
+        return 2;
+      }
+      const result = await remoteExecCommand({ root, transfer: flag.transfer });
       return result.exitCode;
     }
     case 'remote-result': {

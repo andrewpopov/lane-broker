@@ -1018,6 +1018,13 @@ launchd job; it adds no second ledger and builds on the BRAIN-594 clock:
   call during placement, rebind and rebalance. A `localRefused` lane (it has no local fallback) probes a runner that timed out once
   more, but only a runner the heartbeat vouches for (watcher tick under 5 minutes old and the runner's `lastOkAt` under 5 minutes old);
   a runner the heartbeat has not seen answer is skipped as `probe timed out` straight away.
+- Snapshot transfer encoding (BRAIN-642, `snapshot-gzip/1`): a runner whose probe lists `snapshot-gzip/1` is sent the snapshot as one gzip
+  member (`lane remote-exec --transfer gzip`, deflate level `remoteSnapshotGzipLevel`, global config, integer 1-9, default 3); any other
+  runner gets the legacy plain stream, byte for byte, with no new flag or key. The capability is re-read per dispatch, so a rebalance to a
+  runner without it sends the plain stream. The runner decodes with a strict single-member decoder: decompressed bytes are capped at the
+  header limit plus the 2 GiB tree limit plus 64 MiB of frame lines, compressed input at the same figure, and any compressed byte after the
+  member's trailer is refused. A stream that fails before a usable header leaves no ticket (exit 1: the client proves it never started via
+  the withdraw tombstone and retries elsewhere); one that fails after it is a `rejected` result with the reason.
 - The probe contract: `lane remote-probe` must answer promptly on a busy runner. It waits at most 500 ms for the broker lock (the lock
   only reaps stale leases). If the lock is held it answers from a lock-free read of the lease, queue and gate files and adds
   `"stale": true, "snapshot": "lockless"`. Each file is written by atomic rename, so each is consistent on its own, but the set can be a
@@ -2281,6 +2288,8 @@ What a run leaves behind is collected; what a live one owns never is. Everything
 - `LANE_BROKER_TEST_LOCK_TIMEOUT_MS` — overrides `withLock`'s default 15s
   acquire deadline, so a test can force a lock-acquire timeout (BRAIN-345: a
   queued supervisor must treat one as contention and keep polling).
+- `LANE_BROKER_TEST_TRANSFER_MAX_BYTES` — lowers `lane remote-exec`'s decompressed and compressed transfer caps (BRAIN-642), so a gzip-bomb
+  test never needs 2 GiB.
 - `LANE_BROKER_TEST_PAUSE_AFTER_TICKET_ID` — if set, `lane remote-exec` pauses
   right after writing its ticket's `remote-id` file AND checking its own
   ticket-local `cancelled` marker (finding it not yet set), until the named

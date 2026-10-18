@@ -133,6 +133,8 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // cooldown is the minimum gap between two moves of one ticket, and the cap is how many times one ticket may move.
   remoteRebalanceMinQueuedMs: 300_000,
   remoteRebalanceIntervalMs: 60_000,
+  // BRAIN-642: zlib level (1-9) of the gzip stream a submitter sends a runner that lists `snapshot-gzip/1`.
+  remoteSnapshotGzipLevel: 3,
   remoteRebalanceCooldownMs: 600_000,
   remoteRebalanceMaxMoves: 1,
   // BRAIN-207 (forgiving admission): whether the load gate is allowed to
@@ -382,6 +384,7 @@ function validateGlobalConfig(cfg, sourcePath) {
     assert(Number.isInteger(cfg[field]) && cfg[field] >= 0, `${sourcePath}: "${field}" must be a non-negative integer`);
   }
   assert(Number.isInteger(cfg.remoteRebalanceIntervalMs) && cfg.remoteRebalanceIntervalMs > 0, `${sourcePath}: "remoteRebalanceIntervalMs" must be a positive integer`);
+  assert(Number.isInteger(cfg.remoteSnapshotGzipLevel) && cfg.remoteSnapshotGzipLevel >= 1 && cfg.remoteSnapshotGzipLevel <= 9, `${sourcePath}: "remoteSnapshotGzipLevel" must be an integer from 1 to 9`);
   assert(typeof cfg.admissionLoadGate === 'boolean', `${sourcePath}: "admissionLoadGate" must be a boolean`);
   assert(typeof cfg.allocationShadow === 'boolean', `${sourcePath}: "allocationShadow" must be a boolean`);
   assert(Number.isInteger(cfg.simArmWindowMs) && cfg.simArmWindowMs > 0, `${sourcePath}: "simArmWindowMs" must be a positive integer`);

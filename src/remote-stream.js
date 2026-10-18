@@ -128,49 +128,90 @@ export function encodeSnapshot(worktreeRoot, header, entries, readFile = (entry)
   return Readable.from(generate());
 }
 
-/** Buffered line/byte reader over any async-iterable of Buffer/string chunks. */
+/**
+ * Buffered line/byte reader over any async-iterable of Buffer/string chunks. Chunks are queued, never re-concatenated per
+ * arrival: a body delivered in many small chunks (a decompressor's output) costs one copy at the end, and a line costs one
+ * scan of each new chunk.
+ */
 export function makeReader(readable) {
-  let buf = Buffer.alloc(0);
+  const queue = [];
+  let queued = 0;
+  let newline = -1; // offset of the first newline in the queue, -1 when none is known
   let done = false;
   const it = readable[Symbol.asyncIterator]();
 
-  async function fill() {
+  function rescan() {
+    newline = -1;
+    let pos = 0;
+    for (const chunk of queue) {
+      const idx = chunk.indexOf(NEWLINE);
+      if (idx !== -1) {
+        newline = pos + idx;
+        return;
+      }
+      pos += chunk.length;
+    }
+  }
+
+  async function fill(scan) {
     if (done) return false;
     const { value, done: iterDone } = await it.next();
     if (iterDone) {
       done = true;
       return false;
     }
-    buf = Buffer.concat([buf, Buffer.isBuffer(value) ? value : Buffer.from(value)]);
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    if (scan && newline === -1) {
+      const idx = chunk.indexOf(NEWLINE);
+      if (idx !== -1) newline = queued + idx;
+    }
+    queue.push(chunk);
+    queued += chunk.length;
     return true;
+  }
+
+  function take(n) {
+    const parts = [];
+    let need = n;
+    while (need > 0) {
+      const head = queue[0];
+      if (head.length <= need) {
+        parts.push(queue.shift());
+        need -= head.length;
+      } else {
+        parts.push(head.subarray(0, need));
+        queue[0] = head.subarray(need);
+        need = 0;
+      }
+    }
+    queued -= n;
+    rescan();
+    return parts.length === 1 ? Buffer.from(parts[0]) : Buffer.concat(parts, n);
   }
 
   async function readLine(maxLen) {
     for (;;) {
-      const idx = buf.indexOf(NEWLINE);
-      if (idx !== -1) {
-        if (idx > maxLen) throw new Error('line exceeds max length');
-        const line = buf.subarray(0, idx).toString('utf8');
-        buf = buf.subarray(idx + 1);
+      if (newline !== -1) {
+        if (newline > maxLen) throw new Error('line exceeds max length');
+        const line = take(newline).toString('utf8');
+        take(1);
         return line;
       }
-      if (buf.length > maxLen) throw new Error('line exceeds max length');
-      if (!(await fill())) return null;
+      if (queued > maxLen) throw new Error('line exceeds max length');
+      if (!(await fill(true))) return null;
     }
   }
 
   async function readBytes(n) {
-    while (buf.length < n) {
-      if (!(await fill())) return null;
+    while (queued < n) {
+      if (!(await fill(false))) return null;
     }
-    const out = Buffer.from(buf.subarray(0, n));
-    buf = buf.subarray(n);
-    return out;
+    return take(n);
   }
 
   async function hasMore() {
-    if (buf.length > 0) return true;
-    return fill();
+    if (queued > 0) return true;
+    return fill(false);
   }
 
   return { readLine, readBytes, hasMore };
@@ -365,7 +406,11 @@ export async function extractFrames(reader, destDir, expectedManifest, limits = 
     return { ok: false, reason: 'missing entry: stream ended before all manifest entries arrived' };
   }
 
-  if (await reader.hasMore()) return { ok: false, reason: 'trailing bytes after terminator' };
+  try {
+    if (await reader.hasMore()) return { ok: false, reason: 'trailing bytes after terminator' };
+  } catch (err) {
+    return { ok: false, reason: `after terminator: ${err.message}` };
+  }
 
   return verifyManifestNoGit(destDir, expectedManifest);
 }

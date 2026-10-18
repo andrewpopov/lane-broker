@@ -43,6 +43,7 @@ import { remoteExcludeWarnings } from './remote-exclude.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
 import { REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
+import { SNAPSHOT_GZIP_CAPABILITY, TRANSFER_GZIP } from './remote-gzip.js';
 import { createAttempt, readAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX, hostCpuLoad, ticketCpuEstimate } from './admission.js';
 import { relayedUsage, relayedDeps } from './remote-relay.js';
@@ -965,6 +966,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       if (thisEpoch === epoch) write(chunk);
     };
     const canWithdraw = Array.isArray(probe?.capabilities) && probe.capabilities.includes(REMOTE_WITHDRAW_CAPABILITY);
+    // BRAIN-642: re-read per dispatch like the artifacts gate, so a rebalance to a runner without it sends the legacy stream.
+    const snapshotGzip = Array.isArray(probe?.capabilities) && probe.capabilities.includes(SNAPSHOT_GZIP_CAPABILITY);
     let target = null;
 
     // BRAIN-320 S1c: `enriched.remote.remoteDeps`/`remoteSetup` ride along in
@@ -973,6 +976,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     dispatch = await dispatchRemote({
       ...enriched.remote,
       remoteArtifacts: artifactsSupported ? declaredArtifacts : null,
+      transfer: snapshotGzip ? TRANSFER_GZIP : undefined,
+      gzipLevel: globalCfg.remoteSnapshotGzipLevel,
       artifactLimits: artifactLimitsOf(globalCfg),
       manifest,
       runner,

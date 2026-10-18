@@ -10,6 +10,7 @@ import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartT
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, RUNNER_NAME_RE, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
 import { CAPABILITIES } from './capabilities.js';
+import { createStrictGunzip, TRANSFER_GZIP } from './remote-gzip.js';
 import { reportReadiness } from './runner-readiness.js';
 import { NO_PROGRESS_REASON, SILENCE_REASON } from './no-progress.js';
 import { artifactLimitsOf, collectArtifacts, encodeArtifacts, pruneStaleArtifacts } from './remote-artifacts.js';
@@ -90,6 +91,12 @@ const REPO_KEY_RE = /^[A-Za-z0-9._:-]{1,200}$/;
 // real worktree snapshot (zirkbot today: ~2k files, ~29MB total).
 const MAX_FILE_BYTES = 256 * 1024 * 1024;
 const MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
+// BRAIN-642: decoded = header + every body + frame lines; compressed is bounded by the same figure (deflate expands by < 0.1%).
+const TRANSFER_SLACK_BYTES = 64 * 1024 * 1024;
+const TRANSFER_LIMITS = {
+  maxDecodedBytes: MAX_HEADER_BYTES + MAX_TOTAL_BYTES + TRANSFER_SLACK_BYTES,
+  maxCompressedBytes: MAX_HEADER_BYTES + MAX_TOTAL_BYTES + TRANSFER_SLACK_BYTES,
+};
 
 /** Preflight refusal codes `run.js` already returns before a child ever
  *  starts (undeclared lane / resource budget exceeded, local-sim refusal,
@@ -341,6 +348,12 @@ async function collectGarbage(root) {
   }
 }
 
+// Testing hook (README "Testing hooks"): lowers both transfer caps so a bomb test never needs 2 GiB.
+function transferLimitsFromEnv() {
+  const cap = Number(process.env.LANE_BROKER_TEST_TRANSFER_MAX_BYTES);
+  return Number.isInteger(cap) && cap > 0 ? { maxDecodedBytes: cap, maxCompressedBytes: cap } : TRANSFER_LIMITS;
+}
+
 /**
  * `lane remote-exec` (BRAIN-319 T2): read a framed snapshot stream (header +
  * body, see remote-stream.js) off `stdin`, extract and verify it into a
@@ -350,7 +363,7 @@ async function collectGarbage(root) {
  * one of `<root>/tickets/<ticketId>/result.json` (exit 0) or nothing (exit
  * nonzero) -- see the module-level comment on kind derivation below.
  */
-export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = process.stdin } = {}) {
+export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = process.stdin, transfer, transferLimits = transferLimitsFromEnv() } = {}) {
   const execStartedAt = Date.now();
   // BRAIN-320 review fix A: resolve once, up front -- every path derived
   // below (ticketDir, workDir, and the protocol-2 pipeline argv) is passed
@@ -393,7 +406,15 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     if (!(name in scrubbed)) delete process.env[name];
   }
 
-  const reader = makeReader(stdin);
+  // BRAIN-642: `--transfer gzip` wraps the whole stream. A failure before a usable header leaves no ticket and no result (the
+  // client treats it as never started); after the header it is a `rejected` result like any other bad stream.
+  let source = stdin;
+  if (transfer === TRANSFER_GZIP) {
+    const gunzip = createStrictGunzip(transferLimits);
+    pipeline(stdin, gunzip.input).catch(() => {});
+    source = gunzip.output;
+  }
+  const reader = makeReader(source);
   const headerResult = await readHeaderLine(reader, MAX_HEADER_BYTES);
   if (!headerResult.ok) {
     process.stderr.write(`lane remote-exec: ${headerResult.reason}\n`);

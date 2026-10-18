@@ -1,6 +1,9 @@
 import { spawn } from 'node:child_process';
 import { buildManifest, RemoteIneligibleError } from './remote-manifest.js';
+import zlib from 'node:zlib';
+import { pipeline } from 'node:stream';
 import { encodeSnapshot, serializeHeader, makeReader, MAX_HEADER_BYTES } from './remote-stream.js';
+import { countBytes, TRANSFER_GZIP } from './remote-gzip.js';
 import { receiveArtifacts, artifactLimitsOf } from './remote-artifacts.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
@@ -665,7 +668,7 @@ export async function remoteWithdraw(runner, ticketId, { sshBin = 'ssh', deadlin
   if (res.timedOut || res.code !== 0) return unknown;
   try {
     const reply = JSON.parse(String(res.stdout).trim().split('\n').pop());
-    return reply?.protocol === 1 && reply.ticketId === ticketId && typeof reply.action === 'string' ? { action: reply.action } : unknown;
+    return reply?.protocol === 1 && reply.ticketId === ticketId && typeof reply.action === 'string' ? { action: reply.action, ...(reply.tombstoned === true ? { tombstoned: true } : {}) } : unknown;
   } catch {
     return unknown;
   }
@@ -813,6 +816,11 @@ export async function dispatchRemote(opts) {
     remoteArtifacts = null,
     remoteOmitEscapingSymlinks = false,
     remoteExclude = null,
+    // BRAIN-642: 'gzip' only when the selected runner lists `snapshot-gzip/1` (the caller decides); anything else is the legacy stream.
+    transfer,
+    gzipLevel = DEFAULT_GLOBAL_CONFIG.remoteSnapshotGzipLevel,
+    // Called once the upload settles with { mode, rawBytes, sentBytes }; the log line and history fields are a later slice.
+    onTransferStats,
     remoteArtifactsOn = 'success',
     artifactLimits,
     // BRAIN-320 S1d: opt-in, from the CLIENT machine's global config
@@ -948,9 +956,15 @@ export async function dispatchRemote(opts) {
     if (!persisted) return { outcome: 'unconfirmed', reason: 'could not persist the dispatch binding', neverStarted: true };
   }
 
-  const snapshotStream = encodeSnapshot(worktreeRoot, header, manifest.entries);
+  // BRAIN-642: pipeline() so an upstream encode error (a file mutated since the manifest) reaches pipeSnapshot and tears every
+  // stage down. `transfer` is set only for a runner that lists `snapshot-gzip/1`; otherwise the stream is the legacy one.
+  const transferStats = { mode: transfer === TRANSFER_GZIP ? TRANSFER_GZIP : 'plain', rawBytes: 0, sentBytes: 0 };
+  const sendStages = [encodeSnapshot(worktreeRoot, header, manifest.entries), countBytes((n) => { transferStats.rawBytes += n; })];
+  if (transfer === TRANSFER_GZIP) sendStages.push(zlib.createGzip({ level: gzipLevel }));
+  sendStages.push(countBytes((n) => { transferStats.sentBytes += n; }));
+  const snapshotStream = pipeline(...sendStages, () => {});
 
-  const execCommand = buildRemoteCommand(runner, 'remote-exec');
+  const execCommand = buildRemoteCommand(runner, 'remote-exec', transfer === TRANSFER_GZIP ? ['--transfer', TRANSFER_GZIP] : []);
   const child = spawn(sshBin, sshArgv(runner, execCommand), { stdio: ['pipe', 'pipe', 'pipe'], env });
   if (onStdout) child.stdout.on('data', onStdout);
   if (onStderr) child.stderr.on('data', onStderr);
@@ -966,6 +980,7 @@ export async function dispatchRemote(opts) {
   const uploadStartedAt = Date.now();
   const pipeResult = await pipeSnapshot(child, snapshotStream, transferDeadlineMs, abortSignal);
   const uploadMs = Date.now() - uploadStartedAt;
+  if (onTransferStats) onTransferStats({ ...transferStats });
   // The ssh session IS the remote job; wait for it to close (unbounded here
   // -- an outer --timeout is the caller's concern), killable by abort.
   if (pipeResult.ok && onSnapshotSent) {
@@ -1111,7 +1126,9 @@ export async function dispatchRemote(opts) {
       // The move's own withdraw reply was lost and the session closed: this retry is the proof, and the chosen target is where it goes.
       return { outcome: 'moved', from: runner, to: state.attemptedTarget, queuedMs: state.queuedSince === null ? 0 : now() - state.queuedSince, waitedOnRunnerMs: Math.max(0, now() - dispatchedAt), neverStarted: true, ...moveReasonOf(state) };
     }
-    if (withdraw.action === 'withdrawn') return { outcome: 'unconfirmed', reason: 'result not available after retries; the runner confirmed it never started the ticket', neverStarted: true, retryElsewhere: true };
+    // BRAIN-642: a runner that never created the ticket (the stream failed before a usable header, e.g. a corrupt gzip upload) and has now
+    // tombstoned the id also proves it never started.
+    if (withdraw.action === 'withdrawn' || (withdraw.action === 'no-such-ticket' && withdraw.tombstoned === true)) return { outcome: 'unconfirmed', reason: 'result not available after retries; the runner confirmed it never started the ticket', neverStarted: true, retryElsewhere: true };
     return {
       outcome: 'unconfirmed',
       reason: `result not available after retries from ${runner.name}; the dispatch may have been accepted and ${withdrawCapable ? `could not be withdrawn (${withdraw.action})` : 'the runner cannot withdraw it'}, so it may still be running and was not re-run`,
