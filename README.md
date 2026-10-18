@@ -676,13 +676,22 @@ naming the field.
 The submitter sends the names in the runner probe it already makes (`lane remote-probe --requires rg,poetry`); the runner answers
 `tools: {"rg": true, "poetry": false}`, resolving each against the `PATH` of the login shell the probe ran in. A runner lacking one is
 skipped for that lane only (`remote-skip` / the selection reason reads `missing tool poetry (required by the lane)`), and `lane status`
-shows `not ready: missing poetry (<age> ago)` on that runner until a placement passes it again. A runner older than 0.47.0 ignores the
+shows `not ready: missing poetry (<age> ago)` on that runner until a placement passes it again (any placement whose probe the runner passes clears it, chosen or not) or an hour passes. A runner older than 0.47.0 ignores the
 flag and answers no `tools`, so it counts as **not ready** for a lane with `requires` (it cannot vouch for the tool); a lane without
 `requires` sends the probe command it always did and is unaffected.
 
 With no eligible runner a remote-eligible lane runs locally (the local machine is not checked for the tool), and a remote-only
 (`localRefused`) lane exits `76` ("no runner can take it now", retryable) with the message naming each runner and its reason.
 The check list lives in `src/runner-readiness.js` (`READINESS_CHECKS`); further readiness checks are added there.
+
+Two more checks need nothing from the lane (BRAIN-623):
+
+- **Version floor.** Set `runnerVersionFloor` (`"X.Y.Z"`, default `null` = none; anything else is a config error) in the global config and a
+  runner whose probe reports a lower `lane-broker` version, or none, is skipped (`lane-broker 0.47.0 is below the floor 0.49.0`).
+  Compared as numbers, major then minor then patch.
+- **Install integrity.** Every runner of this release reports `integrity.zeroLength`: the zero-length files under its own package's `bin/` and
+  `src/` plus `package.json` (what an unclean shutdown leaves behind). A runner reporting any is skipped (`truncated install: 2 zero-length
+  file(s) (src/a.js, src/b.js)`). A runner that reports no `integrity` (older) is not skipped for it; use the version floor to exclude those.
 
 ### Dependencies and setup on the runner (BRAIN-320)
 
