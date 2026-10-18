@@ -14,6 +14,7 @@ import { parseByteSize } from '../src/resources.js';
 import { isTicketId } from '../src/state.js';
 import { leaseCheckCommand } from '../src/lease.js';
 import { parseTransferFlag } from '../src/remote-gzip.js';
+import { parseTransferCacheFlag } from '../src/remote-blobs.js';
 import {
   remoteExecCommand,
   remoteProbeCommand,
@@ -358,7 +359,12 @@ async function main() {
         process.stderr.write(`lane remote-exec: ${flag.reason}\n`);
         return 2;
       }
-      const result = await remoteExecCommand({ root, transfer: flag.transfer });
+      const cacheFlag = parseTransferCacheFlag(rest);
+      if (!cacheFlag.ok) {
+        process.stderr.write(`lane remote-exec: ${cacheFlag.reason}\n`);
+        return 2;
+      }
+      const result = await remoteExecCommand({ root, transfer: flag.transfer, transferCache: cacheFlag.transferCache });
       return result.exitCode;
     }
     case 'remote-result': {

@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
 import { manifestHashOf, sortEntries, verifyManifestNoGit, isCanonicalRelPath } from './remote-manifest.js';
+import { MIN_CACHEABLE_BYTES, materializeBlob, publishBlob } from './remote-blobs.js';
 
 const NEWLINE = 0x0a;
 
@@ -217,7 +218,7 @@ export function makeReader(readable) {
   return { readLine, readBytes, hasMore };
 }
 
-function validateFrame(frame, expectedByPath, seen, symlinkPaths, maxFileBytes, remainingBudget) {
+function validateFrame(frame, expectedByPath, seen, symlinkPaths, maxFileBytes, remainingBudget, cacheEnabled) {
   if (!frame || typeof frame.path !== 'string') return { ok: false, reason: 'malformed frame' };
   const p = frame.path;
   if (path.isAbsolute(p)) return { ok: false, reason: `absolute path: ${p}` };
@@ -243,6 +244,12 @@ function validateFrame(frame, expectedByPath, seen, symlinkPaths, maxFileBytes, 
     if (frame.size !== entry.size) return { ok: false, reason: `size mismatch: ${p}` };
     if (frame.size > maxFileBytes) return { ok: false, reason: `oversize frame: ${p}` };
     if (frame.size > remainingBudget) return { ok: false, reason: `oversize total: ${p}` };
+    if (frame.body === 'cached') {
+      if (!cacheEnabled) return { ok: false, reason: `cached body not enabled: ${p}` };
+      if (entry.size < MIN_CACHEABLE_BYTES) return { ok: false, reason: `cached body below minimum size: ${p}` };
+    } else if (cacheEnabled && frame.body !== undefined) {
+      return { ok: false, reason: `unknown body encoding: ${p}` };
+    }
   } else if (frame.target !== entry.target) {
     return { ok: false, reason: `target mismatch: ${p}` };
   }
@@ -323,6 +330,11 @@ export async function readHeaderLine(reader, maxLineBytes = MAX_HEADER_BYTES) {
  * (e.g. `lane remote-exec`, which needs ticketId/repoKey/argv before it can
  * decide where `destDir` even is) can read the header with `readHeaderLine`
  * and then hand the same reader here.
+ *
+ * BRAIN-642: `limits.blobCache = {root, ns, stats}` switches on the runner's blob store: a `body:'cached'` frame (no body bytes,
+ * only for a manifest file of at least MIN_CACHEABLE_BYTES) is copied out of the store using the MANIFEST entry's hash, and a
+ * body frame is published to it. `stats` ({hits, misses, corrupt, published}) is filled in for the caller; `publishOptions` is a test seam. Without it a
+ * `body:'cached'` frame is refused and nothing here changes.
  */
 export async function extractFrames(reader, destDir, expectedManifest, limits = {}) {
   const maxFileBytes = limits.maxFileBytes ?? Infinity;
@@ -342,6 +354,10 @@ export async function extractFrames(reader, destDir, expectedManifest, limits = 
   );
   const seen = new Set();
   let cumulativeBytes = 0;
+  const blobCache = limits.blobCache;
+  const stats = blobCache?.stats;
+  const missing = [];
+  const corrupt = [];
 
   for (;;) {
     let line;
@@ -359,14 +375,32 @@ export async function extractFrames(reader, destDir, expectedManifest, limits = 
     }
     if (frame && frame.end === true) break;
 
-    const check = validateFrame(frame, expectedByPath, seen, symlinkPaths, maxFileBytes, maxTotalBytes - cumulativeBytes);
+    const check = validateFrame(frame, expectedByPath, seen, symlinkPaths, maxFileBytes, maxTotalBytes - cumulativeBytes, !!blobCache);
     if (!check.ok) return check;
     seen.add(frame.path);
 
     const fullPath = path.join(destDir, frame.path);
     fs.mkdirSync(path.dirname(fullPath), { recursive: true });
 
-    if (frame.type === 'file') {
+    if (frame.type === 'file' && frame.body === 'cached') {
+      const entry = expectedByPath.get(frame.path);
+      let result;
+      try {
+        result = materializeBlob(blobCache.root, blobCache.ns, entry, fullPath);
+      } catch (err) {
+        return { ok: false, reason: `open failed: ${frame.path}: ${err.message}` };
+      }
+      if (result.status === 'hit') {
+        stats.hits += 1;
+        cumulativeBytes += frame.size;
+      } else if (result.status === 'corrupt') {
+        stats.corrupt += 1;
+        corrupt.push(frame.path);
+      } else {
+        stats.misses += 1;
+        missing.push(frame.path);
+      }
+    } else if (frame.type === 'file') {
       let bytes;
       try {
         bytes = await reader.readBytes(frame.size);
@@ -391,6 +425,9 @@ export async function extractFrames(reader, destDir, expectedManifest, limits = 
       }
       fs.chmodSync(fullPath, frame.exec ? 0o755 : 0o644);
       cumulativeBytes += frame.size;
+      if (blobCache && frame.size >= MIN_CACHEABLE_BYTES && publishBlob(blobCache.root, blobCache.ns, expectedByPath.get(frame.path), bytes, blobCache.publishOptions) === 'published') {
+        stats.published += 1;
+      }
     } else {
       const escapeCheck = checkExtractSymlinkTarget(frame.path, frame.target, symlinkPaths);
       if (!escapeCheck.ok) return escapeCheck;
@@ -411,6 +448,9 @@ export async function extractFrames(reader, destDir, expectedManifest, limits = 
   } catch (err) {
     return { ok: false, reason: `after terminator: ${err.message}` };
   }
+
+  if (corrupt.length > 0) return { ok: false, reason: `cache-corrupt: ${corrupt.length}` };
+  if (missing.length > 0) return { ok: false, reason: `cache-miss: ${missing.length}` };
 
   return verifyManifestNoGit(destDir, expectedManifest);
 }

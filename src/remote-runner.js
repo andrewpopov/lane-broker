@@ -11,6 +11,7 @@ import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemo
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, RUNNER_NAME_RE, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
 import { CAPABILITIES } from './capabilities.js';
 import { createStrictGunzip, TRANSFER_GZIP } from './remote-gzip.js';
+import { blobNamespace, evictBlobs } from './remote-blobs.js';
 import { reportReadiness } from './runner-readiness.js';
 import { NO_PROGRESS_REASON, SILENCE_REASON } from './no-progress.js';
 import { artifactLimitsOf, collectArtifacts, encodeArtifacts, pruneStaleArtifacts } from './remote-artifacts.js';
@@ -85,6 +86,7 @@ function gitInitSnapshot(workDir) {
   return { ok: true };
 }
 
+const MAX_REPO_IDENTITY_CHARS = 4096;
 const REPO_KEY_RE = /^[A-Za-z0-9._:-]{1,200}$/;
 
 // BRAIN-319: kept well under the platform arg/exec limits, generous for any
@@ -136,6 +138,10 @@ function validateHeaderFields(header) {
   }
   if (typeof header.repoKey !== 'string' || !REPO_KEY_RE.test(header.repoKey)) {
     return { ok: false, reason: 'invalid repoKey' };
+  }
+  // BRAIN-642: only ever hashed (blobNamespace), never a path component
+  if (header.repoIdentity !== undefined && (typeof header.repoIdentity !== 'string' || header.repoIdentity.length === 0 || header.repoIdentity.length > MAX_REPO_IDENTITY_CHARS)) {
+    return { ok: false, reason: 'invalid repoIdentity' };
   }
   if (typeof header.lane !== 'string' || header.lane.length === 0) {
     return { ok: false, reason: 'invalid lane: must be a non-empty string' };
@@ -276,6 +282,8 @@ function buildResult(header, ticketDir, { kind, exit = null, signal = null, remo
     phasesMs,
     // BRAIN-398: additive summary of the stored artifacts; the bytes travel separately (`lane remote-artifacts`)
     artifacts,
+    // BRAIN-642: additive; blob-store hit/miss/corrupt/published counts, present only when this exec used the store
+    blobStats: readJsonSafe(path.join(ticketDir, 'blob-stats.json')) ?? undefined,
   };
 }
 
@@ -338,14 +346,28 @@ function readIfExists(file) {
   }
 }
 
+const brokerLock = (fn) => withLock(stateHome(), fn);
+
 async function collectGarbage(root) {
   try {
     await testHoldAt('remote-gc');
     const cfg = loadGlobalConfig();
     await gcRemoteTickets({ remoteRoot: root, retentionMs: cfg.remoteTicketRetentionMs, maxTickets: cfg.remoteGcMaxTicketsPerRun, maxExamined: cfg.remoteGcMaxExaminedPerRun, remove: removeDetached });
+    // BRAIN-642: the blob store is trimmed here too, bounded and off the dispatch path
+    await evictBlobs(root, { maxBytes: cfg.remoteBlobCacheMaxBytes, maxAgeMs: cfg.remoteBlobCacheMaxAgeMs, lock: brokerLock });
   } catch (err) {
     writeBrokerLog(ensureStateDirs().root, `lane-broker-gc error: ${err.message}\n`);
   }
+}
+
+function blobCacheFor(root, header) {
+  if (typeof header.repoIdentity !== 'string') return undefined;
+  try {
+    if (!loadGlobalConfig().remoteBlobCache) return undefined;
+  } catch {
+    return undefined;
+  }
+  return { root, ns: blobNamespace(header.repoIdentity), stats: { hits: 0, misses: 0, corrupt: 0, published: 0 } };
 }
 
 // Testing hook (README "Testing hooks"): lowers both transfer caps so a bomb test never needs 2 GiB.
@@ -363,7 +385,7 @@ function transferLimitsFromEnv() {
  * one of `<root>/tickets/<ticketId>/result.json` (exit 0) or nothing (exit
  * nonzero) -- see the module-level comment on kind derivation below.
  */
-export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = process.stdin, transfer, transferLimits = transferLimitsFromEnv() } = {}) {
+export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = process.stdin, transfer, transferCache = false, transferLimits = transferLimitsFromEnv() } = {}) {
   const execStartedAt = Date.now();
   // BRAIN-320 review fix A: resolve once, up front -- every path derived
   // below (ticketDir, workDir, and the protocol-2 pipeline argv) is passed
@@ -497,10 +519,15 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   process.env.TMP = tmpDir;
   process.env.TEMP = tmpDir;
   const snapshotStartedAt = Date.now();
+  // BRAIN-642: the blob store is used only when the client asked (`--transfer-cache`), named a repo identity, and this runner's
+  // config allows it; the namespace comes from that identity, never from the stream.
+  const blobCache = transferCache ? blobCacheFor(root, header) : undefined;
   const extractResult = await extractFrames(reader, workDir, header.manifest, {
     maxFileBytes: MAX_FILE_BYTES,
     maxTotalBytes: MAX_TOTAL_BYTES,
+    blobCache,
   });
+  if (blobCache) atomicWriteJson(path.join(ticketDir, 'blob-stats.json'), blobCache.stats);
   if (!extractResult.ok) {
     writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: extractResult.reason }));
     process.stderr.write(`lane remote-exec: ${extractResult.reason}\n`);

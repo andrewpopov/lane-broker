@@ -135,6 +135,11 @@ export const DEFAULT_GLOBAL_CONFIG = {
   remoteRebalanceIntervalMs: 60_000,
   // BRAIN-642: zlib level (1-9) of the gzip stream a submitter sends a runner that lists `snapshot-gzip/1`.
   remoteSnapshotGzipLevel: 3,
+  // BRAIN-642: the runner's content-addressed blob store (used only for a client that sends --transfer-cache). Soft size target,
+  // evicted by age and least-recently-used by the runner's bounded GC.
+  remoteBlobCache: true,
+  remoteBlobCacheMaxBytes: 10 * 1024 * 1024 * 1024,
+  remoteBlobCacheMaxAgeMs: 14 * 24 * 3_600_000,
   remoteRebalanceCooldownMs: 600_000,
   remoteRebalanceMaxMoves: 1,
   // BRAIN-207 (forgiving admission): whether the load gate is allowed to
@@ -385,6 +390,10 @@ function validateGlobalConfig(cfg, sourcePath) {
   }
   assert(Number.isInteger(cfg.remoteRebalanceIntervalMs) && cfg.remoteRebalanceIntervalMs > 0, `${sourcePath}: "remoteRebalanceIntervalMs" must be a positive integer`);
   assert(Number.isInteger(cfg.remoteSnapshotGzipLevel) && cfg.remoteSnapshotGzipLevel >= 1 && cfg.remoteSnapshotGzipLevel <= 9, `${sourcePath}: "remoteSnapshotGzipLevel" must be an integer from 1 to 9`);
+  assert(typeof cfg.remoteBlobCache === 'boolean', `${sourcePath}: "remoteBlobCache" must be a boolean`);
+  for (const field of ['remoteBlobCacheMaxBytes', 'remoteBlobCacheMaxAgeMs']) {
+    assert(Number.isInteger(cfg[field]) && cfg[field] > 0, `${sourcePath}: "${field}" must be a positive integer`);
+  }
   assert(typeof cfg.admissionLoadGate === 'boolean', `${sourcePath}: "admissionLoadGate" must be a boolean`);
   assert(typeof cfg.allocationShadow === 'boolean', `${sourcePath}: "allocationShadow" must be a boolean`);
   assert(Number.isInteger(cfg.simArmWindowMs) && cfg.simArmWindowMs > 0, `${sourcePath}: "simArmWindowMs" must be a positive integer`);
