@@ -125,7 +125,7 @@ export async function cancelAttempt(root, id, attempt) {
     if (!runnerCfg) {
       process.stderr.write(`lane cancel: runner "${name}" is no longer configured; skipping remote-cancel\n`);
       unconfirmed.push(name);
-    } else if (!(await remoteCancel(runnerCfg, id))) {
+    } else if (!(await remoteCancel(runnerCfg, attempt.binding?.ticketId ?? id))) {
       unconfirmed.push(name);
     }
   }

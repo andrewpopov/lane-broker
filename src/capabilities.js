@@ -4,6 +4,7 @@ import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
 import { PRIORITY_CAPABILITY } from './priority.js';
 import { ARTIFACTS_CAPABILITY } from './remote-artifacts.js';
 import { SNAPSHOT_GZIP_CAPABILITY } from './remote-gzip.js';
+import { BLOB_CACHE_CAPABILITY } from './remote-blobs.js';
 import { EXCLUSIVE_CAPABILITY } from './exclusive.js';
 import { LEASE_CHECK_CAPABILITY } from './lease.js';
 import { stateHome } from './state.js';
@@ -45,6 +46,11 @@ export const CAPABILITIES = [
   SNAPSHOT_GZIP_CAPABILITY,
 ];
 
+/** `CAPABILITIES` plus what depends on this runner's config: `blob-cache/1` only while its blob store is enabled. */
+export function advertisedCapabilities(cfg) {
+  return cfg.remoteBlobCache ? [...CAPABILITIES, BLOB_CACHE_CAPABILITY] : CAPABILITIES;
+}
+
 /** `lane capabilities --json`: what this install can do and which scheduler/admission mode it is in. */
 export function capabilitiesCommand({ root = stateHome() } = {}) {
   const pkg = JSON.parse(fs.readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'));
@@ -58,7 +64,7 @@ export function capabilitiesCommand({ root = stateHome() } = {}) {
   const { mode, configHash, stateRoot, valid } = resolveClasses(cfg, root);
   const payload = {
     version: pkg.version,
-    capabilities: CAPABILITIES,
+    capabilities: advertisedCapabilities(cfg),
     schedulerMode: readSchedulerFence(root).status === 'valid' ? 'priority' : 'legacy',
     admissionMode: cfg.schedulerMode,
     classes: { mode, configHash, stateRoot, valid },

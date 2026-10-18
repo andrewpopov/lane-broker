@@ -537,3 +537,79 @@ test('remote-blob-cache: the global config keys have defaults and are validated'
     }
   }
 });
+
+// ---- BRAIN-642 slice C2 review fixes ---------------------------------------------------------------------------------------
+
+test('remote-blob-cache: a non-hex hash or namespace never reaches a path (no unlink outside the store)', async () => {
+  const s = store();
+  const real = big('real');
+  seed(s, entryOf('r.bin', real), real); // the store directories must exist for a traversal to have anywhere to start
+  const victim = path.join(s.root, 'victim');
+  fs.writeFileSync(victim, 'not a blob');
+  const traversal = { path: 'a.bin', sha256: '../victim', size: 3, exec: false };
+  assert.equal(hasBlob(s.root, s.ns, '../victim', 10), 'miss');
+  assert.equal(materializeBlob(s.root, s.ns, traversal, path.join(tmpDir('blob-dest'), 'f')).status, 'miss');
+  assert.equal(hasBlob(s.root, '../..', 'a'.repeat(64), 10), 'miss');
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'not a blob', 'the file outside the store survives');
+
+  // a manifest entry whose hash is not hex cannot even ask for a cached body
+  const entry = { path: 'a.bin', type: 'file', exec: false, size: MIN_CACHEABLE_BYTES + 1, sha256: '../victim' };
+  const r = await extract(s, [cachedFrame(entry)], [entry]);
+  assert.equal(r.res.ok, false);
+  assert.match(r.res.reason, /cached body without a valid sha256/);
+  assert.equal(fs.readFileSync(victim, 'utf8'), 'not a blob');
+});
+
+test('remote-blob-cache: a symlinked blobs/.leases is never read or emptied by eviction bookkeeping', async () => {
+  const s = store();
+  const outside = tmpDir('lease-outside');
+  const stale = path.join(outside, 'x.json');
+  fs.writeFileSync(stale, JSON.stringify({ pid: 2_000_000_000, hashes: [] })); // a dead process: a plain .leases would delete it
+  fs.mkdirSync(path.join(s.root, 'blobs'), { recursive: true });
+  fs.symlinkSync(outside, path.join(s.root, 'blobs', '.leases'));
+  const { leasedHashes } = await import('../src/remote-blobs.js');
+  const { held, blockAll } = leasedHashes(s.root);
+  assert.equal(blockAll, true, 'eviction is blocked while the lease directory is a link');
+  assert.equal(held.size, 0);
+  assert.equal(fs.existsSync(stale), true, 'the file behind the link is untouched');
+});
+
+test('remote-blob-cache: cached frames that miss are charged to the total cap before materialization', async () => {
+  const s = store();
+  const entries = ['a', 'b', 'c'].map((n) => entryOf(`${n}.bin`, big(n)));
+  const items = entries.map(cachedFrame);
+  const total = entries.reduce((sum, e) => sum + e.size, 0);
+  const r = await extract(s, items, entries, { limits: { maxTotalBytes: total - 1 } });
+  assert.equal(r.res.ok, false);
+  assert.match(r.res.reason, /oversize total/, 'the third declared size does not fit once the two misses are charged');
+});
+
+test('remote-blob-cache: remote-exec holds a lease on the manifest hashes while it extracts, and releases it after', async () => {
+  const env = runnerEnv();
+  const root = tmpDir('blob-runner');
+  const buf = big('lease');
+  const entry = entryOf('a.bin', buf);
+  const identity = '/repos/lease/.git';
+  const ns = blobNamespace(identity);
+  seed({ root, ns }, entry, buf);
+  const header = headerOf({ repoIdentity: identity });
+  const bytes = cachedStream(header, [entry], ['a.bin']);
+  const terminator = Buffer.from('{"end":true}\n');
+  const child = spawn(process.execPath, [BIN, 'remote-exec', '--transfer-cache', '--root', root], { env });
+  spawned.push(child);
+  child.stdin.on('error', () => {});
+  const exited = new Promise((resolve) => child.on('close', (code) => resolve(code)));
+  child.stdin.write(bytes.subarray(0, bytes.length - terminator.length)); // everything but the terminator: extraction cannot finish
+  const leasesDir = path.join(root, 'blobs', '.leases');
+  const held = async () => (fs.existsSync(leasesDir) ? fs.readdirSync(leasesDir).filter((n) => n.endsWith('.json')).map((n) => fs.readFileSync(path.join(leasesDir, n), 'utf8')) : []);
+  let seen = [];
+  for (let i = 0; i < 100 && seen.length === 0; i += 1) {
+    seen = await held();
+    if (seen.length === 0) await new Promise((r) => setTimeout(r, 100));
+  }
+  assert.equal(seen.length, 1, 'a lease exists mid-extraction');
+  assert.ok(seen[0].includes(entry.sha256));
+  child.stdin.end(terminator);
+  assert.equal(await exited, 0);
+  assert.deepEqual(await held(), [], 'the lease is released afterwards');
+});

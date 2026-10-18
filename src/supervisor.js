@@ -44,6 +44,7 @@ import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remo
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
 import { REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
 import { SNAPSHOT_GZIP_CAPABILITY, TRANSFER_GZIP } from './remote-gzip.js';
+import { BLOB_CACHE_CAPABILITY } from './remote-blobs.js';
 import { createAttempt, readAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX, hostCpuLoad, ticketCpuEstimate } from './admission.js';
 import { relayedUsage, relayedDeps } from './remote-relay.js';
@@ -968,6 +969,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     const canWithdraw = Array.isArray(probe?.capabilities) && probe.capabilities.includes(REMOTE_WITHDRAW_CAPABILITY);
     // BRAIN-642: re-read per dispatch like the artifacts gate, so a rebalance to a runner without it sends the legacy stream.
     const snapshotGzip = Array.isArray(probe?.capabilities) && probe.capabilities.includes(SNAPSHOT_GZIP_CAPABILITY);
+    const blobCache = globalCfg.remoteBlobCache === true && Array.isArray(probe?.capabilities) && probe.capabilities.includes(BLOB_CACHE_CAPABILITY);
     let target = null;
 
     // BRAIN-320 S1c: `enriched.remote.remoteDeps`/`remoteSetup` ride along in
@@ -977,6 +979,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       ...enriched.remote,
       remoteArtifacts: artifactsSupported ? declaredArtifacts : null,
       transfer: snapshotGzip ? TRANSFER_GZIP : undefined,
+      blobCache,
       gzipLevel: globalCfg.remoteSnapshotGzipLevel,
       artifactLimits: artifactLimitsOf(globalCfg),
       manifest,
@@ -1007,8 +1010,9 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       onSnapshotSent: moves.length > 0 && movingSet ? clearMoving : undefined,
       // BRAIN-515: every dispatch (a rebalance move's second one too) re-persists which runner the snapshot goes to and the
       // identity a result fetched from it must carry; `lane`'s orphan reconcile trusts a runner record only against this.
-      onBinding: async ({ protocol, generation, manifestHash }) =>
-        (await updateAttempt(root, enriched.id, gen, { binding: { protocol, generation, manifestHash, runner: runner.name } })).ok,
+      // `ticketId` differs from the lane id only on a cache repair retry (BRAIN-642), whose runner ticket is a fresh one.
+      onBinding: async ({ protocol, ticketId, generation, manifestHash }) =>
+        (await updateAttempt(root, enriched.id, gen, { binding: { protocol, generation, manifestHash, runner: runner.name, ...(ticketId === enriched.id ? {} : { ticketId }) } })).ok,
       rebalance: rebalanceOn && canWithdraw ? {
         minQueuedMs: globalCfg.remoteRebalanceMinQueuedMs,
         intervalMs: globalCfg.remoteRebalanceIntervalMs,

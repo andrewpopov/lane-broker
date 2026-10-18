@@ -1,11 +1,13 @@
 import { spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 import { buildManifest, RemoteIneligibleError } from './remote-manifest.js';
 import zlib from 'node:zlib';
 import { pipeline } from 'node:stream';
 import { encodeSnapshot, serializeHeader, makeReader, MAX_HEADER_BYTES } from './remote-stream.js';
 import { countBytes, TRANSFER_GZIP, REMOTE_EXEC_NO_TICKET_EXIT } from './remote-gzip.js';
 import { receiveArtifacts, artifactLimitsOf } from './remote-artifacts.js';
-import { DEFAULT_GLOBAL_CONFIG } from './config.js';
+import { DEFAULT_GLOBAL_CONFIG, repoIdentity } from './config.js';
+import { isCacheable, isBlobHash } from './remote-blobs.js';
 import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
 import { isPriorityTier } from './priority.js';
 import { runnerAvailability } from './runner-schedule.js';
@@ -578,6 +580,62 @@ function sleepUnlessAborted(ms, abortSignal) {
   });
 }
 
+/** Below this many cacheable bytes the have-query's round trip costs more than it can save, so every body is sent. */
+export const BLOB_CACHE_MIN_BYTES = 4 * 1024 * 1024;
+/** The runner rejects with exactly these reasons when a `body:'cached'` frame could not be served from its store. */
+const CACHE_REJECT_RE = /^cache-(?:miss|corrupt): \d+$/;
+
+/**
+ * BRAIN-642: ask `runner` (`lane remote-have`, one ssh round trip) which of `hashes` its blob store holds. Resolves the Set of
+ * hashes it has, or null for ANY failure (spawn error, timeout, non-zero exit, a reply that is not `{v:1, have:[valid indices]}`):
+ * the caller then sends every body, so the query can only ever save bytes, never fail a dispatch.
+ */
+export function queryRemoteHave(runner, identity, hashes, { sshBin = 'ssh', deadlineMs = 3000, env, abortSignal } = {}) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(sshBin, sshArgv(runner, buildRemoteCommand(runner, 'remote-have')), { stdio: ['pipe', 'pipe', 'ignore'], env });
+    } catch {
+      resolve(null);
+      return;
+    }
+    let out = '';
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      abortSignal?.removeEventListener('abort', onAbort);
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // already gone
+      }
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(null), deadlineMs);
+    const onAbort = () => finish(null);
+    abortSignal?.addEventListener('abort', onAbort, { once: true });
+    child.stdout.on('data', (d) => {
+      out += d;
+      if (out.length > 4 * 1024 * 1024) finish(null);
+    });
+    child.stdin.on('error', () => {});
+    child.on('error', () => finish(null));
+    child.on('close', (code) => {
+      if (code !== 0) return finish(null);
+      try {
+        const reply = JSON.parse(out.trim());
+        const ok = reply?.v === 1 && Array.isArray(reply.have) && reply.have.every((i) => Number.isInteger(i) && i >= 0 && i < hashes.length);
+        finish(ok ? new Set(reply.have.map((i) => hashes[i])) : null);
+      } catch {
+        finish(null);
+      }
+    });
+    child.stdin.end(JSON.stringify({ v: 1, repoIdentity: identity, hashes }));
+  });
+}
+
 /** `lane remote-result <ticketId>` over ssh, bounded by `deadlineMs`. Returns the parsed
  *  record, `{missing:true}`, or `null` on any transport/parse failure (never throws). */
 export async function fetchRemoteResult(runner, ticketId, sshBin, deadlineMs, env) {
@@ -793,6 +851,14 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
  * the client polls it (5s backoff growing to 30s) for up to `resultWaitMs`.
  */
 export async function dispatchRemote(opts) {
+  const first = await dispatchOnce(opts);
+  if (first.cacheRepair !== true) return first;
+  // BRAIN-642: the runner could not serve a cached body (a miss or a corrupt blob it removed). Exactly ONE repair on the SAME runner:
+  // a fresh ticket id (the runner keeps the rejected ticket's directory), the cache off, every body sent. Never a local fallback.
+  return dispatchOnce({ ...opts, ticketId: crypto.randomUUID(), blobCache: false });
+}
+
+async function dispatchOnce(opts) {
   const {
     runner,
     worktreeRoot,
@@ -818,6 +884,10 @@ export async function dispatchRemote(opts) {
     remoteExclude = null,
     // BRAIN-642: 'gzip' only when the selected runner lists `snapshot-gzip/1` (the caller decides); anything else is the legacy stream.
     transfer,
+    // BRAIN-642: true only when the runner lists `blob-cache/1` AND this client's `remoteBlobCache` is on; the have-query below
+    // still decides whether `--transfer-cache` is sent.
+    blobCache = false,
+    blobCacheMinBytes = BLOB_CACHE_MIN_BYTES,
     gzipLevel = DEFAULT_GLOBAL_CONFIG.remoteSnapshotGzipLevel,
     // Called once the upload settles with { mode, rawBytes, sentBytes }; the log line and history fields are a later slice.
     onTransferStats,
@@ -925,6 +995,25 @@ export async function dispatchRemote(opts) {
   if (isPriorityTier(priorityRequested)) header.priorityRequested = priorityRequested;
   if (Number.isInteger(priorityAccruedMs) && priorityAccruedMs >= 0) header.priorityAccruedMs = priorityAccruedMs;
 
+  // BRAIN-642: the have-query. Any failure or timeout leaves `cached` empty and `transferCache` false: every body is sent, gzip or
+  // plain by the runner's OTHER capability. The two capabilities are independent.
+  let cached = new Set();
+  let transferCache = false;
+  if (blobCache) {
+    const identity = repoIdentity(worktreeRoot);
+    const candidates = manifest.entries.filter(isCacheable);
+    if (identity && candidates.reduce((sum, e) => sum + e.size, 0) >= blobCacheMinBytes) {
+      const hashes = [...new Set(candidates.map((e) => e.sha256))].filter(isBlobHash);
+      const have = await queryRemoteHave(runner, identity, hashes, { sshBin, deadlineMs: deadlines.haveMs ?? 3000, env, abortSignal });
+      if (abortSignal && abortSignal.aborted) return { outcome: 'cancelled' };
+      if (have !== null) {
+        header.repoIdentity = identity;
+        transferCache = true;
+        cached = new Set(candidates.filter((e) => have.has(e.sha256)).map((e) => e.path));
+      }
+    }
+  }
+
   // BRAIN-320 follow-up: reject an oversized header locally, before ever
   // dialing ssh. `serializeHeader` is the exact function `encodeSnapshot`
   // uses for this same line (below), so the byte count checked here can
@@ -959,12 +1048,12 @@ export async function dispatchRemote(opts) {
   // BRAIN-642: pipeline() so an upstream encode error (a file mutated since the manifest) reaches pipeSnapshot and tears every
   // stage down. `transfer` is set only for a runner that lists `snapshot-gzip/1`; otherwise the stream is the legacy one.
   const transferStats = { mode: transfer === TRANSFER_GZIP ? TRANSFER_GZIP : 'plain', rawBytes: 0, sentBytes: 0 };
-  const sendStages = [encodeSnapshot(worktreeRoot, header, manifest.entries), countBytes((n) => { transferStats.rawBytes += n; })];
+  const sendStages = [encodeSnapshot(worktreeRoot, header, manifest.entries, undefined, { cached }), countBytes((n) => { transferStats.rawBytes += n; })];
   if (transfer === TRANSFER_GZIP) sendStages.push(zlib.createGzip({ level: gzipLevel }));
   sendStages.push(countBytes((n) => { transferStats.sentBytes += n; }));
   const snapshotStream = pipeline(...sendStages, () => {});
 
-  const execCommand = buildRemoteCommand(runner, 'remote-exec', transfer === TRANSFER_GZIP ? ['--transfer', TRANSFER_GZIP] : []);
+  const execCommand = buildRemoteCommand(runner, 'remote-exec', [...(transfer === TRANSFER_GZIP ? ['--transfer', TRANSFER_GZIP] : []), ...(transferCache ? ['--transfer-cache'] : [])]);
   const child = spawn(sshBin, sshArgv(runner, execCommand), { stdio: ['pipe', 'pipe', 'pipe'], env });
   if (onStdout) child.stdout.on('data', onStdout);
   if (onStderr) child.stderr.on('data', onStderr);
@@ -1162,7 +1251,8 @@ export async function dispatchRemote(opts) {
     if (confirmedExpiryCancel) return { outcome: 'unconfirmed', reason: classification.reason };
     if (provesNeverStarted(record, expected) && !unconfirmedCancel) {
       // a runner that rejected the ticket on its merits would reject it again elsewhere; one that expired or gave it up in its queue says nothing about another runner
-      return { outcome: 'unconfirmed', reason: classification.reason, neverStarted: true, ...(record.kind === 'unfinished' ? { retryElsewhere: true } : {}) };
+      const cacheRepair = transferCache && record.kind === 'rejected' && CACHE_REJECT_RE.test(record.reason ?? '');
+      return { outcome: 'unconfirmed', reason: classification.reason, neverStarted: true, ...(record.kind === 'unfinished' ? { retryElsewhere: true } : {}), ...(cacheRepair ? { cacheRepair: true } : {}) };
     }
     return { outcome: 'unconfirmed', reason: classification.reason, mayStillBeRunning: true };
   }

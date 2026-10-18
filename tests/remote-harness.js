@@ -75,6 +75,10 @@ export function makeFakeSshBin() {
   const teePath = path.join(probeLogDir, 'exec-stdin.bin');
   const violationsPath = path.join(probeLogDir, 'legacy-violations.log');
   fs.writeFileSync(violationsPath, '');
+  // BRAIN-642 slice C2: the stdin of the last `remote-have`, and every `remote-exec` command string (one per line), in order.
+  const haveLogPath = path.join(probeLogDir, 'have-stdin.json');
+  const execCmdsPath = path.join(probeLogDir, 'exec-cmds.log');
+  fs.writeFileSync(execCmdsPath, '');
   const laneShim = path.join(binDir, 'lane');
   fs.writeFileSync(
     laneShim,
@@ -111,6 +115,27 @@ function exitNow(code) {
   process.exit(code);
 }
 
+if (commandString && commandString.includes('remote-exec')) {
+  try { fs.appendFileSync(${JSON.stringify(execCmdsPath)}, commandString + '\\n'); } catch {}
+}
+
+// BRAIN-642 C2: env knobs. LANE_FAKE_HAVE = fail | hang; LANE_FAKE_AFTER_HAVE = delete:<dir> | corrupt:<dir> | mutate:<file>, applied
+// once the runner has answered a remote-have (the window between the have-answer and the exec).
+function afterHave() {
+  const spec = process.env.LANE_FAKE_AFTER_HAVE;
+  if (!spec) return;
+  const at = spec.indexOf(':');
+  const kind = spec.slice(0, at);
+  const target = spec.slice(at + 1);
+  const flip = (file) => { const b = fs.readFileSync(file); b[0] ^= 0xff; fs.writeFileSync(file, b); };
+  const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => e.name.startsWith('.') ? [] : e.isDirectory() ? walk(dir + '/' + e.name) : [dir + '/' + e.name]);
+  try {
+    if (kind === 'delete') for (const f of walk(target)) fs.rmSync(f, { force: true });
+    else if (kind === 'corrupt') for (const f of walk(target)) { fs.chmodSync(f, 0o600); flip(f); }
+    else if (kind === 'mutate') flip(target);
+  } catch {}
+}
+
 if (destination === 'old-runner' && commandString && commandString.includes('remote-probe')) {
   // BRAIN-320 S1c (1d): simulate a pre-S1a runner (0.6.0) whose remote-probe
   // response has no 'protocols' field at all -- the client must skip it for
@@ -139,7 +164,22 @@ if (destination === 'die-midstream') {
   });
   process.stdin.on('end', finish);
   process.stdin.on('error', finish);
-} else if ((destination === 'no-artifacts' || destination === 'queued-one' || destination === 'strict-legacy') && commandString.includes('remote-probe')) {
+} else if (commandString && commandString.includes('remote-have') && process.env.LANE_FAKE_HAVE === 'fail') {
+  exitNow(255);
+} else if (commandString && commandString.includes('remote-have') && process.env.LANE_FAKE_HAVE === 'hang') {
+  setInterval(() => {}, 1000);
+} else if (commandString && commandString.includes('remote-have')) {
+  const chunks = [];
+  process.stdin.on('data', (c) => chunks.push(c));
+  const child = spawn('sh', ['-c', commandString], { stdio: ['pipe', 'pipe', 'inherit'], env: { ...process.env, LANE_FAKE_RUNNER: '1', LANE_BROKER_HOME: ${JSON.stringify(runnerHome)}, LANE_BROKER_STATE: ${JSON.stringify(runnerState)} } });
+  process.stdin.pipe(child.stdin);
+  child.stdout.pipe(process.stdout);
+  child.on('close', (code) => {
+    try { fs.writeFileSync(${JSON.stringify(haveLogPath)}, Buffer.concat(chunks)); } catch {}
+    if (code === 0) afterHave();
+    exitNow(code == null ? 1 : code);
+  });
+} else if (((destination === 'no-artifacts' || destination === 'queued-one' || destination === 'strict-legacy') || process.env.LANE_FAKE_CAPS_DROP) && commandString.includes('remote-probe')) {
   // BRAIN-398: a runner built before artifacts/1 -- its probe simply lacks the capability.
   // BRAIN-455: 'queued-one' reports one queued ticket whatever the client's own queue holds, so local admission stays free.
   const child = spawn('sh', ['-c', commandString], { stdio: ['ignore', 'pipe', 'inherit'] });
@@ -148,8 +188,10 @@ if (destination === 'die-midstream') {
   child.on('close', () => {
     const probe = JSON.parse(out.trim());
     if (destination === 'no-artifacts') probe.capabilities = probe.capabilities.filter((c) => !c.startsWith('artifacts/'));
-    else if (destination === 'strict-legacy') probe.capabilities = probe.capabilities.filter((c) => !c.startsWith('snapshot-gzip/'));
-    else probe.queued = 1;
+    else if (destination === 'strict-legacy') probe.capabilities = probe.capabilities.filter((c) => !c.startsWith('snapshot-gzip/') && !c.startsWith('blob-cache/'));
+    else if (destination === 'queued-one') probe.queued = 1;
+    // BRAIN-642 C2: LANE_FAKE_CAPS_DROP=snapshot-gzip/,blob-cache/ drops capabilities by prefix on any destination
+    for (const prefix of (process.env.LANE_FAKE_CAPS_DROP || '').split(',').filter(Boolean)) probe.capabilities = probe.capabilities.filter((c) => !c.startsWith(prefix));
     process.stdout.write(\`\${JSON.stringify(probe)}\\n\`);
     exitNow(0);
   });
@@ -313,7 +355,7 @@ if (destination === 'die-midstream') {
   // broker state directly (e.g. pausing it, or pre-seeding a lease) to make
   // it durably busy for a `remote-exec` dispatch, without affecting the
   // client's own state (see the cross-contamination comment above).
-  return { binDir, sshBin, probeLogPath, runnerHome, runnerState, teePath, violationsPath };
+  return { binDir, sshBin, probeLogPath, runnerHome, runnerState, teePath, violationsPath, haveLogPath, execCmdsPath };
 }
 
 export function makeRunner({ ssh, root, name = ssh }) {
@@ -371,7 +413,7 @@ export function makeDispatchArgs(overrides = {}) {
 /** One global config (runners + admission knobs) and one repo config (lane
  *  `remote: true`) per test, sharing a fresh fake-ssh binDir. */
 export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1, cpuCores, remoteQueueTimeoutMs, remoteResultWaitMs, globalExtra = {} } = {}) {
-  const { binDir, probeLogPath, runnerHome, runnerState, teePath, violationsPath } = makeFakeSshBin();
+  const { binDir, probeLogPath, runnerHome, runnerState, teePath, violationsPath, haveLogPath, execCmdsPath } = makeFakeSshBin();
   const runnerRoot = tmpDir('remote-dispatch-runner-root');
   const { home, state, env } = freshEnv(FAST_WAITS);
   const cfg = {
@@ -403,7 +445,7 @@ export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1, cpuCore
   // remote-first: this harness exercises remote mechanics; speed-aware placement (BRAIN-548) has its own tests
   // and would otherwise keep a ticket local once the lane has local history.
   gitFixture(['init', '-q'], repoDir);
-  return { env: { ...env, PATH: `${binDir}${path.delimiter}${env.PATH}` }, home, state, repoDir, runnerRoot, probeLogPath, runnerHome, runnerState, teePath, violationsPath };
+  return { env: { ...env, PATH: `${binDir}${path.delimiter}${env.PATH}` }, home, state, repoDir, runnerRoot, probeLogPath, runnerHome, runnerState, teePath, violationsPath, haveLogPath, execCmdsPath };
 }
 
 /** Number of `remote-probe` calls logged so far (see makeFakeSshBin's `probeLogPath`). */

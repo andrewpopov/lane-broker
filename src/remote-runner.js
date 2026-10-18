@@ -9,9 +9,9 @@ import { pipeline } from 'node:stream/promises';
 import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, readRemoteDrain, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, RUNNER_NAME_RE, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
-import { CAPABILITIES } from './capabilities.js';
+import { advertisedCapabilities } from './capabilities.js';
 import { createStrictGunzip, TRANSFER_GZIP, REMOTE_EXEC_NO_TICKET_EXIT } from './remote-gzip.js';
-import { blobNamespace, evictBlobs } from './remote-blobs.js';
+import { blobNamespace, evictBlobs, acquireBlobLeases, haveBlobs, isBlobHash, isCacheable, HAVE_LEASE_TTL_MS } from './remote-blobs.js';
 import { reportReadiness } from './runner-readiness.js';
 import { NO_PROGRESS_REASON, SILENCE_REASON } from './no-progress.js';
 import { artifactLimitsOf, collectArtifacts, encodeArtifacts, pruneStaleArtifacts } from './remote-artifacts.js';
@@ -522,11 +522,18 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   // BRAIN-642: the blob store is used only when the client asked (`--transfer-cache`), named a repo identity, and this runner's
   // config allows it; the namespace comes from that identity, never from the stream.
   const blobCache = transferCache ? blobCacheFor(root, header) : undefined;
-  const extractResult = await extractFrames(reader, workDir, header.manifest, {
-    maxFileBytes: MAX_FILE_BYTES,
-    maxTotalBytes: MAX_TOTAL_BYTES,
-    blobCache,
-  });
+  // a pid lease on every cacheable manifest hash, under the lock eviction renames under, held until extraction is done
+  const releaseBlobLeases = blobCache ? await acquireBlobLeases(root, header.manifest.entries.filter(isCacheable).map((e) => e.sha256), brokerLock) : undefined;
+  let extractResult;
+  try {
+    extractResult = await extractFrames(reader, workDir, header.manifest, {
+      maxFileBytes: MAX_FILE_BYTES,
+      maxTotalBytes: MAX_TOTAL_BYTES,
+      blobCache,
+    });
+  } finally {
+    await releaseBlobLeases?.();
+  }
   if (blobCache) atomicWriteJson(path.join(ticketDir, 'blob-stats.json'), blobCache.stats);
   if (!extractResult.ok) {
     writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: extractResult.reason }));
@@ -819,6 +826,57 @@ export async function probeCpuHeadroom(root, cfg, heldLeases, { now = Date.now()
   return { cpuCores: headroomAt(preemptible), cpuCoresUndiscounted: headroomAt(0) };
 }
 
+/** The have-query's stdin cap: eight megabytes holds ~120k hashes, far more than any snapshot has cacheable files. */
+export const MAX_HAVE_INPUT_BYTES = 8 * 1024 * 1024;
+
+async function readCapped(stdin, maxBytes) {
+  const chunks = [];
+  let total = 0;
+  for await (const chunk of stdin) {
+    total += chunk.length;
+    if (total > maxBytes) return null;
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks);
+}
+
+/**
+ * `lane remote-have` (BRAIN-642): stdin `{v:1, repoIdentity, hashes:[sha256 hex...]}`, stdout `{v:1, have:[indices into hashes]}`.
+ * A blob is reported only if it passes the store's own existence, ancestor and hash checks. A lease on every queried hash is taken
+ * FIRST (and expires on its own: this process is gone before the run starts), so eviction cannot remove a blob between this
+ * answer and the exec that materializes it. A disabled cache answers an empty `have`.
+ */
+export async function remoteHaveCommand({ root = defaultRemoteRoot(), stdin = process.stdin, stdout = process.stdout } = {}) {
+  const refuse = (message) => {
+    process.stderr.write(`lane remote-have: ${message}\n`);
+    return { exitCode: 2 };
+  };
+  const raw = await readCapped(stdin, MAX_HAVE_INPUT_BYTES);
+  if (raw === null) return refuse(`input over ${MAX_HAVE_INPUT_BYTES} bytes`);
+  let request;
+  try {
+    request = JSON.parse(raw.toString('utf8'));
+  } catch {
+    return refuse('malformed json');
+  }
+  if (!request || request.v !== 1) return refuse('unsupported request version');
+  if (typeof request.repoIdentity !== 'string' || request.repoIdentity.length === 0 || request.repoIdentity.length > MAX_REPO_IDENTITY_CHARS) return refuse('invalid repoIdentity');
+  if (!Array.isArray(request.hashes) || !request.hashes.every(isBlobHash)) return refuse('invalid hashes: each must be a lowercase sha256 hex string');
+  let enabled = false;
+  try {
+    enabled = loadGlobalConfig().remoteBlobCache === true;
+  } catch {
+    // an unreadable config answers as a disabled cache
+  }
+  let have = [];
+  if (enabled && request.hashes.length > 0) {
+    await acquireBlobLeases(root, request.hashes, brokerLock, { ttlMs: HAVE_LEASE_TTL_MS });
+    have = haveBlobs(root, blobNamespace(request.repoIdentity), request.hashes);
+  }
+  stdout.write(`${JSON.stringify({ v: 1, have })}\n`);
+  return { exitCode: 0 };
+}
+
 /** BRAIN-602: how long the probe waits for the broker lock before answering from a lock-free read instead. */
 export const PROBE_LOCK_WAIT_MS = 500;
 
@@ -856,7 +914,7 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot(), measure, 
     protocols: [1, 2],
     ...(status.lockError ? { stale: true, snapshot: 'lockless' } : {}),
     // BRAIN-360: this runner resolves minCpuCores itself, so a submitter may judge fit by the floor
-    capabilities: CAPABILITIES,
+    capabilities: advertisedCapabilities(globalCfg),
     version: pkg.version,
     // BRAIN-380 slice 4: a draining runner takes no new work. `draining` names why; `paused` is also set so a client
     // built before this field skips the runner the way it skips a paused one.

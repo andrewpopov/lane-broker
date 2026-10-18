@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
 import { manifestHashOf, sortEntries, verifyManifestNoGit, isCanonicalRelPath } from './remote-manifest.js';
-import { MIN_CACHEABLE_BYTES, materializeBlob, publishBlob } from './remote-blobs.js';
+import { MIN_CACHEABLE_BYTES, isBlobHash, materializeBlob, publishBlob } from './remote-blobs.js';
 
 const NEWLINE = 0x0a;
 
@@ -107,8 +107,11 @@ export function serializeHeader(header, entries, manifestHash) {
  * file bytes off disk at encode time (re-verified against the manifest via
  * `readVerifiedFile`), in path-sorted order. `readFile(entry)` replaces that
  * disk read when the bytes come from somewhere else (lane-store's blobs).
+ *
+ * BRAIN-642: a path in `cached` (the runner's have-answer) travels as a body-less `body:'cached'` frame. The file is STILL read and
+ * verified here (`readFile`), so one mutated since the manifest was built fails the encode exactly as an uncached one would.
  */
-export function encodeSnapshot(worktreeRoot, header, entries, readFile = (entry) => readVerifiedFile(worktreeRoot, entry)) {
+export function encodeSnapshot(worktreeRoot, header, entries, readFile = (entry) => readVerifiedFile(worktreeRoot, entry), { cached = new Set() } = {}) {
   const manifestHash = manifestHashOf(entries);
   const ordered = sortEntries(entries);
   const headerLine = serializeHeader(header, entries, manifestHash);
@@ -117,8 +120,10 @@ export function encodeSnapshot(worktreeRoot, header, entries, readFile = (entry)
     yield Buffer.from(headerLine, 'utf8');
     for (const entry of ordered) {
       if (entry.type === 'file') {
-        yield Buffer.from(`${JSON.stringify({ path: entry.path, type: 'file', exec: !!entry.exec, size: entry.size })}\n`, 'utf8');
-        yield await readFile(entry);
+        const isCached = cached.has(entry.path);
+        yield Buffer.from(`${JSON.stringify({ path: entry.path, type: 'file', exec: !!entry.exec, size: entry.size, ...(isCached ? { body: 'cached' } : {}) })}\n`, 'utf8');
+        const bytes = await readFile(entry);
+        if (!isCached) yield bytes;
       } else {
         yield Buffer.from(`${JSON.stringify({ path: entry.path, type: 'symlink', target: entry.target })}\n`, 'utf8');
       }
@@ -255,6 +260,7 @@ function validateFrame(frame, expectedByPath, seen, symlinkPaths, maxFileBytes, 
     if (frame.body === 'cached') {
       if (!cacheEnabled) return { ok: false, reason: `cached body not enabled: ${p}` };
       if (entry.size < MIN_CACHEABLE_BYTES) return { ok: false, reason: `cached body below minimum size: ${p}` };
+      if (!isBlobHash(entry.sha256)) return { ok: false, reason: `cached body without a valid sha256: ${p}` };
     } else if (cacheEnabled && frame.body !== undefined) {
       return { ok: false, reason: `unknown body encoding: ${p}` };
     }
@@ -392,6 +398,8 @@ export async function extractFrames(reader, destDir, expectedManifest, limits = 
 
     if (frame.type === 'file' && frame.body === 'cached') {
       const entry = expectedByPath.get(frame.path);
+      // charged up front: a miss or corrupt blob still counts, so no mix of them can step past the total cap
+      cumulativeBytes += frame.size;
       let result;
       try {
         result = materializeBlob(blobCache.root, blobCache.ns, entry, fullPath);
@@ -400,7 +408,6 @@ export async function extractFrames(reader, destDir, expectedManifest, limits = 
       }
       if (result.status === 'hit') {
         stats.hits += 1;
-        cumulativeBytes += frame.size;
       } else if (result.status === 'corrupt') {
         stats.corrupt += 1;
         corrupt.push(frame.path);

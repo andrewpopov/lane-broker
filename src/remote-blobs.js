@@ -14,6 +14,11 @@ import { isProcessAlive, processStartTime } from './process-liveness.js';
  * Every function takes the runner's `root` first. `ns` and `sha` are hex-validated and never raw client strings in a path.
  */
 
+// BRAIN-642: advertised by `lane remote-probe` only while this runner's blob store is enabled; a client sends `--transfer-cache` only to a runner that lists it.
+export const BLOB_CACHE_CAPABILITY = 'blob-cache/1';
+/** A have-query lease outlives its (short-lived) process: it covers the client's 5 minute transfer deadline plus slack. */
+export const HAVE_LEASE_TTL_MS = 10 * 60_000;
+
 /** Smaller files cost more to look up than to send. */
 export const MIN_CACHEABLE_BYTES = 8 * 1024;
 export const DEFAULT_MAX_BYTES = 10 * 1024 * 1024 * 1024;
@@ -41,6 +46,10 @@ export function parseTransferCacheFlag(args) {
 export function blobNamespace(identity) {
   if (typeof identity !== 'string' || identity.length === 0) throw new Error('blob namespace needs a non-empty repo identity');
   return crypto.createHash('sha256').update(`lane-broker-blob-ns/1\0${identity}`).digest('hex').slice(0, 32);
+}
+
+export function isBlobHash(value) {
+  return typeof value === 'string' && SHA_RE.test(value);
 }
 
 export function isCacheable(entry) {
@@ -99,6 +108,8 @@ function unlinkQuiet(file) {
 
 /** Read a blob without following a symlink; `{status:'hit', bytes}`, `'miss'` or `'corrupt'` (the bad blob is removed). */
 function readBlobVerified(root, ns, entry) {
+  // before ANY fs access: an unvalidated hash or namespace is a path component ('../victim') and a mismatch below unlinks it
+  if (!NS_RE.test(ns) || !isBlobHash(entry.sha256)) return { status: 'miss' };
   let shard;
   try {
     shard = validatedShardDir(root, ns, entry.sha256);
@@ -152,6 +163,27 @@ export function materializeBlob(root, ns, entry, destPath) {
   }
   fs.chmodSync(destPath, entry.exec ? 0o755 : 0o644);
   return { status: 'hit' };
+}
+
+/**
+ * The have-query's answer: the indices of `hashes` whose blob is present and intact under `ns`. The size comes from the blob itself
+ * (the query carries only hashes) and `hasBlob` then hashes the content, so a corrupt blob is removed rather than reported. Each
+ * lookup goes through the same lstat-validated ancestors as every other read.
+ */
+export function haveBlobs(root, ns, hashes) {
+  const have = [];
+  hashes.forEach((sha, index) => {
+    let size;
+    try {
+      const shard = validatedShardDir(root, ns, sha);
+      const st = shard === null ? undefined : fs.lstatSync(path.join(shard, sha), { throwIfNoEntry: false });
+      if (st?.isFile()) size = st.size;
+    } catch {
+      return;
+    }
+    if (size !== undefined && hasBlob(root, ns, sha, size) === 'hit') have.push(index);
+  });
+  return have;
 }
 
 function freeBytesOf(root) {
@@ -212,13 +244,14 @@ function ensureLeasesDir(root) {
  * broker lock in production) that eviction renames under, so a run either holds its lease before eviction renames a victim or
  * finds the blob gone (a miss). Returns `async release()`. The lease names this process; a dead process's lease is reaped.
  */
-export async function acquireBlobLeases(root, hashes, lock) {
+export async function acquireBlobLeases(root, hashes, lock, { ttlMs } = {}) {
   const valid = [...new Set(hashes)].filter((h) => SHA_RE.test(h));
   const file = await lock(() => {
     const dir = ensureLeasesDir(root);
     const target = path.join(dir, `${process.pid}-${crypto.randomBytes(6).toString('hex')}.json`);
     const tmp = path.join(dir, `.tmp-${crypto.randomBytes(6).toString('hex')}`);
-    fs.writeFileSync(tmp, JSON.stringify({ pid: process.pid, start: processStartTime(process.pid) ?? null, hashes: valid }));
+    const expiresAt = ttlMs === undefined ? undefined : Date.now() + ttlMs;
+    fs.writeFileSync(tmp, JSON.stringify({ pid: process.pid, start: processStartTime(process.pid) ?? null, hashes: valid, ...(expiresAt === undefined ? {} : { expiresAt }) }));
     fs.renameSync(tmp, target);
     return target;
   });
@@ -227,10 +260,18 @@ export async function acquireBlobLeases(root, hashes, lock) {
   };
 }
 
-/** Hashes held by a live lease. A dead process's lease is removed; an unreadable one blocks eviction until a day old. */
+/** Hashes held by a live lease. A lease with an `expiresAt` (a have-query's: its process is gone before the run starts) lives until then;
+ *  otherwise a dead process's lease is removed; an unreadable one blocks eviction until a day old. */
 export function leasedHashes(root, { now = Date.now() } = {}) {
   const held = new Set();
   const dir = leasesDir(root);
+  // `blobs/` and `blobs/.leases` must be plain directories: through a symlink this function would read and REMOVE files elsewhere.
+  // Eviction is blocked outright until an operator clears the link.
+  for (const d of [blobsDir(root), dir]) {
+    const st = fs.lstatSync(d, { throwIfNoEntry: false });
+    if (!st) return { held, blockAll: false };
+    if (!st.isDirectory()) return { held, blockAll: true };
+  }
   let names;
   try {
     names = fs.readdirSync(dir);
@@ -241,6 +282,10 @@ export function leasedHashes(root, { now = Date.now() } = {}) {
   for (const name of names) {
     if (name.startsWith('.tmp-')) continue;
     const file = path.join(dir, name);
+    if (!fs.lstatSync(file, { throwIfNoEntry: false })?.isFile()) {
+      blockAll = true;
+      continue;
+    }
     let lease;
     try {
       lease = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -254,7 +299,8 @@ export function leasedHashes(root, { now = Date.now() } = {}) {
       blockAll = true;
       continue;
     }
-    if (isProcessAlive(lease.pid, lease.start ?? undefined)) for (const h of lease.hashes) held.add(h);
+    const live = Number.isFinite(lease.expiresAt) ? lease.expiresAt > now : isProcessAlive(lease.pid, lease.start ?? undefined);
+    if (live) for (const h of lease.hashes) held.add(h);
     else fs.rmSync(file, { force: true });
   }
   return { held, blockAll };

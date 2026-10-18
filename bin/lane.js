@@ -17,6 +17,7 @@ import { parseTransferFlag } from '../src/remote-gzip.js';
 import { parseTransferCacheFlag } from '../src/remote-blobs.js';
 import {
   remoteExecCommand,
+  remoteHaveCommand,
   remoteProbeCommand,
   remoteResultCommand,
   remoteCancelCommand,
@@ -365,6 +366,10 @@ async function main() {
         return 2;
       }
       const result = await remoteExecCommand({ root, transfer: flag.transfer, transferCache: cacheFlag.transferCache });
+      return result.exitCode;
+    }
+    case 'remote-have': {
+      const result = await remoteHaveCommand({ root: parseRootFlag(rest) || defaultRemoteRoot() });
       return result.exitCode;
     }
     case 'remote-result': {
