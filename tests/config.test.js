@@ -298,3 +298,41 @@ test('BRAIN-532: hung and idle-credit keys default sensibly and reject bad value
     assert.throws(() => load(bad), ConfigError, JSON.stringify(bad));
   }
 });
+
+// ---- BRAIN-629: localWindow validation ----
+
+function loadWithGlobal(cfg) {
+  const { home } = freshEnv();
+  writeGlobalConfig(home, { version: 1, ...cfg });
+  const prevHome = process.env.LANE_BROKER_HOME;
+  process.env.LANE_BROKER_HOME = home;
+  try {
+    return loadGlobalConfig();
+  } finally {
+    if (prevHome === undefined) delete process.env.LANE_BROKER_HOME;
+    else process.env.LANE_BROKER_HOME = prevHome;
+  }
+}
+const goodSchedule = { timezone: 'America/Los_Angeles', available: [{ days: ['mon', 'tue'], from: '01:00', to: '06:00' }] };
+
+test('localWindow defaults to null and accepts a valid schedule with lane names', () => {
+  assert.equal(loadWithGlobal({}).localWindow, null);
+  const cfg = loadWithGlobal({ localWindow: { schedule: goodSchedule, lanes: ['train', 'e2e'] } });
+  assert.deepEqual(cfg.localWindow.lanes, ['train', 'e2e']);
+});
+
+test('localWindow rejects a bad schedule, empty or non-string lanes, and unknown keys', () => {
+  const bad = [
+    [{ schedule: { ...goodSchedule, timezone: 'Nowhere/Land' }, lanes: ['e2e'] }, /localWindow.*timezone/],
+    [{ schedule: { ...goodSchedule, available: [] }, lanes: ['e2e'] }, /localWindow.*available/],
+    [{ lanes: ['e2e'] }, /localWindow.*schedule/],
+    [{ schedule: goodSchedule, lanes: [] }, /localWindow\.lanes/],
+    [{ schedule: goodSchedule, lanes: [7] }, /localWindow\.lanes/],
+    [{ schedule: goodSchedule }, /localWindow\.lanes/],
+    [{ schedule: goodSchedule, lanes: ['e2e'], extra: 1 }, /unknown key "extra"/],
+    ['always', /localWindow/],
+  ];
+  for (const [localWindow, pattern] of bad) {
+    assert.throws(() => loadWithGlobal({ localWindow }), (err) => err instanceof ConfigError && pattern.test(err.message), JSON.stringify(localWindow));
+  }
+});

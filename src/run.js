@@ -11,7 +11,7 @@ import { resolveTicketConfig, reloadGlobalConfig, isDispatchOnly, resolvePriorit
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
 import { stampPriorityOrigin } from './priority-clock.js';
-import { detectResourceCapacity, leaseResources, resolveTicketResources, capUnapprovedCpu, checkResourceBudget, localSimRefusal, dispatchOnlyRefusal } from './resources.js';
+import { detectResourceCapacity, leaseResources, resolveTicketResources, capUnapprovedCpu, checkResourceBudget, localSimRefusal, dispatchOnlyRefusal, locallyRefusedNow } from './resources.js';
 import { argvFingerprint } from './cpu-estimates.js';
 import { readRows } from './suggest.js';
 import { rightSizedCpuCores } from './right-size.js';
@@ -497,7 +497,7 @@ export async function runCommand({
   // (via `ticket.localRefused`/`ticket.allowLocalSim` below) once/if a
   // remote attempt actually falls back, mirroring how the resource-budget
   // refusal below is skipped here and re-applied on that same fallback path.
-  if (resolved.localRefused && !allowLocalSim && !remoteEligible) {
+  if (locallyRefusedNow({ ...resolved, allowLocalSim }, globalCfg) && !remoteEligible) {
     const refusal = localSimRefusal(resolved.lane, resolved.class);
     process.stderr.write(refusal.message);
     return { exitCode: refusal.exitCode };

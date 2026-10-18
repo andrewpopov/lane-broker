@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { laneRun, writeRepoConfig } from './helpers.js';
+import { paths } from '../src/state.js';
+import { locallyRefusedNow, localWindowAllowing } from '../src/resources.js';
 import { setup as remoteSetup, tmpDir, markerCmd, detachAndWait, resultOf } from './remote-harness.js';
 
 /**
@@ -162,4 +164,81 @@ test('BRAIN-509: a localRefused ticket outlasting remoteQueueTimeoutMs in a busy
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
   assert.equal(resultOf(ctx.state, id).executor, 'remote');
+});
+
+// ---- BRAIN-629: localWindow lets named localRefused lanes run on this machine during a window ----
+
+const ALL_DAYS = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+/** Always open: two windows that together cover every minute of every day. */
+const ALWAYS_OPEN = { timezone: 'UTC', available: [{ days: ALL_DAYS, from: '00:00', to: '23:59' }, { days: ALL_DAYS, from: '23:59', to: '00:00' }] };
+/** Closed today: open only on the days other than today (UTC). */
+const closedToday = () => ({
+  timezone: 'UTC',
+  available: [{ days: ALL_DAYS.filter((d) => d !== ALL_DAYS[(new Date().getUTCDay() + 6) % 7]), from: '00:00', to: '23:59' }],
+});
+
+function setupWindow({ schedule, lanes, ssh = 'down' }) {
+  const ctx = remoteSetup({ ssh });
+  writeRepoConfig(ctx.repoDir, {
+    version: 1,
+    lanes: { e2e: { weight: 1, remote: true, localRefused: true }, sim: { weight: 1, remote: true, localRefused: true, class: 'sim' } },
+  });
+  const cfg = JSON.parse(fs.readFileSync(path.join(ctx.home, 'config.json'), 'utf8'));
+  cfg.localWindow = { schedule, lanes };
+  fs.writeFileSync(path.join(ctx.home, 'config.json'), JSON.stringify(cfg));
+  return ctx;
+}
+
+async function runLane(ctx, lane) {
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', lane, '--detach', '--', ...markerCmd(marker, 0)], ctx.env, ctx.repoDir);
+  return { id, waited, marker };
+}
+
+test('BRAIN-629: in-window + listed lane, no runner can take it: runs locally, and the log says why', async () => {
+  const ctx = setupWindow({ schedule: ALWAYS_OPEN, lanes: ['e2e'] });
+  const { id, waited, marker } = await runLane(ctx, 'e2e');
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
+  assert.equal(resultOf(ctx.state, id).executor, 'local');
+  assert.match(fs.readFileSync(paths(ctx.state).admissionLog, 'utf8'), /running locally \(localWindow 00:00-23:59, 23:59-00:00\)/);
+});
+
+test('BRAIN-629 + BRAIN-634: a dispatch-only host ignores an open window: listed lane exits 76, never ran', async () => {
+  const ctx = setupWindow({ schedule: ALWAYS_OPEN, lanes: ['e2e'] });
+  const file = path.join(ctx.home, 'config.json');
+  fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), localExecution: 'refused' }));
+  const { waited, marker } = await runLane(ctx, 'e2e');
+  assert.equal(waited.code, 76, `stderr: ${waited.stderr}`);
+  assert.equal(fs.existsSync(marker), false);
+});
+
+test('BRAIN-629: in-window + unlisted lane (sim): still refused, exit 76, never ran', async () => {
+  const ctx = setupWindow({ schedule: ALWAYS_OPEN, lanes: ['e2e'] });
+  const { waited, marker } = await runLane(ctx, 'sim');
+  assert.equal(waited.code, 76, `stderr: ${waited.stderr}`);
+  assert.equal(fs.existsSync(marker), false);
+});
+
+test('BRAIN-629: out-of-window + listed lane: refused exactly as before (exit 76, never ran)', async () => {
+  const ctx = setupWindow({ schedule: closedToday(), lanes: ['e2e'] });
+  const { waited, marker } = await runLane(ctx, 'e2e');
+  assert.equal(waited.code, 76, `stderr: ${waited.stderr}`);
+  assert.equal(fs.existsSync(marker), false);
+});
+
+test('BRAIN-629: locallyRefusedNow follows the clock: closed at 00:50, open at 01:00, closed again at 06:01', () => {
+  const globalCfg = {
+    localWindow: { schedule: { timezone: 'UTC', available: [{ days: ALL_DAYS, from: '01:00', to: '06:00' }] }, lanes: ['e2e'] },
+  };
+  const e2e = { lane: 'e2e', localRefused: true, allowLocalSim: false };
+  const at = (hhmm) => Date.parse(`2026-10-19T${hhmm}:00Z`);
+  assert.equal(locallyRefusedNow(e2e, globalCfg, at('00:50')), true);
+  assert.equal(locallyRefusedNow(e2e, globalCfg, at('01:00')), false);
+  assert.equal(localWindowAllowing(e2e, globalCfg, at('01:00')), '01:00-06:00');
+  assert.equal(locallyRefusedNow(e2e, globalCfg, at('05:59')), false);
+  assert.equal(locallyRefusedNow(e2e, globalCfg, at('06:01')), true);
+  assert.equal(locallyRefusedNow({ ...e2e, lane: 'sim' }, globalCfg, at('03:00')), true, 'an unlisted lane stays refused in the window');
+  assert.equal(locallyRefusedNow({ ...e2e, localRefused: false }, globalCfg, at('00:50')), false);
+  assert.equal(locallyRefusedNow(e2e, { localWindow: null }, at('03:00')), true);
 });

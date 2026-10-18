@@ -125,6 +125,9 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // BRAIN-623: the oldest lane-broker release a runner may run and still be placed on ("X.Y.Z"); a runner reporting less (or no)
   // version is skipped. null = no floor.
   runnerVersionFloor: null,
+  // BRAIN-629: null, or `{ schedule, lanes }`: during `schedule` (a runner-style schedule on this machine's clock) the named
+  // remote-eligible `localRefused` lanes may run on THIS machine. Outside it, and for every unlisted lane, nothing changes.
+  localWindow: null,
   // BRAIN-597: a runner whose first failed contact (runner-unreachable.json, kept fresh by `lane runner watch`) is at least this old is
   // skipped by placement without being probed. 0 disables the skip.
   runnerDownAfterMs: 300_000,
@@ -381,6 +384,17 @@ function validateGlobalConfig(cfg, sourcePath) {
   );
   assert(Number.isInteger(cfg.runnerLostAfterMs) && cfg.runnerLostAfterMs >= 0, `${sourcePath}: "runnerLostAfterMs" must be a non-negative integer`);
   assert(cfg.runnerVersionFloor === null || (typeof cfg.runnerVersionFloor === 'string' && VERSION_FLOOR_RE.test(cfg.runnerVersionFloor)), `${sourcePath}: "runnerVersionFloor" must be null or a version like "0.49.0"`);
+  if (cfg.localWindow !== null) {
+    const win = cfg.localWindow;
+    assert(win && typeof win === 'object' && !Array.isArray(win), `${sourcePath}: "localWindow" must be null or an object`);
+    for (const key of Object.keys(win)) assert(['schedule', 'lanes'].includes(key), `${sourcePath}: "localWindow" has unknown key "${key}"`);
+    const problem = scheduleProblem(win.schedule);
+    assert(problem === null, `${sourcePath}: "localWindow": ${problem}`);
+    assert(
+      Array.isArray(win.lanes) && win.lanes.length > 0 && win.lanes.every((l) => typeof l === 'string' && l.length > 0),
+      `${sourcePath}: "localWindow.lanes" must be a non-empty array of lane names`,
+    );
+  }
   assert(Number.isInteger(cfg.runnerDownAfterMs) && cfg.runnerDownAfterMs >= 0, `${sourcePath}: "runnerDownAfterMs" must be a non-negative integer`);
   assert(Number.isInteger(cfg.remoteProbeDeadlineMs) && cfg.remoteProbeDeadlineMs > 0 && cfg.remoteProbeDeadlineMs <= MAX_TIMER_MS, `${sourcePath}: "remoteProbeDeadlineMs" must be a positive integer no larger than ${MAX_TIMER_MS} (a larger Node timer overflows to 1 ms)`);
   for (const field of ['remoteRebalanceMinQueuedMs', 'remoteRebalanceCooldownMs', 'remoteRebalanceMaxMoves']) {

@@ -35,7 +35,7 @@ import { starvedStaleMs } from './external-cpu.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, priorityOf, resolveLaneNice, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
-import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, dispatchOnlyRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
+import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, dispatchOnlyRefusal, locallyRefusedNow, localWindowAllowing, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
@@ -497,9 +497,9 @@ function migrationRefusalResult(ticket) {
  *  whether the ticket carries a queue timeout (which exists only to enable a local fallback). */
 function localIneligibilityOf(enriched, globalCfg) {
   // BRAIN-634: a dispatch-only host can never run anything; every caller treats that as "no local fallback" (no queue timeout,
-  // no local-first, no speed-aware local choice, wait on a busy runner).
+  // no local-first, no speed-aware local choice, wait on a busy runner). It wins over a BRAIN-629 localWindow.
   if (isDispatchOnly(globalCfg)) return dispatchOnlyRefusal(enriched.lane);
-  if (enriched.localRefused && !enriched.allowLocalSim) return localSimRefusal(enriched.lane, enriched.class);
+  if (locallyRefusedNow(enriched, globalCfg)) return localSimRefusal(enriched.lane, enriched.class);
   const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host: detectResourceCapacity() });
   return budget.ok ? null : budget;
 }
@@ -582,7 +582,7 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
     ...(Object.keys(downRunners).length > 0 ? { downRunners } : {}),
     deadlineMs: globalCfg.remoteProbeDeadlineMs,
     // BRAIN-602: a lane this machine refuses has nowhere else to go, so a busy-but-up runner's timed-out probe is retried once
-    ...(enriched.localRefused && !enriched.allowLocalSim ? { retryTimedOut: heartbeatUpRunners(root, globalCfg) } : {}),
+    ...(isDispatchOnly(globalCfg) || locallyRefusedNow(enriched, globalCfg) ? { retryTimedOut: heartbeatUpRunners(root, globalCfg) } : {}),
     maxRemoteQueue: globalCfg.maxRemoteQueue,
     requireProtocol2: needsProtocol2(enriched.remote) || Boolean(queueTimeoutFor(enriched, globalCfg)),
     requireCapabilities: isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : [],
@@ -750,8 +750,14 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     }
 
     const dispatchOnly = isDispatchOnly(globalCfg);
-    const refusedHere = dispatchOnly || (enriched.localRefused && !enriched.allowLocalSim);
-    const skipLine = `lane: remote-skip: ${runner ? runner.name : 'none'}: ${reason} — ${dispatchOnly ? 'not running locally (localExecution refused)' : refusedHere ? 'not running locally (localRefused)' : 'running locally'}\n`;
+    const refusedHere = dispatchOnly || locallyRefusedNow(enriched, globalCfg);
+    const windowLabel = !refusedHere && enriched.localRefused && !enriched.allowLocalSim ? localWindowAllowing(enriched, globalCfg) : null;
+    const where = dispatchOnly
+      ? 'not running locally (localExecution refused)'
+      : refusedHere
+        ? 'not running locally (localRefused)'
+        : `running locally${windowLabel ? ` (localWindow ${windowLabel})` : ''}`;
+    const skipLine = `lane: remote-skip: ${runner ? runner.name : 'none'}: ${reason} — ${where}\n`;
     process.stderr.write(skipLine);
     writeBrokerLog(root, skipLine);
 
