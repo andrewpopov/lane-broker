@@ -1397,7 +1397,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // BRAIN-627: the nice this ticket will run at (its lane's own, else its ADMITTED tier's, else laneNice), recorded on the lease below.
     // Both the process discount here and the held-lease discount in admission judge the candidate at it.
     const admittedTier = priorityOf(queue[position]);
-    const startNice = effectiveNice(resolveLaneNice(ticket, admittedTier, cfg), os.getPriority());
+    const startNice = effectiveNice(resolveLaneNice(ticket, admittedTier, cfg), shadowSeams.currentNice ?? os.getPriority());
     const cpuSample = sampleCpuSafe(root, cpuSampler, cfg.sampleMs / 2, {
       laneNice: startNice,
       niceMin: cfg.preemptibleNiceMin,

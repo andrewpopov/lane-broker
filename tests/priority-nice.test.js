@@ -131,14 +131,16 @@ async function niceOfFirstLease(args, globalCfg, laneCfg) {
 
 test('a real high lane runs at priorityNice.high and records it on the lease; a medium lane runs at laneNice', async () => {
   const high = await niceOfFirstLease(['--priority', 'high'], { laneNice: 12, priorityNice: { high: 4 } });
-  assert.deepEqual(high, { leaseNice: 4, ps: 4 });
+  const at = (target) => effectiveNice(target, os.getPriority());
+  assert.deepEqual(high, { leaseNice: at(4), ps: at(4) });
   const medium = await niceOfFirstLease([], { laneNice: 12, priorityNice: { high: 4 } });
-  assert.deepEqual(medium, { leaseNice: 12, ps: 12 });
+  assert.deepEqual(medium, { leaseNice: at(12), ps: at(12) });
 });
 
 test('a lane\'s own nice beats priorityNice for a high lane', async () => {
   const r = await niceOfFirstLease(['--priority', 'high'], { laneNice: 12, priorityNice: { high: 4 } }, { nice: 8 });
-  assert.deepEqual(r, { leaseNice: 8, ps: 8 });
+  const want = effectiveNice(8, os.getPriority());
+  assert.deepEqual(r, { leaseNice: want, ps: want });
 });
 
 // the scheduler wiring: the tier comes from the queue record, the held leases from the lease files
@@ -148,11 +150,11 @@ const fullSampler = () => ({ hostBusyCores: 0, cores: 8, stale: false, sampledAt
 const heldAt = (id, tier, nice) => ({ id, key: `other:${id}`, bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight: 1, resources: { cpuCores: 4 }, priorityAdmitted: tier, ...(nice === undefined ? {} : { nice }), state: LEASE_STATE.RUNNING });
 const queued = (id, priorityRequested) => ({ id, key: `r:${id}`, weight: 1, resources: { cpuCores: 4 }, cwd: process.cwd(), cmd: ['true'], supervisorPid: process.pid, supervisorStart: null, logPath: '/dev/null', resultPath: '/dev/null', priorityRequested });
 
-async function pollAgainst(held, ticket) {
+async function pollAgainst(held, ticket, currentNice = 0) {
   const { state } = freshEnv();
   for (const l of held) writeLease(state, l);
   await enqueue(state, ticket);
-  return tryStart(state, ticket, schedCfg, undefined, fullSampler, () => schedCfg, () => null);
+  return tryStart(state, ticket, schedCfg, undefined, fullSampler, () => schedCfg, () => null, undefined, { currentNice });
 }
 
 test('tryStart: a high ticket starts at nice 5 over medium/low leases that fill the budget; a medium ticket is denied', async () => {
@@ -180,12 +182,14 @@ test('effectiveNice and the spawn increment: `nice -n` adds to the supervisor\'s
   const cmd = ['sleep', '2'];
   assert.deepEqual(resolveNicedSpawn({ nice: 5, cmd }, 0), ['/usr/bin/nice', ['-n', '5', 'sleep', '2']]);
   assert.deepEqual(resolveNicedSpawn({ nice: 15, cmd }, 10), ['/usr/bin/nice', ['-n', '5', 'sleep', '2']], 'increment = effective - current');
-  assert.deepEqual(resolveNicedSpawn({ nice: effectiveNice(5, 10), cmd }, 10), ['sleep', ['2']], 'no wrapper when already there');
+  assert.deepEqual(resolveNicedSpawn({ nice: effectiveNice(5, 10), cmd }, 10), ['/usr/bin/nice', ['-n', '0', 'sleep', '2']], 'increment 0 keeps the wrapper (it reports a missing command as 127)');
+  assert.deepEqual(resolveNicedSpawn({ nice: 0, cmd }, 0), ['sleep', ['2']]);
+  assert.deepEqual(resolveNicedSpawn({ nice: 10, cmd }, 10, 0), ['sleep', ['2']], 'a configured nice 0 never wraps, even when the supervisor is niced');
 });
 
 test('tryStart records the nice the lane really runs at: the target raised to the supervisor\'s own nice', async () => {
-  const lowered = await pollAgainst([], queued('hi', 'high'));
-  assert.equal(lowered.lease.nice, effectiveNice(5, os.getPriority()));
+  assert.equal((await pollAgainst([], queued('hi', 'high'), 0)).lease.nice, 5);
+  assert.equal((await pollAgainst([], queued('hi', 'high'), 10)).lease.nice, 10, 'a supervisor at nice 10 cannot run a lane below it');
 });
 
 test('tryStart: a high backfill protecting a reserved head gets NO lease discount', async () => {
@@ -199,7 +203,7 @@ test('tryStart: a high backfill protecting a reserved head gets NO lease discoun
   const jun = { ...queued('jun', 'high'), key: 'jun:default', resources: { cpuCores: 3 } };
   await enqueue(state, jun);
   const sampler = () => ({ hostBusyCores: 0, cores: 10, stale: false, sampledAt: Date.now() });
-  const result = await tryStart(state, jun, cfg, undefined, sampler, () => cfg, () => null);
+  const result = await tryStart(state, jun, cfg, undefined, sampler, () => cfg, () => null, undefined, { currentNice: 0 });
   assert.equal(result.started, false, JSON.stringify(result));
   assert.equal(result.cpuReason, 'projected-over-budget');
 });

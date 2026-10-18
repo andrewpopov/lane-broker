@@ -33,7 +33,7 @@ import { expectedRunMs } from './estimates-history.js';
 import { speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, externalCpuSlots, DEFAULT_REMOTE_OVERHEAD_MS } from './speed-placement.js';
 import { starvedStaleMs } from './external-cpu.js';
 import { effectiveNow } from './priority-clock.js';
-import { isPriorityTier, priorityAuditOf, waitedMs } from './priority.js';
+import { isPriorityTier, priorityAuditOf, priorityOf, resolveLaneNice, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
 import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness } from './runner-unreachable.js';
@@ -317,11 +317,12 @@ function backpressureGate(source) {
  * all, so a niceless lane pays nothing extra. Split out as its own function
  * so the wrapping decision is unit-testable without spawning a real process.
  */
-export function resolveNicedSpawn(ticket, currentNice = 0) {
+export function resolveNicedSpawn(ticket, currentNice = 0, target = ticket.nice) {
   const nice = Number.isInteger(ticket.nice) && ticket.nice >= 0 ? ticket.nice : 0;
+  // `target` is the nice the lane was configured for, before being raised to the supervisor's own: a configured 0 never wraps
   // `nice -n` is an increment on this process's own nice (BRAIN-627): ticket.nice is the absolute value the lane runs at
-  const increment = nice - currentNice;
-  if (increment > 0) return ['/usr/bin/nice', ['-n', String(increment), ...ticket.cmd]];
+  // the wrapper stays whenever the target is above 0, even at increment 0: it is what reports a missing command as 127
+  if (Number.isInteger(target) && target > 0) return ['/usr/bin/nice', ['-n', String(Math.max(0, nice - currentNice)), ...ticket.cmd]];
   return [ticket.cmd[0], ticket.cmd.slice(1)];
 }
 
@@ -1523,7 +1524,7 @@ async function main() {
   }
 
   const startedAt = Date.now();
-  const [cmd, args] = resolveNicedSpawn({ ...ticket, nice: started.lease.nice ?? ticket.nice }, os.getPriority());
+  const [cmd, args] = resolveNicedSpawn({ ...ticket, nice: started.lease.nice ?? ticket.nice }, os.getPriority(), resolveLaneNice(ticket, priorityOf(started.lease), globalCfg));
   const child = spawn(cmd, args, {
     cwd: ticket.cwd,
     detached: true,
