@@ -364,6 +364,21 @@ export function noRunnerRefusal(lane, reason) {
   };
 }
 
+/**
+ * BRAIN-634: `localExecution: "refused"` makes this host dispatch-only. `retryable` is a ticket that could go remote but no runner
+ * can take it now (exit 76); otherwise it can never go remote from here (exit 69).
+ */
+export function dispatchOnlyRefusal(lane, { retryable = false, reason } = {}) {
+  const detail = reason ? ` (${reason})` : '';
+  return {
+    ok: false,
+    exitCode: retryable ? NO_RUNNER_EXIT_CODE : LOCAL_REFUSED_EXIT_CODE,
+    message: retryable
+      ? `lane run: localExecution is refused on this host (dispatch-only) and no runner can take lane "${lane}" now${detail}. Retry later.\n`
+      : `lane run: localExecution is refused on this host (dispatch-only) and lane "${lane}" cannot run on a runner${detail}.\n`,
+  };
+}
+
 export function evaluateMemoryAdmission({ memoryInfo, heldLeases, candidateResources, cfg, now = Date.now() }) {
   if (!memoryInfo || !Number.isFinite(memoryInfo.availableBytes)) {
     return { admit: false, reason: 'memory-unavailable', projectedAvailableBytes: null, memoryBudgetBytes: null };

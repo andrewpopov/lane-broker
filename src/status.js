@@ -334,6 +334,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     },
     externalCpu,
     paused,
+    ...(cfg.localExecution === 'refused' ? { localExecution: 'refused' } : {}),
     draining,
     remoteDrain,
     exclusiveHold: exclusiveHoldView(queue, held),
@@ -609,6 +610,7 @@ export function renderStatusText(status) {
     const h = status.exclusiveHold;
     lines.push(`HOLD (exclusive) ${h.id} (${h.key}) waiting for ${h.waitingFor} running lane(s)`);
   }
+  if (status.localExecution === 'refused') lines.push('local execution: refused (dispatch-only host)');
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
   lines.push(renderRemoteDrainLine(status.remoteDrain, { running: status.running.length, queued: status.queued.length }));
   if (status.configError) lines.push(`config: global config unreadable: ${status.configError}`);

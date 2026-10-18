@@ -20,6 +20,8 @@ export const ATTEMPT_LOGPATH_CAPABILITY = 'attempt-logpath/1';
 // BRAIN-520: `lane drain`/`undrain`; a probe may carry `remoteDrain`. Informational: selection keys off the probe field.
 export const REMOTE_DRAIN_CAPABILITY = 'remote-drain/1';
 // BRAIN-518: `lane priority` re-tiers a ticket still queued on this runner; a submitter checks this before sending one.
+// BRAIN-634: advertised only while the global config sets `localExecution: "refused"`.
+export const DISPATCH_ONLY_CAPABILITY = 'dispatch-only/1';
 export const QUEUE_RETIER_CAPABILITY = 'queue-retier/1';
 
 // BRAIN-597: `lane runner watch|status`, the runner heartbeat feeding runner-unreachable.json.
@@ -56,7 +58,7 @@ export function capabilitiesCommand({ root = stateHome() } = {}) {
   const { mode, configHash, stateRoot, valid } = resolveClasses(cfg, root);
   const payload = {
     version: pkg.version,
-    capabilities: CAPABILITIES,
+    capabilities: cfg.localExecution === 'refused' ? [...CAPABILITIES, DISPATCH_ONLY_CAPABILITY] : CAPABILITIES,
     schedulerMode: readSchedulerFence(root).status === 'valid' ? 'priority' : 'legacy',
     admissionMode: cfg.schedulerMode,
     classes: { mode, configHash, stateRoot, valid },
