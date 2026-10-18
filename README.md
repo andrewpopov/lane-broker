@@ -355,7 +355,7 @@ form: an undeclared `--lane` name still keeps its own key and name (the
 same-key exclusivity rule above is unaffected — two sessions using the same
 ad-hoc name still conflict with each other), but instead of the no-config-file
 default it inherits `weight`, `cpuCores`, `minCpuCores`, `memoryBytes`, `nice`, `remote`,
-`remoteDeps`, `remoteSetup`, `remoteOmitEscapingSymlinks`, `remoteArtifacts` and `remoteArtifactsOn` from the named declared lane. It does NOT
+`requires`, `remoteDeps`, `remoteSetup`, `remoteOmitEscapingSymlinks`, `remoteArtifacts` and `remoteArtifactsOn` from the named declared lane. It does NOT
 inherit that lane's own named `conflicts` entries or its `maxConcurrent`
 (stays `1`) — only the `*` wildcard universe still reaches it, same as plain
 `"allow"`. The named lane must be declared and must not be `localRefused`.
@@ -459,7 +459,8 @@ What a remote run does:
    hard deadline each, default 10 s) and keep those that are reachable, speak the protocol the
    lane needs (below), are not paused, have no queue, could ever fit the
    lane's reservation (weight, CPU budget, memory plus its reserve, from the
-   runner's static capacity) **and have real room right now**: the probe's
+   runner's static capacity), **have every executable the lane `requires`**
+   (below) **and have real room right now**: the probe's
    `headroom` (BRAIN-506: the room this runner's own admission would see for
    a ticket at the default `laneNice`, `budget − projectBusy` over its held
    leases with the same `leaseDemand` charges and preemptible discount, via
@@ -650,6 +651,29 @@ repo's own gate needs there (for example the Playwright browsers its tests
 launch). A snapshot carries no `node_modules` and no build output, so a
 lane whose command needs them either installs them itself (as a pre-push
 gate usually does) or declares them (below).
+
+### Tools a lane needs on the runner (`requires`, BRAIN-623)
+
+A lane (and, as a default for every lane, the repo) may name executables a runner must have on its `PATH`:
+
+```json
+{ "version": 1, "requires": ["rg"], "lanes": { "shard": { "weight": 2, "remote": true, "requires": ["poetry"] } } }
+```
+
+`requires` is an array of executable names (letters, digits, `.` `_` `+` `-`; no paths); the lane's set is the repo's plus its own,
+and an `undeclaredLanes: {"as": ...}` lane inherits the template's. Anything else (a string, a non-string entry, a path) is a config error
+naming the field.
+
+The submitter sends the names in the runner probe it already makes (`lane remote-probe --requires rg,poetry`); the runner answers
+`tools: {"rg": true, "poetry": false}`, resolving each against the `PATH` of the login shell the probe ran in. A runner lacking one is
+skipped for that lane only (`remote-skip` / the selection reason reads `missing tool poetry (required by the lane)`), and `lane status`
+shows `not ready: missing poetry (<age> ago)` on that runner until a placement passes it again. A runner older than 0.47.0 ignores the
+flag and answers no `tools`, so it counts as **not ready** for a lane with `requires` (it cannot vouch for the tool); a lane without
+`requires` sends the probe command it always did and is unaffected.
+
+With no eligible runner a remote-eligible lane runs locally (the local machine is not checked for the tool), and a remote-only
+(`localRefused`) lane exits `76` ("no runner can take it now", retryable) with the message naming each runner and its reason.
+The check list lives in `src/runner-readiness.js` (`READINESS_CHECKS`); further readiness checks are added there.
 
 ### Dependencies and setup on the runner (BRAIN-320)
 

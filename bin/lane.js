@@ -23,6 +23,7 @@ import {
   remoteArtifactsReleaseCommand,
   defaultRemoteRoot,
 } from '../src/remote-runner.js';
+import { parseReadinessArgs } from '../src/runner-readiness.js';
 import { gcCommand } from '../src/gc.js';
 import { loadGlobalConfig } from '../src/config.js';
 import { runnerWatchCommand, runnerStatusCommand } from '../src/runner-watch.js';
@@ -346,7 +347,7 @@ async function main() {
     // BRAIN-319 T2: hidden runner-side subcommands, invoked by a client Mac
     // over ssh — deliberately not listed in usage() above.
     case 'remote-probe': {
-      const result = await remoteProbeCommand({ root: parseRootFlag(rest) || defaultRemoteRoot() });
+      const result = await remoteProbeCommand({ root: parseRootFlag(rest) || defaultRemoteRoot(), needs: parseReadinessArgs(rest) });
       return result.exitCode;
     }
     case 'remote-exec': {

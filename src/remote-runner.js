@@ -10,6 +10,7 @@ import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartT
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, RUNNER_NAME_RE, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
 import { CAPABILITIES } from './capabilities.js';
+import { reportReadiness } from './runner-readiness.js';
 import { NO_PROGRESS_REASON, SILENCE_REASON } from './no-progress.js';
 import { artifactLimitsOf, collectArtifacts, encodeArtifacts, pruneStaleArtifacts } from './remote-artifacts.js';
 import { remotePriorityFrom } from './priority.js';
@@ -778,7 +779,7 @@ export const PROBE_LOCK_WAIT_MS = 500;
  *  BRAIN-602: the lock is only taken to reap stale leases, so a busy runner whose lock is held answers after PROBE_LOCK_WAIT_MS from
  *  the lease/queue/gate files as they are (each written by atomic rename, so each file is consistent but the set may be a moment
  *  apart, and dead leases are not reaped) and says so with `stale: true, snapshot: "lockless"`. */
-export async function remoteProbeCommand({ root = defaultRemoteRoot(), measure } = {}) {
+export async function remoteProbeCommand({ root = defaultRemoteRoot(), measure, needs = {} } = {}) {
   pruneStaleArtifacts(path.join(path.resolve(root), 'tickets'));
   const status = await collectStatus({ lockTimeoutMs: PROBE_LOCK_WAIT_MS });
   const pkgPath = fileURLToPath(new URL('../package.json', import.meta.url));
@@ -815,6 +816,8 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot(), measure }
     ...(remoteDrain ? { remoteDrain } : {}),
     paused: Boolean(status.paused) || draining || Boolean(configError),
     ...(configError ? { configError } : {}),
+    // BRAIN-623: answers to the submitter's readiness needs (`--requires` ...); an older runner sends none, which the submitter reads as not ready
+    ...reportReadiness(needs),
     queued: status.queued.length,
     running: status.running.length,
     // BRAIN-360: additive; the CPU the runner's leases are charged (grants, not declarations)

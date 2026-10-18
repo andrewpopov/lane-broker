@@ -679,6 +679,7 @@ export async function runCommand({
       // BRAIN-320 S1a: carried through so the supervisor's eligibility hook
       // and (later slice) dispatchRemote's protocol-2 header see exactly what
       // this process resolved, not a re-derived value.
+      requires: resolved.requires,
       remoteDeps: resolved.remoteDeps,
       remoteSetup: resolved.remoteSetup,
       remoteDepsCache: resolved.remoteDepsCache,
