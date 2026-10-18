@@ -1,13 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneSpawn, waitFor } from './helpers.js';
 import { evaluateCpuAdmission, formatAdmissionLog } from '../src/admission.js';
 import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig, ConfigError } from '../src/config.js';
-import { resolveLaneNice } from '../src/priority.js';
-import { paths } from '../src/state.js';
+import { resolveLaneNice, effectiveNice } from '../src/priority.js';
+import { resolveNicedSpawn } from '../src/supervisor.js';
+import { paths, atomicWriteJson } from '../src/state.js';
 import { readLease, writeLease, LEASE_STATE } from '../src/lease.js';
 import { enqueue, tryStart } from '../src/scheduler.js';
 import { bootId } from '../src/state.js';
@@ -167,4 +169,37 @@ test('tryStart: leases with no recorded nice are charged in full, so the high ti
   const high = await pollAgainst([heldAt('m', 'medium'), heldAt('l', 'low')], queued('hi', 'high'));
   assert.equal(high.started, false);
   assert.equal(high.cpuReason, 'projected-over-budget');
+});
+
+test('effectiveNice and the spawn increment: `nice -n` adds to the supervisor\'s own nice, so the record is the real one', () => {
+  assert.equal(effectiveNice(5, 0), 5);
+  assert.equal(effectiveNice(5, 10), 10, 'a supervisor at nice 10 cannot run a lane below it');
+  assert.equal(effectiveNice(15, 10), 15);
+  assert.equal(effectiveNice(19, 15), 19);
+  assert.equal(effectiveNice(0, 25), 19, 'clamped to 19');
+  const cmd = ['sleep', '2'];
+  assert.deepEqual(resolveNicedSpawn({ nice: 5, cmd }, 0), ['/usr/bin/nice', ['-n', '5', 'sleep', '2']]);
+  assert.deepEqual(resolveNicedSpawn({ nice: 15, cmd }, 10), ['/usr/bin/nice', ['-n', '5', 'sleep', '2']], 'increment = effective - current');
+  assert.deepEqual(resolveNicedSpawn({ nice: effectiveNice(5, 10), cmd }, 10), ['sleep', ['2']], 'no wrapper when already there');
+});
+
+test('tryStart records the nice the lane really runs at: the target raised to the supervisor\'s own nice', async () => {
+  const lowered = await pollAgainst([], queued('hi', 'high'));
+  assert.equal(lowered.lease.nice, effectiveNice(5, os.getPriority()));
+});
+
+test('tryStart: a high backfill protecting a reserved head gets NO lease discount', async () => {
+  // 10 cores, reserve 1: budget 9. The medium holder (4 cores, nice 10) blocks the head (4 cores); head + holder + candidate (3) = 11 > 9.
+  // Discounting the holder (0.8) would read 7.8 and admit a backfill that delays the head.
+  const { state } = freshEnv();
+  const cfg = { ...schedCfg, capacity: 20, cpuReserveCores: 1, admissionCooldownMs: 0, conflictSkipLimit: 3 };
+  writeLease(state, { ...heldAt('holder', 'medium', 10), key: 'rouge:sim' });
+  await enqueue(state, { ...queued('head', 'medium'), key: 'rouge:default', conflicts: ['rouge:sim'] });
+  atomicWriteJson(paths(state).conflictSkipState, { headId: 'head', count: 3, blockedSince: Date.now(), loggedPhase: 'exhausted' });
+  const jun = { ...queued('jun', 'high'), key: 'jun:default', resources: { cpuCores: 3 } };
+  await enqueue(state, jun);
+  const sampler = () => ({ hostBusyCores: 0, cores: 10, stale: false, sampledAt: Date.now() });
+  const result = await tryStart(state, jun, cfg, undefined, sampler, () => cfg, () => null);
+  assert.equal(result.started, false, JSON.stringify(result));
+  assert.equal(result.cpuReason, 'projected-over-budget');
 });

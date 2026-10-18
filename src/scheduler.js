@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, isExpired, writeExpireMarkerFile, isWithdrawn, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
 import { sampleAndUpdateGate, readGateState } from './load.js';
@@ -16,7 +17,7 @@ import { resolveClasses, classEnforcementOf, bookedSims, classQueuePolicy, capSi
 import { reconcileSimArm, touchSimArmFor } from './sim-arm.js';
 import { advanceHwm } from './priority-clock.js';
 import { isExclusive, exclusiveDeny, isExclusiveHead, exclusiveLeaseFields, withoutBackfillExclusives, clampQueuedWeight } from './exclusive.js';
-import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, resolveLaneNice, effectiveRank, score, waitedMs } from './priority.js';
+import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, resolveLaneNice, effectiveNice, effectiveRank, score, waitedMs } from './priority.js';
 import { loadExpressTable, expressVerdict, expressAdmissionsLastMinute, recordExpressAdmission, logExpressAdmission } from './express.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { resolveScheduler, resolveSchedulerDetailed, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
@@ -1396,7 +1397,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // BRAIN-627: the nice this ticket will run at (its lane's own, else its ADMITTED tier's, else laneNice), recorded on the lease below.
     // Both the process discount here and the held-lease discount in admission judge the candidate at it.
     const admittedTier = priorityOf(queue[position]);
-    const startNice = resolveLaneNice(ticket, admittedTier, cfg);
+    const startNice = effectiveNice(resolveLaneNice(ticket, admittedTier, cfg), os.getPriority());
     const cpuSample = sampleCpuSafe(root, cpuSampler, cfg.sampleMs / 2, {
       laneNice: startNice,
       niceMin: cfg.preemptibleNiceMin,
@@ -1431,7 +1432,10 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // the head's claim joins the held leases for the CPU projection and memory admission.
     const headReservation = { id: headTicket.id, key: headTicket.key, configLane: headTicket.configLane, cmdFingerprint: headTicket.cmdFingerprint, weight: headTicket.weight, resources: headTicket.resources };
     const admissionHeld = safeBackfill || conflictPick || (expressAdmit && expressHeadProtected) ? [...held, headReservation] : held;
-    const admissionTicket = { ...ticket, nice: startNice, priorityAdmitted: admittedTier };
+    // Never discount held leases while protecting another ticket's reservation: the discount could admit a backfill that
+    // delays the reserved head, which would see these leases charged in full once it runs (no tier on the ref = no discount).
+    const protectingHead = admissionHeld !== held && ticket.id !== headTicket.id;
+    const admissionTicket = { ...ticket, nice: startNice, ...(protectingHead ? {} : { priorityAdmitted: admittedTier }) };
     const fullDecision = evaluateNewAdmission(root, cfg, admissionTicket, admissionHeld, cpuSample, memInfo);
     // BRAIN-532 step 2: shadow idle credit. Computed from the finished decision and only recorded; nothing below reads it.
     if (cfg.idleCreditMode !== 'off' && ticket.id === headTicket.id) {

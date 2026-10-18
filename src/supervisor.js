@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import {
@@ -316,9 +317,11 @@ function backpressureGate(source) {
  * all, so a niceless lane pays nothing extra. Split out as its own function
  * so the wrapping decision is unit-testable without spawning a real process.
  */
-export function resolveNicedSpawn(ticket) {
+export function resolveNicedSpawn(ticket, currentNice = 0) {
   const nice = Number.isInteger(ticket.nice) && ticket.nice >= 0 ? ticket.nice : 0;
-  if (nice > 0) return ['/usr/bin/nice', ['-n', String(nice), ...ticket.cmd]];
+  // `nice -n` is an increment on this process's own nice (BRAIN-627): ticket.nice is the absolute value the lane runs at
+  const increment = nice - currentNice;
+  if (increment > 0) return ['/usr/bin/nice', ['-n', String(increment), ...ticket.cmd]];
   return [ticket.cmd[0], ticket.cmd.slice(1)];
 }
 
@@ -1520,7 +1523,7 @@ async function main() {
   }
 
   const startedAt = Date.now();
-  const [cmd, args] = resolveNicedSpawn({ ...ticket, nice: started.lease.nice ?? ticket.nice });
+  const [cmd, args] = resolveNicedSpawn({ ...ticket, nice: started.lease.nice ?? ticket.nice }, os.getPriority());
   const child = spawn(cmd, args, {
     cwd: ticket.cwd,
     detached: true,

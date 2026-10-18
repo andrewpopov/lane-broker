@@ -36,6 +36,14 @@ export function resolveLaneNice(ticket, tier, cfg) {
   return Number.isInteger(tiered) ? tiered : cfg.laneNice;
 }
 
+/**
+ * BRAIN-627: `nice -n <n>` ADDS to the spawning process's own nice, so a lane can never run below it. The nice a lane
+ * really runs at is the target, raised to the supervisor's `currentNice`, clamped to 19; spawn adds `effective - currentNice`.
+ */
+export function effectiveNice(target, currentNice) {
+  return Math.min(19, Math.max(target, currentNice));
+}
+
 /** The tier a ticket was ADMITTED at; a record without a readable one is medium. */
 export function priorityOf(ticket) {
   return isPriorityTier(ticket?.priorityAdmitted) ? ticket.priorityAdmitted : DEFAULT_PRIORITY;
