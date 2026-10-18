@@ -148,6 +148,8 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // niceing (spawns the bare command). A `.lane-broker.json` lane's own
   // `nice` overrides this per-lane.
   laneNice: 10,
+  // BRAIN-634: `refused` makes this host dispatch-only: no lane payload ever executes here, whatever a repo config says.
+  localExecution: 'allowed',
   // BRAIN-627: the nice a lane runs at, by the tier it was ADMITTED at; a tier not named uses laneNice, and a lane's own
   // `nice` wins over both. A human-waiting `high` lane runs ahead of medium/low ones, so admission trusts the kernel to
   // yield them (preemptibleNiceMin / preemptibleShare). `{}` gives every tier laneNice.
@@ -408,6 +410,10 @@ function validateGlobalConfig(cfg, sourcePath) {
   assert(Number.isInteger(cfg.idleCreditAfterMs) && cfg.idleCreditAfterMs > 0, `${sourcePath}: "idleCreditAfterMs" must be a positive integer`);
   assert(cfg.idleCreditMode !== 'active', `${sourcePath}: "idleCreditMode" "active" is not implemented until BRAIN-532 step 3`);
   assert(['off', 'shadow'].includes(cfg.idleCreditMode), `${sourcePath}: "idleCreditMode" must be "off" or "shadow"`);
+  assert(
+    cfg.localExecution === 'allowed' || cfg.localExecution === 'refused',
+    `${sourcePath}: "localExecution" must be "allowed" or "refused"`,
+  );
   // BRAIN-320 S1a: how long a remote ticket may sit queued on the runner
   // before it is cancelled and treated as unconfirmed (fallback to local).
   // Absent by default (not read yet -- that is a later slice) so a config
@@ -855,6 +861,18 @@ export function loadGlobalConfigOrError() {
 /** A config that could not be (re)read leaves the class policy unknown ONLY where classes were ever configured; elsewhere it is 0.28.2 behaviour. */
 function withClassPolicyUnknown(cfg, reason) {
   return cfg.classes !== undefined || cfg.classesInvalid !== undefined || classesFenceHeld() ? { ...cfg, classesInvalid: reason } : cfg;
+}
+
+/** BRAIN-634: file whose mere presence in the broker home keeps this host dispatch-only even when config.json is missing or invalid. */
+export const LOCAL_EXECUTION_MARKER = 'local-execution-refused';
+
+/**
+ * BRAIN-634: the ONE answer to "may this host execute a lane payload". Refused when the config says so, when the marker file
+ * exists in the broker home, or when LANE_BROKER_LOCAL_EXECUTION=refused: the last two do not depend on parsing config.json,
+ * so a missing or invalid config (which loads as defaults) cannot silently restore local execution.
+ */
+export function isDispatchOnly(cfg) {
+  return cfg?.localExecution === 'refused' || process.env.LANE_BROKER_LOCAL_EXECUTION === 'refused' || fs.existsSync(path.join(brokerHome(), LOCAL_EXECUTION_MARKER));
 }
 
 export function reloadGlobalConfig(previous, { onError } = {}) {

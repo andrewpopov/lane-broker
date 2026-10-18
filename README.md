@@ -150,6 +150,7 @@ never told to forward to it — both still get the `--log` file.
   "resourceIdleOvershootCores": 1,
   "admissionLoadGate": false,
   "laneNice": 10,
+  "localExecution": "allowed",
   "priorityNice": { "high": 5 },
   "noProgressTimeoutMs": 0
 }
@@ -1180,6 +1181,30 @@ What it refuses, as a warning and never a change to the exit code or to the publ
 A warning shows in the log as `lane: warning: remote artifacts: ...` and in the history row as
 `remoteArtifactsWarning`. The lane's success is about the command: a stamp that did not arrive shows up when whatever
 reads it refuses.
+
+### Dispatch-only host (`localExecution`)
+
+`"localExecution": "refused"` (default `"allowed"`; any other value is a config error) makes this host dispatch-only,
+for a controller that must never execute a lane payload (BRAIN-634, e.g. a Pi that also hosts production Postgres).
+Every ticket behaves as remote-only whatever the repo's `.lane-broker.json` says: a lane not marked `remote`, an
+`undeclaredLanes` lane, `--local` and `LANE_BROKER_LOCAL=1` all dispatch to a runner, and `remoteQueueTimeoutMs`
+never expires a ticket into a local run. Nothing ever falls back to local; instead:
+
+- exit `76` when the ticket is remote-eligible but no runner can take it (runners down or busy-refused, a dispatch lost
+  before it started); retry later;
+- exit `69`, with a stderr line naming `localExecution is refused`, when it can never go remote from here (no runners
+  configured, a tree that cannot be snapshotted, an exclusive lane, a nested run inside a lease, a runner intake).
+
+Fail-closed: the refusal is in force when the config says `refused`, **or** a file named `local-execution-refused` exists
+in the broker home (`$LANE_BROKER_HOME`, default `~/.config/lane-broker`), **or** `LANE_BROKER_LOCAL_EXECUTION=refused` is
+in the environment. The last two do not depend on parsing `config.json`, which loads as defaults when missing or invalid,
+so provision the marker on a controller host (the systemd unit can set the env var too). The host is re-checked right before
+a payload spawns and at every `lane remote-pipeline` phase (deps, cached-deps script replay, setup, command; exit `69`).
+A permanent rejection by a runner, or runners that can never fit the ticket, exit `69`; unavailable or busy runners `76`.
+
+A ticket already queued locally when the setting is turned on is refused on its next poll instead of started (`76`
+if it was remote-eligible, else `69`). `lane capabilities --json` then lists `dispatch-only/1`, and `lane status`
+prints `local execution: refused`.
 
 ### Queue timeout
 

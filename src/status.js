@@ -15,7 +15,7 @@ import { readLastSimDemandAt } from './sim-arm.js';
 import { listAttempts, supervisorAlive, moveInterruptedLabel } from './attempts.js';
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
-import { loadGlobalConfigOrError } from './config.js';
+import { loadGlobalConfigOrError, isDispatchOnly } from './config.js';
 import { collectRunnerStates, renderRunnersLines } from './runner-unreachable.js';
 import { remoteOwnerMap } from './retier.js';
 import { defaultRemoteRoot } from './remote-runner.js';
@@ -334,6 +334,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     },
     externalCpu,
     paused,
+    ...(isDispatchOnly(cfg) ? { localExecution: 'refused' } : {}),
     draining,
     remoteDrain,
     exclusiveHold: exclusiveHoldView(queue, held),
@@ -609,6 +610,7 @@ export function renderStatusText(status) {
     const h = status.exclusiveHold;
     lines.push(`HOLD (exclusive) ${h.id} (${h.key}) waiting for ${h.waitingFor} running lane(s)`);
   }
+  if (status.localExecution === 'refused') lines.push('local execution: refused (dispatch-only host)');
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
   lines.push(renderRemoteDrainLine(status.remoteDrain, { running: status.running.length, queued: status.queued.length }));
   if (status.configError) lines.push(`config: global config unreadable: ${status.configError}`);

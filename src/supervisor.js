@@ -26,7 +26,7 @@ import { touchSimArmFor } from './sim-arm.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
-import { reloadGlobalConfig } from './config.js';
+import { reloadGlobalConfig, isDispatchOnly } from './config.js';
 import { stateHome } from './state.js';
 import { readRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
@@ -35,7 +35,7 @@ import { starvedStaleMs } from './external-cpu.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, priorityOf, resolveLaneNice, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
-import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
+import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, dispatchOnlyRefusal, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
@@ -496,6 +496,9 @@ function migrationRefusalResult(ticket) {
  *  else a claim over the local budget. The one definition behind local-first, the queued-runner choice, the fallback and
  *  whether the ticket carries a queue timeout (which exists only to enable a local fallback). */
 function localIneligibilityOf(enriched, globalCfg) {
+  // BRAIN-634: a dispatch-only host can never run anything; every caller treats that as "no local fallback" (no queue timeout,
+  // no local-first, no speed-aware local choice, wait on a busy runner).
+  if (isDispatchOnly(globalCfg)) return dispatchOnlyRefusal(enriched.lane);
   if (enriched.localRefused && !enriched.allowLocalSim) return localSimRefusal(enriched.lane, enriched.class);
   const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host: detectResourceCapacity() });
   return budget.ok ? null : budget;
@@ -733,7 +736,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
 
   /** `rebindable`: this fallback is only "no runner had room right now", so a later probe may still find one.
    *  `noRunner`: the fallback is "the fleet had no usable runner", which a `localRefused` lane reports as retryable. */
-  async function fallbackOrRefuse(runner, reason, { rebindable = false, neverStarted = false, noRunner = false } = {}) {
+  async function fallbackOrRefuse(runner, reason, { rebindable = false, neverStarted = false, noRunner = false, retryable = noRunner } = {}) {
     if (rebind) return abandonRebind(runner, reason, { neverStarted: neverStarted || withdrawn === null });
     const fb = await fallbackToLocal(root, enriched.id, reason);
     if (!fb.ok) {
@@ -746,8 +749,9 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       throw new Error(`lane-broker supervisor: could not fall back to local for ${enriched.id} (attempt record missing)`);
     }
 
-    const refusedHere = enriched.localRefused && !enriched.allowLocalSim;
-    const skipLine = `lane: remote-skip: ${runner ? runner.name : 'none'}: ${reason} — ${refusedHere ? 'not running locally (localRefused)' : 'running locally'}\n`;
+    const dispatchOnly = isDispatchOnly(globalCfg);
+    const refusedHere = dispatchOnly || (enriched.localRefused && !enriched.allowLocalSim);
+    const skipLine = `lane: remote-skip: ${runner ? runner.name : 'none'}: ${reason} — ${dispatchOnly ? 'not running locally (localExecution refused)' : refusedHere ? 'not running locally (localRefused)' : 'running locally'}\n`;
     process.stderr.write(skipLine);
     writeBrokerLog(root, skipLine);
 
@@ -758,7 +762,11 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     // now, before the resource-budget check below (mirroring run.js's own
     // ordering: local-sim refusal, then budget).
     if (refusedHere) {
-      const refusal = noRunner ? noRunnerRefusal(enriched.lane, reason) : localSimRefusal(enriched.lane, enriched.class);
+      const refusal = dispatchOnly
+        ? dispatchOnlyRefusal(enriched.lane, { retryable, reason })
+        : noRunner
+          ? noRunnerRefusal(enriched.lane, reason)
+          : localSimRefusal(enriched.lane, enriched.class);
       process.stderr.write(refusal.message);
       await publishAndExit(fb.attempt.generation, () => localRefusalResult(enriched, refusal));
       return { fallback: false };
@@ -860,7 +868,9 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   }
   if (!runner) {
     const reason = skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : 'no runners configured';
-    return fallbackOrRefuse(null, reason, { rebindable: true, noRunner: true });
+    // every configured runner is too small for this ticket for good: no retry will place it
+    const neverPlaceable = skipped.length > 0 && skipped.length === (globalCfg.runners || []).length && skipped.every((s) => s.neverFits === true);
+    return fallbackOrRefuse(null, reason, { rebindable: true, noRunner: true, retryable: !neverPlaceable });
   }
 
   if (speed && !busyQueuedAt) {
@@ -1189,7 +1199,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // 'ineligible' or 'unconfirmed'
   // Only a runner that provably never started it AND says nothing about other runners (a queue expiry or withdrawal, an incomplete
   // transfer) leaves the fallback rebindable; ineligible, rejected and possibly-run outcomes stay local for good.
-  return fallbackOrRefuse(runner, dispatch.reason, { neverStarted: dispatch.neverStarted === true, rebindable: dispatch.outcome === 'unconfirmed' && dispatch.neverStarted === true && dispatch.retryElsewhere === true });
+  return fallbackOrRefuse(runner, dispatch.reason, { neverStarted: dispatch.neverStarted === true, rebindable: dispatch.outcome === 'unconfirmed' && dispatch.neverStarted === true && dispatch.retryElsewhere === true, retryable: dispatch.outcome === 'unconfirmed' && dispatch.rejected !== true });
 }
 
 async function main() {
@@ -1357,6 +1367,26 @@ async function main() {
     process.exit(refusal.exitCode);
   }
 
+  /**
+   * BRAIN-634: this host became (or is) dispatch-only while the ticket sits in, or just left, the local queue. Never start it:
+   * 76 when it is remote-eligible (retry once a runner has room), else 69. `lease` is true once tryStart has already leased it.
+   */
+  async function refuseDispatchOnlyAndExit({ lease = false } = {}) {
+    const refusal = dispatchOnlyRefusal(enriched.lane, { retryable: Boolean(enriched.remote), reason: 'queued locally' });
+    process.stderr.write(refusal.message);
+    await underLock(root, () => dequeueSync(root, ticket.id));
+    if (lease) removeLease(root, ticket.id);
+    const result = localRefusalResult(enriched, refusal);
+    const publish = () => {
+      atomicWriteJson(ticket.resultPath, result);
+      appendHistory(root, historyRow(ticket, result, { fallbackReason }));
+    };
+    if (attemptGeneration !== null) await publishTerminal(root, ticket.id, attemptGeneration, publish);
+    else publish();
+    await underLock(root, () => clearTicketMarkers(root, ticket.id));
+    process.exit(refusal.exitCode);
+  }
+
   try {
     const queued = await enqueue(root, enriched, globalCfg, { ownerGeneration: attemptGeneration });
     // BRAIN-321: this id was already submitted (a retried `lane run --detach --id`); its first supervisor owns it.
@@ -1431,6 +1461,7 @@ async function main() {
       touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit('cancelled', { forcePublish: alsoWithdrawn });
     }
+    if (isDispatchOnly(globalCfg)) await refuseDispatchOnlyAndExit();
     if (!enriched.exclusive) {
       const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host: detectResourceCapacity() });
       if (!budget.ok) await refuseQueuedOverBudgetAndExit(budget);
@@ -1525,6 +1556,8 @@ async function main() {
 
   const startedAt = Date.now();
   const [cmd, args] = resolveNicedSpawn({ ...ticket, nice: started.lease.nice ?? ticket.nice }, os.getPriority(), resolveLaneNice(ticket, priorityOf(started.lease), globalCfg));
+  // the host may have turned dispatch-only since admission (config flip or marker): re-read it at the last moment, release the lease unused
+  if (isDispatchOnly(reloadGlobalConfig(globalCfg))) await refuseDispatchOnlyAndExit({ lease: true });
   const child = spawn(cmd, args, {
     cwd: ticket.cwd,
     detached: true,

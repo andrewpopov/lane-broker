@@ -7,11 +7,11 @@ import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { ensureStateDirs, paths, stateHome, readJsonSafe, appendHistory, LockTimeoutError, MigrationInProgressError, assertNotMigrating, isUuid } from './state.js';
 import { classTransportMismatch } from './classes.js';
-import { resolveTicketConfig, reloadGlobalConfig, resolvePriority, assertHostConfigHookless, ConfigError } from './config.js';
+import { resolveTicketConfig, reloadGlobalConfig, isDispatchOnly, resolvePriority, assertHostConfigHookless, ConfigError } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
 import { stampPriorityOrigin } from './priority-clock.js';
-import { detectResourceCapacity, leaseResources, resolveTicketResources, capUnapprovedCpu, checkResourceBudget, localSimRefusal } from './resources.js';
+import { detectResourceCapacity, leaseResources, resolveTicketResources, capUnapprovedCpu, checkResourceBudget, localSimRefusal, dispatchOnlyRefusal } from './resources.js';
 import { argvFingerprint } from './cpu-estimates.js';
 import { readRows } from './suggest.js';
 import { rightSizedCpuCores } from './right-size.js';
@@ -152,6 +152,12 @@ function resolveForcedLocal({ local, localReason, lane, remoteCapable }) {
     `lane: --local ignored for remote-eligible lane ${lane}: pass --local-reason "<why>" if this command needs this machine (ssh, gh, lane, paths outside the worktree)\n`,
   );
   return {};
+}
+
+function refuseDispatchOnly(lane, details) {
+  const refusal = dispatchOnlyRefusal(lane, details);
+  process.stderr.write(refusal.message);
+  return { exitCode: refusal.exitCode };
 }
 
 function fmtAgo(ms) {
@@ -343,14 +349,18 @@ export async function runCommand({
   // lane/config, since it either reuses the ancestor's lease below or is
   // itself the remote-exec child of an already-remote run (I5: a runner
   // never re-dispatches).
+  // BRAIN-634: on a dispatch-only host every ticket is remote-only whatever the repo config says (`--local` included).
+  const dispatchOnly = isDispatchOnly(globalCfg);
   const remoteCapable =
-    resolved.remote === true &&
+    (resolved.remote === true || dispatchOnly) &&
+    !runnerIntake &&
     Array.isArray(globalCfg.runners) &&
     globalCfg.runners.length > 0 &&
     !exclusive &&
     !process.env.LANE_BROKER_LEASE;
   const { forced, text: localReasonText } = resolveForcedLocal({ local, localReason: localReasonOpt, lane, remoteCapable });
-  const remoteWanted = remoteCapable && !forced;
+  if (dispatchOnly && forced) process.stderr.write(`lane: --local ignored: localExecution is refused on this host (dispatch-only)\n`);
+  const remoteWanted = remoteCapable && (!forced || dispatchOnly);
   // Resolved eagerly (not deferred to ticket construction) so the
   // resource-budget skip below and the ticket payload agree on the exact
   // same eligibility -- a worktree root that fails to resolve must also
@@ -445,6 +455,7 @@ export async function runCommand({
           );
           return { exitCode: 64 };
         }
+        if (dispatchOnly) return refuseDispatchOnly(lane, { reason: 'nested run inside a lease' });
         // Reentrant: an ancestor already holds a lease covering this run. Run directly, no new acquisition.
         const child = spawn(cmd[0], cmd.slice(1), { cwd, stdio: 'inherit', env: { ...process.env, LANE_BROKER_PRIORITY: priority } });
         return new Promise((resolve) => {
@@ -463,6 +474,21 @@ export async function runCommand({
     }
     // LANE_BROKER_LEASE is set but no such lease exists on disk (stale/forged
     // env var) -- fall through to normal acquisition rather than trusting it.
+  }
+
+  // BRAIN-634: whatever could not become a remote ticket (exclusive, runner intake, a nested run, no runners, a tree that
+  // cannot be snapshotted) can never run on a dispatch-only host.
+  if (dispatchOnly && !remoteEligible) {
+    const reason = runnerIntake
+      ? 'this host is not a runner'
+      : exclusive
+        ? 'exclusive lanes run locally only'
+        : process.env.LANE_BROKER_LEASE
+          ? 'nested run inside a lease'
+          : !(Array.isArray(globalCfg.runners) && globalCfg.runners.length > 0)
+            ? 'no runners configured'
+            : 'the tree cannot be snapshotted for a runner';
+    return refuseDispatchOnly(lane, { reason });
   }
 
   // BRAIN-320 (local-refused + remote): a `localRefused` lane that is ALSO
