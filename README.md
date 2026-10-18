@@ -1023,8 +1023,11 @@ launchd job; it adds no second ledger and builds on the BRAIN-594 clock:
   runner gets the legacy plain stream, byte for byte, with no new flag or key. The capability is re-read per dispatch, so a rebalance to a
   runner without it sends the plain stream. The runner decodes with a strict single-member decoder: decompressed bytes are capped at the
   header limit plus the 2 GiB tree limit plus 64 MiB of frame lines, compressed input at the same figure, and any compressed byte after the
-  member's trailer is refused. A stream that fails before a usable header leaves no ticket (exit 1: the client proves it never started via
-  the withdraw tombstone and retries elsewhere); one that fails after it is a `rejected` result with the reason.
+  member's trailer is refused. The member's CRC-32 and size must match the decoded bytes, and the decoded stream ends only once the whole
+  8-byte trailer has arrived and verified, so no work starts on a truncated member. A stream refused before a usable header leaves no
+  ticket and exits `66` with a one-line reason on stderr: that exit code, and nothing else (not a withdraw reply, not an absent
+  ticket), is what lets the client treat the dispatch as never started and retry elsewhere. One that fails after the header is a
+  `rejected` result with the reason.
 - The probe contract: `lane remote-probe` must answer promptly on a busy runner. It waits at most 500 ms for the broker lock (the lock
   only reaps stale leases). If the lock is held it answers from a lock-free read of the lease, queue and gate files and adds
   `"stale": true, "snapshot": "lockless"`. Each file is written by atomic rename, so each is consistent on its own, but the set can be a

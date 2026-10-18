@@ -11,7 +11,7 @@ import { tmpDir, setup, makeFakeSshBin, makeRunner, clientEnv, makeGitWorktree, 
 import { dispatchRemote } from '../src/remote-client.js';
 import { buildManifest } from '../src/remote-manifest.js';
 import { encodeSnapshot, makeReader, extractSnapshot } from '../src/remote-stream.js';
-import { createStrictGunzip, parseTransferFlag } from '../src/remote-gzip.js';
+import { createStrictGunzip, parseTransferFlag, REMOTE_EXEC_NO_TICKET_EXIT } from '../src/remote-gzip.js';
 import { CAPABILITIES } from '../src/capabilities.js';
 
 /** BRAIN-642 slice B: the `snapshot-gzip/1` capability and the gzip transfer, client and runner side. */
@@ -195,31 +195,55 @@ test('remote-transfer: truncated gzip after the header is rejected with a reason
   assert.ok(out.result.reason.length > 0);
 });
 
-test('remote-transfer: gzip cut inside the header creates no ticket and exits 1 (never started)', async () => {
+test('remote-transfer: gzip cut inside the header creates no ticket and exits 66 (never started)', async () => {
   const { dir, entries } = makeSource({ 'a.txt': 'x' });
   const header = makeHeader();
   const gz = zlib.gzipSync(await rawStream(dir, header, entries));
   const out = await gzipExec(gz.subarray(0, 14), header);
-  assert.equal(out.code, 1);
+  assert.equal(out.code, REMOTE_EXEC_NO_TICKET_EXIT);
   assert.deepEqual(out.dirs, []);
   assert.match(out.stderr, /lane remote-exec:/);
 });
 
-test('remote-transfer: a corrupt gzip body is rejected', async () => {
-  const { dir, entries } = makeSource({ 'a.txt': crypto.randomBytes(50_000) });
+/** A gzip member big enough that the runner has the header (and made a ticket) long before the trailer arrives. */
+async function bigMember() {
+  const { dir, entries } = makeSource({ 'a.txt': crypto.randomBytes(400_000) });
   const header = makeHeader();
-  const gz = Buffer.from(zlib.gzipSync(await rawStream(dir, header, entries)));
+  return { header, gz: Buffer.from(zlib.gzipSync(await rawStream(dir, header, entries))) };
+}
+
+test('remote-transfer: a corrupt gzip body is rejected by the gzip layer, not by a file hash', async () => {
+  const { header, gz } = await bigMember();
   gz[Math.floor(gz.length / 2)] ^= 0xff;
   const out = await gzipExec(gz, header);
   assert.equal(out.code, 0, out.stderr);
   assert.equal(out.result.kind, 'rejected');
+  assert.doesNotMatch(out.result.reason, /sha|hash/i);
+});
+
+test('remote-transfer: flipping only a trailer CRC byte is rejected with a checksum mismatch', async () => {
+  const { header, gz } = await bigMember();
+  gz[gz.length - 8] ^= 0x01; // every decoded byte, and so every file hash, is still correct
+  const out = await gzipExec(gz, header);
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(out.result.kind, 'rejected');
+  assert.match(out.result.reason, /gzip trailer checksum mismatch/);
+});
+
+test('remote-transfer: a wrong trailer ISIZE is rejected with a size mismatch', async () => {
+  const { header, gz } = await bigMember();
+  gz.writeUInt32LE(999, gz.length - 4);
+  const out = await gzipExec(gz, header);
+  assert.equal(out.code, 0, out.stderr);
+  assert.equal(out.result.kind, 'rejected');
+  assert.match(out.result.reason, /gzip trailer size mismatch/);
 });
 
 test('remote-transfer: not-gzip bytes with --transfer gzip create no ticket', async () => {
   const { dir, entries } = makeSource({ 'a.txt': 'x' });
   const header = makeHeader();
   const out = await gzipExec(await rawStream(dir, header, entries), header);
-  assert.equal(out.code, 1);
+  assert.equal(out.code, REMOTE_EXEC_NO_TICKET_EXIT);
   assert.deepEqual(out.dirs, []);
 });
 
@@ -246,24 +270,6 @@ test('remote-transfer: decoded trailing garbage after the terminator is rejected
 
 // ---- the reader and decompressor, direct ----
 
-test('remote-transfer: a 64 MiB highly compressible file delivered in 1 KiB chunks is read in linear time', async () => {
-  const total = 64 * 1024 * 1024;
-  const piece = Buffer.alloc(1024);
-  async function* chunks() {
-    yield Buffer.from('header\n');
-    for (let sent = 0; sent < total; sent += piece.length) yield piece;
-    yield Buffer.from('tail\n');
-  }
-  const reader = makeReader(Readable.from(chunks()));
-  const started = Date.now();
-  assert.equal(await reader.readLine(1000), 'header');
-  const body = await reader.readBytes(total);
-  assert.equal(body.length, total);
-  assert.equal(await reader.readLine(1000), 'tail');
-  assert.equal(await reader.hasMore(), false);
-  assert.ok(Date.now() - started < 5000, `took ${Date.now() - started} ms`);
-});
-
 test('remote-transfer: the reader still splits lines and bodies containing newlines correctly across tiny chunks', async () => {
   const wire = Buffer.from('one\ntwo words\nBODY\nWITH\nNEWLINES\nlast\n');
   const tiny = Readable.from((function* () { for (let i = 0; i < wire.length; i += 3) yield wire.subarray(i, i + 3); })());
@@ -287,6 +293,80 @@ test('remote-transfer: createStrictGunzip round-trips a stream written in tiny c
   g.input.end();
   await done;
   assert.ok(Buffer.concat(parts).equals(data));
+});
+
+/** Drive createStrictGunzip by hand: `settled` is 'end', or the error, once the output finished; `ended()` peeks without waiting. */
+function driveGunzip() {
+  const g = createStrictGunzip({ maxDecodedBytes: 10_000_000, maxCompressedBytes: 10_000_000 });
+  const parts = [];
+  let verdict = null;
+  g.output.on('data', (d) => parts.push(d));
+  g.output.on('end', () => { verdict = verdict ?? 'end'; });
+  g.output.on('error', (err) => { verdict = verdict ?? err; });
+  g.input.on('error', () => {});
+  return { g, decoded: () => Buffer.concat(parts), verdict: () => verdict };
+}
+
+test('remote-transfer: createStrictGunzip does not finish on a full deflate payload plus one trailer byte, and rejects the EOF', async () => {
+  const data = crypto.randomBytes(100_000);
+  const gz = zlib.gzipSync(data);
+  const d = driveGunzip();
+  d.g.input.write(gz.subarray(0, gz.length - 7));
+  await sleep(200);
+  assert.equal(d.verdict(), null, 'must not signal end-of-input before the whole trailer');
+  assert.ok(d.decoded().equals(data));
+  d.g.input.end();
+  await sleep(100);
+  assert.match(String(d.verdict()?.message), /truncated gzip stream: missing trailer/);
+});
+
+test('remote-transfer: createStrictGunzip accepts the stream only once a delayed trailer arrives', async () => {
+  const data = crypto.randomBytes(100_000);
+  const gz = zlib.gzipSync(data);
+  const d = driveGunzip();
+  d.g.input.write(gz.subarray(0, gz.length - 8));
+  await sleep(200);
+  assert.equal(d.verdict(), null);
+  d.g.input.write(gz.subarray(gz.length - 8));
+  d.g.input.end();
+  await sleep(100);
+  assert.equal(d.verdict(), 'end');
+  assert.ok(d.decoded().equals(data));
+});
+
+test('remote-transfer: createStrictGunzip rejects a wrong CRC, a wrong ISIZE and any byte after the trailer', async () => {
+  const gz = zlib.gzipSync(crypto.randomBytes(50_000));
+  const badCrc = Buffer.from(gz);
+  badCrc[badCrc.length - 8] ^= 0x01;
+  const badSize = Buffer.from(gz);
+  badSize.writeUInt32LE(7, badSize.length - 4);
+  const cases = [
+    [badCrc, /gzip trailer checksum mismatch/],
+    [badSize, /gzip trailer size mismatch/],
+    [Buffer.concat([gz, Buffer.from([0])]), /compressed data after the end of the gzip member/],
+    [gz.subarray(0, gz.length - 3), /truncated gzip stream: missing trailer/],
+  ];
+  for (const [bytes, reason] of cases) {
+    const d = driveGunzip();
+    d.g.input.end(bytes);
+    await sleep(150);
+    assert.match(String(d.verdict()?.message), reason);
+  }
+});
+
+test('remote-transfer: the reader\'s cost per one-byte chunk does not grow with the number of chunks queued', async () => {
+  // Array.prototype.shift is cheap on a short array and memmoves on a long one, so the comparison spans a 12x range of chunk counts.
+  const drain = async (n) => {
+    const reader = makeReader(Readable.from((function* () { for (let i = 0; i < n; i++) yield Buffer.from([65]); })()));
+    const started = process.hrtime.bigint();
+    assert.equal((await reader.readBytes(n)).length, n);
+    assert.equal(await reader.hasMore(), false);
+    return Number(process.hrtime.bigint() - started) / n;
+  };
+  await drain(5_000); // warm up
+  const small = Math.min(await drain(16_000), await drain(16_000));
+  const large = Math.min(await drain(192_000), await drain(192_000));
+  assert.ok(large / small < 3, `per-chunk cost grew ${(large / small).toFixed(1)}x for 12x the chunks`);
 });
 
 // ---- the client: upstream failure, cancellation, teardown ----
@@ -361,9 +441,9 @@ test('remote-transfer: the client reports raw and sent byte counts for a gzip di
   assert.ok(stats.sentBytes > 0 && stats.sentBytes < stats.rawBytes / 4, JSON.stringify(stats));
 });
 
-test('remote-transfer: a pre-header failure on the runner is reported as never started and safe to retry elsewhere', async () => {
-  // A runner whose exec dies before creating any ticket (here: it is handed a corrupt gzip by a transport bug) has nothing to
-  // report; the client must still prove "never started" via the withdraw tombstone rather than leave the dispatch possibly running.
+test('remote-transfer: a pre-header failure on the runner is never started via its exit code alone, with no withdraw', async () => {
+  // The runner refused the corrupt gzip before creating any ticket and exited 66; that exit code is the proof. canWithdraw is off, so
+  // nothing else can have supplied it.
   const { binDir, sshBin } = makeFakeSshBin();
   const { env } = clientEnv(binDir);
   const src = makeGitWorktree({ 'a.txt': 'hello' });
@@ -375,11 +455,78 @@ test('remote-transfer: a pre-header failure on the runner is reported as never s
     sshBin,
     env,
     transfer: 'gzip',
-    canWithdraw: true,
+    canWithdraw: false,
     deadlines: { transferMs: 20_000, resultMs: 5000, resultAttempts: 2 },
   });
   assert.equal(result.outcome, 'unconfirmed');
   assert.equal(result.neverStarted, true);
   assert.equal(result.retryElsewhere, true);
+  assert.match(result.reason, /refused the snapshot stream before creating a ticket/);
   assert.deepEqual(ticketDirs(root), []);
+});
+
+async function dropDispatch(ssh) {
+  const { binDir, sshBin } = makeFakeSshBin();
+  const { env } = clientEnv(binDir);
+  return dispatchRemote({
+    ...makeDispatchArgs(),
+    runner: makeRunner({ ssh, root: tmpDir('remote-transfer-client-root') }),
+    worktreeRoot: makeGitWorktree({ 'a.txt': 'hello' }),
+    sshBin,
+    env,
+    transfer: 'gzip',
+    canWithdraw: true,
+    deadlines: { transferMs: 20_000, resultMs: 5000, resultAttempts: 1 },
+  });
+}
+
+test('remote-transfer: a tombstoned, absent ticket on withdraw is NOT proof it never started (a GC-removed finished ticket)', async () => {
+  const result = await dropDispatch('drop-gone');
+  assert.equal(result.outcome, 'unconfirmed');
+  assert.notEqual(result.neverStarted, true);
+  assert.notEqual(result.retryElsewhere, true);
+  assert.equal(result.mayStillBeRunning, true);
+});
+
+test('remote-transfer: any other non-zero remote-exec exit stays unconfirmed', async () => {
+  for (const ssh of ['drop-exit1', 'drop-stuck']) {
+    const result = await dropDispatch(ssh);
+    assert.equal(result.outcome, 'unconfirmed', ssh);
+    assert.notEqual(result.neverStarted, true, ssh);
+    assert.equal(result.mayStillBeRunning, true, ssh);
+  }
+});
+
+test('remote-transfer: a throwing onTransferStats neither rejects the dispatch nor leaves the ssh child alive on abort', async () => {
+  const { binDir, sshBin } = makeFakeSshBin();
+  const { env } = clientEnv(binDir);
+  const throwing = () => { throw new Error('stats sink broke'); };
+  const done = await dispatchRemote({
+    ...makeDispatchArgs(),
+    runner: makeRunner({ ssh: 'tee', root: tmpDir('remote-transfer-client-root') }),
+    worktreeRoot: makeGitWorktree({ 'a.txt': 'hello' }),
+    sshBin,
+    env,
+    transfer: 'gzip',
+    onTransferStats: throwing,
+  });
+  assert.equal(done.outcome, 'confirmed');
+
+  const root = tmpDir('remote-transfer-client-root');
+  const controller = new AbortController();
+  setTimeout(() => controller.abort(), 1500);
+  const cancelled = await dispatchRemote({
+    ...makeDispatchArgs(),
+    runner: makeRunner({ ssh: 'no-read', root }),
+    worktreeRoot: makeGitWorktree({ 'rand.bin': crypto.randomBytes(24 * 1024 * 1024) }),
+    sshBin,
+    env,
+    transfer: 'gzip',
+    abortSignal: controller.signal,
+    onTransferStats: throwing,
+    deadlines: { transferMs: 60_000, resultMs: 5000, resultAttempts: 1 },
+  });
+  assert.equal(cancelled.outcome, 'cancelled');
+  await sleep(300);
+  assert.deepEqual(psLines(root), []);
 });

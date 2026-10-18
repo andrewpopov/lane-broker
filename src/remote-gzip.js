@@ -5,8 +5,25 @@ import { Transform, Writable, pipeline } from 'node:stream';
 export const SNAPSHOT_GZIP_CAPABILITY = 'snapshot-gzip/1';
 export const TRANSFER_GZIP = 'gzip';
 
+/** BRAIN-642: `lane remote-exec` exits with this, after a one-line reason on stderr, when it refused the stream before creating any
+ *  ticket. It is the runner's positive statement that nothing was started; the client trusts exactly this code and no other. */
+export const REMOTE_EXEC_NO_TICKET_EXIT = 66;
+
 const GZIP_HEADER_BYTES = 10;
 const GZIP_TRAILER_BYTES = 8;
+
+const CRC_TABLE = new Uint32Array(256).map((_, n) => {
+  let c = n;
+  for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+  return c >>> 0;
+});
+
+/** Running CRC-32 (gzip's); engines allows Node 20, where `zlib.crc32` may be missing, so it is computed here. */
+function crc32Update(crc, chunk) {
+  let c = ~crc;
+  for (let i = 0; i < chunk.length; i++) c = CRC_TABLE[(c ^ chunk[i]) & 0xff] ^ (c >>> 8);
+  return ~c >>> 0;
+}
 
 /** Parse the `--transfer` value off `lane remote-exec`'s args: `{ok, transfer}` (undefined = the legacy plain stream). */
 export function parseTransferFlag(args) {
@@ -31,22 +48,32 @@ export function countBytes(onBytes) {
  * The runner's decompressor for a `--transfer gzip` stream. Node's Gunzip would accept concatenated members (an appended empty
  * member costs work and yields no bytes), so the gzip framing is parsed here: exactly one fixed 10-byte header, one raw deflate
  * stream, one 8-byte trailer, nothing after. Returns `{ input, output }`: write the compressed bytes to `input`; read the decoded
- * bytes from `output`. Past `maxDecodedBytes` decoded or `maxCompressedBytes` compressed, or on any framing/corruption error,
+ * bytes from `output`. `output` ends only after the whole 8-byte trailer has arrived and its CRC-32 and size match the decoded
+ * bytes, so a consumer that sees the end of `output` has seen a complete, verified member. Past `maxDecodedBytes` decoded or `maxCompressedBytes` compressed, or on any framing/corruption error,
  * every stage is destroyed and `output` errors, so the reader sees a failure rather than a hang.
  */
 export function createStrictGunzip({ maxDecodedBytes, maxCompressedBytes }) {
   const inflate = zlib.createInflateRaw();
   let decoded = 0;
-  let expectedIsize = null;
+  let crc = 0;
+  let trailerArrived;
+  const trailerReceived = new Promise((resolve) => {
+    trailerArrived = resolve;
+  });
   const counter = new Transform({
     transform(chunk, _enc, cb) {
       decoded += chunk.length;
+      crc = crc32Update(crc, chunk);
       if (decoded > maxDecodedBytes) return cb(new Error(`decompressed stream exceeds ${maxDecodedBytes} bytes`));
       return cb(null, chunk);
     },
+    // The deflate stream has ended, but the member has not: hold the end of the output until the input has delivered a valid trailer.
     flush(cb) {
-      if (expectedIsize !== null && (decoded >>> 0) !== expectedIsize) return cb(new Error('gzip trailer size mismatch'));
-      return cb();
+      trailerReceived.then((t) => {
+        if (t.readUInt32LE(0) !== crc) return cb(new Error('gzip trailer checksum mismatch'));
+        if (t.readUInt32LE(4) !== decoded >>> 0) return cb(new Error('gzip trailer size mismatch'));
+        return cb();
+      });
     },
   });
   pipeline(inflate, counter, () => {});
@@ -89,7 +116,7 @@ export function createStrictGunzip({ maxDecodedBytes, maxCompressedBytes }) {
       // A deflate stream cut short surfaces as the inflate 'error' (unexpected end of file) from this end().
       inflate.end(() => {
         if (trailer.length !== GZIP_TRAILER_BYTES) return cb(new Error('truncated gzip stream: missing trailer'));
-        expectedIsize = trailer.readUInt32LE(4);
+        trailerArrived(trailer);
         return cb();
       });
     },

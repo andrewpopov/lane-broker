@@ -3,7 +3,7 @@ import { buildManifest, RemoteIneligibleError } from './remote-manifest.js';
 import zlib from 'node:zlib';
 import { pipeline } from 'node:stream';
 import { encodeSnapshot, serializeHeader, makeReader, MAX_HEADER_BYTES } from './remote-stream.js';
-import { countBytes, TRANSFER_GZIP } from './remote-gzip.js';
+import { countBytes, TRANSFER_GZIP, REMOTE_EXEC_NO_TICKET_EXIT } from './remote-gzip.js';
 import { receiveArtifacts, artifactLimitsOf } from './remote-artifacts.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
@@ -530,7 +530,7 @@ function pipeSnapshot(child, stream, deadlineMs, abortSignal) {
 function waitClosed(child, abortSignal) {
   return new Promise((resolve) => {
     if (child.exitCode !== null || child.signalCode !== null) {
-      resolve();
+      resolve(child.exitCode);
       return;
     }
     // An abort that fired before this wait began (no listener existed to hear it) must still end the session.
@@ -541,9 +541,9 @@ function waitClosed(child, abortSignal) {
         // already gone
       }
     }
-    const onClose = () => {
+    const onClose = (code) => {
       if (abortSignal) abortSignal.removeEventListener('abort', onAbort);
-      resolve();
+      resolve(code);
     };
     const onAbort = () => {
       try {
@@ -980,7 +980,13 @@ export async function dispatchRemote(opts) {
   const uploadStartedAt = Date.now();
   const pipeResult = await pipeSnapshot(child, snapshotStream, transferDeadlineMs, abortSignal);
   const uploadMs = Date.now() - uploadStartedAt;
-  if (onTransferStats) onTransferStats({ ...transferStats });
+  if (onTransferStats) {
+    try {
+      onTransferStats({ ...transferStats });
+    } catch {
+      // a stats sink failing never changes the dispatch (or leaves the ssh session behind)
+    }
+  }
   // The ssh session IS the remote job; wait for it to close (unbounded here
   // -- an outer --timeout is the caller's concern), killable by abort.
   if (pipeResult.ok && onSnapshotSent) {
@@ -1033,6 +1039,12 @@ export async function dispatchRemote(opts) {
   }
 
   if (move) return { outcome: 'moved', from: move.from, to: move.to, queuedMs: move.queuedMs, waitedOnRunnerMs: Math.max(0, move.withdrawnAt - dispatchedAt), neverStarted: true, reason: move.reason, ...(move.drainReason === undefined ? {} : { drainReason: move.drainReason }) };
+
+  // BRAIN-642: the runner's own statement that it refused the stream before creating a ticket (a corrupt or oversized gzip, an
+  // ill-framed header). Only this exit code proves it; any other close says nothing and falls through to the usual reconcile.
+  if ((await closed) === REMOTE_EXEC_NO_TICKET_EXIT) {
+    return { outcome: 'unconfirmed', reason: 'the runner refused the snapshot stream before creating a ticket', neverStarted: true, retryElsewhere: true };
+  }
 
   if (!pipeResult.ok) {
     // BRAIN-405: the snapshot was never completely sent, and a runner runs nothing before it has received and verified all of it
@@ -1126,9 +1138,7 @@ export async function dispatchRemote(opts) {
       // The move's own withdraw reply was lost and the session closed: this retry is the proof, and the chosen target is where it goes.
       return { outcome: 'moved', from: runner, to: state.attemptedTarget, queuedMs: state.queuedSince === null ? 0 : now() - state.queuedSince, waitedOnRunnerMs: Math.max(0, now() - dispatchedAt), neverStarted: true, ...moveReasonOf(state) };
     }
-    // BRAIN-642: a runner that never created the ticket (the stream failed before a usable header, e.g. a corrupt gzip upload) and has now
-    // tombstoned the id also proves it never started.
-    if (withdraw.action === 'withdrawn' || (withdraw.action === 'no-such-ticket' && withdraw.tombstoned === true)) return { outcome: 'unconfirmed', reason: 'result not available after retries; the runner confirmed it never started the ticket', neverStarted: true, retryElsewhere: true };
+    if (withdraw.action === 'withdrawn') return { outcome: 'unconfirmed', reason: 'result not available after retries; the runner confirmed it never started the ticket', neverStarted: true, retryElsewhere: true };
     return {
       outcome: 'unconfirmed',
       reason: `result not available after retries from ${runner.name}; the dispatch may have been accepted and ${withdrawCapable ? `could not be withdrawn (${withdraw.action})` : 'the runner cannot withdraw it'}, so it may still be running and was not re-run`,

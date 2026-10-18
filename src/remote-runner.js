@@ -10,7 +10,7 @@ import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartT
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, RUNNER_NAME_RE, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
 import { CAPABILITIES } from './capabilities.js';
-import { createStrictGunzip, TRANSFER_GZIP } from './remote-gzip.js';
+import { createStrictGunzip, TRANSFER_GZIP, REMOTE_EXEC_NO_TICKET_EXIT } from './remote-gzip.js';
 import { blobNamespace, evictBlobs } from './remote-blobs.js';
 import { reportReadiness } from './runner-readiness.js';
 import { NO_PROGRESS_REASON, SILENCE_REASON } from './no-progress.js';
@@ -440,7 +440,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   const headerResult = await readHeaderLine(reader, MAX_HEADER_BYTES);
   if (!headerResult.ok) {
     process.stderr.write(`lane remote-exec: ${headerResult.reason}\n`);
-    return { exitCode: 1 };
+    return { exitCode: REMOTE_EXEC_NO_TICKET_EXIT };
   }
   const header = headerResult.header;
 
@@ -450,7 +450,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   // a result for it either.
   if (!header || !isUuid(header.ticketId)) {
     process.stderr.write('lane remote-exec: missing or invalid ticketId\n');
-    return { exitCode: 1 };
+    return { exitCode: REMOTE_EXEC_NO_TICKET_EXIT };
   }
 
   // BRAIN-380: the check at the top ran before a (possibly slow) header read, so a drain may have started since. The check

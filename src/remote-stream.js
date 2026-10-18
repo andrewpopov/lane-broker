@@ -136,6 +136,7 @@ export function encodeSnapshot(worktreeRoot, header, entries, readFile = (entry)
  */
 export function makeReader(readable) {
   const queue = [];
+  let head = 0; // index of the first unconsumed chunk; shifting the array per chunk would be quadratic over many tiny chunks
   let queued = 0;
   let newline = -1; // offset of the first newline in the queue, -1 when none is known
   let done = false;
@@ -144,7 +145,8 @@ export function makeReader(readable) {
   function rescan() {
     newline = -1;
     let pos = 0;
-    for (const chunk of queue) {
+    for (let i = head; i < queue.length; i++) {
+      const chunk = queue[i];
       const idx = chunk.indexOf(NEWLINE);
       if (idx !== -1) {
         newline = pos + idx;
@@ -175,15 +177,21 @@ export function makeReader(readable) {
     const parts = [];
     let need = n;
     while (need > 0) {
-      const head = queue[0];
-      if (head.length <= need) {
-        parts.push(queue.shift());
-        need -= head.length;
+      const first = queue[head];
+      if (first.length <= need) {
+        parts.push(first);
+        queue[head] = undefined;
+        head += 1;
+        need -= first.length;
       } else {
-        parts.push(head.subarray(0, need));
-        queue[0] = head.subarray(need);
+        parts.push(first.subarray(0, need));
+        queue[head] = first.subarray(need);
         need = 0;
       }
+    }
+    if (head > 1024 && head * 2 > queue.length) {
+      queue.splice(0, head);
+      head = 0;
     }
     queued -= n;
     rescan();

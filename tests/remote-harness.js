@@ -188,17 +188,21 @@ if (destination === 'die-midstream') {
     process.stdout.write(\`\${JSON.stringify({ protocol: 1, cancelConfirmed: false })}\\n\`);
     exitNow(0);
   }
-} else if ((destination === 'drop-withdrawn' || destination === 'drop-stuck') && /remote-(exec|result|withdraw)/.test(commandString)) {
+} else if (/^drop-/.test(destination) && /remote-(exec|result|withdraw)/.test(commandString)) {
   // BRAIN-437: a runner that took the snapshot and then lost the connection, and whose result fetches all fail. Its
-  // remote-withdraw answers 'withdrawn' (drop-withdrawn: it never started) or 'not-queued' (drop-stuck: it may have).
+  // remote-withdraw answers 'withdrawn' (drop-withdrawn: it never started), 'not-queued' (drop-stuck, drop-exit1: it may have) or
+  // 'no-such-ticket' + tombstoned (drop-gone: a finished ticket the runner's GC has since removed). remote-exec closes with 255
+  // (the connection dropped), or with 1 (drop-exit1: the remote command failed in a way that says nothing about a ticket).
   if (commandString.includes('remote-exec')) {
     process.stdin.resume();
-    process.stdin.on('end', () => exitNow(255));
+    process.stdin.on('end', () => exitNow(destination === 'drop-exit1' ? 1 : 255));
   } else if (commandString.includes('remote-result')) {
     exitNow(1);
   } else {
     const ticketId = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/.exec(commandString)[0];
-    process.stdout.write(\`\${JSON.stringify({ protocol: 1, ticketId, action: destination === 'drop-withdrawn' ? 'withdrawn' : 'not-queued' })}\\n\`);
+    const reply = { protocol: 1, ticketId, action: { 'drop-withdrawn': 'withdrawn', 'drop-gone': 'no-such-ticket' }[destination] ?? 'not-queued' };
+    if (destination === 'drop-gone') reply.tombstoned = true;
+    process.stdout.write(\`\${JSON.stringify(reply)}\\n\`);
     exitNow(0);
   }
 } else if (destination === 'no-read' && commandString.includes('remote-exec')) {
