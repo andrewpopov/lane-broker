@@ -1520,7 +1520,7 @@ async function main() {
   }
 
   const startedAt = Date.now();
-  const [cmd, args] = resolveNicedSpawn(ticket);
+  const [cmd, args] = resolveNicedSpawn({ ...ticket, nice: started.lease.nice ?? ticket.nice });
   const child = spawn(cmd, args, {
     cwd: ticket.cwd,
     detached: true,

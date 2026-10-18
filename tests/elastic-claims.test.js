@@ -175,6 +175,8 @@ test('no minCpuCores: decisions are unchanged at every ambient load, and the lea
         logPath: '/dev/null',
         resultPath: '/dev/null',
         state: LEASE_STATE.RUNNING,
+        // BRAIN-627: the nice it was spawned at (laneNice: no lane nice, and `high` is the only default tier entry)
+        nice: 10,
         // BRAIN-380 slice 4: the admission audit, the only addition since BRAIN-360
         priorityRequested: 'medium',
         priorityAdmitted: 'medium',

@@ -145,6 +145,10 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // niceing (spawns the bare command). A `.lane-broker.json` lane's own
   // `nice` overrides this per-lane.
   laneNice: 10,
+  // BRAIN-627: the nice a lane runs at, by the tier it was ADMITTED at; a tier not named uses laneNice, and a lane's own
+  // `nice` wins over both. A human-waiting `high` lane runs ahead of medium/low ones, so admission trusts the kernel to
+  // yield them (preemptibleNiceMin / preemptibleShare). `{}` gives every tier laneNice.
+  priorityNice: { high: 5 },
   // BRAIN-431: a run idle (no output, no CPU, no process churn) for this long is killed (exit 124, reason 'no-progress').
   // 0 (the default) never kills: quiet work is legitimate, so the kill is opted into per lane (`noProgressTimeoutMs`).
   // The stall is recorded either way.
@@ -384,6 +388,11 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isInteger(cfg.laneNice) && cfg.laneNice >= 0 && cfg.laneNice <= 19,
     `${sourcePath}: "laneNice" must be an integer in [0, 19]`,
   );
+  assert(cfg.priorityNice && typeof cfg.priorityNice === 'object' && !Array.isArray(cfg.priorityNice), `${sourcePath}: "priorityNice" must be an object`);
+  for (const [tier, value] of Object.entries(cfg.priorityNice)) {
+    assert(isPriorityTier(tier), `${sourcePath}: "priorityNice.${tier}" is not a tier (one of ${PRIORITY_TIERS.join(', ')})`);
+    assert(Number.isInteger(value) && value >= 0 && value <= 19, `${sourcePath}: "priorityNice.${tier}" must be an integer in [0, 19]`);
+  }
   assert(Number.isInteger(cfg.noProgressTimeoutMs) && cfg.noProgressTimeoutMs >= 0, `${sourcePath}: "noProgressTimeoutMs" must be a non-negative integer`);
   assert(Number.isInteger(cfg.silenceTimeoutMs) && cfg.silenceTimeoutMs >= 0, `${sourcePath}: "silenceTimeoutMs" must be a non-negative integer`);
   assert(Number.isInteger(cfg.hungAfterMs) && cfg.hungAfterMs > 0, `${sourcePath}: "hungAfterMs" must be a positive integer`);
