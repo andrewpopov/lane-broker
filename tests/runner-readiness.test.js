@@ -5,11 +5,13 @@ import path from 'node:path';
 import { selectRunner } from '../src/remote-client.js';
 import { remoteSelectOptions } from '../src/supervisor.js';
 import { resolveTicketConfig, ConfigError, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
-import { isOnPath, readinessGap, readinessNeeds, readinessProbeArgs, parseReadinessArgs } from '../src/runner-readiness.js';
-import { recordReadiness, collectRunnerStates, renderRunnersLines } from '../src/runner-unreachable.js';
+import { isOnPath, readinessGap, readinessNeeds, readinessProbeArgs, parseReadinessArgs, reportReadiness, scanZeroLength } from '../src/runner-readiness.js';
+import { recordReadiness, readReadiness, collectRunnerStates, renderRunnersLines, READINESS_TTL_MS } from '../src/runner-unreachable.js';
 import { noRunnerRefusal, NO_RUNNER_EXIT_CODE } from '../src/resources.js';
-import { tmpDir, makeRunner } from './remote-harness.js';
-import { freshEnv, writeRepoConfig, laneRun } from './helpers.js';
+import { tmpDir, makeRunner, setup as remoteSetup, markerCmd, detachAndWait } from './remote-harness.js';
+import { paths, readJsonSafe } from '../src/state.js';
+import { freshEnv, writeRepoConfig, writeGlobalConfig, laneRun } from './helpers.js';
+import { loadGlobalConfig } from '../src/config.js';
 
 /** BRAIN-623 slice 1: `requires` (executables a runner must have), its probe round trip, placement, config and status. */
 
@@ -91,14 +93,15 @@ test('no eligible runner: the refusal (exit 76) names the missing tool and each 
 test('remoteSelectOptions derives the needs from the ticket payload (empty without requires)', () => {
   const cfg = { ...DEFAULT_GLOBAL_CONFIG, runners: [] };
   const base = { id: 'x', lane: 'l', repoId: 'r', weight: 1, resources: {}, remote: {} };
-  assert.deepEqual(remoteSelectOptions(base, cfg, tmpDir('opts')).readinessNeeds, { tools: [] });
-  assert.deepEqual(remoteSelectOptions({ ...base, remote: { requires: ['rg', 'rg', 'jq'] } }, cfg, tmpDir('opts')).readinessNeeds, { tools: ['rg', 'jq'] });
+  assert.deepEqual(remoteSelectOptions(base, cfg, tmpDir('opts')).readinessNeeds, { tools: [], version: null, integrity: true });
+  assert.deepEqual(remoteSelectOptions({ ...base, remote: { requires: ['rg', 'rg', 'jq'] } }, cfg, tmpDir('opts')).readinessNeeds, { tools: ['rg', 'jq'], version: null, integrity: true });
+  assert.equal(remoteSelectOptions(base, { ...cfg, runnerVersionFloor: '0.49.0' }, tmpDir('opts')).readinessNeeds.version, '0.49.0');
 });
 
 test('probe args round trip between submitter and runner', () => {
-  const args = readinessProbeArgs({ tools: ['rg', 'jq'] });
+  const args = readinessProbeArgs({ tools: ['rg', 'jq'], integrity: true });
   assert.deepEqual(args, ['--requires', 'rg,jq']);
-  assert.deepEqual(parseReadinessArgs(['--requires', 'rg,jq', '--root', '/x']), { tools: ['rg', 'jq'] });
+  assert.deepEqual(parseReadinessArgs(['--requires', 'rg,jq', '--root', '/x']), { tools: ['rg', 'jq'], integrity: true });
   assert.deepEqual(readinessProbeArgs({ tools: [] }), []);
   assert.equal(readinessGap({ tools: { rg: true } }, { tools: ['rg'] }), null);
 });
@@ -159,4 +162,114 @@ test('status: the runner block names the missing tool, and a runner that passes 
   await recordReadiness(root, {}, ['skybox'], now);
   lines = renderRunnersLines(collectRunnerStates(root, cfg, now), now).join('\n');
   assert.doesNotMatch(lines, /not ready/);
+});
+
+/** BRAIN-623 slice 2a: the version floor and the install-integrity check. */
+const gapOf = (probe, needs) => readinessGap(probe, { tools: [], version: null, integrity: true, ...needs });
+
+test('version floor: unset is no gap; below, missing and unparsable versions are gaps; equal and above are not', () => {
+  assert.equal(gapOf({ version: '0.1.0' }, {}), null);
+  assert.equal(gapOf({}, {}), null);
+  const gap = gapOf({ version: '0.47.0' }, { version: '0.49.0' });
+  assert.deepEqual(gap, { check: 'version', reason: 'lane-broker 0.47.0 is below the floor 0.49.0', missing: ['lane-broker>=0.49.0'] });
+  assert.equal(gapOf({ version: '0.49.0' }, { version: '0.49.0' }), null);
+  assert.equal(gapOf({ version: '0.50.0' }, { version: '0.49.0' }), null);
+  assert.equal(gapOf({ version: '1.0.0' }, { version: '0.49.0' }), null);
+  assert.equal(gapOf({ version: '0.9.0' }, { version: '0.10.0' })?.check, 'version', 'numeric, not lexical');
+  assert.equal(gapOf({ version: '0.49.1' }, { version: '0.49.0' }), null);
+  assert.match(gapOf({}, { version: '0.49.0' }).reason, /version not reported/);
+  assert.equal(gapOf({ version: 'junk' }, { version: '0.49.0' }).check, 'version');
+});
+
+test('version floor: flows from the global config into the needs, and sends no probe flag', () => {
+  assert.equal(readinessNeeds({}, { runnerVersionFloor: '0.49.0' }).version, '0.49.0');
+  assert.equal(readinessNeeds({}, {}).version, null);
+  assert.deepEqual(readinessProbeArgs({ tools: [], version: '0.49.0', integrity: true }), []);
+});
+
+test('integrity: a non-empty zeroLength list is a gap (reason capped at 3 paths); absent or empty is not', () => {
+  const gap = gapOf({ integrity: { zeroLength: ['src/a.js', 'src/b.js'] } }, {});
+  assert.deepEqual(gap, { check: 'integrity', reason: 'truncated install: 2 zero-length file(s) (src/a.js, src/b.js)', missing: ['src/a.js', 'src/b.js'] });
+  const many = gapOf({ integrity: { zeroLength: ['a', 'b', 'c', 'd'] } }, {});
+  assert.match(many.reason, /4 zero-length file\(s\) \(a, b, c, \.\.\.\)/);
+  assert.equal(gapOf({}, {}), null, 'an older runner reports no integrity: not a gap (the version floor excludes it)');
+  assert.equal(gapOf({ integrity: { zeroLength: [] } }, {}), null);
+  assert.equal(readinessGap({ integrity: { zeroLength: ['x'] } }, {})?.check, 'integrity', 'judged even when the submitter passed no needs');
+});
+
+test('integrity: the runner reports unasked, and the scan finds zero-length files under bin/, src/ and package.json only', () => {
+  const root = tmpDir('integrity-pkg');
+  for (const d of ['bin', 'src/store', 'node_modules/x', 'tests']) fs.mkdirSync(path.join(root, d), { recursive: true });
+  fs.writeFileSync(path.join(root, 'package.json'), '{}');
+  fs.writeFileSync(path.join(root, 'bin/lane.js'), 'ok');
+  fs.writeFileSync(path.join(root, 'src/full.js'), 'ok');
+  fs.writeFileSync(path.join(root, 'src/store/empty.js'), '');
+  fs.writeFileSync(path.join(root, 'node_modules/x/empty.js'), '');
+  fs.writeFileSync(path.join(root, 'tests/empty.js'), '');
+  assert.deepEqual(scanZeroLength(root), [path.join('src', 'store', 'empty.js')]);
+  fs.writeFileSync(path.join(root, 'package.json'), '');
+  assert.deepEqual(scanZeroLength(root), ['package.json', path.join('src', 'store', 'empty.js')]);
+  assert.deepEqual(scanZeroLength(path.join(root, 'missing')), []);
+  const needs = parseReadinessArgs([]);
+  assert.deepEqual(reportReadiness(needs, { packageRoot: root }).integrity.zeroLength, ['package.json', path.join('src', 'store', 'empty.js')]);
+  assert.equal('version' in reportReadiness(needs, { packageRoot: root }), false);
+  assert.deepEqual(scanZeroLength(new URL('..', import.meta.url).pathname), [], 'this checkout is intact');
+});
+
+test('config: runnerVersionFloor defaults to null, accepts X.Y.Z, rejects anything else', () => {
+  const { home } = freshEnv();
+  const load = (patch) => {
+    writeGlobalConfig(home, { version: 1, ...patch });
+    const prev = process.env.LANE_BROKER_HOME;
+    process.env.LANE_BROKER_HOME = home;
+    try {
+      return loadGlobalConfig();
+    } finally {
+      if (prev === undefined) delete process.env.LANE_BROKER_HOME;
+      else process.env.LANE_BROKER_HOME = prev;
+    }
+  };
+  assert.equal(load({}).runnerVersionFloor, null);
+  assert.equal(load({ runnerVersionFloor: '0.49.0' }).runnerVersionFloor, '0.49.0');
+  for (const bad of ['0.49', 'v0.49.0', '0.49.0-rc1', 49, '', true]) assert.throws(() => load({ runnerVersionFloor: bad }), ConfigError, String(bad));
+});
+
+/** BRAIN-623 slice 2b: a stored "not ready" note clears when a placement sees the runner pass, and expires. */
+test('selectRunner lists every runner that passed the readiness checks, chosen or not', async () => {
+  const ssh = makeToolSsh({ tools: { a: [], b: ['rg', 'poetry'], c: ['rg', 'poetry'] } });
+  const res = await selectRunner(runners('a', 'b', 'c'), { sshBin: ssh.bin, deadlineMs: 3000, readinessNeeds: NEEDS });
+  assert.deepEqual(res.ready, ['b', 'c']);
+  assert.deepEqual(Object.keys(res.readiness), ['a']);
+  assert.deepEqual((await selectRunner(runners('a'), { sshBin: ssh.bin, deadlineMs: 3000, readinessNeeds: NEEDS })).ready, [], 'present on the no-runner return too');
+});
+
+test('a placement clears the gap of every runner that passed (not only the chosen one) and keeps the gap of one it could not probe', async () => {
+  const { env, state, home, repoDir } = remoteSetup({ ssh: 'normal' });
+  const cfg = JSON.parse(fs.readFileSync(path.join(home, 'config.json'), 'utf8'));
+  cfg.runners.push({ ...cfg.runners[0], name: 'wintop' }, { ...cfg.runners[0], name: 'ghost', ssh: 'down' });
+  fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(cfg));
+  const stale = { check: 'tools', missing: ['zzz'] };
+  await recordReadiness(state, { skybox: stale, wintop: stale, ghost: stale }, [], Date.now());
+  const { waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(path.join(tmpDir('marker'), 'where'), 0)], env, repoDir);
+  assert.equal(waited.code, 0, waited.stderr);
+  assert.deepEqual(Object.keys(readReadiness(state)), ['ghost'], 'skybox and wintop passed (one was chosen, one was not); ghost was never probed ready');
+});
+
+test('readiness entries expire after the TTL: not shown, pruned on the next write; a fresh one is kept', async () => {
+  const root = tmpDir('readiness-ttl');
+  const cfg = { ...DEFAULT_GLOBAL_CONFIG, runners: [{ name: 'skybox', ssh: 's' }, { name: 'wintop', ssh: 'w' }] };
+  const now = Date.now();
+  const gap = { check: 'tools', missing: ['rg'] };
+  await recordReadiness(root, { skybox: gap }, [], now - READINESS_TTL_MS - 1);
+  await recordReadiness(root, { wintop: gap }, [], now - READINESS_TTL_MS + 60_000);
+  assert.deepEqual(Object.keys(readReadiness(root, now)), ['wintop']);
+  const lines = renderRunnersLines(collectRunnerStates(root, cfg, now), now).join('\n');
+  assert.doesNotMatch(lines, /skybox .*not ready/);
+  assert.match(lines, /wintop .*not ready/);
+  await recordReadiness(root, {}, [], now);
+  assert.deepEqual(Object.keys(readJsonSafe(paths(root).runnerUnreachable).__readiness), ['wintop'], 'the expired entry is pruned from the file');
+  const raw = readJsonSafe(paths(root).runnerUnreachable);
+  raw.__readiness.bad = { check: 'tools', missing: ['x'] };
+  fs.writeFileSync(paths(root).runnerUnreachable, JSON.stringify(raw));
+  assert.deepEqual(Object.keys(readReadiness(root, now)), ['wintop'], 'an entry without a finite at is dropped');
 });

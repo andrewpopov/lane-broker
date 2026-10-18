@@ -16,7 +16,9 @@ import { runnerAvailability } from './runner-schedule.js';
  */
 
 export const HEARTBEAT_KEY = '__heartbeat';
-/** BRAIN-623: `{ "<runner>": { check, missing, at } }`, the last readiness gap placement found on each runner (see src/runner-readiness.js). */
+/** BRAIN-623: `{ "<runner>": { check, missing, at } }`, the last readiness gap placement found on each runner (see src/runner-readiness.js).
+ *  A placement clears the runners that passed its probe; a runner it never probes (down, off schedule) would keep its gap forever, so an
+ *  entry older than READINESS_TTL_MS is dropped on read and pruned on the next write. */
 export const READINESS_KEY = '__readiness';
 export const HEARTBEAT_FRESH_MS = 5 * 60_000;
 const LOCK_WAIT_MS = 5000;
@@ -29,15 +31,20 @@ export function readUnreachable(root) {
   return Object.fromEntries(Object.entries(raw).filter(([key, value]) => key !== HEARTBEAT_KEY && Number.isFinite(value)));
 }
 
-export function readReadiness(root) {
+export const READINESS_TTL_MS = 60 * 60_000;
+
+const unexpired = (gaps, now) =>
+  Object.fromEntries(Object.entries(gaps).filter(([, gap]) => Number.isFinite(gap?.at) && now - gap.at <= READINESS_TTL_MS));
+
+export function readReadiness(root, now = Date.now()) {
   const gaps = (readJsonSafe(paths(root).runnerUnreachable) ?? {})[READINESS_KEY];
-  return gaps && typeof gaps === 'object' ? gaps : {};
+  return gaps && typeof gaps === 'object' ? unexpired(gaps, now) : {};
 }
 
 /** Record what a placement found: `gaps` (`{ [runner]: { check, missing } }`) are stored with the time; `clear` names runners now known ready. */
 export const recordReadiness = (root, gaps, clear, now) =>
   updateFile(root, (file) => {
-    const stored = { ...(file[READINESS_KEY] ?? {}) };
+    const stored = unexpired(file[READINESS_KEY] ?? {}, now);
     for (const name of clear) delete stored[name];
     for (const [name, gap] of Object.entries(gaps)) stored[name] = { ...gap, at: now };
     if (Object.keys(stored).length > 0) file[READINESS_KEY] = stored;
@@ -148,7 +155,7 @@ export function collectRunnerStates(root, cfg, now = Date.now()) {
   const beat = readHeartbeat(root);
   const unreachable = readUnreachable(root);
   const down = downRunnerReasons(root, cfg, now);
-  const gaps = readReadiness(root);
+  const gaps = readReadiness(root, now);
   const ageMs = heartbeatAgeMs(beat, now);
   return runners.map((runner) => {
     const since = unreachable[runner.name] ?? null;

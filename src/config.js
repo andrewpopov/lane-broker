@@ -8,7 +8,7 @@ import { isCanonicalRelPath } from './remote-manifest.js';
 import { unsupportedHookKeys, hookRefusalMessage } from './exclusive.js';
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
 import { DEFAULT_DEPS_CACHE_MAX_BYTES } from './deps-cache.js';
-import { isValidRequiresShape } from './runner-readiness.js';
+import { isValidRequiresShape, VERSION_FLOOR_RE } from './runner-readiness.js';
 
 /** The largest delay Node's setTimeout honours; above it the timer fires after 1 ms. */
 const MAX_TIMER_MS = 2_147_483_647;
@@ -122,6 +122,9 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // BRAIN-594: a runner continuously unreachable this long has its unresolved remote attempts settled as lost (exit 75,
   // `runner-lost`) by reconcile. 0 disables the bound; `runners[].offline: true` settles at once instead.
   runnerLostAfterMs: 7_200_000,
+  // BRAIN-623: the oldest lane-broker release a runner may run and still be placed on ("X.Y.Z"); a runner reporting less (or no)
+  // version is skipped. null = no floor.
+  runnerVersionFloor: null,
   // BRAIN-597: a runner whose first failed contact (runner-unreachable.json, kept fresh by `lane runner watch`) is at least this old is
   // skipped by placement without being probed. 0 disables the skip.
   runnerDownAfterMs: 300_000,
@@ -375,6 +378,7 @@ function validateGlobalConfig(cfg, sourcePath) {
     `${sourcePath}: "remoteRebindMinLocalWaitMs" must be a non-negative integer`,
   );
   assert(Number.isInteger(cfg.runnerLostAfterMs) && cfg.runnerLostAfterMs >= 0, `${sourcePath}: "runnerLostAfterMs" must be a non-negative integer`);
+  assert(cfg.runnerVersionFloor === null || (typeof cfg.runnerVersionFloor === 'string' && VERSION_FLOOR_RE.test(cfg.runnerVersionFloor)), `${sourcePath}: "runnerVersionFloor" must be null or a version like "0.49.0"`);
   assert(Number.isInteger(cfg.runnerDownAfterMs) && cfg.runnerDownAfterMs >= 0, `${sourcePath}: "runnerDownAfterMs" must be a non-negative integer`);
   assert(Number.isInteger(cfg.remoteProbeDeadlineMs) && cfg.remoteProbeDeadlineMs > 0 && cfg.remoteProbeDeadlineMs <= MAX_TIMER_MS, `${sourcePath}: "remoteProbeDeadlineMs" must be a positive integer no larger than ${MAX_TIMER_MS} (a larger Node timer overflows to 1 ms)`);
   for (const field of ['remoteRebalanceMinQueuedMs', 'remoteRebalanceCooldownMs', 'remoteRebalanceMaxMoves']) {
