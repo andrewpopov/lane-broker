@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, gitFixture, laneRun, laneSpawn, waitFor, BIN } from './helpers.js';
@@ -14,6 +15,14 @@ import { CAPABILITIES } from '../src/capabilities.js';
  * (end-to-end `lane run` CLI calls). Extracted so there is exactly one fake
  * transport, never two independently-drifting copies.
  */
+
+/** The snapshot header a client sent over `remote-exec`'s stdin, from the raw stdin bytes a test's ssh wrapper saved: plain JSON line for a
+ *  legacy runner, a gzip stream (BRAIN-642, snapshot-gzip/1) for the default path. */
+export function readCapturedHeader(file) {
+  let bytes = fs.readFileSync(file);
+  if (bytes[0] === 0x1f && bytes[1] === 0x8b) bytes = zlib.gunzipSync(bytes);
+  return JSON.parse(bytes.subarray(0, bytes.indexOf(10)).toString('utf8'));
+}
 
 export function tmpDir(prefix) {
   return makeTmpDir(`${prefix}-`);

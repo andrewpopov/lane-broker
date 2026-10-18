@@ -5,7 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { laneRun, writeGlobalConfig, waitFor, BIN, freshEnv } from './helpers.js';
-import { setup, tmpDir, markerCmd } from './remote-harness.js';
+import { setup, tmpDir, markerCmd, readCapturedHeader } from './remote-harness.js';
 import { paths, bootId } from '../src/state.js';
 import { writeLease, removeLease, LEASE_STATE } from '../src/lease.js';
 import { listQueue } from '../src/scheduler.js';
@@ -45,7 +45,7 @@ const run = (extraEnv, stdinBuf) =>
     const chunks = [];
     for await (const c of process.stdin) chunks.push(c);
     const buf = Buffer.concat(chunks);
-    fs.writeFileSync(${JSON.stringify(captureFile)}, buf.subarray(0, buf.indexOf(10)));
+    fs.writeFileSync(${JSON.stringify(captureFile)}, buf);
     code = await run({ NODE_OPTIONS: '--import=${CLOCK_STUB}', LANE_TEST_CLOCK_OFFSET_MS: '${runnerClockOffsetMs}' }, buf);
   } else {
     code = await run({});
@@ -65,7 +65,7 @@ function remoteSetup({ ssh = 'normal', probeDelayMs = 0, runnerClockOffsetMs = 0
   const wrapperDir = wrapperSsh({ realSsh, captureFile, probeDelayMs, runnerClockOffsetMs });
   writeGlobalConfig(ctx.runnerHome, { sampleMs: 50, capacity: 4, priorityAgingMs: 60_000, ...runnerConfig });
   const env = { ...ctx.env, PATH: `${wrapperDir}${path.delimiter}${ctx.env.PATH}` };
-  const header = () => JSON.parse(fs.readFileSync(captureFile, 'utf8'));
+  const header = () => readCapturedHeader(captureFile);
   const runnerHistory = () =>
     fs.existsSync(paths(ctx.runnerState).history)
       ? fs.readFileSync(paths(ctx.runnerState).history, 'utf8').trim().split('\n').map((l) => JSON.parse(l))
