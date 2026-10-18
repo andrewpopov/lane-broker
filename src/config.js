@@ -5,6 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { paths, stateHome } from './state.js';
 import { scheduleProblem } from './runner-schedule.js';
 import { isCanonicalRelPath } from './remote-manifest.js';
+import { remoteExcludeShapeProblem, remoteExcludeConflict } from './remote-exclude.js';
 import { unsupportedHookKeys, hookRefusalMessage } from './exclusive.js';
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
 import { DEFAULT_DEPS_CACHE_MAX_BYTES } from './deps-cache.js';
@@ -694,6 +695,10 @@ function validateRepoConfig(cfg, sourcePath) {
         `${sourcePath}: lane "${name}".remoteArtifacts must be a non-empty array (at most ${MAX_REMOTE_ARTIFACT_PATTERNS}) of canonical relative paths or globs ("*" within a segment, "**" as a whole segment), each under a literal directory (so "**/*.json" and "*.json" are refused), no duplicates`,
       );
     }
+    if (lane.remoteExclude !== undefined) {
+      const problem = remoteExcludeShapeProblem(lane.remoteExclude) ?? remoteExcludeConflict(lane.remoteExclude, { remoteDeps: lane.remoteDeps });
+      assert(problem === null, `${sourcePath}: lane "${name}".remoteExclude ${problem}`);
+    }
     if (lane.remoteArtifactsOn !== undefined) {
       assert(REMOTE_ARTIFACTS_ON.includes(lane.remoteArtifactsOn), `${sourcePath}: lane "${name}".remoteArtifactsOn must be "success" or "always"`);
     }
@@ -1079,7 +1084,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   if (isDeclaredLane) {
     laneCfg = repoConfig.lanes[laneName];
   } else if (undeclaredTemplateName) {
-    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/noProgressTimeoutMs/silenceTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteOmitEscapingSymlinks/remoteArtifacts/remoteArtifactsOn/class/priority/aging/cache/rightSize
+    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/noProgressTimeoutMs/silenceTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteOmitEscapingSymlinks/remoteExclude/remoteArtifacts/remoteArtifactsOn/class/priority/aging/cache/rightSize
     // from the named declared lane, keeping this lane's OWN key/name. Not
     // inherited: `localRefused` (stays default false), the template's named
     // conflicts (only the `*` wildcard universe below reaches this lane, same
@@ -1103,6 +1108,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       localFirstWaitMs: templateCfg.localFirstWaitMs,
       remoteDepsCacheRootScriptsSafe: templateCfg.remoteDepsCacheRootScriptsSafe,
       remoteOmitEscapingSymlinks: templateCfg.remoteOmitEscapingSymlinks,
+      remoteExclude: templateCfg.remoteExclude,
       remoteArtifacts: templateCfg.remoteArtifacts,
       remoteArtifactsOn: templateCfg.remoteArtifactsOn,
       class: templateCfg.class,
@@ -1186,6 +1192,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     remoteDepsCacheRootScriptsSafe: laneCfg.remoteDepsCacheRootScriptsSafe === true,
     // BRAIN-334: true leaves a tracked symlink that points outside the repo out of the remote snapshot instead of making the lane ineligible.
     remoteOmitEscapingSymlinks: laneCfg.remoteOmitEscapingSymlinks === true,
+    // BRAIN-642: paths left out of the remote snapshot; ignored by a local run.
+    remoteExclude: Array.isArray(laneCfg.remoteExclude) ? laneCfg.remoteExclude : null,
     // BRAIN-398: files a remote run returns to the submitter's worktree; ignored by a local run (they are already there).
     remoteArtifacts: Array.isArray(laneCfg.remoteArtifacts) ? laneCfg.remoteArtifacts : null,
     remoteArtifactsOn: laneCfg.remoteArtifactsOn === 'always' ? 'always' : 'success',

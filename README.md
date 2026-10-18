@@ -356,7 +356,7 @@ form: an undeclared `--lane` name still keeps its own key and name (the
 same-key exclusivity rule above is unaffected — two sessions using the same
 ad-hoc name still conflict with each other), but instead of the no-config-file
 default it inherits `weight`, `cpuCores`, `minCpuCores`, `memoryBytes`, `nice`, `remote`,
-`requires`, `remoteDeps`, `remoteSetup`, `remoteOmitEscapingSymlinks`, `remoteArtifacts` and `remoteArtifactsOn` from the named declared lane. It does NOT
+`requires`, `remoteDeps`, `remoteSetup`, `remoteOmitEscapingSymlinks`, `remoteExclude`, `remoteArtifacts` and `remoteArtifactsOn` from the named declared lane. It does NOT
 inherit that lane's own named `conflicts` entries or its `maxConcurrent`
 (stays `1`) — only the `*` wildcard universe still reaches it, same as plain
 `"allow"`. The named lane must be declared and must not be `localRefused`.
@@ -708,6 +708,14 @@ The check list lives in `src/runner-readiness.js` (`READINESS_CHECKS`); further 
   safe despite them.
 - `remoteSetup`: argv arrays run in the repo root after deps, before the
   command.
+- `remoteExclude` (BRAIN-642): an array of at most 64 patterns (each at most 256 characters) naming paths to leave out of
+  the remote snapshot to shrink it. `*` stays within one path segment, `**` is a whole segment, and a trailing `/` means
+  a directory and everything under it. Excluded files are never read or hashed, and are out of consideration entirely
+  (an excluded `.env` is not an ineligibility refusal). No `!`, absolute paths or `..`. A pattern that would exclude
+  `.lane-broker.json`, a `remoteDeps` dir's `package.json` or lockfile, or the directory the lane runs in is refused
+  (config load, or `lane run` for the working directory). Dispatch prints `lane: remote snapshot excludes N files / X MB
+  (pattern: count)` and warns about a pattern that matched nothing. Caveat: the runner's synthetic git repo only sees the
+  included files, so a command that needs an excluded file fails remotely. Client-side only; works with any runner.
 - `remoteOmitEscapingSymlinks` (BRAIN-334): `true` leaves a tracked symlink
   whose target points outside the repo root (a relative target that climbs
   above it, or any absolute target) out of the snapshot instead of making the

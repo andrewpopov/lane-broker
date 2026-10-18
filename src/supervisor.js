@@ -39,6 +39,7 @@ import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, l
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness } from './runner-unreachable.js';
 import { readinessNeeds } from './runner-readiness.js';
 import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
+import { remoteExcludeWarnings } from './remote-exclude.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
 import { REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
@@ -799,10 +800,14 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // comment).
   let manifest;
   try {
-    manifest = buildManifest(enriched.remote.worktreeRoot, { omitEscapingSymlinks: enriched.remote.remoteOmitEscapingSymlinks === true });
+    manifest = buildManifest(enriched.remote.worktreeRoot, { omitEscapingSymlinks: enriched.remote.remoteOmitEscapingSymlinks === true, exclude: enriched.remote.remoteExclude ?? null });
   } catch (err) {
     if (!(err instanceof RemoteIneligibleError)) throw err;
     return fallbackOrRefuse(null, err.message);
+  }
+  for (const line of remoteExcludeWarnings(manifest.excluded)) {
+    process.stderr.write(line);
+    writeBrokerLog(root, line);
   }
   const omittedSymlinks = manifest.omittedSymlinks ?? [];
   if (omittedSymlinks.length > 0) {
@@ -1018,7 +1023,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
         beforeWithdraw: async ({ from, to }) => {
           let unchanged = false;
           try {
-            unchanged = buildManifest(enriched.remote.worktreeRoot, { omitEscapingSymlinks: enriched.remote.remoteOmitEscapingSymlinks === true }).manifestHash === manifest.manifestHash;
+            unchanged = buildManifest(enriched.remote.worktreeRoot, { omitEscapingSymlinks: enriched.remote.remoteOmitEscapingSymlinks === true, exclude: enriched.remote.remoteExclude ?? null }).manifestHash === manifest.manifestHash;
           } catch {
             // ineligible now: it changed
           }
