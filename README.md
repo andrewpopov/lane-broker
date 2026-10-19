@@ -1239,7 +1239,7 @@ A warning shows in the log as `lane: warning: remote artifacts: ...` and in the 
 `remoteArtifactsWarning`. The lane's success is about the command: a stamp that did not arrive shows up when whatever
 reads it refuses.
 
-### CPU quota per lane (`cpuLimit`, BRAIN-651 L1, L2)
+### CPU quota per lane (`cpuLimit`, BRAIN-651 L1, L2, L3)
 
 `"cpuLimit": "off" | "prefer" | "require"` (global config, default `"off"`; any other value is a config error naming the key) is the
 opt-in for enforcing a lane's admitted CPU grant on a **Linux** host with a transient systemd scope, `CPUQuota=<grant x 100>%`.
@@ -1247,8 +1247,13 @@ With `"prefer"` or `"require"` and a passing probe, the supervisor spawns each l
 where the grant is the one admission gave (an elastic grant included, the same number as `LANE_BROKER_CPU_CORES`; a fractional grant rounds up).
 `--scope` execs the command in place, so `nice`, cwd, env, stdout/stderr and the exit status are unchanged. A remote protocol-2 pipeline is the lane child,
 so its deps install, setup and command share one scope. The unit name is recorded on the lease as `cpuScopeUnit` (only when a scope was made).
-With `"off"`, on macOS, or under `"prefer"` with a failed probe, the spawn is exactly what it was before. Stopping and reaping the scope on cancel, watchdog kill
-and orphan recovery is a later change (L3): until then cancellation still kills the process group and tracked descendants only.
+With `"off"`, on macOS, or under `"prefer"` with a failed probe, the spawn is exactly what it was before.
+Cancel semantics (L3): when a lease carries `cpuScopeUnit`, every way a lane is ended also runs `systemctl --user stop <unit>`, in addition to the
+process-group and tracked-descendant signals that always ran. The scope stop signals every process in the scope (control-group kill: SIGTERM, then SIGKILL
+after the unit's stop timeout), a `setsid`'d grandchild included, and returns once the scope is empty. It runs for `lane cancel` of an orphaned lease, for a
+supervisor reaping after a cancel, a signal or the silence/no-progress watchdog, and for orphan recovery of a dead supervisor's lease. The lease is released only
+after the stop returns, or after 15 s: a stop that did not complete is logged in the admission log as `lane-broker-cpu-scope id=<id> unit=<unit> stop-incomplete reason=<why>`
+and the lease is released anyway. A scope that is already unloaded counts as stopped. A lease without `cpuScopeUnit` (cpuLimit off, macOS, failed probe) behaves exactly as before.
 
 - The probe runs `systemd-run --user --scope -p CPUQuota=100% --quiet sh -c <read cpu.max>` as the broker's own user and requires the
   scope's `cpu.max` to read back `100000 100000`. It reports `{mode, available, reason}`: `unsupported-platform` on macOS,
