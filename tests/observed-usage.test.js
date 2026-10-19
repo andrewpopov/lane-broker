@@ -197,7 +197,16 @@ test('lane status: an overrunning RUNNING lease is marked, with observed/booked 
   }
 });
 
-const busyCmd = (ms) => [process.execPath, '-e', `const end=Date.now()+${ms};while(Date.now()<end){}`];
+// A busy loop gets less than a core when the machine is contended, so the sampled peak is checked against the share it
+// actually got rather than a fixed rate (BRAIN-661: a fixed 0.3 read 0.279 under load).
+const busyLoop = (ms, statsFile) =>
+  `const c0=process.cpuUsage(),t0=Date.now();while(Date.now()<t0+${ms}){}const c=process.cpuUsage(c0);` +
+  `require('fs').writeFileSync(${JSON.stringify(statsFile)},JSON.stringify({cores:(c.user+c.system)/1000/(Date.now()-t0)}));`;
+const assertReadsAsBusy = (observedCpu, statsFile) => {
+  const { cores } = JSON.parse(fs.readFileSync(statsFile, 'utf8'));
+  assert.ok(observedCpu.peak > 0 && observedCpu.peak >= cores / 2,
+    `a busy loop that got ${cores.toFixed(3)} cores must read as CPU: ${JSON.stringify(observedCpu)}`);
+};
 const lastRow = (root) => fs.readFileSync(paths(root).history, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).at(-1);
 
 test('end to end (local): the history row carries observedCpu and observedRssPeakBytes', async () => {
@@ -205,11 +214,12 @@ test('end to end (local): the history row carries observedCpu and observedRssPea
   writeGlobalConfig(home, { version: 1, capacity: 100, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
   const repoDir = path.join(base, 'repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, cpuCores: 2 } } });
-  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...busyCmd(1500)], { env, cwd: repoDir });
+  const stats = path.join(tmpDir('busy'), 'stats.json');
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', process.execPath, '-e', busyLoop(1500, stats)], { env, cwd: repoDir });
   assert.equal(result.code, 0, result.stderr);
   const row = lastRow(state);
   assert.ok(row.observedCpu.samples >= 2, JSON.stringify(row.observedCpu));
-  assert.ok(row.observedCpu.peak > 0.3, `a busy loop must read as CPU: ${JSON.stringify(row.observedCpu)}`);
+  assertReadsAsBusy(row.observedCpu, stats);
   assert.ok(row.observedCpu.mean > 0 && row.observedCpu.mean <= row.observedCpu.peak);
   assert.ok(row.observedRssPeakBytes > 1_000_000);
 });
@@ -220,12 +230,13 @@ test('end to end (remote): runner history AND the submitter history carry observ
   gitFixture(['add', '-A'], repoDir);
   gitFixture(['commit', '-q', '-m', 'x'], repoDir);
   const marker = path.join(tmpDir('marker'), 'where');
-  const cmd = [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local'); const end=Date.now()+1500;while(Date.now()<end){}`];
+  const stats = path.join(tmpDir('busy'), 'stats.json');
+  const cmd = [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local');${busyLoop(1500, stats)}`];
   const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...cmd], { env, cwd: repoDir });
   assert.equal(result.code, 0, `stderr: ${result.stderr}`);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
   const runnerRow = lastRow(runnerState);
-  assert.ok(runnerRow.observedCpu.peak > 0.3, `runner: ${JSON.stringify(runnerRow.observedCpu)}`);
+  assertReadsAsBusy(runnerRow.observedCpu, stats);
   const submitter = lastRow(state);
   assert.equal(submitter.executor, 'remote');
   assert.deepEqual(submitter.observedCpu, runnerRow.observedCpu);
