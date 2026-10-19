@@ -578,7 +578,7 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
   const expectedMs = scheduled ? expectedRunMs(readRows(paths(root).history), enriched.repoId, enriched.lane) : null;
   // BRAIN-597: first placement, rebind and rebalance all select through here, so a down runner is skipped by every one of them.
   const downRunners = downRunnerReasons(root, globalCfg);
-  // BRAIN-649: a `remoteExclusive` lane takes a whole runner, so it is placed only on an idle one that honours the flag
+  // BRAIN-649: a `remoteExclusive` lane takes a whole runner and its intake waits for the leases to drain: an idle runner is preferred, else the shortest queue
   const exclusiveOnRunner = enriched.remote?.remoteExclusive === true;
   return {
     ...(expectedMs !== null ? { expectedRunMs: expectedMs } : {}),
@@ -589,7 +589,7 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
     maxRemoteQueue: globalCfg.maxRemoteQueue,
     requireProtocol2: needsProtocol2(enriched.remote) || Boolean(queueTimeoutFor(enriched, globalCfg)),
     requireCapabilities: [...(isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : []), ...(exclusiveOnRunner ? [REMOTE_EXCLUSIVE_CAPABILITY] : [])],
-    requireIdle: exclusiveOnRunner,
+    preferIdle: exclusiveOnRunner,
     readinessNeeds: readinessNeeds(enriched.remote, globalCfg),
     reservation: {
       weight: enriched.weight,
@@ -607,9 +607,10 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
  */
 export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHome(), stuckLocally = false, draining = false } = {}) {
   const base = remoteSelectOptions(enriched, globalCfg, root);
-  if (kind === 'rebind') return { ...base, maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0 };
+  // a move or rebind picks a better home for a ticket that already has one, so it never takes a loaded runner for the exclusive drain
+  if (kind === 'rebind') return { ...base, preferIdle: false, maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0 };
   if (kind === 'rebalance') {
-    return { ...base, maxRemoteQueue: 0, requireCapabilities: draining ? [...base.requireCapabilities, REMOTE_WITHDRAW_CAPABILITY] : base.requireCapabilities };
+    return { ...base, preferIdle: false, maxRemoteQueue: 0, requireCapabilities: draining ? [...base.requireCapabilities, REMOTE_WITHDRAW_CAPABILITY] : base.requireCapabilities };
   }
   return base;
 }
@@ -896,13 +897,17 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   if (queuedChoice) {
     queuedAt = `${runner.name}(${probe.queued})`;
     const ineligible = localIneligibility();
-    const local = ineligible ? null : await couldAdmitNow(root, globalCfg, enriched);
+    // BRAIN-649: a remoteExclusive lane waits for its runner to drain; it is never run locally because this machine could admit it
+    const exclusive = enriched.remote?.remoteExclusive === true;
+    const local = ineligible || exclusive ? null : await couldAdmitNow(root, globalCfg, enriched);
     if (local?.admit) {
       const reason = skipped.map((s) => `${s.name}: ${s.reason}`).join('; ');
       return fallbackOrRefuse(null, `${reason}; local can admit now, not queuing on ${queuedAt}`, { rebindable: true });
     }
     const line = ineligible
       ? `lane: queuing on ${queuedAt}: not locally eligible (${ineligible.message.trim()})\n`
+      : exclusive
+      ? `lane: queuing on ${queuedAt}: remoteExclusive lane waits for the runner to drain\n`
       : `lane: queuing on ${queuedAt}: local cannot admit now (${local.reason})\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);

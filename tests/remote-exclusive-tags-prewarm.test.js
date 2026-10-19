@@ -5,7 +5,7 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { selectRunner } from '../src/remote-client.js';
-import { remoteSelectOptions } from '../src/supervisor.js';
+import { remoteSelectOptions, selectionOptionsFor } from '../src/supervisor.js';
 import { resolveTicketConfig, ConfigError, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { readinessGap, readinessProbeArgs, parseReadinessArgs } from '../src/runner-readiness.js';
 import { runCommand } from '../src/run.js';
@@ -45,38 +45,59 @@ const runners = (...names) => names.map((n) => makeRunner({ ssh: n }));
 
 // ---- remoteExclusive: placement ----
 
-test('requireIdle: a runner running or queueing anything is skipped; the idle one is chosen, whatever the config order', async () => {
+test('preferIdle: an idle eligible runner is taken over busy and queued ones, whatever the config order', async () => {
   const sshBin = makeProbeSsh({ probes: { busy: { running: 1 }, queued: { queued: 1 }, idle: {} } });
-  const res = await selectRunner(runners('busy', 'queued', 'idle'), { sshBin, deadlineMs: 3000, requireIdle: true, maxRemoteQueue: 5 });
+  const res = await selectRunner(runners('busy', 'queued', 'idle'), { sshBin, deadlineMs: 3000, preferIdle: true, maxRemoteQueue: 0 });
   assert.equal(res.runner.name, 'idle');
-  assert.deepEqual(res.skipped.map((s) => s.name), ['busy', 'queued']);
-  assert.match(res.skipped[0].reason, /not idle \(running 1, queued 0\).*remoteExclusive/);
+  assert.equal(res.queuedChoice, undefined);
 });
 
-test('requireIdle: with no idle runner nothing is chosen, not even as a queued or busy choice (control: without it the queued runner is taken)', async () => {
-  const sshBin = makeProbeSsh({ probes: { busy: { running: 1 }, queued: { queued: 1 } } });
-  const exclusive = await selectRunner(runners('busy', 'queued'), { sshBin, deadlineMs: 3000, requireIdle: true, maxRemoteQueue: 5 });
-  assert.equal(exclusive.runner, null);
-  assert.equal(exclusive.queuedChoice, undefined);
-  const control = await selectRunner(runners('queued'), { sshBin, deadlineMs: 3000, maxRemoteQueue: 5 });
-  assert.equal(control.runner.name, 'queued');
+test('preferIdle: with none idle the least-loaded eligible runner is the queued choice, past maxRemoteQueue (not no-runner); control: an ordinary lane gets none', async () => {
+  const sshBin = makeProbeSsh({ probes: { deep: { running: 2, queued: 9 }, busy: { running: 3, queued: 0 }, mid: { running: 1, queued: 4 } } });
+  const res = await selectRunner(runners('deep', 'busy', 'mid'), { sshBin, deadlineMs: 3000, preferIdle: true, maxRemoteQueue: 2 });
+  assert.equal(res.runner.name, 'busy');
+  assert.equal(res.queuedChoice, true);
+  assert.match(res.skipped.find((s) => s.name === 'busy').reason, /not idle \(running 3, queued 0\).*drain/);
+  const tie = await selectRunner(runners('deep', 'mid', 'mid2'), { sshBin: makeProbeSsh({ probes: { deep: { queued: 4 }, mid: { queued: 4, headroom: { cpuCores: 1 } }, mid2: { queued: 4, headroom: { cpuCores: 8 } } } }), deadlineMs: 3000, preferIdle: true, reservation: { weight: 1, cpuCores: 1, memoryBytes: 0 } });
+  assert.equal(tie.runner.name, 'mid2', 'equal queues: more free CPU wins');
+  const control = await selectRunner(runners('deep', 'busy', 'mid'), { sshBin, deadlineMs: 3000, maxRemoteQueue: 2 });
+  assert.equal(control.runner.name, 'busy');
+  const controlDeep = await selectRunner(runners('deep'), { sshBin, deadlineMs: 3000, maxRemoteQueue: 2 });
+  assert.equal(controlDeep.runner, null);
 });
 
-test('remoteSelectOptions: a remoteExclusive lane requires an idle runner that advertises remote-exclusive/1; an ordinary lane neither', () => {
+test('preferIdle: a runner missing the tag or the capability is never chosen, even when idle, and with none eligible there is no runner', async () => {
+  const sshBin = makeProbeSsh({
+    probes: { idleNoTag: {}, idleOld: { capabilities: ['exclusive/1'] }, loaded: { running: 2, queued: 3 } },
+    tags: { loaded: ['browser'] },
+  });
+  const needs = { sshBin, deadlineMs: 3000, preferIdle: true, requireCapabilities: [REMOTE_EXCLUSIVE_CAPABILITY], readinessNeeds: { tags: ['browser'] } };
+  const res = await selectRunner(runners('idleNoTag', 'idleOld', 'loaded'), needs);
+  assert.equal(res.runner.name, 'loaded');
+  assert.equal(res.queuedChoice, true);
+  const none = await selectRunner(runners('idleNoTag', 'idleOld'), needs);
+  assert.equal(none.runner, null);
+  assert.equal(none.queuedChoice, undefined);
+});
+
+test('remoteSelectOptions: a remoteExclusive lane prefers an idle runner and requires remote-exclusive/1; rebind and rebalance never take a loaded one; an ordinary lane neither', () => {
   const cfg = { ...DEFAULT_GLOBAL_CONFIG, runners: [] };
   const base = { id: 'x', lane: 'l', repoId: 'r', weight: 1, resources: {}, remote: {} };
   const exclusive = remoteSelectOptions({ ...base, remote: { remoteExclusive: true } }, cfg, tmpDir('opts'));
-  assert.equal(exclusive.requireIdle, true);
+  assert.equal(exclusive.preferIdle, true);
   assert.ok(exclusive.requireCapabilities.includes(REMOTE_EXCLUSIVE_CAPABILITY));
+  const exclusiveEnriched = { ...base, remote: { remoteExclusive: true } };
+  for (const kind of ['rebind', 'rebalance']) assert.equal(selectionOptionsFor(kind, exclusiveEnriched, cfg, { root: tmpDir('opts') }).preferIdle, false);
+  assert.equal(selectionOptionsFor('place', exclusiveEnriched, cfg, { root: tmpDir('opts') }).preferIdle, true);
   const plain = remoteSelectOptions(base, cfg, tmpDir('opts'));
-  assert.equal(plain.requireIdle, false);
+  assert.equal(plain.preferIdle, false);
   assert.deepEqual(plain.requireCapabilities, []);
   assert.ok(CAPABILITIES.includes(REMOTE_EXCLUSIVE_CAPABILITY));
 });
 
 test('a runner that does not advertise remote-exclusive/1 (an older release, which would ignore the flag) is skipped', async () => {
   const sshBin = makeProbeSsh({ probes: { old: { capabilities: ['exclusive/1'] }, current: {} } });
-  const res = await selectRunner(runners('old', 'current'), { sshBin, deadlineMs: 3000, requireIdle: true, requireCapabilities: [REMOTE_EXCLUSIVE_CAPABILITY] });
+  const res = await selectRunner(runners('old', 'current'), { sshBin, deadlineMs: 3000, preferIdle: true, requireCapabilities: [REMOTE_EXCLUSIVE_CAPABILITY] });
   assert.equal(res.runner.name, 'current');
   assert.match(res.skipped[0].reason, /does not advertise remote-exclusive\/1/);
 });
