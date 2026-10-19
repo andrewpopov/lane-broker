@@ -150,6 +150,7 @@ never told to forward to it — both still get the `--log` file.
   "resourceIdleOvershootCores": 1,
   "admissionLoadGate": false,
   "laneNice": 10,
+  "localExecution": "allowed",
   "priorityNice": { "high": 5 },
   "noProgressTimeoutMs": 0
 }
@@ -390,6 +391,28 @@ A lane with `localRefused: true` (the `sim` lane by default, matching the
 rouge fleet split) is refused on `lane run` unless `--allow-local-sim` is
 passed — print a refusal message and exit `69` instead. The message points at
 `ROUGE_FLEET_SUBMIT_DSN` (never its value) only for a `class: "sim"` lane.
+
+`localWindow` (global config, default `null`; BRAIN-629) lets named `localRefused`
+lanes run on this machine during a window, e.g. the Mac taking nightly
+release-candidate e2e. A dispatch-only host (`localExecution: "refused"`, BRAIN-634)
+ignores it: nothing runs locally there, window or not.
+
+```json
+"localWindow": {
+  "schedule": { "timezone": "America/Los_Angeles", "available": [{ "days": ["mon", "tue", "wed", "thu", "fri", "sat", "sun"], "from": "01:00", "to": "06:00" }] },
+  "lanes": ["train", "e2e"]
+}
+```
+
+`schedule` has the same shape as a runner's `schedule`; `lanes` is a non-empty
+list of lane names. While the window is open, a listed lane is no longer refused
+locally and is placed like any remote-eligible lane that is not `localRefused`
+(runner or this machine, whichever placement picks; the window does not force
+local). It is evaluated at every placement attempt, so a ticket queued before the
+window opens can run here once it opens, and none starts here after it closes. An
+unlisted lane (rouge's `sim`) stays refused, and so does a listed lane outside the
+window. The placement log line reads `running locally (localWindow 01:00-06:00)`.
+`--allow-local-sim` still overrides per run.
 
 A lane's own `nice` (integer `0`-`19`) overrides the global `laneNice` for
 that lane only; omit it to use the global default.
@@ -676,13 +699,22 @@ naming the field.
 The submitter sends the names in the runner probe it already makes (`lane remote-probe --requires rg,poetry`); the runner answers
 `tools: {"rg": true, "poetry": false}`, resolving each against the `PATH` of the login shell the probe ran in. A runner lacking one is
 skipped for that lane only (`remote-skip` / the selection reason reads `missing tool poetry (required by the lane)`), and `lane status`
-shows `not ready: missing poetry (<age> ago)` on that runner until a placement passes it again. A runner older than 0.47.0 ignores the
+shows `not ready: missing poetry (<age> ago)` on that runner until a placement passes it again (any placement whose probe the runner passes clears it, chosen or not) or an hour passes. A runner older than 0.47.0 ignores the
 flag and answers no `tools`, so it counts as **not ready** for a lane with `requires` (it cannot vouch for the tool); a lane without
 `requires` sends the probe command it always did and is unaffected.
 
 With no eligible runner a remote-eligible lane runs locally (the local machine is not checked for the tool), and a remote-only
 (`localRefused`) lane exits `76` ("no runner can take it now", retryable) with the message naming each runner and its reason.
 The check list lives in `src/runner-readiness.js` (`READINESS_CHECKS`); further readiness checks are added there.
+
+Two more checks need nothing from the lane (BRAIN-623):
+
+- **Version floor.** Set `runnerVersionFloor` (`"X.Y.Z"`, default `null` = none; anything else is a config error) in the global config and a
+  runner whose probe reports a lower `lane-broker` version, or none, is skipped (`lane-broker 0.47.0 is below the floor 0.49.0`).
+  Compared as numbers, major then minor then patch.
+- **Install integrity.** Every runner of this release reports `integrity.zeroLength`: the zero-length files under its own package's `bin/` and
+  `src/` plus `package.json` (what an unclean shutdown leaves behind). A runner reporting any is skipped (`truncated install: 2 zero-length
+  file(s) (src/a.js, src/b.js)`). A runner that reports no `integrity` (older) is not skipped for it; use the version floor to exclude those.
 
 ### Dependencies and setup on the runner (BRAIN-320)
 
@@ -1206,6 +1238,30 @@ What it refuses, as a warning and never a change to the exit code or to the publ
 A warning shows in the log as `lane: warning: remote artifacts: ...` and in the history row as
 `remoteArtifactsWarning`. The lane's success is about the command: a stamp that did not arrive shows up when whatever
 reads it refuses.
+
+### Dispatch-only host (`localExecution`)
+
+`"localExecution": "refused"` (default `"allowed"`; any other value is a config error) makes this host dispatch-only,
+for a controller that must never execute a lane payload (BRAIN-634, e.g. a Pi that also hosts production Postgres).
+Every ticket behaves as remote-only whatever the repo's `.lane-broker.json` says: a lane not marked `remote`, an
+`undeclaredLanes` lane, `--local` and `LANE_BROKER_LOCAL=1` all dispatch to a runner, and `remoteQueueTimeoutMs`
+never expires a ticket into a local run. Nothing ever falls back to local; instead:
+
+- exit `76` when the ticket is remote-eligible but no runner can take it (runners down or busy-refused, a dispatch lost
+  before it started); retry later;
+- exit `69`, with a stderr line naming `localExecution is refused`, when it can never go remote from here (no runners
+  configured, a tree that cannot be snapshotted, an exclusive lane, a nested run inside a lease, a runner intake).
+
+Fail-closed: the refusal is in force when the config says `refused`, **or** a file named `local-execution-refused` exists
+in the broker home (`$LANE_BROKER_HOME`, default `~/.config/lane-broker`), **or** `LANE_BROKER_LOCAL_EXECUTION=refused` is
+in the environment. The last two do not depend on parsing `config.json`, which loads as defaults when missing or invalid,
+so provision the marker on a controller host (the systemd unit can set the env var too). The host is re-checked right before
+a payload spawns and at every `lane remote-pipeline` phase (deps, cached-deps script replay, setup, command; exit `69`).
+A permanent rejection by a runner, or runners that can never fit the ticket, exit `69`; unavailable or busy runners `76`.
+
+A ticket already queued locally when the setting is turned on is refused on its next poll instead of started (`76`
+if it was remote-eligible, else `69`). `lane capabilities --json` then lists `dispatch-only/1`, and `lane status`
+prints `local execution: refused`.
 
 ### Queue timeout
 

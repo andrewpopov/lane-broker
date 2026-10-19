@@ -9,7 +9,7 @@ import { remoteExcludeShapeProblem, remoteExcludeConflict } from './remote-exclu
 import { unsupportedHookKeys, hookRefusalMessage } from './exclusive.js';
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
 import { DEFAULT_DEPS_CACHE_MAX_BYTES } from './deps-cache.js';
-import { isValidRequiresShape } from './runner-readiness.js';
+import { isValidRequiresShape, VERSION_FLOOR_RE } from './runner-readiness.js';
 
 /** The largest delay Node's setTimeout honours; above it the timer fires after 1 ms. */
 const MAX_TIMER_MS = 2_147_483_647;
@@ -123,6 +123,12 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // BRAIN-594: a runner continuously unreachable this long has its unresolved remote attempts settled as lost (exit 75,
   // `runner-lost`) by reconcile. 0 disables the bound; `runners[].offline: true` settles at once instead.
   runnerLostAfterMs: 7_200_000,
+  // BRAIN-623: the oldest lane-broker release a runner may run and still be placed on ("X.Y.Z"); a runner reporting less (or no)
+  // version is skipped. null = no floor.
+  runnerVersionFloor: null,
+  // BRAIN-629: null, or `{ schedule, lanes }`: during `schedule` (a runner-style schedule on this machine's clock) the named
+  // remote-eligible `localRefused` lanes may run on THIS machine. Outside it, and for every unlisted lane, nothing changes.
+  localWindow: null,
   // BRAIN-597: a runner whose first failed contact (runner-unreachable.json, kept fresh by `lane runner watch`) is at least this old is
   // skipped by placement without being probed. 0 disables the skip.
   runnerDownAfterMs: 300_000,
@@ -153,6 +159,8 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // niceing (spawns the bare command). A `.lane-broker.json` lane's own
   // `nice` overrides this per-lane.
   laneNice: 10,
+  // BRAIN-634: `refused` makes this host dispatch-only: no lane payload ever executes here, whatever a repo config says.
+  localExecution: 'allowed',
   // BRAIN-627: the nice a lane runs at, by the tier it was ADMITTED at; a tier not named uses laneNice, and a lane's own
   // `nice` wins over both. A human-waiting `high` lane runs ahead of medium/low ones, so admission trusts the kernel to
   // yield them (preemptibleNiceMin / preemptibleShare). `{}` gives every tier laneNice.
@@ -383,6 +391,18 @@ function validateGlobalConfig(cfg, sourcePath) {
     `${sourcePath}: "remoteRebindMinLocalWaitMs" must be a non-negative integer`,
   );
   assert(Number.isInteger(cfg.runnerLostAfterMs) && cfg.runnerLostAfterMs >= 0, `${sourcePath}: "runnerLostAfterMs" must be a non-negative integer`);
+  assert(cfg.runnerVersionFloor === null || (typeof cfg.runnerVersionFloor === 'string' && VERSION_FLOOR_RE.test(cfg.runnerVersionFloor)), `${sourcePath}: "runnerVersionFloor" must be null or a version like "0.49.0"`);
+  if (cfg.localWindow !== null) {
+    const win = cfg.localWindow;
+    assert(win && typeof win === 'object' && !Array.isArray(win), `${sourcePath}: "localWindow" must be null or an object`);
+    for (const key of Object.keys(win)) assert(['schedule', 'lanes'].includes(key), `${sourcePath}: "localWindow" has unknown key "${key}"`);
+    const problem = scheduleProblem(win.schedule);
+    assert(problem === null, `${sourcePath}: "localWindow": ${problem}`);
+    assert(
+      Array.isArray(win.lanes) && win.lanes.length > 0 && win.lanes.every((l) => typeof l === 'string' && l.length > 0),
+      `${sourcePath}: "localWindow.lanes" must be a non-empty array of lane names`,
+    );
+  }
   assert(Number.isInteger(cfg.runnerDownAfterMs) && cfg.runnerDownAfterMs >= 0, `${sourcePath}: "runnerDownAfterMs" must be a non-negative integer`);
   assert(Number.isInteger(cfg.remoteProbeDeadlineMs) && cfg.remoteProbeDeadlineMs > 0 && cfg.remoteProbeDeadlineMs <= MAX_TIMER_MS, `${sourcePath}: "remoteProbeDeadlineMs" must be a positive integer no larger than ${MAX_TIMER_MS} (a larger Node timer overflows to 1 ms)`);
   for (const field of ['remoteRebalanceMinQueuedMs', 'remoteRebalanceCooldownMs', 'remoteRebalanceMaxMoves']) {
@@ -417,6 +437,10 @@ function validateGlobalConfig(cfg, sourcePath) {
   assert(Number.isInteger(cfg.idleCreditAfterMs) && cfg.idleCreditAfterMs > 0, `${sourcePath}: "idleCreditAfterMs" must be a positive integer`);
   assert(cfg.idleCreditMode !== 'active', `${sourcePath}: "idleCreditMode" "active" is not implemented until BRAIN-532 step 3`);
   assert(['off', 'shadow'].includes(cfg.idleCreditMode), `${sourcePath}: "idleCreditMode" must be "off" or "shadow"`);
+  assert(
+    cfg.localExecution === 'allowed' || cfg.localExecution === 'refused',
+    `${sourcePath}: "localExecution" must be "allowed" or "refused"`,
+  );
   // BRAIN-320 S1a: how long a remote ticket may sit queued on the runner
   // before it is cancelled and treated as unconfirmed (fallback to local).
   // Absent by default (not read yet -- that is a later slice) so a config
@@ -868,6 +892,18 @@ export function loadGlobalConfigOrError() {
 /** A config that could not be (re)read leaves the class policy unknown ONLY where classes were ever configured; elsewhere it is 0.28.2 behaviour. */
 function withClassPolicyUnknown(cfg, reason) {
   return cfg.classes !== undefined || cfg.classesInvalid !== undefined || classesFenceHeld() ? { ...cfg, classesInvalid: reason } : cfg;
+}
+
+/** BRAIN-634: file whose mere presence in the broker home keeps this host dispatch-only even when config.json is missing or invalid. */
+export const LOCAL_EXECUTION_MARKER = 'local-execution-refused';
+
+/**
+ * BRAIN-634: the ONE answer to "may this host execute a lane payload". Refused when the config says so, when the marker file
+ * exists in the broker home, or when LANE_BROKER_LOCAL_EXECUTION=refused: the last two do not depend on parsing config.json,
+ * so a missing or invalid config (which loads as defaults) cannot silently restore local execution.
+ */
+export function isDispatchOnly(cfg) {
+  return cfg?.localExecution === 'refused' || process.env.LANE_BROKER_LOCAL_EXECUTION === 'refused' || fs.existsSync(path.join(brokerHome(), LOCAL_EXECUTION_MARKER));
 }
 
 export function reloadGlobalConfig(previous, { onError } = {}) {

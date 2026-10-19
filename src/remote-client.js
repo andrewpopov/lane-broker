@@ -220,7 +220,8 @@ function neverFits(reservation, probe) {
  * `opts.downRunners` (BRAIN-597): `{ [runner name]: skip reason }` for runners unreachable long enough to be skipped without probing.
  *
  * `opts.readinessNeeds` (BRAIN-623, `{ <check id>: need }`, see src/runner-readiness.js): sent to each runner in its probe; a runner whose answer does not
- * meet them (a missing tool, or no answer from an older runner) is skipped and named in `readiness` (`{ [runner]: { check, missing } }`).
+ * meet them (a missing tool, or no answer from an older runner) is skipped and named in `readiness` (`{ [runner]: { check, missing } }`);
+ * every runner whose probe met them is listed in `ready`, so a caller can clear their stored gaps.
  *
  * `opts.requireCapabilities` (BRAIN-321): capability strings the runner's probe must advertise, else it is skipped.
  *
@@ -243,6 +244,7 @@ export async function selectRunner(runners, opts = {}) {
   const { env, requireProtocol2 = false, requireCapabilities = [], readinessNeeds = {}, reservation, maxRemoteQueue = 0, downRunners = {} } = opts;
   const skipped = [];
   const readiness = {};
+  const ready = [];
   // BRAIN-405: every runner is probed, then the idle one with real room and the earliest estimated finish wins (ties: more
   // free CPU, then config order). A runner with an empty queue but no headroom is not idle, however empty its queue.
   let idleBest = null;
@@ -310,6 +312,7 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason: gap.reason });
       continue;
     }
+    ready.push(runner.name);
     if (probe.configError) {
       skipped.push({ name: runner.name, reason: `runner config unreadable: ${probe.configError}` });
       continue;
@@ -329,7 +332,9 @@ export async function selectRunner(runners, opts = {}) {
     if (probe.queued !== 0) {
       const overCap = maxRemoteQueue > 0 && probe.queued > maxRemoteQueue;
       skipped.push({ name: runner.name, reason: `queued: ${probe.queued}${overCap ? ` (over maxRemoteQueue ${maxRemoteQueue})` : ''}` });
-      const fits = !(reservation && neverFits(reservation, probe));
+      const never = Boolean(reservation && neverFits(reservation, probe));
+      skipped[skipped.length - 1].neverFits = never;
+      const fits = !never;
       const queueable = Number.isInteger(probe.queued) && probe.queued > 0 && probe.queued <= maxRemoteQueue;
       if (fits && queueable) {
         const cand = { runner, probe, finish: estimatedFinish(reservation, probe, runner), cpuFree: 0 };
@@ -338,7 +343,7 @@ export async function selectRunner(runners, opts = {}) {
       continue;
     }
     if (reservation && neverFits(reservation, probe)) {
-      skipped.push({ name: runner.name, reason: 'runner capacity can never fit this ticket' });
+      skipped.push({ name: runner.name, reason: 'runner capacity can never fit this ticket', neverFits: true });
       continue;
     }
     const { room, cpuFree, reason } = reservation ? runnerRoom(reservation, probe) : { room: true, cpuFree: 0 };
@@ -351,7 +356,7 @@ export async function selectRunner(runners, opts = {}) {
     const cand = { runner, probe, finish: estimatedFinish(reservation, probe, runner), cpuFree };
     if (better(cand, idleBest)) idleBest = cand;
   }
-  const readinessField = Object.keys(readiness).length > 0 ? { readiness } : {};
+  const readinessField = { ready, ...(Object.keys(readiness).length > 0 ? { readiness } : {}) };
   if (idleBest) return { runner: idleBest.runner, probe: idleBest.probe, skipped, ...readinessField };
   if (queuedBest) return { runner: queuedBest.runner, probe: queuedBest.probe, skipped, ...readinessField, queuedChoice: true };
   return { runner: null, skipped, ...readinessField, ...(busyBest ? { busy: { runner: busyBest.runner, probe: busyBest.probe } } : {}) };
@@ -1252,7 +1257,7 @@ async function dispatchOnce(opts) {
     if (provesNeverStarted(record, expected) && !unconfirmedCancel) {
       // a runner that rejected the ticket on its merits would reject it again elsewhere; one that expired or gave it up in its queue says nothing about another runner
       const cacheRepair = transferCache && record.kind === 'rejected' && CACHE_REJECT_RE.test(record.reason ?? '');
-      return { outcome: 'unconfirmed', reason: classification.reason, neverStarted: true, ...(record.kind === 'unfinished' ? { retryElsewhere: true } : {}), ...(cacheRepair ? { cacheRepair: true } : {}) };
+      return { outcome: 'unconfirmed', reason: classification.reason, neverStarted: true, ...(record.kind === 'unfinished' ? { retryElsewhere: true } : { rejected: true }), ...(cacheRepair ? { cacheRepair: true } : {}) };
     }
     return { outcome: 'unconfirmed', reason: classification.reason, mayStillBeRunning: true };
   }

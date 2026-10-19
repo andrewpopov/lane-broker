@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, execFileSync } from 'node:child_process';
+import { reloadGlobalConfig, isDispatchOnly } from './config.js';
+import { dispatchOnlyRefusal, LOCAL_REFUSED_EXIT_CODE } from './resources.js';
 import { atomicWriteFile, atomicWriteJson, readJsonSafe, withLock, ensureStateDirs } from './state.js';
 import {
   computeDepsKey,
@@ -37,6 +39,13 @@ import {
  * and every descendant, since the broker only ever knows about the one
  * ticket that spawned this process.
  */
+
+class DispatchOnlyError extends Error {}
+
+/** BRAIN-634: re-evaluated (fresh config read + marker + env) at every point this pipeline would execute something. */
+function assertLocalExecutionAllowed() {
+  if (isDispatchOnly(reloadGlobalConfig(undefined))) throw new DispatchOnlyError(dispatchOnlyRefusal('remote-pipeline').message.trim());
+}
 
 const NPM_CONFIG_ENV_RE = /^npm_config_/i;
 
@@ -87,12 +96,14 @@ function buildDepsEnv(npmCacheDir, npmUserConfig, npmGlobalConfig) {
  * this slice.
  */
 function spawnPhaseChild(argv, cwd, env) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let child;
     try {
+      assertLocalExecutionAllowed();
       child = spawn(argv[0], argv.slice(1), { cwd, env, stdio: 'inherit', detached: false });
     } catch (err) {
-      resolve({ spawnError: err });
+      if (err instanceof DispatchOnlyError) reject(err);
+      else resolve({ spawnError: err });
       return;
     }
     child.on('error', (err) => resolve({ spawnError: err }));
@@ -235,6 +246,7 @@ run({ path: process.cwd(), args: [], scriptShell: process.argv[3] || undefined, 
  * replay": the caller installs instead.
  */
 async function replayRootScripts(cwd, scripts, depsEnv, npmConfig) {
+  assertLocalExecutionAllowed();
   if (npmConfig.ignoreScripts === 'true') return true;
   const events = allowlistedRootEvents(scripts);
   if (events.length === 0) return true;
@@ -414,6 +426,7 @@ export async function remotePipelineCommand(ticketDir) {
   };
   try {
     if (remoteDeps.length > 0) {
+      assertLocalExecutionAllowed();
       writePhase(ticketDir, 'deps');
       startStage('depsMs');
       const depsEnv = buildDepsEnv(npmCacheDir, npmUserConfig, npmGlobalConfig);
@@ -423,6 +436,7 @@ export async function remotePipelineCommand(ticketDir) {
     }
 
     if (remoteSetup.length > 0) {
+      assertLocalExecutionAllowed();
       writePhase(ticketDir, 'setup');
       startStage('setupMs');
       for (const setupArgv of remoteSetup) {
@@ -432,11 +446,16 @@ export async function remotePipelineCommand(ticketDir) {
       endStage();
     }
 
+    assertLocalExecutionAllowed();
     writePhase(ticketDir, 'command');
     startStage('commandMs');
     const cmdCwd = path.join(workDir, relCwd || '');
     const code = await runPhaseCommand(argv, cmdCwd, process.env);
     return { exitCode: code };
+  } catch (err) {
+    if (!(err instanceof DispatchOnlyError)) throw err;
+    process.stderr.write(`${err.message}\n`);
+    return { exitCode: LOCAL_REFUSED_EXIT_CODE };
   } finally {
     endStage();
     try {

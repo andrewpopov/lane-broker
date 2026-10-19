@@ -3,6 +3,7 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 
 import { parseVmStatAvailable } from './memory.js';
+import { runnerAvailability } from './runner-schedule.js';
 
 const GIB = 1024 ** 3;
 
@@ -318,6 +319,26 @@ export function checkResourceBudget({ resources, globalCfg, host }) {
   return { ok: true };
 }
 
+/** BRAIN-629: the `localWindow` hours as text, e.g. "01:00-06:00" (several windows joined by ", "). */
+function localWindowLabel(schedule) {
+  return [...new Set(schedule.available.map((w) => `${w.from}-${w.to}`))].join(', ');
+}
+
+/** BRAIN-629: the label of the `localWindow` that lets this lane run here at `now`, or null (no window, lane unlisted, or closed). */
+export function localWindowAllowing(enriched, globalCfg, now = Date.now()) {
+  const win = globalCfg.localWindow;
+  if (!win || !win.lanes.includes(enriched.lane) || !runnerAvailability(win.schedule, now).available) return null;
+  return localWindowLabel(win.schedule);
+}
+
+/**
+ * BRAIN-629: the one definition of "this machine refuses this lane right now": a `localRefused` lane without --allow-local-sim,
+ * unless a configured `localWindow` names it and is open at `now`. Evaluated at every placement attempt, never cached on a ticket.
+ */
+export function locallyRefusedNow(enriched, globalCfg, now = Date.now()) {
+  return Boolean(enriched.localRefused && !enriched.allowLocalSim && localWindowAllowing(enriched, globalCfg, now) === null);
+}
+
 /** Exit code of every `localRefused` policy refusal (BRAIN-320). */
 export const LOCAL_REFUSED_EXIT_CODE = 69;
 /** BRAIN-455: a remote-only lane found no usable runner right now. Retryable, unlike the policy refusal above. */
@@ -361,6 +382,21 @@ export function noRunnerRefusal(lane, reason) {
     message:
       `lane run: lane "${lane}" runs only on a remote runner and none can take it now (${reason}). ` +
       `Retry later, or pass --allow-local-sim to run here.\n`,
+  };
+}
+
+/**
+ * BRAIN-634: `localExecution: "refused"` makes this host dispatch-only. `retryable` is a ticket that could go remote but no runner
+ * can take it now (exit 76); otherwise it can never go remote from here (exit 69).
+ */
+export function dispatchOnlyRefusal(lane, { retryable = false, reason } = {}) {
+  const detail = reason ? ` (${reason})` : '';
+  return {
+    ok: false,
+    exitCode: retryable ? NO_RUNNER_EXIT_CODE : LOCAL_REFUSED_EXIT_CODE,
+    message: retryable
+      ? `lane run: localExecution is refused on this host (dispatch-only) and no runner can take lane "${lane}" now${detail}. Retry later.\n`
+      : `lane run: localExecution is refused on this host (dispatch-only) and lane "${lane}" cannot run on a runner${detail}.\n`,
   };
 }
 
