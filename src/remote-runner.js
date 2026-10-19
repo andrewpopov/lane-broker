@@ -9,7 +9,7 @@ import { pipeline } from 'node:stream/promises';
 import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, readRemoteDrain, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, RUNNER_NAME_RE, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
-import { CAPABILITIES } from './capabilities.js';
+import { advertisedCapabilities } from './capabilities.js';
 import { reportReadiness } from './runner-readiness.js';
 import { NO_PROGRESS_REASON, SILENCE_REASON } from './no-progress.js';
 import { artifactLimitsOf, collectArtifacts, encodeArtifacts, pruneStaleArtifacts } from './remote-artifacts.js';
@@ -808,7 +808,8 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot(), measure, 
     protocols: [1, 2],
     ...(status.lockError ? { stale: true, snapshot: 'lockless' } : {}),
     // BRAIN-360: this runner resolves minCpuCores itself, so a submitter may judge fit by the floor
-    capabilities: CAPABILITIES,
+    capabilities: advertisedCapabilities(status.cpuLimit),
+    cpuLimit: status.cpuLimit,
     version: pkg.version,
     // BRAIN-380 slice 4: a draining runner takes no new work. `draining` names why; `paused` is also set so a client
     // built before this field skips the runner the way it skips a paused one.

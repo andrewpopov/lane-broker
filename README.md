@@ -1235,6 +1235,22 @@ A warning shows in the log as `lane: warning: remote artifacts: ...` and in the 
 `remoteArtifactsWarning`. The lane's success is about the command: a stamp that did not arrive shows up when whatever
 reads it refuses.
 
+### CPU quota per lane (`cpuLimit`, BRAIN-651 L1)
+
+`"cpuLimit": "off" | "prefer" | "require"` (global config, default `"off"`; any other value is a config error naming the key) is the
+opt-in for enforcing a lane's admitted CPU grant on a **Linux** host with a transient systemd scope, `CPUQuota=<grant x 100>%`.
+**This release adds the capability and the probe only; nothing is wrapped yet** (the spawn wrap is L2), so no mode changes how a lane runs.
+
+- The probe runs `systemd-run --user --scope -p CPUQuota=100% --quiet sh -c <read cpu.max>` as the broker's own user and requires the
+  scope's `cpu.max` to read back `100000 100000`. It reports `{mode, available, reason}`: `unsupported-platform` on macOS,
+  `systemd-run-missing`, `systemd-run-exit-N: <first stderr line>`, or `cpu-max-not-applied: <readback>`. Mode `off` never probes.
+- `"require"` on a host whose probe fails makes the supervisor refuse the ticket before it queues, exit `69`, with `CPU_LIMIT_UNAVAILABLE`
+  named in the message. `"prefer"` logs one warning per supervisor and carries on.
+- `lane status --json` and `lane remote-probe` carry `cpuLimit: {mode, available, reason}`; `lane capabilities --json` carries it too.
+  `cpu-limit/1` is added to the advertised capabilities only when the mode is not `off` and the probe passed.
+- Quota limits CPU time over a period, not instantaneous concurrency, and it needs a user systemd instance with the `cpu` controller delegated;
+  that is what the probe checks.
+
 ### Dispatch-only host (`localExecution`)
 
 `"localExecution": "refused"` (default `"allowed"`; any other value is a config error) makes this host dispatch-only,

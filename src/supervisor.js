@@ -27,6 +27,7 @@ import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processSt
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
 import { reloadGlobalConfig, isDispatchOnly } from './config.js';
+import { enforceCpuLimitStartup, CpuLimitUnavailableError } from './cpu-limit.js';
 import { stateHome } from './state.js';
 import { readRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
@@ -35,7 +36,7 @@ import { starvedStaleMs } from './external-cpu.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, priorityOf, resolveLaneNice, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
-import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, dispatchOnlyRefusal, locallyRefusedNow, localWindowAllowing, leaseCpuCores, terminalRowDefaults } from './resources.js';
+import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, dispatchOnlyRefusal, LOCAL_REFUSED_EXIT_CODE, locallyRefusedNow, localWindowAllowing, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
@@ -1228,6 +1229,21 @@ async function main() {
     supervisorStart: supervisorStart === undefined ? null : supervisorStart,
     bootId: bootId(),
   };
+
+  // BRAIN-651 L1: "require" on a host that cannot enforce a CPU quota refuses the ticket by name before it is ever queued;
+  // "prefer" warns once. The spawn wrap itself is a later ticket (L2).
+  try {
+    enforceCpuLimitStartup(globalCfg, { warn: (line) => process.stderr.write(line) });
+  } catch (err) {
+    if (!(err instanceof CpuLimitUnavailableError)) throw err;
+    const refusal = { exitCode: LOCAL_REFUSED_EXIT_CODE, message: `lane run: ${err.message}\n` };
+    process.stderr.write(refusal.message);
+    const result = localRefusalResult(enriched, refusal);
+    atomicWriteJson(ticket.resultPath, result);
+    appendHistory(root, historyRow(ticket, result, {}));
+    await underLock(root, () => clearTicketMarkers(root, ticket.id));
+    process.exit(refusal.exitCode);
+  }
 
   let cancelledBeforeStart = false;
   // BRAIN-319 T3b-2: the same SIGTERM/SIGINT this supervisor already reacts
