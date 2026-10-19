@@ -40,12 +40,15 @@ import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, l
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
+import { remoteExcludeWarnings } from './remote-exclude.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
 import { REMOTE_WITHDRAW_CAPABILITY, REMOTE_EXCLUSIVE_CAPABILITY } from './capabilities.js';
+import { SNAPSHOT_GZIP_CAPABILITY, TRANSFER_GZIP } from './remote-gzip.js';
+import { BLOB_CACHE_CAPABILITY } from './remote-blobs.js';
 import { createAttempt, readAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX, hostCpuLoad, ticketCpuEstimate } from './admission.js';
-import { relayedUsage, relayedDeps } from './remote-relay.js';
+import { relayedUsage, relayedDeps, relayedTransfer, snapshotLine } from './remote-relay.js';
 import { maybeDailyGc } from './gc.js';
 import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, SILENCE_REASON, noProgressMessage, silenceMessage } from './no-progress.js';
 import { settledContentKey, isCleanPass } from './result-cache.js';
@@ -818,10 +821,14 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // comment).
   let manifest;
   try {
-    manifest = buildManifest(enriched.remote.worktreeRoot, { omitEscapingSymlinks: enriched.remote.remoteOmitEscapingSymlinks === true });
+    manifest = buildManifest(enriched.remote.worktreeRoot, { omitEscapingSymlinks: enriched.remote.remoteOmitEscapingSymlinks === true, exclude: enriched.remote.remoteExclude ?? null });
   } catch (err) {
     if (!(err instanceof RemoteIneligibleError)) throw err;
     return fallbackOrRefuse(null, err.message);
+  }
+  for (const line of remoteExcludeWarnings(manifest.excluded)) {
+    process.stderr.write(line);
+    writeBrokerLog(root, line);
   }
   const omittedSymlinks = manifest.omittedSymlinks ?? [];
   if (omittedSymlinks.length > 0) {
@@ -970,6 +977,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   };
   const dispatchedAt = Date.now(); // the FIRST dispatch: waitedMs includes the time spent queued on every runner before the last
   let dispatch;
+  let lastTransferStats = null;
   while (true) {
     // BRAIN-398: a runner without `artifacts/1` would run the command and silently return nothing, so say so up front.
     artifactsSupported = Boolean(declaredArtifacts) && Array.isArray(probe?.capabilities) && probe.capabilities.includes(ARTIFACTS_CAPABILITY);
@@ -985,7 +993,16 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       if (thisEpoch === epoch) write(chunk);
     };
     const canWithdraw = Array.isArray(probe?.capabilities) && probe.capabilities.includes(REMOTE_WITHDRAW_CAPABILITY);
+    // BRAIN-642: re-read per dispatch like the artifacts gate, so a rebalance to a runner without it sends the legacy stream.
+    const snapshotGzip = Array.isArray(probe?.capabilities) && probe.capabilities.includes(SNAPSHOT_GZIP_CAPABILITY);
+    const blobCache = globalCfg.remoteBlobCache === true && Array.isArray(probe?.capabilities) && probe.capabilities.includes(BLOB_CACHE_CAPABILITY);
     let target = null;
+    const onTransferStats = (stats) => {
+      lastTransferStats = stats;
+      const line = snapshotLine(runner.name, stats, manifest.excluded);
+      process.stderr.write(line);
+      writeBrokerLog(root, line);
+    };
 
     // BRAIN-320 S1c: `enriched.remote.remoteDeps`/`remoteSetup` ride along in
     // this spread and are what `dispatchRemote` derives its protocol-2 exec
@@ -993,6 +1010,10 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     dispatch = await dispatchRemote({
       ...enriched.remote,
       remoteArtifacts: artifactsSupported ? declaredArtifacts : null,
+      transfer: snapshotGzip ? TRANSFER_GZIP : undefined,
+      blobCache,
+      onTransferStats,
+      gzipLevel: globalCfg.remoteSnapshotGzipLevel,
       artifactLimits: artifactLimitsOf(globalCfg),
       manifest,
       runner,
@@ -1022,8 +1043,9 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       onSnapshotSent: moves.length > 0 && movingSet ? clearMoving : undefined,
       // BRAIN-515: every dispatch (a rebalance move's second one too) re-persists which runner the snapshot goes to and the
       // identity a result fetched from it must carry; `lane`'s orphan reconcile trusts a runner record only against this.
-      onBinding: async ({ protocol, generation, manifestHash }) =>
-        (await updateAttempt(root, enriched.id, gen, { binding: { protocol, generation, manifestHash, runner: runner.name } })).ok,
+      // `ticketId` differs from the lane id only on a cache repair retry (BRAIN-642), whose runner ticket is a fresh one.
+      onBinding: async ({ protocol, ticketId, generation, manifestHash }) =>
+        (await updateAttempt(root, enriched.id, gen, { binding: { protocol, generation, manifestHash, runner: runner.name, ...(ticketId === enriched.id ? {} : { ticketId }) } })).ok,
       rebalance: rebalanceOn && canWithdraw ? {
         minQueuedMs: globalCfg.remoteRebalanceMinQueuedMs,
         intervalMs: globalCfg.remoteRebalanceIntervalMs,
@@ -1043,7 +1065,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
         beforeWithdraw: async ({ from, to }) => {
           let unchanged = false;
           try {
-            unchanged = buildManifest(enriched.remote.worktreeRoot, { omitEscapingSymlinks: enriched.remote.remoteOmitEscapingSymlinks === true }).manifestHash === manifest.manifestHash;
+            unchanged = buildManifest(enriched.remote.worktreeRoot, { omitEscapingSymlinks: enriched.remote.remoteOmitEscapingSymlinks === true, exclude: enriched.remote.remoteExclude ?? null }).manifestHash === manifest.manifestHash;
           } catch {
             // ineligible now: it changed
           }
@@ -1160,6 +1182,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       ...(Number.isFinite(dispatch.result.grantedCpuCores) ? { grantedCpuCores: dispatch.result.grantedCpuCores } : {}),
       ...relayedUsage(dispatch.result),
       ...relayedDeps(dispatch.result),
+      ...relayedTransfer(lastTransferStats, dispatch.result),
       ...relayedPhases(dispatch),
       ...rebalanceFields(),
       ...artifactFields,

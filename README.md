@@ -358,7 +358,7 @@ form: an undeclared `--lane` name still keeps its own key and name (the
 same-key exclusivity rule above is unaffected — two sessions using the same
 ad-hoc name still conflict with each other), but instead of the no-config-file
 default it inherits `weight`, `cpuCores`, `minCpuCores`, `memoryBytes`, `nice`, `remote`,
-`requires`, `remoteDeps`, `remoteSetup`, `remoteOmitEscapingSymlinks`, `remoteArtifacts` and `remoteArtifactsOn` from the named declared lane. It does NOT
+`requires`, `remoteDeps`, `remoteSetup`, `remoteOmitEscapingSymlinks`, `remoteExclude`, `remoteArtifacts` and `remoteArtifactsOn` from the named declared lane. It does NOT
 inherit that lane's own named `conflicts` entries or its `maxConcurrent`
 (stays `1`) — only the `*` wildcard universe still reaches it, same as plain
 `"allow"`. The named lane must be declared and must not be `localRefused`.
@@ -775,6 +775,14 @@ ordinary low-priority ticket on the runner (not preempted by later work).
   safe despite them.
 - `remoteSetup`: argv arrays run in the repo root after deps, before the
   command.
+- `remoteExclude` (BRAIN-642): an array of at most 64 patterns (each at most 256 characters) naming paths to leave out of
+  the remote snapshot to shrink it. `*` stays within one path segment, `**` is a whole segment, and a trailing `/` means
+  a directory and everything under it. Excluded files are never read or hashed, and are out of consideration entirely
+  (an excluded `.env` is not an ineligibility refusal). No `!`, absolute paths or `..`. A pattern that would exclude
+  `.lane-broker.json`, a `remoteDeps` dir's `package.json` or lockfile, or the directory the lane runs in is refused
+  (config load, or `lane run` for the working directory). Dispatch prints `lane: remote snapshot excludes N files / X MB
+  (pattern: count)` and warns about a pattern that matched nothing. Caveat: the runner's synthetic git repo only sees the
+  included files, so a command that needs an excluded file fails remotely. Client-side only; works with any runner.
 - `remoteOmitEscapingSymlinks` (BRAIN-334): `true` leaves a tracked symlink
   whose target points outside the repo root (a relative target that climbs
   above it, or any absolute target) out of the snapshot instead of making the
@@ -1077,6 +1085,33 @@ launchd job; it adds no second ledger and builds on the BRAIN-594 clock:
   call during placement, rebind and rebalance. A `localRefused` lane (it has no local fallback) probes a runner that timed out once
   more, but only a runner the heartbeat vouches for (watcher tick under 5 minutes old and the runner's `lastOkAt` under 5 minutes old);
   a runner the heartbeat has not seen answer is skipped as `probe timed out` straight away.
+- Snapshot transfer encoding (BRAIN-642, `snapshot-gzip/1`): a runner whose probe lists `snapshot-gzip/1` is sent the snapshot as one gzip
+  member (`lane remote-exec --transfer gzip`, deflate level `remoteSnapshotGzipLevel`, global config, integer 1-9, default 3); any other
+  runner gets the legacy plain stream, byte for byte, with no new flag or key. The capability is re-read per dispatch, so a rebalance to a
+  runner without it sends the plain stream. The runner decodes with a strict single-member decoder: decompressed bytes are capped at the
+  header limit plus the 2 GiB tree limit plus 64 MiB of frame lines, compressed input at the same figure, and any compressed byte after the
+  member's trailer is refused. The member's CRC-32 and size must match the decoded bytes, and the decoded stream ends only once the whole
+  8-byte trailer has arrived and verified, so no work starts on a truncated member. A stream refused before a usable header leaves no
+  ticket and exits `66` with a one-line reason on stderr: that exit code, and nothing else (not a withdraw reply, not an absent
+  ticket), is what lets the client treat the dispatch as never started and retry elsewhere. One that fails after the header is a
+  `rejected` result with the reason.
+- Runner blob cache (BRAIN-642, `blob-cache/1`): a runner whose probe lists `blob-cache/1` keeps file bodies of 64 KiB and up
+  under `<root>/blobs`, keyed by sha256 and namespaced by a hash of the repo's git-common-dir path (that only prevents accidental
+  cross-repo reuse; it is not a security boundary). When the tree's cacheable files total at least 4 MiB the client runs `lane
+  remote-have` (one ssh round trip, 3 s deadline) and sends no body for a file the runner already holds; the client still reads and
+  hashes every file, so a file changed after the manifest still fails. A failed have-query sends every body, so the cache and gzip
+  capabilities are independent. Global config on the client: `remoteBlobCache` (boolean, default `true`). On the runner:
+  `remoteBlobCacheMaxBytes` (default 10 GiB, a soft target: nothing is published without free-space headroom) and
+  `remoteBlobCacheMaxAgeMs` (default 14 days). The runner verifies a blob's size and hash on every use and removes a bad one.
+  If the runner reports a cache miss or corrupt blob, the client retries exactly once on the same runner with a fresh ticket and full
+  bodies, never falling back to local for that reason.
+- Observability (BRAIN-642): each dispatch prints and logs one line, e.g. `lane: snapshot -> skybox: tree 238.1 MB, sent 41.0 MB
+  (gzip), cache 8730/8788 files (99.3%), excluded 0`. `(gzip)`, `cache` and `excluded` appear only when they apply. History rows
+  carry `snapshotRawBytes` (the tree size), `snapshotSentBytes` (bytes on the wire) and, from the runner, `blobHits`, `blobMisses`
+  and `blobCorrupt`; all are optional.
+- Rollout order: upgrade the runners first, check each with `ssh <alias> bash -lc 'lane remote-probe'` (version plus `snapshot-gzip/1`
+  and `blob-cache/1`), then upgrade the client machine. Capability gating makes any order safe; runners first starts the savings
+  at once. A runner without a capability gets the legacy stream, byte for byte.
 - The probe contract: `lane remote-probe` must answer promptly on a busy runner. It waits at most 500 ms for the broker lock (the lock
   only reaps stale leases). If the lock is held it answers from a lock-free read of the lease, queue and gate files and adds
   `"stale": true, "snapshot": "lockless"`. Each file is written by atomic rename, so each is consistent on its own, but the set can be a
@@ -2390,6 +2425,8 @@ What a run leaves behind is collected; what a live one owns never is. Everything
 - `LANE_BROKER_TEST_LOCK_TIMEOUT_MS` — overrides `withLock`'s default 15s
   acquire deadline, so a test can force a lock-acquire timeout (BRAIN-345: a
   queued supervisor must treat one as contention and keep polling).
+- `LANE_BROKER_TEST_TRANSFER_MAX_BYTES` — lowers `lane remote-exec`'s decompressed and compressed transfer caps (BRAIN-642), so a gzip-bomb
+  test never needs 2 GiB.
 - `LANE_BROKER_TEST_PAUSE_AFTER_TICKET_ID` — if set, `lane remote-exec` pauses
   right after writing its ticket's `remote-id` file AND checking its own
   ticket-local `cancelled` marker (finding it not yet set), until the named

@@ -80,9 +80,9 @@ test('prefer plus an unavailable probe warns exactly once and continues; off is 
 });
 
 test('cpu-limit/1 is advertised only when mode is not off and the probe passed', () => {
-  assert.equal(advertisedCapabilities({ mode: 'off', available: false }).includes(CPU_LIMIT_CAPABILITY), false);
-  assert.equal(advertisedCapabilities({ mode: 'prefer', available: false }).includes(CPU_LIMIT_CAPABILITY), false);
-  assert.equal(advertisedCapabilities({ mode: 'require', available: true }).includes(CPU_LIMIT_CAPABILITY), true);
+  assert.equal(advertisedCapabilities({}, { mode: 'off', available: false }).includes(CPU_LIMIT_CAPABILITY), false);
+  assert.equal(advertisedCapabilities({}, { mode: 'prefer', available: false }).includes(CPU_LIMIT_CAPABILITY), false);
+  assert.equal(advertisedCapabilities({}, { mode: 'require', available: true }).includes(CPU_LIMIT_CAPABILITY), true);
   assert.equal(DEFAULT_GLOBAL_CONFIG.cpuLimit, 'off');
 });
 

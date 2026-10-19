@@ -13,8 +13,11 @@ import { migrateSchedulerCommand } from '../src/migrate.js';
 import { parseByteSize } from '../src/resources.js';
 import { isTicketId } from '../src/state.js';
 import { leaseCheckCommand } from '../src/lease.js';
+import { parseTransferFlag } from '../src/remote-gzip.js';
+import { parseTransferCacheFlag } from '../src/remote-blobs.js';
 import {
   remoteExecCommand,
+  remoteHaveCommand,
   remoteProbeCommand,
   remoteResultCommand,
   remoteCancelCommand,
@@ -355,7 +358,21 @@ async function main() {
     }
     case 'remote-exec': {
       const root = parseRootFlag(rest) || defaultRemoteRoot();
-      const result = await remoteExecCommand({ root });
+      const flag = parseTransferFlag(rest);
+      if (!flag.ok) {
+        process.stderr.write(`lane remote-exec: ${flag.reason}\n`);
+        return 2;
+      }
+      const cacheFlag = parseTransferCacheFlag(rest);
+      if (!cacheFlag.ok) {
+        process.stderr.write(`lane remote-exec: ${cacheFlag.reason}\n`);
+        return 2;
+      }
+      const result = await remoteExecCommand({ root, transfer: flag.transfer, transferCache: cacheFlag.transferCache });
+      return result.exitCode;
+    }
+    case 'remote-have': {
+      const result = await remoteHaveCommand({ root: parseRootFlag(rest) || defaultRemoteRoot() });
       return result.exitCode;
     }
     case 'remote-result': {

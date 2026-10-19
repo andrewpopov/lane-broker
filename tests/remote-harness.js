@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import zlib from 'node:zlib';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, gitFixture, laneRun, laneSpawn, waitFor, BIN } from './helpers.js';
@@ -14,6 +15,14 @@ import { CAPABILITIES } from '../src/capabilities.js';
  * (end-to-end `lane run` CLI calls). Extracted so there is exactly one fake
  * transport, never two independently-drifting copies.
  */
+
+/** The snapshot header a client sent over `remote-exec`'s stdin, from the raw stdin bytes a test's ssh wrapper saved: plain JSON line for a
+ *  legacy runner, a gzip stream (BRAIN-642, snapshot-gzip/1) for the default path. */
+export function readCapturedHeader(file) {
+  let bytes = fs.readFileSync(file);
+  if (bytes[0] === 0x1f && bytes[1] === 0x8b) bytes = zlib.gunzipSync(bytes);
+  return JSON.parse(bytes.subarray(0, bytes.indexOf(10)).toString('utf8'));
+}
 
 export function tmpDir(prefix) {
   return makeTmpDir(`${prefix}-`);
@@ -71,6 +80,14 @@ export function makeFakeSshBin() {
   const probeLogDir = tmpDir('fake-probe-log');
   const probeLogPath = path.join(probeLogDir, 'probes.log');
   fs.writeFileSync(probeLogPath, '');
+  // BRAIN-642: the bytes ssh's stdin carried for a `remote-exec` to 'tee' / 'strict-legacy', and what a strict-legacy runner objected to.
+  const teePath = path.join(probeLogDir, 'exec-stdin.bin');
+  const violationsPath = path.join(probeLogDir, 'legacy-violations.log');
+  fs.writeFileSync(violationsPath, '');
+  // BRAIN-642 slice C2: the stdin of the last `remote-have`, and every `remote-exec` command string (one per line), in order.
+  const haveLogPath = path.join(probeLogDir, 'have-stdin.json');
+  const execCmdsPath = path.join(probeLogDir, 'exec-cmds.log');
+  fs.writeFileSync(execCmdsPath, '');
   const laneShim = path.join(binDir, 'lane');
   fs.writeFileSync(
     laneShim,
@@ -107,6 +124,27 @@ function exitNow(code) {
   process.exit(code);
 }
 
+if (commandString && commandString.includes('remote-exec')) {
+  try { fs.appendFileSync(${JSON.stringify(execCmdsPath)}, commandString + '\\n'); } catch {}
+}
+
+// BRAIN-642 C2: env knobs. LANE_FAKE_HAVE = fail | hang; LANE_FAKE_AFTER_HAVE = delete:<dir> | corrupt:<dir> | mutate:<file>, applied
+// once the runner has answered a remote-have (the window between the have-answer and the exec).
+function afterHave() {
+  const spec = process.env.LANE_FAKE_AFTER_HAVE;
+  if (!spec) return;
+  const at = spec.indexOf(':');
+  const kind = spec.slice(0, at);
+  const target = spec.slice(at + 1);
+  const flip = (file) => { const b = fs.readFileSync(file); b[0] ^= 0xff; fs.writeFileSync(file, b); };
+  const walk = (dir) => fs.readdirSync(dir, { withFileTypes: true }).flatMap((e) => e.name.startsWith('.') ? [] : e.isDirectory() ? walk(dir + '/' + e.name) : [dir + '/' + e.name]);
+  try {
+    if (kind === 'delete') for (const f of walk(target)) fs.rmSync(f, { force: true });
+    else if (kind === 'corrupt') for (const f of walk(target)) { fs.chmodSync(f, 0o600); flip(f); }
+    else if (kind === 'mutate') flip(target);
+  } catch {}
+}
+
 if (destination === 'old-runner' && commandString && commandString.includes('remote-probe')) {
   // BRAIN-320 S1c (1d): simulate a pre-S1a runner (0.6.0) whose remote-probe
   // response has no 'protocols' field at all -- the client must skip it for
@@ -135,7 +173,22 @@ if (destination === 'die-midstream') {
   });
   process.stdin.on('end', finish);
   process.stdin.on('error', finish);
-} else if ((destination === 'no-artifacts' || destination === 'queued-one') && commandString.includes('remote-probe')) {
+} else if (commandString && commandString.includes('remote-have') && process.env.LANE_FAKE_HAVE === 'fail') {
+  exitNow(255);
+} else if (commandString && commandString.includes('remote-have') && process.env.LANE_FAKE_HAVE === 'hang') {
+  setInterval(() => {}, 1000);
+} else if (commandString && commandString.includes('remote-have')) {
+  const chunks = [];
+  process.stdin.on('data', (c) => chunks.push(c));
+  const child = spawn('sh', ['-c', commandString], { stdio: ['pipe', 'pipe', 'inherit'], env: { ...process.env, LANE_FAKE_RUNNER: '1', LANE_BROKER_HOME: ${JSON.stringify(runnerHome)}, LANE_BROKER_STATE: ${JSON.stringify(runnerState)} } });
+  process.stdin.pipe(child.stdin);
+  child.stdout.pipe(process.stdout);
+  child.on('close', (code) => {
+    try { fs.writeFileSync(${JSON.stringify(haveLogPath)}, Buffer.concat(chunks)); } catch {}
+    if (code === 0) afterHave();
+    exitNow(code == null ? 1 : code);
+  });
+} else if (((destination === 'no-artifacts' || destination === 'queued-one' || destination === 'strict-legacy') || process.env.LANE_FAKE_CAPS_DROP) && commandString.includes('remote-probe')) {
   // BRAIN-398: a runner built before artifacts/1 -- its probe simply lacks the capability.
   // BRAIN-455: 'queued-one' reports one queued ticket whatever the client's own queue holds, so local admission stays free.
   const child = spawn('sh', ['-c', commandString], { stdio: ['ignore', 'pipe', 'inherit'] });
@@ -144,7 +197,10 @@ if (destination === 'die-midstream') {
   child.on('close', () => {
     const probe = JSON.parse(out.trim());
     if (destination === 'no-artifacts') probe.capabilities = probe.capabilities.filter((c) => !c.startsWith('artifacts/'));
-    else probe.queued = 1;
+    else if (destination === 'strict-legacy') probe.capabilities = probe.capabilities.filter((c) => !c.startsWith('snapshot-gzip/') && !c.startsWith('blob-cache/'));
+    else if (destination === 'queued-one') probe.queued = 1;
+    // BRAIN-642 C2: LANE_FAKE_CAPS_DROP=snapshot-gzip/,blob-cache/ drops capabilities by prefix on any destination
+    for (const prefix of (process.env.LANE_FAKE_CAPS_DROP || '').split(',').filter(Boolean)) probe.capabilities = probe.capabilities.filter((c) => !c.startsWith(prefix));
     process.stdout.write(\`\${JSON.stringify(probe)}\\n\`);
     exitNow(0);
   });
@@ -183,19 +239,26 @@ if (destination === 'die-midstream') {
     process.stdout.write(\`\${JSON.stringify({ protocol: 1, cancelConfirmed: false })}\\n\`);
     exitNow(0);
   }
-} else if ((destination === 'drop-withdrawn' || destination === 'drop-stuck') && /remote-(exec|result|withdraw)/.test(commandString)) {
+} else if (/^drop-/.test(destination) && /remote-(exec|result|withdraw)/.test(commandString)) {
   // BRAIN-437: a runner that took the snapshot and then lost the connection, and whose result fetches all fail. Its
-  // remote-withdraw answers 'withdrawn' (drop-withdrawn: it never started) or 'not-queued' (drop-stuck: it may have).
+  // remote-withdraw answers 'withdrawn' (drop-withdrawn: it never started), 'not-queued' (drop-stuck, drop-exit1: it may have) or
+  // 'no-such-ticket' + tombstoned (drop-gone: a finished ticket the runner's GC has since removed). remote-exec closes with 255
+  // (the connection dropped), or with 1 (drop-exit1: the remote command failed in a way that says nothing about a ticket).
   if (commandString.includes('remote-exec')) {
     process.stdin.resume();
-    process.stdin.on('end', () => exitNow(255));
+    process.stdin.on('end', () => exitNow(destination === 'drop-exit1' ? 1 : 255));
   } else if (commandString.includes('remote-result')) {
     exitNow(1);
   } else {
     const ticketId = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/.exec(commandString)[0];
-    process.stdout.write(\`\${JSON.stringify({ protocol: 1, ticketId, action: destination === 'drop-withdrawn' ? 'withdrawn' : 'not-queued' })}\\n\`);
+    const reply = { protocol: 1, ticketId, action: { 'drop-withdrawn': 'withdrawn', 'drop-gone': 'no-such-ticket' }[destination] ?? 'not-queued' };
+    if (destination === 'drop-gone') reply.tombstoned = true;
+    process.stdout.write(\`\${JSON.stringify(reply)}\\n\`);
     exitNow(0);
   }
+} else if (destination === 'no-read' && commandString.includes('remote-exec')) {
+  // BRAIN-642: a runner session that never reads stdin, so the client's pipeline stalls mid-transfer under backpressure.
+  setInterval(() => {}, 1000);
 } else if (destination === 'result-tamper' && commandString.includes('remote-result')) {
   const child = spawn('sh', ['-c', commandString], { stdio: ['ignore', 'pipe', 'inherit'] });
   let out = '';
@@ -236,7 +299,58 @@ if (destination === 'die-midstream') {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, LANE_FAKE_RUNNER: '1', ...remoteExecEnv },
   });
-  process.stdin.pipe(child.stdin);
+  if ((destination === 'tee' || destination === 'strict-legacy') && commandString.includes('remote-exec')) {
+    const chunks = [];
+    let flushed = false;
+    const flush = () => {
+      if (flushed) return;
+      flushed = true;
+      const bytes = Buffer.concat(chunks);
+      fs.writeFileSync(${JSON.stringify(teePath)}, bytes);
+      if (destination !== 'strict-legacy') return;
+      const violations = [];
+      if (commandString.includes('--transfer')) violations.push('--transfer flag in argv');
+      if (bytes.length > 0 && bytes[0] !== 0x7b) violations.push('first stdin byte is not {');
+      else if (bytes.length > 0) {
+        // header line, then per frame: a line, then size body bytes for a file; stop at {end:true}
+        let pos = 0;
+        const nextLine = () => {
+          const nl = bytes.indexOf(10, pos);
+          if (nl === -1) return null;
+          const line = bytes.subarray(pos, nl).toString('utf8');
+          pos = nl + 1;
+          return line;
+        };
+        try {
+          const header = JSON.parse(nextLine());
+          if ('transfer' in header) violations.push('transfer key in header');
+          for (let line = nextLine(); line !== null; line = nextLine()) {
+            const frame = JSON.parse(line);
+            if (frame.end === true) break;
+            if ('body' in frame) violations.push('body key in frame ' + frame.path);
+            if (frame.type === 'file') pos += frame.size;
+          }
+        } catch (err) {
+          violations.push('unparsable legacy stream: ' + err.message);
+        }
+      }
+      for (const v of violations) fs.appendFileSync(${JSON.stringify(violationsPath)}, v + '\\n');
+    };
+    process.stdin.on('data', (c) => chunks.push(c));
+    process.stdin.on('end', flush);
+    child.on('close', flush);
+  }
+  if (destination === 'corrupt-gzip' && commandString.includes('remote-exec')) {
+    // BRAIN-642: a transport bug that damages the first byte, so the runner never gets a usable header.
+    let first = true;
+    process.stdin.on('data', (c) => {
+      if (first) { first = false; c = Buffer.from(c); c[0] ^= 0xff; }
+      child.stdin.write(c);
+    });
+    process.stdin.on('end', () => child.stdin.end());
+  } else {
+    process.stdin.pipe(child.stdin);
+  }
   child.stdout.pipe(process.stdout);
   child.stderr.pipe(process.stderr);
   child.on('close', (code) => exitNow(code == null ? 1 : code));
@@ -250,7 +364,7 @@ if (destination === 'die-midstream') {
   // broker state directly (e.g. pausing it, or pre-seeding a lease) to make
   // it durably busy for a `remote-exec` dispatch, without affecting the
   // client's own state (see the cross-contamination comment above).
-  return { binDir, sshBin, probeLogPath, runnerHome, runnerState };
+  return { binDir, sshBin, probeLogPath, runnerHome, runnerState, teePath, violationsPath, haveLogPath, execCmdsPath };
 }
 
 export function makeRunner({ ssh, root, name = ssh }) {
@@ -307,8 +421,8 @@ export function makeDispatchArgs(overrides = {}) {
 
 /** One global config (runners + admission knobs) and one repo config (lane
  *  `remote: true`) per test, sharing a fresh fake-ssh binDir. */
-export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1, cpuCores, remoteQueueTimeoutMs, remoteResultWaitMs } = {}) {
-  const { binDir, probeLogPath, runnerHome, runnerState } = makeFakeSshBin();
+export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1, cpuCores, remoteQueueTimeoutMs, remoteResultWaitMs, globalExtra = {} } = {}) {
+  const { binDir, probeLogPath, runnerHome, runnerState, teePath, violationsPath, haveLogPath, execCmdsPath } = makeFakeSshBin();
   const runnerRoot = tmpDir('remote-dispatch-runner-root');
   const { home, state, env } = freshEnv(FAST_WAITS);
   const cfg = {
@@ -332,6 +446,7 @@ export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1, cpuCore
   // sampleMs before ever observing the expiry.
   if (remoteQueueTimeoutMs !== undefined) cfg.remoteQueueTimeoutMs = remoteQueueTimeoutMs;
   if (remoteResultWaitMs !== undefined) cfg.remoteResultWaitMs = remoteResultWaitMs;
+  Object.assign(cfg, globalExtra);
   writeGlobalConfig(home, cfg);
   writeGlobalConfig(runnerHome, { sampleMs: 50, capacity: 4 });
   const repoDir = tmpDir('remote-dispatch-repo');
@@ -339,7 +454,7 @@ export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1, cpuCore
   // remote-first: this harness exercises remote mechanics; speed-aware placement (BRAIN-548) has its own tests
   // and would otherwise keep a ticket local once the lane has local history.
   gitFixture(['init', '-q'], repoDir);
-  return { env: { ...env, PATH: `${binDir}${path.delimiter}${env.PATH}` }, home, state, repoDir, runnerRoot, probeLogPath, runnerHome, runnerState };
+  return { env: { ...env, PATH: `${binDir}${path.delimiter}${env.PATH}` }, home, state, repoDir, runnerRoot, probeLogPath, runnerHome, runnerState, teePath, violationsPath, haveLogPath, execCmdsPath };
 }
 
 /** Number of `remote-probe` calls logged so far (see makeFakeSshBin's `probeLogPath`). */

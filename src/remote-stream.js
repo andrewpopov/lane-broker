@@ -3,6 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { Readable } from 'node:stream';
 import { manifestHashOf, sortEntries, verifyManifestNoGit, isCanonicalRelPath } from './remote-manifest.js';
+import { MIN_CACHEABLE_BYTES, isBlobHash, materializeBlob, publishBlob } from './remote-blobs.js';
 
 const NEWLINE = 0x0a;
 
@@ -106,8 +107,11 @@ export function serializeHeader(header, entries, manifestHash) {
  * file bytes off disk at encode time (re-verified against the manifest via
  * `readVerifiedFile`), in path-sorted order. `readFile(entry)` replaces that
  * disk read when the bytes come from somewhere else (lane-store's blobs).
+ *
+ * BRAIN-642: a path in `cached` (the runner's have-answer) travels as a body-less `body:'cached'` frame. The file is STILL read and
+ * verified here (`readFile`), so one mutated since the manifest was built fails the encode exactly as an uncached one would.
  */
-export function encodeSnapshot(worktreeRoot, header, entries, readFile = (entry) => readVerifiedFile(worktreeRoot, entry)) {
+export function encodeSnapshot(worktreeRoot, header, entries, readFile = (entry) => readVerifiedFile(worktreeRoot, entry), { cached = new Set() } = {}) {
   const manifestHash = manifestHashOf(entries);
   const ordered = sortEntries(entries);
   const headerLine = serializeHeader(header, entries, manifestHash);
@@ -116,8 +120,10 @@ export function encodeSnapshot(worktreeRoot, header, entries, readFile = (entry)
     yield Buffer.from(headerLine, 'utf8');
     for (const entry of ordered) {
       if (entry.type === 'file') {
-        yield Buffer.from(`${JSON.stringify({ path: entry.path, type: 'file', exec: !!entry.exec, size: entry.size })}\n`, 'utf8');
-        yield await readFile(entry);
+        const isCached = cached.has(entry.path);
+        yield Buffer.from(`${JSON.stringify({ path: entry.path, type: 'file', exec: !!entry.exec, size: entry.size, ...(isCached ? { body: 'cached' } : {}) })}\n`, 'utf8');
+        const bytes = await readFile(entry);
+        if (!isCached) yield bytes;
       } else {
         yield Buffer.from(`${JSON.stringify({ path: entry.path, type: 'symlink', target: entry.target })}\n`, 'utf8');
       }
@@ -128,55 +134,104 @@ export function encodeSnapshot(worktreeRoot, header, entries, readFile = (entry)
   return Readable.from(generate());
 }
 
-/** Buffered line/byte reader over any async-iterable of Buffer/string chunks. */
+/**
+ * Buffered line/byte reader over any async-iterable of Buffer/string chunks. Chunks are queued, never re-concatenated per
+ * arrival: a body delivered in many small chunks (a decompressor's output) costs one copy at the end, and a line costs one
+ * scan of each new chunk.
+ */
 export function makeReader(readable) {
-  let buf = Buffer.alloc(0);
+  const queue = [];
+  let head = 0; // index of the first unconsumed chunk; shifting the array per chunk would be quadratic over many tiny chunks
+  let queued = 0;
+  let newline = -1; // offset of the first newline in the queue, -1 when none is known
   let done = false;
   const it = readable[Symbol.asyncIterator]();
 
-  async function fill() {
+  function rescan() {
+    newline = -1;
+    let pos = 0;
+    for (let i = head; i < queue.length; i++) {
+      const chunk = queue[i];
+      const idx = chunk.indexOf(NEWLINE);
+      if (idx !== -1) {
+        newline = pos + idx;
+        return;
+      }
+      pos += chunk.length;
+    }
+  }
+
+  async function fill(scan) {
     if (done) return false;
     const { value, done: iterDone } = await it.next();
     if (iterDone) {
       done = true;
       return false;
     }
-    buf = Buffer.concat([buf, Buffer.isBuffer(value) ? value : Buffer.from(value)]);
+    const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+    if (scan && newline === -1) {
+      const idx = chunk.indexOf(NEWLINE);
+      if (idx !== -1) newline = queued + idx;
+    }
+    queue.push(chunk);
+    queued += chunk.length;
     return true;
+  }
+
+  function take(n) {
+    const parts = [];
+    let need = n;
+    while (need > 0) {
+      const first = queue[head];
+      if (first.length <= need) {
+        parts.push(first);
+        queue[head] = undefined;
+        head += 1;
+        need -= first.length;
+      } else {
+        parts.push(first.subarray(0, need));
+        queue[head] = first.subarray(need);
+        need = 0;
+      }
+    }
+    if (head > 1024 && head * 2 > queue.length) {
+      queue.splice(0, head);
+      head = 0;
+    }
+    queued -= n;
+    rescan();
+    return parts.length === 1 ? Buffer.from(parts[0]) : Buffer.concat(parts, n);
   }
 
   async function readLine(maxLen) {
     for (;;) {
-      const idx = buf.indexOf(NEWLINE);
-      if (idx !== -1) {
-        if (idx > maxLen) throw new Error('line exceeds max length');
-        const line = buf.subarray(0, idx).toString('utf8');
-        buf = buf.subarray(idx + 1);
+      if (newline !== -1) {
+        if (newline > maxLen) throw new Error('line exceeds max length');
+        const line = take(newline).toString('utf8');
+        take(1);
         return line;
       }
-      if (buf.length > maxLen) throw new Error('line exceeds max length');
-      if (!(await fill())) return null;
+      if (queued > maxLen) throw new Error('line exceeds max length');
+      if (!(await fill(true))) return null;
     }
   }
 
   async function readBytes(n) {
-    while (buf.length < n) {
-      if (!(await fill())) return null;
+    while (queued < n) {
+      if (!(await fill(false))) return null;
     }
-    const out = Buffer.from(buf.subarray(0, n));
-    buf = buf.subarray(n);
-    return out;
+    return take(n);
   }
 
   async function hasMore() {
-    if (buf.length > 0) return true;
-    return fill();
+    if (queued > 0) return true;
+    return fill(false);
   }
 
   return { readLine, readBytes, hasMore };
 }
 
-function validateFrame(frame, expectedByPath, seen, symlinkPaths, maxFileBytes, remainingBudget) {
+function validateFrame(frame, expectedByPath, seen, symlinkPaths, maxFileBytes, remainingBudget, cacheEnabled) {
   if (!frame || typeof frame.path !== 'string') return { ok: false, reason: 'malformed frame' };
   const p = frame.path;
   if (path.isAbsolute(p)) return { ok: false, reason: `absolute path: ${p}` };
@@ -202,6 +257,13 @@ function validateFrame(frame, expectedByPath, seen, symlinkPaths, maxFileBytes, 
     if (frame.size !== entry.size) return { ok: false, reason: `size mismatch: ${p}` };
     if (frame.size > maxFileBytes) return { ok: false, reason: `oversize frame: ${p}` };
     if (frame.size > remainingBudget) return { ok: false, reason: `oversize total: ${p}` };
+    if (frame.body === 'cached') {
+      if (!cacheEnabled) return { ok: false, reason: `cached body not enabled: ${p}` };
+      if (entry.size < MIN_CACHEABLE_BYTES) return { ok: false, reason: `cached body below minimum size: ${p}` };
+      if (!isBlobHash(entry.sha256)) return { ok: false, reason: `cached body without a valid sha256: ${p}` };
+    } else if (cacheEnabled && frame.body !== undefined) {
+      return { ok: false, reason: `unknown body encoding: ${p}` };
+    }
   } else if (frame.target !== entry.target) {
     return { ok: false, reason: `target mismatch: ${p}` };
   }
@@ -282,6 +344,11 @@ export async function readHeaderLine(reader, maxLineBytes = MAX_HEADER_BYTES) {
  * (e.g. `lane remote-exec`, which needs ticketId/repoKey/argv before it can
  * decide where `destDir` even is) can read the header with `readHeaderLine`
  * and then hand the same reader here.
+ *
+ * BRAIN-642: `limits.blobCache = {root, ns, stats}` switches on the runner's blob store: a `body:'cached'` frame (no body bytes,
+ * only for a manifest file of at least MIN_CACHEABLE_BYTES) is copied out of the store using the MANIFEST entry's hash, and a
+ * body frame is published to it. `stats` ({hits, misses, corrupt, published}) is filled in for the caller; `publishOptions` is a test seam. Without it a
+ * `body:'cached'` frame is refused and nothing here changes.
  */
 export async function extractFrames(reader, destDir, expectedManifest, limits = {}) {
   const maxFileBytes = limits.maxFileBytes ?? Infinity;
@@ -301,6 +368,10 @@ export async function extractFrames(reader, destDir, expectedManifest, limits = 
   );
   const seen = new Set();
   let cumulativeBytes = 0;
+  const blobCache = limits.blobCache;
+  const stats = blobCache?.stats;
+  const missing = [];
+  const corrupt = [];
 
   for (;;) {
     let line;
@@ -318,14 +389,33 @@ export async function extractFrames(reader, destDir, expectedManifest, limits = 
     }
     if (frame && frame.end === true) break;
 
-    const check = validateFrame(frame, expectedByPath, seen, symlinkPaths, maxFileBytes, maxTotalBytes - cumulativeBytes);
+    const check = validateFrame(frame, expectedByPath, seen, symlinkPaths, maxFileBytes, maxTotalBytes - cumulativeBytes, !!blobCache);
     if (!check.ok) return check;
     seen.add(frame.path);
 
     const fullPath = path.join(destDir, frame.path);
     fs.mkdirSync(path.dirname(fullPath), { recursive: true });
 
-    if (frame.type === 'file') {
+    if (frame.type === 'file' && frame.body === 'cached') {
+      const entry = expectedByPath.get(frame.path);
+      // charged up front: a miss or corrupt blob still counts, so no mix of them can step past the total cap
+      cumulativeBytes += frame.size;
+      let result;
+      try {
+        result = materializeBlob(blobCache.root, blobCache.ns, entry, fullPath);
+      } catch (err) {
+        return { ok: false, reason: `open failed: ${frame.path}: ${err.message}` };
+      }
+      if (result.status === 'hit') {
+        stats.hits += 1;
+      } else if (result.status === 'corrupt') {
+        stats.corrupt += 1;
+        corrupt.push(frame.path);
+      } else {
+        stats.misses += 1;
+        missing.push(frame.path);
+      }
+    } else if (frame.type === 'file') {
       let bytes;
       try {
         bytes = await reader.readBytes(frame.size);
@@ -350,6 +440,9 @@ export async function extractFrames(reader, destDir, expectedManifest, limits = 
       }
       fs.chmodSync(fullPath, frame.exec ? 0o755 : 0o644);
       cumulativeBytes += frame.size;
+      if (blobCache && frame.size >= MIN_CACHEABLE_BYTES && publishBlob(blobCache.root, blobCache.ns, expectedByPath.get(frame.path), bytes, blobCache.publishOptions) === 'published') {
+        stats.published += 1;
+      }
     } else {
       const escapeCheck = checkExtractSymlinkTarget(frame.path, frame.target, symlinkPaths);
       if (!escapeCheck.ok) return escapeCheck;
@@ -365,7 +458,14 @@ export async function extractFrames(reader, destDir, expectedManifest, limits = 
     return { ok: false, reason: 'missing entry: stream ended before all manifest entries arrived' };
   }
 
-  if (await reader.hasMore()) return { ok: false, reason: 'trailing bytes after terminator' };
+  try {
+    if (await reader.hasMore()) return { ok: false, reason: 'trailing bytes after terminator' };
+  } catch (err) {
+    return { ok: false, reason: `after terminator: ${err.message}` };
+  }
+
+  if (corrupt.length > 0) return { ok: false, reason: `cache-corrupt: ${corrupt.length}` };
+  if (missing.length > 0) return { ok: false, reason: `cache-miss: ${missing.length}` };
 
   return verifyManifestNoGit(destDir, expectedManifest);
 }

@@ -3,6 +3,8 @@ import { fileURLToPath } from 'node:url';
 import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
 import { PRIORITY_CAPABILITY } from './priority.js';
 import { ARTIFACTS_CAPABILITY } from './remote-artifacts.js';
+import { SNAPSHOT_GZIP_CAPABILITY } from './remote-gzip.js';
+import { BLOB_CACHE_CAPABILITY } from './remote-blobs.js';
 import { EXCLUSIVE_CAPABILITY } from './exclusive.js';
 import { LEASE_CHECK_CAPABILITY } from './lease.js';
 import { stateHome } from './state.js';
@@ -46,12 +48,17 @@ export const CAPABILITIES = [
   QUEUE_RETIER_CAPABILITY,
   LEASE_CHECK_CAPABILITY,
   RUNNER_HEARTBEAT_CAPABILITY,
+  SNAPSHOT_GZIP_CAPABILITY,
   REMOTE_EXCLUSIVE_CAPABILITY,
 ];
 
-/** CAPABILITIES plus the ones that depend on this host's config: `cpu-limit/1` only when `cpuLimit` is not "off" and its probe passed. */
-export function advertisedCapabilities(cpuLimit) {
-  return cpuLimit.mode !== 'off' && cpuLimit.available ? [...CAPABILITIES, CPU_LIMIT_CAPABILITY] : CAPABILITIES;
+/** `CAPABILITIES` plus what depends on this host's config: `blob-cache/1` only while the runner blob store is enabled, `cpu-limit/1` only when `cpuLimit` is not "off" and its probe passed. */
+export function advertisedCapabilities(cfg, cpuLimit = { mode: 'off', available: false }) {
+  return [
+    ...CAPABILITIES,
+    ...(cfg.remoteBlobCache ? [BLOB_CACHE_CAPABILITY] : []),
+    ...(cpuLimit.mode !== 'off' && cpuLimit.available ? [CPU_LIMIT_CAPABILITY] : []),
+  ];
 }
 
 /** `lane capabilities --json`: what this install can do and which scheduler/admission mode it is in. */
@@ -68,7 +75,7 @@ export function capabilitiesCommand({ root = stateHome() } = {}) {
   const cpuLimit = resolveCpuLimit(cfg);
   const payload = {
     version: pkg.version,
-    capabilities: isDispatchOnly(cfg) ? [...advertisedCapabilities(cpuLimit), DISPATCH_ONLY_CAPABILITY] : advertisedCapabilities(cpuLimit),
+    capabilities: [...advertisedCapabilities(cfg, cpuLimit), ...(isDispatchOnly(cfg) ? [DISPATCH_ONLY_CAPABILITY] : [])],
     schedulerMode: readSchedulerFence(root).status === 'valid' ? 'priority' : 'legacy',
     admissionMode: cfg.schedulerMode,
     classes: { mode, configHash, stateRoot, valid },

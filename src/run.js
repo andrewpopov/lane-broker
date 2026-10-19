@@ -7,6 +7,7 @@ import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { ensureStateDirs, paths, stateHome, readJsonSafe, appendHistory, LockTimeoutError, MigrationInProgressError, assertNotMigrating, isUuid } from './state.js';
 import { classTransportMismatch } from './classes.js';
+import { remoteExcludePreflight } from './remote-exclude.js';
 import { resolveTicketConfig, reloadGlobalConfig, isDispatchOnly, resolvePriority, assertHostConfigHookless, ConfigError } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
@@ -694,9 +695,18 @@ export async function runCommand({
     } catch {
       resolvedCwd = path.resolve(cwd);
     }
+    const relCwd = path.relative(remoteWorktreeRoot, resolvedCwd) || '';
+    // BRAIN-642: the lane's working directory is only known here, so the exclude protections that depend on it run now, before any snapshot is built
+    const excludeConflict = resolved.remoteExclude
+      ? remoteExcludePreflight(resolved.remoteExclude, { worktreeRoot: remoteWorktreeRoot, relCwd, remoteDeps: resolved.remoteDeps })
+      : null;
+    if (excludeConflict) {
+      process.stderr.write(`lane run: remoteExclude ${excludeConflict}\n`);
+      return { exitCode: 64 };
+    }
     ticket.remote = {
       worktreeRoot: remoteWorktreeRoot,
-      relCwd: path.relative(remoteWorktreeRoot, resolvedCwd) || '',
+      relCwd,
       repoKey: resolved.repoId,
       weight,
       cpuCores: resources.cpuCores,
@@ -714,6 +724,7 @@ export async function runCommand({
       remoteDepsCache: resolved.remoteDepsCache,
       remoteDepsCacheRootScriptsSafe: resolved.remoteDepsCacheRootScriptsSafe,
       remoteOmitEscapingSymlinks: resolved.remoteOmitEscapingSymlinks,
+      remoteExclude: resolved.remoteExclude,
       remoteArtifacts: resolved.remoteArtifacts,
       remoteArtifactsOn: resolved.remoteArtifactsOn,
     };

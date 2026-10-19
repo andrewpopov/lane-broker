@@ -87,9 +87,11 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
     return ms < MIN_CALL_MS ? null : ms;
   };
 
+  // the runner's ticket id: the lane id, except after a cache repair retry (BRAIN-642), which dispatched under a fresh one
+  const remoteId = attempt.binding?.ticketId ?? id;
   const firstBudget = callBudget();
   if (firstBudget === null) return waitTimedOut();
-  const fetched = await fetchRemoteResult(runner, id, sshBin, firstBudget, env);
+  const fetched = await fetchRemoteResult(runner, remoteId, sshBin, firstBudget, env);
   if (fetched === null) {
     const since = await recordContact(root, runner.name, false, now, { deadlineAt });
     return (await publishUnreachable(since)) ?? { settled: false, state: 'unreachable', transport: true, reason: `no usable answer from ${runner.name}` };
@@ -106,14 +108,14 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
   // start or still be running there.
   const cancelBudget = callBudget();
   if (cancelBudget === null) return waitTimedOut();
-  if (!(await remoteCancel(runner, id, { sshBin, deadlineMs: cancelBudget, env }))) {
+  if (!(await remoteCancel(runner, remoteId, { sshBin, deadlineMs: cancelBudget, env }))) {
     // an unconfirmed cancel is no answer to build on: the rest of a sweep treats this runner as down, like a failed fetch
     return { settled: false, state: 'unreachable', transport: true, reason: 'remote cancel not confirmed' };
   }
   // The job may have published a result between the first fetch and the cancel; that real outcome wins over "lost".
   const lateBudget = callBudget();
   if (lateBudget === null) return waitTimedOut();
-  const late = await fetchRemoteResult(runner, id, sshBin, lateBudget, env);
+  const late = await fetchRemoteResult(runner, remoteId, sshBin, lateBudget, env);
   if (late && !late.missing) {
     const adopted = await adoptOrAmbiguous(attempt, id, late, publish);
     if (adopted.state !== 'ambiguous') return adopted;
@@ -142,9 +144,9 @@ const neverDispatched = (attempt) => attempt.phase === 'probe' && !attempt.runne
 async function adoptOrAmbiguous(attempt, id, record, publish) {
   const { binding } = attempt;
   if (!binding) return { settled: false, state: 'ambiguous', reason: 'legacy attempt has no dispatch binding' };
-  const classified = classifyRemoteResult(record, { protocol: binding.protocol, ticketId: id, generation: binding.generation, manifestHash: binding.manifestHash });
+  const classified = classifyRemoteResult(record, { protocol: binding.protocol, ticketId: binding.ticketId ?? id, generation: binding.generation, manifestHash: binding.manifestHash });
   if (classified.outcome !== 'confirmed') {
-    const expected = { protocol: binding.protocol, ticketId: id, generation: binding.generation, manifestHash: binding.manifestHash };
+    const expected = { protocol: binding.protocol, ticketId: binding.ticketId ?? id, generation: binding.generation, manifestHash: binding.manifestHash };
     if (provesNeverStarted(record, expected)) {
       const kind = record.reason ? `${record.kind}: ${record.reason}` : record.kind;
       return publish('lost', () => lostResult(id, attempt, 'runner-never-started', `runner ${attempt.runner} reported ${kind}`));

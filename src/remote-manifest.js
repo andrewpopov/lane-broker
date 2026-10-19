@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
+import { applyRemoteExclude } from './remote-exclude.js';
 
 /**
  * Thrown by `buildManifest` when a worktree cannot be safely snapshotted for
@@ -213,8 +214,12 @@ function parsePathList(buf) {
  * the root (relative escape, or absolute) is left out of the manifest instead of making the tree ineligible; the
  * omitted paths come back as `omittedSymlinks` (present only when something was omitted). Nothing else is relaxed.
  * The runner's extraction re-validates whatever arrives and never learns of this option.
+ *
+ * `exclude` (BRAIN-642, a lane's `remoteExclude`): patterns whose paths are dropped before anything else looks at them
+ * -- no lstat-for-type, hash, or eligibility check -- so an excluded `.env` is not a refusal. A summary of what was
+ * dropped comes back as `excluded` (present only when `exclude` is given).
  */
-export function buildManifest(worktreeRoot, { omitEscapingSymlinks = false } = {}) {
+export function buildManifest(worktreeRoot, { omitEscapingSymlinks = false, exclude = null } = {}) {
   const root = path.resolve(worktreeRoot);
   const env = scrubbedGitEnv();
   const common = { cwd: root, env, encoding: 'buffer', maxBuffer: 1024 * 1024 * 256 };
@@ -233,7 +238,8 @@ export function buildManifest(worktreeRoot, { omitEscapingSymlinks = false } = {
   }
 
   const modeMap = parseModeMap(modesOut);
-  const candidates = parsePathList(pathsOut);
+  const listed = parsePathList(pathsOut);
+  const { kept: candidates, excluded } = exclude ? applyRemoteExclude(root, exclude, listed) : { kept: listed, excluded: undefined };
 
   const seen = new Set();
   const rawEntries = [];
@@ -277,7 +283,7 @@ export function buildManifest(worktreeRoot, { omitEscapingSymlinks = false } = {
   }
 
   const entries = sortEntries(kept).map(canonicalizeEntry);
-  return { entries, manifestHash: manifestHashOf(entries), ...(omittedSymlinks.length > 0 ? { omittedSymlinks: omittedSymlinks.sort(comparePaths) } : {}) };
+  return { entries, manifestHash: manifestHashOf(entries), ...(omittedSymlinks.length > 0 ? { omittedSymlinks: omittedSymlinks.sort(comparePaths) } : {}), ...(excluded ? { excluded } : {}) };
 }
 
 function walkDir(root, ignoreRootGit) {
