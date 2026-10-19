@@ -39,10 +39,27 @@ export function probeCpuLimit({ platform = process.platform, exec = defaultExec 
   return { available: true, reason: 'ok' };
 }
 
-/** The argv that runs `argv` in its own scope capped at `grantCores` cores. Spawns nothing. */
-export function cpuLimitArgv(grantCores, argv) {
+/** The transient scope's unit name for a lease: deterministic, so a later stop (BRAIN-651 L3) never has to discover it. */
+export const cpuScopeUnit = (leaseId) => `lane-${leaseId}.scope`;
+
+/** The argv that runs `argv` in its own scope capped at `grantCores` cores (named `unit` when given). Spawns nothing. */
+export function cpuLimitArgv(grantCores, argv, { unit } = {}) {
   if (!Number.isInteger(grantCores) || grantCores < 1) throw new Error(`cpuLimitArgv: grantCores must be a positive integer, got ${grantCores}`);
-  return ['systemd-run', '--user', '--scope', '-p', `CPUQuota=${grantCores * 100}%`, '--quiet', '--collect', '--', ...argv];
+  return ['systemd-run', '--user', '--scope', ...(unit ? [`--unit=${unit}`] : []), '-p', `CPUQuota=${grantCores * 100}%`, '--quiet', '--collect', '--', ...argv];
+}
+
+/**
+ * BRAIN-651 L2: spawn a lane's child with `spawnFn`, inside a CPUQuota scope when `resolved` (resolveCpuLimit's shape) says the mode
+ * is on and the probe passed, on Linux. `systemd-run --scope` execs the command in place, so the pid, process group, stdio, cwd, env and
+ * exit status are the bare command's. A fractional grant rounds UP: the quota is never below what admission reserved.
+ * Returns `{child, unit}`; `unit` is null when nothing was wrapped.
+ */
+export function spawnInCpuScope(spawnFn, { resolved, platform = process.platform, leaseId, grantCores, cmd, args, options }) {
+  const enforce = platform === 'linux' && resolved?.mode !== 'off' && resolved?.available === true && Number.isFinite(grantCores) && grantCores > 0;
+  if (!enforce) return { child: spawnFn(cmd, args, options), unit: null };
+  const unit = cpuScopeUnit(leaseId);
+  const [file, ...wrapped] = cpuLimitArgv(Math.ceil(grantCores), [cmd, ...args], { unit });
+  return { child: spawnFn(file, wrapped, options), unit };
 }
 
 /** `{mode, available, reason}` for status and remote-probe. Mode "off" never runs the probe. */

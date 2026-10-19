@@ -27,7 +27,7 @@ import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processSt
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
 import { reloadGlobalConfig, isDispatchOnly } from './config.js';
-import { enforceCpuLimitStartup, CpuLimitUnavailableError } from './cpu-limit.js';
+import { enforceCpuLimitStartup, CpuLimitUnavailableError, spawnInCpuScope } from './cpu-limit.js';
 import { stateHome } from './state.js';
 import { readRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
@@ -1236,9 +1236,10 @@ async function main() {
   };
 
   // BRAIN-651 L1: "require" on a host that cannot enforce a CPU quota refuses the ticket by name before it is ever queued;
-  // "prefer" warns once. The spawn wrap itself is a later ticket (L2).
+  // "prefer" warns once. L2: the resolved result also decides whether the lane child is spawned inside a CPUQuota scope.
+  let cpuLimit;
   try {
-    enforceCpuLimitStartup(globalCfg, { warn: (line) => process.stderr.write(line) });
+    cpuLimit = enforceCpuLimitStartup(globalCfg, { warn: (line) => process.stderr.write(line) });
   } catch (err) {
     if (!(err instanceof CpuLimitUnavailableError)) throw err;
     const refusal = { exitCode: LOCAL_REFUSED_EXIT_CODE, message: `lane run: ${err.message}\n` };
@@ -1588,11 +1589,19 @@ async function main() {
   const [cmd, args] = resolveNicedSpawn({ ...ticket, nice: started.lease.nice ?? ticket.nice }, os.getPriority(), resolveLaneNice(ticket, priorityOf(started.lease), globalCfg));
   // the host may have turned dispatch-only since admission (config flip or marker): re-read it at the last moment, release the lease unused
   if (isDispatchOnly(reloadGlobalConfig(globalCfg))) await refuseDispatchOnlyAndExit({ lease: true });
-  const child = spawn(cmd, args, {
-    cwd: ticket.cwd,
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: childEnv({ ...ticket, priorityAdmitted: started.lease.priorityAdmitted }, process.env, leaseCpuCores(started.lease), started.lease.classEnforcement),
+  // BRAIN-651 L2: the admitted grant (elastic included) caps the whole tree; a remote protocol-2 pipeline is this same child, so deps, setup and command share it
+  const { child, unit: cpuScope } = spawnInCpuScope(spawn, {
+    resolved: cpuLimit,
+    leaseId: ticket.id,
+    grantCores: leaseCpuCores(started.lease),
+    cmd,
+    args,
+    options: {
+      cwd: ticket.cwd,
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: childEnv({ ...ticket, priorityAdmitted: started.lease.priorityAdmitted }, process.env, leaseCpuCores(started.lease), started.lease.classEnforcement),
+    },
   });
 
   const logWriter = new CappedLogWriter(ticket.logPath);
@@ -1625,7 +1634,7 @@ async function main() {
     if (!forwardedOk) stderrForward.pauseUntilDrain(stderrGate);
   });
 
-  writeLease(root, { ...started.lease, childPgid: child.pid, heartbeatAt: Date.now(), startedAt });
+  writeLease(root, runningLease(started.lease, { childPgid: child.pid, cpuScopeUnit: cpuScope, startedAt }));
 
   let finished = false;
   let cancelling = false;
@@ -1883,6 +1892,11 @@ if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
     process.stderr.write(`lane-broker supervisor error: ${err.stack || err.message}\n`);
     process.exit(1);
   });
+}
+
+/** The lease once its child is running. `cpuScopeUnit` (BRAIN-651 L2) is recorded only when the child was wrapped, so L3 can stop that scope. */
+export function runningLease(lease, { childPgid, cpuScopeUnit, startedAt }) {
+  return { ...lease, childPgid, ...(cpuScopeUnit ? { cpuScopeUnit } : {}), heartbeatAt: Date.now(), startedAt };
 }
 
 /** Other held leases' supervisor pids and child groups, so a nested `lane run` is not observed twice (BRAIN-353). */
