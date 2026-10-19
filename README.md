@@ -1239,11 +1239,16 @@ A warning shows in the log as `lane: warning: remote artifacts: ...` and in the 
 `remoteArtifactsWarning`. The lane's success is about the command: a stamp that did not arrive shows up when whatever
 reads it refuses.
 
-### CPU quota per lane (`cpuLimit`, BRAIN-651 L1)
+### CPU quota per lane (`cpuLimit`, BRAIN-651 L1, L2)
 
 `"cpuLimit": "off" | "prefer" | "require"` (global config, default `"off"`; any other value is a config error naming the key) is the
 opt-in for enforcing a lane's admitted CPU grant on a **Linux** host with a transient systemd scope, `CPUQuota=<grant x 100>%`.
-**This release adds the capability and the probe only; nothing is wrapped yet** (the spawn wrap is L2), so no mode changes how a lane runs.
+With `"prefer"` or `"require"` and a passing probe, the supervisor spawns each lane child inside `systemd-run --user --scope --unit=lane-<leaseId>.scope -p CPUQuota=<grant x 100>% --quiet --collect`,
+where the grant is the one admission gave (an elastic grant included, the same number as `LANE_BROKER_CPU_CORES`; a fractional grant rounds up).
+`--scope` execs the command in place, so `nice`, cwd, env, stdout/stderr and the exit status are unchanged. A remote protocol-2 pipeline is the lane child,
+so its deps install, setup and command share one scope. The unit name is recorded on the lease as `cpuScopeUnit` (only when a scope was made).
+With `"off"`, on macOS, or under `"prefer"` with a failed probe, the spawn is exactly what it was before. Stopping and reaping the scope on cancel, watchdog kill
+and orphan recovery is a later change (L3): until then cancellation still kills the process group and tracked descendants only.
 
 - The probe runs `systemd-run --user --scope -p CPUQuota=100% --quiet sh -c <read cpu.max>` as the broker's own user and requires the
   scope's `cpu.max` to read back `100000 100000`. It reports `{mode, available, reason}`: `unsupported-platform` on macOS,
