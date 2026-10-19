@@ -914,7 +914,8 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot(), measure, 
     protocols: [1, 2],
     ...(status.lockError ? { stale: true, snapshot: 'lockless' } : {}),
     // BRAIN-360: this runner resolves minCpuCores itself, so a submitter may judge fit by the floor
-    capabilities: advertisedCapabilities(globalCfg),
+    capabilities: advertisedCapabilities(globalCfg, status.cpuLimit),
+    cpuLimit: status.cpuLimit,
     version: pkg.version,
     // BRAIN-380 slice 4: a draining runner takes no new work. `draining` names why; `paused` is also set so a client
     // built before this field skips the runner the way it skips a paused one.
@@ -923,7 +924,7 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot(), measure, 
     paused: Boolean(status.paused) || draining || Boolean(configError),
     ...(configError ? { configError } : {}),
     // BRAIN-623: answers to the submitter's readiness needs (`--requires` ...); an older runner sends none, which the submitter reads as not ready
-    ...reportReadiness(needs),
+    ...reportReadiness(needs, { runnerTags: globalCfg.runnerTags }),
     queued: status.queued.length,
     running: status.running.length,
     // BRAIN-360: additive; the CPU the runner's leases are charged (grants, not declarations)

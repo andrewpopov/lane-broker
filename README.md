@@ -54,6 +54,7 @@ lane gc [--dry-run] [--max <n>]
 lane reconcile [--now] [--json]          # settle ORPHANED-REMOTE attempts from their runners (BRAIN-515)
 lane runner [status] [--json]            # each runner's state, last-ok age and lost-settle time (BRAIN-597)
 lane runner watch                        # one heartbeat tick (ping every runner, then one reconcile sweep); schedule it every 60 s
+lane runner prewarm [--lane <n>] [--runner <n>] [--dry-run]   # warm a runner's per-machine caches with a lane's remoteSetup (BRAIN-649)
 ```
 
 `lane status` adds `  log file unchanged for <duration>` to a RUNNING line once the
@@ -716,6 +717,40 @@ Two more checks need nothing from the lane (BRAIN-623):
   `src/` plus `package.json` (what an unclean shutdown leaves behind). A runner reporting any is skipped (`truncated install: 2 zero-length
   file(s) (src/a.js, src/b.js)`). A runner that reports no `integrity` (older) is not skipped for it; use the version floor to exclude those.
 
+### A lane that holds a whole runner (`remoteExclusive`, BRAIN-649)
+
+```json
+{ "version": 1, "lanes": { "train": { "weight": 4, "cpuCores": 9, "remote": true, "remoteExclusive": true } } }
+```
+
+`exclusive` stays local-only (a runner's intake suppresses it). `remoteExclusive` is the runner-side form: the submitter places the lane
+on an **idle** runner (`running 0`, `queued 0` in its probe) when one is eligible, else on the eligible runner with the shortest queue
+(ties: earliest estimated finish, more free CPU, then config order). Eligible means up, not paused or draining, passing the readiness and
+`requiresTags` checks, and advertising `remote-exclusive/1` (an older runner would ignore the flag, so it is skipped). `maxRemoteQueue` does
+not cap it: an exclusive lane waits its turn rather than exit `76`, and it is not run locally because this machine could admit it. On the
+runner the intake ticket is an ordinary exclusive: it waits at the queue head for the leases to drain, then
+starts only when the runner holds no lease, and nothing else is admitted while it runs, so a load-sensitive suite (a Playwright RC) is
+not run on a runner that already has other lanes. `lane run --exclusive` and `exclusive` on the snapshot's lane are still ignored there. If no
+runner is eligible the lane waits or falls back like any lane with no usable runner; it is not made exclusive locally. A locally queued
+or already-queued remote ticket is moved (rebind, rebalance) only to a runner that is not queued.
+
+### Runner capability tags (`requiresTags` / `runnerTags`, BRAIN-649)
+
+A runner declares what it supports in its **own** global config, `"runnerTags": ["browser"]` (names as for `requires`; default none). A lane (or
+the repo) lists `"requiresTags": ["browser"]`; the sets merge like `requires`. It is one more readiness check (`tags`, `src/runner-readiness.js`):
+the submitter sends `--tags browser` in the probe it already makes, the runner answers `tags: { browser: true|false }`, and a runner that
+lacks a tag, or an older one that answers nothing, is **not ready** and shows `missing tag browser` in `lane status`. Use it to keep a lane off
+a runner whose OS or tooling the repo does not support (Playwright on an unsupported distro) by leaving the tag off that runner.
+
+### Prewarming a runner (`prewarm`, `lane runner prewarm`, BRAIN-649)
+
+`"prewarm": true` on a lane marks its `remoteDeps`/`remoteSetup` as worth warming (a cold `art:pull` is minutes). From a checkout of the repo,
+`lane runner prewarm [--lane <name>] [--runner <name>] [--dry-run]` sends that lane's snapshot to each online runner (or one) with the command
+`true` at `low` priority, so the runner's own broker runs the setup and leaves its per-machine caches warm for the first real ticket. The
+lane is `--lane`, else the repo's only `prewarm: true` lane. Give it a dedicated lane with the same setup (not a `remoteExclusive` one: that
+run would hold the runner). It exits 1 if any runner did not warm. It is manual: nothing schedules it yet, and a running prewarm is an
+ordinary low-priority ticket on the runner (not preempted by later work).
+
 ### Dependencies and setup on the runner (BRAIN-320)
 
 ```json
@@ -1238,6 +1273,32 @@ What it refuses, as a warning and never a change to the exit code or to the publ
 A warning shows in the log as `lane: warning: remote artifacts: ...` and in the history row as
 `remoteArtifactsWarning`. The lane's success is about the command: a stamp that did not arrive shows up when whatever
 reads it refuses.
+
+### CPU quota per lane (`cpuLimit`, BRAIN-651 L1, L2, L3)
+
+`"cpuLimit": "off" | "prefer" | "require"` (global config, default `"off"`; any other value is a config error naming the key) is the
+opt-in for enforcing a lane's admitted CPU grant on a **Linux** host with a transient systemd scope, `CPUQuota=<grant x 100>%`.
+With `"prefer"` or `"require"` and a passing probe, the supervisor spawns each lane child inside `systemd-run --user --scope --unit=lane-<leaseId>.scope -p CPUQuota=<grant x 100>% --quiet --collect`,
+where the grant is the one admission gave (an elastic grant included, the same number as `LANE_BROKER_CPU_CORES`; a fractional grant rounds up).
+`--scope` execs the command in place, so `nice`, cwd, env, stdout/stderr and the exit status are unchanged. A remote protocol-2 pipeline is the lane child,
+so its deps install, setup and command share one scope. The unit name is recorded on the lease as `cpuScopeUnit` (only when a scope was made).
+With `"off"`, on macOS, or under `"prefer"` with a failed probe, the spawn is exactly what it was before.
+Cancel semantics (L3): when a lease carries `cpuScopeUnit`, every way a lane is ended also runs `systemctl --user stop <unit>`, in addition to the
+process-group and tracked-descendant signals that always ran. The scope stop signals every process in the scope (control-group kill: SIGTERM, then SIGKILL
+after the unit's stop timeout), a `setsid`'d grandchild included, and returns once the scope is empty. It runs for `lane cancel` of an orphaned lease, for a
+supervisor reaping after a cancel, a signal or the silence/no-progress watchdog, and for orphan recovery of a dead supervisor's lease. The lease is released only
+after the stop returns, or after 15 s: a stop that did not complete is logged in the admission log as `lane-broker-cpu-scope id=<id> unit=<unit> stop-incomplete reason=<why>`
+and the lease is released anyway. A scope that is already unloaded counts as stopped. A lease without `cpuScopeUnit` (cpuLimit off, macOS, failed probe) behaves exactly as before.
+
+- The probe runs `systemd-run --user --scope -p CPUQuota=100% --quiet sh -c <read cpu.max>` as the broker's own user and requires the
+  scope's `cpu.max` to read back `100000 100000`. It reports `{mode, available, reason}`: `unsupported-platform` on macOS,
+  `systemd-run-missing`, `systemd-run-exit-N: <first stderr line>`, or `cpu-max-not-applied: <readback>`. Mode `off` never probes.
+- `"require"` on a host whose probe fails makes the supervisor refuse the ticket before it queues, exit `69`, with `CPU_LIMIT_UNAVAILABLE`
+  named in the message. `"prefer"` logs one warning per supervisor and carries on.
+- `lane status --json` and `lane remote-probe` carry `cpuLimit: {mode, available, reason}`; `lane capabilities --json` carries it too.
+  `cpu-limit/1` is added to the advertised capabilities only when the mode is not `off` and the probe passed.
+- Quota limits CPU time over a period, not instantaneous concurrency, and it needs a user systemd instance with the `cpu` controller delegated;
+  that is what the probe checks.
 
 ### Dispatch-only host (`localExecution`)
 

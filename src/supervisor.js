@@ -27,6 +27,7 @@ import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processSt
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
 import { reloadGlobalConfig, isDispatchOnly } from './config.js';
+import { enforceCpuLimitStartup, CpuLimitUnavailableError, spawnInCpuScope, stopLeaseCpuScope } from './cpu-limit.js';
 import { stateHome } from './state.js';
 import { readRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
@@ -35,14 +36,14 @@ import { starvedStaleMs } from './external-cpu.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, priorityOf, resolveLaneNice, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
-import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, dispatchOnlyRefusal, locallyRefusedNow, localWindowAllowing, leaseCpuCores, terminalRowDefaults } from './resources.js';
+import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, dispatchOnlyRefusal, LOCAL_REFUSED_EXIT_CODE, locallyRefusedNow, localWindowAllowing, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
 import { remoteExcludeWarnings } from './remote-exclude.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
-import { REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
+import { REMOTE_WITHDRAW_CAPABILITY, REMOTE_EXCLUSIVE_CAPABILITY } from './capabilities.js';
 import { SNAPSHOT_GZIP_CAPABILITY, TRANSFER_GZIP } from './remote-gzip.js';
 import { BLOB_CACHE_CAPABILITY } from './remote-blobs.js';
 import { createAttempt, readAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
@@ -580,6 +581,8 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
   const expectedMs = scheduled ? expectedRunMs(readRows(paths(root).history), enriched.repoId, enriched.lane) : null;
   // BRAIN-597: first placement, rebind and rebalance all select through here, so a down runner is skipped by every one of them.
   const downRunners = downRunnerReasons(root, globalCfg);
+  // BRAIN-649: a `remoteExclusive` lane takes a whole runner and its intake waits for the leases to drain: an idle runner is preferred, else the shortest queue
+  const exclusiveOnRunner = enriched.remote?.remoteExclusive === true;
   return {
     ...(expectedMs !== null ? { expectedRunMs: expectedMs } : {}),
     ...(Object.keys(downRunners).length > 0 ? { downRunners } : {}),
@@ -588,7 +591,8 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
     ...(isDispatchOnly(globalCfg) || locallyRefusedNow(enriched, globalCfg) ? { retryTimedOut: heartbeatUpRunners(root, globalCfg) } : {}),
     maxRemoteQueue: globalCfg.maxRemoteQueue,
     requireProtocol2: needsProtocol2(enriched.remote) || Boolean(queueTimeoutFor(enriched, globalCfg)),
-    requireCapabilities: isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : [],
+    requireCapabilities: [...(isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : []), ...(exclusiveOnRunner ? [REMOTE_EXCLUSIVE_CAPABILITY] : [])],
+    preferIdle: exclusiveOnRunner,
     readinessNeeds: readinessNeeds(enriched.remote, globalCfg),
     reservation: {
       weight: enriched.weight,
@@ -606,9 +610,10 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
  */
 export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHome(), stuckLocally = false, draining = false } = {}) {
   const base = remoteSelectOptions(enriched, globalCfg, root);
-  if (kind === 'rebind') return { ...base, maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0 };
+  // a move or rebind picks a better home for a ticket that already has one, so it never takes a loaded runner for the exclusive drain
+  if (kind === 'rebind') return { ...base, preferIdle: false, maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0 };
   if (kind === 'rebalance') {
-    return { ...base, maxRemoteQueue: 0, requireCapabilities: draining ? [...base.requireCapabilities, REMOTE_WITHDRAW_CAPABILITY] : base.requireCapabilities };
+    return { ...base, preferIdle: false, maxRemoteQueue: 0, requireCapabilities: draining ? [...base.requireCapabilities, REMOTE_WITHDRAW_CAPABILITY] : base.requireCapabilities };
   }
   return base;
 }
@@ -899,13 +904,17 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   if (queuedChoice) {
     queuedAt = `${runner.name}(${probe.queued})`;
     const ineligible = localIneligibility();
-    const local = ineligible ? null : await couldAdmitNow(root, globalCfg, enriched);
+    // BRAIN-649: a remoteExclusive lane waits for its runner to drain; it is never run locally because this machine could admit it
+    const exclusive = enriched.remote?.remoteExclusive === true;
+    const local = ineligible || exclusive ? null : await couldAdmitNow(root, globalCfg, enriched);
     if (local?.admit) {
       const reason = skipped.map((s) => `${s.name}: ${s.reason}`).join('; ');
       return fallbackOrRefuse(null, `${reason}; local can admit now, not queuing on ${queuedAt}`, { rebindable: true });
     }
     const line = ineligible
       ? `lane: queuing on ${queuedAt}: not locally eligible (${ineligible.message.trim()})\n`
+      : exclusive
+      ? `lane: queuing on ${queuedAt}: remoteExclusive lane waits for the runner to drain\n`
       : `lane: queuing on ${queuedAt}: local cannot admit now (${local.reason})\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);
@@ -1249,6 +1258,22 @@ async function main() {
     bootId: bootId(),
   };
 
+  // BRAIN-651 L1: "require" on a host that cannot enforce a CPU quota refuses the ticket by name before it is ever queued;
+  // "prefer" warns once. L2: the resolved result also decides whether the lane child is spawned inside a CPUQuota scope.
+  let cpuLimit;
+  try {
+    cpuLimit = enforceCpuLimitStartup(globalCfg, { warn: (line) => process.stderr.write(line) });
+  } catch (err) {
+    if (!(err instanceof CpuLimitUnavailableError)) throw err;
+    const refusal = { exitCode: LOCAL_REFUSED_EXIT_CODE, message: `lane run: ${err.message}\n` };
+    process.stderr.write(refusal.message);
+    const result = localRefusalResult(enriched, refusal);
+    atomicWriteJson(ticket.resultPath, result);
+    appendHistory(root, historyRow(ticket, result, {}));
+    await underLock(root, () => clearTicketMarkers(root, ticket.id));
+    process.exit(refusal.exitCode);
+  }
+
   let cancelledBeforeStart = false;
   // BRAIN-319 T3b-2: the same SIGTERM/SIGINT this supervisor already reacts
   // to (queued-cancel above, killGroup once running below) also aborts an
@@ -1587,11 +1612,19 @@ async function main() {
   const [cmd, args] = resolveNicedSpawn({ ...ticket, nice: started.lease.nice ?? ticket.nice }, os.getPriority(), resolveLaneNice(ticket, priorityOf(started.lease), globalCfg));
   // the host may have turned dispatch-only since admission (config flip or marker): re-read it at the last moment, release the lease unused
   if (isDispatchOnly(reloadGlobalConfig(globalCfg))) await refuseDispatchOnlyAndExit({ lease: true });
-  const child = spawn(cmd, args, {
-    cwd: ticket.cwd,
-    detached: true,
-    stdio: ['ignore', 'pipe', 'pipe'],
-    env: childEnv({ ...ticket, priorityAdmitted: started.lease.priorityAdmitted }, process.env, leaseCpuCores(started.lease), started.lease.classEnforcement),
+  // BRAIN-651 L2: the admitted grant (elastic included) caps the whole tree; a remote protocol-2 pipeline is this same child, so deps, setup and command share it
+  const { child, unit: cpuScope } = spawnInCpuScope(spawn, {
+    resolved: cpuLimit,
+    leaseId: ticket.id,
+    grantCores: leaseCpuCores(started.lease),
+    cmd,
+    args,
+    options: {
+      cwd: ticket.cwd,
+      detached: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: childEnv({ ...ticket, priorityAdmitted: started.lease.priorityAdmitted }, process.env, leaseCpuCores(started.lease), started.lease.classEnforcement),
+    },
   });
 
   const logWriter = new CappedLogWriter(ticket.logPath);
@@ -1624,7 +1657,7 @@ async function main() {
     if (!forwardedOk) stderrForward.pauseUntilDrain(stderrGate);
   });
 
-  writeLease(root, { ...started.lease, childPgid: child.pid, heartbeatAt: Date.now(), startedAt });
+  writeLease(root, runningLease(started.lease, { childPgid: child.pid, cpuScopeUnit: cpuScope, startedAt }));
 
   let finished = false;
   let cancelling = false;
@@ -1639,6 +1672,8 @@ async function main() {
     const [, result] = await Promise.all([killGroup(child.pid), descendants.reap({ graceMs: cancelGraceMs() })]);
     // an incomplete reap is logged but never wedges the lease: the lease is still released
     writeBrokerLog(root, reapLogLine(ticket.id, result, reason));
+    // BRAIN-651 L3: the group and tracked-descendant signals above cannot reach a setsid'd process the tracker lost; stopping the scope can
+    stopLeaseCpuScope({ id: ticket.id, cpuScopeUnit: cpuScope }, { log: (line) => writeBrokerLog(root, line) });
   }
 
   /** BRAIN-431: ONE reap however many things ask (watchdog, cancel marker, signal, leader exit); the first caller's reason is logged. */
@@ -1882,6 +1917,11 @@ if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
     process.stderr.write(`lane-broker supervisor error: ${err.stack || err.message}\n`);
     process.exit(1);
   });
+}
+
+/** The lease once its child is running. `cpuScopeUnit` (BRAIN-651 L2) is recorded only when the child was wrapped, so L3 can stop that scope. */
+export function runningLease(lease, { childPgid, cpuScopeUnit, startedAt }) {
+  return { ...lease, childPgid, ...(cpuScopeUnit ? { cpuScopeUnit } : {}), heartbeatAt: Date.now(), startedAt };
 }
 
 /** Other held leases' supervisor pids and child groups, so a nested `lane run` is not observed twice (BRAIN-353). */

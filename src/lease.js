@@ -5,6 +5,7 @@ import { trackerForLease, reapLogLine, cancelGraceMs } from './descendants.js';
 import { writeBrokerLog } from './admission.js';
 import { isPidAlive, processStartTime, isProcessAlive } from './process-liveness.js';
 import { touchSimArmFor } from './sim-arm.js';
+import { stopLeaseCpuScope } from './cpu-limit.js';
 
 export { isPidAlive, processStartTime };
 
@@ -121,13 +122,15 @@ const ORPHAN_UNREADABLE_GIVE_UP_MS = 60_000;
  * unreadable (no KILL can be sent then), so a lease never blocks its lane forever.
  * Returns 'released' (lease removed) or 'held'. `clock.now`/`kill`/`readTable` are injectable for tests.
  */
-function stepOrphanReap(root, lease, { now = Date.now(), kill, readTable } = {}) {
+function stepOrphanReap(root, lease, { now = Date.now(), kill, readTable, exec } = {}) {
   const state = lease.orphanReap ?? { termAt: now, signalled: 0, termed: [], killed: [] };
   const release = (result) => {
     if (lease.orphanReap || !result.complete) writeBrokerLog(root, reapLogLine(lease.id, result));
     removeLease(root, lease.id);
     return 'released';
   };
+  // BRAIN-651 L3: stop the lane's CPU scope once, before any release, so a setsid'd process the tracker lost cannot outlive the lease
+  if (!state.scopeStopAttempted) stopLeaseCpuScope(lease, { exec, log: (line) => writeBrokerLog(root, line) });
   const tracker = trackerForLease(lease, { readTable });
   const rows = tracker.scan();
   const live = rows ? tracker.live(rows) : null;
@@ -156,6 +159,7 @@ function stepOrphanReap(root, lease, { now = Date.now(), kill, readTable } = {})
     descendants: tracker.snapshot(),
     orphanReap: {
       termAt: state.termAt,
+      ...(lease.cpuScopeUnit ? { scopeStopAttempted: true } : {}),
       ...(killAt !== undefined ? { killAt } : {}),
       signalled: state.signalled + signalled.length,
       termed: [...termed],

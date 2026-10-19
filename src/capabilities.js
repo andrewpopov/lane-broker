@@ -11,7 +11,10 @@ import { stateHome } from './state.js';
 import { readSchedulerFence } from './fairness.js';
 import { loadGlobalConfig, DEFAULT_GLOBAL_CONFIG, isDispatchOnly } from './config.js';
 import { CLASSES_CAPABILITY, resolveClasses } from './classes.js';
+import { CPU_LIMIT_CAPABILITY, resolveCpuLimit } from './cpu-limit.js';
 
+/** BRAIN-649: this runner honours `remoteExclusive` on intake (holds the whole runner while the lane runs). */
+export const REMOTE_EXCLUSIVE_CAPABILITY = 'remote-exclusive/1';
 export const SIM_SAFE_BACKFILL_CAPABILITY = 'sim-safe-backfill/1';
 export const LANE_AGING_CAPABILITY = 'lane-aging/1';
 export const GROUP_REAP_CAPABILITY = 'group-reap/1';
@@ -46,11 +49,16 @@ export const CAPABILITIES = [
   LEASE_CHECK_CAPABILITY,
   RUNNER_HEARTBEAT_CAPABILITY,
   SNAPSHOT_GZIP_CAPABILITY,
+  REMOTE_EXCLUSIVE_CAPABILITY,
 ];
 
-/** `CAPABILITIES` plus what depends on this runner's config: `blob-cache/1` only while its blob store is enabled. */
-export function advertisedCapabilities(cfg) {
-  return cfg.remoteBlobCache ? [...CAPABILITIES, BLOB_CACHE_CAPABILITY] : CAPABILITIES;
+/** `CAPABILITIES` plus what depends on this host's config: `blob-cache/1` only while the runner blob store is enabled, `cpu-limit/1` only when `cpuLimit` is not "off" and its probe passed. */
+export function advertisedCapabilities(cfg, cpuLimit = { mode: 'off', available: false }) {
+  return [
+    ...CAPABILITIES,
+    ...(cfg.remoteBlobCache ? [BLOB_CACHE_CAPABILITY] : []),
+    ...(cpuLimit.mode !== 'off' && cpuLimit.available ? [CPU_LIMIT_CAPABILITY] : []),
+  ];
 }
 
 /** `lane capabilities --json`: what this install can do and which scheduler/admission mode it is in. */
@@ -64,12 +72,14 @@ export function capabilitiesCommand({ root = stateHome() } = {}) {
     cfg = { ...DEFAULT_GLOBAL_CONFIG, classesInvalid: err.message };
   }
   const { mode, configHash, stateRoot, valid } = resolveClasses(cfg, root);
+  const cpuLimit = resolveCpuLimit(cfg);
   const payload = {
     version: pkg.version,
-    capabilities: [...advertisedCapabilities(cfg), ...(isDispatchOnly(cfg) ? [DISPATCH_ONLY_CAPABILITY] : [])],
+    capabilities: [...advertisedCapabilities(cfg, cpuLimit), ...(isDispatchOnly(cfg) ? [DISPATCH_ONLY_CAPABILITY] : [])],
     schedulerMode: readSchedulerFence(root).status === 'valid' ? 'priority' : 'legacy',
     admissionMode: cfg.schedulerMode,
     classes: { mode, configHash, stateRoot, valid },
+    cpuLimit,
   };
   process.stdout.write(`${JSON.stringify(payload)}\n`);
   return { exitCode: 0 };

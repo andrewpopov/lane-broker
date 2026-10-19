@@ -10,6 +10,7 @@ import { unsupportedHookKeys, hookRefusalMessage } from './exclusive.js';
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
 import { DEFAULT_DEPS_CACHE_MAX_BYTES } from './deps-cache.js';
 import { isValidRequiresShape, VERSION_FLOOR_RE } from './runner-readiness.js';
+import { CPU_LIMIT_MODES } from './cpu-limit.js';
 
 /** The largest delay Node's setTimeout honours; above it the timer fires after 1 ms. */
 const MAX_TIMER_MS = 2_147_483_647;
@@ -129,6 +130,12 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // BRAIN-629: null, or `{ schedule, lanes }`: during `schedule` (a runner-style schedule on this machine's clock) the named
   // remote-eligible `localRefused` lanes may run on THIS machine. Outside it, and for every unlisted lane, nothing changes.
   localWindow: null,
+  // BRAIN-649: capability tags THIS runner declares for itself (e.g. ["browser"]); a lane's `requiresTags` is matched against them. A
+  // runner whose OS a lane's tooling does not support simply omits the tag.
+  runnerTags: [],
+  // BRAIN-651 L1: "off" | "prefer" | "require". Whether a lane's CPU grant is to be enforced with a systemd CPUQuota scope (Linux only).
+  // "require" refuses to start a supervisor on a host whose probe fails (CPU_LIMIT_UNAVAILABLE); "prefer" warns once and continues.
+  cpuLimit: 'off',
   // BRAIN-597: a runner whose first failed contact (runner-unreachable.json, kept fresh by `lane runner watch`) is at least this old is
   // skipped by placement without being probed. 0 disables the skip.
   runnerDownAfterMs: 300_000,
@@ -403,6 +410,8 @@ function validateGlobalConfig(cfg, sourcePath) {
       `${sourcePath}: "localWindow.lanes" must be a non-empty array of lane names`,
     );
   }
+  assert(isValidRequiresShape(cfg.runnerTags), `${sourcePath}: "runnerTags" must be an array of tag names (letters, digits, "." "_" "+" "-"), e.g. ["browser"]`);
+  assert(CPU_LIMIT_MODES.includes(cfg.cpuLimit), `${sourcePath}: "cpuLimit" must be one of ${CPU_LIMIT_MODES.map((m) => `"${m}"`).join(', ')}, got ${JSON.stringify(cfg.cpuLimit)}`);
   assert(Number.isInteger(cfg.runnerDownAfterMs) && cfg.runnerDownAfterMs >= 0, `${sourcePath}: "runnerDownAfterMs" must be a non-negative integer`);
   assert(Number.isInteger(cfg.remoteProbeDeadlineMs) && cfg.remoteProbeDeadlineMs > 0 && cfg.remoteProbeDeadlineMs <= MAX_TIMER_MS, `${sourcePath}: "remoteProbeDeadlineMs" must be a positive integer no larger than ${MAX_TIMER_MS} (a larger Node timer overflows to 1 ms)`);
   for (const field of ['remoteRebalanceMinQueuedMs', 'remoteRebalanceCooldownMs', 'remoteRebalanceMaxMoves']) {
@@ -631,7 +640,7 @@ function assertNoHookKeys(config, where) {
   assert(keys.length === 0, hookRefusalMessage(where, keys));
 }
 
-/** BRAIN-623: `requires` names executables a runner must have on PATH for the lane (repo level and lane level). */
+/** BRAIN-623: `requires` names executables a runner must have on PATH for the lane (repo level and lane level); BRAIN-649 `requiresTags` and `runnerTags` share the name shape. */
 function assertRequires(requires, where) {
   assert(isValidRequiresShape(requires), `${where} must be an array of executable names (letters, digits, "." "_" "+" "-"; no paths), e.g. ["rg", "poetry"]`);
 }
@@ -642,6 +651,7 @@ function validateRepoConfig(cfg, sourcePath) {
   assert(cfg.lanes && typeof cfg.lanes === 'object' && !Array.isArray(cfg.lanes), `${sourcePath}: "lanes" must be an object`);
   assertNoHookKeys(cfg, sourcePath);
   if (cfg.requires !== undefined) assertRequires(cfg.requires, `${sourcePath}: "requires"`);
+  if (cfg.requiresTags !== undefined) assertRequires(cfg.requiresTags, `${sourcePath}: "requiresTags"`);
   for (const [name, lane] of Object.entries(cfg.lanes)) {
     assert(lane && typeof lane === 'object', `${sourcePath}: lane "${name}" must be an object`);
     assert(Number.isFinite(lane.weight) && lane.weight > 0, `${sourcePath}: lane "${name}".weight must be a positive number`);
@@ -713,6 +723,7 @@ function validateRepoConfig(cfg, sourcePath) {
       assert(typeof lane.remote === 'boolean', `${sourcePath}: lane "${name}".remote must be a boolean`);
     }
     if (lane.requires !== undefined) assertRequires(lane.requires, `${sourcePath}: lane "${name}".requires`);
+    if (lane.requiresTags !== undefined) assertRequires(lane.requiresTags, `${sourcePath}: lane "${name}".requiresTags`);
     if (lane.remoteDeps !== undefined) {
       assert(
         isValidRemoteDepsShape(lane.remoteDeps),
@@ -744,7 +755,7 @@ function validateRepoConfig(cfg, sourcePath) {
     if (lane.localFirstWaitMs !== undefined) {
       assert(Number.isInteger(lane.localFirstWaitMs) && lane.localFirstWaitMs >= 0, `${sourcePath}: lane "${name}".localFirstWaitMs must be a non-negative integer`);
     }
-    for (const field of ['remoteDepsCache', 'remoteDepsCacheRootScriptsSafe', 'remoteOmitEscapingSymlinks']) {
+    for (const field of ['remoteDepsCache', 'remoteDepsCacheRootScriptsSafe', 'remoteOmitEscapingSymlinks', 'remoteExclusive', 'prewarm']) {
       if (lane[field] !== undefined) assert(typeof lane[field] === 'boolean', `${sourcePath}: lane "${name}".${field} must be a boolean`);
     }
   }
@@ -1149,6 +1160,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       silenceTimeoutMs: templateCfg.silenceTimeoutMs,
       remote: templateCfg.remote,
       requires: templateCfg.requires,
+      requiresTags: templateCfg.requiresTags,
+      remoteExclusive: templateCfg.remoteExclusive,
       remoteDeps: templateCfg.remoteDeps,
       remoteSetup: templateCfg.remoteSetup,
       remoteDepsCache: templateCfg.remoteDepsCache,
@@ -1232,6 +1245,12 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     // protocol it speaks (1d).
     // BRAIN-623: executables a runner must have for this lane: the repo's `requires` plus the lane's own
     requires: [...new Set([...(repoConfig.requires ?? []), ...(laneCfg.requires ?? [])])],
+    // BRAIN-649: capability tags a runner must declare (`runnerTags` in the runner's own config), merged the same way
+    requiresTags: [...new Set([...(repoConfig.requiresTags ?? []), ...(laneCfg.requiresTags ?? [])])],
+    // BRAIN-649: a runner admits this lane only when idle and runs nothing else while it runs; `exclusive` stays local-only
+    remoteExclusive: laneCfg.remoteExclusive === true,
+    // BRAIN-649: opt this lane's remoteDeps/remoteSetup into `lane runner prewarm`
+    prewarm: laneCfg.prewarm === true,
     remoteDeps: Array.isArray(laneCfg.remoteDeps) ? laneCfg.remoteDeps : null,
     remoteSetup: Array.isArray(laneCfg.remoteSetup) ? laneCfg.remoteSetup : null,
     // BRAIN-389: false opts this lane out of the runner's installed-deps cache; anything else leaves it on.

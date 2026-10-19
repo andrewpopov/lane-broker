@@ -68,6 +68,22 @@ const toolsCheck = {
   },
 };
 
+/** BRAIN-649: capability tags. The lane's `requiresTags` are asked of the runner, which answers from its own config's `runnerTags`. */
+const tagsCheck = {
+  id: 'tags',
+  flag: '--tags',
+  need: (lane) => [...new Set(lane?.requiresTags ?? [])],
+  /** Runner side: `{ <tag>: true|false }` for each requested tag; `opts.runnerTags` is the runner's configured list. */
+  report: (names, { runnerTags = [] } = {}) => Object.fromEntries(names.filter((n) => EXECUTABLE_NAME_RE.test(n)).map((n) => [n, runnerTags.includes(n)])),
+  gap: (probe, names = []) => {
+    if (names.length === 0) return null;
+    const answered = probe.tags && typeof probe.tags === 'object' ? probe.tags : null;
+    if (!answered) return { reason: `runner does not report tags (older lane-broker); the lane requires ${names.join(', ')}`, missing: names };
+    const missing = names.filter((n) => answered[n] !== true);
+    return missing.length ? { reason: `missing tag ${missing.join(', ')} (required by the lane; set runnerTags on the runner)`, missing } : null;
+  },
+};
+
 /** The lane-broker release floor: `runnerVersionFloor` in the global config (null = none). Submitter side only, read from the probe's `version`. */
 const versionCheck = {
   id: 'version',
@@ -126,7 +142,7 @@ const integrityCheck = {
   },
 };
 
-export const READINESS_CHECKS = [toolsCheck, versionCheck, integrityCheck];
+export const READINESS_CHECKS = [toolsCheck, tagsCheck, versionCheck, integrityCheck];
 
 /** Everything the lane needs of a runner, `{ <check id>: need }`, from its remote payload and the global config. */
 export const readinessNeeds = (remote, globalCfg) => Object.fromEntries(READINESS_CHECKS.map((c) => [c.id, c.need(remote, globalCfg)]));
