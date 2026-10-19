@@ -27,6 +27,7 @@ import { parseReadinessArgs } from '../src/runner-readiness.js';
 import { gcCommand } from '../src/gc.js';
 import { loadGlobalConfig } from '../src/config.js';
 import { runnerWatchCommand, runnerStatusCommand } from '../src/runner-watch.js';
+import { runnerPrewarmCommand } from '../src/runner-prewarm.js';
 import { reconcileCommand } from '../src/reconcile-sweep.js';
 import { capabilitiesCommand } from '../src/capabilities.js';
 import { remotePipelineCommand } from '../src/remote-pipeline.js';
@@ -54,6 +55,7 @@ function usage() {
   lane reconcile [--now] [--json]
   lane runner [status] [--json]
   lane runner watch
+  lane runner prewarm [--lane <name>] [--runner <name>] [--dry-run]
   lane report phases --repo <a[,b]> --since <iso> --until <iso> [--history <file>] [--json]
   lane report cost --repo <a[,b]> --since <iso> --until <iso> [--prs <file | repo=file,...>] [--journal-root <dir>] [--history <file>] [--json]
 `;
@@ -317,6 +319,7 @@ async function main() {
         process.stderr.write(`lane runner: ${msg}\n${usage()}`);
         return 2;
       };
+      if (sub === 'prewarm') return (await runnerPrewarmCommand(args)).exitCode;
       if (sub === 'watch') return args.length === 0 ? (await runnerWatchCommand()).exitCode : bad(`unexpected argument "${args[0]}"`);
       if (sub === 'status' || sub === '--json') {
         const flags = sub === '--json' ? ['--json', ...args] : args;

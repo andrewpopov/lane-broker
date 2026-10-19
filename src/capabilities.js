@@ -10,6 +10,8 @@ import { readSchedulerFence } from './fairness.js';
 import { loadGlobalConfig, DEFAULT_GLOBAL_CONFIG, isDispatchOnly } from './config.js';
 import { CLASSES_CAPABILITY, resolveClasses } from './classes.js';
 
+/** BRAIN-649: this runner honours `remoteExclusive` on intake (holds the whole runner while the lane runs). */
+export const REMOTE_EXCLUSIVE_CAPABILITY = 'remote-exclusive/1';
 export const SIM_SAFE_BACKFILL_CAPABILITY = 'sim-safe-backfill/1';
 export const LANE_AGING_CAPABILITY = 'lane-aging/1';
 export const GROUP_REAP_CAPABILITY = 'group-reap/1';
@@ -43,6 +45,7 @@ export const CAPABILITIES = [
   QUEUE_RETIER_CAPABILITY,
   LEASE_CHECK_CAPABILITY,
   RUNNER_HEARTBEAT_CAPABILITY,
+  REMOTE_EXCLUSIVE_CAPABILITY,
 ];
 
 /** `lane capabilities --json`: what this install can do and which scheduler/admission mode it is in. */

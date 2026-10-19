@@ -220,6 +220,9 @@ function neverFits(reservation, probe) {
  *
  * `opts.requireCapabilities` (BRAIN-321): capability strings the runner's probe must advertise, else it is skipped.
  *
+ * `opts.requireIdle` (BRAIN-649, a `remoteExclusive` lane): only a runner holding nothing (`running === 0`, `queued === 0`) qualifies; it
+ * is never the queued or busy choice, because the lane holds the whole runner while it runs.
+ *
  * `opts.reservation` (BRAIN-320 S1e): the ticket's resolved
  * `{weight, cpuCores, memoryBytes}`, checked against each probe's static
  * `capacity` (1e). The existing `queued > 0` skip is unchanged.
@@ -236,7 +239,7 @@ export async function selectRunner(runners, opts = {}) {
   const deadlineMs = opts.deadlineMs ?? DEFAULT_GLOBAL_CONFIG.remoteProbeDeadlineMs;
   const retryTimedOut = new Set(opts.retryTimedOut ?? []);
   const sshBin = opts.sshBin ?? 'ssh';
-  const { env, requireProtocol2 = false, requireCapabilities = [], readinessNeeds = {}, reservation, maxRemoteQueue = 0, downRunners = {} } = opts;
+  const { env, requireProtocol2 = false, requireIdle = false, requireCapabilities = [], readinessNeeds = {}, reservation, maxRemoteQueue = 0, downRunners = {} } = opts;
   const skipped = [];
   const readiness = {};
   const ready = [];
@@ -322,6 +325,10 @@ export async function selectRunner(runners, opts = {}) {
     }
     if (probe.paused) {
       skipped.push({ name: runner.name, reason: 'paused' });
+      continue;
+    }
+    if (requireIdle && (probe.running !== 0 || probe.queued !== 0)) {
+      skipped.push({ name: runner.name, reason: `runner is not idle (running ${probe.running}, queued ${probe.queued}); the lane holds a whole runner (remoteExclusive)` });
       continue;
     }
     if (probe.queued !== 0) {

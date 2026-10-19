@@ -73,7 +73,7 @@ export function waitForStreamEnd(stream, idleMs = 2000) {
  * cannot resolve a worktree root for a remote-eligible lane must fall back
  * to running locally, not crash the run.
  */
-function gitRevParse(cwd, arg) {
+export function gitRevParse(cwd, arg) {
   try {
     return execFileSync('git', ['rev-parse', ...[].concat(arg)], {
       cwd,
@@ -320,9 +320,10 @@ export async function runCommand({
     return { exitCode: 64 };
   }
   // BRAIN-403: exclusive lanes are local only. A runner (configRoot is set only by `lane remote-exec`) never honours an
-  // exclusive from a snapshot's lane config or a flag, so an incoming snapshot can never hold the runner.
+  // exclusive from a snapshot's lane config or a flag. BRAIN-649: the one thing it does honour is the lane's own
+  // `remoteExclusive`, which holds the runner (admitted only when it holds nothing else, and nothing else starts meanwhile).
   const runnerIntake = configRoot !== undefined;
-  const exclusive = !runnerIntake && (exclusiveOverride === true || resolved.exclusive === true);
+  const exclusive = runnerIntake ? resolved.remoteExclusive === true : exclusiveOverride === true || resolved.exclusive === true;
   if (runnerIntake && (exclusiveOverride === true || resolved.exclusive === true)) {
     process.stderr.write('lane run: exclusive ignored on runner intake (exclusive lanes are local only)\n');
   }
@@ -706,6 +707,8 @@ export async function runCommand({
       // and (later slice) dispatchRemote's protocol-2 header see exactly what
       // this process resolved, not a re-derived value.
       requires: resolved.requires,
+      requiresTags: resolved.requiresTags,
+      remoteExclusive: resolved.remoteExclusive,
       remoteDeps: resolved.remoteDeps,
       remoteSetup: resolved.remoteSetup,
       remoteDepsCache: resolved.remoteDepsCache,
