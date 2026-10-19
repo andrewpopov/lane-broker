@@ -724,11 +724,15 @@ Two more checks need nothing from the lane (BRAIN-623):
 ```
 
 `exclusive` stays local-only (a runner's intake suppresses it). `remoteExclusive` is the runner-side form: the submitter places the lane
-only on a runner that is **idle** (`running 0`, `queued 0` in its probe; never the queued or busy choice) and that advertises
-`remote-exclusive/1` (an older runner would ignore the flag, so it is skipped). On the runner the intake ticket is then an ordinary exclusive: it
+on an **idle** runner (`running 0`, `queued 0` in its probe) when one is eligible, else on the eligible runner with the shortest queue
+(ties: earliest estimated finish, more free CPU, then config order). Eligible means up, not paused or draining, passing the readiness and
+`requiresTags` checks, and advertising `remote-exclusive/1` (an older runner would ignore the flag, so it is skipped). `maxRemoteQueue` does
+not cap it: an exclusive lane waits its turn rather than exit `76`, and it is not run locally because this machine could admit it. On the
+runner the intake ticket is an ordinary exclusive: it waits at the queue head for the leases to drain, then
 starts only when the runner holds no lease, and nothing else is admitted while it runs, so a load-sensitive suite (a Playwright RC) is
 not run on a runner that already has other lanes. `lane run --exclusive` and `exclusive` on the snapshot's lane are still ignored there. If no
-runner is idle the lane waits or falls back like any lane with no usable runner; it is not made exclusive locally.
+runner is eligible the lane waits or falls back like any lane with no usable runner; it is not made exclusive locally. A locally queued
+or already-queued remote ticket is moved (rebind, rebalance) only to a runner that is not queued.
 
 ### Runner capability tags (`requiresTags` / `runnerTags`, BRAIN-649)
 
