@@ -9,6 +9,7 @@ import { remoteCancel } from './remote-client.js';
 import { loadGlobalConfigOrError } from './config.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
 import { writeBrokerLog } from './admission.js';
+import { stopLeaseCpuScope } from './cpu-limit.js';
 import { trackerForLease, reapLogLine, cancelGraceMs } from './descendants.js';
 
 function sleep(ms) {
@@ -17,13 +18,15 @@ function sleep(ms) {
 
 /** TERM the group, wait a grace period, KILL, verify gone. Used when there is no supervisor left to do it.
  *  Also reaps the descendants the dead supervisor last recorded on the lease (BRAIN-419), token-checked. */
-async function killGroupDirectly(lease, root) {
+async function killGroupDirectly(lease, root, exec) {
   const reaping = trackerForLease(lease).reap({ graceMs: cancelGraceMs() });
   try {
     if (lease.childPgid) await killGroupOnly(lease.childPgid);
   } finally {
     const result = await reaping;
     writeBrokerLog(root, reapLogLine(lease.id, result));
+    // BRAIN-651 L3: no supervisor is left to stop the lane's CPU scope, and a setsid'd process in it is invisible to the group kill
+    stopLeaseCpuScope(lease, { exec, log: (line) => writeBrokerLog(root, line) });
   }
 }
 
@@ -155,7 +158,7 @@ export async function cancelAttempt(root, id, attempt) {
 }
 
 /** `lane cancel <id>`: cancels a queued ticket or a running/ORPHANED lease. */
-export async function cancelCommand(id) {
+export async function cancelCommand(id, { exec } = {}) {
   const root = ensureStateDirs().root;
 
   // Dequeue and mark cancelled atomically, under the same lock the scheduler
@@ -219,7 +222,7 @@ export async function cancelCommand(id) {
 
   // ORPHANED: no supervisor left to react to the cancel request. Do the kill
   // sequence ourselves, then release.
-  await killGroupDirectly(lease, root);
+  await killGroupDirectly(lease, root, exec);
 
   // BRAIN-319 (older bug, fixed alongside P1/P2/P3): a ticket that fell back
   // to local and was ADMITTED (leased) still has its attempt record --

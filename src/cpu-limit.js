@@ -80,3 +80,37 @@ export function enforceCpuLimitStartup(cfg, { warn = () => {}, ...deps } = {}) {
   warn(`lane-broker: cpuLimit is "prefer" but CPU quotas are unavailable (${resolved.reason}); running without them\n`);
   return resolved;
 }
+
+/** How long a lease release waits for a scope stop before it gives up and releases anyway (BRAIN-651 L3). */
+export const CPU_SCOPE_STOP_WAIT_MS = 15_000;
+const stopExec = (file, args) => spawnSync(file, args, { encoding: 'utf8', timeout: CPU_SCOPE_STOP_WAIT_MS });
+
+/**
+ * BRAIN-651 L3: stop a lane's scope, which signals EVERY process in it (a setsid'd grandchild included; KillMode defaults to
+ * control-group: SIGTERM, then SIGKILL after the unit's stop timeout) and returns once the scope is empty. A scope that is not
+ * loaded has already ended (`--collect` unloads it when its last process exits), so that counts as stopped.
+ * `exec(file, args)` returns spawnSync's shape. Returns `{stopped, reason}`.
+ */
+export function stopCpuScope(unit, { exec = stopExec } = {}) {
+  const res = exec('systemctl', ['--user', 'stop', unit]);
+  if (res.error) {
+    const reason = res.error.code === 'ENOENT' ? 'systemctl-missing' : res.error.code === 'ETIMEDOUT' ? 'timeout' : `systemctl-failed: ${res.error.message}`;
+    return { stopped: false, reason };
+  }
+  if (res.status === 0) return { stopped: true, reason: 'stopped' };
+  const detail = String(res.stderr ?? '').trim().split('\n')[0];
+  if (/not loaded|not found/i.test(detail)) return { stopped: true, reason: 'not-loaded' };
+  return { stopped: false, reason: `systemctl-exit-${res.status}${detail ? `: ${detail}` : ''}` };
+}
+
+/**
+ * Stop the scope a lease recorded as `cpuScopeUnit`, before the lease is released. A lease without one (cpuLimit off, macOS)
+ * makes no call and returns null. A stop that did not complete is logged through `log` naming the unit, and the caller releases anyway.
+ */
+export function stopLeaseCpuScope(lease, { exec, log = () => {} } = {}) {
+  const unit = lease?.cpuScopeUnit;
+  if (!unit) return null;
+  const result = stopCpuScope(unit, { exec });
+  if (!result.stopped) log(`lane-broker-cpu-scope id=${lease.id} unit=${unit} stop-incomplete reason=${result.reason}; releasing the lease anyway\n`);
+  return result;
+}

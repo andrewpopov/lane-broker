@@ -27,7 +27,7 @@ import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processSt
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
 import { reloadGlobalConfig, isDispatchOnly } from './config.js';
-import { enforceCpuLimitStartup, CpuLimitUnavailableError, spawnInCpuScope } from './cpu-limit.js';
+import { enforceCpuLimitStartup, CpuLimitUnavailableError, spawnInCpuScope, stopLeaseCpuScope } from './cpu-limit.js';
 import { stateHome } from './state.js';
 import { readRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
@@ -1649,6 +1649,8 @@ async function main() {
     const [, result] = await Promise.all([killGroup(child.pid), descendants.reap({ graceMs: cancelGraceMs() })]);
     // an incomplete reap is logged but never wedges the lease: the lease is still released
     writeBrokerLog(root, reapLogLine(ticket.id, result, reason));
+    // BRAIN-651 L3: the group and tracked-descendant signals above cannot reach a setsid'd process the tracker lost; stopping the scope can
+    stopLeaseCpuScope({ id: ticket.id, cpuScopeUnit: cpuScope }, { log: (line) => writeBrokerLog(root, line) });
   }
 
   /** BRAIN-431: ONE reap however many things ask (watchdog, cancel marker, signal, leader exit); the first caller's reason is logged. */
