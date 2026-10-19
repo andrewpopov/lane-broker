@@ -16,6 +16,7 @@ import { listAttempts, supervisorAlive, moveInterruptedLabel } from './attempts.
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfigOrError, isDispatchOnly } from './config.js';
+import { resolveCpuLimit } from './cpu-limit.js';
 import { collectRunnerStates, renderRunnersLines } from './runner-unreachable.js';
 import { remoteOwnerMap } from './retier.js';
 import { defaultRemoteRoot } from './remote-runner.js';
@@ -335,6 +336,8 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     externalCpu,
     paused,
     ...(isDispatchOnly(cfg) ? { localExecution: 'refused' } : {}),
+    // BRAIN-651 L1: whether lane CPU grants can be enforced with a systemd quota here (never probes while mode is "off")
+    cpuLimit: resolveCpuLimit(cfg),
     draining,
     remoteDrain,
     exclusiveHold: exclusiveHoldView(queue, held),

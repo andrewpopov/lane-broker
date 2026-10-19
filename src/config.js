@@ -9,6 +9,7 @@ import { unsupportedHookKeys, hookRefusalMessage } from './exclusive.js';
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
 import { DEFAULT_DEPS_CACHE_MAX_BYTES } from './deps-cache.js';
 import { isValidRequiresShape, VERSION_FLOOR_RE } from './runner-readiness.js';
+import { CPU_LIMIT_MODES } from './cpu-limit.js';
 
 /** The largest delay Node's setTimeout honours; above it the timer fires after 1 ms. */
 const MAX_TIMER_MS = 2_147_483_647;
@@ -131,6 +132,9 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // BRAIN-649: capability tags THIS runner declares for itself (e.g. ["browser"]); a lane's `requiresTags` is matched against them. A
   // runner whose OS a lane's tooling does not support simply omits the tag.
   runnerTags: [],
+  // BRAIN-651 L1: "off" | "prefer" | "require". Whether a lane's CPU grant is to be enforced with a systemd CPUQuota scope (Linux only).
+  // "require" refuses to start a supervisor on a host whose probe fails (CPU_LIMIT_UNAVAILABLE); "prefer" warns once and continues.
+  cpuLimit: 'off',
   // BRAIN-597: a runner whose first failed contact (runner-unreachable.json, kept fresh by `lane runner watch`) is at least this old is
   // skipped by placement without being probed. 0 disables the skip.
   runnerDownAfterMs: 300_000,
@@ -399,6 +403,7 @@ function validateGlobalConfig(cfg, sourcePath) {
     );
   }
   assert(isValidRequiresShape(cfg.runnerTags), `${sourcePath}: "runnerTags" must be an array of tag names (letters, digits, "." "_" "+" "-"), e.g. ["browser"]`);
+  assert(CPU_LIMIT_MODES.includes(cfg.cpuLimit), `${sourcePath}: "cpuLimit" must be one of ${CPU_LIMIT_MODES.map((m) => `"${m}"`).join(', ')}, got ${JSON.stringify(cfg.cpuLimit)}`);
   assert(Number.isInteger(cfg.runnerDownAfterMs) && cfg.runnerDownAfterMs >= 0, `${sourcePath}: "runnerDownAfterMs" must be a non-negative integer`);
   assert(Number.isInteger(cfg.remoteProbeDeadlineMs) && cfg.remoteProbeDeadlineMs > 0 && cfg.remoteProbeDeadlineMs <= MAX_TIMER_MS, `${sourcePath}: "remoteProbeDeadlineMs" must be a positive integer no larger than ${MAX_TIMER_MS} (a larger Node timer overflows to 1 ms)`);
   for (const field of ['remoteRebalanceMinQueuedMs', 'remoteRebalanceCooldownMs', 'remoteRebalanceMaxMoves']) {

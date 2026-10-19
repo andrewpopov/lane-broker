@@ -9,6 +9,7 @@ import { stateHome } from './state.js';
 import { readSchedulerFence } from './fairness.js';
 import { loadGlobalConfig, DEFAULT_GLOBAL_CONFIG, isDispatchOnly } from './config.js';
 import { CLASSES_CAPABILITY, resolveClasses } from './classes.js';
+import { CPU_LIMIT_CAPABILITY, resolveCpuLimit } from './cpu-limit.js';
 
 /** BRAIN-649: this runner honours `remoteExclusive` on intake (holds the whole runner while the lane runs). */
 export const REMOTE_EXCLUSIVE_CAPABILITY = 'remote-exclusive/1';
@@ -48,6 +49,11 @@ export const CAPABILITIES = [
   REMOTE_EXCLUSIVE_CAPABILITY,
 ];
 
+/** CAPABILITIES plus the ones that depend on this host's config: `cpu-limit/1` only when `cpuLimit` is not "off" and its probe passed. */
+export function advertisedCapabilities(cpuLimit) {
+  return cpuLimit.mode !== 'off' && cpuLimit.available ? [...CAPABILITIES, CPU_LIMIT_CAPABILITY] : CAPABILITIES;
+}
+
 /** `lane capabilities --json`: what this install can do and which scheduler/admission mode it is in. */
 export function capabilitiesCommand({ root = stateHome() } = {}) {
   const pkg = JSON.parse(fs.readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'));
@@ -59,12 +65,14 @@ export function capabilitiesCommand({ root = stateHome() } = {}) {
     cfg = { ...DEFAULT_GLOBAL_CONFIG, classesInvalid: err.message };
   }
   const { mode, configHash, stateRoot, valid } = resolveClasses(cfg, root);
+  const cpuLimit = resolveCpuLimit(cfg);
   const payload = {
     version: pkg.version,
-    capabilities: isDispatchOnly(cfg) ? [...CAPABILITIES, DISPATCH_ONLY_CAPABILITY] : CAPABILITIES,
+    capabilities: isDispatchOnly(cfg) ? [...advertisedCapabilities(cpuLimit), DISPATCH_ONLY_CAPABILITY] : advertisedCapabilities(cpuLimit),
     schedulerMode: readSchedulerFence(root).status === 'valid' ? 'priority' : 'legacy',
     admissionMode: cfg.schedulerMode,
     classes: { mode, configHash, stateRoot, valid },
+    cpuLimit,
   };
   process.stdout.write(`${JSON.stringify(payload)}\n`);
   return { exitCode: 0 };
