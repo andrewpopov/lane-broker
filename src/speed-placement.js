@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { classifyRow, backfillEstimates } from './estimates-history.js';
 
 /**
@@ -130,4 +132,22 @@ export function chooseSpeedPlacement({ localAdmitsNow, localWaitMs: waitMs = 0, 
   const localFinishMs = (localAdmitsNow ? 0 : waitMs) + estimateMs;
   const choice = remoteFinishMs === null || localFinishMs <= remoteFinishMs ? 'local' : 'remote';
   return { choice, localFinishMs: Math.round(localFinishMs), remoteFinishMs: remoteFinishMs === null ? null : Math.round(remoteFinishMs) };
+}
+
+const DEP_LOCKFILES = ['package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'npm-shrinkwrap.json'];
+
+/**
+ * BRAIN-663: the `remoteDeps` dirs (relative to `treeRoot`) that hold a lockfile but no `node_modules` directory, i.e. what the
+ * runner would install and this tree lacks. Running such a lane here fails on its first tool (rouge e2e-scoped: `tsc: command not found`).
+ */
+export function missingLocalDeps(treeRoot, remoteDeps) {
+  return (remoteDeps ?? []).filter((dir) => {
+    const abs = path.join(treeRoot, dir);
+    if (!DEP_LOCKFILES.some((name) => fs.existsSync(path.join(abs, name)))) return false;
+    try {
+      return !fs.statSync(path.join(abs, 'node_modules')).isDirectory();
+    } catch {
+      return true;
+    }
+  });
 }

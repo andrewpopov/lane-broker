@@ -8,7 +8,7 @@ import { paths, bootId, appendHistory } from '../src/state.js';
 import { writeLease, removeLease, LEASE_STATE } from '../src/lease.js';
 import { loadGlobalConfig, ConfigError } from '../src/config.js';
 import { detectResourceCapacity } from '../src/resources.js';
-import { speedRatio, pairingCommand, externalCpuSlots, localRunEstimateMs, localWaitMs, chooseSpeedPlacement } from '../src/speed-placement.js';
+import { missingLocalDeps, speedRatio, pairingCommand, externalCpuSlots, localRunEstimateMs, localWaitMs, chooseSpeedPlacement } from '../src/speed-placement.js';
 
 const TIMEOUT = { timeout: 120_000 };
 
@@ -135,6 +135,54 @@ test('speed-aware: this machine admits now and a 3x runner exists -> runs locall
   assert.equal(result.executor ?? 'local', 'local');
   assert.equal(probeCount(ctx.probeLogPath), probesBefore);
   assert.match(admissionLog(ctx), /speed-placement: ts=\d{4}-\d\d-\d\dT[\d:.]+Z \S+: local: admits now, local estimate 10s/);
+});
+
+/** BRAIN-663: a tiny dependency-free npm package in the repo, so `remoteDeps: ["."]` is eligible and `npm ci` on a runner succeeds. */
+function addLockedPackage(repoDir) {
+  fs.writeFileSync(path.join(repoDir, 'package.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', private: true }));
+  fs.writeFileSync(path.join(repoDir, 'package-lock.json'), JSON.stringify({ name: 'fixture', version: '1.0.0', lockfileVersion: 3, requires: true, packages: { '': { name: 'fixture', version: '1.0.0' } } }));
+}
+const writeDefaultLane = (ctx, extra) => writeRepoConfig(ctx.repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, ...extra } } });
+
+test('speed-aware (BRAIN-663): remoteDeps lane with a lockfile but no node_modules is not placed local, the reason is logged', TIMEOUT, async () => {
+  const ctx = await speedSetup({ speedRatioCfg: 3, localMs: 10_000 });
+  addLockedPackage(ctx.repoDir);
+  writeDefaultLane(ctx, { remoteDeps: ['.'] });
+  const { result } = await runDefault(ctx);
+  assert.equal(result.executor, 'remote');
+  assert.match(admissionLog(ctx), /speed-placement: ts=\S+ \S+: remote: speed-aware: local skipped \(no node_modules for remoteDeps \.\)/);
+});
+
+test('speed-aware (BRAIN-663): the same lane with node_modules present still runs locally', TIMEOUT, async () => {
+  const ctx = await speedSetup({ speedRatioCfg: 3, localMs: 10_000 });
+  addLockedPackage(ctx.repoDir);
+  fs.mkdirSync(path.join(ctx.repoDir, 'node_modules'));
+  writeDefaultLane(ctx, { remoteDeps: ['.'] });
+  const probesBefore = probeCount(ctx.probeLogPath);
+  const { result } = await runDefault(ctx);
+  assert.equal(result.executor ?? 'local', 'local');
+  assert.equal(probeCount(ctx.probeLogPath), probesBefore);
+  assert.match(admissionLog(ctx), /local: admits now/);
+});
+
+test('speed-aware (BRAIN-663): a lane without remoteDeps is unaffected by a missing node_modules', TIMEOUT, async () => {
+  const ctx = await speedSetup({ speedRatioCfg: 3, localMs: 10_000 });
+  addLockedPackage(ctx.repoDir);
+  const { result } = await runDefault(ctx);
+  assert.equal(result.executor ?? 'local', 'local');
+  assert.doesNotMatch(admissionLog(ctx), /local skipped/);
+});
+
+test('missingLocalDeps: only remoteDeps dirs with a lockfile and no node_modules directory count', () => {
+  const root = tmpDir('mld');
+  for (const d of ['a', 'b', 'c', 'd']) fs.mkdirSync(path.join(root, d));
+  fs.writeFileSync(path.join(root, 'a', 'pnpm-lock.yaml'), '');
+  fs.writeFileSync(path.join(root, 'b', 'yarn.lock'), '');
+  fs.mkdirSync(path.join(root, 'b', 'node_modules'));
+  fs.writeFileSync(path.join(root, 'c', 'package-lock.json'), '{}');
+  fs.writeFileSync(path.join(root, 'c', 'node_modules'), 'a file, not a directory');
+  assert.deepEqual(missingLocalDeps(root, ['a', 'b', 'c', 'd']), ['a', 'c']);
+  assert.deepEqual(missingLocalDeps(root, null), []);
 });
 
 test('speed-aware: local queue wait + E beats the runner by too much -> goes remote, both estimates logged', TIMEOUT, async () => {

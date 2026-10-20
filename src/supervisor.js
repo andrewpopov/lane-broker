@@ -31,7 +31,7 @@ import { enforceCpuLimitStartup, CpuLimitUnavailableError, spawnInCpuScope, stop
 import { stateHome } from './state.js';
 import { readRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
-import { speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, externalCpuSlots, DEFAULT_REMOTE_OVERHEAD_MS } from './speed-placement.js';
+import { missingLocalDeps, speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, externalCpuSlots, DEFAULT_REMOTE_OVERHEAD_MS } from './speed-placement.js';
 import { starvedStaleMs } from './external-cpu.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, priorityOf, resolveLaneNice, waitedMs } from './priority.js';
@@ -851,7 +851,13 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   }
 
   // BRAIN-548: a speed-aware ticket this machine can start right now runs here, without probing a (slower) runner.
-  const speed = rebind || localIneligibility() ? null : speedInputs(root, enriched);
+  let speed = rebind || localIneligibility() ? null : speedInputs(root, enriched);
+  // BRAIN-663: this tree lacks what the runner would install for the lane's remoteDeps, so a local run would fail: stay remote
+  const lackingDeps = speed ? missingLocalDeps(enriched.remote.worktreeRoot, enriched.remote.remoteDeps) : [];
+  if (lackingDeps.length > 0) {
+    speed = null;
+    logSpeedDecision(root, enriched, 'remote', `speed-aware: local skipped (no node_modules for remoteDeps ${lackingDeps.join(', ')})`);
+  }
   if (speed) {
     const local = await couldAdmitNow(root, globalCfg, enriched);
     if (local.admit) {
