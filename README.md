@@ -612,6 +612,12 @@ What a remote run does:
      selected runner's finish, `E x speedRatio + 60 s` dispatch overhead (plus
      `queued x E x speedRatio` when that runner is itself queued). The earlier
      wins; a tie stays local.
+   - BRAIN-663: a lane that declares `remoteDeps` is placed locally only when
+     this tree has them: each `remoteDeps` dir with a lockfile needs a
+     `node_modules` directory. Otherwise the lane stays remote and the
+     admission log says `speed-aware: local skipped (no node_modules for
+     remoteDeps .)`. With no runner able to take it, the ticket still falls
+     back to local as before.
 
    A runner's `speedRatio` is remote run / local run, taken from the most
    specific evidence that holds up (BRAIN-596). Commands are paired by
