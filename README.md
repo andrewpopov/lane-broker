@@ -858,7 +858,7 @@ reason.
   form is refused. A workspace with a lifecycle script, `binding.gyp` or lock
   install script is always ineligible, even with `remoteDepsCacheRootScriptsSafe`.
   The key covers the discovered set and each workspace's path, lock entry and
-  whole `package.json` (canonical JSON).
+  whole `package.json` (canonical JSON). A workspace declaring `bin` is refused until its executable links can be restored. When a dependency has an install script, or the lane declares root scripts safe, the key also covers repository source bytes and executable modes outside `.git` and `node_modules`. Source links escaping that keyed tree are refused; an install that writes outside dependency trees still cannot publish a cache entry.
   The store holds only installed packages, never the workspace symlinks or
   sources, and records which workspaces had a nested `node_modules`: a hit
   recreates each `node_modules/<name>` link (relative, as `npm ci` makes it)

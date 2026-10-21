@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
@@ -1380,4 +1381,29 @@ test('snapshot: an atomic replacement that keeps size and mtime changes the file
     const changed = snapshotChanges(before, snapshotOutsideNodeModules(dir, roots));
     assert.ok(changed.includes('top.js') && changed.includes('packages/api/a.js'), JSON.stringify(roots));
   }
+});
+
+
+test('workspace scripts key source bytes and reject source links outside the snapshot', () => {
+  const f = makeWorkspaceKeyFixture({ lockPackages: workspaceLockPackages({
+    'node_modules/dotenv': { ...REGISTRY_ENTRY('17.0.0'), hasInstallScript: true },
+  }) });
+  const first = computeDepsKey(f.inputs());
+  assert.ok(first.key, first.reason);
+  fs.writeFileSync(path.join(f.root, 'packages/api/index.js'), 'module.exports = 42;');
+  assert.notEqual(computeDepsKey(f.inputs()).key, first.key, 'a dependency install script can read workspace source');
+  fs.writeFileSync(path.join(f.root, 'schema.prisma'), 'model Source {}');
+  const schemaKey = computeDepsKey(f.inputs()).key;
+  fs.writeFileSync(path.join(f.root, 'schema.prisma'), 'model Changed {}');
+  assert.notEqual(computeDepsKey(f.inputs()).key, schemaKey, 'root source bytes also shape generated dependencies');
+  fs.symlinkSync(os.tmpdir(), path.join(f.root, 'outside-source'));
+  const refused = computeDepsKey(f.inputs());
+  assert.equal(refused.key, null);
+  assert.match(refused.reason, /escapes the keyed source tree/);
+});
+
+test('workspace bin entry stays ineligible until its executable links can be recreated', () => {
+  const f = makeWorkspaceKeyFixture();
+  writeWorkspaceFile(f, 'packages/api/package.json', JSON.stringify({ name: '@x/api', bin: 'cli.js' }));
+  assert.match(computeDepsKey(f.inputs()).reason, /declares bin/);
 });

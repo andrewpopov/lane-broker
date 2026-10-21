@@ -29,7 +29,7 @@ import { isProcessAlive, processStartTime } from './process-liveness.js';
 export const DEFAULT_DEPS_CACHE_MAX_BYTES = 10 * 1024 ** 3;
 
 /** Bumping this invalidates every existing entry. */
-const KEY_VERSION = 'v5';
+const KEY_VERSION = 'v6';
 
 /** npm reads npm-shrinkwrap.json in preference to package-lock.json. */
 const LOCKFILES = ['npm-shrinkwrap.json', 'package-lock.json'];
@@ -503,10 +503,50 @@ function workspaceKeyParts({ dir, lock, rootPackage, workspaces }) {
     if (fs.existsSync(path.join(dir, resolved, 'binding.gyp'))) lifecycle.push('binding.gyp');
     if (lock.packages[resolved]?.hasInstallScript) lifecycle.push('lock hasInstallScript');
     if (lifecycle.length > 0) return { reason: `workspace ${resolved} has lifecycle inputs (${lifecycle.join(', ')})` };
+    if ('bin' in manifest) return { reason: `workspace ${resolved} declares bin, whose .bin links are not restored` };
     parts.push([`workspace:${resolved}`, canonicalJson({ links, lock: lock.packages[resolved], manifest })]);
   }
   parts.push(['workspace-set', JSON.stringify(identities)]);
   return { parts };
+}
+
+/** Install scripts may read repository sources, so workspace installs with scripts key their bytes too. */
+function installSourceDigest(rootDir) {
+  const hash = crypto.createHash('sha256');
+  const root = fs.realpathSync(rootDir);
+  const record = (name, value) => { hash.update(`${name}:${value.length}:`); hash.update(value); };
+  const walk = (relative) => {
+    for (const name of fs.readdirSync(path.join(root, relative)).sort()) {
+      if (name === 'node_modules' || name === '.git') continue;
+      const rel = relative ? `${relative}/${name}` : name;
+      const file = path.join(root, rel);
+      const stat = fs.lstatSync(file);
+      record(rel, Buffer.from(`${stat.mode & 0o7777}:`));
+      if (stat.isSymbolicLink()) {
+        const target = fs.realpathSync(file);
+        const destination = path.relative(root, target);
+        if (destination.startsWith('..') || path.isAbsolute(destination) || destination.split(path.sep).some((part) => part === 'node_modules' || part === '.git')) {
+          throw new Error(`install source link ${rel} escapes the keyed source tree`);
+        }
+        record(`link:${rel}`, Buffer.from(fs.readlinkSync(file)));
+      } else if (stat.isDirectory()) {
+        walk(rel);
+      } else if (stat.isFile()) {
+        const contents = crypto.createHash('sha256');
+        const fd = fs.openSync(file, 'r');
+        try {
+          const chunk = Buffer.alloc(SCAN_CHUNK_BYTES);
+          let count;
+          while ((count = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0) contents.update(chunk.subarray(0, count));
+        } finally { fs.closeSync(fd); }
+        record(`file:${rel}`, contents.digest());
+      } else {
+        throw new Error(`unsupported install source ${rel}`);
+      }
+    }
+  };
+  walk('');
+  return hash.digest('hex');
 }
 
 /**
@@ -591,6 +631,10 @@ export function computeDepsKey({
     const ws = workspaceKeyParts({ dir, lock, rootPackage: pkg, workspaces: eligibility.workspaces });
     if (ws.reason) return { key: null, reason: ws.reason };
     parts.push(...ws.parts);
+    if (eligibility.hasInstallScript || rootScriptsSafe) {
+      try { parts.push(['install-sources', installSourceDigest(rootDir)]); }
+      catch (error) { return { key: null, reason: error.message }; }
+    }
   }
   for (const rel of eligibility.tarballs) {
     const bytes = readIfExists(path.resolve(dir, rel));

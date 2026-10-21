@@ -584,7 +584,7 @@ function workspaceProbe(marker) {
   return [process.execPath, '-e', script];
 }
 
-test('an npm-workspace repo is cached: the second run is a hit that recreates the workspace links and the nested workspace node_modules (BRAIN-466)', async () => {
+test('an npm-workspace repo is cached: the second run is a hit that recreates the workspace links and the nested workspace node_modules (BRAIN-466)', async (t) => {
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(workspaceRepoFiles());
   const run = async () => {
@@ -603,6 +603,8 @@ test('an npm-workspace repo is cached: the second run is a hit that recreates th
   assert.equal(second.code, 0, second.stderr);
   assert.equal(second.row.depsCache, 'hit');
   assert.equal(s.npmCiCalls(), 1, 'a hit runs no npm ci');
+  t.diagnostic(`workspace dependency setup: miss ${first.row.depsMs}ms, hit ${second.row.depsMs}ms; same runner and fixture`);
+  assert.ok(second.row.depsMs < first.row.depsMs, 'restoring a workspace cache entry beats reinstalling it');
   for (const { probe } of [first, second]) {
     assert.equal(probe.source, 'workspace source');
     assert.equal(probe.isLink, true);
