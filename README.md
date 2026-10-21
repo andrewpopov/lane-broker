@@ -844,8 +844,15 @@ reason.
   or `npm-shrinkwrap.json` when present) must be v2 or v3 with a `packages`
   map, and every non-root entry must be an `https://registry.npmjs.org/`
   tarball with `integrity`, a `git+...#<40-hex sha>`, or a `file:*.tgz` with
-  `integrity`. `file:` dirs, links, workspaces, unresolved entries and
-  anything else are refused. An entry with no `resolved` is allowed only when
+  `integrity`. `file:` dirs, unresolved entries and anything else are
+  refused. An npm-workspace repo (BRAIN-466) is eligible: a `link: true` entry
+  whose `resolved` is a plain relative path inside the repo, with a lock entry
+  of its own, is accepted; one that is absolute or escapes the repo with `..`
+  is refused. The key then also covers each workspace's path, lock entry and
+  the dependency fields of its `package.json` (not its source). The store
+  holds only installed packages, never the workspace symlinks or sources: a
+  hit recreates each `node_modules/<name>` link, relative to the work dir as
+  `npm ci` makes it, and restores each workspace's own nested `node_modules`. An entry with no `resolved` is allowed only when
   an enclosing package bundles it (the parent's `bundleDependencies`, or
   `inDepBundle`) and that parent passes the same checks; a top-level
   bundled entry gets the normal checks. Every root script `npm ci` can run

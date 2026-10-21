@@ -33,6 +33,8 @@ import {
   snapshotChanges,
   diffAgainstNewestEntry,
   readKeyPartsSecret,
+  placeWorkspaces,
+  collectInstallPathReferences,
 } from '../src/deps-cache.js';
 import { resolveTicketConfig, loadGlobalConfig, ConfigError, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { freshEnv, writeRepoConfig, writeGlobalConfig } from './helpers.js';
@@ -1018,4 +1020,170 @@ test('config: a lane may opt out with remoteDepsCache false; absent means on; a 
   assert.equal(resolveTicketConfig({ cwd: safe, repo: 'x', lane: 'default' }).remoteDepsCacheRootScriptsSafe, false, 'defaults to false');
   assert.equal(resolveTicketConfig({ cwd: safe, repo: 'x', lane: 's' }).remoteDepsCacheRootScriptsSafe, true);
   assert.equal(resolveTicketConfig({ cwd: safe, repo: 'x', lane: 'adhoc' }).remoteDepsCacheRootScriptsSafe, true, 'an ad-hoc lane inherits it');
+});
+
+// ---- BRAIN-466: npm workspaces ----
+
+/** Lock `packages` shaped like savoro/cairn/smarthome: top-level links, workspace entries, and a nested workspace dependency. */
+const workspaceLockPackages = (overrides = {}) => ({
+  '': { name: 'root', workspaces: ['packages/*'] },
+  'node_modules/@x/api': { resolved: 'packages/api', link: true },
+  'node_modules/@x/shared': { resolved: 'packages/shared', link: true },
+  'node_modules/dotenv': REGISTRY_ENTRY('17.0.0'),
+  'packages/api': { name: '@x/api', version: '1.0.0', dependencies: { dotenv: '^16.0.0', '@x/shared': '*' } },
+  'packages/api/node_modules/dotenv': REGISTRY_ENTRY('16.6.1'),
+  'packages/shared': { name: '@x/shared', version: '1.0.0' },
+  ...overrides,
+});
+
+test('workspace eligibility: in-repo relative links with their own lock entries are eligible and reported; escaping or malformed links keep their refusal', () => {
+  const lockOf = (packages) => ({ lockfileVersion: 3, packages });
+  const ok = lockEligibility(lockOf(workspaceLockPackages()));
+  assert.equal(ok.ok, true, ok.reason);
+  assert.deepEqual(ok.workspaces, [
+    { resolved: 'packages/api', links: ['@x/api'] },
+    { resolved: 'packages/shared', links: ['@x/shared'] },
+  ]);
+  assert.deepEqual(lockEligibility(lockOf({ '': {}, 'node_modules/r': REGISTRY_ENTRY('1.0.0') })).workspaces, [], 'no links: no workspaces');
+
+  const refused = {
+    'absolute path': { 'node_modules/@x/api': { resolved: '/etc/api', link: true } },
+    'parent escape': { 'node_modules/@x/api': { resolved: '../outside/api', link: true }, '../outside/api': { version: '1.0.0' } },
+    'sneaky escape': { 'node_modules/@x/api': { resolved: 'packages/../../api', link: true } },
+    'link to the repo root': { 'node_modules/@x/api': { resolved: '.', link: true } },
+    'link with no workspace entry': { 'node_modules/@x/api': { resolved: 'packages/missing', link: true } },
+    'link into node_modules': { 'node_modules/@x/api': { resolved: 'node_modules/other', link: true }, 'node_modules/other': REGISTRY_ENTRY('1.0.0') },
+    'nested link': { 'node_modules/dotenv/node_modules/inner': { resolved: 'packages/shared', link: true } },
+    'workspace entry no link names': { 'packages/orphan': { version: '1.0.0' } },
+    'unpinned dependency nested in a workspace': { 'packages/api/node_modules/dotenv': { version: '1.0.0', resolved: 'file:../local' } },
+  };
+  for (const [name, overrides] of Object.entries(refused)) {
+    const result = lockEligibility(lockOf(workspaceLockPackages(overrides)));
+    assert.equal(result.ok, false, name);
+    assert.ok(result.reason.length > 0, name);
+  }
+  assert.match(lockEligibility(lockOf(workspaceLockPackages({ 'node_modules/@x/api': { resolved: '../outside/api', link: true } }))).reason, /node_modules\/@x\/api is a link/);
+});
+
+test('workspace key: the paths, lock entries and package.json dependency fields are in the key, workspace source code is not', () => {
+  const f = makeKeyFixture({ lockPackages: workspaceLockPackages() });
+  for (const ws of ['api', 'shared']) {
+    fs.mkdirSync(path.join(f.root, 'packages', ws), { recursive: true });
+    fs.writeFileSync(path.join(f.root, 'packages', ws, 'package.json'), JSON.stringify({ name: `@x/${ws}`, version: '1.0.0', dependencies: ws === 'api' ? { dotenv: '^16.0.0' } : {} }));
+    fs.writeFileSync(path.join(f.root, 'packages', ws, 'index.js'), 'module.exports = 1;');
+  }
+  const base = computeDepsKey(f.inputs());
+  assert.match(base.key, /^[0-9a-f]{64}$/, base.reason);
+  assert.equal(base.workspaces.length, 2);
+
+  fs.writeFileSync(path.join(f.root, 'packages', 'api', 'index.js'), 'module.exports = "edited source";');
+  assert.equal(computeDepsKey(f.inputs()).key, base.key, 'editing workspace source does not change the key');
+  fs.writeFileSync(path.join(f.root, 'packages', 'api', 'package.json'), JSON.stringify({ name: '@x/api', version: '9.9.9', description: 'unrelated field', dependencies: { dotenv: '^16.0.0' } }));
+  assert.equal(computeDepsKey(f.inputs()).key, base.key, 'fields that do not shape an install do not change the key');
+
+  fs.writeFileSync(path.join(f.root, 'packages', 'api', 'package.json'), JSON.stringify({ name: '@x/api', dependencies: { dotenv: '^17.0.0' } }));
+  assert.notEqual(computeDepsKey(f.inputs()).key, base.key, 'a changed workspace package.json dependency changes the key');
+  fs.writeFileSync(path.join(f.root, 'packages', 'api', 'package.json'), JSON.stringify({ name: '@x/api', dependencies: { dotenv: '^16.0.0' } }));
+  assert.equal(computeDepsKey(f.inputs()).key, base.key);
+
+  const lockFile = path.join(f.root, 'package-lock.json');
+  const lock = JSON.parse(fs.readFileSync(lockFile, 'utf8'));
+  lock.packages['packages/api'].dependencies.dotenv = '^17.0.0';
+  fs.writeFileSync(lockFile, JSON.stringify(lock));
+  assert.notEqual(computeDepsKey(f.inputs()).key, base.key, 'a changed workspace lock entry changes the key');
+
+  fs.rmSync(path.join(f.root, 'packages', 'shared', 'package.json'));
+  assert.match(computeDepsKey(f.inputs()).reason, /workspace packages\/shared has no readable package.json/);
+});
+
+test('workspace key: a link that escapes the repo gives no key, with the link reason', () => {
+  const f = makeKeyFixture({ lockPackages: workspaceLockPackages({ 'node_modules/@x/api': { resolved: '../api', link: true }, '../api': { version: '1.0.0' } }) });
+  const result = computeDepsKey(f.inputs());
+  assert.equal(result.key, null);
+  assert.match(result.reason, /node_modules\/@x\/api is a link/);
+});
+
+/** An installed tree as `npm ci` leaves it for the workspace lock: real packages, relative workspace links, a nested workspace node_modules. */
+function makeWorkspaceInstall() {
+  const work = tmpDir('deps-cache-ws-work');
+  for (const ws of ['api', 'shared']) {
+    fs.mkdirSync(path.join(work, 'packages', ws), { recursive: true });
+    fs.writeFileSync(path.join(work, 'packages', ws, 'package.json'), JSON.stringify({ name: `@x/${ws}`, main: 'index.js' }));
+    fs.writeFileSync(path.join(work, 'packages', ws, 'index.js'), `module.exports = { ws: '${ws}', dotenv: require('dotenv') };\n`);
+  }
+  const nm = path.join(work, 'node_modules');
+  fs.mkdirSync(path.join(nm, 'dotenv'), { recursive: true });
+  fs.writeFileSync(path.join(nm, 'dotenv', 'index.js'), 'module.exports = "17";');
+  fs.mkdirSync(path.join(work, 'packages', 'api', 'node_modules', 'dotenv'), { recursive: true });
+  fs.writeFileSync(path.join(work, 'packages', 'api', 'node_modules', 'dotenv', 'index.js'), 'module.exports = "16";');
+  fs.mkdirSync(path.join(work, 'packages', 'api', 'node_modules', '.bin'));
+  fs.symlinkSync('../dotenv/index.js', path.join(work, 'packages', 'api', 'node_modules', '.bin', 'dotenv'));
+  fs.mkdirSync(path.join(nm, '@x'));
+  fs.symlinkSync('../../packages/api', path.join(nm, '@x', 'api'));
+  fs.symlinkSync('../../packages/shared', path.join(nm, '@x', 'shared'));
+  return work;
+}
+
+const WORKSPACES = [
+  { resolved: 'packages/api', links: ['@x/api'] },
+  { resolved: 'packages/shared', links: ['@x/shared'] },
+];
+
+test('workspace store: only real packages are stored (no links, no sources); a restore in another dir recreates the relative links and the nested node_modules', () => {
+  const cacheRoot = tmpDir('deps-cache-store');
+  const src = makeWorkspaceInstall();
+  const roles = [{ role: 'workDir', path: src }, { role: 'realWorkDir', path: fs.realpathSync(src) }];
+  const { relocation, ...refusal } = collectInstallPathReferences(path.join(src, 'node_modules'), roles, { workspaces: WORKSPACES });
+  assert.deepEqual(refusal, {}, 'workspace links and sources are not scanned as install-path references');
+  const key = newKey();
+  assert.equal(publishToStore(cacheRoot, key, path.join(src, 'node_modules'), relocation, null, WORKSPACES).published, true);
+
+  const stored = entryTree(cacheRoot, key);
+  assert.equal(fs.existsSync(path.join(stored, '@x', 'api')), false, 'no workspace symlink in the store');
+  assert.equal(fs.existsSync(path.join(stored, 'dotenv', 'index.js')), true);
+  assert.equal(fs.readFileSync(path.join(stored, '.lane-workspaces', 'packages', 'api', 'node_modules', 'dotenv', 'index.js'), 'utf8'), 'module.exports = "16";');
+  assert.equal(fs.readlinkSync(path.join(stored, '.lane-workspaces', 'packages', 'api', 'node_modules', '.bin', 'dotenv')), '../dotenv/index.js');
+  assert.equal(execFileSync('find', [stored, '-name', 'index.js', '-path', '*packages/api/index.js'], { encoding: 'utf8' }).trim(), '', 'no workspace source in the store');
+
+  const dest = tmpDir('deps-cache-ws-dest');
+  for (const ws of ['api', 'shared']) {
+    fs.cpSync(path.join(src, 'packages', ws), path.join(dest, 'packages', ws), { recursive: true });
+    fs.rmSync(path.join(dest, 'packages', ws, 'node_modules'), { recursive: true, force: true });
+  }
+  materializeFromStore(cacheRoot, key, path.join(dest, 'node_modules'));
+  placeWorkspaces(path.join(dest, 'node_modules'), WORKSPACES);
+
+  assert.equal(fs.readlinkSync(path.join(dest, 'node_modules', '@x', 'api')), '../../packages/api');
+  assert.equal(fs.readlinkSync(path.join(dest, 'node_modules', '@x', 'shared')), '../../packages/shared');
+  assert.equal(fs.existsSync(path.join(dest, 'node_modules', '.lane-workspaces')), false, 'the stash is gone');
+  assert.equal(treeDigest(path.join(dest, 'node_modules')), treeDigest(path.join(src, 'node_modules')));
+  assert.equal(treeDigest(path.join(dest, 'packages', 'api', 'node_modules')), treeDigest(path.join(src, 'packages', 'api', 'node_modules')));
+  const out = execFileSync(process.execPath, ['-e', 'console.log(JSON.stringify(require("@x/api")))'], { cwd: dest, encoding: 'utf8' });
+  assert.deepEqual(JSON.parse(out), { ws: 'api', dotenv: '16' }, 'require resolves through the recreated link to the workspace source and its nested dependency');
+});
+
+test('workspace restore fails closed: a missing workspace dir or an existing nested node_modules throws and leaves nothing placed', () => {
+  const cacheRoot = tmpDir('deps-cache-store');
+  const src = makeWorkspaceInstall();
+  const key = newKey();
+  publishToStore(cacheRoot, key, path.join(src, 'node_modules'), null, null, WORKSPACES);
+
+  const missing = tmpDir('deps-cache-ws-dest');
+  materializeFromStore(cacheRoot, key, path.join(missing, 'node_modules'));
+  assert.throws(() => placeWorkspaces(path.join(missing, 'node_modules'), WORKSPACES), /ENOENT/);
+
+  const occupied = tmpDir('deps-cache-ws-dest');
+  for (const ws of ['api', 'shared']) fs.mkdirSync(path.join(occupied, 'packages', ws), { recursive: true });
+  fs.mkdirSync(path.join(occupied, 'packages', 'api', 'node_modules'));
+  materializeFromStore(cacheRoot, key, path.join(occupied, 'node_modules'));
+  assert.throws(() => placeWorkspaces(path.join(occupied, 'node_modules'), WORKSPACES), /already exists/);
+  assert.equal(fs.existsSync(path.join(occupied, 'packages', 'shared', 'node_modules')), false);
+});
+
+test('workspace publish refuses a workspace link that is not the relative symlink npm ci makes', () => {
+  const cacheRoot = tmpDir('deps-cache-store');
+  const src = makeWorkspaceInstall();
+  fs.rmSync(path.join(src, 'node_modules', '@x', 'api'));
+  fs.symlinkSync(path.join(src, 'packages', 'api'), path.join(src, 'node_modules', '@x', 'api'));
+  assert.throws(() => publishToStore(cacheRoot, newKey(), path.join(src, 'node_modules'), null, null, WORKSPACES), /workspace link @x\/api/);
 });
