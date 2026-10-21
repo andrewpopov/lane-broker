@@ -5,7 +5,7 @@ test suites with no awareness of each other; `lane run` serializes conflicting
 lanes, caps how many heavy lanes run at once, and refuses to start new work
 while the machine is already overloaded — instead of every agent guessing.
 
-Zero runtime dependencies — Node `child_process`/`fs`/`os` only (Node ≥ 20).
+The scheduler uses Node primitives (Node ≥ 20); the optional Postgres store uses the `pg` dependency listed in `package.json`.
 
 ## Install
 
@@ -17,7 +17,7 @@ cache and `lane` breaks machine-wide. Pack first, then install the tarball:
 
 ```sh
 tmp=$(mktemp -d)
-(cd "$tmp" && npm pack "github:andrewpopov/lane-broker#v0.4.0")
+(cd "$tmp" && npm pack "github:andrewpopov/lane-broker#v0.57.0")
 npm install -g "$tmp"/*.tgz
 rm -rf "$tmp"
 ```
