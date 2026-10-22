@@ -27,7 +27,7 @@ import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processSt
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
 import { reloadGlobalConfig, isDispatchOnly } from './config.js';
-import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, spawnInCpuScope, stopLeaseCpuScope } from './cpu-limit.js';
+import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope } from './cpu-limit.js';
 import { stateHome } from './state.js';
 import { readRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
@@ -39,11 +39,11 @@ import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, class
 import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, dispatchOnlyRefusal, LOCAL_REFUSED_EXIT_CODE, locallyRefusedNow, localWindowAllowing, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
-import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
+import { remoteCpuAllocation, selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
 import { remoteExcludeWarnings } from './remote-exclude.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
-import { REMOTE_WITHDRAW_CAPABILITY, REMOTE_EXCLUSIVE_CAPABILITY } from './capabilities.js';
+import { EXECUTION_CEILING_CAPABILITY, REMOTE_WITHDRAW_CAPABILITY, REMOTE_EXCLUSIVE_CAPABILITY } from './capabilities.js';
 import { SNAPSHOT_GZIP_CAPABILITY, TRANSFER_GZIP } from './remote-gzip.js';
 import { BLOB_CACHE_CAPABILITY } from './remote-blobs.js';
 import { createAttempt, readAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
@@ -591,7 +591,7 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
     ...(isDispatchOnly(globalCfg) || locallyRefusedNow(enriched, globalCfg) ? { retryTimedOut: heartbeatUpRunners(root, globalCfg) } : {}),
     maxRemoteQueue: globalCfg.maxRemoteQueue,
     requireProtocol2: needsProtocol2(enriched.remote) || Boolean(queueTimeoutFor(enriched, globalCfg)),
-    requireCapabilities: [...(isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : []), ...(exclusiveOnRunner ? [REMOTE_EXCLUSIVE_CAPABILITY] : [])],
+    requireCapabilities: [...(isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : []), ...(exclusiveOnRunner ? [REMOTE_EXCLUSIVE_CAPABILITY] : []), ...(enriched.maxExecutionCpuCores !== undefined ? [EXECUTION_CEILING_CAPABILITY, CPU_LIMIT_CAPABILITY] : [])],
     preferIdle: exclusiveOnRunner,
     readinessNeeds: readinessNeeds(enriched.remote, globalCfg),
     reservation: {
@@ -1185,7 +1185,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       executor: 'remote',
       runner: runner.name,
       ...(queuedAt ? { queuedAt } : {}),
-      ...(Number.isFinite(dispatch.result.grantedCpuCores) ? { grantedCpuCores: dispatch.result.grantedCpuCores } : {}),
+      ...remoteCpuAllocation(dispatch.result),
       ...relayedUsage(dispatch.result),
       ...relayedDeps(dispatch.result),
       ...relayedTransfer(lastTransferStats, dispatch.result),

@@ -1,3 +1,4 @@
+import { remoteCpuAllocation } from './remote-client.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -246,7 +247,7 @@ function readPhasesMs(ticketDir, own) {
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
-function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, grantedCpuCores, observedCpu, observedRssPeakBytes, cpuSeconds, phasesMs, artifacts }) {
+export function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, grantedCpuCores, executionCpuCores, observedCpu, observedRssPeakBytes, cpuSeconds, phasesMs, artifacts }) {
   const isProtocol2 = header.protocol === 2;
   return {
     protocol: isProtocol2 ? 2 : 1,
@@ -276,7 +277,7 @@ function buildResult(header, ticketDir, { kind, exit = null, signal = null, remo
     // phase) before the command started, also a duration on the runner's own clock. Additive; omitted by an older runner.
     queuedMs,
     // BRAIN-360: additive; only an elastic lane's runner-side grant (an old submitter ignores it)
-    grantedCpuCores,
+    ...remoteCpuAllocation({ grantedCpuCores, executionCpuCores }),
     // BRAIN-361: additive; what the lane actually used on the runner, relayed to the submitter's history
     observedCpu,
     observedRssPeakBytes,
@@ -725,7 +726,6 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   let silenceTimeoutMs;
   let runMs;
   let queuedMs;
-  let grantedCpuCores;
   let observedCpu;
   let observedRssPeakBytes;
   let cpuSeconds;
@@ -754,7 +754,6 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
       reason = SILENCE_REASON;
       silenceTimeoutMs = structured.silenceTimeoutMs;
     }
-    if (Number.isFinite(structured.grantedCpuCores)) grantedCpuCores = structured.grantedCpuCores;
     observedCpu = sanitizeObservedCpu(structured.observedCpu) ?? undefined;
     observedRssPeakBytes = sanitizeRssPeak(structured.observedRssPeakBytes);
     cpuSeconds = sanitizeCpuSeconds(structured.cpuSeconds);
@@ -783,7 +782,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   const artifacts = storeArtifacts(header, ticketDir, workDir, { kind, exit, signal });
   if (artifacts !== undefined) ownPhasesMs.artifactsMs = Date.now() - artifactsStartedAt;
   try {
-    writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, grantedCpuCores, observedCpu, observedRssPeakBytes, cpuSeconds, phasesMs: readPhasesMs(ticketDir, ownPhasesMs), artifacts }));
+    writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, ...remoteCpuAllocation(structured ?? {}), observedCpu, observedRssPeakBytes, cpuSeconds, phasesMs: readPhasesMs(ticketDir, ownPhasesMs), artifacts }));
   } finally {
     cleanupWork(workDir, tmpDir);
   }

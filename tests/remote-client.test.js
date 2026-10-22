@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor, sleep } from './helpers.js';
 import { tmpDir, makeFakeSshBin, makeRunner, clientEnv, makeGitWorktree, makeDispatchArgs, readCapturedHeader } from './remote-harness.js';
-import { shellQuote, buildRemoteCommand, selectRunner, dispatchRemote, remoteWithdraw, isGreen, needsProtocol2, classifyRemoteResult } from '../src/remote-client.js';
+import { remoteCpuAllocation, shellQuote, buildRemoteCommand, selectRunner, dispatchRemote, remoteWithdraw, isGreen, needsProtocol2, classifyRemoteResult } from '../src/remote-client.js';
 import { MAX_HEADER_BYTES } from '../src/remote-stream.js';
 import { buildManifest } from '../src/remote-manifest.js';
 
@@ -1325,7 +1325,7 @@ test('retryElsewhere: a runner-confirmed withdrawal after lost results may be re
 });
 
 
-test('dispatchRemote preserves an opted-in execution ceiling in the header and omits it by default', async () => {
+test('dispatchRemote captures the execution ceiling header, while the non-enforcing fake runner refuses the capped payload', async () => {
   for (const cap of [undefined, 3]) {
     const { binDir, sshBin, teePath } = makeFakeSshBin();
     const { env } = clientEnv(binDir);
@@ -1334,10 +1334,20 @@ test('dispatchRemote preserves an opted-in execution ceiling in the header and o
       runner: makeRunner({ ssh: 'tee', root: tmpDir('execution-cap-root') }),
       worktreeRoot: makeGitWorktree({ 'a.txt': 'transport-only' }), sshBin, env });
     assert.equal(result.outcome, 'confirmed');
-    assert.equal(result.exitCode, 0);
+    assert.equal(result.exitCode, cap === undefined ? 0 : 69, 'header transport never bypasses quota enforcement');
     const header = readCapturedHeader(teePath);
     assert.equal(header.cpuCores, 2);
     assert.equal(header.maxExecutionCpuCores, cap);
     assert.equal(Object.hasOwn(header, 'maxExecutionCpuCores'), cap !== undefined);
   }
+});
+
+test('EXECUTION_ALLOCATION_RELAY: execution 6 and reservation grant 14.4 survive result classification and projection independently', () => {
+  const expected = { protocol: 2, ticketId: 'cap', generation: 0, manifestHash: 'hash' };
+  const record = { ...expected, kind: 'completed', exit: 0, signal: null, phase: 'command', grantedCpuCores: 14.4, executionCpuCores: 6 };
+  const classified = classifyRemoteResult(record, expected);
+  assert.equal(classified.outcome, 'confirmed');
+  assert.deepEqual(remoteCpuAllocation(classified.result), { grantedCpuCores: 14.4, executionCpuCores: 6 });
+  assert.deepEqual(remoteCpuAllocation({ grantedCpuCores: 14.4 }), { grantedCpuCores: 14.4 });
+  for (const value of [undefined, null, 0, -1, Infinity, '6']) assert.deepEqual(remoteCpuAllocation({ executionCpuCores: value }), {});
 });

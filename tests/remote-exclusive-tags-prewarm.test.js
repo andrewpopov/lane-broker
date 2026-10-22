@@ -4,12 +4,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
+import { CPU_LIMIT_CAPABILITY } from '../src/cpu-limit.js';
 import { selectRunner } from '../src/remote-client.js';
 import { remoteSelectOptions, selectionOptionsFor } from '../src/supervisor.js';
 import { resolveTicketConfig, ConfigError, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { readinessGap, readinessProbeArgs, parseReadinessArgs } from '../src/runner-readiness.js';
 import { runCommand } from '../src/run.js';
-import { CAPABILITIES, REMOTE_EXCLUSIVE_CAPABILITY } from '../src/capabilities.js';
+import { CAPABILITIES, REMOTE_EXCLUSIVE_CAPABILITY, EXECUTION_CEILING_CAPABILITY, advertisedCapabilities } from '../src/capabilities.js';
 import { runnerPrewarmCommand, pickPrewarmLane } from '../src/runner-prewarm.js';
 import { enqueue, tryStart } from '../src/scheduler.js';
 import { writeLease, removeLease, LEASE_STATE } from '../src/lease.js';
@@ -314,4 +315,43 @@ test('execution ceiling header override remains exact and invalid internal overr
     assert.equal(refused.ticket, null);
     assert.match(refused.stderr, /maxExecutionCpuCores must be a positive integer/);
   }
+});
+
+test('EXECUTION_CEILING_COMPATIBILITY: every placement path rejects old runners and missing quotas, while uncapped routing is unchanged', async () => {
+  const cfg = { ...DEFAULT_GLOBAL_CONFIG, runners: [] };
+  const base = { id: 'ceiling', lane: 'release', repoId: 'r', weight: 1, resources: { cpuCores: 14.4 }, remote: {} };
+  const sshBin = makeProbeSsh({ probes: {
+    oldQuota: { capabilities: [CPU_LIMIT_CAPABILITY] },
+    noQuota: { capabilities: [EXECUTION_CEILING_CAPABILITY] },
+    supported: { capabilities: [CPU_LIMIT_CAPABILITY, EXECUTION_CEILING_CAPABILITY] },
+  } });
+  for (const kind of ['place', 'rebind', 'rebalance']) {
+    const opts = selectionOptionsFor(kind, { ...base, maxExecutionCpuCores: 6 }, cfg, { root: tmpDir('cap-options') });
+    const draining = selectionOptionsFor(kind, { ...base, maxExecutionCpuCores: 6 }, cfg, { root: tmpDir('draining-cap-options'), draining: true, stuckLocally: true });
+    assert.ok(draining.requireCapabilities.includes(EXECUTION_CEILING_CAPABILITY), `${kind} draining`);
+    assert.ok(draining.requireCapabilities.includes(CPU_LIMIT_CAPABILITY), `${kind} draining`);
+    assert.ok(opts.requireCapabilities.includes(EXECUTION_CEILING_CAPABILITY), kind);
+    assert.ok(opts.requireCapabilities.includes(CPU_LIMIT_CAPABILITY), kind);
+    const selected = await selectRunner(runners('oldQuota', 'noQuota', 'supported'), { ...opts, sshBin });
+    assert.equal(selected.runner.name, 'supported', kind);
+    assert.match(selected.skipped.find((row) => row.name === 'oldQuota').reason, /execution-cpu-ceiling\/1/);
+    assert.match(selected.skipped.find((row) => row.name === 'noQuota').reason, /cpu-limit\/1/);
+    const none = await selectRunner(runners('oldQuota', 'noQuota'), { ...opts, sshBin });
+    assert.equal(none.runner, null, kind);
+    const plain = selectionOptionsFor(kind, base, cfg, { root: tmpDir('uncapped-options') });
+    assert.deepEqual(plain.requireCapabilities, []);
+    assert.equal((await selectRunner(runners('oldQuota'), { ...plain, sshBin })).runner.name, 'oldQuota');
+  }
+});
+
+test('EXECUTION_CEILING_ADVERTISEMENT: ceiling support is advertised only with usable quota enforcement', () => {
+  for (const quota of [{ mode: 'off', available: false }, { mode: 'off', available: true }, { mode: 'prefer', available: false }]) {
+    const caps = advertisedCapabilities({}, quota);
+    assert.equal(caps.includes(EXECUTION_CEILING_CAPABILITY), false);
+    assert.equal(caps.includes(CPU_LIMIT_CAPABILITY), false);
+  }
+  const caps = advertisedCapabilities({}, { mode: 'prefer', available: true });
+  assert.ok(caps.includes(EXECUTION_CEILING_CAPABILITY));
+  assert.ok(caps.includes(CPU_LIMIT_CAPABILITY));
+  assert.equal(CAPABILITIES.includes(EXECUTION_CEILING_CAPABILITY), false, 'never advertise unconditionally');
 });
