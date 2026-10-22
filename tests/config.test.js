@@ -336,3 +336,30 @@ test('localWindow rejects a bad schedule, empty or non-string lanes, and unknown
     assert.throws(() => loadWithGlobal({ localWindow }), (err) => err instanceof ConfigError && pattern.test(err.message), JSON.stringify(localWindow));
   }
 });
+
+
+test('maxExecutionCpuCores is optional, inherited and independent of CPU reservation/floor', () => {
+  const { base } = freshEnv();
+  const repoDir = path.join(base, 'execution-cap');
+  writeRepoConfig(repoDir, { version: 1, undeclaredLanes: { as: 'capped' }, lanes: {
+    default: { weight: 2 }, capped: { weight: 2, cpuCores: 8, minCpuCores: 1, maxExecutionCpuCores: 3 },
+  } });
+  const uncapped = resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' });
+  assert.equal(Object.hasOwn(uncapped, 'maxExecutionCpuCores'), false);
+  for (const lane of ['capped', 'ad-hoc']) {
+    const resolved = resolveTicketConfig({ cwd: repoDir, repo: 'r', lane });
+    assert.equal(resolved.maxExecutionCpuCores, 3);
+    assert.equal(resolved.cpuCores, 8);
+    assert.equal(resolved.minCpuCores, 1);
+  }
+});
+
+test('maxExecutionCpuCores rejects nonpositive, fractional, nonfinite and nonnumeric declarations', () => {
+  for (const maxExecutionCpuCores of [0, -1, 1.5, Number.NaN, Infinity, null, '3']) {
+    const { base } = freshEnv();
+    const repoDir = path.join(base, 'invalid-execution-cap');
+    writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, maxExecutionCpuCores } } });
+    assert.throws(() => resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' }),
+      /maxExecutionCpuCores must be a positive integer/);
+  }
+});

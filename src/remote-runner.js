@@ -149,6 +149,9 @@ function validateHeaderFields(header) {
   if (!isPositiveFiniteOrAbsent(header.weight)) return { ok: false, reason: 'invalid weight' };
   if (!isPositiveFiniteOrAbsent(header.cpuCores)) return { ok: false, reason: 'invalid cpuCores' };
   if (!isPositiveFiniteOrAbsent(header.minCpuCores)) return { ok: false, reason: 'invalid minCpuCores' };
+  if (header.maxExecutionCpuCores !== undefined && (!Number.isInteger(header.maxExecutionCpuCores) || header.maxExecutionCpuCores <= 0)) {
+    return { ok: false, reason: 'invalid maxExecutionCpuCores: must be a positive integer' };
+  }
   if (!isPositiveFiniteOrAbsent(header.memoryBytes)) return { ok: false, reason: 'invalid memoryBytes' };
   if (!Array.isArray(header.argv) || header.argv.length === 0 || !header.argv.every((a) => typeof a === 'string')) {
     return { ok: false, reason: 'invalid argv: must be a non-empty array of strings' };
@@ -649,6 +652,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     weightOverride: header.weight,
     cpuOverride: header.cpuCores,
     minCpuOverride: header.minCpuCores,
+    maxExecutionCpuCoresOverride: header.maxExecutionCpuCores,
     memoryOverride: header.memoryBytes,
     // An older submitter sends no timeout: the kill is opt-in, so absent means disabled, never this runner's own default.
     noProgressTimeoutOverride: Number.isFinite(header.noProgressTimeoutMs) ? header.noProgressTimeoutMs : 0,

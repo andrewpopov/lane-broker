@@ -896,6 +896,7 @@ async function dispatchOnce(opts) {
     weight,
     cpuCores,
     minCpuCores,
+    maxExecutionCpuCores,
     memoryBytes,
     argv,
     ticketId,
@@ -1015,6 +1016,7 @@ async function dispatchOnce(opts) {
     header.remoteArtifactsOn = remoteArtifactsOn;
   }
   if (Number.isFinite(minCpuCores)) header.minCpuCores = minCpuCores;
+  if (maxExecutionCpuCores !== undefined) header.maxExecutionCpuCores = maxExecutionCpuCores;
   if (Number.isInteger(queueTimeoutMs) && queueTimeoutMs > 0) header.queueTimeoutMs = queueTimeoutMs;
   if (Number.isInteger(noProgressTimeoutMs) && noProgressTimeoutMs >= 0) header.noProgressTimeoutMs = noProgressTimeoutMs;
   if (Number.isInteger(silenceTimeoutMs) && silenceTimeoutMs >= 0) header.silenceTimeoutMs = silenceTimeoutMs;

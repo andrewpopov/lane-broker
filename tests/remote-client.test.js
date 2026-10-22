@@ -5,7 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor, sleep } from './helpers.js';
-import { tmpDir, makeFakeSshBin, makeRunner, clientEnv, makeGitWorktree, makeDispatchArgs } from './remote-harness.js';
+import { tmpDir, makeFakeSshBin, makeRunner, clientEnv, makeGitWorktree, makeDispatchArgs, readCapturedHeader } from './remote-harness.js';
 import { shellQuote, buildRemoteCommand, selectRunner, dispatchRemote, remoteWithdraw, isGreen, needsProtocol2, classifyRemoteResult } from '../src/remote-client.js';
 import { MAX_HEADER_BYTES } from '../src/remote-stream.js';
 import { buildManifest } from '../src/remote-manifest.js';
@@ -1322,4 +1322,22 @@ test('retryElsewhere: a runner-confirmed withdrawal after lost results may be re
   const ineligible = await dispatchRemote({ ...makeDispatchArgs(), runner: makeRunner({ ssh: 'unused', root: tmpDir('retry-root') }), worktreeRoot: makeGitWorktree({ '.env': 'SECRET=1' }), sshBin, env: clientEnv(binDir).env });
   assert.equal(ineligible.outcome, 'ineligible', JSON.stringify(ineligible));
   assert.equal(ineligible.retryElsewhere, undefined);
+});
+
+
+test('dispatchRemote preserves an opted-in execution ceiling in the header and omits it by default', async () => {
+  for (const cap of [undefined, 3]) {
+    const { binDir, sshBin, teePath } = makeFakeSshBin();
+    const { env } = clientEnv(binDir);
+    const result = await dispatchRemote({ ...makeDispatchArgs({ cpuCores: 2,
+      ...(cap === undefined ? {} : { maxExecutionCpuCores: cap }) }),
+      runner: makeRunner({ ssh: 'tee', root: tmpDir('execution-cap-root') }),
+      worktreeRoot: makeGitWorktree({ 'a.txt': 'transport-only' }), sshBin, env });
+    assert.equal(result.outcome, 'confirmed');
+    assert.equal(result.exitCode, 0);
+    const header = readCapturedHeader(teePath);
+    assert.equal(header.cpuCores, 2);
+    assert.equal(header.maxExecutionCpuCores, cap);
+    assert.equal(Object.hasOwn(header, 'maxExecutionCpuCores'), cap !== undefined);
+  }
 });
