@@ -11,8 +11,8 @@ const READBACK = 'cat "/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)/cpu.max"';
 const PROBE_ARGV = ['systemd-run', '--user', '--scope', '-p', 'CPUQuota=100%', '--quiet', 'sh', '-c', READBACK];
 
 export class CpuLimitUnavailableError extends Error {
-  constructor(reason) {
-    super(`${CPU_LIMIT_UNAVAILABLE}: cpuLimit is "require" but this host cannot enforce a CPU quota (${reason})`);
+  constructor(reason, requirement = 'cpuLimit is "require"') {
+    super(`${CPU_LIMIT_UNAVAILABLE}: ${requirement} but this host cannot enforce a CPU quota (${reason})`);
     this.name = 'CpuLimitUnavailableError';
     this.code = CPU_LIMIT_UNAVAILABLE;
     this.reason = reason;
@@ -44,21 +44,30 @@ export const cpuScopeUnit = (leaseId) => `lane-${leaseId}.scope`;
 
 /** The argv that runs `argv` in its own scope capped at `grantCores` cores (named `unit` when given). Spawns nothing. */
 export function cpuLimitArgv(grantCores, argv, { unit } = {}) {
-  if (!Number.isInteger(grantCores) || grantCores < 1) throw new Error(`cpuLimitArgv: grantCores must be a positive integer, got ${grantCores}`);
+  if (!Number.isFinite(grantCores) || grantCores <= 0) throw new Error(`cpuLimitArgv: grantCores must be positive and finite, got ${grantCores}`);
   return ['systemd-run', '--user', '--scope', ...(unit ? [`--unit=${unit}`] : []), '-p', `CPUQuota=${grantCores * 100}%`, '--quiet', '--collect', '--', ...argv];
+}
+
+/** Execution is distinct from admission: an exclusive reservation is never reduced by this ceiling. */
+export function resolveExecutionCpuCores(grantedCpuCores, maxExecutionCpuCores) {
+  if (maxExecutionCpuCores === undefined) return grantedCpuCores;
+  if (!Number.isInteger(maxExecutionCpuCores) || maxExecutionCpuCores <= 0) throw new Error('maxExecutionCpuCores must be a positive integer');
+  if (!Number.isFinite(grantedCpuCores) || grantedCpuCores <= 0) throw new CpuLimitUnavailableError('no usable CPU grant', 'maxExecutionCpuCores was requested');
+  return Math.min(grantedCpuCores, maxExecutionCpuCores);
 }
 
 /**
  * BRAIN-651 L2: spawn a lane's child with `spawnFn`, inside a CPUQuota scope when `resolved` (resolveCpuLimit's shape) says the mode
  * is on and the probe passed, on Linux. `systemd-run --scope` execs the command in place, so the pid, process group, stdio, cwd, env and
- * exit status are the bare command's. A fractional grant rounds UP: the quota is never below what admission reserved.
+ * exit status are the bare command's. By default a fractional grant rounds UP, preserving legacy behavior. An explicit execution ceiling uses the exact allocation.
  * Returns `{child, unit}`; `unit` is null when nothing was wrapped.
  */
-export function spawnInCpuScope(spawnFn, { resolved, platform = process.platform, leaseId, grantCores, cmd, args, options }) {
+export function spawnInCpuScope(spawnFn, { resolved, platform = process.platform, leaseId, grantCores, requireQuota = false, cmd, args, options }) {
   const enforce = platform === 'linux' && resolved?.mode !== 'off' && resolved?.available === true && Number.isFinite(grantCores) && grantCores > 0;
+  if (requireQuota && !enforce) throw new CpuLimitUnavailableError(resolved?.reason ?? 'unsupported-platform', 'maxExecutionCpuCores was requested');
   if (!enforce) return { child: spawnFn(cmd, args, options), unit: null };
   const unit = cpuScopeUnit(leaseId);
-  const [file, ...wrapped] = cpuLimitArgv(Math.ceil(grantCores), [cmd, ...args], { unit });
+  const [file, ...wrapped] = cpuLimitArgv(requireQuota ? grantCores : Math.ceil(grantCores), [cmd, ...args], { unit });
   return { child: spawnFn(file, wrapped, options), unit };
 }
 

@@ -22,6 +22,14 @@ import { readinessProbeArgs, readinessGap } from './runner-readiness.js';
  * (status/wait/cancel, fallback-to-local) is a later slice.
  */
 
+/** Keep the runner's reservation/grant separate from its enforced execution allocation. */
+export function remoteCpuAllocation(result) {
+  return {
+    ...(Number.isFinite(result.grantedCpuCores) ? { grantedCpuCores: result.grantedCpuCores } : {}),
+    ...(Number.isFinite(result.executionCpuCores) && result.executionCpuCores > 0 ? { executionCpuCores: result.executionCpuCores } : {}),
+  };
+}
+
 /**
  * POSIX single-quote a string for use as one shell word: wrap in single
  * quotes, escaping any embedded single quote as `'\''`. Everything else
@@ -896,6 +904,7 @@ async function dispatchOnce(opts) {
     weight,
     cpuCores,
     minCpuCores,
+    maxExecutionCpuCores,
     memoryBytes,
     argv,
     ticketId,
@@ -1015,6 +1024,7 @@ async function dispatchOnce(opts) {
     header.remoteArtifactsOn = remoteArtifactsOn;
   }
   if (Number.isFinite(minCpuCores)) header.minCpuCores = minCpuCores;
+  if (maxExecutionCpuCores !== undefined) header.maxExecutionCpuCores = maxExecutionCpuCores;
   if (Number.isInteger(queueTimeoutMs) && queueTimeoutMs > 0) header.queueTimeoutMs = queueTimeoutMs;
   if (Number.isInteger(noProgressTimeoutMs) && noProgressTimeoutMs >= 0) header.noProgressTimeoutMs = noProgressTimeoutMs;
   if (Number.isInteger(silenceTimeoutMs) && silenceTimeoutMs >= 0) header.silenceTimeoutMs = silenceTimeoutMs;

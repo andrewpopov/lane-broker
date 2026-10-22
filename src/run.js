@@ -238,6 +238,7 @@ export async function runCommand({
   weightOverride,
   cpuOverride,
   minCpuOverride,
+  maxExecutionCpuCoresOverride,
   memoryOverride,
   noProgressTimeoutOverride,
   silenceTimeoutOverride,
@@ -314,6 +315,12 @@ export async function runCommand({
       return { exitCode: 64 };
     }
     throw err;
+  }
+  const maxExecutionCpuCores = maxExecutionCpuCoresOverride !== undefined
+    ? maxExecutionCpuCoresOverride : resolved.maxExecutionCpuCores;
+  if (maxExecutionCpuCores !== undefined && (!Number.isInteger(maxExecutionCpuCores) || maxExecutionCpuCores <= 0)) {
+    process.stderr.write('lane run: maxExecutionCpuCores must be a positive integer\n');
+    return { exitCode: 64 };
   }
   const classMismatch = expectClass && classTransportMismatch(expectClass, resolved);
   if (classMismatch) {
@@ -614,6 +621,7 @@ export async function runCommand({
     ...(resolved.configLane ? { configLane: resolved.configLane } : {}),
     weight,
     resources,
+    ...(maxExecutionCpuCores !== undefined ? { maxExecutionCpuCores } : {}),
     ...(resources !== declaredResources ? { declaredCpuCores: declaredResources.cpuCores } : {}),
     nice,
     // BRAIN-506: only the lane's own override; a remote ticket runs at it, else at the RUNNER's laneNice (never this host's), which the runner-room check needs to know
@@ -710,6 +718,7 @@ export async function runCommand({
       repoKey: resolved.repoId,
       weight,
       cpuCores: resources.cpuCores,
+      ...(maxExecutionCpuCores !== undefined ? { maxExecutionCpuCores } : {}),
       // BRAIN-360: elastic lanes only, so a non-elastic ticket's remote payload is unchanged
       ...(resources.minCpuCores !== undefined ? { minCpuCores: resources.minCpuCores } : {}),
       memoryBytes: resources.memoryBytes,

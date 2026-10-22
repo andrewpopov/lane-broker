@@ -27,7 +27,7 @@ import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processSt
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
 import { reloadGlobalConfig, isDispatchOnly } from './config.js';
-import { enforceCpuLimitStartup, CpuLimitUnavailableError, spawnInCpuScope, stopLeaseCpuScope } from './cpu-limit.js';
+import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope } from './cpu-limit.js';
 import { stateHome } from './state.js';
 import { readRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
@@ -39,11 +39,11 @@ import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, class
 import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, dispatchOnlyRefusal, LOCAL_REFUSED_EXIT_CODE, locallyRefusedNow, localWindowAllowing, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
-import { selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
+import { remoteCpuAllocation, selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
 import { remoteExcludeWarnings } from './remote-exclude.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
-import { REMOTE_WITHDRAW_CAPABILITY, REMOTE_EXCLUSIVE_CAPABILITY } from './capabilities.js';
+import { EXECUTION_CEILING_CAPABILITY, REMOTE_WITHDRAW_CAPABILITY, REMOTE_EXCLUSIVE_CAPABILITY } from './capabilities.js';
 import { SNAPSHOT_GZIP_CAPABILITY, TRANSFER_GZIP } from './remote-gzip.js';
 import { BLOB_CACHE_CAPABILITY } from './remote-blobs.js';
 import { createAttempt, readAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
@@ -497,20 +497,24 @@ function migrationRefusalResult(ticket) {
 }
 
 /** Why this machine can never run the ticket (a refusal result), or null: a `localRefused` lane without --allow-local-sim,
- *  else a claim over the local budget. The one definition behind local-first, the queued-runner choice, the fallback and
+ *  an explicit execution ceiling without usable quotas, or a claim over the local budget. The one definition behind local-first, the queued-runner choice, the fallback and
  *  whether the ticket carries a queue timeout (which exists only to enable a local fallback). */
-function localIneligibilityOf(enriched, globalCfg) {
+export function localIneligibilityOf(enriched, globalCfg, cpuLimit) {
   // BRAIN-634: a dispatch-only host can never run anything; every caller treats that as "no local fallback" (no queue timeout,
   // no local-first, no speed-aware local choice, wait on a busy runner). It wins over a BRAIN-629 localWindow.
   if (isDispatchOnly(globalCfg)) return dispatchOnlyRefusal(enriched.lane);
   if (locallyRefusedNow(enriched, globalCfg)) return localSimRefusal(enriched.lane, enriched.class);
+  if (enriched.maxExecutionCpuCores !== undefined && (cpuLimit?.mode === 'off' || cpuLimit?.available !== true)) {
+    const error = new CpuLimitUnavailableError(cpuLimit?.reason ?? 'quota support unavailable', 'maxExecutionCpuCores was requested');
+    return { exitCode: LOCAL_REFUSED_EXIT_CODE, message: `lane run: ${error.message}\n` };
+  }
   const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host: detectResourceCapacity() });
   return budget.ok ? null : budget;
 }
 
 /** The client's `remoteQueueTimeoutMs` for this ticket: none when it has no local fallback to expire into (BRAIN-509). */
-function queueTimeoutFor(enriched, globalCfg) {
-  return localIneligibilityOf(enriched, globalCfg) ? undefined : globalCfg.remoteQueueTimeoutMs;
+function queueTimeoutFor(enriched, globalCfg, cpuLimit) {
+  return localIneligibilityOf(enriched, globalCfg, cpuLimit) ? undefined : globalCfg.remoteQueueTimeoutMs;
 }
 
 /** BRAIN-548: history rows and this lane's local run estimate for a speed-aware ticket; null (today's behaviour) without an estimate. */
@@ -575,7 +579,7 @@ function logSpeedDecision(root, enriched, choice, detail) {
 const seconds = (ms) => (ms === null ? 'unbounded' : `${Math.round(ms / 1000)}s`);
 
 /** What `selectRunner` needs to judge a ticket: its protocol, and its reservation (shared by a first attempt and a rebind). */
-export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
+export function remoteSelectOptions(enriched, globalCfg, root = stateHome(), cpuLimit) {
   // BRAIN-533: history is read only when some runner has a schedule that could make the expected run time matter.
   const scheduled = (globalCfg.runners || []).some((r) => r.schedule);
   const expectedMs = scheduled ? expectedRunMs(readRows(paths(root).history), enriched.repoId, enriched.lane) : null;
@@ -590,8 +594,8 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
     // BRAIN-602: a lane this machine refuses has nowhere else to go, so a busy-but-up runner's timed-out probe is retried once
     ...(isDispatchOnly(globalCfg) || locallyRefusedNow(enriched, globalCfg) ? { retryTimedOut: heartbeatUpRunners(root, globalCfg) } : {}),
     maxRemoteQueue: globalCfg.maxRemoteQueue,
-    requireProtocol2: needsProtocol2(enriched.remote) || Boolean(queueTimeoutFor(enriched, globalCfg)),
-    requireCapabilities: [...(isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : []), ...(exclusiveOnRunner ? [REMOTE_EXCLUSIVE_CAPABILITY] : [])],
+    requireProtocol2: needsProtocol2(enriched.remote) || Boolean(queueTimeoutFor(enriched, globalCfg, cpuLimit)),
+    requireCapabilities: [...(isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : []), ...(exclusiveOnRunner ? [REMOTE_EXCLUSIVE_CAPABILITY] : []), ...(enriched.maxExecutionCpuCores !== undefined ? [EXECUTION_CEILING_CAPABILITY, CPU_LIMIT_CAPABILITY] : [])],
     preferIdle: exclusiveOnRunner,
     readinessNeeds: readinessNeeds(enriched.remote, globalCfg),
     reservation: {
@@ -608,8 +612,8 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome()) {
  * The ONE builder of `selectRunner` options for the three placement paths ('place' a first attempt, 'rebind' a locally queued
  * ticket, 'rebalance' a queued remote one), so what every path must carry (BRAIN-597's `downRunners`) cannot be dropped by one.
  */
-export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHome(), stuckLocally = false, draining = false } = {}) {
-  const base = remoteSelectOptions(enriched, globalCfg, root);
+export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHome(), stuckLocally = false, draining = false, cpuLimit } = {}) {
+  const base = remoteSelectOptions(enriched, globalCfg, root, cpuLimit);
   // a move or rebind picks a better home for a ticket that already has one, so it never takes a loaded runner for the exclusive drain
   if (kind === 'rebind') return { ...base, preferIdle: false, maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0 };
   if (kind === 'rebalance') {
@@ -633,7 +637,7 @@ export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHom
  * right before dispatch, and any failure after that puts it back at its original queue position and resolves
  * `{ fallback: true, rebindFailed: true }` -- a rebind never terminates a ticket by refusing it.
  */
-async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind = null) {
+async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind = null, cpuLimit) {
   const attemptStartedAt = Date.now();
   // the attempt generation every fence below acts on: 0 for a first attempt, the fallback's generation for a rebind
   const gen = rebind ? rebind.generation : 0;
@@ -740,7 +744,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     return { fallback: true, rebindFailed: true, attemptGeneration: gen };
   }
 
-  const localIneligibility = () => localIneligibilityOf(enriched, globalCfg);
+  const localIneligibility = () => localIneligibilityOf(enriched, globalCfg, cpuLimit);
 
   /** `rebindable`: this fallback is only "no runner had room right now", so a later probe may still find one.
    *  `noRunner`: the fallback is "the fleet had no usable runner", which a `localRefused` lane reports as retryable. */
@@ -759,12 +763,15 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
 
     const dispatchOnly = isDispatchOnly(globalCfg);
     const refusedHere = dispatchOnly || locallyRefusedNow(enriched, globalCfg);
+    const otherwiseIneligible = localIneligibility();
     const windowLabel = !refusedHere && enriched.localRefused && !enriched.allowLocalSim ? localWindowAllowing(enriched, globalCfg) : null;
     const where = dispatchOnly
       ? 'not running locally (localExecution refused)'
       : refusedHere
         ? 'not running locally (localRefused)'
-        : `running locally${windowLabel ? ` (localWindow ${windowLabel})` : ''}`;
+        : otherwiseIneligible
+          ? 'not running locally (locally ineligible)'
+          : `running locally${windowLabel ? ` (localWindow ${windowLabel})` : ''}`;
     const skipLine = `lane: remote-skip: ${runner ? runner.name : 'none'}: ${reason} — ${where}\n`;
     process.stderr.write(skipLine);
     writeBrokerLog(root, skipLine);
@@ -786,11 +793,10 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       return { fallback: false };
     }
 
-    const host = detectResourceCapacity();
-    const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host });
-    if (!budget.ok) {
-      process.stderr.write(budget.message);
-      await publishAndExit(fb.attempt.generation, () => localRefusalResult(enriched, budget));
+    const refusal = localIneligibility();
+    if (refusal) {
+      process.stderr.write(refusal.message);
+      await publishAndExit(fb.attempt.generation, () => localRefusalResult(enriched, refusal));
       return { fallback: false };
     }
 
@@ -872,7 +878,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // own protocol (inside dispatchRemote) still derives from
   // `needsProtocol2(enriched.remote)` alone, so an optionless lane still
   // sends a protocol-1 header even when this is true.
-  const placeOptions = rebind ? null : selectionOptionsFor('place', enriched, globalCfg);
+  const placeOptions = rebind ? null : selectionOptionsFor('place', enriched, globalCfg, { root, cpuLimit });
   let { runner, skipped, queuedChoice, probe, busy, readiness, ready } = rebind
     ? { runner: rebind.runner, skipped: [], queuedChoice: false, probe: rebind.probe }
     : await selectRunner(globalCfg.runners || [], placeOptions);
@@ -1031,7 +1037,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       // -- never the runner's -- so an unset value here means the header
       // carries no queueTimeoutMs at all (I6). The timeout only exists to enable a local fallback, so a ticket this
       // machine can never run carries none either: it waits in the runner's queue instead of expiring into a refusal (BRAIN-509).
-      queueTimeoutMs: queueTimeoutFor(enriched, globalCfg),
+      queueTimeoutMs: queueTimeoutFor(enriched, globalCfg, cpuLimit),
       noProgressTimeoutMs: enriched.noProgressTimeoutMs ?? globalCfg.noProgressTimeoutMs,
       silenceTimeoutMs: enriched.silenceTimeoutMs ?? globalCfg.silenceTimeoutMs,
       // BRAIN-380 §6: the tier BEFORE any cap, and the wait this ticket has accrued on THIS host's priority clock. The
@@ -1062,7 +1068,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
           if (!draining && rebalanceBlocked({ moves: countedMoves, maxMoves: globalCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: globalCfg.remoteRebalanceCooldownMs })) return null;
           const candidates = (globalCfg.runners || []).filter((r) => !visited.includes(r.name) && r.rebalanceTarget !== false);
           if (candidates.length === 0) return null;
-          const picked = await selectRunner(candidates, selectionOptionsFor('rebalance', enriched, globalCfg, { draining }));
+          const picked = await selectRunner(candidates, selectionOptionsFor('rebalance', enriched, globalCfg, { draining, root, cpuLimit }));
           const eligible = picked.runner && hasMeasuredHeadroom(picked.probe);
           target = eligible ? { runner: picked.runner, probe: picked.probe } : null;
           return target;
@@ -1185,7 +1191,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       executor: 'remote',
       runner: runner.name,
       ...(queuedAt ? { queuedAt } : {}),
-      ...(Number.isFinite(dispatch.result.grantedCpuCores) ? { grantedCpuCores: dispatch.result.grantedCpuCores } : {}),
+      ...remoteCpuAllocation(dispatch.result),
       ...relayedUsage(dispatch.result),
       ...relayedDeps(dispatch.result),
       ...relayedTransfer(lastTransferStats, dispatch.result),
@@ -1271,13 +1277,17 @@ async function main() {
     cpuLimit = enforceCpuLimitStartup(globalCfg, { warn: (line) => process.stderr.write(line) });
   } catch (err) {
     if (!(err instanceof CpuLimitUnavailableError)) throw err;
-    const refusal = { exitCode: LOCAL_REFUSED_EXIT_CODE, message: `lane run: ${err.message}\n` };
-    process.stderr.write(refusal.message);
-    const result = localRefusalResult(enriched, refusal);
-    atomicWriteJson(ticket.resultPath, result);
-    appendHistory(root, historyRow(ticket, result, {}));
-    await underLock(root, () => clearTicketMarkers(root, ticket.id));
-    process.exit(refusal.exitCode);
+    if (ticket.remote && ticket.maxExecutionCpuCores !== undefined) {
+      cpuLimit = { mode: globalCfg.cpuLimit, available: false, reason: err.reason };
+    } else {
+      const refusal = { exitCode: LOCAL_REFUSED_EXIT_CODE, message: `lane run: ${err.message}\n` };
+      process.stderr.write(refusal.message);
+      const result = localRefusalResult(enriched, refusal);
+      atomicWriteJson(ticket.resultPath, result);
+      appendHistory(root, historyRow(ticket, result, {}));
+      await underLock(root, () => clearTicketMarkers(root, ticket.id));
+      process.exit(refusal.exitCode);
+    }
   }
 
   let cancelledBeforeStart = false;
@@ -1328,7 +1338,7 @@ async function main() {
   if (ticket.remote) {
     let outcome;
     try {
-      outcome = await runRemoteAttempt(root, enriched, globalCfg, abortController.signal);
+      outcome = await runRemoteAttempt(root, enriched, globalCfg, abortController.signal, null, cpuLimit);
     } catch (err) {
       if (!(err instanceof MigrationInProgressError)) throw err;
       return exitMigrating(err);
@@ -1431,8 +1441,11 @@ async function main() {
    * BRAIN-634: this host became (or is) dispatch-only while the ticket sits in, or just left, the local queue. Never start it:
    * 76 when it is remote-eligible (retry once a runner has room), else 69. `lease` is true once tryStart has already leased it.
    */
-  async function refuseDispatchOnlyAndExit({ lease = false } = {}) {
-    const refusal = dispatchOnlyRefusal(enriched.lane, { retryable: Boolean(enriched.remote), reason: 'queued locally' });
+  async function refuseDispatchOnlyAndExit(options = {}) {
+    return refuseLocalAndExit(dispatchOnlyRefusal(enriched.lane, { retryable: Boolean(enriched.remote), reason: 'queued locally' }), options);
+  }
+
+  async function refuseLocalAndExit(refusal, { lease = false } = {}) {
     process.stderr.write(refusal.message);
     await underLock(root, () => dequeueSync(root, ticket.id));
     if (lease) removeLease(root, ticket.id);
@@ -1474,7 +1487,7 @@ async function main() {
     // An idle runner is always taken; a runner that is itself queued (up to maxRemoteQueue) only for a ticket stuck locally long enough.
     const waitedMs = Date.now() - (readQueuedRecord(root, ticket.id)?.localSince ?? Date.now());
     const stuckLocally = globalCfg.remoteRebindMinLocalWaitMs > 0 && waitedMs >= globalCfg.remoteRebindMinLocalWaitMs;
-    const { runner, probe, queuedChoice } = await selectRunner(candidates, selectionOptionsFor('rebind', enriched, globalCfg, { stuckLocally }));
+    const { runner, probe, queuedChoice } = await selectRunner(candidates, selectionOptionsFor('rebind', enriched, globalCfg, { stuckLocally, root, cpuLimit }));
     if (!runner) return;
     // BRAIN-548: a speed-aware ticket moves only when the runner is now expected to finish it sooner than waiting here does.
     const speed = speedInputs(root, enriched);
@@ -1490,7 +1503,7 @@ async function main() {
       }
       logSpeedDecision(root, enriched, 'remote', `rebind: local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)}, ${decision.ratioTier} n=${decision.ratioPairs}${decision.localBlocked ? ', local blocked by host CPU load' : ''})`);
     }
-    await runRemoteAttempt(root, enriched, globalCfg, abortController.signal, { generation: attemptGeneration, runner, probe, queued: queuedChoice === true });
+    await runRemoteAttempt(root, enriched, globalCfg, abortController.signal, { generation: attemptGeneration, runner, probe, queued: queuedChoice === true }, cpuLimit);
   }
   let nextRebindAt = Date.now() + (globalCfg.remoteRebindIntervalMs || 0);
   // BRAIN-442: a local-first ticket is not rebind-eligible until it has waited in the local queue this long
@@ -1619,19 +1632,30 @@ async function main() {
   // the host may have turned dispatch-only since admission (config flip or marker): re-read it at the last moment, release the lease unused
   if (isDispatchOnly(reloadGlobalConfig(globalCfg))) await refuseDispatchOnlyAndExit({ lease: true });
   // BRAIN-651 L2: the admitted grant (elastic included) caps the whole tree; a remote protocol-2 pipeline is this same child, so deps, setup and command share it
-  const { child, unit: cpuScope } = spawnInCpuScope(spawn, {
-    resolved: cpuLimit,
-    leaseId: ticket.id,
-    grantCores: leaseCpuCores(started.lease),
-    cmd,
-    args,
-    options: {
-      cwd: ticket.cwd,
-      detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: childEnv({ ...ticket, priorityAdmitted: started.lease.priorityAdmitted }, process.env, leaseCpuCores(started.lease), started.lease.classEnforcement),
-    },
-  });
+  let executionCpuCores;
+  let scopedChild;
+  try {
+    executionCpuCores = resolveExecutionCpuCores(leaseCpuCores(started.lease), ticket.maxExecutionCpuCores);
+    scopedChild = spawnInCpuScope(spawn, {
+      resolved: cpuLimit,
+      leaseId: ticket.id,
+      grantCores: executionCpuCores,
+      requireQuota: ticket.maxExecutionCpuCores !== undefined,
+      cmd,
+      args,
+      options: {
+        cwd: ticket.cwd,
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: childEnv({ ...ticket, priorityAdmitted: started.lease.priorityAdmitted }, process.env, executionCpuCores, started.lease.classEnforcement),
+      },
+    });
+  } catch (err) {
+    if (!(err instanceof CpuLimitUnavailableError)) throw err;
+    await refuseLocalAndExit({ exitCode: LOCAL_REFUSED_EXIT_CODE, message: `lane run: ${err.message}\n` }, { lease: true });
+  }
+  const { child, unit: cpuScope } = scopedChild;
+  if (ticket.maxExecutionCpuCores !== undefined) started.lease.executionCpuCores = executionCpuCores;
 
   const logWriter = new CappedLogWriter(ticket.logPath);
   // ticket.forwardOutput (BRAIN-308) is set explicitly by run.js's foreground
@@ -1818,6 +1842,7 @@ async function main() {
     const writeResult = (finalResult) => {
       // BRAIN-360: an elastic lease's grant rides on the result (a runner relays it to its submitter)
       if (started.lease.grantedCpuCores !== undefined) finalResult = { ...finalResult, grantedCpuCores: started.lease.grantedCpuCores };
+      if (ticket.maxExecutionCpuCores !== undefined) finalResult = { ...finalResult, executionCpuCores };
       // BRAIN-361: what the lease actually used, from the last heartbeat's lease file (absent when no
       // heartbeat ever observed it); additive, and relayed by a runner to its submitter like the grant.
       const finalLease = readLease(root, ticket.id);

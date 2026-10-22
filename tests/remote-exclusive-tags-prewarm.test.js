@@ -4,12 +4,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
+import { CPU_LIMIT_CAPABILITY } from '../src/cpu-limit.js';
 import { selectRunner } from '../src/remote-client.js';
 import { remoteSelectOptions, selectionOptionsFor } from '../src/supervisor.js';
 import { resolveTicketConfig, ConfigError, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { readinessGap, readinessProbeArgs, parseReadinessArgs } from '../src/runner-readiness.js';
 import { runCommand } from '../src/run.js';
-import { CAPABILITIES, REMOTE_EXCLUSIVE_CAPABILITY } from '../src/capabilities.js';
+import { CAPABILITIES, REMOTE_EXCLUSIVE_CAPABILITY, EXECUTION_CEILING_CAPABILITY, advertisedCapabilities } from '../src/capabilities.js';
 import { runnerPrewarmCommand, pickPrewarmLane } from '../src/runner-prewarm.js';
 import { enqueue, tryStart } from '../src/scheduler.js';
 import { writeLease, removeLease, LEASE_STATE } from '../src/lease.js';
@@ -278,4 +279,79 @@ test('prewarm: refuses without a flagged lane, with an ambiguous choice, or with
   assert.match(empty.err[0], /neither remoteDeps nor remoteSetup/);
   assert.equal((await run(['--bogus'], { cfg })).exitCode, 2);
   assert.deepEqual(pickPrewarmLane({ fileLanes: { x: { prewarm: true } } }, 'y'), { error: 'lane "y" does not set prewarm: true' });
+});
+
+
+test('execution ceiling is carried separately in local tickets and remote payloads without changing reservation', async () => {
+  const local = setup({ cpuCores: 2, minCpuCores: 1, maxExecutionCpuCores: 1 });
+  const capped = await submit({ env: local.env, cwd: local.repoDir });
+  assert.equal(capped.result.exitCode, 0);
+  assert.equal(capped.ticket.maxExecutionCpuCores, 1);
+  assert.equal(capped.ticket.resources.cpuCores, 2);
+  assert.equal(capped.ticket.resources.minCpuCores, 1);
+  assert.equal(Object.hasOwn(capped.ticket.resources, 'maxExecutionCpuCores'), false);
+
+  const remote = setup({ cpuCores: 2, maxExecutionCpuCores: 3, remote: true });
+  writeGlobalConfig(remote.home, { runners: [makeRunner({ ssh: 'unused', root: tmpDir('execution-cap-runner') })] });
+  const forwarded = await submit({ env: remote.env, cwd: remote.repoDir });
+  assert.equal(forwarded.result.exitCode, 0);
+  assert.equal(forwarded.ticket.maxExecutionCpuCores, 3);
+  assert.equal(forwarded.ticket.remote.maxExecutionCpuCores, 3);
+  assert.equal(forwarded.ticket.remote.cpuCores, 2);
+
+  const ordinary = setup({ cpuCores: 2 });
+  const absent = await submit({ env: ordinary.env, cwd: ordinary.repoDir });
+  assert.equal(Object.hasOwn(absent.ticket, 'maxExecutionCpuCores'), false);
+});
+
+test('execution ceiling header override remains exact and invalid internal overrides fail before submission', async () => {
+  const lane = setup({ cpuCores: 2, maxExecutionCpuCores: 1 });
+  const overridden = await submit({ env: lane.env, cwd: lane.repoDir, maxExecutionCpuCoresOverride: 3 });
+  assert.equal(overridden.ticket.maxExecutionCpuCores, 3);
+  assert.equal(overridden.ticket.resources.cpuCores, 2);
+  for (const maxExecutionCpuCoresOverride of [0, -1, 1.5, Infinity, null]) {
+    const refused = await submit({ env: lane.env, cwd: lane.repoDir, maxExecutionCpuCoresOverride });
+    assert.equal(refused.result.exitCode, 64);
+    assert.equal(refused.ticket, null);
+    assert.match(refused.stderr, /maxExecutionCpuCores must be a positive integer/);
+  }
+});
+
+test('EXECUTION_CEILING_COMPATIBILITY: every placement path rejects old runners and missing quotas, while uncapped routing is unchanged', async () => {
+  const cfg = { ...DEFAULT_GLOBAL_CONFIG, runners: [] };
+  const base = { id: 'ceiling', lane: 'release', repoId: 'r', weight: 1, resources: { cpuCores: 14.4 }, remote: {} };
+  const sshBin = makeProbeSsh({ probes: {
+    oldQuota: { capabilities: [CPU_LIMIT_CAPABILITY] },
+    noQuota: { capabilities: [EXECUTION_CEILING_CAPABILITY] },
+    supported: { capabilities: [CPU_LIMIT_CAPABILITY, EXECUTION_CEILING_CAPABILITY] },
+  } });
+  for (const kind of ['place', 'rebind', 'rebalance']) {
+    const opts = selectionOptionsFor(kind, { ...base, maxExecutionCpuCores: 6 }, cfg, { root: tmpDir('cap-options') });
+    const draining = selectionOptionsFor(kind, { ...base, maxExecutionCpuCores: 6 }, cfg, { root: tmpDir('draining-cap-options'), draining: true, stuckLocally: true });
+    assert.ok(draining.requireCapabilities.includes(EXECUTION_CEILING_CAPABILITY), `${kind} draining`);
+    assert.ok(draining.requireCapabilities.includes(CPU_LIMIT_CAPABILITY), `${kind} draining`);
+    assert.ok(opts.requireCapabilities.includes(EXECUTION_CEILING_CAPABILITY), kind);
+    assert.ok(opts.requireCapabilities.includes(CPU_LIMIT_CAPABILITY), kind);
+    const selected = await selectRunner(runners('oldQuota', 'noQuota', 'supported'), { ...opts, sshBin });
+    assert.equal(selected.runner.name, 'supported', kind);
+    assert.match(selected.skipped.find((row) => row.name === 'oldQuota').reason, /execution-cpu-ceiling\/1/);
+    assert.match(selected.skipped.find((row) => row.name === 'noQuota').reason, /cpu-limit\/1/);
+    const none = await selectRunner(runners('oldQuota', 'noQuota'), { ...opts, sshBin });
+    assert.equal(none.runner, null, kind);
+    const plain = selectionOptionsFor(kind, base, cfg, { root: tmpDir('uncapped-options') });
+    assert.deepEqual(plain.requireCapabilities, []);
+    assert.equal((await selectRunner(runners('oldQuota'), { ...plain, sshBin })).runner.name, 'oldQuota');
+  }
+});
+
+test('EXECUTION_CEILING_ADVERTISEMENT: ceiling support is advertised only with usable quota enforcement', () => {
+  for (const quota of [{ mode: 'off', available: false }, { mode: 'off', available: true }, { mode: 'prefer', available: false }]) {
+    const caps = advertisedCapabilities({}, quota);
+    assert.equal(caps.includes(EXECUTION_CEILING_CAPABILITY), false);
+    assert.equal(caps.includes(CPU_LIMIT_CAPABILITY), false);
+  }
+  const caps = advertisedCapabilities({}, { mode: 'prefer', available: true });
+  assert.ok(caps.includes(EXECUTION_CEILING_CAPABILITY));
+  assert.ok(caps.includes(CPU_LIMIT_CAPABILITY));
+  assert.equal(CAPABILITIES.includes(EXECUTION_CEILING_CAPABILITY), false, 'never advertise unconditionally');
 });

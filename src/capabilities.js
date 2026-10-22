@@ -13,6 +13,7 @@ import { loadGlobalConfig, DEFAULT_GLOBAL_CONFIG, isDispatchOnly } from './confi
 import { CLASSES_CAPABILITY, resolveClasses } from './classes.js';
 import { CPU_LIMIT_CAPABILITY, resolveCpuLimit } from './cpu-limit.js';
 
+export const EXECUTION_CEILING_CAPABILITY = 'execution-cpu-ceiling/1';
 /** BRAIN-649: this runner honours `remoteExclusive` on intake (holds the whole runner while the lane runs). */
 export const REMOTE_EXCLUSIVE_CAPABILITY = 'remote-exclusive/1';
 export const SIM_SAFE_BACKFILL_CAPABILITY = 'sim-safe-backfill/1';
@@ -57,7 +58,7 @@ export function advertisedCapabilities(cfg, cpuLimit = { mode: 'off', available:
   return [
     ...CAPABILITIES,
     ...(cfg.remoteBlobCache ? [BLOB_CACHE_CAPABILITY] : []),
-    ...(cpuLimit.mode !== 'off' && cpuLimit.available ? [CPU_LIMIT_CAPABILITY] : []),
+    ...(cpuLimit.mode !== 'off' && cpuLimit.available ? [CPU_LIMIT_CAPABILITY, EXECUTION_CEILING_CAPABILITY] : []),
   ];
 }
 

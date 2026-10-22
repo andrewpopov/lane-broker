@@ -13,7 +13,7 @@ import { sanitizeKey } from '../src/config.js';
 import { paths, readJsonSafe, processStartTime, withLock, writeCancelMarkerFile } from '../src/state.js';
 import { writeLease } from '../src/lease.js';
 import { enqueue } from '../src/scheduler.js';
-import { remoteResultCommand } from '../src/remote-runner.js';
+import { remoteResultCommand, buildResult } from '../src/remote-runner.js';
 import { makeTmpDir } from './helpers/tmp.js';
 
 function tmpDir(prefix) {
@@ -1441,4 +1441,42 @@ test('lane remote-artifacts refuses a ticket id that is not a uuid, and reports 
   const none = await laneRun(['remote-artifacts', crypto.randomUUID(), '--root', root], { env });
   assert.equal(none.code, 1);
   assert.equal(none.stdout, '');
+});
+
+
+test('remote header rejects an invalid execution ceiling before running the command', async () => {
+  const { env } = freshShadowEnv();
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'execution-cap' });
+  for (const maxExecutionCpuCores of [0, -1, 1.5, Number.NaN, Infinity, null, '3']) {
+    const root = tmpDir('invalid-execution-cap-root');
+    const header = makeHeader({ maxExecutionCpuCores });
+    const { code } = await runOne(header, entries, { env, root, src });
+    assert.equal(code, 0);
+    const result = await getResult(header.ticketId, root, env);
+    assert.equal(result.kind, 'rejected');
+    assert.match(result.reason, /invalid maxExecutionCpuCores/);
+    assert.equal(result.remoteLaneId, null);
+  }
+});
+
+test('EXECUTION_ALLOCATION_WIRE: runner result preserves execution 6 separately from grant 14.4', () => {
+  const result = buildResult(makeHeader(), tmpDir('allocation-wire'), { kind: 'completed', exit: 0, grantedCpuCores: 14.4, executionCpuCores: 6 });
+  const wire = JSON.parse(JSON.stringify(result));
+  assert.equal(wire.grantedCpuCores, 14.4);
+  assert.equal(wire.executionCpuCores, 6);
+  const legacy = JSON.parse(JSON.stringify(buildResult(makeHeader(), tmpDir('allocation-legacy'), { kind: 'completed', exit: 0, grantedCpuCores: 14.4 })));
+  assert.equal(Object.hasOwn(legacy, 'executionCpuCores'), false);
+});
+
+test('EXECUTION_CEILING_DIRECT_REFUSAL: a modern runner with quotas off rejects before payload even without negotiation', async () => {
+  const { env } = freshShadowEnv();
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'execution-cap' });
+  const root = tmpDir('direct-cap-off');
+  const marker = path.join(root, 'payload-ran');
+  const header = makeHeader({ maxExecutionCpuCores: 6, argv: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran')`] });
+  const outcome = await runOne(header, entries, { env, root, src });
+  const result = await getResult(header.ticketId, root, env);
+  assert.equal(result.exit, 69);
+  assert.equal(fs.existsSync(marker), false, 'refused intake never runs the payload');
+  assert.match(outcome.err, /CPU_LIMIT_UNAVAILABLE.*maxExecutionCpuCores/);
 });

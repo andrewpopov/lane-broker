@@ -1285,10 +1285,11 @@ reads it refuses.
 `"cpuLimit": "off" | "prefer" | "require"` (global config, default `"off"`; any other value is a config error naming the key) is the
 opt-in for enforcing a lane's admitted CPU grant on a **Linux** host with a transient systemd scope, `CPUQuota=<grant x 100>%`.
 With `"prefer"` or `"require"` and a passing probe, the supervisor spawns each lane child inside `systemd-run --user --scope --unit=lane-<leaseId>.scope -p CPUQuota=<grant x 100>% --quiet --collect`,
-where the grant is the one admission gave (an elastic grant included, the same number as `LANE_BROKER_CPU_CORES`; a fractional grant rounds up).
+By default the grant is the one admission gave (an elastic grant included, the same number as `LANE_BROKER_CPU_CORES`; a fractional grant rounds up).
+A lane can set a separate execution ceiling as described below.
 `--scope` execs the command in place, so `nice`, cwd, env, stdout/stderr and the exit status are unchanged. A remote protocol-2 pipeline is the lane child,
 so its deps install, setup and command share one scope. The unit name is recorded on the lease as `cpuScopeUnit` (only when a scope was made).
-With `"off"`, on macOS, or under `"prefer"` with a failed probe, the spawn is exactly what it was before.
+Without an explicit execution ceiling, with `"off"`, on macOS, or under `"prefer"` with a failed probe, the spawn is exactly what it was before.
 Cancel semantics (L3): when a lease carries `cpuScopeUnit`, every way a lane is ended also runs `systemctl --user stop <unit>`, in addition to the
 process-group and tracked-descendant signals that always ran. The scope stop signals every process in the scope (control-group kill: SIGTERM, then SIGKILL
 after the unit's stop timeout), a `setsid`'d grandchild included, and returns once the scope is empty. It runs for `lane cancel` of an orphaned lease, for a
@@ -1305,6 +1306,25 @@ and the lease is released anyway. A scope that is already unloaded counts as sto
   `cpu-limit/1` is added to the advertised capabilities only when the mode is not `off` and the probe passed.
 - Quota limits CPU time over a period, not instantaneous concurrency, and it needs a user systemd instance with the `cpu` controller delegated;
   that is what the probe checks.
+
+### Execution ceiling (`maxExecutionCpuCores`)
+
+A lane may set a positive-integer `maxExecutionCpuCores` independently of its reservation:
+
+```json
+{ "lanes": { "release": { "cpuCores": 9, "remote": true, "remoteExclusive": true, "maxExecutionCpuCores": 6 } } }
+```
+
+Exclusive admission still reserves the whole runner and blocks competing jobs. Execution uses
+`min(admitted grant, maxExecutionCpuCores)` for both the systemd quota and `LANE_BROKER_CPU_CORES`.
+A 14.4-core exclusive reservation with a ceiling of 6 therefore executes at `CPUQuota=600%` and advertises
+6 cores to child workers. A grant below the ceiling remains the limit; fractional allocations use an exact quota.
+Omitting the field preserves existing quota rounding, environment and admission behavior.
+
+An explicit ceiling requires usable Linux quota enforcement. If it is off or unavailable, the ticket refuses
+with exit `69` and `CPU_LIMIT_UNAVAILABLE` before running its payload and releases any admitted reservation.
+Remote placement requires both `execution-cpu-ceiling/1` and `cpu-limit/1`, advertised only with usable quota enforcement; it cannot silently send the field to an older runner.
+Running leases and results distinguish `executionCpuCores` from the unchanged reserved/granted resources.
 
 ### Dispatch-only host (`localExecution`)
 

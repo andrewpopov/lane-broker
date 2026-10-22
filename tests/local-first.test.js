@@ -4,9 +4,12 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { laneRun, writeRepoConfig, waitFor, sleep, freshEnv } from './helpers.js';
 import { setup, tmpDir, probeCount, markerCmd, resultOf } from './remote-harness.js';
-import { paths, bootId } from '../src/state.js';
+import { paths, bootId, appendHistory } from '../src/state.js';
 import { writeLease, removeLease, LEASE_STATE } from '../src/lease.js';
 import { listQueue } from '../src/scheduler.js';
+import { localIneligibilityOf, selectionOptionsFor } from '../src/supervisor.js';
+import { EXECUTION_CEILING_CAPABILITY, CAPABILITIES } from '../src/capabilities.js';
+import { CPU_LIMIT_CAPABILITY } from '../src/cpu-limit.js';
 import { loadGlobalConfig, resolveTicketConfig, ConfigError } from '../src/config.js';
 
 /** BRAIN-442: `remotePolicy: "local-first"` queues locally and only becomes rebind-eligible after `localFirstWaitMs`. */
@@ -17,7 +20,7 @@ const TIMEOUT = { timeout: 120_000 };
  * The harness's fake runner shares the client's broker state, so its probe would report the client's own held lease as runner
  * load. Wrap ssh so a probe always reports an idle runner with plenty of headroom (the same trick remote-rebind.test.js uses).
  */
-function localFirstSetup({ lane = { remotePolicy: 'local-first' }, rebindMs = 200, cpuAdmissionPercent } = {}) {
+function localFirstSetup({ lane = { remotePolicy: 'local-first' }, rebindMs = 200, cpuAdmissionPercent, probeOverrides = {} } = {}) {
   const ctx = setup({ ssh: 'normal', cpuAdmissionPercent });
   const binDir = ctx.env.PATH.split(path.delimiter)[0];
   fs.renameSync(path.join(binDir, 'ssh'), path.join(binDir, 'ssh-real'));
@@ -34,6 +37,7 @@ if ((argv[argv.length - 1] || '').includes('remote-probe')) {
   p.running = 0;
   p.headroom = { cpuCores: 64, memoryBytes: 1e12 };
   p.capacity = { ...p.capacity, cpuCores: 64, memoryBytes: 1e12 };
+  Object.assign(p, ${JSON.stringify(probeOverrides)});
   process.stdout.write(JSON.stringify(p) + '\\n');
   process.exit(res.status == null ? 1 : res.status);
 }
@@ -184,3 +188,52 @@ test('config: a lane remotePolicy/localFirstWaitMs is validated, resolved, and i
   const adHoc = resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'zirk1' });
   assert.deepEqual([adHoc.remotePolicy, adHoc.localFirstWaitMs], ['local-first', 5]);
 });
+
+test('EXECUTION_CEILING_LOCAL_ELIGIBILITY: cached unavailable quotas disable local fallback and queue expiry, omitted caps preserve defaults', () => {
+  const ctx = localFirstSetup();
+  const cfg = JSON.parse(fs.readFileSync(path.join(ctx.home, 'config.json'), 'utf8'));
+  cfg.remoteQueueTimeoutMs = 1000;
+  const ticket = { id: 'cap', lane: 'default', resources: {}, remote: {}, maxExecutionCpuCores: 6 };
+  for (const quota of [undefined, { mode: 'off', available: false, reason: 'off' }, { mode: 'prefer', available: false, reason: 'unsupported-platform' }, { mode: 'require', available: false, reason: 'systemd-run-missing' }]) {
+    assert.match(localIneligibilityOf(ticket, cfg, quota).message, /CPU_LIMIT_UNAVAILABLE.*maxExecutionCpuCores/);
+    for (const kind of ['place', 'rebind', 'rebalance']) {
+      assert.equal(selectionOptionsFor(kind, ticket, cfg, { root: ctx.state, cpuLimit: quota }).requireProtocol2, false, `${kind}: no local expiry for impossible fallback`);
+    }
+    const { maxExecutionCpuCores, ...uncapped } = ticket;
+    assert.equal(localIneligibilityOf(uncapped, cfg, quota), null);
+    assert.equal(selectionOptionsFor('place', uncapped, cfg, { root: ctx.state, cpuLimit: quota }).requireProtocol2, true);
+  }
+  assert.equal(localIneligibilityOf(ticket, cfg, { mode: 'prefer', available: true }), null);
+});
+
+for (const scenario of [
+  { name: 'local-first', remotePolicy: 'local-first', probe: {} },
+  { name: 'local-first require unavailable', remotePolicy: 'local-first', probe: {}, cpuLimit: 'require', skip: process.platform === 'linux' },
+  { name: 'speed-aware', remotePolicy: 'speed-aware', probe: {} },
+  { name: 'remote queue', remotePolicy: 'remote-first', probe: { queued: 1 } },
+  { name: 'busy remote fallback', remotePolicy: 'remote-first', probe: { running: 1, headroom: { cpuCores: 0, memoryBytes: 1e12 } } },
+]) {
+  test(`EXECUTION_CEILING_ROUTING: ${scenario.name} seeks a quota-capable remote instead of choosing an incapable local host`, { ...TIMEOUT, skip: scenario.skip }, async () => {
+    const ctx = localFirstSetup({ lane: { remotePolicy: scenario.remotePolicy, maxExecutionCpuCores: 6 }, probeOverrides: {
+      capabilities: [...CAPABILITIES, CPU_LIMIT_CAPABILITY, EXECUTION_CEILING_CAPABILITY], ...scenario.probe,
+    } });
+    const cfgPath = path.join(ctx.home, 'config.json');
+    fs.writeFileSync(cfgPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(cfgPath, 'utf8')), cpuLimit: scenario.cpuLimit ?? 'off', remoteQueueTimeoutMs: 500, maxRemoteQueue: 2 }));
+    if (scenario.remotePolicy === 'speed-aware') {
+      const { repoId } = resolveTicketConfig({ cwd: ctx.repoDir, lane: 'default' });
+      for (let i = 0; i < 5; i += 1) appendHistory(ctx.state, { id: `speed-seed-${i}`, repo: repoId, lane: 'default', executor: 'local', exit: 0, startedAt: 1000, endedAt: 11_000 });
+    }
+    const marker = path.join(tmpDir('cap-routing'), 'payload');
+    const id = await submit(ctx, marker);
+    const waited = await laneRun(['wait', id, '--timeout', '60s'], { env: ctx.env });
+    // The routing fixture advertises support, but its real remote-exec has quotas off: it must still fail closed there.
+    assert.equal(waited.code, 69, waited.stderr);
+    const result = resultOf(ctx.state, id);
+    assert.equal(result.executor, 'remote', 'the capped ticket reached the selected runner, not local spawn/refusal');
+    assert.ok(probeCount(ctx.probeLogPath) > 0);
+    assert.equal(fs.existsSync(marker), false);
+    assert.doesNotMatch(admissionLog(ctx), /speed-placement:.*local: admits now/);
+    if (scenario.remotePolicy === 'local-first') assert.match(admissionLog(ctx), /local-first: not locally eligible.*CPU_LIMIT_UNAVAILABLE/);
+    if (scenario.name === 'busy remote fallback') assert.match(admissionLog(ctx), /every runner is busy and this lane cannot run locally/);
+  });
+}

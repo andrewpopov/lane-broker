@@ -659,6 +659,10 @@ function validateRepoConfig(cfg, sourcePath) {
       assert(Number.isFinite(lane.cpuCores) && lane.cpuCores > 0, `${sourcePath}: lane "${name}".cpuCores must be a positive number`);
       assert(lane.cpuCores <= MAX_LANE_CPU_CORES, `${sourcePath}: lane "${name}".cpuCores must be <= ${MAX_LANE_CPU_CORES}`);
     }
+    if (lane.maxExecutionCpuCores !== undefined) {
+      assert(Number.isInteger(lane.maxExecutionCpuCores) && lane.maxExecutionCpuCores > 0,
+        `${sourcePath}: lane "${name}".maxExecutionCpuCores must be a positive integer`);
+    }
     if (lane.minCpuCores !== undefined) {
       assert(Number.isFinite(lane.minCpuCores) && lane.minCpuCores > 0, `${sourcePath}: lane "${name}".minCpuCores must be a positive number`);
       // an unset cpuCores resolves to weight (resolveTicketResources), so that is the claim the floor sits under
@@ -1143,7 +1147,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   if (isDeclaredLane) {
     laneCfg = repoConfig.lanes[laneName];
   } else if (undeclaredTemplateName) {
-    // Inherit weight/cpuCores/minCpuCores/memoryBytes/nice/noProgressTimeoutMs/silenceTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteOmitEscapingSymlinks/remoteExclude/remoteArtifacts/remoteArtifactsOn/class/priority/aging/cache/rightSize
+    // Inherit weight/cpuCores/minCpuCores/maxExecutionCpuCores/memoryBytes/nice/noProgressTimeoutMs/silenceTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteOmitEscapingSymlinks/remoteExclude/remoteArtifacts/remoteArtifactsOn/class/priority/aging/cache/rightSize
     // from the named declared lane, keeping this lane's OWN key/name. Not
     // inherited: `localRefused` (stays default false), the template's named
     // conflicts (only the `*` wildcard universe below reaches this lane, same
@@ -1154,6 +1158,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       weight: templateCfg.weight,
       cpuCores: templateCfg.cpuCores,
       minCpuCores: templateCfg.minCpuCores,
+      maxExecutionCpuCores: templateCfg.maxExecutionCpuCores,
       memoryBytes: templateCfg.memoryBytes,
       nice: templateCfg.nice,
       noProgressTimeoutMs: templateCfg.noProgressTimeoutMs,
@@ -1202,6 +1207,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     weight: laneCfg.weight,
     cpuCores: Number.isFinite(laneCfg.cpuCores) ? laneCfg.cpuCores : null,
     minCpuCores: Number.isFinite(laneCfg.minCpuCores) ? laneCfg.minCpuCores : null,
+    ...(laneCfg.maxExecutionCpuCores !== undefined ? { maxExecutionCpuCores: laneCfg.maxExecutionCpuCores } : {}),
     memoryBytes: Number.isFinite(laneCfg.memoryBytes) ? laneCfg.memoryBytes : null,
     localRefused: Boolean(laneCfg.localRefused),
     // null (not defaulted here) when the lane doesn't declare its own nice:
