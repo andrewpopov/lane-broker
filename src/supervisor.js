@@ -27,7 +27,7 @@ import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processSt
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
 import { reloadGlobalConfig, isDispatchOnly } from './config.js';
-import { enforceCpuLimitStartup, CpuLimitUnavailableError, spawnInCpuScope, stopLeaseCpuScope } from './cpu-limit.js';
+import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, spawnInCpuScope, stopLeaseCpuScope } from './cpu-limit.js';
 import { stateHome } from './state.js';
 import { readRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
@@ -1431,8 +1431,11 @@ async function main() {
    * BRAIN-634: this host became (or is) dispatch-only while the ticket sits in, or just left, the local queue. Never start it:
    * 76 when it is remote-eligible (retry once a runner has room), else 69. `lease` is true once tryStart has already leased it.
    */
-  async function refuseDispatchOnlyAndExit({ lease = false } = {}) {
-    const refusal = dispatchOnlyRefusal(enriched.lane, { retryable: Boolean(enriched.remote), reason: 'queued locally' });
+  async function refuseDispatchOnlyAndExit(options = {}) {
+    return refuseLocalAndExit(dispatchOnlyRefusal(enriched.lane, { retryable: Boolean(enriched.remote), reason: 'queued locally' }), options);
+  }
+
+  async function refuseLocalAndExit(refusal, { lease = false } = {}) {
     process.stderr.write(refusal.message);
     await underLock(root, () => dequeueSync(root, ticket.id));
     if (lease) removeLease(root, ticket.id);
@@ -1619,19 +1622,30 @@ async function main() {
   // the host may have turned dispatch-only since admission (config flip or marker): re-read it at the last moment, release the lease unused
   if (isDispatchOnly(reloadGlobalConfig(globalCfg))) await refuseDispatchOnlyAndExit({ lease: true });
   // BRAIN-651 L2: the admitted grant (elastic included) caps the whole tree; a remote protocol-2 pipeline is this same child, so deps, setup and command share it
-  const { child, unit: cpuScope } = spawnInCpuScope(spawn, {
-    resolved: cpuLimit,
-    leaseId: ticket.id,
-    grantCores: leaseCpuCores(started.lease),
-    cmd,
-    args,
-    options: {
-      cwd: ticket.cwd,
-      detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      env: childEnv({ ...ticket, priorityAdmitted: started.lease.priorityAdmitted }, process.env, leaseCpuCores(started.lease), started.lease.classEnforcement),
-    },
-  });
+  let executionCpuCores;
+  let scopedChild;
+  try {
+    executionCpuCores = resolveExecutionCpuCores(leaseCpuCores(started.lease), ticket.maxExecutionCpuCores);
+    scopedChild = spawnInCpuScope(spawn, {
+      resolved: cpuLimit,
+      leaseId: ticket.id,
+      grantCores: executionCpuCores,
+      requireQuota: ticket.maxExecutionCpuCores !== undefined,
+      cmd,
+      args,
+      options: {
+        cwd: ticket.cwd,
+        detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: childEnv({ ...ticket, priorityAdmitted: started.lease.priorityAdmitted }, process.env, executionCpuCores, started.lease.classEnforcement),
+      },
+    });
+  } catch (err) {
+    if (!(err instanceof CpuLimitUnavailableError)) throw err;
+    await refuseLocalAndExit({ exitCode: LOCAL_REFUSED_EXIT_CODE, message: `lane run: ${err.message}\n` }, { lease: true });
+  }
+  const { child, unit: cpuScope } = scopedChild;
+  if (ticket.maxExecutionCpuCores !== undefined) started.lease.executionCpuCores = executionCpuCores;
 
   const logWriter = new CappedLogWriter(ticket.logPath);
   // ticket.forwardOutput (BRAIN-308) is set explicitly by run.js's foreground
@@ -1818,6 +1832,7 @@ async function main() {
     const writeResult = (finalResult) => {
       // BRAIN-360: an elastic lease's grant rides on the result (a runner relays it to its submitter)
       if (started.lease.grantedCpuCores !== undefined) finalResult = { ...finalResult, grantedCpuCores: started.lease.grantedCpuCores };
+      if (ticket.maxExecutionCpuCores !== undefined) finalResult = { ...finalResult, executionCpuCores };
       // BRAIN-361: what the lease actually used, from the last heartbeat's lease file (absent when no
       // heartbeat ever observed it); additive, and relayed by a runner to its submitter like the grant.
       const finalLease = readLease(root, ticket.id);

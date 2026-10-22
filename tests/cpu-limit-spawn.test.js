@@ -4,8 +4,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { makeTmpDir } from './helpers/tmp.js';
-import { spawnInCpuScope, cpuScopeUnit, resolveCpuLimit } from '../src/cpu-limit.js';
-import { runningLease } from '../src/supervisor.js';
+import { spawnInCpuScope, cpuScopeUnit, resolveCpuLimit, resolveExecutionCpuCores } from '../src/cpu-limit.js';
+import { childEnv, runningLease } from '../src/supervisor.js';
 
 /** BRAIN-651 L2: a lane child runs inside a CPUQuota scope sized to its admitted grant. Unit tests inject `spawn`; the integration test is Linux-only. */
 
@@ -34,6 +34,40 @@ test('CPU_GRANT_WRAPPED: grants 2 and 4 spawn systemd-run with CPUQuota = 100% p
     assert.deepEqual(calls[0].args, ['--user', '--scope', `--unit=lane-${LEASE}.scope`, '-p', `CPUQuota=${quota}`, '--quiet', '--collect', '--', '/usr/bin/nice', '-n', '5', 'npm', 'test']);
     assert.equal(calls[0].options, OPTIONS, 'cwd, env, detached and stdio are handed through untouched');
   }
+});
+
+test('EXECUTION_CEILING: quota and worker budget use min(actual grant, ceiling) without changing the reservation', () => {
+  for (const [grant, cap, expected] of [[14.4, 6, 6], [2, 6, 2], [1.5, 6, 1.5]]) {
+    const lease = { id: LEASE, key: 'r:release', exclusive: true, resources: { cpuCores: grant }, grantedCpuCores: grant };
+    const allocation = resolveExecutionCpuCores(grant, cap);
+    const { fn, calls } = recordingSpawn();
+    run(fn, { grantCores: allocation, requireQuota: true, options: { ...OPTIONS, env: childEnv(lease, {}, allocation) } });
+    assert.equal(allocation, expected);
+    assert.ok(calls[0].args.includes(`CPUQuota=${expected * 100}%`));
+    assert.equal(calls[0].options.env.LANE_BROKER_CPU_CORES, String(expected));
+    assert.equal(lease.resources.cpuCores, grant);
+    assert.equal(lease.grantedCpuCores, grant);
+    const live = runningLease({ ...lease, executionCpuCores: allocation }, { childPgid: 42, startedAt: 1 });
+    assert.equal(live.executionCpuCores, expected);
+    assert.equal(live.grantedCpuCores, grant);
+  }
+  assert.equal(resolveExecutionCpuCores(14.4), 14.4, 'omitted ceiling preserves the original worker budget');
+  for (const bad of [0, -1, 1.5, Infinity, NaN, '6', null]) assert.throws(() => resolveExecutionCpuCores(14.4, bad), /positive integer/);
+});
+
+test('EXECUTION_CEILING_FAIL_CLOSED: quota off, unsupported or unavailable never spawns a child', () => {
+  for (const over of [
+    { resolved: { mode: 'off', available: false, reason: 'off' } },
+    { resolved: { mode: 'prefer', available: false, reason: 'systemd-run-missing' } },
+    { platform: 'darwin' },
+    { resolved: undefined },
+    { grantCores: undefined },
+  ]) {
+    const { fn, calls } = recordingSpawn();
+    assert.throws(() => run(fn, { requireQuota: true, ...over }), /CPU_LIMIT_UNAVAILABLE.*maxExecutionCpuCores/);
+    assert.equal(calls.length, 0);
+  }
+  assert.throws(() => resolveExecutionCpuCores(undefined, 6), /CPU_LIMIT_UNAVAILABLE/);
 });
 
 test('a fractional grant rounds the quota up, never below what admission reserved', () => {

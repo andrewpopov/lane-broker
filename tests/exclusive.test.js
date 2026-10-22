@@ -204,6 +204,26 @@ for (const mode of MODES) {
   }
 }
 
+test('EXECUTION_CEILING_EXCLUSIVE: a 14.4-core reservation still blocks competitors when execution is capped at 6', async () => {
+  const state = stateFor('legacy');
+  const cfg = baseCfg();
+  writeLease(state, heldLease('exclusive-cap', 'r:release', cfg.capacity, {
+    exclusive: true,
+    resources: { cpuCores: 14.4, memoryBytes: GIB },
+    grantedCpuCores: 14.4,
+    executionCpuCores: 6,
+  }));
+  const other = ticket('other');
+  await enqueue(state, other);
+  const denied = await poll(state, other, cfg);
+  assert.equal(denied.started, false);
+  assert.equal(denied.reason, 'exclusive-held');
+  const held = listLeases(state).find((lease) => lease.id === 'exclusive-cap');
+  assert.equal(held.resources.cpuCores, 14.4);
+  assert.equal(held.grantedCpuCores, 14.4);
+  assert.equal(held.executionCpuCores, 6);
+});
+
 test('AC1: while the exclusive runs, a non-conflicting ticket of any weight is denied', async () => {
   const state = stateFor('legacy');
   const cfg = baseCfg();

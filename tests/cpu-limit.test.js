@@ -1,6 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
+import fs from 'node:fs';
+import { listLeases } from '../src/lease.js';
+import { listQueue } from '../src/scheduler.js';
+import { paths } from '../src/state.js';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun } from './helpers.js';
 import {
   probeCpuLimit,
@@ -51,7 +55,8 @@ test('cpuLimitArgv: CPUQuota is 100% per granted core, and the original argv fol
   for (const [grant, quota] of [[1, '100%'], [2, '200%'], [4, '400%']]) {
     assert.deepEqual(cpuLimitArgv(grant, ['npm', 'test']), ['systemd-run', '--user', '--scope', '-p', `CPUQuota=${quota}`, '--quiet', '--collect', '--', 'npm', 'test']);
   }
-  for (const bad of [0, 1.5, -1, undefined, '2']) assert.throws(() => cpuLimitArgv(bad, ['x']), /positive integer/);
+  assert.ok(cpuLimitArgv(1.5, ['x']).includes('CPUQuota=150%'));
+  for (const bad of [0, -1, Infinity, NaN, undefined, '2']) assert.throws(() => cpuLimitArgv(bad, ['x']), /positive and finite/);
 });
 
 test('resolveCpuLimit: mode off never probes', () => {
@@ -121,3 +126,24 @@ test('supervisor: cpuLimit "require" on a host without quotas refuses the run by
   assert.equal(res.code, 69, res.stderr);
   assert.match(res.stderr, /CPU_LIMIT_UNAVAILABLE.*unsupported-platform/);
 });
+
+for (const mode of ['off', 'prefer']) {
+  test(`EXECUTION_CEILING_REFUSED: cpuLimit ${mode} without enforcement publishes terminal refusal and releases exclusive reservation before payload`, { skip: mode === 'prefer' && process.platform === 'linux' }, async () => {
+    const { base, home, state, env } = freshEnv();
+    writeGlobalConfig(home, { version: 1, cpuLimit: mode, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1 });
+    const repoDir = path.join(base, 'repo');
+    writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, exclusive: true, maxExecutionCpuCores: 6 } } });
+    const res = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', process.execPath, '-e', 'console.log("PAYLOAD_RAN")'], { env, cwd: repoDir });
+    assert.equal(res.code, 69, res.stderr);
+    assert.match(res.stderr, /CPU_LIMIT_UNAVAILABLE.*maxExecutionCpuCores/);
+    assert.doesNotMatch(res.stdout, /PAYLOAD_RAN/);
+    const results = fs.readdirSync(paths(state).results).filter((name) => name.endsWith('.json'));
+    assert.equal(results.length, 1, 'the supervisor published a terminal result');
+    const terminal = JSON.parse(fs.readFileSync(path.join(paths(state).results, results[0]), 'utf8'));
+    assert.equal(terminal.exit, 69);
+    assert.match(terminal.error, /CPU_LIMIT_UNAVAILABLE.*maxExecutionCpuCores/);
+    assert.equal(terminal.startedAt, null);
+    assert.deepEqual(listLeases(state), [], 'refusal released the admitted exclusive reservation');
+    assert.deepEqual(listQueue(state), [], 'refusal removed the queued ticket');
+  });
+}
