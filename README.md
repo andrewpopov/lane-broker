@@ -776,9 +776,16 @@ ordinary low-priority ticket on the runner (not preempted by later work).
   `npm ci --no-audit --no-fund`, or from the runner's installed-deps cache
   when it has seen the same lockfile and environment before (below).
 - `remoteDepsCache`: `false` opts this lane out of that cache.
-- `remoteDepsCacheRootScriptsSafe`: `true` declares that the repo's root
-  install/prepare scripts leave `node_modules` alone, so a cached tree is
-  safe despite them.
+- `remoteDepsCacheRootScriptsSafe`: `true` declares that the root lifecycle
+  scripts produce reusable dependency trees. In a workspace repository, all
+  repository source bytes and executable modes are keyed: a deterministic
+  generator may write inside dependency trees when its inputs are entirely
+  covered by that key and the keyed install environment. Writes outside those
+  trees prevent publication. Custom root scripts are not replayed on a hit;
+  their generated dependency output must be complete in the cached tree.
+  In other repositories, root scripts must leave `node_modules` alone because
+  their source inputs are not keyed. Scripts reading external state or fetching
+  unpinned generator inputs do not satisfy this declaration; leave the flag off.
 - `remoteSetup`: argv arrays run in the repo root after deps, before the
   command.
 - `remoteExclude` (BRAIN-642): an array of at most 64 patterns (each at most 256 characters) naming paths to leave out of
@@ -872,8 +879,9 @@ reason.
   `postprepare`; from npm 11.9.0's `arborist/reify.js` and `lib/commands/ci.js`)
   must be an exact command on the allowlist (today only
   `git config core.hooksPath .githooks || true`), or the lane must declare
-  `remoteDepsCacheRootScriptsSafe: true` ("these scripts do not touch
-  `node_modules`").
+  `remoteDepsCacheRootScriptsSafe: true` under the lifecycle-input contract above.
+  Declaring a workspace generator safe requires a cold/warm restore check and
+  a changed-input check that verifies regenerated output, not just a cache hit.
 - **Key**: sha256 of the lockfile and `package.json` bytes, the `.npmrc` of
   that dir and of the repo root, the bytes of every `file:` tarball the
   lockfile names, the node version, platform and arch, the glibc runtime

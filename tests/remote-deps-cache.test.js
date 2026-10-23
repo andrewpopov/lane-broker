@@ -584,6 +584,39 @@ function workspaceProbe(marker) {
   return [process.execPath, '-e', script];
 }
 
+test('workspace root generators restore keyed output and regenerate after source changes', async () => {
+  const s = setupWithNpmSpy();
+  const files = workspaceRepoFiles();
+  const manifest = JSON.parse(files['package.json']);
+  manifest.scripts = { postinstall: 'node generate.cjs' };
+  files['package.json'] = JSON.stringify(manifest);
+  const config = JSON.parse(files['.lane-broker.json']);
+  config.lanes.default.remoteDepsCacheRootScriptsSafe = true;
+  files['.lane-broker.json'] = JSON.stringify(config);
+  files['generate.cjs'] = `const fs = require('fs');
+    fs.writeFileSync('node_modules/generated-value.json', JSON.stringify({
+      value: fs.readFileSync('packages/api/schema.txt', 'utf8')
+    }));`;
+  const run = async (value) => {
+    const repoDir = makeGitWorktree({ ...files, 'packages/api/schema.txt': value });
+    const marker = path.join(tmpDir('deps-cache-generator-marker'), 'probe.json');
+    const probe = `require('fs').copyFileSync('node_modules/generated-value.json', ${JSON.stringify(marker)})`;
+    const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', process.execPath, '-e', probe], { env: s.env, cwd: repoDir });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(JSON.parse(fs.readFileSync(marker, 'utf8')).value, value);
+    return { ...result, row: lastRow(s.state) };
+  };
+  const first = await run('initial schema');
+  assert.equal(first.row.depsCache, 'miss');
+  assert.match(first.stderr, /published=yes/);
+  const second = await run('initial schema');
+  assert.equal(second.row.depsCache, 'hit');
+  assert.equal(s.npmCiCalls(), 1, 'generated output survives a hit in another work directory');
+  const changed = await run('changed schema');
+  assert.equal(changed.row.depsCache, 'miss');
+  assert.equal(s.npmCiCalls(), 2, 'new generator inputs require a new install');
+});
+
 test('an npm-workspace repo is cached: the second run is a hit that recreates the workspace links and the nested workspace node_modules (BRAIN-466)', async (t) => {
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(workspaceRepoFiles());
