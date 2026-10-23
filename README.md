@@ -5,7 +5,7 @@ test suites with no awareness of each other; `lane run` serializes conflicting
 lanes, caps how many heavy lanes run at once, and refuses to start new work
 while the machine is already overloaded — instead of every agent guessing.
 
-Zero runtime dependencies — Node `child_process`/`fs`/`os` only (Node ≥ 20).
+The scheduler uses Node primitives (Node ≥ 20); the optional Postgres store uses the `pg` dependency listed in `package.json`.
 
 ## Install
 
@@ -17,7 +17,7 @@ cache and `lane` breaks machine-wide. Pack first, then install the tarball:
 
 ```sh
 tmp=$(mktemp -d)
-(cd "$tmp" && npm pack "github:andrewpopov/lane-broker#v0.4.0")
+(cd "$tmp" && npm pack "github:andrewpopov/lane-broker#v0.58.0")
 npm install -g "$tmp"/*.tgz
 rm -rf "$tmp"
 ```
@@ -776,9 +776,16 @@ ordinary low-priority ticket on the runner (not preempted by later work).
   `npm ci --no-audit --no-fund`, or from the runner's installed-deps cache
   when it has seen the same lockfile and environment before (below).
 - `remoteDepsCache`: `false` opts this lane out of that cache.
-- `remoteDepsCacheRootScriptsSafe`: `true` declares that the repo's root
-  install/prepare scripts leave `node_modules` alone, so a cached tree is
-  safe despite them.
+- `remoteDepsCacheRootScriptsSafe`: `true` declares that the root lifecycle
+  scripts produce reusable dependency trees. In a workspace repository, all
+  repository source bytes and executable modes are keyed: a deterministic
+  generator may write inside dependency trees when its inputs are entirely
+  covered by that key and the keyed install environment. Writes outside those
+  trees prevent publication. Custom root scripts are not replayed on a hit;
+  their generated dependency output must be complete in the cached tree.
+  In other repositories, root scripts must leave `node_modules` alone because
+  their source inputs are not keyed. Scripts reading external state or fetching
+  unpinned generator inputs do not satisfy this declaration; leave the flag off.
 - `remoteSetup`: argv arrays run in the repo root after deps, before the
   command.
 - `remoteExclude` (BRAIN-642): an array of at most 64 patterns (each at most 256 characters) naming paths to leave out of
@@ -844,8 +851,26 @@ reason.
   or `npm-shrinkwrap.json` when present) must be v2 or v3 with a `packages`
   map, and every non-root entry must be an `https://registry.npmjs.org/`
   tarball with `integrity`, a `git+...#<40-hex sha>`, or a `file:*.tgz` with
-  `integrity`. `file:` dirs, links, workspaces, unresolved entries and
-  anything else are refused. An entry with no `resolved` is allowed only when
+  `integrity`. `file:` dirs, unresolved entries and anything else are
+  refused. An npm-workspace repo (BRAIN-466) is eligible: a `link: true` entry
+  whose `resolved` is a plain relative path inside the repo, with a lock entry
+  of its own, is accepted; one that is absolute or escapes the repo with `..`
+  is refused, as is any path that is not plain (trailing slash, backslash,
+  `.`/`..`/empty segment, case alias) or whose real path passes through a
+  symlink (checked before every read, copy, move and delete). The
+  `workspaces` globs of the root `package.json` are re-discovered on every run
+  and must equal the lock's links exactly (empty included, whenever the root
+  declares `workspaces`), with unique package names. Only plain segments, `*`
+  and `**` are understood: a `!` pattern, any other glob syntax or the object
+  form is refused. A workspace with a lifecycle script, `binding.gyp` or lock
+  install script is always ineligible, even with `remoteDepsCacheRootScriptsSafe`.
+  The key covers the discovered set and each workspace's path, lock entry and
+  whole `package.json` (canonical JSON). A workspace declaring `bin` is refused until its executable links can be restored. When a dependency has an install script, or the lane declares root scripts safe, the key also covers repository source bytes and executable modes outside `.git` and `node_modules`. Source links escaping that keyed tree are refused; an install that writes outside dependency trees still cannot publish a cache entry.
+  The store holds only installed packages, never the workspace symlinks or
+  sources, and records which workspaces had a nested `node_modules`: a hit
+  recreates each `node_modules/<name>` link (relative, as `npm ci` makes it)
+  and restores exactly those trees, and it is refused (so `npm ci` runs) if any
+  workspace already has a `node_modules` or a stored tree is missing. An entry with no `resolved` is allowed only when
   an enclosing package bundles it (the parent's `bundleDependencies`, or
   `inDepBundle`) and that parent passes the same checks; a top-level
   bundled entry gets the normal checks. Every root script `npm ci` can run
@@ -854,8 +879,9 @@ reason.
   `postprepare`; from npm 11.9.0's `arborist/reify.js` and `lib/commands/ci.js`)
   must be an exact command on the allowlist (today only
   `git config core.hooksPath .githooks || true`), or the lane must declare
-  `remoteDepsCacheRootScriptsSafe: true` ("these scripts do not touch
-  `node_modules`").
+  `remoteDepsCacheRootScriptsSafe: true` under the lifecycle-input contract above.
+  Declaring a workspace generator safe requires a cold/warm restore check and
+  a changed-input check that verifies regenerated output, not just a cache hit.
 - **Key**: sha256 of the lockfile and `package.json` bytes, the `.npmrc` of
   that dir and of the repo root, the bytes of every `file:` tarball the
   lockfile names, the node version, platform and arch, the glibc runtime

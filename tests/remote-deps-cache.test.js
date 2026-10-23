@@ -503,3 +503,155 @@ test('with ignore-scripts in effect (from .npmrc) a hit does not replay the root
   assert.equal(hit.row.depsCache, 'hit');
   assert.equal(hit.probe.hooksPath, null, 'and neither did the hit');
 });
+
+// ---- BRAIN-466: npm workspaces ----
+
+/**
+ * A real npm-workspace repo, built offline: the root depends on hello-tool 1.0.0 and the `@x/api` workspace on
+ * hello-tool 2.0.0 (both local tarballs), so npm installs the second under `packages/api/node_modules`.
+ * `@x/web` depends on `@x/api`, which npm satisfies with a workspace link.
+ */
+const workspaceFixture = (() => {
+  let built;
+  return () => {
+    if (built) return built;
+    const dir = tmpDir('deps-cache-workspace-fixture');
+    const npmEnv = { ...process.env, HOME: dir, npm_config_cache: path.join(dir, 'cache'), npm_config_userconfig: path.join(dir, 'userrc') };
+    const app = path.join(dir, 'app');
+    const tarballs = {};
+    for (const version of ['1.0.0', '2.0.0']) {
+      const tool = path.join(dir, `tool-${version}`);
+      fs.mkdirSync(tool, { recursive: true });
+      fs.writeFileSync(path.join(tool, 'package.json'), JSON.stringify({ name: 'hello-tool', version }));
+      fs.writeFileSync(path.join(tool, 'index.js'), `module.exports = ${JSON.stringify(version)};\n`);
+      fs.mkdirSync(app, { recursive: true });
+      execFileSync(REAL_NPM, ['pack', '--silent', '--pack-destination', app], { cwd: tool, env: npmEnv });
+      tarballs[`hello-tool-${version}.tgz`] = fs.readFileSync(path.join(app, `hello-tool-${version}.tgz`));
+    }
+    const write = (rel, content) => {
+      fs.mkdirSync(path.dirname(path.join(app, rel)), { recursive: true });
+      fs.writeFileSync(path.join(app, rel), content);
+    };
+    write('package.json', JSON.stringify({ name: 'ws-root', version: '1.0.0', private: true, workspaces: ['packages/*'], dependencies: { 'hello-tool': 'file:./hello-tool-1.0.0.tgz' } }));
+    write('packages/api/package.json', JSON.stringify({ name: '@x/api', version: '1.0.0', main: 'index.js', dependencies: { 'hello-tool': 'file:../../hello-tool-2.0.0.tgz' } }));
+    write('packages/api/index.js', 'module.exports = { source: "workspace source", tool: require("hello-tool") };\n');
+    write('packages/web/package.json', JSON.stringify({ name: '@x/web', version: '1.0.0', dependencies: { '@x/api': '*' } }));
+    execFileSync(REAL_NPM, ['install', '--offline', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: app, env: npmEnv });
+    built = {
+      tarballs,
+      files: {
+        'package.json': fs.readFileSync(path.join(app, 'package.json'), 'utf8'),
+        'package-lock.json': fs.readFileSync(path.join(app, 'package-lock.json'), 'utf8'),
+        'packages/api/package.json': fs.readFileSync(path.join(app, 'packages/api/package.json'), 'utf8'),
+        'packages/api/index.js': fs.readFileSync(path.join(app, 'packages/api/index.js'), 'utf8'),
+        'packages/web/package.json': fs.readFileSync(path.join(app, 'packages/web/package.json'), 'utf8'),
+      },
+    };
+    return built;
+  };
+})();
+
+function workspaceRepoFiles() {
+  const base = workspaceFixture();
+  return {
+    ...base.files,
+    ...Object.fromEntries(Object.entries(base.tarballs).map(([name, bytes]) => [name, bytes])),
+    '.npmrc': NPMRC,
+    '.lane-broker.json': JSON.stringify({ version: 1, lanes: { default: { weight: 1, remote: true, remoteDeps: ['.'] } } }),
+  };
+}
+
+/** Run in the work dir: what `@x/api` resolves to, whether its link is a relative symlink, and which hello-tool each side sees. */
+function workspaceProbe(marker) {
+  const script = `
+    const fs = require('fs');
+    const path = require('path');
+    const api = require('@x/api');
+    const web = require.resolve('@x/api', { paths: [path.join(process.cwd(), 'packages/web')] });
+    fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({
+      source: api.source,
+      apiTool: api.tool,
+      rootTool: require('hello-tool'),
+      linkTarget: fs.readlinkSync('node_modules/@x/api'),
+      isLink: fs.lstatSync('node_modules/@x/api').isSymbolicLink(),
+      resolvedReal: fs.realpathSync(require.resolve('@x/api')),
+      webResolvedReal: fs.realpathSync(web),
+      cwd: fs.realpathSync(process.cwd()),
+      nestedIsDir: fs.lstatSync('packages/api/node_modules/hello-tool').isDirectory(),
+      stashLeft: fs.existsSync('node_modules/.lane-workspaces'),
+    }));
+  `;
+  return [process.execPath, '-e', script];
+}
+
+test('workspace root generators restore keyed output and regenerate after source changes', async () => {
+  const s = setupWithNpmSpy();
+  const files = workspaceRepoFiles();
+  const manifest = JSON.parse(files['package.json']);
+  manifest.scripts = { postinstall: 'node generate.cjs' };
+  files['package.json'] = JSON.stringify(manifest);
+  const config = JSON.parse(files['.lane-broker.json']);
+  config.lanes.default.remoteDepsCacheRootScriptsSafe = true;
+  files['.lane-broker.json'] = JSON.stringify(config);
+  files['generate.cjs'] = `const fs = require('fs');
+    fs.writeFileSync('node_modules/generated-value.json', JSON.stringify({
+      value: fs.readFileSync('packages/api/schema.txt', 'utf8')
+    }));`;
+  const run = async (value) => {
+    const repoDir = makeGitWorktree({ ...files, 'packages/api/schema.txt': value });
+    const marker = path.join(tmpDir('deps-cache-generator-marker'), 'probe.json');
+    const probe = `require('fs').copyFileSync('node_modules/generated-value.json', ${JSON.stringify(marker)})`;
+    const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', process.execPath, '-e', probe], { env: s.env, cwd: repoDir });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(JSON.parse(fs.readFileSync(marker, 'utf8')).value, value);
+    return { ...result, row: lastRow(s.state) };
+  };
+  const first = await run('initial schema');
+  assert.equal(first.row.depsCache, 'miss');
+  assert.match(first.stderr, /published=yes/);
+  const second = await run('initial schema');
+  assert.equal(second.row.depsCache, 'hit');
+  assert.equal(s.npmCiCalls(), 1, 'generated output survives a hit in another work directory');
+  const changed = await run('changed schema');
+  assert.equal(changed.row.depsCache, 'miss');
+  assert.equal(s.npmCiCalls(), 2, 'new generator inputs require a new install');
+});
+
+test('an npm-workspace repo is cached: the second run is a hit that recreates the workspace links and the nested workspace node_modules (BRAIN-466)', async (t) => {
+  const s = setupWithNpmSpy();
+  const repoDir = makeGitWorktree(workspaceRepoFiles());
+  const run = async () => {
+    const marker = path.join(tmpDir('deps-cache-ws-marker'), 'probe.json');
+    const r = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...workspaceProbe(marker)], { env: s.env, cwd: repoDir });
+    return { ...r, probe: fs.existsSync(marker) ? JSON.parse(fs.readFileSync(marker, 'utf8')) : null, row: lastRow(s.state) };
+  };
+
+  const first = await run();
+  assert.equal(first.code, 0, first.stderr);
+  assert.equal(first.row.depsCache, 'miss');
+  assert.match(first.stderr, /published=yes/);
+  assert.equal(s.npmCiCalls(), 1);
+
+  const second = await run();
+  assert.equal(second.code, 0, second.stderr);
+  assert.equal(second.row.depsCache, 'hit');
+  assert.equal(s.npmCiCalls(), 1, 'a hit runs no npm ci');
+  t.diagnostic(`workspace dependency setup: miss ${first.row.depsMs}ms, hit ${second.row.depsMs}ms; same runner and fixture`);
+  assert.ok(second.row.depsMs < first.row.depsMs, 'restoring a workspace cache entry beats reinstalling it');
+  for (const { probe } of [first, second]) {
+    assert.equal(probe.source, 'workspace source');
+    assert.equal(probe.isLink, true);
+    assert.equal(probe.linkTarget, '../../packages/api', 'a relative link, as npm ci makes it');
+    assert.equal(probe.resolvedReal, path.join(probe.cwd, 'packages/api/index.js'), 'the link leads to the workspace source in THIS run\'s work dir');
+    assert.equal(probe.webResolvedReal, probe.resolvedReal);
+    assert.equal(probe.rootTool, '1.0.0');
+    assert.equal(probe.apiTool, '2.0.0', 'the workspace\'s own conflicting dependency is restored under packages/api/node_modules');
+    assert.equal(probe.nestedIsDir, true);
+    assert.equal(probe.stashLeft, false);
+  }
+  assert.equal(second.probe.cwd === first.probe.cwd, false, 'the hit ran in a different work dir');
+
+  const stored = path.join(s.storeDir, s.storedKeys()[0], 'node_modules');
+  assert.equal(fs.existsSync(path.join(stored, '@x', 'api')), false, 'the store holds no workspace symlink');
+  assert.equal(fs.existsSync(path.join(stored, '.lane-workspaces', 'packages', 'api', 'node_modules', 'hello-tool', 'package.json')), true);
+});

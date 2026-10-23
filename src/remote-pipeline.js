@@ -10,6 +10,9 @@ import {
   pinInstallLocale,
   entryTree,
   materializeFromStore,
+  placeWorkspaces,
+  readWorkspaceTrees,
+  removeWorkspaceTrees,
   publishToStore,
   touchLastUsed,
   acquireLease,
@@ -144,8 +147,8 @@ function logDepsCache(outcome, dir, ms, { key, published, reason, file, missing,
 }
 
 /** What an install in `cwd` could change outside node_modules: `cwd` itself, and the work dir's `.git` (shared by every dir). */
-function snapshotInstallSurface(cwd, workDir) {
-  const surface = snapshotOutsideNodeModules(cwd);
+function snapshotInstallSurface(cwd, workDir, workspaces) {
+  const surface = snapshotOutsideNodeModules(cwd, workspaces.map((w) => w.resolved));
   if (cwd === workDir) return surface;
   const gitDir = path.join(workDir, '.git');
   const st = fs.lstatSync(gitDir);
@@ -166,7 +169,7 @@ function readTextOrNull(file) {
 const brokerLock = (fn) => withLock(ensureStateDirs().root, fn);
 
 /** Hit: copy the stored tree into place and relocate it to this run's install paths. False (with the partial tree removed) means install instead. */
-async function materializeHit(depsCache, key, cwd, releaseLeases, { workDir, depsEnv }) {
+async function materializeHit(depsCache, key, cwd, releaseLeases, { workDir, depsEnv, workspaces }) {
   const tree = path.join(cwd, 'node_modules');
   if (!fs.existsSync(entryTree(depsCache.root, key))) return false;
   try {
@@ -175,6 +178,7 @@ async function materializeHit(depsCache, key, cwd, releaseLeases, { workDir, dep
     materializeFromStore(depsCache.root, key, tree);
     const newPaths = Object.fromEntries(installPathRoles(workDir, depsEnv).map((r) => [r.role, r.path]));
     relocateRestoredTree(tree, readRelocation(depsCache.root, key), newPaths);
+    placeWorkspaces(tree, workspaces, workspaces.length > 0 ? readWorkspaceTrees(depsCache.root, key) : []);
     touchLastUsed(depsCache.root, key);
     return true;
   } catch (err) {
@@ -263,8 +267,8 @@ async function replayRootScripts(cwd, scripts, depsEnv, npmConfig) {
 }
 
 /** Copy the freshly installed tree into the store, then trim the store to its bound under the broker lock. */
-async function publishAndEvict(depsCache, key, cwd, releaseLeases, relocation, keyParts) {
-  const result = publishToStore(depsCache.root, key, path.join(cwd, 'node_modules'), relocation, keyParts);
+async function publishAndEvict(depsCache, key, cwd, releaseLeases, relocation, keyParts, workspaces) {
+  const result = publishToStore(depsCache.root, key, path.join(cwd, 'node_modules'), relocation, keyParts, workspaces);
   if (!result.published) return result;
   touchLastUsed(depsCache.root, key);
   try {
@@ -317,20 +321,21 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
   }
   const { key } = keyed;
 
-  if (key && (await materializeHit(depsCache, key, cwd, releaseLeases, { workDir, depsEnv }))) {
+  if (key && (await materializeHit(depsCache, key, cwd, releaseLeases, { workDir, depsEnv, workspaces: keyed.workspaces }))) {
     if (await replayRootScripts(cwd, keyed.scripts, depsEnv, npmConfig)) return { exitCode: 0, record: done('hit', { key }) };
     process.stderr.write('deps-cache replay of the root scripts failed, installing instead\n');
     fs.rmSync(path.join(cwd, 'node_modules'), { recursive: true, force: true });
+    removeWorkspaceTrees(cwd, keyed.workspaces);
   }
 
-  const before = key ? snapshotInstallSurface(cwd, workDir) : null;
+  const before = key ? snapshotInstallSurface(cwd, workDir, keyed.workspaces) : null;
   const configBefore = key ? readTextOrNull(path.join(workDir, '.git', 'config')) : null;
   const exitCode = await runPhaseCommand(DEPS_INSTALL_ARGV, cwd, depsEnv);
   if (!key) return { exitCode, record: done('skip', { reason: keyed.reason }) };
   if (exitCode !== 0) return { exitCode, record: done('miss', { key, published: false, reason: 'install failed' }) };
 
   const configAfter = readTextOrNull(path.join(workDir, '.git', 'config'));
-  const outside = unexplainedChanges(snapshotChanges(before, snapshotInstallSurface(cwd, workDir)), { scripts: keyed.scripts, configBefore, configAfter });
+  const outside = unexplainedChanges(snapshotChanges(before, snapshotInstallSurface(cwd, workDir, keyed.workspaces)), { scripts: keyed.scripts, configBefore, configAfter });
   if (outside.length > 0) {
     const shown = outside.slice(0, 3).join(', ');
     return { exitCode, record: done('miss', { key, published: false, reason: `install changed files outside node_modules: ${shown}${outside.length > 3 ? ', ...' : ''}` }) };
@@ -340,13 +345,13 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
   }
   const missing = missingInstalled(path.join(cwd, 'node_modules'), keyed.lock);
   if (missing) return { exitCode, record: done('skip', { key, reason: 'incomplete-optional', missing }) };
-  const references = collectInstallPathReferences(path.join(cwd, 'node_modules'), installPathRoles(workDir, depsEnv));
+  const references = collectInstallPathReferences(path.join(cwd, 'node_modules'), installPathRoles(workDir, depsEnv), { workspaces: keyed.workspaces });
   if (references.prunedLink) return { exitCode, record: done('skip', { key, reason: 'symlink-into-pruned-or-unresolvable', file: references.prunedLink }) };
   if (references.binary) return { exitCode, record: done('skip', { key, reason: 'absolute-install-path-binary', file: references.binary }) };
   if (references.ambiguous) return { exitCode, record: done('skip', { key, reason: 'absolute-install-path-ambiguous', file: references.ambiguous }) };
   try {
     const keyDiff = diffAgainstNewestEntry(depsCache.root, keyed.keyParts);
-    const result = await publishAndEvict(depsCache, key, cwd, releaseLeases, references.relocation, keyed.keyParts);
+    const result = await publishAndEvict(depsCache, key, cwd, releaseLeases, references.relocation, keyed.keyParts, keyed.workspaces);
     return { exitCode, record: done('miss', { key, keyDiff, published: result.published, ...(result.published ? {} : { reason: 'another run published this key first' }) }) };
   } catch (err) {
     // the tree is installed and usable for this run whatever happened to the store

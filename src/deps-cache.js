@@ -29,7 +29,7 @@ import { isProcessAlive, processStartTime } from './process-liveness.js';
 export const DEFAULT_DEPS_CACHE_MAX_BYTES = 10 * 1024 ** 3;
 
 /** Bumping this invalidates every existing entry. */
-const KEY_VERSION = 'v5';
+const KEY_VERSION = 'v6';
 
 /** npm reads npm-shrinkwrap.json in preference to package-lock.json. */
 const LOCKFILES = ['npm-shrinkwrap.json', 'package-lock.json'];
@@ -135,6 +135,23 @@ export const SCAN_CHUNK_BYTES = 1024 * 1024;
 
 const KEY_RE = /^[0-9a-f]{64}$/;
 
+/**
+ * BRAIN-466: npm workspaces. A lock `link: true` entry is a workspace (or in-repo `file:` dir) symlink that `npm ci`
+ * creates in `node_modules`. The store never holds those symlinks or the workspace sources: it holds only installed
+ * packages, with each workspace's own nested `node_modules` stashed under this reserved name (a dot-dir, so never
+ * a package) inside the stored tree. A restore moves each back next to its workspace and recreates the links.
+ */
+const WORKSPACE_STASH = '.lane-workspaces';
+
+/** The stash directories above a workspace's stored `node_modules`, deepest first, that exist (so they can be made read-only like the rest). */
+function stashParents(storedTree, resolved) {
+  const dirs = [];
+  for (let rel = path.posix.join(WORKSPACE_STASH, resolved); rel !== '.'; rel = path.posix.dirname(rel)) {
+    if (fs.existsSync(path.join(storedTree, rel))) dirs.push(path.join(storedTree, rel));
+  }
+  return dirs;
+}
+
 /** Unpublished temp dirs older than this belong to a crashed publisher. */
 const STALE_TMP_MS = 60 * 60 * 1000;
 
@@ -239,11 +256,43 @@ export function currentSystem() {
   return systemMemo;
 }
 
+/** A workspace path npm writes and this cache can trust: relative, canonical, POSIX, no empty/`.`/`..`/`node_modules` segment. */
+function isPlainWorkspacePath(p) {
+  if (p === '' || p.includes('\\') || p.includes('\0') || p.startsWith('/') || p.endsWith('/')) return false;
+  return p.split('/').every((seg) => seg !== '' && seg !== '.' && seg !== '..' && seg !== 'node_modules');
+}
+
+/**
+ * Throws unless `<baseDir>/<rel>` lies inside `baseDir` in the real filesystem: no component between them may be a
+ * symlink, and what exists must resolve under `realpath(baseDir)`. Every read, copy, move or delete of a workspace
+ * path goes through this first. A component that does not exist yet ends the walk (nothing there to follow).
+ */
+export function assertContained(baseDir, rel) {
+  if (!isPlainWorkspacePath(rel)) throw new Error(`workspace path ${JSON.stringify(rel)} is not a plain relative path`);
+  let current = baseDir;
+  for (const seg of rel.split('/')) {
+    current = path.join(current, seg);
+    let st;
+    try {
+      st = fs.lstatSync(current);
+    } catch (err) {
+      if (err.code === 'ENOENT') return;
+      throw err;
+    }
+    if (st.isSymbolicLink()) throw new Error(`workspace path ${rel} passes through a symlink at ${seg}`);
+  }
+  const inside = path.relative(fs.realpathSync(baseDir), fs.realpathSync(current));
+  if (inside.startsWith('..') || path.isAbsolute(inside)) throw new Error(`workspace path ${rel} resolves outside the work dir`);
+}
+
 /**
  * Whether every lock entry is pinned to content, so `npm ci` from this lock is reproducible. Fails closed:
  * lock v2/v3 with a `packages` map only, and every non-root entry must be an npmjs.org tarball with
  * integrity, a git commit pin, or a `file:*.tgz` with integrity (returned in `tarballs`, which the key
- * hashes). `file:` dirs, links, workspaces and unresolved entries are refused.
+ * hashes). `file:` dirs and unresolved entries are refused. A `link: true` entry is accepted only when it is a
+ * plain relative path inside the repo whose target has a lock entry of its own (an npm workspace); those come
+ * back in `workspaces` as `{ resolved, links }`. A link that escapes the repo, or a workspace entry no link
+ * names, is refused.
  *
  * An entry with no `resolved` of its own is accepted only when its bytes ride inside an enclosing package's
  * tarball: it is `inBundle`, nested under a package that bundles it (the parent's `bundleDependencies` names
@@ -257,6 +306,27 @@ export function lockEligibility(lock) {
   const packages = lock.packages;
   const tarballs = [];
   const verdicts = new Map();
+  const linkTargets = Object.values(packages).filter((e) => e?.link === true && typeof e.resolved === 'string').map((e) => e.resolved);
+  const workspaceLinks = new Map(); // workspace dir -> names (under node_modules) of the links to it
+
+  /** Why a link entry is refused; null when it is a plain relative link to an in-repo dir that has its own lock entry. */
+  const linkProblem = (name, entry) => {
+    const { resolved } = entry;
+    if (!/^node_modules\/(@[^/]+\/)?[^/]+$/.test(name)) return `lock entry ${name} is a link that is not a top-level package`;
+    if (typeof resolved !== 'string' || !isPlainWorkspacePath(resolved)) {
+      return `lock entry ${name} is a link to ${String(resolved).slice(0, 80)}, which is not a plain relative path inside the repo`;
+    }
+    if (linkTargets.some((other) => other !== resolved && other.toLowerCase() === resolved.toLowerCase())) return `lock entry ${name} is a link to ${resolved}, which differs from another workspace path only by case`;
+    const target = packages[resolved];
+    if (!target || typeof target !== 'object' || target.link === true || typeof target.resolved === 'string') return `lock entry ${name} is a link to ${resolved}, which has no workspace entry in the lock`;
+    return null;
+  };
+  for (const [name, entry] of Object.entries(packages)) {
+    if (entry?.link === true && linkProblem(name, entry) === null) {
+      workspaceLinks.set(entry.resolved, [...(workspaceLinks.get(entry.resolved) ?? []), name.slice('node_modules/'.length)]);
+    }
+  }
+  const owningWorkspace = (name) => [...workspaceLinks.keys()].find((dir) => name.startsWith(`${dir}/node_modules/`));
 
   const check = (name) => {
     if (verdicts.has(name)) return verdicts.get(name);
@@ -268,8 +338,12 @@ export function lockEligibility(lock) {
   const checkEntry = (name) => {
     const entry = packages[name];
     if (!entry || typeof entry !== 'object') return `lock entry ${name} is malformed`;
-    if (entry.link === true) return `lock entry ${name} is a link`;
-    if (!name.startsWith('node_modules/')) return `lock entry ${name} is not under node_modules (workspace or local package)`;
+    if (entry.link === true) return linkProblem(name, entry);
+    if (workspaceLinks.has(name)) return null; // the workspace package itself: its dependency fields only, no source in the lock
+    const owner = owningWorkspace(name);
+    if (!(owner ? name.slice(owner.length + 1) : name).startsWith('node_modules/')) {
+      return `lock entry ${name} is not under node_modules (workspace or local package)`;
+    }
     const { resolved, integrity } = entry;
     if (typeof resolved === 'string') {
       if (REGISTRY_RE.test(resolved) && typeof integrity === 'string') return null;
@@ -298,7 +372,8 @@ export function lockEligibility(lock) {
     const verdict = check(name);
     if (verdict !== null) return { ok: false, reason: verdict };
   }
-  return { ok: true, tarballs: [...new Set(tarballs)].sort(), hasInstallScript };
+  const workspaces = [...workspaceLinks].map(([resolved, links]) => ({ resolved, links: links.sort() })).sort((a, b) => a.resolved.localeCompare(b.resolved));
+  return { ok: true, tarballs: [...new Set(tarballs)].sort(), hasInstallScript, workspaces };
 }
 
 /** The first root lifecycle script that is neither allowlisted nor declared safe, as "<name>: <command>"; else null. */
@@ -334,11 +409,153 @@ export function unexplainedChanges(changes, { scripts, configBefore, configAfter
   return changes.filter((c) => !(configExplained && (c === '.git' || c === '.git/config')));
 }
 
+/** JSON with every object's keys sorted, so equal manifests hash equal whatever their key order. */
+const canonicalJson = (value) =>
+  JSON.stringify(value, (_, v) => (v && typeof v === 'object' && !Array.isArray(v) ? Object.fromEntries(Object.keys(v).sort().map((k) => [k, v[k]])) : v));
+
+/** Glob segment -> regex, for the only wildcard supported: `*` within a segment. */
+const segmentPattern = (seg) => new RegExp(`^${seg.split('*').map((x) => x.replace(/[.]/g, '\\.')).join('[^/]*')}$`);
+
+/**
+ * The directories (relative, sorted, each with a package.json) the root `workspaces` globs select in `dir`, as npm's
+ * workspace discovery would. Only plain segments, `*` and `**` are understood; anything else (negation, braces, `?`, classes,
+ * the object form, a symlinked entry on the way) throws, and the caller treats the dir as ineligible.
+ */
+export function discoverWorkspaceDirs(dir, rootPackage) {
+  const patterns = rootPackage.workspaces;
+  if (!Array.isArray(patterns)) {
+    if (patterns === undefined) return [];
+    throw new Error('workspaces is not a plain array of patterns');
+  }
+  const skip = new Set(['node_modules', '.git']);
+  const children = (rel) =>
+    fs.readdirSync(path.join(dir, rel), { withFileTypes: true }).filter((e) => !skip.has(e.name)).map((e) => {
+      if (e.isSymbolicLink()) throw new Error(`workspace discovery crosses a symlink at ${rel ? `${rel}/` : ''}${e.name}`);
+      return e;
+    }).filter((e) => e.isDirectory()).map((e) => e.name);
+  const expand = (segs, rel, out) => {
+    if (segs.length === 0) return out.add(rel);
+    const [first, ...rest] = segs;
+    const join = (name) => (rel ? `${rel}/${name}` : name);
+    if (first === '**') {
+      expand(rest, rel, out);
+      for (const name of children(rel)) expand(segs, join(name), out);
+    } else if (!first.includes('*')) {
+      if (fs.existsSync(path.join(dir, join(first)))) {
+        if (fs.lstatSync(path.join(dir, join(first))).isSymbolicLink()) throw new Error(`workspace discovery crosses a symlink at ${join(first)}`);
+        expand(rest, join(first), out);
+      }
+    } else {
+      const re = segmentPattern(first);
+      for (const name of children(rel).filter((n) => re.test(n))) expand(rest, join(name), out);
+    }
+    return out;
+  };
+  const selected = new Set();
+  for (const raw of patterns) {
+    if (typeof raw !== 'string') throw new Error('workspaces entry is not a string');
+    const pattern = raw.replace(/^\.\//, '').replace(/\/+$/, '');
+    if (!/^[A-Za-z0-9_.@\-/*]+$/.test(pattern) || pattern.split('/').some((seg) => seg === '' || seg === '.' || seg === '..' || (seg.includes('**') && seg !== '**'))) {
+      throw new Error(`workspaces pattern ${JSON.stringify(raw)} is not one this cache understands`);
+    }
+    expand(pattern.split('/'), '', selected);
+  }
+  return [...selected].filter((rel) => rel !== '' && fs.existsSync(path.join(dir, rel, 'package.json'))).sort();
+}
+
+/**
+ * The key parts for an npm-workspace dir (BRAIN-466), or `{ reason }` when it must not be cached. Anything not fully
+ * modelled is refused:
+ *  - run whenever the root `package.json` has a `workspaces` field or the lock has links: the workspaces its globs select NOW
+ *    must be exactly the lock's links (empty included), with unique names, each link named after its package;
+ *  - every workspace path is checked for real containment before anything is read;
+ *  - a workspace with a lifecycle script (any npm runs), a `binding.gyp` or a lock `hasInstallScript` is never cached;
+ *  - the key covers the discovered set and, per workspace, its path, links, lock entry and its whole package.json (canonical JSON).
+ */
+function workspaceKeyParts({ dir, lock, rootPackage, workspaces }) {
+  const parts = [];
+  let discovered;
+  try {
+    discovered = discoverWorkspaceDirs(dir, rootPackage);
+    for (const { resolved } of workspaces) assertContained(dir, resolved);
+  } catch (err) {
+    return { reason: `workspaces not determined: ${err.message}` };
+  }
+  const linked = workspaces.map((w) => w.resolved);
+  if (JSON.stringify(discovered) !== JSON.stringify(linked)) {
+    return { reason: `workspaces in package.json (${discovered.join(', ') || 'none'}) differ from the lock's links (${linked.join(', ') || 'none'})` };
+  }
+  const names = new Set();
+  const identities = [];
+  for (const { resolved, links } of workspaces) {
+    let manifest;
+    try {
+      manifest = JSON.parse(fs.readFileSync(path.join(dir, resolved, 'package.json'), 'utf8'));
+    } catch {
+      return { reason: `workspace ${resolved} has no readable package.json in the snapshot` };
+    }
+    if (typeof manifest.name !== 'string' || names.has(manifest.name)) return { reason: `workspace ${resolved} has a missing or duplicate package name` };
+    names.add(manifest.name);
+    if (links.length !== 1 || links[0] !== manifest.name) return { reason: `workspace ${resolved} is linked as ${links.join(', ')}, not as its package name ${manifest.name}` };
+    identities.push([resolved, manifest.name]);
+    const scripts = manifest.scripts && typeof manifest.scripts === 'object' ? manifest.scripts : {};
+    const lifecycle = ROOT_SCRIPT_NAMES.filter((n) => n in scripts);
+    if (fs.existsSync(path.join(dir, resolved, 'binding.gyp'))) lifecycle.push('binding.gyp');
+    if (lock.packages[resolved]?.hasInstallScript) lifecycle.push('lock hasInstallScript');
+    if (lifecycle.length > 0) return { reason: `workspace ${resolved} has lifecycle inputs (${lifecycle.join(', ')})` };
+    if ('bin' in manifest) return { reason: `workspace ${resolved} declares bin, whose .bin links are not restored` };
+    parts.push([`workspace:${resolved}`, canonicalJson({ links, lock: lock.packages[resolved], manifest })]);
+  }
+  parts.push(['workspace-set', JSON.stringify(identities)]);
+  return { parts };
+}
+
+/** Install scripts may read repository sources, so workspace installs with scripts key their bytes too. */
+function installSourceDigest(rootDir) {
+  const hash = crypto.createHash('sha256');
+  const root = fs.realpathSync(rootDir);
+  const record = (name, value) => { hash.update(`${name}:${value.length}:`); hash.update(value); };
+  const walk = (relative) => {
+    for (const name of fs.readdirSync(path.join(root, relative)).sort()) {
+      if (name === 'node_modules' || name === '.git') continue;
+      const rel = relative ? `${relative}/${name}` : name;
+      const file = path.join(root, rel);
+      const stat = fs.lstatSync(file);
+      record(rel, Buffer.from(`${stat.mode & 0o7777}:`));
+      if (stat.isSymbolicLink()) {
+        const target = fs.realpathSync(file);
+        const destination = path.relative(root, target);
+        if (destination.startsWith('..') || path.isAbsolute(destination) || destination.split(path.sep).some((part) => part === 'node_modules' || part === '.git')) {
+          throw new Error(`install source link ${rel} escapes the keyed source tree`);
+        }
+        record(`link:${rel}`, Buffer.from(fs.readlinkSync(file)));
+      } else if (stat.isDirectory()) {
+        walk(rel);
+      } else if (stat.isFile()) {
+        const contents = crypto.createHash('sha256');
+        const fd = fs.openSync(file, 'r');
+        try {
+          const chunk = Buffer.alloc(SCAN_CHUNK_BYTES);
+          let count;
+          while ((count = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0) contents.update(chunk.subarray(0, count));
+        } finally { fs.closeSync(fd); }
+        record(`file:${rel}`, contents.digest());
+      } else {
+        throw new Error(`unsupported install source ${rel}`);
+      }
+    }
+  };
+  walk('');
+  return hash.digest('hex');
+}
+
 /**
  * The cache key for one `remoteDeps` dir: a sha256 over everything that can change what `npm ci` produces
  * there. Returns `{ key, keyParts, lock, scripts }` (`keyParts`: a keyed digest per labelled input, for diagnosis, only when `keyPartsSecret` is given), or `{ key: null, reason }` when the dir must not be cached at all
  * (lockfile not pinned, or a root lifecycle script that is not known to leave `node_modules` alone).
  *
+ *  - for npm workspaces (BRAIN-466, `workspaceKeyParts`): the discovered set, and each one's path, links, lock entry and
+ *    whole package.json (never its source; a workspace with lifecycle inputs is refused);
  *  - the lockfile (name and bytes), `package.json`, the `.npmrc` of the dir and of the repo root, and the
  *    bytes of every `file:` tarball the lockfile names;
  *  - node version/platform/arch (`runtime`), the glibc runtime and distro (`system`), the npm version;
@@ -410,6 +627,15 @@ export function computeDepsKey({
     ['install-locale', env.LC_ALL ?? ''],
   ];
   if (eligibility.hasInstallScript) parts.push(['cc-version', toolVersion('cc')], ['python3-version', toolVersion('python3')]);
+  if (eligibility.workspaces.length > 0 || 'workspaces' in pkg) {
+    const ws = workspaceKeyParts({ dir, lock, rootPackage: pkg, workspaces: eligibility.workspaces });
+    if (ws.reason) return { key: null, reason: ws.reason };
+    parts.push(...ws.parts);
+    if (eligibility.hasInstallScript || rootScriptsSafe) {
+      try { parts.push(['install-sources', installSourceDigest(rootDir)]); }
+      catch (error) { return { key: null, reason: error.message }; }
+    }
+  }
   for (const rel of eligibility.tarballs) {
     const bytes = readIfExists(path.resolve(dir, rel));
     if (!bytes) return { key: null, reason: `file: tarball ${rel} is not in the snapshot` };
@@ -430,7 +656,7 @@ export function computeDepsKey({
     hash.update(bytes);
     if (keyPartsSecret) keyParts[label] = crypto.createHmac('sha256', keyPartsSecret).update(bytes).digest('hex').slice(0, 12);
   }
-  return { key: hash.digest('hex'), keyParts, lock, scripts: pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {} };
+  return { key: hash.digest('hex'), keyParts, lock, workspaces: eligibility.workspaces, scripts: pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {} };
 }
 
 function listAllows(list, value) {
@@ -597,10 +823,11 @@ export function entryTree(cacheRoot, key) {
  * Recreate `src` as `dst`, directory by directory: real directories, symlinks re-created with their
  * target text (through `linkTarget(target, rel)`, identity by default), regular files handed to
  * `onFile(srcFile, dstFile, rel)`. Each directory is created owner-writable so its entries can be added,
- * then given `dirMode(srcMode)` once it is complete. An entry for which `skip(rel)` is true is left out.
+ * then given `dirMode(srcMode)` once it is complete (after `finish(dst, rel)` has added anything else to it).
+ * An entry for which `skip(rel)` is true is left out.
  */
 function cloneTree(src, dst, hooks, rel = '') {
-  const { onFile, dirMode, linkTarget = (target) => target, skip = () => false } = hooks;
+  const { onFile, dirMode, linkTarget = (target) => target, skip = () => false, finish = () => {} } = hooks;
   const srcMode = fs.statSync(src).mode & 0o7777;
   fs.mkdirSync(dst, { mode: 0o700 });
   for (const ent of fs.readdirSync(src, { withFileTypes: true })) {
@@ -613,6 +840,7 @@ function cloneTree(src, dst, hooks, rel = '') {
     else if (ent.isFile()) onFile(s, d, r);
     else throw new Error(`unsupported entry type at ${s}`);
   }
+  finish(dst, rel);
   fs.chmodSync(dst, dirMode(srcMode));
 }
 
@@ -648,6 +876,82 @@ export function materializeFromStore(cacheRoot, key, destTree) {
   });
 }
 
+/** Where the symlink for workspace `resolved` at `<tree>/<name>` points: relative, as `npm ci` writes it. */
+function workspaceLinkTarget(tree, name, resolved) {
+  return path.relative(path.dirname(path.join(tree, name)), path.join(path.dirname(tree), resolved));
+}
+
+/** The workspaces whose nested `node_modules` a stored entry holds (its inventory); throws unless the entry records one. */
+export function readWorkspaceTrees(cacheRoot, key) {
+  const meta = JSON.parse(fs.readFileSync(path.join(entryDir(cacheRoot, key), 'meta.json'), 'utf8'));
+  if (!Array.isArray(meta.workspaceTrees) || !meta.workspaceTrees.every((t) => typeof t === 'string')) throw new Error('stored entry records no workspace inventory');
+  return meta.workspaceTrees;
+}
+
+/**
+ * After a restore: give each workspace back its nested `node_modules` (stashed in the tree under WORKSPACE_STASH)
+ * and recreate the workspace symlinks in `tree`, relative to the work dir exactly as `npm ci` makes them. The stash
+ * is removed. `storedTrees` is the entry's inventory of workspaces that had a nested tree: each must be in the stash,
+ * nothing else may be, and NO workspace may already have a `node_modules` (a leftover would survive where `npm ci`
+ * cleans it). Every path is containment-checked first. Throws (after undoing what it moved) on any mismatch.
+ */
+export function placeWorkspaces(tree, workspaces, storedTrees) {
+  if (workspaces.length === 0) return;
+  const workDir = path.dirname(tree);
+  const stash = path.join(tree, WORKSPACE_STASH);
+  const moved = [];
+  try {
+    const expected = new Set(storedTrees);
+    for (const t of expected) if (!workspaces.some((w) => w.resolved === t)) throw new Error(`stored inventory names ${t}, which is not a workspace`);
+    for (const { resolved } of workspaces) {
+      assertContained(workDir, resolved);
+      if (!fs.statSync(path.join(workDir, resolved)).isDirectory()) throw new Error(`workspace ${resolved} is not a directory`);
+      const dest = path.join(workDir, resolved, 'node_modules');
+      if (pathExists(dest)) throw new Error(`${dest} already exists`);
+      if (pathExists(path.join(stash, resolved, 'node_modules')) !== expected.has(resolved)) {
+        throw new Error(`stored nested node_modules for ${resolved} does not match the entry's inventory`);
+      }
+    }
+    for (const { resolved, links } of workspaces) {
+      if (expected.has(resolved)) {
+        const dest = path.join(workDir, resolved, 'node_modules');
+        fs.renameSync(path.join(stash, resolved, 'node_modules'), dest);
+        moved.push(dest);
+      }
+      for (const name of links) {
+        fs.mkdirSync(path.dirname(path.join(tree, name)), { recursive: true });
+        fs.symlinkSync(workspaceLinkTarget(tree, name, resolved), path.join(tree, name));
+      }
+    }
+    fs.rmSync(stash, { recursive: true, force: true });
+  } catch (err) {
+    for (const dest of moved) fs.rmSync(dest, { recursive: true, force: true });
+    throw err;
+  }
+}
+
+const pathExists = (p) => {
+  try {
+    fs.lstatSync(p);
+    return true;
+  } catch (err) {
+    if (err.code === 'ENOENT') return false;
+    throw err;
+  }
+};
+
+/** Remove every workspace's nested `node_modules` under `workDir` (what `placeWorkspaces` put there); a path that fails containment is left alone. */
+export function removeWorkspaceTrees(workDir, workspaces) {
+  for (const { resolved } of workspaces) {
+    try {
+      assertContained(workDir, resolved);
+    } catch {
+      continue;
+    }
+    fs.rmSync(path.join(workDir, resolved, 'node_modules'), { recursive: true, force: true });
+  }
+}
+
 /**
  * Copy an installed tree into the store, read-only, and publish it atomically (build under `.tmp-*`,
  * then rename onto `<key>`). Returns `{ published: true, bytes }`, or `{ published: false }` when another
@@ -655,7 +959,7 @@ export function materializeFromStore(cacheRoot, key, destTree) {
  * `collectInstallPathReferences` found: the stored COPY of each recorded file or symlink has its install paths
  * replaced by placeholder tokens (the source tree is untouched), and the record goes into `meta.json`.
  */
-export function publishToStore(cacheRoot, key, srcTree, relocation = null, keyParts = null) {
+export function publishToStore(cacheRoot, key, srcTree, relocation = null, keyParts = null, workspaces = []) {
   fs.mkdirSync(cacheRoot, { recursive: true });
   const tmp = path.join(cacheRoot, `.tmp-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
   fs.mkdirSync(tmp);
@@ -668,7 +972,24 @@ export function publishToStore(cacheRoot, key, srcTree, relocation = null, keyPa
       if (out === null) throw new Error(`relocation: ${rel} changed since collection and now has an ambiguous install path`);
       return out;
     };
-    cloneTree(srcTree, path.join(tmp, 'node_modules'), {
+    const workDir = path.dirname(srcTree);
+    for (const { resolved } of workspaces) assertContained(workDir, resolved);
+    const storedTrees = [];
+    const linkNames = new Set(workspaces.flatMap((w) => w.links));
+    for (const { resolved, links } of workspaces) {
+      for (const name of links) {
+        let actual = null;
+        try {
+          actual = fs.readlinkSync(path.join(srcTree, name));
+        } catch {
+          // not a symlink: refused just below
+        }
+        if (actual !== workspaceLinkTarget(srcTree, name, resolved)) throw new Error(`workspace link ${name} is not the symlink npm ci makes to ${resolved}`);
+      }
+    }
+    if (workspaces.length > 0 && fs.existsSync(path.join(srcTree, WORKSPACE_STASH))) throw new Error(`${WORKSPACE_STASH} already exists in the installed tree`);
+    // `base` is the tree `localRel` is relative to; `prefix` is where that tree sits inside the stored one ('' for the root).
+    const hooksFor = (base, prefix) => ({
       onFile: (s, d, rel) => {
         if (recorded.get(rel) !== 'text') {
           bytes += copyFileAs(s, d, (mode) => mode & 0o7555);
@@ -681,10 +1002,26 @@ export function publishToStore(cacheRoot, key, srcTree, relocation = null, keyPa
       },
       linkTarget: (target, rel) => (recorded.get(rel) === 'symlink' ? template(Buffer.from(target, 'utf8'), rel, anchoredOccurrence).toString('utf8') : target),
       dirMode: (mode) => mode & 0o7555,
-      skip: (rel) => isRegenerableBuildArtifact(srcTree, rel),
+      skip: (rel) => (prefix ? isRegenerableBuildArtifact(base, rel.slice(prefix.length + 1)) : linkNames.has(rel) || isRegenerableBuildArtifact(base, rel)),
+    });
+    const storedTree = path.join(tmp, 'node_modules');
+    cloneTree(srcTree, storedTree, {
+      ...hooksFor(srcTree, ''),
+      finish: (dst, rel) => {
+        if (rel !== '') return;
+        for (const { resolved } of workspaces) {
+          const nested = path.join(workDir, resolved, 'node_modules');
+          if (!pathExists(nested)) continue;
+          storedTrees.push(resolved);
+          const prefix = `${WORKSPACE_STASH}/${resolved}/node_modules`;
+          fs.mkdirSync(path.dirname(path.join(dst, prefix)), { recursive: true });
+          cloneTree(nested, path.join(dst, prefix), hooksFor(nested, prefix), prefix);
+        }
+        for (const dir of workspaces.flatMap(({ resolved }) => stashParents(dst, resolved))) fs.chmodSync(dir, 0o555);
+      },
     });
     if (relocation) verifyTemplatedCopy(path.join(tmp, 'node_modules'), relocation);
-    fs.writeFileSync(path.join(tmp, 'meta.json'), JSON.stringify({ bytes, createdAt: Date.now(), ...(relocation ? { relocation } : {}), ...(keyParts ? { keyParts } : {}) }));
+    fs.writeFileSync(path.join(tmp, 'meta.json'), JSON.stringify({ bytes, createdAt: Date.now(), ...(workspaces.length > 0 ? { workspaceTrees: storedTrees.sort() } : {}), ...(relocation ? { relocation } : {}), ...(keyParts ? { keyParts } : {}) }));
     fs.writeFileSync(path.join(tmp, '.last-used'), '');
     fs.mkdirSync(path.join(tmp, 'leases'));
     try {
@@ -1112,8 +1449,10 @@ function isRewritableText(relPath, content) {
  *   { relocation }         else: `{ nonce, prefixes: [{ roles, path }], entries: [{ relPath, kind: 'text' | 'symlink' }] }`,
  *                          roles sharing one path being ONE group; `publishToStore` templates the entries.
  * The nonce (a fresh one if the tree already contains the token text) names this entry's placeholder tokens.
+ * With `workspaces` (BRAIN-466) the scan skips their symlinks and also covers each workspace's own `node_modules`,
+ * whose entries are named by their path inside the stored tree (under the stash).
  */
-export function collectInstallPathReferences(tree, roles, { newNonce = () => crypto.randomBytes(16).toString('hex') } = {}) {
+export function collectInstallPathReferences(tree, roles, { newNonce = () => crypto.randomBytes(16).toString('hex'), workspaces = [] } = {}) {
   const groups = [];
   for (const { role, path: p } of roles) {
     const group = groups.find((g) => g.path === p);
@@ -1124,7 +1463,7 @@ export function collectInstallPathReferences(tree, roles, { newNonce = () => cry
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const nonce = newNonce();
     const marker = tokenTail(nonce);
-    const outcome = scanTree(tree, groups, pairs, marker);
+    const outcome = scanTree(tree, groups, pairs, marker, workspaces);
     if (outcome.collision) continue;
     if (outcome.prunedLink) return { prunedLink: outcome.prunedLink };
     if (outcome.binary) return { binary: outcome.binary };
@@ -1147,51 +1486,76 @@ function relocatableInstallLink(groups, text) {
   return group.roles.some((role) => role === 'workDir' || role === 'realWorkDir') && /^\/(?:[^/]+\/)*node_modules(?:\/|$)/.test(text.slice(group.path.length));
 }
 
-function scanTree(tree, groups, pairs, marker) {
+function scanTree(tree, groups, pairs, marker, workspaces) {
   const bufs = [...pairs.map((p) => p.from), marker];
   const markerIdx = bufs.length - 1;
   const found = new Set();
   const entries = [];
-  const walk = (abs, rel) => {
+  const linkNames = new Set(workspaces.flatMap((w) => w.links));
+  // `base` is the tree `rel` is relative to; `prefix` is where it sits in the stored tree, so entries and outcomes use `prefix + rel`.
+  const walk = (base, abs, rel, prefix) => {
     for (const ent of fs.readdirSync(abs, { withFileTypes: true })) {
       const p = path.join(abs, ent.name);
       const r = rel ? `${rel}/${ent.name}` : ent.name;
-      if (isRegenerableBuildArtifact(tree, r)) {
-        if (ent.isSymbolicLink()) return { prunedLink: r };
+      const stored = prefix + r;
+      if (!prefix && ent.isSymbolicLink() && linkNames.has(r)) continue;
+      if (isRegenerableBuildArtifact(base, r)) {
+        if (ent.isSymbolicLink()) return { prunedLink: stored };
         continue;
       }
       let outcome = null;
-      if (ent.isDirectory()) outcome = walk(p, r);
+      if (ent.isDirectory()) outcome = walk(base, p, r, prefix);
       else if (ent.isSymbolicLink()) {
         const target = Buffer.from(fs.readlinkSync(p), 'utf8');
         const text = target.toString('utf8');
         const keeps = relocatableInstallLink(groups, text);
-        if (keeps === false) return { prunedLink: r };
+        if (keeps === false) return { prunedLink: stored };
         if (keeps !== null || !pairs.some((pr) => target.includes(pr.from))) {
-          if (refusesLink(tree, p, keeps === true)) return { prunedLink: r };
+          if (refusesLink(base, p, keeps === true)) return { prunedLink: stored };
         }
         if (target.includes(marker)) return { collision: true };
         const hit = pairs.some((pr) => target.includes(pr.from));
-        if (hit && rewritePrefixes(target, pairs, anchoredOccurrence) === null) return { ambiguous: r };
+        if (hit && rewritePrefixes(target, pairs, anchoredOccurrence) === null) return { ambiguous: stored };
         if (hit) {
           pairs.forEach((pr, i) => target.includes(pr.from) && found.add(i));
-          entries.push({ relPath: r, kind: 'symlink' });
+          entries.push({ relPath: stored, kind: 'symlink' });
         }
       } else if (ent.isFile()) {
         const { hits } = fileNeedleHits(p, bufs);
         if (hits.has(markerIdx)) return { collision: true };
         if (hits.size === 0) continue;
         const content = fs.readFileSync(p);
-        if (!isRewritableText(r, content)) return { binary: r };
-        if (rewritePrefixes(content, pairs, strictOccurrence) === null) return { ambiguous: r };
+        if (!isRewritableText(r, content)) return { binary: stored };
+        if (rewritePrefixes(content, pairs, strictOccurrence) === null) return { ambiguous: stored };
         hits.forEach((i) => found.add(i));
-        entries.push({ relPath: r, kind: 'text' });
+        entries.push({ relPath: stored, kind: 'text' });
       }
       if (outcome) return outcome;
     }
     return null;
   };
-  return walk(tree, '') ?? { found, entries };
+  if (workspaces.length > 0 && fs.existsSync(path.join(tree, WORKSPACE_STASH))) return { ambiguous: WORKSPACE_STASH };
+  const rootOutcome = walk(tree, tree, '', '');
+  if (rootOutcome) return rootOutcome;
+  for (const { resolved } of workspaces) {
+    const nested = path.join(path.dirname(tree), resolved, 'node_modules');
+    const prefix = `${WORKSPACE_STASH}/${resolved}/node_modules/`;
+    try {
+      assertContained(path.dirname(tree), resolved);
+    } catch {
+      return { prunedLink: prefix.slice(0, -1) };
+    }
+    let st = null;
+    try {
+      st = fs.lstatSync(nested);
+    } catch {
+      continue; // this workspace installed nothing of its own
+    }
+    if (!st.isDirectory()) return { prunedLink: prefix.slice(0, -1) };
+    const outcome = walk(nested, nested, '', prefix);
+    if (outcome) return outcome;
+  }
+  return { found, entries };
 }
 
 /** The first file or symlink under `tree` (rel path, none in `skip`) holding any of `needles`, scanning files in chunks. Null when clean. */
@@ -1290,18 +1654,26 @@ export function relocateRestoredTree(tree, { nonce, candidates, prefixes, entrie
 }
 
 /**
- * Everything under `dir` except `node_modules` trees, `.git` included, as path -> "type:size:mtimeMs".
+ * Everything under `dir` except `node_modules` trees, `.git` included, as path -> "type:size:mtimeMs" (files and symlinks add dev:ino, so an atomic replacement that keeps size and mtime still shows) (an exact workspace root: its child names).
  * Taken before and after an install: any difference means a lifecycle script wrote outside `node_modules`,
  * which a cached `node_modules` could never reproduce.
  */
-export function snapshotOutsideNodeModules(dir) {
+export function snapshotOutsideNodeModules(dir, workspaceRoots = []) {
   const out = new Map();
+  const roots = new Set(workspaceRoots);
   const walk = (abs, rel) => {
     for (const ent of fs.readdirSync(abs, { withFileTypes: true })) {
       if (ent.name === 'node_modules') continue;
       const childRel = rel ? `${rel}/${ent.name}` : ent.name;
       const st = fs.lstatSync(path.join(abs, ent.name));
-      out.set(childRel, `${ent.isDirectory() ? 'd' : ent.isSymbolicLink() ? 'l' : 'f'}:${st.size}:${st.mtimeMs}`);
+      // An exact workspace root gains a `node_modules` child during a real install, which moves its own size and mtime:
+      // it is compared by its child names without `node_modules` instead (BRAIN-466). Every other directory keeps size and mtime.
+      const signature = roots.has(childRel)
+        ? `d:names:${fs.readdirSync(path.join(abs, ent.name)).filter((n) => n !== 'node_modules').sort().join('/')}`
+        : ent.isDirectory()
+          ? `d:${st.size}:${st.mtimeMs}`
+          : `${ent.isSymbolicLink() ? 'l' : 'f'}:${st.size}:${st.mtimeMs}:${st.dev}:${st.ino}`;
+      out.set(childRel, signature);
       if (ent.isDirectory()) walk(path.join(abs, ent.name), childRel);
     }
   };
