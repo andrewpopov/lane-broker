@@ -33,6 +33,9 @@ export const QUEUE_RETIER_CAPABILITY = 'queue-retier/1';
 // BRAIN-597: `lane runner watch|status`, the runner heartbeat feeding runner-unreachable.json.
 export const RUNNER_HEARTBEAT_CAPABILITY = 'runner-heartbeat/1';
 
+// TPWR-674: `LANE_BROKER_SCRUB_COMMAND_ENV` strips the listed variables from a locally exec'd command.
+export const SCRUB_COMMAND_ENV_CAPABILITY = 'scrub-command-env/1';
+
 /** The ONE list: `lane remote-probe` advertises it and `lane capabilities --json` prints it. */
 export const CAPABILITIES = [
   ELASTIC_CLAIMS_CAPABILITY,
@@ -51,6 +54,7 @@ export const CAPABILITIES = [
   RUNNER_HEARTBEAT_CAPABILITY,
   SNAPSHOT_GZIP_CAPABILITY,
   REMOTE_EXCLUSIVE_CAPABILITY,
+  SCRUB_COMMAND_ENV_CAPABILITY,
 ];
 
 /** `CAPABILITIES` plus what depends on this host's config: `blob-cache/1` only while the runner blob store is enabled, `cpu-limit/1` only when `cpuLimit` is not "off" and its probe passed. */
