@@ -5,6 +5,7 @@ import path from 'node:path';
 import { writeRepoConfig, laneRun } from './helpers.js';
 import { tmpDir, setup } from './remote-harness.js';
 import { parseScrubCommandEnv } from '../src/scrub-command-env.js';
+import { execFileSync } from 'node:child_process';
 import { childEnv } from '../src/supervisor.js';
 
 /** TPWR-674: LANE_BROKER_SCRUB_COMMAND_ENV names variables a locally exec'd command must not inherit. */
@@ -72,4 +73,9 @@ test('parseScrubCommandEnv keeps valid names only; childEnv leaves env alone wit
   const ticket = { id: 't', key: 'k' };
   assert.equal(childEnv(ticket, { SSH_AUTH_SOCK: 's' }).SSH_AUTH_SOCK, 's');
   assert.equal(childEnv({ ...ticket, scrubCommandEnv: ['SSH_AUTH_SOCK'] }, { SSH_AUTH_SOCK: 's', LANE_BROKER_SCRUB_COMMAND_ENV: 'SSH_AUTH_SOCK' }).LANE_BROKER_SCRUB_COMMAND_ENV, undefined);
+});
+
+test('lane capabilities --json advertises scrub-command-env/1', () => {
+  const out = JSON.parse(execFileSync(process.execPath, [path.resolve('bin/lane.js'), 'capabilities', '--json'], { encoding: 'utf8' }));
+  assert.ok(out.capabilities.includes('scrub-command-env/1'));
 });

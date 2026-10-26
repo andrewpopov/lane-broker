@@ -1189,7 +1189,8 @@ A client that needs its own ssh agent to reach runners but runs untrusted comman
 comma-separated list of variable names (for example `SSH_AUTH_SOCK,SSH_AGENT_PID`). When the command runs on this machine, `lane`
 removes those variables, and `LANE_BROKER_SCRUB_COMMAND_ENV` itself, from the command's environment (the supervisor path and a
 nested direct run alike). `lane` and its supervisor keep them, so runner ssh still works. Names that are not valid variable names are
-ignored. Unset, the command's environment is unchanged. A runner never receives the client's environment.
+ignored. Unset, the command's environment is unchanged. A runner never receives the client's environment. Advertised as capability `scrub-command-env/1`; clients should check it
+(`lane capabilities --json`) before relying on the scrub, since an older `lane` ignores the variable.
 
 ### Runners that are scheduled to be off (BRAIN-533)
 
