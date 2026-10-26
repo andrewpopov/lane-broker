@@ -9,6 +9,7 @@ import { readAttempt } from '../src/attempts.js';
 import { paths, atomicWriteJson, ensureStateDirs, bootId } from '../src/state.js';
 import { processStartTime } from '../src/process-liveness.js';
 import { sweepOrphans } from '../src/reconcile-sweep.js';
+import { recordPings } from '../src/runner-unreachable.js';
 import { selectRunner } from '../src/remote-client.js';
 import { loadGlobalConfig, ConfigError, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 
@@ -166,6 +167,26 @@ test('a runner that answers gone but cannot confirm the cancel is treated as dow
     assert.ok(readAttempt(ctx.state, id), 'every attempt is kept');
     assert.equal(resultOf(ctx.state, id), null);
   }
+});
+
+test('TPWR-674: a heartbeat-vouched runner whose oldest orphan cannot be settled does not hide a newer finished one (submitter died, result.json waiting on the runner)', async () => {
+  const ctx = context();
+  const stuck = seedOrphan(ctx, { attempt: { startedAt: Date.now() - 300_000 } });
+  const finished = seedOrphan(ctx, { record: completed(1), attempt: { startedAt: Date.now() - 100_000 } });
+  await recordPings(ctx.state, [{ name: 'skybox', ok: true }], Date.now());
+  const ssh = cancelFailingSsh(ctx);
+
+  const out = await sweep(ctx, { sshBin: ssh.bin });
+  assert.deepEqual(
+    out.results.map(({ id, state, exit }) => ({ id, state, exit })),
+    [
+      { id: stuck, state: 'unreachable', exit: undefined },
+      { id: finished, state: 'adopted', exit: 1 },
+    ],
+  );
+  assert.ok(readAttempt(ctx.state, stuck), 'the stuck attempt is kept');
+  assert.equal(resultOf(ctx.state, finished).exit, 1);
+  assert.equal(historyRows(ctx, finished).length, 1, 'history recorded');
 });
 
 test('claim: concurrent in-process sweeps run exactly one; a second call within 5 min is recently swept; force bypasses', async () => {

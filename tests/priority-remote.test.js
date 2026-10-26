@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
-import { laneRun, writeGlobalConfig, waitFor, BIN, freshEnv } from './helpers.js';
+import { laneRun, writeGlobalConfig, writeRepoConfig, waitFor, BIN, freshEnv } from './helpers.js';
 import { setup, tmpDir, markerCmd, readCapturedHeader } from './remote-harness.js';
 import { paths, bootId } from '../src/state.js';
 import { writeLease, removeLease, LEASE_STATE } from '../src/lease.js';
@@ -117,6 +117,16 @@ for (const skewMs of [10 * MIN, -10 * MIN]) {
     // low: score = 2 * waited / 120000 (aging 60s, age cap 120s). The submitter's 2.5s+ counts, a 10 minute skew must not.
     assert.ok(row.scoreAtStart > 0.03, `the accrued wait was applied: ${row.scoreAtStart}`);
     assert.ok(row.scoreAtStart < 0.8, `the skew was not: ${row.scoreAtStart}`);
+  });
+}
+
+for (const [name, priority, expected] of [['without priority', undefined, 'high'], ['with an explicit medium', 'medium', 'medium']]) {
+  test(`TPWR-674: a remoteExclusive lane ${name} reaches the runner ticket as ${expected}`, async () => {
+    const ctx = remoteSetup();
+    writeRepoConfig(ctx.repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, remoteExclusive: true, ...(priority ? { priority } : {}) } } });
+    const result = await laneRun(['run', '--lane', 'default', '--', ...noopCmd], { env: ctx.env, cwd: ctx.repoDir });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(ctx.header().priorityRequested, expected);
   });
 }
 

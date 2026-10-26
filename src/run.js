@@ -339,7 +339,7 @@ export async function runCommand({
   // BRAIN-380: resolved and validated before the reentrancy check below, so a bad value exits 64 on every path.
   let priority;
   try {
-    priority = resolvePriority({ cli: priorityOverride, env: process.env.LANE_BROKER_PRIORITY, configTier: resolved.priority, exclusive });
+    priority = resolvePriority({ cli: priorityOverride, env: process.env.LANE_BROKER_PRIORITY, configTier: resolved.priority, exclusive: exclusive || resolved.remoteExclusive === true });
   } catch (err) {
     if (err instanceof ConfigError) {
       process.stderr.write(`lane run: ${err.message}\n`);

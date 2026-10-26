@@ -712,6 +712,9 @@ flag and answers no `tools`, so it counts as **not ready** for a lane with `requ
 
 With no eligible runner a remote-eligible lane runs locally (the local machine is not checked for the tool), and a remote-only
 (`localRefused`) lane exits `76` ("no runner can take it now", retryable) with the message naming each runner and its reason.
+A remote-eligible lane that no runner can take right now AND this machine cannot run either (a `maxExecutionCpuCores` ceiling the host cannot
+enforce, a claim over the local budget; e.g. a `localRefused` lane inside its `localWindow`) also exits `76`, naming both reasons, never `69`
+`CPU_LIMIT_UNAVAILABLE` (TPWR-674). `69` stays for a lane no runner could ever take.
 The check list lives in `src/runner-readiness.js` (`READINESS_CHECKS`); further readiness checks are added there.
 
 Two more checks need nothing from the lane (BRAIN-623):
@@ -739,6 +742,9 @@ starts only when the runner holds no lease, and nothing else is admitted while i
 not run on a runner that already has other lanes. `lane run --exclusive` and `exclusive` on the snapshot's lane are still ignored there. If no
 runner is eligible the lane waits or falls back like any lane with no usable runner; it is not made exclusive locally. A locally queued
 or already-queued remote ticket is moved (rebind, rebalance) only to a runner that is not queued.
+The runner-side ticket is ordered like any exclusive (see "Documented limits" under Exclusive lanes): it defaults to `high` only when the lane's
+resolved tier says so, earns no age credit, and the runner's own high cap can demote it, so a higher-tier or aged arrival can still be admitted
+ahead of it while it waits. That is the documented starvation limit, not a leak in the head gate: whenever the exclusive IS the effective head, nothing else starts.
 
 ### Runner capability tags (`requiresTags` / `runnerTags`, BRAIN-649)
 
@@ -1162,7 +1168,8 @@ calls never run past it, and out of time `lane wait` exits `75`, not `1`. A sign
 cannot confirm makes `lane wait` exit `1` (`cancel of <id> not confirmed (attempt kept)`) rather than poll on. `lane status` starts `lane reconcile` detached whenever it lists an orphan and never waits on ssh itself.
 `lane reconcile [--now] [--json]` runs the sweep by hand: one sweep per 5 minutes per broker (claimed under the broker lock;
 `--now` skips the interval), oldest attempt first, and a runner whose first answer is a transport failure (or whose cancel it cannot confirm) is skipped for the rest
-of that sweep. Every publish goes through `publishTerminal`, which settles an attempt exactly once: a second publisher (a racing
+of that sweep, unless the heartbeat (`lane runner watch`) vouches for the runner (pinged OK within 5 minutes): then one attempt it cannot
+answer is that ticket's problem, and the newer attempts behind it are still asked (TPWR-674; a stuck oldest orphan used to hide every finished one on a runner that was up). Every publish goes through `publishTerminal`, which settles an attempt exactly once: a second publisher (a racing
 `lane cancel`, another sweep, the supervisor) finds no record and writes nothing. A confirmed `remote-cancel` trusts the runner's
 own cancel, whose descendant reap reports survivors without failing.
 

@@ -181,7 +181,7 @@ function setupWindow({ schedule, lanes, ssh = 'down' }) {
   const ctx = remoteSetup({ ssh });
   writeRepoConfig(ctx.repoDir, {
     version: 1,
-    lanes: { e2e: { weight: 1, remote: true, localRefused: true }, sim: { weight: 1, remote: true, localRefused: true, class: 'sim' } },
+    lanes: { e2e: { weight: 1, remote: true, localRefused: true }, train: { weight: 1, remote: true, localRefused: true, maxExecutionCpuCores: 6 }, sim: { weight: 1, remote: true, localRefused: true, class: 'sim' } },
   });
   const cfg = JSON.parse(fs.readFileSync(path.join(ctx.home, 'config.json'), 'utf8'));
   cfg.localWindow = { schedule, lanes };
@@ -224,6 +224,14 @@ test('BRAIN-629: out-of-window + listed lane: refused exactly as before (exit 76
   const ctx = setupWindow({ schedule: closedToday(), lanes: ['e2e'] });
   const { waited, marker } = await runLane(ctx, 'e2e');
   assert.equal(waited.code, 76, `stderr: ${waited.stderr}`);
+  assert.equal(fs.existsSync(marker), false);
+});
+
+test('TPWR-674: in-window lane with an unenforceable CPU ceiling and no runner free: exit 76 (retryable), not 69 CPU_LIMIT_UNAVAILABLE, never ran', async () => {
+  const ctx = setupWindow({ schedule: ALWAYS_OPEN, lanes: ['train'] });
+  const { id, waited, marker } = await runLane(ctx, 'train');
+  assert.equal(waited.code, 76, `stderr: ${waited.stderr}`);
+  assert.match(resultOf(ctx.state, id).error, /no runner can take lane "train" now \(skybox: probe exited 255\) and it cannot run locally \(CPU_LIMIT_UNAVAILABLE/);
   assert.equal(fs.existsSync(marker), false);
 });
 
