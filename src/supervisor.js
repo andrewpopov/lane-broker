@@ -52,6 +52,7 @@ import { relayedUsage, relayedDeps, relayedTransfer, snapshotLine } from './remo
 import { maybeDailyGc } from './gc.js';
 import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, SILENCE_REASON, noProgressMessage, silenceMessage } from './no-progress.js';
 import { settledContentKey, isCleanPass } from './result-cache.js';
+import { scrubCommandEnv } from './scrub-command-env.js';
 import { observedLeaseFields, summarizeObservedCpu, sanitizeRssPeak, integratedCpuSeconds } from './observed.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
@@ -366,7 +367,7 @@ export function childEnv(ticket, baseEnv = process.env, grantedCpuCores = ticket
   // BRAIN-321: a sim lease granted under live caps says so; any other child never inherits the claim.
   if (classEnforcement) env[CLASS_ENFORCEMENT_ENV] = JSON.stringify(classEnforcement);
   else delete env[CLASS_ENFORCEMENT_ENV];
-  return env;
+  return scrubCommandEnv(env, ticket.scrubCommandEnv);
 }
 
 export function applyHeartbeatObservation(lease, observed, now = Date.now(), observedMemoryBytes = null, maxGapMs, idle = null) {

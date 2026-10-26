@@ -1183,6 +1183,14 @@ work-stealing restricted to tasks that have not started; a started task is never
 Both are set by the broker, so a value exported in the caller's shell is replaced. `LANE_BROKER_LOCAL_REASON` is unchanged. The two
 variables reach the `remoteDeps` install and so are part of its deps-cache key.
 
+### Keeping client credentials from a local command (TPWR-674)
+
+A client that needs its own ssh agent to reach runners but runs untrusted commands can set `LANE_BROKER_SCRUB_COMMAND_ENV` to a
+comma-separated list of variable names (for example `SSH_AUTH_SOCK,SSH_AGENT_PID`). When the command runs on this machine, `lane`
+removes those variables, and `LANE_BROKER_SCRUB_COMMAND_ENV` itself, from the command's environment (the supervisor path and a
+nested direct run alike). `lane` and its supervisor keep them, so runner ssh still works. Names that are not valid variable names are
+ignored. Unset, the command's environment is unchanged. A runner never receives the client's environment.
+
 ### Runners that are scheduled to be off (BRAIN-533)
 
 A runner that is powered down on a timetable (a workstation shut down every night) takes an optional `schedule` in the client's

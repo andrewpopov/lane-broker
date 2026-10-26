@@ -18,6 +18,7 @@ import { readRows } from './suggest.js';
 import { rightSizedCpuCores } from './right-size.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
 import { isExclusive, oversizedWeight, oversizedWeightMessage } from './exclusive.js';
+import { parseScrubCommandEnv, scrubCommandEnv, SCRUB_COMMAND_ENV_VAR } from './scrub-command-env.js';
 import { computeContentKey, findCachedPass } from './result-cache.js';
 
 const supervisorPath = fileURLToPath(new URL('./supervisor.js', import.meta.url));
@@ -466,7 +467,7 @@ export async function runCommand({
         }
         if (dispatchOnly) return refuseDispatchOnly(lane, { reason: 'nested run inside a lease' });
         // Reentrant: an ancestor already holds a lease covering this run. Run directly, no new acquisition.
-        const child = spawn(cmd[0], cmd.slice(1), { cwd, stdio: 'inherit', env: { ...process.env, LANE_BROKER_PRIORITY: priority } });
+        const child = spawn(cmd[0], cmd.slice(1), { cwd, stdio: 'inherit', env: scrubCommandEnv({ ...process.env, LANE_BROKER_PRIORITY: priority }, parseScrubCommandEnv(process.env[SCRUB_COMMAND_ENV_VAR])) });
         return new Promise((resolve) => {
           child.on('error', (err) => {
             process.stderr.write(`lane run: failed to start command: ${err.message}\n`);
@@ -612,6 +613,7 @@ export async function runCommand({
   const logPath = log || path.join(p.logs, `${id}.log`);
   const resultPath = path.join(p.results, `${id}.json`);
 
+  const scrubNames = parseScrubCommandEnv(process.env[SCRUB_COMMAND_ENV_VAR]);
   const ticket = {
     id,
     ...(ticketId ? { clientId: true } : {}),
@@ -643,6 +645,8 @@ export async function runCommand({
     allowLocalSim: Boolean(allowLocalSim),
     cwd,
     cmd,
+    // TPWR-674: names only, never values; the supervisor strips them from a locally exec'd command's env
+    ...(scrubNames.length ? { scrubCommandEnv: scrubNames } : {}),
     createdAt: Date.now(),
     priorityRequested: priority,
     priorityAdmitted: priority,
