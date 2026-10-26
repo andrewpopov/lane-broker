@@ -4,6 +4,7 @@ import { paths, atomicWriteFile, ensureStateDirs, withLock } from './state.js';
 import { loadGlobalConfigOrError } from './config.js';
 import { listAttempts, supervisorAlive } from './attempts.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
+import { heartbeatUpRunners } from './runner-unreachable.js';
 
 /**
  * BRAIN-515: settle every ORPHANED-REMOTE attempt whose runner answers, without anyone typing `lane cancel`. A runner that comes
@@ -12,7 +13,9 @@ import { reconcileRemoteAttempt } from './remote-reconcile.js';
  *
  * At most one sweep per SWEEP_INTERVAL_MS: the marker is claimed under the broker lock, so concurrent sweeps (several `lane
  * status` calls) run exactly one. Attempts are asked one at a time, oldest first; the first transport failure for a runner skips
- * that runner's remaining attempts this sweep (no repeated ssh timeouts), and other runners carry on.
+ * that runner's remaining attempts this sweep (no repeated ssh timeouts), and other runners carry on. Exception (TPWR-674): a
+ * runner the heartbeat vouches for (pinged OK within HEARTBEAT_FRESH_MS, read before the sweep, because a failed fetch starts the
+ * unreachable clock) is up, so one attempt it cannot answer is that ticket's problem and must not hide the newer, finished ones.
  */
 export const SWEEP_INTERVAL_MS = 5 * 60_000;
 const CLAIM_LOCK_TIMEOUT_MS = 5000;
@@ -55,6 +58,7 @@ export async function sweepOrphans(root, { globalCfg, force = false, now = Date.
     const orphans = listAttempts(root)
       .filter((a) => a.executor === 'remote' && !supervisorAlive(a) && !a.moving)
       .sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0));
+    const vouchedUp = new Set(heartbeatUpRunners(root, globalCfg, now));
     const downRunners = new Set();
     const results = [];
     for (const attempt of orphans) {
@@ -66,7 +70,7 @@ export async function sweepOrphans(root, { globalCfg, force = false, now = Date.
         results.push({ ...entry, state: 'skipped-runner-down' });
         continue;
       }
-      if (outcome.transport) downRunners.add(attempt.runner);
+      if (outcome.transport && !vouchedUp.has(attempt.runner)) downRunners.add(attempt.runner);
       results.push({
         ...entry,
         state: outcome.state,

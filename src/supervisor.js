@@ -36,7 +36,7 @@ import { starvedStaleMs } from './external-cpu.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, priorityOf, resolveLaneNice, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
-import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, dispatchOnlyRefusal, LOCAL_REFUSED_EXIT_CODE, locallyRefusedNow, localWindowAllowing, leaseCpuCores, terminalRowDefaults } from './resources.js';
+import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, noRunnerLocallyIneligibleRefusal, dispatchOnlyRefusal, LOCAL_REFUSED_EXIT_CODE, locallyRefusedNow, localWindowAllowing, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { remoteCpuAllocation, selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
@@ -794,8 +794,10 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       return { fallback: false };
     }
 
-    const refusal = localIneligibility();
-    if (refusal) {
+    const localRefusal = localIneligibility();
+    if (localRefusal) {
+      // a busy fleet is retryable: a local POLICY refusal (69) becomes 76; a budget refusal (64) and a lane no runner can EVER take keep their codes (TPWR-674)
+      const refusal = noRunner && retryable && localRefusal.exitCode === LOCAL_REFUSED_EXIT_CODE ? noRunnerLocallyIneligibleRefusal(enriched.lane, reason, localRefusal.message) : localRefusal;
       process.stderr.write(refusal.message);
       await publishAndExit(fb.attempt.generation, () => localRefusalResult(enriched, refusal));
       return { fallback: false };

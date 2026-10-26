@@ -386,6 +386,18 @@ export function noRunnerRefusal(lane, reason) {
 }
 
 /**
+ * TPWR-674: no runner can take a remote-eligible lane right now AND this machine cannot run it either (CPU ceiling it cannot enforce, or
+ * a claim over its budget). The fleet being busy is retryable (exit 76), so the local reason rides along instead of becoming a policy refusal (69).
+ */
+export function noRunnerLocallyIneligibleRefusal(lane, reason, localMessage) {
+  return {
+    ok: false,
+    exitCode: NO_RUNNER_EXIT_CODE,
+    message: `lane run: no runner can take lane "${lane}" now (${reason}) and it cannot run locally (${localMessage.replace(/^lane run: /, '').trim()}). Retry later.\n`,
+  };
+}
+
+/**
  * BRAIN-634: `localExecution: "refused"` makes this host dispatch-only. `retryable` is a ticket that could go remote but no runner
  * can take it now (exit 76); otherwise it can never go remote from here (exit 69).
  */
