@@ -532,6 +532,7 @@ test('remote-probe advertises elastic-claims/1', () => {
     'runner-heartbeat/1',
     'snapshot-gzip/1',
     'remote-exclusive/1',
+    'scrub-command-env/1',
     'blob-cache/1',
   ]);
 });
