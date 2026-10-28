@@ -39,7 +39,7 @@ import { phasesReportCommand } from '../src/phases-report.js';
 
 function usage() {
   return `Usage:
-  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--exclusive] [--no-cache] [--detach [--id <ticket-id>]]
+  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--exclusive] [--no-cache] [--no-reuse] [--retry "<why>"] [--detach [--id <ticket-id>]]
            [--timeout <duration>] [--allow-local-sim] [--local] [--log <path>] -- <command...>
   lane status [--json]
   lane capabilities --json
@@ -110,6 +110,16 @@ function parseRunArgs(args) {
         break;
       case '--no-cache':
         opts.noCache = true;
+        break;
+      // BRAIN-700: a hypothesis for re-running content that already failed; blank is a usage error
+      case '--retry': {
+        const raw = flagArgs[++i];
+        if (!raw || !raw.trim() || raw.startsWith('--')) throw new Error('--retry needs a non-empty reason');
+        opts.retryReason = raw;
+        break;
+      }
+      case '--no-reuse':
+        opts.noReuse = true;
         break;
       case '--detach':
         opts.detach = true;
@@ -190,6 +200,8 @@ async function main() {
         priority: opts.priority,
         exclusive: opts.exclusive,
         noCache: opts.noCache,
+        noReuse: opts.noReuse,
+        retryReason: opts.retryReason,
         detach: opts.detach,
         timeoutMs: opts.timeout ? parseDurationMs(opts.timeout) : undefined,
         allowLocalSim: opts.allowLocalSim,

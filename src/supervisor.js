@@ -461,7 +461,7 @@ function localRefusalResult(ticket, refusal) {
  * the `result` spread); `localReason` is the ticket's creation-time reason, or
  * `fallback:<reason>` when a remote attempt fell back to local.
  */
-function historyRow(ticket, result, { fallbackReason, lease, contentKey = isCleanPass(result) ? undefined : ticket.contentKey } = {}) {
+function historyRow(ticket, result, { fallbackReason, lease, contentKey = isCleanPass(result) ? undefined : ticket.contentKey, contentKeyVerified = false } = {}) {
   const executor = result.executor ?? 'local';
   const localReason = executor === 'local' ? (fallbackReason === undefined ? ticket.localReason : `fallback:${fallbackReason}`) : undefined;
   return {
@@ -481,6 +481,10 @@ function historyRow(ticket, result, { fallbackReason, lease, contentKey = isClea
     ...(ticket.cmdFingerprint ? { cmdFingerprint: ticket.cmdFingerprint } : {}),
     headTree: ticket.headTree,
     ...(contentKey ? { contentKey } : {}),
+    // BRAIN-700: the tree still hashed to the key when the run ended, so a failure on it is a verdict about that content
+    ...(contentKey && contentKeyVerified ? { contentKeyVerified: true } : {}),
+    ...(ticket.retryReason ? { retryReason: ticket.retryReason } : {}),
+    ...(ticket.logPath ? { logPath: ticket.logPath } : {}),
     // BRAIN-380 §8: only a ticket that was admitted has a lease, so only its row carries the admission audit
     ...priorityAuditOf(lease),
     // BRAIN-425: every row states what the lane was granted and how it ended; a grant or exit in `result` wins
@@ -670,9 +674,9 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   let selectedRunner = null;
   function writeResultSync(result) {
     // BRAIN-549: settled before the result is published, so a caller that reads history once `lane run` returns finds the row
-    const contentKey = settledContentKey(enriched, result);
+    const contentKey = settledContentKey(enriched);
     atomicWriteJson(enriched.resultPath, result);
-    appendHistory(root, historyRow(enriched, { ...result, ...(selectedRunner ? { runner: selectedRunner } : {}) }, { contentKey }));
+    appendHistory(root, historyRow(enriched, { ...result, ...(selectedRunner ? { runner: selectedRunner } : {}) }, { contentKey, contentKeyVerified: contentKey !== null }));
   }
 
   /**
@@ -1206,6 +1210,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       ...(silence ? { reason: SILENCE_REASON, silenceTimeoutMs: dispatch.result.silenceTimeoutMs } : {}),
       remoteKind: dispatch.result.kind,
       remotePhase: dispatch.phase ?? null,
+      // BRAIN-700: the client reports a signalled remote child as exit 1, so the runner's own signal is kept to tell it from a test failure
+      ...(dispatch.result.signal ? { remoteSignal: dispatch.result.signal } : {}),
       startedAt: remoteWaitedMs === null ? attemptStartedAt : enriched.createdAt + remoteWaitedMs,
       // the runner-measured run duration: endedAt is the local receipt time, so `endedAt - startedAt` also holds the delivery delay
       ...(Number.isFinite(runMs) && runMs >= 0 ? { runMs } : {}),
@@ -1858,9 +1864,9 @@ async function main() {
       // BRAIN-431: the longest stretch with no output and no CPU, whether or not the opt-in kill is on (monitoring reads it)
       finalResult = { ...finalResult, maxNoProgressMs: Math.round(watchdog.maxIdleMs) };
       // BRAIN-549: settled before the result is published, so a caller that reads history once `lane run` returns finds the row
-      const contentKey = settledContentKey(ticket, finalResult);
+      const contentKey = settledContentKey(ticket);
       atomicWriteJson(ticket.resultPath, finalResult);
-      appendHistory(root, historyRow(ticket, finalResult, { fallbackReason, lease: started.lease, contentKey }));
+      appendHistory(root, historyRow(ticket, finalResult, { fallbackReason, lease: started.lease, contentKey, contentKeyVerified: contentKey !== null }));
       removeLease(root, ticket.id); // release always comes last
       touchSimArmFor(root, ticket); // after the release: the arm stamp's I/O never delays freeing the lease
       // Cleanup only, AFTER the terminal write above -- never before (BLOCKER #1).

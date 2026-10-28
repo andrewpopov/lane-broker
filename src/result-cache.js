@@ -78,27 +78,56 @@ export function computeContentKey({ cwd, key, cmdFingerprint }) {
   }
 }
 
-/** The newest real, clean exit-0 run with this key inside the TTL, or null. A cached row (`cachedFrom`) never counts, so a hit cannot extend a pass's life. */
-export function findCachedPass(rows, { contentKey, now, ttlMs }) {
-  let best = null;
+/** Exits that describe the broker, the runner or the caller rather than the command's own verdict (usage, refusal, retryable, timeout, cancel). */
+const NON_VERDICT_EXITS = new Set([64, 69, 75, 76, 79, 124, 130]);
+
+const isNewestRowCandidate = (row, contentKey, now) =>
+  Boolean(row) && row.contentKey === contentKey && !row.cachedFrom && !row.refusedFrom && Number.isFinite(row.startedAt) && Number.isFinite(row.endedAt) && row.endedAt <= now;
+
+/** A clean exit-0 row: the only kind that may be served. */
+const isServablePass = (row) => row.exit === 0 && !row.signal && !row.cancelled && !row.error && !row.reason;
+
+/**
+ * BRAIN-700: a genuine test failure, safe to refuse a byte-identical re-run for: the command itself exited non-zero on content the
+ * key still described when it ended (`contentKeyVerified`), with no signal, cancel, error or watchdog reason. A remote run also must
+ * have completed (not been refused or rejected) in the `command` phase, never `deps` or `setup`. Rows written before
+ * `contentKeyVerified` existed never qualify.
+ */
+export function isQualifyingRed(row) {
+  if (row.contentKeyVerified !== true) return false;
+  if (!Number.isInteger(row.exit) || row.exit === 0 || row.exit >= 128 || NON_VERDICT_EXITS.has(row.exit)) return false;
+  if (row.signal || row.cancelled || row.error || row.reason) return false;
+  if (row.executor === 'remote' && (row.remoteKind !== 'completed' || row.remotePhase !== 'command' || row.remoteSignal)) return false;
+  return true;
+}
+
+/**
+ * The newest real outcome for `contentKey` decides: a servable pass inside `passTtlMs` is served, a qualifying red inside
+ * `redTtlMs` is refused, anything else (a newer infra/signal/cancel row, a red that does not qualify, expiry) runs. A TTL of 0
+ * turns that answer off. Cached and refused rows and rows with no usable or future timestamps are not outcomes. On equal
+ * `endedAt` the later row in the file wins.
+ */
+export function decideReuse(rows, { contentKey, now, passTtlMs, redTtlMs }) {
+  let newest = null;
   for (const row of rows) {
-    if (!row || row.contentKey !== contentKey || row.cachedFrom) continue;
-    if (row.exit !== 0 || row.signal || row.cancelled || row.error || row.reason) continue;
-    if (!Number.isFinite(row.startedAt) || !Number.isFinite(row.endedAt) || row.endedAt > now || now - row.endedAt > ttlMs) continue;
-    if (!best || row.endedAt > best.endedAt) best = row;
+    if (!isNewestRowCandidate(row, contentKey, now)) continue;
+    if (!newest || row.endedAt >= newest.endedAt) newest = row;
   }
-  return best;
+  if (!newest) return { action: 'run' };
+  const age = now - newest.endedAt;
+  if (isServablePass(newest) && passTtlMs > 0 && age <= passTtlMs) return { action: 'serve', row: newest };
+  if (isQualifyingRed(newest) && redTtlMs > 0 && age <= redTtlMs) return { action: 'refuse', row: newest };
+  return { action: 'run' };
 }
 
 export const isCleanPass = (result) => result.exit === 0 && !result.signal;
 
 /**
- * The key a finished run's history row carries. A pass keeps it only if the worktree still hashes to the key taken at
- * `lane run` time: an edit while the run was queued or running means the pass may describe other content than the key says.
+ * The key a finished run's history row carries (null: none), for a pass or a failure alike: it is kept only if the worktree still hashes to the key
+ * taken at `lane run` time. An edit while the run was queued or ran means the result may describe other content than the key says.
  */
-export function settledContentKey(ticket, result) {
-  if (!ticket.contentKey) return undefined;
-  if (!isCleanPass(result)) return ticket.contentKey;
+export function settledContentKey(ticket) {
+  if (!ticket.contentKey) return null;
   const after = computeContentKey({ cwd: ticket.cwd, key: ticket.key, cmdFingerprint: ticket.cmdFingerprint });
-  return after === ticket.contentKey ? after : undefined;
+  return after === ticket.contentKey ? after : null;
 }
