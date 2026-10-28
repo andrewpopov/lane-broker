@@ -1596,6 +1596,16 @@ Each express start is logged in `admission-decisions.log` as
 express tickets `[express]` (JSON: `express: true`). The estimates are cached in
 `express-estimates.json` for 5 minutes. `expressMaxMs: 0` turns it off.
 
+**Priority yield past a reserved head** (BRAIN-630). A ticket whose admitted tier is strictly higher than a
+head's with a *resource* reservation (not the capacity-blocked kind) may start past it when it fits now on its own
+(the normal admission checks) and the weight-capacity half of BRAIN-355's proof holds. It is decided before express, so
+an express-sized gate past a protected head yields instead of being denied against the head's claim. The head keeps its
+reservation and place, and a yield is not a skip against it. Starvation bound: the first `resourceSkipLimit` yields per head
+(`yields` in `resource-skip-state.json`) do not reserve the head's CPU claim, since a head that cannot fit until leases
+drain would otherwise exclude every push gate however far it aged; each later yield must also fit with the head's claim
+reserved, as a protected express start does, so a stream of gates cannot keep the head from starting. Starts also share the
+`expressPerMinute` window. Same-tier and lower-tier tickets still wait behind the head.
+
 **Bounded idle exemption** (`resourceIdleOvershootCores`, default 1; `0`
 disables): ambient load can make a large lane unsatisfiable even with nothing
 running (9 cores of budget, 5.4 busy, a 4-core head projects 9.4). When the
