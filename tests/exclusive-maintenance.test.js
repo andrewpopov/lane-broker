@@ -148,11 +148,11 @@ test('purpose or deadline without exclusive exits 64 naming the key; bad values 
 test('exclusive without purpose or deadline warns and stays exclusive; with both it is silent', async () => {
   const ctx = setup();
   const bare = await submit(ctx, { exclusive: true });
-  assert.match(bare.stderr, /exclusive without --exclusive-purpose\/--exclusive-deadline is deprecated; refused from 0\.62\.0/);
+  assert.match(bare.stderr, /exclusive without --exclusive-purpose\/--exclusive-deadline is deprecated; refused from 0\.63\.0/);
   assert.equal(bare.ticket.exclusive, true, 'never silently downgraded');
   assert.equal(bare.ticket.exclusivePurpose, undefined);
   const half = await submit(ctx, { exclusive: true, exclusivePurpose: 'upgrade' });
-  assert.match(half.stderr, /is deprecated; refused from 0\.62\.0/);
+  assert.match(half.stderr, /is deprecated; refused from 0\.63\.0/);
   assert.equal(half.ticket.exclusive, true);
   const full = await submit(ctx, { exclusive: true, exclusivePurpose: 'upgrade', exclusiveDeadline: '1m' });
   assert.doesNotMatch(full.stderr, /deprecated/);
@@ -162,7 +162,7 @@ test('exclusive without purpose or deadline warns and stays exclusive; with both
 test('remoteExclusive: still honoured, with the one deprecation line on stderr (and none for a lane without it)', async () => {
   const ctx = setup({ lane: { remoteExclusive: true } });
   const run = await submit(ctx, {});
-  const expected = 'lane-broker: lane "default": "remoteExclusive" is deprecated: it holds a whole runner. Book cpuCores/memoryBytes honestly instead; leases are CPU-enforced (BRAIN-695). Refused from 0.62.0.\n';
+  const expected = 'lane-broker: lane "default": "remoteExclusive" is deprecated: it holds a whole runner. Book cpuCores/memoryBytes honestly instead; leases are CPU-enforced (BRAIN-695). Refused from 0.63.0.\n';
   assert.equal(remoteExclusiveDeprecationMessage('default') + '\n', expected);
   assert.equal(run.stderr.split(expected).length - 1, 1, `exactly once: ${run.stderr}`);
   assert.equal(run.result.exitCode, 0, 'behaviour unchanged');

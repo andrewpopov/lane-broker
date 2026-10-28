@@ -134,10 +134,10 @@ test('enforcementOf: enforced + measured, cpu-only host, memory off, and the dar
   assert.deepEqual(enforcementOf(mac, { platform: 'darwin' }), { cpu: 'unenforced', memory: 'unavailable', reason: 'no cgroups on darwin; children get nice only' });
 });
 
-test('enforcementLabel names the enforcement, or that the runner is older than 0.61.0', () => {
+test('enforcementLabel names the enforcement, or that the runner is older than 0.62.0', () => {
   assert.equal(enforcementLabel({ cpu: 'enforced', memory: 'measured', reason: 'ok' }), 'cpu enforced, memory measured');
   assert.equal(enforcementLabel(undefined), ENFORCEMENT_UNKNOWN);
-  assert.equal(ENFORCEMENT_UNKNOWN, 'unknown (runner older than 0.61.0)');
+  assert.equal(ENFORCEMENT_UNKNOWN, 'unknown (runner older than 0.62.0)');
 });
 
 test('RUNNERS lines show each runner\'s last-seen enforcement; absent field renders nothing', () => {
@@ -148,7 +148,7 @@ test('RUNNERS lines show each runner\'s last-seen enforcement; absent field rend
     { ...base, name: 'unseen' },
   ]).join('\n');
   assert.match(lines, /skybox .*enforcement: cpu enforced, memory measured/);
-  assert.match(lines, /old .*enforcement: unknown \(runner older than 0\.61\.0\)/);
+  assert.match(lines, /old .*enforcement: unknown \(runner older than 0\.62\.0\)/);
   assert.doesNotMatch(lines.split('\n').find((l) => l.includes('unseen')), /enforcement/);
 });
 

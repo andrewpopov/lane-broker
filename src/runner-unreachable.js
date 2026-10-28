@@ -21,7 +21,7 @@ export const HEARTBEAT_KEY = '__heartbeat';
  *  A placement clears the runners that passed its probe; a runner it never probes (down, off schedule) would keep its gap forever, so an
  *  entry older than READINESS_TTL_MS is dropped on read and pruned on the next write. */
 export const READINESS_KEY = '__readiness';
-/** BRAIN-695: `{ "<runner>": { cpu, memory, reason } | null }`, the enforcement each runner's probe last reported at placement (null = a runner older than 0.61.0). */
+/** BRAIN-695: `{ "<runner>": { cpu, memory, reason } | null }`, the enforcement each runner's probe last reported at placement (null = a runner older than 0.62.0). */
 export const ENFORCEMENT_KEY = '__enforcement';
 export const HEARTBEAT_FRESH_MS = 5 * 60_000;
 const LOCK_WAIT_MS = 5000;

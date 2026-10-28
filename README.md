@@ -732,8 +732,8 @@ Two more checks need nothing from the lane (BRAIN-623):
 
 ### A lane that holds a whole runner (`remoteExclusive`, BRAIN-649) - deprecated
 
-**Deprecated (BRAIN-695), refused from 0.62.0.** A lane that holds a whole runner is the opposite of an enforced lease: book `cpuCores` and
-`memoryBytes` honestly instead (leases are CPU-enforced), and let the scheduler share the runner. In 0.61.0 the key still works as described
+**Deprecated (BRAIN-695), refused from 0.63.0.** A lane that holds a whole runner is the opposite of an enforced lease: book `cpuCores` and
+`memoryBytes` honestly instead (leases are CPU-enforced), and let the scheduler share the runner. In 0.62.0 the key still works as described
 below, and `lane run` prints `"remoteExclusive" is deprecated` to stderr once per run for a lane that sets it. Do not use it for test suites or release candidates.
 
 ```json
@@ -1332,7 +1332,7 @@ reads it refuses.
 
 ### Enforced leases: CPU quota per lane, memory measured (`cpuLimit`, `memoryLimit`, BRAIN-651 L1-L3, BRAIN-695)
 
-A booking is a cap on CPU and a measured figure for memory (BRAIN-695, 0.61.0).
+A booking is a cap on CPU and a measured figure for memory (BRAIN-695, 0.62.0).
 `"cpuLimit": "off" | "prefer" | "require"` (global config, default `"prefer"`; any other value is a config error naming the key)
 enforces a lane's admitted CPU grant on a **Linux** host with a transient systemd scope, `CPUQuota=<grant x 100>%`.
 With `"prefer"` or `"require"` and a passing probe, the supervisor spawns each lane child inside `systemd-run --user --scope --unit=lane-<leaseId>.scope -p CPUQuota=<grant x 100>% --quiet --collect`,
@@ -1360,7 +1360,7 @@ and the lease is released anyway. A scope that is already unloaded counts as sto
 - `lane status --json`, `lane remote-probe` and `lane capabilities --json` carry `cpuLimit: {mode, available, reason, memory}` and
   `enforcement: {cpu: "enforced"|"unenforced", memory: "measured"|"off"|"unavailable", reason}` (macOS: "no cgroups on darwin; children get nice only").
   `cpu-limit/1` is added to the advertised capabilities only when the mode is not `off` and the probe passed; `enforced-leases/1` additionally needs `memoryLimit` not `off`.
-  The placement line `lane: running on <runner> (cpu enforced, memory measured)` names the chosen runner's enforcement (a runner older than 0.61.0 reads `unknown (runner older than 0.61.0)`), and the `lane status` RUNNERS block repeats the last one placement saw.
+  The placement line `lane: running on <runner> (cpu enforced, memory measured)` names the chosen runner's enforcement (a runner older than 0.62.0 reads `unknown (runner older than 0.62.0)`), and the `lane status` RUNNERS block repeats the last one placement saw.
 - Quota limits CPU time over a period, not instantaneous concurrency, and it needs a user systemd instance with the `cpu` controller delegated;
   that is what the probe checks.
 
@@ -2192,8 +2192,8 @@ deadline (`--exclusive-deadline <dur>`, or `exclusiveDeadlineMs` on the lane: an
 `--detach`), and a nested same-lane run lives inside the parent's lease, so it is covered by the parent's deadline and never starts a second timer.
 On expiry the supervisor ends the whole workload through the same process-group, descendant and CPU-scope cleanup as `lane cancel`, releases the
 lease, and publishes exit `124` with `exclusive deadline <d> expired` (the history row carries `exclusiveDeadlineExpired: true`), even if the command
-trapped TERM and exited `0`. A `lane cancel` that lands before expiry keeps exit `130`. In 0.61.0 an exclusive run without a purpose or a deadline
-still runs, with a stderr warning (`exclusive without --exclusive-purpose/--exclusive-deadline is deprecated; refused from 0.62.0`); it is refused from 0.62.0.
+trapped TERM and exited `0`. A `lane cancel` that lands before expiry keeps exit `130`. In 0.62.0 an exclusive run without a purpose or a deadline
+still runs, with a stderr warning (`exclusive without --exclusive-purpose/--exclusive-deadline is deprecated; refused from 0.63.0`); it is refused from 0.63.0.
 
 A non-exclusive lane whose `weight` exceeds the global `maxLaneWeight` (integer, default 4, the same on every host) is refused
 with exit 64 at every submission, a runner's intake included (BRAIN-452: book the real size with `cpuCores`/`memoryBytes`),

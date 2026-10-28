@@ -8,7 +8,7 @@ export const CPU_LIMIT_MODES = ['off', 'prefer', 'require'];
 export const MEMORY_LIMIT_MODES = ['off', 'measure', 'enforce'];
 /** BRAIN-695: advertised when CPU is capped per lease (probe passed, cpuLimit on) and memory is not switched off. */
 export const ENFORCED_LEASES_CAPABILITY = 'enforced-leases/1';
-export const ENFORCEMENT_UNKNOWN = 'unknown (runner older than 0.61.0)';
+export const ENFORCEMENT_UNKNOWN = 'unknown (runner older than 0.62.0)';
 export const CPU_LIMIT_UNAVAILABLE = 'CPU_LIMIT_UNAVAILABLE';
 
 const PROBE_TIMEOUT_MS = 10_000;
@@ -122,7 +122,7 @@ export function enforcementOf(resolved, { platform = process.platform } = {}) {
   return { cpu, memory, reason };
 }
 
-/** A probe's enforcement as the placement line and `lane status` name it; a runner older than 0.61.0 sends none. */
+/** A probe's enforcement as the placement line and `lane status` name it; a runner older than 0.62.0 sends none. */
 export function enforcementLabel(enforcement) {
   if (!enforcement || typeof enforcement !== 'object') return ENFORCEMENT_UNKNOWN;
   return `cpu ${enforcement.cpu}, memory ${enforcement.memory}`;
