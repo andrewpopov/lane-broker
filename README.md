@@ -1288,6 +1288,22 @@ already dropped (the submitter is polling `remote-result`) waits on the drained 
 0.33 does not move queued tickets early: it skips the drained runner for new work but waits the usual minimum before moving
 anything queued.
 
+**Before a host shutdown: `lane drain --shutdown` (BRAIN-350).**
+
+```
+lane drain --shutdown ["reason"] [--wait-ms N]   # default reason "host shutting down", default wait 60000
+```
+
+Run it just before the machine goes down (a logoff script on a Windows host running the runner in WSL). It writes a drain marker
+that also records the boot it was written in, so it ends with that boot: the runner takes work again after it comes back, with no
+`lane undrain`. Then, for every remote ticket that has not published a result, it writes a `shutdown` marker in the ticket
+directory, stops its local lane if one is registered, and waits (up to `--wait-ms`) for each ticket to publish or its publisher
+to die. A `remote-exec` that arrives later sees the same marker and never starts its command. Each ticket ends with a record
+`kind: "unfinished"`, `reason: "runner-shutdown"` (the ticket's `cancelled` marker is never written, so the submitter does not
+read it as a user cancel). That record proves the job is dead, so the submitter can run it elsewhere. A job that completed on
+its own first keeps its `completed` record, and a user cancel still reads `cancelled`. It prints `stopped N, published M, still
+pending K` and exits 0 (1 only if the marker could not be written). `--root <dir>` overrides the remote root (tests).
+
 ### Returning files from a remote run (BRAIN-398)
 
 A gate that leaves a stamp for a later check (a lane stamp, a report) writes it on the runner, not in your worktree. List
