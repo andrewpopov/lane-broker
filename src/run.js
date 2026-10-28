@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { ensureStateDirs, paths, stateHome, readJsonSafe, appendHistory, LockTimeoutError, MigrationInProgressError, assertNotMigrating, isUuid } from './state.js';
 import { classTransportMismatch } from './classes.js';
 import { remoteExcludePreflight } from './remote-exclude.js';
+import { MIN_CPU_GRANT_CORES } from './cpu-limit.js';
 import { resolveTicketConfig, reloadGlobalConfig, isDispatchOnly, resolvePriority, assertHostConfigHookless, ConfigError } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
@@ -428,6 +429,11 @@ export async function runCommand({
   // BRAIN-552: client side only. A runner (configRoot) takes the cores the submitting client already capped, from a snapshot with no git;
   // an exclusive claims the whole budget by design, so it is not capped here.
   let requestedCpuCores = cpuOverride ?? resolved.cpuCores ?? weight;
+  // an unset cpuCores resolves to weight, so a weight under the minimum grant is a CPU claim no quota can express
+  if (!exclusive && requestedCpuCores < MIN_CPU_GRANT_CORES) {
+    process.stderr.write(`lane run: --weight must be >= ${MIN_CPU_GRANT_CORES} when it is the CPU claim (no --cpu or cpuCores; got ${weight})\n`);
+    return { exitCode: 2 };
+  }
   let cappedMinCpuCores = requestedMinCpuCores;
   if (!runnerIntake && !exclusive) {
     const approval = committedLaneApproval(checkoutRoot, resolved.lane);
