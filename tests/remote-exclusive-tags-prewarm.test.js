@@ -6,19 +6,17 @@ import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { CPU_LIMIT_CAPABILITY } from '../src/cpu-limit.js';
 import { selectRunner } from '../src/remote-client.js';
-import { remoteSelectOptions, selectionOptionsFor } from '../src/supervisor.js';
+import { selectionOptionsFor } from '../src/supervisor.js';
 import { resolveTicketConfig, ConfigError, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { readinessGap, readinessProbeArgs, parseReadinessArgs } from '../src/runner-readiness.js';
 import { runCommand } from '../src/run.js';
-import { CAPABILITIES, REMOTE_EXCLUSIVE_CAPABILITY, EXECUTION_CEILING_CAPABILITY, advertisedCapabilities } from '../src/capabilities.js';
+import { CAPABILITIES, EXECUTION_CEILING_CAPABILITY, advertisedCapabilities } from '../src/capabilities.js';
 import { runnerPrewarmCommand, pickPrewarmLane } from '../src/runner-prewarm.js';
-import { enqueue, tryStart } from '../src/scheduler.js';
-import { writeLease, removeLease, LEASE_STATE } from '../src/lease.js';
-import { bootId, atomicWriteJson } from '../src/state.js';
+import { atomicWriteJson } from '../src/state.js';
 import { tmpDir, makeRunner } from './remote-harness.js';
 import { freshEnv, writeRepoConfig, writeGlobalConfig, laneRun, gitFixture } from './helpers.js';
 
-/** BRAIN-649: `remoteExclusive` (a lane holds a whole runner), `requiresTags`/`runnerTags` (capability filter), `lane runner prewarm`. */
+/** BRAIN-649: `requiresTags`/`runnerTags` (capability filter), `lane runner prewarm`. */
 
 /** A fake ssh answering `remote-probe` per destination from `probes`; `tags` answers `--tags` like the real runner does, for names asked. */
 function makeProbeSsh({ probes, tags = {} }) {
@@ -43,67 +41,6 @@ process.stdout.write(JSON.stringify(probe) + '\\n');
   return bin;
 }
 const runners = (...names) => names.map((n) => makeRunner({ ssh: n }));
-
-// ---- remoteExclusive: placement ----
-
-test('preferIdle: an idle eligible runner is taken over busy and queued ones, whatever the config order', async () => {
-  const sshBin = makeProbeSsh({ probes: { busy: { running: 1 }, queued: { queued: 1 }, idle: {} } });
-  const res = await selectRunner(runners('busy', 'queued', 'idle'), { sshBin, deadlineMs: 3000, preferIdle: true, maxRemoteQueue: 0 });
-  assert.equal(res.runner.name, 'idle');
-  assert.equal(res.queuedChoice, undefined);
-});
-
-test('preferIdle: with none idle the least-loaded eligible runner is the queued choice, past maxRemoteQueue (not no-runner); control: an ordinary lane gets none', async () => {
-  const sshBin = makeProbeSsh({ probes: { deep: { running: 2, queued: 9 }, busy: { running: 3, queued: 0 }, mid: { running: 1, queued: 4 } } });
-  const res = await selectRunner(runners('deep', 'busy', 'mid'), { sshBin, deadlineMs: 3000, preferIdle: true, maxRemoteQueue: 2 });
-  assert.equal(res.runner.name, 'busy');
-  assert.equal(res.queuedChoice, true);
-  assert.match(res.skipped.find((s) => s.name === 'busy').reason, /not idle \(running 3, queued 0\).*drain/);
-  const tie = await selectRunner(runners('deep', 'mid', 'mid2'), { sshBin: makeProbeSsh({ probes: { deep: { queued: 4 }, mid: { queued: 4, headroom: { cpuCores: 1 } }, mid2: { queued: 4, headroom: { cpuCores: 8 } } } }), deadlineMs: 3000, preferIdle: true, reservation: { weight: 1, cpuCores: 1, memoryBytes: 0 } });
-  assert.equal(tie.runner.name, 'mid2', 'equal queues: more free CPU wins');
-  const control = await selectRunner(runners('deep', 'busy', 'mid'), { sshBin, deadlineMs: 3000, maxRemoteQueue: 2 });
-  assert.equal(control.runner.name, 'busy');
-  const controlDeep = await selectRunner(runners('deep'), { sshBin, deadlineMs: 3000, maxRemoteQueue: 2 });
-  assert.equal(controlDeep.runner, null);
-});
-
-test('preferIdle: a runner missing the tag or the capability is never chosen, even when idle, and with none eligible there is no runner', async () => {
-  const sshBin = makeProbeSsh({
-    probes: { idleNoTag: {}, idleOld: { capabilities: ['exclusive/1'] }, loaded: { running: 2, queued: 3 } },
-    tags: { loaded: ['browser'] },
-  });
-  const needs = { sshBin, deadlineMs: 3000, preferIdle: true, requireCapabilities: [REMOTE_EXCLUSIVE_CAPABILITY], readinessNeeds: { tags: ['browser'] } };
-  const res = await selectRunner(runners('idleNoTag', 'idleOld', 'loaded'), needs);
-  assert.equal(res.runner.name, 'loaded');
-  assert.equal(res.queuedChoice, true);
-  const none = await selectRunner(runners('idleNoTag', 'idleOld'), needs);
-  assert.equal(none.runner, null);
-  assert.equal(none.queuedChoice, undefined);
-});
-
-test('remoteSelectOptions: a remoteExclusive lane prefers an idle runner and requires remote-exclusive/1; rebind and rebalance never take a loaded one; an ordinary lane neither', () => {
-  const cfg = { ...DEFAULT_GLOBAL_CONFIG, runners: [] };
-  const base = { id: 'x', lane: 'l', repoId: 'r', weight: 1, resources: {}, remote: {} };
-  const exclusive = remoteSelectOptions({ ...base, remote: { remoteExclusive: true } }, cfg, tmpDir('opts'));
-  assert.equal(exclusive.preferIdle, true);
-  assert.ok(exclusive.requireCapabilities.includes(REMOTE_EXCLUSIVE_CAPABILITY));
-  const exclusiveEnriched = { ...base, remote: { remoteExclusive: true } };
-  for (const kind of ['rebind', 'rebalance']) assert.equal(selectionOptionsFor(kind, exclusiveEnriched, cfg, { root: tmpDir('opts') }).preferIdle, false);
-  assert.equal(selectionOptionsFor('place', exclusiveEnriched, cfg, { root: tmpDir('opts') }).preferIdle, true);
-  const plain = remoteSelectOptions(base, cfg, tmpDir('opts'));
-  assert.equal(plain.preferIdle, false);
-  assert.deepEqual(plain.requireCapabilities, []);
-  assert.ok(CAPABILITIES.includes(REMOTE_EXCLUSIVE_CAPABILITY));
-});
-
-test('a runner that does not advertise remote-exclusive/1 (an older release, which would ignore the flag) is skipped', async () => {
-  const sshBin = makeProbeSsh({ probes: { old: { capabilities: ['exclusive/1'] }, current: {} } });
-  const res = await selectRunner(runners('old', 'current'), { sshBin, deadlineMs: 3000, preferIdle: true, requireCapabilities: [REMOTE_EXCLUSIVE_CAPABILITY] });
-  assert.equal(res.runner.name, 'current');
-  assert.match(res.skipped[0].reason, /does not advertise remote-exclusive\/1/);
-});
-
-// ---- remoteExclusive: runner-side admission ----
 
 const GIB = 1024 ** 3;
 async function submit({ env, cwd, ...options }) {
@@ -146,34 +83,6 @@ function setup(lane) {
   return { home, state, env, repoDir };
 }
 
-test('runner intake honours remoteExclusive (an exclusive, high ticket) but still ignores a plain exclusive; the submitter side is not made exclusive', async () => {
-  const withRemote = setup({ remoteExclusive: true });
-  const intake = await submit({ env: withRemote.env, cwd: withRemote.repoDir, configRoot: withRemote.repoDir });
-  assert.equal(intake.ticket.exclusive, true);
-  assert.equal(intake.ticket.priorityRequested, 'high');
-  const submitterSide = await submit({ env: withRemote.env, cwd: withRemote.repoDir });
-  assert.equal(Object.hasOwn(submitterSide.ticket, 'exclusive'), false, 'remoteExclusive does not make the local run exclusive');
-  const plainExclusive = setup({ exclusive: true });
-  const ignored = await submit({ env: plainExclusive.env, cwd: plainExclusive.repoDir, configRoot: plainExclusive.repoDir });
-  assert.equal(Object.hasOwn(ignored.ticket, 'exclusive'), false);
-});
-
-test('the runner admits the intake ticket only when it holds nothing, then admits nothing else while it runs', async () => {
-  const { state, env, repoDir } = setup({ remoteExclusive: true });
-  const { ticket: submitted } = await submit({ env, cwd: repoDir, configRoot: repoDir });
-  const ticket = { ...submitted, id: 'intake-excl', supervisorPid: process.pid, supervisorStart: null, logPath: '/dev/null', resultPath: '/dev/null' };
-  const cfg = { ...DEFAULT_GLOBAL_CONFIG, schedulerMode: 'shadow', capacity: 10, loadClose: 1000, loadOpen: 900, admissionCooldownMs: 0 };
-  const lease = (id, extra = {}) => ({ id, key: `r:${id}`, bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight: 1, state: LEASE_STATE.RUNNING, ...extra });
-  writeLease(state, lease('other'));
-  await enqueue(state, ticket);
-  assert.equal((await tryStart(state, ticket, cfg)).reason, 'exclusive-draining');
-  removeLease(state, 'other');
-  assert.equal((await tryStart(state, ticket, cfg)).started, true, 'control: it starts once the runner holds nothing');
-  const newcomer = { ...ticket, id: 'newcomer', exclusive: undefined, priorityRequested: 'medium', key: 'r:newcomer' };
-  await enqueue(state, newcomer);
-  assert.equal((await tryStart(state, newcomer, cfg)).reason, 'exclusive-held');
-});
-
 // ---- capability tags ----
 
 test('requiresTags: a runner without the tag is not chosen; one declaring it is, whatever the config order', async () => {
@@ -204,19 +113,17 @@ test('the real runner side: remote-probe --tags answers from the runner config r
   assert.equal('tags' in plain, false);
 });
 
-test('config: requiresTags merges at repo and lane level, remoteExclusive and prewarm resolve, and bad shapes are config errors', () => {
+test('config: requiresTags merges at repo and lane level, prewarm resolves, and bad shapes are config errors', () => {
   const { base } = freshEnv();
   const repoDir = path.join(base, 'repo');
-  writeRepoConfig(repoDir, { version: 1, requiresTags: ['a'], lanes: { train: { weight: 1, requiresTags: ['browser', 'a'], remoteExclusive: true, prewarm: true }, plain: { weight: 1 } } });
+  writeRepoConfig(repoDir, { version: 1, requiresTags: ['a'], lanes: { train: { weight: 1, requiresTags: ['browser', 'a'], prewarm: true }, plain: { weight: 1 } } });
   const train = resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'train' });
   assert.deepEqual(train.requiresTags, ['a', 'browser']);
-  assert.equal(train.remoteExclusive, true);
   assert.equal(train.prewarm, true);
   const plain = resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'plain' });
-  assert.deepEqual([plain.requiresTags, plain.remoteExclusive, plain.prewarm], [['a'], false, false]);
+  assert.deepEqual([plain.requiresTags, plain.prewarm], [['a'], false]);
   for (const [lane, pattern] of [
     [{ requiresTags: 'browser' }, /requiresTags must be an array/],
-    [{ remoteExclusive: 'yes' }, /remoteExclusive must be a boolean/],
     [{ prewarm: 1 }, /prewarm must be a boolean/],
   ]) {
     writeRepoConfig(repoDir, { version: 1, lanes: { train: { weight: 1, ...lane } } });

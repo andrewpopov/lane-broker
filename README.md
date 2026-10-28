@@ -89,7 +89,7 @@ features like pipes or globbing.
 | `--memory <size>` | Override the lane's memory reservation, e.g. `768MiB` or `4GiB`. |
 | `--id <ticket-id>` | With `--detach` only: a client-supplied ticket id (`[A-Za-z0-9._-]`, up to 128 chars) that makes the submission idempotent. An id the broker already knows (queued, leased, finished or mid remote attempt) is returned as the same ticket: no new queue sequence and, for a remote-eligible lane, no second dispatch (the check runs before any probe). A remote-eligible lane needs a UUID id. |
 | `--priority high\|medium\|low` | BRAIN-380 priority tier (default `medium`). Beats env `LANE_BROKER_PRIORITY`, which beats the lane's `priority` in `.lane-broker.json` (an `undeclaredLanes.as` template passes its tier on), which beats `medium`. Any invalid value from any of the three exits `64`. See "Priority (foundations)" below. |
-| `--exclusive` | BRAIN-403 v1: claim the whole host for this run. A maintenance class (host upgrade, calibration), not a way to run tests: pair it with `--exclusive-purpose` and `--exclusive-deadline`. See "Exclusive lanes (BRAIN-403 v1)" below. The lane config key `lanes.<name>.exclusive: true` does the same. |
+| `--exclusive` | BRAIN-403 v1: claim the whole host for this run. A maintenance class (host upgrade, calibration), not a way to run tests: it requires both `--exclusive-purpose` and `--exclusive-deadline` (exit `64` without). See "Exclusive lanes (BRAIN-403 v1)" below. The lane config key `lanes.<name>.exclusive: true` does the same. |
 | `--exclusive-purpose upgrade\|calibration` | BRAIN-695: why the run needs the whole host. Config key `exclusivePurpose`. Without `--exclusive` it exits `64`. |
 | `--exclusive-deadline <dur>` | BRAIN-695: the hard limit on an exclusive run, from 60000 ms to 2 h: an integer in ms, or `30s`, `20m`, `2h`. Config key `exclusiveDeadlineMs` (integer ms). Without `--exclusive` it exits `64`. Not `--timeout`, which only stops *waiting* (exit `75`). |
 | `--no-cache` | BRAIN-549: run even if the same command already passed on identical content (env `LANE_BROKER_NO_CACHE=1` does the same). See "Result cache" below. |
@@ -746,29 +746,12 @@ Two more checks need nothing from the lane (BRAIN-623):
   `src/` plus `package.json` (what an unclean shutdown leaves behind). A runner reporting any is skipped (`truncated install: 2 zero-length
   file(s) (src/a.js, src/b.js)`). A runner that reports no `integrity` (older) is not skipped for it; use the version floor to exclude those.
 
-### A lane that holds a whole runner (`remoteExclusive`, BRAIN-649) - deprecated
+### `remoteExclusive` (BRAIN-649) - removed in 0.65.0
 
-**Deprecated (BRAIN-695), refused from 0.63.0.** A lane that holds a whole runner is the opposite of an enforced lease: book `cpuCores` and
-`memoryBytes` honestly instead (leases are CPU-enforced), and let the scheduler share the runner. In 0.62.0 the key still works as described
-below, and `lane run` prints `"remoteExclusive" is deprecated` to stderr once per run for a lane that sets it. Do not use it for test suites or release candidates.
-
-```json
-{ "version": 1, "lanes": { "train": { "weight": 4, "cpuCores": 9, "remote": true, "remoteExclusive": true } } }
-```
-
-`exclusive` stays local-only (a runner's intake suppresses it). `remoteExclusive` is the runner-side form: the submitter places the lane
-on an **idle** runner (`running 0`, `queued 0` in its probe) when one is eligible, else on the eligible runner with the shortest queue
-(ties: earliest estimated finish, more free CPU, then config order). Eligible means up, not paused or draining, passing the readiness and
-`requiresTags` checks, and advertising `remote-exclusive/1` (an older runner would ignore the flag, so it is skipped). `maxRemoteQueue` does
-not cap it: an exclusive lane waits its turn rather than exit `76`, and it is not run locally because this machine could admit it. On the
-runner the intake ticket is an ordinary exclusive: it waits at the queue head for the leases to drain, then
-starts only when the runner holds no lease, and nothing else is admitted while it runs, so a load-sensitive suite (a Playwright RC) is
-not run on a runner that already has other lanes. `lane run --exclusive` and `exclusive` on the snapshot's lane are still ignored there. If no
-runner is eligible the lane waits or falls back like any lane with no usable runner; it is not made exclusive locally. A locally queued
-or already-queued remote ticket is moved (rebind, rebalance) only to a runner that is not queued.
-The runner-side ticket is ordered like any exclusive (see "Documented limits" under Exclusive lanes): it defaults to `high` only when the lane's
-resolved tier says so, earns no age credit, and the runner's own high cap can demote it, so a higher-tier or aged arrival can still be admitted
-ahead of it while it waits. That is the documented starvation limit, not a leak in the head gate: whenever the exclusive IS the effective head, nothing else starts.
+`remoteExclusive` is refused at config load, by name, with exit `64` (on `lane run` and on a runner's intake of a snapshot that still carries it, `true` or `false`):
+`lane "<name>": "remoteExclusive" is no longer supported: it holds a whole runner. Remove it and book cpuCores/memoryBytes honestly; leases are CPU-enforced (BRAIN-695).`
+A lane that holds a whole runner is the opposite of an enforced lease: book `cpuCores` and `memoryBytes` and let the scheduler share the runner.
+The `remote-exclusive/1` capability is no longer advertised.
 
 ### Runner capability tags (`requiresTags` / `runnerTags`, BRAIN-649)
 
@@ -783,8 +766,7 @@ a runner whose OS or tooling the repo does not support (Playwright on an unsuppo
 `"prewarm": true` on a lane marks its `remoteDeps`/`remoteSetup` as worth warming (a cold `art:pull` is minutes). From a checkout of the repo,
 `lane runner prewarm [--lane <name>] [--runner <name>] [--dry-run]` sends that lane's snapshot to each online runner (or one) with the command
 `true` at `low` priority, so the runner's own broker runs the setup and leaves its per-machine caches warm for the first real ticket. The
-lane is `--lane`, else the repo's only `prewarm: true` lane. Give it a dedicated lane with the same setup (not a `remoteExclusive` one: that
-run would hold the runner). It exits 1 if any runner did not warm. It is manual: nothing schedules it yet, and a running prewarm is an
+lane is `--lane`, else the repo's only `prewarm: true` lane. Give it a dedicated lane with the same setup. It exits 1 if any runner did not warm. It is manual: nothing schedules it yet, and a running prewarm is an
 ordinary low-priority ticket on the runner (not preempted by later work).
 
 ### Dependencies and setup on the runner (BRAIN-320)
@@ -1409,12 +1391,12 @@ and the lease is released anyway. A scope that is already unloaded counts as sto
 A lane may set a positive-integer `maxExecutionCpuCores` independently of its reservation:
 
 ```json
-{ "lanes": { "release": { "cpuCores": 9, "remote": true, "remoteExclusive": true, "maxExecutionCpuCores": 6 } } }
+{ "lanes": { "release": { "cpuCores": 9, "remote": true, "maxExecutionCpuCores": 6 } } }
 ```
 
-Exclusive admission (deprecated `remoteExclusive`) still reserves the whole runner and blocks competing jobs. Execution uses
+Execution uses
 `min(admitted grant, maxExecutionCpuCores)` for both the systemd quota and `LANE_BROKER_CPU_CORES`.
-A 14.4-core exclusive reservation with a ceiling of 6 therefore executes at `CPUQuota=600%` and advertises
+A 14.4-core reservation with a ceiling of 6 therefore executes at `CPUQuota=600%` and advertises
 6 cores to child workers. A grant below the ceiling remains the limit; fractional allocations use an exact quota.
 Omitting the field preserves existing quota rounding, environment and admission behavior.
 
@@ -2242,8 +2224,8 @@ deadline (`--exclusive-deadline <dur>`, or `exclusiveDeadlineMs` on the lane: an
 `--detach`), and a nested same-lane run lives inside the parent's lease, so it is covered by the parent's deadline and never starts a second timer.
 On expiry the supervisor ends the whole workload through the same process-group, descendant and CPU-scope cleanup as `lane cancel`, releases the
 lease, and publishes exit `124` with `exclusive deadline <d> expired` (the history row carries `exclusiveDeadlineExpired: true`), even if the command
-trapped TERM and exited `0`. A `lane cancel` that lands before expiry keeps exit `130`. In 0.62.0 an exclusive run without a purpose or a deadline
-still runs, with a stderr warning (`exclusive without --exclusive-purpose/--exclusive-deadline is deprecated; refused from 0.63.0`); it is refused from 0.63.0.
+trapped TERM and exited `0`. A `lane cancel` that lands before expiry keeps exit `130`. An exclusive run without BOTH a purpose and a deadline
+(config or CLI) is refused with exit `64`, naming the missing key(s) (0.65.0).
 
 A non-exclusive lane whose `weight` exceeds the global `maxLaneWeight` (integer, default 4, the same on every host) is refused
 with exit 64 at every submission, a runner's intake included (BRAIN-452: book the real size with `cpuCores`/`memoryBytes`),

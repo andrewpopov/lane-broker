@@ -8,7 +8,7 @@ import { gitRevParse } from './run.js';
  * `prewarm: true` has `remoteDeps`/`remoteSetup` worth warming (towerpower's `art:pull`, a cold dependency install). This sends that
  * lane's snapshot to each runner with the command `true` at LOW priority, so the runner's own broker runs the setup through the same
  * path a real ticket takes and leaves its per-machine caches warm. It is opt-in per lane and never automatic: nothing schedules it yet.
- * A lane for this should not be `remoteExclusive` (the run would hold the runner); give it a dedicated lane with the same setup.
+ * Give it a dedicated lane with the same setup.
  */
 
 const PREWARM_WEIGHT = 1;

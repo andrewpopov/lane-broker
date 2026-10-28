@@ -6,7 +6,7 @@ import { paths, stateHome } from './state.js';
 import { scheduleProblem } from './runner-schedule.js';
 import { isCanonicalRelPath } from './remote-manifest.js';
 import { remoteExcludeShapeProblem, remoteExcludeConflict } from './remote-exclude.js';
-import { unsupportedHookKeys, hookRefusalMessage, EXCLUSIVE_PURPOSES, exclusiveDeadlineProblem } from './exclusive.js';
+import { unsupportedHookKeys, hookRefusalMessage, EXCLUSIVE_PURPOSES, exclusiveDeadlineProblem, remoteExclusiveRefusal } from './exclusive.js';
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
 import { DEFAULT_DEPS_CACHE_MAX_BYTES } from './deps-cache.js';
 import { isValidRequiresShape, VERSION_FLOOR_RE } from './runner-readiness.js';
@@ -778,7 +778,8 @@ function validateRepoConfig(cfg, sourcePath) {
     if (lane.localFirstWaitMs !== undefined) {
       assert(Number.isInteger(lane.localFirstWaitMs) && lane.localFirstWaitMs >= 0, `${sourcePath}: lane "${name}".localFirstWaitMs must be a non-negative integer`);
     }
-    for (const field of ['remoteDepsCache', 'remoteDepsCacheRootScriptsSafe', 'remoteOmitEscapingSymlinks', 'remoteExclusive', 'prewarm']) {
+    assert(lane.remoteExclusive === undefined, `${sourcePath}: ${remoteExclusiveRefusal(name)}`);
+    for (const field of ['remoteDepsCache', 'remoteDepsCacheRootScriptsSafe', 'remoteOmitEscapingSymlinks', 'prewarm']) {
       if (lane[field] !== undefined) assert(typeof lane[field] === 'boolean', `${sourcePath}: lane "${name}".${field} must be a boolean`);
     }
   }
@@ -1185,7 +1186,6 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       remote: templateCfg.remote,
       requires: templateCfg.requires,
       requiresTags: templateCfg.requiresTags,
-      remoteExclusive: templateCfg.remoteExclusive,
       remoteDeps: templateCfg.remoteDeps,
       remoteSetup: templateCfg.remoteSetup,
       remoteDepsCache: templateCfg.remoteDepsCache,
@@ -1275,8 +1275,6 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     requires: [...new Set([...(repoConfig.requires ?? []), ...(laneCfg.requires ?? [])])],
     // BRAIN-649: capability tags a runner must declare (`runnerTags` in the runner's own config), merged the same way
     requiresTags: [...new Set([...(repoConfig.requiresTags ?? []), ...(laneCfg.requiresTags ?? [])])],
-    // BRAIN-649: a runner admits this lane only when idle and runs nothing else while it runs; `exclusive` stays local-only
-    remoteExclusive: laneCfg.remoteExclusive === true,
     // BRAIN-649: opt this lane's remoteDeps/remoteSetup into `lane runner prewarm`
     prewarm: laneCfg.prewarm === true,
     remoteDeps: Array.isArray(laneCfg.remoteDeps) ? laneCfg.remoteDeps : null,

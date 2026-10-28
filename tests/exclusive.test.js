@@ -473,7 +473,7 @@ function setup({ lane = {}, repo = {}, host = {} } = {}) {
 
 test('lane run --exclusive: the ticket is exclusive, defaults to high, and is never remote even with a remote lane and runners', async () => {
   const { env, repoDir } = setup({ lane: { remote: true }, host: { runners: RUNNERS } });
-  const { result, ticket: t, stderr } = await submit({ env, cwd: repoDir, exclusive: true });
+  const { result, ticket: t, stderr } = await submit({ env, cwd: repoDir, exclusive: true, exclusivePurpose: 'upgrade', exclusiveDeadline: '1m' });
   assert.equal(result.exitCode, 0, stderr);
   assert.equal(t.exclusive, true);
   assert.equal(t.priorityRequested, 'high');
@@ -488,11 +488,11 @@ test('lane run --exclusive: the ticket is exclusive, defaults to high, and is ne
 });
 
 test('lanes.<n>.exclusive makes the lane exclusive; an explicit priority (cli, lane config) still wins over the high default', async () => {
-  const { env, repoDir } = setup({ lane: { exclusive: true } });
+  const { env, repoDir } = setup({ lane: { exclusive: true, exclusivePurpose: 'upgrade', exclusiveDeadlineMs: 60_000 } });
   assert.equal((await submit({ env, cwd: repoDir })).ticket.priorityRequested, 'high');
   assert.equal((await submit({ env, cwd: repoDir })).ticket.exclusive, true);
   assert.equal((await submit({ env, cwd: repoDir, priority: 'low' })).ticket.priorityRequested, 'low');
-  const configured = setup({ lane: { exclusive: true, priority: 'medium' } });
+  const configured = setup({ lane: { exclusive: true, exclusivePurpose: 'upgrade', exclusiveDeadlineMs: 60_000, priority: 'medium' } });
   assert.equal((await submit({ env: configured.env, cwd: configured.repoDir })).ticket.priorityRequested, 'medium');
   assert.equal(resolvePriority({ exclusive: true }), 'high');
   assert.equal(resolvePriority({ exclusive: false }), 'medium');
@@ -524,7 +524,7 @@ test('runner intake (configRoot set) suppresses a lane-config or flag exclusive,
 });
 
 test('an exclusive nested under another lane exits 64 before enqueue; a same-key nested run is reentrant as today', async () => {
-  const { env, repoDir, state } = setup({ lane: { exclusive: true } });
+  const { env, repoDir, state } = setup({ lane: { exclusive: true, exclusivePurpose: 'upgrade', exclusiveDeadlineMs: 60_000 } });
   const ownKey = resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' }).key;
   const parent = (key) => writeLease(state, heldLease('parent', key, 4, { resources: { cpuCores: 4, memoryBytes: GIB } }));
 
@@ -557,7 +557,7 @@ test('an exclusive nested under another lane exits 64 before enqueue; a same-key
 });
 
 test('an exclusive declaring more than the host budget is still accepted at submission (it is admitted on the whole budget)', async () => {
-  const { env, repoDir } = setup({ lane: { exclusive: true, cpuCores: 1000, memoryBytes: 512 * GIB }, host: { schedulerMode: 'active' } });
+  const { env, repoDir } = setup({ lane: { exclusive: true, exclusivePurpose: 'upgrade', exclusiveDeadlineMs: 60_000, cpuCores: 1000, memoryBytes: 512 * GIB }, host: { schedulerMode: 'active' } });
   const { result, spawnCalled, stderr } = await submit({ env, cwd: repoDir });
   assert.notEqual(result.exitCode, 64, stderr);
   assert.equal(spawnCalled, true, stderr);
@@ -619,7 +619,7 @@ test('BRAIN-452: a submission at exactly maxLaneWeight is accepted locally and o
   const intake = setup({ lane: { weight: 1 }, host: { capacity: 100 } });
   const accepted = await submit({ env: intake.env, cwd: intake.repoDir, configRoot: intake.repoDir, weightOverride: 4 });
   assert.equal(accepted.result.exitCode, 0, accepted.stderr);
-  const exclusive = setup({ lane: { weight: 9, exclusive: true }, host: { capacity: 100 } });
+  const exclusive = setup({ lane: { weight: 9, exclusive: true, exclusivePurpose: 'upgrade', exclusiveDeadlineMs: 60_000 }, host: { capacity: 100 } });
   const { result, stderr } = await submit({ env: exclusive.env, cwd: exclusive.repoDir });
   assert.equal(result.exitCode, 0, stderr);
 });

@@ -157,10 +157,10 @@ test('(h) an exclusive lane (flag or config) exits 69, never local', async () =>
   const ctx = setup({ ssh: 'normal' });
   refuse(ctx);
   const m1 = markerPath();
-  const flagged = await run(ctx, markerCmd(m1, 0), ['--exclusive']);
+  const flagged = await run(ctx, markerCmd(m1, 0), ['--exclusive', '--exclusive-purpose', 'upgrade', '--exclusive-deadline', '1m']);
   assert.equal(flagged.code, 69, flagged.stderr);
   ranNowhere(m1);
-  writeRepoConfig(ctx.repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, exclusive: true } } });
+  writeRepoConfig(ctx.repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, exclusive: true, exclusivePurpose: 'upgrade', exclusiveDeadlineMs: 60_000 } } });
   const m2 = markerPath();
   assert.equal((await run(ctx, markerCmd(m2, 0))).code, 69);
   ranNowhere(m2);

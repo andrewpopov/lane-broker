@@ -262,7 +262,7 @@ for (const mode of ['off', 'prefer']) {
     const { base, home, state, env } = freshEnv();
     writeGlobalConfig(home, { version: 1, cpuLimit: mode, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1 });
     const repoDir = path.join(base, 'repo');
-    writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, exclusive: true, maxExecutionCpuCores: 6 } } });
+    writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, exclusive: true, exclusivePurpose: 'upgrade', exclusiveDeadlineMs: 60_000, maxExecutionCpuCores: 6 } } });
     const res = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', process.execPath, '-e', 'console.log("PAYLOAD_RAN")'], { env, cwd: repoDir });
     assert.equal(res.code, 69, res.stderr);
     assert.match(res.stderr, /CPU_LIMIT_UNAVAILABLE.*maxExecutionCpuCores/);

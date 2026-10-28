@@ -235,12 +235,6 @@ function neverFits(reservation, probe) {
  *
  * `opts.requireCapabilities` (BRAIN-321): capability strings the runner's probe must advertise, else it is skipped.
  *
- * `opts.preferIdle` (BRAIN-649, a `remoteExclusive` lane): the lane holds the whole runner while it runs, and the runner's own intake makes
- * it wait at the queue head until its leases drain, so a busy runner is a valid home. An idle runner (`running === 0`, `queued === 0`, with
- * room) is taken first; otherwise the eligible runner with the FEWEST queued tickets (ties: earliest estimated finish, more free CPU, then config
- * order) is returned as `queuedChoice: true`. `maxRemoteQueue` does not cap it: an exclusive lane must wait its turn, not fail with no runner.
- * Eligibility (protocol, capabilities, readiness, up and not paused or draining, capacity that can ever fit) is unchanged.
- *
  * `opts.reservation` (BRAIN-320 S1e): the ticket's resolved
  * `{weight, cpuCores, memoryBytes}`, checked against each probe's static
  * `capacity` (1e). The existing `queued > 0` skip is unchanged.
@@ -257,7 +251,7 @@ export async function selectRunner(runners, opts = {}) {
   const deadlineMs = opts.deadlineMs ?? DEFAULT_GLOBAL_CONFIG.remoteProbeDeadlineMs;
   const retryTimedOut = new Set(opts.retryTimedOut ?? []);
   const sshBin = opts.sshBin ?? 'ssh';
-  const { env, requireProtocol2 = false, preferIdle = false, requireCapabilities = [], readinessNeeds = {}, reservation, maxRemoteQueue = 0, downRunners = {} } = opts;
+  const { env, requireProtocol2 = false, requireCapabilities = [], readinessNeeds = {}, reservation, maxRemoteQueue = 0, downRunners = {} } = opts;
   const skipped = [];
   const readiness = {};
   const ready = [];
@@ -265,7 +259,6 @@ export async function selectRunner(runners, opts = {}) {
   // free CPU, then config order). A runner with an empty queue but no headroom is not idle, however empty its queue.
   let idleBest = null;
   let queuedBest = null;
-  let loadedBest = null; // preferIdle only: eligible but not idle, the shortest queue
   let busyBest = null; // passed every check except headroom, empty queue: its own broker would hold the ticket until it has room
   const better = (cand, best) => !best || cand.finish < best.finish || (cand.finish === best.finish && cand.cpuFree > best.cpuFree);
   const now = opts.now ?? Date.now();
@@ -346,21 +339,6 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason: 'paused' });
       continue;
     }
-    if (preferIdle) {
-      if (reservation && neverFits(reservation, probe)) {
-        skipped.push({ name: runner.name, reason: 'runner capacity can never fit this ticket', neverFits: true });
-        continue;
-      }
-      const { room, cpuFree } = reservation ? runnerRoom(reservation, probe) : { room: true, cpuFree: 0 };
-      const cand = { runner, probe, finish: estimatedFinish(reservation, probe, runner), cpuFree: cpuFree ?? 0 };
-      if (probe.running === 0 && probe.queued === 0 && room) {
-        if (better(cand, idleBest)) idleBest = cand;
-      } else {
-        skipped.push({ name: runner.name, reason: `runner is not idle (running ${probe.running}, queued ${probe.queued}); the lane waits for it to drain (remoteExclusive)` });
-        if (!loadedBest || cand.probe.queued < loadedBest.probe.queued || (cand.probe.queued === loadedBest.probe.queued && better(cand, loadedBest))) loadedBest = cand;
-      }
-      continue;
-    }
     if (probe.queued !== 0) {
       const overCap = maxRemoteQueue > 0 && probe.queued > maxRemoteQueue;
       skipped.push({ name: runner.name, reason: `queued: ${probe.queued}${overCap ? ` (over maxRemoteQueue ${maxRemoteQueue})` : ''}` });
@@ -390,8 +368,7 @@ export async function selectRunner(runners, opts = {}) {
   }
   const readinessField = { ready, ...(Object.keys(readiness).length > 0 ? { readiness } : {}) };
   if (idleBest) return { runner: idleBest.runner, probe: idleBest.probe, skipped, ...readinessField };
-  const waitHere = queuedBest ?? loadedBest;
-  if (waitHere) return { runner: waitHere.runner, probe: waitHere.probe, skipped, ...readinessField, queuedChoice: true };
+  if (queuedBest) return { runner: queuedBest.runner, probe: queuedBest.probe, skipped, ...readinessField, queuedChoice: true };
   return { runner: null, skipped, ...readinessField, ...(busyBest ? { busy: { runner: busyBest.runner, probe: busyBest.probe } } : {}) };
 }
 
