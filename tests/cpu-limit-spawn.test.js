@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { makeTmpDir } from './helpers/tmp.js';
-import { spawnInCpuScope, cpuScopeUnit, resolveCpuLimit, resolveExecutionCpuCores } from '../src/cpu-limit.js';
+import { CpuLimitUnavailableError, spawnInCpuScope, cpuScopeUnit, resolveCpuLimit, resolveExecutionCpuCores } from '../src/cpu-limit.js';
 import { childEnv, runningLease } from '../src/supervisor.js';
 
 /** BRAIN-651 L2: a lane child runs inside a CPUQuota scope sized to its admitted grant. Unit tests inject `spawn`; the integration test is Linux-only. */
@@ -178,4 +178,13 @@ test('CPU_GRANT_ENFORCED: a grant-1 scope holds a CPU burner and its detached gr
   // two busy processes would use about 2.0 cores unconstrained
   assert.ok(cores <= 1.2, `scope used ${cores.toFixed(2)} cores at grant 1`);
   assert.ok(cores >= 0.5, `scope used only ${cores.toFixed(2)} cores: the burner did not run`);
+});
+
+test('a grant below the minimum cannot be enforced: unwrapped under prefer, CpuLimitUnavailableError under require or maxExecutionCpuCores', () => {
+  const { fn, calls } = recordingSpawn();
+  const { unit } = run(fn, { grantCores: 0.005 });
+  assert.equal(unit, null);
+  assert.equal(calls[0].cmd, '/usr/bin/nice');
+  assert.throws(() => run(fn, { grantCores: 0.005, resolved: { ...ON, mode: 'require' } }), (e) => e instanceof CpuLimitUnavailableError && /0\.005/.test(e.message));
+  assert.throws(() => run(fn, { grantCores: 0.005, requireQuota: true }), CpuLimitUnavailableError);
 });

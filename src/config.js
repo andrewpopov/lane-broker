@@ -664,6 +664,7 @@ function validateRepoConfig(cfg, sourcePath) {
   for (const [name, lane] of Object.entries(cfg.lanes)) {
     assert(lane && typeof lane === 'object', `${sourcePath}: lane "${name}" must be an object`);
     assert(Number.isFinite(lane.weight) && lane.weight > 0, `${sourcePath}: lane "${name}".weight must be a positive number`);
+    if (lane.cpuCores === undefined) assert(lane.weight >= MIN_CPU_GRANT_CORES, `${sourcePath}: lane "${name}".weight must be >= ${MIN_CPU_GRANT_CORES} (it is the CPU claim when cpuCores is unset)`);
     if (lane.cpuCores !== undefined) {
       assert(Number.isFinite(lane.cpuCores) && lane.cpuCores > 0, `${sourcePath}: lane "${name}".cpuCores must be a positive number`);
       assert(lane.cpuCores >= MIN_CPU_GRANT_CORES, `${sourcePath}: lane "${name}".cpuCores must be >= ${MIN_CPU_GRANT_CORES}`);

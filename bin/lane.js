@@ -85,6 +85,8 @@ function parseRunArgs(args) {
         if (!Number.isFinite(n) || n <= 0) {
           throw new Error(`--weight must be a positive number (got "${raw}")`);
         }
+        // an unset cpuCores resolves to weight, so a weight under the minimum grant is a CPU claim no quota can express
+        if (n < MIN_CPU_GRANT_CORES) throw new Error(`--weight must be >= ${MIN_CPU_GRANT_CORES} (it is the CPU claim when cpuCores is unset; got "${raw}")`);
         opts.weightOverride = n;
         break;
       }

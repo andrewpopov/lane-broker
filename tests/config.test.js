@@ -374,3 +374,12 @@ test('cpuCores and minCpuCores below 0.01 core are rejected naming the key (a 1%
     }
   }
 });
+
+test('a lane weight below 0.01 is rejected naming weight when cpuCores is unset, and allowed when cpuCores carries the claim', () => {
+  const { base } = freshEnv();
+  const repoDir = path.join(base, 'tiny-weight');
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 0.001 } } });
+  assert.throws(() => resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' }), /lane "default"\.weight must be >= 0\.01/);
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 0.001, cpuCores: 1 } } });
+  assert.equal(resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' }).weight, 0.001);
+});

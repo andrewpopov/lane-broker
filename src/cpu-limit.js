@@ -89,8 +89,11 @@ export function resolveExecutionCpuCores(grantedCpuCores, maxExecutionCpuCores) 
  * `resolved.memory.available` additionally turns on memory accounting so the heartbeat can read the scope's peak. Returns `{child, unit}`; `unit` is null when nothing was wrapped.
  */
 export function spawnInCpuScope(spawnFn, { resolved, platform = process.platform, leaseId, grantCores, requireQuota = false, cmd, args, options }) {
-  const enforce = platform === 'linux' && resolved?.mode !== 'off' && resolved?.available === true && Number.isFinite(grantCores) && grantCores > 0;
-  if (requireQuota && !enforce) throw new CpuLimitUnavailableError(resolved?.reason ?? 'unsupported-platform', 'maxExecutionCpuCores was requested');
+  const grantTooSmall = Number.isFinite(grantCores) && grantCores > 0 && grantCores < MIN_CPU_GRANT_CORES;
+  const enforce = platform === 'linux' && resolved?.mode !== 'off' && resolved?.available === true && Number.isFinite(grantCores) && grantCores >= MIN_CPU_GRANT_CORES;
+  const unenforceable = () => new CpuLimitUnavailableError(grantTooSmall ? `grant of ${grantCores} cores is below the ${MIN_CPU_GRANT_CORES}-core minimum` : resolved?.reason ?? 'unsupported-platform', 'maxExecutionCpuCores was requested');
+  if (requireQuota && !enforce) throw unenforceable();
+  if (grantTooSmall && resolved?.mode === 'require') throw unenforceable();
   if (!enforce) return { child: spawnFn(cmd, args, options), unit: null };
   const unit = cpuScopeUnit(leaseId);
   const [file, ...wrapped] = cpuLimitArgv(grantCores, [cmd, ...args], { unit, measureMemory: resolved.memory?.available === true });
