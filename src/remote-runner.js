@@ -811,6 +811,18 @@ export function probeHeadroom(resources, cfg, enforced, loadAvg1 = os.loadavg()[
 }
 
 /**
+ * BRAIN-653: the most memory a new ticket could ever be admitted with on this host once the broker's own leases drain: what the OS
+ * reports available plus what those leases observably hold, minus the reserve (admission's `projectedAvailable >= reserve` with no
+ * growth reserve). The difference from the static budget is memory held by processes outside the broker (e.g. a fleet worker), which
+ * no wait will release. Null when the budgets are not enforced or the measurement is missing.
+ */
+export function probeAdmissibleMemoryBytes(resources, cfg, enforced, running = []) {
+  if (!enforced || !resources || !Number.isFinite(resources.availableMemoryBytes)) return null;
+  const brokerHeld = running.reduce((sum, lease) => sum + (Number.isFinite(lease.observedMemoryBytes) ? lease.observedMemoryBytes : 0), 0);
+  return Math.max(0, resources.availableMemoryBytes + brokerHeld - cfg.memoryReserveBytes);
+}
+
+/**
  * BRAIN-506: the cores a new ticket would still fit on this runner, by the same predicate its admission applies
  * (admission.js cpuHeadroomCores): host busy counters, the preemptible discount recomputed at cfg.laneNice (the default a
  * remote ticket runs at; the stored discount belongs to whichever candidate was sampled last), held leases charged by
@@ -939,6 +951,8 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot(), measure, 
       cpuCores: enforced ? cpuBudgetCores(host, globalCfg) : null,
       memoryBytes: enforced ? host.memoryBytes : null,
       memoryReserveBytes: enforced ? globalCfg.memoryReserveBytes : null,
+      // BRAIN-653: additive; the budget net of memory held outside the broker
+      memoryAdmissibleBytes: probeAdmissibleMemoryBytes(status.resources, globalCfg, enforced, status.running),
     },
   };
   process.stdout.write(`${JSON.stringify(payload)}\n`);

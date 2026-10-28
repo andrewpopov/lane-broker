@@ -189,3 +189,17 @@ test('memory admission accounts for reservations and live available headroom', (
   assert.equal(result.admit, true);
   assert.equal(result.projectedAvailableBytes, GiB);
 });
+
+test('BRAIN-385: cgroup inactive_file page cache counts as available, not used', () => {
+  const GiB = 1024 ** 3;
+  const files = new Map([
+    ['/sys/fs/cgroup/memory.max', String(10 * GiB)],
+    ['/sys/fs/cgroup/memory.current', String(Math.round(2.7 * GiB))],
+    ['/sys/fs/cgroup/memory.stat', `anon ${Math.round(0.134 * GiB)}\nfile ${Math.round(2.5 * GiB)}\ninactive_file ${Math.round(1.6 * GiB)}\nactive_file ${Math.round(0.86 * GiB)}\n`],
+  ]);
+  const snapshot = detectResourceCapacity({
+    platform: 'linux', parallelism: 4, totalMemory: 32 * GiB, freeMemory: 30 * GiB,
+    readFile: (file) => { if (files.has(file)) return files.get(file); throw new Error('ENOENT'); },
+  });
+  assert.equal(Math.round((snapshot.availableMemoryBytes / GiB) * 10) / 10, 8.9); // 10 - (2.7 - 1.6)
+});

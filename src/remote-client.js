@@ -199,6 +199,8 @@ function neverFits(reservation, probe) {
   ) {
     return true;
   }
+  // BRAIN-653: memory held outside the broker (the runner reports the budget net of it) never drains, so a lane above it waits forever
+  if (Number.isFinite(capacity.memoryAdmissibleBytes) && Number.isFinite(memoryBytes) && memoryBytes > capacity.memoryAdmissibleBytes) return true;
   return false;
 }
 

@@ -65,6 +65,11 @@ function finiteCgroupBytes(value) {
   return Number.isFinite(bytes) && bytes > 0 && bytes < 2 ** 60 ? bytes : null;
 }
 
+function cgroupInactiveFileBytes(dir, readFile) {
+  const match = /^inactive_file\s+(\d+)\s*$/m.exec(readText(`${dir}/memory.stat`, readFile) ?? '');
+  return match ? Number(match[1]) : 0;
+}
+
 function cgroupV2Dirs(readFile) {
   const membership = readText('/proc/self/cgroup', readFile);
   const line = membership?.split(/\r?\n/).find((entry) => entry.startsWith('0::'));
@@ -148,10 +153,11 @@ export function detectResourceCapacity({
       }
 
       const memoryMax = finiteCgroupBytes(readText(`${dir}/memory.max`, readFile));
-      const memoryCurrent = finiteCgroupBytes(readText(`${dir}/memory.current`, readFile)) ?? 0;
+      // BRAIN-385: reclaimable page cache is available, not used (the kubelet's working set is current - inactive_file)
+      const memoryCurrent = (finiteCgroupBytes(readText(`${dir}/memory.current`, readFile)) ?? 0) - cgroupInactiveFileBytes(dir, readFile);
       if (memoryMax !== null) {
         memoryBytes = Math.min(memoryBytes, memoryMax);
-        availableMemoryBytes = Math.min(availableMemoryBytes, Math.max(0, memoryMax - memoryCurrent));
+        availableMemoryBytes = Math.min(availableMemoryBytes, Math.max(0, memoryMax - Math.max(0, memoryCurrent)));
         foundMemory = true;
       }
     }
