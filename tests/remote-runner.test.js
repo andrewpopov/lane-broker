@@ -1469,7 +1469,8 @@ test('EXECUTION_ALLOCATION_WIRE: runner result preserves execution 6 separately 
 });
 
 test('EXECUTION_CEILING_DIRECT_REFUSAL: a modern runner with quotas off rejects before payload even without negotiation', async () => {
-  const { env } = freshShadowEnv();
+  const { env, home } = freshShadowEnv();
+  writeGlobalConfig(home, { cpuLimit: 'off' });
   const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'execution-cap' });
   const root = tmpDir('direct-cap-off');
   const marker = path.join(root, 'payload-ran');

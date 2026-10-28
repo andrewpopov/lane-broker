@@ -31,7 +31,7 @@ test('CPU_GRANT_WRAPPED: grants 2 and 4 spawn systemd-run with CPUQuota = 100% p
     assert.equal(unit, cpuScopeUnit(LEASE));
     assert.equal(calls.length, 1);
     assert.equal(calls[0].cmd, 'systemd-run');
-    assert.deepEqual(calls[0].args, ['--user', '--scope', `--unit=lane-${LEASE}.scope`, '-p', `CPUQuota=${quota}`, '--quiet', '--collect', '--', '/usr/bin/nice', '-n', '5', 'npm', 'test']);
+    assert.deepEqual(calls[0].args, ['--user', '--scope', '--expand-environment=no', `--unit=lane-${LEASE}.scope`, '-p', `CPUQuota=${quota}`, '--quiet', '--collect', '--', '/usr/bin/nice', '-n', '5', 'npm', 'test']);
     assert.equal(calls[0].options, OPTIONS, 'cwd, env, detached and stdio are handed through untouched');
   }
 });
@@ -187,4 +187,22 @@ test('a grant below the minimum cannot be enforced: unwrapped under prefer, CpuL
   assert.equal(calls[0].cmd, '/usr/bin/nice');
   assert.throws(() => run(fn, { grantCores: 0.005, resolved: { ...ON, mode: 'require' } }), (e) => e instanceof CpuLimitUnavailableError && /0\.005/.test(e.message));
   assert.throws(() => run(fn, { grantCores: 0.005, requireQuota: true }), CpuLimitUnavailableError);
+});
+
+test('CPU_ARGV_VERBATIM: a wrapped command receives $$ and $VAR untouched (systemd must not expand them)', { skip: SKIP }, async () => {
+  const { child } = spawnInCpuScope(spawn, {
+    resolved: probe,
+    leaseId: `cpu-argv-${process.pid}`,
+    grantCores: 1,
+    cmd: 'bash',
+    args: ['-c', 'echo $$ $FOO'],
+    options: { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, FOO: 'foo-value' } },
+  });
+  let out = '';
+  let err = '';
+  child.stdout.on('data', (c) => (out += c));
+  child.stderr.on('data', (c) => (err += c));
+  const code = await new Promise((resolve) => child.on('exit', resolve));
+  assert.equal(code, 0, err);
+  assert.match(out.trim(), /^\d+ foo-value$/);
 });

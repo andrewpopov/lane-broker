@@ -16,7 +16,8 @@ const PROBE_TIMEOUT_MS = 10_000;
 // The same scope reads back the memory controller too (line 2): CPU and memory resolve independently, so a host that delegates only
 // `cpu` (pitelite) still enforces CPU. A memory file that cannot be read prints "none".
 const READBACK = 'cg="/sys/fs/cgroup$(cut -d: -f3 /proc/self/cgroup)"; cat "$cg/cpu.max" 2>/dev/null || echo none; cat "$cg/memory.peak" 2>/dev/null || cat "$cg/memory.current" 2>/dev/null || echo none';
-const PROBE_ARGV = ['systemd-run', '--user', '--scope', '-p', 'CPUQuota=100%', '-p', 'MemoryAccounting=yes', '--quiet', 'sh', '-c', READBACK];
+// systemd >= 259 expands $VAR in scope command arguments; --expand-environment=no keeps lane argv byte-for-byte (a host that rejects the flag fails the probe and runs unwrapped).
+const PROBE_ARGV = ['systemd-run', '--user', '--scope', '--expand-environment=no', '-p', 'CPUQuota=100%', '-p', 'MemoryAccounting=yes', '--quiet', 'sh', '-c', READBACK];
 
 export class CpuLimitUnavailableError extends Error {
   constructor(reason, requirement = 'cpuLimit is "require"') {
@@ -71,7 +72,7 @@ export function cpuQuotaPercent(cores) {
 /** The argv that runs `argv` in its own scope capped at `grantCores` cores (named `unit` when given; `measureMemory` turns memory accounting on, with no cap). Spawns nothing. */
 export function cpuLimitArgv(grantCores, argv, { unit, measureMemory = false } = {}) {
   if (!Number.isFinite(grantCores) || grantCores <= 0) throw new Error(`cpuLimitArgv: grantCores must be positive and finite, got ${grantCores}`);
-  return ['systemd-run', '--user', '--scope', ...(unit ? [`--unit=${unit}`] : []), '-p', `CPUQuota=${cpuQuotaPercent(grantCores)}%`, ...(measureMemory ? ['-p', 'MemoryAccounting=yes'] : []), '--quiet', '--collect', '--', ...argv];
+  return ['systemd-run', '--user', '--scope', '--expand-environment=no', ...(unit ? [`--unit=${unit}`] : []), '-p', `CPUQuota=${cpuQuotaPercent(grantCores)}%`, ...(measureMemory ? ['-p', 'MemoryAccounting=yes'] : []), '--quiet', '--collect', '--', ...argv];
 }
 
 /** Execution is distinct from admission: an exclusive reservation is never reduced by this ceiling. */

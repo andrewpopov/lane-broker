@@ -42,7 +42,7 @@ test('probe: success runs systemd-run --user --scope with CPUQuota=100% and read
   assert.deepEqual(probeCpuLimit({ platform: 'linux', exec: okExec }), { available: true, reason: 'ok' });
   const [file, ...args] = calls[0];
   assert.equal(file, 'systemd-run');
-  assert.deepEqual(args.slice(0, 8), ['--user', '--scope', '-p', 'CPUQuota=100%', '-p', 'MemoryAccounting=yes', '--quiet', 'sh']);
+  assert.deepEqual(args.slice(0, 9), ['--user', '--scope', '--expand-environment=no', '-p', 'CPUQuota=100%', '-p', 'MemoryAccounting=yes', '--quiet', 'sh']);
   assert.match(args.join(' '), /cpu\.max/);
   assert.match(args.join(' '), /memory\.peak/);
 });
@@ -76,7 +76,7 @@ test('probe: CPU and memory resolve independently (a cpu-only delegation still e
 
 test('cpuLimitArgv: CPUQuota is 100% per booked core, and the original argv follows --', () => {
   for (const [grant, quota] of [[1, '100%'], [2, '200%'], [4, '400%']]) {
-    assert.deepEqual(cpuLimitArgv(grant, ['npm', 'test']), ['systemd-run', '--user', '--scope', '-p', `CPUQuota=${quota}`, '--quiet', '--collect', '--', 'npm', 'test']);
+    assert.deepEqual(cpuLimitArgv(grant, ['npm', 'test']), ['systemd-run', '--user', '--scope', '--expand-environment=no', '-p', `CPUQuota=${quota}`, '--quiet', '--collect', '--', 'npm', 'test']);
   }
   assert.ok(cpuLimitArgv(1.5, ['x']).includes('CPUQuota=150%'), 'exact fractional quota, not rounded up');
   // a quota never exceeds its grant: 0.015 cores is 1%, not the 2% a rounding quota would give; below 0.01 core nothing is expressible
