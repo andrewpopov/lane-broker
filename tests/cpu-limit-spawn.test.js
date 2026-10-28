@@ -70,10 +70,23 @@ test('EXECUTION_CEILING_FAIL_CLOSED: quota off, unsupported or unavailable never
   assert.throws(() => resolveExecutionCpuCores(undefined, 6), /CPU_LIMIT_UNAVAILABLE/);
 });
 
-test('a fractional grant rounds the quota up, never below what admission reserved', () => {
-  const { fn, calls } = recordingSpawn();
-  run(fn, { grantCores: 1.5 });
-  assert.ok(calls[0].args.includes('CPUQuota=200%'));
+test('a fractional grant gets its exact quota, not one rounded up to the next core (BRAIN-695: bookings are caps)', () => {
+  for (const [grant, quota] of [[1.5, '150%'], [0.5, '50%'], [2.25, '225%']]) {
+    const { fn, calls } = recordingSpawn();
+    run(fn, { grantCores: grant });
+    assert.ok(calls[0].args.includes(`CPUQuota=${quota}`), `${grant} cores -> ${quota}`);
+  }
+});
+
+test('memory accounting is switched on in the scope only when the memory probe passed', () => {
+  const on = recordingSpawn();
+  run(on.fn, { resolved: { ...ON, memory: { mode: 'measure', available: true, reason: 'ok' } } });
+  assert.ok(on.calls[0].args.includes('MemoryAccounting=yes'));
+  assert.ok(!on.calls[0].args.some((a) => /MemoryMax/.test(a)), 'measured, never capped');
+  const off = recordingSpawn();
+  run(off.fn, { resolved: { ...ON, memory: { mode: 'measure', available: false, reason: 'x' } } });
+  assert.ok(!off.calls[0].args.includes('MemoryAccounting=yes'));
+  assert.ok(off.calls[0].args.includes('CPUQuota=200%'), 'CPU enforcement does not depend on memory');
 });
 
 test('not wrapped when off, when prefer found no support, on darwin, or when there is no usable grant', () => {

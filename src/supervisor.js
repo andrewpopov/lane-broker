@@ -27,7 +27,7 @@ import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processSt
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
 import { reloadGlobalConfig, isDispatchOnly } from './config.js';
-import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope } from './cpu-limit.js';
+import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope, scopeMemoryPeakReader, enforcementLabel } from './cpu-limit.js';
 import { stateHome } from './state.js';
 import { readRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
@@ -37,7 +37,7 @@ import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, priorityOf, resolveLaneNice, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
 import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, noRunnerLocallyIneligibleRefusal, dispatchOnlyRefusal, LOCAL_REFUSED_EXIT_CODE, locallyRefusedNow, localWindowAllowing, leaseCpuCores, terminalRowDefaults } from './resources.js';
-import { downRunnerReasons, heartbeatUpRunners, recordReadiness } from './runner-unreachable.js';
+import { downRunnerReasons, heartbeatUpRunners, recordReadiness, recordEnforcement } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { remoteCpuAllocation, selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
 import { remoteExcludeWarnings } from './remote-exclude.js';
@@ -971,7 +971,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   selectedRunner = runner.name;
   // Printed only now that eligibility is settled and a usable runner is
   // about to actually be dialed for the transfer -- see finding #5 above.
-  process.stderr.write(`lane: running on ${runner.name}\n`);
+  process.stderr.write(`lane: running on ${runner.name} (${enforcementLabel(probe?.enforcement)})\n`);
+  await recordEnforcement(root, { [runner.name]: probe?.enforcement ?? null }, Date.now()).catch(() => {});
 
   const declaredArtifacts = enriched.remote.remoteArtifacts;
   let artifactsSupported = false;
@@ -1129,7 +1130,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     const line = `lane: remote-rebalance: ${enriched.id}: ${from.name} -> ${runner.name} (${why}; ${runner.name} ${probe.headroom.cpuCores} cores free)\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);
-    process.stderr.write(`lane: running on ${runner.name}\n`);
+    process.stderr.write(`lane: running on ${runner.name} (${enforcementLabel(probe?.enforcement)})\n`);
+    await recordEnforcement(root, { [runner.name]: probe?.enforcement ?? null }, Date.now()).catch(() => {});
   }
   // A move that never completed (or one whose second dispatch ended before a snapshot went out) must not outlive this attempt's record.
   if (movingSet && !dispatch.mayStillBeRunning) await clearMoving();
@@ -1664,6 +1666,8 @@ async function main() {
     await refuseLocalAndExit({ exitCode: LOCAL_REFUSED_EXIT_CODE, message: `lane run: ${err.message}\n` }, { lease: true });
   }
   const { child, unit: cpuScope } = scopedChild;
+  // BRAIN-695: memory is measured through the same scope; without one (cpuLimit off, macOS) there is no cgroup to read
+  const memoryReader = cpuScope && cpuLimit?.memory?.available === true ? scopeMemoryPeakReader(cpuScope, { pid: child.pid }) : null;
   if (ticket.maxExecutionCpuCores !== undefined) started.lease.executionCpuCores = executionCpuCores;
 
   const logWriter = new CappedLogWriter(ticket.logPath);
@@ -1738,6 +1742,7 @@ async function main() {
         const tree = rows ? selectLeaseTree(rows, child.pid, otherLeaseStops(root, ticket.id)) : null;
         const observed = tree?.cores ?? null;
         const observedMemory = tree?.memoryBytes ?? null;
+        const cgroupPeak = memoryReader?.read() ?? null;
         // a gap of more than two heartbeats between good readings ends an overrun streak
         writeLease(root, {
           ...applyHeartbeatObservation(lease, observed, Date.now(), observedMemory, 2 * globalCfg.sampleMs, {
@@ -1745,6 +1750,7 @@ async function main() {
             belowFraction: globalCfg.idleCreditBelowFraction,
             hungCores: globalCfg.hungCpuCores,
           }),
+          ...(cgroupPeak === null ? {} : { observedCgroupMemoryPeakBytes: Math.max(lease.observedCgroupMemoryPeakBytes ?? 0, cgroupPeak) }),
           descendants: descendants.snapshot(),
           noProgressSinceMs: Math.round(idleMs),
           ...(watchdog.lastOutputAt === null ? {} : { lastOutputAt: watchdog.lastOutputAt }),
@@ -1859,6 +1865,8 @@ async function main() {
       if (observedCpu) finalResult = { ...finalResult, observedCpu };
       const rssPeak = sanitizeRssPeak(finalLease?.observedRssPeakBytes);
       if (rssPeak !== undefined) finalResult = { ...finalResult, observedRssPeakBytes: rssPeak };
+      const cgroupPeak = sanitizeRssPeak(finalLease?.observedCgroupMemoryPeakBytes);
+      if (cgroupPeak !== undefined) finalResult = { ...finalResult, observedCgroupMemoryPeakBytes: cgroupPeak };
       const cpuSeconds = integratedCpuSeconds(finalLease?.observedCpuStats, startedAt, finalResult.endedAt);
       if (cpuSeconds !== undefined) finalResult = { ...finalResult, cpuSeconds };
       // BRAIN-431: the longest stretch with no output and no CPU, whether or not the opt-in kill is on (monitoring reads it)

@@ -11,7 +11,7 @@ import { stateHome } from './state.js';
 import { readSchedulerFence } from './fairness.js';
 import { loadGlobalConfig, DEFAULT_GLOBAL_CONFIG, isDispatchOnly } from './config.js';
 import { CLASSES_CAPABILITY, resolveClasses } from './classes.js';
-import { CPU_LIMIT_CAPABILITY, resolveCpuLimit } from './cpu-limit.js';
+import { CPU_LIMIT_CAPABILITY, ENFORCED_LEASES_CAPABILITY, resolveCpuLimit, enforcementOf } from './cpu-limit.js';
 
 export const EXECUTION_CEILING_CAPABILITY = 'execution-cpu-ceiling/1';
 /** BRAIN-649: this runner honours `remoteExclusive` on intake (holds the whole runner while the lane runs). */
@@ -60,12 +60,13 @@ export const CAPABILITIES = [
   REUSE_GREEN_CAPABILITY,
 ];
 
-/** `CAPABILITIES` plus what depends on this host's config: `blob-cache/1` only while the runner blob store is enabled, `cpu-limit/1` only when `cpuLimit` is not "off" and its probe passed. */
+/** `CAPABILITIES` plus what depends on this host's config: `blob-cache/1` only while the runner blob store is enabled, `cpu-limit/1` only when `cpuLimit` is not "off" and its probe passed, `enforced-leases/1` on top of that unless `memoryLimit` is "off". */
 export function advertisedCapabilities(cfg, cpuLimit = { mode: 'off', available: false }) {
   return [
     ...CAPABILITIES,
     ...(cfg.remoteBlobCache ? [BLOB_CACHE_CAPABILITY] : []),
     ...(cpuLimit.mode !== 'off' && cpuLimit.available ? [CPU_LIMIT_CAPABILITY, EXECUTION_CEILING_CAPABILITY] : []),
+    ...(cpuLimit.mode !== 'off' && cpuLimit.available && cfg.memoryLimit !== 'off' ? [ENFORCED_LEASES_CAPABILITY] : []),
   ];
 }
 
@@ -88,6 +89,7 @@ export function capabilitiesCommand({ root = stateHome() } = {}) {
     admissionMode: cfg.schedulerMode,
     classes: { mode, configHash, stateRoot, valid },
     cpuLimit,
+    enforcement: enforcementOf(cpuLimit),
   };
   process.stdout.write(`${JSON.stringify(payload)}\n`);
   return { exitCode: 0 };

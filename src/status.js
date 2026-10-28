@@ -16,7 +16,7 @@ import { listAttempts, supervisorAlive, moveInterruptedLabel } from './attempts.
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfigOrError, isDispatchOnly } from './config.js';
-import { resolveCpuLimit } from './cpu-limit.js';
+import { resolveCpuLimit, enforcementOf } from './cpu-limit.js';
 import { collectRunnerStates, renderRunnersLines } from './runner-unreachable.js';
 import { remoteOwnerMap } from './retier.js';
 import { defaultRemoteRoot } from './remote-runner.js';
@@ -214,6 +214,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
   const remoteOwners = remoteOwnerMap(remoteRoot);
   const now = Date.now();
   const resourceCapacity = detectResourceCapacity();
+  const cpuLimit = resolveCpuLimit(cfg);
   const running = leases
     .filter((l) => l.state === LEASE_STATE.RUNNING || l.state === LEASE_STATE.ORPHANED)
     .map((l) => ({
@@ -239,6 +240,9 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       bookedCpuCores: leaseCpuCores(l) ?? null,
       overrun: leaseOverrun(l),
       observedMemoryBytes: l.observedMemoryBytes ?? null,
+      // BRAIN-695: the lease scope's cgroup memory peak against what it booked (report-only; never read by admission)
+      observedCgroupMemoryPeakBytes: l.observedCgroupMemoryPeakBytes ?? null,
+      memOver: memOver(l, leaseResources(l, cfg)),
       // BRAIN-431: how long the run has shown no output, CPU or process churn (null before the first heartbeat observation)
       noProgressSinceMs: Number.isFinite(l.noProgressSinceMs) ? l.noProgressSinceMs : null,
       // BRAIN-532: silence and CPU-idle streaks (warning only; never read by admission)
@@ -337,7 +341,8 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     paused,
     ...(isDispatchOnly(cfg) ? { localExecution: 'refused' } : {}),
     // BRAIN-651 L1: whether lane CPU grants can be enforced with a systemd quota here (never probes while mode is "off")
-    cpuLimit: resolveCpuLimit(cfg),
+    cpuLimit,
+    enforcement: enforcementOf(cpuLimit),
     draining,
     remoteDrain,
     exclusiveHold: exclusiveHoldView(queue, held),
@@ -430,6 +435,12 @@ function computeClasses(cfg, root, held, host) {
     sim: { bookedCores: booked.cores, capCores: classes.sim?.capCores ?? null, tickets: booked.count, maxTickets: classes.sim?.maxTickets ?? null, bookedMemoryBytes: booked.memoryBytes, capMemoryBytes: classes.sim?.capMemoryBytes ?? null },
     test: { bookedCores: testBooked, reserveCores: classes.test?.reserveCores ?? null, budgetCores: B },
   };
+}
+
+/** BRAIN-695: true when the lease's measured cgroup memory peak exceeds the memory it booked. */
+export function memOver(lease, bookedResources) {
+  const booked = bookedResources?.memoryBytes;
+  return Number.isFinite(lease.observedCgroupMemoryPeakBytes) && Number.isFinite(booked) && lease.observedCgroupMemoryPeakBytes > booked;
 }
 
 /** BRAIN-360: shown only when admission granted less CPU than the lane declared; BRAIN-550: `declared\u2192granted` for a right-sized one. */
@@ -629,7 +640,7 @@ export function renderStatusText(status) {
     lines.push('  (none)');
   } else {
     for (const r of status.running) {
-      const flag = (r.exclusive ? ' [exclusive]' : '') + (r.state === 'ORPHANED' ? ' [ORPHANED]' : '') + (r.overrun ? ` [OVERRUN peak ${r.overrun.observedPeak} for ${fmtMs(r.overrun.sinceMs)}]` : '') + silenceFlag(r);
+      const flag = (r.exclusive ? ' [exclusive]' : '') + (r.state === 'ORPHANED' ? ' [ORPHANED]' : '') + (r.overrun ? ` [OVERRUN peak ${r.overrun.observedPeak} for ${fmtMs(r.overrun.sinceMs)}]` : '') + (r.memOver ? ` [MEM-OVER peak ${fmtMB(r.observedCgroupMemoryPeakBytes)} > booked ${fmtMB(r.resources?.memoryBytes)}]` : '') + silenceFlag(r);
       // BRAIN-255: only shown once it's non-default, so "2 running" reads
       // differently against a maxConcurrent: 8 lane than a plain exclusive
       // one, without cluttering the common (ceiling 1) case.

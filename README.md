@@ -1324,16 +1324,21 @@ A warning shows in the log as `lane: warning: remote artifacts: ...` and in the 
 `remoteArtifactsWarning`. The lane's success is about the command: a stamp that did not arrive shows up when whatever
 reads it refuses.
 
-### CPU quota per lane (`cpuLimit`, BRAIN-651 L1, L2, L3)
+### Enforced leases: CPU quota per lane, memory measured (`cpuLimit`, `memoryLimit`, BRAIN-651 L1-L3, BRAIN-695)
 
-`"cpuLimit": "off" | "prefer" | "require"` (global config, default `"off"`; any other value is a config error naming the key) is the
-opt-in for enforcing a lane's admitted CPU grant on a **Linux** host with a transient systemd scope, `CPUQuota=<grant x 100>%`.
+A booking is a cap on CPU and a measured figure for memory (BRAIN-695, 0.61.0).
+`"cpuLimit": "off" | "prefer" | "require"` (global config, default `"prefer"`; any other value is a config error naming the key)
+enforces a lane's admitted CPU grant on a **Linux** host with a transient systemd scope, `CPUQuota=<grant x 100>%`.
 With `"prefer"` or `"require"` and a passing probe, the supervisor spawns each lane child inside `systemd-run --user --scope --unit=lane-<leaseId>.scope -p CPUQuota=<grant x 100>% --quiet --collect`,
-By default the grant is the one admission gave (an elastic grant included, the same number as `LANE_BROKER_CPU_CORES`; a fractional grant rounds up).
-A lane can set a separate execution ceiling as described below.
+The grant is the one admission gave (an elastic grant included, the same number as `LANE_BROKER_CPU_CORES`); the quota is that exact number of cores, never rounded up (a 1.5-core grant is `CPUQuota=150%`; the percent is an integer, at least 1).
+A lane can set a separate execution ceiling as described below. A nested `lane run` that reuses an inherited lease spawns directly inside the parent's scope and never opens a second one.
+`"memoryLimit": "off" | "measure" | "enforce"` (default `"measure"`) is resolved independently of the CPU quota: the probe reads the scope's `memory.peak` (or `memory.current`) back separately, so a host that delegates only `cpu` (pitelite) still enforces CPU.
+With `"measure"` and a readable memory controller the scope also sets `MemoryAccounting=yes` (no cap), and each heartbeat reads the scope's `memory.peak` (fallback: the running max of `memory.current`) into the lease as `observedCgroupMemoryPeakBytes`;
+it lands on the history row and travels through the remote result to the submitter. `lane status` flags a lease `[MEM-OVER ...]` when that peak exceeds the memory it booked. Report-only: admission never reads it.
+`"enforce"` (a hard `MemoryMax`) is refused at config load, naming the key, until BRAIN-696.
 `--scope` execs the command in place, so `nice`, cwd, env, stdout/stderr and the exit status are unchanged. A remote protocol-2 pipeline is the lane child,
 so its deps install, setup and command share one scope. The unit name is recorded on the lease as `cpuScopeUnit` (only when a scope was made).
-Without an explicit execution ceiling, with `"off"`, on macOS, or under `"prefer"` with a failed probe, the spawn is exactly what it was before.
+With `"off"`, on macOS, or under `"prefer"` with a failed probe, the spawn is exactly what it was before (macOS children get `nice` only; there are no cgroups).
 Cancel semantics (L3): when a lease carries `cpuScopeUnit`, every way a lane is ended also runs `systemctl --user stop <unit>`, in addition to the
 process-group and tracked-descendant signals that always ran. The scope stop signals every process in the scope (control-group kill: SIGTERM, then SIGKILL
 after the unit's stop timeout), a `setsid`'d grandchild included, and returns once the scope is empty. It runs for `lane cancel` of an orphaned lease, for a
@@ -1341,13 +1346,15 @@ supervisor reaping after a cancel, a signal or the silence/no-progress watchdog,
 after the stop returns, or after 15 s: a stop that did not complete is logged in the admission log as `lane-broker-cpu-scope id=<id> unit=<unit> stop-incomplete reason=<why>`
 and the lease is released anyway. A scope that is already unloaded counts as stopped. A lease without `cpuScopeUnit` (cpuLimit off, macOS, failed probe) behaves exactly as before.
 
-- The probe runs `systemd-run --user --scope -p CPUQuota=100% --quiet sh -c <read cpu.max>` as the broker's own user and requires the
-  scope's `cpu.max` to read back `100000 100000`. It reports `{mode, available, reason}`: `unsupported-platform` on macOS,
+- The probe runs `systemd-run --user --scope -p CPUQuota=100% -p MemoryAccounting=yes --quiet sh -c <read cpu.max, then memory.peak/memory.current>` as the broker's own user and requires the
+  scope's `cpu.max` to read back `100000 100000`. It reports `{mode, available, reason, memory: {mode, available, reason}}`: `unsupported-platform` on macOS,
   `systemd-run-missing`, `systemd-run-exit-N: <first stderr line>`, or `cpu-max-not-applied: <readback>`. Mode `off` never probes.
 - `"require"` on a host whose probe fails makes the supervisor refuse the ticket before it queues, exit `69`, with `CPU_LIMIT_UNAVAILABLE`
   named in the message. `"prefer"` logs one warning per supervisor and carries on.
-- `lane status --json` and `lane remote-probe` carry `cpuLimit: {mode, available, reason}`; `lane capabilities --json` carries it too.
-  `cpu-limit/1` is added to the advertised capabilities only when the mode is not `off` and the probe passed.
+- `lane status --json`, `lane remote-probe` and `lane capabilities --json` carry `cpuLimit: {mode, available, reason, memory}` and
+  `enforcement: {cpu: "enforced"|"unenforced", memory: "measured"|"off"|"unavailable", reason}` (macOS: "no cgroups on darwin; children get nice only").
+  `cpu-limit/1` is added to the advertised capabilities only when the mode is not `off` and the probe passed; `enforced-leases/1` additionally needs `memoryLimit` not `off`.
+  The placement line `lane: running on <runner> (cpu enforced, memory measured)` names the chosen runner's enforcement (a runner older than 0.61.0 reads `unknown (runner older than 0.61.0)`), and the `lane status` RUNNERS block repeats the last one placement saw.
 - Quota limits CPU time over a period, not instantaneous concurrency, and it needs a user systemd instance with the `cpu` controller delegated;
   that is what the probe checks.
 
