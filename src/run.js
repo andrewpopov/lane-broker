@@ -551,7 +551,8 @@ export async function runCommand({
   const contentKey = !runnerIntake && !exclusive && resolved.cache && (passTtlMs > 0 || redTtlMs > 0) ? computeContentKey({ cwd, key: resolved.key, cmdFingerprint }) : null;
   const envRetry = (process.env.LANE_BROKER_RETRY_REASON ?? '').trim();
   const retryReason = (retryReasonFlag !== undefined ? retryReasonFlag.trim() : envRetry).slice(0, RETRY_REASON_MAX) || undefined;
-  if (contentKey && !noReuse && !retryReason) {
+  // A client-supplied --id may be a resubmission of a ticket that already ran: its idempotent answer is that ticket, never a history verdict.
+  if (contentKey && !noReuse && !retryReason && !ticketId) {
     const now = Date.now();
     // A detached caller waits on a ticket id, which a cached answer has none of, so it always runs (and still records its key).
     // `--no-cache` skips only the pass; the known-red refusal also covers detached runs and ignores `--no-cache`.

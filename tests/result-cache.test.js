@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, gitFixture, waitFor } from './helpers.js';
 import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig } from '../src/config.js';
 import { decideReuse, isQualifyingRed, MAX_UNTRACKED_FILES, computeContentKey } from '../src/result-cache.js';
@@ -288,7 +289,7 @@ test('decideReuse resolver table: the newest real outcome decides', () => {
 test('isQualifyingRed: only the command\'s own non-zero verdict qualifies', () => {
   assert.equal(isQualifyingRed(row()), true);
   assert.equal(isQualifyingRed(row({ exit: 2 })), true);
-  for (const exit of [0, 124, 130, 69, 75, 76, 64, 79, 128, 137, 255, null, 'x']) assert.equal(isQualifyingRed(row({ exit })), false, `exit ${exit}`);
+  for (const exit of [0, 124, 126, 127, 130, 69, 75, 76, 64, 79, 128, 137, 255, null, 'x']) assert.equal(isQualifyingRed(row({ exit })), false, `exit ${exit}`);
   assert.equal(isQualifyingRed(row({ signal: 'SIGTERM' })), false);
   assert.equal(isQualifyingRed(row({ cancelled: true })), false);
   assert.equal(isQualifyingRed(row({ error: 'boom' })), false);
@@ -330,6 +331,17 @@ test('a failed run on identical content is refused with exit 79, empty stdout, n
   assert.equal(refusals[0].refusedFrom, original.id);
   assert.equal(refusals[0].runMs, 0);
   assert.equal(refusals[0].contentKey, undefined, 'a refusal row never renews or shadows anything');
+});
+
+test('a --detach --id submission is never refused: it may be an idempotent resubmission of a ticket that already ran', async () => {
+  const t = setup();
+  await t.lane([], { script: RED });
+  await t.settled(1);
+  const id = crypto.randomUUID();
+  const resubmit = await t.lane(['--detach', '--id', id], { script: RED });
+  assert.equal(resubmit.code, 0, resubmit.stderr);
+  assert.equal(resubmit.stdout.trim(), id);
+  assert.equal(t.rows().filter((r) => r.refusedFrom).length, 0);
 });
 
 test('--retry runs, records retryReason (trimmed, capped); env LANE_BROKER_RETRY_REASON works and the flag wins; a blank flag is usage exit 2', async () => {

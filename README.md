@@ -2150,13 +2150,14 @@ change wastes a lane; the refusal makes the caller state a hypothesis first.
   `cachedFrom`/`refusedFrom` rows, rows without finite `startedAt`/`endedAt`, and rows that ended in the future), the greatest `endedAt` wins; on a tie the
   later row in the file does. A pass within `resultCacheTtlSec` is served, a qualifying red within `knownRedTtlSec` is refused, and
   anything else (a newer infra, signal or cancel row, a red that does not qualify, an expired row) runs.
-- **A qualifying red** has an integer exit that is not `0`, not in `{64, 69, 75, 76, 79, 124, 130}` and below `128`; no signal, `cancelled`,
+- **A qualifying red** has an integer exit that is not `0`, not in `{64, 69, 75, 76, 79, 124, 126, 127, 130}` and below `128` (126/127: the command could not be executed or found, which a remote spawn error is reported as); no signal, `cancelled`,
   `error` or `reason`; and `contentKeyVerified: true` (the tree still hashed to the key when the run ended). A remote result also needs
   `remoteKind: "completed"` and `remotePhase: "command"`, so a failed dependency install or setup is never a test failure. Rows
   written before this release carry no `contentKeyVerified`, so they never cause a refusal (they can still be served as passes).
 - **Bypasses.** `--retry "<why>"` (or env `LANE_BROKER_RETRY_REASON`) runs, bypassing both serving and refusal, and records
   `retryReason` (trimmed, at most 200 characters) on the ticket and history row. `--no-reuse` bypasses both and records nothing extra.
   `--no-cache` and `LANE_BROKER_NO_CACHE=1` skip only pass serving: they do **not** bypass the refusal, and `--detach` runs are refused too.
+  A `--detach --id <id>` submission is never answered from history (served or refused): it may be an idempotent resubmission, whose answer is that ticket.
 - **Config.** Global `knownRedTtlSec` (default `21600`, 6 h; `0` turns the refusal off). It is independent of `resultCacheTtlSec`: each TTL
   applies to its own answer, and a run gets a key while either is above `0` (both `0`: no keys, as before).
 - **Log path.** New history rows record `logPath` (the `--log` override, else the default `<state>/logs/<id>.log`), so the message can name it.
