@@ -27,7 +27,7 @@ import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processSt
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
 import { reloadGlobalConfig, isDispatchOnly } from './config.js';
-import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope, scopeMemoryPeakReader, enforcementLabel } from './cpu-limit.js';
+import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope, scopeMemoryPeakReader, scopeMemoryPeakTracker, enforcementLabel } from './cpu-limit.js';
 import { stateHome } from './state.js';
 import { readRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
@@ -1669,6 +1669,8 @@ async function main() {
   const { child, unit: cpuScope } = scopedChild;
   // BRAIN-695: memory is measured through the same scope; without one (cpuLimit off, macOS) there is no cgroup to read
   const memoryReader = cpuScope && cpuLimit?.memory?.available === true ? scopeMemoryPeakReader(cpuScope, { pid: child.pid }) : null;
+  // the --collect scope vanishes with its last process, so the peak is also read at leader exit and at finalize, not just on heartbeats
+  const memoryPeak = scopeMemoryPeakTracker(memoryReader);
   if (ticket.maxExecutionCpuCores !== undefined) started.lease.executionCpuCores = executionCpuCores;
 
   const logWriter = new CappedLogWriter(ticket.logPath);
@@ -1712,6 +1714,7 @@ async function main() {
   let finished = false;
   let cancelling = false;
   let deadlineExpired = false;
+  let leaderExited = false; // set on 'exit', before stdio drains: a command that ended on its own is never expired by its deadline
   let watchdogKill = null; // BRAIN-431/576: the watchdog reason (no-progress | silence) that began the reap; the first one wins
   let killPromise = null;
 
@@ -1750,7 +1753,7 @@ async function main() {
         const tree = rows ? selectLeaseTree(rows, child.pid, otherLeaseStops(root, ticket.id)) : null;
         const observed = tree?.cores ?? null;
         const observedMemory = tree?.memoryBytes ?? null;
-        const cgroupPeak = memoryReader?.read() ?? null;
+        const cgroupPeak = memoryPeak.sample();
         // a gap of more than two heartbeats between good readings ends an overrun streak
         writeLease(root, {
           ...applyHeartbeatObservation(lease, observed, Date.now(), observedMemory, 2 * globalCfg.sampleMs, {
@@ -1782,10 +1785,10 @@ async function main() {
   /** BRAIN-695: the exclusive's deadline ends the run through the same reap as a cancel; an explicit cancel that landed first keeps its 130. */
   const exclusiveDeadlineTimer = exclusiveDeadlineMs
     ? setTimeout(() => {
-        if (finished || cancelling || killPromise || cancelRequested(root, ticket.id)) return;
+        if (finished || leaderExited || cancelling || killPromise || cancelRequested(root, ticket.id)) return;
         deadlineExpired = true;
         reap(EXCLUSIVE_DEADLINE_REASON);
-      }, exclusiveDeadlineMs)
+      }, Math.max(0, startedAt + exclusiveDeadlineMs - Date.now())) // from the recorded start, not from after the initial scan
     : null;
   const earlySample = setTimeout(() => {
     if (!finished) observeLease();
@@ -1822,6 +1825,7 @@ async function main() {
 
   async function finalizeAndExit(result, exitCode) {
     finished = true;
+    memoryPeak.sample(); // before any scope stop
     clearInterval(heartbeat);
     clearTimeout(earlySample);
     clearTimeout(exclusiveDeadlineTimer);
@@ -1889,7 +1893,9 @@ async function main() {
       if (observedCpu) finalResult = { ...finalResult, observedCpu };
       const rssPeak = sanitizeRssPeak(finalLease?.observedRssPeakBytes);
       if (rssPeak !== undefined) finalResult = { ...finalResult, observedRssPeakBytes: rssPeak };
-      const cgroupPeak = sanitizeRssPeak(finalLease?.observedCgroupMemoryPeakBytes);
+      const leasePeak = sanitizeRssPeak(finalLease?.observedCgroupMemoryPeakBytes);
+      const exitPeak = memoryPeak.sample();
+      const cgroupPeak = leasePeak === undefined ? (exitPeak ?? undefined) : Math.max(leasePeak, exitPeak ?? 0);
       if (cgroupPeak !== undefined) finalResult = { ...finalResult, observedCgroupMemoryPeakBytes: cgroupPeak };
       const cpuSeconds = integratedCpuSeconds(finalLease?.observedCpuStats, startedAt, finalResult.endedAt);
       if (cpuSeconds !== undefined) finalResult = { ...finalResult, cpuSeconds };
@@ -1972,6 +1978,8 @@ async function main() {
   // gone. So reap on 'exit'; finalizeAndExit awaits killPromise before the result is written or the lease released.
   let groupReaped = false;
   child.on('exit', () => {
+    leaderExited = true;
+    memoryPeak.sample(); // first, while the scope still exists
     if (finished || cancelling || watchdogKill) return;
     if (!isGroupAlive(child.pid) && !hasLiveMembers(descendants)) return;
     groupReaped = true;

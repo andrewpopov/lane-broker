@@ -196,6 +196,17 @@ test('a command that finishes inside its deadline is untouched (exit 0, no expir
   assert.equal(historyOf(ctx.state)[0].exclusiveDeadlineExpired, undefined);
 });
 
+test('a command that exited before its deadline while its output is still draining is not expired', async () => {
+  const ctx = setup({ extraEnv: { LANE_BROKER_TEST_EXCLUSIVE_DEADLINE_MS: String(TEST_DEADLINE_MS) } });
+  // the leader exits at once; a setsid'd child (outside the group, not yet tracked) holds stdout for 3s, so 'close' lands after the 1500ms deadline with no reap having begun
+  const holder = `perl -MPOSIX -e 'exit 0 if fork; setsid(); exec "sleep", "3"'`;
+  const result = await laneRun(runArgs(EXCL, bash(`${holder}; exit 0`)), { env: ctx.env, cwd: ctx.repoDir });
+  assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+  const [row] = historyOf(ctx.state);
+  assert.equal(row.exclusiveDeadlineExpired, undefined);
+  assert.notEqual(row.exit, 124);
+});
+
 test('an explicit lane cancel before expiry keeps 130, not 124', async () => {
   const ctx = setup({ extraEnv: { LANE_BROKER_TEST_EXCLUSIVE_DEADLINE_MS: '20000' } });
   const { id, lease } = await detached(ctx, EXCL, bash(TRAP_EXIT_ZERO));

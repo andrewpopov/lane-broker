@@ -58,8 +58,15 @@ export const probeCpuLimit = (deps = {}) => probeCgroupControllers(deps).cpu;
 /** The transient scope's unit name for a lease: deterministic, so a later stop (BRAIN-651 L3) never has to discover it. */
 export const cpuScopeUnit = (leaseId) => `lane-${leaseId}.scope`;
 
-/** The quota for `cores` booked cores: the exact percent (systemd accepts e.g. 150%), integer, at least 1%. */
-export const cpuQuotaPercent = (cores) => Math.max(1, Math.round(cores * 100));
+/** The smallest CPU grant, in cores, a quota can express (1%): below it a quota would have to exceed the grant. */
+export const MIN_CPU_GRANT_CORES = 0.01;
+
+/** The quota for `cores` booked cores: the exact percent (systemd accepts e.g. 150%), floored so it never exceeds the grant. */
+export function cpuQuotaPercent(cores) {
+  const percent = Math.floor(cores * 100 + 1e-9); // 0.29 * 100 is 28.999999999999996: the epsilon absorbs float error, never a real fraction of a percent
+  if (!(percent >= 1)) throw new Error(`cpuQuotaPercent: a grant of ${cores} cores is below the ${MIN_CPU_GRANT_CORES}-core minimum (1%)`);
+  return percent;
+}
 
 /** The argv that runs `argv` in its own scope capped at `grantCores` cores (named `unit` when given; `measureMemory` turns memory accounting on, with no cap). Spawns nothing. */
 export function cpuLimitArgv(grantCores, argv, { unit, measureMemory = false } = {}) {
@@ -183,6 +190,22 @@ export function scopeCgroupDir(unit, { pid, uid = process.getuid?.(), readFile =
  * BRAIN-695: a reader of one lease scope's memory peak in bytes. `read()` returns the scope's `memory.peak`, else the running max of its
  * `memory.current`, or null when nothing is readable (scope not yet entered, already collected, no memory controller). It never throws.
  */
+export function scopeMemoryPeakTracker(reader) {
+  let peak = null;
+  return {
+    /** Reads once more and returns the highest value seen so far (null when nothing was ever readable); never throws. */
+    sample() {
+      try {
+        const value = reader?.read() ?? null;
+        if (value !== null) peak = Math.max(peak ?? 0, value);
+      } catch {
+        // best effort: an unreadable scope leaves the previous peak
+      }
+      return peak;
+    },
+  };
+}
+
 export function scopeMemoryPeakReader(unit, { pid, ...deps } = {}) {
   const readFile = deps.readFile ?? ((p) => fs.readFileSync(p, 'utf8'));
   let dir = null;

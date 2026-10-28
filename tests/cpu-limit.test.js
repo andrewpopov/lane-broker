@@ -79,7 +79,10 @@ test('cpuLimitArgv: CPUQuota is 100% per booked core, and the original argv foll
     assert.deepEqual(cpuLimitArgv(grant, ['npm', 'test']), ['systemd-run', '--user', '--scope', '-p', `CPUQuota=${quota}`, '--quiet', '--collect', '--', 'npm', 'test']);
   }
   assert.ok(cpuLimitArgv(1.5, ['x']).includes('CPUQuota=150%'), 'exact fractional quota, not rounded up');
-  assert.ok(cpuLimitArgv(0.001, ['x']).includes('CPUQuota=1%'), 'at least 1%');
+  // a quota never exceeds its grant: 0.015 cores is 1%, not the 2% a rounding quota would give; below 0.01 core nothing is expressible
+  assert.ok(cpuLimitArgv(0.015, ['x']).includes('CPUQuota=1%'), 'floored, never above the grant');
+  assert.ok(cpuLimitArgv(0.29, ['x']).includes('CPUQuota=29%'));
+  for (const tiny of [0.001, 0.0099]) assert.throws(() => cpuLimitArgv(tiny, ['x']), /below the 0\.01-core minimum/);
   assert.ok(cpuLimitArgv(2, ['x'], { measureMemory: true }).includes('MemoryAccounting=yes'));
   for (const bad of [0, -1, Infinity, NaN, undefined, '2']) assert.throws(() => cpuLimitArgv(bad, ['x']), /positive and finite/);
 });

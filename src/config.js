@@ -10,7 +10,7 @@ import { unsupportedHookKeys, hookRefusalMessage, EXCLUSIVE_PURPOSES, exclusiveD
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
 import { DEFAULT_DEPS_CACHE_MAX_BYTES } from './deps-cache.js';
 import { isValidRequiresShape, VERSION_FLOOR_RE } from './runner-readiness.js';
-import { CPU_LIMIT_MODES, MEMORY_LIMIT_MODES } from './cpu-limit.js';
+import { CPU_LIMIT_MODES, MEMORY_LIMIT_MODES, MIN_CPU_GRANT_CORES } from './cpu-limit.js';
 
 /** The largest delay Node's setTimeout honours; above it the timer fires after 1 ms. */
 const MAX_TIMER_MS = 2_147_483_647;
@@ -666,6 +666,7 @@ function validateRepoConfig(cfg, sourcePath) {
     assert(Number.isFinite(lane.weight) && lane.weight > 0, `${sourcePath}: lane "${name}".weight must be a positive number`);
     if (lane.cpuCores !== undefined) {
       assert(Number.isFinite(lane.cpuCores) && lane.cpuCores > 0, `${sourcePath}: lane "${name}".cpuCores must be a positive number`);
+      assert(lane.cpuCores >= MIN_CPU_GRANT_CORES, `${sourcePath}: lane "${name}".cpuCores must be >= ${MIN_CPU_GRANT_CORES}`);
       assert(lane.cpuCores <= MAX_LANE_CPU_CORES, `${sourcePath}: lane "${name}".cpuCores must be <= ${MAX_LANE_CPU_CORES}`);
     }
     if (lane.maxExecutionCpuCores !== undefined) {
@@ -675,6 +676,7 @@ function validateRepoConfig(cfg, sourcePath) {
     if (lane.minCpuCores !== undefined) {
       assert(Number.isFinite(lane.minCpuCores) && lane.minCpuCores > 0, `${sourcePath}: lane "${name}".minCpuCores must be a positive number`);
       // an unset cpuCores resolves to weight (resolveTicketResources), so that is the claim the floor sits under
+      assert(lane.minCpuCores >= MIN_CPU_GRANT_CORES, `${sourcePath}: lane "${name}".minCpuCores must be >= ${MIN_CPU_GRANT_CORES}`);
       assert(lane.minCpuCores <= MAX_LANE_CPU_CORES, `${sourcePath}: lane "${name}".minCpuCores must be <= ${MAX_LANE_CPU_CORES}`);
       const claim = lane.cpuCores ?? lane.weight;
       assert(lane.minCpuCores <= claim, `${sourcePath}: lane "${name}".minCpuCores (${lane.minCpuCores}) must be <= its cpuCores (${claim})`);

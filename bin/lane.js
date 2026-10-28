@@ -11,6 +11,7 @@ import { waitCommand } from '../src/wait.js';
 import { pauseCommand, resumeCommand, drainCommand, undrainCommand } from '../src/pause.js';
 import { migrateSchedulerCommand } from '../src/migrate.js';
 import { parseByteSize } from '../src/resources.js';
+import { MIN_CPU_GRANT_CORES } from '../src/cpu-limit.js';
 import { isTicketId } from '../src/state.js';
 import { leaseCheckCommand } from '../src/lease.js';
 import { parseTransferFlag } from '../src/remote-gzip.js';
@@ -90,7 +91,7 @@ function parseRunArgs(args) {
       case '--cpu': {
         const raw = flagArgs[++i];
         const n = Number(raw);
-        if (!Number.isFinite(n) || n <= 0) throw new Error(`--cpu must be a positive number (got "${raw}")`);
+        if (!Number.isFinite(n) || n < MIN_CPU_GRANT_CORES) throw new Error(`--cpu must be a number >= ${MIN_CPU_GRANT_CORES} (got "${raw}")`);
         opts.cpuOverride = n;
         break;
       }
