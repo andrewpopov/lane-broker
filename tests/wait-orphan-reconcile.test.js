@@ -149,15 +149,15 @@ test('--timeout is honoured while the runner reports the job running (exit 75 on
   }
 });
 
-test('a post-fallback orphan (executor local) is still reported ORPHANED, never reconciled', async () => {
+test('a post-fallback orphan (executor local) that never reached admission is settled as exit 75 (BRAIN-605), not reported ORPHANED', async () => {
   const ctx = setup();
   const id = crypto.randomUUID();
   ensureStateDirs(ctx.state);
   atomicWriteJson(path.join(paths(ctx.state).attempts, `${id}.json`), { id, generation: 0, executor: 'local', phase: 'queued', runner: null, startedAt: Date.now(), supervisor: DEAD_SUPERVISOR });
   const out = await wait(ctx, id);
-  assert.equal(out.code, 1);
-  assert.match(out.stderr, /ORPHANED \(post-fallback\)/);
-  assert.match(out.stderr, /reconcile with: lane cancel/);
+  assert.equal(out.code, 75, out.stderr);
+  assert.equal(resultOf(ctx.state, id).reason, 'supervisor-died-while-queued');
+  assert.equal(readAttempt(ctx.state, id), null);
 });
 
 /** A PATH entry whose `ssh` never answers: it sleeps far past any deadline (and dies with its parent's SIGKILL). */

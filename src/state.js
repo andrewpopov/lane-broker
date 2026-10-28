@@ -118,6 +118,8 @@ export function paths(root = stateHome()) {
     // BRAIN-319 T3b-2 (C3): one durable attempt record per remote-eligible
     // ticket, keyed by ticket id -- see src/attempts.js.
     attempts: path.join(root, 'attempts'),
+    // BRAIN-494: one record per `lane run --detach` id, written before the id is printed (src/pending.js).
+    pending: path.join(root, 'pending'),
   };
 }
 

@@ -5,6 +5,7 @@ import { loadGlobalConfigOrError } from './config.js';
 import { listAttempts, supervisorAlive } from './attempts.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
 import { heartbeatUpRunners } from './runner-unreachable.js';
+import { settleAbandonedLocalAttempts } from './local-reconcile.js';
 
 /**
  * BRAIN-515: settle every ORPHANED-REMOTE attempt whose runner answers, without anyone typing `lane cancel`. A runner that comes
@@ -78,6 +79,7 @@ export async function sweepOrphans(root, { globalCfg, force = false, now = Date.
         ...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
       });
     }
+    results.push(...(await settleAbandonedLocalAttempts(root)));
     return { ran: true, results };
   } catch (err) {
     return { ran: false, reason: `sweep failed: ${err.message}` };

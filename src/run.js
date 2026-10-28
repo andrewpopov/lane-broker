@@ -12,6 +12,7 @@ import { MIN_CPU_GRANT_CORES } from './cpu-limit.js';
 import { resolveTicketConfig, reloadGlobalConfig, isDispatchOnly, resolvePriority, assertHostConfigHookless, ConfigError } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
+import { writePending } from './pending.js';
 import { stampPriorityOrigin } from './priority-clock.js';
 import { detectResourceCapacity, leaseResources, resolveTicketResources, capUnapprovedCpu, checkResourceBudget, localSimRefusal, dispatchOnlyRefusal, locallyRefusedNow } from './resources.js';
 import { argvFingerprint } from './cpu-estimates.js';
@@ -870,6 +871,13 @@ export async function runCommand({
       supervisor.once('error', resolve);
     });
     if (spawnFailure) {
+      return { exitCode: 1 };
+    }
+    // BRAIN-494: a durable record must name this id before anyone is told it, or a supervisor that dies before registering leaves an id nothing can find
+    try {
+      writePending(root, { id, pid: supervisor.pid, logPath, cwd, repo: resolved.repoId, lane: resolved.lane });
+    } catch (err) {
+      process.stderr.write(`lane run: could not record detached ${id}: ${err.message}\n`);
       return { exitCode: 1 };
     }
     process.stdout.write(`${id}\n`);
