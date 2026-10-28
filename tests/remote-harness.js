@@ -569,6 +569,22 @@ if (sub === 'probe') {
   if (sub === 'cancel' && r.cancelFails) done(1);
   if (sub === 'result' && r.resultDownAfterWithdraw && fs.existsSync(flag)) done(1);
   if (sub === 'withdraw' && r.withdrawReplyLost) fs.writeFileSync(flag, '1');
+  if (sub === 'result' && r.resultPatch) {
+    // a test-only rewrite of the runner's real record (a null value deletes the key), e.g. a record with no \`reason\` or a wrong binding
+    const patched = spawn('sh', ['-c', cmd], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, LANE_FAKE_RUNNER: dest, LANE_BROKER_HOME: r.home, LANE_BROKER_STATE: r.state } });
+    let out = '';
+    patched.stdout.on('data', (d) => { out += d; });
+    patched.stderr.pipe(process.stderr);
+    patched.on('close', (code) => {
+      try {
+        const rec = JSON.parse(out.trim());
+        if (!rec.missing) for (const [k, v] of Object.entries(r.resultPatch)) { if (v === null) delete rec[k]; else rec[k] = v; }
+        process.stdout.write(JSON.stringify(rec) + '\\n');
+      } catch { process.stdout.write(out); }
+      done(code == null ? 1 : code);
+    });
+    return;
+  }
   const lost = sub === 'withdraw' && r.withdrawReplyLost;
   const child = spawn('sh', ['-c', cmd], { stdio: ['pipe', lost ? 'ignore' : 'pipe', 'pipe'], env: { ...process.env, LANE_FAKE_RUNNER: dest, LANE_BROKER_HOME: r.home, LANE_BROKER_STATE: r.state } });
   process.stdin.pipe(child.stdin);

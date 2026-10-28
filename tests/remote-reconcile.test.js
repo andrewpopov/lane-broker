@@ -275,6 +275,29 @@ for (const record of [{ kind: 'unfinished', reason: 'queue-timeout' }, { kind: '
   });
 }
 
+// BRAIN-350: a runner's host shutdown proves the job is dead there, exactly like a never-started record.
+test('a binding-matched unfinished/runner-shutdown runner record is settled as lost (exit 75, runner-shutdown) and never re-run', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { record: { kind: 'unfinished', reason: 'runner-shutdown' } });
+  const outcome = await reconcile(ctx, id);
+  assert.deepEqual(outcome, { settled: true, state: 'lost', exit: 75 });
+  assert.equal(readAttempt(ctx.state, id), null);
+  const result = resultOf(ctx.state, id);
+  assert.equal(result.reason, 'runner-shutdown');
+  assert.equal(result.lostDetail, 'runner skybox stopped the job: host shutting down');
+  const rows = historyRows(ctx.state);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].reason, 'runner-shutdown');
+  assertNothingRan(ctx);
+});
+
+test('a runner-shutdown record with a mismatched binding stays ambiguous: attempt kept', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { record: { kind: 'unfinished', reason: 'runner-shutdown', manifestHash: 'x'.repeat(64) } });
+  assert.equal((await reconcile(ctx, id)).state, 'ambiguous');
+  assertKept(ctx, id);
+});
+
 test('a never-started runner record with a mismatched binding stays ambiguous: attempt kept', async () => {
   const ctx = context();
   const id = seedOrphan(ctx, { record: { kind: 'unfinished', reason: 'queue-timeout', manifestHash: 'x'.repeat(64) } });

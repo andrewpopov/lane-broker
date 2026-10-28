@@ -11,7 +11,7 @@ import { isCacheable, isBlobHash } from './remote-blobs.js';
 import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
 import { isPriorityTier } from './priority.js';
 import { runnerAvailability } from './runner-schedule.js';
-import { sanitizeDrainReason } from './state.js';
+import { sanitizeDrainReason, RUNNER_SHUTDOWN_REASON } from './state.js';
 import { readinessProbeArgs, readinessGap } from './runner-readiness.js';
 
 /**
@@ -784,6 +784,11 @@ export function provesNeverStarted(record, expected) {
   );
 }
 
+/** BRAIN-350: true iff `record` binds to `expected` and is the runner's own proof its host shut down and the job is no longer running there (so running it again cannot double-run). */
+export function provesStopped(record, expected) {
+  return matchesTicket(record, expected) && record.kind === 'unfinished' && record.reason === RUNNER_SHUTDOWN_REASON;
+}
+
 const DEFAULT_REBALANCE_INTERVAL_MS = 30_000;
 export const DRAIN_MOVE_REASON = 'runner-draining';
 export const QUEUED_TOO_LONG_REASON = 'queued-too-long';
@@ -1294,6 +1299,7 @@ async function dispatchOnce(opts) {
       const cacheRepair = transferCache && record.kind === 'rejected' && CACHE_REJECT_RE.test(record.reason ?? '');
       return { outcome: 'unconfirmed', reason: classification.reason, neverStarted: true, ...(record.kind === 'unfinished' ? { retryElsewhere: true } : { rejected: true }), ...(cacheRepair ? { cacheRepair: true } : {}) };
     }
+    if (provesStopped(record, expected) && !unconfirmedCancel) return { outcome: 'unconfirmed', reason: classification.reason, runnerStopped: true };
     return { outcome: 'unconfirmed', reason: classification.reason, mayStillBeRunning: true };
   }
   const confirmed = { outcome: 'confirmed', result: record, exitCode: classification.exitCode, phase: classification.phase, uploadMs };
