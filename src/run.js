@@ -19,7 +19,7 @@ import { rightSizedCpuCores } from './right-size.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
 import { isExclusive, oversizedWeight, oversizedWeightMessage } from './exclusive.js';
 import { parseScrubCommandEnv, scrubCommandEnv, SCRUB_COMMAND_ENV_VAR } from './scrub-command-env.js';
-import { computeContentKey, findCachedPass } from './result-cache.js';
+import { computeContentKey, decideReuse } from './result-cache.js';
 
 const supervisorPath = fileURLToPath(new URL('./supervisor.js', import.meta.url));
 
@@ -129,6 +129,9 @@ function resolveWorktreeRoot(cwd) {
 }
 
 const HISTORY_COMMAND_MAX = 300;
+/** BRAIN-700: the `lane run` exit when byte-identical content already failed (README "Known-red refusal"). */
+const REFUSED_KNOWN_RED_EXIT = 79;
+const RETRY_REASON_MAX = 200;
 
 /** Why a run of a remote-capable lane (`remote: true`) is executing locally,
  *  decided at ticket creation. A remote attempt that later falls back is
@@ -247,6 +250,9 @@ export async function runCommand({
   exclusive: exclusiveOverride,
   // BRAIN-549: `--no-cache` (env LANE_BROKER_NO_CACHE=1 is the other way): run even when a cached pass exists
   noCache,
+  // BRAIN-700: `--no-reuse` (answer nothing from history) and `--retry "<why>"` (env LANE_BROKER_RETRY_REASON): re-run content that already failed
+  noReuse,
+  retryReason: retryReasonFlag,
   detach,
   timeoutMs,
   allowLocalSim,
@@ -539,13 +545,46 @@ export async function runCommand({
   }
 
   const root = ensureStateDirs().root;
-  // BRAIN-549: a run gets a content key unless caching is off for it; a runner (snapshot intake) and an exclusive never cache.
-  const cacheTtlMs = globalCfg.resultCacheTtlSec * 1000;
-  const contentKey = !runnerIntake && !exclusive && resolved.cache && cacheTtlMs > 0 ? computeContentKey({ cwd, key: resolved.key, cmdFingerprint }) : null;
-  // A detached caller waits on a ticket id, which a cached answer has none of, so it always runs (and still records its key).
-  if (contentKey && !detach && !noCache && process.env.LANE_BROKER_NO_CACHE !== '1') {
+  // BRAIN-549/700: a run gets a content key unless caching is off for it or both TTLs are 0; a runner (snapshot intake) and an exclusive never key.
+  const passTtlMs = globalCfg.resultCacheTtlSec * 1000;
+  const redTtlMs = globalCfg.knownRedTtlSec * 1000;
+  const contentKey = !runnerIntake && !exclusive && resolved.cache && (passTtlMs > 0 || redTtlMs > 0) ? computeContentKey({ cwd, key: resolved.key, cmdFingerprint }) : null;
+  const envRetry = (process.env.LANE_BROKER_RETRY_REASON ?? '').trim();
+  const retryReason = (retryReasonFlag !== undefined ? retryReasonFlag.trim() : envRetry).slice(0, RETRY_REASON_MAX) || undefined;
+  // A client-supplied --id may be a resubmission of a ticket that already ran: its idempotent answer is that ticket, never a history verdict.
+  if (contentKey && !noReuse && !retryReason && !ticketId) {
     const now = Date.now();
-    const hit = findCachedPass(readRows(paths(root).history), { contentKey, now, ttlMs: cacheTtlMs });
+    // A detached caller waits on a ticket id, which a cached answer has none of, so it always runs (and still records its key).
+    // `--no-cache` skips only the pass; the known-red refusal also covers detached runs and ignores `--no-cache`.
+    const servePass = !detach && !noCache && process.env.LANE_BROKER_NO_CACHE !== '1';
+    const rows = readRows(paths(root).history);
+    const decision = decideReuse(rows, { contentKey, now, passTtlMs: servePass ? passTtlMs : 0, redTtlMs });
+    if (decision.action === 'refuse') {
+      const red = decision.row;
+      const redLog = [red.logPath, path.join(paths(root).logs, `${red.id}.log`)].find((candidate) => candidate && fs.existsSync(candidate)) ?? 'unavailable';
+      process.stderr.write(`lane: identical content failed in ${red.id} at ${new Date(red.endedAt).toISOString()} (exit ${red.exit}, log ${redLog}); fix the cause, or pass --retry "<hypothesis>" to re-run\n`);
+      appendHistory(root, {
+        id: crypto.randomUUID(),
+        key: resolved.key,
+        repo: resolved.repoId,
+        lane: resolved.lane,
+        ...(resolved.configLane ? { configLane: resolved.configLane } : {}),
+        weight,
+        command: cmd.join(' ').slice(0, HISTORY_COMMAND_MAX),
+        cmdFingerprint,
+        headTree,
+        exit: REFUSED_KNOWN_RED_EXIT,
+        signal: null,
+        startedAt: now,
+        endedAt: now,
+        waitedMs: 0,
+        runMs: 0,
+        executor: 'local',
+        refusedFrom: red.id,
+      });
+      return { exitCode: REFUSED_KNOWN_RED_EXIT };
+    }
+    const hit = decision.action === 'serve' ? decision.row : null;
     if (hit) {
       const cachedLine = `lane: cached pass from ${hit.id} at ${new Date(hit.endedAt).toISOString()} (pass --no-cache to re-run)\n`;
       process.stderr.write(cachedLine);
@@ -664,6 +703,7 @@ export async function runCommand({
     ...(cmdFingerprint ? { cmdFingerprint } : {}),
     ...(headTree ? { headTree } : {}),
     ...(contentKey ? { contentKey } : {}),
+    ...(retryReason ? { retryReason } : {}),
     ...(localReason ? { localReason } : {}),
     ...(localReason && localReason === forced && localReasonText ? { localReasonText } : {}),
     // BRAIN-442: a local-first lane enqueues locally and only becomes rebind-eligible after its wait (lane value, else global)

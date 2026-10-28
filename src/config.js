@@ -193,6 +193,9 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // BRAIN-549: a command that already passed on the exact same worktree content within this many seconds is answered from
   // history instead of re-run. 0 turns the result cache off.
   resultCacheTtlSec: 86_400,
+  // BRAIN-700: a command that FAILED (a genuine test failure) on byte-identical content within this many seconds is refused (exit 79) unless
+  // `--retry "<why>"`. 0 turns the refusal off.
+  knownRedTtlSec: 21_600,
   // BRAIN-379 (balancer P2, slice 2): record, in admission-decisions.log and `lane status`, what
   // class-aware test/sim allocation WOULD decide. Never changes a live admission decision.
   allocationShadow: false,
@@ -355,6 +358,7 @@ function validateGlobalConfig(cfg, sourcePath) {
     `${sourcePath}: "settledDemandFloorFraction" must be a number in [0, 1]`,
   );
   assert(Number.isInteger(cfg.resultCacheTtlSec) && cfg.resultCacheTtlSec >= 0, `${sourcePath}: "resultCacheTtlSec" must be a non-negative integer (0 disables the result cache)`);
+  assert(Number.isInteger(cfg.knownRedTtlSec) && cfg.knownRedTtlSec >= 0, `${sourcePath}: "knownRedTtlSec" must be a non-negative integer (0 disables the known-red refusal)`);
   assert(typeof cfg.historyDemandEnabled === 'boolean', `${sourcePath}: "historyDemandEnabled" must be a boolean`);
   assert(Number.isInteger(cfg.maxLaneWeight) && cfg.maxLaneWeight >= 1, `${sourcePath}: "maxLaneWeight" must be a positive integer`);
   assert(typeof cfg.rightSizeFromHistory === 'boolean', `${sourcePath}: "rightSizeFromHistory" must be a boolean`);

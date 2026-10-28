@@ -91,6 +91,8 @@ features like pipes or globbing.
 | `--priority high\|medium\|low` | BRAIN-380 priority tier (default `medium`). Beats env `LANE_BROKER_PRIORITY`, which beats the lane's `priority` in `.lane-broker.json` (an `undeclaredLanes.as` template passes its tier on), which beats `medium`. Any invalid value from any of the three exits `64`. See "Priority (foundations)" below. |
 | `--exclusive` | BRAIN-403 v1: claim the whole host for this run. See "Exclusive lanes (BRAIN-403 v1)" below. The lane config key `lanes.<name>.exclusive: true` does the same. |
 | `--no-cache` | BRAIN-549: run even if the same command already passed on identical content (env `LANE_BROKER_NO_CACHE=1` does the same). See "Result cache" below. |
+| `--no-reuse` | BRAIN-700: answer nothing from history: neither a cached pass nor a known-red refusal. Advertised as capability `reuse-green/1`. See "Known-red refusal" below. |
+| `--retry "<why>"` | BRAIN-700: re-run content that already failed (env `LANE_BROKER_RETRY_REASON`; the flag wins; blank is usage exit `2`). Also bypasses serving a pass. The reason is recorded on the history row as `retryReason`. |
 | `--detach` | Print the run id and return immediately instead of waiting. |
 | `--timeout <duration>` | e.g. `30s`, `5m`, `500ms`. Exit `75` if not finished in time — see below. |
 | `--allow-local-sim` | Override a lane's `localRefused: true`. |
@@ -2115,9 +2117,12 @@ happens before admission: no ticket, no queue, no lease.
 The content key is a sha256 over: the lane key (repo + lane), the command fingerprint (argv and cwd), HEAD's tree, the
 binary-safe `git diff HEAD` (every tracked edit, staged or not, deletions and mode changes) and the sorted path, mode
 and content hash of every untracked, non-ignored file. Only an exit-`0` run with the same key inside `resultCacheTtlSec`
-is served; a failed, signalled, cancelled or refused run never is, and a cached row never renews the pass it points to.
-Every keyed run stores `contentKey` on its history row; a pass keeps it only if the worktree still hashes to the same
-key when the run ends (a run that edits the tree, or an edit made while it queued or ran, leaves nothing to serve).
+is served, and only while it is the **newest** real outcome for that key: a later failure (or signalled, cancelled or refused run)
+invalidates an older pass (BRAIN-700; before, the older pass was still served). A failed, signalled, cancelled or refused run is never
+served, and a cached row never renews the pass it points to.
+Every keyed run stores `contentKey` on its history row; a result (pass or failure) keeps it only if the worktree still hashes to the same
+key when the run ends (a run that edits the tree, or an edit made while it queued or ran, leaves nothing to serve), and then also
+carries `contentKeyVerified: true`.
 
 It gives no key, so the run simply executes, when: the command has no fingerprint or the directory is not a git checkout
 with a HEAD; the checkout has a `.gitmodules`; a tracked file is flagged assume-unchanged or skip-worktree (git diff
@@ -2129,9 +2134,37 @@ file or symlink; or any git call fails.
 file should opt out (below), or its pass can be served when it would now fail.
 
 Opt-outs: `--no-cache`, env `LANE_BROKER_NO_CACHE=1`, `"cache": false` on a lane in `.lane-broker.json` (inherited by
-an `undeclaredLanes.as` template's lanes), and global `resultCacheTtlSec` (default `86400`; `0` turns it off, no keys are
+an `undeclaredLanes.as` template's lanes), and global `resultCacheTtlSec` (default `86400`; `0` turns it off; with `knownRedTtlSec` also `0` no keys are
 recorded either). Never cached: exclusive lanes, `--detach` runs (they return an id to wait on; they still record a key),
 nested runs under an inherited lease, and a runner's `remote-exec` intake.
+
+### Known-red refusal (BRAIN-700)
+
+`lane run` refuses to re-run byte-identical content whose newest real outcome was a genuine test failure. It prints
+`lane: identical content failed in <id> at <time> (exit <n>, log <path or "unavailable">); fix the cause, or pass --retry "<hypothesis>" to re-run`
+to stderr (nothing on stdout, `--detach` included), exits `79`, and appends a history row with `exit: 79`, `refusedFrom: <id>`,
+`runMs: 0` and no `contentKey`. It happens before admission: no ticket, queue entry or lease. Rerunning a failure that cannot
+change wastes a lane; the refusal makes the caller state a hypothesis first.
+
+- **Same key, newest outcome decides.** The content key is the Result cache's. Among the history rows with that key (ignoring
+  `cachedFrom`/`refusedFrom` rows, rows without finite `startedAt`/`endedAt`, and rows that ended in the future), the greatest `endedAt` wins; on a tie the
+  later row in the file does. A pass within `resultCacheTtlSec` is served, a qualifying red within `knownRedTtlSec` is refused, and
+  anything else (a newer infra, signal or cancel row, a red that does not qualify, an expired row) runs.
+- **A qualifying red** has an integer exit that is not `0`, not in `{64, 69, 75, 76, 79, 124, 126, 127, 130}` and below `128` (126/127: the command could not be executed or found, which a remote spawn error is reported as); no signal, `cancelled`,
+  `error` or `reason`; and `contentKeyVerified: true` (the tree still hashed to the key when the run ended). A remote result also needs
+  `remoteKind: "completed"` and `remotePhase: "command"`, so a failed dependency install or setup is never a test failure. Rows
+  written before this release carry no `contentKeyVerified`, so they never cause a refusal (they can still be served as passes).
+- **Bypasses.** `--retry "<why>"` (or env `LANE_BROKER_RETRY_REASON`) runs, bypassing both serving and refusal, and records
+  `retryReason` (trimmed, at most 200 characters) on the ticket and history row. `--no-reuse` bypasses both and records nothing extra.
+  `--no-cache` and `LANE_BROKER_NO_CACHE=1` skip only pass serving: they do **not** bypass the refusal, and `--detach` runs are refused too.
+  A `--detach --id <id>` submission is never answered from history (served or refused): it may be an idempotent resubmission, whose answer is that ticket.
+- **Config.** Global `knownRedTtlSec` (default `21600`, 6 h; `0` turns the refusal off). It is independent of `resultCacheTtlSec`: each TTL
+  applies to its own answer, and a run gets a key while either is above `0` (both `0`: no keys, as before).
+- **Log path.** New history rows record `logPath` (the `--log` override, else the default `<state>/logs/<id>.log`), so the message can name it.
+- **What the key does not see.** Ignored files (`node_modules`, build output) and the environment are not in the key. After fixing
+  dependencies or the environment with the source untouched, re-run with `--retry "deps reinstalled"`.
+- **merge-train** sends `--no-reuse` on every train lane when `lane capabilities --json` lists `reuse-green/1`, so a train run is never
+  answered from history.
 
 ### Exclusive lanes (BRAIN-403 v1)
 
@@ -2201,6 +2234,7 @@ Documented limits, not bugs:
 | `69` | Local-sim lane refused (fleet-offload message); use `--allow-local-sim`. |
 | `76` | A remote-only (`localRefused` + `remote`) lane found no runner able to take it right now (BRAIN-455). Retryable, unlike `69`; `--allow-local-sim` runs it here. |
 | `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. Also `lane run` / `remote-exec` refused with "scheduler migration in progress" while `lane migrate-scheduler` runs, or "scheduler migration pending (draining)" while `--when-idle` waits. `lane priority` also exits `75` (nothing changed, retry) on a lock timeout, a migration in progress, or a ticket mid-rebind to a runner. |
+| `79` | BRAIN-700: refused to re-run byte-identical content that already failed ("Known-red refusal"); pass `--retry "<why>"`. |
 | `80` | `lane priority`: no such ticket, or it already finished (result, cancel, expire or withdraw marker). |
 | `81` | `lane priority`: the ticket is in the wrong state: running, or queued on a runner / owned by a submitter (cancel and resubmit with `--priority`). |
 | `85` | `lane priority`: the queued ticket's supervisor is no longer alive. |

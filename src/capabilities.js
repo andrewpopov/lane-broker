@@ -28,6 +28,8 @@ export const REMOTE_DRAIN_CAPABILITY = 'remote-drain/1';
 // BRAIN-518: `lane priority` re-tiers a ticket still queued on this runner; a submitter checks this before sending one.
 // BRAIN-634: advertised only while the global config sets `localExecution: "refused"`.
 export const DISPATCH_ONLY_CAPABILITY = 'dispatch-only/1';
+// BRAIN-700: `lane run --no-reuse` answers nothing from history (neither a cached pass nor a known-red refusal).
+export const REUSE_GREEN_CAPABILITY = 'reuse-green/1';
 export const QUEUE_RETIER_CAPABILITY = 'queue-retier/1';
 
 // BRAIN-597: `lane runner watch|status`, the runner heartbeat feeding runner-unreachable.json.
@@ -55,6 +57,7 @@ export const CAPABILITIES = [
   SNAPSHOT_GZIP_CAPABILITY,
   REMOTE_EXCLUSIVE_CAPABILITY,
   SCRUB_COMMAND_ENV_CAPABILITY,
+  REUSE_GREEN_CAPABILITY,
 ];
 
 /** `CAPABILITIES` plus what depends on this host's config: `blob-cache/1` only while the runner blob store is enabled, `cpu-limit/1` only when `cpuLimit` is not "off" and its probe passed. */
