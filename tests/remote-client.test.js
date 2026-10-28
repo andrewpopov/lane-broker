@@ -1351,3 +1351,20 @@ test('EXECUTION_ALLOCATION_RELAY: execution 6 and reservation grant 14.4 survive
   assert.deepEqual(remoteCpuAllocation({ grantedCpuCores: 14.4 }), { grantedCpuCores: 14.4 });
   for (const value of [undefined, null, 0, -1, Infinity, '6']) assert.deepEqual(remoteCpuAllocation({ executionCpuCores: value }), {});
 });
+
+test('selectRunner: BRAIN-653 a runner whose budget net of outside memory is below the lane need is never-fits; one that fits later still waits', async () => {
+  const { binDir } = makeFakeSshBin();
+  const base = { protocol: 1, protocols: [1, 2], version: '0.0.0', paused: false, queued: 0, running: 0 };
+  const capacity = { weight: 100, cpuCores: 64, memoryBytes: 16_000_000_000, memoryReserveBytes: 4_000_000_000 };
+  const reservation = { weight: 1, cpuCores: 1, memoryBytes: 8_000_000_000 };
+  const { env } = clientEnv(binDir);
+  // static budget 12 GB admits 8 GB, but only 6.5 GB can ever be admitted beside the outside process
+  const starved = makeFixedProbeSsh(binDir, 'ssh-starved', { ...base, capacity: { ...capacity, memoryAdmissibleBytes: 6_500_000_000 } });
+  const never = await selectRunner([makeRunner({ ssh: 'normal' })], { sshBin: starved, env, deadlineMs: 3000, reservation });
+  assert.equal(never.runner, null);
+  assert.equal(never.skipped[0].neverFits, true);
+  // enough admissible memory, only busy now: not never-fits (still chosen as busy/waitable)
+  const busy = makeFixedProbeSsh(binDir, 'ssh-busy', { ...base, capacity: { ...capacity, memoryAdmissibleBytes: 9_000_000_000 }, headroom: { cpuCores: 8, memoryBytes: 1_000_000_000 } });
+  const waits = await selectRunner([makeRunner({ ssh: 'normal' })], { sshBin: busy, env, deadlineMs: 3000, reservation });
+  assert.notEqual(waits.skipped[0]?.neverFits, true);
+});

@@ -148,3 +148,11 @@ test('(g) the submitter global laneNice never travels: no lane override is judge
   assert.equal(runnerRoom({ cpuCores: 2 }, probe).room, true, 'no lane override (submitter nice 10 is not sent): discounted figure');
   assert.equal(runnerRoom({ cpuCores: 2, niceOverride: 15 }, probe).room, false, 'lane override 15 > runner laneNice 0: undiscounted figure');
 });
+
+test('BRAIN-653: admissible memory is available plus broker-held, minus the reserve', async () => {
+  const { probeAdmissibleMemoryBytes } = await import('../src/remote-runner.js');
+  const resources = { availableMemoryBytes: 6_500_000_000 };
+  const running = [{ observedMemoryBytes: 1_000_000_000 }, { observedMemoryBytes: null }];
+  assert.equal(probeAdmissibleMemoryBytes(resources, { memoryReserveBytes: 4_000_000_000 }, true, running), 3_500_000_000);
+  assert.equal(probeAdmissibleMemoryBytes(resources, { memoryReserveBytes: 4_000_000_000 }, false, running), null);
+});

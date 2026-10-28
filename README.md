@@ -162,12 +162,27 @@ never told to forward to it — both still get the `--log` file.
 By default lane-broker detects the resources visible to its process and
 actively reserves CPU and memory before starting a worker. On Linux this
 includes cgroup v2 quota, CPU-set, and memory limits; WSL is treated as Linux.
+On a cgroup host, available memory is `memory.max` minus `memory.current` less the
+reclaimable `inactive_file` page cache from `memory.stat` (BRAIN-385), so cache is
+available, not used; a capped unit no longer needs a raised `MemoryMax`/`MemoryHigh`
+drop-in (the wintop workaround) to avoid stalling its own queue.
 On macOS it uses the logical CPUs visible to Node; available memory is sampled
 via `vm_stat` (free + inactive + speculative pages), because
 `os.freemem()` counts only free pages and undercounts available memory by an
 order of magnitude on macOS. `capacity: "auto"` derives the legacy weight cap
 from the detected CPU budget. A numeric capacity remains supported as an
 additional compatibility cap.
+
+`lane remote-probe` reports `capacity.memoryAdmissibleBytes` (BRAIN-653): the most
+memory a new ticket could ever be admitted with once the runner's own leases drain,
+that is available memory plus the memory its leases observably hold, minus
+`memoryReserveBytes`. The gap to the static budget is memory held by processes outside
+the broker (for example a fleet worker). It is null when budgets are not enforced
+(shadow mode); a runner that predates it omits it and the client falls back to the
+static check. Placement treats a lane whose `memoryBytes` exceeds it as never-fits:
+that runner is skipped, and when every runner is never-fits the existing
+`neverPlaceable` refusal applies instead of a wait that cannot end. The figure is a
+point-in-time reading, so a transient outside-memory spike can read as never-fits.
 
 `cpuAdmissionPercent` and `cpuReserveCores` retain CPU headroom for interactive
 work. `memoryReserveBytes` is held back from worker reservations and current
@@ -494,7 +509,8 @@ What a remote run does:
    hard deadline each, default 10 s) and keep those that are reachable, speak the protocol the
    lane needs (below), are not paused, have no queue, could ever fit the
    lane's reservation (weight, CPU budget, memory plus its reserve, from the
-   runner's static capacity), **have every executable the lane `requires`**
+   runner's static capacity, and BRAIN-653: `memoryBytes` no greater than the probe's
+   `capacity.memoryAdmissibleBytes`, below), **have every executable the lane `requires`**
    (below) **and have real room right now**: the probe's
    `headroom` (BRAIN-506: the room this runner's own admission would see for
    a ticket at the default `laneNice`, `budget − projectBusy` over its held
