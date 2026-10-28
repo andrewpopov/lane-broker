@@ -5,10 +5,12 @@ export function relayedUsage(result) {
   const observedCpu = sanitizeObservedCpu(result?.observedCpu);
   const rssPeak = sanitizeRssPeak(result?.observedRssPeakBytes);
   const cpuSeconds = sanitizeCpuSeconds(result?.cpuSeconds);
+  const cgroupPeak = sanitizeRssPeak(result?.observedCgroupMemoryPeakBytes);
   return {
     ...(observedCpu ? { observedCpu } : {}),
     ...(rssPeak !== undefined ? { observedRssPeakBytes: rssPeak } : {}),
     ...(cpuSeconds !== undefined ? { cpuSeconds } : {}),
+    ...(cgroupPeak !== undefined ? { observedCgroupMemoryPeakBytes: cgroupPeak } : {}),
   };
 }
 

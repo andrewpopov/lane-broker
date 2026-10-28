@@ -6,11 +6,11 @@ import { paths, stateHome } from './state.js';
 import { scheduleProblem } from './runner-schedule.js';
 import { isCanonicalRelPath } from './remote-manifest.js';
 import { remoteExcludeShapeProblem, remoteExcludeConflict } from './remote-exclude.js';
-import { unsupportedHookKeys, hookRefusalMessage } from './exclusive.js';
+import { unsupportedHookKeys, hookRefusalMessage, EXCLUSIVE_PURPOSES, exclusiveDeadlineProblem } from './exclusive.js';
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
 import { DEFAULT_DEPS_CACHE_MAX_BYTES } from './deps-cache.js';
 import { isValidRequiresShape, VERSION_FLOOR_RE } from './runner-readiness.js';
-import { CPU_LIMIT_MODES } from './cpu-limit.js';
+import { CPU_LIMIT_MODES, MEMORY_LIMIT_MODES, MIN_CPU_GRANT_CORES } from './cpu-limit.js';
 
 /** The largest delay Node's setTimeout honours; above it the timer fires after 1 ms. */
 const MAX_TIMER_MS = 2_147_483_647;
@@ -134,8 +134,11 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // runner whose OS a lane's tooling does not support simply omits the tag.
   runnerTags: [],
   // BRAIN-651 L1: "off" | "prefer" | "require". Whether a lane's CPU grant is to be enforced with a systemd CPUQuota scope (Linux only).
-  // "require" refuses to start a supervisor on a host whose probe fails (CPU_LIMIT_UNAVAILABLE); "prefer" warns once and continues.
-  cpuLimit: 'off',
+  // "require" refuses to start a supervisor on a host whose probe fails (CPU_LIMIT_UNAVAILABLE); "prefer" (BRAIN-695 default) warns once and continues.
+  cpuLimit: 'prefer',
+  // BRAIN-695: "off" | "measure" | "enforce". "measure" records each lease's cgroup memory peak (lane status flags MEM-OVER against the booking);
+  // "enforce" (a hard MemoryMax) is refused at load until BRAIN-696.
+  memoryLimit: 'measure',
   // BRAIN-597: a runner whose first failed contact (runner-unreachable.json, kept fresh by `lane runner watch`) is at least this old is
   // skipped by placement without being probed. 0 disables the skip.
   runnerDownAfterMs: 300_000,
@@ -416,6 +419,8 @@ function validateGlobalConfig(cfg, sourcePath) {
   }
   assert(isValidRequiresShape(cfg.runnerTags), `${sourcePath}: "runnerTags" must be an array of tag names (letters, digits, "." "_" "+" "-"), e.g. ["browser"]`);
   assert(CPU_LIMIT_MODES.includes(cfg.cpuLimit), `${sourcePath}: "cpuLimit" must be one of ${CPU_LIMIT_MODES.map((m) => `"${m}"`).join(', ')}, got ${JSON.stringify(cfg.cpuLimit)}`);
+  assert(MEMORY_LIMIT_MODES.includes(cfg.memoryLimit), `${sourcePath}: "memoryLimit" must be one of ${MEMORY_LIMIT_MODES.map((m) => `"${m}"`).join(', ')}, got ${JSON.stringify(cfg.memoryLimit)}`);
+  assert(cfg.memoryLimit !== 'enforce', `${sourcePath}: "memoryLimit": "enforce" is not yet supported (hard memory caps are tracked in BRAIN-696); use "measure" or "off"`);
   assert(Number.isInteger(cfg.runnerDownAfterMs) && cfg.runnerDownAfterMs >= 0, `${sourcePath}: "runnerDownAfterMs" must be a non-negative integer`);
   assert(Number.isInteger(cfg.remoteProbeDeadlineMs) && cfg.remoteProbeDeadlineMs > 0 && cfg.remoteProbeDeadlineMs <= MAX_TIMER_MS, `${sourcePath}: "remoteProbeDeadlineMs" must be a positive integer no larger than ${MAX_TIMER_MS} (a larger Node timer overflows to 1 ms)`);
   for (const field of ['remoteRebalanceMinQueuedMs', 'remoteRebalanceCooldownMs', 'remoteRebalanceMaxMoves']) {
@@ -659,8 +664,10 @@ function validateRepoConfig(cfg, sourcePath) {
   for (const [name, lane] of Object.entries(cfg.lanes)) {
     assert(lane && typeof lane === 'object', `${sourcePath}: lane "${name}" must be an object`);
     assert(Number.isFinite(lane.weight) && lane.weight > 0, `${sourcePath}: lane "${name}".weight must be a positive number`);
+    if (lane.cpuCores === undefined) assert(lane.weight >= MIN_CPU_GRANT_CORES, `${sourcePath}: lane "${name}".weight must be >= ${MIN_CPU_GRANT_CORES} (it is the CPU claim when cpuCores is unset)`);
     if (lane.cpuCores !== undefined) {
       assert(Number.isFinite(lane.cpuCores) && lane.cpuCores > 0, `${sourcePath}: lane "${name}".cpuCores must be a positive number`);
+      assert(lane.cpuCores >= MIN_CPU_GRANT_CORES, `${sourcePath}: lane "${name}".cpuCores must be >= ${MIN_CPU_GRANT_CORES}`);
       assert(lane.cpuCores <= MAX_LANE_CPU_CORES, `${sourcePath}: lane "${name}".cpuCores must be <= ${MAX_LANE_CPU_CORES}`);
     }
     if (lane.maxExecutionCpuCores !== undefined) {
@@ -670,6 +677,7 @@ function validateRepoConfig(cfg, sourcePath) {
     if (lane.minCpuCores !== undefined) {
       assert(Number.isFinite(lane.minCpuCores) && lane.minCpuCores > 0, `${sourcePath}: lane "${name}".minCpuCores must be a positive number`);
       // an unset cpuCores resolves to weight (resolveTicketResources), so that is the claim the floor sits under
+      assert(lane.minCpuCores >= MIN_CPU_GRANT_CORES, `${sourcePath}: lane "${name}".minCpuCores must be >= ${MIN_CPU_GRANT_CORES}`);
       assert(lane.minCpuCores <= MAX_LANE_CPU_CORES, `${sourcePath}: lane "${name}".minCpuCores must be <= ${MAX_LANE_CPU_CORES}`);
       const claim = lane.cpuCores ?? lane.weight;
       assert(lane.minCpuCores <= claim, `${sourcePath}: lane "${name}".minCpuCores (${lane.minCpuCores}) must be <= its cpuCores (${claim})`);
@@ -712,6 +720,13 @@ function validateRepoConfig(cfg, sourcePath) {
     }
     if (lane.exclusive !== undefined) {
       assert(typeof lane.exclusive === 'boolean', `${sourcePath}: lane "${name}".exclusive must be a boolean`);
+    }
+    if (lane.exclusivePurpose !== undefined) {
+      assert(EXCLUSIVE_PURPOSES.includes(lane.exclusivePurpose), `${sourcePath}: lane "${name}".exclusivePurpose must be ${EXCLUSIVE_PURPOSES.map((p) => `"${p}"`).join(' or ')}`);
+    }
+    if (lane.exclusiveDeadlineMs !== undefined) {
+      const problem = exclusiveDeadlineProblem(lane.exclusiveDeadlineMs);
+      assert(problem === null, `${sourcePath}: lane "${name}".exclusiveDeadlineMs ${problem}`);
     }
     if (lane.cache !== undefined) {
       assert(typeof lane.cache === 'boolean', `${sourcePath}: lane "${name}".cache must be a boolean`);
@@ -1238,6 +1253,9 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     rightSize: laneCfg.rightSize !== false,
     // BRAIN-403: never inherited through an undeclaredLanes template (the template literal above does not copy it)
     exclusive: laneCfg.exclusive === true,
+    // BRAIN-695: the maintenance class's purpose and hard deadline (validated above); not inherited either
+    exclusivePurpose: EXCLUSIVE_PURPOSES.includes(laneCfg.exclusivePurpose) ? laneCfg.exclusivePurpose : null,
+    exclusiveDeadlineMs: Number.isInteger(laneCfg.exclusiveDeadlineMs) ? laneCfg.exclusiveDeadlineMs : null,
     // BRAIN-549: false opts this lane out of the result cache; inherited through an undeclaredLanes template
     cache: laneCfg.cache !== false,
     // BRAIN-321: "required" = granted only under live class caps (`classes.mode` active and valid); absent for every other lane

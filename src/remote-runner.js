@@ -11,6 +11,7 @@ import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartT
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, RUNNER_NAME_RE, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
 import { advertisedCapabilities } from './capabilities.js';
+import { enforcementOf } from './cpu-limit.js';
 import { createStrictGunzip, TRANSFER_GZIP, REMOTE_EXEC_NO_TICKET_EXIT } from './remote-gzip.js';
 import { blobNamespace, evictBlobs, acquireBlobLeases, haveBlobs, isBlobHash, isCacheable, HAVE_LEASE_TTL_MS } from './remote-blobs.js';
 import { reportReadiness } from './runner-readiness.js';
@@ -247,7 +248,7 @@ function readPhasesMs(ticketDir, own) {
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
-export function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, grantedCpuCores, executionCpuCores, observedCpu, observedRssPeakBytes, cpuSeconds, phasesMs, artifacts }) {
+export function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, grantedCpuCores, executionCpuCores, observedCpu, observedRssPeakBytes, observedCgroupMemoryPeakBytes, cpuSeconds, phasesMs, artifacts }) {
   const isProtocol2 = header.protocol === 2;
   return {
     protocol: isProtocol2 ? 2 : 1,
@@ -281,6 +282,7 @@ export function buildResult(header, ticketDir, { kind, exit = null, signal = nul
     // BRAIN-361: additive; what the lane actually used on the runner, relayed to the submitter's history
     observedCpu,
     observedRssPeakBytes,
+    observedCgroupMemoryPeakBytes,
     // BRAIN-425: additive; CPU seconds and phase wall times measured on the runner
     cpuSeconds,
     phasesMs,
@@ -728,6 +730,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   let queuedMs;
   let observedCpu;
   let observedRssPeakBytes;
+  let observedCgroupMemoryPeakBytes;
   let cpuSeconds;
   // A user cancel that landed after the expiry still wins (kind cancelled below).
   if (structured && structured.reason === 'withdrawn' && !cancelled) {
@@ -756,6 +759,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     }
     observedCpu = sanitizeObservedCpu(structured.observedCpu) ?? undefined;
     observedRssPeakBytes = sanitizeRssPeak(structured.observedRssPeakBytes);
+    observedCgroupMemoryPeakBytes = sanitizeRssPeak(structured.observedCgroupMemoryPeakBytes);
     cpuSeconds = sanitizeCpuSeconds(structured.cpuSeconds);
     if (Number.isFinite(structured.startedAt) && Number.isFinite(structured.endedAt)) {
       runMs = Math.max(0, structured.endedAt - structured.startedAt);
@@ -782,7 +786,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   const artifacts = storeArtifacts(header, ticketDir, workDir, { kind, exit, signal });
   if (artifacts !== undefined) ownPhasesMs.artifactsMs = Date.now() - artifactsStartedAt;
   try {
-    writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, ...remoteCpuAllocation(structured ?? {}), observedCpu, observedRssPeakBytes, cpuSeconds, phasesMs: readPhasesMs(ticketDir, ownPhasesMs), artifacts }));
+    writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, ...remoteCpuAllocation(structured ?? {}), observedCpu, observedRssPeakBytes, observedCgroupMemoryPeakBytes, cpuSeconds, phasesMs: readPhasesMs(ticketDir, ownPhasesMs), artifacts }));
   } finally {
     cleanupWork(workDir, tmpDir);
   }
@@ -931,6 +935,7 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot(), measure, 
     // BRAIN-360: this runner resolves minCpuCores itself, so a submitter may judge fit by the floor
     capabilities: advertisedCapabilities(globalCfg, status.cpuLimit),
     cpuLimit: status.cpuLimit,
+    enforcement: enforcementOf(status.cpuLimit),
     version: pkg.version,
     // BRAIN-380 slice 4: a draining runner takes no new work. `draining` names why; `paused` is also set so a client
     // built before this field skips the runner the way it skips a paused one.

@@ -591,7 +591,7 @@ test('repo config carrying exclusiveHooks (top level or on a lane) is refused th
 test('the exclusive/1 capability is advertised and --exclusive is in the lane usage text', () => {
   assert.ok(CAPABILITIES.includes('exclusive/1'));
   const lane = fs.readFileSync(new URL('../bin/lane.js', import.meta.url), 'utf8');
-  assert.match(lane, /\[--priority high\|medium\|low\] \[--exclusive\]/);
+  assert.match(lane, /\[--priority high\|medium\|low\] \[--exclusive \[--exclusive-purpose upgrade\|calibration\] \[--exclusive-deadline <dur>\]\]/);
   assert.match(lane, /case '--exclusive':/);
 });
 
@@ -602,7 +602,7 @@ test('BRAIN-452: lane run refuses a non-exclusive weight over maxLaneWeight with
   const { result, spawnCalled, stderr } = await submit({ env, cwd: repoDir });
   assert.equal(result.exitCode, 64, stderr);
   assert.equal(spawnCalled, false);
-  assert.match(stderr, /weight 5 would hold most of this machine's capacity; declare `exclusive: true` or use `cpuCores` for size \(BRAIN-452; maxLaneWeight is 4\)/);
+  assert.match(stderr, /weight 5 would hold most of this machine's capacity; book the real size with `cpuCores`\/`memoryBytes` instead \(BRAIN-452; maxLaneWeight is 4\)/);
 });
 
 test('BRAIN-452: a runner\'s intake refuses the same weight, so a submission valid on one host is valid on all', async () => {

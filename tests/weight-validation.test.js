@@ -73,3 +73,27 @@ test('active admission rejects a permanently impossible request before enqueuein
   assert.match(result.stderr, /requested resources exceed this environment's budget/);
   assert.equal(fs.existsSync(paths(state).queue), false, 'state is not created for an impossible request');
 });
+
+test('--weight 0.001 is rejected naming weight, before enqueueing', async () => {
+  const { base, home, env } = freshEnv();
+  writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 2 } } });
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--weight', '0.001', '--', 'true'], { env, cwd: repoDir });
+  assert.equal(result.code, 2, `stderr: ${result.stderr}`);
+  assert.match(result.stderr, /--weight must be >= 0\.01/);
+});
+
+test('--weight 0.001 runs when --cpu or a configured cpuCores carries the CPU claim', async () => {
+  const { base, home, env } = freshEnv();
+  writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
+  const viaFlag = path.join(base, 'flag');
+  writeRepoConfig(viaFlag, { version: 1, lanes: { default: { weight: 2 } } });
+  const viaConfig = path.join(base, 'config');
+  writeRepoConfig(viaConfig, { version: 1, lanes: { default: { weight: 2, cpuCores: 1 } } });
+
+  for (const [cwd, extra] of [[viaFlag, ['--cpu', '1']], [viaConfig, []]]) {
+    const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--weight', '0.001', ...extra, '--', 'true'], { env, cwd });
+    assert.equal(result.code, 0, `${cwd}: stderr: ${result.stderr}`);
+  }
+});

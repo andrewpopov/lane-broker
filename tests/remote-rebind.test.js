@@ -604,21 +604,25 @@ test('a user cancel during the expiry cancel of a rebound attempt publishes 130 
   const globalPath = path.join(ctx.home, 'config.json');
   fs.writeFileSync(globalPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(globalPath, 'utf8')), remoteResultWaitMs: 1 }));
   const hold = await holdLaneLocally(ctx);
-  const ran = path.join(tmpDir('rebind-ran'), 'ran');
-  const id = await detach(ctx, recordingCmd(ran));
-  await waitFor(() => queuedIds(ctx.state).includes(id), { timeoutMs: 30_000 });
+  try {
+    const ran = path.join(tmpDir('rebind-ran'), 'ran');
+    const id = await detach(ctx, recordingCmd(ran));
+    await waitFor(() => queuedIds(ctx.state).includes(id), { timeoutMs: 30_000 });
 
-  const cancelling = path.join(tmpDir('rebind-stuck'), 'cancelling');
-  ctx.setMode(`stuck-cancel:${cancelling}`);
-  await waitFor(() => fs.existsSync(cancelling), { timeoutMs: 90_000 });
-  await laneRun(['cancel', id], { env: ctx.env });
-  await waitFor(() => readJsonSafe(path.join(paths(ctx.state).results, `${id}.json`)) != null, { timeoutMs: 60_000 });
-  assert.equal(readJsonSafe(path.join(paths(ctx.state).results, `${id}.json`)).exit, 130);
-  assert.equal(readAttempt(ctx.state, id), null, 'the attempt is cleaned up');
-  assert.deepEqual(parkedFiles(ctx.state), []);
-  assert.deepEqual(linesOf(ran), [], 'never ran');
-  hold.release();
-  await hold.done;
+    const cancelling = path.join(tmpDir('rebind-stuck'), 'cancelling');
+    ctx.setMode(`stuck-cancel:${cancelling}`);
+    await waitFor(() => fs.existsSync(cancelling), { timeoutMs: 90_000 });
+    await laneRun(['cancel', id], { env: ctx.env });
+    await waitFor(() => readJsonSafe(path.join(paths(ctx.state).results, `${id}.json`)) != null, { timeoutMs: 60_000 });
+    assert.equal(readJsonSafe(path.join(paths(ctx.state).results, `${id}.json`)).exit, 130);
+    // publishAndExit clears the parked record only AFTER the terminal write, so the result can be visible before the cleanup
+    await waitFor(() => parkedFiles(ctx.state).length === 0, { timeoutMs: 10_000 });
+    assert.equal(readAttempt(ctx.state, id), null, 'the attempt is cleaned up');
+    assert.deepEqual(linesOf(ran), [], 'never ran');
+  } finally {
+    hold.release();
+    await hold.done;
+  }
 });
 
 test('a supervisor killed between withdraw and dispatch leaves a parked ticket that recovery restores at its original seq', async () => {

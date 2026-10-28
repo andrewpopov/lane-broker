@@ -11,6 +11,7 @@ import { waitCommand } from '../src/wait.js';
 import { pauseCommand, resumeCommand, drainCommand, undrainCommand } from '../src/pause.js';
 import { migrateSchedulerCommand } from '../src/migrate.js';
 import { parseByteSize } from '../src/resources.js';
+import { MIN_CPU_GRANT_CORES } from '../src/cpu-limit.js';
 import { isTicketId } from '../src/state.js';
 import { leaseCheckCommand } from '../src/lease.js';
 import { parseTransferFlag } from '../src/remote-gzip.js';
@@ -39,7 +40,7 @@ import { phasesReportCommand } from '../src/phases-report.js';
 
 function usage() {
   return `Usage:
-  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--exclusive] [--no-cache] [--no-reuse] [--retry "<why>"] [--detach [--id <ticket-id>]]
+  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--exclusive [--exclusive-purpose upgrade|calibration] [--exclusive-deadline <dur>]] [--no-cache] [--no-reuse] [--retry "<why>"] [--detach [--id <ticket-id>]]
            [--timeout <duration>] [--allow-local-sim] [--local] [--log <path>] -- <command...>
   lane status [--json]
   lane capabilities --json
@@ -90,7 +91,7 @@ function parseRunArgs(args) {
       case '--cpu': {
         const raw = flagArgs[++i];
         const n = Number(raw);
-        if (!Number.isFinite(n) || n <= 0) throw new Error(`--cpu must be a positive number (got "${raw}")`);
+        if (!Number.isFinite(n) || n < MIN_CPU_GRANT_CORES) throw new Error(`--cpu must be a number >= ${MIN_CPU_GRANT_CORES} (got "${raw}")`);
         opts.cpuOverride = n;
         break;
       }
@@ -107,6 +108,13 @@ function parseRunArgs(args) {
         break;
       case '--exclusive':
         opts.exclusive = true;
+        break;
+      // Validated (exit 64) by runCommand, together with the lane config's keys.
+      case '--exclusive-purpose':
+        opts.exclusivePurpose = flagArgs[++i] ?? '';
+        break;
+      case '--exclusive-deadline':
+        opts.exclusiveDeadline = flagArgs[++i] ?? '';
         break;
       case '--no-cache':
         opts.noCache = true;
@@ -199,6 +207,8 @@ async function main() {
         memoryOverride: opts.memoryOverride,
         priority: opts.priority,
         exclusive: opts.exclusive,
+        exclusivePurpose: opts.exclusivePurpose,
+        exclusiveDeadline: opts.exclusiveDeadline,
         noCache: opts.noCache,
         noReuse: opts.noReuse,
         retryReason: opts.retryReason,

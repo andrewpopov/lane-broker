@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { paths, atomicWriteJson, readJsonSafe, withLock } from './state.js';
 import { runnerAvailability } from './runner-schedule.js';
+import { enforcementLabel } from './cpu-limit.js';
 
 /**
  * BRAIN-594/597: the ONE record of "first failed contact" per runner, `runner-unreachable.json`.
@@ -20,6 +21,8 @@ export const HEARTBEAT_KEY = '__heartbeat';
  *  A placement clears the runners that passed its probe; a runner it never probes (down, off schedule) would keep its gap forever, so an
  *  entry older than READINESS_TTL_MS is dropped on read and pruned on the next write. */
 export const READINESS_KEY = '__readiness';
+/** BRAIN-695: `{ "<runner>": { cpu, memory, reason } | null }`, the enforcement each runner's probe last reported at placement (null = a runner older than 0.62.0). */
+export const ENFORCEMENT_KEY = '__enforcement';
 export const HEARTBEAT_FRESH_MS = 5 * 60_000;
 const LOCK_WAIT_MS = 5000;
 
@@ -49,6 +52,17 @@ export const recordReadiness = (root, gaps, clear, now) =>
     for (const [name, gap] of Object.entries(gaps)) stored[name] = { ...gap, at: now };
     if (Object.keys(stored).length > 0) file[READINESS_KEY] = stored;
     else delete file[READINESS_KEY];
+  });
+
+export function readEnforcement(root) {
+  const seen = (readJsonSafe(paths(root).runnerUnreachable) ?? {})[ENFORCEMENT_KEY];
+  return seen && typeof seen === 'object' ? seen : {};
+}
+
+/** Record the enforcement placement just saw on the runners it probed (a runner whose probe sent none is stored as null). */
+export const recordEnforcement = (root, byRunner) =>
+  updateFile(root, (file) => {
+    file[ENFORCEMENT_KEY] = { ...(file[ENFORCEMENT_KEY] ?? {}), ...byRunner };
   });
 
 export function readHeartbeat(root) {
@@ -156,6 +170,7 @@ export function collectRunnerStates(root, cfg, now = Date.now()) {
   const unreachable = readUnreachable(root);
   const down = downRunnerReasons(root, cfg, now);
   const gaps = readReadiness(root, now);
+  const enforcement = readEnforcement(root);
   const ageMs = heartbeatAgeMs(beat, now);
   return runners.map((runner) => {
     const since = unreachable[runner.name] ?? null;
@@ -170,6 +185,7 @@ export function collectRunnerStates(root, cfg, now = Date.now()) {
       lastPingAt: beat.runners[runner.name]?.lastPingAt ?? null,
       offSchedule,
       readinessGap: gaps[runner.name] ?? null,
+      enforcement: Object.hasOwn(enforcement, runner.name) ? enforcement[runner.name] : undefined,
       watcherRunning: ageMs !== null && ageMs <= HEARTBEAT_FRESH_MS,
       stateAgeMs: ageMs,
     };
@@ -195,7 +211,8 @@ export function renderRunnersLines(runners, now = Date.now()) {
     const lastOk = r.lastOkAt === null ? 'never' : `${ageOf(Math.max(0, now - r.lastOkAt))} ago`;
     const settle = r.lostSettleAt === null ? '' : `  lost-settle ${clock(r.lostSettleAt)}`;
     const gap = r.readinessGap ? `  not ready: missing ${r.readinessGap.missing.join(', ')} (${ageOf(Math.max(0, now - r.readinessGap.at))} ago)` : '';
-    lines.push(`  ${r.name}  ${STATE_TEXT[r.state](r)}${r.offSchedule && r.state !== 'off-schedule' ? ' (off-schedule)' : ''}  last-ok ${lastOk}${settle}${gap}`);
+    const enforced = r.enforcement === undefined ? '' : `  enforcement: ${enforcementLabel(r.enforcement)}`;
+    lines.push(`  ${r.name}  ${STATE_TEXT[r.state](r)}${r.offSchedule && r.state !== 'off-schedule' ? ' (off-schedule)' : ''}  last-ok ${lastOk}${settle}${gap}${enforced}`);
   }
   return lines;
 }

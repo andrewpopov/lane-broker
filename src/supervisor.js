@@ -27,7 +27,7 @@ import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processSt
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
 import { reloadGlobalConfig, isDispatchOnly } from './config.js';
-import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope } from './cpu-limit.js';
+import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope, scopeMemoryPeakReader, scopeMemoryPeakTracker, enforcementLabel } from './cpu-limit.js';
 import { stateHome } from './state.js';
 import { readRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
@@ -37,7 +37,7 @@ import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, priorityOf, resolveLaneNice, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
 import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, noRunnerLocallyIneligibleRefusal, dispatchOnlyRefusal, LOCAL_REFUSED_EXIT_CODE, locallyRefusedNow, localWindowAllowing, leaseCpuCores, terminalRowDefaults } from './resources.js';
-import { downRunnerReasons, heartbeatUpRunners, recordReadiness } from './runner-unreachable.js';
+import { downRunnerReasons, heartbeatUpRunners, recordReadiness, recordEnforcement } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { remoteCpuAllocation, selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
 import { remoteExcludeWarnings } from './remote-exclude.js';
@@ -50,6 +50,7 @@ import { createAttempt, readAttempt, updateAttempt, fallbackToLocal, publishTerm
 import { writeBrokerLog, OBSERVED_HISTORY_MAX, hostCpuLoad, ticketCpuEstimate } from './admission.js';
 import { relayedUsage, relayedDeps, relayedTransfer, snapshotLine } from './remote-relay.js';
 import { maybeDailyGc } from './gc.js';
+import { EXCLUSIVE_DEADLINE_EXIT, EXCLUSIVE_DEADLINE_REASON, exclusiveDeadlineExpiredMessage } from './exclusive.js';
 import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, SILENCE_REASON, noProgressMessage, silenceMessage } from './no-progress.js';
 import { settledContentKey, isCleanPass } from './result-cache.js';
 import { scrubCommandEnv } from './scrub-command-env.js';
@@ -971,7 +972,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   selectedRunner = runner.name;
   // Printed only now that eligibility is settled and a usable runner is
   // about to actually be dialed for the transfer -- see finding #5 above.
-  process.stderr.write(`lane: running on ${runner.name}\n`);
+  process.stderr.write(`lane: running on ${runner.name} (${enforcementLabel(probe?.enforcement)})\n`);
+  await recordEnforcement(root, { [runner.name]: probe?.enforcement ?? null }, Date.now()).catch(() => {});
 
   const declaredArtifacts = enriched.remote.remoteArtifacts;
   let artifactsSupported = false;
@@ -1129,7 +1131,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     const line = `lane: remote-rebalance: ${enriched.id}: ${from.name} -> ${runner.name} (${why}; ${runner.name} ${probe.headroom.cpuCores} cores free)\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);
-    process.stderr.write(`lane: running on ${runner.name}\n`);
+    process.stderr.write(`lane: running on ${runner.name} (${enforcementLabel(probe?.enforcement)})\n`);
+    await recordEnforcement(root, { [runner.name]: probe?.enforcement ?? null }, Date.now()).catch(() => {});
   }
   // A move that never completed (or one whose second dispatch ended before a snapshot went out) must not outlive this attempt's record.
   if (movingSet && !dispatch.mayStillBeRunning) await clearMoving();
@@ -1664,6 +1667,10 @@ async function main() {
     await refuseLocalAndExit({ exitCode: LOCAL_REFUSED_EXIT_CODE, message: `lane run: ${err.message}\n` }, { lease: true });
   }
   const { child, unit: cpuScope } = scopedChild;
+  // BRAIN-695: memory is measured through the same scope; without one (cpuLimit off, macOS) there is no cgroup to read
+  const memoryReader = cpuScope && cpuLimit?.memory?.available === true ? scopeMemoryPeakReader(cpuScope, { pid: child.pid }) : null;
+  // the --collect scope vanishes with its last process, so the peak is also read at leader exit and at finalize, not just on heartbeats
+  const memoryPeak = scopeMemoryPeakTracker(memoryReader);
   if (ticket.maxExecutionCpuCores !== undefined) started.lease.executionCpuCores = executionCpuCores;
 
   const logWriter = new CappedLogWriter(ticket.logPath);
@@ -1696,10 +1703,18 @@ async function main() {
     if (!forwardedOk) stderrForward.pauseUntilDrain(stderrGate);
   });
 
-  writeLease(root, runningLease(started.lease, { childPgid: child.pid, cpuScopeUnit: cpuScope, startedAt }));
+  // BRAIN-695: an exclusive's deadline runs from this spawn; the test seam lets a test use a deadline under the public minimum
+  const exclusiveDeadlineMs = ticket.exclusive === true ? Number(process.env.LANE_BROKER_TEST_EXCLUSIVE_DEADLINE_MS) || ticket.exclusiveDeadlineMs : undefined;
+  writeLease(root, {
+    ...runningLease(started.lease, { childPgid: child.pid, cpuScopeUnit: cpuScope, startedAt }),
+    ...(ticket.exclusivePurpose ? { exclusivePurpose: ticket.exclusivePurpose } : {}),
+    ...(exclusiveDeadlineMs ? { exclusiveDeadlineAt: startedAt + exclusiveDeadlineMs } : {}),
+  });
 
   let finished = false;
   let cancelling = false;
+  let deadlineExpired = false;
+  let leaderExited = false; // set on 'exit', before stdio drains: a command that ended on its own is never expired by its deadline
   let watchdogKill = null; // BRAIN-431/576: the watchdog reason (no-progress | silence) that began the reap; the first one wins
   let killPromise = null;
 
@@ -1738,6 +1753,7 @@ async function main() {
         const tree = rows ? selectLeaseTree(rows, child.pid, otherLeaseStops(root, ticket.id)) : null;
         const observed = tree?.cores ?? null;
         const observedMemory = tree?.memoryBytes ?? null;
+        const cgroupPeak = memoryPeak.sample();
         // a gap of more than two heartbeats between good readings ends an overrun streak
         writeLease(root, {
           ...applyHeartbeatObservation(lease, observed, Date.now(), observedMemory, 2 * globalCfg.sampleMs, {
@@ -1745,6 +1761,7 @@ async function main() {
             belowFraction: globalCfg.idleCreditBelowFraction,
             hungCores: globalCfg.hungCpuCores,
           }),
+          ...(cgroupPeak === null ? {} : { observedCgroupMemoryPeakBytes: Math.max(lease.observedCgroupMemoryPeakBytes ?? 0, cgroupPeak) }),
           descendants: descendants.snapshot(),
           noProgressSinceMs: Math.round(idleMs),
           ...(watchdog.lastOutputAt === null ? {} : { lastOutputAt: watchdog.lastOutputAt }),
@@ -1765,6 +1782,14 @@ async function main() {
     watchdogKill = reason;
     reap(reason);
   }
+  /** BRAIN-695: the exclusive's deadline ends the run through the same reap as a cancel; an explicit cancel that landed first keeps its 130. */
+  const exclusiveDeadlineTimer = exclusiveDeadlineMs
+    ? setTimeout(() => {
+        if (finished || leaderExited || cancelling || killPromise || cancelRequested(root, ticket.id)) return;
+        deadlineExpired = true;
+        reap(EXCLUSIVE_DEADLINE_REASON);
+      }, Math.max(0, startedAt + exclusiveDeadlineMs - Date.now())) // from the recorded start, not from after the initial scan
+    : null;
   const earlySample = setTimeout(() => {
     if (!finished) observeLease();
   }, Math.min(EARLY_SAMPLE_MS, globalCfg.sampleMs));
@@ -1800,8 +1825,10 @@ async function main() {
 
   async function finalizeAndExit(result, exitCode) {
     finished = true;
+    memoryPeak.sample(); // before any scope stop
     clearInterval(heartbeat);
     clearTimeout(earlySample);
+    clearTimeout(exclusiveDeadlineTimer);
     // killGroup must be awaited on every path: if the group leader exited
     // but a TERM-resistant descendant is still alive, we must not write the
     // result / release the lease until the whole group is confirmed gone.
@@ -1809,7 +1836,14 @@ async function main() {
     // BRAIN-349: a cancelled run is 'cancelled' (exit 130) whatever the child
     // itself exited with -- a child that traps TERM and exits 0 must not read
     // as success. Same shape as the remote-cancel result (remoteCancelledResult).
-    if (cancelling) {
+    if (deadlineExpired) {
+      // a command that traps TERM and exits 0 still did not finish inside its window; a cancel after expiry does not rewrite it
+      result = { ...result, exit: EXCLUSIVE_DEADLINE_EXIT, signal: null, reason: EXCLUSIVE_DEADLINE_REASON, exclusiveDeadlineExpired: true, exclusiveDeadlineMs };
+      const message = exclusiveDeadlineExpiredMessage(exclusiveDeadlineMs);
+      logWriter.write(message);
+      stderrForward?.write(message);
+      exitCode = EXCLUSIVE_DEADLINE_EXIT;
+    } else if (cancelling) {
       result = { ...result, exit: 130, signal: null, cancelled: true };
       exitCode = 130;
     } else if (watchdogKill) {
@@ -1859,6 +1893,10 @@ async function main() {
       if (observedCpu) finalResult = { ...finalResult, observedCpu };
       const rssPeak = sanitizeRssPeak(finalLease?.observedRssPeakBytes);
       if (rssPeak !== undefined) finalResult = { ...finalResult, observedRssPeakBytes: rssPeak };
+      const leasePeak = sanitizeRssPeak(finalLease?.observedCgroupMemoryPeakBytes);
+      const exitPeak = memoryPeak.sample();
+      const cgroupPeak = leasePeak === undefined ? (exitPeak ?? undefined) : Math.max(leasePeak, exitPeak ?? 0);
+      if (cgroupPeak !== undefined) finalResult = { ...finalResult, observedCgroupMemoryPeakBytes: cgroupPeak };
       const cpuSeconds = integratedCpuSeconds(finalLease?.observedCpuStats, startedAt, finalResult.endedAt);
       if (cpuSeconds !== undefined) finalResult = { ...finalResult, cpuSeconds };
       // BRAIN-431: the longest stretch with no output and no CPU, whether or not the opt-in kill is on (monitoring reads it)
@@ -1940,6 +1978,8 @@ async function main() {
   // gone. So reap on 'exit'; finalizeAndExit awaits killPromise before the result is written or the lease released.
   let groupReaped = false;
   child.on('exit', () => {
+    leaderExited = true;
+    memoryPeak.sample(); // first, while the scope still exists
     if (finished || cancelling || watchdogKill) return;
     if (!isGroupAlive(child.pid) && !hasLiveMembers(descendants)) return;
     groupReaped = true;

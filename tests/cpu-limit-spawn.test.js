@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { makeTmpDir } from './helpers/tmp.js';
-import { spawnInCpuScope, cpuScopeUnit, resolveCpuLimit, resolveExecutionCpuCores } from '../src/cpu-limit.js';
+import { CpuLimitUnavailableError, spawnInCpuScope, cpuScopeUnit, resolveCpuLimit, resolveExecutionCpuCores } from '../src/cpu-limit.js';
 import { childEnv, runningLease } from '../src/supervisor.js';
 
 /** BRAIN-651 L2: a lane child runs inside a CPUQuota scope sized to its admitted grant. Unit tests inject `spawn`; the integration test is Linux-only. */
@@ -31,7 +31,7 @@ test('CPU_GRANT_WRAPPED: grants 2 and 4 spawn systemd-run with CPUQuota = 100% p
     assert.equal(unit, cpuScopeUnit(LEASE));
     assert.equal(calls.length, 1);
     assert.equal(calls[0].cmd, 'systemd-run');
-    assert.deepEqual(calls[0].args, ['--user', '--scope', `--unit=lane-${LEASE}.scope`, '-p', `CPUQuota=${quota}`, '--quiet', '--collect', '--', '/usr/bin/nice', '-n', '5', 'npm', 'test']);
+    assert.deepEqual(calls[0].args, ['--user', '--scope', '--expand-environment=no', `--unit=lane-${LEASE}.scope`, '-p', `CPUQuota=${quota}`, '--quiet', '--collect', '--', '/usr/bin/nice', '-n', '5', 'npm', 'test']);
     assert.equal(calls[0].options, OPTIONS, 'cwd, env, detached and stdio are handed through untouched');
   }
 });
@@ -70,10 +70,23 @@ test('EXECUTION_CEILING_FAIL_CLOSED: quota off, unsupported or unavailable never
   assert.throws(() => resolveExecutionCpuCores(undefined, 6), /CPU_LIMIT_UNAVAILABLE/);
 });
 
-test('a fractional grant rounds the quota up, never below what admission reserved', () => {
-  const { fn, calls } = recordingSpawn();
-  run(fn, { grantCores: 1.5 });
-  assert.ok(calls[0].args.includes('CPUQuota=200%'));
+test('a fractional grant gets its exact quota, not one rounded up to the next core (BRAIN-695: bookings are caps)', () => {
+  for (const [grant, quota] of [[1.5, '150%'], [0.5, '50%'], [2.25, '225%']]) {
+    const { fn, calls } = recordingSpawn();
+    run(fn, { grantCores: grant });
+    assert.ok(calls[0].args.includes(`CPUQuota=${quota}`), `${grant} cores -> ${quota}`);
+  }
+});
+
+test('memory accounting is switched on in the scope only when the memory probe passed', () => {
+  const on = recordingSpawn();
+  run(on.fn, { resolved: { ...ON, memory: { mode: 'measure', available: true, reason: 'ok' } } });
+  assert.ok(on.calls[0].args.includes('MemoryAccounting=yes'));
+  assert.ok(!on.calls[0].args.some((a) => /MemoryMax/.test(a)), 'measured, never capped');
+  const off = recordingSpawn();
+  run(off.fn, { resolved: { ...ON, memory: { mode: 'measure', available: false, reason: 'x' } } });
+  assert.ok(!off.calls[0].args.includes('MemoryAccounting=yes'));
+  assert.ok(off.calls[0].args.includes('CPUQuota=200%'), 'CPU enforcement does not depend on memory');
 });
 
 test('not wrapped when off, when prefer found no support, on darwin, or when there is no usable grant', () => {
@@ -165,4 +178,31 @@ test('CPU_GRANT_ENFORCED: a grant-1 scope holds a CPU burner and its detached gr
   // two busy processes would use about 2.0 cores unconstrained
   assert.ok(cores <= 1.2, `scope used ${cores.toFixed(2)} cores at grant 1`);
   assert.ok(cores >= 0.5, `scope used only ${cores.toFixed(2)} cores: the burner did not run`);
+});
+
+test('a grant below the minimum cannot be enforced: unwrapped under prefer, CpuLimitUnavailableError under require or maxExecutionCpuCores', () => {
+  const { fn, calls } = recordingSpawn();
+  const { unit } = run(fn, { grantCores: 0.005 });
+  assert.equal(unit, null);
+  assert.equal(calls[0].cmd, '/usr/bin/nice');
+  assert.throws(() => run(fn, { grantCores: 0.005, resolved: { ...ON, mode: 'require' } }), (e) => e instanceof CpuLimitUnavailableError && /0\.005/.test(e.message));
+  assert.throws(() => run(fn, { grantCores: 0.005, requireQuota: true }), CpuLimitUnavailableError);
+});
+
+test('CPU_ARGV_VERBATIM: a wrapped command receives $$ and $VAR untouched (systemd must not expand them)', { skip: SKIP }, async () => {
+  const { child } = spawnInCpuScope(spawn, {
+    resolved: probe,
+    leaseId: `cpu-argv-${process.pid}`,
+    grantCores: 1,
+    cmd: 'bash',
+    args: ['-c', 'echo $$ $FOO'],
+    options: { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, FOO: 'foo-value' } },
+  });
+  let out = '';
+  let err = '';
+  child.stdout.on('data', (c) => (out += c));
+  child.stderr.on('data', (c) => (err += c));
+  const code = await new Promise((resolve) => child.on('exit', resolve));
+  assert.equal(code, 0, err);
+  assert.match(out.trim(), /^\d+ foo-value$/);
 });
