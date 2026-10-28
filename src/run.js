@@ -17,13 +17,13 @@ import { argvFingerprint } from './cpu-estimates.js';
 import { readRows } from './suggest.js';
 import { rightSizedCpuCores } from './right-size.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
-import { isExclusive, oversizedWeight, oversizedWeightMessage } from './exclusive.js';
+import { isExclusive, oversizedWeight, oversizedWeightMessage, EXCLUSIVE_PURPOSES, EXCLUSIVE_UNDECLARED_WARNING, exclusiveDeadlineProblem, remoteExclusiveDeprecationMessage } from './exclusive.js';
 import { parseScrubCommandEnv, scrubCommandEnv, SCRUB_COMMAND_ENV_VAR } from './scrub-command-env.js';
 import { computeContentKey, decideReuse } from './result-cache.js';
 
 const supervisorPath = fileURLToPath(new URL('./supervisor.js', import.meta.url));
 
-function parseDuration(spec) {
+export function parseDuration(spec) {
   const m = String(spec).trim().match(/^(\d+(?:\.\d+)?)(ms|s|m|h)?$/);
   if (!m) throw new Error(`invalid duration "${spec}" (expected e.g. 30s, 5m, 500ms)`);
   const n = Number(m[1]);
@@ -248,6 +248,9 @@ export async function runCommand({
   silenceTimeoutOverride,
   // BRAIN-403: `--exclusive`; the lane config's `exclusive` is the other way in
   exclusive: exclusiveOverride,
+  // BRAIN-695: `--exclusive-purpose` / `--exclusive-deadline` (raw text, validated here); the lane config's keys are the other way in
+  exclusivePurpose: exclusivePurposeOverride,
+  exclusiveDeadline: exclusiveDeadlineOverride,
   // BRAIN-549: `--no-cache` (env LANE_BROKER_NO_CACHE=1 is the other way): run even when a cached pass exists
   noCache,
   // BRAIN-700: `--no-reuse` (answer nothing from history) and `--retry "<why>"` (env LANE_BROKER_RETRY_REASON): re-run content that already failed
@@ -323,6 +326,7 @@ export async function runCommand({
     }
     throw err;
   }
+  if (resolved.remoteExclusive === true && configRoot === undefined) process.stderr.write(`${remoteExclusiveDeprecationMessage(resolved.lane)}\n`);
   const maxExecutionCpuCores = maxExecutionCpuCoresOverride !== undefined
     ? maxExecutionCpuCoresOverride : resolved.maxExecutionCpuCores;
   if (maxExecutionCpuCores !== undefined && (!Number.isInteger(maxExecutionCpuCores) || maxExecutionCpuCores <= 0)) {
@@ -341,6 +345,34 @@ export async function runCommand({
   const exclusive = runnerIntake ? resolved.remoteExclusive === true : exclusiveOverride === true || resolved.exclusive === true;
   if (runnerIntake && (exclusiveOverride === true || resolved.exclusive === true)) {
     process.stderr.write('lane run: exclusive ignored on runner intake (exclusive lanes are local only)\n');
+  }
+  // BRAIN-695: the maintenance class's purpose and deadline; validated here, before the reentrancy check, so a bad value exits 64 on every path.
+  let exclusivePurpose = null;
+  let exclusiveDeadlineMs = null;
+  if (!runnerIntake) {
+    const refuse = (message) => {
+      process.stderr.write(`lane run: ${message}\n`);
+      return { exitCode: 64 };
+    };
+    exclusivePurpose = exclusivePurposeOverride ?? resolved.exclusivePurpose;
+    if (exclusivePurpose !== null && !EXCLUSIVE_PURPOSES.includes(exclusivePurpose)) {
+      return refuse(`--exclusive-purpose must be ${EXCLUSIVE_PURPOSES.join(' or ')} (got "${exclusivePurpose}")`);
+    }
+    if (exclusiveDeadlineOverride !== undefined) {
+      try {
+        exclusiveDeadlineMs = /^\d+$/.test(String(exclusiveDeadlineOverride).trim()) ? Number(exclusiveDeadlineOverride) : parseDuration(exclusiveDeadlineOverride);
+      } catch (err) {
+        return refuse(`--exclusive-deadline: ${err.message}`);
+      }
+      const problem = exclusiveDeadlineProblem(exclusiveDeadlineMs);
+      if (problem) return refuse(`--exclusive-deadline ${problem}`);
+    } else {
+      exclusiveDeadlineMs = resolved.exclusiveDeadlineMs;
+    }
+    if (!exclusive) {
+      if (exclusivePurpose !== null) return refuse(`lane "${resolved.lane}": exclusivePurpose is set but the run is not exclusive; it applies only to an exclusive run`);
+      if (exclusiveDeadlineMs !== null) return refuse(`lane "${resolved.lane}": exclusiveDeadlineMs is set but the run is not exclusive; it applies only to an exclusive run`);
+    }
   }
   // BRAIN-380: resolved and validated before the reentrancy check below, so a bad value exits 64 on every path.
   let priority;
@@ -544,6 +576,8 @@ export async function runCommand({
     return { exitCode: 64 };
   }
 
+  if (exclusive && !runnerIntake && (exclusivePurpose === null || exclusiveDeadlineMs === null)) process.stderr.write(`${EXCLUSIVE_UNDECLARED_WARNING}\n`);
+
   const root = ensureStateDirs().root;
   // BRAIN-549/700: a run gets a content key unless caching is off for it or both TTLs are 0; a runner (snapshot intake) and an exclusive never key.
   const passTtlMs = globalCfg.resultCacheTtlSec * 1000;
@@ -674,6 +708,8 @@ export async function runCommand({
     class: resolved.class,
     aging: resolved.aging,
     ...(exclusive ? { exclusive: true } : {}),
+    ...(exclusive && exclusivePurpose !== null ? { exclusivePurpose } : {}),
+    ...(exclusive && exclusiveDeadlineMs !== null ? { exclusiveDeadlineMs } : {}),
     ...(resolved.classEnforcement ? { classEnforcement: resolved.classEnforcement } : {}),
     conflicts: resolved.conflicts,
     // BRAIN-320: carried so the supervisor's remote-fallback path

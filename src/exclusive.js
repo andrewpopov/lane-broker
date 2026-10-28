@@ -25,7 +25,41 @@ export function oversizedWeight(weight, maxLaneWeight, exclusive) {
 }
 
 export function oversizedWeightMessage(weight, maxLaneWeight) {
-  return `weight ${weight} would hold most of this machine's capacity; declare \`exclusive: true\` or use \`cpuCores\` for size (BRAIN-452; maxLaneWeight is ${maxLaneWeight})`;
+  return `weight ${weight} would hold most of this machine's capacity; book the real size with \`cpuCores\`/\`memoryBytes\` instead (BRAIN-452; maxLaneWeight is ${maxLaneWeight})`;
+}
+
+/**
+ * BRAIN-695: `exclusive` is a MAINTENANCE class (host upgrade, calibration), never a way to run tests: it names a purpose and
+ * carries a hard deadline, after which the supervisor ends the run. 0.61.0 warns when either is missing; 0.62.0 refuses.
+ */
+export const EXCLUSIVE_PURPOSES = ['upgrade', 'calibration'];
+export const EXCLUSIVE_DEADLINE_MIN_MS = 60_000;
+export const EXCLUSIVE_DEADLINE_MAX_MS = 7_200_000;
+export const EXCLUSIVE_DEADLINE_EXIT = 124;
+export const EXCLUSIVE_DEADLINE_REASON = 'exclusive-deadline';
+
+/** The ONE text for the `remoteExclusive` deprecation; 0.62.0 reuses it for the refusal. */
+export function remoteExclusiveDeprecationMessage(laneName) {
+  return `lane-broker: lane "${laneName}": "remoteExclusive" is deprecated: it holds a whole runner. Book cpuCores/memoryBytes honestly instead; leases are CPU-enforced (BRAIN-695). Refused from 0.62.0.`;
+}
+
+export const EXCLUSIVE_UNDECLARED_WARNING = 'lane-broker: exclusive without --exclusive-purpose/--exclusive-deadline is deprecated; refused from 0.62.0';
+
+/** The shape problem with a deadline in ms, or null. */
+export function exclusiveDeadlineProblem(ms) {
+  return Number.isInteger(ms) && ms >= EXCLUSIVE_DEADLINE_MIN_MS && ms <= EXCLUSIVE_DEADLINE_MAX_MS
+    ? null
+    : `must be an integer number of milliseconds from ${EXCLUSIVE_DEADLINE_MIN_MS} to ${EXCLUSIVE_DEADLINE_MAX_MS}`;
+}
+
+/** A duration in the largest unit that is exact: 7200000 -> "2h", 90000 -> "90s", 1500 -> "1500ms". */
+export function formatDeadline(ms) {
+  for (const [unit, size] of [['h', 3_600_000], ['m', 60_000], ['s', 1000]]) if (ms % size === 0) return `${ms / size}${unit}`;
+  return `${ms}ms`;
+}
+
+export function exclusiveDeadlineExpiredMessage(ms) {
+  return `lane: exclusive deadline ${formatDeadline(ms)} expired\n`;
 }
 
 /** The heaviest weight an ALREADY QUEUED ticket is admitted at on this host: min(maxLaneWeight, floor(capacity / 2)), at least 1. */

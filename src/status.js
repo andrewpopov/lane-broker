@@ -228,6 +228,9 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       log: l.logPath,
       weight: l.weight,
       ...(l.exclusive === true ? { exclusive: true } : {}),
+      // BRAIN-695: a held exclusive's maintenance purpose and how long it has left before the supervisor ends it
+      ...(l.exclusive === true && l.exclusivePurpose ? { exclusivePurpose: l.exclusivePurpose } : {}),
+      ...(l.exclusive === true && Number.isFinite(l.exclusiveDeadlineAt) ? { exclusiveDeadlineRemainingMs: Math.max(0, l.exclusiveDeadlineAt - now) } : {}),
       // BRAIN-255: default 1 for a lease written before this field existed,
       // matching resolveTicketConfig's own compatibility default.
       maxConcurrent: l.maxConcurrent ?? 1,
@@ -558,7 +561,7 @@ export function renderStatusText(status) {
         `queue stalled: head ${hb.headId} (weight ${hb.headWeight}) does not fit capacity ` +
           `(${hb.runningWeight}/${hb.capacity} running); skip allowance exhausted (${hb.skipCount}/${hb.skipLimit}), ` +
           `backfill refused until running work drains` +
-          (hb.oversizedWeight ? `; cause: declared weight ${hb.oversizedWeight} is over this host's queued-weight limit (maxLaneWeight / half the capacity), admitted at ${hb.headWeight} (BRAIN-452: declare exclusive: true or use cpuCores)` : ''),
+          (hb.oversizedWeight ? `; cause: declared weight ${hb.oversizedWeight} is over this host's queued-weight limit (maxLaneWeight / half the capacity), admitted at ${hb.headWeight} (BRAIN-452: book the real size with cpuCores/memoryBytes)` : ''),
       );
     } else {
       lines.push(
@@ -640,7 +643,7 @@ export function renderStatusText(status) {
     lines.push('  (none)');
   } else {
     for (const r of status.running) {
-      const flag = (r.exclusive ? ' [exclusive]' : '') + (r.state === 'ORPHANED' ? ' [ORPHANED]' : '') + (r.overrun ? ` [OVERRUN peak ${r.overrun.observedPeak} for ${fmtMs(r.overrun.sinceMs)}]` : '') + (r.memOver ? ` [MEM-OVER peak ${fmtMB(r.observedCgroupMemoryPeakBytes)} > booked ${fmtMB(r.resources?.memoryBytes)}]` : '') + silenceFlag(r);
+      const flag = (r.exclusive ? ` [exclusive${r.exclusivePurpose ? ` ${r.exclusivePurpose}` : ''}${r.exclusiveDeadlineRemainingMs !== undefined ? `, deadline in ${fmtMs(r.exclusiveDeadlineRemainingMs)}` : ''}]` : '') + (r.state === 'ORPHANED' ? ' [ORPHANED]' : '') + (r.overrun ? ` [OVERRUN peak ${r.overrun.observedPeak} for ${fmtMs(r.overrun.sinceMs)}]` : '') + (r.memOver ? ` [MEM-OVER peak ${fmtMB(r.observedCgroupMemoryPeakBytes)} > booked ${fmtMB(r.resources?.memoryBytes)}]` : '') + silenceFlag(r);
       // BRAIN-255: only shown once it's non-default, so "2 running" reads
       // differently against a maxConcurrent: 8 lane than a plain exclusive
       // one, without cluttering the common (ceiling 1) case.

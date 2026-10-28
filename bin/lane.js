@@ -39,7 +39,7 @@ import { phasesReportCommand } from '../src/phases-report.js';
 
 function usage() {
   return `Usage:
-  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--exclusive] [--no-cache] [--no-reuse] [--retry "<why>"] [--detach [--id <ticket-id>]]
+  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--exclusive [--exclusive-purpose upgrade|calibration] [--exclusive-deadline <dur>]] [--no-cache] [--no-reuse] [--retry "<why>"] [--detach [--id <ticket-id>]]
            [--timeout <duration>] [--allow-local-sim] [--local] [--log <path>] -- <command...>
   lane status [--json]
   lane capabilities --json
@@ -107,6 +107,13 @@ function parseRunArgs(args) {
         break;
       case '--exclusive':
         opts.exclusive = true;
+        break;
+      // Validated (exit 64) by runCommand, together with the lane config's keys.
+      case '--exclusive-purpose':
+        opts.exclusivePurpose = flagArgs[++i] ?? '';
+        break;
+      case '--exclusive-deadline':
+        opts.exclusiveDeadline = flagArgs[++i] ?? '';
         break;
       case '--no-cache':
         opts.noCache = true;
@@ -199,6 +206,8 @@ async function main() {
         memoryOverride: opts.memoryOverride,
         priority: opts.priority,
         exclusive: opts.exclusive,
+        exclusivePurpose: opts.exclusivePurpose,
+        exclusiveDeadline: opts.exclusiveDeadline,
         noCache: opts.noCache,
         noReuse: opts.noReuse,
         retryReason: opts.retryReason,

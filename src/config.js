@@ -6,7 +6,7 @@ import { paths, stateHome } from './state.js';
 import { scheduleProblem } from './runner-schedule.js';
 import { isCanonicalRelPath } from './remote-manifest.js';
 import { remoteExcludeShapeProblem, remoteExcludeConflict } from './remote-exclude.js';
-import { unsupportedHookKeys, hookRefusalMessage } from './exclusive.js';
+import { unsupportedHookKeys, hookRefusalMessage, EXCLUSIVE_PURPOSES, exclusiveDeadlineProblem } from './exclusive.js';
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
 import { DEFAULT_DEPS_CACHE_MAX_BYTES } from './deps-cache.js';
 import { isValidRequiresShape, VERSION_FLOOR_RE } from './runner-readiness.js';
@@ -718,6 +718,13 @@ function validateRepoConfig(cfg, sourcePath) {
     if (lane.exclusive !== undefined) {
       assert(typeof lane.exclusive === 'boolean', `${sourcePath}: lane "${name}".exclusive must be a boolean`);
     }
+    if (lane.exclusivePurpose !== undefined) {
+      assert(EXCLUSIVE_PURPOSES.includes(lane.exclusivePurpose), `${sourcePath}: lane "${name}".exclusivePurpose must be ${EXCLUSIVE_PURPOSES.map((p) => `"${p}"`).join(' or ')}`);
+    }
+    if (lane.exclusiveDeadlineMs !== undefined) {
+      const problem = exclusiveDeadlineProblem(lane.exclusiveDeadlineMs);
+      assert(problem === null, `${sourcePath}: lane "${name}".exclusiveDeadlineMs ${problem}`);
+    }
     if (lane.cache !== undefined) {
       assert(typeof lane.cache === 'boolean', `${sourcePath}: lane "${name}".cache must be a boolean`);
     }
@@ -1243,6 +1250,9 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     rightSize: laneCfg.rightSize !== false,
     // BRAIN-403: never inherited through an undeclaredLanes template (the template literal above does not copy it)
     exclusive: laneCfg.exclusive === true,
+    // BRAIN-695: the maintenance class's purpose and hard deadline (validated above); not inherited either
+    exclusivePurpose: EXCLUSIVE_PURPOSES.includes(laneCfg.exclusivePurpose) ? laneCfg.exclusivePurpose : null,
+    exclusiveDeadlineMs: Number.isInteger(laneCfg.exclusiveDeadlineMs) ? laneCfg.exclusiveDeadlineMs : null,
     // BRAIN-549: false opts this lane out of the result cache; inherited through an undeclaredLanes template
     cache: laneCfg.cache !== false,
     // BRAIN-321: "required" = granted only under live class caps (`classes.mode` active and valid); absent for every other lane

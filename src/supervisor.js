@@ -50,6 +50,7 @@ import { createAttempt, readAttempt, updateAttempt, fallbackToLocal, publishTerm
 import { writeBrokerLog, OBSERVED_HISTORY_MAX, hostCpuLoad, ticketCpuEstimate } from './admission.js';
 import { relayedUsage, relayedDeps, relayedTransfer, snapshotLine } from './remote-relay.js';
 import { maybeDailyGc } from './gc.js';
+import { EXCLUSIVE_DEADLINE_EXIT, EXCLUSIVE_DEADLINE_REASON, exclusiveDeadlineExpiredMessage } from './exclusive.js';
 import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, SILENCE_REASON, noProgressMessage, silenceMessage } from './no-progress.js';
 import { settledContentKey, isCleanPass } from './result-cache.js';
 import { scrubCommandEnv } from './scrub-command-env.js';
@@ -1700,10 +1701,17 @@ async function main() {
     if (!forwardedOk) stderrForward.pauseUntilDrain(stderrGate);
   });
 
-  writeLease(root, runningLease(started.lease, { childPgid: child.pid, cpuScopeUnit: cpuScope, startedAt }));
+  // BRAIN-695: an exclusive's deadline runs from this spawn; the test seam lets a test use a deadline under the public minimum
+  const exclusiveDeadlineMs = ticket.exclusive === true ? Number(process.env.LANE_BROKER_TEST_EXCLUSIVE_DEADLINE_MS) || ticket.exclusiveDeadlineMs : undefined;
+  writeLease(root, {
+    ...runningLease(started.lease, { childPgid: child.pid, cpuScopeUnit: cpuScope, startedAt }),
+    ...(ticket.exclusivePurpose ? { exclusivePurpose: ticket.exclusivePurpose } : {}),
+    ...(exclusiveDeadlineMs ? { exclusiveDeadlineAt: startedAt + exclusiveDeadlineMs } : {}),
+  });
 
   let finished = false;
   let cancelling = false;
+  let deadlineExpired = false;
   let watchdogKill = null; // BRAIN-431/576: the watchdog reason (no-progress | silence) that began the reap; the first one wins
   let killPromise = null;
 
@@ -1771,6 +1779,14 @@ async function main() {
     watchdogKill = reason;
     reap(reason);
   }
+  /** BRAIN-695: the exclusive's deadline ends the run through the same reap as a cancel; an explicit cancel that landed first keeps its 130. */
+  const exclusiveDeadlineTimer = exclusiveDeadlineMs
+    ? setTimeout(() => {
+        if (finished || cancelling || killPromise || cancelRequested(root, ticket.id)) return;
+        deadlineExpired = true;
+        reap(EXCLUSIVE_DEADLINE_REASON);
+      }, exclusiveDeadlineMs)
+    : null;
   const earlySample = setTimeout(() => {
     if (!finished) observeLease();
   }, Math.min(EARLY_SAMPLE_MS, globalCfg.sampleMs));
@@ -1808,6 +1824,7 @@ async function main() {
     finished = true;
     clearInterval(heartbeat);
     clearTimeout(earlySample);
+    clearTimeout(exclusiveDeadlineTimer);
     // killGroup must be awaited on every path: if the group leader exited
     // but a TERM-resistant descendant is still alive, we must not write the
     // result / release the lease until the whole group is confirmed gone.
@@ -1815,7 +1832,14 @@ async function main() {
     // BRAIN-349: a cancelled run is 'cancelled' (exit 130) whatever the child
     // itself exited with -- a child that traps TERM and exits 0 must not read
     // as success. Same shape as the remote-cancel result (remoteCancelledResult).
-    if (cancelling) {
+    if (deadlineExpired) {
+      // a command that traps TERM and exits 0 still did not finish inside its window; a cancel after expiry does not rewrite it
+      result = { ...result, exit: EXCLUSIVE_DEADLINE_EXIT, signal: null, reason: EXCLUSIVE_DEADLINE_REASON, exclusiveDeadlineExpired: true, exclusiveDeadlineMs };
+      const message = exclusiveDeadlineExpiredMessage(exclusiveDeadlineMs);
+      logWriter.write(message);
+      stderrForward?.write(message);
+      exitCode = EXCLUSIVE_DEADLINE_EXIT;
+    } else if (cancelling) {
       result = { ...result, exit: 130, signal: null, cancelled: true };
       exitCode = 130;
     } else if (watchdogKill) {
