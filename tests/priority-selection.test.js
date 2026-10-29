@@ -270,7 +270,7 @@ test('behind the fence the singleton skip files are neither read nor written', a
   });
 });
 
-test('a reservation is not taken over by an arriving high', async () => {
+test('a reservation is not taken over by an arriving high (BRAIN-630: the high may still start past it, the owner keeps the reservation)', async () => {
   await withClock(async () => {
     const cfg = activeCfg();
     const run = async (reserve) => {
@@ -283,8 +283,9 @@ test('a reservation is not taken over by an arriving high', async () => {
       return { state, owner, high };
     };
     const reserved = await run(true);
-    assert.equal((await poll(reserved.state, reserved.high, cfg)).reason, 'not-head', 'waits like any other follower');
-    assert.deepEqual(viewOf(reserved.state, cfg), { ids: ['owner', 'arriving-high'], ownerId: 'owner' });
+    assert.deepEqual(viewOf(reserved.state, cfg), { ids: ['owner', 'arriving-high'], ownerId: 'owner' }, 'the high does not take the front');
+    assert.equal((await poll(reserved.state, reserved.high, cfg)).started, true, 'BRAIN-630: a strictly higher tier that fits starts past the reservation');
+    assert.deepEqual(viewOf(reserved.state, cfg), { ids: ['owner'], ownerId: 'owner' }, 'and the owner still holds it');
     const control = await run(false);
     assert.equal((await poll(control.state, control.high, cfg)).started, true, 'control: with no reservation the high goes first');
   });

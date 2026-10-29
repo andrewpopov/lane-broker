@@ -542,7 +542,7 @@ What a remote run does:
    A queued ticket whose supervisor is provably dead (pid gone, start time changed, or a different boot; an
    indeterminate probe counts as alive) is an orphan, e.g. after a runner reboot. It is reaped under the broker
    lock by every admission poll, `lane status` and `remote-probe`, so it never holds a `maxRemoteQueue` slot: it
-   is dequeued, its result is published as exit 75 (`supervisor gone before admission (host restart?)`) and a
+   is dequeued, its result is published as exit 75 (`supervisor-died-while-queued`, `reconciled: true`, so `lane wait` names it as lost) and a
    history row is written. Leases are not touched here; the lease reaper owns them.
    A run queued this way records `queuedAt: "<runner>(<queued at pick time>)"`
    in its result and attempt record and logs `lane: queuing on ...`. The
@@ -1595,6 +1595,16 @@ Each express start is logged in `admission-decisions.log` as
 `lane-broker-express event=express-admit`, and `lane status` marks queued
 express tickets `[express]` (JSON: `express: true`). The estimates are cached in
 `express-estimates.json` for 5 minutes. `expressMaxMs: 0` turns it off.
+
+**Priority yield past a reserved head** (BRAIN-630). A ticket whose admitted tier is strictly higher than a
+head's with a *resource* reservation (not the capacity-blocked kind) may start past it when it fits now on its own
+(the normal admission checks) and the weight-capacity half of BRAIN-355's proof holds. It is decided before express, so
+an express-sized gate past a protected head yields instead of being denied against the head's claim. The head keeps its
+reservation and place, and a yield is not a skip against it. Starvation bound: the first `resourceSkipLimit` yields per head
+(`yields` in `resource-skip-state.json`) do not reserve the head's CPU claim, since a head that cannot fit until leases
+drain would otherwise exclude every push gate however far it aged; each later yield must also fit with the head's claim
+reserved, as a protected express start does, so a stream of gates cannot keep the head from starting. Starts also share the
+`expressPerMinute` window. Same-tier and lower-tier tickets still wait behind the head.
 
 **Bounded idle exemption** (`resourceIdleOvershootCores`, default 1; `0`
 disables): ambient load can make a large lane unsatisfiable even with nothing

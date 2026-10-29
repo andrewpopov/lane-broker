@@ -54,7 +54,8 @@ function assertReaped(fx, id) {
   assert.equal(listQueue(fx.state).find((t) => t && t.id === id), undefined, `${id} must be dequeued`);
   const result = JSON.parse(fs.readFileSync(path.join(fx.base, `${id}.json`), 'utf8'));
   assert.equal(result.exit, 75);
-  assert.equal(result.reason, 'supervisor gone before admission (host restart?)');
+  assert.equal(result.reason, 'supervisor-died-while-queued');
+  assert.equal(result.reconciled, true, 'lane wait names a reconciled result as lost');
   const rows = fs.readFileSync(paths(fx.state).history, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
   assert.ok(rows.find((r) => r.id === id && r.dequeuedDeadSupervisor), 'history row written');
 }

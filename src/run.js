@@ -228,6 +228,12 @@ async function describeLaneState(root, id, resultPath) {
   }
 }
 
+/** BRAIN-675: the floor a remote header carries. A declared floor that equals the claim is fixed intent, not "no floor". */
+export function remoteMinCpuCores(resources, declaredMinCpuCores) {
+  if (resources.minCpuCores !== undefined) return resources.minCpuCores;
+  return Number.isFinite(declaredMinCpuCores) && declaredMinCpuCores > 0 ? resources.cpuCores : undefined;
+}
+
 function refuseForMigration(err) {
   process.stderr.write(`lane run: ${err.message}; try again once \`lane migrate-scheduler\` has finished\n`);
   return { exitCode: 75 };
@@ -806,8 +812,9 @@ export async function runCommand({
       weight,
       cpuCores: resources.cpuCores,
       ...(maxExecutionCpuCores !== undefined ? { maxExecutionCpuCores } : {}),
-      // BRAIN-360: elastic lanes only, so a non-elastic ticket's remote payload is unchanged
-      ...(resources.minCpuCores !== undefined ? { minCpuCores: resources.minCpuCores } : {}),
+      // BRAIN-360: elastic lanes only. BRAIN-675: an explicit fixed minimum (floor == claim) resolves to no floor locally, but
+      // is sent as the claim itself so the runner's own lane default cannot lower it; no declared floor still sends nothing.
+      ...(remoteMinCpuCores(resources, cappedMinCpuCores) !== undefined ? { minCpuCores: remoteMinCpuCores(resources, cappedMinCpuCores) } : {}),
       memoryBytes: resources.memoryBytes,
       // BRAIN-320 S1a: carried through so the supervisor's eligibility hook
       // and (later slice) dispatchRemote's protocol-2 header see exactly what
