@@ -62,17 +62,21 @@ test('(a) the operator marks A offline while the supervisor waits: re-dispatched
   assert.equal(attempt, null, 'the settled attempt is gone');
 });
 
-test('(b) A stays unreachable past runnerLostAfterMs: re-dispatched to B', T, async () => {
+test('(b) A stays unreachable past runnerLostAfterMs: the bound is no proof, so the ticket settles lost (75) and is NOT re-dispatched', T, async () => {
   const ctx = rebalanceSetup({ paused: ['a'], rebalance: { ...OPTS, runnerLostAfterMs: 1500 } });
   const id = await dropA(ctx);
   const waited = await ctx.finish(id);
-  assert.equal(waited.code, 0, waited.stderr);
-  assert.deepEqual(ctx.runs(), ['b']);
+  assert.equal(waited.code, 75, waited.stderr);
+  assert.equal(ctx.fake.count('exec b'), 0, 'never sent to B: a partitioned A may still run it');
+  assert.deepEqual(ctx.runs(), []);
+  const result = resultOf(ctx.state, id);
+  assert.equal(result.exit, 75);
+  assert.equal(result.reason, 'runner-lost');
   const row = historyRow(ctx, id);
-  assert.deepEqual(row.redispatchedFrom, ['a']);
-  assert.equal(row.redispatchReason, 'runner-lost');
-  assert.equal(row.runner, 'b');
-  assert.equal(row.localReason, undefined);
+  assert.equal(row.reason, 'runner-lost');
+  assert.equal(row.exit, 75);
+  assert.equal(row.redispatchedFrom, undefined);
+  assert.equal(readAttempt(ctx.state, id), null);
 });
 
 test('(c) BRAIN-437: A comes back answering running before the bound: nothing is re-dispatched and the result from A is adopted', T, async () => {
@@ -95,14 +99,15 @@ test('(c) BRAIN-437: A comes back answering running before the bound: nothing is
   assert.equal(readAttempt(ctx.state, id), null);
 });
 
-test('(d) no other runner: falls back to local with localReason fallback:runner-lost, and runs once', T, async () => {
-  const ctx = rebalanceSetup({ names: ['a'], paused: ['a'], rebalance: { ...OPTS, runnerLostAfterMs: 1500 } });
+test('(d) no other runner: falls back to local with localReason fallback:runner-offline, and runs once', T, async () => {
+  const ctx = rebalanceSetup({ names: ['a'], paused: ['a'], rebalance: { ...OPTS, runnerLostAfterMs: 0 } });
   const id = await dropA(ctx);
+  setOffline(ctx, 'a');
   const waited = await ctx.finish(id);
   assert.equal(waited.code, 0, waited.stderr);
   assert.equal(ctx.fake.count('exec a'), 1, 'never sent to A a second time');
   assert.deepEqual(ctx.runs(), ['undefined'], 'ran once, locally');
-  assert.equal(historyRow(ctx, id).localReason, 'fallback:runner-lost');
+  assert.equal(historyRow(ctx, id).localReason, 'fallback:runner-offline');
 });
 
 test('(e) remoteLostPollMs 0 keeps today\'s behaviour: the supervisor exits at once, the attempt is left unresolved and nothing is re-run', T, async () => {
@@ -132,6 +137,54 @@ test('(f) lane cancel while waiting: the runner is asked to cancel and the ticke
   assert.deepEqual(ctx.runs(), []);
   assert.equal(resultOf(ctx.state, id).exit, 130);
   assert.equal(readAttempt(ctx.state, id), null);
+});
+
+test('(g) a config reload that changes A\'s ssh mid-wait does not change who is asked', T, async () => {
+  const ctx = rebalanceSetup({ paused: ['a'], rebalance: { ...OPTS, runnerLostAfterMs: 0 } });
+  const id = await dropA(ctx);
+  const cfg = JSON.parse(fs.readFileSync(path.join(ctx.home, 'config.json'), 'utf8'));
+  cfg.runners.find((r) => r.name === 'a').ssh = 'a2';
+  writeGlobalConfig(ctx.home, cfg);
+  const before = ctx.fake.count('result a');
+  await waitFor(() => ctx.fake.count('result a') >= before + 3, { timeoutMs: 30_000 });
+  assert.equal(ctx.fake.count('result a2'), 0, 'the new alias is never asked');
+  assert.equal(ctx.fake.count('exec b'), 0);
+  assert.ok(readAttempt(ctx.state, id)?.awaitingProof, 'still waiting on the dispatched runner');
+});
+
+test('(h) lane cancel while a reconcile call is in flight settles promptly even with a 60 s poll', T, async () => {
+  const ctx = rebalanceSetup({ paused: ['a'], rebalance: { ...OPTS, remoteLostPollMs: 60_000, runnerLostAfterMs: 0 } });
+  const id = await ctx.start();
+  await execArrived(ctx, 'a');
+  ctx.fake.setSlow('a', true);
+  ctx.fake.setDown('a', true);
+  ctx.fake.dropExec('a');
+  await waitFor(() => readAttempt(ctx.state, id)?.awaitingProof, { timeoutMs: 60_000 });
+  const inFlight = () => ctx.fake.calls().filter((l) => l === 'result a').length - ctx.fake.calls().filter((l) => l.startsWith('end-result a ')).length;
+  await waitFor(() => inFlight() > 0, { timeoutMs: 30_000 });
+  ctx.fake.setSlow('a', false);
+  ctx.fake.setDown('a', false);
+  const started = Date.now();
+  const cancelled = await laneRun(['cancel', id], { env: ctx.env });
+  assert.equal(cancelled.code, 0, cancelled.stderr);
+  assert.ok(Date.now() - started < 20_000, `settled in ${Date.now() - started} ms`);
+  assert.equal(resultOf(ctx.state, id).exit, 130);
+  assert.equal(ctx.fake.count('exec b'), 0);
+});
+
+test('(i) remoteLostPollMs reloaded to 0 mid-wait: the supervisor exits leaving the attempt unresolved, nothing is re-run', T, async () => {
+  const ctx = rebalanceSetup({ paused: ['a'], rebalance: { ...OPTS, runnerLostAfterMs: 0 } });
+  const id = await dropA(ctx);
+  const cfg = JSON.parse(fs.readFileSync(path.join(ctx.home, 'config.json'), 'utf8'));
+  cfg.remoteLostPollMs = 0;
+  writeGlobalConfig(ctx.home, cfg);
+  await waitFor(() => !supervisorAlive(readAttempt(ctx.state, id)), { timeoutMs: 30_000 });
+  const attempt = readAttempt(ctx.state, id);
+  assert.equal(attempt.awaitingProof, undefined);
+  assert.ok(attempt.unresolved);
+  assert.equal(ctx.fake.count('exec b'), 0);
+  assert.deepEqual(ctx.runs(), []);
+  assert.equal(resultOf(ctx.state, id), null);
 });
 
 test('(f) lane cancel while waiting and the runner cannot confirm: the attempt stays unresolved and cancel fails', T, async () => {

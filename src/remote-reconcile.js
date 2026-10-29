@@ -35,14 +35,17 @@ import { writeBrokerLog } from './admission.js';
  *
  * `self` (BRAIN-350 S3): the caller is the supervisor that OWNS the attempt (`attempt.supervisor.pid === process.pid`), waiting for proof
  * before it re-dispatches. It is not skipped for being alive, its publish fence accepts itself, an `adopted` outcome is published as
- * usual, but a `lost` outcome is NOT published: it returns `{ settled: false, state: 'lost', reason, lostDetail }` for the caller to act on.
+ * usual, but a PROVEN `lost` outcome (runner-offline, a runner-confirmed gone, runner-shutdown, runner-never-started) is NOT published: it returns
+ * `{ settled: false, state: 'lost', reason, lostDetail }` for the caller to re-dispatch on. The `runnerLostAfterMs` bound is no proof (a partitioned
+ * runner may still run the job, BRAIN-437), so it is published like any caller's (exit 75, `runner-lost`) and comes back settled. `runner` pins the
+ * runner object captured at dispatch (self mode only), so a config reload cannot swap the host asked; only its `offline` flag is read from `globalCfg`.
  *
  * Returns `{ settled, state, exit?, reason?, transport?, timedOut? }` (`transport: true`: the runner gave no usable answer at all, so
  * asking it about another attempt would fail the same way); never throws.
  */
-export async function reconcileRemoteAttempt(root, id, { globalCfg, sshBin = 'ssh', env, deadlineMs = 30_000, deadlineAt, now = Date.now(), assumeDown = false, self = false } = {}) {
+export async function reconcileRemoteAttempt(root, id, { globalCfg, sshBin = 'ssh', env, deadlineMs = 30_000, deadlineAt, now = Date.now(), assumeDown = false, self = false, runner } = {}) {
   try {
-    return await reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt, now, assumeDown, self });
+    return await reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt, now, assumeDown, self, pinnedRunner: self ? runner : undefined });
   } catch (err) {
     // the clock lock stayed held past the caller's deadline: the same outcome as an ssh call that ran out of time
     if (err instanceof LockTimeoutError && deadlineAt !== undefined) return waitTimedOut();
@@ -58,7 +61,7 @@ const skipped = (reason) => ({ settled: false, state: 'skipped', reason });
 const MIN_CALL_MS = 250;
 const waitTimedOut = () => ({ settled: false, state: 'unreachable', reason: 'wait timeout reached', timedOut: true });
 
-async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt, now, assumeDown, self }) {
+async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt, now, assumeDown, self, pinnedRunner }) {
   const resultPath = path.join(paths(root).results, `${id}.json`);
   const attempt = readAttempt(root, id);
   if (!attempt) return skipped('no attempt record');
@@ -71,10 +74,11 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
     return publishSettled(root, id, attempt, resultPath, 'lost', () => lostResult(id, attempt, 'never-dispatched', 'supervisor died before dispatching to any runner'), { stillEligible: neverDispatched, self });
   }
 
-  const runner = (globalCfg?.runners ?? []).find((r) => r.name === attempt.runner);
+  const configured = (globalCfg?.runners ?? []).find((r) => r.name === attempt.runner);
+  const runner = pinnedRunner ?? configured;
   if (!runner) return { settled: false, state: 'unreachable', reason: 'runner not configured' };
 
-  if (runner.offline) {
+  if (pinnedRunner ? configured?.offline : runner.offline) {
     return publishSettled(root, id, attempt, resultPath, 'lost', () => lostResult(id, attempt, 'runner-offline', `runner ${runner.name} is marked offline in the config; not contacted`), { self });
   }
   const publishUnreachable = (since) => {
@@ -82,7 +86,7 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
     if (!(globalCfg.runnerLostAfterMs > 0) || unreachableMs <= globalCfg.runnerLostAfterMs) return null;
     return publishSettled(root, id, attempt, resultPath, 'lost', () =>
       lostResult(id, attempt, 'runner-lost', `runner ${runner.name} unreachable for ${Math.round(unreachableMs / 60_000)} min (limit ${Math.round(globalCfg.runnerLostAfterMs / 60_000)} min)`),
-      { self },
+      { self, boundOnly: true },
     );
   };
   const unreachable = async (outcome) => {
@@ -182,8 +186,8 @@ async function adoptOrAmbiguous(attempt, id, record, publish) {
 
 /** Publish through the shared exactly-once path. The fence ties the publish to the attempt this reconcile read: a record that
  *  changed hands (another runner, a restarted supervisor, a move) meanwhile is left alone. */
-async function publishSettled(root, id, attempt, resultPath, kind, buildResult, { stillEligible = () => true, self = false } = {}) {
-  if (self && kind === 'lost') {
+async function publishSettled(root, id, attempt, resultPath, kind, buildResult, { stillEligible = () => true, self = false, boundOnly = false } = {}) {
+  if (self && kind === 'lost' && !boundOnly) {
     const { reason, lostDetail } = buildResult();
     return { settled: false, state: 'lost', reason, lostDetail };
   }

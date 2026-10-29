@@ -525,7 +525,7 @@ const DEFAULT_DRAIN_REASON = 'drained by operator';
 export const RUNNER_SHUTDOWN_REASON = 'runner-shutdown';
 /** BRAIN-350: the same stop when the runner cannot prove the job is dead; the submitter treats it as possibly still running. */
 export const RUNNER_SHUTDOWN_UNPROVEN_REASON = 'runner-shutdown-unproven';
-/** BRAIN-350 S3: every reason that PROVES a runner no longer holds the job, so the submitter may place it again (a reconcile `lost` reason). */
+/** BRAIN-350 S3: every reason that PROVES a runner no longer holds the job, so the submitter may place it again (a reconcile `lost` reason; `runner-lost` only from a runner-confirmed gone, never the unreachable bound, which settles the ticket instead). */
 export const LOST_REASONS = new Set([RUNNER_SHUTDOWN_REASON, 'runner-lost', 'runner-offline', 'runner-never-started']);
 
 /** A drain reason is shown to operators and in submitter logs: no ANSI/control characters, one line, at most 200 chars. */
@@ -567,7 +567,9 @@ export function readRemoteDrain(root = stateHome()) {
   const reason = sanitizeDrainReason(m.reason) || DEFAULT_DRAIN_REASON;
   // BRAIN-350: a shutdown drain ends with the boot it was written in (the host is about to go down, so it comes back taking work).
   if (m.shutdown === true) {
-    if (m.bootId !== bootId()) return null;
+    // the kernel boot id survives a wall-clock correction that shifts `bootId`; an old marker (none stored) or a host without one keeps `bootId`
+    const kernel = typeof m.kernelBootId === 'string' ? kernelBootId() : null;
+    if (kernel !== null ? m.kernelBootId !== kernel : m.bootId !== bootId()) return null;
     return { reason, since: m.since, unreadable: false, shutdown: true };
   }
   return { reason, since: m.since, unreadable: false };
@@ -582,7 +584,7 @@ export async function writeRemoteDrain(root, reason, { shutdown = false } = {}) 
       reason: sanitizeDrainReason(reason) || DEFAULT_DRAIN_REASON,
       since: prev && !prev.unreadable ? prev.since : Date.now(),
       host: os.hostname(),
-      ...(shutdown ? { shutdown: true, bootId: bootId() } : {}),
+      ...(shutdown ? { shutdown: true, bootId: bootId(), ...(kernelBootId() ? { kernelBootId: kernelBootId() } : {}) } : {}),
     };
     atomicWriteJson(paths(root).remoteDrain, marker, { fsync: true });
     return { reason: marker.reason, since: marker.since, unreadable: false, ...(shutdown ? { shutdown: true } : {}) };
@@ -1064,6 +1066,18 @@ export function bootId() {
   const approxBootEpoch = Date.now() / 1000 - os.uptime();
   cachedBootId = String(Math.round(approxBootEpoch / 10) * 10);
   return cachedBootId;
+}
+
+/** The kernel's own boot id: unlike `bootId` (linux btime) it does not move when the wall clock is corrected, so a reboot PROOF uses it.
+ *  `LANE_BROKER_KERNEL_BOOT_ID` overrides (tests); null where the host exposes none (darwin), and nothing may then be proven by a reboot. */
+export function kernelBootId() {
+  if (process.env.LANE_BROKER_KERNEL_BOOT_ID) return process.env.LANE_BROKER_KERNEL_BOOT_ID;
+  if (process.platform !== 'linux') return null;
+  try {
+    return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null;
+  } catch {
+    return null;
+  }
 }
 
 /** Test-only access to the lock takeover's internal steps, so tests can drive the CAS directly instead of racing real processes. Not part of the public API. */

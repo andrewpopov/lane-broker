@@ -558,7 +558,11 @@ const sub = (/remote-(probe|exec|result|cancel|withdraw|artifacts-release|artifa
 fs.appendFileSync(${JSON.stringify(logPath)}, sub + ' ' + dest + '\\n');
 const done = (code) => { fs.appendFileSync(${JSON.stringify(logPath)}, 'end-' + sub + ' ' + dest + ' ' + code + '\\n'); process.exitCode = code; process.exit(code); };
 // a test-only outage: every call to a runner marked down fails like an unreachable host, until the flag is removed
-if (fs.existsSync(${JSON.stringify(path.join(dir, 'down-'))} + dest)) done(255);
+if (fs.existsSync(${JSON.stringify(path.join(dir, 'down-'))} + dest)) {
+  // a slow outage: the call hangs a while before failing, so a caller can be caught mid-call
+  if (fs.existsSync(${JSON.stringify(path.join(dir, 'slow-'))} + dest)) { setTimeout(() => done(255), 3000); return; }
+  done(255);
+}
 if (sub === 'exec') fs.writeFileSync(${JSON.stringify(path.join(dir, 'exec-pid-'))} + dest, String(process.pid));
 if (sub === 'probe') {
   const probe = JSON.parse(fs.readFileSync(${JSON.stringify(probesPath)}, 'utf8'))[dest];
@@ -607,6 +611,12 @@ if (sub === 'probe') {
     setDown: (name, down) => {
       const flag = path.join(dir, `down-${name}`);
       if (down) fs.writeFileSync(flag, '1');
+      else fs.rmSync(flag, { force: true });
+    },
+    /** While runner `name` is down, make each failing call take 3 s instead of failing at once. */
+    setSlow: (name, slow) => {
+      const flag = path.join(dir, `slow-${name}`);
+      if (slow) fs.writeFileSync(flag, '1');
       else fs.rmSync(flag, { force: true });
     },
     /** Kill the exec ssh connection to runner `name`, as a dropped host would; the runner-side job is untouched. */

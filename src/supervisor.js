@@ -1026,6 +1026,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
    * BRAIN-350 S3: the runner dropped with no proof either way (`mayStillBeRunning`). This supervisor stays alive and asks reconcile (in
    * `self` mode) every `remoteLostPollMs` until the job is proven gone, then hands back a `runnerStopped` dispatch so the S2 branch
    * re-dispatches it; a result the runner turns out to hold is adopted and ends the ticket; `lane cancel` becomes a remote cancel.
+   * The `runnerLostAfterMs` bound is not proof: it settles the ticket lost (exit 75) like an orphan, never re-dispatching it. The runner
+   * is the object captured at dispatch, so a config reload cannot change the host asked; the reload only supplies the flags and polling.
    * The attempt keeps `unresolved` throughout, so a supervisor killed meanwhile still leaves an ordinary reconcilable orphan.
    */
   const awaitProof = async (dropped) => {
@@ -1042,8 +1044,17 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
         return { outcome: 'cancelled', remoteCancelConfirmed };
       }
       globalCfg = reloadGlobalConfig(globalCfg, { onError: (err) => recordConfigReloadError(root, err) });
-      const settled = await reconcileRemoteAttempt(root, enriched.id, { globalCfg, self: true });
-      if (settled.state === 'lost') {
+      if (!(globalCfg.remoteLostPollMs > 0)) {
+        // polling was switched off meanwhile: leave as the pre-S3 path does, the attempt stays unresolved for `lane status`/`lane cancel`
+        const line = `lane: remote: ${enriched.id}: ${runner.name}: ${dropped.reason} (see lane status, lane cancel)\n`;
+        process.stderr.write(line);
+        writeBrokerLog(root, line);
+        await updateAttempt(root, enriched.id, gen, { unresolved: dropped.reason, awaitingProof: undefined });
+        await logWriter.finish();
+        process.exit(1);
+      }
+      const settled = await reconcileRemoteAttempt(root, enriched.id, { globalCfg, self: true, runner });
+      if (settled.state === 'lost' && settled.settled !== true) {
         await updateAttempt(root, enriched.id, gen, { unresolved: undefined, awaitingProof: undefined });
         return { outcome: 'unconfirmed', reason: settled.lostDetail, runnerStopped: true, lostReason: settled.reason };
       }
@@ -1056,6 +1067,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
         else process.stderr.write(`lane-broker supervisor: could not settle ${enriched.id} while waiting for proof: ${settled.reason}\n`);
         process.exit(settled.settled === true && Number.isInteger(settled.exit) ? settled.exit : 1);
       }
+      if (abortSignal.aborted) continue; // cancelled during the reconcile: take the cancel branch now, not after a full interval
       await new Promise((resolve) => {
         const timer = setTimeout(resolve, globalCfg.remoteLostPollMs);
         abortSignal.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });

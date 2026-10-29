@@ -1178,8 +1178,9 @@ waiting on them) forever. Two ways to settle them as lost (exit `75`; a job's ou
 `lane wait` on a settled-lost attempt exits `75` and prints the reason on stderr.
 
 **Losses are now re-dispatched (BRAIN-350).** A `runner-shutdown` record re-dispatches the work at once. A dropped runner keeps its
-supervisor waiting for proof (the `offline` flag, `runnerLostAfterMs`, or the runner's own record), then re-dispatches to another
-runner before falling back to local. `remoteLostPollMs` (default 60000; `0` = exit at once, as before) sets that poll.
+supervisor waiting for proof (the `offline` flag, a runner-confirmed gone, or the runner's own record), then re-dispatches to another
+runner before falling back to local. `runnerLostAfterMs` is not proof (a partitioned runner may still run the job): it settles the
+ticket lost (exit `75`, `runner-lost`) and never re-dispatches it. The runner asked is the one dispatched to, even if the config changes meanwhile. `remoteLostPollMs` (default 60000; `0` = exit at once, as before) sets that poll.
 
 **The runner heartbeat (BRAIN-597).** Reconcile only runs when someone asks, so a runner that died with nothing on it was never
 noticed, and placement re-probed it (about 6 s each) on every submission. `lane runner watch` is one tick, run every 60 s by a

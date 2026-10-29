@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, BIN, laneRun, waitFor } from './helpers.js';
 import { encodeSnapshot } from '../src/remote-stream.js';
-import { paths, readJsonSafe, readRemoteDrain, writeRemoteDrain, clearRemoteDrain, RUNNER_SHUTDOWN_REASON } from '../src/state.js';
+import { paths, readJsonSafe, readRemoteDrain, writeRemoteDrain, clearRemoteDrain, RUNNER_SHUTDOWN_REASON, kernelBootId } from '../src/state.js';
 import { makeTmpDir } from './helpers/tmp.js';
 import { shutdownStopReason, servedRecord } from '../src/remote-runner.js';
 
@@ -141,35 +141,35 @@ test('a user cancel still wins over a shutdown marker', async () => {
 
 test('a shutdown marker from a previous boot reads as not draining; the current boot reads as draining', async () => {
   const ctx = setup();
-  const prev = process.env.LANE_BROKER_BOOT_ID;
+  const prev = process.env.LANE_BROKER_KERNEL_BOOT_ID;
   try {
-    process.env.LANE_BROKER_BOOT_ID = 'boot-1';
+    process.env.LANE_BROKER_KERNEL_BOOT_ID = 'boot-1';
     const marker = await writeRemoteDrain(ctx.state, 'going down', { shutdown: true });
     assert.equal(marker.shutdown, true);
     assert.equal(readRemoteDrain(ctx.state).shutdown, true);
-    process.env.LANE_BROKER_BOOT_ID = 'boot-2';
+    process.env.LANE_BROKER_KERNEL_BOOT_ID = 'boot-2';
     assert.equal(readRemoteDrain(ctx.state), null);
   } finally {
-    if (prev === undefined) delete process.env.LANE_BROKER_BOOT_ID;
-    else process.env.LANE_BROKER_BOOT_ID = prev;
+    if (prev === undefined) delete process.env.LANE_BROKER_KERNEL_BOOT_ID;
+    else process.env.LANE_BROKER_KERNEL_BOOT_ID = prev;
   }
 });
 
 test('plain drain is not a shutdown drain, survives a boot change, and undrain clears either kind', async () => {
   const ctx = setup();
-  const prev = process.env.LANE_BROKER_BOOT_ID;
+  const prev = process.env.LANE_BROKER_KERNEL_BOOT_ID;
   try {
-    process.env.LANE_BROKER_BOOT_ID = 'boot-1';
+    process.env.LANE_BROKER_KERNEL_BOOT_ID = 'boot-1';
     await writeRemoteDrain(ctx.state, 'maint');
     assert.equal(readRemoteDrain(ctx.state).shutdown, undefined);
-    process.env.LANE_BROKER_BOOT_ID = 'boot-2';
+    process.env.LANE_BROKER_KERNEL_BOOT_ID = 'boot-2';
     assert.equal(readRemoteDrain(ctx.state).reason, 'maint');
     await writeRemoteDrain(ctx.state, 'going down', { shutdown: true });
     assert.equal(await clearRemoteDrain(ctx.state), true);
     assert.equal(readRemoteDrain(ctx.state), null);
   } finally {
-    if (prev === undefined) delete process.env.LANE_BROKER_BOOT_ID;
-    else process.env.LANE_BROKER_BOOT_ID = prev;
+    if (prev === undefined) delete process.env.LANE_BROKER_KERNEL_BOOT_ID;
+    else process.env.LANE_BROKER_KERNEL_BOOT_ID = prev;
   }
 });
 
@@ -186,6 +186,39 @@ test('shutdownStopReason: only a proven stop yields runner-shutdown (Codex P1s o
   assert.equal(shutdownStopReason({ ...base, structured: { cancelled: false, startedAt: 1, exit: 0 } }), null, 'completed on its own keeps its record');
   assert.equal(shutdownStopReason({ ...base, cancelled: true, refusedAtStart: true, structured: null }), null, 'a user cancel wins');
   assert.equal(shutdownStopReason({ ...base, shutdownMarked: false, unstarted: true, structured: null }), null, 'no shutdown, no say');
+});
+
+test('a shutdown marker with no kernel boot id (old marker, or a host without one) keeps binding to bootId', async () => {
+  const ctx = setup();
+  const prev = { boot: process.env.LANE_BROKER_BOOT_ID, kernel: process.env.LANE_BROKER_KERNEL_BOOT_ID };
+  try {
+    delete process.env.LANE_BROKER_KERNEL_BOOT_ID;
+    process.env.LANE_BROKER_BOOT_ID = 'boot-1';
+    await writeRemoteDrain(ctx.state, 'going down', { shutdown: true });
+    assert.equal(readRemoteDrain(ctx.state).shutdown, true);
+    process.env.LANE_BROKER_BOOT_ID = 'boot-2';
+    assert.equal(readRemoteDrain(ctx.state), null);
+  } finally {
+    for (const [k, v] of [['LANE_BROKER_BOOT_ID', prev.boot], ['LANE_BROKER_KERNEL_BOOT_ID', prev.kernel]]) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+});
+
+test('kernelBootId: the override wins, and a null current id never upgrades an unproven record', () => {
+  const prev = process.env.LANE_BROKER_KERNEL_BOOT_ID;
+  try {
+    process.env.LANE_BROKER_KERNEL_BOOT_ID = 'k-1';
+    assert.equal(kernelBootId(), 'k-1');
+  } finally {
+    if (prev === undefined) delete process.env.LANE_BROKER_KERNEL_BOOT_ID;
+    else process.env.LANE_BROKER_KERNEL_BOOT_ID = prev;
+  }
+  const unproven = { protocol: 1, ticketId: 't', generation: 0, manifestHash: 'h', kind: 'unfinished', reason: 'runner-shutdown-unproven', shutdownBootId: 'k-1' };
+  assert.equal(servedRecord(unproven, null), unproven, 'no current id: nothing is proven');
+  assert.equal(servedRecord({ ...unproven, shutdownBootId: null }, 'k-2').reason, 'runner-shutdown-unproven');
+  assert.equal(servedRecord(unproven, 'k-2').provenBy, 'reboot', 'a different kernel id upgrades');
 });
 
 test('servedRecord: an unproven stop from an earlier boot is served as proven; the same boot stays unproven', () => {
