@@ -14,8 +14,6 @@ import { CLASSES_CAPABILITY, resolveClasses } from './classes.js';
 import { CPU_LIMIT_CAPABILITY, ENFORCED_LEASES_CAPABILITY, resolveCpuLimit, enforcementOf } from './cpu-limit.js';
 
 export const EXECUTION_CEILING_CAPABILITY = 'execution-cpu-ceiling/1';
-/** BRAIN-649: this runner honours `remoteExclusive` on intake (holds the whole runner while the lane runs). */
-export const REMOTE_EXCLUSIVE_CAPABILITY = 'remote-exclusive/1';
 export const SIM_SAFE_BACKFILL_CAPABILITY = 'sim-safe-backfill/1';
 export const LANE_AGING_CAPABILITY = 'lane-aging/1';
 export const GROUP_REAP_CAPABILITY = 'group-reap/1';
@@ -55,7 +53,6 @@ export const CAPABILITIES = [
   LEASE_CHECK_CAPABILITY,
   RUNNER_HEARTBEAT_CAPABILITY,
   SNAPSHOT_GZIP_CAPABILITY,
-  REMOTE_EXCLUSIVE_CAPABILITY,
   SCRUB_COMMAND_ENV_CAPABILITY,
   REUSE_GREEN_CAPABILITY,
 ];

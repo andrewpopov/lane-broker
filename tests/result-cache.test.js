@@ -157,7 +157,7 @@ test('a lane with cache: false always runs', async () => {
 });
 
 test('an exclusive lane never caches', async () => {
-  const t = setup({ lanes: { default: { weight: 1 }, solo: { weight: 1, exclusive: true } } });
+  const t = setup({ lanes: { default: { weight: 1 }, solo: { weight: 1, exclusive: true, exclusivePurpose: 'calibration', exclusiveDeadlineMs: 600_000 } } });
   await t.lane([], { laneName: 'solo' });
   await t.settled(1);
   const second = await t.lane([], { laneName: 'solo' });

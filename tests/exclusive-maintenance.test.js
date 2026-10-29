@@ -9,9 +9,9 @@ import { resolveTicketConfig, ConfigError } from '../src/config.js';
 import { readLease } from '../src/lease.js';
 import { paths, atomicWriteJson } from '../src/state.js';
 import { runCommand } from '../src/run.js';
-import { oversizedWeightMessage, remoteExclusiveDeprecationMessage, formatDeadline } from '../src/exclusive.js';
+import { oversizedWeightMessage, remoteExclusiveRefusal, formatDeadline } from '../src/exclusive.js';
 
-/** BRAIN-695 S3: exclusive is a maintenance class with a purpose and a hard deadline; remoteExclusive is deprecated. */
+/** BRAIN-695 S3: exclusive is a maintenance class with a purpose and a hard deadline; remoteExclusive is refused (0.65.0). */
 
 const TEST_DEADLINE_MS = 1500; // below the public minimum, injected at the supervisor only
 const TRAP_EXIT_ZERO = `trap 'exit 0' TERM; echo ready; while :; do sleep 0.1; done`;
@@ -145,29 +145,51 @@ test('purpose or deadline without exclusive exits 64 naming the key; bad values 
   }
 });
 
-test('exclusive without purpose or deadline warns and stays exclusive; with both it is silent', async () => {
+test('exclusive without a purpose, or without a deadline, exits 64 naming the missing key and never enqueues; with both it runs', async () => {
   const ctx = setup();
   const bare = await submit(ctx, { exclusive: true });
-  assert.match(bare.stderr, /exclusive without --exclusive-purpose\/--exclusive-deadline is deprecated; refused from 0\.63\.0/);
-  assert.equal(bare.ticket.exclusive, true, 'never silently downgraded');
-  assert.equal(bare.ticket.exclusivePurpose, undefined);
-  const half = await submit(ctx, { exclusive: true, exclusivePurpose: 'upgrade' });
-  assert.match(half.stderr, /is deprecated; refused from 0\.63\.0/);
-  assert.equal(half.ticket.exclusive, true);
+  assert.equal(bare.result.exitCode, 64);
+  assert.match(bare.stderr, /exclusive requires both a purpose and a deadline; missing exclusivePurpose \(--exclusive-purpose\) and exclusiveDeadlineMs \(--exclusive-deadline\)/);
+  assert.equal(bare.ticket, null);
+  const noDeadline = await submit(ctx, { exclusive: true, exclusivePurpose: 'upgrade' });
+  assert.equal(noDeadline.result.exitCode, 64);
+  assert.match(noDeadline.stderr, /missing exclusiveDeadlineMs \(--exclusive-deadline\)\n/);
+  assert.doesNotMatch(noDeadline.stderr, /missing exclusivePurpose/);
+  assert.equal(noDeadline.ticket, null);
+  const noPurpose = await submit(ctx, { exclusive: true, exclusiveDeadline: '1m' });
+  assert.equal(noPurpose.result.exitCode, 64);
+  assert.match(noPurpose.stderr, /missing exclusivePurpose \(--exclusive-purpose\)\n/);
+  assert.equal(noPurpose.ticket, null);
+  const configured = setup({ lane: { exclusive: true, exclusivePurpose: 'upgrade' } });
+  const configMissing = await submit(configured, {});
+  assert.equal(configMissing.result.exitCode, 64);
+  assert.match(configMissing.stderr, /lane "default": exclusive requires both .* missing exclusiveDeadlineMs/);
   const full = await submit(ctx, { exclusive: true, exclusivePurpose: 'upgrade', exclusiveDeadline: '1m' });
-  assert.doesNotMatch(full.stderr, /deprecated/);
+  assert.equal(full.result.exitCode, 0);
+  assert.equal(full.stderr, '');
   assert.equal(full.ticket.exclusive, true);
 });
 
-test('remoteExclusive: still honoured, with the one deprecation line on stderr (and none for a lane without it)', async () => {
+test('remoteExclusive (true or false) is refused by name with exit 64 on the client and never enqueues', async () => {
+  const expected = 'lane "default": "remoteExclusive" is no longer supported: it holds a whole runner. Remove it and book cpuCores/memoryBytes honestly; leases are CPU-enforced (BRAIN-695).';
+  assert.equal(remoteExclusiveRefusal('default'), expected);
+  for (const value of [true, false]) {
+    const ctx = setup({ lane: { remoteExclusive: value } });
+    const run = await submit(ctx, {});
+    assert.equal(run.result.exitCode, 64, String(value));
+    assert.ok(run.stderr.includes(expected), `${value}: ${run.stderr}`);
+    assert.equal(run.ticket, null);
+  }
+  const clean = await submit(setup({ lane: { remoteExclusive: true } }), { lane: 'plain' });
+  assert.equal(clean.result.exitCode, 64, 'the key is refused at config load wherever the lane sits');
+});
+
+test('a runner refuses a snapshot whose repo config still carries remoteExclusive: 64 at intake, no ticket', async () => {
   const ctx = setup({ lane: { remoteExclusive: true } });
-  const run = await submit(ctx, {});
-  const expected = 'lane-broker: lane "default": "remoteExclusive" is deprecated: it holds a whole runner. Book cpuCores/memoryBytes honestly instead; leases are CPU-enforced (BRAIN-695). Refused from 0.63.0.\n';
-  assert.equal(remoteExclusiveDeprecationMessage('default') + '\n', expected);
-  assert.equal(run.stderr.split(expected).length - 1, 1, `exactly once: ${run.stderr}`);
-  assert.equal(run.result.exitCode, 0, 'behaviour unchanged');
-  const clean = await submit(ctx, { lane: 'plain' });
-  assert.doesNotMatch(clean.stderr, /remoteExclusive/);
+  const intake = await submit(ctx, { configRoot: ctx.repoDir });
+  assert.equal(intake.result.exitCode, 64);
+  assert.match(intake.stderr, /"remoteExclusive" is no longer supported/);
+  assert.equal(intake.ticket, null);
 });
 
 // ---- the supervisor: deadline expiry ----
@@ -239,7 +261,7 @@ test('--detach keeps the deadline: the detached supervisor ends the run at 124, 
 test('a nested same-lane run lives inside the parent: the parent deadline ends both, with no second timer or reset', async () => {
   const ctx = setup({ extraEnv: { LANE_BROKER_TEST_EXCLUSIVE_DEADLINE_MS: String(TEST_DEADLINE_MS) } });
   const pidFile = path.join(ctx.base, 'nested.pid');
-  const script = `node ${JSON.stringify(BIN)} run --repo r --lane default --exclusive -- bash -c 'echo $$ > ${pidFile}; while :; do sleep 0.1; done'`;
+  const script = `node ${JSON.stringify(BIN)} run --repo r --lane default --exclusive --exclusive-purpose upgrade --exclusive-deadline 1m -- bash -c 'echo $$ > ${pidFile}; while :; do sleep 0.1; done'`;
   const result = await laneRun(runArgs(EXCL, bash(script)), { env: ctx.env, cwd: ctx.repoDir });
   assert.equal(result.code, 124, `stderr: ${result.stderr}`);
   assert.equal(historyOf(ctx.state).length, 1, 'the nested run never became a ticket of its own');

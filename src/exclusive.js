@@ -30,7 +30,7 @@ export function oversizedWeightMessage(weight, maxLaneWeight) {
 
 /**
  * BRAIN-695: `exclusive` is a MAINTENANCE class (host upgrade, calibration), never a way to run tests: it names a purpose and
- * carries a hard deadline, after which the supervisor ends the run. 0.62.0 warns when either is missing; 0.63.0 refuses.
+ * carries a hard deadline, after which the supervisor ends the run. Either missing is refused (exit 64).
  */
 export const EXCLUSIVE_PURPOSES = ['upgrade', 'calibration'];
 export const EXCLUSIVE_DEADLINE_MIN_MS = 60_000;
@@ -38,12 +38,10 @@ export const EXCLUSIVE_DEADLINE_MAX_MS = 7_200_000;
 export const EXCLUSIVE_DEADLINE_EXIT = 124;
 export const EXCLUSIVE_DEADLINE_REASON = 'exclusive-deadline';
 
-/** The ONE text for the `remoteExclusive` deprecation; 0.63.0 reuses it for the refusal. */
-export function remoteExclusiveDeprecationMessage(laneName) {
-  return `lane-broker: lane "${laneName}": "remoteExclusive" is deprecated: it holds a whole runner. Book cpuCores/memoryBytes honestly instead; leases are CPU-enforced (BRAIN-695). Refused from 0.63.0.`;
+/** The ONE text for the `remoteExclusive` refusal (config load, on the client and on runner intake). */
+export function remoteExclusiveRefusal(laneName) {
+  return `lane "${laneName}": "remoteExclusive" is no longer supported: it holds a whole runner. Remove it and book cpuCores/memoryBytes honestly; leases are CPU-enforced (BRAIN-695).`;
 }
-
-export const EXCLUSIVE_UNDECLARED_WARNING = 'lane-broker: exclusive without --exclusive-purpose/--exclusive-deadline is deprecated; refused from 0.63.0';
 
 /** The shape problem with a deadline in ms, or null. */
 export function exclusiveDeadlineProblem(ms) {

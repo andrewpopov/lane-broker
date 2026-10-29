@@ -120,16 +120,6 @@ for (const skewMs of [10 * MIN, -10 * MIN]) {
   });
 }
 
-for (const [name, priority, expected] of [['without priority', undefined, 'high'], ['with an explicit medium', 'medium', 'medium']]) {
-  test(`TPWR-674: a remoteExclusive lane ${name} reaches the runner ticket as ${expected}`, async () => {
-    const ctx = remoteSetup();
-    writeRepoConfig(ctx.repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, remoteExclusive: true, ...(priority ? { priority } : {}) } } });
-    const result = await laneRun(['run', '--lane', 'default', '--', ...noopCmd], { env: ctx.env, cwd: ctx.repoDir });
-    assert.equal(result.code, 0, result.stderr);
-    assert.equal(ctx.header().priorityRequested, expected);
-  });
-}
-
 test('remote: the runner applies ITS OWN cap (the submitter would have admitted the high)', async () => {
   const ctx = remoteSetup({ runnerConfig: { maxQueuedHighPerRepo: 0 } });
   const result = await laneRun(['run', '--lane', 'default', '--priority', 'high', '--', ...noopCmd], { env: ctx.env, cwd: ctx.repoDir });

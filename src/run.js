@@ -19,7 +19,7 @@ import { argvFingerprint } from './cpu-estimates.js';
 import { readRows } from './suggest.js';
 import { rightSizedCpuCores } from './right-size.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
-import { isExclusive, oversizedWeight, oversizedWeightMessage, EXCLUSIVE_PURPOSES, EXCLUSIVE_UNDECLARED_WARNING, exclusiveDeadlineProblem, remoteExclusiveDeprecationMessage } from './exclusive.js';
+import { isExclusive, oversizedWeight, oversizedWeightMessage, EXCLUSIVE_PURPOSES, exclusiveDeadlineProblem } from './exclusive.js';
 import { parseScrubCommandEnv, scrubCommandEnv, SCRUB_COMMAND_ENV_VAR } from './scrub-command-env.js';
 import { computeContentKey, decideReuse } from './result-cache.js';
 
@@ -334,7 +334,6 @@ export async function runCommand({
     }
     throw err;
   }
-  if (resolved.remoteExclusive === true && configRoot === undefined) process.stderr.write(`${remoteExclusiveDeprecationMessage(resolved.lane)}\n`);
   const maxExecutionCpuCores = maxExecutionCpuCoresOverride !== undefined
     ? maxExecutionCpuCoresOverride : resolved.maxExecutionCpuCores;
   if (maxExecutionCpuCores !== undefined && (!Number.isInteger(maxExecutionCpuCores) || maxExecutionCpuCores <= 0)) {
@@ -347,10 +346,9 @@ export async function runCommand({
     return { exitCode: 64 };
   }
   // BRAIN-403: exclusive lanes are local only. A runner (configRoot is set only by `lane remote-exec`) never honours an
-  // exclusive from a snapshot's lane config or a flag. BRAIN-649: the one thing it does honour is the lane's own
-  // `remoteExclusive`, which holds the runner (admitted only when it holds nothing else, and nothing else starts meanwhile).
+  // exclusive from a snapshot's lane config or a flag.
   const runnerIntake = configRoot !== undefined;
-  const exclusive = runnerIntake ? resolved.remoteExclusive === true : exclusiveOverride === true || resolved.exclusive === true;
+  const exclusive = !runnerIntake && (exclusiveOverride === true || resolved.exclusive === true);
   if (runnerIntake && (exclusiveOverride === true || resolved.exclusive === true)) {
     process.stderr.write('lane run: exclusive ignored on runner intake (exclusive lanes are local only)\n');
   }
@@ -377,7 +375,10 @@ export async function runCommand({
     } else {
       exclusiveDeadlineMs = resolved.exclusiveDeadlineMs;
     }
-    if (!exclusive) {
+    if (exclusive) {
+      const missing = [...(exclusivePurpose === null ? ['exclusivePurpose (--exclusive-purpose)'] : []), ...(exclusiveDeadlineMs === null ? ['exclusiveDeadlineMs (--exclusive-deadline)'] : [])];
+      if (missing.length > 0) return refuse(`lane "${resolved.lane}": exclusive requires both a purpose and a deadline; missing ${missing.join(' and ')}`);
+    } else {
       if (exclusivePurpose !== null) return refuse(`lane "${resolved.lane}": exclusivePurpose is set but the run is not exclusive; it applies only to an exclusive run`);
       if (exclusiveDeadlineMs !== null) return refuse(`lane "${resolved.lane}": exclusiveDeadlineMs is set but the run is not exclusive; it applies only to an exclusive run`);
     }
@@ -385,7 +386,7 @@ export async function runCommand({
   // BRAIN-380: resolved and validated before the reentrancy check below, so a bad value exits 64 on every path.
   let priority;
   try {
-    priority = resolvePriority({ cli: priorityOverride, env: process.env.LANE_BROKER_PRIORITY, configTier: resolved.priority, exclusive: exclusive || resolved.remoteExclusive === true });
+    priority = resolvePriority({ cli: priorityOverride, env: process.env.LANE_BROKER_PRIORITY, configTier: resolved.priority, exclusive });
   } catch (err) {
     if (err instanceof ConfigError) {
       process.stderr.write(`lane run: ${err.message}\n`);
@@ -588,8 +589,6 @@ export async function runCommand({
     process.stderr.write(`lane run: ${oversizedWeightMessage(weight, globalCfg.maxLaneWeight)}\n`);
     return { exitCode: 64 };
   }
-
-  if (exclusive && !runnerIntake && (exclusivePurpose === null || exclusiveDeadlineMs === null)) process.stderr.write(`${EXCLUSIVE_UNDECLARED_WARNING}\n`);
 
   const root = ensureStateDirs().root;
   // BRAIN-549/700: a run gets a content key unless caching is off for it or both TTLs are 0; a runner (snapshot intake) and an exclusive never key.
@@ -821,7 +820,6 @@ export async function runCommand({
       // this process resolved, not a re-derived value.
       requires: resolved.requires,
       requiresTags: resolved.requiresTags,
-      remoteExclusive: resolved.remoteExclusive,
       remoteDeps: resolved.remoteDeps,
       remoteSetup: resolved.remoteSetup,
       remoteDepsCache: resolved.remoteDepsCache,
