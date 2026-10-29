@@ -3,7 +3,7 @@ import path from 'node:path';
 import { paths, atomicWriteJson, appendHistory, withLock } from './state.js';
 import { readAttempt, listAttempts, supervisorAlive, publishTerminal } from './attempts.js';
 import { readLease } from './lease.js';
-import { listQueue, listRebindingIds, reapOrphanedQueue } from './scheduler.js';
+import { listQueue, listRebindingIds, reapOrphanedQueue, DEAD_QUEUED_SUPERVISOR_REASON } from './scheduler.js';
 import { terminalRowDefaults } from './resources.js';
 import { writeBrokerLog } from './admission.js';
 
@@ -31,7 +31,7 @@ export async function settleAbandonedLocalAttempt(root, id) {
       attempt.generation,
       () => {
         if (fs.existsSync(resultPath)) return;
-        written = { id, exit: 75, signal: null, executor: 'local', startedAt: null, endedAt: Date.now(), waitedMs: null, cancelled: false, reason: 'supervisor-died-while-queued', reconciled: true };
+        written = { id, exit: 75, signal: null, executor: 'local', startedAt: null, endedAt: Date.now(), waitedMs: null, cancelled: false, reason: DEAD_QUEUED_SUPERVISOR_REASON, reconciled: true };
         atomicWriteJson(resultPath, written);
         appendHistory(root, { ...terminalRowDefaults(attempt), ...written, runner: attempt.runner ?? null });
       },
@@ -66,7 +66,7 @@ export async function settleAbandonedLocalAttempts(root) {
     .sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0));
   for (const attempt of candidates) {
     const outcome = await settleAbandonedLocalAttempt(root, attempt.id);
-    if (outcome.settled) results.push({ id: attempt.id, runner: attempt.runner, state: 'lost', exit: outcome.exit, reason: 'supervisor-died-while-queued' });
+    if (outcome.settled) results.push({ id: attempt.id, runner: attempt.runner, state: 'lost', exit: outcome.exit, reason: DEAD_QUEUED_SUPERVISOR_REASON });
   }
   return results;
 }

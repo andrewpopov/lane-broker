@@ -542,7 +542,7 @@ What a remote run does:
    A queued ticket whose supervisor is provably dead (pid gone, start time changed, or a different boot; an
    indeterminate probe counts as alive) is an orphan, e.g. after a runner reboot. It is reaped under the broker
    lock by every admission poll, `lane status` and `remote-probe`, so it never holds a `maxRemoteQueue` slot: it
-   is dequeued, its result is published as exit 75 (`supervisor gone before admission (host restart?)`) and a
+   is dequeued, its result is published as exit 75 (`supervisor-died-while-queued`, `reconciled: true`, so `lane wait` names it as lost) and a
    history row is written. Leases are not touched here; the lease reaper owns them.
    A run queued this way records `queuedAt: "<runner>(<queued at pick time>)"`
    in its result and attempt record and logs `lane: queuing on ...`. The

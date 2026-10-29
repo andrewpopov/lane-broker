@@ -493,6 +493,9 @@ export async function retierQueued(root, id, tier, cfg, { reloadConfig = (c) => 
   });
 }
 
+/** The reason on every result settled because a queued ticket's supervisor died before admission (BRAIN-457, BRAIN-605). */
+export const DEAD_QUEUED_SUPERVISOR_REASON = 'supervisor-died-while-queued';
+
 /**
  * BRAIN-457: dequeue every queued ticket whose supervisor is gone, nothing else (leases are `reapAll`'s). Nothing polls for
  * such a ticket any more, so it would hold queue slots (`maxRemoteQueue`) forever. Publishes the terminal exit-75 result a
@@ -506,7 +509,7 @@ export function reapOrphanedQueue(root, keepTicketId) {
     // Publish first: a ticket whose result cannot be written stays queued and is retried on the next pass, so a submitter
     // reconciling later never finds neither.
     try {
-      atomicWriteJson(t.resultPath, { id: t.id, exit: 75, signal: null, startedAt: null, endedAt, waitedMs: null, cancelled: false, reason: 'supervisor gone before admission (host restart?)' });
+      atomicWriteJson(t.resultPath, { id: t.id, exit: 75, signal: null, startedAt: null, endedAt, waitedMs: null, cancelled: false, reason: DEAD_QUEUED_SUPERVISOR_REASON, reconciled: true });
     } catch (err) {
       writeBrokerLog(root, `reap ${t.id}: could not publish result, leaving it queued: ${err.message}\n`);
       continue;
