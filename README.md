@@ -43,6 +43,7 @@ lane status [--json]
 lane capabilities --json
 lane suggest [--repo <name>] [--days 7] [--json]
 lane report cost --repo zirkbot,jun --since 2026-10-01 --until 2026-10-08 --prs zirkbot=z.json,jun=j.json [--json]   # gate-cost scorecard (BRAIN-529)
+lane report losses --since 2026-10-01 --until 2026-10-08 [--repo zirkbot] [--json]   # runner losses and re-dispatches (BRAIN-350)
 lane cancel <id>
 lane lease-check <id>                    # exit 0 only if <id> is a live lease on this host (BRAIN-553)
 lane priority <id> high|medium|low       # re-tier a queued ticket in place (BRAIN-518)
@@ -1175,6 +1176,10 @@ waiting on them) forever. Two ways to settle them as lost (exit `75`; a job's ou
   included, clears it, and a runner that answers `running` keeps its attempt (the no-rerun guarantee holds until the bound).
 
 `lane wait` on a settled-lost attempt exits `75` and prints the reason on stderr.
+
+**Losses are now re-dispatched (BRAIN-350).** A `runner-shutdown` record re-dispatches the work at once. A dropped runner keeps its
+supervisor waiting for proof (the `offline` flag, `runnerLostAfterMs`, or the runner's own record), then re-dispatches to another
+runner before falling back to local. `remoteLostPollMs` (default 60000; `0` = exit at once, as before) sets that poll.
 
 **The runner heartbeat (BRAIN-597).** Reconcile only runs when someone asks, so a runner that died with nothing on it was never
 noticed, and placement re-probed it (about 6 s each) on every submission. `lane runner watch` is one tick, run every 60 s by a
@@ -2833,6 +2838,13 @@ journal `enqueue` (an eject keeps it; `remove`/`drop` resets it) to `landed`: p5
 listed apart. `--prs` takes `gh pr list --json number,mergedAt,closedAt,labels` output: run it with
 `--state merged --search 'merged:>=<since>'` and again with `--state closed --label train-landed
 --search 'closed:>=<since>'`, concatenate the arrays, and pass one file per repo (`repo=file,...`).
+
+### Runner losses: `lane report losses` (BRAIN-350)
+
+`lane report losses --since <iso> --until <iso> [--repo <a[,b]>] [--history <file>] [--json]` reads the history rows in
+`[since, until)` (by `startedAt`; every repo unless `--repo`) and prints, per runner: settled-lost rows by `reason` with the
+lane-hours spent before settling (`endedAt - startedAt`), re-dispatched rows by `redispatchReason` (one per runner in
+`redispatchedFrom`), and local fallbacks by `localReason: fallback:<reason>`, plus a total line. Rows without these fields are ignored.
 
 ### Where a remote run spends its time: `lane report phases` (BRAIN-530)
 

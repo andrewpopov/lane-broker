@@ -33,12 +33,16 @@ import { writeBrokerLog } from './admission.js';
  * `now` (ms epoch) is the clock for the unreachable bound; `assumeDown` skips contacting the runner because this sweep already found it
  * unreachable (only the offline flag and the bound can settle then).
  *
+ * `self` (BRAIN-350 S3): the caller is the supervisor that OWNS the attempt (`attempt.supervisor.pid === process.pid`), waiting for proof
+ * before it re-dispatches. It is not skipped for being alive, its publish fence accepts itself, an `adopted` outcome is published as
+ * usual, but a `lost` outcome is NOT published: it returns `{ settled: false, state: 'lost', reason, lostDetail }` for the caller to act on.
+ *
  * Returns `{ settled, state, exit?, reason?, transport?, timedOut? }` (`transport: true`: the runner gave no usable answer at all, so
  * asking it about another attempt would fail the same way); never throws.
  */
-export async function reconcileRemoteAttempt(root, id, { globalCfg, sshBin = 'ssh', env, deadlineMs = 30_000, deadlineAt, now = Date.now(), assumeDown = false } = {}) {
+export async function reconcileRemoteAttempt(root, id, { globalCfg, sshBin = 'ssh', env, deadlineMs = 30_000, deadlineAt, now = Date.now(), assumeDown = false, self = false } = {}) {
   try {
-    return await reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt, now, assumeDown });
+    return await reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt, now, assumeDown, self });
   } catch (err) {
     // the clock lock stayed held past the caller's deadline: the same outcome as an ssh call that ran out of time
     if (err instanceof LockTimeoutError && deadlineAt !== undefined) return waitTimedOut();
@@ -46,35 +50,39 @@ export async function reconcileRemoteAttempt(root, id, { globalCfg, sshBin = 'ss
   }
 }
 
+/** The attempt's supervisor is this very process and the caller said it is the one asking. */
+const ownedBySelf = (attempt, self) => self === true && attempt.supervisor?.pid === process.pid;
+
 const skipped = (reason) => ({ settled: false, state: 'skipped', reason });
 
 const MIN_CALL_MS = 250;
 const waitTimedOut = () => ({ settled: false, state: 'unreachable', reason: 'wait timeout reached', timedOut: true });
 
-async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt, now, assumeDown }) {
+async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt, now, assumeDown, self }) {
   const resultPath = path.join(paths(root).results, `${id}.json`);
   const attempt = readAttempt(root, id);
   if (!attempt) return skipped('no attempt record');
   if (attempt.executor !== 'remote') return skipped('not a remote attempt');
-  if (supervisorAlive(attempt)) return skipped('its supervisor is alive');
+  if (supervisorAlive(attempt) && !ownedBySelf(attempt, self)) return skipped('its supervisor is alive');
   if (attempt.moving) return skipped('a runner-to-runner move was interrupted');
   if (fs.existsSync(resultPath)) return skipped('already settled');
 
   if (neverDispatched(attempt)) {
-    return publishSettled(root, id, attempt, resultPath, 'lost', () => lostResult(id, attempt, 'never-dispatched', 'supervisor died before dispatching to any runner'), neverDispatched);
+    return publishSettled(root, id, attempt, resultPath, 'lost', () => lostResult(id, attempt, 'never-dispatched', 'supervisor died before dispatching to any runner'), { stillEligible: neverDispatched, self });
   }
 
   const runner = (globalCfg?.runners ?? []).find((r) => r.name === attempt.runner);
   if (!runner) return { settled: false, state: 'unreachable', reason: 'runner not configured' };
 
   if (runner.offline) {
-    return publishSettled(root, id, attempt, resultPath, 'lost', () => lostResult(id, attempt, 'runner-offline', `runner ${runner.name} is marked offline in the config; not contacted`));
+    return publishSettled(root, id, attempt, resultPath, 'lost', () => lostResult(id, attempt, 'runner-offline', `runner ${runner.name} is marked offline in the config; not contacted`), { self });
   }
   const publishUnreachable = (since) => {
     const unreachableMs = now - since;
     if (!(globalCfg.runnerLostAfterMs > 0) || unreachableMs <= globalCfg.runnerLostAfterMs) return null;
     return publishSettled(root, id, attempt, resultPath, 'lost', () =>
       lostResult(id, attempt, 'runner-lost', `runner ${runner.name} unreachable for ${Math.round(unreachableMs / 60_000)} min (limit ${Math.round(globalCfg.runnerLostAfterMs / 60_000)} min)`),
+      { self },
     );
   };
   const unreachable = async (outcome) => {
@@ -100,7 +108,7 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
   }
   await recordContact(root, runner.name, true, now, { deadlineAt });
 
-  const publish = (kind, build) => publishSettled(root, id, attempt, resultPath, kind, build);
+  const publish = (kind, build) => publishSettled(root, id, attempt, resultPath, kind, build, { self });
 
   if (!fetched.missing) return await adoptOrAmbiguous(attempt, id, fetched, publish);
   if (fetched.state === 'queued' || fetched.state === 'running') return { settled: false, state: 'running' };
@@ -174,7 +182,11 @@ async function adoptOrAmbiguous(attempt, id, record, publish) {
 
 /** Publish through the shared exactly-once path. The fence ties the publish to the attempt this reconcile read: a record that
  *  changed hands (another runner, a restarted supervisor, a move) meanwhile is left alone. */
-async function publishSettled(root, id, attempt, resultPath, kind, buildResult, stillEligible = () => true) {
+async function publishSettled(root, id, attempt, resultPath, kind, buildResult, { stillEligible = () => true, self = false } = {}) {
+  if (self && kind === 'lost') {
+    const { reason, lostDetail } = buildResult();
+    return { settled: false, state: 'lost', reason, lostDetail };
+  }
   let written = null;
   const published = await publishTerminal(
     root,
@@ -199,7 +211,7 @@ async function publishSettled(root, id, attempt, resultPath, kind, buildResult, 
         cur.generation === attempt.generation &&
         cur.startedAt === attempt.startedAt &&
         !cur.moving &&
-        !supervisorAlive(cur) &&
+        (!supervisorAlive(cur) || ownedBySelf(cur, self)) &&
         stillEligible(cur),
     },
   );

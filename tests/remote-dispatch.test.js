@@ -90,7 +90,7 @@ test('die-midstream: falls back to local and reports the LOCAL exit', async () =
 });
 
 test('result-tamper: a record that does not bind proves nothing, so the ticket is NOT run locally (it may be live) and stays reported', { timeout: 300_000 }, async () => {
-  const { env, state, repoDir } = setup({ ssh: 'result-tamper' });
+  const { env, state, repoDir } = setup({ ssh: 'result-tamper', globalExtra: { remoteLostPollMs: 0 } });
   const marker = path.join(tmpDir('marker'), 'where');
   const { id, waited } = await detachAndWait(
     ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 9)],
@@ -695,7 +695,7 @@ test('remote run: a result from a runner that reports no queuedMs still gets a w
 // ---- BRAIN-363: an unconfirmed expiry cancel must never lead to a second (local) execution ----
 
 test('remote run: result-wait expiry with an unconfirmed cancel is never re-run locally, and the attempt stays reported and cancellable', { timeout: 300_000 }, async () => {
-  const { env, state, repoDir } = setup({ ssh: 'stuck-running', remoteResultWaitMs: 1 });
+  const { env, state, repoDir } = setup({ ssh: 'stuck-running', remoteResultWaitMs: 1, globalExtra: { remoteLostPollMs: 0 } });
   const marker = path.join(tmpDir('marker'), 'where');
   const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], env, repoDir, '4s');
   // BRAIN-515: `lane wait` asks the runner, which still reports the job running, so it keeps waiting (75) rather than giving up
@@ -716,7 +716,7 @@ test('remote run: result-wait expiry with an unconfirmed cancel is never re-run 
 // ---- BRAIN-437: a dispatch the runner may have accepted is never re-run locally without proof it never started ----
 
 test('BRAIN-437: ssh dropped after the runner took the job, fetches all failing, withdraw not confirmed: not re-run locally, attempt kept and cancellable', { timeout: 300_000 }, async () => {
-  const { env, state, repoDir } = setup({ ssh: 'drop-stuck' });
+  const { env, state, repoDir } = setup({ ssh: 'drop-stuck', globalExtra: { remoteLostPollMs: 0 } });
   const marker = path.join(tmpDir('marker'), 'where');
   const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], env, repoDir, '90s');
   assert.equal(waited.code, 75, `stderr: ${waited.stderr}`);
