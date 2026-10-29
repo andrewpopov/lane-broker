@@ -997,6 +997,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     await updateAttempt(root, enriched.id, gen, { moving: undefined });
   };
   const dispatchedAt = Date.now(); // the FIRST dispatch: waitedMs includes the time spent queued on every runner before the last
+  let epochDispatchedAt = dispatchedAt; // BRAIN-350: when the current runner got the ticket; a runner that stopped it adds all of it to the wait
   let dispatch;
   let lastTransferStats = null;
   while (true) {
@@ -1108,6 +1109,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       if (!picked.runner) break;
       const from = runner;
       epoch += 1;
+      priorRemoteQueuedMs += Math.max(0, Date.now() - epochDispatchedAt);
+      epochDispatchedAt = Date.now();
       visited.push(picked.runner.name);
       moves.push({ from: from.name, to: picked.runner.name, at: Date.now(), reason: RUNNER_SHUTDOWN_REASON });
       runner = picked.runner;
@@ -1139,6 +1142,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     epoch += 1;
     visited.push(to.runner.name);
     lastMoveAt = Date.now();
+    epochDispatchedAt = lastMoveAt;
     priorRemoteQueuedMs += dispatch.waitedOnRunnerMs;
     const move = { from: from.name, to: to.runner.name, at: lastMoveAt, queuedMs: dispatch.queuedMs, reason: dispatch.reason ?? QUEUED_TOO_LONG_REASON, ...(dispatch.drainReason === undefined ? {} : { drainReason: dispatch.drainReason }) };
     moves.push(move);
@@ -1752,6 +1756,8 @@ async function main() {
   let cancelling = false;
   let deadlineExpired = false;
   let leaderExited = false; // set on 'exit', before stdio drains: a command that ended on its own is never expired by its deadline
+  let leaderExitedBeforeCancel = false; // BRAIN-350: a cancel that lands while a finished command drains its output stopped nothing
+  let reapComplete = null; // BRAIN-350: the reap's own verdict (every tracked descendant confirmed gone), null until one ran
   let watchdogKill = null; // BRAIN-431/576: the watchdog reason (no-progress | silence) that began the reap; the first one wins
   let killPromise = null;
 
@@ -1761,6 +1767,7 @@ async function main() {
   async function killTree(reason) {
     descendants.scan(); // the leader may still be alive: catches anything spawned since the last heartbeat
     const [, result] = await Promise.all([killGroup(child.pid), descendants.reap({ graceMs: cancelGraceMs() })]);
+    reapComplete = result.complete === true;
     // an incomplete reap is logged but never wedges the lease: the lease is still released
     writeBrokerLog(root, reapLogLine(ticket.id, result, reason));
     // BRAIN-651 L3: the group and tracked-descendant signals above cannot reach a setsid'd process the tracker lost; stopping the scope can
@@ -1881,7 +1888,10 @@ async function main() {
       stderrForward?.write(message);
       exitCode = EXCLUSIVE_DEADLINE_EXIT;
     } else if (cancelling) {
-      result = { ...result, exit: 130, signal: null, cancelled: true };
+      // BRAIN-350 `stopProven`: this cancel is what ended the command and the reap confirmed every tracked process gone. A runner
+      // turns only such a result into its `runner-shutdown` proof, which lets the submitter run the job again elsewhere.
+      const stopProven = !leaderExitedBeforeCancel && reapComplete === true;
+      result = { ...result, exit: 130, signal: null, cancelled: true, ...(stopProven ? { stopProven: true } : {}) };
       exitCode = 130;
     } else if (watchdogKill) {
       // BRAIN-431: the kill's own signal is not the story; it is `timeout`'s 124, with the window that elapsed
@@ -2016,6 +2026,7 @@ async function main() {
   let groupReaped = false;
   child.on('exit', () => {
     leaderExited = true;
+    if (!cancelling) leaderExitedBeforeCancel = true;
     memoryPeak.sample(); // first, while the scope still exists
     if (finished || cancelling || watchdogKill) return;
     if (!isGroupAlive(child.pid) && !hasLiveMembers(descendants)) return;

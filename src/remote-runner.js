@@ -7,7 +7,7 @@ import { childExitSafeFlags } from './node-exit-safe.js';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, readRemoteDrain, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath, RUNNER_SHUTDOWN_REASON } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, readRemoteDrain, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath, RUNNER_SHUTDOWN_REASON, RUNNER_SHUTDOWN_UNPROVEN_REASON } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, RUNNER_NAME_RE, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
 import { advertisedCapabilities } from './capabilities.js';
@@ -26,6 +26,7 @@ import { collectStatus } from './status.js';
 import { readLease, isSupervisorAlive, listLeasesStrict, listLeases } from './lease.js';
 import { readAttempt, listAttemptsStrict } from './attempts.js';
 import { listQueue, listQueueStrict, dequeueSync, HELD_STATES } from './scheduler.js';
+import { touchSimArmFor } from './sim-arm.js';
 import { REMOTE_TMP_BASE, TMP_OWNER_FILE, gcRemoteTickets, removeDetached } from './gc.js';
 import { writeBrokerLog, cpuHeadroomCores } from './admission.js';
 import { measureHostCpuReadOnly } from './cpu.js';
@@ -596,6 +597,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   const cancelledMarker = path.join(ticketDir, 'cancelled');
   const shutdownMarker = path.join(ticketDir, 'shutdown');
   const remoteLaneId = crypto.randomUUID();
+  let refusedAtStart = false; // BRAIN-350: onTicketCreated refused, so run.js never spawned a supervisor and nothing ran
 
   // Belt and braces alongside `configRoot`/`repoIdentityOverride` below: no
   // git invocation the child (or anything it shells out to) makes can ever
@@ -691,7 +693,10 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
         if (!fs.existsSync(shutdownMarker) && readRemoteDrain(stateHome())?.shutdown) atomicWriteFile(shutdownMarker, String(Date.now()));
         return fs.existsSync(cancelledMarker) || fs.existsSync(shutdownMarker);
       });
-      if (cancelledEarly) return false;
+      if (cancelledEarly) {
+        refusedAtStart = true;
+        return false;
+      }
       // Test-only seam (BRAIN-319): hold here, right after the ticket-local
       // `cancelled` check above has already come back false, until the named
       // file appears -- lets a test deterministically land `lane
@@ -750,12 +755,8 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     // fallback log line.
     kind = 'unfinished';
     reason = 'queue-timeout';
-  } else if (!cancelled && fs.existsSync(shutdownMarker) && (!structured || structured.cancelled === true)) {
-    // BRAIN-350: `lane drain --shutdown` stopped this ticket (or it arrived after the drain), so the host is going down and
-    // nothing here finished it. A job that completed on its own before the stop keeps its real record (structured.cancelled
-    // is not true); a user cancel wins (`cancelled`).
+  } else if ((reason = shutdownStopReason({ cancelled, shutdownMarked: fs.existsSync(shutdownMarker), refusedAtStart, unstarted: fs.existsSync(path.join(ticketDir, 'shutdown-unstarted')), structured })) !== null) {
     kind = 'unfinished';
-    reason = RUNNER_SHUTDOWN_REASON;
   } else if (structured) {
     exit = structured.exit;
     signal = structured.signal;
@@ -1232,6 +1233,21 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
 }
 
 /**
+ * BRAIN-350: the `reason` of the record for a ticket `lane drain --shutdown` marked, or null when the shutdown does not decide it.
+ * `runner-shutdown` lets the submitter run the job again elsewhere, so only a PROVEN stop produces it: refused before anything ran,
+ * found unleased by the shutdown sweep, which dequeued or fenced it so it can never start (`unstarted`), or a cancel that ended the command with every process confirmed
+ * gone (`stopProven`, set by the local supervisor). A stop it cannot prove (the supervisor died with no result, an incomplete reap,
+ * a command that had already exited and was draining output) is `runner-shutdown-unproven`: possibly still running. A user cancel
+ * wins, and a job that completed on its own keeps its real record.
+ */
+export function shutdownStopReason({ cancelled, shutdownMarked, refusedAtStart, unstarted, structured }) {
+  if (cancelled || !shutdownMarked) return null;
+  if (refusedAtStart || unstarted || structured?.stopProven === true) return RUNNER_SHUTDOWN_REASON;
+  if (!structured || structured.cancelled === true) return RUNNER_SHUTDOWN_UNPROVEN_REASON;
+  return null;
+}
+
+/**
  * BRAIN-350: `lane drain --shutdown`, step two. Marks every unpublished ticket under `root` with a `shutdown` marker and stops
  * the registered ones in the local broker (broker cancel marker + `cancelCommand`), all under the broker lock `remote-cancel` and
  * `onTicketCreated` use, so an exec either sees the marker or is seen here. It never writes the ticket's `cancelled` marker: that
@@ -1264,7 +1280,16 @@ export async function remoteShutdownCommand({ root = defaultRemoteRoot(), waitMs
       }
       if (recorded !== null && isUuid(recorded)) {
         writeCancelMarkerFile(brokerRoot, recorded);
-        toStop.push(recorded);
+        // Not leased yet: it can never start now. A queued ticket is dequeued here, under the lock the scheduler moves a ticket
+        // from queue to lease under; one not yet enqueued meets the cancel marker just written, which the scheduler checks under
+        // that same lock before any start. The `shutdown-unstarted` marker is that proof, written before its supervisor can exit.
+        const queued = listQueue(brokerRoot).find((t) => t && t.id === recorded);
+        if (queued) {
+          dequeueSync(brokerRoot, recorded);
+          touchSimArmFor(brokerRoot, queued);
+        }
+        if (queued || !readLease(brokerRoot, recorded)) atomicWriteFile(path.join(ticketDir, 'shutdown-unstarted'), String(Date.now()));
+        if (!queued) toStop.push(recorded);
       }
     }
   });

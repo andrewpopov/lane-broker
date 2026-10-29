@@ -8,6 +8,7 @@ import { freshEnv, writeGlobalConfig, BIN, laneRun, waitFor } from './helpers.js
 import { encodeSnapshot } from '../src/remote-stream.js';
 import { paths, readJsonSafe, readRemoteDrain, writeRemoteDrain, clearRemoteDrain, RUNNER_SHUTDOWN_REASON } from '../src/state.js';
 import { makeTmpDir } from './helpers/tmp.js';
+import { shutdownStopReason } from '../src/remote-runner.js';
 
 /**
  * BRAIN-350 S1 (runner side): `lane drain --shutdown` stops new remote work and stops every in-flight remote ticket with an
@@ -170,4 +171,19 @@ test('plain drain is not a shutdown drain, survives a boot change, and undrain c
     if (prev === undefined) delete process.env.LANE_BROKER_BOOT_ID;
     else process.env.LANE_BROKER_BOOT_ID = prev;
   }
+});
+
+test('shutdownStopReason: only a proven stop yields runner-shutdown (Codex P1s on BRAIN-350)', () => {
+  const base = { cancelled: false, shutdownMarked: true, refusedAtStart: false };
+  const proven = 'runner-shutdown';
+  const unproven = 'runner-shutdown-unproven';
+  assert.equal(shutdownStopReason({ ...base, refusedAtStart: true, structured: null }), proven, 'refused before anything ran');
+  assert.equal(shutdownStopReason({ ...base, unstarted: true, structured: null }), proven, 'found unleased by the sweep: dequeued or fenced');
+  assert.equal(shutdownStopReason({ ...base, structured: { id: 'x', exit: null, signal: 'SIGKILL', startedAt: null, cancelled: true } }), unproven, 'an orphan-lease kill result is not proof');
+  assert.equal(shutdownStopReason({ ...base, structured: { cancelled: true, startedAt: 1, exit: 130, stopProven: true } }), proven, 'cancel ended it, reap complete');
+  assert.equal(shutdownStopReason({ ...base, structured: null }), unproven, 'supervisor died with no result: the child may live');
+  assert.equal(shutdownStopReason({ ...base, structured: { cancelled: true, startedAt: 1, exit: 130 } }), unproven, 'incomplete reap, or the command had already exited');
+  assert.equal(shutdownStopReason({ ...base, structured: { cancelled: false, startedAt: 1, exit: 0 } }), null, 'completed on its own keeps its record');
+  assert.equal(shutdownStopReason({ ...base, cancelled: true, refusedAtStart: true, structured: null }), null, 'a user cancel wins');
+  assert.equal(shutdownStopReason({ ...base, shutdownMarked: false, unstarted: true, structured: null }), null, 'no shutdown, no say');
 });

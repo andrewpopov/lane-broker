@@ -464,6 +464,8 @@ export const DRAIN_UNREADABLE_REASON = 'drain marker unreadable';
 const DEFAULT_DRAIN_REASON = 'drained by operator';
 /** BRAIN-350: the `reason` of an `unfinished` runner record for a job the runner stopped because its host is shutting down. */
 export const RUNNER_SHUTDOWN_REASON = 'runner-shutdown';
+/** BRAIN-350: the same stop when the runner cannot prove the job is dead; the submitter treats it as possibly still running. */
+export const RUNNER_SHUTDOWN_UNPROVEN_REASON = 'runner-shutdown-unproven';
 
 /** A drain reason is shown to operators and in submitter logs: no ANSI/control characters, one line, at most 200 chars. */
 export function sanitizeDrainReason(raw) {
