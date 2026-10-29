@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
+import { makeTmpDir } from './helpers/tmp.js';
 import { buildLossesReport, renderLossesText, lossesReportCommand } from '../src/losses-report.js';
 
 const REPO = '_Volumes_Lexar_proj_foo_.git';
@@ -52,8 +52,8 @@ test('per runner counts by reason, lane-hours, redispatches and fallbacks; windo
   assert.match(text, /total: 6 lost \(5\.0 lane-hours\), 3 re-dispatched, 1 local fallbacks/);
 });
 
-test('command: --json and text from a history file, repo optional', async () => {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'losses-'));
+test('command: --json and text from a history file, repo optional', async (t) => {
+  const dir = makeTmpDir('losses-', t);
   const file = path.join(dir, 'history.jsonl');
   fs.writeFileSync(file, `${rows.map((r) => JSON.stringify(r)).join('\n')}\n`);
   const run = async (extra) => {
