@@ -9,7 +9,7 @@ import { ensureStateDirs, writeReleasedMarkerFile, withLock, paths, stateHome, r
 import { classTransportMismatch } from './classes.js';
 import { remoteExcludePreflight } from './remote-exclude.js';
 import { MIN_CPU_GRANT_CORES } from './cpu-limit.js';
-import { resolveTicketConfig, reloadGlobalConfig, isDispatchOnly, resolvePriority, assertHostConfigHookless, ConfigError } from './config.js';
+import { resolveTicketConfig, reloadGlobalConfig, isDispatchOnly, resolvePriority, assertHostConfigHookless, ConfigError, CONFIG_FROM_ENV } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
 import { writePending } from './pending.js';
@@ -100,11 +100,20 @@ function gitTreeAndRoot(cwd) {
   return { headTree: lines?.[0] || null, checkoutRoot: lines?.[1] || null };
 }
 
+/** BRAIN-552: the approval a parsed committed `.lane-broker.json` gives `lane`. An explicit lane with no cpuCores claims its weight, as resolveTicketResources does. */
+function laneApprovalFrom(committed, lane) {
+  const declared = committed?.lanes && Object.prototype.hasOwnProperty.call(committed.lanes, lane) ? committed.lanes[lane] : null;
+  if (declared === null || typeof declared !== 'object') return { ceiling: null, reason: `lane "${lane}" is not declared in the committed .lane-broker.json` };
+  const ceiling = declared.cpuCores ?? declared.weight;
+  return Number.isFinite(ceiling) ? { ceiling, reason: `the committed .lane-broker.json declares lane "${lane}" at cpu ${ceiling}` } : { ceiling: null, reason: `lane "${lane}" declares no cpu in the committed .lane-broker.json` };
+}
+
 /**
- * BRAIN-552: the cpuCores `lane` declares under `lanes` in the COMMITTED `.lane-broker.json` (`git show HEAD:`, never the working tree),
- * or why it is not approved. An explicit lane with no cpuCores claims its weight, as resolveTicketResources does.
+ * BRAIN-552: the cpuCores `lane` declares under `lanes` in the COMMITTED `.lane-broker.json`, or why it is not approved. When the config
+ * came from the default branch (BRAIN-713) that text is the committed one; otherwise `git show HEAD:` (never the working tree).
  */
-function committedLaneApproval(checkoutRoot, lane) {
+function committedLaneApproval(checkoutRoot, lane, configSource) {
+  if (configSource.from === 'default-branch') return laneApprovalFrom(JSON.parse(configSource.text), lane);
   if (!checkoutRoot) return { ceiling: null, reason: 'there is no git checkout' };
   let committed;
   try {
@@ -114,10 +123,7 @@ function committedLaneApproval(checkoutRoot, lane) {
   } catch {
     return { ceiling: null, reason: 'there is no committed .lane-broker.json' };
   }
-  const declared = committed?.lanes && Object.prototype.hasOwnProperty.call(committed.lanes, lane) ? committed.lanes[lane] : null;
-  if (declared === null || typeof declared !== 'object') return { ceiling: null, reason: `lane "${lane}" is not declared in the committed .lane-broker.json` };
-  const ceiling = declared.cpuCores ?? declared.weight;
-  return Number.isFinite(ceiling) ? { ceiling, reason: `the committed .lane-broker.json declares lane "${lane}" at cpu ${ceiling}` } : { ceiling: null, reason: `lane "${lane}" declares no cpu in the committed .lane-broker.json` };
+  return laneApprovalFrom(committed, lane);
 }
 
 /** git's toplevel is realpath'd, so the fingerprint's cwd must be too; a vanished cwd keeps its given path. */
@@ -350,6 +356,10 @@ export async function runCommand({
     }
     throw err;
   }
+  const { configSource } = resolved;
+  if (configRoot === undefined && configSource.from === 'default-branch' && configSource.differs) {
+    process.stderr.write(`lane run: using .lane-broker.json from ${configSource.ref} (${configSource.blob.slice(0, 7)}), not this worktree's copy; set ${CONFIG_FROM_ENV}=worktree to test an uncommitted config\n`);
+  }
   const maxExecutionCpuCores = maxExecutionCpuCoresOverride !== undefined
     ? maxExecutionCpuCoresOverride : resolved.maxExecutionCpuCores;
   if (maxExecutionCpuCores !== undefined && (!Number.isInteger(maxExecutionCpuCores) || maxExecutionCpuCores <= 0)) {
@@ -472,7 +482,7 @@ export async function runCommand({
   }
   let cappedMinCpuCores = requestedMinCpuCores;
   if (!runnerIntake && !exclusive) {
-    const approval = committedLaneApproval(checkoutRoot, resolved.lane);
+    const approval = committedLaneApproval(checkoutRoot, resolved.lane, resolved.configSource);
     const cap = capUnapprovedCpu({
       cpuCores: requestedCpuCores,
       minCpuCores: requestedMinCpuCores,
@@ -736,6 +746,8 @@ export async function runCommand({
     repoId: resolved.repoId,
     lane: resolved.lane,
     ...(resolved.configLane ? { configLane: resolved.configLane } : {}),
+    ...(configSource.from === 'default-branch' ? { configFrom: 'default-branch', configBlob: configSource.blob } : {}),
+    ...(configSource.from === 'worktree-override' ? { configFrom: 'worktree-override' } : {}),
     weight,
     resources,
     ...(maxExecutionCpuCores !== undefined ? { maxExecutionCpuCores } : {}),

@@ -4,7 +4,7 @@ import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { paths, stateHome } from './state.js';
 import { scheduleProblem } from './runner-schedule.js';
-import { isCanonicalRelPath } from './remote-manifest.js';
+import { isCanonicalRelPath, scrubbedGitEnv } from './remote-manifest.js';
 import { remoteExcludeShapeProblem, remoteExcludeConflict, excludingPattern } from './remote-exclude.js';
 import { unsupportedHookKeys, hookRefusalMessage, EXCLUSIVE_PURPOSES, exclusiveDeadlineProblem, remoteExclusiveRefusal } from './exclusive.js';
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
@@ -1107,15 +1107,105 @@ export function findRepoConfigPath(cwd, gitCommonDir, configRoot) {
   }
 }
 
-export function loadRepoConfig(cwd, configRoot) {
-  const commonDir = repoIdentity(cwd);
+/** BRAIN-713: `worktree` makes `lane run` read the submitting worktree's own `.lane-broker.json` instead of the default branch's. */
+export const CONFIG_FROM_ENV = 'LANE_BROKER_CONFIG_FROM';
+
+const DEFAULT_BRANCH_REFS = ['refs/remotes/origin/HEAD', 'refs/remotes/origin/main', 'refs/remotes/origin/master', 'refs/heads/main', 'refs/heads/master'];
+const blobTextCache = new Map();
+
+/** The directory holding `.git` (file or dir) at or above `cwd`, no subprocess; null outside a checkout. */
+function worktreeRootOf(cwd) {
+  let dir = path.resolve(cwd);
+  for (;;) {
+    if (fs.existsSync(path.join(dir, '.git'))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+/** Root-relative `.lane-broker.json` paths from `cwd` up to the worktree root, nearest first (the order `findRepoConfigPath` walks). */
+function configRelPaths(worktreeRoot, cwd) {
+  const relCwd = path.relative(worktreeRoot, path.resolve(cwd)).split(path.sep).join('/');
+  const rels = [];
+  let dir = relCwd;
+  for (;;) {
+    rels.push(dir === '' ? '.lane-broker.json' : `${dir}/.lane-broker.json`);
+    if (dir === '') return rels;
+    dir = dir.includes('/') ? dir.slice(0, dir.lastIndexOf('/')) : '';
+  }
+}
+
+function gitInCommonDir(commonDir, args, input) {
+  return execFileSync('git', ['--git-dir', commonDir, ...args], {
+    input,
+    encoding: 'utf8',
+    env: scrubbedGitEnv(),
+    stdio: ['pipe', 'pipe', 'ignore'],
+    timeout: 5000,
+  });
+}
+
+/**
+ * BRAIN-713: the nearest `.lane-broker.json` on the repo's default branch, read through the shared git dir so every worktree of a
+ * repo resolves the same file. The first existing ref wins even when it lacks the file. Null on any git failure or when the
+ * winning ref has no config (the caller then reads the worktree's file, as before).
+ */
+export function defaultBranchConfig(cwd, commonDir) {
+  const root = worktreeRootOf(cwd);
+  if (!root || !commonDir) return null;
+  const rels = configRelPaths(root, cwd);
+  try {
+    const queries = DEFAULT_BRANCH_REFS.flatMap((ref) => [ref, ...rels.map((rel) => `${ref}:${rel}`)]);
+    const lines = gitInCommonDir(commonDir, ['cat-file', '--batch-check=%(objectname) %(objecttype)'], `${queries.join('\n')}\n`).split('\n');
+    const stride = 1 + rels.length;
+    for (let i = 0; i < DEFAULT_BRANCH_REFS.length; i += 1) {
+      if (!lines[i * stride]?.endsWith(' commit')) continue;
+      const hit = rels.findIndex((_, j) => lines[i * stride + 1 + j]?.endsWith(' blob'));
+      if (hit === -1) return null;
+      const ref = DEFAULT_BRANCH_REFS[i];
+      const blob = lines[i * stride + 1 + hit].split(' ')[0];
+      if (!blobTextCache.has(blob)) blobTextCache.set(blob, gitInCommonDir(commonDir, ['cat-file', 'blob', blob]));
+      return { ref, shortRef: ref.replace(/^refs\/(remotes|heads)\//, ''), rel: rels[hit], blob, text: blobTextCache.get(blob) };
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function readWorktreeConfig(cwd, commonDir, configRoot) {
   const configPath = findRepoConfigPath(cwd, commonDir, configRoot);
-  if (!configPath) return { ...DEFAULT_REPO_CONFIG, fileLanes: DEFAULT_REPO_CONFIG.lanes, declared: false };
+  return configPath ? { label: configPath, text: fs.readFileSync(configPath, 'utf8'), configPath } : { label: undefined, text: undefined, configPath: null };
+}
+
+/**
+ * BRAIN-713: where this invocation's repo config comes from. A runner snapshot (`configRoot`) and `LANE_BROKER_CONFIG_FROM=worktree`
+ * read the checkout's file; otherwise the default branch's file wins whenever the repo has one, and `differs` says the worktree's
+ * own copy is another path, absent, or other bytes.
+ */
+export function repoConfigSource(cwd, configRoot, env = process.env) {
+  const commonDir = repoIdentity(cwd);
+  const worktree = readWorktreeConfig(cwd, commonDir, configRoot);
+  if (configRoot !== undefined) return { from: 'snapshot', label: worktree.label, text: worktree.text };
+  const mode = env[CONFIG_FROM_ENV] ?? '';
+  if (mode !== '' && mode !== 'worktree') throw new ConfigError(`${CONFIG_FROM_ENV}="${mode}" is not valid; use "worktree" or leave it unset`);
+  if (mode === 'worktree') return { from: 'worktree-override', label: worktree.label, text: worktree.text };
+  const main = commonDir ? defaultBranchConfig(cwd, commonDir) : null;
+  if (!main) return { from: 'worktree', label: worktree.label, text: worktree.text };
+  const root = worktreeRootOf(cwd);
+  const differs = !worktree.configPath || path.relative(root, worktree.configPath).split(path.sep).join('/') !== main.rel || worktree.text !== main.text;
+  return { from: 'default-branch', label: `${main.shortRef}:${main.rel}`, text: main.text, ref: main.shortRef, blob: main.blob, differs };
+}
+
+export function loadRepoConfig(cwd, configRoot) {
+  const source = repoConfigSource(cwd, configRoot);
+  if (source.text === undefined) return { ...DEFAULT_REPO_CONFIG, fileLanes: DEFAULT_REPO_CONFIG.lanes, declared: false, source };
   let parsed;
   try {
-    parsed = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    parsed = JSON.parse(source.text);
   } catch (err) {
-    throw new ConfigError(`${configPath}: invalid JSON (${err.message})`);
+    throw new ConfigError(`${source.label}: invalid JSON (${err.message})`);
   }
   const cfg = {
     version: 1,
@@ -1124,9 +1214,9 @@ export function loadRepoConfig(cwd, configRoot) {
     ...parsed,
     lanes: { ...DEFAULT_REPO_CONFIG.lanes, ...(parsed.lanes || {}) },
   };
-  validateRepoConfig(cfg, configPath);
+  validateRepoConfig(cfg, source.label);
   // `lanes` has the built-in `default` merged in; `fileLanes` is only what the file itself declared (BRAIN-448).
-  return { ...cfg, fileLanes: parsed.lanes || {}, declared: true };
+  return { ...cfg, fileLanes: parsed.lanes || {}, declared: true, source };
 }
 
 /** Expand conflict pairs (with `*` wildcard) into a symmetric adjacency map of laneName -> Set<laneName>. */
@@ -1241,9 +1331,12 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   const conflictingLaneNames = adj.has(laneName) ? [...adj.get(laneName)] : [];
   const key = `${repoId}:${sanitizeKey(laneName)}`;
   const conflicts = conflictingLaneNames.map((n) => `${repoId}:${sanitizeKey(n)}`);
+  const { from, ref, blob, differs, text } = repoConfig.source;
   return {
     repoId,
     lane: laneName,
+    // BRAIN-713: where the repo config came from; `text` is for approval only and must never be persisted
+    configSource: { from, ...(ref ? { ref } : {}), ...(blob ? { blob } : {}), ...(differs !== undefined ? { differs } : {}), ...(from === 'default-branch' ? { text } : {}) },
     // BRAIN-361: the declared lane an ad-hoc name inherited from; present only when it differs from `lane`
     ...(!isDeclaredLane && undeclaredTemplateName ? { configLane: undeclaredTemplateName } : {}),
     key,
