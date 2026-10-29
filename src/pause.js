@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import { ensureStateDirs, paths, atomicWriteFile, withLock, readRemoteDrain, writeRemoteDrain, clearRemoteDrain } from './state.js';
+import { remoteShutdownCommand } from './remote-runner.js';
 import { collectStatus, renderRemoteDrainLine } from './status.js';
 
 export async function pauseCommand(reason = '') {
@@ -45,4 +46,16 @@ export async function undrainCommand() {
   const pausedReason = fs.existsSync(paths(p.root).pause) ? fs.readFileSync(paths(p.root).pause, 'utf8').trim() : null;
   process.stdout.write(`lane undrained${pausedReason ? ` (still paused: ${pausedReason}; lane resume to admit work again)` : ''}\n`);
   return { exitCode: 0 };
+}
+
+/** BRAIN-350: drain for a host shutdown: no new remote work, and every in-flight remote ticket stopped with a proof-of-death record. */
+export async function drainShutdownCommand(reason = '', { waitMs = 60_000, root } = {}) {
+  const p = ensureStateDirs();
+  try {
+    await writeRemoteDrain(p.root, reason || 'host shutting down', { shutdown: true });
+  } catch (err) {
+    process.stderr.write(`lane drain --shutdown: cannot write the drain marker: ${err.message}\n`);
+    return { exitCode: 1 };
+  }
+  return remoteShutdownCommand({ waitMs, ...(root ? { root } : {}) });
 }

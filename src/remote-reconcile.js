@@ -1,10 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths, atomicWriteJson, appendHistory, LockTimeoutError } from './state.js';
+import { paths, atomicWriteJson, appendHistory, LockTimeoutError, RUNNER_SHUTDOWN_REASON } from './state.js';
 import { readUnreachable, recordContact } from './runner-unreachable.js';
 import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { terminalRowDefaults } from './resources.js';
-import { fetchRemoteResult, classifyRemoteResult, provesNeverStarted, remoteCancel } from './remote-client.js';
+import { fetchRemoteResult, classifyRemoteResult, provesNeverStarted, provesStopped, remoteCancel } from './remote-client.js';
 import { relayedUsage, relayedDeps } from './remote-relay.js';
 import { writeBrokerLog } from './admission.js';
 
@@ -17,6 +17,8 @@ import { writeBrokerLog } from './admission.js';
  *  - a runner-CONFIRMED `remote-cancel` of a job the runner reports gone with no result (lost: exit 75, `runner-lost`), or
  *  - (BRAIN-570) a binding-matched runner record that itself proves the job never started (`provesNeverStarted`: rejected,
  *    queue-timeout, withdrawn; lost: exit 75, `runner-never-started`), or
+ *  - (BRAIN-350) a binding-matched runner record that proves its host shut down and stopped the job (`provesStopped`; lost: exit 75,
+ *    `runner-shutdown`), or
  *  - a probe-phase attempt that never reached a runner (no runner, no dispatchedRunners, no binding: the supervisor persists all
  *    three before its first ssh submit, so nothing was ever sent; lost: exit 75, `never-dispatched`, no ssh at all).
  *  - (BRAIN-594) a runner the operator marked `offline: true` (lost: exit 75, `runner-offline`, settled WITHOUT contacting it), or a
@@ -151,6 +153,7 @@ async function adoptOrAmbiguous(attempt, id, record, publish) {
       const kind = record.reason ? `${record.kind}: ${record.reason}` : record.kind;
       return publish('lost', () => lostResult(id, attempt, 'runner-never-started', `runner ${attempt.runner} reported ${kind}`));
     }
+    if (provesStopped(record, expected)) return publish('lost', () => lostResult(id, attempt, RUNNER_SHUTDOWN_REASON, `runner ${attempt.runner} stopped the job: host shutting down`));
     return { settled: false, state: 'ambiguous', reason: classified.reason };
   }
   return publish('adopted', () => ({

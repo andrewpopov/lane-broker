@@ -7,7 +7,7 @@ import { childExitSafeFlags } from './node-exit-safe.js';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, readRemoteDrain, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, readRemoteDrain, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath, RUNNER_SHUTDOWN_REASON, RUNNER_SHUTDOWN_UNPROVEN_REASON } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, RUNNER_NAME_RE, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
 import { advertisedCapabilities } from './capabilities.js';
@@ -26,6 +26,7 @@ import { collectStatus } from './status.js';
 import { readLease, isSupervisorAlive, listLeasesStrict, listLeases } from './lease.js';
 import { readAttempt, listAttemptsStrict } from './attempts.js';
 import { listQueue, listQueueStrict, dequeueSync, HELD_STATES } from './scheduler.js';
+import { touchSimArmFor } from './sim-arm.js';
 import { REMOTE_TMP_BASE, TMP_OWNER_FILE, gcRemoteTickets, removeDetached } from './gc.js';
 import { writeBrokerLog, cpuHeadroomCores } from './admission.js';
 import { measureHostCpuReadOnly } from './cpu.js';
@@ -594,7 +595,9 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
 
   const ownPhasesMs = { snapshotMs: Date.now() - snapshotStartedAt };
   const cancelledMarker = path.join(ticketDir, 'cancelled');
+  const shutdownMarker = path.join(ticketDir, 'shutdown');
   const remoteLaneId = crypto.randomUUID();
+  let refusedAtStart = false; // BRAIN-350: onTicketCreated refused, so run.js never spawned a supervisor and nothing ran
 
   // Belt and braces alongside `configRoot`/`repoIdentityOverride` below: no
   // git invocation the child (or anything it shells out to) makes can ever
@@ -684,11 +687,16 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
       await testHoldAt('remote-exec-before-id');
       // Under the broker lock, the same one `remote-cancel` writes its `cancelled` marker and reads `remote-id` under: either
       // that cancel sees this id (and takes the broker path), or this check sees its marker and refuses. Neither can miss the other.
+      // BRAIN-350: the same lock orders this against `lane drain --shutdown`, which marks every ticket dir under it.
       const cancelledEarly = await withLock(stateHome(), () => {
         atomicWriteFile(path.join(ticketDir, 'remote-id'), id);
-        return fs.existsSync(cancelledMarker);
+        if (!fs.existsSync(shutdownMarker) && readRemoteDrain(stateHome())?.shutdown) atomicWriteFile(shutdownMarker, String(Date.now()));
+        return fs.existsSync(cancelledMarker) || fs.existsSync(shutdownMarker);
       });
-      if (cancelledEarly) return false;
+      if (cancelledEarly) {
+        refusedAtStart = true;
+        return false;
+      }
       // Test-only seam (BRAIN-319): hold here, right after the ticket-local
       // `cancelled` check above has already come back false, until the named
       // file appears -- lets a test deterministically land `lane
@@ -747,6 +755,8 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     // fallback log line.
     kind = 'unfinished';
     reason = 'queue-timeout';
+  } else if ((reason = shutdownStopReason({ cancelled, shutdownMarked: fs.existsSync(shutdownMarker), refusedAtStart, unstarted: fs.existsSync(path.join(ticketDir, 'shutdown-unstarted')), structured })) !== null) {
+    kind = 'unfinished';
   } else if (structured) {
     exit = structured.exit;
     signal = structured.signal;
@@ -1220,4 +1230,86 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
 
   process.stdout.write(`${JSON.stringify({ protocol: 1, ticketId, markedCancelled: true, cancelRequested, cancelConfirmed, registered })}\n`);
   return { exitCode: 0 };
+}
+
+/**
+ * BRAIN-350: the `reason` of the record for a ticket `lane drain --shutdown` marked, or null when the shutdown does not decide it.
+ * `runner-shutdown` lets the submitter run the job again elsewhere, so only a PROVEN stop produces it: refused before anything ran,
+ * found unleased by the shutdown sweep, which dequeued or fenced it so it can never start (`unstarted`), or a cancel that ended the command with every process confirmed
+ * gone (`stopProven`, set by the local supervisor). A stop it cannot prove (the supervisor died with no result, an incomplete reap,
+ * a command that had already exited and was draining output) is `runner-shutdown-unproven`: possibly still running. A user cancel
+ * wins, and a job that completed on its own keeps its real record.
+ */
+export function shutdownStopReason({ cancelled, shutdownMarked, refusedAtStart, unstarted, structured }) {
+  if (cancelled || !shutdownMarked) return null;
+  if (refusedAtStart || unstarted || structured?.stopProven === true) return RUNNER_SHUTDOWN_REASON;
+  if (!structured || structured.cancelled === true) return RUNNER_SHUTDOWN_UNPROVEN_REASON;
+  return null;
+}
+
+/**
+ * BRAIN-350: `lane drain --shutdown`, step two. Marks every unpublished ticket under `root` with a `shutdown` marker and stops
+ * the registered ones in the local broker (broker cancel marker + `cancelCommand`), all under the broker lock `remote-cancel` and
+ * `onTicketCreated` use, so an exec either sees the marker or is seen here. It never writes the ticket's `cancelled` marker: that
+ * is a user cancel (exit 130) to the submitter, whereas the finalize step turns a `shutdown` marker into an `unfinished`
+ * `runner-shutdown` record, the proof the job is dead. Then waits (bounded) for each ticket to publish or its publisher to die.
+ */
+export async function remoteShutdownCommand({ root = defaultRemoteRoot(), waitMs = 60_000 } = {}) {
+  root = path.resolve(root);
+  const ticketsDir = path.join(root, 'tickets');
+  const marked = [];
+  const toStop = [];
+  await withLock(stateHome(), () => {
+    let names = [];
+    try {
+      names = fs.readdirSync(ticketsDir);
+    } catch {
+      return;
+    }
+    const brokerRoot = ensureStateDirs().root;
+    for (const name of names) {
+      const ticketDir = path.join(ticketsDir, name);
+      if (!isUuid(name) || fs.existsSync(path.join(ticketDir, 'result.json'))) continue;
+      atomicWriteFile(path.join(ticketDir, 'shutdown'), String(Date.now()));
+      marked.push(ticketDir);
+      let recorded = null;
+      try {
+        recorded = readIfExists(path.join(ticketDir, 'remote-id'));
+      } catch {
+        // unreadable: the finalize step still sees the shutdown marker
+      }
+      if (recorded !== null && isUuid(recorded)) {
+        writeCancelMarkerFile(brokerRoot, recorded);
+        // Not leased yet: it can never start now. A queued ticket is dequeued here, under the lock the scheduler moves a ticket
+        // from queue to lease under; one not yet enqueued meets the cancel marker just written, which the scheduler checks under
+        // that same lock before any start. The `shutdown-unstarted` marker is that proof, written before its supervisor can exit.
+        const queued = listQueue(brokerRoot).find((t) => t && t.id === recorded);
+        if (queued) {
+          dequeueSync(brokerRoot, recorded);
+          touchSimArmFor(brokerRoot, queued);
+        }
+        if (queued || !readLease(brokerRoot, recorded)) atomicWriteFile(path.join(ticketDir, 'shutdown-unstarted'), String(Date.now()));
+        if (!queued) toStop.push(recorded);
+      }
+    }
+  });
+  for (const laneId of toStop) await cancelCommand(laneId);
+
+  const deadline = Date.now() + waitMs;
+  const brokerRoot = ensureStateDirs().root;
+  let published = 0;
+  let pending = marked.slice();
+  for (;;) {
+    pending = pending.filter((dir) => {
+      if (fs.existsSync(path.join(dir, 'result.json'))) {
+        published += 1;
+        return false;
+      }
+      return remoteTicketState(dir, brokerRoot) !== 'gone';
+    });
+    if (pending.length === 0 || Date.now() >= deadline) break;
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  process.stdout.write(`lane drain --shutdown: stopped ${marked.length - published - pending.length}, published ${published}, still pending ${pending.length}\n`);
+  return { exitCode: 0, stopped: marked.length - published - pending.length, published, pending: pending.length };
 }

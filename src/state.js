@@ -462,6 +462,10 @@ const DRAIN_MARKER_VERSION = 1;
 const DRAIN_REASON_MAX = 200;
 export const DRAIN_UNREADABLE_REASON = 'drain marker unreadable';
 const DEFAULT_DRAIN_REASON = 'drained by operator';
+/** BRAIN-350: the `reason` of an `unfinished` runner record for a job the runner stopped because its host is shutting down. */
+export const RUNNER_SHUTDOWN_REASON = 'runner-shutdown';
+/** BRAIN-350: the same stop when the runner cannot prove the job is dead; the submitter treats it as possibly still running. */
+export const RUNNER_SHUTDOWN_UNPROVEN_REASON = 'runner-shutdown-unproven';
 
 /** A drain reason is shown to operators and in submitter logs: no ANSI/control characters, one line, at most 200 chars. */
 export function sanitizeDrainReason(raw) {
@@ -499,11 +503,17 @@ export function readRemoteDrain(root = stateHome()) {
   }
   const ok = m && typeof m === 'object' && !Array.isArray(m) && m.version === DRAIN_MARKER_VERSION && typeof m.reason === 'string' && Number.isFinite(m.since);
   if (!ok) return { reason: DRAIN_UNREADABLE_REASON, since: null, unreadable: true };
-  return { reason: sanitizeDrainReason(m.reason) || DEFAULT_DRAIN_REASON, since: m.since, unreadable: false };
+  const reason = sanitizeDrainReason(m.reason) || DEFAULT_DRAIN_REASON;
+  // BRAIN-350: a shutdown drain ends with the boot it was written in (the host is about to go down, so it comes back taking work).
+  if (m.shutdown === true) {
+    if (m.bootId !== bootId()) return null;
+    return { reason, since: m.since, unreadable: false, shutdown: true };
+  }
+  return { reason, since: m.since, unreadable: false };
 }
 
-/** Write the drain marker under the state lock. A re-drain keeps the original `since` and replaces the reason. Returns the marker. */
-export async function writeRemoteDrain(root, reason) {
+/** Write the drain marker under the state lock (`shutdown` adds the BRAIN-350 shutdown form, bound to this boot). A re-drain keeps the original `since` and replaces the reason. Returns the marker. */
+export async function writeRemoteDrain(root, reason, { shutdown = false } = {}) {
   return withLock(root, () => {
     const prev = readRemoteDrain(root);
     const marker = {
@@ -511,9 +521,10 @@ export async function writeRemoteDrain(root, reason) {
       reason: sanitizeDrainReason(reason) || DEFAULT_DRAIN_REASON,
       since: prev && !prev.unreadable ? prev.since : Date.now(),
       host: os.hostname(),
+      ...(shutdown ? { shutdown: true, bootId: bootId() } : {}),
     };
     atomicWriteJson(paths(root).remoteDrain, marker, { fsync: true });
-    return { reason: marker.reason, since: marker.since, unreadable: false };
+    return { reason: marker.reason, since: marker.since, unreadable: false, ...(shutdown ? { shutdown: true } : {}) };
   });
 }
 

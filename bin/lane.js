@@ -8,7 +8,7 @@ import { estimatesCommand } from '../src/estimates-history.js';
 import { cancelCommand } from '../src/cancel.js';
 import { priorityCommand } from '../src/retier.js';
 import { waitCommand } from '../src/wait.js';
-import { pauseCommand, resumeCommand, drainCommand, undrainCommand } from '../src/pause.js';
+import { pauseCommand, resumeCommand, drainCommand, drainShutdownCommand, undrainCommand } from '../src/pause.js';
 import { migrateSchedulerCommand } from '../src/migrate.js';
 import { parseByteSize } from '../src/resources.js';
 import { MIN_CPU_GRANT_CORES } from '../src/cpu-limit.js';
@@ -53,6 +53,7 @@ function usage() {
   lane pause ["reason"]
   lane resume
   lane drain ["reason"]
+  lane drain --shutdown ["reason"] [--wait-ms N]
   lane undrain
   lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
   lane gc [--dry-run] [--max <n>] [--root <remoteRoot>]
@@ -288,6 +289,31 @@ async function main() {
       return result.exitCode;
     }
     case 'drain': {
+      if (rest.includes('--shutdown')) {
+        let waitMs = 60_000;
+        let remoteRoot;
+        const args = [];
+        for (let i = 0; i < rest.length; i += 1) {
+          if (rest[i] === '--shutdown') continue;
+          if (rest[i] === '--wait-ms') {
+            waitMs = Number(rest[i + 1]);
+            i += 1;
+            if (!Number.isFinite(waitMs) || waitMs < 0) {
+              process.stderr.write(`lane drain: --wait-ms needs a non-negative number\n${usage()}`);
+              return 2;
+            }
+          } else if (rest[i] === '--root' && rest[i + 1]) {
+            remoteRoot = rest[i + 1];
+            i += 1;
+          } else args.push(rest[i]);
+        }
+        const bad = args.find((arg) => arg.startsWith('-'));
+        if (bad !== undefined || args.length > 1) {
+          process.stderr.write(`lane drain --shutdown: ${bad !== undefined ? `unknown option "${bad}"` : 'unexpected argument (quote a multi-word reason)'}\n${usage()}`);
+          return 2;
+        }
+        return (await drainShutdownCommand(args[0] ?? '', { waitMs, root: remoteRoot })).exitCode;
+      }
       const unknownOption = rest.find((arg) => arg.startsWith('-'));
       if (unknownOption !== undefined) {
         process.stderr.write(`lane drain: unknown option "${unknownOption}"\n${usage()}`);
