@@ -7,16 +7,24 @@ const HOST_ONLY_PREFIXES = ['/private/', '/var/folders/', '/tmp/', '/Volumes/', 
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash']);
 const SCRIPT_SPLIT = /[\s'"`;&|()<>]+/;
 
+const OUTPUT_REDIRECT = /[0-9&]?>[>|]?\s*("[^"]*"|'[^']*'|[^\s;&|()<>`'"]+)/g;
+
+// BRAIN-721: look through a leading `env [-flags] [NAME=value ...]` to the shell it wraps.
 function shellScript(argv) {
-  if (!SHELLS.has(path.basename(argv[0] ?? ''))) return null;
-  const flag = argv.findIndex((a, i) => i > 0 && /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
+  let i = 0;
+  if (path.basename(argv[0] ?? '') === 'env') {
+    i = 1;
+    while (i < argv.length && (argv[i].startsWith('-') || /^[A-Za-z_][A-Za-z0-9_]*=/.test(argv[i]))) i++;
+  }
+  if (!SHELLS.has(path.basename(argv[i] ?? ''))) return null;
+  const flag = argv.findIndex((a, j) => j > i && /^-[A-Za-z]*c[A-Za-z]*$/.test(a));
   return flag === -1 ? null : argv[flag + 1] ?? null;
 }
 
 function candidates(argv) {
   const raw = [...argv];
   const script = shellScript(argv);
-  if (script !== null) raw.push(...script.split(SCRIPT_SPLIT));
+  if (script !== null) raw.push(...script.replace(OUTPUT_REDIRECT, ' ').split(SCRIPT_SPLIT));
   const out = new Set();
   for (const token of raw) {
     if (token.includes('://')) continue;
@@ -37,6 +45,12 @@ const realpathOrSelf = (p) => {
 
 const isUnder = (child, root) => child === root || child.startsWith(root.endsWith('/') ? root : `${root}/`);
 
+const relativeSuggestion = (cwd, real, realpath) => {
+  const rel = path.relative(realpath(cwd), real);
+  if (rel === '') return '.';
+  return rel.startsWith('..') ? rel : `./${rel}`;
+};
+
 /** Absolute argv paths that exist only on this machine, each with whether it lies inside the worktree
  *  and, if so, the cwd-relative path to use instead. */
 export function hostOnlyPaths(argv, { worktreeRoot, cwd, home = os.homedir(), exists = fs.existsSync, realpath = realpathOrSelf }) {
@@ -47,7 +61,7 @@ export function hostOnlyPaths(argv, { worktreeRoot, cwd, home = os.homedir(), ex
     if (!prefixes.some((p) => token.startsWith(p)) || !exists(token)) continue;
     const real = realpath(token);
     const insideWorktree = [token, real].some((p) => isUnder(p, worktreeRoot) || isUnder(p, root));
-    found.push({ path: token, insideWorktree, suggestion: insideWorktree ? path.relative(realpath(cwd), real) || '.' : null });
+    found.push({ path: token, insideWorktree, suggestion: insideWorktree ? relativeSuggestion(cwd, real, realpath) : null });
   }
   return found;
 }

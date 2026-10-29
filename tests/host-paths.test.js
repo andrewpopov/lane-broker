@@ -14,12 +14,13 @@ test('an existing host-only script path is flagged as outside the worktree', () 
 
 test('a path inside sh -c is inside the worktree with a cwd-relative suggestion', () => {
   const found = detect(['sh', '-c', `cd ${ROOT}/sub && npm test`], { present: [`${ROOT}/sub`] });
-  assert.deepEqual(found, [{ path: `${ROOT}/sub`, insideWorktree: true, suggestion: 'sub' }]);
+  assert.deepEqual(found, [{ path: `${ROOT}/sub`, insideWorktree: true, suggestion: './sub' }]);
 });
 
 test('the suggestion is relative to the command cwd, not the worktree root', () => {
   const present = [`${ROOT}/a/b/f.js`, ROOT];
   assert.equal(detect(['node', `${ROOT}/a/b/f.js`], { cwd: `${ROOT}/a/c`, present })[0].suggestion, '../b/f.js');
+  assert.equal(detect(['sh', `${ROOT}/check.sh`], { present: [`${ROOT}/check.sh`] })[0].suggestion, './check.sh');
   assert.equal(detect(['ls', ROOT], { cwd: ROOT, present })[0].suggestion, '.');
 });
 
@@ -44,4 +45,15 @@ test('the refusal text names the path and omits --local on a dispatch-only host'
   const found = [{ path: '/tmp/x', insideWorktree: false, suggestion: null }];
   assert.match(hostPathsRefusal('default', found, { dispatchOnly: false })[0], /names \/tmp\/x, which exists only on this machine.*--local --local-reason/);
   assert.doesNotMatch(hostPathsRefusal('default', found, { dispatchOnly: true })[0], /--local/);
+});
+
+test('an output redirect target is not flagged, an input redirect still is', () => {
+  const present = ['/tmp/test.out', '/tmp/in.txt'];
+  assert.deepEqual(detect(['sh', '-c', 'npm test > /tmp/test.out 2>/tmp/test.out &>/tmp/test.out >>/tmp/test.out'], { present }), []);
+  assert.deepEqual(detect(['sh', '-c', 'cat < /tmp/in.txt > /tmp/test.out'], { present }).map((f) => f.path), ['/tmp/in.txt']);
+});
+
+test('an env wrapper around sh -c is inspected like a bare shell', () => {
+  const found = detect(['env', '-i', 'A=1', 'sh', '-c', 'bash /tmp/x.sh'], { present: ['/tmp/x.sh'] });
+  assert.deepEqual(found.map((f) => f.path), ['/tmp/x.sh']);
 });
