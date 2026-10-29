@@ -8,7 +8,7 @@ import { freshEnv, writeGlobalConfig, BIN, laneRun, waitFor } from './helpers.js
 import { encodeSnapshot } from '../src/remote-stream.js';
 import { paths, readJsonSafe, readRemoteDrain, writeRemoteDrain, clearRemoteDrain, RUNNER_SHUTDOWN_REASON } from '../src/state.js';
 import { makeTmpDir } from './helpers/tmp.js';
-import { shutdownStopReason } from '../src/remote-runner.js';
+import { shutdownStopReason, servedRecord } from '../src/remote-runner.js';
 
 /**
  * BRAIN-350 S1 (runner side): `lane drain --shutdown` stops new remote work and stops every in-flight remote ticket with an
@@ -186,4 +186,14 @@ test('shutdownStopReason: only a proven stop yields runner-shutdown (Codex P1s o
   assert.equal(shutdownStopReason({ ...base, structured: { cancelled: false, startedAt: 1, exit: 0 } }), null, 'completed on its own keeps its record');
   assert.equal(shutdownStopReason({ ...base, cancelled: true, refusedAtStart: true, structured: null }), null, 'a user cancel wins');
   assert.equal(shutdownStopReason({ ...base, shutdownMarked: false, unstarted: true, structured: null }), null, 'no shutdown, no say');
+});
+
+test('servedRecord: an unproven stop from an earlier boot is served as proven; the same boot stays unproven', () => {
+  const unproven = { protocol: 1, ticketId: 't', generation: 0, manifestHash: 'h', kind: 'unfinished', reason: 'runner-shutdown-unproven', shutdownBootId: 'boot-1' };
+  assert.deepEqual(servedRecord(unproven, 'boot-2'), { ...unproven, reason: RUNNER_SHUTDOWN_REASON, provenBy: 'reboot' });
+  assert.equal(servedRecord(unproven, 'boot-1'), unproven, 'same boot: the job may still be alive');
+  const { shutdownBootId: _, ...noBoot } = unproven;
+  assert.equal(servedRecord(noBoot, 'boot-2'), noBoot, 'no recorded boot: cannot prove anything');
+  const completed = { ...unproven, kind: 'completed', reason: null };
+  assert.equal(servedRecord(completed, 'boot-2'), completed, 'only an unproven shutdown record is ever upgraded');
 });

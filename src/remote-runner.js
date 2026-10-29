@@ -7,7 +7,7 @@ import { childExitSafeFlags } from './node-exit-safe.js';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, readRemoteDrain, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath, RUNNER_SHUTDOWN_REASON, RUNNER_SHUTDOWN_UNPROVEN_REASON } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, readRemoteDrain, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath, RUNNER_SHUTDOWN_REASON, RUNNER_SHUTDOWN_UNPROVEN_REASON, bootId } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidDepsKeyFilesShape, isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, RUNNER_NAME_RE, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
 import { advertisedCapabilities } from './capabilities.js';
@@ -801,7 +801,9 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   const artifacts = storeArtifacts(header, ticketDir, workDir, { kind, exit, signal });
   if (artifacts !== undefined) ownPhasesMs.artifactsMs = Date.now() - artifactsStartedAt;
   try {
-    writeResult(ticketDir, buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, ...remoteCpuAllocation(structured ?? {}), observedCpu, observedRssPeakBytes, observedCgroupMemoryPeakBytes, cpuSeconds, phasesMs: readPhasesMs(ticketDir, ownPhasesMs), artifacts }));
+    const built = buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, ...remoteCpuAllocation(structured ?? {}), observedCpu, observedRssPeakBytes, observedCgroupMemoryPeakBytes, cpuSeconds, phasesMs: readPhasesMs(ticketDir, ownPhasesMs), artifacts });
+    // BRAIN-350: an unproven stop names the boot it happened in; a later boot proves the job died with it (servedRecord)
+    writeResult(ticketDir, reason === RUNNER_SHUTDOWN_UNPROVEN_REASON ? { ...built, shutdownBootId: bootId() } : built);
   } finally {
     cleanupWork(workDir, tmpDir);
   }
@@ -1118,8 +1120,19 @@ export async function remoteResultCommand(ticketId, { root = defaultRemoteRoot()
     const drain = readRemoteDrain(stateHome());
     record = (state === 'gone' && readResult(resultPath)) || { protocol: 1, missing: true, state, ...(phase !== state ? { phase } : {}), ...(drain ? { remoteDrain: { reason: drain.reason, since: drain.since } } : {}) };
   }
-  process.stdout.write(`${JSON.stringify(record)}\n`);
+  process.stdout.write(`${JSON.stringify(servedRecord(record, bootId()))}\n`);
   return { exitCode: 0 };
+}
+
+/**
+ * BRAIN-350: what `remote-result` serves for a stored record. A `runner-shutdown-unproven` stop written in an earlier boot is proven
+ * now: every process of that boot died with it, so it is served as `runner-shutdown` (`provenBy: 'reboot'`) and the submitter may
+ * run the job again. Without this a runner that came back within `runnerLostAfterMs` left such a ticket ambiguous for good.
+ */
+export function servedRecord(record, currentBootId) {
+  if (record?.kind !== 'unfinished' || record.reason !== RUNNER_SHUTDOWN_UNPROVEN_REASON) return record;
+  if (typeof record.shutdownBootId !== 'string' || !currentBootId || record.shutdownBootId === currentBootId) return record;
+  return { ...record, reason: RUNNER_SHUTDOWN_REASON, provenBy: 'reboot' };
 }
 
 /** `lane remote-artifacts <ticketId>` (BRAIN-398): stream the stored artifacts, framed; nonzero and silent when there are none. */
