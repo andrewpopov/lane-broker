@@ -62,7 +62,7 @@ test('phases.json times deps, setup and command separately, and a stage that did
   const workDir = appFixture(dir);
   const ticketDir = path.join(dir, 'ticket');
   fs.mkdirSync(ticketDir);
-  const sleep = (ms) => [process.execPath, '-e', `const e=Date.now()+${ms};while(Date.now()<e){}`];
+  const sleep = (ms) => ['node', '-e', `const e=Date.now()+${ms};while(Date.now()<e){}`];
   const run = async (remoteDeps, remoteSetup) => {
     fs.rmSync(ticketDir, { recursive: true, force: true });
     fs.mkdirSync(ticketDir);

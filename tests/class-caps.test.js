@@ -387,7 +387,7 @@ test('P1: a runner refuses a dispatch whose class/enforcement is stricter than i
   const prev = { home: process.env.LANE_BROKER_HOME, state: process.env.LANE_BROKER_STATE };
   Object.assign(process.env, { LANE_BROKER_HOME: home, LANE_BROKER_STATE: state });
   const marker = path.join(base, 'ran');
-  const run = (lane, expectClass) => runCommand({ repo: 'r', lane, cmd: [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, 'x')`], cwd: repoDir, configRoot: repoDir, repoIdentityOverride: 'r', allowLocalSim: true, expectClass });
+  const run = (lane, expectClass) => runCommand({ repo: 'r', lane, cmd: ['node', '-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, 'x')`], cwd: repoDir, configRoot: repoDir, repoIdentityOverride: 'r', allowLocalSim: true, expectClass });
   try {
     const enforced = await run('default', { laneClass: 'sim', classEnforcement: 'required' });
     assert.equal(enforced.exitCode, 64);

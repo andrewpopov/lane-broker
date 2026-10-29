@@ -15,6 +15,7 @@ import { listQueue } from './scheduler.js';
 import { writePending } from './pending.js';
 import { stampPriorityOrigin } from './priority-clock.js';
 import { detectResourceCapacity, leaseResources, resolveTicketResources, capUnapprovedCpu, checkResourceBudget, localSimRefusal, dispatchOnlyRefusal, locallyRefusedNow } from './resources.js';
+import { hostOnlyPaths, hostPathsRefusal } from './host-paths.js';
 import { argvFingerprint } from './cpu-estimates.js';
 import { readRows } from './suggest.js';
 import { rightSizedCpuCores } from './right-size.js';
@@ -424,6 +425,13 @@ export async function runCommand({
   // re-enable the local budget check, not just omit `ticket.remote`.
   const remoteWorktreeRoot = remoteWanted ? resolveWorktreeRoot(cwd) : null;
   const remoteEligible = remoteWanted && remoteWorktreeRoot !== null;
+  if (remoteEligible) {
+    const hostOnly = hostOnlyPaths(cmd, { worktreeRoot: remoteWorktreeRoot, cwd });
+    if (hostOnly.length > 0) {
+      for (const line of hostPathsRefusal(resolved.lane, hostOnly, { dispatchOnly })) process.stderr.write(`${line}\n`);
+      return { exitCode: 64 };
+    }
+  }
   const localReason = localReasonFor(resolved, remoteEligible, forced, exclusive);
   const { headTree, checkoutRoot } = gitTreeAndRoot(cwd);
   // No fingerprint (so no history relief, charge declared) when the checkout root is

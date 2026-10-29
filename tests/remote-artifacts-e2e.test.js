@@ -24,7 +24,7 @@ for (const [rel, content] of Object.entries(${JSON.stringify(files)})) {
 }
 process.exit(${exitCode});
 `;
-  return [process.execPath, '-e', body];
+  return ['node', '-e', body];
 }
 
 function configure(repoDir, lane) {
@@ -163,7 +163,7 @@ fs.mkdirSync('artifacts/test-lane', { recursive: true });
 fs.writeFileSync(${JSON.stringify(STAMP)}, 'x');
 process.exit(3);
 `;
-  const { id, waited } = await runLane(env, repoDir, [process.execPath, '-e', body]);
+  const { id, waited } = await runLane(env, repoDir, ['node', '-e', body]);
   assert.equal(waited.code, 3, waited.stderr);
   const result = resultOf(state, id);
   assert.equal(result.executor, 'remote', 'a published result means no local fallback');
@@ -188,7 +188,7 @@ test('a runner without artifacts/1 runs the command, warns, and returns nothing'
   configure(repoDir, { remoteArtifacts: [STAMP] });
   const marker = path.join(tmpDir('marker'), 'where');
   const body = `require('fs').writeFileSync(${JSON.stringify(marker)}, process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local');`;
-  const { id, waited } = await runLane(env, repoDir, [process.execPath, '-e', body]);
+  const { id, waited } = await runLane(env, repoDir, ['node', '-e', body]);
   assert.equal(waited.code, 0, waited.stderr);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
   assert.equal(fs.existsSync(path.join(repoDir, STAMP)), false);

@@ -19,7 +19,7 @@ import { paths } from '../src/state.js';
  *  before acting on it (SIGKILL, cancel, status) instead of racing dial. */
 function sleeperCmd(startedMarker) {
   return [
-    process.execPath,
+    'node',
     '-e',
     `require('fs').writeFileSync(${JSON.stringify(startedMarker)}, 'x'); setInterval(() => {}, 1000);`,
   ];
@@ -199,7 +199,7 @@ test('an attempt record survives a changed boot id and still reports ORPHANED-RE
  *  with 'local' after a remote-run cancellation. */
 function sleeperMarkerCmd(startedMarker, whereMarker) {
   return [
-    process.execPath,
+    'node',
     '-e',
     `const fs = require('fs');
 fs.writeFileSync(${JSON.stringify(whereMarker)}, process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local');

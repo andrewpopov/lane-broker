@@ -122,7 +122,7 @@ function probeCommand(marker) {
     try { hooksPath = execFileSync('git', ['config', '--get', 'core.hooksPath'], { encoding: 'utf8' }).trim(); } catch {}
     fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ out, inPlace, hooksPath, cwd: process.cwd(), tmpdir: process.env.TMPDIR }));
   `;
-  return [process.execPath, '-e', script];
+  return ['node', '-e', script];
 }
 
 const lastRow = (state) => fs.readFileSync(paths(state).history, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).at(-1);
@@ -581,7 +581,7 @@ function workspaceProbe(marker) {
       stashLeft: fs.existsSync('node_modules/.lane-workspaces'),
     }));
   `;
-  return [process.execPath, '-e', script];
+  return ['node', '-e', script];
 }
 
 test('workspace root generators restore keyed output and regenerate after source changes', async () => {
@@ -601,7 +601,7 @@ test('workspace root generators restore keyed output and regenerate after source
     const repoDir = makeGitWorktree({ ...files, 'packages/api/schema.txt': value });
     const marker = path.join(tmpDir('deps-cache-generator-marker'), 'probe.json');
     const probe = `require('fs').copyFileSync('node_modules/generated-value.json', ${JSON.stringify(marker)})`;
-    const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', process.execPath, '-e', probe], { env: s.env, cwd: repoDir });
+    const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'node', '-e', probe], { env: s.env, cwd: repoDir });
     assert.equal(result.code, 0, result.stderr);
     assert.equal(JSON.parse(fs.readFileSync(marker, 'utf8')).value, value);
     return { ...result, row: lastRow(s.state) };

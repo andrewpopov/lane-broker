@@ -11,7 +11,7 @@ import { childEnv } from '../src/supervisor.js';
 /** TPWR-674: LANE_BROKER_SCRUB_COMMAND_ENV names variables a locally exec'd command must not inherit. */
 
 const dumpEnv = (file) => [
-  process.execPath,
+  'node',
   '-e',
   `require('fs').writeFileSync(${JSON.stringify(file)}, JSON.stringify(process.env));`,
 ];
@@ -57,7 +57,7 @@ test('nested direct-exec path scrubs too', async () => {
   const res = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...inner], { env: { ...env, ...AGENT }, cwd: repoDir });
   assert.equal(res.code, 0, res.stderr);
   assert.equal(read(file).SSH_AUTH_SOCK, '/tmp/agent.sock', 'control: nested run without the list keeps it');
-  const scrubbed = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', process.execPath, '-e',
+  const scrubbed = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'node', '-e',
     `const {spawnSync}=require('child_process');const r=spawnSync(process.execPath,${JSON.stringify(inner.slice(1))},{stdio:'inherit',env:{...process.env,LANE_BROKER_SCRUB_COMMAND_ENV:'SSH_AUTH_SOCK'}});process.exit(r.status)`],
   { env: { ...env, ...AGENT }, cwd: repoDir });
   assert.equal(scrubbed.code, 0, scrubbed.stderr);

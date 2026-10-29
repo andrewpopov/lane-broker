@@ -47,7 +47,7 @@ async function startOrphanedHeldRemote(ctx) {
   const started = path.join(dir, 'started');
   const releaseFile = path.join(dir, 'release');
   const cmd = [
-    process.execPath,
+    'node',
     '-e',
     `const fs = require('fs'); fs.writeFileSync(${JSON.stringify(started)}, 'x'); const t = setInterval(() => { if (fs.existsSync(${JSON.stringify(releaseFile)})) { clearInterval(t); process.exit(3); } }, 50);`,
   ];

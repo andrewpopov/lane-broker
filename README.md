@@ -111,6 +111,14 @@ machine (ssh, `gh`, `lane`, paths outside the worktree); it stays local and the 
 are not remote-eligible are unchanged: `--local` is accepted silently. The runner side of `remote-exec` sets
 its own reason internally.
 
+**A remote-eligible command may not name a path that exists only on this machine (BRAIN-721).** A runner gets a
+snapshot of the worktree, so an argv (or `sh -c` script) naming an existing absolute path under `/private`,
+`/var/folders`, `/tmp`, `/Volumes`, `/Users`, `/opt/homebrew`, `/Library` or your home dies there with exit 2/127.
+`lane run` refuses it before admission with exit `64` and no ticket. A path into the worktree itself is refused with
+the cwd-relative path to use instead; anything else must be copied into the worktree or the run pinned with
+`--local --local-reason`. `remote:false` lanes and forced-local runs are not checked; a dispatch-only host checks
+every run and offers no `--local`. `$HOME` and `~` are not checked (the runner's shell expands them).
+
 **Every run gets a detached supervisor**, always. `lane run` spawns it, then
 only *waits* on the supervisor's result file. If the calling agent (or its
 10-minute tool ceiling) kills the `lane run` process, the supervisor and the
@@ -2308,7 +2316,7 @@ Documented limits, not bugs:
 | the child's exit code | Passed straight through on completion. |
 | `1` | The command errored, was signalled, or the supervisor died unexpectedly. |
 | `2` | Bad CLI usage (missing command / argument). |
-| `64` | Nested `lane run` would widen the inherited lease — refused; or an invalid `--priority` / `LANE_BROKER_PRIORITY` / lane `priority`; or an invalid tier given to `lane priority`; or an `--exclusive` lane nested under another lane; or `exclusiveHooks` in host or repo config (not supported yet). |
+| `64` | Nested `lane run` would widen the inherited lease — refused; or an invalid `--priority` / `LANE_BROKER_PRIORITY` / lane `priority`; or an invalid tier given to `lane priority`; or an `--exclusive` lane nested under another lane; or `exclusiveHooks` in host or repo config (not supported yet); or a remote-eligible command naming a path that exists only on this machine (BRAIN-721). |
 | `69` | Local-sim lane refused (fleet-offload message); use `--allow-local-sim`. |
 | `76` | A remote-only (`localRefused` + `remote`) lane found no runner able to take it right now (BRAIN-455). Retryable, unlike `69`; `--allow-local-sim` runs it here. |
 | `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. Also `lane run` / `remote-exec` refused with "scheduler migration in progress" while `lane migrate-scheduler` runs, or "scheduler migration pending (draining)" while `--when-idle` waits. `lane priority` also exits `75` (nothing changed, retry) on a lock timeout, a migration in progress, or a ticket mid-rebind to a runner. |

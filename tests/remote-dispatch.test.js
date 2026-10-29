@@ -171,7 +171,7 @@ require('fs').writeFileSync(${JSON.stringify(startedMarker)}, 'x');
 process.on('SIGTERM', () => { process.exit(0); });
 setInterval(() => {}, 1000);
 `;
-  const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', process.execPath, '-e', body], { env, cwd: repoDir });
+  const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', 'node', '-e', body], { env, cwd: repoDir });
   let stderr = '';
   child.stderr.on('data', (d) => {
     stderr += d;
@@ -243,7 +243,7 @@ test('SIGINT during the post-completion drain of a remote success still reports 
   const bytes = 24 * 1024 * 1024;
   const body = `process.stdout.write(Buffer.alloc(${bytes}, 'a')); process.exit(0);`;
   const child = laneSpawn(
-    ['run', '--repo', 'r', '--lane', 'default', '--log', logPath, '--', process.execPath, '-e', body],
+    ['run', '--repo', 'r', '--lane', 'default', '--log', logPath, '--', 'node', '-e', body],
     { env, cwd: repoDir },
   );
   let sentSignal = false;
@@ -292,7 +292,7 @@ setInterval(() => {}, 1000);
     // the cancel, it would write the marker at process end, which never
     // happens for this sleeping command; a local rerun is instead detected
     // by the marker's absence.
-    const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', process.execPath, '-e', body], { env, cwd: repoDir });
+    const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', 'node', '-e', body], { env, cwd: repoDir });
     let stderr = '';
     child.stderr.on('data', (d) => {
       stderr += d;
@@ -395,7 +395,7 @@ test('~5MB of remote stdout under a slowly-draining foreground caller completes,
   const logPath = path.join(tmpDir('log'), 'out.log');
   const bytes = 5 * 1024 * 1024;
   const body = `process.stdout.write(Buffer.alloc(${bytes}, 'a'));`;
-  const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--log', logPath, '--', process.execPath, '-e', body], {
+  const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--log', logPath, '--', 'node', '-e', body], {
     env,
     cwd: repoDir,
   });
@@ -654,7 +654,7 @@ test('remote run: waitedMs records the wait before the command started, not the 
   const { env, state, repoDir } = setup();
   // Long enough that the ssh connect + runner startup the formula counts as wait (seconds under load) stays well under the run.
   const runMs = 8000;
-  const cmd = [process.execPath, '-e', `setTimeout(() => process.exit(0), ${runMs});`];
+  const cmd = ['node', '-e', `setTimeout(() => process.exit(0), ${runMs});`];
   const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...cmd], env, repoDir);
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
   const result = resultOf(state, id);
@@ -668,7 +668,7 @@ test('remote run: waitedMs records the wait before the command started, not the 
 
 test('remote run: a result that lands 6s after the run ended does not count the fetch delay as queue wait', async () => {
   const { env, state, repoDir } = setup({ ssh: 'slow-result' });
-  const cmd = [process.execPath, '-e', 'process.exit(0)'];
+  const cmd = ['node', '-e', 'process.exit(0)'];
   const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...cmd], env, repoDir);
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
   const result = resultOf(state, id);
@@ -683,7 +683,7 @@ test('remote run: a result from a runner that reports no queuedMs still gets a w
   const { env, state, repoDir } = setup({ ssh: 'legacy-result' });
   // Long enough that the ssh connect + runner startup the formula counts as wait (seconds under load) stays well under the run.
   const runMs = 8000;
-  const cmd = [process.execPath, '-e', `setTimeout(() => process.exit(0), ${runMs});`];
+  const cmd = ['node', '-e', `setTimeout(() => process.exit(0), ${runMs});`];
   const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...cmd], env, repoDir);
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
   const result = resultOf(state, id);
@@ -754,7 +754,7 @@ test('a concurrent double submit of the same --id dispatches once and runs once;
   const marker = path.join(tmpDir('marker'), 'runs');
   const ID = crypto.randomUUID();
   const body = `require('fs').appendFileSync(${JSON.stringify(marker)}, process.env.LANE_FAKE_RUNNER === '1' ? 'R' : 'L'); setTimeout(() => {}, 1500);`;
-  const args = ['run', '--repo', 'r', '--lane', 'default', '--detach', '--id', ID, '--', process.execPath, '-e', body];
+  const args = ['run', '--repo', 'r', '--lane', 'default', '--detach', '--id', ID, '--', 'node', '-e', body];
   const [a, b] = await Promise.all([laneRun(args, { env, cwd: repoDir }), laneRun(args, { env, cwd: repoDir })]);
   assert.equal(a.code, 0, a.stderr);
   assert.equal(b.code, 0, b.stderr);
