@@ -1155,6 +1155,8 @@ export function defaultBranchConfig(cwd, commonDir) {
   const root = worktreeRootOf(cwd);
   if (!root || !commonDir) return null;
   const rels = configRelPaths(root, cwd);
+  // cat-file's batch protocol is newline-delimited: such a path would misalign every response after it
+  if (rels.some((rel) => rel.includes('\n'))) return null;
   try {
     const queries = DEFAULT_BRANCH_REFS.flatMap((ref) => [ref, ...rels.map((rel) => `${ref}:${rel}`)]);
     const lines = gitInCommonDir(commonDir, ['cat-file', '--batch-check=%(objectname) %(objecttype)'], `${queries.join('\n')}\n`).split('\n');
@@ -1186,15 +1188,25 @@ function readWorktreeConfig(cwd, commonDir, configRoot) {
  */
 export function repoConfigSource(cwd, configRoot, env = process.env) {
   const commonDir = repoIdentity(cwd);
-  const worktree = readWorktreeConfig(cwd, commonDir, configRoot);
-  if (configRoot !== undefined) return { from: 'snapshot', label: worktree.label, text: worktree.text };
+  const fromWorktree = (from) => {
+    const worktree = readWorktreeConfig(cwd, commonDir, configRoot);
+    return { from, label: worktree.label, text: worktree.text };
+  };
+  if (configRoot !== undefined) return fromWorktree('snapshot');
   const mode = env[CONFIG_FROM_ENV] ?? '';
   if (mode !== '' && mode !== 'worktree') throw new ConfigError(`${CONFIG_FROM_ENV}="${mode}" is not valid; use "worktree" or leave it unset`);
-  if (mode === 'worktree') return { from: 'worktree-override', label: worktree.label, text: worktree.text };
+  if (mode === 'worktree') return fromWorktree('worktree-override');
   const main = commonDir ? defaultBranchConfig(cwd, commonDir) : null;
-  if (!main) return { from: 'worktree', label: worktree.label, text: worktree.text };
+  if (!main) return fromWorktree('worktree');
+  // read only to report a difference, so an unreadable worktree copy counts as different and never blocks the default branch's
+  let worktree = null;
+  try {
+    worktree = readWorktreeConfig(cwd, commonDir, configRoot);
+  } catch {
+    worktree = null;
+  }
   const root = worktreeRootOf(cwd);
-  const differs = !worktree.configPath || path.relative(root, worktree.configPath).split(path.sep).join('/') !== main.rel || worktree.text !== main.text;
+  const differs = !worktree?.configPath || path.relative(root, worktree.configPath).split(path.sep).join('/') !== main.rel || worktree.text !== main.text;
   return { from: 'default-branch', label: `${main.shortRef}:${main.rel}`, text: main.text, ref: main.shortRef, blob: main.blob, differs };
 }
 

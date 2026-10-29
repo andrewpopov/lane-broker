@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import path from 'node:path';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, gitFixture } from './helpers.js';
 import { paths } from '../src/state.js';
@@ -69,7 +70,8 @@ test('a branch that raises a lane has no effect until LANE_BROKER_CONFIG_FROM=wo
   commitConfig(feature, withCpu(6));
   const ignored = await run(f, feature);
   assert.equal(grantOf(ignored), 2, ignored.stderr);
-  const override = await run(f, feature, { [CONFIG_FROM_ENV]: 'worktree', LANE_BROKER_NO_CACHE: '1' });
+  // no LANE_BROKER_NO_CACHE: the override is another config, so the default-branch pass above must not be reused
+  const override = await run(f, feature, { [CONFIG_FROM_ENV]: 'worktree' });
   assert.equal(grantOf(override), 6, override.stderr);
   assert.doesNotMatch(override.stderr, USING_LINE);
   assert.equal(lastRow(f).configFrom, 'worktree-override');
@@ -122,4 +124,32 @@ test('repoConfigSource with a configRoot reads the snapshot even inside a git re
   const source = repoConfigSource(f.repoDir, f.repoDir, {});
   assert.equal(source.from, 'snapshot');
   assert.equal(JSON.parse(source.text).lanes.l.cpuCores, 9);
+});
+
+test('a merged config change is never answered from a pass cached under the old one, and a cached row records its config', async () => {
+  const f = repoFixture({ committed: withCpu(2) });
+  const old = path.join(f.base, 'old');
+  gitFixture(['worktree', 'add', '-q', '-b', 'old', old], f.repoDir);
+  assert.equal(grantOf(await run(f, old)), 2);
+  const cached = await run(f, old);
+  assert.match(cached.stderr, /cached pass from /);
+  const blobBefore = gitFixture(['rev-parse', 'main:.lane-broker.json'], f.repoDir).trim();
+  assert.equal(lastRow(f).configFrom, 'default-branch');
+  assert.equal(lastRow(f).configBlob, blobBefore);
+  commitConfig(f.repoDir, withCpu(3));
+  const after = await run(f, old);
+  assert.doesNotMatch(after.stderr, /cached pass from /);
+  assert.equal(grantOf(after), 3, after.stderr);
+});
+
+test('an unreadable worktree copy does not block the default branch config', async () => {
+  const f = repoFixture({ committed: withCpu(2) });
+  const old = path.join(f.base, 'old');
+  gitFixture(['worktree', 'add', '-q', '-b', 'old', old], f.repoDir);
+  fs.rmSync(path.join(old, '.lane-broker.json'));
+  fs.mkdirSync(path.join(old, '.lane-broker.json'));
+  const r = await run(f, old);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(grantOf(r), 2);
+  assert.equal(r.stderr.match(USING_LINE)?.length, 1, r.stderr);
 });

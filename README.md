@@ -391,7 +391,9 @@ value besides unset; anything else exits `64`) reads the worktree's file instead
 (`default-branch` with `configBlob`, or `worktree-override`); a run on the worktree's own file (no git repo, or no default-branch
 config) records neither. A runner (`lane remote-exec`) is unchanged: it reads its snapshot's own file, so a class tightened on main
 reaches an old worktree's remote run only once that worktree rebases. The BRAIN-552 approval below follows the same source: a config
-read from the default branch is approved against that text, otherwise against `git show HEAD:.lane-broker.json`.
+read from the default branch is approved against that text, otherwise against `git show HEAD:.lane-broker.json`. The result cache keys a run on that config too
+(`configBlob`, or the override), so a merged lane change never reuses a verdict reached under the old one. A `.lane-broker.json`
+committed as a symlink is not followed on the default branch (its blob is the link target): commit the file itself.
 
 A top-level `"undeclaredLanes": "allow"` (default `"refuse"`, today's
 behaviour) lets an undeclared `--lane` name through instead of refusing it:
