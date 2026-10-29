@@ -6,6 +6,8 @@ import { readAttempt, supervisorAlive, moveInterruptedLabel } from './attempts.j
 import { cancelCommand } from './cancel.js';
 import { loadGlobalConfigOrError } from './config.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
+import { settleAbandonedLocalAttempt } from './local-reconcile.js';
+import { readPending, settleDeadPending } from './pending.js';
 
 const RECONCILE_SSH_DEADLINE_MS = 30_000;
 // Under this much of --timeout left, asking the runner cannot finish in time: keep polling so the timeout path answers 75.
@@ -137,6 +139,8 @@ export async function waitCommand(id, { timeoutMs } = {}) {
         const settledAttempt = readAttempt(root, id);
         if (settledAttempt && !supervisorAlive(settledAttempt)) {
           const moveLabel = moveInterruptedLabel(id, settledAttempt);
+          // BRAIN-605: a post-fallback attempt that never reached admission is settled (exit 75) rather than reported forever
+          if (!moveLabel && settledAttempt.executor === 'local' && (await settleAbandonedLocalAttempt(root, id)).settled) continue;
           if (moveLabel || settledAttempt.executor !== 'remote') {
             const label = moveLabel ?? 'ORPHANED (post-fallback)';
             process.stderr.write(
@@ -166,7 +170,13 @@ export async function waitCommand(id, { timeoutMs } = {}) {
           }
         }
       }
-      const found = lease || listQueue(root).some((t) => t && t.id === id) || Boolean(attempt);
+      // BRAIN-494: a detached id whose supervisor has not registered yet is found while that supervisor lives; once it is dead the id settles
+      let pendingFound = false;
+      if (!lease && !attempt && readPending(root, id)) {
+        if ((await settleDeadPending(root, id)).settled) continue;
+        pendingFound = true;
+      }
+      const found = pendingFound || lease || listQueue(root).some((t) => t && t.id === id) || Boolean(attempt);
       if (found) {
         notFoundSince = null;
       } else {

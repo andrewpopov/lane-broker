@@ -1095,6 +1095,14 @@ records nothing, yet its job may still be running (BRAIN-515). The one exception
 `remoteResultWaitMs`): it cancels the remote command and confirms that before any local retry, so the retry is sequential, not a
 concurrent second run.
 
+**Dead supervisor before admission (BRAIN-605, BRAIN-494).** An attempt with `executor: local` (a remote attempt that fell back, or
+a rebind that stayed in the local queue) whose supervisor is dead, with no lease, queue entry or parked ticket, can never
+produce a result. `lane reconcile` (and `lane wait`) settle it: exit 75, `reason: supervisor-died-while-queued`, the
+attempt record removed (`src/local-reconcile.js`). `lane run --detach` writes `pending/<id>.json` (fsynced, with the
+supervisor's identity) before printing the id; `lane wait` counts a pending id with a live supervisor as found, and
+settles one whose supervisor died before registering anything as exit 75, `reason: supervisor-died-before-register`
+(`src/pending.js`). Any other record wins over the pending file; `lane gc` prunes it with logs and results.
+
 **Reconciling an ORPHANED-REMOTE attempt (BRAIN-515).** A runner that went away (a reboot, a nightly power-off, a dropped
 network) usually comes back knowing what happened to the job, so an orphan is settled from the runner's own answer and never run
 again:

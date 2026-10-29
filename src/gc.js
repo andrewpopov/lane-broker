@@ -242,10 +242,10 @@ export async function gcRemoteTickets({ remoteRoot, brokerRoot = stateHome(), re
  * unless it is new, and a new id's files are brand new.
  */
 export async function gcLogsAndResults(root, { retentionMs, maxFiles = Infinity, now = Date.now(), dryRun = false }) {
-  const summary = { logs: 0, results: 0, skippedLive: 0, bounded: false };
+  const summary = { logs: 0, results: 0, pending: 0, skippedLive: 0, bounded: false };
   const live = await withLock(root, () => liveIds(root, { withAttempts: true }), lockOptions);
   const p = paths(root);
-  for (const [kind, dir] of [['logs', p.logs], ['results', p.results]]) {
+  for (const [kind, dir] of [['logs', p.logs], ['results', p.results], ['pending', p.pending]]) {
     let entries = [];
     try {
       assertRealDirUnder(root, dir);
@@ -258,7 +258,7 @@ export async function gcLogsAndResults(root, { retentionMs, maxFiles = Infinity,
     for (const entry of entries) {
       // Dirent comes from the directory listing without following links: a symlink is not a file here.
       if (!entry.isFile() || path.extname(entry.name) !== generated || !GENERATED_NAME.test(path.parse(entry.name).name)) continue;
-      if (summary.logs + summary.results >= maxFiles) {
+      if (summary.logs + summary.results + summary.pending >= maxFiles) {
         summary.bounded = true;
         return summary;
       }

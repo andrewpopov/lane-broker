@@ -302,7 +302,9 @@ test('cancel while a post-fallback ticket sits QUEUED (capacity full): result 13
   await laneRun(['cancel', blockerId], { env }); // cleanup: release the blocker's own child group
 });
 
-test('supervisor SIGKILLed after fallback (still queued): wait fails fast, naming it, instead of hanging', async () => {
+// BRAIN-605: a still-queued attempt never ran, so `wait` settles it as lost (75) instead of reporting ORPHANED and
+// waiting for an operator's `lane cancel`.
+test('supervisor SIGKILLed after fallback (still queued): wait settles it as lost (75), naming it, instead of hanging', async () => {
   const { env, home, state, repoDir } = setup({ ssh: 'down' });
   const { id, blockerId } = await startQueuedFallback(env, home, state, repoDir);
 
@@ -313,11 +315,9 @@ test('supervisor SIGKILLed after fallback (still queued): wait fails fast, namin
   await sleep(300);
 
   const waited = await laneRun(['wait', id, '--timeout', '5s'], { env });
-  assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
-  assert.match(waited.stderr, /ORPHANED/);
-  assert.match(waited.stderr, new RegExp(`lane cancel ${id}`));
-
-  await laneRun(['cancel', blockerId], { env }); // cleanup: release the blocker's own child group
+  await laneRun(['cancel', blockerId], { env }); // cleanup first: release the blocker's own child group
+  assert.equal(waited.code, 75, `stderr: ${waited.stderr}`);
+  assert.match(waited.stderr, new RegExp(`${id} was settled as lost \\(supervisor-died-while-queued\\)`));
 });
 
 // ---- BRAIN-319 P1 (Codex re-review): admitted (leased) fallback, dead supervisor ----
