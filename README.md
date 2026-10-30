@@ -2618,7 +2618,8 @@ What a run leaves behind is collected; what a live one owns never is. Everything
   contention policy (`setLockContentionPolicy` in `state.js`): every default-deadline acquisition that times out against a live
   holder logs `lane: lock-timeout: … still waiting, retrying`, backs off (jittered, up to 2 s) and tries again with a fresh
   deadline, so a supervisor never dies of contention. Only acquisition is retried, never the callback; an explicit `timeoutMs`
-  still throws; an owner.json that stays unreadable for three deadlines still throws; nesting the same lock throws `NestedLockError`.
+  still throws; an owner.json that stays unreadable for three consecutive deadlines still throws; a holder in the same process is never waited
+  out (it may be an awaited nested acquisition), so that still throws at the deadline.
 - `LANE_BROKER_TEST_SUPERVISOR_ERROR_AT` — a supervisor phase name (`remote`, `queued`, `running`, `finalize`);
   entering that phase throws a `TypeError`, to exercise the crash recorder (BRAIN-730).
 - `LANE_BROKER_TEST_TRANSFER_MAX_BYTES` — lowers `lane remote-exec`'s decompressed and compressed transfer caps (BRAIN-642), so a gzip-bomb

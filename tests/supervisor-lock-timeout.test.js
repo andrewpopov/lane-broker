@@ -4,7 +4,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneSpawn, laneRun, waitFor, sleep } from './helpers.js';
 import { tmpDir, setup, markerCmd, resultOf } from './remote-harness.js';
-import { paths, withLock, LockTimeoutError, NestedLockError, setLockContentionPolicy, resetLockContentionPolicy } from '../src/state.js';
+import { paths, withLock, LockTimeoutError, setLockContentionPolicy, resetLockContentionPolicy } from '../src/state.js';
 import { readHistoryRows } from '../src/suggest.js';
 
 // BRAIN-730: the lock is busy ~99% of the time under load, so a supervisor's default 15s acquire deadline expires. That is
@@ -139,14 +139,13 @@ test('under the policy a LockTimeoutError thrown inside fn is not retried', with
   assert.equal(ran, 1);
 }));
 
-test('acquiring the same lock from inside a held one throws NestedLockError at once', async () => {
+test('under the policy an awaited nested acquisition fails at its deadline instead of waiting forever', { timeout: 10_000 }, withShortDeadline(async () => {
   const { state } = freshEnv();
-  const started = Date.now();
+  setLockContentionPolicy({ onContention: () => {} });
   await withLock(state, async () => {
-    await assert.rejects(withLock(state, () => {}), NestedLockError);
-  });
-  assert.ok(Date.now() - started < 5000);
-});
+    await assert.rejects(withLock(state, () => {}), LockTimeoutError);
+  }, { timeoutMs: 10_000 });
+}));
 
 test('under the policy an owner.json that stays unreadable still fails, after three deadlines', withShortDeadline(async () => {
   const { state } = freshEnv();
@@ -175,7 +174,7 @@ test('under the policy a readable owner between unreadable ones restarts the unr
   setLockContentionPolicy({
     onContention: (err) => {
       contentions.push(err);
-      if (contentions.length === 1) fs.writeFileSync(ownerFile, JSON.stringify({ pid: process.pid, token: 'live', start: null, at: Date.now() }));
+      if (contentions.length === 1) fs.writeFileSync(ownerFile, JSON.stringify({ pid: process.ppid, token: 'live', start: null, at: Date.now() }));
       if (contentions.length === 2) fs.writeFileSync(ownerFile, '{torn');
     },
   });

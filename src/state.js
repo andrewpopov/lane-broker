@@ -593,21 +593,12 @@ export class LockTimeoutError extends Error {
   }
 }
 
-/** Thrown at once when a lock is taken from inside a callback that already holds it: it could only wait for itself. */
-export class NestedLockError extends Error {
-  constructor(lockPath) {
-    super(`lane-broker: nested acquisition of the lock at ${lockPath} from inside a callback that already holds it`);
-    this.name = 'NestedLockError';
-    this.code = 'LANE_LOCK_NESTED';
-  }
-}
-
 let lockContentionPolicy = null;
 
 /**
  * BRAIN-730: a process that must not die of lock contention (the supervisor) sets this. A `withLock` that did not pass its own
  * `timeoutMs` then reports a live-holder timeout to `onContention(err)`, backs off with jitter and starts a fresh acquisition,
- * instead of throwing. Only acquisition is retried, never the callback.
+ * instead of throwing. Only acquisition is retried, never the callback, and never against a holder in this same process.
  */
 export function setLockContentionPolicy({ onContention }) {
   lockContentionPolicy = { onContention };
@@ -834,8 +825,7 @@ function assertLockOrder(group) {
  */
 export async function withLock(root, fn, { timeoutMs, pollMs = 25, lockPath = paths(root).lock, group = 'broker' } = {}) {
   assertLockOrder(group);
-  if ((heldGroups.getStore() ?? []).some((h) => h.held && h.lockPath === lockPath)) throw new NestedLockError(lockPath);
-  const handle = { group, held: true, lockPath };
+  const handle = { group, held: true };
   const lockDir = lockPath;
   const retryContention = timeoutMs === undefined && lockContentionPolicy !== null;
   if (timeoutMs === undefined) timeoutMs = lockTimeoutMsDefault();
@@ -929,7 +919,8 @@ export async function withLock(root, fn, { timeoutMs, pollMs = 25, lockPath = pa
     }
     if (Date.now() > deadline) {
       const err = new LockTimeoutError(`lane-broker: timed out waiting for the global lock held by pid ${owner.pid}`);
-      if (!retryContention) throw err;
+      // our own process holding it may be an awaited nested acquisition, which waiting can never end
+      if (!retryContention || owner.pid === process.pid) throw err;
       await backOff(err);
       continue;
     }
