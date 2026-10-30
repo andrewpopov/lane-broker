@@ -43,7 +43,7 @@ import { remoteCpuAllocation, selectRunner, dispatchRemote, needsProtocol2, reba
 import { remoteExcludeWarnings } from './remote-exclude.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
-import { EXECUTION_CEILING_CAPABILITY, REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
+import { DEPS_KEY_FILES_CAPABILITY, EXECUTION_CEILING_CAPABILITY, REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
 import { SNAPSHOT_GZIP_CAPABILITY, TRANSFER_GZIP } from './remote-gzip.js';
 import { BLOB_CACHE_CAPABILITY } from './remote-blobs.js';
 import { createAttempt, readAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
@@ -585,7 +585,7 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome(), cpu
     ...(isDispatchOnly(globalCfg) || locallyRefusedNow(enriched, globalCfg) ? { retryTimedOut: heartbeatUpRunners(root, globalCfg) } : {}),
     maxRemoteQueue: globalCfg.maxRemoteQueue,
     requireProtocol2: needsProtocol2(enriched.remote) || Boolean(queueTimeoutFor(enriched, globalCfg, cpuLimit)),
-    requireCapabilities: [...(isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : []), ...(enriched.maxExecutionCpuCores !== undefined ? [EXECUTION_CEILING_CAPABILITY, CPU_LIMIT_CAPABILITY] : [])],
+    requireCapabilities: [...(isEnforcementRequired(enriched) ? [CLASSES_CAPABILITY] : []), ...(enriched.maxExecutionCpuCores !== undefined ? [EXECUTION_CEILING_CAPABILITY, CPU_LIMIT_CAPABILITY] : []), ...(enriched.remote?.remoteDepsCacheKeyFiles?.length > 0 ? [DEPS_KEY_FILES_CAPABILITY] : [])],
     readinessNeeds: readinessNeeds(enriched.remote, globalCfg),
     reservation: {
       weight: enriched.weight,

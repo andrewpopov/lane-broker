@@ -510,43 +510,64 @@ function workspaceKeyParts({ dir, lock, rootPackage, workspaces }) {
   return { parts };
 }
 
-/** Install scripts may read repository sources, so workspace installs with scripts key their bytes too. */
-function installSourceDigest(rootDir) {
+/**
+ * Install scripts may read repository sources, so workspace installs with scripts key their bytes too. `roots` are
+ * repo-relative paths (files or directories) walked in sorted order; the default `['']` is the whole tree.
+ */
+function installSourceDigest(rootDir, roots = ['']) {
   const hash = crypto.createHash('sha256');
   const root = fs.realpathSync(rootDir);
   const record = (name, value) => { hash.update(`${name}:${value.length}:`); hash.update(value); };
-  const walk = (relative) => {
+  const walkChildren = (relative) => {
     for (const name of fs.readdirSync(path.join(root, relative)).sort()) {
-      if (name === 'node_modules' || name === '.git') continue;
-      const rel = relative ? `${relative}/${name}` : name;
-      const file = path.join(root, rel);
-      const stat = fs.lstatSync(file);
-      record(rel, Buffer.from(`${stat.mode & 0o7777}:`));
-      if (stat.isSymbolicLink()) {
-        const target = fs.realpathSync(file);
-        const destination = path.relative(root, target);
-        if (destination.startsWith('..') || path.isAbsolute(destination) || destination.split(path.sep).some((part) => part === 'node_modules' || part === '.git')) {
-          throw new Error(`install source link ${rel} escapes the keyed source tree`);
-        }
-        record(`link:${rel}`, Buffer.from(fs.readlinkSync(file)));
-      } else if (stat.isDirectory()) {
-        walk(rel);
-      } else if (stat.isFile()) {
-        const contents = crypto.createHash('sha256');
-        const fd = fs.openSync(file, 'r');
-        try {
-          const chunk = Buffer.alloc(SCAN_CHUNK_BYTES);
-          let count;
-          while ((count = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0) contents.update(chunk.subarray(0, count));
-        } finally { fs.closeSync(fd); }
-        record(`file:${rel}`, contents.digest());
-      } else {
-        throw new Error(`unsupported install source ${rel}`);
-      }
+      if (name !== 'node_modules' && name !== '.git') visit(relative ? `${relative}/${name}` : name);
     }
   };
-  walk('');
+  const visit = (rel) => {
+    const file = path.join(root, rel);
+    const stat = fs.lstatSync(file);
+    record(rel, Buffer.from(`${stat.mode & 0o7777}:`));
+    if (stat.isSymbolicLink()) {
+      const target = fs.realpathSync(file);
+      const destination = path.relative(root, target);
+      if (destination.startsWith('..') || path.isAbsolute(destination) || destination.split(path.sep).some((part) => part === 'node_modules' || part === '.git')) {
+        throw new Error(`install source link ${rel} escapes the keyed source tree`);
+      }
+      record(`link:${rel}`, Buffer.from(fs.readlinkSync(file)));
+    } else if (stat.isDirectory()) {
+      walkChildren(rel);
+    } else if (stat.isFile()) {
+      const contents = crypto.createHash('sha256');
+      const fd = fs.openSync(file, 'r');
+      try {
+        const chunk = Buffer.alloc(SCAN_CHUNK_BYTES);
+        let count;
+        while ((count = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0) contents.update(chunk.subarray(0, count));
+      } finally { fs.closeSync(fd); }
+      record(`file:${rel}`, contents.digest());
+    } else {
+      throw new Error(`unsupported install source ${rel}`);
+    }
+  };
+  for (const start of roots) {
+    if (start === '') walkChildren('');
+    else visit(start);
+  }
   return hash.digest('hex');
+}
+
+/** PKG-277: pushes the `key-files` part (the lane's `remoteDepsCacheKeyFiles`, sorted, path names included), or returns the refusal. */
+function keyFilesPart({ rootDir, keyFiles, parts }) {
+  try {
+    for (const rel of keyFiles) {
+      assertContained(rootDir, rel);
+      if (!fs.existsSync(path.join(rootDir, rel))) return { key: null, reason: `remoteDepsCacheKeyFiles path ${rel} is not in the snapshot` };
+    }
+    parts.push(['key-files', installSourceDigest(rootDir, [...keyFiles].sort())]);
+    return null;
+  } catch (error) {
+    return { key: null, reason: error.message };
+  }
 }
 
 /**
@@ -573,6 +594,7 @@ export function computeDepsKey({
   env,
   npmVersion,
   rootScriptsSafe = false,
+  keyFiles = [],
   runtime = { version: process.version, platform: process.platform, arch: process.arch },
   system = currentSystem(),
   toolVersion = (cmd) => firstLineOfCommand(cmd, env),
@@ -627,15 +649,24 @@ export function computeDepsKey({
     ['install-locale', env.LC_ALL ?? ''],
   ];
   if (eligibility.hasInstallScript) parts.push(['cc-version', toolVersion('cc')], ['python3-version', toolVersion('python3')]);
-  if (eligibility.workspaces.length > 0 || 'workspaces' in pkg) {
+  const isWorkspaceRepo = eligibility.workspaces.length > 0 || 'workspaces' in pkg;
+  if (isWorkspaceRepo) {
     const ws = workspaceKeyParts({ dir, lock, rootPackage: pkg, workspaces: eligibility.workspaces });
     if (ws.reason) return { key: null, reason: ws.reason };
     parts.push(...ws.parts);
-    if (eligibility.hasInstallScript || rootScriptsSafe) {
-      try { parts.push(['install-sources', installSourceDigest(rootDir)]); }
-      catch (error) { return { key: null, reason: error.message }; }
-    }
   }
+  // PKG-277: which repo sources a declared-safe root script may have read. Precedence: a workspace repo with install scripts
+  // keys the whole tree (over keyFiles); else the lane's keyFiles; else a workspace repo keys the whole tree; else refuse.
+  const wholeTree = () => {
+    try { parts.push(['install-sources', installSourceDigest(rootDir)]); return null; }
+    catch (error) { return { key: null, reason: error.message }; }
+  };
+  let refused = null;
+  if (isWorkspaceRepo && eligibility.hasInstallScript) refused = wholeTree();
+  else if (rootScriptsSafe && keyFiles.length > 0) refused = keyFilesPart({ rootDir, keyFiles, parts });
+  else if (rootScriptsSafe && isWorkspaceRepo) refused = wholeTree();
+  else if (rootScriptsSafe) refused = { key: null, reason: 'remoteDepsCacheRootScriptsSafe on a repo without workspaces needs remoteDepsCacheKeyFiles naming the files its root scripts read' };
+  if (refused) return refused;
   for (const rel of eligibility.tarballs) {
     const bytes = readIfExists(path.resolve(dir, rel));
     if (!bytes) return { key: null, reason: `file: tarball ${rel} is not in the snapshot` };

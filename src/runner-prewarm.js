@@ -101,6 +101,7 @@ export async function runnerPrewarmCommand(
       remoteSetup: resolved.remoteSetup,
       remoteDepsCache: resolved.remoteDepsCache,
       remoteDepsCacheRootScriptsSafe: resolved.remoteDepsCacheRootScriptsSafe,
+      remoteDepsCacheKeyFiles: resolved.remoteDepsCacheKeyFiles,
       remoteOmitEscapingSymlinks: resolved.remoteOmitEscapingSymlinks,
       priorityRequested: 'low',
     });

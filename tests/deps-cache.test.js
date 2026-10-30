@@ -433,7 +433,8 @@ test('key: a root lifecycle script outside the allowlist is not cacheable unless
     const result = computeDepsKey(f.inputs());
     assert.equal(result.key, null, name);
     assert.match(result.reason, new RegExp(`${name}: husky install`));
-    assert.ok(computeDepsKey({ ...f.inputs(), rootScriptsSafe: true }).key, `${name} is cacheable once the lane declares root scripts safe`);
+    fs.writeFileSync(path.join(f.root, 'gen-input.txt'), 'one');
+    assert.ok(computeDepsKey({ ...f.inputs(), rootScriptsSafe: true, keyFiles: ['gen-input.txt'] }).key, `${name} is cacheable once the lane declares root scripts safe and names the files they read`);
   }
   const near = makeKeyFixture({ scripts: { prepare: 'git config core.hooksPath .githooks' } });
   assert.equal(computeDepsKey(near.inputs()).key, null, 'the allowlist is exact strings, not a prefix');
@@ -1406,4 +1407,95 @@ test('workspace bin entry stays ineligible until its executable links can be rec
   const f = makeWorkspaceKeyFixture();
   writeWorkspaceFile(f, 'packages/api/package.json', JSON.stringify({ name: '@x/api', bin: 'cli.js' }));
   assert.match(computeDepsKey(f.inputs()).reason, /declares bin/);
+});
+
+test('key: PKG-277 a workspace repo with the safe flag and no key files keys byte-identically to before (whole-tree install-sources)', () => {
+  const previous = process.umask(0o022);
+  try {
+    const f = makeWorkspaceKeyFixture({ scripts: { postinstall: 'node gen.js' } });
+    const normalizeModes = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        fs.chmodSync(full, entry.isDirectory() ? 0o755 : 0o644);
+        if (entry.isDirectory()) normalizeModes(full);
+      }
+    };
+    normalizeModes(f.root);
+    const runtime = { version: 'v22.0.0', platform: 'linux', arch: 'x64' };
+    assert.equal(computeDepsKey({ ...f.inputs(), env: { PATH: '/bin', HOME: '/home/runner' }, runtime, rootScriptsSafe: true }).key, '08d7ee63702d74216de9a7981bdc4ce8e86753fec7a5b920e2d9e3ee6217d496');
+  } finally { process.umask(previous); }
+});
+
+test('key-files: PKG-277 a listed file or directory is keyed by bytes; an unlisted one is not', () => {
+  const f = makeKeyFixture({ scripts: { postinstall: 'node gen.js' } });
+  const write = (rel, content) => {
+    fs.mkdirSync(path.dirname(path.join(f.root, rel)), { recursive: true });
+    fs.writeFileSync(path.join(f.root, rel), content);
+  };
+  write('prisma/schema.prisma', 'model A {}');
+  write('prisma/migrations/1/migration.sql', 'select 1');
+  write('unlisted.txt', 'one');
+  const keyed = () => computeDepsKey({ ...f.inputs(), rootScriptsSafe: true, keyFiles: ['prisma/schema.prisma', 'prisma/migrations'] });
+  const base = keyed();
+  assert.ok(base.key, base.reason);
+  assert.equal(keyed().key, base.key);
+  write('unlisted.txt', 'two');
+  assert.equal(keyed().key, base.key, 'an unlisted file is not in the key');
+  write('prisma/schema.prisma', 'model A { id Int }');
+  const edited = keyed().key;
+  assert.notEqual(edited, base.key, 'a changed listed file changes the key');
+  write('prisma/migrations/2/migration.sql', 'select 2');
+  assert.notEqual(keyed().key, edited, 'a new file under a listed directory changes the key');
+  assert.notEqual(
+    computeDepsKey({ ...f.inputs(), rootScriptsSafe: true, keyFiles: ['prisma/schema.prisma'] }).key,
+    edited,
+    'which paths are listed is part of the key',
+  );
+  assert.equal(
+    computeDepsKey({ ...f.inputs(), rootScriptsSafe: true, keyFiles: ['prisma/migrations', 'prisma/schema.prisma'] }).key,
+    keyed().key,
+    'the order the lane lists them in does not matter',
+  );
+  assert.equal(computeDepsKey({ ...f.inputs(), keyFiles: ['prisma/schema.prisma'] }).key, null, 'without the safe flag the install script is still refused (keyFiles never widens it)');
+});
+
+test('key-files: PKG-277 a missing listed path, an escaping link or no key files on a repo without workspaces refuse', () => {
+  const f = makeKeyFixture({ scripts: { postinstall: 'node gen.js' } });
+  fs.writeFileSync(path.join(f.root, 'gen-input.txt'), 'one');
+  const missing = computeDepsKey({ ...f.inputs(), rootScriptsSafe: true, keyFiles: ['gen-input.txt', 'nope/schema.prisma'] });
+  assert.deepEqual(missing, { key: null, reason: 'remoteDepsCacheKeyFiles path nope/schema.prisma is not in the snapshot' });
+
+  fs.mkdirSync(path.join(f.root, 'dir'));
+  fs.symlinkSync(os.tmpdir(), path.join(f.root, 'dir', 'out'));
+  const escaping = computeDepsKey({ ...f.inputs(), rootScriptsSafe: true, keyFiles: ['dir'] });
+  assert.equal(escaping.key, null);
+  assert.match(escaping.reason, /escapes the keyed source tree/);
+  const viaLink = computeDepsKey({ ...f.inputs(), rootScriptsSafe: true, keyFiles: ['dir/out'] });
+  assert.match(viaLink.reason, /symlink/);
+  assert.match(computeDepsKey({ ...f.inputs(), rootScriptsSafe: true, keyFiles: ['../x'] }).reason, /not a plain relative path/);
+
+  assert.deepEqual(computeDepsKey({ ...f.inputs(), rootScriptsSafe: true }), {
+    key: null,
+    reason: 'remoteDepsCacheRootScriptsSafe on a repo without workspaces needs remoteDepsCacheKeyFiles naming the files its root scripts read',
+  });
+});
+
+test('key-files: PKG-277 in a workspace repo a dependency install script keys the whole tree over keyFiles; without one the key files decide', () => {
+  const withScript = makeWorkspaceKeyFixture({ lockPackages: workspaceLockPackages({ 'node_modules/x': { ...REGISTRY_ENTRY('1.0.0'), hasInstallScript: true } }), scripts: { postinstall: 'node gen.js' } });
+  fs.writeFileSync(path.join(withScript.root, 'gen-input.txt'), 'one');
+  const keyed = (f) => computeDepsKey({ ...f.inputs(), rootScriptsSafe: true, keyFiles: ['gen-input.txt'] });
+  const whole = keyed(withScript);
+  assert.ok(whole.key, whole.reason);
+  assert.equal(whole.key, computeDepsKey({ ...withScript.inputs(), rootScriptsSafe: true }).key, 'keyFiles are ignored when the whole tree is keyed');
+  fs.writeFileSync(path.join(withScript.root, 'unlisted.txt'), 'x');
+  assert.notEqual(keyed(withScript).key, whole.key, 'an unlisted file changes the key');
+
+  const noScript = makeWorkspaceKeyFixture({ scripts: { postinstall: 'node gen.js' } });
+  fs.writeFileSync(path.join(noScript.root, 'gen-input.txt'), 'one');
+  const listed = keyed(noScript);
+  assert.ok(listed.key, listed.reason);
+  fs.writeFileSync(path.join(noScript.root, 'unlisted.txt'), 'x');
+  assert.equal(keyed(noScript).key, listed.key, 'the key files replace the whole-tree key');
+  fs.writeFileSync(path.join(noScript.root, 'gen-input.txt'), 'two');
+  assert.notEqual(keyed(noScript).key, listed.key);
 });

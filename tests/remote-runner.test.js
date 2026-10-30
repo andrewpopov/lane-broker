@@ -1481,3 +1481,27 @@ test('EXECUTION_CEILING_DIRECT_REFUSAL: a modern runner with quotas off rejects 
   assert.equal(fs.existsSync(marker), false, 'refused intake never runs the payload');
   assert.match(outcome.err, /CPU_LIMIT_UNAVAILABLE.*maxExecutionCpuCores/);
 });
+
+test('PKG-277: remoteDepsCacheKeyFiles needs protocol 2, the safe flag and an array of plain relative paths', async () => {
+  const safe = { remoteDeps: ['.'], remoteDepsCacheRootScriptsSafe: true };
+  const cases = {
+    'protocol 1': { protocol: 1, remoteDepsCacheKeyFiles: ['a.txt'] },
+    'no safe flag': { protocol: 2, remoteDeps: ['.'], remoteDepsCacheKeyFiles: ['a.txt'] },
+    absolute: { protocol: 2, ...safe, remoteDepsCacheKeyFiles: ['/etc/passwd'] },
+    parent: { protocol: 2, ...safe, remoteDepsCacheKeyFiles: ['../a.txt'] },
+    'not an array': { protocol: 2, ...safe, remoteDepsCacheKeyFiles: 'a.txt' },
+    empty: { protocol: 2, ...safe, remoteDepsCacheKeyFiles: [] },
+    duplicate: { protocol: 2, ...safe, remoteDepsCacheKeyFiles: ['a.txt', 'a.txt'] },
+  };
+  for (const [name, fields] of Object.entries(cases)) {
+    const { env } = freshShadowEnv();
+    const root = tmpDir('remote-exec-root');
+    const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+    const header = makeHeader(fields);
+    const { code } = await runOne(header, entries, { env, root, src });
+    assert.equal(code, 0, name);
+    const result = await getResult(header.ticketId, root, env);
+    assert.equal(result.kind, 'rejected', name);
+    assert.match(result.reason, /invalid remoteDepsCacheKeyFiles/, name);
+  }
+});
