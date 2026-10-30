@@ -1,0 +1,89 @@
+import crypto from 'node:crypto';
+import path from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { scrubbedGitEnv } from './remote-manifest.js';
+
+const MAX_HOPS = 8;
+const PS_LINE = /^\s*(\d+)\s+(\w{3} \w{3}\s+\d+ \d\d:\d\d:\d\d \d{4})\s+(.*)$/;
+const OPTIONS_WITH_VALUE = new Set(['-c', '-C']);
+
+export const PUSH_GATE_LANE = /^prepush(-|$)/;
+
+function psRow(pid) {
+  const out = execFileSync('ps', ['-o', 'ppid=,lstart=,args=', '-p', String(pid)], {
+    encoding: 'utf8',
+    env: { ...process.env, LC_ALL: 'C', LC_TIME: 'C' },
+    stdio: ['ignore', 'pipe', 'ignore'],
+    timeout: 5000,
+  });
+  const match = PS_LINE.exec(out.trim());
+  if (!match) throw new Error(`unparseable ps row for ${pid}`);
+  return { ppid: Number(match[1]), start: match[2], args: match[3].split(/\s+/) };
+}
+
+function pushArgsOf(args) {
+  if (path.basename(args[0] ?? '') !== 'git') return null;
+  for (let i = 1; i < args.length; i += 1) {
+    if (OPTIONS_WITH_VALUE.has(args[i])) i += 1;
+    else if (!args[i].startsWith('-')) return args[i] === 'push' ? args.slice(i + 1) : null;
+  }
+  return null;
+}
+
+const sha256 = (text) => crypto.createHash('sha256').update(text).digest('hex');
+
+function callerOf(worktree, env) {
+  return env.CLAUDE_CODE_SESSION_ID || env.CODEX_THREAD_ID || env.CODEX_SESSION_ID || `worktree:${worktree}`;
+}
+
+// Only the nearest git ancestor counts (so `git hook run pre-push` is not a push). Raw args are never kept: a URL can carry a token.
+export function detectPushGate({ cwd = process.cwd(), env = process.env, ppid = process.ppid } = {}) {
+  try {
+    for (let pid = ppid, hops = 0; pid > 1 && hops < MAX_HOPS; hops += 1) {
+      const row = psRow(pid);
+      const pushArgs = pushArgsOf(row.args);
+      if (path.basename(row.args[0] ?? '') === 'git') {
+        if (!pushArgs) return null;
+        const [worktree, branch] = execFileSync('git', ['rev-parse', '--show-toplevel', '--abbrev-ref', 'HEAD'], {
+          cwd,
+          encoding: 'utf8',
+          env: scrubbedGitEnv(),
+          stdio: ['ignore', 'pipe', 'ignore'],
+          timeout: 5000,
+        })
+          .trim()
+          .split('\n');
+        const gitStartEpoch = Date.parse(row.start);
+        if (!worktree || !branch || !Number.isFinite(gitStartEpoch)) return null;
+        return {
+          gitPid: pid,
+          gitStart: row.start,
+          gitStartEpoch,
+          clientPid: process.pid,
+          clientStart: psRow(process.pid).start,
+          caller: callerOf(worktree, env),
+          worktree,
+          branch,
+          pushArgsHash: sha256(pushArgs.join(' ')),
+        };
+      }
+      pid = row.ppid;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+// Never createdAt: hook setup can reorder lane submission.
+export function pushOrder(a, b) {
+  return a.gitStartEpoch - b.gitStartEpoch || a.gitPid - b.gitPid;
+}
+
+export function isSuperseded(result) {
+  return result.reason === 'superseded';
+}
+
+export function isRepeatOfPush(a, b) {
+  return a.worktree === b.worktree && a.branch === b.branch && a.pushArgsHash === b.pushArgsHash && a.gitPid !== b.gitPid;
+}

@@ -23,6 +23,7 @@ import { scrubbedGitEnv } from './remote-manifest.js';
 import { isExclusive, oversizedWeight, oversizedWeightMessage, EXCLUSIVE_PURPOSES, exclusiveDeadlineProblem } from './exclusive.js';
 import { parseScrubCommandEnv, scrubCommandEnv, SCRUB_COMMAND_ENV_VAR } from './scrub-command-env.js';
 import { computeContentKey, decideReuse } from './result-cache.js';
+import { detectPushGate, isSuperseded, PUSH_GATE_LANE } from './push-gate.js';
 
 const supervisorPath = fileURLToPath(new URL('./supervisor.js', import.meta.url));
 
@@ -178,6 +179,10 @@ function fmtAgo(ms) {
 /** Format a finished command's result the same way at every call site that
  *  reads one, instead of repeating the signal/exit branch three times. */
 function resultExit(prefix, result) {
+  if (isSuperseded(result)) {
+    process.stderr.write(`${prefix}: superseded by ${result.supersededBy}\n`);
+    return 130;
+  }
   if (result.signal) {
     process.stderr.write(`${prefix}: command terminated by signal ${result.signal}\n`);
     return 1;
@@ -707,8 +712,10 @@ export async function runCommand({
   const resultPath = path.join(p.results, `${id}.json`);
 
   const scrubNames = parseScrubCommandEnv(process.env[SCRUB_COMMAND_ENV_VAR]);
+  const pushGate = !detach && PUSH_GATE_LANE.test(resolved.lane) ? detectPushGate({ cwd }) : null;
   const ticket = {
     id,
+    ...(pushGate ? { pushGate } : {}),
     ...(ticketId ? { clientId: true } : {}),
     key: resolved.key,
     repoId: resolved.repoId,

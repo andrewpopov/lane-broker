@@ -15,6 +15,8 @@ import {
   withdrawMarkerPath,
   isWithdrawn,
   writeCancelMarkerFile,
+  supersededMarkerPath,
+  readSupersededBy,
   withLock,
   setLockContentionPolicy,
   MigrationInProgressError,
@@ -23,6 +25,7 @@ import {
 } from './state.js';
 import { enqueue, existingTicket, tryStart, dequeueSync, couldAdmitNow, listQueue, HELD_STATES, withdrawQueued, restoreQueued, discardRebinding, readQueuedRecord } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
+import { cancelCommand } from './cancel.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
@@ -113,14 +116,33 @@ function cancelRequested(root, id) {
   return isCancelled(root, id);
 }
 
+/** BRAIN-731: the one place a cancelled result learns it was a repeat push replacing it, whether it was queued or running. */
+function withSupersession(root, id, result) {
+  const supersededBy = readSupersededBy(root, id);
+  return supersededBy && result.cancelled ? { ...result, reason: 'superseded', supersededBy } : result;
+}
+
 function clearTicketMarkers(root, id) {
   discardRebinding(root, id);
-  for (const marker of [cancelMarkerPath(root, id), expireMarkerPath(root, id), withdrawMarkerPath(root, id)]) {
+  for (const marker of [cancelMarkerPath(root, id), expireMarkerPath(root, id), withdrawMarkerPath(root, id), supersededMarkerPath(root, id)]) {
     try {
       fs.unlinkSync(marker);
     } catch {
       // none pending
     }
+  }
+}
+
+/** Stop a ticket a repeat push replaced: TERM its live supervisor without waiting, or cancel an orphaned lease whose supervisor is gone. */
+async function stopSupersededTicket({ id, supervisorPid, orphanedLease }) {
+  if (orphanedLease) {
+    await cancelCommand(id);
+    return;
+  }
+  try {
+    process.kill(supervisorPid, 'SIGTERM');
+  } catch {
+    // already gone
   }
 }
 
@@ -448,6 +470,10 @@ function localRefusalResult(ticket, refusal) {
  * the `result` spread); `localReason` is the ticket's creation-time reason, or
  * `fallback:<reason>` when a remote attempt fell back to local.
  */
+function pushGateRowFields({ worktree, branch, caller, pushArgsHash }) {
+  return { worktree, branch, caller, pushArgsHash };
+}
+
 function historyRow(ticket, result, { fallbackReason, lease, contentKey = isCleanPass(result) ? undefined : ticket.contentKey, contentKeyVerified = false } = {}) {
   const executor = result.executor ?? 'local';
   const localReason = executor === 'local' ? (fallbackReason === undefined ? ticket.localReason : `fallback:${fallbackReason}`) : undefined;
@@ -471,6 +497,7 @@ function historyRow(ticket, result, { fallbackReason, lease, contentKey = isClea
     // BRAIN-700: the tree still hashed to the key when the run ended, so a failure on it is a verdict about that content
     ...(contentKey && contentKeyVerified ? { contentKeyVerified: true } : {}),
     ...(ticket.retryReason ? { retryReason: ticket.retryReason } : {}),
+    ...(ticket.pushGate ? pushGateRowFields(ticket.pushGate) : {}),
     ...(ticket.logPath ? { logPath: ticket.logPath } : {}),
     // BRAIN-380 §8: only a ticket that was admitted has a lease, so only its row carries the admission audit
     ...priorityAuditOf(lease),
@@ -1472,14 +1499,14 @@ async function main() {
             cancelled: false,
             reason: outcome,
           }
-        : { ...remoteCancelledResult(enriched.id, null), executor: 'local', fallbackReason };
+        : withSupersession(root, ticket.id, { ...remoteCancelledResult(enriched.id, null), executor: 'local', fallbackReason });
     const publish = (result) => {
       atomicWriteJson(ticket.resultPath, result);
       appendHistory(root, historyRow(ticket, result, { fallbackReason }));
     };
     if (attemptGeneration !== null) {
       await publishTerminal(root, ticket.id, attemptGeneration, () => publish(buildResult()));
-    } else if (isTimeout || forcePublish) {
+    } else if (isTimeout || forcePublish || readSupersededBy(root, ticket.id)) {
       // BRAIN-320 review fix B: `forcePublish` is only ever set by the
       // queue-timeout-then-cancel recheck above -- a ticket the queue-
       // timeout branch was ABOUT to publish (unconditionally, since it's
@@ -1543,6 +1570,7 @@ async function main() {
     const queued = await enqueue(root, enriched, globalCfg, { ownerGeneration: attemptGeneration });
     // BRAIN-321: this id was already submitted (a retried `lane run --detach --id`); its first supervisor owns it.
     if (queued.existing) process.exit(0);
+    for (const target of queued.supersededTargets ?? []) await stopSupersededTicket(target);
     if (queued.priorityDemoted) process.stderr.write('lane run: priority high demoted to medium (repo already has a queued high ticket)\n');
   } catch (err) {
     if (!(err instanceof MigrationInProgressError)) throw err;
@@ -1917,7 +1945,7 @@ async function main() {
       // BRAIN-350 `stopProven`: this cancel is what ended the command and the reap confirmed every tracked process gone. A runner
       // turns only such a result into its `runner-shutdown` proof, which lets the submitter run the job again elsewhere.
       const stopProven = !leaderExitedBeforeCancel && reapComplete === true;
-      result = { ...result, exit: 130, signal: null, cancelled: true, ...(stopProven ? { stopProven: true } : {}) };
+      result = withSupersession(root, ticket.id, { ...result, exit: 130, signal: null, cancelled: true, ...(stopProven ? { stopProven: true } : {}) });
       exitCode = 130;
     } else if (watchdogKill) {
       // BRAIN-431: the kill's own signal is not the story; it is `timeout`'s 124, with the window that elapsed
@@ -1995,7 +2023,7 @@ async function main() {
     if (attemptGeneration !== null) {
       const published = await publishTerminal(root, ticket.id, attemptGeneration, () => {
         if (cancelling) {
-          writeResult({ ...remoteCancelledResult(enriched.id, startedAt), executor: 'local' });
+          writeResult(withSupersession(root, ticket.id, { ...remoteCancelledResult(enriched.id, startedAt), executor: 'local' }));
         } else {
           writeResult({ ...result, executor: 'local', fallbackReason });
         }

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, isExpired, writeExpireMarkerFile, isWithdrawn, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, isExpired, writeExpireMarkerFile, writeCancelMarkerFile, writeSupersededMarkerFile, isWithdrawn, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
 import { sampleAndUpdateGate, readGateState } from './load.js';
 import { patchAttemptLocked, readAttempt } from './attempts.js';
 import { listLeases, readLease, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
@@ -20,6 +20,7 @@ import { isExclusive, exclusiveDeny, isExclusiveHead, exclusiveLeaseFields, with
 import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, resolveLaneNice, effectiveNice, effectiveRank, score, tierRank, waitedMs } from './priority.js';
 import { loadExpressTable, expressVerdict, expressAdmissionsLastMinute, recordExpressAdmission, logExpressAdmission } from './express.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
+import { isRepeatOfPush, pushOrder } from './push-gate.js';
 import { resolveScheduler, resolveSchedulerDetailed, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
 import { detectResourceCapacity, effectiveWeightCapacity, exclusiveBudget, cpuBudgetCores, evaluateMemoryAdmission, leaseResources, resolveTicketResources, terminalRowDefaults, capElasticClaim, elasticBelowFloor, elasticClaimRange } from './resources.js';
 
@@ -215,8 +216,28 @@ export async function enqueue(root, ticket, cfg = DEFAULT_GLOBAL_CONFIG, { owner
     };
     atomicWriteJson(queueFile(root, seq, ticket.id), record);
     touchSimArmFor(root, record);
-    return record;
+    return record.pushGate ? { ...record, supersededTargets: supersedeRepeatedPushes(root, record) } : record;
   });
+}
+
+/**
+ * BRAIN-731: a repeat of the same push (same repo, checkout, branch and args, another git process) replaces the earlier one,
+ * queued or running. Marks the loser (superseded + cancel marker) and returns the other tickets the caller must now stop,
+ * after the lock: the loser may be the incoming ticket itself when a slow supervisor enqueues the older push last.
+ */
+function supersedeRepeatedPushes(root, incoming) {
+  const targets = [];
+  const leased = listLeases(root).map((lease) => ({ lease, held: true }));
+  const queued = listQueue(root).filter(Boolean).map((t) => ({ lease: t, held: false }));
+  for (const { lease: other, held } of [...leased, ...queued]) {
+    if (other.id === incoming.id || other.repoId !== incoming.repoId || !other.pushGate || !isRepeatOfPush(other.pushGate, incoming.pushGate)) continue;
+    const incomingIsNewer = pushOrder(other.pushGate, incoming.pushGate) < 0;
+    const [loser, winner] = incomingIsNewer ? [other, incoming] : [incoming, other];
+    writeSupersededMarkerFile(root, loser.id, winner.id);
+    writeCancelMarkerFile(root, loser.id);
+    if (loser !== incoming) targets.push({ id: loser.id, supervisorPid: loser.supervisorPid, supervisorStart: loser.supervisorStart, orphanedLease: held && !isSupervisorAlive(loser) });
+  }
+  return targets;
 }
 
 /** Remove a queue record. Returns whether the ticket is now durably not
@@ -1790,6 +1811,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       ...((classOf(ticket) === 'sim' || isEnforcementRequired(ticket)) && classEnforcementOf(classes, root) ? { classEnforcement: classEnforcementOf(classes, root) } : {}),
       logPath: ticket.logPath,
       resultPath: ticket.resultPath,
+      ...(ticket.pushGate ? { pushGate: ticket.pushGate, repoId: ticket.repoId } : {}),
       // BRAIN-403: an exclusive run claims the whole admission budget (every capacity and resource path then refuses the rest)
       ...(exclusiveHolder ? exclusiveLeaseFields({ ...exclusiveBudget(detectResourceCapacity(), cfg), weightCapacity, declaredResources: submitted.resources }) : {}),
       state: LEASE_STATE.RUNNING,
