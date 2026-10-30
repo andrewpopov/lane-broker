@@ -200,7 +200,7 @@ test('drain (B7): a submitter killed during a drain move is MOVE-INTERRUPTED, ex
     moving: { from: 'a', to: 'b', phase: 'dispatching', at: Date.now() },
   }));
   const waited = await laneRun(['wait', id, '--timeout', '5s'], { env: ctx.env });
-  assert.equal(waited.code, 1, waited.stderr);
+  assert.equal(waited.code, 74, waited.stderr);
   assert.match(waited.stderr, new RegExp(`MOVE-INTERRUPTED ${id} withdrawn from a`));
   assert.doesNotMatch(waited.stderr, /ORPHANED-REMOTE/);
 

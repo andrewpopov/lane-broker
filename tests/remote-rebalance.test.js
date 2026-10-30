@@ -203,7 +203,7 @@ test('rebalance: a supervisor killed with `moving` recorded is MOVE-INTERRUPTED 
   await withLock(ctx.state, () => patchAttemptLocked(ctx.state, id, { runner: 'b', moving: { from: 'a', to: 'b', phase: 'dispatching', at: Date.now() } }));
 
   const waited = await laneRun(['wait', id, '--timeout', '5s'], { env: ctx.env });
-  assert.equal(waited.code, 1, waited.stderr);
+  assert.equal(waited.code, 74, waited.stderr);
   assert.match(waited.stderr, new RegExp(`MOVE-INTERRUPTED ${id} withdrawn from a`));
   assert.doesNotMatch(waited.stderr, /ORPHANED-REMOTE/);
   const status = await laneRun(['status'], { env: ctx.env });
@@ -269,7 +269,7 @@ test('P1-2: an unknown withdraw keeps `moving`, and the possibly-live ticket sta
   const ctx = rebalanceSetup({ runnerOpts: { a: { withdrawReplyLost: true, resultDownAfterWithdraw: true } }, rebalance: { remoteRebalanceMinQueuedMs: 300 } });
   const id = await ctx.start();
   const waited = await ctx.finish(id, '60s');
-  assert.equal(waited.code, 1, waited.stderr);
+  assert.equal(waited.code, 74, waited.stderr);
   assert.match(waited.stderr, /MOVE-INTERRUPTED/);
   const attempt = readAttempt(ctx.state, id);
   assert.ok(attempt, 'the attempt is kept');

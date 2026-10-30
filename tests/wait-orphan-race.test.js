@@ -98,14 +98,21 @@ test('BRAIN-319 orphan race: a genuinely dead supervisor with no result ever sho
     const pid = await deadPid();
     writeDeadAttempt(state, id, pid);
 
-    const waited = waitCommand(id);
+    const stderrLines = [];
+    const realWrite = process.stderr.write.bind(process.stderr);
+    process.stderr.write = (chunk, ...rest) => { stderrLines.push(String(chunk)); return realWrite(chunk, ...rest); };
+    let outcome;
+    try {
+      const waited = waitCommand(id);
 
-    // Nothing changes during the gap -- release immediately, no result and
-    // no attempt-removal show up.
-    fs.writeFileSync(pauseFile, 'go');
+      fs.writeFileSync(pauseFile, 'go'); // nothing changes during the gap: no result, no attempt removal
 
-    const outcome = await waited;
-    assert.equal(outcome.exitCode, 1, 'a genuinely dead supervisor with no result must still be reported, not silently kept waiting');
+      outcome = await waited;
+    } finally {
+      process.stderr.write = realWrite;
+    }
+    assert.equal(outcome.exitCode, 75, 'a genuinely dead supervisor with no result must still be reported, not silently kept waiting');
+    assert.match(stderrLines.join(''), /ORPHANED-REMOTE/, 'the 75 must come from the orphan verdict, not a timeout');
   } finally {
     if (priorState === undefined) delete process.env.LANE_BROKER_STATE;
     else process.env.LANE_BROKER_STATE = priorState;
