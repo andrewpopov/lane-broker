@@ -1078,7 +1078,7 @@ export function floorWinner(cfg, queue, held, cpuSample, memInfo, gateClosed, lo
   const withinOvershoot = (d) => d.memoryReason === 'ok' && d.cpuReason !== 'cooldown' && (d.admit || (Number.isFinite(d.projectedBusy) && d.projectedBusy - d.budget <= cfg.resourceIdleOvershootCores));
   const head = queue[0];
   const headDecision = decide(head, gateClosed);
-  const headStarts = runnable(head) && (headDecision.admit || evaluateElasticAdmission(cfg, head, held, cpuSample, memInfo, headDecision) !== null || (headDecision.cpuReason === 'projected-over-budget' && withinOvershoot(headDecision)));
+  const headStarts = runnable(head) && (headDecision.admit || evaluateElasticAdmission(cfg, head, held, cpuSample, memInfo, headDecision) !== null || (held.length === 0 && headDecision.cpuReason === 'projected-over-budget' && withinOvershoot(headDecision)));
   if (headStarts) return null;
   for (const t of queue.slice(1)) {
     if (!t || isExclusive(t)) return null;

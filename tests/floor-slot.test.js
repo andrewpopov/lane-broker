@@ -151,3 +151,16 @@ test('floor slot: an ordinary lease does not count as the floor lease', async ()
   assert.equal(listLeases(state)[0].floor, undefined);
   assert.equal((await poll(state, gate, 10)).floor, true, 'the floor slot is free although a lease is held');
 });
+
+test('floor slot: a head within the overshoot does not block the floor slot while ordinary leases are held', async () => {
+  const { state } = freshEnv();
+  const head = ticket('head', { weight: 3 });
+  const gate = ticket('gate');
+  await queueAll(state, [head, gate]);
+  ordinaryLease(state);
+  // head: 10 + 1 + 3 = 14 <= 11 + 3, but the idle exemption needs an empty broker, so it is denied
+  assert.equal((await poll(state, head, 10)).started, false);
+  const result = await poll(state, gate, 10);
+  assert.equal(result.started, true);
+  assert.equal(result.floor, true);
+});
