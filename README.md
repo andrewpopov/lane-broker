@@ -960,8 +960,8 @@ reason.
   dependency can be fetched, not which commit it is; a pin does not constrain
   what a dependency's own lifecycle scripts generate, so every other `SSH_*`
   variable is hashed like any other. Any other change is a miss.
-- **Hit**: the stored tree is COPIED into the work dir (a reflink where the
-  filesystem has them), as private writable files, so nothing a lane does to
+- **Hit**: the stored tree is COPIED into the work dir (on macOS one APFS
+  `clonefile(2)` of the whole tree, then made writable; elsewhere file by file), as private writable files, so nothing a lane does to
   its tree can reach the store. The store itself is read-only. The copy is
   slower than a hardlink farm and is the price of that isolation. Recorded
   install paths are then substituted: the stored copy of each recorded

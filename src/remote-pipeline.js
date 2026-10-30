@@ -175,9 +175,9 @@ async function materializeHit(depsCache, key, cwd, releaseLeases, { workDir, dep
   try {
     const release = await acquireLease(depsCache.root, key, depsCache.maxBytes, brokerLock);
     releaseLeases.push(release);
-    materializeFromStore(depsCache.root, key, tree);
+    const { cloned } = materializeFromStore(depsCache.root, key, tree);
     const newPaths = Object.fromEntries(installPathRoles(workDir, depsEnv).map((r) => [r.role, r.path]));
-    relocateRestoredTree(tree, readRelocation(depsCache.root, key), newPaths);
+    relocateRestoredTree(tree, readRelocation(depsCache.root, key), newPaths, cloned ? { scanRoot: entryTree(depsCache.root, key) } : {});
     placeWorkspaces(tree, workspaces, workspaces.length > 0 ? readWorkspaceTrees(depsCache.root, key) : []);
     touchLastUsed(depsCache.root, key);
     return true;

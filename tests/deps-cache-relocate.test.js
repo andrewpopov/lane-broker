@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import {
   collectInstallPathReferences,
   installPathRoles,
@@ -282,6 +283,60 @@ test('restore scans the whole tree: a file the record omits that still holds a t
     },
   });
   assert.throws(run, /b\.js still holds a placeholder/);
+});
+
+const cpClone = (src, dst) => execFileSync('cp', ['-a', src, dst]);
+
+/** Like roundTrip, but the restore is a whole-tree clone (injected `cp -a`), and `run` scans the store entry. */
+function clonedRoundTrip(tree, roles, newPaths, { tamper, tamperRestored } = {}) {
+  const collected = collectInstallPathReferences(tree, roles);
+  const cacheRoot = tmpDir();
+  const key = newKey();
+  publishToStore(cacheRoot, key, tree, collected.relocation);
+  const storedTree = path.join(entryDir(cacheRoot, key), 'node_modules');
+  if (tamper) tamper(storedTree, path.join(entryDir(cacheRoot, key), 'meta.json'));
+  const restored = path.join(tmpDir(), 'node_modules');
+  assert.deepEqual(materializeFromStore(cacheRoot, key, restored, { platform: 'darwin', cloneWholeTree: cpClone }), { cloned: true });
+  if (tamperRestored) tamperRestored(restored);
+  return () => relocateRestoredTree(restored, readRelocation(cacheRoot, key), newPaths, { scanRoot: storedTree });
+}
+
+const omitFromRecord = (relPath) => (_stored, meta) => {
+  const m = JSON.parse(fs.readFileSync(meta, 'utf8'));
+  m.relocation.entries = m.relocation.entries.filter((e) => e.relPath !== relPath);
+  fs.chmodSync(meta, 0o644);
+  fs.writeFileSync(meta, JSON.stringify(m));
+};
+
+test('scanRoot: a cloned restore relocates, and the store scan still catches an omitted file', () => {
+  const t = tree();
+  write(t, 'a.js', `"${OLD}"`);
+  write(t, 'b.js', `"${OLD}/b"`);
+  const clean = clonedRoundTrip(t, ...one(OLD, NEW));
+  clean();
+  const omitted = clonedRoundTrip(t, ...one(OLD, NEW), { tamper: omitFromRecord('b.js') });
+  assert.throws(omitted, /b\.js still holds a placeholder/);
+});
+
+test('scanRoot: a stray old install path in the store is caught', () => {
+  const t = tree();
+  write(t, 'a.js', `"${OLD}"`);
+  const run = clonedRoundTrip(t, ...one(OLD, NEW), {
+    tamper: (stored) => {
+      fs.chmodSync(stored, 0o755);
+      fs.writeFileSync(path.join(stored, 'stray.js'), `"${OLD}/x"`);
+    },
+  });
+  assert.throws(run, /stray\.js still holds/);
+});
+
+test('scanRoot: a leftover old path in a recorded entry of the restored tree is caught', () => {
+  const t = tree();
+  write(t, 'a.js', `"${OLD}"`);
+  const run = clonedRoundTrip(t, ...one(OLD, NEW), {
+    tamperRestored: (restored) => fs.appendFileSync(path.join(restored, 'a.js'), ` "${OLD}/late"`),
+  });
+  assert.throws(run, /a\.js still holds/);
 });
 
 test('publish verifies the cached copy: a file that changed or appeared after collection publishes nothing', () => {
