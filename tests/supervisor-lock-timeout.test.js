@@ -96,13 +96,14 @@ test('under the contention policy a default-deadline withLock outlives a holder 
   const { state } = freshEnv();
   const contentions = [];
   setLockContentionPolicy({ onContention: (err) => contentions.push(err) });
-  const holder = withLock(state, () => sleep(700), { timeoutMs: 10_000 });
-  await sleep(50);
+  // a holder in another live process (the test runner): a same-process holder is never waited out
+  fs.mkdirSync(paths(state).lock, { recursive: true });
+  fs.writeFileSync(path.join(paths(state).lock, 'owner.json'), JSON.stringify({ pid: process.ppid, token: 'other', start: null, at: Date.now() }));
+  setTimeout(() => fs.rmSync(paths(state).lock, { recursive: true, force: true }), 700);
   let ran = 0;
   await withLock(state, () => {
     ran += 1;
   });
-  await holder;
   assert.equal(ran, 1);
   assert.ok(contentions.length >= 1);
   assert.ok(contentions.every((e) => e instanceof LockTimeoutError));
