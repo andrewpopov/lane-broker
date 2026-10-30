@@ -487,8 +487,8 @@ test('--local and LANE_BROKER_LOCAL=1 tickets are never rebound', async () => {
   const hold = await holdLaneLocally(ctx);
   ctx.setMode('ok');
   const probesBefore = probeCount(ctx.probeLogPath);
-  const flagged = await detach(ctx, recordingCmd(path.join(tmpDir('rebind-ran'), 'ran')), { extra: ['--local', '--local-reason', 'test'] });
-  const enved = await detach(ctx, recordingCmd(path.join(tmpDir('rebind-ran'), 'ran')), { env: { ...ctx.env, LANE_BROKER_LOCAL: '1', LANE_BROKER_LOCAL_REASON: 'test' } });
+  const flagged = await detach(ctx, recordingCmd(path.join(tmpDir('rebind-ran'), 'ran')), { extra: ['--local', '--local-reason', 'needs ssh'] });
+  const enved = await detach(ctx, recordingCmd(path.join(tmpDir('rebind-ran'), 'ran')), { env: { ...ctx.env, LANE_BROKER_LOCAL: '1', LANE_BROKER_LOCAL_REASON: 'needs ssh' } });
   await waitFor(() => queuedIds(ctx.state).length === 2, { timeoutMs: 30_000 });
   await sleep(1500); // five rebind intervals
   assert.deepEqual(queuedIds(ctx.state), [flagged, enved], 'both still queued locally');

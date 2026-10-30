@@ -100,7 +100,7 @@ features like pipes or globbing.
 | `--allow-local-sim` | Override a lane's `localRefused: true`. |
 | `--log <path>` | Override the default log path. |
 | `--local` | Never dispatch to a remote runner (same as `LANE_BROKER_LOCAL=1`). On a remote-eligible lane it is **ignored with a stderr warning unless a reason is given** (BRAIN-547, below). |
-| `--local-reason "<why>"` | BRAIN-547: why this command needs this machine. Implies `--local`; same as env `LANE_BROKER_LOCAL_REASON`. |
+| `--local-reason "<why>"` | BRAIN-547: why this command needs this machine. Implies `--local`; same as env `LANE_BROKER_LOCAL_REASON`. BRAIN-724: refused (exit `64`) on a remote-eligible lane unless it names an accepted need (below). |
 
 **`--local` needs a reason on a remote-eligible lane (BRAIN-547).** Pinning test work to the local machine
 defeats remote placement, so `--local` / `LANE_BROKER_LOCAL=1` alone on a lane that would otherwise run on a
@@ -110,6 +110,15 @@ machine (ssh, `gh`, `lane`, paths outside the worktree); it stays local and the 
 `localReason: "forced-flag"` (`"forced-env"` when only env vars were used) plus `localReasonText`. Lanes that
 are not remote-eligible are unchanged: `--local` is accepted silently. The runner side of `remote-exec` sets
 its own reason internally.
+
+**The reason must name a real need for this machine (BRAIN-724).** A runner gets a snapshot of the worktree,
+installs and builds its own deps, and returns the lane's declared `remoteArtifacts`, so "the worktree lives
+here", "uses the dist built here" and "screenshots must land here" are not reasons. On a remote-eligible lane
+`lane run` refuses (exit `64`, nothing queued) a `--local-reason` / `LANE_BROKER_LOCAL_REASON` that matches none
+of the accepted categories (case-insensitive): `ssh`/`scp`; `gh`; the `lane` CLI; a browser rendering on this
+machine; an input not in the snapshot (gitignored, local-only, unpublished); a path outside the worktree; git
+history; `docker`; Mac hardware or toolchain (Xcode, iOS simulator, macOS, iPhone, USB); Andrew's approval. Drop
+`--local` and put a missing build step in `remoteSetup`, or the output that must come back in `remoteArtifacts`.
 
 **A remote-eligible command may not name a path that exists only on this machine (BRAIN-721).** A runner gets a
 snapshot of the worktree, so an argv (or `sh -c` script) naming an existing absolute path under `/private`,

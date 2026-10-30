@@ -28,7 +28,7 @@ test('the same command on a remote:false lane, or with --local --local-reason, i
   fs.writeFileSync(hostFile, 'exit 0');
   const onLocalLane = await laneRun(['run', '--repo', 'r', '--lane', 'localonly', '--', 'sh', hostFile], { env, cwd: repoDir });
   assert.equal(onLocalLane.code, 0, onLocalLane.stderr);
-  const forced = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--local', '--local-reason', 'test', '--', 'sh', hostFile], { env, cwd: repoDir });
+  const forced = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--local', '--local-reason', 'needs ssh', '--', 'sh', hostFile], { env, cwd: repoDir });
   assert.equal(forced.code, 0, forced.stderr);
   assert.doesNotMatch(onLocalLane.stderr + forced.stderr, /exists only on this machine/);
 });

@@ -103,8 +103,8 @@ const NO_REMOTE_CASES = [
   ['no runners configured', { runners: undefined, remote: true }, {}],
   ['lane not opted into remote', { runners: RUNNERS, remote: false }, {}],
   ['lane has no remote field at all', { runners: RUNNERS, remote: undefined }, {}],
-  ['--local forces local', { runners: RUNNERS, remote: true }, { local: true, localReason: 'test' }],
-  ['LANE_BROKER_LOCAL=1 forces local', { runners: RUNNERS, remote: true }, { extraEnv: { LANE_BROKER_LOCAL: '1', LANE_BROKER_LOCAL_REASON: 'test' } }],
+  ['--local forces local', { runners: RUNNERS, remote: true }, { local: true, localReason: 'needs ssh' }],
+  ['LANE_BROKER_LOCAL=1 forces local', { runners: RUNNERS, remote: true }, { extraEnv: { LANE_BROKER_LOCAL: '1', LANE_BROKER_LOCAL_REASON: 'needs ssh' } }],
   ['an inherited LANE_BROKER_LEASE forces local', { runners: RUNNERS, remote: true }, { extraEnv: { LANE_BROKER_LEASE: 'some-ancestor-id' } }],
 ];
 
