@@ -774,6 +774,8 @@ const REJECTED_TRANSFER = { kind: 'rejected', reason: 'file body: truncated gzip
  */
 function rejectingRunnerSetup({ blocked, rebindIntervalMs = 300, repoLane = {} }) {
   const ctx = rebalanceSetup({ names: ['a', 'b'], paused: [], rebalance: { remoteRebindIntervalMs: rebindIntervalMs }, runnerOpts: { a: { resultPatch: REJECTED_TRANSFER } } });
+  // runner a's own broker refuses the job at preflight, so nothing ever executes there; its record is then the incident's rejection
+  writeGlobalConfig(ctx.runners.a.home, { schedulerMode: 'active', sampleMs: 50, capacity: 4, memoryReserveBytes: 1e15 });
   writeRepoConfig(ctx.repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, remotePolicy: 'remote-first', ...repoLane } } });
   const { cpuCores } = detectResourceCapacity();
   const writeHostCpu = () => {
@@ -792,7 +794,7 @@ test('blocked rebind: a ticket a runner rejected (never started) moves to anothe
     const result = await waitResult(ctx, id);
     assert.equal(result.executor, 'remote');
     assert.equal(result.runner, 'b', 'the rejecting runner a is never revisited; b takes it');
-    assert.ok(ctx.runs().includes('b'));
+    assert.deepEqual(ctx.runs(), ['b'], 'the command executed exactly once, on b');
     assert.equal(ctx.fake.count('exec a'), 1, 'a was tried once, and only once');
     assert.match(ctx.admissionLog(), new RegExp(`remote-rebind: ${id}: local blocked: no CPU slot beside external load — moving to b`));
   } finally {
@@ -813,6 +815,7 @@ test('blocked rebind: the same rejected ticket stays local while a local CPU slo
   hold.release();
   await hold.done;
   assert.equal((await waitResult(ctx, id)).executor, 'local');
+  assert.deepEqual(ctx.runs(), ['undefined'], 'the command ran exactly once, locally');
 });
 
 test('blocked rebind: client-wide ineligibility never rebinds, even when blocked', async () => {
@@ -828,6 +831,7 @@ test('blocked rebind: client-wide ineligibility never rebinds, even when blocked
   hold.release();
   await hold.done;
   assert.equal((await waitResult(ctx, id)).executor, 'local');
+  assert.deepEqual(ctx.runs(), ['undefined'], 'the command ran exactly once, locally');
 });
 
 test('blocked rebind: remoteRebindIntervalMs 0 disables it', async () => {
@@ -842,4 +846,5 @@ test('blocked rebind: remoteRebindIntervalMs 0 disables it', async () => {
   hold.release();
   await hold.done;
   assert.equal((await waitResult(ctx, id)).executor, 'local');
+  assert.deepEqual(ctx.runs(), ['undefined'], 'the command ran exactly once, locally');
 });
