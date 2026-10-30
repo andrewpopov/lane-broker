@@ -1764,7 +1764,7 @@ additive: readers must ignore unknown keys and tolerate absent ones.
 | `remoteOmittedSymlinks`, `remoteOmittedSymlinkNames` | remote runs with `remoteOmitEscapingSymlinks`: how many escaping symlinks the snapshot left out, and the first 10 paths |
 | `priorityRequested`, `priorityAdmitted`, `priorityDemoted`, `effectiveRankAtStart`, `scoreAtStart` | priority audit (admitted tickets only) |
 | `contentKey`, `cachedFrom` | BRAIN-549: the run's result-cache key (on every keyed run; a pass keeps it only if the worktree still matched at the end), and on a cache answer the id of the run it was served from (`runMs: 0`, no `contentKey`) |
-| `event`, `errorClass`, `errorMessage`, `phase`, `at` | BRAIN-730: a diagnostic row (`event: "supervisor-error"`, `reason: "supervisor-error"`) appended when a supervisor crashes: the error class, its first message line, and the phase it died in (`startup`, `remote`, `queued`, `running`, `finalize`). It has no `exit` and writes no `result.json`; settlement stays with reconcile and the scheduler's dead-supervisor reaping. Every reader skips rows with `event` set (`isRunRow` in `suggest.js`, applied by `readRows`) |
+| `event`, `errorClass`, `errorMessage`, `phase`, `at` | BRAIN-730: a diagnostic row (`event: "supervisor-error"`, `reason: "supervisor-error"`) appended when a supervisor crashes: the error class, its first message line, and the phase it died in (`startup`, `remote`, `queued`, `running`, `finalize`). It has no `exit` and writes no `result.json`; settlement stays with reconcile and the scheduler's dead-supervisor reaping. Every history reader skips rows with `event` set (`readHistoryRows` in `suggest.js`). Count crashes with `event == "supervisor-error"` by `errorClass` |
 | `dequeuedDeadSupervisor` | marks a row for a queued ticket whose supervisor died (`exit: null`, `signal: null`) |
 
 A runner's `result.json` carries the same `cpuSeconds` and a `phasesMs` object; the submitter folds them into its own row.
@@ -2614,9 +2614,12 @@ What a run leaves behind is collected; what a live one owns never is. Everything
   `LANE_BROKER_TEST_ROUNDS=10 npm test`.
 - `LANE_BROKER_TEST_LOCK_TIMEOUT_MS` — overrides `withLock`'s default 15s
   acquire deadline, so a test can force a lock-acquire timeout (BRAIN-345: a
-  queued supervisor must treat one as contention and keep polling). The supervisor, which sets a lock contention policy
-  (BRAIN-730), waits through it on every acquisition instead of dying.
-- `LANE_BROKER_TEST_SUPERVISOR_ERROR_AT` — a supervisor phase name (`startup`, `remote`, `queued`, `running`, `finalize`);
+  queued supervisor must treat one as contention and keep polling). Since BRAIN-730 the supervisor sets a process-wide lock
+  contention policy (`setLockContentionPolicy` in `state.js`): every default-deadline acquisition that times out against a live
+  holder logs `lane: lock-timeout: … still waiting, retrying`, backs off (jittered, up to 2 s) and tries again with a fresh
+  deadline, so a supervisor never dies of contention. Only acquisition is retried, never the callback; an explicit `timeoutMs`
+  still throws; an owner.json that stays unreadable for three deadlines still throws; nesting the same lock throws `NestedLockError`.
+- `LANE_BROKER_TEST_SUPERVISOR_ERROR_AT` — a supervisor phase name (`remote`, `queued`, `running`, `finalize`);
   entering that phase throws a `TypeError`, to exercise the crash recorder (BRAIN-730).
 - `LANE_BROKER_TEST_TRANSFER_MAX_BYTES` — lowers `lane remote-exec`'s decompressed and compressed transfer caps (BRAIN-642), so a gzip-bomb
   test never needs 2 GiB.
