@@ -4,7 +4,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneSpawn, gitFixture, waitFor, sleep, BIN } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneSpawn, laneRun, gitFixture, waitFor, sleep, BIN } from './helpers.js';
+import { isPidAlive } from '../src/lease.js';
 import { enqueue } from '../src/scheduler.js';
 import { paths, ensureStateDirs, readSupersededBy, isCancelled } from '../src/state.js';
 
@@ -27,22 +28,26 @@ function setup() {
   gitFixture(['commit', '-m', 'init'], work);
   gitFixture(['remote', 'add', 'origin', remote], work);
   const hook = path.join(work, '.git', 'hooks', 'pre-push');
-  fs.writeFileSync(hook, '#!/bin/sh\ncat >/dev/null\nnode "$LANE_BIN" run --repo r --lane prepush -- sh -c "$GATE_CMD"\nrc=$?\necho $rc > "$GATE_RC"\nexit $rc\n', { mode: 0o755 });
+  fs.writeFileSync(hook, '#!/bin/sh\ncat >/dev/null\nnode "$LANE_BIN" run --repo r --lane prepush $GATE_ARGS -- sh -c "$GATE_CMD"\nrc=$?\necho $rc > "$GATE_RC"\nexit $rc\n', { mode: 0o755 });
   const env = { ...fx.env };
   for (const name of Object.keys(env)) if (name.startsWith('GIT_')) delete env[name];
   return { ...fx, env, work, history: paths(fx.state).history };
 }
 
 /** A real `git push`; resolves with the hook's exit (via GATE_RC) and the push's stderr. */
-function push(fx, name, gateCmd, ref = PUSH_REF) {
+function push(fx, name, gateCmd, ref = PUSH_REF, gateArgs = '') {
   const rcFile = path.join(fx.base, `${name}.rc`);
-  const child = spawn('git', ['push', 'origin', ref], { cwd: fx.work, env: { ...fx.env, GATE_CMD: gateCmd, GATE_RC: rcFile } });
+  const child = spawn('git', ['push', 'origin', ref], { cwd: fx.work, env: { ...fx.env, GATE_CMD: gateCmd, GATE_ARGS: gateArgs, GATE_RC: rcFile } });
   let stderr = '';
   child.stderr.on('data', (d) => {
     stderr += d;
   });
   const done = new Promise((resolve) => child.on('close', () => resolve({ rc: Number(fs.readFileSync(rcFile, 'utf8')), stderr })));
-  return { child, done };
+  const hookRc = async () => {
+    await waitFor(() => fs.existsSync(rcFile) && fs.readFileSync(rcFile, 'utf8').trim() !== '', { timeoutMs: 60_000 });
+    return Number(fs.readFileSync(rcFile, 'utf8'));
+  };
+  return { child, done, hookRc };
 }
 
 const historyRows = (fx) => (fs.existsSync(fx.history) ? fs.readFileSync(fx.history, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
@@ -168,4 +173,100 @@ test('a late-enqueued older push supersedes itself, not the newer one', async ()
   assert.equal(isCancelled(state, 'older'), true);
   assert.equal(readSupersededBy(state, 'newer'), null);
   assert.equal(isCancelled(state, 'newer'), false);
+});
+
+const queuedGate = async (fx) => {
+  await waitFor(() => fs.existsSync(paths(fx.state).queue) && queuedRecords(fx).some((r) => r.pushGate), { timeoutMs: 60_000 });
+  return queuedRecords(fx).find((r) => r.pushGate);
+};
+const queueFiles = (fx) => fs.readdirSync(paths(fx.state).queue);
+
+async function expectAbandoned(fx, record, hook) {
+  assert.equal(await hook.hookRc(), 75);
+  await waitFor(() => gateRows(fx).length === 1, { timeoutMs: 30_000 });
+  const [row] = gateRows(fx);
+  assert.equal(row.id, record.id);
+  assert.equal(row.exit, 75);
+  assert.equal(row.reason, 'push-abandoned');
+  assert.notEqual(row.cancelled, true);
+  assert.deepEqual(queueFiles(fx), []);
+  await waitFor(() => !isPidAlive(record.supervisorPid), { timeoutMs: 30_000 });
+}
+
+test('killing only the git push removes its queued gate within a cycle', async () => {
+  const fx = setup();
+  await occupyCapacity(fx, 30);
+  const hook = push(fx, 'p', 'true');
+  const record = await queuedGate(fx);
+  process.kill(record.pushGate.gitPid, 'SIGKILL');
+  assert.ok(isPidAlive(record.pushGate.clientPid), 'the hook and its lane client survive the git kill');
+  await expectAbandoned(fx, record, hook);
+});
+
+test('killing the lane client removes its queued gate', async () => {
+  const fx = setup();
+  await occupyCapacity(fx, 30);
+  const hook = push(fx, 'p', 'true');
+  const record = await queuedGate(fx);
+  process.kill(record.pushGate.clientPid, 'SIGKILL');
+  await waitFor(() => !isPidAlive(record.supervisorPid), { timeoutMs: 30_000 });
+  await waitFor(() => gateRows(fx).length === 1, { timeoutMs: 30_000 });
+  const [row] = gateRows(fx);
+  assert.equal(row.reason, 'push-abandoned');
+  assert.equal(row.exit, 75);
+  assert.deepEqual(queueFiles(fx), []);
+  assert.equal(await hook.hookRc(), 137);
+});
+
+test('a dead push leaves a push-abandoned history row and no queue file or orphan process', async () => {
+  const fx = setup();
+  await occupyCapacity(fx, 30);
+  const hook = push(fx, 'p', 'true');
+  const record = await queuedGate(fx);
+  process.kill(record.pushGate.gitPid, 'SIGKILL');
+  await expectAbandoned(fx, record, hook);
+  assert.equal(hasLeaseOf(fx, record.id), false);
+  assert.equal(isPidAlive(record.pushGate.clientPid), false);
+});
+
+const hasLeaseOf = (fx, id) => fs.existsSync(path.join(paths(fx.state).leases, `${id}.json`));
+
+test('a client that timed out is not reaped and lane wait still returns its result', async () => {
+  const fx = setup();
+  await occupyCapacity(fx, 5);
+  const hook = push(fx, 'p', 'true', PUSH_REF, '--timeout 1s');
+  const record = await queuedGate(fx);
+  assert.equal(await hook.hookRc(), 75);
+  await hook.done;
+  assert.equal(isPidAlive(record.pushGate.clientPid), false);
+  await sleep(1500);
+  assert.equal(queueFiles(fx).length, 1, 'a released gate stays queued though its push and client are gone');
+  assert.ok(isPidAlive(record.supervisorPid));
+  const waited = await laneRun(['wait', record.id], { env: fx.env, cwd: fx.work });
+  assert.equal(waited.code, 0);
+  assert.equal(gateRows(fx)[0].exit, 0);
+});
+
+test('an orphaned superseded gate is cancelled with the superseded result, quietly', async () => {
+  const fx = setup();
+  const older = push(fx, 'older', 'sleep 60');
+  await waitFor(() => hasLease(fx), { timeoutMs: 60_000 });
+  const leaseDir = paths(fx.state).leases;
+  const lease = JSON.parse(fs.readFileSync(path.join(leaseDir, fs.readdirSync(leaseDir).find((n) => n.endsWith('.json'))), 'utf8'));
+  await waitFor(() => JSON.parse(fs.readFileSync(path.join(leaseDir, `${lease.id}.json`), 'utf8')).childPgid, { timeoutMs: 30_000 });
+  process.kill(lease.supervisorPid, 'SIGKILL');
+  await sleep(GATE_SECONDS_APART);
+  const newer = push(fx, 'newer', 'true');
+  const newerDone = await newer.done;
+  assert.equal(newerDone.rc, 0);
+  assert.doesNotMatch(newerDone.stderr, /cancelled orphaned lease/);
+  await older.hookRc();
+  const loser = historyRows(fx).find((r) => r.id === lease.id);
+  const winner = gateRows(fx).find((r) => r.id !== lease.id);
+  assert.equal(loser.exit, 130);
+  assert.equal(loser.cancelled, true);
+  assert.equal(loser.reason, 'superseded');
+  assert.equal(loser.supersededBy, winner.id);
+  assert.equal(fs.existsSync(path.join(paths(fx.state).superseded, lease.id)), false);
+  assert.equal(hasLeaseOf(fx, lease.id), false);
 });

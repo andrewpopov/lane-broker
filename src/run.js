@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { childExitSafeFlags } from './node-exit-safe.js';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { ensureStateDirs, paths, stateHome, readJsonSafe, appendHistory, LockTimeoutError, MigrationInProgressError, assertNotMigrating, isUuid } from './state.js';
+import { ensureStateDirs, writeReleasedMarkerFile, paths, stateHome, readJsonSafe, appendHistory, LockTimeoutError, MigrationInProgressError, assertNotMigrating, isUuid } from './state.js';
 import { classTransportMismatch } from './classes.js';
 import { remoteExcludePreflight } from './remote-exclude.js';
 import { MIN_CPU_GRANT_CORES } from './cpu-limit.js';
@@ -978,6 +978,7 @@ export async function runCommand({
           return await finishedReturn(resultExit('lane run', state.result));
         }
         process.stderr.write(`lane run: waited ${timeoutMs}ms, not failed — ${state.text}\n`);
+        if (pushGate) writeReleasedMarkerFile(root, id);
         return abortReturn(75);
       }
       if (!isPidAlive(supervisor.pid)) {

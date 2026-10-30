@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { ensureStateDirs, paths, appendHistory, atomicWriteJson, withLock, writeCancelMarkerFile } from './state.js';
+import { ensureStateDirs, paths, appendHistory, atomicWriteJson, withLock, writeCancelMarkerFile, withSupersession, removeSupersededMarker } from './state.js';
 import { readLease, removeLease, isSupervisorAlive, isGroupAlive } from './lease.js';
 import { dequeueSync, listQueue } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
@@ -158,8 +158,11 @@ export async function cancelAttempt(root, id, attempt) {
 }
 
 /** `lane cancel <id>`: cancels a queued ticket or a running/ORPHANED lease. */
-export async function cancelCommand(id, { exec } = {}) {
+export async function cancelCommand(id, { exec, quiet = false } = {}) {
   const root = ensureStateDirs().root;
+  const say = (line) => {
+    if (!quiet) process.stdout.write(line);
+  };
 
   // Dequeue and mark cancelled atomically, under the same lock the scheduler
   // uses to move a ticket from queue to lease -- otherwise the supervisor
@@ -175,7 +178,7 @@ export async function cancelCommand(id, { exec } = {}) {
     return true;
   });
   if (dequeuedHere) {
-    process.stdout.write(`lane cancel: removed queued ticket ${id}\n`);
+    say(`lane cancel: removed queued ticket ${id}\n`);
     return { exitCode: 0 };
   }
 
@@ -216,7 +219,7 @@ export async function cancelCommand(id, { exec } = {}) {
       );
       return { exitCode: 1 };
     }
-    process.stdout.write(`lane cancel: cancelled ${id}\n`);
+    say(`lane cancel: cancelled ${id}\n`);
     return { exitCode: 0 };
   }
 
@@ -244,8 +247,8 @@ export async function cancelCommand(id, { exec } = {}) {
   const attempt = readAttempt(root, id);
   if (attempt) {
     const published = await publishTerminal(root, id, attempt.generation, () => {
-      atomicWriteJson(lease.resultPath, { ...remoteCancelledResult(id, attempt.startedAt), executor: attempt.executor });
-      appendHistory(root, { ...terminalRowDefaults(lease), id, key: lease.key, exit: 130, cancelled: true, endedAt: Date.now(), executor: attempt.executor });
+      atomicWriteJson(lease.resultPath, withSupersession(root, id, { ...remoteCancelledResult(id, attempt.startedAt), executor: attempt.executor }));
+      appendHistory(root, withSupersession(root, id, { ...terminalRowDefaults(lease), id, key: lease.key, exit: 130, cancelled: true, endedAt: Date.now(), executor: attempt.executor }));
     });
     // `alreadyPublished`: the attempt was settled between the read above and this publish, so its result and history row
     // stand. Fall through to release the lease; the plain-lease branch below must not write a second result.
@@ -256,11 +259,12 @@ export async function cancelCommand(id, { exec } = {}) {
   } else {
     // Plain lease-only ticket (no attempt record) -- unchanged behaviour.
     const endedAt = Date.now();
-    atomicWriteJson(lease.resultPath, { id, exit: null, signal: 'SIGKILL', startedAt: null, endedAt, waitedMs: null, cancelled: true });
-    appendHistory(root, { ...terminalRowDefaults(lease), id, key: lease.key, signal: 'SIGKILL', cancelled: true, endedAt, executor: 'local' });
+    atomicWriteJson(lease.resultPath, withSupersession(root, id, { id, exit: null, signal: 'SIGKILL', startedAt: null, endedAt, waitedMs: null, cancelled: true }));
+    appendHistory(root, withSupersession(root, id, { ...terminalRowDefaults(lease), id, key: lease.key, signal: 'SIGKILL', cancelled: true, endedAt, executor: 'local' }));
   }
   removeLease(root, id);
+  removeSupersededMarker(root, id);
   touchSimArmFor(root, lease);
-  process.stdout.write(`lane cancel: cancelled orphaned lease ${id}\n`);
+  say(`lane cancel: cancelled orphaned lease ${id}\n`);
   return { exitCode: 0 };
 }

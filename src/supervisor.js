@@ -17,6 +17,9 @@ import {
   writeCancelMarkerFile,
   supersededMarkerPath,
   readSupersededBy,
+  withSupersession,
+  releasedMarkerPath,
+  isReleased,
   withLock,
   setLockContentionPolicy,
   MigrationInProgressError,
@@ -27,6 +30,7 @@ import { enqueue, existingTicket, tryStart, dequeueSync, couldAdmitNow, listQueu
 import { touchSimArmFor } from './sim-arm.js';
 import { cancelCommand } from './cancel.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
+import { isPidAlive, isProcessAlive } from './process-liveness.js';
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
 import { reloadGlobalConfig, isDispatchOnly } from './config.js';
@@ -116,15 +120,11 @@ function cancelRequested(root, id) {
   return isCancelled(root, id);
 }
 
-/** BRAIN-731: the one place a cancelled result learns it was a repeat push replacing it, whether it was queued or running. */
-function withSupersession(root, id, result) {
-  const supersededBy = readSupersededBy(root, id);
-  return supersededBy && result.cancelled ? { ...result, reason: 'superseded', supersededBy } : result;
-}
+const PUSH_ABANDONED = 'push-abandoned';
 
 function clearTicketMarkers(root, id) {
   discardRebinding(root, id);
-  for (const marker of [cancelMarkerPath(root, id), expireMarkerPath(root, id), withdrawMarkerPath(root, id), supersededMarkerPath(root, id)]) {
+  for (const marker of [cancelMarkerPath(root, id), expireMarkerPath(root, id), withdrawMarkerPath(root, id), supersededMarkerPath(root, id), releasedMarkerPath(root, id)]) {
     try {
       fs.unlinkSync(marker);
     } catch {
@@ -136,7 +136,7 @@ function clearTicketMarkers(root, id) {
 /** Stop a ticket a repeat push replaced: TERM its live supervisor without waiting, or cancel an orphaned lease whose supervisor is gone. */
 async function stopSupersededTicket({ id, supervisorPid, orphanedLease }) {
   if (orphanedLease) {
-    await cancelCommand(id);
+    await cancelCommand(id, { quiet: true });
     return;
   }
   try {
@@ -1486,7 +1486,7 @@ async function main() {
   async function finalizeQueuedAndExit(outcome = 'cancelled', { forcePublish = false } = {}) {
     // BRAIN-436: 'withdrawn' (a submitter took the queued ticket back to move it) finalizes exactly like a queue timeout:
     // a structured, unconditionally published exit-75 result that says the command never started.
-    const isTimeout = outcome === 'queue-timeout' || outcome === 'withdrawn';
+    const isTimeout = outcome === 'queue-timeout' || outcome === 'withdrawn' || outcome === PUSH_ABANDONED;
     const buildResult = () =>
       isTimeout
         ? {
@@ -1621,6 +1621,20 @@ async function main() {
   // BRAIN-442: a local-first ticket is not rebind-eligible until it has waited in the local queue this long
   const rebindNotBefore = enriched.localFirst ? enriched.createdAt + (enriched.localFirstWaitMs ?? globalCfg.localFirstWaitMs) : 0;
 
+  // BRAIN-731: a gate whose push (git) or client is gone will never be read by anyone. pid-alive each poll (no fork), the
+  // start-time check every 5 s; a released ticket (client gave up at --timeout for `lane wait`) is never reaped.
+  const START_CHECK_INTERVAL_MS = 5000;
+  let lastStartCheckAt = Date.now();
+  function pushAbandoned() {
+    const { gitPid, gitStart, clientPid, clientStart } = enriched.pushGate;
+    let dead = !isPidAlive(gitPid) || !isPidAlive(clientPid);
+    if (!dead && Date.now() - lastStartCheckAt >= START_CHECK_INTERVAL_MS) {
+      lastStartCheckAt = Date.now();
+      dead = !isProcessAlive(gitPid, gitStart) || !isProcessAlive(clientPid, clientStart);
+    }
+    return dead && !isReleased(root, ticket.id);
+  }
+
   let started;
   for (;;) {
     // Re-read the config each iteration rather than reusing the snapshot
@@ -1645,6 +1659,13 @@ async function main() {
       else await withLock(root, () => dequeueSync(root, ticket.id));
       touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit('cancelled', { forcePublish: alsoWithdrawn });
+    }
+    if (enriched.pushGate && pushAbandoned()) {
+      const stillQueued = await withLock(root, () => listQueue(root).some((t) => t?.id === ticket.id) && dequeueSync(root, ticket.id));
+      if (stillQueued) {
+        touchSimArmFor(root, ticket);
+        await finalizeQueuedAndExit(PUSH_ABANDONED);
+      }
     }
     if (isDispatchOnly(globalCfg)) await refuseDispatchOnlyAndExit();
     if (!enriched.exclusive) {

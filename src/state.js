@@ -58,6 +58,8 @@ export function paths(root = stateHome()) {
     withdraw: path.join(root, 'withdraw'),
     // BRAIN-731: one file per ticket cancelled because a repeat of its push replaced it; the content is the superseding id.
     superseded: path.join(root, 'superseded'),
+    // BRAIN-731: one file per push-gate ticket whose foreground client gave up at --timeout and left it queued for `lane wait`.
+    released: path.join(root, 'released'),
     // BRAIN-504: what each queued ticket is waiting on, one file per ticket (src/ticket-wait.js).
     waits: path.join(root, 'waits'),
     history: path.join(root, 'history.jsonl'),
@@ -223,6 +225,33 @@ export function readSupersededBy(root, id) {
   } catch {
     return null;
   }
+}
+
+export function removeSupersededMarker(root, id) {
+  try {
+    fs.unlinkSync(supersededMarkerPath(root, id));
+  } catch {
+    // none pending
+  }
+}
+
+/** A cancelled result (or history row) that was a repeat push replacing it says so, and is exit 130 whoever wrote it. */
+export function withSupersession(root, id, result) {
+  const supersededBy = readSupersededBy(root, id);
+  return supersededBy && result.cancelled ? { ...result, exit: 130, signal: null, reason: 'superseded', supersededBy } : result;
+}
+
+export function releasedMarkerPath(root, id) {
+  return path.join(paths(root).released, id);
+}
+
+export function isReleased(root, id) {
+  return fs.existsSync(releasedMarkerPath(root, id));
+}
+
+export function writeReleasedMarkerFile(root, id) {
+  fs.mkdirSync(paths(root).released, { recursive: true });
+  atomicWriteFile(releasedMarkerPath(root, id), String(Date.now()));
 }
 
 export function writeSupersededMarkerFile(root, id, byId) {
