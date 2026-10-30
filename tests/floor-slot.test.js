@@ -164,3 +164,16 @@ test('floor slot: a head within the overshoot does not block the floor slot whil
   assert.equal(result.started, true);
   assert.equal(result.floor, true);
 });
+
+test('floor slot: a lane-local ticket picked by express or capacity backfill that fails CPU still gets the floor slot', async () => {
+  const { state } = freshEnv();
+  const head = ticket('head', { weight: 6 });
+  const gate = ticket('gate');
+  await queueAll(state, [head, gate]);
+  // 8 + 6 > 12 capacity: the head is capacity-blocked and capacity backfill picks the gate, which then fails CPU (4 + 8 + 1 = 13 > 11)
+  writeLease(state, { id: 'busy', key: 'held:busy', bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight: 8, state: LEASE_STATE.RUNNING });
+  const result = await poll(state, gate, 4);
+  assert.equal(result.started, true);
+  assert.equal(result.floor, true);
+  assert.equal(readJsonSafe(paths(state).capacitySkipState)?.count ?? 0, 0, 'no capacity skip is recorded');
+});

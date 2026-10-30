@@ -1427,10 +1427,8 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       !held.some((l) => l.floor === true) &&
       cfg.resourceIdleOvershootCores > 0 &&
       ticket.id !== headTicket.id &&
-      candidate?.id !== ticket.id &&
       !headConflicted &&
       !safeBackfill &&
-      !headBypass &&
       isFloorTicket(queue[position]) &&
       queue.slice(0, position).every((t) => t && !isExclusive(t));
     if (!candidate) {
@@ -1523,8 +1521,9 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // only: shadow never denies, so there is nothing to relax.
     const elastic = cfg.schedulerMode === 'active' ? evaluateElasticAdmission(cfg, admissionTicket, admissionHeld, cpuSample, memInfo, fullDecision) : null;
     const cpuDecision = elastic ? { ...elastic.decision, declaredCpuCores: submitted.resources?.cpuCores ?? fullDecision.candidateCpuCores } : fullDecision;
-    const floorAdmit = floorTrial && floorWinner(cfg, queue, held, cpuSample, memInfo, fullDecision.cpuGateClosed, gate.closed, weightCapacity)?.id === ticket.id;
-    if (floorTrial && !floorAdmit) {
+    const ordinarilyAdmitted = candidate?.id === ticket.id && cpuDecision.admit;
+    const floorAdmit = floorTrial && !ordinarilyAdmitted && floorWinner(cfg, queue, held, cpuSample, memInfo, fullDecision.cpuGateClosed, gate.closed, weightCapacity)?.id === ticket.id;
+    if (floorTrial && !floorAdmit && candidate?.id !== ticket.id) {
       return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
     }
     // BRAIN-418: only the head's own denial can declare its reservation futile; a candidate's poll reads the verdict
@@ -1738,10 +1737,10 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       };
     }
     // Same fail-CLOSED discipline as the skips above: an express start whose count is not durable would escape the rate cap.
-    if (priorityYield && !recordPriorityYield(root, store, resourceRecord, writeResourceState)) {
+    if (priorityYield && !floorAdmit && !recordPriorityYield(root, store, resourceRecord, writeResourceState)) {
       return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
     }
-    if (headBypass && !recordExpressAdmission(root, now)) {
+    if (headBypass && !floorAdmit && !recordExpressAdmission(root, now)) {
       return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
     }
     dequeueSync(root, ticket.id);
@@ -1811,7 +1810,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
         blockedMs: headBlock?.blockedMs ?? 0,
       });
     }
-    if (expressAdmit) {
+    if (expressAdmit && !floorAdmit) {
       logExpressAdmission(root, {
         candidateId: ticket.id,
         headId: headTicket.id,
