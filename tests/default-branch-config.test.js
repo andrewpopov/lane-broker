@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, gitFixture } from './helpers.js';
 import { paths } from '../src/state.js';
-import { readRows } from '../src/suggest.js';
+import { readHistoryRows } from '../src/suggest.js';
 import { repoConfigSource, CONFIG_FROM_ENV } from '../src/config.js';
 
 // BRAIN-713: `lane run` reads .lane-broker.json from the repo's default branch, so a merged lane change reaches every existing worktree.
@@ -34,7 +34,7 @@ const commitConfig = (dir, cfg) => {
 };
 const run = (f, cwd, extraEnv = {}) =>
   laneRun(['run', '--repo', 'r', '--lane', 'l', '--', ...SHOW_GRANT], { env: { ...f.env, ...extraEnv }, cwd });
-const lastRow = (f) => readRows(paths(f.state).history).at(-1);
+const lastRow = (f) => readHistoryRows(paths(f.state).history).at(-1);
 
 test('an old worktree is granted the value main has now, and says so once on stderr', async () => {
   const f = repoFixture({ committed: withCpu(2) });
