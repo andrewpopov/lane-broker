@@ -20,7 +20,7 @@ function collect(child) {
   });
 }
 
-test('a supervisor whose first enqueue meets a held lock waits for it and runs the ticket', async () => {
+test('a supervisor whose first enqueue meets a held lock waits for it and runs the ticket', { timeout: 120_000 }, async () => {
   const { base, home, state, env } = freshEnv({ LANE_BROKER_TEST_LOCK_TIMEOUT_MS: '150' });
   writeGlobalConfig(home, { version: 1, capacity: 1, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 50 });
   const repoDir = path.join(base, 'repo');
@@ -39,7 +39,7 @@ test('a supervisor whose first enqueue meets a held lock waits for it and runs t
   }
 });
 
-test('a fallback ticket whose finalize meets a held lock still publishes its result', async () => {
+test('a fallback ticket whose finalize meets a held lock still publishes its result', { timeout: 120_000 }, async () => {
   const { env, state, repoDir } = setup({ ssh: 'down' });
   const dir = tmpDir('b730');
   const ready = path.join(dir, 'ready');
@@ -59,7 +59,7 @@ test('a fallback ticket whose finalize meets a held lock still publishes its res
   assert.equal(result.executor, 'local');
 });
 
-test('a supervisor crash leaves exactly one supervisor-error history row that readers skip', async () => {
+test('a supervisor crash leaves exactly one supervisor-error history row that readers skip', { timeout: 120_000 }, async () => {
   const { base, home, state, env } = freshEnv({ LANE_BROKER_TEST_SUPERVISOR_ERROR_AT: 'queued' });
   writeGlobalConfig(home, { version: 1, capacity: 1, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 50 });
   const repoDir = path.join(base, 'repo');
