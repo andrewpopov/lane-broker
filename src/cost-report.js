@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { paths } from './state.js';
-import { readRows } from './suggest.js';
+import { readRows, readHistoryRows } from './suggest.js';
 
 /**
  * BRAIN-529 `lane report cost`: the gate-cost scorecard for the BRAIN-528 fleet-throughput program.
@@ -272,7 +272,7 @@ export async function costReportCommand(args, { stdout = process.stdout, stderr 
     }
     const journalRoot = flag('--journal-root') || path.join(os.homedir(), '.cache', 'merge-train');
     const journals = Object.fromEntries(repos.map((r) => [r, readJournal(path.join(journalRoot, r, 'journal.jsonl'))]));
-    const rows = readRows(flag('--history') || paths().history);
+    const rows = readHistoryRows(flag('--history') || paths().history);
     const report = buildCostReport({ repos, rows, journals, prsByRepo, since, until });
     stdout.write(args.includes('--json') ? `${JSON.stringify(report, null, 2)}\n` : `${renderCostText(report)}\n`);
     return { exitCode: 0 };

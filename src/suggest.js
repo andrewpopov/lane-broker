@@ -21,7 +21,7 @@ function percentile(sorted, p) {
 /** A history row that records a run. Rows with `event` set (BRAIN-730 `supervisor-error`) are diagnostics, never runs. */
 export const isRunRow = (row) => row.event === undefined;
 
-/** Tolerant history.jsonl reader: a torn or partial line is skipped, never fatal. Only run rows are returned (`isRunRow`). */
+/** Tolerant JSONL reader: a torn or partial line is skipped, never fatal. */
 export function readRows(file) {
   let text;
   try {
@@ -33,13 +33,17 @@ export function readRows(file) {
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
     try {
-      const row = JSON.parse(line);
-      if (isRunRow(row)) rows.push(row);
+      rows.push(JSON.parse(line));
     } catch {
       // a torn trailing line must not hide the rest of the history
     }
   }
   return rows;
+}
+
+/** history.jsonl's run rows: diagnostic rows (`event` set) are skipped. */
+export function readHistoryRows(file) {
+  return readRows(file).filter(isRunRow);
 }
 
 /** Pure: rows -> { groups, skippedNoObservation }. Declared cpuCores is the group's most recent row's. */
@@ -144,7 +148,7 @@ export function renderSuggestText(report) {
 }
 
 export async function suggestCommand({ repo, days, json } = {}) {
-  const report = buildSuggestions(readRows(paths(ensureStateDirs().root).history), { repo, days });
+  const report = buildSuggestions(readHistoryRows(paths(ensureStateDirs().root).history), { repo, days });
   process.stdout.write(json ? `${JSON.stringify(report, null, 2)}\n` : `${renderSuggestText(report)}\n`);
   return { exitCode: 0 };
 }

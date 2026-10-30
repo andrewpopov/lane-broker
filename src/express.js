@@ -1,6 +1,6 @@
 import { paths, atomicWriteJson, readJsonSafe } from './state.js';
 import { backfillEstimates } from './estimates-history.js';
-import { readRows } from './suggest.js';
+import { readHistoryRows } from './suggest.js';
 import { writeBrokerLog } from './admission.js';
 
 /**
@@ -49,7 +49,7 @@ export function loadExpressTable(root, now = Date.now(), { write = true } = {}) 
   const file = paths(root).expressEstimates;
   const cached = readJsonSafe(file);
   if (cached && Number.isFinite(cached.builtAt) && now - cached.builtAt >= 0 && now - cached.builtAt < TABLE_TTL_MS && cached.lane && cached.command) return cached;
-  const table = { builtAt: now, ...buildExpressTable(readRows(paths(root).history)) };
+  const table = { builtAt: now, ...buildExpressTable(readHistoryRows(paths(root).history)) };
   if (write) {
     try {
       atomicWriteJson(file, table);

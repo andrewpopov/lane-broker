@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneSpawn, laneRun, waitFor, sleep } from './helpers.js';
 import { tmpDir, setup, markerCmd, resultOf } from './remote-harness.js';
 import { paths, withLock, LockTimeoutError, NestedLockError, setLockContentionPolicy, resetLockContentionPolicy } from '../src/state.js';
-import { readRows } from '../src/suggest.js';
+import { readHistoryRows } from '../src/suggest.js';
 
 // BRAIN-730: the lock is busy ~99% of the time under load, so a supervisor's default 15s acquire deadline expires. That is
 // contention: the supervisor waits instead of dying with no result.
@@ -75,7 +75,7 @@ test('a supervisor crash leaves exactly one supervisor-error history row that re
   assert.equal(crashRows[0].phase, 'queued');
   assert.equal(crashRows[0].repo, 'r');
   assert.equal('exit' in crashRows[0], false);
-  assert.equal(readRows(paths(state).history).some((r) => r.event === 'supervisor-error'), false);
+  assert.equal(readHistoryRows(paths(state).history).some((r) => r.event === 'supervisor-error'), false);
 });
 
 function withShortDeadline(fn) {

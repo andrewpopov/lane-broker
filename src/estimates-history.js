@@ -1,6 +1,6 @@
 import { paths, stateHome } from './state.js';
 import { recordObservation, estimateFor, emptyEstimator } from './estimates.js';
-import { readRows } from './suggest.js';
+import { readHistoryRows } from './suggest.js';
 
 /**
  * BRAIN-408 slice A: fold the local broker's history.jsonl through the estimator, read-only.
@@ -82,7 +82,7 @@ export function expectedRunMs(rows, repo, lane) {
 
 export async function estimatesCommand({ root = stateHome(), json = false } = {}) {
   const hostFactor = 1;
-  const report = { root, hostFactor, hostFactorSource: 'none: no calibration, factor 1.0', ...backfillEstimates(readRows(paths(root).history), { hostFactor }) };
+  const report = { root, hostFactor, hostFactorSource: 'none: no calibration, factor 1.0', ...backfillEstimates(readHistoryRows(paths(root).history), { hostFactor }) };
   if (json) process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
   else {
     process.stdout.write(`host factor ${hostFactor} (${report.hostFactorSource})\n`);

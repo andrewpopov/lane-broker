@@ -17,7 +17,7 @@ import { stampPriorityOrigin } from './priority-clock.js';
 import { detectResourceCapacity, leaseResources, resolveTicketResources, capUnapprovedCpu, checkResourceBudget, localSimRefusal, dispatchOnlyRefusal, locallyRefusedNow } from './resources.js';
 import { hostOnlyPaths, hostPathsRefusal } from './host-paths.js';
 import { argvFingerprint } from './cpu-estimates.js';
-import { readRows } from './suggest.js';
+import { readHistoryRows } from './suggest.js';
 import { rightSizedCpuCores } from './right-size.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
 import { isExclusive, oversizedWeight, oversizedWeightMessage, EXCLUSIVE_PURPOSES, exclusiveDeadlineProblem } from './exclusive.js';
@@ -477,7 +477,7 @@ export async function runCommand({
   // BRAIN-550: an explicit --cpu is the caller's own claim, and an exclusive claims the whole budget; neither is right-sized
   const rightSized =
     globalCfg.rightSizeFromHistory && resolved.rightSize && !exclusive && cpuOverride === undefined
-      ? rightSizedCpuCores(readRows(paths(stateHome()).history), {
+      ? rightSizedCpuCores(readHistoryRows(paths(stateHome()).history), {
           repoId: resolved.repoId,
           lane: resolved.configLane ?? resolved.lane,
           declared: declaredResources.cpuCores,
@@ -611,7 +611,7 @@ export async function runCommand({
     // A detached caller waits on a ticket id, which a cached answer has none of, so it always runs (and still records its key).
     // `--no-cache` skips only the pass; the known-red refusal also covers detached runs and ignores `--no-cache`.
     const servePass = !detach && !noCache && process.env.LANE_BROKER_NO_CACHE !== '1';
-    const rows = readRows(paths(root).history);
+    const rows = readHistoryRows(paths(root).history);
     const decision = decideReuse(rows, { contentKey, now, passTtlMs: servePass ? passTtlMs : 0, redTtlMs });
     if (decision.action === 'refuse') {
       const red = decision.row;

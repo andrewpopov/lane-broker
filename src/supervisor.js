@@ -29,7 +29,7 @@ import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from '.
 import { reloadGlobalConfig, isDispatchOnly } from './config.js';
 import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope, scopeMemoryPeakReader, scopeMemoryPeakTracker, enforcementLabel } from './cpu-limit.js';
 import { stateHome, RUNNER_SHUTDOWN_REASON } from './state.js';
-import { readRows } from './suggest.js';
+import { readHistoryRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
 import { missingLocalDeps, speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, externalCpuSlots, DEFAULT_REMOTE_OVERHEAD_MS } from './speed-placement.js';
 import { starvedStaleMs } from './external-cpu.js';
@@ -512,7 +512,7 @@ function queueTimeoutFor(enriched, globalCfg, cpuLimit) {
 /** BRAIN-548: history rows and this lane's local run estimate for a speed-aware ticket; null (today's behaviour) without an estimate. */
 function speedInputs(root, enriched) {
   if (!enriched.speedAware) return null;
-  const rows = readRows(paths(root).history);
+  const rows = readHistoryRows(paths(root).history);
   const estimateMs = localRunEstimateMs(rows, enriched.repoId, enriched.lane);
   return estimateMs === null ? null : { rows, estimateMs };
 }
@@ -574,7 +574,7 @@ const seconds = (ms) => (ms === null ? 'unbounded' : `${Math.round(ms / 1000)}s`
 export function remoteSelectOptions(enriched, globalCfg, root = stateHome(), cpuLimit) {
   // BRAIN-533: history is read only when some runner has a schedule that could make the expected run time matter.
   const scheduled = (globalCfg.runners || []).some((r) => r.schedule);
-  const expectedMs = scheduled ? expectedRunMs(readRows(paths(root).history), enriched.repoId, enriched.lane) : null;
+  const expectedMs = scheduled ? expectedRunMs(readHistoryRows(paths(root).history), enriched.repoId, enriched.lane) : null;
   // BRAIN-597: first placement, rebind and rebalance all select through here, so a down runner is skipped by every one of them.
   const downRunners = downRunnerReasons(root, globalCfg);
   return {

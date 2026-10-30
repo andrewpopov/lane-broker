@@ -1,5 +1,5 @@
 import { paths } from './state.js';
-import { readRows } from './suggest.js';
+import { readHistoryRows } from './suggest.js';
 import { repoMatches, stats, parseTime } from './cost-report.js';
 
 /**
@@ -74,7 +74,7 @@ export async function phasesReportCommand(args, { stdout = process.stdout, stder
     parseTime('--since', since);
     parseTime('--until', until);
     if (Date.parse(until) <= Date.parse(since)) throw new Error('--until must be after --since');
-    const rows = readRows(flag('--history') || paths().history);
+    const rows = readHistoryRows(flag('--history') || paths().history);
     const report = buildPhasesReport({ repos: repoArg.split(',').filter(Boolean), rows, since, until });
     stdout.write(args.includes('--json') ? `${JSON.stringify(report, null, 2)}\n` : `${renderPhasesText(report)}\n`);
     return { exitCode: 0 };
