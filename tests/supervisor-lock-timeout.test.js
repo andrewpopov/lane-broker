@@ -151,6 +151,7 @@ test('acquiring the same lock from inside a held one throws NestedLockError at o
 test('under the policy an owner.json that stays unreadable still fails, after three deadlines', withShortDeadline(async () => {
   const { state } = freshEnv();
   fs.mkdirSync(paths(state).lock, { recursive: true });
+  fs.writeFileSync(path.join(paths(state).lock, 'owner.json'), '{torn');
   const contentions = [];
   setLockContentionPolicy({ onContention: (err) => contentions.push(err) });
   await assert.rejects(withLock(state, () => {}), /owner\.json is unreadable/);
