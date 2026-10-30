@@ -897,6 +897,7 @@ export async function withLock(root, fn, { timeoutMs, pollMs = 25, lockPath = pa
       await sleep(pollMs);
       continue;
     }
+    unreadableDeadlines = 0;
     if (!isLockOwnerAlive(owner)) {
       // recoverDeadLock never itself grants ownership: whether it moves the
       // dead lock dir aside or loses that race, loop back to the top and

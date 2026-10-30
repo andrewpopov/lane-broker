@@ -165,3 +165,20 @@ test('readHistoryRows skips a null line and diagnostic rows', () => {
   fs.writeFileSync(file, `null\n${JSON.stringify({ id: 'a', lane: 'l' })}\n${JSON.stringify({ id: 'b', event: 'supervisor-error' })}\n`);
   assert.deepEqual(readHistoryRows(file).map((r) => r.id), ['a']);
 });
+
+test('under the policy a readable owner between unreadable ones restarts the unreadable count', withShortDeadline(async () => {
+  const { state } = freshEnv();
+  const ownerFile = path.join(paths(state).lock, 'owner.json');
+  fs.mkdirSync(paths(state).lock, { recursive: true });
+  fs.writeFileSync(ownerFile, '{torn');
+  const contentions = [];
+  setLockContentionPolicy({
+    onContention: (err) => {
+      contentions.push(err);
+      if (contentions.length === 1) fs.writeFileSync(ownerFile, JSON.stringify({ pid: process.pid, token: 'live', start: null, at: Date.now() }));
+      if (contentions.length === 2) fs.writeFileSync(ownerFile, '{torn');
+    },
+  });
+  await assert.rejects(withLock(state, () => {}), /owner\.json is unreadable/);
+  assert.equal(contentions.length, 4);
+}));
