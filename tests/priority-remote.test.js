@@ -73,7 +73,7 @@ function remoteSetup({ ssh = 'normal', probeDelayMs = 0, runnerClockOffsetMs = 0
   return { ...ctx, env, header, runnerHistory };
 }
 
-const noopCmd = [process.execPath, '-e', '0'];
+const noopCmd = ['node', '-e', '0'];
 
 // ---- capability and the pure validators ----
 

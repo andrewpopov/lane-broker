@@ -79,7 +79,7 @@ async function startHeldRemote(ctx) {
   const releaseFile = path.join(dir, 'release');
   const counter = path.join(dir, 'executions');
   const cmd = [
-    process.execPath,
+    'node',
     '-e',
     `const fs = require('fs'); fs.appendFileSync(${JSON.stringify(counter)}, (process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local') + '\\n'); fs.writeFileSync(${JSON.stringify(started)}, 'x'); const t = setInterval(() => { if (fs.existsSync(${JSON.stringify(releaseFile)})) { clearInterval(t); process.exit(3); } }, 50);`,
   ];

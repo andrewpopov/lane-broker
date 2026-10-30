@@ -134,7 +134,7 @@ test('(g) a nested run inside a lease never executes locally: exit 69', async ()
   const release = path.join(dir, 'release');
   const envFile = path.join(dir, 'env.json');
   const holder = laneSpawn(
-    ['run', '--repo', 'r', '--lane', 'default', '--local', '--local-reason', 'test', '--', process.execPath, '-e',
+    ['run', '--repo', 'r', '--lane', 'default', '--local', '--local-reason', 'test', '--', 'node', '-e',
       `const fs=require('fs');fs.writeFileSync(${JSON.stringify(envFile)},JSON.stringify({LANE_BROKER_LEASE:process.env.LANE_BROKER_LEASE,LANE_BROKER_KEY:process.env.LANE_BROKER_KEY}));const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)})){clearInterval(t);process.exit(0)}},50)`],
     { env: ctx.env, cwd: ctx.repoDir },
   );
@@ -247,7 +247,7 @@ const pipelineDir = (payload) => {
   fs.writeFileSync(path.join(dir, 'pipeline.json'), JSON.stringify({ npmCacheDir: path.join(dir, 'c'), npmUserConfig: path.join(dir, 'npmrc'), ...payload }));
   return dir;
 };
-const writer = (file) => [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(file)}, 'ran')`];
+const writer = (file) => ['node', '-e', `require('fs').writeFileSync(${JSON.stringify(file)}, 'ran')`];
 
 test('P1-2 remote-pipeline refuses every phase (setup and command) on a dispatch-only host, and runs them otherwise', async () => {
   const ctx = setup({ ssh: 'normal' });
@@ -303,4 +303,17 @@ test('P2-6 every runner too small for the ticket for good: 69, not a retryable 7
   const res = await run(ctx, markerCmd(marker, 0));
   assert.equal(res.code, 69, res.stderr);
   ranNowhere(marker);
+});
+
+test('BRAIN-721: a dispatch-only host still refuses a host-only path, even with --local, and offers no --local option', async () => {
+  const ctx = setup({ ssh: 'normal' });
+  refuse(ctx);
+  const hostFile = path.join(tmpDir('hostonly'), 'x.sh');
+  fs.writeFileSync(hostFile, 'true');
+  for (const extra of [[], ['--local', '--local-reason', 'test']]) {
+    const res = await run(ctx, ['sh', hostFile], extra);
+    assert.equal(res.code, 64, res.stderr);
+    assert.ok(res.stderr.includes(`names ${hostFile}`), res.stderr);
+    assert.doesNotMatch(res.stderr, /pass --local/);
+  }
 });

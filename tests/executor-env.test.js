@@ -14,7 +14,7 @@ import { childEnv } from '../src/supervisor.js';
 
 /** A command that records the two variables to `file`. */
 const dumpEnv = (file) => [
-  process.execPath,
+  'node',
   '-e',
   `require('fs').writeFileSync(${JSON.stringify(file)}, JSON.stringify({ executor: process.env.LANE_BROKER_EXECUTOR ?? null, runner: process.env.LANE_BROKER_RUNNER ?? null }));`,
 ];

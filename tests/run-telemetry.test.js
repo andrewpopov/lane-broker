@@ -16,7 +16,7 @@ import { foldObservedCpu, integratedCpuSeconds } from '../src/observed.js';
 /** BRAIN-425: the shape of a finished run's history.jsonl row, per kind of run. */
 
 const GIB = 1024 ** 3;
-const busyCmd = (ms, exit = 0) => [process.execPath, '-e', `const end=Date.now()+${ms};while(Date.now()<end){} process.exit(${exit})`];
+const busyCmd = (ms, exit = 0) => ['node', '-e', `const end=Date.now()+${ms};while(Date.now()<end){} process.exit(${exit})`];
 const rows = (root) => fs.readFileSync(paths(root).history, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
 const lastRow = (root) => rows(root).at(-1);
 
@@ -103,7 +103,7 @@ test('remote run: submitter row carries exit, grant, cpuSeconds and remotePhases
   gitFixture(['add', '-A'], repoDir);
   gitFixture(['commit', '-q', '-m', 'x'], repoDir);
   const marker = path.join(tmpDir('marker'), 'where');
-  const cmd = [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local'); const end=Date.now()+1500;while(Date.now()<end){}`];
+  const cmd = ['node', '-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local'); const end=Date.now()+1500;while(Date.now()<end){}`];
   const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...cmd], { env, cwd: repoDir });
   assert.equal(result.code, 0, `stderr: ${result.stderr}`);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');

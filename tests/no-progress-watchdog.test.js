@@ -12,7 +12,7 @@ import { loadGlobalConfig, loadRepoConfig, reloadGlobalConfig } from '../src/con
 /** BRAIN-431: a run with no output AND no CPU for the window is killed (exit 124, reason no-progress). */
 
 const WINDOW_MS = 2000;
-const node = (body) => [process.execPath, '-e', body];
+const node = (body) => ['node', '-e', body];
 const PRINT_THEN_SLEEP = node(`process.stdout.write('started\\n'); setInterval(() => {}, 1000);`);
 const BUSY_SILENT = node(`const end = Date.now() + 5000; while (Date.now() < end) {} process.stdout.write('done\\n');`);
 const CHATTY = node(`let n = 0; const t = setInterval(() => { process.stdout.write('tick ' + n++ + '\\n'); if (n === 14) { clearInterval(t); } }, 300);`);

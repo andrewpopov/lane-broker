@@ -570,7 +570,7 @@ test('runner starts the job, ssh drops and result queries fail: NOT restored loc
   const pidFile = path.join(dir, 'pid');
   const release = path.join(dir, 'release');
   const cmd = [
-    process.execPath,
+    'node',
     '-e',
     `const fs = require('fs');
 fs.writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));

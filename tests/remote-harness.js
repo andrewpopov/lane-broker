@@ -477,7 +477,7 @@ ${stdoutText ? `process.stdout.write(${JSON.stringify(stdoutText)});` : ''}
 fs.writeFileSync(${JSON.stringify(markerPath)}, process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local');
 process.exit(${exitCode});
 `;
-  return [process.execPath, '-e', body];
+  return ['node', '-e', body];
 }
 
 export async function detachAndWait(args, env, cwd, waitTimeout = '180s') {
@@ -499,7 +499,7 @@ export function resultOf(state, id) {
 
 /** `lane run` of a command that appends where it ran to `file` (a line per execution), and holds until `release` exists if given. */
 export const recordingCmd = (file, release = null) => [
-  process.execPath,
+  'node',
   '-e',
   `const fs = require('fs');
 fs.appendFileSync(${JSON.stringify(file)}, (process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local') + '\\n');
@@ -634,7 +634,7 @@ export function rebalanceSetup({ names = ['a', 'b'], paused = ['a'], rebalance =
   });
   if (localPaused) fs.writeFileSync(path.join(base.state, 'PAUSE'), 'keep the local queue closed');
   const runsFile = path.join(tmpDir('rb-runs'), 'runs');
-  const cmd = [process.execPath, '-e', `require('fs').appendFileSync(${JSON.stringify(runsFile)}, process.env.LANE_FAKE_RUNNER + '\\n')`];
+  const cmd = ['node', '-e', `require('fs').appendFileSync(${JSON.stringify(runsFile)}, process.env.LANE_FAKE_RUNNER + '\\n')`];
   const cmdArgv = cmd;
   const runs = () => (fs.existsSync(runsFile) ? fs.readFileSync(runsFile, 'utf8').split('\n').filter(Boolean) : []);
   const unpause = (name) => fs.rmSync(runners[name].pause, { force: true });

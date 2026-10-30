@@ -215,7 +215,7 @@ test('end to end (local): the history row carries observedCpu and observedRssPea
   const repoDir = path.join(base, 'repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, cpuCores: 2 } } });
   const stats = path.join(tmpDir('busy'), 'stats.json');
-  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', process.execPath, '-e', busyLoop(1500, stats)], { env, cwd: repoDir });
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'node', '-e', busyLoop(1500, stats)], { env, cwd: repoDir });
   assert.equal(result.code, 0, result.stderr);
   const row = lastRow(state);
   assert.ok(row.observedCpu.samples >= 2, JSON.stringify(row.observedCpu));
@@ -231,7 +231,7 @@ test('end to end (remote): runner history AND the submitter history carry observ
   gitFixture(['commit', '-q', '-m', 'x'], repoDir);
   const marker = path.join(tmpDir('marker'), 'where');
   const stats = path.join(tmpDir('busy'), 'stats.json');
-  const cmd = [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local');${busyLoop(1500, stats)}`];
+  const cmd = ['node', '-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local');${busyLoop(1500, stats)}`];
   const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...cmd], { env, cwd: repoDir });
   assert.equal(result.code, 0, `stderr: ${result.stderr}`);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');

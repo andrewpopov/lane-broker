@@ -11,7 +11,7 @@ import { reloadGlobalConfig, loadGlobalConfig, loadRepoConfig } from '../src/con
 /** BRAIN-576: a run that writes no output for silenceTimeoutMs is killed whatever its CPU does (exit 124, reason silence). */
 
 const WINDOW_MS = 2000;
-const node = (body) => [process.execPath, '-e', body];
+const node = (body) => ['node', '-e', body];
 // prints once, then burns CPU silently: the no-progress watchdog never fires on this
 const SPIN_SILENT = node(`process.stdout.write('started\\n'); const end = Date.now() + 20000; while (Date.now() < end) {}`);
 // burns CPU the whole time and prints every ~300 ms for ~4.5 s
