@@ -171,6 +171,7 @@ never told to forward to it — both still get the `--log` file.
   "sampleMs": 5000,
   "resourceSkipLimit": 3,
   "resourceIdleOvershootCores": 1,
+  "floorOvershootCores": 6,
   "admissionLoadGate": false,
   "laneNice": 10,
   "localExecution": "allowed",
@@ -1671,14 +1672,17 @@ one lock transaction, so two supervisors never both exempt. macOS memory
 pressure `warn` or unknown does not block it, only `critical` does (as for every
 start). It is logged as `current=start:resource-idle-exempt`.
 
-**Floor slot (BRAIN-727).** While load outside the broker keeps the head from
-starting, one lane-local ticket (its lane is not `remote: true`, and it was not
-forced `--local`; never `sim` or exclusive) may start past it: the earliest such
-ticket in selection order whose projection, held leases charged as usual, is
-within `resourceIdleOvershootCores` of the budget and whose memory admits. A
-closed CPU gate is judged by the projection alone. At most one floor lease
-exists at a time (`floor: true` on the lease; an orphaned one counts). It spends
-no skip, express or yield allowance, and is logged `floor=1` with
+**Floor slot (BRAIN-727, push gates only since BRAIN-740).** While load outside
+the broker keeps a push gate from starting, it may take the floor slot: one
+local ticket whose lane is `prepush` or `prepush-*` (not `remote: true`, not
+forced `--local`; never `sim` or exclusive). The head may take it as well as a
+ticket behind a blocked head: the earliest such ticket in selection order whose
+projection, held leases charged as usual, is within `floorOvershootCores`
+(default 6; `0` disables the floor slot) of the budget and whose memory admits.
+Ordinary lanes never use it. A closed CPU gate is judged by the projection
+alone; a push held by BRAIN-731 is never chosen. At most one floor lease exists
+at a time (`floor: true` on the lease; an orphaned one counts). It spends no
+skip, express or yield allowance, and is logged `floor=1` with
 `current=start:floor-slot`. This is what keeps a push gate moving when the
 Mac's own use leaves lanes no room.
 
