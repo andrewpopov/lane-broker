@@ -18,7 +18,10 @@ function percentile(sorted, p) {
   return sorted[Math.max(0, Math.ceil(p * sorted.length) - 1)];
 }
 
-/** Tolerant history.jsonl reader: a torn or partial line is skipped, never fatal. */
+/** A history row that records a run. Rows with `event` set (BRAIN-730 `supervisor-error`) are diagnostics, never runs. */
+export const isRunRow = (row) => row.event === undefined;
+
+/** Tolerant history.jsonl reader: a torn or partial line is skipped, never fatal. Only run rows are returned (`isRunRow`). */
 export function readRows(file) {
   let text;
   try {
@@ -30,7 +33,8 @@ export function readRows(file) {
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
     try {
-      rows.push(JSON.parse(line));
+      const row = JSON.parse(line);
+      if (isRunRow(row)) rows.push(row);
     } catch {
       // a torn trailing line must not hide the rest of the history
     }
