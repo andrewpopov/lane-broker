@@ -499,6 +499,7 @@ function historyRow(ticket, result, { fallbackReason, lease, contentKey = isClea
     repo: ticket.repoId,
     lane: ticket.lane,
     ...(ticket.configLane ? { configLane: ticket.configLane } : {}),
+    ...(ticket.configFrom ? { configFrom: ticket.configFrom, ...(ticket.configBlob ? { configBlob: ticket.configBlob } : {}) } : {}),
     ...(ticket.localFirst ? { localFirst: true } : {}),
     ...(ticket.exclusive === true ? { exclusive: true } : {}),
     weight: ticket.weight,

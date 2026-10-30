@@ -27,7 +27,8 @@ function repoFixture({ committed, working, git = true, host = {} }) {
   if (working) writeRepoConfig(repoDir, working);
   return { env, repoDir, base };
 }
-const run = (f, lane, extra = []) => laneRun(['run', '--repo', 'r', '--lane', lane, ...extra, '--', ...SHOW_GRANT], { env: f.env, cwd: f.repoDir });
+// BRAIN-713: the config resolves from the default branch; a test of an uncommitted working-tree config opts into the worktree's file
+const run = (f, lane, extra = [], env = {}) => laneRun(['run', '--repo', 'r', '--lane', lane, ...extra, '--', ...SHOW_GRANT], { env: { ...f.env, ...env }, cwd: f.repoDir });
 const grantOf = (r) => Number(/grant=([\d.]+)/.exec(r.stdout)?.[1]);
 
 const BIG = { version: 1, undeclaredLanes: { as: 'big' }, lanes: { big: { weight: 1, cpuCores: 9 }, small: { weight: 1, cpuCores: 4 } } };
@@ -60,10 +61,11 @@ test('a lane declared at 9 in the committed config keeps 9, with no cap line', a
 
 test('a lane raised only in the working tree is capped to max(HEAD value, 4)', async () => {
   const raised = (cpuCores) => ({ version: 1, lanes: { l: { weight: 1, cpuCores } } });
+  const fromWorktree = { LANE_BROKER_CONFIG_FROM: 'worktree' };
   const low = repoFixture({ committed: raised(2), working: raised(8) });
-  assert.equal(grantOf(await run(low, 'l')), 4);
+  assert.equal(grantOf(await run(low, 'l', [], fromWorktree)), 4);
   const high = repoFixture({ committed: raised(6), working: raised(8) });
-  const r = await run(high, 'l');
+  const r = await run(high, 'l', [], fromWorktree);
   assert.equal(grantOf(r), 6, r.stderr);
   assert.match(r.stderr, /cpu 8 -> 6 /);
 });

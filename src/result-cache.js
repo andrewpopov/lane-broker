@@ -61,7 +61,7 @@ function untrackedFingerprint(root) {
  * sorted path/mode/content-hash list of untracked non-ignored files. Ignored files are NOT in it (node_modules, build
  * output), nor is the environment: the key says "same source", not "same machine". Null = never cache this run.
  */
-export function computeContentKey({ cwd, key, cmdFingerprint }) {
+export function computeContentKey({ cwd, key, cmdFingerprint, configIdentity = null }) {
   if (!key || !cmdFingerprint) return null;
   try {
     const [headTree, root] = git(cwd, ['rev-parse', 'HEAD^{tree}', '--show-toplevel']).toString('utf8').trim().split('\n');
@@ -72,7 +72,7 @@ export function computeContentKey({ cwd, key, cmdFingerprint }) {
     const diff = git(root, ['diff', 'HEAD', '--binary', '--full-index', '--no-ext-diff', '--no-textconv', '--no-color', '--ignore-submodules=none']);
     const untracked = untrackedFingerprint(root);
     if (untracked === null) return null;
-    return digest([KEY_VERSION, key, cmdFingerprint, headTree, diff, untracked]);
+    return digest([KEY_VERSION, key, cmdFingerprint, headTree, diff, untracked, ...(configIdentity ? [configIdentity] : [])]);
   } catch {
     return null;
   }
@@ -123,7 +123,14 @@ export function decideReuse(rows, { contentKey, now, passTtlMs, redTtlMs }) {
   return { action: 'run' };
 }
 
-export const isCleanPass = (result) => result.exit === 0 && !result.signal;
+/**
+ * BRAIN-713: the repo config a run used when it is not the worktree's own file (which the tree hash already covers), so a merged lane
+ * change or the worktree override never reuses a verdict reached under another config. Null keeps a worktree-config key unchanged.
+ */
+export const configIdentityOf = ({ configFrom, configBlob }) =>
+  configFrom === 'default-branch' ? `default-branch:${configBlob}` : configFrom === 'worktree-override' ? 'worktree-override' : null;
+
+export const isCleanPass =(result) => result.exit === 0 && !result.signal;
 
 /**
  * The key a finished run's history row carries (null: none), for a pass or a failure alike: it is kept only if the worktree still hashes to the key
@@ -131,6 +138,6 @@ export const isCleanPass = (result) => result.exit === 0 && !result.signal;
  */
 export function settledContentKey(ticket) {
   if (!ticket.contentKey) return null;
-  const after = computeContentKey({ cwd: ticket.cwd, key: ticket.key, cmdFingerprint: ticket.cmdFingerprint });
+  const after = computeContentKey({ cwd: ticket.cwd, key: ticket.key, cmdFingerprint: ticket.cmdFingerprint, configIdentity: configIdentityOf(ticket) });
   return after === ticket.contentKey ? after : null;
 }
