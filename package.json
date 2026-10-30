@@ -1,6 +1,6 @@
 {
   "name": "@andrewpopov/lane-broker",
-  "version": "0.65.0",
+  "version": "0.65.1",
   "description": "Machine-wide test-lane coordinator: serializes conflicting test lanes, caps concurrent heavy lanes, and refuses to start new work while the machine is overloaded.",
   "author": "Andrew Popov",
   "license": "MIT",
@@ -37,7 +37,7 @@
     "test": "node --test --test-concurrency=1 tests/*.test.js",
     "lint": "node --check bin/lane.js && node --check bin/lane-store.js && for f in src/*.js src/store/*.js scripts/*.sh; do case \"$f\" in *.sh) sh -n \"$f\" || exit 1 ;; *) node --check \"$f\" || exit 1 ;; esac; done",
     "verify": "npm run lint && sh scripts/verify-suite.sh",
-    "prepare": "git config core.hooksPath .githooks || true"
+    "hooks": "git config core.hooksPath .githooks"
   },
   "dependencies": {
     "pg": "^8.23.1"

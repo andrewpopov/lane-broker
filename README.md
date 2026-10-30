@@ -2691,6 +2691,8 @@ npm test
 npm run lint
 ```
 
+Run `npm run hooks` once after cloning to enable the pre-push gate.
+
 `npm run lint` is `node --check` — a syntax parser, not a full linter. It
 catches parse errors only (no unused vars, no shadowing, no undefined
 globals); the pre-push hook's real coverage is `npm test`.
