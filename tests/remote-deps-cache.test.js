@@ -83,9 +83,10 @@ function repoFiles({ lockEdit, postinstall = null, prepare = null, scripts = {},
     'package-lock.json': JSON.stringify(lock),
     'hello-tool-1.0.0.tgz': tarball ?? base.tarball,
     '.npmrc': NPMRC + npmrcExtra,
+    ...(rootScriptsSafe ? { 'gen-input.txt': 'generator input one' } : {}),
     '.lane-broker.json': JSON.stringify({
       version: 1,
-      lanes: { default: { weight: 1, remote: true, remoteDeps: ['.'], ...(rootScriptsSafe ? { remoteDepsCacheRootScriptsSafe: true } : {}), ...laneExtra } },
+      lanes: { default: { weight: 1, remote: true, remoteDeps: ['.'], ...(rootScriptsSafe ? { remoteDepsCacheRootScriptsSafe: true, remoteDepsCacheKeyFiles: ['gen-input.txt'] } : {}), ...laneExtra } },
     }),
   };
 }
@@ -396,6 +397,21 @@ test('a root lifecycle script outside the allowlist skips the cache unless the l
   const declared = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'harmless', rootScriptsSafe: true })));
   assert.equal(declared.row.depsCache, 'miss');
   assert.equal(s.storedKeys().length, 1);
+});
+
+test('PKG-277: a non-workspace repo with safe root scripts keys its remoteDepsCacheKeyFiles: edit one and the cache misses, edit anything else and it hits', async () => {
+  const s = setupWithNpmSpy();
+  const files = repoFiles({ postinstall: 'harmless' });
+  const run = async (edit = {}) => runLane(s, makeGitWorktree({ ...files, 'unrelated.txt': 'one', ...edit }));
+  const cold = await run();
+  assert.equal(cold.row.depsCache, 'miss');
+  assert.match(cold.stderr, /published=yes/);
+  assert.equal((await run()).row.depsCache, 'hit');
+  assert.equal((await run({ 'unrelated.txt': 'two' })).row.depsCache, 'hit', 'an unrelated file is not in the key');
+  const regenerated = await run({ 'gen-input.txt': 'generator input two' });
+  assert.equal(regenerated.row.depsCache, 'miss', 'a changed key file must miss');
+  assert.equal(s.npmCiCalls(), 2);
+  assert.equal(s.storedKeys().length, 2);
 });
 
 test('the allowlisted prepare script (git config core.hooksPath) does not stop a tree being cached', async () => {

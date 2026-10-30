@@ -814,9 +814,25 @@ ordinary low-priority ticket on the runner (not preempted by later work).
   covered by that key and the keyed install environment. Writes outside those
   trees prevent publication. Custom root scripts are not replayed on a hit;
   their generated dependency output must be complete in the cached tree.
-  In other repositories, root scripts must leave `node_modules` alone because
-  their source inputs are not keyed. Scripts reading external state or fetching
+  In a repository without npm workspaces nothing bounds those inputs, so the
+  flag also needs `remoteDepsCacheKeyFiles` (below) and the cache refuses
+  (`skip`) without it. Scripts reading external state or fetching
   unpinned generator inputs do not satisfy this declaration; leave the flag off.
+- `remoteDepsCacheKeyFiles` (PKG-277): a non-empty array of repo-root relative
+  files or directories (no absolute path, `..`, `.`/empty segment, backslash,
+  trailing slash, duplicate, or anything under `node_modules` or `.git`) whose
+  bytes, executable modes and names key the cache, for a lane whose root
+  scripts generate code into `node_modules` from known repo files (bewks:
+  `prisma/schema.prisma` into `node_modules/.prisma/client`). It requires
+  `remoteDepsCacheRootScriptsSafe: true` and may not name a path the lane's
+  `remoteExclude` removes (both are config errors); each path must exist in
+  the snapshot or the cache skips. A workspace repository whose lock has a
+  dependency install script keeps keying the whole source tree and ignores the
+  list; without one, the list replaces the whole-tree key. The field rides in
+  the protocol-2 header only with the safe flag, and the lane is placed only
+  on runners advertising `deps-key-files/1` (an older runner would ignore the
+  field and key without it); `lane runner prewarm` does not probe, so warm
+  such a lane only on upgraded runners.
 - `remoteSetup`: argv arrays run in the repo root after deps, before the
   command.
 - `remoteExclude` (BRAIN-642): an array of at most 64 patterns (each at most 256 characters) naming paths to leave out of
@@ -896,7 +912,7 @@ reason.
   form is refused. A workspace with a lifecycle script, `binding.gyp` or lock
   install script is always ineligible, even with `remoteDepsCacheRootScriptsSafe`.
   The key covers the discovered set and each workspace's path, lock entry and
-  whole `package.json` (canonical JSON). A workspace declaring `bin` is refused until its executable links can be restored. When a dependency has an install script, or the lane declares root scripts safe, the key also covers repository source bytes and executable modes outside `.git` and `node_modules`. Source links escaping that keyed tree are refused; an install that writes outside dependency trees still cannot publish a cache entry.
+  whole `package.json` (canonical JSON). A workspace declaring `bin` is refused until its executable links can be restored. In a workspace repo, when a dependency has an install script, or the lane declares root scripts safe, the key also covers repository source bytes and executable modes outside `.git` and `node_modules` (PKG-277: a safe lane with `remoteDepsCacheKeyFiles` and no dependency install script keys only those paths instead; a repo without workspaces keys only its `remoteDepsCacheKeyFiles` and is refused without them). Source links escaping that keyed tree are refused; an install that writes outside dependency trees still cannot publish a cache entry.
   The store holds only installed packages, never the workspace symlinks or
   sources, and records which workspaces had a nested `node_modules`: a hit
   recreates each `node_modules/<name>` link (relative, as `npm ci` makes it)

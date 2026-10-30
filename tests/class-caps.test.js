@@ -306,6 +306,29 @@ test('P1: a ticket that requires class enforcement only goes to a runner adverti
   assert.equal(plain.runner.name, runners[0].name, 'a ticket without classEnforcement is unchanged on an old runner');
 });
 
+test('PKG-277: a lane with remoteDepsCacheKeyFiles only goes to a runner advertising deps-key-files/1', async () => {
+  const { binDir } = makeFakeSshBin();
+  const probe = (capabilities) => ({ protocol: 1, protocols: [1, 2], version: '0.0.0', paused: false, queued: 0, running: 0, capabilities });
+  const ssh = (name, payload) => {
+    const bin = path.join(binDir, name);
+    fs.writeFileSync(bin, `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(JSON.stringify(payload))} + '\\n');\nprocess.exit(0);\n`);
+    fs.chmodSync(bin, 0o755);
+    return bin;
+  };
+  const { env } = clientEnv(binDir);
+  const runners = [makeRunner({ ssh: 'normal' })];
+  const enriched = (remote) => ({ weight: 1, resources: { cpuCores: 1, memoryBytes: GIB }, remote });
+  const keyed = { remoteDeps: ['.'], remoteDepsCacheRootScriptsSafe: true, remoteDepsCacheKeyFiles: ['gen-input.txt'] };
+  const old = await selectRunner(runners, { ...remoteSelectOptions(enriched(keyed), DEFAULT_GLOBAL_CONFIG), sshBin: ssh('ssh-old-keyfiles', probe(['elastic-claims/1'])), env, deadlineMs: 3000 });
+  assert.equal(old.runner, null);
+  assert.match(old.skipped[0].reason, /deps-key-files\/1/);
+  const newer = await selectRunner(runners, { ...remoteSelectOptions(enriched(keyed), DEFAULT_GLOBAL_CONFIG), sshBin: ssh('ssh-new-keyfiles', probe(['deps-key-files/1'])), env, deadlineMs: 3000 });
+  assert.equal(newer.runner.name, runners[0].name);
+  const { remoteDepsCacheKeyFiles, ...unkeyed } = keyed;
+  const plain = await selectRunner(runners, { ...remoteSelectOptions(enriched(unkeyed), DEFAULT_GLOBAL_CONFIG), sshBin: ssh('ssh-old-plain', probe(['elastic-claims/1'])), env, deadlineMs: 3000 });
+  assert.equal(plain.runner.name, runners[0].name, 'a lane without key files is unchanged on an old runner');
+});
+
 test('P2: only an ABSENT global config means no classes; unreadable or vanished-after-use fails the sim class closed', () => {
   const { home, state } = freshEnv();
   const prev = { home: process.env.LANE_BROKER_HOME, state: process.env.LANE_BROKER_STATE };

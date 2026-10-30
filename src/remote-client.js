@@ -898,6 +898,8 @@ async function dispatchOnce(opts) {
     // BRAIN-389: only `false` (the lane opted out) rides in the header; the cache is on by default on the runner.
     remoteDepsCache = true,
     remoteDepsCacheRootScriptsSafe = false,
+    // PKG-277: sent only with the safe flag; a runner without `deps-key-files/1` would ignore it, so the supervisor requires the capability.
+    remoteDepsCacheKeyFiles = null,
     // BRAIN-398: the lane's declared artifact paths/globs and policy (null: none, or the runner cannot return them),
     // and the submitter's own caps on what it will accept back.
     remoteArtifacts = null,
@@ -1001,7 +1003,10 @@ async function dispatchOnce(opts) {
     if (Array.isArray(remoteDeps) && remoteDeps.length > 0) header.remoteDeps = remoteDeps;
     if (Array.isArray(remoteSetup) && remoteSetup.length > 0) header.remoteSetup = remoteSetup;
     if (remoteDepsCache === false) header.remoteDepsCache = false;
-    if (remoteDepsCacheRootScriptsSafe === true) header.remoteDepsCacheRootScriptsSafe = true;
+    if (remoteDepsCacheRootScriptsSafe === true) {
+      header.remoteDepsCacheRootScriptsSafe = true;
+      if (Array.isArray(remoteDepsCacheKeyFiles) && remoteDepsCacheKeyFiles.length > 0) header.remoteDepsCacheKeyFiles = remoteDepsCacheKeyFiles;
+    }
   }
   if (Array.isArray(remoteArtifacts) && remoteArtifacts.length > 0) {
     header.remoteArtifacts = remoteArtifacts;

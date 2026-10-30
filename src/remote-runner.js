@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
 import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, readRemoteDrain, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath, RUNNER_SHUTDOWN_REASON, RUNNER_SHUTDOWN_UNPROVEN_REASON } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
-import { isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, RUNNER_NAME_RE, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
+import { isValidDepsKeyFilesShape, isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, RUNNER_NAME_RE, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
 import { advertisedCapabilities } from './capabilities.js';
 import { enforcementOf } from './cpu-limit.js';
 import { createStrictGunzip, TRANSFER_GZIP, REMOTE_EXEC_NO_TICKET_EXIT } from './remote-gzip.js';
@@ -192,6 +192,10 @@ function validateHeaderFields(header) {
   }
   if (header.remoteDepsCacheRootScriptsSafe !== undefined && (header.protocol !== 2 || header.remoteDepsCacheRootScriptsSafe !== true)) {
     return { ok: false, reason: 'invalid remoteDepsCacheRootScriptsSafe' };
+  }
+  // PKG-277: key files only ever ride with the safe flag on protocol 2.
+  if (header.remoteDepsCacheKeyFiles !== undefined && (header.protocol !== 2 || header.remoteDepsCacheRootScriptsSafe !== true || !isValidDepsKeyFilesShape(header.remoteDepsCacheKeyFiles))) {
+    return { ok: false, reason: 'invalid remoteDepsCacheKeyFiles' };
   }
   // BRAIN-320 S1d: opt-in on both protocols -- an old runner simply ignores
   // an unknown field, which is fine (the feature is opt-in), but THIS
@@ -633,6 +637,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
       depsCache: {
         enabled: header.remoteDepsCache !== false && runnerCfg.remoteDepsCache,
         rootScriptsSafe: header.remoteDepsCacheRootScriptsSafe === true,
+        keyFiles: header.remoteDepsCacheKeyFiles ?? [],
         root: path.join(remoteRootAbs, 'deps-cache'),
         maxBytes: runnerCfg.remoteDepsCacheMaxBytes,
       },

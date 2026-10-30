@@ -313,6 +313,7 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
         env: depsEnv,
         npmVersion: npmVersion(),
         rootScriptsSafe: depsCache.rootScriptsSafe === true,
+        keyFiles: depsCache.keyFiles ?? [],
         keyPartsSecret: readKeyPartsSecret(depsCache.root),
       });
     } catch (err) {

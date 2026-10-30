@@ -383,3 +383,58 @@ test('a lane weight below 0.01 is rejected naming weight when cpuCores is unset,
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 0.001, cpuCores: 1 } } });
   assert.equal(resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' }).weight, 0.001);
 });
+
+test('PKG-277 remoteDepsCacheKeyFiles resolves, is inherited through an undeclared-lane template, and null when absent', () => {
+  const { base } = freshEnv();
+  const repoDir = path.join(base, 'key-files');
+  writeRepoConfig(repoDir, { version: 1, undeclaredLanes: { as: 'keyed' }, lanes: {
+    default: { weight: 1 },
+    keyed: { weight: 1, remoteDeps: ['.'], remoteDepsCacheRootScriptsSafe: true, remoteDepsCacheKeyFiles: ['prisma/schema.prisma', 'scripts/tools'] },
+  } });
+  assert.equal(resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' }).remoteDepsCacheKeyFiles, null);
+  for (const lane of ['keyed', 'ad-hoc']) {
+    const resolved = resolveTicketConfig({ cwd: repoDir, repo: 'r', lane });
+    assert.deepEqual(resolved.remoteDepsCacheKeyFiles, ['prisma/schema.prisma', 'scripts/tools'], lane);
+    assert.equal(resolved.remoteDepsCacheRootScriptsSafe, true, lane);
+  }
+});
+
+test('PKG-277 remoteDepsCacheKeyFiles rejects bad shapes, a lane without the safe flag and a key file the lane excludes', () => {
+  const bad = {
+    'not an array': 'a.txt',
+    empty: [],
+    'empty string': [''],
+    absolute: ['/etc/passwd'],
+    parent: ['../a.txt'],
+    'inner parent': ['a/../b.txt'],
+    dot: ['.'],
+    'dot segment': ['./a.txt'],
+    'empty segment': ['a//b.txt'],
+    backslash: ['a\\b.txt'],
+    'trailing slash': ['dir/'],
+    duplicate: ['a.txt', 'a.txt'],
+    'not a string': [3],
+    'inside node_modules': ['node_modules/x/package.json'],
+    'inside .git': ['.git/config'],
+  };
+  for (const [name, remoteDepsCacheKeyFiles] of Object.entries(bad)) {
+    const { base } = freshEnv();
+    const repoDir = path.join(base, 'bad-key-files');
+    writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, remoteDepsCacheRootScriptsSafe: true, remoteDepsCacheKeyFiles } } });
+    assert.throws(() => resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' }), /remoteDepsCacheKeyFiles must be a non-empty array/, name);
+  }
+  const rejected = (lane, pattern) => {
+    const { base } = freshEnv();
+    const repoDir = path.join(base, 'bad-key-files');
+    writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, ...lane } } });
+    assert.throws(() => resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' }), pattern);
+  };
+  rejected({ remoteDepsCacheKeyFiles: ['a.txt'] }, /requires remoteDepsCacheRootScriptsSafe: true/);
+  rejected({ remoteDepsCacheRootScriptsSafe: false, remoteDepsCacheKeyFiles: ['a.txt'] }, /requires remoteDepsCacheRootScriptsSafe: true/);
+  rejected({ remoteDepsCacheRootScriptsSafe: true, remoteDepsCacheKeyFiles: ['prisma/schema.prisma'], remoteExclude: ['prisma/'] }, /path "prisma\/schema.prisma" is excluded by remoteExclude/);
+  rejected({ remoteDepsCacheRootScriptsSafe: true, remoteDepsCacheKeyFiles: ['a.txt'], remoteExclude: ['*.txt'] }, /excluded by remoteExclude/);
+  const { base } = freshEnv();
+  const repoDir = path.join(base, 'ok-key-files');
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, remoteDepsCacheRootScriptsSafe: true, remoteDepsCacheKeyFiles: ['a.txt'], remoteExclude: ['docs/'] } } });
+  assert.deepEqual(resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' }).remoteDepsCacheKeyFiles, ['a.txt']);
+});
