@@ -5,6 +5,7 @@ import path from 'node:path';
 import { laneRun, writeRepoConfig, waitFor, sleep, freshEnv } from './helpers.js';
 import { setup, tmpDir, probeCount, markerCmd, resultOf } from './remote-harness.js';
 import { paths, bootId, appendHistory } from '../src/state.js';
+import { detectResourceCapacity } from '../src/resources.js';
 import { writeLease, removeLease, LEASE_STATE } from '../src/lease.js';
 import { listQueue } from '../src/scheduler.js';
 import { localIneligibilityOf, selectionOptionsFor } from '../src/supervisor.js';
@@ -106,6 +107,12 @@ test('local-first held longer than localFirstWaitMs rebinds to the runner', TIME
 test('local-first under localFirstWaitMs does not rebind yet, then runs locally once admitted', TIMEOUT, async () => {
   const ctx = localFirstSetup({ lane: { remotePolicy: 'local-first', localFirstWaitMs: 60_000 } });
   holdLocalQueue(ctx);
+  // an idle host, pinned: a loaded dev machine leaves no CPU slot, and a blocked ticket rightly skips the local-first wait (BRAIN-727)
+  const { cpuCores } = detectResourceCapacity();
+  const busyFile = path.join(tmpDir('lf-busy'), 'busy');
+  fs.writeFileSync(busyFile, `0,${cpuCores}\n`);
+  ctx.env.LANE_BROKER_CPU_BUSY_FILE = busyFile;
+  fs.writeFileSync(paths(ctx.state).cpuSample, JSON.stringify({ lastValid: { at: Date.now(), hostBusyCores: 0, cores: cpuCores } }));
   const marker = path.join(tmpDir('lf-marker'), 'm');
   let id;
   try {

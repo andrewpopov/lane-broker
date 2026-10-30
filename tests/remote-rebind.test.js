@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor, sleep } from './helpers.js';
-import { tmpDir, makeRunner, setup, probeCount, recordingCmd, linesOf, hasLease, holdLaneLocally, detach, waitResult } from './remote-harness.js';
+import { tmpDir, makeRunner, setup, rebalanceSetup, probeCount, recordingCmd, linesOf, hasLease, holdLaneLocally, detach, waitResult } from './remote-harness.js';
+import { detectResourceCapacity } from '../src/resources.js';
 import { selectRunner } from '../src/remote-client.js';
 import { spawn } from 'node:child_process';
 import { enqueue, tryStart, listQueue, withdrawQueued, restoreQueued, recoverRebinding, reapStale } from '../src/scheduler.js';
@@ -760,4 +761,90 @@ test('an ordinary remote lane with every runner full still waits in the local qu
   hold.release();
   await hold.done;
   assert.equal((await waitResult(ctx, id)).executor, 'local');
+});
+
+// ---- BRAIN-727: a ticket stuck behind host load outside any lease leaves a runner's rejection behind ----
+
+const REJECTED_TRANSFER = { kind: 'rejected', reason: 'file body: truncated gzip stream: missing trailer' };
+
+/**
+ * Runner `a` (first in config order) answers every job with the rejection record of BRAIN-727's incident; runner `b` is idle.
+ * The local lane is held, and the host CPU state is WRITTEN as the supervisor reads it: `blocked` = every core busy with the
+ * gate closed (no slot beside external load), otherwise an idle host.
+ */
+function rejectingRunnerSetup({ blocked, rebindIntervalMs = 300, repoLane = {} }) {
+  const ctx = rebalanceSetup({ names: ['a', 'b'], paused: [], rebalance: { remoteRebindIntervalMs: rebindIntervalMs }, runnerOpts: { a: { resultPatch: REJECTED_TRANSFER } } });
+  // runner a's own broker refuses the job at preflight, so nothing ever executes there; its record is then the incident's rejection
+  writeGlobalConfig(ctx.runners.a.home, { schedulerMode: 'active', sampleMs: 50, capacity: 4, memoryReserveBytes: 1e15 });
+  writeRepoConfig(ctx.repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, remotePolicy: 'remote-first', ...repoLane } } });
+  const { cpuCores } = detectResourceCapacity();
+  const writeHostCpu = () => {
+    fs.writeFileSync(paths(ctx.state).cpuSample, JSON.stringify({ lastValid: { at: Date.now(), hostBusyCores: blocked ? cpuCores : 0, cores: cpuCores } }));
+    fs.writeFileSync(paths(ctx.state).cpuGate, JSON.stringify({ closed: blocked, consecutiveUnder: 0 }));
+  };
+  return { ...ctx, writeHostCpu, admissionLog: () => fs.readFileSync(paths(ctx.state).admissionLog, 'utf8') };
+}
+
+test('blocked rebind: a ticket a runner rejected (never started) moves to another runner when no local CPU slot is left', async () => {
+  const ctx = rejectingRunnerSetup({ blocked: true });
+  const hold = await holdLaneLocally(ctx);
+  try {
+    ctx.writeHostCpu();
+    const id = await detach(ctx, ctx.cmdArgv);
+    const result = await waitResult(ctx, id);
+    assert.equal(result.executor, 'remote');
+    assert.equal(result.runner, 'b', 'the rejecting runner a is never revisited; b takes it');
+    assert.deepEqual(ctx.runs(), ['b'], 'the command executed exactly once, on b');
+    assert.equal(ctx.fake.count('exec a'), 1, 'a was tried once, and only once');
+    assert.match(ctx.admissionLog(), new RegExp(`remote-rebind: ${id}: local blocked: no CPU slot beside external load — moving to b`));
+  } finally {
+    hold.release();
+    await hold.done;
+  }
+});
+
+test('blocked rebind: the same rejected ticket stays local while a local CPU slot exists', async () => {
+  const ctx = rejectingRunnerSetup({ blocked: false });
+  const hold = await holdLaneLocally(ctx);
+  ctx.writeHostCpu();
+  const id = await detach(ctx, ctx.cmdArgv);
+  await waitFor(() => listQueue(ctx.state).some((t) => t.id === id), { timeoutMs: 30_000 });
+  await sleep(1500); // five rebind intervals
+  assert.equal(ctx.fake.count('exec b'), 0, 'runner b was never dispatched to');
+  assert.deepEqual(listQueue(ctx.state).map((t) => t.id), [id]);
+  hold.release();
+  await hold.done;
+  assert.equal((await waitResult(ctx, id)).executor, 'local');
+  assert.deepEqual(ctx.runs(), ['undefined'], 'the command ran exactly once, locally');
+});
+
+test('blocked rebind: client-wide ineligibility never rebinds, even when blocked', async () => {
+  const ctx = rejectingRunnerSetup({ blocked: true, repoLane: { remoteDeps: ['no-such-dir'] } });
+  const hold = await holdLaneLocally(ctx);
+  ctx.writeHostCpu();
+  const id = await detach(ctx, ctx.cmdArgv);
+  await waitFor(() => listQueue(ctx.state).some((t) => t.id === id), { timeoutMs: 30_000 });
+  assert.match(ctx.admissionLog(), /remote-skip: none: .*remoteDeps|remote-skip: none/);
+  await sleep(1500);
+  assert.equal(ctx.fake.count('exec a') + ctx.fake.count('exec b'), 0, 'no runner was dispatched to');
+  assert.deepEqual(listQueue(ctx.state).map((t) => t.id), [id]);
+  hold.release();
+  await hold.done;
+  assert.equal((await waitResult(ctx, id)).executor, 'local');
+  assert.deepEqual(ctx.runs(), ['undefined'], 'the command ran exactly once, locally');
+});
+
+test('blocked rebind: remoteRebindIntervalMs 0 disables it', async () => {
+  const ctx = rejectingRunnerSetup({ blocked: true, rebindIntervalMs: 0 });
+  const hold = await holdLaneLocally(ctx);
+  ctx.writeHostCpu();
+  const id = await detach(ctx, ctx.cmdArgv);
+  await waitFor(() => listQueue(ctx.state).some((t) => t.id === id), { timeoutMs: 30_000 });
+  await sleep(1500);
+  assert.equal(ctx.fake.count('exec b'), 0);
+  assert.deepEqual(listQueue(ctx.state).map((t) => t.id), [id]);
+  hold.release();
+  await hold.done;
+  assert.equal((await waitResult(ctx, id)).executor, 'local');
+  assert.deepEqual(ctx.runs(), ['undefined'], 'the command ran exactly once, locally');
 });
