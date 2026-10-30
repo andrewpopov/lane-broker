@@ -875,7 +875,7 @@ function cloneTree(src, dst, hooks, rel = '') {
   fs.chmodSync(dst, dirMode(srcMode));
 }
 
-/** Copy one file (a reflink where the filesystem has them) and set its mode; returns its size. */
+/** Copy one file and set its mode; returns its size. Node's COPYFILE_FICLONE makes a real copy on macOS, so no reflink is promised. */
 function copyFileAs(src, dst, transformMode) {
   fs.copyFileSync(src, dst, fs.constants.COPYFILE_FICLONE);
   const st = fs.statSync(src);
@@ -896,15 +896,48 @@ export function removeTree(target) {
   fs.rmSync(target, { recursive: true, force: true });
 }
 
+const CLONEFILE_PY = 'import ctypes,sys\nl=ctypes.CDLL(None,use_errno=True)\nif l.clonefile(sys.argv[1].encode(),sys.argv[2].encode(),0)!=0:\n    e=ctypes.get_errno();sys.stderr.write("clonefile errno %d\\n"%e);sys.exit(e or 1)\n';
+const CLONE_TIMEOUT_MS = 120_000;
+
+/** One clonefile(2) of the whole tree (APFS copy-on-write); Node has no binding, so python3's ctypes makes the call. Throws on any failure. */
+function cloneWholeTreeViaPython(src, dst) {
+  execFileSync('/usr/bin/python3', ['-I', '-c', CLONEFILE_PY, src, dst], { stdio: 'ignore', timeout: CLONE_TIMEOUT_MS });
+}
+
+/** Make every directory and regular file under `dir` owner-writable, never following symlinks; throws on an unsupported entry type. */
+function makeTreeWritable(dir) {
+  fs.chmodSync(dir, (fs.lstatSync(dir).mode & 0o7777) | 0o200);
+  for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
+    const p = path.join(dir, ent.name);
+    if (ent.isDirectory()) makeTreeWritable(p);
+    else if (ent.isFile()) fs.chmodSync(p, (fs.lstatSync(p).mode & 0o7777) | 0o200);
+    else if (!ent.isSymbolicLink()) throw new Error(`unsupported entry type at ${p}`);
+  }
+}
+
 /**
- * Copy a stored tree to `destTree` as private files and directories the lane may write freely. Throws on
- * any failure (including a `destTree` that already exists); the caller removes the partial tree and installs.
+ * Restore a stored tree to `destTree` as private files and directories the lane may write freely. On darwin the
+ * whole tree is cloned in one call; any clone failure removes the partial tree and falls back to the file-by-file
+ * copy. Throws on a failure of that copy (including a `destTree` that already exists); the caller removes the
+ * partial tree and installs. Returns `{ cloned }`: a cloned file reads cold, so the caller scans the store instead.
  */
-export function materializeFromStore(cacheRoot, key, destTree) {
-  cloneTree(entryTree(cacheRoot, key), destTree, {
+export function materializeFromStore(cacheRoot, key, destTree, { platform = process.platform, cloneWholeTree = cloneWholeTreeViaPython } = {}) {
+  const src = entryTree(cacheRoot, key);
+  if (platform === 'darwin' && !fs.existsSync(destTree)) {
+    try {
+      cloneWholeTree(src, destTree);
+      makeTreeWritable(destTree);
+      return { cloned: true };
+    } catch (err) {
+      process.stderr.write(`deps-cache clone failed, copying instead: ${err.message}\n`);
+      removeTree(destTree);
+    }
+  }
+  cloneTree(src, destTree, {
     onFile: (s, d) => copyFileAs(s, d, (mode) => mode | 0o200),
     dirMode: (mode) => mode | 0o200,
   });
+  return { cloned: false };
 }
 
 /** Where the symlink for workspace `resolved` at `<tree>/<name>` points: relative, as `npm ci` writes it. */
@@ -1612,6 +1645,16 @@ function findNeedleInTree(tree, needles, skip = new Set()) {
   return walk(tree, '');
 }
 
+/** The first recorded entry of `tree` (a file's content or a symlink's target) holding any of `needles`; null when clean. */
+function findNeedleInEntries(tree, entries, needles) {
+  for (const { relPath, kind } of entries) {
+    const file = path.join(tree, relPath);
+    const content = kind === 'symlink' ? Buffer.from(fs.readlinkSync(file), 'utf8') : fs.readFileSync(file);
+    if (needles.some((n) => content.includes(n))) return relPath;
+  }
+  return null;
+}
+
 /**
  * Check the cached copy of a tree before it is published: each recorded entry holds a token and no raw install
  * path, and nothing else holds a raw install path or a token (a file created or changed after collection).
@@ -1646,9 +1689,10 @@ export function readRelocation(cacheRoot, key) {
  * the new path of the token's role (exact bytes, via a temp file renamed over the original with its mode kept; a
  * symlink is re-created with the substituted target), then verify that no token of this entry's nonce is left anywhere in
  * the tree (a file the record omits included). Throws on any failure (roles that now differ, a missing role, an entry with no token, a
- * leftover token); the caller discards the tree.
+ * leftover token); the caller discards the tree. With `scanRoot` (the warm store entry a clone came from), the
+ * leftover scan reads that instead of `tree` (skipping the recorded entries) and checks the recorded entries of `tree` itself.
  */
-export function relocateRestoredTree(tree, { nonce, candidates, prefixes, entries }, newPaths) {
+export function relocateRestoredTree(tree, { nonce, candidates, prefixes, entries }, newPaths, { scanRoot } = {}) {
   const pairs = prefixes.map(({ roles }) => {
     const targets = roles.map((role) => {
       if (!newPaths[role]) throw new Error(`relocation: no new path for ${role}`);
@@ -1680,7 +1724,8 @@ export function relocateRestoredTree(tree, { nonce, candidates, prefixes, entrie
 
   const destinations = Object.values(newPaths);
   const stale = candidates.filter((c) => !destinations.some((d) => d.includes(c))).map((c) => Buffer.from(c, 'utf8'));
-  const leftover = findNeedleInTree(tree, [tail, ...stale]);
+  const needles = [tail, ...stale];
+  const leftover = scanRoot ? findNeedleInTree(scanRoot, needles, new Set(entries.map((e) => e.relPath))) ?? findNeedleInEntries(tree, entries, needles) : findNeedleInTree(tree, needles);
   if (leftover) throw new Error(`relocation: ${leftover} still holds a placeholder or an old install path`);
 }
 

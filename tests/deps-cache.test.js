@@ -564,6 +564,74 @@ test('materialize makes private writable copies: no shared inodes, read-only sto
   assert.ok((fs.statSync(stored).mode & 0o222) === 0, 'store files are read-only');
 });
 
+const cpClone = (src, dst) => execFileSync('cp', ['-a', src, dst]);
+const isWritableTree = (root) => {
+  const bad = [];
+  const walk = (d) => {
+    if ((fs.lstatSync(d).mode & 0o200) === 0) bad.push(d);
+    for (const ent of fs.readdirSync(d, { withFileTypes: true })) {
+      const p = path.join(d, ent.name);
+      if (ent.isDirectory()) walk(p);
+      else if (ent.isFile() && (fs.lstatSync(p).mode & 0o200) === 0) bad.push(p);
+    }
+  };
+  walk(root);
+  return bad;
+};
+
+test('darwin clone restore: the tree matches the store, is writable, and the store stays read-only', () => {
+  const cacheRoot = tmpDir('deps-cache-store');
+  const { key, src } = publish(cacheRoot);
+  const copy = path.join(tmpDir('deps-cache-work'), 'node_modules');
+  assert.deepEqual(materializeFromStore(cacheRoot, key, copy, { platform: 'darwin', cloneWholeTree: cpClone }), { cloned: true });
+  assert.equal(treeDigest(copy), treeDigest(src));
+  assert.deepEqual(isWritableTree(copy), []);
+  assert.ok((fs.statSync(path.join(entryTree(cacheRoot, key), 'pkg1')).mode & 0o222) === 0, 'store directories stay read-only');
+});
+
+test('darwin clone failure falls back to the copy loop and leaves no partial tree', () => {
+  const cacheRoot = tmpDir('deps-cache-store');
+  const { key, src } = publish(cacheRoot);
+  const copy = path.join(tmpDir('deps-cache-work'), 'node_modules');
+  const failAfterPartial = (s, d) => {
+    cpClone(s, d);
+    throw new Error('clone broke');
+  };
+  assert.deepEqual(materializeFromStore(cacheRoot, key, copy, { platform: 'darwin', cloneWholeTree: failAfterPartial }), { cloned: false });
+  assert.equal(treeDigest(copy), treeDigest(src));
+  assert.deepEqual(isWritableTree(copy), []);
+  const partialLeft = (s, d) => {
+    fs.mkdirSync(d);
+    fs.writeFileSync(path.join(d, 'junk'), 'x');
+    throw new Error('clone broke');
+  };
+  const copy2 = path.join(tmpDir('deps-cache-work'), 'node_modules');
+  materializeFromStore(cacheRoot, key, copy2, { platform: 'darwin', cloneWholeTree: partialLeft });
+  assert.ok(!fs.existsSync(path.join(copy2, 'junk')), 'the partial clone was removed before the copy');
+});
+
+test('darwin restore into an existing destination throws EEXIST and keeps it, without cloning', () => {
+  const cacheRoot = tmpDir('deps-cache-store');
+  const { key } = publish(cacheRoot);
+  const copy = path.join(tmpDir('deps-cache-work'), 'node_modules');
+  fs.mkdirSync(copy);
+  fs.writeFileSync(path.join(copy, 'mine'), 'keep');
+  const neverCalled = () => assert.fail('clone must not run onto an existing destination');
+  assert.throws(() => materializeFromStore(cacheRoot, key, copy, { platform: 'darwin', cloneWholeTree: neverCalled }), { code: 'EEXIST' });
+  assert.equal(fs.readFileSync(path.join(copy, 'mine'), 'utf8'), 'keep');
+});
+
+test('a real clonefile restore is writable, matches the store and shares no edits (darwin only)', { skip: process.platform !== 'darwin' }, () => {
+  const cacheRoot = tmpDir('deps-cache-store');
+  const { key, src } = publish(cacheRoot);
+  const copy = path.join(tmpDir('deps-cache-work'), 'node_modules');
+  assert.deepEqual(materializeFromStore(cacheRoot, key, copy), { cloned: true });
+  assert.equal(treeDigest(copy), treeDigest(src));
+  assert.deepEqual(isWritableTree(copy), []);
+  fs.appendFileSync(path.join(copy, 'pkg3', 'package.json'), ' edited');
+  assert.equal(treeDigest(entryTree(cacheRoot, key)), treeDigest(src));
+});
+
 test('an in-place edit of a materialized file changes only that run\'s copy', () => {
   const cacheRoot = tmpDir('deps-cache-store');
   const { key, src } = publish(cacheRoot);
