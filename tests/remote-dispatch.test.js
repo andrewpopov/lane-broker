@@ -98,7 +98,7 @@ test('result-tamper: a record that does not bind proves nothing, so the ticket i
     repoDir,
     '180s',
   );
-  assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
+  assert.equal(waited.code, 75, `stderr: ${waited.stderr}`);
   assert.match(waited.stderr, /ORPHANED-REMOTE/);
   assert.equal(readAttempt(state, id)?.executor, 'remote', 'the attempt is kept');
   assert.ok(readAttempt(state, id)?.unresolved);
@@ -719,7 +719,7 @@ test('BRAIN-437: ssh dropped after the runner took the job, fetches all failing,
   const { env, state, repoDir } = setup({ ssh: 'drop-stuck' });
   const marker = path.join(tmpDir('marker'), 'where');
   const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], env, repoDir, '90s');
-  assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
+  assert.equal(waited.code, 75, `stderr: ${waited.stderr}`);
   assert.equal(fs.existsSync(marker), false, 'the job must not have been run locally');
   assert.match(waited.stderr, /ORPHANED-REMOTE/);
   assert.equal(readAttempt(state, id).executor, 'remote');

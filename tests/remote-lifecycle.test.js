@@ -345,7 +345,7 @@ async function startAdmittedFallback(env, state, repoDir, argv) {
   return id;
 }
 
-test('SIGKILLing a fallback supervisor after its local child has been admitted (child keeps running): lane wait exits 1 fast, naming it', async () => {
+test('SIGKILLing a fallback supervisor after its local child has been admitted (child keeps running): lane wait exits 74 fast, naming it', async () => {
   const { env, state, repoDir } = setup({ ssh: 'down' });
   const id = await startAdmittedFallback(env, state, repoDir, ['sleep', '30']);
 
@@ -361,7 +361,7 @@ test('SIGKILLing a fallback supervisor after its local child has been admitted (
   const startedAt = Date.now();
   const waited = await laneRun(['wait', id, '--timeout', '10s'], { env });
   assert.ok(Date.now() - startedAt < 8000, 'must fail fast off the attempt-liveness check, not poll out to the timeout');
-  assert.equal(waited.code, 1, `stderr: ${waited.stderr}`);
+  assert.equal(waited.code, 74, `stderr: ${waited.stderr}`);
   assert.match(waited.stderr, /ORPHANED/);
   assert.match(waited.stderr, new RegExp(`lane cancel ${id}`));
 

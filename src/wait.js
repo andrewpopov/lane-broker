@@ -147,7 +147,7 @@ export async function waitCommand(id, { timeoutMs } = {}) {
               `lane wait: ${id} is ${label} (runner ${settledAttempt.runner ?? 'unknown'}) -- its supervisor is gone and nothing ` +
                 `will ever produce a result; reconcile with: lane cancel ${id}\n`,
             );
-            return { exitCode: 1 };
+            return { exitCode: 74 };
           }
           // ORPHANED-REMOTE: the runner knows what happened to the job, so ask it (never re-runs anything). A settled
           // outcome is read back by the top of the loop; a job the runner still has keeps polling like any in-flight
@@ -165,7 +165,7 @@ export async function waitCommand(id, { timeoutMs } = {}) {
                   `(${outcome.state}${outcome.reason ? `: ${outcome.reason}` : ''}); it will be reconciled automatically once ${runnerName} ` +
                   `answers (lane status); or: lane cancel ${id}\n`,
               );
-              return { exitCode: 1 };
+              return { exitCode: 75 };
             }
           }
         }

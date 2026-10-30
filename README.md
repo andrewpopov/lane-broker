@@ -1196,7 +1196,7 @@ launchd job; it adds no second ledger and builds on the BRAIN-594 clock:
   Advertised as capability `runner-heartbeat/1`.
 
 `lane wait` asks the runner inline: it returns the settled exit, keeps waiting while the runner reports the job running (asking
-again every 30 s), and exits `1` naming the reason otherwise. `--timeout` is an absolute deadline for the reconcile too: its ssh
+again every 30 s), and exits `75` ("waited, not failed": it is reconciled automatically once the runner answers) naming the reason otherwise. `--timeout` is an absolute deadline for the reconcile too: its ssh
 calls never run past it, and out of time `lane wait` exits `75`, not `1`. A signal during the wait asks the runner to cancel; one it
 cannot confirm makes `lane wait` exit `1` (`cancel of <id> not confirmed (attempt kept)`) rather than poll on. `lane status` starts `lane reconcile` detached whenever it lists an orphan and never waits on ssh itself.
 `lane reconcile [--now] [--json]` runs the sweep by hand: one sweep per 5 minutes per broker (claimed under the broker lock;
@@ -2319,7 +2319,8 @@ Documented limits, not bugs:
 | `64` | Nested `lane run` would widen the inherited lease — refused; or an invalid `--priority` / `LANE_BROKER_PRIORITY` / lane `priority`; or an invalid tier given to `lane priority`; or an `--exclusive` lane nested under another lane; or `exclusiveHooks` in host or repo config (not supported yet); or a remote-eligible command naming a path that exists only on this machine (BRAIN-721). |
 | `69` | Local-sim lane refused (fleet-offload message); use `--allow-local-sim`. |
 | `76` | A remote-only (`localRefused` + `remote`) lane found no runner able to take it right now (BRAIN-455). Retryable, unlike `69`; `--allow-local-sim` runs it here. |
-| `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. Also `lane run` / `remote-exec` refused with "scheduler migration in progress" while `lane migrate-scheduler` runs, or "scheduler migration pending (draining)" while `--when-idle` waits. `lane priority` also exits `75` (nothing changed, retry) on a lock timeout, a migration in progress, or a ticket mid-rebind to a runner. |
+| `74` | `lane wait`: the attempt's supervisor is gone (ORPHANED post-fallback, or MOVE-INTERRUPTED) and no result will ever be produced; `lane cancel` it. |
+| `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. Also `lane run` / `remote-exec` refused with "scheduler migration in progress" while `lane migrate-scheduler` runs, or "scheduler migration pending (draining)" while `--when-idle` waits. `lane priority` also exits `75` (nothing changed, retry) on a lock timeout, a migration in progress, or a ticket mid-rebind to a runner. `lane wait` also exits `75` for an ORPHANED-REMOTE attempt its runner could not settle (unreachable, unreadable global config): it may still settle. |
 | `79` | BRAIN-700: refused to re-run byte-identical content that already failed ("Known-red refusal"); pass `--retry "<why>"`. |
 | `80` | `lane priority`: no such ticket, or it already finished (result, cancel, expire or withdraw marker). |
 | `81` | `lane priority`: the ticket is in the wrong state: running, or queued on a runner / owned by a submitter (cancel and resubmit with `--priority`). |

@@ -109,11 +109,11 @@ test('orphan + runner still running, then finishes: lane wait keeps waiting and 
   assert.equal(resultOf(ctx.state, id).exit, 3);
 });
 
-test('orphan + runner unreachable: exit 1, message keeps ORPHANED-REMOTE and names the state, the auto-reconcile and lane cancel', async () => {
+test('orphan + runner unreachable: exit 75, message keeps ORPHANED-REMOTE and names the state, the auto-reconcile and lane cancel', async () => {
   const ctx = setup({ ssh: 'down' });
   const id = seedOrphan(ctx, { record: completed(3) });
   const out = await wait(ctx, id);
-  assert.equal(out.code, 1);
+  assert.equal(out.code, 75);
   assert.match(out.stderr, /ORPHANED-REMOTE/);
   assert.match(out.stderr, /unreachable/);
   assert.match(out.stderr, /reconciled automatically once skybox answers/);
@@ -122,12 +122,12 @@ test('orphan + runner unreachable: exit 1, message keeps ORPHANED-REMOTE and nam
   assert.equal(resultOf(ctx.state, id), null);
 });
 
-test('orphan + unreadable global config: treated as unreachable (exit 1)', async () => {
+test('orphan + unreadable global config: treated as unreachable (exit 75)', async () => {
   const ctx = setup();
   const id = seedOrphan(ctx, { record: completed(3) });
   fs.writeFileSync(path.join(ctx.home, 'config.json'), '{ not json');
   const out = await wait(ctx, id);
-  assert.equal(out.code, 1);
+  assert.equal(out.code, 75);
   assert.match(out.stderr, /ORPHANED-REMOTE/);
   assert.match(out.stderr, /unreachable/);
   assert.ok(readAttempt(ctx.state, id));
