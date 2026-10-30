@@ -564,6 +564,17 @@ What a remote run does:
    one of the two takes it (a started, cancelled or already-gone ticket is
    never withdrawn), then dispatches as above, logging
    `lane: remote-rebind: <id>: seq <n> -> <runner>` to the admission log.
+   **Blocked rebinding (BRAIN-727).** A runner's record proving it never
+   started the ticket (a rejected transfer such as a truncated upload
+   included) does not make the fallback rebindable, since another runner
+   might reject it on the same merits. But while load outside every lease
+   leaves this machine no CPU slot for the ticket (the BRAIN-596 verdict:
+   a closed CPU gate, or budget minus external busy cores below its claim),
+   it is re-probed on the same `remoteRebindIntervalMs` schedule, skips any
+   `localFirstWaitMs` wait, counts as stuck locally, and is moved to a runner
+   it has not been to, logging `lane: remote-rebind: <id>: local blocked: no
+   CPU slot beside external load`. Client-side ineligibility (manifest,
+   `remoteDeps`) never rebinds.
    The withdrawal is two-phase: the queue file is renamed to
    `<seq>-<id>.json.rebinding` (no listing reads it, and the scheduler keeps
    the ticket's fairness records for it) and the attempt records
@@ -1600,6 +1611,17 @@ disable the exemption; only `resourceIdleOvershootCores: 0` does. The check and 
 one lock transaction, so two supervisors never both exempt. macOS memory
 pressure `warn` or unknown does not block it, only `critical` does (as for every
 start). It is logged as `current=start:resource-idle-exempt`.
+
+**Floor slot (BRAIN-727).** While load outside the broker keeps the head from
+starting, one lane-local ticket (its lane is not `remote: true`, and it was not
+forced `--local`; never `sim` or exclusive) may start past it: the earliest such
+ticket in selection order whose projection, held leases charged as usual, is
+within `resourceIdleOvershootCores` of the budget and whose memory admits. A
+closed CPU gate is judged by the projection alone. At most one floor lease
+exists at a time (`floor: true` on the lease; an orphaned one counts). It spends
+no skip, express or yield allowance, and is logged `floor=1` with
+`current=start:floor-slot`. This is what keeps a push gate moving when the
+Mac's own use leaves lanes no room.
 
 ### Elastic CPU claims (`minCpuCores`, BRAIN-360)
 
