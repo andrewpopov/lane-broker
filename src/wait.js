@@ -7,6 +7,7 @@ import { cancelCommand } from './cancel.js';
 import { loadGlobalConfigOrError } from './config.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
 import { settleAbandonedLocalAttempt } from './local-reconcile.js';
+import { isSuperseded } from './push-gate.js';
 import { readPending, settleDeadPending } from './pending.js';
 
 const RECONCILE_SSH_DEADLINE_MS = 30_000;
@@ -24,6 +25,10 @@ async function reconcileOrphan(root, id, deadline) {
 
 /** The exit `lane wait` reports for a published result. A reconciled-as-lost result (exit 75) says why on stderr (BRAIN-594). */
 function resultExit(id, result) {
+  if (isSuperseded(result)) {
+    process.stderr.write(`lane wait: superseded by ${result.supersededBy}\n`);
+    return { exitCode: 130 };
+  }
   if (result.signal) {
     process.stderr.write(`lane wait: command terminated by signal ${result.signal}\n`);
     return { exitCode: 1 };

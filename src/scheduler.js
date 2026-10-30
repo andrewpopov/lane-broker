@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, isExpired, writeExpireMarkerFile, isWithdrawn, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, isExpired, writeExpireMarkerFile, writeCancelMarkerFile, writeSupersededMarkerFile, readSupersededBy, withSupersession, removeSupersededMarker, removeReleasedMarker, isWithdrawn, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
 import { sampleAndUpdateGate, readGateState } from './load.js';
 import { patchAttemptLocked, readAttempt } from './attempts.js';
 import { listLeases, readLease, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
@@ -20,6 +20,7 @@ import { isExclusive, exclusiveDeny, isExclusiveHead, exclusiveLeaseFields, with
 import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, resolveLaneNice, effectiveNice, effectiveRank, score, tierRank, waitedMs } from './priority.js';
 import { loadExpressTable, expressVerdict, expressAdmissionsLastMinute, recordExpressAdmission, logExpressAdmission } from './express.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
+import { isRepeatOfPush, pushOrder, pushHolds } from './push-gate.js';
 import { resolveScheduler, resolveSchedulerDetailed, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
 import { detectResourceCapacity, effectiveWeightCapacity, exclusiveBudget, cpuBudgetCores, evaluateMemoryAdmission, leaseResources, resolveTicketResources, terminalRowDefaults, capElasticClaim, elasticBelowFloor, elasticClaimRange } from './resources.js';
 
@@ -215,8 +216,28 @@ export async function enqueue(root, ticket, cfg = DEFAULT_GLOBAL_CONFIG, { owner
     };
     atomicWriteJson(queueFile(root, seq, ticket.id), record);
     touchSimArmFor(root, record);
-    return record;
+    return record.pushGate ? { ...record, supersededTargets: supersedeRepeatedPushes(root, record) } : record;
   });
+}
+
+/**
+ * BRAIN-731: a repeat of the same push (same repo, checkout, branch and args, another git process) replaces the earlier one,
+ * queued or running. Marks the loser (superseded + cancel marker) and returns the other tickets the caller must now stop,
+ * after the lock: the loser may be the incoming ticket itself when a slow supervisor enqueues the older push last.
+ */
+function supersedeRepeatedPushes(root, incoming) {
+  const targets = [];
+  const leased = listLeases(root).map((lease) => ({ lease, held: true }));
+  const queued = listQueue(root).filter(Boolean).map((t) => ({ lease: t, held: false }));
+  for (const { lease: other, held } of [...leased, ...queued]) {
+    if (other.id === incoming.id || isCancelled(root, other.id) || readSupersededBy(root, other.id) || other.repoId !== incoming.repoId || !other.pushGate || !isRepeatOfPush(other.pushGate, incoming.pushGate)) continue;
+    const incomingIsNewer = pushOrder(other.pushGate, incoming.pushGate) < 0;
+    const [loser, winner] = incomingIsNewer ? [other, incoming] : [incoming, other];
+    writeSupersededMarkerFile(root, loser.id, winner.id);
+    writeCancelMarkerFile(root, loser.id);
+    if (loser !== incoming) targets.push({ id: loser.id, supervisorPid: loser.supervisorPid, supervisorStart: loser.supervisorStart, orphanedLease: held && !isSupervisorAlive(loser) });
+  }
+  return targets;
 }
 
 /** Remove a queue record. Returns whether the ticket is now durably not
@@ -506,10 +527,12 @@ export function reapOrphanedQueue(root, keepTicketId) {
   for (const t of listQueue(root)) {
     if (!t || t.id === keepTicketId || !isQueuedSupervisorGone(t, current)) continue;
     const endedAt = Date.now();
+    const superseded = readSupersededBy(root, t.id) !== null;
+    const outcome = superseded ? { exit: 130, cancelled: true } : { exit: 75, cancelled: false, reason: DEAD_QUEUED_SUPERVISOR_REASON };
     // Publish first: a ticket whose result cannot be written stays queued and is retried on the next pass, so a submitter
     // reconciling later never finds neither.
     try {
-      atomicWriteJson(t.resultPath, { id: t.id, exit: 75, signal: null, startedAt: null, endedAt, waitedMs: null, cancelled: false, reason: DEAD_QUEUED_SUPERVISOR_REASON, reconciled: true });
+      atomicWriteJson(t.resultPath, withSupersession(root, t.id, { id: t.id, signal: null, startedAt: null, endedAt, waitedMs: null, reconciled: true, ...outcome }));
     } catch (err) {
       writeBrokerLog(root, `reap ${t.id}: could not publish result, leaving it queued: ${err.message}\n`);
       continue;
@@ -520,7 +543,9 @@ export function reapOrphanedQueue(root, keepTicketId) {
     // trace of the drop (BRAIN-202). Same row conventions as cancel.js.
     if (!dequeueSync(root, t.id)) continue;
     touchSimArmFor(root, t);
-    appendHistory(root, { ...terminalRowDefaults(t), id: t.id, key: t.key, dequeuedDeadSupervisor: true, error: 'supervisor died while queued', supervisorPid: t.supervisorPid, endedAt, executor: 'local' });
+    appendHistory(root, withSupersession(root, t.id, { ...terminalRowDefaults(t), id: t.id, key: t.key, dequeuedDeadSupervisor: true, error: 'supervisor died while queued', supervisorPid: t.supervisorPid, endedAt, executor: 'local', ...(superseded ? { cancelled: true } : {}) }));
+    removeSupersededMarker(root, t.id);
+    removeReleasedMarker(root, t.id);
   }
 }
 
@@ -550,9 +575,11 @@ export async function couldAdmitNow(root, cfg, ticket, memoryReader = readMemory
 }
 
 function couldAdmitLocked(root, cfg, ticket, memoryReader) {
-  if (listQueue(root).length > 0) return { admit: false, reason: 'queue-ahead' };
-  if (fs.existsSync(paths(root).pause)) return { admit: false, reason: 'paused' };
   const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
+  const queued = listQueue(root);
+  const pushHeld = pushHolds(root, queued, held);
+  if (queued.some((t) => t === null || !pushHeld.has(t.id))) return { admit: false, reason: 'queue-ahead' };
+  if (fs.existsSync(paths(root).pause)) return { admit: false, reason: 'paused' };
   if (held.some(isExclusive)) return { admit: false, reason: 'exclusive-held' };
   if (blockedBy(held, ticket)) return { admit: false, reason: 'conflict' };
   const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
@@ -1178,13 +1205,19 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     const classes = resolveClasses(cfg, root);
     const classHost = classes.mode === 'off' && classes.valid ? null : detectResourceCapacity();
     const { capEnforced, eligible, simsAfterTests } = classQueuePolicy(rawQueue, classes, held, classHost, cfg);
+    // BRAIN-731: a push held behind the same caller's other push leaves every selection like a cap-denied sim does
+    const pushHeld = pushHolds(root, rawQueue, held);
+    if (pushHeld.has(submitted.id)) {
+      const behind = pushHeld.get(submitted.id);
+      return { result: { started: false, reason: 'push-hold', behind, behindRepo: [...rawQueue, ...held].find((t) => t?.id === behind)?.repoId } };
+    }
     const { queue: fullQueue, ownerId: reservationOwnerId } = sched.v2
-      ? effectiveView(rawQueue, nowEff, cfg, store, eligible, { simsAfterTests })
+      ? effectiveView(rawQueue, nowEff, cfg, store, (t) => eligible(t) && !pushHeld.has(t.id), { simsAfterTests })
       : { queue: rawQueue, ownerId: null };
     if (!fullQueue.some((t) => t && t.id === submitted.id)) {
       return { result: { started: false, reason: 'not-head', position: null, queueLength: fullQueue.length } };
     }
-    const queue = capEnforced.size ? fullQueue.filter((t) => t === null || !capEnforced.has(t.id)) : fullQueue;
+    const queue = capEnforced.size || pushHeld.size ? fullQueue.filter((t) => t === null || !(capEnforced.has(t.id) || pushHeld.has(t.id))) : fullQueue;
     const booked = classes.valid && classHost ? bookedSims(held, cfg) : null;
     const ticket = classes.valid && classes.mode === 'active' ? capSimClaim(budgetCapped, classes, booked, classHost, cfg) : budgetCapped;
     const position = queue.findIndex((t) => t && t.id === ticket.id);
@@ -1790,6 +1823,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       ...((classOf(ticket) === 'sim' || isEnforcementRequired(ticket)) && classEnforcementOf(classes, root) ? { classEnforcement: classEnforcementOf(classes, root) } : {}),
       logPath: ticket.logPath,
       resultPath: ticket.resultPath,
+      ...(ticket.pushGate ? { pushGate: ticket.pushGate, repoId: ticket.repoId } : {}),
       // BRAIN-403: an exclusive run claims the whole admission budget (every capacity and resource path then refuses the rest)
       ...(exclusiveHolder ? exclusiveLeaseFields({ ...exclusiveBudget(detectResourceCapacity(), cfg), weightCapacity, declaredResources: submitted.resources }) : {}),
       state: LEASE_STATE.RUNNING,

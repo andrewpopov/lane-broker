@@ -15,6 +15,11 @@ import {
   withdrawMarkerPath,
   isWithdrawn,
   writeCancelMarkerFile,
+  supersededMarkerPath,
+  readSupersededBy,
+  withSupersession,
+  releasedMarkerPath,
+  isReleased,
   withLock,
   setLockContentionPolicy,
   MigrationInProgressError,
@@ -23,7 +28,9 @@ import {
 } from './state.js';
 import { enqueue, existingTicket, tryStart, dequeueSync, couldAdmitNow, listQueue, HELD_STATES, withdrawQueued, restoreQueued, discardRebinding, readQueuedRecord } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
+import { cancelCommand } from './cancel.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
+import { isPidAlive, isProcessAlive } from './process-liveness.js';
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
 import { reloadGlobalConfig, isDispatchOnly } from './config.js';
@@ -113,14 +120,45 @@ function cancelRequested(root, id) {
   return isCancelled(root, id);
 }
 
+const PUSH_ABANDONED = 'push-abandoned';
+const PUSH_HOLD_POLL_MS = 5000;
+
+/** BRAIN-731: how long this supervisor's ticket sat held behind the same caller's other push, and behind which (the last). */
+const pushHold = { heldMs: 0, since: null, behind: null };
+
+function pushHoldFields() {
+  const heldMs = pushHold.heldMs + (pushHold.since === null ? 0 : Date.now() - pushHold.since);
+  return pushHold.behind === null ? {} : { pushHeldMs: heldMs, heldBehind: pushHold.behind };
+}
+
+function endPushHold() {
+  if (pushHold.since === null) return;
+  pushHold.heldMs += Date.now() - pushHold.since;
+  pushHold.since = null;
+}
+
 function clearTicketMarkers(root, id) {
   discardRebinding(root, id);
-  for (const marker of [cancelMarkerPath(root, id), expireMarkerPath(root, id), withdrawMarkerPath(root, id)]) {
+  for (const marker of [cancelMarkerPath(root, id), expireMarkerPath(root, id), withdrawMarkerPath(root, id), supersededMarkerPath(root, id), releasedMarkerPath(root, id)]) {
     try {
       fs.unlinkSync(marker);
     } catch {
       // none pending
     }
+  }
+}
+
+/** Stop a ticket a repeat push replaced: TERM its live supervisor without waiting, or cancel an orphaned lease whose supervisor is gone. */
+export async function stopSupersededTicket({ id, supervisorPid, supervisorStart, orphanedLease }) {
+  if (orphanedLease) {
+    await cancelCommand(id, { quiet: true });
+    return;
+  }
+  if (!isProcessAlive(supervisorPid, supervisorStart)) return;
+  try {
+    process.kill(supervisorPid, 'SIGTERM');
+  } catch {
+    // already gone
   }
 }
 
@@ -448,6 +486,10 @@ function localRefusalResult(ticket, refusal) {
  * the `result` spread); `localReason` is the ticket's creation-time reason, or
  * `fallback:<reason>` when a remote attempt fell back to local.
  */
+function pushGateRowFields({ worktree, branch, caller, pushArgsHash }) {
+  return { worktree, branch, caller, pushArgsHash };
+}
+
 function historyRow(ticket, result, { fallbackReason, lease, contentKey = isCleanPass(result) ? undefined : ticket.contentKey, contentKeyVerified = false } = {}) {
   const executor = result.executor ?? 'local';
   const localReason = executor === 'local' ? (fallbackReason === undefined ? ticket.localReason : `fallback:${fallbackReason}`) : undefined;
@@ -471,6 +513,7 @@ function historyRow(ticket, result, { fallbackReason, lease, contentKey = isClea
     // BRAIN-700: the tree still hashed to the key when the run ended, so a failure on it is a verdict about that content
     ...(contentKey && contentKeyVerified ? { contentKeyVerified: true } : {}),
     ...(ticket.retryReason ? { retryReason: ticket.retryReason } : {}),
+    ...(ticket.pushGate ? { ...pushGateRowFields(ticket.pushGate), ...pushHoldFields() } : {}),
     ...(ticket.logPath ? { logPath: ticket.logPath } : {}),
     // BRAIN-380 §8: only a ticket that was admitted has a lease, so only its row carries the admission audit
     ...priorityAuditOf(lease),
@@ -1459,7 +1502,7 @@ async function main() {
   async function finalizeQueuedAndExit(outcome = 'cancelled', { forcePublish = false } = {}) {
     // BRAIN-436: 'withdrawn' (a submitter took the queued ticket back to move it) finalizes exactly like a queue timeout:
     // a structured, unconditionally published exit-75 result that says the command never started.
-    const isTimeout = outcome === 'queue-timeout' || outcome === 'withdrawn';
+    const isTimeout = outcome === 'queue-timeout' || outcome === 'withdrawn' || outcome === PUSH_ABANDONED;
     const buildResult = () =>
       isTimeout
         ? {
@@ -1472,14 +1515,14 @@ async function main() {
             cancelled: false,
             reason: outcome,
           }
-        : { ...remoteCancelledResult(enriched.id, null), executor: 'local', fallbackReason };
+        : withSupersession(root, ticket.id, { ...remoteCancelledResult(enriched.id, null), executor: 'local', fallbackReason });
     const publish = (result) => {
       atomicWriteJson(ticket.resultPath, result);
       appendHistory(root, historyRow(ticket, result, { fallbackReason }));
     };
     if (attemptGeneration !== null) {
       await publishTerminal(root, ticket.id, attemptGeneration, () => publish(buildResult()));
-    } else if (isTimeout || forcePublish) {
+    } else if (isTimeout || forcePublish || readSupersededBy(root, ticket.id)) {
       // BRAIN-320 review fix B: `forcePublish` is only ever set by the
       // queue-timeout-then-cancel recheck above -- a ticket the queue-
       // timeout branch was ABOUT to publish (unconditionally, since it's
@@ -1543,6 +1586,7 @@ async function main() {
     const queued = await enqueue(root, enriched, globalCfg, { ownerGeneration: attemptGeneration });
     // BRAIN-321: this id was already submitted (a retried `lane run --detach --id`); its first supervisor owns it.
     if (queued.existing) process.exit(0);
+    for (const target of queued.supersededTargets ?? []) await stopSupersededTicket(target);
     if (queued.priorityDemoted) process.stderr.write('lane run: priority high demoted to medium (repo already has a queued high ticket)\n');
   } catch (err) {
     if (!(err instanceof MigrationInProgressError)) throw err;
@@ -1593,6 +1637,21 @@ async function main() {
   // BRAIN-442: a local-first ticket is not rebind-eligible until it has waited in the local queue this long
   const rebindNotBefore = enriched.localFirst ? enriched.createdAt + (enriched.localFirstWaitMs ?? globalCfg.localFirstWaitMs) : 0;
 
+  // BRAIN-731: a gate whose push (git) or client is gone will never be read by anyone. pid-alive each poll (no fork), the
+  // start-time check every 5 s; a released ticket (client gave up at --timeout for `lane wait`) is never reaped.
+  const START_CHECK_INTERVAL_MS = 5000;
+  let lastStartCheckAt = Date.now();
+  function pushAbandoned() {
+    const { gitPid, gitStart, clientPid, clientStart } = enriched.pushGate;
+    let dead = !isPidAlive(gitPid) || !isPidAlive(clientPid);
+    if (!dead && Date.now() - lastStartCheckAt >= START_CHECK_INTERVAL_MS) {
+      lastStartCheckAt = Date.now();
+      dead = !isProcessAlive(gitPid, gitStart) || !isProcessAlive(clientPid, clientStart);
+    }
+    return dead && !isReleased(root, ticket.id);
+  }
+
+  let holdPollAt = 0;
   let started;
   for (;;) {
     // Re-read the config each iteration rather than reusing the snapshot
@@ -1618,10 +1677,21 @@ async function main() {
       touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit('cancelled', { forcePublish: alsoWithdrawn });
     }
+    if (enriched.pushGate && pushAbandoned()) {
+      const stillQueued = await withLock(root, () => listQueue(root).some((t) => t?.id === ticket.id) && dequeueSync(root, ticket.id));
+      if (stillQueued) {
+        touchSimArmFor(root, ticket);
+        await finalizeQueuedAndExit(PUSH_ABANDONED);
+      }
+    }
     if (isDispatchOnly(globalCfg)) await refuseDispatchOnlyAndExit();
     if (!enriched.exclusive) {
       const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host: detectResourceCapacity() });
       if (!budget.ok) await refuseQueuedOverBudgetAndExit(budget);
+    }
+    if (holdPollAt > Date.now()) {
+      await sleep(globalCfg.sampleMs);
+      continue;
     }
     // tryStart re-reads the config again inside its lock (BRAIN-182): the
     // outer reload above can be superseded by an edit that lands in the gap
@@ -1639,7 +1709,20 @@ async function main() {
     });
     // Test seam: lets a test land a cancel between admission and spawn (BRAIN-364).
     await testHoldAt('local-admitted');
-    if (started.started) break;
+    if (started.started) {
+      endPushHold();
+      break;
+    }
+    if (started.reason === 'push-hold') {
+      if (pushHold.since === null) {
+        pushHold.since = Date.now();
+        process.stderr.write(`lane run: waiting behind your other push ${started.behind}${started.behindRepo ? ` (${started.behindRepo})` : ''}\n`);
+      }
+      pushHold.behind = started.behind;
+      holdPollAt = Date.now() + PUSH_HOLD_POLL_MS;
+    } else {
+      endPushHold();
+    }
     // BRAIN-436: the withdraw marker is the commit, but the queue file may still be there (the runner's best-effort
     // dequeue failed, or it crashed after the marker). Dequeue it here -- retrying the unlink -- BEFORE publishing, so the
     // published result never contradicts a ticket that is still queued. A cancel that is already pending wins.
@@ -1917,7 +2000,7 @@ async function main() {
       // BRAIN-350 `stopProven`: this cancel is what ended the command and the reap confirmed every tracked process gone. A runner
       // turns only such a result into its `runner-shutdown` proof, which lets the submitter run the job again elsewhere.
       const stopProven = !leaderExitedBeforeCancel && reapComplete === true;
-      result = { ...result, exit: 130, signal: null, cancelled: true, ...(stopProven ? { stopProven: true } : {}) };
+      result = withSupersession(root, ticket.id, { ...result, exit: 130, signal: null, cancelled: true, ...(stopProven ? { stopProven: true } : {}) });
       exitCode = 130;
     } else if (watchdogKill) {
       // BRAIN-431: the kill's own signal is not the story; it is `timeout`'s 124, with the window that elapsed
@@ -1973,7 +2056,7 @@ async function main() {
       const cpuSeconds = integratedCpuSeconds(finalLease?.observedCpuStats, startedAt, finalResult.endedAt);
       if (cpuSeconds !== undefined) finalResult = { ...finalResult, cpuSeconds };
       // BRAIN-431: the longest stretch with no output and no CPU, whether or not the opt-in kill is on (monitoring reads it)
-      finalResult = { ...finalResult, maxNoProgressMs: Math.round(watchdog.maxIdleMs) };
+      finalResult = { ...finalResult, maxNoProgressMs: Math.round(watchdog.maxIdleMs), ...pushHoldFields() };
       // BRAIN-549: settled before the result is published, so a caller that reads history once `lane run` returns finds the row
       const contentKey = settledContentKey(ticket);
       atomicWriteJson(ticket.resultPath, finalResult);
@@ -1995,7 +2078,7 @@ async function main() {
     if (attemptGeneration !== null) {
       const published = await publishTerminal(root, ticket.id, attemptGeneration, () => {
         if (cancelling) {
-          writeResult({ ...remoteCancelledResult(enriched.id, startedAt), executor: 'local' });
+          writeResult(withSupersession(root, ticket.id, { ...remoteCancelledResult(enriched.id, startedAt), executor: 'local' }));
         } else {
           writeResult({ ...result, executor: 'local', fallbackReason });
         }

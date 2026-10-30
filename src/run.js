@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { childExitSafeFlags } from './node-exit-safe.js';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { ensureStateDirs, paths, stateHome, readJsonSafe, appendHistory, LockTimeoutError, MigrationInProgressError, assertNotMigrating, isUuid } from './state.js';
+import { ensureStateDirs, writeReleasedMarkerFile, withLock, paths, stateHome, readJsonSafe, appendHistory, LockTimeoutError, MigrationInProgressError, assertNotMigrating, isUuid } from './state.js';
 import { classTransportMismatch } from './classes.js';
 import { remoteExcludePreflight } from './remote-exclude.js';
 import { MIN_CPU_GRANT_CORES } from './cpu-limit.js';
@@ -23,6 +23,7 @@ import { scrubbedGitEnv } from './remote-manifest.js';
 import { isExclusive, oversizedWeight, oversizedWeightMessage, EXCLUSIVE_PURPOSES, exclusiveDeadlineProblem } from './exclusive.js';
 import { parseScrubCommandEnv, scrubCommandEnv, SCRUB_COMMAND_ENV_VAR } from './scrub-command-env.js';
 import { computeContentKey, decideReuse } from './result-cache.js';
+import { detectPushGate, isSuperseded, PUSH_GATE_LANE } from './push-gate.js';
 
 const supervisorPath = fileURLToPath(new URL('./supervisor.js', import.meta.url));
 
@@ -177,7 +178,20 @@ function fmtAgo(ms) {
 
 /** Format a finished command's result the same way at every call site that
  *  reads one, instead of repeating the signal/exit branch three times. */
+/** BRAIN-731: leave a timed-out push gate queued for `lane wait`, unless its result landed first. True when it did. */
+export async function releaseUnlessSettled(root, id, resultPath) {
+  return withLock(root, () => {
+    if (readJsonSafe(resultPath)) return true;
+    writeReleasedMarkerFile(root, id);
+    return false;
+  });
+}
+
 function resultExit(prefix, result) {
+  if (isSuperseded(result)) {
+    process.stderr.write(`${prefix}: superseded by ${result.supersededBy}\n`);
+    return 130;
+  }
   if (result.signal) {
     process.stderr.write(`${prefix}: command terminated by signal ${result.signal}\n`);
     return 1;
@@ -707,8 +721,10 @@ export async function runCommand({
   const resultPath = path.join(p.results, `${id}.json`);
 
   const scrubNames = parseScrubCommandEnv(process.env[SCRUB_COMMAND_ENV_VAR]);
+  const pushGate = !detach && PUSH_GATE_LANE.test(resolved.lane) ? detectPushGate({ cwd }) : null;
   const ticket = {
     id,
+    ...(pushGate ? { pushGate } : {}),
     ...(ticketId ? { clientId: true } : {}),
     key: resolved.key,
     repoId: resolved.repoId,
@@ -971,6 +987,9 @@ export async function runCommand({
           return await finishedReturn(resultExit('lane run', state.result));
         }
         process.stderr.write(`lane run: waited ${timeoutMs}ms, not failed — ${state.text}\n`);
+        if (pushGate) {
+          if (await releaseUnlessSettled(root, id, resultPath)) return await finishedReturn(resultExit('lane run', readJsonSafe(resultPath)));
+        }
         return abortReturn(75);
       }
       if (!isPidAlive(supervisor.pid)) {

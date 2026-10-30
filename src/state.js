@@ -56,6 +56,10 @@ export function paths(root = stateHome()) {
     expire: path.join(root, 'expire'),
     // BRAIN-436: a runner-side withdraw marker (see `writeWithdrawMarkerFile`).
     withdraw: path.join(root, 'withdraw'),
+    // BRAIN-731: one file per ticket cancelled because a repeat of its push replaced it; the content is the superseding id.
+    superseded: path.join(root, 'superseded'),
+    // BRAIN-731: one file per push-gate ticket whose foreground client gave up at --timeout and left it queued for `lane wait`.
+    released: path.join(root, 'released'),
     // BRAIN-504: what each queued ticket is waiting on, one file per ticket (src/ticket-wait.js).
     waits: path.join(root, 'waits'),
     history: path.join(root, 'history.jsonl'),
@@ -208,6 +212,59 @@ export function writeWithdrawMarkerFile(root, id) {
   fs.mkdirSync(dir, { recursive: true });
   if (created) fsyncDirectory(root);
   atomicWriteFile(withdrawMarkerPath(root, id), String(Date.now()), { fsync: true });
+}
+
+export function supersededMarkerPath(root, id) {
+  return path.join(paths(root).superseded, id);
+}
+
+/** The id of the ticket that superseded `id`, or null. */
+export function readSupersededBy(root, id) {
+  try {
+    return fs.readFileSync(supersededMarkerPath(root, id), 'utf8') || null;
+  } catch {
+    return null;
+  }
+}
+
+export function removeSupersededMarker(root, id) {
+  try {
+    fs.unlinkSync(supersededMarkerPath(root, id));
+  } catch {
+    // none pending
+  }
+}
+
+/** A cancelled result (or history row) that was a repeat push replacing it says so, and is exit 130 whoever wrote it. */
+export function withSupersession(root, id, result) {
+  const supersededBy = readSupersededBy(root, id);
+  return supersededBy && result.cancelled ? { ...result, exit: 130, signal: null, reason: 'superseded', supersededBy } : result;
+}
+
+export function releasedMarkerPath(root, id) {
+  return path.join(paths(root).released, id);
+}
+
+export function removeReleasedMarker(root, id) {
+  try {
+    fs.unlinkSync(releasedMarkerPath(root, id));
+  } catch {
+    // none pending
+  }
+}
+
+export function isReleased(root, id) {
+  return fs.existsSync(releasedMarkerPath(root, id));
+}
+
+export function writeReleasedMarkerFile(root, id) {
+  fs.mkdirSync(paths(root).released, { recursive: true });
+  atomicWriteFile(releasedMarkerPath(root, id), String(Date.now()));
+}
+
+export function writeSupersededMarkerFile(root, id, byId) {
+  fs.mkdirSync(paths(root).superseded, { recursive: true });
+  atomicWriteFile(supersededMarkerPath(root, id), byId);
 }
 
 /** Make every withdraw marker's directory entry durable. A marker that exists may have been renamed in by a process that
