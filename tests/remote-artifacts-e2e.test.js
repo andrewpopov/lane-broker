@@ -199,7 +199,7 @@ test('a runner without artifacts/1 runs the command, warns, and returns nothing'
 test('a local run ignores remoteArtifacts: the command\'s own file is simply there, with no artifact line or warning', async () => {
   const { env, state, repoDir } = setup();
   configure(repoDir, { remoteArtifacts: [STAMP] });
-  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--local', '--local-reason', 'test', '--', ...writerCmd({ [STAMP]: 'local' })], { env, cwd: repoDir });
+  const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--local', '--local-reason', 'needs ssh', '--', ...writerCmd({ [STAMP]: 'local' })], { env, cwd: repoDir });
   assert.equal(result.code, 0, result.stderr);
   assert.equal(fs.readFileSync(path.join(repoDir, STAMP), 'utf8'), 'local');
   assert.doesNotMatch(result.stderr, /remote artifacts/);

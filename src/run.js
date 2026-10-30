@@ -16,6 +16,7 @@ import { writePending } from './pending.js';
 import { stampPriorityOrigin } from './priority-clock.js';
 import { detectResourceCapacity, leaseResources, resolveTicketResources, capUnapprovedCpu, checkResourceBudget, localSimRefusal, dispatchOnlyRefusal, locallyRefusedNow } from './resources.js';
 import { hostOnlyPaths, hostPathsRefusal } from './host-paths.js';
+import { acceptedLocalReason, localReasonRefusal } from './local-reason.js';
 import { argvFingerprint } from './cpu-estimates.js';
 import { readHistoryRows } from './suggest.js';
 import { rightSizedCpuCores } from './right-size.js';
@@ -432,6 +433,11 @@ export async function runCommand({
     !process.env.LANE_BROKER_LEASE;
   const { forced, text: localReasonText } = resolveForcedLocal({ local, localReason: localReasonOpt, lane, remoteCapable });
   if (dispatchOnly && forced) process.stderr.write(`lane: --local ignored: localExecution is refused on this host (dispatch-only)\n`);
+  // BRAIN-724
+  if (forced && localReasonText && remoteCapable && !dispatchOnly && !acceptedLocalReason(localReasonText)) {
+    for (const line of localReasonRefusal(resolved.lane, localReasonText)) process.stderr.write(`${line}\n`);
+    return { exitCode: 64 };
+  }
   const remoteWanted = remoteCapable && (!forced || dispatchOnly);
   // Resolved eagerly (not deferred to ticket construction) so the
   // resource-budget skip below and the ticket payload agree on the exact

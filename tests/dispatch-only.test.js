@@ -95,7 +95,7 @@ test('(e) --local with a reason and LANE_BROKER_LOCAL=1 are ignored: runs remote
   const ok = setup({ ssh: 'normal' });
   refuse(ok);
   const m1 = markerPath();
-  const flagged = await run(ok, markerCmd(m1, 0), ['--local', '--local-reason', 'test']);
+  const flagged = await run(ok, markerCmd(m1, 0), ['--local', '--local-reason', 'needs ssh']);
   assert.equal(flagged.code, 0, flagged.stderr);
   assert.equal(fs.readFileSync(m1, 'utf8'), 'remote');
   assert.match(flagged.stderr, /--local ignored/);
@@ -103,10 +103,10 @@ test('(e) --local with a reason and LANE_BROKER_LOCAL=1 are ignored: runs remote
   const down = setup({ ssh: 'down' });
   refuse(down);
   const m2 = markerPath();
-  assert.equal((await run(down, markerCmd(m2, 0), ['--local', '--local-reason', 'test'])).code, 76);
+  assert.equal((await run(down, markerCmd(m2, 0), ['--local', '--local-reason', 'needs ssh'])).code, 76);
   ranNowhere(m2);
   const m3 = markerPath();
-  const viaEnv = await run(down, markerCmd(m3, 0), [], { ...down.env, LANE_BROKER_LOCAL: '1', LANE_BROKER_LOCAL_REASON: 'test' });
+  const viaEnv = await run(down, markerCmd(m3, 0), [], { ...down.env, LANE_BROKER_LOCAL: '1', LANE_BROKER_LOCAL_REASON: 'needs ssh' });
   assert.equal(viaEnv.code, 76, viaEnv.stderr);
   ranNowhere(m3);
 });
@@ -134,7 +134,7 @@ test('(g) a nested run inside a lease never executes locally: exit 69', async ()
   const release = path.join(dir, 'release');
   const envFile = path.join(dir, 'env.json');
   const holder = laneSpawn(
-    ['run', '--repo', 'r', '--lane', 'default', '--local', '--local-reason', 'test', '--', 'node', '-e',
+    ['run', '--repo', 'r', '--lane', 'default', '--local', '--local-reason', 'needs ssh', '--', 'node', '-e',
       `const fs=require('fs');fs.writeFileSync(${JSON.stringify(envFile)},JSON.stringify({LANE_BROKER_LEASE:process.env.LANE_BROKER_LEASE,LANE_BROKER_KEY:process.env.LANE_BROKER_KEY}));const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)})){clearInterval(t);process.exit(0)}},50)`],
     { env: ctx.env, cwd: ctx.repoDir },
   );
@@ -181,11 +181,11 @@ test('restart recovery: tickets queued locally before the host became dispatch-o
   const dir = tmpDir('restart');
   const release = path.join(dir, 'release');
   const ranFile = path.join(dir, 'ran');
-  const holder = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--local', '--local-reason', 'test', '--', ...recordingCmd(ranFile, release)], { env: ctx.env, cwd: ctx.repoDir });
+  const holder = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--local', '--local-reason', 'needs ssh', '--', ...recordingCmd(ranFile, release)], { env: ctx.env, cwd: ctx.repoDir });
   await waitFor(() => hasLease(ctx.state), { timeoutMs: 60_000, intervalMs: 50 });
   // runner down + allowed: falls back to the local queue behind the holder (remote-eligible), and a forced-local one beside it
   const fallback = await run(ctx, recordingCmd(ranFile), ['--detach']);
-  const forced = await run(ctx, recordingCmd(ranFile), ['--detach', '--local', '--local-reason', 'test']);
+  const forced = await run(ctx, recordingCmd(ranFile), ['--detach', '--local', '--local-reason', 'needs ssh']);
   const ids = [fallback.stdout.trim(), forced.stdout.trim()];
   await waitFor(() => fs.existsSync(paths(ctx.state).queue) && fs.readdirSync(paths(ctx.state).queue).length >= 2, { timeoutMs: 60_000, intervalMs: 50 });
   refuse(ctx);
@@ -276,7 +276,7 @@ test('P1-3 a flip to refused between admission and spawn stops the spawn and rel
   const go = path.join(dir, 'p13-go');
   const env = { ...ctx.env, LANE_BROKER_TEST_HOLD_AT: 'local-admitted', LANE_BROKER_TEST_HOLD_READY: ready, LANE_BROKER_TEST_HOLD_GO: go };
   const marker = markerPath();
-  const pending = run(ctx, markerCmd(marker, 0), ['--local', '--local-reason', 'test'], env);
+  const pending = run(ctx, markerCmd(marker, 0), ['--local', '--local-reason', 'needs ssh'], env);
   await waitFor(() => fs.existsSync(ready), { timeoutMs: 30_000, intervalMs: 50 });
   fs.writeFileSync(path.join(ctx.home, MARKER_FILE), '');
   fs.writeFileSync(go, 'x');
@@ -310,7 +310,7 @@ test('BRAIN-721: a dispatch-only host still refuses a host-only path, even with 
   refuse(ctx);
   const hostFile = path.join(tmpDir('hostonly'), 'x.sh');
   fs.writeFileSync(hostFile, 'true');
-  for (const extra of [[], ['--local', '--local-reason', 'test']]) {
+  for (const extra of [[], ['--local', '--local-reason', 'needs ssh']]) {
     const res = await run(ctx, ['sh', hostFile], extra);
     assert.equal(res.code, 64, res.stderr);
     assert.ok(res.stderr.includes(`names ${hostFile}`), res.stderr);
