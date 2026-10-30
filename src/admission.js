@@ -417,7 +417,7 @@ export function evaluateNewAdmission(root, cfg, ticket, heldLeases, cpuSample, m
 }
 
 /** The pure CPU + memory decision for one claim, given an already-updated gate and cooldown. */
-function decideAdmission(cfg, ticket, heldLeases, cpuSample, memoryInfo, cpuGateState, blocked) {
+export function decideAdmission(cfg, ticket, heldLeases, cpuSample, memoryInfo, cpuGateState, blocked) {
   const candidateResources = resolveTicketResources({
     weight: ticket.weight,
     cpuCores: ticket.resources?.cpuCores,
@@ -547,6 +547,7 @@ export function formatAdmissionLog(f) {
     `headScore=${fmt(f.headScore)}`,
     ...(f.reservation ? [`reservation=${f.reservation}`, `futileCause=${f.futileCause}`, `headCpu=${fmt(f.headCpu)}`] : []),
     ...(f.classCap ? [`classCap=${f.classCap}`] : []),
+    ...(f.floor ? ['floor=1'] : []),
     `bias=${KNOWN_BIAS_NOTE}`,
   ].join(' ');
 }

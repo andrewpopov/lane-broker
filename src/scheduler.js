@@ -7,7 +7,7 @@ import { patchAttemptLocked, readAttempt } from './attempts.js';
 import { listLeases, readLease, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
 import { refreshCpuEstimates } from './cpu-estimates.js';
 import { recordTicketWait, pruneTicketWaits } from './ticket-wait.js';
-import { evaluateCpuAdmission, freshObservedCores, evaluateNewAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, writeBrokerLog, projectBusy, ticketCpuEstimate } from './admission.js';
+import { evaluateCpuAdmission, freshObservedCores, evaluateNewAdmission, decideAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, writeBrokerLog, projectBusy, ticketCpuEstimate } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
 import { idleCreditCores, wouldAdmitWithCredit, recordIdleCreditShadow } from './idle-credit.js';
 import { recordExternalDenial, clearExternalStarved } from './external-cpu.js';
@@ -1059,6 +1059,34 @@ export function selectCandidate(queue, held) {
   return null;
 }
 
+/** BRAIN-727: a ticket that runs on this Mac whatever the lanes do: queued locally by a lane that never goes remote. */
+function isFloorTicket(t) {
+  return !t.remote && !t.localReason && classOf(t) !== 'sim' && !isExclusive(t);
+}
+
+/**
+ * BRAIN-727 floor slot: the earliest lane-local ticket whose CPU projection, with the held leases charged, fits within
+ * resourceIdleOvershootCores of the budget (the CPU gate's state is not judged), once the head cannot start. Pure over
+ * the poll's inputs, so every polling supervisor names the same ticket. Null when the head can start or nobody qualifies.
+ */
+export function floorWinner(cfg, queue, held, cpuSample, memInfo, gateClosed, loadGateClosed, weightCapacity) {
+  if (memInfo?.macPressure === 'critical' || (cfg.admissionLoadGate && loadGateClosed && held.length > 0)) return null;
+  const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
+  const cooldown = cooldownActive(held, cfg);
+  const decide = (t, closed) => decideAdmission(cfg, t, held, cpuSample, memInfo, { closed }, cooldown);
+  const runnable = (t) => !blockedBy(held, t) && runningWeight + t.weight <= weightCapacity && !elasticBelowFloor(t, cfg);
+  const withinOvershoot = (d) => d.memoryReason === 'ok' && d.cpuReason !== 'cooldown' && (d.admit || (Number.isFinite(d.projectedBusy) && d.projectedBusy - d.budget <= cfg.resourceIdleOvershootCores));
+  const head = queue[0];
+  const headDecision = decide(head, gateClosed);
+  const headStarts = runnable(head) && (headDecision.admit || evaluateElasticAdmission(cfg, head, held, cpuSample, memInfo, headDecision) !== null || (headDecision.cpuReason === 'projected-over-budget' && withinOvershoot(headDecision)));
+  if (headStarts) return null;
+  for (const t of queue.slice(1)) {
+    if (!t || isExclusive(t)) return null;
+    if (isFloorTicket(t) && runnable(t) && withinOvershoot(decide(t, false))) return t;
+  }
+  return null;
+}
+
 /**
  * Like selectCandidate, but for the head-fits-capacity case (BRAIN-249 part 2): used only when
  * the head itself does not conflict with anything held but simply does not fit under capacity
@@ -1393,6 +1421,18 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
         shadow.captureError = err;
       }
     }
+    // BRAIN-727: a lane-local ticket behind a head that cannot start may take the floor slot; one floor lease at a time.
+    const floorTrial =
+      cfg.schedulerMode === 'active' &&
+      !held.some((l) => l.floor === true) &&
+      cfg.resourceIdleOvershootCores > 0 &&
+      ticket.id !== headTicket.id &&
+      candidate?.id !== ticket.id &&
+      !headConflicted &&
+      !safeBackfill &&
+      !headBypass &&
+      isFloorTicket(queue[position]) &&
+      queue.slice(0, position).every((t) => t && !isExclusive(t));
     if (!candidate) {
       // Either nobody in the queue is eligible (selectCandidate/
       // selectCapacityCandidate found nothing), or the head's skip
@@ -1401,7 +1441,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       // the head is the one genuinely blocked — EXCEPT for the
       // headCapacityBlocked + "ticket is the head itself" combination,
       // handled by the deliberate no-op comment below.
-      if (ticket.id !== headTicket.id) {
+      if (ticket.id !== headTicket.id && !floorTrial) {
         return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
       }
       if (headConflicted) {
@@ -1418,7 +1458,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       // "the admission decision log is written on a deny path too
       // (capacity)" pins this). The eventual denial reason is 'capacity'
       // either way — only whether it is logged differs.
-    } else if (candidate.id !== ticket.id) {
+    } else if (candidate.id !== ticket.id && !floorTrial) {
       // A non-conflicting/fitting ticket earlier in the queue gets to go
       // first (or already has). This ticket just isn't up yet — same as the
       // old strict-head "not-head", just computed against the conflict/
@@ -1483,6 +1523,10 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // only: shadow never denies, so there is nothing to relax.
     const elastic = cfg.schedulerMode === 'active' ? evaluateElasticAdmission(cfg, admissionTicket, admissionHeld, cpuSample, memInfo, fullDecision) : null;
     const cpuDecision = elastic ? { ...elastic.decision, declaredCpuCores: submitted.resources?.cpuCores ?? fullDecision.candidateCpuCores } : fullDecision;
+    const floorAdmit = floorTrial && floorWinner(cfg, queue, held, cpuSample, memInfo, fullDecision.cpuGateClosed, gate.closed, weightCapacity)?.id === ticket.id;
+    if (floorTrial && !floorAdmit) {
+      return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
+    }
     // BRAIN-418: only the head's own denial can declare its reservation futile; a candidate's poll reads the verdict
     // the head's latest denial recorded. Only a CPU-projection or memory denial is judged: a closed gate, a cooldown or an unavailable sample is not the
     // head's own arithmetic, so those keep today's handling.
@@ -1532,6 +1576,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       headRank: effectiveRank(headTicket, nowEff, cfg),
       headScore: score(headTicket, nowEff, cfg),
       loadGateIgnored,
+      ...(floorAdmit ? { floor: true } : {}),
       ...(grantCapReason && classes.mode === 'shadow' ? { classCap: `class-cap(shadow):${grantCapReason}` } : {}),
       ...cpuDecision,
       ...(futileView ? { reservation: 'futile', futileCause: futileView.cause, headCpu: futileView.headCpu } : {}),
@@ -1624,7 +1669,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       cfg.resourceIdleOvershootCores > 0 &&
       cpuDecision.projectedBusy - cpuDecision.budget <= cfg.resourceIdleOvershootCores;
     if (shadow.live) shadow.live.idleExempt = idleExempt;
-    if (cfg.schedulerMode === 'active' && !cpuDecision.admit && !idleExempt && !exclusiveHolder) {
+    if (cfg.schedulerMode === 'active' && !cpuDecision.admit && !idleExempt && !floorAdmit && !exclusiveHolder) {
       // BRAIN-463: remember how long projected-over-budget denials have been mostly external CPU
       if (resourceDenied) recordExternalDenial(root, cfg, cpuDecision, now);
       if (headPolling) {
@@ -1659,7 +1704,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       if (!recordSkip(root, store, headTicket.id, now)) {
         return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
       }
-    } else if (ticket.id !== headTicket.id && headCapacityBlocked && !headBypass) {
+    } else if (ticket.id !== headTicket.id && headCapacityBlocked && !headBypass && !floorAdmit) {
       // BRAIN-249 part 2: same event, same fail-CLOSED discipline as the
       // conflict branch above, for a ticket genuinely skipping ahead of a
       // head that doesn't fit capacity (see recordCapacitySkip's doc
@@ -1667,7 +1712,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       if (!recordCapacitySkip(root, store, headTicket.id)) {
         return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
       }
-    } else if (ticket.id !== headTicket.id && !safeBackfill && !headBypass && resourceBackfill && !resourceFutile(resourceRecord, cfg, now)) {
+    } else if (ticket.id !== headTicket.id && !safeBackfill && !headBypass && !floorAdmit && resourceBackfill && !resourceFutile(resourceRecord, cfg, now)) {
       // BRAIN-346: same event, same fail-CLOSED discipline; a refused write never restarts the allowance.
       recorded = recordResourceBackfill(root, store, cfg, resourceRecord, writeResourceState);
       if (!recorded) {
@@ -1729,6 +1774,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       cmd: ticket.cmd,
       ...(ticket.cmdFingerprint ? { cmdFingerprint: ticket.cmdFingerprint } : {}),
       weight: ticket.weight,
+      ...(floorAdmit ? { floor: true } : {}),
       resources: submitted.resources,
       // BRAIN-360: elastic lanes only; what admission actually charged. `resources.cpuCores` stays the declaration.
       ...(submitted.resources?.minCpuCores !== undefined ? { grantedCpuCores } : {}),
@@ -1784,6 +1830,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     if (submitted.resources?.minCpuCores !== undefined && grantedCpuCores < submitted.resources.cpuCores) {
       events.push(['elastic-grant', { candidateId: ticket.id, declared: submitted.resources.cpuCores, granted: grantedCpuCores, min: submitted.resources.minCpuCores }]);
     }
+    if (floorAdmit) events.push(['floor-slot', { headId: headTicket.id, candidateId: ticket.id, overshoot: (cpuDecision.projectedBusy - cpuDecision.budget).toFixed(2) }]);
     if (idleExempt) {
       events.push(['resource-idle-exempt', { headId: headTicket.id, overshoot: (cpuDecision.projectedBusy - cpuDecision.budget).toFixed(2) }]);
     }
@@ -1793,8 +1840,8 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     else if (headPolling) store.dropResourceRecord();
     if (cfg.idleCreditMode !== 'off') recordIdleCreditShadow(root, { ticket, started: true, now });
     return {
-      result: { started: true, lease },
-      logFields: { ...logBase, currentDecision: 'start', currentReason: idleExempt ? 'resource-idle-exempt' : baselineReason },
+      result: { started: true, lease, ...(floorAdmit ? { floor: true } : {}) },
+      logFields: { ...logBase, currentDecision: 'start', currentReason: floorAdmit ? 'floor-slot' : idleExempt ? 'resource-idle-exempt' : baselineReason },
       events,
     };
   };
