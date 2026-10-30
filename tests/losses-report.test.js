@@ -52,8 +52,8 @@ test('per runner counts by reason, lane-hours, redispatches and fallbacks; windo
   assert.match(text, /total: 6 lost \(5\.0 lane-hours\), 3 re-dispatched, 1 local fallbacks/);
 });
 
-test('command: --json and text from a history file, repo optional', async (t) => {
-  const dir = makeTmpDir('losses-', t);
+test('command: --json and text from a history file, repo optional', async (testCtx) => {
+  const dir = makeTmpDir('losses-', testCtx);
   const file = path.join(dir, 'history.jsonl');
   fs.writeFileSync(file, `${rows.map((r) => JSON.stringify(r)).join('\n')}\n`);
   const run = async (extra) => {
