@@ -593,6 +593,25 @@ export class LockTimeoutError extends Error {
   }
 }
 
+let lockContentionPolicy = null;
+
+/**
+ * BRAIN-730: a process that must not die of lock contention (the supervisor) sets this. A `withLock` that did not pass its own
+ * `timeoutMs` then reports a live-holder timeout to `onContention(err)`, backs off with jitter and starts a fresh acquisition,
+ * instead of throwing. Only acquisition is retried, never the callback, and never against a holder in this same process.
+ */
+export function setLockContentionPolicy({ onContention }) {
+  lockContentionPolicy = { onContention };
+}
+
+export function resetLockContentionPolicy() {
+  lockContentionPolicy = null;
+}
+
+const CONTENTION_BACKOFF_MIN_MS = 100;
+const CONTENTION_BACKOFF_MAX_MS = 2000;
+const UNREADABLE_OWNER_DEADLINES_MAX = 3;
+
 // `LANE_BROKER_TEST_LOCK_TIMEOUT_MS` (README "Testing hooks") shortens the
 // default acquire deadline so a test can force a timeout without holding the
 // lock for 15s.
@@ -804,13 +823,23 @@ function assertLockOrder(group) {
  * (pid, token) it is acting on. "How long has this sat here" never enters a
  * takeover decision; only liveness does.
  */
-export async function withLock(root, fn, { timeoutMs = lockTimeoutMsDefault(), pollMs = 25, lockPath = paths(root).lock, group = 'broker' } = {}) {
+export async function withLock(root, fn, { timeoutMs, pollMs = 25, lockPath = paths(root).lock, group = 'broker' } = {}) {
   assertLockOrder(group);
   const handle = { group, held: true };
   const lockDir = lockPath;
+  const retryContention = timeoutMs === undefined && lockContentionPolicy !== null;
+  if (timeoutMs === undefined) timeoutMs = lockTimeoutMsDefault();
   fs.mkdirSync(root, { recursive: true });
   const ownerFile = path.join(lockDir, 'owner.json');
-  const deadline = Date.now() + timeoutMs;
+  let deadline = Date.now() + timeoutMs;
+  let backoffCeilingMs = CONTENTION_BACKOFF_MIN_MS;
+  let unreadableDeadlines = 0;
+  const backOff = async (err) => {
+    lockContentionPolicy.onContention(err);
+    await sleep(Math.random() * backoffCeilingMs);
+    backoffCeilingMs = Math.min(backoffCeilingMs * 2, CONTENTION_BACKOFF_MAX_MS);
+    deadline = Date.now() + timeoutMs;
+  };
   const token = crypto.randomUUID();
   const start = processStartTime(process.pid);
 
@@ -847,13 +876,18 @@ export async function withLock(root, fn, { timeoutMs = lockTimeoutMsDefault(), p
       // on but wait and re-evaluate; report by name rather than assume
       // stale.
       if (Date.now() > deadline) {
-        throw new LockTimeoutError(
+        const err = new LockTimeoutError(
           `lane-broker: timed out waiting for the global lock at ${lockDir} — owner.json is unreadable; needs manual removal`,
         );
+        // a holder releasing between our rename and this read is ordinary contention; only a persistently unreadable owner is a fault
+        if (!retryContention || ++unreadableDeadlines >= UNREADABLE_OWNER_DEADLINES_MAX) throw err;
+        await backOff(err);
+        continue;
       }
       await sleep(pollMs);
       continue;
     }
+    unreadableDeadlines = 0;
     if (!isLockOwnerAlive(owner)) {
       // recoverDeadLock never itself grants ownership: whether it moves the
       // dead lock dir aside or loses that race, loop back to the top and
@@ -862,7 +896,7 @@ export async function withLock(root, fn, { timeoutMs = lockTimeoutMsDefault(), p
       // by whoever won the CAS, and either way the single-winner rename
       // above is what actually decides the next owner.
       const won = recoverDeadLock(root, lockDir, ownerFile, owner);
-      if (won && Date.now() > deadline) {
+      if (won && Date.now() > deadline && !retryContention) {
         // We moved a dead lock aside but our own deadline has passed: leave
         // the path free for whoever is still waiting and give up honestly.
         throw new LockTimeoutError(
@@ -884,7 +918,11 @@ export async function withLock(root, fn, { timeoutMs = lockTimeoutMsDefault(), p
       continue;
     }
     if (Date.now() > deadline) {
-      throw new LockTimeoutError(`lane-broker: timed out waiting for the global lock held by pid ${owner.pid}`);
+      const err = new LockTimeoutError(`lane-broker: timed out waiting for the global lock held by pid ${owner.pid}`);
+      // our own process holding it may be an awaited nested acquisition, which waiting can never end
+      if (!retryContention || owner.pid === process.pid) throw err;
+      await backOff(err);
+      continue;
     }
     await sleep(pollMs);
   }

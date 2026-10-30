@@ -15,8 +15,8 @@ import {
   withdrawMarkerPath,
   isWithdrawn,
   writeCancelMarkerFile,
-  LockTimeoutError,
   withLock,
+  setLockContentionPolicy,
   MigrationInProgressError,
   testDrainAt,
   testHoldAt,
@@ -29,7 +29,7 @@ import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from '.
 import { reloadGlobalConfig, isDispatchOnly } from './config.js';
 import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope, scopeMemoryPeakReader, scopeMemoryPeakTracker, enforcementLabel } from './cpu-limit.js';
 import { stateHome, RUNNER_SHUTDOWN_REASON } from './state.js';
-import { readRows } from './suggest.js';
+import { readHistoryRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
 import { missingLocalDeps, speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, externalCpuSlots, DEFAULT_REMOTE_OVERHEAD_MS } from './speed-placement.js';
 import { starvedStaleMs } from './external-cpu.js';
@@ -57,6 +57,7 @@ import { scrubCommandEnv } from './scrub-command-env.js';
 import { observedLeaseFields, summarizeObservedCpu, sanitizeRssPeak, integratedCpuSeconds } from './observed.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
+const SUPERVISOR_ERROR_EXIT = 70;
 const GROUP_REAPED_REASON = 'leader-exited-group-reaped';
 const MAX_OMITTED_SYMLINKS_LISTED = 10;
 
@@ -110,21 +111,6 @@ function clearConfigReloadWarning(root) {
 
 function cancelRequested(root, id) {
   return isCancelled(root, id);
-}
-
-/**
- * BRAIN-518 A1: run `fn` under the broker lock, retrying on a lock timeout (contention, not a fault: the caller has nothing else to
- * do). A queued supervisor's dequeue and marker clearing take the lock so `lane priority` (read, classify, rename under the lock)
- * can never rewrite a queue record this supervisor has just removed. Only for the polling loop and the finalizer, never a signal handler.
- */
-async function underLock(root, fn) {
-  for (;;) {
-    try {
-      return await withLock(root, fn);
-    } catch (err) {
-      if (!(err instanceof LockTimeoutError)) throw err;
-    }
-  }
 }
 
 function clearTicketMarkers(root, id) {
@@ -526,7 +512,7 @@ function queueTimeoutFor(enriched, globalCfg, cpuLimit) {
 /** BRAIN-548: history rows and this lane's local run estimate for a speed-aware ticket; null (today's behaviour) without an estimate. */
 function speedInputs(root, enriched) {
   if (!enriched.speedAware) return null;
-  const rows = readRows(paths(root).history);
+  const rows = readHistoryRows(paths(root).history);
   const estimateMs = localRunEstimateMs(rows, enriched.repoId, enriched.lane);
   return estimateMs === null ? null : { rows, estimateMs };
 }
@@ -588,7 +574,7 @@ const seconds = (ms) => (ms === null ? 'unbounded' : `${Math.round(ms / 1000)}s`
 export function remoteSelectOptions(enriched, globalCfg, root = stateHome(), cpuLimit) {
   // BRAIN-533: history is read only when some runner has a schedule that could make the expected run time matter.
   const scheduled = (globalCfg.runners || []).some((r) => r.schedule);
-  const expectedMs = scheduled ? expectedRunMs(readRows(paths(root).history), enriched.repoId, enriched.lane) : null;
+  const expectedMs = scheduled ? expectedRunMs(readHistoryRows(paths(root).history), enriched.repoId, enriched.lane) : null;
   // BRAIN-597: first placement, rebind and rebalance all select through here, so a down runner is skipped by every one of them.
   const downRunners = downRunnerReasons(root, globalCfg);
   return {
@@ -1300,9 +1286,50 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   return fallbackOrRefuse(runner, dispatch.reason, { neverStarted: dispatch.neverStarted === true, retryWhenBlocked: dispatch.outcome === 'unconfirmed' && dispatch.neverStarted === true, rebindable: dispatch.outcome === 'unconfirmed' && dispatch.neverStarted === true && dispatch.retryElsewhere === true, retryable: dispatch.outcome === 'unconfirmed' && dispatch.rejected !== true });
 }
 
+let crashContext = null;
+let supervisorPhase = 'startup';
+
+function enterPhase(phase) {
+  supervisorPhase = phase;
+  if (process.env.LANE_BROKER_TEST_SUPERVISOR_ERROR_AT === phase) throw new TypeError(`injected supervisor error at ${phase}`);
+}
+
+/** BRAIN-730: one diagnostic history row for a supervisor that is about to die; settlement stays with reconcile and the scheduler's reaping. Never throws, never locks. */
+function recordSupervisorError(err) {
+  try {
+    if (crashContext) {
+      const { root, ticket } = crashContext;
+      appendHistory(root, {
+        id: ticket.id,
+        key: ticket.key,
+        repo: ticket.repoId,
+        lane: ticket.lane,
+        event: 'supervisor-error',
+        reason: 'supervisor-error',
+        errorClass: err?.name || err?.constructor?.name,
+        errorMessage: String(err?.message ?? err).split('\n')[0],
+        phase: supervisorPhase,
+        at: Date.now(),
+      });
+    }
+  } catch {
+    // the crash recorder must never mask the crash
+  }
+}
+
+function dieOfSupervisorError(err) {
+  recordSupervisorError(err);
+  process.stderr.write(`lane-broker supervisor error: ${err?.stack || err?.message || err}\n`);
+  process.exit(SUPERVISOR_ERROR_EXIT);
+}
+
 async function main() {
   const ticket = readTicketFromEnv();
   const root = ensureStateDirs().root;
+  crashContext = { root, ticket };
+  setLockContentionPolicy({
+    onContention: (err) => writeBrokerLog(root, `lane: lock-timeout: ${ticket.id}: ${err.message} — still waiting, retrying\n`),
+  });
   // reloadGlobalConfig(undefined), not loadGlobalConfig(): a supervisor that
   // launches while config.json is missing, mid-write, or invalid must start
   // on defaults rather than crash before it ever reaches the resilient
@@ -1333,7 +1360,7 @@ async function main() {
       const result = localRefusalResult(enriched, refusal);
       atomicWriteJson(ticket.resultPath, result);
       appendHistory(root, historyRow(ticket, result, {}));
-      await underLock(root, () => clearTicketMarkers(root, ticket.id));
+      await withLock(root, () => clearTicketMarkers(root, ticket.id));
       process.exit(refusal.exitCode);
     }
   }
@@ -1385,6 +1412,7 @@ async function main() {
     process.exit(75);
   }
   if (ticket.remote) {
+    enterPhase('remote');
     let outcome;
     try {
       outcome = await runRemoteAttempt(root, enriched, globalCfg, abortController.signal, null, cpuLimit);
@@ -1463,7 +1491,7 @@ async function main() {
       // touches that marker).
       publish(buildResult());
     }
-    await underLock(root, () => clearTicketMarkers(root, ticket.id));
+    await withLock(root, () => clearTicketMarkers(root, ticket.id));
     process.exit(isTimeout ? 75 : 0);
   }
 
@@ -1475,7 +1503,7 @@ async function main() {
   async function refuseQueuedOverBudgetAndExit(budget) {
     const refusal = { exitCode: budget.exitCode, message: `${budget.message.trim()} Lane "${enriched.lane}" can never start here: the budget shrank while it was queued.\n` };
     process.stderr.write(refusal.message);
-    await underLock(root, () => dequeueSync(root, ticket.id));
+    await withLock(root, () => dequeueSync(root, ticket.id));
     const result = localRefusalResult(enriched, refusal);
     const publish = () => {
       atomicWriteJson(ticket.resultPath, result);
@@ -1483,7 +1511,7 @@ async function main() {
     };
     if (attemptGeneration !== null) await publishTerminal(root, ticket.id, attemptGeneration, publish);
     else publish();
-    await underLock(root, () => clearTicketMarkers(root, ticket.id));
+    await withLock(root, () => clearTicketMarkers(root, ticket.id));
     process.exit(refusal.exitCode);
   }
 
@@ -1497,7 +1525,7 @@ async function main() {
 
   async function refuseLocalAndExit(refusal, { lease = false } = {}) {
     process.stderr.write(refusal.message);
-    await underLock(root, () => dequeueSync(root, ticket.id));
+    await withLock(root, () => dequeueSync(root, ticket.id));
     if (lease) removeLease(root, ticket.id);
     const result = localRefusalResult(enriched, refusal);
     const publish = () => {
@@ -1506,10 +1534,11 @@ async function main() {
     };
     if (attemptGeneration !== null) await publishTerminal(root, ticket.id, attemptGeneration, publish);
     else publish();
-    await underLock(root, () => clearTicketMarkers(root, ticket.id));
+    await withLock(root, () => clearTicketMarkers(root, ticket.id));
     process.exit(refusal.exitCode);
   }
 
+  enterPhase('queued');
   try {
     const queued = await enqueue(root, enriched, globalCfg, { ownerGeneration: attemptGeneration });
     // BRAIN-321: this id was already submitted (a retried `lane run --detach --id`); its first supervisor owns it.
@@ -1584,8 +1613,8 @@ async function main() {
       // BRAIN-436: a withdrawn ticket that is also cancelled must still leave the queue (retrying) and publish its
       // cancelled result BEFORE the withdraw marker goes: that marker is what keeps `tryStart` from admitting it.
       const alsoWithdrawn = isWithdrawn(root, ticket.id);
-      if (alsoWithdrawn) while (!(await underLock(root, () => dequeueSync(root, ticket.id)))) await sleep(100);
-      else await underLock(root, () => dequeueSync(root, ticket.id));
+      if (alsoWithdrawn) while (!(await withLock(root, () => dequeueSync(root, ticket.id)))) await sleep(100);
+      else await withLock(root, () => dequeueSync(root, ticket.id));
       touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit('cancelled', { forcePublish: alsoWithdrawn });
     }
@@ -1599,25 +1628,15 @@ async function main() {
     // between this poll's reload and the lock actually being granted. Reuse
     // the same fallback/warning handling so a reload failure inside the lock
     // degrades exactly like one out here.
-    try {
-      started = await tryStart(root, enriched, globalCfg, undefined, undefined, () => {
-        globalCfg = reloadGlobalConfig(globalCfg, {
-          onError: (err) => {
-            reloadFailed = true;
-            recordConfigReloadError(root, err);
-          },
-        });
-        return globalCfg;
+    started = await tryStart(root, enriched, globalCfg, undefined, undefined, () => {
+      globalCfg = reloadGlobalConfig(globalCfg, {
+        onError: (err) => {
+          reloadFailed = true;
+          recordConfigReloadError(root, err);
+        },
       });
-    } catch (err) {
-      // BRAIN-345: failing to get the global lock within its deadline is
-      // contention, not a fault. Dying here published no result and lost the
-      // ticket; keep polling instead. Anything else still escapes.
-      if (!(err instanceof LockTimeoutError)) throw err;
-      writeBrokerLog(root, `lane: lock-timeout: ${enriched.id}: ${err.message} — still queued, retrying\n`);
-      await sleep(globalCfg.sampleMs);
-      continue;
-    }
+      return globalCfg;
+    });
     // Test seam: lets a test land a cancel between admission and spawn (BRAIN-364).
     await testHoldAt('local-admitted');
     if (started.started) break;
@@ -1625,7 +1644,7 @@ async function main() {
     // dequeue failed, or it crashed after the marker). Dequeue it here -- retrying the unlink -- BEFORE publishing, so the
     // published result never contradicts a ticket that is still queued. A cancel that is already pending wins.
     if (started.reason === 'withdrawn' || (started.reason === 'not-head' && started.position === null && isWithdrawn(root, ticket.id))) {
-      while (!(await underLock(root, () => dequeueSync(root, ticket.id)))) await sleep(100);
+      while (!(await withLock(root, () => dequeueSync(root, ticket.id)))) await sleep(100);
       // read AFTER the dequeue: the retry above can wait, and a cancel landing meanwhile must still win
       const cancelWon = cancelRequested(root, ticket.id);
       touchSimArmFor(root, ticket);
@@ -1662,7 +1681,7 @@ async function main() {
       // derivation (reading this ticket's result.json) sees it. The cancel
       // marker is read INSIDE the lock, after the dequeue: waiting for the
       // lock can take a while, and a cancel landing meanwhile must still win.
-      const cancelWon = await underLock(root, () => {
+      const cancelWon = await withLock(root, () => {
         dequeueSync(root, ticket.id);
         return cancelRequested(root, ticket.id);
       });
@@ -1685,6 +1704,7 @@ async function main() {
     await sleep(globalCfg.sampleMs);
   }
 
+  enterPhase('running');
   const startedAt = Date.now();
   const [cmd, args] = resolveNicedSpawn({ ...ticket, nice: started.lease.nice ?? ticket.nice }, os.getPriority(), resolveLaneNice(ticket, priorityOf(started.lease), globalCfg));
   // the host may have turned dispatch-only since admission (config flip or marker): re-read it at the last moment, release the lease unused
@@ -1873,6 +1893,7 @@ async function main() {
   }
 
   async function finalizeAndExit(result, exitCode) {
+    enterPhase('finalize');
     finished = true;
     memoryPeak.sample(); // before any scope stop
     clearInterval(heartbeat);
@@ -2005,7 +2026,7 @@ async function main() {
     finalizeAndExit(
       { id: ticket.id, exit: 1, signal: null, startedAt, endedAt, waitedMs: startedAt - enriched.createdAt || 0, error: err.message },
       1,
-    );
+    ).catch(dieOfSupervisorError);
   });
 
   // Listen on 'close' rather than 'exit': 'close' fires only after stdio is
@@ -2022,7 +2043,7 @@ async function main() {
       waitedMs: startedAt - enriched.createdAt || 0,
     };
     if (groupReaped) result.reason = GROUP_REAPED_REASON;
-    finalizeAndExit(result, 0);
+    finalizeAndExit(result, 0).catch(dieOfSupervisorError);
   });
 
   // ROG-2181 T1b: a leader that exits on its own can leave descendants running unleased once the lease is
@@ -2046,10 +2067,9 @@ export { CappedLogWriter, recordConfigReloadError, clearConfigReloadWarning };
 // CappedLogWriter directly) without running the supervisor for real; it only
 // runs when invoked as the entrypoint, as run.js spawns it (`node supervisor.js`).
 if (import.meta.url === pathToFileURL(process.argv[1] || '').href) {
-  main().catch((err) => {
-    process.stderr.write(`lane-broker supervisor error: ${err.stack || err.message}\n`);
-    process.exit(1);
-  });
+  process.on('uncaughtException', dieOfSupervisorError);
+  process.on('unhandledRejection', dieOfSupervisorError);
+  main().catch(dieOfSupervisorError);
 }
 
 /** The lease once its child is running. `cpuScopeUnit` (BRAIN-651 L2) is recorded only when the child was wrapped, so L3 can stop that scope. */

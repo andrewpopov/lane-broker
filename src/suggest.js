@@ -18,7 +18,10 @@ function percentile(sorted, p) {
   return sorted[Math.max(0, Math.ceil(p * sorted.length) - 1)];
 }
 
-/** Tolerant history.jsonl reader: a torn or partial line is skipped, never fatal. */
+/** A history row that records a run. Rows with `event` set (BRAIN-730 `supervisor-error`) are diagnostics, never runs. */
+export const isRunRow = (row) => row !== null && typeof row === 'object' && row.event === undefined;
+
+/** Tolerant JSONL reader: a torn or partial line is skipped, never fatal. */
 export function readRows(file) {
   let text;
   try {
@@ -36,6 +39,11 @@ export function readRows(file) {
     }
   }
   return rows;
+}
+
+/** history.jsonl's run rows: diagnostic rows (`event` set) are skipped. */
+export function readHistoryRows(file) {
+  return readRows(file).filter(isRunRow);
 }
 
 /** Pure: rows -> { groups, skippedNoObservation }. Declared cpuCores is the group's most recent row's. */
@@ -140,7 +148,7 @@ export function renderSuggestText(report) {
 }
 
 export async function suggestCommand({ repo, days, json } = {}) {
-  const report = buildSuggestions(readRows(paths(ensureStateDirs().root).history), { repo, days });
+  const report = buildSuggestions(readHistoryRows(paths(ensureStateDirs().root).history), { repo, days });
   process.stdout.write(json ? `${JSON.stringify(report, null, 2)}\n` : `${renderSuggestText(report)}\n`);
   return { exitCode: 0 };
 }

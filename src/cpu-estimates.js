@@ -1,6 +1,6 @@
 import crypto from 'node:crypto';
 import { paths, stateHome } from './state.js';
-import { readRows } from './suggest.js';
+import { readHistoryRows } from './suggest.js';
 import { sanitizeKey } from './config.js';
 import { classifyRow, percentile } from './estimates-history.js';
 
@@ -113,7 +113,7 @@ export function refreshCpuEstimates(cfg, now = Date.now(), root = stateHome()) {
   if (hit && hit.minRuns === minRuns && now >= hit.at && now - hit.at < REFRESH_MS) return;
   let map;
   try {
-    map = computeCpuEstimates(readRows(paths(root).history), { now, minRuns });
+    map = computeCpuEstimates(readHistoryRows(paths(root).history), { now, minRuns });
   } catch {
     map = new Map();
   }
