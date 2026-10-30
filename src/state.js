@@ -619,6 +619,7 @@ export function resetLockContentionPolicy() {
 
 const CONTENTION_BACKOFF_MIN_MS = 100;
 const CONTENTION_BACKOFF_MAX_MS = 2000;
+const UNREADABLE_OWNER_DEADLINES_MAX = 3;
 
 // `LANE_BROKER_TEST_LOCK_TIMEOUT_MS` (README "Testing hooks") shortens the
 // default acquire deadline so a test can force a timeout without holding the
@@ -842,6 +843,13 @@ export async function withLock(root, fn, { timeoutMs, pollMs = 25, lockPath = pa
   const ownerFile = path.join(lockDir, 'owner.json');
   let deadline = Date.now() + timeoutMs;
   let backoffCeilingMs = CONTENTION_BACKOFF_MIN_MS;
+  let unreadableDeadlines = 0;
+  const backOff = async (err) => {
+    lockContentionPolicy.onContention(err);
+    await sleep(Math.random() * backoffCeilingMs);
+    backoffCeilingMs = Math.min(backoffCeilingMs * 2, CONTENTION_BACKOFF_MAX_MS);
+    deadline = Date.now() + timeoutMs;
+  };
   const token = crypto.randomUUID();
   const start = processStartTime(process.pid);
 
@@ -878,9 +886,13 @@ export async function withLock(root, fn, { timeoutMs, pollMs = 25, lockPath = pa
       // on but wait and re-evaluate; report by name rather than assume
       // stale.
       if (Date.now() > deadline) {
-        throw new LockTimeoutError(
+        const err = new LockTimeoutError(
           `lane-broker: timed out waiting for the global lock at ${lockDir} — owner.json is unreadable; needs manual removal`,
         );
+        // a holder releasing between our rename and this read is ordinary contention; only a persistently unreadable owner is a fault
+        if (!retryContention || ++unreadableDeadlines >= UNREADABLE_OWNER_DEADLINES_MAX) throw err;
+        await backOff(err);
+        continue;
       }
       await sleep(pollMs);
       continue;
@@ -917,10 +929,7 @@ export async function withLock(root, fn, { timeoutMs, pollMs = 25, lockPath = pa
     if (Date.now() > deadline) {
       const err = new LockTimeoutError(`lane-broker: timed out waiting for the global lock held by pid ${owner.pid}`);
       if (!retryContention) throw err;
-      lockContentionPolicy.onContention(err);
-      await sleep(Math.random() * backoffCeilingMs);
-      backoffCeilingMs = Math.min(backoffCeilingMs * 2, CONTENTION_BACKOFF_MAX_MS);
-      deadline = Date.now() + timeoutMs;
+      await backOff(err);
       continue;
     }
     await sleep(pollMs);

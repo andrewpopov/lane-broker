@@ -147,3 +147,20 @@ test('acquiring the same lock from inside a held one throws NestedLockError at o
   });
   assert.ok(Date.now() - started < 5000);
 });
+
+test('under the policy an owner.json that stays unreadable still fails, after three deadlines', withShortDeadline(async () => {
+  const { state } = freshEnv();
+  fs.mkdirSync(paths(state).lock, { recursive: true });
+  const contentions = [];
+  setLockContentionPolicy({ onContention: (err) => contentions.push(err) });
+  await assert.rejects(withLock(state, () => {}), /owner\.json is unreadable/);
+  assert.equal(contentions.length, 2);
+}));
+
+test('readHistoryRows skips a null line and diagnostic rows', () => {
+  const { state } = freshEnv();
+  const file = paths(state).history;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, `null\n${JSON.stringify({ id: 'a', lane: 'l' })}\n${JSON.stringify({ id: 'b', event: 'supervisor-error' })}\n`);
+  assert.deepEqual(readHistoryRows(file).map((r) => r.id), ['a']);
+});

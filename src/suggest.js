@@ -19,7 +19,7 @@ function percentile(sorted, p) {
 }
 
 /** A history row that records a run. Rows with `event` set (BRAIN-730 `supervisor-error`) are diagnostics, never runs. */
-export const isRunRow = (row) => row.event === undefined;
+export const isRunRow = (row) => row !== null && typeof row === 'object' && row.event === undefined;
 
 /** Tolerant JSONL reader: a torn or partial line is skipped, never fatal. */
 export function readRows(file) {
