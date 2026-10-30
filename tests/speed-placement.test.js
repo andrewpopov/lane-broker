@@ -200,6 +200,12 @@ test('speed-aware: local queue wait + E beats the runner by too much -> goes rem
 test('speed-aware: a 3x runner while this machine is only briefly blocked -> waits and runs locally', TIMEOUT, async () => {
   const ctx = await speedSetup({ speedRatioCfg: 3, localMs: 10_000 });
   holdLocal(ctx);
+  // an idle host, pinned: a loaded dev machine would otherwise leave no CPU slot and rightly send the ticket to the runner (BRAIN-727)
+  const { cpuCores } = detectResourceCapacity();
+  const busyFile = path.join(tmpDir('sp-busy'), 'busy');
+  fs.writeFileSync(busyFile, `0,${cpuCores}\n`);
+  ctx.env.LANE_BROKER_CPU_BUSY_FILE = busyFile;
+  fs.writeFileSync(paths(ctx.state).cpuSample, JSON.stringify({ lastValid: { at: Date.now(), hostBusyCores: 0, cores: cpuCores } }));
   setTimeout(() => removeLease(ctx.state, 'held'), 2500);
   const { result } = await runDefault(ctx);
   assert.notEqual(result.executor, 'remote');

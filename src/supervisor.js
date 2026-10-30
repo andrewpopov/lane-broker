@@ -550,7 +550,7 @@ function externalCpuSlotsFor(root, enriched, globalCfg) {
  * its measured speed ratio, plus dispatch overhead and, if it too is queued, that queue). One decision, with both estimates.
  * BRAIN-596: host load outside any lease that leaves no admissible slot makes the local wait unbounded, so an unqueued runner wins.
  */
-function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, probe, queuedChoice, waitedMs = 0) {
+function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, probe, queuedChoice, waitedMs = 0, forceLocalBlocked = false) {
   const queue = listQueue(root).filter(Boolean);
   const own = queue.findIndex((t) => t.id === enriched.id);
   const ahead = own === -1 ? queue : queue.slice(0, own);
@@ -558,7 +558,7 @@ function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, pr
   const evidence = speedRatio(rows, runner, { job: { command: enriched.command, repo: enriched.repoId, lane: enriched.lane, estimateMs } });
   const ratio = evidence.ratio;
   const runnerQueueMs = queuedChoice ? probe.queued * estimateMs * ratio : 0;
-  const localBlocked = !queuedChoice && externalCpuSlotsFor(root, enriched, globalCfg) === 0;
+  const localBlocked = forceLocalBlocked || (!queuedChoice && externalCpuSlotsFor(root, enriched, globalCfg) === 0);
   return {
     ...chooseSpeedPlacement({
       localAdmitsNow: false,
@@ -750,8 +750,10 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   const localIneligibility = () => localIneligibilityOf(enriched, globalCfg, cpuLimit);
 
   /** `rebindable`: this fallback is only "no runner had room right now", so a later probe may still find one.
+   *  `retryWhenBlocked`: a runner proved it never started the ticket (rejecting it included), so while this machine cannot admit it
+   *  either, another runner may take it (BRAIN-727).
    *  `noRunner`: the fallback is "the fleet had no usable runner", which a `localRefused` lane reports as retryable. */
-  async function fallbackOrRefuse(runner, reason, { rebindable = false, neverStarted = false, noRunner = false, retryable = noRunner } = {}) {
+  async function fallbackOrRefuse(runner, reason, { rebindable = false, retryWhenBlocked = false, neverStarted = false, noRunner = false, retryable = noRunner } = {}) {
     if (rebind) return abandonRebind(runner, reason, { neverStarted: neverStarted || withdrawn === null });
     const fb = await fallbackToLocal(root, enriched.id, reason);
     if (!fb.ok) {
@@ -805,7 +807,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       return { fallback: false };
     }
 
-    return { fallback: true, attemptGeneration: fb.attempt.generation, fallbackReason: reason, rebindable };
+    return { fallback: true, attemptGeneration: fb.attempt.generation, fallbackReason: reason, rebindable, retryWhenBlocked };
   }
 
   // BRAIN-442: a local-first ticket skips the initial dispatch and queues locally; only `tryRebind` may move it, after its wait.
@@ -1295,7 +1297,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // Only a runner that provably never started it AND says nothing about other runners (a queue expiry or withdrawal, an incomplete
   // transfer) leaves the fallback rebindable; ineligible, rejected and possibly-run outcomes stay local for good.
   if (dispatch.runnerStopped === true) return fallbackOrRefuse(runner, RUNNER_SHUTDOWN_REASON, { rebindable: true, neverStarted: true });
-  return fallbackOrRefuse(runner, dispatch.reason, { neverStarted: dispatch.neverStarted === true, rebindable: dispatch.outcome === 'unconfirmed' && dispatch.neverStarted === true && dispatch.retryElsewhere === true, retryable: dispatch.outcome === 'unconfirmed' && dispatch.rejected !== true });
+  return fallbackOrRefuse(runner, dispatch.reason, { neverStarted: dispatch.neverStarted === true, retryWhenBlocked: dispatch.outcome === 'unconfirmed' && dispatch.neverStarted === true, rebindable: dispatch.outcome === 'unconfirmed' && dispatch.neverStarted === true && dispatch.retryElsewhere === true, retryable: dispatch.outcome === 'unconfirmed' && dispatch.rejected !== true });
 }
 
 async function main() {
@@ -1371,6 +1373,7 @@ async function main() {
   let attemptGeneration = null;
   let fallbackReason;
   let rebindable = false;
+  let retryWhenBlocked = false;
   // BRAIN-380: createAttempt and enqueue refuse under the lock while `lane migrate-scheduler` runs. The ticket never
   // started, so publish exit 75 (through the attempt, if a fallback one exists) rather than die with no result.
   async function exitMigrating(err) {
@@ -1394,6 +1397,7 @@ async function main() {
     fallbackReason = outcome.fallbackReason;
     // BRAIN-405: only a fallback for want of a runner with room stays rebindable; the marker rides in the queue record.
     rebindable = outcome.rebindable === true;
+    retryWhenBlocked = outcome.retryWhenBlocked === true;
     if (rebindable) enriched.remote = { ...enriched.remote, fallback: { reason: fallbackReason, at: Date.now() } };
   }
 
@@ -1524,7 +1528,7 @@ async function main() {
    */
   const LOCAL_LOG_INTERVAL_MS = 10 * 60_000;
   let lastLocalLogAt = 0;
-  async function tryRebind() {
+  async function tryRebind(localBlocked = false) {
     // A ticket never goes back to a runner it left, was refused by, or was ever dispatched to (nor to one it is on).
     const attempt = readAttempt(root, ticket.id);
     const left = new Set([...(attempt?.moves ?? []).flatMap((m) => [m.from, m.to]), ...(attempt?.refusedRunners ?? []), ...(attempt?.dispatchedRunners ?? [])]);
@@ -1532,13 +1536,13 @@ async function main() {
     if (candidates.length === 0) return;
     // An idle runner is always taken; a runner that is itself queued (up to maxRemoteQueue) only for a ticket stuck locally long enough.
     const waitedMs = Date.now() - (readQueuedRecord(root, ticket.id)?.localSince ?? Date.now());
-    const stuckLocally = globalCfg.remoteRebindMinLocalWaitMs > 0 && waitedMs >= globalCfg.remoteRebindMinLocalWaitMs;
+    const stuckLocally = localBlocked || (globalCfg.remoteRebindMinLocalWaitMs > 0 && waitedMs >= globalCfg.remoteRebindMinLocalWaitMs);
     const { runner, probe, queuedChoice } = await selectRunner(candidates, selectionOptionsFor('rebind', enriched, globalCfg, { stuckLocally, root, cpuLimit }));
     if (!runner) return;
     // BRAIN-548: a speed-aware ticket moves only when the runner is now expected to finish it sooner than waiting here does.
     const speed = speedInputs(root, enriched);
     if (speed) {
-      const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true, waitedMs);
+      const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true, waitedMs, localBlocked);
       if (decision.choice === 'local') {
         // BRAIN-556: make a ticket that keeps staying local visible, at most once per 10 min
         if (Date.now() - lastLocalLogAt >= LOCAL_LOG_INTERVAL_MS) {
@@ -1548,6 +1552,11 @@ async function main() {
         return;
       }
       logSpeedDecision(root, enriched, 'remote', `rebind: local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)}, ${decision.ratioTier} n=${decision.ratioPairs}${decision.localBlocked ? ', local blocked by host CPU load' : ''})`);
+    }
+    if (localBlocked) {
+      const line = `lane: remote-rebind: ${enriched.id}: local blocked: no CPU slot beside external load — moving to ${runner.name}\n`;
+      process.stderr.write(line);
+      writeBrokerLog(root, line);
     }
     await runRemoteAttempt(root, enriched, globalCfg, abortController.signal, { generation: attemptGeneration, runner, probe, queued: queuedChoice === true }, cpuLimit);
   }
@@ -1661,10 +1670,13 @@ async function main() {
       touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit(outcome, { forcePublish: cancelWon });
     }
-    if (rebindable && globalCfg.remoteRebindIntervalMs > 0 && Date.now() >= nextRebindAt && Date.now() >= rebindNotBefore && (globalCfg.runners || []).length > 0) {
+    const rebindDue = (rebindable || retryWhenBlocked) && globalCfg.remoteRebindIntervalMs > 0 && Date.now() >= nextRebindAt && (globalCfg.runners || []).length > 0;
+    // BRAIN-727: a remote-eligible ticket the host's external load leaves no slot for is blocked, whether or not it is the head
+    const localBlocked = rebindDue && Boolean(enriched.remote) && externalCpuSlotsFor(root, enriched, globalCfg) === 0;
+    if (rebindDue && (rebindable || localBlocked) && (Date.now() >= rebindNotBefore || localBlocked)) {
       nextRebindAt = Date.now() + globalCfg.remoteRebindIntervalMs;
       try {
-        await tryRebind();
+        await tryRebind(localBlocked);
       } catch (err) {
         if (!(err instanceof MigrationInProgressError)) throw err;
         return exitMigrating(err);
