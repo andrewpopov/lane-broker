@@ -2,6 +2,8 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { scrubbedGitEnv } from './remote-manifest.js';
+import { isCancelled, readSupersededBy } from './state.js';
+import { LEASE_STATE } from './lease.js';
 
 const MAX_HOPS = 8;
 const PS_LINE = /^\s*(\d+)\s+(\w{3} \w{3}\s+\d+ \d\d:\d\d:\d\d \d{4})\s+(.*)$/;
@@ -86,4 +88,28 @@ export function isSuperseded(result) {
 
 export function isRepeatOfPush(a, b) {
   return a.worktree === b.worktree && a.branch === b.branch && a.pushArgsHash === b.pushArgsHash && a.gitPid !== b.gitPid;
+}
+
+/**
+ * The id of the other push of the same caller that `ticket` waits behind, or null. A RUNNING gate holds whatever its order (an
+ * older push that enqueues late must not run beside a younger one already started); among queued gates the earlier push holds.
+ * Siblings of one push (same gitPid), orphaned leases and gates already cancelled or superseded hold nothing.
+ */
+export function pushHoldBehind(root, ticket, queue, leases) {
+  const holds = (other) =>
+    other.id !== ticket.id && other.pushGate?.caller === ticket.pushGate.caller && other.pushGate.gitPid !== ticket.pushGate.gitPid && !isCancelled(root, other.id) && !readSupersededBy(root, other.id);
+  const running = leases.find((lease) => lease.state === LEASE_STATE.RUNNING && holds(lease));
+  if (running) return running.id;
+  const earlier = queue.filter((other) => other && holds(other) && pushOrder(other.pushGate, ticket.pushGate) < 0).sort((a, b) => pushOrder(a.pushGate, b.pushGate));
+  return earlier[0]?.id ?? null;
+}
+
+/** Map of every held queued gate id to the id it waits behind. */
+export function pushHolds(root, queue, leases) {
+  const holds = new Map();
+  for (const ticket of queue) {
+    const behind = ticket?.pushGate ? pushHoldBehind(root, ticket, queue, leases) : null;
+    if (behind) holds.set(ticket.id, behind);
+  }
+  return holds;
 }

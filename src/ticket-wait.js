@@ -111,6 +111,8 @@ export function waitLabel(reason, detail = {}) {
     case 'exclusive-head':
     case 'exclusive-draining':
       return `an exclusive lease (${reason})`;
+    case 'push-hold':
+      return `your other push (${detail.behind})`;
     case 'not-head':
       return `${(detail.position ?? 1) - 1} ticket(s) ahead (position ${detail.position}/${detail.queueLength})`;
     default:

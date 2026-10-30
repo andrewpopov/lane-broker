@@ -5,8 +5,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneSpawn, laneRun, gitFixture, waitFor, sleep, BIN } from './helpers.js';
+import { fenceLegacyQueue } from '../src/migrate.js';
 import { isPidAlive } from '../src/lease.js';
-import { enqueue } from '../src/scheduler.js';
+import { enqueue, tryStart } from '../src/scheduler.js';
+import { writeLease, LEASE_STATE } from '../src/lease.js';
+import { pushHoldBehind } from '../src/push-gate.js';
+import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
+import { writeCancelMarkerFile, bootId, atomicWriteJson } from '../src/state.js';
 import { paths, ensureStateDirs, readSupersededBy, isCancelled } from '../src/state.js';
 
 const PUSH_REF = 'HEAD:refs/heads/feat';
@@ -15,29 +20,34 @@ const GATE_SECONDS_APART = 1100; // git start times have one-second resolution
 
 const sha256 = (text) => crypto.createHash('sha256').update(text).digest('hex');
 
-function setup() {
-  const fx = freshEnv({ CLAUDE_CODE_SESSION_ID: SESSION, LANE_BIN: BIN });
-  writeGlobalConfig(fx.home, { version: 1, capacity: 1, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
-  const work = path.join(fx.base, 'work');
-  const remote = path.join(fx.base, 'remote.git');
+function addWork(fx, name) {
+  const work = path.join(fx.base, name);
+  const remote = path.join(fx.base, `${name}-remote.git`);
   fs.mkdirSync(work, { recursive: true });
   gitFixture(['init', '--bare', remote], fx.base);
   gitFixture(['init'], work);
-  writeRepoConfig(work, { version: 1, lanes: { prepush: { weight: 1 }, default: { weight: 1 } } });
+  writeRepoConfig(work, { version: 1, lanes: { prepush: { weight: 1 }, default: { weight: 1 }, other: { weight: 1 } } });
   gitFixture(['add', '.'], work);
   gitFixture(['commit', '-m', 'init'], work);
   gitFixture(['remote', 'add', 'origin', remote], work);
   const hook = path.join(work, '.git', 'hooks', 'pre-push');
-  fs.writeFileSync(hook, '#!/bin/sh\ncat >/dev/null\nnode "$LANE_BIN" run --repo r --lane prepush $GATE_ARGS -- sh -c "$GATE_CMD"\nrc=$?\necho $rc > "$GATE_RC"\nexit $rc\n', { mode: 0o755 });
+  fs.writeFileSync(hook, `#!/bin/sh\ncat >/dev/null\nnode "$LANE_BIN" run --repo ${name} --lane prepush $GATE_ARGS -- sh -c "$GATE_CMD"\nrc=$?\necho $rc > "$GATE_RC"\nexit $rc\n`, { mode: 0o755 });
+  return work;
+}
+
+function setup(extraEnv = {}, capacity = 1) {
+  const fx = freshEnv({ CLAUDE_CODE_SESSION_ID: SESSION, LANE_BIN: BIN, ...extraEnv });
+  writeGlobalConfig(fx.home, { version: 1, capacity, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
+  const work = addWork(fx, 'r');
   const env = { ...fx.env };
   for (const name of Object.keys(env)) if (name.startsWith('GIT_')) delete env[name];
   return { ...fx, env, work, history: paths(fx.state).history };
 }
 
 /** A real `git push`; resolves with the hook's exit (via GATE_RC) and the push's stderr. */
-function push(fx, name, gateCmd, ref = PUSH_REF, gateArgs = '') {
+function push(fx, name, gateCmd, ref = PUSH_REF, gateArgs = '', work = fx.work, extraEnv = {}) {
   const rcFile = path.join(fx.base, `${name}.rc`);
-  const child = spawn('git', ['push', 'origin', ref], { cwd: fx.work, env: { ...fx.env, GATE_CMD: gateCmd, GATE_ARGS: gateArgs, GATE_RC: rcFile } });
+  const child = spawn('git', ['push', 'origin', ref], { cwd: work, env: { ...fx.env, ...extraEnv, GATE_CMD: gateCmd, GATE_ARGS: gateArgs, GATE_RC: rcFile } });
   let stderr = '';
   child.stderr.on('data', (d) => {
     stderr += d;
@@ -269,4 +279,138 @@ test('an orphaned superseded gate is cancelled with the superseded result, quiet
   assert.equal(loser.supersededBy, winner.id);
   assert.equal(fs.existsSync(path.join(paths(fx.state).superseded, lease.id)), false);
   assert.equal(hasLeaseOf(fx, lease.id), false);
+});
+
+const intervalOf = (row) => [row.startedAt, row.endedAt];
+
+/** Two pushes of one caller to two repos on a roomy broker: the second is enqueued while the first is running. */
+async function pushToTwoRepos({ firstCmd = 'sleep 3', extraEnv = {}, secondEnv = {}, unsetCaller = false } = {}) {
+  const fx = setup(extraEnv, 4);
+  if (unsetCaller) for (const name of ['CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID']) delete fx.env[name];
+  const second = addWork(fx, 's');
+  const first = push(fx, 'first', firstCmd);
+  await waitFor(() => hasLease(fx), { timeoutMs: 60_000 });
+  await sleep(GATE_SECONDS_APART);
+  const held = push(fx, 'second', 'true', PUSH_REF, '', second, secondEnv);
+  const [firstDone, heldDone] = await Promise.all([first.done, held.done]);
+  const rows = gateRows(fx);
+  return { fx, firstDone, heldDone, firstRow: rows.find((r) => r.worktree === fs.realpathSync(fx.work)), heldRow: rows.find((r) => r.worktree === fs.realpathSync(second)) };
+}
+
+let sameCallerRun;
+const sameCaller = () => (sameCallerRun ??= pushToTwoRepos());
+
+test('two pushes from one caller to different repos never run concurrently', async () => {
+  const { firstDone, heldDone, firstRow, heldRow } = await sameCaller();
+  assert.equal(firstDone.rc, 0);
+  assert.equal(heldDone.rc, 0);
+  const [, firstEnd] = intervalOf(firstRow);
+  const [heldStart] = intervalOf(heldRow);
+  assert.ok(heldStart >= firstEnd, `the held push started at ${heldStart}, before the first ended at ${firstEnd}`);
+});
+
+test('a held push prints that it waits behind its own other push and records pushHeldMs', async () => {
+  const { heldDone, firstRow, heldRow } = await sameCaller();
+  assert.match(heldDone.stderr, new RegExp(`lane run: waiting behind your other push ${firstRow.id} \\(${firstRow.repo}\\)`));
+  assert.equal(heldDone.stderr.match(/waiting behind your other push/g).length, 1, 'printed once');
+  assert.equal(heldRow.heldBehind, firstRow.id);
+  assert.ok(heldRow.pushHeldMs > 0);
+  assert.equal(firstRow.heldBehind, undefined);
+});
+
+test('pushes from different callers are not held', async () => {
+  const { firstDone, heldDone, firstRow, heldRow } = await pushToTwoRepos({ secondEnv: { CLAUDE_CODE_SESSION_ID: 'another-session' } });
+  assert.equal(firstDone.rc, 0);
+  assert.equal(heldDone.rc, 0);
+  assert.equal(heldRow.heldBehind, undefined);
+  assert.ok(heldRow.startedAt < firstRow.endedAt, 'the second push ran beside the first');
+});
+
+test('without a session id each worktree is its own caller, so pushes from two worktrees are not held', async () => {
+  const { heldRow, firstRow } = await pushToTwoRepos({ unsetCaller: true });
+  assert.match(firstRow.caller, /^worktree:/);
+  assert.notEqual(firstRow.caller, heldRow.caller);
+  assert.equal(heldRow.heldBehind, undefined);
+  assert.ok(heldRow.startedAt < firstRow.endedAt);
+});
+
+test('a held ticket blocks no other ticket', async () => {
+  const fx = setup({}, 2);
+  const second = addWork(fx, 's');
+  const first = push(fx, 'first', 'sleep 6');
+  await waitFor(() => hasLease(fx), { timeoutMs: 60_000 });
+  await sleep(GATE_SECONDS_APART);
+  const held = push(fx, 'second', 'true', PUSH_REF, '', second);
+  await waitFor(() => fs.existsSync(paths(fx.state).queue) && queuedRecords(fx).some((r) => r.pushGate), { timeoutMs: 60_000 });
+  const unrelated = await laneRun(['run', '--repo', 'r', '--lane', 'other', '--', 'true'], { env: fx.env, cwd: fx.work });
+  assert.equal(unrelated.code, 0);
+  assert.equal(queuedRecords(fx).filter((r) => r.pushGate).length, 1, 'the held push is still queued');
+  await Promise.all([first.done, held.done]);
+});
+
+test('killing the holder lifts the hold', async () => {
+  const fx = setup({}, 4);
+  const second = addWork(fx, 's');
+  const first = push(fx, 'first', 'sleep 60');
+  await waitFor(() => hasLease(fx), { timeoutMs: 60_000 });
+  const leaseDir = paths(fx.state).leases;
+  const leaseFile = path.join(leaseDir, fs.readdirSync(leaseDir).find((n) => n.endsWith('.json')));
+  await waitFor(() => JSON.parse(fs.readFileSync(leaseFile, 'utf8')).childPgid, { timeoutMs: 30_000 });
+  const lease = JSON.parse(fs.readFileSync(leaseFile, 'utf8'));
+  await sleep(GATE_SECONDS_APART);
+  const held = push(fx, 'second', 'true', PUSH_REF, '', second);
+  await waitFor(() => fs.existsSync(paths(fx.state).queue) && queuedRecords(fx).some((r) => r.pushGate), { timeoutMs: 60_000 });
+  const heldId = queuedRecords(fx).find((r) => r.pushGate).id;
+  const waitFile = path.join(paths(fx.state).waits, `${heldId}.json`);
+  await waitFor(() => fs.existsSync(waitFile) && JSON.parse(fs.readFileSync(waitFile, 'utf8')).reason === 'push-hold', { timeoutMs: 30_000 });
+  process.kill(lease.supervisorPid, 'SIGKILL');
+  try {
+    assert.equal((await held.done).rc, 0);
+  } finally {
+    process.kill(-lease.childPgid, 'SIGKILL');
+  }
+  assert.ok(gateRows(fx).find((r) => r.worktree === fs.realpathSync(second)).pushHeldMs > 0);
+  await first.hookRc();
+});
+
+const gate = (gitPid, gitStartEpoch, caller = 'c') => ({ gitPid, gitStartEpoch, worktree: `/w${gitPid}`, branch: 'main', pushArgsHash: 'h', caller });
+const stamped = (id, pushGate, extra = {}) => ({ id, key: `k:${id}`, repoId: `repo${id}`, lane: 'prepush', weight: 1, cwd: '/w', cmd: ['true'], pushGate, ...extra });
+const runningLease = (id, pushGate, state = LEASE_STATE.RUNNING) => ({ ...stamped(id, pushGate), bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), state });
+
+test('a younger running push holds an older late enqueue', () => {
+  const { state } = freshEnv();
+  const older = stamped('older', gate(100, 1_000_000));
+  const younger = runningLease('younger', gate(200, 2_000_000));
+  assert.equal(pushHoldBehind(state, older, [older], [younger]), 'younger');
+  assert.equal(pushHoldBehind(state, older, [older], [{ ...younger, state: LEASE_STATE.ORPHANED }]), null, 'an orphaned lease holds nothing');
+  assert.equal(pushHoldBehind(state, older, [older], [runningLease('sibling', gate(100, 1_000_000))]), null, 'the same push is a sibling');
+  assert.equal(pushHoldBehind(state, older, [older], [runningLease('other', gate(300, 3_000_000, 'someone else'))]), null);
+  writeCancelMarkerFile(state, 'younger');
+  assert.equal(pushHoldBehind(state, older, [older], [younger]), null, 'a cancelled ticket holds nothing');
+});
+
+test('among queued pushes the earlier holds and the earliest is never held', () => {
+  const { state } = freshEnv();
+  const a = stamped('a', gate(100, 1_000_000));
+  const b = stamped('b', gate(200, 2_000_000));
+  assert.equal(pushHoldBehind(state, b, [a, b], []), 'a');
+  assert.equal(pushHoldBehind(state, a, [a, b], []), null);
+});
+
+test('a held ticket is never reservation owner', async () => {
+  const { state } = freshEnv();
+  const cfg = { ...DEFAULT_GLOBAL_CONFIG, schedulerMode: 'active', capacity: 10, maxLaneWeight: 5, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, cpuAdmissionPercent: 100, cpuReserveCores: 1, admissionCooldownMs: 0, resourceSkipLimit: 3 };
+  atomicWriteJson(paths(state).schedFence, { version: 2, migratedAt: Date.now() });
+  fenceLegacyQueue(state, 'test');
+  const rec = (seq) => ({ reason: 'resource', skipsCharged: 3, reserved: true, reservationSeq: seq, inScope: true, behindConflict: false, deniedAt: Date.now(), budget: 9, externalBusy: 0 });
+  atomicWriteJson(paths(state).fairness, { version: 2, tickets: { held: { resource: rec(10) }, owner: { resource: rec(12) } } });
+  writeLease(state, runningLease('running', gate(1, 1_000)));
+  await enqueue(state, stamped('held', gate(2, 2_000)));
+  await enqueue(state, stamped('plain', undefined));
+  const owner = stamped('owner', undefined);
+  await enqueue(state, owner);
+  const sampler = () => ({ hostBusyCores: 0, cores: 10, stale: false, sampledAt: Date.now() });
+  const memory = () => ({ availableBytes: 64 * 1024 ** 3, totalBytes: 64 * 1024 ** 3, macPressure: 'normal', source: 'test' });
+  const result = await tryStart(state, owner, cfg, undefined, sampler, undefined, memory);
+  assert.equal(result.started, true, 'the next dormant owner is promoted past the held ticket and heads the queue');
 });

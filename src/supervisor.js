@@ -121,6 +121,21 @@ function cancelRequested(root, id) {
 }
 
 const PUSH_ABANDONED = 'push-abandoned';
+const PUSH_HOLD_POLL_MS = 5000;
+
+/** BRAIN-731: how long this supervisor's ticket sat held behind the same caller's other push, and behind which (the last). */
+const pushHold = { heldMs: 0, since: null, behind: null };
+
+function pushHoldFields() {
+  const heldMs = pushHold.heldMs + (pushHold.since === null ? 0 : Date.now() - pushHold.since);
+  return pushHold.behind === null ? {} : { pushHeldMs: heldMs, heldBehind: pushHold.behind };
+}
+
+function endPushHold() {
+  if (pushHold.since === null) return;
+  pushHold.heldMs += Date.now() - pushHold.since;
+  pushHold.since = null;
+}
 
 function clearTicketMarkers(root, id) {
   discardRebinding(root, id);
@@ -497,7 +512,7 @@ function historyRow(ticket, result, { fallbackReason, lease, contentKey = isClea
     // BRAIN-700: the tree still hashed to the key when the run ended, so a failure on it is a verdict about that content
     ...(contentKey && contentKeyVerified ? { contentKeyVerified: true } : {}),
     ...(ticket.retryReason ? { retryReason: ticket.retryReason } : {}),
-    ...(ticket.pushGate ? pushGateRowFields(ticket.pushGate) : {}),
+    ...(ticket.pushGate ? { ...pushGateRowFields(ticket.pushGate), ...pushHoldFields() } : {}),
     ...(ticket.logPath ? { logPath: ticket.logPath } : {}),
     // BRAIN-380 §8: only a ticket that was admitted has a lease, so only its row carries the admission audit
     ...priorityAuditOf(lease),
@@ -1635,6 +1650,7 @@ async function main() {
     return dead && !isReleased(root, ticket.id);
   }
 
+  let holdPollAt = 0;
   let started;
   for (;;) {
     // Re-read the config each iteration rather than reusing the snapshot
@@ -1672,6 +1688,10 @@ async function main() {
       const budget = checkResourceBudget({ resources: enriched.resources, globalCfg, host: detectResourceCapacity() });
       if (!budget.ok) await refuseQueuedOverBudgetAndExit(budget);
     }
+    if (holdPollAt > Date.now()) {
+      await sleep(globalCfg.sampleMs);
+      continue;
+    }
     // tryStart re-reads the config again inside its lock (BRAIN-182): the
     // outer reload above can be superseded by an edit that lands in the gap
     // between this poll's reload and the lock actually being granted. Reuse
@@ -1688,7 +1708,20 @@ async function main() {
     });
     // Test seam: lets a test land a cancel between admission and spawn (BRAIN-364).
     await testHoldAt('local-admitted');
-    if (started.started) break;
+    if (started.started) {
+      endPushHold();
+      break;
+    }
+    if (started.reason === 'push-hold') {
+      if (pushHold.since === null) {
+        pushHold.since = Date.now();
+        process.stderr.write(`lane run: waiting behind your other push ${started.behind}${started.behindRepo ? ` (${started.behindRepo})` : ''}\n`);
+      }
+      pushHold.behind = started.behind;
+      holdPollAt = Date.now() + PUSH_HOLD_POLL_MS;
+    } else {
+      endPushHold();
+    }
     // BRAIN-436: the withdraw marker is the commit, but the queue file may still be there (the runner's best-effort
     // dequeue failed, or it crashed after the marker). Dequeue it here -- retrying the unlink -- BEFORE publishing, so the
     // published result never contradicts a ticket that is still queued. A cancel that is already pending wins.
@@ -2022,7 +2055,7 @@ async function main() {
       const cpuSeconds = integratedCpuSeconds(finalLease?.observedCpuStats, startedAt, finalResult.endedAt);
       if (cpuSeconds !== undefined) finalResult = { ...finalResult, cpuSeconds };
       // BRAIN-431: the longest stretch with no output and no CPU, whether or not the opt-in kill is on (monitoring reads it)
-      finalResult = { ...finalResult, maxNoProgressMs: Math.round(watchdog.maxIdleMs) };
+      finalResult = { ...finalResult, maxNoProgressMs: Math.round(watchdog.maxIdleMs), ...pushHoldFields() };
       // BRAIN-549: settled before the result is published, so a caller that reads history once `lane run` returns finds the row
       const contentKey = settledContentKey(ticket);
       atomicWriteJson(ticket.resultPath, finalResult);

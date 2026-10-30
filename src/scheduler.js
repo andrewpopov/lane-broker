@@ -20,7 +20,7 @@ import { isExclusive, exclusiveDeny, isExclusiveHead, exclusiveLeaseFields, with
 import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, resolveLaneNice, effectiveNice, effectiveRank, score, tierRank, waitedMs } from './priority.js';
 import { loadExpressTable, expressVerdict, expressAdmissionsLastMinute, recordExpressAdmission, logExpressAdmission } from './express.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
-import { isRepeatOfPush, pushOrder } from './push-gate.js';
+import { isRepeatOfPush, pushOrder, pushHolds } from './push-gate.js';
 import { resolveScheduler, resolveSchedulerDetailed, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
 import { detectResourceCapacity, effectiveWeightCapacity, exclusiveBudget, cpuBudgetCores, evaluateMemoryAdmission, leaseResources, resolveTicketResources, terminalRowDefaults, capElasticClaim, elasticBelowFloor, elasticClaimRange } from './resources.js';
 
@@ -571,9 +571,11 @@ export async function couldAdmitNow(root, cfg, ticket, memoryReader = readMemory
 }
 
 function couldAdmitLocked(root, cfg, ticket, memoryReader) {
-  if (listQueue(root).length > 0) return { admit: false, reason: 'queue-ahead' };
-  if (fs.existsSync(paths(root).pause)) return { admit: false, reason: 'paused' };
   const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
+  const queued = listQueue(root);
+  const pushHeld = pushHolds(root, queued, held);
+  if (queued.some((t) => t === null || !pushHeld.has(t.id))) return { admit: false, reason: 'queue-ahead' };
+  if (fs.existsSync(paths(root).pause)) return { admit: false, reason: 'paused' };
   if (held.some(isExclusive)) return { admit: false, reason: 'exclusive-held' };
   if (blockedBy(held, ticket)) return { admit: false, reason: 'conflict' };
   const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
@@ -1199,13 +1201,19 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     const classes = resolveClasses(cfg, root);
     const classHost = classes.mode === 'off' && classes.valid ? null : detectResourceCapacity();
     const { capEnforced, eligible, simsAfterTests } = classQueuePolicy(rawQueue, classes, held, classHost, cfg);
+    // BRAIN-731: a push held behind the same caller's other push leaves every selection like a cap-denied sim does
+    const pushHeld = pushHolds(root, rawQueue, held);
+    if (pushHeld.has(submitted.id)) {
+      const behind = pushHeld.get(submitted.id);
+      return { result: { started: false, reason: 'push-hold', behind, behindRepo: [...rawQueue, ...held].find((t) => t?.id === behind)?.repoId } };
+    }
     const { queue: fullQueue, ownerId: reservationOwnerId } = sched.v2
-      ? effectiveView(rawQueue, nowEff, cfg, store, eligible, { simsAfterTests })
+      ? effectiveView(rawQueue, nowEff, cfg, store, (t) => eligible(t) && !pushHeld.has(t.id), { simsAfterTests })
       : { queue: rawQueue, ownerId: null };
     if (!fullQueue.some((t) => t && t.id === submitted.id)) {
       return { result: { started: false, reason: 'not-head', position: null, queueLength: fullQueue.length } };
     }
-    const queue = capEnforced.size ? fullQueue.filter((t) => t === null || !capEnforced.has(t.id)) : fullQueue;
+    const queue = capEnforced.size || pushHeld.size ? fullQueue.filter((t) => t === null || !(capEnforced.has(t.id) || pushHeld.has(t.id))) : fullQueue;
     const booked = classes.valid && classHost ? bookedSims(held, cfg) : null;
     const ticket = classes.valid && classes.mode === 'active' ? capSimClaim(budgetCapped, classes, booked, classHost, cfg) : budgetCapped;
     const position = queue.findIndex((t) => t && t.id === ticket.id);
