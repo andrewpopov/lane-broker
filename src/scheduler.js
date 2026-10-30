@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, isExpired, writeExpireMarkerFile, writeCancelMarkerFile, writeSupersededMarkerFile, isWithdrawn, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, isExpired, writeExpireMarkerFile, writeCancelMarkerFile, writeSupersededMarkerFile, readSupersededBy, withSupersession, removeSupersededMarker, removeReleasedMarker, isWithdrawn, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
 import { sampleAndUpdateGate, readGateState } from './load.js';
 import { patchAttemptLocked, readAttempt } from './attempts.js';
 import { listLeases, readLease, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
@@ -230,7 +230,7 @@ function supersedeRepeatedPushes(root, incoming) {
   const leased = listLeases(root).map((lease) => ({ lease, held: true }));
   const queued = listQueue(root).filter(Boolean).map((t) => ({ lease: t, held: false }));
   for (const { lease: other, held } of [...leased, ...queued]) {
-    if (other.id === incoming.id || other.repoId !== incoming.repoId || !other.pushGate || !isRepeatOfPush(other.pushGate, incoming.pushGate)) continue;
+    if (other.id === incoming.id || isCancelled(root, other.id) || readSupersededBy(root, other.id) || other.repoId !== incoming.repoId || !other.pushGate || !isRepeatOfPush(other.pushGate, incoming.pushGate)) continue;
     const incomingIsNewer = pushOrder(other.pushGate, incoming.pushGate) < 0;
     const [loser, winner] = incomingIsNewer ? [other, incoming] : [incoming, other];
     writeSupersededMarkerFile(root, loser.id, winner.id);
@@ -527,10 +527,12 @@ export function reapOrphanedQueue(root, keepTicketId) {
   for (const t of listQueue(root)) {
     if (!t || t.id === keepTicketId || !isQueuedSupervisorGone(t, current)) continue;
     const endedAt = Date.now();
+    const superseded = readSupersededBy(root, t.id) !== null;
+    const outcome = superseded ? { exit: 130, cancelled: true } : { exit: 75, cancelled: false, reason: DEAD_QUEUED_SUPERVISOR_REASON };
     // Publish first: a ticket whose result cannot be written stays queued and is retried on the next pass, so a submitter
     // reconciling later never finds neither.
     try {
-      atomicWriteJson(t.resultPath, { id: t.id, exit: 75, signal: null, startedAt: null, endedAt, waitedMs: null, cancelled: false, reason: DEAD_QUEUED_SUPERVISOR_REASON, reconciled: true });
+      atomicWriteJson(t.resultPath, withSupersession(root, t.id, { id: t.id, signal: null, startedAt: null, endedAt, waitedMs: null, reconciled: true, ...outcome }));
     } catch (err) {
       writeBrokerLog(root, `reap ${t.id}: could not publish result, leaving it queued: ${err.message}\n`);
       continue;
@@ -541,7 +543,9 @@ export function reapOrphanedQueue(root, keepTicketId) {
     // trace of the drop (BRAIN-202). Same row conventions as cancel.js.
     if (!dequeueSync(root, t.id)) continue;
     touchSimArmFor(root, t);
-    appendHistory(root, { ...terminalRowDefaults(t), id: t.id, key: t.key, dequeuedDeadSupervisor: true, error: 'supervisor died while queued', supervisorPid: t.supervisorPid, endedAt, executor: 'local' });
+    appendHistory(root, withSupersession(root, t.id, { ...terminalRowDefaults(t), id: t.id, key: t.key, dequeuedDeadSupervisor: true, error: 'supervisor died while queued', supervisorPid: t.supervisorPid, endedAt, executor: 'local', ...(superseded ? { cancelled: true } : {}) }));
+    removeSupersededMarker(root, t.id);
+    removeReleasedMarker(root, t.id);
   }
 }
 

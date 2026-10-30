@@ -9,9 +9,14 @@ import { fenceLegacyQueue } from '../src/migrate.js';
 import { isPidAlive } from '../src/lease.js';
 import { enqueue, tryStart } from '../src/scheduler.js';
 import { writeLease, LEASE_STATE } from '../src/lease.js';
+import { stopSupersededTicket } from '../src/supervisor.js';
+import { releaseUnlessSettled } from '../src/run.js';
+import { reapOrphanedQueue } from '../src/scheduler.js';
+import { waitLabel } from '../src/ticket-wait.js';
+import { processStartTime } from '../src/lease.js';
 import { pushHoldBehind } from '../src/push-gate.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
-import { writeCancelMarkerFile, bootId, atomicWriteJson } from '../src/state.js';
+import { writeCancelMarkerFile, writeSupersededMarkerFile, isReleased, bootId, atomicWriteJson } from '../src/state.js';
 import { paths, ensureStateDirs, readSupersededBy, isCancelled } from '../src/state.js';
 
 const PUSH_REF = 'HEAD:refs/heads/feat';
@@ -413,4 +418,63 @@ test('a held ticket is never reservation owner', async () => {
   const memory = () => ({ availableBytes: 64 * 1024 ** 3, totalBytes: 64 * 1024 ** 3, macPressure: 'normal', source: 'test' });
   const result = await tryStart(state, owner, cfg, undefined, sampler, undefined, memory);
   assert.equal(result.started, true, 'the next dormant owner is promoted past the held ticket and heads the queue');
+});
+
+test('a superseded ticket is signalled only when its recorded supervisor identity still matches', async () => {
+  const child = spawn('sleep', ['30']);
+  try {
+    await stopSupersededTicket({ id: 'x', supervisorPid: child.pid, supervisorStart: 'Mon Jan  1 00:00:00 2001' });
+    await sleep(200);
+    assert.equal(child.signalCode, null, 'a reused pid (different start time) is not signalled');
+    const exited = new Promise((resolve) => child.on('exit', resolve));
+    await stopSupersededTicket({ id: 'x', supervisorPid: child.pid, supervisorStart: processStartTime(child.pid) });
+    await exited;
+  } finally {
+    child.kill('SIGKILL');
+  }
+});
+
+test('a push already cancelled or superseded cannot supersede a live older push', async () => {
+  const { state } = freshEnv();
+  ensureStateDirs(state);
+  const ticket = (id, pushGate) => ({ id, key: 'r:prepush', repoId: 'r', lane: 'prepush', weight: 1, cwd: '/w', cmd: ['true'], pushGate });
+  const sameCheckout = (gitPid, gitStartEpoch) => ({ gitPid, gitStartEpoch, worktree: '/w', branch: 'main', pushArgsHash: 'h', caller: 'c' });
+  await enqueue(state, ticket('dying', sameCheckout(200, 2_000_000)));
+  writeCancelMarkerFile(state, 'dying');
+  const live = await enqueue(state, ticket('live', sameCheckout(100, 1_000_000)));
+  assert.deepEqual(live.supersededTargets, []);
+  assert.equal(readSupersededBy(state, 'live'), null);
+  assert.equal(isCancelled(state, 'live'), false);
+});
+
+test('a queued superseded ticket whose supervisor died publishes the superseded result and clears its markers', async () => {
+  const { state, base } = freshEnv();
+  ensureStateDirs(state);
+  const dead = spawn('true');
+  await new Promise((resolve) => dead.on('exit', resolve));
+  const resultPath = path.join(base, 'result.json');
+  await enqueue(state, { ...stamped('gone', gate(100, 1_000_000)), supervisorPid: dead.pid, supervisorStart: null, resultPath });
+  writeSupersededMarkerFile(state, 'gone', 'winner');
+  reapOrphanedQueue(state, 'someone-else');
+  const result = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
+  assert.deepEqual([result.exit, result.cancelled, result.reason, result.supersededBy], [130, true, 'superseded', 'winner']);
+  const row = fs.readFileSync(paths(state).history, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).find((r) => r.id === 'gone');
+  assert.deepEqual([row.exit, row.cancelled, row.reason, row.supersededBy], [130, true, 'superseded', 'winner']);
+  assert.equal(readSupersededBy(state, 'gone'), null);
+  assert.deepEqual(fs.readdirSync(paths(state).queue), []);
+});
+
+test('a timed-out client releases its gate only when no result has landed', async () => {
+  const { state, base } = freshEnv();
+  ensureStateDirs(state);
+  const resultPath = path.join(base, 'result.json');
+  assert.equal(await releaseUnlessSettled(state, 'open', resultPath), false);
+  assert.equal(isReleased(state, 'open'), true);
+  fs.writeFileSync(resultPath, JSON.stringify({ id: 'done', exit: 0 }));
+  assert.equal(await releaseUnlessSettled(state, 'done', resultPath), true);
+  assert.equal(isReleased(state, 'done'), false);
+});
+
+test('lane status names the other push a held ticket waits behind', () => {
+  assert.equal(waitLabel('push-hold', { behind: 'abc-123' }), 'your other push (abc-123)');
 });

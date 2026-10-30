@@ -149,11 +149,12 @@ function clearTicketMarkers(root, id) {
 }
 
 /** Stop a ticket a repeat push replaced: TERM its live supervisor without waiting, or cancel an orphaned lease whose supervisor is gone. */
-async function stopSupersededTicket({ id, supervisorPid, orphanedLease }) {
+export async function stopSupersededTicket({ id, supervisorPid, supervisorStart, orphanedLease }) {
   if (orphanedLease) {
     await cancelCommand(id, { quiet: true });
     return;
   }
+  if (!isProcessAlive(supervisorPid, supervisorStart)) return;
   try {
     process.kill(supervisorPid, 'SIGTERM');
   } catch {

@@ -2325,6 +2325,27 @@ Documented limits, not bugs:
   held-exclusive check still refuses everything else; raising the capacity is an operator action either way.
 - `drainMs` (time from becoming head to admission) is not recorded in v1.
 
+## Push gates (BRAIN-731)
+
+A **push gate** is a foreground `lane run` on a `prepush` or `prepush-*` lane whose nearest git ancestor (at most 8 hops) is a
+real `git push`; `git hook run pre-push`, `--detach` and hand-run `lane run` are never gates. Such a ticket is stamped with
+`pushGate` (git pid and start, client pid, caller, worktree, branch, a sha256 of the args after `push`; raw args are never
+stored). The caller is `CLAUDE_CODE_SESSION_ID`, else `CODEX_THREAD_ID`, else `CODEX_SESSION_ID`, else the worktree. Three rules:
+
+- **Supersede.** A repeat of the same push (same repo, worktree, branch and args hash, another git process) replaces the older
+  one, queued or running: the older ticket ends with exit `130`, `reason: "superseded"`, `supersededBy: <id>`, and its client
+  prints `lane run: superseded by <id>`. Order is by git start time then pid, never submission time. Pushes with different
+  args are not superseded; they are held (below).
+- **Reap.** A queued gate whose git push or lane client died is removed with exit `75`, `reason: "push-abandoned"`. A client
+  that gave up at `--timeout` leaves a release marker, so its ticket stays queued for `lane wait` even though its push is gone.
+- **Hold.** A push waits behind another push of the same caller, across repos: a running one always holds, among queued ones the
+  earlier holds. The held ticket prints `waiting behind your other push <id> (<repo>)`, leaves every selection so it blocks no
+  one, polls every 5 s, and is never rejected; the hold lifts when the holder ends or its lease is orphaned.
+
+History rows of a gate also carry `worktree`, `branch`, `caller`, `pushArgsHash`, and `pushHeldMs` / `heldBehind` when held.
+Limits: a running gate is never reaped; a terminal panel has no session id, so its caller is the worktree; the superseded,
+released and cancel markers are removed with their ticket and nothing sweeps one a dead supervisor left behind.
+
 ## Exit codes
 
 | Code | Meaning |

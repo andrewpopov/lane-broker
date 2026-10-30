@@ -91,25 +91,40 @@ export function isRepeatOfPush(a, b) {
 }
 
 /**
- * The id of the other push of the same caller that `ticket` waits behind, or null. A RUNNING gate holds whatever its order (an
- * older push that enqueues late must not run beside a younger one already started); among queued gates the earlier push holds.
- * Siblings of one push (same gitPid), orphaned leases and gates already cancelled or superseded hold nothing.
+ * Map of every held queued gate id to the id of the other push of the same caller it waits behind. A RUNNING gate holds whatever
+ * its order (an older push that enqueues late must not run beside a younger one already started); among queued gates the
+ * earlier push holds. Siblings of one push (same gitPid), orphaned leases and gates already cancelled or superseded hold nothing.
+ * One pass per caller over gates sorted once, each ticket's markers read at most once: linear in stamped tickets.
  */
-export function pushHoldBehind(root, ticket, queue, leases) {
-  const holds = (other) =>
-    other.id !== ticket.id && other.pushGate?.caller === ticket.pushGate.caller && other.pushGate.gitPid !== ticket.pushGate.gitPid && !isCancelled(root, other.id) && !readSupersededBy(root, other.id);
-  const running = leases.find((lease) => lease.state === LEASE_STATE.RUNNING && holds(lease));
-  if (running) return running.id;
-  const earlier = queue.filter((other) => other && holds(other) && pushOrder(other.pushGate, ticket.pushGate) < 0).sort((a, b) => pushOrder(a.pushGate, b.pushGate));
-  return earlier[0]?.id ?? null;
-}
-
-/** Map of every held queued gate id to the id it waits behind. */
 export function pushHolds(root, queue, leases) {
+  const live = new Map();
+  const isLive = (id) => {
+    if (!live.has(id)) live.set(id, !isCancelled(root, id) && !readSupersededBy(root, id));
+    return live.get(id);
+  };
+  const byCaller = new Map();
+  const group = (caller) => byCaller.get(caller) ?? byCaller.set(caller, { running: [], queued: [] }).get(caller);
+  for (const lease of leases) if (lease.pushGate && lease.state === LEASE_STATE.RUNNING && isLive(lease.id)) group(lease.pushGate.caller).running.push(lease);
+  for (const ticket of queue) if (ticket?.pushGate) group(ticket.pushGate.caller).queued.push(ticket);
   const holds = new Map();
-  for (const ticket of queue) {
-    const behind = ticket?.pushGate ? pushHoldBehind(root, ticket, queue, leases) : null;
-    if (behind) holds.set(ticket.id, behind);
+  for (const { running, queued } of byCaller.values()) {
+    const firstRunning = running[0];
+    const otherRunning = firstRunning && running.find((l) => l.pushGate.gitPid !== firstRunning.pushGate.gitPid);
+    let earliest;
+    let earliestOfAnotherPush;
+    for (const ticket of queued.sort((x, y) => pushOrder(x.pushGate, y.pushGate))) {
+      const differs = (other) => other && other.pushGate.gitPid !== ticket.pushGate.gitPid;
+      const runningHolder = differs(firstRunning) ? firstRunning : otherRunning;
+      const holder = runningHolder ?? (differs(earliest) ? earliest : earliestOfAnotherPush);
+      if (holder) holds.set(ticket.id, holder.id);
+      if (!isLive(ticket.id)) continue;
+      if (!earliest) earliest = ticket;
+      else if (!earliestOfAnotherPush && ticket.pushGate.gitPid !== earliest.pushGate.gitPid) earliestOfAnotherPush = ticket;
+    }
   }
   return holds;
+}
+
+export function pushHoldBehind(root, ticket, queue, leases) {
+  return pushHolds(root, queue.some((t) => t?.id === ticket.id) ? queue : [...queue, ticket], leases).get(ticket.id) ?? null;
 }

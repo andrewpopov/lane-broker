@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { childExitSafeFlags } from './node-exit-safe.js';
 import { spawn, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { ensureStateDirs, writeReleasedMarkerFile, paths, stateHome, readJsonSafe, appendHistory, LockTimeoutError, MigrationInProgressError, assertNotMigrating, isUuid } from './state.js';
+import { ensureStateDirs, writeReleasedMarkerFile, withLock, paths, stateHome, readJsonSafe, appendHistory, LockTimeoutError, MigrationInProgressError, assertNotMigrating, isUuid } from './state.js';
 import { classTransportMismatch } from './classes.js';
 import { remoteExcludePreflight } from './remote-exclude.js';
 import { MIN_CPU_GRANT_CORES } from './cpu-limit.js';
@@ -178,6 +178,15 @@ function fmtAgo(ms) {
 
 /** Format a finished command's result the same way at every call site that
  *  reads one, instead of repeating the signal/exit branch three times. */
+/** BRAIN-731: leave a timed-out push gate queued for `lane wait`, unless its result landed first. True when it did. */
+export async function releaseUnlessSettled(root, id, resultPath) {
+  return withLock(root, () => {
+    if (readJsonSafe(resultPath)) return true;
+    writeReleasedMarkerFile(root, id);
+    return false;
+  });
+}
+
 function resultExit(prefix, result) {
   if (isSuperseded(result)) {
     process.stderr.write(`${prefix}: superseded by ${result.supersededBy}\n`);
@@ -978,7 +987,9 @@ export async function runCommand({
           return await finishedReturn(resultExit('lane run', state.result));
         }
         process.stderr.write(`lane run: waited ${timeoutMs}ms, not failed — ${state.text}\n`);
-        if (pushGate) writeReleasedMarkerFile(root, id);
+        if (pushGate) {
+          if (await releaseUnlessSettled(root, id, resultPath)) return await finishedReturn(resultExit('lane run', readJsonSafe(resultPath)));
+        }
         return abortReturn(75);
       }
       if (!isPidAlive(supervisor.pid)) {

@@ -245,6 +245,14 @@ export function releasedMarkerPath(root, id) {
   return path.join(paths(root).released, id);
 }
 
+export function removeReleasedMarker(root, id) {
+  try {
+    fs.unlinkSync(releasedMarkerPath(root, id));
+  } catch {
+    // none pending
+  }
+}
+
 export function isReleased(root, id) {
   return fs.existsSync(releasedMarkerPath(root, id));
 }
