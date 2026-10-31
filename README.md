@@ -557,7 +557,7 @@ What a remote run does:
    `headroom.laneNice`, the nice that discount assumed, and
    `headroom.cpuCoresUndiscounted`, and a submitter whose lane sets its own
    `nice` above that uses the undiscounted figure, since the runner runs it at
-   the lane's nice rather than its own `laneNice`) covers the ticket's CPU (its
+   the lane's nice rather than its own `laneNice`; BRAIN-743: a runner whose probe reports `enforcement.cpu: 'unenforced'` (nice-only, e.g. darwin) is always judged on its undiscounted headroom, since nice alone does not let a lane outrank the load the discount assumes it can preempt) covers the ticket's CPU (its
    elastic floor on a runner that admits below the declared claim) and memory.
    A figure the probe does not report never counts against a runner. A runner
    with an empty queue and no headroom is not chosen. Among the rest the

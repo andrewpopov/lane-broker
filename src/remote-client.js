@@ -137,7 +137,7 @@ function cpuNeedOf(reservation, probe) {
 
 /**
  * BRAIN-405: true iff the runner has REAL room for this ticket right now: free CPU (the probe's measured `headroom`, else its
- * CPU budget minus reserved) covers the ticket's CPU (its elastic floor on an elastic runner) and available memory covers its
+ * CPU budget minus reserved; the undiscounted figure on an unenforced runner) covers the ticket's CPU (its elastic floor on an elastic runner) and available memory covers its
  * memory. An unmeasured figure never counts against a runner (an older probe or shadow mode degrades to "assume room").
  * Returns `{ room, cpuFree }`; `cpuFree` ranks runners that tie.
  */
@@ -146,8 +146,11 @@ export function runnerRoom(reservation, probe) {
   let cpuFree = headroom && Number.isFinite(headroom.cpuCores) ? headroom.cpuCores : null;
   // BRAIN-506: the probe discounted preemptible load at `headroom.laneNice`; a lane whose own nice override is higher is discounted less by
   // the runner's admission, so it is judged on the undiscounted figure. With no override the ticket runs at the runner's laneNice (the discounted figure);
-  // a runner without the fields is judged as before.
-  if (cpuFree !== null && Number.isFinite(headroom.laneNice) && Number.isFinite(headroom.cpuCoresUndiscounted) && Number.isInteger(reservation.niceOverride) && reservation.niceOverride > headroom.laneNice) {
+  // a runner without the fields is judged as before. BRAIN-743: a runner whose CPU is `unenforced` (nice only, no cgroup weight) cannot
+  // let a lane outrank the load the discount assumes it can preempt, so it is always judged on the undiscounted figure.
+  const niceOverridden = Number.isFinite(headroom?.laneNice) && Number.isInteger(reservation.niceOverride) && reservation.niceOverride > headroom.laneNice;
+  const unenforced = probe.enforcement?.cpu === 'unenforced';
+  if (cpuFree !== null && Number.isFinite(headroom.cpuCoresUndiscounted) && (niceOverridden || unenforced)) {
     cpuFree = headroom.cpuCoresUndiscounted;
   }
   if (cpuFree === null && Number.isFinite(probe.capacity?.cpuCores) && Number.isFinite(probe.reservedCpuCores)) {
