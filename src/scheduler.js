@@ -1581,7 +1581,10 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     const bypassYields = () => {
       const winner = cfg.floorOvershootCores > 0 ? floorWinner(cfg, queue, held, cpuSample, memInfo, fullDecision.cpuGateClosed, gate.closed, weightCapacity) : null;
       if (winner && winner.id !== ticket.id) return true;
-      return ticket.id !== headTicket.id && expressHeadProtected && !headConflicted && bypassHeld.length > 0 && headClearWithoutBypass(headTicket, held, cpuSample, fullDecision.cpuGateClosed, cfg, now);
+      if (ticket.id === headTicket.id || !expressHeadProtected) return false;
+      // a replacement on a key the aged head conflicts with would keep it conflicted for as long as they keep arriving
+      if (blockedBy([{ key: ticket.key }], headTicket)) return true;
+      return !headConflicted && bypassHeld.length > 0 && headClearWithoutBypass(ticketCpuFloor(headTicket, cfg), held, cpuSample, fullDecision.cpuGateClosed, cfg, now);
     };
     const bypassAdmit = bypassTrial && !ordinarilyAdmitted && !floorAdmit && cpuDecision.memoryReason === 'ok' && BYPASS_LIFTED_CPU_REASONS.has(cpuDecision.cpuReason) && !bypassYields();
     const lifted = floorAdmit || bypassAdmit;

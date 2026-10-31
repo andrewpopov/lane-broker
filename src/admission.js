@@ -266,14 +266,16 @@ export function hostCpuLoad(cpuSample, heldLeases, cfg, now = Date.now()) {
  * them plus the head's claim must fit, and no ordinary lease may hold the cooldown. External load alone fails it, so
  * bypass is never refused for a head the host would not start anyway.
  */
-export function headClearWithoutBypass(head, heldLeases, cpuSample, gateClosed, cfg, now = Date.now()) {
+export function headClearWithoutBypass(headFloorCores, heldLeases, cpuSample, gateClosed, cfg, now = Date.now()) {
   const bypass = heldLeases.filter((l) => l.queueBypass);
   const { externalBusy, budget } = hostCpuLoad(cpuSample, heldLeases, cfg, now);
   const attributed = bypass.reduce((sum, l) => sum + (freshObservedCores(l, now) ?? leaseDemand(l, now, cfg, budget)), 0);
   const drainedBusy = Math.max(0, nonPreemptibleBusy(cpuSample, cfg) - attributed);
   const gateClear = (drainedBusy / cpuSample.cores) * 100 < (gateClosed ? cfg.cpuOpenPercent : cfg.cpuClosePercent);
   const rest = heldLeases.filter((l) => !l.queueBypass);
-  return gateClear && !cooldownActive(rest, cfg, now) && projectBusy(externalBusy, rest, ticketCpuEstimate(head, cfg, now, budget), now, cfg, budget) <= budget;
+  // an unobserved bypass lease's CPU sits in externalBusy, since hostCpuLoad subtracts only fresh observations
+  const unobserved = bypass.reduce((sum, l) => sum + (freshObservedCores(l, now) === null ? leaseDemand(l, now, cfg, budget) : 0), 0);
+  return gateClear && !cooldownActive(rest, cfg, now) && projectBusy(Math.max(0, externalBusy - unobserved), rest, headFloorCores, now, cfg, budget) <= budget;
 }
 
 /** BRAIN-506: the cores a zero-claim candidate would still fit, by admission's own projection (the runner's headroom probe reports this). */

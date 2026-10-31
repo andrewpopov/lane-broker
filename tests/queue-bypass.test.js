@@ -332,6 +332,29 @@ const withEnv = async ({ home, state }, fn) => {
   }
 };
 
+test('an aged head: a bypass on a key it conflicts with refuses; an unobserved bypass lease and an elastic floor both count as drainable', async () => {
+  const rotating = freshEnv().state;
+  seedRuns(rotating);
+  writeLease(rotating, bypassLease('b0', 1000, { key: 'r:b' }));
+  await queued(rotating, agedHead({ conflicts: ['r:b', 'r:a'] }));
+  assert.equal((await poll(rotating, await queued(rotating, ticket('a')))).started, false, 'a replacement on a key the aged head conflicts with');
+
+  const unobserved = freshEnv().state;
+  seedRuns(unobserved);
+  writeLease(unobserved, bypassLease('b0', 1000, { weight: 6, resources: { cpuCores: 6 } }));
+  await queued(unobserved, agedHead());
+  const u = await queued(unobserved, ticket('u'));
+  assert.equal((await poll(unobserved, u, baseCfg({ capacity: 12 }))).started, false, 'its charge leaves externalBusy when drained');
+
+  const elastic = freshEnv().state;
+  seedRuns(elastic);
+  writeLease(elastic, held('ordinary', { weight: 1, resources: { cpuCores: 4 }, observedCpuCores: 4, observedAt: Date.now() }));
+  writeLease(elastic, bypassLease('b0', 1000, { observedCpuCores: 4.5, observedAt: Date.now() }));
+  await queued(elastic, agedHead({ resources: { cpuCores: 8, minCpuCores: 1 } }));
+  const e = await queued(elastic, ticket('e'));
+  assert.equal((await poll(elastic, e, baseCfg(), 8.5)).started, false, 'the head fits at its floor once drained');
+});
+
 test('lane status tags a held in-window bypass lease', async () => {
   const env = freshEnv();
   writeGlobalConfig(env.home, { version: 1, schedulerMode: 'active', queueBypassCap: CAP });
