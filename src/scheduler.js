@@ -1583,7 +1583,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       if (winner && winner.id !== ticket.id) return true;
       if (ticket.id === headTicket.id || !expressHeadProtected) return false;
       // a replacement on a key the aged head conflicts with would keep it conflicted for as long as they keep arriving
-      if (blockedBy([{ key: ticket.key }], headTicket)) return true;
+      if (ticket.key === headTicket.key || headTicket.conflicts?.includes(ticket.key)) return true;
       return !headConflicted && bypassHeld.length > 0 && headClearWithoutBypass(ticketCpuFloor(headTicket, cfg), held, cpuSample, fullDecision.cpuGateClosed, cfg, now);
     };
     const bypassAdmit = bypassTrial && !ordinarilyAdmitted && !floorAdmit && cpuDecision.memoryReason === 'ok' && BYPASS_LIFTED_CPU_REASONS.has(cpuDecision.cpuReason) && !bypassYields();

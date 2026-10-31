@@ -339,6 +339,12 @@ test('an aged head: a bypass on a key it conflicts with refuses; an unobserved b
   await queued(rotating, agedHead({ conflicts: ['r:b', 'r:a'] }));
   assert.equal((await poll(rotating, await queued(rotating, ticket('a')))).started, false, 'a replacement on a key the aged head conflicts with');
 
+  const sameKey = freshEnv().state;
+  seedRuns(sameKey);
+  writeLease(sameKey, bypassLease('b0', 1000, { key: 'r:same' }));
+  await queued(sameKey, agedHead({ key: 'r:same', maxConcurrent: 2 }));
+  assert.equal((await poll(sameKey, await queued(sameKey, ticket('s', { key: 'r:same', maxConcurrent: 3 })))).started, false, 'a same-key replacement under the ceiling');
+
   const unobserved = freshEnv().state;
   seedRuns(unobserved);
   writeLease(unobserved, bypassLease('b0', 1000, { weight: 6, resources: { cpuCores: 6 } }));
