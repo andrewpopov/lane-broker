@@ -283,9 +283,15 @@ export async function selectRunner(runners, opts = {}) {
       continue;
     }
     const cmd = buildRemoteCommand(runner, 'remote-probe', readinessProbeArgs(readinessNeeds));
+    let attemptStart = Date.now();
     let res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
+    let roundTripMs = Date.now() - attemptStart;
     // BRAIN-602: a runner the heartbeat says is up that merely timed out is busy, not gone: a lane with nowhere else to go probes it once more
-    if (res.timedOut && retryTimedOut.has(runner.name)) res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
+    if (res.timedOut && retryTimedOut.has(runner.name)) {
+      attemptStart = Date.now();
+      res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
+      roundTripMs = Date.now() - attemptStart;
+    }
     if (res.timedOut) {
       skipped.push({ name: runner.name, reason: 'probe timed out' });
       continue;
@@ -301,6 +307,7 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason: 'malformed probe response' });
       continue;
     }
+    if (probe !== null && typeof probe === 'object') probe.roundTripMs = roundTripMs;
     if (probe.protocol !== 1) {
       skipped.push({ name: runner.name, reason: `unsupported protocol: ${probe.protocol}` });
       continue;
@@ -597,6 +604,14 @@ function sleepUnlessAborted(ms, abortSignal) {
 
 /** Below this many cacheable bytes the have-query's round trip costs more than it can save, so every body is sent. */
 export const BLOB_CACHE_MIN_BYTES = 4 * 1024 * 1024;
+export const HAVE_DEADLINE_MIN_MS = 3000;
+export const HAVE_DEADLINE_MAX_MS = 15_000;
+/** The have-query is one ssh round trip like the probe, so its deadline follows the probe's measured one (a slow-handshake runner would otherwise always time out). */
+export function haveDeadlineFor(probe) {
+  const roundTripMs = probe?.roundTripMs;
+  if (typeof roundTripMs !== 'number' || !Number.isFinite(roundTripMs) || roundTripMs < 0) return HAVE_DEADLINE_MIN_MS;
+  return Math.min(HAVE_DEADLINE_MAX_MS, Math.max(HAVE_DEADLINE_MIN_MS, 2 * roundTripMs));
+}
 /** The runner rejects with exactly these reasons when a `body:'cached'` frame could not be served from its store. */
 const CACHE_REJECT_RE = /^cache-(?:miss|corrupt): \d+$/;
 
@@ -605,7 +620,7 @@ const CACHE_REJECT_RE = /^cache-(?:miss|corrupt): \d+$/;
  * hashes it has, or null for ANY failure (spawn error, timeout, non-zero exit, a reply that is not `{v:1, have:[valid indices]}`):
  * the caller then sends every body, so the query can only ever save bytes, never fail a dispatch.
  */
-export function queryRemoteHave(runner, identity, hashes, { sshBin = 'ssh', deadlineMs = 3000, env, abortSignal } = {}) {
+export function queryRemoteHave(runner, identity, hashes, { sshBin = 'ssh', deadlineMs = HAVE_DEADLINE_MIN_MS, env, abortSignal } = {}) {
   return new Promise((resolve) => {
     let child;
     try {
@@ -1031,7 +1046,7 @@ async function dispatchOnce(opts) {
     const candidates = manifest.entries.filter(isCacheable);
     if (identity && candidates.reduce((sum, e) => sum + e.size, 0) >= blobCacheMinBytes) {
       const hashes = [...new Set(candidates.map((e) => e.sha256))].filter(isBlobHash);
-      const have = await queryRemoteHave(runner, identity, hashes, { sshBin, deadlineMs: deadlines.haveMs ?? 3000, env, abortSignal });
+      const have = await queryRemoteHave(runner, identity, hashes, { sshBin, deadlineMs: deadlines.haveMs ?? HAVE_DEADLINE_MIN_MS, env, abortSignal });
       if (abortSignal && abortSignal.aborted) return { outcome: 'cancelled' };
       if (have !== null) {
         header.repoIdentity = identity;

@@ -388,9 +388,10 @@ test('selectRunner: sequential order, skips an unreachable runner and picks the 
   const { env } = clientEnv(binDir);
   const runners = [makeRunner({ ssh: 'down' }), makeRunner({ ssh: 'normal', name: 'second' })];
 
-  const { runner, skipped } = await selectRunner(runners, { sshBin, env, deadlineMs: 3000 });
+  const { runner, skipped, probe } = await selectRunner(runners, { sshBin, env, deadlineMs: 3000 });
 
   assert.equal(runner.name, 'second');
+  assert.equal(Number.isInteger(probe.roundTripMs), true);
   assert.equal(skipped.length, 1);
   assert.equal(skipped[0].name, runners[0].name);
 });

@@ -1215,7 +1215,7 @@ launchd job; it adds no second ledger and builds on the BRAIN-594 clock:
 - Runner blob cache (BRAIN-642, `blob-cache/1`): a runner whose probe lists `blob-cache/1` keeps file bodies of 64 KiB and up
   under `<root>/blobs`, keyed by sha256 and namespaced by a hash of the repo's git-common-dir path (that only prevents accidental
   cross-repo reuse; it is not a security boundary). When the tree's cacheable files total at least 4 MiB the client runs `lane
-  remote-have` (one ssh round trip, 3 s deadline) and sends no body for a file the runner already holds; the client still reads and
+  remote-have` (one ssh round trip; its deadline is twice the runner probe's measured round trip, between 3 s and 15 s, so a runner with a slow ssh handshake still gets the cache) and sends no body for a file the runner already holds; the client still reads and
   hashes every file, so a file changed after the manifest still fails. A failed have-query sends every body, so the cache and gzip
   capabilities are independent. Global config on the client: `remoteBlobCache` (boolean, default `true`). On the runner:
   `remoteBlobCacheMaxBytes` (default 10 GiB, a soft target: nothing is published without free-space headroom) and
