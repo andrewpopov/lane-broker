@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, assertNotMigrating, listJsonRecordsStrict } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, kernelBootId, isCancelled, assertNotMigrating, listJsonRecordsStrict } from './state.js';
 import { isProcessAlive, processStartTime } from './process-liveness.js';
 
 /**
@@ -112,9 +112,10 @@ export function moveInterruptedLabel(id, attempt) {
 
 /** BRAIN-759: a dead supervisor's remote attempt stranded mid-withdraw, still on the runner it was withdrawing from. Reconcile may
  *  settle it, but only on proof from both hosts (remote-reconcile.js); `dispatching` never qualifies. Attempt writes are not fsynced,
- *  so the supervisor must have died in THIS boot: after a reboot `moving` may be stale and stays cancel-only. */
+ *  so the supervisor must have died in THIS boot, proven by the same kernel boot UUID: after a reboot `moving` may be stale, and an
+ *  attempt (or host) with no kernel boot id stays cancel-only. */
 export const isStrandedWithdrawingMove = (attempt) =>
-  attempt?.executor === 'remote' && !supervisorAlive(attempt) && attempt.supervisor?.bootId === bootId() && attempt.moving?.phase === 'withdrawing' && attempt.runner === attempt.moving.from;
+  attempt?.executor === 'remote' && Boolean(attempt.supervisor?.kernelBootId) && attempt.supervisor.kernelBootId === kernelBootId() && !isProcessAlive(attempt.supervisor.pid, attempt.supervisor.startTime) && attempt.moving?.phase === 'withdrawing' && attempt.runner === attempt.moving.from;
 
 /** Create the initial attempt record for `id` (generation 0, executor 'remote',
  *  phase 'probe'), stamped with THIS process's own identity as the owning
@@ -138,6 +139,7 @@ export async function createAttempt(root, id, { runner = null, resources, logPat
       pid: process.pid,
       startTime: processStartTime(process.pid) ?? null,
       bootId: bootId(),
+      ...(kernelBootId() ? { kernelBootId: kernelBootId() } : {}),
     },
   };
   // BRAIN-321: a client-supplied id (`refuseIf` given) is claimed here, under the same lock as the write: an id that is already

@@ -6,6 +6,19 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { freshEnv, sleep } from './helpers.js';
 import { paths, withLock, __test } from '../src/state.js';
+import { makeTmpDir } from './helpers/tmp.js';
+
+test('a failing ps cannot make a live lock owner look dead: the lock is not stolen', () => {
+  const bin = makeTmpDir('lane-ps-stub-');
+  fs.writeFileSync(path.join(bin, 'ps'), '#!/bin/sh\nexit 1\n', { mode: 0o755 });
+  const saved = process.env.PATH;
+  process.env.PATH = `${bin}${path.delimiter}${saved}`;
+  try {
+    assert.equal(__test.isLockOwnerAlive({ pid: process.pid, token: 't', start: 'Mon Jan  1 00:00:00 2024' }), true);
+  } finally {
+    process.env.PATH = saved;
+  }
+});
 
 /** Spawn a child that exits immediately, and return its (now-dead) pid. */
 async function spawnDeadPid() {

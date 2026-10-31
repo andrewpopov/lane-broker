@@ -6,7 +6,7 @@ import path from 'node:path';
 import { laneRun, writeGlobalConfig, waitFor, sleep, freshEnv } from './helpers.js';
 import { tmpDir, setup, resultOf } from './remote-harness.js';
 import { readAttempt } from '../src/attempts.js';
-import { paths, atomicWriteJson, ensureStateDirs, bootId, tombstonePath } from '../src/state.js';
+import { paths, atomicWriteJson, ensureStateDirs, bootId, kernelBootId, tombstonePath } from '../src/state.js';
 import { processStartTime } from '../src/process-liveness.js';
 import { sweepOrphans } from '../src/reconcile-sweep.js';
 import { recordPings } from '../src/runner-unreachable.js';
@@ -301,7 +301,7 @@ test('lane status without an orphan (or with only an interrupted move) spawns no
 
 const strandedWithdraw = (ctx) => {
   const destRoot = addRunner(ctx, 'dest', 'normal');
-  const id = seedOrphan(ctx, { record: { kind: 'unfinished', reason: 'withdrawn' }, attempt: { supervisor: { ...DEAD_SUPERVISOR, bootId: bootId() }, moving: { from: 'skybox', to: 'dest', phase: 'withdrawing', at: 1234 } } });
+  const id = seedOrphan(ctx, { record: { kind: 'unfinished', reason: 'withdrawn' }, attempt: { supervisor: { ...DEAD_SUPERVISOR, bootId: bootId(), kernelBootId: kernelBootId() }, moving: { from: 'skybox', to: 'dest', phase: 'withdrawing', at: 1234 } } });
   return { id, destRoot };
 };
 
