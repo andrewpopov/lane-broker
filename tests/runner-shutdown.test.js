@@ -195,6 +195,8 @@ test('a shutdown marker with no kernel boot id (old marker, or a host without on
     delete process.env.LANE_BROKER_KERNEL_BOOT_ID;
     process.env.LANE_BROKER_BOOT_ID = 'boot-1';
     await writeRemoteDrain(ctx.state, 'going down', { shutdown: true });
+    const { kernelBootId: _stored, ...oldMarker } = JSON.parse(fs.readFileSync(paths(ctx.state).remoteDrain, 'utf8'));
+    fs.writeFileSync(paths(ctx.state).remoteDrain, JSON.stringify(oldMarker));
     assert.equal(readRemoteDrain(ctx.state).shutdown, true);
     process.env.LANE_BROKER_BOOT_ID = 'boot-2';
     assert.equal(readRemoteDrain(ctx.state), null);
