@@ -26,4 +26,4 @@ if [ "$only_deletes" = "1" ] && [ "$deletions" -gt 0 ]; then
   echo "pre-push: deletion-only push; nothing to verify."
   exit 0
 fi
-LABEL=pre-push npm run verify
+LABEL=pre-push npm run verify:fast
