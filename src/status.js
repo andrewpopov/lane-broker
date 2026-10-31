@@ -227,6 +227,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       logAgeMs: logMtimeAgeMs(l.logPath),
       log: l.logPath,
       weight: l.weight,
+      ...(l.queueBypass && now - l.admittedAt < cfg.queueBypassMaxMs ? { queueBypass: true } : {}),
       ...(l.exclusive === true ? { exclusive: true } : {}),
       // BRAIN-695: a held exclusive's maintenance purpose and how long it has left before the supervisor ends it
       ...(l.exclusive === true && l.exclusivePurpose ? { exclusivePurpose: l.exclusivePurpose } : {}),
@@ -270,7 +271,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     : { queue: rawQueue, ownerId: null };
   const queue = [...fullQueue.filter((t) => t === null || classPolicy.eligible(t)), ...fullQueue.filter((t) => t !== null && !classPolicy.eligible(t))];
   // BRAIN-551: built only for a non-empty queue, in memory (status never writes).
-  const expressTable = queue.some(Boolean) ? loadExpressTable(root, now, { write: false }) : null;
+  const expressTable = queue.some(Boolean) ? loadExpressTable(root, now, { write: false, bypassMaxMs: cfg.queueBypassMaxMs }) : null;
   const queued = queue.map((t, i) => {
     const rank = effectiveRank(t, nowEff, cfg);
     const tier = priorityOf(t);
@@ -645,7 +646,7 @@ export function renderStatusText(status) {
     lines.push('  (none)');
   } else {
     for (const r of status.running) {
-      const flag = (r.exclusive ? ` [exclusive${r.exclusivePurpose ? ` ${r.exclusivePurpose}` : ''}${r.exclusiveDeadlineRemainingMs !== undefined ? `, deadline in ${fmtMs(r.exclusiveDeadlineRemainingMs)}` : ''}]` : '') + (r.state === 'ORPHANED' ? ' [ORPHANED]' : '') + (r.overrun ? ` [OVERRUN peak ${r.overrun.observedPeak} for ${fmtMs(r.overrun.sinceMs)}]` : '') + (r.memOver ? ` [MEM-OVER peak ${fmtMB(r.observedCgroupMemoryPeakBytes)} > booked ${fmtMB(r.resources?.memoryBytes)}]` : '') + silenceFlag(r);
+      const flag = (r.exclusive ? ` [exclusive${r.exclusivePurpose ? ` ${r.exclusivePurpose}` : ''}${r.exclusiveDeadlineRemainingMs !== undefined ? `, deadline in ${fmtMs(r.exclusiveDeadlineRemainingMs)}` : ''}]` : '') + (r.queueBypass ? ' [bypass]' : '') + (r.state === 'ORPHANED' ? ' [ORPHANED]' : '') + (r.overrun ? ` [OVERRUN peak ${r.overrun.observedPeak} for ${fmtMs(r.overrun.sinceMs)}]` : '') + (r.memOver ? ` [MEM-OVER peak ${fmtMB(r.observedCgroupMemoryPeakBytes)} > booked ${fmtMB(r.resources?.memoryBytes)}]` : '') + silenceFlag(r);
       // BRAIN-255: only shown once it's non-default, so "2 running" reads
       // differently against a maxConcurrent: 8 lane than a plain exclusive
       // one, without cluttering the common (ceiling 1) case.

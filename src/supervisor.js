@@ -491,7 +491,7 @@ function pushGateRowFields({ worktree, branch, caller, pushArgsHash }) {
   return { worktree, branch, caller, pushArgsHash };
 }
 
-function historyRow(ticket, result, { fallbackReason, lease, contentKey = isCleanPass(result) ? undefined : ticket.contentKey, contentKeyVerified = false } = {}) {
+export function historyRow(ticket, result, { fallbackReason, lease, contentKey = isCleanPass(result) ? undefined : ticket.contentKey, contentKeyVerified = false } = {}) {
   const executor = result.executor ?? 'local';
   const localReason = executor === 'local' ? (fallbackReason === undefined ? ticket.localReason : `fallback:${fallbackReason}`) : undefined;
   return {
@@ -519,6 +519,7 @@ function historyRow(ticket, result, { fallbackReason, lease, contentKey = isClea
     ...(ticket.logPath ? { logPath: ticket.logPath } : {}),
     // BRAIN-380 §8: only a ticket that was admitted has a lease, so only its row carries the admission audit
     ...priorityAuditOf(lease),
+    ...(lease?.queueBypass ? { queueBypass: lease.queueBypass } : {}),
     // BRAIN-425: every row states what the lane was granted and how it ended; a grant or exit in `result` wins
     ...terminalRowDefaults({ resources: ticket.resources, grantedCpuCores: lease?.grantedCpuCores }),
     ...result,

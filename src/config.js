@@ -98,6 +98,10 @@ export const DEFAULT_GLOBAL_CONFIG = {
   expressMaxMs: 30_000,
   expressPerMinute: 6,
   expressHeadMaxWaitMs: 900_000,
+  // BRAIN-756: up to queueBypassCap tickets predicted under queueBypassMaxMs (by command history) start without waiting on
+  // the CPU gate, the projection or the cooldown. 0 turns it off.
+  queueBypassCap: 0,
+  queueBypassMaxMs: 60_000,
   // BRAIN-346: how many tickets may start behind a FIFO head denied only by
   // projected-over-budget CPU before the head is reserved (nothing else is
   // admitted past it). 0 restores strict FIFO for resource denials.
@@ -383,7 +387,7 @@ function validateGlobalConfig(cfg, sourcePath) {
     `${sourcePath}: "headBlockGraceMs" must be a non-negative integer`,
   );
   assert(typeof cfg.conflictSafeBackfill === 'boolean', `${sourcePath}: "conflictSafeBackfill" must be a boolean`);
-  for (const name of ['expressMaxMs', 'expressPerMinute', 'expressHeadMaxWaitMs']) {
+  for (const name of ['expressMaxMs', 'expressPerMinute', 'expressHeadMaxWaitMs', 'queueBypassCap', 'queueBypassMaxMs']) {
     assert(Number.isInteger(cfg[name]) && cfg[name] >= 0, `${sourcePath}: "${name}" must be a non-negative integer`);
   }
   assert(

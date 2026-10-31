@@ -1638,7 +1638,7 @@ median (p50) of this machine's local history for the ticket's exact command
 (`cmdFingerprint`), else for its `(repo, lane)`, with at least 3 runs; no
 history means not express. The ticket still has to pass everything else:
 its own conflicts and key serialization (`maxConcurrent`), weight capacity, the
-CPU projection and memory. An express start is not counted against any skip
+CPU gate, projection and cooldown, and memory (queue bypass, below, lifts the CPU denials). An express start is not counted against any skip
 allowance above, and a sim never uses it behind a test head. Two bounds keep the
 head from starving:
 
@@ -1655,6 +1655,37 @@ Each express start is logged in `admission-decisions.log` as
 `lane-broker-express event=express-admit`, and `lane status` marks queued
 express tickets `[express]` (JSON: `express: true`). The estimates are cached in
 `express-estimates.json` for 5 minutes. `expressMaxMs: 0` turns it off.
+
+**Queue bypass** (BRAIN-756). A ticket predicted to run under `queueBypassMaxMs` (default 60000) starts
+without waiting on the CPU gate, the CPU projection or the admission cooldown, so a 10-second check does not sit
+behind a closed gate for minutes. `queueBypassCap` (default 0 = off; set it per machine, runners stay off until their
+history supports it) bounds how many such leases are held at once.
+
+- **Prediction**: from this machine's local history, the median of the last 20 successful runs of the ticket's exact
+  command (`cmdFingerprint`) when it has at least 3, else of its command family (its first 3 words, without env
+  assignments, flags, paths or files, so `pnpm test src/a.test.js` and `pnpm test` share one), under
+  `queueBypassMaxMs`, and at most 3 of the last 20 runs that started (any outcome: failed, cancelled and signalled
+  count) over `queueBypassMaxMs`. The lane median is never used; no history means no bypass. The table is cached in
+  `express-estimates.json` for 5 minutes.
+- **What it lifts**: only a `cpu-gate-closed`, `cooldown` or `projected-over-budget` denial. It still needs the ticket's
+  own conflicts and `maxConcurrent` to clear, weight capacity, memory, the load gate, no pause, and no exclusive ticket
+  ahead; train, release and sim lanes never bypass. An unavailable CPU sample never lifts.
+- **Cap**: the leases are counted from the held leases (`queueBypass` on the lease). A bypass is refused while
+  `queueBypassCap` are inside their first `queueBypassMaxMs`, or while `queueBypassCap` have outlived it, so a burst of
+  mispredictions cannot keep stacking after its slots free: at most `2 x queueBypassCap - 1` are held. Every bypass lease
+  is charged to the CPU projection and memory like any other, from admission, and nothing is killed or flipped when
+  one outlives the window; repeat offenders lose eligibility through the over-60 s count.
+- **Fairness**: a bypass yields to a waiting real push gate that would take the floor slot, and, once the head has waited
+  `expressHeadMaxWaitMs` (and is not futile), is refused when the head would start with the held bypass leases drained
+  (the host's busy cores less what those leases use under the gate's own open/close threshold, and the CPU projection
+  without them). External load that keeps the gate shut, or a head that does not fit even then, does not refuse.
+  Bypass leases do not start the admission cooldown for ordinary tickets.
+- **Bound**: an eligible ticket starts at its next poll while a slot is free and it is not refused above; otherwise it keeps
+  its ordinary queue place. A bypass uses no express rate or skip allowance.
+
+A bypass start is logged in `admission-decisions.log` as `current=start:queue-bypass` with `bypass=1`, plus a
+`lane-broker-head-block event=queue-bypass` line (expected ms, source, in-window/cap, the lifted reason). The lease and the
+terminal history row carry `queueBypass: { expectedMs, source }`, and `lane status` tags a held in-window one `[bypass]`.
 
 **Priority yield past a reserved head** (BRAIN-630). A ticket whose admitted tier is strictly higher than a
 head's with a *resource* reservation (not the capacity-blocked kind) may start past it when it fits now on its own
