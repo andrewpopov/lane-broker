@@ -47,7 +47,7 @@ import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, l
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness, recordEnforcement } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
-import { remoteCpuAllocation, selectRunner, dispatchRemote, remoteCancel, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
+import { remoteCpuAllocation, selectRunner, dispatchRemote, remoteCancel, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, haveDeadlineFor, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
 import { remoteExcludeWarnings } from './remote-exclude.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
@@ -1112,6 +1112,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       remoteArtifacts: artifactsSupported ? declaredArtifacts : null,
       transfer: snapshotGzip ? TRANSFER_GZIP : undefined,
       blobCache,
+      deadlines: { haveMs: haveDeadlineFor(probe) },
       onTransferStats,
       gzipLevel: globalCfg.remoteSnapshotGzipLevel,
       artifactLimits: artifactLimitsOf(globalCfg),

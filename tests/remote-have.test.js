@@ -7,7 +7,7 @@ import zlib from 'node:zlib';
 import { spawn } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, BIN, laneRun } from './helpers.js';
 import { tmpDir, setup, makeFakeSshBin, makeRunner, clientEnv, makeGitWorktree, makeDispatchArgs, markerCmd, detachAndWait, linesOf } from './remote-harness.js';
-import { dispatchRemote } from '../src/remote-client.js';
+import { dispatchRemote, haveDeadlineFor } from '../src/remote-client.js';
 import { buildManifest } from '../src/remote-manifest.js';
 import { repoIdentity } from '../src/config.js';
 import { advertisedCapabilities, CAPABILITIES } from '../src/capabilities.js';
@@ -21,6 +21,15 @@ const BIG = 5 * 1024 * 1024; // over the client's 4 MiB have-query threshold
 const sha = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
 const entryOf = (name, buf) => ({ path: name, type: 'file', exec: false, size: buf.length, sha256: sha(buf) });
 const blobOf = (seed, n = MIN_CACHEABLE_BYTES + 64) => crypto.createHash('sha512').update(seed).digest().toString('hex').repeat(Math.ceil(n / 128)).slice(0, n);
+
+test('haveDeadlineFor: twice the probe round trip, clamped to 3 s .. 15 s', () => {
+  for (const probe of [undefined, null, {}, { roundTripMs: NaN }, { roundTripMs: Infinity }, { roundTripMs: -5 }, { roundTripMs: '2000' }]) {
+    assert.equal(haveDeadlineFor(probe), 3000);
+  }
+  assert.equal(haveDeadlineFor({ roundTripMs: 1000 }), 3000);
+  assert.equal(haveDeadlineFor({ roundTripMs: 1700 }), 3400);
+  assert.equal(haveDeadlineFor({ roundTripMs: 20000 }), 15000);
+});
 
 const spawned = [];
 afterEach(() => {

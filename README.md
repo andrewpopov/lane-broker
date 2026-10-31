@@ -557,7 +557,7 @@ What a remote run does:
    `headroom.laneNice`, the nice that discount assumed, and
    `headroom.cpuCoresUndiscounted`, and a submitter whose lane sets its own
    `nice` above that uses the undiscounted figure, since the runner runs it at
-   the lane's nice rather than its own `laneNice`) covers the ticket's CPU (its
+   the lane's nice rather than its own `laneNice`; BRAIN-743: a runner whose probe reports `enforcement.cpu: 'unenforced'` (nice-only, e.g. darwin) is always judged on its undiscounted headroom, since nice alone does not let a lane outrank the load the discount assumes it can preempt) covers the ticket's CPU (its
    elastic floor on a runner that admits below the declared claim) and memory.
    A figure the probe does not report never counts against a runner. A runner
    with an empty queue and no headroom is not chosen. Among the rest the
@@ -1215,7 +1215,7 @@ launchd job; it adds no second ledger and builds on the BRAIN-594 clock:
 - Runner blob cache (BRAIN-642, `blob-cache/1`): a runner whose probe lists `blob-cache/1` keeps file bodies of 64 KiB and up
   under `<root>/blobs`, keyed by sha256 and namespaced by a hash of the repo's git-common-dir path (that only prevents accidental
   cross-repo reuse; it is not a security boundary). When the tree's cacheable files total at least 4 MiB the client runs `lane
-  remote-have` (one ssh round trip, 3 s deadline) and sends no body for a file the runner already holds; the client still reads and
+  remote-have` (one ssh round trip; its deadline is twice the runner probe's measured round trip, between 3 s and 15 s, so a runner with a slow ssh handshake still gets the cache) and sends no body for a file the runner already holds; the client still reads and
   hashes every file, so a file changed after the manifest still fails. A failed have-query sends every body, so the cache and gzip
   capabilities are independent. Global config on the client: `remoteBlobCache` (boolean, default `true`). On the runner:
   `remoteBlobCacheMaxBytes` (default 10 GiB, a soft target: nothing is published without free-space headroom) and

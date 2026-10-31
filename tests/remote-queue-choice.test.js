@@ -267,3 +267,14 @@ test('supervisor: maxRemoteQueue 0 -> a queued runner is skipped and the ticket 
   assert.equal(result.queuedAt, undefined);
   await Promise.all([blocker, queued]);
 });
+
+test('selectRunner: an unenforced runner with only discounted room loses to an enforced runner with a short queue (BRAIN-743)', async () => {
+  const headroom = { cpuCores: 2.3, cpuCoresUndiscounted: 0, laneNice: 8 };
+  const sshBin = makeProbeMapSsh({
+    mac: probe(0, { headroom, enforcement: { cpu: 'unenforced', reason: 'no cgroups on darwin; children get nice only' } }),
+    fast: probe(1, { headroom, enforcement: { cpu: 'enforced' } }),
+  });
+  const res = await selectRunner(runnersOf('mac', 'fast'), { sshBin, deadlineMs: 3000, maxRemoteQueue: 2, reservation: { weight: 2, cpuCores: 2, memoryBytes: 1 } });
+  assert.equal(res.runner.name, 'fast');
+  assert.equal(res.queuedChoice, true);
+});

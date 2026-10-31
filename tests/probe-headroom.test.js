@@ -156,3 +156,16 @@ test('BRAIN-653: admissible memory is available plus broker-held, minus the rese
   assert.equal(probeAdmissibleMemoryBytes(resources, { memoryReserveBytes: 4_000_000_000 }, true, running), 3_500_000_000);
   assert.equal(probeAdmissibleMemoryBytes(resources, { memoryReserveBytes: 4_000_000_000 }, false, running), null);
 });
+
+test('(f) BRAIN-743: an unenforced (nice-only) runner is judged on the undiscounted figure', () => {
+  const headroom = { cpuCores: 2.3, cpuCoresUndiscounted: 0, laneNice: 8 };
+  const need = { cpuCores: 2 };
+  const unenforced = { enforcement: { cpu: 'unenforced', reason: 'no cgroups on darwin; children get nice only' }, headroom };
+  const res = runnerRoom(need, unenforced);
+  assert.equal(res.room, false);
+  assert.equal(res.cpuFree, 0);
+  assert.equal(runnerRoom(need, { enforcement: { cpu: 'enforced' }, headroom }).room, true, 'enforced: discounted figure');
+  const older = { enforcement: unenforced.enforcement, headroom: { cpuCores: 2.3 } };
+  assert.equal(runnerRoom(need, older).room, true, 'no undiscounted figure: discounted figure kept');
+  assert.equal(runnerRoom(need, older).cpuFree, 2.3);
+});
