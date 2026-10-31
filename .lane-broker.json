@@ -3,7 +3,8 @@
   "lanes": {
     "default": { "weight": 2 },
     "prepush": { "weight": 2, "cpuCores": 1 },
-    "train": { "weight": 2, "cpuCores": 1 }
+    "train": { "weight": 2, "cpuCores": 1 },
+    "pr": { "weight": 2, "cpuCores": 1 }
   },
   "conflicts": []
 }

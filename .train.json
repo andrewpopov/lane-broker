@@ -1,10 +1,29 @@
 {
   "version": 1,
   "lane": "train",
-  "command": ["sh", "scripts/train-gate.sh"],
+  "command": [
+    "sh",
+    "scripts/train-gate.sh"
+  ],
   "fastTier": "verify:fast",
   "batchSize": 4,
   "maxExtraRunsPerBatch": 2,
   "maxRebuilds": 2,
-  "soloPaths": [".githooks/**", ".train.json", "package-lock.json"]
+  "soloPaths": [
+    ".githooks/**",
+    ".train.json",
+    "package-lock.json"
+  ],
+  "verifyMaster": false,
+  "prCi": {
+    "lane": "pr",
+    "command": [
+      "sh",
+      "scripts/train-gate.sh"
+    ],
+    "fallbackCommand": [
+      "sh",
+      "scripts/train-gate.sh"
+    ]
+  }
 }
