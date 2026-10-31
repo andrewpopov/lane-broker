@@ -301,7 +301,7 @@ test('lane status without an orphan (or with only an interrupted move) spawns no
 
 const strandedWithdraw = (ctx) => {
   const destRoot = addRunner(ctx, 'dest', 'normal');
-  const id = seedOrphan(ctx, { record: { kind: 'unfinished', reason: 'withdrawn' }, attempt: { moving: { from: 'skybox', to: 'dest', phase: 'withdrawing', at: 1234 } } });
+  const id = seedOrphan(ctx, { record: { kind: 'unfinished', reason: 'withdrawn' }, attempt: { supervisor: { ...DEAD_SUPERVISOR, bootId: bootId() }, moving: { from: 'skybox', to: 'dest', phase: 'withdrawing', at: 1234 } } });
   return { id, destRoot };
 };
 
