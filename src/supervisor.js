@@ -35,7 +35,7 @@ import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
 import { reloadGlobalConfig, isDispatchOnly } from './config.js';
 import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope, scopeMemoryPeakReader, scopeMemoryPeakTracker, enforcementLabel } from './cpu-limit.js';
-import { stateHome, RUNNER_SHUTDOWN_REASON } from './state.js';
+import { stateHome, RUNNER_SHUTDOWN_REASON, LOST_REASONS } from './state.js';
 import { readHistoryRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
 import { missingLocalDeps, speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, externalCpuSlots, DEFAULT_REMOTE_OVERHEAD_MS } from './speed-placement.js';
@@ -46,7 +46,8 @@ import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, class
 import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, noRunnerLocallyIneligibleRefusal, dispatchOnlyRefusal, LOCAL_REFUSED_EXIT_CODE, locallyRefusedNow, localWindowAllowing, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness, recordEnforcement } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
-import { remoteCpuAllocation, selectRunner, dispatchRemote, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
+import { reconcileRemoteAttempt } from './remote-reconcile.js';
+import { remoteCpuAllocation, selectRunner, dispatchRemote, remoteCancel, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
 import { remoteExcludeWarnings } from './remote-exclude.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
@@ -1021,6 +1022,58 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     movingSet = false;
     await updateAttempt(root, enriched.id, gen, { moving: undefined });
   };
+  /**
+   * BRAIN-350 S3: the runner dropped with no proof either way (`mayStillBeRunning`). This supervisor stays alive and asks reconcile (in
+   * `self` mode) every `remoteLostPollMs` until the job is proven gone, then hands back a `runnerStopped` dispatch so the S2 branch
+   * re-dispatches it; a result the runner turns out to hold is adopted and ends the ticket; `lane cancel` becomes a remote cancel.
+   * The `runnerLostAfterMs` bound is not proof: it settles the ticket lost (exit 75) like an orphan, never re-dispatching it. The runner
+   * is the object captured at dispatch, so a config reload cannot change the host asked; the reload only supplies the flags and polling.
+   * The attempt keeps `unresolved` throughout, so a supervisor killed meanwhile still leaves an ordinary reconcilable orphan.
+   */
+  const awaitProof = async (dropped) => {
+    const since = Date.now();
+    await updateAttempt(root, enriched.id, gen, { unresolved: dropped.reason, awaitingProof: { runner: runner.name, since } });
+    const line = `lane: remote: ${enriched.id}: ${runner.name} dropped; waiting for proof the job is gone before re-dispatching (see lane status)\n`;
+    process.stderr.write(line);
+    writeBrokerLog(root, line);
+    while (true) {
+      if (abortSignal.aborted) {
+        const remoteId = readAttempt(root, enriched.id)?.binding?.ticketId ?? enriched.id;
+        const remoteCancelConfirmed = await remoteCancel(runner, remoteId, {});
+        await updateAttempt(root, enriched.id, gen, { awaitingProof: undefined });
+        return { outcome: 'cancelled', remoteCancelConfirmed };
+      }
+      globalCfg = reloadGlobalConfig(globalCfg, { onError: (err) => recordConfigReloadError(root, err) });
+      if (!(globalCfg.remoteLostPollMs > 0)) {
+        // polling was switched off meanwhile: leave as the pre-S3 path does, the attempt stays unresolved for `lane status`/`lane cancel`
+        const line = `lane: remote: ${enriched.id}: ${runner.name}: ${dropped.reason} (see lane status, lane cancel)\n`;
+        process.stderr.write(line);
+        writeBrokerLog(root, line);
+        await updateAttempt(root, enriched.id, gen, { unresolved: dropped.reason, awaitingProof: undefined });
+        await logWriter.finish();
+        process.exit(1);
+      }
+      const settled = await reconcileRemoteAttempt(root, enriched.id, { globalCfg, self: true, runner });
+      if (settled.state === 'lost' && settled.settled !== true) {
+        await updateAttempt(root, enriched.id, gen, { unresolved: undefined, awaitingProof: undefined });
+        return { outcome: 'unconfirmed', reason: settled.lostDetail, runnerStopped: true, lostReason: settled.reason };
+      }
+      if (settled.settled === true || settled.state === 'skipped') {
+        // adopted (the runner held the result, now published), cancelled by `lane cancel` meanwhile, or the attempt is not ours to settle
+        await logWriter.finish();
+        if (stdoutForward) await stdoutForward.drain();
+        if (stderrForward) await stderrForward.drain();
+        if (settled.settled === true) clearTicketMarkers(root, enriched.id);
+        else process.stderr.write(`lane-broker supervisor: could not settle ${enriched.id} while waiting for proof: ${settled.reason}\n`);
+        process.exit(settled.settled === true && Number.isInteger(settled.exit) ? settled.exit : 1);
+      }
+      if (abortSignal.aborted) continue; // cancelled during the reconcile: take the cancel branch now, not after a full interval
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, globalCfg.remoteLostPollMs);
+        abortSignal.addEventListener('abort', () => { clearTimeout(timer); resolve(); }, { once: true });
+      });
+    }
+  };
   const dispatchedAt = Date.now(); // the FIRST dispatch: waitedMs includes the time spent queued on every runner before the last
   let epochDispatchedAt = dispatchedAt; // BRAIN-350: when the current runner got the ticket; a runner that stopped it adds all of it to the wait
   let dispatch;
@@ -1127,7 +1180,9 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
         },
       } : null,
     });
+    if (dispatch.mayStillBeRunning === true && !rebind && !movingSet && globalCfg.remoteLostPollMs > 0 && !abortSignal.aborted) dispatch = await awaitProof(dispatch);
     if (dispatch.runnerStopped === true) {
+      const lostReason = dispatch.lostReason ?? RUNNER_SHUTDOWN_REASON;
       // BRAIN-350: the runner's own record proves its host shut down and the job is dead there, so running it again cannot double-run (BRAIN-437).
       // This is a new placement, not a rebalance: any configured runner this ticket has not been on is a candidate.
       const picked = rebind ? { runner: null } : await selectRunner((globalCfg.runners || []).filter((r) => !visited.includes(r.name)), selectionOptionsFor('place', enriched, globalCfg, { root, cpuLimit }));
@@ -1137,7 +1192,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       priorRemoteQueuedMs += Math.max(0, Date.now() - epochDispatchedAt);
       epochDispatchedAt = Date.now();
       visited.push(picked.runner.name);
-      moves.push({ from: from.name, to: picked.runner.name, at: Date.now(), reason: RUNNER_SHUTDOWN_REASON });
+      moves.push({ from: from.name, to: picked.runner.name, at: Date.now(), reason: lostReason });
       runner = picked.runner;
       probe = picked.probe;
       selectedRunner = runner.name;
@@ -1153,7 +1208,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
         await publishAndExit(gen, () => migrationRefusalResult(enriched));
         return { fallback: false };
       }
-      const line = `lane: remote-redispatch: ${enriched.id}: ${from.name} -> ${runner.name} (${from.name} stopped the job: ${RUNNER_SHUTDOWN_REASON})\n`;
+      const line = `lane: remote-redispatch: ${enriched.id}: ${from.name} -> ${runner.name} (${from.name} ${lostReason === RUNNER_SHUTDOWN_REASON ? 'stopped the job' : 'lost the job'}: ${lostReason})\n`;
       process.stderr.write(line);
       writeBrokerLog(root, line);
       process.stderr.write(`lane: running on ${runner.name} (${enforcementLabel(probe?.enforcement)})\n`);
@@ -1196,10 +1251,10 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   }
   // A move that never completed (or one whose second dispatch ended before a snapshot went out) must not outlive this attempt's record.
   if (movingSet && !dispatch.mayStillBeRunning) await clearMoving();
-  const rebalanceFields = () => (moves.length ? { rebalancedFrom: moves.at(-1).from, rebalancedAt: moves.at(-1).at, rebalanceReason: moves.at(-1).reason === DRAIN_MOVE_REASON ? `${moves.at(-1).from} draining (${moves.at(-1).drainReason})` : moves.at(-1).reason === RUNNER_SHUTDOWN_REASON ? `${moves.at(-1).from} stopped the job (${RUNNER_SHUTDOWN_REASON})` : `queued ${Math.round(moves.at(-1).queuedMs / 1000)}s on ${moves.at(-1).from}`, moves: moves.length } : {});
+  const rebalanceFields = () => (moves.length ? { rebalancedFrom: moves.at(-1).from, rebalancedAt: moves.at(-1).at, rebalanceReason: moves.at(-1).reason === DRAIN_MOVE_REASON ? `${moves.at(-1).from} draining (${moves.at(-1).drainReason})` : LOST_REASONS.has(moves.at(-1).reason) ? `${moves.at(-1).from} ${moves.at(-1).reason === RUNNER_SHUTDOWN_REASON ? 'stopped' : 'lost'} the job (${moves.at(-1).reason})` : `queued ${Math.round(moves.at(-1).queuedMs / 1000)}s on ${moves.at(-1).from}`, moves: moves.length } : {});
   const redispatchFields = () => {
-    const from = moves.filter((m) => m.reason === RUNNER_SHUTDOWN_REASON).map((m) => m.from);
-    return from.length ? { redispatchedFrom: from, redispatchReason: RUNNER_SHUTDOWN_REASON } : {};
+    const lost = moves.filter((m) => LOST_REASONS.has(m.reason));
+    return lost.length ? { redispatchedFrom: lost.map((m) => m.from), redispatchReason: lost.at(-1).reason } : {};
   };
 
   // BRAIN-405: a confirmed preflight refusal means the runner never started the job, so a rebound ticket goes back to its place
@@ -1326,7 +1381,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   // 'ineligible' or 'unconfirmed'
   // Only a runner that provably never started it AND says nothing about other runners (a queue expiry or withdrawal, an incomplete
   // transfer) leaves the fallback rebindable; ineligible, rejected and possibly-run outcomes stay local for good.
-  if (dispatch.runnerStopped === true) return fallbackOrRefuse(runner, RUNNER_SHUTDOWN_REASON, { rebindable: true, neverStarted: true });
+  if (dispatch.runnerStopped === true) return fallbackOrRefuse(runner, dispatch.lostReason ?? RUNNER_SHUTDOWN_REASON, { rebindable: true, neverStarted: true });
   return fallbackOrRefuse(runner, dispatch.reason, { neverStarted: dispatch.neverStarted === true, retryWhenBlocked: dispatch.outcome === 'unconfirmed' && dispatch.neverStarted === true, rebindable: dispatch.outcome === 'unconfirmed' && dispatch.neverStarted === true && dispatch.retryElsewhere === true, retryable: dispatch.outcome === 'unconfirmed' && dispatch.rejected !== true });
 }
 

@@ -43,6 +43,7 @@ lane status [--json]
 lane capabilities --json
 lane suggest [--repo <name>] [--days 7] [--json]
 lane report cost --repo zirkbot,jun --since 2026-10-01 --until 2026-10-08 --prs zirkbot=z.json,jun=j.json [--json]   # gate-cost scorecard (BRAIN-529)
+lane report losses --since 2026-10-01 --until 2026-10-08 [--repo zirkbot] [--json]   # runner losses and re-dispatches (BRAIN-350)
 lane cancel <id>
 lane lease-check <id>                    # exit 0 only if <id> is a live lease on this host (BRAIN-553)
 lane priority <id> high|medium|low       # re-tier a queued ticket in place (BRAIN-518)
@@ -1176,6 +1177,11 @@ waiting on them) forever. Two ways to settle them as lost (exit `75`; a job's ou
 
 `lane wait` on a settled-lost attempt exits `75` and prints the reason on stderr.
 
+**Losses are now re-dispatched (BRAIN-350).** A `runner-shutdown` record re-dispatches the work at once. A dropped runner keeps its
+supervisor waiting for proof (the `offline` flag, a runner-confirmed gone, or the runner's own record), then re-dispatches to another
+runner before falling back to local. `runnerLostAfterMs` is not proof (a partitioned runner may still run the job): it settles the
+ticket lost (exit `75`, `runner-lost`) and never re-dispatches it. The runner asked is the one dispatched to, even if the config changes meanwhile. `remoteLostPollMs` (default 60000; `0` = exit at once, as before) sets that poll.
+
 **The runner heartbeat (BRAIN-597).** Reconcile only runs when someone asks, so a runner that died with nothing on it was never
 noticed, and placement re-probed it (about 6 s each) on every submission. `lane runner watch` is one tick, run every 60 s by a
 launchd job; it adds no second ledger and builds on the BRAIN-594 clock:
@@ -1342,15 +1348,21 @@ anything queued.
 lane drain --shutdown ["reason"] [--wait-ms N]   # default reason "host shutting down", default wait 60000
 ```
 
-Run it just before the machine goes down (a logoff script on a Windows host running the runner in WSL). It writes a drain marker
-that also records the boot it was written in, so it ends with that boot: the runner takes work again after it comes back, with no
-`lane undrain`. Then, for every remote ticket that has not published a result, it writes a `shutdown` marker in the ticket
-directory, stops its local lane if one is registered, and waits (up to `--wait-ms`) for each ticket to publish or its publisher
-to die. A `remote-exec` that arrives later sees the same marker and never starts its command. Each ticket ends with a record
-`kind: "unfinished"`, `reason: "runner-shutdown"` (the ticket's `cancelled` marker is never written, so the submitter does not
-read it as a user cancel). That record proves the job is dead, so the submitter can run it elsewhere. A job that completed on
-its own first keeps its `completed` record, and a user cancel still reads `cancelled`. It prints `stopped N, published M, still
-pending K` and exits 0 (1 only if the marker could not be written). `--root <dir>` overrides the remote root (tests).
+Run it just before the machine goes down; on a Windows host running the runner in WSL, `ops/windows-shutdown-drain/` runs it
+from the user's session. It writes a drain marker that records the boot it was written in, so it ends with that boot: the runner
+takes work again after it comes back, with no `lane undrain`. Then, under the broker lock, every remote ticket that has not
+published gets a `shutdown` marker, and its local lane is stopped: a queued or not-yet-enqueued one is dequeued or fenced so it can
+never start, a running one is cancelled. A `remote-exec` that arrives later sees the drain and never starts its command. It waits
+(up to `--wait-ms`) for each ticket to publish, prints `stopped N, published M, still pending K` and exits 0 (1 only if the
+marker could not be written). `--root <dir>` overrides the remote root (tests).
+
+Each stopped ticket ends with `kind: "unfinished"` and a reason. `runner-shutdown` proves the job is dead, so the submitter runs
+it elsewhere; only a stop the runner can prove gets it: refused before it ran, unleased when the sweep ran, or a cancel that
+ended the command with every process confirmed gone (the local result's `stopProven`). Anything weaker (a supervisor that died
+with no result, an incomplete reap, a command that had already exited and was draining output) is `runner-shutdown-unproven`:
+possibly still running, never re-run. Such a record carries `shutdownBootId`; once the runner has rebooted, `remote-result`
+serves it as `runner-shutdown` with `provenBy: "reboot"`, since nothing from that boot survived. A job that completed on its
+own keeps its `completed` record, and a user cancel still reads `cancelled`.
 
 ### Returning files from a remote run (BRAIN-398)
 
@@ -2833,6 +2845,13 @@ journal `enqueue` (an eject keeps it; `remove`/`drop` resets it) to `landed`: p5
 listed apart. `--prs` takes `gh pr list --json number,mergedAt,closedAt,labels` output: run it with
 `--state merged --search 'merged:>=<since>'` and again with `--state closed --label train-landed
 --search 'closed:>=<since>'`, concatenate the arrays, and pass one file per repo (`repo=file,...`).
+
+### Runner losses: `lane report losses` (BRAIN-350)
+
+`lane report losses --since <iso> --until <iso> [--repo <a[,b]>] [--history <file>] [--json]` reads the history rows in
+`[since, until)` (by `startedAt`; every repo unless `--repo`) and prints, per runner: settled-lost rows by `reason` with the
+lane-hours spent before settling (`endedAt - startedAt`), re-dispatched rows by `redispatchReason` (one per runner in
+`redispatchedFrom`), and local fallbacks by `localReason: fallback:<reason>`, plus a total line. Rows without these fields are ignored.
 
 ### Where a remote run spends its time: `lane report phases` (BRAIN-530)
 

@@ -314,6 +314,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       elapsedMs: a.startedAt ? now - a.startedAt : null,
       orphaned: !supervisorAlive(a),
       moveInterrupted: !supervisorAlive(a) ? moveInterruptedLabel(a.id, a) : null,
+      awaitingProof: supervisorAlive(a) ? (a.awaitingProof ?? null) : null,
     }));
 
   const resourceBlock = computeResourceBlock(root, store, cfg, queue[0], held, now);
@@ -672,7 +673,7 @@ export function renderStatusText(status) {
       lines.push('  (none)');
     } else {
       for (const r of status.remote) {
-        const flag = r.moveInterrupted ? `  [${r.moveInterrupted}] — reconcile with: lane cancel ${r.id}` : r.orphaned ? `  [ORPHANED-REMOTE] — ${r.runner ? `reconciles automatically when ${r.runner} answers` : 'no runner recorded; settles on the next reconcile if it never dispatched'} (or: lane cancel ${r.id})` : '';
+        const flag = r.moveInterrupted ? `  [${r.moveInterrupted}] — reconcile with: lane cancel ${r.id}` : r.awaitingProof ? `  awaiting proof from ${r.awaitingProof.runner} since ${new Date(r.awaitingProof.since).toTimeString().slice(0, 5)} (dropped)` : r.orphaned ? `  [ORPHANED-REMOTE] — ${r.runner ? `reconciles automatically when ${r.runner} answers` : 'no runner recorded; settles on the next reconcile if it never dispatched'} (or: lane cancel ${r.id})` : '';
         lines.push(`  ${r.id}  runner=${r.runner ?? '-'}  phase=${r.phase}  elapsed=${fmtMs(r.elapsedMs)}${flag}`);
       }
     }

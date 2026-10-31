@@ -124,6 +124,10 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // BRAIN-594: a runner continuously unreachable this long has its unresolved remote attempts settled as lost (exit 75,
   // `runner-lost`) by reconcile. 0 disables the bound; `runners[].offline: true` settles at once instead.
   runnerLostAfterMs: 7_200_000,
+  // BRAIN-350: when a runner drops mid-job with no proof either way, the supervisor stays alive and asks reconcile this often
+  // (re-reading the config, so `runners[].offline: true` is seen) until the job is proven gone (offline flag, `runnerLostAfterMs`,
+  // a runner record) and then re-dispatches it to another runner. 0 = exit at once, leaving the attempt for a later reconcile.
+  remoteLostPollMs: 60_000,
   // BRAIN-623: the oldest lane-broker release a runner may run and still be placed on ("X.Y.Z"); a runner reporting less (or no)
   // version is skipped. null = no floor.
   runnerVersionFloor: null,
@@ -405,6 +409,7 @@ function validateGlobalConfig(cfg, sourcePath) {
     `${sourcePath}: "remoteRebindMinLocalWaitMs" must be a non-negative integer`,
   );
   assert(Number.isInteger(cfg.runnerLostAfterMs) && cfg.runnerLostAfterMs >= 0, `${sourcePath}: "runnerLostAfterMs" must be a non-negative integer`);
+  assert(Number.isInteger(cfg.remoteLostPollMs) && cfg.remoteLostPollMs >= 0, `${sourcePath}: "remoteLostPollMs" must be a non-negative integer`);
   assert(cfg.runnerVersionFloor === null || (typeof cfg.runnerVersionFloor === 'string' && VERSION_FLOOR_RE.test(cfg.runnerVersionFloor)), `${sourcePath}: "runnerVersionFloor" must be null or a version like "0.49.0"`);
   if (cfg.localWindow !== null) {
     const win = cfg.localWindow;

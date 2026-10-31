@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneSpawn, laneRun, gitFixture, waitFor, sleep, BIN } from './helpers.js';
 import { fenceLegacyQueue } from '../src/migrate.js';
 import { isPidAlive } from '../src/lease.js';
-import { enqueue, tryStart } from '../src/scheduler.js';
+import { enqueue, tryStart, listQueueStrict } from '../src/scheduler.js';
 import { writeLease, LEASE_STATE } from '../src/lease.js';
 import { stopSupersededTicket } from '../src/supervisor.js';
 import { releaseUnlessSettled } from '../src/run.js';
@@ -67,7 +67,7 @@ function push(fx, name, gateCmd, ref = PUSH_REF, gateArgs = '', work = fx.work, 
 
 const historyRows = (fx) => (fs.existsSync(fx.history) ? fs.readFileSync(fx.history, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
 const gateRows = (fx) => historyRows(fx).filter((r) => r.lane === 'prepush');
-const queuedRecords = (fx) => fs.readdirSync(paths(fx.state).queue).map((n) => JSON.parse(fs.readFileSync(path.join(paths(fx.state).queue, n), 'utf8')));
+const queuedRecords = (fx) => listQueueStrict(fx.state);
 const hasLease = (fx) => fs.existsSync(paths(fx.state).leases) && fs.readdirSync(paths(fx.state).leases).some((n) => n.endsWith('.json'));
 
 async function occupyCapacity(fx, seconds) {
@@ -345,8 +345,11 @@ test('a held ticket blocks no other ticket', async () => {
   const first = push(fx, 'first', 'sleep 6');
   await waitFor(() => hasLease(fx), { timeoutMs: 60_000 });
   await sleep(GATE_SECONDS_APART);
+  // A half-written atomicWriteFile temp sits in the queue folder until its rename; the listing must not parse it.
+  fs.mkdirSync(paths(fx.state).queue, { recursive: true });
+  fs.writeFileSync(path.join(paths(fx.state).queue, `.tmp-${process.pid}-inflight`), '');
   const held = push(fx, 'second', 'true', PUSH_REF, '', second);
-  await waitFor(() => fs.existsSync(paths(fx.state).queue) && queuedRecords(fx).some((r) => r.pushGate), { timeoutMs: 60_000 });
+  await waitFor(() => queuedRecords(fx).some((r) => r.pushGate), { timeoutMs: 60_000 });
   const unrelated = await laneRun(['run', '--repo', 'r', '--lane', 'other', '--', 'true'], { env: fx.env, cwd: fx.work });
   assert.equal(unrelated.code, 0);
   assert.equal(queuedRecords(fx).filter((r) => r.pushGate).length, 1, 'the held push is still queued');
