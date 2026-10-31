@@ -302,6 +302,8 @@ test('BRAIN-746 selectRunner: allowBusyQueue prefers an idle runner, then the fe
   res = await selectRunner(runnersOf('a', 'b'), { ...opts, sshBin: makeProbeMapSsh({ a: probe(0, sat), b: probe(1, sat) }) });
   assert.equal(res.runner.name, 'a', 'the fewest queued wins: a saturated empty runner beats one already queued 1 deep');
   assert.equal(res.queuedChoice, true);
+  res = await selectRunner(runnersOf('b', 'a'), { ...opts, sshBin: makeProbeMapSsh({ a: probe(0, sat), b: probe(1, sat) }) });
+  assert.equal(res.runner.name, 'a', 'and whatever order the runners are configured in');
   res = await selectRunner(runnersOf('a', 'b'), { ...opts, sshBin: makeProbeMapSsh({ a: probe(3, sat), b: probe(0, { capacity: { cpuCores: 2 }, ...sat }) }) });
   assert.equal(res.runner, null, 'over the cap, and one that can never fit the reservation');
 });
