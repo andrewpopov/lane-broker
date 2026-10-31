@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { laneRun, laneSpawn, waitFor, sleep } from './helpers.js';
+import { laneRun, laneSpawn, waitFor, sleep, writeGlobalConfig } from './helpers.js';
 import { tmpDir, setup, resultOf } from './remote-harness.js';
 import { readAttempt } from '../src/attempts.js';
-import { paths, atomicWriteJson, ensureStateDirs } from '../src/state.js';
+import { paths, atomicWriteJson, ensureStateDirs, tombstonePath } from '../src/state.js';
 
 /**
  * BRAIN-515 step 3: `lane wait <id>` on an ORPHANED-REMOTE ticket asks the runner instead of giving up. Same fake-ssh transport
@@ -201,4 +201,34 @@ test('a signal to lane wait on an orphan whose cancel cannot be confirmed: it ex
   } finally {
     child.kill('SIGKILL');
   }
+});
+
+test('withdrawing-move orphan: lane wait reconciles it to the settled exit 75 (not MOVE-INTERRUPTED 74); a destination that has the job keeps 74', async () => {
+  const ctx = setup();
+  const cfg = JSON.parse(fs.readFileSync(path.join(ctx.home, 'config.json'), 'utf8'));
+  const destRoot = tmpDir('wait-dest-root');
+  writeGlobalConfig(ctx.home, { ...cfg, runners: [...cfg.runners, { name: 'dest', ssh: 'normal', shell: 'sh -c', root: destRoot }] });
+  const stranded = () => {
+    const id = seedOrphan(ctx, { record: { kind: 'unfinished', reason: 'withdrawn' } });
+    const file = path.join(paths(ctx.state).attempts, `${id}.json`);
+    atomicWriteJson(file, { ...JSON.parse(fs.readFileSync(file, 'utf8')), moving: { from: 'skybox', to: 'dest', phase: 'withdrawing', at: 1234 } });
+    return id;
+  };
+
+  const held = stranded();
+  const heldDir = path.join(destRoot, 'tickets', held);
+  fs.mkdirSync(heldDir, { recursive: true });
+  fs.writeFileSync(path.join(heldDir, 'result.json'), JSON.stringify({ protocol: 1, ticketId: held, generation: 0, manifestHash: MANIFEST, ...completed(0) }));
+  const heldOut = await wait(ctx, held);
+  assert.equal(heldOut.code, 74, heldOut.stderr);
+  assert.match(heldOut.stderr, /MOVE-INTERRUPTED/);
+  assert.ok(readAttempt(ctx.state, held));
+
+  const id = stranded();
+  const out = await wait(ctx, id);
+  assert.equal(out.code, 75, out.stderr);
+  assert.match(out.stderr, /runner-never-started/);
+  assert.equal(resultOf(ctx.state, id).reason, 'runner-never-started');
+  assert.equal(readAttempt(ctx.state, id), null);
+  assert.ok(fs.existsSync(tombstonePath(destRoot, id)));
 });
