@@ -107,6 +107,8 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // load can make a big lane unsatisfiable even with nothing running).
   // 0 disables the exemption.
   resourceIdleOvershootCores: 1,
+  // BRAIN-740: how many cores over the CPU budget the one floor-slot push gate may project; 0 disables the floor slot.
+  floorOvershootCores: 6,
   // BRAIN-338: how many tickets may already be queued on the least-loaded
   // runner for a remote-eligible ticket to be queued there instead of
   // running locally -- only when this machine could not admit it right now
@@ -391,6 +393,10 @@ function validateGlobalConfig(cfg, sourcePath) {
   assert(
     Number.isFinite(cfg.resourceIdleOvershootCores) && cfg.resourceIdleOvershootCores >= 0,
     `${sourcePath}: "resourceIdleOvershootCores" must be a non-negative number`,
+  );
+  assert(
+    Number.isFinite(cfg.floorOvershootCores) && cfg.floorOvershootCores >= 0,
+    `${sourcePath}: "floorOvershootCores" must be a non-negative number`,
   );
   assert(
     Number.isInteger(cfg.maxRemoteQueue) && cfg.maxRemoteQueue >= 0,

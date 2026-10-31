@@ -1086,14 +1086,14 @@ export function selectCandidate(queue, held) {
   return null;
 }
 
-/** BRAIN-727: a ticket that runs on this Mac whatever the lanes do: queued locally by a lane that never goes remote. */
+/** BRAIN-727: a ticket that runs on this Mac whatever the lanes do: queued locally by a lane that never goes remote. BRAIN-740: stamped push gates only (submitted under a real git push, BRAIN-731). */
 function isFloorTicket(t) {
-  return !t.remote && !t.localReason && classOf(t) !== 'sim' && !isExclusive(t);
+  return Boolean(t.pushGate) && !t.remote && !t.localReason && classOf(t) !== 'sim' && !isExclusive(t);
 }
 
 /**
- * BRAIN-727 floor slot: the earliest lane-local ticket whose CPU projection, with the held leases charged, fits within
- * resourceIdleOvershootCores of the budget (the CPU gate's state is not judged), once the head cannot start. Pure over
+ * BRAIN-727 floor slot: the earliest local stamped push gate (the head included, BRAIN-740) whose CPU projection, with the held leases charged, fits within
+ * floorOvershootCores of the budget (the CPU gate's state is not judged), once the head cannot start. Pure over
  * the poll's inputs, so every polling supervisor names the same ticket. Null when the head can start or nobody qualifies.
  */
 export function floorWinner(cfg, queue, held, cpuSample, memInfo, gateClosed, loadGateClosed, weightCapacity) {
@@ -1102,12 +1102,12 @@ export function floorWinner(cfg, queue, held, cpuSample, memInfo, gateClosed, lo
   const cooldown = cooldownActive(held, cfg);
   const decide = (t, closed) => decideAdmission(cfg, t, held, cpuSample, memInfo, { closed }, cooldown);
   const runnable = (t) => !blockedBy(held, t) && runningWeight + t.weight <= weightCapacity && !elasticBelowFloor(t, cfg);
-  const withinOvershoot = (d) => d.memoryReason === 'ok' && d.cpuReason !== 'cooldown' && (d.admit || (Number.isFinite(d.projectedBusy) && d.projectedBusy - d.budget <= cfg.resourceIdleOvershootCores));
+  const withinOvershoot = (d) => d.memoryReason === 'ok' && d.cpuReason !== 'cooldown' && (d.admit || (Number.isFinite(d.projectedBusy) && d.projectedBusy - d.budget <= cfg.floorOvershootCores));
   const head = queue[0];
   const headDecision = decide(head, gateClosed);
   const headStarts = runnable(head) && (headDecision.admit || evaluateElasticAdmission(cfg, head, held, cpuSample, memInfo, headDecision) !== null || (held.length === 0 && headDecision.cpuReason === 'projected-over-budget' && withinOvershoot(headDecision)));
   if (headStarts) return null;
-  for (const t of queue.slice(1)) {
+  for (const t of queue) {
     if (!t || isExclusive(t)) return null;
     if (isFloorTicket(t) && runnable(t) && withinOvershoot(decide(t, false))) return t;
   }
@@ -1454,12 +1454,11 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
         shadow.captureError = err;
       }
     }
-    // BRAIN-727: a lane-local ticket behind a head that cannot start may take the floor slot; one floor lease at a time.
+    // BRAIN-727/740: a push gate (the head included) that cannot start ordinarily may take the floor slot; one floor lease at a time.
     const floorTrial =
       cfg.schedulerMode === 'active' &&
       !held.some((l) => l.floor === true) &&
-      cfg.resourceIdleOvershootCores > 0 &&
-      ticket.id !== headTicket.id &&
+      cfg.floorOvershootCores > 0 &&
       !headConflicted &&
       !safeBackfill &&
       isFloorTicket(queue[position]) &&

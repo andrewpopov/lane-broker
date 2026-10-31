@@ -438,3 +438,19 @@ test('PKG-277 remoteDepsCacheKeyFiles rejects bad shapes, a lane without the saf
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, remoteDepsCacheRootScriptsSafe: true, remoteDepsCacheKeyFiles: ['a.txt'], remoteExclude: ['docs/'] } } });
   assert.deepEqual(resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' }).remoteDepsCacheKeyFiles, ['a.txt']);
 });
+
+test('floorOvershootCores (BRAIN-740) defaults to 6, accepts 0 and rejects a negative', () => {
+  assert.equal(DEFAULT_GLOBAL_CONFIG.floorOvershootCores, 6);
+  for (const [value, ok] of [[0, true], [-1, false]]) {
+    const { home } = freshEnv();
+    writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 15, loadOpen: 11, loadOpenSamples: 3, sampleMs: 5000, floorOvershootCores: value });
+    const prevHome = process.env.LANE_BROKER_HOME;
+    process.env.LANE_BROKER_HOME = home;
+    try {
+      if (ok) assert.equal(loadGlobalConfig().floorOvershootCores, 0);
+      else assert.throws(() => loadGlobalConfig(), ConfigError);
+    } finally {
+      process.env.LANE_BROKER_HOME = prevHome;
+    }
+  }
+});
