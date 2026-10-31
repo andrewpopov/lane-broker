@@ -249,12 +249,16 @@ function neverFits(reservation, probe) {
  * `{runner, probe, skipped, queuedChoice: true}`. This only PICKS; whether
  * to queue there instead of running locally is the caller's call, and
  * nothing is dispatched here. 0 keeps the pre-BRAIN-338 behaviour exactly.
+ *
+ * `opts.allowBusyQueue` (BRAIN-746, default false; needs `maxRemoteQueue > 0`): a runner with an EMPTY queue but no headroom
+ * that statically fits also counts as a queued candidate (depth 0), and is preferred over a runner already queued deeper (fewest queued wins, as before).
+ * Only a ticket whose local queue is CPU-blocked asks for this; every other caller keeps `busy` as a non-choice.
  */
 export async function selectRunner(runners, opts = {}) {
   const deadlineMs = opts.deadlineMs ?? DEFAULT_GLOBAL_CONFIG.remoteProbeDeadlineMs;
   const retryTimedOut = new Set(opts.retryTimedOut ?? []);
   const sshBin = opts.sshBin ?? 'ssh';
-  const { env, requireProtocol2 = false, requireCapabilities = [], readinessNeeds = {}, reservation, maxRemoteQueue = 0, downRunners = {} } = opts;
+  const { env, requireProtocol2 = false, requireCapabilities = [], readinessNeeds = {}, reservation, maxRemoteQueue = 0, allowBusyQueue = false, downRunners = {} } = opts;
   const skipped = [];
   const readiness = {};
   const ready = [];
@@ -264,6 +268,7 @@ export async function selectRunner(runners, opts = {}) {
   let queuedBest = null;
   let busyBest = null; // passed every check except headroom, empty queue: its own broker would hold the ticket until it has room
   const better = (cand, best) => !best || cand.finish < best.finish || (cand.finish === best.finish && cand.cpuFree > best.cpuFree);
+  const fewerQueued = (cand, best) => !best || cand.probe.queued < best.probe.queued || (cand.probe.queued === best.probe.queued && better(cand, best));
   const now = opts.now ?? Date.now();
   for (const runner of runners) {
     if (runner.offline) {
@@ -358,7 +363,7 @@ export async function selectRunner(runners, opts = {}) {
       const queueable = Number.isInteger(probe.queued) && probe.queued > 0 && probe.queued <= maxRemoteQueue;
       if (fits && queueable) {
         const cand = { runner, probe, finish: estimatedFinish(reservation, probe, runner), cpuFree: 0 };
-        if (!queuedBest || cand.probe.queued < queuedBest.probe.queued || (cand.probe.queued === queuedBest.probe.queued && better(cand, queuedBest))) queuedBest = cand;
+        if (fewerQueued(cand, queuedBest)) queuedBest = cand;
       }
       continue;
     }
@@ -371,6 +376,7 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason });
       const cand = { runner, probe, finish: estimatedFinish(reservation, probe, runner), cpuFree };
       if (better(cand, busyBest)) busyBest = cand;
+      if (allowBusyQueue && maxRemoteQueue > 0 && fewerQueued(cand, queuedBest)) queuedBest = cand;
       continue;
     }
     const cand = { runner, probe, finish: estimatedFinish(reservation, probe, runner), cpuFree };

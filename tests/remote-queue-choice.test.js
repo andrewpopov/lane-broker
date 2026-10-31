@@ -278,3 +278,32 @@ test('selectRunner: an unenforced runner with only discounted room loses to an e
   assert.equal(res.runner.name, 'fast');
   assert.equal(res.queuedChoice, true);
 });
+
+test('BRAIN-746 selectRunner: allowBusyQueue admits a saturated empty-queue runner as a queued choice; without it, or with maxRemoteQueue 0, it stays `busy`', async () => {
+  const reservation = { weight: 1, cpuCores: 4, memoryBytes: 1e9 };
+  const sshBin = makeProbeMapSsh({ a: probe(0, { headroom: { cpuCores: 0, memoryBytes: 1e12 } }) });
+  const withOpt = await selectRunner(runnersOf('a'), { sshBin, deadlineMs: 3000, maxRemoteQueue: 2, allowBusyQueue: true, reservation });
+  assert.equal(withOpt.runner.name, 'a');
+  assert.equal(withOpt.queuedChoice, true);
+  for (const opts of [{ maxRemoteQueue: 2 }, { maxRemoteQueue: 0, allowBusyQueue: true }]) {
+    const res = await selectRunner(runnersOf('a'), { sshBin, deadlineMs: 3000, reservation, ...opts });
+    assert.equal(res.runner, null, JSON.stringify(opts));
+    assert.equal(res.busy.runner.name, 'a');
+  }
+});
+
+test('BRAIN-746 selectRunner: allowBusyQueue prefers an idle runner, then the fewest queued, and never admits one that can never fit or is over the cap', async () => {
+  const reservation = { weight: 1, cpuCores: 4, memoryBytes: 1e9 };
+  const sat = { headroom: { cpuCores: 0, memoryBytes: 1e12 } };
+  const opts = { deadlineMs: 3000, maxRemoteQueue: 2, allowBusyQueue: true, reservation };
+  let res = await selectRunner(runnersOf('a', 'b'), { ...opts, sshBin: makeProbeMapSsh({ a: probe(0, sat), b: probe(0, { headroom: { cpuCores: 8, memoryBytes: 1e12 } }) }) });
+  assert.equal(res.runner.name, 'b');
+  assert.equal(res.queuedChoice, undefined);
+  res = await selectRunner(runnersOf('a', 'b'), { ...opts, sshBin: makeProbeMapSsh({ a: probe(0, sat), b: probe(1, sat) }) });
+  assert.equal(res.runner.name, 'a', 'the fewest queued wins: a saturated empty runner beats one already queued 1 deep');
+  assert.equal(res.queuedChoice, true);
+  res = await selectRunner(runnersOf('b', 'a'), { ...opts, sshBin: makeProbeMapSsh({ a: probe(0, sat), b: probe(1, sat) }) });
+  assert.equal(res.runner.name, 'a', 'and whatever order the runners are configured in');
+  res = await selectRunner(runnersOf('a', 'b'), { ...opts, sshBin: makeProbeMapSsh({ a: probe(3, sat), b: probe(0, { capacity: { cpuCores: 2 }, ...sat }) }) });
+  assert.equal(res.runner, null, 'over the cap, and one that can never fit the reservation');
+});

@@ -8,6 +8,7 @@ import { enqueue, listQueue, withdrawQueued, restoreQueued } from '../src/schedu
 import { readAttempt } from '../src/attempts.js';
 import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig, ConfigError } from '../src/config.js';
 import { paths, atomicWriteJson } from '../src/state.js';
+import { detectResourceCapacity } from '../src/resources.js';
 import { fenceLegacyQueue } from '../src/migrate.js';
 
 /**
@@ -90,7 +91,8 @@ if (command.includes('remote-probe')) {
     const p = JSON.parse(res.stdout.trim());
     p.queued = mode.queued;
     p.running = 0;
-    p.headroom = { cpuCores: mode.queued > 0 ? 0 : 64, memoryBytes: 1e12 };
+    p.headroom = { cpuCores: mode.cpuCores ?? (mode.queued > 0 ? 0 : 64), memoryBytes: 1e12 };
+    if (mode.paused === false) p.paused = false;
     process.stdout.write(JSON.stringify(p) + '\\n');
     process.exit(res.status == null ? 1 : res.status);
   }
@@ -270,6 +272,38 @@ const cmd = argv[argv.length - 1] || '';
     const result = await waitResult(ctx, id);
     assert.equal(result.executor, 'remote');
     assert.equal(readCapturedHeader(captureFile).priorityRequested, 'high', 'the header carries the re-tiered tier, not the one the supervisor cached at submit');
+  } finally {
+    hold.release();
+    await hold.done;
+  }
+});
+
+test('BRAIN-746: blocked local rebind queues on zero-headroom empty runner exactly once', { timeout: 120_000 }, async () => {
+  const ctx = queuedRunnerCtx({ config: { remoteRebindMinLocalWaitMs: 600_000, maxRemoteQueue: 2 } });
+  const ran = path.join(tmpDir('queued-ran'), 'ran');
+  const { cpuCores } = detectResourceCapacity();
+  const runnerPause = path.join(ctx.runnerState, 'PAUSE');
+  fs.mkdirSync(ctx.runnerState, { recursive: true });
+  fs.writeFileSync(runnerPause, 'hold runner admission');
+  ctx.setMode({ queued: 0, cpuCores: 0, paused: false }); // saturated, empty queue
+  const hold = await holdLaneLocally(ctx);
+  const id = await detach(ctx, recordingCmd(ran));
+  await waitFor(() => queuedIds(ctx.state).includes(id), { timeoutMs: 30_000 });
+  await sleep(1200);
+  assert.deepEqual(queuedIds(ctx.state), [id], 'without external CPU evidence the ticket stays local');
+  assert.equal(ctx.execCommands().length, 0);
+  fs.writeFileSync(paths(ctx.state).cpuSample, JSON.stringify({ lastValid: { at: Date.now(), hostBusyCores: cpuCores, cores: cpuCores } }));
+  fs.writeFileSync(paths(ctx.state).cpuGate, JSON.stringify({ closed: true, consecutiveUnder: 0 }));
+  try {
+    await waitFor(() => ctx.execCommands().length === 1, { timeoutMs: 60_000 });
+    assert.deepEqual(queuedIds(ctx.state), [], 'the runner owns the ticket now');
+    assert.deepEqual(linesOf(ran), [], 'nothing executed while the runner holds admission');
+    assert.match(ctx.admissionLog(), new RegExp(`remote-rebind: ${id}: local blocked`));
+    fs.rmSync(runnerPause);
+    const result = await waitResult(ctx, id);
+    assert.equal(result.executor, 'remote');
+    assert.deepEqual(linesOf(ran), ['remote'], 'executed exactly once, on the runner');
+    assert.equal(ctx.execCommands().length, 1);
   } finally {
     hold.release();
     await hold.done;
