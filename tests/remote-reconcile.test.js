@@ -799,6 +799,22 @@ test('withdrawing move fence: the move advancing to dispatching between the read
   assert.deepEqual(historyRows(ctx.state), []);
 });
 
+test('withdrawing move fence: a supervisor found alive between the read and the publish is not settled', async () => {
+  const ctx = context();
+  const destRoot = addDestination(ctx);
+  const id = seedOrphan(ctx, { record: WITHDRAWN, attempt: strandedAttempt() });
+  const attemptFile = path.join(paths(ctx.state).attempts, `${id}.json`);
+  const live = { pid: process.pid, startTime: processStartTime(process.pid), bootId: 'a-different-boot', kernelBootId: kernelBootId() };
+  const revive = `const a = JSON.parse(fs.readFileSync(${JSON.stringify(attemptFile)}, 'utf8')); fs.writeFileSync(${JSON.stringify(attemptFile)}, JSON.stringify({ ...a, supervisor: ${JSON.stringify(live)} }));`;
+  const ssh = twoHostSsh(ctx, destRoot, { afterDestCancel: revive });
+  const outcome = await reconcile(ctx, id, { sshBin: ssh.bin });
+  assert.equal(outcome.settled, false, JSON.stringify(outcome));
+  assert.equal(outcome.state, 'skipped');
+  assert.equal(resultOf(ctx.state, id), null, 'no result may be published over a live supervisor');
+  assert.deepEqual(readAttempt(ctx.state, id).supervisor, live);
+  assert.deepEqual(historyRows(ctx.state), []);
+});
+
 test('withdrawing move: a repaired ticket id is asked of the source only; the destination is asked for, and tombstoned under, the lane id', async () => {
   const ctx = context();
   const destRoot = addDestination(ctx);
