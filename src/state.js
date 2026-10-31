@@ -1036,6 +1036,7 @@ export async function withLock(root, fn, { timeoutMs, pollMs = 25, lockPath = pa
 }
 
 let cachedBootId = process.env.LANE_BROKER_BOOT_ID || null;
+let cachedKernelBootId = null;
 
 /** A boot identifier that changes across a reboot: darwin sysctl, linux /proc/stat btime,
  *  or a computed epoch-boot-time fallback derived from os.uptime(). The fallback is rounded
@@ -1068,16 +1069,18 @@ export function bootId() {
   return cachedBootId;
 }
 
-/** The kernel's own boot id: unlike `bootId` (linux btime) it does not move when the wall clock is corrected, so a reboot PROOF uses it.
- *  `LANE_BROKER_KERNEL_BOOT_ID` overrides (tests); null where the host exposes none (darwin), and nothing may then be proven by a reboot. */
+/** The kernel's own boot id: unlike `bootId` (linux btime, darwin kern.boottime) it does not move when the wall clock is corrected, so a reboot PROOF uses it.
+ *  linux /proc boot_id, darwin `kern.bootsessionuuid`. `LANE_BROKER_KERNEL_BOOT_ID` overrides (tests); null where the host exposes none, and nothing may then be proven by a reboot. */
 export function kernelBootId() {
   if (process.env.LANE_BROKER_KERNEL_BOOT_ID) return process.env.LANE_BROKER_KERNEL_BOOT_ID;
-  if (process.platform !== 'linux') return null;
+  if (cachedKernelBootId) return cachedKernelBootId;
   try {
-    return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null;
+    if (process.platform === 'linux') cachedKernelBootId = fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim() || null;
+    else if (process.platform === 'darwin') cachedKernelBootId = execFileSync('sysctl', ['-n', 'kern.bootsessionuuid'], { encoding: 'utf8' }).trim() || null;
   } catch {
     return null;
   }
+  return cachedKernelBootId;
 }
 
 /** Test-only access to the lock takeover's internal steps, so tests can drive the CAS directly instead of racing real processes. Not part of the public API. */

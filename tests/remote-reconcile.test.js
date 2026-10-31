@@ -7,7 +7,7 @@ import { laneRun, waitFor, sleep } from './helpers.js';
 import { tmpDir, setup, resultOf, linesOf, makeFakeSshBin, makeRunner, clientEnv, makeGitWorktree, makeDispatchArgs } from './remote-harness.js';
 import { readAttempt } from '../src/attempts.js';
 import { cancelAttempt } from '../src/cancel.js';
-import { paths, atomicWriteJson, writeCancelMarkerFile, ensureStateDirs, withLock, tombstonePath, bootId, RUNNER_SHUTDOWN_REASON } from '../src/state.js';
+import { paths, atomicWriteJson, writeCancelMarkerFile, ensureStateDirs, withLock, tombstonePath, bootId, kernelBootId, RUNNER_SHUTDOWN_REASON } from '../src/state.js';
 import { readUnreachable, recordContact } from '../src/runner-unreachable.js';
 import { reapStale } from '../src/scheduler.js';
 import { dispatchRemote } from '../src/remote-client.js';
@@ -576,7 +576,7 @@ for (const [name, onBinding] of [
 const HOUR = 3_600_000;
 const WITHDRAWN = { kind: 'unfinished', reason: 'withdrawn' };
 const withdrawingMove = () => ({ from: 'skybox', to: 'dest', phase: 'withdrawing', at: 1234 });
-const thisBootDead = () => ({ ...DEAD_SUPERVISOR, bootId: bootId() });
+const thisBootDead = () => ({ ...DEAD_SUPERVISOR, bootId: bootId(), kernelBootId: kernelBootId() });
 const strandedAttempt = (extra = {}) => ({ supervisor: thisBootDead(), moving: withdrawingMove(), ...extra });
 
 /** A second runner `dest` (its own root, so its tickets differ from skybox's) in the client config; returns its root. */
@@ -847,7 +847,26 @@ test('withdrawing move: a destination ticket dir with no job or record (withdraw
 test('withdrawing move whose supervisor died in an earlier boot is skipped: no host contacted, attempt kept (stays cancel-only)', async () => {
   const ctx = context();
   const destRoot = addDestination(ctx);
-  const id = seedOrphan(ctx, { record: WITHDRAWN, attempt: strandedAttempt({ supervisor: { ...DEAD_SUPERVISOR, bootId: 'an-earlier-boot' } }) });
+  const id = seedOrphan(ctx, { record: WITHDRAWN, attempt: strandedAttempt({ supervisor: { ...DEAD_SUPERVISOR, bootId: 'an-earlier-boot', kernelBootId: 'an-earlier-kernel-boot' } }) });
+  const ssh = twoHostSsh(ctx, destRoot);
+  assertHeld(ctx, id, await reconcile(ctx, id, { sshBin: ssh.bin }), 'skipped');
+  assert.deepEqual(ssh.calls(), []);
+});
+
+test('withdrawing move: the same bootId but a different kernelBootId is skipped, no host contacted', async () => {
+  const ctx = context();
+  const destRoot = addDestination(ctx);
+  const id = seedOrphan(ctx, { record: WITHDRAWN, attempt: strandedAttempt({ supervisor: { ...thisBootDead(), kernelBootId: 'another-kernel-boot' } }) });
+  const ssh = twoHostSsh(ctx, destRoot);
+  assertHeld(ctx, id, await reconcile(ctx, id, { sshBin: ssh.bin }), 'skipped');
+  assert.deepEqual(ssh.calls(), []);
+});
+
+test('withdrawing move: an attempt with no kernelBootId is skipped, no host contacted', async () => {
+  const ctx = context();
+  const destRoot = addDestination(ctx);
+  const { kernelBootId: _omitted, ...supervisor } = thisBootDead();
+  const id = seedOrphan(ctx, { record: WITHDRAWN, attempt: strandedAttempt({ supervisor }) });
   const ssh = twoHostSsh(ctx, destRoot);
   assertHeld(ctx, id, await reconcile(ctx, id, { sshBin: ssh.bin }), 'skipped');
   assert.deepEqual(ssh.calls(), []);

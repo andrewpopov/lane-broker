@@ -6,7 +6,7 @@ import path from 'node:path';
 import { laneRun, laneSpawn, waitFor, sleep, writeGlobalConfig } from './helpers.js';
 import { tmpDir, setup, resultOf } from './remote-harness.js';
 import { readAttempt } from '../src/attempts.js';
-import { paths, atomicWriteJson, ensureStateDirs, tombstonePath, bootId } from '../src/state.js';
+import { paths, atomicWriteJson, ensureStateDirs, tombstonePath, bootId, kernelBootId } from '../src/state.js';
 
 /**
  * BRAIN-515 step 3: `lane wait <id>` on an ORPHANED-REMOTE ticket asks the runner instead of giving up. Same fake-ssh transport
@@ -211,7 +211,7 @@ test('withdrawing-move orphan: lane wait reconciles it to the settled exit 75 (n
   const stranded = () => {
     const id = seedOrphan(ctx, { record: { kind: 'unfinished', reason: 'withdrawn' } });
     const file = path.join(paths(ctx.state).attempts, `${id}.json`);
-    atomicWriteJson(file, { ...JSON.parse(fs.readFileSync(file, 'utf8')), supervisor: { ...DEAD_SUPERVISOR, bootId: bootId() }, moving: { from: 'skybox', to: 'dest', phase: 'withdrawing', at: 1234 } });
+    atomicWriteJson(file, { ...JSON.parse(fs.readFileSync(file, 'utf8')), supervisor: { ...DEAD_SUPERVISOR, bootId: bootId(), kernelBootId: kernelBootId() }, moving: { from: 'skybox', to: 'dest', phase: 'withdrawing', at: 1234 } });
     return id;
   };
 

@@ -53,6 +53,19 @@ test('createAttempt records the submitter logPath and cwd (BRAIN-462: a crashed 
   assert.equal(Object.hasOwn(bare, 'logPath'), false, 'absent when not supplied');
 });
 
+test('createAttempt stores the supervisor kernelBootId, and omits it when the host has none', async () => {
+  const { state } = freshEnv();
+  const saved = process.env.LANE_BROKER_KERNEL_BOOT_ID;
+  process.env.LANE_BROKER_KERNEL_BOOT_ID = 'kernel-boot-xyz';
+  try {
+    assert.equal((await createAttempt(state, 'with-kernel-boot', {})).supervisor.kernelBootId, 'kernel-boot-xyz');
+    assert.equal(readAttempt(state, 'with-kernel-boot').supervisor.kernelBootId, 'kernel-boot-xyz');
+  } finally {
+    if (saved === undefined) delete process.env.LANE_BROKER_KERNEL_BOOT_ID;
+    else process.env.LANE_BROKER_KERNEL_BOOT_ID = saved;
+  }
+});
+
 test('listAttempts lists every record present, and an empty state dir lists none', async () => {
   const { state } = freshEnv();
   assert.deepEqual(listAttempts(state), []);

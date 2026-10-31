@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
+import { isPidAlive } from '../../src/process-liveness.js';
 
 /**
  * The one way a test makes a scratch directory (BRAIN-420). Every dir is removed again when the
@@ -52,23 +53,42 @@ export function removeTmpDir(dir) {
 const SETTLE_MS = 2000;
 const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
+// pids of other processes whose argv or environment names one of our dirs. A process matches only by naming a
+// mkdtemp path unique to this run; this process and its ancestors are never returned.
 function processesMentioning(dirs) {
   let listing;
   try {
-    listing = execFileSync('ps', ['axeww', '-o', 'pid=,command='], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
+    listing = execFileSync('ps', ['axeww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
   } catch {
-    return 0;
+    return [];
   }
-  return listing.split('\n').filter((line) => {
-    const pid = Number.parseInt(line, 10);
-    return pid && pid !== process.pid && dirs.some((dir) => line.includes(dir));
-  }).length;
+  const rows = listing.split('\n').map((line) => {
+    const [pid, ppid] = line.trim().split(/\s+/, 2).map(Number);
+    return { pid, ppid, line };
+  }).filter((row) => row.pid);
+  const parentOf = new Map(rows.map((row) => [row.pid, row.ppid]));
+  const protectedPids = new Set([process.pid]);
+  for (let pid = parentOf.get(process.pid); pid > 1 && !protectedPids.has(pid); pid = parentOf.get(pid)) protectedPids.add(pid);
+  return rows.filter((row) => !protectedPids.has(row.pid) && dirs.some((dir) => row.line.includes(dir))).map((row) => row.pid);
+}
+
+function killStragglers(pids) {
+  for (const pid of pids) {
+    try {
+      process.kill(pid, 'SIGKILL');
+    } catch {
+      // already gone
+    }
+  }
+  const deadline = Date.now() + 1000;
+  while (Date.now() < deadline && pids.some(isPidAlive)) sleepMs(25);
 }
 
 function removeAll() {
   const dirs = [...created];
   const deadline = Date.now() + SETTLE_MS;
-  while (Date.now() < deadline && processesMentioning(dirs) > 0) sleepMs(100);
+  while (Date.now() < deadline && processesMentioning(dirs).length > 0) sleepMs(100);
+  killStragglers(processesMentioning(dirs));
   for (const dir of dirs) removeTmpDir(dir);
   created.clear();
 }

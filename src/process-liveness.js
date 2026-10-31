@@ -44,6 +44,6 @@ export function isProcessAlive(pid, startTime) {
   if (!startTime) return true; // couldn't capture a start time at write time; fall back to pid-alive
   const current = processStartTime(pid);
   if (current === undefined) return true; // probe failed: fail closed
-  if (current === null) return false; // confirmed gone
+  if (current === null) return isPidAlive(pid); // `ps` alone cannot declare a pid that kill(0) just saw alive dead
   return current === startTime;
 }
