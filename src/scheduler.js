@@ -20,7 +20,7 @@ import { isExclusive, exclusiveDeny, isExclusiveHead, exclusiveLeaseFields, with
 import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, resolveLaneNice, effectiveNice, effectiveRank, score, tierRank, waitedMs } from './priority.js';
 import { loadExpressTable, expressVerdict, expressAdmissionsLastMinute, recordExpressAdmission, logExpressAdmission } from './express.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
-import { isRepeatOfPush, pushOrder, pushHolds, PUSH_GATE_LANE } from './push-gate.js';
+import { isRepeatOfPush, pushOrder, pushHolds } from './push-gate.js';
 import { resolveScheduler, resolveSchedulerDetailed, legacyStore, fairnessStore, effectiveView, readSchedulerFence } from './fairness.js';
 import { detectResourceCapacity, effectiveWeightCapacity, exclusiveBudget, cpuBudgetCores, evaluateMemoryAdmission, leaseResources, resolveTicketResources, terminalRowDefaults, capElasticClaim, elasticBelowFloor, elasticClaimRange } from './resources.js';
 
@@ -1086,13 +1086,13 @@ export function selectCandidate(queue, held) {
   return null;
 }
 
-/** BRAIN-727: a ticket that runs on this Mac whatever the lanes do: queued locally by a lane that never goes remote. BRAIN-740: push gates only. */
+/** BRAIN-727: a ticket that runs on this Mac whatever the lanes do: queued locally by a lane that never goes remote. BRAIN-740: stamped push gates only (submitted under a real git push, BRAIN-731). */
 function isFloorTicket(t) {
-  return PUSH_GATE_LANE.test(t.lane ?? '') && !t.remote && !t.localReason && classOf(t) !== 'sim' && !isExclusive(t);
+  return Boolean(t.pushGate) && !t.remote && !t.localReason && classOf(t) !== 'sim' && !isExclusive(t);
 }
 
 /**
- * BRAIN-727 floor slot: the earliest local push-gate ticket (the head included, BRAIN-740) whose CPU projection, with the held leases charged, fits within
+ * BRAIN-727 floor slot: the earliest local stamped push gate (the head included, BRAIN-740) whose CPU projection, with the held leases charged, fits within
  * floorOvershootCores of the budget (the CPU gate's state is not judged), once the head cannot start. Pure over
  * the poll's inputs, so every polling supervisor names the same ticket. Null when the head can start or nobody qualifies.
  */
