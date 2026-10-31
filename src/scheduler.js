@@ -1459,8 +1459,6 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       cfg.schedulerMode === 'active' &&
       !held.some((l) => l.floor === true) &&
       cfg.floorOvershootCores > 0 &&
-      !headConflicted &&
-      !safeBackfill &&
       isFloorTicket(queue[position]) &&
       queue.slice(0, position).every((t) => t && !isExclusive(t));
     if (!candidate) {
@@ -1474,7 +1472,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       if (ticket.id !== headTicket.id && !floorTrial) {
         return { result: { started: false, reason: 'not-head', position: position + 1, queueLength: queue.length } };
       }
-      if (headConflicted) {
+      if (headConflicted && !(floorTrial && ticket.id !== headTicket.id)) {
         return { result: { started: false, reason: 'conflict', with: blocker.id, key: blocker.key } };
       }
       // headCapacityBlocked, and this poll's own ticket IS the head: fall
@@ -1727,7 +1725,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       };
     }
     let recorded = null;
-    if (ticket.id !== headTicket.id && headConflicted && !safeBackfill && !headBypass) {
+    if (ticket.id !== headTicket.id && headConflicted && !safeBackfill && !headBypass && !floorAdmit) {
       // This ticket is genuinely skipping ahead of the still-blocked head —
       // count it toward conflictSkipLimit above. Fail CLOSED: if the count
       // can't be durably recorded, refuse the skip rather than let it
@@ -1830,7 +1828,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     writeLease(root, lease);
     touchSimArmFor(root, lease, now);
     clearExternalStarved(root);
-    if (safeBackfill) {
+    if (safeBackfill && !floorAdmit) {
       logHeadBlock(root, {
         event: 'safe-backfill',
         headId: headTicket.id,

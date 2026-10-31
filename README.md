@@ -1680,7 +1680,8 @@ forced `--local`; never `sim` or exclusive). The head may take it as well as a
 ticket behind a blocked head: the earliest such ticket in selection order whose
 projection, held leases charged as usual, is within `floorOvershootCores`
 (default 6; `0` disables the floor slot) of the budget and whose memory admits.
-Ordinary lanes and hand-run tests never use it. A closed CPU gate is judged by the projection
+Ordinary lanes and hand-run tests never use it. A head waiting on a conflict
+does not disable it, and the floor start spends none of the head's conflict skip allowance. A closed CPU gate is judged by the projection
 alone; a push held by BRAIN-731 is never chosen. At most one floor lease exists
 at a time (`floor: true` on the lease; an orphaned one counts). It spends no
 skip, express or yield allowance, and is logged `floor=1` with

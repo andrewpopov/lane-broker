@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { freshEnv } from './helpers.js';
-import { enqueue, tryStart, listQueue } from '../src/scheduler.js';
+import { enqueue, tryStart, listQueue, readSkipState } from '../src/scheduler.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { writeLease, listLeases, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths, readJsonSafe } from '../src/state.js';
@@ -275,4 +275,37 @@ test('floor slot (BRAIN-740): a hand-run prepush-lane ticket without a pushGate 
   assert.equal(result.started, false);
   assert.notEqual(result.floor, true);
   assert.deepEqual(listLeases(state), []);
+});
+
+const conflictCfg = { ...cfg, conflictSkipLimit: 0 };
+const conflictLease = (state) =>
+  writeLease(state, { id: 'blocker', key: 'k:head', bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight: 1, state: LEASE_STATE.RUNNING });
+const pollConflicted = (state, t, ext) => tryStart(state, t, conflictCfg, undefined, sampler(ext), undefined, memory());
+
+test('floor slot (BRAIN-740): a push gate of another repo starts via the floor behind a conflict-blocked head with its skip allowance exhausted', async () => {
+  const { state } = freshEnv();
+  const head = ticket('head', { key: 'k:head', lane: 'local', pushGate: undefined });
+  const gate = ticket('gate');
+  await queueAll(state, [head, gate]);
+  conflictLease(state);
+  assert.equal((await pollConflicted(state, head, 10)).started, false);
+  const result = await pollConflicted(state, gate, 10);
+  assert.equal(result.started, true);
+  assert.equal(result.floor, true);
+  assert.deepEqual(listLeases(state).map((l) => [l.id, l.floor]).sort(), [['blocker', undefined], ['gate', true]]);
+  assert.equal(readSkipState(state).count, 0, 'the head conflict skip count is unchanged');
+  assert.deepEqual(listQueue(state).map((t) => t.id), ['head']);
+});
+
+test('floor slot (BRAIN-740): a push gate that itself conflicts with a held lease does not take the floor behind a conflicted head', async () => {
+  const { state } = freshEnv();
+  const head = ticket('head', { key: 'k:head', lane: 'local', pushGate: undefined });
+  const gate = ticket('gate', { key: 'k:head' });
+  await queueAll(state, [head, gate]);
+  conflictLease(state);
+  assert.equal((await pollConflicted(state, head, 10)).started, false);
+  const result = await pollConflicted(state, gate, 10);
+  assert.equal(result.started, false);
+  assert.notEqual(result.floor, true);
+  assert.deepEqual(listLeases(state).map((l) => l.id), ['blocker']);
 });
