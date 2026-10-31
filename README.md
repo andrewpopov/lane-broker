@@ -572,6 +572,10 @@ What a remote run does:
    (its queue is non-empty, or a conflict, capacity, pause, load-gate,
    cooldown or memory check refuses it); otherwise the run stays local.
    A runner with room always beats any runner queue.
+   BRAIN-746: a ticket back in the local queue whose rebind finds this machine CPU-blocked (fresh host load outside
+   any lease leaves no admissible slot) may also queue on a runner that statically fits it but has no headroom and an
+   EMPTY queue (depth 0; the fewest queued still wins), when `maxRemoteQueue` > 0. Any other placement leaves such a
+   runner as `busy`, as before.
    A queued ticket whose supervisor is provably dead (pid gone, start time changed, or a different boot; an
    indeterminate probe counts as alive) is an orphan, e.g. after a runner reboot. It is reaped under the broker
    lock by every admission poll, `lane status` and `remote-probe`, so it never holds a `maxRemoteQueue` slot: it

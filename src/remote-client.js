@@ -249,12 +249,16 @@ function neverFits(reservation, probe) {
  * `{runner, probe, skipped, queuedChoice: true}`. This only PICKS; whether
  * to queue there instead of running locally is the caller's call, and
  * nothing is dispatched here. 0 keeps the pre-BRAIN-338 behaviour exactly.
+ *
+ * `opts.allowBusyQueue` (BRAIN-746, default false; needs `maxRemoteQueue > 0`): a runner with an EMPTY queue but no headroom
+ * that statically fits also counts as a queued candidate (depth 0), and is preferred over a runner already queued deeper (fewest queued wins, as before).
+ * Only a ticket whose local queue is CPU-blocked asks for this; every other caller keeps `busy` as a non-choice.
  */
 export async function selectRunner(runners, opts = {}) {
   const deadlineMs = opts.deadlineMs ?? DEFAULT_GLOBAL_CONFIG.remoteProbeDeadlineMs;
   const retryTimedOut = new Set(opts.retryTimedOut ?? []);
   const sshBin = opts.sshBin ?? 'ssh';
-  const { env, requireProtocol2 = false, requireCapabilities = [], readinessNeeds = {}, reservation, maxRemoteQueue = 0, downRunners = {} } = opts;
+  const { env, requireProtocol2 = false, requireCapabilities = [], readinessNeeds = {}, reservation, maxRemoteQueue = 0, allowBusyQueue = false, downRunners = {} } = opts;
   const skipped = [];
   const readiness = {};
   const ready = [];
@@ -371,6 +375,7 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason });
       const cand = { runner, probe, finish: estimatedFinish(reservation, probe, runner), cpuFree };
       if (better(cand, busyBest)) busyBest = cand;
+      if (allowBusyQueue && maxRemoteQueue > 0 && (!queuedBest || (queuedBest.probe.queued === 0 && better(cand, queuedBest)))) queuedBest = cand;
       continue;
     }
     const cand = { runner, probe, finish: estimatedFinish(reservation, probe, runner), cpuFree };

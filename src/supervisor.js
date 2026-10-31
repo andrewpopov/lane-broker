@@ -646,10 +646,10 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome(), cpu
  * The ONE builder of `selectRunner` options for the three placement paths ('place' a first attempt, 'rebind' a locally queued
  * ticket, 'rebalance' a queued remote one), so what every path must carry (BRAIN-597's `downRunners`) cannot be dropped by one.
  */
-export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHome(), stuckLocally = false, draining = false, cpuLimit } = {}) {
+export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHome(), stuckLocally = false, localBlocked = false, draining = false, cpuLimit } = {}) {
   const base = remoteSelectOptions(enriched, globalCfg, root, cpuLimit);
   // a move or rebind picks a better home for a ticket that already has one
-  if (kind === 'rebind') return { ...base, maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0 };
+  if (kind === 'rebind') return { ...base, maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0, allowBusyQueue: localBlocked };
   if (kind === 'rebalance') {
     return { ...base, maxRemoteQueue: 0, requireCapabilities: draining ? [...base.requireCapabilities, REMOTE_WITHDRAW_CAPABILITY] : base.requireCapabilities };
   }
@@ -1667,7 +1667,7 @@ async function main() {
     // An idle runner is always taken; a runner that is itself queued (up to maxRemoteQueue) only for a ticket stuck locally long enough.
     const waitedMs = Date.now() - (readQueuedRecord(root, ticket.id)?.localSince ?? Date.now());
     const stuckLocally = localBlocked || (globalCfg.remoteRebindMinLocalWaitMs > 0 && waitedMs >= globalCfg.remoteRebindMinLocalWaitMs);
-    const { runner, probe, queuedChoice } = await selectRunner(candidates, selectionOptionsFor('rebind', enriched, globalCfg, { stuckLocally, root, cpuLimit }));
+    const { runner, probe, queuedChoice } = await selectRunner(candidates, selectionOptionsFor('rebind', enriched, globalCfg, { stuckLocally, localBlocked, root, cpuLimit }));
     if (!runner) return;
     // BRAIN-548: a speed-aware ticket moves only when the runner is now expected to finish it sooner than waiting here does.
     const speed = speedInputs(root, enriched);
