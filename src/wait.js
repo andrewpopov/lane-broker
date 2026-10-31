@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { ensureStateDirs, paths, readJsonSafe } from './state.js';
 import { readLease, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
-import { readAttempt, supervisorAlive, moveInterruptedLabel } from './attempts.js';
+import { readAttempt, supervisorAlive, moveInterruptedLabel, isStrandedWithdrawingMove } from './attempts.js';
 import { cancelCommand } from './cancel.js';
 import { loadGlobalConfigOrError } from './config.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
@@ -144,8 +144,14 @@ export async function waitCommand(id, { timeoutMs } = {}) {
         const settledAttempt = readAttempt(root, id);
         if (settledAttempt && !supervisorAlive(settledAttempt)) {
           const moveLabel = moveInterruptedLabel(id, settledAttempt);
+          const reconcilableMove = isStrandedWithdrawingMove(settledAttempt);
           // BRAIN-605: a post-fallback attempt that never reached admission is settled (exit 75) rather than reported forever
           if (!moveLabel && settledAttempt.executor === 'local' && (await settleAbandonedLocalAttempt(root, id)).settled) continue;
+          if (reconcilableMove) {
+            const outcome = await reconcileOrphan(root, id, deadline);
+            if (outcome.settled) continue;
+            if (outcome.timedOut || (deadline && Date.now() > deadline)) return timedOutResult();
+          }
           if (moveLabel || settledAttempt.executor !== 'remote') {
             const label = moveLabel ?? 'ORPHANED (post-fallback)';
             process.stderr.write(

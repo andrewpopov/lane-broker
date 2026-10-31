@@ -110,6 +110,12 @@ export function moveInterruptedLabel(id, attempt) {
   return `MOVE-INTERRUPTED ${id} ${state}`;
 }
 
+/** BRAIN-759: a dead supervisor's remote attempt stranded mid-withdraw, still on the runner it was withdrawing from. Reconcile may
+ *  settle it, but only on proof from both hosts (remote-reconcile.js); `dispatching` never qualifies. Attempt writes are not fsynced,
+ *  so the supervisor must have died in THIS boot: after a reboot `moving` may be stale and stays cancel-only. */
+export const isStrandedWithdrawingMove = (attempt) =>
+  attempt?.executor === 'remote' && !supervisorAlive(attempt) && attempt.supervisor?.bootId === bootId() && attempt.moving?.phase === 'withdrawing' && attempt.runner === attempt.moving.from;
+
 /** Create the initial attempt record for `id` (generation 0, executor 'remote',
  *  phase 'probe'), stamped with THIS process's own identity as the owning
  *  supervisor. `runner` is not yet known at this point in the real dispatch

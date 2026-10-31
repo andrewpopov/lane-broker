@@ -6,7 +6,7 @@ import path from 'node:path';
 import { laneRun, writeGlobalConfig, waitFor, sleep, freshEnv } from './helpers.js';
 import { tmpDir, setup, resultOf } from './remote-harness.js';
 import { readAttempt } from '../src/attempts.js';
-import { paths, atomicWriteJson, ensureStateDirs, bootId } from '../src/state.js';
+import { paths, atomicWriteJson, ensureStateDirs, bootId, tombstonePath } from '../src/state.js';
 import { processStartTime } from '../src/process-liveness.js';
 import { sweepOrphans } from '../src/reconcile-sweep.js';
 import { recordPings } from '../src/runner-unreachable.js';
@@ -295,6 +295,39 @@ test('lane status without an orphan (or with only an interrupted move) spawns no
   assert.equal(out.code, 0, out.stderr);
   await sleep(2000);
   assert.equal(fs.existsSync(paths(ctx.state).reconcileLastRun), false, 'no sweep claimed');
+});
+
+// ---- BRAIN-759: a withdrawing move is an orphan the sweep and `lane status` act on ----
+
+const strandedWithdraw = (ctx) => {
+  const destRoot = addRunner(ctx, 'dest', 'normal');
+  const id = seedOrphan(ctx, { record: { kind: 'unfinished', reason: 'withdrawn' }, attempt: { supervisor: { ...DEAD_SUPERVISOR, bootId: bootId() }, moving: { from: 'skybox', to: 'dest', phase: 'withdrawing', at: 1234 } } });
+  return { id, destRoot };
+};
+
+test('sweep: a withdrawing-move orphan alone is admitted and settled lost runner-never-started, destination tombstoned', async () => {
+  const ctx = context();
+  const { id, destRoot } = strandedWithdraw(ctx);
+  const out = await sweep(ctx);
+  assert.deepEqual(out.results.map(({ id: rid, runner, state, exit }) => ({ id: rid, runner, state, exit })), [{ id, runner: 'skybox', state: 'lost', exit: 75 }]);
+  assert.equal(resultOf(ctx.state, id).reason, 'runner-never-started');
+  assert.ok(fs.existsSync(tombstonePath(destRoot, id)));
+});
+
+test('sweep: a dispatching-move orphan is still not admitted', async () => {
+  const ctx = context();
+  addRunner(ctx, 'dest', 'normal');
+  const id = seedOrphan(ctx, { record: { kind: 'unfinished', reason: 'withdrawn' }, attempt: { moving: { from: 'skybox', to: 'dest', phase: 'dispatching', at: 1234 } } });
+  assert.deepEqual(await sweep(ctx), { ran: true, results: [] });
+  assert.ok(readAttempt(ctx.state, id));
+});
+
+test('lane status spawns a sweep for a withdrawing-move orphan, which settles it', async () => {
+  const ctx = context();
+  const { id } = strandedWithdraw(ctx);
+  assert.equal((await laneRun(['status', '--json'], { env: ctx.env, cwd: ctx.repoDir })).code, 0);
+  await waitFor(() => resultOf(ctx.state, id) !== null, { timeoutMs: 15_000, intervalMs: 100 });
+  assert.equal(resultOf(ctx.state, id).reason, 'runner-never-started');
 });
 
 // ---- BRAIN-594: a runner that stays down must not hold its orphans forever ----

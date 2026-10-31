@@ -12,7 +12,7 @@ import { classLocks, classOf, simArmed, usedByClass } from './allocation.js';
 import { resolveClasses, bookedSims, classQueuePolicy } from './classes.js';
 import { queuedClaimsByClass } from './allocation-shadow.js';
 import { readLastSimDemandAt } from './sim-arm.js';
-import { listAttempts, supervisorAlive, moveInterruptedLabel } from './attempts.js';
+import { listAttempts, supervisorAlive, moveInterruptedLabel, isStrandedWithdrawingMove } from './attempts.js';
 import { readGateState } from './load.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfigOrError, isDispatchOnly } from './config.js';
@@ -314,6 +314,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       elapsedMs: a.startedAt ? now - a.startedAt : null,
       orphaned: !supervisorAlive(a),
       moveInterrupted: !supervisorAlive(a) ? moveInterruptedLabel(a.id, a) : null,
+      reconcilable: isStrandedWithdrawingMove(a),
       awaitingProof: supervisorAlive(a) ? (a.awaitingProof ?? null) : null,
     }));
 
@@ -673,7 +674,7 @@ export function renderStatusText(status) {
       lines.push('  (none)');
     } else {
       for (const r of status.remote) {
-        const flag = r.moveInterrupted ? `  [${r.moveInterrupted}] — reconcile with: lane cancel ${r.id}` : r.awaitingProof ? `  awaiting proof from ${r.awaitingProof.runner} since ${new Date(r.awaitingProof.since).toTimeString().slice(0, 5)} (dropped)` : r.orphaned ? `  [ORPHANED-REMOTE] — ${r.runner ? `reconciles automatically when ${r.runner} answers` : 'no runner recorded; settles on the next reconcile if it never dispatched'} (or: lane cancel ${r.id})` : '';
+        const flag = r.moveInterrupted ? `  [${r.moveInterrupted}] — ${r.reconcilable ? `reconciles automatically once ${r.runner} and the destination answer (or: lane cancel ${r.id})` : `reconcile with: lane cancel ${r.id}`}` : r.awaitingProof ? `  awaiting proof from ${r.awaitingProof.runner} since ${new Date(r.awaitingProof.since).toTimeString().slice(0, 5)} (dropped)` : r.orphaned ? `  [ORPHANED-REMOTE] — ${r.runner ? `reconciles automatically when ${r.runner} answers` : 'no runner recorded; settles on the next reconcile if it never dispatched'} (or: lane cancel ${r.id})` : '';
         lines.push(`  ${r.id}  runner=${r.runner ?? '-'}  phase=${r.phase}  elapsed=${fmtMs(r.elapsedMs)}${flag}`);
       }
     }
@@ -704,7 +705,7 @@ function writeAndFlush(stream, text) {
  *  on it (status does no ssh itself); the sweep's own 5-minute claim rate-limits it, so every status call may spawn one. */
 function spawnReconcileSweep(status) {
   if (process.env.LANE_BROKER_TEST_NO_STATUS_RECONCILE === '1') return;
-  if (!status.remote?.some((r) => r.orphaned && !r.moveInterrupted)) return;
+  if (!status.remote?.some((r) => r.orphaned && (!r.moveInterrupted || r.reconcilable))) return;
   try {
     const child = spawn(process.execPath, [...childExitSafeFlags(), LANE_BIN, 'reconcile'], { detached: true, stdio: 'ignore', env: process.env });
     child.on('error', () => {});

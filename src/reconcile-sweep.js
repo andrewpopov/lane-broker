@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { paths, atomicWriteFile, ensureStateDirs, withLock } from './state.js';
 import { loadGlobalConfigOrError } from './config.js';
-import { listAttempts, supervisorAlive } from './attempts.js';
+import { listAttempts, supervisorAlive, isStrandedWithdrawingMove } from './attempts.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
 import { heartbeatUpRunners } from './runner-unreachable.js';
 import { settleAbandonedLocalAttempts } from './local-reconcile.js';
@@ -57,7 +57,7 @@ export async function sweepOrphans(root, { globalCfg, force = false, now = Date.
     if (!(await claimSweep(root, now, force))) return { ran: false, reason: 'recently swept' };
 
     const orphans = listAttempts(root)
-      .filter((a) => a.executor === 'remote' && !supervisorAlive(a) && !a.moving)
+      .filter((a) => a.executor === 'remote' && !supervisorAlive(a) && (!a.moving || isStrandedWithdrawingMove(a)))
       .sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0));
     const vouchedUp = new Set(heartbeatUpRunners(root, globalCfg, now));
     const downRunners = new Set();

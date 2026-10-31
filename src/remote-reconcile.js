@@ -1,10 +1,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { isDeepStrictEqual } from 'node:util';
 import { paths, atomicWriteJson, appendHistory, LockTimeoutError, RUNNER_SHUTDOWN_REASON } from './state.js';
 import { readUnreachable, recordContact } from './runner-unreachable.js';
-import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult } from './attempts.js';
+import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult, isStrandedWithdrawingMove } from './attempts.js';
 import { terminalRowDefaults } from './resources.js';
-import { fetchRemoteResult, classifyRemoteResult, provesNeverStarted, provesStopped, remoteCancel } from './remote-client.js';
+import { fetchRemoteResult, classifyRemoteResult, provesNeverStarted, provesStopped, remoteCancel, remoteWithdraw } from './remote-client.js';
 import { relayedUsage, relayedDeps } from './remote-relay.js';
 import { writeBrokerLog } from './admission.js';
 
@@ -24,6 +25,9 @@ import { writeBrokerLog } from './admission.js';
  *  - (BRAIN-594) a runner the operator marked `offline: true` (lost: exit 75, `runner-offline`, settled WITHOUT contacting it), or a
  *    runner that has given no usable answer for longer than `runnerLostAfterMs`, measured from the first failed fetch and persisted
  *    in `runner-unreachable.json` (lost: exit 75, `runner-lost`). Any answer from the runner, `running` included, clears that clock.
+ *  - (BRAIN-759) a move stranded in phase `withdrawing` (`isStrandedWithdrawingMove`): settled only when the source's bound record proves the
+ *    job never started there (or is adopted if it ran there) AND the destination, asked for the same ticket, has no record and no queued or running job,
+ *    and a `remote-withdraw` answers `no-such-ticket` with `tombstoned: true` (lost: exit 75, `runner-never-started`). Every other move stays `skipped`.
  * Anything else leaves the attempt untouched, with the state saying why: `running` (the runner still has it), `unreachable`
  * (no usable answer), `ambiguous` (a record that cannot be trusted), `skipped` (not an orphan, or already settled).
  *
@@ -67,8 +71,16 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
   if (!attempt) return skipped('no attempt record');
   if (attempt.executor !== 'remote') return skipped('not a remote attempt');
   if (supervisorAlive(attempt) && !ownedBySelf(attempt, self)) return skipped('its supervisor is alive');
-  if (attempt.moving) return skipped('a runner-to-runner move was interrupted');
+  const strandedWithdraw = !self && isStrandedWithdrawingMove(attempt);
+  if (attempt.moving && !strandedWithdraw) return skipped('a runner-to-runner move was interrupted');
   if (fs.existsSync(resultPath)) return skipped('already settled');
+
+  /** The time the next ssh call may take, or null when too little of the overall deadline is left to make it. */
+  const callBudget = () => {
+    const ms = deadlineAt === undefined ? deadlineMs : Math.min(deadlineMs, deadlineAt - Date.now());
+    return ms < MIN_CALL_MS ? null : ms;
+  };
+  if (strandedWithdraw) return settleStrandedWithdraw(root, id, attempt, resultPath, { globalCfg, sshBin, env, now, assumeDown, callBudget, deadlineAt });
 
   if (neverDispatched(attempt)) {
     return publishSettled(root, id, attempt, resultPath, 'lost', () => lostResult(id, attempt, 'never-dispatched', 'supervisor died before dispatching to any runner'), { stillEligible: neverDispatched, self });
@@ -94,12 +106,6 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
     return (since === undefined ? null : await publishUnreachable(since)) ?? outcome;
   };
   if (assumeDown) return unreachable({ settled: false, state: 'unreachable', transport: true, reason: `no usable answer from ${runner.name}` });
-
-  /** The time the next ssh call may take, or null when too little of the overall deadline is left to make it. */
-  const callBudget = () => {
-    const ms = deadlineAt === undefined ? deadlineMs : Math.min(deadlineMs, deadlineAt - Date.now());
-    return ms < MIN_CALL_MS ? null : ms;
-  };
 
   // the runner's ticket id: the lane id, except after a cache repair retry (BRAIN-642), which dispatched under a fresh one
   const remoteId = attempt.binding?.ticketId ?? id;
@@ -135,6 +141,70 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
     if (adopted.state !== 'ambiguous') return adopted;
   }
   return publish('lost', () => lostResult(id, attempt, 'runner-lost', attempt.unresolved ?? 'supervisor gone; runner reported the job gone'));
+}
+
+/**
+ * BRAIN-759: the supervisor died mid-move in phase `withdrawing`. The `withdrawing` record alone proves nothing (the attempt file is not
+ * fsynced), so this settles only on both hosts' own answers; every unclear answer leaves the attempt kept.
+ */
+async function settleStrandedWithdraw(root, id, attempt, resultPath, { globalCfg, sshBin, env, now, assumeDown, callBudget, deadlineAt }) {
+  const { from, to } = attempt.moving;
+  const held = (state, reason, extra = {}) => ({ settled: false, state, reason, ...extra });
+  if (assumeDown) return held('unreachable', `no usable answer from ${from} earlier in this sweep`);
+  const runners = globalCfg?.runners ?? [];
+  const source = runners.find((r) => r.name === from);
+  if (!source) return held('unreachable', 'source runner not configured');
+  if (source.offline) return held('unreachable', `source runner ${from} is marked offline; not contacted`);
+
+  const sourceId = attempt.binding?.ticketId ?? id;
+  const sourceBudget = callBudget();
+  if (sourceBudget === null) return waitTimedOut();
+  const fetched = await fetchRemoteResult(source, sourceId, sshBin, sourceBudget, env);
+  if (fetched === null) {
+    await recordContact(root, from, false, now, { deadlineAt });
+    return held('unreachable', `no usable answer from ${from}`, { transport: true });
+  }
+  await recordContact(root, from, true, now, { deadlineAt });
+
+  if (fetched.missing) {
+    return fetched.state === 'queued' || fetched.state === 'running'
+      ? held('running', `source ${from} still has the job (${fetched.state})`)
+      : held('ambiguous', `source ${from} has no record of the job (${fetched.state ?? 'no state'}); the withdraw is unproven`);
+  }
+  const { binding } = attempt;
+  if (!binding) return held('ambiguous', 'legacy attempt has no dispatch binding');
+  const expected = { protocol: binding.protocol, ticketId: binding.ticketId ?? id, generation: binding.generation, manifestHash: binding.manifestHash };
+  const publishMove = (kind, build) => publishSettled(root, id, attempt, resultPath, kind, build, {});
+  const classified = classifyRemoteResult(fetched, expected);
+  if (classified.outcome === 'confirmed' && fetched.kind === 'completed') return adoptOrAmbiguous(attempt, id, fetched, (kind, build) => publishMove(kind, build));
+  if (!provesNeverStarted(fetched, expected)) return held('ambiguous', `source ${from} record (${fetched.kind}) does not prove the job never started`);
+
+  const destination = runners.find((r) => r.name === to);
+  if (!destination) return held('unreachable', 'destination runner not configured');
+  const asDestination = async () => {
+    const budget = callBudget();
+    return budget === null ? undefined : fetchRemoteResult(destination, id, sshBin, budget, env);
+  };
+  const heldByDestination = (record) => {
+    if (record === undefined) return waitTimedOut();
+    if (record === null) return held('unreachable', `no usable answer from destination ${to}`);
+    if (!record.missing) return held('ambiguous', `destination ${to} has a record for the job`);
+    if (record.state === 'queued' || record.state === 'running') return held('running', `destination ${to} has the job (${record.state})`);
+    return record.state === 'gone' ? null : held('ambiguous', `destination ${to} reported no job state`);
+  };
+  const atDestination = await asDestination();
+  const destinationHold = heldByDestination(atDestination);
+  if (destinationHold) return destinationHold;
+
+  const cancelBudget = callBudget();
+  if (cancelBudget === null) return waitTimedOut();
+  const withdrawn = await remoteWithdraw(destination, id, { sshBin, deadlineMs: cancelBudget, env });
+  if (withdrawn.action !== 'no-such-ticket' || withdrawn.tombstoned !== true) return held('unreachable', `destination ${to} did not confirm a tombstone (withdraw answered ${withdrawn.action})`);
+  const afterCancel = heldByDestination(await asDestination());
+  if (afterCancel) return afterCancel;
+
+  const kind = fetched.reason ? `${fetched.kind}: ${fetched.reason}` : fetched.kind;
+  return publishMove('lost', () => lostResult(id, attempt, 'runner-never-started', `source ${from} reported ${kind}; destination ${to} confirmed absent and tombstoned`));
 }
 
 const lostResult = (id, attempt, reason, lostDetail) => ({
@@ -214,7 +284,7 @@ async function publishSettled(root, id, attempt, resultPath, kind, buildResult, 
         cur.runner === attempt.runner &&
         cur.generation === attempt.generation &&
         cur.startedAt === attempt.startedAt &&
-        !cur.moving &&
+        isDeepStrictEqual(cur.moving, attempt.moving) &&
         (!supervisorAlive(cur) || ownedBySelf(cur, self)) &&
         stillEligible(cur),
     },
