@@ -2854,6 +2854,9 @@ importing a changed `src/` or `bin/` file, and `tests/<name>*.test.js` for a
 changed `src/<name>.js`). An unbounded change (no merge-base, over 20 tests, or
 a dependency change) skips the unit tests; the merge train runs the full suite.
 `npm run verify` is the full suite.
+Land with `train add <pr>` and `train wait <pr>`, not `gh pr merge`: the train runs
+the full suite (`scripts/train-gate.sh`) before the PR lands. A landed PR reads
+CLOSED with the `train-landed` label.
 
 `npm run lint` is `node --check` — a syntax parser, not a full linter. It
 catches parse errors only (no unused vars, no shadowing, no undefined
