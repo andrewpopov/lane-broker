@@ -177,7 +177,6 @@ async function settleStrandedWithdraw(root, id, attempt, resultPath, { globalCfg
   const publishMove = (kind, build) => publishSettled(root, id, attempt, resultPath, kind, build, {});
   const classified = classifyRemoteResult(fetched, expected);
   if (classified.outcome === 'confirmed' && fetched.kind === 'completed') return adoptOrAmbiguous(attempt, id, fetched, (kind, build) => publishMove(kind, build));
-  if (provesStopped(fetched, expected)) return held('ambiguous', `source ${from} stopped the job at shutdown; the move's state is ambiguous`);
   if (!provesNeverStarted(fetched, expected)) return held('ambiguous', `source ${from} record (${fetched.kind}) does not prove the job never started`);
 
   const destination = runners.find((r) => r.name === to);
