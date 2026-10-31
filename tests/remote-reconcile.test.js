@@ -591,7 +591,7 @@ function writeRunnerRecord(root, ticketId, record) {
 }
 
 /** An ssh that logs `<subcommand> <src|dest>` per call, answers `remote-result` on dest from `destResults` (one entry per call:
- *  'real', 'fail' or a reply object; 'real' once exhausted), can leave dest's `remote-cancel` unconfirmed, and can run `afterDestCancel`. */
+ *  'real', 'fail' or a reply object; 'real' once exhausted), can answer dest's `remote-withdraw` with not-queued, and can run `afterDestCancel`. */
 function twoHostSsh(ctx, destRoot, { destResults = [], cancel = 'real', afterDestCancel = '' } = {}) {
   const real = path.join(ctx.env.PATH.split(path.delimiter)[0], 'ssh');
   const dir = tmpDir('reconcile-two-host-ssh');
@@ -606,7 +606,7 @@ const { spawnSync } = require('child_process');
 const args = process.argv.slice(2);
 const cmd = args[args.length - 1];
 const onDest = cmd.includes(${JSON.stringify(destRoot)});
-const sub = (/remote-(result|cancel)/.exec(cmd) || [])[1];
+const sub = (/remote-(result|withdraw|cancel)/.exec(cmd) || [])[1];
 fs.appendFileSync(${JSON.stringify(log)}, sub + ' ' + (onDest ? 'dest' : 'src') + '\\n');
 if (onDest && sub === 'result') {
   const n = fs.existsSync(${JSON.stringify(counter)}) ? Number(fs.readFileSync(${JSON.stringify(counter)}, 'utf8')) : 0;
@@ -615,9 +615,9 @@ if (onDest && sub === 'result') {
   if (reply === 'fail') process.exit(255);
   if (reply !== 'real') { process.stdout.write(JSON.stringify(reply) + '\\n'); process.exit(0); }
 }
-if (onDest && sub === 'cancel' && ${JSON.stringify(cancel)} === 'unconfirmed') { process.stdout.write(JSON.stringify({ protocol: 1, cancelConfirmed: false }) + '\\n'); process.exit(0); }
+if (onDest && sub === 'withdraw' && ${JSON.stringify(cancel)} === 'unconfirmed') { process.stdout.write(JSON.stringify({ protocol: 1, ticketId: /[0-9a-f]{8}-[0-9a-f-]{27}/.exec(cmd)[0], action: 'not-queued' }) + '\\n'); process.exit(0); }
 const res = spawnSync(${JSON.stringify(real)}, args, { stdio: 'inherit', env: process.env });
-if (onDest && sub === 'cancel') { ${afterDestCancel} }
+if (onDest && sub === 'withdraw') { ${afterDestCancel} }
 process.exit(res.status == null ? 1 : res.status);
 `,
   );
@@ -632,7 +632,7 @@ const assertHeld = (ctx, id, outcome, state) => {
   assertKept(ctx, id);
 };
 
-test('withdrawing move: source says withdrawn and destination is gone and confirms the cancel -> lost runner-never-started, destination tombstoned', async () => {
+test('withdrawing move: source says withdrawn and destination is gone and a withdraw confirms the tombstone -> lost runner-never-started, destination tombstoned', async () => {
   const ctx = context();
   const destRoot = addDestination(ctx);
   const id = seedOrphan(ctx, { record: WITHDRAWN, attempt: { moving: withdrawingMove() } });
@@ -644,7 +644,7 @@ test('withdrawing move: source says withdrawn and destination is gone and confir
   assert.match(result.lostDetail, /skybox.*withdrawn.*dest.*absent and tombstoned/);
   assert.equal(readAttempt(ctx.state, id), null);
   assert.equal(historyRows(ctx.state).length, 1);
-  assert.equal(ssh.callsTo('cancel dest'), 1, 'the destination cancel was issued');
+  assert.equal(ssh.callsTo('withdraw dest'), 1, 'the destination withdraw was issued');
   assert.equal(ssh.callsTo('cancel src'), 0, 'the source is never cancelled');
   assert.ok(fs.existsSync(tombstonePath(destRoot, id)), 'the destination refuses a later exec for this ticket');
   assertNothingRan(ctx);
@@ -658,7 +658,7 @@ test('withdrawing move: destination reports the job running -> held, and it is n
   const outcome = await reconcile(ctx, id, { sshBin: ssh.bin });
   assertHeld(ctx, id, outcome, 'running');
   assert.match(outcome.reason, /destination dest/);
-  assert.equal(ssh.callsTo('cancel dest'), 0);
+  assert.equal(ssh.callsTo('withdraw dest'), 0);
   assert.equal(fs.existsSync(tombstonePath(destRoot, id)), false);
 });
 
@@ -668,7 +668,7 @@ test('withdrawing move: destination reports the job queued -> held, and it is ne
   const id = seedOrphan(ctx, { record: WITHDRAWN, attempt: { moving: withdrawingMove() } });
   const ssh = twoHostSsh(ctx, destRoot, { destResults: [{ missing: true, state: 'queued' }] });
   assertHeld(ctx, id, await reconcile(ctx, id, { sshBin: ssh.bin }), 'running');
-  assert.equal(ssh.callsTo('cancel dest'), 0);
+  assert.equal(ssh.callsTo('withdraw dest'), 0);
 });
 
 test('withdrawing move: destination holds a result record for the job -> held, no cancel', async () => {
@@ -680,7 +680,7 @@ test('withdrawing move: destination holds a result record for the job -> held, n
   const outcome = await reconcile(ctx, id, { sshBin: ssh.bin });
   assertHeld(ctx, id, outcome, 'ambiguous');
   assert.match(outcome.reason, /destination dest has a record/);
-  assert.equal(ssh.callsTo('cancel dest'), 0);
+  assert.equal(ssh.callsTo('withdraw dest'), 0);
 });
 
 test('withdrawing move: destination unreachable -> held, and the source is not marked down for the sweep', async () => {
@@ -692,10 +692,10 @@ test('withdrawing move: destination unreachable -> held, and the source is not m
   assertHeld(ctx, id, outcome, 'unreachable');
   assert.equal(outcome.transport, undefined, 'a down destination must not flag the source as down');
   assert.equal(readUnreachable(ctx.state).skybox, undefined);
-  assert.equal(ssh.callsTo('cancel dest'), 0);
+  assert.equal(ssh.callsTo('withdraw dest'), 0);
 });
 
-test('withdrawing move: destination cancel not confirmed -> held', async () => {
+test('withdrawing move: destination withdraw does not confirm a tombstone -> held', async () => {
   const ctx = context();
   const destRoot = addDestination(ctx);
   const id = seedOrphan(ctx, { record: WITHDRAWN, attempt: { moving: withdrawingMove() } });
@@ -703,10 +703,10 @@ test('withdrawing move: destination cancel not confirmed -> held', async () => {
   const outcome = await reconcile(ctx, id, { sshBin: ssh.bin });
   assertHeld(ctx, id, outcome, 'unreachable');
   assert.equal(outcome.transport, undefined);
-  assert.equal(ssh.callsTo('cancel dest'), 1);
+  assert.equal(ssh.callsTo('withdraw dest'), 1);
 });
 
-test('withdrawing move: a record appears on the destination after the cancel -> held', async () => {
+test('withdrawing move: a record appears on the destination after the withdraw -> held', async () => {
   const ctx = context();
   const destRoot = addDestination(ctx);
   const id = seedOrphan(ctx, { record: WITHDRAWN, attempt: { moving: withdrawingMove() } });
@@ -794,16 +794,48 @@ test('withdrawing move fence: the move advancing to dispatching between the read
   assert.deepEqual(historyRows(ctx.state), []);
 });
 
-test('withdrawing move: a repaired ticket id (binding.ticketId) is what both hosts are asked for and what is tombstoned', async () => {
+test('withdrawing move: a repaired ticket id is asked of the source only; the destination is asked for, and tombstoned under, the lane id', async () => {
   const ctx = context();
   const destRoot = addDestination(ctx);
   const repaired = crypto.randomUUID();
-  const binding = { ...BINDING, ticketId: repaired };
-  const id = seedOrphan(ctx, { binding, attempt: { moving: withdrawingMove() } });
+  const id = seedOrphan(ctx, { binding: { ...BINDING, ticketId: repaired }, attempt: { moving: withdrawingMove() } });
   writeRunnerRecord(ctx.runnerRoot, repaired, WITHDRAWN);
   const ssh = twoHostSsh(ctx, destRoot);
   assert.deepEqual(await reconcile(ctx, id, { sshBin: ssh.bin }), { settled: true, state: 'lost', exit: 75 });
-  assert.ok(fs.existsSync(tombstonePath(destRoot, repaired)), 'the destination tombstone is for the repaired id');
-  assert.equal(fs.existsSync(tombstonePath(destRoot, id)), false, 'not for the lane id');
-  assert.deepEqual(ssh.calls(), ['result src', 'result dest', 'cancel dest', 'result dest']);
+  assert.ok(fs.existsSync(tombstonePath(destRoot, id)), 'the destination tombstone is for the lane id');
+  assert.equal(fs.existsSync(tombstonePath(destRoot, repaired)), false, 'not for the source-side repaired id');
+  assert.deepEqual(ssh.calls(), ['result src', 'result dest', 'withdraw dest', 'result dest']);
+});
+
+test('withdrawing move: a destination job under the lane id is held even when the binding holds a repaired id', async () => {
+  const ctx = context();
+  const destRoot = addDestination(ctx);
+  const repaired = crypto.randomUUID();
+  const id = seedOrphan(ctx, { binding: { ...BINDING, ticketId: repaired }, attempt: { moving: withdrawingMove() } });
+  writeRunnerRecord(ctx.runnerRoot, repaired, WITHDRAWN);
+  writeRunnerRecord(destRoot, id, completed());
+  const ssh = twoHostSsh(ctx, destRoot);
+  assertHeld(ctx, id, await reconcile(ctx, id, { sshBin: ssh.bin }), 'ambiguous');
+  assert.equal(ssh.callsTo('withdraw dest'), 0);
+});
+
+test('withdrawing move: a source record of kind cancelled is held, not adopted', async () => {
+  const ctx = context();
+  const destRoot = addDestination(ctx);
+  const id = seedOrphan(ctx, { record: { kind: 'cancelled' }, attempt: { moving: withdrawingMove() } });
+  const ssh = twoHostSsh(ctx, destRoot);
+  assertHeld(ctx, id, await reconcile(ctx, id, { sshBin: ssh.bin }), 'ambiguous');
+  assert.deepEqual(ssh.calls(), ['result src']);
+});
+
+test('withdrawing move: a destination ticket dir with no job or record (withdraw does not answer no-such-ticket) is held, no tombstone', async () => {
+  const ctx = context();
+  const destRoot = addDestination(ctx);
+  const id = seedOrphan(ctx, { record: WITHDRAWN, attempt: { moving: withdrawingMove() } });
+  fs.mkdirSync(path.join(destRoot, 'tickets', id), { recursive: true });
+  const ssh = twoHostSsh(ctx, destRoot, { destResults: [{ missing: true, state: 'gone' }] });
+  const outcome = await reconcile(ctx, id, { sshBin: ssh.bin });
+  assertHeld(ctx, id, outcome, 'unreachable');
+  assert.match(outcome.reason, /not-queued/);
+  assert.equal(fs.existsSync(tombstonePath(destRoot, id)), false);
 });

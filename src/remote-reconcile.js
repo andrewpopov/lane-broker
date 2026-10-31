@@ -5,7 +5,7 @@ import { paths, atomicWriteJson, appendHistory, LockTimeoutError, RUNNER_SHUTDOW
 import { readUnreachable, recordContact } from './runner-unreachable.js';
 import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult, isStrandedWithdrawingMove } from './attempts.js';
 import { terminalRowDefaults } from './resources.js';
-import { fetchRemoteResult, classifyRemoteResult, provesNeverStarted, provesStopped, remoteCancel } from './remote-client.js';
+import { fetchRemoteResult, classifyRemoteResult, provesNeverStarted, provesStopped, remoteCancel, remoteWithdraw } from './remote-client.js';
 import { relayedUsage, relayedDeps } from './remote-relay.js';
 import { writeBrokerLog } from './admission.js';
 
@@ -27,7 +27,7 @@ import { writeBrokerLog } from './admission.js';
  *    in `runner-unreachable.json` (lost: exit 75, `runner-lost`). Any answer from the runner, `running` included, clears that clock.
  *  - (BRAIN-759) a move stranded in phase `withdrawing` (`isStrandedWithdrawingMove`): settled only when the source's bound record proves the
  *    job never started there (or is adopted if it ran there) AND the destination, asked for the same ticket, has no record and no queued or running job,
- *    and a runner-CONFIRMED `remote-cancel` has tombstoned it (lost: exit 75, `runner-never-started`). Every other move stays `skipped`.
+ *    and a `remote-withdraw` answers `no-such-ticket` with `tombstoned: true` (lost: exit 75, `runner-never-started`). Every other move stays `skipped`.
  * Anything else leaves the attempt untouched, with the state saying why: `running` (the runner still has it), `unreachable`
  * (no usable answer), `ambiguous` (a record that cannot be trusted), `skipped` (not an orphan, or already settled).
  *
@@ -156,10 +156,10 @@ async function settleStrandedWithdraw(root, id, attempt, resultPath, { globalCfg
   if (!source) return held('unreachable', 'source runner not configured');
   if (source.offline) return held('unreachable', `source runner ${from} is marked offline; not contacted`);
 
-  const remoteId = attempt.binding?.ticketId ?? id;
+  const sourceId = attempt.binding?.ticketId ?? id;
   const sourceBudget = callBudget();
   if (sourceBudget === null) return waitTimedOut();
-  const fetched = await fetchRemoteResult(source, remoteId, sshBin, sourceBudget, env);
+  const fetched = await fetchRemoteResult(source, sourceId, sshBin, sourceBudget, env);
   if (fetched === null) {
     await recordContact(root, from, false, now, { deadlineAt });
     return held('unreachable', `no usable answer from ${from}`, { transport: true });
@@ -175,15 +175,16 @@ async function settleStrandedWithdraw(root, id, attempt, resultPath, { globalCfg
   if (!binding) return held('ambiguous', 'legacy attempt has no dispatch binding');
   const expected = { protocol: binding.protocol, ticketId: binding.ticketId ?? id, generation: binding.generation, manifestHash: binding.manifestHash };
   const publishMove = (kind, build) => publishSettled(root, id, attempt, resultPath, kind, build, {});
-  if (classifyRemoteResult(fetched, expected).outcome === 'confirmed') return adoptOrAmbiguous(attempt, id, fetched, (kind, build) => publishMove(kind, build));
+  const classified = classifyRemoteResult(fetched, expected);
+  if (classified.outcome === 'confirmed' && fetched.kind === 'completed') return adoptOrAmbiguous(attempt, id, fetched, (kind, build) => publishMove(kind, build));
   if (provesStopped(fetched, expected)) return held('ambiguous', `source ${from} stopped the job at shutdown; the move's state is ambiguous`);
-  if (!provesNeverStarted(fetched, expected)) return held('ambiguous', `source ${from} record does not prove the job never started`);
+  if (!provesNeverStarted(fetched, expected)) return held('ambiguous', `source ${from} record (${fetched.kind}) does not prove the job never started`);
 
   const destination = runners.find((r) => r.name === to);
   if (!destination) return held('unreachable', 'destination runner not configured');
   const asDestination = async () => {
     const budget = callBudget();
-    return budget === null ? undefined : fetchRemoteResult(destination, remoteId, sshBin, budget, env);
+    return budget === null ? undefined : fetchRemoteResult(destination, id, sshBin, budget, env);
   };
   const heldByDestination = (record) => {
     if (record === undefined) return waitTimedOut();
@@ -198,7 +199,8 @@ async function settleStrandedWithdraw(root, id, attempt, resultPath, { globalCfg
 
   const cancelBudget = callBudget();
   if (cancelBudget === null) return waitTimedOut();
-  if (!(await remoteCancel(destination, remoteId, { sshBin, deadlineMs: cancelBudget, env }))) return held('unreachable', `remote cancel not confirmed by destination ${to}`);
+  const withdrawn = await remoteWithdraw(destination, id, { sshBin, deadlineMs: cancelBudget, env });
+  if (withdrawn.action !== 'no-such-ticket' || withdrawn.tombstoned !== true) return held('unreachable', `destination ${to} did not confirm a tombstone (withdraw answered ${withdrawn.action})`);
   const afterCancel = heldByDestination(await asDestination());
   if (afterCancel) return afterCancel;
 

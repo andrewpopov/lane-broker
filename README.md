@@ -1126,7 +1126,7 @@ the wait on the first runner, and the result and history row carry `rebalancedFr
 `lane status` report `MOVE-INTERRUPTED <id> withdrawn from <A>` instead of a generic orphan, and `lane cancel` cancels on every
 runner the move names and clears it. Nothing resumes a stranded move, but one stranded in phase `withdrawing` (still on the runner it
 was withdrawing from) is settled by `lane reconcile`/`lane status`/`lane wait` (exit 75, `runner-never-started`) once the source's own bound record proves
-the job never started and the destination has no record and no queued or running job, then confirms a cancel (tombstone) for it; a source record of a
+the job never started and the destination has no record and no queued or running job, then confirms a tombstone for it with a `remote-withdraw`; a source record of a
 completed run is adopted instead. Anything unclear on either host, and any `dispatching` move, stays `MOVE-INTERRUPTED` until `lane cancel`.
 
 **Which runners are destinations.** A runner entry may set `"rebalanceTarget": false` (boolean, default `true`) to opt out of
