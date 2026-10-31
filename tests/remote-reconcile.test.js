@@ -6,6 +6,7 @@ import path from 'node:path';
 import { laneRun, waitFor, sleep } from './helpers.js';
 import { tmpDir, setup, resultOf, linesOf, makeFakeSshBin, makeRunner, clientEnv, makeGitWorktree, makeDispatchArgs } from './remote-harness.js';
 import { readAttempt } from '../src/attempts.js';
+import { processStartTime } from '../src/process-liveness.js';
 import { cancelAttempt } from '../src/cancel.js';
 import { paths, atomicWriteJson, writeCancelMarkerFile, ensureStateDirs, withLock, tombstonePath, bootId, kernelBootId, RUNNER_SHUTDOWN_REASON } from '../src/state.js';
 import { readUnreachable, recordContact } from '../src/runner-unreachable.js';
@@ -857,6 +858,16 @@ test('withdrawing move: the same bootId but a different kernelBootId is skipped,
   const ctx = context();
   const destRoot = addDestination(ctx);
   const id = seedOrphan(ctx, { record: WITHDRAWN, attempt: strandedAttempt({ supervisor: { ...thisBootDead(), kernelBootId: 'another-kernel-boot' } }) });
+  const ssh = twoHostSsh(ctx, destRoot);
+  assertHeld(ctx, id, await reconcile(ctx, id, { sshBin: ssh.bin }), 'skipped');
+  assert.deepEqual(ssh.calls(), []);
+});
+
+test('withdrawing move: a different bootId but the same kernelBootId with a live supervisor is skipped, no host contacted', async () => {
+  const ctx = context();
+  const destRoot = addDestination(ctx);
+  const live = { pid: process.pid, startTime: processStartTime(process.pid), bootId: 'a-skewed-boot-id', kernelBootId: kernelBootId() };
+  const id = seedOrphan(ctx, { record: WITHDRAWN, attempt: strandedAttempt({ supervisor: live }) });
   const ssh = twoHostSsh(ctx, destRoot);
   assertHeld(ctx, id, await reconcile(ctx, id, { sshBin: ssh.bin }), 'skipped');
   assert.deepEqual(ssh.calls(), []);

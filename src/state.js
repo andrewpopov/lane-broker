@@ -625,7 +625,7 @@ function isLockOwnerAlive(owner) {
   if (!owner.start) return true; // couldn't capture a start time at acquire time; fall back to pid-alive
   const current = processStartTime(owner.pid);
   if (current === undefined) return true; // probe failed: fail closed, never steal
-  if (current === null) return false; // confirmed gone
+  if (current === null) return isPidAlive(owner.pid); // `ps` alone cannot declare a pid that kill(0) just saw alive dead
   return current === owner.start;
 }
 

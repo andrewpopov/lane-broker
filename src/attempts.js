@@ -115,7 +115,7 @@ export function moveInterruptedLabel(id, attempt) {
  *  so the supervisor must have died in THIS boot, proven by the same kernel boot UUID: after a reboot `moving` may be stale, and an
  *  attempt (or host) with no kernel boot id stays cancel-only. */
 export const isStrandedWithdrawingMove = (attempt) =>
-  attempt?.executor === 'remote' && !supervisorAlive(attempt) && Boolean(attempt.supervisor?.kernelBootId) && attempt.supervisor.kernelBootId === kernelBootId() && attempt.moving?.phase === 'withdrawing' && attempt.runner === attempt.moving.from;
+  attempt?.executor === 'remote' && Boolean(attempt.supervisor?.kernelBootId) && attempt.supervisor.kernelBootId === kernelBootId() && !isProcessAlive(attempt.supervisor.pid, attempt.supervisor.startTime) && attempt.moving?.phase === 'withdrawing' && attempt.runner === attempt.moving.from;
 
 /** Create the initial attempt record for `id` (generation 0, executor 'remote',
  *  phase 'probe'), stamped with THIS process's own identity as the owning

@@ -55,7 +55,7 @@ const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0
 
 // pids of other processes whose argv or environment names one of our dirs. A process matches only by naming a
 // mkdtemp path unique to this run; this process and its ancestors are never returned.
-function processesMentioning(dirs) {
+function scanProcesses(matches) {
   let listing;
   try {
     listing = execFileSync('ps', ['axeww', '-o', 'pid=,ppid=,command='], { encoding: 'utf8', maxBuffer: 256 * 1024 * 1024 });
@@ -69,8 +69,13 @@ function processesMentioning(dirs) {
   const parentOf = new Map(rows.map((row) => [row.pid, row.ppid]));
   const protectedPids = new Set([process.pid]);
   for (let pid = parentOf.get(process.pid); pid > 1 && !protectedPids.has(pid); pid = parentOf.get(pid)) protectedPids.add(pid);
-  return rows.filter((row) => !protectedPids.has(row.pid) && dirs.some((dir) => row.line.includes(dir))).map((row) => row.pid);
+  return rows.filter((row) => !protectedPids.has(row.pid) && matches(row.line)).map((row) => row.pid);
 }
+
+const processesMentioning = (dirs) => scanProcesses((line) => dirs.some((dir) => line.includes(dir)));
+
+// Only a process that inherited the test environment (LANE_BROKER_STATE/HOME naming the dir) is ever signalled.
+const inheritedEnvPids = (dirs) => scanProcesses((line) => dirs.some((dir) => new RegExp(`LANE_BROKER_(?:STATE|HOME)=${dir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?:/|\\s|$)`).test(line)));
 
 function killStragglers(pids) {
   for (const pid of pids) {
@@ -88,7 +93,7 @@ function removeAll() {
   const dirs = [...created];
   const deadline = Date.now() + SETTLE_MS;
   while (Date.now() < deadline && processesMentioning(dirs).length > 0) sleepMs(100);
-  killStragglers(processesMentioning(dirs));
+  killStragglers(inheritedEnvPids(dirs));
   for (const dir of dirs) removeTmpDir(dir);
   created.clear();
 }

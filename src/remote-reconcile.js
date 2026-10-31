@@ -286,6 +286,7 @@ async function publishSettled(root, id, attempt, resultPath, kind, buildResult, 
         cur.startedAt === attempt.startedAt &&
         isDeepStrictEqual(cur.moving, attempt.moving) &&
         (!supervisorAlive(cur) || ownedBySelf(cur, self)) &&
+        (!cur.moving || isStrandedWithdrawingMove(cur)) &&
         stillEligible(cur),
     },
   );

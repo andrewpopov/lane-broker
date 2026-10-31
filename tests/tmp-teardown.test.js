@@ -5,6 +5,7 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { makeTmpDir } from './helpers/tmp.js';
+import { isPidAlive } from '../src/process-liveness.js';
 
 const tmpHelper = fileURLToPath(new URL('./helpers/tmp.js', import.meta.url));
 
@@ -17,7 +18,10 @@ test('teardown kills a straggler that names a temp dir and would recreate it', a
     import { makeTmpDir } from ${JSON.stringify(tmpHelper)};
     const dir = makeTmpDir('lane-teardown-victim-');
     const script = 'setTimeout(() => { require("fs").mkdirSync(process.argv[1], { recursive: true }); require("fs").writeFileSync(process.argv[1] + "/late", "x"); }, 4000)';
-    spawn(process.execPath, ['-e', script, dir], { detached: true, stdio: 'ignore' }).unref();
+    spawn(process.execPath, ['-e', script, dir], { detached: true, stdio: 'ignore', env: { ...process.env, LANE_BROKER_STATE: dir } }).unref();
+    const bystander = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)', dir], { detached: true, stdio: 'ignore' });
+    bystander.unref();
+    fs.writeFileSync(${JSON.stringify(dirFile)} + '.bystander', String(bystander.pid));
     fs.writeFileSync(${JSON.stringify(dirFile)}, dir);
   `;
   const run = spawnSync(process.execPath, ['--input-type=module', '-e', driver], { encoding: 'utf8' });
@@ -26,4 +30,13 @@ test('teardown kills a straggler that names a temp dir and would recreate it', a
   assert.equal(fs.existsSync(dir), false, 'removed at teardown');
   await new Promise((resolve) => setTimeout(resolve, 5000));
   assert.equal(fs.existsSync(dir), false, 'not recreated by the straggler');
+  const bystander = Number(fs.readFileSync(`${dirFile}.bystander`, 'utf8'));
+  t.after(() => {
+    try {
+      process.kill(bystander, 'SIGKILL');
+    } catch {
+      // already gone
+    }
+  });
+  assert.equal(isPidAlive(bystander), true, 'a process naming the dir only in argv is not signalled');
 });
