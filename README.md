@@ -2851,7 +2851,7 @@ Run `npm run hooks` once after cloning to enable the pre-push gate.
 The pre-push gate is lint only and takes no lane, so a push never queues. Tests run
 on the PR: the train checks every open PR with the full suite
 (`scripts/train-gate.sh`), and `train pr add <pr>` merges it once that commit is
-green. `npm run verify` is the full suite.
+green; `train pr wait <pr>` reports the result. `npm run verify` is the full suite.
 
 `npm run lint` is `node --check` — a syntax parser, not a full linter. It
 catches parse errors only (no unused vars, no shadowing, no undefined
