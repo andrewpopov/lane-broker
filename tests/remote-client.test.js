@@ -1046,7 +1046,7 @@ if (cmd.includes('remote-exec')) {
 const phaseRecord = (phase) => ({ protocol: 1, missing: true, state: phase === 'queued' ? 'queued' : 'running', phase });
 const TARGET = { name: 'B', ssh: 'b' };
 
-async function dispatchRebalance({ results, withdraws, execMs, rebalance, canWithdraw = true, clock = makeFakeClock(), abortSignal, abortWhen, onSnapshotSent, closeExecOnWithdraw, cancelConfirmed, src = makeGitWorktree({ 'a.txt': 'hello' }) }) {
+async function dispatchRebalance({ results, withdraws, execMs, rebalance, canWithdraw = true, clock = makeFakeClock(), abortSignal, abortWhen, onSnapshotSent, onRunnerPhase, closeExecOnWithdraw, cancelConfirmed, src = makeGitWorktree({ 'a.txt': 'hello' }) }) {
   const ssh = makeRebalanceSsh({ results: [], withdraws, execMs, closeExecOnWithdraw, cancelConfirmed });
   const args = makeDispatchArgs();
   const { manifestHash } = buildManifest(src);
@@ -1064,6 +1064,8 @@ async function dispatchRebalance({ results, withdraws, execMs, rebalance, canWit
     abortSignal: abortWhen ? { get aborted() { return abortWhen(ssh.calls()); }, addEventListener() {}, removeEventListener() {} } : abortSignal,
     canWithdraw,
     onSnapshotSent,
+    onRunnerPhase,
+    phaseIntervalMs: 10_000,
     deadlines: { resultMs: 5000, resultAttempts: 3 },
     rebalance: rebalance && { minQueuedMs: 30_000, intervalMs: 10_000, pickTarget: () => TARGET, ...rebalance },
   });
@@ -1368,4 +1370,16 @@ test('selectRunner: BRAIN-653 a runner whose budget net of outside memory is bel
   const busy = makeFixedProbeSsh(binDir, 'ssh-busy', { ...base, capacity: { ...capacity, memoryAdmissibleBytes: 9_000_000_000 }, headroom: { cpuCores: 8, memoryBytes: 1_000_000_000 } });
   const waits = await selectRunner([makeRunner({ ssh: 'normal' })], { sshBin: busy, env, deadlineMs: 3000, reservation });
   assert.notEqual(waits.skipped[0]?.neverFits, true);
+});
+
+test('BRAIN-770: the runner phase is reported on each change, with commandStartedAt from the first admitted poll', { timeout: 60_000 }, async () => {
+  const seen = [];
+  const clock = makeFakeClock();
+  const start = clock.now();
+  await dispatchRebalance({ results: [preparing, queued, queued, phaseRecord('admitted'), 'RESULT'], execMs: 3000, canWithdraw: false, clock, onRunnerPhase: (p) => seen.push(p) });
+  const phases = seen.map((p) => p.phase);
+  assert.deepEqual(phases.slice(0, 3), ['preparing', 'queued', 'admitted']);
+  assert.equal(new Set(phases).size, phases.length, 'only changes are reported');
+  assert.deepEqual(seen.slice(0, 2).map((p) => p.commandStartedAt), [null, null]);
+  assert.ok(seen[2].commandStartedAt > start);
 });

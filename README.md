@@ -747,7 +747,11 @@ not change its result. A cancel that lands between admission and the child's sta
 reaped at once and the run reports `130`.
 
 A remote run takes no local capacity or resource reservation. `lane status`
-lists it under REMOTE; if its supervisor dies it shows as ORPHANED-REMOTE
+lists it under REMOTE, as `queued@<runner> waited=<d>` while the runner has not admitted it and
+`running@<runner> run=<d> waited=<d>` after (the split is read from the runner's own phase, polled every
+`remoteRebalanceIntervalMs`, so it is that coarse; `run` includes the runner's deps/setup). `--json` adds `runnerPhase`,
+`commandStartedAt`, `waitedMs` and `runMs`; a runner that reports no phase keeps the plain `runner=… phase=running elapsed=…`
+line. If its supervisor dies it shows as ORPHANED-REMOTE
 (it survives a reboot) until the runner settles it (see "Reconciling an
 ORPHANED-REMOTE attempt" below), and `lane cancel` cancels it on the runner
 (then a `130` result) once the runner confirms.

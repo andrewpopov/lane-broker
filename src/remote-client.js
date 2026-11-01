@@ -815,6 +815,36 @@ export function hasMeasuredHeadroom(probe) {
   return Boolean(probe?.headroom) && typeof probe.headroom === 'object' && Number.isFinite(probe.headroom.cpuCores);
 }
 
+const COMMAND_RUNNING_PHASES = new Set(['admitted', 'running']);
+
+/**
+ * BRAIN-770: while the exec ssh session is open, poll the runner's own phase (`preparing`/`queued`/`admitted`/`running`) and
+ * report each CHANGE to `onPhase({phase, commandStartedAt})`. `commandStartedAt` is the clock reading at the first poll that saw the
+ * ticket admitted (null before). Read-only: it never withdraws, moves or settles anything. Stops on a terminal record, on close or abort.
+ */
+async function observeRunnerPhase({ runner, ticketId, onPhase, isClosed, signal, abortSignal, now, sleep, intervalMs, fetchDeadlineMs, sshBin, env }) {
+  const stopped = () => isClosed() || signal.aborted || abortSignal?.aborted;
+  let last = null;
+  let commandStartedAt = null;
+  while (true) {
+    await sleep(intervalMs, signal);
+    if (stopped()) return;
+    const fetched = await fetchRemoteResult(runner, ticketId, sshBin, fetchDeadlineMs, env);
+    if (stopped()) return;
+    if (!fetched) continue;
+    if (!fetched.missing) return;
+    const phase = fetched.phase ?? fetched.state;
+    if (typeof phase !== 'string' || phase === 'gone' || phase === last) continue;
+    last = phase;
+    if (commandStartedAt === null && COMMAND_RUNNING_PHASES.has(phase)) commandStartedAt = now();
+    try {
+      await onPhase({ phase, commandStartedAt });
+    } catch {
+      // a bookkeeping failure never changes the dispatch
+    }
+  }
+}
+
 /**
  * BRAIN-436: while the exec ssh session is open (the ticket is on runner A), observe A and, once the ticket has sat `queued`
  * for `minQueuedMs` with a better runner on offer, withdraw it. ONE serial loop: every step is awaited in turn, so there is
@@ -990,6 +1020,9 @@ async function dispatchOnce(opts) {
     // binding a later reconcile needs to trust a result record fetched for this dispatch. Resolving `false` or throwing means it
     // is not durable: the dispatch does not start (`unconfirmed`, `neverStarted`).
     onBinding,
+    // BRAIN-770: called with `{phase, commandStartedAt}` whenever the runner's own phase changes, polled every `phaseIntervalMs`.
+    onRunnerPhase,
+    phaseIntervalMs = DEFAULT_REBALANCE_INTERVAL_MS,
   } = opts;
   const withdrawCapable = (rebalance?.canWithdraw ?? canWithdraw) === true;
 
@@ -1139,6 +1172,22 @@ async function dispatchOnce(opts) {
   const closed = waitClosed(child, abortSignal);
   let move = null;
   const state = { runner, epoch: 1, attemptedTarget: null, attemptedReason: null, queuedSince: null };
+  if (onRunnerPhase && pipeResult.ok) {
+    const phaseAbort = new AbortController();
+    let phaseSessionClosed = false;
+    const stopPhaseObserver = () => {
+      phaseSessionClosed = true;
+      phaseAbort.abort();
+    };
+    closed.then(stopPhaseObserver, stopPhaseObserver);
+    observeRunnerPhase({
+      runner, ticketId: expected.ticketId, onPhase: onRunnerPhase, signal: phaseAbort.signal, abortSignal, now, sleep,
+      isClosed: () => phaseSessionClosed,
+      intervalMs: phaseIntervalMs,
+      fetchDeadlineMs: resultDeadlineMs,
+      sshBin, env,
+    }).catch(() => {});
+  }
   if (rebalance && withdrawCapable && pipeResult.ok) {
     // One serial watcher beside the open ssh session; it is stopped and JOINED before anything below looks at the outcome.
     const watchAbort = new AbortController();

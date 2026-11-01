@@ -989,7 +989,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     // Every runner this ticket is ever dispatched to is remembered for good (it survives fallback, restore and rebalance): a runner
     // keeps a ticket dir for this id, so dispatching to it a second time would meet the first dispatch's stale state.
     const dispatchedRunners = [...new Set([...(readAttempt(root, enriched.id)?.dispatchedRunners ?? []), runner.name])];
-    await updateAttempt(root, enriched.id, gen, { phase: 'running', runner: runner.name, dispatchedRunners, ...(rebind ? { executor: 'remote' } : {}), ...(queuedAt ? { queuedAt } : {}) }, { refuseWhileMigrating: true });
+    await updateAttempt(root, enriched.id, gen, { phase: 'running', runner: runner.name, runnerPhase: undefined, commandStartedAt: undefined, dispatchedRunners, ...(rebind ? { executor: 'remote' } : {}), ...(queuedAt ? { queuedAt } : {}) }, { refuseWhileMigrating: true });
   } catch (err) {
     if (!(err instanceof MigrationInProgressError)) throw err;
     process.stderr.write(`lane: ${err.message}\n`);
@@ -1146,6 +1146,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       // BRAIN-515: every dispatch (a rebalance move's second one too) re-persists which runner the snapshot goes to and the
       // identity a result fetched from it must carry; `lane`'s orphan reconcile trusts a runner record only against this.
       // `ticketId` differs from the lane id only on a cache repair retry (BRAIN-642), whose runner ticket is a fresh one.
+      onRunnerPhase: ({ phase, commandStartedAt }) => updateAttempt(root, enriched.id, gen, { runnerPhase: phase, ...(commandStartedAt === null ? {} : { commandStartedAt }) }),
+      phaseIntervalMs: globalCfg.remoteRebalanceIntervalMs,
       onBinding: async ({ protocol, ticketId, generation, manifestHash }) =>
         (await updateAttempt(root, enriched.id, gen, { binding: { protocol, generation, manifestHash, runner: runner.name, ...(ticketId === enriched.id ? {} : { ticketId }) } })).ok,
       rebalance: rebalanceOn && canWithdraw ? {
