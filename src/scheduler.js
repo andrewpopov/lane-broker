@@ -831,12 +831,13 @@ function resolveCapacityBlock(root, store, cfg, headId, headWeight, runningWeigh
 }
 
 /**
- * BRAIN-346: the projected-over-budget head's record (resource-skip-state.json):
- * `{ headId, count, reserved, inScope, deniedAt, budget, externalBusy }`. `count`/`reserved` are the
+ * BRAIN-346: the resource-denied head's record (resource-skip-state.json):
+ * `{ headId, count, reserved, inScope, deniedAt, budget, externalBusy, memInfo? }`. `count`/`reserved` are the
  * head's allowance and survive ANY denial kind for the same head; they are dropped only when the
  * head starts, leaves queue[0], or resourceSkipLimit is 0. `inScope` is whether the head's LATEST
- * denial was projected-over-budget (memory ok): an out-of-scope denial pauses backfill without
- * resetting the allowance. Written by the head's own denials (recordResourceDenial,
+ * denial was projected-over-budget or (BRAIN-772) memory-headroom/memory-reservations: an
+ * out-of-scope denial pauses backfill without resetting the allowance. `memInfo` is the memory
+ * the head's latest in-scope denial saw; selection checks candidates against it. Written by the head's own denials (recordResourceDenial,
  * markResourceOutOfScope) and by a backfill's count (recordResourceBackfill). Anything missing
  * or malformed reads as null, which means "no backfill"; a missing `inScope` reads as false.
  */
@@ -863,6 +864,9 @@ export function readResourceSkipState(root, store = legacyStore(root), headId = 
     deniedAt: raw.deniedAt,
     budget: raw.budget,
     externalBusy: raw.externalBusy,
+    ...(raw.memInfo && Number.isFinite(raw.memInfo.availableBytes) && Number.isFinite(raw.memInfo.totalBytes)
+      ? { memInfo: { availableBytes: raw.memInfo.availableBytes, totalBytes: raw.memInfo.totalBytes } }
+      : {}),
     ...(typeof raw.futile === 'string' ? { futile: raw.futile, headCpu: raw.headCpu, futileAt: Number.isFinite(raw.futileAt) ? raw.futileAt : 0 } : {}),
     ...(Number.isInteger(raw.reservationSeq) ? { reservationSeq: raw.reservationSeq } : {}),
     ...(Number.isInteger(raw.yields) && raw.yields > 0 ? { yields: raw.yields } : {}),
@@ -934,12 +938,12 @@ function headFutility(cfg, headTicket, held, cpuSample, cpuDecision, memInfo, no
   return null;
 }
 
-/** The head's own in-scope denial (projected-over-budget, memory ok): create the record for a new
+/** The head's own in-scope denial (projected-over-budget or memory, see tryStart): create the record for a new
  *  head, or refresh the budget/externalBusy snapshot while carrying count/reserved forward for
  *  the same head. Best-effort: a failed write leaves the old record (or none), never an allowance.
  *  `behindConflict` (BRAIN-365) marks the snapshot as a conflict-backfill candidate's denial, not
  *  the head's: only a conflicted head reads it, and the head's own next denial overwrites it. */
-function recordResourceDenial(root, store, cfg, headId, cpuDecision, now, write, behindConflict = false, futility = null) {
+function recordResourceDenial(root, store, cfg, headId, cpuDecision, now, write, behindConflict = false, futility = null, memInfo = null) {
   if (!(cfg.resourceSkipLimit > 0)) return;
   const prev = readResourceSkipState(root, store, headId);
   const same = prev !== null && prev.headId === headId;
@@ -957,6 +961,9 @@ function recordResourceDenial(root, store, cfg, headId, cpuDecision, now, write,
       deniedAt: now,
       budget: cpuDecision.budget,
       externalBusy: cpuDecision.externalBusy,
+      ...(Number.isFinite(memInfo?.availableBytes) && Number.isFinite(memInfo.totalBytes)
+        ? { memInfo: { availableBytes: memInfo.availableBytes, totalBytes: memInfo.totalBytes } }
+        : {}),
       ...(futility ? { futile: futility.cause, headCpu: futility.headCpu, futileAt: futility.sampledAt } : {}),
     }, write);
   } catch {
@@ -964,7 +971,7 @@ function recordResourceDenial(root, store, cfg, headId, cpuDecision, now, write,
   }
 }
 
-/** The head's latest denial is NOT projected-over-budget: pause backfill but keep the allowance
+/** The head's latest denial is out of scope (not projected-over-budget or memory): pause backfill but keep the allowance
  *  (count/reserved). Never creates a record — there is no allowance to keep for a fresh head. */
 function markResourceOutOfScope(root, store, headId, now, write) {
   const prev = readResourceSkipState(root, store, headId);
@@ -1034,7 +1041,7 @@ function ticketCpuFloor(ticket, cfg, budget, held = [], headroom) {
 }
 
 /**
- * BRAIN-346: pick the backfill ticket behind a head denied projected-over-budget. Walks the queue
+ * BRAIN-346: pick the backfill ticket behind a head denied projected-over-budget (or, BRAIN-772, memory). Walks the queue
  * like selectCapacityCandidate (a null record stops the walk; conflicting or weight-overflowing
  * tickets are skipped) and additionally skips any ticket whose start would make the head
  * conflicted. Among tickets whose CPU claim fits the headroom the head's record was denied
@@ -1054,6 +1061,7 @@ function ticketCpuFloor(ticket, cfg, budget, held = [], headroom) {
  * is the snapshot a conflict-backfill candidate was denied against.
  *
  * An elastic ticket (BRAIN-360) is judged, and ranked, at its floor: ceil(minCpuCores).
+ * When the record carries the head's memory snapshot, a ticket failing evaluateMemoryAdmission against it is skipped too.
  */
 export function selectResourceCandidate(queue, held, runningWeight, weightCapacity, record, cfg, now = Date.now(), headReserved = false) {
   const headTicket = queue[0];
@@ -1068,6 +1076,10 @@ export function selectResourceCandidate(queue, held, runningWeight, weightCapaci
     if (headReserved ? blockedBy([{ key: t.key }], headTicket) || blockedBy([{ key: headTicket.key }], t) : blockedBy([...held, { key: t.key }], headTicket)) continue;
     const claim = ticketCpuFloor(t, cfg, record.budget, held, record.budget - projectBusy(record.externalBusy, view, 0, now, cfg, record.budget));
     if (projectBusy(record.externalBusy, view, claim, now, cfg, record.budget) > record.budget) continue;
+    if (record.memInfo) {
+      const candidateResources = resolveTicketResources({ weight: t.weight, cpuCores: t.resources?.cpuCores, memoryBytes: t.resources?.memoryBytes, defaultMemoryBytesPerWeight: cfg.defaultMemoryBytesPerWeight });
+      if (!evaluateMemoryAdmission({ memoryInfo: record.memInfo, heldLeases: view, candidateResources, cfg, now }).admit) continue;
+    }
     if (claim < bestClaim) {
       best = t;
       bestClaim = claim;
@@ -1393,7 +1405,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       : null;
     const capacitySkipExhausted = headCapacityBlocked && capacityBlock.phase === 'exhausted';
 
-    // BRAIN-346: a head whose last in-scope denial was projected-over-budget (see its record) may
+    // BRAIN-346: a head whose last in-scope denial was projected-over-budget or memory (see its record) may
     // be backfilled past, bounded by resourceSkipLimit, then reserved. A reservation also stops
     // capacity backfill past that same head (the one cross-kind check); conflict backfill is
     // never affected — a conflict-blocked head never reaches either resource path.
@@ -1776,6 +1788,12 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     const headPolling = ticket.id === headTicket.id;
     const resourceDenied =
       cfg.schedulerMode === 'active' && !cpuDecision.admit && cpuDecision.cpuReason === 'projected-over-budget' && cpuDecision.memoryReason === 'ok';
+    // BRAIN-772: a memory denial (alone or joint with the CPU projection) is in scope for backfill too; resourceDenied keeps its meaning for the idle exemption.
+    const memoryDenied =
+      cfg.schedulerMode === 'active' &&
+      !cpuDecision.admit &&
+      (cpuDecision.memoryReason === 'memory-headroom' || cpuDecision.memoryReason === 'memory-reservations') &&
+      (cpuDecision.cpuReason === 'ok' || cpuDecision.cpuReason === 'projected-over-budget');
     // BRAIN-346 idle exemption: the head on a fully idle broker (orphaned leases count as held)
     // whose projection overshoots the budget by at most resourceIdleOvershootCores starts anyway
     // — ambient load alone can make a big lane unsatisfiable with nothing running, with or
@@ -1795,8 +1813,8 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       if (headPolling) {
         // Cooldown is the head's own backfill echoing back (each admission starts one), so it
         // changes nothing. Any other out-of-scope denial pauses backfill but keeps the allowance.
-        if (headFutile) recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState, false, headFutile);
-        else if (resourceDenied) recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState);
+        if (headFutile) recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState, false, headFutile, memInfo);
+        else if (resourceDenied || memoryDenied) recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState, false, null, memInfo);
         else if (cpuDecision.cpuReason !== 'cooldown') markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
       } else if (headConflicted && !skipExhausted && resourceDenied && !safeBackfill && !headBypass) {
         recordResourceDenial(root, store, cfg, headTicket.id, cpuDecision, now, writeResourceState, true);

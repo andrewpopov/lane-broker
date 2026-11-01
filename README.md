@@ -1615,20 +1615,26 @@ ending in strict FIFO for that head once spent:
 - *Capacity* (same `conflictSkipLimit`, counted separately): a head that does
   not fit the weight capacity is skipped for a ticket that does. No time-based
   resume: refusal is self-terminating because running work drains.
-- *Resource* (`resourceSkipLimit`, default 3; BRAIN-346): a head denied **only**
-  by `projected-over-budget` CPU (with memory fine; not cooldown, a closed CPU
-  gate, memory, sample-unavailable, load gate or shadow mode) may be overtaken
+- *Resource* (`resourceSkipLimit`, default 3; BRAIN-346, memory BRAIN-772): a head
+  denied by `projected-over-budget` CPU or by memory (`memory-headroom` or
+  `memory-reservations`, alone or jointly with the projection; not cooldown, a
+  closed CPU gate, sample-unavailable, load gate or shadow mode) may be overtaken
   by up to `resourceSkipLimit` tickets. The head's own denial records the
-  ambient load and budget it was denied against (`resource-skip-state.json`);
-  the backfill candidate is the smallest-CPU-claim ticket that fits the
-  remaining headroom, that does not conflict, and that would not make the head
-  conflicted. It still goes through the normal, unchanged admission. The head
+  ambient load, budget and memory reading it was denied against
+  (`resource-skip-state.json`); the backfill candidate is the smallest-CPU-claim
+  ticket that fits the remaining headroom, whose memory also fits that latest
+  snapshot, that does not conflict, and that would not make the head
+  conflicted. The snapshot can be stale: an optimistic pick is denied by its own
+  fresh admission and spends no allowance, a pessimistic one waits for the
+  head's next poll. It still goes through the normal, unchanged admission. The head
   keeps being evaluated every poll and starts the moment it fits. When the
   allowance is used the head is **reserved**: nothing but the head is admitted,
-  and that also stops *capacity* backfill past the same head. Conflict-path
-  backfill is unaffected. The head's count and reservation survive any other
-  denial of the same head (closed CPU gate, memory, unavailable sample); such a
-  denial only pauses backfill until the head is next denied by the projection.
+  and that also stops *capacity* backfill past the same head. The reservation is
+  not absolute: a floor-slot push gate can still start past a reserved head.
+  Conflict-path backfill is unaffected. The head's count and reservation survive
+  any other denial of the same head (closed CPU gate, unavailable sample); such a
+  denial only pauses backfill until the head is next denied by the projection or
+  memory.
   They are dropped only when the head starts, leaves the front of the queue, or
   the limit is 0 (behind the priority scheduler fence, see "Priority (ordered
   selection)" below, the front moves for reasons unrelated to the owner, so they

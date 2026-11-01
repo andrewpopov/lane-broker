@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { freshEnv, writeGlobalConfig } from './helpers.js';
-import { enqueue, tryStart, readResourceSkipState } from '../src/scheduler.js';
+import { enqueue, tryStart, listQueue, readResourceSkipState } from '../src/scheduler.js';
+import { resolveScheduler, fairnessStore, effectiveView } from '../src/fairness.js';
+import { fenceLegacyQueue } from '../src/migrate.js';
 import { sampleHostCpu } from '../src/cpu.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
@@ -204,19 +206,16 @@ test('4b: a reserved record refuses backfill even with the count below the limit
 
 test('4c: the reservation and count survive out-of-scope denials; only the latest denial gates backfill', async () => {
   const cfg = baseCfg();
-  for (const kind of ['cpu-gate-closed', 'memory-headroom']) {
+  for (const kind of ['cpu-gate-closed']) {
     const { state } = freshEnv();
-  holdLaneLoad(state);
+    holdLaneLoad(state);
     const head = ticket('head', { weight: 4 });
     const extra = ticket('extra');
     await enqueue(state, head);
     await enqueue(state, extra);
     seedRecord(state, 'head', { count: 3, reserved: true });
 
-    const out =
-      kind === 'cpu-gate-closed'
-        ? await pollLaneBlocked(state, head, cfg, { ext: 9.5 }) // 95% busy closes the CPU gate
-        : await pollLaneBlocked(state, head, cfg, { mem: memory({ availableBytes: 7 * GIB }) });
+    const out = await pollLaneBlocked(state, head, cfg, { ext: 9.5 }); // 95% busy closes the CPU gate
     assert.equal(out.started, false, kind);
     const mid = readResourceSkipState(state);
     assert.deepEqual({ count: mid.count, reserved: mid.reserved, inScope: mid.inScope }, { count: 3, reserved: true, inScope: false }, `${kind}: allowance kept, backfill paused`);
@@ -239,9 +238,10 @@ test('4d: an out-of-scope latest denial pauses an unreserved head\'s backfill wi
   await enqueue(state, head);
   await enqueue(state, small);
   seedRecord(state, 'head', { count: 2 });
-  await pollLaneBlocked(state, head, cfg, { mem: memory({ availableBytes: 7 * GIB }) });
+  await pollLaneBlocked(state, head, cfg, { ext: 9.5 }); // 95% busy closes the CPU gate
   assert.equal(readResourceSkipState(state).count, 2);
   assert.equal((await pollLaneBlocked(state, small, cfg)).reason, 'not-head', 'paused while the latest denial is out of scope');
+  atomicWriteJson(paths(state).cpuGate, { closed: false, consecutiveUnder: 0 });
   await pollLaneBlocked(state, head, cfg); // in scope again
   assert.equal((await pollLaneBlocked(state, small, cfg)).started, true, 'resumes, one backfill left of the allowance');
   assert.equal(readResourceSkipState(state).count, 3);
@@ -527,4 +527,136 @@ test('13c: reuse is only for validated, unchanged counters: malformed, regressin
   const eight = cpus10(1, 0.54).slice(0, 8);
   assert.equal(sampleHostCpu(state, eight, window).stale, true, 'a topology change is unavailable');
   assert.equal(sampleHostCpu(state, eight, window).stale, true, 'and the old measurement is not carried over the new topology');
+});
+
+// BRAIN-772: a head denied on memory is backfilled past like a CPU-denied one. Fixture: the held 2-core
+// lane lease books 2 GiB; with 7 GiB free the weight-4 head (4 GiB) fails headroom (1 < 2 GiB reserve) while a weight-1 ticket fits (4).
+const tightMemory = (overrides = {}) => memory({ availableBytes: 7 * GIB, ...overrides });
+const pollMem = (state, t, cfg, opts = {}) => poll(state, t, cfg, { ext: 0, mem: tightMemory(), ...opts });
+
+for (const [reason, mem] of Object.entries({ 'memory-headroom': tightMemory(), 'memory-reservations': memory({ totalBytes: 6 * GIB }) })) {
+  test(`13 (${reason}): a memory-denied head admits small fitting tickets, is then reserved, and starts once memory frees`, async () => {
+    const { state } = freshEnv();
+    holdLaneLoad(state);
+    const cfg = baseCfg();
+    const head = ticket('head', { weight: 4 });
+    await enqueue(state, head);
+    const denied = await pollMem(state, head, cfg, { mem });
+    assert.equal(denied.memoryReason, reason);
+    assert.equal(denied.cpuReason, 'ok');
+    assert.equal(readResourceSkipState(state).inScope, true);
+
+    for (let i = 0; i < 3; i += 1) {
+      const s = ticket(`s${i}`);
+      await enqueue(state, s);
+      assert.equal((await pollMem(state, s, cfg, { mem })).started, true, `backfill ${i}`);
+      assert.equal(readResourceSkipState(state).count, i + 1);
+      removeLease(state, s.id);
+    }
+    assert.equal(readResourceSkipState(state).reserved, true);
+    const extra = ticket('extra');
+    await enqueue(state, extra);
+    assert.equal((await pollMem(state, extra, cfg, { mem })).reason, 'not-head', 'reserved: no further overtaking');
+
+    removeLease(state, 'lane-load');
+    assert.equal((await poll(state, head, cfg, { ext: 0 })).started, true, 'the reserved head starts once memory frees');
+  });
+}
+
+test('14: selection skips the smallest-CPU ticket that fails memory on the snapshot and picks a larger one that fits', async () => {
+  const { state } = freshEnv();
+  holdLaneLoad(state);
+  const cfg = baseCfg();
+  const head = ticket('head', { weight: 4 });
+  const hungry = ticket('hungry', { resources: { memoryBytes: 8 * GIB } });
+  const fits = ticket('fits', { weight: 2 });
+  await enqueue(state, head);
+  await enqueue(state, hungry);
+  await enqueue(state, fits);
+  await pollMem(state, head, cfg);
+
+  assert.equal((await pollMem(state, hungry, cfg)).reason, 'not-head', 'refused by selection, not by its own admission');
+  assert.equal((await pollMem(state, fits, cfg)).started, true);
+});
+
+test('15: a stale snapshot is pessimistic until the head polls again, and an optimistic pick is denied by fresh admission without spending allowance', async () => {
+  const { state } = freshEnv();
+  holdLaneLoad(state);
+  const cfg = baseCfg();
+  const head = ticket('head', { weight: 4 });
+  const small = ticket('small');
+  await enqueue(state, head);
+  await enqueue(state, small);
+
+  await pollMem(state, head, cfg, { mem: tightMemory({ availableBytes: 4 * GIB }) }); // small fails this snapshot
+  assert.equal((await pollMem(state, small, cfg, { mem: memory() })).reason, 'not-head', 'pessimistic: memory is free now but the snapshot says no');
+  await pollMem(state, head, cfg); // head's next poll refreshes the snapshot to 7 GiB
+  assert.equal((await pollMem(state, small, cfg, { mem: tightMemory({ availableBytes: 3 * GIB }) })).reason, 'memory-admission', 'optimistic pick, denied by fresh admission');
+  assert.equal(readLease(state, 'small'), null);
+  assert.equal(readResourceSkipState(state).count, 0, 'a denied pick spends no allowance');
+  assert.equal((await pollMem(state, small, cfg)).started, true);
+});
+
+test('16: a joint CPU and memory denial is in scope (the idle exemption is test 8)', async () => {
+  const { state } = freshEnv();
+  holdLaneLoad(state); // unobserved lease: not futile, so only scope decides whether a record exists
+  const head = ticket('head', { weight: 4 });
+  await enqueue(state, head);
+  const result = await pollLaneBlocked(state, head, baseCfg(), { mem: tightMemory() });
+  assert.equal(result.cpuReason, 'projected-over-budget');
+  assert.equal(result.memoryReason, 'memory-headroom');
+  assert.equal(readResourceSkipState(state).inScope, true);
+});
+
+test('17: shadow mode writes no record for a memory denial', async () => {
+  const { state } = freshEnv();
+  holdLaneLoad(state);
+  const head = ticket('head', { weight: 4 });
+  await enqueue(state, head);
+  await pollMem(state, head, baseCfg({ schedulerMode: 'shadow' }));
+  assert.equal(fs.existsSync(paths(state).resourceSkipState), false);
+});
+
+test('18 v2: a memory reservation is acquired, a second owner stays dormant, and reactivates when the first leaves', async () => {
+  const { state } = freshEnv();
+  atomicWriteJson(paths(state).schedFence, { version: 2, migratedAt: Date.now() });
+  fenceLegacyQueue(state, 'test');
+  atomicWriteJson(paths(state).fairness, { version: 2, tickets: {} });
+  holdLaneLoad(state);
+  const cfg = baseCfg();
+  const dormant = { reason: 'resource', skipsCharged: 3, reserved: true, reservationSeq: 1_000_000, inScope: true, behindConflict: false, deniedAt: Date.now(), budget: 9, externalBusy: 0 };
+  const a = ticket('a', { weight: 4 });
+  const b = ticket('b', { weight: 4 });
+  await enqueue(state, a);
+  await enqueue(state, b);
+  const stored = (id) => JSON.parse(fs.readFileSync(paths(state).fairness, 'utf8')).tickets[id]?.resource;
+  const owner = () => {
+    const sched = resolveScheduler(state, { log: false });
+    return effectiveView(listQueue(state), Date.now(), cfg, fairnessStore(state, sched.tickets)).ownerId;
+  };
+
+  assert.equal((await pollMem(state, a, cfg)).memoryReason, 'memory-headroom');
+  for (let i = 0; i < 3; i += 1) {
+    const s = ticket(`s${i}`);
+    await enqueue(state, s);
+    assert.equal((await pollMem(state, s, cfg)).started, true, `backfill ${i}`);
+    removeLease(state, s.id);
+  }
+  assert.equal(stored('a').reserved, true);
+  assert.ok(Number.isInteger(stored('a').reservationSeq), 'the memory reservation drew an ordering sequence');
+
+  const tickets = JSON.parse(fs.readFileSync(paths(state).fairness, 'utf8'));
+  tickets.tickets.b = { resource: dormant };
+  atomicWriteJson(paths(state).fairness, tickets);
+  assert.equal(owner(), 'a', 'the earlier reservation stays the active one; b is dormant');
+
+  removeLease(state, 'lane-load');
+  assert.equal((await poll(state, a, cfg, { ext: 0 })).started, true);
+  removeLease(state, 'a');
+  assert.equal(owner(), 'b', 'b reactivates once a has left');
+  writeLease(state, heldLease('lane-load', 'lane:load', 2));
+  const extra = ticket('extra');
+  await enqueue(state, extra);
+  assert.equal((await pollMem(state, b, cfg)).memoryReason, 'memory-headroom');
+  assert.equal((await pollMem(state, extra, cfg)).reason, 'not-head', 'b\'s reservation now refuses overtaking');
 });
