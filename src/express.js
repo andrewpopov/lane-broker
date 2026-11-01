@@ -148,13 +148,16 @@ export function expressVerdict(table, ticket, cfg) {
 /**
  * BRAIN-756: the expected run ms and source when the ticket is predicted under `cfg.queueBypassMaxMs`: its exact command's
  * history when it has enough, else its command family's, never the lane's. At most BYPASS_MAX_STRIKES of the last
- * BYPASS_WINDOW_RUNS runs may have been over the threshold. Null otherwise (no history is not a prediction).
+ * BYPASS_WINDOW_RUNS runs may have been over the threshold. Otherwise `{ refused }` names why (no history is not a prediction).
  */
 export function bypassVerdict(table, ticket, cfg) {
   const byCommand = ticket.cmdFingerprint ? table.bypass[bypassId(ticket.repoId, ticket.lane, 'command', ticket.cmdFingerprint)] : undefined;
   const family = byCommand ? undefined : table.bypass[bypassId(ticket.repoId, ticket.lane, 'family', commandFamily(ticket.command ?? ticket.cmd?.join(' ')))];
   const entry = byCommand ?? family;
-  return entry && entry.medianMs < cfg.queueBypassMaxMs && entry.strikes <= BYPASS_MAX_STRIKES ? { ms: entry.medianMs, source: byCommand ? 'command' : 'family' } : null;
+  if (!entry) return { refused: 'no-history' };
+  if (!(entry.medianMs < cfg.queueBypassMaxMs)) return { refused: 'median-over-max' };
+  if (entry.strikes > BYPASS_MAX_STRIKES) return { refused: 'too-many-strikes' };
+  return { ms: entry.medianMs, source: byCommand ? 'command' : 'family' };
 }
 
 const recentAdmissions = (root, now) => {

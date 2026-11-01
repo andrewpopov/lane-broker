@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { freshEnv, writeGlobalConfig } from './helpers.js';
-import { enqueue, tryStart, couldBypassNow } from '../src/scheduler.js';
+import { enqueue, tryStart, couldBypassNow, readQueuedRecord } from '../src/scheduler.js';
 import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig } from '../src/config.js';
 import { writeLease, listLeases, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths, atomicWriteJson } from '../src/state.js';
@@ -122,7 +122,7 @@ test('a command family with enough runs predicts a ticket whose exact command is
   const table = { bypass: buildBypassTable(Array.from({ length: 4 }, (_, i) => run(i, { cmdFingerprint: `other${i}`, command: 'pnpm test --silent ./x' })), MAX_MS) };
   const cfg = baseCfg();
   assert.deepEqual(bypassVerdict(table, ticket('a', { cmdFingerprint: 'new' }), cfg), { ms: 10_000, source: 'family' });
-  assert.equal(bypassVerdict(table, ticket('a', { cmd: ['pnpm', 'lint'], command: 'pnpm lint' }), cfg), null);
+  assert.deepEqual(bypassVerdict(table, ticket('a', { cmd: ['pnpm', 'lint'], command: 'pnpm lint' }), cfg), { refused: 'no-history' });
 });
 
 test('more than 3 of the last 20 runs over 60 s refuse the bypass, and failed and cancelled runs count as strikes', async () => {
@@ -410,7 +410,7 @@ test('commands with shell syntax have no family, so they never collide, and an e
   assert.deepEqual(Object.keys(table.bypass).filter((id) => id.includes('"family"')), []);
   const cfg = baseCfg();
   assert.deepEqual(bypassVerdict(table, ticket('a', { command: short, cmd: short.split(' '), cmdFingerprint: 'short' }), cfg), { ms: 10_000, source: 'command' });
-  assert.equal(bypassVerdict(table, ticket('b', { command: "sh -c 'echo ok && true'", cmdFingerprint: 'unseen' }), cfg), null);
+  assert.deepEqual(bypassVerdict(table, ticket('b', { command: "sh -c 'echo ok && true'", cmdFingerprint: 'unseen' }), cfg), { refused: 'no-history' });
 });
 
 const probeNow = (state, t = ticket('a'), cfg = baseCfg(), mem = memory()) => couldBypassNow(state, cfg, t, mem);
@@ -486,4 +486,130 @@ test('couldBypassNow ignores the admission cooldown that couldAdmitNow honours',
   seedRuns(state);
   writeLease(state, held('recent', { admittedAt: Date.now() }));
   assert.equal((await probeNow(state, ticket('a'), baseCfg({ admissionCooldownMs: 60_000 }))).admit, true);
+});
+
+const refusedLines = (state) => readLog(state).split('\n').filter((l) => l.includes('lane-broker-bypass-refused')).map((l) => l.slice(l.indexOf('lane-broker-bypass-refused')));
+const recordedReason = (state, id) => readQueuedRecord(state, id)?.bypassRefused;
+const pushGate = { caller: 'push', gitPid: 4242, gitStartEpoch: 1, worktree: '/wt/push', branch: 'push', pushArgsHash: 'push' };
+const otherHead = (extra = {}) => ticket('head', { key: 'r:head', cmdFingerprint: 'h', command: 'h', ...extra });
+
+// each case differs from the history row's other fields (lane quick, weight 1, exit 0) in exactly the cause under test
+const REFUSALS = {
+  'no-history': { setup: () => {} },
+  'median-over-max': { setup: (state) => seed(state, [run(0), run(1, { runMs: 70_000 }), run(2, { runMs: 70_000 })]) },
+  'too-many-strikes': {
+    setup: (state) => {
+      seedRuns(state, 16);
+      seed(state, [0, 1, 2, 3].map((i) => run(100 + i, { runMs: 120_000 })));
+    },
+  },
+  'not-active': { cfg: { schedulerMode: 'shadow' }, head: otherHead() },
+  'cap-full': { setup: (state) => Array.from({ length: CAP }, (_, i) => writeLease(state, bypassLease(`b${i}`))) },
+  'excluded-lane': { lane: 'train', history: { lane: 'train' } },
+  'exclusive-ahead': { head: otherHead({ weight: 4 }), after: (state) => queued(state, ticket('x', { exclusive: true, key: 'r:x', cmdFingerprint: 'other', command: 'other' })) },
+  exclusive: { head: otherHead(), overrides: { exclusive: true } },
+  sim: { head: otherHead(), overrides: { class: 'sim' } },
+  conflict: { head: otherHead(), setup: (state) => writeLease(state, held('holder', { key: 'r:a' })) },
+  capacity: { head: otherHead(), setup: (state) => writeLease(state, held('holder', { weight: 6 })) },
+  'elastic-floor': { overrides: { resources: { cpuCores: 40, minCpuCores: 30 } } },
+  'yields-push-gate': { cfg: { floorOvershootCores: 3 }, head: otherHead(), setup: (state) => queued(state, ticket('push', { lane: 'prepush', cmdFingerprint: 'p', command: 'p', pushGate })) },
+  'yields-aged-head': { head: agedHead({ conflicts: ['r:b', 'r:a'] }), setup: (state) => writeLease(state, bypassLease('b0', 1000, { key: 'r:b' })) },
+  memory: { mem: memory({ availableBytes: 1 }) },
+  'reason-not-lifted': { sampler: () => null, setup: (state) => writeLease(state, held('other')) },
+  'load-gate': {
+    cfg: { admissionLoadGate: true },
+    load: () => 5000,
+    setup: (state) => writeLease(state, held('other')),
+  },
+  paused: { setup: (state) => fs.writeFileSync(paths(state).pause, 'maintenance') },
+};
+
+for (const [reason, c] of Object.entries(REFUSALS)) {
+  test(`a poll that does not start the ticket records bypassRefused=${reason} on its queue record and logs it once`, async () => {
+    const { state } = freshEnv();
+    if (reason !== 'no-history' && reason !== 'median-over-max' && reason !== 'too-many-strikes') seedRuns(state, 5, c.history);
+    await c.setup?.(state);
+    if (c.head) await queued(state, c.head);
+    await c.after?.(state);
+    const t = await queued(state, ticket('a', { ...(c.lane ? { lane: c.lane } : {}), ...c.overrides }));
+    const cfg = baseCfg(c.cfg);
+    const result = await tryStart(state, t, cfg, c.load, c.sampler ?? sampler(), undefined, c.mem ?? memory());
+    assert.equal(result.started, false);
+    assert.equal(recordedReason(state, 'a'), reason);
+    assert.deepEqual(refusedLines(state), [`lane-broker-bypass-refused candidate=a reason=${reason} previous=none`]);
+    await tryStart(state, t, cfg, c.load, c.sampler ?? sampler(), undefined, c.mem ?? memory());
+    assert.equal(refusedLines(state).length, 1, 'an unchanged reason adds no line');
+  });
+}
+
+test('a changed reason writes a second line naming the previous one', async () => {
+  const { state } = freshEnv();
+  const t = await queued(state, ticket('a'));
+  await poll(state, t);
+  seedRuns(state);
+  fs.rmSync(paths(state).expressEstimates);
+  fs.writeFileSync(paths(state).pause, 'maintenance');
+  await poll(state, t);
+  await poll(state, t);
+  assert.equal(recordedReason(state, 'a'), 'paused');
+  assert.deepEqual(refusedLines(state), ['lane-broker-bypass-refused candidate=a reason=no-history previous=none', 'lane-broker-bypass-refused candidate=a reason=paused previous=no-history']);
+});
+
+test('repeated polls with one reason rewrite the queue record once', async () => {
+  const { state } = freshEnv();
+  const t = await queued(state, ticket('a'));
+  const writes = [];
+  const seams = { writeQueueRecord: (file, record) => (writes.push(record.bypassRefused), atomicWriteJson(file, record)) };
+  for (let i = 0; i < 3; i += 1) await tryStart(state, t, baseCfg(), undefined, sampler(), undefined, memory(), undefined, seams);
+  assert.deepEqual(writes, ['no-history']);
+});
+
+test('the reason reaches the lease and the history row of a ticket that later starts ordinarily; a bypass start drops it', async () => {
+  const { state } = freshEnv();
+  const t = await queued(state, ticket('a', { lane: 'slow' }));
+  await poll(state, t);
+  const started = await poll(state, t, baseCfg(), 1);
+  assert.equal(started.started, true);
+  assert.equal(started.lease.bypassRefused, 'no-history');
+  assert.equal('queueBypass' in started.lease, false);
+  const row = historyRow(t, { id: 'a', exit: 0, startedAt: 1, endedAt: 2 }, { lease: started.lease });
+  assert.equal(row.bypassRefused, 'no-history');
+  assert.equal('bypassRefused' in historyRow(t, { id: 'a', exit: 0 }, { lease: held('a') }), false);
+
+  const full = freshEnv().state;
+  seedRuns(full);
+  for (let i = 0; i < CAP; i += 1) writeLease(full, bypassLease(`b${i}`));
+  const b = await queued(full, ticket('b'));
+  await poll(full, b);
+  assert.equal(recordedReason(full, 'b'), 'cap-full');
+  for (let i = 0; i < CAP; i += 1) writeLease(full, held(`b${i}`));
+  const viaBypass = await poll(full, b);
+  assert.equal(viaBypass.started, true);
+  assert.ok(viaBypass.lease.queueBypass);
+  assert.equal('bypassRefused' in viaBypass.lease, false);
+});
+
+test('queueBypassCap 0 records nothing and writes no queue record or line', async () => {
+  const { state } = freshEnv();
+  const t = await queued(state, ticket('a'));
+  const before = readQueuedRecord(state, 'a');
+  const seams = { writeQueueRecord: () => assert.fail('no queue record write with the cap at 0') };
+  assert.equal((await tryStart(state, t, baseCfg({ queueBypassCap: 0 }), undefined, sampler(), undefined, memory(), undefined, seams)).started, false);
+  assert.deepEqual(readQueuedRecord(state, 'a'), before);
+  assert.deepEqual(refusedLines(state), []);
+});
+
+test('a failed record write neither refuses nor delays a start, and writes no line', async () => {
+  const { state } = freshEnv();
+  const t = await queued(state, ticket('a'));
+  const seams = {
+    writeQueueRecord: () => {
+      throw new Error('disk full');
+    },
+  };
+  const first = await tryStart(state, t, baseCfg(), undefined, sampler(), undefined, memory(), undefined, seams);
+  assert.equal(first.started, false);
+  assert.equal(recordedReason(state, 'a'), undefined);
+  assert.deepEqual(refusedLines(state), []);
+  assert.equal((await tryStart(state, t, baseCfg(), undefined, sampler(1), undefined, memory(), undefined, seams)).started, true);
 });

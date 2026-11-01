@@ -520,6 +520,7 @@ export function historyRow(ticket, result, { fallbackReason, lease, contentKey =
     // BRAIN-380 §8: only a ticket that was admitted has a lease, so only its row carries the admission audit
     ...priorityAuditOf(lease),
     ...(lease?.queueBypass ? { queueBypass: lease.queueBypass } : {}),
+    ...(lease?.bypassRefused ? { bypassRefused: lease.bypassRefused } : {}),
     // BRAIN-425: every row states what the lane was granted and how it ended; a grant or exit in `result` wins
     ...terminalRowDefaults({ resources: ticket.resources, grantedCpuCores: lease?.grantedCpuCores }),
     ...result,

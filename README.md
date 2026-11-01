@@ -1689,6 +1689,14 @@ history supports it) bounds how many such leases are held at once.
   Bypass leases do not start the admission cooldown for ordinary tickets.
 - **Bound**: an eligible ticket starts at its next poll while a slot is free and it is not refused above; otherwise it keeps
   its ordinary queue place. A bypass uses no express rate or skip allowance.
+- **Why not**: with `queueBypassCap` above 0, a queued ticket that does not start records why it did not take the bypass as
+  `bypassRefused` on its queue record, rewritten only when the reason changes (a failed write never delays a start), with
+  one `admission-decisions.log` line per change: `lane-broker-bypass-refused candidate=<id> reason=<reason> previous=<reason|none>`.
+  Prediction: `no-history`, `median-over-max`, `too-many-strikes`. Trial: `not-active`, `cap-full`, `exclusive`,
+  `excluded-lane`, `sim`, `exclusive-ahead`, `conflict`, `capacity`, `elastic-floor`. Admission: `yields-push-gate`,
+  `yields-aged-head`, `memory`, `reason-not-lifted`, `load-gate`, `paused`. The last reason is copied onto the lease and the
+  history row (`bypassRefused`) unless the ticket started by bypass; a ticket removed before the rule is reached (not in the
+  queue, cap-denied sim, push hold, exclusive denial, unreadable head) keeps its last reason.
 
 **Placement.** When every usable runner has a queue and this machine cannot admit the ticket now (typically a ticket
 queued ahead), a ticket that is locally eligible and would pass the bypass (the gates it does not lift, the cap and the
