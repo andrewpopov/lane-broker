@@ -45,6 +45,9 @@ import {
 
 class DispatchOnlyError extends Error {}
 
+/** BRAIN-769: a local run's own preparation (deps or setup) failed, so the command never ran: infrastructure, not a verdict on the command. */
+export const LOCAL_SETUP_FAILED_EXIT_CODE = 77;
+
 /** BRAIN-634: re-evaluated (fresh config read + marker + env) at every point this pipeline would execute something. */
 function assertLocalExecutionAllowed() {
   if (isDispatchOnly(reloadGlobalConfig(undefined))) throw new DispatchOnlyError(dispatchOnlyRefusal('remote-pipeline').message.trim());
@@ -282,7 +285,7 @@ async function publishAndEvict(depsCache, key, cwd, releaseLeases, relocation, k
 }
 
 /** Install one deps dir: from the store on a hit, else `npm ci` (then publish when that is safe). */
-async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases, npmVersion }) {
+async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases, npmVersion, localTree }) {
   const started = Date.now();
   const cwd = dir === '.' ? workDir : path.join(workDir, dir);
   const done = (outcome, fields = {}) => {
@@ -299,6 +302,8 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
       ...(fields.keyDiff?.length ? { keyDiff: fields.keyDiff } : {}),
     };
   };
+
+  if (localTree && localDepsCurrent(cwd)) return { exitCode: 0, record: done('skip', { reason: 'current' }) };
 
   let keyed = { key: null, reason: 'disabled' };
   let npmConfig;
@@ -369,6 +374,16 @@ function missingInstalled(tree, lock) {
   return missing.length > 0 ? missing : null;
 }
 
+/** BRAIN-769: the tree's `node_modules` holds every platform-applicable lock entry on disk, at the locked version, source and integrity, so `npm ci` would change nothing. */
+function localDepsCurrent(cwd) {
+  const lock = readJsonSafe(path.join(cwd, 'package-lock.json'));
+  const tree = path.join(cwd, 'node_modules');
+  if (!lock?.packages || missingInstalled(tree, lock)) return false;
+  const installed = readJsonSafe(path.join(tree, '.package-lock.json')).packages;
+  const sameLocked = (name, entry) => ['version', 'resolved', 'integrity'].every((field) => entry[field] === undefined || installed[name][field] === entry[field]);
+  return Object.entries(lock.packages).every(([name, entry]) => name === '' || !entry || !installed[name] || (fs.existsSync(path.join(cwd, name)) && sameLocked(name, entry)));
+}
+
 function aggregateDepsOutcome(records) {
   if (records.some((r) => r.outcome === 'miss')) return 'miss';
   return records.length > 0 && records.every((r) => r.outcome === 'hit') ? 'hit' : 'skip';
@@ -378,7 +393,7 @@ function aggregateDepsOutcome(records) {
  * The deps phase: every dir in order, stopping at the first failed install. Records
  * `<ticketDir>/deps.json` (outcome, wall ms, per-dir detail) for `remote-exec` to put in the result.
  */
-async function runDepsPhase({ ticketDir, workDir, remoteDeps, depsEnv, depsCache, releaseLeases }) {
+async function runDepsPhase({ ticketDir, workDir, remoteDeps, depsEnv, depsCache, releaseLeases, localTree }) {
   const phaseStart = Date.now();
   let npmVersionMemo;
   const npmVersion = () => {
@@ -388,7 +403,7 @@ async function runDepsPhase({ ticketDir, workDir, remoteDeps, depsEnv, depsCache
   const records = [];
   let exitCode = 0;
   for (const dir of remoteDeps) {
-    const r = await installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases, npmVersion });
+    const r = await installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases, npmVersion, localTree });
     records.push(r.record);
     if (r.exitCode !== 0) {
       exitCode = r.exitCode;
@@ -412,6 +427,14 @@ export async function remotePipelineCommand(ticketDir) {
     process.stderr.write(`lane remote-pipeline: missing or invalid pipeline.json in ${ticketDir}\n`);
     return { exitCode: 1 };
   }
+  if (!payload.pipelineLockPath) return runPipeline(ticketDir, payload);
+  // BRAIN-769: the supervisor's tree lock dies with a SIGKILLed supervisor; this one is owned by the pipeline, which outlives it. Losing both
+  // while a grandchild survives is an accepted residual.
+  return withLock(path.dirname(payload.pipelineLockPath), () => runPipeline(ticketDir, payload), { lockPath: payload.pipelineLockPath, group: 'tree', timeoutMs: payload.pipelineLockWaitMs });
+}
+
+async function runPipeline(ticketDir, payload) {
+  const localTree = payload.localTree === true;
   const { workDir, relCwd, remoteDeps = [], remoteSetup = [], argv, npmCacheDir, npmUserConfig, depsCache } = payload;
   const npmGlobalConfig = path.join(path.dirname(npmUserConfig), 'npmrc-global');
   ensureNpmrcFile(npmUserConfig);
@@ -423,6 +446,10 @@ export async function remotePipelineCommand(ticketDir) {
   // A stage that did not run has no key; one that failed is still timed, in `finally`.
   const phasesMs = {};
   let stage = null;
+  const localSetupFailed = (phase) => {
+    process.stderr.write(`lane: local-setup failed (${phase}) — infrastructure, not the command\n`);
+    return { exitCode: LOCAL_SETUP_FAILED_EXIT_CODE };
+  };
   const startStage = (key) => {
     stage = { key, startedAt: Date.now() };
   };
@@ -436,9 +463,9 @@ export async function remotePipelineCommand(ticketDir) {
       writePhase(ticketDir, 'deps');
       startStage('depsMs');
       const depsEnv = buildDepsEnv(npmCacheDir, npmUserConfig, npmGlobalConfig);
-      const code = await runDepsPhase({ ticketDir, workDir, remoteDeps, depsEnv, depsCache, releaseLeases });
+      const code = await runDepsPhase({ ticketDir, workDir, remoteDeps, depsEnv, depsCache, releaseLeases, localTree });
       endStage();
-      if (code !== 0) return { exitCode: code };
+      if (code !== 0) return localTree ? localSetupFailed('deps') : { exitCode: code };
     }
 
     if (remoteSetup.length > 0) {
@@ -447,7 +474,7 @@ export async function remotePipelineCommand(ticketDir) {
       startStage('setupMs');
       for (const setupArgv of remoteSetup) {
         const code = await runPhaseCommand(setupArgv, workDir, process.env);
-        if (code !== 0) return { exitCode: code };
+        if (code !== 0) return localTree ? localSetupFailed('setup') : { exitCode: code };
       }
       endStage();
     }
@@ -459,6 +486,10 @@ export async function remotePipelineCommand(ticketDir) {
     const code = await runPhaseCommand(argv, cmdCwd, process.env);
     return { exitCode: code };
   } catch (err) {
+    if (localTree && !(err instanceof DispatchOnlyError) && (stage?.key === 'depsMs' || stage?.key === 'setupMs')) {
+      process.stderr.write(`lane remote-pipeline: ${err.message}\n`);
+      return localSetupFailed(stage.key === 'depsMs' ? 'deps' : 'setup');
+    }
     if (!(err instanceof DispatchOnlyError)) throw err;
     process.stderr.write(`${err.message}\n`);
     return { exitCode: LOCAL_REFUSED_EXIT_CODE };

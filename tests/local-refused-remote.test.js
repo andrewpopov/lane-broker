@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { laneRun, writeRepoConfig } from './helpers.js';
+import { execFileSync } from 'node:child_process';
+import { laneRun, writeRepoConfig, gitFixture, waitFor } from './helpers.js';
 import { paths } from '../src/state.js';
 import { locallyRefusedNow, localWindowAllowing } from '../src/resources.js';
 import { setup as remoteSetup, tmpDir, markerCmd, detachAndWait, resultOf } from './remote-harness.js';
@@ -249,4 +250,253 @@ test('BRAIN-629: locallyRefusedNow follows the clock: closed at 00:50, open at 0
   assert.equal(locallyRefusedNow({ ...e2e, lane: 'sim' }, globalCfg, at('03:00')), true, 'an unlisted lane stays refused in the window');
   assert.equal(locallyRefusedNow({ ...e2e, localRefused: false }, globalCfg, at('00:50')), false);
   assert.equal(locallyRefusedNow(e2e, { localWindow: null }, at('03:00')), true);
+});
+
+// ---- BRAIN-769: a lane that fell back to a local run prepares its tree first ----
+
+const NPMRC = 'registry=http://127.0.0.1:9\nfetch-retries=0\nfetch-timeout=2000\n';
+const REAL_NPM = execFileSync('which', ['npm'], { encoding: 'utf8' }).trim();
+
+/** package.json, package-lock.json and a tarball dependency, built once with real npm offline. */
+const depsFixture = (() => {
+  let built;
+  return () => {
+    if (built) return built;
+    const dir = tmpDir('brain769-fixture');
+    const npmEnv = { ...process.env, HOME: dir, npm_config_cache: path.join(dir, 'cache'), npm_config_userconfig: path.join(dir, 'userrc') };
+    const tool = path.join(dir, 'tool');
+    const app = path.join(dir, 'app');
+    fs.mkdirSync(tool, { recursive: true });
+    fs.mkdirSync(app);
+    fs.writeFileSync(path.join(tool, 'package.json'), JSON.stringify({ name: 'hello-tool', version: '1.0.0' }));
+    execFileSync(REAL_NPM, ['pack', '--silent', '--pack-destination', app], { cwd: tool, env: npmEnv });
+    fs.writeFileSync(path.join(app, 'package.json'), JSON.stringify({ name: 'app', version: '1.0.0', private: true, dependencies: { 'hello-tool': 'file:./hello-tool-1.0.0.tgz' } }));
+    execFileSync(REAL_NPM, ['install', '--offline', '--ignore-scripts', '--no-audit', '--no-fund'], { cwd: app, env: npmEnv });
+    built = Object.fromEntries(['package.json', 'package-lock.json', 'hello-tool-1.0.0.tgz'].map((f) => [f, fs.readFileSync(path.join(app, f))]));
+    return built;
+  };
+})();
+
+/** An ALWAYS_OPEN window harness whose repo is a committed tree with the fixture app and the given lane declarations; no node_modules. */
+function setupPrep(laneDecl) {
+  const ctx = setupWindow({ schedule: ALWAYS_OPEN, lanes: ['e2e'] });
+  for (const [name, content] of Object.entries(depsFixture())) fs.writeFileSync(path.join(ctx.repoDir, name), content);
+  fs.writeFileSync(path.join(ctx.repoDir, '.npmrc'), NPMRC);
+  fs.mkdirSync(path.join(ctx.repoDir, 'sub'));
+  fs.writeFileSync(path.join(ctx.repoDir, 'sub', 'keep'), '');
+  writeRepoConfig(ctx.repoDir, {
+    version: 1,
+    lanes: { e2e: { weight: 1, remote: true, localRefused: true, ...laneDecl }, plain: { weight: 1, remote: true, ...laneDecl } },
+  });
+  gitFixture(['add', '-A'], ctx.repoDir);
+  gitFixture(['commit', '-q', '-m', 'fixture'], ctx.repoDir);
+  return ctx;
+}
+
+/** A command that records, in `marker`, its cwd and whether the fixture dependency resolves from there. */
+const probeCmd = (marker) => [
+  'node',
+  '-e',
+  `const fs = require('fs'); fs.writeFileSync(${JSON.stringify(marker)}, JSON.stringify({ cwd: fs.realpathSync(process.cwd()), dep: require('module').createRequire(process.cwd() + '/').resolve.paths('x').some((p) => fs.existsSync(p + '/hello-tool/package.json')) }))`,
+];
+const SETUP_MARK = (file) => ['node', '-e', `require('fs').appendFileSync(${JSON.stringify(file)}, 'x')`];
+
+async function runPrepLane(ctx, cmd, { lane = 'e2e', cwd = ctx.repoDir, extra = [] } = {}) {
+  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', lane, '--detach', ...extra, '--', ...cmd], ctx.env, cwd);
+  return { id, waited, log: () => fs.readFileSync(path.join(paths(ctx.state).logs, `${id}.log`), 'utf8') };
+}
+
+test('BRAIN-769: a fallback lane in a tree lacking node_modules installs, then runs the command', async () => {
+  const ctx = setupPrep({ remoteDeps: ['.'] });
+  const marker = path.join(tmpDir('marker'), 'probe.json');
+  const { waited } = await runPrepLane(ctx, probeCmd(marker));
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(JSON.parse(fs.readFileSync(marker, 'utf8')).dep, true, 'the dependency was installed before the command ran');
+  assert.ok(fs.existsSync(path.join(ctx.repoDir, 'node_modules', 'hello-tool', 'package.json')));
+  assert.match(fs.readFileSync(paths(ctx.state).admissionLog, 'utf8'), /preparing tree before local run/);
+});
+
+test('BRAIN-769: a failed setup exits 77 with the infrastructure message and the command never runs', async () => {
+  const ctx = setupPrep({ remoteDeps: ['.'], remoteSetup: [['node', '-e', 'process.exit(3)']] });
+  const marker = path.join(tmpDir('marker'), 'probe.json');
+  const { waited, log } = await runPrepLane(ctx, probeCmd(marker));
+  assert.equal(waited.code, 77, `stderr: ${waited.stderr}`);
+  assert.equal(fs.existsSync(marker), false, 'the command must not run in an unprepared tree');
+  assert.match(log(), /lane: local-setup failed \(setup\) — infrastructure, not the command/);
+});
+
+test('BRAIN-769: a tree whose dependencies are current is not reinstalled', async () => {
+  const ctx = setupPrep({ remoteDeps: ['.'] });
+  const first = await runPrepLane(ctx, ['node', '-e', '0']);
+  assert.equal(first.waited.code, 0, `stderr: ${first.waited.stderr}`);
+  const sentinel = path.join(ctx.repoDir, 'node_modules', 'sentinel');
+  fs.writeFileSync(sentinel, '');
+  const marker = path.join(tmpDir('marker'), 'probe.json');
+  const second = await runPrepLane(ctx, probeCmd(marker));
+  assert.equal(second.waited.code, 0, `stderr: ${second.waited.stderr}`);
+  assert.ok(fs.existsSync(sentinel), 'npm ci would have removed node_modules');
+  assert.equal(JSON.parse(fs.readFileSync(marker, 'utf8')).dep, true);
+});
+
+test('BRAIN-769: a stale tree (locked version differs from the installed one) is reinstalled', async () => {
+  const ctx = setupPrep({ remoteDeps: ['.'] });
+  await runPrepLane(ctx, ['node', '-e', '0']);
+  const hiddenFile = path.join(ctx.repoDir, 'node_modules', '.package-lock.json');
+  const hidden = JSON.parse(fs.readFileSync(hiddenFile, 'utf8'));
+  hidden.packages['node_modules/hello-tool'].version = '0.0.1';
+  fs.writeFileSync(hiddenFile, JSON.stringify(hidden));
+  const sentinel = path.join(ctx.repoDir, 'node_modules', 'sentinel');
+  fs.writeFileSync(sentinel, '');
+  const { waited } = await runPrepLane(ctx, ['node', '-e', '0']);
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.existsSync(sentinel), false, 'npm ci replaced the stale tree');
+});
+
+test('BRAIN-769: a setup-only lane runs its setup before the command', async () => {
+  const setupLog = path.join(tmpDir('marker'), 'setup.log');
+  const ctx = setupPrep({ remoteSetup: [SETUP_MARK(setupLog)] });
+  const marker = path.join(tmpDir('marker'), 'probe.json');
+  const { waited } = await runPrepLane(ctx, probeCmd(marker));
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(setupLog, 'utf8'), 'x');
+  assert.ok(fs.existsSync(marker));
+});
+
+test('BRAIN-769: a command started in a subdirectory runs in that subdirectory of the prepared tree', async () => {
+  const ctx = setupPrep({ remoteDeps: ['.'] });
+  const marker = path.join(tmpDir('marker'), 'probe.json');
+  const { waited } = await runPrepLane(ctx, probeCmd(marker), { cwd: path.join(ctx.repoDir, 'sub') });
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  const probe = JSON.parse(fs.readFileSync(marker, 'utf8'));
+  assert.equal(probe.cwd, fs.realpathSync(path.join(ctx.repoDir, 'sub')));
+  assert.equal(probe.dep, true, 'the root install is visible from the subdirectory');
+});
+
+test('BRAIN-769: an explicit --local run does not prepare the tree', async () => {
+  const setupLog = path.join(tmpDir('marker'), 'setup.log');
+  const ctx = setupPrep({ remoteDeps: ['.'], remoteSetup: [SETUP_MARK(setupLog)] });
+  const marker = path.join(tmpDir('marker'), 'probe.json');
+  const { waited } = await runPrepLane(ctx, probeCmd(marker), { lane: 'plain', extra: ['--local', '--local-reason', 'needs the lane CLI'] });
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.existsSync(setupLog), false, 'setup must not run');
+  assert.equal(fs.existsSync(path.join(ctx.repoDir, 'node_modules')), false, 'nothing was installed');
+});
+
+test('BRAIN-769: the command\'s own nonzero exit passes through a prepared tree unchanged', async () => {
+  const ctx = setupPrep({ remoteDeps: ['.'] });
+  const { waited } = await runPrepLane(ctx, ['node', '-e', 'process.exit(5)']);
+  assert.equal(waited.code, 5, `stderr: ${waited.stderr}`);
+});
+
+/** Compact lock bytes: `npm ci` leaves them alone, `npm install` would reformat them. */
+const compactLock = () => JSON.stringify(JSON.parse(depsFixture()['package-lock.json']));
+
+test('BRAIN-769: a package deleted from node_modules is reinstalled', async () => {
+  const ctx = setupPrep({ remoteDeps: ['.'] });
+  await runPrepLane(ctx, ['node', '-e', '0']);
+  fs.rmSync(path.join(ctx.repoDir, 'node_modules', 'hello-tool'), { recursive: true });
+  const marker = path.join(tmpDir('marker'), 'probe.json');
+  const { waited } = await runPrepLane(ctx, probeCmd(marker));
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(JSON.parse(fs.readFileSync(marker, 'utf8')).dep, true);
+});
+
+test('BRAIN-769: a same-version dependency whose locked resolved source changed is reinstalled', async () => {
+  const ctx = setupPrep({ remoteDeps: ['.'] });
+  await runPrepLane(ctx, ['node', '-e', '0']);
+  const hiddenFile = path.join(ctx.repoDir, 'node_modules', '.package-lock.json');
+  const hidden = JSON.parse(fs.readFileSync(hiddenFile, 'utf8'));
+  hidden.packages['node_modules/hello-tool'].resolved = 'git+ssh://git@example.invalid/hello-tool.git#0000000';
+  fs.writeFileSync(hiddenFile, JSON.stringify(hidden));
+  const sentinel = path.join(ctx.repoDir, 'node_modules', 'sentinel');
+  fs.writeFileSync(sentinel, '');
+  const { waited } = await runPrepLane(ctx, ['node', '-e', '0']);
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.existsSync(sentinel), false, 'npm ci replaced the tree');
+});
+
+test('BRAIN-769: the prep dir is gone after the spawn fails', async () => {
+  const ctx = setupPrep({ remoteDeps: ['.'] });
+  const gate = tmpDir('hold');
+  const holdEnv = { ...ctx.env, LANE_BROKER_TEST_HOLD_AT: 'local-admitted', LANE_BROKER_TEST_HOLD_READY: path.join(gate, 'ready'), LANE_BROKER_TEST_HOLD_GO: path.join(gate, 'go') };
+  const doomedCwd = path.join(ctx.repoDir, 'sub');
+  const started = await laneRun(['run', '--repo', 'r', '--lane', 'e2e', '--detach', '--', 'node', '-e', '0'], { env: holdEnv, cwd: doomedCwd });
+  assert.equal(started.code, 0, started.stderr);
+  const id = started.stdout.trim();
+  await waitFor(() => fs.existsSync(path.join(gate, 'ready')), { timeoutMs: 30000 });
+  fs.rmSync(doomedCwd, { recursive: true });
+  fs.writeFileSync(path.join(gate, 'go'), '');
+  const waited = await laneRun(['wait', id, '--timeout', '60s'], { env: ctx.env });
+  assert.notEqual(waited.code, 0);
+  assert.equal(fs.existsSync(path.join(ctx.state, 'local-prep', id)), false, 'the prep dir was removed with the failed run');
+});
+
+test('BRAIN-769: two runs in one tree serialise: the second prepares only after the first command ends', async () => {
+  const events = path.join(tmpDir('marker'), 'events.log');
+  const ctx = setupPrep({ remoteDeps: ['.'], remoteSetup: [['node', '-e', `require('fs').appendFileSync(${JSON.stringify(events)}, 'setup\\n')`]] });
+  const slow = ['node', '-e', `const fs = require('fs'); fs.appendFileSync(${JSON.stringify(events)}, 'start\\n'); setTimeout(() => { fs.appendFileSync(${JSON.stringify(events)}, 'end\\n'); }, 2500)`];
+  const a = await laneRun(['run', '--repo', 'r', '--lane', 'e2e', '--detach', '--', ...slow], { env: ctx.env, cwd: ctx.repoDir });
+  await waitFor(() => fs.existsSync(events) && fs.readFileSync(events, 'utf8').includes('start'), { timeoutMs: 60000 });
+  const b = await laneRun(['run', '--repo', 'r', '--lane', 'plain', '--detach', '--', ...slow], { env: ctx.env, cwd: ctx.repoDir });
+  for (const id of [a.stdout.trim(), b.stdout.trim()]) assert.equal((await laneRun(['wait', id, '--timeout', '120s'], { env: ctx.env })).code, 0);
+  assert.deepEqual(fs.readFileSync(events, 'utf8').split('\n').filter(Boolean), ['setup', 'start', 'end', 'setup', 'start', 'end']);
+});
+
+test('BRAIN-769: cancelling a run that waits for the tree lock ends it as cancelled without preparing', async () => {
+  const events = path.join(tmpDir('marker'), 'events.log');
+  const ctx = setupPrep({ remoteDeps: ['.'], remoteSetup: [['node', '-e', `require('fs').appendFileSync(${JSON.stringify(events)}, 'setup\\n')`]] });
+  const hold = ['node', '-e', `require('fs').appendFileSync(${JSON.stringify(events)}, 'start\\n'); setTimeout(() => {}, 30000)`];
+  const a = await laneRun(['run', '--repo', 'r', '--lane', 'e2e', '--detach', '--', ...hold], { env: ctx.env, cwd: ctx.repoDir });
+  await waitFor(() => fs.existsSync(events) && fs.readFileSync(events, 'utf8').includes('start'), { timeoutMs: 60000 });
+  const b = await laneRun(['run', '--repo', 'r', '--lane', 'plain', '--detach', '--', 'node', '-e', '0'], { env: ctx.env, cwd: ctx.repoDir });
+  await new Promise((r) => setTimeout(r, 1500));
+  await laneRun(['cancel', b.stdout.trim()], { env: ctx.env });
+  const waitedB = await laneRun(['wait', b.stdout.trim(), '--timeout', '20s'], { env: ctx.env });
+  assert.equal(waitedB.code, 130, `stderr: ${waitedB.stderr}`);
+  assert.equal(fs.readFileSync(events, 'utf8'), 'setup\nstart\n', 'the waiting run never prepared');
+  await laneRun(['cancel', a.stdout.trim()], { env: ctx.env });
+  await laneRun(['wait', a.stdout.trim(), '--timeout', '20s'], { env: ctx.env });
+});
+
+test('BRAIN-769: a tracked package-lock.json is byte-identical after the install', async () => {
+  const ctx = setupPrep({ remoteDeps: ['.'] });
+  const lockFile = path.join(ctx.repoDir, 'package-lock.json');
+  fs.writeFileSync(lockFile, compactLock());
+  const before = fs.readFileSync(lockFile);
+  const { waited } = await runPrepLane(ctx, ['node', '-e', '0']);
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.ok(fs.existsSync(path.join(ctx.repoDir, 'node_modules', 'hello-tool')));
+  assert.deepEqual(fs.readFileSync(lockFile), before);
+});
+
+test('BRAIN-769: a SIGKILLed supervisor whose pipeline lives on still keeps a second run waiting until the pipeline ends', async () => {
+  const events = path.join(tmpDir('marker'), 'events.log');
+  const ctx = setupPrep({ remoteDeps: ['.'], remoteSetup: [['node', '-e', `require('fs').appendFileSync(${JSON.stringify(events)}, 'setup\\n')`]] });
+  const slow = ['node', '-e', `const fs = require('fs'); fs.appendFileSync(${JSON.stringify(events)}, 'start\\n'); setTimeout(() => { fs.appendFileSync(${JSON.stringify(events)}, 'end\\n'); }, 4000)`];
+  const a = await laneRun(['run', '--repo', 'r', '--lane', 'e2e', '--detach', '--', ...slow], { env: ctx.env, cwd: ctx.repoDir });
+  const idA = a.stdout.trim();
+  await waitFor(() => fs.existsSync(events) && fs.readFileSync(events, 'utf8').includes('start'), { timeoutMs: 60000 });
+  const lease = JSON.parse(fs.readFileSync(path.join(paths(ctx.state).leases, `${idA}.json`), 'utf8'));
+  process.kill(lease.supervisorPid, 'SIGKILL');
+  const b = await laneRun(['run', '--repo', 'r', '--lane', 'plain', '--detach', '--', ...slow], { env: ctx.env, cwd: ctx.repoDir });
+  assert.equal((await laneRun(['wait', b.stdout.trim(), '--timeout', '120s'], { env: ctx.env })).code, 0);
+  assert.deepEqual(fs.readFileSync(events, 'utf8').split('\n').filter(Boolean), ['setup', 'start', 'end', 'setup', 'start', 'end']);
+});
+
+test('BRAIN-769: a tree-lock wait past localTreeLockWaitMs exits 77, removes the prep dir and releases the lease', async () => {
+  const events = path.join(tmpDir('marker'), 'events.log');
+  const ctx = setupPrep({ remoteDeps: ['.'] });
+  const globalFile = path.join(ctx.home, 'config.json');
+  fs.writeFileSync(globalFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(globalFile, 'utf8')), localTreeLockWaitMs: 1500 }));
+  const hold = ['node', '-e', `require('fs').appendFileSync(${JSON.stringify(events)}, 'start\\n'); setTimeout(() => {}, 30000)`];
+  const a = await laneRun(['run', '--repo', 'r', '--lane', 'e2e', '--detach', '--', ...hold], { env: ctx.env, cwd: ctx.repoDir });
+  await waitFor(() => fs.existsSync(events), { timeoutMs: 60000 });
+  const idB = (await laneRun(['run', '--repo', 'r', '--lane', 'plain', '--detach', '--', 'node', '-e', '0'], { env: ctx.env, cwd: ctx.repoDir })).stdout.trim();
+  const waited = await laneRun(['wait', idB, '--timeout', '60s'], { env: ctx.env });
+  assert.equal(waited.code, 77, `stderr: ${waited.stderr}`);
+  assert.match(resultOf(ctx.state, idB).error, /local-setup failed \(tree-lock\) — infrastructure, not the command/);
+  assert.equal(fs.existsSync(path.join(ctx.state, 'local-prep', idB)), false);
+  assert.equal(fs.existsSync(path.join(paths(ctx.state).leases, `${idB}.json`)), false, 'lease released');
+  await laneRun(['cancel', a.stdout.trim()], { env: ctx.env });
+  await laneRun(['wait', a.stdout.trim(), '--timeout', '20s'], { env: ctx.env });
 });
