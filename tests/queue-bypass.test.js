@@ -2,10 +2,10 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { freshEnv, writeGlobalConfig } from './helpers.js';
-import { enqueue, tryStart } from '../src/scheduler.js';
+import { enqueue, tryStart, couldBypassNow } from '../src/scheduler.js';
 import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig } from '../src/config.js';
 import { writeLease, listLeases, LEASE_STATE } from '../src/lease.js';
-import { bootId, paths } from '../src/state.js';
+import { bootId, paths, atomicWriteJson } from '../src/state.js';
 import { cooldownActive } from '../src/admission.js';
 import { buildBypassTable, bypassVerdict, commandFamily } from '../src/express.js';
 import { historyRow } from '../src/supervisor.js';
@@ -382,4 +382,108 @@ test('queueBypassCap and queueBypassMaxMs must be non-negative integers', async 
       }
     }
   });
+});
+
+test('commandFamily looks through env and sh -c wrappers', () => {
+  assert.equal(commandFamily('env FOO=1 pnpm test'), 'pnpm test');
+  assert.equal(commandFamily('env -i -u HOME FOO=1 pnpm -r test src/a.test.js'), 'pnpm test');
+  assert.equal(commandFamily("sh -c 'pnpm test src/a.test.js'"), 'pnpm test');
+  assert.equal(commandFamily('bash -lc "FOO=1 pnpm test"'), 'pnpm test');
+  assert.equal(commandFamily("env A=1 sh -c 'env B=2 bash -lc \"pnpm test\"'"), 'pnpm test');
+  assert.equal(commandFamily('pnpm test src/a.test.js'), commandFamily('pnpm test'));
+});
+
+test('commandFamily is empty for a bare wrapper, a shell on a script and shell syntax', () => {
+  for (const command of ['env', 'env FOO=1', 'sh', 'sh -c', "sh -c ''", 'sh script.sh', 'bash -x ./run.sh', 'env sh script.sh', 'env env env env env pnpm test', "sh -c 'echo ok && true'", 'pnpm test || true', 'pnpm test; ls', 'pnpm test | tee out', 'pnpm test > out', 'cat < in', 'echo $(date)', 'echo `date`']) {
+    assert.equal(commandFamily(command), '', command);
+  }
+});
+
+test('commands with shell syntax have no family, so they never collide, and an exact fingerprint still predicts', () => {
+  const short = "sh -c 'echo ok && true'";
+  const long = "sh -c 'echo ok && sleep 600'";
+  const rows = [
+    ...Array.from({ length: 4 }, (_, i) => run(i, { command: short, cmdFingerprint: 'short' })),
+    ...Array.from({ length: 4 }, (_, i) => run(10 + i, { command: long, cmdFingerprint: 'long', runMs: 600_000, endedAt: 2000 + i + 600_000 })),
+  ];
+  const table = { bypass: buildBypassTable(rows, MAX_MS) };
+  assert.deepEqual(Object.keys(table.bypass).filter((id) => id.includes('"family"')), []);
+  const cfg = baseCfg();
+  assert.deepEqual(bypassVerdict(table, ticket('a', { command: short, cmd: short.split(' '), cmdFingerprint: 'short' }), cfg), { ms: 10_000, source: 'command' });
+  assert.equal(bypassVerdict(table, ticket('b', { command: "sh -c 'echo ok && true'", cmdFingerprint: 'unseen' }), cfg), null);
+});
+
+const probeNow = (state, t = ticket('a'), cfg = baseCfg(), mem = memory()) => couldBypassNow(state, cfg, t, mem);
+
+test('couldBypassNow admits an eligible ticket, with ordinary tickets queued ahead and the CPU gate not consulted', async () => {
+  const { state } = freshEnv();
+  seedRuns(state);
+  assert.deepEqual(await probeNow(state), { admit: true, reason: 'queue-bypass' });
+  await queued(state, ticket('head', { key: 'r:head', weight: 4, cmdFingerprint: 'h', command: 'h' }));
+  assert.deepEqual(await probeNow(state), { admit: true, reason: 'queue-bypass' });
+});
+
+test('couldBypassNow refuses without a prediction, over the strike limit, with the cap full or 0, and behind a queued exclusive ticket', async () => {
+  const none = freshEnv().state;
+  assert.equal((await probeNow(none)).admit, false, 'no history');
+
+  const strikes = freshEnv().state;
+  seedRuns(strikes, 16);
+  seed(strikes, [0, 1, 2, 3].map((i) => run(100 + i, { runMs: 120_000 })));
+  assert.equal((await probeNow(strikes)).admit, false, 'too many strikes');
+
+  const full = freshEnv().state;
+  seedRuns(full);
+  for (const id of ['b1', 'b2', 'b3']) writeLease(full, bypassLease(id, 1000, { key: `r:${id}` }));
+  assert.equal((await probeNow(full)).admit, false, 'cap full');
+
+  const off = freshEnv().state;
+  seedRuns(off);
+  assert.equal((await probeNow(off, ticket('a'), baseCfg({ queueBypassCap: 0 }))).admit, false, 'cap 0');
+
+  const exclusive = freshEnv().state;
+  seedRuns(exclusive);
+  await queued(exclusive, ticket('x', { exclusive: true, key: 'r:x', cmdFingerprint: 'other', command: 'other' }));
+  assert.equal((await probeNow(exclusive)).admit, false, 'exclusive ahead');
+});
+
+test('couldBypassNow keeps the gates a bypass does not lift: memory, pause, load gate, conflict, capacity, exclusive held', async () => {
+  const mem = freshEnv().state;
+  seedRuns(mem);
+  assert.deepEqual(await probeNow(mem, ticket('a'), baseCfg(), memory({ macPressure: 'critical' })), { admit: false, reason: 'memory-critical' });
+  assert.equal((await probeNow(mem, ticket('a'), baseCfg(), memory({ availableBytes: 1 }))).admit, false, 'memory admission');
+
+  const paused = freshEnv().state;
+  seedRuns(paused);
+  fs.writeFileSync(paths(paused).pause, 'maintenance');
+  assert.equal((await probeNow(paused)).reason, 'paused');
+
+  const gate = freshEnv().state;
+  seedRuns(gate);
+  writeLease(gate, held('other'));
+  atomicWriteJson(paths(gate).loadGate, { closed: true, consecutiveUnder: 0 });
+  assert.equal((await probeNow(gate, ticket('a'), baseCfg({ admissionLoadGate: true }))).reason, 'load-gate-closed');
+  assert.equal((await probeNow(gate, ticket('a'), baseCfg({ admissionLoadGate: false }))).admit, true, 'the gate is only judged when enabled');
+
+  const conflict = freshEnv().state;
+  seedRuns(conflict);
+  writeLease(conflict, held('holder', { key: 'r:a' }));
+  assert.equal((await probeNow(conflict)).reason, 'conflict');
+
+  const heavy = freshEnv().state;
+  seedRuns(heavy);
+  writeLease(heavy, held('holder', { weight: 6 }));
+  assert.equal((await probeNow(heavy)).reason, 'capacity');
+
+  const exHeld = freshEnv().state;
+  seedRuns(exHeld);
+  writeLease(exHeld, held('holder', { exclusive: true, weight: 1 }));
+  assert.equal((await probeNow(exHeld)).reason, 'exclusive-held');
+});
+
+test('couldBypassNow ignores the admission cooldown that couldAdmitNow honours', async () => {
+  const { state } = freshEnv();
+  seedRuns(state);
+  writeLease(state, held('recent', { admittedAt: Date.now() }));
+  assert.equal((await probeNow(state, ticket('a'), baseCfg({ admissionCooldownMs: 60_000 }))).admit, true);
 });

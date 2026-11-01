@@ -579,6 +579,29 @@ function couldAdmitLocked(root, cfg, ticket, memoryReader) {
   const queued = listQueue(root);
   const pushHeld = pushHolds(root, queued, held);
   if (queued.some((t) => t === null || !pushHeld.has(t.id))) return { admit: false, reason: 'queue-ahead' };
+  return localGates(root, cfg, ticket, held, memoryReader, { cooldown: true });
+}
+
+/**
+ * Whether this ticket would be started by an ordinary-or-bypass poll right now, ahead of any queued ticket, from the gates a
+ * bypass does not lift (pause, exclusive, conflict, capacity, load gate, memory) plus the shared bypass predicate. Optimistic
+ * placement probe: the fairness yields (a real push gate, an aged head) are not evaluated, and a slot lost to them means an
+ * ordinary local queue wait. Returns `{ admit, reason }`.
+ */
+export async function couldBypassNow(root, cfg, ticket, memoryReader = readMemoryInfo) {
+  return withLock(root, () => {
+    advanceHwm(root);
+    reapStale(root, ticket.id);
+    const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
+    const gates = localGates(root, cfg, ticket, held, memoryReader, { cooldown: false });
+    if (!gates.admit) return gates;
+    const queueAhead = listQueue(root);
+    const weightCapacity = effectiveWeightCapacity(cfg, detectResourceCapacity().cpuCores);
+    return bypassTrialVerdict(root, cfg, ticket, { held, queueAhead, weightCapacity, now: Date.now() }) ? { admit: true, reason: 'queue-bypass' } : { admit: false, reason: 'no-bypass' };
+  });
+}
+
+function localGates(root, cfg, ticket, held, memoryReader, { cooldown }) {
   if (fs.existsSync(paths(root).pause)) return { admit: false, reason: 'paused' };
   if (held.some(isExclusive)) return { admit: false, reason: 'exclusive-held' };
   if (blockedBy(held, ticket)) return { admit: false, reason: 'conflict' };
@@ -595,7 +618,7 @@ function couldAdmitLocked(root, cfg, ticket, memoryReader) {
   }
   if (memInfo && memInfo.macPressure === 'critical') return { admit: false, reason: 'memory-critical' };
   if (cfg.schedulerMode === 'active') {
-    if (cooldownActive(held, cfg)) return { admit: false, reason: 'cooldown' };
+    if (cooldown && cooldownActive(held, cfg)) return { admit: false, reason: 'cooldown' };
     if (memInfo) {
       const candidateResources = resolveTicketResources({
         weight: ticket.weight,
@@ -1089,6 +1112,29 @@ export function selectCandidate(queue, held) {
 const BYPASS_LIFTED_CPU_REASONS = new Set(['cpu-gate-closed', 'cooldown', 'projected-over-budget']);
 const BYPASS_EXCLUDED_LANE = /^(train|release)([-_:.]|$)/;
 
+const bypassLeaseCounts = (cfg, held, now) => {
+  const bypassHeld = held.filter((l) => l.queueBypass);
+  return { bypassHeld, bypassInWindow: bypassHeld.filter((l) => now - l.admittedAt < cfg.queueBypassMaxMs).length };
+};
+
+/** BRAIN-756: the bypass trial rule, shared by tryStart and couldBypassNow: the `{ ms, source }` prediction, or null. */
+function bypassTrialVerdict(root, cfg, ticket, { held, queueAhead, weightCapacity, now }) {
+  const { bypassHeld, bypassInWindow } = bypassLeaseCounts(cfg, held, now);
+  const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
+  return cfg.schedulerMode === 'active' &&
+    bypassInWindow < cfg.queueBypassCap &&
+    bypassHeld.length - bypassInWindow < cfg.queueBypassCap &&
+    !isExclusive(ticket) &&
+    !BYPASS_EXCLUDED_LANE.test(ticket.configLane ?? ticket.lane ?? '') &&
+    classOf(ticket) !== 'sim' &&
+    queueAhead.every((t) => t && !isExclusive(t)) &&
+    !blockedBy(held, ticket) &&
+    runningWeight + ticket.weight <= weightCapacity &&
+    !elasticBelowFloor(ticket, cfg)
+    ? bypassVerdict(loadExpressTable(root, now, { bypassMaxMs: cfg.queueBypassMaxMs }), ticket, cfg)
+    : null;
+}
+
 /** BRAIN-727: a ticket that runs on this Mac whatever the lanes do: queued locally by a lane that never goes remote. BRAIN-740: stamped push gates only (submitted under a real git push, BRAIN-731). */
 function isFloorTicket(t) {
   return Boolean(t.pushGate) && !t.remote && !t.localReason && classOf(t) !== 'sim' && !isExclusive(t);
@@ -1467,22 +1513,8 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // BRAIN-756: a ticket predicted under queueBypassMaxMs may start past the CPU gate, the projection and the cooldown, bounded
     // by queueBypassCap in-window leases (and as many that outran the window). The cap is read from the held leases, so it is as
     // atomic as the lease write below.
-    const bypassHeld = held.filter((l) => l.queueBypass);
-    const inBypassWindow = (l) => now - l.admittedAt < cfg.queueBypassMaxMs;
-    const bypassInWindow = bypassHeld.filter(inBypassWindow).length;
-    const bypass =
-      cfg.schedulerMode === 'active' &&
-      bypassInWindow < cfg.queueBypassCap &&
-      bypassHeld.length - bypassInWindow < cfg.queueBypassCap &&
-      !isExclusive(ticket) &&
-      !BYPASS_EXCLUDED_LANE.test(ticket.configLane ?? ticket.lane ?? '') &&
-      classOf(ticket) !== 'sim' &&
-      queue.slice(0, position).every((t) => t && !isExclusive(t)) &&
-      !blockedBy(held, ticket) &&
-      runningWeight + ticket.weight <= weightCapacity &&
-      !elasticBelowFloor(ticket, cfg)
-        ? bypassVerdict(loadExpressTable(root, now, { bypassMaxMs: cfg.queueBypassMaxMs }), ticket, cfg)
-        : null;
+    const { bypassHeld, bypassInWindow } = bypassLeaseCounts(cfg, held, now);
+    const bypass = bypassTrialVerdict(root, cfg, ticket, { held, queueAhead: queue.slice(0, position), weightCapacity, now });
     const bypassTrial = bypass !== null;
     const liftTrial = floorTrial || bypassTrial;
     if (!candidate) {

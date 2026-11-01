@@ -26,13 +26,40 @@ export const BYPASS_WINDOW_RUNS = 20;
 export const BYPASS_MAX_STRIKES = 3;
 const FAMILY_TOKENS = 3;
 
-/** The command's leading words without env assignments, flags, paths or files: `pnpm test src/a.test.js` and `pnpm test` share one. */
-export const commandFamily = (command) =>
-  String(command ?? '')
-    .split(/\s+/)
+const SHELL_SYNTAX = /&&|\|\||[;|<>`]|\$\(/;
+const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash']);
+const ENV_FLAGS_WITH_VALUE = new Set(['-u', '-C']);
+const WRAPPER_DEPTH = 4;
+const unquote = (token) => token.replace(/^['"]+|['"]+$/g, '');
+
+/** Drops one leading `env [flags] [VAR=val]` or `sh|bash|zsh|dash -c|-lc`; null when a shell runs anything but a -c string. */
+function unwrapOnce(tokens) {
+  if (tokens[0] === 'env') {
+    let i = 1;
+    while (i < tokens.length && (tokens[i].startsWith('-') || /^[A-Za-z_]\w*=/.test(tokens[i]))) i += ENV_FLAGS_WITH_VALUE.has(tokens[i]) ? 2 : 1;
+    return tokens.slice(i);
+  }
+  return tokens[1] === '-c' || tokens[1] === '-lc' ? tokens.slice(2) : null;
+}
+
+/**
+ * The command's leading words without env assignments, flags, paths or files: `pnpm test src/a.test.js` and `pnpm test` share
+ * one. Leading `env` and `sh -c` wrappers are looked through; '' (no family) for shell syntax, a wrapper with nothing after it,
+ * or a shell running a script, so a bare `sh` or `env` family never forms.
+ */
+export function commandFamily(command) {
+  const text = String(command ?? '');
+  if (SHELL_SYNTAX.test(text)) return '';
+  let tokens = text.split(/\s+/).filter(Boolean).map(unquote);
+  for (let depth = 0; tokens[0] === 'env' || SHELLS.has(tokens[0]); depth++) {
+    tokens = depth < WRAPPER_DEPTH ? unwrapOnce(tokens) : null;
+    if (!tokens?.length) return '';
+  }
+  return tokens
     .filter((token) => token && !/^[A-Za-z_]\w*=/.test(token) && !token.startsWith('-') && !/[/.]/.test(token))
     .slice(0, FAMILY_TOKENS)
     .join(' ');
+}
 
 const bypassId = (repo, lane, kind, name) => JSON.stringify([repo, lane, kind, name]);
 const runMsOf = (row) => (Number.isFinite(row.runMs) && row.runMs > 0 ? row.runMs : row.endedAt - row.startedAt);

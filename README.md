@@ -1668,7 +1668,9 @@ history supports it) bounds how many such leases are held at once.
 
 - **Prediction**: from this machine's local history, the median of the last 20 successful runs of the ticket's exact
   command (`cmdFingerprint`) when it has at least 3, else of its command family (its first 3 words, without env
-  assignments, flags, paths or files, so `pnpm test src/a.test.js` and `pnpm test` share one), under
+  assignments, flags, paths or files, so `pnpm test src/a.test.js` and `pnpm test` share one; leading `env ...` and
+  `sh|bash|zsh|dash -c|-lc '...'` wrappers are looked through, and a command with shell syntax (`&&`, `||`, `;`, `|`,
+  `>`, `<`, `$(`, backtick), a bare wrapper or a shell on a script has no family, only its exact command), under
   `queueBypassMaxMs`, and at most 3 of the last 20 runs that started (any outcome: failed, cancelled and signalled
   count) over `queueBypassMaxMs`. The lane median is never used; no history means no bypass. The table is cached in
   `express-estimates.json` for 5 minutes.
@@ -1687,6 +1689,12 @@ history supports it) bounds how many such leases are held at once.
   Bypass leases do not start the admission cooldown for ordinary tickets.
 - **Bound**: an eligible ticket starts at its next poll while a slot is free and it is not refused above; otherwise it keeps
   its ordinary queue place. A bypass uses no express rate or skip allowance.
+
+**Placement.** When every usable runner has a queue and this machine cannot admit the ticket now (typically a ticket
+queued ahead), a ticket that is locally eligible and would pass the bypass (the gates it does not lift, the cap and the
+prediction above, ignoring queue position and the cooldown) runs locally instead of joining the runner's queue, logged as
+`queue-bypass: predicted short, not queuing on <runner>(<n>)`. The probe is optimistic: it does not evaluate the fairness
+yields, so a lost slot means an ordinary local queue wait. An idle runner, a rebind and a locally ineligible ticket are unchanged.
 
 A bypass start is logged in `admission-decisions.log` as `current=start:queue-bypass` with `bypass=1`, plus a
 `lane-broker-head-block event=queue-bypass` line (expected ms, source, in-window/cap, the lifted reason). The lease and the
