@@ -427,6 +427,13 @@ export async function remotePipelineCommand(ticketDir) {
     process.stderr.write(`lane remote-pipeline: missing or invalid pipeline.json in ${ticketDir}\n`);
     return { exitCode: 1 };
   }
+  if (!payload.pipelineLockPath) return runPipeline(ticketDir, payload);
+  // BRAIN-769: the supervisor's tree lock dies with a SIGKILLed supervisor; this one is owned by the pipeline, which outlives it. Losing both
+  // while a grandchild survives is an accepted residual.
+  return withLock(path.dirname(payload.pipelineLockPath), () => runPipeline(ticketDir, payload), { lockPath: payload.pipelineLockPath, group: 'tree', timeoutMs: payload.pipelineLockWaitMs });
+}
+
+async function runPipeline(ticketDir, payload) {
   const localTree = payload.localTree === true;
   const { workDir, relCwd, remoteDeps = [], remoteSetup = [], argv, npmCacheDir, npmUserConfig, depsCache } = payload;
   const npmGlobalConfig = path.join(path.dirname(npmUserConfig), 'npmrc-global');

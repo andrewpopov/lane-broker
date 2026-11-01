@@ -39,6 +39,7 @@ import { reloadGlobalConfig, isDispatchOnly } from './config.js';
 import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope, scopeMemoryPeakReader, scopeMemoryPeakTracker, enforcementLabel } from './cpu-limit.js';
 import { stateHome, RUNNER_SHUTDOWN_REASON, LOST_REASONS } from './state.js';
 import { childExitSafeFlags } from './node-exit-safe.js';
+import { LOCAL_SETUP_FAILED_EXIT_CODE } from './remote-pipeline.js';
 import { readHistoryRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
 import { missingLocalDeps, speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, externalCpuSlots, DEFAULT_REMOTE_OVERHEAD_MS } from './speed-placement.js';
@@ -370,7 +371,7 @@ const declaresTreePreparation = (remote) => remote?.remoteDeps?.length > 0 || re
  * tree (deps reconciled against the lockfile, setup always) and then runs `ticket.cmd` in the lane's own subdirectory. The supervisor
  * holds the per-tree lock (`treeLockPath`) from before the spawn until the group is reaped, so no run can reinstall under a survivor.
  */
-function writeLocalPreparation(root, ticket) {
+function writeLocalPreparation(root, ticket, lockWaitMs) {
   const { worktreeRoot, relCwd, remoteDeps, remoteSetup } = ticket.remote;
   const ticketDir = path.join(root, 'local-prep', ticket.id);
   const treeLockPath = path.join(root, 'tree-locks', crypto.createHash('sha256').update(worktreeRoot).digest('hex').slice(0, 24));
@@ -385,14 +386,14 @@ function writeLocalPreparation(root, ticket) {
     npmUserConfig: path.join(root, 'npmrc'),
     depsCache: { enabled: false },
     localTree: true,
+    pipelineLockPath: `${treeLockPath}.pipeline`,
+    pipelineLockWaitMs: lockWaitMs,
   });
   return { ticketDir, treeLockPath, cmd: [process.execPath, ...childExitSafeFlags(), laneBinPath, 'remote-pipeline', ticketDir] };
 }
 
-const TREE_LOCK_WAIT_MS = 6 * 60 * 60 * 1000;
-
 /** Resolves with `{ release }` once the per-tree lock is held (release resolves when it is dropped), or null when `shouldStop()` turned true first. */
-function acquireTreeLock(lockPath, shouldStop, pollMs) {
+function acquireTreeLock(lockPath, shouldStop, pollMs, waitMs) {
   return new Promise((resolve, reject) => {
     let settled = false;
     const poll = setInterval(() => {
@@ -410,7 +411,7 @@ function acquireTreeLock(lockPath, shouldStop, pollMs) {
           clearInterval(poll);
           resolve({ release: () => (drop(), done) });
         }),
-      { lockPath, group: 'tree', timeoutMs: TREE_LOCK_WAIT_MS },
+      { lockPath, group: 'tree', timeoutMs: waitMs },
     );
     done.catch((err) => {
       clearInterval(poll);
@@ -1925,15 +1926,23 @@ async function main() {
   const startedAt = Date.now();
   // the host may have turned dispatch-only since admission (config flip or marker): re-read it at the last moment, release the lease unused
   if (isDispatchOnly(reloadGlobalConfig(globalCfg))) await refuseDispatchOnlyAndExit({ lease: true });
-  const localPreparation = fallbackReason !== undefined && declaresTreePreparation(ticket.remote) ? writeLocalPreparation(root, ticket) : null;
-  // a cancel that lands while waiting for the tree lock spawns nothing: the no-op below is reaped as a cancel before it matters
-  const treeLock = localPreparation ? await acquireTreeLock(localPreparation.treeLockPath, () => cancelledBeforeStart || cancelRequested(root, ticket.id), globalCfg.sampleMs) : null;
+  const localPreparation = fallbackReason !== undefined && declaresTreePreparation(ticket.remote) ? writeLocalPreparation(root, ticket, globalCfg.localTreeLockWaitMs) : null;
+  let treeLock = null;
   let releasedLocalPreparation = false;
   async function releaseLocalPreparation() {
     if (!localPreparation || releasedLocalPreparation) return;
     releasedLocalPreparation = true;
     fs.rmSync(localPreparation.ticketDir, { recursive: true, force: true });
     await treeLock?.release();
+  }
+  if (localPreparation) {
+    try {
+      // a cancel that lands while waiting for the tree lock spawns nothing: the no-op below is reaped as a cancel before it matters
+      treeLock = await acquireTreeLock(localPreparation.treeLockPath, () => cancelledBeforeStart || cancelRequested(root, ticket.id), globalCfg.sampleMs, globalCfg.localTreeLockWaitMs);
+    } catch {
+      await releaseLocalPreparation();
+      await refuseLocalAndExit({ exitCode: LOCAL_SETUP_FAILED_EXIT_CODE, message: `lane: local-setup failed (tree-lock) — infrastructure, not the command\n` }, { lease: true });
+    }
   }
   const spawnTicket = localPreparation ? { ...ticket, cmd: treeLock ? localPreparation.cmd : [process.execPath, '-e', ''] } : ticket;
   const [cmd, args] = resolveNicedSpawn({ ...spawnTicket, nice: started.lease.nice ?? ticket.nice }, os.getPriority(), resolveLaneNice(ticket, priorityOf(started.lease), globalCfg));

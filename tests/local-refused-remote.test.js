@@ -468,3 +468,35 @@ test('BRAIN-769: a tracked package-lock.json is byte-identical after the install
   assert.ok(fs.existsSync(path.join(ctx.repoDir, 'node_modules', 'hello-tool')));
   assert.deepEqual(fs.readFileSync(lockFile), before);
 });
+
+test('BRAIN-769: a SIGKILLed supervisor whose pipeline lives on still keeps a second run waiting until the pipeline ends', async () => {
+  const events = path.join(tmpDir('marker'), 'events.log');
+  const ctx = setupPrep({ remoteDeps: ['.'], remoteSetup: [['node', '-e', `require('fs').appendFileSync(${JSON.stringify(events)}, 'setup\\n')`]] });
+  const slow = ['node', '-e', `const fs = require('fs'); fs.appendFileSync(${JSON.stringify(events)}, 'start\\n'); setTimeout(() => { fs.appendFileSync(${JSON.stringify(events)}, 'end\\n'); }, 4000)`];
+  const a = await laneRun(['run', '--repo', 'r', '--lane', 'e2e', '--detach', '--', ...slow], { env: ctx.env, cwd: ctx.repoDir });
+  const idA = a.stdout.trim();
+  await waitFor(() => fs.existsSync(events) && fs.readFileSync(events, 'utf8').includes('start'), { timeoutMs: 60000 });
+  const lease = JSON.parse(fs.readFileSync(path.join(paths(ctx.state).leases, `${idA}.json`), 'utf8'));
+  process.kill(lease.supervisorPid, 'SIGKILL');
+  const b = await laneRun(['run', '--repo', 'r', '--lane', 'plain', '--detach', '--', ...slow], { env: ctx.env, cwd: ctx.repoDir });
+  assert.equal((await laneRun(['wait', b.stdout.trim(), '--timeout', '120s'], { env: ctx.env })).code, 0);
+  assert.deepEqual(fs.readFileSync(events, 'utf8').split('\n').filter(Boolean), ['setup', 'start', 'end', 'setup', 'start', 'end']);
+});
+
+test('BRAIN-769: a tree-lock wait past localTreeLockWaitMs exits 77, removes the prep dir and releases the lease', async () => {
+  const events = path.join(tmpDir('marker'), 'events.log');
+  const ctx = setupPrep({ remoteDeps: ['.'] });
+  const globalFile = path.join(ctx.home, 'config.json');
+  fs.writeFileSync(globalFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(globalFile, 'utf8')), localTreeLockWaitMs: 1500 }));
+  const hold = ['node', '-e', `require('fs').appendFileSync(${JSON.stringify(events)}, 'start\\n'); setTimeout(() => {}, 30000)`];
+  const a = await laneRun(['run', '--repo', 'r', '--lane', 'e2e', '--detach', '--', ...hold], { env: ctx.env, cwd: ctx.repoDir });
+  await waitFor(() => fs.existsSync(events), { timeoutMs: 60000 });
+  const idB = (await laneRun(['run', '--repo', 'r', '--lane', 'plain', '--detach', '--', 'node', '-e', '0'], { env: ctx.env, cwd: ctx.repoDir })).stdout.trim();
+  const waited = await laneRun(['wait', idB, '--timeout', '60s'], { env: ctx.env });
+  assert.equal(waited.code, 77, `stderr: ${waited.stderr}`);
+  assert.match(resultOf(ctx.state, idB).error, /local-setup failed \(tree-lock\) — infrastructure, not the command/);
+  assert.equal(fs.existsSync(path.join(ctx.state, 'local-prep', idB)), false);
+  assert.equal(fs.existsSync(path.join(paths(ctx.state).leases, `${idB}.json`)), false, 'lease released');
+  await laneRun(['cancel', a.stdout.trim()], { env: ctx.env });
+  await laneRun(['wait', a.stdout.trim(), '--timeout', '20s'], { env: ctx.env });
+});
