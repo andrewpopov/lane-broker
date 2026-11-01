@@ -1372,43 +1372,41 @@ test('selectRunner: BRAIN-653 a runner whose budget net of outside memory is bel
   assert.notEqual(waits.skipped[0]?.neverFits, true);
 });
 
-test('BRAIN-770: the runner phase is reported on each change, with commandStartedAt from the first admitted poll', { timeout: 60_000 }, async () => {
+test('BRAIN-770: the watcher\'s samples are reported on each change, with commandStartedAt from the first admitted sample', { timeout: 60_000 }, async () => {
   const seen = [];
   const clock = makeFakeClock();
   const start = clock.now();
-  await dispatchRebalance({ results: [preparing, queued, queued, phaseRecord('admitted'), 'RESULT'], execMs: 3000, canWithdraw: false, clock, onRunnerPhase: (p) => seen.push(p) });
-  const phases = seen.map((p) => p.phase);
-  assert.deepEqual(phases.slice(0, 3), ['preparing', 'queued', 'admitted']);
-  assert.equal(new Set(phases).size, phases.length, 'only changes are reported');
+  await dispatchRebalance({ results: [preparing, queued, queued, phaseRecord('admitted'), 'RESULT'], execMs: 3000, rebalance: { minQueuedMs: 600_000 }, clock, onRunnerPhase: (p) => seen.push(p) });
+  assert.deepEqual(seen.map((p) => p.phase), ['preparing', 'queued', 'admitted']);
   assert.deepEqual(seen.slice(0, 2).map((p) => p.commandStartedAt), [null, null]);
   assert.ok(seen[2].commandStartedAt > start);
 });
 
-test('BRAIN-770: a phase whose write failed is not counted as reported; the next poll retries it', { timeout: 60_000 }, async () => {
+test('BRAIN-770: a phase whose write failed is not counted as reported; the next sample retries it', { timeout: 60_000 }, async () => {
   const writes = [];
-  let failNextAdmitted = true;
+  let failNext = true;
   const onRunnerPhase = ({ phase }) => {
     writes.push(phase);
-    if (phase === 'admitted' && failNextAdmitted) {
-      failNextAdmitted = false;
+    if (failNext) {
+      failNext = false;
       return { ok: false };
     }
     return { ok: true };
   };
-  await dispatchRebalance({ results: [queued, phaseRecord('admitted'), phaseRecord('admitted'), phaseRecord('admitted'), 'RESULT'], execMs: 3000, canWithdraw: false, onRunnerPhase });
-  assert.deepEqual(writes, ['queued', 'admitted', 'admitted']);
+  await dispatchRebalance({ results: [queued, queued, phaseRecord('admitted'), 'RESULT'], execMs: 3000, rebalance: { minQueuedMs: 600_000 }, onRunnerPhase });
+  assert.deepEqual(writes, ['queued', 'queued', 'admitted']);
 });
 
 test('BRAIN-770: a runner that states no phase reports nothing while running, and its bare queued state is queued', { timeout: 60_000 }, async () => {
   const legacy = [];
-  await dispatchRebalance({ results: [{ protocol: 1, missing: true, state: 'running' }, { protocol: 1, missing: true, state: 'running' }, 'RESULT'], execMs: 2000, canWithdraw: false, onRunnerPhase: (p) => legacy.push(p) });
+  await dispatchRebalance({ results: [{ protocol: 1, missing: true, state: 'running' }, { protocol: 1, missing: true, state: 'running' }, 'RESULT'], execMs: 2000, rebalance: { minQueuedMs: 600_000 }, onRunnerPhase: (p) => legacy.push(p) });
   assert.deepEqual(legacy, []);
   const bare = [];
-  await dispatchRebalance({ results: [{ protocol: 1, missing: true, state: 'queued' }, { protocol: 1, missing: true, state: 'queued' }, 'RESULT'], execMs: 2000, canWithdraw: false, onRunnerPhase: (p) => bare.push(p.phase) });
+  await dispatchRebalance({ results: [{ protocol: 1, missing: true, state: 'queued' }, { protocol: 1, missing: true, state: 'queued' }, 'RESULT'], execMs: 2000, rebalance: { minQueuedMs: 600_000 }, onRunnerPhase: (p) => bare.push(p.phase) });
   assert.deepEqual(bare, ['queued']);
 });
 
-test('BRAIN-770: dispatch joins the phase observer: a write still in flight at close finishes before dispatch returns, and none starts after', { timeout: 60_000 }, async () => {
+test('BRAIN-770: dispatch joins the phase writes: one in flight at close finishes before dispatch returns, and none starts after', { timeout: 60_000 }, async () => {
   let returned = false;
   let startedLate = false;
   let finishedBeforeReturn = null;
@@ -1418,16 +1416,16 @@ test('BRAIN-770: dispatch joins the phase observer: a write still in flight at c
     finishedBeforeReturn = !returned;
     return { ok: true };
   };
-  await dispatchRebalance({ results: [queued, queued, queued, queued, 'RESULT'], execMs: 200, canWithdraw: false, onRunnerPhase });
+  await dispatchRebalance({ results: [queued, queued, queued, queued, 'RESULT'], execMs: 200, rebalance: { minQueuedMs: 600_000 }, onRunnerPhase });
   returned = true;
   await new Promise((resolve) => setTimeout(resolve, 800));
   assert.equal(startedLate, false);
   assert.equal(finishedBeforeReturn, true);
 });
 
-test('BRAIN-770: with the rebalance watcher active its samples feed the reporter and no second poll runs', { timeout: 60_000 }, async () => {
+test('BRAIN-770: with no rebalance watcher nothing is polled and nothing is reported', { timeout: 60_000 }, async () => {
   const seen = [];
-  const { calls } = await dispatchRebalance({ results: [preparing, queued, phaseRecord('admitted'), 'RESULT'], execMs: 2000, rebalance: { minQueuedMs: 600_000 }, onRunnerPhase: (p) => seen.push(p.phase) });
-  assert.deepEqual(seen, ['preparing', 'queued', 'admitted']);
-  assert.ok(calls.filter((c) => c === 'result').length <= 4, `result fetches: ${calls.join(',')}`);
+  const { calls } = await dispatchRebalance({ results: ['RESULT'], execMs: 1500, canWithdraw: false, onRunnerPhase: (p) => seen.push(p) });
+  assert.deepEqual(seen, []);
+  assert.equal(calls.filter((c) => c === 'result').length, 1, 'only the settlement fetch');
 });

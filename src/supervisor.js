@@ -1147,7 +1147,6 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       // identity a result fetched from it must carry; `lane`'s orphan reconcile trusts a runner record only against this.
       // `ticketId` differs from the lane id only on a cache repair retry (BRAIN-642), whose runner ticket is a fresh one.
       onRunnerPhase: runnerPhaseRecorder(root, enriched.id, gen),
-      phaseIntervalMs: globalCfg.remoteRebalanceIntervalMs,
       onBinding: async ({ protocol, ticketId, generation, manifestHash }) =>
         (await updateAttempt(root, enriched.id, gen, { binding: { protocol, generation, manifestHash, runner: runner.name, ...(ticketId === enriched.id ? {} : { ticketId }) } })).ok,
       rebalance: rebalanceOn && canWithdraw ? {

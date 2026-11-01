@@ -826,8 +826,6 @@ export function hasMeasuredHeadroom(probe) {
 }
 
 const COMMAND_RUNNING_PHASES = new Set(['admitted', 'running']);
-const PHASE_BACKOFF_CAP = 8;
-const PHASE_JITTER = 0.2;
 
 /**
  * BRAIN-770: the runner's own phase out of a `remote-result` record, or null. The runner states `phase` only where it differs from
@@ -840,7 +838,7 @@ function runnerPhaseOf(record) {
 }
 
 /**
- * BRAIN-770: hands each observed runner phase to `onPhase({phase, commandStartedAt})` and counts a phase as reported only once that
+ * BRAIN-770: hands each phase the rebalance watcher samples to `onPhase({phase, commandStartedAt})` and counts a phase as reported only once that
  * write succeeded (it returned, and not `{ok:false}`), so a failed write is retried on the next sample. Writes are serial, and none is
  * started once `canWrite()` is false. `commandStartedAt` is the clock reading at the first sample that saw the ticket admitted.
  */
@@ -867,35 +865,7 @@ function makePhaseReporter({ onPhase, now, canWrite }) {
       return chain;
     },
     settled: () => chain,
-    pending: () => latest !== null && (latest !== reported || !COMMAND_RUNNING_PHASES.has(latest)),
   };
-}
-
-/**
- * BRAIN-770: while the exec ssh session is open, poll the runner's phase on its own and feed `reporter`. Used only where the rebalance
- * watcher is not already sampling this ticket (it feeds the same reporter). Read-only: it never withdraws, moves or settles anything.
- * Polls back off (with jitter) while fetches fail, stop once the ticket is reported running or has a terminal record, and a fetch in
- * flight is killed through `signal` when the session closes.
- */
-async function trackRunnerPhase({ runner, ticketId, reporter, isClosed, signal, abortSignal, sleep, intervalMs, fetchDeadlineMs, sshBin, env }) {
-  const stopped = () => isClosed() || signal.aborted || abortSignal?.aborted;
-  let failures = 0;
-  while (true) {
-    const wait = Math.min(intervalMs * 2 ** failures, intervalMs * PHASE_BACKOFF_CAP);
-    await sleep(Math.round(wait * (1 + Math.random() * PHASE_JITTER)), signal);
-    if (stopped()) return;
-    const fetched = await fetchRemoteResult(runner, ticketId, sshBin, fetchDeadlineMs, env, signal);
-    if (stopped()) return;
-    if (!fetched) {
-      failures += 1;
-      continue;
-    }
-    failures = 0;
-    if (!fetched.missing) return;
-    const phase = runnerPhaseOf(fetched);
-    if (phase) await reporter.observe(phase);
-    if (!reporter.pending() && COMMAND_RUNNING_PHASES.has(phase)) return;
-  }
 }
 
 /**
@@ -1075,9 +1045,9 @@ async function dispatchOnce(opts) {
     // binding a later reconcile needs to trust a result record fetched for this dispatch. Resolving `false` or throwing means it
     // is not durable: the dispatch does not start (`unconfirmed`, `neverStarted`).
     onBinding,
-    // BRAIN-770: called with `{phase, commandStartedAt}` whenever the runner's own phase changes, polled every `phaseIntervalMs`.
+    // BRAIN-770: called with `{phase, commandStartedAt}` as the rebalance watcher's own samples show the runner's phase change. Nothing
+    // is polled for it: with rebalance off (or no withdraw capability) it is never called.
     onRunnerPhase,
-    phaseIntervalMs = DEFAULT_REBALANCE_INTERVAL_MS,
   } = opts;
   const withdrawCapable = (rebalance?.canWithdraw ?? canWithdraw) === true;
 
@@ -1227,29 +1197,11 @@ async function dispatchOnce(opts) {
   const closed = waitClosed(child, abortSignal);
   let move = null;
   const state = { runner, epoch: 1, attemptedTarget: null, attemptedReason: null, queuedSince: null };
-  let observing = Promise.resolve();
-  let reporter = null;
-  let trackPhase = null;
-  if (onRunnerPhase && pipeResult.ok) {
-    const phaseAbort = new AbortController();
-    let phaseSessionClosed = false;
-    const stopPhaseObserver = () => {
-      phaseSessionClosed = true;
-      phaseAbort.abort();
-    };
-    closed.then(stopPhaseObserver, stopPhaseObserver);
-    reporter = makePhaseReporter({ onPhase: onRunnerPhase, now, canWrite: () => !phaseSessionClosed && !abortSignal?.aborted });
-    const trackAlone = () => trackRunnerPhase({
-      runner, ticketId: expected.ticketId, reporter, signal: phaseAbort.signal, abortSignal, sleep,
-      isClosed: () => phaseSessionClosed,
-      intervalMs: phaseIntervalMs,
-      fetchDeadlineMs: resultDeadlineMs,
-      sshBin, env,
-    }).catch((err) => process.stderr.write(`lane: remote phase observer for ${runner.name} stopped: ${err?.message ?? err}\n`));
-    trackPhase = trackAlone;
-    // Where the rebalance watcher samples this ticket anyway it feeds the reporter; the standalone poll covers the rest.
-    if (!(rebalance && withdrawCapable)) observing = trackAlone();
-  }
+  let sessionEnded = false;
+  closed.then(() => { sessionEnded = true; }, () => { sessionEnded = true; });
+  const reporter = onRunnerPhase && rebalance && withdrawCapable && pipeResult.ok
+    ? makePhaseReporter({ onPhase: onRunnerPhase, now, canWrite: () => !sessionEnded && !abortSignal?.aborted })
+    : null;
   if (rebalance && withdrawCapable && pipeResult.ok) {
     // One serial watcher beside the open ssh session; it is stopped and JOINED before anything below looks at the outcome.
     const watchAbort = new AbortController();
@@ -1273,14 +1225,6 @@ async function dispatchOnce(opts) {
       }
       return m;
     });
-    if (reporter) {
-      // The watcher stops sampling at admitted; if that write (or any earlier one) failed, the standalone poll finishes the job.
-      observing = settled.then(async (m) => {
-        if (m) return;
-        await reporter.settled();
-        if (reporter.pending()) await trackPhase();
-      }).catch(() => {});
-    }
     // Only a move ends the wait early; a watcher that stopped for good (admitted, terminal) leaves the session to close on its own.
     try {
       await Promise.race([closed, settled.then((m) => m ?? closed)]);
@@ -1294,7 +1238,6 @@ async function dispatchOnce(opts) {
     await closed;
   }
 
-  await observing;
   await reporter?.settled();
 
   if (abortSignal && abortSignal.aborted) {

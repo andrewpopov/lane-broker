@@ -85,11 +85,13 @@ test('runnerPhaseRecorder writes the phase and command start under the attempt\'
   });
 });
 
-test('wiring: the supervisor records the queued phase of a ticket sitting in the runner\'s queue (standalone observer, rebalance off)', T, async () => {
+test('wiring: with rebalance disabled nothing polls the runner and the attempt keeps the legacy fields', T, async () => {
   const ctx = rebalanceSetup({ rebalance: { remoteRebalanceMinQueuedMs: 0, remoteRebalanceIntervalMs: 150 } });
   const id = await ctx.start();
-  await waitFor(() => readAttempt(ctx.state, id)?.runnerPhase === 'queued', { timeoutMs: 30_000 });
-  assert.equal(readAttempt(ctx.state, id).commandStartedAt, undefined);
+  await waitFor(() => ctx.fake.count('exec a') > 0, { timeoutMs: 30_000 });
+  await new Promise((resolve) => setTimeout(resolve, 1000));
+  assert.equal(ctx.fake.count('result a'), 0);
+  assert.equal(readAttempt(ctx.state, id).runnerPhase, undefined);
   ctx.unpause('a');
   assert.equal((await ctx.finish(id)).code, 0);
 });
