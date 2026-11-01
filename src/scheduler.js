@@ -1738,7 +1738,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       };
     }
     if (cfg.admissionLoadGate && gate.closed && !brokerIdle && !exclusiveHolder) {
-      if (bypassAdmit) refuseBypass('load-gate');
+      if (bypassTrial) refuseBypass('load-gate');
       if (ticket.id === headTicket.id) markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
       dropPickRecord();
       return {
@@ -1761,7 +1761,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // throwing reader all admit — same fail-open tolerance as the CPU/load
     // samplers elsewhere in this function.
     if (memInfo && memInfo.macPressure === 'critical') {
-      if (bypassAdmit) refuseBypass('memory');
+      if (bypassTrial) refuseBypass('memory');
       if (ticket.id === headTicket.id) markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
       dropPickRecord();
       return {

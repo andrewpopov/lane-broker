@@ -542,6 +542,20 @@ for (const [reason, c] of Object.entries(REFUSALS)) {
   });
 }
 
+test('a closed load gate records its reason for a ticket CPU admission would have started', async () => {
+  const { state } = freshEnv();
+  seedRuns(state);
+  writeLease(state, held('other'));
+  const t = await queued(state, ticket('a'));
+  const result = await tryStart(state, t, baseCfg({ admissionLoadGate: true }), () => 5000, sampler(1), undefined, memory());
+  assert.equal(result.started, false);
+  assert.equal(recordedReason(state, 'a'), 'load-gate');
+});
+
+test('a newline separates shell commands, so a multi-line script has no family', () => {
+  assert.equal(commandFamily("sh -c 'pnpm exec eslint src/a.js\nsleep 600'"), '');
+});
+
 test('a changed reason writes a second line naming the previous one', async () => {
   const { state } = freshEnv();
   const t = await queued(state, ticket('a'));

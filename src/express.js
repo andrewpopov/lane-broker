@@ -26,7 +26,7 @@ export const BYPASS_WINDOW_RUNS = 20;
 export const BYPASS_MAX_STRIKES = 3;
 const FAMILY_TOKENS = 3;
 
-const SHELL_SYNTAX = /&&|\|\||[;|<>`]|\$\(/;
+const SHELL_SYNTAX = /&&|\|\||[;|<>`\n]|\$\(/;
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash']);
 const ENV_FLAGS_WITH_VALUE = new Set(['-u', '-C']);
 const WRAPPER_DEPTH = 4;
