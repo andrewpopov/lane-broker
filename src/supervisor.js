@@ -26,7 +26,7 @@ import {
   testDrainAt,
   testHoldAt,
 } from './state.js';
-import { enqueue, existingTicket, tryStart, dequeueSync, couldAdmitNow, listQueue, HELD_STATES, withdrawQueued, restoreQueued, discardRebinding, readQueuedRecord } from './scheduler.js';
+import { enqueue, existingTicket, tryStart, dequeueSync, couldAdmitNow, couldBypassNow, listQueue, HELD_STATES, withdrawQueued, restoreQueued, discardRebinding, readQueuedRecord } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
 import { cancelCommand } from './cancel.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
@@ -520,6 +520,7 @@ export function historyRow(ticket, result, { fallbackReason, lease, contentKey =
     // BRAIN-380 §8: only a ticket that was admitted has a lease, so only its row carries the admission audit
     ...priorityAuditOf(lease),
     ...(lease?.queueBypass ? { queueBypass: lease.queueBypass } : {}),
+    ...(lease?.bypassRefused ? { bypassRefused: lease.bypassRefused } : {}),
     // BRAIN-425: every row states what the lane was granted and how it ended; a grant or exit in `result` wins
     ...terminalRowDefaults({ resources: ticket.resources, grantedCpuCores: lease?.grantedCpuCores }),
     ...result,
@@ -959,6 +960,12 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     if (local?.admit) {
       const reason = skipped.map((s) => `${s.name}: ${s.reason}`).join('; ');
       return fallbackOrRefuse(null, `${reason}; local can admit now, not queuing on ${queuedAt}`, { rebindable: true });
+    }
+    if (!ineligible && (await couldBypassNow(root, globalCfg, enriched)).admit) {
+      const line = `lane: queue-bypass: predicted short, local can bypass now, not queuing on ${queuedAt}\n`;
+      process.stderr.write(line);
+      writeBrokerLog(root, line);
+      return fallbackOrRefuse(null, `queue-bypass: predicted short, not queuing on ${queuedAt}`, { rebindable: true });
     }
     const line = ineligible
       ? `lane: queuing on ${queuedAt}: not locally eligible (${ineligible.message.trim()})\n`

@@ -7,7 +7,7 @@ import { spawn } from 'node:child_process';
 import { tmpDir, makeRunner, setup, markerCmd, detachAndWait, resultOf } from './remote-harness.js';
 import { selectRunner } from '../src/remote-client.js';
 import { couldAdmitNow, enqueue } from '../src/scheduler.js';
-import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig, ConfigError } from '../src/config.js';
+import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig, ConfigError, resolveTicketConfig } from '../src/config.js';
 import { writeLease, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths } from '../src/state.js';
 
@@ -306,4 +306,52 @@ test('BRAIN-746 selectRunner: allowBusyQueue prefers an idle runner, then the fe
   assert.equal(res.runner.name, 'a', 'and whatever order the runners are configured in');
   res = await selectRunner(runnersOf('a', 'b'), { ...opts, sshBin: makeProbeMapSsh({ a: probe(3, sat), b: probe(0, { capacity: { cpuCores: 2 }, ...sat }) }) });
   assert.equal(res.runner, null, 'over the cap, and one that can never fit the reservation');
+});
+
+// ---- queue-bypass placement: a predicted-short ticket stays local rather than join a runner's queue ----
+
+async function runBehindQueuedLocalTicket({ seedHistory, globalExtra = {}, laneExtra = {} }) {
+  const { env, state, repoDir } = setup({ globalExtra: { schedulerMode: 'active', cpuAdmissionPercent: 100, cpuReserveCores: 0, queueBypassCap: 3, ...globalExtra } });
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, remotePolicy: 'remote-first', ...laneExtra }, hold: { weight: 1 } } });
+  const script = 'where.js';
+  const marker = path.join(tmpDir('bypass-marker'), 'where');
+  fs.writeFileSync(path.join(repoDir, script), `require('fs').writeFileSync(${JSON.stringify(marker)}, process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local');`);
+  if (seedHistory) {
+    const { repoId } = resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' });
+    const rows = Array.from({ length: 5 }, (_, i) => ({ id: `h${i}`, repo: repoId, lane: 'default', command: `node ${script}`, startedAt: 1000 + i, endedAt: 11_000 + i, runMs: 10_000, exit: 0 }));
+    fs.appendFileSync(paths(state).history, rows.map((r) => `${JSON.stringify(r)}\n`).join(''));
+  }
+  const blocker = laneRun(['run', '--repo', 'r', '--lane', 'hold', '--', 'sleep', '6'], { env, cwd: repoDir });
+  await waitFor(() => fs.existsSync(paths(state).leases) && fs.readdirSync(paths(state).leases).some((n) => n.endsWith('.json')), { timeoutMs: 60_000 });
+  const ahead = laneRun(['run', '--repo', 'r', '--lane', 'hold', '--', 'true'], { env, cwd: repoDir });
+  await waitFor(() => fs.existsSync(paths(state).queue) && fs.readdirSync(paths(state).queue).length > 0, { timeoutMs: 60_000 });
+  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', 'node', script], env, repoDir);
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  await Promise.all([blocker, ahead]);
+  return { result: resultOf(state, id), where: fs.readFileSync(marker, 'utf8') };
+}
+
+test('supervisor: a ticket predicted short runs locally instead of queuing on a queued runner', async () => {
+  const { result, where } = await runBehindQueuedLocalTicket({ seedHistory: true });
+  assert.equal(where, 'local');
+  assert.equal(result.executor, 'local');
+  assert.match(result.fallbackReason, /queue-bypass: predicted short, not queuing on skybox\(1\)/);
+  assert.equal(result.queuedAt, undefined);
+});
+
+test('supervisor: without history, or with the cap at 0, the same ticket still queues on the runner', async () => {
+  for (const options of [{ seedHistory: false }, { seedHistory: true, globalExtra: { queueBypassCap: 0 } }]) {
+    const { result, where } = await runBehindQueuedLocalTicket(options);
+    assert.equal(where, 'remote', JSON.stringify(options));
+    assert.equal(result.executor, 'remote');
+    assert.equal(result.queuedAt, 'skybox(1)');
+  }
+});
+
+test('supervisor: a predicted-short ticket this machine refuses to run (localRefused) queues on the runner instead of bypassing', async () => {
+  const { result, where } = await runBehindQueuedLocalTicket({ seedHistory: true, laneExtra: { localRefused: true } });
+  assert.equal(where, 'remote');
+  assert.equal(result.executor, 'remote');
+  assert.equal(result.queuedAt, 'skybox(1)');
+  assert.equal(result.fallbackReason, undefined);
 });
