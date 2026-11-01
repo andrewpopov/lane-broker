@@ -303,6 +303,7 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
     };
   };
 
+  if (localTree && !fs.existsSync(path.join(cwd, 'package-lock.json'))) return { exitCode: 0, record: done('skip', { reason: 'no-lockfile' }) };
   if (localTree && localDepsCurrent(cwd)) return { exitCode: 0, record: done('skip', { reason: 'current' }) };
 
   let keyed = { key: null, reason: 'disabled' };
