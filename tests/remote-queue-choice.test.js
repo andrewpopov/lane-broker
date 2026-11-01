@@ -310,9 +310,9 @@ test('BRAIN-746 selectRunner: allowBusyQueue prefers an idle runner, then the fe
 
 // ---- queue-bypass placement: a predicted-short ticket stays local rather than join a runner's queue ----
 
-async function runBehindQueuedLocalTicket({ seedHistory, globalExtra = {} }) {
+async function runBehindQueuedLocalTicket({ seedHistory, globalExtra = {}, laneExtra = {} }) {
   const { env, state, repoDir } = setup({ globalExtra: { schedulerMode: 'active', cpuAdmissionPercent: 100, cpuReserveCores: 0, queueBypassCap: 3, ...globalExtra } });
-  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, remotePolicy: 'remote-first' }, hold: { weight: 1 } } });
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, remotePolicy: 'remote-first', ...laneExtra }, hold: { weight: 1 } } });
   const script = 'where.js';
   const marker = path.join(tmpDir('bypass-marker'), 'where');
   fs.writeFileSync(path.join(repoDir, script), `require('fs').writeFileSync(${JSON.stringify(marker)}, process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local');`);
@@ -346,4 +346,12 @@ test('supervisor: without history, or with the cap at 0, the same ticket still q
     assert.equal(result.executor, 'remote');
     assert.equal(result.queuedAt, 'skybox(1)');
   }
+});
+
+test('supervisor: a predicted-short ticket this machine refuses to run (localRefused) queues on the runner instead of bypassing', async () => {
+  const { result, where } = await runBehindQueuedLocalTicket({ seedHistory: true, laneExtra: { localRefused: true } });
+  assert.equal(where, 'remote');
+  assert.equal(result.executor, 'remote');
+  assert.equal(result.queuedAt, 'skybox(1)');
+  assert.equal(result.fallbackReason, undefined);
 });
