@@ -96,7 +96,7 @@ function tailCapture(max) {
 }
 
 /** Spawn `cmdBin argv`, capturing (the tail of) stdout/stderr, SIGKILL on `deadlineMs`. Never rejects. */
-export function runWithDeadline(cmdBin, argv, deadlineMs, env, maxCaptureBytes = DEFAULT_CAPTURE_BYTES) {
+export function runWithDeadline(cmdBin, argv, deadlineMs, env, maxCaptureBytes = DEFAULT_CAPTURE_BYTES, signal) {
   return new Promise((resolve) => {
     let child;
     try {
@@ -116,10 +116,20 @@ export function runWithDeadline(cmdBin, argv, deadlineMs, env, maxCaptureBytes =
         // already gone
       }
     }, deadlineMs);
+    const kill = () => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // already gone
+      }
+    };
+    if (signal?.aborted) kill();
+    else signal?.addEventListener('abort', kill, { once: true });
     child.stdout.on('data', (d) => out.push(d));
     child.stderr.on('data', (d) => err.push(d));
     child.on('close', (code) => {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', kill);
       resolve({ code, stdout: out.text(), stderr: err.text(), timedOut });
     });
     child.on('error', () => {
@@ -677,9 +687,9 @@ export function queryRemoteHave(runner, identity, hashes, { sshBin = 'ssh', dead
 
 /** `lane remote-result <ticketId>` over ssh, bounded by `deadlineMs`. Returns the parsed
  *  record, `{missing:true}`, or `null` on any transport/parse failure (never throws). */
-export async function fetchRemoteResult(runner, ticketId, sshBin, deadlineMs, env) {
+export async function fetchRemoteResult(runner, ticketId, sshBin, deadlineMs, env, signal) {
   const cmd = buildRemoteCommand(runner, 'remote-result', [ticketId]);
-  const res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
+  const res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env, undefined, signal);
   if (res.timedOut || res.code !== 0) return null;
   try {
     return JSON.parse(res.stdout.trim());
@@ -815,6 +825,49 @@ export function hasMeasuredHeadroom(probe) {
   return Boolean(probe?.headroom) && typeof probe.headroom === 'object' && Number.isFinite(probe.headroom.cpuCores);
 }
 
+const COMMAND_RUNNING_PHASES = new Set(['admitted', 'running']);
+
+/**
+ * BRAIN-770: the runner's own phase out of a `remote-result` record, or null. The runner states `phase` only where it differs from
+ * `state`, so a bare `queued` is a real phase; a bare `running` is a runner that predates phases (it folds preparing and admitted into
+ * it), which says nothing precise and so reports nothing.
+ */
+function runnerPhaseOf(record) {
+  if (typeof record.phase === 'string') return record.phase === 'gone' ? null : record.phase;
+  return record.state === 'queued' ? 'queued' : null;
+}
+
+/**
+ * BRAIN-770: hands each phase the rebalance watcher samples to `onPhase({phase, commandStartedAt})` and counts a phase as reported only once that
+ * write succeeded (it returned, and not `{ok:false}`), so a failed write is retried on the next sample. Writes are serial, and none is
+ * started once `canWrite()` is false. `commandStartedAt` is the clock reading at the first sample that saw the ticket admitted.
+ */
+function makePhaseReporter({ onPhase, now, canWrite }) {
+  let latest = null;
+  let reported = null;
+  let commandStartedAt = null;
+  let chain = Promise.resolve();
+  const flush = async () => {
+    if (latest === reported || !canWrite()) return;
+    const phase = latest;
+    try {
+      const written = await onPhase({ phase, commandStartedAt });
+      if (written?.ok !== false) reported = phase;
+    } catch {
+      // not reported: the next sample retries
+    }
+  };
+  return {
+    observe(phase) {
+      latest = phase;
+      if (commandStartedAt === null && COMMAND_RUNNING_PHASES.has(phase)) commandStartedAt = now();
+      chain = chain.then(flush);
+      return chain;
+    },
+    settled: () => chain,
+  };
+}
+
 /**
  * BRAIN-436: while the exec ssh session is open (the ticket is on runner A), observe A and, once the ticket has sat `queued`
  * for `minQueuedMs` with a better runner on offer, withdraw it. ONE serial loop: every step is awaited in turn, so there is
@@ -823,7 +876,7 @@ export function hasMeasuredHeadroom(probe) {
  * proof the runner never started the ticket (a `withdrawn` reply, or a bound `unfinished/withdrawn` record fetched from A);
  * anything else keeps waiting on A. Stops for good once the ticket is `admitted` or terminal. Resolves null when it did not move.
  */
-async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed, signal, abortSignal, now, sleep, fetchDeadlineMs, withdrawDeadlineMs, sshBin, env }) {
+async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed, signal, abortSignal, now, sleep, fetchDeadlineMs, withdrawDeadlineMs, sshBin, env, onSample }) {
   const { minQueuedMs, intervalMs = DEFAULT_REBALANCE_INTERVAL_MS, pickTarget, beforeWithdraw, afterWithdraw } = rebalance;
   const fence = { runner, epoch: state.epoch };
   const current = () => state.runner === fence.runner && state.epoch === fence.epoch;
@@ -844,6 +897,8 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
       if (state.attemptedTarget && isWithdrawnRecord(fetched, expected)) return moved(state.attemptedTarget, state.queuedSince);
       return null;
     }
+    const sampledPhase = runnerPhaseOf(fetched);
+    if (sampledPhase) void onSample?.(sampledPhase);
     const phase = fetched.phase ?? fetched.state;
     // `gone` is read before the runner has written its publisher record (the snapshot may still be landing), so it is not final here.
     if (phase !== 'preparing' && phase !== 'queued' && phase !== 'gone') return null;
@@ -990,6 +1045,9 @@ async function dispatchOnce(opts) {
     // binding a later reconcile needs to trust a result record fetched for this dispatch. Resolving `false` or throwing means it
     // is not durable: the dispatch does not start (`unconfirmed`, `neverStarted`).
     onBinding,
+    // BRAIN-770: called with `{phase, commandStartedAt}` as the rebalance watcher's own samples show the runner's phase change. Nothing
+    // is polled for it: with rebalance off (or no withdraw capability) it is never called.
+    onRunnerPhase,
   } = opts;
   const withdrawCapable = (rebalance?.canWithdraw ?? canWithdraw) === true;
 
@@ -1139,6 +1197,11 @@ async function dispatchOnce(opts) {
   const closed = waitClosed(child, abortSignal);
   let move = null;
   const state = { runner, epoch: 1, attemptedTarget: null, attemptedReason: null, queuedSince: null };
+  let sessionEnded = false;
+  closed.then(() => { sessionEnded = true; }, () => { sessionEnded = true; });
+  const reporter = onRunnerPhase && rebalance && withdrawCapable && pipeResult.ok
+    ? makePhaseReporter({ onPhase: onRunnerPhase, now, canWrite: () => !sessionEnded && !abortSignal?.aborted })
+    : null;
   if (rebalance && withdrawCapable && pipeResult.ok) {
     // One serial watcher beside the open ssh session; it is stopped and JOINED before anything below looks at the outcome.
     const watchAbort = new AbortController();
@@ -1149,6 +1212,7 @@ async function dispatchOnce(opts) {
       fetchDeadlineMs: resultDeadlineMs,
       withdrawDeadlineMs: deadlines.withdrawMs ?? 15_000,
       sshBin, env,
+      onSample: reporter ? reporter.observe : undefined,
     });
     // The watcher ends the session itself once it has moved the ticket (it is queued: nothing is running behind the ssh).
     const settled = watcher.then((m) => {
@@ -1173,6 +1237,8 @@ async function dispatchOnce(opts) {
   } else {
     await closed;
   }
+
+  await reporter?.settled();
 
   if (abortSignal && abortSignal.aborted) {
     return cancelledOutcome();

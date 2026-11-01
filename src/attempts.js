@@ -157,6 +157,12 @@ export async function createAttempt(root, id, { runner = null, resources, logPat
   return existing ? { existing } : attempt;
 }
 
+/** BRAIN-770: the `onRunnerPhase` callback for a dispatch of attempt `id` at `generation`: records the runner's phase (and the command's
+ *  start, once known) on the attempt, refused by `updateAttempt`'s generation fence once the attempt has moved on. Resolves its `{ok}`. */
+export function runnerPhaseRecorder(root, id, generation) {
+  return ({ phase, commandStartedAt }) => updateAttempt(root, id, generation, { runnerPhase: phase, ...(commandStartedAt === null ? {} : { commandStartedAt }) });
+}
+
 /** BRAIN-405: patch the stored record with no generation fence, for a caller that already holds the broker lock. `undefined` drops a key. */
 export function patchAttemptLocked(root, id, patch) {
   const current = readAttempt(root, id);
