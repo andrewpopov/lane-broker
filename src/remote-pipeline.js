@@ -47,7 +47,6 @@ class DispatchOnlyError extends Error {}
 
 /** BRAIN-769: a local run's own preparation (deps or setup) failed, so the command never ran: infrastructure, not a verdict on the command. */
 export const LOCAL_SETUP_FAILED_EXIT_CODE = 77;
-const TREE_LOCK_WAIT_MS = 6 * 60 * 60 * 1000;
 
 /** BRAIN-634: re-evaluated (fresh config read + marker + env) at every point this pipeline would execute something. */
 function assertLocalExecutionAllowed() {
@@ -375,13 +374,14 @@ function missingInstalled(tree, lock) {
   return missing.length > 0 ? missing : null;
 }
 
-/** BRAIN-769: the tree's `node_modules` already holds every platform-applicable lock entry at the locked version, so `npm ci` would change nothing. */
+/** BRAIN-769: the tree's `node_modules` holds every platform-applicable lock entry on disk, at the locked version, source and integrity, so `npm ci` would change nothing. */
 function localDepsCurrent(cwd) {
   const lock = readJsonSafe(path.join(cwd, 'package-lock.json'));
   const tree = path.join(cwd, 'node_modules');
   if (!lock?.packages || missingInstalled(tree, lock)) return false;
   const installed = readJsonSafe(path.join(tree, '.package-lock.json')).packages;
-  return Object.entries(lock.packages).every(([name, entry]) => name === '' || !entry?.version || !installed[name] || installed[name].version === entry.version);
+  const sameLocked = (name, entry) => ['version', 'resolved', 'integrity'].every((field) => entry[field] === undefined || installed[name][field] === entry[field]);
+  return Object.entries(lock.packages).every(([name, entry]) => name === '' || !entry || !installed[name] || (fs.existsSync(path.join(cwd, name)) && sameLocked(name, entry)));
 }
 
 function aggregateDepsOutcome(records) {
@@ -427,13 +427,7 @@ export async function remotePipelineCommand(ticketDir) {
     process.stderr.write(`lane remote-pipeline: missing or invalid pipeline.json in ${ticketDir}\n`);
     return { exitCode: 1 };
   }
-  if (!payload.treeLockPath) return runPipeline(ticketDir, payload);
-  // BRAIN-769: a local run prepares and runs under one per-tree lock, so two runs in a tree cannot reinstall under each other
-  return withLock(path.dirname(payload.treeLockPath), () => runPipeline(ticketDir, payload), { lockPath: payload.treeLockPath, group: 'tree', timeoutMs: TREE_LOCK_WAIT_MS });
-}
-
-async function runPipeline(ticketDir, payload) {
-  const localTree = Boolean(payload.treeLockPath);
+  const localTree = payload.localTree === true;
   const { workDir, relCwd, remoteDeps = [], remoteSetup = [], argv, npmCacheDir, npmUserConfig, depsCache } = payload;
   const npmGlobalConfig = path.join(path.dirname(npmUserConfig), 'npmrc-global');
   ensureNpmrcFile(npmUserConfig);

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { laneRun, writeRepoConfig, gitFixture } from './helpers.js';
+import { laneRun, writeRepoConfig, gitFixture, waitFor } from './helpers.js';
 import { paths } from '../src/state.js';
 import { locallyRefusedNow, localWindowAllowing } from '../src/resources.js';
 import { setup as remoteSetup, tmpDir, markerCmd, detachAndWait, resultOf } from './remote-harness.js';
@@ -386,4 +386,85 @@ test('BRAIN-769: the command\'s own nonzero exit passes through a prepared tree 
   const ctx = setupPrep({ remoteDeps: ['.'] });
   const { waited } = await runPrepLane(ctx, ['node', '-e', 'process.exit(5)']);
   assert.equal(waited.code, 5, `stderr: ${waited.stderr}`);
+});
+
+/** Compact lock bytes: `npm ci` leaves them alone, `npm install` would reformat them. */
+const compactLock = () => JSON.stringify(JSON.parse(depsFixture()['package-lock.json']));
+
+test('BRAIN-769: a package deleted from node_modules is reinstalled', async () => {
+  const ctx = setupPrep({ remoteDeps: ['.'] });
+  await runPrepLane(ctx, ['node', '-e', '0']);
+  fs.rmSync(path.join(ctx.repoDir, 'node_modules', 'hello-tool'), { recursive: true });
+  const marker = path.join(tmpDir('marker'), 'probe.json');
+  const { waited } = await runPrepLane(ctx, probeCmd(marker));
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(JSON.parse(fs.readFileSync(marker, 'utf8')).dep, true);
+});
+
+test('BRAIN-769: a same-version dependency whose locked resolved source changed is reinstalled', async () => {
+  const ctx = setupPrep({ remoteDeps: ['.'] });
+  await runPrepLane(ctx, ['node', '-e', '0']);
+  const hiddenFile = path.join(ctx.repoDir, 'node_modules', '.package-lock.json');
+  const hidden = JSON.parse(fs.readFileSync(hiddenFile, 'utf8'));
+  hidden.packages['node_modules/hello-tool'].resolved = 'git+ssh://git@example.invalid/hello-tool.git#0000000';
+  fs.writeFileSync(hiddenFile, JSON.stringify(hidden));
+  const sentinel = path.join(ctx.repoDir, 'node_modules', 'sentinel');
+  fs.writeFileSync(sentinel, '');
+  const { waited } = await runPrepLane(ctx, ['node', '-e', '0']);
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.existsSync(sentinel), false, 'npm ci replaced the tree');
+});
+
+test('BRAIN-769: the prep dir is gone after the spawn fails', async () => {
+  const ctx = setupPrep({ remoteDeps: ['.'] });
+  const gate = tmpDir('hold');
+  const holdEnv = { ...ctx.env, LANE_BROKER_TEST_HOLD_AT: 'local-admitted', LANE_BROKER_TEST_HOLD_READY: path.join(gate, 'ready'), LANE_BROKER_TEST_HOLD_GO: path.join(gate, 'go') };
+  const doomedCwd = path.join(ctx.repoDir, 'sub');
+  const started = await laneRun(['run', '--repo', 'r', '--lane', 'e2e', '--detach', '--', 'node', '-e', '0'], { env: holdEnv, cwd: doomedCwd });
+  assert.equal(started.code, 0, started.stderr);
+  const id = started.stdout.trim();
+  await waitFor(() => fs.existsSync(path.join(gate, 'ready')), { timeoutMs: 30000 });
+  fs.rmSync(doomedCwd, { recursive: true });
+  fs.writeFileSync(path.join(gate, 'go'), '');
+  const waited = await laneRun(['wait', id, '--timeout', '60s'], { env: ctx.env });
+  assert.notEqual(waited.code, 0);
+  assert.equal(fs.existsSync(path.join(ctx.state, 'local-prep', id)), false, 'the prep dir was removed with the failed run');
+});
+
+test('BRAIN-769: two runs in one tree serialise: the second prepares only after the first command ends', async () => {
+  const events = path.join(tmpDir('marker'), 'events.log');
+  const ctx = setupPrep({ remoteDeps: ['.'], remoteSetup: [['node', '-e', `require('fs').appendFileSync(${JSON.stringify(events)}, 'setup\\n')`]] });
+  const slow = ['node', '-e', `const fs = require('fs'); fs.appendFileSync(${JSON.stringify(events)}, 'start\\n'); setTimeout(() => { fs.appendFileSync(${JSON.stringify(events)}, 'end\\n'); }, 2500)`];
+  const a = await laneRun(['run', '--repo', 'r', '--lane', 'e2e', '--detach', '--', ...slow], { env: ctx.env, cwd: ctx.repoDir });
+  await waitFor(() => fs.existsSync(events) && fs.readFileSync(events, 'utf8').includes('start'), { timeoutMs: 60000 });
+  const b = await laneRun(['run', '--repo', 'r', '--lane', 'plain', '--detach', '--', ...slow], { env: ctx.env, cwd: ctx.repoDir });
+  for (const id of [a.stdout.trim(), b.stdout.trim()]) assert.equal((await laneRun(['wait', id, '--timeout', '120s'], { env: ctx.env })).code, 0);
+  assert.deepEqual(fs.readFileSync(events, 'utf8').split('\n').filter(Boolean), ['setup', 'start', 'end', 'setup', 'start', 'end']);
+});
+
+test('BRAIN-769: cancelling a run that waits for the tree lock ends it as cancelled without preparing', async () => {
+  const events = path.join(tmpDir('marker'), 'events.log');
+  const ctx = setupPrep({ remoteDeps: ['.'], remoteSetup: [['node', '-e', `require('fs').appendFileSync(${JSON.stringify(events)}, 'setup\\n')`]] });
+  const hold = ['node', '-e', `require('fs').appendFileSync(${JSON.stringify(events)}, 'start\\n'); setTimeout(() => {}, 30000)`];
+  const a = await laneRun(['run', '--repo', 'r', '--lane', 'e2e', '--detach', '--', ...hold], { env: ctx.env, cwd: ctx.repoDir });
+  await waitFor(() => fs.existsSync(events) && fs.readFileSync(events, 'utf8').includes('start'), { timeoutMs: 60000 });
+  const b = await laneRun(['run', '--repo', 'r', '--lane', 'plain', '--detach', '--', 'node', '-e', '0'], { env: ctx.env, cwd: ctx.repoDir });
+  await new Promise((r) => setTimeout(r, 1500));
+  await laneRun(['cancel', b.stdout.trim()], { env: ctx.env });
+  const waitedB = await laneRun(['wait', b.stdout.trim(), '--timeout', '20s'], { env: ctx.env });
+  assert.equal(waitedB.code, 130, `stderr: ${waitedB.stderr}`);
+  assert.equal(fs.readFileSync(events, 'utf8'), 'setup\nstart\n', 'the waiting run never prepared');
+  await laneRun(['cancel', a.stdout.trim()], { env: ctx.env });
+  await laneRun(['wait', a.stdout.trim(), '--timeout', '20s'], { env: ctx.env });
+});
+
+test('BRAIN-769: a tracked package-lock.json is byte-identical after the install', async () => {
+  const ctx = setupPrep({ remoteDeps: ['.'] });
+  const lockFile = path.join(ctx.repoDir, 'package-lock.json');
+  fs.writeFileSync(lockFile, compactLock());
+  const before = fs.readFileSync(lockFile);
+  const { waited } = await runPrepLane(ctx, ['node', '-e', '0']);
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.ok(fs.existsSync(path.join(ctx.repoDir, 'node_modules', 'hello-tool')));
+  assert.deepEqual(fs.readFileSync(lockFile), before);
 });
