@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { freshEnv, writeGlobalConfig } from './helpers.js';
-import { createAttempt, updateAttempt } from '../src/attempts.js';
+import { createAttempt, updateAttempt, readAttempt, runnerPhaseRecorder } from '../src/attempts.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
+import { rebalanceSetup, T } from './remote-harness.js';
+import { waitFor } from './helpers.js';
 
 // BRAIN-770: a remote attempt waiting in the runner's queue reads queued, not `phase=running`; wait and run time are split.
 
@@ -59,4 +61,44 @@ test('a runner that reports no phase keeps the old line and null fields', async 
     assert.deepEqual([row.runnerPhase, row.commandStartedAt, row.waitedMs, row.runMs], [null, null, null, null]);
     assert.match(text, /att-1 {2}runner=skybox {2}phase=running {2}elapsed=10m/);
   });
+});
+
+test('a clock step backwards never prints a negative duration', async () => {
+  await withStatusEnv(async (state) => {
+    const { row, text } = await remoteAttempt(state, { startedAt: Date.now() + 5 * MIN, runnerPhase: 'queued' });
+    assert.equal(row.waitedMs, null);
+    assert.match(text, /att-1 {2}queued@skybox {2}waited=-(\s|$)/);
+  });
+});
+
+test('runnerPhaseRecorder writes the phase and command start under the attempt\'s generation, and a stale generation writes nothing', async () => {
+  await withStatusEnv(async (state) => {
+    const created = await createAttempt(state, 'att-1', { runner: 'skybox' });
+    const record = runnerPhaseRecorder(state, 'att-1', created.generation);
+    assert.equal((await record({ phase: 'queued', commandStartedAt: null })).ok, true);
+    assert.deepEqual([readAttempt(state, 'att-1').runnerPhase, readAttempt(state, 'att-1').commandStartedAt], ['queued', undefined]);
+    assert.equal((await record({ phase: 'admitted', commandStartedAt: 123 })).ok, true);
+    assert.deepEqual([readAttempt(state, 'att-1').runnerPhase, readAttempt(state, 'att-1').commandStartedAt], ['admitted', 123]);
+    await updateAttempt(state, 'att-1', created.generation, { generation: created.generation + 1, runnerPhase: undefined, commandStartedAt: undefined });
+    assert.equal((await record({ phase: 'admitted', commandStartedAt: 456 })).ok, false);
+    assert.deepEqual([readAttempt(state, 'att-1').runnerPhase, readAttempt(state, 'att-1').commandStartedAt], [undefined, undefined]);
+  });
+});
+
+test('wiring: the supervisor records the queued phase of a ticket sitting in the runner\'s queue (standalone observer, rebalance off)', T, async () => {
+  const ctx = rebalanceSetup({ rebalance: { remoteRebalanceMinQueuedMs: 0, remoteRebalanceIntervalMs: 150 } });
+  const id = await ctx.start();
+  await waitFor(() => readAttempt(ctx.state, id)?.runnerPhase === 'queued', { timeoutMs: 30_000 });
+  assert.equal(readAttempt(ctx.state, id).commandStartedAt, undefined);
+  ctx.unpause('a');
+  assert.equal((await ctx.finish(id)).code, 0);
+});
+
+test('wiring: after a rebalance move the attempt shows the new runner\'s phase, not the old one\'s (watcher feeds the reporter)', T, async () => {
+  const ctx = rebalanceSetup({ paused: ['a', 'b'], rebalance: { remoteRebalanceMinQueuedMs: 400, remoteRebalanceIntervalMs: 150 } });
+  const id = await ctx.start();
+  await waitFor(() => readAttempt(ctx.state, id)?.runner === 'b' && readAttempt(ctx.state, id)?.runnerPhase === 'queued', { timeoutMs: 40_000 });
+  assert.equal(readAttempt(ctx.state, id).commandStartedAt, undefined);
+  ctx.unpause('b');
+  assert.equal((await ctx.finish(id)).code, 0);
 });

@@ -165,13 +165,13 @@ test('rebalance: a B whose probe has no measured headroom is not a destination',
   assert.deepEqual(ctx.runs(), ['a']);
 });
 
-test('rebalance: remoteRebalanceMinQueuedMs 0 disables it entirely -- nothing watches the runner', T, async () => {
+test('rebalance: remoteRebalanceMinQueuedMs 0 disables it entirely -- nothing is ever withdrawn or moved', T, async () => {
   const ctx = rebalanceSetup({ rebalance: { remoteRebalanceMinQueuedMs: 0 } });
   const id = await ctx.start();
   await execArrived(ctx, 'a');
   await sleep(2500);
-  assert.equal(ctx.fake.count('result a'), 0, 'no watcher poll');
   assert.equal(ctx.fake.count('withdraw a'), 0);
+  assert.equal(ctx.fake.count('exec b'), 0);
   ctx.unpause('a');
   assert.equal((await ctx.finish(id)).code, 0);
   assert.deepEqual(ctx.runs(), ['a']);

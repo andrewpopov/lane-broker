@@ -54,7 +54,7 @@ import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remo
 import { DEPS_KEY_FILES_CAPABILITY, EXECUTION_CEILING_CAPABILITY, REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
 import { SNAPSHOT_GZIP_CAPABILITY, TRANSFER_GZIP } from './remote-gzip.js';
 import { BLOB_CACHE_CAPABILITY } from './remote-blobs.js';
-import { createAttempt, readAttempt, updateAttempt, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
+import { createAttempt, readAttempt, updateAttempt, runnerPhaseRecorder, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX, hostCpuLoad, ticketCpuEstimate } from './admission.js';
 import { relayedUsage, relayedDeps, relayedTransfer, snapshotLine } from './remote-relay.js';
 import { maybeDailyGc } from './gc.js';
@@ -1146,7 +1146,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       // BRAIN-515: every dispatch (a rebalance move's second one too) re-persists which runner the snapshot goes to and the
       // identity a result fetched from it must carry; `lane`'s orphan reconcile trusts a runner record only against this.
       // `ticketId` differs from the lane id only on a cache repair retry (BRAIN-642), whose runner ticket is a fresh one.
-      onRunnerPhase: ({ phase, commandStartedAt }) => updateAttempt(root, enriched.id, gen, { runnerPhase: phase, ...(commandStartedAt === null ? {} : { commandStartedAt }) }),
+      onRunnerPhase: runnerPhaseRecorder(root, enriched.id, gen),
       phaseIntervalMs: globalCfg.remoteRebalanceIntervalMs,
       onBinding: async ({ protocol, ticketId, generation, manifestHash }) =>
         (await updateAttempt(root, enriched.id, gen, { binding: { protocol, generation, manifestHash, runner: runner.name, ...(ticketId === enriched.id ? {} : { ticketId }) } })).ok,

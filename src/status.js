@@ -315,8 +315,8 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       elapsedMs: a.startedAt ? now - a.startedAt : null,
       runnerPhase: a.runnerPhase ?? null,
       commandStartedAt: a.commandStartedAt ?? null,
-      waitedMs: a.runnerPhase && a.startedAt ? (a.commandStartedAt ?? now) - a.startedAt : null,
-      runMs: a.commandStartedAt ? now - a.commandStartedAt : null,
+      waitedMs: a.runnerPhase && a.startedAt ? nonNegative((a.commandStartedAt ?? now) - a.startedAt) : null,
+      runMs: a.commandStartedAt ? nonNegative(now - a.commandStartedAt) : null,
       orphaned: !supervisorAlive(a),
       moveInterrupted: !supervisorAlive(a) ? moveInterruptedLabel(a.id, a) : null,
       reconcilable: isStrandedWithdrawingMove(a),
@@ -477,6 +477,9 @@ function silenceFlag(r) {
   if (r.silent) return ` [SILENT ${fmtMs(r.silentMs)}, cpu ${cpu}]`;
   return r.idle ? ` idle ${fmtMs(r.idleMs)}` : '';
 }
+
+/** A wall-clock step backwards must not print a negative duration. */
+const nonNegative = (ms) => (ms >= 0 ? ms : null);
 
 function fmtMs(ms) {
   if (ms == null) return '-';

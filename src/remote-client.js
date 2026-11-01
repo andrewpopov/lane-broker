@@ -96,7 +96,7 @@ function tailCapture(max) {
 }
 
 /** Spawn `cmdBin argv`, capturing (the tail of) stdout/stderr, SIGKILL on `deadlineMs`. Never rejects. */
-export function runWithDeadline(cmdBin, argv, deadlineMs, env, maxCaptureBytes = DEFAULT_CAPTURE_BYTES) {
+export function runWithDeadline(cmdBin, argv, deadlineMs, env, maxCaptureBytes = DEFAULT_CAPTURE_BYTES, signal) {
   return new Promise((resolve) => {
     let child;
     try {
@@ -116,10 +116,20 @@ export function runWithDeadline(cmdBin, argv, deadlineMs, env, maxCaptureBytes =
         // already gone
       }
     }, deadlineMs);
+    const kill = () => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        // already gone
+      }
+    };
+    if (signal?.aborted) kill();
+    else signal?.addEventListener('abort', kill, { once: true });
     child.stdout.on('data', (d) => out.push(d));
     child.stderr.on('data', (d) => err.push(d));
     child.on('close', (code) => {
       clearTimeout(timer);
+      signal?.removeEventListener('abort', kill);
       resolve({ code, stdout: out.text(), stderr: err.text(), timedOut });
     });
     child.on('error', () => {
@@ -677,9 +687,9 @@ export function queryRemoteHave(runner, identity, hashes, { sshBin = 'ssh', dead
 
 /** `lane remote-result <ticketId>` over ssh, bounded by `deadlineMs`. Returns the parsed
  *  record, `{missing:true}`, or `null` on any transport/parse failure (never throws). */
-export async function fetchRemoteResult(runner, ticketId, sshBin, deadlineMs, env) {
+export async function fetchRemoteResult(runner, ticketId, sshBin, deadlineMs, env, signal) {
   const cmd = buildRemoteCommand(runner, 'remote-result', [ticketId]);
-  const res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env);
+  const res = await runWithDeadline(sshBin, sshArgv(runner, cmd), deadlineMs, env, undefined, signal);
   if (res.timedOut || res.code !== 0) return null;
   try {
     return JSON.parse(res.stdout.trim());
@@ -816,32 +826,75 @@ export function hasMeasuredHeadroom(probe) {
 }
 
 const COMMAND_RUNNING_PHASES = new Set(['admitted', 'running']);
+const PHASE_BACKOFF_CAP = 8;
+const PHASE_JITTER = 0.2;
 
 /**
- * BRAIN-770: while the exec ssh session is open, poll the runner's own phase (`preparing`/`queued`/`admitted`/`running`) and
- * report each CHANGE to `onPhase({phase, commandStartedAt})`. `commandStartedAt` is the clock reading at the first poll that saw the
- * ticket admitted (null before). Read-only: it never withdraws, moves or settles anything. Stops on a terminal record, on close or abort.
+ * BRAIN-770: the runner's own phase out of a `remote-result` record, or null. The runner states `phase` only where it differs from
+ * `state`, so a bare `queued` is a real phase; a bare `running` is a runner that predates phases (it folds preparing and admitted into
+ * it), which says nothing precise and so reports nothing.
  */
-async function observeRunnerPhase({ runner, ticketId, onPhase, isClosed, signal, abortSignal, now, sleep, intervalMs, fetchDeadlineMs, sshBin, env }) {
-  const stopped = () => isClosed() || signal.aborted || abortSignal?.aborted;
-  let last = null;
+function runnerPhaseOf(record) {
+  if (typeof record.phase === 'string') return record.phase === 'gone' ? null : record.phase;
+  return record.state === 'queued' ? 'queued' : null;
+}
+
+/**
+ * BRAIN-770: hands each observed runner phase to `onPhase({phase, commandStartedAt})` and counts a phase as reported only once that
+ * write succeeded (it returned, and not `{ok:false}`), so a failed write is retried on the next sample. Writes are serial, and none is
+ * started once `canWrite()` is false. `commandStartedAt` is the clock reading at the first sample that saw the ticket admitted.
+ */
+function makePhaseReporter({ onPhase, now, canWrite }) {
+  let latest = null;
+  let reported = null;
   let commandStartedAt = null;
-  while (true) {
-    await sleep(intervalMs, signal);
-    if (stopped()) return;
-    const fetched = await fetchRemoteResult(runner, ticketId, sshBin, fetchDeadlineMs, env);
-    if (stopped()) return;
-    if (!fetched) continue;
-    if (!fetched.missing) return;
-    const phase = fetched.phase ?? fetched.state;
-    if (typeof phase !== 'string' || phase === 'gone' || phase === last) continue;
-    last = phase;
-    if (commandStartedAt === null && COMMAND_RUNNING_PHASES.has(phase)) commandStartedAt = now();
+  let chain = Promise.resolve();
+  const flush = async () => {
+    if (latest === reported || !canWrite()) return;
+    const phase = latest;
     try {
-      await onPhase({ phase, commandStartedAt });
+      const written = await onPhase({ phase, commandStartedAt });
+      if (written?.ok !== false) reported = phase;
     } catch {
-      // a bookkeeping failure never changes the dispatch
+      // not reported: the next sample retries
     }
+  };
+  return {
+    observe(phase) {
+      latest = phase;
+      if (commandStartedAt === null && COMMAND_RUNNING_PHASES.has(phase)) commandStartedAt = now();
+      chain = chain.then(flush);
+      return chain;
+    },
+    settled: () => chain,
+    pending: () => latest !== null && (latest !== reported || !COMMAND_RUNNING_PHASES.has(latest)),
+  };
+}
+
+/**
+ * BRAIN-770: while the exec ssh session is open, poll the runner's phase on its own and feed `reporter`. Used only where the rebalance
+ * watcher is not already sampling this ticket (it feeds the same reporter). Read-only: it never withdraws, moves or settles anything.
+ * Polls back off (with jitter) while fetches fail, stop once the ticket is reported running or has a terminal record, and a fetch in
+ * flight is killed through `signal` when the session closes.
+ */
+async function trackRunnerPhase({ runner, ticketId, reporter, isClosed, signal, abortSignal, sleep, intervalMs, fetchDeadlineMs, sshBin, env }) {
+  const stopped = () => isClosed() || signal.aborted || abortSignal?.aborted;
+  let failures = 0;
+  while (true) {
+    const wait = Math.min(intervalMs * 2 ** failures, intervalMs * PHASE_BACKOFF_CAP);
+    await sleep(Math.round(wait * (1 + Math.random() * PHASE_JITTER)), signal);
+    if (stopped()) return;
+    const fetched = await fetchRemoteResult(runner, ticketId, sshBin, fetchDeadlineMs, env, signal);
+    if (stopped()) return;
+    if (!fetched) {
+      failures += 1;
+      continue;
+    }
+    failures = 0;
+    if (!fetched.missing) return;
+    const phase = runnerPhaseOf(fetched);
+    if (phase) await reporter.observe(phase);
+    if (!reporter.pending() && COMMAND_RUNNING_PHASES.has(phase)) return;
   }
 }
 
@@ -853,7 +906,7 @@ async function observeRunnerPhase({ runner, ticketId, onPhase, isClosed, signal,
  * proof the runner never started the ticket (a `withdrawn` reply, or a bound `unfinished/withdrawn` record fetched from A);
  * anything else keeps waiting on A. Stops for good once the ticket is `admitted` or terminal. Resolves null when it did not move.
  */
-async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed, signal, abortSignal, now, sleep, fetchDeadlineMs, withdrawDeadlineMs, sshBin, env }) {
+async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed, signal, abortSignal, now, sleep, fetchDeadlineMs, withdrawDeadlineMs, sshBin, env, onSample }) {
   const { minQueuedMs, intervalMs = DEFAULT_REBALANCE_INTERVAL_MS, pickTarget, beforeWithdraw, afterWithdraw } = rebalance;
   const fence = { runner, epoch: state.epoch };
   const current = () => state.runner === fence.runner && state.epoch === fence.epoch;
@@ -874,6 +927,8 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
       if (state.attemptedTarget && isWithdrawnRecord(fetched, expected)) return moved(state.attemptedTarget, state.queuedSince);
       return null;
     }
+    const sampledPhase = runnerPhaseOf(fetched);
+    if (sampledPhase) void onSample?.(sampledPhase);
     const phase = fetched.phase ?? fetched.state;
     // `gone` is read before the runner has written its publisher record (the snapshot may still be landing), so it is not final here.
     if (phase !== 'preparing' && phase !== 'queued' && phase !== 'gone') return null;
@@ -1172,6 +1227,9 @@ async function dispatchOnce(opts) {
   const closed = waitClosed(child, abortSignal);
   let move = null;
   const state = { runner, epoch: 1, attemptedTarget: null, attemptedReason: null, queuedSince: null };
+  let observing = Promise.resolve();
+  let reporter = null;
+  let trackPhase = null;
   if (onRunnerPhase && pipeResult.ok) {
     const phaseAbort = new AbortController();
     let phaseSessionClosed = false;
@@ -1180,13 +1238,17 @@ async function dispatchOnce(opts) {
       phaseAbort.abort();
     };
     closed.then(stopPhaseObserver, stopPhaseObserver);
-    observeRunnerPhase({
-      runner, ticketId: expected.ticketId, onPhase: onRunnerPhase, signal: phaseAbort.signal, abortSignal, now, sleep,
+    reporter = makePhaseReporter({ onPhase: onRunnerPhase, now, canWrite: () => !phaseSessionClosed && !abortSignal?.aborted });
+    const trackAlone = () => trackRunnerPhase({
+      runner, ticketId: expected.ticketId, reporter, signal: phaseAbort.signal, abortSignal, sleep,
       isClosed: () => phaseSessionClosed,
       intervalMs: phaseIntervalMs,
       fetchDeadlineMs: resultDeadlineMs,
       sshBin, env,
-    }).catch(() => {});
+    }).catch((err) => process.stderr.write(`lane: remote phase observer for ${runner.name} stopped: ${err?.message ?? err}\n`));
+    trackPhase = trackAlone;
+    // Where the rebalance watcher samples this ticket anyway it feeds the reporter; the standalone poll covers the rest.
+    if (!(rebalance && withdrawCapable)) observing = trackAlone();
   }
   if (rebalance && withdrawCapable && pipeResult.ok) {
     // One serial watcher beside the open ssh session; it is stopped and JOINED before anything below looks at the outcome.
@@ -1198,6 +1260,7 @@ async function dispatchOnce(opts) {
       fetchDeadlineMs: resultDeadlineMs,
       withdrawDeadlineMs: deadlines.withdrawMs ?? 15_000,
       sshBin, env,
+      onSample: reporter ? reporter.observe : undefined,
     });
     // The watcher ends the session itself once it has moved the ticket (it is queued: nothing is running behind the ssh).
     const settled = watcher.then((m) => {
@@ -1210,6 +1273,14 @@ async function dispatchOnce(opts) {
       }
       return m;
     });
+    if (reporter) {
+      // The watcher stops sampling at admitted; if that write (or any earlier one) failed, the standalone poll finishes the job.
+      observing = settled.then(async (m) => {
+        if (m) return;
+        await reporter.settled();
+        if (reporter.pending()) await trackPhase();
+      }).catch(() => {});
+    }
     // Only a move ends the wait early; a watcher that stopped for good (admitted, terminal) leaves the session to close on its own.
     try {
       await Promise.race([closed, settled.then((m) => m ?? closed)]);
@@ -1222,6 +1293,9 @@ async function dispatchOnce(opts) {
   } else {
     await closed;
   }
+
+  await observing;
+  await reporter?.settled();
 
   if (abortSignal && abortSignal.aborted) {
     return cancelledOutcome();
