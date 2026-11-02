@@ -528,7 +528,7 @@ test('BRAIN-770: remoteRebalanceMaxMoves 0 with an idle runner is "moving paused
 });
 
 test('BRAIN-770: the cap is total wait since first queued, kept on the attempt and not restarted by a move', T, async () => {
-  const ctx = refusedSetup({ names: ['a', 'b'], paused: ['a', 'b'], cap: 3000, rebalance: { remoteRebalanceMinQueuedMs: 300 } });
+  const ctx = refusedSetup({ names: ['a', 'b'], paused: ['a', 'b'], cap: 4000, rebalance: { remoteRebalanceMinQueuedMs: 1500 } });
   const id = await ctx.start();
   await waitFor(() => readAttempt(ctx.state, id)?.moves?.length === 1, { timeoutMs: 30_000 });
   await waitFor(() => ctx.fake.count('result b') >= 3, { timeoutMs: 30_000 });
@@ -538,6 +538,26 @@ test('BRAIN-770: the cap is total wait since first queued, kept on the attempt a
   assert.ok(moved.firstQueuedAt < moved.moves[0].at, 'stamped on A, before the move, and not re-stamped on B');
   const waited = await ctx.finish(id, '60s');
   assert.equal(waited.code, 76, `${waited.stderr}\n${ctx.fake.calls().join(',')}`);
-  assert.ok(resultOf(ctx.state, id).endedAt - moved.firstQueuedAt >= 3000, 'refused only after the whole cap');
+  const { endedAt } = resultOf(ctx.state, id);
+  assert.ok(endedAt - moved.firstQueuedAt >= 4000, 'refused only after the whole cap');
+  assert.ok(endedAt < moved.moves[0].at + 4000, 'refused before a fresh full cap on B could have elapsed');
   assert.deepEqual(ctx.runs(), []);
+});
+
+test('BRAIN-770: a failed write of the first-queued stamp is retried on the next sample, not latched as done', T, async () => {
+  // a slow watcher: the dispatch has finished its own attempt writes before the first sample, so only the stamp's write meets the locked directory
+  const ctx = refusedSetup({ names: ['a'], cap: 600_000, rebalance: { remoteRebalanceIntervalMs: 1000 } });
+  const attemptsDir = paths(ctx.state).attempts;
+  const id = await ctx.start();
+  await execArrived(ctx, 'a');
+  fs.chmodSync(attemptsDir, 0o500);
+  try {
+    await sleep(2500);
+    assert.equal(readAttempt(ctx.state, id)?.firstQueuedAt, undefined, 'the write was blocked');
+  } finally {
+    fs.chmodSync(attemptsDir, 0o700);
+  }
+  await waitFor(() => Number.isFinite(readAttempt(ctx.state, id)?.firstQueuedAt), { timeoutMs: 30_000 });
+  ctx.unpause('a');
+  assert.equal((await ctx.finish(id)).code, 0);
 });

@@ -166,6 +166,16 @@ async function settleStrandedWithdraw(root, id, attempt, resultPath, { globalCfg
   }
   await recordContact(root, from, true, now, { deadlineAt });
 
+  if (fetched.missing && fetched.state === 'queued' && attempt.moving.kind === 'refuse') {
+    // BRAIN-770: the intent is persisted before the withdraw is sent, so the supervisor may have died before it went out. Re-issue it:
+    // only the runner's `withdrawn` answer settles the refusal; any other answer keeps the ticket held and the next pass looks again
+    // (a ticket the runner started meanwhile is then found completed and adopted).
+    const withdrawBudget = callBudget();
+    if (withdrawBudget === null) return waitTimedOut();
+    const withdrawal = await remoteWithdraw(source, sourceId, { sshBin, deadlineMs: withdrawBudget, env });
+    if (withdrawal.action !== 'withdrawn') return held('running', `source ${from} still has the job (queued; withdraw answered ${withdrawal.action})`);
+    return publishSettled(root, id, attempt, resultPath, 'refused', () => refusedResult(id, attempt, `source ${from} confirmed the withdraw; withdrawn with no other runner able to take it`), {});
+  }
   if (fetched.missing) {
     return fetched.state === 'queued' || fetched.state === 'running'
       ? held('running', `source ${from} still has the job (${fetched.state})`)

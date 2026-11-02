@@ -1242,8 +1242,9 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
         refusedSince: () => firstQueuedAt,
         markQueued: async (at) => {
           if (firstQueuedAt !== null) return;
-          firstQueuedAt = at;
-          await updateAttempt(root, enriched.id, gen, { firstQueuedAt });
+          // latched only once the write landed: a failed one is retried on the next sample, and the cap meanwhile counts from this runner's queuedSince
+          const written = await updateAttempt(root, enriched.id, gen, { firstQueuedAt: at });
+          if (written.ok) firstQueuedAt = at;
         },
         // Refusing says "no runner could take it", which is only true when moving was allowed: a pause (cooldown, or a max-moves of 0)
         // is not a lack of capacity. A ticket that has used up its moves has had its chance.
