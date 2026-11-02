@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { laneRun, waitFor, sleep, writeGlobalConfig, gitFixture } from './helpers.js';
+import { laneRun, waitFor, sleep, writeGlobalConfig, writeRepoConfig, gitFixture } from './helpers.js';
 import { tmpDir, setup, resultOf, holdLaneLocally, IDLE, rebalanceSetup, execArrived, T } from './remote-harness.js';
 import { rebalanceBlocked, hasMeasuredHeadroom } from '../src/remote-client.js';
 import { readAttempt, patchAttemptLocked } from '../src/attempts.js';
@@ -10,7 +10,8 @@ import { dispatchRemote } from '../src/remote-client.js';
 import { makeGitWorktree } from './remote-harness.js';
 import crypto from 'node:crypto';
 import { listQueue } from '../src/scheduler.js';
-import { withLock } from '../src/state.js';
+import { withLock, paths } from '../src/state.js';
+import { REMOTE_WITHDRAW_CAPABILITY } from '../src/capabilities.js';
 import { loadGlobalConfig, ConfigError } from '../src/config.js';
 
 /**
@@ -382,4 +383,119 @@ test('rebalance never picks a runner the ticket was already dispatched to: A tim
   assert.equal(waited.code, 0, waited.stderr);
   assert.deepEqual(ctx.runs().filter((r) => r === 'a' || r === 'b'), [], 'never ran on a runner');
   assert.equal(ctx.runs().length, 1, 'the command ran exactly once, locally');
+});
+
+// ---- BRAIN-770: a ticket with no local fallback is refused (76) after remoteRefusedMaxQueuedMs with nowhere to move ----
+
+/** rebalanceSetup whose lane is `localRefused` (no local fallback, so no queue timeout) with the refusal cap set. */
+function refusedSetup({ cap = 1000, localRefused = true, rebalance = {}, ...rest } = {}) {
+  const ctx = rebalanceSetup({ rebalance: { remoteRebalanceMinQueuedMs: 300, remoteRefusedMaxQueuedMs: cap, ...rebalance }, ...rest });
+  writeRepoConfig(ctx.repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, ...(localRefused ? { localRefused: true } : {}) } } });
+  return ctx;
+}
+
+test('BRAIN-770 config: remoteRefusedMaxQueuedMs defaults to 30 min, accepts 0 (off) and rejects bad values', () => {
+  const load = (extra) => {
+    const { home } = setup();
+    writeGlobalConfig(home, { version: 1, capacity: 2, loadClose: 15, loadOpen: 11, loadOpenSamples: 3, sampleMs: 5000, ...extra });
+    const prev = process.env.LANE_BROKER_HOME;
+    process.env.LANE_BROKER_HOME = home;
+    try {
+      return loadGlobalConfig();
+    } finally {
+      process.env.LANE_BROKER_HOME = prev;
+    }
+  };
+  assert.equal(load({}).remoteRefusedMaxQueuedMs, 1_800_000);
+  assert.equal(load({ remoteRefusedMaxQueuedMs: 0 }).remoteRefusedMaxQueuedMs, 0);
+  for (const bad of [-1, 1.5, '5']) assert.throws(() => load({ remoteRefusedMaxQueuedMs: bad }), ConfigError, `remoteRefusedMaxQueuedMs=${bad}`);
+});
+
+test('BRAIN-770: a localRefused ticket queued past the cap with no runner to move to is withdrawn and exits 76, never run', T, async () => {
+  const ctx = refusedSetup({ names: ['a'] });
+  const id = await ctx.start();
+  const waited = await ctx.finish(id, '30s');
+  assert.equal(waited.code, 76, `${waited.stderr}\n${ctx.fake.calls().join(',')}`);
+  const result = resultOf(ctx.state, id);
+  assert.match(result.error, /runs only on a remote runner and none can take it now \(waited \d+ min on a, withdrawn/);
+  assert.ok(ctx.fake.count('withdraw a') >= 1, 'the withdraw is the proof the runner never started it');
+  assert.deepEqual(ctx.runs(), [], 'nothing ran anywhere');
+  assert.equal(readAttempt(ctx.state, id), null, 'no attempt is left behind');
+  assert.match(fs.readFileSync(paths(ctx.state).admissionLog, 'utf8'), /remote-refused: .*withdrawn from a/);
+});
+
+test('BRAIN-770: the ticket waits the whole cap first (it is not refused before remoteRefusedMaxQueuedMs)', T, async () => {
+  const ctx = refusedSetup({ names: ['a'], cap: 600_000 });
+  const id = await ctx.start();
+  await execArrived(ctx, 'a');
+  await sleep(2500);
+  assert.equal(ctx.fake.count('withdraw a'), 0);
+  ctx.unpause('a');
+  assert.equal((await ctx.finish(id)).code, 0);
+  assert.deepEqual(ctx.runs(), ['a']);
+});
+
+test('BRAIN-770: with a runner that has room the existing move runs, not the refusal', T, async () => {
+  const ctx = refusedSetup();
+  const id = await ctx.start();
+  const waited = await ctx.finish(id, '30s');
+  assert.equal(waited.code, 0, `${waited.stderr}\n${ctx.fake.calls().join(',')}`);
+  assert.deepEqual(ctx.runs(), ['b']);
+  assert.equal(resultOf(ctx.state, id).rebalancedFrom, 'a');
+});
+
+test('BRAIN-770: a lost withdraw reply is MOVE-INTERRUPTED (74), never the 76 refusal -- the ticket may still be on the runner', T, async () => {
+  const ctx = refusedSetup({ names: ['a'], runnerOpts: { a: { withdrawReplyLost: true, resultDownAfterWithdraw: true } } });
+  const id = await ctx.start();
+  const waited = await ctx.finish(id, '60s');
+  assert.equal(waited.code, 74, waited.stderr);
+  assert.match(waited.stderr, /MOVE-INTERRUPTED/);
+  assert.ok(readAttempt(ctx.state, id), 'the attempt is kept');
+  assert.equal(readAttempt(ctx.state, id).moving?.from, 'a');
+  assert.deepEqual(ctx.runs(), []);
+});
+
+test('BRAIN-770: a runner without remote-withdraw/1 keeps the ticket waiting (no 76), and the log says the cap does not apply', T, async () => {
+  const ctx = refusedSetup({ names: ['a'] });
+  ctx.fake.setProbe('a', { ...IDLE, capabilities: IDLE.capabilities.filter((c) => c !== REMOTE_WITHDRAW_CAPABILITY) });
+  const id = await ctx.start();
+  await execArrived(ctx, 'a');
+  await sleep(2500);
+  assert.equal(ctx.fake.count('withdraw a'), 0);
+  assert.match(fs.readFileSync(paths(ctx.state).admissionLog, 'utf8'), /remote-refused: .*a cannot withdraw \(no remote-withdraw\/1\)/);
+  ctx.unpause('a');
+  assert.equal((await ctx.finish(id)).code, 0);
+  assert.deepEqual(ctx.runs(), ['a']);
+});
+
+test('BRAIN-770: remoteRebalanceMinQueuedMs 0 still watches nothing, cap or no cap', T, async () => {
+  const ctx = refusedSetup({ names: ['a'], rebalance: { remoteRebalanceMinQueuedMs: 0 } });
+  const id = await ctx.start();
+  await execArrived(ctx, 'a');
+  await sleep(2500);
+  assert.equal(ctx.fake.count('result a'), 0, 'no watcher poll');
+  assert.equal(ctx.fake.count('withdraw a'), 0);
+  ctx.unpause('a');
+  assert.equal((await ctx.finish(id)).code, 0);
+});
+
+test('BRAIN-770: remoteRefusedMaxQueuedMs 0 turns the cap off', T, async () => {
+  const ctx = refusedSetup({ names: ['a'], cap: 0 });
+  const id = await ctx.start();
+  await execArrived(ctx, 'a');
+  await sleep(2500);
+  assert.equal(ctx.fake.count('withdraw a'), 0);
+  ctx.unpause('a');
+  assert.equal((await ctx.finish(id)).code, 0);
+});
+
+test('BRAIN-770: a ticket that CAN fall back locally (not localRefused) is untouched by the cap', T, async () => {
+  const ctx = refusedSetup({ names: ['a'], localRefused: false });
+  const id = await ctx.start();
+  await execArrived(ctx, 'a');
+  await sleep(2500);
+  assert.equal(ctx.fake.count('withdraw a'), 0);
+  ctx.unpause('a');
+  assert.equal((await ctx.finish(id)).code, 0);
+  assert.deepEqual(ctx.runs(), ['a']);
 });

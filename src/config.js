@@ -161,6 +161,9 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // cooldown is the minimum gap between two moves of one ticket, and the cap is how many times one ticket may move.
   remoteRebalanceMinQueuedMs: 300_000,
   remoteRebalanceIntervalMs: 60_000,
+  // BRAIN-770: a ticket with no local fallback (a localRefused lane) that sat queued this long on a runner with nowhere to move to is
+  // withdrawn and exits 76 (needs `remote-withdraw/1`, and rebalance on). 0 disables the cap.
+  remoteRefusedMaxQueuedMs: 1_800_000,
   // BRAIN-642: zlib level (1-9) of the gzip stream a submitter sends a runner that lists `snapshot-gzip/1`.
   remoteSnapshotGzipLevel: 3,
   // BRAIN-642: the runner's content-addressed blob store (used only for a client that sends --transfer-cache). Soft size target,
@@ -444,7 +447,7 @@ function validateGlobalConfig(cfg, sourcePath) {
   assert(cfg.memoryLimit !== 'enforce', `${sourcePath}: "memoryLimit": "enforce" is not yet supported (hard memory caps are tracked in BRAIN-696); use "measure" or "off"`);
   assert(Number.isInteger(cfg.runnerDownAfterMs) && cfg.runnerDownAfterMs >= 0, `${sourcePath}: "runnerDownAfterMs" must be a non-negative integer`);
   assert(Number.isInteger(cfg.remoteProbeDeadlineMs) && cfg.remoteProbeDeadlineMs > 0 && cfg.remoteProbeDeadlineMs <= MAX_TIMER_MS, `${sourcePath}: "remoteProbeDeadlineMs" must be a positive integer no larger than ${MAX_TIMER_MS} (a larger Node timer overflows to 1 ms)`);
-  for (const field of ['remoteRebalanceMinQueuedMs', 'remoteRebalanceCooldownMs', 'remoteRebalanceMaxMoves']) {
+  for (const field of ['remoteRebalanceMinQueuedMs', 'remoteRebalanceCooldownMs', 'remoteRebalanceMaxMoves', 'remoteRefusedMaxQueuedMs']) {
     assert(Number.isInteger(cfg[field]) && cfg[field] >= 0, `${sourcePath}: "${field}" must be a non-negative integer`);
   }
   assert(Number.isInteger(cfg.remoteRebalanceIntervalMs) && cfg.remoteRebalanceIntervalMs > 0, `${sourcePath}: "remoteRebalanceIntervalMs" must be a positive integer`);

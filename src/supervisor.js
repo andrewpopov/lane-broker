@@ -51,7 +51,7 @@ import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, l
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness, recordEnforcement } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
-import { remoteCpuAllocation, selectRunner, dispatchRemote, remoteCancel, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, haveDeadlineFor, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON } from './remote-client.js';
+import { remoteCpuAllocation, selectRunner, dispatchRemote, remoteCancel, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, haveDeadlineFor, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON, REFUSED_MOVE_TARGET } from './remote-client.js';
 import { remoteExcludeWarnings } from './remote-exclude.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
@@ -1170,6 +1170,12 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       if (thisEpoch === epoch) write(chunk);
     };
     const canWithdraw = Array.isArray(probe?.capabilities) && probe.capabilities.includes(REMOTE_WITHDRAW_CAPABILITY);
+    const refusedMaxQueuedMs = rebalanceOn && localIneligibilityOf(enriched, globalCfg, cpuLimit) ? globalCfg.remoteRefusedMaxQueuedMs : 0;
+    if (refusedMaxQueuedMs > 0 && !canWithdraw) {
+      const line = `lane: remote-refused: ${enriched.id}: ${runner.name} cannot withdraw (no remote-withdraw/1), so the ${Math.round(refusedMaxQueuedMs / 60_000)} min cap does not apply; waiting until it starts\n`;
+      process.stderr.write(line);
+      writeBrokerLog(root, line);
+    }
     // BRAIN-642: re-read per dispatch like the artifacts gate, so a rebalance to a runner without it sends the legacy stream.
     const snapshotGzip = Array.isArray(probe?.capabilities) && probe.capabilities.includes(SNAPSHOT_GZIP_CAPABILITY);
     const blobCache = globalCfg.remoteBlobCache === true && Array.isArray(probe?.capabilities) && probe.capabilities.includes(BLOB_CACHE_CAPABILITY);
@@ -1228,6 +1234,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       rebalance: rebalanceOn && canWithdraw ? {
         minQueuedMs: globalCfg.remoteRebalanceMinQueuedMs,
         intervalMs: globalCfg.remoteRebalanceIntervalMs,
+        // BRAIN-770: a ticket with no local fallback is refused (76) after this long queued with no runner to move it to
+        refusedMaxQueuedMs,
         // BRAIN-520: a drain move is an operator fact, so it skips the cooldown and the max-moves damping (the no-revisit rule still
         // bounds it), and its destination must itself be able to withdraw.
         pickTarget: async ({ draining } = {}) => {
@@ -1248,8 +1256,9 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
           } catch {
             // ineligible now: it changed
           }
-          if (!unchanged) return false;
-          const written = await updateAttempt(root, enriched.id, gen, { moving: { from: from.name, to: to.runner.name, phase: 'withdrawing', at: Date.now() } });
+          // a refusal withdraw re-dispatches nothing, so a changed tree does not hold it back
+          if (!unchanged && to !== REFUSED_MOVE_TARGET) return false;
+          const written = await updateAttempt(root, enriched.id, gen, { moving: { from: from.name, to: to.runner?.name, phase: 'withdrawing', at: Date.now() } });
           movingSet = written.ok;
           return written.ok;
         },
@@ -1293,6 +1302,13 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       process.stderr.write(`lane: running on ${runner.name} (${enforcementLabel(probe?.enforcement)})\n`);
       await recordEnforcement(root, { [runner.name]: probe?.enforcement ?? null }, Date.now()).catch(() => {});
       continue;
+    }
+    if (dispatch.outcome === 'moved' && dispatch.to === REFUSED_MOVE_TARGET) {
+      // BRAIN-770: the runner's own proof says it never started the ticket and there is nowhere to move it: refuse it, retryably.
+      if (movingSet) await clearMoving();
+      const line = `lane: remote-refused: ${enriched.id}: no runner could take it within ${Math.round(globalCfg.remoteRefusedMaxQueuedMs / 60_000)} min; withdrawn from ${runner.name}\n`;
+      writeBrokerLog(root, line);
+      return fallbackOrRefuse(runner, `waited ${Math.max(1, Math.round(dispatch.queuedMs / 60_000))} min on ${runner.name}, withdrawn with no other runner able to take it`, { neverStarted: true, noRunner: true });
     }
     if (dispatch.outcome !== 'moved') break;
 

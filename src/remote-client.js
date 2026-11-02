@@ -803,6 +803,10 @@ export function provesStopped(record, expected) {
 const DEFAULT_REBALANCE_INTERVAL_MS = 30_000;
 export const DRAIN_MOVE_REASON = 'runner-draining';
 export const QUEUED_TOO_LONG_REASON = 'queued-too-long';
+export const REFUSED_CAP_REASON = 'refused-queue-cap';
+/** BRAIN-770: the "destination" of a withdraw that has none: a ticket with no local fallback that sat queued past `refusedMaxQueuedMs`
+ *  with no runner able to take it. It rides the same proof paths as a real target and ends in a retryable refusal, not a dispatch. */
+export const REFUSED_MOVE_TARGET = Object.freeze({ refused: true });
 
 /** BRAIN-520: the `reason` (and, for a drain move, `drainReason`) a move carries, from what the watcher recorded when it chose the target. */
 function moveReasonOf(state) {
@@ -874,10 +878,11 @@ function makePhaseReporter({ onPhase, now, canWrite }) {
  * never more than one move in flight, and every await is followed by a re-check that this dispatch is still current (same
  * runner, same epoch), the ssh session is still open and nobody cancelled. Resolves `{from, to, queuedMs}` only on positive
  * proof the runner never started the ticket (a `withdrawn` reply, or a bound `unfinished/withdrawn` record fetched from A);
- * anything else keeps waiting on A. Stops for good once the ticket is `admitted` or terminal. Resolves null when it did not move.
+ * anything else keeps waiting on A. BRAIN-770: with `refusedMaxQueuedMs` set and no target once the ticket has sat that long, the same
+ * withdraw runs towards `REFUSED_MOVE_TARGET` (no destination) under the same proof. Stops for good once the ticket is `admitted` or terminal. Resolves null when it did not move.
  */
 async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed, signal, abortSignal, now, sleep, fetchDeadlineMs, withdrawDeadlineMs, sshBin, env, onSample }) {
-  const { minQueuedMs, intervalMs = DEFAULT_REBALANCE_INTERVAL_MS, pickTarget, beforeWithdraw, afterWithdraw } = rebalance;
+  const { minQueuedMs, intervalMs = DEFAULT_REBALANCE_INTERVAL_MS, pickTarget, beforeWithdraw, afterWithdraw, refusedMaxQueuedMs = 0 } = rebalance;
   const fence = { runner, epoch: state.epoch };
   const current = () => state.runner === fence.runner && state.epoch === fence.epoch;
   const watching = () => current() && !isClosed() && !signal.aborted && !abortSignal?.aborted;
@@ -913,13 +918,15 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
     let to;
     try {
       to = await pickTarget(draining ? { draining } : undefined);
-      if (!to || !watching()) continue;
+      const refusing = !to && refusedMaxQueuedMs > 0 && now() - queuedSince >= refusedMaxQueuedMs;
+      if (!(to || refusing) || !watching()) continue;
+      to ||= REFUSED_MOVE_TARGET;
       if (beforeWithdraw && (await beforeWithdraw({ from: runner, to, queuedMs: now() - queuedSince })) === false) continue;
     } catch {
       continue;
     }
     if (!watching()) return null;
-    state.attemptedReason = draining ? { reason: DRAIN_MOVE_REASON, drainReason: draining.reason } : { reason: QUEUED_TOO_LONG_REASON };
+    state.attemptedReason = to === REFUSED_MOVE_TARGET ? { reason: REFUSED_CAP_REASON } : draining ? { reason: DRAIN_MOVE_REASON, drainReason: draining.reason } : { reason: QUEUED_TOO_LONG_REASON };
     state.attemptedTarget = to; // kept on the dispatch's own state: a lost reply plus a closed session is resolved from the record by the caller
     const { action } = await remoteWithdraw(runner, expected.ticketId, { sshBin, deadlineMs: withdrawDeadlineMs, env });
     // The runner decided; a cancel or an ssh close that raced it is the caller's to resolve, not ours to undo.

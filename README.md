@@ -1113,6 +1113,7 @@ Global config (the submitter's), all integers in milliseconds except the cap:
 | `remoteRebalanceIntervalMs` | `60000` | how often the submitter looks at the runner while it waits (> 0) |
 | `remoteRebalanceCooldownMs` | `600000` | the minimum gap between two queued-too-long moves of one ticket (a drain move ignores it) |
 | `remoteRebalanceMaxMoves` | `1` | how many times one ticket may move for queueing too long (drain moves are not counted) |
+| `remoteRefusedMaxQueuedMs` | `1800000` | a ticket with no local fallback (BRAIN-770, below) that sat queued this long with no runner to move to is withdrawn and exits `76`; `0` disables |
 
 **How a move goes.** The submitter picks the destination with the same probe dispatch uses, excluding the current runner and
 every runner the ticket already left, and requires an empty queue and a *measured* free-CPU figure for the ticket (an unknown
@@ -1521,8 +1522,14 @@ If the runner's broker has not started it by then, the runner expires it
 it locally instead. A user cancel still wins: exit `130`, no local run.
 
 A ticket this machine can never run locally (a `localRefused` lane without `--allow-local-sim`, or a claim over the
-local budget) carries no queue timeout: there is nothing to fall back to, so it waits in the runner's queue until it
-starts instead of expiring into a refusal.
+local budget) carries no queue timeout: there is nothing to fall back to, so it never expires into a local run (BRAIN-509
+still holds: no local fallback, ever). It is instead capped by `remoteRefusedMaxQueuedMs` (BRAIN-770, default 30 min, `0`
+disables): the rebalance watcher moves it as usual when a runner has room, and once it has sat queued that long with no
+runner to move it to, it is withdrawn from the runner and exits `76` (retryable, `waited N min on <runner>`). The refusal
+needs the same proof as a move: only a `withdrawn` answer, or the runner's bound `unfinished/withdrawn` record, ends the ticket;
+a lost reply stays `MOVE-INTERRUPTED` and keeps waiting, so it can never run twice. It lives inside the rebalance gate, so
+`remoteRebalanceMinQueuedMs: 0` (no watcher) or a runner without `remote-withdraw/1` leaves the ticket waiting until it starts
+(the latter is logged as `remote-refused`).
 
 ### When the ssh session drops mid-job
 
