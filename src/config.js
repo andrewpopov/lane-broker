@@ -121,6 +121,8 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // BRAIN-405: how often a remote-eligible ticket that fell back to this machine's queue (no runner had room) re-probes the
   // runners and moves to one that now has real headroom. 0 disables rebinding.
   remoteRebindIntervalMs: 30_000,
+  // BRAIN-769: how long a local run that fell back from a remote attempt waits for another run's hold on the same tree before failing as infrastructure (exit 77).
+  localTreeLockWaitMs: 6 * 60 * 60 * 1000,
   // BRAIN-442: a `remotePolicy: "local-first"` lane queues locally and becomes rebind-eligible only after waiting this long
   // there (a lane may override it with its own `localFirstWaitMs`). Rebinding still needs `remoteRebindIntervalMs` > 0.
   localFirstWaitMs: 90_000,
@@ -405,6 +407,10 @@ function validateGlobalConfig(cfg, sourcePath) {
   assert(
     Number.isInteger(cfg.maxRemoteQueue) && cfg.maxRemoteQueue >= 0,
     `${sourcePath}: "maxRemoteQueue" must be a non-negative integer`,
+  );
+  assert(
+    Number.isInteger(cfg.localTreeLockWaitMs) && cfg.localTreeLockWaitMs > 0,
+    `${sourcePath}: "localTreeLockWaitMs" must be a positive integer`,
   );
   assert(
     Number.isInteger(cfg.remoteRebindIntervalMs) && cfg.remoteRebindIntervalMs >= 0,

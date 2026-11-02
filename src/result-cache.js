@@ -82,7 +82,7 @@ export function computeContentKey({ cwd, key, cmdFingerprint, configIdentity = n
  * Exits that describe the broker, the runner or the caller rather than the command's own verdict (usage, refusal, retryable,
  * timeout, cancel), plus 126/127: the command could not be executed or found (a remote spawn error is reported as 127), which is the machine, not the code.
  */
-const NON_VERDICT_EXITS = new Set([64, 69, 75, 76, 79, 124, 126, 127, 130]);
+const NON_VERDICT_EXITS = new Set([64, 69, 75, 76, 77, 79, 124, 126, 127, 130]);
 
 const isNewestRowCandidate = (row, contentKey, now) =>
   Boolean(row) && row.contentKey === contentKey && !row.cachedFrom && !row.refusedFrom && Number.isFinite(row.startedAt) && Number.isFinite(row.endedAt) && row.endedAt <= now;

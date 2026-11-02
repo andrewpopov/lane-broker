@@ -289,7 +289,7 @@ test('decideReuse resolver table: the newest real outcome decides', () => {
 test('isQualifyingRed: only the command\'s own non-zero verdict qualifies', () => {
   assert.equal(isQualifyingRed(row()), true);
   assert.equal(isQualifyingRed(row({ exit: 2 })), true);
-  for (const exit of [0, 124, 126, 127, 130, 69, 75, 76, 64, 79, 128, 137, 255, null, 'x']) assert.equal(isQualifyingRed(row({ exit })), false, `exit ${exit}`);
+  for (const exit of [0, 124, 126, 127, 130, 69, 75, 76, 77, 64, 79, 128, 137, 255, null, 'x']) assert.equal(isQualifyingRed(row({ exit })), false, `exit ${exit}`);
   assert.equal(isQualifyingRed(row({ signal: 'SIGTERM' })), false);
   assert.equal(isQualifyingRed(row({ cancelled: true })), false);
   assert.equal(isQualifyingRed(row({ error: 'boom' })), false);

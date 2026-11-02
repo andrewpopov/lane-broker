@@ -1,7 +1,9 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
-import { pathToFileURL } from 'node:url';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+import path from 'node:path';
 import {
   paths,
   ensureStateDirs,
@@ -36,6 +38,8 @@ import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from '.
 import { reloadGlobalConfig, isDispatchOnly } from './config.js';
 import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope, scopeMemoryPeakReader, scopeMemoryPeakTracker, enforcementLabel } from './cpu-limit.js';
 import { stateHome, RUNNER_SHUTDOWN_REASON, LOST_REASONS } from './state.js';
+import { childExitSafeFlags } from './node-exit-safe.js';
+import { LOCAL_SETUP_FAILED_EXIT_CODE } from './remote-pipeline.js';
 import { readHistoryRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
 import { missingLocalDeps, speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, externalCpuSlots, DEFAULT_REMOTE_OVERHEAD_MS } from './speed-placement.js';
@@ -355,6 +359,66 @@ export function resolveNicedSpawn(ticket, currentNice = 0, target = ticket.nice)
   // the wrapper stays whenever the target is above 0, even at increment 0: it is what reports a missing command as 127
   if (Number.isInteger(target) && target > 0) return ['/usr/bin/nice', ['-n', String(Math.max(0, nice - currentNice)), ...ticket.cmd]];
   return [ticket.cmd[0], ticket.cmd.slice(1)];
+}
+
+const laneBinPath = fileURLToPath(new URL('../bin/lane.js', import.meta.url));
+
+/** BRAIN-769: a ticket that fell back from a remote attempt still owes the tree its declared `remoteDeps` and `remoteSetup`. */
+const declaresTreePreparation = (remote) => remote?.remoteDeps?.length > 0 || remote?.remoteSetup?.length > 0;
+
+/**
+ * BRAIN-769: the `lane remote-pipeline` ticket dir for a local run that fell back from a remote attempt. The pipeline child prepares the
+ * tree (deps reconciled against the lockfile, setup always) and then runs `ticket.cmd` in the lane's own subdirectory. The supervisor
+ * holds the per-tree lock (`treeLockPath`) from before the spawn until the group is reaped, so no run can reinstall under a survivor.
+ */
+function writeLocalPreparation(root, ticket, lockWaitMs) {
+  const { worktreeRoot, relCwd, remoteDeps, remoteSetup } = ticket.remote;
+  const ticketDir = path.join(root, 'local-prep', ticket.id);
+  const treeLockPath = path.join(root, 'tree-locks', crypto.createHash('sha256').update(worktreeRoot).digest('hex').slice(0, 24));
+  fs.mkdirSync(ticketDir, { recursive: true });
+  atomicWriteJson(path.join(ticketDir, 'pipeline.json'), {
+    workDir: worktreeRoot,
+    relCwd: relCwd || '',
+    remoteDeps: remoteDeps || [],
+    remoteSetup: remoteSetup || [],
+    argv: ticket.cmd,
+    npmCacheDir: path.join(root, 'npm-cache'),
+    npmUserConfig: path.join(root, 'npmrc'),
+    depsCache: { enabled: false },
+    localTree: true,
+    pipelineLockPath: `${treeLockPath}.pipeline`,
+    pipelineLockWaitMs: lockWaitMs,
+  });
+  return { ticketDir, treeLockPath, cmd: [process.execPath, ...childExitSafeFlags(), laneBinPath, 'remote-pipeline', ticketDir] };
+}
+
+/** Resolves with `{ release }` once the per-tree lock is held (release resolves when it is dropped), or null when `shouldStop()` turned true first. */
+function acquireTreeLock(lockPath, shouldStop, pollMs, waitMs) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const poll = setInterval(() => {
+      if (settled || !shouldStop()) return;
+      settled = true;
+      clearInterval(poll);
+      resolve(null);
+    }, pollMs);
+    const done = withLock(
+      path.dirname(lockPath),
+      () =>
+        new Promise((drop) => {
+          if (settled) return drop();
+          settled = true;
+          clearInterval(poll);
+          resolve({ release: () => (drop(), done) });
+        }),
+      { lockPath, group: 'tree', timeoutMs: waitMs },
+    );
+    done.catch((err) => {
+      clearInterval(poll);
+      if (!settled) reject(err);
+      settled = true;
+    });
+  });
 }
 
 /**
@@ -813,6 +877,11 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     const skipLine = `lane: remote-skip: ${runner ? runner.name : 'none'}: ${reason} — ${where}\n`;
     process.stderr.write(skipLine);
     writeBrokerLog(root, skipLine);
+    if (!refusedHere && !otherwiseIneligible && declaresTreePreparation(enriched.remote)) {
+      const prepLine = `lane: ${enriched.id}: preparing tree before local run\n`;
+      process.stderr.write(prepLine);
+      writeBrokerLog(root, prepLine);
+    }
 
     // BRAIN-320: a `localRefused` lane (rouge's `sim`) that was remote-
     // eligible reaches here only once the remote attempt itself has fallen
@@ -1855,9 +1924,28 @@ async function main() {
 
   enterPhase('running');
   const startedAt = Date.now();
-  const [cmd, args] = resolveNicedSpawn({ ...ticket, nice: started.lease.nice ?? ticket.nice }, os.getPriority(), resolveLaneNice(ticket, priorityOf(started.lease), globalCfg));
   // the host may have turned dispatch-only since admission (config flip or marker): re-read it at the last moment, release the lease unused
   if (isDispatchOnly(reloadGlobalConfig(globalCfg))) await refuseDispatchOnlyAndExit({ lease: true });
+  const localPreparation = fallbackReason !== undefined && declaresTreePreparation(ticket.remote) ? writeLocalPreparation(root, ticket, globalCfg.localTreeLockWaitMs) : null;
+  let treeLock = null;
+  let releasedLocalPreparation = false;
+  async function releaseLocalPreparation() {
+    if (!localPreparation || releasedLocalPreparation) return;
+    releasedLocalPreparation = true;
+    fs.rmSync(localPreparation.ticketDir, { recursive: true, force: true });
+    await treeLock?.release();
+  }
+  if (localPreparation) {
+    try {
+      // a cancel that lands while waiting for the tree lock spawns nothing: the no-op below is reaped as a cancel before it matters
+      treeLock = await acquireTreeLock(localPreparation.treeLockPath, () => cancelledBeforeStart || cancelRequested(root, ticket.id), globalCfg.sampleMs, globalCfg.localTreeLockWaitMs);
+    } catch {
+      await releaseLocalPreparation();
+      await refuseLocalAndExit({ exitCode: LOCAL_SETUP_FAILED_EXIT_CODE, message: `lane: local-setup failed (tree-lock) — infrastructure, not the command\n` }, { lease: true });
+    }
+  }
+  const spawnTicket = localPreparation ? { ...ticket, cmd: treeLock ? localPreparation.cmd : [process.execPath, '-e', ''] } : ticket;
+  const [cmd, args] = resolveNicedSpawn({ ...spawnTicket, nice: started.lease.nice ?? ticket.nice }, os.getPriority(), resolveLaneNice(ticket, priorityOf(started.lease), globalCfg));
   // BRAIN-651 L2: the admitted grant (elastic included) caps the whole tree; a remote protocol-2 pipeline is this same child, so deps, setup and command share it
   let executionCpuCores;
   let scopedChild;
@@ -1878,6 +1966,7 @@ async function main() {
       },
     });
   } catch (err) {
+    await releaseLocalPreparation();
     if (!(err instanceof CpuLimitUnavailableError)) throw err;
     await refuseLocalAndExit({ exitCode: LOCAL_REFUSED_EXIT_CODE, message: `lane run: ${err.message}\n` }, { lease: true });
   }
@@ -2052,6 +2141,7 @@ async function main() {
     // but a TERM-resistant descendant is still alive, we must not write the
     // result / release the lease until the whole group is confirmed gone.
     if (killPromise) await killPromise;
+    await releaseLocalPreparation();
     // BRAIN-349: a cancelled run is 'cancelled' (exit 130) whatever the child
     // itself exited with -- a child that traps TERM and exits 0 must not read
     // as success. Same shape as the remote-cancel result (remoteCancelledResult).
