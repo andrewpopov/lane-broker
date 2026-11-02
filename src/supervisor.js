@@ -744,7 +744,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   let withdrawn = null;
   if (!rebind) {
     // BRAIN-321: a retried `--id` submission is the same ticket: dedup BEFORE any probe or dispatch, under the attempt's lock.
-    const created = await createAttempt(root, enriched.id, { runner: null, resources: enriched.resources, logPath: enriched.logPath, cwd: enriched.cwd, ...(enriched.clientId ? { refuseIf: () => existingTicket(root, enriched.id) } : {}) });
+    const created = await createAttempt(root, enriched.id, { runner: null, resources: enriched.resources, logPath: enriched.logPath, cwd: enriched.cwd, key: enriched.key, ...(enriched.clientId ? { refuseIf: () => existingTicket(root, enriched.id) } : {}) });
     if (created.existing) process.exit(0);
   }
 
