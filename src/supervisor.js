@@ -1094,6 +1094,9 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   let epoch = Number.isInteger(priorAttempt?.dispatchEpoch) ? priorAttempt.dispatchEpoch : 1;
   let priorRemoteQueuedMs = 0;
   let lastMoveAt = moves.length > 0 ? moves.at(-1).at : null;
+  // BRAIN-770: when the ticket was first seen queued on a runner (client clock), kept on the attempt so a move or a rebind does not restart the refusal cap
+  let firstQueuedAt = Number.isFinite(priorAttempt?.firstQueuedAt) ? priorAttempt.firstQueuedAt : null;
+  let refusalHeldLogged = false;
   let movingSet = false;
   const clearMoving = async () => {
     movingSet = false;
@@ -1236,6 +1239,26 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
         intervalMs: globalCfg.remoteRebalanceIntervalMs,
         // BRAIN-770: a ticket with no local fallback is refused (76) after this long queued with no runner to move it to
         refusedMaxQueuedMs,
+        refusedSince: () => firstQueuedAt,
+        markQueued: async (at) => {
+          if (firstQueuedAt !== null) return;
+          firstQueuedAt = at;
+          await updateAttempt(root, enriched.id, gen, { firstQueuedAt });
+        },
+        // Refusing says "no runner could take it", which is only true when moving was allowed: a pause (cooldown, or a max-moves of 0)
+        // is not a lack of capacity. A ticket that has used up its moves has had its chance.
+        refusalAllowed: ({ draining } = {}) => {
+          const countedMoves = moves.filter((m) => m.reason !== DRAIN_MOVE_REASON).length;
+          const blocked = draining ? null : rebalanceBlocked({ moves: countedMoves, maxMoves: globalCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: globalCfg.remoteRebalanceCooldownMs });
+          if (blocked === null || (blocked === 'max-moves' && countedMoves > 0)) return true;
+          if (!refusalHeldLogged) {
+            refusalHeldLogged = true;
+            const line = `lane: remote-refused: ${enriched.id}: cap elapsed on ${runner.name} but moving is paused (${blocked === 'max-moves' ? 'remoteRebalanceMaxMoves is 0' : 'remoteRebalanceCooldownMs'}), which is not a lack of capacity; waiting\n`;
+            process.stderr.write(line);
+            writeBrokerLog(root, line);
+          }
+          return false;
+        },
         // BRAIN-520: a drain move is an operator fact, so it skips the cooldown and the max-moves damping (the no-revisit rule still
         // bounds it), and its destination must itself be able to withdraw.
         pickTarget: async ({ draining } = {}) => {
@@ -1258,7 +1281,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
           }
           // a refusal withdraw re-dispatches nothing, so a changed tree does not hold it back
           if (!unchanged && to !== REFUSED_MOVE_TARGET) return false;
-          const written = await updateAttempt(root, enriched.id, gen, { moving: { from: from.name, to: to.runner?.name, phase: 'withdrawing', at: Date.now() } });
+          const written = await updateAttempt(root, enriched.id, gen, { moving: { from: from.name, ...(to === REFUSED_MOVE_TARGET ? { kind: 'refuse', lane: enriched.lane } : { to: to.runner.name }), phase: 'withdrawing', at: Date.now() } });
           movingSet = written.ok;
           return written.ok;
         },
@@ -1308,7 +1331,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       if (movingSet) await clearMoving();
       const line = `lane: remote-refused: ${enriched.id}: no runner could take it within ${Math.round(globalCfg.remoteRefusedMaxQueuedMs / 60_000)} min; withdrawn from ${runner.name}\n`;
       writeBrokerLog(root, line);
-      return fallbackOrRefuse(runner, `waited ${Math.max(1, Math.round(dispatch.queuedMs / 60_000))} min on ${runner.name}, withdrawn with no other runner able to take it`, { neverStarted: true, noRunner: true });
+      return fallbackOrRefuse(runner, `waited ${Math.max(1, Math.round((Date.now() - (firstQueuedAt ?? Date.now() - dispatch.queuedMs)) / 60_000))} min queued, last on ${runner.name}, withdrawn with no other runner able to take it`, { neverStarted: true, noRunner: true });
     }
     if (dispatch.outcome !== 'moved') break;
 

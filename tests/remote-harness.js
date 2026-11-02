@@ -575,6 +575,8 @@ if (sub === 'probe') {
   if (sub === 'exec' && r.execFails) done(255);
   if (sub === 'cancel' && r.cancelFails) done(1);
   if (sub === 'result' && r.resultDownAfterWithdraw && fs.existsSync(flag)) done(1);
+  // admission race: the runner starts the ticket after the client last saw it queued and before this withdraw reaches it
+  if (sub === 'withdraw' && r.admitBeforeWithdraw) { fs.rmSync(r.pause, { force: true }); const until = Date.now() + 2500; while (Date.now() < until) require('child_process').spawnSync('sleep', ['0.1']); }
   if (sub === 'withdraw' && r.withdrawReplyLost) fs.writeFileSync(flag, '1');
   if (sub === 'result' && r.resultPatch) {
     // a test-only rewrite of the runner's real record (a null value deletes the key), e.g. a record with no \`reason\` or a wrong binding

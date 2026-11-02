@@ -4,8 +4,8 @@ import { isDeepStrictEqual } from 'node:util';
 import { paths, atomicWriteJson, appendHistory, LockTimeoutError, RUNNER_SHUTDOWN_REASON } from './state.js';
 import { readUnreachable, recordContact } from './runner-unreachable.js';
 import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult, isStrandedWithdrawingMove } from './attempts.js';
-import { terminalRowDefaults } from './resources.js';
-import { fetchRemoteResult, classifyRemoteResult, provesNeverStarted, provesStopped, remoteCancel, remoteWithdraw } from './remote-client.js';
+import { terminalRowDefaults, noRunnerRefusal } from './resources.js';
+import { fetchRemoteResult, classifyRemoteResult, provesNeverStarted, provesStopped, remoteCancel, remoteWithdraw, REFUSED_CAP_REASON } from './remote-client.js';
 import { relayedUsage, relayedDeps } from './remote-relay.js';
 import { writeBrokerLog } from './admission.js';
 
@@ -179,6 +179,11 @@ async function settleStrandedWithdraw(root, id, attempt, resultPath, { globalCfg
   if (classified.outcome === 'confirmed' && fetched.kind === 'completed') return adoptOrAmbiguous(attempt, id, fetched, (kind, build) => publishMove(kind, build));
   if (!provesNeverStarted(fetched, expected)) return held('ambiguous', `source ${from} record (${fetched.kind}) does not prove the job never started`);
 
+  if (attempt.moving.kind === 'refuse') {
+    // BRAIN-770: a refusal withdraw has no destination; the source's bound record proving it never started is the whole proof
+    const detail = fetched.reason ? `${fetched.kind}: ${fetched.reason}` : fetched.kind;
+    return publishMove('refused', () => refusedResult(id, attempt, `source ${from} reported ${detail}; withdrawn with no other runner able to take it`));
+  }
   const destination = runners.find((r) => r.name === to);
   if (!destination) return held('unreachable', 'destination runner not configured');
   const asDestination = async () => {
@@ -206,6 +211,20 @@ async function settleStrandedWithdraw(root, id, attempt, resultPath, { globalCfg
   const kind = fetched.reason ? `${fetched.kind}: ${fetched.reason}` : fetched.kind;
   return publishMove('lost', () => lostResult(id, attempt, 'runner-never-started', `source ${from} reported ${kind}; destination ${to} confirmed absent and tombstoned`));
 }
+
+/** BRAIN-770: the retryable refusal (exit 76) a supervisor died before publishing, rebuilt from the intent it persisted (`moving.lane`). */
+const refusedResult = (id, attempt, detail) => ({
+  id,
+  exit: noRunnerRefusal(attempt.moving.lane, detail).exitCode,
+  signal: null,
+  executor: 'remote',
+  runner: attempt.runner ?? null,
+  reason: REFUSED_CAP_REASON,
+  error: noRunnerRefusal(attempt.moving.lane, detail).message.trim(),
+  startedAt: attempt.startedAt,
+  endedAt: Date.now(),
+  reconciled: true,
+});
 
 const lostResult = (id, attempt, reason, lostDetail) => ({
   id,

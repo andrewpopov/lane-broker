@@ -417,7 +417,7 @@ test('BRAIN-770: a localRefused ticket queued past the cap with no runner to mov
   const waited = await ctx.finish(id, '30s');
   assert.equal(waited.code, 76, `${waited.stderr}\n${ctx.fake.calls().join(',')}`);
   const result = resultOf(ctx.state, id);
-  assert.match(result.error, /runs only on a remote runner and none can take it now \(waited \d+ min on a, withdrawn/);
+  assert.match(result.error, /runs only on a remote runner and none can take it now \(waited \d+ min queued, last on a, withdrawn/);
   assert.ok(ctx.fake.count('withdraw a') >= 1, 'the withdraw is the proof the runner never started it');
   assert.deepEqual(ctx.runs(), [], 'nothing ran anywhere');
   assert.equal(readAttempt(ctx.state, id), null, 'no attempt is left behind');
@@ -452,6 +452,8 @@ test('BRAIN-770: a lost withdraw reply is MOVE-INTERRUPTED (74), never the 76 re
   assert.match(waited.stderr, /MOVE-INTERRUPTED/);
   assert.ok(readAttempt(ctx.state, id), 'the attempt is kept');
   assert.equal(readAttempt(ctx.state, id).moving?.from, 'a');
+  assert.equal(readAttempt(ctx.state, id).moving?.kind, 'refuse', 'the refusal intent is durable, so a restart can settle it');
+  assert.equal(readAttempt(ctx.state, id).moving?.lane, 'default');
   assert.deepEqual(ctx.runs(), []);
 });
 
@@ -498,4 +500,44 @@ test('BRAIN-770: a ticket that CAN fall back locally (not localRefused) is untou
   ctx.unpause('a');
   assert.equal((await ctx.finish(id)).code, 0);
   assert.deepEqual(ctx.runs(), ['a']);
+});
+
+test('BRAIN-770: the runner admits the ticket between the queued observation and the withdraw -- it runs exactly once and is never refused', T, async () => {
+  const ctx = refusedSetup({ names: ['a'], runnerOpts: { a: { admitBeforeWithdraw: true } } });
+  const id = await ctx.start();
+  const waited = await ctx.finish(id, '60s');
+  assert.equal(waited.code, 0, `${waited.stderr}\n${ctx.fake.calls().join(',')}`);
+  assert.deepEqual(ctx.runs(), ['a'], 'one execution, counted by the command itself');
+  const result = resultOf(ctx.state, id);
+  assert.equal(result.exit, 0);
+  assert.equal(result.executor, 'remote');
+  assert.notEqual(result.reason, 'refused-queue-cap');
+  assert.ok(ctx.fake.count('withdraw a') >= 1, 'the race really reached the withdraw');
+});
+
+test('BRAIN-770: remoteRebalanceMaxMoves 0 with an idle runner is "moving paused", not "no capacity": the ticket is not refused', T, async () => {
+  const ctx = refusedSetup({ cap: 1000, rebalance: { remoteRebalanceMaxMoves: 0 } });
+  const id = await ctx.start();
+  await execArrived(ctx, 'a');
+  await sleep(3000);
+  assert.equal(ctx.fake.count('withdraw a'), 0);
+  assert.match(fs.readFileSync(paths(ctx.state).admissionLog, 'utf8'), /remote-refused: .*moving is paused \(remoteRebalanceMaxMoves is 0\)/);
+  ctx.unpause('a');
+  assert.equal((await ctx.finish(id)).code, 0);
+  assert.deepEqual(ctx.runs(), ['a']);
+});
+
+test('BRAIN-770: the cap is total wait since first queued, kept on the attempt and not restarted by a move', T, async () => {
+  const ctx = refusedSetup({ names: ['a', 'b'], paused: ['a', 'b'], cap: 3000, rebalance: { remoteRebalanceMinQueuedMs: 300 } });
+  const id = await ctx.start();
+  await waitFor(() => readAttempt(ctx.state, id)?.moves?.length === 1, { timeoutMs: 30_000 });
+  await waitFor(() => ctx.fake.count('result b') >= 3, { timeoutMs: 30_000 });
+  const moved = readAttempt(ctx.state, id);
+  assert.equal(moved.runner, 'b');
+  assert.ok(Number.isFinite(moved.firstQueuedAt), 'persisted on the attempt');
+  assert.ok(moved.firstQueuedAt < moved.moves[0].at, 'stamped on A, before the move, and not re-stamped on B');
+  const waited = await ctx.finish(id, '60s');
+  assert.equal(waited.code, 76, `${waited.stderr}\n${ctx.fake.calls().join(',')}`);
+  assert.ok(resultOf(ctx.state, id).endedAt - moved.firstQueuedAt >= 3000, 'refused only after the whole cap');
+  assert.deepEqual(ctx.runs(), []);
 });

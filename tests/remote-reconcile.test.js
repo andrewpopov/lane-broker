@@ -945,3 +945,38 @@ test('withdrawing move: destination withdraw answering no-such-ticket without to
   assertHeld(ctx, id, await reconcile(ctx, id, { sshBin: ssh.bin }), 'unreachable');
   assert.equal(fs.existsSync(tombstonePath(destRoot, id)), false);
 });
+
+// ---- BRAIN-770: a supervisor that died after a refusal withdraw settles from the persisted intent ----
+
+const refusingMove = () => ({ from: 'skybox', kind: 'refuse', lane: 'sim', phase: 'withdrawing', at: 1234 });
+
+test('refusal intent: a bound withdrawn record on the source settles the ticket as the retryable 76 refusal, nothing contacted but the source', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { record: WITHDRAWN, attempt: strandedAttempt({ moving: refusingMove() }) });
+  const outcome = await reconcile(ctx, id);
+  assert.deepEqual(outcome, { settled: true, state: 'refused', exit: 76 });
+  const result = resultOf(ctx.state, id);
+  assert.equal(result.reason, 'refused-queue-cap');
+  assert.match(result.error, /lane "sim" runs only on a remote runner and none can take it now \(source skybox reported unfinished: withdrawn/);
+  assert.equal(readAttempt(ctx.state, id), null);
+  assertNothingRan(ctx);
+});
+
+test('refusal intent: a source that started and completed the ticket is adopted, never refused', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { record: completed(), attempt: strandedAttempt({ moving: refusingMove() }) });
+  assert.deepEqual(await reconcile(ctx, id), { settled: true, state: 'adopted', exit: 3 });
+  assert.equal(resultOf(ctx.state, id).exit, 3);
+});
+
+test('refusal intent: no record on the source (the withdraw is unproven) stays held, not refused', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { attempt: strandedAttempt({ moving: refusingMove() }) });
+  assertHeld(ctx, id, await reconcile(ctx, id), 'ambiguous');
+});
+
+test('refusal intent: a withdrawn record with a different manifest is ambiguous, not refused', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { record: { ...WITHDRAWN, manifestHash: 'x'.repeat(64) }, attempt: strandedAttempt({ moving: refusingMove() }) });
+  assertHeld(ctx, id, await reconcile(ctx, id), 'ambiguous');
+});

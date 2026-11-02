@@ -882,7 +882,7 @@ function makePhaseReporter({ onPhase, now, canWrite }) {
  * withdraw runs towards `REFUSED_MOVE_TARGET` (no destination) under the same proof. Stops for good once the ticket is `admitted` or terminal. Resolves null when it did not move.
  */
 async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed, signal, abortSignal, now, sleep, fetchDeadlineMs, withdrawDeadlineMs, sshBin, env, onSample }) {
-  const { minQueuedMs, intervalMs = DEFAULT_REBALANCE_INTERVAL_MS, pickTarget, beforeWithdraw, afterWithdraw, refusedMaxQueuedMs = 0 } = rebalance;
+  const { minQueuedMs, intervalMs = DEFAULT_REBALANCE_INTERVAL_MS, pickTarget, beforeWithdraw, afterWithdraw, refusedMaxQueuedMs = 0, refusedSince, markQueued, refusalAllowed } = rebalance;
   const fence = { runner, epoch: state.epoch };
   const current = () => state.runner === fence.runner && state.epoch === fence.epoch;
   const watching = () => current() && !isClosed() && !signal.aborted && !abortSignal?.aborted;
@@ -910,6 +910,8 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
     if (phase !== 'queued') continue;
     queuedSince ??= now();
     state.queuedSince = queuedSince;
+    // BRAIN-770: the refusal cap counts the whole wait since the ticket was first queued remotely, across moves
+    if (refusedMaxQueuedMs > 0) await Promise.resolve(markQueued?.(queuedSince)).catch(() => {});
     // BRAIN-520: a draining runner is an operator fact, so its queued tickets skip the minimum-queued wait. `minQueuedMs: 0` is
     // still the off switch for every move.
     const draining = fetched.remoteDrain ? { reason: sanitizeDrainReason(fetched.remoteDrain.reason) || 'drained by operator' } : null;
@@ -918,7 +920,7 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
     let to;
     try {
       to = await pickTarget(draining ? { draining } : undefined);
-      const refusing = !to && refusedMaxQueuedMs > 0 && now() - queuedSince >= refusedMaxQueuedMs;
+      const refusing = !to && refusedMaxQueuedMs > 0 && now() - (refusedSince?.() ?? queuedSince) >= refusedMaxQueuedMs && (refusalAllowed?.({ draining }) ?? true);
       if (!(to || refusing) || !watching()) continue;
       to ||= REFUSED_MOVE_TARGET;
       if (beforeWithdraw && (await beforeWithdraw({ from: runner, to, queuedMs: now() - queuedSince })) === false) continue;
