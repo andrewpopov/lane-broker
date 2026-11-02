@@ -4,8 +4,8 @@ import { isDeepStrictEqual } from 'node:util';
 import { paths, atomicWriteJson, appendHistory, LockTimeoutError, RUNNER_SHUTDOWN_REASON } from './state.js';
 import { readUnreachable, recordContact } from './runner-unreachable.js';
 import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult, isStrandedWithdrawingMove } from './attempts.js';
-import { terminalRowDefaults } from './resources.js';
-import { fetchRemoteResult, classifyRemoteResult, provesNeverStarted, provesStopped, remoteCancel, remoteWithdraw } from './remote-client.js';
+import { terminalRowDefaults, noRunnerRefusal } from './resources.js';
+import { fetchRemoteResult, classifyRemoteResult, provesNeverStarted, provesStopped, remoteCancel, remoteWithdraw, REFUSED_CAP_REASON } from './remote-client.js';
 import { relayedUsage, relayedDeps } from './remote-relay.js';
 import { writeBrokerLog } from './admission.js';
 
@@ -166,6 +166,16 @@ async function settleStrandedWithdraw(root, id, attempt, resultPath, { globalCfg
   }
   await recordContact(root, from, true, now, { deadlineAt });
 
+  if (fetched.missing && fetched.state === 'queued' && attempt.moving.kind === 'refuse') {
+    // BRAIN-770: the intent is persisted before the withdraw is sent, so the supervisor may have died before it went out. Re-issue it:
+    // only the runner's `withdrawn` answer settles the refusal; any other answer keeps the ticket held and the next pass looks again
+    // (a ticket the runner started meanwhile is then found completed and adopted).
+    const withdrawBudget = callBudget();
+    if (withdrawBudget === null) return waitTimedOut();
+    const withdrawal = await remoteWithdraw(source, sourceId, { sshBin, deadlineMs: withdrawBudget, env });
+    if (withdrawal.action !== 'withdrawn') return held('running', `source ${from} still has the job (queued; withdraw answered ${withdrawal.action})`);
+    return publishSettled(root, id, attempt, resultPath, 'refused', () => refusedResult(id, attempt, `source ${from} confirmed the withdraw; withdrawn with no other runner able to take it`), {});
+  }
   if (fetched.missing) {
     return fetched.state === 'queued' || fetched.state === 'running'
       ? held('running', `source ${from} still has the job (${fetched.state})`)
@@ -179,6 +189,11 @@ async function settleStrandedWithdraw(root, id, attempt, resultPath, { globalCfg
   if (classified.outcome === 'confirmed' && fetched.kind === 'completed') return adoptOrAmbiguous(attempt, id, fetched, (kind, build) => publishMove(kind, build));
   if (!provesNeverStarted(fetched, expected)) return held('ambiguous', `source ${from} record (${fetched.kind}) does not prove the job never started`);
 
+  if (attempt.moving.kind === 'refuse') {
+    // BRAIN-770: a refusal withdraw has no destination; the source's bound record proving it never started is the whole proof
+    const detail = fetched.reason ? `${fetched.kind}: ${fetched.reason}` : fetched.kind;
+    return publishMove('refused', () => refusedResult(id, attempt, `source ${from} reported ${detail}; withdrawn with no other runner able to take it`));
+  }
   const destination = runners.find((r) => r.name === to);
   if (!destination) return held('unreachable', 'destination runner not configured');
   const asDestination = async () => {
@@ -206,6 +221,20 @@ async function settleStrandedWithdraw(root, id, attempt, resultPath, { globalCfg
   const kind = fetched.reason ? `${fetched.kind}: ${fetched.reason}` : fetched.kind;
   return publishMove('lost', () => lostResult(id, attempt, 'runner-never-started', `source ${from} reported ${kind}; destination ${to} confirmed absent and tombstoned`));
 }
+
+/** BRAIN-770: the retryable refusal (exit 76) a supervisor died before publishing, rebuilt from the intent it persisted (`moving.lane`). */
+const refusedResult = (id, attempt, detail) => ({
+  id,
+  exit: noRunnerRefusal(attempt.moving.lane, detail).exitCode,
+  signal: null,
+  executor: 'remote',
+  runner: attempt.runner ?? null,
+  reason: REFUSED_CAP_REASON,
+  error: noRunnerRefusal(attempt.moving.lane, detail).message.trim(),
+  startedAt: attempt.startedAt,
+  endedAt: Date.now(),
+  reconciled: true,
+});
 
 const lostResult = (id, attempt, reason, lostDetail) => ({
   id,

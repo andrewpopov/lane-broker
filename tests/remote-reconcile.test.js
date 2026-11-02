@@ -945,3 +945,96 @@ test('withdrawing move: destination withdraw answering no-such-ticket without to
   assertHeld(ctx, id, await reconcile(ctx, id, { sshBin: ssh.bin }), 'unreachable');
   assert.equal(fs.existsSync(tombstonePath(destRoot, id)), false);
 });
+
+// ---- BRAIN-770: a supervisor that died after a refusal withdraw settles from the persisted intent ----
+
+const refusingMove = () => ({ from: 'skybox', kind: 'refuse', lane: 'sim', phase: 'withdrawing', at: 1234 });
+
+test('refusal intent: a bound withdrawn record on the source settles the ticket as the retryable 76 refusal, nothing contacted but the source', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { record: WITHDRAWN, attempt: strandedAttempt({ moving: refusingMove() }) });
+  const outcome = await reconcile(ctx, id);
+  assert.deepEqual(outcome, { settled: true, state: 'refused', exit: 76 });
+  const result = resultOf(ctx.state, id);
+  assert.equal(result.reason, 'refused-queue-cap');
+  assert.match(result.error, /lane "sim" runs only on a remote runner and none can take it now \(source skybox reported unfinished: withdrawn/);
+  assert.equal(readAttempt(ctx.state, id), null);
+  assertNothingRan(ctx);
+});
+
+test('refusal intent: a source that started and completed the ticket is adopted, never refused', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { record: completed(), attempt: strandedAttempt({ moving: refusingMove() }) });
+  assert.deepEqual(await reconcile(ctx, id), { settled: true, state: 'adopted', exit: 3 });
+  assert.equal(resultOf(ctx.state, id).exit, 3);
+});
+
+test('refusal intent: no record on the source (the withdraw is unproven) stays held, not refused', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { attempt: strandedAttempt({ moving: refusingMove() }) });
+  assertHeld(ctx, id, await reconcile(ctx, id), 'ambiguous');
+});
+
+test('refusal intent: a withdrawn record with a different manifest is ambiguous, not refused', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { record: { ...WITHDRAWN, manifestHash: 'x'.repeat(64) }, attempt: strandedAttempt({ moving: refusingMove() }) });
+  assertHeld(ctx, id, await reconcile(ctx, id), 'ambiguous');
+});
+
+/** An ssh that answers the source's `remote-result` as queued for the first `queuedPasses` calls (then really), and its `remote-withdraw` with `withdrawReply`. */
+function queuedSourceSsh(ctx, { queuedPasses = 1, withdrawReply }) {
+  const real = path.join(ctx.env.PATH.split(path.delimiter)[0], 'ssh');
+  const dir = tmpDir('reconcile-queued-ssh');
+  const log = path.join(dir, 'calls.log');
+  const counter = path.join(dir, 'results');
+  const bin = path.join(dir, 'ssh');
+  fs.writeFileSync(
+    bin,
+    `#!/usr/bin/env node
+const fs = require('fs');
+const { spawnSync } = require('child_process');
+const args = process.argv.slice(2);
+const cmd = args[args.length - 1];
+const sub = (/remote-(result|withdraw|cancel)/.exec(cmd) || [])[1];
+fs.appendFileSync(${JSON.stringify(log)}, sub + '\\n');
+const id = (/[0-9a-f]{8}-[0-9a-f-]{27}/.exec(cmd) || [])[0];
+if (sub === 'result') {
+  const n = fs.existsSync(${JSON.stringify(counter)}) ? Number(fs.readFileSync(${JSON.stringify(counter)}, 'utf8')) : 0;
+  fs.writeFileSync(${JSON.stringify(counter)}, String(n + 1));
+  if (n < ${queuedPasses}) { process.stdout.write(JSON.stringify({ missing: true, state: 'queued' }) + '\\n'); process.exit(0); }
+}
+if (sub === 'withdraw') { process.stdout.write(JSON.stringify({ protocol: 1, ticketId: id, action: ${JSON.stringify(withdrawReply)} }) + '\\n'); process.exit(0); }
+const res = spawnSync(${JSON.stringify(real)}, args, { stdio: 'inherit', env: process.env });
+process.exit(res.status == null ? 1 : res.status);
+`,
+  );
+  fs.chmodSync(bin, 0o755);
+  const calls = () => (fs.existsSync(log) ? fs.readFileSync(log, 'utf8').split('\n').filter(Boolean) : []);
+  return { bin, calls };
+}
+
+test('refusal intent: the withdraw never went out and the source still has the ticket queued -> reconcile withdraws it and settles the 76 refusal', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { attempt: strandedAttempt({ moving: refusingMove() }) });
+  const ssh = queuedSourceSsh(ctx, { withdrawReply: 'withdrawn' });
+  assert.deepEqual(await reconcile(ctx, id, { sshBin: ssh.bin }), { settled: true, state: 'refused', exit: 76 });
+  assert.equal(resultOf(ctx.state, id).reason, 'refused-queue-cap');
+  assert.deepEqual(ssh.calls(), ['result', 'withdraw']);
+});
+
+test('refusal intent: the source started the ticket before the re-issued withdraw -> held that pass (never 76), adopted on the next, one run', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { record: completed(), attempt: strandedAttempt({ moving: refusingMove() }) });
+  const ssh = queuedSourceSsh(ctx, { queuedPasses: 1, withdrawReply: 'not-queued' });
+  assertHeld(ctx, id, await reconcile(ctx, id, { sshBin: ssh.bin }), 'running');
+  assert.deepEqual(await reconcile(ctx, id, { sshBin: ssh.bin }), { settled: true, state: 'adopted', exit: 3 });
+  assert.equal(resultOf(ctx.state, id).exit, 3);
+  assert.deepEqual(ssh.calls(), ['result', 'withdraw', 'result'], 'the withdraw is not repeated once the record shows the run');
+});
+
+test('refusal intent: an unknown withdraw reply on a still-queued source stays held, never 76', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { attempt: strandedAttempt({ moving: refusingMove() }) });
+  const ssh = queuedSourceSsh(ctx, { queuedPasses: 5, withdrawReply: 'unknown' });
+  assertHeld(ctx, id, await reconcile(ctx, id, { sshBin: ssh.bin }), 'running');
+});
