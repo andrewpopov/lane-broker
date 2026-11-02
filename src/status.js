@@ -313,6 +313,8 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       runner: a.runner,
       phase: a.phase,
       elapsedMs: a.startedAt ? now - a.startedAt : null,
+      key: a.key ?? null,
+      unresolved: a.unresolved ?? null,
       runnerPhase: a.runnerPhase ?? null,
       commandStartedAt: a.commandStartedAt ?? null,
       waitedMs: a.runnerPhase && a.startedAt ? nonNegative((a.commandStartedAt ?? now) - a.startedAt) : null,
@@ -684,7 +686,7 @@ export function renderStatusText(status) {
       for (const r of status.remote) {
         const flag = r.moveInterrupted ? `  [${r.moveInterrupted}] — ${r.reconcilable ? `reconciles automatically once ${r.runner} and the destination answer (or: lane cancel ${r.id})` : `reconcile with: lane cancel ${r.id}`}` : r.awaitingProof ? `  awaiting proof from ${r.awaitingProof.runner} since ${new Date(r.awaitingProof.since).toTimeString().slice(0, 5)} (dropped)` : r.orphaned ? `  [ORPHANED-REMOTE] — ${r.runner ? `reconciles automatically when ${r.runner} answers` : 'no runner recorded; settles on the next reconcile if it never dispatched'} (or: lane cancel ${r.id})` : '';
         const where = r.runnerPhase ? (r.commandStartedAt ? `running@${r.runner}  run=${fmtMs(r.runMs)}  waited=${fmtMs(r.waitedMs)}` : `queued@${r.runner}  waited=${fmtMs(r.waitedMs)}`) : `runner=${r.runner ?? '-'}  phase=${r.phase}  elapsed=${fmtMs(r.elapsedMs)}`;
-        lines.push(`  ${r.id}  ${where}${flag}`);
+        lines.push(`  ${r.id}${r.key ? `  ${r.key}` : ''}  ${where}${flag}`);
       }
     }
   }

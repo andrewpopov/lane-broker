@@ -63,6 +63,22 @@ test('a runner that reports no phase keeps the old line and null fields', async 
   });
 });
 
+test('BRAIN-782: remote[] carries key and unresolved, null without them, and the key prints after the id', async () => {
+  await withStatusEnv(async (state) => {
+    const bare = await remoteAttempt(state, {});
+    assert.deepEqual([bare.row.key, bare.row.unresolved], [null, null]);
+    assert.match(bare.text, /att-1 {2}runner=skybox/);
+  });
+  await withStatusEnv(async (state) => {
+    const created = await createAttempt(state, 'att-1', { runner: 'skybox', key: 'zirkbot:test' });
+    await updateAttempt(state, 'att-1', created.generation, { phase: 'running', unresolved: 'proof pending' });
+    const status = await collectStatus({});
+    const row = status.remote.find((r) => r.id === 'att-1');
+    assert.deepEqual([row.key, row.unresolved], ['zirkbot:test', 'proof pending']);
+    assert.match(renderStatusText(status), /att-1 {2}zirkbot:test {2}runner=skybox/);
+  });
+});
+
 test('a clock step backwards never prints a negative duration', async () => {
   await withStatusEnv(async (state) => {
     const { row, text } = await remoteAttempt(state, { startedAt: Date.now() + 5 * MIN, runnerPhase: 'queued' });

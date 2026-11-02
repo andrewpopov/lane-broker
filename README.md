@@ -750,7 +750,7 @@ A remote run takes no local capacity or resource reservation. `lane status`
 lists it under REMOTE, as `queued@<runner> waited=<d>` while the runner has not admitted it and
 `running@<runner> run=<d> waited=<d>` after (the split is read from the runner's own phase, as the queued-ticket rebalance watcher samples it every
 `remoteRebalanceIntervalMs`, so it is that coarse and shown only where rebalance runs; with `remoteRebalanceMinQueuedMs: 0` nothing
-polls the runner and the line stays as below; `run` includes the runner's deps/setup). `--json` adds `runnerPhase`,
+polls the runner and the line stays as below; `run` includes the runner's deps/setup). `--json` adds `key` (the dispatch `repo:lane`, also printed after the id), `unresolved` (the reason string or null), `runnerPhase`,
 `commandStartedAt`, `waitedMs` and `runMs`; a runner that reports no phase keeps the plain `runner=… phase=running elapsed=…`
 line. If its supervisor dies it shows as ORPHANED-REMOTE
 (it survives a reboot) until the runner settles it (see "Reconciling an

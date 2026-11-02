@@ -53,6 +53,14 @@ test('createAttempt records the submitter logPath and cwd (BRAIN-462: a crashed 
   assert.equal(Object.hasOwn(bare, 'logPath'), false, 'absent when not supplied');
 });
 
+test('createAttempt stores the dispatch key (BRAIN-782) and omits it when not given', async () => {
+  const { state } = freshEnv();
+  await createAttempt(state, 'keyed', { key: 'zirkbot:test' });
+  assert.equal(readAttempt(state, 'keyed').key, 'zirkbot:test');
+  await createAttempt(state, 'unkeyed', {});
+  assert.equal(Object.hasOwn(readAttempt(state, 'unkeyed'), 'key'), false);
+});
+
 test('createAttempt stores the supervisor kernelBootId, and omits it when the host has none', async () => {
   const { state } = freshEnv();
   const saved = process.env.LANE_BROKER_KERNEL_BOOT_ID;

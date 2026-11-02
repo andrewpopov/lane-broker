@@ -51,7 +51,7 @@ test('(a) the operator marks A offline while the supervisor waits: re-dispatched
   assert.equal(readAttempt(ctx.state, id).awaitingProof.runner, 'a');
   assert.ok(readAttempt(ctx.state, id).unresolved, 'a supervisor killed now still leaves a reconcilable orphan');
   const status = await laneRun(['status'], { env: ctx.env });
-  assert.match(status.stdout, new RegExp(`${id}  runner=a .*awaiting proof from a since \\d\\d:\\d\\d \\(dropped\\)`));
+  assert.match(status.stdout, new RegExp(`${id}  \\S+:default  runner=a .*awaiting proof from a since \\d\\d:\\d\\d \\(dropped\\)`));
   assert.equal(ctx.fake.count('exec b'), 0, 'nothing is re-dispatched without proof');
   setOffline(ctx, 'a');
   const waited = await ctx.finish(id);
