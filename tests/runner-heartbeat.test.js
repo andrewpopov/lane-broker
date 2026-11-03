@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { runnerWatchOnce } from '../src/runner-watch.js';
-import { readUnreachable, readHeartbeat, downRunnerReasons, collectRunnerStates, renderRunnersLines, recordContact, clock } from '../src/runner-unreachable.js';
+import { readUnreachable, readHeartbeat, downRunnerReasons, collectRunnerStates, renderRunnersLines, recordContact, recordPings, clock } from '../src/runner-unreachable.js';
 import { selectRunner } from '../src/remote-client.js';
 import { reconcileRemoteAttempt } from '../src/remote-reconcile.js';
 import { remoteSelectOptions, selectionOptionsFor } from '../src/supervisor.js';
@@ -179,11 +179,29 @@ test('BRAIN-809: an answer from the runner clears a stale clock and is its last-
 test('BRAIN-809: a failure observed no later than the last answer does not start a clock; a later one does', async () => {
   const root = tmpDir('heartbeat-backdated');
   seed(root, {}, beat(NOW, { skybox: { lastOkAt: NOW, lastPingAt: NOW } }));
-  assert.equal(await recordContact(root, 'skybox', false, NOW - 3 * HOUR), undefined);
-  assert.equal(await recordContact(root, 'skybox', false, NOW), undefined);
+  assert.equal(await recordContact(root, 'skybox', false, NOW - 3 * HOUR, { writeNow: NOW }), undefined);
+  assert.equal(await recordContact(root, 'skybox', false, NOW, { writeNow: NOW }), undefined);
   assert.deepEqual(readUnreachable(root), {});
-  assert.equal(await recordContact(root, 'skybox', false, NOW + MIN), NOW + MIN);
+  assert.equal(await recordContact(root, 'skybox', false, NOW + MIN, { writeNow: NOW + MIN }), NOW + MIN);
   assert.deepEqual(readUnreachable(root), { skybox: NOW + MIN });
+});
+
+test('BRAIN-809: after the clock rolls back (stored last-ok an hour ahead), a failure starts the clock and the runner goes down', async () => {
+  const root = tmpDir('heartbeat-rollback-fail');
+  seed(root, {}, beat(NOW, { skybox: { lastOkAt: NOW + HOUR, lastPingAt: NOW } }));
+  assert.equal(await recordContact(root, 'skybox', false, NOW, { writeNow: NOW }), NOW);
+  assert.deepEqual(readUnreachable(root), { skybox: NOW });
+  await recordPings(root, [{ name: 'skybox', ok: false }], NOW + 6 * MIN, { writeNow: NOW + 6 * MIN });
+  assert.deepEqual(downRunnerReasons(root, placementCfg, NOW + 6 * MIN), { skybox: `unreachable since ${clock(NOW)}` });
+});
+
+test('BRAIN-809: an ok after the clock rolled back resets last-ok to the contact time', async () => {
+  const root = tmpDir('heartbeat-rollback-ok');
+  seed(root, {}, beat(NOW, { skybox: { lastOkAt: NOW + HOUR, lastPingAt: NOW } }));
+  await recordContact(root, 'skybox', true, NOW, { writeNow: NOW });
+  assert.equal(readHeartbeat(root).runners.skybox.lastOkAt, NOW);
+  await recordContact(root, 'skybox', true, NOW + MIN, { writeNow: NOW + MIN });
+  assert.equal(readHeartbeat(root).runners.skybox.lastOkAt, NOW + MIN);
 });
 
 test('BRAIN-809: runner-lost does not settle a live attempt whose runner answered after the failed call began', async () => {
