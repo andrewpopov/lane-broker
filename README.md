@@ -1190,6 +1190,9 @@ waiting on them) forever. Two ways to settle them as lost (exit `75`; a job's ou
   than this has its unresolved attempts settled with `reason: runner-lost`. The clock starts at the first failed fetch and is kept
   in `runner-unreachable.json` in the state root (each reconcile is its own process); any answer from the runner, `running`
   included, clears it, and a runner that answers `running` keeps its attempt (the no-rerun guarantee holds until the bound).
+  A dispatch's own result fetches count the same way (BRAIN-809), so a runner that is finishing lanes clears its clock even when
+  the watcher's ping is behind. An answer also sets the runner's `lastOkAt`, and a failure observed no later than that answer
+  (a call that began before it) starts no clock, so a slow failed call cannot write a backdated clock after an ok contact.
 
 `lane wait` on a settled-lost attempt exits `75` and prints the reason on stderr.
 

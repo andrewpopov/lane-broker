@@ -94,6 +94,7 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
     return publishSettled(root, id, attempt, resultPath, 'lost', () => lostResult(id, attempt, 'runner-offline', `runner ${runner.name} is marked offline in the config; not contacted`), { self });
   }
   const publishUnreachable = (since) => {
+    if (!Number.isFinite(since)) return null;
     const unreachableMs = now - since;
     if (!(globalCfg.runnerLostAfterMs > 0) || unreachableMs <= globalCfg.runnerLostAfterMs) return null;
     return publishSettled(root, id, attempt, resultPath, 'lost', () =>
@@ -102,8 +103,7 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
     );
   };
   const unreachable = async (outcome) => {
-    const since = readUnreachable(root)[runner.name];
-    return (since === undefined ? null : await publishUnreachable(since)) ?? outcome;
+    return (await publishUnreachable(readUnreachable(root)[runner.name])) ?? outcome;
   };
   if (assumeDown) return unreachable({ settled: false, state: 'unreachable', transport: true, reason: `no usable answer from ${runner.name}` });
 

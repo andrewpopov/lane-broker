@@ -70,10 +70,20 @@ export function readHeartbeat(root) {
   return beat && typeof beat === 'object' ? { ...emptyHeartbeat(), ...beat } : emptyHeartbeat();
 }
 
-/** Apply one contact result to the parsed file: the clock keeps its first time on a failure and is removed on an answer. */
+/**
+ * Apply one contact result to the parsed file. An answer removes the clock and is the runner's last-ok (kept monotonic). A failure keeps the
+ * clock's first time, and one observed no later than the last answer starts nothing: its call began before that answer, so it only
+ * reports a stale moment (BRAIN-809: a fetch that began before an ok ping would otherwise write a backdated clock after the ping cleared it).
+ */
 function applyContact(file, name, ok, at) {
-  if (ok) delete file[name];
-  else if (!Number.isFinite(file[name])) file[name] = at;
+  if (ok) {
+    delete file[name];
+    const beat = { ...emptyHeartbeat(), ...(file[HEARTBEAT_KEY] ?? {}) };
+    const known = beat.runners[name] ?? { lastOkAt: null, lastPingAt: null };
+    file[HEARTBEAT_KEY] = { ...beat, runners: { ...beat.runners, [name]: { ...known, lastOkAt: Math.max(known.lastOkAt ?? -Infinity, at) } } };
+  } else if (!Number.isFinite(file[name]) && at > (file[HEARTBEAT_KEY]?.runners?.[name]?.lastOkAt ?? -Infinity)) {
+    file[name] = at;
+  }
 }
 
 /** Test-only seam (README "Testing hooks"): park inside the critical section, after the read, until `<dir>/go` exists. */
@@ -115,12 +125,8 @@ export const recordContact = (root, name, ok, now, opts) =>
 /** One watcher tick's pings, `[{ name, ok }]`, in a single locked write: the same clock, plus the heartbeat (tick time, per-runner last-ok/last-ping). */
 export const recordPings = (root, pings, now) =>
   updateFile(root, (file) => {
-    const beat = { ...emptyHeartbeat(), ...(file[HEARTBEAT_KEY] ?? {}) };
-    const runners = {};
-    for (const { name, ok } of pings) {
-      applyContact(file, name, ok, now);
-      runners[name] = { lastOkAt: ok ? now : beat.runners?.[name]?.lastOkAt ?? null, lastPingAt: now };
-    }
+    for (const { name, ok } of pings) applyContact(file, name, ok, now);
+    const runners = Object.fromEntries(pings.map(({ name }) => [name, { lastOkAt: file[HEARTBEAT_KEY]?.runners?.[name]?.lastOkAt ?? null, lastPingAt: now }]));
     file[HEARTBEAT_KEY] = { at: now, runners };
   });
 
