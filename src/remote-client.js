@@ -897,7 +897,7 @@ function makePhaseReporter({ onPhase, now, canWrite }) {
  * anything else keeps waiting on A. BRAIN-770: with `refusedMaxQueuedMs` set and no target once the ticket has sat that long, the same
  * withdraw runs towards `REFUSED_MOVE_TARGET` (no destination) under the same proof. Stops for good once the ticket is `admitted` or terminal. Resolves null when it did not move.
  */
-async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed, signal, abortSignal, now, sleep, fetchDeadlineMs, withdrawDeadlineMs, sshBin, env, onSample }) {
+async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed, signal, abortSignal, now, sleep, fetchDeadlineMs, withdrawDeadlineMs, sshBin, env, fetchResult, onSample }) {
   const { minQueuedMs, intervalMs = DEFAULT_REBALANCE_INTERVAL_MS, pickTarget, beforeWithdraw, afterWithdraw, refusedMaxQueuedMs = 0, refusedSince, markQueued, refusalAllowed } = rebalance;
   const fence = { runner, epoch: state.epoch };
   const current = () => state.runner === fence.runner && state.epoch === fence.epoch;
@@ -910,7 +910,7 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
   while (true) {
     await sleep(intervalMs, signal);
     if (!watching()) return null;
-    const fetched = await fetchRemoteResult(runner, expected.ticketId, sshBin, fetchDeadlineMs, env);
+    const fetched = await fetchResult(runner, expected.ticketId, sshBin, fetchDeadlineMs, env);
     if (!watching()) return null;
     if (!fetched) continue;
     if (!fetched.missing) {
@@ -1018,6 +1018,8 @@ async function dispatchOnce(opts) {
     gzipLevel = DEFAULT_GLOBAL_CONFIG.remoteSnapshotGzipLevel,
     // Called once the upload settles with { mode, rawBytes, sentBytes, treeBytes, cacheFiles, cachedFiles }; the supervisor logs and records it.
     onTransferStats,
+    // BRAIN-809: called with the runner's name whenever one of this dispatch's own result fetches got an answer, so live traffic counts as contact.
+    onContact,
     remoteArtifactsOn = 'success',
     artifactLimits,
     // BRAIN-320 S1d: opt-in, from the CLIENT machine's global config
@@ -1078,6 +1080,11 @@ async function dispatchOnce(opts) {
 
   const transferDeadlineMs = deadlines.transferMs ?? 5 * 60_000;
   const resultDeadlineMs = deadlines.resultMs ?? 30_000;
+  const fetchResult = async (target, ...rest) => {
+    const fetched = await fetchRemoteResult(target, ...rest);
+    if (fetched !== null) await Promise.resolve(onContact?.(target.name)).catch(() => {});
+    return fetched;
+  };
   const resultAttempts = deadlines.resultAttempts ?? 3;
   const cancelDeadlineMs = deadlines.cancelMs ?? 15_000;
   // A cancel the runner did not confirm leaves the command possibly alive; the caller keeps the attempt (and reports it) until it is.
@@ -1236,7 +1243,7 @@ async function dispatchOnce(opts) {
       isClosed: () => sessionClosed,
       fetchDeadlineMs: resultDeadlineMs,
       withdrawDeadlineMs: deadlines.withdrawMs ?? 15_000,
-      sshBin, env,
+      sshBin, env, fetchResult,
       onSample: reporter ? reporter.observe : undefined,
     });
     // The watcher ends the session itself once it has moved the ticket (it is queued: nothing is running behind the ssh).
@@ -1291,7 +1298,7 @@ async function dispatchOnce(opts) {
     if (abortSignal && abortSignal.aborted) {
       return cancelledOutcome();
     }
-    const fetched = await fetchRemoteResult(runner, ticketId, sshBin, resultDeadlineMs, env);
+    const fetched = await fetchResult(runner, ticketId, sshBin, resultDeadlineMs, env);
     if (fetched && !fetched.missing) {
       record = fetched;
       break;
@@ -1336,7 +1343,7 @@ async function dispatchOnce(opts) {
     const cancelConfirmed = await remoteCancelBestEffort(runner, ticketId, sshBin, cancelDeadlineMs, env);
     if (abortSignal && abortSignal.aborted) return { outcome: 'cancelled' };
     // The result may have landed while the cancel was in flight; a finished remote run is used, never discarded for a re-run.
-    const late = await fetchRemoteResult(runner, ticketId, sshBin, resultDeadlineMs, env);
+    const late = await fetchResult(runner, ticketId, sshBin, resultDeadlineMs, env);
     if (abortSignal && abortSignal.aborted) return { outcome: 'cancelled' };
     if (late && !late.missing) {
       record = late;

@@ -70,10 +70,30 @@ export function readHeartbeat(root) {
   return beat && typeof beat === 'object' ? { ...emptyHeartbeat(), ...beat } : emptyHeartbeat();
 }
 
-/** Apply one contact result to the parsed file: the clock keeps its first time on a failure and is removed on an answer. */
-function applyContact(file, name, ok, at) {
-  if (ok) delete file[name];
-  else if (!Number.isFinite(file[name])) file[name] = at;
+/** A stored `lastOkAt` further ahead of a contact than this is a clock that moved backward, not an answer from the future. */
+export const CLOCK_SKEW_MS = 5 * 60_000;
+
+/** The runner's last answer, or -Infinity when none is recorded or it lies beyond the skew allowance of the wall time at write (a rolled-back clock). */
+const validLastOkAt = (file, name, writeNow) => {
+  const stored = file[HEARTBEAT_KEY]?.runners?.[name]?.lastOkAt;
+  return Number.isFinite(stored) && stored <= writeNow + CLOCK_SKEW_MS ? stored : -Infinity;
+};
+
+/**
+ * Apply one contact result to the parsed file. An answer removes the clock and is the runner's last-ok (kept monotonic). A failure keeps the
+ * clock's first time, and one observed no later than the last answer starts nothing: its call began before that answer, so it only
+ * reports a stale moment (BRAIN-809: a fetch that began before an ok ping would otherwise write a backdated clock after the ping cleared it).
+ * A stored last-ok beyond CLOCK_SKEW_MS ahead of the wall time at write (`writeNow`, not the contact's call-start `at`) is ignored by both rules, so a clock rolled back cannot mute failures.
+ */
+function applyContact(file, name, ok, at, writeNow) {
+  if (ok) {
+    delete file[name];
+    const beat = { ...emptyHeartbeat(), ...(file[HEARTBEAT_KEY] ?? {}) };
+    const known = beat.runners[name] ?? { lastOkAt: null, lastPingAt: null };
+    file[HEARTBEAT_KEY] = { ...beat, runners: { ...beat.runners, [name]: { ...known, lastOkAt: Math.max(validLastOkAt(file, name, writeNow), at) } } };
+  } else if (!Number.isFinite(file[name]) && at > validLastOkAt(file, name, writeNow)) {
+    file[name] = at;
+  }
 }
 
 /** Test-only seam (README "Testing hooks"): park inside the critical section, after the read, until `<dir>/go` exists. */
@@ -85,7 +105,7 @@ async function pauseInUpdateForTest() {
 }
 
 /** `deadlineAt` (ms epoch, optional) bounds the wait for the lock; a lock still held then throws `LockTimeoutError`. */
-async function updateFile(root, mutate, { deadlineAt } = {}) {
+async function updateFile(root, mutate, { deadlineAt, writeNow } = {}) {
   const timeoutMs = deadlineAt === undefined ? LOCK_WAIT_MS : Math.max(0, Math.min(LOCK_WAIT_MS, deadlineAt - Date.now()));
   return withLock(
     root,
@@ -93,7 +113,7 @@ async function updateFile(root, mutate, { deadlineAt } = {}) {
       const file = readJsonSafe(paths(root).runnerUnreachable) ?? {};
       const before = JSON.stringify(file);
       await pauseInUpdateForTest();
-      const result = mutate(file);
+      const result = mutate(file, writeNow ?? Date.now());
       if (JSON.stringify(file) !== before) atomicWriteJson(paths(root).runnerUnreachable, file);
       return result;
     },
@@ -105,24 +125,20 @@ async function updateFile(root, mutate, { deadlineAt } = {}) {
 export const recordContact = (root, name, ok, now, opts) =>
   updateFile(
     root,
-    (file) => {
-      applyContact(file, name, ok, now);
+    (file, writeNow) => {
+      applyContact(file, name, ok, now, writeNow);
       return ok ? null : file[name];
     },
     opts,
   );
 
 /** One watcher tick's pings, `[{ name, ok }]`, in a single locked write: the same clock, plus the heartbeat (tick time, per-runner last-ok/last-ping). */
-export const recordPings = (root, pings, now) =>
-  updateFile(root, (file) => {
-    const beat = { ...emptyHeartbeat(), ...(file[HEARTBEAT_KEY] ?? {}) };
-    const runners = {};
-    for (const { name, ok } of pings) {
-      applyContact(file, name, ok, now);
-      runners[name] = { lastOkAt: ok ? now : beat.runners?.[name]?.lastOkAt ?? null, lastPingAt: now };
-    }
+export const recordPings = (root, pings, now, opts) =>
+  updateFile(root, (file, writeNow) => {
+    for (const { name, ok } of pings) applyContact(file, name, ok, now, writeNow);
+    const runners = Object.fromEntries(pings.map(({ name }) => [name, { lastOkAt: file[HEARTBEAT_KEY]?.runners?.[name]?.lastOkAt ?? null, lastPingAt: now }]));
     file[HEARTBEAT_KEY] = { at: now, runners };
-  });
+  }, opts);
 
 /** HH:MM in the local zone. */
 export const clock = (ms) => new Date(ms).toTimeString().slice(0, 5);

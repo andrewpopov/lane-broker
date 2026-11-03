@@ -48,7 +48,7 @@ import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, priorityOf, resolveLaneNice, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
 import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, noRunnerLocallyIneligibleRefusal, dispatchOnlyRefusal, LOCAL_REFUSED_EXIT_CODE, locallyRefusedNow, localWindowAllowing, leaseCpuCores, terminalRowDefaults } from './resources.js';
-import { downRunnerReasons, heartbeatUpRunners, recordReadiness, recordEnforcement } from './runner-unreachable.js';
+import { downRunnerReasons, heartbeatUpRunners, recordReadiness, recordEnforcement, recordContact } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
 import { remoteCpuAllocation, selectRunner, dispatchRemote, remoteCancel, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, haveDeadlineFor, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON, REFUSED_MOVE_TARGET } from './remote-client.js';
@@ -1200,6 +1200,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       blobCache,
       deadlines: { haveMs: haveDeadlineFor(probe) },
       onTransferStats,
+      onContact: (name) => recordContact(root, name, true, Date.now()),
       gzipLevel: globalCfg.remoteSnapshotGzipLevel,
       artifactLimits: artifactLimitsOf(globalCfg),
       manifest,

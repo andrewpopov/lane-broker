@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { runnerWatchOnce } from '../src/runner-watch.js';
-import { readUnreachable, readHeartbeat, downRunnerReasons, collectRunnerStates, renderRunnersLines, recordContact, clock } from '../src/runner-unreachable.js';
+import { readUnreachable, readHeartbeat, downRunnerReasons, collectRunnerStates, renderRunnersLines, recordContact, recordPings, clock } from '../src/runner-unreachable.js';
 import { selectRunner } from '../src/remote-client.js';
 import { reconcileRemoteAttempt } from '../src/remote-reconcile.js';
 import { remoteSelectOptions, selectionOptionsFor } from '../src/supervisor.js';
@@ -150,6 +150,96 @@ test('watch runs the sweep: an orphan on a runner unreachable past runnerLostAft
   assert.equal(resultOf(ctx.state, id).reason, 'runner-lost');
   assert.equal(resultOf(ctx.state, id).exit, 75);
   assert.equal(readAttempt(ctx.state, id), null);
+});
+
+/** An orphaned remote attempt on skybox whose supervisor is dead, and the fake-ssh environment where every runner call fails. */
+function orphanOnDownRunner() {
+  const ctx = setup({ ssh: 'down' });
+  const globalCfg = { ...DEFAULT_GLOBAL_CONFIG, ...JSON.parse(fs.readFileSync(path.join(ctx.home, 'config.json'), 'utf8')) };
+  const id = crypto.randomUUID();
+  ensureStateDirs(ctx.state);
+  atomicWriteJson(path.join(paths(ctx.state).attempts, `${id}.json`), {
+    id, generation: 0, executor: 'remote', phase: 'running', runner: 'skybox', startedAt: NOW - 4 * HOUR,
+    supervisor: { pid: DEAD_PID, startTime: null, bootId: 'dead' }, binding: { protocol: 1, generation: 0, manifestHash: 'm'.repeat(64), runner: 'skybox' },
+  });
+  const sshBin = path.join(ctx.env.PATH.split(path.delimiter)[0], 'ssh');
+  return { ctx, globalCfg, id, sshBin };
+}
+
+test('BRAIN-809: an answer from the runner clears a stale clock and is its last-ok, whoever saw it', async () => {
+  const root = tmpDir('heartbeat-live-ok');
+  seed(root, { skybox: NOW - 3 * HOUR }, beat(NOW - MIN, { skybox: { lastOkAt: NOW - 3 * HOUR - MIN, lastPingAt: NOW - MIN } }));
+  await recordContact(root, 'skybox', true, NOW);
+  assert.deepEqual(readUnreachable(root), {});
+  assert.deepEqual(readHeartbeat(root).runners.skybox, { lastOkAt: NOW, lastPingAt: NOW - MIN });
+  assert.equal(readHeartbeat(root).at, NOW - MIN, 'the watcher tick time is the watcher\'s alone');
+  assert.equal(collectRunnerStates(root, placementCfg, NOW)[0].state, 'up');
+});
+
+test('BRAIN-809: a failure observed no later than the last answer does not start a clock; a later one does', async () => {
+  const root = tmpDir('heartbeat-backdated');
+  seed(root, {}, beat(NOW, { skybox: { lastOkAt: NOW, lastPingAt: NOW } }));
+  assert.equal(await recordContact(root, 'skybox', false, NOW - 3 * HOUR, { writeNow: NOW }), undefined);
+  assert.equal(await recordContact(root, 'skybox', false, NOW, { writeNow: NOW }), undefined);
+  assert.deepEqual(readUnreachable(root), {});
+  assert.equal(await recordContact(root, 'skybox', false, NOW + MIN, { writeNow: NOW + MIN }), NOW + MIN);
+  assert.deepEqual(readUnreachable(root), { skybox: NOW + MIN });
+});
+
+test('BRAIN-809: after the clock rolls back (stored last-ok an hour ahead), a failure starts the clock and the runner goes down', async () => {
+  const root = tmpDir('heartbeat-rollback-fail');
+  seed(root, {}, beat(NOW, { skybox: { lastOkAt: NOW + HOUR, lastPingAt: NOW } }));
+  assert.equal(await recordContact(root, 'skybox', false, NOW, { writeNow: NOW }), NOW);
+  assert.deepEqual(readUnreachable(root), { skybox: NOW });
+  await recordPings(root, [{ name: 'skybox', ok: false }], NOW + 6 * MIN, { writeNow: NOW + 6 * MIN });
+  assert.deepEqual(downRunnerReasons(root, placementCfg, NOW + 6 * MIN), { skybox: `unreachable since ${clock(NOW)}` });
+});
+
+test('BRAIN-809: an ok after the clock rolled back resets last-ok to the contact time', async () => {
+  const root = tmpDir('heartbeat-rollback-ok');
+  seed(root, {}, beat(NOW, { skybox: { lastOkAt: NOW + HOUR, lastPingAt: NOW } }));
+  await recordContact(root, 'skybox', true, NOW, { writeNow: NOW });
+  assert.equal(readHeartbeat(root).runners.skybox.lastOkAt, NOW);
+  await recordContact(root, 'skybox', true, NOW + MIN, { writeNow: NOW + MIN });
+  assert.equal(readHeartbeat(root).runners.skybox.lastOkAt, NOW + MIN);
+});
+
+test('BRAIN-809: runner-lost does not settle a live attempt whose runner answered after the failed call began', async () => {
+  const { ctx, globalCfg, id, sshBin } = orphanOnDownRunner();
+  seed(ctx.state, {}, beat(NOW, { skybox: { lastOkAt: NOW, lastPingAt: NOW } }));
+  const stale = await reconcileRemoteAttempt(ctx.state, id, { globalCfg, sshBin, env: ctx.env, now: NOW - 3 * HOUR });
+  assert.equal(stale.state, 'unreachable');
+  assert.deepEqual(readUnreachable(ctx.state), {}, 'a call that began before the ok ping left no backdated clock');
+  const later = await reconcileRemoteAttempt(ctx.state, id, { globalCfg, sshBin, env: ctx.env, now: NOW + MIN });
+  assert.equal(later.state, 'unreachable');
+  assert.equal(later.settled, false);
+  assert.ok(readAttempt(ctx.state, id), 'the attempt is kept');
+  assert.equal(readUnreachable(ctx.state).skybox, NOW + MIN);
+});
+
+test('BRAIN-809: continuous failure with no answer still marks the runner down and settles its orphan as runner-lost', async () => {
+  const { ctx, globalCfg, id, sshBin } = orphanOnDownRunner();
+  await runnerWatchOnce(ctx.state, { cfg: globalCfg, sshBin, env: ctx.env, now: NOW - 3 * HOUR });
+  assert.equal(readUnreachable(ctx.state).skybox, NOW - 3 * HOUR);
+  assert.deepEqual(downRunnerReasons(ctx.state, { ...globalCfg, runnerDownAfterMs: 3 * MIN }, NOW - 3 * HOUR + 4 * MIN), { skybox: `unreachable since ${clock(NOW - 3 * HOUR)}` });
+  await recordContact(ctx.state, 'skybox', false, NOW - 2 * HOUR);
+  assert.equal(readUnreachable(ctx.state).skybox, NOW - 3 * HOUR, 'the first failure is kept');
+  const settled = await reconcileRemoteAttempt(ctx.state, id, { globalCfg, sshBin, env: ctx.env, now: NOW });
+  assert.equal(settled.settled, true);
+  assert.equal(resultOf(ctx.state, id).reason, 'runner-lost');
+});
+
+test('BRAIN-809: a dispatch whose own result fetch is answered counts as contact, so a runner finishing lanes clears its clock without the watcher', async () => {
+  const ctx = setup();
+  writeRepoConfig(ctx.repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, remotePolicy: 'remote-first' } } });
+  const startedAt = Date.now();
+  seed(ctx.state, { skybox: startedAt - MIN });
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], ctx.env, ctx.repoDir);
+  assert.equal(waited.code, 0, waited.stderr);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
+  assert.deepEqual(readUnreachable(ctx.state), {});
+  assert.ok(readHeartbeat(ctx.state).runners.skybox.lastOkAt >= startedAt);
 });
 
 /** A child that records a contact for `name`, parked inside the critical section (after its read) until `<dir>/go` exists. */
