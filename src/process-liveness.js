@@ -1,12 +1,28 @@
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+
+/** The state letter in a `/proc/<pid>/stat` line: the first field after the LAST `)`, since comm may itself contain parens. */
+export function procStatState(stat) {
+  const afterComm = String(stat).slice(String(stat).lastIndexOf(')') + 1).trimStart();
+  return afterComm.length > 0 && afterComm[1] === ' ' ? afterComm[0] : null;
+}
+
+function isZombie(pid) {
+  if (process.platform !== 'linux') return false;
+  try {
+    return procStatState(fs.readFileSync(`/proc/${pid}/stat`, 'utf8')) === 'Z';
+  } catch {
+    return false;
+  }
+}
 
 export function isPidAlive(pid) {
   try {
     process.kill(pid, 0);
-    return true;
   } catch {
     return false;
   }
+  return !isZombie(pid);
 }
 
 /**

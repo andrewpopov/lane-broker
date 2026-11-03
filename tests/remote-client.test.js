@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor, sleep } from './helpers.js';
 import { tmpDir, makeFakeSshBin, makeRunner, clientEnv, makeGitWorktree, makeDispatchArgs, readCapturedHeader } from './remote-harness.js';
-import { remoteCpuAllocation, shellQuote, buildRemoteCommand, selectRunner, dispatchRemote, remoteWithdraw, isGreen, needsProtocol2, classifyRemoteResult } from '../src/remote-client.js';
+import { remoteCpuAllocation, shellQuote, buildRemoteCommand, selectRunner, dispatchRemote, remoteWithdraw, isGreen, needsProtocol2, classifyRemoteResult, provesNeverStarted } from '../src/remote-client.js';
 import { MAX_HEADER_BYTES } from '../src/remote-stream.js';
 import { buildManifest } from '../src/remote-manifest.js';
 
@@ -1046,12 +1046,12 @@ if (cmd.includes('remote-exec')) {
 const phaseRecord = (phase) => ({ protocol: 1, missing: true, state: phase === 'queued' ? 'queued' : 'running', phase });
 const TARGET = { name: 'B', ssh: 'b' };
 
-async function dispatchRebalance({ results, withdraws, execMs, rebalance, canWithdraw = true, clock = makeFakeClock(), abortSignal, abortWhen, onSnapshotSent, onRunnerPhase, closeExecOnWithdraw, cancelConfirmed, src = makeGitWorktree({ 'a.txt': 'hello' }) }) {
+async function dispatchRebalance({ results, withdraws, execMs, rebalance, canWithdraw = true, clock = makeFakeClock(), abortSignal, abortWhen, onSnapshotSent, onRunnerPhase, closeExecOnWithdraw, cancelConfirmed, argsExtra, src = makeGitWorktree({ 'a.txt': 'hello' }) }) {
   const ssh = makeRebalanceSsh({ results: [], withdraws, execMs, closeExecOnWithdraw, cancelConfirmed });
-  const args = makeDispatchArgs();
+  const args = makeDispatchArgs(argsExtra);
   const { manifestHash } = buildManifest(src);
   const bound = boundResult(args, { manifestHash });
-  const expand = (r) => (r === 'RESULT' ? bound : r === 'REJECTED' ? { ...bound, kind: 'rejected', reason: 'bad header' } : r === 'QUEUE_TIMEOUT' ? { ...bound, kind: 'unfinished', reason: 'queue-timeout' } : r === 'UNFINISHED' ? { ...bound, kind: 'unfinished' } : r === 'UNBOUND' ? { ...bound, ticketId: 'someone-else' } : r === 'WITHDRAWN' ? { ...bound, kind: 'unfinished', reason: 'withdrawn' } : r?.record === 'WITHDRAWN' ? { ...r, record: { ...bound, kind: 'unfinished', reason: 'withdrawn' } } : r);
+  const expand = (r) => (r === 'RESULT' ? bound : r === 'REJECTED' ? { ...bound, kind: 'rejected', reason: 'bad header' } : r === 'QUEUE_TIMEOUT' ? { ...bound, kind: 'unfinished', reason: 'queue-timeout' } : r === 'UNFINISHED' ? { ...bound, kind: 'unfinished' } : r === 'DEAD_QUEUED' ? { ...bound, protocol: 2, kind: 'unfinished', reason: 'supervisor-died-while-queued' } : r === 'LEGACY_DEAD_QUEUED' ? { ...bound, protocol: 2, kind: 'completed', exit: 75, phase: null, reason: null } : r === 'COMPLETED_1_NO_PHASE' ? { ...bound, protocol: 2, kind: 'completed', exit: 1, phase: null, reason: null } : r === 'UNBOUND' ? { ...bound, ticketId: 'someone-else' } : r === 'WITHDRAWN' ? { ...bound, kind: 'unfinished', reason: 'withdrawn' } : r?.record === 'WITHDRAWN' ? { ...r, record: { ...bound, kind: 'unfinished', reason: 'withdrawn' } } : r);
   fs.writeFileSync(path.join(path.dirname(ssh.sshBin), 'script.json'), JSON.stringify({ results: results.map(expand), withdraws: withdraws ?? [] }));
   const result = await dispatchRemote({
     ...args,
@@ -1250,6 +1250,30 @@ test('P1-4: an unusable record proves nothing -- only a bound rejected/queue-tim
     assert.equal(result.neverStarted === true, never, record);
     assert.equal(result.mayStillBeRunning === true, !never, record);
   }
+});
+
+test('BRAIN-797: a dead-queued-supervisor record is neverStarted + retryElsewhere, the 0.85.0 completed/75/no-phase shape included; other no-phase exits are not', { timeout: 60_000 }, async () => {
+  for (const [record, never] of [['DEAD_QUEUED', true], ['LEGACY_DEAD_QUEUED', true], ['COMPLETED_1_NO_PHASE', false]]) {
+    const { result } = await dispatchRebalance({ results: [record], withdraws: [], execMs: 0, canWithdraw: false, rebalance: null, argsExtra: { remoteSetup: [['true']] } });
+    assert.equal(result.outcome, 'unconfirmed', `${record}: ${JSON.stringify(result)}`);
+    assert.equal(result.neverStarted === true, never, `${record}: ${JSON.stringify(result)}`);
+    assert.equal(result.retryElsewhere === true, never, record);
+    assert.equal(result.rejected, undefined, record);
+  }
+});
+
+test('BRAIN-797: provesNeverStarted accepts the legacy completed/75 shape only for protocol 2, no signal, no phase', () => {
+  const expected = { protocol: 2, ticketId: 't1', generation: 0, manifestHash: 'h1' };
+  const legacy = { protocol: 2, ticketId: 't1', generation: 0, manifestHash: 'h1', kind: 'completed', exit: 75, signal: null, reason: null, phase: null };
+  assert.equal(provesNeverStarted(legacy, expected), true);
+  assert.equal(provesNeverStarted({ ...legacy, phase: undefined }, expected), true);
+  assert.equal(provesNeverStarted({ ...legacy, kind: 'unfinished', reason: 'supervisor-died-while-queued' }, expected), true);
+  assert.equal(provesNeverStarted({ ...legacy, exit: 1 }, expected), false);
+  assert.equal(provesNeverStarted({ ...legacy, exit: 0 }, expected), false);
+  assert.equal(provesNeverStarted({ ...legacy, signal: 'SIGKILL' }, expected), false);
+  assert.equal(provesNeverStarted({ ...legacy, phase: 'command' }, expected), false);
+  assert.equal(provesNeverStarted({ ...legacy, manifestHash: 'other' }, expected), false);
+  assert.equal(provesNeverStarted({ ...legacy, protocol: 1 }, { ...expected, protocol: 1 }), false);
 });
 
 test('P2-6: a lost withdraw reply plus a session that closed before the watcher saw anything is still a move to the chosen target', { timeout: 60_000 }, async () => {

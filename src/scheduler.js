@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, isExpired, writeExpireMarkerFile, writeCancelMarkerFile, writeSupersededMarkerFile, readSupersededBy, withSupersession, removeSupersededMarker, removeReleasedMarker, isWithdrawn, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
+import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, isExpired, writeExpireMarkerFile, writeCancelMarkerFile, writeSupersededMarkerFile, readSupersededBy, withSupersession, removeSupersededMarker, removeReleasedMarker, isWithdrawn, DEAD_QUEUED_SUPERVISOR_REASON, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
 import { sampleAndUpdateGate, readGateState } from './load.js';
 import { patchAttemptLocked, readAttempt } from './attempts.js';
 import { listLeases, readLease, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
@@ -514,8 +514,7 @@ export async function retierQueued(root, id, tier, cfg, { reloadConfig = (c) => 
   });
 }
 
-/** The reason on every result settled because a queued ticket's supervisor died before admission (BRAIN-457, BRAIN-605). */
-export const DEAD_QUEUED_SUPERVISOR_REASON = 'supervisor-died-while-queued';
+export { DEAD_QUEUED_SUPERVISOR_REASON };
 
 /**
  * BRAIN-457: dequeue every queued ticket whose supervisor is gone, nothing else (leases are `reapAll`'s). Nothing polls for

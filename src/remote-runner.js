@@ -7,7 +7,7 @@ import { childExitSafeFlags } from './node-exit-safe.js';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, readRemoteDrain, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath, RUNNER_SHUTDOWN_REASON, RUNNER_SHUTDOWN_UNPROVEN_REASON, kernelBootId } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, readRemoteDrain, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath, RUNNER_SHUTDOWN_REASON, RUNNER_SHUTDOWN_UNPROVEN_REASON, DEAD_QUEUED_SUPERVISOR_REASON, kernelBootId } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidDepsKeyFilesShape, isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, RUNNER_NAME_RE, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
 import { advertisedCapabilities } from './capabilities.js';
@@ -760,6 +760,9 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     // fallback log line.
     kind = 'unfinished';
     reason = 'queue-timeout';
+  } else if (structured && structured.reason === DEAD_QUEUED_SUPERVISOR_REASON && !cancelled) {
+    kind = 'unfinished';
+    reason = DEAD_QUEUED_SUPERVISOR_REASON;
   } else if ((reason = shutdownStopReason({ cancelled, shutdownMarked: fs.existsSync(shutdownMarker), refusedAtStart, unstarted: fs.existsSync(path.join(ticketDir, 'shutdown-unstarted')), structured })) !== null) {
     kind = 'unfinished';
   } else if (structured) {

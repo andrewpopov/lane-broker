@@ -12,7 +12,7 @@ import { encodeSnapshot, serializeHeader, MAX_HEADER_BYTES } from '../src/remote
 import { sanitizeKey } from '../src/config.js';
 import { paths, readJsonSafe, processStartTime, withLock, writeCancelMarkerFile } from '../src/state.js';
 import { writeLease } from '../src/lease.js';
-import { enqueue } from '../src/scheduler.js';
+import { enqueue, listQueue, reapOrphanedQueue } from '../src/scheduler.js';
 import { remoteResultCommand, buildResult } from '../src/remote-runner.js';
 import { makeTmpDir } from './helpers/tmp.js';
 
@@ -1063,6 +1063,33 @@ test('a broker-level lane cancel landing after a queue-timeout expiry, before fi
   assert.ok(structured, 'the local broker must have published a result for the raced ticket');
   assert.equal(structured.cancelled, true);
   assert.notEqual(structured.reason, 'queue-timeout');
+});
+
+test('BRAIN-797: a queued ticket whose supervisor died is published as kind unfinished / supervisor-died-while-queued', async () => {
+  const { env, home, state } = freshEnv();
+  writeGlobalConfig(home, { schedulerMode: 'shadow', sampleMs: 30 });
+  fs.mkdirSync(state, { recursive: true });
+  fs.writeFileSync(path.join(state, 'PAUSE'), 'kept busy for the test');
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ protocol: 2, queueTimeoutMs: 120_000, argv: [process.execPath, '-e', 'process.exit(0)'] });
+  const { child } = spawnRemoteExec(encodeSnapshot(src, header, entries), { env, root });
+
+  const remoteIdPath = path.join(root, 'tickets', header.ticketId, 'remote-id');
+  await waitFor(() => fs.existsSync(remoteIdPath));
+  const remoteLaneId = fs.readFileSync(remoteIdPath, 'utf8').trim();
+  await waitFor(() => listQueue(state).some((t) => t.id === remoteLaneId && Number.isInteger(t.supervisorPid)));
+  await withLock(state, () => {
+    const dir = paths(state).queue;
+    const file = fs.readdirSync(dir).map((n) => path.join(dir, n)).find((f) => readJsonSafe(f)?.id === remoteLaneId);
+    fs.writeFileSync(file, JSON.stringify({ ...readJsonSafe(file), supervisorPid: deadPid(), supervisorStart: null }));
+    reapOrphanedQueue(state);
+  });
+
+  assert.equal(await waitClose(child), 0);
+  const published = await getResult(header.ticketId, root, env);
+  assert.equal(published.kind, 'unfinished', JSON.stringify(published));
+  assert.equal(published.reason, 'supervisor-died-while-queued');
 });
 
 // BRAIN-518 review: the supervisor decides cancelled-vs-queue-timeout INSIDE the lock, after its dequeue. A cancel marker that lands

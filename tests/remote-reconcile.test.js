@@ -277,6 +277,22 @@ for (const record of [{ kind: 'unfinished', reason: 'queue-timeout' }, { kind: '
   });
 }
 
+// BRAIN-797: runners before 0.89 published a dead queued supervisor as completed exit 75 with no phase file.
+test('a binding-matched legacy completed/75/no-phase runner record is settled as lost (runner-never-started), not ambiguous', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { binding: { ...BINDING, protocol: 2 }, record: { protocol: 2, kind: 'completed', exit: 75, signal: null, reason: null, phase: null, remoteLaneId: 'x' } });
+  assert.deepEqual(await reconcile(ctx, id), { settled: true, state: 'lost', exit: 75 });
+  assert.equal(resultOf(ctx.state, id).reason, 'runner-never-started');
+  assertNothingRan(ctx);
+});
+
+test('a legacy-shaped completed/no-phase record with exit 1 stays ambiguous: attempt kept', async () => {
+  const ctx = context();
+  const id = seedOrphan(ctx, { binding: { ...BINDING, protocol: 2 }, record: { protocol: 2, kind: 'completed', exit: 1, signal: null, reason: null, phase: null } });
+  assert.equal((await reconcile(ctx, id)).state, 'ambiguous');
+  assertKept(ctx, id);
+});
+
 // BRAIN-350: a runner's host shutdown proves the job is dead there, exactly like a never-started record.
 test('a binding-matched unfinished/runner-shutdown runner record is settled as lost (exit 75, runner-shutdown) and never re-run', async () => {
   const ctx = context();

@@ -11,7 +11,7 @@ import { isCacheable, isBlobHash } from './remote-blobs.js';
 import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
 import { isPriorityTier } from './priority.js';
 import { runnerAvailability } from './runner-schedule.js';
-import { sanitizeDrainReason, RUNNER_SHUTDOWN_REASON } from './state.js';
+import { sanitizeDrainReason, RUNNER_SHUTDOWN_REASON, DEAD_QUEUED_SUPERVISOR_REASON } from './state.js';
 import { readinessProbeArgs, readinessGap } from './runner-readiness.js';
 
 /**
@@ -786,12 +786,19 @@ function isWithdrawnRecord(record, expected) {
   return matchesTicket(record, expected) && record.kind === 'unfinished' && record.reason === 'withdrawn';
 }
 
+/** The shape runners before 0.89 published for a queued ticket whose inner supervisor died: a completed exit 75 with no phase file. */
+function isLegacyDeadQueuedRecord(record) {
+  return record.protocol === 2 && record.kind === 'completed' && record.exit === 75 && !record.signal && (record.phase ?? null) === null;
+}
+
 /** True iff `record` binds to `expected` and is the runner's own statement that nothing ran: rejected before running, expired
- *  in its queue, or withdrawn while queued. */
+ *  in its queue, withdrawn while queued, or its queued supervisor died (BRAIN-797). */
 export function provesNeverStarted(record, expected) {
   return (
     matchesTicket(record, expected) &&
-    (record.kind === 'rejected' || (record.kind === 'unfinished' && (record.reason === 'queue-timeout' || record.reason === 'withdrawn')))
+    (record.kind === 'rejected' ||
+      (record.kind === 'unfinished' && (record.reason === 'queue-timeout' || record.reason === 'withdrawn' || record.reason === DEAD_QUEUED_SUPERVISOR_REASON)) ||
+      isLegacyDeadQueuedRecord(record))
   );
 }
 
@@ -1378,7 +1385,7 @@ async function dispatchOnce(opts) {
     if (provesNeverStarted(record, expected) && !unconfirmedCancel) {
       // a runner that rejected the ticket on its merits would reject it again elsewhere; one that expired or gave it up in its queue says nothing about another runner
       const cacheRepair = transferCache && record.kind === 'rejected' && CACHE_REJECT_RE.test(record.reason ?? '');
-      return { outcome: 'unconfirmed', reason: classification.reason, neverStarted: true, ...(record.kind === 'unfinished' ? { retryElsewhere: true } : { rejected: true }), ...(cacheRepair ? { cacheRepair: true } : {}) };
+      return { outcome: 'unconfirmed', reason: classification.reason, neverStarted: true, ...(record.kind === 'rejected' ? { rejected: true } : { retryElsewhere: true }), ...(cacheRepair ? { cacheRepair: true } : {}) };
     }
     if (provesStopped(record, expected) && !unconfirmedCancel) return { outcome: 'unconfirmed', reason: classification.reason, runnerStopped: true };
     return { outcome: 'unconfirmed', reason: classification.reason, mayStillBeRunning: true };
