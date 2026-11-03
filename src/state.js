@@ -523,6 +523,8 @@ export const DRAIN_UNREADABLE_REASON = 'drain marker unreadable';
 const DEFAULT_DRAIN_REASON = 'drained by operator';
 /** BRAIN-350: the `reason` of an `unfinished` runner record for a job the runner stopped because its host is shutting down. */
 export const RUNNER_SHUTDOWN_REASON = 'runner-shutdown';
+/** The reason on every result settled because a queued ticket's supervisor died before admission (BRAIN-457, BRAIN-605). */
+export const DEAD_QUEUED_SUPERVISOR_REASON = 'supervisor-died-while-queued';
 /** BRAIN-350: the same stop when the runner cannot prove the job is dead; the submitter treats it as possibly still running. */
 export const RUNNER_SHUTDOWN_UNPROVEN_REASON = 'runner-shutdown-unproven';
 /** BRAIN-350 S3: every reason that PROVES a runner no longer holds the job, so the submitter may place it again (a reconcile `lost` reason; `runner-lost` only from a runner-confirmed gone, never the unreachable bound, which settles the ticket instead). */

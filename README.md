@@ -1168,7 +1168,9 @@ again:
 - a job the runner reports `gone` with no result is settled as lost (exit `75`, `reason: runner-lost`) only after the runner
   confirms a `remote-cancel`, so it can no longer be running or start there;
 - a runner record that binds to the dispatch and itself proves the job never started (`rejected`, `unfinished: queue-timeout`,
-  `unfinished: withdrawn`, the same proof the live supervisor trusts to retry elsewhere) is settled as lost (exit `75`,
+  `unfinished: withdrawn`, `unfinished: supervisor-died-while-queued`, and, from runners before 0.89, a `completed` exit `75` with no
+  signal and no phase: the runner's pipeline never wrote one; BRAIN-797 -- the same proof the live supervisor trusts to retry
+  elsewhere) is settled as lost (exit `75`,
   `reason: runner-never-started`, `lostDetail` naming the record). A record that fails the binding match stays ambiguous;
 - a probe-phase orphan with no `runner`, no `dispatchedRunners` and no `binding` (the supervisor died while probing) is settled as
   lost (exit `75`, `reason: never-dispatched`) without any ssh call. This is safe because the supervisor writes the runner,
