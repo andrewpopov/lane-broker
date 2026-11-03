@@ -786,9 +786,18 @@ function isWithdrawnRecord(record, expected) {
   return matchesTicket(record, expected) && record.kind === 'unfinished' && record.reason === 'withdrawn';
 }
 
-/** The shape runners before 0.89 published for a queued ticket whose inner supervisor died: a completed exit 75 with no phase file. */
+/** The shape runners before 0.89 published for a queued ticket whose inner supervisor died: a completed exit 75 with no phase.
+ *  A null phase alone could be a failed read, so the proof is the missing queuedMs/runMs: the runner sets both only once admitted. */
 function isLegacyDeadQueuedRecord(record) {
-  return record.protocol === 2 && record.kind === 'completed' && record.exit === 75 && !record.signal && (record.phase ?? null) === null;
+  return (
+    record.protocol === 2 &&
+    record.kind === 'completed' &&
+    record.exit === 75 &&
+    !record.signal &&
+    (record.phase ?? null) === null &&
+    record.queuedMs === undefined &&
+    record.runMs === undefined
+  );
 }
 
 /** True iff `record` binds to `expected` and is the runner's own statement that nothing ran: rejected before running, expired

@@ -1272,6 +1272,9 @@ test('BRAIN-797: provesNeverStarted accepts the legacy completed/75 shape only f
   assert.equal(provesNeverStarted({ ...legacy, exit: 0 }, expected), false);
   assert.equal(provesNeverStarted({ ...legacy, signal: 'SIGKILL' }, expected), false);
   assert.equal(provesNeverStarted({ ...legacy, phase: 'command' }, expected), false);
+  // an admitted run whose phase file could not be read: queuedMs/runMs prove it reached admission
+  assert.equal(provesNeverStarted({ ...legacy, queuedMs: 1200 }, expected), false);
+  assert.equal(provesNeverStarted({ ...legacy, runMs: 0 }, expected), false);
   assert.equal(provesNeverStarted({ ...legacy, manifestHash: 'other' }, expected), false);
   assert.equal(provesNeverStarted({ ...legacy, protocol: 1 }, { ...expected, protocol: 1 }), false);
 });
