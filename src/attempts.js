@@ -4,14 +4,19 @@ import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, kernelBootId, i
 import { isProcessAlive, processStartTime } from './process-liveness.js';
 import { cancelGraceMs } from './descendants.js';
 
-/** How long `lane cancel` waits on a live supervisor after its SIGTERM. */
-export const cancelWaitMs = () => cancelGraceMs() + 5000;
-/** BRAIN-850 S3: a remote supervisor still alive this long after its cancel signal exits, so `lane cancel` is never left waiting out its own grace. */
-export const remoteCancelExitDeadlineMs = () => cancelWaitMs() - 2000;
-/** Exit code of a supervisor that gave up on a cancel it could not finish: the attempt, binding and cancel marker stay for the orphaned-remote path. */
-export const REMOTE_CANCEL_ABANDONED_EXIT = 74;
+/** How long a remote cancel/withdraw round trip may take: the grace a local cancel gives plus 5 s, so one knob scales every cancel deadline in tests. */
+export const remoteCancelDeadlineMs = () => cancelGraceMs() + 5000;
+/** Bound on each join of a settled/aborted ssh session (BRAIN-850): the session's close is never waited on past this after an abort. */
+export const POST_ABORT_JOIN_MS = 1500;
 /** Lock acquire bound for the writes a cancelling supervisor makes: failing fast lets it exit instead of retrying contention forever. */
 export const CANCELLING_LOCK_TIMEOUT_MS = 3000;
+const CANCEL_MARGIN_MS = 1000;
+/** BRAIN-850 S3: a remote supervisor still alive this long after its cancel signal exits: the remote cancel, the post-abort join, the publish lock, and a margin. */
+export const remoteCancelExitDeadlineMs = () => remoteCancelDeadlineMs() + POST_ABORT_JOIN_MS + CANCELLING_LOCK_TIMEOUT_MS + CANCEL_MARGIN_MS;
+/** How long `lane cancel` waits on a live supervisor after its SIGTERM: the supervisor's exit deadline plus a margin. */
+export const cancelWaitMs = () => remoteCancelExitDeadlineMs() + 2 * CANCEL_MARGIN_MS;
+/** Exit code of a supervisor that gave up on a cancel it could not finish: the attempt, binding and cancel marker stay for the orphaned-remote path. */
+export const REMOTE_CANCEL_ABANDONED_EXIT = 74;
 
 /**
  * BRAIN-319 (.review-plan.md v3 C3/C4/C5): one durable ATTEMPT record per

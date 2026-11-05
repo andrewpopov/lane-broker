@@ -742,7 +742,34 @@ export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHom
  * right before dispatch, and any failure after that puts it back at its original queue position and resolves
  * `{ fallback: true, rebindFailed: true }` -- a rebind never terminates a ticket by refusing it.
  */
+/**
+ * BRAIN-850 S3: a cancelled remote dispatch must make this process EXIT within `lane cancel`'s wait even if an await never settles
+ * (a hung exec channel, a lock that stays held). The record, binding and cancel marker stay: the state a SIGKILL leaves, which
+ * `lane cancel` and reconcile already settle as an orphaned remote. Armed per dispatch (initial and rebind), so no caller can miss it.
+ */
 async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind = null, cpuLimit) {
+  let exitTimer = null;
+  const arm = () => {
+    if (exitTimer) return;
+    exitTimer = setTimeout(() => {
+      const line = `lane: remote: ${enriched.id}: cancel did not finish within ${remoteCancelExitDeadlineMs()}ms; exiting ${REMOTE_CANCEL_ABANDONED_EXIT} and leaving the attempt for lane cancel to settle\n`;
+      process.stderr.write(line);
+      writeBrokerLog(root, line);
+      process.exit(REMOTE_CANCEL_ABANDONED_EXIT);
+    }, remoteCancelExitDeadlineMs());
+    exitTimer.unref();
+  };
+  if (abortSignal.aborted) arm();
+  else abortSignal.addEventListener('abort', arm, { once: true });
+  try {
+    return await dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind, cpuLimit);
+  } finally {
+    abortSignal.removeEventListener('abort', arm);
+    clearTimeout(exitTimer);
+  }
+}
+
+async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind, cpuLimit) {
   const attemptStartedAt = Date.now();
   // BRAIN-850 S3: once cancelled, a lock write fails fast (the process then exits with the attempt kept) instead of retrying contention forever
   const whileCancelling = () => (abortSignal.aborted ? { lockTimeoutMs: CANCELLING_LOCK_TIMEOUT_MS } : {});
@@ -1614,26 +1641,10 @@ async function main() {
   // site regardless of which phase (remote-dispatch, queued, or a running
   // local child) the cancellation actually lands in. `onCancelSignal`
   // (below) deliberately does NOT duplicate this write.
-  // BRAIN-850 S3: a cancelled remote dispatch must make this process EXIT within `lane cancel`'s grace even if an await below never
-  // settles (a hung exec channel, a lock that stays held). The record, binding and cancel marker stay: the state a SIGKILL leaves,
-  // which `lane cancel` and reconcile already settle as an orphaned remote.
-  let remoteDispatchInFlight = false;
-  let cancelExitTimer = null;
-  const armRemoteCancelDeadline = () => {
-    if (!remoteDispatchInFlight || cancelExitTimer) return;
-    cancelExitTimer = setTimeout(() => {
-      const line = `lane: remote: ${ticket.id}: cancel did not finish within ${remoteCancelExitDeadlineMs()}ms; exiting ${REMOTE_CANCEL_ABANDONED_EXIT} and leaving the attempt for lane cancel to settle\n`;
-      process.stderr.write(line);
-      writeBrokerLog(root, line);
-      process.exit(REMOTE_CANCEL_ABANDONED_EXIT);
-    }, remoteCancelExitDeadlineMs());
-    cancelExitTimer.unref();
-  };
   const onFirstCancelSignal = () => {
     cancelledBeforeStart = true;
     writeCancelMarkerFile(root, ticket.id);
     abortController.abort();
-    armRemoteCancelDeadline();
   };
   process.on('SIGTERM', onFirstCancelSignal);
   process.on('SIGINT', onFirstCancelSignal);
@@ -1655,14 +1666,11 @@ async function main() {
   if (ticket.remote) {
     enterPhase('remote');
     let outcome;
-    remoteDispatchInFlight = true;
     try {
       outcome = await runRemoteAttempt(root, enriched, globalCfg, abortController.signal, null, cpuLimit);
     } catch (err) {
       if (!(err instanceof MigrationInProgressError)) throw err;
       return exitMigrating(err);
-    } finally {
-      remoteDispatchInFlight = false;
     }
     if (!outcome.fallback) return; // terminal outcome: runRemoteAttempt already called process.exit()
     attemptGeneration = outcome.attemptGeneration;

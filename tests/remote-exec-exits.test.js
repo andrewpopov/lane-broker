@@ -8,6 +8,7 @@ import { spawn } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, BIN } from './helpers.js';
 import { encodeSnapshot } from '../src/remote-stream.js';
 import { makeTmpDir } from './helpers/tmp.js';
+import { paths } from '../src/state.js';
 
 /** BRAIN-850 S1: `lane remote-exec` exits once its result is published, even with a live handle holding the event loop. */
 
@@ -18,8 +19,8 @@ afterEach(() => {
   for (const child of children.splice(0)) child.kill('SIGKILL');
 });
 
-function runExec(gzip) {
-  const f = freshEnv({ LANE_BROKER_TEST_RETAIN_HANDLE: '1', LANE_BROKER_TEST_CANCEL_GRACE_MS: '1000' });
+function runExec(gzip, { env = {}, readStdout = true } = {}) {
+  const f = freshEnv({ LANE_BROKER_TEST_RETAIN_HANDLE: '1', LANE_BROKER_TEST_CANCEL_GRACE_MS: '1000', ...env });
   writeGlobalConfig(f.home, {});
   const root = makeTmpDir('exec-exits-root-');
   const dir = makeTmpDir('exec-exits-src-');
@@ -39,7 +40,7 @@ function runExec(gzip) {
   const child = spawn(process.execPath, args, { env: f.env });
   children.push(child);
   let out = '';
-  child.stdout.on('data', (d) => (out += d));
+  if (readStdout) child.stdout.on('data', (d) => (out += d));
   child.stderr.on('data', () => {});
   const snapshot = encodeSnapshot(dir, header, entries);
   (gzip ? snapshot.pipe(zlib.createGzip()) : snapshot).pipe(child.stdin);
@@ -62,3 +63,10 @@ for (const gzip of [false, true]) {
     assert.ok(r.out.includes('y'.repeat(TAIL_BYTES) + 'END'), `stdout lost the ${TAIL_BYTES}-byte tail (got ${r.out.length} bytes)`);
   });
 }
+
+test('remote-exec whose stdout is never read records the flush timeout in the broker log and keeps its exit code', { timeout: 60_000 }, async () => {
+  const r = await runExec(false, { env: { LANE_BROKER_TEST_FLUSH_MS: '500' }, readStdout: false });
+  assert.equal(r.timedOut, false, 'remote-exec did not exit after the flush bound');
+  assert.equal(r.code, 0);
+  assert.match(fs.readFileSync(paths(r.root).admissionLog, 'utf8'), /stdout\/stderr did not flush within 500ms/);
+});

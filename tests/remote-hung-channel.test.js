@@ -15,7 +15,7 @@ import { buildManifest } from '../src/remote-manifest.js';
 const GRACE_MS = 300;
 const T = { timeout: 30_000 };
 
-function makeHungSsh({ closeAfterMs = null, stdoutText = '' } = {}) {
+function makeHungSsh({ closeAfterMs = null, stdoutText = '', resultCallsMax = null, holdPipesMs = null } = {}) {
   const dir = tmpDir('hung-channel-ssh');
   const recordPath = path.join(dir, 'record.json');
   const logPath = path.join(dir, 'calls.log');
@@ -28,6 +28,8 @@ const cmd = process.argv.slice(2).filter((a) => !a.startsWith('-o') && a !== '-o
 const log = (w) => fs.appendFileSync(${JSON.stringify(logPath)}, w + '\\n');
 if (cmd.includes('remote-exec')) {
   log('exec');
+  // a grandchild holding the inherited pipes open: SIGKILL ends ssh itself but its close event does not arrive until the grandchild exits
+  if (${holdPipesMs === null ? 'false' : 'true'}) fs.writeFileSync(${JSON.stringify(path.join(dir, 'holder.pid'))}, String(require('child_process').spawn('sleep', ['${Math.ceil((holdPipesMs ?? 0) / 1000)}'], { stdio: 'inherit' }).pid));
   process.stdin.resume();
   process.stdin.on('end', () => {
     if (${JSON.stringify(stdoutText)}) process.stdout.write(${JSON.stringify(stdoutText)});
@@ -36,6 +38,8 @@ if (cmd.includes('remote-exec')) {
   });
 } else if (cmd.includes('remote-result')) {
   log('result');
+  // after this many served fetches every further result query fails like a dead transport
+  if (${resultCallsMax === null ? 'false' : 'true'} && fs.readFileSync(${JSON.stringify(logPath)}, 'utf8').split('\\n').filter((l) => l === 'result').length > ${resultCallsMax ?? 0}) process.exit(255);
   const body = fs.existsSync(${JSON.stringify(recordPath)}) ? fs.readFileSync(${JSON.stringify(recordPath)}, 'utf8') : '';
   if (body) process.stdout.write(body + '\\n'); else process.stdout.write(JSON.stringify({ protocol: 1, missing: true, state: 'running', phase: 'admitted' }) + '\\n');
 } else if (cmd.includes('remote-cancel')) {
@@ -46,7 +50,14 @@ if (cmd.includes('remote-exec')) {
   );
   fs.chmodSync(sshBin, 0o755);
   const calls = () => (fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8').split('\n').filter(Boolean) : []);
-  return { sshBin, calls, publish: (record) => fs.writeFileSync(recordPath, JSON.stringify(record)) };
+  const releaseHolder = () => {
+    try {
+      process.kill(Number(fs.readFileSync(path.join(dir, 'holder.pid'), 'utf8')), 'SIGKILL');
+    } catch {
+      // never started or gone
+    }
+  };
+  return { sshBin, calls, releaseHolder, publish: (record) => fs.writeFileSync(recordPath, JSON.stringify(record)) };
 }
 
 /** Starts a dispatch against the hung ssh. `record` is a function of the bound result; it is published before the dispatch starts unless null. */
@@ -171,4 +182,26 @@ test('an abort during the grace is the cancelled path, not the fallback', T, asy
   const result = await finish(run, { expectSettled: false });
   assert.equal(result.outcome, 'cancelled', JSON.stringify(result));
   assert.doesNotMatch(run.err(), /did not close/);
+});
+
+test('an observer-settled completion stays confirmed with its exit when every later fetch fails', T, async () => {
+  const ssh = makeHungSsh({ resultCallsMax: 2 });
+  const result = await finish(startDispatch({ record: (b) => ({ ...b, exit: 7 }), ssh }));
+  assert.equal(result.outcome, 'confirmed', JSON.stringify(result));
+  assert.equal(result.exitCode, 7);
+});
+
+test('an abort whose ssh close never arrives still returns cancelled within the post-abort bound', T, async () => {
+  const ssh = makeHungSsh({ holdPipesMs: 20_000 });
+  const run = startDispatch({ record: null, ssh });
+  try {
+    await sleep(800);
+    const abortedAt = Date.now();
+    run.abort.abort();
+    const result = await finish(run, { expectSettled: false });
+    assert.equal(result.outcome, 'cancelled', JSON.stringify(result));
+    assert.ok(Date.now() - abortedAt < 8000, `cancelled only after ${Date.now() - abortedAt}ms, waiting on a close that never came`);
+  } finally {
+    ssh.releaseHolder();
+  }
 });
