@@ -17,7 +17,7 @@ import { resolveClasses, classEnforcementOf, bookedSims, classQueuePolicy, capSi
 import { reconcileSimArm, touchSimArmFor } from './sim-arm.js';
 import { advanceHwm } from './priority-clock.js';
 import { isExclusive, exclusiveDeny, isExclusiveHead, exclusiveLeaseFields, withoutBackfillExclusives, clampQueuedWeight } from './exclusive.js';
-import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, resolveLaneNice, effectiveNice, effectiveRank, score, tierRank, waitedMs } from './priority.js';
+import { DEFAULT_PRIORITY, isPriorityTier, originOrNow, priorityOf, resolveLaneNice, effectiveNice, effectiveRank, score, starvationHorizonMs, tierRank, waitedMs } from './priority.js';
 import { loadExpressTable, expressVerdict, bypassVerdict, expressAdmissionsLastMinute, recordExpressAdmission, logExpressAdmission } from './express.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { isRepeatOfPush, pushOrder, pushHolds } from './push-gate.js';
@@ -1669,11 +1669,14 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // BRAIN-418: only the head's own denial can declare its reservation futile; a candidate's poll reads the verdict
     // the head's latest denial recorded. Only a CPU-projection or memory denial is judged: a closed gate, a cooldown or an unavailable sample is not the
     // head's own arithmetic, so those keep today's handling.
+    // BRAIN-805: past the starvation horizon a projected verdict stops excusing backfill, or the head never earns its reservation.
+    const agedProjection = held.length > 0 && waitedMs(headTicket, nowEff) >= starvationHorizonMs(cfg);
     const headFutile =
-      cfg.schedulerMode === 'active' && ticket.id === headTicket.id && !headConflicted && !cpuDecision.admit && (cpuDecision.cpuReason === 'projected-over-budget' || cpuDecision.cpuReason === 'ok')
+      cfg.schedulerMode === 'active' && ticket.id === headTicket.id && !headConflicted && !agedProjection && !cpuDecision.admit && (cpuDecision.cpuReason === 'projected-over-budget' || cpuDecision.cpuReason === 'ok')
         ? headFutility(cfg, headTicket, held, cpuSample, cpuDecision, memInfo, now)
         : null;
-    const futileView = headFutile ?? (resourceFutile(resourceRecord, cfg, now) ? { cause: resourceRecord.futile, headCpu: resourceRecord.headCpu } : null);
+    const ownAgedPoll = agedProjection && ticket.id === headTicket.id;
+    const futileView = headFutile ?? (!ownAgedPoll && resourceFutile(resourceRecord, cfg, now) ? { cause: resourceRecord.futile, headCpu: resourceRecord.headCpu } : null);
     if (shadow.inputs) {
       // what the LIVE evaluation that decided the outcome produced (after any elastic retry: same clock reads,
       // same charges), copied out, with the memory observation and its time, for the post-lock evaluator
