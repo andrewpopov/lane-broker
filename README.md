@@ -1150,6 +1150,12 @@ records nothing, yet its job may still be running (BRAIN-515). The one exception
 `remoteResultWaitMs`): it cancels the remote command and confirms that before any local retry, so the retry is sequential, not a
 concurrent second run.
 
+**A published result ends the dispatch (BRAIN-850).** While the client waits on the exec channel it polls the runner's result;
+once a terminal record bound to this ticket (id, generation, manifest hash, protocol phase) has stood for `remoteChannelGraceMs`
+(default 60000, 0 disables) the client kills its ssh, settles from that record and prints `remote channel from <runner> did not
+close ...; settled from the published result (output may be truncated)`. A record that does not bind is never terminal. The
+runner ends the channel too: `remote-exec` flushes its output and exits once it has published its result.
+
 **Dead supervisor before admission (BRAIN-605, BRAIN-494).** An attempt with `executor: local` (a remote attempt that fell back, or
 a rebind that stayed in the local queue) whose supervisor is dead, with no lease, queue entry or parked ticket, can never
 produce a result. `lane reconcile` (and `lane wait`) settle it: exit 75, `reason: supervisor-died-while-queued`, the

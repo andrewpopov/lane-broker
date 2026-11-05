@@ -1221,6 +1221,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       ...classTransport(enriched, resolveClasses(globalCfg, root)),
       priorityAccruedMs: waitedMs(enriched, effectiveNow(root)),
       resultWaitMs: globalCfg.remoteResultWaitMs,
+      channelGraceMs: globalCfg.remoteChannelGraceMs,
       // BRAIN-437: a runner that can withdraw lets a dropped connection prove the job never started; one that cannot leaves it possibly running
       canWithdraw,
       onStdout: current(onStdout),
