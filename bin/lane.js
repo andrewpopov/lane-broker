@@ -419,8 +419,10 @@ async function main() {
         process.stderr.write(`lane remote-exec: ${cacheFlag.reason}\n`);
         return 2;
       }
+      if (process.env.LANE_BROKER_TEST_RETAIN_HANDLE) setInterval(() => {}, 1000);
       const result = await remoteExecCommand({ root, transfer: flag.transfer, transferCache: cacheFlag.transferCache });
-      return result.exitCode;
+      await flushStdio();
+      process.exit(result.exitCode);
     }
     case 'remote-have': {
       const result = await remoteHaveCommand({ root: parseRootFlag(rest) || defaultRemoteRoot() });
@@ -482,6 +484,26 @@ async function main() {
       process.stderr.write(`lane: unknown command "${sub}"\n\n${usage()}`);
       return 2;
   }
+}
+
+// A runner's remote-exec has published its result by the time it returns; an unidentified live handle must not keep the
+// ssh channel open (BRAIN-850). Flush both streams (bounded, EPIPE tolerated) so no output is truncated, then the caller exits.
+async function flushStdio(timeoutMs = 5000) {
+  const flush = (stream) =>
+    new Promise((resolve) => {
+      stream.on('error', () => resolve());
+      try {
+        stream.write('', () => resolve());
+      } catch {
+        resolve();
+      }
+    });
+  let timer;
+  const bound = new Promise((resolve) => {
+    timer = setTimeout(resolve, timeoutMs);
+  });
+  await Promise.race([Promise.all([flush(process.stdout), flush(process.stderr)]), bound]);
+  clearTimeout(timer);
 }
 
 main()
