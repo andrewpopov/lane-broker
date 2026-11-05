@@ -570,6 +570,17 @@ function pipeSnapshot(child, stream, deadlineMs, abortSignal) {
 
 /** Resolve once `child` has closed, killing it immediately on `abortSignal` (BRAIN-319:
  *  a caller must never fall through to "unconfirmed" after asking to cancel). */
+const POST_ABORT_JOIN_MS = 1500;
+
+/** Resolves `ms` after `signal` aborts (immediately counted if already aborted); the timer is unref'd and cleared never, so it cannot hold the process. */
+function afterAbort(signal, ms) {
+  return new Promise((resolve) => {
+    const start = () => setTimeout(resolve, ms).unref();
+    if (signal.aborted) start();
+    else signal.addEventListener('abort', start, { once: true });
+  });
+}
+
 function waitClosed(child, abortSignal) {
   return new Promise((resolve) => {
     if (child.exitCode !== null || child.signalCode !== null) {
@@ -1271,6 +1282,10 @@ async function dispatchOnce(opts) {
     }
   }
   const closed = waitClosed(child, abortSignal);
+  // BRAIN-850 S3: after an abort these joins must not outlive the cancel; the unbounded wait is unchanged when nothing aborts
+  const untilAbortedFor = (promise, fallback) => (abortSignal
+    ? Promise.race([promise, afterAbort(abortSignal, POST_ABORT_JOIN_MS).then(() => fallback)])
+    : promise);
   let move = null;
   const state = { runner, epoch: 1, attemptedTarget: null, attemptedReason: null, queuedSince: null };
   let sessionEnded = false;
@@ -1318,15 +1333,15 @@ async function dispatchOnce(opts) {
     } finally {
       sessionClosed = true;
       watchAbort.abort();
-      move = await settled.catch(() => null);
-      channelHung = await hung.catch(() => false);
-      if (!channelHung) await closed;
+      move = await untilAbortedFor(settled.catch(() => null), null);
+      channelHung = await untilAbortedFor(hung.catch(() => false), false);
+      if (!channelHung) await untilAbortedFor(closed, null);
     }
   } else {
-    await closed;
+    await untilAbortedFor(closed, null);
   }
 
-  await reporter?.settled();
+  if (reporter) await untilAbortedFor(reporter.settled(), null);
 
   if (abortSignal && abortSignal.aborted) {
     return cancelledOutcome();

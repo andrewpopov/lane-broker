@@ -2,6 +2,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, kernelBootId, isCancelled, assertNotMigrating, listJsonRecordsStrict } from './state.js';
 import { isProcessAlive, processStartTime } from './process-liveness.js';
+import { cancelGraceMs } from './descendants.js';
+
+/** How long `lane cancel` waits on a live supervisor after its SIGTERM. */
+export const cancelWaitMs = () => cancelGraceMs() + 5000;
+/** BRAIN-850 S3: a remote supervisor still alive this long after its cancel signal exits, so `lane cancel` is never left waiting out its own grace. */
+export const remoteCancelExitDeadlineMs = () => cancelWaitMs() - 2000;
+/** Exit code of a supervisor that gave up on a cancel it could not finish: the attempt, binding and cancel marker stay for the orphaned-remote path. */
+export const REMOTE_CANCEL_ABANDONED_EXIT = 74;
+/** Lock acquire bound for the writes a cancelling supervisor makes: failing fast lets it exit instead of retrying contention forever. */
+export const CANCELLING_LOCK_TIMEOUT_MS = 3000;
 
 /**
  * BRAIN-319 (.review-plan.md v3 C3/C4/C5): one durable ATTEMPT record per
@@ -177,7 +187,7 @@ export function patchAttemptLocked(root, id, patch) {
 /** Apply `patch` to the stored record, but only if its generation is still
  *  exactly `expectedGeneration` -- the fence against a stale writer acting
  *  on state that has since moved on (e.g. already fell back to local). */
-export async function updateAttempt(root, id, expectedGeneration, patch, { refuseWhileMigrating = false } = {}) {
+export async function updateAttempt(root, id, expectedGeneration, patch, { refuseWhileMigrating = false, lockTimeoutMs } = {}) {
   return withLock(root, () => {
     // BRAIN-380: the intake check and the write are one locked step, so a migration cannot start between them.
     if (refuseWhileMigrating) assertNotMigrating(root);
@@ -188,7 +198,7 @@ export async function updateAttempt(root, id, expectedGeneration, patch, { refus
     const next = { ...current, ...patch };
     atomicWriteJson(attemptFile(root, id), next);
     return { ok: true, attempt: next };
-  });
+  }, { timeoutMs: lockTimeoutMs });
 }
 
 /**
@@ -257,7 +267,7 @@ function assertSyncWriter(returned) {
   }
 }
 
-export async function publishTerminal(root, id, generation, resultWriterFn, { expect } = {}) {
+export async function publishTerminal(root, id, generation, resultWriterFn, { expect, lockTimeoutMs } = {}) {
   return withLock(root, () => {
     const current = readAttempt(root, id);
     if (!current) {
@@ -277,5 +287,5 @@ export async function publishTerminal(root, id, generation, resultWriterFn, { ex
     assertSyncWriter(resultWriterFn({ cancelled: false }));
     removeAttempt(root, id);
     return { ok: true, cancelled: false };
-  });
+  }, { timeoutMs: lockTimeoutMs });
 }

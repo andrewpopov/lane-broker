@@ -3,7 +3,7 @@ import { ensureStateDirs, paths, appendHistory, atomicWriteJson, withLock, write
 import { readLease, removeLease, isSupervisorAlive, isGroupAlive } from './lease.js';
 import { dequeueSync, listQueue } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
-import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult } from './attempts.js';
+import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult, cancelWaitMs } from './attempts.js';
 import { terminalRowDefaults } from './resources.js';
 import { remoteCancel } from './remote-client.js';
 import { loadGlobalConfigOrError } from './config.js';
@@ -78,11 +78,15 @@ export async function cancelAttempt(root, id, attempt) {
     } catch {
       // race: supervisor just exited
     }
-    const deadline = Date.now() + cancelGraceMs() + 5000;
+    const deadline = Date.now() + cancelWaitMs();
     while (Date.now() < deadline && readAttempt(root, id) && supervisorAlive(readAttempt(root, id))) {
       await sleep(100);
     }
     const stillHeld = readAttempt(root, id);
+    if (stillHeld && !supervisorAlive(stillHeld) && !stillHeld.unresolved) {
+      // BRAIN-850 S3: the supervisor died (or abandoned a cancel it could not finish) leaving its record, which is an orphaned remote: finish here.
+      return cancelAttempt(root, id, stillHeld);
+    }
     if (stillHeld && !supervisorAlive(stillHeld)) {
       // The supervisor exited on purpose and kept the record: the runner never confirmed the cancel.
       process.stderr.write(`lane cancel: ${id} is still held: ${stillHeld.unresolved ?? 'its remote cancel was not confirmed'}; retry lane cancel once the runner is reachable\n`);

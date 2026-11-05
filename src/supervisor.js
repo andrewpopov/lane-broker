@@ -58,7 +58,7 @@ import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remo
 import { DEPS_KEY_FILES_CAPABILITY, EXECUTION_CEILING_CAPABILITY, REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
 import { SNAPSHOT_GZIP_CAPABILITY, TRANSFER_GZIP } from './remote-gzip.js';
 import { BLOB_CACHE_CAPABILITY } from './remote-blobs.js';
-import { createAttempt, readAttempt, updateAttempt, runnerPhaseRecorder, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
+import { createAttempt, readAttempt, updateAttempt, runnerPhaseRecorder, fallbackToLocal, publishTerminal, remoteCancelledResult, remoteCancelExitDeadlineMs, REMOTE_CANCEL_ABANDONED_EXIT, CANCELLING_LOCK_TIMEOUT_MS } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX, hostCpuLoad, ticketCpuEstimate } from './admission.js';
 import { relayedUsage, relayedDeps, relayedTransfer, snapshotLine } from './remote-relay.js';
 import { maybeDailyGc } from './gc.js';
@@ -744,6 +744,8 @@ export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHom
  */
 async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind = null, cpuLimit) {
   const attemptStartedAt = Date.now();
+  // BRAIN-850 S3: once cancelled, a lock write fails fast (the process then exits with the attempt kept) instead of retrying contention forever
+  const whileCancelling = () => (abortSignal.aborted ? { lockTimeoutMs: CANCELLING_LOCK_TIMEOUT_MS } : {});
   // the attempt generation every fence below acts on: 0 for a first attempt, the fallback's generation for a rebind
   const gen = rebind ? rebind.generation : 0;
   let withdrawn = null;
@@ -800,7 +802,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     const published = await publishTerminal(root, enriched.id, generation, ({ cancelled }) => {
       finalResult = cancelled ? remoteCancelledResult(enriched.id, attemptStartedAt) : buildConfirmedResult();
       writeResultSync(finalResult);
-    });
+    }, whileCancelling());
     if (!published.ok) {
       // Generation mismatch: unreachable on every call site below (nothing
       // else advances this attempt's generation while this supervisor is
@@ -833,7 +835,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       const line = `lane: remote-rebind: ${enriched.id}: ${where}: ${reason} — outcome unknown, the job may be running there; not re-running it locally (see lane status, lane cancel)\n`;
       process.stderr.write(line);
       writeBrokerLog(root, line);
-      await updateAttempt(root, enriched.id, gen, { unresolved: reason });
+      await updateAttempt(root, enriched.id, gen, { unresolved: reason }, whileCancelling());
       await logWriter.finish();
       process.exit(1);
       return { fallback: false };
@@ -1478,7 +1480,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     const line = `lane: remote: ${enriched.id}: ${reason} (see lane status, lane cancel)\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);
-    await updateAttempt(root, enriched.id, gen, { unresolved: reason });
+    await updateAttempt(root, enriched.id, gen, { unresolved: reason }, whileCancelling());
     await logWriter.finish();
     process.exit(1);
     return { fallback: false };
@@ -1612,16 +1614,29 @@ async function main() {
   // site regardless of which phase (remote-dispatch, queued, or a running
   // local child) the cancellation actually lands in. `onCancelSignal`
   // (below) deliberately does NOT duplicate this write.
-  process.on('SIGTERM', () => {
+  // BRAIN-850 S3: a cancelled remote dispatch must make this process EXIT within `lane cancel`'s grace even if an await below never
+  // settles (a hung exec channel, a lock that stays held). The record, binding and cancel marker stay: the state a SIGKILL leaves,
+  // which `lane cancel` and reconcile already settle as an orphaned remote.
+  let remoteDispatchInFlight = false;
+  let cancelExitTimer = null;
+  const armRemoteCancelDeadline = () => {
+    if (!remoteDispatchInFlight || cancelExitTimer) return;
+    cancelExitTimer = setTimeout(() => {
+      const line = `lane: remote: ${ticket.id}: cancel did not finish within ${remoteCancelExitDeadlineMs()}ms; exiting ${REMOTE_CANCEL_ABANDONED_EXIT} and leaving the attempt for lane cancel to settle\n`;
+      process.stderr.write(line);
+      writeBrokerLog(root, line);
+      process.exit(REMOTE_CANCEL_ABANDONED_EXIT);
+    }, remoteCancelExitDeadlineMs());
+    cancelExitTimer.unref();
+  };
+  const onFirstCancelSignal = () => {
     cancelledBeforeStart = true;
     writeCancelMarkerFile(root, ticket.id);
     abortController.abort();
-  });
-  process.on('SIGINT', () => {
-    cancelledBeforeStart = true;
-    writeCancelMarkerFile(root, ticket.id);
-    abortController.abort();
-  });
+    armRemoteCancelDeadline();
+  };
+  process.on('SIGTERM', onFirstCancelSignal);
+  process.on('SIGINT', onFirstCancelSignal);
 
   let attemptGeneration = null;
   let fallbackReason;
@@ -1640,11 +1655,14 @@ async function main() {
   if (ticket.remote) {
     enterPhase('remote');
     let outcome;
+    remoteDispatchInFlight = true;
     try {
       outcome = await runRemoteAttempt(root, enriched, globalCfg, abortController.signal, null, cpuLimit);
     } catch (err) {
       if (!(err instanceof MigrationInProgressError)) throw err;
       return exitMigrating(err);
+    } finally {
+      remoteDispatchInFlight = false;
     }
     if (!outcome.fallback) return; // terminal outcome: runRemoteAttempt already called process.exit()
     attemptGeneration = outcome.attemptGeneration;
