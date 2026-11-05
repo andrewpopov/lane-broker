@@ -1283,9 +1283,10 @@ async function dispatchOnce(opts) {
     }
   }
   const closed = waitClosed(child, abortSignal);
-  // BRAIN-850 S3: after an abort these joins must not outlive the cancel; the unbounded wait is unchanged when nothing aborts
-  const untilAbortedFor = (promise, fallback) => (abortSignal
-    ? Promise.race([promise, afterAbort(abortSignal, POST_ABORT_JOIN_MS).then(() => fallback)])
+  // BRAIN-850: every post-abort join shares this one window, so sequential joins cannot outlive the cancel deadline budget
+  const sharedPostAbortWindow = abortSignal ? afterAbort(abortSignal, POST_ABORT_JOIN_MS) : null;
+  const untilAbortedFor = (promise, fallback) => (sharedPostAbortWindow
+    ? Promise.race([promise, sharedPostAbortWindow.then(() => fallback)])
     : promise);
   let move = null;
   const state = { runner, epoch: 1, attemptedTarget: null, attemptedReason: null, queuedSince: null };

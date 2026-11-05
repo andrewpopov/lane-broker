@@ -1162,7 +1162,15 @@ concurrent second run.
 once a terminal record bound to this ticket (id, generation, manifest hash, protocol phase) has stood for `remoteChannelGraceMs`
 (default 60000, 0 disables) the client kills its ssh, settles from that record and prints `remote channel from <runner> did not
 close ...; settled from the published result (output may be truncated)`. A record that does not bind is never terminal. The
-runner ends the channel too: `remote-exec` flushes its output and exits once it has published its result.
+runner ends the channel too: `remote-exec` flushes its output (bounded at 60 s; a timeout is written to the runner's broker
+log) and exits once it has published its result.
+
+**A remote supervisor stops within `lane cancel`'s wait (BRAIN-850).** The deadlines nest, all derived in `src/attempts.js`:
+remote cancel 15 s (cancel grace + 5 s), then the post-abort joins (1.5 s) and the terminal lock write (3 s), so a supervisor
+SIGTERMed during any remote dispatch (initial or rebind) exits by 20.5 s. If its cancel has not finished by then it exits **74**
+and leaves the attempt, binding and cancel marker exactly as a `kill -KILL` would. `lane cancel` waits 22.5 s; once the
+supervisor it signalled is dead and the attempt is still held, it runs the orphaned-remote path in the same invocation, which
+removes the attempt only after every named runner confirms the cancel.
 
 **Dead supervisor before admission (BRAIN-605, BRAIN-494).** An attempt with `executor: local` (a remote attempt that fell back, or
 a rebind that stayed in the local queue) whose supervisor is dead, with no lease, queue entry or parked ticket, can never
