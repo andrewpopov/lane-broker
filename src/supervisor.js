@@ -647,7 +647,7 @@ function externalCpuSlotsFor(root, enriched, globalCfg) {
  * its measured speed ratio, plus dispatch overhead and, if it too is queued, that queue). One decision, with both estimates.
  * BRAIN-596: host load outside any lease that leaves no admissible slot makes the local wait unbounded, so an unqueued runner wins.
  */
-function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, probe, queuedChoice, waitedMs = 0, forceLocalBlocked = false) {
+function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, probe, queuedChoice, waitedMs = 0, forceLocalBlocked = false, heldByKey = null) {
   const queue = listQueue(root).filter(Boolean);
   const own = queue.findIndex((t) => t.id === enriched.id);
   const ahead = own === -1 ? queue : queue.slice(0, own);
@@ -661,6 +661,7 @@ function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, pr
       localAdmitsNow: false,
       localWaitMs: localWaitMs({ aheadEstimatesMs: ahead.map((t) => localRunEstimateMs(rows, t.repoId, t.lane) ?? estimateMs), estimateMs, slots, waitedMs }),
       localBlocked,
+      localHeldByKey: Boolean(heldByKey),
       estimateMs,
       runnerRatio: ratio,
       overheadMs: DEFAULT_REMOTE_OVERHEAD_MS + runnerQueueMs,
@@ -669,8 +670,12 @@ function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, pr
     ratioTier: evidence.tier,
     ratioPairs: evidence.pairs,
     localBlocked,
+    heldByKey,
   };
 }
+
+/** The decision-log suffix naming why local was written off (host CPU load, or BRAIN-839 a same-key holder). */
+const localBlockNote = (decision) => (decision.localBlocked ? ', local blocked by host CPU load' : decision.choice === 'remote' && decision.heldByKey ? `, local held by same-key holder ${decision.heldByKey}` : '');
 
 /** One admission-decisions line per speed-aware decision, timestamped, carrying both estimates. */
 function logSpeedDecision(root, enriched, choice, detail) {
@@ -973,8 +978,10 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     speed = null;
     logSpeedDecision(root, enriched, 'remote', `speed-aware: local skipped (no node_modules for remoteDeps ${lackingDeps.join(', ')})`);
   }
+  let heldByKey = null;
   if (speed) {
     const local = await couldAdmitNow(root, globalCfg, enriched);
+    heldByKey = local.heldByKey ?? null;
     if (local.admit) {
       logSpeedDecision(root, enriched, 'local', `admits now, local estimate ${seconds(speed.estimateMs)}`);
       return fallbackOrRefuse(null, 'speed-aware: local admits now', { rebindable: true });
@@ -1013,8 +1020,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   }
 
   if (speed && !busyQueuedAt) {
-    const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true);
-    logSpeedDecision(root, enriched, decision.choice, `local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)}, ${decision.ratioTier} n=${decision.ratioPairs}${decision.localBlocked ? ', local blocked by host CPU load' : ''})`);
+    const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true, 0, false, heldByKey);
+    logSpeedDecision(root, enriched, decision.choice, `local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)}, ${decision.ratioTier} n=${decision.ratioPairs}${localBlockNote(decision)})`);
     if (decision.choice === 'local') return fallbackOrRefuse(null, 'speed-aware: local finishes sooner', { rebindable: true });
   }
 
@@ -1777,7 +1784,7 @@ async function main() {
    */
   const LOCAL_LOG_INTERVAL_MS = 10 * 60_000;
   let lastLocalLogAt = 0;
-  async function tryRebind(localBlocked = false) {
+  async function tryRebind(localBlocked = false, heldByKey = null) {
     // A ticket never goes back to a runner it left, was refused by, or was ever dispatched to (nor to one it is on).
     const attempt = readAttempt(root, ticket.id);
     const left = new Set([...(attempt?.moves ?? []).flatMap((m) => [m.from, m.to]), ...(attempt?.refusedRunners ?? []), ...(attempt?.dispatchedRunners ?? [])]);
@@ -1791,7 +1798,7 @@ async function main() {
     // BRAIN-548: a speed-aware ticket moves only when the runner is now expected to finish it sooner than waiting here does.
     const speed = speedInputs(root, enriched);
     if (speed) {
-      const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true, waitedMs, localBlocked);
+      const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true, waitedMs, localBlocked, heldByKey);
       if (decision.choice === 'local') {
         // BRAIN-556: make a ticket that keeps staying local visible, at most once per 10 min
         if (Date.now() - lastLocalLogAt >= LOCAL_LOG_INTERVAL_MS) {
@@ -1800,7 +1807,7 @@ async function main() {
         }
         return;
       }
-      logSpeedDecision(root, enriched, 'remote', `rebind: local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)}, ${decision.ratioTier} n=${decision.ratioPairs}${decision.localBlocked ? ', local blocked by host CPU load' : ''})`);
+      logSpeedDecision(root, enriched, 'remote', `rebind: local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)}, ${decision.ratioTier} n=${decision.ratioPairs}${localBlockNote(decision)})`);
     }
     if (localBlocked) {
       const line = `lane: remote-rebind: ${enriched.id}: local blocked: no CPU slot beside external load — moving to ${runner.name}\n`;
@@ -1954,7 +1961,7 @@ async function main() {
     if (rebindDue && (rebindable || localBlocked) && (Date.now() >= rebindNotBefore || localBlocked)) {
       nextRebindAt = Date.now() + globalCfg.remoteRebindIntervalMs;
       try {
-        await tryRebind(localBlocked);
+        await tryRebind(localBlocked, started.localHeldByKey ?? null);
       } catch (err) {
         if (!(err instanceof MigrationInProgressError)) throw err;
         return exitMigrating(err);
