@@ -13,7 +13,7 @@ import { isPidAlive } from '../src/lease.js';
  * BRAIN-850 S3: a supervisor running a REMOTE ticket stops within `lane cancel`'s grace after SIGTERM. The wrapper ssh below
  * sits ahead of the harness's fake ssh and misbehaves on `remote-cancel` per its mode file: `hang-first` hangs only the first
  * call (the supervisor's) with a grandchild holding its pipes open, so even the deadline kill of the call never yields its `close`,
- * `slow-first` answers the first call (genuinely, via the real ssh) only after 5 s, `fail` exits 255 on every call, anything else
+ * `slow-first` answers the first call (genuinely, via the real ssh) only after 2 s, `fail` exits 255 on every call, anything else
  * passes through. A `down` file makes every ssh call fail (a runner that is unreachable); a `probe-patch` file gives the runner room.
  *
  * Deadlines under the harness's 1 s cancel grace: remote cancel 6 s, supervisor exit deadline 11.5 s, `lane cancel` wait 13.5 s.
@@ -54,7 +54,7 @@ if (mode === 'fail') process.exit(255);
 if (mode === 'hang-first' && calls === 1) {
   fs.writeFileSync(${JSON.stringify(holderPidFile)}, String(spawn('sleep', ['45'], { stdio: 'inherit' }).pid));
   setTimeout(() => process.exit(255), 45_000);
-} else if (mode === 'slow-first' && calls === 1) setTimeout(passThrough, 5000);
+} else if (mode === 'slow-first' && calls === 1) setTimeout(passThrough, 2000);
 else passThrough();
 `,
   );
