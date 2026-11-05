@@ -352,3 +352,21 @@ test('BRAIN-805 v2: the earned reservation gets a reservationSeq and is the acti
   assert.ok(Number.isFinite(stored.reservationSeq), 'reservationSeq assigned');
   assert.equal(effectiveView(listQueue(state), Date.now(), cfg, fairnessStore(state, sched.tickets)).ownerId, 'head');
 });
+
+test('BRAIN-805 transition: the head poll that crosses the horizon does not log the stale futile verdict', async () => {
+  const { state } = freshEnv();
+  const head = bigHead({ prioOriginAt: agedOrigin() });
+  await enqueue(state, head);
+  holdLease(state, 'lane-a', 1, observed(0.1, 0.5 * GIB));
+  const young = { ...cfg, priorityAgeMaxMs: 10 * cfg.priorityAgeMaxMs };
+  await poll(state, head, { ext: 0.2, mem: lowMemory, cfg: young });
+  assert.equal(readResourceSkipState(state).futile, 'memory', 'under the wider horizon the head is futile');
+
+  fs.writeFileSync(paths(state).admissionLog, '');
+  fs.rmSync(paths(state).admissionLast, { force: true }); // an unchanged decision is otherwise not logged again
+  await poll(state, head, { ext: 0.2, mem: lowMemory });
+  assert.equal(readResourceSkipState(state).futile, undefined, 'past the horizon the denial is ordinary');
+  const headLine = readLog(state).split('\n').find((l) => l.includes('candidate=head '));
+  assert.ok(headLine, 'the crossing poll writes a decision line');
+  assert.doesNotMatch(headLine, /reservation=futile/);
+});
