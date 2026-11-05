@@ -1673,6 +1673,28 @@ ending in strict FIFO for that head once spent:
   refused, never uncounted. `resourceSkipLimit: 0` restores strict FIFO for
   resource denials.
 
+  *Futile heads* (BRAIN-418). A head that would still be denied with every lane
+  lease drained (external load or memory alone rule it out, judged by the same
+  predicates with the held leases' observed CPU and RSS handed back) holds no
+  reservation and spends no allowance: backfill past it stays open, uncounted,
+  while its latest verdict is fresh, and each futile verdict resets its count.
+  With leases held that verdict is a *projection*, and on macOS (vm_stat
+  available memory, RSS that under-counts what a lane tree frees) it can be
+  wrong for hours. **An aged head is judged futile only on a drained broker**
+  (BRAIN-805): once a head has waited the starvation horizon (3 x
+  `priorityAgeMaxMs`, default 60 min, the same bound as "Priority" below), a
+  denial while lanes are held is recorded as an ordinary resource denial, so it
+  earns its reservation after `resourceSkipLimit` overtakes and the host drains
+  for it. With nothing held the verdict is a direct observation: if the head
+  still does not fit, it is futile again and backfill reopens until its next
+  ordinary denial, so a head that cannot fit this host costs throughput in
+  reserve-drain-retry cycles but cannot keep the runner from ever draining.
+  This bounds ordinary backfill only; the floor-slot and queue-bypass
+  exceptions above still apply, and it is not a start deadline. Moving a lane
+  that fits nowhere on this host is the submitter's rebalance, not this rule.
+  Seen on zirkbot 2026-11-03: a 6 GiB train lane was memory-futile on every poll
+  for 399 minutes while smaller lanes backfilled one after another.
+
 **Express admission** (BRAIN-551). A ticket expected to run under `expressMaxMs`
 (default 30000) starts past a waiting head as soon as it fits *now*, so a
 10-second check does not queue behind a 30-minute job. Expected run time is the
@@ -2306,6 +2328,10 @@ ticket is running or has finished (result, cancel, expire or withdraw marker), i
 submitter, is mid-rebind, has a dead supervisor, or has a queue record from before the priority scheduler or one that
 cannot be read. Exit codes are in the table below. **A remote ticket is refused (81): `lane cancel` it and resubmit with
 `--priority`.** Do not re-tier on the runner: a rebalance re-dispatches from the submitter's tier and would silently undo it.
+Forwarding a re-tier from the submitter to its runner was considered and declined (BRAIN-805): it needs an
+ownership-aware runner verb the protocol does not have (`queue-retier/1` only covers a ticket queued on that host), and
+the starvation that prompted it was a futile-head reservation bug, not a tier problem (the lane had already aged to the
+top score). Cancel and resubmit loses the ticket's queue age and any reservation it earned.
 
 **Rollout.** A waiting supervisor from an older version caches the tier it was submitted with and puts that tier in
 the header of a later rebind or rebalance dispatch, so a ticket re-tiered while such a supervisor waits can still go to a
