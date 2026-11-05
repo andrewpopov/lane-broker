@@ -1471,6 +1471,37 @@ test('workspace scripts key source bytes and reject source links outside the sna
   assert.match(refused.reason, /escapes the keyed source tree/);
 });
 
+test('workspace scripts key an in-tree dangling source link by its text', () => {
+  const f = makeWorkspaceKeyFixture({ lockPackages: workspaceLockPackages({
+    'node_modules/dotenv': { ...REGISTRY_ENTRY('17.0.0'), hasInstallScript: true },
+  }) });
+  const link = path.join(f.root, '.agents/skills/x');
+  fs.mkdirSync(path.dirname(link), { recursive: true });
+  fs.symlinkSync('../../.agent-brain/current/x', link);
+  const dangling = computeDepsKey(f.inputs());
+  assert.ok(dangling.key, dangling.reason);
+  fs.rmSync(link);
+  fs.symlinkSync('../../.agent-brain/current/y', link);
+  assert.notEqual(computeDepsKey(f.inputs()).key, dangling.key, 'the link text keys the tree');
+  fs.rmSync(link);
+  fs.symlinkSync('../../.agent-brain/current/x', link);
+  assert.equal(computeDepsKey(f.inputs()).key, dangling.key, 'same text, same key');
+  fs.mkdirSync(path.join(f.root, '.agent-brain/current/x'), { recursive: true });
+  const resolving = computeDepsKey(f.inputs());
+  assert.ok(resolving.key, resolving.reason);
+  assert.notEqual(resolving.key, dangling.key, 'creating the target changes the key');
+});
+
+test('workspace scripts refuse a dangling source link whose target is outside the snapshot', () => {
+  const f = makeWorkspaceKeyFixture({ lockPackages: workspaceLockPackages({
+    'node_modules/dotenv': { ...REGISTRY_ENTRY('17.0.0'), hasInstallScript: true },
+  }) });
+  fs.symlinkSync('../../../../nowhere', path.join(f.root, 'dangling-outside'));
+  const refused = computeDepsKey(f.inputs());
+  assert.equal(refused.key, null);
+  assert.match(refused.reason, /escapes the keyed source tree/);
+});
+
 test('workspace bin entry stays ineligible until its executable links can be recreated', () => {
   const f = makeWorkspaceKeyFixture();
   writeWorkspaceFile(f, 'packages/api/package.json', JSON.stringify({ name: '@x/api', bin: 'cli.js' }));

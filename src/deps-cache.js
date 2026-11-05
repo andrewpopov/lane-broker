@@ -528,12 +528,22 @@ function installSourceDigest(rootDir, roots = ['']) {
     const stat = fs.lstatSync(file);
     record(rel, Buffer.from(`${stat.mode & 0o7777}:`));
     if (stat.isSymbolicLink()) {
-      const target = fs.realpathSync(file);
+      const text = fs.readlinkSync(file);
+      let target;
+      let dangling = false;
+      try {
+        target = fs.realpathSync(file);
+      } catch (error) {
+        if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error;
+        // Nothing can be read through a dangling link, so its text is its whole content; an install creating the target is caught by the changed-files check.
+        target = path.resolve(path.dirname(file), text);
+        dangling = true;
+      }
       const destination = path.relative(root, target);
       if (destination.startsWith('..') || path.isAbsolute(destination) || destination.split(path.sep).some((part) => part === 'node_modules' || part === '.git')) {
         throw new Error(`install source link ${rel} escapes the keyed source tree`);
       }
-      record(`link:${rel}`, Buffer.from(fs.readlinkSync(file)));
+      record(`link:${rel}`, Buffer.from(dangling ? `dangling:${text}` : text));
     } else if (stat.isDirectory()) {
       walkChildren(rel);
     } else if (stat.isFile()) {
