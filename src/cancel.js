@@ -3,7 +3,7 @@ import { ensureStateDirs, paths, appendHistory, atomicWriteJson, withLock, write
 import { readLease, removeLease, isSupervisorAlive, isGroupAlive } from './lease.js';
 import { dequeueSync, listQueue } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
-import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult } from './attempts.js';
+import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult, cancelWaitMs } from './attempts.js';
 import { terminalRowDefaults } from './resources.js';
 import { remoteCancel } from './remote-client.js';
 import { loadGlobalConfigOrError } from './config.js';
@@ -70,23 +70,23 @@ async function killGroupOnly(pgid) {
  *    ordinary "nothing to cancel" branch above -- same as re-cancelling any
  *    already-finished ticket today.
  */
-export async function cancelAttempt(root, id, attempt) {
-  if (supervisorAlive(attempt)) {
+export async function cancelAttempt(root, id, attempt, { orphanOnly = false } = {}) {
+  if (!orphanOnly && supervisorAlive(attempt)) {
     writeCancelMarkerFile(root, id);
     try {
       process.kill(attempt.supervisor.pid, 'SIGTERM');
     } catch {
       // race: supervisor just exited
     }
-    const deadline = Date.now() + cancelGraceMs() + 5000;
+    const deadline = Date.now() + cancelWaitMs();
     while (Date.now() < deadline && readAttempt(root, id) && supervisorAlive(readAttempt(root, id))) {
       await sleep(100);
     }
     const stillHeld = readAttempt(root, id);
     if (stillHeld && !supervisorAlive(stillHeld)) {
-      // The supervisor exited on purpose and kept the record: the runner never confirmed the cancel.
-      process.stderr.write(`lane cancel: ${id} is still held: ${stillHeld.unresolved ?? 'its remote cancel was not confirmed'}; retry lane cancel once the runner is reachable\n`);
-      return { exitCode: 1 };
+      // BRAIN-850 S3: the supervisor died or abandoned a cancel it could not finish, leaving its record (even an `unresolved` one): an orphaned
+      // remote. The orphan path removes nothing without every named runner's confirmation, so it is safe; `orphanOnly` makes it a single pass.
+      return cancelAttempt(root, id, stillHeld, { orphanOnly: true });
     }
     if (stillHeld) {
       process.stderr.write(

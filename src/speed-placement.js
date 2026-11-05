@@ -123,12 +123,15 @@ export function localWaitMs({ aheadEstimatesMs, estimateMs, slots, waitedMs = 0 
 
 /**
  * Local vs the given runner: whichever finishes first. `runnerRatio` is the slowdown of the runner that would take the ticket;
- * a tie stays local (no snapshot to ship); `localBlocked` (BRAIN-596) sends it to the runner outright. Returns the choice with both estimates for the decision log.
+ * a tie stays local (no snapshot to ship); `localBlocked` (BRAIN-596) and `localHeldByKey` (BRAIN-839) send it to the runner outright. Returns the choice with both estimates for the decision log.
  */
-export function chooseSpeedPlacement({ localAdmitsNow, localWaitMs: waitMs = 0, localBlocked = false, estimateMs, runnerRatio, overheadMs = DEFAULT_REMOTE_OVERHEAD_MS }) {
+export function chooseSpeedPlacement({ localAdmitsNow, localWaitMs: waitMs = 0, localBlocked = false, localHeldByKey = false, estimateMs, runnerRatio, overheadMs = DEFAULT_REMOTE_OVERHEAD_MS }) {
   const remoteFinishMs = runnerRatio === null ? null : estimateMs * runnerRatio + overheadMs;
   // BRAIN-596: `localBlocked` = host load admits no ticket here, so the local finish is unbounded: remote whenever a runner can take it
   if (localBlocked && !localAdmitsNow) return { choice: remoteFinishMs === null ? 'local' : 'remote', localFinishMs: null, remoteFinishMs: remoteFinishMs === null ? null : Math.round(remoteFinishMs) };
+  // BRAIN-839: a same-key holder (exclusive lane, or maxConcurrent reached) blocks local admission for as long as it runs; the queue
+  // model cannot see that, so its short local finish is fiction. A narrow exception to tie-to-local: remote whenever a runner can take it.
+  if (localHeldByKey && !localAdmitsNow && remoteFinishMs !== null) return { choice: 'remote', localFinishMs: null, remoteFinishMs: Math.round(remoteFinishMs) };
   const localFinishMs = (localAdmitsNow ? 0 : waitMs) + estimateMs;
   const choice = remoteFinishMs === null || localFinishMs <= remoteFinishMs ? 'local' : 'remote';
   return { choice, localFinishMs: Math.round(localFinishMs), remoteFinishMs: remoteFinishMs === null ? null : Math.round(remoteFinishMs) };

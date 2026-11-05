@@ -13,6 +13,7 @@ import { isPriorityTier } from './priority.js';
 import { runnerAvailability } from './runner-schedule.js';
 import { sanitizeDrainReason, RUNNER_SHUTDOWN_REASON, DEAD_QUEUED_SUPERVISOR_REASON } from './state.js';
 import { readinessProbeArgs, readinessGap } from './runner-readiness.js';
+import { remoteCancelDeadlineMs, POST_ABORT_JOIN_MS } from './attempts.js';
 
 /**
  * BRAIN-319 T3a: the CLIENT side of the remote runner protocol implemented
@@ -570,6 +571,16 @@ function pipeSnapshot(child, stream, deadlineMs, abortSignal) {
 
 /** Resolve once `child` has closed, killing it immediately on `abortSignal` (BRAIN-319:
  *  a caller must never fall through to "unconfirmed" after asking to cancel). */
+
+/** Resolves `ms` after `signal` aborts (immediately counted if already aborted); the timer is unref'd and cleared never, so it cannot hold the process. */
+function afterAbort(signal, ms) {
+  return new Promise((resolve) => {
+    const start = () => setTimeout(resolve, ms).unref();
+    if (signal.aborted) start();
+    else signal.addEventListener('abort', start, { once: true });
+  });
+}
+
 function waitClosed(child, abortSignal) {
   return new Promise((resolve) => {
     if (child.exitCode !== null || child.signalCode !== null) {
@@ -759,7 +770,7 @@ async function remoteCancelBestEffort(runner, ticketId, sshBin, deadlineMs, env)
 /** Public entry point for `remoteCancelBestEffort` (resolves whether the runner CONFIRMED the cancel), for a caller with no `dispatchRemote` of
  *  its own in flight -- BRAIN-319 T3b-4's ORPHANED-REMOTE reconciliation (`lane cancel`, no
  *  live supervisor left to have done this itself). Same best-effort contract: never throws. */
-export async function remoteCancel(runner, ticketId, { sshBin = 'ssh', deadlineMs = 15_000, env } = {}) {
+export async function remoteCancel(runner, ticketId, { sshBin = 'ssh', deadlineMs = remoteCancelDeadlineMs(), env } = {}) {
   return remoteCancelBestEffort(runner, ticketId, sshBin, deadlineMs, env);
 }
 
@@ -769,7 +780,7 @@ export async function remoteCancel(runner, ticketId, { sshBin = 'ssh', deadlineM
  * `not-queued`, `finished`, `no-such-ticket`), or `{action:'unknown'}` for a nonzero exit, a timeout or a reply that does not
  * parse and bind to this ticket. Only `withdrawn` is ever acted on; never throws.
  */
-export async function remoteWithdraw(runner, ticketId, { sshBin = 'ssh', deadlineMs = 15_000, env } = {}) {
+export async function remoteWithdraw(runner, ticketId, { sshBin = 'ssh', deadlineMs = remoteCancelDeadlineMs(), env } = {}) {
   const unknown = { action: 'unknown' };
   const res = await runWithDeadline(sshBin, sshArgv(runner, buildRemoteCommand(runner, 'remote-withdraw', [ticketId])), deadlineMs, env);
   if (res.timedOut || res.code !== 0) return unknown;
@@ -958,6 +969,55 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
   }
 }
 
+const DEFAULT_CHANNEL_GRACE_MS = 60_000;
+const CHANNEL_DRAIN_MS = 2_000;
+
+/**
+ * BRAIN-850: the ssh exec channel is the remote job's output pipe, not its verdict, and a half-dead connection can leave it open
+ * forever after the runner has published the result. While the dispatch awaits `closed`, poll the runner's record every interval;
+ * once a record that BINDS to this ticket and classifies `confirmed` (the one definition of a usable terminal result) has been
+ * published for `graceMs` with the channel still open, kill ssh, give already-buffered output `CHANNEL_DRAIN_MS` to arrive, and
+ * resolve the validated record, so the caller settles from exactly that record (a later fetch can fail). Anything else (missing, malformed, unbound, contradictory) keeps
+ * waiting. Runs only after the rebalance watcher has stopped sampling, so there is one polling loop at a time. It keeps real time
+ * (not the injected clock): it measures a live ssh channel, and must not consume a test's scripted result fetches.
+ */
+async function watchPublishedResult({ runner, expected, graceMs, intervalMs, child, closed, isClosed, signal, abortSignal, fetchDeadlineMs, sshBin, env, reporter, stderr }) {
+  if (!(graceMs > 0)) return false;
+  const watching = () => !isClosed() && !signal.aborted && !abortSignal?.aborted;
+  const sample = async () => {
+    const fetched = await fetchRemoteResult(runner, expected.ticketId, sshBin, fetchDeadlineMs, env);
+    if (!watching() || !fetched) return { terminal: false, fetched: null };
+    if (fetched.missing) return { terminal: false, fetched };
+    return { terminal: classifyRemoteResult(fetched, expected).outcome === 'confirmed', fetched };
+  };
+  while (true) {
+    await sleepUnlessAborted(intervalMs, signal);
+    if (!watching()) return false;
+    const { terminal, fetched } = await sample();
+    if (!watching()) return false;
+    if (!terminal) {
+      const phase = fetched?.missing ? runnerPhaseOf(fetched) : null;
+      if (phase && COMMAND_RUNNING_PHASES.has(phase)) void reporter?.observe(phase);
+      continue;
+    }
+    const publishedAt = Date.now();
+    await sleepUnlessAborted(graceMs, signal);
+    if (!watching()) return false;
+    const confirmedSample = await sample();
+    if (!confirmedSample.terminal || !watching()) continue;
+    stderr(`lane: remote channel from ${runner.name} did not close ${Math.round((Date.now() - publishedAt) / 1000)}s after its result was published; settled from the published result (output may be truncated)\n`);
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      // already gone
+    }
+    const drained = new AbortController();
+    await Promise.race([closed, sleepUnlessAborted(CHANNEL_DRAIN_MS, drained.signal)]);
+    drained.abort();
+    return confirmedSample.fetched;
+  }
+}
+
 /**
  * Dispatch one lane run to `runner` over ssh and resolve to exactly one of
  * `{outcome:'ineligible'|'confirmed'|'unconfirmed'|'cancelled', ...}`
@@ -1073,13 +1133,16 @@ async function dispatchOnce(opts) {
     // BRAIN-770: called with `{phase, commandStartedAt}` as the rebalance watcher's own samples show the runner's phase change. Nothing
     // is polled for it: with rebalance off (or no withdraw capability) it is never called.
     onRunnerPhase,
+    // BRAIN-850: how long the ssh channel may stay open after the runner has published a terminal result before the client settles
+    // from that result (0 disables).
+    channelGraceMs = DEFAULT_CHANNEL_GRACE_MS,
   } = opts;
   const withdrawCapable = (rebalance?.canWithdraw ?? canWithdraw) === true;
 
   const transferDeadlineMs = deadlines.transferMs ?? 5 * 60_000;
   const resultDeadlineMs = deadlines.resultMs ?? 30_000;
   const resultAttempts = deadlines.resultAttempts ?? 3;
-  const cancelDeadlineMs = deadlines.cancelMs ?? 15_000;
+  const cancelDeadlineMs = deadlines.cancelMs ?? remoteCancelDeadlineMs();
   // A cancel the runner did not confirm leaves the command possibly alive; the caller keeps the attempt (and reports it) until it is.
   const cancelledOutcome = async () => ({ outcome: 'cancelled', remoteCancelConfirmed: await remoteCancelBestEffort(runner, ticketId, sshBin, cancelDeadlineMs, env) });
 
@@ -1220,6 +1283,11 @@ async function dispatchOnce(opts) {
     }
   }
   const closed = waitClosed(child, abortSignal);
+  // BRAIN-850: every post-abort join shares this one window, so sequential joins cannot outlive the cancel deadline budget
+  const sharedPostAbortWindow = abortSignal ? afterAbort(abortSignal, POST_ABORT_JOIN_MS) : null;
+  const untilAbortedFor = (promise, fallback) => (sharedPostAbortWindow
+    ? Promise.race([promise, sharedPostAbortWindow.then(() => fallback)])
+    : promise);
   let move = null;
   const state = { runner, epoch: 1, attemptedTarget: null, attemptedReason: null, queuedSince: null };
   let sessionEnded = false;
@@ -1227,18 +1295,22 @@ async function dispatchOnce(opts) {
   const reporter = onRunnerPhase && rebalance && withdrawCapable && pipeResult.ok
     ? makePhaseReporter({ onPhase: onRunnerPhase, now, canWrite: () => !sessionEnded && !abortSignal?.aborted })
     : null;
-  if (rebalance && withdrawCapable && pipeResult.ok) {
-    // One serial watcher beside the open ssh session; it is stopped and JOINED before anything below looks at the outcome.
+  let hungRecord = null;
+  if (pipeResult.ok) {
+    // One serial observer beside the open ssh session; it is stopped and JOINED before anything below looks at the outcome.
     const watchAbort = new AbortController();
     let sessionClosed = false;
-    const watcher = watchQueuedTicket({
-      runner, expected, state, rebalance, signal: watchAbort.signal, abortSignal, now, sleep,
-      isClosed: () => sessionClosed,
-      fetchDeadlineMs: resultDeadlineMs,
-      withdrawDeadlineMs: deadlines.withdrawMs ?? 15_000,
-      sshBin, env,
-      onSample: reporter ? reporter.observe : undefined,
-    });
+    const rebalanceWatching = rebalance && withdrawCapable;
+    const watcher = rebalanceWatching
+      ? watchQueuedTicket({
+          runner, expected, state, rebalance, signal: watchAbort.signal, abortSignal, now, sleep,
+          isClosed: () => sessionClosed,
+          fetchDeadlineMs: resultDeadlineMs,
+          withdrawDeadlineMs: deadlines.withdrawMs ?? remoteCancelDeadlineMs(),
+          sshBin, env,
+          onSample: reporter ? reporter.observe : undefined,
+        })
+      : Promise.resolve(null);
     // The watcher ends the session itself once it has moved the ticket (it is queued: nothing is running behind the ssh).
     const settled = watcher.then((m) => {
       if (m) {
@@ -1250,20 +1322,29 @@ async function dispatchOnce(opts) {
       }
       return m;
     });
-    // Only a move ends the wait early; a watcher that stopped for good (admitted, terminal) leaves the session to close on its own.
+    // BRAIN-850: once the queue watcher has stopped sampling (or never ran), watch for a published result behind a channel that never closes.
+    const hung = settled.then((m) => (m ? null : watchPublishedResult({
+      runner, expected, graceMs: channelGraceMs, intervalMs: rebalance?.intervalMs ?? DEFAULT_REBALANCE_INTERVAL_MS,
+      child, closed, isClosed: () => sessionClosed, signal: watchAbort.signal, abortSignal,
+      fetchDeadlineMs: resultDeadlineMs, sshBin, env, reporter,
+      stderr: onStderr ?? ((line) => process.stderr.write(line)),
+    })));
+    // A move or a published result ends the wait early; a watcher that stopped for good (admitted, terminal) leaves the session to close on its own.
     try {
-      await Promise.race([closed, settled.then((m) => m ?? closed)]);
+      // after an abort a `close` that never arrives is bounded like the joins below
+      await Promise.race([untilAbortedFor(closed, null), hung.then((h) => (h ? true : untilAbortedFor(closed, null)))]);
     } finally {
       sessionClosed = true;
       watchAbort.abort();
-      move = await settled.catch(() => null);
-      await closed;
+      move = await untilAbortedFor(settled.catch(() => null), null);
+      hungRecord = (await untilAbortedFor(hung.catch(() => null), null)) || null;
+      if (!hungRecord) await untilAbortedFor(closed, null);
     }
   } else {
-    await closed;
+    await untilAbortedFor(closed, null);
   }
 
-  await reporter?.settled();
+  if (reporter) await untilAbortedFor(reporter.settled(), null);
 
   if (abortSignal && abortSignal.aborted) {
     return cancelledOutcome();
@@ -1273,7 +1354,7 @@ async function dispatchOnce(opts) {
 
   // BRAIN-642: the runner's own statement that it refused the stream before creating a ticket (a corrupt or oversized gzip, an
   // ill-framed header). Only this exit code proves it; any other close says nothing and falls through to the usual reconcile.
-  if ((await closed) === REMOTE_EXEC_NO_TICKET_EXIT) {
+  if (!hungRecord && (await closed) === REMOTE_EXEC_NO_TICKET_EXIT) {
     return { outcome: 'unconfirmed', reason: 'the runner refused the snapshot stream before creating a ticket', neverStarted: true, retryElsewhere: true };
   }
 
@@ -1282,12 +1363,12 @@ async function dispatchOnce(opts) {
     return { outcome: 'unconfirmed', reason: pipeResult.reason, neverStarted: true, retryElsewhere: true };
   }
 
-  let record = null;
+  let record = hungRecord;
   let attemptsMade = 0;
   let waitedFrom = null;
   let backoffMs = resultPollStartMs();
   let waitExpired = false;
-  while (true) {
+  while (!record) {
     if (abortSignal && abortSignal.aborted) {
       return cancelledOutcome();
     }
@@ -1360,7 +1441,7 @@ async function dispatchOnce(opts) {
     // BRAIN-437: ssh dropped after a dispatch the runner may have accepted, and no result could be fetched. Falling back to
     // local here can run the job twice, so the runner is asked to give up the ticket; only a `withdrawn` answer proves it never
     // ran. Anything else (or a runner that cannot withdraw) leaves it possibly running, which the caller must not re-run.
-    const withdraw = withdrawCapable ? await remoteWithdraw(runner, ticketId, { sshBin, deadlineMs: deadlines.withdrawMs ?? 15_000, env }) : { action: 'unknown' };
+    const withdraw = withdrawCapable ? await remoteWithdraw(runner, ticketId, { sshBin, deadlineMs: deadlines.withdrawMs ?? remoteCancelDeadlineMs(), env }) : { action: 'unknown' };
     if (abortSignal && abortSignal.aborted) {
       // The cancel arrived while the withdraw was in flight; unless the runner gave the ticket up, it must still be told.
       return cancelledOutcome();

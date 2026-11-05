@@ -340,3 +340,76 @@ test('2026-10-15 numbers: a train run stuck behind an external-load gate goes to
   assert.equal(place(evidence.ratio, false).choice, 'remote');
   assert.equal(place(old.ratio, true).choice, 'remote', 'a gate with no admissible slots sends it out even on the pessimistic ratio');
 });
+
+/** BRAIN-839: a holder of this lane's own key (maxConcurrent 1) keeps local admission blocked, so even a 3x runner wins a placement the queue model calls a tie. */
+const sameKeyHolder = (ctx, id = 'held-key') => {
+  const repo = fs.readFileSync(paths(ctx.state).history, 'utf8').trim().split('\n').map((l) => JSON.parse(l))[0].repo;
+  writeLease(ctx.state, { id, key: `${repo}:default`, bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight: 1, state: LEASE_STATE.RUNNING });
+  return id;
+};
+
+test('speed-aware (BRAIN-839): a same-key holder blocks local admission -> goes remote though local would finish sooner, holder named in the log', TIMEOUT, async () => {
+  const ctx = await speedSetup({ speedRatioCfg: 3, localMs: 10_000 });
+  const id = sameKeyHolder(ctx);
+  try {
+    const { result } = await runDefault(ctx);
+    assert.equal(result.executor, 'remote');
+    assert.match(admissionLog(ctx), new RegExp(`speed-placement: ts=\\S+ \\S+: remote: local finish unbounded \\(estimate 10s\\), skybox finish 90s .*local held by same-key holder ${id}`));
+  } finally {
+    removeLease(ctx.state, id);
+  }
+});
+
+test('speed-aware (BRAIN-839): an unrelated-key holder is not same-key evidence -> a brief block still waits and runs locally', TIMEOUT, async () => {
+  const ctx = await speedSetup({ speedRatioCfg: 3, localMs: 10_000 });
+  holdLocal(ctx);
+  const { cpuCores } = detectResourceCapacity();
+  const busyFile = path.join(tmpDir('sp-busy'), 'busy');
+  fs.writeFileSync(busyFile, `0,${cpuCores}\n`);
+  ctx.env.LANE_BROKER_CPU_BUSY_FILE = busyFile;
+  fs.writeFileSync(paths(ctx.state).cpuSample, JSON.stringify({ lastValid: { at: Date.now(), hostBusyCores: 0, cores: cpuCores } }));
+  setTimeout(() => removeLease(ctx.state, 'held'), 2500);
+  const { result } = await runDefault(ctx);
+  assert.notEqual(result.executor, 'remote');
+  assert.doesNotMatch(admissionLog(ctx), /same-key holder/);
+});
+
+test('speed-aware (BRAIN-839): a ticket placed locally while the runner is down is rebound once it is up, because the same-key holder keeps it blocked', TIMEOUT, async () => {
+  const ctx = await speedSetup({ speedRatioCfg: 3, localMs: 10_000 });
+  const binDir = ctx.env.PATH.split(path.delimiter)[0];
+  const control = path.join(tmpDir('sp-control'), 'mode');
+  fs.writeFileSync(control, 'down');
+  fs.renameSync(path.join(binDir, 'ssh'), path.join(binDir, 'ssh-real'));
+  // the fake runner shares this broker's state, so its probe would report the waiting ticket as the runner's own queue and no headroom
+  fs.writeFileSync(path.join(binDir, 'ssh'), `#!/usr/bin/env node
+const fs = require('fs');
+const { spawnSync } = require('child_process');
+const argv = process.argv.slice(2);
+if (fs.readFileSync(${JSON.stringify(control)}, 'utf8').trim() === 'down') process.exit(255);
+const res = spawnSync(${JSON.stringify(path.join(binDir, 'ssh-real'))}, argv, { encoding: 'utf8', stdio: ['inherit', 'pipe', 'inherit'] });
+if ((argv[argv.length - 1] || '').includes('remote-probe')) {
+  const p = JSON.parse(res.stdout.trim());
+  Object.assign(p, { queued: 0, running: 0, headroom: { cpuCores: 64, memoryBytes: 1e12 } });
+  res.stdout = JSON.stringify(p) + '\\n';
+}
+process.stdout.write(res.stdout);
+process.exit(res.status == null ? 1 : res.status);
+`);
+  fs.chmodSync(path.join(binDir, 'ssh'), 0o755);
+  const id = sameKeyHolder(ctx);
+  try {
+    const marker = path.join(tmpDir('sp-marker'), 'm');
+    const started = await laneRun(['run', '--detach', '--lane', 'default', '--', ...markerCmd(marker)], { env: ctx.env, cwd: ctx.repoDir });
+    assert.equal(started.code, 0, started.stderr);
+    const ticketId = started.stdout.trim();
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    assert.doesNotMatch(admissionLog(ctx), /rebind: local finish/, 'no runner yet: it waits locally');
+    fs.writeFileSync(control, 'ok');
+    const waited = await laneRun(['wait', ticketId, '--timeout', '60s'], { env: ctx.env });
+    assert.equal(waited.code, 0, waited.stderr);
+    assert.equal(resultOf(ctx.state, ticketId).executor, 'remote');
+    assert.match(admissionLog(ctx), new RegExp(`${ticketId}: remote: rebind: local finish unbounded .*local held by same-key holder ${id}`));
+  } finally {
+    removeLease(ctx.state, id);
+  }
+});

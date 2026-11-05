@@ -428,6 +428,14 @@ export function blockedBy(held, ticket) {
 }
 
 /**
+ * BRAIN-839: the held lease that blocks `ticket` through its OWN key (same-key holders at its `maxConcurrent`), or null. A
+ * declared `conflicts` entry on another key is not counted: only a same-key holder makes the local wait unbounded for speed placement.
+ */
+export function sameKeyHolder(held, ticket) {
+  return blockedBy(held.filter((l) => l.key === ticket.key), { key: ticket.key, maxConcurrent: ticket.maxConcurrent });
+}
+
+/**
  * The liveness maintenance every admission decision starts with: reap/orphan
  * stale leases, and dequeue queued tickets whose supervisor already died
  * (crashed, or the machine killed it) so they never sit at the FIFO head
@@ -577,8 +585,9 @@ function couldAdmitLocked(root, cfg, ticket, memoryReader) {
   const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
   const queued = listQueue(root);
   const pushHeld = pushHolds(root, queued, held);
-  if (queued.some((t) => t === null || !pushHeld.has(t.id))) return { admit: false, reason: 'queue-ahead' };
-  return localGates(root, cfg, ticket, held, memoryReader, { cooldown: true });
+  const holder = sameKeyHolder(held, ticket);
+  const verdict = queued.some((t) => t === null || !pushHeld.has(t.id)) ? { admit: false, reason: 'queue-ahead' } : localGates(root, cfg, ticket, held, memoryReader, { cooldown: true });
+  return holder ? { ...verdict, heldByKey: holder.id } : verdict;
 }
 
 /**
@@ -1245,6 +1254,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
   // filled with copies and flags, never read back by the live decision.
   const shadow = {};
   const bypassTrace = {};
+  const ownKeyTrace = {};
   const decideTicket = () => {
     const cfg = reloadCfg() || globalCfg;
     // BRAIN-362: every evaluation below sees the claim capped to this host's budget; the submitted ticket keeps the declaration.
@@ -1273,6 +1283,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // Selection depends only on the queue and who currently holds a key (see below); read the holders first, since the
     // BRAIN-321 class caps are counted against what is BOOKED now.
     const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
+    ownKeyTrace.holder = sameKeyHolder(held, submitted)?.id ?? null;
     // BRAIN-321: `active` enforces the sim caps; a broken `classes` block makes every sim ineligible (fail closed); `shadow`
     // only reports what `active` would deny. A cap-denied sim is skip-free: it leaves every selection below, so it is never
     // the head and never blocks anything, and it cannot hold a reservation-owner promotion either.
@@ -1994,7 +2005,9 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     return changed ? { ...outcome, bypassRefusedChange: { reason, previous } } : outcome;
   };
   refreshCpuEstimates(globalCfg);
-  const { result, logFields, events, bypassRefusedChange } = await withLock(root, decide);
+  const { result: decided, logFields, events, bypassRefusedChange } = await withLock(root, decide);
+  // BRAIN-839: every non-start verdict (head or not-head) carries the same-key holder the locked snapshot saw
+  const result = decided.started !== true && ownKeyTrace.holder ? { ...decided, localHeldByKey: ownKeyTrace.holder } : decided;
 
   // BRAIN-379: evaluated and logged after the lock is released, so shadow never lengthens a live admission or release.
   // One record per poll cycle (the head's poll) plus one per real admission; a non-head poll that starts nothing adds

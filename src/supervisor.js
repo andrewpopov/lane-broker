@@ -58,7 +58,7 @@ import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remo
 import { DEPS_KEY_FILES_CAPABILITY, EXECUTION_CEILING_CAPABILITY, REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
 import { SNAPSHOT_GZIP_CAPABILITY, TRANSFER_GZIP } from './remote-gzip.js';
 import { BLOB_CACHE_CAPABILITY } from './remote-blobs.js';
-import { createAttempt, readAttempt, updateAttempt, runnerPhaseRecorder, fallbackToLocal, publishTerminal, remoteCancelledResult } from './attempts.js';
+import { createAttempt, readAttempt, updateAttempt, runnerPhaseRecorder, fallbackToLocal, publishTerminal, remoteCancelledResult, remoteCancelExitDeadlineMs, REMOTE_CANCEL_ABANDONED_EXIT, CANCELLING_LOCK_TIMEOUT_MS } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX, hostCpuLoad, ticketCpuEstimate } from './admission.js';
 import { relayedUsage, relayedDeps, relayedTransfer, snapshotLine } from './remote-relay.js';
 import { maybeDailyGc } from './gc.js';
@@ -647,7 +647,7 @@ function externalCpuSlotsFor(root, enriched, globalCfg) {
  * its measured speed ratio, plus dispatch overhead and, if it too is queued, that queue). One decision, with both estimates.
  * BRAIN-596: host load outside any lease that leaves no admissible slot makes the local wait unbounded, so an unqueued runner wins.
  */
-function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, probe, queuedChoice, waitedMs = 0, forceLocalBlocked = false) {
+function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, probe, queuedChoice, waitedMs = 0, forceLocalBlocked = false, heldByKey = null) {
   const queue = listQueue(root).filter(Boolean);
   const own = queue.findIndex((t) => t.id === enriched.id);
   const ahead = own === -1 ? queue : queue.slice(0, own);
@@ -661,6 +661,7 @@ function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, pr
       localAdmitsNow: false,
       localWaitMs: localWaitMs({ aheadEstimatesMs: ahead.map((t) => localRunEstimateMs(rows, t.repoId, t.lane) ?? estimateMs), estimateMs, slots, waitedMs }),
       localBlocked,
+      localHeldByKey: Boolean(heldByKey),
       estimateMs,
       runnerRatio: ratio,
       overheadMs: DEFAULT_REMOTE_OVERHEAD_MS + runnerQueueMs,
@@ -669,8 +670,12 @@ function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, pr
     ratioTier: evidence.tier,
     ratioPairs: evidence.pairs,
     localBlocked,
+    heldByKey,
   };
 }
+
+/** The decision-log suffix naming why local was written off (host CPU load, or BRAIN-839 a same-key holder). */
+const localBlockNote = (decision) => (decision.localBlocked ? ', local blocked by host CPU load' : decision.choice === 'remote' && decision.heldByKey ? `, local held by same-key holder ${decision.heldByKey}` : '');
 
 /** One admission-decisions line per speed-aware decision, timestamped, carrying both estimates. */
 function logSpeedDecision(root, enriched, choice, detail) {
@@ -737,8 +742,37 @@ export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHom
  * right before dispatch, and any failure after that puts it back at its original queue position and resolves
  * `{ fallback: true, rebindFailed: true }` -- a rebind never terminates a ticket by refusing it.
  */
+/**
+ * BRAIN-850 S3: a cancelled remote dispatch must make this process EXIT within `lane cancel`'s wait even if an await never settles
+ * (a hung exec channel, a lock that stays held). The record, binding and cancel marker stay: the state a SIGKILL leaves, which
+ * `lane cancel` and reconcile already settle as an orphaned remote. Armed per dispatch (initial and rebind), so no caller can miss it.
+ */
 async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind = null, cpuLimit) {
+  let exitTimer = null;
+  const arm = () => {
+    if (exitTimer) return;
+    exitTimer = setTimeout(() => {
+      const line = `lane: remote: ${enriched.id}: cancel did not finish within ${remoteCancelExitDeadlineMs()}ms; exiting ${REMOTE_CANCEL_ABANDONED_EXIT} and leaving the attempt for lane cancel to settle\n`;
+      process.stderr.write(line);
+      writeBrokerLog(root, line);
+      process.exit(REMOTE_CANCEL_ABANDONED_EXIT);
+    }, remoteCancelExitDeadlineMs());
+    exitTimer.unref();
+  };
+  if (abortSignal.aborted) arm();
+  else abortSignal.addEventListener('abort', arm, { once: true });
+  try {
+    return await dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind, cpuLimit);
+  } finally {
+    abortSignal.removeEventListener('abort', arm);
+    clearTimeout(exitTimer);
+  }
+}
+
+async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind, cpuLimit) {
   const attemptStartedAt = Date.now();
+  // BRAIN-850 S3: once cancelled, a lock write fails fast (the process then exits with the attempt kept) instead of retrying contention forever
+  const whileCancelling = () => (abortSignal.aborted ? { lockTimeoutMs: CANCELLING_LOCK_TIMEOUT_MS } : {});
   // the attempt generation every fence below acts on: 0 for a first attempt, the fallback's generation for a rebind
   const gen = rebind ? rebind.generation : 0;
   let withdrawn = null;
@@ -795,7 +829,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     const published = await publishTerminal(root, enriched.id, generation, ({ cancelled }) => {
       finalResult = cancelled ? remoteCancelledResult(enriched.id, attemptStartedAt) : buildConfirmedResult();
       writeResultSync(finalResult);
-    });
+    }, whileCancelling());
     if (!published.ok) {
       // Generation mismatch: unreachable on every call site below (nothing
       // else advances this attempt's generation while this supervisor is
@@ -828,7 +862,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       const line = `lane: remote-rebind: ${enriched.id}: ${where}: ${reason} — outcome unknown, the job may be running there; not re-running it locally (see lane status, lane cancel)\n`;
       process.stderr.write(line);
       writeBrokerLog(root, line);
-      await updateAttempt(root, enriched.id, gen, { unresolved: reason });
+      await updateAttempt(root, enriched.id, gen, { unresolved: reason }, whileCancelling());
       await logWriter.finish();
       process.exit(1);
       return { fallback: false };
@@ -973,8 +1007,10 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     speed = null;
     logSpeedDecision(root, enriched, 'remote', `speed-aware: local skipped (no node_modules for remoteDeps ${lackingDeps.join(', ')})`);
   }
+  let heldByKey = null;
   if (speed) {
     const local = await couldAdmitNow(root, globalCfg, enriched);
+    heldByKey = local.heldByKey ?? null;
     if (local.admit) {
       logSpeedDecision(root, enriched, 'local', `admits now, local estimate ${seconds(speed.estimateMs)}`);
       return fallbackOrRefuse(null, 'speed-aware: local admits now', { rebindable: true });
@@ -1013,8 +1049,8 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   }
 
   if (speed && !busyQueuedAt) {
-    const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true);
-    logSpeedDecision(root, enriched, decision.choice, `local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)}, ${decision.ratioTier} n=${decision.ratioPairs}${decision.localBlocked ? ', local blocked by host CPU load' : ''})`);
+    const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true, 0, false, heldByKey);
+    logSpeedDecision(root, enriched, decision.choice, `local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)}, ${decision.ratioTier} n=${decision.ratioPairs}${localBlockNote(decision)})`);
     if (decision.choice === 'local') return fallbackOrRefuse(null, 'speed-aware: local finishes sooner', { rebindable: true });
   }
 
@@ -1221,6 +1257,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
       ...classTransport(enriched, resolveClasses(globalCfg, root)),
       priorityAccruedMs: waitedMs(enriched, effectiveNow(root)),
       resultWaitMs: globalCfg.remoteResultWaitMs,
+      channelGraceMs: globalCfg.remoteChannelGraceMs,
       // BRAIN-437: a runner that can withdraw lets a dropped connection prove the job never started; one that cannot leaves it possibly running
       canWithdraw,
       onStdout: current(onStdout),
@@ -1470,7 +1507,7 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
     const line = `lane: remote: ${enriched.id}: ${reason} (see lane status, lane cancel)\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);
-    await updateAttempt(root, enriched.id, gen, { unresolved: reason });
+    await updateAttempt(root, enriched.id, gen, { unresolved: reason }, whileCancelling());
     await logWriter.finish();
     process.exit(1);
     return { fallback: false };
@@ -1604,16 +1641,13 @@ async function main() {
   // site regardless of which phase (remote-dispatch, queued, or a running
   // local child) the cancellation actually lands in. `onCancelSignal`
   // (below) deliberately does NOT duplicate this write.
-  process.on('SIGTERM', () => {
+  const onFirstCancelSignal = () => {
     cancelledBeforeStart = true;
     writeCancelMarkerFile(root, ticket.id);
     abortController.abort();
-  });
-  process.on('SIGINT', () => {
-    cancelledBeforeStart = true;
-    writeCancelMarkerFile(root, ticket.id);
-    abortController.abort();
-  });
+  };
+  process.on('SIGTERM', onFirstCancelSignal);
+  process.on('SIGINT', onFirstCancelSignal);
 
   let attemptGeneration = null;
   let fallbackReason;
@@ -1776,7 +1810,7 @@ async function main() {
    */
   const LOCAL_LOG_INTERVAL_MS = 10 * 60_000;
   let lastLocalLogAt = 0;
-  async function tryRebind(localBlocked = false) {
+  async function tryRebind(localBlocked = false, heldByKey = null) {
     // A ticket never goes back to a runner it left, was refused by, or was ever dispatched to (nor to one it is on).
     const attempt = readAttempt(root, ticket.id);
     const left = new Set([...(attempt?.moves ?? []).flatMap((m) => [m.from, m.to]), ...(attempt?.refusedRunners ?? []), ...(attempt?.dispatchedRunners ?? [])]);
@@ -1790,7 +1824,7 @@ async function main() {
     // BRAIN-548: a speed-aware ticket moves only when the runner is now expected to finish it sooner than waiting here does.
     const speed = speedInputs(root, enriched);
     if (speed) {
-      const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true, waitedMs, localBlocked);
+      const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true, waitedMs, localBlocked, heldByKey);
       if (decision.choice === 'local') {
         // BRAIN-556: make a ticket that keeps staying local visible, at most once per 10 min
         if (Date.now() - lastLocalLogAt >= LOCAL_LOG_INTERVAL_MS) {
@@ -1799,7 +1833,7 @@ async function main() {
         }
         return;
       }
-      logSpeedDecision(root, enriched, 'remote', `rebind: local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)}, ${decision.ratioTier} n=${decision.ratioPairs}${decision.localBlocked ? ', local blocked by host CPU load' : ''})`);
+      logSpeedDecision(root, enriched, 'remote', `rebind: local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)}, ${decision.ratioTier} n=${decision.ratioPairs}${localBlockNote(decision)})`);
     }
     if (localBlocked) {
       const line = `lane: remote-rebind: ${enriched.id}: local blocked: no CPU slot beside external load — moving to ${runner.name}\n`;
@@ -1953,7 +1987,7 @@ async function main() {
     if (rebindDue && (rebindable || localBlocked) && (Date.now() >= rebindNotBefore || localBlocked)) {
       nextRebindAt = Date.now() + globalCfg.remoteRebindIntervalMs;
       try {
-        await tryRebind(localBlocked);
+        await tryRebind(localBlocked, started.localHeldByKey ?? null);
       } catch (err) {
         if (!(err instanceof MigrationInProgressError)) throw err;
         return exitMigrating(err);

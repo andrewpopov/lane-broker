@@ -13,6 +13,7 @@ import { migrateSchedulerCommand } from '../src/migrate.js';
 import { parseByteSize } from '../src/resources.js';
 import { MIN_CPU_GRANT_CORES } from '../src/cpu-limit.js';
 import { isTicketId } from '../src/state.js';
+import { writeBrokerLog } from '../src/admission.js';
 import { leaseCheckCommand } from '../src/lease.js';
 import { parseTransferFlag } from '../src/remote-gzip.js';
 import { parseTransferCacheFlag } from '../src/remote-blobs.js';
@@ -419,8 +420,10 @@ async function main() {
         process.stderr.write(`lane remote-exec: ${cacheFlag.reason}\n`);
         return 2;
       }
+      if (process.env.LANE_BROKER_TEST_RETAIN_HANDLE) setInterval(() => {}, 1000);
       const result = await remoteExecCommand({ root, transfer: flag.transfer, transferCache: cacheFlag.transferCache });
-      return result.exitCode;
+      await flushStdio(root);
+      process.exit(result.exitCode);
     }
     case 'remote-have': {
       const result = await remoteHaveCommand({ root: parseRootFlag(rest) || defaultRemoteRoot() });
@@ -481,6 +484,39 @@ async function main() {
     default:
       process.stderr.write(`lane: unknown command "${sub}"\n\n${usage()}`);
       return 2;
+  }
+}
+
+// A runner's remote-exec has published its result by the time it returns; an unidentified live handle must not keep the
+// ssh channel open (BRAIN-850). Flush both streams (EPIPE tolerated) so no output is truncated, then the caller exits.
+// The bound is generous (a slow but healthy reader is waited for); when it expires the result stays published and the exit code
+// stays, but the truncation is recorded in the broker log, where it is visible even if stdout and stderr are the stuck streams.
+// Test-only seam: LANE_BROKER_TEST_FLUSH_MS.
+async function flushStdio(root, timeoutMs = Number(process.env.LANE_BROKER_TEST_FLUSH_MS) || 60_000) {
+  const flush = (stream) =>
+    new Promise((resolve) => {
+      stream.on('error', () => resolve());
+      try {
+        stream.write('', () => resolve());
+      } catch {
+        resolve();
+      }
+    });
+  let timer;
+  const timedOut = Symbol('flush-timed-out');
+  const bound = new Promise((resolve) => {
+    timer = setTimeout(() => resolve(timedOut), timeoutMs);
+  });
+  const outcome = await Promise.race([Promise.all([flush(process.stdout), flush(process.stderr)]), bound]);
+  clearTimeout(timer);
+  if (outcome === timedOut) {
+    const line = `lane: remote-exec: stdout/stderr did not flush within ${timeoutMs}ms; exiting with the result already published, output may be truncated\n`;
+    writeBrokerLog(root, line);
+    try {
+      process.stderr.write(line);
+    } catch {
+      // the stream that is stuck is the reason for this line
+    }
   }
 }
 

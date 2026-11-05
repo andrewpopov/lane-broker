@@ -502,6 +502,14 @@ function validateGlobalConfig(cfg, sourcePath) {
       `${sourcePath}: "remoteResultWaitMs" must be a positive integer`,
     );
   }
+  // BRAIN-850: how long an ssh exec channel may stay open after the runner has published a terminal result before the client settles
+  // from that result. Absent means the dispatcher's 60s default; 0 turns the fallback off.
+  if (cfg.remoteChannelGraceMs !== undefined) {
+    assert(
+      Number.isInteger(cfg.remoteChannelGraceMs) && cfg.remoteChannelGraceMs >= 0,
+      `${sourcePath}: "remoteChannelGraceMs" must be a non-negative integer (0 disables)`,
+    );
+  }
   assert(typeof cfg.remoteDepsCache === 'boolean', `${sourcePath}: "remoteDepsCache" must be a boolean`);
   assert(
     Number.isInteger(cfg.remoteDepsCacheMaxBytes) && cfg.remoteDepsCacheMaxBytes > 0,

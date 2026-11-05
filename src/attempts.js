@@ -2,6 +2,21 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, kernelBootId, isCancelled, assertNotMigrating, listJsonRecordsStrict } from './state.js';
 import { isProcessAlive, processStartTime } from './process-liveness.js';
+import { cancelGraceMs } from './descendants.js';
+
+/** How long a remote cancel/withdraw round trip may take: the grace a local cancel gives plus 5 s, so one knob scales every cancel deadline in tests. */
+export const remoteCancelDeadlineMs = () => cancelGraceMs() + 5000;
+/** Bound on each join of a settled/aborted ssh session (BRAIN-850): the session's close is never waited on past this after an abort. */
+export const POST_ABORT_JOIN_MS = 1500;
+/** Lock acquire bound for the writes a cancelling supervisor makes: failing fast lets it exit instead of retrying contention forever. */
+export const CANCELLING_LOCK_TIMEOUT_MS = 3000;
+const CANCEL_MARGIN_MS = 1000;
+/** BRAIN-850 S3: a remote supervisor still alive this long after its cancel signal exits: the remote cancel, the post-abort join, the publish lock, and a margin. */
+export const remoteCancelExitDeadlineMs = () => remoteCancelDeadlineMs() + POST_ABORT_JOIN_MS + CANCELLING_LOCK_TIMEOUT_MS + CANCEL_MARGIN_MS;
+/** How long `lane cancel` waits on a live supervisor after its SIGTERM: the supervisor's exit deadline plus a margin. */
+export const cancelWaitMs = () => remoteCancelExitDeadlineMs() + 2 * CANCEL_MARGIN_MS;
+/** Exit code of a supervisor that gave up on a cancel it could not finish: the attempt, binding and cancel marker stay for the orphaned-remote path. */
+export const REMOTE_CANCEL_ABANDONED_EXIT = 74;
 
 /**
  * BRAIN-319 (.review-plan.md v3 C3/C4/C5): one durable ATTEMPT record per
@@ -177,7 +192,7 @@ export function patchAttemptLocked(root, id, patch) {
 /** Apply `patch` to the stored record, but only if its generation is still
  *  exactly `expectedGeneration` -- the fence against a stale writer acting
  *  on state that has since moved on (e.g. already fell back to local). */
-export async function updateAttempt(root, id, expectedGeneration, patch, { refuseWhileMigrating = false } = {}) {
+export async function updateAttempt(root, id, expectedGeneration, patch, { refuseWhileMigrating = false, lockTimeoutMs } = {}) {
   return withLock(root, () => {
     // BRAIN-380: the intake check and the write are one locked step, so a migration cannot start between them.
     if (refuseWhileMigrating) assertNotMigrating(root);
@@ -188,7 +203,7 @@ export async function updateAttempt(root, id, expectedGeneration, patch, { refus
     const next = { ...current, ...patch };
     atomicWriteJson(attemptFile(root, id), next);
     return { ok: true, attempt: next };
-  });
+  }, { timeoutMs: lockTimeoutMs });
 }
 
 /**
@@ -257,7 +272,7 @@ function assertSyncWriter(returned) {
   }
 }
 
-export async function publishTerminal(root, id, generation, resultWriterFn, { expect } = {}) {
+export async function publishTerminal(root, id, generation, resultWriterFn, { expect, lockTimeoutMs } = {}) {
   return withLock(root, () => {
     const current = readAttempt(root, id);
     if (!current) {
@@ -277,5 +292,5 @@ export async function publishTerminal(root, id, generation, resultWriterFn, { ex
     assertSyncWriter(resultWriterFn({ cancelled: false }));
     removeAttempt(root, id);
     return { ok: true, cancelled: false };
-  });
+  }, { timeoutMs: lockTimeoutMs });
 }

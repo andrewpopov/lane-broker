@@ -680,6 +680,14 @@ What a remote run does:
      selected runner's finish, `E x speedRatio + 60 s` dispatch overhead (plus
      `queued x E x speedRatio` when that runner is itself queued). The earlier
      wins; a tie stays local.
+   - BRAIN-839: a ticket whose local admission is blocked by a holder of its own
+     key (the lane's `maxConcurrent` reached, the default 1 being exclusive) goes
+     to the runner whenever one can take it, even on a tie or a short modelled
+     local wait, because that wait lasts as long as the holder runs. It applies
+     at first placement and at every rebind (head or not); the log names it
+     (`local held by same-key holder <lease id>`). A holder of another key, a
+     key below its `maxConcurrent`, or a ticket this machine admits now does not
+     trigger it, and a runner over `maxRemoteQueue` still is not chosen.
    - BRAIN-663: a lane that declares `remoteDeps` is placed locally only when
      this tree has them: each `remoteDeps` dir with a lockfile needs a
      `node_modules` directory. Otherwise the lane stays remote and the
@@ -1149,6 +1157,20 @@ later `remote-exec` for that id is refused), whether or not the attempt recorded
 records nothing, yet its job may still be running (BRAIN-515). The one exception is the result-wait expiry (BRAIN-363,
 `remoteResultWaitMs`): it cancels the remote command and confirms that before any local retry, so the retry is sequential, not a
 concurrent second run.
+
+**A published result ends the dispatch (BRAIN-850).** While the client waits on the exec channel it polls the runner's result;
+once a terminal record bound to this ticket (id, generation, manifest hash, protocol phase) has stood for `remoteChannelGraceMs`
+(default 60000, 0 disables) the client kills its ssh, settles from that record and prints `remote channel from <runner> did not
+close ...; settled from the published result (output may be truncated)`. A record that does not bind is never terminal. The
+runner ends the channel too: `remote-exec` flushes its output (bounded at 60 s; a timeout is written to the runner's broker
+log) and exits once it has published its result.
+
+**A remote supervisor stops within `lane cancel`'s wait (BRAIN-850).** The deadlines nest, all derived in `src/attempts.js`:
+remote cancel 15 s (cancel grace + 5 s), then the post-abort joins (1.5 s) and the terminal lock write (3 s), so a supervisor
+SIGTERMed during any remote dispatch (initial or rebind) exits by 20.5 s. If its cancel has not finished by then it exits **74**
+and leaves the attempt, binding and cancel marker exactly as a `kill -KILL` would. `lane cancel` waits 22.5 s; once the
+supervisor it signalled is dead and the attempt is still held, it runs the orphaned-remote path in the same invocation, which
+removes the attempt only after every named runner confirms the cancel.
 
 **Dead supervisor before admission (BRAIN-605, BRAIN-494).** An attempt with `executor: local` (a remote attempt that fell back, or
 a rebind that stayed in the local queue) whose supervisor is dead, with no lease, queue entry or parked ticket, can never
