@@ -1,8 +1,15 @@
+import fs from 'node:fs';
 import os from 'node:os';
 
-// BRAIN-860: a lane's cpuset shrinks availableParallelism to its 1-core grant; the CPU sampler counts os.cpus().
+// BRAIN-860: the suite runs inside a lane's 1-core cgroup and cpuset; capacity detection must see the machine instead.
 const machineCores = os.cpus().length;
 os.availableParallelism = () => machineCores;
+
+const readFileSync = fs.readFileSync;
+fs.readFileSync = function readOutsideLaneCgroup(file, ...rest) {
+  if (file === '/proc/self/cgroup') throw Object.assign(new Error(`ENOENT: hermetic-host hides ${file}`), { code: 'ENOENT' });
+  return readFileSync.call(this, file, ...rest);
+};
 
 const self = `--import=${import.meta.url}`;
 const inherited = process.env.NODE_OPTIONS ?? '';

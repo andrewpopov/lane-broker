@@ -2,7 +2,6 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, BIN } from './helpers.js';
@@ -31,9 +30,7 @@ import { loadModules, scenarios, runScript, liveTrace } from './allocation-scena
  */
 
 const GIB = 1024 ** 3;
-// detectResourceCapacity() reads os.availableParallelism at call time; node --test isolates each file in its own process.
-const HOST_CORES = 8;
-os.availableParallelism = () => HOST_CORES;
+const HOST_CORES = detectResourceCapacity().cpuCores;
 // The CPU budget B is pinned to POOL cores on any host with at least that many (reserve = host - POOL, 100%), and every
 // sample is injected, so no outcome here depends on the real core count above POOL or on the machine's load.
 const POOL = 4;
@@ -101,9 +98,8 @@ async function admit(state, t, cfg) {
   return poll(state, t, cfg);
 }
 
-test('the fixtures run on the injected host capacity, not the real machine', () => {
-  assert.equal(detectResourceCapacity().cpuCores, HOST_CORES);
-  assert.ok(HOST_CORES >= POOL);
+test('HOST has the cores these fixtures assume', () => {
+  assert.ok(HOST_CORES >= POOL, `class-caps fixtures need >= ${POOL} host cores (got ${HOST_CORES})`);
 });
 
 test('a sim beyond capCores is denied class-cap; one that fits the booked cap starts', async () => {
