@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv, writeGlobalConfig, laneRun, waitFor, writeRepoConfig } from './helpers.js';
+import { freshEnv, writeGlobalConfig, laneRun, waitFor, writeRepoConfig, writeCpuBusyFile } from './helpers.js';
 import { spawn } from 'node:child_process';
 import { tmpDir, makeRunner, setup, markerCmd, detachAndWait, resultOf } from './remote-harness.js';
 import { selectRunner } from '../src/remote-client.js';
@@ -313,6 +313,8 @@ test('BRAIN-746 selectRunner: allowBusyQueue prefers an idle runner, then the fe
 async function runBehindQueuedLocalTicket({ seedHistory, globalExtra = {}, laneExtra = {} }) {
   const { env, state, repoDir } = setup({ globalExtra: { schedulerMode: 'active', cpuAdmissionPercent: 100, cpuReserveCores: 0, queueBypassCap: 3, ...globalExtra } });
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, remotePolicy: 'remote-first', ...laneExtra }, hold: { weight: 1 } } });
+  // active admission reads host CPU: stub an idle host, or a loaded CI runner holds the local ticket until its real load drops
+  env.LANE_BROKER_CPU_BUSY_FILE = writeCpuBusyFile(tmpDir('bypass-cpu'), 0, 8);
   const script = 'where.js';
   const marker = path.join(tmpDir('bypass-marker'), 'where');
   fs.writeFileSync(path.join(repoDir, script), `require('fs').writeFileSync(${JSON.stringify(marker)}, process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local');`);
