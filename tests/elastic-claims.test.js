@@ -512,7 +512,8 @@ test('mixed versions: a runner without elastic-claims/1 is judged on the FULL cl
 });
 
 test('remote-probe advertises elastic-claims/1', () => {
-  const { env } = freshEnv();
+  const { env, home } = freshEnv();
+  writeGlobalConfig(home, { version: 1, cpuLimit: 'off' });
   const res = spawnSync(process.execPath, [BIN, 'remote-probe'], { env, encoding: 'utf8' });
   assert.equal(res.status, 0, res.stderr);
   assert.deepEqual(JSON.parse(res.stdout).capabilities, [

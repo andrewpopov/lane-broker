@@ -10,6 +10,7 @@ import { couldAdmitNow, enqueue } from '../src/scheduler.js';
 import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig, ConfigError, resolveTicketConfig } from '../src/config.js';
 import { writeLease, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths } from '../src/state.js';
+import { detectResourceCapacity } from '../src/resources.js';
 
 /** A fake ssh that answers `remote-probe` per destination from `probes` (name -> payload). */
 function makeProbeMapSsh(probes) {
@@ -314,7 +315,7 @@ async function runBehindQueuedLocalTicket({ seedHistory, globalExtra = {}, laneE
   const { env, state, repoDir } = setup({ globalExtra: { schedulerMode: 'active', cpuAdmissionPercent: 100, cpuReserveCores: 0, queueBypassCap: 3, ...globalExtra } });
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, remotePolicy: 'remote-first', ...laneExtra }, hold: { weight: 1 } } });
   // active admission reads host CPU: stub an idle host, or a loaded CI runner holds the local ticket until its real load drops
-  env.LANE_BROKER_CPU_BUSY_FILE = writeCpuBusyFile(tmpDir('bypass-cpu'), 0, 8);
+  env.LANE_BROKER_CPU_BUSY_FILE = writeCpuBusyFile(tmpDir('bypass-cpu'), 0, detectResourceCapacity().cpuCores);
   const script = 'where.js';
   const marker = path.join(tmpDir('bypass-marker'), 'where');
   fs.writeFileSync(path.join(repoDir, script), `require('fs').writeFileSync(${JSON.stringify(marker)}, process.env.LANE_FAKE_RUNNER === '1' ? 'remote' : 'local');`);
