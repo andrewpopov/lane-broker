@@ -2783,6 +2783,9 @@ What a run leaves behind is collected; what a live one owns never is. Everything
 - `LANE_BROKER_LOADAVG_FILE` — if set, `lane` reads the 1-minute load from the
   first line of this file instead of `os.loadavg()`, for deterministic gate
   tests.
+- `LANE_BROKER_TEST_HOST_CORES` — the CPU core count `detectResourceCapacity()` reports instead of
+  `os.availableParallelism()` and the cgroup's `cpu.max`/`cpuset` (BRAIN-860). `npm test` sets it to
+  the machine's core count, so the suite behaves the same inside a 1-core runner lane as on a bare host.
 - `LANE_BROKER_BOOT_ID` — override the detected boot id, to simulate a reboot.
 - `LANE_BROKER_TEST_ROUNDS` — override the dead-owner-lock contention sweep's
   round count (default 4; the original suite ran 10) for a fuller sweep, e.g.

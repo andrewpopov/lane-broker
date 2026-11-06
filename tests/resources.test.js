@@ -9,6 +9,8 @@ import {
   resolveTicketResources,
 } from '../src/resources.js';
 
+delete process.env.LANE_BROKER_TEST_HOST_CORES;
+
 test('resource parsers accept human sizes, fractional quotas, and CPU sets', () => {
   assert.equal(parseByteSize('1.5GiB'), 1.5 * 1024 ** 3);
   assert.equal(parseByteSize('512mb'), 512_000_000);
@@ -38,6 +40,26 @@ test('Linux capacity honors cgroup v2 CPU, cpuset, and memory limits', () => {
   assert.equal(snapshot.cpuCores, 2.5);
   assert.equal(snapshot.memoryBytes, 8 * 1024 ** 3);
   assert.equal(snapshot.availableMemoryBytes, 5 * 1024 ** 3);
+});
+
+test('LANE_BROKER_TEST_HOST_CORES pins the core count over parallelism and the cgroup CPU limits, and leaves memory alone', () => {
+  const files = new Map([
+    ['/sys/fs/cgroup/cpu.max', '100000 100000'],
+    ['/sys/fs/cgroup/cpuset.cpus.effective', '0'],
+    ['/sys/fs/cgroup/memory.max', String(8 * 1024 ** 3)],
+  ]);
+  const snapshot = detectResourceCapacity({
+    platform: 'linux',
+    parallelism: 1,
+    totalMemory: 32 * 1024 ** 3,
+    readFile: (file) => {
+      if (!files.has(file)) throw new Error('missing');
+      return files.get(file);
+    },
+    testHostCores: 12,
+  });
+  assert.equal(snapshot.cpuCores, 12);
+  assert.equal(snapshot.memoryBytes, 8 * 1024 ** 3);
 });
 
 test('Linux capacity follows nested cgroup v2 membership and ancestor limits', () => {
