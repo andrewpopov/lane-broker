@@ -73,6 +73,7 @@ export function makeFakeSshBin() {
   // with a queued ticket is skipped") rely on the client's own queue/lease
   // doubling as the probed runner's busy state.
   const runnerHome = tmpDir('fake-runner-home');
+  writeGlobalConfig(runnerHome, { cpuLimit: 'off' });
   const runnerState = tmpDir('fake-runner-state');
   // BRAIN-319 T3b-5 (finding #5): a durable log of every `remote-probe` this
   // fake ssh sees, one destination name per line -- lets a test assert "no
@@ -448,7 +449,7 @@ export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1, cpuCore
   if (remoteResultWaitMs !== undefined) cfg.remoteResultWaitMs = remoteResultWaitMs;
   Object.assign(cfg, globalExtra);
   writeGlobalConfig(home, cfg);
-  writeGlobalConfig(runnerHome, { sampleMs: 50, capacity: 4 });
+  writeGlobalConfig(runnerHome, { sampleMs: 50, capacity: 4, cpuLimit: 'off' });
   const repoDir = tmpDir('remote-dispatch-repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight, ...(cpuCores !== undefined ? { cpuCores } : {}), remote: true, remotePolicy: 'remote-first' } } });
   // remote-first: this harness exercises remote mechanics; speed-aware placement (BRAIN-548) has its own tests

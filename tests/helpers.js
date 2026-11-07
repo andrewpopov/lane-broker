@@ -19,7 +19,7 @@ let counter = 0;
 // documents at the top of .githooks/pre-push.
 //
 // HOME and STATE are absent here on purpose: freshEnv overwrites both explicitly below.
-const INHERITED_BROKER_VARS = [
+export const INHERITED_BROKER_VARS = [
   'LANE_BROKER_LEASE',
   'LANE_BROKER_TICKET',
   'LANE_BROKER_KEY',
@@ -29,6 +29,8 @@ const INHERITED_BROKER_VARS = [
   'LANE_BROKER_MEMORY_FILE',
   'LANE_BROKER_LOCAL',
   'LANE_BROKER_LOCAL_REASON',
+  'LANE_BROKER_EXECUTOR',
+  'LANE_BROKER_RUNNER',
   'LANE_BROKER_PRIORITY',
   'LANE_BROKER_NO_CACHE',
   'LANE_BROKER_RETRY_REASON',
@@ -65,8 +67,8 @@ export function freshEnv(extra = {}) {
 export function writeGlobalConfig(home, cfg) {
   // Most integration tests predate resource admission and exercise another
   // scheduler dimension. Keep those fixtures independent of ambient host load;
-  // active-admission tests opt in explicitly.
-  const deterministicCfg = { schedulerMode: 'shadow', ...cfg };
+  // active-admission tests opt in explicitly. cpuLimit 'off': no systemd-run scope racing nice checks.
+  const deterministicCfg = { schedulerMode: 'shadow', cpuLimit: 'off', ...cfg };
   fs.writeFileSync(path.join(home, 'config.json'), JSON.stringify(deterministicCfg, null, 2));
 }
 

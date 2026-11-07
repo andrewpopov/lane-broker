@@ -12,6 +12,11 @@ test('an existing host-only script path is flagged as outside the worktree', () 
   assert.deepEqual(found, [{ path: '/private/tmp/x/foo.sh', insideWorktree: false, suggestion: null }]);
 });
 
+test('a /var/tmp path (Linux runner TMPDIR) is host-only', () => {
+  const found = detect(['sh', '/var/tmp/lb-x/foo.sh'], { present: ['/var/tmp/lb-x/foo.sh'] });
+  assert.deepEqual(found, [{ path: '/var/tmp/lb-x/foo.sh', insideWorktree: false, suggestion: null }]);
+});
+
 test('a path inside sh -c is inside the worktree with a cwd-relative suggestion', () => {
   const found = detect(['sh', '-c', `cd ${ROOT}/sub && npm test`], { present: [`${ROOT}/sub`] });
   assert.deepEqual(found, [{ path: `${ROOT}/sub`, insideWorktree: true, suggestion: './sub' }]);

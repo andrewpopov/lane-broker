@@ -222,7 +222,7 @@ test('status --json and remote-probe report cpuLimit {mode, available, reason, m
 
 test('default config: cpuLimit prefer and memoryLimit measure; on darwin the enforcement reason says nice only', async () => {
   const { home, env } = freshEnv();
-  writeGlobalConfig(home, { version: 1 });
+  writeGlobalConfig(home, { version: 1, cpuLimit: 'prefer' });
   const caps = JSON.parse((await laneRun(['capabilities', '--json'], { env })).stdout);
   assert.equal(caps.cpuLimit.mode, 'prefer');
   assert.equal(caps.cpuLimit.memory.mode, 'measure');
@@ -232,14 +232,14 @@ test('default config: cpuLimit prefer and memoryLimit measure; on darwin the enf
 test('config: memoryLimit accepts off/measure, rejects unknown values by name, and refuses "enforce" (BRAIN-696)', async () => {
   for (const value of ['off', 'measure']) {
     const { home, env } = freshEnv();
-    writeGlobalConfig(home, { version: 1, memoryLimit: value });
+    writeGlobalConfig(home, { version: 1, cpuLimit: 'prefer', memoryLimit: value });
     const res = await laneRun(['capabilities', '--json'], { env });
     assert.equal(res.code, 0, res.stderr);
     assert.equal(JSON.parse(res.stdout).cpuLimit.memory.mode, value);
   }
   for (const [value, message] of [['always', /"memoryLimit" must be one of "off", "measure", "enforce", got "always"/], ['enforce', /"memoryLimit": "enforce" is not yet supported.*BRAIN-696/]]) {
     const { base, home, env } = freshEnv();
-    writeGlobalConfig(home, { version: 1, memoryLimit: value });
+    writeGlobalConfig(home, { version: 1, cpuLimit: 'prefer', memoryLimit: value });
     const repoDir = path.join(base, 'repo');
     writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1 } } });
     const res = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'true'], { env, cwd: repoDir });

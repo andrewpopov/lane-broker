@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 // BRAIN-721: absolute paths that exist on the submitting Mac but not in the snapshot a remote runner receives.
-const HOST_ONLY_PREFIXES = ['/private/', '/var/folders/', '/tmp/', '/Volumes/', '/Users/', '/opt/homebrew/', '/Library/'];
+const HOST_ONLY_PREFIXES = ['/private/', '/var/folders/', '/tmp/', '/var/tmp/', '/Volumes/', '/Users/', '/opt/homebrew/', '/Library/'];
 const SHELLS = new Set(['sh', 'bash', 'zsh', 'dash']);
 const SCRIPT_SPLIT = /[\s'"`;&|()<>]+/;
 
