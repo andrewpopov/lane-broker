@@ -539,8 +539,9 @@ test('BRAIN-770: the cap is total wait since first queued, kept on the attempt a
   const waited = await ctx.finish(id, '60s');
   assert.equal(waited.code, 76, `${waited.stderr}\n${ctx.fake.calls().join(',')}`);
   const { endedAt } = resultOf(ctx.state, id);
-  assert.ok(endedAt - moved.firstQueuedAt >= 4000, 'refused only after the whole cap');
-  assert.ok(endedAt < moved.moves[0].at + 4000, 'refused before a fresh full cap on B could have elapsed');
+  const timeline = `firstQueuedAt+${moved.moves[0].at - moved.firstQueuedAt}ms moved, +${endedAt - moved.firstQueuedAt}ms refused`;
+  assert.ok(endedAt - moved.firstQueuedAt >= 4000, `refused only after the whole cap (${timeline})`);
+  assert.ok(endedAt < moved.moves[0].at + 4000, `refused before a fresh full cap on B could have elapsed (${timeline})`);
   assert.deepEqual(ctx.runs(), []);
 });
 

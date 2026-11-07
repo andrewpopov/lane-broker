@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import zlib from 'node:zlib';
+import net from 'node:net';
 import { spawn } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, BIN } from './helpers.js';
 import { encodeSnapshot } from '../src/remote-stream.js';
@@ -14,14 +15,32 @@ import { paths } from '../src/state.js';
 
 const TAIL_BYTES = 200_000;
 const EXIT_WITHIN_MS = 15_000;
-// The job exits at once while a child it leaves behind fills the shared stdout past any pipe buffer (Linux socketpairs hold ~200 KB+).
-const FILL_UNREAD_STDOUT_THEN_EXIT = [process.execPath, '-e', `require('child_process').spawn(process.execPath, ['-e', "process.stdout.write('y'.repeat(8e6))"], { stdio: ['ignore', 'inherit', 'ignore'] }).unref()`];
 const children = [];
+const sockets = [];
 afterEach(() => {
   for (const child of children.splice(0)) child.kill('SIGKILL');
+  for (const s of sockets.splice(0)) s.destroy();
 });
 
-function runExec(gzip, { env = {}, readStdout = true } = {}) {
+/**
+ * A stdout nobody reads whose kernel buffer is already full, so everything remote-exec writes stays pending.
+ * Sizing the job's output cannot do this: a payload past the socket buffer blocks the job itself (macOS and Linux).
+ */
+async function fullUnreadStdout() {
+  const server = net.createServer();
+  await new Promise((resolve) => server.listen(path.join(makeTmpDir('exec-exits-sock-'), 's'), resolve));
+  const accepted = new Promise((resolve) => server.once('connection', resolve));
+  const writer = net.connect(server.address());
+  await new Promise((resolve) => writer.once('connect', resolve));
+  const reader = await accepted;
+  reader.pause();
+  sockets.push(writer, reader, server);
+  writer.write(Buffer.alloc(16 * 1024 * 1024));
+  assert.ok(writer.writableLength > 0, 'the kernel took the whole fill, so the buffer is not full');
+  return writer;
+}
+
+async function runExec(gzip, { env = {}, readStdout = true } = {}) {
   const f = freshEnv({ LANE_BROKER_TEST_RETAIN_HANDLE: '1', LANE_BROKER_TEST_CANCEL_GRACE_MS: '1000', ...env });
   writeGlobalConfig(f.home, {});
   const root = makeTmpDir('exec-exits-root-');
@@ -34,12 +53,12 @@ function runExec(gzip, { env = {}, readStdout = true } = {}) {
     generation: 0,
     repoKey: 'exec-exits-repo',
     lane: 'default',
-    argv: readStdout ? [process.execPath, '-e', `process.stdout.write('y'.repeat(${TAIL_BYTES}) + 'END')`] : FILL_UNREAD_STDOUT_THEN_EXIT,
+    argv: [process.execPath, '-e', `process.stdout.write('y'.repeat(${readStdout ? TAIL_BYTES : 1}) + 'END')`],
     relCwd: '',
   };
   const args = [BIN, 'remote-exec', '--root', root];
   if (gzip) args.push('--transfer', 'gzip');
-  const child = spawn(process.execPath, args, { env: f.env });
+  const child = spawn(process.execPath, args, { env: f.env, stdio: ['pipe', readStdout ? 'pipe' : await fullUnreadStdout(), 'pipe'] });
   children.push(child);
   let out = '';
   if (readStdout) child.stdout.on('data', (d) => (out += d));
