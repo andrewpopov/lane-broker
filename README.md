@@ -2949,6 +2949,12 @@ hammer. They measure the host as much as the code, so PR CI leaves them out, and
 master verify runs them on every master tip (`.train.json` `masterCommand`, `scripts/train-gate.sh
 heavy`). A red there opens the train's master-red incident, as any master verify does.
 
+PR CI can split `npm test` across lanes. When the merge train sets `TRAIN_SHARD=i/N`, `scripts/train-gate.sh`
+runs `scripts/test-shard.sh`, which lints and runs only the files `scripts/test-files.js` deals to shard `i`.
+Files go longest first to the shard with the least time so far, weighted by `tests/durations.json` (seconds
+per file, measured on a runner); a file missing from it counts as the median. Each shard still runs its files
+one at a time, and every shard ends with `zz-tmp-leak-guard`, which checks what the files before it left behind.
+
 ### Gate-cost scorecard: `lane report cost` (BRAIN-529)
 
 Per repo and window `[since, until)` (UTC, one frozen cutoff for history rows by `startedAt`, the
