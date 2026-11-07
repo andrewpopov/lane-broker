@@ -128,7 +128,7 @@ test('firstCores is the first reading, not the whole-span average (4 -> 0 -> 0 c
   assert.equal(integratedCpuSeconds(s, 0, 3000), 8);
 });
 
-test('the exit path takes no process-table scan of its own: only the constructor, the early sample and the reap check', async () => {
+test('the exit path takes no process-table scan of its own: only the constructor, the early sample and the reap check', { skip: process.platform !== 'darwin' && 'counts ps scans, but readProcessTable reads /proc on Linux (src/descendants.js)' }, async () => {
   const f = localEnv(60_000);
   const shimDir = tmpDir('ps-shim');
   const log = path.join(shimDir, 'ps.log');

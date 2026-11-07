@@ -42,9 +42,19 @@ function migratedRoot() {
 /**
  * The "old version" a rollout may still have running, extracted read-only into a temp dir. Pinned to the tag v0.17.0,
  * the last release BEFORE the priority scheduler: `origin/main` moves on (it is 0.18.0+, which is new code and is
- * admitted fine against a migrated root), so it cannot stand for old code. A missing tag fails the test loudly.
+ * admitted fine against a migrated root), so it cannot stand for old code. Without the tag (a runner snapshot has no
+ * history) these tests skip by name; a full checkout runs them.
  */
 const OLD_CODE_TAG = 'v0.17.0';
+const oldCodeTagMissing = (() => {
+  try {
+    gitFixture(['rev-parse', '-q', '--verify', `refs/tags/${OLD_CODE_TAG}`], REPO);
+    return false;
+  } catch {
+    return true;
+  }
+})();
+const needsOldCode = { skip: oldCodeTagMissing && `tag ${OLD_CODE_TAG} is absent (a runner snapshot has no git history; run: git fetch --tags)` };
 function extractOldCode() {
   const dir = makeTmpDir('lane-broker-old-');
   // Archive to a file, then extract it: piping the archive into tar's stdin hit EPIPE under heavy host load.
@@ -98,7 +108,7 @@ test('the cutover leaves a regular file where old code expects queue/, and new c
 
 // ---- REAL old code ----
 
-test('REAL old code (main) cannot be admitted against a migrated root: `lane run` fails and never runs the command', async () => {
+test('REAL old code (main) cannot be admitted against a migrated root: `lane run` fails and never runs the command', needsOldCode, async () => {
   const oldDir = extractOldCode();
   const { state, home, env } = migratedRoot();
   writeGlobalConfig(home, { sampleMs: 100 });
@@ -114,7 +124,7 @@ test('REAL old code (main) cannot be admitted against a migrated root: `lane run
   assert.deepEqual(fs.readdirSync(path.join(state, 'queue-v2')), [], 'nothing queued');
 });
 
-test('REAL old code launched AFTER the process snapshot (the migrator holds the lock) is still refused once the cutover completes', async () => {
+test('REAL old code launched AFTER the process snapshot (the migrator holds the lock) is still refused once the cutover completes', needsOldCode, async () => {
   const oldDir = extractOldCode();
   const { state, home, env } = migratedRoot();
   writeGlobalConfig(home, { sampleMs: 100 });
