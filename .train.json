@@ -25,6 +25,7 @@
     "fallbackCommand": [
       "sh",
       "scripts/train-gate.sh"
-    ]
+    ],
+    "maxConcurrent": 2
   }
 }
