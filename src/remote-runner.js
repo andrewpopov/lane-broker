@@ -67,7 +67,7 @@ const SYNTHETIC_GIT_ENV = {
  * rewriting `.git` (gc.pid, tmp_pack_*, info/refs) into the deps phase. Returns `{ok:true}` or
  * `{ok:false, reason}` -- never throws.
  */
-function gitInitSnapshot(workDir) {
+export function gitInitSnapshot(workDir) {
   const env = { ...scrubbedGitEnv(), ...SYNTHETIC_GIT_ENV };
   const common = {
     cwd: workDir,

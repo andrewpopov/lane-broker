@@ -2,14 +2,18 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
-import { laneRun, writeGlobalConfig } from './helpers.js';
+import { execFileSync, spawn } from 'node:child_process';
+import { laneRun, writeGlobalConfig, BIN } from './helpers.js';
 import { setup, tmpDir, makeGitWorktree } from './remote-harness.js';
-import { paths } from '../src/state.js';
+import { paths, readJsonSafe } from '../src/state.js';
+import { loadGlobalConfig } from '../src/config.js';
+import { gitInitSnapshot } from '../src/remote-runner.js';
 
 /**
- * BRAIN-389, end to end: a real `lane run` -> fake-ssh transport -> `remote-exec` -> `remote-pipeline` with
- * REAL npm. The fixture installs a tarball dependency that ships a `.bin` command, so `npm ci` needs no
+ * BRAIN-389, with REAL npm. Most tests run the runner side alone (`runPipeline`: the snapshot commit and
+ * `lane remote-pipeline` on the pipeline.json remote-exec writes); the ones that test how a lane's config, the
+ * runner's config and the client's env reach that pipeline run a real `lane run` -> fake-ssh transport ->
+ * `remote-exec` -> `remote-pipeline` (`runLane`). The fixture installs a tarball dependency that ships a `.bin` command, so `npm ci` needs no
  * network and a hit has a real `.bin` symlink to run. A shim in front of `npm` counts its invocations, which is
  * how "a hit runs no npm ci" is observed.
  */
@@ -128,6 +132,61 @@ function probeCommand(marker) {
 
 const lastRow = (state) => fs.readFileSync(paths(state).history, 'utf8').trim().split('\n').map((l) => JSON.parse(l)).at(-1);
 
+function runnerConfig(s) {
+  const prev = process.env.LANE_BROKER_HOME;
+  process.env.LANE_BROKER_HOME = s.runnerHome;
+  try {
+    return loadGlobalConfig();
+  } finally {
+    if (prev === undefined) delete process.env.LANE_BROKER_HOME;
+    else process.env.LANE_BROKER_HOME = prev;
+  }
+}
+
+/**
+ * The runner side of one remote run without the transport, about 2 s cheaper than `runLane`: the tracked files land
+ * in a fresh work dir with remote-exec's own snapshot commit, under a per-run TMPDIR, and `lane remote-pipeline`
+ * runs a pipeline.json built from the lane's and the runner's config as remote-exec builds it.
+ */
+async function runPipeline(s, repoDir, { marker, env = s.env, argv } = {}) {
+  const markerPath = marker ?? path.join(tmpDir('deps-cache-marker'), 'probe.json');
+  const ticketDir = tmpDir('deps-cache-ticket');
+  const workDir = path.join(ticketDir, 'work');
+  const tracked = execFileSync('git', ['ls-files', '-z'], { cwd: repoDir, encoding: 'utf8' }).split('\0').filter(Boolean);
+  for (const rel of tracked) fs.cpSync(path.join(repoDir, rel), path.join(workDir, rel));
+  assert.deepEqual(gitInitSnapshot(workDir), { ok: true });
+  const lane = JSON.parse(fs.readFileSync(path.join(workDir, '.lane-broker.json'), 'utf8')).lanes.default;
+  const runnerCfg = runnerConfig(s);
+  fs.writeFileSync(path.join(ticketDir, 'pipeline.json'), JSON.stringify({
+    workDir,
+    relCwd: '',
+    remoteDeps: lane.remoteDeps ?? [],
+    remoteSetup: [],
+    argv: argv ?? probeCommand(markerPath),
+    npmCacheDir: path.join(s.runnerRoot, 'npm-cache'),
+    npmUserConfig: path.join(s.runnerRoot, 'npmrc'),
+    depsCache: {
+      enabled: lane.remoteDepsCache !== false && runnerCfg.remoteDepsCache,
+      rootScriptsSafe: lane.remoteDepsCacheRootScriptsSafe === true,
+      keyFiles: lane.remoteDepsCacheKeyFiles ?? [],
+      root: s.storeDir,
+      maxBytes: runnerCfg.remoteDepsCacheMaxBytes,
+    },
+  }));
+  const runTmp = tmpDir('deps-cache-run-tmp');
+  const child = spawn(process.execPath, [BIN, 'remote-pipeline', ticketDir], {
+    cwd: workDir,
+    env: { ...env, LANE_FAKE_RUNNER: '1', LANE_BROKER_HOME: s.runnerHome, LANE_BROKER_STATE: s.runnerState, TMPDIR: runTmp, TMP: runTmp, TEMP: runTmp },
+  });
+  let stderr = '';
+  child.stderr.on('data', (d) => (stderr += d));
+  child.stdout.resume();
+  const code = await new Promise((resolve) => child.on('close', resolve));
+  const deps = readJsonSafe(path.join(ticketDir, 'deps.json'));
+  const probe = fs.existsSync(markerPath) ? JSON.parse(fs.readFileSync(markerPath, 'utf8')) : null;
+  return { code, stderr, probe, cwd: workDir, row: { depsCache: deps?.outcome, depsMs: deps?.ms } };
+}
+
 async function runLane(s, repoDir, { repo = 'r', marker, env = s.env } = {}) {
   const markerPath = marker ?? path.join(tmpDir('deps-cache-marker'), 'probe.json');
   const r = await laneRun(['run', '--repo', repo, '--lane', 'default', '--', ...probeCommand(markerPath)], { env, cwd: repoDir });
@@ -161,8 +220,8 @@ test('a miss installs and publishes; the next run is a hit that runs no npm ci, 
 test('what a lane does to its own tree never reaches the store: the next hit gets the original bytes', async () => {
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(repoFiles());
-  await runLane(s, repoDir); // miss: publishes
-  const hit = await runLane(s, repoDir); // hit: its command appended to an installed file and added a new one
+  await runPipeline(s, repoDir); // miss: publishes
+  const hit = await runPipeline(s, repoDir); // hit: its command appended to an installed file and added a new one
   assert.equal(hit.probe.inPlace, 'wrote');
   const key = s.storedKeys()[0];
   const storedTree = path.join(s.storeDir, key, 'node_modules');
@@ -175,10 +234,10 @@ test('what a lane does to its own tree never reaches the store: the next hit get
 
 test('a lockfile change is a miss and installs again', async () => {
   const s = setupWithNpmSpy();
-  await runLane(s, makeGitWorktree(repoFiles()));
+  await runPipeline(s, makeGitWorktree(repoFiles()));
   assert.equal(s.npmCiCalls(), 1);
 
-  const changed = await runLane(s, makeGitWorktree(repoFiles({ lockEdit: (lock) => (lock.packages[''].version = '1.0.1') })));
+  const changed = await runPipeline(s, makeGitWorktree(repoFiles({ lockEdit: (lock) => (lock.packages[''].version = '1.0.1') })));
   assert.equal(changed.code, 0, changed.stderr);
   assert.equal(changed.row.depsCache, 'miss');
   assert.equal(s.npmCiCalls(), 2);
@@ -215,27 +274,27 @@ test('an install that writes outside node_modules is not cached, says why, and s
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(repoFiles({ postinstall: 'outside' }));
 
-  const first = await runLane(s, repoDir);
+  const first = await runPipeline(s, repoDir);
   assert.equal(first.code, 0, first.stderr);
   assert.equal(first.row.depsCache, 'miss');
   assert.match(first.stderr, /deps-cache miss key=[0-9a-f]{12} dir=\. ms=\d+ published=no reason="install changed files outside node_modules: generated-by-postinstall\.txt"/);
   assert.equal(first.probe.out, 'hello from the bin', 'the tree is usable for this run');
   assert.equal(s.storedKeys().length, 0);
 
-  const second = await runLane(s, repoDir);
+  const second = await runPipeline(s, repoDir);
   assert.equal(second.row.depsCache, 'miss', 'never a hit: the postinstall must run again');
   assert.equal(s.npmCiCalls(), 2);
 });
 
 test('a store bound that holds one tree: publishing a second key evicts the first, and releasing the lease trims what the lease had protected', async () => {
   const s = setupWithNpmSpy();
-  const a = await runLane(s, makeGitWorktree(repoFiles()));
+  const a = await runPipeline(s, makeGitWorktree(repoFiles()));
   assert.equal(a.row.depsCache, 'miss');
   const [keyA] = s.storedKeys();
   const bytes = JSON.parse(fs.readFileSync(path.join(s.storeDir, keyA, 'meta.json'), 'utf8')).bytes;
 
   writeGlobalConfig(s.runnerHome, { sampleMs: 50, capacity: 4, remoteDepsCacheMaxBytes: bytes + 1 });
-  const b = await runLane(s, makeGitWorktree(repoFiles({ lockEdit: (lock) => (lock.packages[''].version = '2.0.0') })));
+  const b = await runPipeline(s, makeGitWorktree(repoFiles({ lockEdit: (lock) => (lock.packages[''].version = '2.0.0') })));
   assert.equal(b.row.depsCache, 'miss');
   const keysAfterB = s.storedKeys();
   assert.equal(keysAfterB.length, 1);
@@ -243,7 +302,7 @@ test('a store bound that holds one tree: publishing a second key evicts the firs
   assert.deepEqual(fs.readdirSync(s.storeDir).filter((n) => n.startsWith('.trash-') || n.startsWith('.tmp-')), []);
 
   writeGlobalConfig(s.runnerHome, { sampleMs: 50, capacity: 4, remoteDepsCacheMaxBytes: 1 });
-  const c = await runLane(s, makeGitWorktree(repoFiles({ lockEdit: (lock) => (lock.packages[''].version = '3.0.0') })));
+  const c = await runPipeline(s, makeGitWorktree(repoFiles({ lockEdit: (lock) => (lock.packages[''].version = '3.0.0') })));
   assert.equal(c.row.depsCache, 'miss');
   assert.equal(s.storedKeys().length, 0, 'over the bound only while this run held its lease; trimmed when it released it');
 });
@@ -252,8 +311,8 @@ test('two real runs missing on the same key at once both succeed and leave one i
   const s = setupWithNpmSpy();
   const files = repoFiles();
   const [a, b] = await Promise.all([
-    runLane(s, makeGitWorktree(files), { repo: 'r1' }),
-    runLane(s, makeGitWorktree(files), { repo: 'r2' }),
+    runPipeline(s, makeGitWorktree(files)),
+    runPipeline(s, makeGitWorktree(files)),
   ]);
   assert.equal(a.code, 0, a.stderr);
   assert.equal(b.code, 0, b.stderr);
@@ -263,7 +322,7 @@ test('two real runs missing on the same key at once both succeed and leave one i
   assert.deepEqual(fs.readdirSync(s.storeDir).filter((n) => n.startsWith('.tmp-')), []);
 
   const calls = s.npmCiCalls();
-  const next = await runLane(s, makeGitWorktree(files), { repo: 'r3' });
+  const next = await runPipeline(s, makeGitWorktree(files));
   assert.equal(next.row.depsCache, 'hit');
   assert.equal(s.npmCiCalls(), calls, 'the entry the racing runs left behind is complete');
   assert.equal(next.probe.out, 'hello from the bin');
@@ -274,7 +333,7 @@ test('an install that embeds its own absolute path in a text file is cached, and
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(repoFiles({ postinstall: 'embed' }));
 
-  const first = await runLane(s, repoDir);
+  const first = await runPipeline(s, repoDir);
   assert.equal(first.code, 0, first.stderr);
   assert.equal(first.row.depsCache, 'miss');
   assert.match(first.stderr, /deps-cache miss key=[0-9a-f]{12} dir=\. ms=\d+ published=yes/);
@@ -282,7 +341,7 @@ test('an install that embeds its own absolute path in a text file is cached, and
   const recorded = JSON.parse(fs.readFileSync(path.join(s.storeDir, s.storedKeys()[0], 'meta.json'), 'utf8')).relocation;
   assert.deepEqual(recorded.entries, [{ relPath: 'hello-tool/where.txt', kind: 'text' }]);
 
-  const second = await runLane(s, repoDir);
+  const second = await runPipeline(s, repoDir);
   assert.equal(second.row.depsCache, 'hit');
   assert.equal(s.npmCiCalls(), 1, 'a hit runs no npm ci');
   assert.equal(second.probe.out, 'hello from the bin');
@@ -292,7 +351,7 @@ test('a node-gyp build tree (Makefile and config.gypi naming the work dir) is ca
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(repoFiles({ postinstall: 'node-gyp' }));
 
-  const first = await runLane(s, repoDir);
+  const first = await runPipeline(s, repoDir);
   assert.equal(first.code, 0, first.stderr);
   assert.equal(first.row.depsCache, 'miss');
   assert.match(first.stderr, /deps-cache miss key=[0-9a-f]{12} dir=\. ms=\d+ published=yes/);
@@ -300,7 +359,7 @@ test('a node-gyp build tree (Makefile and config.gypi naming the work dir) is ca
   assert.deepEqual(fs.readdirSync(path.join(stored, 'build')), ['Release']);
   assert.ok(fs.existsSync(path.join(stored, 'build', 'Release', 'hello.node')));
 
-  const second = await runLane(s, repoDir);
+  const second = await runPipeline(s, repoDir);
   assert.equal(second.row.depsCache, 'hit');
   assert.equal(s.npmCiCalls(), 1, 'a hit runs no npm ci');
   assert.equal(second.probe.out, 'hello from the bin');
@@ -312,17 +371,17 @@ test('a snapshot with more than ~6,700 loose objects (the trigger of git gc --au
   for (let i = 0; i < 7200; i += 1) files[`many/f${i}.txt`] = `file ${i}\n`;
   const repoDir = makeGitWorktree(files);
 
-  const first = await runLane(s, repoDir);
+  const first = await runPipeline(s, repoDir);
   assert.equal(first.code, 0, first.stderr);
   assert.match(first.stderr, /deps-cache miss key=[0-9a-f]{12} dir=\. ms=\d+ published=yes/);
   assert.equal(s.storedKeys().length, 1);
-  const second = await runLane(s, repoDir);
+  const second = await runPipeline(s, repoDir);
   assert.equal(second.row.depsCache, 'hit');
 });
 
 test('an install script that creates a git tag (a ref change) is not published (BRAIN-423)', async () => {
   const s = setupWithNpmSpy();
-  const run = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'git-tag' })));
+  const run = await runPipeline(s, makeGitWorktree(repoFiles({ postinstall: 'git-tag' })));
   assert.equal(run.code, 0, run.stderr);
   assert.match(run.stderr, /published=no reason="install changed files outside node_modules: .*\.git/);
   assert.equal(s.storedKeys().length, 0);
@@ -331,14 +390,14 @@ test('an install script that creates a git tag (a ref change) is not published (
 test('a hit whose relocation cannot be verified is discarded and installed normally, with the reason logged', async () => {
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(repoFiles({ postinstall: 'embed' }));
-  await runLane(s, repoDir);
+  await runPipeline(s, repoDir);
   const meta = path.join(s.storeDir, s.storedKeys()[0], 'meta.json');
   const record = JSON.parse(fs.readFileSync(meta, 'utf8'));
   record.relocation.entries.push({ relPath: 'hello-tool/package.json', kind: 'text' }); // names no install path
   fs.chmodSync(meta, 0o644);
   fs.writeFileSync(meta, JSON.stringify(record));
 
-  const second = await runLane(s, repoDir);
+  const second = await runPipeline(s, repoDir);
   assert.equal(second.code, 0, second.stderr);
   assert.match(second.stderr, /deps-cache materialize failed, installing instead: relocation: hello-tool\/package\.json holds no placeholder/);
   assert.equal(s.npmCiCalls(), 2, 'it installed');
@@ -347,7 +406,7 @@ test('a hit whose relocation cannot be verified is discarded and installed norma
 
 test('a binary file that embeds the install path keeps the tree out of the cache', async () => {
   const s = setupWithNpmSpy();
-  const first = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'embed-big' })));
+  const first = await runPipeline(s, makeGitWorktree(repoFiles({ postinstall: 'embed-big' })));
   assert.equal(first.code, 0, first.stderr);
   assert.equal(first.row.depsCache, 'skip');
   assert.match(first.stderr, /reason=absolute-install-path-binary file=hello-tool\/native\.bin/);
@@ -357,20 +416,20 @@ test('a binary file that embeds the install path keeps the tree out of the cache
 test('a changed environment variable is a miss', async () => {
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(repoFiles());
-  await runLane(s, repoDir);
-  assert.equal((await runLane(s, repoDir)).row.depsCache, 'hit');
-  const changed = await runLane(s, repoDir, { env: { ...s.env, CXX: 'a-different-compiler' } });
+  await runPipeline(s, repoDir);
+  assert.equal((await runPipeline(s, repoDir)).row.depsCache, 'hit');
+  const changed = await runPipeline(s, repoDir, { env: { ...s.env, CXX: 'a-different-compiler' } });
   assert.equal(changed.code, 0, changed.stderr);
   assert.equal(changed.row.depsCache, 'miss');
   assert.equal(s.storedKeys().length, 2);
-  const volatile = await runLane(s, repoDir, { env: { ...s.env, SSH_CONNECTION: '1.2.3.4 1 5.6.7.8 22', LANE_FAKE_OTHER: 'x' } });
+  const volatile = await runPipeline(s, repoDir, { env: { ...s.env, SSH_CONNECTION: '1.2.3.4 1 5.6.7.8 22', LANE_FAKE_OTHER: 'x' } });
   assert.equal(volatile.row.depsCache, 'hit', 'ssh and lane variables are excluded from the key');
 });
 
 test('a changed file: tarball is a miss and installs again', async () => {
   const s = setupWithNpmSpy();
-  await runLane(s, makeGitWorktree(repoFiles()));
-  const changed = await runLane(s, makeGitWorktree(repoFiles({ tarball: Buffer.concat([fixtureBase().tarball, Buffer.from('changed')]) })));
+  await runPipeline(s, makeGitWorktree(repoFiles()));
+  const changed = await runPipeline(s, makeGitWorktree(repoFiles({ tarball: Buffer.concat([fixtureBase().tarball, Buffer.from('changed')]) })));
   assert.equal(changed.row.depsCache, 'miss');
   assert.equal(s.npmCiCalls(), 2, 'it did not reuse the cached tree for the changed tarball');
   assert.equal(s.storedKeys().length, 2);
@@ -379,7 +438,7 @@ test('a changed file: tarball is a miss and installs again', async () => {
 test('a lock that is not pinned to content is skipped with its reason, and the run still installs', async () => {
   const s = setupWithNpmSpy();
   const noIntegrity = (lock) => delete lock.packages['node_modules/hello-tool'].integrity;
-  const run = await runLane(s, makeGitWorktree(repoFiles({ lockEdit: noIntegrity })));
+  const run = await runPipeline(s, makeGitWorktree(repoFiles({ lockEdit: noIntegrity })));
   assert.equal(run.code, 0, run.stderr);
   assert.equal(run.row.depsCache, 'skip');
   assert.match(run.stderr, /deps-cache skip dir=\. ms=\d+ reason="lock entry node_modules\/hello-tool resolves to an unpinned source/);
@@ -388,13 +447,13 @@ test('a lock that is not pinned to content is skipped with its reason, and the r
 
 test('a root lifecycle script outside the allowlist skips the cache unless the lane declares root scripts safe', async () => {
   const s = setupWithNpmSpy();
-  const skipped = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'harmless', rootScriptsSafe: false })));
+  const skipped = await runPipeline(s, makeGitWorktree(repoFiles({ postinstall: 'harmless', rootScriptsSafe: false })));
   assert.equal(skipped.code, 0, skipped.stderr);
   assert.equal(skipped.row.depsCache, 'skip');
   assert.match(skipped.stderr, /reason="root lifecycle script not known to leave node_modules alone \(postinstall: node -e/);
   assert.equal(s.storedKeys().length, 0);
 
-  const declared = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'harmless', rootScriptsSafe: true })));
+  const declared = await runPipeline(s, makeGitWorktree(repoFiles({ postinstall: 'harmless', rootScriptsSafe: true })));
   assert.equal(declared.row.depsCache, 'miss');
   assert.equal(s.storedKeys().length, 1);
 });
@@ -402,7 +461,7 @@ test('a root lifecycle script outside the allowlist skips the cache unless the l
 test('PKG-277: a non-workspace repo with safe root scripts keys its remoteDepsCacheKeyFiles: edit one and the cache misses, edit anything else and it hits', async () => {
   const s = setupWithNpmSpy();
   const files = repoFiles({ postinstall: 'harmless' });
-  const run = async (edit = {}) => runLane(s, makeGitWorktree({ ...files, 'unrelated.txt': 'one', ...edit }));
+  const run = async (edit = {}) => runPipeline(s, makeGitWorktree({ ...files, 'unrelated.txt': 'one', ...edit }));
   const cold = await run();
   assert.equal(cold.row.depsCache, 'miss');
   assert.match(cold.stderr, /published=yes/);
@@ -417,15 +476,15 @@ test('PKG-277: a non-workspace repo with safe root scripts keys its remoteDepsCa
 test('the allowlisted prepare script (git config core.hooksPath) does not stop a tree being cached', async () => {
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(repoFiles({ prepare: 'git config core.hooksPath .githooks || true' }));
-  const first = await runLane(s, repoDir);
+  const first = await runPipeline(s, repoDir);
   assert.equal(first.code, 0, first.stderr);
   assert.match(first.stderr, /deps-cache miss key=[0-9a-f]{12} dir=\. ms=\d+ published=yes/);
-  assert.equal((await runLane(s, repoDir)).row.depsCache, 'hit');
+  assert.equal((await runPipeline(s, repoDir)).row.depsCache, 'hit');
 });
 
 test('an install npm did not fully record (a simulated missing optional dependency) is not published', async () => {
   const s = setupWithNpmSpy();
-  const run = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'drop-installed-record' })));
+  const run = await runPipeline(s, makeGitWorktree(repoFiles({ postinstall: 'drop-installed-record' })));
   assert.equal(run.code, 0, run.stderr);
   assert.equal(run.row.depsCache, 'skip');
   assert.match(run.stderr, /deps-cache skip key=[0-9a-f]{12} dir=\. ms=\d+ reason=incomplete-optional missing=hello-tool/);
@@ -435,11 +494,11 @@ test('an install npm did not fully record (a simulated missing optional dependen
 test('every hit replays the allowlisted root script: core.hooksPath is set in the work dir whether the tree was installed or copied', async () => {
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(repoFiles({ prepare: 'git config core.hooksPath .githooks || true' }));
-  const miss = await runLane(s, repoDir);
+  const miss = await runPipeline(s, repoDir);
   assert.equal(miss.row.depsCache, 'miss');
   assert.equal(miss.probe.hooksPath, '.githooks', 'npm ci ran the script');
 
-  const hit = await runLane(s, repoDir);
+  const hit = await runPipeline(s, repoDir);
   assert.equal(hit.row.depsCache, 'hit');
   assert.equal(s.npmCiCalls(), 1);
   assert.equal(hit.probe.hooksPath, '.githooks', 'the hit replayed it, since npm ci did not run');
@@ -447,7 +506,7 @@ test('every hit replays the allowlisted root script: core.hooksPath is set in th
 
 test('a root script that writes anything else under .git (a hook file) is not published', async () => {
   const s = setupWithNpmSpy();
-  const run = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'hook-file' })));
+  const run = await runPipeline(s, makeGitWorktree(repoFiles({ postinstall: 'hook-file' })));
   assert.equal(run.code, 0, run.stderr);
   assert.equal(run.row.depsCache, 'miss');
   assert.match(run.stderr, /published=no reason="install changed files outside node_modules: .*\.git\/hooks/);
@@ -456,7 +515,7 @@ test('a root script that writes anything else under .git (a hook file) is not pu
 
 test('a prepublish root script (which npm ci runs) is not cached unless the lane declares it safe', async () => {
   const s = setupWithNpmSpy();
-  const run = await runLane(s, makeGitWorktree(repoFiles({ scripts: { prepublish: 'node -e 0' } })));
+  const run = await runPipeline(s, makeGitWorktree(repoFiles({ scripts: { prepublish: 'node -e 0' } })));
   assert.equal(run.code, 0, run.stderr);
   assert.equal(run.row.depsCache, 'skip');
   assert.match(run.stderr, /reason="root lifecycle script not known to leave node_modules alone \(prepublish: node -e 0\)"/);
@@ -467,10 +526,10 @@ test('a variable an .npmrc reads from a scrubbed name (LANE_OMIT) never reaches 
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(repoFiles({ dev: true, npmrcExtra: 'omit=${LANE_OMIT}\n' }));
   // if LANE_OMIT=dev reached npm it would leave the (dev) tool out of the tree and the command would fail
-  const omitDev = await runLane(s, repoDir, { env: { ...s.env, LANE_OMIT: 'dev' } });
+  const omitDev = await runPipeline(s, repoDir, { env: { ...s.env, LANE_OMIT: 'dev' } });
   assert.equal(omitDev.code, 0, omitDev.stderr);
   assert.equal(omitDev.probe.out, 'hello from the bin', 'the tree is the one a run without LANE_OMIT gets');
-  const other = await runLane(s, repoDir, { env: { ...s.env, LANE_OMIT: 'optional' } });
+  const other = await runPipeline(s, repoDir, { env: { ...s.env, LANE_OMIT: 'optional' } });
   assert.equal(other.code, 0, other.stderr);
   assert.equal(other.probe.out, 'hello from the bin');
   assert.equal(other.row.depsCache, 'hit', 'same effective environment, same key');
@@ -479,7 +538,7 @@ test('a variable an .npmrc reads from a scrubbed name (LANE_OMIT) never reaches 
 
 test('the per-run TMPDIR path is recorded for relocation too', async () => {
   const s = setupWithNpmSpy();
-  const run = await runLane(s, makeGitWorktree(repoFiles({ postinstall: 'embed-tmpdir' })));
+  const run = await runPipeline(s, makeGitWorktree(repoFiles({ postinstall: 'embed-tmpdir' })));
   assert.equal(run.code, 0, run.stderr);
   assert.equal(run.row.depsCache, 'miss');
   const recorded = JSON.parse(fs.readFileSync(path.join(s.storeDir, s.storedKeys()[0], 'meta.json'), 'utf8')).relocation;
@@ -490,9 +549,9 @@ test('the per-run TMPDIR path is recorded for relocation too', async () => {
 test('runs submitted with different LC_ALL / LC_CTYPE / LANG share one key: the second is a hit (BRAIN-429)', async () => {
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(repoFiles());
-  const first = await runLane(s, repoDir, { env: { ...s.env, LC_ALL: 'en_US.UTF-8', LANG: 'en_US.UTF-8' } });
+  const first = await runPipeline(s, repoDir, { env: { ...s.env, LC_ALL: 'en_US.UTF-8', LANG: 'en_US.UTF-8' } });
   assert.equal(first.row.depsCache, 'miss');
-  const second = await runLane(s, repoDir, { env: { ...s.env, LC_ALL: undefined, LC_CTYPE: 'C', LANG: 'fr_FR.UTF-8' } });
+  const second = await runPipeline(s, repoDir, { env: { ...s.env, LC_ALL: undefined, LC_CTYPE: 'C', LANG: 'fr_FR.UTF-8' } });
   assert.equal(second.code, 0, second.stderr);
   assert.match(second.stderr, /deps-cache hit key=/);
   assert.equal(s.storedKeys().length, 1);
@@ -512,10 +571,10 @@ test('SSH_AUTH_SOCK reaches the install (a git+ssh dependency needs it) but is n
 test('with ignore-scripts in effect (from .npmrc) a hit does not replay the root script a miss did not run', async () => {
   const s = setupWithNpmSpy();
   const repoDir = makeGitWorktree(repoFiles({ prepare: 'git config core.hooksPath .githooks || true', npmrcExtra: 'ignore-scripts=true\n' }));
-  const miss = await runLane(s, repoDir);
+  const miss = await runPipeline(s, repoDir);
   assert.equal(miss.row.depsCache, 'miss');
   assert.equal(miss.probe.hooksPath, null, 'npm ci ran no scripts');
-  const hit = await runLane(s, repoDir);
+  const hit = await runPipeline(s, repoDir);
   assert.equal(hit.row.depsCache, 'hit');
   assert.equal(hit.probe.hooksPath, null, 'and neither did the hit');
 });
@@ -617,10 +676,10 @@ test('workspace root generators restore keyed output and regenerate after source
     const repoDir = makeGitWorktree({ ...files, 'packages/api/schema.txt': value });
     const marker = path.join(tmpDir('deps-cache-generator-marker'), 'probe.json');
     const probe = `require('fs').copyFileSync('node_modules/generated-value.json', ${JSON.stringify(marker)})`;
-    const result = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'node', '-e', probe], { env: s.env, cwd: repoDir });
+    const result = await runPipeline(s, repoDir, { argv: ['node', '-e', probe] });
     assert.equal(result.code, 0, result.stderr);
     assert.equal(JSON.parse(fs.readFileSync(marker, 'utf8')).value, value);
-    return { ...result, row: lastRow(s.state) };
+    return result;
   };
   const first = await run('initial schema');
   assert.equal(first.row.depsCache, 'miss');
@@ -638,8 +697,7 @@ test('an npm-workspace repo is cached: the second run is a hit that recreates th
   const repoDir = makeGitWorktree(workspaceRepoFiles());
   const run = async () => {
     const marker = path.join(tmpDir('deps-cache-ws-marker'), 'probe.json');
-    const r = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...workspaceProbe(marker)], { env: s.env, cwd: repoDir });
-    return { ...r, probe: fs.existsSync(marker) ? JSON.parse(fs.readFileSync(marker, 'utf8')) : null, row: lastRow(s.state) };
+    return runPipeline(s, repoDir, { marker, argv: workspaceProbe(marker) });
   };
 
   const first = await run();
