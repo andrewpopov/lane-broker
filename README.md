@@ -2908,9 +2908,9 @@ npm run lint
 Run `npm run hooks` once after cloning to enable the pre-push gate.
 
 The pre-push gate is lint only and takes no lane, so a push never queues. Tests run
-on the PR: the train checks every open PR with the full suite
-(`scripts/train-gate.sh`), and `train pr add <pr>` merges it once that commit is
-green; `train pr wait <pr>` reports the result. `npm run verify` is the full suite.
+on the PR: the train checks every open PR with the `pr` tier of the suite
+(`scripts/train-gate.sh`; the heavy files run on master), and `train pr add <pr>` merges it once that commit is
+green; `train pr wait <pr>` reports the result. `npm run verify` is lint plus the full suite.
 
 `npm run lint` is `node --check` — a syntax parser, not a full linter. It
 catches parse errors only (no unused vars, no shadowing, no undefined
@@ -2929,15 +2929,22 @@ failure the hook is there to catch.
 
 ### Running the tests
 
-`npm test` runs the suite with `--test-concurrency=1`. That is deliberate, not
-timidity: every test here drives **real** processes — detached supervisors,
-process groups, SIGSTOP/SIGTERM/SIGKILL, an 8×200 mutex contention hammer, a
-200k-line log tee. Running the files in parallel multiplies that by the number
-of workers and the suite starves itself: `no-backfill` then times out waiting
-for a lease that a scheduled-out CLI has not written yet, on a machine where it
-passes standalone in under two seconds. A test suite for a tool that exists to
-stop parallel processes from starving each other should not itself be a
-thundering herd.
+`scripts/test-tier.js <pr|heavy|all>` runs the suite as one `node:test` runner process, so the
+final `zz-tmp-leak-guard` file (which checks the temp dirs every other file left, keyed by the runner's pid)
+runs alone after the pool has exited. Files run concurrently, **concurrency = `floor(LANE_BROKER_CPU_CORES)`**
+(the lane's CPU grant; 1 outside a lane), longest-first by `scripts/test-weights.json`. Every test here drives
+real processes (supervisors, process groups, signals, an 8x200 mutex hammer), so workers must never outnumber
+the cores the lane was given: that over-subscription is what starved the suite when it ran in parallel.
+
+- `pr`: every file except the heavy ones. PR CI runs it (`sh scripts/train-gate.sh`, default tier).
+- `heavy`: `lane-claim-scale`, `lane-soak` and `mutex-contention` (scale, soak and perf), too slow for a PR.
+  The train's master verify runs `sh scripts/train-gate.sh all`, so they run on every master tip.
+- `all`: everything. `npm test` is `all` and serial locally (concurrency 1); `npm run test:pr` / `test:heavy`
+  run the other tiers.
+- `--dry-run` runs nothing and prints the ordered files plus the predicted makespan for the concurrency.
+- A real run ends with `test-tier file <name> <seconds>s` lines; refresh the weights from a saved log with
+  `node scripts/test-tier.js --weights-from <log> > scripts/test-weights.json`. A test over 400 s weight fails
+  `tests/test-tier.test.js`, so split it before it becomes the critical path.
 
 ### Gate-cost scorecard: `lane report cost` (BRAIN-529)
 

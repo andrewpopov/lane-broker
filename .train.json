@@ -3,7 +3,8 @@
   "lane": "train",
   "command": [
     "sh",
-    "scripts/train-gate.sh"
+    "scripts/train-gate.sh",
+    "all"
   ],
   "fastTier": "verify:fast",
   "batchSize": 4,
@@ -14,16 +15,18 @@
     ".train.json",
     "package-lock.json"
   ],
-  "verifyMaster": false,
+  "verifyMaster": true,
   "prCi": {
     "lane": "pr",
     "command": [
       "sh",
-      "scripts/train-gate.sh"
+      "scripts/train-gate.sh",
+      "pr"
     ],
     "fallbackCommand": [
       "sh",
-      "scripts/train-gate.sh"
+      "scripts/train-gate.sh",
+      "pr"
     ],
     "maxConcurrent": 2
   }

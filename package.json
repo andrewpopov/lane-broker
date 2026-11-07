@@ -34,8 +34,10 @@
     "node": ">=20"
   },
   "scripts": {
-    "test": "node --test --test-concurrency=1 tests/*.test.js",
-    "lint": "node --check bin/lane.js && node --check bin/lane-store.js && for f in src/*.js src/store/*.js scripts/*.sh; do case \"$f\" in *.sh) sh -n \"$f\" || exit 1 ;; *) node --check \"$f\" || exit 1 ;; esac; done",
+    "test": "node scripts/test-tier.js all",
+    "test:pr": "node scripts/test-tier.js pr",
+    "test:heavy": "node scripts/test-tier.js heavy",
+    "lint": "node --check bin/lane.js && node --check bin/lane-store.js && for f in src/*.js src/store/*.js scripts/*.sh scripts/*.js; do case \"$f\" in *.sh) sh -n \"$f\" || exit 1 ;; *) node --check \"$f\" || exit 1 ;; esac; done",
     "verify": "npm run lint && sh scripts/verify-suite.sh",
     "verify:fast": "npm run lint",
     "hooks": "git config core.hooksPath .githooks"
