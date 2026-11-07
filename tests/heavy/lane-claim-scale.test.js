@@ -1,8 +1,8 @@
 import { describe, test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
-import { claimNext } from '../src/lane-db.js';
-import { PgCluster, PG_SKIP_REASON, seedScale } from './lane-db-harness.js';
+import { claimNext } from '../../src/lane-db.js';
+import { PgCluster, PG_SKIP_REASON, seedScale } from '../lane-db-harness.js';
 
 /**
  * BRAIN-400: claim_next at the size the spec plans for (60,000 queued jobs, about 40 active groups, 3 classes, 5 hosts).

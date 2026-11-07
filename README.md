@@ -2943,6 +2943,12 @@ passes standalone in under two seconds. A test suite for a tool that exists to
 stop parallel processes from starving each other should not itself be a
 thundering herd.
 
+The scale, perf and soak tests live in `tests/heavy/` and run with `npm run test:heavy`, not
+`npm test`: claim latency at 60,000 queued jobs, the Postgres lock-order soak and the 8×200 mutex
+hammer. They measure the host as much as the code, so PR CI leaves them out, and the merge train's
+master verify runs them on every master tip (`.train.json` `masterCommand`, `scripts/train-gate.sh
+heavy`). A red there opens the train's master-red incident, as any master verify does.
+
 ### Gate-cost scorecard: `lane report cost` (BRAIN-529)
 
 Per repo and window `[since, until)` (UTC, one frozen cutoff for history rows by `startedAt`, the

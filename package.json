@@ -35,6 +35,7 @@
   },
   "scripts": {
     "test": "node --test --test-concurrency=1 --import ./tests/helpers/hermetic-host.js tests/*.test.js",
+    "test:heavy": "node --test --test-concurrency=1 --import ./tests/helpers/hermetic-host.js tests/heavy/*.test.js",
     "lint": "node --check bin/lane.js && node --check bin/lane-store.js && for f in src/*.js src/store/*.js scripts/*.sh; do case \"$f\" in *.sh) sh -n \"$f\" || exit 1 ;; *) node --check \"$f\" || exit 1 ;; esac; done",
     "verify": "npm run lint && sh scripts/verify-suite.sh",
     "verify:fast": "npm run lint",
