@@ -87,7 +87,7 @@ function cgroupV2Dirs(readFile) {
  * treated as Linux: cgroup limits win over host-level values when present. */
 export function detectResourceCapacity({
   platform = process.platform,
-  parallelism = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length,
+  parallelism = null,
   totalMemory = os.totalmem(),
   freeMemory = os.freemem(),
   readFile = fs.readFileSync,
@@ -95,7 +95,8 @@ export function detectResourceCapacity({
   exec = execFileSync,
   testHostCores = Number(process.env.LANE_BROKER_TEST_HOST_CORES) || null,
 } = {}) {
-  let cpuCores = Math.max(1, Number(testHostCores ?? parallelism) || 1);
+  const machineCores = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
+  let cpuCores = Math.max(1, Number(parallelism ?? testHostCores ?? machineCores) || 1);
   let memoryBytes = Math.max(1, Number(totalMemory) || 1);
   let availableMemoryBytes = Math.max(0, Number(freeMemory) || 0);
   const sources = ['os'];
