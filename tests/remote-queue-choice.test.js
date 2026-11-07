@@ -4,12 +4,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { freshEnv, writeGlobalConfig, laneRun, waitFor, writeRepoConfig, writeCpuBusyFile } from './helpers.js';
 import { spawn } from 'node:child_process';
-import { tmpDir, makeRunner, setup, markerCmd, detachAndWait, resultOf } from './remote-harness.js';
+import { tmpDir, makeRunner, setup, markerCmd, detachAndWait, resultOf, recordingCmd } from './remote-harness.js';
 import { selectRunner } from '../src/remote-client.js';
 import { couldAdmitNow, enqueue } from '../src/scheduler.js';
 import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig, ConfigError, resolveTicketConfig } from '../src/config.js';
 import { writeLease, LEASE_STATE } from '../src/lease.js';
-import { bootId, paths } from '../src/state.js';
+import { bootId, paths, readJsonSafe } from '../src/state.js';
+import { readAttempt } from '../src/attempts.js';
 import { detectResourceCapacity } from '../src/resources.js';
 
 /** A fake ssh that answers `remote-probe` per destination from `probes` (name -> payload). */
@@ -199,6 +200,36 @@ test('maxRemoteQueue defaults to 2, accepts 0, rejects negative and non-integers
 // The fake runner's `remote-probe` reads the CLIENT's own broker state (see makeFakeSshBin), so a
 // ticket queued locally shows up as `queued: 1` on the runner AND makes local admission say no.
 
+/** The supervisor has chosen where `id` runs: it is dispatched to a runner, or it sits in the local queue. */
+function dispatched(state, id) {
+  if (readAttempt(state, id)?.runner) return true;
+  const queue = paths(state).queue;
+  return fs.existsSync(queue) && fs.readdirSync(queue).some((n) => readJsonSafe(path.join(queue, n))?.id === id);
+}
+
+/**
+ * Runs `args` detached while a local `hold` lease and a queued ticket behind it make local admission say no, and
+ * releases the hold only once the supervisor has chosen. A fixed-length hold can end first on a loaded host.
+ */
+async function dispatchWhileHeld({ env, state, repoDir }, args) {
+  const release = path.join(tmpDir('release'), 'go');
+  const blocker = laneRun(['run', '--repo', 'r', '--lane', 'hold', '--', ...recordingCmd(path.join(tmpDir('hold'), 'ran'), release)], { env, cwd: repoDir });
+  await waitFor(() => fs.existsSync(paths(state).leases) && fs.readdirSync(paths(state).leases).some((n) => n.endsWith('.json')), { timeoutMs: 60_000 });
+  const queued = laneRun(['run', '--repo', 'r', '--lane', 'hold', '--', 'true'], { env, cwd: repoDir });
+  await waitFor(() => fs.existsSync(paths(state).queue) && fs.readdirSync(paths(state).queue).length > 0, { timeoutMs: 60_000 });
+  const started = await laneRun(args, { env, cwd: repoDir });
+  assert.equal(started.code, 0, `--detach itself should not fail: ${started.stderr}`);
+  const id = started.stdout.trim();
+  try {
+    await waitFor(() => dispatched(state, id), { timeoutMs: 60_000 });
+  } finally {
+    fs.writeFileSync(release, '');
+  }
+  const waited = await laneRun(['wait', id, '--timeout', '180s'], { env });
+  await Promise.all([blocker, queued]);
+  return { id, waited };
+}
+
 test('supervisor: runner has a queue and local cannot admit -> the ticket is queued on the runner, recorded as queuedAt', async () => {
   const { env, state, repoDir } = setup();
   const globalPath = path.join(env.LANE_BROKER_HOME, 'config.json');
@@ -206,23 +237,14 @@ test('supervisor: runner has a queue and local cannot admit -> the ticket is que
   fs.writeFileSync(globalPath, JSON.stringify({ ...cfg, capacity: 1 }));
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, remote: true }, hold: { weight: 1 } } });
 
-  const blocker = laneRun(['run', '--repo', 'r', '--lane', 'hold', '--', 'sleep', '4'], { env, cwd: repoDir });
-  await waitFor(() => fs.existsSync(paths(state).leases) && fs.readdirSync(paths(state).leases).some((n) => n.endsWith('.json')), { timeoutMs: 60_000 });
-  const queued = laneRun(['run', '--repo', 'r', '--lane', 'hold', '--', 'true'], { env, cwd: repoDir });
-  await waitFor(() => fs.existsSync(paths(state).queue) && fs.readdirSync(paths(state).queue).length > 0, { timeoutMs: 60_000 });
 
   const marker = path.join(tmpDir('marker'), 'where');
-  const { id, waited } = await detachAndWait(
-    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
-    env,
-    repoDir,
-  );
+  const { id, waited } = await dispatchWhileHeld({ env, state, repoDir }, ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)]);
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
   const result = resultOf(state, id);
   assert.equal(result.executor, 'remote');
   assert.equal(result.queuedAt, 'skybox(1)');
-  await Promise.all([blocker, queued]);
 });
 
 test('supervisor: a localRefused lane queues on a queued runner even when local could admit it (BRAIN-455)', async () => {
@@ -249,24 +271,15 @@ test('supervisor: maxRemoteQueue 0 -> a queued runner is skipped and the ticket 
   fs.writeFileSync(globalPath, JSON.stringify({ ...cfg, capacity: 1, maxRemoteQueue: 0 }));
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, remote: true }, hold: { weight: 1 } } });
 
-  const blocker = laneRun(['run', '--repo', 'r', '--lane', 'hold', '--', 'sleep', '3'], { env, cwd: repoDir });
-  await waitFor(() => fs.existsSync(paths(state).leases) && fs.readdirSync(paths(state).leases).some((n) => n.endsWith('.json')), { timeoutMs: 60_000 });
-  const queued = laneRun(['run', '--repo', 'r', '--lane', 'hold', '--', 'true'], { env, cwd: repoDir });
-  await waitFor(() => fs.existsSync(paths(state).queue) && fs.readdirSync(paths(state).queue).length > 0, { timeoutMs: 60_000 });
 
   const marker = path.join(tmpDir('marker'), 'where');
-  const { id, waited } = await detachAndWait(
-    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
-    env,
-    repoDir,
-  );
+  const { id, waited } = await dispatchWhileHeld({ env, state, repoDir }, ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)]);
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
   const result = resultOf(state, id);
   assert.equal(result.executor, 'local');
   assert.match(result.fallbackReason, /skybox: queued: 1/);
   assert.equal(result.queuedAt, undefined);
-  await Promise.all([blocker, queued]);
 });
 
 test('selectRunner: an unenforced runner with only discounted room loses to an enforced runner with a short queue (BRAIN-743)', async () => {
