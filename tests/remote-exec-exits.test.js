@@ -14,6 +14,8 @@ import { paths } from '../src/state.js';
 
 const TAIL_BYTES = 200_000;
 const EXIT_WITHIN_MS = 15_000;
+// The job exits at once while a child it leaves behind fills the shared stdout past any pipe buffer (Linux socketpairs hold ~200 KB+).
+const FILL_UNREAD_STDOUT_THEN_EXIT = [process.execPath, '-e', `require('child_process').spawn(process.execPath, ['-e', "process.stdout.write('y'.repeat(8e6))"], { stdio: ['ignore', 'inherit', 'ignore'] }).unref()`];
 const children = [];
 afterEach(() => {
   for (const child of children.splice(0)) child.kill('SIGKILL');
@@ -32,7 +34,7 @@ function runExec(gzip, { env = {}, readStdout = true } = {}) {
     generation: 0,
     repoKey: 'exec-exits-repo',
     lane: 'default',
-    argv: [process.execPath, '-e', `process.stdout.write('y'.repeat(${TAIL_BYTES}) + 'END')`],
+    argv: readStdout ? [process.execPath, '-e', `process.stdout.write('y'.repeat(${TAIL_BYTES}) + 'END')`] : FILL_UNREAD_STDOUT_THEN_EXIT,
     relCwd: '',
   };
   const args = [BIN, 'remote-exec', '--root', root];

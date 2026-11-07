@@ -1416,6 +1416,7 @@ test('snapshot: directory mtime changes are detected as in 0.28.2, so an atomic 
   assert.deepEqual(snapshotChanges(base, rooted()), ['packages/api', 'packages/api/generated.txt']);
 
   fs.mkdirSync(path.join(dir, 'packages', 'other'), { recursive: true });
+  fs.utimesSync(path.join(dir, 'packages', 'other'), when, when);
   const plainBase = snapshotOutsideNodeModules(dir);
   fs.mkdirSync(path.join(dir, 'packages', 'other', 'node_modules'));
   assert.deepEqual(snapshotChanges(plainBase, snapshotOutsideNodeModules(dir)), ['packages/other'], 'without workspace roots the directory change is reported, exactly as before');
