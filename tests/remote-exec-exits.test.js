@@ -17,9 +17,11 @@ const TAIL_BYTES = 200_000;
 const EXIT_WITHIN_MS = 15_000;
 const children = [];
 const sockets = [];
+const servers = [];
 afterEach(() => {
   for (const child of children.splice(0)) child.kill('SIGKILL');
   for (const s of sockets.splice(0)) s.destroy();
+  for (const s of servers.splice(0)) s.close();
 });
 
 /**
@@ -27,17 +29,24 @@ afterEach(() => {
  * Sizing the job's output cannot do this: a payload past the socket buffer blocks the job itself (macOS and Linux).
  */
 async function fullUnreadStdout() {
-  const server = net.createServer();
+  const server = net.createServer({ pauseOnConnect: true }); // a paused-later reader still drains a highWaterMark of the fill
   await new Promise((resolve) => server.listen(path.join(makeTmpDir('exec-exits-sock-'), 's'), resolve));
   const accepted = new Promise((resolve) => server.once('connection', resolve));
   const writer = net.connect(server.address());
   await new Promise((resolve) => writer.once('connect', resolve));
   const reader = await accepted;
-  reader.pause();
-  sockets.push(writer, reader, server);
-  writer.write(Buffer.alloc(16 * 1024 * 1024));
-  assert.ok(writer.writableLength > 0, 'the kernel took the whole fill, so the buffer is not full');
-  return writer;
+  sockets.push(writer, reader);
+  servers.push(server);
+  // Raw writes until the kernel refuses: nothing stays queued in this process to flush later.
+  const chunk = Buffer.alloc(64 * 1024);
+  for (;;) {
+    try {
+      fs.writeSync(writer._handle.fd, chunk);
+    } catch (err) {
+      if (err.code !== 'EAGAIN') throw err;
+      return writer;
+    }
+  }
 }
 
 async function runExec(gzip, { env = {}, readStdout = true } = {}) {
