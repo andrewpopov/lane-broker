@@ -4,6 +4,8 @@ import crypto from 'node:crypto';
 import zlib from 'node:zlib';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { afterEach } from 'node:test';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, gitFixture, laneRun, laneSpawn, waitFor, BIN } from './helpers.js';
 import { paths, readJsonSafe } from '../src/state.js';
 import { makeTmpDir } from './helpers/tmp.js';
@@ -510,12 +512,26 @@ export const linesOf = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'u
 export const hasLease = (state) => fs.existsSync(paths(state).leases) && fs.readdirSync(paths(state).leases).some((n) => n.endsWith('.json'));
 
 /** A local-only holder of the lane's key, so every later ticket on that lane waits in the local queue. */
+const liveHolds = new Set();
+
+// A test that fails before releasing its hold would leave the holder alive, and node --test then waits on the file forever.
+afterEach(async () => {
+  for (const hold of liveHolds) {
+    hold.release();
+    const exited = await Promise.race([hold.done.then(() => true), sleep(10_000).then(() => false)]);
+    if (!exited) hold.holder.kill('SIGKILL');
+  }
+  liveHolds.clear();
+});
+
 export async function holdLaneLocally(ctx) {
   const dir = tmpDir('rebind-hold');
   const release = path.join(dir, 'release');
   const holder = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--local', '--local-reason', 'needs ssh', '--', ...recordingCmd(path.join(dir, 'ran'), release)], { env: ctx.env, cwd: ctx.repoDir });
+  const hold = { release: () => fs.writeFileSync(release, ''), holder, done: new Promise((resolve) => holder.on('close', resolve)) };
+  liveHolds.add(hold);
   await waitFor(() => hasLease(ctx.state), { timeoutMs: 60_000 });
-  return { release: () => fs.writeFileSync(release, ''), holder, done: new Promise((resolve) => holder.on('close', resolve)) };
+  return hold;
 }
 
 export const detach = async (ctx, cmd, { env = ctx.env, extra = [] } = {}) => {
