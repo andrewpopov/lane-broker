@@ -528,7 +528,11 @@ test('BRAIN-770: remoteRebalanceMaxMoves 0 with an idle runner is "moving paused
 });
 
 test('BRAIN-770: the cap is total wait since first queued, kept on the attempt and not restarted by a move', T, async () => {
-  const ctx = refusedSetup({ names: ['a', 'b'], paused: ['a', 'b'], cap: 4000, rebalance: { remoteRebalanceMinQueuedMs: 1500 } });
+  // The only margin between "total wait" and "a fresh cap on B" is the wait before the move, while a refusal on B also waits B's
+  // own minimum-queued time plus a pick and a withdraw (seconds on a loaded runner), so both are wide.
+  const MIN_QUEUED = 5000;
+  const CAP = 15_000;
+  const ctx = refusedSetup({ names: ['a', 'b'], paused: ['a', 'b'], cap: CAP, rebalance: { remoteRebalanceMinQueuedMs: MIN_QUEUED } });
   const id = await ctx.start();
   await waitFor(() => readAttempt(ctx.state, id)?.moves?.length === 1, { timeoutMs: 30_000 });
   await waitFor(() => ctx.fake.count('result b') >= 3, { timeoutMs: 30_000 });
@@ -540,8 +544,8 @@ test('BRAIN-770: the cap is total wait since first queued, kept on the attempt a
   assert.equal(waited.code, 76, `${waited.stderr}\n${ctx.fake.calls().join(',')}`);
   const { endedAt } = resultOf(ctx.state, id);
   const timeline = `firstQueuedAt+${moved.moves[0].at - moved.firstQueuedAt}ms moved, +${endedAt - moved.firstQueuedAt}ms refused`;
-  assert.ok(endedAt - moved.firstQueuedAt >= 4000, `refused only after the whole cap (${timeline})`);
-  assert.ok(endedAt < moved.moves[0].at + 4000, `refused before a fresh full cap on B could have elapsed (${timeline})`);
+  assert.ok(endedAt - moved.firstQueuedAt >= CAP, `refused only after the whole cap (${timeline})`);
+  assert.ok(endedAt < moved.moves[0].at + CAP, `refused before a fresh full cap on B could have elapsed (${timeline})`);
   assert.deepEqual(ctx.runs(), []);
 });
 
