@@ -7,7 +7,7 @@ import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneRun
 import { tmpDir, setup, markerCmd, makeFakeSshBin, clientEnv, makeRunner } from './remote-harness.js';
 import { selectRunner } from '../src/remote-client.js';
 import { enqueue, tryStart, listQueueCapped } from '../src/scheduler.js';
-import { DEFAULT_GLOBAL_CONFIG, resolveTicketConfig } from '../src/config.js';
+import { DEFAULT_GLOBAL_CONFIG, resolveTicketConfig, loadGlobalConfig } from '../src/config.js';
 import { writeLease, readLease, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths, atomicWriteJson } from '../src/state.js';
 import { childEnv } from '../src/supervisor.js';
@@ -36,6 +36,7 @@ function baseCfg(overrides = {}) {
     cpuAdmissionPercent: 100,
     cpuReserveCores: 1,
     admissionCooldownMs: 0,
+    elasticFloorAfterMs: 0,
     resourceSkipLimit: 3,
     resourceIdleOvershootCores: 0,
     ...overrides,
@@ -438,11 +439,11 @@ test('a pathological declared claim returns promptly with a bounded grant (child
   const code = `
     import { evaluateElasticAdmission } from ${JSON.stringify(new URL('../src/admission.js', import.meta.url).href)};
     import { DEFAULT_GLOBAL_CONFIG } from ${JSON.stringify(new URL('../src/config.js', import.meta.url).href)};
-    const cfg = { ...DEFAULT_GLOBAL_CONFIG, schedulerMode: 'active', cpuAdmissionPercent: 100, cpuReserveCores: 1, admissionCooldownMs: 0 };
+    const cfg = { ...DEFAULT_GLOBAL_CONFIG, schedulerMode: 'active', cpuAdmissionPercent: 100, cpuReserveCores: 1, admissionCooldownMs: 0, elasticFloorAfterMs: 0 };
     const sample = { hostBusyCores: 5, cores: 10, stale: false };
     const ticket = { id: 't', weight: 1, resources: { cpuCores: 1e20, minCpuCores: 1, memoryBytes: 1 } };
     const full = { admit: false, cpuReason: 'projected-over-budget', memoryReason: 'ok', budget: 9, projectedBusy: 5 + 1e20, candidateCpuCores: 1e20, candidateEstimate: 1e20, cpuGateClosed: false, cooldownBlocked: false };
-    const r = evaluateElasticAdmission(cfg, ticket, [], sample, null, full);
+    const r = evaluateElasticAdmission(cfg, ticket, [], sample, null, full, Date.now());
     console.log(JSON.stringify(r && r.grantedCpuCores));
   `;
   const res = spawnSync(process.execPath, ['--input-type=module', '-e', code], { encoding: 'utf8', timeout: 15_000 });
@@ -794,4 +795,52 @@ test('BRAIN-531: a queued claim that still fits after the config edit waits and 
 test('BRAIN-531: a queued elastic claim is capped, not refused, while its floor still fits', async () => {
   const result = await queueBehindBlocker({ secondLane: { weight: 1, cpuCores: 3, minCpuCores: 2, memoryBytes: 1048576 }, shrinkTo: 2 });
   assert.equal(result.code, 0, `stderr: ${result.stderr}`);
+});
+
+const FLOOR_AFTER_MS = 600_000;
+
+test('BRAIN-867: a ticket that has waited under elasticFloorAfterMs is not admitted elastically, even though a smaller claim fits', async () => {
+  const { state } = freshEnv();
+  const t = elastic('young', { prioOriginAt: Date.now() - (FLOOR_AFTER_MS - 60_000) });
+  await enqueue(state, t);
+  const result = await poll(state, t, baseCfg({ elasticFloorAfterMs: FLOOR_AFTER_MS }), { ext: 6 }); // 6+3 would fit
+  assert.equal(result.started, false);
+  assert.doesNotMatch(readLog(state), /event=elastic-grant/);
+});
+
+test('BRAIN-867: after elasticFloorAfterMs the same ticket is admitted at the largest claim that fits', async () => {
+  const { state } = freshEnv();
+  const t = elastic('aged', { prioOriginAt: Date.now() - (FLOOR_AFTER_MS + 60_000) });
+  await enqueue(state, t);
+  const result = await poll(state, t, baseCfg({ elasticFloorAfterMs: FLOOR_AFTER_MS }), { ext: 6 });
+  assert.equal(result.started, true);
+  assert.equal(result.lease.grantedCpuCores, 3);
+});
+
+test('BRAIN-867: elasticFloorAfterMs 0 grants a brand-new ticket at once', async () => {
+  const { state } = freshEnv();
+  const t = elastic('fresh');
+  await enqueue(state, t);
+  const result = await poll(state, t, baseCfg({ elasticFloorAfterMs: 0 }), { ext: 6 });
+  assert.equal(result.started, true);
+  assert.equal(result.lease.grantedCpuCores, 3);
+});
+
+test('BRAIN-867: config defaults elasticFloorAfterMs to 10 minutes and rejects a negative or non-integer value by name', () => {
+  assert.equal(DEFAULT_GLOBAL_CONFIG.elasticFloorAfterMs, 600_000);
+  const load = (value) => {
+    const { home } = freshEnv();
+    writeGlobalConfig(home, { version: 1, elasticFloorAfterMs: value });
+    const prev = process.env.LANE_BROKER_HOME;
+    process.env.LANE_BROKER_HOME = home;
+    try {
+      return loadGlobalConfig();
+    } finally {
+      if (prev === undefined) delete process.env.LANE_BROKER_HOME;
+      else process.env.LANE_BROKER_HOME = prev;
+    }
+  };
+  assert.equal(load(0).elasticFloorAfterMs, 0);
+  assert.throws(() => load(-1), /"elasticFloorAfterMs" must be a non-negative integer/);
+  assert.throws(() => load(1.5), /"elasticFloorAfterMs" must be a non-negative integer/);
 });

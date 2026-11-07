@@ -27,6 +27,7 @@ const cfg = {
   cpuAdmissionPercent: 100,
   cpuReserveCores: 1,
   admissionCooldownMs: 0,
+  elasticFloorAfterMs: 0,
 };
 
 const sampler = () => ({ hostBusyCores: 2, cores: 10, stale: false, sampledAt: Date.now() });
