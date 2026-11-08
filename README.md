@@ -2810,6 +2810,8 @@ What a run leaves behind is collected; what a live one owns never is. Everything
   inside the window that check cannot see: after `remote-id` is recorded but
   before the supervisor (not yet spawned) has enqueued or leased that same id
   with the local broker.
+- `LANE_BROKER_TEST_WAIT_READY_FILE` — `lane wait` writes its pid to this file once its SIGINT and SIGTERM handlers are
+  installed, so a test signals it only after it can forward the cancel (a fixed sleep raced Node's startup on a loaded runner).
 - `LANE_BROKER_TEST_PAUSE_BEFORE_WAIT_ORPHAN` — if set, `lane wait` pauses,
   right after finding no result yet and an attempt record whose supervisor
   is dead, until the named file appears -- so a test can deterministically

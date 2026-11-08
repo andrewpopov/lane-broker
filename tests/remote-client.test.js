@@ -1019,14 +1019,16 @@ const ticketId = (/'([0-9a-f-]{36})'/.exec(cmd) || [])[1];
 if (cmd.includes('remote-exec')) {
   log('exec');
   process.stdin.resume();
-  process.stdin.on('end', () => setTimeout(() => process.exit(255), ${execMs}));
+  process.stdin.on('end', () => setTimeout(() => { fs.writeFileSync(${JSON.stringify(path.join(dir, 'exec-exited'))}, '1'); process.exit(255); }, ${execMs}));
   if (${closeExecOnWithdraw}) setInterval(() => { if (fs.existsSync(${JSON.stringify(path.join(dir, 'withdrew'))})) process.exit(255); }, 30);
 } else if (cmd.includes('remote-result')) {
   log('result');
   const entry = next(results, ${JSON.stringify(path.join(dir, 'result-count'))});
   if (entry === null) process.exit(1);
   const send = () => process.stdout.write(JSON.stringify(entry.record ?? entry) + '\\n');
-  if (entry.delayMs) setTimeout(send, entry.delayMs); else send();
+  const later = () => (entry.delayMs ? setTimeout(send, entry.delayMs) : send());
+  // afterExec: the delay starts only once the exec session has exited, so "lands after the session closed" holds at any load
+  if (entry.afterExec) { const t = setInterval(() => { if (fs.existsSync(${JSON.stringify(path.join(dir, 'exec-exited'))})) { clearInterval(t); later(); } }, 30); } else later();
 } else if (cmd.includes('remote-withdraw')) {
   log('withdraw');
   fs.writeFileSync(${JSON.stringify(path.join(dir, 'withdrew'))}, '1');
@@ -1133,7 +1135,7 @@ test('rebalance: a withdrawn record that does not bind to this ticket is not pro
 test('rebalance: a record that arrives after the session closed is ignored by the watcher (stale epoch), and the normal path reads its own', { timeout: 60_000 }, async () => {
   // The watcher's fetch is slow and lands after ssh has closed; it carries a withdrawn record that would read as a move.
   const { result } = await dispatchRebalance({
-    results: [queued, queued, queued, queued, { delayMs: 2000, record: 'WITHDRAWN' }, 'RESULT'],
+    results: [queued, queued, queued, queued, { afterExec: true, delayMs: 2000, record: 'WITHDRAWN' }, 'RESULT'],
     withdraws: [null],
     execMs: 600,
     rebalance: { minQueuedMs: 20_000, intervalMs: 10_000 },

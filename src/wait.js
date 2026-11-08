@@ -74,6 +74,7 @@ export async function waitCommand(id, { timeoutMs } = {}) {
   };
   process.on('SIGINT', forwardCancel);
   process.on('SIGTERM', forwardCancel);
+  if (process.env.LANE_BROKER_TEST_WAIT_READY_FILE) fs.writeFileSync(process.env.LANE_BROKER_TEST_WAIT_READY_FILE, String(process.pid));
 
   const deadline = timeoutMs ? Date.now() + timeoutMs : null;
   const timedOutResult = () => {

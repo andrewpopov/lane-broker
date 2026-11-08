@@ -100,6 +100,8 @@ test('a remote supervisor whose cancel never finishes exits within the deadline 
     setMode('hang-first');
     const pid = readAttempt(state, id).supervisor.pid;
     const signalledAt = Date.now();
+    // A supervisor gone before the cancel is a different failure from a missed deadline: name it with the evidence.
+    assert.ok(isPidAlive(pid), `the supervisor exited before it was cancelled: attempt ${JSON.stringify(readAttempt(state, id))}, result ${JSON.stringify(resultOf(state, id))}, broker log tail ${brokerLog(state).slice(-2000)}`);
     process.kill(pid, 'SIGTERM');
     await waitFor(() => !isPidAlive(pid), { timeoutMs: 25_000 });
     assert.ok(Date.now() - signalledAt < cancelWaitMs(), 'exits within the cancel wait, though the remote cancel never yields its close');
