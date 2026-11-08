@@ -23,6 +23,7 @@ import { makeReader, readHeaderLine, extractFrames, MAX_HEADER_BYTES } from './r
 import { runCommand } from './run.js';
 import { cancelCommand } from './cancel.js';
 import { collectStatus } from './status.js';
+import { queueFacts } from './queue-facts.js';
 import { readLease, isSupervisorAlive, listLeasesStrict, listLeases } from './lease.js';
 import { readAttempt, listAttemptsStrict } from './attempts.js';
 import { listQueue, listQueueStrict, dequeueSync, HELD_STATES } from './scheduler.js';
@@ -967,6 +968,8 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot(), measure, 
     ...reportReadiness(needs, { runnerTags: globalCfg.runnerTags }),
     queued: status.queued.length,
     running: status.running.length,
+    // BRAIN-888: whether this runner's queue has a reservation owner; omitted unless the validated v2 scheduler answered
+    ...(status.priority.mode === 'v2' ? { reservationOwner: Boolean(status.priority.reservationOwner) } : {}),
     // BRAIN-360: additive; the CPU the runner's leases are charged (grants, not declarations)
     reservedCpuCores: status.resources?.reservedCpuCores,
     // BRAIN-405: what a new ticket could be given RIGHT NOW (unlike `capacity`, which is static); null where unmeasurable
@@ -1104,9 +1107,27 @@ export async function remoteWithdrawCommand(ticketId, { root = defaultRemoteRoot
   return reply(result.reason === 'withdrawn' && result.kind === 'unfinished' ? 'withdrawn' : 'finished');
 }
 
+/**
+ * BRAIN-888: where the runner's queue has our ticket, as advisory fields on the queued record. Computed from the broker state
+ * root with the lane id from `remote-id` (not the remote ticket id); any failure omits all of them, never the phase record.
+ */
+function advisoryQueueFacts(ticketDir, readFacts) {
+  try {
+    const laneId = fs.readFileSync(path.join(ticketDir, 'remote-id'), 'utf8').trim();
+    const { position, behindOtherOwner, reservationOwnerWaitedMs } = readFacts(stateHome(), loadGlobalConfig(), laneId, Date.now());
+    return {
+      ...(position === null ? {} : { position }),
+      ...(behindOtherOwner === undefined ? {} : { behindOtherOwner }),
+      ...(reservationOwnerWaitedMs === undefined ? {} : { reservationOwnerWaitedMs }),
+    };
+  } catch {
+    return {};
+  }
+}
+
 /** `lane remote-result <ticketId>`: print result.json, or {missing:true, state} where state is
  *  queued|running|gone (is the publishing remote-exec alive) (BRAIN-339; `missing:true` stays for older clients). */
-export async function remoteResultCommand(ticketId, { root = defaultRemoteRoot(), readResult = readJsonSafe } = {}) {
+export async function remoteResultCommand(ticketId, { root = defaultRemoteRoot(), readResult = readJsonSafe, readFacts = queueFacts } = {}) {
   if (!isUuid(ticketId)) {
     process.stderr.write('lane remote-result: missing or invalid ticketId\n');
     return { exitCode: 2 };
@@ -1121,7 +1142,7 @@ export async function remoteResultCommand(ticketId, { root = defaultRemoteRoot()
     // The publisher may have written result.json and exited between the read above and the
     // liveness check; re-read once before concluding it died with nothing to show (as run.js does).
     const drain = readRemoteDrain(stateHome());
-    record = (state === 'gone' && readResult(resultPath)) || { protocol: 1, missing: true, state, ...(phase !== state ? { phase } : {}), ...(drain ? { remoteDrain: { reason: drain.reason, since: drain.since } } : {}) };
+    record = (state === 'gone' && readResult(resultPath)) || { protocol: 1, missing: true, state, ...(phase !== state ? { phase } : {}), ...(drain ? { remoteDrain: { reason: drain.reason, since: drain.since } } : {}), ...(phase === 'queued' ? advisoryQueueFacts(ticketDir, readFacts) : {}) };
   }
   process.stdout.write(`${JSON.stringify(servedRecord(record, kernelBootId()))}\n`);
   return { exitCode: 0 };
