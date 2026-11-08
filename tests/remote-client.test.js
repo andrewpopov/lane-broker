@@ -1150,7 +1150,7 @@ test('rebalance (BRAIN-888): the picker gets the queue facts of the latest sampl
 
 test('rebalance (BRAIN-888): the picker is told whether the refusal cap has elapsed', { timeout: 60_000 }, async () => {
   const seen = [];
-  await dispatchRebalance({ results: [queued, queued, queued, queued, queued, 'RESULT'], withdraws: [], execMs: 1500, rebalance: { minQueuedMs: 5_000, refusedMaxQueuedMs: 25_000, pickTarget: (args) => { seen.push(args.refusalCapElapsed); return null; } } });
+  await dispatchRebalance({ results: [queued, queued, queued, queued, queued, 'RESULT'], withdraws: [], execMs: 1500, rebalance: { minQueuedMs: 5_000, refusedMaxQueuedMs: 25_000, pickTarget: (args) => { seen.push(args.refusalCapElapsed()); return null; } } });
   assert.deepEqual(seen.slice(0, 2), [false, false]);
   assert.ok(seen.includes(true), JSON.stringify(seen));
 });

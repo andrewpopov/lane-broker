@@ -39,8 +39,17 @@ function stuckSetup({ names = ['a', 'b'], facts = FACTS, probes = { b: QUEUED_B 
 
 const admissionLog = (ctx) => fs.readFileSync(paths(ctx.state).admissionLog, 'utf8');
 
-async function assertStays(ctx, id, { settleMs = MIN_QUEUED + 2500 } = {}) {
-  await sleep(settleMs);
+/**
+ * Proves the rejection ran before asserting there was no move: the target's probe was served again after arming (twice where the
+ * non-idle selection runs on top of the idle one), then a further sample of the source completed its tick with no withdraw.
+ */
+async function assertStays(ctx, id, { probesNeeded, probeBefore }) {
+  await waitFor(() => ctx.fake.count('probe b') >= probeBefore + probesNeeded, { timeoutMs: 60_000 });
+  const resultsAfterDecision = ctx.fake.count('result a');
+  await waitFor(() => ctx.fake.count('result a') > resultsAfterDecision, { timeoutMs: 30_000 });
+  const probes = ctx.fake.count('probe b') - probeBefore;
+  const ticks = ctx.fake.count('result a');
+  if (probesNeeded === 1) assert.ok(probes <= ticks, 'the facts gate stopped the non-idle selection: one probe per tick');
   assert.equal(ctx.fake.count('withdraw a'), 0, `no withdraw\n${ctx.fake.calls().join(',')}`);
   assert.equal(readAttempt(ctx.state, id)?.moving, undefined);
   ctx.unpause('a');
@@ -85,26 +94,29 @@ test('queued rebalance: a busy runner with an empty queue and no headroom is a d
   assert.match(admissionLog(ctx), /behind another owner on a \(pos 2\) -> b \(queued 0\)/);
 });
 
+// probesNeeded: 2 where the target predicate rejects (idle selection, then the non-idle one); 1 where the source facts gate the branch
 const STAYS = {
-  'our own ticket is the owner (behindOtherOwner false)': { facts: { ...FACTS, behindOtherOwner: false } },
-  'the target is itself a reservation owner': { probes: { b: { ...QUEUED_B, reservationOwner: true } } },
-  'the target probe has no reservationOwner field': { probes: { b: without(QUEUED_B, 'reservationOwner') } },
-  'the target lacks remote-withdraw/1': { probes: { b: { ...QUEUED_B, capabilities: IDLE.capabilities.filter((c) => c !== REMOTE_WITHDRAW_CAPABILITY) } } },
-  'the target headroom is unmeasured': { probes: { b: without(QUEUED_B, 'headroom') } },
-  'the target has 2 queued and remoteRebalanceQueuedMax is 1': { probes: { b: { ...QUEUED_B, queued: 2 } } },
-  'the owner waited less than remoteRebalanceMinQueuedMs': { facts: { ...FACTS, reservationOwnerWaitedMs: MIN_QUEUED - 1 } },
-  'the runner record has no facts (an old runner)': { facts: NO_FACTS },
-  'remoteRebalanceQueuedMax is 0': { rebalance: { remoteRebalanceQueuedMax: 0 } },
-  'the gain is exactly the threshold (strict)': { speed: 0.5, rebalance: { remoteRebalanceQueuedMax: 2 }, probes: { b: { ...QUEUED_B, queued: 2 } } },
+  'our own ticket is the owner (behindOtherOwner false)': { probesNeeded: 1, facts: { ...FACTS, behindOtherOwner: false } },
+  'the target is itself a reservation owner': { probesNeeded: 2, probes: { b: { ...QUEUED_B, reservationOwner: true } } },
+  'the target probe has no reservationOwner field': { probesNeeded: 2, probes: { b: without(QUEUED_B, 'reservationOwner') } },
+  'the target lacks remote-withdraw/1': { probesNeeded: 2, probes: { b: { ...QUEUED_B, capabilities: IDLE.capabilities.filter((c) => c !== REMOTE_WITHDRAW_CAPABILITY) } } },
+  'the target headroom is unmeasured': { probesNeeded: 2, probes: { b: without(QUEUED_B, 'headroom') } },
+  'the target has 2 queued and remoteRebalanceQueuedMax is 1': { probesNeeded: 2, probes: { b: { ...QUEUED_B, queued: 2 } } },
+  'the owner waited less than remoteRebalanceMinQueuedMs': { probesNeeded: 1, facts: { ...FACTS, reservationOwnerWaitedMs: MIN_QUEUED - 1 } },
+  'the runner record has no facts (an old runner)': { probesNeeded: 1, facts: NO_FACTS },
+  'remoteRebalanceQueuedMax is 0': { probesNeeded: 1, rebalance: { remoteRebalanceQueuedMax: 0 } },
+  'the gain is exactly the threshold (strict)': { probesNeeded: 2, speed: 0.5, rebalance: { remoteRebalanceQueuedMax: 2 }, probes: { b: { ...QUEUED_B, queued: 2 } } },
 };
 
 for (const [name, setup] of Object.entries(STAYS)) {
   test(`queued rebalance: no move when ${name}`, T, async () => {
-    const ctx = stuckSetup(setup);
+    const { probesNeeded, ...options } = setup;
+    const ctx = stuckSetup(options);
     const id = await ctx.start();
     await execArrived(ctx, 'a');
+    const probeBefore = ctx.fake.count('probe b');
     ctx.arm();
-    await assertStays(ctx, id);
+    await assertStays(ctx, id, { probesNeeded, probeBefore });
   });
 }
 
@@ -276,6 +288,33 @@ test('queued rebalance: the cumulative refusal cap still counts from the first q
   assert.equal(waited.code, 76, `${waited.stderr}\n${ctx.fake.calls().join(',')}`);
   const { endedAt } = resultOf(ctx.state, id);
   assert.ok(endedAt - moved.firstQueuedAt >= CAP, 'refused only after the whole cap');
-  assert.ok(endedAt < moved.moves[0].at + CAP, 'and not after a fresh cap on b');
+  assert.equal(readAttempt(ctx.state, id)?.firstQueuedAt ?? moved.firstQueuedAt, moved.firstQueuedAt, 'the stamp was not restarted on b');
+  assert.ok(ctx.fake.count('withdraw b') >= 1, 'the refusal withdrew from b');
   assert.deepEqual(ctx.runs(), []);
+});
+
+test('A1 at decision time: a cap that runs out while the non-idle probes are out leaves the refusal reachable (76, no queued move)', T, async () => {
+  const ctx = refusedStuckSetup({ cap: 2500 });
+  const id = await ctx.start();
+  await execArrived(ctx, 'a');
+  const probeBefore = ctx.fake.count('probe b');
+  ctx.fake.setProbe('b', { ...QUEUED_B, delayMs: 1500 });
+  const waited = await ctx.finish(id, '60s');
+  assert.equal(waited.code, 76, `${waited.stderr}\n${ctx.fake.calls().join(',')}`);
+  assert.ok(ctx.fake.count('probe b') - probeBefore >= 2, 'the selections really ran');
+  assert.equal(ctx.fake.count('exec b'), 0);
+  assert.deepEqual(ctx.runs(), []);
+});
+
+test('queued rebalance: the runner starts the ticket as the withdraw arrives -- no move, it runs once on a', T, async () => {
+  const ctx = stuckSetup({ runnerOpts: { a: { admitBeforeWithdraw: true } } });
+  const id = await ctx.start();
+  await execArrived(ctx, 'a');
+  ctx.arm();
+  const waited = await ctx.finish(id, '60s');
+  assert.equal(waited.code, 0, `${waited.stderr}\n${ctx.fake.calls().join(',')}`);
+  assert.deepEqual(ctx.runs(), ['a'], 'one execution');
+  assert.ok(ctx.fake.count('withdraw a') >= 1, 'the race reached the withdraw');
+  assert.equal(ctx.fake.count('exec b'), 0);
+  assert.equal(resultOf(ctx.state, id).executor, 'remote');
 });

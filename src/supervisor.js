@@ -1320,12 +1320,13 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
           const picked = await selectRunner(candidates, selectionOptionsFor('rebalance', enriched, globalCfg, { draining, root, cpuLimit }));
           const eligible = picked.runner && hasMeasuredHeadroom(picked.probe);
           target = eligible ? { runner: picked.runner, probe: picked.probe } : null;
-          if (target || draining || refusalCapElapsed) return target;
+          if (target || draining || refusalCapElapsed?.()) return target;
           // BRAIN-888: behind another ticket's reservation with no idle runner on offer, a short non-idle queue elsewhere can be better
           const stuckBehindOwner = globalCfg.remoteRebalanceQueuedMax > 0 && sourceFacts?.position >= 1 && sourceFacts.behindOtherOwner === true && sourceFacts.reservationOwnerWaitedMs >= globalCfg.remoteRebalanceMinQueuedMs;
           if (!stuckBehindOwner) return null;
           const queued = await selectRunner(candidates, selectionOptionsFor('rebalance', enriched, globalCfg, { draining, root, cpuLimit, queuedMove: { position: sourceFacts.position, sourceRunner: runner } }));
-          if (!queued.runner) return null;
+          // the cap may have run out while the probes were out: refusal must stay reachable
+          if (!queued.runner || refusalCapElapsed?.()) return null;
           const viaQueue = queued.queuedChoice === true;
           if (!viaQueue && !hasMeasuredHeadroom(queued.probe)) return null;
           target = { runner: queued.runner, probe: queued.probe, ...(viaQueue ? { behindOwnerPosition: sourceFacts.position } : {}) };

@@ -175,9 +175,32 @@ test('parity: the facts order is lane status\'s queue without push-held and cap-
     assert.deepEqual(queueFacts(state, loadGlobalConfig(), 'z').order, expected);
     // collectStatus itself throws on an unreadable record (status.js:278), so the barrier is added after its reading
     fs.writeFileSync(path.join(paths(state).queue, '000000000099-barrier.json'), '{broken');
-    const got = queueFacts(state, loadGlobalConfig(), 'z');
-    assert.deepEqual(got.order, expected);
-    assert.equal(got.ownerId, 'z');
-    assert.equal(got.order[0], 'z');
+    assert.throws(() => queueFacts(state, loadGlobalConfig(), 'z'), /unreadable|JSON/i, 'an unreadable record is unknown, never skipped into a definite fact');
+  });
+});
+
+test('A2: an unreadable queue directory or a corrupt record omits the facts and the probe field (production reader)', async () => {
+  await withBroker({}, async (state) => {
+    await ownerThenOurs(state);
+    const dir = paths(state).queue;
+    const good = facts(state, 'ours');
+    assert.equal(good.behindOtherOwner, true);
+    assert.equal((await probe(state)).reservationOwner, true);
+    const corrupt = path.join(dir, '000000000099-corrupt.json');
+    fs.writeFileSync(corrupt, '{broken');
+    assert.throws(() => facts(state, 'ours'));
+    assert.equal((await runnerRecord(state, { laneId: 'ours' })).behindOtherOwner, undefined, 'corrupt record: remote-result serves the bare phase');
+    assert.equal((await runnerRecord(state, { laneId: 'ours' })).position, undefined);
+    assert.equal(await probe(state).then((p) => p.reservationOwner, () => undefined), undefined, 'corrupt record: the probe omits it (or fails outright)');
+    fs.rmSync(corrupt);
+    fs.chmodSync(dir, 0);
+    try {
+      assert.throws(() => facts(state, 'ours'));
+      const record = await runnerRecord(state, { laneId: 'ours' });
+      assert.deepEqual([record.position, record.behindOtherOwner, record.reservationOwnerWaitedMs], [undefined, undefined, undefined], 'unreadable dir: remote-result');
+      assert.equal((await probe(state)).reservationOwner, undefined, 'unreadable dir: probe');
+    } finally {
+      fs.chmodSync(dir, 0o755);
+    }
   });
 });

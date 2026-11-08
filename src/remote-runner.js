@@ -26,7 +26,7 @@ import { collectStatus } from './status.js';
 import { queueFacts } from './queue-facts.js';
 import { readLease, isSupervisorAlive, listLeasesStrict, listLeases } from './lease.js';
 import { readAttempt, listAttemptsStrict } from './attempts.js';
-import { listQueue, listQueueStrict, dequeueSync, HELD_STATES } from './scheduler.js';
+import { listQueue, listQueueStrict, queueReadable, dequeueSync, HELD_STATES } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
 import { REMOTE_TMP_BASE, TMP_OWNER_FILE, gcRemoteTickets, removeDetached } from './gc.js';
 import { writeBrokerLog, cpuHeadroomCores } from './admission.js';
@@ -968,8 +968,8 @@ export async function remoteProbeCommand({ root = defaultRemoteRoot(), measure, 
     ...reportReadiness(needs, { runnerTags: globalCfg.runnerTags }),
     queued: status.queued.length,
     running: status.running.length,
-    // BRAIN-888: whether this runner's queue has a reservation owner; omitted unless the validated v2 scheduler answered
-    ...(status.priority.mode === 'v2' ? { reservationOwner: Boolean(status.priority.reservationOwner) } : {}),
+    // BRAIN-888: whether this runner's queue has a reservation owner; omitted unless the validated v2 scheduler answered from a fully read queue
+    ...(status.priority.mode === 'v2' && queueReadable(brokerRoot) ? { reservationOwner: Boolean(status.priority.reservationOwner) } : {}),
     // BRAIN-360: additive; the CPU the runner's leases are charged (grants, not declarations)
     reservedCpuCores: status.resources?.reservedCpuCores,
     // BRAIN-405: what a new ticket could be given RIGHT NOW (unlike `capacity`, which is static); null where unmeasurable

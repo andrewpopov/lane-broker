@@ -963,7 +963,7 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
     // A callback that throws or rejects is a failed tick: no move, keep watching. The target is awaited (the real picker is async).
     let to;
     try {
-      to = await pickTarget({ ...(draining ? { draining } : {}), sourceFacts: queueFactsOf(fetched), refusalCapElapsed: refusalCapElapsed() });
+      to = await pickTarget({ ...(draining ? { draining } : {}), sourceFacts: queueFactsOf(fetched), refusalCapElapsed });
       const refusing = !to && refusalCapElapsed() && (refusalAllowed?.({ draining }) ?? true);
       if (!(to || refusing) || !watching()) continue;
       to ||= REFUSED_MOVE_TARGET;

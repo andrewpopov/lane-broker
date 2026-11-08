@@ -1,5 +1,5 @@
 import { listLeases } from './lease.js';
-import { listQueueCapped, HELD_STATES } from './scheduler.js';
+import { listQueueCappedStrict, HELD_STATES } from './scheduler.js';
 import { resolveClasses, classQueuePolicy } from './classes.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView } from './fairness.js';
 import { effectiveNow } from './priority-clock.js';
@@ -18,7 +18,7 @@ import { detectResourceCapacity } from './resources.js';
  * defined; `behindOtherOwner` means another eligible ticket ahead of ours holds the reservation. The owner's wait is its total
  * priority wait, the one the scheduler ages it by. Throws on any read failure: callers omit every fact then.
  */
-export function queueFacts(root, cfg, laneId, now = Date.now(), { readQueue = listQueueCapped } = {}) {
+export function queueFacts(root, cfg, laneId, now = Date.now(), { readQueue = listQueueCappedStrict } = {}) {
   const sched = resolveScheduler(root, { log: false });
   const rawQueue = readQueue(root, cfg);
   const held = listLeases(root).filter((l) => HELD_STATES.has(l.state));
