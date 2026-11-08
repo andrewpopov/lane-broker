@@ -21,6 +21,15 @@ import { loadGlobalConfig, ConfigError } from '../src/config.js';
  * `lane run` over a two-runner fake ssh whose runners are real brokers (A is paused, so a ticket sent there stays queued).
  */
 
+/** The watcher samples its runner once per rebalance interval, so N samples are N real move decisions: an ordering signal, not a wall-clock window.
+ *  A withdraw from that runner also ends the wait, so a test asserting "never moved" fails by name instead of waiting for samples that stopped. */
+const samples = (ctx, runner, n = 5) => waitFor(() => ctx.fake.count(`result ${runner}`) >= n || ctx.fake.count(`withdraw ${runner}`) > 0, { timeoutMs: 30_000 });
+
+/** Where no watcher runs there is no sample to count, and one would be logged a rebalance interval (150 ms here) after the dispatch. */
+const NO_WATCHER_WINDOW_MS = 1000;
+
+const admissionLog = (ctx) => fs.readFileSync(paths(ctx.state).admissionLog, 'utf8');
+
 // ---- the pure policy ----
 
 test('rebalanceBlocked: the cap and the cooldown, on a fake clock', () => {
@@ -112,7 +121,7 @@ test('rebalance: no ping-pong -- with B queued too and A idle again, the ticket 
   // `c` is idle with room and A is idle again: with MaxMoves 3 the only thing keeping the ticket on B is the no-revisit rule for A
   // (and, for C, nothing -- so C is taken out of play to pin that down)
   ctx.fake.setProbe('c', { ...IDLE, paused: true });
-  await sleep(2500);
+  await samples(ctx, 'b');
   assert.equal(ctx.fake.count('withdraw b'), 0, 'never moved off B back to A');
   assert.equal(ctx.fake.count('exec a'), 1, 'A was not dispatched to again');
   assert.equal(ctx.fake.count('withdraw a'), 1);
@@ -129,7 +138,7 @@ test('rebalance: MaxMoves 1 -- after A -> B the ticket does not move on to an id
   const id = await ctx.start();
   await waitFor(() => ctx.fake.count('exec b') === 1, { timeoutMs: 30_000 });
   ctx.fake.setProbe('c', IDLE);
-  await sleep(2500);
+  await samples(ctx, 'b');
   assert.equal(ctx.fake.count('withdraw b'), 0, 'the cap stops a second move');
   assert.equal(ctx.fake.count('exec c'), 0);
   ctx.unpause('b');
@@ -143,8 +152,9 @@ test('rebalance: a changed worktree is never moved (the snapshot would be stale)
   gitFixture(['commit', '-q', '-m', 'x'], ctx.repoDir);
   const id = await ctx.start();
   await execArrived(ctx, 'a');
+  const seen = ctx.fake.count('result a');
   fs.appendFileSync(path.join(ctx.repoDir, '.lane-broker.json'), '\n');
-  await sleep(2500);
+  await samples(ctx, 'a', seen + 4);
   assert.equal(ctx.fake.count('withdraw a'), 0, 'no withdraw once the tree changed');
   assert.equal(ctx.fake.count('exec b'), 0);
   assert.equal(readAttempt(ctx.state, id)?.moving, undefined);
@@ -159,7 +169,7 @@ test('rebalance: a B whose probe has no measured headroom is not a destination',
   ctx.fake.setProbe('b', { ...unmeasured, capacity: { cpuCores: 8 }, reservedCpuCores: 0 });
   const id = await ctx.start();
   await execArrived(ctx, 'a');
-  await sleep(2500);
+  await samples(ctx, 'a');
   assert.equal(ctx.fake.count('withdraw a'), 0);
   ctx.unpause('a');
   assert.equal((await ctx.finish(id)).code, 0);
@@ -170,7 +180,7 @@ test('rebalance: remoteRebalanceMinQueuedMs 0 disables it entirely -- nothing wa
   const ctx = rebalanceSetup({ rebalance: { remoteRebalanceMinQueuedMs: 0 } });
   const id = await ctx.start();
   await execArrived(ctx, 'a');
-  await sleep(2500);
+  await sleep(NO_WATCHER_WINDOW_MS);
   assert.equal(ctx.fake.count('result a'), 0, 'no watcher poll');
   assert.equal(ctx.fake.count('withdraw a'), 0);
   ctx.unpause('a');
@@ -183,13 +193,15 @@ test('rebalance: a cancel that lands while the destination is being chosen stops
   const id = await ctx.start();
   await execArrived(ctx, 'a');
   const probesBefore = ctx.fake.count('probe b');
-  ctx.fake.setProbe('b', { ...IDLE, delayMs: 3000 });
+  const probesEnded = ctx.fake.count('end-probe b 0');
+  ctx.fake.setProbe('b', { ...IDLE, delayMs: 2000 });
   await waitFor(() => ctx.fake.count('probe b') > probesBefore, { timeoutMs: 30_000 });
   const cancelled = await laneRun(['cancel', id], { env: ctx.env });
   assert.equal(cancelled.code, 0, cancelled.stderr);
   const waited = await ctx.finish(id, '30s');
   assert.equal(waited.code, 130, waited.stderr);
-  await sleep(3500);
+  // the slow pick answered only after the cancel: a withdraw it went on to make would still be logged
+  await waitFor(() => ctx.fake.count('end-probe b 0') > probesEnded, { timeoutMs: 30_000 });
   assert.equal(ctx.fake.count('withdraw a'), 0);
   assert.deepEqual(ctx.runs(), []);
 });
@@ -284,7 +296,8 @@ test('P2-5: after A -> B fails before starting, the rebind never goes back to A 
   const ctx = rebalanceSetup({ runnerOpts: { b: { execFails: true } }, localPaused: true, rebalance: { remoteRebalanceMinQueuedMs: 300, remoteRebindIntervalMs: 200 } });
   const id = await ctx.start();
   await waitFor(() => ctx.fake.count('exec b') >= 1, { timeoutMs: 30_000 });
-  await sleep(3000);
+  // B's exec failed before starting and both runners are visited, so the paused local queue is where it lands instead of a retry on A
+  await waitFor(() => listQueue(ctx.state).some((t) => t.id === id), { timeoutMs: 30_000 });
   assert.equal(ctx.fake.count('exec a'), 1, 'A was never dispatched to again');
   assert.equal(ctx.fake.count('exec b'), 1);
   assert.equal(readAttempt(ctx.state, id)?.moves?.length, 1);
@@ -295,7 +308,7 @@ test('P2-8: a runner with rebalanceTarget false is never a destination', T, asyn
   const ctx = rebalanceSetup({ configOpts: { b: { rebalanceTarget: false } }, rebalance: { remoteRebalanceMinQueuedMs: 300 } });
   const id = await ctx.start();
   await execArrived(ctx, 'a');
-  await sleep(2500);
+  await samples(ctx, 'a');
   assert.equal(ctx.fake.count('withdraw a'), 0);
   ctx.unpause('a');
   assert.equal((await ctx.finish(id)).code, 0);
@@ -325,7 +338,7 @@ test('a live cancel the runner does not confirm keeps the attempt and fails `lan
   const attempt = readAttempt(ctx.state, id);
   assert.ok(attempt?.unresolved, 'the attempt is kept and marked');
   // BRAIN-515: `lane wait` asks the runner, which still holds the ticket queued, so it keeps waiting (75) instead of giving up
-  const waited = await ctx.finish(id, '3s');
+  const waited = await ctx.finish(id, '2s');
   assert.equal(waited.code, 75, waited.stderr);
   assert.match(waited.stderr, /still queued or running/);
   const runnersPath = path.join(path.dirname(ctx.fake.probesPath), 'runners.json');
@@ -372,7 +385,7 @@ test('rebalance never picks a runner the ticket was already dispatched to: A tim
   const globalPath = path.join(ctx.home, 'config.json');
   fs.writeFileSync(globalPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(globalPath, 'utf8')), remoteRebalanceMinQueuedMs: 300, remoteQueueTimeoutMs: 6000 }));
   await waitFor(() => ctx.fake.count('exec b') === 1, { timeoutMs: 60_000 });
-  await sleep(2500); // many rebalance ticks while it sits queued on B, with A idle in every probe
+  await samples(ctx, 'b', 4); // rebalance ticks while it sits queued on B, with A idle in every probe
   assert.equal(ctx.fake.count('withdraw b'), 0, 'never withdrawn from B back to A');
   assert.equal(ctx.fake.count('exec a'), 1, 'A was dispatched to once');
   assert.deepEqual(readAttempt(ctx.state, id).dispatchedRunners, ['a', 'b']);
@@ -421,14 +434,14 @@ test('BRAIN-770: a localRefused ticket queued past the cap with no runner to mov
   assert.ok(ctx.fake.count('withdraw a') >= 1, 'the withdraw is the proof the runner never started it');
   assert.deepEqual(ctx.runs(), [], 'nothing ran anywhere');
   assert.equal(readAttempt(ctx.state, id), null, 'no attempt is left behind');
-  assert.match(fs.readFileSync(paths(ctx.state).admissionLog, 'utf8'), /remote-refused: .*withdrawn from a/);
+  assert.match(admissionLog(ctx), /remote-refused: .*withdrawn from a/);
 });
 
 test('BRAIN-770: the ticket waits the whole cap first (it is not refused before remoteRefusedMaxQueuedMs)', T, async () => {
   const ctx = refusedSetup({ names: ['a'], cap: 600_000 });
   const id = await ctx.start();
   await execArrived(ctx, 'a');
-  await sleep(2500);
+  await samples(ctx, 'a');
   assert.equal(ctx.fake.count('withdraw a'), 0);
   ctx.unpause('a');
   assert.equal((await ctx.finish(id)).code, 0);
@@ -462,9 +475,10 @@ test('BRAIN-770: a runner without remote-withdraw/1 keeps the ticket waiting (no
   ctx.fake.setProbe('a', { ...IDLE, capabilities: IDLE.capabilities.filter((c) => c !== REMOTE_WITHDRAW_CAPABILITY) });
   const id = await ctx.start();
   await execArrived(ctx, 'a');
-  await sleep(2500);
+  await waitFor(() => /cannot withdraw/.test(admissionLog(ctx)), { timeoutMs: 30_000 });
+  await sleep(NO_WATCHER_WINDOW_MS); // no withdraw capability means no watcher at all, so there is no sample to count
   assert.equal(ctx.fake.count('withdraw a'), 0);
-  assert.match(fs.readFileSync(paths(ctx.state).admissionLog, 'utf8'), /remote-refused: .*a cannot withdraw \(no remote-withdraw\/1\)/);
+  assert.match(admissionLog(ctx), /remote-refused: .*a cannot withdraw \(no remote-withdraw\/1\)/);
   ctx.unpause('a');
   assert.equal((await ctx.finish(id)).code, 0);
   assert.deepEqual(ctx.runs(), ['a']);
@@ -474,7 +488,7 @@ test('BRAIN-770: remoteRebalanceMinQueuedMs 0 still watches nothing, cap or no c
   const ctx = refusedSetup({ names: ['a'], rebalance: { remoteRebalanceMinQueuedMs: 0 } });
   const id = await ctx.start();
   await execArrived(ctx, 'a');
-  await sleep(2500);
+  await sleep(NO_WATCHER_WINDOW_MS);
   assert.equal(ctx.fake.count('result a'), 0, 'no watcher poll');
   assert.equal(ctx.fake.count('withdraw a'), 0);
   ctx.unpause('a');
@@ -485,7 +499,7 @@ test('BRAIN-770: remoteRefusedMaxQueuedMs 0 turns the cap off', T, async () => {
   const ctx = refusedSetup({ names: ['a'], cap: 0 });
   const id = await ctx.start();
   await execArrived(ctx, 'a');
-  await sleep(2500);
+  await samples(ctx, 'a');
   assert.equal(ctx.fake.count('withdraw a'), 0);
   ctx.unpause('a');
   assert.equal((await ctx.finish(id)).code, 0);
@@ -495,7 +509,7 @@ test('BRAIN-770: a ticket that CAN fall back locally (not localRefused) is untou
   const ctx = refusedSetup({ names: ['a'], localRefused: false });
   const id = await ctx.start();
   await execArrived(ctx, 'a');
-  await sleep(2500);
+  await samples(ctx, 'a');
   assert.equal(ctx.fake.count('withdraw a'), 0);
   ctx.unpause('a');
   assert.equal((await ctx.finish(id)).code, 0);
@@ -519,9 +533,9 @@ test('BRAIN-770: remoteRebalanceMaxMoves 0 with an idle runner is "moving paused
   const ctx = refusedSetup({ cap: 1000, rebalance: { remoteRebalanceMaxMoves: 0 } });
   const id = await ctx.start();
   await execArrived(ctx, 'a');
-  await sleep(3000);
+  await waitFor(() => /moving is paused/.test(admissionLog(ctx)), { timeoutMs: 30_000 }); // the cap elapsed and the refusal was declined
   assert.equal(ctx.fake.count('withdraw a'), 0);
-  assert.match(fs.readFileSync(paths(ctx.state).admissionLog, 'utf8'), /remote-refused: .*moving is paused \(remoteRebalanceMaxMoves is 0\)/);
+  assert.match(admissionLog(ctx), /remote-refused: .*moving is paused \(remoteRebalanceMaxMoves is 0\)/);
   ctx.unpause('a');
   assert.equal((await ctx.finish(id)).code, 0);
   assert.deepEqual(ctx.runs(), ['a']);
@@ -555,9 +569,10 @@ test('BRAIN-770: a failed write of the first-queued stamp is retried on the next
   const attemptsDir = paths(ctx.state).attempts;
   const id = await ctx.start();
   await execArrived(ctx, 'a');
+  const seen = ctx.fake.count('result a');
   fs.chmodSync(attemptsDir, 0o500);
   try {
-    await sleep(2500);
+    await samples(ctx, 'a', seen + 2);
     assert.equal(readAttempt(ctx.state, id)?.firstQueuedAt, undefined, 'the write was blocked');
   } finally {
     fs.chmodSync(attemptsDir, 0o700);
