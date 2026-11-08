@@ -87,14 +87,16 @@ function cgroupV2Dirs(readFile) {
  * treated as Linux: cgroup limits win over host-level values when present. */
 export function detectResourceCapacity({
   platform = process.platform,
-  parallelism = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length,
+  parallelism = null,
   totalMemory = os.totalmem(),
   freeMemory = os.freemem(),
   readFile = fs.readFileSync,
   vmStatText = null,
   exec = execFileSync,
+  testHostCores = Number(process.env.LANE_BROKER_TEST_HOST_CORES) || null,
 } = {}) {
-  let cpuCores = Math.max(1, Number(parallelism) || 1);
+  const machineCores = typeof os.availableParallelism === 'function' ? os.availableParallelism() : os.cpus().length;
+  let cpuCores = Math.max(1, Number(parallelism ?? testHostCores ?? machineCores) || 1);
   let memoryBytes = Math.max(1, Number(totalMemory) || 1);
   let availableMemoryBytes = Math.max(0, Number(freeMemory) || 0);
   const sources = ['os'];
@@ -143,11 +145,11 @@ export function detectResourceCapacity({
     for (const dir of cgroupV2Dirs(readFile)) {
       const cpuQuota = parseCpuMax(readText(`${dir}/cpu.max`, readFile));
       const cpuSet = parseCpuSet(readText(`${dir}/cpuset.cpus.effective`, readFile));
-      if (cpuQuota !== null) {
+      if (cpuQuota !== null && testHostCores === null) {
         cpuCores = Math.min(cpuCores, cpuQuota);
         foundCpu = true;
       }
-      if (cpuSet !== null) {
+      if (cpuSet !== null && testHostCores === null) {
         cpuCores = Math.min(cpuCores, cpuSet);
         foundCpuSet = true;
       }

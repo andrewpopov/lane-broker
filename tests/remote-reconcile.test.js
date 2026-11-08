@@ -169,7 +169,7 @@ test('a completed runner result matching the dispatch binding is adopted: exit k
   assert.equal(result.runner, 'skybox');
   assert.equal(result.remoteKind, 'completed');
   // A short job may finish before the runner's first CPU sample, so compare against what the runner actually recorded.
-  const usageOf = (r) => Object.fromEntries(['observedCpu', 'observedRssPeakBytes', 'cpuSeconds'].filter((k) => k in r).map((k) => [k, r[k]]));
+  const usageOf = (r) => Object.fromEntries(['observedCpu', 'observedRssPeakBytes', 'cpuSeconds', 'observedCgroupMemoryPeakBytes'].filter((k) => k in r).map((k) => [k, r[k]]));
   assert.deepEqual(usageOf(result), relayedUsage(record), 'the runner usage is relayed exactly');
   const rows = historyRows(ctx.state);
   assert.equal(rows.length, 1);

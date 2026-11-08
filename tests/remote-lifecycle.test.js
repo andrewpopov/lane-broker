@@ -221,12 +221,13 @@ test('SIGINT to `lane wait` on a detached remote run cancels it: exit 130, runne
   await waitFor(() => fs.existsSync(startedMarker), { timeoutMs: 15_000 });
   assert.equal(fs.readFileSync(whereMarker, 'utf8'), 'remote');
 
-  const waitChild = laneSpawn(['wait', id], { env });
+  const ready = path.join(tmpDir('wait-ready'), 'ready');
+  const waitChild = laneSpawn(['wait', id], { env: { ...env, LANE_BROKER_TEST_WAIT_READY_FILE: ready } });
   let waitStderr = '';
   waitChild.stderr.on('data', (d) => {
     waitStderr += d;
   });
-  await sleep(500); // let `lane wait` actually attach and poll at least once
+  await waitFor(() => fs.existsSync(ready), { timeoutMs: 30_000 });
   waitChild.kill('SIGINT');
   // Bounded: a broken cancel-forwarding path here must fail this test fast
   // and by name, never hang the whole suite waiting on a `lane wait` that

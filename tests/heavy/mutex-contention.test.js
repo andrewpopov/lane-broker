@@ -4,9 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { freshEnv } from './helpers.js';
+import { freshEnv } from '../helpers.js';
 
-const stateJsPath = fileURLToPath(new URL('../src/state.js', import.meta.url));
+const stateJsPath = fileURLToPath(new URL('../../src/state.js', import.meta.url));
 
 const WORKERS = 8;
 const ITERATIONS = 200;

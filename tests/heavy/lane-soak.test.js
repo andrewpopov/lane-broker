@@ -1,7 +1,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runSoak, soakPassed } from './lane-soak.js';
-import { PG_SKIP_REASON } from './lane-db-harness.js';
+import { runSoak, soakPassed } from '../lane-soak.js';
+import { PG_SKIP_REASON } from '../lane-db-harness.js';
 
 /** The 30 minute run is `node tests/lane-soak.js --minutes 30`; this is the same harness for a few seconds. */
 describe('lane lock-order soak harness', { skip: PG_SKIP_REASON ?? false, timeout: 120000 }, () => {

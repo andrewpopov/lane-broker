@@ -655,12 +655,15 @@ test('remote run: waitedMs records the wait before the command started, not the 
   // Long enough that the ssh connect + runner startup the formula counts as wait (seconds under load) stays well under the run.
   const runMs = 8000;
   const cmd = ['node', '-e', `setTimeout(() => process.exit(0), ${runMs});`];
+  const submittedAt = Date.now();
   const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...cmd], env, repoDir);
+  const elapsedMs = Date.now() - submittedAt;
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
   const result = resultOf(state, id);
   assert.equal(result.executor, 'remote');
   assert.ok(Number.isFinite(result.waitedMs), `waitedMs should be a number, got ${result.waitedMs}`);
-  assert.ok(result.waitedMs < runMs, `waitedMs ${result.waitedMs} must not include the ${runMs}ms run`);
+  // Load-independent: a waitedMs that counted the run would leave less than the run's length of the test's own wall time.
+  assert.ok(result.waitedMs <= elapsedMs - (runMs - 500), `waitedMs ${result.waitedMs} must not include the ${runMs}ms run (${elapsedMs}ms in all)`);
   assert.ok(result.endedAt - result.startedAt >= runMs - 100, 'startedAt must still mean "command started"');
 });
 
@@ -669,13 +672,15 @@ test('remote run: waitedMs records the wait before the command started, not the 
 test('remote run: a result that lands 6s after the run ended does not count the fetch delay as queue wait', async () => {
   const { env, state, repoDir } = setup({ ssh: 'slow-result' });
   const cmd = ['node', '-e', 'process.exit(0)'];
+  const submittedAt = Date.now();
   const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...cmd], env, repoDir);
+  const elapsedMs = Date.now() - submittedAt;
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
   const result = resultOf(state, id);
   assert.equal(result.executor, 'remote');
   assert.ok(Number.isFinite(result.waitedMs), `waitedMs should be a number, got ${result.waitedMs}`);
-  assert.ok(result.waitedMs < 3000, `waitedMs ${result.waitedMs} must not include the 6000ms result delay`);
-  assert.ok(Number.isFinite(result.runMs) && result.runMs < 3000, `the runner-measured runMs must be recorded, got ${result.runMs}`);
+  assert.ok(result.waitedMs <= elapsedMs - 5500, `waitedMs ${result.waitedMs} must not include the 6000ms result delay (${elapsedMs}ms in all)`);
+  assert.ok(Number.isFinite(result.runMs) && result.runMs <= elapsedMs - 5500, `the runner-measured runMs must be recorded without the delay, got ${result.runMs}`);
   assert.ok(result.endedAt - result.startedAt >= 5500, 'the delivery delay sits between startedAt and endedAt, not before startedAt');
 });
 
@@ -684,12 +689,15 @@ test('remote run: a result from a runner that reports no queuedMs still gets a w
   // Long enough that the ssh connect + runner startup the formula counts as wait (seconds under load) stays well under the run.
   const runMs = 8000;
   const cmd = ['node', '-e', `setTimeout(() => process.exit(0), ${runMs});`];
+  const submittedAt = Date.now();
   const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...cmd], env, repoDir);
+  const elapsedMs = Date.now() - submittedAt;
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
   const result = resultOf(state, id);
   assert.equal(result.executor, 'remote');
   assert.ok(Number.isFinite(result.waitedMs), `waitedMs should be a number, got ${result.waitedMs}`);
-  assert.ok(result.waitedMs < runMs, `waitedMs ${result.waitedMs} must not include the ${runMs}ms run`);
+  // Load-independent: a waitedMs that counted the run would leave less than the run's length of the test's own wall time.
+  assert.ok(result.waitedMs <= elapsedMs - (runMs - 500), `waitedMs ${result.waitedMs} must not include the ${runMs}ms run (${elapsedMs}ms in all)`);
 });
 
 // ---- BRAIN-363: an unconfirmed expiry cancel must never lead to a second (local) execution ----
@@ -702,6 +710,7 @@ test('remote run: result-wait expiry with an unconfirmed cancel is never re-run 
   assert.equal(waited.code, 75, `stderr: ${waited.stderr}`);
   assert.match(waited.stderr, /still queued or running/);
   assert.equal(fs.existsSync(marker), false, 'the job must not have been re-run locally');
+  await waitFor(() => readAttempt(state, id)?.unresolved, { timeoutMs: 120_000 });
   const attempt = readAttempt(state, id);
   assert.equal(attempt.executor, 'remote');
   assert.equal(attempt.runner, 'skybox');

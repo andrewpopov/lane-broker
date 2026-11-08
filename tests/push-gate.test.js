@@ -62,7 +62,14 @@ function push(fx, name, gateCmd, ref = PUSH_REF, gateArgs = '', work = fx.work, 
     await waitFor(() => fs.existsSync(rcFile) && fs.readFileSync(rcFile, 'utf8').trim() !== '', { timeoutMs: 60_000 });
     return Number(fs.readFileSync(rcFile, 'utf8'));
   };
-  return { child, done, hookRc };
+  return { child, done, hookRc, stderr: () => stderr };
+}
+
+/** A shell command that runs until `release()` is called, or `maxSeconds` pass: a fixed sleep can end first on a loaded host. */
+function heldCmd(fx, maxSeconds) {
+  const file = path.join(fx.base, `release-${crypto.randomUUID()}`);
+  const cmd = `i=0; while [ ! -e '${file}' ] && [ $i -lt ${maxSeconds * 10} ]; do sleep 0.1; i=$((i+1)); done`;
+  return { cmd, release: () => fs.writeFileSync(file, '') };
 }
 
 const historyRows = (fx) => (fs.existsSync(fx.history) ? fs.readFileSync(fx.history, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
@@ -70,10 +77,12 @@ const gateRows = (fx) => historyRows(fx).filter((r) => r.lane === 'prepush');
 const queuedRecords = (fx) => listQueueStrict(fx.state);
 const hasLease = (fx) => fs.existsSync(paths(fx.state).leases) && fs.readdirSync(paths(fx.state).leases).some((n) => n.endsWith('.json'));
 
-async function occupyCapacity(fx, seconds) {
-  const blocker = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', 'sleep', String(seconds)], { env: fx.env, cwd: fx.work });
+/** Holds the broker's capacity until the returned `release()`, or `maxSeconds`. */
+async function occupyCapacity(fx, maxSeconds = 120) {
+  const held = heldCmd(fx, maxSeconds);
+  laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', 'sh', '-c', held.cmd], { env: fx.env, cwd: fx.work });
   await waitFor(() => hasLease(fx), { timeoutMs: 60_000 });
-  return blocker;
+  return held.release;
 }
 
 function expectSupersededRow(fx, row, winnerRow) {
@@ -89,12 +98,14 @@ function expectSupersededRow(fx, row, winnerRow) {
 
 test('a repeat of the same push supersedes the older queued gate', async () => {
   const fx = setup();
-  await occupyCapacity(fx, 4);
+  const release = await occupyCapacity(fx);
   const older = push(fx, 'older', 'true');
   await waitFor(() => fs.existsSync(paths(fx.state).queue) && queuedRecords(fx).some((r) => r.pushGate), { timeoutMs: 60_000 });
   await sleep(GATE_SECONDS_APART);
   const newer = push(fx, 'newer', 'true');
-  const [olderDone, newerDone] = await Promise.all([older.done, newer.done]);
+  const olderDone = await older.done;
+  release();
+  const newerDone = await newer.done;
   assert.equal(olderDone.rc, 130);
   assert.match(olderDone.stderr, /lane run: superseded by [0-9a-f-]+/);
   assert.equal(newerDone.rc, 0);
@@ -125,11 +136,13 @@ test('a repeat of the same push supersedes the older running gate', async () => 
 
 test('two pushes of the same checkout with different args are not superseded', async () => {
   const fx = setup();
-  await occupyCapacity(fx, 3);
+  const release = await occupyCapacity(fx);
   const first = push(fx, 'first', 'true');
   await waitFor(() => fs.existsSync(paths(fx.state).queue) && queuedRecords(fx).some((r) => r.pushGate), { timeoutMs: 60_000 });
   await sleep(GATE_SECONDS_APART);
   const second = push(fx, 'second', 'true', 'HEAD:refs/heads/other');
+  await waitFor(() => queuedRecords(fx).filter((r) => r.pushGate).length === 2, { timeoutMs: 60_000 });
+  release();
   const [firstDone, secondDone] = await Promise.all([first.done, second.done]);
   assert.equal(firstDone.rc, 0);
   assert.equal(secondDone.rc, 0);
@@ -150,13 +163,14 @@ function runOrphaned(fx, name, gateCmd) {
 
 test('a hand-run lane run on the prepush lane is never stamped or superseded', async () => {
   const fx = setup();
-  await occupyCapacity(fx, 3);
+  const release = await occupyCapacity(fx);
   const first = runOrphaned(fx, 'first', 'exit 0');
   await waitFor(() => fs.existsSync(paths(fx.state).queue) && queuedRecords(fx).length === 1, { timeoutMs: 60_000 });
   await sleep(GATE_SECONDS_APART);
   const second = runOrphaned(fx, 'second', 'exit 0');
   await waitFor(() => queuedRecords(fx).length === 2, { timeoutMs: 60_000 });
   assert.ok(queuedRecords(fx).every((r) => r.pushGate === undefined));
+  release();
   await waitFor(() => gateRows(fx).length === 2, { timeoutMs: 60_000 });
   await Promise.all([first, second]);
   const rows = gateRows(fx);
@@ -248,7 +262,7 @@ const hasLeaseOf = (fx, id) => fs.existsSync(path.join(paths(fx.state).leases, `
 
 test('a client that timed out is not reaped and lane wait still returns its result', async () => {
   const fx = setup();
-  await occupyCapacity(fx, 5);
+  const release = await occupyCapacity(fx);
   const hook = push(fx, 'p', 'true', PUSH_REF, '--timeout 1s');
   const record = await queuedGate(fx);
   assert.equal(await hook.hookRc(), 75);
@@ -257,6 +271,7 @@ test('a client that timed out is not reaped and lane wait still returns its resu
   await sleep(1500);
   assert.equal(queueFiles(fx).length, 1, 'a released gate stays queued though its push and client are gone');
   assert.ok(isPidAlive(record.supervisorPid));
+  release();
   const waited = await laneRun(['wait', record.id], { env: fx.env, cwd: fx.work });
   assert.equal(waited.code, 0);
   assert.equal(gateRows(fx)[0].exit, 0);
@@ -288,15 +303,25 @@ test('an orphaned superseded gate is cancelled with the superseded result, quiet
 
 const intervalOf = (row) => [row.startedAt, row.endedAt];
 
-/** Two pushes of one caller to two repos on a roomy broker: the second is enqueued while the first is running. */
-async function pushToTwoRepos({ firstCmd = 'sleep 3', extraEnv = {}, secondEnv = {}, unsetCaller = false } = {}) {
+/**
+ * Two pushes to two repos on a roomy broker: the second is enqueued while the first is running, and the first runs until
+ * the second is either held behind it or running beside it.
+ */
+async function pushToTwoRepos({ extraEnv = {}, secondEnv = {}, unsetCaller = false } = {}) {
   const fx = setup(extraEnv, 4);
   if (unsetCaller) for (const name of ['CLAUDE_CODE_SESSION_ID', 'CODEX_THREAD_ID', 'CODEX_SESSION_ID']) delete fx.env[name];
   const second = addWork(fx, 's');
-  const first = push(fx, 'first', firstCmd);
+  const firstGate = heldCmd(fx, 120);
+  const first = push(fx, 'first', firstGate.cmd);
   await waitFor(() => hasLease(fx), { timeoutMs: 60_000 });
   await sleep(GATE_SECONDS_APART);
   const held = push(fx, 'second', 'true', PUSH_REF, '', second, secondEnv);
+  const leases = () => fs.readdirSync(paths(fx.state).leases).filter((n) => n.endsWith('.json')).length;
+  try {
+    await waitFor(() => /waiting behind your other push/.test(held.stderr()) || leases() >= 2, { timeoutMs: 60_000 });
+  } finally {
+    firstGate.release();
+  }
   const [firstDone, heldDone] = await Promise.all([first.done, held.done]);
   const rows = gateRows(fx);
   return { fx, firstDone, heldDone, firstRow: rows.find((r) => r.worktree === fs.realpathSync(fx.work)), heldRow: rows.find((r) => r.worktree === fs.realpathSync(second)) };

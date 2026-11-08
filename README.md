@@ -2783,6 +2783,10 @@ What a run leaves behind is collected; what a live one owns never is. Everything
 - `LANE_BROKER_LOADAVG_FILE` — if set, `lane` reads the 1-minute load from the
   first line of this file instead of `os.loadavg()`, for deterministic gate
   tests.
+- `LANE_BROKER_TEST_HOST_CORES` — the CPU core count `detectResourceCapacity()` reports instead of
+  `os.availableParallelism()` and the cgroup's `cpu.max`/`cpuset` (BRAIN-860); a caller's explicit
+  `parallelism` (a sampler's fixture CPU list) still wins. `npm test` sets it to
+  the machine's core count, so the suite behaves the same inside a 1-core runner lane as on a bare host.
 - `LANE_BROKER_BOOT_ID` — override the detected boot id, to simulate a reboot.
 - `LANE_BROKER_TEST_ROUNDS` — override the dead-owner-lock contention sweep's
   round count (default 4; the original suite ran 10) for a fuller sweep, e.g.
@@ -2806,6 +2810,8 @@ What a run leaves behind is collected; what a live one owns never is. Everything
   inside the window that check cannot see: after `remote-id` is recorded but
   before the supervisor (not yet spawned) has enqueued or leased that same id
   with the local broker.
+- `LANE_BROKER_TEST_WAIT_READY_FILE` — `lane wait` writes its pid to this file once its SIGINT and SIGTERM handlers are
+  installed, so a test signals it only after it can forward the cancel (a fixed sleep raced Node's startup on a loaded runner).
 - `LANE_BROKER_TEST_PAUSE_BEFORE_WAIT_ORPHAN` — if set, `lane wait` pauses,
   right after finding no result yet and an attempt record whose supervisor
   is dead, until the named file appears -- so a test can deterministically
@@ -2938,6 +2944,18 @@ for a lease that a scheduled-out CLI has not written yet, on a machine where it
 passes standalone in under two seconds. A test suite for a tool that exists to
 stop parallel processes from starving each other should not itself be a
 thundering herd.
+
+The scale, perf and soak tests live in `tests/heavy/` and run with `npm run test:heavy`, not
+`npm test`: claim latency at 60,000 queued jobs, the Postgres lock-order soak and the 8×200 mutex
+hammer. They measure the host as much as the code, so PR CI leaves them out, and the merge train's
+master verify runs them on every master tip (`.train.json` `masterCommand`, `scripts/train-gate.sh
+heavy`). A red there opens the train's master-red incident, as any master verify does.
+
+PR CI can split `npm test` across lanes. When the merge train sets `TRAIN_SHARD=i/N`, `scripts/train-gate.sh`
+runs `scripts/test-shard.sh`, which lints and runs only the files `scripts/test-files.js` deals to shard `i`.
+Files go longest first to the shard with the least time so far, weighted by `tests/durations.json` (seconds
+per file, measured on a runner); a file missing from it counts as the median. Each shard still runs its files
+one at a time, and every shard ends with `zz-tmp-leak-guard`, which checks what the files before it left behind.
 
 ### Gate-cost scorecard: `lane report cost` (BRAIN-529)
 

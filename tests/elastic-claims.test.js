@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneRun, laneSpawn, gitFixture, BIN } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneRun, laneSpawn, gitFixture, BIN, waitFor } from './helpers.js';
 import { tmpDir, setup, markerCmd, makeFakeSshBin, clientEnv, makeRunner } from './remote-harness.js';
 import { selectRunner } from '../src/remote-client.js';
 import { enqueue, tryStart, listQueueCapped } from '../src/scheduler.js';
@@ -512,7 +512,8 @@ test('mixed versions: a runner without elastic-claims/1 is judged on the FULL cl
 });
 
 test('remote-probe advertises elastic-claims/1', () => {
-  const { env } = freshEnv();
+  const { env, home } = freshEnv();
+  writeGlobalConfig(home, { version: 1, cpuLimit: 'off' });
   const res = spawnSync(process.execPath, [BIN, 'remote-probe'], { env, encoding: 'utf8' });
   assert.equal(res.status, 0, res.stderr);
   assert.deepEqual(JSON.parse(res.stdout).capabilities, [
@@ -759,7 +760,7 @@ test('BRAIN-362: the queue keeps the declared claim; the cap follows the current
 
 // BRAIN-531: a queued claim the budget later shrank below is refused fast (exit 64) instead of waiting forever.
 async function queueBehindBlocker({ secondLane, shrinkTo }) {
-  const { base, home, env } = freshEnv();
+  const { base, home, state, env } = freshEnv();
   const cfg = (reserveLeft) => ({
     version: 1, capacity: 1, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100, schedulerMode: 'active',
     cpuAdmissionPercent: 100, cpuReserveCores: HOST_CORES - reserveLeft, admissionCooldownMs: 0,
@@ -769,11 +770,15 @@ async function queueBehindBlocker({ secondLane, shrinkTo }) {
   writeRepoConfig(repoDir, { version: 1, lanes: { blocker: { weight: 1, cpuCores: 1, memoryBytes: 1048576 }, second: secondLane } });
   const busy = writeCpuBusyFile(base, 0, HOST_CORES);
   const opts = { env: { ...env, LANE_BROKER_CPU_BUSY_FILE: busy }, cwd: repoDir };
-  const blocker = laneSpawn(['run', '--repo', 'r', '--lane', 'blocker', '--', 'sleep', '3'], opts);
-  await new Promise((r) => setTimeout(r, 800));
+  // The blocker holds until released and the edit waits for the second claim to be queued: fixed sleeps let a loaded host
+  // shrink the budget before the claim queued, so the up-front budget check refused it instead.
+  const release = path.join(base, 'release');
+  const blocker = laneSpawn(['run', '--repo', 'r', '--lane', 'blocker', '--', 'sh', '-c', `while [ ! -e '${release}' ]; do sleep 0.1; done`], opts);
+  await waitFor(() => fs.existsSync(paths(state).leases) && fs.readdirSync(paths(state).leases).some((n) => n.endsWith('.json')), { timeoutMs: 60_000 });
   const second = laneRun(['run', '--repo', 'r', '--lane', 'second', '--', 'true'], opts);
-  await new Promise((r) => setTimeout(r, 800));
+  await waitFor(() => fs.existsSync(paths(state).queue) && fs.readdirSync(paths(state).queue).length > 0, { timeoutMs: 60_000 });
   writeGlobalConfig(home, cfg(shrinkTo));
+  fs.writeFileSync(release, '');
   const result = await second;
   blocker.kill();
   return result;

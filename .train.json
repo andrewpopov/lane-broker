@@ -14,7 +14,8 @@
     ".train.json",
     "package-lock.json"
   ],
-  "verifyMaster": false,
+  "verifyMaster": true,
+  "masterCommand": ["sh", "scripts/train-gate.sh", "heavy"],
   "prCi": {
     "lane": "pr",
     "command": [

@@ -26,7 +26,7 @@ test('every directory made through makeTmpDir has been removed', () => {
 
 test('no test creates a temp directory except through makeTmpDir', () => {
   const offenders = [];
-  for (const file of fs.readdirSync(testsDir).filter((f) => f.endsWith('.js'))) {
+  for (const file of fs.readdirSync(testsDir, { recursive: true }).filter((f) => f.endsWith('.js') && !f.startsWith(`helpers${path.sep}`) && !f.startsWith(`fixtures${path.sep}`))) {
     if (file === 'zz-tmp-leak-guard.test.js') continue;
     fs.readFileSync(path.join(testsDir, file), 'utf8').split('\n').forEach((line, i) => {
       if (/\bmkdtemp(Sync)?\(/.test(line) && !/^\s*(\/\/|\*)/.test(line) && !/orig\.apply|lbpg-/.test(line) && !/(join|mkdtempSync)\((path\.dirname\(home\)|base),/.test(line)) {
