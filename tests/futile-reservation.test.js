@@ -5,6 +5,7 @@ import { freshEnv, writeGlobalConfig } from './helpers.js';
 import { enqueue, tryStart, listQueue, readResourceSkipState } from '../src/scheduler.js';
 import { collectStatus, renderStatusText } from '../src/status.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
+import { starvationHorizonMs } from '../src/priority.js';
 import { writeLease, removeLease, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths, atomicWriteJson } from '../src/state.js';
 import { resolveScheduler, fairnessStore, effectiveView } from '../src/fairness.js';
@@ -258,4 +259,114 @@ test('BRAIN-578 non-futile protected head: an express candidate still reserves t
   const result = await poll(state, candidate, { ext: 3 }); // 3 + 3 + 1 = 7 fits alone; 3 + 3 + 4 + 1 = 11 > 9 with the head charged
   assert.equal(result.started, false);
   assert.doesNotMatch(readLog(state), /event=express-admit candidateId=cand/);
+});
+
+// BRAIN-805: a futile verdict stops excusing backfill once the head has waited past the starvation horizon, while lanes are held.
+const agedOrigin = () => Date.now() - starvationHorizonMs(cfg) - 1000;
+const lowMemory = memory({ availableBytes: 6 * GIB });
+const bigHead = (overrides = {}) => ticket('head', { weight: 1, resources: { cpuCores: 1, memoryBytes: 8 * GIB }, ...overrides });
+
+async function backfillPastHead(state, head, prefix, count) {
+  const results = [];
+  for (let i = 0; i < count; i += 1) {
+    const small = ticket(`${prefix}${i}`);
+    await enqueue(state, small);
+    await poll(state, head, { ext: 0.2, mem: lowMemory });
+    results.push(await poll(state, small, { ext: 0.2, mem: lowMemory }));
+    removeLease(state, small.id);
+  }
+  return results;
+}
+
+test('BRAIN-805 aged memory-futile head with lanes held earns its reservation and refuses further backfill', async () => {
+  const { state } = freshEnv();
+  const head = bigHead({ prioOriginAt: agedOrigin() });
+  await enqueue(state, head);
+  holdLease(state, 'lane-a', 1, observed(0.1, 0.5 * GIB));
+  const denied = await poll(state, head, { ext: 0.2, mem: lowMemory });
+  assert.equal(denied.reason, 'memory-admission');
+  assert.equal(readResourceSkipState(state).futile, undefined, 'no futile verdict once aged with lanes held');
+
+  const started = await backfillPastHead(state, head, 's', cfg.resourceSkipLimit);
+  assert.ok(started.every((r) => r.started === true), 'the first resourceSkipLimit backfills start');
+  const record = readResourceSkipState(state);
+  assert.deepEqual({ count: record.count, reserved: record.reserved }, { count: cfg.resourceSkipLimit, reserved: true });
+
+  const extra = ticket('extra');
+  await enqueue(state, extra);
+  assert.equal((await poll(state, extra, { ext: 0.2, mem: lowMemory })).reason, 'not-head', 'the earned reservation holds');
+  const headLines = readLog(state).split('\n').filter((l) => l.includes('candidate=head ') || l.includes('candidateId=head '));
+  assert.ok(headLines.length > 0);
+  assert.ok(headLines.every((l) => !l.includes('reservation=futile')), 'the head poll never logs reservation=futile');
+});
+
+test('BRAIN-805 guard: a young memory-futile head with lanes held stays futile and backfill is uncounted', async () => {
+  const { state } = freshEnv();
+  const head = bigHead();
+  await enqueue(state, head);
+  holdLease(state, 'lane-a', 1, observed(0.1, 0.5 * GIB));
+  await poll(state, head, { ext: 0.2, mem: lowMemory });
+  assert.equal(readResourceSkipState(state).futile, 'memory');
+  const started = await backfillPastHead(state, head, 's', cfg.resourceSkipLimit + 2);
+  assert.ok(started.every((r) => r.started === true));
+  const record = readResourceSkipState(state);
+  assert.deepEqual({ count: record.count, reserved: record.reserved, futile: record.futile }, { count: 0, reserved: false, futile: 'memory' });
+});
+
+test('BRAIN-805 drained: an aged head with no lanes held is still judged memory-futile and a small ticket backfills', async () => {
+  const { state } = freshEnv();
+  const head = bigHead({ prioOriginAt: agedOrigin() });
+  const small = ticket('small');
+  await enqueue(state, head);
+  await enqueue(state, small);
+  assert.equal((await poll(state, head, { ext: 0.2, mem: lowMemory })).reason, 'memory-admission');
+  assert.equal(readResourceSkipState(state).futile, 'memory');
+  assert.equal((await poll(state, small, { ext: 0.2, mem: lowMemory })).started, true);
+});
+
+test('BRAIN-805 drained and fits: an aged reserved head starts once the held lane is removed and memory allows', async () => {
+  const { state } = freshEnv();
+  const head = bigHead({ prioOriginAt: agedOrigin() });
+  await enqueue(state, head);
+  holdLease(state, 'lane-a', 1, observed(0.1, 0.5 * GIB));
+  await poll(state, head, { ext: 0.2, mem: lowMemory });
+  await backfillPastHead(state, head, 's', cfg.resourceSkipLimit);
+  assert.equal(readResourceSkipState(state).reserved, true);
+  removeLease(state, 'lane-a');
+  assert.equal((await poll(state, head, { ext: 0.2, mem: memory() })).started, true);
+});
+
+test('BRAIN-805 v2: the earned reservation gets a reservationSeq and is the active owner', async () => {
+  const { state } = freshEnv();
+  atomicWriteJson(paths(state).schedFence, { version: 2, migratedAt: Date.now() });
+  fenceLegacyQueue(state, 'test');
+  atomicWriteJson(paths(state).fairness, { version: 2, tickets: {} });
+  const head = bigHead({ prioOriginAt: agedOrigin() });
+  await enqueue(state, head);
+  holdLease(state, 'lane-a', 1, observed(0.1, 0.5 * GIB));
+  await poll(state, head, { ext: 0.2, mem: lowMemory });
+  await backfillPastHead(state, head, 's', cfg.resourceSkipLimit);
+  const sched = resolveScheduler(state, { log: false });
+  const stored = sched.tickets.head?.resource;
+  assert.equal(stored?.reserved, true, JSON.stringify(sched.tickets));
+  assert.ok(Number.isFinite(stored.reservationSeq), 'reservationSeq assigned');
+  assert.equal(effectiveView(listQueue(state), Date.now(), cfg, fairnessStore(state, sched.tickets)).ownerId, 'head');
+});
+
+test('BRAIN-805 transition: the head poll that crosses the horizon does not log the stale futile verdict', async () => {
+  const { state } = freshEnv();
+  const head = bigHead({ prioOriginAt: agedOrigin() });
+  await enqueue(state, head);
+  holdLease(state, 'lane-a', 1, observed(0.1, 0.5 * GIB));
+  const young = { ...cfg, priorityAgeMaxMs: 10 * cfg.priorityAgeMaxMs };
+  await poll(state, head, { ext: 0.2, mem: lowMemory, cfg: young });
+  assert.equal(readResourceSkipState(state).futile, 'memory', 'under the wider horizon the head is futile');
+
+  fs.writeFileSync(paths(state).admissionLog, '');
+  fs.rmSync(paths(state).admissionLast, { force: true }); // an unchanged decision is otherwise not logged again
+  await poll(state, head, { ext: 0.2, mem: lowMemory });
+  assert.equal(readResourceSkipState(state).futile, undefined, 'past the horizon the denial is ordinary');
+  const headLine = readLog(state).split('\n').find((l) => l.includes('candidate=head '));
+  assert.ok(headLine, 'the crossing poll writes a decision line');
+  assert.doesNotMatch(headLine, /reservation=futile/);
 });
