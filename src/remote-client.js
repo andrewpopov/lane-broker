@@ -264,12 +264,15 @@ function neverFits(reservation, probe) {
  * `opts.allowBusyQueue` (BRAIN-746, default false; needs `maxRemoteQueue > 0`): a runner with an EMPTY queue but no headroom
  * that statically fits also counts as a queued candidate (depth 0), and is preferred over a runner already queued deeper (fewest queued wins, as before).
  * Only a ticket whose local queue is CPU-blocked asks for this; every other caller keeps `busy` as a non-choice.
+ *
+ * `opts.queuedFilter` (BRAIN-888, `(cand: {runner, probe, finish}) => boolean`): applied to every queued or busy candidate before it can
+ * become the queued choice. Without it nothing changes.
  */
 export async function selectRunner(runners, opts = {}) {
   const deadlineMs = opts.deadlineMs ?? DEFAULT_GLOBAL_CONFIG.remoteProbeDeadlineMs;
   const retryTimedOut = new Set(opts.retryTimedOut ?? []);
   const sshBin = opts.sshBin ?? 'ssh';
-  const { env, requireProtocol2 = false, requireCapabilities = [], readinessNeeds = {}, reservation, maxRemoteQueue = 0, allowBusyQueue = false, downRunners = {} } = opts;
+  const { env, requireProtocol2 = false, requireCapabilities = [], readinessNeeds = {}, reservation, maxRemoteQueue = 0, allowBusyQueue = false, downRunners = {}, queuedFilter = () => true } = opts;
   const skipped = [];
   const readiness = {};
   const ready = [];
@@ -374,7 +377,7 @@ export async function selectRunner(runners, opts = {}) {
       const queueable = Number.isInteger(probe.queued) && probe.queued > 0 && probe.queued <= maxRemoteQueue;
       if (fits && queueable) {
         const cand = { runner, probe, finish: estimatedFinish(reservation, probe, runner), cpuFree: 0 };
-        if (fewerQueued(cand, queuedBest)) queuedBest = cand;
+        if (queuedFilter(cand) && fewerQueued(cand, queuedBest)) queuedBest = cand;
       }
       continue;
     }
@@ -387,7 +390,7 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason });
       const cand = { runner, probe, finish: estimatedFinish(reservation, probe, runner), cpuFree };
       if (better(cand, busyBest)) busyBest = cand;
-      if (allowBusyQueue && maxRemoteQueue > 0 && fewerQueued(cand, queuedBest)) queuedBest = cand;
+      if (allowBusyQueue && maxRemoteQueue > 0 && queuedFilter(cand) && fewerQueued(cand, queuedBest)) queuedBest = cand;
       continue;
     }
     const cand = { runner, probe, finish: estimatedFinish(reservation, probe, runner), cpuFree };
@@ -851,6 +854,19 @@ export function rebalanceBlocked({ moves, maxMoves, lastMoveAt, now, cooldownMs 
   return null;
 }
 
+/**
+ * BRAIN-888: the advisory queue facts of one `remote-result` sample, each null unless well-formed. Read from that sample alone,
+ * so a stale or malformed value never carries into a later tick or another runner.
+ */
+function queueFactsOf(record) {
+  const { position, behindOtherOwner, reservationOwnerWaitedMs } = record;
+  return {
+    position: Number.isInteger(position) && position >= 1 ? position : null,
+    behindOtherOwner: typeof behindOtherOwner === 'boolean' ? behindOtherOwner : null,
+    reservationOwnerWaitedMs: Number.isFinite(reservationOwnerWaitedMs) && reservationOwnerWaitedMs >= 0 ? reservationOwnerWaitedMs : null,
+  };
+}
+
 /** BRAIN-436: a move needs a POSITIVE measurement -- unlike dispatch (`runnerRoom`), a probe with no measured free CPU is not room. */
 export function hasMeasuredHeadroom(probe) {
   return Boolean(probe?.headroom) && typeof probe.headroom === 'object' && Number.isFinite(probe.headroom.cpuCores);
@@ -918,6 +934,7 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
     return { from: runner, to, queuedMs: now() - since, withdrawnAt: now(), ...moveReasonOf(state) };
   };
   let queuedSince = null;
+  const refusalCapElapsed = () => refusedMaxQueuedMs > 0 && now() - (refusedSince?.() ?? queuedSince) >= refusedMaxQueuedMs;
   while (true) {
     await sleep(intervalMs, signal);
     if (!watching()) return null;
@@ -946,8 +963,8 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
     // A callback that throws or rejects is a failed tick: no move, keep watching. The target is awaited (the real picker is async).
     let to;
     try {
-      to = await pickTarget(draining ? { draining } : undefined);
-      const refusing = !to && refusedMaxQueuedMs > 0 && now() - (refusedSince?.() ?? queuedSince) >= refusedMaxQueuedMs && (refusalAllowed?.({ draining }) ?? true);
+      to = await pickTarget({ ...(draining ? { draining } : {}), sourceFacts: queueFactsOf(fetched), refusalCapElapsed: refusalCapElapsed() });
+      const refusing = !to && refusalCapElapsed() && (refusalAllowed?.({ draining }) ?? true);
       if (!(to || refusing) || !watching()) continue;
       to ||= REFUSED_MOVE_TARGET;
       if (beforeWithdraw && (await beforeWithdraw({ from: runner, to, queuedMs: now() - queuedSince })) === false) continue;
