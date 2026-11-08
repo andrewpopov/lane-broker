@@ -2951,7 +2951,7 @@ hammer. They measure the host as much as the code, so PR CI leaves them out, and
 master verify runs them on every master tip (`.train.json` `masterCommand`, `scripts/train-gate.sh
 heavy`). A red there opens the train's master-red incident, as any master verify does.
 
-PR CI can split `npm test` across lanes. When the merge train sets `TRAIN_SHARD=i/N`, `scripts/train-gate.sh`
+PR CI splits `npm test` across 4 lanes (`.train.json` `prCi.shards: 4`, one PR at a time). The suite waits far more than it computes (one full run used 1,793 CPU-seconds in 2,428 s of wall time), so each `pr` lane claims 2 cores with a 1-core floor. When the merge train sets `TRAIN_SHARD=i/N`, `scripts/train-gate.sh`
 runs `scripts/test-shard.sh`, which lints and runs only the files `scripts/test-files.js` deals to shard `i`.
 Files go longest first to the shard with the least time so far, weighted by `tests/durations.json` (seconds
 per file, measured on a runner); a file missing from it counts as the median. Each shard still runs its files

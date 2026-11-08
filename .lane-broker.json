@@ -4,7 +4,7 @@
     "default": { "weight": 2 },
     "prepush": { "weight": 2, "cpuCores": 1 },
     "train": { "weight": 2, "cpuCores": 6, "minCpuCores": 4 },
-    "pr": { "weight": 2, "cpuCores": 6, "minCpuCores": 4, "maxConcurrent": 3 }
+    "pr": { "weight": 2, "cpuCores": 2, "minCpuCores": 1, "maxConcurrent": 8 }
   },
   "conflicts": []
 }
