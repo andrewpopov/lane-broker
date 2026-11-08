@@ -759,7 +759,7 @@ test('BRAIN-362: the queue keeps the declared claim; the cap follows the current
 });
 
 // BRAIN-531: a queued claim the budget later shrank below is refused fast (exit 64) instead of waiting forever.
-async function queueBehindBlocker({ secondLane, shrinkTo }) {
+async function queueBehindBlocker({ secondLane, shrinkTo, expectRefusal = false }) {
   const { base, home, state, env } = freshEnv();
   const cfg = (reserveLeft) => ({
     version: 1, capacity: 1, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100, schedulerMode: 'active',
@@ -778,14 +778,17 @@ async function queueBehindBlocker({ secondLane, shrinkTo }) {
   const second = laneRun(['run', '--repo', 'r', '--lane', 'second', '--', 'true'], opts);
   await waitFor(() => fs.existsSync(paths(state).queue) && fs.readdirSync(paths(state).queue).length > 0, { timeoutMs: 60_000 });
   writeGlobalConfig(home, cfg(shrinkTo));
-  fs.writeFileSync(release, '');
+  // A refusal needs no free slot, so the blocker holds until it lands: released at once, the freed slot could admit the claim
+  // before the scheduler re-read the shrunk budget (it did on a loaded runner). A claim that still fits needs the release to run.
+  if (!expectRefusal) fs.writeFileSync(release, '');
   const result = await second;
+  fs.writeFileSync(release, '');
   blocker.kill();
   return result;
 }
 
 test('BRAIN-531: a non-elastic queued claim the budget shrank below is refused (exit 64) naming the lane, not left queued', async () => {
-  const result = await queueBehindBlocker({ secondLane: { weight: 1, cpuCores: 3, memoryBytes: 1048576 }, shrinkTo: 2 });
+  const result = await queueBehindBlocker({ secondLane: { weight: 1, cpuCores: 3, memoryBytes: 1048576 }, shrinkTo: 2, expectRefusal: true });
   assert.equal(result.code, 64, `stderr: ${result.stderr}`);
   assert.match(result.stderr, /exceed this environment's budget \(3\/2\.00 CPU cores/);
   assert.match(result.stderr, /Lane "second" can never start here/);
