@@ -595,7 +595,7 @@ if (sub === 'probe') {
   // admission race: the runner starts the ticket after the client last saw it queued and before this withdraw reaches it
   if (sub === 'withdraw' && r.admitBeforeWithdraw) { fs.rmSync(r.pause, { force: true }); const until = Date.now() + 2500; while (Date.now() < until) require('child_process').spawnSync('sleep', ['0.1']); }
   if (sub === 'withdraw' && r.withdrawReplyLost) fs.writeFileSync(flag, '1');
-  if (sub === 'result' && r.resultPatch) {
+  if (sub === 'result' && (r.resultPatch || r.queuedPatch)) {
     // a test-only rewrite of the runner's real record (a null value deletes the key), e.g. a record with no \`reason\` or a wrong binding
     const patched = spawn('sh', ['-c', cmd], { stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, LANE_FAKE_RUNNER: dest, LANE_BROKER_HOME: r.home, LANE_BROKER_STATE: r.state } });
     let out = '';
@@ -604,7 +604,9 @@ if (sub === 'probe') {
     patched.on('close', (code) => {
       try {
         const rec = JSON.parse(out.trim());
-        if (!rec.missing) for (const [k, v] of Object.entries(r.resultPatch)) { if (v === null) delete rec[k]; else rec[k] = v; }
+        // queuedPatch: the same rewrite for the still-queued record (BRAIN-888's advisory queue facts)
+        const patch = rec.missing ? (rec.state === 'queued' && r.queuedPatch) || {} : r.resultPatch || {};
+        for (const [k, v] of Object.entries(patch)) { if (v === null) delete rec[k]; else rec[k] = v; }
         process.stdout.write(JSON.stringify(rec) + '\\n');
       } catch { process.stdout.write(out); }
       done(code == null ? 1 : code);
@@ -640,6 +642,13 @@ if (sub === 'probe') {
     },
     /** Kill the exec ssh connection to runner `name`, as a dropped host would; the runner-side job is untouched. */
     dropExec: (name) => process.kill(Number(fs.readFileSync(path.join(dir, `exec-pid-${name}`), 'utf8')), 'SIGKILL'),
+    /** Merge `patch` into runner `name`'s fake options (e.g. a new `resultPatch`) for every later call. */
+    setRunner: (name, patch) => {
+      const file = path.join(dir, 'runners.json');
+      const all = JSON.parse(fs.readFileSync(file, 'utf8'));
+      all[name] = { ...all[name], ...patch };
+      fs.writeFileSync(file, JSON.stringify(all));
+    },
     setProbe: (name, probe) => {
       const all = JSON.parse(fs.readFileSync(probesPath, 'utf8'));
       all[name] = probe;

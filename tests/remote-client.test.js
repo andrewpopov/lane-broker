@@ -1125,6 +1125,36 @@ test('rebalance: a lost withdraw reply is resolved by the runner\'s own bound wi
   assert.equal(calls.filter((c) => c === 'withdraw').length, 1, 'the lost reply was not retried once the record proved it');
 });
 
+test('rebalance (BRAIN-888): the picker gets the queue facts of the latest sample only, malformed values as null, nothing carried over', { timeout: 60_000 }, async () => {
+  const seen = [];
+  const withFacts = (facts) => ({ ...queued, ...facts });
+  const results = [
+    queued,
+    withFacts({ position: 2, behindOtherOwner: true, reservationOwnerWaitedMs: 90_000 }),
+    withFacts({ position: 0, behindOtherOwner: 'yes', reservationOwnerWaitedMs: -1 }),
+    withFacts({ position: 1.5, reservationOwnerWaitedMs: 'soon' }),
+    withFacts({ position: 3, behindOtherOwner: false, reservationOwnerWaitedMs: 0 }),
+    queued,
+    'RESULT',
+  ];
+  await dispatchRebalance({ results, withdraws: [], execMs: 1500, rebalance: { minQueuedMs: 5_000, pickTarget: (args) => { seen.push(args.sourceFacts); return null; } } });
+  const none = { position: null, behindOtherOwner: null, reservationOwnerWaitedMs: null };
+  assert.deepEqual(seen, [
+    { position: 2, behindOtherOwner: true, reservationOwnerWaitedMs: 90_000 },
+    none,
+    none,
+    { position: 3, behindOtherOwner: false, reservationOwnerWaitedMs: 0 },
+    none,
+  ]);
+});
+
+test('rebalance (BRAIN-888): the picker is told whether the refusal cap has elapsed', { timeout: 60_000 }, async () => {
+  const seen = [];
+  await dispatchRebalance({ results: [queued, queued, queued, queued, queued, 'RESULT'], withdraws: [], execMs: 1500, rebalance: { minQueuedMs: 5_000, refusedMaxQueuedMs: 25_000, pickTarget: (args) => { seen.push(args.refusalCapElapsed()); return null; } } });
+  assert.deepEqual(seen.slice(0, 2), [false, false]);
+  assert.ok(seen.includes(true), JSON.stringify(seen));
+});
+
 test('rebalance: a withdrawn record that does not bind to this ticket is not proof', { timeout: 60_000 }, async () => {
   const stale = { protocol: 1, ticketId: 'someone-else', generation: 999, kind: 'unfinished', reason: 'withdrawn', manifestHash: 'nope' };
   const { result } = await dispatchRebalance({ results: [queued, queued, queued, queued, stale, stale, 'RESULT'], withdraws: [null], execMs: 1500, rebalance: { minQueuedMs: 20_000 } });

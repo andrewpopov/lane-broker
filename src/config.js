@@ -173,6 +173,9 @@ export const DEFAULT_GLOBAL_CONFIG = {
   remoteBlobCacheMaxAgeMs: 14 * 24 * 3_600_000,
   remoteRebalanceCooldownMs: 600_000,
   remoteRebalanceMaxMoves: 1,
+  // BRAIN-888: a ticket stuck behind another ticket's reservation may move to a runner with at most this many queued tickets (and no
+  // reservation owner); 0 turns that branch off, leaving only moves to an idle runner.
+  remoteRebalanceQueuedMax: 1,
   // BRAIN-207 (forgiving admission): whether the load gate is allowed to
   // deny a start at all. Default false — the gate is informational-only
   // (still sampled every poll, still logged) until an operator opts back
@@ -447,7 +450,7 @@ function validateGlobalConfig(cfg, sourcePath) {
   assert(cfg.memoryLimit !== 'enforce', `${sourcePath}: "memoryLimit": "enforce" is not yet supported (hard memory caps are tracked in BRAIN-696); use "measure" or "off"`);
   assert(Number.isInteger(cfg.runnerDownAfterMs) && cfg.runnerDownAfterMs >= 0, `${sourcePath}: "runnerDownAfterMs" must be a non-negative integer`);
   assert(Number.isInteger(cfg.remoteProbeDeadlineMs) && cfg.remoteProbeDeadlineMs > 0 && cfg.remoteProbeDeadlineMs <= MAX_TIMER_MS, `${sourcePath}: "remoteProbeDeadlineMs" must be a positive integer no larger than ${MAX_TIMER_MS} (a larger Node timer overflows to 1 ms)`);
-  for (const field of ['remoteRebalanceMinQueuedMs', 'remoteRebalanceCooldownMs', 'remoteRebalanceMaxMoves', 'remoteRefusedMaxQueuedMs']) {
+  for (const field of ['remoteRebalanceMinQueuedMs', 'remoteRebalanceCooldownMs', 'remoteRebalanceMaxMoves', 'remoteRebalanceQueuedMax', 'remoteRefusedMaxQueuedMs']) {
     assert(Number.isInteger(cfg[field]) && cfg[field] >= 0, `${sourcePath}: "${field}" must be a non-negative integer`);
   }
   assert(Number.isInteger(cfg.remoteRebalanceIntervalMs) && cfg.remoteRebalanceIntervalMs > 0, `${sourcePath}: "remoteRebalanceIntervalMs" must be a positive integer`);

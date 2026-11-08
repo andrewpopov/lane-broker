@@ -51,7 +51,7 @@ import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, l
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness, recordEnforcement } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
-import { remoteCpuAllocation, selectRunner, dispatchRemote, remoteCancel, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, haveDeadlineFor, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON, REFUSED_MOVE_TARGET } from './remote-client.js';
+import { remoteCpuAllocation, selectRunner, dispatchRemote, remoteCancel, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, estimatedFinish, haveDeadlineFor, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON, REFUSED_MOVE_TARGET } from './remote-client.js';
 import { remoteExcludeWarnings } from './remote-exclude.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
@@ -713,14 +713,27 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome(), cpu
   };
 }
 
+/** BRAIN-888: a non-idle destination must finish the ticket in under this fraction of the time staying put would take. */
+const REBALANCE_QUEUED_GAIN = 0.75;
+
 /**
  * The ONE builder of `selectRunner` options for the three placement paths ('place' a first attempt, 'rebind' a locally queued
  * ticket, 'rebalance' a queued remote one), so what every path must carry (BRAIN-597's `downRunners`) cannot be dropped by one.
  */
-export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHome(), stuckLocally = false, localBlocked = false, draining = false, cpuLimit } = {}) {
+export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHome(), stuckLocally = false, localBlocked = false, draining = false, cpuLimit, queuedMove = null } = {}) {
   const base = remoteSelectOptions(enriched, globalCfg, root, cpuLimit);
   // a move or rebind picks a better home for a ticket that already has one
   if (kind === 'rebind') return { ...base, maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0, allowBusyQueue: localBlocked };
+  if (kind === 'rebalance' && queuedMove) {
+    const stayFinish = estimatedFinish(base.reservation, { queued: queuedMove.position - 1 }, queuedMove.sourceRunner);
+    const queuedFilter = ({ probe, finish }) =>
+      probe.reservationOwner === false &&
+      Array.isArray(probe.capabilities) && probe.capabilities.includes(REMOTE_WITHDRAW_CAPABILITY) &&
+      hasMeasuredHeadroom(probe) &&
+      probe.queued <= globalCfg.remoteRebalanceQueuedMax &&
+      finish < REBALANCE_QUEUED_GAIN * stayFinish;
+    return { ...base, maxRemoteQueue: globalCfg.remoteRebalanceQueuedMax, allowBusyQueue: true, queuedFilter };
+  }
   if (kind === 'rebalance') {
     return { ...base, maxRemoteQueue: 0, requireCapabilities: draining ? [...base.requireCapabilities, REMOTE_WITHDRAW_CAPABILITY] : base.requireCapabilities };
   }
@@ -1299,7 +1312,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
         },
         // BRAIN-520: a drain move is an operator fact, so it skips the cooldown and the max-moves damping (the no-revisit rule still
         // bounds it), and its destination must itself be able to withdraw.
-        pickTarget: async ({ draining } = {}) => {
+        pickTarget: async ({ draining, sourceFacts, refusalCapElapsed } = {}) => {
           const countedMoves = moves.filter((m) => m.reason !== DRAIN_MOVE_REASON).length;
           if (!draining && rebalanceBlocked({ moves: countedMoves, maxMoves: globalCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: globalCfg.remoteRebalanceCooldownMs })) return null;
           const candidates = (globalCfg.runners || []).filter((r) => !visited.includes(r.name) && r.rebalanceTarget !== false);
@@ -1307,6 +1320,16 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
           const picked = await selectRunner(candidates, selectionOptionsFor('rebalance', enriched, globalCfg, { draining, root, cpuLimit }));
           const eligible = picked.runner && hasMeasuredHeadroom(picked.probe);
           target = eligible ? { runner: picked.runner, probe: picked.probe } : null;
+          if (target || draining || refusalCapElapsed?.()) return target;
+          // BRAIN-888: behind another ticket's reservation with no idle runner on offer, a short non-idle queue elsewhere can be better
+          const stuckBehindOwner = globalCfg.remoteRebalanceQueuedMax > 0 && sourceFacts?.position >= 1 && sourceFacts.behindOtherOwner === true && sourceFacts.reservationOwnerWaitedMs >= globalCfg.remoteRebalanceMinQueuedMs;
+          if (!stuckBehindOwner) return null;
+          const queued = await selectRunner(candidates, selectionOptionsFor('rebalance', enriched, globalCfg, { draining, root, cpuLimit, queuedMove: { position: sourceFacts.position, sourceRunner: runner } }));
+          // the cap may have run out while the probes were out: refusal must stay reachable
+          if (!queued.runner || refusalCapElapsed?.()) return null;
+          const viaQueue = queued.queuedChoice === true;
+          if (!viaQueue && !hasMeasuredHeadroom(queued.probe)) return null;
+          target = { runner: queued.runner, probe: queued.probe, ...(viaQueue ? { behindOwnerPosition: sourceFacts.position } : {}) };
           return target;
         },
         // The worktree must still be what was snapshotted, then the intent is made durable BEFORE the irreversible withdraw.
@@ -1399,9 +1422,15 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       return { fallback: false };
     }
     const why = move.reason === DRAIN_MOVE_REASON ? `${from.name} draining: ${move.drainReason}` : `queued ${Math.round(dispatch.queuedMs / 1000)}s on ${from.name}`;
-    const line = `lane: remote-rebalance: ${enriched.id}: ${from.name} -> ${runner.name} (${why}; ${runner.name} ${probe.headroom.cpuCores} cores free)\n`;
+    const destination = to.behindOwnerPosition === undefined && hasMeasuredHeadroom(probe) ? `${probe.headroom.cpuCores} cores free` : `queued ${probe?.queued ?? 'unknown'}`;
+    const line = `lane: remote-rebalance: ${enriched.id}: ${from.name} -> ${runner.name} (${why}; ${runner.name} ${destination})\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);
+    if (to.behindOwnerPosition !== undefined) {
+      const ownerLine = `lane: rebalance: ${enriched.id} behind another owner on ${from.name} (pos ${to.behindOwnerPosition}) -> ${runner.name} (queued ${probe?.queued ?? 'unknown'})\n`;
+      process.stderr.write(ownerLine);
+      writeBrokerLog(root, ownerLine);
+    }
     process.stderr.write(`lane: running on ${runner.name} (${enforcementLabel(probe?.enforcement)})\n`);
     await recordEnforcement(root, { [runner.name]: probe?.enforcement ?? null }, Date.now()).catch(() => {});
   }

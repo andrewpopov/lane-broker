@@ -1121,6 +1121,7 @@ Global config (the submitter's), all integers in milliseconds except the cap:
 | `remoteRebalanceIntervalMs` | `60000` | how often the submitter looks at the runner while it waits (> 0) |
 | `remoteRebalanceCooldownMs` | `600000` | the minimum gap between two queued-too-long moves of one ticket (a drain move ignores it) |
 | `remoteRebalanceMaxMoves` | `1` | how many times one ticket may move for queueing too long (drain moves are not counted) |
+| `remoteRebalanceQueuedMax` | `1` | a ticket queued behind **another ticket's reservation** (the runner reports it, BRAIN-888) may also move to a runner that is not idle: no reservation owner of its own, `remote-withdraw/1`, a measured free-CPU figure, at most this many queued tickets, and an estimated finish under 0.75 of staying; `0` leaves only moves to an idle runner. Never used once the `remoteRefusedMaxQueuedMs` cap has elapsed |
 | `remoteRefusedMaxQueuedMs` | `1800000` | a ticket with no local fallback (BRAIN-770, below) that sat queued this long with no runner to move to is withdrawn and exits `76`; `0` disables |
 
 **How a move goes.** The submitter picks the destination with the same probe dispatch uses, excluding the current runner and

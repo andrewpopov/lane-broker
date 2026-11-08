@@ -67,6 +67,21 @@ export function listQueueStrict(root) {
   return listJsonRecordsStrict(paths(root).queue);
 }
 
+/** `listQueueCapped` for a reader that must know the read was complete: throws `UnreadableRecordError` on an unreadable directory or record. */
+export function listQueueCappedStrict(root, cfg) {
+  return listQueueStrict(root).map((t) => capElasticClaim(t, cfg));
+}
+
+/** Whether every queue record could be read, for callers that must not turn a failed read into a definite fact. */
+export function queueReadable(root) {
+  try {
+    listQueueStrict(root);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Thrown when a valid scheduler fence coexists with a non-empty legacy `queue/` directory: a crash or tampering, never a state to guess about. */
 export class LegacyQueueAfterFenceError extends Error {
   constructor(dir) {
