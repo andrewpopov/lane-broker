@@ -2960,11 +2960,13 @@ failure the hook is there to catch.
 
 ### Running the tests
 
-`npm test` (`scripts/test-run.sh`) runs the files several at a time: twice the lane's CPU grant
+`npm test` (`scripts/test-run.sh`) runs the files several at a time: one per core of the lane's CPU grant
 (`LANE_BROKER_CPU_CORES`), at most 4, or `LANE_BROKER_TEST_CONCURRENCY`. The suite waits far more than
 it computes, because its tests drive real processes (detached supervisors, process groups, signals, a
 fake ssh transport) and wait on them: one serial run used 1,793 CPU-seconds in 2,428 s of wall time.
-Four at a time ran the whole suite in 603 s on one machine where one at a time took about 1,800 s. The
+Four at a time ran the whole suite in 603 s on one machine where one at a time took about 1,800 s, but
+on a busy 2-core PR runner four files took a shard from 389 s to 767 s and broke tests on timing, so the
+default is one file per granted core. The
 suite once starved itself when run in parallel; the timing races behind that (fixed sleeps standing in
 for "the other process got there") have been replaced by ordering signals and release files. The
 tmp-leak guard runs alone, after every other file has finished, because it checks what they left behind.
