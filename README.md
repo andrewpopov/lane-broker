@@ -1830,6 +1830,8 @@ lane waits with the same `projected-over-budget` denial (and the existing
 backfill, reservation and idle-exemption behaviour, which judge the full
 claim). Active `schedulerMode` only; shadow never denies, so it never relaxes.
 
+A ticket gets this smaller grant only after it has waited the global `elasticFloorAfterMs` (default 600000, a non-negative integer; BRAIN-867); until then it waits for its full claim, and `0` drops at once.
+
 An elastic grant never exceeds this host's CPU budget (BRAIN-362). In active mode the
 claim an elastic ticket is evaluated and charged at is capped at `floor(budget)`
 (`capElasticClaim`), so every admission path that admits

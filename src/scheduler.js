@@ -1165,7 +1165,7 @@ function isFloorTicket(t) {
  * floorOvershootCores of the budget (the CPU gate's state is not judged), once the head cannot start. Pure over
  * the poll's inputs, so every polling supervisor names the same ticket. Null when the head can start or nobody qualifies.
  */
-export function floorWinner(cfg, queue, held, cpuSample, memInfo, gateClosed, loadGateClosed, weightCapacity) {
+export function floorWinner(cfg, queue, held, cpuSample, memInfo, gateClosed, loadGateClosed, weightCapacity, nowEff) {
   if (memInfo?.macPressure === 'critical' || (cfg.admissionLoadGate && loadGateClosed && held.length > 0)) return null;
   const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
   const cooldown = cooldownActive(held, cfg);
@@ -1174,7 +1174,7 @@ export function floorWinner(cfg, queue, held, cpuSample, memInfo, gateClosed, lo
   const withinOvershoot = (d) => d.memoryReason === 'ok' && d.cpuReason !== 'cooldown' && (d.admit || (Number.isFinite(d.projectedBusy) && d.projectedBusy - d.budget <= cfg.floorOvershootCores));
   const head = queue[0];
   const headDecision = decide(head, gateClosed);
-  const headStarts = runnable(head) && (headDecision.admit || evaluateElasticAdmission(cfg, head, held, cpuSample, memInfo, headDecision) !== null || (held.length === 0 && headDecision.cpuReason === 'projected-over-budget' && withinOvershoot(headDecision)));
+  const headStarts = runnable(head) && (headDecision.admit || evaluateElasticAdmission(cfg, head, held, cpuSample, memInfo, headDecision, nowEff) !== null || (held.length === 0 && headDecision.cpuReason === 'projected-over-budget' && withinOvershoot(headDecision)));
   if (headStarts) return null;
   for (const t of queue) {
     if (!t || isExclusive(t)) return null;
@@ -1646,13 +1646,13 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // re-evaluated at smaller claims, over the same held leases (and, for a safe backfill, the same
     // head reservation), so the grant can never delay what the full claim could not. Active mode
     // only: shadow never denies, so there is nothing to relax.
-    const elastic = cfg.schedulerMode === 'active' ? evaluateElasticAdmission(cfg, admissionTicket, admissionHeld, cpuSample, memInfo, fullDecision) : null;
+    const elastic = cfg.schedulerMode === 'active' ? evaluateElasticAdmission(cfg, admissionTicket, admissionHeld, cpuSample, memInfo, fullDecision, nowEff) : null;
     const cpuDecision = elastic ? { ...elastic.decision, declaredCpuCores: submitted.resources?.cpuCores ?? fullDecision.candidateCpuCores } : fullDecision;
     const ordinarilyAdmitted = candidate?.id === ticket.id && cpuDecision.admit;
-    const floorAdmit = floorTrial && !ordinarilyAdmitted && floorWinner(cfg, queue, held, cpuSample, memInfo, fullDecision.cpuGateClosed, gate.closed, weightCapacity)?.id === ticket.id;
+    const floorAdmit = floorTrial && !ordinarilyAdmitted && floorWinner(cfg, queue, held, cpuSample, memInfo, fullDecision.cpuGateClosed, gate.closed, weightCapacity, nowEff)?.id === ticket.id;
     // A bypass yields to a waiting real push gate (the floor winner) and to an aged head that only the bypass leases hold back.
     const bypassYields = () => {
-      const winner = cfg.floorOvershootCores > 0 ? floorWinner(cfg, queue, held, cpuSample, memInfo, fullDecision.cpuGateClosed, gate.closed, weightCapacity) : null;
+      const winner = cfg.floorOvershootCores > 0 ? floorWinner(cfg, queue, held, cpuSample, memInfo, fullDecision.cpuGateClosed, gate.closed, weightCapacity, nowEff) : null;
       if (winner && winner.id !== ticket.id) return 'yields-push-gate';
       if (ticket.id === headTicket.id || !expressHeadProtected) return null;
       // a replacement on a key the aged head conflicts with would keep it conflicted for as long as they keep arriving

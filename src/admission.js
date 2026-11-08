@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import { paths, atomicWriteJson, readJsonSafe, fingerprintOf } from './state.js';
 import { sampleHostCpu } from './cpu.js';
 import { peekCpuEstimates, lookupEstimate, clampEstimate, raiseEstimate } from './cpu-estimates.js';
-import { isPriorityTier, priorityOf, tierRank } from './priority.js';
+import { isPriorityTier, priorityOf, tierRank, waitedMs } from './priority.js';
 import { evaluateMemoryAdmission, resolveTicketResources, leaseCpuCores, elasticClaimRange } from './resources.js';
 
 /**
@@ -492,10 +492,12 @@ export function isCpuOnlyDenial(decision) {
  * `{ decision, grantedCpuCores }`. Memory keeps the full declared claim. Null when not elastic, not
  * a CPU-only denial, or nothing down to the floor fits -- the caller then keeps `fullDecision`
  * (and with it the pre-existing wait / backfill / idle-exemption behaviour) untouched.
+ * BRAIN-867: a ticket that has waited under `elasticFloorAfterMs` (the priority clock `nowEff`) gets no grant: it waits for its full claim.
  */
-export function evaluateElasticAdmission(cfg, ticket, heldLeases, cpuSample, memoryInfo, fullDecision) {
+export function evaluateElasticAdmission(cfg, ticket, heldLeases, cpuSample, memoryInfo, fullDecision, nowEff) {
   try {
     if (!isCpuOnlyDenial(fullDecision)) return null;
+    if (!(waitedMs(ticket, nowEff) >= cfg.elasticFloorAfterMs)) return null;
     const declared = resolveTicketResources({ weight: ticket.weight, cpuCores: ticket.resources?.cpuCores });
     // headroom: what the budget has left once everything but this ticket's own claim is counted
     const headroom = fullDecision.budget - (fullDecision.projectedBusy - fullDecision.candidateEstimate);

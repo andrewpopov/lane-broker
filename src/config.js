@@ -198,6 +198,8 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // 0 (the default) never kills; opt a lane in per lane (`silenceTimeoutMs`). Catches a spinning-but-wedged process the
   // no-progress watchdog (which needs CPU idle too) never fires on.
   silenceTimeoutMs: 0,
+  // BRAIN-867: an elastic ticket (minCpuCores) must have waited this long (priority-clock wait) before it may run below its full claim. 0 drops at once.
+  elasticFloorAfterMs: 600_000,
   // BRAIN-532: a run silent AND under `hungCpuCores` for `hungAfterMs` is flagged `HUNG?` in `lane status` (warning only, never a kill);
   // silence alone is flagged `SILENT`. `idleCreditBelowFraction` x grant is the CPU-idle line the idle detector uses.
   // `idleCreditAfterMs` is how long a lease must stay CPU-idle before `lane status` notes `idle` and the credit counts it.
@@ -427,6 +429,7 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isInteger(cfg.remoteRebindMinLocalWaitMs) && cfg.remoteRebindMinLocalWaitMs >= 0,
     `${sourcePath}: "remoteRebindMinLocalWaitMs" must be a non-negative integer`,
   );
+  assert(Number.isInteger(cfg.elasticFloorAfterMs) && cfg.elasticFloorAfterMs >= 0, `${sourcePath}: "elasticFloorAfterMs" must be a non-negative integer`);
   assert(Number.isInteger(cfg.runnerLostAfterMs) && cfg.runnerLostAfterMs >= 0, `${sourcePath}: "runnerLostAfterMs" must be a non-negative integer`);
   assert(Number.isInteger(cfg.remoteLostPollMs) && cfg.remoteLostPollMs >= 0, `${sourcePath}: "remoteLostPollMs" must be a non-negative integer`);
   assert(cfg.runnerVersionFloor === null || (typeof cfg.runnerVersionFloor === 'string' && VERSION_FLOOR_RE.test(cfg.runnerVersionFloor)), `${sourcePath}: "runnerVersionFloor" must be null or a version like "0.49.0"`);
