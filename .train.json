@@ -26,6 +26,7 @@
       "sh",
       "scripts/train-gate.sh"
     ],
-    "maxConcurrent": 2
+    "maxConcurrent": 1,
+    "shards": 4
   }
 }
