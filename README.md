@@ -2862,13 +2862,11 @@ What a run leaves behind is collected; what a live one owns never is. Everything
   claim, right after reading `reconcile-last-run` (under the broker lock), writing `<dir>/ready-<pid>`
   and waiting for `<dir>/go`, so a test can hold several concurrent sweeps at the claim and prove
   exactly one runs.
-- `LANE_BROKER_TEST_PAUSE_AFTER_QUEUE_TIMEOUT` — if set, a queued supervisor
-  pauses right after `tryStart` returns `reason: 'queue-timeout'`, before its
-  own recheck of the durable cancel marker, until the named file appears --
-  so a test can deterministically land a `lane cancel` write inside the
-  window between an expiry being recorded and the expiry being finalized
-  (BRAIN-320 review fix B: a cancel that lands in that window must still win
-  over the expiry).
+- `LANE_BROKER_TEST_HOLD_AT=queue-timeout` (with `LANE_BROKER_TEST_HOLD_READY` and `LANE_BROKER_TEST_HOLD_GO`) — a
+  queued supervisor holds right after `tryStart` returns `reason: 'queue-timeout'`, before its own recheck of the
+  durable cancel marker, so a test can land a `lane cancel` write inside the window between an expiry being recorded
+  and the expiry being finalized (BRAIN-320 review fix B: a cancel that lands in that window must still win over the
+  expiry). The READY file says the supervisor is there; a fixed sleep raced a loaded runner.
 - `LANE_BROKER_TEST_HOLD_AT=local-finalize` (with `LANE_BROKER_TEST_HOLD_READY` and
   `LANE_BROKER_TEST_HOLD_GO`) — a local supervisor pauses after its child has ended and its
   output is drained, before writing the result, so a test can land a `lane cancel` in that

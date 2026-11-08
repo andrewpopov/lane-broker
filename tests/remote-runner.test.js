@@ -1028,8 +1028,10 @@ test('a broker-level lane cancel landing after a queue-timeout expiry, before fi
   fs.mkdirSync(state, { recursive: true });
   fs.writeFileSync(path.join(state, 'PAUSE'), 'kept busy for the test');
 
-  const pauseFile = path.join(tmpDir('remote-exec-pause'), 'go');
-  const env = { ...baseEnv, LANE_BROKER_TEST_PAUSE_AFTER_QUEUE_TIMEOUT: pauseFile };
+  const hold = tmpDir('remote-exec-hold');
+  const ready = path.join(hold, 'ready');
+  const pauseFile = path.join(hold, 'go');
+  const env = { ...baseEnv, LANE_BROKER_TEST_HOLD_AT: 'queue-timeout', LANE_BROKER_TEST_HOLD_READY: ready, LANE_BROKER_TEST_HOLD_GO: pauseFile };
   const root = tmpDir('remote-exec-root');
   const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
   const header = makeHeader({ protocol: 2, queueTimeoutMs: 200, argv: [process.execPath, '-e', 'process.exit(0)'] });
@@ -1049,7 +1051,7 @@ test('a broker-level lane cancel landing after a queue-timeout expiry, before fi
   // derivation already covers -- this test targets the LOCAL BROKER's own
   // published result instead, which is exactly what finalizeQueuedAndExit
   // decides).
-  await sleep(500);
+  await waitFor(() => fs.existsSync(ready), { timeoutMs: 60_000 });
   const cancelResult = await laneRun(['cancel', remoteLaneId], { env });
   assert.equal(cancelResult.code, 0, `stderr: ${cancelResult.stderr}`);
 
@@ -1100,8 +1102,10 @@ test('a cancel marker written while the supervisor waits for the broker lock aft
   fs.mkdirSync(state, { recursive: true });
   fs.writeFileSync(path.join(state, 'PAUSE'), 'kept busy for the test');
 
-  const pauseFile = path.join(tmpDir('remote-exec-pause'), 'go');
-  const env = { ...baseEnv, LANE_BROKER_TEST_PAUSE_AFTER_QUEUE_TIMEOUT: pauseFile };
+  const hold = tmpDir('remote-exec-hold');
+  const ready = path.join(hold, 'ready');
+  const pauseFile = path.join(hold, 'go');
+  const env = { ...baseEnv, LANE_BROKER_TEST_HOLD_AT: 'queue-timeout', LANE_BROKER_TEST_HOLD_READY: ready, LANE_BROKER_TEST_HOLD_GO: pauseFile };
   const root = tmpDir('remote-exec-root');
   const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
   const header = makeHeader({ protocol: 2, queueTimeoutMs: 200, argv: [process.execPath, '-e', 'process.exit(0)'] });
@@ -1110,7 +1114,7 @@ test('a cancel marker written while the supervisor waits for the broker lock aft
   const remoteIdPath = path.join(root, 'tickets', header.ticketId, 'remote-id');
   await waitFor(() => fs.existsSync(remoteIdPath));
   const remoteLaneId = fs.readFileSync(remoteIdPath, 'utf8').trim();
-  await sleep(500);
+  await waitFor(() => fs.existsSync(ready), { timeoutMs: 60_000 });
 
   // Hold the broker lock, release the supervisor from its pause so it blocks on that lock, and only then write the marker.
   await withLock(state, async () => {

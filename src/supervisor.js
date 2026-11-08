@@ -1980,16 +1980,9 @@ async function main() {
       await finalizeQueuedAndExit('cancelled');
     }
     if (started.reason === 'queue-timeout') {
-      // Test-only seam: `LANE_BROKER_TEST_PAUSE_AFTER_QUEUE_TIMEOUT` widens
-      // the gap between tryStart recording the expiry and the cancel
-      // recheck below, so a test can deterministically land a `lane cancel`
-      // marker write into that exact window (see README's "Testing hooks").
-      const pauseFile = process.env.LANE_BROKER_TEST_PAUSE_AFTER_QUEUE_TIMEOUT;
-      if (pauseFile) {
-        while (!fs.existsSync(pauseFile)) {
-          await sleep(10);
-        }
-      }
+      // Test-only seam: holds between tryStart recording the expiry and the cancel recheck below, so a test lands a
+      // `lane cancel` marker in that exact window (README's "Testing hooks", `LANE_BROKER_TEST_HOLD_AT=queue-timeout`).
+      await testHoldAt('queue-timeout');
       // BRAIN-320 review fix B: a runner-side `lane cancel` can land between
       // tryStart recording the expiry and this branch running. Re-check the
       // durable cancel marker here -- if a cancel was ALSO requested, it
