@@ -417,7 +417,9 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason });
       const cand = candidate(probe, cpuFree, false);
       busySeq.push(cand);
-      if ((busyIsQueueable || (allowBusyQueue && maxRemoteQueue > 0)) && queuedFilter(cand)) queuedSeq.push(cand);
+      const queueableToday = allowBusyQueue && maxRemoteQueue > 0;
+      cand.queueableOnlyIfRanked = busyIsQueueable && !queueableToday;
+      if ((busyIsQueueable || queueableToday) && queuedFilter(cand)) queuedSeq.push(cand);
       continue;
     }
     idleSeq.push(candidate(probe, cpuFree, true));
@@ -452,7 +454,7 @@ export async function selectRunner(runners, opts = {}) {
   const busyBest = bestOf(liveBusy, better);
   if (!ranked) {
     const idleBest = bestOf(idleSeq.filter((cand) => !dropped.has(cand)), better);
-    const queuedBest = bestOf(queuedSeq.filter((cand) => !dropped.has(cand)), fewerQueued);
+    const queuedBest = bestOf(queuedSeq.filter((cand) => !dropped.has(cand) && !cand.queueableOnlyIfRanked), fewerQueued);
     if (idleBest) return { runner: idleBest.runner, probe: idleBest.probe, skipped, ...readinessField };
     if (queuedBest) return { runner: queuedBest.runner, probe: queuedBest.probe, skipped, ...readinessField, queuedChoice: true };
     return { runner: null, skipped, ...readinessField, ...(busyBest ? { busy: { runner: busyBest.runner, probe: busyBest.probe } } : {}) };

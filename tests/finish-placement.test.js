@@ -319,3 +319,12 @@ test('selectRunner finish: exclusions still come before any scoring', async () =
   assert.deepEqual(names(res), ['slow']);
   assert.deepEqual(res.skipped.map((s) => s.reason), ['unreachable for 10m', 'paused', 'queued: 5 (over maxRemoteQueue 2)']);
 });
+
+test('selectRunner finish: busyQueueable without estimates leaves a busy runner as today\'s busy fallback, not a queued choice', async () => {
+  const res = await select({ fast: probe(0, NO_CPU), slow: probe(1, ROOM) }, runnersOf('fast', 'slow'), { busyQueueable: true, finishModel: modelOf({}) });
+  assert.equal(res.runner.name, 'slow', 'today: the queued runner within maxRemoteQueue is the queued choice');
+  assert.equal(res.queuedChoice, true);
+  const lone = await select({ fast: probe(0, NO_CPU) }, runnersOf('fast'), { busyQueueable: true, finishModel: modelOf({}) });
+  assert.equal(lone.runner, null);
+  assert.equal(lone.busy.runner.name, 'fast');
+});

@@ -183,9 +183,10 @@ export function runnerWaitMs({ probe, estimateMs, room }) {
 /**
  * Local vs the given runner: whichever finishes first. `runnerRatio` is the slowdown of the runner that would take the ticket;
  * a tie stays local (no snapshot to ship); `localBlocked` (BRAIN-596) and `localHeldByKey` (BRAIN-839) send it to the runner outright. Returns the choice with both estimates for the decision log.
+ * BRAIN-899: a finite `remoteFinishMs` IS that runner's finish (its placement score), replacing the ratio arithmetic, not adding to it.
  */
-export function chooseSpeedPlacement({ localAdmitsNow, localWaitMs: waitMs = 0, localBlocked = false, localHeldByKey = false, estimateMs, runnerRatio, overheadMs = DEFAULT_REMOTE_OVERHEAD_MS }) {
-  const remoteFinishMs = runnerRatio === null ? null : estimateMs * runnerRatio + overheadMs;
+export function chooseSpeedPlacement({ localAdmitsNow, localWaitMs: waitMs = 0, localBlocked = false, localHeldByKey = false, estimateMs, runnerRatio, overheadMs = DEFAULT_REMOTE_OVERHEAD_MS, remoteFinishMs: scoredFinishMs = null }) {
+  const remoteFinishMs = Number.isFinite(scoredFinishMs) ? scoredFinishMs : runnerRatio === null ? null : estimateMs * runnerRatio + overheadMs;
   // BRAIN-596: `localBlocked` = host load admits no ticket here, so the local finish is unbounded: remote whenever a runner can take it
   if (localBlocked && !localAdmitsNow) return { choice: remoteFinishMs === null ? 'local' : 'remote', localFinishMs: null, remoteFinishMs: remoteFinishMs === null ? null : Math.round(remoteFinishMs) };
   // BRAIN-839: a same-key holder (exclusive lane, or maxConcurrent reached) blocks local admission for as long as it runs; the queue

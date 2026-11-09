@@ -728,6 +728,19 @@ What a remote run does:
    "runners": [{ "name": "skybox", "ssh": "skybox", "speedRatio": 2.9 }]
    ```
 
+   **Runner vs runner (BRAIN-899).** The runners themselves are compared the
+   same way: each candidate scores `wait + run + 60 s` overhead, where `run` is
+   this repo+lane+command's median on that runner (else that repo+lane, else
+   another runner's evidence scaled by their `speedFactor`s) and `wait` is
+   serial and conservative — 0 on an idle runner with room, else
+   `(queued + 1) x run`. So a fast runner with a queue can beat a slow idle one,
+   and on this path a busy runner (empty queue, no headroom) is queueable too.
+   All or nothing: one candidate without an estimate leaves the whole selection
+   on the old ranking (idle first, then fewest queued). Moving a ticket already
+   queued on a runner also needs `destFinish < 0.75 x position x E_source`; a
+   drain and the refusal deadline are ungated. A scored decision writes a
+   `lane: finish-placement:` line naming every candidate's finish and the winner.
+
 3. **Send a snapshot**, not history: a framed stream of exactly the listed
    files. Each file is re-read without following symlinks and its sha256
    checked before its bytes are sent. The runner validates every frame
