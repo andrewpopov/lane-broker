@@ -337,13 +337,8 @@ async function runBehindQueuedLocalTicket({ seedHistory, globalExtra = {}, laneE
     const rows = Array.from({ length: 5 }, (_, i) => ({ id: `h${i}`, repo: repoId, lane: 'default', command: `node ${script}`, startedAt: 1000 + i, endedAt: 11_000 + i, runMs: 10_000, exit: 0 }));
     fs.appendFileSync(paths(state).history, rows.map((r) => `${JSON.stringify(r)}\n`).join(''));
   }
-  const blocker = laneRun(['run', '--repo', 'r', '--lane', 'hold', '--', 'sleep', '6'], { env, cwd: repoDir });
-  await waitFor(() => fs.existsSync(paths(state).leases) && fs.readdirSync(paths(state).leases).some((n) => n.endsWith('.json')), { timeoutMs: 60_000 });
-  const ahead = laneRun(['run', '--repo', 'r', '--lane', 'hold', '--', 'true'], { env, cwd: repoDir });
-  await waitFor(() => fs.existsSync(paths(state).queue) && fs.readdirSync(paths(state).queue).length > 0, { timeoutMs: 60_000 });
-  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', 'node', script], env, repoDir);
+  const { id, waited } = await dispatchWhileHeld({ env, state, repoDir }, ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', 'node', script]);
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
-  await Promise.all([blocker, ahead]);
   return { result: resultOf(state, id), where: fs.readFileSync(marker, 'utf8') };
 }
 

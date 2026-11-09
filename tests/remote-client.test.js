@@ -1009,10 +1009,15 @@ function makeRebalanceSsh({ results, withdraws = [], execMs = 0, closeExecOnWith
 const fs = require('fs');
 const cmd = process.argv.slice(2).filter((a) => !a.startsWith('-o') && a !== '-o').join(' ');
 const log = (w) => fs.appendFileSync(${JSON.stringify(logPath)}, w + '\\n');
+const execExited = () => fs.existsSync(${JSON.stringify(path.join(dir, 'exec-exited'))});
 const next = (list, countFile) => {
-  const n = Number(fs.readFileSync(countFile, 'utf8'));
-  fs.writeFileSync(countFile, String(n + 1));
-  return list[Math.min(n, list.length - 1)];
+  for (;;) {
+    const n = Number(fs.readFileSync(countFile, 'utf8'));
+    fs.writeFileSync(countFile, String(n + 1));
+    const entry = list[Math.min(n, list.length - 1)];
+    // duringExec: only a fetch that starts while the exec session is open (the watcher's) receives it; a later one skips it
+    if (!(entry && entry.duringExec && execExited() && n < list.length - 1)) return entry;
+  }
 };
 const { results, withdraws } = JSON.parse(fs.readFileSync(${JSON.stringify(scriptPath)}, 'utf8'));
 const ticketId = (/'([0-9a-f-]{36})'/.exec(cmd) || [])[1];
@@ -1028,7 +1033,7 @@ if (cmd.includes('remote-exec')) {
   const send = () => process.stdout.write(JSON.stringify(entry.record ?? entry) + '\\n');
   const later = () => (entry.delayMs ? setTimeout(send, entry.delayMs) : send());
   // afterExec: the delay starts only once the exec session has exited, so "lands after the session closed" holds at any load
-  if (entry.afterExec) { const t = setInterval(() => { if (fs.existsSync(${JSON.stringify(path.join(dir, 'exec-exited'))})) { clearInterval(t); later(); } }, 30); } else later();
+  if (entry.afterExec) { const t = setInterval(() => { if (execExited()) { clearInterval(t); later(); } }, 30); } else later();
 } else if (cmd.includes('remote-withdraw')) {
   log('withdraw');
   fs.writeFileSync(${JSON.stringify(path.join(dir, 'withdrew'))}, '1');
@@ -1165,7 +1170,7 @@ test('rebalance: a withdrawn record that does not bind to this ticket is not pro
 test('rebalance: a record that arrives after the session closed is ignored by the watcher (stale epoch), and the normal path reads its own', { timeout: 60_000 }, async () => {
   // The watcher's fetch is slow and lands after ssh has closed; it carries a withdrawn record that would read as a move.
   const { result } = await dispatchRebalance({
-    results: [queued, queued, queued, queued, { afterExec: true, delayMs: 2000, record: 'WITHDRAWN' }, 'RESULT'],
+    results: [queued, queued, queued, queued, { duringExec: true, afterExec: true, delayMs: 2000, record: 'WITHDRAWN' }, 'RESULT'],
     withdraws: [null],
     execMs: 600,
     rebalance: { minQueuedMs: 20_000, intervalMs: 10_000 },

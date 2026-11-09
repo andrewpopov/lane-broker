@@ -2862,13 +2862,11 @@ What a run leaves behind is collected; what a live one owns never is. Everything
   claim, right after reading `reconcile-last-run` (under the broker lock), writing `<dir>/ready-<pid>`
   and waiting for `<dir>/go`, so a test can hold several concurrent sweeps at the claim and prove
   exactly one runs.
-- `LANE_BROKER_TEST_PAUSE_AFTER_QUEUE_TIMEOUT` — if set, a queued supervisor
-  pauses right after `tryStart` returns `reason: 'queue-timeout'`, before its
-  own recheck of the durable cancel marker, until the named file appears --
-  so a test can deterministically land a `lane cancel` write inside the
-  window between an expiry being recorded and the expiry being finalized
-  (BRAIN-320 review fix B: a cancel that lands in that window must still win
-  over the expiry).
+- `LANE_BROKER_TEST_HOLD_AT=queue-timeout` (with `LANE_BROKER_TEST_HOLD_READY` and `LANE_BROKER_TEST_HOLD_GO`) — a
+  queued supervisor holds right after `tryStart` returns `reason: 'queue-timeout'`, before its own recheck of the
+  durable cancel marker, so a test can land a `lane cancel` write inside the window between an expiry being recorded
+  and the expiry being finalized (BRAIN-320 review fix B: a cancel that lands in that window must still win over the
+  expiry). The READY file says the supervisor is there; a fixed sleep raced a loaded runner.
 - `LANE_BROKER_TEST_HOLD_AT=local-finalize` (with `LANE_BROKER_TEST_HOLD_READY` and
   `LANE_BROKER_TEST_HOLD_GO`) — a local supervisor pauses after its child has ended and its
   output is drained, before writing the result, so a test can land a `lane cancel` in that
@@ -2962,15 +2960,17 @@ failure the hook is there to catch.
 
 ### Running the tests
 
-`npm test` runs the suite with `--test-concurrency=1`. That is deliberate, not
-timidity: every test here drives **real** processes — detached supervisors,
-process groups, SIGSTOP/SIGTERM/SIGKILL, an 8×200 mutex contention hammer, a
-200k-line log tee. Running the files in parallel multiplies that by the number
-of workers and the suite starves itself: `no-backfill` then times out waiting
-for a lease that a scheduled-out CLI has not written yet, on a machine where it
-passes standalone in under two seconds. A test suite for a tool that exists to
-stop parallel processes from starving each other should not itself be a
-thundering herd.
+`npm test` (`scripts/test-run.sh`) runs the files several at a time: one per core of the lane's CPU grant
+(`LANE_BROKER_CPU_CORES`), at most 4, or `LANE_BROKER_TEST_CONCURRENCY`. The suite waits far more than
+it computes, because its tests drive real processes (detached supervisors, process groups, signals, a
+fake ssh transport) and wait on them: one serial run used 1,793 CPU-seconds in 2,428 s of wall time.
+Four at a time ran the whole suite in 603 s on one machine where one at a time took about 1,800 s, but
+on a busy 2-core PR runner four files took a shard from 389 s to 767 s and broke tests on timing, so the
+default is one file per granted core. The
+suite once starved itself when run in parallel; the timing races behind that (fixed sleeps standing in
+for "the other process got there") have been replaced by ordering signals and release files. The
+tmp-leak guard runs alone, after every other file has finished, because it checks what they left behind.
+The 8×200 mutex hammer is in `tests/heavy/`.
 
 The scale, perf and soak tests live in `tests/heavy/` and run with `npm run test:heavy`, not
 `npm test`: claim latency at 60,000 queued jobs, the Postgres lock-order soak and the 8×200 mutex
@@ -2981,8 +2981,8 @@ heavy`). A red there opens the train's master-red incident, as any master verify
 PR CI splits `npm test` across 4 lanes (`.train.json` `prCi.shards: 4`, one PR at a time). The suite waits far more than it computes (one full run used 1,793 CPU-seconds in 2,428 s of wall time), so each `pr` lane claims 2 cores with a 1-core floor. When the merge train sets `TRAIN_SHARD=i/N`, `scripts/train-gate.sh`
 runs `scripts/test-shard.sh`, which lints and runs only the files `scripts/test-files.js` deals to shard `i`.
 Files go longest first to the shard with the least time so far, weighted by `tests/durations.json` (seconds
-per file, measured on a runner); a file missing from it counts as the median. Each shard still runs its files
-one at a time, and every shard ends with `zz-tmp-leak-guard`, which checks what the files before it left behind.
+per file, measured on a runner); a file missing from it counts as the median. Each shard runs its files through
+`scripts/test-run.sh` as `npm test` does: several at a time, then `zz-tmp-leak-guard` alone.
 
 ### Gate-cost scorecard: `lane report cost` (BRAIN-529)
 
