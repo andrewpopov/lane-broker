@@ -121,12 +121,72 @@ export function localWaitMs({ aheadEstimatesMs, estimateMs, slots, waitedMs = 0 
   return Math.max(work / Math.max(1, slots), waitedMs);
 }
 
+/** How fast a runner is configured to run (higher is faster); unset or malformed is 1. */
+const speedOf = (runner) => (Number.isFinite(runner?.speedFactor) && runner.speedFactor > 0 ? runner.speedFactor : 1);
+
+/** The fewest successful remote runs of a (repo, lane) on one runner that stand in for a command never run there. */
+export const MIN_REPO_LANE_ROWS = 3;
+
+/** Successful (`exit === 0`, finite duration) remote wall times on `runner` of the rows `match` accepts. */
+const remoteRunMs = (rows, runnerName, match) =>
+  rows.filter((r) => r?.executor === 'remote' && r?.runner === runnerName && r?.exit === 0 && Number.isFinite(r.runMs) && r.runMs > 0 && match(r)).map((r) => r.runMs);
+
+/**
+ * BRAIN-899: how long this ticket is expected to RUN on `runner`, in ms, from the broker's own history rows: the median of the
+ * most specific evidence that holds up, first hit wins -- this repo+lane+command on `runner` (`pairingCommand`, so a per-run sha
+ * or shard id does not split it, >= MIN_EXACT_RUNS runs); this repo+lane on `runner` (>= MIN_REPO_LANE_ROWS runs); either of
+ * those on the OTHER configured runner with the most matching rows (ties: config order), scaled by its `speedFactor` over
+ * `runner`'s and named as the `donor`. No evidence anywhere: null, and the caller keeps today's ranking. `job` is { repo, lane, command }.
+ */
+export function runnerRunEstimateMs(rows, runner, job, runners) {
+  const history = Array.isArray(rows) ? rows : [];
+  const command = typeof job?.command === 'string' && job.command.trim() !== '' ? pairingCommand(job.command) : null;
+  const tiers = [
+    { tier: 'exact', min: MIN_EXACT_RUNS, match: command === null ? null : (r) => r.repo === job.repo && r.lane === job.lane && typeof r.command === 'string' && pairingCommand(r.command) === command },
+    { tier: 'repo-lane', min: MIN_REPO_LANE_ROWS, match: (r) => r.repo === job?.repo && r.lane === job?.lane },
+  ];
+  const others = (Array.isArray(runners) ? runners : []).filter((r) => r?.name && r.name !== runner?.name);
+  const hit = (ms, tier, n, donor) => (Number.isFinite(ms) && ms > 0 ? { ms: Math.round(ms), tier, n, ...(donor === null ? {} : { donor }) } : null);
+  for (const { tier, min, match } of tiers) {
+    if (match === null) continue;
+    const own = remoteRunMs(history, runner?.name, match);
+    if (own.length >= min) {
+      const got = hit(median(own), tier, own.length, null);
+      if (got) return got;
+    }
+  }
+  for (const { tier, min, match } of tiers) {
+    if (match === null) continue;
+    let donor = null;
+    for (const other of others) {
+      const values = remoteRunMs(history, other.name, match);
+      if (values.length >= min && (donor === null || values.length > donor.values.length)) donor = { name: other.name, speed: speedOf(other), values };
+    }
+    if (donor === null) continue;
+    const got = hit((median(donor.values) * donor.speed) / speedOf(runner), tier, donor.values.length, donor.name);
+    if (got) return got;
+  }
+  return null;
+}
+
+/**
+ * BRAIN-899: how long a ticket expects to WAIT before it starts on a runner the probe sees: 0 when the runner is idle with room,
+ * else one run of this ticket's size per ticket ahead of it plus one for the work blocking admission. Serial and conservative on
+ * purpose -- `probe.running` counts orphaned leases and pressure can block admission, so it never shortens the wait. A `queued`
+ * that is not a positive integer counts as 0.
+ */
+export function runnerWaitMs({ probe, estimateMs, room }) {
+  const queued = Number.isInteger(probe?.queued) && probe.queued > 0 ? probe.queued : 0;
+  return room && queued === 0 ? 0 : (queued + 1) * estimateMs;
+}
+
 /**
  * Local vs the given runner: whichever finishes first. `runnerRatio` is the slowdown of the runner that would take the ticket;
  * a tie stays local (no snapshot to ship); `localBlocked` (BRAIN-596) and `localHeldByKey` (BRAIN-839) send it to the runner outright. Returns the choice with both estimates for the decision log.
+ * BRAIN-899: a finite `remoteFinishMs` IS that runner's finish (its placement score), replacing the ratio arithmetic, not adding to it.
  */
-export function chooseSpeedPlacement({ localAdmitsNow, localWaitMs: waitMs = 0, localBlocked = false, localHeldByKey = false, estimateMs, runnerRatio, overheadMs = DEFAULT_REMOTE_OVERHEAD_MS }) {
-  const remoteFinishMs = runnerRatio === null ? null : estimateMs * runnerRatio + overheadMs;
+export function chooseSpeedPlacement({ localAdmitsNow, localWaitMs: waitMs = 0, localBlocked = false, localHeldByKey = false, estimateMs, runnerRatio, overheadMs = DEFAULT_REMOTE_OVERHEAD_MS, remoteFinishMs: scoredFinishMs = null }) {
+  const remoteFinishMs = Number.isFinite(scoredFinishMs) ? scoredFinishMs : runnerRatio === null ? null : estimateMs * runnerRatio + overheadMs;
   // BRAIN-596: `localBlocked` = host load admits no ticket here, so the local finish is unbounded: remote whenever a runner can take it
   if (localBlocked && !localAdmitsNow) return { choice: remoteFinishMs === null ? 'local' : 'remote', localFinishMs: null, remoteFinishMs: remoteFinishMs === null ? null : Math.round(remoteFinishMs) };
   // BRAIN-839: a same-key holder (exclusive lane, or maxConcurrent reached) blocks local admission for as long as it runs; the queue

@@ -42,7 +42,7 @@ import { childExitSafeFlags } from './node-exit-safe.js';
 import { LOCAL_SETUP_FAILED_EXIT_CODE } from './remote-pipeline.js';
 import { readHistoryRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
-import { missingLocalDeps, speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, externalCpuSlots, DEFAULT_REMOTE_OVERHEAD_MS } from './speed-placement.js';
+import { missingLocalDeps, speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, externalCpuSlots, DEFAULT_REMOTE_OVERHEAD_MS, runnerRunEstimateMs, runnerWaitMs } from './speed-placement.js';
 import { starvedStaleMs } from './external-cpu.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, priorityOf, resolveLaneNice, waitedMs } from './priority.js';
@@ -648,14 +648,16 @@ function externalCpuSlotsFor(root, enriched, globalCfg) {
  * its measured speed ratio, plus dispatch overhead and, if it too is queued, that queue). One decision, with both estimates.
  * BRAIN-596: host load outside any lease that leaves no admissible slot makes the local wait unbounded, so an unqueued runner wins.
  */
-function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, probe, queuedChoice, waitedMs = 0, forceLocalBlocked = false, heldByKey = null) {
+function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, probe, queuedChoice, waitedMs = 0, forceLocalBlocked = false, heldByKey = null, score = null) {
   const queue = listQueue(root).filter(Boolean);
   const own = queue.findIndex((t) => t.id === enriched.id);
   const ahead = own === -1 ? queue : queue.slice(0, own);
   const slots = Math.floor(effectiveWeightCapacity(globalCfg, detectResourceCapacity().cpuCores) / Math.max(1, enriched.weight));
   const evidence = speedRatio(rows, runner, { job: { command: enriched.command, repo: enriched.repoId, lane: enriched.lane, estimateMs } });
   const ratio = evidence.ratio;
-  const runnerQueueMs = queuedChoice ? probe.queued * estimateMs * ratio : 0;
+  // BRAIN-899: a score already carries this runner's wait and the overhead, so the queue term survives only as the unscored fallback
+  const scoredFinishMs = Number.isFinite(score?.finishMs) ? score.finishMs : null;
+  const runnerQueueMs = scoredFinishMs === null && queuedChoice ? probe.queued * estimateMs * ratio : 0;
   const localBlocked = forceLocalBlocked || (!queuedChoice && externalCpuSlotsFor(root, enriched, globalCfg) === 0);
   return {
     ...chooseSpeedPlacement({
@@ -666,6 +668,7 @@ function speedChoice(root, enriched, globalCfg, { rows, estimateMs }, runner, pr
       estimateMs,
       runnerRatio: ratio,
       overheadMs: DEFAULT_REMOTE_OVERHEAD_MS + runnerQueueMs,
+      remoteFinishMs: scoredFinishMs,
     }),
     ratio,
     ratioTier: evidence.tier,
@@ -687,11 +690,33 @@ function logSpeedDecision(root, enriched, choice, detail) {
 
 const seconds = (ms) => (ms === null ? 'unbounded' : `${Math.round(ms / 1000)}s`);
 
+function logFinishPlacement(root, enriched, picked) {
+  if (!picked?.runner || !Array.isArray(picked.scores) || picked.scores.length === 0) return;
+  const scored = picked.scores.map((s) => `${s.name} ${seconds(s.finishMs)} (wait ${seconds(s.waitMs)}, run ${seconds(s.runMs)}, ${s.tier} n=${s.n})`).join(' | ');
+  const line = `lane: finish-placement: ts=${new Date().toISOString()} ${enriched.id}: ${scored} -> ${picked.runner.name}${picked.queuedChoice === true ? ' (queued)' : ''}\n`;
+  process.stderr.write(line);
+  writeBrokerLog(root, line);
+}
+
+/** The winner's own entry in a scored selection, or null when that call was not ranked by the finish model. */
+const scoreOf = (picked, runner) => (Array.isArray(picked?.scores) ? picked.scores.find((s) => s.name === runner?.name) ?? null : null);
+
+function finishModelFor(enriched, globalCfg, rows) {
+  const job = { repo: enriched.repoId, lane: enriched.lane, command: enriched.command };
+  const runners = globalCfg.runners || [];
+  return { estimateFor: (runner) => runnerRunEstimateMs(rows, runner, job, runners) };
+}
+
+const estimateMsOf = (model, runner) => {
+  const ms = model?.estimateFor(runner)?.ms;
+  return Number.isFinite(ms) ? ms : null;
+};
+
 /** What `selectRunner` needs to judge a ticket: its protocol, and its reservation (shared by a first attempt and a rebind). */
-export function remoteSelectOptions(enriched, globalCfg, root = stateHome(), cpuLimit) {
+export function remoteSelectOptions(enriched, globalCfg, root = stateHome(), cpuLimit, historyRows = null) {
   // BRAIN-533: history is read only when some runner has a schedule that could make the expected run time matter.
   const scheduled = (globalCfg.runners || []).some((r) => r.schedule);
-  const expectedMs = scheduled ? expectedRunMs(readHistoryRows(paths(root).history), enriched.repoId, enriched.lane) : null;
+  const expectedMs = scheduled ? expectedRunMs(historyRows ?? readHistoryRows(paths(root).history), enriched.repoId, enriched.lane) : null;
   // BRAIN-597: first placement, rebind and rebalance all select through here, so a down runner is skipped by every one of them.
   const downRunners = downRunnerReasons(root, globalCfg);
   return {
@@ -717,28 +742,46 @@ export function remoteSelectOptions(enriched, globalCfg, root = stateHome(), cpu
 /** BRAIN-888: a non-idle destination must finish the ticket in under this fraction of the time staying put would take. */
 const REBALANCE_QUEUED_GAIN = 0.75;
 
+/** BRAIN-899 R5: does a SCORED rebalance destination finish soon enough to be worth the move? Staying put costs the source's own
+ *  estimate times `position` (ahead + self, serial, no overhead: the ticket is already there). Today's rules answer whenever the
+ *  model cannot -- a drain, the refusal deadline, no destination score, no source estimate, no position. */
+export function rebalanceFinishAllows({ destScore, sourceEstimateMs, position, draining, refusalCapElapsed }) {
+  if (draining || refusalCapElapsed || destScore === null || destScore === undefined) return true;
+  if (!Number.isFinite(sourceEstimateMs) || !(position >= 1)) return true;
+  return destScore.finishMs < REBALANCE_QUEUED_GAIN * position * sourceEstimateMs;
+}
+
 /**
  * The ONE builder of `selectRunner` options for the three placement paths ('place' a first attempt, 'rebind' a locally queued
  * ticket, 'rebalance' a queued remote one), so what every path must carry (BRAIN-597's `downRunners`) cannot be dropped by one.
+ * BRAIN-899: all four rank by predicted finish; only the place path may also queue on a busy runner.
  */
 export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHome(), stuckLocally = false, localBlocked = false, draining = false, cpuLimit, queuedMove = null } = {}) {
-  const base = remoteSelectOptions(enriched, globalCfg, root, cpuLimit);
+  const rows = readHistoryRows(paths(root).history);
+  const base = remoteSelectOptions(enriched, globalCfg, root, cpuLimit, rows);
+  const finishModel = finishModelFor(enriched, globalCfg, rows);
   // a move or rebind picks a better home for a ticket that already has one
-  if (kind === 'rebind') return { ...base, maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0, allowBusyQueue: localBlocked };
+  if (kind === 'rebind') return { ...base, maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0, allowBusyQueue: localBlocked, finishModel };
   if (kind === 'rebalance' && queuedMove) {
     const stayFinish = estimatedFinish(base.reservation, { queued: queuedMove.position - 1 }, queuedMove.sourceRunner);
-    const queuedFilter = ({ probe, finish }) =>
-      probe.reservationOwner === false &&
-      Array.isArray(probe.capabilities) && probe.capabilities.includes(REMOTE_WITHDRAW_CAPABILITY) &&
-      hasMeasuredHeadroom(probe) &&
-      probe.queued <= globalCfg.remoteRebalanceQueuedMax &&
-      finish < REBALANCE_QUEUED_GAIN * stayFinish;
-    return { ...base, maxRemoteQueue: globalCfg.remoteRebalanceQueuedMax, allowBusyQueue: true, queuedFilter };
+    const sourceMs = estimateMsOf(finishModel, queuedMove.sourceRunner);
+    const queuedFilter = ({ runner, probe, finish, idle }) => {
+      if (
+        !(probe.reservationOwner === false &&
+          Array.isArray(probe.capabilities) && probe.capabilities.includes(REMOTE_WITHDRAW_CAPABILITY) &&
+          hasMeasuredHeadroom(probe) &&
+          probe.queued <= globalCfg.remoteRebalanceQueuedMax)
+      ) return false;
+      const destMs = estimateMsOf(finishModel, runner);
+      if (sourceMs === null || destMs === null) return finish < REBALANCE_QUEUED_GAIN * stayFinish;
+      return runnerWaitMs({ probe, estimateMs: destMs, room: idle === true }) + destMs + DEFAULT_REMOTE_OVERHEAD_MS < REBALANCE_QUEUED_GAIN * queuedMove.position * sourceMs;
+    };
+    return { ...base, maxRemoteQueue: globalCfg.remoteRebalanceQueuedMax, allowBusyQueue: true, queuedFilter, finishModel };
   }
   if (kind === 'rebalance') {
-    return { ...base, maxRemoteQueue: 0, requireCapabilities: draining ? [...base.requireCapabilities, REMOTE_WITHDRAW_CAPABILITY] : base.requireCapabilities };
+    return { ...base, maxRemoteQueue: 0, requireCapabilities: draining ? [...base.requireCapabilities, REMOTE_WITHDRAW_CAPABILITY] : base.requireCapabilities, finishModel };
   }
-  return base;
+  return { ...base, finishModel, busyQueueable: true };
 }
 
 /**
@@ -1038,9 +1081,11 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   // `needsProtocol2(enriched.remote)` alone, so an optionless lane still
   // sends a protocol-1 header even when this is true.
   const placeOptions = rebind ? null : selectionOptionsFor('place', enriched, globalCfg, { root, cpuLimit });
-  let { runner, skipped, queuedChoice, probe, busy, readiness, ready } = rebind
+  const placed = rebind
     ? { runner: rebind.runner, skipped: [], queuedChoice: false, probe: rebind.probe }
     : await selectRunner(globalCfg.runners || [], placeOptions);
+  let { runner, skipped, queuedChoice, probe, busy, readiness, ready } = placed;
+  logFinishPlacement(root, enriched, placed);
   // BRAIN-623: `lane status` names a runner that lacked what the lane needs; a runner that passed is ready again
   if (placeOptions && Object.values(placeOptions.readinessNeeds).some(hasNeed)) {
     await recordReadiness(root, readiness ?? {}, ready ?? [], Date.now()).catch(() => {});
@@ -1063,7 +1108,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   }
 
   if (speed && !busyQueuedAt) {
-    const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true, 0, false, heldByKey);
+    const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true, 0, false, heldByKey, scoreOf(placed, runner));
     logSpeedDecision(root, enriched, decision.choice, `local finish ${seconds(decision.localFinishMs)} (estimate ${seconds(speed.estimateMs)}), ${runner.name} finish ${seconds(decision.remoteFinishMs)} (ratio ${decision.ratio.toFixed(2)}, ${decision.ratioTier} n=${decision.ratioPairs}${localBlockNote(decision)})`);
     if (decision.choice === 'local') return fallbackOrRefuse(null, 'speed-aware: local finishes sooner', { rebindable: true });
   }
@@ -1319,16 +1364,24 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
           if (!draining && rebalanceBlocked({ moves: countedMoves, maxMoves: globalCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: globalCfg.remoteRebalanceCooldownMs })) return null;
           const candidates = (globalCfg.runners || []).filter((r) => !visited.includes(r.name) && r.rebalanceTarget !== false);
           if (candidates.length === 0) return null;
-          const picked = await selectRunner(candidates, selectionOptionsFor('rebalance', enriched, globalCfg, { draining, root, cpuLimit }));
-          const eligible = picked.runner && hasMeasuredHeadroom(picked.probe);
-          target = eligible ? { runner: picked.runner, probe: picked.probe } : null;
-          if (target || draining || refusalCapElapsed?.()) return target;
+          const idleOptions = selectionOptionsFor('rebalance', enriched, globalCfg, { draining, root, cpuLimit });
+          const picked = await selectRunner(candidates, idleOptions);
+          // BRAIN-899 R5: a scored destination must also beat staying put by the gain; a drain or the refusal deadline is ungated
+          const sourceEstimateMs = estimateMsOf(idleOptions.finishModel, runner);
+          const finishAllows = (result) => rebalanceFinishAllows({ destScore: scoreOf(result, result.runner), sourceEstimateMs, position: sourceFacts?.position, draining, refusalCapElapsed: refusalCapElapsed?.() });
+          const idleTarget = picked.runner && hasMeasuredHeadroom(picked.probe) ? { runner: picked.runner, probe: picked.probe } : null;
+          target = idleTarget && finishAllows(picked) ? idleTarget : null;
+          if (target || draining) return target;
+          // at the refusal deadline an idle destination the gain gate turned down is taken after all: refusal is the worse outcome
+          if (refusalCapElapsed?.()) return (target = idleTarget);
           // BRAIN-888: behind another ticket's reservation with no idle runner on offer, a short non-idle queue elsewhere can be better
           const stuckBehindOwner = globalCfg.remoteRebalanceQueuedMax > 0 && sourceFacts?.position >= 1 && sourceFacts.behindOtherOwner === true && sourceFacts.reservationOwnerWaitedMs >= globalCfg.remoteRebalanceMinQueuedMs;
           if (!stuckBehindOwner) return null;
           const queued = await selectRunner(candidates, selectionOptionsFor('rebalance', enriched, globalCfg, { draining, root, cpuLimit, queuedMove: { position: sourceFacts.position, sourceRunner: runner } }));
           // the cap may have run out while the probes were out: refusal must stay reachable
-          if (!queued.runner || refusalCapElapsed?.()) return null;
+          if (refusalCapElapsed?.()) return (target = idleTarget);
+          if (!queued.runner) return null;
+          if (!finishAllows(queued)) return null;
           const viaQueue = queued.queuedChoice === true;
           if (!viaQueue && !hasMeasuredHeadroom(queued.probe)) return null;
           target = { runner: queued.runner, probe: queued.probe, ...(viaQueue ? { behindOwnerPosition: sourceFacts.position } : {}) };
@@ -1850,12 +1903,14 @@ async function main() {
     // An idle runner is always taken; a runner that is itself queued (up to maxRemoteQueue) only for a ticket stuck locally long enough.
     const waitedMs = Date.now() - (readQueuedRecord(root, ticket.id)?.localSince ?? Date.now());
     const stuckLocally = localBlocked || (globalCfg.remoteRebindMinLocalWaitMs > 0 && waitedMs >= globalCfg.remoteRebindMinLocalWaitMs);
-    const { runner, probe, queuedChoice } = await selectRunner(candidates, selectionOptionsFor('rebind', enriched, globalCfg, { stuckLocally, localBlocked, root, cpuLimit }));
+    const rebound = await selectRunner(candidates, selectionOptionsFor('rebind', enriched, globalCfg, { stuckLocally, localBlocked, root, cpuLimit }));
+    const { runner, probe, queuedChoice } = rebound;
     if (!runner) return;
+    logFinishPlacement(root, enriched, rebound);
     // BRAIN-548: a speed-aware ticket moves only when the runner is now expected to finish it sooner than waiting here does.
     const speed = speedInputs(root, enriched);
     if (speed) {
-      const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true, waitedMs, localBlocked, heldByKey);
+      const decision = speedChoice(root, enriched, globalCfg, speed, runner, probe, queuedChoice === true, waitedMs, localBlocked, heldByKey, scoreOf(rebound, runner));
       if (decision.choice === 'local') {
         // BRAIN-556: make a ticket that keeps staying local visible, at most once per 10 min
         if (Date.now() - lastLocalLogAt >= LOCAL_LOG_INTERVAL_MS) {
