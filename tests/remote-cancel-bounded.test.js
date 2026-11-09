@@ -185,7 +185,9 @@ test('an unconfirmed remote cancel (runner unreachable) keeps the attempt and ex
 
 test('a remote cancel the runner confirms slowly (inside its own deadline) publishes 130, not an abandoned exit 74', T, async () => {
   const base = setup();
-  const { env, setMode } = withCancelWrapper(base.env);
+  // A 5 s grace (remote cancel 10 s, exit deadline 15.5 s): the 2 s answer plus a real fake-ssh round trip on a loaded
+  // runner outran the 1 s grace's 6 s deadline. "Slowly, inside the deadline" is the case; how tight is not.
+  const { env, setMode } = withCancelWrapper({ ...base.env, LANE_BROKER_TEST_CANCEL_GRACE_MS: '5000' });
   const { state, repoDir } = base;
   const { id, ranLog } = await startRemote(env, repoDir);
   try {
