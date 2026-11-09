@@ -691,9 +691,14 @@ function logSpeedDecision(root, enriched, choice, detail) {
 const seconds = (ms) => (ms === null ? 'unbounded' : `${Math.round(ms / 1000)}s`);
 
 function logFinishPlacement(root, enriched, picked) {
-  if (!picked?.runner || !Array.isArray(picked.scores) || picked.scores.length === 0) return;
-  const scored = picked.scores.map((s) => `${s.name} ${seconds(s.finishMs)} (wait ${seconds(s.waitMs)}, run ${seconds(s.runMs)}, ${s.tier} n=${s.n})`).join(' | ');
-  const line = `lane: finish-placement: ts=${new Date().toISOString()} ${enriched.id}: ${scored} -> ${picked.runner.name}${picked.queuedChoice === true ? ' (queued)' : ''}\n`;
+  if (!picked?.runner) return;
+  const scores = Array.isArray(picked.scores) ? picked.scores : [];
+  // BRAIN-602: a runner left out of the ranking says why, so a busy runner skipped as `probe timed out` is countable
+  const timedOut = (picked.skipped ?? []).filter((s) => s.reason === 'probe timed out' && !scores.some((sc) => sc.name === s.name));
+  if (scores.length === 0 && timedOut.length === 0) return;
+  const scored = scores.map((s) => `${s.name} ${seconds(s.finishMs)} (wait ${seconds(s.waitMs)}, run ${seconds(s.runMs)}, ${s.tier} n=${s.n})`).join(' | ') || 'unscored';
+  const skippedNote = timedOut.length > 0 ? ` [skipped: ${timedOut.map((s) => `${s.name}: probe timed out`).join('; ')}]` : '';
+  const line = `lane: finish-placement: ts=${new Date().toISOString()} ${enriched.id}: ${scored}${skippedNote} -> ${picked.runner.name}${picked.queuedChoice === true ? ' (queued)' : ''}\n`;
   process.stderr.write(line);
   writeBrokerLog(root, line);
 }

@@ -131,18 +131,62 @@ export const MIN_REPO_LANE_ROWS = 3;
 const remoteRunMs = (rows, runnerName, match) =>
   rows.filter((r) => r?.executor === 'remote' && r?.runner === runnerName && r?.exit === 0 && Number.isFinite(r.runMs) && r.runMs > 0 && match(r)).map((r) => r.runMs);
 
+export const MAX_CLASS_VALUES = 8;
+export const MIN_CLASS_ROWS = 2;
+
+function assignmentOf(token) {
+  const matched = ENV_ASSIGNMENT.exec(token);
+  if (matched === null) return null;
+  const value = unquoted(matched[1]);
+  return isVolatileValue(value) ? null : [token.slice(0, token.indexOf('=')), value];
+}
+
+const stableAssignments = (command) => String(command ?? '').split(/\s+/).map(assignmentOf).filter((a) => a !== null);
+
+function lowCardinalityNames(rows) {
+  const seen = new Map();
+  for (const row of rows) {
+    for (const [name, value] of stableAssignments(row?.command)) {
+      const values = seen.get(name);
+      if (values === undefined) seen.set(name, new Set([value]));
+      else values.add(value);
+    }
+  }
+  return new Set([...seen].filter(([, values]) => values.size <= MAX_CLASS_VALUES).map(([name]) => name));
+}
+
+const classKey = (command, names) => {
+  const kept = stableAssignments(command).filter(([name]) => names.has(name)).map(([name, value]) => `${name}=${value}`).sort();
+  return kept.length === 0 ? null : kept.join(' ');
+};
+
+/** BRAIN-916: the class of `command` among `sameLaneRows`: the sorted `NAME=value` of its env assignments that are neither per-run values nor names taking more than MAX_CLASS_VALUES distinct values there, or null when none survives and the class tier does not apply. */
+export function jobClass(command, sameLaneRows) {
+  return classKey(command, lowCardinalityNames(Array.isArray(sameLaneRows) ? sameLaneRows : []));
+}
+
 /**
  * BRAIN-899: how long this ticket is expected to RUN on `runner`, in ms, from the broker's own history rows: the median of the
  * most specific evidence that holds up, first hit wins -- this repo+lane+command on `runner` (`pairingCommand`, so a per-run sha
- * or shard id does not split it, >= MIN_EXACT_RUNS runs); this repo+lane on `runner` (>= MIN_REPO_LANE_ROWS runs); either of
- * those on the OTHER configured runner with the most matching rows (ties: config order), scaled by its `speedFactor` over
- * `runner`'s and named as the `donor`. No evidence anywhere: null, and the caller keeps today's ranking. `job` is { repo, lane, command }.
+ * or shard id does not split it, >= MIN_EXACT_RUNS runs); this repo+lane+`jobClass` on `runner` (>= MIN_CLASS_ROWS runs); this
+ * repo+lane on `runner` (>= MIN_REPO_LANE_ROWS runs); any of those on the OTHER configured runner with the most matching rows
+ * (ties: config order), scaled by its `speedFactor` over `runner`'s and named as the `donor`. No evidence anywhere: null, and the
+ * caller keeps today's ranking. `job` is { repo, lane, command }.
  */
 export function runnerRunEstimateMs(rows, runner, job, runners) {
   const history = Array.isArray(rows) ? rows : [];
   const command = typeof job?.command === 'string' && job.command.trim() !== '' ? pairingCommand(job.command) : null;
+  const sameLane = command === null ? null : history.filter((r) => r?.repo === job.repo && r?.lane === job.lane);
+  const classNames = sameLane === null ? null : lowCardinalityNames(sameLane);
+  const jobClassKey = classNames === null ? null : classKey(job.command, classNames);
+  const classKeys = new Map();
+  const classOf = (cmd) => {
+    if (!classKeys.has(cmd)) classKeys.set(cmd, classKey(cmd, classNames));
+    return classKeys.get(cmd);
+  };
   const tiers = [
     { tier: 'exact', min: MIN_EXACT_RUNS, match: command === null ? null : (r) => r.repo === job.repo && r.lane === job.lane && typeof r.command === 'string' && pairingCommand(r.command) === command },
+    { tier: 'class', min: MIN_CLASS_ROWS, match: jobClassKey === null ? null : (r) => r.repo === job.repo && r.lane === job.lane && typeof r.command === 'string' && classOf(r.command) === jobClassKey },
     { tier: 'repo-lane', min: MIN_REPO_LANE_ROWS, match: (r) => r.repo === job?.repo && r.lane === job?.lane },
   ];
   const others = (Array.isArray(runners) ? runners : []).filter((r) => r?.name && r.name !== runner?.name);

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { makeRunner, tmpDir } from './remote-harness.js';
 import { selectRunner } from '../src/remote-client.js';
-import { DEFAULT_REMOTE_OVERHEAD_MS, pairingCommand, runnerRunEstimateMs, runnerWaitMs } from '../src/speed-placement.js';
+import { DEFAULT_REMOTE_OVERHEAD_MS, jobClass, pairingCommand, runnerRunEstimateMs, runnerWaitMs } from '../src/speed-placement.js';
 
 // ---- runnerRunEstimateMs: the tiers, the donor and its scaling ----
 
@@ -92,6 +92,71 @@ test('runnerRunEstimateMs: the same command in another repo or lane never matche
   assert.equal(runnerRunEstimateMs(otherLane, SKYBOX, job(), CONFIGURED), null);
   const mixed = [...elsewhere, ...rowsOf('skybox', 900_000, 910_000, 920_000).map((r) => ({ ...r, command: 'sh other.sh' }))];
   assert.deepEqual(runnerRunEstimateMs(mixed, SKYBOX, job(), CONFIGURED), { ms: 910_000, tier: 'repo-lane', n: 3 }, 'only this repo and lane count');
+});
+
+// ---- runnerRunEstimateMs: the BRAIN-916 class tier ----
+
+const TRAIN_REPO = 'durvivors';
+const TRAIN_LANE = 'train';
+const IDS = 'abcdef0123456789';
+const trainCommand = ({ shard = null, tier = 'pr', id, files = null }) =>
+  `env ${shard === null ? '' : `TRAIN_SHARD=${shard} TRAIN_SHARDS=3 `}env TRAIN_TIER=${tier} TRAIN_BASE=${id.repeat(40)} TRAIN_TIP=${id.repeat(40)} TRAIN_CHANGED_FILES_PATH=.train-changed-files TRAIN_CHANGED_FILES=${files ?? `src/pages/${id}.html\nsrc/lib/${id}.js`} sh .githooks/pre-push-gate.sh verify-full`;
+const trainRow = (runner, runMs, parts) => ({ repo: TRAIN_REPO, lane: TRAIN_LANE, command: trainCommand(parts), executor: 'remote', runner, exit: 0, startedAt: 1000, endedAt: 1000 + runMs, runMs });
+const trainJob = (parts) => ({ repo: TRAIN_REPO, lane: TRAIN_LANE, command: trainCommand(parts) });
+const trainRows = (runner) => [
+  ...['1/3', '2/3', '3/3'].flatMap((shard, s) => [0, 1, 2].map((i) => trainRow(runner, 400_000 + s * 100_000 + i * 20_000, { shard, id: IDS[s * 3 + i] }))),
+  trainRow(runner, 3_000_000, { id: '3' }),
+  trainRow(runner, 3_200_000, { id: '4' }),
+  trainRow(runner, 5_000_000, { tier: 'master', id: '5' }),
+];
+const REPO_LANE_MEDIAN = 570_000;
+
+test('jobClass: the sorted low-cardinality assignments, without the per-run ones', () => {
+  const rows = trainRows('skybox');
+  assert.equal(jobClass(trainCommand({ shard: '1/3', id: 'ff' }), rows), 'TRAIN_CHANGED_FILES_PATH=.train-changed-files TRAIN_SHARD=1/3 TRAIN_SHARDS=3 TRAIN_TIER=pr', 'the shas and the 12-value changed-file list are gone');
+  assert.equal(jobClass(trainCommand({ id: 'ff' }), rows), 'TRAIN_CHANGED_FILES_PATH=.train-changed-files TRAIN_TIER=pr');
+  assert.equal(jobClass('sh scripts/test-run.sh', rows), null);
+  assert.equal(jobClass(trainCommand({ shard: '1/3', id: 'ff' }), []), null, 'with no lane history no name is low-cardinality');
+});
+
+test('runnerRunEstimateMs: a train lane\'s shards and tiers keep their own medians through the class tier', () => {
+  const rows = trainRows('skybox');
+  assert.deepEqual(runnerRunEstimateMs(rows, SKYBOX, trainJob({ shard: '1/3', id: 'ff' }), CONFIGURED), { ms: 420_000, tier: 'class', n: 3 }, `not the ${REPO_LANE_MEDIAN / 1000}s repo-lane median that mixes 400s shards with 3000s unsharded runs`);
+  assert.deepEqual(runnerRunEstimateMs(rows, SKYBOX, trainJob({ shard: '2/3', id: 'ff' }), CONFIGURED), { ms: 520_000, tier: 'class', n: 3 });
+  assert.deepEqual(runnerRunEstimateMs(rows, SKYBOX, trainJob({ shard: '3/3', id: 'ff' }), CONFIGURED), { ms: 620_000, tier: 'class', n: 3 });
+  assert.deepEqual(runnerRunEstimateMs(rows, SKYBOX, trainJob({ id: 'ff' }), CONFIGURED), { ms: 3_100_000, tier: 'class', n: 2 }, 'an unsharded pr run is a class of its own');
+  assert.deepEqual(runnerRunEstimateMs(rows, SKYBOX, trainJob({ tier: 'master', id: 'ff' }), CONFIGURED), { ms: REPO_LANE_MEDIAN, tier: 'repo-lane', n: 12 }, 'one run is no class evidence, so the master tier falls back');
+});
+
+test('runnerRunEstimateMs: the exact tier still beats the class one', () => {
+  const same = { shard: '1/3', files: 'src/pages/classic.html\nsrc/lib/same.js' };
+  const rows = [...trainRows('skybox'), trainRow('skybox', 700_000, { ...same, id: 'aa' }), trainRow('skybox', 900_000, { ...same, id: 'bb' })];
+  assert.deepEqual(runnerRunEstimateMs(rows, SKYBOX, trainJob({ ...same, id: 'cc' }), CONFIGURED), { ms: 800_000, tier: 'exact', n: 2 }, 'two runs of this very command beat the 420s class median of its shard');
+});
+
+test('runnerRunEstimateMs: the class tier scales from a donor, chosen by its class rows', () => {
+  const rows = trainRows('skybox');
+  assert.deepEqual(runnerRunEstimateMs(rows, WINTOP, trainJob({ shard: '2/3', id: 'ff' }), CONFIGURED), { ms: 1_040_000, tier: 'class', n: 3, donor: 'skybox' }, '520s at speedFactor 1 is 1040s at 0.5, not the 1140s a repo-lane donor would give');
+  const both = [...rows, trainRow('wintop', 2_000_000, { shard: '2/3', id: 'aa' }), trainRow('wintop', 2_200_000, { shard: '2/3', id: 'bb' })];
+  assert.deepEqual(runnerRunEstimateMs(both, BIGPI, trainJob({ shard: '2/3', id: 'ff' }), [SKYBOX, WINTOP, BIGPI]), { ms: 520_000, tier: 'class', n: 3, donor: 'skybox' }, 'three class rows beat two, whatever the rest of the lane says');
+});
+
+test('runnerRunEstimateMs: a repeating short changed-file value joins the class only while the lane keeps repeating it', () => {
+  const classic = (runMs, id) => trainRow('skybox', runMs, { shard: '1/3', id, files: `classic.html\nsrc/lib/${id}.js` });
+  const other = (runMs, id) => trainRow('skybox', runMs, { shard: '1/3', id });
+  const wanted = trainJob({ shard: '1/3', id: 'ff', files: 'classic.html\nsrc/lib/ff.js' });
+  const few = [classic(100_000, 'a'), classic(120_000, 'b'), other(900_000, 'c'), other(980_000, 'd')];
+  assert.deepEqual(runnerRunEstimateMs(few, SKYBOX, wanted, CONFIGURED), { ms: 110_000, tier: 'class', n: 2 }, 'TRAIN_CHANGED_FILES takes 3 distinct values here, so it stays in the class key and only the classic.html rows match');
+  const many = [...few, ...[0, 1, 2, 3, 4, 5, 6].map((i) => other(900_000 + i * 10_000, IDS[6 + i]))];
+  assert.deepEqual(runnerRunEstimateMs(many, SKYBOX, wanted, CONFIGURED), { ms: 920_000, tier: 'class', n: 11 }, 'at 10 distinct values the name is dropped, so the classic.html runs pool with the rest of their shard class');
+});
+
+test('runnerRunEstimateMs: no kept assignment leaves the class tier out, as today', () => {
+  const rows = trainRows('skybox');
+  const plain = { repo: TRAIN_REPO, lane: TRAIN_LANE, command: 'sh .githooks/pre-push-gate.sh verify-full' };
+  assert.deepEqual(runnerRunEstimateMs(rows, SKYBOX, plain, CONFIGURED), { ms: REPO_LANE_MEDIAN, tier: 'repo-lane', n: 12 });
+  assert.equal(runnerRunEstimateMs(rows, SKYBOX, { ...plain, command: 'env BRAND_NEW=1 sh .githooks/pre-push-gate.sh verify-full' }, CONFIGURED).tier, 'repo-lane', 'a name this lane has never seen is not a class');
+  assert.equal(runnerRunEstimateMs(rows, SKYBOX, { ...plain, command: 'env TRAIN_SHARD=9/9 sh .githooks/pre-push-gate.sh verify-full' }, CONFIGURED).tier, 'repo-lane', 'nor is a class no row shares');
 });
 
 // ---- runnerWaitMs ----
