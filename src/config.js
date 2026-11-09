@@ -594,8 +594,8 @@ function validateRunners(runners, sourcePath) {
     }
     if (runner.speedFactor !== undefined) {
       assert(
-        Number.isFinite(runner.speedFactor) && runner.speedFactor > 0,
-        `${sourcePath}: runner "${runner.name}".speedFactor must be a positive number`,
+        Number.isFinite(runner.speedFactor) && runner.speedFactor > 0 && runner.speedFactor <= 4,
+        `${sourcePath}: runner "${runner.name}".speedFactor must be a number in (0, 4]`,
       );
     }
     // BRAIN-548: how many times slower this runner is than this machine, used until history has enough paired runs to measure it.

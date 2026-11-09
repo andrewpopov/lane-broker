@@ -444,6 +444,7 @@ export function childEnv(ticket, baseEnv = process.env, grantedCpuCores = ticket
   else {
     env.LANE_BROKER_EXECUTOR = 'local';
     delete env.LANE_BROKER_RUNNER;
+    delete env.LANE_BROKER_RUNNER_SPEED_FACTOR;
   }
   const cpuCores = grantedCpuCores;
   const memoryBytes = ticket.resources?.memoryBytes;

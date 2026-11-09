@@ -224,6 +224,7 @@ function validateHeaderFields(header) {
   }
   // BRAIN-597: additive; absent from an older submitter, in which case only LANE_BROKER_EXECUTOR is exported
   if (header.runnerName !== undefined && !(typeof header.runnerName === 'string' && RUNNER_NAME_RE.test(header.runnerName))) return { ok: false, reason: 'invalid runnerName' };
+  if (header.runnerSpeedFactor !== undefined && !(Number.isFinite(header.runnerSpeedFactor) && header.runnerSpeedFactor > 0 && header.runnerSpeedFactor <= 4)) return { ok: false, reason: 'invalid runnerSpeedFactor' };
   // BRAIN-321: additive; an older submitter sends neither, an older runner ignores both
   if (header.laneClass !== undefined && header.laneClass !== 'sim' && header.laneClass !== 'test') return { ok: false, reason: 'invalid laneClass' };
   if (header.classEnforcement !== undefined && header.classEnforcement !== 'required') return { ok: false, reason: 'invalid classEnforcement' };
@@ -520,6 +521,8 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   process.env.LANE_BROKER_EXECUTOR = 'remote';
   if (header.runnerName !== undefined) process.env.LANE_BROKER_RUNNER = header.runnerName;
   else delete process.env.LANE_BROKER_RUNNER;
+  if (header.runnerSpeedFactor !== undefined) process.env.LANE_BROKER_RUNNER_SPEED_FACTOR = String(header.runnerSpeedFactor);
+  else delete process.env.LANE_BROKER_RUNNER_SPEED_FACTOR;
 
   const workDir = path.join(ticketDir, 'work');
   // Every phase env is derived from this process's env (buildDepsEnv, the

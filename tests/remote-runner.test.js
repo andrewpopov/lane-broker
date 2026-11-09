@@ -1490,6 +1490,20 @@ test('remote header rejects an invalid execution ceiling before running the comm
   }
 });
 
+test('remote header rejects an invalid runnerSpeedFactor before running the command', async () => {
+  const { env } = freshShadowEnv();
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'speed-factor' });
+  for (const runnerSpeedFactor of [0, -1, 5, Number.NaN, Infinity, null, '2']) {
+    const root = tmpDir('invalid-speed-factor-root');
+    const header = makeHeader({ runnerSpeedFactor });
+    const { code } = await runOne(header, entries, { env, root, src });
+    assert.equal(code, 0);
+    const result = await getResult(header.ticketId, root, env);
+    assert.equal(result.kind, 'rejected');
+    assert.match(result.reason, /invalid runnerSpeedFactor/);
+  }
+});
+
 test('EXECUTION_ALLOCATION_WIRE: runner result preserves execution 6 separately from grant 14.4', () => {
   const result = buildResult(makeHeader(), tmpDir('allocation-wire'), { kind: 'completed', exit: 0, grantedCpuCores: 14.4, executionCpuCores: 6 });
   const wire = JSON.parse(JSON.stringify(result));

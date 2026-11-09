@@ -127,10 +127,11 @@ test('remoteRebindIntervalMs defaults to 30000, accepts 0, rejects negative and 
   for (const bad of [-1, 1.5, '30000']) assert.throws(() => loadWith({ remoteRebindIntervalMs: bad }), ConfigError);
 });
 
-test('runner speedFactor must be a positive number', () => {
+test('runner speedFactor must be a number in (0, 4]', () => {
   const runners = (speedFactor) => [{ name: 'a', ssh: 'a', speedFactor }];
   assert.equal(loadWith({ runners: runners(2.5) }).runners[0].speedFactor, 2.5);
-  for (const bad of [0, -1, '2', null]) assert.throws(() => loadWith({ runners: runners(bad) }), ConfigError);
+  assert.equal(loadWith({ runners: runners(4) }).runners[0].speedFactor, 4);
+  for (const bad of [0, -1, 4.5, '2', null]) assert.throws(() => loadWith({ runners: runners(bad) }), ConfigError);
 });
 
 // ---- the atomic withdraw (scheduler) ----
