@@ -3,34 +3,70 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { gitFixture, laneRun, laneSpawn, waitFor, sleep, writeRepoConfig } from './helpers.js';
-import { tmpDir, setup, markerCmd, detachAndWait, resultOf, probeCount } from './remote-harness.js';
+import { gitFixture, laneRun, laneSpawn, waitFor, sleep, writeRepoConfig, writeGlobalConfig } from './helpers.js';
+import {
+  tmpDir, setup, markerCmd, detachAndWait, resultOf, probeCount,
+  makeFakeSshBin, makeRunner, clientEnv, makeGitWorktree, makeDispatchArgs, readCapturedHeader,
+} from './remote-harness.js';
 import { paths, readJsonSafe, isCancelled } from '../src/state.js';
 import { readAttempt } from '../src/attempts.js';
+import { dispatchRemote, selectRunner, needsProtocol2 } from '../src/remote-client.js';
+import { remoteSelectOptions } from '../src/supervisor.js';
+import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 
 /**
- * BRAIN-319 T3b-3: end-to-end coverage of the supervisor's remote-dispatch
- * wiring (T3b-2), driving the REAL `lane run` CLI over the fake-ssh
- * transport from tests/remote-harness.js -- no direct calls into
- * src/supervisor.js or src/attempts.js.
+ * BRAIN-319 T3b-3: coverage of the supervisor's remote-dispatch wiring (T3b-2). Every test here is
+ * either WIRING -- it drives the REAL `lane run` CLI over the fake-ssh transport from
+ * tests/remote-harness.js to check how the pieces connect (the history row, the attempt record, the
+ * local fallback, what `lane wait`/`lane cancel` see, the stderr the CLI prints) -- or a DECISION,
+ * checked in-process at its own seam (`dispatchRemote`, `selectRunner`, `remoteSelectOptions`) over
+ * that same transport, which costs no CLI, supervisor or `lane wait` process (BRAIN-868).
  */
+
+// ---- the DECISION seam: the client's own calls, in-process, over the harness's fake ssh ----
+
+function seam(ssh = 'normal') {
+  const fake = makeFakeSshBin();
+  // the fake runner's OWN broker: a 5s default sampleMs would make a small queueTimeoutMs take a whole extra poll to observe
+  writeGlobalConfig(fake.runnerHome, { sampleMs: 50, capacity: 4, cpuLimit: 'off' });
+  const { env } = clientEnv(fake.binDir);
+  return {
+    ...fake,
+    env,
+    runner: makeRunner({ ssh, name: 'skybox', root: tmpDir('seam-runner-root') }),
+    select: { sshBin: fake.sshBin, env, deadlineMs: 5000 },
+  };
+}
+
+/** One `dispatchRemote` against `seam()`'s runner. `files` is the dispatched tree; the command defaults to
+ *  `markerCmd(marker, exit)`, so the marker still reports which side of the transport it ran on. The result-poll
+ *  backoff is capped: in-process there is no CLI to hand it the harness's `LANE_BROKER_TEST_RESULT_POLL_MS`. */
+async function seamDispatch(s, { files = { 'a.txt': 'hello' }, exit = 0, argv, deadlines, ...extra } = {}) {
+  const marker = path.join(tmpDir('seam-marker'), 'where');
+  const args = makeDispatchArgs({ argv: argv ?? markerCmd(marker, exit) });
+  const result = await dispatchRemote({
+    ...args,
+    runner: s.runner,
+    worktreeRoot: makeGitWorktree(files),
+    sshBin: s.sshBin,
+    env: s.env,
+    sleep: (ms) => sleep(Math.min(ms, 50)),
+    deadlines: { resultMs: 5000, resultAttempts: 3, ...deadlines },
+    ...extra,
+  });
+  return { result, marker, args };
+}
 
 // ---- usable runner: exit passthrough, output relay, stderr banner ----
 
 for (const exitCode of [0, 1, 42]) {
   test(`runner usable: a remote child exiting ${exitCode} passes that exit through, marked as having run remotely`, async () => {
-    const { env, state, repoDir } = setup();
-    const marker = path.join(tmpDir('marker'), 'where');
-    const { id, waited } = await detachAndWait(
-      ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, exitCode)],
-      env,
-      repoDir,
-    );
-    assert.equal(waited.code, exitCode, `stderr: ${waited.stderr}`);
+    const s = seam();
+    const { result, marker } = await seamDispatch(s, { exit: exitCode });
+    assert.equal(result.outcome, 'confirmed');
+    assert.equal(result.exitCode, exitCode);
+    assert.equal(result.result.kind, 'completed');
     assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
-    const result = resultOf(state, id);
-    assert.equal(result.executor, 'remote');
-    assert.equal(result.runner, 'skybox');
   });
 }
 
@@ -337,7 +373,9 @@ test('--detach + lane wait works for a remotely-dispatched run', async () => {
   );
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
-  assert.equal(resultOf(state, id).executor, 'remote');
+  const result = resultOf(state, id);
+  assert.equal(result.executor, 'remote');
+  assert.equal(result.runner, 'skybox');
 });
 
 // ---- oversize resource request ----
@@ -428,23 +466,14 @@ test('~5MB of remote stdout under a slowly-draining foreground caller completes,
 // ---- BRAIN-320 S1c: protocol-2 dispatch end to end ----
 
 test('protocol 2: remoteSetup succeeds, command exits 0 -> green, ran remotely, phase command recorded', async () => {
-  const { env, state, repoDir } = setup();
-  writeRepoConfig(repoDir, {
-    version: 1,
-    lanes: { default: { weight: 1, remote: true, remoteSetup: [[process.execPath, '-e', 'process.exit(0)']] } },
-  });
-  const marker = path.join(tmpDir('marker'), 'where');
-  const { id, waited } = await detachAndWait(
-    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
-    env,
-    repoDir,
-  );
-  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  const s = seam();
+  const { result, marker } = await seamDispatch(s, { remoteSetup: [[process.execPath, '-e', 'process.exit(0)']] });
+  assert.equal(result.outcome, 'confirmed');
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.result.protocol, 2);
+  assert.equal(result.result.kind, 'completed');
+  assert.equal(result.phase, 'command');
   assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
-  const result = resultOf(state, id);
-  assert.equal(result.executor, 'remote');
-  assert.equal(result.remoteKind, 'completed');
-  assert.equal(result.remotePhase, 'command');
 });
 
 test('protocol 2: remoteSetup fails -> exit is the setup exit, the local command never runs, phase setup attributed', async () => {
@@ -504,58 +533,39 @@ test('protocol 2: remoteDeps (npm ci) fails -> exit is npm ci\'s exit, the local
 });
 
 test('protocol 1: an optionless remote lane still sends protocol 1 (no phase in the result)', async () => {
-  const { env, state, repoDir } = setup();
-  const marker = path.join(tmpDir('marker'), 'where');
-  const { id, waited } = await detachAndWait(
-    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
-    env,
-    repoDir,
-  );
-  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
-  const result = resultOf(state, id);
-  assert.equal(result.executor, 'remote');
-  assert.equal(result.remoteKind, 'completed');
-  assert.equal(result.remotePhase, null, 'a protocol-1 result carries no pipeline phase');
+  const s = seam('tee');
+  const { result, marker } = await seamDispatch(s);
+  assert.equal(result.outcome, 'confirmed');
+  assert.equal(readCapturedHeader(s.teePath).protocol, 1, 'the exec header itself is protocol 1');
+  assert.equal(result.result.protocol, 1);
+  assert.equal(result.phase, undefined, 'a protocol-1 result carries no pipeline phase');
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
 });
 
 // ---- BRAIN-320 S1c: mixed protocol versions against a pre-S1a (0.6.0-style) runner ----
 
 test('mixed versions: a v2 (remoteSetup) lane against a runner whose probe lacks protocols is skipped, falls back local', async () => {
-  const { env, state, repoDir } = setup({ ssh: 'old-runner' });
-  writeRepoConfig(repoDir, {
-    version: 1,
-    lanes: { default: { weight: 1, remote: true, remoteSetup: [[process.execPath, '-e', 'process.exit(0)']] } },
-  });
-  const marker = path.join(tmpDir('marker'), 'where');
-  const { id, waited } = await detachAndWait(
-    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
-    env,
-    repoDir,
-  );
-  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
-  assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
-  const result = resultOf(state, id);
-  assert.equal(result.executor, 'local');
-  assert.match(result.fallbackReason, /does not support protocol 2/);
+  const remote = { remoteSetup: [[process.execPath, '-e', 'process.exit(0)']] };
+  assert.equal(needsProtocol2(remote), true, 'a remoteSetup lane needs protocol 2 to run at all');
+  const s = seam('old-runner');
+  const picked = await selectRunner([s.runner], { ...s.select, requireProtocol2: true });
+  assert.equal(picked.runner, null, 'the runner whose probe has no `protocols` is never dispatched');
+  assert.deepEqual(picked.skipped.map((k) => k.name), ['skybox']);
+  assert.match(picked.skipped[0].reason, /does not support protocol 2/, 'the reason the supervisor records as fallbackReason');
 });
 
 // ---- BRAIN-320 S1d: opt-in queue timeout ----
 
-test('queue timeout: the client global config carries remoteQueueTimeoutMs, the runner broker never starts the ticket, and the run falls back and completes LOCALLY', async () => {
-  const { env, state, repoDir, runnerState } = setup({ remoteQueueTimeoutMs: 300 });
-  fs.mkdirSync(runnerState, { recursive: true });
-  fs.writeFileSync(path.join(runnerState, 'PAUSE'), 'kept busy for the test');
-  const marker = path.join(tmpDir('marker'), 'where');
-  const { id, waited } = await detachAndWait(
-    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
-    env,
-    repoDir,
-  );
-  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
-  assert.equal(fs.readFileSync(marker, 'utf8'), 'local', 'the run must have fallen back and executed locally');
-  const result = resultOf(state, id);
-  assert.equal(result.executor, 'local');
-  assert.match(result.fallbackReason, /queue-timeout/);
+test('queue timeout: remoteQueueTimeoutMs in the header expires a ticket the runner broker never starts, as never-started and retryable elsewhere', async () => {
+  const s = seam();
+  fs.mkdirSync(s.runnerState, { recursive: true });
+  fs.writeFileSync(path.join(s.runnerState, 'PAUSE'), 'kept busy for the test');
+  const { result, marker } = await seamDispatch(s, { queueTimeoutMs: 300, deadlines: { resultMs: 5000, resultAttempts: 20 } });
+  assert.equal(result.outcome, 'unconfirmed');
+  assert.match(result.reason, /queue-timeout/, 'the reason the supervisor records as fallbackReason');
+  assert.equal(result.neverStarted, true);
+  assert.equal(result.retryElsewhere, true, 'so the supervisor runs it locally instead (see the die-midstream fallback below)');
+  assert.equal(fs.existsSync(marker), false, 'the runner never started the command');
 });
 
 test('queue timeout: a user cancel while queued (deadline still pending) exits 130, never falls back locally, and the runner ticket is cancelled -- not queue-timeout', async () => {
@@ -595,9 +605,9 @@ test('queue timeout: a user cancel while queued (deadline still pending) exits 1
 });
 
 test('queue timeout: with no remoteQueueTimeoutMs configured, a busy runner broker is not treated as expired -- the run still dispatches remotely once the runner frees up', async () => {
-  const { env, state, repoDir, runnerState } = setup();
-  fs.mkdirSync(runnerState, { recursive: true });
-  const pauseFile = path.join(runnerState, 'PAUSE');
+  const s = seam('tee');
+  fs.mkdirSync(s.runnerState, { recursive: true });
+  const pauseFile = path.join(s.runnerState, 'PAUSE');
   fs.writeFileSync(pauseFile, 'kept busy for the test');
   setTimeout(() => {
     try {
@@ -606,54 +616,43 @@ test('queue timeout: with no remoteQueueTimeoutMs configured, a busy runner brok
       // already gone
     }
   }, 600);
-  const marker = path.join(tmpDir('marker'), 'where');
-  const { id, waited } = await detachAndWait(
-    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
-    env,
-    repoDir,
-    '180s',
-  );
-  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
-  assert.equal(fs.readFileSync(marker, 'utf8'), 'remote', 'no queueTimeoutMs was configured, so the ticket must never have expired');
-  const result = resultOf(state, id);
-  assert.equal(result.executor, 'remote');
+  const { result, marker } = await seamDispatch(s);
+  assert.equal('queueTimeoutMs' in readCapturedHeader(s.teePath), false, 'I6: an unconfigured timeout never rides in the header');
+  assert.equal(result.outcome, 'confirmed', 'no queueTimeoutMs was configured, so the ticket must never have expired');
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
 });
 
 test('BRAIN-320 review fix D: with remoteQueueTimeoutMs configured, an optionless lane skips an old-style (protocol-2-less) runner and falls back local', async () => {
-  const { env, state, repoDir } = setup({ ssh: 'old-runner', remoteQueueTimeoutMs: 300 });
-  const marker = path.join(tmpDir('marker'), 'where');
-  const { id, waited } = await detachAndWait(
-    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
-    env,
-    repoDir,
-  );
-  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
-  assert.equal(fs.readFileSync(marker, 'utf8'), 'local', 'an old runner cannot honour remoteQueueTimeoutMs, so selection must skip it');
-  const result = resultOf(state, id);
-  assert.equal(result.executor, 'local');
-  assert.match(result.fallbackReason, /does not support protocol 2/);
+  const enriched = { repoId: 'r', lane: 'default', remote: {}, resources: {}, weight: 1 };
+  const configured = { ...DEFAULT_GLOBAL_CONFIG, remoteQueueTimeoutMs: 300 };
+  assert.equal(needsProtocol2(enriched.remote), false, 'an optionless lane needs no protocol 2 of its own');
+  assert.equal(remoteSelectOptions(enriched, DEFAULT_GLOBAL_CONFIG, tmpDir('opts')).requireProtocol2, false);
+  // only a 0.7.0+, protocol-2-capable runner honours a queue timeout -- an older one silently ignores it
+  const opts = remoteSelectOptions(enriched, configured, tmpDir('opts'));
+  assert.equal(opts.requireProtocol2, true, 'remoteQueueTimeoutMs alone requires protocol 2');
+  const s = seam('old-runner');
+  const picked = await selectRunner([s.runner], { ...s.select, requireProtocol2: opts.requireProtocol2 });
+  assert.equal(picked.runner, null, 'an old runner cannot honour remoteQueueTimeoutMs, so selection must skip it');
+  assert.match(picked.skipped[0].reason, /does not support protocol 2/);
 });
 
 test('mixed versions: a v1 (optionless) lane still dispatches remotely against the same old-style probe', async () => {
-  const { env, state, repoDir } = setup({ ssh: 'old-runner' });
-  const marker = path.join(tmpDir('marker'), 'where');
-  const { id, waited } = await detachAndWait(
-    ['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)],
-    env,
-    repoDir,
-  );
-  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  const s = seam('old-runner');
+  const picked = await selectRunner([s.runner], { ...s.select, requireProtocol2: false });
+  assert.equal(picked.runner?.name, 'skybox', 'an optionless lane keeps using a runner that predates `protocols`');
+  const { result, marker } = await seamDispatch(s);
+  assert.equal(result.outcome, 'confirmed');
+  assert.equal(result.result.protocol, 1);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'remote');
-  const result = resultOf(state, id);
-  assert.equal(result.executor, 'remote');
 });
 
 // ---- BRAIN-341: a remote attempt's waitedMs is queue wait, never the run's own duration ----
 
 test('remote run: waitedMs records the wait before the command started, not the ~2.5s the command ran', async () => {
   const { env, state, repoDir } = setup();
-  // Long enough that the ssh connect + runner startup the formula counts as wait (seconds under load) stays well under the run.
-  const runMs = 8000;
+  // The bound below scales with this test's own wall time, so the run only has to be long enough that a waitedMs
+  // which counted it would overshoot the bound by more than the measurement noise.
+  const runMs = 4000;
   const cmd = ['node', '-e', `setTimeout(() => process.exit(0), ${runMs});`];
   const submittedAt = Date.now();
   const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...cmd], env, repoDir);
@@ -686,8 +685,8 @@ test('remote run: a result that lands 6s after the run ended does not count the 
 
 test('remote run: a result from a runner that reports no queuedMs still gets a waitedMs (the BRAIN-341 formula)', { timeout: 240_000 }, async () => {
   const { env, state, repoDir } = setup({ ssh: 'legacy-result' });
-  // Long enough that the ssh connect + runner startup the formula counts as wait (seconds under load) stays well under the run.
-  const runMs = 8000;
+  // As above: the bound scales with this test's own wall time, so the run only has to beat the measurement noise.
+  const runMs = 4000;
   const cmd = ['node', '-e', `setTimeout(() => process.exit(0), ${runMs});`];
   const submittedAt = Date.now();
   const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...cmd], env, repoDir);
@@ -738,12 +737,14 @@ test('BRAIN-437: ssh dropped after the runner took the job, fetches all failing,
   assert.equal(readAttempt(state, id), null);
 });
 
-test('BRAIN-437: the same drop with a runner that confirms `withdrawn` falls back to local, once', { timeout: 300_000 }, async () => {
-  const { env, repoDir } = setup({ ssh: 'drop-withdrawn' });
-  const marker = path.join(tmpDir('marker'), 'where');
-  const { waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 7)], env, repoDir, '90s');
-  assert.equal(waited.code, 7, `stderr: ${waited.stderr}`);
-  assert.equal(fs.readFileSync(marker, 'utf8'), 'local');
+test('BRAIN-437: the same drop with a runner that confirms `withdrawn` is proven never-started, so it is safe to run locally -- once', async () => {
+  const s = seam('drop-withdrawn');
+  const { result, marker } = await seamDispatch(s, { exit: 7, canWithdraw: true });
+  assert.equal(result.outcome, 'unconfirmed');
+  assert.match(result.reason, /confirmed it never started the ticket/);
+  assert.equal(result.neverStarted, true);
+  assert.equal(result.retryElsewhere, true, 'the one local re-run this licenses is driven end to end by the die-midstream test above');
+  assert.equal(fs.existsSync(marker), false, 'the runner never ran it');
 });
 
 test('BRAIN-452: a fresh oversized weight is refused with exit 64 even for a remote-eligible lane, before anything is enqueued', async () => {
