@@ -1304,6 +1304,7 @@ work-stealing restricted to tasks that have not started; a started task is never
 |---|---|
 | `LANE_BROKER_EXECUTOR` | `remote` when the command (and `remoteDeps` / `remoteSetup`) runs on a runner; `local` otherwise. |
 | `LANE_BROKER_RUNNER` | On a runner: the runner's name as the submitter's `runners[]` config names it, carried in the dispatch header (`runnerName`). Never set for a local run; absent when the submitter is older than 0.45.0, in which case only `LANE_BROKER_EXECUTOR` is exported. |
+| `LANE_BROKER_RUNNER_SPEED_FACTOR` | On a runner: that runner's `speedFactor` from the submitter's `runners[]` config (carried as `runnerSpeedFactor`, a number in (0, 4]), so a repo can scale test time budgets on slow runners. Never set for a local run; absent when the runner has no `speedFactor` or the submitter is older than this feature. |
 
 Both are set by the broker, so a value exported in the caller's shell is replaced. `LANE_BROKER_LOCAL_REASON` is unchanged. The two
 variables reach the `remoteDeps` install and so are part of its deps-cache key.

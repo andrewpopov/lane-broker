@@ -1188,6 +1188,8 @@ async function dispatchOnce(opts) {
   const header = { protocol, ticketId, generation, repoKey, lane, weight, cpuCores, memoryBytes, argv, relCwd };
   // BRAIN-597: the runner's name in THIS submitter's config, exported to the command as LANE_BROKER_RUNNER (additive; an older runner ignores it).
   header.runnerName = runner.name;
+  // BRAIN-901: exported as LANE_BROKER_RUNNER_SPEED_FACTOR so a repo can scale test time budgets (additive; an older runner ignores it).
+  if (runner.speedFactor !== undefined) header.runnerSpeedFactor = runner.speedFactor;
   if (protocol === 2) {
     if (Array.isArray(remoteDeps) && remoteDeps.length > 0) header.remoteDeps = remoteDeps;
     if (Array.isArray(remoteSetup) && remoteSetup.length > 0) header.remoteSetup = remoteSetup;

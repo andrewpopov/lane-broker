@@ -62,7 +62,7 @@ export const SESSION_ENV_NAMES = new Set(['SSH_CONNECTION', 'SSH_CLIENT', 'SSH_T
 export const PER_RUN_PATH_ENV_NAMES = ['TMPDIR', 'TMP', 'TEMP'];
 
 /** BRAIN-597: the documented executor contract (README "Environment a lane command sees"): reaches the install, and is hashed with the rest of the env. */
-const EXECUTOR_CONTRACT_ENV_NAMES = new Set(['LANE_BROKER_EXECUTOR', 'LANE_BROKER_RUNNER']);
+const EXECUTOR_CONTRACT_ENV_NAMES = new Set(['LANE_BROKER_EXECUTOR', 'LANE_BROKER_RUNNER', 'LANE_BROKER_RUNNER_SPEED_FACTOR']);
 
 const isScrubbed = (name) => !EXECUTOR_CONTRACT_ENV_NAMES.has(name) && (SCRUBBED_ENV_NAMES.has(name) || SCRUBBED_ENV_PREFIXES.some((p) => name.startsWith(p)));
 
