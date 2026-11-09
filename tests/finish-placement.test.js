@@ -285,16 +285,17 @@ test('selectRunner finish: a window closing during the predicted wait + run skip
   assert.deepEqual(names(unscheduled), ['fast', 'slow']);
 });
 
-test('selectRunner finish: a model that cannot rank leaves today\'s expected-run window check, behind the probe', async () => {
-  const probes = { fast: probe(0, ROOM), slow: probe(0, LESS_ROOM) };
+test('selectRunner finish: with a model, today\'s expected-run window check still skips a runner before it is probed', async () => {
+  const probes = { slow: probe(0, LESS_ROOM) };
   const res = await select(probes, [scheduled('fast'), makeRunner({ ssh: 'slow' })], {
     now: NOW,
     expectedRunMs: 600_000,
     finishModel: modelOf({}),
   });
-  assert.equal(res.runner.name, 'slow', 'fast has more free CPU and would win today\'s idle ranking');
+  assert.equal(res.runner.name, 'slow');
   assert.equal('scores' in res, false);
   assert.match(reasonFor(res, 'fast'), /window closes at 2026-10-11T20:05:00\.000Z, before the expected 600s run/);
+  assert.doesNotMatch(reasonFor(res, 'fast'), /probe/, 'fast has no probe answer, so probing it would have shown up as a probe failure');
 });
 
 test('selectRunner finish: a runner outside its window is still skipped before it is probed', async () => {

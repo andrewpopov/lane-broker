@@ -713,10 +713,10 @@ const estimateMsOf = (model, runner) => {
 };
 
 /** What `selectRunner` needs to judge a ticket: its protocol, and its reservation (shared by a first attempt and a rebind). */
-export function remoteSelectOptions(enriched, globalCfg, root = stateHome(), cpuLimit) {
+export function remoteSelectOptions(enriched, globalCfg, root = stateHome(), cpuLimit, historyRows = null) {
   // BRAIN-533: history is read only when some runner has a schedule that could make the expected run time matter.
   const scheduled = (globalCfg.runners || []).some((r) => r.schedule);
-  const expectedMs = scheduled ? expectedRunMs(readHistoryRows(paths(root).history), enriched.repoId, enriched.lane) : null;
+  const expectedMs = scheduled ? expectedRunMs(historyRows ?? readHistoryRows(paths(root).history), enriched.repoId, enriched.lane) : null;
   // BRAIN-597: first placement, rebind and rebalance all select through here, so a down runner is skipped by every one of them.
   const downRunners = downRunnerReasons(root, globalCfg);
   return {
@@ -757,8 +757,9 @@ export function rebalanceFinishAllows({ destScore, sourceEstimateMs, position, d
  * BRAIN-899: all four rank by predicted finish; only the place path may also queue on a busy runner.
  */
 export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHome(), stuckLocally = false, localBlocked = false, draining = false, cpuLimit, queuedMove = null } = {}) {
-  const base = remoteSelectOptions(enriched, globalCfg, root, cpuLimit);
-  const finishModel = finishModelFor(enriched, globalCfg, readHistoryRows(paths(root).history));
+  const rows = readHistoryRows(paths(root).history);
+  const base = remoteSelectOptions(enriched, globalCfg, root, cpuLimit, rows);
+  const finishModel = finishModelFor(enriched, globalCfg, rows);
   // a move or rebind picks a better home for a ticket that already has one
   if (kind === 'rebind') return { ...base, maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0, allowBusyQueue: localBlocked, finishModel };
   if (kind === 'rebalance' && queuedMove) {
@@ -1368,15 +1369,18 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
           // BRAIN-899 R5: a scored destination must also beat staying put by the gain; a drain or the refusal deadline is ungated
           const sourceEstimateMs = estimateMsOf(idleOptions.finishModel, runner);
           const finishAllows = (result) => rebalanceFinishAllows({ destScore: scoreOf(result, result.runner), sourceEstimateMs, position: sourceFacts?.position, draining, refusalCapElapsed: refusalCapElapsed?.() });
-          const eligible = picked.runner && hasMeasuredHeadroom(picked.probe);
-          target = eligible && finishAllows(picked) ? { runner: picked.runner, probe: picked.probe } : null;
-          if (target || draining || refusalCapElapsed?.()) return target;
+          const idleTarget = picked.runner && hasMeasuredHeadroom(picked.probe) ? { runner: picked.runner, probe: picked.probe } : null;
+          target = idleTarget && finishAllows(picked) ? idleTarget : null;
+          if (target || draining) return target;
+          // at the refusal deadline an idle destination the gain gate turned down is taken after all: refusal is the worse outcome
+          if (refusalCapElapsed?.()) return (target = idleTarget);
           // BRAIN-888: behind another ticket's reservation with no idle runner on offer, a short non-idle queue elsewhere can be better
           const stuckBehindOwner = globalCfg.remoteRebalanceQueuedMax > 0 && sourceFacts?.position >= 1 && sourceFacts.behindOtherOwner === true && sourceFacts.reservationOwnerWaitedMs >= globalCfg.remoteRebalanceMinQueuedMs;
           if (!stuckBehindOwner) return null;
           const queued = await selectRunner(candidates, selectionOptionsFor('rebalance', enriched, globalCfg, { draining, root, cpuLimit, queuedMove: { position: sourceFacts.position, sourceRunner: runner } }));
           // the cap may have run out while the probes were out: refusal must stay reachable
-          if (!queued.runner || refusalCapElapsed?.()) return null;
+          if (refusalCapElapsed?.()) return (target = idleTarget);
+          if (!queued.runner) return null;
           if (!finishAllows(queued)) return null;
           const viaQueue = queued.queuedChoice === true;
           if (!viaQueue && !hasMeasuredHeadroom(queued.probe)) return null;

@@ -245,9 +245,8 @@ function neverFits(reservation, probe) {
  * protocol-1 header even when `remoteQueueTimeoutMs` made this true.
  *
  * `opts.now` (ms, default the clock) and `opts.expectedRunMs` (BRAIN-533): a runner outside its `schedule` window is skipped before it is
- * probed, as is one whose window closes before `now + expectedRunMs`; no `expectedRunMs` places normally. BRAIN-899: with a
- * `finishModel` that second check moves behind the probe, so it can judge the window against the predicted wait + run instead
- * (and against `expectedRunMs` when the model turns out not to rank after all).
+ * probed, as is one whose window closes before `now + expectedRunMs`; no `expectedRunMs` places normally. BRAIN-899: a ranked
+ * call also drops, after the probe, a runner whose window closes before its own predicted wait + run.
  *
  * `opts.downRunners` (BRAIN-597): `{ [runner name]: skip reason }` for runners unreachable long enough to be skipped without probing.
  *
@@ -325,8 +324,7 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason: 'outside schedule' });
       continue;
     }
-    // BRAIN-899: a scored call judges the closing window against this runner's own predicted wait + run, which the probe is needed for.
-    if (!scoring && window.closesAt !== null && Number.isFinite(opts.expectedRunMs) && now + opts.expectedRunMs > window.closesAt) {
+    if (window.closesAt !== null && Number.isFinite(opts.expectedRunMs) && now + opts.expectedRunMs > window.closesAt) {
       skipped.push({ name: runner.name, reason: `schedule window closes at ${new Date(window.closesAt).toISOString()}, before the expected ${Math.round(opts.expectedRunMs / 1000)}s run` });
       continue;
     }
@@ -439,15 +437,11 @@ export async function selectRunner(runners, opts = {}) {
     for (const cand of [...pool, ...busySeq.filter((c) => !pooled.has(c))]) {
       const estimate = ranked ? estimateOf(cand.runner) : null;
       const waitMs = estimate === null ? null : runnerWaitMs({ probe: cand.probe, estimateMs: estimate.ms, room: cand.idle });
-      const needMs = estimate === null ? (Number.isFinite(opts.expectedRunMs) ? opts.expectedRunMs : null) : waitMs + estimate.ms;
-      if (cand.closesAt === null || needMs === null || now + needMs <= cand.closesAt) continue;
-      const closes = new Date(cand.closesAt).toISOString();
-      const tooLate =
-        estimate === null
-          ? `before the expected ${Math.round(needMs / 1000)}s run`
-          : `before the predicted ${Math.round(needMs / 1000)}s finish (wait ${Math.round(waitMs / 1000)}s + run ${Math.round(estimate.ms / 1000)}s)`;
+      if (estimate === null || cand.closesAt === null) continue;
+      const needMs = waitMs + estimate.ms;
+      if (now + needMs <= cand.closesAt) continue;
       dropped.add(cand);
-      skipped.push({ name: cand.runner.name, reason: `schedule window closes at ${closes}, ${tooLate}` });
+      skipped.push({ name: cand.runner.name, reason: `schedule window closes at ${new Date(cand.closesAt).toISOString()}, before the predicted ${Math.round(needMs / 1000)}s finish (wait ${Math.round(waitMs / 1000)}s + run ${Math.round(estimate.ms / 1000)}s)` });
     }
   }
   const liveBusy = busySeq.filter((cand) => !dropped.has(cand));
