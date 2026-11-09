@@ -1550,3 +1550,38 @@ test('PKG-277: remoteDepsCacheKeyFiles needs protocol 2, the safe flag and an ar
     assert.match(result.reason, /invalid remoteDepsCacheKeyFiles/, name);
   }
 });
+
+test('BRAIN-926: remoteDepsCacheKeyFilesCoverInstallScripts needs protocol 2, the safe flag, key files and exactly true', async () => {
+  const keyed = { remoteSetup: [[process.execPath, '-e', 'process.exit(0)']], remoteDepsCacheRootScriptsSafe: true, remoteDepsCacheKeyFiles: ['a.txt'] };
+  const cover = /invalid remoteDepsCacheKeyFilesCoverInstallScripts/;
+  const cases = {
+    'protocol 1': [{ protocol: 1, remoteDepsCacheKeyFilesCoverInstallScripts: true }, cover],
+    // the key files themselves are refused first, on their own check, but the header is rejected all the same
+    'no safe flag': [{ protocol: 2, remoteSetup: keyed.remoteSetup, remoteDepsCacheKeyFiles: ['a.txt'], remoteDepsCacheKeyFilesCoverInstallScripts: true }, /invalid remoteDepsCacheKeyFiles/],
+    'no key files': [{ protocol: 2, remoteSetup: keyed.remoteSetup, remoteDepsCacheRootScriptsSafe: true, remoteDepsCacheKeyFilesCoverInstallScripts: true }, cover],
+    string: [{ protocol: 2, ...keyed, remoteDepsCacheKeyFilesCoverInstallScripts: 'true' }, cover],
+    one: [{ protocol: 2, ...keyed, remoteDepsCacheKeyFilesCoverInstallScripts: 1 }, cover],
+    null: [{ protocol: 2, ...keyed, remoteDepsCacheKeyFilesCoverInstallScripts: null }, cover],
+    false: [{ protocol: 2, ...keyed, remoteDepsCacheKeyFilesCoverInstallScripts: false }, cover],
+  };
+  for (const [name, [fields, reason]] of Object.entries(cases)) {
+    const { env } = freshShadowEnv();
+    const root = tmpDir('remote-exec-root');
+    const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+    const header = makeHeader(fields);
+    const { code } = await runOne(header, entries, { env, root, src });
+    assert.equal(code, 0, name);
+    const result = await getResult(header.ticketId, root, env);
+    assert.equal(result.kind, 'rejected', name);
+    assert.match(result.reason, reason, name);
+  }
+
+  const { env } = freshShadowEnv();
+  const root = tmpDir('remote-exec-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ protocol: 2, ...keyed, remoteDepsCacheKeyFilesCoverInstallScripts: true });
+  assert.equal((await runOne(header, entries, { env, root, src })).code, 0);
+  const accepted = await getResult(header.ticketId, root, env);
+  assert.equal(accepted.kind, 'completed', JSON.stringify(accepted));
+  assert.equal(accepted.exit, 0);
+});

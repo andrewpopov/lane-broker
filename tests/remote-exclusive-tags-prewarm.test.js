@@ -162,6 +162,16 @@ test('prewarm: sends the flagged lane to every online runner as `true` at low pr
   assert.equal((await run(['--runner', 'c'], { cwd, cfg, dispatch })).out.length, 1);
 });
 
+test('prewarm: BRAIN-926 never sends remoteDepsCacheKeyFilesCoverInstallScripts, because it does not probe the runner', async () => {
+  const cwd = prewarmRepo({ warm: { weight: 1, remoteSetup: SETUP, prewarm: true, remoteDepsCacheRootScriptsSafe: true, remoteDepsCacheKeyFiles: ['gen-input.txt'], remoteDepsCacheKeyFilesCoverInstallScripts: true } });
+  const calls = [];
+  const dispatch = async (opts) => (calls.push(opts), { outcome: 'confirmed', exitCode: 0 });
+  const res = await run([], { cwd, cfg: { runners: [{ name: 'a', ssh: 'a' }] }, dispatch });
+  assert.equal(res.exitCode, 0, res.err.join('\n'));
+  assert.deepEqual(calls[0].remoteDepsCacheKeyFiles, ['gen-input.txt']);
+  assert.equal('remoteDepsCacheKeyFilesCoverInstallScripts' in calls[0], false);
+});
+
 test('prewarm: a failed warm-up exits 1 and names the runner; --dry-run dispatches nothing', async () => {
   const cwd = prewarmRepo({ warm: { weight: 1, remoteSetup: SETUP, prewarm: true } });
   const cfg = { runners: [{ name: 'a', ssh: 'a' }] };

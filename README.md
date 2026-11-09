@@ -888,11 +888,34 @@ ordinary low-priority ticket on the runner (not preempted by later work).
   `remoteExclude` removes (both are config errors); each path must exist in
   the snapshot or the cache skips. A workspace repository whose lock has a
   dependency install script keeps keying the whole source tree and ignores the
-  list; without one, the list replaces the whole-tree key. The field rides in
+  list, unless the lane also sets
+  `remoteDepsCacheKeyFilesCoverInstallScripts` (below); without one, the list
+  replaces the whole-tree key. The field rides in
   the protocol-2 header only with the safe flag, and the lane is placed only
   on runners advertising `deps-key-files/1` (an older runner would ignore the
   field and key without it); `lane runner prewarm` does not probe, so warm
   such a lane only on upgraded runners.
+- `remoteDepsCacheKeyFilesCoverInstallScripts` (BRAIN-926): `true` extends that
+  key-files list to a workspace repository whose lockfile has a dependency
+  install script, which otherwise keys the whole source tree on every commit.
+  It requires `remoteDepsCacheKeyFiles` (and so
+  `remoteDepsCacheRootScriptsSafe: true`), and defaults to `false`. Setting it
+  is a trust contract: the listed paths must be **every** repository input
+  that the root *and* the dependency install scripts read, transitively —
+  schemas, generators, config, vendored sources — and no install script may
+  read an unkeyed external input (a network fetch of unpinned content, another
+  checkout, host state). Anything those scripts read that is not listed, and
+  not already in the key (the lockfile, every `package.json`, the install
+  environment), can serve a stale cached tree; publication only detects
+  *writes* outside dependency trees, never an omitted read. A key path holding
+  a symlink below it is refused (`key: null`), because the digest hashes the
+  link text rather than its target's bytes. The covered key carries its own
+  marker, so it never collides with a non-covered one over the same files.
+  The field rides in the protocol-2 header only when the lane sets it *and*
+  the chosen runner advertises `deps-key-files/2`; it adds no placement
+  requirement, so a `deps-key-files/1` runner still takes the lane and simply
+  keys the whole tree. `lane runner prewarm` does not probe and therefore
+  never sends it: warming keys the whole tree.
 - `remoteSetup`: argv arrays run in the repo root after deps, before the
   command.
 - `remoteExclude` (BRAIN-642): an array of at most 64 patterns (each at most 256 characters) naming paths to leave out of
@@ -972,7 +995,7 @@ reason.
   form is refused. A workspace with a lifecycle script, `binding.gyp` or lock
   install script is always ineligible, even with `remoteDepsCacheRootScriptsSafe`.
   The key covers the discovered set and each workspace's path, lock entry and
-  whole `package.json` (canonical JSON). A workspace declaring `bin` is refused until its executable links can be restored. In a workspace repo, when a dependency has an install script, or the lane declares root scripts safe, the key also covers repository source bytes and executable modes outside `.git` and `node_modules` (PKG-277: a safe lane with `remoteDepsCacheKeyFiles` and no dependency install script keys only those paths instead; a repo without workspaces keys only its `remoteDepsCacheKeyFiles` and is refused without them). Source links escaping that keyed tree are refused; an install that writes outside dependency trees still cannot publish a cache entry.
+  whole `package.json` (canonical JSON). A workspace declaring `bin` is refused until its executable links can be restored. In a workspace repo, when a dependency has an install script, or the lane declares root scripts safe, the key also covers repository source bytes and executable modes outside `.git` and `node_modules` (PKG-277: a safe lane with `remoteDepsCacheKeyFiles` and no dependency install script keys only those paths instead; a repo without workspaces keys only its `remoteDepsCacheKeyFiles` and is refused without them; BRAIN-926: a safe lane that also sets `remoteDepsCacheKeyFilesCoverInstallScripts` keys only those paths even with a dependency install script, adds a `key-files-cover` marker so its key cannot collide with a non-covered one, and is refused if a key path holds a symlink below it). Source links escaping that keyed tree are refused; an install that writes outside dependency trees still cannot publish a cache entry.
   The store holds only installed packages, never the workspace symlinks or
   sources, and records which workspaces had a nested `node_modules`: a hit
   recreates each `node_modules/<name>` link (relative, as `npm ci` makes it)

@@ -1568,3 +1568,50 @@ test('key-files: PKG-277 in a workspace repo a dependency install script keys th
   fs.writeFileSync(path.join(noScript.root, 'gen-input.txt'), 'two');
   assert.notEqual(keyed(noScript).key, listed.key);
 });
+
+const INSTALL_SCRIPT_LOCK = () => workspaceLockPackages({ 'node_modules/x': { ...REGISTRY_ENTRY('1.0.0'), hasInstallScript: true } });
+
+test('key-files-cover: BRAIN-926 a covered workspace repo with a dependency install script keys only its key files', () => {
+  const f = makeWorkspaceKeyFixture({ lockPackages: INSTALL_SCRIPT_LOCK(), scripts: { postinstall: 'node gen.js' } });
+  fs.writeFileSync(path.join(f.root, 'gen-input.txt'), 'one');
+  const covered = () => computeDepsKey({ ...f.inputs(), rootScriptsSafe: true, keyFiles: ['gen-input.txt'], keyFilesCoverInstallScripts: true });
+  const base = covered();
+  assert.ok(base.key, base.reason);
+  fs.writeFileSync(path.join(f.root, 'unlisted.txt'), 'x');
+  assert.equal(covered().key, base.key, 'an unrelated source change leaves a covered key unchanged');
+  fs.writeFileSync(path.join(f.root, 'gen-input.txt'), 'two');
+  const edited = covered().key;
+  assert.notEqual(edited, base.key, 'a key-file change changes it');
+  fs.writeFileSync(path.join(f.root, 'gen-input.txt'), 'one');
+  assert.equal(covered().key, base.key);
+
+  for (const cover of [undefined, false]) {
+    const whole = () => computeDepsKey({ ...f.inputs(), rootScriptsSafe: true, keyFiles: ['gen-input.txt'], ...(cover === undefined ? {} : { keyFilesCoverInstallScripts: cover }) });
+    const before = whole();
+    assert.ok(before.key, before.reason);
+    assert.notEqual(covered().key, before.key, `cover=${String(cover)} never collides with a covered key over the same tree`);
+    fs.writeFileSync(path.join(f.root, 'unlisted.txt'), `y-${String(cover)}`);
+    assert.notEqual(whole().key, before.key, `cover=${String(cover)} still keys the whole tree`);
+  }
+});
+
+test('key-files-cover: BRAIN-926 a missing key file still refuses, and a nested symlink under a key path refuses only when covered', () => {
+  const missing = makeWorkspaceKeyFixture({ lockPackages: INSTALL_SCRIPT_LOCK(), scripts: { postinstall: 'node gen.js' } });
+  assert.deepEqual(
+    computeDepsKey({ ...missing.inputs(), rootScriptsSafe: true, keyFiles: ['gen-input.txt'], keyFilesCoverInstallScripts: true }),
+    { key: null, reason: 'remoteDepsCacheKeyFiles path gen-input.txt is not in the snapshot' },
+    'a covered lane gets no whole-tree fallback',
+  );
+
+  const f = makeWorkspaceKeyFixture({ lockPackages: INSTALL_SCRIPT_LOCK(), scripts: { postinstall: 'node gen.js' } });
+  fs.mkdirSync(path.join(f.root, 'gen'));
+  fs.writeFileSync(path.join(f.root, 'unlisted.txt'), 'target');
+  fs.symlinkSync(path.join(f.root, 'unlisted.txt'), path.join(f.root, 'gen', 'link.txt'));
+  const keyFiles = ['gen'];
+  const linked = computeDepsKey({ ...f.inputs(), rootScriptsSafe: true, keyFiles, keyFilesCoverInstallScripts: true });
+  assert.equal(linked.key, null);
+  assert.match(linked.reason, /refuses symlink gen\/link\.txt under a key path/);
+  const plain = computeDepsKey({ ...f.inputs(), rootScriptsSafe: true, keyFiles });
+  assert.ok(plain.key, plain.reason);
+  assert.equal(plain.key, computeDepsKey({ ...f.inputs(), rootScriptsSafe: true }).key, 'an uncovered lane keeps keying the whole tree, nested symlink and all');
+});

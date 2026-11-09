@@ -9,6 +9,9 @@ import { gitRevParse } from './run.js';
  * lane's snapshot to each runner with the command `true` at LOW priority, so the runner's own broker runs the setup through the same
  * path a real ticket takes and leaves its per-machine caches warm. It is opt-in per lane and never automatic: nothing schedules it yet.
  * Give it a dedicated lane with the same setup.
+ *
+ * BRAIN-926: prewarm never probes a runner, so it cannot know whether that runner supports `deps-key-files/2`; it therefore omits
+ * `remoteDepsCacheKeyFilesCoverInstallScripts` and warming keys the whole source tree, whatever the lane declares.
  */
 
 const PREWARM_WEIGHT = 1;

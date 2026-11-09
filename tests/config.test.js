@@ -439,6 +439,33 @@ test('PKG-277 remoteDepsCacheKeyFiles rejects bad shapes, a lane without the saf
   assert.deepEqual(resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' }).remoteDepsCacheKeyFiles, ['a.txt']);
 });
 
+test('BRAIN-926 remoteDepsCacheKeyFilesCoverInstallScripts resolves false, is inherited, and needs keyFiles and a boolean', () => {
+  const { base } = freshEnv();
+  const repoDir = path.join(base, 'cover-key-files');
+  const keyed = { remoteDeps: ['.'], remoteDepsCacheRootScriptsSafe: true, remoteDepsCacheKeyFiles: ['gen-input.txt'] };
+  writeRepoConfig(repoDir, { version: 1, undeclaredLanes: { as: 'covered' }, lanes: {
+    default: { weight: 1 },
+    off: { weight: 1, ...keyed, remoteDepsCacheKeyFilesCoverInstallScripts: false },
+    covered: { weight: 1, ...keyed, remoteDepsCacheKeyFilesCoverInstallScripts: true },
+  } });
+  assert.equal(resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' }).remoteDepsCacheKeyFilesCoverInstallScripts, false, 'absent resolves false');
+  assert.equal(resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'off' }).remoteDepsCacheKeyFilesCoverInstallScripts, false);
+  for (const lane of ['covered', 'ad-hoc']) {
+    assert.equal(resolveTicketConfig({ cwd: repoDir, repo: 'r', lane }).remoteDepsCacheKeyFilesCoverInstallScripts, true, lane);
+  }
+
+  const rejected = (lane, pattern) => {
+    const { base: b } = freshEnv();
+    const dir = path.join(b, 'bad-cover');
+    writeRepoConfig(dir, { version: 1, lanes: { default: { weight: 1, ...lane } } });
+    assert.throws(() => resolveTicketConfig({ cwd: dir, repo: 'r', lane: 'default' }), pattern, JSON.stringify(lane));
+  };
+  rejected({ remoteDepsCacheRootScriptsSafe: true, remoteDepsCacheKeyFilesCoverInstallScripts: true }, /remoteDepsCacheKeyFilesCoverInstallScripts requires remoteDepsCacheKeyFiles/);
+  rejected({ ...keyed, remoteDepsCacheKeyFilesCoverInstallScripts: 'true' }, /remoteDepsCacheKeyFilesCoverInstallScripts must be a boolean/);
+  rejected({ ...keyed, remoteDepsCacheKeyFilesCoverInstallScripts: 1 }, /remoteDepsCacheKeyFilesCoverInstallScripts must be a boolean/);
+  rejected({ remoteDepsCacheKeyFilesCoverInstallScripts: true, remoteDepsCacheKeyFiles: ['a.txt'] }, /requires remoteDepsCacheRootScriptsSafe: true/);
+});
+
 test('floorOvershootCores (BRAIN-740) defaults to 6, accepts 0 and rejects a negative', () => {
   assert.equal(DEFAULT_GLOBAL_CONFIG.floorOvershootCores, 6);
   for (const [value, ok] of [[0, true], [-1, false]]) {

@@ -198,6 +198,10 @@ function validateHeaderFields(header) {
   if (header.remoteDepsCacheKeyFiles !== undefined && (header.protocol !== 2 || header.remoteDepsCacheRootScriptsSafe !== true || !isValidDepsKeyFilesShape(header.remoteDepsCacheKeyFiles))) {
     return { ok: false, reason: 'invalid remoteDepsCacheKeyFiles' };
   }
+  // BRAIN-926: the covered-key assertion only ever rides with those key files, as exactly `true`.
+  if (header.remoteDepsCacheKeyFilesCoverInstallScripts !== undefined && (header.protocol !== 2 || header.remoteDepsCacheRootScriptsSafe !== true || !isValidDepsKeyFilesShape(header.remoteDepsCacheKeyFiles) || header.remoteDepsCacheKeyFilesCoverInstallScripts !== true)) {
+    return { ok: false, reason: 'invalid remoteDepsCacheKeyFilesCoverInstallScripts' };
+  }
   // BRAIN-320 S1d: opt-in on both protocols -- an old runner simply ignores
   // an unknown field, which is fine (the feature is opt-in), but THIS
   // runner, once it understands the field at all, validates it the same way
@@ -643,6 +647,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
         enabled: header.remoteDepsCache !== false && runnerCfg.remoteDepsCache,
         rootScriptsSafe: header.remoteDepsCacheRootScriptsSafe === true,
         keyFiles: header.remoteDepsCacheKeyFiles ?? [],
+        keyFilesCoverInstallScripts: header.remoteDepsCacheKeyFilesCoverInstallScripts === true,
         root: path.join(remoteRootAbs, 'deps-cache'),
         maxBytes: runnerCfg.remoteDepsCacheMaxBytes,
       },
