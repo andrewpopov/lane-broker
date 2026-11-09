@@ -730,9 +730,13 @@ What a remote run does:
 
    **Runner vs runner (BRAIN-899).** The runners themselves are compared the
    same way: each candidate scores `wait + run + 60 s` overhead, where `run` is
-   this repo+lane+command's median on that runner (else that repo+lane, else
-   another runner's evidence scaled by their `speedFactor`s) and `wait` is
-   serial and conservative — 0 on an idle runner with room, else
+   this repo+lane+command's median on that runner (else that repo+lane's job
+   class — BRAIN-916: the sorted env assignments that are neither per-run values
+   nor names taking more than 8 distinct values in that repo+lane's history, so a
+   train shard or tier keeps its own median while a changed-file list or a sha
+   cannot split it; else that repo+lane; else another runner's evidence scaled by
+   their `speedFactor`s) and `wait` is serial and conservative — 0 on an idle
+   runner with room, else
    `(queued + 1) x run`. So a fast runner with a queue can beat a slow idle one,
    and on this path a busy runner (empty queue, no headroom) is queueable too.
    All or nothing: one candidate without an estimate leaves the whole selection
