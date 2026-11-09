@@ -294,11 +294,12 @@ test('queued rebalance: the cumulative refusal cap still counts from the first q
 });
 
 test('A1 at decision time: a cap that runs out while the non-idle probes are out leaves the refusal reachable (76, no queued move)', T, async () => {
-  const ctx = refusedStuckSetup({ cap: 2500 });
+  // The cap must run out during the second slow probe; both scale together so a slow spawn on a loaded runner still fits two.
+  const ctx = refusedStuckSetup({ cap: 6500 });
   const id = await ctx.start();
   await execArrived(ctx, 'a');
   const probeBefore = ctx.fake.count('probe b');
-  ctx.fake.setProbe('b', { ...QUEUED_B, delayMs: 1500 });
+  ctx.fake.setProbe('b', { ...QUEUED_B, delayMs: 4000 });
   const waited = await ctx.finish(id, '60s');
   assert.equal(waited.code, 76, `${waited.stderr}\n${ctx.fake.calls().join(',')}`);
   assert.ok(ctx.fake.count('probe b') - probeBefore >= 2, 'the selections really ran');
