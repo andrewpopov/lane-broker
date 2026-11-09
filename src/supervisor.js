@@ -1267,6 +1267,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       // BRAIN-380 §6: the tier BEFORE any cap, and the wait this ticket has accrued on THIS host's priority clock. The
       // runner re-anchors from the wait, never from our timestamps, so clock skew between hosts cannot matter.
       priorityRequested: enriched.priorityRequested,
+      group: enriched.group,
       ...classTransport(enriched, resolveClasses(globalCfg, root)),
       priorityAccruedMs: waitedMs(enriched, effectiveNow(root)),
       resultWaitMs: globalCfg.remoteResultWaitMs,

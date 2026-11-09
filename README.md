@@ -90,6 +90,7 @@ features like pipes or globbing.
 | `--memory <size>` | Override the lane's memory reservation, e.g. `768MiB` or `4GiB`. |
 | `--id <ticket-id>` | With `--detach` only: a client-supplied ticket id (`[A-Za-z0-9._-]`, up to 128 chars) that makes the submission idempotent. An id the broker already knows (queued, leased, finished or mid remote attempt) is returned as the same ticket: no new queue sequence and, for a remote-eligible lane, no second dispatch (the check runs before any probe). A remote-eligible lane needs a UUID id. |
 | `--priority high\|medium\|low` | BRAIN-380 priority tier (default `medium`). Beats env `LANE_BROKER_PRIORITY`, which beats the lane's `priority` in `.lane-broker.json` (an `undeclaredLanes.as` template passes its tier on), which beats `medium`. Any invalid value from any of the three exits `64`. See "Priority (foundations)" below. |
+| `--group <id>` | BRAIN-894: shards of one job share one slot of the per-repo high cap (see "The high cap"). Invalid id exits `64`. |
 | `--exclusive` | BRAIN-403 v1: claim the whole host for this run. A maintenance class (host upgrade, calibration), not a way to run tests: it requires both `--exclusive-purpose` and `--exclusive-deadline` (exit `64` without). See "Exclusive lanes (BRAIN-403 v1)" below. The lane config key `lanes.<name>.exclusive: true` does the same. |
 | `--exclusive-purpose upgrade\|calibration` | BRAIN-695: why the run needs the whole host. Config key `exclusivePurpose`. Without `--exclusive` it exits `64`. |
 | `--exclusive-deadline <dur>` | BRAIN-695: the hard limit on an exclusive run, from 60000 ms to 2 h: an integer in ms, or `30s`, `20m`, `2h`. Config key `exclusiveDeadlineMs` (integer ms). Without `--exclusive` it exits `64`. Not `--timeout`, which only stops *waiting* (exit `75`). |
@@ -2278,6 +2279,12 @@ A high at or over the cap is admitted as `medium`: the record keeps `priorityReq
 `priorityAdmitted: medium`, `priorityDemoted: true`, and `lane run` prints
 `lane run: priority high demoted to medium (repo already has a queued high ticket)` to stderr. A demoted ticket does
 not hold the slot. The cap is recorded in legacy mode too, but it only reorders anything behind the scheduler fence.
+
+**Shards share a slot.** `lane run --group <id>` (1-128 characters of `A-Za-z0-9._:/-`, else exit `64`; BRAIN-894) marks a ticket
+as one shard of a job. Queued highs of one repo that share a `group` occupy a single slot of the cap, so a high joining
+a queued high of its own group stays high, while a different group, or no group, counts as its own slot as before. The
+group rides in the remote header and a runner advertising `priority-group/1` applies it; an older runner ignores it and
+caps the shard on its own. `lane status` prints `group=<id>` on the queue line.
 The lane child sees the admitted tier in `LANE_BROKER_PRIORITY`.
 
 **The cap is per broker.** Remote dispatch happens before the local enqueue, and every runner has its own broker and

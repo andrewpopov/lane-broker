@@ -535,6 +535,7 @@ test('remote-probe advertises elastic-claims/1', () => {
     'scrub-command-env/1',
     'reuse-green/1',
     'deps-key-files/1',
+    'priority-group/1',
     'blob-cache/1',
   ]);
 });

@@ -9,7 +9,7 @@ import { receiveArtifacts, artifactLimitsOf } from './remote-artifacts.js';
 import { DEFAULT_GLOBAL_CONFIG, repoIdentity } from './config.js';
 import { isCacheable, isBlobHash } from './remote-blobs.js';
 import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
-import { isPriorityTier } from './priority.js';
+import { isPriorityTier, isValidGroupId } from './priority.js';
 import { runnerAvailability } from './runner-schedule.js';
 import { sanitizeDrainReason, RUNNER_SHUTDOWN_REASON, DEAD_QUEUED_SUPERVISOR_REASON } from './state.js';
 import { readinessProbeArgs, readinessGap } from './runner-readiness.js';
@@ -1111,6 +1111,8 @@ async function dispatchOnce(opts) {
     // clock. Additive header fields: an older runner ignores them, so its ticket is simply medium.
     priorityRequested,
     priorityAccruedMs,
+    // BRAIN-894: the job this ticket is a shard of; an older runner ignores it and caps the shard on its own
+    group,
     // BRAIN-321: the class the submitter resolved; only a sim / a required lane ever sends them (absent = byte-identical header)
     laneClass,
     classEnforcement,
@@ -1208,6 +1210,7 @@ async function dispatchOnce(opts) {
   if (classEnforcement === 'required') header.classEnforcement = 'required';
   if (isPriorityTier(priorityRequested)) header.priorityRequested = priorityRequested;
   if (Number.isInteger(priorityAccruedMs) && priorityAccruedMs >= 0) header.priorityAccruedMs = priorityAccruedMs;
+  if (isValidGroupId(group)) header.group = group;
 
   // BRAIN-642: the have-query. Any failure or timeout leaves `cached` empty and `transferCache` false: every body is sent, gzip or
   // plain by the runner's OTHER capability. The two capabilities are independent.

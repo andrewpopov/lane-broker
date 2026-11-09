@@ -17,7 +17,7 @@ import { blobNamespace, evictBlobs, acquireBlobLeases, haveBlobs, isBlobHash, is
 import { reportReadiness } from './runner-readiness.js';
 import { NO_PROGRESS_REASON, SILENCE_REASON } from './no-progress.js';
 import { artifactLimitsOf, collectArtifacts, encodeArtifacts, pruneStaleArtifacts } from './remote-artifacts.js';
-import { remotePriorityFrom } from './priority.js';
+import { isValidGroupId, remotePriorityFrom } from './priority.js';
 import { detectResourceCapacity, effectiveWeightCapacity, cpuBudgetCores } from './resources.js';
 import { makeReader, readHeaderLine, extractFrames, MAX_HEADER_BYTES } from './remote-stream.js';
 import { runCommand } from './run.js';
@@ -210,6 +210,7 @@ function validateHeaderFields(header) {
   if (header.noProgressTimeoutMs !== undefined && !(Number.isInteger(header.noProgressTimeoutMs) && header.noProgressTimeoutMs >= 0)) {
     return { ok: false, reason: 'invalid noProgressTimeoutMs' };
   }
+  if (header.group !== undefined && !isValidGroupId(header.group)) return { ok: false, reason: 'invalid group' };
   // BRAIN-576: the submitter's resolved silence timeout, same additive shape
   if (header.silenceTimeoutMs !== undefined && !(Number.isInteger(header.silenceTimeoutMs) && header.silenceTimeoutMs >= 0)) {
     return { ok: false, reason: 'invalid silenceTimeoutMs' };
@@ -661,6 +662,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     expectClass: { laneClass: header.laneClass, classEnforcement: header.classEnforcement },
     priority: remotePriority.priority,
     priorityAccruedMs: remotePriority.accruedMs,
+    group: header.group,
     weightOverride: header.weight,
     cpuOverride: header.cpuCores,
     minCpuOverride: header.minCpuCores,

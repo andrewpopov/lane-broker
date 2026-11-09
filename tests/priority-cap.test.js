@@ -87,6 +87,32 @@ test('cap: a high from a DIFFERENT repo is not demoted, and a non-high ticket is
   assert.deepEqual([low.priorityAdmitted, low.priorityDemoted], ['low', false]);
 });
 
+test('cap: two highs of the same group both stay high under cap 1; a different group or no group is demoted', async () => {
+  const { state } = freshEnv();
+  const a = await enqueue(state, ticket('a', 'r1', 'high', { group: 'job-1' }), cfgWith());
+  const b = await enqueue(state, ticket('b', 'r1', 'high', { group: 'job-1' }), cfgWith());
+  const c = await enqueue(state, ticket('c', 'r1', 'high', { group: 'job-2' }), cfgWith());
+  const d = await enqueue(state, ticket('d', 'r1', 'high'), cfgWith());
+  const otherRepo = await enqueue(state, ticket('e', 'r2', 'high', { group: 'job-1' }), cfgWith());
+  assert.deepEqual([a, b, c, d, otherRepo].map((t) => t.priorityAdmitted), ['high', 'high', 'medium', 'medium', 'high']);
+  assert.equal(queued(state).b.group, 'job-1', 'the group is persisted');
+});
+
+test('cap: a grouped high does not join an ungrouped high, and cap 1 with a full group still demotes a stranger', async () => {
+  const { state } = freshEnv();
+  await enqueue(state, ticket('a', 'r1', 'high'), cfgWith());
+  const joiner = await enqueue(state, ticket('b', 'r1', 'high', { group: 'job-1' }), cfgWith());
+  assert.deepEqual([joiner.priorityAdmitted, joiner.priorityDemoted], ['medium', true]);
+});
+
+test('cap: with cap 2, a group counts as one slot', async () => {
+  const { state } = freshEnv();
+  const cfg = cfgWith({ maxQueuedHighPerRepo: 2 });
+  const admitted = [];
+  for (const [id, group] of [['a', 'g'], ['b', 'g'], ['c', undefined], ['d', 'h'], ['e', 'g']]) admitted.push((await enqueue(state, ticket(id, 'r1', 'high', { group }), cfg)).priorityAdmitted);
+  assert.deepEqual(admitted, ['high', 'high', 'high', 'medium', 'high']);
+});
+
 test('cap: maxQueuedHighPerRepo 0 demotes every high; 2 admits two', async () => {
   const zero = freshEnv();
   for (const id of ['a', 'b']) {

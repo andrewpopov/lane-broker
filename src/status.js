@@ -283,6 +283,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       position: i + 1,
       waitedMs: now - t.createdAt,
       priority: tier,
+      ...(t.group ? { group: t.group } : {}),
       ...(t.id === reservationOwnerId ? { reservationOwner: true } : {}),
       ...(classPolicy.capEnforced.has(t.id) ? { classDenied: classPolicy.capEnforced.get(t.id) } : {}),
       ...(t.exclusive === true ? { exclusive: true } : {}),
@@ -673,7 +674,7 @@ export function renderStatusText(status) {
     lines.push('  (none)');
   } else {
     for (const q of status.queued) {
-      const tier = q.priority ? `  priority=${q.priority}${q.effectiveRank ? ` (aged to ${q.effectiveRank})` : ''}` : '';
+      const tier = q.priority ? `  priority=${q.priority}${q.effectiveRank ? ` (aged to ${q.effectiveRank})` : ''}${q.group ? ` group=${q.group}` : ''}` : '';
       lines.push(`  #${q.position} ${q.id}  key=${q.key}${q.cpuEstimate ? `  cpu~${q.cpuEstimate.cores.toFixed(2)}(${q.cpuEstimate.source})` : ''}  waited=${fmtMs(q.waitedMs)}${tier}${q.reservationOwner ? '  [reservation owner]' : ''}${q.exclusive ? '  [exclusive]' : ''}${q.express ? '  [express]' : ''}${q.wait ? `  waiting: ${q.wait.label}` : ''}`);
     }
   }

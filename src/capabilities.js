@@ -39,6 +39,9 @@ export const SCRUB_COMMAND_ENV_CAPABILITY = 'scrub-command-env/1';
 // PKG-277: a runner keys `remoteDepsCacheKeyFiles` into the deps cache key; an older one ignores the header field and would key without them.
 export const DEPS_KEY_FILES_CAPABILITY = 'deps-key-files/1';
 
+// BRAIN-894: a runner reads the header's `group`, so shards of one job share one slot of its per-repo high cap.
+export const PRIORITY_GROUP_CAPABILITY = 'priority-group/1';
+
 /** The ONE list: `lane remote-probe` advertises it and `lane capabilities --json` prints it. */
 export const CAPABILITIES = [
   ELASTIC_CLAIMS_CAPABILITY,
@@ -59,6 +62,7 @@ export const CAPABILITIES = [
   SCRUB_COMMAND_ENV_CAPABILITY,
   REUSE_GREEN_CAPABILITY,
   DEPS_KEY_FILES_CAPABILITY,
+  PRIORITY_GROUP_CAPABILITY,
 ];
 
 /** `CAPABILITIES` plus what depends on this host's config: `blob-cache/1` only while the runner blob store is enabled, `cpu-limit/1` only when `cpuLimit` is not "off" and its probe passed, `enforced-leases/1` on top of that unless `memoryLimit` is "off". */

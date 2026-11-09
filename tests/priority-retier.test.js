@@ -222,6 +222,18 @@ test('record.id mismatch is its own reason, and writes nothing (A2)', async () =
 
 // ---- the re-tier itself ----
 
+test('retier respects the group: a medium joins a queued same-group high, a stranger is demoted', async () => {
+  const fx = fenced();
+  const cfg = cfgWith();
+  await enqueue(fx.state, ticket('a', 'r1', 'high', { group: 'job-1' }), cfg);
+  await enqueue(fx.state, ticket('b', 'r1', 'medium', { group: 'job-1' }), cfg);
+  await enqueue(fx.state, ticket('c', 'r1', 'medium', { group: 'job-2' }), cfg);
+  assert.equal((await retierQueued(fx.state, 'b', 'high', cfg)).outcome, 'retiered');
+  assert.equal((await retierQueued(fx.state, 'c', 'high', cfg)).after.priorityDemoted, true);
+  const after = queued(fx.state);
+  assert.deepEqual([after.b.priorityAdmitted, after.c.priorityAdmitted], ['high', 'medium']);
+});
+
 test('success: the tier changes in place; seq, filename, age and every other file stay byte-identical; one log line', async () => {
   const fx = fenced();
   const cfg = cfgWith();

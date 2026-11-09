@@ -190,6 +190,33 @@ test('runner: absent fields mean medium, and the runner shell\'s own LANE_BROKER
   assert.deepEqual([row.priorityRequested, row.priorityAdmitted, row.priorityDemoted], ['medium', 'medium', false]);
 });
 
+// ---- BRAIN-894: a group shares one slot of the runner's high cap ----
+
+test('remote: --group rides in the header, and a bad one is refused before any ticket exists', async () => {
+  const ctx = remoteSetup();
+  const result = await laneRun(['run', '--lane', 'default', '--priority', 'high', '--group', 'train:job-1', '--', ...noopCmd], { env: ctx.env, cwd: ctx.repoDir });
+  assert.equal(result.code, 0, result.stderr);
+  assert.equal(ctx.header().group, 'train:job-1');
+  const { env, state, root } = runnerEnvAndRoot();
+  const run = await remoteExec({ group: 'bad group!' }, { env, root });
+  assert.match(run.err, /invalid group/);
+  assert.equal(fs.existsSync(paths(state).history), false, 'nothing ran');
+});
+
+test('runner: highs of one group share the cap slot while queued; an ungrouped high is demoted', async () => {
+  const { env, state, root } = runnerEnvAndRoot();
+  writeGlobalConfig(env.LANE_BROKER_HOME, { sampleMs: 50, capacity: 4, priorityAgingMs: 60_000 });
+  writeLease(state, { id: 'held', key: 'x:held', bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight: 4, state: LEASE_STATE.RUNNING });
+  const runs = [];
+  for (const [i, group] of [[1, 'job-1'], [2, 'job-1'], [3, undefined]]) {
+    runs.push(remoteExec({ priorityRequested: 'high', group }, { env, root }));
+    await waitFor(() => listQueue(state).length === i, { timeoutMs: 20_000 });
+  }
+  assert.deepEqual(listQueue(state).map((t) => [t.group ?? null, t.priorityAdmitted]), [['job-1', 'high'], ['job-1', 'high'], [null, 'medium']]);
+  removeLease(state, 'held');
+  for (const run of await Promise.all(runs)) assert.equal(run.code, 0, run.err);
+});
+
 // ---- fallback to local: the origin is the local one, nothing added ----
 
 test('fallback to local: the local ticket enqueues with its OWN origin, the remote wait is not added on top', async () => {
