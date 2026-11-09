@@ -591,7 +591,7 @@ test('repo config carrying exclusiveHooks (top level or on a lane) is refused th
 test('the exclusive/1 capability is advertised and --exclusive is in the lane usage text', () => {
   assert.ok(CAPABILITIES.includes('exclusive/1'));
   const lane = fs.readFileSync(new URL('../bin/lane.js', import.meta.url), 'utf8');
-  assert.match(lane, /\[--priority high\|medium\|low\] \[--exclusive \[--exclusive-purpose upgrade\|calibration\] \[--exclusive-deadline <dur>\]\]/);
+  assert.match(lane, /\[--priority high\|medium\|low\] \[--group <id>\] \[--exclusive \[--exclusive-purpose upgrade\|calibration\] \[--exclusive-deadline <dur>\]\]/);
   assert.match(lane, /case '--exclusive':/);
 });
 
