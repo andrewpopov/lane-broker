@@ -14,6 +14,7 @@ import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.
 import { listQueue } from './scheduler.js';
 import { writePending } from './pending.js';
 import { stampPriorityOrigin } from './priority-clock.js';
+import { isValidGroupId } from './priority.js';
 import { detectResourceCapacity, leaseResources, resolveTicketResources, capUnapprovedCpu, checkResourceBudget, localSimRefusal, dispatchOnlyRefusal, locallyRefusedNow } from './resources.js';
 import { hostOnlyPaths, hostPathsRefusal } from './host-paths.js';
 import { acceptedLocalReason, localReasonRefusal } from './local-reason.js';
@@ -309,6 +310,8 @@ export async function runCommand({
   // BRAIN-380: the raw `--priority` value (validated here, exit 64), or the tier a caller that must
   // not read this process's env pins (`lane remote-exec` passes 'medium').
   priority: priorityOverride,
+  // BRAIN-894: shards of one job share one slot of the per-repo high cap (validated here, exit 64).
+  group,
   // BRAIN-380 §6: wait a submitter already accrued (`lane remote-exec` only; validated there). The origin is anchored
   // on THIS host's priority clock, minus that wait, so the other host's wall clock never enters.
   priorityAccruedMs = 0,
@@ -422,6 +425,10 @@ export async function runCommand({
       return { exitCode: 64 };
     }
     throw err;
+  }
+  if (group !== undefined && !isValidGroupId(group)) {
+    process.stderr.write('lane run: --group must be 1-128 characters of A-Z a-z 0-9 . _ : / -\n');
+    return { exitCode: 64 };
   }
   const weight = weightOverride ?? resolved.weight;
   // A bad/missing global config must never block enqueueing a lane — it
@@ -783,6 +790,7 @@ export async function runCommand({
     createdAt: Date.now(),
     priorityRequested: priority,
     priorityAdmitted: priority,
+    ...(group !== undefined ? { group } : {}),
     prioOriginAt,
     logPath,
     resultPath,

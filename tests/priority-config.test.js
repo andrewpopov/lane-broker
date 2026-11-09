@@ -157,6 +157,17 @@ test('lane run --priority with an invalid or missing value exits 64 and enqueues
   }
 });
 
+test('lane run --group with an invalid or missing value exits 64; a valid one runs', async () => {
+  const { env, repoDir } = setup();
+  for (const args of [['--group', ''], ['--group'], ['--group', 'has space'], ['--group', 'x'.repeat(129)], ['--group', 'a;b']]) {
+    const result = await laneRun(['run', '--repo', 'r', ...args, '--', 'true'], { env, cwd: repoDir });
+    assert.equal(result.code, 64, `${JSON.stringify(args)}: ${result.stderr}`);
+    assert.match(result.stderr, /--group must be/);
+  }
+  const ok = await laneRun(['run', '--repo', 'r', '--group', 'train:job-1.a/b_c-d', '--', 'true'], { env, cwd: repoDir });
+  assert.equal(ok.code, 0, ok.stderr);
+});
+
 test('an invalid LANE_BROKER_PRIORITY exits 64; --priority overrides it', async () => {
   const { env, repoDir } = setup();
   const bad = { ...env, LANE_BROKER_PRIORITY: 'urgent' };

@@ -175,9 +175,11 @@ export function existingTicket(root, id, { ownerGeneration = null } = {}) {
  * BRAIN-380 §7: the per-repo high cap, the ONE place it is decided (enqueue and `retierQueued` both call it). A `requested`
  * high is admitted high while fewer than `maxQueuedHighPerRepo` tickets of `repoId` are queued admitted-high with a live
  * supervisor, else it is demoted to medium. `excludeId` is the ticket being re-tiered: it must not count against itself.
+ * BRAIN-894: tickets sharing a non-empty `group` (the shards of one job) occupy ONE slot, so a high joining a queued high
+ * of its own group is admitted; an ungrouped ticket is its own slot.
  * Caller holds the lock, so two racing callers cannot both read "no high queued".
  */
-export function admitTier(root, repoId, requested, cfg, excludeId = null) {
+export function admitTier(root, repoId, requested, cfg, excludeId = null, group = null) {
   let demoted = false;
   if (requested === 'high') {
     const queuedHigh = listQueue(root).filter(
@@ -188,8 +190,9 @@ export function admitTier(root, repoId, requested, cfg, excludeId = null) {
         t.priorityRequested === 'high' &&
         t.priorityAdmitted === 'high' &&
         isSupervisorAlive({ supervisorPid: t.supervisorPid, supervisorStart: t.supervisorStart }),
-    ).length;
-    demoted = queuedHigh >= cfg.maxQueuedHighPerRepo;
+    );
+    const slots = new Set(queuedHigh.map((t) => (t.group ? `group:${t.group}` : `ticket:${t.id}`)));
+    demoted = !(group && slots.has(`group:${group}`)) && slots.size >= cfg.maxQueuedHighPerRepo;
   }
   return { priorityAdmitted: demoted ? 'medium' : requested, priorityDemoted: demoted };
 }
@@ -212,7 +215,7 @@ export async function enqueue(root, ticket, cfg = DEFAULT_GLOBAL_CONFIG, { owner
     // BRAIN-380 §7: the high cap, per broker. It shares this lock with the seq allocation and the queue write below,
     // so two racing enqueues cannot both read "no high queued". Across lanes and worktrees. A queued high whose supervisor
     // is dead does not hold the slot, but is not reaped here: enqueue must not mutate other tickets' state (tryStart reaps).
-    const { priorityAdmitted, priorityDemoted } = admitTier(root, ticket.repoId, priorityRequested, cfg);
+    const { priorityAdmitted, priorityDemoted } = admitTier(root, ticket.repoId, priorityRequested, cfg, null, ticket.group);
     const seq = nextSeq(root);
     const record = {
       // BRAIN-362: the record keeps the DECLARED claim; the cap is derived at read time (listQueueCapped, tryStart) against the current budget
@@ -520,7 +523,7 @@ export async function retierQueued(root, id, tier, cfg, { reloadConfig = (c) => 
     if (isQueuedSupervisorGone(record)) return refuse('supervisor-gone');
 
     const before = { priorityRequested: record.priorityRequested, priorityAdmitted: record.priorityAdmitted, priorityDemoted: record.priorityDemoted };
-    const after = { priorityRequested: tier, ...admitTier(root, record.repoId, tier, reloadConfig(cfg), id) };
+    const after = { priorityRequested: tier, ...admitTier(root, record.repoId, tier, reloadConfig(cfg), id, record.group) };
     if (before.priorityRequested === after.priorityRequested && before.priorityAdmitted === after.priorityAdmitted && before.priorityDemoted === after.priorityDemoted) {
       return { outcome: 'unchanged', reason: null, before, after };
     }

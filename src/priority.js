@@ -21,6 +21,12 @@ export function isPriorityTier(value) {
   return typeof value === 'string' && Object.hasOwn(TIER_BASE, value);
 }
 
+/** BRAIN-894: `lane run --group <id>`; shards of one job share one slot of the per-repo high cap. */
+const GROUP_ID_RE = /^[A-Za-z0-9._:/-]{1,128}$/;
+export function isValidGroupId(value) {
+  return typeof value === 'string' && GROUP_ID_RE.test(value);
+}
+
 /** Ordering of the tiers: a higher rank outranks a lower one. */
 export function tierRank(tier) {
   return isPriorityTier(tier) ? TIER_BASE[tier] : TIER_BASE[DEFAULT_PRIORITY];
