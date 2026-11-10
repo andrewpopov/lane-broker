@@ -746,6 +746,26 @@ What a remote run does:
    predicted/actual wait ratio at 0.92 against 2.79 for a whole run per ticket
    ahead. So a fast runner with a queue can beat a slow idle one, and on this
    path a busy runner (empty queue, no headroom) is queueable too.
+   Those medians read a **14-day window** of this repo's history — taken from the
+   tail of `history.jsonl`, so the window and not a byte cap decides coverage,
+   and filtered to this repo's raw lines before any of them is parsed — and each
+   covers the **newest 20** matching runs, so a month-old run cannot outvote
+   recent ones and the job classes above are the window's, not all time's. Rows
+   are appended when they end, so the backward read skips a row older than the
+   window and stops only at one that ended more than 24 h before it. The same
+   windowed rows give the schedule pre-check its expected run time (the lane's
+   p90); a window that yields no p90 (no run, or only failed or cancelled ones)
+   falls back to the full history there, so the lane keeps the exclusions it has
+   always had.
+   A ranked selection estimates the whole field at **one tier** — the most
+   specific at which every candidate has evidence, own or donor-scaled — because
+   comparing runners like for like beats mixing one runner's exact evidence with
+   another's repo-lane one; settling on a donor-scaled tier is intended. Since any
+   runner's evidence reaches the others through the donor rule, the common tier
+   is the most specific one ANY runner has: two exact runs on one runner put the
+   whole field on its speedFactor-scaled number. Place and rebind rank this way;
+   both rebalance passes keep per-runner estimates, because their gain gate costs
+   the source per runner.
    All or nothing: one candidate without an estimate leaves the whole selection
    on the old ranking (idle first, then fewest queued). Moving a ticket already
    queued on a runner also needs `destFinish < 0.75 x position x E_source`; a

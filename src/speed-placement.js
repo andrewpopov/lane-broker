@@ -127,9 +127,9 @@ const speedOf = (runner) => (Number.isFinite(runner?.speedFactor) && runner.spee
 /** The fewest successful remote runs of a (repo, lane) on one runner that stand in for a command never run there. */
 export const MIN_REPO_LANE_ROWS = 3;
 
-/** Successful (`exit === 0`, finite duration) remote wall times on `runner` of the rows `match` accepts. */
-const remoteRunMs = (rows, runnerName, match) =>
-  rows.filter((r) => r?.executor === 'remote' && r?.runner === runnerName && r?.exit === 0 && Number.isFinite(r.runMs) && r.runMs > 0 && match(r)).map((r) => r.runMs);
+/** The successful (`exit === 0`, finite duration) remote runs on `runner` of the rows `match` accepts. */
+const remoteRuns = (rows, runnerName, match) =>
+  rows.filter((r) => r?.executor === 'remote' && r?.runner === runnerName && r?.exit === 0 && Number.isFinite(r.runMs) && r.runMs > 0 && match(r));
 
 export const MAX_CLASS_VALUES = 8;
 export const MIN_CLASS_ROWS = 2;
@@ -165,16 +165,26 @@ export function jobClass(command, sameLaneRows) {
   return classKey(command, lowCardinalityNames(Array.isArray(sameLaneRows) ? sameLaneRows : []));
 }
 
+/** How far back a run estimate looks (BRAIN-899 B2): what a runner does today, not what it did a month ago. */
+export const RUN_ESTIMATE_WINDOW_MS = 14 * 24 * 3_600_000;
+
+/** BRAIN-899 B2: a tier's median covers the newest this many matching rows, so a stale run cannot outvote recent ones. */
+export const NEWEST_RUN_ROWS = 20;
+
+const startedAtOf = (row) => (Number.isFinite(row?.startedAt) ? row.startedAt : 0);
+
+/** The median runMs of the newest NEWEST_RUN_ROWS rows by `startedAt`, and how many rows that median covers. */
+function newestRunMedian(runRows) {
+  const newest = [...runRows].sort((a, b) => startedAtOf(a) - startedAtOf(b)).slice(-NEWEST_RUN_ROWS);
+  return { ms: median(newest.map((r) => r.runMs)), n: newest.length };
+}
+
 /**
- * BRAIN-899: how long this ticket is expected to RUN on `runner`, in ms, from the broker's own history rows: the median of the
- * most specific evidence that holds up, first hit wins -- this repo+lane+command on `runner` (`pairingCommand`, so a per-run sha
- * or shard id does not split it, >= MIN_EXACT_RUNS runs); this repo+lane+`jobClass` on `runner` (>= MIN_CLASS_ROWS runs); this
- * repo+lane on `runner` (>= MIN_REPO_LANE_ROWS runs); any of those on the OTHER configured runner with the most matching rows
- * (ties: config order), scaled by its `speedFactor` over `runner`'s and named as the `donor`. No evidence anywhere: null, and the
- * caller keeps today's ranking. `job` is { repo, lane, command }.
+ * The tiers a run estimate tries, most specific first, over the rows it is given (a placement caller passes a windowed, single-repo
+ * tail, so the class cardinality below is measured on those same rows): each is the predicate that matches it and the fewest
+ * matching runs that make it evidence. A `match` of null is a tier that cannot apply to this job. `job` is { repo, lane, command }.
  */
-export function runnerRunEstimateMs(rows, runner, job, runners) {
-  const history = Array.isArray(rows) ? rows : [];
+function runEstimateTiers(history, job) {
   const command = typeof job?.command === 'string' && job.command.trim() !== '' ? pairingCommand(job.command) : null;
   const sameLane = command === null ? null : history.filter((r) => r?.repo === job.repo && r?.lane === job.lane);
   const classNames = sameLane === null ? null : lowCardinalityNames(sameLane);
@@ -184,33 +194,72 @@ export function runnerRunEstimateMs(rows, runner, job, runners) {
     if (!classKeys.has(cmd)) classKeys.set(cmd, classKey(cmd, classNames));
     return classKeys.get(cmd);
   };
-  const tiers = [
+  return [
     { tier: 'exact', min: MIN_EXACT_RUNS, match: command === null ? null : (r) => r.repo === job.repo && r.lane === job.lane && typeof r.command === 'string' && pairingCommand(r.command) === command },
     { tier: 'class', min: MIN_CLASS_ROWS, match: jobClassKey === null ? null : (r) => r.repo === job.repo && r.lane === job.lane && typeof r.command === 'string' && classOf(r.command) === jobClassKey },
     { tier: 'repo-lane', min: MIN_REPO_LANE_ROWS, match: (r) => r.repo === job?.repo && r.lane === job?.lane },
   ];
+}
+
+/** One tier's evidence for `runner`: what its own matching runs give, and what the best donor's give scaled by their speedFactors. */
+function tierEvidence(history, { tier, min, match }, runner, others) {
+  if (match === null) return { own: null, donor: null };
+  const hit = (ms, n, donor) => (Number.isFinite(ms) && ms > 0 ? { ms: Math.round(ms), tier, n, ...(donor === null ? {} : { donor }) } : null);
+  const own = remoteRuns(history, runner?.name, match);
+  const ownMedian = own.length >= min ? newestRunMedian(own) : null;
+  let donor = null;
+  for (const other of others) {
+    const runs = remoteRuns(history, other.name, match);
+    if (runs.length >= min && (donor === null || runs.length > donor.runs.length)) donor = { name: other.name, speed: speedOf(other), runs };
+  }
+  const donorMedian = donor === null ? null : newestRunMedian(donor.runs);
+  return {
+    own: ownMedian === null ? null : hit(ownMedian.ms, ownMedian.n, null),
+    donor: donorMedian === null ? null : hit((donorMedian.ms * donor.speed) / speedOf(runner), donorMedian.n, donor.name),
+  };
+}
+
+const evidenceOf = (history, tiers, runner, runners) => {
   const others = (Array.isArray(runners) ? runners : []).filter((r) => r?.name && r.name !== runner?.name);
-  const hit = (ms, tier, n, donor) => (Number.isFinite(ms) && ms > 0 ? { ms: Math.round(ms), tier, n, ...(donor === null ? {} : { donor }) } : null);
-  for (const { tier, min, match } of tiers) {
-    if (match === null) continue;
-    const own = remoteRunMs(history, runner?.name, match);
-    if (own.length >= min) {
-      const got = hit(median(own), tier, own.length, null);
-      if (got) return got;
-    }
+  return tiers.map((spec) => tierEvidence(history, spec, runner, others));
+};
+
+/** The most specific evidence of one kind this runner has, or null. */
+const bestOf = (evidence, kind) => evidence.map((e) => e[kind]).find((got) => got !== null) ?? null;
+
+/**
+ * BRAIN-899: how long this ticket is expected to RUN on `runner`, in ms, from the broker's own history rows: the median of the
+ * most specific evidence that holds up, first hit wins -- this repo+lane+command on `runner` (`pairingCommand`, so a per-run sha
+ * or shard id does not split it, >= MIN_EXACT_RUNS runs); this repo+lane+`jobClass` on `runner` (>= MIN_CLASS_ROWS runs); this
+ * repo+lane on `runner` (>= MIN_REPO_LANE_ROWS runs); any of those on the OTHER configured runner with the most matching rows
+ * (ties: config order), scaled by its `speedFactor` over `runner`'s and named as the `donor`. Each median covers the newest
+ * NEWEST_RUN_ROWS matching rows. No evidence anywhere: null, and the caller keeps today's ranking. `job` is { repo, lane, command }.
+ */
+export function runnerRunEstimateMs(rows, runner, job, runners) {
+  const history = Array.isArray(rows) ? rows : [];
+  const evidence = evidenceOf(history, runEstimateTiers(history, job), runner, runners);
+  return bestOf(evidence, 'own') ?? bestOf(evidence, 'donor');
+}
+
+/**
+ * BRAIN-899 B3: what every runner in `candidates` is expected to run this ticket in, all at ONE tier -- the most specific at which
+ * EVERY one of them has evidence, own or donor-scaled -- so the field is compared like for like. Settling on a donor-scaled tier is
+ * intended: a common tier beats mixing one runner's exact evidence with another's repo-lane one. With no tier every candidate
+ * reaches, each keeps its own most specific estimate, which is `runnerRunEstimateMs`' answer. A runner with no evidence at any tier
+ * maps to null, and `selectRunner`'s all-or-nothing rule then keeps today's ranking. Returns Map<runner name, estimate | null>.
+ */
+export function runnerRunEstimatesMs(rows, candidates, job, runners) {
+  const history = Array.isArray(rows) ? rows : [];
+  const field = (Array.isArray(candidates) ? candidates : []).filter((r) => r?.name);
+  const tiers = runEstimateTiers(history, job);
+  const evidence = field.map((runner) => ({ name: runner.name, tiers: evidenceOf(history, tiers, runner, runners) }));
+  const atTier = (entry, i) => entry.tiers[i].own ?? entry.tiers[i].donor;
+  const common = evidence.length === 0 ? -1 : tiers.findIndex((_spec, i) => evidence.every((entry) => atTier(entry, i) !== null));
+  const estimates = new Map();
+  for (const entry of evidence) {
+    estimates.set(entry.name, common === -1 ? bestOf(entry.tiers, 'own') ?? bestOf(entry.tiers, 'donor') : atTier(entry, common));
   }
-  for (const { tier, min, match } of tiers) {
-    if (match === null) continue;
-    let donor = null;
-    for (const other of others) {
-      const values = remoteRunMs(history, other.name, match);
-      if (values.length >= min && (donor === null || values.length > donor.values.length)) donor = { name: other.name, speed: speedOf(other), values };
-    }
-    if (donor === null) continue;
-    const got = hit((median(donor.values) * donor.speed) / speedOf(runner), tier, donor.values.length, donor.name);
-    if (got) return got;
-  }
-  return null;
+  return estimates;
 }
 
 /** The probe's queue depth as the wait model reads it: anything that is not a positive integer counts as 0. */
