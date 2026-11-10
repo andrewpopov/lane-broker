@@ -5,9 +5,11 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, laneSpawn, waitFor, BIN } from './helpers.js';
 import { makeTmpDir } from './helpers/tmp.js';
-import { gcLeaseTmpDirs, retireLeaseTmpDir, createLeaseTmpDir, tmpBase, TMP_OWNER_FILE } from '../src/gc.js';
-import { writeLease } from '../src/lease.js';
+import { gcLeaseTmpDirs, maybeDailyGc, retireLeaseTmpDir, createLeaseTmpDir, tmpBase, TMP_OWNER_FILE } from '../src/gc.js';
+import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
+import { writeLease, readLease } from '../src/lease.js';
 import { paths, atomicWriteFile, processStartTime } from '../src/state.js';
+import { isPidAlive } from '../src/process-liveness.js';
 
 /**
  * BRAIN-937: every local run gets its own `lb-*` TMPDIR/TMP/TEMP dir under the tmp base, retired (renamed, then a detached rm)
@@ -16,6 +18,7 @@ import { paths, atomicWriteFile, processStartTime } from '../src/state.js';
 
 const HOUR = 3_600_000;
 const GREEN = [0, 0];
+const subdir = (base, prefix) => fs.mkdtempSync(path.join(base, prefix));
 const lbEntries = (base) => fs.readdirSync(base).filter((n) => n.startsWith('lb-'));
 
 /** One run's environment with its own tmp base, also installed in this process for the in-process helpers. */
@@ -184,7 +187,7 @@ test('LEASE_TMP_RETIRE_GUARDS: only a real lb-* dir under the base whose marker 
   retireLeaseTmpDir(outsideLb, { root: s.state, id: 'lease-a' });
   assert.equal(fs.existsSync(outsideLb), true, 'outside the base');
 
-  const remoteMarked = fs.mkdtempSync(path.join(s.tmpBase, 'lb-'));
+  const remoteMarked = subdir(s.tmpBase, 'lb-');
   atomicWriteFile(path.join(remoteMarked, TMP_OWNER_FILE), 'lease-a');
   retireLeaseTmpDir(remoteMarked, { root: s.state, id: 'lease-a' });
   assert.equal(fs.existsSync(remoteMarked), true, 'a remote-format marker');
@@ -238,7 +241,7 @@ test('LEASE_TMP_SWEEP_LIVE: a live lease, an ORPHANED lease, a live supervisor p
   const orphaned = leaseDir(s.tmpBase, s.state, { id: 'orphaned' });
   writeLease(s.state, { id: 'orphaned', state: 'ORPHANED' });
   const alive = leaseDir(s.tmpBase, s.state, { id: 'no-lease-but-alive', pid: process.pid, start: processStartTime(process.pid) });
-  const remote = fs.mkdtempSync(path.join(s.tmpBase, 'lb-'));
+  const remote = subdir(s.tmpBase, 'lb-');
   atomicWriteFile(path.join(remote, TMP_OWNER_FILE), 'some-remote-ticket');
   const when = new Date(Date.now() - 2 * HOUR);
   fs.utimesSync(path.join(remote, TMP_OWNER_FILE), when, when);
@@ -267,14 +270,29 @@ test('LEASE_TMP_SWEEP_SYMLINK: a symlink named lb-* is never followed', async ()
   assert.equal(fs.existsSync(path.join(target, 'scratch')), true);
 });
 
-test('LEASE_TMP_SWEEP_DEAD: an lb-dead-* dir whose marker is over an hour old is removed whatever its owner; a fresher one is kept', async () => {
+/** An lb-dead-* dir with NO marker and a read-only nested subtree, its own mtime set `ageMs` back. */
+function deadDir(base, ageMs) {
+  const dir = fs.mkdtempSync(path.join(base, 'lb-dead-'));
+  const nested = path.join(dir, 'a', 'b');
+  fs.mkdirSync(nested, { recursive: true });
+  fs.writeFileSync(path.join(nested, 'f'), 'x');
+  fs.chmodSync(path.join(nested, 'f'), 0o400);
+  fs.chmodSync(nested, 0o500);
+  fs.chmodSync(path.join(dir, 'a'), 0o500);
+  const when = new Date(Date.now() - ageMs);
+  fs.utimesSync(dir, when, when);
+  return dir;
+}
+
+test('LEASE_TMP_SWEEP_DEAD: an aged lb-dead-* dir with no marker and a read-only subtree is fully removed; a fresher one is kept', async () => {
   const s = setup();
-  const stale = leaseDir(s.tmpBase, s.state, { id: 'x', pid: process.pid, name: 'lb-dead-' });
-  const fresh = leaseDir(s.tmpBase, s.state, { id: 'y', pid: process.pid, name: 'lb-dead-', ageMs: 60_000 });
+  const stale = deadDir(s.tmpBase, 2 * HOUR);
+  const fresh = deadDir(s.tmpBase, 60_000);
   const summary = await gcLeaseTmpDirs(s.state);
   assert.equal(summary.tmpDead, 1);
   assert.equal(fs.existsSync(fresh), true);
   await settle([stale]);
+  spawnSync('chmod', ['-R', 'u+w', fresh]);
 });
 
 test('LEASE_TMP_SWEEP_DRY_RUN: reports and removes nothing', async () => {
@@ -283,4 +301,64 @@ test('LEASE_TMP_SWEEP_DRY_RUN: reports and removes nothing', async () => {
   assert.equal((await gcLeaseTmpDirs(s.state, { dryRun: true })).tmpDirs, 1);
   assert.equal(fs.existsSync(orphan), true);
   assert.equal(tmpBase(), s.tmpBase);
+});
+
+test('LEASE_TMP_MARKER_DELETED: a child that deletes its own marker still has its dir gone when lane run returns', async () => {
+  const s = setup();
+  const out = path.join(path.dirname(s.probe), 'tmpdir.txt');
+  const script = `const fs = require('fs'); fs.rmSync(process.env.TMPDIR + '/${TMP_OWNER_FILE}'); fs.writeFileSync(${JSON.stringify(out)}, process.env.TMPDIR)`;
+  const res = await laneRun(runArgs(['node', '-e', script]), { env: s.env, cwd: s.repoDir });
+  assert.equal(res.code, 0, res.stderr);
+  assert.equal(fs.existsSync(fs.readFileSync(out, 'utf8')), false);
+});
+
+test('LEASE_TMP_SWEEP_REAL_SUPERVISOR: the real marker keeps a live supervisor\'s dir, and collects it once the supervisor is SIGKILLed', async () => {
+  const s = setup();
+  const child = laneSpawn(runArgs(probeCommand(s.probe, 'hang')), { env: s.env, cwd: s.repoDir });
+  const closed = new Promise((resolve) => child.on('close', resolve));
+  const seen = await waitFor(() => (fs.existsSync(s.probe) ? readProbe(s.probe) : null), { timeoutMs: 15_000 });
+  const leaseFile = fs.readdirSync(paths(s.state).leases).find((n) => n.endsWith('.json'));
+  const lease = readLease(s.state, leaseFile.replace(/\.json$/, ''));
+  const marker = path.join(seen.TMPDIR, TMP_OWNER_FILE);
+  const aged = new Date(Date.now() - 2 * HOUR);
+  fs.utimesSync(marker, aged, aged);
+  fs.rmSync(path.join(paths(s.state).leases, leaseFile));
+
+  const alive = await gcLeaseTmpDirs(s.state);
+  assert.equal(alive.tmpDirs, 0, 'no lease record, but the marker\'s pid and start still match the running supervisor');
+  assert.equal(alive.tmpSkippedLive, 1);
+  assert.equal(fs.existsSync(seen.TMPDIR), true);
+
+  process.kill(lease.supervisorPid, 'SIGKILL');
+  process.kill(-lease.childPgid, 'SIGKILL');
+  child.kill('SIGKILL');
+  await closed;
+  await waitFor(() => !isPidAlive(lease.supervisorPid));
+  const dead = await gcLeaseTmpDirs(s.state);
+  assert.equal(dead.tmpDirs, 1);
+  assert.equal(fs.existsSync(seen.TMPDIR), false);
+});
+
+test('LEASE_TMP_SWEEP_PID_REUSE: a marker whose pid is alive but whose start differs is collected', async () => {
+  const s = setup();
+  const reused = leaseDir(s.tmpBase, s.state, { id: 'reused', pid: process.pid, start: 'Mon Jan  1 00:00:00 1990' });
+  assert.equal((await gcLeaseTmpDirs(s.state)).tmpDirs, 1);
+  assert.equal(fs.existsSync(reused), false);
+});
+
+test('LEASE_TMP_DAILY_GC: a due maybeDailyGc runs the sweep', async () => {
+  const s = setup();
+  const orphan = leaseDir(s.tmpBase, s.state, { id: 'gone' });
+  const result = await maybeDailyGc(s.state, DEFAULT_GLOBAL_CONFIG);
+  assert.equal(result.tmp.tmpDirs, 1);
+  assert.equal(fs.existsSync(orphan), false);
+});
+
+test('LEASE_TMP_GC_COMMAND: `lane gc` prints a tmp summary in its JSON line and collects the orphan', async () => {
+  const s = setup();
+  const orphan = leaseDir(s.tmpBase, s.state, { id: 'gone' });
+  const res = await laneRun(['gc', '--root', makeTmpDir('lease-tmp-remote-root-')], { env: s.env, cwd: s.repoDir });
+  assert.equal(res.code, 0, res.stderr);
+  assert.equal(JSON.parse(res.stdout).tmp.tmpDirs, 1);
+  assert.equal(fs.existsSync(orphan), false);
 });

@@ -2871,7 +2871,7 @@ What a run leaves behind is collected; what a live one owns never is. Everything
   supervisor's start, never on the admission path. A sweep that stops at its bound leaves the marker unclaimed so the next
   supervisor continues.
 - **Tmp dirs.** `remote-exec` writes `.lane-broker-owner` (the ticket id) inside each ticket's tmp dir. GC deletes a recorded
-  tmp dir only if it is a real `lb-*` directory directly under `/var/tmp` carrying a marker naming that ticket; a legacy
+  tmp dir only if it is a real `lb-*` directory directly under the tmp base (`LANE_BROKER_TMP_BASE`, default `/var/tmp`) carrying a marker naming that ticket; a legacy
   dir without a marker, or with another ticket's, is left and reported as `tmpSkipped`.
 - **Lease tmp dirs** (BRAIN-937). A local run's supervisor retires its own `lb-*` dir at lease end; one left by a supervisor that
   was killed outright (SIGKILL, power loss) is collected by a sweep of the tmp base, run from `lane gc` and the daily GC, at most
@@ -2880,7 +2880,7 @@ What a run leaves behind is collected; what a live one owns never is. Everything
   the base (never a symlink), its marker names this broker's state root, its id has no lease (an ORPHANED one counts), queue entry
   or attempt record (read strictly: an unreadable record aborts the sweep), its supervisor is dead (a failed probe counts as alive)
   and the marker is over an hour old. The `tmpDir` on a lease is display only and never trusted. Removal is a rename to
-  `lb-dead-*` inside the lock and a detached `rm` after it; an `lb-dead-*` dir is removed once its marker is over an hour old.
+  `lb-dead-*` inside the lock and a detached `rm` after it; an `lb-dead-*` dir (a name only the broker's own retire and sweep produce, after an ownership check) is removed on its name alone once the dir itself is over an hour old, read-only subtrees included. The supervisor retires its own dir even if the command deleted the marker; a marker that is present but names another root or id is refused.
 - **Threat model.** Accidental configuration (a symlinked directory, a stale recorded path, a custom log path) and ordinary
   concurrency between broker processes. A same-uid adversary swapping directories for symlinks during a sweep is out of scope:
   they can already delete anything that uid owns.

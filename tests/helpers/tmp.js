@@ -98,10 +98,10 @@ function removeAll() {
   created.clear();
 }
 
-export function makeTmpDir(prefix, t) {
+export function makeTmpDir(prefix, t, { manifest = true } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   created.add(dir);
-  fs.appendFileSync(manifestPath(), `${dir}\n`);
+  if (manifest) fs.appendFileSync(manifestPath(), `${dir}\n`);
   if (t) t.after(() => removeTmpDir(dir));
   if (!exitHookInstalled) {
     exitHookInstalled = true;
@@ -111,5 +111,6 @@ export function makeTmpDir(prefix, t) {
 }
 
 // BRAIN-937: the broker's per-run `lb-*` temp dirs live under LANE_BROKER_TMP_BASE (default /var/tmp). Every test file gets its own
-// base, so no test touches the real one and a leak is caught by the manifest like any other dir.
-process.env.LANE_BROKER_TMP_BASE = makeTmpDir('lane-broker-tmpbase-');
+// base, so no test touches the real one. It stays out of the manifest: the leak guard imports this file too, so its own base is
+// still alive while it checks.
+process.env.LANE_BROKER_TMP_BASE = makeTmpDir('lane-broker-tmpbase-', undefined, { manifest: false });

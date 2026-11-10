@@ -91,7 +91,7 @@ export function removeNow(targets) {
 /** Delete in a detached `rm`, for `remote-exec`: the submitter's ssh session must not wait on a multi-GB removal. */
 export function removeDetached(targets) {
   if (targets.length === 0) return;
-  const child = spawn('rm', ['-rf', '--', ...targets], { detached: true, stdio: 'ignore' });
+  const child = spawn('sh', ['-c', 'chmod -R u+w -- "$@" 2>/dev/null; rm -rf -- "$@"', 'sh', ...targets], { detached: true, stdio: 'ignore' });
   child.on('error', () => {});
   child.unref();
 }
@@ -130,15 +130,20 @@ function liveReason(ticketDir, brokerRoot, live) {
   return null;
 }
 
-function markerOfRealTmpDir(dir) {
+function statRealDirInBase(dir) {
   try {
-    if (!fs.lstatSync(dir).isDirectory()) return null;
-    if (path.dirname(fs.realpathSync(dir)) !== fs.realpathSync(tmpBase())) return null;
-    const marker = path.join(dir, TMP_OWNER_FILE);
-    return fs.lstatSync(marker).isFile() ? marker : null;
+    const stat = fs.lstatSync(dir);
+    if (!stat.isDirectory()) return null;
+    return path.dirname(fs.realpathSync(dir)) === fs.realpathSync(tmpBase()) ? stat : null;
   } catch {
     return null;
   }
+}
+
+function markerOfRealTmpDir(dir) {
+  if (!statRealDirInBase(dir)) return null;
+  const marker = path.join(dir, TMP_OWNER_FILE);
+  return fs.lstatSync(marker, { throwIfNoEntry: false })?.isFile() ? marker : null;
 }
 
 /**
@@ -191,9 +196,11 @@ function renameToDead(dir) {
 
 export function retireLeaseTmpDir(dir, { root, id }) {
   try {
-    const marker = path.basename(dir).startsWith(TMP_PREFIX) ? markerOfRealTmpDir(dir) : null;
-    const owner = marker && parseLeaseMarker(marker);
-    if (!owner || owner.id !== id || owner.root !== fs.realpathSync(root)) {
+    const markerFile = path.join(dir, TMP_OWNER_FILE);
+    const markerPresent = fs.lstatSync(markerFile, { throwIfNoEntry: false }) !== undefined;
+    const owner = markerPresent ? parseLeaseMarker(markerFile) : null;
+    const ours = owner ? owner.id === id && owner.root === fs.realpathSync(root) : !markerPresent;
+    if (!path.basename(dir).startsWith(TMP_PREFIX) || !statRealDirInBase(dir) || !ours) {
       writeBrokerLog(root, `lane-broker lease-tmp: not retiring ${dir} for ${id}: it is not provably this lease's\n`);
       return;
     }
@@ -350,12 +357,17 @@ export async function gcLeaseTmpDirs(root, { maxDirs = Infinity, now = Date.now(
   const candidates = [];
   for (const name of names) {
     const dir = path.join(base, name);
+    if (name.startsWith(DEAD_PREFIX)) {
+      const stat = statRealDirInBase(dir);
+      if (stat && now - stat.mtimeMs >= HOUR_MS) candidates.push({ dir, owner: null, dead: true });
+      continue;
+    }
     const marker = markerOfRealTmpDir(dir);
     const owner = marker && parseLeaseMarker(marker);
     if (!owner || owner.root !== rootReal) continue;
     const markerStat = fs.lstatSync(marker, { throwIfNoEntry: false });
     if (!markerStat || now - markerStat.mtimeMs < HOUR_MS) continue;
-    candidates.push({ dir, owner, dead: name.startsWith(DEAD_PREFIX) });
+    candidates.push({ dir, owner, dead: false });
   }
   if (candidates.length === 0) return summary;
 
@@ -379,6 +391,7 @@ export async function gcLeaseTmpDirs(root, { maxDirs = Infinity, now = Date.now(
         try {
           doomed.push(dead ? dir : renameToDead(dir));
         } catch {
+          continue;
         }
       }
     },
