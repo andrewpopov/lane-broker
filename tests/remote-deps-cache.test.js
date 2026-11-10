@@ -180,12 +180,16 @@ async function runPipeline(s, repoDir, { marker, env = s.env, argv } = {}) {
   });
   let stderr = '';
   child.stderr.on('data', (d) => (stderr += d));
-  child.stdout.resume();
+  let stdout = '';
+  child.stdout.on('data', (d) => (stdout += d));
   const code = await new Promise((resolve) => child.on('close', resolve));
   const deps = readJsonSafe(path.join(ticketDir, 'deps.json'));
   const probe = fs.existsSync(markerPath) ? JSON.parse(fs.readFileSync(markerPath, 'utf8')) : null;
-  return { code, stderr, probe, cwd: workDir, row: { depsCache: deps?.outcome, depsMs: deps?.ms } };
+  return { code, stdout, stderr, probe, cwd: workDir, row: { depsCache: deps?.outcome, depsMs: deps?.ms } };
 }
+
+/** An assertion message for a pipeline run that must have succeeded: the exit code and the tail of the install's own stdout and stderr, which a bare `stderr` loses when npm dies by a signal. */
+const describeRun = (r, tailChars = 2000) => `exit ${r.code}\n--- stdout tail ---\n${r.stdout.slice(-tailChars)}\n--- stderr tail ---\n${r.stderr.slice(-tailChars)}`;
 
 async function runLane(s, repoDir, { repo = 'r', marker, env = s.env } = {}) {
   const markerPath = marker ?? path.join(tmpDir('deps-cache-marker'), 'probe.json');
@@ -314,8 +318,8 @@ test('two real runs missing on the same key at once both succeed and leave one i
     runPipeline(s, makeGitWorktree(files)),
     runPipeline(s, makeGitWorktree(files)),
   ]);
-  assert.equal(a.code, 0, a.stderr);
-  assert.equal(b.code, 0, b.stderr);
+  assert.equal(a.code, 0, describeRun(a));
+  assert.equal(b.code, 0, describeRun(b));
   assert.equal(a.probe.out, 'hello from the bin');
   assert.equal(b.probe.out, 'hello from the bin');
   assert.equal(s.storedKeys().length, 1);
