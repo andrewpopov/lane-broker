@@ -6,7 +6,7 @@ import crypto from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, laneRun, BIN, stripLogTimestamps } from './helpers.js';
 import { makeTmpDir } from './helpers/tmp.js';
-import { gcRemoteTickets, gcLogsAndResults, maybeDailyGc, REMOTE_TMP_BASE, TMP_OWNER_FILE } from '../src/gc.js';
+import { gcRemoteTickets, gcLogsAndResults, maybeDailyGc, tmpBase, TMP_OWNER_FILE } from '../src/gc.js';
 import { enqueue } from '../src/scheduler.js';
 import { writeLease } from '../src/lease.js';
 import { paths, atomicWriteFile, processStartTime, tombstonePath, writeCancelMarkerFile, writeWithdrawMarkerFile, writeExpireMarkerFile } from '../src/state.js';
@@ -35,7 +35,7 @@ function setAge(file, ageMs) {
   fs.utimesSync(file, t, t);
 }
 
-// The tmp dir lives under /var/tmp (what remote-exec records), outside makeTmpDir's os.tmpdir(); removed at exit even on failure.
+// The tmp dir lives under the tmp base (what remote-exec records), outside makeTmpDir's os.tmpdir(); removed at exit even on failure.
 const leakedTmpDirs = new Set();
 process.on('exit', () => {
   for (const dir of leakedTmpDirs) fs.rmSync(dir, { recursive: true, force: true });
@@ -66,7 +66,7 @@ function makeTicket(remoteRoot, { id = crypto.randomUUID(), publisher = 'dead', 
   }
   let tmpDir = null;
   if (tmp) {
-    tmpDir = path.join(REMOTE_TMP_BASE, `lb-gctest-${crypto.randomBytes(6).toString('hex')}`);
+    tmpDir = path.join(tmpBase(), `lb-gctest-${crypto.randomBytes(6).toString('hex')}`);
     fs.mkdirSync(tmpDir);
     leakedTmpDirs.add(tmpDir);
     fs.writeFileSync(path.join(tmpDir, 'scratch'), 'y');

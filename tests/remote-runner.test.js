@@ -15,6 +15,7 @@ import { writeLease } from '../src/lease.js';
 import { enqueue, listQueue, reapOrphanedQueue } from '../src/scheduler.js';
 import { remoteResultCommand, buildResult } from '../src/remote-runner.js';
 import { makeTmpDir } from './helpers/tmp.js';
+import { tmpBase } from '../src/gc.js';
 
 function tmpDir(prefix) {
   return makeTmpDir(`${prefix}-`);
@@ -1367,7 +1368,7 @@ function tmpProbeArgv(file) {
   ];
 }
 
-test('a protocol-1 argv sees TMPDIR/TMP/TEMP = one 0700 /var/tmp/lb-* dir, and the dir is removed after success', async () => {
+test('a protocol-1 argv sees TMPDIR/TMP/TEMP = one 0700 lb-* dir under the tmp base, and the dir is removed after success', async () => {
   const probeFile = path.join(tmpDir('remote-exec-probe'), 'env.json');
   const { env } = freshShadowEnv({ TMPDIR: os.tmpdir() });
   const root = tmpDir('remote-exec-root');
@@ -1379,7 +1380,7 @@ test('a protocol-1 argv sees TMPDIR/TMP/TEMP = one 0700 /var/tmp/lb-* dir, and t
   const ticketDir = path.join(root, 'tickets', header.ticketId);
   const seen = JSON.parse(fs.readFileSync(probeFile, 'utf8'));
   const expected = seen.TMPDIR;
-  assert.ok(expected.startsWith('/var/tmp/lb-'), `TMPDIR ${expected} must be a /var/tmp/lb-* dir`);
+  assert.ok(expected.startsWith(`${tmpBase()}/lb-`), `TMPDIR ${expected} must be an lb-* dir under the tmp base`);
   assert.notEqual(expected, os.tmpdir(), 'the ambient TMPDIR is overridden');
   assert.deepEqual(seen, { TMPDIR: expected, TMP: expected, TEMP: expected, mode: 0o700 });
   assert.equal(fs.existsSync(expected), false);
@@ -1399,7 +1400,7 @@ test('the per-ticket tmp dir is removed after a failing command, scratch files i
   const result = await getResult(header.ticketId, root, env);
   assert.equal(result.exit, 3);
   const { TMPDIR: seenTmp } = JSON.parse(fs.readFileSync(probeFile, 'utf8'));
-  assert.ok(seenTmp.startsWith('/var/tmp/lb-'), `TMPDIR ${seenTmp} must be a /var/tmp/lb-* dir`);
+  assert.ok(seenTmp.startsWith(`${tmpBase()}/lb-`), `TMPDIR ${seenTmp} must be an lb-* dir under the tmp base`);
   assert.equal(fs.existsSync(seenTmp), false);
 });
 
@@ -1437,8 +1438,8 @@ test('the per-ticket tmp dir is removed after an early extract/verify rejection'
 
   const ticketDir = path.join(root, 'tickets', ticketId);
   assert.equal((await getResult(ticketId, root, env)).kind, 'rejected');
-  const made = fs.readFileSync(mkdtempLog, 'utf8').split('\n').filter((d) => d.startsWith('/var/tmp/lb-'));
-  assert.equal(made.length, 1, 'the runner created exactly one /var/tmp/lb-* dir before extraction');
+  const made = fs.readFileSync(mkdtempLog, 'utf8').split('\n').filter((d) => d.startsWith(`${tmpBase()}/lb-`));
+  assert.equal(made.length, 1, 'the runner created exactly one lb-* dir before extraction');
   assert.equal(fs.existsSync(made[0]), false);
   assert.equal(fs.existsSync(path.join(ticketDir, 'work')), false);
 });

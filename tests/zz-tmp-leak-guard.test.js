@@ -19,7 +19,7 @@ test('every directory made through makeTmpDir has been removed', () => {
   const manifest = manifestPath();
   if (!fs.existsSync(manifest)) return; // run alone, not as part of one suite run
   const dirs = fs.readFileSync(manifest, 'utf8').split('\n').filter(Boolean);
-  const leaked = dirs.filter((d) => fs.existsSync(d));
+  const leaked = dirs.filter((d) => d !== process.env.LANE_BROKER_TMP_BASE && fs.existsSync(d));
   fs.rmSync(manifest, { force: true });
   assert.deepEqual(leaked, [], `${leaked.length} of ${dirs.length} test temp dirs leaked: ${leaked.slice(0, 5).join(', ')}`);
 });
