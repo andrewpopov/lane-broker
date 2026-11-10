@@ -61,7 +61,7 @@ import { BLOB_CACHE_CAPABILITY } from './remote-blobs.js';
 import { createAttempt, readAttempt, updateAttempt, runnerPhaseRecorder, fallbackToLocal, publishTerminal, remoteCancelledResult, remoteCancelExitDeadlineMs, REMOTE_CANCEL_ABANDONED_EXIT, CANCELLING_LOCK_TIMEOUT_MS } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX, hostCpuLoad, ticketCpuEstimate } from './admission.js';
 import { relayedUsage, relayedDeps, relayedTransfer, snapshotLine } from './remote-relay.js';
-import { maybeDailyGc } from './gc.js';
+import { maybeDailyGc, createLeaseTmpDir, retireLeaseTmpDir, tmpEnv } from './gc.js';
 import { EXCLUSIVE_DEADLINE_EXIT, EXCLUSIVE_DEADLINE_REASON, exclusiveDeadlineExpiredMessage } from './exclusive.js';
 import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, SILENCE_REASON, noProgressMessage, silenceMessage } from './no-progress.js';
 import { settledContentKey, isCleanPass } from './result-cache.js';
@@ -436,8 +436,8 @@ function acquireTreeLock(lockPath, shouldStop, pollMs, waitMs) {
  * pool to what the broker reserved (BRAIN-318): an unsized vitest spawns
  * cores-1 workers and was measured averaging 4.2 cores on a 2-core lease.
  */
-export function childEnv(ticket, baseEnv = process.env, grantedCpuCores = ticket.resources?.cpuCores, classEnforcement = null) {
-  const env = { ...baseEnv, LANE_BROKER_LEASE: ticket.id, LANE_BROKER_KEY: ticket.key };
+export function childEnv(ticket, baseEnv = process.env, grantedCpuCores = ticket.resources?.cpuCores, classEnforcement = null, tmpDir = null) {
+  const env = { ...baseEnv, LANE_BROKER_LEASE: ticket.id, LANE_BROKER_KEY: ticket.key, ...(tmpDir ? tmpEnv(tmpDir) : {}) };
   // BRAIN-597: where the command runs. A runner's own `remote-exec` marked itself (src/remote-runner.js) and keeps `remote` (+ the submitter's runner name);
   // every other run is `local`, whatever a caller's shell exported.
   if (baseEnv.LANE_BROKER_EXECUTOR === 'remote' && baseEnv.LANE_BROKER_LOCAL_REASON === 'remote-exec runner') env.LANE_BROKER_EXECUTOR = 'remote';
@@ -2164,6 +2164,11 @@ async function main() {
   // BRAIN-651 L2: the admitted grant (elastic included) caps the whole tree; a remote protocol-2 pipeline is this same child, so deps, setup and command share it
   let executionCpuCores;
   let scopedChild;
+  // a runner's `remote-exec` already made this ticket's one tmp dir and put it in our env
+  const leaseTmpDir =
+    process.env.LANE_BROKER_LOCAL_REASON === 'remote-exec runner'
+      ? null
+      : createLeaseTmpDir({ root, id: ticket.id, pid: process.pid, start: enriched.supervisorStart });
   try {
     executionCpuCores = resolveExecutionCpuCores(leaseCpuCores(started.lease), ticket.maxExecutionCpuCores);
     scopedChild = spawnInCpuScope(spawn, {
@@ -2177,10 +2182,11 @@ async function main() {
         cwd: ticket.cwd,
         detached: true,
         stdio: ['ignore', 'pipe', 'pipe'],
-        env: childEnv({ ...ticket, priorityAdmitted: started.lease.priorityAdmitted }, process.env, executionCpuCores, started.lease.classEnforcement),
+        env: childEnv({ ...ticket, priorityAdmitted: started.lease.priorityAdmitted }, process.env, executionCpuCores, started.lease.classEnforcement, leaseTmpDir),
       },
     });
   } catch (err) {
+    if (leaseTmpDir) retireLeaseTmpDir(leaseTmpDir, { root, id: ticket.id });
     await releaseLocalPreparation();
     if (!(err instanceof CpuLimitUnavailableError)) throw err;
     await refuseLocalAndExit({ exitCode: LOCAL_REFUSED_EXIT_CODE, message: `lane run: ${err.message}\n` }, { lease: true });
@@ -2226,6 +2232,7 @@ async function main() {
   const exclusiveDeadlineMs = ticket.exclusive === true ? Number(process.env.LANE_BROKER_TEST_EXCLUSIVE_DEADLINE_MS) || ticket.exclusiveDeadlineMs : undefined;
   writeLease(root, {
     ...runningLease(started.lease, { childPgid: child.pid, cpuScopeUnit: cpuScope, startedAt }),
+    ...(leaseTmpDir ? { tmpDir: leaseTmpDir } : {}),
     ...(ticket.exclusivePurpose ? { exclusivePurpose: ticket.exclusivePurpose } : {}),
     ...(exclusiveDeadlineMs ? { exclusiveDeadlineAt: startedAt + exclusiveDeadlineMs } : {}),
   });
@@ -2394,6 +2401,7 @@ async function main() {
     // reading would just wait out its own bounded timeout for nothing.
     if (stdoutForward) await stdoutForward.drain();
     if (stderrForward) await stderrForward.drain();
+    if (leaseTmpDir) retireLeaseTmpDir(leaseTmpDir, { root, id: ticket.id });
     // Test seam: lets a test land a `lane cancel` after the child ended, before the result is written (BRAIN-364).
     await testHoldAt('local-finalize');
 

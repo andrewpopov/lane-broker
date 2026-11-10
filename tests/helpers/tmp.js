@@ -109,3 +109,7 @@ export function makeTmpDir(prefix, t) {
   }
   return dir;
 }
+
+// BRAIN-937: the broker's per-run `lb-*` temp dirs live under LANE_BROKER_TMP_BASE (default /var/tmp). Every test file gets its own
+// base, so no test touches the real one and a leak is caught by the manifest like any other dir.
+process.env.LANE_BROKER_TMP_BASE = makeTmpDir('lane-broker-tmpbase-');

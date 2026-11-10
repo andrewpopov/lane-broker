@@ -7,7 +7,7 @@ import { isSupervisorAlive } from './lease.js';
 import { writeBrokerLog } from './admission.js';
 
 /**
- * BRAIN-438: garbage collection of what runs leave behind. Two sweeps, both of which only ever remove what nothing can
+ * BRAIN-438: garbage collection of what runs leave behind. Three sweeps, all of which only ever remove what nothing can
  * still be using:
  *
  *  - `gcRemoteTickets`: on a runner, the `work/` and tmp dirs of finished tickets (a ticket whose `remote-exec` was killed
@@ -15,10 +15,11 @@ import { writeBrokerLog } from './admission.js';
  *    every `remote-exec` and from `lane gc`.
  *  - `gcLogsAndResults`: `logs/` and `results/` files past `logRetentionMs`. Run from `lane gc` and, at most once a day,
  *    from a supervisor's start (`maybeDailyGc`).
+ *  - `gcLeaseTmpDirs` (BRAIN-937): dead supervisors' per-lease `lb-*` temp dirs, collected only on a marker's proof (README).
  *
- * Both decide under the broker lock (`withLock`, the lock `remote-exec` creates tickets and tombstones under). Neither
- * removes anything while holding it: a doomed directory is first RENAMED into `<remoteRoot>/gc-trash` (one atomic, fast
- * step inside the lock) and deleted afterwards, so a multi-GB `rm` never blocks admission.
+ * All decide under the broker lock (`withLock`, the lock `remote-exec` creates tickets and tombstones under). None
+ * removes anything while holding it: a doomed directory is first RENAMED (into `<remoteRoot>/gc-trash`, or to `lb-dead-*` in
+ * the tmp base; one atomic, fast step inside the lock) and deleted afterwards, so a multi-GB `rm` never blocks admission.
  *
  * TOMBSTONES (BRAIN-436) are NEVER pruned in this version. A tombstone is the only thing refusing a `remote-exec` for an id
  * that was cancelled before it arrived, and nothing bounds how late such an exec can be (a suspended process, a long-lived
@@ -37,13 +38,17 @@ import { writeBrokerLog } from './admission.js';
  * of scope: they can already delete anything that uid owns. `lstat` / no-follow is used wherever it is cheap, no further.
  */
 
-/** Per-ticket TMPDIR base of a runner (BRAIN-374/376): /var/tmp is disk-backed, unlike a possibly RAM-backed /tmp. */
-export const REMOTE_TMP_BASE = '/var/tmp';
+export function tmpBase() {
+  return process.env.LANE_BROKER_TMP_BASE || '/var/tmp';
+}
 const TMP_DIR_FILE = 'tmp-dir';
 /** Written inside a ticket's tmp dir by `remote-exec`; its content is the ticket id that owns the directory. */
 export const TMP_OWNER_FILE = '.lane-broker-owner';
 const GENERATED_NAME = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
 const DAY_MS = 86_400_000;
+const HOUR_MS = 3_600_000;
+const TMP_PREFIX = 'lb-';
+const DEAD_PREFIX = 'lb-dead-';
 
 const lockOptions = { timeoutMs: 2000 };
 
@@ -125,21 +130,76 @@ function liveReason(ticketDir, brokerRoot, live) {
   return null;
 }
 
+function markerOfRealTmpDir(dir) {
+  try {
+    if (!fs.lstatSync(dir).isDirectory()) return null;
+    if (path.dirname(fs.realpathSync(dir)) !== fs.realpathSync(tmpBase())) return null;
+    const marker = path.join(dir, TMP_OWNER_FILE);
+    return fs.lstatSync(marker).isFile() ? marker : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * The tmp dir `remote-exec` recorded for this ticket, only if it provably belongs to it: a real (non-symlink) `lb-*`
  * directory directly under the tmp base whose owner marker names `ticketId`. Null otherwise (the caller counts it skipped).
  */
 function ownedTmpDir(ticketDir, ticketId) {
   const recorded = readTrimmed(path.join(ticketDir, TMP_DIR_FILE));
-  if (!recorded || !path.isAbsolute(recorded) || !path.basename(recorded).startsWith('lb-')) return null;
+  if (!recorded || !path.isAbsolute(recorded) || !path.basename(recorded).startsWith(TMP_PREFIX)) return null;
+  const marker = markerOfRealTmpDir(recorded);
+  return marker && readTrimmed(marker) === ticketId ? recorded : null;
+}
+
+function parseLeaseMarker(file) {
+  const parsed = readJsonSafe(file);
+  if (!parsed || typeof parsed !== 'object' || parsed.kind !== 'lease') return null;
+  if (typeof parsed.root !== 'string' || typeof parsed.id !== 'string') return null;
+  return parsed;
+}
+
+export function createOwnedTmpDir(marker) {
+  const dir = fs.mkdtempSync(path.join(tmpBase(), TMP_PREFIX));
   try {
-    if (!fs.lstatSync(recorded).isDirectory()) return null;
-    if (path.dirname(fs.realpathSync(recorded)) !== fs.realpathSync(REMOTE_TMP_BASE)) return null;
-    const marker = path.join(recorded, TMP_OWNER_FILE);
-    if (!fs.lstatSync(marker).isFile()) return null;
-    return readTrimmed(marker) === ticketId ? recorded : null;
-  } catch {
+    atomicWriteFile(path.join(dir, TMP_OWNER_FILE), marker);
+  } catch (err) {
+    fs.rmSync(dir, { recursive: true, force: true });
+    throw err;
+  }
+  return dir;
+}
+
+export function tmpEnv(dir) {
+  return { TMPDIR: dir, TMP: dir, TEMP: dir };
+}
+
+export function createLeaseTmpDir({ root, id, pid, start }) {
+  try {
+    return createOwnedTmpDir(JSON.stringify({ kind: 'lease', root: fs.realpathSync(root), id, pid, start }));
+  } catch (err) {
+    writeBrokerLog(root, `lane-broker lease-tmp: cannot create a temp dir for ${id}: ${err.message}\n`);
     return null;
+  }
+}
+
+function renameToDead(dir) {
+  const dead = path.join(tmpBase(), `${DEAD_PREFIX}${crypto.randomBytes(6).toString('hex')}`);
+  fs.renameSync(dir, dead);
+  return dead;
+}
+
+export function retireLeaseTmpDir(dir, { root, id }) {
+  try {
+    const marker = path.basename(dir).startsWith(TMP_PREFIX) ? markerOfRealTmpDir(dir) : null;
+    const owner = marker && parseLeaseMarker(marker);
+    if (!owner || owner.id !== id || owner.root !== fs.realpathSync(root)) {
+      writeBrokerLog(root, `lane-broker lease-tmp: not retiring ${dir} for ${id}: it is not provably this lease's\n`);
+      return;
+    }
+    removeDetached([renameToDead(dir)]);
+  } catch (err) {
+    writeBrokerLog(root, `lane-broker lease-tmp: cannot retire ${dir} for ${id}: ${err.message}\n`);
   }
 }
 
@@ -276,6 +336,58 @@ export async function gcLogsAndResults(root, { retentionMs, maxFiles = Infinity,
   return summary;
 }
 
+// Candidates are screened outside the lock (a marker never changes); liveness is read and the rename done inside it, the rm after.
+export async function gcLeaseTmpDirs(root, { maxDirs = Infinity, now = Date.now(), dryRun = false } = {}) {
+  const summary = { tmpDirs: 0, tmpDead: 0, tmpSkippedLive: 0, bounded: false };
+  const base = tmpBase();
+  let names = [];
+  try {
+    names = fs.readdirSync(base).filter((n) => n.startsWith(TMP_PREFIX)).sort();
+  } catch {
+    return summary;
+  }
+  const rootReal = fs.realpathSync(root);
+  const candidates = [];
+  for (const name of names) {
+    const dir = path.join(base, name);
+    const marker = markerOfRealTmpDir(dir);
+    const owner = marker && parseLeaseMarker(marker);
+    if (!owner || owner.root !== rootReal) continue;
+    const markerStat = fs.lstatSync(marker, { throwIfNoEntry: false });
+    if (!markerStat || now - markerStat.mtimeMs < HOUR_MS) continue;
+    candidates.push({ dir, owner, dead: name.startsWith(DEAD_PREFIX) });
+  }
+  if (candidates.length === 0) return summary;
+
+  const doomed = [];
+  await withLock(
+    root,
+    () => {
+      const live = liveIds(root, { withAttempts: true });
+      for (const { dir, owner, dead } of candidates) {
+        const supervisorAlive = () => !Number.isFinite(owner.pid) || isSupervisorAlive({ supervisorPid: owner.pid, supervisorStart: owner.start });
+        if (!dead && (live.has(owner.id) || supervisorAlive())) {
+          summary.tmpSkippedLive += 1;
+          continue;
+        }
+        if (summary.tmpDirs + summary.tmpDead >= maxDirs) {
+          summary.bounded = true;
+          break;
+        }
+        summary[dead ? 'tmpDead' : 'tmpDirs'] += 1;
+        if (dryRun) continue;
+        try {
+          doomed.push(dead ? dir : renameToDead(dir));
+        } catch {
+        }
+      }
+    },
+    lockOptions,
+  );
+  removeDetached(doomed);
+  return summary;
+}
+
 /**
  * The supervisor's hook: run `gcLogsAndResults` at most once a day. The marker is claimed BEFORE the sweep so concurrent
  * supervisors do not all sweep, and released again if the sweep hit its bound so the next supervisor carries on.
@@ -288,7 +400,12 @@ export async function maybeDailyGc(root, cfg, now = Date.now()) {
   try {
     atomicWriteFile(marker, String(now));
     const summary = await gcLogsAndResults(root, { retentionMs: cfg.logRetentionMs, maxFiles: cfg.logGcMaxFilesPerRun, now });
-    if (summary.bounded) fs.rmSync(marker, { force: true });
+    try {
+      summary.tmp = await gcLeaseTmpDirs(root, { maxDirs: cfg.logGcMaxFilesPerRun, now });
+    } catch (err) {
+      writeBrokerLog(root, `lane-broker-gc warning: lease tmp sweep skipped: ${err.message}\n`);
+    }
+    if (summary.bounded || summary.tmp?.bounded) fs.rmSync(marker, { force: true });
     return summary;
   } catch {
     fs.rmSync(marker, { force: true });
@@ -296,7 +413,7 @@ export async function maybeDailyGc(root, cfg, now = Date.now()) {
   }
 }
 
-/** `lane gc [--root <remoteRoot>] [--dry-run] [--max <n>]`: both sweeps, unbounded unless `--max`, one JSON line out. */
+/** `lane gc [--root <remoteRoot>] [--dry-run] [--max <n>]`: every sweep, unbounded unless `--max`, one JSON line out. */
 export async function gcCommand(args, { remoteRoot, cfg, brokerRoot = stateHome() }) {
   const dryRun = args.includes('--dry-run');
   const maxIdx = args.indexOf('--max');
@@ -308,8 +425,9 @@ export async function gcCommand(args, { remoteRoot, cfg, brokerRoot = stateHome(
   try {
     const remote = await gcRemoteTickets({ remoteRoot, brokerRoot, retentionMs: cfg.remoteTicketRetentionMs, maxTickets: max, dryRun });
     const logs = await gcLogsAndResults(brokerRoot, { retentionMs: cfg.logRetentionMs, maxFiles: max, dryRun });
-    if (!dryRun && !logs.bounded) atomicWriteFile(paths(brokerRoot).gcLastRun, String(Date.now()));
-    process.stdout.write(`${JSON.stringify({ dryRun, remote, logs })}\n`);
+    const tmp = await gcLeaseTmpDirs(brokerRoot, { maxDirs: max, dryRun });
+    if (!dryRun && !logs.bounded && !tmp.bounded) atomicWriteFile(paths(brokerRoot).gcLastRun, String(Date.now()));
+    process.stdout.write(`${JSON.stringify({ dryRun, remote, logs, tmp })}\n`);
     return { exitCode: 0 };
   } catch (err) {
     process.stderr.write(`lane gc: ${err.message}\n`);

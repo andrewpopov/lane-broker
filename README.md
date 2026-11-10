@@ -1378,6 +1378,7 @@ work-stealing restricted to tasks that have not started; a started task is never
 | `LANE_BROKER_EXECUTOR` | `remote` when the command (and `remoteDeps` / `remoteSetup`) runs on a runner; `local` otherwise. |
 | `LANE_BROKER_RUNNER` | On a runner: the runner's name as the submitter's `runners[]` config names it, carried in the dispatch header (`runnerName`). Never set for a local run; absent when the submitter is older than 0.45.0, in which case only `LANE_BROKER_EXECUTOR` is exported. |
 | `LANE_BROKER_RUNNER_SPEED_FACTOR` | On a runner: that runner's `speedFactor` from the submitter's `runners[]` config (carried as `runnerSpeedFactor`, a number in (0, 4]), so a repo can scale test time budgets on slow runners. Never set for a local run; absent when the runner has no `speedFactor` or the submitter is older than this feature. |
+| `TMPDIR`, `TMP`, `TEMP` (BRAIN-937) | A per-lease `lb-*` directory (mode 0700) under `/var/tmp` (`LANE_BROKER_TMP_BASE` overrides it, for tests), as a runner already provides. It is renamed away and removed in a detached `rm` before the result is published, so a suite that skips its own cleanup cannot fill the shared temp volume, and a file the command left there is gone once `lane run` returns. Tool caches kept under `os.tmpdir()` go cold on every run, as they already do on runners. A nested `lane run` inherits its parent's directory, which outlives the nested run. If the directory cannot be created the run proceeds with the inherited `TMPDIR` and a line in the admission log. |
 
 Both are set by the broker, so a value exported in the caller's shell is replaced. `LANE_BROKER_LOCAL_REASON` is unchanged. The two
 variables reach the `remoteDeps` install and so are part of its deps-cache key.
@@ -2845,7 +2846,7 @@ symlinks.
 ## Garbage collection (BRAIN-438)
 
 What a run leaves behind is collected; what a live one owns never is. Everything here is also available on demand as
-`lane gc [--dry-run] [--max <n>] [--root <remoteRoot>]` (both sweeps, unbounded unless `--max`, one JSON summary line;
+`lane gc [--dry-run] [--max <n>] [--root <remoteRoot>]` (every sweep, unbounded unless `--max`, one JSON summary line;
 `--dry-run` reports and removes nothing).
 
 - **Runner ticket GC** (global config `remoteTicketRetentionMs`, default 7 days; `remoteGcMaxTicketsPerRun`, default 10).
@@ -2872,6 +2873,14 @@ What a run leaves behind is collected; what a live one owns never is. Everything
 - **Tmp dirs.** `remote-exec` writes `.lane-broker-owner` (the ticket id) inside each ticket's tmp dir. GC deletes a recorded
   tmp dir only if it is a real `lb-*` directory directly under `/var/tmp` carrying a marker naming that ticket; a legacy
   dir without a marker, or with another ticket's, is left and reported as `tmpSkipped`.
+- **Lease tmp dirs** (BRAIN-937). A local run's supervisor retires its own `lb-*` dir at lease end; one left by a supervisor that
+  was killed outright (SIGKILL, power loss) is collected by a sweep of the tmp base, run from `lane gc` and the daily GC, at most
+  `logGcMaxFilesPerRun` per run, reported as `tmp` in the JSON line. The marker inside is JSON (`kind`, `root`, `id`, `pid`,
+  `start`); a runner's plain-id marker is never judged here. A dir is removed only if it is a real `lb-*` directory directly under
+  the base (never a symlink), its marker names this broker's state root, its id has no lease (an ORPHANED one counts), queue entry
+  or attempt record (read strictly: an unreadable record aborts the sweep), its supervisor is dead (a failed probe counts as alive)
+  and the marker is over an hour old. The `tmpDir` on a lease is display only and never trusted. Removal is a rename to
+  `lb-dead-*` inside the lock and a detached `rm` after it; an `lb-dead-*` dir is removed once its marker is over an hour old.
 - **Threat model.** Accidental configuration (a symlinked directory, a stale recorded path, a custom log path) and ordinary
   concurrency between broker processes. A same-uid adversary swapping directories for symlinks during a sweep is out of scope:
   they can already delete anything that uid owns.

@@ -8,6 +8,7 @@ import { Readable } from 'node:stream';
 import { freshEnv, writeGlobalConfig, BIN, laneRun, sleep, waitFor } from './helpers.js';
 import { encodeSnapshot } from '../src/remote-stream.js';
 import { makeTmpDir } from './helpers/tmp.js';
+import { tmpBase } from '../src/gc.js';
 
 /**
  * BRAIN-320 S1b (1b/1h): end-to-end pipeline tests against REAL `npm`, no
@@ -354,7 +355,7 @@ test('cancel during deps: kind cancelled, and the sleeping postinstall process i
 
 // ---- BRAIN-374: per-ticket TMPDIR ----
 
-test('TMPDIR/TMP/TEMP point at one 0700 /var/tmp/lb-* dir for deps, setup and command, and the dir is removed afterwards', async () => {
+test('TMPDIR/TMP/TEMP point at one 0700 lb-* dir under the tmp base for deps, setup and command, and the dir is removed afterwards', async () => {
   const { env } = freshShadowEnv();
   const root = tmpDir('remote-pipeline-root');
   const markerDir = tmpDir('remote-pipeline-markers');
@@ -380,7 +381,7 @@ test('TMPDIR/TMP/TEMP point at one 0700 /var/tmp/lb-* dir for deps, setup and co
   const ticketDir = path.join(root, 'tickets', header.ticketId);
   const commandSeen = JSON.parse(fs.readFileSync(commandEnvFile, 'utf8'));
   const expected = commandSeen.TMPDIR;
-  assert.ok(expected.startsWith('/var/tmp/lb-'), `TMPDIR ${expected} must be a /var/tmp/lb-* dir`);
+  assert.ok(expected.startsWith(`${tmpBase()}/lb-`), `TMPDIR ${expected} must be an lb-* dir under the tmp base`);
   assert.notEqual(expected, markerDir, 'the decoy ambient TMPDIR is overridden');
   for (const file of [depsEnvFile, setupEnvFile, commandEnvFile]) {
     const seen = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -411,7 +412,8 @@ test('BRAIN-376: the default TMPDIR leaves room for a Unix socket path inside su
   assert.equal(await waitClose(child), 0);
   assert.equal((await getResult(header.ticketId, root, env)).kind, 'completed');
 
-  const seenTmpdir = JSON.parse(fs.readFileSync(commandEnvFile, 'utf8')).TMPDIR;
+  // the suite points the base at a scratch dir (BRAIN-937); judge the length under the default base
+  const seenTmpdir = JSON.parse(fs.readFileSync(commandEnvFile, 'utf8')).TMPDIR.replace(tmpBase(), '/var/tmp');
   // 40 bytes of headroom for the socket file name a consumer's test appends.
   assert.ok(
     Buffer.byteLength(seenTmpdir) + 40 < 107,

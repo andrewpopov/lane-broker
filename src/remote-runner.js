@@ -28,7 +28,7 @@ import { readLease, isSupervisorAlive, listLeasesStrict, listLeases } from './le
 import { readAttempt, listAttemptsStrict } from './attempts.js';
 import { listQueue, listQueueStrict, queueReadable, dequeueSync, HELD_STATES } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
-import { REMOTE_TMP_BASE, TMP_OWNER_FILE, gcRemoteTickets, removeDetached } from './gc.js';
+import { createOwnedTmpDir, gcRemoteTickets, removeDetached, tmpEnv } from './gc.js';
 import { writeBrokerLog, cpuHeadroomCores } from './admission.js';
 import { measureHostCpuReadOnly } from './cpu.js';
 import { preemptibleCores } from './preemptible.js';
@@ -532,12 +532,9 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   // Every phase env is derived from this process's env (buildDepsEnv, the
   // pipeline's setup/command children, and a protocol-1 argv via runCommand),
   // so setting it once here covers them all.
-  const tmpDir = fs.mkdtempSync(path.join(REMOTE_TMP_BASE, 'lb-'));
-  atomicWriteFile(path.join(tmpDir, TMP_OWNER_FILE), header.ticketId);
+  const tmpDir = createOwnedTmpDir(header.ticketId);
   atomicWriteFile(path.join(ticketDir, 'tmp-dir'), tmpDir);
-  process.env.TMPDIR = tmpDir;
-  process.env.TMP = tmpDir;
-  process.env.TEMP = tmpDir;
+  Object.assign(process.env, tmpEnv(tmpDir));
   const snapshotStartedAt = Date.now();
   // BRAIN-642: the blob store is used only when the client asked (`--transfer-cache`), named a repo identity, and this runner's
   // config allows it; the namespace comes from that identity, never from the stream.
