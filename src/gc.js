@@ -91,7 +91,7 @@ export function removeNow(targets) {
 /** Delete in a detached `rm`, for `remote-exec`: the submitter's ssh session must not wait on a multi-GB removal. */
 export function removeDetached(targets) {
   if (targets.length === 0) return;
-  const child = spawn('sh', ['-c', 'chmod -R u+w -- "$@" 2>/dev/null; rm -rf -- "$@"', 'sh', ...targets], { detached: true, stdio: 'ignore' });
+  const child = spawn('sh', ['-c', 'chmod -R u+rwX -- "$@" 2>/dev/null; rm -rf -- "$@"', 'sh', ...targets], { detached: true, stdio: 'ignore' });
   child.on('error', () => {});
   child.unref();
 }

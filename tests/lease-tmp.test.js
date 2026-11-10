@@ -270,12 +270,16 @@ test('LEASE_TMP_SWEEP_SYMLINK: a symlink named lb-* is never followed', async ()
   assert.equal(fs.existsSync(path.join(target, 'scratch')), true);
 });
 
-/** An lb-dead-* dir with NO marker and a read-only nested subtree, its own mtime set `ageMs` back. */
+/** An lb-dead-* dir with NO marker, a read-only nested subtree and a mode-000 dir, its own mtime set `ageMs` back. */
 function deadDir(base, ageMs) {
   const dir = fs.mkdtempSync(path.join(base, 'lb-dead-'));
   const nested = path.join(dir, 'a', 'b');
   fs.mkdirSync(nested, { recursive: true });
   fs.writeFileSync(path.join(nested, 'f'), 'x');
+  const sealed = path.join(dir, 'sealed');
+  fs.mkdirSync(sealed);
+  fs.writeFileSync(path.join(sealed, 'g'), 'x');
+  fs.chmodSync(sealed, 0o000);
   fs.chmodSync(path.join(nested, 'f'), 0o400);
   fs.chmodSync(nested, 0o500);
   fs.chmodSync(path.join(dir, 'a'), 0o500);
@@ -292,7 +296,7 @@ test('LEASE_TMP_SWEEP_DEAD: an aged lb-dead-* dir with no marker and a read-only
   assert.equal(summary.tmpDead, 1);
   assert.equal(fs.existsSync(fresh), true);
   await settle([stale]);
-  spawnSync('chmod', ['-R', 'u+w', fresh]);
+  spawnSync('chmod', ['-R', 'u+rwX', fresh]);
 });
 
 test('LEASE_TMP_SWEEP_DRY_RUN: reports and removes nothing', async () => {
@@ -322,6 +326,7 @@ test('LEASE_TMP_SWEEP_REAL_SUPERVISOR: the real marker keeps a live supervisor\'
   const marker = path.join(seen.TMPDIR, TMP_OWNER_FILE);
   const aged = new Date(Date.now() - 2 * HOUR);
   fs.utimesSync(marker, aged, aged);
+  process.kill(lease.supervisorPid, 'SIGSTOP'); // a stopped supervisor cannot heartbeat the lease back between our remove and the sweep
   fs.rmSync(path.join(paths(s.state).leases, leaseFile));
 
   const alive = await gcLeaseTmpDirs(s.state);
