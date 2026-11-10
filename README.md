@@ -3028,6 +3028,8 @@ heavy`). A red there opens the train's master-red incident, as any master verify
 
 PR CI splits `npm test` across 4 lanes (`.train.json` `prCi.shards: 4`, one PR at a time). The suite waits far more than it computes (one full run used 1,793 CPU-seconds in 2,428 s of wall time), so each `pr` lane claims 2 cores with a 1-core floor. When the merge train sets `TRAIN_SHARD=i/N`, `scripts/train-gate.sh`
 runs `scripts/test-shard.sh`, which lints and runs only the files `scripts/test-files.js` deals to shard `i`.
+Given the train's re-run hint (`TRAIN_RERUN_FAILED=1`, `TRAIN_FAILED_FILES`) whose every line is an existing
+top-level `tests/*.test.js`, it lints and runs only those files instead; any other list runs as without it (PKG-298).
 Files go longest first to the shard with the least time so far, weighted by `tests/durations.json` (seconds
 per file, measured on a runner); a file missing from it counts as the median. Each shard runs its files through
 `scripts/test-run.sh` as `npm test` does: several at a time, then `zz-tmp-leak-guard` alone.

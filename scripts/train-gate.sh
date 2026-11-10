@@ -5,9 +5,25 @@
 # install stays infra; only a failed suite prints the train's red line.
 set -e
 npm ci --prefer-offline --no-audit --no-fund
+
+rerun_files() {
+  [ "$TRAIN_RERUN_FAILED" = 1 ] && [ -n "$TRAIN_FAILED_FILES" ] || return 1
+  printf '%s\n' "$TRAIN_FAILED_FILES" | while IFS= read -r file; do
+    case "$file" in
+      '') ;;
+      *' '* | tests/*/*) return 1 ;;
+      tests/*.test.js) [ -f "$file" ] || return 1 ;;
+      *) return 1 ;;
+    esac
+  done
+}
+
 case "${1:-}" in
   heavy) step='npm run test:heavy' ;;
-  '') if [ -n "$TRAIN_SHARDS" ]; then step="sh scripts/test-shard.sh"; else step='npm run verify'; fi ;;
+  '')
+    if rerun_files; then step="sh scripts/test-shard.sh $(printf '%s\n' "$TRAIN_FAILED_FILES" | grep -v '^$' | tr '\n' ' ')"
+    elif [ -n "$TRAIN_SHARDS" ]; then step="sh scripts/test-shard.sh"
+    else step='npm run verify'; fi ;;
   *) echo "train-gate.sh: unknown tier '$1'" >&2; exit 64 ;;
 esac
 $step || {
