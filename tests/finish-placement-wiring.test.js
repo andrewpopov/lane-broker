@@ -2,11 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { tmpDir, makeRunner, IDLE } from './remote-harness.js';
-import { paths } from '../src/state.js';
+import { paths, appendHistory } from '../src/state.js';
+import { readRecentHistoryRows } from '../src/suggest.js';
 import { REMOTE_WITHDRAW_CAPABILITY } from '../src/capabilities.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
-import { rebalanceFinishAllows, selectionOptionsFor } from '../src/supervisor.js';
-import { chooseSpeedPlacement, DEFAULT_REMOTE_OVERHEAD_MS } from '../src/speed-placement.js';
+import { historyIncludeFor, rebalanceFinishAllows, selectionOptionsFor } from '../src/supervisor.js';
+import { chooseSpeedPlacement, DEFAULT_REMOTE_OVERHEAD_MS, RUN_ESTIMATE_WINDOW_MS } from '../src/speed-placement.js';
 
 // BRAIN-899 slice B: how the supervisor wires the finish model into the four selection paths. Unit level -- the estimator and
 // selectRunner's ranking are tests/finish-placement.test.js, the end-to-end moves are tests/rebalance-queued.test.js.
@@ -18,9 +19,14 @@ const SKYBOX = { name: 'skybox', speedFactor: 1 };
 const WINTOP = { name: 'wintop', speedFactor: 0.5 };
 const ticket = { id: 't-1', repoId: REPO, lane: LANE, command: CMD, weight: 1, resources: { cpuCores: 1 }, remote: {} };
 const cfg = (runners = [SKYBOX, WINTOP]) => ({ ...DEFAULT_GLOBAL_CONFIG, runners });
+const RECENT = Date.now() - 3_600_000;
+const AGED = Date.now() - RUN_ESTIMATE_WINDOW_MS - 3_600_000;
 
 const remoteRows = (runner, ...runMs) =>
-  runMs.map((ms, i) => ({ id: `${runner}-${i}`, repo: REPO, lane: LANE, command: CMD, executor: 'remote', runner, exit: 0, startedAt: 1000, endedAt: 1000 + ms, runMs: ms }));
+  runMs.map((ms, i) => ({ id: `${runner}-${i}`, repo: REPO, lane: LANE, command: CMD, executor: 'remote', runner, exit: 0, startedAt: RECENT + i * 1000, endedAt: RECENT + i * 1000 + ms, runMs: ms }));
+
+/** The same runs, started before the run-estimate window: a placement must not see them. */
+const agedRows = (runner, ...runMs) => remoteRows(runner, ...runMs).map((row, i) => ({ ...row, startedAt: AGED + i * 1000, endedAt: AGED + i * 1000 + row.runMs }));
 
 /** A state root whose history.jsonl holds `rows`. */
 function rootWithHistory(rows, prefix = 'finish-wiring') {
@@ -68,6 +74,66 @@ test('selectionOptionsFor: history too thin to estimate leaves a model that answ
   const root = rootWithHistory(remoteRows('skybox', 200_000));
   assert.equal(optionsFor('place', root).finishModel.estimateFor(SKYBOX), null, 'one run is neither exact nor repo-lane evidence');
   assert.equal(optionsFor('place', rootWithHistory([])).finishModel.estimateFor(SKYBOX), null, 'nor is an empty history');
+});
+
+// ---- BRAIN-899 B2: the window a placement reads ----
+
+test('selectionOptionsFor: a run older than the window estimates nothing, and cannot move a newer median', () => {
+  assert.equal(optionsFor('place', rootWithHistory(agedRows('skybox', 200_000, 210_000, 220_000))).finishModel.estimateFor(SKYBOX), null, `${RUN_ESTIMATE_WINDOW_MS / 86_400_000} days is how far back a run estimate looks`);
+  const mixed = rootWithHistory([...agedRows('skybox', 900_000, 900_000, 900_000), ...remoteRows('skybox', 200_000, 210_000, 220_000)]);
+  assert.deepEqual(optionsFor('place', mixed).finishModel.estimateFor(SKYBOX), { ms: 210_000, tier: 'exact', n: 3 }, 'the aged runs neither add to n nor move the median');
+});
+
+test('historyIncludeFor: the raw-line filter is spelled exactly as appendHistory writes the repo key', () => {
+  const root = tmpDir('include-spelling');
+  appendHistory(root, { id: 'a', repo: REPO, lane: LANE, startedAt: Date.now(), exit: 0 });
+  appendHistory(root, { id: 'b', repo: `${REPO}-x`, lane: LANE, startedAt: Date.now(), exit: 0 });
+  assert.equal(historyIncludeFor(REPO), '"repo":"lane-broker"');
+  assert.ok(fs.readFileSync(paths(root).history, 'utf8').split('\n')[0].includes(historyIncludeFor(REPO)), 'the reader filters on the writer\'s own spelling');
+  const read = readRecentHistoryRows(paths(root).history, { sinceMs: Date.now() - RUN_ESTIMATE_WINDOW_MS, include: historyIncludeFor(REPO) });
+  assert.deepEqual(read.map((r) => r.id), ['a'], 'and the closing quote keeps a longer repo id out');
+});
+
+const TRAIN_IDS = 'abcdef0123456789';
+/** A train-shaped command. The `\n` inside TRAIN_CHANGED_FILES splits the token, so the class value is the first path alone. */
+const trainCommand = ({ id, files }) =>
+  `env TRAIN_SHARD=1/3 TRAIN_SHARDS=3 TRAIN_TIER=pr TRAIN_CHANGED_FILES_PATH=.train-changed-files TRAIN_CHANGED_FILES=${files ?? `src/pages/${id}.html\nsrc/lib/${id}.js`} sh .githooks/pre-push-gate.sh verify-full`;
+const trainRuns = (startedAt, ...specs) =>
+  specs.map(({ runMs, id, files }, i) => ({ id: `train-${id}-${i}`, repo: REPO, lane: LANE, command: trainCommand({ id, files }), executor: 'remote', runner: 'skybox', exit: 0, startedAt: startedAt + i * 1000, endedAt: startedAt + i * 1000 + runMs, runMs }));
+
+test('selectionOptionsFor: the job classes are the windowed rows\', so aged runs cannot drop a name from the class key', () => {
+  const classic = (runMs, id) => ({ runMs, id, files: `classic.html\nsrc/lib/${id}.js` });
+  const other = (runMs, id) => ({ runMs, id });
+  const inWindow = trainRuns(RECENT, classic(100_000, 'a'), classic(120_000, 'b'), other(900_000, 'c'), other(980_000, 'd'));
+  // seven more distinct changed-file values: nine with the window's two, so an all-history read would drop the name and pool the shard
+  const aged = trainRuns(AGED, ...[0, 1, 2, 3, 4, 5, 6].map((i) => other(900_000 + i * 10_000, TRAIN_IDS[6 + i])));
+  const wanted = { ...ticket, command: trainCommand({ id: 'ff', files: 'classic.html\nsrc/lib/ff.js' }) };
+  const model = selectionOptionsFor('place', wanted, cfg([SKYBOX]), { root: rootWithHistory([...aged, ...inWindow]) }).finishModel;
+  assert.deepEqual(model.estimateFor(SKYBOX), { ms: 110_000, tier: 'class', n: 2 }, 'only the window\'s two classic.html runs are of this class');
+  assert.deepEqual(model.estimateAll([SKYBOX]).get('skybox'), { ms: 110_000, tier: 'class', n: 2 });
+});
+
+// ---- BRAIN-899 B3: the model estimates a field at one tier ----
+
+test('selectionOptionsFor: estimateAll settles the field on one tier, and estimateFor stays the single-runner answer', () => {
+  const root = rootWithHistory([...remoteRows('skybox', 200_000, 220_000, 240_000), ...remoteRows('wintop', 900_000, 900_000, 900_000).map((r) => ({ ...r, command: 'sh other.sh' }))]);
+  const model = optionsFor('place', root).finishModel;
+  const all = model.estimateAll([SKYBOX, WINTOP]);
+  assert.deepEqual([...all.keys()], ['skybox', 'wintop']);
+  assert.deepEqual(all.get('skybox'), { ms: 220_000, tier: 'exact', n: 3 });
+  assert.deepEqual(all.get('wintop'), { ms: 440_000, tier: 'exact', n: 3, donor: 'skybox' }, 'exact through the donor, so both are compared alike');
+  assert.deepEqual(model.estimateFor(WINTOP), { ms: 900_000, tier: 'repo-lane', n: 3 }, 'per-runner, wintop would have been compared at repo-lane');
+  assert.deepEqual(model.estimateAll([SKYBOX, { name: 'ghost' }]).get('ghost'), { ms: 220_000, tier: 'exact', n: 3, donor: 'skybox' }, 'a candidate with no rows of its own is estimated through the configured donor');
+  assert.deepEqual([...model.estimateAll([]).keys()], [], 'no candidates, no estimates');
+  assert.deepEqual([...optionsFor('place', rootWithHistory([])).finishModel.estimateAll([SKYBOX, WINTOP]).values()], [null, null], 'no history estimates nobody, and the answer is null rather than a missing key');
+});
+
+test('selectionOptionsFor: rebalance keeps per-runner estimates, since its gain gate costs the source per runner', () => {
+  const root = rootWithHistory([...remoteRows('skybox', 200_000, 220_000, 240_000), ...remoteRows('wintop', 900_000, 900_000, 900_000).map((r) => ({ ...r, command: 'sh other.sh' }))]);
+  assert.equal(typeof optionsFor('rebind', root).finishModel.estimateAll, 'function', 'rebind ranks at one tier, as place does');
+  const rebalance = optionsFor('rebalance', root).finishModel;
+  assert.equal('estimateAll' in rebalance, false, 'so selectRunner falls back to estimateFor for every destination');
+  assert.deepEqual(rebalance.estimateFor(WINTOP), { ms: 900_000, tier: 'repo-lane', n: 3 });
 });
 
 test('selectionOptionsFor: place always offers busyQueueable; selectRunner honours it only when the model ranks', () => {

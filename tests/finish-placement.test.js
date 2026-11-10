@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { makeRunner, tmpDir } from './remote-harness.js';
 import { selectRunner, waitSlots } from '../src/remote-client.js';
-import { DEFAULT_REMOTE_OVERHEAD_MS, jobClass, pairingCommand, RANKED_WAIT_RESIDUAL, runnerRunEstimateMs, runnerWaitMs } from '../src/speed-placement.js';
+import { DEFAULT_REMOTE_OVERHEAD_MS, jobClass, pairingCommand, RANKED_WAIT_RESIDUAL, runnerRunEstimateMs, runnerRunEstimatesMs, runnerWaitMs } from '../src/speed-placement.js';
 
 // ---- runnerRunEstimateMs: the tiers, the donor and its scaling ----
 
@@ -94,6 +94,28 @@ test('runnerRunEstimateMs: the same command in another repo or lane never matche
   assert.deepEqual(runnerRunEstimateMs(mixed, SKYBOX, job(), CONFIGURED), { ms: 910_000, tier: 'repo-lane', n: 3 }, 'only this repo and lane count');
 });
 
+// ---- runnerRunEstimateMs: the BRAIN-899 B2 recency of a tier median ----
+
+/** `n` runs of this exact command on `runner`, started one second apart from `firstStartedAt`, in the order given. */
+const runsFrom = (runner, firstStartedAt, ...runMs) =>
+  runMs.map((ms, i) => remoteRow(runner, ms, { startedAt: firstStartedAt + i * 1000, endedAt: firstStartedAt + i * 1000 + ms }));
+
+test('runnerRunEstimateMs: the median covers the newest 20 matching runs by startedAt, not the append order', () => {
+  const stale = runsFrom('skybox', 1000, 600_000, 600_000, 600_000, 600_000, 600_000);
+  const recent = runsFrom('skybox', 100_000, ...Array.from({ length: 20 }, () => 100_000));
+  const appendedLast = runnerRunEstimateMs([...recent, ...stale], SKYBOX, job(), CONFIGURED);
+  assert.deepEqual(appendedLast, { ms: 100_000, tier: 'exact', n: 20 }, 'the five stale runs were appended last but started first');
+  assert.deepEqual(runnerRunEstimateMs([...stale, ...recent], SKYBOX, job(), CONFIGURED), appendedLast, 'append order decides nothing');
+  assert.deepEqual(runnerRunEstimateMs(runsFrom('skybox', 1000, 100_000, 600_000, 200_000), SKYBOX, job(), CONFIGURED), { ms: 200_000, tier: 'exact', n: 3 }, 'under 20 runs, every one still counts');
+});
+
+test('runnerRunEstimateMs: a run without startedAt sorts oldest, so the newest-20 drops it first', () => {
+  const recent = runsFrom('skybox', 100_000, ...Array.from({ length: 20 }, () => 100_000));
+  const undated = [remoteRow('skybox', 600_000, { startedAt: undefined })];
+  assert.deepEqual(runnerRunEstimateMs([...undated, ...recent], SKYBOX, job(), CONFIGURED), { ms: 100_000, tier: 'exact', n: 20 });
+  assert.deepEqual(runnerRunEstimateMs(runsFrom('skybox', 1000, 100_000, 200_000).concat(undated), SKYBOX, job(), CONFIGURED), { ms: 200_000, tier: 'exact', n: 3 }, 'under 20 it still counts, as a row without startedAt always has');
+});
+
 // ---- runnerRunEstimateMs: the BRAIN-916 class tier ----
 
 const TRAIN_REPO = 'durvivors';
@@ -157,6 +179,35 @@ test('runnerRunEstimateMs: no kept assignment leaves the class tier out, as toda
   assert.deepEqual(runnerRunEstimateMs(rows, SKYBOX, plain, CONFIGURED), { ms: REPO_LANE_MEDIAN, tier: 'repo-lane', n: 12 });
   assert.equal(runnerRunEstimateMs(rows, SKYBOX, { ...plain, command: 'env BRAND_NEW=1 sh .githooks/pre-push-gate.sh verify-full' }, CONFIGURED).tier, 'repo-lane', 'a name this lane has never seen is not a class');
   assert.equal(runnerRunEstimateMs(rows, SKYBOX, { ...plain, command: 'env TRAIN_SHARD=9/9 sh .githooks/pre-push-gate.sh verify-full' }, CONFIGURED).tier, 'repo-lane', 'nor is a class no row shares');
+});
+
+// ---- runnerRunEstimatesMs: BRAIN-899 B3, the whole field at ONE tier ----
+
+test('runnerRunEstimatesMs: a mixed-evidence pair settles on the tier every candidate reaches, donor-scaled included', () => {
+  const rows = [...rowsOf('skybox', 200_000, 220_000, 240_000), ...rowsOf('wintop', 900_000, 900_000, 900_000).map((r) => ({ ...r, command: 'sh other.sh' }))];
+  const all = runnerRunEstimatesMs(rows, [SKYBOX, WINTOP], job(), CONFIGURED);
+  assert.deepEqual(all.get('skybox'), { ms: 220_000, tier: 'exact', n: 3 });
+  assert.deepEqual(all.get('wintop'), { ms: 440_000, tier: 'exact', n: 3, donor: 'skybox' }, 'exact through the donor, not its own 900s repo-lane median');
+  assert.deepEqual(runnerRunEstimateMs(rows, WINTOP, job(), CONFIGURED), { ms: 900_000, tier: 'repo-lane', n: 3 }, 'per-runner, the field would have been compared at two tiers');
+});
+
+test('runnerRunEstimatesMs: a class tier is the common one when every candidate reaches it', () => {
+  const shard = trainJob({ shard: '2/3', id: 'ff' });
+  const rows = [...trainRows('skybox'), ...[700_000, 800_000, 900_000].map((ms, i) => trainRow('wintop', ms, { shard: '9/9', id: IDS[i] }))];
+  const all = runnerRunEstimatesMs(rows, [SKYBOX, WINTOP], shard, CONFIGURED);
+  assert.deepEqual(all.get('skybox'), { ms: 520_000, tier: 'class', n: 3 });
+  assert.deepEqual(all.get('wintop'), { ms: 1_040_000, tier: 'class', n: 3, donor: 'skybox' }, 'its own 3 runs are of another class, so the common tier comes from the donor');
+  assert.deepEqual(runnerRunEstimateMs(rows, WINTOP, shard, CONFIGURED), { ms: 800_000, tier: 'repo-lane', n: 3 }, 'per-runner it would have mixed a repo-lane 800s against a class 520s');
+});
+
+test('runnerRunEstimatesMs: a candidate nothing can estimate is null, and it does not downgrade the others', () => {
+  const rows = rowsOf('skybox', 200_000, 220_000, 240_000);
+  const noDonor = runnerRunEstimatesMs(rows, [SKYBOX, WINTOP], job(), []);
+  assert.deepEqual(noDonor.get('skybox'), { ms: 220_000, tier: 'exact', n: 3 }, 'no tier reaches every candidate, so each keeps its own most specific one');
+  assert.equal(noDonor.get('wintop'), null, 'the one nothing can estimate, which is what leaves selectRunner unranked');
+  assert.deepEqual([...runnerRunEstimatesMs([], [SKYBOX, WINTOP], job(), CONFIGURED).values()], [null, null], 'no history estimates nobody');
+  assert.equal(runnerRunEstimatesMs(rows, [], job(), CONFIGURED).size, 0, 'no candidates, no estimates');
+  assert.deepEqual(runnerRunEstimatesMs(rows, null, job(), CONFIGURED).size, 0);
 });
 
 // ---- runnerWaitMs ----
@@ -466,4 +517,47 @@ test('selectRunner finish: slotAwareWait false ranks with the serial wait (the r
   const aware = await select(probes, runnersOf('fast', 'slow'), { busyQueueable: true, maxRemoteQueue: 4, finishModel: model });
   assert.equal(aware.scores.find((s) => s.name === 'fast').waitMs, 175_000, '(3 + 0.5) x 200s / 4 slots of a 4-core ticket');
   assert.equal(aware.runner.name, 'fast');
+});
+
+// ---- BRAIN-899 B3: one estimateAll call over the whole field ----
+
+/** A model that records every field it was asked about, answering from a per-name table. */
+const recordingModel = (byName, calls = []) => ({
+  calls,
+  estimateFor: (runner) => byName[runner.name] ?? null,
+  estimateAll: (runners) => {
+    calls.push(runners.map((runner) => runner.name));
+    return new Map(runners.map((runner) => [runner.name, byName[runner.name] ?? null]));
+  },
+});
+
+test('selectRunner: estimateAll is called ONCE, over the pool plus the busy candidates the schedule check inspects', async () => {
+  const calls = [];
+  const model = recordingModel({ fast: est(150_000), slow: est(500_000) }, calls);
+  // `fast` is busy and not queueable here, so it never reaches the pool -- only the schedule check below it looks at it
+  const res = await select({ fast: probe(0, NO_CPU), slow: probe(0, ROOM) }, runnersOf('fast', 'slow'), { finishModel: model });
+  assert.deepEqual(calls, [['slow', 'fast']], 'one call, naming the busy candidate outside the pool too');
+  assert.equal(res.runner.name, 'slow');
+  assert.deepEqual(names(res), ['slow']);
+});
+
+test('selectRunner: a busy candidate outside the pool is estimated, so a closing window can still drop it', async () => {
+  const calls = [];
+  const model = recordingModel({ fast: est(400_000), slow: est(500_000) }, calls);
+  const res = await select({ fast: probe(0, NO_CPU), slow: probe(0, ROOM) }, [scheduled('fast'), makeRunner({ ssh: 'slow' })], { now: NOW, finishModel: model });
+  assert.deepEqual(calls, [['slow', 'fast']]);
+  assert.equal(res.runner.name, 'slow');
+  assert.match(reasonFor(res, 'fast'), /window closes at 2026-10-11T20:05:00\.000Z, before the predicted 600s finish \(wait 200s \+ run 400s\)/, 'the busy runner had an estimate to predict with');
+});
+
+test('selectRunner: an estimateAll answer that omits a runner is null, never undefined', async () => {
+  const omitsAll = { estimateFor: () => est(200_000), estimateAll: () => new Map() };
+  const res = await select({ fast: probe(0, NO_CPU), slow: probe(0, ROOM) }, [scheduled('fast'), makeRunner({ ssh: 'slow' })], { now: NOW, finishModel: omitsAll });
+  assert.equal(res.runner.name, 'slow');
+  assert.equal('scores' in res, false, 'a missing estimate leaves the whole field on today\'s ranking');
+  assert.doesNotMatch(reasonFor(res, 'fast'), /predicted/, 'with nothing to predict, the window check stays out of it');
+  const omitsBusy = { estimateFor: () => est(200_000), estimateAll: (runners) => new Map(runners.filter((runner) => runner.name === 'slow').map((runner) => [runner.name, est(200_000)])) };
+  const ranked = await select({ fast: probe(0, NO_CPU), slow: probe(0, ROOM) }, [scheduled('fast'), makeRunner({ ssh: 'slow' })], { now: NOW, finishModel: omitsBusy });
+  assert.equal(ranked.runner.name, 'slow');
+  assert.deepEqual(names(ranked), ['slow'], 'the pool candidate it did answer for is still ranked');
 });

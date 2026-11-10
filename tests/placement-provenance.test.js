@@ -37,11 +37,14 @@ test('historyRow: the placement the publisher passes rides into the row, and its
 
 // ---- end to end, through the real supervisor and the two-runner fake ssh ----
 
-/** Enough successful remote runs of this repo+lane for the repo-lane tier to estimate a runner (donor-scaled where it has none). */
+/** Enough successful remote runs of this repo+lane for the repo-lane tier to estimate a runner (donor-scaled where it has none).
+ *  Started inside the run-estimate window, which is all a placement reads (BRAIN-899 B2). */
+const SEEDED_AT = Date.now() - 3_600_000;
+
 function seedEstimates(ctx, byRunner) {
   const { repoId } = resolveTicketConfig({ cwd: ctx.repoDir, repo: 'r', lane: 'default' });
   const rows = Object.entries(byRunner).flatMap(([runner, durations]) =>
-    durations.map((runMs, i) => ({ id: `seed-${runner}-${i}`, repo: repoId, lane: 'default', command: 'sh seeded.sh', executor: 'remote', runner, exit: 0, startedAt: 1000 + i, endedAt: 1000 + runMs, runMs })));
+    durations.map((runMs, i) => ({ id: `seed-${runner}-${i}`, repo: repoId, lane: 'default', command: 'sh seeded.sh', executor: 'remote', runner, exit: 0, startedAt: SEEDED_AT + i * 1000, endedAt: SEEDED_AT + i * 1000 + runMs, runMs })));
   fs.appendFileSync(paths(ctx.state).history, `${rows.map((r) => JSON.stringify(r)).join('\n')}\n`);
 }
 

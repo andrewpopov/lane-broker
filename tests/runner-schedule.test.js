@@ -6,7 +6,8 @@ import { runnerAvailability, scheduleProblem } from '../src/runner-schedule.js';
 import { selectRunner } from '../src/remote-client.js';
 import { loadGlobalConfig, DEFAULT_GLOBAL_CONFIG, ConfigError } from '../src/config.js';
 import { expectedRunMs } from '../src/estimates-history.js';
-import { remoteSelectOptions } from '../src/supervisor.js';
+import { remoteSelectOptions, selectionOptionsFor } from '../src/supervisor.js';
+import { RUN_ESTIMATE_WINDOW_MS } from '../src/speed-placement.js';
 import { tmpDir } from './remote-harness.js';
 import { freshEnv, writeGlobalConfig } from './helpers.js';
 
@@ -140,4 +141,26 @@ test('remoteSelectOptions: carries the lane\'s history p90 only when a runner is
   assert.ok(scheduled.expectedRunMs >= 60_000 && scheduled.expectedRunMs <= 180_000, String(scheduled.expectedRunMs));
   const plain = remoteSelectOptions(enriched, { ...DEFAULT_GLOBAL_CONFIG, runners: [{ name: 'a', ssh: 'a' }] }, root);
   assert.equal('expectedRunMs' in plain, false);
+});
+
+test('selectionOptionsFor: the schedule pre-check reads the windowed rows, and the full history when the window has none', () => {
+  const scheduledCfg = { ...DEFAULT_GLOBAL_CONFIG, runners: [{ name: 'a', ssh: 'a', schedule: daytime }] };
+  const enriched = { repoId: 'r', lane: 't', remote: {}, resources: {}, weight: 1 };
+  const recent = (runMs, i) => ({ id: `new-${i}`, repo: 'r', lane: 't', startedAt: Date.now() - 3_600_000 + i, endedAt: Date.now() - 3_600_000 + i + runMs, runMs, exit: 0 });
+  const aged = { id: 'old', repo: 'r', lane: 't', startedAt: Date.now() - RUN_ESTIMATE_WINDOW_MS - 86_400_000, runMs: 36_000_000, exit: 0 };
+  aged.endedAt = aged.startedAt + aged.runMs;
+  const rootOf = (rows) => {
+    const root = tmpDir('schedule-window');
+    fs.writeFileSync(path.join(root, 'history.jsonl'), rows.map((r) => `${JSON.stringify(r)}\n`).join(''));
+    return root;
+  };
+  const optionsFor = (rows) => selectionOptionsFor('place', enriched, scheduledCfg, { root: rootOf(rows) });
+
+  const windowed = optionsFor([aged, ...[60_000, 62_000, 64_000].map(recent)]).expectedRunMs;
+  assert.ok(windowed >= 60_000 && windowed <= 300_000, `the 10-hour aged run is outside the window, so it is not the p90: ${windowed}`);
+  const fallback = optionsFor([aged]).expectedRunMs;
+  assert.ok(fallback >= 36_000_000, `a window with no row for this repo+lane reads the full history instead: ${fallback}`);
+  const failedOnly = optionsFor([aged, { ...recent(60_000, 9), exit: 1 }]).expectedRunMs;
+  assert.ok(failedOnly >= 36_000_000, `a window holding only a failed run gives no p90, so the full history does: ${failedOnly}`);
+  assert.equal('expectedRunMs' in optionsFor([]), false, 'no history at all is still no p90');
 });

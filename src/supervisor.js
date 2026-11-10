@@ -40,9 +40,9 @@ import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCo
 import { stateHome, RUNNER_SHUTDOWN_REASON, LOST_REASONS } from './state.js';
 import { childExitSafeFlags } from './node-exit-safe.js';
 import { LOCAL_SETUP_FAILED_EXIT_CODE } from './remote-pipeline.js';
-import { readHistoryRows } from './suggest.js';
+import { readHistoryRows, readRecentHistoryRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
-import { missingLocalDeps, speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, externalCpuSlots, DEFAULT_REMOTE_OVERHEAD_MS, runnerRunEstimateMs, runnerWaitMs, placementOf } from './speed-placement.js';
+import { missingLocalDeps, speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, externalCpuSlots, DEFAULT_REMOTE_OVERHEAD_MS, runnerRunEstimateMs, runnerRunEstimatesMs, runnerWaitMs, placementOf, RUN_ESTIMATE_WINDOW_MS } from './speed-placement.js';
 import { starvedStaleMs } from './external-cpu.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, priorityOf, resolveLaneNice, waitedMs } from './priority.js';
@@ -724,10 +724,13 @@ function logFinishPlacement(root, enriched, picked, prefix = '') {
 /** The winner's own entry in a scored selection, or null when that call was not ranked by the finish model. */
 const scoreOf = (picked, runner) => (Array.isArray(picked?.scores) ? picked.scores.find((s) => s.name === runner?.name) ?? null : null);
 
-function finishModelFor(enriched, globalCfg, rows) {
+function finishModelFor(enriched, globalCfg, rows, { commonTier = true } = {}) {
   const job = { repo: enriched.repoId, lane: enriched.lane, command: enriched.command };
   const runners = globalCfg.runners || [];
-  return { estimateFor: (runner) => runnerRunEstimateMs(rows, runner, job, runners) };
+  const estimateFor = (runner) => runnerRunEstimateMs(rows, runner, job, runners);
+  // rebalance keeps per-runner estimates (BRAIN-899 B4 moves it): its gain gate costs the source with `estimateFor`, so ranking
+  // the destinations at a common tier would compare a donor's exact number against the source's own repo-lane one
+  return commonTier ? { estimateFor, estimateAll: (candidates) => runnerRunEstimatesMs(rows, candidates, job, runners) } : { estimateFor };
 }
 
 const estimateMsOf = (model, runner) => {
@@ -735,11 +738,30 @@ const estimateMsOf = (model, runner) => {
   return Number.isFinite(ms) ? ms : null;
 };
 
+/**
+ * The raw-line filter that keeps a windowed history read to one repo: `"repo":"<id>"`, spelled by stringifying the key itself so it
+ * is exactly what `appendHistory`'s JSON.stringify writes. The closing quote is what keeps `lane-broker` from matching `lane-broker-x`.
+ */
+export const historyIncludeFor = (repoId) => JSON.stringify({ repo: repoId }).slice(1, -1);
+
+/** BRAIN-899 B2: the history a placement ranks on -- the run-estimate window of this repo's rows, read once and passed on. */
+const placementHistoryRows = (root, enriched, now = Date.now()) =>
+  readRecentHistoryRows(paths(root).history, { sinceMs: now - RUN_ESTIMATE_WINDOW_MS, include: historyIncludeFor(enriched.repoId) });
+
+/**
+ * BRAIN-533's schedule pre-check on the windowed rows a placement already read. A window that yields no p90 for this repo+lane (no
+ * run, or only failed or cancelled ones) falls back to the full history, so the lane keeps the exclusions it has always had.
+ */
+function expectedRunMsFor(root, windowRows, enriched) {
+  const { repoId, lane } = enriched;
+  return (Array.isArray(windowRows) ? expectedRunMs(windowRows, repoId, lane) : null) ?? expectedRunMs(readHistoryRows(paths(root).history), repoId, lane);
+}
+
 /** What `selectRunner` needs to judge a ticket: its protocol, and its reservation (shared by a first attempt and a rebind). */
 export function remoteSelectOptions(enriched, globalCfg, root = stateHome(), cpuLimit, historyRows = null) {
   // BRAIN-533: history is read only when some runner has a schedule that could make the expected run time matter.
   const scheduled = (globalCfg.runners || []).some((r) => r.schedule);
-  const expectedMs = scheduled ? expectedRunMs(historyRows ?? readHistoryRows(paths(root).history), enriched.repoId, enriched.lane) : null;
+  const expectedMs = scheduled ? expectedRunMsFor(root, historyRows, enriched) : null;
   // BRAIN-597: first placement, rebind and rebalance all select through here, so a down runner is skipped by every one of them.
   const downRunners = downRunnerReasons(root, globalCfg);
   return {
@@ -780,9 +802,10 @@ export function rebalanceFinishAllows({ destScore, sourceEstimateMs, position, d
  * BRAIN-899: all four rank by predicted finish; only the place path may also queue on a busy runner.
  */
 export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHome(), stuckLocally = false, localBlocked = false, draining = false, cpuLimit, queuedMove = null } = {}) {
-  const rows = readHistoryRows(paths(root).history);
+  // BRAIN-899 B2: ONE windowed, repo-filtered read feeds both the finish model and the schedule pre-check.
+  const rows = placementHistoryRows(root, enriched);
   const base = remoteSelectOptions(enriched, globalCfg, root, cpuLimit, rows);
-  const finishModel = finishModelFor(enriched, globalCfg, rows);
+  const finishModel = finishModelFor(enriched, globalCfg, rows, { commonTier: kind !== 'rebalance' });
   // a move or rebind picks a better home for a ticket that already has one
   if (kind === 'rebind') return { ...base, maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0, allowBusyQueue: localBlocked, finishModel };
   if (kind === 'rebalance' && queuedMove) {

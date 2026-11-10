@@ -437,10 +437,13 @@ test('a ticket that fell back to the local queue is rebound once a runner frees 
   await hold.done;
 });
 
-/** Enough successful remote runs of this repo+lane for the repo-lane tier to estimate the runner, so the rebind is ranked. */
+/** Enough successful remote runs of this repo+lane for the repo-lane tier to estimate the runner, so the rebind is ranked.
+ *  Started inside the run-estimate window, which is all a placement reads (BRAIN-899 B2). */
+const SEEDED_AT = Date.now() - 3_600_000;
+
 function seedRemoteEstimates(ctx, runner, durations) {
   const { repoId } = resolveTicketConfig({ cwd: ctx.repoDir, repo: 'r', lane: 'default' });
-  const rows = durations.map((runMs, i) => ({ id: `seed-${i}`, repo: repoId, lane: 'default', command: 'sh seeded.sh', executor: 'remote', runner, exit: 0, startedAt: 1000 + i, endedAt: 1000 + runMs, runMs }));
+  const rows = durations.map((runMs, i) => ({ id: `seed-${i}`, repo: repoId, lane: 'default', command: 'sh seeded.sh', executor: 'remote', runner, exit: 0, startedAt: SEEDED_AT + i * 1000, endedAt: SEEDED_AT + i * 1000 + runMs, runMs }));
   fs.appendFileSync(paths(ctx.state).history, `${rows.map((r) => JSON.stringify(r)).join('\n')}\n`);
 }
 

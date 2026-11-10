@@ -287,13 +287,16 @@ function neverFits(reservation, probe) {
  * `opts.queuedFilter` (BRAIN-888, `(cand: {runner, probe, finish}) => boolean`): applied to every queued or busy candidate before it can
  * become the queued choice. Without it nothing changes.
  *
- * `opts.finishModel` (BRAIN-899, `{ estimateFor(runner) -> {ms, tier, n, donor?} | null }`): ranks the candidates those rules
+ * `opts.finishModel` (BRAIN-899, `{ estimateFor(runner) -> {ms, tier, n, donor?} | null, estimateAll(runners) -> Map<name, same | null> }`):
+ * ranks the candidates those rules
  * already made eligible by PREDICTED FINISH -- `runnerWaitMs` + the estimate + `DEFAULT_REMOTE_OVERHEAD_MS` -- instead of
  * idle-before-queued and fewest-queued, so a fast runner with a queue can beat a slow idle one. The wait is slot-aware
  * (BRAIN-899 A1, `waitSlots`): a runner whose CPU budget holds several tickets of this size divides its queue by that many.
  * Lowest finish wins; a tie goes to an idle runner, then to more free CPU, then to config order, and a non-idle winner is still
  * `queuedChoice: true`. Every candidate carries its numbers home in `scores` (`[{name, finishMs, waitMs, runMs, tier, n, idle,
- * queued, slots}]`, config order). All or nothing: without the option, or with a null estimate for any candidate, the ranking
+ * queued, slots}]`, config order). After the last probe the whole field -- the pool plus every busy candidate the schedule check
+ * inspects -- is estimated by ONE `estimateAll` call (BRAIN-899 B3), so the candidates are compared at one tier rather than each
+ * at its own most specific one. All or nothing: without the option, or with a null estimate for any candidate, the ranking
  * above is exactly today's and there are no `scores`.
  *
  * `opts.busyQueueable` (BRAIN-899, default false; needs `maxRemoteQueue > 0` and a ranking `finishModel`): the place path's
@@ -445,11 +448,19 @@ export async function selectRunner(runners, opts = {}) {
   const readinessField = { ready, ...(Object.keys(readiness).length > 0 ? { readiness } : {}) };
   const pool = [...idleSeq, ...queuedSeq];
   const pooled = new Set(pool);
+  // every candidate the ranking below, or the schedule check under it, can inspect
+  const inspectable = [...pool, ...busySeq.filter((cand) => !pooled.has(cand))];
   const estimates = new Map();
-  const estimateOf = (runner) => {
-    if (!estimates.has(runner)) estimates.set(runner, scoring ? usableEstimate(finishModel.estimateFor(runner)) : null);
-    return estimates.get(runner);
-  };
+  if (scoring) {
+    // BRAIN-899 B3: ONE `estimateAll` call over that whole field, so every runner is estimated at the same tier instead of each at
+    // its own most specific one. A model that answers only per-runner is folded into the same map, and a runner the answer leaves
+    // out is null, never undefined -- the `estimate.ms` reads below must not have a crash path.
+    const all = typeof finishModel.estimateAll === 'function' ? finishModel.estimateAll(inspectable.map((cand) => cand.runner)) : null;
+    for (const cand of inspectable) {
+      estimates.set(cand.runner, usableEstimate(all === null ? finishModel.estimateFor(cand.runner) : all?.get?.(cand.runner.name)));
+    }
+  }
+  const estimateOf = (runner) => estimates.get(runner) ?? null;
   // BRAIN-899: all or nothing -- one candidate without an estimate leaves the whole field on today's ranking.
   const ranked = scoring && pool.length > 0 && pool.every((cand) => estimateOf(cand.runner) !== null);
   // BRAIN-899 A1: rebalance keeps the serial wait its gain gate was written against (`slotAwareWait: false`)
@@ -458,7 +469,7 @@ export async function selectRunner(runners, opts = {}) {
   const rankedWaitMs = (cand, estimate) => runnerWaitMs({ probe: cand.probe, estimateMs: estimate.ms, room: cand.idle, slots: slotsOf(cand.probe), residual });
   const dropped = new Set();
   if (scoring) {
-    for (const cand of [...pool, ...busySeq.filter((c) => !pooled.has(c))]) {
+    for (const cand of inspectable) {
       const estimate = ranked ? estimateOf(cand.runner) : null;
       const waitMs = estimate === null ? null : rankedWaitMs(cand, estimate);
       if (estimate === null || cand.closesAt === null) continue;

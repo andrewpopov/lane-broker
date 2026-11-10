@@ -21,14 +21,33 @@ function percentile(sorted, p) {
 /** A history row that records a run. Rows with `event` set (BRAIN-730 `supervisor-error`) are diagnostics, never runs. */
 export const isRunRow = (row) => row !== null && typeof row === 'object' && row.event === undefined;
 
+const readText = (file) => {
+  try {
+    return fs.readFileSync(file, 'utf8');
+  } catch {
+    return null;
+  }
+};
+
+/** One JSONL line -> its run row, or null when it is blank, torn, a diagnostic row, or (windowed reader) lacks `include`. The ONE
+ *  definition of that tolerance, so the two history readers below cannot drift. */
+function parseRunLine(line, include) {
+  if (include !== null && !line.includes(include)) return null;
+  const text = typeof line === 'string' ? line : line.toString('utf8');
+  if (!text.trim()) return null;
+  let row;
+  try {
+    row = JSON.parse(text);
+  } catch {
+    return null; // a torn trailing line must not hide the rest of the history
+  }
+  return isRunRow(row) ? row : null;
+}
+
 /** Tolerant JSONL reader: a torn or partial line is skipped, never fatal. */
 export function readRows(file) {
-  let text;
-  try {
-    text = fs.readFileSync(file, 'utf8');
-  } catch {
-    return [];
-  }
+  const text = readText(file);
+  if (text === null) return [];
   const rows = [];
   for (const line of text.split('\n')) {
     if (!line.trim()) continue;
@@ -43,7 +62,97 @@ export function readRows(file) {
 
 /** history.jsonl's run rows: diagnostic rows (`event` set) are skipped. */
 export function readHistoryRows(file) {
-  return readRows(file).filter(isRunRow);
+  const text = readText(file);
+  if (text === null) return [];
+  const rows = [];
+  for (const line of text.split('\n')) {
+    const row = parseRunLine(line, null);
+    if (row !== null) rows.push(row);
+  }
+  return rows;
+}
+
+/** How much of the tail `readRecentHistoryRows` reads at a time. The window, not this, decides coverage. */
+export const RECENT_READ_CHUNK_BYTES = 1 << 20;
+/** How far past the window `readRecentHistoryRows` keeps scanning for rows appended out of start order. */
+export const RECENT_READ_STOP_MARGIN_MS = 24 * 3_600_000;
+const NEWLINE = 0x0a;
+
+/** A buffer's newline-delimited lines. Reading backwards, a buffer that does not start at the file's start opens mid-line, so its
+ *  bytes before the first newline come back as `carry`, to be completed by the chunk before it. Splitting on the newline BYTE is
+ *  safe in utf8: no multi-byte sequence contains one, so no line is ever cut inside a character. */
+function splitLines(buf, atFileStart) {
+  const lines = [];
+  let from = 0;
+  let carry = Buffer.alloc(0);
+  if (!atFileStart) {
+    const first = buf.indexOf(NEWLINE);
+    if (first === -1) return { lines, carry: buf };
+    carry = buf.subarray(0, first);
+    from = first + 1;
+  }
+  for (let at = buf.indexOf(NEWLINE, from); at !== -1; at = buf.indexOf(NEWLINE, at + 1)) {
+    lines.push(buf.subarray(from, at));
+    from = at + 1;
+  }
+  lines.push(buf.subarray(from)); // the file's unterminated tail, or (mid-file) empty
+  return { lines, carry };
+}
+
+/** `buf.length` bytes at `position`, or as many as the file has left. */
+function readAt(fd, buf, position) {
+  let offset = 0;
+  while (offset < buf.length) {
+    const got = fs.readSync(fd, buf, offset, buf.length - offset, position + offset);
+    if (got === 0) break;
+    offset += got;
+  }
+  return offset === buf.length ? buf : buf.subarray(0, offset);
+}
+
+/**
+ * BRAIN-899 B2: the run rows of `file`'s tail that are at least as new as `sinceMs`, read backwards in chunks so the WINDOW, not
+ * a byte cap, decides coverage. Rows come back in file order, with the same parser (so the same tolerance for torn lines and
+ * diagnostic rows) as `readHistoryRows`; a row without `startedAt` is kept, as it is there. A row is appended when it ENDS, so file
+ * order is not start order: a row older than the window is skipped, and the scan stops only at a row that ended (or, without
+ * `endedAt`, started) more than RECENT_READ_STOP_MARGIN_MS before `sinceMs` -- a queued-then-long run, a late reconcile row or one
+ * bogus timestamp cannot cut the window short. `include` is a substring a raw line must contain before it is parsed -- a placement
+ * caller passes `"repo":"<id>"`, exactly as `appendHistory`'s JSON.stringify writes it -- so the parse cost scales with that repo's
+ * rows, not with the whole history.
+ */
+export function readRecentHistoryRows(file, { sinceMs = null, include = null } = {}) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+  } catch {
+    return [];
+  }
+  try {
+    const rows = [];
+    let carry = Buffer.alloc(0);
+    let end = fs.fstatSync(fd).size;
+    let stopped = false;
+    const take = (line) => {
+      const row = parseRunLine(line, include);
+      if (row === null) return;
+      if (sinceMs === null || !Number.isFinite(row.startedAt) || row.startedAt >= sinceMs) {
+        rows.push(row);
+        return;
+      }
+      const settledAt = Number.isFinite(row.endedAt) ? row.endedAt : row.startedAt;
+      if (settledAt < sinceMs - RECENT_READ_STOP_MARGIN_MS) stopped = true;
+    };
+    while (end > 0 && !stopped) {
+      const start = Math.max(0, end - RECENT_READ_CHUNK_BYTES);
+      const chunk = splitLines(Buffer.concat([readAt(fd, Buffer.allocUnsafe(end - start), start), carry]), start === 0);
+      carry = chunk.carry;
+      for (let i = chunk.lines.length - 1; i >= 0 && !stopped; i -= 1) take(chunk.lines[i]);
+      end = start;
+    }
+    return rows.reverse();
+  } finally {
+    fs.closeSync(fd);
+  }
 }
 
 /** Pure: rows -> { groups, skippedNoObservation }. Declared cpuCores is the group's most recent row's. */
