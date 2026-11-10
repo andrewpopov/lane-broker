@@ -825,7 +825,7 @@ function validateRepoConfig(cfg, sourcePath) {
       assert(Number.isInteger(lane.localFirstWaitMs) && lane.localFirstWaitMs >= 0, `${sourcePath}: lane "${name}".localFirstWaitMs must be a non-negative integer`);
     }
     assert(lane.remoteExclusive === undefined, `${sourcePath}: ${remoteExclusiveRefusal(name)}`);
-    for (const field of ['remoteDepsCache', 'remoteDepsCacheRootScriptsSafe', 'remoteOmitEscapingSymlinks', 'prewarm']) {
+    for (const field of ['remoteDepsCache', 'remoteDepsCacheRootScriptsSafe', 'remoteDepsCacheKeyFilesCoverInstallScripts', 'remoteOmitEscapingSymlinks', 'prewarm']) {
       if (lane[field] !== undefined) assert(typeof lane[field] === 'boolean', `${sourcePath}: lane "${name}".${field} must be a boolean`);
     }
     if (lane.remoteDepsCacheKeyFiles !== undefined) {
@@ -839,6 +839,12 @@ function validateRepoConfig(cfg, sourcePath) {
       );
       const excluded = lane.remoteExclude === undefined ? null : lane.remoteDepsCacheKeyFiles.find((file) => excludingPattern(lane.remoteExclude, file));
       assert(excluded === null || excluded === undefined, `${sourcePath}: lane "${name}".remoteDepsCacheKeyFiles path "${excluded}" is excluded by remoteExclude`);
+    }
+    if (lane.remoteDepsCacheKeyFilesCoverInstallScripts === true) {
+      assert(
+        isValidDepsKeyFilesShape(lane.remoteDepsCacheKeyFiles),
+        `${sourcePath}: lane "${name}".remoteDepsCacheKeyFilesCoverInstallScripts requires remoteDepsCacheKeyFiles`,
+      );
     }
   }
   if (cfg.conflicts !== undefined) {
@@ -1327,7 +1333,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
   if (isDeclaredLane) {
     laneCfg = repoConfig.lanes[laneName];
   } else if (undeclaredTemplateName) {
-    // Inherit weight/cpuCores/minCpuCores/maxExecutionCpuCores/memoryBytes/nice/noProgressTimeoutMs/silenceTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteDepsCacheKeyFiles/remoteOmitEscapingSymlinks/remoteExclude/remoteArtifacts/remoteArtifactsOn/class/priority/aging/cache/rightSize
+    // Inherit weight/cpuCores/minCpuCores/maxExecutionCpuCores/memoryBytes/nice/noProgressTimeoutMs/silenceTimeoutMs/remote/remoteDeps/remoteSetup/remoteDepsCache/remoteDepsCacheRootScriptsSafe/remoteDepsCacheKeyFiles/remoteDepsCacheKeyFilesCoverInstallScripts/remoteOmitEscapingSymlinks/remoteExclude/remoteArtifacts/remoteArtifactsOn/class/priority/aging/cache/rightSize
     // from the named declared lane, keeping this lane's OWN key/name. Not
     // inherited: `localRefused` (stays default false), the template's named
     // conflicts (only the `*` wildcard universe below reaches this lane, same
@@ -1353,6 +1359,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       localFirstWaitMs: templateCfg.localFirstWaitMs,
       remoteDepsCacheRootScriptsSafe: templateCfg.remoteDepsCacheRootScriptsSafe,
       remoteDepsCacheKeyFiles: templateCfg.remoteDepsCacheKeyFiles,
+      remoteDepsCacheKeyFilesCoverInstallScripts: templateCfg.remoteDepsCacheKeyFilesCoverInstallScripts,
       remoteOmitEscapingSymlinks: templateCfg.remoteOmitEscapingSymlinks,
       remoteExclude: templateCfg.remoteExclude,
       remoteArtifacts: templateCfg.remoteArtifacts,
@@ -1449,6 +1456,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     remoteDepsCacheRootScriptsSafe: laneCfg.remoteDepsCacheRootScriptsSafe === true,
     // PKG-277: repo files a safe-declared non-workspace root script reads; keyed into the deps cache key.
     remoteDepsCacheKeyFiles: Array.isArray(laneCfg.remoteDepsCacheKeyFiles) ? laneCfg.remoteDepsCacheKeyFiles : null,
+    // BRAIN-926: true asserts those key files also cover every repo input the dependency install scripts read.
+    remoteDepsCacheKeyFilesCoverInstallScripts: laneCfg.remoteDepsCacheKeyFilesCoverInstallScripts === true,
     // BRAIN-334: true leaves a tracked symlink that points outside the repo out of the remote snapshot instead of making the lane ineligible.
     remoteOmitEscapingSymlinks: laneCfg.remoteOmitEscapingSymlinks === true,
     // BRAIN-642: paths left out of the remote snapshot; ignored by a local run.

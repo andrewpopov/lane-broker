@@ -1156,6 +1156,8 @@ async function dispatchOnce(opts) {
     remoteDepsCacheRootScriptsSafe = false,
     // PKG-277: sent only with the safe flag; a runner without `deps-key-files/1` would ignore it, so the supervisor requires the capability.
     remoteDepsCacheKeyFiles = null,
+    // BRAIN-926: the caller (the supervisor) decides this from the chosen runner's probe; without `deps-key-files/2` the field is never sent.
+    remoteDepsCacheKeyFilesCoverInstallScripts = false,
     // BRAIN-398: the lane's declared artifact paths/globs and policy (null: none, or the runner cannot return them),
     // and the submitter's own caps on what it will accept back.
     remoteArtifacts = null,
@@ -1271,7 +1273,10 @@ async function dispatchOnce(opts) {
     if (remoteDepsCache === false) header.remoteDepsCache = false;
     if (remoteDepsCacheRootScriptsSafe === true) {
       header.remoteDepsCacheRootScriptsSafe = true;
-      if (Array.isArray(remoteDepsCacheKeyFiles) && remoteDepsCacheKeyFiles.length > 0) header.remoteDepsCacheKeyFiles = remoteDepsCacheKeyFiles;
+      if (Array.isArray(remoteDepsCacheKeyFiles) && remoteDepsCacheKeyFiles.length > 0) {
+        header.remoteDepsCacheKeyFiles = remoteDepsCacheKeyFiles;
+        if (remoteDepsCacheKeyFilesCoverInstallScripts === true) header.remoteDepsCacheKeyFilesCoverInstallScripts = true;
+      }
     }
   }
   if (Array.isArray(remoteArtifacts) && remoteArtifacts.length > 0) {

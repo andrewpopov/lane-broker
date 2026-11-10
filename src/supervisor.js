@@ -55,7 +55,7 @@ import { remoteCpuAllocation, selectRunner, dispatchRemote, remoteCancel, needsP
 import { remoteExcludeWarnings } from './remote-exclude.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
-import { DEPS_KEY_FILES_CAPABILITY, EXECUTION_CEILING_CAPABILITY, REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
+import { DEPS_KEY_FILES_CAPABILITY, DEPS_KEY_FILES_COVER_CAPABILITY, EXECUTION_CEILING_CAPABILITY, REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
 import { SNAPSHOT_GZIP_CAPABILITY, TRANSFER_GZIP } from './remote-gzip.js';
 import { BLOB_CACHE_CAPABILITY } from './remote-blobs.js';
 import { createAttempt, readAttempt, updateAttempt, runnerPhaseRecorder, fallbackToLocal, publishTerminal, remoteCancelledResult, remoteCancelExitDeadlineMs, REMOTE_CANCEL_ABANDONED_EXIT, CANCELLING_LOCK_TIMEOUT_MS } from './attempts.js';
@@ -1282,6 +1282,8 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     // BRAIN-642: re-read per dispatch like the artifacts gate, so a rebalance to a runner without it sends the legacy stream.
     const snapshotGzip = Array.isArray(probe?.capabilities) && probe.capabilities.includes(SNAPSHOT_GZIP_CAPABILITY);
     const blobCache = globalCfg.remoteBlobCache === true && Array.isArray(probe?.capabilities) && probe.capabilities.includes(BLOB_CACHE_CAPABILITY);
+    // BRAIN-926: re-read per dispatch like those two; a runner without `deps-key-files/2` never gets the assertion and keys the whole tree.
+    const keyFilesCoverInstallScripts = enriched.remote.remoteDepsCacheKeyFilesCoverInstallScripts === true && Array.isArray(probe?.capabilities) && probe.capabilities.includes(DEPS_KEY_FILES_COVER_CAPABILITY);
     let target = null;
     const onTransferStats = (stats) => {
       lastTransferStats = stats;
@@ -1295,6 +1297,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     // header from (see its own `needsProtocol2` call).
     dispatch = await dispatchRemote({
       ...enriched.remote,
+      remoteDepsCacheKeyFilesCoverInstallScripts: keyFilesCoverInstallScripts,
       remoteArtifacts: artifactsSupported ? declaredArtifacts : null,
       transfer: snapshotGzip ? TRANSFER_GZIP : undefined,
       blobCache,

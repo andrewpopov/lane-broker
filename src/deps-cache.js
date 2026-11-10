@@ -556,14 +556,40 @@ function installSourceDigest(rootDir, roots = ['']) {
   return hash.digest('hex');
 }
 
-/** PKG-277: pushes the `key-files` part (the lane's `remoteDepsCacheKeyFiles`, sorted, path names included), or returns the refusal. */
-function keyFilesPart({ rootDir, keyFiles, parts }) {
+/** BRAIN-926: the first symlink BELOW one of `roots`; the digest hashes link text, never the target's bytes. */
+function firstNestedSymlink(rootDir, roots) {
+  const walk = (rel) => {
+    const stat = fs.lstatSync(path.join(rootDir, rel));
+    if (stat.isSymbolicLink()) return rel;
+    if (!stat.isDirectory()) return null;
+    for (const name of fs.readdirSync(path.join(rootDir, rel)).sort()) {
+      if (name === 'node_modules' || name === '.git') continue;
+      const found = walk(`${rel}/${name}`);
+      if (found) return found;
+    }
+    return null;
+  };
+  for (const start of roots) {
+    const found = walk(start);
+    if (found && found !== start) return found;
+  }
+  return null;
+}
+
+/** PKG-277: pushes the `key-files` part (the lane's `remoteDepsCacheKeyFiles`, sorted, path names included), or returns the refusal.
+ *  BRAIN-926: `coverInstallScripts` also marks the key, and refuses a nested symlink whose target's bytes the digest never covers. */
+function keyFilesPart({ rootDir, keyFiles, parts, coverInstallScripts = false }) {
   try {
     for (const rel of keyFiles) {
       assertContained(rootDir, rel);
       if (!fs.existsSync(path.join(rootDir, rel))) return { key: null, reason: `remoteDepsCacheKeyFiles path ${rel} is not in the snapshot` };
     }
+    if (coverInstallScripts) {
+      const linked = firstNestedSymlink(rootDir, keyFiles);
+      if (linked) return { key: null, reason: `remoteDepsCacheKeyFilesCoverInstallScripts refuses symlink ${linked} under a key path, whose target the key would not cover` };
+    }
     parts.push(['key-files', installSourceDigest(rootDir, [...keyFiles].sort())]);
+    if (coverInstallScripts) parts.push(['key-files-cover', 'install-scripts']);
     return null;
   } catch (error) {
     return { key: null, reason: error.message };
@@ -595,6 +621,7 @@ export function computeDepsKey({
   npmVersion,
   rootScriptsSafe = false,
   keyFiles = [],
+  keyFilesCoverInstallScripts = false,
   runtime = { version: process.version, platform: process.platform, arch: process.arch },
   system = currentSystem(),
   toolVersion = (cmd) => firstLineOfCommand(cmd, env),
@@ -655,15 +682,16 @@ export function computeDepsKey({
     if (ws.reason) return { key: null, reason: ws.reason };
     parts.push(...ws.parts);
   }
-  // PKG-277: which repo sources a declared-safe root script may have read. Precedence: a workspace repo with install scripts
-  // keys the whole tree (over keyFiles); else the lane's keyFiles; else a workspace repo keys the whole tree; else refuse.
+  // PKG-277: which repo sources a declared-safe root script may have read. Precedence: a workspace repo with install scripts keys
+  // the whole tree (over keyFiles) unless the lane covers those scripts (BRAIN-926); else keyFiles; else whole tree; else refuse.
   const wholeTree = () => {
     try { parts.push(['install-sources', installSourceDigest(rootDir)]); return null; }
     catch (error) { return { key: null, reason: error.message }; }
   };
+  const coverInstallScripts = rootScriptsSafe && keyFiles.length > 0 && keyFilesCoverInstallScripts === true;
   let refused = null;
-  if (isWorkspaceRepo && eligibility.hasInstallScript) refused = wholeTree();
-  else if (rootScriptsSafe && keyFiles.length > 0) refused = keyFilesPart({ rootDir, keyFiles, parts });
+  if (isWorkspaceRepo && eligibility.hasInstallScript && !coverInstallScripts) refused = wholeTree();
+  else if (rootScriptsSafe && keyFiles.length > 0) refused = keyFilesPart({ rootDir, keyFiles, parts, coverInstallScripts });
   else if (rootScriptsSafe && isWorkspaceRepo) refused = wholeTree();
   else if (rootScriptsSafe) refused = { key: null, reason: 'remoteDepsCacheRootScriptsSafe on a repo without workspaces needs remoteDepsCacheKeyFiles naming the files its root scripts read' };
   if (refused) return refused;

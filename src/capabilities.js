@@ -39,6 +39,9 @@ export const SCRUB_COMMAND_ENV_CAPABILITY = 'scrub-command-env/1';
 // PKG-277: a runner keys `remoteDepsCacheKeyFiles` into the deps cache key; an older one ignores the header field and would key without them.
 export const DEPS_KEY_FILES_CAPABILITY = 'deps-key-files/1';
 
+// BRAIN-926: a runner also keys them for a workspace repo whose dependencies have install scripts; an older one keys the whole tree instead.
+export const DEPS_KEY_FILES_COVER_CAPABILITY = 'deps-key-files/2';
+
 // BRAIN-894: a runner reads the header's `group`, so shards of one job share one slot of its per-repo high cap.
 export const PRIORITY_GROUP_CAPABILITY = 'priority-group/1';
 
@@ -62,6 +65,7 @@ export const CAPABILITIES = [
   SCRUB_COMMAND_ENV_CAPABILITY,
   REUSE_GREEN_CAPABILITY,
   DEPS_KEY_FILES_CAPABILITY,
+  DEPS_KEY_FILES_COVER_CAPABILITY,
   PRIORITY_GROUP_CAPABILITY,
 ];
 
