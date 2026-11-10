@@ -42,7 +42,7 @@ import { childExitSafeFlags } from './node-exit-safe.js';
 import { LOCAL_SETUP_FAILED_EXIT_CODE } from './remote-pipeline.js';
 import { readHistoryRows } from './suggest.js';
 import { expectedRunMs } from './estimates-history.js';
-import { missingLocalDeps, speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, externalCpuSlots, DEFAULT_REMOTE_OVERHEAD_MS, runnerRunEstimateMs, runnerWaitMs } from './speed-placement.js';
+import { missingLocalDeps, speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, externalCpuSlots, DEFAULT_REMOTE_OVERHEAD_MS, runnerRunEstimateMs, runnerWaitMs, placementOf } from './speed-placement.js';
 import { starvedStaleMs } from './external-cpu.js';
 import { effectiveNow } from './priority-clock.js';
 import { isPriorityTier, priorityAuditOf, priorityOf, resolveLaneNice, waitedMs } from './priority.js';
@@ -556,6 +556,13 @@ function pushGateRowFields({ worktree, branch, caller, pushArgsHash }) {
   return { worktree, branch, caller, pushArgsHash };
 }
 
+/** BRAIN-899 A2: a cleared prediction (`placement: undefined`) writes no key, so a row never claims a placement it lacks. */
+function withoutUndefinedPlacement(result) {
+  if (!('placement' in result) || result.placement !== undefined) return result;
+  const { placement: _cleared, ...rest } = result;
+  return rest;
+}
+
 export function historyRow(ticket, result, { fallbackReason, lease, contentKey = isCleanPass(result) ? undefined : ticket.contentKey, contentKeyVerified = false } = {}) {
   const executor = result.executor ?? 'local';
   const localReason = executor === 'local' ? (fallbackReason === undefined ? ticket.localReason : `fallback:${fallbackReason}`) : undefined;
@@ -588,7 +595,7 @@ export function historyRow(ticket, result, { fallbackReason, lease, contentKey =
     ...(lease?.bypassRefused ? { bypassRefused: lease.bypassRefused } : {}),
     // BRAIN-425: every row states what the lane was granted and how it ended; a grant or exit in `result` wins
     ...terminalRowDefaults({ resources: ticket.resources, grantedCpuCores: lease?.grantedCpuCores }),
-    ...result,
+    ...withoutUndefinedPlacement(result),
     executor,
     ...(localReason ? { localReason } : {}),
     ...(localReason && localReason === ticket.localReason && ticket.localReasonText ? { localReasonText: ticket.localReasonText } : {}),
@@ -690,15 +697,26 @@ function logSpeedDecision(root, enriched, choice, detail) {
 
 const seconds = (ms) => (ms === null ? 'unbounded' : `${Math.round(ms / 1000)}s`);
 
-function logFinishPlacement(root, enriched, picked) {
-  if (!picked?.runner) return;
-  const scores = Array.isArray(picked.scores) ? picked.scores : [];
-  // BRAIN-602: a runner left out of the ranking says why, so a busy runner skipped as `probe timed out` is countable
-  const timedOut = (picked.skipped ?? []).filter((s) => s.reason === 'probe timed out' && !scores.some((sc) => sc.name === s.name));
-  if (scores.length === 0 && timedOut.length === 0) return;
-  const scored = scores.map((s) => `${s.name} ${seconds(s.finishMs)} (wait ${seconds(s.waitMs)}, run ${seconds(s.runMs)}, ${s.tier} n=${s.n})`).join(' | ') || 'unscored';
-  const skippedNote = timedOut.length > 0 ? ` [skipped: ${timedOut.map((s) => `${s.name}: probe timed out`).join('; ')}]` : '';
-  const line = `lane: finish-placement: ts=${new Date().toISOString()} ${enriched.id}: ${scored}${skippedNote} -> ${picked.runner.name}${picked.queuedChoice === true ? ' (queued)' : ''}\n`;
+/**
+ * BRAIN-899 A3: the body of one `finish-placement` line. Every scored candidate carries its queue depth and slot count, every
+ * runner left out says why as an EXCLUSION -- a runner merely queued but still in the running for the choice is not one, and
+ * neither is the winner -- an unranked decision says `unscored`, and a decision with no runner says `none`. Null when there was
+ * no field to judge at all (no runners configured), which is not a decision worth a line.
+ */
+export function finishPlacementText(picked, prefix = '') {
+  const scores = Array.isArray(picked?.scores) ? picked.scores : [];
+  const excluded = (picked?.skipped ?? []).filter((s) => s?.candidate !== true && s?.name !== picked?.runner?.name);
+  if (scores.length === 0 && excluded.length === 0 && !picked?.runner) return null;
+  const scored = scores.map((s) => `${s.name} ${seconds(s.finishMs)} (wait ${seconds(s.waitMs)}, run ${seconds(s.runMs)}, ${s.tier} n=${s.n}, q=${s.queued} slots=${s.slots})`).join(' | ') || 'unscored';
+  const excludedNote = excluded.length > 0 ? ` [excluded: ${excluded.map((s) => `${s?.name}: ${s?.reason}`).join('; ')}]` : '';
+  const winner = picked?.runner ? `${picked.runner.name}${picked.queuedChoice === true ? ' (queued)' : ''}` : 'none';
+  return `${prefix}${scored}${excludedNote} -> ${winner}`;
+}
+
+function logFinishPlacement(root, enriched, picked, prefix = '') {
+  const text = finishPlacementText(picked, prefix);
+  if (text === null) return;
+  const line = `lane: finish-placement: ts=${new Date().toISOString()} ${enriched.id}: ${text}\n`;
   process.stderr.write(line);
   writeBrokerLog(root, line);
 }
@@ -781,10 +799,10 @@ export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHom
       if (sourceMs === null || destMs === null) return finish < REBALANCE_QUEUED_GAIN * stayFinish;
       return runnerWaitMs({ probe, estimateMs: destMs, room: idle === true }) + destMs + DEFAULT_REMOTE_OVERHEAD_MS < REBALANCE_QUEUED_GAIN * queuedMove.position * sourceMs;
     };
-    return { ...base, maxRemoteQueue: globalCfg.remoteRebalanceQueuedMax, allowBusyQueue: true, queuedFilter, finishModel };
+    return { ...base, maxRemoteQueue: globalCfg.remoteRebalanceQueuedMax, allowBusyQueue: true, queuedFilter, finishModel, slotAwareWait: false };
   }
   if (kind === 'rebalance') {
-    return { ...base, maxRemoteQueue: 0, requireCapabilities: draining ? [...base.requireCapabilities, REMOTE_WITHDRAW_CAPABILITY] : base.requireCapabilities, finishModel };
+    return { ...base, maxRemoteQueue: 0, requireCapabilities: draining ? [...base.requireCapabilities, REMOTE_WITHDRAW_CAPABILITY] : base.requireCapabilities, finishModel, slotAwareWait: false };
   }
   return { ...base, finishModel, busyQueueable: true };
 }
@@ -799,7 +817,7 @@ export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHom
  * `process.exit()` has already been called on that path, matching every
  * other terminal path in this file.
  *
- * BRAIN-405: `rebind` (`{ generation, runner, probe }`) runs the same attempt for a ticket that already fell back and sits in
+ * BRAIN-405: `rebind` (`{ generation, runner, probe, score }`) runs the same attempt for a ticket that already fell back and sits in
  * the local queue: the caller has chosen the runner, this withdraws the ticket from the queue (only if it is still queued)
  * right before dispatch, and any failure after that puts it back at its original queue position and resolves
  * `{ fallback: true, rebindFailed: true }` -- a rebind never terminates a ticket by refusing it.
@@ -863,11 +881,15 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   };
 
   let selectedRunner = null;
+  // BRAIN-899 A2: the prediction of the FINAL dispatch of this attempt, so the history row it publishes can be joined to the wait
+  // and run that dispatch actually saw. Every dispatch site sets it; an unranked one clears it.
+  let placement = null;
+  const placementField = () => (placement ? { placement } : { placement: undefined });
   function writeResultSync(result) {
     // BRAIN-549: settled before the result is published, so a caller that reads history once `lane run` returns finds the row
     const contentKey = settledContentKey(enriched);
     atomicWriteJson(enriched.resultPath, result);
-    appendHistory(root, historyRow(enriched, { ...result, ...(selectedRunner ? { runner: selectedRunner } : {}) }, { contentKey, contentKeyVerified: contentKey !== null }));
+    appendHistory(root, historyRow(enriched, { ...result, ...(selectedRunner ? { runner: selectedRunner } : {}), ...(placement ? { placement } : {}) }, { contentKey, contentKeyVerified: contentKey !== null }));
   }
 
   /**
@@ -1090,7 +1112,9 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     ? { runner: rebind.runner, skipped: [], queuedChoice: false, probe: rebind.probe }
     : await selectRunner(globalCfg.runners || [], placeOptions);
   let { runner, skipped, queuedChoice, probe, busy, readiness, ready } = placed;
-  logFinishPlacement(root, enriched, placed);
+  // a rebind's own selection is logged by tryRebind, which holds the scores this synthetic `placed` deliberately drops
+  if (!rebind) logFinishPlacement(root, enriched, placed);
+  placement = placementOf(rebind?.score);
   // BRAIN-623: `lane status` names a runner that lacked what the lane needs; a runner that passed is ready again
   if (placeOptions && Object.values(placeOptions.readinessNeeds).some(hasNeed)) {
     await recordReadiness(root, readiness ?? {}, ready ?? [], Date.now()).catch(() => {});
@@ -1165,7 +1189,9 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     // Every runner this ticket is ever dispatched to is remembered for good (it survives fallback, restore and rebalance): a runner
     // keeps a ticket dir for this id, so dispatching to it a second time would meet the first dispatch's stale state.
     const dispatchedRunners = [...new Set([...(readAttempt(root, enriched.id)?.dispatchedRunners ?? []), runner.name])];
-    await updateAttempt(root, enriched.id, gen, { phase: 'running', runner: runner.name, runnerPhase: undefined, commandStartedAt: undefined, dispatchedRunners, ...(rebind ? { executor: 'remote' } : {}), ...(queuedAt ? { queuedAt } : {}) }, { refuseWhileMigrating: true });
+    // `runner` may be the busy fallback by now, which no score covers: re-read the winner's score against the runner actually dispatched
+    if (!rebind) placement = placementOf(scoreOf(placed, runner));
+    await updateAttempt(root, enriched.id, gen, { phase: 'running', runner: runner.name, runnerPhase: undefined, commandStartedAt: undefined, dispatchedRunners, ...placementField(), ...(rebind ? { executor: 'remote' } : {}), ...(queuedAt ? { queuedAt } : {}) }, { refuseWhileMigrating: true });
   } catch (err) {
     if (!(err instanceof MigrationInProgressError)) throw err;
     process.stderr.write(`lane: ${err.message}\n`);
@@ -1374,10 +1400,11 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
           if (candidates.length === 0) return null;
           const idleOptions = selectionOptionsFor('rebalance', enriched, globalCfg, { draining, root, cpuLimit });
           const picked = await selectRunner(candidates, idleOptions);
+          if (picked.runner) logFinishPlacement(root, enriched, picked, 'rebalance: ');
           // BRAIN-899 R5: a scored destination must also beat staying put by the gain; a drain or the refusal deadline is ungated
           const sourceEstimateMs = estimateMsOf(idleOptions.finishModel, runner);
           const finishAllows = (result) => rebalanceFinishAllows({ destScore: scoreOf(result, result.runner), sourceEstimateMs, position: sourceFacts?.position, draining, refusalCapElapsed: refusalCapElapsed?.() });
-          const idleTarget = picked.runner && hasMeasuredHeadroom(picked.probe) ? { runner: picked.runner, probe: picked.probe } : null;
+          const idleTarget = picked.runner && hasMeasuredHeadroom(picked.probe) ? { runner: picked.runner, probe: picked.probe, score: scoreOf(picked, picked.runner) } : null;
           target = idleTarget && finishAllows(picked) ? idleTarget : null;
           if (target || draining) return target;
           // at the refusal deadline an idle destination the gain gate turned down is taken after all: refusal is the worse outcome
@@ -1386,13 +1413,14 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
           const stuckBehindOwner = globalCfg.remoteRebalanceQueuedMax > 0 && sourceFacts?.position >= 1 && sourceFacts.behindOtherOwner === true && sourceFacts.reservationOwnerWaitedMs >= globalCfg.remoteRebalanceMinQueuedMs;
           if (!stuckBehindOwner) return null;
           const queued = await selectRunner(candidates, selectionOptionsFor('rebalance', enriched, globalCfg, { draining, root, cpuLimit, queuedMove: { position: sourceFacts.position, sourceRunner: runner } }));
+          if (queued.runner) logFinishPlacement(root, enriched, queued, 'rebalance: queued: ');
           // the cap may have run out while the probes were out: refusal must stay reachable
           if (refusalCapElapsed?.()) return (target = idleTarget);
           if (!queued.runner) return null;
           if (!finishAllows(queued)) return null;
           const viaQueue = queued.queuedChoice === true;
           if (!viaQueue && !hasMeasuredHeadroom(queued.probe)) return null;
-          target = { runner: queued.runner, probe: queued.probe, ...(viaQueue ? { behindOwnerPosition: sourceFacts.position } : {}) };
+          target = { runner: queued.runner, probe: queued.probe, score: scoreOf(queued, queued.runner), ...(viaQueue ? { behindOwnerPosition: sourceFacts.position } : {}) };
           return target;
         },
         // The worktree must still be what was snapshotted, then the intent is made durable BEFORE the irreversible withdraw.
@@ -1422,6 +1450,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       // This is a new placement, not a rebalance: any configured runner this ticket has not been on is a candidate.
       const picked = rebind ? { runner: null } : await selectRunner((globalCfg.runners || []).filter((r) => !visited.includes(r.name)), selectionOptionsFor('place', enriched, globalCfg, { root, cpuLimit }));
       if (!picked.runner) break;
+      logFinishPlacement(root, enriched, picked, 'redispatch: ');
       const from = runner;
       epoch += 1;
       priorRemoteQueuedMs += Math.max(0, Date.now() - epochDispatchedAt);
@@ -1431,10 +1460,11 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       runner = picked.runner;
       probe = picked.probe;
       selectedRunner = runner.name;
+      placement = placementOf(scoreOf(picked, runner));
       try {
         await updateAttempt(
           root, enriched.id, gen,
-          { runner: runner.name, dispatchedRunners: [...new Set([...(readAttempt(root, enriched.id)?.dispatchedRunners ?? []), runner.name])], dispatchEpoch: epoch, moves: [...moves] },
+          { runner: runner.name, dispatchedRunners: [...new Set([...(readAttempt(root, enriched.id)?.dispatchedRunners ?? []), runner.name])], dispatchEpoch: epoch, moves: [...moves], ...placementField() },
           { refuseWhileMigrating: true },
         );
       } catch (err) {
@@ -1471,10 +1501,11 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     runner = to.runner;
     probe = to.probe;
     selectedRunner = runner.name;
+    placement = placementOf(to.score);
     try {
       await updateAttempt(
         root, enriched.id, gen,
-        { runner: runner.name, dispatchedRunners: [...new Set([...(readAttempt(root, enriched.id)?.dispatchedRunners ?? []), runner.name])], dispatchEpoch: epoch, moves: [...moves], moving: { from: from.name, to: runner.name, phase: 'dispatching', at: lastMoveAt } },
+        { runner: runner.name, dispatchedRunners: [...new Set([...(readAttempt(root, enriched.id)?.dispatchedRunners ?? []), runner.name])], dispatchEpoch: epoch, moves: [...moves], ...placementField(), moving: { from: from.name, to: runner.name, phase: 'dispatching', at: lastMoveAt } },
         { refuseWhileMigrating: true },
       );
       movingSet = true;
@@ -1934,7 +1965,7 @@ async function main() {
       process.stderr.write(line);
       writeBrokerLog(root, line);
     }
-    await runRemoteAttempt(root, enriched, globalCfg, abortController.signal, { generation: attemptGeneration, runner, probe, queued: queuedChoice === true }, cpuLimit);
+    await runRemoteAttempt(root, enriched, globalCfg, abortController.signal, { generation: attemptGeneration, runner, probe, queued: queuedChoice === true, score: scoreOf(rebound, runner) }, cpuLimit);
   }
   let nextRebindAt = Date.now() + (globalCfg.remoteRebindIntervalMs || 0);
   // BRAIN-442: a local-first ticket is not rebind-eligible until it has waited in the local queue this long

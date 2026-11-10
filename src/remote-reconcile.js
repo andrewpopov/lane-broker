@@ -300,12 +300,13 @@ async function publishSettled(root, id, attempt, resultPath, kind, buildResult, 
         // cancel precedence, same shape `lane cancel` writes
         written = remoteCancelledResult(id, attempt.startedAt);
         atomicWriteJson(resultPath, written);
-        appendHistory(root, { ...terminalRowDefaults(attempt), id, exit: 130, cancelled: true, endedAt: Date.now(), executor: 'remote', runner: attempt.runner });
+        appendHistory(root, { ...terminalRowDefaults(attempt), id, exit: 130, cancelled: true, endedAt: Date.now(), executor: 'remote', runner: attempt.runner, ...(attempt.placement ? { placement: attempt.placement } : {}) });
         return;
       }
       written = buildResult();
       atomicWriteJson(resultPath, written);
-      appendHistory(root, { ...terminalRowDefaults(attempt), ...written });
+      // BRAIN-899 A2: the attempt carries the FINAL dispatch's prediction, which is what this settled row's own wait is measured against
+      appendHistory(root, { ...terminalRowDefaults(attempt), ...written, ...(attempt.placement ? { placement: attempt.placement } : {}) });
     },
     {
       expect: (cur) =>

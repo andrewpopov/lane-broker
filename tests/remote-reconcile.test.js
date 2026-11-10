@@ -461,6 +461,20 @@ test('an interrupted move is skipped', async () => {
   assertKept(ctx, id);
 });
 
+test('BRAIN-899 A2: the settled row copies the attempt\'s placement, the prediction of the dispatch it settles', async () => {
+  const ctx = context();
+  const placement = { runner: 'skybox', rawWaitMs: 0, factor: 1, predictedWaitMs: 0, predictedRunMs: 220_000, tier: 'repo-lane', n: 3, slots: 1, queued: 0 };
+  const scored = seedOrphan(ctx, { record: completed(), attempt: { placement } });
+  assert.equal((await reconcile(ctx, scored)).settled, true);
+  assert.deepEqual(historyRows(ctx.state).find((r) => r.id === scored).placement, placement);
+
+  const unscored = seedOrphan(ctx, { record: completed() });
+  assert.equal((await reconcile(ctx, unscored)).settled, true);
+  const row = historyRows(ctx.state).find((r) => r.id === unscored);
+  assert.equal(row.runner, 'skybox');
+  assert.equal('placement' in row, false, 'an attempt nothing ranked has no prediction to copy');
+});
+
 test('an attempt that changed runner between the read and the publish is left alone (stale)', async () => {
   const ctx = context();
   const id = seedOrphan(ctx, { record: completed() });

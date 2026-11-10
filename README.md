@@ -44,6 +44,7 @@ lane capabilities --json
 lane suggest [--repo <name>] [--days 7] [--json]
 lane report cost --repo zirkbot,jun --since 2026-10-01 --until 2026-10-08 --prs zirkbot=z.json,jun=j.json [--json]   # gate-cost scorecard (BRAIN-529)
 lane report losses --since 2026-10-01 --until 2026-10-08 [--repo zirkbot] [--json]   # runner losses and re-dispatches (BRAIN-350)
+lane report placement --since 2026-10-01 [--until 2026-10-08] [--json]   # how accurate the finish model's own predictions were (BRAIN-899)
 lane cancel <id>
 lane lease-check <id>                    # exit 0 only if <id> is a live lease on this host (BRAIN-553)
 lane priority <id> high|medium|low       # re-tier a queued ticket in place (BRAIN-518)
@@ -735,15 +736,27 @@ What a remote run does:
    nor names taking more than 8 distinct values in that repo+lane's history, so a
    train shard or tier keeps its own median while a changed-file list or a sha
    cannot split it; else that repo+lane; else another runner's evidence scaled by
-   their `speedFactor`s) and `wait` is serial and conservative — 0 on an idle
-   runner with room, else
-   `(queued + 1) x run`. So a fast runner with a queue can beat a slow idle one,
-   and on this path a busy runner (empty queue, no headroom) is queueable too.
+   their `speedFactor`s) and `wait` is what the queue ahead of it implies — 0 on
+   an idle runner with room, else `(queued + 0.5) x run / slots`, where `slots`
+   is how many tickets of this size the runner's own CPU budget admits at once
+   (`floor(capacity.cpuCores / reservation.cpuCores)`, and 1 when either figure
+   is missing or unusable, so an unenforced runner is ranked serially rather
+   than optimistically). The `0.5` is the expected remainder of the work
+   blocking admission; a backtest over 102 pitelite placements put its median
+   predicted/actual wait ratio at 0.92 against 2.79 for a whole run per ticket
+   ahead. So a fast runner with a queue can beat a slow idle one, and on this
+   path a busy runner (empty queue, no headroom) is queueable too.
    All or nothing: one candidate without an estimate leaves the whole selection
    on the old ranking (idle first, then fewest queued). Moving a ticket already
    queued on a runner also needs `destFinish < 0.75 x position x E_source`; a
-   drain and the refusal deadline are ungated. A scored decision writes a
-   `lane: finish-placement:` line naming every candidate's finish and the winner.
+   drain and the refusal deadline are ungated. Both of those keep the older,
+   serial wait — the slot-aware one ranks placements only. Every decision,
+   scored or not, writes a `lane: finish-placement:` line naming each
+   candidate's finish, queue depth and slots, each runner really excluded and
+   why, and the winner (or `none`); a rebalance or re-dispatch decision carries
+   a `rebalance:`/`redispatch:` prefix. The winning score is recorded as
+   `placement` on the attempt and on the history row, which is what
+   `lane report placement` measures the model against.
 
 3. **Send a snapshot**, not history: a framed stream of exactly the listed
    files. Each file is re-read without following symlinks and its sha256
@@ -3067,3 +3080,17 @@ the median and p90 of each phase (`uploadMs`, `queuedMs`, `snapshotMs`, `depsMs`
 a slow CPU (a large `commandMs` with a low share) from contention (a large `queuedMs`). A row from a
 runner that predates a phase is left out of that phase's stats (an old runner's `setupMs` holds deps and setup,
 so the share still counts it once); a row with no `remotePhasesMs` is not counted. `lane status` is unchanged.
+
+### How accurate the finish model is: `lane report placement` (BRAIN-899)
+
+`lane report placement --since <iso> [--until <iso>] [--history <file>] [--json]` (`--until` defaults to now) reads the
+`placement` every scored remote dispatch records — the prediction of the FINAL dispatch of that attempt, so a rebind, a
+rebalance move or a re-dispatch is measured against the runner it actually ended on — and joins it to what that same dispatch
+saw: `remotePhasesMs.queuedMs` for the wait and `runMs` for the run. Per runner it prints the sample count, the median
+predicted and actual wait and run, the median predicted/actual ratio, and how many predictions were over 2x or under 2x their
+actual. The ratio pads both sides by 30 s, so a runner that admitted a ticket instantly is still measurable instead of dividing
+by zero. A row whose `placement.runner` is not the runner that ran it, a local row, a row with no `placement`, a repeated id and
+anything outside `[since, until)` (by `startedAt`) are not counted. A run that did not exit 0 is counted as `non-green` and left
+out of the run stats — it says nothing about how long the command takes — but its wait still counts, because it waited however
+it ended. A ratio consistently above 1 means the model is over-predicting that runner's wait (it loses placements it would have
+won); below 1 means it is under-predicting (it wins placements that then queue).

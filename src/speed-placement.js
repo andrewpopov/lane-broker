@@ -213,15 +213,34 @@ export function runnerRunEstimateMs(rows, runner, job, runners) {
   return null;
 }
 
+/** The probe's queue depth as the wait model reads it: anything that is not a positive integer counts as 0. */
+export const probeQueued = (probe) => (Number.isInteger(probe?.queued) && probe.queued > 0 ? probe.queued : 0);
+
 /**
  * BRAIN-899: how long a ticket expects to WAIT before it starts on a runner the probe sees: 0 when the runner is idle with room,
- * else one run of this ticket's size per ticket ahead of it plus one for the work blocking admission. Serial and conservative on
- * purpose -- `probe.running` counts orphaned leases and pressure can block admission, so it never shortens the wait. A `queued`
- * that is not a positive integer counts as 0.
+ * else the work ahead of it -- one run of this ticket's size per ticket queued, plus `residual` runs for the work blocking
+ * admission -- spread over the `slots` tickets of this size the runner admits at once. `probe.running` counts orphaned leases and
+ * pressure can block admission, so it never shortens the wait.
+ * BRAIN-899 A1: only the RANKING path divides by slots and charges the measured half-run residual (`RANKED_WAIT_RESIDUAL`); the
+ * BRAIN-888 rebalance gate keeps the defaults, so its arithmetic is exactly what it was.
  */
-export function runnerWaitMs({ probe, estimateMs, room }) {
-  const queued = Number.isInteger(probe?.queued) && probe.queued > 0 ? probe.queued : 0;
-  return room && queued === 0 ? 0 : (queued + 1) * estimateMs;
+export function runnerWaitMs({ probe, estimateMs, room, slots = 1, residual = 1 }) {
+  const queued = probeQueued(probe);
+  if (room && queued === 0) return 0;
+  return ((queued + residual) * estimateMs) / (Number.isFinite(slots) && slots > 1 ? slots : 1);
+}
+
+/** The residual of the work blocking admission that the ranking charges, in runs of this ticket: the backtest over 102 pitelite placements measured 0.5 against 1's median ratio of 2.79. */
+export const RANKED_WAIT_RESIDUAL = 0.5;
+
+/**
+ * BRAIN-899 A2: the winning score as the durable prediction its own outcome is later measured against -- `lane report placement`
+ * joins it to that dispatch's `remotePhasesMs.queuedMs` and `runMs`. Null when the dispatch was not ranked, which clears any
+ * prediction an earlier dispatch of this ticket recorded. `rawWaitMs` and `factor` are the calibration seam: stage A applies none.
+ */
+export function placementOf(score) {
+  if (!score || !Number.isFinite(score.finishMs)) return null;
+  return { runner: score.name, rawWaitMs: score.waitMs, factor: 1, predictedWaitMs: score.waitMs, predictedRunMs: score.runMs, tier: score.tier, n: score.n, slots: score.slots, queued: score.queued };
 }
 
 /**

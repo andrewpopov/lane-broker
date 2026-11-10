@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { makeRunner, tmpDir } from './remote-harness.js';
-import { selectRunner } from '../src/remote-client.js';
-import { DEFAULT_REMOTE_OVERHEAD_MS, jobClass, pairingCommand, runnerRunEstimateMs, runnerWaitMs } from '../src/speed-placement.js';
+import { selectRunner, waitSlots } from '../src/remote-client.js';
+import { DEFAULT_REMOTE_OVERHEAD_MS, jobClass, pairingCommand, RANKED_WAIT_RESIDUAL, runnerRunEstimateMs, runnerWaitMs } from '../src/speed-placement.js';
 
 // ---- runnerRunEstimateMs: the tiers, the donor and its scaling ----
 
@@ -176,6 +176,34 @@ test('runnerWaitMs: a queued that is not a positive integer counts as 0', () => 
   assert.equal(runnerWaitMs({ probe: null, estimateMs: 200_000, room: false }), 200_000);
 });
 
+// ---- BRAIN-899 A1: the slot-aware ranking wait ----
+
+test('runnerWaitMs: slots divide the work ahead, and a sub-one slot count never inflates the wait', () => {
+  assert.equal(runnerWaitMs({ probe: { queued: 3 }, estimateMs: 200_000, room: false, slots: 2, residual: 0.5 }), 350_000, '(3 + 0.5) x 200s / 2');
+  assert.equal(runnerWaitMs({ probe: { queued: 0 }, estimateMs: 200_000, room: false, slots: 4, residual: 0.5 }), 25_000, 'a busy runner with an empty queue still charges the residual');
+  assert.equal(runnerWaitMs({ probe: { queued: 0 }, estimateMs: 200_000, room: true, slots: 4, residual: 0.5 }), 0, 'idle with room is 0 however many slots it has');
+  for (const slots of [0, -1, 0.5, NaN, null, undefined]) {
+    assert.equal(runnerWaitMs({ probe: { queued: 1 }, estimateMs: 200_000, room: false, slots, residual: 0.5 }), 300_000, String(slots));
+  }
+});
+
+test('runnerWaitMs: the residual defaults to the whole run the BRAIN-888 rebalance gate has always charged', () => {
+  assert.equal(runnerWaitMs({ probe: { queued: 2 }, estimateMs: 200_000, room: false }), 600_000);
+  assert.equal(runnerWaitMs({ probe: { queued: 2 }, estimateMs: 200_000, room: false, residual: RANKED_WAIT_RESIDUAL }), 500_000);
+});
+
+test('waitSlots: the CPU budget over the claim, floored at 1, and 1 whenever either figure is unusable', () => {
+  const at = (cpuCores, claim = 4) => waitSlots({ weight: 1, cpuCores: claim }, { capacity: { cpuCores } });
+  assert.equal(at(12), 3);
+  assert.equal(at(12, 5), 2, 'a fraction of a slot is no slot');
+  assert.equal(at(4), 1);
+  assert.equal(at(2), 1, 'a budget smaller than the claim is still one slot, never a longer wait');
+  for (const cpuCores of [null, undefined, NaN, 0, -8, Infinity, '12']) assert.equal(at(cpuCores), 1, String(cpuCores));
+  for (const cpuCores of [undefined, null, NaN, 0, -1, '4']) assert.equal(waitSlots({ weight: 1, cpuCores }, { capacity: { cpuCores: 12 } }), 1, String(cpuCores));
+  assert.equal(waitSlots(undefined, undefined), 1);
+  assert.equal(waitSlots({ weight: 1, cpuCores: 4 }, { capacity: {} }), 1, 'an unenforced runner reports no budget');
+});
+
 // ---- selectRunner: ranking the eligible candidates by predicted finish ----
 
 /** A fake ssh that answers `remote-probe` per destination from `probes` (name -> payload), the tests/remote-queue-choice.test.js pattern. */
@@ -222,9 +250,9 @@ test('selectRunner finish: a busy fast runner beats an idle slow one on the plac
   assert.equal(res.queuedChoice, true);
   assert.equal(res.probe.queued, 0, 'the winner\'s probe is the busy one the BRAIN-338 branch records as name(0)');
   assert.deepEqual(res.scores, [
-    { name: 'fast', finishMs: finishOf(200_000, 200_000), waitMs: 200_000, runMs: 200_000, tier: 'exact', n: 9, idle: false },
-    { name: 'slow', finishMs: finishOf(0, 500_000), waitMs: 0, runMs: 500_000, tier: 'repo-lane', n: 3, idle: true },
-  ]);
+    { name: 'fast', finishMs: finishOf(100_000, 200_000), waitMs: 100_000, runMs: 200_000, tier: 'exact', n: 9, idle: false, queued: 0, slots: 1 },
+    { name: 'slow', finishMs: finishOf(0, 500_000), waitMs: 0, runMs: 500_000, tier: 'repo-lane', n: 3, idle: true, queued: 0, slots: 1 },
+  ], 'a busy runner charges the 0.5-run residual, an idle one with room nothing');
 });
 
 test('selectRunner finish: a queued fast runner loses to an idle slow one, strictly', async () => {
@@ -235,9 +263,9 @@ test('selectRunner finish: a queued fast runner loses to an idle slow one, stric
   );
   assert.equal(res.runner.name, 'slow');
   assert.equal(res.queuedChoice, undefined);
-  assert.deepEqual(res.scores.map((s) => [s.name, s.waitMs, s.finishMs]), [
-    ['fast', 600_000, finishOf(600_000, 200_000)],
-    ['slow', 0, finishOf(0, 500_000)],
+  assert.deepEqual(res.scores.map((s) => [s.name, s.queued, s.slots, s.waitMs, s.finishMs]), [
+    ['fast', 2, 1, 500_000, finishOf(500_000, 200_000)],
+    ['slow', 0, 1, 0, finishOf(0, 500_000)],
   ]);
   assert.ok(res.scores[1].finishMs < res.scores[0].finishMs, 'a strict win on finish, not a tie broken by idle-first');
 });
@@ -246,11 +274,11 @@ test('selectRunner finish: an exact tie goes to the idle runner, not to its free
   const res = await select(
     { fast: probe(0, NO_MEMORY), slow: probe(0, LESS_ROOM) },
     runnersOf('fast', 'slow'),
-    { busyQueueable: true, finishModel: modelOf({ fast: est(250_000), slow: est(500_000) }) },
+    { busyQueueable: true, finishModel: modelOf({ fast: est(250_000), slow: est(375_000) }) },
   );
   assert.equal(res.runner.name, 'slow', 'the busy runner has 8 cores free against the idle one\'s 5 and still loses');
   assert.equal(res.queuedChoice, undefined);
-  assert.deepEqual(res.scores.map((s) => [s.name, s.finishMs, s.idle]), [['fast', finishOf(250_000, 250_000), false], ['slow', finishOf(0, 500_000), true]]);
+  assert.deepEqual(res.scores.map((s) => [s.name, s.finishMs, s.idle]), [['fast', finishOf(125_000, 250_000), false], ['slow', finishOf(0, 375_000), true]]);
 });
 
 test('selectRunner finish: equal finishes between two queued runners go to config order, and probe.running is ignored', async () => {
@@ -261,7 +289,7 @@ test('selectRunner finish: equal finishes between two queued runners go to confi
   );
   assert.equal(res.runner.name, 'b');
   assert.equal(res.queuedChoice, true);
-  assert.deepEqual(res.scores.map((s) => [s.name, s.waitMs]), [['b', 300_000], ['a', 300_000]], '4 running tickets do not halve the wait');
+  assert.deepEqual(res.scores.map((s) => [s.name, s.waitMs]), [['b', 250_000], ['a', 250_000]], '4 running tickets do not halve the wait');
 });
 
 test('selectRunner finish: a deeper queue on a much faster runner still beats a shallow one', async () => {
@@ -272,7 +300,29 @@ test('selectRunner finish: a deeper queue on a much faster runner still beats a 
   );
   assert.equal(res.runner.name, 'fast', 'today\'s fewest-queued rule would have picked slow');
   assert.equal(res.queuedChoice, true);
-  assert.deepEqual(res.scores.map((s) => [s.name, s.finishMs]), [['fast', finishOf(300_000, 100_000)], ['slow', finishOf(1_000_000, 500_000)]]);
+  assert.deepEqual(res.scores.map((s) => [s.name, s.finishMs]), [['fast', finishOf(250_000, 100_000)], ['slow', finishOf(750_000, 500_000)]]);
+});
+
+test('selectRunner finish: a runner whose budget holds several of these tickets divides its queue by that many', async () => {
+  const wide = { capacity: { cpuCores: 12 } };
+  const model = modelOf({ wide: est(120_000), narrow: est(120_000) });
+  const res = await select(
+    { wide: probe(3, { ...ROOM, ...wide }), narrow: probe(1, ROOM) },
+    runnersOf('wide', 'narrow'),
+    { maxRemoteQueue: 3, finishModel: model },
+  );
+  assert.equal(res.runner.name, 'wide', '3 queued over 3 slots beats 1 queued over 1');
+  assert.deepEqual(res.scores.map((s) => [s.name, s.queued, s.slots, s.waitMs, s.finishMs]), [
+    ['wide', 3, 3, 140_000, finishOf(140_000, 120_000)],
+    ['narrow', 1, 1, 180_000, finishOf(180_000, 120_000)],
+  ]);
+  const unenforced = await select(
+    { wide: probe(3, { ...ROOM, capacity: { cpuCores: null } }), narrow: probe(1, ROOM) },
+    runnersOf('wide', 'narrow'),
+    { maxRemoteQueue: 3, finishModel: model },
+  );
+  assert.equal(unenforced.runner.name, 'narrow', 'a runner that reports no budget is ranked serially, so its deeper queue loses');
+  assert.deepEqual(unenforced.scores.map((s) => [s.name, s.slots, s.waitMs]), [['wide', 1, 420_000], ['narrow', 1, 180_000]]);
 });
 
 test('selectRunner finish: between two idle runners the faster estimate wins, not the freer CPU', async () => {
@@ -302,6 +352,18 @@ test('selectRunner finish: one candidate without an estimate gives exactly today
   );
   assert.equal(busyNull.runner.name, 'slow');
   assert.equal('scores' in busyNull, false);
+});
+
+test('selectRunner finish: a capacity that would give slots changes nothing while an estimate is missing', async () => {
+  const probes = { wide: probe(2, { ...ROOM, capacity: { cpuCores: 12 } }), narrow: probe(1, ROOM) };
+  const partial = await select(probes, runnersOf('wide', 'narrow'), { maxRemoteQueue: 3, finishModel: modelOf({ wide: est(120_000), narrow: null }) });
+  const plain = await select(probes, runnersOf('wide', 'narrow'), { maxRemoteQueue: 3 });
+  for (const res of [partial, plain]) {
+    assert.equal(res.runner.name, 'narrow', 'fewest queued, exactly as before the finish model');
+    assert.equal(res.queuedChoice, true);
+    assert.equal('scores' in res, false);
+  }
+  assert.deepEqual(partial.skipped, plain.skipped, 'one missing estimate leaves the whole field, slots included, on today\'s ranking');
 });
 
 test('selectRunner finish: queuedFilter still vetoes a candidate, and a vetoed one cannot veto the ranking', async () => {
@@ -340,11 +402,11 @@ const reasonFor = (res, name) => res.skipped.filter((s) => s.name === name).map(
 
 test('selectRunner finish: a window closing during the predicted wait + run skips that runner', async () => {
   const probes = { fast: probe(1, ROOM), slow: probe(0, ROOM) };
-  const model = modelOf({ fast: est(120_000), slow: est(500_000) });
+  const model = modelOf({ fast: est(150_000), slow: est(500_000) });
   const res = await select(probes, [scheduled('fast'), makeRunner({ ssh: 'slow' })], { now: NOW, finishModel: model });
   assert.equal(res.runner.name, 'slow');
   assert.deepEqual(names(res), ['slow']);
-  assert.match(reasonFor(res, 'fast'), /window closes at 2026-10-11T20:05:00\.000Z, before the predicted 360s finish \(wait 240s \+ run 120s\)/);
+  assert.match(reasonFor(res, 'fast'), /window closes at 2026-10-11T20:05:00\.000Z, before the predicted 375s finish \(wait 225s \+ run 150s\)/);
   const unscheduled = await select(probes, runnersOf('fast', 'slow'), { now: NOW, finishModel: model });
   assert.equal(unscheduled.runner.name, 'fast', 'the same runner wins on finish alone, so the window is what dropped it');
   assert.deepEqual(names(unscheduled), ['fast', 'slow']);
@@ -393,4 +455,15 @@ test('selectRunner finish: busyQueueable without estimates leaves a busy runner 
   const lone = await select({ fast: probe(0, NO_CPU) }, runnersOf('fast'), { busyQueueable: true, finishModel: modelOf({}) });
   assert.equal(lone.runner, null);
   assert.equal(lone.busy.runner.name, 'fast');
+});
+
+test('selectRunner finish: slotAwareWait false ranks with the serial wait (the rebalance passes)', async () => {
+  const probes = { fast: probe(3, { ...NO_CPU, capacity: { cpuCores: 16 } }), slow: probe(0, ROOM) };
+  const model = modelOf({ fast: est(200_000), slow: est(500_000) });
+  const serial = await select(probes, runnersOf('fast', 'slow'), { busyQueueable: true, maxRemoteQueue: 4, finishModel: model, slotAwareWait: false });
+  assert.equal(serial.scores.find((s) => s.name === 'fast').waitMs, 800_000, '(3 + 1) x 200s, one slot');
+  assert.equal(serial.runner.name, 'slow');
+  const aware = await select(probes, runnersOf('fast', 'slow'), { busyQueueable: true, maxRemoteQueue: 4, finishModel: model });
+  assert.equal(aware.scores.find((s) => s.name === 'fast').waitMs, 175_000, '(3 + 0.5) x 200s / 4 slots of a 4-core ticket');
+  assert.equal(aware.runner.name, 'fast');
 });
