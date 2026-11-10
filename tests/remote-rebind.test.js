@@ -12,7 +12,7 @@ import { reconcileRemoteAttempt } from '../src/remote-reconcile.js';
 import { createAttempt, readAttempt, patchAttemptLocked } from '../src/attempts.js';
 import { fenceLegacyQueue } from '../src/migrate.js';
 import { listLeases } from '../src/lease.js';
-import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig, ConfigError } from '../src/config.js';
+import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig, ConfigError, resolveTicketConfig } from '../src/config.js';
 import { paths, readJsonSafe, withLock, atomicWriteJson } from '../src/state.js';
 
 /**
@@ -433,6 +433,33 @@ test('a ticket that fell back to the local queue is rebound once a runner frees 
   assert.equal(result.runner, 'skybox');
   assert.deepEqual(linesOf(ran), ['remote'], 'the command ran once, on the runner');
   assert.match(ctx.admissionLog(), new RegExp(`remote-rebind: ${id}: seq \\d+ -> skybox`));
+  hold.release();
+  await hold.done;
+});
+
+/** Enough successful remote runs of this repo+lane for the repo-lane tier to estimate the runner, so the rebind is ranked. */
+function seedRemoteEstimates(ctx, runner, durations) {
+  const { repoId } = resolveTicketConfig({ cwd: ctx.repoDir, repo: 'r', lane: 'default' });
+  const rows = durations.map((runMs, i) => ({ id: `seed-${i}`, repo: repoId, lane: 'default', command: 'sh seeded.sh', executor: 'remote', runner, exit: 0, startedAt: 1000 + i, endedAt: 1000 + runMs, runMs }));
+  fs.appendFileSync(paths(ctx.state).history, `${rows.map((r) => JSON.stringify(r)).join('\n')}\n`);
+}
+
+test('BRAIN-899 A2: a rebind carries its winning score through to the attempt and the history row it publishes', async () => {
+  const ctx = controllableRunner();
+  seedRemoteEstimates(ctx, 'skybox', [200_000, 220_000, 240_000]);
+  const hold = await holdLaneLocally(ctx);
+  const ran = path.join(tmpDir('rebind-placement'), 'ran');
+  const id = await detach(ctx, recordingCmd(ran));
+  await waitFor(() => queuedIds(ctx.state).includes(id), { timeoutMs: 30_000 });
+  assert.equal('placement' in (readAttempt(ctx.state, id) ?? {}), false, 'the unreachable runner was never scored, so nothing was predicted');
+
+  ctx.setMode('ok');
+  const result = await waitResult(ctx, id);
+  assert.equal(result.executor, 'remote');
+  assert.equal(result.runner, 'skybox');
+  assert.deepEqual(linesOf(ran), ['remote']);
+  assert.deepEqual(rowsFor(ctx.state, id).at(-1).placement, { runner: 'skybox', rawWaitMs: 0, factor: 1, predictedWaitMs: 0, predictedRunMs: 220_000, tier: 'repo-lane', n: 3, slots: 1, queued: 0 });
+  assert.match(ctx.admissionLog(), new RegExp(`finish-placement: ts=\\S+ ${id}: skybox 280s \\(wait 0s, run 220s, repo-lane n=3, q=0 slots=1\\) -> skybox`));
   hold.release();
   await hold.done;
 });

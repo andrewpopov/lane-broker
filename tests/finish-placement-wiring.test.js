@@ -170,3 +170,10 @@ test('chooseSpeedPlacement: localBlocked and localHeldByKey report the score as 
     assert.deepEqual([got.choice, got.localFinishMs, got.remoteFinishMs], ['remote', null, 123_456], JSON.stringify(extra));
   }
 });
+
+test('BRAIN-899 A1: both rebalance passes keep the serial wait; place and rebind rank slot-aware', () => {
+  const root = rootWithHistory([]);
+  assert.equal(optionsFor('rebalance', root).slotAwareWait, false);
+  assert.equal(optionsFor('rebalance', root, { queuedMove: { position: 2, sourceRunner: SKYBOX } }).slotAwareWait, false);
+  assert.equal(optionsFor('place', root).slotAwareWait, undefined, 'place takes selectRunner\'s slot-aware default');
+});

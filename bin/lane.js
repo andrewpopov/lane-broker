@@ -39,6 +39,7 @@ import { remotePipelineCommand } from '../src/remote-pipeline.js';
 import { costReportCommand } from '../src/cost-report.js';
 import { phasesReportCommand } from '../src/phases-report.js';
 import { lossesReportCommand } from '../src/losses-report.js';
+import { placementReportCommand } from '../src/placement-report.js';
 
 function usage() {
   return `Usage:
@@ -66,6 +67,7 @@ function usage() {
   lane report phases --repo <a[,b]> --since <iso> --until <iso> [--history <file>] [--json]
   lane report losses --since <iso> --until <iso> [--repo <a[,b]>] [--history <file>] [--json]
   lane report cost --repo <a[,b]> --since <iso> --until <iso> [--prs <file | repo=file,...>] [--journal-root <dir>] [--history <file>] [--json]
+  lane report placement --since <iso> [--until <iso>] [--history <file>] [--json]
 `;
 }
 
@@ -394,8 +396,9 @@ async function main() {
     case 'report': {
       if (rest[0] === 'phases') return (await phasesReportCommand(rest.slice(1))).exitCode;
       if (rest[0] === 'losses') return (await lossesReportCommand(rest.slice(1))).exitCode;
+      if (rest[0] === 'placement') return (await placementReportCommand(rest.slice(1))).exitCode;
       if (rest[0] !== 'cost') {
-        process.stderr.write('lane report: only `cost`, `phases` and `losses` are supported\n');
+        process.stderr.write('lane report: only `cost`, `phases`, `losses` and `placement` are supported\n');
         return 2;
       }
       return (await costReportCommand(rest.slice(1))).exitCode;
