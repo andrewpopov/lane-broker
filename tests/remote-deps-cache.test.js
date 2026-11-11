@@ -55,6 +55,10 @@ const POSTINSTALLS = {
   harmless: "process.exit(0)",
   'hook-file': "require('fs').mkdirSync('.git/hooks', { recursive: true }); require('fs').writeFileSync('.git/hooks/pre-commit', '#!/bin/sh\\n')",
   'node-gyp': "const fs = require('fs'); const d = 'node_modules/hello-tool/'; fs.mkdirSync(d + 'build/Release', { recursive: true }); fs.writeFileSync(d + 'binding.gyp', '{}'); fs.writeFileSync(d + 'build/Makefile', 'srcdir := ' + process.cwd() + '/node_modules\\n'); fs.writeFileSync(d + 'build/config.gypi', '{\\\"d\\\": \\\"' + process.cwd() + '\\\"}'); fs.writeFileSync(d + 'build/Release/hello.node', 'loadable')",
+  'jiti-cache': "const fs = require('fs'); fs.mkdirSync('node_modules/.cache/jiti', { recursive: true }); fs.writeFileSync('node_modules/.cache/jiti/api-prisma.config.abc.mjs', 'root=' + process.cwd())",
+  'pkg-cache': "const fs = require('fs'); fs.mkdirSync('node_modules/.cache/hello-tool', { recursive: true }); fs.writeFileSync('node_modules/.cache/hello-tool/data.json', 'needed-at-runtime')",
+  'pkg-cache-ambiguous': "const fs = require('fs'); fs.mkdirSync('node_modules/.cache/hello-tool', { recursive: true }); fs.writeFileSync('node_modules/.cache/hello-tool/data.json', 'root=' + process.cwd())",
+  'jiti-lookalike': "require('fs').writeFileSync('node_modules/hello-tool/jiti.mjs', 'root=' + process.cwd())",
   'git-tag': "require('child_process').execFileSync('git', ['tag', 'installed'])",
   'embed-tmpdir': "require('fs').writeFileSync('node_modules/hello-tool/tmp.txt', process.env.TMPDIR)",
 };
@@ -367,6 +371,54 @@ test('a node-gyp build tree (Makefile and config.gypi naming the work dir) is ca
   assert.equal(second.row.depsCache, 'hit');
   assert.equal(s.npmCiCalls(), 1, 'a hit runs no npm ci');
   assert.equal(second.probe.out, 'hello from the bin');
+});
+
+test('a jiti cache under node_modules/.cache/jiti with an ambiguous path is left out: the tree publishes without it and the next run hits', async () => {
+  const s = setupWithNpmSpy();
+  const repoDir = makeGitWorktree(repoFiles({ postinstall: 'jiti-cache' }));
+
+  const first = await runPipeline(s, repoDir);
+  assert.equal(first.code, 0, describeRun(first));
+  assert.equal(first.row.depsCache, 'miss');
+  assert.match(first.stderr, /published=yes/);
+  assert.equal(s.storedKeys().length, 1);
+  assert.equal(fs.existsSync(path.join(s.storeDir, s.storedKeys()[0], 'node_modules', '.cache', 'jiti')), false, 'the store holds no jiti cache');
+
+  const second = await runPipeline(s, repoDir);
+  assert.equal(second.row.depsCache, 'hit');
+  assert.equal(s.npmCiCalls(), 1, 'a hit runs no npm ci');
+  assert.equal(fs.existsSync(path.join(second.cwd, 'node_modules', '.cache', 'jiti')), false, 'the hit tree has no node_modules/.cache/jiti');
+  assert.equal(second.probe.out, 'hello from the bin');
+});
+
+test('a package\'s own node_modules/.cache entry is stored and is still there on a hit', async () => {
+  const s = setupWithNpmSpy();
+  const repoDir = makeGitWorktree(repoFiles({ postinstall: 'pkg-cache' }));
+  const first = await runPipeline(s, repoDir);
+  assert.equal(first.code, 0, describeRun(first));
+  assert.match(first.stderr, /published=yes/);
+  const second = await runPipeline(s, repoDir);
+  assert.equal(second.row.depsCache, 'hit');
+  assert.equal(s.npmCiCalls(), 1, 'a hit runs no npm ci');
+  assert.equal(fs.readFileSync(path.join(second.cwd, 'node_modules', '.cache', 'hello-tool', 'data.json'), 'utf8'), 'needed-at-runtime');
+});
+
+test('an ambiguous path in a package\'s own node_modules/.cache entry still skips the cache', async () => {
+  const s = setupWithNpmSpy();
+  const first = await runPipeline(s, makeGitWorktree(repoFiles({ postinstall: 'pkg-cache-ambiguous' })));
+  assert.equal(first.code, 0, describeRun(first));
+  assert.equal(first.row.depsCache, 'skip');
+  assert.match(first.stderr, /reason=absolute-install-path-ambiguous file=\.cache\/hello-tool\/data\.json/);
+  assert.equal(s.storedKeys().length, 0);
+});
+
+test('the same ambiguous file outside node_modules/.cache/jiti still skips the cache', async () => {
+  const s = setupWithNpmSpy();
+  const first = await runPipeline(s, makeGitWorktree(repoFiles({ postinstall: 'jiti-lookalike' })));
+  assert.equal(first.code, 0, describeRun(first));
+  assert.equal(first.row.depsCache, 'skip');
+  assert.match(first.stderr, /reason=absolute-install-path-ambiguous file=hello-tool\/jiti\.mjs/);
+  assert.equal(s.storedKeys().length, 0);
 });
 
 test('a snapshot with more than ~6,700 loose objects (the trigger of git gc --auto) still publishes: the snapshot commit starts no gc (BRAIN-423)', async () => {
