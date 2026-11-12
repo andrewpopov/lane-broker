@@ -9,7 +9,7 @@ import { remoteCancel } from './remote-client.js';
 import { loadGlobalConfigOrError } from './config.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
 import { writeBrokerLog } from './admission.js';
-import { stopLeaseCpuScope } from './cpu-limit.js';
+import { stopLeaseCpuScope, CPU_SCOPE_STOP_WAIT_MS } from './cpu-limit.js';
 import { trackerForLease, reapLogLine, cancelGraceMs, KILL_WAIT_MS } from './descendants.js';
 
 function sleep(ms) {
@@ -32,7 +32,10 @@ async function killGroupDirectly(lease, root, exec, deadline) {
     const result = await reaping;
     writeBrokerLog(root, reapLogLine(lease.id, result));
     // BRAIN-651 L3: no supervisor is left to stop the lane's CPU scope, and a setsid'd process in it is invisible to the group kill
-    stopLeaseCpuScope(lease, { exec, log: (line) => writeBrokerLog(root, line) });
+    // spawnSync blocks the event loop, so under a deadline the stop gets only what is left, and none at 0 (the result stays unproven)
+    const stopBudgetMs = deadline === undefined ? CPU_SCOPE_STOP_WAIT_MS : Math.min(CPU_SCOPE_STOP_WAIT_MS, msUntil(deadline));
+    if (stopBudgetMs > 0) stopLeaseCpuScope(lease, { exec, timeoutMs: stopBudgetMs, log: (line) => writeBrokerLog(root, line) });
+    else if (lease.cpuScopeUnit) groupGone = false;
   }
   return groupGone;
 }

@@ -2,7 +2,8 @@ import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { laneRun } from './helpers.js';
+import { spawnSync } from 'node:child_process';
+import { laneRun, BIN } from './helpers.js';
 import { isExecutionId, executionIdOf, parseExecutionId, tombstonePath } from '../src/state.js';
 import { makeTmpDir } from './helpers/tmp.js';
 import { reapSpawned, setupRunner, makeHeader, execRemote, readExecResult, ticketPath } from './helpers/remote-exec-fixture.js';
@@ -23,6 +24,8 @@ test('execution ids: a uuid or uuid.e<positive int> only, and they parse back to
   }
   assert.throws(() => executionIdOf(UUID, 0));
   assert.throws(() => executionIdOf('not-a-uuid', 1));
+  assert.throws(() => executionIdOf(UUID, 1e15), 'a 16-digit epoch would name a dir the readers skip');
+  assert.equal(isExecutionId(executionIdOf(UUID, 999_999_999_999_999)), true);
 });
 
 test('the same ticket at e1 then e2 on one host gives two dirs and two results carrying their epoch; a tombstone of e1 does not block e2', async () => {
@@ -77,6 +80,8 @@ test('remote-result, remote-cancel, remote-artifacts-release accept an execution
   assert.equal((await laneRun(['remote-withdraw', execId, '--root', ctx.root], { env: ctx.env })).code, 2);
   assert.equal((await laneRun(['remote-exec', '--root', ctx.root, '--epoch', '0'], { env: ctx.env })).code, 2);
   assert.equal((await laneRun(['remote-exec', '--root', ctx.root, '--epoch'], { env: ctx.env })).code, 2);
+  const sixteen = spawnSync(process.execPath, [BIN, 'remote-exec', '--root', ctx.root, '--epoch', '1000000000000000'], { env: ctx.env, input: '', timeout: 20_000 });
+  assert.equal(sixteen.status, 2, 'a 16-digit epoch is refused');
 });
 
 test('--runner-name and --runner-speed-factor override the header fields and are validated by the header rules', async () => {

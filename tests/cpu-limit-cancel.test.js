@@ -184,3 +184,25 @@ test('CPU_SCOPE_EMPTY_BEFORE_RELEASE: cancel leaves the scope with no process, a
   assert.equal(left, '', `the scope still holds processes: ${left}`);
   assert.equal(procAlive(reported.grandchild), false, 'the detached grandchild survived the cancel');
 });
+
+test('BRAIN-1035: under a deadline the scope stop gets only the remaining budget, and none once it is spent (the lease is kept, unproven)', async () => {
+  const budgeted = freshEnv();
+  const lease = orphanedLease(budgeted.state, { cpuScopeUnit: UNIT });
+  const timeouts = [];
+  const slowExec = (file, args, timeoutMs) => {
+    timeouts.push(timeoutMs);
+    return { status: 0, stdout: '', stderr: '' };
+  };
+  const res = await withState(budgeted.state, () => cancelCommand(lease.id, { exec: slowExec, deadline: Date.now() + 2000 }));
+  assert.equal(res.exitCode, 0);
+  assert.equal(timeouts.length, 1);
+  assert.ok(timeouts[0] > 0 && timeouts[0] <= 2000, `the stop was allowed ${timeouts[0]} ms, not the 15 s default`);
+
+  const spent = freshEnv();
+  const spentLease = orphanedLease(spent.state, { cpuScopeUnit: UNIT });
+  const never = recordingExec();
+  const out = await withState(spent.state, () => cancelCommand(spentLease.id, { exec: never.exec, deadline: Date.now() - 1 }));
+  assert.equal(out.exitCode, 1);
+  assert.equal(never.calls.length, 0, 'no blocking stop with no budget left');
+  assert.ok(readLease(spent.state, 'orphan-1'), 'unproven: the lease is kept');
+});

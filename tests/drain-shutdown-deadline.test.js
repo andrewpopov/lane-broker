@@ -72,7 +72,7 @@ test('a broker lock held by another process does not hold the drain past W', asy
   const out = await drainSubprocess(ctx, { limitMs: W + 9000 });
   assert.equal(out.timedOut, undefined, `the drain outlived its deadline (${out.elapsedMs} ms)`);
   assert.ok(out.elapsedMs < W + SLACK, `exited after ${out.elapsedMs} ms, deadline ${W} ms`);
-  assert.notEqual(out.code, 0, 'it could not do its work, and says so');
+  assert.equal(out.code, 75, 'the documented "try again" exit');
 });
 
 test('a stdout pipe nobody reads, with 1 MiB written before the flush, does not hold the drain past W', async () => {

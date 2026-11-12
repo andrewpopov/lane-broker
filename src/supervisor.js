@@ -1869,7 +1869,10 @@ async function main() {
     // a structured, unconditionally published exit-75 result that says the command never started.
     const isTimeout = outcome === 'queue-timeout' || outcome === 'withdrawn' || outcome === PUSH_ABANDONED;
     // Explicit pre-spawn provenance for a pull agent (BRAIN-1035): this ticket was queued, never leased, and no lease exists under the lock.
-    const neverStarted = await withLock(root, () => !readLease(root, ticket.id));
+    // A lock timeout here leaves the flag off (conservative) and still publishes.
+    const neverStarted = await withLock(root, () => !readLease(root, ticket.id)).catch(() => false);
+    // The one publication that is new in BRAIN-1035 (a plain queued cancel nothing used to publish): remote-exec must not read it as a command result.
+    const provenanceOnly = attemptGeneration === null && !isTimeout && !forcePublish && isRemoteExecRunner() && readSupersededBy(root, ticket.id) === null;
     const buildResult = () =>
       isTimeout
         ? {
@@ -1883,14 +1886,14 @@ async function main() {
             reason: outcome,
             ...(neverStarted ? { neverStarted } : {}),
           }
-        : withSupersession(root, ticket.id, { ...remoteCancelledResult(enriched.id, null), executor: 'local', fallbackReason, ...(neverStarted ? { neverStarted } : {}) });
+        : withSupersession(root, ticket.id, { ...remoteCancelledResult(enriched.id, null), executor: 'local', fallbackReason, ...(neverStarted ? { neverStarted } : {}), ...(provenanceOnly ? { provenanceOnly } : {}) });
     const publish = (result) => {
       atomicWriteJson(ticket.resultPath, result);
       appendHistory(root, historyRow(ticket, result, { fallbackReason }));
     };
     if (attemptGeneration !== null) {
       await publishTerminal(root, ticket.id, attemptGeneration, () => publish(buildResult()));
-    } else if (isTimeout || forcePublish || (isRemoteExecRunner() && !fs.existsSync(ticket.resultPath)) || readSupersededBy(root, ticket.id)) {
+    } else if (isTimeout || forcePublish || (provenanceOnly && !fs.existsSync(ticket.resultPath)) || readSupersededBy(root, ticket.id)) {
       // BRAIN-320 review fix B: `forcePublish` is only ever set by the
       // queue-timeout-then-cancel recheck above -- a ticket the queue-
       // timeout branch was ABOUT to publish (unconditionally, since it's

@@ -12,7 +12,7 @@ import { pauseCommand, resumeCommand, drainCommand, drainShutdownCommand, undrai
 import { migrateSchedulerCommand } from '../src/migrate.js';
 import { parseByteSize } from '../src/resources.js';
 import { MIN_CPU_GRANT_CORES } from '../src/cpu-limit.js';
-import { isTicketId, stateHome } from '../src/state.js';
+import { isTicketId, stateHome, executionIdOf } from '../src/state.js';
 import { writeBrokerLog } from '../src/admission.js';
 import { leaseCheckCommand } from '../src/lease.js';
 import { parseTransferFlag } from '../src/remote-gzip.js';
@@ -191,7 +191,13 @@ function parseAgentExecFlags(args) {
     if (args[idx + 1] === undefined) return { ok: false, reason: `${flag} needs a value` };
     options[key] = convert(args[idx + 1]);
   }
-  if (options.epoch !== undefined && !(Number.isSafeInteger(options.epoch) && options.epoch >= 1)) return { ok: false, reason: '--epoch needs a positive integer' };
+  if (options.epoch !== undefined) {
+    try {
+      executionIdOf('00000000-0000-0000-0000-000000000000', options.epoch);
+    } catch {
+      return { ok: false, reason: '--epoch needs a positive integer that fits an execution id' };
+    }
+  }
   return { ok: true, options };
 }
 

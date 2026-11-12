@@ -1501,7 +1501,7 @@ takes work again after it comes back, with no `lane undrain`. Then, under the br
 published gets a `shutdown` marker, and its local lane is stopped: a queued or not-yet-enqueued one is dequeued or fenced so it can
 never start, a running one is cancelled. A `remote-exec` that arrives later sees the drain and never starts its command. It waits
 (up to `--wait-ms`) for each ticket to publish, prints `stopped N, published M, still pending K` and exits 0 (1 only if the
-marker could not be written; 75 if the broker lock could not be taken in time). `--wait-ms` is one absolute deadline for the whole
+marker could not be written for another reason; 75 if the broker lock could not be taken in time, for the marker or the sweep). `--wait-ms` is one absolute deadline for the whole
 command: the lock waits, the cancels (the supervisor grace loop and the SIGKILL wait), the final wait and the stdout flush all stop
 at it, and the process then exits at once. Work still unfinished keeps its `shutdown` marker and ends `runner-shutdown-unproven`.
 `--root <dir>` overrides the remote root (tests).

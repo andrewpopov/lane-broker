@@ -302,7 +302,7 @@ export function buildResult(header, ticketDir, { kind, exit = null, signal = nul
     artifacts,
     // BRAIN-642: additive; blob-store hit/miss/corrupt/published counts, present only when this exec used the store
     blobStats: readJsonSafe(path.join(ticketDir, 'blob-stats.json')) ?? undefined,
-    // BRAIN-1035: additive stop-proof provenance for a pull agent; each is present only when true / named, so push results are unchanged
+    // BRAIN-1035: additive stop-proof provenance for a pull agent; each is present only when true / named, so a result without them keeps its shape (queued cancels, rejects and shutdown records gain them)
     ...(neverStarted ? { neverStarted: true } : {}),
     ...(stopProven ? { stopProven: true } : {}),
     ...(shutdownProof ? { shutdownProof } : {}),
@@ -792,7 +792,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     kind = 'unfinished';
     reason = shutdownStop.reason;
     shutdownProof = shutdownStop.proof;
-  } else if (structured && structured.neverStarted !== true) {
+  } else if (structured && structured.provenanceOnly !== true) {
     exit = structured.exit;
     signal = structured.signal;
     if (structured.reason === NO_PROGRESS_REASON && Number.isFinite(structured.noProgressTimeoutMs)) {
@@ -1386,8 +1386,7 @@ export async function remoteShutdownCommand({ root = defaultRemoteRoot(), waitMs
         // which the scheduler checks under that same lock before any start; its supervisor publishes `neverStarted` for it. A
         // missing lease alone proves nothing (the lease may be gone because the command already ran).
         const queued = listQueue(brokerRoot).find((t) => t && t.id === recorded);
-        if (queued) {
-          dequeueSync(brokerRoot, recorded);
+        if (queued && dequeueSync(brokerRoot, recorded)) {
           touchSimArmFor(brokerRoot, queued);
           atomicWriteFile(path.join(ticketDir, 'shutdown-unstarted'), String(Date.now()));
         } else toStop.push(recorded);

@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { ensureStateDirs, paths, atomicWriteFile, withLock, readRemoteDrain, writeRemoteDrain, clearRemoteDrain } from './state.js';
+import { ensureStateDirs, paths, atomicWriteFile, withLock, LockTimeoutError, readRemoteDrain, writeRemoteDrain, clearRemoteDrain } from './state.js';
 import { remoteShutdownCommand } from './remote-runner.js';
 import { collectStatus, renderRemoteDrainLine } from './status.js';
 
@@ -58,7 +58,7 @@ export async function drainShutdownCommand(reason = '', { waitMs = 60_000, root,
     await writeRemoteDrain(p.root, reason || 'host shutting down', { shutdown: true, timeoutMs: Math.max(0, deadline - Date.now()) });
   } catch (err) {
     process.stderr.write(`lane drain --shutdown: cannot write the drain marker: ${err.message}\n`);
-    return { exitCode: 1 };
+    return { exitCode: err instanceof LockTimeoutError ? 75 : 1 };
   }
   return remoteShutdownCommand({ deadline, ...(root ? { root } : {}) });
 }

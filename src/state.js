@@ -143,7 +143,9 @@ export function isExecutionId(v) {
 
 export function executionIdOf(ticketId, epoch) {
   if (!isUuid(ticketId) || !Number.isSafeInteger(epoch) || epoch < 1) throw new Error(`invalid execution id parts: ${ticketId} e${epoch}`);
-  return `${ticketId}.e${epoch}`;
+  const id = `${ticketId}.e${epoch}`;
+  if (!isExecutionId(id)) throw new Error(`invalid execution id parts: ${ticketId} e${epoch}`);
+  return id;
 }
 
 /** The logical ticket UUID and epoch (null for a bare uuid) of an execution id, or null when `v` is not one. */
