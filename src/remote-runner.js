@@ -647,6 +647,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
         keyFilesCoverInstallScripts: header.remoteDepsCacheKeyFilesCoverInstallScripts === true,
         root: path.join(remoteRootAbs, 'deps-cache'),
         maxBytes: runnerCfg.remoteDepsCacheMaxBytes,
+        registries: runnerCfg.depsCacheRegistries,
       },
     });
     pipelineCmd = [process.execPath, ...childExitSafeFlags(), laneBinPath, 'remote-pipeline', ticketDir];

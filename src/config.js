@@ -8,7 +8,7 @@ import { isCanonicalRelPath, scrubbedGitEnv } from './remote-manifest.js';
 import { remoteExcludeShapeProblem, remoteExcludeConflict, excludingPattern } from './remote-exclude.js';
 import { unsupportedHookKeys, hookRefusalMessage, EXCLUSIVE_PURPOSES, exclusiveDeadlineProblem, remoteExclusiveRefusal } from './exclusive.js';
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
-import { DEFAULT_DEPS_CACHE_MAX_BYTES } from './deps-cache.js';
+import { DEFAULT_DEPS_CACHE_MAX_BYTES, DEFAULT_DEPS_CACHE_REGISTRIES, registriesProblem } from './deps-cache.js';
 import { isValidRequiresShape, VERSION_FLOOR_RE } from './runner-readiness.js';
 import { CPU_LIMIT_MODES, MEMORY_LIMIT_MODES, MIN_CPU_GRANT_CORES } from './cpu-limit.js';
 
@@ -238,6 +238,8 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // `remoteDepsCache: false` opts that lane out.
   remoteDepsCache: true,
   remoteDepsCacheMaxBytes: DEFAULT_DEPS_CACHE_MAX_BYTES,
+  // BRAIN-1010: registry URL prefixes whose tarballs (with integrity) the deps cache accepts; an eligibility gate, not key material.
+  depsCacheRegistries: DEFAULT_DEPS_CACHE_REGISTRIES,
   // BRAIN-398: caps on the files a remote run returns (`remoteArtifacts`), enforced by the runner that collects them and
   // again by the submitter that receives them, each from its own config.
   remoteArtifactMaxFileBytes: 16 * 1024 * 1024,
@@ -518,6 +520,8 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isInteger(cfg.remoteDepsCacheMaxBytes) && cfg.remoteDepsCacheMaxBytes > 0,
     `${sourcePath}: "remoteDepsCacheMaxBytes" must be a positive integer`,
   );
+  const registriesError = registriesProblem(cfg.depsCacheRegistries);
+  assert(registriesError === null, `${sourcePath}: "depsCacheRegistries" ${registriesError}`);
   for (const field of ['remoteArtifactMaxFileBytes', 'remoteArtifactMaxTotalBytes', 'remoteArtifactMaxCount']) {
     assert(Number.isInteger(cfg[field]) && cfg[field] > 0, `${sourcePath}: "${field}" must be a positive integer`);
   }

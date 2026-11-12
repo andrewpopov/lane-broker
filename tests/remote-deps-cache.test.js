@@ -152,7 +152,7 @@ function runnerConfig(s) {
  * in a fresh work dir with remote-exec's own snapshot commit, under a per-run TMPDIR, and `lane remote-pipeline`
  * runs a pipeline.json built from the lane's and the runner's config as remote-exec builds it.
  */
-async function runPipeline(s, repoDir, { marker, env = s.env, argv } = {}) {
+async function runPipeline(s, repoDir, { marker, env = s.env, argv, registries } = {}) {
   const markerPath = marker ?? path.join(tmpDir('deps-cache-marker'), 'probe.json');
   const ticketDir = tmpDir('deps-cache-ticket');
   const workDir = path.join(ticketDir, 'work');
@@ -175,6 +175,7 @@ async function runPipeline(s, repoDir, { marker, env = s.env, argv } = {}) {
       keyFiles: lane.remoteDepsCacheKeyFiles ?? [],
       root: s.storeDir,
       maxBytes: runnerCfg.remoteDepsCacheMaxBytes,
+      registries,
     },
   }));
   const runTmp = tmpDir('deps-cache-run-tmp');
@@ -499,6 +500,17 @@ test('a lock that is not pinned to content is skipped with its reason, and the r
   assert.equal(run.row.depsCache, 'skip');
   assert.match(run.stderr, /deps-cache skip dir=\. ms=\d+ reason="lock entry node_modules\/hello-tool resolves to an unpinned source/);
   assert.equal(s.storedKeys().length, 0);
+});
+
+test('BRAIN-1010: pipeline.json depsCache.registries decides whether a private-registry lock is cached', async () => {
+  const s = setupWithNpmSpy();
+  const privateHost = 'https://npm.tail615381.ts.net/';
+  const onPrivate = (lock) => { lock.packages['node_modules/hello-tool'].resolved = `${privateHost}hello-tool/-/hello-tool-1.0.0.tgz`; };
+  const repo = () => makeGitWorktree(repoFiles({ lockEdit: onPrivate }));
+  const refused = await runPipeline(s, repo());
+  assert.match(refused.stderr, /deps-cache skip dir=\. ms=\d+ reason="lock entry node_modules\/hello-tool resolves to a registry not in depsCacheRegistries: https:\/\/npm\.tail615381\.ts\.net"/);
+  const allowed = await runPipeline(s, repo(), { registries: ['https://registry.npmjs.org/', privateHost] });
+  assert.doesNotMatch(allowed.stderr, /not in depsCacheRegistries/);
 });
 
 test('a root lifecycle script outside the allowlist skips the cache unless the lane declares root scripts safe', async () => {
