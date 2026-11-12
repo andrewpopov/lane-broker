@@ -12,7 +12,7 @@ import { pauseCommand, resumeCommand, drainCommand, drainShutdownCommand, undrai
 import { migrateSchedulerCommand } from '../src/migrate.js';
 import { parseByteSize } from '../src/resources.js';
 import { MIN_CPU_GRANT_CORES } from '../src/cpu-limit.js';
-import { isTicketId } from '../src/state.js';
+import { isTicketId, stateHome } from '../src/state.js';
 import { writeBrokerLog } from '../src/admission.js';
 import { leaseCheckCommand } from '../src/lease.js';
 import { parseTransferFlag } from '../src/remote-gzip.js';
@@ -182,6 +182,19 @@ function parseRootFlag(args) {
   return idx === -1 ? undefined : args[idx + 1];
 }
 
+/** BRAIN-1035 `remote-exec` flags a pull agent passes: `--epoch N` (a positive integer), `--runner-name S`, `--runner-speed-factor X`. Values are validated downstream by the header rules. */
+function parseAgentExecFlags(args) {
+  const options = {};
+  for (const [flag, key, convert] of [['--epoch', 'epoch', Number], ['--runner-name', 'runnerName', String], ['--runner-speed-factor', 'runnerSpeedFactor', Number]]) {
+    const idx = args.indexOf(flag);
+    if (idx === -1) continue;
+    if (args[idx + 1] === undefined) return { ok: false, reason: `${flag} needs a value` };
+    options[key] = convert(args[idx + 1]);
+  }
+  if (options.epoch !== undefined && !(Number.isSafeInteger(options.epoch) && options.epoch >= 1)) return { ok: false, reason: '--epoch needs a positive integer' };
+  return { ok: true, options };
+}
+
 function parseDurationMs(spec) {
   const m = String(spec).trim().match(/^(\d+(?:\.\d+)?)(ms|s|m|h)?$/);
   if (!m) throw new Error(`invalid duration "${spec}" (expected e.g. 30s, 5m, 500ms)`);
@@ -300,6 +313,7 @@ async function main() {
     }
     case 'drain': {
       if (rest.includes('--shutdown')) {
+        const startedAt = Date.now();
         let waitMs = 60_000;
         let remoteRoot;
         const args = [];
@@ -322,7 +336,11 @@ async function main() {
           process.stderr.write(`lane drain --shutdown: ${bad !== undefined ? `unknown option "${bad}"` : 'unexpected argument (quote a multi-word reason)'}\n${usage()}`);
           return 2;
         }
-        return (await drainShutdownCommand(args[0] ?? '', { waitMs, root: remoteRoot })).exitCode;
+        const deadline = startedAt + waitMs;
+        const result = await drainShutdownCommand(args[0] ?? '', { waitMs, root: remoteRoot, deadline });
+        if (Number(process.env.LANE_BROKER_TEST_STDOUT_FILL_BYTES) > 0) process.stdout.write('x'.repeat(Number(process.env.LANE_BROKER_TEST_STDOUT_FILL_BYTES))); // test seam: a stdout nobody reads
+        await flushStdio(stateHome(), Math.max(0, deadline - Date.now()));
+        process.exit(result.exitCode);
       }
       const unknownOption = rest.find((arg) => arg.startsWith('-'));
       if (unknownOption !== undefined) {
@@ -428,8 +446,13 @@ async function main() {
         process.stderr.write(`lane remote-exec: ${cacheFlag.reason}\n`);
         return 2;
       }
+      const agentFlags = parseAgentExecFlags(rest);
+      if (!agentFlags.ok) {
+        process.stderr.write(`lane remote-exec: ${agentFlags.reason}\n`);
+        return 2;
+      }
       if (process.env.LANE_BROKER_TEST_RETAIN_HANDLE) setInterval(() => {}, 1000);
-      const result = await remoteExecCommand({ root, transfer: flag.transfer, transferCache: cacheFlag.transferCache });
+      const result = await remoteExecCommand({ root, transfer: flag.transfer, transferCache: cacheFlag.transferCache, ...agentFlags.options });
       await flushStdio(root);
       process.exit(result.exitCode);
     }
@@ -501,6 +524,10 @@ async function main() {
 // stays, but the truncation is recorded in the broker log, where it is visible even if stdout and stderr are the stuck streams.
 // Test-only seam: LANE_BROKER_TEST_FLUSH_MS.
 async function flushStdio(root, timeoutMs = Number(process.env.LANE_BROKER_TEST_FLUSH_MS) || 60_000) {
+  if (timeoutMs <= 0) {
+    writeBrokerLog(root, 'lane: stdout/stderr flush skipped: the deadline had passed; output may be truncated\n');
+    return;
+  }
   const flush = (stream) =>
     new Promise((resolve) => {
       stream.on('error', () => resolve());

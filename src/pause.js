@@ -48,14 +48,17 @@ export async function undrainCommand() {
   return { exitCode: 0 };
 }
 
-/** BRAIN-350: drain for a host shutdown: no new remote work, and every in-flight remote ticket stopped with a proof-of-death record. */
-export async function drainShutdownCommand(reason = '', { waitMs = 60_000, root } = {}) {
+/**
+ * BRAIN-350: drain for a host shutdown: no new remote work, and every in-flight remote ticket stopped with a proof-of-death record.
+ * `deadline` (ms epoch, default `waitMs` from now) is the one absolute time everything below must finish by.
+ */
+export async function drainShutdownCommand(reason = '', { waitMs = 60_000, root, deadline = Date.now() + waitMs } = {}) {
   const p = ensureStateDirs();
   try {
-    await writeRemoteDrain(p.root, reason || 'host shutting down', { shutdown: true });
+    await writeRemoteDrain(p.root, reason || 'host shutting down', { shutdown: true, timeoutMs: Math.max(0, deadline - Date.now()) });
   } catch (err) {
     process.stderr.write(`lane drain --shutdown: cannot write the drain marker: ${err.message}\n`);
     return { exitCode: 1 };
   }
-  return remoteShutdownCommand({ waitMs, ...(root ? { root } : {}) });
+  return remoteShutdownCommand({ deadline, ...(root ? { root } : {}) });
 }

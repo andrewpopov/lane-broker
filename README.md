@@ -1264,6 +1264,14 @@ close ...; settled from the published result (output may be truncated)`. A recor
 runner ends the channel too: `remote-exec` flushes its output (bounded at 60 s; a timeout is written to the runner's broker
 log) and exits once it has published its result.
 
+**Execution ids (BRAIN-1035).** A pull agent runs one epoch of a ticket as `lane remote-exec --epoch N`: the ticket dir, tombstone and
+tmp owner are then named `<uuid>.e<N>` and the result carries `epoch`; without the flag nothing changes. `remote-result`,
+`remote-cancel`, `remote-artifacts` and `remote-artifacts-release` accept either form (`remote-withdraw` stays uuid-only), and
+`remote-artifacts` encodes with the logical uuid so the receiver's binding check passes. `--runner-name` and `--runner-speed-factor`
+override the header's `runnerName` / `runnerSpeedFactor` under the same validation. A result also carries `neverStarted: true` when
+the command provably never ran (a pre-spawn exit, a refusal at start, a preflight refusal with no `remote-id`, or a queued ticket the
+local supervisor finalized with no lease) and `stopProven: true` when the supervisor confirmed the stop; both only when true.
+
 **A remote supervisor stops within `lane cancel`'s wait (BRAIN-850).** The deadlines nest, all derived in `src/attempts.js`:
 remote cancel 15 s (cancel grace + 5 s), then the post-abort joins (1.5 s) and the terminal lock write (3 s), so a supervisor
 SIGTERMed during any remote dispatch (initial or rebind) exits by 20.5 s. If its cancel has not finished by then it exits **74**
@@ -1493,14 +1501,19 @@ takes work again after it comes back, with no `lane undrain`. Then, under the br
 published gets a `shutdown` marker, and its local lane is stopped: a queued or not-yet-enqueued one is dequeued or fenced so it can
 never start, a running one is cancelled. A `remote-exec` that arrives later sees the drain and never starts its command. It waits
 (up to `--wait-ms`) for each ticket to publish, prints `stopped N, published M, still pending K` and exits 0 (1 only if the
-marker could not be written). `--root <dir>` overrides the remote root (tests).
+marker could not be written; 75 if the broker lock could not be taken in time). `--wait-ms` is one absolute deadline for the whole
+command: the lock waits, the cancels (the supervisor grace loop and the SIGKILL wait), the final wait and the stdout flush all stop
+at it, and the process then exits at once. Work still unfinished keeps its `shutdown` marker and ends `runner-shutdown-unproven`.
+`--root <dir>` overrides the remote root (tests).
 
 Each stopped ticket ends with `kind: "unfinished"` and a reason. `runner-shutdown` proves the job is dead, so the submitter runs
-it elsewhere; only a stop the runner can prove gets it: refused before it ran, unleased when the sweep ran, or a cancel that
-ended the command with every process confirmed gone (the local result's `stopProven`). Anything weaker (a supervisor that died
+it elsewhere; only a stop the runner can prove gets it, and the record's `shutdownProof` names the evidence: `refused-at-start`,
+`dequeued` (the sweep itself dequeued it), `never-started` (the local result carries an explicit `neverStarted` flag, set only by
+the writers that finalize a ticket that was queued and never leased), or `stop-proven` (a cancel that ended the command with every
+process confirmed gone: the local result's `stopProven`). A ticket with no lease proves nothing by itself. Anything weaker (a supervisor that died
 with no result, an incomplete reap, a command that had already exited and was draining output) is `runner-shutdown-unproven`:
 possibly still running, never re-run. Such a record carries `shutdownBootId`; once the runner has rebooted, `remote-result`
-serves it as `runner-shutdown` with `provenBy: "reboot"`, since nothing from that boot survived. A job that completed on its
+serves it as `runner-shutdown` with `provenBy: "reboot"` and `shutdownProof: "reboot"` (both boot ids must be non-empty and differ), since nothing from that boot survived. A job that completed on its
 own keeps its `completed` record, and a user cancel still reads `cancelled`.
 
 ### Returning files from a remote run (BRAIN-398)
@@ -2981,6 +2994,10 @@ What a run leaves behind is collected; what a live one owns never is. Everything
   durable cancel marker, so a test can land a `lane cancel` write inside the window between an expiry being recorded
   and the expiry being finalized (BRAIN-320 review fix B: a cancel that lands in that window must still win over the
   expiry). The READY file says the supervisor is there; a fixed sleep raced a loaded runner.
+- `LANE_BROKER_TEST_HOLD_AT=remote-exec-before-result` (with `LANE_BROKER_TEST_HOLD_READY` and `LANE_BROKER_TEST_HOLD_GO`) — `lane remote-exec`
+  holds after its command has ended, before it reads the broker's result and any shutdown evidence (BRAIN-1035).
+- `LANE_BROKER_TEST_STDOUT_FILL_BYTES` — `lane drain --shutdown` writes that many bytes to stdout before its flush, so a test can
+  block the pipe and prove the flush stays inside `--wait-ms`.
 - `LANE_BROKER_TEST_HOLD_AT=local-finalize` (with `LANE_BROKER_TEST_HOLD_READY` and
   `LANE_BROKER_TEST_HOLD_GO`) — a local supervisor pauses after its child has ended and its
   output is drained, before writing the result, so a test can land a `lane cancel` in that

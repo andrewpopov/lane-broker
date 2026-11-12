@@ -557,7 +557,7 @@ export function reapOrphanedQueue(root, keepTicketId) {
     // Publish first: a ticket whose result cannot be written stays queued and is retried on the next pass, so a submitter
     // reconciling later never finds neither.
     try {
-      atomicWriteJson(t.resultPath, withSupersession(root, t.id, { id: t.id, signal: null, startedAt: null, endedAt, waitedMs: null, reconciled: true, ...outcome }));
+      atomicWriteJson(t.resultPath, withSupersession(root, t.id, { id: t.id, signal: null, startedAt: null, endedAt, waitedMs: null, reconciled: true, ...outcome, ...(readLease(root, t.id) ? {} : { neverStarted: true }) }));
     } catch (err) {
       writeBrokerLog(root, `reap ${t.id}: could not publish result, leaving it queued: ${err.message}\n`);
       continue;

@@ -7,7 +7,7 @@ import { childExitSafeFlags } from './node-exit-safe.js';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, readRemoteDrain, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, isUuid, tombstonePath, RUNNER_SHUTDOWN_REASON, RUNNER_SHUTDOWN_UNPROVEN_REASON, DEAD_QUEUED_SUPERVISOR_REASON, kernelBootId } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, readRemoteDrain, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, LockTimeoutError, isUuid, isExecutionId, executionIdOf, parseExecutionId, tombstonePath, RUNNER_SHUTDOWN_REASON, RUNNER_SHUTDOWN_UNPROVEN_REASON, DEAD_QUEUED_SUPERVISOR_REASON, kernelBootId } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidDepsKeyFilesShape, isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, RUNNER_NAME_RE, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
 import { advertisedCapabilities } from './capabilities.js';
@@ -260,7 +260,7 @@ function readPhasesMs(ticketDir, own) {
   return Object.keys(merged).length > 0 ? merged : undefined;
 }
 
-export function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, grantedCpuCores, executionCpuCores, observedCpu, observedRssPeakBytes, observedCgroupMemoryPeakBytes, cpuSeconds, phasesMs, artifacts }) {
+export function buildResult(header, ticketDir, { kind, exit = null, signal = null, remoteLaneId = null, reason = null, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, grantedCpuCores, executionCpuCores, observedCpu, observedRssPeakBytes, observedCgroupMemoryPeakBytes, cpuSeconds, phasesMs, artifacts, neverStarted, stopProven, shutdownProof }) {
   const isProtocol2 = header.protocol === 2;
   return {
     protocol: isProtocol2 ? 2 : 1,
@@ -302,6 +302,10 @@ export function buildResult(header, ticketDir, { kind, exit = null, signal = nul
     artifacts,
     // BRAIN-642: additive; blob-store hit/miss/corrupt/published counts, present only when this exec used the store
     blobStats: readJsonSafe(path.join(ticketDir, 'blob-stats.json')) ?? undefined,
+    // BRAIN-1035: additive stop-proof provenance for a pull agent; each is present only when true / named, so push results are unchanged
+    ...(neverStarted ? { neverStarted: true } : {}),
+    ...(stopProven ? { stopProven: true } : {}),
+    ...(shutdownProof ? { shutdownProof } : {}),
   };
 }
 
@@ -323,8 +327,8 @@ function storeArtifacts(header, ticketDir, workDir, { kind, exit, signal }) {
   }
 }
 
-function writeResult(ticketDir, result) {
-  atomicWriteJson(path.join(ticketDir, 'result.json'), result);
+function writeResult(ticketDir, result, epoch) {
+  atomicWriteJson(path.join(ticketDir, 'result.json'), epoch === undefined ? result : { ...result, epoch });
 }
 
 // BRAIN-374: the runner's own /tmp can be RAM-backed, so every phase gets a
@@ -403,7 +407,7 @@ function transferLimitsFromEnv() {
  * one of `<root>/tickets/<ticketId>/result.json` (exit 0) or nothing (exit
  * nonzero) -- see the module-level comment on kind derivation below.
  */
-export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = process.stdin, transfer, transferCache = false, transferLimits = transferLimitsFromEnv() } = {}) {
+export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = process.stdin, transfer, transferCache = false, transferLimits = transferLimitsFromEnv(), epoch, runnerName, runnerSpeedFactor } = {}) {
   const execStartedAt = Date.now();
   // BRAIN-320 review fix A: resolve once, up front -- every path derived
   // below (ticketDir, workDir, and the protocol-2 pipeline argv) is passed
@@ -474,20 +478,26 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   // BRAIN-380: the check at the top ran before a (possibly slow) header read, so a drain may have started since. The check
   // and the ticket directory (the intake commit point) are ONE locked step: nothing is created after a drain publishes, and a
   // drain that publishes afterwards finds this live `lane remote-exec` in its process check and waits for it.
+  // BRAIN-1035: a pull agent names the runner and the epoch; the ticket dir, tombstone and tmp owner then carry `<uuid>.e<epoch>`.
+  // The overrides replace the submitter's fields and go through the same validation below.
+  if (runnerName !== undefined) header.runnerName = runnerName;
+  if (runnerSpeedFactor !== undefined) header.runnerSpeedFactor = runnerSpeedFactor;
+  const execId = epoch === undefined ? header.ticketId : executionIdOf(header.ticketId, epoch);
   testDrainAt(stateHome(), 'remote-exec');
   const ticketsDir = path.join(root, 'tickets');
-  const ticketDir = path.join(ticketsDir, header.ticketId);
+  const ticketDir = path.join(ticketsDir, execId);
+  const publishResult = (result) => writeResult(ticketDir, result, epoch);
   try {
     await withLock(stateHome(), () => {
       assertNotMigrating(stateHome());
       // BRAIN-436: a cancel/withdraw that overtook this exec left a tombstone under this same lock, so it loses the race.
-      if (fs.existsSync(tombstonePath(root, header.ticketId))) throw new TombstonedError();
+      if (fs.existsSync(tombstonePath(root, execId))) throw new TombstonedError();
       fs.mkdirSync(ticketsDir, { recursive: true });
       fs.mkdirSync(ticketDir);
     });
   } catch (err) {
     if (err instanceof TombstonedError) {
-      process.stderr.write(`lane remote-exec: ticket ${header.ticketId} was cancelled before it arrived; not creating it\n`);
+      process.stderr.write(`lane remote-exec: ticket ${execId} was cancelled before it arrived; not creating it\n`);
       return { exitCode: 1 };
     }
     if (err instanceof MigrationInProgressError) {
@@ -516,7 +526,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
 
   const fieldCheck = validateHeaderFields(header);
   if (!fieldCheck.ok) {
-    writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: fieldCheck.reason }));
+    publishResult(buildResult(header, ticketDir, { kind: 'rejected', reason: fieldCheck.reason, neverStarted: true }));
     process.stderr.write(`lane remote-exec: ${fieldCheck.reason}\n`);
     return { exitCode: 0 };
   }
@@ -532,7 +542,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   // Every phase env is derived from this process's env (buildDepsEnv, the
   // pipeline's setup/command children, and a protocol-1 argv via runCommand),
   // so setting it once here covers them all.
-  const tmpDir = createOwnedTmpDir(header.ticketId);
+  const tmpDir = createOwnedTmpDir(execId);
   atomicWriteFile(path.join(ticketDir, 'tmp-dir'), tmpDir);
   Object.assign(process.env, tmpEnv(tmpDir));
   const snapshotStartedAt = Date.now();
@@ -553,7 +563,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   }
   if (blobCache) atomicWriteJson(path.join(ticketDir, 'blob-stats.json'), blobCache.stats);
   if (!extractResult.ok) {
-    writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: extractResult.reason }));
+    publishResult(buildResult(header, ticketDir, { kind: 'rejected', reason: extractResult.reason, neverStarted: true }));
     process.stderr.write(`lane remote-exec: ${extractResult.reason}\n`);
     cleanupWork(workDir, tmpDir);
     return { exitCode: 0 };
@@ -567,14 +577,14 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   // side effect of it) is still caught.
   const gitResult = gitInitSnapshot(workDir);
   if (!gitResult.ok) {
-    writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: gitResult.reason }));
+    publishResult(buildResult(header, ticketDir, { kind: 'rejected', reason: gitResult.reason, neverStarted: true }));
     process.stderr.write(`lane remote-exec: ${gitResult.reason}\n`);
     cleanupWork(workDir, tmpDir);
     return { exitCode: 0 };
   }
   const postGitVerify = verifyManifestNoGit(workDir, header.manifest, { ignoreRootGit: true });
   if (!postGitVerify.ok) {
-    writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: postGitVerify.reason }));
+    publishResult(buildResult(header, ticketDir, { kind: 'rejected', reason: postGitVerify.reason, neverStarted: true }));
     process.stderr.write(`lane remote-exec: ${postGitVerify.reason}\n`);
     cleanupWork(workDir, tmpDir);
     return { exitCode: 0 };
@@ -589,14 +599,14 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   if (header.protocol === 2 && Array.isArray(header.remoteDeps)) {
     const depsManifestCheck = validateRemoteDeps(header.manifest, header.remoteDeps);
     if (!depsManifestCheck.ok) {
-      writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: depsManifestCheck.reason }));
+      publishResult(buildResult(header, ticketDir, { kind: 'rejected', reason: depsManifestCheck.reason, neverStarted: true }));
       process.stderr.write(`lane remote-exec: ${depsManifestCheck.reason}\n`);
       cleanupWork(workDir, tmpDir);
       return { exitCode: 0 };
     }
     const depsDiskCheck = checkRemoteDepsDirsOnDisk(workDir, header.remoteDeps);
     if (!depsDiskCheck.ok) {
-      writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'rejected', reason: depsDiskCheck.reason }));
+      publishResult(buildResult(header, ticketDir, { kind: 'rejected', reason: depsDiskCheck.reason, neverStarted: true }));
       process.stderr.write(`lane remote-exec: ${depsDiskCheck.reason}\n`);
       cleanupWork(workDir, tmpDir);
       return { exitCode: 0 };
@@ -626,7 +636,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     const remoteRootAbs = path.resolve(root);
     const { config: runnerCfg, error: configError } = loadGlobalConfigOrError();
     if (configError) {
-      writeResult(ticketDir, buildResult(header, ticketDir, { kind: 'refused', exit: 64, reason: `runner global config unreadable: ${configError}` }));
+      publishResult(buildResult(header, ticketDir, { kind: 'refused', exit: 64, reason: `runner global config unreadable: ${configError}`, neverStarted: true }));
       process.stderr.write(`lane remote-exec: runner global config unreadable: ${configError}\n`);
       cleanupWork(workDir, tmpDir);
       return { exitCode: 0 };
@@ -738,9 +748,15 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   // one". The one case with no such record at all is a preflight refusal
   // (run.js returns before ever calling idOverride/onTicketCreated), where
   // runOutcome.exitCode is the only signal there is.
+  // Test seam (BRAIN-1035): hold BEFORE any shutdown evidence is read, so a test can publish the broker result and run a second sweep first.
+  await testHoldAt('remote-exec-before-result');
   const localRoot = ensureStateDirs().root;
   const structured = readJsonSafe(path.join(paths(localRoot).results, `${remoteLaneId}.json`));
   const cancelled = fs.existsSync(cancelledMarker);
+  const shutdownStop = shutdownStopReason({ cancelled, shutdownMarked: fs.existsSync(shutdownMarker), refusedAtStart, unstarted: fs.existsSync(path.join(ticketDir, 'shutdown-unstarted')), neverStarted: structured?.neverStarted === true, structured });
+  // BRAIN-1035: never-started provenance is explicit (a flag a pre-spawn writer set), never inferred from `startedAt`.
+  let neverStarted = refusedAtStart || structured?.neverStarted === true;
+  let shutdownProof;
 
   let kind;
   let exit = null;
@@ -772,9 +788,11 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   } else if (structured && structured.reason === DEAD_QUEUED_SUPERVISOR_REASON && !cancelled) {
     kind = 'unfinished';
     reason = DEAD_QUEUED_SUPERVISOR_REASON;
-  } else if ((reason = shutdownStopReason({ cancelled, shutdownMarked: fs.existsSync(shutdownMarker), refusedAtStart, unstarted: fs.existsSync(path.join(ticketDir, 'shutdown-unstarted')), structured })) !== null) {
+  } else if (shutdownStop !== null) {
     kind = 'unfinished';
-  } else if (structured) {
+    reason = shutdownStop.reason;
+    shutdownProof = shutdownStop.proof;
+  } else if (structured && structured.neverStarted !== true) {
     exit = structured.exit;
     signal = structured.signal;
     if (structured.reason === NO_PROGRESS_REASON && Number.isFinite(structured.noProgressTimeoutMs)) {
@@ -797,6 +815,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
     kind = 'cancelled';
   } else if (PREFLIGHT_REFUSAL_EXIT_CODES.has(runOutcome.exitCode)) {
     kind = 'refused';
+    neverStarted = !fs.existsSync(path.join(ticketDir, 'remote-id'));
     // BRAIN-319 T3a: record the actual preflight refusal code (64/69/2) so a
     // client can trust it as the exit status -- there is no structured
     // result record for a preflight refusal (run.js returns before ever
@@ -813,9 +832,9 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   const artifacts = storeArtifacts(header, ticketDir, workDir, { kind, exit, signal });
   if (artifacts !== undefined) ownPhasesMs.artifactsMs = Date.now() - artifactsStartedAt;
   try {
-    const built = buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, ...remoteCpuAllocation(structured ?? {}), observedCpu, observedRssPeakBytes, observedCgroupMemoryPeakBytes, cpuSeconds, phasesMs: readPhasesMs(ticketDir, ownPhasesMs), artifacts });
+    const built = buildResult(header, ticketDir, { kind, exit, signal, remoteLaneId, reason, noProgressTimeoutMs, silenceTimeoutMs, runMs, queuedMs, ...remoteCpuAllocation(structured ?? {}), observedCpu, observedRssPeakBytes, observedCgroupMemoryPeakBytes, cpuSeconds, phasesMs: readPhasesMs(ticketDir, ownPhasesMs), artifacts, neverStarted, stopProven: structured?.stopProven === true, shutdownProof });
     // BRAIN-350: an unproven stop names the boot it happened in; a later boot proves the job died with it (servedRecord)
-    writeResult(ticketDir, reason === RUNNER_SHUTDOWN_UNPROVEN_REASON ? { ...built, shutdownBootId: kernelBootId() } : built);
+    publishResult(reason === RUNNER_SHUTDOWN_UNPROVEN_REASON ? { ...built, shutdownBootId: kernelBootId() } : built);
   } finally {
     cleanupWork(workDir, tmpDir);
   }
@@ -1065,14 +1084,14 @@ export async function withdrawLane(brokerRoot, laneId, { dequeue = dequeueSync }
 class TombstonedError extends Error {}
 
 /**
- * Record, under the broker lock `remote-exec` creates tickets under, that `ticketId` must never be created -- unless its ticket
+ * Record, under the broker lock `remote-exec` creates tickets under, that `execId` must never be created -- unless its ticket
  * directory already exists by the time the lock is held (then the caller handles it as an ordinary ticket). Resolves true iff
  * the tombstone was written, which is the proof a later `remote-exec` for that id is refused.
  */
-async function tombstoneAbsentTicket(root, ticketId) {
+export async function tombstoneAbsentTicket(root, execId) {
   return withLock(stateHome(), () => {
-    if (fs.existsSync(path.join(path.resolve(root), 'tickets', ticketId))) return false;
-    atomicWriteFile(tombstonePath(root, ticketId), String(Date.now()));
+    if (fs.existsSync(path.join(path.resolve(root), 'tickets', execId))) return false;
+    atomicWriteFile(tombstonePath(root, execId), String(Date.now()));
     return true;
   });
 }
@@ -1133,15 +1152,13 @@ function advisoryQueueFacts(ticketDir, readFacts) {
   }
 }
 
-/** `lane remote-result <ticketId>`: print result.json, or {missing:true, state} where state is
- *  queued|running|gone (is the publishing remote-exec alive) (BRAIN-339; `missing:true` stays for older clients). */
-export async function remoteResultCommand(ticketId, { root = defaultRemoteRoot(), readResult = readJsonSafe, readFacts = queueFacts } = {}) {
-  if (!isUuid(ticketId)) {
-    process.stderr.write('lane remote-result: missing or invalid ticketId\n');
-    return { exitCode: 2 };
-  }
+/**
+ * The record `lane remote-result` serves for `execId` (a validated execution id): result.json, or {missing:true, state} where state is
+ * queued|running|gone (is the publishing remote-exec alive) (BRAIN-339; `missing:true` stays for older clients). `servedRecord` applies.
+ */
+export async function readRemoteResultRecord(execId, { root = defaultRemoteRoot(), readResult = readJsonSafe, readFacts = queueFacts } = {}) {
   root = path.resolve(root);
-  const ticketDir = path.join(root, 'tickets', ticketId);
+  const ticketDir = path.join(root, 'tickets', execId);
   const resultPath = path.join(ticketDir, 'result.json');
   let record = readResult(resultPath);
   if (!record) {
@@ -1152,7 +1169,16 @@ export async function remoteResultCommand(ticketId, { root = defaultRemoteRoot()
     const drain = readRemoteDrain(stateHome());
     record = (state === 'gone' && readResult(resultPath)) || { protocol: 1, missing: true, state, ...(phase !== state ? { phase } : {}), ...(drain ? { remoteDrain: { reason: drain.reason, since: drain.since } } : {}), ...(phase === 'queued' ? advisoryQueueFacts(ticketDir, readFacts) : {}) };
   }
-  process.stdout.write(`${JSON.stringify(servedRecord(record, kernelBootId()))}\n`);
+  return servedRecord(record, kernelBootId());
+}
+
+/** `lane remote-result <ticketId|execId>`: print `readRemoteResultRecord`. */
+export async function remoteResultCommand(execId, options) {
+  if (!isExecutionId(execId)) {
+    process.stderr.write('lane remote-result: missing or invalid ticketId\n');
+    return { exitCode: 2 };
+  }
+  process.stdout.write(`${JSON.stringify(await readRemoteResultRecord(execId, options))}\n`);
   return { exitCode: 0 };
 }
 
@@ -1163,17 +1189,20 @@ export async function remoteResultCommand(ticketId, { root = defaultRemoteRoot()
  */
 export function servedRecord(record, currentBootId) {
   if (record?.kind !== 'unfinished' || record.reason !== RUNNER_SHUTDOWN_UNPROVEN_REASON) return record;
-  if (typeof record.shutdownBootId !== 'string' || !currentBootId || record.shutdownBootId === currentBootId) return record;
-  return { ...record, reason: RUNNER_SHUTDOWN_REASON, provenBy: 'reboot' };
+  if (!record.shutdownBootId || typeof record.shutdownBootId !== 'string' || !currentBootId || record.shutdownBootId === currentBootId) return record;
+  return { ...record, reason: RUNNER_SHUTDOWN_REASON, provenBy: 'reboot', shutdownProof: 'reboot' };
 }
 
-/** `lane remote-artifacts <ticketId>` (BRAIN-398): stream the stored artifacts, framed; nonzero and silent when there are none. */
-export async function remoteArtifactsCommand(ticketId, { root = defaultRemoteRoot(), stdout = process.stdout } = {}) {
-  if (!isUuid(ticketId)) {
+/**
+ * `lane remote-artifacts <ticketId|execId>` (BRAIN-398): stream the stored artifacts, framed; nonzero and silent when there are none.
+ * The stored directory is the execution's, but the stream binds to the logical ticket uuid, which is what the receiver checks.
+ */
+export async function remoteArtifactsCommand(execId, { root = defaultRemoteRoot(), stdout = process.stdout } = {}) {
+  if (!isExecutionId(execId)) {
     process.stderr.write('lane remote-artifacts: missing or invalid ticketId\n');
     return { exitCode: 2 };
   }
-  const stream = encodeArtifacts(path.join(path.resolve(root), 'tickets', ticketId, 'artifacts'), ticketId);
+  const stream = encodeArtifacts(path.join(path.resolve(root), 'tickets', execId, 'artifacts'), parseExecutionId(execId).ticketId);
   if (!stream) {
     process.stderr.write('lane remote-artifacts: no artifacts stored for this ticket\n');
     return { exitCode: 1 };
@@ -1188,35 +1217,31 @@ export async function remoteArtifactsCommand(ticketId, { root = defaultRemoteRoo
 }
 
 /** `lane remote-artifacts-release <ticketId>`: delete the stored copies once the submitter has them. Idempotent. */
-export async function remoteArtifactsReleaseCommand(ticketId, { root = defaultRemoteRoot() } = {}) {
-  if (!isUuid(ticketId)) {
+export async function remoteArtifactsReleaseCommand(execId, { root = defaultRemoteRoot() } = {}) {
+  if (!isExecutionId(execId)) {
     process.stderr.write('lane remote-artifacts-release: missing or invalid ticketId\n');
     return { exitCode: 2 };
   }
-  fs.rmSync(path.join(path.resolve(root), 'tickets', ticketId, 'artifacts'), { recursive: true, force: true });
+  fs.rmSync(path.join(path.resolve(root), 'tickets', execId, 'artifacts'), { recursive: true, force: true });
   return { exitCode: 0 };
 }
 
 /**
- * `lane remote-cancel <ticketId>`: write the cancel marker (only if the
+ * Cancel the execution `execId` (a validated execution id): write the cancel marker (only if the
  * ticket directory already exists — this must never CREATE one), then, if a
  * broker ticket id has already been recorded, cancel it via the existing
  * `lane cancel` machinery. Idempotent: calling it twice, or before/after
  * `remote-id` exists, is always safe (BRAIN-319 C5's ordering guarantee).
+ * Returns what `lane remote-cancel` prints, plus `confirmedBy` (what made `cancelConfirmed` true, else null) and `remoteLaneId`.
  */
-export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot() } = {}) {
-  if (!isUuid(ticketId)) {
-    process.stderr.write('lane remote-cancel: missing or invalid ticketId\n');
-    return { exitCode: 2 };
-  }
+export async function cancelRemoteExecution(execId, { root = defaultRemoteRoot() } = {}) {
   root = path.resolve(root);
-  const ticketDir = path.join(root, 'tickets', ticketId);
+  const ticketDir = path.join(root, 'tickets', execId);
   if (!fs.existsSync(ticketDir)) {
     // BRAIN-436: the exec may still be in flight. The tombstone makes it refuse to create the ticket, so this cancel is a real
     // one (`cancelConfirmed`): the job can no longer start here. A ticket that appeared meanwhile falls through as an ordinary one.
-    if (await tombstoneAbsentTicket(root, ticketId)) {
-      process.stdout.write(`${JSON.stringify({ protocol: 1, ticketId, action: 'no-such-ticket', cancelConfirmed: true, tombstoned: true })}\n`);
-      return { exitCode: 0 };
+    if (await tombstoneAbsentTicket(root, execId)) {
+      return { ticketId: execId, action: 'no-such-ticket', cancelConfirmed: true, tombstoned: true, confirmedBy: 'tombstone', remoteLaneId: null };
     }
   }
 
@@ -1232,6 +1257,7 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
   //    and only its own exit 0 confirms. `registered` is informational.
   let cancelRequested = false;
   let cancelConfirmed = false;
+  let confirmedBy = null;
   let registered = false;
   let remoteLaneId = null;
   // Only a genuine absence (ENOENT) is a proof of "no remote-id" / "not registered". A read that FAILS is an unknown, never a
@@ -1246,6 +1272,7 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
     }
     if (recorded === null) {
       cancelConfirmed = true;
+      confirmedBy = 'no-remote-id';
       return;
     }
     if (!isUuid(recorded)) return;
@@ -1258,10 +1285,14 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
     } catch {
       registered = true;
     }
-    if (!registered) cancelConfirmed = true;
+    if (!registered) {
+      cancelConfirmed = true;
+      confirmedBy = 'not-registered';
+    }
   });
   if (registered) {
     cancelConfirmed = (await cancelCommand(remoteLaneId)).exitCode === 0;
+    if (cancelConfirmed) confirmedBy = 'broker-cancel';
     // The marker written above makes a queued ticket's own supervisor dequeue itself, which can happen before `cancelCommand` takes
     // the lock; it then finds nothing and exits 1. Not registered any more, with the marker in place, means it can never start.
     if (!cancelConfirmed) {
@@ -1272,28 +1303,46 @@ export async function remoteCancelCommand(ticketId, { root = defaultRemoteRoot()
           return false;
         }
       });
+      if (cancelConfirmed) confirmedBy = 'not-registered';
     }
   }
   // A ticket that has already published its result is not running: a retried cancel is confirmed, not forever unconfirmed.
   // That holds with or without a `remote-id` -- a ticket rejected or refused before it was enqueued never had one.
-  if (!cancelConfirmed && fs.existsSync(path.join(ticketDir, 'result.json'))) cancelConfirmed = true;
+  if (!cancelConfirmed && fs.existsSync(path.join(ticketDir, 'result.json'))) {
+    cancelConfirmed = true;
+    confirmedBy = 'result-exists';
+  }
 
-  process.stdout.write(`${JSON.stringify({ protocol: 1, ticketId, markedCancelled: true, cancelRequested, cancelConfirmed, registered })}\n`);
+  return { ticketId: execId, markedCancelled: true, cancelRequested, cancelConfirmed, registered, confirmedBy, remoteLaneId };
+}
+
+/** `lane remote-cancel <ticketId|execId>`: print `cancelRemoteExecution`'s record (without `confirmedBy` and `remoteLaneId`). */
+export async function remoteCancelCommand(execId, { root = defaultRemoteRoot() } = {}) {
+  if (!isExecutionId(execId)) {
+    process.stderr.write('lane remote-cancel: missing or invalid ticketId\n');
+    return { exitCode: 2 };
+  }
+  const { confirmedBy: _confirmedBy, remoteLaneId: _remoteLaneId, ...printed } = await cancelRemoteExecution(execId, { root });
+  process.stdout.write(`${JSON.stringify({ protocol: 1, ...printed })}\n`);
   return { exitCode: 0 };
 }
 
 /**
- * BRAIN-350: the `reason` of the record for a ticket `lane drain --shutdown` marked, or null when the shutdown does not decide it.
- * `runner-shutdown` lets the submitter run the job again elsewhere, so only a PROVEN stop produces it: refused before anything ran,
- * found unleased by the shutdown sweep, which dequeued or fenced it so it can never start (`unstarted`), or a cancel that ended the command with every process confirmed
- * gone (`stopProven`, set by the local supervisor). A stop it cannot prove (the supervisor died with no result, an incomplete reap,
- * a command that had already exited and was draining output) is `runner-shutdown-unproven`: possibly still running. A user cancel
- * wins, and a job that completed on its own keeps its real record.
+ * BRAIN-350: what `lane drain --shutdown` decided for a ticket it marked: `{reason, proof}`, or null when the shutdown does not decide it.
+ * `runner-shutdown` lets the submitter run the job again elsewhere, so only a PROVEN stop produces it, and `proof` names the evidence:
+ * `refused-at-start` (refused before anything ran), `dequeued` (the shutdown sweep itself dequeued it, so it can never start),
+ * `never-started` (a pre-spawn writer's explicit `neverStarted` flag on the broker result), or `stop-proven` (a cancel that ended the
+ * command with every process confirmed gone, set by the local supervisor). A missing lease proves nothing. A stop it cannot prove (the
+ * supervisor died with no result, an incomplete reap, a command that had already exited and was draining output) is
+ * `runner-shutdown-unproven` (`proof` null): possibly still running. A user cancel wins, and a job that completed on its own keeps its record.
  */
-export function shutdownStopReason({ cancelled, shutdownMarked, refusedAtStart, unstarted, structured }) {
+export function shutdownStopReason({ cancelled, shutdownMarked, refusedAtStart, unstarted, neverStarted, structured }) {
   if (cancelled || !shutdownMarked) return null;
-  if (refusedAtStart || unstarted || structured?.stopProven === true) return RUNNER_SHUTDOWN_REASON;
-  if (!structured || structured.cancelled === true) return RUNNER_SHUTDOWN_UNPROVEN_REASON;
+  if (refusedAtStart) return { reason: RUNNER_SHUTDOWN_REASON, proof: 'refused-at-start' };
+  if (unstarted) return { reason: RUNNER_SHUTDOWN_REASON, proof: 'dequeued' };
+  if (neverStarted) return { reason: RUNNER_SHUTDOWN_REASON, proof: 'never-started' };
+  if (structured?.stopProven === true) return { reason: RUNNER_SHUTDOWN_REASON, proof: 'stop-proven' };
+  if (!structured || structured.cancelled === true) return { reason: RUNNER_SHUTDOWN_UNPROVEN_REASON, proof: null };
   return null;
 }
 
@@ -1303,13 +1352,15 @@ export function shutdownStopReason({ cancelled, shutdownMarked, refusedAtStart, 
  * `onTicketCreated` use, so an exec either sees the marker or is seen here. It never writes the ticket's `cancelled` marker: that
  * is a user cancel (exit 130) to the submitter, whereas the finalize step turns a `shutdown` marker into an `unfinished`
  * `runner-shutdown` record, the proof the job is dead. Then waits (bounded) for each ticket to publish or its publisher to die.
+ * One absolute `deadline` (ms epoch; default `waitMs` from now) bounds every step: the lock waits, the cancels and the final wait.
  */
-export async function remoteShutdownCommand({ root = defaultRemoteRoot(), waitMs = 60_000 } = {}) {
+export async function remoteShutdownCommand({ root = defaultRemoteRoot(), waitMs = 60_000, deadline = Date.now() + waitMs } = {}) {
   root = path.resolve(root);
   const ticketsDir = path.join(root, 'tickets');
   const marked = [];
   const toStop = [];
-  await withLock(stateHome(), () => {
+  const msLeft = () => Math.max(0, deadline - Date.now());
+  const lockTimedOut = await withLock(stateHome(), () => {
     let names = [];
     try {
       names = fs.readdirSync(ticketsDir);
@@ -1319,7 +1370,7 @@ export async function remoteShutdownCommand({ root = defaultRemoteRoot(), waitMs
     const brokerRoot = ensureStateDirs().root;
     for (const name of names) {
       const ticketDir = path.join(ticketsDir, name);
-      if (!isUuid(name) || fs.existsSync(path.join(ticketDir, 'result.json'))) continue;
+      if (!isExecutionId(name) || fs.existsSync(path.join(ticketDir, 'result.json'))) continue;
       atomicWriteFile(path.join(ticketDir, 'shutdown'), String(Date.now()));
       marked.push(ticketDir);
       let recorded = null;
@@ -1330,22 +1381,31 @@ export async function remoteShutdownCommand({ root = defaultRemoteRoot(), waitMs
       }
       if (recorded !== null && isUuid(recorded)) {
         writeCancelMarkerFile(brokerRoot, recorded);
-        // Not leased yet: it can never start now. A queued ticket is dequeued here, under the lock the scheduler moves a ticket
-        // from queue to lease under; one not yet enqueued meets the cancel marker just written, which the scheduler checks under
-        // that same lock before any start. The `shutdown-unstarted` marker is that proof, written before its supervisor can exit.
+        // A queued ticket is dequeued here, under the lock the scheduler moves a ticket from queue to lease under, so it can never
+        // start; `shutdown-unstarted` records that this sweep did it. A ticket not yet enqueued meets the cancel marker just written,
+        // which the scheduler checks under that same lock before any start; its supervisor publishes `neverStarted` for it. A
+        // missing lease alone proves nothing (the lease may be gone because the command already ran).
         const queued = listQueue(brokerRoot).find((t) => t && t.id === recorded);
         if (queued) {
           dequeueSync(brokerRoot, recorded);
           touchSimArmFor(brokerRoot, queued);
-        }
-        if (queued || !readLease(brokerRoot, recorded)) atomicWriteFile(path.join(ticketDir, 'shutdown-unstarted'), String(Date.now()));
-        if (!queued) toStop.push(recorded);
+          atomicWriteFile(path.join(ticketDir, 'shutdown-unstarted'), String(Date.now()));
+        } else toStop.push(recorded);
       }
     }
-  });
-  for (const laneId of toStop) await cancelCommand(laneId);
+  }, { timeoutMs: msLeft() }).then(
+    () => false,
+    (err) => {
+      if (!(err instanceof LockTimeoutError)) throw err;
+      return true;
+    },
+  );
+  if (lockTimedOut) {
+    process.stdout.write('lane drain --shutdown: could not take the broker lock before the deadline; nothing was marked\n');
+    return { exitCode: 75, stopped: 0, published: 0, pending: 0, lockTimedOut };
+  }
+  await Promise.allSettled(toStop.map((laneId) => cancelCommand(laneId, { deadline })));
 
-  const deadline = Date.now() + waitMs;
   const brokerRoot = ensureStateDirs().root;
   let published = 0;
   let pending = marked.slice();
@@ -1358,7 +1418,7 @@ export async function remoteShutdownCommand({ root = defaultRemoteRoot(), waitMs
       return remoteTicketState(dir, brokerRoot) !== 'gone';
     });
     if (pending.length === 0 || Date.now() >= deadline) break;
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    await new Promise((resolve) => setTimeout(resolve, Math.min(100, msLeft())));
   }
   process.stdout.write(`lane drain --shutdown: stopped ${marked.length - published - pending.length}, published ${published}, still pending ${pending.length}\n`);
   return { exitCode: 0, stopped: marked.length - published - pending.length, published, pending: pending.length };

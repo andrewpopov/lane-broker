@@ -10,34 +10,42 @@ import { loadGlobalConfigOrError } from './config.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
 import { writeBrokerLog } from './admission.js';
 import { stopLeaseCpuScope } from './cpu-limit.js';
-import { trackerForLease, reapLogLine, cancelGraceMs } from './descendants.js';
+import { trackerForLease, reapLogLine, cancelGraceMs, KILL_WAIT_MS } from './descendants.js';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+const msUntil = (deadline) => Math.max(0, deadline - Date.now());
+
 /** TERM the group, wait a grace period, KILL, verify gone. Used when there is no supervisor left to do it.
- *  Also reaps the descendants the dead supervisor last recorded on the lease (BRAIN-419), token-checked. */
-async function killGroupDirectly(lease, root, exec) {
-  const reaping = trackerForLease(lease).reap({ graceMs: cancelGraceMs() });
+ *  Also reaps the descendants the dead supervisor last recorded on the lease (BRAIN-419), token-checked.
+ *  With an absolute `deadline` (ms epoch) every wait stops there; resolves whether the group is confirmed gone. */
+async function killGroupDirectly(lease, root, exec, deadline) {
+  const graceMs = deadline === undefined ? cancelGraceMs() : Math.min(cancelGraceMs(), msUntil(deadline));
+  const killWaitMs = deadline === undefined ? KILL_WAIT_MS : Math.min(KILL_WAIT_MS, msUntil(deadline) - graceMs);
+  const reaping = trackerForLease(lease).reap({ graceMs, killWaitMs: Math.max(0, killWaitMs) });
+  let groupGone = true;
   try {
-    if (lease.childPgid) await killGroupOnly(lease.childPgid);
+    if (lease.childPgid) groupGone = await killGroupOnly(lease.childPgid, deadline);
   } finally {
     const result = await reaping;
     writeBrokerLog(root, reapLogLine(lease.id, result));
     // BRAIN-651 L3: no supervisor is left to stop the lane's CPU scope, and a setsid'd process in it is invisible to the group kill
     stopLeaseCpuScope(lease, { exec, log: (line) => writeBrokerLog(root, line) });
   }
+  return groupGone;
 }
 
-async function killGroupOnly(pgid) {
+/** Resolves true once the group is gone, false when the optional absolute `deadline` passes with it still alive. */
+async function killGroupOnly(pgid, deadline = Infinity) {
   try {
     process.kill(-pgid, 'SIGTERM');
   } catch {
-    return;
+    return true;
   }
-  const deadline = Date.now() + cancelGraceMs();
-  while (Date.now() < deadline && isGroupAlive(pgid)) {
+  const graceEnd = Math.min(Date.now() + cancelGraceMs(), deadline);
+  while (Date.now() < graceEnd && isGroupAlive(pgid)) {
     await sleep(100);
   }
   if (isGroupAlive(pgid)) {
@@ -47,9 +55,11 @@ async function killGroupOnly(pgid) {
       // gone
     }
     while (isGroupAlive(pgid)) {
+      if (Date.now() >= deadline) return false;
       await sleep(50);
     }
   }
+  return true;
 }
 
 /**
@@ -157,8 +167,11 @@ export async function cancelAttempt(root, id, attempt, { orphanOnly = false } = 
   return { exitCode: 0 };
 }
 
-/** `lane cancel <id>`: cancels a queued ticket or a running/ORPHANED lease. */
-export async function cancelCommand(id, { exec, quiet = false } = {}) {
+/**
+ * `lane cancel <id>`: cancels a queued ticket or a running/ORPHANED lease. An absolute `deadline` (ms epoch, `lane drain --shutdown`)
+ * bounds the lock wait, the supervisor grace loop and the kill waits; what it cannot finish by then is reported as exit 1, never as a cancel.
+ */
+export async function cancelCommand(id, { exec, quiet = false, deadline } = {}) {
   const root = ensureStateDirs().root;
   const say = (line) => {
     if (!quiet) process.stdout.write(line);
@@ -176,7 +189,7 @@ export async function cancelCommand(id, { exec, quiet = false } = {}) {
     writeCancelMarkerFile(root, id);
     touchSimArmFor(root, stillQueued);
     return true;
-  });
+  }, { timeoutMs: deadline === undefined ? undefined : msUntil(deadline) });
   if (dequeuedHere) {
     say(`lane cancel: removed queued ticket ${id}\n`);
     return { exitCode: 0 };
@@ -204,8 +217,8 @@ export async function cancelCommand(id, { exec, quiet = false } = {}) {
     } catch {
       // race: supervisor just exited
     }
-    const deadline = Date.now() + cancelGraceMs() + 5000;
-    while (Date.now() < deadline && readLease(root, id)) {
+    const graceEnd = Math.min(Date.now() + cancelGraceMs() + 5000, deadline ?? Infinity);
+    while (Date.now() < graceEnd && readLease(root, id)) {
       await sleep(100);
     }
     const stillHeld = readLease(root, id);
@@ -225,7 +238,10 @@ export async function cancelCommand(id, { exec, quiet = false } = {}) {
 
   // ORPHANED: no supervisor left to react to the cancel request. Do the kill
   // sequence ourselves, then release.
-  await killGroupDirectly(lease, root, exec);
+  if (!(await killGroupDirectly(lease, root, exec, deadline))) {
+    process.stderr.write(`lane cancel: the process group of ${id} did not exit before the deadline; lease kept\n`);
+    return { exitCode: 1 };
+  }
 
   // BRAIN-319 (older bug, fixed alongside P1/P2/P3): a ticket that fell back
   // to local and was ADMITTED (leased) still has its attempt record --
