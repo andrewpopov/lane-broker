@@ -1016,7 +1016,7 @@ reason.
 
 - **Eligibility**, per `remoteDeps` dir. The lockfile (`package-lock.json`,
   or `npm-shrinkwrap.json` when present) must be v2 or v3 with a `packages`
-  map, and every non-root entry must be a tarball with `integrity` on a
+  map, and every non-root entry must be a tarball with a valid SRI `integrity` (`sha512-<base64>` etc.; `""` or `"x"` is refused) on a
   registry in `depsCacheRegistries` (default `https://registry.npmjs.org/`),
   a `git+...#<40-hex sha>`, or a `file:*.tgz` with `integrity`. A tarball on
   any other registry is refused naming its origin (`resolves to a registry

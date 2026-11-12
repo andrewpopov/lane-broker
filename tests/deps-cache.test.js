@@ -380,6 +380,34 @@ test('eligibility (BRAIN-1010): an allowlisted private-registry tarball with int
   assert.equal(lockEligibility(privateEntry(PRIVATE_TARBALL, null), { registries }).ok, false);
 });
 
+test('eligibility (BRAIN-1010): only a real SRI integrity pins a tarball, on npmjs, a private registry and a file tarball', () => {
+  const registries = [...DEFAULT_DEPS_CACHE_REGISTRIES, PRIVATE_REGISTRY];
+  const resolvedUrls = ['https://registry.npmjs.org/p/-/p-1.0.0.tgz', PRIVATE_TARBALL, 'file:vendor/p-1.0.0.tgz'];
+  for (const resolved of resolvedUrls) {
+    for (const integrity of ['', 'x', 'sha512-', 'md5-abc', 'sha512-abc sha512-', 5]) {
+      assert.equal(lockEligibility(privateEntry(resolved, integrity), { registries }).ok, false, `${resolved} with ${JSON.stringify(integrity)}`);
+    }
+    for (const integrity of ['sha512-abc', ' sha512-YWJj== ', 'sha1-abc sha512-abc']) {
+      assert.equal(lockEligibility(privateEntry(resolved, integrity), { registries }).ok, true, `${resolved} with ${JSON.stringify(integrity)}`);
+    }
+  }
+});
+
+test('eligibility (BRAIN-1010): a ".." in resolved cannot escape a registry with a path prefix', () => {
+  const registries = ['https://host.example/npm/'];
+  assert.equal(lockEligibility(privateEntry('https://host.example/npm/p/-/p-1.0.0.tgz'), { registries }).ok, true);
+  assert.equal(lockEligibility(privateEntry('https://host.example/npm/../other/p-1.0.0.tgz'), { registries }).ok, false);
+  assert.equal(lockEligibility(privateEntry('https://host.example/npm/%2e%2e/other/p-1.0.0.tgz'), { registries }).ok, false);
+});
+
+test('key (BRAIN-1010): the allowlist is not key material: an npmjs-only lock keys the same under either list', () => {
+  const f = makeKeyFixture();
+  const withRegistries = (registries) => computeDepsKey({ ...f.inputs(), registries });
+  const a = withRegistries(DEFAULT_DEPS_CACHE_REGISTRIES);
+  assert.ok(a.key);
+  assert.equal(withRegistries([...DEFAULT_DEPS_CACHE_REGISTRIES, PRIVATE_REGISTRY]).key, a.key);
+});
+
 test('eligibility (BRAIN-1010): a tarball on a host outside the allowlist is refused, naming the origin', () => {
   const verdict = lockEligibility(privateEntry(PRIVATE_TARBALL));
   assert.equal(verdict.ok, false);
@@ -417,7 +445,7 @@ test('config (BRAIN-1010): depsCacheRegistries defaults to npmjs.org and rejects
     assert.deepEqual(loadGlobalConfig().depsCacheRegistries, ['https://registry.npmjs.org/', PRIVATE_REGISTRY]);
     for (const bad of [
       'https://npm.example.com/', ['http://npm.example.com/'], [], ['npm.example.com/'], ['https://npm.example.com'],
-      ['https://u:p@npm.example.com/'], ['https://npm.example.com/?x=1'], ['https://npm.example.com/#f'], [42],
+      ['https://u:p@npm.example.com/'], ['https://npm.example.com/?x=1'], ['https://npm.example.com/#f'], [42], [['https://registry.npmjs.org/']], [null],
     ]) {
       assert.notEqual(registriesProblem(bad), null, JSON.stringify(bad));
       const e = freshEnv();

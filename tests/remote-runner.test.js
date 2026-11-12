@@ -416,6 +416,21 @@ test('a plain protocol-2 header (no remoteDeps/remoteSetup) runs the command and
   assert.equal(result.phase, 'command');
 });
 
+// BRAIN-1010: the runner's own depsCacheRegistries config is what the pipeline's deps cache will be told.
+test('the runner global config depsCacheRegistries reaches pipeline.json (protocol 2)', async () => {
+  const { env, home } = freshShadowEnv();
+  const registries = ['https://registry.npmjs.org/', 'https://npm.tail615381.ts.net/'];
+  writeGlobalConfig(home, { depsCacheRegistries: registries });
+  const root = tmpDir('remote-exec-registries-root');
+  const { dir: src, entries } = makeSnapshotSource({ 'a.txt': 'hello' });
+  const header = makeHeader({ protocol: 2 });
+
+  const { code, err } = await runOne(header, entries, { env, root, src });
+  assert.equal(code, 0, `stderr: ${err}`);
+  const pipeline = readJsonSafe(path.join(root, 'tickets', header.ticketId, 'pipeline.json'));
+  assert.deepEqual(pipeline.depsCache.registries, registries);
+});
+
 // BRAIN-320 review fix A: a relative --root must resolve against remote-exec's
 // OWN cwd once, up front -- not get re-derived against the protocol-2
 // pipeline child's DIFFERENT cwd (the extracted work dir), or the pipeline

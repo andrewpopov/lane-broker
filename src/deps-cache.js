@@ -299,6 +299,15 @@ export function assertContained(baseDir, rel) {
  * it, or the entry is `inDepBundle`), and that parent itself passed these checks. A top-level entry has no
  * enclosing package (root-bundled deps are fetched like any other), so it gets the normal checks.
  */
+const SRI_HASH_RE = /^(sha512|sha384|sha256|sha1)-[A-Za-z0-9+/]+={0,2}$/;
+
+/** True for a real SRI string (one or more space-separated `<algo>-<base64>`), which npm verifies; "" or "x" parses to nothing and pins no bytes. */
+function hasSriIntegrity(integrity) {
+  if (typeof integrity !== 'string') return false;
+  const hashes = integrity.trim().split(/\s+/);
+  return hashes.every((hash) => SRI_HASH_RE.test(hash));
+}
+
 /** The parsed `resolved` when it is a credential-free https URL, else null. Prefix-matched against parsed registry URLs, never a regex. */
 function registryTarball(resolved) {
   try {
@@ -313,6 +322,7 @@ function registryTarball(resolved) {
 export function registriesProblem(registries) {
   if (!Array.isArray(registries) || registries.length === 0) return 'must be a non-empty array of https registry URLs ending in "/"';
   for (const entry of registries) {
+    if (typeof entry !== 'string') return `entry ${JSON.stringify(entry)} is not a string`;
     let url;
     try {
       url = new URL(entry);
@@ -375,12 +385,12 @@ export function lockEligibility(lock, { registries = DEFAULT_DEPS_CACHE_REGISTRI
     const { resolved, integrity } = entry;
     if (typeof resolved === 'string') {
       const registry = registryTarball(resolved);
-      if (registry && typeof integrity === 'string') {
+      if (registry && hasSriIntegrity(integrity)) {
         if (registryPrefixes.some((prefix) => registry.href.startsWith(prefix))) return null;
         return `lock entry ${name} resolves to a registry not in depsCacheRegistries: ${registry.origin}`;
       }
       if (GIT_PINNED_RE.test(resolved)) return null;
-      if (FILE_TARBALL_RE.test(resolved) && typeof integrity === 'string') {
+      if (FILE_TARBALL_RE.test(resolved) && hasSriIntegrity(integrity)) {
         tarballs.push(resolved.slice('file:'.length));
         return null;
       }
