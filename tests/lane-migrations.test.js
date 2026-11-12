@@ -117,13 +117,13 @@ describe('lane schema versioning', { skip: PG_SKIP_REASON ?? false, timeout: 120
   test('migration 003 backfills the scheduling parents of principals that already existed', async () => {
     const c = await emptyDb();
     const dir = fixtureDir();
-    for (const f of fs.readdirSync(path.join(dir, 'migrations')).filter((x) => /^00[34]-/.test(x))) fs.rmSync(path.join(dir, 'migrations', f));
+    for (const f of fs.readdirSync(path.join(dir, 'migrations')).filter((x) => /^00[345]-/.test(x))) fs.rmSync(path.join(dir, 'migrations', f));
     // functions.sql must not reference what 003 adds, so the pre-003 state is applied with the schema as of version 2.
     await applyMigrations(c, { dir });
     await c.query("INSERT INTO lane.principals (login_role, kind, allowed_accounts) VALUES ('old_submit', 'submit', '{a1,a2}')");
     assert.equal((await c.query('SELECT count(*)::int AS n FROM lane.sched_parents')).rows[0].n, 0);
     const r = await applyMigrations(c);
-    assert.equal(r.applied.length, 2);                 // 003 (the backfill) and 004
+    assert.equal(r.applied.length, 3);                 // 003 (the backfill), 004 and 005
     assert.deepEqual((await c.query('SELECT account, count(*)::int AS n FROM lane.sched_parents GROUP BY account ORDER BY account')).rows, [{ account: 'a1', n: 5 }, { account: 'a2', n: 5 }]);
   });
 });

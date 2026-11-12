@@ -579,18 +579,455 @@ BEGIN
   UPDATE lane.sched_parents p SET rem_ref = coalesce((SELECT d.v FROM d WHERE d.pid = p.id), '{}');
 END $$;
 
+-- BRAIN-930 S1: pull dispatch (lane_dispatch). Every body is plpgsql so these apply before migration 005's tables exist; the schema
+-- is created here for that reason. ld_entry is called first by every ld_* function.
+CREATE SCHEMA IF NOT EXISTS lane_dispatch;
+
+-- A restore ends on a new timeline: the first call after it quarantines every non-terminal row (design section 3, invariant 3).
+-- Returns false when this call found the mismatch. The lock is taken waiting, and cluster is re-checked under it so concurrent callers quarantine once.
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_timeline_ok() RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_timeline int;
+BEGIN
+  v_timeline := (SELECT c.timeline_id FROM pg_control_checkpoint() c);
+  IF v_timeline = (SELECT c.timeline FROM lane_dispatch.cluster c WHERE c.id = 1) THEN RETURN true; END IF;
+  PERFORM 1 FROM lane_dispatch.claim_lock WHERE id = 1 FOR UPDATE;
+  UPDATE lane_dispatch.cluster SET timeline = v_timeline, incarnation = incarnation + 1 WHERE id = 1 AND timeline <> v_timeline;
+  IF FOUND THEN
+    UPDATE lane_dispatch.tickets SET state = 'quarantined' WHERE state NOT IN ('finished','cancelled','withdrawn','lost');
+  END IF;
+  RETURN false;
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_entry() RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'lane_dispatch must run at READ COMMITTED, not %', current_setting('transaction_isolation') USING ERRCODE = '25000';
+  END IF;
+  PERFORM lane_dispatch.ld_timeline_ok();
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.me(p_kind text) RETURNS TABLE (host text, tags text[], allowed_repos text[], max_claims int)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+#variable_conflict use_column
+BEGIN
+  RETURN QUERY SELECT p.host, p.tags, p.allowed_repos, p.max_claims FROM lane_dispatch.principals p WHERE p.login_role = session_user AND p.kind = p_kind;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'no % principal for %', p_kind, session_user USING ERRCODE = '42501';
+  END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.fence_ok(p_epoch int, p_token uuid, p_host text, p_row_epoch int, p_row_token uuid, p_row_host text, p_row_state text)
+RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  RETURN coalesce(p_row_state IN ('claimed','running','quarantined') AND p_row_epoch = p_epoch AND p_row_token = p_token AND p_row_host = p_host, false);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.eligible(p_requires_tags text[], p_repo_key text, p_tags text[], p_allowed_repos text[]) RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  RETURN p_requires_tags <@ p_tags AND (p_repo_key = ANY (p_allowed_repos) OR '*' = ANY (p_allowed_repos));
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ticket_view(p_id uuid) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  RETURN (SELECT jsonb_build_object('id', t.id, 'state', t.state, 'epoch', t.epoch, 'execution_id', t.id::text || '.e' || t.epoch::text,
+                                    'host', t.host, 'lease_until', t.lease_until, 'cancel_requested', t.cancel_requested, 'urls', t.urls,
+                                    'result', t.result, 'incarnation', t.incarnation, 'created_at', t.created_at,
+                                    'started_at', t.started_at, 'finished_at', t.finished_at)
+            FROM lane_dispatch.tickets t WHERE t.id = p_id);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.claim_view(p_id uuid, p_epoch int, p_token uuid) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  IF p_id IS NULL THEN RETURN jsonb_build_object('status', 'none'); END IF;
+  RETURN (SELECT jsonb_build_object('status', 'claimed', 'id', t.id, 'epoch', p_epoch, 'token', p_token,
+                                    'execution_id', t.id::text || '.e' || p_epoch::text, 'repo_key', t.repo_key, 'lane', t.lane,
+                                    'lane_key', t.lane_key, 'binding', t.binding, 'header', t.header, 'snapshot', t.snapshot,
+                                    'lease_until', t.lease_until)
+            FROM lane_dispatch.tickets t WHERE t.id = p_id);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.claim_replay(p_req uuid) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_prev record;
+BEGIN
+  SELECT c.ticket, c.epoch, c.claim_token INTO v_prev FROM lane_dispatch.claim_requests c WHERE c.login_role = session_user AND c.req = p_req;
+  IF NOT FOUND THEN RETURN NULL; END IF;
+  RETURN lane_dispatch.claim_view(v_prev.ticket, v_prev.epoch, v_prev.claim_token);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_set_principal(p_login_role text, p_kind text, p_host text, p_tags text[], p_allowed_repos text[], p_max_claims int)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  INSERT INTO lane_dispatch.principals (login_role, kind, host, tags, allowed_repos, max_claims)
+    VALUES (p_login_role, p_kind, p_host, coalesce(p_tags, '{}'), coalesce(p_allowed_repos, '{}'), coalesce(p_max_claims, 1))
+    ON CONFLICT (login_role) DO UPDATE SET kind = EXCLUDED.kind, host = EXCLUDED.host, tags = EXCLUDED.tags,
+                                           allowed_repos = EXCLUDED.allowed_repos, max_claims = EXCLUDED.max_claims;
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_enqueue(p_id uuid, p_repo_key text, p_lane text, p_lane_key text, p_binding jsonb, p_header jsonb, p_snapshot jsonb,
+                                                    p_requires_tags text[], p_cpu_cores real, p_memory_bytes bigint, p_priority int DEFAULT 0)
+RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('submit');
+  INSERT INTO lane_dispatch.tickets (id, owner, repo_key, lane, lane_key, binding, header, snapshot, requires_tags, cpu_cores, memory_bytes, priority, incarnation)
+    VALUES (p_id, session_user, p_repo_key, p_lane, p_lane_key, p_binding, p_header, p_snapshot, coalesce(p_requires_tags, '{}'), p_cpu_cores, p_memory_bytes,
+            coalesce(p_priority, 0), (SELECT c.incarnation FROM lane_dispatch.cluster c))
+    ON CONFLICT (id) DO NOTHING;
+  IF NOT EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user) THEN
+    RAISE EXCEPTION 'ticket % already exists', p_id USING ERRCODE = '23505';
+  END IF;
+  RETURN lane_dispatch.ticket_view(p_id);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_get(p_id uuid) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('submit');
+  IF NOT EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user) THEN RETURN NULL; END IF;
+  RETURN lane_dispatch.ticket_view(p_id);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_list_mine(p_states text[] DEFAULT NULL, p_limit int DEFAULT 100) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('submit');
+  RETURN coalesce((SELECT jsonb_agg(lane_dispatch.ticket_view(m.id) ORDER BY m.created_at DESC, m.id)
+                     FROM (SELECT t.id, t.created_at FROM lane_dispatch.tickets t
+                            WHERE t.owner = session_user AND (p_states IS NULL OR t.state = ANY (p_states))
+                            ORDER BY t.created_at DESC, t.id LIMIT least(greatest(coalesce(p_limit, 100), 1), 500)) m), '[]'::jsonb);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_withdraw(p_id uuid) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record; v_state text;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('submit');
+  SELECT t.state INTO v_state FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user FOR UPDATE;
+  IF NOT FOUND THEN RETURN 'missing'; END IF;
+  IF v_state = 'queued' THEN
+    UPDATE lane_dispatch.tickets SET state = 'withdrawn', finished_at = clock_timestamp() WHERE id = p_id;
+    RETURN 'withdrawn';
+  END IF;
+  RETURN v_state;
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_cancel(p_id uuid) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record; v_t record;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('submit');
+  SELECT t.state, t.cancel_requested, t.claim_token INTO v_t FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user FOR UPDATE;
+  IF NOT FOUND THEN RETURN jsonb_build_object('state', 'missing', 'cancel_requested', false, 'confirmed', false); END IF;
+  IF v_t.state IN ('queued','quarantined') THEN
+    UPDATE lane_dispatch.tickets SET state = 'cancelled', cancel_requested = true, finished_at = clock_timestamp() WHERE id = p_id;
+    RETURN jsonb_build_object('state', 'cancelled', 'cancel_requested', true, 'confirmed', v_t.state = 'queued');
+  END IF;
+  IF v_t.state IN ('claimed','running') THEN
+    UPDATE lane_dispatch.tickets SET cancel_requested = true WHERE id = p_id;
+    RETURN jsonb_build_object('state', v_t.state, 'cancel_requested', true, 'confirmed', false);
+  END IF;
+  RETURN jsonb_build_object('state', v_t.state, 'cancel_requested', v_t.cancel_requested, 'confirmed', v_t.state = 'cancelled');
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_attach_urls(p_id uuid, p_epoch int, p_urls jsonb) RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('submit');
+  UPDATE lane_dispatch.tickets SET urls = p_urls WHERE id = p_id AND owner = session_user AND epoch = p_epoch AND state IN ('claimed','running');
+  RETURN FOUND;
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_register(p_version text, p_schedule jsonb) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('agent');
+  INSERT INTO lane_dispatch.runners (host, version, schedule, last_seen) VALUES (v_me.host, p_version, p_schedule, clock_timestamp())
+    ON CONFLICT (host) DO UPDATE SET version = EXCLUDED.version, schedule = EXCLUDED.schedule, last_seen = EXCLUDED.last_seen;
+  RETURN jsonb_build_object('host', v_me.host, 'max_claims', v_me.max_claims);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_claim(p_req uuid, p_free_cpu real, p_free_mem bigint, p_held_keys text[] DEFAULT '{}') RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record; v_out jsonb; v_now timestamptz; v_held int; v_id uuid; v_epoch int; v_token uuid;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('agent');
+  v_out := lane_dispatch.claim_replay(p_req);
+  IF v_out IS NOT NULL THEN RETURN v_out; END IF;
+  BEGIN
+    PERFORM 1 FROM lane_dispatch.claim_lock WHERE id = 1 FOR UPDATE NOWAIT;
+  EXCEPTION WHEN lock_not_available THEN
+    RETURN jsonb_build_object('status', 'busy');
+  END;
+  v_out := lane_dispatch.claim_replay(p_req);
+  IF v_out IS NOT NULL THEN RETURN v_out; END IF;
+  v_now := clock_timestamp();
+  SELECT count(*) INTO v_held FROM lane_dispatch.tickets t WHERE t.host = v_me.host AND t.state IN ('claimed','running');
+  IF v_held >= v_me.max_claims THEN
+    INSERT INTO lane_dispatch.claim_requests (login_role, req) VALUES (session_user, p_req);
+    RETURN jsonb_build_object('status', 'none');
+  END IF;
+  SELECT t.id INTO v_id FROM lane_dispatch.tickets t
+   WHERE t.state = 'queued' AND NOT t.cancel_requested
+     AND lane_dispatch.eligible(t.requires_tags, t.repo_key, v_me.tags, v_me.allowed_repos)
+     AND t.cpu_cores <= p_free_cpu AND t.memory_bytes <= p_free_mem AND NOT (t.lane_key = ANY (coalesce(p_held_keys, '{}')))
+   ORDER BY t.priority DESC, t.created_at, t.id LIMIT 1 FOR UPDATE SKIP LOCKED;
+  IF NOT FOUND THEN
+    INSERT INTO lane_dispatch.claim_requests (login_role, req) VALUES (session_user, p_req);
+    RETURN jsonb_build_object('status', 'none');
+  END IF;
+  v_token := gen_random_uuid();
+  UPDATE lane_dispatch.tickets SET state = 'claimed', epoch = epoch + 1, claim_token = v_token, host = v_me.host, lease_until = v_now + interval '120 seconds'
+   WHERE id = v_id RETURNING epoch INTO v_epoch;
+  INSERT INTO lane_dispatch.attempts (ticket, epoch, host, claim_token) VALUES (v_id, v_epoch, v_me.host, v_token);
+  INSERT INTO lane_dispatch.claim_requests (login_role, req, ticket, epoch, claim_token) VALUES (session_user, p_req, v_id, v_epoch, v_token);
+  RETURN lane_dispatch.claim_view(v_id, v_epoch, v_token);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_start(p_id uuid, p_epoch int, p_token uuid) RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record; v_t record;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('agent');
+  SELECT * INTO v_t FROM lane_dispatch.tickets t WHERE t.id = p_id FOR UPDATE;
+  IF NOT lane_dispatch.fence_ok(p_epoch, p_token, v_me.host, v_t.epoch, v_t.claim_token, v_t.host, v_t.state) THEN RETURN false; END IF;
+  IF v_t.state = 'running' THEN RETURN true; END IF;
+  IF v_t.state <> 'claimed' THEN RETURN false; END IF;
+  IF v_t.cancel_requested THEN RETURN false; END IF;
+  IF v_t.lease_until <= clock_timestamp() THEN RETURN false; END IF;
+  UPDATE lane_dispatch.tickets SET state = 'running', started_at = clock_timestamp(), lease_until = clock_timestamp() + interval '120 seconds' WHERE id = p_id;
+  RETURN true;
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_heartbeat(p_id uuid, p_epoch int, p_token uuid) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record; v_t record;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('agent');
+  SELECT * INTO v_t FROM lane_dispatch.tickets t WHERE t.id = p_id FOR UPDATE;
+  IF NOT lane_dispatch.fence_ok(p_epoch, p_token, v_me.host, v_t.epoch, v_t.claim_token, v_t.host, v_t.state) THEN
+    RETURN jsonb_build_object('fenced', true, 'cancel', false, 'urls', NULL);
+  END IF;
+  IF v_t.state = 'quarantined' THEN
+    RETURN jsonb_build_object('fenced', false, 'reassert', true, 'cancel', false, 'urls', NULL);
+  END IF;
+  IF v_t.state IN ('claimed','running') THEN
+    UPDATE lane_dispatch.tickets SET lease_until = clock_timestamp() + interval '120 seconds' WHERE id = p_id;
+  END IF;
+  RETURN jsonb_build_object('fenced', false, 'cancel', v_t.cancel_requested, 'urls', v_t.urls);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_finish(p_id uuid, p_epoch int, p_token uuid, p_result jsonb) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record; v_t record; v_state text;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('agent');
+  SELECT * INTO v_t FROM lane_dispatch.tickets t WHERE t.id = p_id FOR UPDATE;
+  IF lane_dispatch.fence_ok(p_epoch, p_token, v_me.host, v_t.epoch, v_t.claim_token, v_t.host, v_t.state) THEN
+    v_state := CASE WHEN p_result->>'kind' = 'cancelled' THEN 'cancelled' ELSE 'finished' END;
+    UPDATE lane_dispatch.tickets SET state = v_state, result = p_result || jsonb_build_object('epoch', p_epoch), finished_at = clock_timestamp() WHERE id = p_id;
+    RETURN jsonb_build_object('fenced', false, 'state', v_state);
+  END IF;
+  IF v_t.state IN ('finished','cancelled') AND v_t.result IS NOT NULL AND v_t.epoch = p_epoch AND v_t.claim_token = p_token AND v_t.host = v_me.host THEN
+    RETURN jsonb_build_object('fenced', false, 'state', v_t.state);
+  END IF;
+  RETURN jsonb_build_object('fenced', true, 'state', v_t.state);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_release(p_id uuid, p_epoch int, p_token uuid, p_proof text) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record; v_t record; v_state text;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('agent');
+  IF p_proof IS NULL OR p_proof NOT IN ('never-started','cancel-confirmed','runner-shutdown','boot-id-changed') THEN
+    RAISE EXCEPTION 'unknown release proof %', p_proof USING ERRCODE = '22023';
+  END IF;
+  SELECT * INTO v_t FROM lane_dispatch.tickets t WHERE t.id = p_id FOR UPDATE;
+  IF NOT lane_dispatch.fence_ok(p_epoch, p_token, v_me.host, v_t.epoch, v_t.claim_token, v_t.host, v_t.state) OR v_t.state = 'quarantined' THEN
+    RETURN jsonb_build_object('fenced', true, 'state', v_t.state);
+  END IF;
+  v_state := CASE WHEN v_t.cancel_requested THEN 'cancelled' ELSE 'queued' END;
+  UPDATE lane_dispatch.tickets SET state = v_state, claim_token = NULL, host = NULL, lease_until = NULL, started_at = NULL,
+         finished_at = CASE WHEN v_state = 'cancelled' THEN clock_timestamp() END
+   WHERE id = p_id;
+  RETURN jsonb_build_object('fenced', false, 'state', v_state);
+END $$;
+
+-- Adopts a reasserted execution: the caller's own (host, epoch, token) as a running phase (a quarantined claim that never started stays fenced),
+-- or a higher epoch on an ownerless rolled-back quarantined row, which only a running phase may adopt.
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_reassert(p_items jsonb) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record; v_item jsonb; v_t record; v_out jsonb := '[]'::jsonb; v_result text; v_now timestamptz;
+        v_id uuid; v_epoch int; v_token uuid; v_phase text; v_state text;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('agent');
+  IF jsonb_typeof(p_items) IS DISTINCT FROM 'array' THEN RAISE EXCEPTION 'items must be a json array' USING ERRCODE = '22023'; END IF;
+  PERFORM 1 FROM lane_dispatch.claim_lock WHERE id = 1 FOR UPDATE;
+  v_now := clock_timestamp();
+  FOR v_item IN SELECT e FROM jsonb_array_elements(p_items) e LOOP
+    v_id := (v_item->>'id')::uuid;
+    v_epoch := (v_item->>'epoch')::int;
+    v_token := (v_item->>'token')::uuid;
+    v_phase := coalesce(v_item->>'phase', 'running');
+    IF v_phase NOT IN ('pre-start','running') THEN RAISE EXCEPTION 'unknown reassert phase %', v_phase USING ERRCODE = '22023'; END IF;
+    v_state := CASE v_phase WHEN 'pre-start' THEN 'claimed' ELSE 'running' END;
+    SELECT * INTO v_t FROM lane_dispatch.tickets t WHERE t.id = v_id FOR UPDATE;
+    IF NOT FOUND THEN
+      v_result := 'unknown';
+    ELSIF (lane_dispatch.fence_ok(v_epoch, v_token, v_me.host, v_t.epoch, v_t.claim_token, v_t.host, v_t.state)
+           AND NOT (v_t.state = 'quarantined' AND v_phase = 'pre-start'))
+       OR (v_phase = 'running' AND v_t.state = 'quarantined' AND v_t.claim_token IS NULL AND v_epoch > v_t.epoch
+           AND lane_dispatch.eligible(v_t.requires_tags, v_t.repo_key, v_me.tags, v_me.allowed_repos)) THEN
+      UPDATE lane_dispatch.tickets SET state = v_state, host = v_me.host, epoch = v_epoch, claim_token = v_token,
+             lease_until = v_now + interval '120 seconds' WHERE id = v_id;
+      INSERT INTO lane_dispatch.attempts (ticket, epoch, host, claim_token) VALUES (v_id, v_epoch, v_me.host, v_token)
+        ON CONFLICT (ticket, epoch) DO UPDATE SET host = EXCLUDED.host, claim_token = EXCLUDED.claim_token;
+      v_result := 'ok';
+    ELSE
+      v_result := 'fenced';
+    END IF;
+    v_out := v_out || jsonb_build_object('id', v_id, 'result', v_result);
+  END LOOP;
+  RETURN v_out;
+END $$;
+
+-- The timer. Never requeues a running row on expiry alone (invariant 2); a quarantined row is never touched.
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_reap(p_interval interval DEFAULT interval '2 seconds', p_lease_ttl interval DEFAULT interval '120 seconds',
+                                                 p_lost_after interval DEFAULT interval '30 minutes') RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_now timestamptz; v_amnesty boolean; v_requeued int; v_cancelled int; v_lost int;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  PERFORM 1 FROM lane_dispatch.claim_lock WHERE id = 1 FOR UPDATE;
+  v_now := clock_timestamp();
+  v_amnesty := v_now - (SELECT c.last_tick FROM lane_dispatch.cluster c WHERE c.id = 1) > 2 * p_interval;
+  IF v_amnesty THEN
+    UPDATE lane_dispatch.tickets SET lease_until = greatest(lease_until, v_now + p_lease_ttl) WHERE lease_until IS NOT NULL AND state NOT IN ('finished','cancelled','withdrawn','lost');
+  END IF;
+  UPDATE lane_dispatch.cluster SET last_tick = v_now WHERE id = 1;
+  WITH r AS (
+    UPDATE lane_dispatch.tickets t SET state = CASE WHEN t.cancel_requested THEN 'cancelled' ELSE 'queued' END, claim_token = NULL, host = NULL, lease_until = NULL,
+           started_at = NULL, finished_at = CASE WHEN t.cancel_requested THEN v_now END
+     WHERE t.state = 'claimed' AND t.lease_until < v_now RETURNING t.state)
+  SELECT count(*) FILTER (WHERE r.state = 'queued'), count(*) FILTER (WHERE r.state = 'cancelled') INTO v_requeued, v_cancelled FROM r;
+  WITH r AS (
+    UPDATE lane_dispatch.tickets t SET state = 'lost', finished_at = v_now
+     WHERE t.state = 'running' AND t.lease_until + (p_lost_after - p_lease_ttl) < v_now RETURNING 1)
+  SELECT count(*) INTO v_lost FROM r;
+  RETURN jsonb_build_object('amnesty', v_amnesty, 'requeued', v_requeued, 'cancelled', v_cancelled, 'lost', v_lost);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_cancel_quarantined(p_id uuid) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_state text;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT t.state INTO v_state FROM lane_dispatch.tickets t WHERE t.id = p_id FOR UPDATE;
+  IF NOT FOUND THEN RETURN 'missing'; END IF;
+  IF v_state <> 'quarantined' THEN RETURN v_state; END IF;
+  UPDATE lane_dispatch.tickets SET state = 'cancelled', cancel_requested = true, finished_at = clock_timestamp() WHERE id = p_id;
+  RETURN 'cancelled';
+END $$;
+
+-- Live logs. Every call is idempotent on (ticket, epoch, seq): a call the guard killed is retried verbatim.
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_log(p_id uuid, p_epoch int, p_token uuid, p_seq int, p_bytes bytea) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record; v_t record; v_logged bigint; v_len int; v_inserted int;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('agent');
+  SELECT t.epoch, t.claim_token, t.host, t.state INTO v_t FROM lane_dispatch.tickets t WHERE t.id = p_id;
+  IF NOT lane_dispatch.fence_ok(p_epoch, p_token, v_me.host, v_t.epoch, v_t.claim_token, v_t.host, v_t.state) THEN RETURN 'fenced'; END IF;
+  v_len := octet_length(p_bytes);
+  IF v_len > 262144 THEN RETURN 'capped'; END IF;
+  SELECT a.log_bytes INTO v_logged FROM lane_dispatch.attempts a WHERE a.ticket = p_id AND a.epoch = p_epoch FOR UPDATE;
+  IF NOT FOUND THEN RETURN 'fenced'; END IF;
+  IF v_logged + v_len > 67108864 THEN RETURN 'capped'; END IF;
+  IF (SELECT coalesce(sum(octet_length(c.bytes)), 0) FROM lane_dispatch.log_chunks c) + v_len > 1073741824 THEN RETURN 'capped'; END IF;
+  INSERT INTO lane_dispatch.log_chunks (ticket, epoch, seq, bytes) VALUES (p_id, p_epoch, p_seq, p_bytes) ON CONFLICT (ticket, epoch, seq) DO NOTHING;
+  GET DIAGNOSTICS v_inserted = ROW_COUNT;
+  IF v_inserted = 1 THEN
+    UPDATE lane_dispatch.attempts SET log_bytes = log_bytes + v_len WHERE ticket = p_id AND epoch = p_epoch;
+  END IF;
+  RETURN 'ok';
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_log_read(p_id uuid, p_epoch int, p_after_seq int) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('submit');
+  IF NOT EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user) THEN RETURN NULL; END IF;
+  RETURN coalesce((SELECT jsonb_agg(jsonb_build_object('seq', m.seq, 'data', encode(m.bytes, 'base64')) ORDER BY m.seq)
+                     FROM (SELECT c.seq, c.bytes FROM lane_dispatch.log_chunks c
+                            WHERE c.ticket = p_id AND c.epoch = p_epoch AND c.seq > p_after_seq ORDER BY c.seq LIMIT 64) m), '[]'::jsonb);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_log_ack(p_id uuid, p_epoch int, p_upto_seq int) RETURNS int
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record; v_deleted int;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('submit');
+  DELETE FROM lane_dispatch.log_chunks c USING lane_dispatch.tickets t
+   WHERE t.id = p_id AND t.owner = session_user AND c.ticket = t.id AND c.epoch = p_epoch AND c.seq <= p_upto_seq;
+  GET DIAGNOSTICS v_deleted = ROW_COUNT;
+  RETURN v_deleted;
+END $$;
+
+-- The backend guard (design section 2 item 4). SECURITY INVOKER on purpose: it runs as the lane_admin login, whose cluster-level grants
+-- (docs/lane-dispatch-db-runbook.md) let it see and signal other roles' backends. Transaction age, not query age, whatever the state.
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_guard(p_max_age interval DEFAULT interval '5 seconds') RETURNS int
+LANGUAGE plpgsql SECURITY INVOKER SET search_path = pg_catalog, pg_temp AS $$
+DECLARE v_killed int;
+BEGIN
+  SELECT count(*) INTO v_killed FROM (
+    SELECT pg_terminate_backend(a.pid)
+      FROM pg_stat_activity a JOIN pg_roles r ON r.rolname = a.usename
+     WHERE (starts_with(a.usename, 'lane_agent_') OR starts_with(a.usename, 'lane_submit_'))
+       AND NOT r.rolsuper AND a.pid <> pg_backend_pid() AND a.datname = current_database()
+       AND clock_timestamp() - a.xact_start > p_max_age) k;
+  RETURN v_killed;
+END $$;
+
 -- Ownership and grants for everything in the schema. Re-applied on every run so drift is corrected.
 DO $$
-DECLARE r record;
+DECLARE r record; s text;
 BEGIN
-  ALTER SCHEMA lane OWNER TO lane_definer;
-  FOR r IN SELECT c.relname, c.relkind FROM pg_class c WHERE c.relnamespace = 'lane'::regnamespace AND c.relkind IN ('r','v','c') LOOP
-    EXECUTE format('ALTER %s lane.%I OWNER TO lane_definer',
-                   CASE r.relkind WHEN 'r' THEN 'TABLE' WHEN 'v' THEN 'VIEW' ELSE 'TYPE' END, r.relname);
-  END LOOP;
-  FOR r IN SELECT p.oid::regprocedure AS sig FROM pg_proc p WHERE p.pronamespace = 'lane'::regnamespace LOOP
-    EXECUTE format('ALTER FUNCTION %s OWNER TO lane_definer', r.sig);
-    EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', r.sig);
+  FOREACH s IN ARRAY ARRAY['lane', 'lane_dispatch'] LOOP
+    EXECUTE format('ALTER SCHEMA %I OWNER TO lane_definer', s);
+    FOR r IN SELECT c.relname, c.relkind FROM pg_class c WHERE c.relnamespace = s::regnamespace AND c.relkind IN ('r','v','c') LOOP
+      EXECUTE format('ALTER %s %I.%I OWNER TO lane_definer',
+                     CASE r.relkind WHEN 'r' THEN 'TABLE' WHEN 'v' THEN 'VIEW' ELSE 'TYPE' END, s, r.relname);
+    END LOOP;
+    FOR r IN SELECT p.oid::regprocedure AS sig FROM pg_proc p WHERE p.pronamespace = s::regnamespace LOOP
+      EXECUTE format('ALTER FUNCTION %s OWNER TO lane_definer', r.sig);
+      EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', r.sig);
+    END LOOP;
   END LOOP;
 END $$;
 
@@ -607,3 +1044,15 @@ GRANT EXECUTE ON FUNCTION lane.activate_group(uuid) TO lane_submit, lane_admin;
 GRANT EXECUTE ON FUNCTION lane.reclass(uuid, text) TO lane_submit, lane_admin;
 GRANT EXECUTE ON FUNCTION lane.refresh_rem_ref(timestamptz) TO lane_admin;
 GRANT EXECUTE ON FUNCTION lane.record_eta(uuid, real, boolean, timestamptz) TO lane_admin;
+
+REVOKE ALL ON SCHEMA lane_dispatch FROM PUBLIC;
+REVOKE ALL ON ALL TABLES IN SCHEMA lane_dispatch FROM PUBLIC, lane_agent, lane_submit, lane_admin, lane_reader;
+GRANT USAGE ON SCHEMA lane_dispatch TO lane_agent, lane_submit, lane_admin;
+GRANT EXECUTE ON FUNCTION lane_dispatch.ld_register(text, jsonb), lane_dispatch.ld_claim(uuid, real, bigint, text[]), lane_dispatch.ld_start(uuid, int, uuid),
+  lane_dispatch.ld_heartbeat(uuid, int, uuid), lane_dispatch.ld_finish(uuid, int, uuid, jsonb), lane_dispatch.ld_release(uuid, int, uuid, text),
+  lane_dispatch.ld_log(uuid, int, uuid, int, bytea), lane_dispatch.ld_reassert(jsonb) TO lane_agent;
+GRANT EXECUTE ON FUNCTION lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int), lane_dispatch.ld_get(uuid),
+  lane_dispatch.ld_list_mine(text[], int), lane_dispatch.ld_withdraw(uuid), lane_dispatch.ld_cancel(uuid), lane_dispatch.ld_attach_urls(uuid, int, jsonb),
+  lane_dispatch.ld_log_read(uuid, int, int), lane_dispatch.ld_log_ack(uuid, int, int) TO lane_submit;
+GRANT EXECUTE ON FUNCTION lane_dispatch.ld_set_principal(text, text, text, text[], text[], int), lane_dispatch.ld_reap(interval, interval, interval),
+  lane_dispatch.ld_cancel_quarantined(uuid), lane_dispatch.ld_guard(interval) TO lane_admin;
