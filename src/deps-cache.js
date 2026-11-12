@@ -125,8 +125,8 @@ export const ROOT_SCRIPT_NAMES = [
  */
 export const ALLOWED_ROOT_SCRIPTS = new Map([['git config core.hooksPath .githooks || true', /^hookspath = \.githooks$/i]]);
 
-/** A lock `resolved` pinned to content: an npmjs.org tarball with integrity, a git commit, or a local tarball with integrity. */
-const REGISTRY_RE = /^https:\/\/registry\.npmjs\.org\//;
+/** A lock `resolved` pinned to content: a tarball on an allowlisted registry with integrity, a git commit, or a local tarball with integrity. */
+export const DEFAULT_DEPS_CACHE_REGISTRIES = ['https://registry.npmjs.org/'];
 const GIT_PINNED_RE = /^git\+.+#[0-9a-f]{40}$/;
 const FILE_TARBALL_RE = /^file:.+\.tgz$/;
 
@@ -299,11 +299,39 @@ export function assertContained(baseDir, rel) {
  * it, or the entry is `inDepBundle`), and that parent itself passed these checks. A top-level entry has no
  * enclosing package (root-bundled deps are fetched like any other), so it gets the normal checks.
  */
-export function lockEligibility(lock) {
+/** The parsed `resolved` when it is a credential-free https URL, else null. Prefix-matched against parsed registry URLs, never a regex. */
+function registryTarball(resolved) {
+  try {
+    const url = new URL(resolved);
+    return url.protocol === 'https:' ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The depsCacheRegistries config shape: an array of credential-free https URLs, each ending in `/`; null when valid, else why not. */
+export function registriesProblem(registries) {
+  if (!Array.isArray(registries) || registries.length === 0) return 'must be a non-empty array of https registry URLs ending in "/"';
+  for (const entry of registries) {
+    let url;
+    try {
+      url = new URL(entry);
+    } catch {
+      return `entry ${JSON.stringify(entry)} is not a URL`;
+    }
+    if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash || !url.pathname.endsWith('/') || !entry.endsWith('/')) {
+      return `entry ${JSON.stringify(entry)} must be an https URL ending in "/" with no credentials, query or fragment`;
+    }
+  }
+  return null;
+}
+
+export function lockEligibility(lock, { registries = DEFAULT_DEPS_CACHE_REGISTRIES } = {}) {
   if (!lock || ![2, 3].includes(lock.lockfileVersion) || !lock.packages || typeof lock.packages !== 'object') {
     return { ok: false, reason: 'lockfile is not v2 or v3 with a packages map' };
   }
   const packages = lock.packages;
+  const registryPrefixes = registries.map((registry) => new URL(registry).href);
   const tarballs = [];
   const verdicts = new Map();
   const linkTargets = Object.values(packages).filter((e) => e?.link === true && typeof e.resolved === 'string').map((e) => e.resolved);
@@ -346,7 +374,11 @@ export function lockEligibility(lock) {
     }
     const { resolved, integrity } = entry;
     if (typeof resolved === 'string') {
-      if (REGISTRY_RE.test(resolved) && typeof integrity === 'string') return null;
+      const registry = registryTarball(resolved);
+      if (registry && typeof integrity === 'string') {
+        if (registryPrefixes.some((prefix) => registry.href.startsWith(prefix))) return null;
+        return `lock entry ${name} resolves to a registry not in depsCacheRegistries: ${registry.origin}`;
+      }
       if (GIT_PINNED_RE.test(resolved)) return null;
       if (FILE_TARBALL_RE.test(resolved) && typeof integrity === 'string') {
         tarballs.push(resolved.slice('file:'.length));
@@ -632,6 +664,7 @@ export function computeDepsKey({
   rootScriptsSafe = false,
   keyFiles = [],
   keyFilesCoverInstallScripts = false,
+  registries = DEFAULT_DEPS_CACHE_REGISTRIES,
   runtime = { version: process.version, platform: process.platform, arch: process.arch },
   system = currentSystem(),
   toolVersion = (cmd) => firstLineOfCommand(cmd, env),
@@ -660,7 +693,7 @@ export function computeDepsKey({
   } catch {
     return { key: null, reason: 'lockfile or package.json is not valid JSON' };
   }
-  const eligibility = lockEligibility(lock);
+  const eligibility = lockEligibility(lock, { registries });
   if (!eligibility.ok) return { key: null, reason: eligibility.reason };
   const script = unsafeRootScript(pkg, rootScriptsSafe);
   if (script) return { key: null, reason: `root lifecycle script not known to leave node_modules alone (${script})` };

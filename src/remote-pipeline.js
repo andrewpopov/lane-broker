@@ -321,6 +321,7 @@ async function installDepsDir({ dir, workDir, depsEnv, depsCache, releaseLeases,
         rootScriptsSafe: depsCache.rootScriptsSafe === true,
         keyFiles: depsCache.keyFiles ?? [],
         keyFilesCoverInstallScripts: depsCache.keyFilesCoverInstallScripts === true,
+        registries: depsCache.registries,
         keyPartsSecret: readKeyPartsSecret(depsCache.root),
       });
     } catch (err) {

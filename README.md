@@ -1016,9 +1016,13 @@ reason.
 
 - **Eligibility**, per `remoteDeps` dir. The lockfile (`package-lock.json`,
   or `npm-shrinkwrap.json` when present) must be v2 or v3 with a `packages`
-  map, and every non-root entry must be an `https://registry.npmjs.org/`
-  tarball with `integrity`, a `git+...#<40-hex sha>`, or a `file:*.tgz` with
-  `integrity`. `file:` dirs, unresolved entries and anything else are
+  map, and every non-root entry must be a tarball with `integrity` on a
+  registry in `depsCacheRegistries` (default `https://registry.npmjs.org/`),
+  a `git+...#<40-hex sha>`, or a `file:*.tgz` with `integrity`. A tarball on
+  any other registry is refused naming its origin (`resolves to a registry
+  not in depsCacheRegistries`). Matching parses the `resolved` URL and
+  compares it to each configured URL by prefix (scheme, host, port, path), so
+  `registry.npmjs.org.evil` or `host@evil` never match. `file:` dirs, unresolved entries and anything else are
   refused. An npm-workspace repo (BRAIN-466) is eligible: a `link: true` entry
   whose `resolved` is a plain relative path inside the repo, with a lock entry
   of its own, is accepted; one that is absolute or escapes the repo with `..`
@@ -1174,7 +1178,16 @@ reason.
   protects its key or finds it already gone (a miss). An unreadable lease
   counts as live; one left by a dead process is ignored.
 - **Config** (runner machine's global config): `remoteDepsCache` (default
-  `true`) and `remoteDepsCacheMaxBytes`. A lane's `remoteDepsCache: false`
+  `true`), `remoteDepsCacheMaxBytes`, and `depsCacheRegistries` (BRAIN-1010:
+  a non-empty array of `https://` registry URLs ending in `/`, no credentials,
+  query or fragment; default `["https://registry.npmjs.org/"]`; a bad entry is
+  a config error). To cache a private registry add it beside npmjs, e.g.
+  `"depsCacheRegistries": ["https://registry.npmjs.org/", "https://npm.tail615381.ts.net/"]`.
+  The package ships only the npmjs default; a fleet's private registry is
+  runner config, so the package stays generic. The list is an eligibility gate,
+  not key material: the lock's `integrity` pins the tarball bytes, so the same
+  lock yields the same tree whichever allowlisted host served it, and changing
+  the list never invalidates existing entries. A lane's `remoteDepsCache: false`
   opts that lane out.
 - **Install locale** (BRAIN-429): the dependency install (`npm ci` and the
   install-time checks) runs with every `LC_*` and `LANG` removed and `LC_ALL`
