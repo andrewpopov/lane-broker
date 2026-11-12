@@ -664,7 +664,7 @@ CREATE OR REPLACE FUNCTION lane_dispatch.ld_set_principal(p_login_role text, p_k
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 BEGIN
   PERFORM lane_dispatch.ld_entry();
-  IF p_host IS NOT NULL AND p_host !~ '^[a-z0-9_]{1,40}$' THEN
+  IF p_host IS NOT NULL AND p_host !~ '^[a-z0-9][a-z0-9-]{0,54}$' THEN
     RAISE EXCEPTION 'host % is not a valid channel name', p_host USING ERRCODE = '22023';
   END IF;
   INSERT INTO lane_dispatch.principals (login_role, kind, host, tags, allowed_repos, max_claims)
@@ -960,7 +960,7 @@ BEGIN
   GET DIAGNOSTICS v_pruned = ROW_COUNT;
   DELETE FROM lane_dispatch.claim_requests WHERE ctid IN (
     SELECT c.ctid FROM lane_dispatch.claim_requests c JOIN lane_dispatch.tickets t ON t.id = c.ticket
-     WHERE t.state IN ('finished','cancelled','withdrawn','lost') AND t.finished_at < v_now - interval '24 hours' LIMIT 1000 - v_pruned);
+     WHERE c.created_at < v_now - interval '24 hours' AND t.state IN ('finished','cancelled','withdrawn','lost') AND t.finished_at < v_now - interval '24 hours' LIMIT 1000 - v_pruned);
   RETURN jsonb_build_object('amnesty', v_amnesty, 'requeued', v_requeued, 'cancelled', v_cancelled, 'lost', v_lost);
 END $$;
 

@@ -85,6 +85,29 @@ const GUARDS = {
     assert.equal(await countRequests(w, `req = '${req[0]}'`), 0, 'finished 25 hours ago');
   },
 
+  'a terminal ticket mapping younger than 24 hours is never touched, so the prune stays off the tickets table scan': async (w) => {
+    const [admin, req] = [await w.as(logins.admin), [randomUUID(), randomUUID(), randomUUID()]];
+    await mappingsOfEachState(w, req);
+    await finishedAgo(w, '25 hours');
+    await ageClaimRequests(w, '23 hours');
+    await call(admin, 'ld_reap');
+    assert.equal(await countRequests(w, `req = '${req[0]}'`), 1);
+  },
+
+  'a running reassert of a claimed row with cancel_requested leaves it claimed, and ld_start still refuses': async (w) => {
+    const [s1, a1] = [await w.as(logins.s1), await w.as(logins.a1)];
+    await enqueue(s1, tid(1));
+    const got = await claim(a1);
+    await call(s1, 'ld_cancel', tid(1));
+    const before = await w.ticket(tid(1));
+    assert.deepEqual(await reassert(a1, [asItem(got)]), [{ id: tid(1), result: 'ok', state: 'claimed' }]);
+    const after = await w.ticket(tid(1));
+    assert.equal(after.state, 'claimed');
+    assert.equal(after.cancel_requested, true);
+    assert.equal(after.started_at, before.started_at);
+    assert.equal(await start(a1, got), false);
+  },
+
   'ld_reap prunes none rows older than 10 minutes and keeps fresher ones': async (w) => {
     const admin = await w.as(logins.admin);
     await insertNoneRows(w, 3, '11 minutes');
@@ -110,12 +133,15 @@ const GUARDS = {
 
 const TERMINAL_PREDICATE = "t.state IN ('finished','cancelled','withdrawn','lost') AND t.finished_at < v_now - interval '24 hours'";
 const CANARIES = [
+  ['a running reassert of a claimed row with cancel_requested leaves it claimed, and ld_start still refuses',
+    "UPDATE lane_dispatch.tickets SET lease_until = v_now + interval '120 seconds' WHERE id = v_id;\n        v_extra", "UPDATE lane_dispatch.tickets SET state = v_state, lease_until = v_now + interval '120 seconds' WHERE id = v_id;\n        v_extra"],
+  ['a terminal ticket mapping younger than 24 hours is never touched, so the prune stays off the tickets table scan', "c.created_at < v_now - interval '24 hours' AND t.state", 't.state'],
   ['ld_finish on a quarantined row answers reassert and changes nothing',
     "    IF v_t.state = 'quarantined' THEN\n      RETURN jsonb_build_object('fenced', false, 'reassert', true, 'state', 'quarantined');\n    END IF;\n", ''],
   ['a pre-start reassert of a matching running row leaves it running',
     "      IF v_t.state = 'quarantined' THEN\n        UPDATE lane_dispatch.tickets SET state = v_state", "      IF true THEN\n        UPDATE lane_dispatch.tickets SET state = v_state"],
   ['a claimed mapping of a non-terminal ticket survives pruning at any age', TERMINAL_PREDICATE, 'true'],
-  ['a terminal ticket mapping is pruned only after 24 hours', "interval '24 hours'", "interval '0 hours'"],
+  ['a terminal ticket mapping is pruned only after 24 hours', "t.finished_at < v_now - interval '24 hours'", "t.finished_at < v_now - interval '0 hours'"],
   ['a terminal ticket mapping is pruned only after 24 hours', "t.state IN ('finished','cancelled','withdrawn','lost') AND", "false AND"],
   ['ld_reap prunes none rows older than 10 minutes and keeps fresher ones', "c.ticket IS NULL AND c.created_at", 'false AND c.created_at'],
   ['ld_reap prunes none rows older than 10 minutes and keeps fresher ones', "interval '10 minutes'", "interval '0 minutes'"],

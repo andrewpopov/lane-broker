@@ -81,11 +81,10 @@ const GUARDS = {
 
   'ld_set_principal refuses a host that is not a safe channel name': async (w) => {
     const admin = await w.as(logins.admin);
-    for (const host of ['A1', 'a-1', 'a1; DROP', '', 'a'.repeat(41), 'a.b']) {
+    for (const host of ['Bad_Host', '-x', 'a1; DROP', '', 'a'.repeat(56), 'a.b', 'a_1']) {
       await assert.rejects(call(admin, 'ld_set_principal', logins.a1, 'agent', host, [], ['*'], 1), /not a valid channel name/, `host ${JSON.stringify(host)}`);
     }
-    await call(admin, 'ld_set_principal', logins.a1, 'agent', 'a'.repeat(40), [], ['*'], 1);
-    await call(admin, 'ld_set_principal', logins.a1, 'agent', 'a_1', [], ['*'], 1);
+    for (const host of ['workbook-pro', 'mac-mbp2', 'a'.repeat(55), '1']) await call(admin, 'ld_set_principal', logins.a1, 'agent', host, [], ['*'], 1);
   },
 };
 
@@ -96,7 +95,7 @@ const CANARIES = [
   ['ld_cancel of a claimed row sends an empty ld_host_<host> hint to its host', "PERFORM pg_notify('ld_host_' || v_t.host, '');", ''],
   ['ld_cancel of a running row sends an empty ld_host_<host> hint to its host', "PERFORM pg_notify('ld_host_' || v_t.host, '');", ''],
   ['ld_attach_urls sends an empty ld_host_<host> hint to the claiming host', "IF FOUND THEN PERFORM pg_notify('ld_host_' || v_host, ''); END IF;", ''],
-  ['ld_set_principal refuses a host that is not a safe channel name', "IF p_host IS NOT NULL AND p_host !~ '^[a-z0-9_]{1,40}$' THEN", 'IF false THEN'],
+  ['ld_set_principal refuses a host that is not a safe channel name', "IF p_host IS NOT NULL AND p_host !~ '^[a-z0-9][a-z0-9-]{0,54}$' THEN", 'IF false THEN'],
 ];
 
 describe('lane_dispatch NOTIFY hints on a disposable Postgres', { skip: pgSkipOption, timeout: 300000 }, () => {
