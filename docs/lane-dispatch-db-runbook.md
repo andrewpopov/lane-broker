@@ -43,6 +43,18 @@ If the reap interval changes, pass the new value as the first argument of `ld_re
 
 `ld_guard` is the only `SECURITY INVOKER` function in the schema, because it must run with the admin login's own cluster privileges. `ld_log` accepts at most 256 KiB per call, 64 MiB per attempt and 1 GiB across the table; past a cap it answers `capped`.
 
-After a restore from backup the first `ld_*` call quarantines every non-terminal ticket (`state = 'quarantined'`). A quarantined ticket leaves that state only when its runner reasserts it as `running` with the same host, epoch and token, through `ld_finish` by that runner, through `ld_cancel` by its owner, or through `SELECT lane_dispatch.ld_cancel_quarantined('<ticket id>');` by an operator. A heartbeat never lifts quarantine: it answers `reassert: true` and changes nothing, so the runner reasserts. A reassert of a quarantined claim as `pre-start`, `ld_start` and `ld_release` are fenced or refused, and a reassert from another host, epoch or token is always fenced (the one exception is an ownerless rolled-back row, which an eligible runner may adopt as `running` at a higher epoch).
+After a restore from backup the first `ld_*` call quarantines every non-terminal ticket (`state = 'quarantined'`). A quarantined ticket leaves that state only when its runner reasserts it as `running` with the same host, epoch and token, through `ld_cancel` by its owner, or through `SELECT lane_dispatch.ld_cancel_quarantined('<ticket id>');` by an operator. A heartbeat and `ld_finish` never lift quarantine: each answers `reassert: true` (finish adds `state: 'quarantined'`) and changes nothing, so the runner reasserts, and only a `running` reassert lifts it. A reassert of a quarantined claim as `pre-start`, `ld_start` and `ld_release` are fenced or refused, and a reassert from another host, epoch or token is always fenced (the one exception is an ownerless rolled-back row, which an eligible runner may adopt as `running` at a higher epoch).
 
 Every `ld_*` call must run at READ COMMITTED; any other isolation level is refused (SQLSTATE 25000).
+
+A reassert of a row that is not quarantined never changes its state: it extends the lease and answers `{result: 'ok', state}` with the row's current state, so a `pre-start` reassert of a `running` row leaves it `running`.
+
+## Notification channels
+
+Each hint carries an empty payload, so no ticket id reaches every listener, and a listener treats it as "look now", never as data. `ld_work` means a ticket may have become claimable: `ld_enqueue` on insert, `ld_release` when the row returns to `queued`, and `ld_reap` when it requeued at least one row. `ld_host_<host>` goes to one agent: `ld_cancel` of a claimed or running row, and `ld_attach_urls` when it found its row. `ld_set_principal` refuses a host that does not match `^[a-z0-9_]{1,40}$`, so the channel name is always safe.
+
+An agent login holds at most two connections (`CONNECTION LIMIT 3` leaves one spare): one for calls and one that only LISTENs. A lost NOTIFY costs latency, not correctness, because the agent still polls.
+
+## Pruning
+
+Each `ld_reap` tick deletes at most 1000 `claim_requests` rows in total. Rows with no ticket (`ticket IS NULL`) older than 10 minutes go first; the remaining budget removes claimed mappings whose ticket is `finished`, `cancelled`, `withdrawn` or `lost` and whose `finished_at` is more than 24 hours old. A mapping whose ticket is not terminal is never pruned, whatever its age. `tickets`, `attempts` and `log_chunks` are not pruned here.

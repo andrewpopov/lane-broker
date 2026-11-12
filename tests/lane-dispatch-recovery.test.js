@@ -121,7 +121,7 @@ const GUARDS = {
     assert.equal((await w.ticket(tid(2))).state, 'finished');
   },
 
-  'a heartbeat never lifts quarantine: the matching runner is told to reassert, the row is unchanged, and a running reassert or ld_finish leaves quarantine': async (w) => {
+  'a heartbeat never lifts quarantine: the matching runner is told to reassert, the row is unchanged, and only a running reassert leaves quarantine; ld_finish answers reassert': async (w) => {
     const [a1, a2] = [await w.as(logins.a1), await w.as(logins.a2)];
     const t1 = await heldAndQueued(w, { started: true });
     const t2 = await claim(a1);
@@ -135,7 +135,7 @@ const GUARDS = {
     assert.equal((await w.ticket(t1.id)).state, 'running');
     assert.ok(await leaseSecondsAhead(w, t1.id) > 100);
     assert.deepEqual(await heartbeat(a1, t1), { fenced: false, cancel: false, urls: null });
-    assert.deepEqual(await finish(a1, t2), { fenced: false, state: 'finished' });
+    assert.deepEqual(await finish(a1, t2), { fenced: false, reassert: true, state: 'quarantined' });
   },
 
   'a quarantined claim that never started is fenced: ld_release, a pre-start reassert and ld_start leave it untouched and unclaimable': async (w) => {
@@ -163,7 +163,7 @@ const GUARDS = {
   'a higher-epoch reassert from another principal, with no restore, is fenced and the owner keeps the row': async (w) => {
     const [a1, x] = [await w.as(logins.a1), await w.as(logins.x)];
     const t1 = await heldAndQueued(w, { started: true });
-    assert.deepEqual(await reassert(a1, [asItem(t1)]), [{ id: t1.id, result: 'ok' }]);
+    assert.deepEqual(await reassert(a1, [asItem(t1)]), [{ id: t1.id, result: 'ok', state: 'running' }]);
     const stolenToken = randomUUID();
     assert.deepEqual(await reassert(x, [{ id: t1.id, epoch: t1.epoch + 1, token: stolenToken, phase: 'running' }]), [{ id: t1.id, result: 'fenced' }]);
     assert.deepEqual(await call(x, 'ld_finish', t1.id, t1.epoch + 1, stolenToken, { kind: 'ok', exitCode: 0 }), { fenced: true, state: 'running' });
@@ -350,7 +350,7 @@ const SEMANTICS = {
     assert.deepEqual([(await w.ticket(t1.id)).state, (await w.ticket(t2.id)).state], ['running', 'quarantined']);
     assert.ok(await leaseSecondsAhead(w, t1.id) > 100);
     await (await w.su()).query("UPDATE lane_dispatch.tickets SET state = 'claimed' WHERE id = $1", [t2.id]);
-    assert.deepEqual(await reassert(a1, [asItem(t2, 'pre-start')]), [{ id: t2.id, result: 'ok' }], 'a live claim before ld_start is adopted');
+    assert.deepEqual(await reassert(a1, [asItem(t2, 'pre-start')]), [{ id: t2.id, result: 'ok', state: 'claimed' }], 'a live claim before ld_start is adopted');
     assert.equal((await w.ticket(t2.id)).state, 'claimed');
     assert.ok(await leaseSecondsAhead(w, t2.id) > 100);
     await assert.rejects(reassert(a1, [{ ...asItem(t1), phase: 'sleeping' }]), /unknown reassert phase/);
@@ -403,7 +403,7 @@ const SEMANTICS = {
     const quarantiner = call(s1, 'ld_get', tid(99));
     await waitBlocked(w, s1.processID);
     await lock.release();
-    assert.deepEqual(await reasserted, [{ id: t1.id, result: 'ok' }]);
+    assert.deepEqual(await reasserted, [{ id: t1.id, result: 'ok', state: 'running' }]);
     await quarantiner;
     let row = await w.ticket(t1.id);
     assert.equal(row.state, 'quarantined', 'the quarantine ran after the reassert, so it wins');
@@ -464,7 +464,7 @@ const CANARIES = [
   ['the amnesty gap: after an outage longer than twice the interval ld_reap extends every lease and settles nothing', 'IF v_amnesty THEN', 'IF false THEN'],
   ['ld_reap requeues a claimed row past its lease, never a running one on expiry alone, and settles lost only after lost_after',
     "WHERE t.state = 'claimed' AND t.lease_until < v_now RETURNING t.state)", "WHERE t.state IN ('claimed','running') AND t.lease_until < v_now RETURNING t.state)"],
-  ["a heartbeat never lifts quarantine: the matching runner is told to reassert, the row is unchanged, and a running reassert or ld_finish leaves quarantine",
+  ["a heartbeat never lifts quarantine: the matching runner is told to reassert, the row is unchanged, and only a running reassert leaves quarantine; ld_finish answers reassert",
     "  IF v_t.state = 'quarantined' THEN\n    RETURN jsonb_build_object('fenced', false, 'reassert', true, 'cancel', false, 'urls', NULL);\n  END IF;", "  IF v_t.state = 'quarantined' THEN\n    UPDATE lane_dispatch.tickets SET state = 'running' WHERE id = p_id;\n  END IF;"],
   ["a quarantined claim that never started is fenced: ld_release, a pre-start reassert and ld_start leave it untouched and unclaimable",
     "OR v_t.state = 'quarantined' THEN\n    RETURN jsonb_build_object('fenced', true, 'state', v_t.state);", "THEN\n    RETURN jsonb_build_object('fenced', true, 'state', v_t.state);"],
