@@ -142,13 +142,18 @@ describe('lane_dispatch schema and ACLs', { skip: pgSkipOption, timeout: 180000 
     await assert.rejects(cluster.client(world.db, logins.stranger), /permission denied for database|not currently accepting connections/);
   });
 
-  test('applyDatabaseAcls is opt-in for applyMigrations, and refuses a database that holds a schema besides lane, lane_dispatch and public', async () => {
+  test('applyDatabaseAcls is opt-in for applyMigrations, and refuses a database that holds a schema besides lane, lane_dispatch and public, or any object in public', async () => {
     const publicConnect = (c) => c.query("SELECT has_database_privilege('public', current_database(), 'CONNECT') AS v").then((r) => r.rows[0].v);
     const shared = await cluster.client(await cluster.freshDb());
     await shared.query('CREATE SCHEMA app');
     await assert.rejects(applyDatabaseAcls(shared), /refusing to revoke database ACLs.*\bapp\b/);
     await assert.rejects(applyMigrations(shared, { databaseAcls: true }), /refusing to revoke database ACLs/);
     assert.equal(await publicConnect(shared), true, 'nothing was revoked');
+
+    const publicApp = await cluster.client(await cluster.freshDb());
+    await publicApp.query('CREATE TABLE public.orders (id int)');
+    await assert.rejects(applyDatabaseAcls(publicApp), /schema public holds objects/);
+    assert.equal(await publicConnect(publicApp), true, 'an app keeping its tables in public is refused too');
 
     const own = await cluster.client(await cluster.freshDb());
     await applyMigrations(own);

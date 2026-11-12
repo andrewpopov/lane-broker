@@ -78,12 +78,16 @@ const CONNECT_GROUPS = ['lane_admin', 'lane_agent', 'lane_submit', 'lane_reader'
 /**
  * The database-level ACLs: nothing is open to PUBLIC, and only the lane group roles may connect. A database cloned from a template
  * loses these, so a harness clone calls this itself. The target is `current_database()`, never a hard-coded name. It refuses a database
- * that holds any schema besides lane, lane_dispatch and public, because the revokes would lock out whatever else lives there.
+ * that holds any schema besides lane, lane_dispatch and public, or any object in public, because the revokes would lock out whatever else lives there.
  */
 export async function applyDatabaseAcls(client) {
   const { rows: foreign } = await client.query(
     `SELECT nspname FROM pg_namespace WHERE nspname NOT IN ('lane', 'lane_dispatch', 'public', 'information_schema') AND nspname NOT LIKE 'pg\\_%' ORDER BY nspname`);
   if (foreign.length) throw new Error(`refusing to revoke database ACLs: the database also holds schema(s) ${foreign.map((r) => r.nspname).join(', ')}`);
+  const { rows: inPublic } = await client.query(
+    `SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public'
+     UNION ALL SELECT 1 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE n.nspname = 'public' LIMIT 1`);
+  if (inPublic.length) throw new Error('refusing to revoke database ACLs: schema public holds objects, so this is not a dedicated lane database');
   const { rows: [{ db }] } = await client.query('SELECT quote_ident(current_database()) AS db');
   await client.query(`REVOKE CONNECT, CREATE, TEMPORARY ON DATABASE ${db} FROM PUBLIC`);
   await client.query('REVOKE ALL ON SCHEMA public FROM PUBLIC');

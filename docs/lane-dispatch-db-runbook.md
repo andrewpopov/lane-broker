@@ -4,7 +4,7 @@
 grant that lives inside the database. `applyDatabaseAcls` (`src/lane-db.js`) revokes CONNECT, CREATE and TEMP on the current
 database from PUBLIC and grants CONNECT to the four lane group roles. It is opt-in (`applyMigrations(client, { databaseAcls: true })`
 or a direct call), and it throws before revoking anything when the database holds a schema other than `lane`, `lane_dispatch`
-and `public`, so it can never run on a shared application database. Design:
+and `public`, or any object in `public`, so it refuses a shared application database. Design:
 `agent_brain/knowledge/lane-pull-dispatch.md` section 2.
 
 Cluster-level privileges need a superuser and stay out of those files, because the applier is a CREATEROLE non-superuser
