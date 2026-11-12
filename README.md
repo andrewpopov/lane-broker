@@ -1141,7 +1141,14 @@ reason.
   `*.target.mk`, `config.gypi`, `gyp-mac-tool`, `Release|Debug/.deps` and
   `Release|Debug/obj.target` (`build/deps/`, `build/Release/*.node` and the
   rest stay); and node-gyp's own `__pycache__` under `pylib/` where each
-  `.pyc` has its `.py` beside it. A symlink pointing into a pruned path
+  `.pyc` has its `.py` beside it; and `node_modules/.cache/jiti`
+  (the root one or a workspace's own: jiti's transpile cache, written when a
+  postinstall such as `prisma generate` loads a `.ts` config), which embeds the
+  work dir in forms the scan cannot bound. It is not scanned, stored or counted in
+  the entry's size, so a hit has no `node_modules/.cache/jiti` and jiti rebuilds it.
+  The list is an allowlist of caches that are pure and self-regenerating; any other
+  `.cache` entry may hold data a package's runtime reads, so it is scanned and
+  stored like any file. A symlink pointing into a pruned path of any published tree (the root or a workspace)
   skips the cache (`reason=symlink-into-pruned-or-unresolvable`); every symlink is resolved with `realpath`, and one that leaves the tree or does not resolve is refused too (unless its text names an install path, which relocation handles). `npm rebuild`
   still works, as it runs `node-gyp rebuild`, which configures again.
 

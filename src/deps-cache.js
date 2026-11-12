@@ -1403,11 +1403,16 @@ const PATH_LEADERS = new Set(Buffer.from('"\'`([{ \t\n\r\v\f', 'latin1'));
  *   - under `<pkg>/build/` when `<pkg>/binding.gyp` exists: `Makefile`, `binding.Makefile`, `*.target.mk`,
  *     `config.gypi`, `gyp-mac-tool`, and `Release|Debug/.deps`, `Release|Debug/obj.target`. Nothing else under
  *     `build/` (`build/deps/`, `build/Release/*.node`, anything a package reads at run time) is touched;
- *   - `__pycache__` under `node-gyp/.../pylib/` where every `.pyc` has its `.py` source beside the cache.
+ *   - `__pycache__` under `node-gyp/.../pylib/` where every `.pyc` has its `.py` source beside the cache;
+ *   - `node_modules/.cache/jiti` (the root `node_modules` or a workspace's own): jiti's transpile cache, keyed on source
+ *     content, rebuilt on a miss, and embedding the absolute work dir in a form the scan cannot bound. Any other
+ *     `.cache` entry is a package's own business (a postinstall may write data its runtime reads), so it is scanned and
+ *     stored like any file.
  * `npm rebuild` still works: it runs `node-gyp rebuild`, which configures from `binding.gyp` again. A symlink that
  * points into or through a pruned path, or is itself pruned, makes the tree uncacheable (`refusesLink`).
  */
 const NODE_GYP_INTERMEDIATE_RE = /^(.*\/)?build\/(?:Makefile|binding\.Makefile|[^/]+\.target\.mk|config\.gypi|gyp-mac-tool|(?:Release|Debug)\/(?:\.deps|obj\.target))$/;
+const SELF_REGENERATING_TOOL_CACHES = new Set(['.cache/jiti']);
 const GYP_PYCACHE_RE = /(?:^|\/)node-gyp\/(?:.*\/)?pylib\/(?:.*\/)?__pycache__$/;
 
 function isGypPycache(tree, rel) {
@@ -1422,6 +1427,7 @@ function isGypPycache(tree, rel) {
 }
 
 function isRegenerableBuildArtifact(tree, rel) {
+  if (SELF_REGENERATING_TOOL_CACHES.has(rel)) return true;
   if (isGypPycache(tree, rel)) return true;
   const match = NODE_GYP_INTERMEDIATE_RE.exec(rel);
   return match !== null && fs.existsSync(path.join(tree, match[1] ?? '', 'binding.gyp'));
@@ -1459,16 +1465,19 @@ function symlinkChain(linkAbs) {
  * whole chain (`symlinkChain`) and its final `realpath` are tested against the pruned set. A link that escapes the
  * tree or cannot be resolved answers true (the tree is refused, not guessed at), except a link `relocatable` says
  * relocation will point back into the work dir's own `node_modules`: that may not resolve here, so it is tested
- * lexically only.
+ * lexically only. `otherTrees` are the other trees published together (workspace `node_modules`): a pruned path in
+ * any of them is as bad as one in `tree`, since the stored copy of that path is gone too.
  */
-function refusesLink(tree, linkAbs, relocatable) {
+function refusesLink(tree, linkAbs, relocatable, otherTrees = []) {
   const root = fs.realpathSync(tree);
   const prunedUnder = (abs) => {
-    for (const base of new Set([tree, root])) {
-      const rel = path.relative(base, abs);
-      if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) continue;
-      const parts = rel.split(path.sep);
-      if (parts.some((_, i) => isRegenerableBuildArtifact(tree, parts.slice(0, i + 1).join('/')))) return true;
+    for (const t of [tree, ...otherTrees]) {
+      for (const base of new Set([t, fs.realpathSync(t)])) {
+        const rel = path.relative(base, abs);
+        if (rel === '' || rel.startsWith('..') || path.isAbsolute(rel)) continue;
+        const parts = rel.split(path.sep);
+        if (parts.some((_, i) => isRegenerableBuildArtifact(t, parts.slice(0, i + 1).join('/')))) return true;
+      }
     }
     return false;
   };
@@ -1485,9 +1494,9 @@ function refusesLink(tree, linkAbs, relocatable) {
   } catch {
     return !relocatable;
   }
+  if (prunedUnder(real)) return true;
   const rel = path.relative(root, real);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) return !relocatable;
-  return prunedUnder(real);
+  return (rel.startsWith('..') || path.isAbsolute(rel)) && !relocatable;
 }
 
 const strictOccurrence = (buf, start, end) => (start === 0 || PATH_LEADERS.has(buf[start - 1])) && (end === buf.length || PATH_FOLLOWERS.has(buf[end]));
@@ -1594,6 +1603,8 @@ function scanTree(tree, groups, pairs, marker, workspaces) {
   const found = new Set();
   const entries = [];
   const linkNames = new Set(workspaces.flatMap((w) => w.links));
+  const workspaceTrees = workspaces.map(({ resolved }) => path.join(path.dirname(tree), resolved, 'node_modules')).filter((t) => fs.existsSync(t));
+  const siblingTrees = (base) => [tree, ...workspaceTrees].filter((t) => t !== base);
   // `base` is the tree `rel` is relative to; `prefix` is where it sits in the stored tree, so entries and outcomes use `prefix + rel`.
   const walk = (base, abs, rel, prefix) => {
     for (const ent of fs.readdirSync(abs, { withFileTypes: true })) {
@@ -1613,7 +1624,7 @@ function scanTree(tree, groups, pairs, marker, workspaces) {
         const keeps = relocatableInstallLink(groups, text);
         if (keeps === false) return { prunedLink: stored };
         if (keeps !== null || !pairs.some((pr) => target.includes(pr.from))) {
-          if (refusesLink(base, p, keeps === true)) return { prunedLink: stored };
+          if (refusesLink(base, p, keeps === true, siblingTrees(base))) return { prunedLink: stored };
         }
         if (target.includes(marker)) return { collision: true };
         const hit = pairs.some((pr) => target.includes(pr.from));

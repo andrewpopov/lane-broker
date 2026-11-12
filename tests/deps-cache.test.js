@@ -1244,6 +1244,74 @@ test('workspace store: only real packages are stored (no links, no sources); a r
   assert.deepEqual(JSON.parse(out), { ws: 'api', dotenv: '16' }, 'require resolves through the recreated link to the workspace source and its nested dependency');
 });
 
+const jitiCacheFile = (nodeModules, work) => {
+  fs.mkdirSync(path.join(nodeModules, '.cache', 'jiti'), { recursive: true });
+  fs.writeFileSync(path.join(nodeModules, '.cache', 'jiti', 'api-prisma.config.abc.mjs'), `root=${work}`);
+};
+
+test('node_modules/.cache/jiti is neither scanned nor stored, in the root node_modules and in a workspace\'s own; the rest of .cache is stored', () => {
+  const src = makeWorkspaceInstall();
+  const nm = path.join(src, 'node_modules');
+  const apiNm = path.join(src, 'packages', 'api', 'node_modules');
+  for (const dir of [nm, apiNm]) {
+    jitiCacheFile(dir, src);
+    fs.writeFileSync(path.join(dir, '.cache', 'jiti', 'big.bin'), Buffer.alloc(1024 * 1024, 65));
+    fs.mkdirSync(path.join(dir, '.cache', 'some-pkg'));
+    fs.writeFileSync(path.join(dir, '.cache', 'some-pkg', 'data.json'), '{"needed": true}');
+  }
+  const roles = [{ role: 'workDir', path: src }, { role: 'realWorkDir', path: fs.realpathSync(src) }];
+  const collected = collectInstallPathReferences(nm, roles, { workspaces: WORKSPACES });
+  assert.ok(collected.relocation, `ambiguous jiti cache files are not scanned, got ${JSON.stringify({ ...collected, relocation: undefined })}`);
+  assert.deepEqual(collected.relocation.entries, []);
+
+  const cacheRoot = tmpDir('deps-cache-store');
+  const key = newKey();
+  const published = publishToStore(cacheRoot, key, nm, collected.relocation, null, WORKSPACES);
+  assert.equal(published.published, true);
+  assert.ok(published.bytes < 1024 * 1024, `the jiti cache bytes are not counted, got ${published.bytes}`);
+  const stored = entryTree(cacheRoot, key);
+  const storedApi = path.join(stored, '.lane-workspaces', 'packages', 'api', 'node_modules');
+  for (const dir of [stored, storedApi]) {
+    assert.equal(fs.existsSync(path.join(dir, '.cache', 'jiti')), false, `no ${dir} jiti cache stored`);
+    assert.equal(fs.readFileSync(path.join(dir, '.cache', 'some-pkg', 'data.json'), 'utf8'), '{"needed": true}', 'another .cache entry is preserved');
+  }
+  assert.equal(fs.existsSync(path.join(storedApi, 'dotenv', 'index.js')), true, 'the rest of the workspace tree is stored');
+});
+
+test('the same ambiguous file is still refused outside node_modules/.cache/jiti: another .cache entry, a deeper or a scoped .cache/jiti', () => {
+  const roles = [{ role: 'workDir', path: '/var/tmp/lb-a/work' }];
+  for (const rel of ['jiti/api-prisma.config.abc.mjs', '.cache/some-pkg/x.mjs', 'pkg/.cache/jiti/x.mjs', '@s/.cache/jiti/x.mjs']) {
+    const t = path.join(tmpDir('deps-cache-cachedir'), 'node_modules');
+    fs.mkdirSync(path.dirname(path.join(t, rel)), { recursive: true });
+    fs.writeFileSync(path.join(t, rel), 'root=/var/tmp/lb-a/work');
+    assert.deepEqual(collectInstallPathReferences(t, roles), { ambiguous: rel }, rel);
+  }
+});
+
+test('a symlink into node_modules/.cache/jiti still refuses the tree', () => {
+  const roles = [{ role: 'workDir', path: '/var/tmp/lb-a/work' }];
+  for (const target of ['.cache/jiti/x.mjs', '.cache/jiti']) {
+    const t = path.join(tmpDir('deps-cache-cachelink'), 'node_modules');
+    fs.mkdirSync(path.join(t, '.cache', 'jiti'), { recursive: true });
+    fs.writeFileSync(path.join(t, '.cache', 'jiti', 'x.mjs'), 'x');
+    fs.symlinkSync(target, path.join(t, 'link'));
+    assert.deepEqual(collectInstallPathReferences(t, roles), { prunedLink: 'link' }, target);
+  }
+});
+
+test('a root dependency\'s absolute symlink into a workspace\'s pruned jiti cache refuses the tree (prunedLink), not a dangling link on a hit', () => {
+  const src = makeWorkspaceInstall();
+  const nm = path.join(src, 'node_modules');
+  jitiCacheFile(path.join(src, 'packages', 'api', 'node_modules'), src);
+  fs.mkdirSync(path.join(nm, 'dep'));
+  fs.symlinkSync(path.join(src, 'packages', 'api', 'node_modules', '.cache', 'jiti', 'api-prisma.config.abc.mjs'), path.join(nm, 'dep', 'cached.mjs'));
+  const roles = [{ role: 'workDir', path: src }, { role: 'realWorkDir', path: fs.realpathSync(src) }];
+  assert.deepEqual(collectInstallPathReferences(nm, roles, { workspaces: WORKSPACES }), { prunedLink: 'dep/cached.mjs' });
+  fs.rmSync(path.join(nm, 'dep', 'cached.mjs'));
+  fs.symlinkSync(path.join(src, 'packages', 'api', 'node_modules', 'dotenv', 'index.js'), path.join(nm, 'dep', 'cached.mjs'));
+  assert.ok(collectInstallPathReferences(nm, roles, { workspaces: WORKSPACES }).relocation, 'a link into the workspace\'s kept files is still relocatable');
+});
+
 test('workspace restore fails closed: a missing workspace dir or an existing nested node_modules throws and leaves nothing placed', () => {
   const cacheRoot = tmpDir('deps-cache-store');
   const src = makeWorkspaceInstall();
