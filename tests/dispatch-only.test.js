@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { laneRun, writeRepoConfig, gitFixture, laneSpawn, waitFor } from './helpers.js';
-import { setup, tmpDir, markerCmd, linesOf, recordingCmd, hasLease } from './remote-harness.js';
+import { setup, tmpDir, markerCmd, linesOf, recordingCmd, hasLease, rebalanceSetup, IDLE } from './remote-harness.js';
 import { readJsonSafe, paths } from '../src/state.js';
 
 /**
@@ -316,4 +316,25 @@ test('BRAIN-721: a dispatch-only host still refuses a host-only path, even with 
     assert.ok(res.stderr.includes(`names ${hostFile}`), res.stderr);
     assert.doesNotMatch(res.stderr, /pass --local/);
   }
+});
+
+test('BRAIN-976: dispatch-only ticket exited 76 with every runner over maxRemoteQueue; it queues on the fewest-queued runner instead', async () => {
+  const ctx = rebalanceSetup({ paused: [] });
+  refuse(ctx, { maxRemoteQueue: 6 });
+  ctx.fake.setProbe('a', { ...IDLE, queued: 9 });
+  ctx.fake.setProbe('b', { ...IDLE, queued: 7 });
+  const res = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...ctx.cmdArgv], { env: ctx.env, cwd: ctx.repoDir });
+  assert.notEqual(res.code, 76, `dispatch-only ticket exited 76 with every runner over maxRemoteQueue: ${res.stderr}`);
+  assert.equal(res.code, 0, res.stderr);
+  assert.deepEqual(ctx.runs(), ['b']);
+});
+
+test('BRAIN-976: a draining or paused runner is still skipped when the cap no longer applies', async () => {
+  const ctx = rebalanceSetup({ paused: [] });
+  refuse(ctx, { maxRemoteQueue: 6 });
+  ctx.fake.setProbe('a', { ...IDLE, queued: 9, paused: true });
+  ctx.fake.setProbe('b', { ...IDLE, queued: 7 });
+  const res = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...ctx.cmdArgv], { env: ctx.env, cwd: ctx.repoDir });
+  assert.equal(res.code, 0, res.stderr);
+  assert.deepEqual(ctx.runs(), ['b']);
 });

@@ -519,8 +519,10 @@ only a *fallback to local execution* is refused, unless `--allow-local-sim`
 is also passed. Such a lane never runs here by default, so it never takes the
 "run locally because this machine could admit it" path (BRAIN-338): when every
 runner is queued it queues on the least-loaded one regardless of local
-capacity. When no runner can take it at all (every probe failed, or every
-runner is paused/draining/over `maxRemoteQueue`) it exits `76` — retry later —
+capacity and of `maxRemoteQueue` (BRAIN-976: the cap is a placement preference
+that a ticket with a local alternative honours; with none it only turned waiting into a refusal;
+`maxRemoteQueue: 0` still means never queue). When no runner can take it at all (every probe failed, or every
+runner is paused/draining/missing a required tag) it exits `76` — retry later —
 rather than the policy refusal `69`. A lane that is not remote-eligible, or
 whose tree is ineligible for a snapshot, still exits `69`.
 
@@ -573,6 +575,8 @@ What a remote run does:
    runner) **and** this machine could not start the ticket right now either
    (its queue is non-empty, or a conflict, capacity, pause, load-gate,
    cooldown or memory check refuses it); otherwise the run stays local.
+   A ticket this machine can never run (dispatch-only host, `localRefused` lane, budget refusal) has no local
+   alternative, so for it `maxRemoteQueue` does not apply (BRAIN-976) and it queues on the best queued runner.
    A runner with room always beats any runner queue.
    BRAIN-746: a ticket back in the local queue whose rebind finds this machine CPU-blocked (fresh host load outside
    any lease leaves no admissible slot) may also queue on a runner that statically fits it but has no headroom and an

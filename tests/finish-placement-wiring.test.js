@@ -243,3 +243,10 @@ test('BRAIN-899 A1: both rebalance passes keep the serial wait; place and rebind
   assert.equal(optionsFor('rebalance', root, { queuedMove: { position: 2, sourceRunner: SKYBOX } }).slotAwareWait, false);
   assert.equal(optionsFor('place', root).slotAwareWait, undefined, 'place takes selectRunner\'s slot-aware default');
 });
+
+test('selectionOptionsFor: place drops maxRemoteQueue only for a ticket this machine can never run (BRAIN-976)', () => {
+  const root = rootWithHistory([]);
+  assert.equal(optionsFor('place', root).maxRemoteQueue, DEFAULT_GLOBAL_CONFIG.maxRemoteQueue, 'a locally eligible ticket keeps the cap');
+  assert.equal(optionsFor('place', root, {}, { localExecution: 'refused' }).maxRemoteQueue, Infinity);
+  assert.equal(optionsFor('place', root, {}, { localExecution: 'refused', maxRemoteQueue: 0 }).maxRemoteQueue, 0, '0 still means never queue');
+});

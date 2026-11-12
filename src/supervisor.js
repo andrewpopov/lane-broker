@@ -827,7 +827,9 @@ export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHom
   if (kind === 'rebalance') {
     return { ...base, maxRemoteQueue: 0, requireCapabilities: draining ? [...base.requireCapabilities, REMOTE_WITHDRAW_CAPABILITY] : base.requireCapabilities, finishModel, slotAwareWait: false };
   }
-  return { ...base, finishModel, busyQueueable: true };
+  // BRAIN-976: a ticket this machine can never run has no local alternative, so the cap would only turn waiting into a 76; 0 (never queue) stays 0
+  const uncapped = globalCfg.maxRemoteQueue > 0 && localIneligibilityOf(enriched, globalCfg, cpuLimit);
+  return { ...base, ...(uncapped ? { maxRemoteQueue: Infinity } : {}), finishModel, busyQueueable: true };
 }
 
 /**
