@@ -57,6 +57,20 @@ const GUARDS = {
     for (const c of [superuser, stranger]) assert.deepEqual((await c.query('SELECT 1 AS one')).rows, [{ one: 1 }]);
   },
 
+  'the guard spares a lane_agent_ backend in another database and still kills one in its own': async (w, cluster) => {
+    const admin = await w.as(logins.admin);
+    const otherDb = `other_${randomUUID().replaceAll('-', '').slice(0, 10)}`;
+    await (await cluster.admin()).query(`CREATE DATABASE ${otherDb}`);
+    const [foreign, own] = [await cluster.client(otherDb, logins.x), await victim(w, logins.x)];
+    foreign.on('error', () => {});
+    await foreign.query('SET idle_in_transaction_session_timeout = 0');
+    for (const c of [foreign, own]) await c.query('BEGIN');
+    for (const c of [foreign, own]) await c.query('SELECT 1');
+    assert.equal(await call(admin, 'ld_guard', '0 seconds'), 1, 'only the backend in this database');
+    await assertDies(own);
+    assert.deepEqual((await foreign.query('SELECT 1 AS one')).rows, [{ one: 1 }]);
+  },
+
   'the guard kills a pg_sleep(10) once its transaction passes 5 s, and not before': async (w) => {
     const [admin, runner] = [await w.as(logins.admin), await victim(w, logins.a1)];
     const sleeping = settle(runner.query('SELECT pg_sleep(10)'));
@@ -132,7 +146,9 @@ const CANARIES = [
     'AND clock_timestamp() - a.xact_start > p_max_age', 'AND a.xact_start IS NOT NULL'],
   ['the guard spares a transaction younger than 5 s, a superuser and any other login prefix, and kills the rest on a lower threshold', 'AND NOT r.rolsuper', ''],
   ['the guard spares a transaction younger than 5 s, a superuser and any other login prefix, and kills the rest on a lower threshold',
-    "(starts_with(a.usename, 'lane_agent_') OR starts_with(a.usename, 'lane_submit_'))", 'true'],
+    "(starts_with(a.usename, 'lane_agent_') OR starts_with(a.usename, 'lane_submit_'))\n       AND NOT r.rolsuper AND a.pid <> pg_backend_pid() AND a.datname = current_database()",
+    'true AND NOT r.rolsuper AND a.pid <> pg_backend_pid()'],
+  ['the guard spares a lane_agent_ backend in another database and still kills one in its own', ' AND a.datname = current_database()', ''],
   ['the guard kills a pg_sleep(10) once its transaction passes 5 s, and not before', 'AND clock_timestamp() - a.xact_start > p_max_age', 'AND a.xact_start IS NOT NULL'],
 ];
 

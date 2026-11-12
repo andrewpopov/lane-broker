@@ -138,6 +138,7 @@ export class PgCluster {
     const c = await this.client(database, user);
     let mutated = !mutate;
     await applyMigrations(c, {
+      databaseAcls: true,
       transform: (text) => {
         if (!mutate || !text.includes(mutate[0])) return text;
         mutated = true;

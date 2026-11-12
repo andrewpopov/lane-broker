@@ -602,6 +602,9 @@ END $$;
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_entry() RETURNS void
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 BEGIN
+  IF current_setting('transaction_isolation') <> 'read committed' THEN
+    RAISE EXCEPTION 'lane_dispatch must run at READ COMMITTED, not %', current_setting('transaction_isolation') USING ERRCODE = '25000';
+  END IF;
   PERFORM lane_dispatch.ld_timeline_ok();
 END $$;
 
@@ -731,7 +734,7 @@ BEGIN
   IF NOT FOUND THEN RETURN jsonb_build_object('state', 'missing', 'cancel_requested', false, 'confirmed', false); END IF;
   IF v_t.state IN ('queued','quarantined') THEN
     UPDATE lane_dispatch.tickets SET state = 'cancelled', cancel_requested = true, finished_at = clock_timestamp() WHERE id = p_id;
-    RETURN jsonb_build_object('state', 'cancelled', 'cancel_requested', true, 'confirmed', v_t.claim_token IS NULL);
+    RETURN jsonb_build_object('state', 'cancelled', 'cancel_requested', true, 'confirmed', v_t.state = 'queued');
   END IF;
   IF v_t.state IN ('claimed','running') THEN
     UPDATE lane_dispatch.tickets SET cancel_requested = true WHERE id = p_id;
@@ -792,8 +795,7 @@ BEGIN
     RETURN jsonb_build_object('status', 'none');
   END IF;
   v_token := gen_random_uuid();
-  UPDATE lane_dispatch.tickets SET state = 'claimed', epoch = epoch + 1, claim_token = v_token, host = v_me.host, lease_until = v_now + interval '120 seconds',
-         reasserted_incarnation = NULL
+  UPDATE lane_dispatch.tickets SET state = 'claimed', epoch = epoch + 1, claim_token = v_token, host = v_me.host, lease_until = v_now + interval '120 seconds'
    WHERE id = v_id RETURNING epoch INTO v_epoch;
   INSERT INTO lane_dispatch.attempts (ticket, epoch, host, claim_token) VALUES (v_id, v_epoch, v_me.host, v_token);
   INSERT INTO lane_dispatch.claim_requests (login_role, req, ticket, epoch, claim_token) VALUES (session_user, p_req, v_id, v_epoch, v_token);
@@ -826,9 +828,11 @@ BEGIN
   IF NOT lane_dispatch.fence_ok(p_epoch, p_token, v_me.host, v_t.epoch, v_t.claim_token, v_t.host, v_t.state) THEN
     RETURN jsonb_build_object('fenced', true, 'cancel', false, 'urls', NULL);
   END IF;
-  IF v_t.state IN ('claimed','running','quarantined') THEN
-    UPDATE lane_dispatch.tickets SET lease_until = clock_timestamp() + interval '120 seconds', state = CASE v_t.state WHEN 'quarantined' THEN 'running' ELSE v_t.state END
-     WHERE id = p_id;
+  IF v_t.state = 'quarantined' THEN
+    RETURN jsonb_build_object('fenced', false, 'reassert', true, 'cancel', false, 'urls', NULL);
+  END IF;
+  IF v_t.state IN ('claimed','running') THEN
+    UPDATE lane_dispatch.tickets SET lease_until = clock_timestamp() + interval '120 seconds' WHERE id = p_id;
   END IF;
   RETURN jsonb_build_object('fenced', false, 'cancel', v_t.cancel_requested, 'urls', v_t.urls);
 END $$;
@@ -861,20 +865,21 @@ BEGIN
     RAISE EXCEPTION 'unknown release proof %', p_proof USING ERRCODE = '22023';
   END IF;
   SELECT * INTO v_t FROM lane_dispatch.tickets t WHERE t.id = p_id FOR UPDATE;
-  IF NOT lane_dispatch.fence_ok(p_epoch, p_token, v_me.host, v_t.epoch, v_t.claim_token, v_t.host, v_t.state) THEN
+  IF NOT lane_dispatch.fence_ok(p_epoch, p_token, v_me.host, v_t.epoch, v_t.claim_token, v_t.host, v_t.state) OR v_t.state = 'quarantined' THEN
     RETURN jsonb_build_object('fenced', true, 'state', v_t.state);
   END IF;
   v_state := CASE WHEN v_t.cancel_requested THEN 'cancelled' ELSE 'queued' END;
-  UPDATE lane_dispatch.tickets SET state = v_state, claim_token = NULL, host = NULL, lease_until = NULL, started_at = NULL, reasserted_incarnation = NULL,
+  UPDATE lane_dispatch.tickets SET state = v_state, claim_token = NULL, host = NULL, lease_until = NULL, started_at = NULL,
          finished_at = CASE WHEN v_state = 'cancelled' THEN clock_timestamp() END
    WHERE id = p_id;
   RETURN jsonb_build_object('fenced', false, 'state', v_state);
 END $$;
 
--- Adopts a reasserted execution: the caller's own (epoch, token), or a higher epoch on an ownerless rolled-back row or on a row another reassert adopted in this incarnation.
+-- Adopts a reasserted execution: the caller's own (host, epoch, token) as a running phase (a quarantined claim that never started stays fenced),
+-- or a higher epoch on an ownerless rolled-back quarantined row, which only a running phase may adopt.
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_reassert(p_items jsonb) RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
-DECLARE v_me record; v_item jsonb; v_t record; v_out jsonb := '[]'::jsonb; v_result text; v_incarnation int; v_now timestamptz;
+DECLARE v_me record; v_item jsonb; v_t record; v_out jsonb := '[]'::jsonb; v_result text; v_now timestamptz;
         v_id uuid; v_epoch int; v_token uuid; v_phase text; v_state text;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
@@ -882,7 +887,6 @@ BEGIN
   IF jsonb_typeof(p_items) IS DISTINCT FROM 'array' THEN RAISE EXCEPTION 'items must be a json array' USING ERRCODE = '22023'; END IF;
   PERFORM 1 FROM lane_dispatch.claim_lock WHERE id = 1 FOR UPDATE;
   v_now := clock_timestamp();
-  v_incarnation := (SELECT c.incarnation FROM lane_dispatch.cluster c WHERE c.id = 1);
   FOR v_item IN SELECT e FROM jsonb_array_elements(p_items) e LOOP
     v_id := (v_item->>'id')::uuid;
     v_epoch := (v_item->>'epoch')::int;
@@ -893,12 +897,12 @@ BEGIN
     SELECT * INTO v_t FROM lane_dispatch.tickets t WHERE t.id = v_id FOR UPDATE;
     IF NOT FOUND THEN
       v_result := 'unknown';
-    ELSIF lane_dispatch.fence_ok(v_epoch, v_token, v_me.host, v_t.epoch, v_t.claim_token, v_t.host, v_t.state)
-       OR (v_epoch > v_t.epoch AND v_t.state IN ('claimed','running','quarantined')
-           AND lane_dispatch.eligible(v_t.requires_tags, v_t.repo_key, v_me.tags, v_me.allowed_repos)
-           AND ((v_t.state = 'quarantined' AND v_t.claim_token IS NULL) OR v_t.reasserted_incarnation = v_incarnation)) THEN
+    ELSIF (lane_dispatch.fence_ok(v_epoch, v_token, v_me.host, v_t.epoch, v_t.claim_token, v_t.host, v_t.state)
+           AND NOT (v_t.state = 'quarantined' AND v_phase = 'pre-start'))
+       OR (v_phase = 'running' AND v_t.state = 'quarantined' AND v_t.claim_token IS NULL AND v_epoch > v_t.epoch
+           AND lane_dispatch.eligible(v_t.requires_tags, v_t.repo_key, v_me.tags, v_me.allowed_repos)) THEN
       UPDATE lane_dispatch.tickets SET state = v_state, host = v_me.host, epoch = v_epoch, claim_token = v_token,
-             lease_until = v_now + interval '120 seconds', reasserted_incarnation = v_incarnation WHERE id = v_id;
+             lease_until = v_now + interval '120 seconds' WHERE id = v_id;
       INSERT INTO lane_dispatch.attempts (ticket, epoch, host, claim_token) VALUES (v_id, v_epoch, v_me.host, v_token)
         ON CONFLICT (ticket, epoch) DO UPDATE SET host = EXCLUDED.host, claim_token = EXCLUDED.claim_token;
       v_result := 'ok';
@@ -926,7 +930,7 @@ BEGIN
   UPDATE lane_dispatch.cluster SET last_tick = v_now WHERE id = 1;
   WITH r AS (
     UPDATE lane_dispatch.tickets t SET state = CASE WHEN t.cancel_requested THEN 'cancelled' ELSE 'queued' END, claim_token = NULL, host = NULL, lease_until = NULL,
-           started_at = NULL, reasserted_incarnation = NULL, finished_at = CASE WHEN t.cancel_requested THEN v_now END
+           started_at = NULL, finished_at = CASE WHEN t.cancel_requested THEN v_now END
      WHERE t.state = 'claimed' AND t.lease_until < v_now RETURNING t.state)
   SELECT count(*) FILTER (WHERE r.state = 'queued'), count(*) FILTER (WHERE r.state = 'cancelled') INTO v_requeued, v_cancelled FROM r;
   WITH r AS (
@@ -1005,7 +1009,7 @@ BEGIN
     SELECT pg_terminate_backend(a.pid)
       FROM pg_stat_activity a JOIN pg_roles r ON r.rolname = a.usename
      WHERE (starts_with(a.usename, 'lane_agent_') OR starts_with(a.usename, 'lane_submit_'))
-       AND NOT r.rolsuper AND a.pid <> pg_backend_pid()
+       AND NOT r.rolsuper AND a.pid <> pg_backend_pid() AND a.datname = current_database()
        AND clock_timestamp() - a.xact_start > p_max_age) k;
   RETURN v_killed;
 END $$;

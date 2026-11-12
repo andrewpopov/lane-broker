@@ -121,6 +121,94 @@ const GUARDS = {
     assert.equal((await w.ticket(tid(2))).state, 'finished');
   },
 
+  'a heartbeat never lifts quarantine: the matching runner is told to reassert, the row is unchanged, and a running reassert or ld_finish leaves quarantine': async (w) => {
+    const [a1, a2] = [await w.as(logins.a1), await w.as(logins.a2)];
+    const t1 = await heldAndQueued(w, { started: true });
+    const t2 = await claim(a1);
+    await quarantineByFirstCall(w);
+    assert.deepEqual(await heartbeat(a2, t1), { fenced: true, cancel: false, urls: null });
+    assert.deepEqual(await heartbeat(a1, { ...t1, token: randomUUID() }), { fenced: true, cancel: false, urls: null });
+    const before = await w.ticket(t1.id);
+    assert.deepEqual(await heartbeat(a1, t1), { fenced: false, reassert: true, cancel: false, urls: null });
+    assert.deepEqual(await w.ticket(t1.id), before, 'a heartbeat changes nothing');
+    assert.deepEqual(await reassert(a1, [asItem(t1)]), [{ id: t1.id, result: 'ok' }]);
+    assert.equal((await w.ticket(t1.id)).state, 'running');
+    assert.ok(await leaseSecondsAhead(w, t1.id) > 100);
+    assert.deepEqual(await heartbeat(a1, t1), { fenced: false, cancel: false, urls: null });
+    assert.deepEqual(await finish(a1, t2), { fenced: false, state: 'finished' });
+  },
+
+  'a quarantined claim that never started is fenced: ld_release, a pre-start reassert and ld_start leave it untouched and unclaimable': async (w) => {
+    const [a1, a2] = [await w.as(logins.a1), await w.as(logins.a2)];
+    const t1 = await heldAndQueued(w);
+    await quarantineByFirstCall(w);
+    const before = await w.ticket(t1.id);
+    assert.deepEqual(await call(a1, 'ld_release', t1.id, t1.epoch, t1.token, 'never-started'), { fenced: true, state: 'quarantined' });
+    assert.deepEqual(await reassert(a1, [asItem(t1, 'pre-start')]), [{ id: t1.id, result: 'fenced' }]);
+    assert.equal(await start(a1, t1), false);
+    assert.deepEqual(await w.ticket(t1.id), before);
+    assert.deepEqual(await claim(a2), { status: 'none' }, 'no other host can claim it');
+  },
+
+  'ld_cancel confirms only a queued row: a quarantined row, owned or ownerless, is never confirmed': async (w) => {
+    const s1 = await w.as(logins.s1);
+    const t1 = await heldAndQueued(w);
+    await quarantineByFirstCall(w);
+    assert.deepEqual(await call(s1, 'ld_cancel', t1.id), { state: 'cancelled', cancel_requested: true, confirmed: false }, 'owned');
+    assert.deepEqual(await call(s1, 'ld_cancel', tid(2)), { state: 'cancelled', cancel_requested: true, confirmed: false }, 'ownerless');
+    await enqueue(s1, tid(4));
+    assert.deepEqual(await call(s1, 'ld_cancel', tid(4)), { state: 'cancelled', cancel_requested: true, confirmed: true }, 'a queued row is confirmed');
+  },
+
+  'a higher-epoch reassert from another principal, with no restore, is fenced and the owner keeps the row': async (w) => {
+    const [a1, x] = [await w.as(logins.a1), await w.as(logins.x)];
+    const t1 = await heldAndQueued(w, { started: true });
+    assert.deepEqual(await reassert(a1, [asItem(t1)]), [{ id: t1.id, result: 'ok' }]);
+    const stolenToken = randomUUID();
+    assert.deepEqual(await reassert(x, [{ id: t1.id, epoch: t1.epoch + 1, token: stolenToken, phase: 'running' }]), [{ id: t1.id, result: 'fenced' }]);
+    assert.deepEqual(await call(x, 'ld_finish', t1.id, t1.epoch + 1, stolenToken, { kind: 'ok', exitCode: 0 }), { fenced: true, state: 'running' });
+    const row = await w.ticket(t1.id);
+    assert.equal(row.state, 'running');
+    sameExecution(row, t1);
+    assert.equal((await heartbeat(a1, t1)).fenced, false);
+  },
+
+  'ld_entry refuses a transaction above READ COMMITTED, so a REPEATABLE READ runner cannot exceed max_claims': async (w) => {
+    const s1 = await w.as(logins.s1);
+    for (let n = 1; n <= 4; n++) await enqueue(s1, tid(n));
+    const [c1, c2] = [await w.cluster.client(w.db, logins.x), await w.cluster.client(w.db, logins.x)];
+    await c2.query('BEGIN ISOLATION LEVEL REPEATABLE READ');
+    await c2.query('SELECT 1');
+    assert.equal((await claim(c1)).status, 'claimed');
+    await assert.rejects(claim(c2, { held: [`lk-${tid(1)}`] }), (err) => err.code === '25000' && /READ COMMITTED/.test(err.message));
+    await c2.query('ROLLBACK');
+    const { rows: [{ n }] } = await (await w.su()).query("SELECT count(*)::int AS n FROM lane_dispatch.tickets WHERE host = 'x' AND state IN ('claimed','running')");
+    assert.equal(n, 1, 'max_claims holds');
+  },
+
+  'two concurrent ld_reassert calls on one row serialise: the matching one is ok, the other is fenced, whatever the order or epochs': async (w) => {
+    const [a1, a2] = [await w.as(logins.a1), await w.as(logins.a2)];
+    const [tokenA, tokenB] = [randomUUID(), randomUUID()];
+    const item = (epoch, token) => ({ id: tid(1), epoch, token, phase: 'running' });
+    const ok = [{ id: tid(1), result: 'ok' }];
+    const fenced = [{ id: tid(1), result: 'fenced' }];
+    const heartbeats = async (a, b) => [(await call(a1, 'ld_heartbeat', tid(1), a.epoch, a.token)).fenced, (await call(a2, 'ld_heartbeat', tid(1), b.epoch, b.token)).fenced];
+    const rollBack = async () => (await w.su()).query("UPDATE lane_dispatch.tickets SET state = 'quarantined', claim_token = NULL, host = NULL, epoch = 0");
+
+    await ownerlessRow(w);
+    assert.deepEqual(await raceReasserts(w, [logins.a1, item(3, tokenA)], [logins.a2, item(3, tokenB)]), [ok, fenced], 'equal epochs');
+    assert.deepEqual(await heartbeats({ epoch: 3, token: tokenA }, { epoch: 3, token: tokenB }), [false, true]);
+
+    await rollBack();
+    assert.deepEqual(await raceReasserts(w, [logins.a1, item(3, tokenA)], [logins.a2, item(5, tokenB)]), [ok, fenced], 'a higher epoch does not replace the first');
+    assert.deepEqual(await heartbeats({ epoch: 3, token: tokenA }, { epoch: 5, token: tokenB }), [false, true]);
+    const row = await w.ticket(tid(1));
+    assert.deepEqual([row.state, row.epoch, row.claim_token, row.host], ['running', 3, tokenA, 'a1']);
+
+    await rollBack();
+    assert.deepEqual(await raceReasserts(w, [logins.a2, item(5, tokenB)], [logins.a1, item(3, tokenA)]), [ok, fenced], 'lower epoch second');
+  },
+
   'the amnesty gap: after an outage longer than twice the interval ld_reap extends every lease and settles nothing': async (w) => {
     const [admin, a1, a2, s1] = [await w.as(logins.admin), await w.as(logins.a1), await w.as(logins.a2), await w.as(logins.s1)];
     await enqueue(s1, tid(1));
@@ -237,21 +325,6 @@ const SEMANTICS = {
     assert.deepEqual((await Promise.all([1, 2, 3].map((n) => w.ticket(tid(n))))).map((r) => r.state), ['quarantined', 'quarantined', 'quarantined']);
   },
 
-  'a heartbeat or finish from the matching host, epoch and token leaves quarantine; another host or token does not': async (w) => {
-    const [a1, a2] = [await w.as(logins.a1), await w.as(logins.a2)];
-    const t1 = await heldAndQueued(w, { started: true });
-    const t2 = await claim(a1);
-    await quarantineByFirstCall(w);
-    assert.deepEqual(await heartbeat(a2, t1), { fenced: true, cancel: false, urls: null });
-    assert.deepEqual(await heartbeat(a1, { ...t1, token: randomUUID() }), { fenced: true, cancel: false, urls: null });
-    assert.equal((await w.ticket(t1.id)).state, 'quarantined');
-    assert.equal((await heartbeat(a1, t1)).fenced, false);
-    const row = await w.ticket(t1.id);
-    assert.equal(row.state, 'running');
-    assert.ok(await leaseSecondsAhead(w, t1.id) > 100);
-    assert.deepEqual(await finish(a1, t2), { fenced: false, state: 'finished' });
-  },
-
   'an owner ld_cancel and the admin ld_cancel_quarantined are terminal for a quarantined row': async (w) => {
     const [admin, s1, s2] = [await w.as(logins.admin), await w.as(logins.s1), await w.as(logins.s2)];
     const t1 = await heldAndQueued(w);
@@ -259,23 +332,27 @@ const SEMANTICS = {
     await quarantineByFirstCall(w);
     assert.deepEqual(await call(s2, 'ld_cancel', t1.id), { state: 'missing', cancel_requested: false, confirmed: false });
     assert.deepEqual(await call(s1, 'ld_cancel', t1.id), { state: 'cancelled', cancel_requested: true, confirmed: false }, 'its runner may still be running it');
-    assert.deepEqual(await call(s1, 'ld_cancel', tid(2)), { state: 'cancelled', cancel_requested: true, confirmed: true }, 'never claimed, so confirmed');
+    assert.deepEqual(await call(s1, 'ld_cancel', tid(2)), { state: 'cancelled', cancel_requested: true, confirmed: false }, 'quarantined is never confirmed');
     assert.equal(await call(admin, 'ld_cancel_quarantined', tid(3)), 'cancelled');
     assert.equal(await call(admin, 'ld_cancel_quarantined', tid(3)), 'cancelled', 'a repeat sees the terminal state');
     assert.equal(await call(admin, 'ld_cancel_quarantined', tid(8)), 'missing');
     assert.equal((await w.ticket(tid(3))).state, 'cancelled');
   },
 
-  'ld_reassert adopts the caller own execution: running, or claimed before ld_start, with the lease extended': async (w) => {
+  'ld_reassert adopts the caller own execution: running with the lease extended, and a claim before ld_start only while it is not quarantined': async (w) => {
     const a1 = await w.as(logins.a1);
     const t1 = await heldAndQueued(w, { started: true });
     const t2 = await claim(a1);
     await quarantineByFirstCall(w);
     await expireLease(w, t1.id, 600);
     await expireLease(w, t2.id, 600);
-    assert.deepEqual(await reassert(a1, [asItem(t1), asItem(t2, 'pre-start')]), [{ id: t1.id, result: 'ok' }, { id: t2.id, result: 'ok' }]);
-    assert.deepEqual([(await w.ticket(t1.id)).state, (await w.ticket(t2.id)).state], ['running', 'claimed']);
-    for (const t of [t1, t2]) assert.ok(await leaseSecondsAhead(w, t.id) > 100);
+    assert.deepEqual(await reassert(a1, [asItem(t1), asItem(t2, 'pre-start')]), [{ id: t1.id, result: 'ok' }, { id: t2.id, result: 'fenced' }]);
+    assert.deepEqual([(await w.ticket(t1.id)).state, (await w.ticket(t2.id)).state], ['running', 'quarantined']);
+    assert.ok(await leaseSecondsAhead(w, t1.id) > 100);
+    await (await w.su()).query("UPDATE lane_dispatch.tickets SET state = 'claimed' WHERE id = $1", [t2.id]);
+    assert.deepEqual(await reassert(a1, [asItem(t2, 'pre-start')]), [{ id: t2.id, result: 'ok' }], 'a live claim before ld_start is adopted');
+    assert.equal((await w.ticket(t2.id)).state, 'claimed');
+    assert.ok(await leaseSecondsAhead(w, t2.id) > 100);
     await assert.rejects(reassert(a1, [{ ...asItem(t1), phase: 'sleeping' }]), /unknown reassert phase/);
   },
 
@@ -295,6 +372,7 @@ const SEMANTICS = {
     assert.deepEqual(await reassert(a1, [item(1, 2, tokenA)]), [{ id: tid(1), result: 'fenced' }], 'repoZ is outside a1 allowed_repos');
     assert.deepEqual(await reassert(a2, [item(2, 2, tokenB)]), [{ id: tid(2), result: 'fenced' }], 'a2 lacks the fast tag');
     assert.deepEqual(await reassert(a2, [item(1, 0, tokenA)]), [{ id: tid(1), result: 'fenced' }], 'the epoch must be higher than the row');
+    assert.deepEqual(await reassert(a2, [{ ...item(1, 2, tokenA), phase: 'pre-start' }]), [{ id: tid(1), result: 'fenced' }], 'only a running phase adopts');
     for (const n of [1, 2]) {
       const row = await w.ticket(tid(n));
       assert.deepEqual([row.state, row.epoch, row.claim_token, row.host], ['quarantined', 0, null, null], `row ${n} untouched`);
@@ -306,29 +384,6 @@ const SEMANTICS = {
     assert.deepEqual([r2.state, r2.epoch, r2.claim_token, r2.host], ['running', 3, tokenC, 'a1']);
     const { rows } = await (await w.su()).query('SELECT ticket, epoch, host, claim_token FROM lane_dispatch.attempts ORDER BY ticket');
     assert.deepEqual(rows, [{ ticket: tid(1), epoch: 2, host: 'a2', claim_token: tokenA }, { ticket: tid(2), epoch: 3, host: 'a1', claim_token: tokenC }]);
-  },
-
-  'two concurrent ld_reassert calls on one row serialise: equal epochs fence the second, a higher epoch replaces the first, a lower one is fenced': async (w) => {
-    const [a1, a2] = [await w.as(logins.a1), await w.as(logins.a2)];
-    const [tokenA, tokenB] = [randomUUID(), randomUUID()];
-    const item = (epoch, token) => ({ id: tid(1), epoch, token, phase: 'running' });
-    const heartbeats = async (a, b) => [(await call(a1, 'ld_heartbeat', tid(1), a.epoch, a.token)).fenced, (await call(a2, 'ld_heartbeat', tid(1), b.epoch, b.token)).fenced];
-
-    await ownerlessRow(w);
-    let results = await raceReasserts(w, [logins.a1, item(3, tokenA)], [logins.a2, item(3, tokenB)]);
-    assert.deepEqual(results, [[{ id: tid(1), result: 'ok' }], [{ id: tid(1), result: 'fenced' }]], 'equal epochs');
-    assert.deepEqual(await heartbeats({ epoch: 3, token: tokenA }, { epoch: 3, token: tokenB }), [false, true]);
-
-    await (await w.su()).query("UPDATE lane_dispatch.tickets SET state = 'quarantined', claim_token = NULL, host = NULL, epoch = 0, reasserted_incarnation = NULL");
-    results = await raceReasserts(w, [logins.a1, item(3, tokenA)], [logins.a2, item(5, tokenB)]);
-    assert.deepEqual(results, [[{ id: tid(1), result: 'ok' }], [{ id: tid(1), result: 'ok' }]], 'higher epoch');
-    assert.deepEqual(await heartbeats({ epoch: 3, token: tokenA }, { epoch: 5, token: tokenB }), [true, false], 'the first is fenced on its next heartbeat');
-    const row = await w.ticket(tid(1));
-    assert.deepEqual([row.state, row.epoch, row.claim_token, row.host], ['running', 5, tokenB, 'a2']);
-
-    await (await w.su()).query("UPDATE lane_dispatch.tickets SET state = 'quarantined', claim_token = NULL, host = NULL, epoch = 0, reasserted_incarnation = NULL");
-    results = await raceReasserts(w, [logins.a2, item(5, tokenB)], [logins.a1, item(3, tokenA)]);
-    assert.deepEqual(results, [[{ id: tid(1), result: 'ok' }], [{ id: tid(1), result: 'fenced' }]], 'lower epoch second');
   },
 
   'a higher epoch never replaces a healthy claimed row that no reassert adopted': async (w) => {
@@ -409,6 +464,22 @@ const CANARIES = [
   ['the amnesty gap: after an outage longer than twice the interval ld_reap extends every lease and settles nothing', 'IF v_amnesty THEN', 'IF false THEN'],
   ['ld_reap requeues a claimed row past its lease, never a running one on expiry alone, and settles lost only after lost_after',
     "WHERE t.state = 'claimed' AND t.lease_until < v_now RETURNING t.state)", "WHERE t.state IN ('claimed','running') AND t.lease_until < v_now RETURNING t.state)"],
+  ["a heartbeat never lifts quarantine: the matching runner is told to reassert, the row is unchanged, and a running reassert or ld_finish leaves quarantine",
+    "  IF v_t.state = 'quarantined' THEN\n    RETURN jsonb_build_object('fenced', false, 'reassert', true, 'cancel', false, 'urls', NULL);\n  END IF;", "  IF v_t.state = 'quarantined' THEN\n    UPDATE lane_dispatch.tickets SET state = 'running' WHERE id = p_id;\n  END IF;"],
+  ["a quarantined claim that never started is fenced: ld_release, a pre-start reassert and ld_start leave it untouched and unclaimable",
+    "OR v_t.state = 'quarantined' THEN\n    RETURN jsonb_build_object('fenced', true, 'state', v_t.state);", "THEN\n    RETURN jsonb_build_object('fenced', true, 'state', v_t.state);"],
+  ["a quarantined claim that never started is fenced: ld_release, a pre-start reassert and ld_start leave it untouched and unclaimable",
+    "AND NOT (v_t.state = 'quarantined' AND v_phase = 'pre-start'))", "AND true)"],
+  ["a quarantined claim that never started is fenced: ld_release, a pre-start reassert and ld_start leave it untouched and unclaimable",
+    "IF v_t.state <> 'claimed' THEN RETURN false; END IF;", "IF v_t.state NOT IN ('claimed','quarantined') THEN RETURN false; END IF;"],
+  ["ld_cancel confirms only a queued row: a quarantined row, owned or ownerless, is never confirmed",
+    "'confirmed', v_t.state = 'queued');", "'confirmed', v_t.claim_token IS NULL);"],
+  ["a higher-epoch reassert from another principal, with no restore, is fenced and the owner keeps the row",
+    "OR (v_phase = 'running' AND v_t.state = 'quarantined' AND v_t.claim_token IS NULL AND v_epoch > v_t.epoch", "OR (v_phase = 'running' AND v_t.state IN ('claimed','running','quarantined') AND v_epoch > v_t.epoch"],
+  ["two concurrent ld_reassert calls on one row serialise: the matching one is ok, the other is fenced, whatever the order or epochs",
+    "OR (v_phase = 'running' AND v_t.state = 'quarantined' AND v_t.claim_token IS NULL AND v_epoch > v_t.epoch", "OR (v_phase = 'running' AND v_t.state IN ('claimed','running','quarantined') AND v_epoch > v_t.epoch"],
+  ["ld_entry refuses a transaction above READ COMMITTED, so a REPEATABLE READ runner cannot exceed max_claims",
+    "RAISE EXCEPTION 'lane_dispatch must run at READ COMMITTED, not %', current_setting('transaction_isolation') USING ERRCODE = '25000';", "NULL;"],
   ['ld_log stores a repeated seq once and counts log_bytes once', 'ON CONFLICT (ticket, epoch, seq) DO NOTHING;', ';'],
   ['ld_log caps one attempt at 64 MiB', 'IF v_logged + v_len > 67108864 THEN', 'IF false THEN'],
   ['ld_log caps one call at 256 KiB', 'IF v_len > 262144 THEN', 'IF false THEN'],

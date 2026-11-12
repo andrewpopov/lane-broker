@@ -1,8 +1,10 @@
 # lane_dispatch database setup (cluster level)
 
 `sql/lane/migrations/005-lane-dispatch.sql` and `sql/lane/functions.sql` create the `lane_dispatch` schema, its functions and every
-grant that lives inside the database. `applyMigrations` also calls `applyDatabaseAcls` (`src/lane-db.js`), which revokes
-CONNECT, CREATE and TEMP on the current database from PUBLIC and grants CONNECT to the four lane group roles. Design:
+grant that lives inside the database. `applyDatabaseAcls` (`src/lane-db.js`) revokes CONNECT, CREATE and TEMP on the current
+database from PUBLIC and grants CONNECT to the four lane group roles. It is opt-in (`applyMigrations(client, { databaseAcls: true })`
+or a direct call), and it throws before revoking anything when the database holds a schema other than `lane`, `lane_dispatch`
+and `public`, so it can never run on a shared application database. Design:
 `agent_brain/knowledge/lane-pull-dispatch.md` section 2.
 
 Cluster-level privileges need a superuser and stay out of those files, because the applier is a CREATEROLE non-superuser
@@ -41,4 +43,6 @@ If the reap interval changes, pass the new value as the first argument of `ld_re
 
 `ld_guard` is the only `SECURITY INVOKER` function in the schema, because it must run with the admin login's own cluster privileges. `ld_log` accepts at most 256 KiB per call, 64 MiB per attempt and 1 GiB across the table; past a cap it answers `capped`.
 
-After a restore from backup the first `ld_*` call quarantines every non-terminal ticket (`state = 'quarantined'`). A quarantined ticket leaves that state only when its runner reasserts it, through a terminal `ld_cancel` by its owner, or through `SELECT lane_dispatch.ld_cancel_quarantined('<ticket id>');` by an operator.
+After a restore from backup the first `ld_*` call quarantines every non-terminal ticket (`state = 'quarantined'`). A quarantined ticket leaves that state only when its runner reasserts it as `running` with the same host, epoch and token, through `ld_finish` by that runner, through `ld_cancel` by its owner, or through `SELECT lane_dispatch.ld_cancel_quarantined('<ticket id>');` by an operator. A heartbeat never lifts quarantine: it answers `reassert: true` and changes nothing, so the runner reasserts. A reassert of a quarantined claim as `pre-start`, `ld_start` and `ld_release` are fenced or refused, and a reassert from another host, epoch or token is always fenced (the one exception is an ownerless rolled-back row, which an eligible runner may adopt as `running` at a higher epoch).
+
+Every `ld_*` call must run at READ COMMITTED; any other isolation level is refused (SQLSTATE 25000).

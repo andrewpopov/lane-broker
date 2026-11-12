@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { LANE_SQL_DIR } from '../src/lane-db.js';
+import { LANE_SQL_DIR, applyDatabaseAcls, applyMigrations } from '../src/lane-db.js';
 import { pgSkipOption } from './lane-db-harness.js';
 import { startDispatchCluster, World, logins, call, enqueue, claim, tid } from './lane-dispatch-fixture.js';
 
@@ -140,6 +140,21 @@ describe('lane_dispatch schema and ACLs', { skip: pgSkipOption, timeout: 180000 
               has_database_privilege('public', current_database(), 'TEMP') AS temp, has_schema_privilege('public', 'public', 'USAGE') AS public_usage`);
     assert.deepEqual(acl, { connect: false, creates: false, temp: false, public_usage: false });
     await assert.rejects(cluster.client(world.db, logins.stranger), /permission denied for database|not currently accepting connections/);
+  });
+
+  test('applyDatabaseAcls is opt-in for applyMigrations, and refuses a database that holds a schema besides lane, lane_dispatch and public', async () => {
+    const publicConnect = (c) => c.query("SELECT has_database_privilege('public', current_database(), 'CONNECT') AS v").then((r) => r.rows[0].v);
+    const shared = await cluster.client(await cluster.freshDb());
+    await shared.query('CREATE SCHEMA app');
+    await assert.rejects(applyDatabaseAcls(shared), /refusing to revoke database ACLs.*\bapp\b/);
+    await assert.rejects(applyMigrations(shared, { databaseAcls: true }), /refusing to revoke database ACLs/);
+    assert.equal(await publicConnect(shared), true, 'nothing was revoked');
+
+    const own = await cluster.client(await cluster.freshDb());
+    await applyMigrations(own);
+    assert.equal(await publicConnect(own), true, 'applyMigrations leaves the database ACLs alone by default');
+    await applyMigrations(own, { databaseAcls: true });
+    assert.equal(await publicConnect(own), false, 'and revokes them when asked');
   });
 
   test('legacy lane_agent_h1 has no lane_dispatch principal, so every agent function refuses it', () => legacyIsRefused(world));
