@@ -13,7 +13,7 @@ import { connect, claimNext, applyMigrations } from '../src/lane-db.js';
 // so a run meant for PG17 can never silently test whatever else is installed.
 const BIN_DIRS = process.env.LANE_TEST_PG_BIN
   ? [process.env.LANE_TEST_PG_BIN]
-  : ['/opt/homebrew/bin', '/opt/homebrew/opt/postgresql@16/bin', '/usr/lib/postgresql/16/bin', '/usr/lib/postgresql/17/bin'];
+  : ['/opt/homebrew/bin', '/opt/homebrew/opt/postgresql@16/bin', '/usr/lib/postgresql/16/bin', '/usr/lib/postgresql/17/bin', '/usr/lib/postgresql/18/bin'];
 
 function findBin() {
   for (const dir of BIN_DIRS) {
@@ -24,6 +24,10 @@ function findBin() {
 
 /** Why the Postgres tests cannot run here, or null when they can. Tests skip with this message. */
 export const PG_SKIP_REASON = findBin() ? null : 'postgres binaries (initdb, pg_ctl, postgres) not found; set LANE_TEST_PG_BIN or install PostgreSQL';
+
+/** LANE_TEST_REQUIRE_PG=1 turns "no postgres found" from a skip into a failure, for a lane that must really exercise it. */
+export const PG_REQUIRED = process.env.LANE_TEST_REQUIRE_PG === '1';
+export const pgSkipOption = PG_REQUIRED ? false : PG_SKIP_REASON ?? false;
 
 /** The environment for every child: git's exported repo-local vars must never reach a test process. */
 function cleanEnv() {
@@ -66,6 +70,7 @@ export class PgCluster {
   }
 
   static start() {
+    if (PG_SKIP_REASON) throw new Error(PG_SKIP_REASON);
     const dir = fs.mkdtempSync('/tmp/lbpg-');
     const port = 20000 + Math.floor(Math.random() * 40000);
     const cluster = new PgCluster(dir, port);
