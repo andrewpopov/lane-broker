@@ -141,7 +141,7 @@ export class PgCluster {
       transform: (text) => {
         if (!mutate || !text.includes(mutate[0])) return text;
         mutated = true;
-        return text.replace(mutate[0], mutate[1]);
+        return text.replace(mutate[0], () => mutate[1]);
       },
     });
     if (!mutated) throw new Error(`mutation target not found in sql/lane: ${mutate[0]}`);

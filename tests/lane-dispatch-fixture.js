@@ -3,11 +3,11 @@ import { applyDatabaseAcls } from '../src/lane-db.js';
 import { PgCluster, roleNames, gid } from './lane-db-harness.js';
 
 export const logins = {
-  a1: 'lane_agent_a1', a2: 'lane_agent_a2', s1: 'lane_submit_s1', s2: 'lane_submit_s2',
+  a1: 'lane_agent_a1', a2: 'lane_agent_a2', x: 'lane_agent_x', s1: 'lane_submit_s1', s2: 'lane_submit_s2',
   admin: roleNames.admin, reader: roleNames.reader, legacy: roleNames.agent1, stranger: 'lane_stranger',
 };
 
-const NEW_LOGINS = [[logins.a1, 'lane_agent'], [logins.a2, 'lane_agent'], [logins.s1, 'lane_submit'], [logins.s2, 'lane_submit']];
+const NEW_LOGINS = [[logins.a1, 'lane_agent'], [logins.a2, 'lane_agent'], [logins.x, 'lane_agent'], [logins.s1, 'lane_submit'], [logins.s2, 'lane_submit']];
 
 /** Cluster-level setup the SQL files deliberately leave out (docs/lane-dispatch-db-runbook.md). */
 async function setUpClusterRoles(cluster) {
@@ -42,6 +42,7 @@ export class World {
     const admin = await world.as(logins.admin);
     await call(admin, 'ld_set_principal', logins.a1, 'agent', 'a1', ['linux', 'fast'], ['repoA'], 2);
     await call(admin, 'ld_set_principal', logins.a2, 'agent', 'a2', ['linux'], ['*'], 1);
+    await call(admin, 'ld_set_principal', logins.x, 'agent', 'x', [], ['*'], 1);
     await call(admin, 'ld_set_principal', logins.s1, 'submit', null, [], [], 1);
     await call(admin, 'ld_set_principal', logins.s2, 'submit', null, [], [], 1);
     return world;
@@ -78,3 +79,36 @@ export const finish = (client, claimed, result = { kind: 'ok', exitCode: 0 }) =>
 export const start = (client, claimed) => call(client, 'ld_start', claimed.id, claimed.epoch, claimed.token);
 export const heartbeat = (client, claimed) => call(client, 'ld_heartbeat', claimed.id, claimed.epoch, claimed.token);
 export const release = (client, claimed, proof = 'never-started') => call(client, 'ld_release', claimed.id, claimed.epoch, claimed.token, proof);
+
+export const reassert = (client, items) => call(client, 'ld_reassert', JSON.stringify(items));
+export const asItem = (claimed, phase = 'running') => ({ id: claimed.id, epoch: claimed.epoch, token: claimed.token, phase });
+
+/** A restore, as far as the queue can tell: the recorded timeline no longer matches the cluster's. */
+export async function simulateRestore(world) {
+  const su = await world.su();
+  await su.query('UPDATE lane_dispatch.cluster SET timeline = timeline + 1000');
+}
+
+/** Resolves once `pid` is waiting on a lock, so a test controls the order in which blocked calls queue. */
+export async function waitBlocked(world, pid) {
+  const su = await world.cluster.client(world.db);
+  try {
+    for (let i = 0; i < 400; i++) {
+      const { rows } = await su.query("SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock'", [pid]);
+      if (rows.length) return;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+  } finally {
+    await su.end();
+    world.cluster.clients.delete(su);
+  }
+  throw new Error(`backend ${pid} never blocked on a lock`);
+}
+
+/** A second superuser connection that holds a lock until released, with `sql` as the lock. */
+export async function holdLock(w, sql) {
+  const holder = await w.cluster.client(w.db);
+  await holder.query('BEGIN');
+  await holder.query(sql);
+  return { release: () => holder.query('COMMIT') };
+}

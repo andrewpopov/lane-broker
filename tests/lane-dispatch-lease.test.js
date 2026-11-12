@@ -225,10 +225,11 @@ const SEMANTICS = {
 
 const CANARIES = [
   ['ld_claim refuses past max_claims', 'IF v_held >= v_me.max_claims THEN', 'IF false THEN'],
-  ['ld_claim never hands out a ticket whose requires_tags the principal lacks', 'AND t.requires_tags <@ v_me.tags', ''],
-  ['ld_claim never hands out a ticket outside the principal allowed_repos', "AND (t.repo_key = ANY (v_me.allowed_repos) OR '*' = ANY (v_me.allowed_repos))", ''],
+  ['ld_claim never hands out a ticket whose requires_tags the principal lacks', 'p_requires_tags <@ p_tags AND ', ''],
+  ['ld_claim never hands out a ticket outside the principal allowed_repos', " AND (p_repo_key = ANY (p_allowed_repos) OR '*' = ANY (p_allowed_repos))", ''],
   ['ld_start refuses a ticket with cancel_requested', 'IF v_t.cancel_requested THEN RETURN false; END IF;', ''],
   ['ld_start refuses an expired lease', 'IF v_t.lease_until <= clock_timestamp() THEN RETURN false; END IF;', ''],
+  ['ld_start refuses a stale epoch, a stale token and another host', 'AND p_row_epoch = p_epoch', ''],
   ['ld_finish is fenced unless id, epoch, token and host match a non-terminal row', 'AND p_row_token = p_token', ''],
   ['a duplicate req returns the stored outcome and never takes a second ticket', 'WHERE c.login_role = session_user AND c.req = p_req', 'WHERE false AND c.req = p_req'],
   ['ld_withdraw returns withdrawn only for a committed queued to withdrawn', "IF v_state = 'queued' THEN", 'IF true THEN'],

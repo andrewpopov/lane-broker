@@ -43,6 +43,7 @@ CREATE TABLE lane_dispatch.tickets (
   host text,
   lease_until timestamptz,
   cancel_requested boolean NOT NULL DEFAULT false,
+  reasserted_incarnation int,
   urls jsonb,
   result jsonb,
   created_at timestamptz NOT NULL DEFAULT now(),
