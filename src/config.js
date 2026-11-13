@@ -564,7 +564,7 @@ const decodedQueryKeys = (raw) => {
 };
 
 /** Why `laneQueueUrl` is not a single direct endpoint of the lane queue database, or null. Checked on what pg connects to (`parse`), not on the raw text. */
-function laneQueueUrlProblem(raw) {
+export function laneQueueUrlProblem(raw) {
   if (typeof raw !== 'string' || !/^postgres(ql)?:\/\//.test(raw)) return 'must be a postgres:// URL';
   let keys;
   try {
