@@ -268,6 +268,7 @@ export const DEFAULT_GLOBAL_CONFIG = {
     quarantineLostAfterMs: 1_800_000,
     blobGc: true,
     blobRefreshAfterDays: 7,
+    rowRetentionMs: 7 * 24 * 3_600_000,
     rustfs: { region: 'us-east-1', snapBucket: 'lane-snap', outBucket: 'lane-out' },
   },
 };
@@ -594,7 +595,7 @@ export function laneQueueUrlProblem(raw) {
   return null;
 }
 
-const LANE_PULL_NUMBERS = ['pollMs', 'urlTtlSec', 'urlRefreshSec', 'quarantineLostAfterMs', 'blobRefreshAfterDays'];
+const LANE_PULL_NUMBERS = ['pollMs', 'urlTtlSec', 'urlRefreshSec', 'quarantineLostAfterMs', 'blobRefreshAfterDays', 'rowRetentionMs'];
 const LANE_PULL_PATHS = ['passwordFile', 'caFile', 'ledgerDir'];
 const RUSTFS_STRINGS = ['region', 'snapBucket', 'outBucket', 'credentialsEnvFile'];
 
