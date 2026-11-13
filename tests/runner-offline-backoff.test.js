@@ -9,6 +9,7 @@ import {
 } from '../src/runner-unreachable.js';
 import { selectRunner } from '../src/remote-client.js';
 import { loadGlobalConfig, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
+import { applyOfflineMarks } from '../src/runner-offline.js';
 import { paths } from '../src/state.js';
 import { tmpDir } from './remote-harness.js';
 import { freshEnv, writeGlobalConfig, laneRun } from './helpers.js';
@@ -123,8 +124,8 @@ test('runner offline/online: round trip through the state file, idempotent, conf
 
   const first = await fx.lane('offline', 'skybox');
   assert.equal(first.code, 0, first.stderr);
-  assert.equal(first.stdout, 'runner skybox: offline (changed)\n');
-  assert.equal((await fx.lane('offline', 'skybox')).stdout, 'runner skybox: offline (unchanged, already marked)\n');
+  assert.equal(first.stdout, `runner skybox: offline (changed; ${paths(fx.state).runnerOffline})\n`);
+  assert.equal((await fx.lane('offline', 'skybox')).stdout, `runner skybox: offline (unchanged, already marked; ${paths(fx.state).runnerOffline})\n`);
   assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(paths(fx.state).runnerOffline, 'utf8'))), ['skybox']);
   assert.equal(fs.readFileSync(path.join(fx.home, 'config.json'), 'utf8'), configBefore);
   const [skybox, wintop] = fx.load().runners;
@@ -134,8 +135,8 @@ test('runner offline/online: round trip through the state file, idempotent, conf
   assert.deepEqual(status.map((r) => [r.name, r.state, r.offlineSource]), [['skybox', 'offline', 'cli'], ['wintop', 'up', null]]);
   assert.match((await fx.lane('status')).stdout, /skybox {2}offline \(lane runner offline, since \d\d:\d\d\)/);
 
-  assert.equal((await fx.lane('online', 'skybox')).stdout, 'runner skybox: online (changed)\n');
-  assert.equal((await fx.lane('online', 'skybox')).stdout, 'runner skybox: online (unchanged, was not marked)\n');
+  assert.equal((await fx.lane('online', 'skybox')).stdout, `runner skybox: online (changed; ${paths(fx.state).runnerOffline})\n`);
+  assert.equal((await fx.lane('online', 'skybox')).stdout, `runner skybox: online (unchanged, was not marked; ${paths(fx.state).runnerOffline})\n`);
   assert.equal(fx.load().runners[0].offline, undefined);
 });
 
@@ -171,4 +172,49 @@ test('overlay: a marked runner is skipped by placement ("marked offline") and no
   await runnerWatchOnce(fx.state, { cfg, sshBin: ssh.bin, now: NOW });
   assert.equal(ssh.callsTo('skybox-runner'), 0, 'the watcher does not ping an overlay-offline runner');
   assert.equal(ssh.callsTo('wintop-runner') > 0, true);
+});
+
+test('overlay: a runner named like an Object.prototype property is not offline without a mark', async () => {
+  const fx = await cliFixture({ runners: [{ name: 'constructor', ssh: 'c-runner' }] });
+  assert.equal(fx.load().runners[0].offline, undefined);
+  assert.equal(applyOfflineMarks({ runners: [{ name: 'toString' }] }, {}).runners[0].offline, undefined);
+});
+
+test('watch backoff: a tick 59.9 s after a failed ping still pings (tick jitter slack)', async () => {
+  const root = tmpDir('backoff-slack');
+  const ssh = fakeSsh();
+  ssh.fail('skybox-runner');
+  await runnerWatchOnce(root, { cfg: CFG, sshBin: ssh.bin, now: NOW });
+  await runnerWatchOnce(root, { cfg: CFG, sshBin: ssh.bin, now: NOW + 59_900 });
+  assert.equal(ssh.callsTo('skybox-runner'), 2);
+});
+
+test('watch: after offline then online, a runner with no running clock is not vouched for by its old last-ok', async () => {
+  const root = tmpDir('backoff-vouch');
+  const ssh = fakeSsh();
+  await runnerWatchOnce(root, { cfg: CFG, sshBin: ssh.bin, now: NOW });
+  assert.deepEqual(heartbeatUpRunners(root, CFG, NOW), ['skybox', 'wintop']);
+  const offline = { ...CFG, runners: [{ ...SKYBOX, offline: true }, WINTOP] };
+  await runnerWatchOnce(root, { cfg: offline, sshBin: ssh.bin, now: NOW + MIN });
+  assert.deepEqual(heartbeatUpRunners(root, CFG, NOW + MIN), ['wintop'], 'skybox was not pinged this tick and has no clock: nothing vouches for it');
+});
+
+test('runner online: clears a mark whose runner left the config; exit 2 only when there is neither', async () => {
+  const fx = await cliFixture();
+  await fx.lane('offline', 'skybox');
+  writeGlobalConfig(fx.home, { version: 1, runners: [WINTOP] });
+  const first = await fx.lane('online', 'skybox');
+  assert.equal(first.code, 0, first.stderr);
+  assert.match(first.stdout, /^runner skybox: online \(changed/);
+  assert.equal((await fx.lane('online', 'skybox')).code, 2);
+});
+
+test('runner status and offline: a corrupt marks file is named on stderr and ignored', async () => {
+  const fx = await cliFixture();
+  fs.writeFileSync(paths(fx.state).runnerOffline, '{not json');
+  for (const args of [['status'], ['offline', 'wintop']]) {
+    const res = await fx.lane(...args);
+    assert.equal(res.code, 0, res.stderr);
+    assert.match(res.stderr, new RegExp(`${paths(fx.state).runnerOffline.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')} is unreadable`));
+  }
 });

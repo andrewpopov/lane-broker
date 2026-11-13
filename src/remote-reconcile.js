@@ -91,7 +91,7 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
   if (!runner) return { settled: false, state: 'unreachable', reason: 'runner not configured' };
 
   if (pinnedRunner ? configured?.offline : runner.offline) {
-    return publishSettled(root, id, attempt, resultPath, 'lost', () => lostResult(id, attempt, 'runner-offline', `runner ${runner.name} is marked offline in the config; not contacted`), { self });
+    return publishSettled(root, id, attempt, resultPath, 'lost', () => lostResult(id, attempt, 'runner-offline', `runner ${runner.name} is marked offline ${(pinnedRunner ? configured : runner).offlineSource === 'cli' ? '(lane runner offline)' : 'in the config'}; not contacted`), { self });
   }
   const publishUnreachable = (since) => {
     const unreachableMs = now - since;
