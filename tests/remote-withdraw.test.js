@@ -1,4 +1,4 @@
-import test, { mock } from 'node:test';
+import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { freshEnv, writeGlobalConfig, laneRun, sleep, waitFor, BIN } from './helpers.js';
 import { makeTmpDir } from './helpers/tmp.js';
+import { recordFsyncs } from './helpers/fsync-recorder.js';
 import { enqueue, tryStart, listQueue } from '../src/scheduler.js';
 import { listLeases } from '../src/lease.js';
 import { withdrawLane, remoteTicketState } from '../src/remote-runner.js';
@@ -343,24 +344,14 @@ test('a retry between the broker result and the remote result still answers with
 test('durability: the idempotent answer fsyncs the marker directory, and creating withdraw/ fsyncs its parent', async () => {
   const { state } = freshEnv();
   await enqueue(state, ticketOf('a'));
-  const opened = new Map();
-  const synced = [];
-  const open = fs.openSync;
-  mock.method(fs, 'openSync', (p, ...rest) => {
-    const fd = open(p, ...rest);
-    opened.set(fd, String(p));
-    return fd;
-  });
-  mock.method(fs, 'fsyncSync', (fd) => {
-    synced.push(opened.get(fd));
-  });
+  const recorder = recordFsyncs();
   try {
     assert.equal(await withdrawLane(state, 'a'), 'withdrawn');
-    assert.ok(synced.includes(state), `creating withdraw/ fsyncs the state root; synced: ${synced.join(', ')}`);
-    synced.length = 0;
+    assert.ok(recorder.fsyncedPaths().includes(state), `creating withdraw/ fsyncs the state root; synced: ${recorder.fsyncedPaths().join(', ')}`);
+    recorder.events.length = 0;
     assert.equal(await withdrawLane(state, 'a'), 'withdrawn');
-    assert.deepEqual(synced, [paths(state).withdraw], 'the idempotent path fsyncs the marker directory before answering');
+    assert.deepEqual(recorder.fsyncedPaths(), [paths(state).withdraw], 'the idempotent path fsyncs the marker directory before answering');
   } finally {
-    mock.restoreAll();
+    recorder.stop();
   }
 });

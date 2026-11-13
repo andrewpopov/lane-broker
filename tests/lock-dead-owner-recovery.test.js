@@ -20,7 +20,7 @@ const ITERATIONS = 50;
 // sensitivity proof that this suite still catches the bug it guards.
 const ROUNDS = Number(process.env.LANE_BROKER_TEST_ROUNDS) || 4;
 
-function workerSource(stateJsUrl, root, resultFile, iterations = ITERATIONS, rendezvous = false) {
+function workerSource(stateJsUrl, root, resultFile, iterations = ITERATIONS, rendezvousMs = 0) {
   return `
 import { withLock } from ${JSON.stringify(stateJsUrl)};
 import fs from 'node:fs';
@@ -35,18 +35,25 @@ for (let i = 0; i < ${iterations}; i++) {
     await withLock(root, async () => {
       if (fs.existsSync(marker)) overlaps += 1;
       fs.writeFileSync(marker, String(process.pid));
-      if (${rendezvous}) {
-        // Hold the critical section until BOTH contenders have entered it, so
-        // an admitted second holder is observed as an overlap every run.
+      if (${rendezvousMs}) {
+        // Hold the critical section until ANOTHER contender is inside it too, so
+        // an admitted second holder is observed as an overlap every run. Each
+        // worker's marker exists only while it is inside, so a marker of
+        // someone else can only mean two holders at once; the marker check
+        // above can miss that when both contenders test before either writes.
         const dir = path.dirname(marker);
-        fs.writeFileSync(path.join(dir, 'entered-' + process.pid), '');
-        const stop = Date.now() + 10000;
-        while (fs.readdirSync(dir).filter((f) => f.startsWith('entered-')).length < 2 && Date.now() < stop) {
+        const mine = path.join(dir, 'entered-' + process.pid);
+        const others = () => fs.readdirSync(dir).filter((f) => f.startsWith('entered-') && f !== path.basename(mine));
+        fs.writeFileSync(mine, '');
+        const stop = Date.now() + ${rendezvousMs};
+        while (others().length === 0 && Date.now() < stop) {
           await new Promise((r) => setTimeout(r, 1));
         }
+        if (others().length > 0) overlaps += 1;
+        fs.rmSync(mine, { force: true });
       }
       await new Promise((r) => setTimeout(r, 5));
-      fs.unlinkSync(marker);
+      fs.rmSync(marker, { force: true });
     });
   } catch (err) {
     escaped += 1;
@@ -75,14 +82,14 @@ function plantDeadLock(state, deadPid, token) {
   );
 }
 
-async function runRound({ base, state }, stateJsUrl, deadPid, round, { workers = WORKERS, iterations = ITERATIONS, rendezvous = false } = {}) {
+async function runRound({ base, state }, stateJsUrl, deadPid, round, { workers = WORKERS, iterations = ITERATIONS, rendezvousMs = 0 } = {}) {
   plantDeadLock(state, deadPid, `dead-${round}`);
 
   const runs = [];
   for (let w = 0; w < workers; w += 1) {
     const scriptFile = path.join(base, `worker-${round}-${w}.mjs`);
     const resultFile = path.join(base, `result-${round}-${w}.json`);
-    fs.writeFileSync(scriptFile, workerSource(stateJsUrl, state, resultFile, iterations, rendezvous));
+    fs.writeFileSync(scriptFile, workerSource(stateJsUrl, state, resultFile, iterations, rendezvousMs));
     runs.push({ scriptFile, resultFile });
   }
 
@@ -127,6 +134,14 @@ test('dead-owner lock recovery: many contenders observing the same dead owner ne
 
   assert.equal(totalEscaped, 0, `expected zero escaped errors across ${ROUNDS} rounds`);
   assert.equal(totalOverlaps, 0, `expected zero overlaps across ${ROUNDS} rounds of a freshly-planted dead lock`);
+});
+
+test('CONTROL: the rendezvous round against the real lock reports no overlap, so the mutation test measures the mutation', async () => {
+  const env = freshEnv();
+  const deadPid = await spawnDeadPid();
+  const { overlaps, escaped } = await runRound(env, pathToFileURL(stateJsPath).href, deadPid, 0, { workers: 2, iterations: 2, rendezvousMs: 300 });
+  assert.equal(escaped, 0);
+  assert.equal(overlaps, 0, 'the rendezvous harness reports an overlap against the correct lock');
 });
 
 test('MUTATION: the pre-fix blind rmSync reintroduces overlap on the same dead-owner scenario', async () => {
@@ -181,7 +196,7 @@ test('MUTATION: the pre-fix blind rmSync reintroduces overlap on the same dead-o
   const { overlaps: totalOverlaps, escaped: totalEscaped } = await runRound(env, stateJsUrl, deadPid, 0, {
     workers: MUTANT_WORKERS,
     iterations: MUTANT_ITERATIONS,
-    rendezvous: true,
+    rendezvousMs: 10000,
   });
 
   fs.rmSync(mutantDir, { recursive: true, force: true });
