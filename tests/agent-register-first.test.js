@@ -28,7 +28,7 @@ const SCENARIOS = {
   },
 };
 
-describe('agent register-first gate on a disposable Postgres', { skip: pgSkipOption, timeout: 300000 }, () => {
+describe('agent register-first on a disposable Postgres', { skip: pgSkipOption, timeout: 300000 }, () => {
   let cluster;
   before(async () => { cluster = await startDispatchCluster(); });
   after(async () => { await cluster?.closeClients(); cluster?.stop(); });
@@ -39,12 +39,12 @@ describe('agent register-first gate on a disposable Postgres', { skip: pgSkipOpt
   }
 
   for (const name of Object.keys(SCENARIOS)) {
-    test(`canary: with the gate bypassed, "${name}" fails on its own call-order assertion`, async (t) => {
-      const bypassed = ['        await this.#gate();\n', "        this.registered ??= { host: 'a1' };\n"];
+    test(`canary: with registration bypassed, "${name}" fails on its own call-order assertion`, async (t) => {
+      const bypassed = ["      this.registered = await this.#sql('ld_register', [this.version, PROTOCOL, this.schedule === null ? null : JSON.stringify(this.schedule)]);\n", "      this.registered ??= { host: 'a1' };\n"];
       const mutant = await importMutant(path.join(import.meta.dirname, '..', 'src', 'agent', 'ld-client.js'), bypassed);
       let failure;
       await SCENARIOS[name](await World.create(cluster), { LdClient: mutant.LdClient }).catch((err) => { failure = err; });
-      assert.ok(failure, `"${name}" still passed with the gate bypassed, so it proves nothing`);
+      assert.ok(failure, `"${name}" still passed with registration bypassed, so it proves nothing`);
       assert.equal(failure.code, 'ERR_ASSERTION', `it must fail on its assertion, not crash: ${failure.stack}`);
       assert.match(failure.message, /ld_register/);
       t.diagnostic(`failed as expected: ${failure.message.split('\n').join(' ').slice(0, 200)}`);

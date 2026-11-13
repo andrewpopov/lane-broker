@@ -11,7 +11,10 @@ export const AGENT_CONFIG_DIR = path.join(os.homedir(), '.config', 'lane-agent')
 
 export const MAX_SPEED_FACTOR = 4;
 
-const DEFAULTS = { stopClaimingBeforeCloseMs: 30 * 60_000, requireAcPower: false, pollMs: 15_000, urlWaitMs: 60_000, speedFactor: 1 };
+// A dead peer must surface as an error the client retries, not a hung query: keepalive probes, a connect bound, and a client-side bound above the role's 2 s statement_timeout.
+export const PG_LIVENESS = Object.freeze({ keepAlive: true, connectionTimeoutMillis: 10_000, query_timeout: 20_000 });
+
+const DEFAULTS = { stopClaimingBeforeCloseMs: 30 * 60_000, requireAcPower: false, pollMs: 15_000, speedFactor: 1 };
 const KNOWN = new Set(['laneQueueUrl', 'passwordFile', 'caFile', 'schedule', ...Object.keys(DEFAULTS)]);
 
 // One descriptor, no symlink followed: the mode and owner checked are those of the bytes returned.
@@ -76,12 +79,11 @@ export function loadAgentConfig({ file = path.join(AGENT_CONFIG_DIR, 'config.jso
   if (cfg.requireAcPower !== undefined && typeof cfg.requireAcPower !== 'boolean') throw new AgentConfigError('"requireAcPower" must be a boolean');
 
   return {
-    pg: { ...target, password, ssl: { ca, rejectUnauthorized: true, servername: target.host } },
+    pg: { ...target, ...PG_LIVENESS, password, ssl: { ca, rejectUnauthorized: true, servername: target.host } },
     schedule: cfg.schedule ?? null,
     stopClaimingBeforeCloseMs: positiveNumber(cfg, 'stopClaimingBeforeCloseMs'),
     requireAcPower: cfg.requireAcPower ?? DEFAULTS.requireAcPower,
     pollMs: positiveNumber(cfg, 'pollMs'),
-    urlWaitMs: positiveNumber(cfg, 'urlWaitMs'),
     speedFactor: positiveNumber(cfg, 'speedFactor', { max: MAX_SPEED_FACTOR }),
   };
 }

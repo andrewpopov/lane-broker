@@ -8,7 +8,7 @@ export async function openAgentCore({ remoteRoot, config, version, log = (line) 
   const table = new ExecutionTable(remoteRoot);
   let listenError = null;
   const status = (extra = {}) => ({
-    gen: ld.gen, host: ld.registered?.host, executions: table.all().map((r) => ({ execId: r.execId, subphase: r.subphase })), listenError, ...extra,
+    host: ld.registered?.host, executions: table.all().map((r) => ({ execId: r.execId, subphase: r.subphase })), listenError, ...extra,
   });
   const wake = (event) => {
     if (event.reason === 'listen-failed') {

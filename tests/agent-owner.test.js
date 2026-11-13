@@ -97,15 +97,15 @@ test('T25 the owner may claim again (an agent restarting under its own pid)', as
 test('--status reads the live owner\'s last status.json tick, and reports no-owner before any owner exists', async () => {
   assert.deepEqual(readAgentStatus(remoteRoot), { state: 'no-owner' });
   await claimOwner(remoteRoot);
-  writeStatus(remoteRoot, { gen: 3, executions: [] });
+  writeStatus(remoteRoot, { host: 'a1', executions: [] });
   const status = readAgentStatus(remoteRoot);
-  assert.deepEqual([status.state, status.gen, status.pid], ['running', 3, process.pid]);
-  assert.equal(JSON.parse(fs.readFileSync(agentPaths(remoteRoot).status, 'utf8')).gen, 3);
+  assert.deepEqual([status.state, status.host, status.pid], ['running', 'a1', process.pid]);
+  assert.equal(JSON.parse(fs.readFileSync(agentPaths(remoteRoot).status, 'utf8')).host, 'a1');
 });
 
 test('--status reports no-owner once the owner that wrote the last tick has died', async () => {
   const child = await liveForeignOwner();
-  writeStatus(remoteRoot, { gen: 1, executions: [] });
+  writeStatus(remoteRoot, { host: 'a1', executions: [] });
   assert.equal(readAgentStatus(remoteRoot).state, 'running');
   child.kill('SIGKILL');
   await new Promise((resolve) => child.once('exit', resolve));

@@ -12,11 +12,11 @@ const claim = { id: ID, epoch: 2, token: TOKEN, repo_key: 'repoA', lane: 'test',
 const at = (subphase, outbox) => ({ ...newExecutionRecord(claim), subphase, ...(outbox && { outbox }) });
 const freshRoot = () => path.join(makeTmpDir('agent-records-'), 'remote');
 
-test('a new record carries the claim, the execution id and a zero log cursor', () => {
+test('a new record carries the claim, and the execution id', () => {
   const record = newExecutionRecord(claim, { now: 1234 });
   assert.deepEqual(record, {
     id: ID, epoch: 2, token: TOKEN, execId: `${ID}.e2`, claim: { repoKey: 'repoA', lane: 'test', laneKey: 'lk', binding: { protocol: 1 }, header: { cmd: ['true'] }, snapshot: { key: 'snap' } },
-    subphase: 'AWAIT_URLS', claimedAt: 1234, kernelBootId: null, logCursor: { seq: 0, offset: 0, len: 0 },
+    subphase: 'FETCHING', claimedAt: 1234, kernelBootId: null,
   });
 });
 

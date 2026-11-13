@@ -26,9 +26,10 @@ test('T5 a valid config builds a verify-full pg config with the password from it
   const config = load(file);
   assert.deepEqual(config.pg, {
     host: 'pitelite', port: 5432, database: 'lane_queue', user: 'lane_agent_wintop', password: 'hunter2',
+    keepAlive: true, connectionTimeoutMillis: 10_000, query_timeout: 20_000,
     ssl: { ca: 'CA PEM\n', rejectUnauthorized: true, servername: 'pitelite' },
   });
-  assert.deepEqual([config.speedFactor, config.pollMs, config.urlWaitMs, config.requireAcPower, config.schedule], [1, 15_000, 60_000, false, null]);
+  assert.deepEqual([config.speedFactor, config.pollMs, config.requireAcPower, config.schedule], [1, 15_000, false, null]);
 });
 
 test('T5 a relative passwordFile and caFile resolve against the config directory, not the cwd', () => {

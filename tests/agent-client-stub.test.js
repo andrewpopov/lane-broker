@@ -7,6 +7,7 @@ import { LdClient, LdClosedError, NOT_LIVE, isRetryable } from '../src/agent/ld-
 import { openAgentCore } from '../src/agent/agent.js';
 import { agentPaths, ensureAgentDirs } from '../src/agent/store.js';
 import { readJsonSafe } from '../src/state.js';
+import { importMutant } from './helpers/mutant-module.js';
 
 const ID = '11111111-1111-4111-8111-111111111111';
 const TOKEN = '22222222-2222-4222-8222-222222222222';
@@ -34,27 +35,12 @@ afterEach(async () => {
   else process.env.LANE_BROKER_STATE = savedState;
 });
 
-function newClient(stub, extra = {}) {
+function newClient(stub, extra = {}, Client = LdClient) {
   const events = [];
-  const client = new LdClient({ pg: {}, version: 't', connect: stub.connect, backoff: BACKOFF, onWake: (e) => events.push(e), ...extra });
+  const client = new Client({ pg: {}, version: 't', connect: stub.connect, backoff: BACKOFF, onWake: (e) => events.push(e), ...extra });
   closers.push(() => client.close());
   return { client, events };
 }
-
-test('a work NOTIFY heard while a LISTEN reconnect is still subscribing cannot reach the server ahead of ld_register', async () => {
-  const stub = makeStubPg();
-  let client;
-  const claims = [];
-  ({ client } = newClient(stub, { onWake: (e) => { if (e.reason === 'notify') claims.push(client.claim('44444444-4444-4444-8444-444444444444', 8, 1e9)); } }));
-  await client.open();
-  stub.sqlLog.length = 0;
-  stub.onListen = (c, n) => { if (n === 1) c.emit('notification', { channel: 'ld_work' }); };
-  const old = stub.listenClient();
-  old.emit('end');
-  await untilTrue('the reconnect finished', () => stub.listenClient() !== old && stub.listenClient()?.listens.length === 2 && claims.length === 1);
-  await Promise.all(claims);
-  assert.deepEqual(stub.names(), ['ld_register', 'ld_claim']);
-});
 
 test('a retryable ld_register failure is retried on a fresh connection before any other call is sent', async () => {
   let registers = 0;
@@ -144,3 +130,60 @@ test('a LISTEN failure after startup is logged and recorded in status.json even 
   core.tick();
   assert.equal(readJsonSafe(agentPaths(remoteRoot).status).listenError.error, '57P03', 'a later tick keeps the last LISTEN error');
 });
+
+test('a client-side timeout is retryable, like a dead connection', () => {
+  for (const message of ['Query read timeout', 'timeout exceeded when trying to connect', 'Connection terminated due to connection timeout']) assert.equal(isRetryable(new Error(message)), true, message);
+  assert.equal(isRetryable(new Error('syntax error')), false);
+});
+
+const LD_CLIENT = path.join(import.meta.dirname, '..', 'src', 'agent', 'ld-client.js');
+const RESULT = { kind: 'ok', exitCode: 0 };
+const FINISHED = { fenced: false, state: 'finished' };
+
+const TURN_SCENARIOS = {
+  'a heartbeat completes while another call keeps failing 57014: the failing call yields its turn after two attempts': async (Client) => {
+    const stub = makeStubPg({ answers: { ld_claim: () => { throw sqlError('57014'); } } });
+    const { client } = newClient(stub, {}, Client);
+    await client.open();
+    stub.sqlLog.length = 0;
+    client.claim('44444444-4444-4444-8444-444444444444', 8, 1e9).catch(() => {});
+    const heartbeat = client.heartbeat(ID, 1, TOKEN);
+    const outcome = await Promise.race([heartbeat.then(() => 'sent'), new Promise((resolve) => setTimeout(resolve, 1500, 'starved'))]);
+    assert.equal(outcome, 'sent', `the heartbeat starved behind the failing claim: ${stub.names().join(',')}`);
+    assert.deepEqual(stub.names().filter((n) => n !== 'ld_register').slice(0, 3), ['ld_claim', 'ld_claim', 'ld_heartbeat']);
+  },
+
+  'a call re-queued at the tail keeps its promise and request, and persist runs once, on the real answer': async (Client) => {
+    let finishes = 0;
+    const stub = makeStubPg({ answers: { ld_finish: () => { if (finishes++ < 2) throw sqlError('57014'); return FINISHED; } } });
+    const { client } = newClient(stub, {}, Client);
+    await client.open();
+    stub.sqlLog.length = 0;
+    const persisted = [];
+    const finish = client.finish(ID, 1, TOKEN, RESULT, { persist: (answer) => { persisted.push(answer); } });
+    const heartbeat = client.heartbeat(ID, 1, TOKEN);
+    assert.deepEqual(await finish, FINISHED);
+    await heartbeat;
+    assert.deepEqual(persisted, [FINISHED], 'persist ran once, with the real answer');
+    assert.deepEqual(stub.names().filter((n) => n !== 'ld_register'), ['ld_finish', 'ld_finish', 'ld_heartbeat', 'ld_finish']);
+    const sent = stub.sqlLog.filter((c) => c.name === 'ld_finish').map((c) => c.args);
+    assert.deepEqual(sent, [[ID, 1, TOKEN, RESULT], [ID, 1, TOKEN, RESULT], [ID, 1, TOKEN, RESULT]], 'the same request each time');
+  },
+};
+
+const TURN_CANARIES = {
+  'a heartbeat completes while another call keeps failing 57014: the failing call yields its turn after two attempts': ['const TURN_ATTEMPTS = 2;', 'const TURN_ATTEMPTS = Infinity;'],
+  'a call re-queued at the tail keeps its promise and request, and persist runs once, on the real answer': [
+    'if (answer === YIELD) return this.#enqueue(turn);', 'await persist?.(answer);\n          if (answer === YIELD) return this.#enqueue(turn);',
+  ],
+};
+
+for (const [name, scenario] of Object.entries(TURN_SCENARIOS)) {
+  test(name, () => scenario(LdClient));
+  test(`canary: with the guard removed, "${name}" fails on its own assertion`, async () => {
+    const mutant = await importMutant(LD_CLIENT, TURN_CANARIES[name]);
+    const failure = await scenario(mutant.LdClient).then(() => null, (err) => err);
+    assert.ok(failure, 'the scenario still passed without its guard, so it proves nothing');
+    assert.equal(failure.code, 'ERR_ASSERTION', failure.stack);
+  });
+}

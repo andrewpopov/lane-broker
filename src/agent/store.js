@@ -8,7 +8,7 @@ import { isProcessAlive } from '../process-liveness.js';
 export class AgentStoreError extends Error {}
 export class AgentOwnedError extends Error {}
 
-export const SUBPHASES = ['AWAIT_URLS', 'FETCHING', 'VERIFIED', 'STARTING', 'SPAWNING', 'RUNNING', 'SETTLING', 'HOLD', 'OUTBOX', 'KILLING', 'DONE'];
+export const SUBPHASES = ['FETCHING', 'STARTING', 'SPAWNING', 'RUNNING', 'SETTLING', 'OUTBOX', 'KILLING', 'DONE'];
 const OUTBOX_KINDS = ['finish', 'release'];
 
 export function agentPaths(remoteRoot) {
@@ -66,7 +66,7 @@ export function newExecutionRecord(claim, { now = Date.now() } = {}) {
   const { id, epoch, token, repo_key: repoKey, lane, lane_key: laneKey, binding, header, snapshot } = claim;
   return {
     id, epoch, token, execId: executionIdOf(id, epoch), claim: { repoKey, lane, laneKey, binding, header, snapshot },
-    subphase: 'AWAIT_URLS', claimedAt: now, kernelBootId: null, logCursor: { seq: 0, offset: 0, len: 0 },
+    subphase: 'FETCHING', claimedAt: now, kernelBootId: null,
   };
 }
 
