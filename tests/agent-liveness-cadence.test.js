@@ -40,6 +40,23 @@ const scenarios = {
     assert.equal(agent.names().includes('ld_claim'), false, 'outside its window it claims nothing');
   },
 
+  'a NOTIFY wake mid-interval does not stretch the gap to the next call: the wait is capped by the liveness deadline': async (w, rw, load) => {
+    const period = 400;
+    const agent = await rw.agent({ load, config: { pollMs: period }, draining: () => true });
+    const su = await w.su();
+    const from = Date.now();
+    for (let round = 0; round < 3; round++) {
+      const seen = agent.timesOf('ld_register').length;
+      await happens('a ping was sent', () => agent.timesOf('ld_register').length > seen, 3000);
+      await sleep(Math.round(period * 0.45));
+      await su.query("SELECT pg_notify('ld_work', '')");
+    }
+    await sleep(period);
+    const times = [from, ...agent.timesOf(...LIVENESS).filter((t) => t >= from), Date.now()];
+    const gaps = times.slice(1).map((t, i) => t - times[i]);
+    assert.ok(Math.max(...gaps) <= period + 100, `a NOTIFY mid-interval stretched a gap to ${Math.max(...gaps)} ms (gaps ${gaps.join(',')})`);
+  },
+
   'at max_claims, with the claim poll far away, heartbeats keep the liveness calls coming': async (w, rw, load) => {
     const ticket = await rw.submit({ code: SLEEP });
     const agent = await rw.agent({ load, login: logins.x, config: { runnerName: 'x', pollMs: 60_000 }, timing: { heartbeatMs: INTERVAL } });
@@ -64,9 +81,10 @@ const scenarios = {
 };
 
 const canaries = [
-  ['a liveness call is made every interval while idle', 'agent/run.js', ['await waker.wait(Math.max(0, config.pollMs - (now() - startedAt)));', 'await waker.wait(1e9);']],
-  ['a draining runner holding nothing still makes a call every interval', 'agent/run.js', ['now() - lastCallAt >= config.pollMs / 2', 'false']],
-  ['a runner outside its schedule window holding nothing still makes a call every interval', 'agent/run.js', ['now() - lastCallAt >= config.pollMs / 2', 'false']],
+  ['a liveness call is made every interval while idle', 'agent/run.js', ['await waker.wait(Math.max(0, Math.min(pollAt, lastLivenessAt + config.pollMs) - now()));', 'await waker.wait(1e9);']],
+  ['a draining runner holding nothing still makes a call every interval', 'agent/run.js', ['now() - lastLivenessAt >= config.pollMs', 'false']],
+  ['a runner outside its schedule window holding nothing still makes a call every interval', 'agent/run.js', ['now() - lastLivenessAt >= config.pollMs', 'false']],
+  ['a NOTIFY wake mid-interval does not stretch the gap to the next call: the wait is capped by the liveness deadline', 'agent/run.js', ['Math.min(pollAt, lastLivenessAt + config.pollMs)', 'pollAt']],
   ['at max_claims, with the claim poll far away, heartbeats keep the liveness calls coming', 'agent/execution.js', ['>= this.timing.heartbeatMs) await this.#beat(execId, context);\n    const current', '>= 1e9) await this.#beat(execId, context);\n    const current']],
   ['while settling, with an upload that never answers, heartbeats keep the liveness calls coming', 'agent/execution.js',
     ['context.abort = abort;\n    const stopBeating = this.#keepBeating(execId, context, abort.signal);\n    try {\n      const since', 'context.abort = abort;\n    const stopBeating = async () => {};\n    try {\n      const since']],

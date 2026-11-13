@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { makeTmpDir } from './helpers/tmp.js';
 import { randomUUID } from 'node:crypto';
 import { logins, call, enqueue, claim, tid } from './lane-dispatch-fixture.js';
 import { agentPg } from './agent-harness.js';
@@ -95,15 +98,36 @@ const scenarios = {
   },
 
   'an upgrade answer stops the claim loop for good: no further ld_claim, and every tick logs it': async (w, rw, load) => {
-    let armed = false;
-    const agent = await rw.agent({ load, config: { pollMs: 100 }, figures: () => (armed ? offer() : null) });
-    await (await w.su()).query("DELETE FROM lane_dispatch.runners WHERE host = 'a1'");
-    armed = true;
-    await happens('the upgrade answer is logged', () => rw.logs.some((l) => /UPGRADE REQUIRED/.test(l)));
+    const su = await w.su();
+    const agent = await rw.agent({ load, config: { pollMs: 300 } });
+    // every ping re-registers the runner, so the row is deleted again and again until the queue has answered `upgrade`
+    const remove = setInterval(() => su.query("DELETE FROM lane_dispatch.runners WHERE host = 'a1'").catch(() => {}), 15);
+    try {
+      await happens(`the upgrade answer is logged (calls ${agent.names().join(',')}; logs ${rw.logs.join(' | ')})`, () => rw.logs.some((l) => /UPGRADE REQUIRED/.test(l)), 4000);
+    } finally {
+      clearInterval(remove);
+    }
     const claimsThen = agent.callsTo('ld_claim').length;
-    await sleep(600);
+    await sleep(900);
     assert.equal(agent.callsTo('ld_claim').length, claimsThen, 'no claim after the upgrade answer');
     assert.ok(rw.logs.filter((l) => /UPGRADE REQUIRED/.test(l)).length >= 2, 'logged on every tick');
+  },
+
+  'the agent reads the stateDir it is configured with and replaces a hostile LANE_BROKER_STATE, for itself and for the lanes it spawns': async (w, rw, load) => {
+    const saved = process.env.LANE_BROKER_STATE;
+    process.env.LANE_BROKER_STATE = makeTmpDir('hostile-state-');
+    try {
+      fs.writeFileSync(path.join(rw.ctx.state, 'remote-drain.json'), JSON.stringify({ version: 1, reason: 'test', since: Date.now() }));
+      await enqueue(await w.as(logins.s1), tid(1));
+      const agent = await rw.agent({ load, config: { pollMs: 100 } });
+      await sleep(600);
+      assert.equal(process.env.LANE_BROKER_STATE, rw.ctx.state, 'the configured state dir replaced the inherited one');
+      assert.equal(agent.names().includes('ld_claim'), false, 'the drain marker in the configured state dir is honoured');
+      assert.equal(agent.driver.spawnEnv.LANE_BROKER_STATE, rw.ctx.state);
+      assert.equal(agent.driver.spawnEnv.LANE_BROKER_HOME, rw.ctx.home);
+    } finally {
+      process.env.LANE_BROKER_STATE = saved;
+    }
   },
 
   'the schedule window is respected: outside it, or too close to its close, no ld_claim is made': async (w, rw, load) => {
@@ -131,6 +155,7 @@ const canaries = [
     ["const offered = await figures();\n  if (!offered) return { status: 'skipped', reason: 'no-headroom' };", 'const offered = (await figures()) ?? { freeCpu: Infinity, freeMem: Infinity };'], /invalid input syntax for type bigint/],
   ['none leaves no pending req, and upgrade is answered, clears the req and is not an error', CLAIMS, ["a.status !== 'none' && a.status !== 'upgrade'", "a.status !== 'none'"], /ld_claim answered/],
   ['an upgrade answer stops the claim loop for good: no further ld_claim, and every tick logs it', 'agent/run.js', ["if (answer.status === 'upgrade') upgradeRequired = true;", 'if (false) upgradeRequired = true;']],
+  ['the agent reads the stateDir it is configured with and replaces a hostile LANE_BROKER_STATE, for itself and for the lanes it spawns', 'agent/run.js', ['Object.assign(process.env, brokerEnv);', '']],
   ['the schedule window is respected: outside it, or too close to its close, no ld_claim is made', CLAIMS, ["if (!available) return 'outside-schedule';", '']],
   ['the schedule window is respected: outside it, or too close to its close, no ld_claim is made', CLAIMS, ["if (reason) return { status: 'skipped', reason };", '']],
 ];

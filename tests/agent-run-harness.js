@@ -100,7 +100,7 @@ export class RunnerWorld {
     const rustfs = { ...this.rustfs, ...config.rustfs };
     const agent = await startAgent({
       remoteRoot: this.root, version: 'test', figures: () => ({ freeCpu: 8, freeMem: 4e9 }), spawnEnv: this.ctx.env, laneBin: BIN, log: (line) => this.logs.push(line),
-      config: { schedule: null, pollMs: 100, stopClaimingBeforeCloseMs: 0, speedFactor: 1, runnerName: HOST, fetchBudgetMs: 20_000, ...config, pg: agentPg(this.w, login), rustfs },
+      config: { schedule: null, pollMs: 100, stopClaimingBeforeCloseMs: 0, speedFactor: 1, runnerName: HOST, brokerHome: this.ctx.home, stateDir: this.ctx.state, fetchBudgetMs: 20_000, ...config, pg: agentPg(this.w, login), rustfs },
       s3: s3 ?? createS3Client({ endpoint: rustfs.endpoint, region: rustfs.region, creds: rustfs.creds, ...(fetchImpl ? { fetchImpl } : {}) }),
       timing: { ...FAST_TIMING, ...timing },
       coreOptions: { onCall: (name, args) => calls.push([name, args, Date.now()]), backoff: { minMs: 20, maxMs: 100 }, ...coreOptions },

@@ -73,16 +73,17 @@ const scenarios = {
     assert.equal(second.names().includes('ld_release'), false);
   },
 
-  'a recovered STARTING release refused as started is converted to the same finish, never acknowledged': async (w, rw, load) => {
+  'a recovered STARTING release refused as started is converted to a finish, never acknowledged: cancelled with its stop proven when a cancel is pending': async (w, rw, load) => {
     const { ticket, execId } = await abandonedStart(w, rw, load);
     await (await w.su()).query('UPDATE lane_dispatch.tickets SET cancel_requested = true WHERE id = $1', [ticket.id]);
     const second = await rw.agent({ load, figures: oneOffer() });
     await rw.untilGone(second, execId);
     const names = second.names();
     assert.deepEqual(second.callsTo('ld_release').map((a) => a[3]), ['never-started']);
-    assert.ok(names.indexOf('ld_release') < names.indexOf('ld_finish'), `the refused release was followed by a finish: ${names.join(',')}`);
+    assert.ok(names.indexOf('ld_release') < names.indexOf('ld_heartbeat') && names.indexOf('ld_heartbeat') < names.indexOf('ld_finish'), `the refused release, one heartbeat for the cancel, then a finish: ${names.join(',')}`);
     const final = await w.ticket(ticket.id);
-    assert.deepEqual([final.state, final.result.kind, final.result.reason], ['finished', 'rejected', 'start-uncertain']);
+    assert.deepEqual([final.state, final.result.kind, final.result.reason], ['cancelled', 'cancelled', 'start-uncertain']);
+    assert.deepEqual([final.result.stopProven, final.result.neverStarted, final.result.cancelConfirmed], [true, true, true]);
     assert.equal(fs.existsSync(rw.ticketDir(execId)), false);
   },
 
@@ -111,7 +112,8 @@ const canaries = [
   ['a cancel that lands after the last heartbeat and before ld_start: ld_start answers false, nothing is spawned, the row ends cancelled', EXEC, ['if (started !== true) this.#releasing(record);', 'if (false) this.#releasing(record);']],
   ['a drain marker after the claim releases never-started before ld_start is ever called', EXEC, ['if (this.draining()) return this.#releasing(record);', '']],
   ['a STARTING record found on restart whose ld_start answers true finishes rejected start-uncertain and spawns nothing', EXEC, ["else if (!context.mayStart) this.#rejected(record, ['STARTING'], 'start-uncertain');", "else if (false) this.#rejected(record, ['STARTING'], 'start-uncertain');"]],
-  ['a recovered STARTING release refused as started is converted to the same finish, never acknowledged', EXEC, ["(answer.refused === 'started' ? this.#rejected(record, ['OUTBOX'], 'start-uncertain') : ack())", 'ack()']],
+  ['a recovered STARTING release refused as started is converted to a finish, never acknowledged: cancelled with its stop proven when a cancel is pending', EXEC, ["(answer.refused === 'started' ? this.#cas(execId, ['OUTBOX'], { outbox: { ...outbox, refused: true } }) : ack())", 'ack()']],
+  ['a recovered STARTING release refused as started is converted to a finish, never acknowledged: cancelled with its stop proven when a cancel is pending', EXEC, ['|| beat.cancel === true;', ';']],
   ['a release whose first response was lost is acknowledged when the retry answers fenced: the record ends DONE, no kill', EXEC, [": ack())", ": answer.fenced === true ? null : ack())"]],
 ];
 

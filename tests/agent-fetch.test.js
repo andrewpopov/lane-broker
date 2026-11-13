@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { call, logins } from './lane-dispatch-fixture.js';
 import { REPO_IDENTITY, recordingFetch, cutShort, happens, scenarioSuite } from './agent-run-harness.js';
 import { blobNamespace, hasBlob } from '../src/remote-blobs.js';
 
@@ -36,7 +37,64 @@ const releasedNeverStarted = async (w, rw, run) => {
   neverSpawned(rw, run);
 };
 
+const withSeams = async (load, seams) => {
+  const { ExecutionDriver } = await load('agent/execution.js');
+  return class extends ExecutionDriver { constructor(options) { super({ ...options, ...seams }); } };
+};
+
 const scenarios = {
+  'a blob that downloads and matches but cannot be kept (publish skipped) is a local problem: retried for the budget, then released never-started, never rejected': async (w, rw, load) => {
+    const Driver = await withSeams(load, { publish: () => 'skipped' });
+    const ticket = await rw.submit({ files: [{ path: 'big.bin', bytes: BIG }] });
+    const agent = await rw.agent({ load, Driver, config: { fetchBudgetMs: 800 }, figures: oneOffer() });
+    const row = await rw.claimed(ticket);
+    await releasedNeverStarted(w, rw, { agent, ticket, execId: rw.execId(row) });
+  },
+
+  'a lease or filesystem error that keeps failing counts against the fetch budget, then releases never-started': async (w, rw, load) => {
+    const Driver = await withSeams(load, { makeLease: () => ({ renew: async () => { throw new Error('EIO: lease directory'); }, release: async () => {} }) });
+    const ticket = await rw.submit();
+    const agent = await rw.agent({ load, Driver, config: { fetchBudgetMs: 800 }, figures: oneOffer() });
+    const row = await rw.claimed(ticket);
+    await releasedNeverStarted(w, rw, { agent, ticket, execId: rw.execId(row) });
+  },
+
+  'a store that hangs is cut off at the fetch budget, not at a fresh GET deadline': async (w, rw, load) => {
+    const ticket = await rw.submit();
+    rw.s3.hang = true;
+    const agent = await rw.agent({ load, config: { fetchBudgetMs: 1500 }, figures: oneOffer() });
+    const row = await rw.claimed(ticket);
+    const claimedAt = Date.now();
+    await happens('the claim was released within the budget plus a margin', () => agent.names().includes('ld_release'), 1500 + 2500);
+    assert.ok(Date.now() - claimedAt < 1500 + 2500);
+  },
+
+  'a cancel answered to a heartbeat during FETCHING aborts the fetch and releases cancel-confirmed': async (w, rw, load) => {
+    rw.s3.hangMatching = (p) => p.includes('/lane-snap/streams/');
+    const ticket = await rw.submit();
+    const agent = await rw.agent({ load, figures: oneOffer() });
+    const row = await rw.claimed(ticket);
+    await call(await w.as(logins.s1), 'ld_cancel', ticket.id);
+    await rw.untilGone(agent, rw.execId(row), 8000);
+    assert.deepEqual(agent.callsTo('ld_release').map((a) => a[3]), ['cancel-confirmed']);
+    assert.equal((await w.ticket(ticket.id)).state, 'cancelled');
+    assert.deepEqual([agent.names().includes('ld_start'), agent.names().includes('ld_finish')], [false, false]);
+  },
+
+  'a fenced answer to a heartbeat during FETCHING aborts the fetch and ends the record with nothing sent': async (w, rw, load) => {
+    rw.s3.hangMatching = (p) => p.includes('/lane-snap/streams/');
+    const ticket = await rw.submit();
+    let cancels = 0;
+    const Driver = await withSeams(load, { cancelExecution: async () => { cancels += 1; return {}; } });
+    const agent = await rw.agent({ load, Driver, figures: oneOffer() });
+    const row = await rw.claimed(ticket);
+    await (await w.su()).query('UPDATE lane_dispatch.tickets SET claim_token = gen_random_uuid() WHERE id = $1', [ticket.id]);
+    await rw.untilGone(agent, rw.execId(row), 8000);
+    assert.deepEqual(['ld_start', 'ld_finish', 'ld_release'].filter((n) => agent.names().includes(n)), []);
+    assert.equal(fs.existsSync(rw.ticketDir(rw.execId(row))), false);
+    assert.equal(cancels, 0, 'a record that never started has nothing to kill, so it does not pass through KILLING');
+  },
+
   'a stream the store does not have (404) finishes rejected and releases nothing': async (w, rw, load) => {
     const run = await runToEnd(w, rw, load, { tamper: (t) => rw.s3.objects.delete(snap(t)) });
     await rejectedWith(run, /^stream-missing/);
@@ -108,15 +166,20 @@ const FETCH = 'agent/fetch.js';
 const EXEC = 'agent/execution.js';
 const REJECT = ["if (err instanceof VerdictError) this.#rejected(record, ['FETCHING'], err.message);", 'if (err instanceof VerdictError) this.#releasing(record);'];
 const canaries = [
+  ['a blob that downloads and matches but cannot be kept (publish skipped) is a local problem: retried for the budget, then released never-started, never rejected', FETCH, ['throw new LocalCacheError(`blob', 'throw new VerdictError(`blob']],
+  ['a lease or filesystem error that keeps failing counts against the fetch budget, then releases never-started', EXEC, ['if (remainingMs() <= 0) throw new FetchBudgetError(err.message);', '']],
+  ['a store that hangs is cut off at the fetch budget, not at a fresh GET deadline', FETCH, ['Math.max(1, Math.min(GET_DEADLINE_MS, remainingMs()))', 'GET_DEADLINE_MS']],
+  ['a cancel answered to a heartbeat during FETCHING aborts the fetch and releases cancel-confirmed', EXEC, ["if (record.subphase === 'FETCHING') {", 'if (false) {']],
+  ['a fenced answer to a heartbeat during FETCHING aborts the fetch and ends the record with nothing sent', EXEC, ["PRE_START.has(record.subphase) ? 'DONE' : 'KILLING'", "'KILLING'"]],
   ['a stream the store does not have (404) finishes rejected and releases nothing', FETCH, ['if (!got.exists) throw new VerdictError(`stream-missing: ${key}`);', '']],
   ['a stream the store does not have (404) finishes rejected and releases nothing', EXEC, REJECT],
-  ['a 403 with the probe unreadable is a store problem: retried for the budget, then released never-started', FETCH, ['if (err.status === 403 && await probeReads(s3, bucket, dest, signal)) return', 'if (err.status === 403) return']],
+  ['a 403 with the probe unreadable is a store problem: retried for the budget, then released never-started', FETCH, ['if (err.status === 403 && await probeReads(s3, bucket, dest, { signal, remainingMs })) return', 'if (err.status === 403) return']],
   ['a stream that arrives whole with the wrong sha256 finishes rejected and nothing is spawned', FETCH, ['if (got.size !== bytes || got.sha256 !== sha256) {', 'if (false) {']],
   ['a stream that is not the ticket the queue bound finishes rejected with the mismatched field', FETCH, ['return bad ?', 'return null && bad ?']],
   ['a blob the store does not have finishes rejected cache-miss, with no release', FETCH, ["if (!got.exists) throw new VerdictError('cache-miss: 1');", '']],
   ['a blob the store does not have finishes rejected cache-miss, with no release', EXEC, REJECT],
   ['a blob whose bytes do not hash to the manifest finishes rejected cache-corrupt at once, with no release', FETCH, ["if (got.size !== blob.size || got.sha256 !== blob.sha256) throw new VerdictError('cache-corrupt: 1');", '']],
-  ['a store that is down is retried with heartbeats for the fetch budget, then the claim is released never-started', EXEC, ['if (this.now() - record.claimedAt >= this.config.fetchBudgetMs) throw new FetchBudgetError(err.message);', '']],
+  ['a store that is down is retried with heartbeats for the fetch budget, then the claim is released never-started', EXEC, ['if (remainingMs() <= 0) throw new FetchBudgetError(err.message);', '']],
 ];
 
 scenarioSuite('agent snapshot fetch and verification on a disposable Postgres', { scenarios, canaries });

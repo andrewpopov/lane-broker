@@ -7,7 +7,8 @@ import { childExitSafeFlags } from '../node-exit-safe.js';
 import { buildResult, cancelRemoteExecution, laneBinPath, readRemoteResultRecord, remoteArtifactsReleaseCommand, tombstoneAbsentTicket } from '../remote-runner.js';
 import { LdClosedError, backoffMs } from './ld-client.js';
 import { artifactsSpoolPath, clearExecutionFiles, logPath, spoolPath } from './store.js';
-import { BlobLease, TransportError, VerdictError, bindingProblem, downloadVerified, hashFile, prefetchBlobs, readSnapshotHeader } from './fetch.js';
+import { publishBlob } from '../remote-blobs.js';
+import { BlobLease, VerdictError, bindingProblem, downloadVerified, hashFile, prefetchBlobs, readSnapshotHeader } from './fetch.js';
 import { artifactsDirOf, uploadOutputs } from './upload.js';
 import { stopEvidence } from './stop-proof.js';
 import { isDraining } from './claims.js';
@@ -42,8 +43,8 @@ export class ExecutionDriver {
   #closed = false;
 
   constructor({ core, remoteRoot, config, s3, timing = {}, waker = new Waker(), log = () => {}, spawnEnv = process.env, laneBin = laneBinPath, draining = isDraining,
-    cancelExecution = cancelRemoteExecution, readResult = readRemoteResultRecord, now = Date.now }) {
-    Object.assign(this, { core, remoteRoot: path.resolve(remoteRoot), config, s3, waker, log, spawnEnv, laneBin, draining, cancelExecution, readResult, now });
+    cancelExecution = cancelRemoteExecution, readResult = readRemoteResultRecord, now = Date.now, publish = publishBlob, makeLease = (root, hashes) => new BlobLease(root, hashes) }) {
+    Object.assign(this, { core, remoteRoot: path.resolve(remoteRoot), config, s3, waker, log, spawnEnv, laneBin, draining, cancelExecution, readResult, now, publish, makeLease });
     this.timing = { ...DEFAULT_TIMING, ...timing };
     this.ld = core.ld;
     this.table = core.table;
@@ -173,7 +174,7 @@ export class ExecutionDriver {
   // ---- pre-start ----
 
   #leaseFor(record) {
-    if (!this.#leases.has(record.execId)) this.#leases.set(record.execId, new BlobLease(this.remoteRoot, (record.claim.snapshot.blobs ?? []).map((b) => b.sha256)));
+    if (!this.#leases.has(record.execId)) this.#leases.set(record.execId, this.makeLease(this.remoteRoot, (record.claim.snapshot.blobs ?? []).map((b) => b.sha256)));
     return this.#leases.get(record.execId);
   }
 
@@ -198,26 +199,32 @@ export class ExecutionDriver {
     }
   }
 
-  /** The stream, its binding and its blobs. A store that does not answer is retried with backoff until `fetchBudgetMs` after the claim; a store that answers wrongly is a verdict. */
+  /**
+   * The stream, its binding and its blobs, inside one absolute deadline (`claimedAt + fetchBudgetMs`) that every GET and probe is capped to.
+   * A store that is unreachable and a runner that cannot keep a blob or lease are retried with backoff until it passes; only a store that
+   * answers wrongly is a verdict.
+   */
   async #fetchWithinBudget(record, signal) {
     const { snapshot } = record.claim;
     const { rustfs } = this.config;
+    const deadlineAt = record.claimedAt + this.config.fetchBudgetMs;
+    const remainingMs = () => deadlineAt - this.now();
     let header = null;
     for (let attempt = 0; ; attempt++) {
       try {
         if (header === null) {
-          await downloadVerified(this.s3, rustfs.snapBucket, snapshot, spoolPath(this.remoteRoot, record.execId), { signal });
+          await downloadVerified(this.s3, rustfs.snapBucket, snapshot, spoolPath(this.remoteRoot, record.execId), { signal, remainingMs });
           header = await readSnapshotHeader(spoolPath(this.remoteRoot, record.execId), { compressedBytes: snapshot.bytes });
           const problem = bindingProblem(header, record);
           if (problem) throw new VerdictError(problem);
         }
         await this.#leaseFor(record).renew();
-        return await prefetchBlobs({ s3: this.s3, bucket: rustfs.snapBucket, root: this.remoteRoot, record, header, signal });
+        return await prefetchBlobs({ s3: this.s3, bucket: rustfs.snapBucket, root: this.remoteRoot, record, header, signal, remainingMs, publish: this.publish });
       } catch (err) {
-        if (!(err instanceof TransportError) || signal.aborted) throw err;
-        if (this.now() - record.claimedAt >= this.config.fetchBudgetMs) throw new FetchBudgetError(err.message);
+        if (err instanceof VerdictError || signal.aborted) throw err;
+        if (remainingMs() <= 0) throw new FetchBudgetError(err.message);
         this.log(`${record.execId}: fetch: ${err.message}`);
-        await this.waker.wait(backoffMs(attempt, this.timing.backoff), signal);
+        await this.waker.wait(Math.min(backoffMs(attempt, this.timing.backoff), remainingMs()), signal);
       }
     }
   }
@@ -274,6 +281,7 @@ export class ExecutionDriver {
     const { execId } = record;
     const dir = this.#ticketDir(execId);
     if (!fs.existsSync(dir) && await tombstoneAbsentTicket(this.remoteRoot, execId)) return this.#rejected(record, ['SPAWNING'], 'never-admitted');
+    if (this.#resultExists(execId)) return this.#cas(execId, ['SPAWNING'], { subphase: 'SETTLING' });
     const publisher = readJsonSafe(path.join(dir, 'publisher.json'));
     if (publisher && isProcessAlive(publisher.pid, publisher.start)) return this.#cas(execId, ['SPAWNING'], { subphase: 'RUNNING', pid: publisher.pid, pidStart: publisher.start });
     return this.#publisherGone(record);
@@ -339,22 +347,20 @@ export class ExecutionDriver {
     const stopBeating = this.#keepBeating(execId, context, abort.signal);
     try {
       const since = record.uploadSince ?? this.now();
-      let sinceSaved = record.uploadSince !== undefined;
+      if (record.uploadSince === undefined) this.#cas(execId, ['SETTLING'], { uploadSince: since });
+      const remainingMs = () => since + this.timing.uploadRetryMs - this.now();
       let outputs;
       let uploadError;
       for (let attempt = 0; outputs === undefined && uploadError === undefined; attempt++) {
         try {
           outputs = await uploadOutputs({
             s3: this.s3, bucket: this.config.rustfs.outBucket, host: this.ld.registered.host, record, logFile: logPath(this.remoteRoot, execId),
-            artifactsDir: artifactsDirOf(this.remoteRoot, execId), artifactsFile: artifactsSpoolPath(this.remoteRoot, execId), signal: abort.signal,
+            artifactsDir: artifactsDirOf(this.remoteRoot, execId), artifactsFile: artifactsSpoolPath(this.remoteRoot, execId), signal: abort.signal, remainingMs,
           });
         } catch (err) {
           if (abort.signal.aborted) return;
-          if (this.now() - since >= this.timing.uploadRetryMs) uploadError = err.message;
-          else {
-            if (!sinceSaved) sinceSaved = Boolean(this.#cas(execId, ['SETTLING'], { uploadSince: since }));
-            await this.waker.wait(backoffMs(attempt, this.timing.backoff), abort.signal);
-          }
+          if (remainingMs() <= 0) uploadError = err.message;
+          else await this.waker.wait(Math.min(backoffMs(attempt, this.timing.backoff), remainingMs()), abort.signal);
         }
       }
       const cancelled = this.table.get(execId)?.cancel?.requested === true || result.kind === 'cancelled';
@@ -370,11 +376,28 @@ export class ExecutionDriver {
 
   async #outbox(record) {
     const { execId, outbox } = record;
+    if (outbox.refused) return this.#startRefused(record);
     const ack = () => this.#cas(execId, ['OUTBOX'], { subphase: outbox.postAck === 'KILLING' ? 'KILLING' : 'DONE' });
-    if (outbox.kind === 'finish') return this.ld.finish(record.id, record.epoch, record.token, outbox.result, { persist: ack });
-    return this.ld.release(record.id, record.epoch, record.token, outbox.proof, {
-      persist: (answer) => (answer.refused === 'started' ? this.#rejected(record, ['OUTBOX'], 'start-uncertain') : ack()),
-    });
+    if (outbox.kind === 'finish') await this.ld.finish(record.id, record.epoch, record.token, outbox.result, { persist: ack });
+    else await this.ld.release(record.id, record.epoch, record.token, outbox.proof, { persist: (answer) => (answer.refused === 'started' ? this.#cas(execId, ['OUTBOX'], { outbox: { ...outbox, refused: true } }) : ack()) });
+    const after = this.table.get(execId);
+    if (after?.subphase === 'OUTBOX' && JSON.stringify(after.outbox) === JSON.stringify(outbox)) await this.waker.wait(this.timing.errorRetryMs);
+  }
+
+  /**
+   * The queue refused a release because the run had already started (an `ld_start` whose answer was lost), and nothing was ever spawned.
+   * One heartbeat learns whether a cancel is pending: then the run finishes `cancelled` with its stop proven, otherwise `rejected`.
+   */
+  async #startRefused(record) {
+    const { execId } = record;
+    const beat = await this.ld.heartbeat(record.id, record.epoch, record.token);
+    if (beat.fenced === true) return this.#cas(execId, ['OUTBOX'], { subphase: 'DONE' });
+    const cancelled = record.cancel?.requested === true || beat.cancel === true;
+    const base = { reason: 'start-uncertain', neverStarted: true };
+    const result = cancelled
+      ? { ...buildResult(headerOf(record), this.#ticketDir(execId), { kind: 'cancelled', stopProven: true, ...base }), cancelConfirmed: true }
+      : buildResult(headerOf(record), this.#ticketDir(execId), { kind: 'rejected', ...base });
+    return this.#finishing(record, ['OUTBOX'], result);
   }
 
   /** The queue is told nothing from here: this only ends a lane the queue already settled, on proof it stopped, a reboot, or a day. */

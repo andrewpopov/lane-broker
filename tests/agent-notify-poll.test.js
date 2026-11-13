@@ -32,7 +32,7 @@ const scenarios = {
 const RUN = 'agent/run.js';
 const canaries = [
   ['a NOTIFY wakes the claim loop: the ticket is claimed within 1 s although the poll fallback is a minute away', RUN, ['driver?.poke(event.channel); waker.poke();', '']],
-  ['with LISTEN disabled the poll fallback claims within pollMs', RUN, ['await waker.wait(Math.max(0, config.pollMs - (now() - startedAt)));', 'await waker.wait(1e9);']],
+  ['with LISTEN disabled the poll fallback claims within pollMs', RUN, ['await waker.wait(Math.max(0, Math.min(pollAt, lastLivenessAt + config.pollMs) - now()));', 'await waker.wait(1e9);']],
 ];
 
 scenarioSuite('agent claim wakeups on a disposable Postgres', { scenarios, canaries });

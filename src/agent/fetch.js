@@ -14,6 +14,9 @@ import { spoolPath } from './store.js';
 /** The store did not answer as a store does (connection, timeout, a status): worth another try until the fetch budget is spent. */
 export class TransportError extends Error {}
 
+/** The blob arrived whole and matched its hash, but this runner could not keep it (low headroom, a local filesystem error): the ticket is fine, so it is retried until the fetch budget is spent. */
+export class LocalCacheError extends Error {}
+
 /** The store answered and the object is absent or wrong, or the stream does not describe this ticket: the ticket finishes `rejected` with `reason`. */
 export class VerdictError extends Error {}
 
@@ -29,10 +32,10 @@ export function hashFile(file) {
 }
 
 // The runner's key has no List, so a store may answer a missing key 403. A 403 means "missing" only while the readable probe object still reads: the key then authenticates and may read.
-async function probeReads(s3, bucket, dest, signal) {
+async function probeReads(s3, bucket, dest, { signal, remainingMs }) {
   const probe = `${dest}.probe`;
   try {
-    return (await s3.getObjectToFile(bucket, SNAP_PROBE_KEY, probe, { deadlineMs: GET_DEADLINE_MS, signal })).exists;
+    return (await s3.getObjectToFile(bucket, SNAP_PROBE_KEY, probe, { deadlineMs: deadlineOf(remainingMs), signal })).exists;
   } catch {
     return false;
   } finally {
@@ -40,20 +43,22 @@ async function probeReads(s3, bucket, dest, signal) {
   }
 }
 
+const deadlineOf = (remainingMs) => Math.max(1, Math.min(GET_DEADLINE_MS, remainingMs()));
+
 /** One GET to `dest`: `{exists, sha256, size}`, with a missing key (404, or a 403 the probe explains) reported as `exists: false`. */
-async function getObject(s3, bucket, key, dest, { signal }) {
+async function getObject(s3, bucket, key, dest, { signal, remainingMs }) {
   try {
-    return await s3.getObjectToFile(bucket, key, dest, { deadlineMs: GET_DEADLINE_MS, signal });
+    return await s3.getObjectToFile(bucket, key, dest, { deadlineMs: deadlineOf(remainingMs), signal });
   } catch (err) {
     if (signal?.aborted || !(err instanceof S3Error)) throw err;
-    if (err.status === 403 && await probeReads(s3, bucket, dest, signal)) return { exists: false };
+    if (err.status === 403 && await probeReads(s3, bucket, dest, { signal, remainingMs })) return { exists: false };
     throw new TransportError(err.message);
   }
 }
 
 /** The ticket's stream into `dest`, checked against the pinned size and sha256, then made durable. */
-export async function downloadVerified(s3, bucket, { key, sha256, bytes }, dest, { signal }) {
-  const got = await getObject(s3, bucket, key, dest, { signal });
+export async function downloadVerified(s3, bucket, { key, sha256, bytes }, dest, { signal, remainingMs }) {
+  const got = await getObject(s3, bucket, key, dest, { signal, remainingMs });
   if (!got.exists) throw new VerdictError(`stream-missing: ${key}`);
   if (got.size !== bytes || got.sha256 !== sha256) {
     fs.rmSync(dest, { force: true });
@@ -111,9 +116,10 @@ export class BlobLease {
 
 /**
  * Make every blob the stream was encoded without present and intact in this runner's cache. An absent object is `cache-miss` and a hash
- * mismatch `cache-corrupt`, both VerdictErrors that finish the ticket `rejected`; an unreachable store is a TransportError.
+ * mismatch `cache-corrupt`, both VerdictErrors that finish the ticket `rejected`; an unreachable store is a TransportError and a blob this
+ * runner cannot keep a LocalCacheError.
  */
-export async function prefetchBlobs({ s3, bucket, root, record, header, signal }) {
+export async function prefetchBlobs({ s3, bucket, root, record, header, signal, remainingMs, publish = publishBlob }) {
   const blobs = record.claim.snapshot.blobs ?? [];
   if (blobs.length === 0) return;
   if (typeof header.repoIdentity !== 'string' || header.repoIdentity === '') throw new VerdictError('binding-mismatch: the header names no repoIdentity but the ticket lists blobs');
@@ -123,11 +129,11 @@ export async function prefetchBlobs({ s3, bucket, root, record, header, signal }
     if (hasBlob(root, ns, blob.sha256, blob.size) === 'hit') continue;
     const tmp = `${spoolPath(root, record.execId)}.blob`;
     try {
-      const got = await getObject(s3, bucket, blobKey(ns, blob.sha256), tmp, { signal });
+      const got = await getObject(s3, bucket, blobKey(ns, blob.sha256), tmp, { signal, remainingMs });
       if (!got.exists) throw new VerdictError('cache-miss: 1');
       if (got.size !== blob.size || got.sha256 !== blob.sha256) throw new VerdictError('cache-corrupt: 1');
-      const published = publishBlob(root, ns, { type: 'file', size: blob.size, sha256: blob.sha256 }, fs.readFileSync(tmp));
-      if (published === 'skipped' || published === 'not-cached') throw new VerdictError('cache-miss: 1');
+      const published = publish(root, ns, { type: 'file', size: blob.size, sha256: blob.sha256 }, fs.readFileSync(tmp));
+      if (published === 'skipped' || published === 'not-cached') throw new LocalCacheError(`blob ${blob.sha256} verified but not kept (${published})`);
     } finally {
       fs.rmSync(tmp, { force: true });
     }

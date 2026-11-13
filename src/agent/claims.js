@@ -11,7 +11,7 @@ import { clearPendingClaim, newExecutionRecord, readPendingClaim, writePendingCl
 
 export const MAX_FREE_MEM = Number.MAX_SAFE_INTEGER;
 
-export const isDraining = () => readRemoteDrain(stateHome()) !== null || drainBlocksIntake(readDrainMarker(stateHome()));
+export const isDraining = (stateDir = stateHome()) => readRemoteDrain(stateDir) !== null || drainBlocksIntake(readDrainMarker(stateDir));
 
 /** Why this runner takes no new claim now, or null: a drain marker, outside its schedule window, or too close to the window closing. */
 export function claimBlock({ schedule, stopClaimingBeforeCloseMs, now = Date.now(), draining = isDraining }) {

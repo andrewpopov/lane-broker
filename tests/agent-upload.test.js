@@ -56,6 +56,17 @@ const scenarios = {
     assert.equal(outputKey('a1', record.id, 3, 'log'), `a1/${record.id}/e3/log`);
   },
 
+  'an upload that never answers is cut off at the upload budget with uploadError, and uploadSince is on disk before the first PUT is answered': async (w, rw, load) => {
+    rw.s3.hangMatching = (p) => p.startsWith('/lane-out/');
+    const ticket = await rw.submit({ code: 'process.exit(0)' });
+    const agent = await rw.agent({ load, timing: { uploadRetryMs: 1500 } });
+    const row = await rw.claimed(ticket);
+    const execId = rw.execId(row);
+    await happens('uploadSince is persisted while the first PUT hangs', () => agent.core.table.get(execId)?.subphase === 'SETTLING' && typeof agent.core.table.get(execId)?.uploadSince === 'number', 4000);
+    await happens('the ticket finishes with uploadError within the budget', async () => (await w.ticket(ticket.id)).state === 'finished', 1500 + 3000);
+    assert.ok((await w.ticket(ticket.id)).result.uploadError);
+  },
+
   'a log PUT that keeps failing finishes with uploadError once uploadRetryMs has passed, and still finishes the ticket': async (w, rw, load) => {
     const fetchImpl = recordingFetch((url, init) => (init?.method === 'PUT' ? new Response('no', { status: 500 }) : undefined));
     const ticket = await rw.submit({ code: 'process.exit(0)' });
@@ -72,9 +83,11 @@ const scenarios = {
 
 const UPLOAD = 'agent/upload.js';
 const canaries = [
+  ['an upload that never answers is cut off at the upload budget with uploadError, and uploadSince is on disk before the first PUT is answered', 'agent/execution.js', ["if (record.uploadSince === undefined) this.#cas(execId, ['SETTLING'], { uploadSince: since });", '']],
+  ['an upload that never answers is cut off at the upload budget with uploadError, and uploadSince is on disk before the first PUT is answered', UPLOAD, ['{ signal, deadlineMs: Math.max(1, remainingMs()) }', '{ signal }']],
   ['a pulled ticket runs end to end, and its outputs are PUT under the host prefix the queue and the runner both derive', UPLOAD, ['`${host}/${ticketId}/e${epoch}/${name}`', '`${ticketId}/e${epoch}/${name}`']],
   ['stored artifacts are spooled to a temp file and PUT under the same prefix, with their hash and size in the finish', UPLOAD, ['await put(\'artifacts\', artifactsFile)', 'await put(\'artifacts\', artifactsFile.replace(/spool$/, "none"))'], /ENOENT/],
-  ['a log PUT that keeps failing finishes with uploadError once uploadRetryMs has passed, and still finishes the ticket', 'agent/execution.js', ['if (this.now() - since >= this.timing.uploadRetryMs) uploadError = err.message;', 'if (false) uploadError = err.message;']],
+  ['a log PUT that keeps failing finishes with uploadError once uploadRetryMs has passed, and still finishes the ticket', 'agent/execution.js', ['if (remainingMs() <= 0) uploadError = err.message;', 'if (false) uploadError = err.message;']],
 ];
 
 scenarioSuite('agent outputs and uploads on a disposable Postgres', { scenarios, canaries });

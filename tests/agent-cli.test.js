@@ -111,7 +111,7 @@ describe('lane agent --check pg probe on a disposable Postgres', { skip: pgSkipO
   });
 });
 
-test('lane agent --check --config <dir> reads everything from that dir with an env of only PATH and HOME', async () => {
+test('lane agent --check --config <dir> reads everything from that dir with an env of PATH and HOME, and a hostile LANE_BROKER_HOME that it ignores', async () => {
   const stub = await fresh();
   try {
     const home = makeTmpDir('agent-home-');
@@ -123,7 +123,7 @@ test('lane agent --check --config <dir> reads everything from that dir with an e
     write('password', 'pw\n');
     write('ca.pem', 'CA\n');
     write('rustfs.env', `AWS_ACCESS_KEY_ID=${STUB_CREDS.accessKeyId}\nAWS_SECRET_ACCESS_KEY=${STUB_CREDS.secretAccessKey}\n`);
-    const child = spawn(process.execPath, [BIN, 'agent', '--check', '--config', dir], { env: { PATH: process.env.PATH, HOME: home } });
+    const child = spawn(process.execPath, [BIN, 'agent', '--check', '--config', dir], { env: { PATH: process.env.PATH, HOME: home, LANE_BROKER_HOME: path.join(home, 'hostile'), LANE_BROKER_STATE: path.join(home, 'hostile-state') } });
     let out = '';
     child.stdout.on('data', (d) => { out += d; });
     child.stderr.on('data', (d) => { out += d; });
