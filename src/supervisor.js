@@ -51,7 +51,8 @@ import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, l
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness, recordEnforcement } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
-import { remoteCpuAllocation, selectRunner, dispatchRemote, remoteCancel, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, estimatedFinish, haveDeadlineFor, DRAIN_MOVE_REASON, QUEUED_TOO_LONG_REASON, REFUSED_MOVE_TARGET } from './remote-client.js';
+import { remoteCpuAllocation, selectRunner, dispatchRemote, remoteCancel, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, estimatedFinish, haveDeadlineFor, DRAIN_MOVE_REASON, SOURCE_LEAVING_REASONS, QUEUED_TOO_LONG_REASON, REFUSED_MOVE_TARGET } from './remote-client.js';
+import { runnerUnavailableReason } from './runner-schedule.js';
 import { remoteExcludeWarnings } from './remote-exclude.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
 import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remote-artifacts.js';
@@ -1458,6 +1459,11 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
         intervalMs: globalCfg.remoteRebalanceIntervalMs,
         // BRAIN-770: a ticket with no local fallback is refused (76) after this long queued with no runner to move it to
         refusedMaxQueuedMs,
+        // BRAIN-1058: re-read each sample, so a window that closes (or an operator's `offline`) is seen here and by pickTarget
+        sourceUnavailable: () => {
+          globalCfg = reloadGlobalConfig(globalCfg, { onError: (err) => recordConfigReloadError(root, err) });
+          return runnerUnavailableReason(pushRunners(globalCfg).find((r) => r.name === runner.name), Date.now());
+        },
         refusedSince: () => firstQueuedAt,
         markQueued: async (at) => {
           if (firstQueuedAt !== null) return;
@@ -1468,7 +1474,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
         // Refusing says "no runner could take it", which is only true when moving was allowed: a pause (cooldown, or a max-moves of 0)
         // is not a lack of capacity. A ticket that has used up its moves has had its chance.
         refusalAllowed: ({ draining } = {}) => {
-          const countedMoves = moves.filter((m) => m.reason !== DRAIN_MOVE_REASON).length;
+          const countedMoves = moves.filter((m) => !SOURCE_LEAVING_REASONS.has(m.reason)).length;
           const blocked = draining ? null : rebalanceBlocked({ moves: countedMoves, maxMoves: globalCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: globalCfg.remoteRebalanceCooldownMs });
           if (blocked === null || (blocked === 'max-moves' && countedMoves > 0)) return true;
           if (!refusalHeldLogged) {
@@ -1482,7 +1488,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
         // BRAIN-520: a drain move is an operator fact, so it skips the cooldown and the max-moves damping (the no-revisit rule still
         // bounds it), and its destination must itself be able to withdraw.
         pickTarget: async ({ draining, sourceFacts, refusalCapElapsed } = {}) => {
-          const countedMoves = moves.filter((m) => m.reason !== DRAIN_MOVE_REASON).length;
+          const countedMoves = moves.filter((m) => !SOURCE_LEAVING_REASONS.has(m.reason)).length;
           if (!draining && rebalanceBlocked({ moves: countedMoves, maxMoves: globalCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: globalCfg.remoteRebalanceCooldownMs })) return null;
           const candidates = pushRunners(globalCfg).filter((r) => !visited.includes(r.name) && r.rebalanceTarget !== false);
           if (candidates.length === 0) return null;
@@ -1603,7 +1609,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       await publishAndExit(gen, () => migrationRefusalResult(enriched));
       return { fallback: false };
     }
-    const why = move.reason === DRAIN_MOVE_REASON ? `${from.name} draining: ${move.drainReason}` : `queued ${Math.round(dispatch.queuedMs / 1000)}s on ${from.name}`;
+    const why = move.reason === DRAIN_MOVE_REASON ? `${from.name} draining: ${move.drainReason}` : SOURCE_LEAVING_REASONS.has(move.reason) ? `${from.name} unavailable: ${move.drainReason}` : `queued ${Math.round(dispatch.queuedMs / 1000)}s on ${from.name}`;
     const destination = to.behindOwnerPosition === undefined && hasMeasuredHeadroom(probe) ? `${probe.headroom.cpuCores} cores free` : `queued ${probe?.queued ?? 'unknown'}`;
     const line = `lane: remote-rebalance: ${enriched.id}: ${from.name} -> ${runner.name} (${why}; ${runner.name} ${destination})\n`;
     process.stderr.write(line);
@@ -1618,7 +1624,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   }
   // A move that never completed (or one whose second dispatch ended before a snapshot went out) must not outlive this attempt's record.
   if (movingSet && !dispatch.mayStillBeRunning) await clearMoving();
-  const rebalanceFields = () => (moves.length ? { rebalancedFrom: moves.at(-1).from, rebalancedAt: moves.at(-1).at, rebalanceReason: moves.at(-1).reason === DRAIN_MOVE_REASON ? `${moves.at(-1).from} draining (${moves.at(-1).drainReason})` : LOST_REASONS.has(moves.at(-1).reason) ? `${moves.at(-1).from} ${moves.at(-1).reason === RUNNER_SHUTDOWN_REASON ? 'stopped' : 'lost'} the job (${moves.at(-1).reason})` : `queued ${Math.round(moves.at(-1).queuedMs / 1000)}s on ${moves.at(-1).from}`, moves: moves.length } : {});
+  const rebalanceFields = () => (moves.length ? { rebalancedFrom: moves.at(-1).from, rebalancedAt: moves.at(-1).at, rebalanceReason: moves.at(-1).reason === DRAIN_MOVE_REASON ? `${moves.at(-1).from} draining (${moves.at(-1).drainReason})` : SOURCE_LEAVING_REASONS.has(moves.at(-1).reason) ? `${moves.at(-1).from} unavailable (${moves.at(-1).drainReason})` : LOST_REASONS.has(moves.at(-1).reason) ? `${moves.at(-1).from} ${moves.at(-1).reason === RUNNER_SHUTDOWN_REASON ? 'stopped' : 'lost'} the job (${moves.at(-1).reason})` : `queued ${Math.round(moves.at(-1).queuedMs / 1000)}s on ${moves.at(-1).from}`, moves: moves.length } : {});
   const redispatchFields = () => {
     const lost = moves.filter((m) => LOST_REASONS.has(m.reason));
     return lost.length ? { redispatchedFrom: lost.map((m) => m.from), redispatchReason: lost.at(-1).reason } : {};

@@ -86,3 +86,10 @@ export function runnerAvailability(schedule, now) {
   }
   return { available: closesAt !== null, closesAt };
 }
+
+/** BRAIN-1058: why a configured runner should not keep tickets queued on it at `now` (ms), or null when it may. */
+export function runnerUnavailableReason(runner, now) {
+  if (!runner) return null;
+  if (runner.offline) return 'marked offline';
+  return runnerAvailability(runner.schedule, now).available ? null : 'outside its schedule';
+}

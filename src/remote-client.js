@@ -947,16 +947,27 @@ export function provesStopped(record, expected) {
 
 const DEFAULT_REBALANCE_INTERVAL_MS = 30_000;
 export const DRAIN_MOVE_REASON = 'runner-draining';
+/** BRAIN-1058: the source runner left its `schedule` window (or was marked `offline`) while the ticket sat queued on it. */
+export const UNAVAILABLE_MOVE_REASON = 'runner-unavailable';
+/** Moves forced by a fact about the source runner rather than the queued-too-long heuristic: they skip its waits and caps. */
+export const SOURCE_LEAVING_REASONS = new Set([DRAIN_MOVE_REASON, UNAVAILABLE_MOVE_REASON]);
 export const QUEUED_TOO_LONG_REASON = 'queued-too-long';
 export const REFUSED_CAP_REASON = 'refused-queue-cap';
 /** BRAIN-770: the "destination" of a withdraw that has none: a ticket with no local fallback that sat queued past `refusedMaxQueuedMs`
  *  with no runner able to take it. It rides the same proof paths as a real target and ends in a retryable refusal, not a dispatch. */
 export const REFUSED_MOVE_TARGET = Object.freeze({ refused: true });
 
-/** BRAIN-520: the `reason` (and, for a drain move, `drainReason`) a move carries, from what the watcher recorded when it chose the target. */
+/** BRAIN-520: the `reason` (and, for a drain or unavailable move, `drainReason`) a move carries, from what the watcher recorded when it chose the target. */
 function moveReasonOf(state) {
   const { reason = QUEUED_TOO_LONG_REASON, drainReason } = state.attemptedReason ?? {};
   return drainReason === undefined ? { reason } : { reason, drainReason };
+}
+
+/** BRAIN-520 / BRAIN-1058: why the source runner is leaving (`{kind, reason}`), or null. A runner-side drain wins over the caller's config view. */
+function sourceLeavingOf(record, sourceUnavailable) {
+  if (record.remoteDrain) return { kind: DRAIN_MOVE_REASON, reason: sanitizeDrainReason(record.remoteDrain.reason) || 'drained by operator' };
+  const unavailable = sourceUnavailable?.() ?? null;
+  return unavailable ? { kind: UNAVAILABLE_MOVE_REASON, reason: unavailable } : null;
 }
 
 /**
@@ -1040,7 +1051,7 @@ function makePhaseReporter({ onPhase, now, canWrite }) {
  * withdraw runs towards `REFUSED_MOVE_TARGET` (no destination) under the same proof. Stops for good once the ticket is `admitted` or terminal. Resolves null when it did not move.
  */
 async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed, signal, abortSignal, now, sleep, fetchDeadlineMs, withdrawDeadlineMs, sshBin, env, onSample }) {
-  const { minQueuedMs, intervalMs = DEFAULT_REBALANCE_INTERVAL_MS, pickTarget, beforeWithdraw, afterWithdraw, refusedMaxQueuedMs = 0, refusedSince, markQueued, refusalAllowed } = rebalance;
+  const { minQueuedMs, intervalMs = DEFAULT_REBALANCE_INTERVAL_MS, pickTarget, beforeWithdraw, afterWithdraw, refusedMaxQueuedMs = 0, refusedSince, markQueued, refusalAllowed, sourceUnavailable } = rebalance;
   const fence = { runner, epoch: state.epoch };
   const current = () => state.runner === fence.runner && state.epoch === fence.epoch;
   const watching = () => current() && !isClosed() && !signal.aborted && !abortSignal?.aborted;
@@ -1071,9 +1082,10 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
     state.queuedSince = queuedSince;
     // BRAIN-770: the refusal cap counts the whole wait since the ticket was first queued remotely, across moves
     if (refusedMaxQueuedMs > 0) await Promise.resolve(markQueued?.(queuedSince)).catch(() => {});
-    // BRAIN-520: a draining runner is an operator fact, so its queued tickets skip the minimum-queued wait. `minQueuedMs: 0` is
-    // still the off switch for every move.
-    const draining = fetched.remoteDrain ? { reason: sanitizeDrainReason(fetched.remoteDrain.reason) || 'drained by operator' } : null;
+    // BRAIN-520: a draining runner is an operator fact, so its queued tickets skip the minimum-queued wait. BRAIN-1058: so is a runner
+    // outside its schedule, which may never admit what is queued on it. `minQueuedMs: 0` is still the off switch for every move.
+    const leaving = sourceLeavingOf(fetched, sourceUnavailable);
+    const draining = leaving ? { reason: leaving.reason } : null;
     if (!(draining && minQueuedMs > 0) && now() - queuedSince < minQueuedMs) continue;
     // A callback that throws or rejects is a failed tick: no move, keep watching. The target is awaited (the real picker is async).
     let to;
@@ -1087,7 +1099,7 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
       continue;
     }
     if (!watching()) return null;
-    state.attemptedReason = to === REFUSED_MOVE_TARGET ? { reason: REFUSED_CAP_REASON } : draining ? { reason: DRAIN_MOVE_REASON, drainReason: draining.reason } : { reason: QUEUED_TOO_LONG_REASON };
+    state.attemptedReason = to === REFUSED_MOVE_TARGET ? { reason: REFUSED_CAP_REASON } : leaving ? { reason: leaving.kind, drainReason: leaving.reason } : { reason: QUEUED_TOO_LONG_REASON };
     state.attemptedTarget = to; // kept on the dispatch's own state: a lost reply plus a closed session is resolved from the record by the caller
     const { action } = await remoteWithdraw(runner, expected.ticketId, { sshBin, deadlineMs: withdrawDeadlineMs, env });
     // The runner decided; a cancel or an ssh close that raced it is the caller's to resolve, not ours to undo.
