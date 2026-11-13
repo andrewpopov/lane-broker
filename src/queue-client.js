@@ -24,7 +24,14 @@ const FUNCTIONS = {
   ld_log_read: { types: ['uuid', 'int', 'int'], idempotent: true },
   ld_log_ack: { types: ['uuid', 'int', 'int'], idempotent: true },
   ld_placeable: { types: ['text', 'text[]'], idempotent: true },
+  // lane_admin only (`lane pull gc`); every one is safe to send again
+  ld_prune_candidates: { types: ['interval', 'interval', 'timestamptz', 'uuid', 'int'], idempotent: true },
+  ld_prune: { types: ['uuid[]', 'interval'], idempotent: true },
+  ld_prune_chunks: { types: ['interval', 'int'], idempotent: true },
+  ld_blobs_live: { types: ['jsonb'], idempotent: true },
 };
+
+const intervalOf = (ms) => `${Math.ceil(ms / 1000)} seconds`;
 
 export class QueueError extends Error {
   constructor(message, { code = null, cause } = {}) {
@@ -118,5 +125,14 @@ export function createQueueClient({
         logAck: (id, epoch, uptoSeq) => invoke('ld_log_ack', [id, epoch, uptoSeq]),
 
         placeable: (repoKey, requiresTags) => invoke('ld_placeable', [repoKey, requiresTags]),
+
+        pruneCandidates: ({ objectsAfterMs, rowsAfterMs, after = null, limit = 200 }) =>
+      invoke('ld_prune_candidates', [intervalOf(objectsAfterMs), intervalOf(rowsAfterMs), after?.finished_at ?? null, after?.id ?? null, limit]),
+
+        prune: (ids, rowsAfterMs) => invoke('ld_prune', [ids, intervalOf(rowsAfterMs)]),
+
+        pruneChunks: ({ terminalAfterMs, limit }) => invoke('ld_prune_chunks', [intervalOf(terminalAfterMs), limit]),
+
+        blobsLive: (refs) => invoke('ld_blobs_live', [refs]),
   };
 }

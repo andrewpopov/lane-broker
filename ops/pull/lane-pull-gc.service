@@ -1,0 +1,17 @@
+# TEMPLATE, not installed. pitelite: pull retention on the ADMIN login (a lane_admin member); holds no submitter credentials.
+# /etc/lane-pull/gc-admin.pass (0600) is the admin login's password only. The CA and the RustFS keys come from the broker config.
+[Unit]
+Description=lane pull gc: delete pull objects, then rows, chunks and unreferenced blobs
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=train
+Environment=LANE_BROKER_HOME=/data/train/config
+Environment=LANE_BROKER_STATE=/data/train/state
+ExecStart=/usr/bin/node /opt/lane-broker/bin/lane.js pull gc --queue-url postgres://lane_admin_gc@pitelite:5432/lane_queue?sslmode=verify-full --password-file /etc/lane-pull/gc-admin.pass
+TimeoutStartSec=15min
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true

@@ -51,7 +51,7 @@ async function claimSweep(root, now, force) {
 }
 
 /** Returns `{ ran: false, reason }` or `{ ran: true, results: [{ id, runner, state, exit?, reason? }] }`; never throws. */
-export async function sweepOrphans(root, { globalCfg, force = false, now = Date.now(), sshBin, env, deadlineMs = 15_000 } = {}) {
+export async function sweepOrphans(root, { globalCfg, force = false, now = Date.now(), sshBin, env, deadlineMs = 15_000, pullContext } = {}) {
   try {
     if (!globalCfg) return { ran: false, reason: 'config unreadable' };
     if (!(await claimSweep(root, now, force))) return { ran: false, reason: 'recently swept' };
@@ -66,7 +66,7 @@ export async function sweepOrphans(root, { globalCfg, force = false, now = Date.
       const entry = { id: attempt.id, runner: attempt.runner };
       // a runner already found down this sweep is not asked again, but the operator flag and the unreachable bound still settle (BRAIN-594)
       const assumeDown = downRunners.has(attempt.runner);
-      const outcome = await reconcileRemoteAttempt(root, attempt.id, { globalCfg, sshBin, env, deadlineMs, now, assumeDown });
+      const outcome = await reconcileRemoteAttempt(root, attempt.id, { globalCfg, sshBin, env, deadlineMs, now, assumeDown, pullContext });
       if (assumeDown && !outcome.settled) {
         results.push({ ...entry, state: 'skipped-runner-down' });
         continue;

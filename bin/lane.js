@@ -41,6 +41,8 @@ import { phasesReportCommand } from '../src/phases-report.js';
 import { lossesReportCommand } from '../src/losses-report.js';
 import { placementReportCommand } from '../src/placement-report.js';
 import { pullCheckCommand } from '../src/pull-check.js';
+import { pullGcCommand } from '../src/pull-gc.js';
+import { pullTendCommand } from '../src/pull-tend.js';
 
 function usage() {
   return `Usage:
@@ -63,6 +65,8 @@ function usage() {
   lane gc [--dry-run] [--max <n>] [--root <remoteRoot>]
   lane reconcile [--now] [--json]
   lane pull check [--json]
+  lane pull tend [--serve]
+  lane pull gc --queue-url <admin url> --password-file <file> [--rows-after <dur>] [--budget <dur>]
   lane runner [status] [--json]
   lane runner watch
   lane runner prewarm [--lane <name>] [--runner <name>] [--dry-run]
@@ -421,7 +425,9 @@ async function main() {
     }
     case 'pull': {
       if (rest[0] === 'check') return (await pullCheckCommand(rest.slice(1))).exitCode;
-      process.stderr.write(`lane pull: ${rest[0] === undefined ? 'missing subcommand' : `unknown subcommand "${rest[0]}"`} (only \`check\`)\n`);
+      if (rest[0] === 'tend') return (await pullTendCommand(rest.slice(1))).exitCode;
+      if (rest[0] === 'gc') return (await pullGcCommand(rest.slice(1))).exitCode;
+      process.stderr.write(`lane pull: ${rest[0] === undefined ? 'missing subcommand' : `unknown subcommand "${rest[0]}"`} (\`check\`, \`tend\`, \`gc\`)\n`);
       return 2;
     }
     case 'report': {

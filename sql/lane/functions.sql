@@ -1050,6 +1050,7 @@ BEGIN
   IF coalesce(cardinality(p_ids), 0) > 500 THEN
     RAISE EXCEPTION 'at most 500 ids per call' USING ERRCODE = '22023';
   END IF;
+  PERFORM 1 FROM lane_dispatch.claim_lock WHERE id = 1 FOR UPDATE;
   SELECT coalesce(array_agg(t.id), '{}') INTO v_due FROM (
     SELECT t.id FROM lane_dispatch.tickets t
      WHERE t.id = ANY (p_ids) AND t.state IN ('finished','cancelled','withdrawn','lost') AND t.finished_at < clock_timestamp() - p_rows_after

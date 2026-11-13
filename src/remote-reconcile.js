@@ -47,15 +47,18 @@ import { writeBrokerLog } from './admission.js';
  * Returns `{ settled, state, exit?, reason?, transport?, timedOut? }` (`transport: true`: the runner gave no usable answer at all, so
  * asking it about another attempt would fail the same way); never throws.
  */
-export async function reconcileRemoteAttempt(root, id, { globalCfg, sshBin = 'ssh', env, deadlineMs = 30_000, deadlineAt, now = Date.now(), assumeDown = false, self = false, runner } = {}) {
+export async function reconcileRemoteAttempt(root, id, { globalCfg, sshBin = 'ssh', env, deadlineMs = 30_000, deadlineAt, now = Date.now(), assumeDown = false, self = false, runner, pullContext } = {}) {
   try {
-    return await reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt, now, assumeDown, self, pinnedRunner: self ? runner : undefined });
+    return await reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt, now, assumeDown, self, pinnedRunner: self ? runner : undefined, pullContext });
   } catch (err) {
     // the clock lock stayed held past the caller's deadline: the same outcome as an ssh call that ran out of time
     if (err instanceof LockTimeoutError && deadlineAt !== undefined) return waitTimedOut();
     return { settled: false, state: 'error', reason: err.message };
   }
 }
+
+// imported on demand: pull-ticket imports the supervisor, which imports this module
+export const loadPullRecovery = async () => ({ ...(await import('./pull-recover.js')), ...(await import('./pull-services.js')) });
 
 /** The attempt's supervisor is this very process and the caller said it is the one asking. */
 const ownedBySelf = (attempt, self) => self === true && attempt.supervisor?.pid === process.pid;
@@ -65,7 +68,7 @@ const skipped = (reason) => ({ settled: false, state: 'skipped', reason });
 const MIN_CALL_MS = 250;
 const waitTimedOut = () => ({ settled: false, state: 'unreachable', reason: 'wait timeout reached', timedOut: true });
 
-async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt, now, assumeDown, self, pinnedRunner }) {
+async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlineAt, now, assumeDown, self, pinnedRunner, pullContext }) {
   const resultPath = path.join(paths(root).results, `${id}.json`);
   const attempt = readAttempt(root, id);
   if (!attempt) return skipped('no attempt record');
@@ -84,6 +87,11 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
 
   if (neverDispatched(attempt)) {
     return publishSettled(root, id, attempt, resultPath, 'lost', () => lostResult(id, attempt, 'never-dispatched', 'supervisor died before dispatching to any runner'), { stillEligible: neverDispatched, self });
+  }
+
+  if (attempt.transport === 'pull') {
+    const recovery = await loadPullRecovery();
+    return recovery.reconcilePullAttempt(attempt, pullContext ?? recovery.pullContextFactory(root, globalCfg));
   }
 
   const configured = (globalCfg?.runners ?? []).find((r) => r.name === attempt.runner);
@@ -251,7 +259,7 @@ export const lostResult = (id, attempt, reason, lostDetail) => ({
 
 /** A probe-phase attempt that nothing was ever sent for: the supervisor writes `runner`, `dispatchedRunners` and `binding` to the
  *  attempt BEFORE the ssh submit (supervisor.js `updateAttempt` ahead of `dispatchRemote`, whose `onBinding` precedes its spawn). */
-const neverDispatched = (attempt) => attempt.phase === 'probe' && !attempt.runner && !attempt.binding && !(attempt.dispatchedRunners?.length > 0);
+const neverDispatched = (attempt) => attempt.phase === 'probe' && !attempt.runner && !attempt.binding && !(attempt.dispatchedRunners?.length > 0) && attempt.transport === undefined;
 
 /** A runner record is adopted only when it is confirmed against the binding stored at dispatch; a legacy attempt has none. */
 async function adoptOrAmbiguous(attempt, id, record, publish) {

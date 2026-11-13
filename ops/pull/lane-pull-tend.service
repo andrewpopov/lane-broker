@@ -1,0 +1,22 @@
+# TEMPLATE, not installed. pitelite: the pull tender, one persistent process on the SUBMITTER login (lane_submit_train).
+# Same user and LANE_BROKER_HOME/LANE_BROKER_STATE as the supervisors it recovers; the broker config carries laneQueueUrl and lanePull (password, CA, RustFS keys).
+# It never holds the admin login: retention runs from lane-pull-gc.service with its own credential file.
+[Unit]
+Description=lane pull tend: steps pull tickets whose supervisor is dead
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=train
+Environment=LANE_BROKER_HOME=/data/train/config
+Environment=LANE_BROKER_STATE=/data/train/state
+ExecStart=/usr/bin/node /opt/lane-broker/bin/lane.js pull tend --serve
+Restart=always
+RestartSec=5
+Nice=10
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

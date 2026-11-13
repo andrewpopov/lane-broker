@@ -26,14 +26,14 @@ export function artifactsStream(ticketId, files) {
 }
 
 // `load` picks the module tree, so a canary runs the same scenario against mutated code
-export async function pullFixture(t, w, { load = realSrc, id = ID, stub = null, files = { 'a.txt': 'x\n' }, cfg = {}, runnerLogin } = {}) {
+export async function pullFixture(t, w, { load = realSrc, id = ID, stub = null, files = { 'a.txt': 'x\n' }, cfg = {}, runnerLogin, state: sharedState } = {}) {
   const clock = { now: Date.now() };
   const s3Stub = stub ?? await startS3Stub();
   if (!stub) t.after(() => s3Stub.close());
   const s3 = createS3Client({ endpoint: s3Stub.endpoint, region: STUB_REGION, creds: STUB_CREDS });
   const { presignerFor, stepPullTicket, preparePullTicket, withdrawQueued, runPullTicket } = await load('pull-ticket.js');
   const presign = presignerFor({ endpoint: s3Stub.endpoint, region: STUB_REGION, creds: STUB_CREDS, now: () => clock.now });
-  const { state } = freshEnv();
+  const state = sharedState ?? freshEnv().state;
   ensureStateDirs(state);
   const worktreeRoot = makeGitWorktree(files);
   const manifest = buildManifest(worktreeRoot);

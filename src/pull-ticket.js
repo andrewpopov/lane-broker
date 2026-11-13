@@ -383,7 +383,7 @@ async function requestCancel(run) {
   await persistPull(run, (pull) => ({ cancel: { ...pull.cancel, answer: { state: answer.state, confirmed: answer.confirmed } } }));
 }
 
-const urlsNeeded = (run, row) => !row.urls || row.urls.epoch !== row.epoch || row.urls.expiresAt - run.now() < run.cfg.urlRefreshSec * 1000;
+export const urlsNeeded = (run, row) => !row.urls || row.urls.epoch !== row.epoch || row.urls.expiresAt - run.now() < run.cfg.urlRefreshSec * 1000;
 
 function buildUrls(run, row, { withInputs }) {
   const { snapBucket, outBucket } = run.cfg.rustfs;
@@ -483,6 +483,7 @@ async function observe(run) {
   const row = await run.queue.get(run.id);
   if (row === null) return settle(run, entryFor(run, null, lost('queue-row-missing')));
   if (row.state !== 'quarantined' && attempt.pull.quarantinedSince !== undefined) await persistPull(run, { quarantinedSince: undefined });
+  if (row.host && row.host !== attempt.pull.host) await persistPull(run, { host: row.host });
   switch (row.state) {
     case 'queued':
       return { state: 'queued', next: run.cfg.pollMs };
