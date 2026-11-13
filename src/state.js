@@ -690,10 +690,23 @@ function isLockOwnerAlive(owner) {
  * was last written before this boot (a power cut left it so: the file was never fsynced), a stand-in owner that is dead by definition.
  * The stand-in's token is the file's inode and mtime, so the tomb CAS keys on that exact file. Null when the file is absent, or is
  * unreadable but not provably from a previous boot (it may be a lock being written right now), or the boot time is unknown.
+ * Using the boot time here is safe even though the wall clock can step: a live owner is published by one rename, never visible
+ * half-written, so only a file that really is empty or unparsable is ever compared with it; and the boot time is read once per process.
  */
 function observeLockOwner(ownerFile) {
-  const owner = readJsonSafe(ownerFile);
-  if (owner) return owner;
+  let raw;
+  try {
+    raw = fs.readFileSync(ownerFile, 'utf8');
+  } catch {
+    return null; // a failed read (EMFILE, EIO, EACCES, ENOENT) says nothing about the content
+  }
+  let owner = null;
+  try {
+    owner = JSON.parse(raw);
+  } catch {
+    // unparsable: falls through to the stand-in
+  }
+  if (owner && typeof owner === 'object' && !Array.isArray(owner)) return owner;
   const boot = bootTimeMs();
   if (boot === null) return null;
   let stat;
@@ -704,6 +717,10 @@ function observeLockOwner(ownerFile) {
   }
   if (stat.mtimeMs >= boot) return null;
   return { pid: 'unreadable', token: `unreadable-${stat.ino}-${stat.mtimeMs}`, unreadable: true };
+}
+
+function deadHolder(owner) {
+  return owner.unreadable ? 'an unreadable owner.json from a previous boot' : `dead pid ${owner.pid}`;
 }
 
 /** How long a tomb (a moved-aside dead lock dir) is kept before GC removes it. Exported for tests.
@@ -810,7 +827,8 @@ function gcTombs(root) {
 /**
  * Best-effort GC of `.lock-stage-<pid>-<rand>` directories a crashed acquirer left behind. A stage is only ever renamed by the process
  * that made it, so one whose pid is dead (the liveness check the dead-owner takeover uses), or whose mtime is before this boot, can
- * never be renamed again; one whose pid is alive is left alone.
+ * never be renamed again; one whose pid is alive is left alone. A stage is renamed aside before it is removed (as release does): a
+ * recursive remove unlinks `owner.json` first, and an acquirer whose stage was misjudged must find it gone, never renamed empty onto `lock/`.
  */
 function gcStages(root) {
   let names;
@@ -821,12 +839,18 @@ function gcStages(root) {
   }
   const boot = bootTimeMs();
   for (const name of names) {
-    const m = /^\.lock-stage-(\d+)-[0-9a-f]+$/.exec(name);
+    const m = /^\.lock-stage-(\d+|gc)-[0-9a-f]+$/.exec(name);
     if (!m) continue;
-    const full = path.join(root, name);
+    let doomed = path.join(root, name);
     try {
-      const beforeBoot = boot !== null && fs.statSync(full).mtimeMs < boot;
-      if (beforeBoot || !isLockOwnerAlive({ pid: Number(m[1]) })) fs.rmSync(full, { recursive: true, force: true });
+      if (m[1] !== 'gc') {
+        const beforeBoot = boot !== null && fs.statSync(doomed).mtimeMs < boot;
+        if (!beforeBoot && isLockOwnerAlive({ pid: Number(m[1]) })) continue;
+        const aside = path.join(root, `.lock-stage-gc-${crypto.randomBytes(6).toString('hex')}`);
+        fs.renameSync(doomed, aside);
+        doomed = aside;
+      }
+      fs.rmSync(doomed, { recursive: true, force: true });
     } catch {
       // gone already, or leaked; retried on a future GC pass
     }
@@ -980,12 +1004,13 @@ function assertLockOrder(group) {
  * acquire, so no separate "I already hold it" special case exists.
  *
  * Invariants: lockDir exists <=> someone holds it, or a foreign/legacy dir
- * with no readable owner.json sits there (handled as "young", timed out and
- * reported by name rather than assumed stale). A live holder can never be
- * displaced — nothing in this protocol renames or removes lockDir except
- * its own release, or a takeover that first re-confirms the exact dead
- * (pid, token) it is acting on. "How long has this sat here" never enters a
- * takeover decision; only liveness does.
+ * with no readable owner.json sits there (timed out and reported by name
+ * rather than assumed stale). A live holder can never be displaced — nothing
+ * in this protocol renames or removes lockDir except its own release, or a
+ * takeover that first re-confirms the exact dead (pid, token) it is acting
+ * on. Elapsed time alone never enters a takeover decision; liveness does,
+ * plus one proof of death by boot: an empty or unparsable owner.json last
+ * written before this boot (see `observeLockOwner`) belongs to no live process.
  */
 export async function withLock(root, fn, { timeoutMs, pollMs = 25, lockPath = paths(root).lock, group = 'broker' } = {}) {
   assertLockOrder(group);
@@ -1020,14 +1045,14 @@ export async function withLock(root, fn, { timeoutMs, pollMs = 25, lockPath = pa
         stagedOwner,
         JSON.stringify({ pid: process.pid, token, start: start === undefined ? null : start, at: Date.now() }),
       );
-      fsyncFile(stagedOwner);
-      fsyncDirectory(staging);
       fs.renameSync(staging, lockDir);
       acquired = true;
+      // Only the winner pays for durability. A crash before these leaves exactly the empty owner.json that observeLockOwner reclaims.
       try {
+        fsyncFile(path.join(lockDir, 'owner.json'));
         fsyncDirectory(path.dirname(lockDir));
       } catch {
-        // we hold the lock; a failed directory fsync must not read as contention
+        // best effort: we hold the lock, and a failed fsync must not read as contention
       }
     } catch {
       // Any failure here (contention, or a transient ENOENT/EINVAL racing a
@@ -1073,7 +1098,7 @@ export async function withLock(root, fn, { timeoutMs, pollMs = 25, lockPath = pa
         // We moved a dead lock aside but our own deadline has passed: leave
         // the path free for whoever is still waiting and give up honestly.
         throw new LockTimeoutError(
-          `lane-broker: timed out waiting for the global lock (recovered dead pid ${owner.pid}, but the deadline passed)`,
+          `lane-broker: timed out waiting for the global lock (recovered ${deadHolder(owner)}, but the deadline passed)`,
         );
       }
       if (won) continue;
@@ -1084,7 +1109,7 @@ export async function withLock(root, fn, { timeoutMs, pollMs = 25, lockPath = pa
       // contention wait.
       if (Date.now() > deadline) {
         throw new LockTimeoutError(
-          `lane-broker: timed out waiting for the global lock held by dead pid ${owner.pid} (recovery kept failing)`,
+          `lane-broker: timed out waiting for the global lock held by ${deadHolder(owner)} (recovery kept failing)`,
         );
       }
       await sleep(pollMs);

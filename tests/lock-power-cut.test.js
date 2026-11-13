@@ -82,9 +82,14 @@ test('bootTimeMs honours the test override and otherwise reports a plausible pas
 });
 
 /** Acquire a lock while recording every fsync and the staging rename into the lock path, in order. */
-async function acquisitionEvents(load) {
-  const { withLock } = await load(STATE_JS);
+async function acquisitionEvents(load, { contend = false } = {}) {
+  const { withLock, paths } = await load(STATE_JS);
   const { state } = freshEnv();
+  if (contend) {
+    const lockDir = paths(state).lock;
+    fs.mkdirSync(lockDir);
+    fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify({ pid: process.pid, token: 'someone-else', start: null, at: Date.now() }));
+  }
   const events = [];
   const { fsyncSync, renameSync } = fs;
   fs.fsyncSync = (fd) => {
@@ -96,7 +101,7 @@ async function acquisitionEvents(load) {
     return renameSync(from, to);
   };
   try {
-    await withLock(state, () => {});
+    await withLock(state, () => {}, { timeoutMs: 150 }).catch((err) => events.push(`threw:${err.name}`));
   } finally {
     fs.fsyncSync = fsyncSync;
     fs.renameSync = renameSync;
@@ -104,18 +109,32 @@ async function acquisitionEvents(load) {
   return events;
 }
 
-async function fsyncsAroundTheRename(load) {
+async function fsyncsOnlyAfterTheRename(load) {
   const events = await acquisitionEvents(load);
   const rename = events.indexOf('rename');
-  assert.equal(events.slice(0, rename).filter((e) => e === 'fsync').length, 2, `owner.json and staging dir must both be fsynced before the rename: ${events}`);
-  assert.ok(events.slice(rename + 1).includes('fsync'), `the lock's parent dir must be fsynced after the rename: ${events}`);
+  assert.deepEqual(events.slice(0, rename), [], `nothing may be fsynced before the rename: ${events}`);
+  assert.deepEqual(events.slice(rename), ['rename', 'fsync', 'fsync'], `owner.json and the parent dir must be fsynced after the rename: ${events}`);
 }
 
-test('acquiring fsyncs owner.json and the staging dir before the rename, and the parent dir after', () => fsyncsAroundTheRename(realSrc));
-
-for (const target of ['fsyncFile(stagedOwner);', 'fsyncDirectory(staging);', 'fsyncDirectory(path.dirname(lockDir));']) {
-  test(`canary: without \`${target}\` the fsync ordering test fails`, () => assertCanaryFails(STATE_JS, [target, ''], fsyncsAroundTheRename));
+async function losersDoNotFsync(load) {
+  const events = await acquisitionEvents(load, { contend: true });
+  assert.deepEqual(events.filter((e) => e === 'fsync'), [], `a contender that loses the rename must not fsync: ${events}`);
+  assert.ok(events.includes('threw:LockTimeoutError'), `the contender should have timed out: ${events}`);
 }
+
+test('the winner fsyncs owner.json and the parent dir after the rename, nothing before it', () => fsyncsOnlyAfterTheRename(realSrc));
+
+test('a contender polling a held lock fsyncs nothing', () => losersDoNotFsync(realSrc));
+
+for (const target of ["fsyncFile(path.join(lockDir, 'owner.json'));", 'fsyncDirectory(path.dirname(lockDir));']) {
+  test(`canary: without \`${target}\` the fsync ordering test fails`, () => assertCanaryFails(STATE_JS, [target, ''], fsyncsOnlyAfterTheRename));
+}
+
+test('canary: an fsync before the staging rename fails both the ordering and the contender tests', async () => {
+  const early = ['fs.renameSync(staging, lockDir);\n      acquired = true;', 'fsyncFile(stagedOwner);\n      fs.renameSync(staging, lockDir);\n      acquired = true;'];
+  await assertCanaryFails(STATE_JS, early, fsyncsOnlyAfterTheRename);
+  await assertCanaryFails(STATE_JS, early, losersDoNotFsync);
+});
 
 function plantStages(state, boot) {
   const mk = (name, ageMs) => {
@@ -146,10 +165,86 @@ async function collectsOnlyUnreachableStages(load) {
   assert.equal(fs.existsSync(s.unrelated), true, 'a directory that is not a stage was removed');
 }
 
-test('stage GC removes stages of dead pids and from before boot, never a live process\'s stage', () => collectsOnlyUnreachableStages(realSrc));
+test('stage GC removes a dead pid\'s stage and a pre-boot stage even under a live pid, and keeps a post-boot live-pid stage', () => collectsOnlyUnreachableStages(realSrc));
 
 test('canary: without the liveness check, stage GC removes a live process\'s stage', () =>
-  assertCanaryFails(STATE_JS, ['!isLockOwnerAlive({ pid: Number(m[1]) })', 'true'], collectsOnlyUnreachableStages));
+  assertCanaryFails(STATE_JS, ['isLockOwnerAlive({ pid: Number(m[1]) })', 'false'], collectsOnlyUnreachableStages));
 
 test('canary: without the boot-time check, stage GC keeps a stage older than boot', () =>
-  assertCanaryFails(STATE_JS, ['boot !== null && fs.statSync(full).mtimeMs < boot', 'false'], collectsOnlyUnreachableStages));
+  assertCanaryFails(STATE_JS, ['boot !== null && fs.statSync(doomed).mtimeMs < boot', 'false'], collectsOnlyUnreachableStages));
+
+async function readFailureIsNotAnUnreadableOwner(load) {
+  const { withLock, paths, LockTimeoutError } = await load(STATE_JS);
+  const { state } = freshEnv();
+  const lockDir = plantLock(state, paths, JSON.stringify({ pid: 2147483646, token: 'good', start: null, at: 1 }), 2 * HOUR_MS);
+  const { readFileSync } = fs;
+  fs.readFileSync = (file, ...rest) => {
+    if (String(file).endsWith('owner.json')) throw Object.assign(new Error('too many open files'), { code: 'EMFILE' });
+    return readFileSync(file, ...rest);
+  };
+  try {
+    await withBootTime(Date.now() - HOUR_MS, () => assert.rejects(withLock(state, () => {}, { timeoutMs: 200 }), LockTimeoutError));
+  } finally {
+    fs.readFileSync = readFileSync;
+  }
+  assert.deepEqual(fs.readdirSync(state).filter((n) => n.startsWith('.lock-tomb-')), [], 'a lock was tombed on the strength of a failed read');
+  assert.ok(fs.existsSync(lockDir));
+}
+
+test('a failing owner.json read (EMFILE) with a good file is waited out, never tombed as unreadable', () => readFailureIsNotAnUnreadableOwner(realSrc));
+
+test('canary: if a failed read counted as an unreadable owner, a pre-boot lock is tombed on a read error', () =>
+  assertCanaryFails(STATE_JS, ['return null; // a failed read (EMFILE, EIO, EACCES, ENOENT) says nothing about the content', "raw = '';"], readFailureIsNotAnUnreadableOwner));
+
+async function misjudgedStageIsNeverPublishedEmpty(load) {
+  const { withLock, paths, readJsonSafe, __test } = await load(STATE_JS);
+  const { state } = freshEnv();
+  const { renameSync, rmSync } = fs;
+  let gcRan = false;
+  fs.renameSync = (from, to) => {
+    if (!gcRan && path.basename(String(from)).startsWith(`.lock-stage-${process.pid}-`)) {
+      gcRan = true;
+      __test.gcStages(state); // boot time in the future: our own live stage is misjudged as pre-boot
+    }
+    return renameSync(from, to);
+  };
+  fs.rmSync = (target, opts) => {
+    // a recursive remove is not atomic: it unlinks owner.json before the directory, and may be interrupted there
+    if (path.basename(String(target)).startsWith('.lock-stage-')) fs.unlinkSync(path.join(String(target), 'owner.json'));
+    throw new Error('interrupted remove');
+  };
+  try {
+    await withBootTime(Date.now() + HOUR_MS, () =>
+      withLock(state, () => {
+        const owner = readJsonSafe(path.join(paths(state).lock, 'owner.json'));
+        assert.equal(owner?.pid, process.pid, 'the lock was published with an empty or foreign owner.json');
+      }, { timeoutMs: 1000 }),
+    );
+  } finally {
+    fs.renameSync = renameSync;
+    fs.rmSync = rmSync;
+  }
+  assert.ok(gcRan, 'the GC hook never fired');
+}
+
+test('a stage that GC misjudges and half-removes is never renamed empty onto lock/', () => misjudgedStageIsNeverPublishedEmpty(realSrc));
+
+test('canary: if GC removed a stage in place, a misjudged acquirer would publish an empty lock/', () =>
+  assertCanaryFails(STATE_JS, ['fs.renameSync(doomed, aside);\n        doomed = aside;', ''], misjudgedStageIsNeverPublishedEmpty));
+
+test('bootTimeMs never returns undefined: a number, or null when unknown', async () => {
+  const { bootTimeMs } = await realSrc(STATE_JS);
+  for (const value of ['unknown', '', '  ', 'NaN', '123']) {
+    await withBootTime(value, () => assert.ok(bootTimeMs() === null || typeof bootTimeMs() === 'number', `${value}: ${bootTimeMs()}`));
+  }
+  assert.equal(await withBootTime('unknown', () => bootTimeMs()), null);
+  assert.equal(await withBootTime('', () => bootTimeMs()), null);
+  const saved = process.env.LANE_BROKER_BOOT_TIME_MS;
+  delete process.env.LANE_BROKER_BOOT_TIME_MS;
+  try {
+    const real = bootTimeMs();
+    assert.ok(real === null || typeof real === 'number', `${real}`);
+  } finally {
+    if (saved !== undefined) process.env.LANE_BROKER_BOOT_TIME_MS = saved;
+  }
+});
