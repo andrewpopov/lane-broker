@@ -315,6 +315,28 @@ export function fsyncDirectory(dir) {
   }
 }
 
+/** Make a file's contents durable (its data, not the directory entry that names it: see `fsyncDirectory`). */
+export function fsyncFile(file) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * `mkdir -p` that survives power loss. Fsyncs the parent of EVERY component of `dir`, whether this call created it or it already
+ * existed: an existing component may have been linked by a process that died before its own directory fsync. Outermost first.
+ */
+export function ensureDurableDir(dir) {
+  const target = path.resolve(dir);
+  fs.mkdirSync(target, { recursive: true });
+  const parents = [];
+  for (let d = target; path.dirname(d) !== d; d = path.dirname(d)) parents.unshift(path.dirname(d));
+  for (const parent of parents) fsyncDirectory(parent);
+}
+
 export function atomicWriteJson(file, obj, opts) {
   atomicWriteFile(file, `${JSON.stringify(obj, null, 2)}\n`, opts);
 }

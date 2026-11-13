@@ -69,6 +69,7 @@ import { scrubCommandEnv } from './scrub-command-env.js';
 import { observedLeaseFields, summarizeObservedCpu, sanitizeRssPeak, integratedCpuSeconds } from './observed.js';
 
 const LOG_CAP_BYTES = 50 * 1024 * 1024;
+const LOG_TRUNCATION_MARKER = '\n[lane-broker] log truncated at 50MB\n';
 const SUPERVISOR_ERROR_EXIT = 70;
 const GROUP_REAPED_REASON = 'leader-exited-group-reaped';
 const MAX_OMITTED_SYMLINKS_LISTED = 10;
@@ -190,14 +191,35 @@ async function killGroup(pgid) {
   }
 }
 
+function fileEndsWith(file, text) {
+  const tail = Buffer.from(text);
+  try {
+    const fd = fs.openSync(file, 'r');
+    try {
+      const { size } = fs.fstatSync(fd);
+      if (size < tail.length) return false;
+      const got = Buffer.alloc(tail.length);
+      fs.readSync(fd, got, 0, tail.length, size - tail.length);
+      return got.equals(tail);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
+
 class CappedLogWriter {
-  constructor(logPath) {
+  /** `capBytes` is injectable so a test need not write 50 MB. The existing file is counted as-is: a caller that must discard an
+   *  uncommitted tail truncates the file BEFORE constructing the writer, so `bytes` and `truncated` describe what is really there. */
+  constructor(logPath, { capBytes = LOG_CAP_BYTES } = {}) {
     let existingBytes = 0;
     try {
       existingBytes = fs.statSync(logPath).size;
     } catch {
       // new file
     }
+    this.capBytes = capBytes;
     // O_NOFOLLOW refuses to open through a symlink; existing bytes count
     // toward the cap so a pre-existing (or re-opened) log can't bypass it.
     const flags = fs.constants.O_CREAT | fs.constants.O_WRONLY | fs.constants.O_APPEND | (fs.constants.O_NOFOLLOW || 0);
@@ -217,16 +239,17 @@ class CappedLogWriter {
       this.pausedSources.clear();
     });
     this.bytes = existingBytes;
-    this.truncated = existingBytes >= LOG_CAP_BYTES;
+    this.truncated = existingBytes >= capBytes && fileEndsWith(logPath, LOG_TRUNCATION_MARKER);
   }
 
   /** Returns false when the caller should pause its source until 'drain' fires. */
   write(chunk) {
     if (this.truncated || this.failed) return true;
-    if (this.bytes + chunk.length > LOG_CAP_BYTES) {
-      const remaining = LOG_CAP_BYTES - this.bytes;
+    if (this.bytes + chunk.length > this.capBytes) {
+      const remaining = this.capBytes - this.bytes;
       if (remaining > 0) this.stream.write(chunk.subarray(0, remaining));
-      this.stream.write('\n[lane-broker] log truncated at 50MB\n');
+      this.stream.write(LOG_TRUNCATION_MARKER);
+      this.bytes += Math.max(remaining, 0) + Buffer.byteLength(LOG_TRUNCATION_MARKER);
       this.truncated = true;
       return true;
     }
@@ -246,6 +269,22 @@ class CappedLogWriter {
       this.pausedSources.delete(source);
       source.resume();
     });
+  }
+
+  /** Wait for every queued write to reach the file, then fsync it. False when the writer failed: nothing it holds is durable. */
+  async durable() {
+    if (this.failed) return false;
+    await new Promise((resolve) => this.stream.write('', resolve));
+    if (this.failed) return false;
+    const fd = this.stream.fd;
+    await new Promise((resolve) => fs.fsync(fd, (err) => {
+      if (err) {
+        this.failed = true;
+        this.error = err;
+      }
+      resolve();
+    }));
+    return !this.failed;
   }
 
   /** Await the stream fully flushing before the process exits, so the log's tail is never lost. */
@@ -874,6 +913,21 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
   }
 }
 
+/**
+ * Drain, then publish one attempt's terminal result inside a single `publishTerminal` transaction. Never exits: the caller owns what
+ * follows. `durable` fsyncs `result.json` (and its directory) before the attempt record is removed. Returns `{published, finalResult}`;
+ * `finalResult` is null when nothing was published.
+ */
+export async function publishAttemptTerminal(root, id, generation, { drain, buildConfirmedResult, buildCancelledResult, writeResult, durable = false, cancelPrecedence, publishOptions = {} }) {
+  await drain();
+  let finalResult = null;
+  const published = await publishTerminal(root, id, generation, ({ cancelled }) => {
+    finalResult = cancelled ? buildCancelledResult() : buildConfirmedResult();
+    writeResult(finalResult, { fsync: durable });
+  }, { ...publishOptions, ...(cancelPrecedence ? { cancelPrecedence } : {}) });
+  return { published, finalResult };
+}
+
 async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind, cpuLimit) {
   const attemptStartedAt = Date.now();
   // BRAIN-850 S3: once cancelled, a lock write fails fast (the process then exits with the attempt kept) instead of retrying contention forever
@@ -910,10 +964,10 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   // and run that dispatch actually saw. Every dispatch site sets it; an unranked one clears it.
   let placement = null;
   const placementField = () => (placement ? { placement } : { placement: undefined });
-  function writeResultSync(result) {
+  function writeResultSync(result, { fsync = false } = {}) {
     // BRAIN-549: settled before the result is published, so a caller that reads history once `lane run` returns finds the row
     const contentKey = settledContentKey(enriched);
-    atomicWriteJson(enriched.resultPath, result);
+    atomicWriteJson(enriched.resultPath, result, { fsync });
     appendHistory(root, historyRow(enriched, { ...result, ...(selectedRunner ? { runner: selectedRunner } : {}), ...(placement ? { placement } : {}) }, { contentKey, contentKeyVerified: contentKey !== null }));
   }
 
@@ -930,15 +984,17 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
    * never assume that outcome on its own.
    */
   async function publishAndExit(generation, buildConfirmedResult) {
-    await logWriter.finish();
-    if (stdoutForward) await stdoutForward.drain();
-    if (stderrForward) await stderrForward.drain();
-
-    let finalResult = null;
-    const published = await publishTerminal(root, enriched.id, generation, ({ cancelled }) => {
-      finalResult = cancelled ? remoteCancelledResult(enriched.id, attemptStartedAt) : buildConfirmedResult();
-      writeResultSync(finalResult);
-    }, whileCancelling());
+    const { published, finalResult } = await publishAttemptTerminal(root, enriched.id, generation, {
+      drain: async () => {
+        await logWriter.finish();
+        if (stdoutForward) await stdoutForward.drain();
+        if (stderrForward) await stderrForward.drain();
+      },
+      buildConfirmedResult,
+      buildCancelledResult: () => remoteCancelledResult(enriched.id, attemptStartedAt),
+      writeResult: writeResultSync,
+      publishOptions: whileCancelling(),
+    });
     if (!published.ok) {
       // Generation mismatch: unreachable on every call site below (nothing
       // else advances this attempt's generation while this supervisor is

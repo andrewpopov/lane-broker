@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { Readable } from 'node:stream';
-import { atomicWriteJson, atomicWriteFile, readJsonSafe } from './state.js';
+import { atomicWriteJson, atomicWriteFile, readJsonSafe, ensureDurableDir, fsyncFile, fsyncDirectory } from './state.js';
 import { isCanonicalRelPath, scrubbedGitEnv } from './remote-manifest.js';
 import { literalDirPrefix } from './config.js';
 import { readHeaderLine, readVerifiedFile } from './remote-stream.js';
@@ -439,4 +439,25 @@ export function installArtifacts(worktreeRoot, files, patterns) {
     }
   }
   return { written, refused };
+}
+
+/**
+ * Pull-only wrapper over the unchanged `installArtifacts`: every written file, each distinct destination directory and every
+ * ancestor of it (`ensureDurableDir`'s every-component rule, so a newly created `reports/run/` is linked durably all the way up
+ * through the worktree root) is fsynced BEFORE the optional `installedMarkerPath` is written, so the marker never outlives the
+ * effects it suppresses. Push keeps calling `installArtifacts` directly.
+ */
+export function installArtifactsDurable(worktreeRoot, files, patterns, { installedMarkerPath } = {}) {
+  const result = installArtifacts(worktreeRoot, files, patterns);
+  if (result.written.length > 0) {
+    const realRoot = fs.realpathSync(worktreeRoot);
+    const dirs = new Set(result.written.map((rel) => path.dirname(path.join(realRoot, rel))));
+    for (const rel of result.written) fsyncFile(path.join(realRoot, rel));
+    for (const dir of dirs) {
+      fsyncDirectory(dir);
+      ensureDurableDir(dir);
+    }
+  }
+  if (installedMarkerPath) atomicWriteJson(installedMarkerPath, { paths: result.written }, { fsync: true });
+  return result;
 }
