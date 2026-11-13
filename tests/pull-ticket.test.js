@@ -495,7 +495,7 @@ SCENARIOS['T16: cancel outcomes: queued, released, runner-confirmed and a normal
 
   const quarantined = await cancelFixture(t, w, load, 5, queued);
   await quarantined.hold();
-  await quarantined.setRow(UNPROVEN_CANCEL_ROW);
+  await quarantined.runner.finishCancelled(false);
   const unproven = await quarantined.cancelStep();
   assert.deepEqual([unproven.state, unproven.exitCode], ['unresolved', 1]);
   assert.ok(readAttempt(quarantined.state, quarantined.id), 'the attempt is kept');

@@ -860,8 +860,10 @@ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, p
 DECLARE v_me record; v_out jsonb; v_now timestamptz; v_protocol int; v_held int; v_id uuid; v_epoch int; v_token uuid;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
-  SELECT * INTO v_me FROM lane_dispatch.me('agent');
-  PERFORM 1 FROM lane_dispatch.principals p WHERE p.login_role = session_user FOR UPDATE;
+  SELECT p.host, p.tags, p.allowed_repos, p.max_claims INTO v_me FROM lane_dispatch.principals p WHERE p.login_role = session_user AND p.kind = 'agent' FOR UPDATE;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'no agent principal for %', session_user USING ERRCODE = '42501';
+  END IF;
   v_out := lane_dispatch.claim_replay(p_req);
   IF v_out IS NOT NULL THEN RETURN v_out; END IF;
   SELECT r.protocol INTO v_protocol FROM lane_dispatch.runners r WHERE r.host = v_me.host;
@@ -875,8 +877,9 @@ BEGIN
    WHERE t.state = 'queued' AND NOT t.cancel_requested AND t.min_protocol <= v_protocol AND t.not_before <= v_now
      AND lane_dispatch.eligible(t.requires_tags, t.repo_key, v_me.tags, v_me.allowed_repos)
      AND t.cpu_cores <= p_free_cpu AND t.memory_bytes <= p_free_mem AND NOT (t.lane_key = ANY (coalesce(p_held_keys, '{}')))
-   ORDER BY lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) DESC, lane_dispatch.scarcity(t.requires_tags, t.repo_key),
-            t.created_at, t.id LIMIT 1 FOR UPDATE SKIP LOCKED;
+   ORDER BY lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) DESC,
+            CASE WHEN lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) >= 2.0 THEN t.created_at END NULLS LAST,
+            lane_dispatch.scarcity(t.requires_tags, t.repo_key), t.created_at, t.id LIMIT 1 FOR UPDATE SKIP LOCKED;
   IF NOT FOUND THEN RETURN jsonb_build_object('status', 'none'); END IF;
   v_token := gen_random_uuid();
   UPDATE lane_dispatch.tickets SET state = 'claimed', epoch = epoch + 1, claim_token = v_token, host = v_me.host, lease_until = v_now + interval '120 seconds'
@@ -965,7 +968,7 @@ BEGIN
     RETURN jsonb_build_object('fenced', true, 'state', v_t.state);
   END IF;
   IF v_t.state = 'running' THEN
-    IF NOT v_t.cancel_requested THEN RETURN jsonb_build_object('refused', 'started'); END IF;
+    IF NOT (v_t.cancel_requested AND p_proof = 'cancel-confirmed') THEN RETURN jsonb_build_object('refused', 'started'); END IF;
     UPDATE lane_dispatch.tickets SET state = 'cancelled', claim_token = NULL, host = NULL, lease_until = NULL, finished_at = lane_dispatch.now() WHERE id = p_id;
     RETURN jsonb_build_object('fenced', false, 'state', 'cancelled');
   END IF;

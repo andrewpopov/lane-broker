@@ -18,4 +18,6 @@ ALTER TABLE lane_dispatch.tickets
   ADD COLUMN reserved_at timestamptz;
 ALTER TABLE lane_dispatch.runners ADD COLUMN protocol int NOT NULL DEFAULT 1;
 
+DELETE FROM lane_dispatch.claim_requests WHERE ticket IS NULL;
+
 DROP TABLE lane_dispatch.claim_lock;

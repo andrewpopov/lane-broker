@@ -31,6 +31,8 @@ const GUARDS = {
     }
     assert.deepEqual(await w.ticket(tid(1)), before, 'nothing changed');
     await call(s1, 'ld_cancel', tid(2));
+    assert.deepEqual(await release(a1, cancelling, 'never-started'), { refused: 'started' }, 'a cancel request alone is not proof the run stopped');
+    assert.equal((await w.ticket(tid(2))).state, 'running');
     assert.deepEqual(await release(a1, cancelling, 'cancel-confirmed'), { fenced: false, state: 'cancelled' });
     assert.notEqual((await w.ticket(tid(2))).finished_at, null);
   },
@@ -142,10 +144,11 @@ const GUARDS = {
   },
 
   'a host takes the ticket fewer hosts can run first, within a tier': async (w) => {
+    await setNow(w, at(0));
     const [s1, a1] = [await w.as(logins.s1), await w.as(logins.a1)];
-    await enqueue(s1, tid(1), { priority: 8 });
-    await enqueue(s1, tid(2), { priority: 8, tags: ['fast'] });
-    assert.equal((await claim(a1)).id, tid(2), 'only a1 can run the fast ticket, so a1 takes it before the older one every host can run');
+    await enqueue(s1, tid(1), { priority: 5 });
+    await enqueue(s1, tid(2), { priority: 5, tags: ['fast'] });
+    assert.equal((await claim(a1)).id, tid(2), 'two fresh mediums of one score: only a1 can run the fast one, so a1 takes it first');
     assert.equal((await claim(a1)).id, tid(1));
   },
 
@@ -182,6 +185,36 @@ const GUARDS = {
     const a1 = await w.as(logins.a1);
     assert.deepEqual([(await claim(a1)).id, (await claim(a1)).id], [tid(3), tid(1)], 'the release candidate first, then the aged low before the fresh high');
     assert.equal((await w.ticket(tid(2))).state, 'queued');
+  },
+
+  'aged work is claimed before fresh scarcer work once it has reached the high level': async (w) => {
+    await setNow(w, at(0));
+    await enqueue(await w.as(logins.s1), tid(1), { priority: 2, tags: ['linux'] });
+    await setNow(w, at(61 * MINUTE));
+    const s1 = await w.as(logins.s1);
+    for (const n of [2, 3, 4]) await enqueue(s1, tid(n), { priority: 8, tags: ['fast'] });
+    assert.equal((await claim(await w.as(logins.a1))).id, tid(1), 'the aged low, runnable on a1 and a2, goes before fresh work only a1 can run');
+  },
+
+  'ld_claim reads the principal under its lock: a max_claims change committed while a claim waits is seen by that claim': async (w) => {
+    await enqueue(await w.as(logins.s1), tid(1));
+    const a1 = await w.as(logins.a1);
+    const admin = await w.cluster.client(w.db, logins.admin);
+    await admin.query('BEGIN');
+    await call(admin, 'ld_set_principal', logins.a1, 'agent', 'a1', ['linux', 'fast'], ['repoA'], 0);
+    const racing = claim(a1);
+    assert.equal(await Promise.race([racing, sleep(400).then(() => 'waiting')]), 'waiting', 'the claim waits for the open principal change');
+    await admin.query('COMMIT');
+    assert.deepEqual(await racing, { status: 'none' }, 'and then sees max_claims 0');
+    assert.equal((await w.ticket(tid(1))).state, 'queued');
+  },
+
+  'a runner cannot store lane.test_now for itself with ALTER ROLE, in the database or cluster-wide': async (w) => {
+    const a1 = await w.as(logins.a1);
+    for (const sql of [`ALTER ROLE ${logins.a1} SET lane.test_now = '2000-01-01T00:00:00Z'`,
+      `ALTER ROLE ${logins.a1} IN DATABASE ${w.db} SET lane.test_now = '2000-01-01T00:00:00Z'`]) {
+      await assert.rejects(a1.query(sql), (err) => err.code === '42501', sql);
+    }
   },
 
   'retention selects every queue-authored lost row: reaped, release-capped and restored': async (w) => {
@@ -252,7 +285,9 @@ const MIGRATION_NOT_BEFORE = "ADD COLUMN not_before timestamptz NOT NULL DEFAULT
 const RESTORE_STAMP = "SET state = 'lost', finished_at = lane_dispatch.now(), result = lane_dispatch.lost_result('queue-restored', epoch)";
 const CANARIES = [
   ['a release of a running row is refused and changes nothing, unless a cancel was requested',
-    "IF NOT v_t.cancel_requested THEN RETURN jsonb_build_object('refused', 'started'); END IF;", ''],
+    "IF NOT (v_t.cancel_requested AND p_proof = 'cancel-confirmed') THEN RETURN jsonb_build_object('refused', 'started'); END IF;", ''],
+  ['a release of a running row is refused and changes nothing, unless a cancel was requested',
+    "IF NOT (v_t.cancel_requested AND p_proof = 'cancel-confirmed') THEN", "IF NOT v_t.cancel_requested THEN"],
   ['the sixth requeue settles lost with release-cap, and each requeue backs off 5, 10, 20, 40 and 60 s', "WHEN v_t.requeues >= 5 THEN 'lost'", "WHEN v_t.requeues >= 500 THEN 'lost'"],
   ['the sixth requeue settles lost with release-cap, and each requeue backs off 5, 10, 20, 40 and 60 s', "interval '5 seconds' * 2 ^ requeues", "interval '5 seconds'"],
   ['the sixth requeue settles lost with release-cap, and each requeue backs off 5, 10, 20, 40 and 60 s', "THEN lane_dispatch.lost_result('release-cap', epoch)", 'THEN NULL'],
@@ -267,16 +302,22 @@ const CANARIES = [
   ['the protocol filter hides a ticket from an older runner, and a runner below protocol_min or unregistered is told to upgrade', 'AND t.min_protocol <= v_protocol', ''],
   ['the protocol filter hides a ticket from an older runner, and a runner below protocol_min or unregistered is told to upgrade', 'IF NOT FOUND OR v_protocol < lane_dispatch.protocol_min() THEN', 'IF false THEN'],
   ['two hosts claim concurrently: neither is answered busy or made to wait for the other',
-    'PERFORM 1 FROM lane_dispatch.principals p WHERE p.login_role = session_user FOR UPDATE;', "PERFORM 1 FROM lane_dispatch.principals p WHERE p.kind = 'agent' ORDER BY p.login_role FOR UPDATE;"],
-  ['two claims by one login serialise on its principal row, so max_claims holds',
-    'PERFORM 1 FROM lane_dispatch.principals p WHERE p.login_role = session_user FOR UPDATE;', ''],
-  ['a host takes the ticket fewer hosts can run first, within a tier', 'lane_dispatch.scarcity(t.requires_tags, t.repo_key),\n            t.created_at', 't.created_at'],
+    'v_out := lane_dispatch.claim_replay(p_req);\n  IF v_out IS NOT NULL THEN RETURN v_out; END IF;\n  SELECT r.protocol', 'PERFORM pg_advisory_xact_lock(1);\n  v_out := lane_dispatch.claim_replay(p_req);\n  IF v_out IS NOT NULL THEN RETURN v_out; END IF;\n  SELECT r.protocol'],
+  ['two claims by one login serialise on its principal row, so max_claims holds', "p.kind = 'agent' FOR UPDATE;", "p.kind = 'agent';"],
+  ['ld_claim reads the principal under its lock: a max_claims change committed while a claim waits is seen by that claim', "p.kind = 'agent' FOR UPDATE;", "p.kind = 'agent';"],
+  ['ld_claim reads the principal under its lock: a max_claims change committed while a claim waits is seen by that claim',
+    "SELECT p.host, p.tags, p.allowed_repos, p.max_claims INTO v_me FROM lane_dispatch.principals p WHERE p.login_role = session_user AND p.kind = 'agent' FOR UPDATE;\n  IF NOT FOUND THEN\n    RAISE EXCEPTION 'no agent principal for %', session_user USING ERRCODE = '42501';\n  END IF;",
+    "SELECT * INTO v_me FROM lane_dispatch.me('agent');\n  PERFORM 1 FROM lane_dispatch.principals p WHERE p.login_role = session_user FOR UPDATE;"],
+  ['aged work is claimed before fresh scarcer work once it has reached the high level',
+    "            CASE WHEN lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) >= 2.0 THEN t.created_at END NULLS LAST,\n", ''],
+  ['a host takes the ticket fewer hosts can run first, within a tier', 'lane_dispatch.scarcity(t.requires_tags, t.repo_key), t.created_at, t.id', 't.created_at, t.id'],
   ['eff_score holds an aged low and medium under a fresh high until 60 minutes, then ties it', 'v_credit >= 3600', 'v_credit >= 360000'],
   ['eff_score holds an aged low and medium under a fresh high until 60 minutes, then ties it', 'ELSE 1.98 END', 'ELSE 2.0 END'],
   ['eff_score holds an aged low and medium under a fresh high until 60 minutes, then ties it', 'CASE WHEN p_priority >= 9 THEN 0.01 ELSE 0 END', '0'],
   ['an aged low ties a fresh priority 8 and wins on age, and a fresh priority 9 beats both', 'CASE WHEN p_priority >= 9 THEN 0.01 ELSE 0 END', '0'],
   ['an aged low ties a fresh priority 8 and wins on age, and a fresh priority 9 beats both', 'v_credit >= 3600', 'v_credit >= 360000'],
-  ['an aged low ties a fresh priority 8 and wins on age, and a fresh priority 9 beats both', 't.created_at, t.id LIMIT 1', 't.id DESC LIMIT 1'],
+  ['an aged low ties a fresh priority 8 and wins on age, and a fresh priority 9 beats both',
+    "THEN t.created_at END NULLS LAST,\n            lane_dispatch.scarcity(t.requires_tags, t.repo_key), t.created_at, t.id LIMIT 1", "THEN t.id END DESC NULLS LAST,\n            lane_dispatch.scarcity(t.requires_tags, t.repo_key), t.id DESC LIMIT 1"],
   ['eff_score holds an aged low and medium under a fresh high until 60 minutes, then ties it', 'CASE WHEN p_ages THEN greatest(p_age_s, 0) ELSE 0 END', 'greatest(p_age_s, 0)'],
   ['retention selects every queue-authored lost row: reaped, release-capped and restored', RESTORE_STAMP, "SET state = 'lost', result = lane_dispatch.lost_result('queue-restored', epoch)"],
   ['retention selects every queue-authored lost row: reaped, release-capped and restored', "finished_at = CASE WHEN v_state = 'queued' THEN NULL ELSE p_now END", 'finished_at = NULL'],
