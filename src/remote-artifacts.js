@@ -3,7 +3,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { Readable } from 'node:stream';
-import { atomicWriteJson, atomicWriteFile, readJsonSafe, ensureDurableDir, fsyncFile, fsyncDirectory } from './state.js';
+import { atomicWriteJson, atomicWriteFile, readJsonSafe, ensureDurableDir, fsyncFile } from './state.js';
 import { isCanonicalRelPath, scrubbedGitEnv } from './remote-manifest.js';
 import { literalDirPrefix } from './config.js';
 import { readHeaderLine, readVerifiedFile } from './remote-stream.js';
@@ -453,10 +453,7 @@ export function installArtifactsDurable(worktreeRoot, files, patterns, { install
     const realRoot = fs.realpathSync(worktreeRoot);
     const dirs = new Set(result.written.map((rel) => path.dirname(path.join(realRoot, rel))));
     for (const rel of result.written) fsyncFile(path.join(realRoot, rel));
-    for (const dir of dirs) {
-      fsyncDirectory(dir);
-      ensureDurableDir(dir);
-    }
+    for (const dir of dirs) ensureDurableDir(dir, { boundary: realRoot });
   }
   if (installedMarkerPath) atomicWriteJson(installedMarkerPath, { paths: result.written }, { fsync: true });
   return result;

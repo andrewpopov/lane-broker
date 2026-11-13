@@ -5,11 +5,12 @@ import fs from 'node:fs';
 import { dispatchRemote } from '../src/remote-client.js';
 import { tmpDir, makeFakeSshBin, makeRunner, clientEnv, makeGitWorktree, makeDispatchArgs } from './remote-harness.js';
 
-const PUSH_STDIN_SHA256 = 'a27aa27af4411ebc552a1c85861d8d44f83788b36fd6dfdbb8cbc7b6db9534da';
+const PUSH_STDIN_SHA256 = '796eb4c85cef123efea7d09ecfbdaf976cba43ac1612322356bb849aecfaf07f';
 
 /** Every optional header field set, so the golden covers the whole of `buildExecHeader`, not just the always-present ones. */
 const FULL_HEADER_ARGS = {
   ticketId: '00000000-0000-4000-8000-000000000001',
+  argv: ['node', '-e', 'process.exit(0)'],
   weight: 2,
   cpuCores: 3,
   memoryBytes: 1024,

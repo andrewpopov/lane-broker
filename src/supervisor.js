@@ -211,8 +211,9 @@ function fileEndsWith(file, text) {
 
 class CappedLogWriter {
   /** `capBytes` is injectable so a test need not write 50 MB. The existing file is counted as-is: a caller that must discard an
-   *  uncommitted tail truncates the file BEFORE constructing the writer, so `bytes` and `truncated` describe what is really there. */
-  constructor(logPath, { capBytes = LOG_CAP_BYTES } = {}) {
+   *  uncommitted tail truncates the file BEFORE constructing the writer, so `bytes` and `truncated` describe what is really there.
+   *  `deriveTruncatedFromMarker` (pull only) sets `truncated` only when the file already ends with the marker; push keeps the size-only rule. */
+  constructor(logPath, { capBytes = LOG_CAP_BYTES, deriveTruncatedFromMarker = false } = {}) {
     let existingBytes = 0;
     try {
       existingBytes = fs.statSync(logPath).size;
@@ -239,7 +240,7 @@ class CappedLogWriter {
       this.pausedSources.clear();
     });
     this.bytes = existingBytes;
-    this.truncated = existingBytes >= capBytes && fileEndsWith(logPath, LOG_TRUNCATION_MARKER);
+    this.truncated = existingBytes >= capBytes && (!deriveTruncatedFromMarker || fileEndsWith(logPath, LOG_TRUNCATION_MARKER));
   }
 
   /** Returns false when the caller should pause its source until 'drain' fires. */
@@ -915,16 +916,17 @@ async function runRemoteAttempt(root, enriched, globalCfg, abortSignal, rebind =
 
 /**
  * Drain, then publish one attempt's terminal result inside a single `publishTerminal` transaction. Never exits: the caller owns what
- * follows. `durable` fsyncs `result.json` (and its directory) before the attempt record is removed. Returns `{published, finalResult}`;
+ * follows. `resolvePublishOptions` runs AFTER the drain, so a cancel that lands mid-drain still gets the cancelling lock timeout
+ * (BRAIN-850). `durable` fsyncs `result.json` (and its directory) before the attempt record is removed. Returns `{published, finalResult}`;
  * `finalResult` is null when nothing was published.
  */
-export async function publishAttemptTerminal(root, id, generation, { drain, buildConfirmedResult, buildCancelledResult, writeResult, durable = false, cancelPrecedence, publishOptions = {} }) {
+export async function publishAttemptTerminal(root, id, generation, { drain, buildConfirmedResult, buildCancelledResult, writeResult, durable = false, cancelPrecedence, resolvePublishOptions = () => ({}) }) {
   await drain();
   let finalResult = null;
   const published = await publishTerminal(root, id, generation, ({ cancelled }) => {
     finalResult = cancelled ? buildCancelledResult() : buildConfirmedResult();
     writeResult(finalResult, { fsync: durable });
-  }, { ...publishOptions, ...(cancelPrecedence ? { cancelPrecedence } : {}) });
+  }, { ...resolvePublishOptions(), ...(cancelPrecedence ? { cancelPrecedence } : {}) });
   return { published, finalResult };
 }
 
@@ -993,7 +995,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       buildConfirmedResult,
       buildCancelledResult: () => remoteCancelledResult(enriched.id, attemptStartedAt),
       writeResult: writeResultSync,
-      publishOptions: whileCancelling(),
+      resolvePublishOptions: whileCancelling,
     });
     if (!published.ok) {
       // Generation mismatch: unreachable on every call site below (nothing

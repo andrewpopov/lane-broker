@@ -2,11 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv } from './helpers.js';
+import { freshEnv, sleep } from './helpers.js';
 import { makeGitWorktree } from './remote-harness.js';
 import { makeTmpDir } from './helpers/tmp.js';
 import { recordFsyncs } from './helpers/fsync-recorder.js';
-import { ensureDurableDir, paths, atomicWriteFile } from '../src/state.js';
+import { ensureDurableDir, fsyncDirectory as fsyncDirectoryOf, paths, atomicWriteFile, withLock } from '../src/state.js';
 import { installArtifactsDurable } from '../src/remote-artifacts.js';
 import { createAttempt, readAttempt, updateAttempt, publishTerminal } from '../src/attempts.js';
 import { CappedLogWriter, publishAttemptTerminal } from '../src/supervisor.js';
@@ -21,29 +21,53 @@ const withRecorder = async (fn) => {
   return recorder;
 };
 
-const parentsOfEveryComponent = (dir) => {
-  const parents = [];
-  for (let d = path.resolve(dir); path.dirname(d) !== d; d = path.dirname(d)) parents.push(path.dirname(d));
-  return parents;
-};
-
 // ---- ensureDurableDir (T33) ----
 
-test('T33: ensureDurableDir fsyncs the parent of every component of a fresh path', async () => {
+const chainUpTo = (dir, boundary) => {
+  const chain = [];
+  for (let d = path.resolve(dir); ; d = path.dirname(d)) {
+    chain.push(d);
+    if (d === boundary) return chain;
+  }
+};
+
+test('T33: ensureDurableDir fsyncs every component of a fresh path up to the boundary, and nothing above it', async () => {
   const base = fs.realpathSync(makeTmpDir('durable-dir-'));
   const target = path.join(base, 'pull', 'ticket-1', 'stage');
-  const recorder = await withRecorder(() => ensureDurableDir(target));
+  const recorder = await withRecorder(() => ensureDurableDir(target, { boundary: base }));
   assert.ok(fs.statSync(target).isDirectory());
-  for (const parent of parentsOfEveryComponent(target)) assert.ok(recorder.fsyncedPaths().includes(parent), `no fsync of ${parent}`);
+  assert.deepEqual(recorder.fsyncedPaths(), chainUpTo(target, base).reverse());
 });
 
 test('T33: an existing but unsynced component still gets its parent fsynced', async () => {
   const base = fs.realpathSync(makeTmpDir('durable-dir-'));
   const existing = path.join(base, 'pull', 'ticket-1');
   fs.mkdirSync(existing, { recursive: true });
-  const recorder = await withRecorder(() => ensureDurableDir(existing));
-  for (const parent of parentsOfEveryComponent(existing)) assert.ok(recorder.fsyncedPaths().includes(parent), `no fsync of ${parent}`);
+  const recorder = await withRecorder(() => ensureDurableDir(existing, { boundary: base }));
   assert.ok(recorder.fsyncedPaths().includes(path.join(base, 'pull')), 'the parent of the pre-existing ticket directory was not fsynced');
+  assert.ok(recorder.fsyncedPaths().includes(base));
+});
+
+test('T33: a missing boundary, or a boundary that does not contain the directory, is an error', () => {
+  const base = fs.realpathSync(makeTmpDir('durable-dir-'));
+  assert.throws(() => ensureDurableDir(path.join(base, 'a')), /requires a boundary/);
+  assert.throws(() => ensureDurableDir(path.join(base, 'a'), { boundary: path.join(base, 'elsewhere') }), /not inside/);
+  assert.equal(fs.existsSync(path.join(base, 'a')), false);
+});
+
+test('T33: an execute-only ancestor above the boundary is never opened', { skip: process.getuid?.() === 0 }, () => {
+  const base = fs.realpathSync(makeTmpDir('durable-dir-'));
+  const sealed = path.join(base, 'sealed');
+  const boundary = path.join(sealed, 'root');
+  fs.mkdirSync(boundary, { recursive: true });
+  fs.chmodSync(sealed, 0o111);
+  try {
+    assert.throws(() => fsyncDirectoryOf(sealed), { code: 'EACCES' });
+    ensureDurableDir(path.join(boundary, 'x', 'y'), { boundary });
+    assert.ok(fs.statSync(path.join(boundary, 'x', 'y')).isDirectory());
+  } finally {
+    fs.chmodSync(sealed, 0o755);
+  }
 });
 
 // ---- installArtifactsDurable (T37) ----
@@ -60,12 +84,16 @@ test('T37: a new nested destination is durable up through the worktree root befo
   });
   assert.deepEqual(result.written, ['reports/run/output.json']);
   assert.deepEqual(JSON.parse(fs.readFileSync(markerPath, 'utf8')), { paths: ['reports/run/output.json'] });
-  const marker = recorder.indexOf('rename', markerPath);
-  assert.ok(marker >= 0);
-  for (const barrier of [path.join(wt, 'reports/run/output.json'), path.join(wt, 'reports/run'), path.join(wt, 'reports'), wt]) {
+  const barriers = [path.join(wt, 'reports/run/output.json'), path.join(wt, 'reports/run'), path.join(wt, 'reports'), wt].map((barrier) => {
     const at = recorder.indexOf('fsync', barrier);
-    assert.ok(at >= 0 && at < marker, `no fsync of ${barrier} before the installed marker`);
-  }
+    assert.ok(at >= 0, `no fsync of ${barrier}`);
+    return at;
+  });
+  const markerTmp = recorder.events.findIndex((e) => e.op === 'fsync' && e.path && path.dirname(e.path) === markerDir && path.basename(e.path).startsWith('.tmp-'));
+  const markerRename = recorder.indexOf('rename', markerPath);
+  const markerDirSync = recorder.indexOf('fsync', markerDir);
+  assert.ok(markerTmp >= 0 && markerRename > markerTmp && markerDirSync > markerRename, 'the marker was not written fsync-file, rename, fsync-dir');
+  assert.ok(Math.max(...barriers) < markerTmp, 'a barrier came after the installed marker began');
 });
 
 // ---- updateAttempt {fsync} and publishTerminal cancelPrecedence ----
@@ -121,16 +149,16 @@ test('publishAttemptTerminal: publishes without exiting; durable fsyncs the resu
   const { state } = freshEnv();
   await createAttempt(state, 'abc', { runner: 'r' });
   const resultPath = path.join(state, 'result-abc.json');
-  let drained = false;
+  let releaseDrain;
   let attemptPresentAtFsync = null;
   let out;
   const recorder = recordFsyncs();
   const attemptFile = path.join(paths(state).attempts, 'abc.json');
   try {
-    out = await publishAttemptTerminal(state, 'abc', 0, {
-      drain: async () => {
-        drained = true;
-      },
+    const pending = publishAttemptTerminal(state, 'abc', 0, {
+      drain: () => new Promise((resolve) => {
+        releaseDrain = resolve;
+      }),
       buildConfirmedResult: () => ({ exit: 3 }),
       buildCancelledResult: () => ({ exit: 130 }),
       writeResult: (result, { fsync }) => {
@@ -139,16 +167,45 @@ test('publishAttemptTerminal: publishes without exiting; durable fsyncs the resu
       },
       durable: true,
     });
+    await sleep(100);
+    assert.equal(fs.existsSync(resultPath), false, 'a result was published before the drain resolved');
+    assert.ok(readAttempt(state, 'abc'));
+    releaseDrain();
+    out = await pending;
   } finally {
     recorder.stop();
   }
-  assert.equal(drained, true);
   assert.deepEqual(out.published, { ok: true, cancelled: false });
   assert.deepEqual(out.finalResult, { exit: 3 });
   assert.equal(attemptPresentAtFsync, true);
   assert.ok(recorder.indexOf('rename', resultPath) >= 0);
-  assert.ok(recorder.fsyncedPaths().some((p) => path.dirname(p) === path.dirname(resultPath)));
+  assert.ok(recorder.fsyncedPaths().includes(path.dirname(resultPath)), 'the result directory was not fsynced');
   assert.equal(readAttempt(state, 'abc'), null);
+});
+
+test('publishAttemptTerminal: publish options are resolved after the drain, so a cancel flagged mid-drain gets the cancelling lock timeout', async () => {
+  const { state } = freshEnv();
+  await createAttempt(state, 'abc', { runner: 'r' });
+  let cancelling = false;
+  let release;
+  const held = withLock(state, () => new Promise((resolve) => {
+    release = resolve;
+  }));
+  await sleep(50);
+  const publishing = publishAttemptTerminal(state, 'abc', 0, {
+    drain: async () => {
+      await sleep(50);
+      cancelling = true;
+    },
+    buildConfirmedResult: () => ({ exit: 0 }),
+    buildCancelledResult: () => ({ exit: 130 }),
+    writeResult: () => {},
+    resolvePublishOptions: () => (cancelling ? { lockTimeoutMs: 200 } : {}),
+  });
+  const outcome = await Promise.race([publishing.then(() => 'published', (err) => err.name), sleep(3000).then(() => 'still waiting')]);
+  release();
+  await held;
+  assert.equal(outcome, 'LockTimeoutError');
 });
 
 test('publishAttemptTerminal: cancelPrecedence "decision" reaches publishTerminal', async () => {
@@ -209,19 +266,42 @@ test('CappedLogWriter: a writer built from a reconciled file counts that file an
   const dir = makeTmpDir('capped-reconcile-');
   const open = path.join(dir, 'open.log');
   fs.writeFileSync(open, 'x'.repeat(10));
-  const fromOpen = new CappedLogWriter(open, { capBytes: 100 });
+  const fromOpen = new CappedLogWriter(open, { capBytes: 100, deriveTruncatedFromMarker: true });
   assert.equal(fromOpen.bytes, 10);
   assert.equal(fromOpen.truncated, false);
   await closeWriter(fromOpen);
 
   const capped = path.join(dir, 'capped.log');
   fs.writeFileSync(capped, `${'x'.repeat(100)}${MARKER}`);
-  const fromCapped = new CappedLogWriter(capped, { capBytes: 100 });
+  const fromCapped = new CappedLogWriter(capped, { capBytes: 100, deriveTruncatedFromMarker: true });
   assert.equal(fromCapped.truncated, true);
   fromCapped.write(Buffer.from('more'));
   await fromCapped.durable();
   assert.equal(fs.statSync(capped).size, 100 + MARKER.length);
   await closeWriter(fromCapped);
+});
+
+test('CappedLogWriter: a file at the cap with no marker is truncated by the default size rule but gets its one marker under deriveTruncatedFromMarker', async () => {
+  const dir = makeTmpDir('capped-nomarker-');
+  const byDefault = path.join(dir, 'default.log');
+  fs.writeFileSync(byDefault, 'x'.repeat(100));
+  const pushWriter = new CappedLogWriter(byDefault, { capBytes: 100 });
+  assert.equal(pushWriter.truncated, true);
+  pushWriter.write(Buffer.from('more'));
+  await pushWriter.durable();
+  assert.equal(fs.statSync(byDefault).size, 100);
+  await closeWriter(pushWriter);
+
+  const derived = path.join(dir, 'derived.log');
+  fs.writeFileSync(derived, 'x'.repeat(100));
+  const pullWriter = new CappedLogWriter(derived, { capBytes: 100, deriveTruncatedFromMarker: true });
+  assert.equal(pullWriter.truncated, false);
+  pullWriter.write(Buffer.from('more'));
+  pullWriter.write(Buffer.from('again'));
+  await pullWriter.durable();
+  assert.equal(fs.readFileSync(derived, 'utf8'), `${'x'.repeat(100)}${MARKER}`);
+  assert.equal(pullWriter.bytes, fs.statSync(derived).size);
+  await closeWriter(pullWriter);
 });
 
 test('CappedLogWriter: a reconciled tail replayed after truncating an uncommitted append stays under the cap with one marker', async () => {
