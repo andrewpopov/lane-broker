@@ -1400,6 +1400,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     // BRAIN-926: re-read per dispatch like those two; a runner without `deps-key-files/2` never gets the assertion and keys the whole tree.
     const keyFilesCoverInstallScripts = enriched.remote.remoteDepsCacheKeyFilesCoverInstallScripts === true && Array.isArray(probe?.capabilities) && probe.capabilities.includes(DEPS_KEY_FILES_COVER_CAPABILITY);
     let target = null;
+    let liveCfg = globalCfg;
     const onTransferStats = (stats) => {
       lastTransferStats = stats;
       const line = snapshotLine(runner.name, stats, manifest.excluded);
@@ -1459,10 +1460,10 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
         intervalMs: globalCfg.remoteRebalanceIntervalMs,
         // BRAIN-770: a ticket with no local fallback is refused (76) after this long queued with no runner to move it to
         refusedMaxQueuedMs,
-        // BRAIN-1058: re-read each sample, so a window that closes (or an operator's `offline`) is seen here and by pickTarget
+        // BRAIN-1058: re-read each sample into `liveCfg`, never `globalCfg`, so a window that closes is seen here and by pickTarget
         sourceUnavailable: () => {
-          globalCfg = reloadGlobalConfig(globalCfg, { onError: (err) => recordConfigReloadError(root, err) });
-          return runnerUnavailableReason(pushRunners(globalCfg).find((r) => r.name === runner.name), Date.now());
+          liveCfg = reloadGlobalConfig(liveCfg, { onError: (err) => recordConfigReloadError(root, err) });
+          return runnerUnavailableReason(pushRunners(liveCfg).find((r) => r.name === runner.name), Date.now());
         },
         refusedSince: () => firstQueuedAt,
         markQueued: async (at) => {
@@ -1475,7 +1476,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
         // is not a lack of capacity. A ticket that has used up its moves has had its chance.
         refusalAllowed: ({ draining } = {}) => {
           const countedMoves = moves.filter((m) => !SOURCE_LEAVING_REASONS.has(m.reason)).length;
-          const blocked = draining ? null : rebalanceBlocked({ moves: countedMoves, maxMoves: globalCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: globalCfg.remoteRebalanceCooldownMs });
+          const blocked = draining ? null : rebalanceBlocked({ moves: countedMoves, maxMoves: liveCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: liveCfg.remoteRebalanceCooldownMs });
           if (blocked === null || (blocked === 'max-moves' && countedMoves > 0)) return true;
           if (!refusalHeldLogged) {
             refusalHeldLogged = true;
@@ -1489,10 +1490,10 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
         // bounds it), and its destination must itself be able to withdraw.
         pickTarget: async ({ draining, sourceFacts, refusalCapElapsed } = {}) => {
           const countedMoves = moves.filter((m) => !SOURCE_LEAVING_REASONS.has(m.reason)).length;
-          if (!draining && rebalanceBlocked({ moves: countedMoves, maxMoves: globalCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: globalCfg.remoteRebalanceCooldownMs })) return null;
-          const candidates = pushRunners(globalCfg).filter((r) => !visited.includes(r.name) && r.rebalanceTarget !== false);
+          if (!draining && rebalanceBlocked({ moves: countedMoves, maxMoves: liveCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: liveCfg.remoteRebalanceCooldownMs })) return null;
+          const candidates = pushRunners(liveCfg).filter((r) => !visited.includes(r.name) && r.rebalanceTarget !== false);
           if (candidates.length === 0) return null;
-          const idleOptions = selectionOptionsFor('rebalance', enriched, globalCfg, { draining, root, cpuLimit });
+          const idleOptions = selectionOptionsFor('rebalance', enriched, liveCfg, { draining, root, cpuLimit });
           const picked = await selectRunner(candidates, idleOptions);
           if (picked.runner) logFinishPlacement(root, enriched, picked, 'rebalance: ');
           // BRAIN-899 R5: a scored destination must also beat staying put by the gain; a drain or the refusal deadline is ungated
@@ -1504,9 +1505,9 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
           // at the refusal deadline an idle destination the gain gate turned down is taken after all: refusal is the worse outcome
           if (refusalCapElapsed?.()) return (target = idleTarget);
           // BRAIN-888: behind another ticket's reservation with no idle runner on offer, a short non-idle queue elsewhere can be better
-          const stuckBehindOwner = globalCfg.remoteRebalanceQueuedMax > 0 && sourceFacts?.position >= 1 && sourceFacts.behindOtherOwner === true && sourceFacts.reservationOwnerWaitedMs >= globalCfg.remoteRebalanceMinQueuedMs;
+          const stuckBehindOwner = liveCfg.remoteRebalanceQueuedMax > 0 && sourceFacts?.position >= 1 && sourceFacts.behindOtherOwner === true && sourceFacts.reservationOwnerWaitedMs >= liveCfg.remoteRebalanceMinQueuedMs;
           if (!stuckBehindOwner) return null;
-          const queued = await selectRunner(candidates, selectionOptionsFor('rebalance', enriched, globalCfg, { draining, root, cpuLimit, queuedMove: { position: sourceFacts.position, sourceRunner: runner } }));
+          const queued = await selectRunner(candidates, selectionOptionsFor('rebalance', enriched, liveCfg, { draining, root, cpuLimit, queuedMove: { position: sourceFacts.position, sourceRunner: runner } }));
           if (queued.runner) logFinishPlacement(root, enriched, queued, 'rebalance: queued: ');
           // the cap may have run out while the probes were out: refusal must stay reachable
           if (refusalCapElapsed?.()) return (target = idleTarget);

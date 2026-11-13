@@ -1084,7 +1084,12 @@ async function watchQueuedTicket({ runner, expected, state, rebalance, isClosed,
     if (refusedMaxQueuedMs > 0) await Promise.resolve(markQueued?.(queuedSince)).catch(() => {});
     // BRAIN-520: a draining runner is an operator fact, so its queued tickets skip the minimum-queued wait. BRAIN-1058: so is a runner
     // outside its schedule, which may never admit what is queued on it. `minQueuedMs: 0` is still the off switch for every move.
-    const leaving = sourceLeavingOf(fetched, sourceUnavailable);
+    let leaving;
+    try {
+      leaving = sourceLeavingOf(fetched, sourceUnavailable);
+    } catch {
+      continue;
+    }
     const draining = leaving ? { reason: leaving.reason } : null;
     if (!(draining && minQueuedMs > 0) && now() - queuedSince < minQueuedMs) continue;
     // A callback that throws or rejects is a failed tick: no move, keep watching. The target is awaited (the real picker is async).
