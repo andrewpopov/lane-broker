@@ -91,9 +91,17 @@ async function acquisitionEvents(load, { contend = false } = {}) {
     fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify({ pid: process.pid, token: 'someone-else', start: null, at: Date.now() }));
   }
   const events = [];
-  const { fsyncSync, renameSync } = fs;
+  const { fsyncSync, renameSync, openSync } = fs;
+  const opened = new Map();
+  const lockDir = paths(state).lock;
+  const label = (file) => ({ [path.join(lockDir, 'owner.json')]: 'owner.json', [lockDir]: 'lockDir', [state]: 'parent' })[file] ?? `other:${file}`;
+  fs.openSync = (file, ...rest) => {
+    const fd = openSync(file, ...rest);
+    opened.set(fd, label(String(file)));
+    return fd;
+  };
   fs.fsyncSync = (fd) => {
-    events.push('fsync');
+    events.push(`fsync:${opened.get(fd)}`);
     return fsyncSync(fd);
   };
   fs.renameSync = (from, to) => {
@@ -105,6 +113,7 @@ async function acquisitionEvents(load, { contend = false } = {}) {
   } finally {
     fs.fsyncSync = fsyncSync;
     fs.renameSync = renameSync;
+    fs.openSync = openSync;
   }
   return events;
 }
@@ -113,20 +122,20 @@ async function fsyncsOnlyAfterTheRename(load) {
   const events = await acquisitionEvents(load);
   const rename = events.indexOf('rename');
   assert.deepEqual(events.slice(0, rename), [], `nothing may be fsynced before the rename: ${events}`);
-  assert.deepEqual(events.slice(rename), ['rename', 'fsync', 'fsync'], `owner.json and the parent dir must be fsynced after the rename: ${events}`);
+  assert.deepEqual(events.slice(rename), ['rename', 'fsync:owner.json', 'fsync:lockDir', 'fsync:parent'], `owner.json, lock/ and its parent must be fsynced after the rename, in that order: ${events}`);
 }
 
 async function losersDoNotFsync(load) {
   const events = await acquisitionEvents(load, { contend: true });
-  assert.deepEqual(events.filter((e) => e === 'fsync'), [], `a contender that loses the rename must not fsync: ${events}`);
+  assert.deepEqual(events.filter((e) => e.startsWith('fsync')), [], `a contender that loses the rename must not fsync: ${events}`);
   assert.ok(events.includes('threw:LockTimeoutError'), `the contender should have timed out: ${events}`);
 }
 
-test('the winner fsyncs owner.json and the parent dir after the rename, nothing before it', () => fsyncsOnlyAfterTheRename(realSrc));
+test('the winner fsyncs owner.json, lock/ and the parent dir after the rename, nothing before it', () => fsyncsOnlyAfterTheRename(realSrc));
 
 test('a contender polling a held lock fsyncs nothing', () => losersDoNotFsync(realSrc));
 
-for (const target of ["fsyncFile(path.join(lockDir, 'owner.json'));", 'fsyncDirectory(path.dirname(lockDir));']) {
+for (const target of ["fsyncFile(path.join(lockDir, 'owner.json'));", 'fsyncDirectory(lockDir);', 'fsyncDirectory(path.dirname(lockDir));']) {
   test(`canary: without \`${target}\` the fsync ordering test fails`, () => assertCanaryFails(STATE_JS, [target, ''], fsyncsOnlyAfterTheRename));
 }
 
@@ -235,7 +244,10 @@ test('canary: if GC removed a stage in place, a misjudged acquirer would publish
 test('bootTimeMs never returns undefined: a number, or null when unknown', async () => {
   const { bootTimeMs } = await realSrc(STATE_JS);
   for (const value of ['unknown', '', '  ', 'NaN', '123']) {
-    await withBootTime(value, () => assert.ok(bootTimeMs() === null || typeof bootTimeMs() === 'number', `${value}: ${bootTimeMs()}`));
+    await withBootTime(value, () => {
+      const t = bootTimeMs();
+      assert.ok(t === null || (typeof t === 'number' && !Number.isNaN(t)), `${value}: ${t}`);
+    });
   }
   assert.equal(await withBootTime('unknown', () => bootTimeMs()), null);
   assert.equal(await withBootTime('', () => bootTimeMs()), null);
@@ -243,7 +255,7 @@ test('bootTimeMs never returns undefined: a number, or null when unknown', async
   delete process.env.LANE_BROKER_BOOT_TIME_MS;
   try {
     const real = bootTimeMs();
-    assert.ok(real === null || typeof real === 'number', `${real}`);
+    assert.ok(real === null || (typeof real === 'number' && !Number.isNaN(real)), `${real}`);
   } finally {
     if (saved !== undefined) process.env.LANE_BROKER_BOOT_TIME_MS = saved;
   }

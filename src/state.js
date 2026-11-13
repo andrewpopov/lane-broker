@@ -1050,6 +1050,7 @@ export async function withLock(root, fn, { timeoutMs, pollMs = 25, lockPath = pa
       // Only the winner pays for durability. A crash before these leaves exactly the empty owner.json that observeLockOwner reclaims.
       try {
         fsyncFile(path.join(lockDir, 'owner.json'));
+        fsyncDirectory(lockDir);
         fsyncDirectory(path.dirname(lockDir));
       } catch {
         // best effort: we hold the lock, and a failed fsync must not read as contention
