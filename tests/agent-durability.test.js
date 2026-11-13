@@ -18,8 +18,7 @@ const stubConnect = async () => ({
   escapeIdentifier: (name) => `"${name}"`,
   query: async (sql) => {
     if (sql.startsWith('LISTEN')) return { rows: [] };
-    const name = /lane_dispatch\.(\w+)/.exec(sql)[1];
-    return { rows: [{ v: name === 'ld_reassert' ? [] : { host: 'a1', max_claims: 2 } }] };
+    return { rows: [{ v: { host: 'a1', max_claims: 2, protocol_min: 1 } }] };
   },
 });
 
@@ -44,7 +43,7 @@ test('T23 every component of the agent directories is fsynced with its parent be
   await core.close();
   const p = agentPaths(remoteRoot);
   const firstCall = recorder.events.findIndex((e) => e.op === 'call');
-  assert.equal(recorder.events[firstCall].path, 'ld_reassert');
+  assert.equal(recorder.events[firstCall].path, 'ld_register');
   for (const dir of [base, remoteRoot, p.root, p.executions, p.out, p.spool]) {
     const at = recorder.indexOf('fsync', dir);
     assert.ok(at >= 0 && at < firstCall, `${dir} fsynced before the first call (at ${at}, call at ${firstCall})`);

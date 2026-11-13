@@ -2,6 +2,8 @@ import pg from 'pg';
 
 export class LdClosedError extends Error {}
 
+export const PROTOCOL = 1;
+
 export const NOT_LIVE = Object.freeze({ skipped: 'not-live' });
 
 // Retried verbatim after a reconnect. Everything else (42501 no principal, 22023 bad input, a bug) fails loud and leaves live executions alone.
@@ -27,23 +29,22 @@ const connectPg = async (config) => {
 
 /**
  * The agent's door to lane_dispatch: one call connection and one LISTEN connection, every call through one FIFO. `gen` counts
- * connection (re)establishments of either kind plus `reassert` answers. While it is ahead of the last reassert the next job is
- * `ld_reassert`, then `ld_register`, so nothing else reaches a session the queue has not re-adopted; queued calls keep their place.
- * A job is the call plus its `persist` callback: the reassert snapshot is only taken between jobs, so it never sees a phase from
- * before a transition whose call has already returned. `persist(answer, {stale})` is told when `gen` moved while the call was in flight.
+ * connection (re)establishments of either kind. While it is ahead of the last registration the next job is `ld_register`, so nothing
+ * else reaches a session the queue has not seen; queued calls keep their place.
+ * `persist(answer, {stale})` is told when `gen` moved while the call was in flight.
  */
 export class LdClient {
   gen = 0;
   registered = null;
-  #reasserted = -1;
+  #registeredGen = -1;
   #client = null;
   #listenClient = null;
   #tail = Promise.resolve();
   #closed = false;
   #sleepers = new Set();
 
-  constructor({ pg: pgConfig, version, schedule = null, snapshot = () => [], onReassert, onWake, onCall, backoff = { minMs: 250, maxMs: 15_000 }, random = Math.random, connect = connectPg }) {
-    Object.assign(this, { pgConfig, version, schedule, snapshot, onReassert, onWake, onCall, backoff, random, connect });
+  constructor({ pg: pgConfig, version, schedule = null, onWake, onCall, backoff = { minMs: 250, maxMs: 15_000 }, random = Math.random, connect = connectPg }) {
+    Object.assign(this, { pgConfig, version, schedule, onWake, onCall, backoff, random, connect });
   }
 
   #sleep(ms) {
@@ -85,14 +86,10 @@ export class LdClient {
   }
 
   async #gate() {
-    while (this.gen !== this.#reasserted) {
+    while (this.gen !== this.#registeredGen) {
       const gen = this.gen;
-      const items = this.snapshot();
-      const results = await this.#sql('ld_reassert', [JSON.stringify(items)]);
-      if (!Array.isArray(results) || results.length !== items.length) throw new Error(`ld_reassert answered ${JSON.stringify(results)} for ${items.length} item(s)`);
-      await this.onReassert?.(items, results);
-      this.registered = await this.#sql('ld_register', [this.version, this.schedule === null ? null : JSON.stringify(this.schedule)]);
-      this.#reasserted = gen;
+      this.registered = await this.#sql('ld_register', [this.version, PROTOCOL, this.schedule === null ? null : JSON.stringify(this.schedule)]);
+      this.#registeredGen = gen;
     }
   }
 
@@ -129,7 +126,6 @@ export class LdClient {
       });
       if (answer === NOT_LIVE) return answer;
       const stale = this.gen !== sentAt;
-      if (answer?.reassert === true) this.gen += 1;
       await persist?.(answer, { stale });
       return answer;
     });

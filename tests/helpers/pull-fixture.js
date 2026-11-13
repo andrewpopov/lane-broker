@@ -17,6 +17,8 @@ import { startS3Stub, STUB_CREDS, STUB_REGION } from './s3-stub.js';
 import { StubRunner } from './stub-runner.js';
 
 export const ID = tid(1);
+/** The row an operator's cancel of a restored ticket used to leave: cancelled, but never proof that the run stopped. */
+export const UNPROVEN_CANCEL_ROW = "state = 'cancelled', cancel_requested = true, finished_at = now(), result = jsonb_build_object('kind', 'cancelled', 'cancelConfirmed', false, 'source', 'operator', 'epoch', epoch, 'author', 'queue')";
 export const ARTIFACT_PATH = 'reports/run/output.json';
 const line = (value) => Buffer.from(`${JSON.stringify(value)}\n`);
 
@@ -65,11 +67,14 @@ export async function pullFixture(t, w, { load = realSrc, id = ID, stub = null, 
       await fx.step(over);
       return fx.step(over);
     },
-    async hold(over) {
+    async claimed(over) {
       await fx.enqueue(over);
       await fx.runner.claim();
       await fx.step(over);
       await fx.runner.heartbeat();
+    },
+    async hold(over) {
+      await fx.claimed(over);
       await fx.runner.start();
     },
     async su() {

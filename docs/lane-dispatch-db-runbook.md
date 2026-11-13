@@ -1,6 +1,6 @@
 # lane_dispatch database setup (cluster level)
 
-`sql/lane/migrations/005-lane-dispatch.sql` and `sql/lane/functions.sql` create the `lane_dispatch` schema, its functions and every
+`sql/lane/migrations/005-lane-dispatch.sql`, `006-pull-simplify.sql` and `sql/lane/functions.sql` create the `lane_dispatch` schema, its functions and every
 grant that lives inside the database. `applyDatabaseAcls` (`src/lane-db.js`) revokes CONNECT, CREATE and TEMP on the current
 database from PUBLIC and grants CONNECT to the four lane group roles. It is opt-in (`applyMigrations(client, { databaseAcls: true })`
 or a direct call), and it throws before revoking anything when the database holds a schema other than `lane`, `lane_dispatch`
@@ -34,38 +34,60 @@ SELECT lane_dispatch.ld_set_principal('lane_submit_<name>', 'submit', NULL, '{}'
 
 ## Timers on the database host
 
-Two systemd timers on pitelite run as a `lane_admin` login (a member of `lane_admin`, so it holds the `pg_signal_backend` and `pg_read_all_stats` grants above). Both are required: the guard is the enforcement behind the per-role `statement_timeout`, which a caller can override.
+Two systemd units on pitelite run as a `lane_admin` login (a member of `lane_admin`, so it holds the `pg_signal_backend` and `pg_read_all_stats` grants above). Both are required: the guard is the enforcement behind the per-role `statement_timeout`, which a caller can override.
 
-| Timer | Every | Runs |
-|---|---|---|
-| `lane-dispatch-reap.timer` | 2 s | `SELECT lane_dispatch.ld_reap();` Defaults: interval 2 s, lease TTL 120 s, `lost_after` 30 min. A gap since the last tick of more than twice the interval extends every lease first (outage amnesty), so an outage settles nothing. |
-| `lane-dispatch-guard.timer` | 2 s | `SELECT lane_dispatch.ld_guard();` It terminates every `lane_agent_*` and `lane_submit_*` backend whose transaction is older than 5 s, whatever its state, and skips superusers. A caller that pins `claim_lock` with `BEGIN; SELECT ld_claim(...)` therefore blocks claims for at most one tick plus 5 s. |
+One `lane-dispatch-reap.timer` fires every 15 s (`AccuracySec=1s`) and runs two separate transactions, one SET per parameter, and the guard runs whether or not the reap succeeded:
 
-If the reap interval changes, pass the new value as the first argument of `ld_reap` (`SELECT lane_dispatch.ld_reap('5 seconds');`), or the amnesty threshold stays at 4 s.
+```sql
+BEGIN; SET LOCAL lock_timeout = '5s'; SET LOCAL statement_timeout = '10s'; SELECT lane_dispatch.ld_reap(); COMMIT;
+SELECT lane_dispatch.ld_guard('30 seconds');
+```
+
+On a reap error the unit rolls back, runs the guard in its own transaction, then exits non-zero.
+
+- `ld_reap(lease_ttl '120 seconds', lost_after '2 hours', amnesty_after '60 seconds')` takes the `cluster` row lock, so two reapers and a restore serialise. A claimed row past its lease returns to `queued` (or settles `cancelled` when a cancel was requested). A running row never returns to the queue on expiry alone: it settles `lost` (reason `runner-lost`) only `lost_after` past its lease. A gap since the last tick longer than `amnesty_after` extends every lease first, so an outage settles nothing. It prunes no `none` rows, because `ld_claim` never writes one.
+- Every return to `queued`, by release or lease expiry, increments `requeues` and sets `not_before` to now plus `least(5 s * 2^requeues, 60 s)` (5, 10, 20, 40, 60 s). The sixth return settles the row `lost` with reason `release-cap`.
+- `ld_guard('30 seconds')` terminates every `lane_agent_*` and `lane_submit_*` backend whose transaction is older than 30 s, whatever its state, and skips superusers. No claim holds a global lock any more (`ld_claim` locks only its own principal row and the ticket it takes), so a pinned claim delays only its own login.
 
 `ld_guard` is the only `SECURITY INVOKER` function in the schema, because it must run with the admin login's own cluster privileges. `ld_log` accepts at most 256 KiB per call, 64 MiB per attempt and 1 GiB across the table; past a cap it answers `capped`.
 
-After a restore from backup the first `ld_*` call quarantines every non-terminal ticket (`state = 'quarantined'`). A quarantined ticket leaves that state only when its runner reasserts it as `running` with the same host, epoch and token, through `ld_cancel` by its owner, or through `SELECT lane_dispatch.ld_cancel_quarantined('<ticket id>');` by an operator. A heartbeat and `ld_finish` never lift quarantine: each answers `reassert: true` (finish adds `state: 'quarantined'`) and changes nothing, so the runner reasserts, and only a `running` reassert lifts it. A reassert of a quarantined claim as `pre-start`, `ld_start` and `ld_release` are fenced or refused, and a reassert from another host, epoch or token is always fenced (the one exception is an ownerless rolled-back row, which an eligible runner may adopt as `running` at a higher epoch).
+Every terminal transition the queue makes itself (restore marking, `ld_restore_reset`, the release cap and the reaper's `lost`) sets `finished_at` and the result `{kind: 'lost', reason, author: 'queue', epoch}`, so retention (`ld_prune_candidates`) selects each of them. The reasons are `queue-restored`, `release-cap` and `runner-lost`.
+
+### Restores
+
+A restore settles every non-terminal ticket `lost` (reason `queue-restored`) and deletes every `claim_requests` row. Runners learn on their next heartbeat (`fenced: true`) and kill their work; the caller resubmits.
+
+- A restore onto a new timeline does this automatically: the first `ld_*` call after it locks the `cluster` row, records the new timeline, bumps the incarnation (so `ld_queue_ref()` moves and fenced enqueues against the old ref are refused) and settles the queue once.
+- A restore that keeps the timeline settles nothing by itself. Run `SELECT lane_dispatch.ld_restore_reset();` as `lane_admin`; it does the same settling unconditionally and returns the number of tickets settled.
+- Seal before restoring. Seal the node (a confirmed full seal with drain passes, not only a pg_hba reload) before the restore, and keep it sealed until the first `ld_*` call on the new timeline or `ld_restore_reset()` has committed. Only then unseal. Otherwise a runner can reconnect to the restored database before the queue has settled it and heartbeat a row that no longer exists.
 
 Every `ld_*` call must run at READ COMMITTED; any other isolation level is refused (SQLSTATE 25000).
 
-A reassert of a row that is not quarantined never changes its state: it extends the lease and answers `{result: 'ok', state}` with the row's current state, so a `pre-start` reassert of a `running` row leaves it `running`.
+### Runner protocol
+
+`ld_register(version, protocol, schedule)` stores `runners.protocol` and answers `{host, max_claims, protocol_min}`. `ld_claim` answers `{status: 'upgrade', protocol_min}` when the host has no `runners` row or its protocol is below `protocol_min()` (a constant, 1), and writes no `claim_requests` row for it. A ticket's `min_protocol` (an `ld_enqueue` argument) hides it from older runners.
+
+`ld_release` takes the proofs `never-started` and `cancel-confirmed` only. A `claimed` row returns to `queued` (or `cancelled` when a cancel was requested); a `running` row with a cancel requested and proof `cancel-confirmed` settles `cancelled`; any other `running` row is left unchanged and the answer is `{refused: 'started'}`. `ld_start` on a running row whose cancel was requested answers false, and a heartbeat answers `cancel: true`.
+
+### Claim order
+
+`ld_claim` takes the ticket with the highest `eff_score(priority, ages, age)`, then, among tickets that have waited past the 60 minute horizon and score at the high level, the oldest first (fresh highs skip this step and go by scarcity), then the fewest agent principals able to run it (`scarcity`, the count `ld_placeable` reports), then the oldest, then the lowest id (priority is no tie-break: after 60 minutes an aged ticket that ties a high wins on age). `eff_score` ports `src/priority.js` `score()`: the tier is the priority band (7-9 high, 4-6 medium, 0-3 low), weights 2 and 2, age saturating at 20 minutes, and a non-high held at 0.99 of the tier weight until it has waited 60 minutes. Priority 9 (a release candidate) adds 0.01, so it beats every other high and every aged ticket that ties one. A ticket enqueued with `ages = false` credits no wait. `lane_dispatch.now()` is the queue's clock; the GUC `lane.test_now` moves it for tests only, and only when its value is the one stored by `ALTER DATABASE` or `ALTER ROLE` (a session `SET` to any other value is ignored).
 
 ## Notification channels
 
-Each hint carries an empty payload, so no ticket id reaches every listener, and a listener treats it as "look now", never as data. `ld_work` means a ticket may have become claimable: `ld_enqueue` on insert, `ld_release` when the row returns to `queued`, and `ld_reap` when it requeued at least one row. `ld_host_<host>` goes to one agent: `ld_cancel` of a claimed or running row, and `ld_attach_urls` when it found its row. `ld_set_principal` refuses a host that does not match `^[a-z0-9][a-z0-9-]{0,54}$` (the runner-name shape, short enough that `ld_host_` plus the host fits Postgres's 63-byte limit), so the channel name is always safe. Hosts may contain hyphens, so the agent must `LISTEN` with a quoted identifier (`client.escapeIdentifier('ld_host_' + host)`); `pg_notify` takes the name as text and needs no quoting.
+Each hint carries an empty payload, so no ticket id reaches every listener, and a listener treats it as "look now", never as data. `ld_work` means a ticket may have become claimable: `ld_enqueue` on insert, `ld_release` when the row returns to `queued`, and `ld_reap` when it requeued at least one row (a row backing off on `not_before` becomes claimable without a hint, so an agent still polls). `ld_host_<host>` goes to one agent: `ld_cancel` of a claimed or running row, and `ld_attach_urls` when it found its row. `ld_set_principal` refuses a host that does not match `^[a-z0-9][a-z0-9-]{0,54}$` (the runner-name shape, short enough that `ld_host_` plus the host fits Postgres's 63-byte limit), so the channel name is always safe. Hosts may contain hyphens, so the agent must `LISTEN` with a quoted identifier (`client.escapeIdentifier('ld_host_' + host)`); `pg_notify` takes the name as text and needs no quoting.
 
 An agent login holds at most two connections (`CONNECTION LIMIT 3` leaves one spare): one for calls and one that only LISTENs. A lost NOTIFY costs latency, not correctness, because the agent still polls.
 
 ## Pruning
 
-Each `ld_reap` tick deletes at most 1000 `claim_requests` rows in total. Rows with no ticket (`ticket IS NULL`) older than 10 minutes go first; the remaining budget removes claimed mappings created more than 24 hours ago (which keeps the delete from scanning `tickets`) whose ticket is `finished`, `cancelled`, `withdrawn` or `lost` and whose `finished_at` is more than 24 hours old. A mapping whose ticket is not terminal is never pruned, whatever its age. `tickets`, `attempts` and `log_chunks` are not pruned here.
+Each `ld_reap` tick deletes at most 1000 `claim_requests` rows: claimed mappings created more than 24 hours ago (which keeps the delete from scanning `tickets`) whose ticket is `finished`, `cancelled`, `withdrawn` or `lost` and whose `finished_at` is more than 24 hours old. A mapping whose ticket is not terminal is never pruned, whatever its age. `tickets`, `attempts` and `log_chunks` are not pruned here.
 
 ## Pull client surface and retention
 
-Submit logins (the pull client) also hold `ld_queue_ref()` (the queue's `timeline.incarnation`, which moves after a restore), `ld_enqueue_fenced(expected_ref, ...)` (the `ld_enqueue` arguments after a leading ref; a stale ref returns `{state: 'stale-queue-ref', queue_ref}` and inserts nothing, otherwise it calls `ld_enqueue` unchanged) and `ld_placeable(repo_key, requires_tags)` (the number of agent principals with `max_claims > 0` that are eligible for the tags and repo). `ticket_view` carries `attempt_ref`, `sha256('lane-attempt-ref:' || claim_token)`, NULL while the row holds no token; `claim_token` itself never reaches a submitter. `ld_heartbeat` returns `urls` only when `urls->>'epoch'` equals the row's epoch, so a reclaimed agent sees `urls: null` until the owner attaches URLs for the new epoch.
+Submit logins (the pull client) also hold `ld_queue_ref()` (the queue's `timeline.incarnation`, which moves after a restore), `ld_enqueue_fenced(expected_ref, ...)` (the `ld_enqueue` arguments after a leading ref; a stale ref returns `{state: 'stale-queue-ref', queue_ref}` and inserts nothing, otherwise it calls `ld_enqueue` unchanged) and `ld_placeable(repo_key, requires_tags)` (the number of agent principals with `max_claims > 0` that are eligible for the tags and repo). `ticket_view` carries `attempt_ref`, `sha256('lane-attempt-ref:' || claim_token)`, NULL while the row holds no token; `claim_token` itself never reaches a submitter. `ld_heartbeat` answers only `{fenced, cancel}`.
 
-`ld_cancel` and `ld_cancel_quarantined` store a server-authored result `{kind: 'cancelled', cancelConfirmed, source, epoch}`. `source` is `queued` (confirmed), `quarantine` (owner cancel of a quarantined row, unconfirmed) or `operator` (unconfirmed). A replayed `ld_cancel` reports `confirmed` from the stored `cancelConfirmed` (a non-boolean value reads as false), so it never upgrades an unproven cancel. A cancelled row with no stored result (released with `cancel-confirmed`, or a claimed row reaped after a cancel request) reads as confirmed.
+`ld_cancel` of a queued row stores a server-authored result `{kind: 'cancelled', cancelConfirmed: true, source: 'queued', epoch}`; a cancel of a claimed or running row only sets `cancel_requested`. A replayed `ld_cancel` reports `confirmed` from the stored `cancelConfirmed` (a non-boolean value reads as false), so it never upgrades an unproven cancel. A cancelled row with no stored result (released with `cancel-confirmed`, or a claimed row reaped after a cancel request) reads as confirmed.
 
 Retention is admin-only (`lane_admin` login, run by `lane pull gc`; none of these is granted to agent or submit logins):
 

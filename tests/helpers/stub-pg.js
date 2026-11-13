@@ -2,11 +2,11 @@ import { EventEmitter } from 'node:events';
 
 /**
  * A pg stand-in for LdClient's `connect`: every lane_dispatch call is recorded in `sqlLog` and answered by `answers[name](args)`
- * (default: empty reassert, a host-a1 register, null otherwise). `failConnects` is a queue of errors the next connects throw.
+ * (default: a host-a1 register, null otherwise). `failConnects` is a queue of errors the next connects throw.
  */
 export function makeStubPg({ answers = {} } = {}) {
   const stub = { clients: [], sqlLog: [], answers, failConnects: [], onListen: null, ended: 0 };
-  const defaults = { ld_reassert: () => [], ld_register: () => ({ host: 'a1', max_claims: 2 }) };
+  const defaults = { ld_register: () => ({ host: 'a1', max_claims: 2, protocol_min: 1 }) };
   stub.connect = async () => {
     const failure = stub.failConnects.shift();
     if (failure) throw failure;

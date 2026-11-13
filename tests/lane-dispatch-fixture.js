@@ -45,6 +45,7 @@ export class World {
     await call(admin, 'ld_set_principal', logins.x, 'agent', 'x', [], ['*'], 1);
     await call(admin, 'ld_set_principal', logins.s1, 'submit', null, [], [], 1);
     await call(admin, 'ld_set_principal', logins.s2, 'submit', null, [], [], 1);
+    for (const login of [logins.a1, logins.a2, logins.x]) await call(await world.as(login), 'ld_register', 'test', 1, null);
     return world;
   }
 
@@ -70,8 +71,8 @@ export async function call(client, name, ...args) {
 
 export const tid = gid;
 
-export const enqueue = (client, id, { repo = 'repoA', laneKey = `lk-${id}`, tags = [], cpu = 1, mem = 1000, priority = 0 } = {}) =>
-  call(client, 'ld_enqueue', id, repo, 'test', laneKey, { protocol: 1 }, { cmd: ['true'] }, { key: 'snap', sha256: 'x' }, tags, cpu, mem, priority);
+export const enqueue = (client, id, { repo = 'repoA', laneKey = `lk-${id}`, tags = [], cpu = 1, mem = 1000, priority = 0, minProtocol = 1, ages = true, source = null, estRunS = null } = {}) =>
+  call(client, 'ld_enqueue', id, repo, 'test', laneKey, { protocol: 1 }, { cmd: ['true'] }, { key: 'snap', sha256: 'x' }, tags, cpu, mem, priority, minProtocol, ages, source, estRunS);
 
 export const claim = (client, { req = randomUUID(), cpu = 8, mem = 1e9, held = [] } = {}) => call(client, 'ld_claim', req, cpu, mem, held);
 
@@ -80,8 +81,21 @@ export const start = (client, claimed) => call(client, 'ld_start', claimed.id, c
 export const heartbeat = (client, claimed) => call(client, 'ld_heartbeat', claimed.id, claimed.epoch, claimed.token);
 export const release = (client, claimed, proof = 'never-started') => call(client, 'ld_release', claimed.id, claimed.epoch, claimed.token, proof);
 
-export const reassert = (client, items) => call(client, 'ld_reassert', JSON.stringify(items));
-export const asItem = (claimed, phase = 'running') => ({ id: claimed.id, epoch: claimed.epoch, token: claimed.token, phase });
+/** A requeue backs the ticket off (5 s and up); a test that claims it again straight away lifts the backoff first. */
+export async function liftBackoff(world) {
+  await (await world.su()).query("UPDATE lane_dispatch.tickets SET not_before = '-infinity'");
+}
+
+/** Moves lane_dispatch.now() for sessions opened from here on (the GUC only counts when set on the database), so every connection the world held is reopened. */
+export async function setNow(world, iso) {
+  const su = await world.su();
+  await su.query(`ALTER DATABASE ${world.db} SET lane.test_now = '${iso}'`);
+  for (const [login, client] of [...world.connections].filter(([login]) => login !== 'postgres')) {
+    await client.end().catch(() => {});
+    world.cluster.clients.delete(client);
+    world.connections.delete(login);
+  }
+}
 
 /** A restore, as far as the queue can tell: the recorded timeline no longer matches the cluster's. */
 export async function simulateRestore(world) {

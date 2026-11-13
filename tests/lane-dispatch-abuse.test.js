@@ -81,13 +81,14 @@ const GUARDS = {
     assert.ok(kills.slice(0, 4).every((k) => k === 0), 'no earlier tick killed it');
   },
 
-  'a pinned sentinel: BEGIN; ld_claim then SELECT 1 every second refuses other claims with busy until the guard kills it within 7 s': async (w) => {
-    const [s1, a2, admin] = [await w.as(logins.s1), await w.as(logins.a2), await w.as(logins.admin)];
+  'a pinned claim: BEGIN; ld_claim then SELECT 1 every second holds only its own ticket, other hosts claim past it, until the guard kills it within 7 s': async (w) => {
+    const [s1, a1, a2, admin] = [await w.as(logins.s1), await w.as(logins.a1), await w.as(logins.a2), await w.as(logins.admin)];
     await enqueue(s1, tid(1));
+    await enqueue(s1, tid(2));
     const pinner = await victim(w, logins.x);
     const beganAt = Date.now();
     const [, claimed] = await pinner.query(`BEGIN; SELECT lane_dispatch.ld_claim('${randomUUID()}', 8, 1000000000, '{}'::text[]) AS v`);
-    assert.equal(claimed.rows[0].v.status, 'claimed', 'the pinner holds the sentinel with an uncommitted claim');
+    assert.equal(claimed.rows[0].v.id, tid(1), 'the pinner holds a ticket with an uncommitted claim');
 
     let pinnerError = null;
     const keepAlive = (async () => {
@@ -97,8 +98,8 @@ const GUARDS = {
       }
     })();
     const started = Date.now();
-    assert.deepEqual(await claim(a2), { status: 'busy' }, 'another principal is refused, not queued');
-    assert.ok(Date.now() - started < 1500, 'busy is immediate');
+    assert.equal((await claim(a2)).id, tid(2), 'another principal claims the next ticket instead of waiting');
+    assert.ok(Date.now() - started < 1500, 'and is not delayed');
 
     const { kills, killedAt } = await runGuardUntil(admin, keepAlive, { everyMs: 2000 });
     const killedAfterMs = killedAt - beganAt;
@@ -107,7 +108,7 @@ const GUARDS = {
     assert.equal(kills.at(-1), 1);
     assert.ok(kills.slice(0, -1).every((k) => k === 0));
 
-    const next = await claim(a2);
+    const next = await claim(a1);
     assert.equal(next.status, 'claimed', 'the next claim succeeds');
     assert.equal(next.id, tid(1), 'the pinner uncommitted claim was rolled back');
     assert.equal((await w.ticket(tid(1))).epoch, 1);

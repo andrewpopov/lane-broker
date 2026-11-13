@@ -2,7 +2,7 @@ import { describe, test, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { pgSkipOption } from './lane-db-harness.js';
-import { startDispatchCluster, World, logins, call, enqueue, claim, start, heartbeat, finish, release, tid } from './lane-dispatch-fixture.js';
+import { startDispatchCluster, World, logins, call, enqueue, claim, start, heartbeat, finish, release, liftBackoff, tid } from './lane-dispatch-fixture.js';
 
 const GUARDS = {
   'ld_claim refuses past max_claims': async (w) => {
@@ -14,6 +14,7 @@ const GUARDS = {
     assert.deepEqual(await claim(a1), { status: 'none' }, 'a third claim exceeds max_claims 2');
     assert.equal((await w.ticket(tid(3))).state, 'queued');
     await release(a1, first);
+    await liftBackoff(w);
     assert.equal((await claim(a1)).id, tid(1), 'a released slot is claimable again');
   },
 
@@ -46,6 +47,16 @@ const GUARDS = {
     assert.equal((await heartbeat(a1, got)).cancel, true);
   },
 
+  'ld_start refuses a running row whose cancel was requested': async (w) => {
+    const [s1, a1] = [await w.as(logins.s1), await w.as(logins.a1)];
+    await enqueue(s1, tid(1));
+    const got = await claim(a1);
+    assert.equal(await start(a1, got), true);
+    await call(s1, 'ld_cancel', tid(1));
+    assert.equal(await start(a1, got), false, 'a repeated start no longer reads true once the cancel is requested');
+    assert.equal((await w.ticket(tid(1))).state, 'running');
+  },
+
   'ld_start refuses an expired lease': async (w) => {
     const [s1, a1, su] = [await w.as(logins.s1), await w.as(logins.a1), await w.su()];
     await enqueue(s1, tid(1));
@@ -60,6 +71,7 @@ const GUARDS = {
     await enqueue(s1, tid(1));
     const old = await claim(a1);
     await release(a1, old);
+    await liftBackoff(w);
     const current = await claim(a1);
     assert.equal(current.epoch, old.epoch + 1);
     assert.equal(await start(a1, old), false, 'both stale');
@@ -102,9 +114,9 @@ const GUARDS = {
     assert.equal((await w.ticket(tid(2))).state, 'queued');
     assert.equal((await claim(a2, { req })).id, tid(2), 'a req is scoped to its login');
     const empty = randomUUID();
-    assert.deepEqual(await claim(a2, { req: empty }), { status: 'none' });
+    assert.deepEqual(await claim(a1, { req: empty }), { status: 'none' });
     await enqueue(s1, tid(3));
-    assert.deepEqual(await claim(a2, { req: empty }), { status: 'none' }, 'a replayed "no claim" stays no claim');
+    assert.equal((await claim(a1, { req: empty })).id, tid(3), 'a "no claim" is not remembered, so the same req claims once work exists');
   },
 
   'ld_withdraw returns withdrawn only for a committed queued to withdrawn': async (w) => {
@@ -135,8 +147,9 @@ const SEMANTICS = {
     await enqueue(s1, tid(1));
     const first = await claim(a1);
     assert.deepEqual([first.epoch, first.execution_id], [1, `${tid(1)}.e1`]);
-    assert.deepEqual(await release(a1, first, 'runner-shutdown'), { fenced: false, state: 'queued' });
-    assert.deepEqual(await release(a1, first, 'runner-shutdown'), { fenced: true, state: 'queued' });
+    assert.deepEqual(await release(a1, first, 'never-started'), { fenced: false, state: 'queued' });
+    assert.deepEqual(await release(a1, first, 'never-started'), { fenced: true, state: 'queued' });
+    await liftBackoff(w);
     const second = await claim(a1);
     assert.deepEqual([second.epoch, second.execution_id], [2, `${tid(1)}.e2`]);
     assert.notEqual(second.token, first.token);
@@ -196,18 +209,18 @@ const SEMANTICS = {
     assert.deepEqual([row.claim_token, row.host, row.lease_until], [null, null, null]);
   },
 
-  'ld_heartbeat extends the lease and returns the owner-attached urls; ld_attach_urls is owner-only and epoch-checked': async (w) => {
+  'ld_heartbeat extends the lease and answers only fenced and cancel; ld_attach_urls is owner-only and epoch-checked': async (w) => {
     const [s1, s2, a1, su] = [await w.as(logins.s1), await w.as(logins.s2), await w.as(logins.a1), await w.su()];
     await enqueue(s1, tid(1));
     const got = await claim(a1);
     await su.query("UPDATE lane_dispatch.tickets SET lease_until = now() + interval '5 seconds'");
-    assert.deepEqual(await heartbeat(a1, got), { fenced: false, cancel: false, urls: null });
+    assert.deepEqual(await heartbeat(a1, got), { fenced: false, cancel: false });
     const { rows: [{ ttl }] } = await su.query('SELECT extract(epoch FROM lease_until - now()) AS ttl FROM lane_dispatch.tickets');
     assert.ok(ttl > 110, `lease ${ttl}`);
     assert.equal(await call(s2, 'ld_attach_urls', tid(1), got.epoch, { get: 'u' }), false, 'not the owner');
     assert.equal(await call(s1, 'ld_attach_urls', tid(1), got.epoch + 1, { get: 'u' }), false, 'wrong epoch');
     assert.equal(await call(s1, 'ld_attach_urls', tid(1), got.epoch, { epoch: got.epoch, get: 'u', put: 'p' }), true);
-    assert.deepEqual((await heartbeat(a1, got)).urls, { epoch: got.epoch, get: 'u', put: 'p' });
+    assert.deepEqual((await call(s1, 'ld_get', tid(1))).urls, { epoch: got.epoch, get: 'u', put: 'p' });
     assert.equal(await call(s2, 'ld_get', tid(1)), null, 'another owner cannot read the ticket');
     assert.equal((await call(s1, 'ld_get', tid(1))).state, 'claimed');
     assert.equal('claim_token' in (await call(s1, 'ld_get', tid(1))), false, 'the fencing token never reaches the submitter');
@@ -228,7 +241,8 @@ const CANARIES = [
   ['ld_claim never hands out a ticket whose requires_tags the principal lacks', 'p_requires_tags <@ p_tags AND ', ''],
   ['ld_claim never hands out a ticket outside the principal allowed_repos', " AND (p_repo_key = ANY (p_allowed_repos) OR '*' = ANY (p_allowed_repos))", ''],
   ['ld_start refuses a ticket with cancel_requested', 'IF v_t.cancel_requested THEN RETURN false; END IF;', ''],
-  ['ld_start refuses an expired lease', 'IF v_t.lease_until <= clock_timestamp() THEN RETURN false; END IF;', ''],
+  ['ld_start refuses a running row whose cancel was requested', 'RETURN NOT v_t.cancel_requested;', 'RETURN true;'],
+  ['ld_start refuses an expired lease', 'IF v_t.lease_until <= lane_dispatch.now() THEN RETURN false; END IF;', ''],
   ['ld_start refuses a stale epoch, a stale token and another host', 'AND p_row_epoch = p_epoch', ''],
   ['ld_finish is fenced unless id, epoch, token and host match a non-terminal row', 'AND p_row_token = p_token', ''],
   ['a duplicate req returns the stored outcome and never takes a second ticket', 'WHERE c.login_role = session_user AND c.req = p_req', 'WHERE false AND c.req = p_req'],

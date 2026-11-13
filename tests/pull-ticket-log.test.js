@@ -88,7 +88,7 @@ const SCENARIOS = {
 
   'T13b: a prior epoch prefix stays byte-identical and the fill touches only the current epoch': async (load, w, t) => {
     const fx = await pullFixture(t, w, { load });
-    await fx.hold();
+    await fx.claimed();
     await fx.runner.log('e1\n');
     await fx.step();
     await fx.runner.release('never-started');

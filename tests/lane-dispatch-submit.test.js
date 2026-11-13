@@ -2,7 +2,7 @@ import { describe, test, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { pgSkipOption } from './lane-db-harness.js';
-import { startDispatchCluster, World, logins, call, enqueue, claim, finish, release, tid, simulateRestore } from './lane-dispatch-fixture.js';
+import { startDispatchCluster, World, logins, call, enqueue, claim, finish, release, liftBackoff, tid, simulateRestore } from './lane-dispatch-fixture.js';
 
 const DAY = 86400;
 const fenced = (client, ref, id) =>
@@ -49,19 +49,6 @@ const GUARDS = {
     assert.equal((await fenced(s1, afterRestore.queue_ref, tid(2))).state, 'queued');
   },
 
-  'ld_heartbeat returns urls only when their epoch is the row epoch': async (w) => {
-    const [s1, a1] = [await w.as(logins.s1), await w.as(logins.a1)];
-    await enqueue(s1, tid(1));
-    const got = await claim(a1);
-    const urls = async () => (await call(a1, 'ld_heartbeat', got.id, got.epoch, got.token)).urls;
-    assert.equal(await call(s1, 'ld_attach_urls', tid(1), got.epoch, { get: 'u' }), true);
-    assert.equal(await urls(), null, 'urls with no epoch');
-    assert.equal(await call(s1, 'ld_attach_urls', tid(1), got.epoch, { epoch: got.epoch + 1, get: 'u' }), true);
-    assert.equal(await urls(), null, 'urls from another epoch');
-    assert.equal(await call(s1, 'ld_attach_urls', tid(1), got.epoch, { epoch: got.epoch, get: 'u' }), true);
-    assert.deepEqual(await urls(), { epoch: got.epoch, get: 'u' });
-  },
-
   'ticket_view carries a stable attempt_ref per claim and never the claim token': async (w) => {
     const [s1, a1, su] = [await w.as(logins.s1), await w.as(logins.a1), await w.su()];
     await enqueue(s1, tid(1));
@@ -73,6 +60,7 @@ const GUARDS = {
     assert.equal('claim_token' in view, false);
     assert.equal(JSON.stringify(view).includes(first.token), false, 'the raw token appears nowhere in the view');
     await call(a1, 'ld_release', first.id, first.epoch, first.token, 'never-started');
+    await liftBackoff(w);
     const second = await claim(a1);
     assert.notEqual((await call(s1, 'ld_get', tid(1))).attempt_ref, view.attempt_ref, 'a new claim of the same ticket has a new ref');
     await finish(a1, second);
@@ -89,16 +77,15 @@ const GUARDS = {
     assert.equal((await call(s1, 'ld_cancel', tid(1))).confirmed, true, 'queued cancel stays confirmed on replay');
 
     await enqueue(s1, tid(2));
-    await enqueue(s1, tid(3));
-    await simulateRestore(w);
-    await call(s1, 'ld_get', tid(9));
-    assert.equal((await call(s1, 'ld_cancel', tid(2))).confirmed, false);
-    assert.deepEqual((await w.ticket(tid(2))).result, { kind: 'cancelled', cancelConfirmed: false, source: 'quarantine', epoch: 0, author: 'queue' });
-    assert.equal((await call(s1, 'ld_cancel', tid(2))).confirmed, false, 'quarantined cancel stays unconfirmed on replay');
+    await call(admin, 'ld_restore_reset');
+    const lost = { state: 'lost', cancel_requested: false, confirmed: false };
+    assert.deepEqual(await call(s1, 'ld_cancel', tid(2)), lost, 'a restored (lost) row is unchanged by a cancel and never reads as confirmed');
+    assert.deepEqual((await w.ticket(tid(2))).result, { kind: 'lost', reason: 'queue-restored', epoch: 0, author: 'queue' });
+    assert.deepEqual(await call(s1, 'ld_cancel', tid(2)), lost, 'and stays so on replay');
 
-    assert.equal(await call(admin, 'ld_cancel_quarantined', tid(3)), 'cancelled');
-    assert.deepEqual((await w.ticket(tid(3))).result, { kind: 'cancelled', cancelConfirmed: false, source: 'operator', epoch: 0, author: 'queue' });
-    assert.equal((await call(s1, 'ld_cancel', tid(3))).confirmed, false, 'operator cancel never reads as confirmed');
+    await enqueue(s1, tid(3));
+    await finish(await w.as(logins.a1), await claim(await w.as(logins.a1)), { kind: 'cancelled', cancelConfirmed: false });
+    assert.equal((await call(s1, 'ld_cancel', tid(3))).confirmed, false, 'a runner-reported unconfirmed cancel never reads as confirmed on replay');
   },
 
   'ld_finish never stores an author key, so only the queue itself can write a queue-authored record': async (w) => {
@@ -148,7 +135,7 @@ const GUARDS = {
     const su = await w.su();
     await wasFinishedAgo(w, old, 'finished', 10 * DAY);
     await wasFinishedAgo(w, fresh, 'finished', 60);
-    await wasFinishedAgo(w, live, 'quarantined', 10 * DAY);
+    await wasFinishedAgo(w, live, 'queued', 10 * DAY);
     await su.query("INSERT INTO lane_dispatch.attempts (ticket, epoch, host, claim_token) VALUES ($1, 1, 'a1', gen_random_uuid())", [old]);
     for (const id of [old, fresh, live]) await su.query("INSERT INTO lane_dispatch.log_chunks (ticket, epoch, seq, bytes) VALUES ($1, 1, 1, 'x')", [id]);
     assert.equal(await call(admin, 'ld_prune', [old, fresh, live, queued], '7 days'), 1);
@@ -271,17 +258,13 @@ const CANARIES = [
     "RETURN (SELECT c.timeline::text || '.' || c.incarnation::text FROM lane_dispatch.cluster c WHERE c.id = 1);", "RETURN '1.0';"],
   ['ld_enqueue_fenced inserts nothing on a stale ref, inserts on a matching ref, replays idempotently and survives a restore',
     'IF p_expect_ref IS DISTINCT FROM v_ref THEN', 'IF false THEN'],
-  ['ld_heartbeat returns urls only when their epoch is the row epoch', "CASE WHEN v_t.urls->>'epoch' = v_t.epoch::text THEN v_t.urls END", 'v_t.urls'],
   ['ticket_view carries a stable attempt_ref per claim and never the claim token',
     "ELSE encode(sha256(convert_to('lane-attempt-ref:' || t.claim_token::text, 'UTF8')), 'hex') END)", "ELSE t.claim_token::text END, 'claim_token', t.claim_token)"],
   ['ticket_view carries a stable attempt_ref per claim and never the claim token',
     "ELSE encode(sha256(convert_to('lane-attempt-ref:' || t.claim_token::text, 'UTF8')), 'hex') END)", "ELSE 'constant' END)"],
   ['ld_cancel stores a server-authored result and a replay never upgrades confirmation',
     "coalesce(CASE WHEN jsonb_typeof(v_t.result->'cancelConfirmed') = 'boolean' THEN (v_t.result->>'cancelConfirmed')::boolean END, v_t.state = 'cancelled' AND v_t.result IS NULL)", "v_t.state = 'cancelled'"],
-  ['ld_cancel stores a server-authored result and a replay never upgrades confirmation',
-    "'cancelConfirmed', false, 'source', 'operator'", "'cancelConfirmed', true, 'source', 'operator'"],
   ['ld_finish never stores an author key, so only the queue itself can write a queue-authored record', "(p_result - 'author') ||", 'p_result ||'],
-  ['ld_cancel stores a server-authored result and a replay never upgrades confirmation', "'epoch', v_epoch, 'author', 'queue')", "'epoch', v_epoch)"],
   ['ld_cancel stores a server-authored result and a replay never upgrades confirmation', "'epoch', v_t.epoch, 'author', 'queue')", "'epoch', v_t.epoch)"],
   ['ld_placeable counts the agents eligible for the repo and tags', ' AND lane_dispatch.eligible(coalesce(p_requires_tags, \'{}\'), p_repo_key, p.tags, p.allowed_repos));', ');'],
   ['ld_placeable counts the agents eligible for the repo and tags', "p.kind = 'agent' AND p.max_claims > 0", "p.kind = 'agent'"],
@@ -291,11 +274,11 @@ const CANARIES = [
     'IF (p_after_finished IS NULL) <> (p_after_id IS NULL) THEN', 'IF false THEN'],
   ['ld_prune deletes only terminal rows past the row age, with their chunks and attempts',
     "t.id = ANY (p_ids) AND t.state IN ('finished','cancelled','withdrawn','lost') AND", 't.id = ANY (p_ids) AND'],
-  ['ld_prune deletes only terminal rows past the row age, with their chunks and attempts', 'AND t.finished_at < clock_timestamp() - p_rows_after', ''],
+  ['ld_prune deletes only terminal rows past the row age, with their chunks and attempts', 'AND t.finished_at < lane_dispatch.now() - p_rows_after', ''],
   ['ld_prune deletes only terminal rows past the row age, with their chunks and attempts', 'DELETE FROM lane_dispatch.log_chunks WHERE ticket = ANY (v_due);', ''],
   ['ld_prune_chunks removes orphans and long-terminal chunks only, at most limit per call', 'LIMIT least(greatest(coalesce(p_limit, 10000), 1), 100000)', ''],
   ['ld_prune_chunks removes orphans and long-terminal chunks only, at most limit per call',
-    "WHERE t.id IS NULL OR (t.state IN ('finished','cancelled','withdrawn','lost') AND t.finished_at < clock_timestamp() - p_terminal_after)", 'WHERE true'],
+    "WHERE t.id IS NULL OR (t.state IN ('finished','cancelled','withdrawn','lost') AND t.finished_at < lane_dispatch.now() - p_terminal_after)", 'WHERE true'],
   ['ld_blobs_live reports only blobs referenced by a non-terminal ticket and bounds its input',
     "WHERE t.state NOT IN ('finished','cancelled','withdrawn','lost')\n       AND b->>", 'WHERE true\n       AND b->>'],
   ['ld_cancel reads a row released as cancelled after a cancel request as confirmed', "v_t.state = 'cancelled' AND v_t.result IS NULL)", 'false)'],
