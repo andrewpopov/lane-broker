@@ -556,6 +556,7 @@ export const LANE_QUEUE_DATABASE = 'lane_queue';
 const LANE_QUEUE_PRIMARY_LABEL = 'pg-primary';
 
 const ROUTING_QUERY_KEYS = new Set(['host', 'hostaddr', 'port', 'dbname', 'database', 'service', 'target_session_attrs']);
+const SSL_FILE_QUERY_KEYS = new Set(['sslrootcert', 'sslcert', 'sslkey']);
 
 const decodedQueryKeys = (raw) => {
   const query = raw.includes('?') ? raw.slice(raw.indexOf('?') + 1).split('#')[0] : '';
@@ -565,19 +566,25 @@ const decodedQueryKeys = (raw) => {
 /** Why `laneQueueUrl` is not a single direct endpoint of the lane queue database, or null. Checked on what pg connects to (`parse`), not on the raw text. */
 function laneQueueUrlProblem(raw) {
   if (typeof raw !== 'string' || !/^postgres(ql)?:\/\//.test(raw)) return 'must be a postgres:// URL';
-  let parsed;
   let keys;
   try {
-    parsed = parsePgConnectionString(raw);
     keys = decodedQueryKeys(raw);
-  } catch {
-    const authority = raw.replace(/^postgres(ql)?:\/\//, '').split(/[/?#]/)[0];
-    return authority.slice(authority.lastIndexOf('@') + 1).startsWith('svc:')
-      ? 'must not use a svc: host (a failover name); name the one direct endpoint'
-      : 'is not a valid single-host postgres:// URL (multi-host URLs are refused)';
+  } catch (err) {
+    return `has a malformed query string (${err.message})`;
   }
   const routing = keys.find((k) => ROUTING_QUERY_KEYS.has(k));
   if (routing !== undefined) return `must not set the "${routing}" query parameter (connection routing belongs in the URL authority and path)`;
+  const sslFile = keys.find((k) => SSL_FILE_QUERY_KEYS.has(k));
+  if (sslFile !== undefined) return `must not set the "${sslFile}" query parameter (TLS files belong in lanePull.caFile)`;
+  let parsed;
+  try {
+    parsed = parsePgConnectionString(raw);
+  } catch (err) {
+    const authority = raw.replace(/^postgres(ql)?:\/\//, '').split(/[/?#]/)[0];
+    return authority.slice(authority.lastIndexOf('@') + 1).startsWith('svc:')
+      ? 'must not use a svc: host (a failover name); name the one direct endpoint'
+      : `is not a valid single-host postgres:// URL (${err.message})`;
+  }
   const host = parsed.host ?? '';
   if (host === '') return 'must name a host';
   if (host.startsWith('svc:')) return 'must not use a svc: host (a failover name); name the one direct endpoint';
