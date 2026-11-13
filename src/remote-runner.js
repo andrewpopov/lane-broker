@@ -38,7 +38,7 @@ import { sanitizeObservedCpu, sanitizeRssPeak, sanitizeCpuSeconds } from './obse
 // BRAIN-320 S1b (1b): the absolute path to `bin/lane.js`, so a protocol-2
 // pipeline's argv (`[node, lane.js, 'remote-pipeline', ticketDir]`) is
 // spawnable regardless of the runner's own PATH/cwd.
-const laneBinPath = fileURLToPath(new URL('../bin/lane.js', import.meta.url));
+export const laneBinPath = fileURLToPath(new URL('../bin/lane.js', import.meta.url));
 
 // BRAIN-374/BRAIN-376: per-ticket TMPDIR base. /var/tmp is disk-backed per the
 // FHS (/tmp is tmpfs on the runners) and short enough that a Unix socket bound
@@ -368,7 +368,7 @@ function readIfExists(file) {
   }
 }
 
-const brokerLock = (fn) => withLock(stateHome(), fn);
+export const brokerLock = (fn) => withLock(stateHome(), fn);
 
 async function collectGarbage(root) {
   try {
