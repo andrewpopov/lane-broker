@@ -206,8 +206,8 @@ const SEMANTICS = {
     assert.ok(ttl > 110, `lease ${ttl}`);
     assert.equal(await call(s2, 'ld_attach_urls', tid(1), got.epoch, { get: 'u' }), false, 'not the owner');
     assert.equal(await call(s1, 'ld_attach_urls', tid(1), got.epoch + 1, { get: 'u' }), false, 'wrong epoch');
-    assert.equal(await call(s1, 'ld_attach_urls', tid(1), got.epoch, { get: 'u', put: 'p' }), true);
-    assert.deepEqual((await heartbeat(a1, got)).urls, { get: 'u', put: 'p' });
+    assert.equal(await call(s1, 'ld_attach_urls', tid(1), got.epoch, { epoch: got.epoch, get: 'u', put: 'p' }), true);
+    assert.deepEqual((await heartbeat(a1, got)).urls, { epoch: got.epoch, get: 'u', put: 'p' });
     assert.equal(await call(s2, 'ld_get', tid(1)), null, 'another owner cannot read the ticket');
     assert.equal((await call(s1, 'ld_get', tid(1))).state, 'claimed');
     assert.equal('claim_token' in (await call(s1, 'ld_get', tid(1))), false, 'the fencing token never reaches the submitter');
