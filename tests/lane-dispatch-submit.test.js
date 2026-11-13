@@ -2,7 +2,7 @@ import { describe, test, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { pgSkipOption } from './lane-db-harness.js';
-import { startDispatchCluster, World, logins, call, enqueue, claim, finish, tid, simulateRestore } from './lane-dispatch-fixture.js';
+import { startDispatchCluster, World, logins, call, enqueue, claim, finish, release, tid, simulateRestore } from './lane-dispatch-fixture.js';
 
 const DAY = 86400;
 const fenced = (client, ref, id) =>
@@ -178,6 +178,82 @@ const GUARDS = {
     await assert.rejects(call(admin, 'ld_blobs_live', JSON.stringify(Array(501).fill(refs[0]))), (err) => err.code === '22023');
     await assert.rejects(call(admin, 'ld_blobs_live', '{}'), (err) => err.code === '22023');
   },
+
+  'ld_cancel reads a row released as cancelled after a cancel request as confirmed': async (w) => {
+    const [s1, a1] = [await w.as(logins.s1), await w.as(logins.a1)];
+    await enqueue(s1, tid(1));
+    const got = await claim(a1);
+    assert.equal((await call(s1, 'ld_cancel', tid(1))).confirmed, false, 'a held row is not confirmed by the request');
+    assert.deepEqual(await release(a1, got, 'cancel-confirmed'), { fenced: false, state: 'cancelled' });
+    assert.equal((await w.ticket(tid(1))).result, null);
+    assert.deepEqual(await call(s1, 'ld_cancel', tid(1)), { state: 'cancelled', cancel_requested: true, confirmed: true });
+  },
+
+  'ld_cancel reads a claimed row reaped as cancelled after a cancel request as confirmed': async (w) => {
+    const [s1, a1, admin, su] = [await w.as(logins.s1), await w.as(logins.a1), await w.as(logins.admin), await w.su()];
+    await enqueue(s1, tid(1));
+    await claim(a1);
+    await call(s1, 'ld_cancel', tid(1));
+    await su.query("UPDATE lane_dispatch.tickets SET lease_until = now() - interval '10 seconds'");
+    await su.query('UPDATE lane_dispatch.cluster SET last_tick = clock_timestamp()');
+    assert.equal((await call(admin, 'ld_reap')).cancelled, 1);
+    assert.deepEqual(await call(s1, 'ld_cancel', tid(1)), { state: 'cancelled', cancel_requested: true, confirmed: true });
+  },
+
+  'ld_cancel reads a non-boolean cancelConfirmed as false': async (w) => {
+    const [s1, a1] = [await w.as(logins.s1), await w.as(logins.a1)];
+    await enqueue(s1, tid(1));
+    const got = await claim(a1);
+    await finish(a1, got, { kind: 'cancelled', cancelConfirmed: 'yes' });
+    assert.equal((await call(s1, 'ld_cancel', tid(1))).confirmed, false);
+  },
+
+  'ld_blobs_live survives a ticket whose snapshot blobs is not an array, and ld_enqueue_fenced refuses one': async (w) => {
+    const [s1, admin] = [await w.as(logins.s1), await w.as(logins.admin)];
+    const raw = (id, snapshot) => call(s1, 'ld_enqueue', id, 'repoA', 'test', `lk-${id}`, { protocol: 1 }, { cmd: ['true'] }, snapshot, [], 1, 1000, 0);
+    await raw(tid(1), { key: 'snap', sha256: 'x', blobs: null });
+    await raw(tid(2), { key: 'snap', sha256: 'x', blobs: [{ ns: 'n', sha256: 'live' }] });
+    const refs = [{ ns: 'n', sha256: 'live' }, { ns: 'n', sha256: 'other' }];
+    assert.deepEqual(await call(admin, 'ld_blobs_live', JSON.stringify(refs)), [refs[0]]);
+  },
+
+  'ld_enqueue_fenced refuses a snapshot whose blobs is not an array': async (w) => {
+    const s1 = await w.as(logins.s1);
+    const ref = await call(s1, 'ld_queue_ref');
+    for (const [i, blobs] of [null, 'x', {}].entries()) {
+      await assert.rejects(
+        call(s1, 'ld_enqueue_fenced', ref, tid(i + 1), 'repoA', 'test', `lk${i}`, { protocol: 1 }, { cmd: ['true'] }, { key: 'snap', sha256: 'x', blobs }, [], 1, 1000, 0),
+        (err) => err.code === '22023');
+      assert.equal(await rowCount(w, tid(i + 1)), 0);
+    }
+    const ok = await call(s1, 'ld_enqueue_fenced', ref, tid(9), 'repoA', 'test', 'lk9', { protocol: 1 }, { cmd: ['true'] }, { key: 'snap', sha256: 'x', blobs: [] }, [], 1, 1000, 0);
+    assert.equal(ok.state, 'queued');
+  },
+
+  'ld_prune deletes the claim_requests of the pruned tickets': async (w) => {
+    const [s1, a1, admin, su] = [await w.as(logins.s1), await w.as(logins.a1), await w.as(logins.admin), await w.su()];
+    await enqueue(s1, tid(1));
+    await enqueue(s1, tid(2));
+    const got = await claim(a1);
+    await finish(a1, got);
+    await claim(a1);
+    const remaining = (await su.query('SELECT ticket FROM lane_dispatch.claim_requests ORDER BY ticket')).rows.map((r) => r.ticket);
+    assert.deepEqual(remaining, [tid(1), tid(2)]);
+    await wasFinishedAgo(w, tid(1), 'finished', 10 * DAY);
+    assert.equal(await call(admin, 'ld_prune', [tid(1), tid(2)], '7 days'), 1);
+    assert.deepEqual((await su.query('SELECT ticket FROM lane_dispatch.claim_requests')).rows.map((r) => r.ticket), [tid(2)],
+      'the pruned ticket mapping goes, the live ticket mapping stays');
+  },
+
+  'ticket_view returns only the callers own tickets from ld_get, ld_list_mine and ld_enqueue': async (w) => {
+    const [s1, s2] = [await w.as(logins.s1), await w.as(logins.s2)];
+    await enqueue(s1, tid(1));
+    assert.equal(await call(s2, 'ld_get', tid(1)), null);
+    assert.deepEqual(await call(s2, 'ld_list_mine'), []);
+    assert.equal((await call(s1, 'ld_get', tid(1))).id, tid(1));
+    assert.deepEqual((await call(s1, 'ld_list_mine')).map((t) => t.id), [tid(1)]);
+    await assert.rejects(enqueue(s2, tid(1)), (err) => err.code === '23505');
+  },
 };
 
 const CANARIES = [
@@ -191,7 +267,7 @@ const CANARIES = [
   ['ticket_view carries a stable attempt_ref per claim and never the claim token',
     "ELSE encode(sha256(convert_to('lane-attempt-ref:' || t.claim_token::text, 'UTF8')), 'hex') END)", "ELSE 'constant' END)"],
   ['ld_cancel stores a server-authored result and a replay never upgrades confirmation',
-    "coalesce(v_t.result->'cancelConfirmed' = 'true'::jsonb, false)", "v_t.state = 'cancelled'"],
+    "coalesce(CASE WHEN jsonb_typeof(v_t.result->'cancelConfirmed') = 'boolean' THEN (v_t.result->>'cancelConfirmed')::boolean END, v_t.state = 'cancelled' AND v_t.result IS NULL)", "v_t.state = 'cancelled'"],
   ['ld_cancel stores a server-authored result and a replay never upgrades confirmation',
     "'cancelConfirmed', false, 'source', 'operator'", "'cancelConfirmed', true, 'source', 'operator'"],
   ['ld_placeable counts the agents eligible for the repo and tags', ' AND lane_dispatch.eligible(coalesce(p_requires_tags, \'{}\'), p_repo_key, p.tags, p.allowed_repos));', ');'],
@@ -209,6 +285,13 @@ const CANARIES = [
     "WHERE t.id IS NULL OR (t.state IN ('finished','cancelled','withdrawn','lost') AND t.finished_at < clock_timestamp() - p_terminal_after)", 'WHERE true'],
   ['ld_blobs_live reports only blobs referenced by a non-terminal ticket and bounds its input',
     "WHERE t.state NOT IN ('finished','cancelled','withdrawn','lost')\n       AND b->>", 'WHERE true\n       AND b->>'],
+  ['ld_cancel reads a row released as cancelled after a cancel request as confirmed', "v_t.state = 'cancelled' AND v_t.result IS NULL)", 'false)'],
+  ['ld_cancel reads a claimed row reaped as cancelled after a cancel request as confirmed', "v_t.state = 'cancelled' AND v_t.result IS NULL)", 'false)'],
+  ['ld_cancel reads a non-boolean cancelConfirmed as false', "CASE WHEN jsonb_typeof(v_t.result->'cancelConfirmed') = 'boolean' THEN (v_t.result->>'cancelConfirmed')::boolean END", "(v_t.result->>'cancelConfirmed')::boolean"],
+  ['ld_blobs_live survives a ticket whose snapshot blobs is not an array, and ld_enqueue_fenced refuses one', "jsonb_array_elements(CASE WHEN jsonb_typeof(t.snapshot->'blobs') = 'array' THEN t.snapshot->'blobs' ELSE '[]'::jsonb END) b", "jsonb_array_elements(t.snapshot->'blobs') b"],
+  ['ld_enqueue_fenced refuses a snapshot whose blobs is not an array', "IF p_snapshot ? 'blobs' AND jsonb_typeof(p_snapshot->'blobs') <> 'array' THEN", 'IF false THEN'],
+  ['ld_prune deletes the claim_requests of the pruned tickets', 'DELETE FROM lane_dispatch.claim_requests WHERE ticket = ANY (v_due);', ''],
+  ['ticket_view returns only the callers own tickets from ld_get, ld_list_mine and ld_enqueue', 'WHERE t.id = p_id AND t.owner = p_owner);', 'WHERE t.id = p_id);'],
 ];
 
 describe('lane_dispatch submit-side surface for the pull client on a disposable Postgres', { skip: pgSkipOption, timeout: 600000 }, () => {

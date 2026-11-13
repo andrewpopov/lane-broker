@@ -630,7 +630,8 @@ BEGIN
   RETURN p_requires_tags <@ p_tags AND (p_repo_key = ANY (p_allowed_repos) OR '*' = ANY (p_allowed_repos));
 END $$;
 
-CREATE OR REPLACE FUNCTION lane_dispatch.ticket_view(p_id uuid) RETURNS jsonb
+DROP FUNCTION IF EXISTS lane_dispatch.ticket_view(uuid);
+CREATE OR REPLACE FUNCTION lane_dispatch.ticket_view(p_id uuid, p_owner text) RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 BEGIN
   RETURN (SELECT jsonb_build_object('id', t.id, 'state', t.state, 'epoch', t.epoch, 'execution_id', t.id::text || '.e' || t.epoch::text,
@@ -639,7 +640,7 @@ BEGIN
                                     'started_at', t.started_at, 'finished_at', t.finished_at,
                                     'attempt_ref', CASE WHEN t.claim_token IS NULL THEN NULL
                                                         ELSE encode(sha256(convert_to('lane-attempt-ref:' || t.claim_token::text, 'UTF8')), 'hex') END)
-            FROM lane_dispatch.tickets t WHERE t.id = p_id);
+            FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = p_owner);
 END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.claim_view(p_id uuid, p_epoch int, p_token uuid) RETURNS jsonb
@@ -690,7 +691,7 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user) THEN
     RAISE EXCEPTION 'ticket % already exists', p_id USING ERRCODE = '23505';
   END IF;
-  RETURN lane_dispatch.ticket_view(p_id);
+  RETURN lane_dispatch.ticket_view(p_id, session_user);
 END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_get(p_id uuid) RETURNS jsonb
@@ -699,8 +700,7 @@ DECLARE v_me record;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT * INTO v_me FROM lane_dispatch.me('submit');
-  IF NOT EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user) THEN RETURN NULL; END IF;
-  RETURN lane_dispatch.ticket_view(p_id);
+  RETURN lane_dispatch.ticket_view(p_id, session_user);
 END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_list_mine(p_states text[] DEFAULT NULL, p_limit int DEFAULT 100) RETURNS jsonb
@@ -709,7 +709,7 @@ DECLARE v_me record;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT * INTO v_me FROM lane_dispatch.me('submit');
-  RETURN coalesce((SELECT jsonb_agg(lane_dispatch.ticket_view(m.id) ORDER BY m.created_at DESC, m.id)
+  RETURN coalesce((SELECT jsonb_agg(lane_dispatch.ticket_view(m.id, session_user) ORDER BY m.created_at DESC, m.id)
                      FROM (SELECT t.id, t.created_at FROM lane_dispatch.tickets t
                             WHERE t.owner = session_user AND (p_states IS NULL OR t.state = ANY (p_states))
                             ORDER BY t.created_at DESC, t.id LIMIT least(greatest(coalesce(p_limit, 100), 1), 500)) m), '[]'::jsonb);
@@ -750,7 +750,7 @@ BEGIN
     PERFORM pg_notify('ld_host_' || v_t.host, '');
     RETURN jsonb_build_object('state', v_t.state, 'cancel_requested', true, 'confirmed', false);
   END IF;
-  RETURN jsonb_build_object('state', v_t.state, 'cancel_requested', v_t.cancel_requested, 'confirmed', coalesce(v_t.result->'cancelConfirmed' = 'true'::jsonb, false));
+  RETURN jsonb_build_object('state', v_t.state, 'cancel_requested', v_t.cancel_requested, 'confirmed', coalesce(CASE WHEN jsonb_typeof(v_t.result->'cancelConfirmed') = 'boolean' THEN (v_t.result->>'cancelConfirmed')::boolean END, v_t.state = 'cancelled' AND v_t.result IS NULL));
 END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_attach_urls(p_id uuid, p_epoch int, p_urls jsonb) RETURNS boolean
@@ -999,6 +999,9 @@ DECLARE v_me record; v_ref text;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT * INTO v_me FROM lane_dispatch.me('submit');
+  IF p_snapshot ? 'blobs' AND jsonb_typeof(p_snapshot->'blobs') <> 'array' THEN
+    RAISE EXCEPTION 'snapshot.blobs must be an array' USING ERRCODE = '22023';
+  END IF;
   SELECT c.timeline::text || '.' || c.incarnation::text INTO v_ref FROM lane_dispatch.cluster c WHERE c.id = 1;
   IF p_expect_ref IS DISTINCT FROM v_ref THEN
     RETURN jsonb_build_object('state', 'stale-queue-ref', 'queue_ref', v_ref);
@@ -1052,6 +1055,7 @@ BEGIN
      WHERE t.id = ANY (p_ids) AND t.state IN ('finished','cancelled','withdrawn','lost') AND t.finished_at < clock_timestamp() - p_rows_after
        ORDER BY t.id FOR UPDATE) t;
   DELETE FROM lane_dispatch.log_chunks WHERE ticket = ANY (v_due);
+  DELETE FROM lane_dispatch.claim_requests WHERE ticket = ANY (v_due);
   DELETE FROM lane_dispatch.tickets WHERE id = ANY (v_due);
   GET DIAGNOSTICS v_deleted = ROW_COUNT;
   RETURN v_deleted;
@@ -1078,7 +1082,7 @@ BEGIN
     RAISE EXCEPTION 'refs must be a json array of at most 500' USING ERRCODE = '22023';
   END IF;
   RETURN coalesce((SELECT jsonb_agg(r) FROM jsonb_array_elements(p_refs) r WHERE EXISTS (
-    SELECT 1 FROM lane_dispatch.tickets t, jsonb_array_elements(t.snapshot->'blobs') b
+    SELECT 1 FROM lane_dispatch.tickets t, jsonb_array_elements(CASE WHEN jsonb_typeof(t.snapshot->'blobs') = 'array' THEN t.snapshot->'blobs' ELSE '[]'::jsonb END) b
      WHERE t.state NOT IN ('finished','cancelled','withdrawn','lost')
        AND b->>'sha256' = r->>'sha256' AND b->>'ns' = r->>'ns')), '[]'::jsonb);
 END $$;
