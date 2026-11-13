@@ -696,6 +696,13 @@ BEGIN
            WHERE p.kind = 'agent' AND p.max_claims > 0 AND lane_dispatch.eligible(coalesce(p_requires_tags, '{}'), p_repo_key, p.tags, p.allowed_repos));
 END $$;
 
+-- Seconds a non-high must wait before it ties a high (3 x the 20 minute age window); eff_score and the claim order share it.
+CREATE OR REPLACE FUNCTION lane_dispatch.age_horizon_s() RETURNS double precision
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  RETURN 3600;
+END $$;
+
 -- src/priority.js score(): min(ceiling, 2 * tierFactor + 2 * ageFactor), age capped at 20 min, a non-high held at 0.99 of the tier weight until it has waited 60 min.
 -- The tier is the priority band: 7-9 high, 4-6 medium, 0-3 low. A ticket that does not age credits no wait.
 -- Priority 9 (a release candidate) adds 0.01 on top, so it outranks every other high and every aged ticket that ties a high.
@@ -703,7 +710,7 @@ CREATE OR REPLACE FUNCTION lane_dispatch.eff_score(p_priority int, p_ages boolea
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 DECLARE v_tier int := CASE WHEN p_priority >= 7 THEN 2 WHEN p_priority >= 4 THEN 1 ELSE 0 END; v_credit double precision := CASE WHEN p_ages THEN greatest(p_age_s, 0) ELSE 0 END;
 BEGIN
-  RETURN least(CASE WHEN v_tier = 2 OR v_credit >= 3600 THEN 2.0 ELSE 1.98 END, 2.0 * v_tier / 2 + 2.0 * least(1.0, v_credit / 1200))
+  RETURN least(CASE WHEN v_tier = 2 OR v_credit >= lane_dispatch.age_horizon_s() THEN 2.0 ELSE 1.98 END, 2.0 * v_tier / 2 + 2.0 * least(1.0, v_credit / 1200))
          + CASE WHEN p_priority >= 9 THEN 0.01 ELSE 0 END;
 END $$;
 
@@ -878,7 +885,8 @@ BEGIN
      AND lane_dispatch.eligible(t.requires_tags, t.repo_key, v_me.tags, v_me.allowed_repos)
      AND t.cpu_cores <= p_free_cpu AND t.memory_bytes <= p_free_mem AND NOT (t.lane_key = ANY (coalesce(p_held_keys, '{}')))
    ORDER BY lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) DESC,
-            CASE WHEN lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) >= 2.0 THEN t.created_at END NULLS LAST,
+            CASE WHEN lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) >= 2.0
+                  AND extract(epoch FROM v_now - t.created_at) >= lane_dispatch.age_horizon_s() THEN t.created_at END NULLS LAST,
             lane_dispatch.scarcity(t.requires_tags, t.repo_key), t.created_at, t.id LIMIT 1 FOR UPDATE SKIP LOCKED;
   IF NOT FOUND THEN RETURN jsonb_build_object('status', 'none'); END IF;
   v_token := gen_random_uuid();
