@@ -132,6 +132,8 @@ test('MUTATION: tryStart ignoring reloadCfg (using globalCfg instead) makes the 
   // the real scheduler.js is load-bearing, not decoration.
   const mutantSrcDir = fs.realpathSync(makeTmpDir('lane-broker-mutant-src-'));
   fs.cpSync(srcDir, mutantSrcDir, { recursive: true });
+  // the copy lives outside the repo, so its package imports need the repo's node_modules
+  fs.symlinkSync(path.join(srcDir, '..', 'node_modules'), path.join(mutantSrcDir, 'node_modules'), 'dir');
 
   const schedulerPath = path.join(mutantSrcDir, 'scheduler.js');
   const source = fs.readFileSync(schedulerPath, 'utf8');
