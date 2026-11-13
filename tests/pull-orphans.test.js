@@ -4,12 +4,15 @@ import path from 'node:path';
 import { readAttempt } from '../src/attempts.js';
 import { paths } from '../src/state.js';
 import { freshEnv } from './helpers.js';
-import { definePullSuite, pullFixture } from './helpers/pull-fixture.js';
+import { ARTIFACT_PATH, artifactsStream, definePullSuite, pullFixture } from './helpers/pull-fixture.js';
 import { tid } from './lane-dispatch-fixture.js';
 
 /** BRAIN-1036 R6: the orphan guards and transport branches (T10a, T10b, T26b, T37b's `lane wait` half), status, and the seam's pull adapter. */
 
 const CRASH = new Error('killed');
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const SLOW_MS = 4000;
+const slowly = (fn) => async (...args) => { await sleep(SLOW_MS); return fn(...args); };
 const GLOBAL_CFG = { runners: [], runnerLostAfterMs: 0 };
 const ctxFor = (fx) => (ticket) => fx.ctx({ generation: ticket.generation });
 
@@ -42,7 +45,7 @@ async function silenced(fn) {
 const counting = (fx, name) => {
   const calls = [];
   const queue = { ...fx.queue, [name]: (...args) => { calls.push(args); return fx.queue[name](...args); } };
-  return { calls, ctx: (ticket) => fx.ctx({ generation: ticket.generation, queue }) };
+  return { calls, ctx: (ticket, extra = {}) => fx.ctx({ generation: ticket.generation, queue, ...extra }) };
 };
 
 const SCENARIOS = {
@@ -133,6 +136,56 @@ const SCENARIOS = {
     assert.equal(fx.writes.length, 1);
   },
 
+  'T26b: a cancel arriving while the publisher holds the ticket lock waits for it and then finds the finish already settled': async (load, w, t) => {
+    const { cancelAttempt } = await load('cancel.js');
+    const fx = await pullFixture(t, w, { load });
+    await fx.hold();
+    await fx.runner.finish({ exit: 0 });
+    let release;
+    let reached;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const atGate = new Promise((resolve) => { reached = resolve; });
+    fx.hooks.afterLedger = () => { reached(); return gate; };
+    const publishing = fx.step();
+    publishing.catch(() => {});
+    await atGate;
+    const spy = counting(fx, 'cancel');
+    const cancelling = cancelAttempt(fx.state, fx.id, readAttempt(fx.state, fx.id), { orphanOnly: true, pullContext: (ticket) => spy.ctx(ticket, { lockTimeoutMs: 10_000, hooks: {} }) });
+    cancelling.catch(() => {});
+    try {
+      assert.equal(await Promise.race([cancelling, sleep(400).then(() => 'blocked')]), 'blocked', 'the cancel is queued behind the lock the publisher holds');
+    } finally {
+      release();
+    }
+    assert.equal((await publishing).state, 'settled');
+    assert.equal((await cancelling).exitCode, 0);
+    assert.deepEqual([fx.published().exit, fx.writes.length, spy.calls.length], [0, 1, 0], 'the finish, once, and the queue never asked to cancel');
+  },
+
+  'lane wait --timeout bounds a pull step that never answers and a ledger rebuild that never finishes': async (load, w, t) => {
+    const { waitCommand } = await load('wait.js');
+    const ledgered = await pullFixture(t, w, { load, id: tid(2) });
+    await ledgered.hold();
+    await ledgered.runner.finish(await ledgered.runner.putOutputs({ log: 'out\n', artifacts: artifactsStream(ledgered.id, { [ARTIFACT_PATH]: '{}' }) }));
+    ledgered.hooks.afterLedger = () => { throw CRASH; };
+    await assert.rejects(ledgered.step(), CRASH);
+    fs.rmSync(path.join(paths(ledgered.state).attempts, `${ledgered.id}.json`));
+    const hangs = { hooks: { beforeInstall: slowly(async () => {}) } };
+    const rebuildStarted = Date.now();
+    const rebuilt = await withBrokerEnv(ledgered.state, () => silenced(() => waitCommand(ledgered.id, { timeoutMs: 1500, pullContext: (ticket) => ledgered.ctx({ generation: ticket.generation, ...hangs }) })));
+    assert.deepEqual(rebuilt, { exitCode: 75 });
+    assert.ok(Date.now() - rebuildStarted < SLOW_MS - 500, 'the ledger rebuild is bounded by the wait deadline, not by how long it takes');
+    const stuck = await pullFixture(t, w, { load, id: tid(1), stub: ledgered.stub });
+    await stuck.enqueue();
+    await stuck.killSupervisor();
+    const hangingQueue = { ...stuck.queue, get: slowly((id) => stuck.queue.get(id)) };
+    const started = Date.now();
+    const reconciled = await withBrokerEnv(stuck.state, () => silenced(() => waitCommand(stuck.id, { timeoutMs: 1500, pullContext: (ticket) => stuck.ctx({ generation: ticket.generation, queue: hangingQueue }) })));
+    assert.deepEqual(reconciled, { exitCode: 75 });
+    assert.ok(Date.now() - started < SLOW_MS - 500, 'the pull step is bounded by the wait deadline, not by how long it takes');
+
+  },
+
   'status shows a pull attempt as pull@host with no runner, and marks an orphan for pull recovery': async (load, w, t) => {
     const { collectStatus, renderStatusText } = await load('status.js');
     const fx = await pullFixture(t, w, { load });
@@ -180,8 +233,10 @@ const CANARIES = [
   ['T26b: an orphan cancel racing a ledgered finish publishes the finish once and never calls the queue', 'cancel.js', ["  if (attempt.transport === 'pull') {", '  if (false) {']],
   ['T26b: an orphan cancel of a queued row publishes 130 confirmed, and of a running row stays held until the runner proves the stop', 'pull-recover.js', ['cancelRequested: () => true', 'cancelRequested: () => false']],
   ['T37b: lane wait returns the ledgered exit when the attempt and the result are both gone', 'wait.js', ['if (readLedger(root, id) !== null) {', 'if (false) {']],
+  ['lane wait --timeout bounds a pull step that never answers and a ledger rebuild that never finishes', 'pull-recover.js', ['return Promise.race([stepPullTicket({ ...ctx, stepBudgetMs: Math.min(ctx.stepBudgetMs ?? Infinity, remaining) }), expiry]).finally(() => clearTimeout(timer));', 'return stepPullTicket(ctx);']],
   ['status shows a pull attempt as pull@host with no runner, and marks an orphan for pull recovery', 'status.js', ["...(a.transport === 'pull' ? { transport: 'pull', pullHost: a.pull?.host ?? null, pullStage: a.pull?.stage ?? null } : {}),", '']],
   ['the pull transport adapter answers in the ssh shapes: a record, {missing, state}, a confirmed bool, an {action}', 'runner-transport.js', ["row.result && row.result.author !== 'queue' ? row.result", 'row.result ? row.result']],
+  ['T26b: a cancel arriving while the publisher holds the ticket lock waits for it and then finds the finish already settled', 'pull-envelope.js', ["return withLock(root, fn, { lockPath: path.join(pullTicketDir(root, id), 'recover.lock'), group: 'broker', timeoutMs: lockTimeoutMs });", 'return fn();']],
 ];
 
 definePullSuite('pull recovery surfaces: reconcile, cancel, wait, status and the transport seam', SCENARIOS, CANARIES);

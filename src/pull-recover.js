@@ -15,10 +15,24 @@ function reconcileOutcome(step) {
   return { settled: false, state: 'running' };
 }
 
+const MIN_STEP_MS = 250;
+const TIMED_OUT = { settled: false, state: 'unreachable', reason: 'wait timeout reached', timedOut: true };
+
+// a step has no deadline of its own beyond its budget, so the caller's `deadlineAt` (ms epoch) is raced against it
+async function stepWithin(ctx, deadlineAt) {
+  if (deadlineAt === undefined) return stepPullTicket(ctx);
+  const remaining = deadlineAt - Date.now();
+  if (remaining < MIN_STEP_MS) return null;
+  let timer;
+  const expiry = new Promise((resolve) => { timer = setTimeout(() => resolve(null), remaining); });
+  return Promise.race([stepPullTicket({ ...ctx, stepBudgetMs: Math.min(ctx.stepBudgetMs ?? Infinity, remaining) }), expiry]).finally(() => clearTimeout(timer));
+}
+
 // an outage is `unreachable`, never a verdict
-export async function reconcilePullAttempt(attempt, ctxFor) {
+export async function reconcilePullAttempt(attempt, ctxFor, { deadlineAt } = {}) {
   try {
-    return reconcileOutcome(await stepPullTicket(ctxFor(attempt)));
+    const step = await stepWithin(ctxFor(attempt), deadlineAt);
+    return step === null ? TIMED_OUT : reconcileOutcome(step);
   } catch (err) {
     if (isTransientError(err)) return { settled: false, state: 'unreachable', reason: err.message };
     throw err;
@@ -51,11 +65,11 @@ export async function cancelPullAttempt(id, attempt, ctxFor) {
   return { exitCode: 1 };
 }
 
-export async function reconstructLedgered(root, id, resultPath, ctxFor) {
+export async function reconstructLedgered(root, id, resultPath, ctxFor, { deadlineAt } = {}) {
   const entry = readLedger(root, id);
   if (entry === null || readAttempt(root, id) || fs.existsSync(resultPath)) return false;
   try {
-    return (await stepPullTicket(ctxFor({ id, generation: entry.generation }))).state === 'settled';
+    return (await stepWithin(ctxFor({ id, generation: entry.generation }), deadlineAt))?.state === 'settled';
   } catch (err) {
     if (isTransientError(err)) return false;
     throw err;

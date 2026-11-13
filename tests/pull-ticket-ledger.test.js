@@ -300,7 +300,7 @@ const SKIP_BARRIERS = 'for (const dir of dirs) ensureDurableDir(dir, { boundary:
 const EARLY_MARKER = '  const result = installArtifacts(worktreeRoot, files, patterns);\n';
 
 const CANARIES = [
-  ['T37b: with the attempt and the result both gone, the ledger entry rebuilds the result durably, once', 'pull-ticket.js', ['reconstructResult(run, entry, extra);', "{ state: 'settled', already: true, decision: entry.decision };"]],
+  ['T37b: with the attempt and the result both gone, the ledger entry rebuilds the result durably, once', 'pull-ticket.js', ['reconstructResult(run, entry, extra));', "{ state: 'settled', already: true, decision: entry.decision });"]],
   ['an entry ledgered for one generation applies nothing to an attempt bumped to the next, even when the caller follows the bump', 'pull-ticket.js', ['attempt.generation !== run.generation || entry.generation !== attempt.generation', 'attempt.generation !== run.generation']],
   ['a stale-generation caller creates no ledger entry, so the correct caller still settles the ticket', 'pull-ticket.js', ["    if (attempt && attempt.generation !== run.generation) return { state: 'stale' };\n", '']],
   ['a stale generation applies no effect: nothing is appended, installed or published', 'pull-ticket.js', ["  if (attempt && (attempt.generation !== run.generation || entry.generation !== attempt.generation)) return { state: 'stale', decision: entry.decision };\n", '']],

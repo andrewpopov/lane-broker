@@ -269,6 +269,7 @@ export const DEFAULT_GLOBAL_CONFIG = {
     blobGc: true,
     blobRefreshAfterDays: 7,
     rowRetentionMs: 7 * 24 * 3_600_000,
+    ledgerRetentionMs: 45 * 24 * 3_600_000,
     rustfs: { region: 'us-east-1', snapBucket: 'lane-snap', outBucket: 'lane-out' },
   },
 };
@@ -595,7 +596,9 @@ export function laneQueueUrlProblem(raw) {
   return null;
 }
 
-const LANE_PULL_NUMBERS = ['pollMs', 'urlTtlSec', 'urlRefreshSec', 'quarantineLostAfterMs', 'blobRefreshAfterDays', 'rowRetentionMs'];
+const LANE_PULL_NUMBERS = ['pollMs', 'urlTtlSec', 'urlRefreshSec', 'quarantineLostAfterMs', 'blobRefreshAfterDays', 'rowRetentionMs', 'ledgerRetentionMs'];
+// the queue's backup retention: a ledger entry must outlive every backup a restore could return
+export const LEDGER_RETENTION_FLOOR_MS = 35 * 24 * 3_600_000;
 const LANE_PULL_PATHS = ['passwordFile', 'caFile', 'ledgerDir'];
 const RUSTFS_STRINGS = ['region', 'snapBucket', 'outBucket', 'credentialsEnvFile'];
 
@@ -609,6 +612,7 @@ function validateLanePull(cfg, sourcePath) {
   assert(typeof pull.enabled === 'boolean', `${sourcePath}: "lanePull.enabled" must be a boolean`);
   assert(typeof pull.blobGc === 'boolean', `${sourcePath}: "lanePull.blobGc" must be a boolean`);
   for (const field of LANE_PULL_NUMBERS) assert(Number.isInteger(pull[field]) && pull[field] > 0, `${sourcePath}: "lanePull.${field}" must be a positive integer`);
+  assert(pull.ledgerRetentionMs >= LEDGER_RETENTION_FLOOR_MS, `${sourcePath}: "lanePull.ledgerRetentionMs" must be at least ${LEDGER_RETENTION_FLOOR_MS} (35 days, the queue's backup retention)`);
   assert(pull.urlTtlSec <= MAX_PRESIGN_EXPIRES_SEC, `${sourcePath}: "lanePull.urlTtlSec" must be at most ${MAX_PRESIGN_EXPIRES_SEC} (the SigV4 limit)`);
   assert(pull.urlRefreshSec < pull.urlTtlSec, `${sourcePath}: "lanePull.urlRefreshSec" must be less than "lanePull.urlTtlSec"`);
   for (const field of LANE_PULL_PATHS) {

@@ -38,6 +38,7 @@ export const presignerFor = ({ endpoint, region, creds, now = Date.now }) => ({ 
   presignUrl({ method, bucket, key, expiresSec, creds, endpoint, region, now: now() });
 
 const stageDirOf = (root, id, tag) => path.join(pullTicketDir(root, id), 'stage', tag);
+const dropStaged = (run) => fs.rmSync(path.join(pullTicketDir(run.root, run.id), 'stage'), { recursive: true, force: true });
 const installedMarkerOf = (root, id) => path.join(pullTicketDir(root, id), 'installed.json');
 const hook = (run, name) => run.hooks?.[name]?.();
 
@@ -356,7 +357,10 @@ function reconstructResult(run, entry, extra) {
 async function applyEntry(run, entry) {
   run.envelope ??= readEnvelope(run.root, run.id);
   const attempt = readAttempt(run.root, run.id);
-  if (fs.existsSync(run.resultPath)) return { state: 'settled', already: true, decision: entry.decision };
+  if (fs.existsSync(run.resultPath)) {
+    dropStaged(run);
+    return { state: 'settled', already: true, decision: entry.decision };
+  }
   if (attempt && (attempt.generation !== run.generation || entry.generation !== attempt.generation)) return { state: 'stale', decision: entry.decision };
   const warnings = { ...entry.warnings };
   const extra = {};
@@ -368,11 +372,16 @@ async function applyEntry(run, entry) {
   if (warnings.log) extra.remoteLogWarning = warnings.log;
   if (warnings.artifacts) extra.remoteArtifactsWarning = warnings.artifacts;
   assertLedgerUnchanged(run, entry);
-  return attempt ? publish(run, attempt, entry, extra) : reconstructResult(run, entry, extra);
+  const settled = await (attempt ? publish(run, attempt, entry, extra) : reconstructResult(run, entry, extra));
+  dropStaged(run);
+  return settled;
 }
 
-async function cancelIfRequested(run) {
-  if (run.cancelRequested?.()) await requestCancel(run);
+// a cancel recorded before the process died but never answered is sent by whoever recovers the ticket
+const cancelPending = (run, pull) => (pull?.cancel?.requestedAt !== undefined && pull.cancel.answer === undefined) || isCancelled(run.root, run.id);
+
+async function cancelIfRequested(run, pull) {
+  if (run.cancelRequested?.() || cancelPending(run, pull)) await requestCancel(run);
 }
 
 async function requestCancel(run) {
@@ -479,7 +488,7 @@ async function observe(run) {
     return settle(run, entryFor(run, null, lost('prepare-interrupted')));
   }
   if (!attempt.pull?.enqueue?.seenRowAt) return { state: 'needs-enqueue' };
-  await cancelIfRequested(run);
+  await cancelIfRequested(run, attempt.pull);
   const row = await run.queue.get(run.id);
   if (row === null) return settle(run, entryFor(run, null, lost('queue-row-missing')));
   if (row.state !== 'quarantined' && attempt.pull.quarantinedSince !== undefined) await persistPull(run, { quarantinedSince: undefined });

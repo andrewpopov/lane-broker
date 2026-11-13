@@ -91,7 +91,7 @@ async function reconcile(root, id, { globalCfg, sshBin, env, deadlineMs, deadlin
 
   if (attempt.transport === 'pull') {
     const recovery = await loadPullRecovery();
-    return recovery.reconcilePullAttempt(attempt, pullContext ?? recovery.pullContextFactory(root, globalCfg));
+    return recovery.reconcilePullAttempt(attempt, pullContext ?? recovery.pullContextFactory(root, globalCfg), { deadlineAt });
   }
 
   const configured = (globalCfg?.runners ?? []).find((r) => r.name === attempt.runner);

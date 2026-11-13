@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { ConfigError, DEFAULT_GLOBAL_CONFIG, loadGlobalConfig, pullConfigured, pullRunners, pushRunners } from '../src/config.js';
 import { freshEnv, writeGlobalConfig } from './helpers.js';
+import { assertCanaryFails } from './helpers/mutant-module.js';
 
 /** BRAIN-1036 R2: the pull-transport config keys and their load-time refusals (T9, T20). */
 
@@ -140,4 +141,29 @@ test('pullConfigured: enabled, a pull runner and every key, from the config alon
   } finally {
     fs.readFileSync = real;
   }
+});
+
+const LEDGER_FLOOR = 35 * 24 * 3_600_000;
+
+async function ledgerRetentionRefusal(loadModule) {
+  const { loadGlobalConfig } = await loadModule('config.js');
+  const attempt = (ledgerRetentionMs) => {
+    const { home } = freshEnv();
+    writeGlobalConfig(home, { version: 1, lanePull: { ledgerRetentionMs } });
+    const prior = process.env.LANE_BROKER_HOME;
+    process.env.LANE_BROKER_HOME = home;
+    try {
+      return loadGlobalConfig().lanePull.ledgerRetentionMs;
+    } finally {
+      process.env.LANE_BROKER_HOME = prior;
+    }
+  };
+  assert.equal(attempt(LEDGER_FLOOR), LEDGER_FLOOR, 'the floor itself is allowed');
+  assert.throws(() => attempt(LEDGER_FLOOR - 1), /lanePull\.ledgerRetentionMs.*35 days/, 'below the queue backup retention is refused by name');
+}
+
+test('lanePull.ledgerRetentionMs defaults to 45 days and is refused below the 35 day backup retention; the check is what refuses', async () => {
+  assert.equal(DEFAULT_GLOBAL_CONFIG.lanePull.ledgerRetentionMs, 45 * 24 * 3_600_000);
+  await ledgerRetentionRefusal((file) => import(`../src/${file}`));
+  await assertCanaryFails('config.js', ['assert(pull.ledgerRetentionMs >= LEDGER_RETENTION_FLOOR_MS,', 'assert(true || pull.ledgerRetentionMs >= LEDGER_RETENTION_FLOOR_MS,'], ledgerRetentionRefusal);
 });

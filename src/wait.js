@@ -195,7 +195,7 @@ export async function waitCommand(id, { timeoutMs, pullContext } = {}) {
       } else {
         if (readLedger(root, id) !== null) {
           const recovery = await loadPullRecovery();
-          if (await recovery.reconstructLedgered(root, id, resultPath, pullContext ?? recovery.configuredPullContext(root))) continue;
+          if (await recovery.reconstructLedgered(root, id, resultPath, pullContext ?? recovery.configuredPullContext(root), { deadlineAt: deadline ?? undefined })) continue;
         }
         if (notFoundSince === null) notFoundSince = Date.now();
         if (Date.now() - notFoundSince > NOT_FOUND_GRACE_MS) {

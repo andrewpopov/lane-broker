@@ -10,9 +10,13 @@ import { ensureStateDirs, paths } from './state.js';
 
 export const TEND_CONCURRENCY = 4;
 export const TEND_STEP_BUDGET_MS = 10_000;
+export const TEND_HARD_DEADLINE_MS = 30_000;
 const MIN_TEND_DELAY_MS = 1_000;
+const LEDGER_NAMES_PER_PASS = 500;
+const LEDGER_TICKETS_PER_PASS = 50;
 const TICKET_FILE = /^([0-9a-f-]{36})\.json$/;
 const TERMINAL_ROW_STATES = new Set(['finished', 'cancelled', 'lost']);
+const ledgerScanOffsets = new Map();
 
 /** Lower is stepped first: a claimed row with no usable URLs is on the runner's 60 s clock, a settle can wait. */
 export function tendRank(row, run) {
@@ -24,52 +28,110 @@ export function tendRank(row, run) {
   return TERMINAL_ROW_STATES.has(row.state) ? 3 : 4;
 }
 
-function resultlessLedgerTickets(root, skip) {
+// a result `lane gc` has expired is deliberate: only a decision younger than the result retention is worth rebuilding
+function resultlessLedgerTickets(root, skip, { now, resultRetentionMs, namesPerPass, ticketsPerPass }) {
   let names;
   try {
-    names = fs.readdirSync(ledgerDir(root));
+    names = fs.readdirSync(ledgerDir(root)).sort();
   } catch {
     return [];
   }
-  return names
-    .map((name) => TICKET_FILE.exec(name)?.[1])
-    .filter((id) => id && !skip.has(id) && !fs.existsSync(path.join(paths(root).results, `${id}.json`)))
-    .map((id) => ({ id, generation: readLedger(root, id)?.generation }));
+  const start = (ledgerScanOffsets.get(root) ?? 0) % Math.max(names.length, 1);
+  const window = Array.from({ length: Math.min(names.length, namesPerPass) }, (_, i) => names[(start + i) % names.length]);
+  ledgerScanOffsets.set(root, start + window.length);
+  const found = [];
+  for (const name of window) {
+    const id = TICKET_FILE.exec(name)?.[1];
+    if (!id || skip.has(id) || fs.existsSync(path.join(paths(root).results, `${id}.json`))) continue;
+    const entry = readLedger(root, id);
+    if (entry !== null && now - (entry.acceptedAt ?? 0) < resultRetentionMs) found.push({ id, generation: entry.generation });
+    if (found.length >= ticketsPerPass) break;
+  }
+  return found;
 }
 
-async function rowsOf(queue) {
-  try {
-    return new Map((await queue.listMine({ limit: 500 })).map((row) => [row.id, row]));
-  } catch {
-    return new Map();
-  }
-}
+const withDeadline = (promise, ms, onTimeout) => {
+  let timer;
+  const expiry = new Promise((resolve) => { timer = setTimeout(() => resolve(onTimeout()), ms); });
+  return Promise.race([promise, expiry]).finally(() => clearTimeout(timer));
+};
+
+export const dueDelayMs = (dueAts, now, pollMs) => Math.min(pollMs, Math.max(MIN_TEND_DELAY_MS, dueAts.length > 0 ? Math.min(...dueAts) - now : pollMs));
 
 /**
- * One pass: every pull attempt whose supervisor is dead, plus every ledger entry with neither an attempt nor a result, stepped by rank with
- * `concurrency` at a time. A failure of one ticket is reported on its entry and never stops the others. `base` is a step context minus the ticket.
+ * Tickets are scheduled independently: a slot is taken per ticket, released when its step ends or passes the hard deadline (a hung step keeps its
+ * ticket marked in flight, so it is never stepped twice, but it no longer holds a slot), and the next `round` re-lists. `base` is a step context minus the ticket.
  */
-export async function tendOnce({ root, concurrency = TEND_CONCURRENCY, stepBudgetMs = TEND_STEP_BUDGET_MS, ...base }) {
-  const attempts = listAttempts(root).filter((a) => a.transport === 'pull' && !supervisorAlive(a));
-  const tickets = [...attempts, ...resultlessLedgerTickets(root, new Set(attempts.map((a) => a.id)))];
-  const rows = await rowsOf(base.queue);
-  const run = { now: base.now ?? Date.now, cfg: { ...DEFAULT_GLOBAL_CONFIG.lanePull, ...base.cfg } };
-  const ordered = tickets.map((t) => ({ id: t.id, generation: t.generation, rank: tendRank(rows.get(t.id), run) })).sort((a, b) => a.rank - b.rank);
+export function createTender({ root, concurrency = TEND_CONCURRENCY, stepBudgetMs = TEND_STEP_BUDGET_MS, hardDeadlineMs = TEND_HARD_DEADLINE_MS, resultRetentionMs = DEFAULT_GLOBAL_CONFIG.logRetentionMs, ledgerNamesPerPass = LEDGER_NAMES_PER_PASS, ledgerTicketsPerPass = LEDGER_TICKETS_PER_PASS, ...base }) {
+  const now = base.now ?? Date.now;
+  const settings = { ...DEFAULT_GLOBAL_CONFIG.lanePull, ...base.cfg };
+  const inFlight = new Set();
+  const dueAt = new Map();
   const results = [];
-  await mapBounded(ordered, concurrency, async ({ id, generation }) => {
+  let free = concurrency;
+  let released = () => {};
+  let releasedSignal = new Promise((resolve) => { released = resolve; });
+
+  async function heldRows() {
+    const none = () => new Map();
     try {
-      const step = await stepPullTicket({ ...base, root, id, generation, stepBudgetMs, logPath: path.join(paths(root).logs, `${id}.log`), resultPath: path.join(paths(root).results, `${id}.json`) });
-      results.push({ id, state: step.state, next: step.next });
-    } catch (err) {
-      results.push({ id, error: err.message });
+      const rows = await withDeadline(base.queue.listMine({ states: ['claimed', 'running'], limit: 500 }), hardDeadlineMs, () => []);
+      return new Map(rows.map((row) => [row.id, row]));
+    } catch {
+      return none();
     }
-  });
-  return results;
+  }
+
+  async function candidates() {
+    const attempts = listAttempts(root).filter((a) => a.transport === 'pull' && !supervisorAlive(a));
+    const tickets = [...attempts, ...resultlessLedgerTickets(root, new Set(attempts.map((a) => a.id)), { now: now(), resultRetentionMs, namesPerPass: ledgerNamesPerPass, ticketsPerPass: ledgerTicketsPerPass })];
+    for (const id of dueAt.keys()) if (!tickets.some((t) => t.id === id)) dueAt.delete(id);
+    const rows = await heldRows();
+    const run = { now, cfg: settings };
+    return tickets
+      .filter((t) => !inFlight.has(t.id) && (dueAt.get(t.id) ?? 0) <= now())
+      .map((t) => ({ id: t.id, generation: t.generation, rank: tendRank(rows.get(t.id), run) }))
+      .sort((a, b) => a.rank - b.rank);
+  }
+
+  function record(id, entry) {
+    results.push({ id, ...entry });
+    dueAt.set(id, now() + Math.max(MIN_TEND_DELAY_MS, entry.error ? settings.pollMs : entry.next ?? settings.pollMs));
+  }
+
+  function launch({ id, generation }) {
+    inFlight.add(id);
+    const step = stepPullTicket({ ...base, root, id, generation, stepBudgetMs, logPath: path.join(paths(root).logs, `${id}.log`), resultPath: path.join(paths(root).results, `${id}.json`) })
+      .then((out) => record(id, { state: out.state, next: out.next }), (err) => record(id, { error: err.message }))
+      .finally(() => inFlight.delete(id));
+    return withDeadline(step, hardDeadlineMs, () => record(id, { error: `no answer within the ${hardDeadlineMs}ms step deadline` })).finally(() => {
+      free++;
+      released();
+      releasedSignal = new Promise((resolve) => { released = resolve; });
+    });
+  }
+
+  return {
+    results,
+    nextRelease: () => releasedSignal,
+    delayMs: () => dueDelayMs([...dueAt.values()], now(), settings.pollMs),
+    async round() {
+      const launched = [];
+      for (const item of await candidates()) {
+        if (free === 0) break;
+        free--;
+        launched.push(launch(item));
+      }
+      return launched;
+    },
+  };
 }
 
-export function nextDelayMs(results, pollMs) {
-  const waits = results.map((r) => (r.error ? pollMs : r.next ?? pollMs));
-  return Math.min(pollMs, Math.max(MIN_TEND_DELAY_MS, waits.length ? Math.min(...waits) : pollMs));
+/** One pass: every due ticket stepped once, `concurrency` at a time, by rank. A failure of one ticket is reported on its entry and never stops the others. */
+export async function tendOnce(deps) {
+  const tender = createTender(deps);
+  for (let launched = await tender.round(); launched.length > 0; launched = await tender.round()) await Promise.all(launched);
+  return tender.results;
 }
 
 const sleepUnlessAborted = (ms, signal) => new Promise((resolve) => {
@@ -83,16 +145,15 @@ const sleepUnlessAborted = (ms, signal) => new Promise((resolve) => {
 });
 
 export async function tendServe({ signal, log = () => {}, ...deps }) {
-  const pollMs = { ...DEFAULT_GLOBAL_CONFIG.lanePull, ...deps.cfg }.pollMs;
+  const tender = createTender(deps);
   while (!signal?.aborted) {
-    let results = [];
     try {
-      results = await tendOnce(deps);
+      await tender.round();
     } catch (err) {
       log(`lane pull tend: pass failed: ${err.message}\n`);
     }
-    for (const r of results.filter((x) => x.error)) log(`lane pull tend: ${r.id}: ${r.error}\n`);
-    await sleepUnlessAborted(nextDelayMs(results, pollMs), signal);
+    for (const r of tender.results.splice(0).filter((x) => x.error)) log(`lane pull tend: ${r.id}: ${r.error}\n`);
+    await Promise.race([sleepUnlessAborted(tender.delayMs(), signal), tender.nextRelease()]);
   }
 }
 
@@ -109,7 +170,7 @@ export async function pullTendCommand(args = []) {
     process.stderr.write(`lane pull tend: ${services.reason}\n`);
     return { exitCode: 1 };
   }
-  const deps = { root, queue: services.queue, s3: services.s3, presign: services.presign, cfg: config.lanePull };
+  const deps = { root, queue: services.queue, s3: services.s3, presign: services.presign, cfg: config.lanePull, resultRetentionMs: config.logRetentionMs };
   if (args.includes('--serve')) {
     const stop = new AbortController();
     for (const signalName of ['SIGTERM', 'SIGINT']) process.once(signalName, () => stop.abort());

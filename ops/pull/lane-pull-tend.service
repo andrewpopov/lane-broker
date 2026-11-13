@@ -1,6 +1,6 @@
 # TEMPLATE, not installed. pitelite: the pull tender, one persistent process on the SUBMITTER login (lane_submit_train).
 # Same user and LANE_BROKER_HOME/LANE_BROKER_STATE as the supervisors it recovers; the broker config carries laneQueueUrl and lanePull (password, CA, RustFS keys).
-# It never holds the admin login: retention runs from lane-pull-gc.service with its own credential file.
+# Credentials: lanePull.passwordFile is /etc/lane-pull/submit.pass (train, 0600). The admin password /etc/lane-pull/gc-admin.pass is root-only and hidden from this unit.
 [Unit]
 Description=lane pull tend: steps pull tickets whose supervisor is dead
 After=network-online.target
@@ -15,6 +15,7 @@ ExecStart=/usr/bin/node /opt/lane-broker/bin/lane.js pull tend --serve
 Restart=always
 RestartSec=5
 Nice=10
+InaccessiblePaths=/etc/lane-pull/gc-admin.pass
 NoNewPrivileges=true
 PrivateTmp=true
 

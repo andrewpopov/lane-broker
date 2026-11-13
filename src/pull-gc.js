@@ -1,10 +1,14 @@
+import fs from 'node:fs';
 import path from 'node:path';
-import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfigOrError } from './config.js';
+import { readAttempt } from './attempts.js';
+import { DEFAULT_GLOBAL_CONFIG, LEDGER_RETENTION_FLOOR_MS, loadGlobalConfigOrError } from './config.js';
+import { ledgerDir, ledgerFile, readLedger } from './pull-ledger.js';
+import { pullTicketDir } from './pull-envelope.js';
 import { createQueueClient } from './queue-client.js';
 import { blobKey } from './pull-snapshot.js';
 import { parseDuration } from './run.js';
 import { createS3Client } from './s3-client.js';
-import { atomicWriteJson, ensureDurableDir, ensureStateDirs, paths, readJsonSafe } from './state.js';
+import { atomicWriteJson, ensureDurableDir, ensureStateDirs, fsyncDirectory, paths, readJsonSafe } from './state.js';
 
 const HOUR_MS = 3_600_000;
 export const OBJECTS_AFTER_MS = 24 * HOUR_MS;
@@ -40,7 +44,7 @@ export function rowsAfterFor(settings, requestedMs) {
   return requestedMs ?? settings.rowRetentionMs;
 }
 
-const readGcState = (root) => ({ rowsFrom: null, objectsDone: null, ...readJsonSafe(gcStateFile(root)) });
+const readGcState = (root) => ({ rowsFrom: null, objectsDone: null, resume: null, ...readJsonSafe(gcStateFile(root)) });
 
 function saveGcState(root, state) {
   ensureDurableDir(paths(root).pull, { boundary: root });
@@ -60,7 +64,6 @@ async function cleanObjects({ s3, settings }, id) {
 
 async function cleanPage(ctx, items, state, summary) {
   const cleaned = new Set();
-  let prefixClean = true;
   for (const item of items) {
     if (!afterCursor(item, state.objectsDone)) {
       cleaned.add(item.id);
@@ -69,19 +72,20 @@ async function cleanPage(ctx, items, state, summary) {
     try {
       summary.objectsDeleted += await cleanObjects(ctx, item.id);
       cleaned.add(item.id);
-      if (prefixClean) state.objectsDone = cursorOf(item);
+      if (ctx.prefixClean) state.objectsDone = cursorOf(item);
     } catch (err) {
-      prefixClean = false;
+      ctx.prefixClean = false;
       summary.failures.push({ id: item.id, error: err.message });
     }
   }
   return cleaned;
 }
 
+const overBudget = (ctx) => ctx.now() - ctx.startedAt >= ctx.budgetMs;
+
 async function sweepTickets(ctx, state, summary) {
-  const started = ctx.now();
-  let after = state.rowsFrom;
-  let frontierOpen = true;
+  let after = state.resume ?? state.rowsFrom;
+  let frontierOpen = state.resume === null;
   for (;;) {
     const page = await ctx.queue.pruneCandidates({ objectsAfterMs: OBJECTS_AFTER_MS, rowsAfterMs: ctx.rowsAfterMs, after, limit: ctx.pageLimit });
     summary.pages++;
@@ -95,9 +99,12 @@ async function sweepTickets(ctx, state, summary) {
       else if (blockedAt > 0) state.rowsFrom = cursorOf(page.items[blockedAt - 1]);
       if (blockedAt !== -1) frontierOpen = false;
     }
+    const finished = page.next === null;
+    const cut = !finished && overBudget(ctx);
+    state.resume = cut ? page.next : null;
     saveGcState(ctx.root, state);
-    if (page.next === null) return;
-    if (ctx.now() - started >= ctx.budgetMs) {
+    if (finished) return;
+    if (cut) {
       summary.budgetCut = true;
       return;
     }
@@ -109,8 +116,9 @@ const isOldBlob = (lastModified, now) => Number.isFinite(lastModified) && now - 
 
 async function sweepBlobs(ctx, summary) {
   const { snapBucket } = ctx.settings.rustfs;
+  const listedAt = ctx.now();
   const candidates = (await ctx.s3.listObjects(snapBucket, { prefix: 'blobs/' }))
-    .filter((object) => isOldBlob(object.lastModified, ctx.now()))
+    .filter((object) => isOldBlob(object.lastModified, listedAt))
     .map((object) => ({ object, match: BLOB_KEY.exec(object.key) }))
     .filter(({ match }) => match !== null)
     .map(({ object, match }) => ({ key: object.key, ref: { ns: match[1], sha256: match[2] } }));
@@ -118,6 +126,10 @@ async function sweepBlobs(ctx, summary) {
     const batch = candidates.slice(from, from + BLOB_BATCH);
     const live = new Set((await ctx.queue.blobsLive(batch.map((c) => c.ref))).map((ref) => blobKey(ref.ns, ref.sha256)));
     for (const { key } of batch.filter((c) => !live.has(c.key))) {
+      if (overBudget(ctx)) {
+        summary.budgetCut = true;
+        return;
+      }
       await ctx.hooks.beforeBlobDelete?.(key);
       try {
         const head = await ctx.s3.headObject(snapBucket, key);
@@ -137,12 +149,50 @@ async function sweepBlobs(ctx, summary) {
  */
 export async function gcOnce({ root, queue, s3, cfg, rowsAfterMs, now = Date.now, budgetMs = GC_BUDGET_MS, pageLimit = PAGE_LIMIT, hooks = {} }) {
   const settings = { ...DEFAULT_GLOBAL_CONFIG.lanePull, ...cfg, rustfs: { ...DEFAULT_GLOBAL_CONFIG.lanePull.rustfs, ...cfg?.rustfs } };
-  const ctx = { root, queue, s3, settings, now, budgetMs, pageLimit, hooks, rowsAfterMs: rowsAfterFor(settings, rowsAfterMs) };
-  const summary = { pages: 0, objectsDeleted: 0, rowsPruned: 0, chunksPruned: 0, blobsDeleted: 0, budgetCut: false, failures: [] };
+  const ctx = { root, queue, s3, settings, now, budgetMs, pageLimit, hooks, startedAt: now(), prefixClean: true, rowsAfterMs: rowsAfterFor(settings, rowsAfterMs) };
+  const summary = { ledgersExpired: 0, pages: 0, objectsDeleted: 0, rowsPruned: 0, chunksPruned: 0, blobsDeleted: 0, budgetCut: false, failures: [] };
+  summary.ledgersExpired = sweepLocal(root, ledgerRetentionFor(settings), ctx.startedAt);
   await sweepTickets(ctx, readGcState(root), summary);
   summary.chunksPruned = await queue.pruneChunks({ terminalAfterMs: CHUNKS_TERMINAL_AFTER_MS, limit: CHUNKS_PER_RUN });
   if (settings.blobGc) await sweepBlobs(ctx, summary);
   return summary;
+}
+
+export function ledgerRetentionFor(settings) {
+  if (settings.ledgerRetentionMs < LEDGER_RETENTION_FLOOR_MS) throw new Error(`lanePull.ledgerRetentionMs ${settings.ledgerRetentionMs} is below the ${LEDGER_RETENTION_FLOOR_MS}ms queue backup retention`);
+  return settings.ledgerRetentionMs;
+}
+
+const TICKET_JSON = /^([0-9a-f-]{36})\.json$/;
+const ageOf = (file, now) => now - fs.statSync(file).mtimeMs;
+
+// the ledger entry goes last: a crash between the two leaves an entry the next run finishes
+function expireTicket(root, id) {
+  fs.rmSync(pullTicketDir(root, id), { recursive: true, force: true });
+  fs.rmSync(ledgerFile(root, id), { force: true });
+  fsyncDirectory(ledgerDir(root));
+}
+
+/** Expires the local record of tickets accepted more than `retentionMs` ago (ledger entry, envelope, cursor, staged copies), and ticket directories nothing owns. */
+export function sweepLocal(root, retentionMs, now) {
+  let expired = 0;
+  const owned = new Set();
+  for (const name of fs.existsSync(ledgerDir(root)) ? fs.readdirSync(ledgerDir(root)) : []) {
+    const id = TICKET_JSON.exec(name)?.[1];
+    if (!id) continue;
+    owned.add(id);
+    const entry = readLedger(root, id);
+    if (readAttempt(root, id) || now - (entry.acceptedAt ?? now) < retentionMs) continue;
+    expireTicket(root, id);
+    expired++;
+  }
+  const pullDir = paths(root).pull;
+  for (const name of fs.existsSync(pullDir) ? fs.readdirSync(pullDir) : []) {
+    if (!/^[0-9a-f-]{36}$/.test(name) || owned.has(name) || readAttempt(root, name) || ageOf(path.join(pullDir, name), now) < retentionMs) continue;
+    fs.rmSync(path.join(pullDir, name), { recursive: true, force: true });
+    expired++;
+  }
+  return expired;
 }
 
 function parseGcArgs(args) {
