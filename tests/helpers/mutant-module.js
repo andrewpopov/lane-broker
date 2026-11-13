@@ -1,7 +1,8 @@
+import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { makeTmpDir } from './tmp.js';
 
 /**
@@ -16,4 +17,39 @@ export async function importMutant(file, [from, to]) {
   const copy = path.join(makeTmpDir('mutant-'), path.basename(file));
   fs.writeFileSync(copy, mutated);
   return import(pathToFileURL(copy).href);
+}
+
+/**
+ * Canary for a module that imports its neighbours: copies `src/` beside the repo's package.json and node_modules, applies one exact-once
+ * mutation to `file` (relative to src/) and returns a loader for any module of the mutated tree, so the scenario runs wholly against it.
+ */
+export async function mutateSrcTree(file, [from, to]) {
+  const repo = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
+  const tree = makeTmpDir('mutant-tree-');
+  fs.cpSync(path.join(repo, 'src'), path.join(tree, 'src'), { recursive: true });
+  fs.copyFileSync(path.join(repo, 'package.json'), path.join(tree, 'package.json'));
+  fs.symlinkSync(path.join(repo, 'node_modules'), path.join(tree, 'node_modules'));
+  const target = path.join(tree, 'src', file);
+  const source = fs.readFileSync(target, 'utf8');
+  if (source.split(from).length !== 2) throw new Error(`mutation target must occur exactly once in ${file}: ${from}`);
+  fs.writeFileSync(target, source.replace(from, () => to));
+  const url = (module) => pathToFileURL(path.join(tree, 'src', module)).href;
+  return Object.assign((module) => import(url(module)), { url });
+}
+
+const realUrl = (module) => new URL(`../../src/${module}`, import.meta.url).href;
+export const realSrc = Object.assign((module) => import(realUrl(module)), { url: realUrl });
+
+/**
+ * Runs `run(load)` against the mutated tree and demands that it fail on an assertion, or on an error whose message matches `expected`
+ * (the one named failure a guard's absence causes): a guard that survives its own removal, or a scenario that dies of something else, proves nothing.
+ */
+export async function assertCanaryFails(file, mutation, run, expected = null) {
+  const load = await mutateSrcTree(file, mutation);
+  let failure;
+  await run(load).catch((err) => { failure = err; });
+  assert.ok(failure, `with "${mutation[0]}" removed from ${file} the scenario still passed, so it proves nothing`);
+  const named = failure.code === 'ERR_ASSERTION' || (expected !== null && expected.test(String(failure.message)));
+  assert.ok(named, `with "${mutation[0]}" removed from ${file} the scenario failed, but not on an assertion or ${expected}: ${failure.stack}`);
+  return failure;
 }

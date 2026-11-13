@@ -236,7 +236,7 @@ const refusedResult = (id, attempt, detail) => ({
   reconciled: true,
 });
 
-const lostResult = (id, attempt, reason, lostDetail) => ({
+export const lostResult = (id, attempt, reason, lostDetail) => ({
   id,
   exit: 75,
   signal: null,

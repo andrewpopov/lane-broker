@@ -85,7 +85,7 @@ const GUARDS = {
     const [s1, admin] = [await w.as(logins.s1), await w.as(logins.admin)];
     await enqueue(s1, tid(1));
     assert.deepEqual(await call(s1, 'ld_cancel', tid(1)), { state: 'cancelled', cancel_requested: true, confirmed: true });
-    assert.deepEqual((await w.ticket(tid(1))).result, { kind: 'cancelled', cancelConfirmed: true, source: 'queued', epoch: 0 });
+    assert.deepEqual((await w.ticket(tid(1))).result, { kind: 'cancelled', cancelConfirmed: true, source: 'queued', epoch: 0, author: 'queue' });
     assert.equal((await call(s1, 'ld_cancel', tid(1))).confirmed, true, 'queued cancel stays confirmed on replay');
 
     await enqueue(s1, tid(2));
@@ -93,12 +93,22 @@ const GUARDS = {
     await simulateRestore(w);
     await call(s1, 'ld_get', tid(9));
     assert.equal((await call(s1, 'ld_cancel', tid(2))).confirmed, false);
-    assert.deepEqual((await w.ticket(tid(2))).result, { kind: 'cancelled', cancelConfirmed: false, source: 'quarantine', epoch: 0 });
+    assert.deepEqual((await w.ticket(tid(2))).result, { kind: 'cancelled', cancelConfirmed: false, source: 'quarantine', epoch: 0, author: 'queue' });
     assert.equal((await call(s1, 'ld_cancel', tid(2))).confirmed, false, 'quarantined cancel stays unconfirmed on replay');
 
     assert.equal(await call(admin, 'ld_cancel_quarantined', tid(3)), 'cancelled');
-    assert.deepEqual((await w.ticket(tid(3))).result, { kind: 'cancelled', cancelConfirmed: false, source: 'operator', epoch: 0 });
+    assert.deepEqual((await w.ticket(tid(3))).result, { kind: 'cancelled', cancelConfirmed: false, source: 'operator', epoch: 0, author: 'queue' });
     assert.equal((await call(s1, 'ld_cancel', tid(3))).confirmed, false, 'operator cancel never reads as confirmed');
+  },
+
+  'ld_finish never stores an author key, so only the queue itself can write a queue-authored record': async (w) => {
+    const [s1, a1] = [await w.as(logins.s1), await w.as(logins.a1)];
+    await enqueue(s1, tid(1));
+    const claimed = await claim(a1);
+    await finish(a1, claimed, { kind: 'cancelled', cancelConfirmed: true, source: 'queued', author: 'queue' });
+    const stored = (await w.ticket(tid(1))).result;
+    assert.equal(Object.hasOwn(stored, 'author'), false);
+    assert.deepEqual(stored, { kind: 'cancelled', cancelConfirmed: true, source: 'queued', epoch: claimed.epoch });
   },
 
   'ld_placeable counts the agents eligible for the repo and tags': async (w) => {
@@ -270,6 +280,9 @@ const CANARIES = [
     "coalesce(CASE WHEN jsonb_typeof(v_t.result->'cancelConfirmed') = 'boolean' THEN (v_t.result->>'cancelConfirmed')::boolean END, v_t.state = 'cancelled' AND v_t.result IS NULL)", "v_t.state = 'cancelled'"],
   ['ld_cancel stores a server-authored result and a replay never upgrades confirmation',
     "'cancelConfirmed', false, 'source', 'operator'", "'cancelConfirmed', true, 'source', 'operator'"],
+  ['ld_finish never stores an author key, so only the queue itself can write a queue-authored record', "(p_result - 'author') ||", 'p_result ||'],
+  ['ld_cancel stores a server-authored result and a replay never upgrades confirmation', "'epoch', v_epoch, 'author', 'queue')", "'epoch', v_epoch)"],
+  ['ld_cancel stores a server-authored result and a replay never upgrades confirmation', "'epoch', v_t.epoch, 'author', 'queue')", "'epoch', v_t.epoch)"],
   ['ld_placeable counts the agents eligible for the repo and tags', ' AND lane_dispatch.eligible(coalesce(p_requires_tags, \'{}\'), p_repo_key, p.tags, p.allowed_repos));', ');'],
   ['ld_placeable counts the agents eligible for the repo and tags', "p.kind = 'agent' AND p.max_claims > 0", "p.kind = 'agent'"],
   ['ld_prune_candidates pages by keyset from a NULL first page and marks row_due; a half-null cursor raises',

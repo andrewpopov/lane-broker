@@ -44,9 +44,10 @@ async function persistIntent({ root, id, generation }, change) {
   return intent;
 }
 
-// runs under the ticket's recovery lock; returns queued, refresh (call again) or lost; a throw leaves the intent pending for the replay
-export function enqueueOnce({ root, id, generation, queue, now = Date.now, rowRetentionMs = DEFAULT_GLOBAL_CONFIG.lanePull.rowRetentionMs, lockTimeoutMs }) {
+// takes the ticket lock itself; `ledgered` is asked inside it so a ledgered decision is never followed by a send; returns queued, refresh (call again), lost or settled; a throw leaves the intent pending for the replay
+export function enqueueOnce({ root, id, generation, queue, ledgered = () => false, now = Date.now, rowRetentionMs = DEFAULT_GLOBAL_CONFIG.lanePull.rowRetentionMs, lockTimeoutMs }) {
   return withTicketLock(root, id, async () => {
+    if (ledgered()) return { outcome: 'settled' };
     const args = enqueueArgs(readEnvelope(root, id));
     const intent = intentOf(readAttempt(root, id));
     if (intent.seenRowAt !== null) return { outcome: 'queued', view: null };

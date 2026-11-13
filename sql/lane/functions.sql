@@ -741,7 +741,7 @@ BEGIN
   IF v_t.state IN ('queued','quarantined') THEN
     UPDATE lane_dispatch.tickets SET state = 'cancelled', cancel_requested = true, finished_at = clock_timestamp(),
            result = jsonb_build_object('kind', 'cancelled', 'cancelConfirmed', v_t.state = 'queued',
-                                       'source', CASE WHEN v_t.state = 'queued' THEN 'queued' ELSE 'quarantine' END, 'epoch', v_t.epoch)
+                                       'source', CASE WHEN v_t.state = 'queued' THEN 'queued' ELSE 'quarantine' END, 'epoch', v_t.epoch, 'author', 'queue')
      WHERE id = p_id;
     RETURN jsonb_build_object('state', 'cancelled', 'cancel_requested', true, 'confirmed', v_t.state = 'queued');
   END IF;
@@ -861,7 +861,7 @@ BEGIN
       RETURN jsonb_build_object('fenced', false, 'reassert', true, 'state', 'quarantined');
     END IF;
     v_state := CASE WHEN p_result->>'kind' = 'cancelled' THEN 'cancelled' ELSE 'finished' END;
-    UPDATE lane_dispatch.tickets SET state = v_state, result = p_result || jsonb_build_object('epoch', p_epoch), finished_at = clock_timestamp() WHERE id = p_id;
+    UPDATE lane_dispatch.tickets SET state = v_state, result = (p_result - 'author') || jsonb_build_object('epoch', p_epoch), finished_at = clock_timestamp() WHERE id = p_id;
     RETURN jsonb_build_object('fenced', false, 'state', v_state);
   END IF;
   IF v_t.state IN ('finished','cancelled') AND v_t.result IS NOT NULL AND v_t.epoch = p_epoch AND v_t.claim_token = p_token AND v_t.host = v_me.host THEN
@@ -978,7 +978,7 @@ BEGIN
   IF NOT FOUND THEN RETURN 'missing'; END IF;
   IF v_state <> 'quarantined' THEN RETURN v_state; END IF;
   UPDATE lane_dispatch.tickets SET state = 'cancelled', cancel_requested = true, finished_at = clock_timestamp(),
-         result = jsonb_build_object('kind', 'cancelled', 'cancelConfirmed', false, 'source', 'operator', 'epoch', v_epoch) WHERE id = p_id;
+         result = jsonb_build_object('kind', 'cancelled', 'cancelConfirmed', false, 'source', 'operator', 'epoch', v_epoch, 'author', 'queue') WHERE id = p_id;
   RETURN 'cancelled';
 END $$;
 

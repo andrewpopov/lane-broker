@@ -53,7 +53,7 @@ export async function startS3Stub({ creds = STUB_CREDS, region = STUB_REGION, no
       res.end(req.method === 'HEAD' ? undefined : text);
     };
     const error = (status, code, message = code) => reply(status, `<?xml version="1.0"?><Error><Code>${code}</Code><Message>${xmlEscape(message)}</Message></Error>`);
-    if (stub.hang) return;
+    if (stub.hang || stub.hangMatching?.(url.pathname)) return;
     const problem = verify(req, url, req.method === 'PUT' ? sha256Hex(body) : req.headers['x-amz-content-sha256']);
     stub.requests.push({ method: req.method, path: url.pathname, query: url.search, problem });
     if (problem) return error(403, 'SignatureDoesNotMatch', problem);
