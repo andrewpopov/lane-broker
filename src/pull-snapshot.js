@@ -2,8 +2,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { once } from 'node:events';
-import { finished } from 'node:stream/promises';
+import { Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { repoIdentity, DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { blobNamespace, isCacheable } from './remote-blobs.js';
 import { BLOB_CACHE_MIN_BYTES, snapshotPipeline } from './remote-client.js';
@@ -40,7 +40,9 @@ async function mapBounded(items, limit, fn) {
       }
     }
   };
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  const settled = await Promise.allSettled(Array.from({ length: Math.min(limit, items.length) }, worker));
+  const failure = settled.find((r) => r.status === 'rejected');
+  if (failure) throw failure.reason;
 }
 
 /** HEAD's Last-Modified is the age when the store reports one, then the local upload index; with neither the blob counts as old. */
@@ -61,37 +63,37 @@ async function uploadBlob({ s3, bucket, ns, blob, entry, worktreeRoot, spool, ro
   return 'uploaded';
 }
 
-async function spoolStream(stream, file) {
+async function spoolStream(stream, out) {
   const hash = crypto.createHash('sha256');
-  const out = fs.createWriteStream(file, { flags: 'wx' });
   let bytes = 0;
-  try {
-    for await (const chunk of stream) {
+  const tap = new Transform({
+    transform(chunk, _encoding, done) {
       hash.update(chunk);
       bytes += chunk.length;
-      if (!out.write(chunk)) await once(out, 'drain');
-    }
-    out.end();
-    await finished(out);
-  } catch (err) {
-    out.destroy();
-    throw err;
-  }
+      done(null, chunk);
+    },
+  });
+  await pipeline(stream, tap, out);
   return { sha256: hash.digest('hex'), bytes };
 }
 
+export const withRepoIdentity = (header, worktreeRoot) => {
+  const identity = repoIdentity(worktreeRoot);
+  return identity ? { ...header, repoIdentity: identity } : header;
+};
+
 /**
- * Uploads what a pull ticket's runner will fetch and returns `{snapshot, header, stats}`. `snapshot` is the descriptor the queue pins,
- * `{key, sha256, bytes, blobs}` with `key` relative to `bucket`; `blobs` lists exactly the hashes encoded as cached frames. `header` is the
- * given header plus `repoIdentity` when the repository has one.
+ * Uploads what a pull ticket's runner will fetch and returns `{snapshot, stats}`. `snapshot` is the descriptor the queue pins,
+ * `{key, sha256, bytes, blobs}` with `key` relative to `bucket`; `blobs` lists exactly the hashes encoded as cached frames. `header` is used
+ * as given: the caller stamps `repoIdentity` (`withRepoIdentity`) before the envelope stores it, so the stream and the ticket agree.
  */
 export async function uploadSnapshot({
   s3, bucket = DEFAULT_GLOBAL_CONFIG.lanePull.rustfs.snapBucket, root, worktreeRoot, header, manifest, ticketId, generation,
   blobRefreshAfterDays = DEFAULT_GLOBAL_CONFIG.lanePull.blobRefreshAfterDays, blobCacheMinBytes = BLOB_CACHE_MIN_BYTES,
   blobConcurrency = DEFAULT_BLOB_CONCURRENCY, gzipLevel = DEFAULT_GLOBAL_CONFIG.remoteSnapshotGzipLevel, now = Date.now, deadlineMs, putDeadlineMs,
+  openSpool = (file) => fs.createWriteStream(file, { flags: 'wx' }),
 }) {
-  const identity = repoIdentity(worktreeRoot);
-  const stamped = identity ? { ...header, repoIdentity: identity } : header;
+  const identity = header.repoIdentity;
   const candidates = identity ? manifest.entries.filter(isCacheable) : [];
   const cacheable = candidates.reduce((sum, e) => sum + e.size, 0) >= blobCacheMinBytes ? candidates : [];
   const ns = identity ? blobNamespace(identity) : null;
@@ -107,14 +109,13 @@ export async function uploadSnapshot({
       }));
     });
     const cached = new Set(cacheable.map((e) => e.path));
-    const { stream, stats } = snapshotPipeline({ worktreeRoot, header: stamped, manifest, cached, transferCache: cached.size > 0, transfer: TRANSFER_GZIP, gzipLevel });
+    const { stream, stats } = snapshotPipeline({ worktreeRoot, header, manifest, cached, transferCache: cached.size > 0, transfer: TRANSFER_GZIP, gzipLevel });
     const file = path.join(spool, 'stream.gz');
-    const { sha256, bytes } = await spoolStream(stream, file);
+    const { sha256, bytes } = await spoolStream(stream, openSpool(file));
     const key = streamKey(ticketId, generation, sha256);
     await s3.putObjectFromFile(bucket, key, file, { deadlineMs: putDeadlineMs });
     return {
       snapshot: { key, sha256, bytes, blobs },
-      header: stamped,
       stats: { ...stats, blobsUploaded: outcomes.filter((o) => o === 'uploaded').length, blobsSkipped: outcomes.filter((o) => o === 'skipped').length },
     };
   } finally {

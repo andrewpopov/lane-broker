@@ -25,7 +25,8 @@ export function harnessClient(t, world, { login = logins.s1, onConnect, sleep = 
     ...secretFiles(t),
     connectClient: async (config) => {
       seen.configs.push(config);
-      const client = await connect(world.cluster.conn(world.db, login));
+      // the harness listens on a Unix socket only, so ssl cannot be exercised; the deadlines are kept
+      const client = await connect({ ...world.cluster.conn(world.db, login), connectionTimeoutMillis: config.connectionTimeoutMillis, query_timeout: config.query_timeout });
       client.on('error', () => {});
       await onConnect?.(client, seen.configs.length);
       return client;

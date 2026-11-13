@@ -3,9 +3,14 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { Writable } from 'node:stream';
 import zlib from 'node:zlib';
 import { repoIdentity } from '../src/config.js';
-import { blobIndexFile, blobKey, uploadSnapshot } from '../src/pull-snapshot.js';
+import { createAttempt } from '../src/attempts.js';
+import { enqueueOnce } from '../src/pull-enqueue.js';
+import { createEnvelope, readEnvelope, recordSnapshot } from '../src/pull-envelope.js';
+import { ensureStateDirs } from '../src/state.js';
+import { blobIndexFile, blobKey, uploadSnapshot, withRepoIdentity } from '../src/pull-snapshot.js';
 import { blobNamespace } from '../src/remote-blobs.js';
 import { buildExecHeader } from '../src/remote-client.js';
 import { buildManifest } from '../src/remote-manifest.js';
@@ -32,7 +37,7 @@ async function fixture(t, { stubOptions = {}, files = FILES } = {}) {
   const worktreeRoot = makeGitWorktree(files);
   const manifest = buildManifest(worktreeRoot);
   const args = makeDispatchArgs();
-  const header = buildExecHeader({ runner: { name: 'pull' }, ...args });
+  const header = withRepoIdentity(buildExecHeader({ runner: { name: 'pull' }, ...args }), worktreeRoot);
   const upload = (options = {}) => uploadSnapshot({
     s3, root: state, worktreeRoot, header, manifest, ticketId: args.ticketId, generation: args.generation, blobCacheMinBytes: 0, now: () => clock.now, ...options,
   });
@@ -66,8 +71,8 @@ const blobObjects = (stub) => [...stub.objects.keys()].filter((name) => name.sta
 const puts = (stub, prefix) => stub.requests.filter((r) => r.method === 'PUT' && r.path.startsWith(prefix));
 
 test('the descriptor matches the stream, and blobs lists exactly the cached frames', async (t) => {
-  const { stub, worktreeRoot, args, upload } = await fixture(t);
-  const { snapshot, header } = await upload();
+  const { stub, worktreeRoot, args, header, upload } = await fixture(t);
+  const { snapshot } = await upload();
   const ns = blobNamespace(repoIdentity(worktreeRoot));
 
   const stream = stub.objects.get(`lane-snap/${snapshot.key}`).body;
@@ -90,8 +95,8 @@ test('the descriptor matches the stream, and blobs lists exactly the cached fram
 });
 
 test('below the cache threshold everything is inline and blobs is empty, with the identity still set', async (t) => {
-  const { stub, worktreeRoot, upload } = await fixture(t);
-  const { snapshot, header } = await upload({ blobCacheMinBytes: 4 * 1024 * 1024 });
+  const { stub, worktreeRoot, header, upload } = await fixture(t);
+  const { snapshot } = await upload({ blobCacheMinBytes: 4 * 1024 * 1024 });
   assert.deepEqual(snapshot.blobs, []);
   assert.deepEqual(blobObjects(stub), []);
   assert.equal(header.repoIdentity, repoIdentity(worktreeRoot));
@@ -197,4 +202,47 @@ test('a stalled store fails the upload at its deadline, on a HEAD, a blob PUT an
   stub.hang = false;
   await upload();
   await assert.rejects(upload({ s3: stallAtPut, deadlineMs: 200, putDeadlineMs: 200 }), (err) => err instanceof S3Error && err.code === 'Timeout' && /PUT .*streams\//.test(err.message));
+});
+
+test('the enqueue arguments carry the stamped header the stream was built with, taken from the envelope', async (t) => {
+  const { stub, state, worktreeRoot, args, header, upload } = await fixture(t);
+  ensureStateDirs(state);
+  const attempt = await createAttempt(state, args.ticketId);
+  await createEnvelope(state, {
+    logicalId: args.ticketId, binding: { protocol: header.protocol, ticketId: args.ticketId, generation: args.generation, manifestHash: 'mh' }, nonce: 'n', header,
+    repoKey: args.repoKey, lane: args.lane, laneKey: 'k', cpuCores: 1, memoryBytes: 1, requiresTags: [], priority: 0,
+  });
+  const { snapshot } = await upload({ header: readEnvelope(state, args.ticketId).header });
+  await recordSnapshot(state, args.ticketId, snapshot);
+  const sent = [];
+  const queue = { queueRef: async () => '1.1', enqueueFenced: async (a) => { sent.push(a); return { state: 'queued', id: a.id }; } };
+  await enqueueOnce({ root: state, id: args.ticketId, generation: attempt.generation, queue });
+  assert.equal(sent[0].header.repoIdentity, repoIdentity(worktreeRoot));
+  assert.equal(decodeStream(stub.objects.get(`lane-snap/${sent[0].snapshot.key}`).body).header.repoIdentity, sent[0].header.repoIdentity);
+  assert.deepEqual(sent[0].snapshot, snapshot);
+});
+
+test('an asynchronous write error on the spool rejects the upload instead of crashing', { timeout: 10_000 }, async (t) => {
+  const { stub, upload } = await fixture(t);
+  const failing = () => new Writable({ write(_chunk, _encoding, done) { setImmediate(() => done(Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' }))); } });
+  await assert.rejects(upload({ openSpool: failing }), { code: 'ENOSPC' });
+  assert.deepEqual([...stub.objects.keys()].filter((name) => name.includes('/streams/')), [], 'no stream was uploaded');
+});
+
+test('a failed blob upload waits for the workers already started before the spool goes away', async (t) => {
+  const files = Object.fromEntries(Array.from({ length: 12 }, (_, i) => [`f${i}.bin`, Buffer.alloc(9_000 + i, `${i}`)]));
+  const { s3, upload } = await fixture(t, { files });
+  const finished = [];
+  const missingSpool = [];
+  let puts = 0;
+  const flaky = { ...s3, putObjectFromFile: async (bucket, key, file, options) => {
+    if (++puts === 1) throw new Error('first put fails');
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    if (!fs.existsSync(file)) missingSpool.push(file);
+    finished.push(key);
+    return s3.putObjectFromFile(bucket, key, file, options);
+  } };
+  await assert.rejects(upload({ s3: flaky, blobConcurrency: 3 }), /first put fails/);
+  assert.deepEqual(missingSpool, [], 'every started worker finished while its spool file still existed');
+  assert.equal(finished.length, 2, 'the two workers in flight completed and no new one started');
 });

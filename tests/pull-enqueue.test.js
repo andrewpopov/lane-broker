@@ -1,9 +1,9 @@
 import { describe, test, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { createAttempt, readAttempt } from '../src/attempts.js';
-import { enqueueOnce, enqueueArgs, ENQUEUE_CROSSED_RESTORE } from '../src/pull-enqueue.js';
-import { createEnvelope, readEnvelope, recordSnapshot } from '../src/pull-envelope.js';
+import { createAttempt, readAttempt, updateAttempt } from '../src/attempts.js';
+import { enqueueOnce, enqueueArgs, ENQUEUE_CROSSED_RESTORE, ENQUEUE_PAST_RETENTION } from '../src/pull-enqueue.js';
+import { createEnvelope, readEnvelope, recordSnapshot, withTicketLock } from '../src/pull-envelope.js';
 import { ensureStateDirs, paths } from '../src/state.js';
 import { freshEnv } from './helpers.js';
 import { recordFsyncs } from './helpers/fsync-recorder.js';
@@ -21,11 +21,11 @@ async function preparedTicket() {
   const { state } = freshEnv();
   ensureStateDirs(state);
   const attempt = await createAttempt(state, ID);
-  createEnvelope(state, {
+  await createEnvelope(state, {
     logicalId: ID, binding: { protocol: 1, ticketId: ID, generation: 0, manifestHash: 'mh' }, nonce: 'n', header: { protocol: 1, ticketId: ID, argv: ['true'] },
     repoKey: 'repoA', lane: 'test', laneKey: 'repoA:test', cpuCores: 1, memoryBytes: 1000, requiresTags: [], priority: 0,
   });
-  recordSnapshot(state, ID, SNAPSHOT);
+  await recordSnapshot(state, ID, SNAPSHOT);
   return { state, generation: attempt.generation };
 }
 
@@ -140,13 +140,54 @@ const SCENARIOS = {
     assert.equal(await rowCount(w), 1);
   },
 
+  'two concurrent callers, a lost response and a restore: no maybe-sent attempt is dropped and the ticket is not recreated': async (w, t) => {
+    const { state, generation } = await preparedTicket();
+    let restored;
+    const restoredSignal = new Promise((resolve) => { restored = resolve; });
+    const committing = instrumented(harnessClient(t, w).queue, {
+      after: async () => {
+        await emulateRestore(w);
+        restored();
+        throw LOST_RESPONSE;
+      },
+    });
+    const racing = instrumented(harnessClient(t, w).queue, { beforeRef: () => restoredSignal });
+    const [first, second] = await Promise.allSettled([
+      enqueueOnce({ root: state, id: ID, generation, queue: committing, lockTimeoutMs: 20_000 }),
+      enqueueOnce({ root: state, id: ID, generation, queue: racing, lockTimeoutMs: 20_000 }),
+    ]);
+    assert.equal(first.status, 'rejected');
+    assert.deepEqual(second.value, { outcome: 'lost', reason: ENQUEUE_CROSSED_RESTORE });
+    assert.equal(await rowCount(w), 0, 'the second caller did not recreate the ticket on a fresh ref');
+    const [pending, ...rest] = intent(state).attempts;
+    assert.deepEqual([pending.n, pending.answer], [1, null], 'the maybe-sent attempt survived');
+    assert.deepEqual(rest.map((a) => [a.n, a.answer]), [[2, 'stale']]);
+    assert.equal(racing.calls.sends[0].expectRef, committing.calls.sends[0].expectRef, 'it reused the maybe-sent ref');
+  },
+
+  'a maybe-sent attempt older than the queue row retention settles lost instead of being sent again': async (w, t) => {
+    const { state, generation } = await preparedTicket();
+    const crashing = instrumented(harnessClient(t, w).queue, { after: dropResponse });
+    const sentAt = Date.now();
+    await assert.rejects(enqueueOnce({ root: state, id: ID, generation, queue: crashing, now: () => sentAt }), LOST_RESPONSE);
+    assert.equal(intent(state).attempts[0].sentAt, sentAt);
+    await (await w.su()).query('DELETE FROM lane_dispatch.tickets WHERE id = $1', [ID]);
+
+    const replay = instrumented(harnessClient(t, w).queue);
+    const day = 24 * 3_600_000;
+    assert.deepEqual(await enqueueOnce({ root: state, id: ID, generation, queue: replay, now: () => sentAt + 8 * day }), { outcome: 'lost', reason: ENQUEUE_PAST_RETENTION });
+    assert.equal(replay.calls.sends.length, 0, 'nothing was sent');
+    assert.equal(await rowCount(w), 0, 'a pruned row is not recreated');
+    assert.equal((await enqueueOnce({ root: state, id: ID, generation, queue: replay, now: () => sentAt + 6 * day })).outcome, 'queued', 'inside the retention it is an ordinary replay');
+  },
+
   'the pending intent is on disk and fsynced before the send leaves': async (w, t) => {
     const { state, generation } = await preparedTicket();
     const rec = recordFsyncs();
     let atSend;
     const spying = instrumented(harnessClient(t, w).queue, {
       before: () => {
-        atSend = { intent: intent(state), fsynced: rec.fsyncedPaths().some((p) => p.startsWith(`${paths(state).attempts}${path.sep}.tmp-`)), renamed: rec.indexOf('rename', path.join(paths(state).attempts, `${ID}.json`)) };
+        atSend = { intent: intent(state), fsynced: rec.fsyncedPaths().some((p) => p.startsWith(`${paths(state).attempts}${path.sep}.tmp-`)), renamed: rec.indexOf('rename', path.join(paths(state).attempts, `${ID}.json`)), dirFsyncs: rec.events.map((e, i) => (e.op === 'fsync' && e.path === paths(state).attempts ? i : -1)).filter((i) => i >= 0) };
       },
     });
     try {
@@ -157,6 +198,7 @@ const SCENARIOS = {
     assert.deepEqual(atSend.intent.attempts.map((a) => [a.n, a.answer]), [[1, null]]);
     assert.equal(atSend.fsynced, true);
     assert.ok(atSend.renamed >= 0);
+    assert.ok(atSend.dirFsyncs.some((i) => i > atSend.renamed), 'the attempts directory entry is fsynced after the rename, before the send');
   },
 };
 
@@ -176,7 +218,7 @@ describe('enqueue intent without a database', () => {
     const { state } = freshEnv();
     ensureStateDirs(state);
     const { generation } = await createAttempt(state, ID);
-    createEnvelope(state, {
+    await createEnvelope(state, {
       logicalId: ID, binding: { protocol: 1, ticketId: ID, generation: 0, manifestHash: 'mh' }, nonce: 'n', header: {}, repoKey: 'repoA', lane: 'test',
       laneKey: 'k', cpuCores: 1, memoryBytes: 1, requiresTags: [], priority: 0,
     });
@@ -200,5 +242,31 @@ describe('enqueue intent without a database', () => {
     assert.deepEqual(Object.keys(args).sort(), ['binding', 'cpuCores', 'header', 'id', 'lane', 'laneKey', 'memoryBytes', 'priority', 'repoKey', 'requiresTags', 'snapshot']);
     assert.equal(args.id, ID);
     assert.deepEqual(args.snapshot, SNAPSHOT);
+  });
+});
+
+describe('enqueue intent locking without a database', () => {
+  test('enqueueOnce takes the per-ticket lock: a held lock makes it time out before any read or send', async () => {
+    const { state, generation } = await preparedTicket();
+    let release;
+    const holding = withTicketLock(state, ID, () => new Promise((resolve) => { release = resolve; }));
+    const queue = instrumented({ queueRef: assert.fail, enqueueFenced: assert.fail });
+    try {
+      await assert.rejects(enqueueOnce({ root: state, id: ID, generation, queue, lockTimeoutMs: 100 }), /lock|timed out|timeout/i);
+    } finally {
+      release();
+      await holding;
+    }
+    assert.equal(queue.calls.refs + queue.calls.sends.length, 0);
+    assert.equal(readAttempt(state, ID).pull, undefined);
+  });
+
+  test('updateAttempt applies a function patch to the record it reads under its lock', async () => {
+    const { state } = freshEnv();
+    ensureStateDirs(state);
+    const { generation } = await createAttempt(state, ID);
+    const bump = () => updateAttempt(state, ID, generation, (current) => ({ counter: (current.counter ?? 0) + 1 }));
+    await Promise.all([bump(), bump(), bump()]);
+    assert.equal(readAttempt(state, ID).counter, 3);
   });
 });

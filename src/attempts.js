@@ -200,7 +200,7 @@ export async function updateAttempt(root, id, expectedGeneration, patch, { refus
     if (!current || current.generation !== expectedGeneration) {
       return { ok: false };
     }
-    const next = { ...current, ...patch };
+    const next = { ...current, ...(typeof patch === 'function' ? patch(current) : patch) };
     atomicWriteJson(attemptFile(root, id), next, { fsync });
     return { ok: true, attempt: next };
   }, { timeoutMs: lockTimeoutMs });

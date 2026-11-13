@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { createEnvelope, envelopeFile, pullTicketDir, readEnvelope, recordSnapshot } from '../src/pull-envelope.js';
+import { createEnvelope, envelopeFile, pullTicketDir, readEnvelope, recordSnapshot, withTicketLock } from '../src/pull-envelope.js';
 import { freshEnv } from './helpers.js';
 import { recordFsyncs } from './helpers/fsync-recorder.js';
 
@@ -26,12 +26,12 @@ const fields = (overrides = {}) => ({
 });
 const SNAPSHOT = { key: `streams/${ID}-3-abc.gz`, sha256: 'abc', bytes: 10, blobs: [] };
 
-test('create: every ancestor is fsynced first, then the file, then its directory entry', (t) => {
+test('create: every ancestor is fsynced first, then the file, then its directory entry', async (t) => {
   const { state } = freshEnv();
   fs.mkdirSync(path.join(state, 'pull'));
   const rec = recordFsyncs();
   try {
-    createEnvelope(state, fields());
+    await createEnvelope(state, fields());
   } finally {
     rec.stop();
   }
@@ -47,41 +47,78 @@ test('create: every ancestor is fsynced first, then the file, then its directory
   t.diagnostic(`fsync order ${[rootFsync, pullFsync, dirFsync, fileFsync, rename]}`);
 });
 
-test('create refuses to overwrite, and a missing required field names itself', () => {
+test('create refuses to overwrite, and a missing required field names itself', async () => {
   const { state } = freshEnv();
-  const created = createEnvelope(state, fields());
+  const created = await createEnvelope(state, fields());
   assert.deepEqual(readEnvelope(state, ID), created);
-  assert.throws(() => createEnvelope(state, fields({ nonce: 'other' })), { code: 'EEXIST' });
+  await assert.rejects(createEnvelope(state, fields({ nonce: 'other' })), { code: 'EEXIST' });
   assert.equal(readEnvelope(state, ID).nonce, 'nonce-1');
   const { nonce, ...withoutNonce } = fields();
-  assert.throws(() => createEnvelope(state, withoutNonce), /lacks nonce/);
-  assert.throws(() => createEnvelope(state, fields({ binding: { protocol: 1 } })), /binding\.generation, binding\.manifestHash/);
-  assert.throws(() => createEnvelope(state, fields({ logicalId: '../escape' })), /ticket uuid/);
+  await assert.rejects(createEnvelope(state, withoutNonce), /lacks nonce/);
+  await assert.rejects(createEnvelope(state, fields({ binding: { protocol: 1 } })), /binding\.generation, binding\.manifestHash/);
+  await assert.rejects(createEnvelope(state, fields({ logicalId: '../escape' })), /ticket uuid/);
 });
 
-test('read: absent is null, but an envelope that exists and cannot be read is never "nothing prepared"', () => {
+test('read: absent is null, but an envelope that exists and cannot be read is never "nothing prepared"', async () => {
   const { state } = freshEnv();
   assert.equal(readEnvelope(state, ID), null);
-  createEnvelope(state, fields());
+  await createEnvelope(state, fields());
   fs.writeFileSync(envelopeFile(state, ID), '{"v":1,');
   assert.throws(() => readEnvelope(state, ID), SyntaxError);
   fs.writeFileSync(envelopeFile(state, ID), JSON.stringify({ ...fields(), v: 2 }));
   assert.throws(() => readEnvelope(state, ID), /version 2/);
 });
 
-test('recordSnapshot: durable, repeatable, and never replaced by a different descriptor', () => {
+test('recordSnapshot: durable, repeatable, and never replaced by a different descriptor', async () => {
   const { state } = freshEnv();
-  createEnvelope(state, fields());
+  await createEnvelope(state, fields());
   const rec = recordFsyncs();
   try {
-    recordSnapshot(state, ID, SNAPSHOT);
+    await recordSnapshot(state, ID, SNAPSHOT);
   } finally {
     rec.stop();
   }
   assert.ok(rec.indexOf('rename', envelopeFile(state, ID)) >= 0 && rec.events.some((e) => e.op === 'fsync' && e.path?.includes('.tmp-')), 'the update is fsynced and renamed');
   assert.deepEqual(readEnvelope(state, ID).snapshot, SNAPSHOT);
-  assert.deepEqual(recordSnapshot(state, ID, { ...SNAPSHOT }).snapshot, SNAPSHOT);
-  assert.throws(() => recordSnapshot(state, ID, { ...SNAPSHOT, sha256: 'def' }), /different snapshot/);
+  assert.deepEqual((await recordSnapshot(state, ID, { ...SNAPSHOT })).snapshot, SNAPSHOT);
+  await assert.rejects(recordSnapshot(state, ID, { ...SNAPSHOT, sha256: 'def' }), /different snapshot/);
   assert.deepEqual(readEnvelope(state, ID).snapshot, SNAPSHOT);
-  assert.throws(() => recordSnapshot(state, '00000000-0000-0000-0000-000000000043', SNAPSHOT), /no pull envelope/);
+  await assert.rejects(recordSnapshot(state, '00000000-0000-0000-0000-000000000043', SNAPSHOT), /no pull envelope/);
+});
+
+const ticketDirFsyncs = (rec, state) => rec.events.filter((e) => e.op === 'fsync' && e.path === pullTicketDir(state, ID)).length;
+
+test('read fsyncs the ticket directory before it returns an envelope to be trusted, and an identical recordSnapshot does too', async () => {
+  const { state } = freshEnv();
+  await createEnvelope(state, fields());
+  await recordSnapshot(state, ID, SNAPSHOT);
+  const rec = recordFsyncs();
+  try {
+    readEnvelope(state, ID);
+    const afterRead = ticketDirFsyncs(rec, state);
+    assert.ok(afterRead >= 1, 'readEnvelope fsynced the ticket directory');
+    assert.equal(rec.events.some((e) => e.op === 'fsync' && e.path === state), true, 'and every ancestor up to the root');
+    await recordSnapshot(state, ID, { ...SNAPSHOT });
+    assert.ok(ticketDirFsyncs(rec, state) > afterRead, 'the identical-descriptor return passed the barrier as well');
+    assert.equal(rec.indexOf('rename', envelopeFile(state, ID)), -1, 'and rewrote nothing');
+  } finally {
+    rec.stop();
+  }
+  assert.equal(readEnvelope(state, '00000000-0000-0000-0000-000000000099'), null);
+});
+
+test('create and recordSnapshot take the per-ticket lock: a held lock makes them time out instead of racing', async () => {
+  const { state } = freshEnv();
+  await createEnvelope(state, fields());
+  let release;
+  const holding = withTicketLock(state, ID, () => new Promise((resolve) => { release = resolve; }));
+  try {
+    await assert.rejects(createEnvelope(state, fields({ nonce: 'racer' }), { lockTimeoutMs: 100 }), /lock|timed out|timeout/i);
+    await assert.rejects(recordSnapshot(state, ID, SNAPSHOT, { lockTimeoutMs: 100 }), /lock|timed out|timeout/i);
+  } finally {
+    release();
+    await holding;
+  }
+  assert.equal(readEnvelope(state, ID).snapshot, undefined);
+  assert.equal(readEnvelope(state, ID).nonce, 'nonce-1');
 });

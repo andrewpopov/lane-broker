@@ -1468,7 +1468,7 @@ Nothing dispatches this way until `lanePull.enabled` is true; this section is th
 - `laneQueueUrl` must be one direct `postgres://` endpoint of the `lane_queue` database. The config is refused, naming the key, for
   a `svc:` host, a `pg-primary` first DNS label, a multi-host URL, any connection-routing query key (`host`, `hostaddr`, `port`, `dbname`, `database`, `service`, `target_session_attrs`), or any other database. It is checked as `pg-connection-string` parses it, which is what `pg` connects to.
 - `lanePull` defaults: `enabled false`, `pollMs 15000`, `urlTtlSec 900` (at most 604800, the SigV4 limit), `urlRefreshSec 300` (below the TTL),
-  `quarantineLostAfterMs 1800000`, `blobGc true`, `blobRefreshAfterDays 7`, `rustfs.region us-east-1`, buckets `lane-snap` and
+  `quarantineLostAfterMs 1800000`, `blobGc true`, `blobRefreshAfterDays 7`, `rowRetentionMs 604800000` (the queue's row retention, matching `ld_prune`), `rustfs.region us-east-1`, buckets `lane-snap` and
   `lane-out`. `enabled: true` needs `laneQueueUrl`, `passwordFile`, `caFile`, `rustfs.endpoint` and `rustfs.credentialsEnvFile`.
   `pullConfigured(cfg)` answers from the config alone and does no I/O. The credentials file holds `AWS_ACCESS_KEY_ID` and
   `AWS_SECRET_ACCESS_KEY`, mode 0600, owned by the user.
@@ -1484,7 +1484,9 @@ Nothing dispatches this way until `lanePull.enabled` is true; this section is th
   recovery needs to enqueue without rebuilding from a changed worktree. The snapshot descriptor is added after the upload and never replaced.
 - `src/pull-enqueue.js` sends `ld_enqueue_fenced` from the envelope. Before **every** send it fsyncs a pending intent into the attempt record
   (`pull.enqueue`). A replay reuses the ref of any attempt not durably recorded as stale. The ref is refreshed only when every earlier attempt is
-  recorded stale. A stale answer after an attempt that may have been sent settles lost (`enqueue-crossed-restore`, exit 75).
+  recorded stale. A stale answer after an attempt that may have been sent settles lost (`enqueue-crossed-restore`, exit 75), and so does an attempt
+  that may have been sent more than `rowRetentionMs` ago (`enqueue-past-retention`: the queue may have pruned the row). Each attempt records `sentAt`. `enqueueOnce`,
+  `createEnvelope` and `recordSnapshot` run under a per-ticket lock (`<state>/pull/<id>/recover.lock`, lock group `broker` so `updateAttempt` nests inside it).
 - `src/pull-snapshot.js` uploads cached blobs to `lane-snap/blobs/<ns>/<sha256>` (HEAD first; a blob older than `blobRefreshAfterDays` is
   uploaded again, aged by HEAD `Last-Modified`, else `<state>/pull/blob-index.json`, else treated as old) and the gzipped stream to
   `lane-snap/streams/<ticketId>-<generation>-<sha256>.gz`. It returns the descriptor `{key, sha256, bytes, blobs}` (`key` is relative to the bucket) and the header with `repoIdentity` set.

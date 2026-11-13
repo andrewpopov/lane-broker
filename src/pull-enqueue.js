@@ -1,8 +1,10 @@
 import { readAttempt, updateAttempt } from './attempts.js';
-import { readEnvelope } from './pull-envelope.js';
+import { DEFAULT_GLOBAL_CONFIG } from './config.js';
+import { readEnvelope, withTicketLock } from './pull-envelope.js';
 
 export const STALE_QUEUE_REF = 'stale-queue-ref';
 export const ENQUEUE_CROSSED_RESTORE = 'enqueue-crossed-restore';
+export const ENQUEUE_PAST_RETENTION = 'enqueue-past-retention';
 
 const EMPTY_INTENT = { attempts: [], seenRowAt: null };
 
@@ -30,28 +32,42 @@ const mayHaveBeenSent = (attempt) => attempt.answer !== 'stale';
 
 const crossedRestore = (attempts) => attempts.some((attempt, i) => attempt.answer === 'stale' && attempts.slice(0, i).some(mayHaveBeenSent));
 
-async function persistIntent({ root, id, generation }, enqueue) {
-  const current = readAttempt(root, id);
-  const written = await updateAttempt(root, id, generation, { pull: { ...current?.pull, enqueue } }, { fsync: true });
+const pastRetention = (attempts, nowMs, rowRetentionMs) => attempts.some((attempt) => mayHaveBeenSent(attempt) && nowMs - attempt.sentAt > rowRetentionMs);
+
+async function persistIntent({ root, id, generation }, change) {
+  let intent;
+  const written = await updateAttempt(root, id, generation, (current) => {
+    intent = change(intentOf(current));
+    return { pull: { ...current.pull, enqueue: intent } };
+  }, { fsync: true });
   if (!written.ok) throw new Error(`attempt ${id} is gone or moved past generation ${generation}; the enqueue intent was not recorded`);
+  return intent;
 }
 
-// returns queued, refresh (call again) or lost; a throw leaves the intent pending for the replay
-export async function enqueueOnce({ root, id, generation, queue, now = Date.now }) {
-  const args = enqueueArgs(readEnvelope(root, id));
-  const intent = intentOf(readAttempt(root, id));
-  if (intent.seenRowAt !== null) return { outcome: 'queued', view: null };
-  if (crossedRestore(intent.attempts)) return { outcome: 'lost', reason: ENQUEUE_CROSSED_RESTORE };
+// runs under the ticket's recovery lock; returns queued, refresh (call again) or lost; a throw leaves the intent pending for the replay
+export function enqueueOnce({ root, id, generation, queue, now = Date.now, rowRetentionMs = DEFAULT_GLOBAL_CONFIG.lanePull.rowRetentionMs, lockTimeoutMs }) {
+  return withTicketLock(root, id, async () => {
+    const args = enqueueArgs(readEnvelope(root, id));
+    const intent = intentOf(readAttempt(root, id));
+    if (intent.seenRowAt !== null) return { outcome: 'queued', view: null };
+    if (crossedRestore(intent.attempts)) return { outcome: 'lost', reason: ENQUEUE_CROSSED_RESTORE };
+    if (pastRetention(intent.attempts, now(), rowRetentionMs)) return { outcome: 'lost', reason: ENQUEUE_PAST_RETENTION };
 
-  const ref = intent.attempts.find(mayHaveBeenSent)?.ref ?? (await queue.queueRef());
-  const sending = { n: intent.attempts.length + 1, ref, answer: null };
-  await persistIntent({ root, id, generation }, { ...intent, attempts: [...intent.attempts, sending] });
+    const ref = intent.attempts.find(mayHaveBeenSent)?.ref ?? (await queue.queueRef());
+    let sending;
+    await persistIntent({ root, id, generation }, (current) => {
+      sending = { n: current.attempts.length + 1, ref, answer: null, sentAt: now() };
+      return { ...current, attempts: [...current.attempts, sending] };
+    });
 
-  const view = await queue.enqueueFenced({ expectRef: ref, ...args });
-  const stale = view.state === STALE_QUEUE_REF;
-  const attempts = [...intent.attempts, { ...sending, answer: stale ? 'stale' : 'row' }];
-  await persistIntent({ root, id, generation }, { attempts, seenRowAt: stale ? null : new Date(now()).toISOString() });
+    const view = await queue.enqueueFenced({ expectRef: ref, ...args });
+    const stale = view.state === STALE_QUEUE_REF;
+    const settled = await persistIntent({ root, id, generation }, (current) => ({
+      attempts: current.attempts.map((attempt) => (attempt.n === sending.n ? { ...attempt, answer: stale ? 'stale' : 'row' } : attempt)),
+      seenRowAt: stale ? null : new Date(now()).toISOString(),
+    }));
 
-  if (!stale) return { outcome: 'queued', view };
-  return crossedRestore(attempts) ? { outcome: 'lost', reason: ENQUEUE_CROSSED_RESTORE } : { outcome: 'refresh' };
+    if (!stale) return { outcome: 'queued', view };
+    return crossedRestore(settled.attempts) ? { outcome: 'lost', reason: ENQUEUE_CROSSED_RESTORE } : { outcome: 'refresh' };
+  }, { lockTimeoutMs });
 }
