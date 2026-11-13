@@ -5,7 +5,8 @@ import { makeTmpDir } from './helpers/tmp.js';
 import { makeStubPg, sqlError } from './helpers/stub-pg.js';
 import { LdClient, LdClosedError, NOT_LIVE, isRetryable } from '../src/agent/ld-client.js';
 import { openAgentCore } from '../src/agent/agent.js';
-import { ExecutionTable, ensureAgentDirs, newExecutionRecord } from '../src/agent/store.js';
+import { ExecutionTable, agentPaths, ensureAgentDirs, newExecutionRecord } from '../src/agent/store.js';
+import { readJsonSafe } from '../src/state.js';
 
 const ID = '11111111-1111-4111-8111-111111111111';
 const TOKEN = '22222222-2222-4222-8222-222222222222';
@@ -130,4 +131,39 @@ test('a finish queued before a reassert that ends its record is not sent after i
   assert.deepEqual([await first, await second], [NOT_LIVE, NOT_LIVE]);
   assert.equal(core.table.get(`${ID}.e1`).subphase, 'KILLING');
   assert.ok(!stub.names().includes('ld_finish') && !stub.names().includes('ld_heartbeat'));
+});
+
+test('a call that has been sent keeps retrying to a real answer when live() turns false meanwhile', async () => {
+  let reasserts = 0;
+  let alive = true;
+  let finishes = 0;
+  const stub = makeStubPg({ answers: {
+    ld_reassert: () => { if (++reasserts > 1) alive = false; return []; },
+    ld_finish: () => { if (finishes++ === 0) throw sqlError('57P01'); return { fenced: false, state: 'finished' }; },
+  } });
+  const { client } = newClient(stub);
+  await client.open();
+  const answer = await client.finish(ID, 1, TOKEN, { kind: 'ok' }, { live: () => alive });
+  assert.deepEqual(answer, { fenced: false, state: 'finished' });
+  assert.equal(alive, false, 'live() did turn false during the reconnect');
+  assert.equal(stub.names().filter((n) => n === 'ld_finish').length, 2);
+});
+
+test('a LISTEN failure after startup is logged and recorded in status.json even with no onWake from the caller', async () => {
+  ensureAgentDirs(remoteRoot);
+  const stub = makeStubPg();
+  const log = [];
+  const core = await openAgentCore({ remoteRoot, config: { pg: {}, schedule: null }, version: 't', connect: stub.connect, backoff: BACKOFF, log: (line) => log.push(line) });
+  closers.push(() => core.close());
+  const old = stub.listenClient();
+  stub.failConnects.push(sqlError('57P03'));
+  const before = Date.now();
+  old.emit('end');
+  await untilTrue('listen came back', () => stub.listenClient() !== old && stub.listenClient()?.listens.length === 2);
+  assert.deepEqual(log, ['listen-failed: 57P03']);
+  const { listenError } = readJsonSafe(agentPaths(remoteRoot).status);
+  assert.equal(listenError.error, '57P03');
+  assert.ok(listenError.at >= before && listenError.at <= Date.now());
+  core.tick();
+  assert.equal(readJsonSafe(agentPaths(remoteRoot).status).listenError.error, '57P03', 'a later tick keeps the last LISTEN error');
 });

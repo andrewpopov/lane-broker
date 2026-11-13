@@ -120,8 +120,10 @@ export class LdClient {
   #run(name, args, { persist, live } = {}) {
     return this.#enqueue(async () => {
       let sentAt;
+      let sent = false;
       const answer = await this.#attempt(() => {
-        if (live && !live()) return NOT_LIVE;
+        if (!sent && live && !live()) return NOT_LIVE;
+        sent = true;
         sentAt = this.gen;
         return this.#sql(name, args);
       });

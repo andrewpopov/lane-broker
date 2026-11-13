@@ -119,12 +119,15 @@ describe('agent reassert-first gate on a disposable Postgres', { skip: pgSkipOpt
   }
 
   for (const name of GATE_CANARIES) {
-    test(`canary: with the gate bypassed, "${name}" fails`, async (t) => {
-      const mutant = await importMutant(path.join(import.meta.dirname, '..', 'src', 'agent', 'ld-client.js'), ['        await this.#gate();\n', '']);
+    test(`canary: with the gate bypassed, "${name}" fails on its own call-order assertion`, async (t) => {
+      const bypassed = ['        await this.#gate();\n', "        this.registered ??= { host: 'a1' };\n"];
+      const mutant = await importMutant(path.join(import.meta.dirname, '..', 'src', 'agent', 'ld-client.js'), bypassed);
       let failure;
       await SCENARIOS[name](await World.create(cluster), { remoteRoot, cores, LdClient: mutant.LdClient }).catch((err) => { failure = err; });
       assert.ok(failure, `"${name}" still passed with the gate bypassed, so it proves nothing`);
-      t.diagnostic(`failed as expected: ${String(failure.message).split('\n')[0]}`);
+      assert.equal(failure.code, 'ERR_ASSERTION', `it must fail on its assertion, not crash: ${failure.stack}`);
+      assert.match(failure.message, /ld_reassert/);
+      t.diagnostic(`failed as expected: ${failure.message.split('\n').join(' ').slice(0, 200)}`);
     });
   }
 });

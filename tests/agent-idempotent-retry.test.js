@@ -129,7 +129,10 @@ for (const [name, scenario] of Object.entries(LOST_RESPONSE)) {
   };
 }
 
-const CANARIES = [[CLAIM_REPLAY, 'WHERE c.login_role = session_user AND c.req = p_req;', 'WHERE c.login_role = session_user AND c.req = p_req AND false;']];
+// Without claim_replay the retry reaches the server with the same request id and nothing answers it, so claim_requests' own primary key
+// refuses it: that error, and no other, proves the replay is what recovers a lost claim response.
+const REPLAY_REMOVED_ERROR = (err) => err.code === '23505' && err.constraint === 'claim_requests_pkey';
+const CANARIES = [[CLAIM_REPLAY, 'WHERE c.login_role = session_user AND c.req = p_req;', 'WHERE c.login_role = session_user AND c.req = p_req AND false;', REPLAY_REMOVED_ERROR]];
 
 describe('agent ld client idempotent retries on a disposable Postgres', { skip: pgSkipOption, timeout: 300000 }, () => {
   let cluster;
@@ -141,11 +144,12 @@ describe('agent ld client idempotent retries on a disposable Postgres', { skip: 
     test(name, async () => scenario(await World.create(cluster)));
   }
 
-  for (const [name, from, to] of CANARIES) {
+  for (const [name, from, to, isExpected] of CANARIES) {
     test(`canary: with the replay guard removed, "${name}" fails`, async (t) => {
       let failure;
       await SCENARIOS[name](await World.create(cluster, { mutate: [from, to] })).catch((err) => { failure = err; });
       assert.ok(failure, `"${name}" still passed with the guard removed, so it proves nothing`);
+      assert.ok(isExpected(failure), `it failed, but not on the guard's own effect: ${failure.stack}`);
       t.diagnostic(`failed as expected: ${String(failure.message).split('\n')[0]}`);
     });
   }
