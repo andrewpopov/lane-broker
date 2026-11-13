@@ -8,7 +8,7 @@ import { countBytes, TRANSFER_GZIP, REMOTE_EXEC_NO_TICKET_EXIT } from './remote-
 import { receiveArtifacts, artifactLimitsOf } from './remote-artifacts.js';
 import { DEFAULT_GLOBAL_CONFIG, repoIdentity } from './config.js';
 import { isCacheable, isBlobHash } from './remote-blobs.js';
-import { ELASTIC_CLAIMS_CAPABILITY } from './resources.js';
+import { ELASTIC_CLAIMS_CAPABILITY, TRANSPORT_FAILURE } from './resources.js';
 import { isPriorityTier, isValidGroupId } from './priority.js';
 import { runnerAvailability } from './runner-schedule.js';
 import { runnerWaitMs, probeQueued, RANKED_WAIT_RESIDUAL, DEFAULT_REMOTE_OVERHEAD_MS } from './speed-placement.js';
@@ -626,7 +626,7 @@ export function isGreen(result, expected) {
 /** Pipe `stream` into `child.stdin`, bounded by `deadlineMs`, killable by `abortSignal`.
  *  Resolves `{ok:true}` once fully written, or `{ok:false, reason}` on error/timeout/abort
  *  or the ssh child closing early -- never rejects, and never waits past the deadline. */
-function pipeSnapshot(child, stream, deadlineMs, abortSignal) {
+export function pipeSnapshot(child, stream, deadlineMs, abortSignal) {
   return new Promise((resolve) => {
     let settled = false;
     const finish = (result) => {
@@ -661,7 +661,7 @@ function pipeSnapshot(child, stream, deadlineMs, abortSignal) {
       } catch {
         // already gone
       }
-      finish({ ok: false, reason: 'ssh stdin error' });
+      finish({ ok: false, reason: 'ssh stdin error', failureKind: TRANSPORT_FAILURE });
     });
     // An encode/stream error (BRAIN-319 review finding #3) must not leave ssh's stdin open:
     // ssh has no way to know the transfer is over, so it would otherwise wait on stdin EOF
@@ -682,7 +682,7 @@ function pipeSnapshot(child, stream, deadlineMs, abortSignal) {
       finish({ ok: false, reason: `snapshot stream error: ${err.message}` });
     });
     child.stdin.on('finish', () => finish({ ok: true }));
-    child.on('close', () => finish({ ok: false, reason: 'ssh closed before transfer finished' }));
+    child.on('close', () => finish({ ok: false, reason: 'ssh closed before transfer finished', failureKind: TRANSPORT_FAILURE }));
     stream.pipe(child.stdin);
   });
 }
@@ -1523,7 +1523,7 @@ async function dispatchOnce(opts) {
 
   if (!pipeResult.ok) {
     // BRAIN-405: the snapshot was never completely sent, and a runner runs nothing before it has received and verified all of it
-    return { outcome: 'unconfirmed', reason: pipeResult.reason, neverStarted: true, retryElsewhere: true };
+    return { outcome: 'unconfirmed', reason: pipeResult.reason, neverStarted: true, retryElsewhere: true, ...(pipeResult.failureKind ? { failureKind: pipeResult.failureKind } : {}) };
   }
 
   let record = hungRecord;

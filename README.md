@@ -1690,6 +1690,9 @@ never expires a ticket into a local run. Nothing ever falls back to local; inste
 
 - exit `76` when the ticket is remote-eligible but no runner can take it (runners down or busy-refused, a dispatch lost
   before it started); retry later;
+  when the cause is a broken ssh transfer (`ssh stdin error`, `ssh closed before transfer finished`), the exit stays `76` but the
+  result and the history row carry `failureKind: "transport"` and the message reads `(transport: <reason>)`, so a report can tell a
+  flaky link from a lack of capacity; other `76` refusals carry no `failureKind`;
 - exit `69`, with a stderr line naming `localExecution is refused`, when it can never go remote from here (no runners
   configured, a tree that cannot be snapshotted, an exclusive lane, a nested run inside a lease, a runner intake).
 

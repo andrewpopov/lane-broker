@@ -259,6 +259,9 @@ if (destination === 'die-midstream') {
     process.stdout.write(\`\${JSON.stringify(reply)}\\n\`);
     exitNow(0);
   }
+} else if (destination === 'exec-exits-at-once' && commandString.includes('remote-exec')) {
+  // BRAIN-1050: ssh that drops the session before reading any of a snapshot too big to sit in the pipe buffer: the client's write fails.
+  exitNow(255);
 } else if (destination === 'no-read' && commandString.includes('remote-exec')) {
   // BRAIN-642: a runner session that never reads stdin, so the client's pipeline stalls mid-transfer under backpressure.
   setInterval(() => {}, 1000);

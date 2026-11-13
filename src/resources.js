@@ -351,6 +351,8 @@ export function locallyRefusedNow(enriched, globalCfg, now = Date.now()) {
 export const LOCAL_REFUSED_EXIT_CODE = 69;
 /** BRAIN-455: a remote-only lane found no usable runner right now. Retryable, unlike the policy refusal above. */
 export const NO_RUNNER_EXIT_CODE = 76;
+/** BRAIN-1050: `failureKind` of a broken ssh transfer; the exit stays 76 because merge-train waits on it. */
+export const TRANSPORT_FAILURE = 'transport';
 
 /**
  * The "this lane is refused for local runs by default" refusal, extracted
@@ -409,10 +411,11 @@ export function noRunnerLocallyIneligibleRefusal(lane, reason, localMessage) {
  * BRAIN-634: `localExecution: "refused"` makes this host dispatch-only. `retryable` is a ticket that could go remote but no runner
  * can take it now (exit 76); otherwise it can never go remote from here (exit 69).
  */
-export function dispatchOnlyRefusal(lane, { retryable = false, reason } = {}) {
-  const detail = reason ? ` (${reason})` : '';
+export function dispatchOnlyRefusal(lane, { retryable = false, reason, failureKind } = {}) {
+  const detail = reason ? ` (${failureKind === TRANSPORT_FAILURE ? `${TRANSPORT_FAILURE}: ` : ''}${reason})` : '';
   return {
     ok: false,
+    ...(retryable && failureKind ? { failureKind } : {}),
     exitCode: retryable ? NO_RUNNER_EXIT_CODE : LOCAL_REFUSED_EXIT_CODE,
     message: retryable
       ? `lane run: localExecution is refused on this host (dispatch-only) and no runner can take lane "${lane}" now${detail}. Retry later.\n`

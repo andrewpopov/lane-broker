@@ -588,7 +588,7 @@ function returnRemoteArtifacts(root, enriched, dispatch) {
  *  or local-refused request (BRAIN-319 T3b-1, BRAIN-320). Shared by both refusal reasons since
  *  they carry the same {exitCode, message} shape. */
 function localRefusalResult(ticket, refusal) {
-  return { id: ticket.id, exit: refusal.exitCode, signal: null, startedAt: null, endedAt: Date.now(), waitedMs: 0, error: refusal.message.trim() };
+  return { id: ticket.id, exit: refusal.exitCode, signal: null, startedAt: null, endedAt: Date.now(), waitedMs: 0, error: refusal.message.trim(), ...(refusal.failureKind ? { failureKind: refusal.failureKind } : {}) };
 }
 
 /**
@@ -1056,7 +1056,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
    *  `retryWhenBlocked`: a runner proved it never started the ticket (rejecting it included), so while this machine cannot admit it
    *  either, another runner may take it (BRAIN-727).
    *  `noRunner`: the fallback is "the fleet had no usable runner", which a `localRefused` lane reports as retryable. */
-  async function fallbackOrRefuse(runner, reason, { rebindable = false, retryWhenBlocked = false, neverStarted = false, noRunner = false, retryable = noRunner } = {}) {
+  async function fallbackOrRefuse(runner, reason, { rebindable = false, retryWhenBlocked = false, neverStarted = false, noRunner = false, retryable = noRunner, failureKind } = {}) {
     if (rebind) return abandonRebind(runner, reason, { neverStarted: neverStarted || withdrawn === null });
     const fb = await fallbackToLocal(root, enriched.id, reason);
     if (!fb.ok) {
@@ -1097,7 +1097,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     // ordering: local-sim refusal, then budget).
     if (refusedHere) {
       const refusal = dispatchOnly
-        ? dispatchOnlyRefusal(enriched.lane, { retryable, reason })
+        ? dispatchOnlyRefusal(enriched.lane, { retryable, reason, failureKind })
         : noRunner
           ? noRunnerRefusal(enriched.lane, reason)
           : localSimRefusal(enriched.lane, enriched.class);
@@ -1749,7 +1749,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   // Only a runner that provably never started it AND says nothing about other runners (a queue expiry or withdrawal, an incomplete
   // transfer) leaves the fallback rebindable; ineligible, rejected and possibly-run outcomes stay local for good.
   if (dispatch.runnerStopped === true) return fallbackOrRefuse(runner, dispatch.lostReason ?? RUNNER_SHUTDOWN_REASON, { rebindable: true, neverStarted: true });
-  return fallbackOrRefuse(runner, dispatch.reason, { neverStarted: dispatch.neverStarted === true, retryWhenBlocked: dispatch.outcome === 'unconfirmed' && dispatch.neverStarted === true, rebindable: dispatch.outcome === 'unconfirmed' && dispatch.neverStarted === true && dispatch.retryElsewhere === true, retryable: dispatch.outcome === 'unconfirmed' && dispatch.rejected !== true });
+  return fallbackOrRefuse(runner, dispatch.reason, { neverStarted: dispatch.neverStarted === true, retryWhenBlocked: dispatch.outcome === 'unconfirmed' && dispatch.neverStarted === true, rebindable: dispatch.outcome === 'unconfirmed' && dispatch.neverStarted === true && dispatch.retryElsewhere === true, retryable: dispatch.outcome === 'unconfirmed' && dispatch.rejected !== true, failureKind: dispatch.failureKind });
 }
 
 let crashContext = null;
