@@ -1,5 +1,5 @@
 import { paths, ensureStateDirs, withLock, LockTimeoutError } from './state.js';
-import { loadGlobalConfigOrError } from './config.js';
+import { loadGlobalConfigOrError, pushRunners } from './config.js';
 import { runWithDeadline, sshArgv } from './remote-client.js';
 import { sweepOrphans } from './reconcile-sweep.js';
 import { recordPings, collectRunnerStates, renderRunnersLines } from './runner-unreachable.js';
@@ -28,7 +28,7 @@ export async function runnerWatchOnce(root, { cfg, sshBin = 'ssh', env = process
     pings = await withLock(
       root,
       async () => {
-        const pinged = (cfg?.runners ?? []).filter((r) => !r.offline);
+        const pinged = pushRunners(cfg).filter((r) => !r.offline);
         const results = await Promise.all(pinged.map((runner) => pingRunner(runner, { sshBin, env })));
         await recordPings(root, results, now);
         return results;

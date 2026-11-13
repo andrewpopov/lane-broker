@@ -256,6 +256,18 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // logGcMaxFilesPerRun per run.
   logRetentionMs: 14 * 24 * 3_600_000,
   logGcMaxFilesPerRun: 5000,
+  // BRAIN-1036: the pull transport (a ticket waits in the lane queue until a runner claims it). Off until `enabled` is set; the
+  // connection and storage keys have no default because nothing secret or host-specific belongs here.
+  lanePull: {
+    enabled: false,
+    pollMs: 15_000,
+    urlTtlSec: 900,
+    urlRefreshSec: 300,
+    quarantineLostAfterMs: 1_800_000,
+    blobGc: true,
+    blobRefreshAfterDays: 7,
+    rustfs: { region: 'us-east-1', snapBucket: 'lane-snap', outBucket: 'lane-out' },
+  },
 };
 
 export const DEFAULT_REPO_CONFIG = {
@@ -532,7 +544,70 @@ function validateGlobalConfig(cfg, sourcePath) {
     assert(Number.isInteger(cfg[field]) && cfg[field] > 0, `${sourcePath}: "${field}" must be a positive integer`);
   }
   if (cfg.runners !== undefined) validateRunners(cfg.runners, sourcePath);
+  validateLanePull(cfg, sourcePath);
   validatePriorityConfig(cfg, sourcePath);
+}
+
+const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
+
+export const LANE_QUEUE_DATABASE = 'lane_queue';
+const LANE_QUEUE_PRIMARY_LABEL = 'pg-primary';
+
+/** Why `laneQueueUrl` is not a single direct endpoint of the lane queue database, or null. Raw-string checks come first: a `svc:` host or a host list is not a parseable URL. */
+function laneQueueUrlProblem(raw) {
+  if (typeof raw !== 'string' || !/^postgres(ql)?:\/\//.test(raw)) return 'must be a postgres:// URL';
+  const authority = raw.replace(/^postgres(ql)?:\/\//, '').split(/[/?#]/)[0];
+  const hostPart = authority.slice(authority.lastIndexOf('@') + 1);
+  if (hostPart.startsWith('svc:')) return 'must not use a svc: host (a failover name); name the one direct endpoint';
+  if (hostPart.includes(',')) return 'must name exactly one host (multi-host URLs are refused)';
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    return 'is not a valid URL';
+  }
+  if (url.hostname === '') return 'must name a host';
+  if (url.hostname.split('.')[0].toLowerCase() === LANE_QUEUE_PRIMARY_LABEL) return `must not use the ${LANE_QUEUE_PRIMARY_LABEL} name (a moving primary); name the one direct endpoint`;
+  if ([...url.searchParams.keys()].some((k) => k.toLowerCase() === 'target_session_attrs')) return 'must not set target_session_attrs';
+  if (decodeURIComponent(url.pathname.slice(1)) !== LANE_QUEUE_DATABASE) return `must name the ${LANE_QUEUE_DATABASE} database`;
+  return null;
+}
+
+const LANE_PULL_NUMBERS = ['pollMs', 'urlTtlSec', 'urlRefreshSec', 'quarantineLostAfterMs', 'blobRefreshAfterDays'];
+const LANE_PULL_PATHS = ['passwordFile', 'caFile', 'ledgerDir'];
+const RUSTFS_STRINGS = ['region', 'snapBucket', 'outBucket', 'credentialsEnvFile'];
+
+function validateLanePull(cfg, sourcePath) {
+  if (cfg.laneQueueUrl !== undefined) {
+    const problem = laneQueueUrlProblem(cfg.laneQueueUrl);
+    assert(problem === null, `${sourcePath}: "laneQueueUrl" ${problem}`);
+  }
+  const pull = cfg.lanePull;
+  assert(isPlainObject(pull), `${sourcePath}: "lanePull" must be an object`);
+  assert(typeof pull.enabled === 'boolean', `${sourcePath}: "lanePull.enabled" must be a boolean`);
+  assert(typeof pull.blobGc === 'boolean', `${sourcePath}: "lanePull.blobGc" must be a boolean`);
+  for (const field of LANE_PULL_NUMBERS) assert(Number.isInteger(pull[field]) && pull[field] > 0, `${sourcePath}: "lanePull.${field}" must be a positive integer`);
+  assert(pull.urlRefreshSec < pull.urlTtlSec, `${sourcePath}: "lanePull.urlRefreshSec" must be less than "lanePull.urlTtlSec"`);
+  for (const field of LANE_PULL_PATHS) {
+    if (pull[field] !== undefined) assert(typeof pull[field] === 'string' && pull[field].length > 0, `${sourcePath}: "lanePull.${field}" must be a non-empty string`);
+  }
+  assert(isPlainObject(pull.rustfs), `${sourcePath}: "lanePull.rustfs" must be an object`);
+  for (const field of RUSTFS_STRINGS) {
+    if (pull.rustfs[field] !== undefined) assert(typeof pull.rustfs[field] === 'string' && pull.rustfs[field].length > 0, `${sourcePath}: "lanePull.rustfs.${field}" must be a non-empty string`);
+  }
+  if (pull.rustfs.endpoint !== undefined) {
+    assert(typeof pull.rustfs.endpoint === 'string' && /^https?:\/\/[^/\s]+\/?$/.test(pull.rustfs.endpoint), `${sourcePath}: "lanePull.rustfs.endpoint" must be an http(s) origin such as https://host:9000`);
+  }
+  if (pull.enabled) {
+    const missing = [
+      ['laneQueueUrl', cfg.laneQueueUrl],
+      ['lanePull.passwordFile', pull.passwordFile],
+      ['lanePull.caFile', pull.caFile],
+      ['lanePull.rustfs.endpoint', pull.rustfs.endpoint],
+      ['lanePull.rustfs.credentialsEnvFile', pull.rustfs.credentialsEnvFile],
+    ].filter(([, value]) => value === undefined);
+    assert(missing.length === 0, `${sourcePath}: "lanePull.enabled" needs ${missing.map(([name]) => `"${name}"`).join(', ')}`);
+  }
 }
 
 function validatePriorityConfig(cfg, sourcePath) {
@@ -561,6 +636,22 @@ function validatePriorityConfig(cfg, sourcePath) {
 }
 
 export const RUNNER_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
+const RUNNER_TRANSPORTS = ['push', 'pull'];
+
+/** BRAIN-1036: the runners a dispatcher reaches over ssh. Every placement, rebind, ping and status path that dials a runner reads this list, never `cfg.runners`. */
+export const pushRunners = (cfg) => (cfg?.runners ?? []).filter((r) => r.transport !== 'pull');
+export const pullRunners = (cfg) => (cfg?.runners ?? []).filter((r) => r.transport === 'pull');
+
+/** Whether the config alone says pull dispatch is usable: enabled, a pull runner, and every connection key present. Reads nothing from disk or the network. */
+export function pullConfigured(cfg) {
+  const pull = cfg?.lanePull;
+  return (
+    pull?.enabled === true &&
+    pullRunners(cfg).length > 0 &&
+    typeof cfg.laneQueueUrl === 'string' &&
+    [pull.passwordFile, pull.caFile, pull.rustfs?.endpoint, pull.rustfs?.credentialsEnvFile].every((value) => typeof value === 'string')
+  );
+}
 
 /**
  * BRAIN-319 T3a: `runners` is optional and absent by default, so a config
@@ -581,10 +672,15 @@ function validateRunners(runners, sourcePath) {
     );
     assert(!seenNames.has(runner.name), `${sourcePath}: duplicate runner name "${runner.name}"`);
     seenNames.add(runner.name);
-    assert(
-      typeof runner.ssh === 'string' && runner.ssh.length > 0 && !runner.ssh.startsWith('-'),
-      `${sourcePath}: runner "${runner.name}".ssh must be a non-empty string not starting with "-"`,
-    );
+    if (runner.transport !== undefined) {
+      assert(RUNNER_TRANSPORTS.includes(runner.transport), `${sourcePath}: runner "${runner.name}".transport must be "push" or "pull"`);
+    }
+    if (runner.transport !== 'pull' || runner.ssh !== undefined) {
+      assert(
+        typeof runner.ssh === 'string' && runner.ssh.length > 0 && !runner.ssh.startsWith('-'),
+        `${sourcePath}: runner "${runner.name}".ssh must be a non-empty string not starting with "-"`,
+      );
+    }
     if (runner.root !== undefined) {
       assert(typeof runner.root === 'string' && runner.root.length > 0, `${sourcePath}: runner "${runner.name}".root must be a non-empty string`);
     }
@@ -932,6 +1028,13 @@ export function loadGlobalConfig() {
   // A partial `priorityWeights` overrides only the weights it names; the age cap follows the aging step unless set.
   if (parsed.priorityWeights && typeof parsed.priorityWeights === 'object' && !Array.isArray(parsed.priorityWeights)) {
     cfg.priorityWeights = { ...DEFAULT_GLOBAL_CONFIG.priorityWeights, ...parsed.priorityWeights };
+  }
+  if (isPlainObject(parsed.lanePull)) {
+    cfg.lanePull = {
+      ...DEFAULT_GLOBAL_CONFIG.lanePull,
+      ...parsed.lanePull,
+      rustfs: { ...DEFAULT_GLOBAL_CONFIG.lanePull.rustfs, ...(isPlainObject(parsed.lanePull.rustfs) ? parsed.lanePull.rustfs : {}) },
+    };
   }
   if (parsed.priorityAgeMaxMs === undefined && Number.isInteger(cfg.priorityAgingMs)) {
     cfg.priorityAgeMaxMs = 2 * cfg.priorityAgingMs;

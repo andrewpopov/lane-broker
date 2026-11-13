@@ -35,7 +35,7 @@ import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processSt
 import { isPidAlive, isProcessAlive } from './process-liveness.js';
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
-import { reloadGlobalConfig, isDispatchOnly } from './config.js';
+import { reloadGlobalConfig, isDispatchOnly, pushRunners } from './config.js';
 import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope, scopeMemoryPeakReader, scopeMemoryPeakTracker, enforcementLabel } from './cpu-limit.js';
 import { stateHome, RUNNER_SHUTDOWN_REASON, LOST_REASONS } from './state.js';
 import { childExitSafeFlags } from './node-exit-safe.js';
@@ -1135,7 +1135,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   const placeOptions = rebind ? null : selectionOptionsFor('place', enriched, globalCfg, { root, cpuLimit });
   const placed = rebind
     ? { runner: rebind.runner, skipped: [], queuedChoice: false, probe: rebind.probe }
-    : await selectRunner(globalCfg.runners || [], placeOptions);
+    : await selectRunner(pushRunners(globalCfg), placeOptions);
   let { runner, skipped, queuedChoice, probe, busy, readiness, ready } = placed;
   // a rebind's own selection is logged by tryRebind, which holds the scores this synthetic `placed` deliberately drops
   if (!rebind) logFinishPlacement(root, enriched, placed);
@@ -1157,7 +1157,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   if (!runner) {
     const reason = skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : 'no runners configured';
     // every configured runner is too small for this ticket for good: no retry will place it
-    const neverPlaceable = skipped.length > 0 && skipped.length === (globalCfg.runners || []).length && skipped.every((s) => s.neverFits === true);
+    const neverPlaceable = skipped.length > 0 && skipped.length === pushRunners(globalCfg).length && skipped.every((s) => s.neverFits === true);
     return fallbackOrRefuse(null, reason, { rebindable: true, noRunner: true, retryable: !neverPlaceable });
   }
 
@@ -1421,7 +1421,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
         pickTarget: async ({ draining, sourceFacts, refusalCapElapsed } = {}) => {
           const countedMoves = moves.filter((m) => m.reason !== DRAIN_MOVE_REASON).length;
           if (!draining && rebalanceBlocked({ moves: countedMoves, maxMoves: globalCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: globalCfg.remoteRebalanceCooldownMs })) return null;
-          const candidates = (globalCfg.runners || []).filter((r) => !visited.includes(r.name) && r.rebalanceTarget !== false);
+          const candidates = pushRunners(globalCfg).filter((r) => !visited.includes(r.name) && r.rebalanceTarget !== false);
           if (candidates.length === 0) return null;
           const idleOptions = selectionOptionsFor('rebalance', enriched, globalCfg, { draining, root, cpuLimit });
           const picked = await selectRunner(candidates, idleOptions);
@@ -1473,7 +1473,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       const lostReason = dispatch.lostReason ?? RUNNER_SHUTDOWN_REASON;
       // BRAIN-350: the runner's own record proves its host shut down and the job is dead there, so running it again cannot double-run (BRAIN-437).
       // This is a new placement, not a rebalance: any configured runner this ticket has not been on is a candidate.
-      const picked = rebind ? { runner: null } : await selectRunner((globalCfg.runners || []).filter((r) => !visited.includes(r.name)), selectionOptionsFor('place', enriched, globalCfg, { root, cpuLimit }));
+      const picked = rebind ? { runner: null } : await selectRunner(pushRunners(globalCfg).filter((r) => !visited.includes(r.name)), selectionOptionsFor('place', enriched, globalCfg, { root, cpuLimit }));
       if (!picked.runner) break;
       logFinishPlacement(root, enriched, picked, 'redispatch: ');
       const from = runner;
@@ -1962,7 +1962,7 @@ async function main() {
     // A ticket never goes back to a runner it left, was refused by, or was ever dispatched to (nor to one it is on).
     const attempt = readAttempt(root, ticket.id);
     const left = new Set([...(attempt?.moves ?? []).flatMap((m) => [m.from, m.to]), ...(attempt?.refusedRunners ?? []), ...(attempt?.dispatchedRunners ?? [])]);
-    const candidates = (globalCfg.runners || []).filter((r) => !left.has(r.name));
+    const candidates = pushRunners(globalCfg).filter((r) => !left.has(r.name));
     if (candidates.length === 0) return;
     // An idle runner is always taken; a runner that is itself queued (up to maxRemoteQueue) only for a ticket stuck locally long enough.
     const waitedMs = Date.now() - (readQueuedRecord(root, ticket.id)?.localSince ?? Date.now());
@@ -2124,7 +2124,7 @@ async function main() {
       touchSimArmFor(root, ticket);
       await finalizeQueuedAndExit(outcome, { forcePublish: cancelWon });
     }
-    const rebindDue = (rebindable || retryWhenBlocked) && globalCfg.remoteRebindIntervalMs > 0 && Date.now() >= nextRebindAt && (globalCfg.runners || []).length > 0;
+    const rebindDue = (rebindable || retryWhenBlocked) && globalCfg.remoteRebindIntervalMs > 0 && Date.now() >= nextRebindAt && pushRunners(globalCfg).length > 0;
     // BRAIN-727: a remote-eligible ticket the host's external load leaves no slot for is blocked, whether or not it is the head
     const localBlocked = rebindDue && Boolean(enriched.remote) && externalCpuSlotsFor(root, enriched, globalCfg) === 0;
     if (rebindDue && (rebindable || localBlocked) && (Date.now() >= rebindNotBefore || localBlocked)) {

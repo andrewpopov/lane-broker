@@ -325,6 +325,10 @@ export async function selectRunner(runners, opts = {}) {
   const bestOf = (seq, cmp) => seq.reduce((best, cand) => (cmp(cand, best) ? cand : best), null);
   const now = opts.now ?? Date.now();
   for (const [order, runner] of runners.entries()) {
+    if (runner.transport === 'pull') {
+      skipped.push({ name: runner.name, reason: 'pull transport' });
+      continue;
+    }
     if (runner.offline) {
       skipped.push({ name: runner.name, reason: 'marked offline' });
       continue;

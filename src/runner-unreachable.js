@@ -3,6 +3,7 @@ import path from 'node:path';
 import { paths, atomicWriteJson, readJsonSafe, withLock } from './state.js';
 import { runnerAvailability } from './runner-schedule.js';
 import { enforcementLabel } from './cpu-limit.js';
+import { pushRunners } from './config.js';
 
 /**
  * BRAIN-594/597: the ONE record of "first failed contact" per runner, `runner-unreachable.json`.
@@ -143,7 +144,7 @@ export function downRunnerReasons(root, cfg, now = Date.now()) {
   if (age === null || age > HEARTBEAT_FRESH_MS) return {};
   const unreachable = readUnreachable(root);
   const reasons = {};
-  for (const runner of cfg.runners ?? []) {
+  for (const runner of pushRunners(cfg)) {
     const since = unreachable[runner.name];
     if (!runner.offline && since !== undefined && now - since >= after) reasons[runner.name] = `unreachable since ${clock(since)}`;
   }
@@ -159,12 +160,12 @@ export function heartbeatUpRunners(root, cfg, now = Date.now()) {
   const age = heartbeatAgeMs(beat, now);
   if (age === null || age > HEARTBEAT_FRESH_MS) return [];
   const unreachable = readUnreachable(root); // a running clock means the latest ping failed, whatever lastOkAt says
-  return (cfg?.runners ?? []).filter((r) => !r.offline && !Object.hasOwn(unreachable, r.name) && now - (beat.runners[r.name]?.lastOkAt ?? -Infinity) <= HEARTBEAT_FRESH_MS).map((r) => r.name);
+  return pushRunners(cfg).filter((r) => !r.offline && !Object.hasOwn(unreachable, r.name) && now - (beat.runners[r.name]?.lastOkAt ?? -Infinity) <= HEARTBEAT_FRESH_MS).map((r) => r.name);
 }
 
 /** One entry per configured runner, for `lane status`, `lane runner status` and the status JSON. */
 export function collectRunnerStates(root, cfg, now = Date.now()) {
-  const runners = cfg?.runners ?? [];
+  const runners = pushRunners(cfg);
   if (runners.length === 0) return [];
   const beat = readHeartbeat(root);
   const unreachable = readUnreachable(root);
