@@ -3022,6 +3022,10 @@ What a run leaves behind is collected; what a live one owns never is. Everything
   `parallelism` (a sampler's fixture CPU list) still wins. `npm test` sets it to
   the machine's core count, so the suite behaves the same inside a 1-core runner lane as on a bare host.
 - `LANE_BROKER_BOOT_ID` — override the detected boot id, to simulate a reboot.
+- `LANE_BROKER_BOOT_TIME_MS` — override the host boot time (epoch ms; non-numeric means unknown). BRAIN-1013: a lock whose
+  `owner.json` is empty or unparsable and was last written before this boot (a power cut; the file is now fsynced at acquire, but older
+  locks are not) is reclaimed through the same tombstone CAS as a dead owner, keyed on that file's inode and mtime. Unknown boot time
+  or a newer file keeps the old wait-and-time-out. `.lock-stage-*` leftovers of a dead pid, or from before boot, are removed on acquire.
 - `LANE_BROKER_TEST_ROUNDS` — override the dead-owner-lock contention sweep's
   round count (default 4; the original suite ran 10) for a fuller sweep, e.g.
   `LANE_BROKER_TEST_ROUNDS=10 npm test`.
