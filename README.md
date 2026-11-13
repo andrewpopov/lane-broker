@@ -1447,6 +1447,14 @@ A runner that is powered down on a timetable (a workstation shut down every nigh
   the expected run time, and a runner whose window closes before `now + expected` is skipped with a reason naming the closing
   time. A lane with no usable history is placed normally.
 
+- A ticket still **queued** on a runner when its window closes, or when the runner is marked `"offline": true`, is moved like a
+  drained runner's (BRAIN-1058): the next rebalance tick withdraws it and sends it to an available runner, under the drain move
+  policy below (no minimum-queued wait, cooldown or max-moves count, never back to a runner it left). The schedule is re-read
+  from the config on every tick. The move carries `reason: 'runner-unavailable'` and `drainReason` `outside its schedule` or
+  `marked offline`; the result says `rebalanceReason: "<A> unavailable (<reason>)"`. The ticket's accrued priority wait goes with
+  it. With no available destination it stays queued where it is; `remoteRefusedMaxQueuedMs: 0` still means it is never refused.
+  An unreachable source cannot prove the ticket never started, so it is not moved this way.
+
 Not covered: work already running when a window closes is left to the existing orphan handling (BRAIN-515); nothing requeues it.
 
 ### Pull transport configuration (BRAIN-1036)
