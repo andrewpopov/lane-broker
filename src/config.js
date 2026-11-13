@@ -13,6 +13,7 @@ import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js'
 import { DEFAULT_DEPS_CACHE_MAX_BYTES, DEFAULT_DEPS_CACHE_REGISTRIES, registriesProblem } from './deps-cache.js';
 import { isValidRequiresShape, VERSION_FLOOR_RE } from './runner-readiness.js';
 import { CPU_LIMIT_MODES, MEMORY_LIMIT_MODES, MIN_CPU_GRANT_CORES } from './cpu-limit.js';
+import { readOfflineMarks, applyOfflineMarks } from './runner-offline.js';
 
 /** The largest delay Node's setTimeout honours; above it the timer fires after 1 ms. */
 const MAX_TIMER_MS = 2_147_483_647;
@@ -1075,7 +1076,7 @@ export function loadGlobalConfig() {
     }
   }
   setClassesFence(cfg.classes !== undefined || cfg.classesInvalid !== undefined);
-  return cfg;
+  return applyOfflineMarks(cfg, readOfflineMarks(stateHome()));
 }
 
 const classesFenceFile = () => paths(stateHome()).classesConfigured;

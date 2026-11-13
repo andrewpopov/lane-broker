@@ -31,7 +31,7 @@ import {
 import { parseReadinessArgs } from '../src/runner-readiness.js';
 import { gcCommand } from '../src/gc.js';
 import { loadGlobalConfig } from '../src/config.js';
-import { runnerWatchCommand, runnerStatusCommand } from '../src/runner-watch.js';
+import { runnerWatchCommand, runnerStatusCommand, runnerMarkCommand } from '../src/runner-watch.js';
 import { runnerPrewarmCommand } from '../src/runner-prewarm.js';
 import { reconcileCommand } from '../src/reconcile-sweep.js';
 import { capabilitiesCommand } from '../src/capabilities.js';
@@ -65,6 +65,8 @@ function usage() {
   lane pull check [--json]
   lane runner [status] [--json]
   lane runner watch
+  lane runner offline <name>
+  lane runner online <name>
   lane runner prewarm [--lane <name>] [--runner <name>] [--dry-run]
   lane report phases --repo <a[,b]> --since <iso> --until <iso> [--history <file>] [--json]
   lane report losses --since <iso> --until <iso> [--repo <a[,b]>] [--history <file>] [--json]
@@ -408,6 +410,9 @@ async function main() {
       };
       if (sub === 'prewarm') return (await runnerPrewarmCommand(args)).exitCode;
       if (sub === 'watch') return args.length === 0 ? (await runnerWatchCommand()).exitCode : bad(`unexpected argument "${args[0]}"`);
+      if (sub === 'offline' || sub === 'online') {
+        return args.length === 1 ? (await runnerMarkCommand(sub, args[0])).exitCode : bad(`${sub} takes one runner name`);
+      }
       if (sub === 'status' || sub === '--json') {
         const flags = sub === '--json' ? ['--json', ...args] : args;
         const unknown = flags.find((a) => a !== '--json');

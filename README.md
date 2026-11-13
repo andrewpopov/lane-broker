@@ -57,6 +57,7 @@ lane reconcile [--now] [--json]          # settle ORPHANED-REMOTE attempts from 
 lane pull check [--json]                 # may pull dispatch be enabled against this storage (BRAIN-1036)
 lane runner [status] [--json]            # each runner's state, last-ok age and lost-settle time (BRAIN-597)
 lane runner watch                        # one heartbeat tick (ping every runner, then one reconcile sweep); schedule it every 60 s
+lane runner offline <name>               # mark a configured runner offline (state file, config untouched); `online <name>` clears it (BRAIN-1057)
 lane runner prewarm [--lane <n>] [--runner <n>] [--dry-run]   # warm a runner's per-machine caches with a lane's remoteSetup (BRAIN-649)
 ```
 
@@ -1314,8 +1315,13 @@ waiting on them) forever. Two ways to settle them as lost (exit `75`; a job's ou
 - `runners[].offline: true` in the global config (boolean): the operator says the runner is down. Placement never chooses it
   (`marked offline` in the skipped list), and reconcile and `lane cancel` settle its unresolved attempts at once without contacting
   it: `reason: runner-offline`, plus a history row, through the same publish path as every other reconcile. Remove the flag when
-  the runner is back. A result the runner produces later for a settled attempt is ignored. There is no `lane runner offline`
-  command: the config is hand-edited JSON and the flag is one line.
+  the runner is back. A result the runner produces later for a settled attempt is ignored. `lane runner offline <name>` (BRAIN-1057)
+  sets the same state without editing the config (which may be generated and overwritten): it records the mark in
+  `runner-offline.json` in the state root, and the global config load overlays it, so offline means config flag OR mark for every
+  reader. `lane runner online <name>` removes the mark. Both are idempotent, print one line (new state, changed or not), and
+  refuse a name not in `runners[]` with exit `2` listing the valid ones. `online` exits `1` when the config file itself says
+  `offline: true`, because only editing the config clears that. `lane runner status` shows the source (`config`, or `lane runner
+  offline, since HH:MM`).
 - `runnerLostAfterMs` (global config, integer >= 0, default 7,200,000 = 2 h; 0 disables): a runner continuously unreachable longer
   than this has its unresolved attempts settled with `reason: runner-lost`. The clock starts at the first failed fetch and is kept
   in `runner-unreachable.json` in the state root (each reconcile is its own process); any answer from the runner, `running`
@@ -1337,6 +1343,11 @@ launchd job; it adds no second ledger and builds on the BRAIN-594 clock:
   `runner-unreachable.json` through the same helper (and `runner-unreachable.lock`) reconcile uses: a failed ping starts the
   clock if it is not running, an ok ping clears it. The file also carries `__heartbeat`: when the last tick ran and each runner's
   `lastOkAt`/`lastPingAt`. The per-runner entries keep their BRAIN-594 shape.
+- Backoff (BRAIN-1057): a runner whose unreachable clock is running is pinged only once `now - lastPingAt` reaches
+  `clamp(lastPingAt - since, 1 min, 1 h)`, so the gap roughly doubles (pings at 0, 1, 2, 4, 8, 16, 32, 64 min, then hourly) with no
+  new state; an ok ping clears the clock and resets it. A runner with no clock or no earlier ping is pinged every tick. A skipped
+  runner keeps its `__heartbeat` entry, the tick time still advances (so `down` and placement skipping hold), the clock start never
+  moves (`runnerLostAfterMs` is unchanged), and the sweep still runs every tick. `lane runner status` prints `next check HH:MM`.
 - It then runs the reconcile sweep once (rate-limited by the sweep's own 5-minute marker, so `runnerLostAfterMs` settles within
   about 5 minutes of its deadline even when nobody runs `lane status`).
 - `runnerDownAfterMs` (global config, integer >= 0, default 300,000 = 5 min; 0 disables): placement, rebind and rebalance skip a
