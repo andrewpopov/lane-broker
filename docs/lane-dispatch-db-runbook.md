@@ -20,6 +20,8 @@ ALTER ROLE lane_agent_<host> SET idle_in_transaction_session_timeout = '5s';
 -- the same three statements for each lane_submit_<name>, IN ROLE lane_submit
 ```
 
+A submit login that runs the pull client (`lane_submit_train`, the shared supervisor identity) is created with `CONNECTION LIMIT 24` instead of 3, because every concurrent `lane` supervisor on the host holds its own connection (approved 2026-11-12). The other submit logins keep 3.
+
 Then, as a member of `lane_admin`, register each login; tags, repos and `max_claims` are admin-owned and never runner-asserted:
 
 ```sql
@@ -58,3 +60,16 @@ An agent login holds at most two connections (`CONNECTION LIMIT 3` leaves one sp
 ## Pruning
 
 Each `ld_reap` tick deletes at most 1000 `claim_requests` rows in total. Rows with no ticket (`ticket IS NULL`) older than 10 minutes go first; the remaining budget removes claimed mappings created more than 24 hours ago (which keeps the delete from scanning `tickets`) whose ticket is `finished`, `cancelled`, `withdrawn` or `lost` and whose `finished_at` is more than 24 hours old. A mapping whose ticket is not terminal is never pruned, whatever its age. `tickets`, `attempts` and `log_chunks` are not pruned here.
+
+## Pull client surface and retention
+
+Submit logins (the pull client) also hold `ld_queue_ref()` (the queue's `timeline.incarnation`, which moves after a restore), `ld_enqueue_fenced(expected_ref, ...)` (the `ld_enqueue` arguments after a leading ref; a stale ref returns `{state: 'stale-queue-ref', queue_ref}` and inserts nothing, otherwise it calls `ld_enqueue` unchanged) and `ld_placeable(repo_key, requires_tags)` (the number of agent principals with `max_claims > 0` that are eligible for the tags and repo). `ticket_view` carries `attempt_ref`, `sha256('lane-attempt-ref:' || claim_token)`, NULL while the row holds no token; `claim_token` itself never reaches a submitter. `ld_heartbeat` returns `urls` only when `urls->>'epoch'` equals the row's epoch, so a reclaimed agent sees `urls: null` until the owner attaches URLs for the new epoch.
+
+`ld_cancel` and `ld_cancel_quarantined` store a server-authored result `{kind: 'cancelled', cancelConfirmed, source, epoch}`. `source` is `queued` (confirmed), `quarantine` (owner cancel of a quarantined row, unconfirmed) or `operator` (unconfirmed). A replayed `ld_cancel` reports `confirmed` from the stored `cancelConfirmed`, so it never upgrades an unproven cancel.
+
+Retention is admin-only (`lane_admin` login, run by `lane pull gc`; none of these is granted to agent or submit logins):
+
+- `ld_prune_candidates(objects_after, rows_after, after_finished, after_id, limit)` pages terminal tickets older than `objects_after` in ascending `(finished_at, id)`. The first page passes both cursor arguments NULL; a half-null cursor raises 22023. `limit` is clamped to 1..500. It returns `{items: [{id, finished_at, row_due}], next}`; `next` is the cursor for the following page, or null on a short page.
+- `ld_prune(ids, rows_after)` deletes the log chunks, attempts and ticket rows of the listed ids that are terminal and older than `rows_after` (re-checked inside the call); more than 500 ids raises 22023. It returns the number of ticket rows deleted.
+- `ld_prune_chunks(terminal_after, limit)` deletes `log_chunks` with no ticket row or whose ticket has been terminal longer than `terminal_after` (default 1 hour), at most `limit` per call (default 10000).
+- `ld_blobs_live(refs)` takes a JSON array of at most 500 `{ns, sha256}` and returns the subset referenced by a non-terminal ticket's `snapshot.blobs`. A blob is deleted from object storage only when it is old enough and absent from this set.
