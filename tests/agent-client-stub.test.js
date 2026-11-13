@@ -199,7 +199,7 @@ async function lonelyCallBacksOff(Client) {
   const { client } = newClient(stub, { backoff: { minMs: MIN_BACKOFF_MS, maxMs: 15_000 }, random: () => 1, onCall: (name) => { if (name === 'ld_claim') at.push(Date.now()); } }, Client);
   await client.open();
   client.claim('44444444-4444-4444-8444-444444444444', 8, 1e9).catch(() => {});
-  await new Promise((resolve) => setTimeout(resolve, 700));
+  for (let i = 0; i < 500 && at.length < 3; i++) await new Promise((resolve) => setTimeout(resolve, 10));
   assert.ok(at.length >= 3, `expected several attempts, saw ${at.length}`);
   const gaps = at.slice(1).map((t, i) => t - at[i]);
   assert.ok(gaps.every((gap) => gap >= MIN_BACKOFF_MS - 10), `two attempts ran back to back: gaps ${gaps.join(',')} ms`);
@@ -215,23 +215,36 @@ test(`canary: with the sleep after a yield removed, "${CADENCE}" fails on its ow
   assert.match(failure.message, /back to back/);
 });
 
-test('close() while a call waits to be re-queued rejects it with LdClosedError and sends nothing more', async () => {
+const CLOSE_WAKE = 'close() while a call sleeps before its re-queue rejects it with LdClosedError quickly and sends nothing more';
+const WAKE_ON_CLOSE = 'for (const wake of [...this.#sleepers]) wake();\n';
+
+async function closeWakesTheRequeueSleep(Client) {
   const stub = makeStubPg({ answers: { ld_claim: () => { throw sqlError('57014'); } } });
-  const { client } = newClient(stub, { backoff: { minMs: 5_000, maxMs: 5_000 } });
+  const { client } = newClient(stub, { backoff: { minMs: 500, maxMs: 5_000 }, random: () => 1 }, Client);
   await client.open();
-  const claim = client.claim('44444444-4444-4444-8444-444444444444', 8, 1e9);
-  const settled = assert.rejects(claim, LdClosedError);
-  await untilTrue('the claim failed its turn', () => stub.names().filter((n) => n === 'ld_claim').length >= 1);
+  const settled = client.claim('44444444-4444-4444-8444-444444444444', 8, 1e9).then(() => assert.fail('the claim answered'), (err) => err);
+  await untilTrue('two claim attempts, so the post-yield sleep is in effect', () => stub.names().filter((n) => n === 'ld_claim').length >= 2);
   await new Promise((resolve) => setTimeout(resolve, 20));
   await client.close();
-  await Promise.race([settled, new Promise((_, reject) => setTimeout(reject, 1000, new Error('close() left the call hanging')))]);
+  const outcome = await Promise.race([settled, new Promise((resolve) => setTimeout(resolve, 250, 'hanging'))]);
+  assert.ok(outcome instanceof LdClosedError, `close() left the call ${outcome === 'hanging' ? 'hanging until its backoff ended' : `rejecting with ${outcome}`}`);
   const sent = stub.names().length;
   await new Promise((resolve) => setTimeout(resolve, 50));
   assert.equal(stub.names().length, sent, 'nothing was sent after close');
+}
+
+test(CLOSE_WAKE, () => closeWakesTheRequeueSleep(LdClient));
+
+test(`canary: with the wake-on-close removed, "${CLOSE_WAKE}" fails on its own assertion`, async () => {
+  const mutant = await importMutant(LD_CLIENT, [WAKE_ON_CLOSE, '']);
+  const failure = await closeWakesTheRequeueSleep(mutant.LdClient).then(() => null, (err) => err);
+  assert.ok(failure, 'the scenario still passed without its guard, so it proves nothing');
+  assert.equal(failure.code, 'ERR_ASSERTION', failure.stack);
+  assert.match(failure.message, /hanging until its backoff ended/);
 });
 
 const RACE = 'a connection that dies in the same tick register answers is retried, not a TypeError';
-const CLIENT_NULL_GUARD = "if (!client) throw new Error('Connection ended before the call was sent');";
+const CLIENT_NULL_GUARD = "if (!this.#client) throw new Error('Connection ended before the call was sent');";
 
 async function connectionDiesRightAfterRegister(Client) {
   let registers = 0;
@@ -250,8 +263,38 @@ async function connectionDiesRightAfterRegister(Client) {
 test(RACE, () => connectionDiesRightAfterRegister(LdClient));
 
 test(`canary: with the null-client guard removed, "${RACE}" fails on its own assertion`, async () => {
-  const mutant = await importMutant(LD_CLIENT, [`\n    ${CLIENT_NULL_GUARD}`, '']);
+  const mutant = await importMutant(LD_CLIENT, [`\n        ${CLIENT_NULL_GUARD}`, '']);
   const failure = await connectionDiesRightAfterRegister(mutant.LdClient).then(() => null, (err) => err);
   assert.ok(failure, 'the scenario still passed without its guard, so it proves nothing');
   assert.ok(failure instanceof TypeError, `it must fail on the TypeError the guard prevents: ${failure.stack}`);
+});
+
+const LIVE_RACE = 'a live()-guarded call whose connection dies right after register is not sent once live() turns false';
+const LIVE_CHECK = 'if (!sent && live && !live()) return NOT_LIVE;';
+
+async function liveRechecked(Client) {
+  let registers = 0;
+  let alive = true;
+  let stub;
+  stub = makeStubPg({ answers: { ld_register: () => new Promise((resolve) => setTimeout(() => {
+    resolve({ host: 'a1', max_claims: 2, protocol_min: 1 });
+    if (registers++ === 1) {
+      alive = false;
+      stub.clients.at(-1).emit('error', sqlError('57P01'));
+    }
+  }, 1)) } });
+  const { client } = newClient(stub, {}, Client);
+  await client.open();
+  stub.clients[0].emit('error', new Error('connection lost'));
+  assert.deepEqual(await client.heartbeat(ID, 1, TOKEN, { live: () => alive }), NOT_LIVE);
+  assert.ok(!stub.names().includes('ld_heartbeat'), 'a call whose live() turned false was sent');
+}
+
+test(LIVE_RACE, () => liveRechecked(LdClient));
+
+test(`canary: with live() ignored, "${LIVE_RACE}" fails on its own assertion`, async () => {
+  const mutant = await importMutant(LD_CLIENT, [LIVE_CHECK, 'if (false) return NOT_LIVE;']);
+  const failure = await liveRechecked(mutant.LdClient).then(() => null, (err) => err);
+  assert.ok(failure, 'the scenario still passed without its guard, so it proves nothing');
+  assert.equal(failure.code, 'ERR_ASSERTION', failure.stack);
 });

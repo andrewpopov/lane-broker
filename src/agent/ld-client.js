@@ -49,6 +49,7 @@ export class LdClient {
   }
 
   #sleep(ms) {
+    if (this.#closed) return Promise.resolve();
     return new Promise((resolve) => {
       const done = () => { clearTimeout(timer); this.#sleepers.delete(done); resolve(); };
       const timer = setTimeout(done, ms);
@@ -87,9 +88,7 @@ export class LdClient {
     this.#assertOpen();
     this.onCall?.(name, args);
     const placeholders = args.map((_, i) => `$${i + 1}`).join(', ');
-    const client = this.#client;
-    if (!client) throw new Error('Connection ended before the call was sent');
-    const { rows: [row] } = await client.query(`SELECT lane_dispatch.${name}(${placeholders}) AS v`, args);
+    const { rows: [row] } = await this.#client.query(`SELECT lane_dispatch.${name}(${placeholders}) AS v`, args);
     return row.v;
   }
 
@@ -98,6 +97,7 @@ export class LdClient {
       this.#assertOpen();
       try {
         await this.#connected();
+        if (!this.#client) throw new Error('Connection ended before the call was sent');
         return await call();
       } catch (err) {
         if (this.#closed || !isRetryable(err)) throw err;
