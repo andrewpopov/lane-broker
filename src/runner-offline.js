@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { paths, atomicWriteJson, readJsonSafe, withLock } from './state.js';
 
 // BRAIN-1057: `{ "<runner>": { at, by } }`; written by `lane runner offline|online` so the provisioned config is never edited, overlaid once at config load.
@@ -10,11 +11,17 @@ export function readOfflineMarks(root) {
   return Object.fromEntries(Object.entries(raw).filter(([, mark]) => Number.isFinite(mark?.at)));
 }
 
+export function offlineMarksWarning(root) {
+  const file = paths(root).runnerOffline;
+  const raw = fs.existsSync(file) ? readJsonSafe(file) : {};
+  return raw && typeof raw === 'object' && !Array.isArray(raw) ? null : `lane runner: ${file} is unreadable or not a JSON object; its offline marks are ignored\n`;
+}
+
 export function applyOfflineMarks(cfg, marks) {
   if (!Array.isArray(cfg.runners)) return cfg;
   const runners = cfg.runners.map((runner) => {
     if (runner.offline === true) return { ...runner, offlineSource: 'config' };
-    const mark = marks[runner.name];
+    const mark = Object.hasOwn(marks, runner.name) ? marks[runner.name] : undefined;
     return mark ? { ...runner, offline: true, offlineSource: 'cli', offlineSince: mark.at } : runner;
   });
   return { ...cfg, runners };

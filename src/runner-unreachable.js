@@ -122,10 +122,12 @@ export const recordPings = (root, pings, now) =>
       applyContact(file, name, ok, now);
       runners[name] = { lastOkAt: ok ? now : beat.runners?.[name]?.lastOkAt ?? null, lastPingAt: now };
     }
-    file[HEARTBEAT_KEY] = { at: now, runners };
+    const kept = Object.fromEntries(Object.entries(runners).filter(([name]) => pings.some((p) => p.name === name) || Number.isFinite(file[name])));
+    file[HEARTBEAT_KEY] = { at: now, runners: kept };
   });
 
 export const MIN_PING_INTERVAL_MS = 60_000;
+export const PING_SLACK_MS = 5_000;
 export const MAX_PING_INTERVAL_MS = 3_600_000;
 
 /** The wait before the next ping of a runner whose clock started at `since`: how long it has already been failing, within [MIN, MAX]. */
@@ -142,7 +144,7 @@ export function nextPingAt(unreachable, beat, name) {
 export function runnersDueForPing(root, cfg, now) {
   const beat = readHeartbeat(root);
   const unreachable = readUnreachable(root);
-  return pushRunners(cfg).filter((r) => !r.offline && now >= (nextPingAt(unreachable, beat, r.name) ?? -Infinity));
+  return pushRunners(cfg).filter((r) => !r.offline && now + PING_SLACK_MS >= (nextPingAt(unreachable, beat, r.name) ?? -Infinity));
 }
 
 /** HH:MM in the local zone. */

@@ -2,7 +2,7 @@ import { paths, ensureStateDirs, withLock, LockTimeoutError } from './state.js';
 import { loadGlobalConfigOrError } from './config.js';
 import { runWithDeadline, sshArgv } from './remote-client.js';
 import { sweepOrphans } from './reconcile-sweep.js';
-import { markOffline, clearOffline } from './runner-offline.js';
+import { markOffline, clearOffline, readOfflineMarks, offlineMarksWarning } from './runner-offline.js';
 import { recordPings, runnersDueForPing, collectRunnerStates, renderRunnersLines } from './runner-unreachable.js';
 
 /** BRAIN-597: the runner heartbeat, `lane runner watch`; what it records lives in src/runner-unreachable.js. */
@@ -61,6 +61,7 @@ export async function runnerWatchCommand() {
 /** `lane runner [status] [--json]` */
 export function runnerStatusCommand({ json = false } = {}) {
   const { root } = ensureStateDirs();
+  process.stderr.write(offlineMarksWarning(root) ?? '');
   const { config, error } = loadGlobalConfigOrError();
   if (error) {
     process.stderr.write(`lane runner: global config unreadable: ${error}\n`);
@@ -75,27 +76,30 @@ export function runnerStatusCommand({ json = false } = {}) {
 /** `lane runner offline|online <name>`: the operator mark of src/runner-offline.js; one line says the new state and whether it changed. */
 export async function runnerMarkCommand(target, name) {
   const { root } = ensureStateDirs();
+  process.stderr.write(offlineMarksWarning(root) ?? '');
   const { config, error } = loadGlobalConfigOrError();
   if (error) {
     process.stderr.write(`lane runner: global config unreadable: ${error}\n`);
     return { exitCode: 1 };
   }
   const names = (config.runners ?? []).map((r) => r.name);
-  if (!names.includes(name)) {
+  const hasMark = Object.hasOwn(readOfflineMarks(root), name);
+  if (!names.includes(name) && !(target === 'online' && hasMark)) {
     process.stderr.write(`lane runner ${target}: no runner named "${name}" (configured: ${names.join(', ') || 'none'})\n`);
     return { exitCode: 2 };
   }
   if (target === 'offline') {
     const changed = await markOffline(root, name);
-    say(`runner ${name}: offline (${changed ? 'changed' : 'unchanged, already marked'})`);
+    say(`runner ${name}: offline (${changed ? 'changed' : 'unchanged, already marked'}; ${paths(root).runnerOffline})`);
     return { exitCode: 0 };
   }
   const changed = await clearOffline(root, name);
-  const stillOffline = loadGlobalConfigOrError().config.runners.find((r) => r.name === name)?.offline;
+  const { config: after, error: afterError } = loadGlobalConfigOrError();
+  const stillOffline = !afterError && (after.runners ?? []).find((r) => r.name === name)?.offline;
   if (stillOffline) {
     process.stderr.write(`lane runner online: ${name} is still offline: the global config sets offline: true; edit it (${changed ? 'the lane runner offline mark was cleared' : 'no lane runner offline mark was set'})\n`);
     return { exitCode: 1 };
   }
-  say(`runner ${name}: online (${changed ? 'changed' : 'unchanged, was not marked'})`);
+  say(`runner ${name}: online (${changed ? 'changed' : 'unchanged, was not marked'}; ${paths(root).runnerOffline})`);
   return { exitCode: 0 };
 }
