@@ -44,9 +44,11 @@ for (let i = 0; i < ${iterations}; i++) {
         while (fs.readdirSync(dir).filter((f) => f.startsWith('entered-')).length < 2 && Date.now() < stop) {
           await new Promise((r) => setTimeout(r, 1));
         }
+        // Both inside at once IS the overlap; the marker check above can miss it when both contenders test before either writes.
+        if (fs.readdirSync(dir).filter((f) => f.startsWith('entered-')).length >= 2) overlaps += 1;
       }
       await new Promise((r) => setTimeout(r, 5));
-      fs.unlinkSync(marker);
+      fs.rmSync(marker, { force: true });
     });
   } catch (err) {
     escaped += 1;
