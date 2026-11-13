@@ -12,6 +12,7 @@ export const TEND_CONCURRENCY = 4;
 export const TEND_STEP_BUDGET_MS = 10_000;
 export const TEND_HARD_DEADLINE_MS = 30_000;
 const MIN_TEND_DELAY_MS = 1_000;
+const OUTSTANDING_PER_SLOT = 3;
 const LEDGER_NAMES_PER_PASS = 500;
 const LEDGER_TICKETS_PER_PASS = 50;
 const TICKET_FILE = /^([0-9a-f-]{36})\.json$/;
@@ -29,7 +30,7 @@ export function tendRank(row, run) {
 }
 
 // a result `lane gc` has expired is deliberate: only a decision younger than the result retention is worth rebuilding
-function resultlessLedgerTickets(root, skip, { now, resultRetentionMs, namesPerPass, ticketsPerPass }) {
+function resultlessLedgerTickets(root, { eligible, now, resultRetentionMs, namesPerPass, ticketsPerPass }) {
   let names;
   try {
     names = fs.readdirSync(ledgerDir(root)).sort();
@@ -37,16 +38,15 @@ function resultlessLedgerTickets(root, skip, { now, resultRetentionMs, namesPerP
     return [];
   }
   const start = (ledgerScanOffsets.get(root) ?? 0) % Math.max(names.length, 1);
-  const window = Array.from({ length: Math.min(names.length, namesPerPass) }, (_, i) => names[(start + i) % names.length]);
-  ledgerScanOffsets.set(root, start + window.length);
   const found = [];
-  for (const name of window) {
-    const id = TICKET_FILE.exec(name)?.[1];
-    if (!id || skip.has(id) || fs.existsSync(path.join(paths(root).results, `${id}.json`))) continue;
+  let examined = 0;
+  while (examined < Math.min(names.length, namesPerPass) && found.length < ticketsPerPass) {
+    const id = TICKET_FILE.exec(names[(start + examined++) % names.length])?.[1];
+    if (!id || !eligible(id) || fs.existsSync(path.join(paths(root).results, `${id}.json`))) continue;
     const entry = readLedger(root, id);
     if (entry !== null && now - (entry.acceptedAt ?? 0) < resultRetentionMs) found.push({ id, generation: entry.generation });
-    if (found.length >= ticketsPerPass) break;
   }
+  ledgerScanOffsets.set(root, start + examined);
   return found;
 }
 
@@ -69,27 +69,32 @@ export function createTender({ root, concurrency = TEND_CONCURRENCY, stepBudgetM
   const dueAt = new Map();
   const results = [];
   let free = concurrency;
+  let listing = false;
   let released = () => {};
   let releasedSignal = new Promise((resolve) => { released = resolve; });
 
   async function heldRows() {
-    const none = () => new Map();
+    if (listing) return new Map();
+    listing = true;
+    const listed = base.queue.listMine({ states: ['claimed', 'running'], limit: 500 });
+    listed.then(() => { listing = false; }, () => { listing = false; });
     try {
-      const rows = await withDeadline(base.queue.listMine({ states: ['claimed', 'running'], limit: 500 }), hardDeadlineMs, () => []);
-      return new Map(rows.map((row) => [row.id, row]));
+      return new Map((await withDeadline(listed, hardDeadlineMs, () => [])).map((row) => [row.id, row]));
     } catch {
-      return none();
+      return new Map();
     }
   }
 
-  async function candidates() {
+  async function candidates(skip) {
+    const due = (id) => !inFlight.has(id) && !skip.has(id) && (dueAt.get(id) ?? 0) <= now();
     const attempts = listAttempts(root).filter((a) => a.transport === 'pull' && !supervisorAlive(a));
-    const tickets = [...attempts, ...resultlessLedgerTickets(root, new Set(attempts.map((a) => a.id)), { now: now(), resultRetentionMs, namesPerPass: ledgerNamesPerPass, ticketsPerPass: ledgerTicketsPerPass })];
-    for (const id of dueAt.keys()) if (!tickets.some((t) => t.id === id)) dueAt.delete(id);
+    const ledgered = resultlessLedgerTickets(root, { eligible: (id) => due(id) && !attempts.some((a) => a.id === id), now: now(), resultRetentionMs, namesPerPass: ledgerNamesPerPass, ticketsPerPass: ledgerTicketsPerPass });
+    const tickets = [...attempts, ...ledgered];
+    for (const [id, at] of dueAt) if (at <= now()) dueAt.delete(id);
     const rows = await heldRows();
     const run = { now, cfg: settings };
     return tickets
-      .filter((t) => !inFlight.has(t.id) && (dueAt.get(t.id) ?? 0) <= now())
+      .filter((t) => due(t.id))
       .map((t) => ({ id: t.id, generation: t.generation, rank: tendRank(rows.get(t.id), run) }))
       .sort((a, b) => a.rank - b.rank);
   }
@@ -115,10 +120,11 @@ export function createTender({ root, concurrency = TEND_CONCURRENCY, stepBudgetM
     results,
     nextRelease: () => releasedSignal,
     delayMs: () => dueDelayMs([...dueAt.values()], now(), settings.pollMs),
-    async round() {
+    async round(skip = new Set()) {
       const launched = [];
-      for (const item of await candidates()) {
-        if (free === 0) break;
+      const room = Math.min(free, concurrency * OUTSTANDING_PER_SLOT - inFlight.size);
+      for (const item of await candidates(skip)) {
+        if (launched.length >= room) break;
         free--;
         launched.push(launch(item));
       }
@@ -130,7 +136,11 @@ export function createTender({ root, concurrency = TEND_CONCURRENCY, stepBudgetM
 /** One pass: every due ticket stepped once, `concurrency` at a time, by rank. A failure of one ticket is reported on its entry and never stops the others. */
 export async function tendOnce(deps) {
   const tender = createTender(deps);
-  for (let launched = await tender.round(); launched.length > 0; launched = await tender.round()) await Promise.all(launched);
+  const stepped = new Set();
+  for (let launched = await tender.round(stepped); launched.length > 0; launched = await tender.round(stepped)) {
+    await Promise.all(launched);
+    for (const r of tender.results) stepped.add(r.id);
+  }
   return tender.results;
 }
 

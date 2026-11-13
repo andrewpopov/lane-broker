@@ -211,3 +211,12 @@ export async function waitCommand(id, { timeoutMs, pullContext } = {}) {
     process.off('SIGTERM', forwardCancel);
   }
 }
+
+const flushed = (stream) => new Promise((resolve) => stream.write('', resolve));
+
+// a pull step that lost the race against --timeout may still be inside a network call: end the process here, not when the event loop drains
+export async function waitAndExit(id, options) {
+  const { exitCode } = await waitCommand(id, options);
+  await Promise.all([flushed(process.stdout), flushed(process.stderr)]);
+  process.exit(exitCode);
+}

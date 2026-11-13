@@ -15,7 +15,7 @@ ExecStart=/usr/bin/node /opt/lane-broker/bin/lane.js pull tend --serve
 Restart=always
 RestartSec=5
 Nice=10
-InaccessiblePaths=/etc/lane-pull/gc-admin.pass
+InaccessiblePaths=-/etc/lane-pull/gc-admin.pass
 NoNewPrivileges=true
 PrivateTmp=true
 

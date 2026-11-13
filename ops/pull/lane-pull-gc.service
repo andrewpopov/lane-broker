@@ -14,6 +14,6 @@ ExecStart=/usr/bin/node /opt/lane-broker/bin/lane.js pull gc --queue-url postgre
 TimeoutStartSec=15min
 Nice=10
 LoadCredential=gc-admin.pass:/etc/lane-pull/gc-admin.pass
-InaccessiblePaths=/etc/lane-pull/submit.pass
+InaccessiblePaths=-/etc/lane-pull/submit.pass
 NoNewPrivileges=true
 PrivateTmp=true

@@ -7,7 +7,7 @@ import { suggestCommand } from '../src/suggest.js';
 import { estimatesCommand } from '../src/estimates-history.js';
 import { cancelCommand } from '../src/cancel.js';
 import { priorityCommand } from '../src/retier.js';
-import { waitCommand } from '../src/wait.js';
+import { waitAndExit } from '../src/wait.js';
 import { pauseCommand, resumeCommand, drainCommand, drainShutdownCommand, undrainCommand } from '../src/pause.js';
 import { migrateSchedulerCommand } from '../src/migrate.js';
 import { parseByteSize } from '../src/resources.js';
@@ -311,8 +311,7 @@ async function main() {
       }
       const timeoutFlagIdx = rest.indexOf('--timeout');
       const timeoutMs = timeoutFlagIdx !== -1 ? parseDurationMs(rest[timeoutFlagIdx + 1]) : undefined;
-      const result = await waitCommand(id, { timeoutMs });
-      return result.exitCode;
+      return waitAndExit(id, { timeoutMs });
     }
     case 'pause': {
       const reason = rest.join(' ');

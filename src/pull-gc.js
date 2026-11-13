@@ -3,12 +3,12 @@ import path from 'node:path';
 import { readAttempt } from './attempts.js';
 import { DEFAULT_GLOBAL_CONFIG, LEDGER_RETENTION_FLOOR_MS, loadGlobalConfigOrError } from './config.js';
 import { ledgerDir, ledgerFile, readLedger } from './pull-ledger.js';
-import { pullTicketDir } from './pull-envelope.js';
+import { pullTicketDir, withTicketLock } from './pull-envelope.js';
 import { createQueueClient } from './queue-client.js';
 import { blobKey } from './pull-snapshot.js';
 import { parseDuration } from './run.js';
 import { createS3Client } from './s3-client.js';
-import { atomicWriteJson, ensureDurableDir, ensureStateDirs, fsyncDirectory, paths, readJsonSafe } from './state.js';
+import { atomicWriteJson, ensureDurableDir, ensureStateDirs, fsyncDirectory, LockTimeoutError, paths, readJsonSafe } from './state.js';
 
 const HOUR_MS = 3_600_000;
 export const OBJECTS_AFTER_MS = 24 * HOUR_MS;
@@ -84,6 +84,7 @@ async function cleanPage(ctx, items, state, summary) {
 const overBudget = (ctx) => ctx.now() - ctx.startedAt >= ctx.budgetMs;
 
 async function sweepTickets(ctx, state, summary) {
+  ctx.prefixClean = state.resume === null;
   let after = state.resume ?? state.rowsFrom;
   let frontierOpen = state.resume === null;
   for (;;) {
@@ -151,7 +152,7 @@ export async function gcOnce({ root, queue, s3, cfg, rowsAfterMs, now = Date.now
   const settings = { ...DEFAULT_GLOBAL_CONFIG.lanePull, ...cfg, rustfs: { ...DEFAULT_GLOBAL_CONFIG.lanePull.rustfs, ...cfg?.rustfs } };
   const ctx = { root, queue, s3, settings, now, budgetMs, pageLimit, hooks, startedAt: now(), prefixClean: true, rowsAfterMs: rowsAfterFor(settings, rowsAfterMs) };
   const summary = { ledgersExpired: 0, pages: 0, objectsDeleted: 0, rowsPruned: 0, chunksPruned: 0, blobsDeleted: 0, budgetCut: false, failures: [] };
-  summary.ledgersExpired = sweepLocal(root, ledgerRetentionFor(settings), ctx.startedAt);
+  summary.ledgersExpired = await sweepLocal(root, ledgerRetentionFor(settings), ctx.startedAt);
   await sweepTickets(ctx, readGcState(root), summary);
   summary.chunksPruned = await queue.pruneChunks({ terminalAfterMs: CHUNKS_TERMINAL_AFTER_MS, limit: CHUNKS_PER_RUN });
   if (settings.blobGc) await sweepBlobs(ctx, summary);
@@ -164,33 +165,61 @@ export function ledgerRetentionFor(settings) {
 }
 
 const TICKET_JSON = /^([0-9a-f-]{36})\.json$/;
-const ageOf = (file, now) => now - fs.statSync(file).mtimeMs;
+const TICKET_DIR = /^[0-9a-f-]{36}$/;
+const LOCK_FILE = 'recover.lock';
+const LOCAL_LOCK_TIMEOUT_MS = 200;
 
-// the ledger entry goes last: a crash between the two leaves an entry the next run finishes
-function expireTicket(root, id) {
-  fs.rmSync(pullTicketDir(root, id), { recursive: true, force: true });
-  fs.rmSync(ledgerFile(root, id), { force: true });
-  fsyncDirectory(ledgerDir(root));
+function newestFileMtime(dir) {
+  let newest = null;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.name !== LOCK_FILE)) {
+    const full = path.join(dir, entry.name);
+    const mtime = entry.isDirectory() ? newestFileMtime(full) : fs.statSync(full).mtimeMs;
+    if (mtime !== null) newest = Math.max(newest ?? 0, mtime);
+  }
+  return newest;
+}
+
+const dirWrittenAt = (dir) => newestFileMtime(dir) ?? fs.statSync(dir).mtimeMs;
+
+// the ledger entry goes last: a crash between the two leaves an entry the next run finishes; a ticket another process holds is skipped
+async function expireTicket(root, id, due) {
+  const dir = pullTicketDir(root, id);
+  let expired = false;
+  try {
+    expired = await withTicketLock(root, id, () => {
+      if (readAttempt(root, id) || !due()) return false;
+      for (const name of fs.readdirSync(dir).filter((n) => n !== LOCK_FILE)) fs.rmSync(path.join(dir, name), { recursive: true, force: true });
+      if (fs.existsSync(ledgerFile(root, id))) {
+        fs.rmSync(ledgerFile(root, id), { force: true });
+        fsyncDirectory(ledgerDir(root));
+      }
+      return true;
+    }, { lockTimeoutMs: LOCAL_LOCK_TIMEOUT_MS });
+  } catch (err) {
+    if (!(err instanceof LockTimeoutError)) throw err;
+  }
+  if (expired) fs.rmSync(dir, { recursive: true, force: true });
+  return expired;
 }
 
 /** Expires the local record of tickets accepted more than `retentionMs` ago (ledger entry, envelope, cursor, staged copies), and ticket directories nothing owns. */
-export function sweepLocal(root, retentionMs, now) {
+export async function sweepLocal(root, retentionMs, now) {
   let expired = 0;
   const owned = new Set();
   for (const name of fs.existsSync(ledgerDir(root)) ? fs.readdirSync(ledgerDir(root)) : []) {
     const id = TICKET_JSON.exec(name)?.[1];
     if (!id) continue;
     owned.add(id);
-    const entry = readLedger(root, id);
-    if (readAttempt(root, id) || now - (entry.acceptedAt ?? now) < retentionMs) continue;
-    expireTicket(root, id);
-    expired++;
+    const ledgerDue = () => now - (readLedger(root, id)?.acceptedAt ?? now) >= retentionMs;
+    if (ledgerDue() && (await expireTicket(root, id, ledgerDue))) expired++;
   }
   const pullDir = paths(root).pull;
   for (const name of fs.existsSync(pullDir) ? fs.readdirSync(pullDir) : []) {
-    if (!/^[0-9a-f-]{36}$/.test(name) || owned.has(name) || readAttempt(root, name) || ageOf(path.join(pullDir, name), now) < retentionMs) continue;
-    fs.rmSync(path.join(pullDir, name), { recursive: true, force: true });
-    expired++;
+    if (!TICKET_DIR.test(name) || owned.has(name)) continue;
+    const dir = path.join(pullDir, name);
+    const seenAt = dirWrittenAt(dir);
+    const dirDue = () => readLedger(root, name) === null && now - seenAt >= retentionMs;
+    if (dirDue() && (await expireTicket(root, name, dirDue))) expired++;
   }
   return expired;
 }

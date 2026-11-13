@@ -168,6 +168,57 @@ const SCENARIOS = {
     assert.deepEqual([10, 11, 12, 13, 14].map((n) => fs.existsSync(path.join(paths(fx.state).results, `${tid(n)}.json`))), [true, true, true, true, true]);
   },
 
+  'outstanding steps are capped at a small multiple of the slots: abandoned steps and an abandoned listing are not piled up round after round': async (load, w, t) => {
+    const { createTender } = await load('pull-tend.js');
+    const first = await pullFixture(t, w, { load, id: tid(1) });
+    await first.enqueue();
+    await first.killSupervisor();
+    for (const n of [2, 3, 4]) {
+      const more = await pullFixture(t, w, { load, id: tid(n), stub: first.stub, state: first.state });
+      await more.enqueue();
+      await more.killSupervisor();
+    }
+    const counts = { gets: 0, lists: 0 };
+    const slowly = (name, fn) => async (...args) => { counts[name]++; await sleep(2500); return fn(...args); };
+    const queue = { ...first.queue, get: slowly('gets', (id) => first.queue.get(id)), listMine: slowly('lists', (opts) => first.queue.listMine(opts)) };
+    const tender = createTender({ ...first.ctx({ queue }), concurrency: 1, hardDeadlineMs: 150 });
+    for (let round = 0; round < 6; round++) await Promise.all(await tender.round());
+    assert.equal(counts.gets, 3, 'one slot, three outstanding: the fourth ticket waits for an abandoned step to finish');
+    assert.equal(counts.lists, 1, 'one abandoned listing, never another on top of it');
+    await sleep(3000);
+  },
+
+  'the ledger scan counts only tickets it could step: an entry already stepped does not take the place of a fresh one': async (load, w, t) => {
+    const { createTender } = await load('pull-tend.js');
+    const fx = await pullFixture(t, w, { load });
+    const accept = (n) => ledgerAccept(fx.state, { logicalId: tid(n), decision: { kind: 'lost', exit: 75, reason: 'x' }, epoch: null, generation: 0 });
+    const failing = fx.ctx({ writeResult: () => { throw new Error('disk full'); } });
+    accept(11);
+    const tender = createTender({ ...failing, ledgerTicketsPerPass: 1 });
+    await Promise.all(await tender.round());
+    assert.deepEqual(tender.results.map((r) => r.id), [tid(11)]);
+    accept(10);
+    await Promise.all(await tender.round());
+    assert.deepEqual(tender.results.map((r) => r.id), [tid(11), tid(10)], 'the very next round steps the new entry, not the one still waiting out its error');
+  },
+
+  'tendOnce steps each ticket once per invocation even when the clock says every ticket is due again': async (load, w, t) => {
+    const { tendOnce } = await load('pull-tend.js');
+    const fx = await pullFixture(t, w, { load });
+    await fx.enqueue();
+    await fx.killSupervisor();
+    let gets = 0;
+    let calls = 0;
+    let at = Date.now();
+    const now = () => {
+      if (++calls > 2000) throw new Error('too many rounds');
+      return (at += 600_000);
+    };
+    const queue = { ...fx.queue, get: (id) => { gets++; return fx.queue.get(id); } };
+    const results = await tendOnce({ ...fx.ctx({ queue, now }) });
+    assert.deepEqual([results.length, gets], [1, 1]);
+  },
+
   'the serve loop keeps passing: a ticket that becomes orphaned after the first pass is tended without a restart': async (load, w, t) => {
     const { tendServe } = await load('pull-tend.js');
     const fx = await pullFixture(t, w, { load, cfg: { pollMs: 1200 } });
@@ -191,10 +242,14 @@ const CANARIES = [
   ['a cancel recorded before the process died is sent by the tender, and so is a cancel marker with no supervisor left', 'pull-ticket.js', ['(pull?.cancel?.requestedAt !== undefined && pull.cancel.answer === undefined) || ', '']],
   ['a cancel recorded before the process died is sent by the tender, and so is a cancel marker with no supervisor left', 'pull-ticket.js', [' || isCancelled(run.root, run.id);', ';']],
   ['the tender rebuilds only ledger decisions younger than the result retention, and a bounded batch per pass', 'pull-tend.js', ['now - (entry.acceptedAt ?? 0) < resultRetentionMs', 'true']],
-  ['the tender rebuilds only ledger decisions younger than the result retention, and a bounded batch per pass', 'pull-tend.js', ['if (found.length >= ticketsPerPass) break;', '']],
-  ['the ledger scan window rotates, so a bounded window never starves later entries', 'pull-tend.js', ['  ledgerScanOffsets.set(root, start + window.length);\n', '']],
+  ['the tender rebuilds only ledger decisions younger than the result retention, and a bounded batch per pass', 'pull-tend.js', ['while (examined < Math.min(names.length, namesPerPass) && found.length < ticketsPerPass) {', 'while (examined < Math.min(names.length, namesPerPass)) {']],
+  ['the ledger scan window rotates, so a bounded window never starves later entries', 'pull-tend.js', ['  ledgerScanOffsets.set(root, start + examined);\n', '']],
   ['a claimed ticket without URLs is stepped before a settling one, whatever order the attempts are listed in', 'pull-tend.js', ['.sort((a, b) => a.rank - b.rank)', '.sort((a, b) => b.rank - a.rank)']],
-  ['T37b: a ledger entry with neither an attempt nor a result is rebuilt by one tender pass, once', 'pull-tend.js', [', ...resultlessLedgerTickets(root, new Set(attempts.map((a) => a.id)), { now: now(), resultRetentionMs, namesPerPass: ledgerNamesPerPass, ticketsPerPass: ledgerTicketsPerPass })]', ']']],
+  ['T37b: a ledger entry with neither an attempt nor a result is rebuilt by one tender pass, once', 'pull-tend.js', ['const tickets = [...attempts, ...ledgered];', 'const tickets = [...attempts];']],
+  ['outstanding steps are capped at a small multiple of the slots: abandoned steps and an abandoned listing are not piled up round after round', 'pull-tend.js', ['Math.min(free, concurrency * OUTSTANDING_PER_SLOT - inFlight.size)', 'free']],
+  ['outstanding steps are capped at a small multiple of the slots: abandoned steps and an abandoned listing are not piled up round after round', 'pull-tend.js', ['    if (listing) return new Map();\n', '']],
+  ['the ledger scan counts only tickets it could step: an entry already stepped does not take the place of a fresh one', 'pull-tend.js', ['eligible: (id) => due(id) && !attempts.some((a) => a.id === id),', 'eligible: () => true,']],
+  ['tendOnce steps each ticket once per invocation even when the clock says every ticket is due again', 'pull-tend.js', ['    for (const r of tender.results) stepped.add(r.id);\n', ''], /too many rounds/],
   ['the serve loop keeps passing: a ticket that becomes orphaned after the first pass is tended without a restart', 'pull-tend.js', ['while (!signal?.aborted) {', 'if (!signal?.aborted) {']],
 ];
 

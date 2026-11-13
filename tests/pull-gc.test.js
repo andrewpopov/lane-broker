@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { createAttempt } from '../src/attempts.js';
-import { pullTicketDir } from '../src/pull-envelope.js';
+import { pullTicketDir, withTicketLock } from '../src/pull-envelope.js';
 import { ledgerAccept, readLedger } from '../src/pull-ledger.js';
 import { createS3Client, S3Error } from '../src/s3-client.js';
 import { ensureStateDirs, readJsonSafe } from '../src/state.js';
@@ -253,6 +253,55 @@ const SCENARIOS = {
     await assert.rejects(low.run(), /below the .*queue backup retention/);
   },
 
+  'a budget-cut run that resumed past a failed ticket never advances objectsDone past it: the retry still cleans its objects before its row goes': async (load, w, t) => {
+    const fx = await gcFixture(t, w, load, { cfg: { blobGc: false } });
+    const ids = [];
+    for (let n = 1; n <= 4; n++) ids.push(await fx.terminal(n, (12 - n) * DAY));
+    ids.forEach((id) => fx.putTicketObjects(id));
+    const failing = { ...fx.s3, deleteObject: async (bucket, key) => { if (key.startsWith(`${ids[0]}/`)) throw new S3Error('denied', { status: 403 }); return fx.s3.deleteObject(bucket, key); } };
+    const first = await fx.run({ pageLimit: 1, budgetMs: 100_000, now: ticking(120_000), s3: failing });
+    assert.deepEqual([first.budgetCut, first.failures.map((f) => f.id)], [true, [ids[0]]]);
+    await fx.run({ pageLimit: 1, budgetMs: 300_000, now: ticking(1000) });
+    assert.equal(fx.state_().objectsDone, null, 'the resumed scan skipped the failed ticket and must not claim the prefix clean');
+    await fx.run({ pageLimit: 1, budgetMs: 300_000, now: ticking(1000) });
+    assert.equal(objectsOf(fx, ids[0]).length, 0, 'the third run cleaned the objects before pruning the row');
+    assert.deepEqual(await fx.rows(), []);
+  },
+
+  'local retention skips a ticket another process holds, and ages an unowned directory by its newest file, not by its own mtime': async (load, w, t) => {
+    const fx = await gcFixture(t, w, load, { cfg: { blobGc: false } });
+    const day = 24 * 3_600_000;
+    ledgerAccept(fx.state, { logicalId: tid(1), decision: { kind: 'lost', exit: 75, reason: 'x' }, epoch: null, generation: 0, acceptedAt: Date.now() - 50 * day });
+    let release;
+    let held;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const holding = new Promise((resolve) => { held = resolve; });
+    const holder = withTicketLock(fx.state, tid(1), async () => { held(); await gate; }, { lockTimeoutMs: 2000 });
+    await holding;
+    let during;
+    try {
+      during = await fx.run();
+    } finally {
+      release();
+      await holder;
+    }
+    assert.equal(during.ledgersExpired, 0);
+    assert.notEqual(readLedger(fx.state, tid(1)), null, 'a ticket under another process\'s lock is left alone');
+    assert.equal((await fx.run()).ledgersExpired, 1);
+
+    const old = new Date(Date.now() - 50 * day);
+    const fresh = pullTicketDir(fx.state, tid(2));
+    fs.mkdirSync(fresh, { recursive: true });
+    fs.writeFileSync(path.join(fresh, 'cursor.json'), '{}');
+    fs.utimesSync(fresh, old, old);
+    const stale = pullTicketDir(fx.state, tid(3));
+    fs.mkdirSync(stale, { recursive: true });
+    fs.writeFileSync(path.join(stale, 'cursor.json'), '{}');
+    fs.utimesSync(path.join(stale, 'cursor.json'), old, old);
+    assert.equal((await fx.run()).ledgersExpired, 1);
+    assert.deepEqual([fs.existsSync(fresh), fs.existsSync(stale)], [true, false], 'a directory with a recently written file is live whatever its own mtime says');
+  },
+
   'a published result drops its staged log and artifact copies, and a crash before the drop is finished by the next step': async (load, w, t) => {
     const fx = await pullFixture(t, w, { load });
     await fx.hold();
@@ -299,10 +348,13 @@ const CANARIES = [
   ['a failed delete on one page never lets a later clean page advance objectsDone past it: its objects are cleaned before its row goes', 'pull-gc.js', ['  const cleaned = new Set();\n  for (const item of items) {', '  const cleaned = new Set();\n  ctx.prefixClean = true;\n  for (const item of items) {']],
   ['the blob sweep stops at the run budget like the ticket sweep', 'pull-gc.js', ['      if (overBudget(ctx)) {\n        summary.budgetCut = true;\n        return;\n      }\n      await ctx.hooks.beforeBlobDelete', '      await ctx.hooks.beforeBlobDelete']],
   ['T35d: a run stops when its budget is spent after k pages, and the next run continues from the persisted cursors without re-cleaning them', 'pull-gc.js', ['state.resume = cut ? page.next : null;', 'state.resume = null;']],
-  ['local retention: a ticket accepted longer ago than ledgerRetentionMs loses its ledger entry and pull directory, unless an attempt exists; a younger one and the floor are respected', 'pull-gc.js', ['if (readAttempt(root, id) || now - (entry.acceptedAt ?? now) < retentionMs) continue;', 'if (readAttempt(root, id)) continue;']],
-  ['local retention: a ticket accepted longer ago than ledgerRetentionMs loses its ledger entry and pull directory, unless an attempt exists; a younger one and the floor are respected', 'pull-gc.js', ['if (readAttempt(root, id) || now - (entry.acceptedAt ?? now) < retentionMs) continue;', 'if (now - (entry.acceptedAt ?? now) < retentionMs) continue;']],
-  ['local retention: a ticket accepted longer ago than ledgerRetentionMs loses its ledger entry and pull directory, unless an attempt exists; a younger one and the floor are respected', 'pull-gc.js', [' || ageOf(path.join(pullDir, name), now) < retentionMs', '']],
   ['local retention: a ticket accepted longer ago than ledgerRetentionMs loses its ledger entry and pull directory, unless an attempt exists; a younger one and the floor are respected', 'pull-gc.js', ['if (settings.ledgerRetentionMs < LEDGER_RETENTION_FLOOR_MS) throw', 'if (false) throw']],
+  ['local retention: a ticket accepted longer ago than ledgerRetentionMs loses its ledger entry and pull directory, unless an attempt exists; a younger one and the floor are respected', 'pull-gc.js', ['const ledgerDue = () => now - (readLedger(root, id)?.acceptedAt ?? now) >= retentionMs;', 'const ledgerDue = () => true;']],
+  ['local retention: a ticket accepted longer ago than ledgerRetentionMs loses its ledger entry and pull directory, unless an attempt exists; a younger one and the floor are respected', 'pull-gc.js', ['if (readAttempt(root, id) || !due()) return false;', 'if (!due()) return false;']],
+  ['local retention: a ticket accepted longer ago than ledgerRetentionMs loses its ledger entry and pull directory, unless an attempt exists; a younger one and the floor are respected', 'pull-gc.js', ['now - seenAt >= retentionMs', 'true']],
+  ['a budget-cut run that resumed past a failed ticket never advances objectsDone past it: the retry still cleans its objects before its row goes', 'pull-gc.js', ['ctx.prefixClean = state.resume === null;', 'ctx.prefixClean = true;']],
+  ['local retention skips a ticket another process holds, and ages an unowned directory by its newest file, not by its own mtime', 'pull-gc.js', ["import { pullTicketDir, withTicketLock } from './pull-envelope.js';", "import { pullTicketDir } from './pull-envelope.js';\nconst withTicketLock = async (root, id, fn) => fn();"]],
+  ['local retention skips a ticket another process holds, and ages an unowned directory by its newest file, not by its own mtime', 'pull-gc.js', ['const dirWrittenAt = (dir) => newestFileMtime(dir) ?? fs.statSync(dir).mtimeMs;', 'const dirWrittenAt = (dir) => fs.statSync(dir).mtimeMs;']],
   ['a published result drops its staged log and artifact copies, and a crash before the drop is finished by the next step', 'pull-ticket.js', ['  dropStaged(run);\n  return settled;', '  return settled;']],
   ['a published result drops its staged log and artifact copies, and a crash before the drop is finished by the next step', 'pull-ticket.js', ['    dropStaged(run);\n    return { state: \'settled\', already: true', '    return { state: \'settled\', already: true']],
   ['rows_after derives from lanePull.rowRetentionMs and a smaller value is refused', 'pull-gc.js', ['return requestedMs ?? settings.rowRetentionMs;', 'return requestedMs ?? 7 * 24 * HOUR_MS;']],
