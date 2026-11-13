@@ -1,4 +1,4 @@
-import { LdClient } from '../src/agent/ld-client.js';
+import { LdClient as RealLdClient } from '../src/agent/ld-client.js';
 import { randomUUID } from 'node:crypto';
 import { logins, call, enqueue, tid } from './lane-dispatch-fixture.js';
 
@@ -14,7 +14,7 @@ export const closeAgents = async () => {
 // statement_timeout=0 lets a blocked call outlive the role's 2 s default, so only the guard ends it.
 export const agentPg = (w, login = logins.a1) => ({ ...w.cluster.conn(w.db, login), options: '-c statement_timeout=0' });
 
-export async function openAgent(w, { login = logins.a1, snapshot = () => [], open = true, ...rest } = {}) {
+export async function openAgent(w, { login = logins.a1, snapshot = () => [], open = true, LdClient = RealLdClient, ...rest } = {}) {
   const calls = [];
   const events = [];
   const client = new LdClient({

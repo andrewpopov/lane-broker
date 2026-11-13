@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import {
-  atomicWriteJson, ensureDurableDir, executionIdOf, fsyncDirectory, isExecutionId, isUuid, kernelBootId, processStartTime, readJsonSafe, stateHome, withLock,
+  atomicWriteJson, ensureDurableDir, executionIdOf, fsyncDirectory, isExecutionId, isUuid, kernelBootId, processStartTime, readJsonSafe, withLock,
 } from '../state.js';
 import { isProcessAlive } from '../process-liveness.js';
 
@@ -16,7 +16,7 @@ const OUTBOX_KINDS = ['finish', 'release'];
 export function agentPaths(remoteRoot) {
   const root = path.join(path.resolve(remoteRoot), 'agent');
   return {
-    root, owner: path.join(root, 'owner.json'), status: path.join(root, 'status.json'), pendingClaim: path.join(root, 'pending-claim.json'),
+    root, ownerLock: path.join(root, 'owner.lock'), owner: path.join(root, 'owner.json'), status: path.join(root, 'status.json'), pendingClaim: path.join(root, 'pending-claim.json'),
     executions: path.join(root, 'executions'), out: path.join(root, 'out'), spool: path.join(root, 'spool'),
   };
 }
@@ -41,9 +41,14 @@ export function readOwner(remoteRoot) {
   return { owner, live: ownerIsLive(owner) };
 }
 
+export function withOwnerLock(remoteRoot, fn) {
+  const { root, ownerLock } = agentPaths(remoteRoot);
+  return withLock(root, fn, { lockPath: ownerLock, group: 'agent' });
+}
+
 export async function claimOwner(remoteRoot, { pid = process.pid } = {}) {
   const p = agentPaths(remoteRoot);
-  await withLock(stateHome(), async () => {
+  await withOwnerLock(remoteRoot, async () => {
     const { owner, live } = readOwner(remoteRoot);
     if (live && owner.pid !== pid) throw new AgentOwnedError(`another lane agent (pid ${owner.pid}) owns ${p.root}`);
     atomicWriteJson(p.owner, { pid, start: processStartTime(pid) ?? null, kernelBootId: kernelBootId() }, { fsync: true });
@@ -88,9 +93,8 @@ export function reassertVerdict(record, answer) {
   const anomaly = answer.result === 'ok' && phase === 'running' && answer.state === 'claimed';
   if (answer.result === 'ok' && !anomaly) return { next: 'resume', anomaly };
   if (answer.result !== 'fenced' && answer.result !== 'unknown' && !anomaly) throw new AgentStoreError(`ld_reassert answered ${JSON.stringify(answer)}`);
-  if (PRE_START.has(record.subphase)) return { next: 'done', anomaly, tombstone: record.subphase === 'STARTING' };
-  if (RUNNING.has(record.subphase)) return { next: 'killing', anomaly };
-  return { next: 'done', anomaly };
+  if (phase === 'running') return { next: 'killing', anomaly };
+  return { next: 'done', anomaly, tombstone: record.subphase === 'STARTING' };
 }
 
 export class ExecutionTable {
@@ -115,17 +119,19 @@ export class ExecutionTable {
   }
 
   get(execId) {
-    return this.#records.get(execId);
+    const record = this.#records.get(execId);
+    return record && structuredClone(record);
   }
 
   all() {
-    return [...this.#records.values()];
+    return [...this.#records.values()].map((r) => structuredClone(r));
   }
 
   put(record) {
     assertRecord(record, `record ${record?.execId}`);
-    atomicWriteJson(this.#file(record.execId), record, { fsync: true });
-    this.#records.set(record.execId, record);
+    const copy = structuredClone(record);
+    atomicWriteJson(this.#file(copy.execId), copy, { fsync: true });
+    this.#records.set(copy.execId, copy);
   }
 
   remove(execId) {

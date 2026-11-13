@@ -5,7 +5,7 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { makeTmpDir } from './helpers/tmp.js';
 import { AgentOwnedError, agentPaths, claimOwner, ensureAgentDirs, readAgentStatus, readOwner, writeStatus } from '../src/agent/store.js';
-import { processStartTime } from '../src/state.js';
+import { processStartTime, withLock } from '../src/state.js';
 
 let remoteRoot;
 let savedEnv;
@@ -62,6 +62,29 @@ test('T25 an owner recorded under another kernel boot is dead even if its pid is
   process.env.LANE_BROKER_KERNEL_BOOT_ID = 'boot-2';
   assert.equal(readOwner(remoteRoot).live, false);
   await claimOwner(remoteRoot);
+  assert.equal(readOwner(remoteRoot).owner.pid, process.pid);
+});
+
+test('T25 two state homes over one remote root serialise on the remote root: a claim waits for the lock held there, and a second home refuses a live owner', async () => {
+  const child = await liveForeignOwner();
+  process.env.LANE_BROKER_STATE = path.join(path.dirname(remoteRoot), 'other-state');
+  await assert.rejects(claimOwner(remoteRoot), AgentOwnedError, 'a different state home still sees the owner');
+  child.kill('SIGKILL');
+  await new Promise((resolve) => child.once('exit', resolve));
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  let locked;
+  const holding = new Promise((resolve) => { locked = resolve; });
+  const { root, ownerLock } = agentPaths(remoteRoot);
+  const holder = withLock(root, async () => { locked(); await held; }, { lockPath: ownerLock, group: 'agent' });
+  await holding;
+  let claimed = false;
+  const claim = claimOwner(remoteRoot).then(() => { claimed = true; });
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  assert.equal(claimed, false, 'the claim waits on the lock under the remote root');
+  release();
+  await holder;
+  await claim;
   assert.equal(readOwner(remoteRoot).owner.pid, process.pid);
 });
 

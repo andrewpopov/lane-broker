@@ -67,8 +67,8 @@ export function loadAgentConfig({ file = path.join(AGENT_CONFIG_DIR, 'config.jso
 
   const target = parseQueueUrl(cfg.laneQueueUrl);
   const dir = path.dirname(file);
-  const password = readPrivateFile(cfg.passwordFile ?? path.join(dir, 'password'), uid).trim();
-  const ca = readPrivateFile(cfg.caFile ?? path.join(dir, 'ca.pem'), uid);
+  const password = readPrivateFile(path.resolve(dir, cfg.passwordFile ?? 'password'), uid).trim();
+  const ca = readPrivateFile(path.resolve(dir, cfg.caFile ?? 'ca.pem'), uid);
   if (cfg.schedule !== undefined) {
     const problem = scheduleProblem(cfg.schedule);
     if (problem) throw new AgentConfigError(`${file}: ${problem}`);

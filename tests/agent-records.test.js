@@ -32,12 +32,12 @@ test('the phase a record is reasserted in follows the phase map: a release outbo
   assert.deepEqual(Object.keys(PHASES).concat('OUTBOX').sort(), [...SUBPHASES].sort(), 'the phase map covers every subphase');
 });
 
-test('reassertVerdict: ok resumes, fenced or unknown ends a pre-start record and kills a running one', () => {
+test('reassertVerdict: ok resumes, fenced or unknown ends a pre-start record and kills a running-phase one, an outbox finish included', () => {
   for (const result of ['fenced', 'unknown']) {
     for (const subphase of ['AWAIT_URLS', 'FETCHING', 'VERIFIED']) assert.deepEqual(reassertVerdict(at(subphase), { id: ID, result }), { next: 'done', anomaly: false, tombstone: false }, subphase);
     assert.deepEqual(reassertVerdict(at('STARTING'), { id: ID, result }), { next: 'done', anomaly: false, tombstone: true }, 'STARTING also tombstones the execution id');
     for (const subphase of ['SPAWNING', 'RUNNING', 'SETTLING', 'HOLD']) assert.deepEqual(reassertVerdict(at(subphase), { id: ID, result }), { next: 'killing', anomaly: false }, subphase);
-    assert.equal(reassertVerdict(at('OUTBOX', { kind: 'finish' }), { id: ID, result }).next, 'done');
+    assert.deepEqual(reassertVerdict(at('OUTBOX', { kind: 'finish' }), { id: ID, result }), { next: 'killing', anomaly: false }, 'its stop proof decides, not the answer');
     assert.equal(reassertVerdict(at('OUTBOX', { kind: 'release' }), { id: ID, result }).next, 'done');
   }
   for (const subphase of ['AWAIT_URLS', 'RUNNING', 'SETTLING']) assert.deepEqual(reassertVerdict(at(subphase), { id: ID, result: 'ok', state: 'claimed' }).next, subphase === 'AWAIT_URLS' ? 'resume' : 'killing');
@@ -47,7 +47,7 @@ test('reassertVerdict: ok resumes, fenced or unknown ends a pre-start record and
 
 test('a running-phase item answered ok on a still-claimed row is an anomaly judged as fenced, for every running-phase record', () => {
   const answer = { id: ID, result: 'ok', state: 'claimed' };
-  for (const [record, next] of [[at('SPAWNING'), 'killing'], [at('RUNNING'), 'killing'], [at('HOLD'), 'killing'], [at('OUTBOX', { kind: 'finish' }), 'done']]) {
+  for (const [record, next] of [[at('SPAWNING'), 'killing'], [at('RUNNING'), 'killing'], [at('HOLD'), 'killing'], [at('OUTBOX', { kind: 'finish' }), 'killing']]) {
     assert.deepEqual(reassertVerdict(record, answer), { next, anomaly: true }, record.subphase);
   }
   assert.equal(reassertVerdict(at('STARTING'), answer).anomaly, false, 'a pre-start item on a claimed row is the normal case');
@@ -64,6 +64,10 @@ test('the table keeps records on disk, reloads them, and reasserts only the live
   assert.deepEqual(table.reassertItems(), [{ id: ID, epoch: 2, token: TOKEN, phase: 'running' }]);
   const reloaded = new ExecutionTable(root);
   assert.deepEqual(reloaded.all(), [live, other].sort((a, b) => a.execId.localeCompare(b.execId)));
+  const handed = table.get(live.execId);
+  handed.subphase = 'DONE';
+  live.subphase = 'DONE';
+  assert.equal(table.get(live.execId).subphase, 'RUNNING', 'what put stored and what get returned are copies, so memory cannot run ahead of disk');
   reloaded.remove(live.execId);
   assert.deepEqual(new ExecutionTable(root).all().map((r) => r.execId), [other.execId]);
 });

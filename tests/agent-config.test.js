@@ -31,6 +31,14 @@ test('T5 a valid config builds a verify-full pg config with the password from it
   assert.deepEqual([config.speedFactor, config.pollMs, config.urlWaitMs, config.requireAcPower, config.schedule], [1, 15_000, 60_000, false, null]);
 });
 
+test('T5 a relative passwordFile and caFile resolve against the config directory, not the cwd', () => {
+  const { dir, file } = setup({ passwordFile: 'secrets/pw', caFile: 'secrets/ca' });
+  fs.mkdirSync(path.join(dir, 'secrets'));
+  for (const name of ['pw', 'ca']) fs.writeFileSync(path.join(dir, 'secrets', name), `${name}\n`, { mode: 0o600 });
+  const config = load(file);
+  assert.deepEqual([config.pg.password, config.pg.ssl.ca], ['pw', 'ca\n']);
+});
+
 test('T5 a VIP or failover host is refused', () => {
   for (const url of ['postgres://u@svc:pg-primary:5432/lane_queue', 'postgres://u@pg-primary.homelab:5432/lane_queue', 'postgres://u@svc:pg-primary/lane_queue']) {
     refused(setup({ laneQueueUrl: url }).file, /laneQueueUrl/);

@@ -2,8 +2,10 @@ import pg from 'pg';
 
 export class LdClosedError extends Error {}
 
+export const NOT_LIVE = Object.freeze({ skipped: 'not-live' });
+
 // Retried verbatim after a reconnect. Everything else (42501 no principal, 22023 bad input, a bug) fails loud and leaves live executions alone.
-const RETRYABLE_SQLSTATES = new Set(['57P01', '57014', '55P03', '53300']);
+const RETRYABLE_SQLSTATES = new Set(['57P01', '57P02', '57P03', '57014', '55P03', '53300']);
 const NETWORK_ERRORS = new Set(['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH', 'ENOTFOUND', 'EAI_AGAIN']);
 const DEAD_CONNECTION_MESSAGE = /Connection terminated|not queryable|connection error|Connection ended/i;
 
@@ -65,12 +67,17 @@ export class LdClient {
   async #connected() {
     if (this.#client) return;
     const client = await this.connect(this.pgConfig);
+    if (this.#closed) {
+      client.end().catch(() => {});
+      throw new LdClosedError('ld client closed');
+    }
     client.on('error', () => { if (this.#client === client) this.#client = null; });
     this.#client = client;
     this.gen += 1;
   }
 
   async #sql(name, args) {
+    this.#assertOpen();
     this.onCall?.(name, args);
     const placeholders = args.map((_, i) => `$${i + 1}`).join(', ');
     const { rows: [row] } = await this.#client.query(`SELECT lane_dispatch.${name}(${placeholders}) AS v`, args);
@@ -83,8 +90,8 @@ export class LdClient {
       const items = this.snapshot();
       const results = await this.#sql('ld_reassert', [JSON.stringify(items)]);
       if (!Array.isArray(results) || results.length !== items.length) throw new Error(`ld_reassert answered ${JSON.stringify(results)} for ${items.length} item(s)`);
-      this.registered = await this.#sql('ld_register', [this.version, this.schedule === null ? null : JSON.stringify(this.schedule)]);
       await this.onReassert?.(items, results);
+      this.registered = await this.#sql('ld_register', [this.version, this.schedule === null ? null : JSON.stringify(this.schedule)]);
       this.#reasserted = gen;
     }
   }
@@ -110,10 +117,15 @@ export class LdClient {
     }
   }
 
-  #run(name, args, { persist } = {}) {
+  #run(name, args, { persist, live } = {}) {
     return this.#enqueue(async () => {
       let sentAt;
-      const answer = await this.#attempt(() => { sentAt = this.gen; return this.#sql(name, args); });
+      const answer = await this.#attempt(() => {
+        if (live && !live()) return NOT_LIVE;
+        sentAt = this.gen;
+        return this.#sql(name, args);
+      });
+      if (answer === NOT_LIVE) return answer;
       const stale = this.gen !== sentAt;
       if (answer?.reassert === true) this.gen += 1;
       await persist?.(answer, { stale });
@@ -131,6 +143,8 @@ export class LdClient {
       let client;
       try {
         client = await this.connect(this.pgConfig);
+        if (this.#closed) return await client.end().catch(() => {});
+        if (bump) this.gen += 1;
         let died = false;
         const dead = () => { died = true; this.#listenDied(client); };
         client.on('error', dead);
@@ -140,14 +154,12 @@ export class LdClient {
         if (this.#closed) return await client.end().catch(() => {});
         if (died) throw new Error('Connection terminated while subscribing');
         this.#listenClient = client;
-        if (bump) {
-          this.gen += 1;
-          this.onWake?.({ reason: 'listen-reconnected' });
-        }
+        if (bump) this.onWake?.({ reason: 'listen-reconnected' });
         return;
-      } catch (err) {
+      } catch (error) {
         client?.end().catch(() => {});
-        if (!isRetryable(err)) throw err;
+        if (!bump && !isRetryable(error)) throw error;
+        this.onWake?.({ reason: 'listen-failed', error });
         await this.#sleep(backoffMs(attempt, this.backoff, this.random));
       }
     }
@@ -157,7 +169,7 @@ export class LdClient {
     if (this.#listenClient !== client) return;
     this.#listenClient = null;
     client.end().catch(() => {});
-    if (!this.#closed) this.#connectListen({ bump: true }).catch((error) => this.onWake?.({ reason: 'listen-failed', error }));
+    if (!this.#closed) this.#connectListen({ bump: true });
   }
 
   claim(req, freeCpu, freeMem, heldKeys = [], opts) {

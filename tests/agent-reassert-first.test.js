@@ -7,23 +7,25 @@ import { pgSkipOption } from './lane-db-harness.js';
 import { startDispatchCluster, World, logins, enqueue, claim, tid, simulateRestore } from './lane-dispatch-fixture.js';
 import { openAgent, closeAgents, agentPg, backendPids, terminateBackend, sleep, takeTicket } from './agent-harness.js';
 import { openAgentCore } from '../src/agent/agent.js';
+import { LdClient } from '../src/agent/ld-client.js';
 import { ExecutionTable, ensureAgentDirs, newExecutionRecord } from '../src/agent/store.js';
+import { importMutant } from './helpers/mutant-module.js';
 
 const FIRST_CALLS = ['ld_reassert', 'ld_register'];
 
 const recordFor = (claimed, subphase) => ({ ...newExecutionRecord({ repo_key: 'repoA', lane: 'test', binding: {}, header: {}, snapshot: {}, ...claimed }), subphase });
 
 const SCENARIOS = {
-  'T7 a client that has never connected sends ld_reassert then ld_register before the claim it was asked for': async (w) => {
+  'T7 a client that has never connected sends ld_reassert then ld_register before the claim it was asked for': async (w, { LdClient }) => {
     await enqueue(await w.as(logins.s1), tid(1));
-    const { client, names } = await openAgent(w, { open: false });
+    const { client, names } = await openAgent(w, { open: false, LdClient });
     assert.equal((await client.claim(randomUUID(), 8, 1e9)).status, 'claimed');
     assert.deepEqual(names(), [...FIRST_CALLS, 'ld_claim']);
   },
 
-  'T7 a heartbeat that answers reassert closes the gate: the next calls are ld_reassert, ld_register, ld_heartbeat, and the row ends running': async (w) => {
+  'T7 a heartbeat that answers reassert closes the gate: the next calls are ld_reassert, ld_register, ld_heartbeat, and the row ends running': async (w, { LdClient }) => {
     const held = [];
-    const { client, names } = await openAgent(w, { snapshot: () => held });
+    const { client, names } = await openAgent(w, { snapshot: () => held, LdClient });
     const c = await takeTicket(w, client, held);
     await simulateRestore(w);
     assert.equal((await client.heartbeat(c.id, c.epoch, c.token)).reassert, true);
@@ -86,6 +88,11 @@ const SCENARIOS = {
   },
 };
 
+const GATE_CANARIES = [
+  'T7 a client that has never connected sends ld_reassert then ld_register before the claim it was asked for',
+  'T7 a heartbeat that answers reassert closes the gate: the next calls are ld_reassert, ld_register, ld_heartbeat, and the row ends running',
+];
+
 describe('agent reassert-first gate on a disposable Postgres', { skip: pgSkipOption, timeout: 300000 }, () => {
   let cluster;
   let remoteRoot;
@@ -108,6 +115,16 @@ describe('agent reassert-first gate on a disposable Postgres', { skip: pgSkipOpt
   });
 
   for (const [name, scenario] of Object.entries(SCENARIOS)) {
-    test(name, async () => scenario(await World.create(cluster), { remoteRoot, cores }));
+    test(name, async () => scenario(await World.create(cluster), { remoteRoot, cores, LdClient }));
+  }
+
+  for (const name of GATE_CANARIES) {
+    test(`canary: with the gate bypassed, "${name}" fails`, async (t) => {
+      const mutant = await importMutant(path.join(import.meta.dirname, '..', 'src', 'agent', 'ld-client.js'), ['        await this.#gate();\n', '']);
+      let failure;
+      await SCENARIOS[name](await World.create(cluster), { remoteRoot, cores, LdClient: mutant.LdClient }).catch((err) => { failure = err; });
+      assert.ok(failure, `"${name}" still passed with the gate bypassed, so it proves nothing`);
+      t.diagnostic(`failed as expected: ${String(failure.message).split('\n')[0]}`);
+    });
   }
 });
