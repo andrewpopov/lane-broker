@@ -9,8 +9,6 @@ export class AgentStoreError extends Error {}
 export class AgentOwnedError extends Error {}
 
 export const SUBPHASES = ['AWAIT_URLS', 'FETCHING', 'VERIFIED', 'STARTING', 'SPAWNING', 'RUNNING', 'SETTLING', 'HOLD', 'OUTBOX', 'KILLING', 'DONE'];
-const PRE_START = new Set(['AWAIT_URLS', 'FETCHING', 'VERIFIED', 'STARTING']);
-const RUNNING = new Set(['SPAWNING', 'RUNNING', 'SETTLING', 'HOLD']);
 const OUTBOX_KINDS = ['finish', 'release'];
 
 export function agentPaths(remoteRoot) {
@@ -80,23 +78,6 @@ function assertRecord(record, where) {
   if (record.subphase === 'OUTBOX' && !OUTBOX_KINDS.includes(record.outbox?.kind)) fail('an OUTBOX record needs outbox.kind finish or release');
 }
 
-export function reassertPhase(record) {
-  if (PRE_START.has(record.subphase)) return 'pre-start';
-  if (RUNNING.has(record.subphase)) return 'running';
-  if (record.subphase === 'OUTBOX') return record.outbox.kind === 'finish' ? 'running' : 'pre-start';
-  return null;
-}
-
-// A running-phase item answered `ok` on a row still `claimed` is an anomaly (nothing spawns before `ld_start` is persisted true): it is judged as `fenced`.
-export function reassertVerdict(record, answer) {
-  const phase = reassertPhase(record);
-  const anomaly = answer.result === 'ok' && phase === 'running' && answer.state === 'claimed';
-  if (answer.result === 'ok' && !anomaly) return { next: 'resume', anomaly };
-  if (answer.result !== 'fenced' && answer.result !== 'unknown' && !anomaly) throw new AgentStoreError(`ld_reassert answered ${JSON.stringify(answer)}`);
-  if (phase === 'running') return { next: 'killing', anomaly };
-  return { next: 'done', anomaly, tombstone: record.subphase === 'STARTING' };
-}
-
 export class ExecutionTable {
   #records = new Map();
 
@@ -138,12 +119,5 @@ export class ExecutionTable {
     fs.rmSync(this.#file(execId), { force: true });
     fsyncDirectory(agentPaths(this.remoteRoot).executions);
     this.#records.delete(execId);
-  }
-
-  reassertItems() {
-    return this.all().flatMap((r) => {
-      const phase = reassertPhase(r);
-      return phase === null ? [] : [{ id: r.id, epoch: r.epoch, token: r.token, phase }];
-    });
   }
 }

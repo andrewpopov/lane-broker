@@ -7,7 +7,7 @@ import { readLedger } from '../src/pull-ledger.js';
 import { S3Error } from '../src/s3-client.js';
 import { QueueError } from '../src/queue-client.js';
 import { sha256Hex } from '../src/s3-presign.js';
-import { definePullSuite, pullFixture, artifactsStream, ARTIFACT_PATH } from './helpers/pull-fixture.js';
+import { definePullSuite, pullFixture, artifactsStream, ARTIFACT_PATH, UNPROVEN_CANCEL_ROW } from './helpers/pull-fixture.js';
 import { simulateRestore, tid } from './lane-dispatch-fixture.js';
 
 /** BRAIN-1036 R5: the step machine against a disposable queue, a stub runner and the S3 stub (T1, T3, T4-T6, T8, T12, T16, T23, T27-T29). */
@@ -59,8 +59,8 @@ const SCENARIOS = {
     assert.deepEqual(await held.withdraw(), { proof: false, state: 'claimed' });
     await held.runner.start();
     assert.deepEqual(await held.withdraw(), { proof: false, state: 'running' });
-    await held.setRow("state = 'quarantined'");
-    assert.deepEqual(await held.withdraw(), { proof: false, state: 'quarantined' });
+    await held.setRow("state = 'lost'");
+    assert.deepEqual(await held.withdraw(), { proof: false, state: 'lost' });
     assert.equal(held.pull().withdrawProof, undefined);
 
     const missing = await next(t, w, load, 5, queued);
@@ -116,7 +116,7 @@ const SCENARIOS = {
     await lostFx.hold();
     const queuedFx = await next(t, w, load, 2, lostFx);
     await queuedFx.enqueue();
-    const reap = async () => (await w.su()).query("SELECT lane_dispatch.ld_reap(interval '2 seconds', interval '120 seconds', interval '2 seconds')");
+    const reap = async () => (await w.su()).query("SELECT lane_dispatch.ld_reap(interval '120 seconds', interval '2 seconds', interval '4 seconds')");
     await reap();
     await lostFx.setRow("lease_until = now() - interval '1 hour'");
     await queuedFx.setRow("created_at = now() - interval '1 hour'");
@@ -165,7 +165,7 @@ const SCENARIOS = {
 
   'T27: URLs are per epoch: a reclaimed ticket gets fresh ones, and the stale epoch keys stay out of the current epoch': async (load, w, t) => {
     const fx = await pullFixture(t, w, { load });
-    await fx.hold();
+    await fx.claimed();
     const stale = fx.runner.urls;
     assert.equal(stale.epoch, 1);
     await fx.runner.release('never-started');
@@ -263,22 +263,6 @@ SCENARIOS['a bound rejected result settles lost 75 with no second enqueue: snaps
     assert.equal(sends, 1, 'no replacement row is enqueued');
     assert.equal(await rowCount(fx), 1);
   }
-};
-
-SCENARIOS['a quarantined row settles lost 75 queue-restored only after quarantineLostAfterMs, and a reassert starts the clock over'] = async (load, w, t) => {
-  const fx = await pullFixture(t, w, { load });
-  await fx.hold();
-  await fx.setRow("state = 'quarantined'");
-  assert.deepEqual(await fx.step(), { state: 'quarantined', next: 15_000 });
-  fx.clock.now += 20 * 60_000;
-  await fx.setRow("state = 'running'");
-  assert.equal((await fx.step()).state, 'running');
-  assert.equal(fx.pull().quarantinedSince, undefined, 'a reassert clears the clock');
-  await fx.setRow("state = 'quarantined'");
-  assert.equal((await fx.step()).state, 'quarantined', 'the 20 minutes before the reassert do not count');
-  fx.clock.now += 31 * 60_000;
-  const settled = await fx.step();
-  assert.deepEqual([settled.decision.reason, settled.result.exit], ['queue-restored', 75]);
 };
 
 SCENARIOS['runPullTicket prepares, waits out a queue failure and returns the confirmed outcome'] = async (load, w, t) => {
@@ -474,16 +458,6 @@ SCENARIOS['runPullTicket ends the run when a step is unresolved instead of loopi
   assert.deepEqual([outcome.outcome, outcome.reason, outcome.exitCode], ['unresolved', 'snapshot-missing', 1]);
 };
 
-SCENARIOS['a quarantined row settled after quarantineLostAfterMs is also cancelled in the queue'] = async (load, w, t) => {
-  const fx = await pullFixture(t, w, { load });
-  await fx.hold();
-  await fx.setRow("state = 'quarantined'");
-  await fx.step();
-  fx.clock.now += 31 * 60_000;
-  assert.equal((await fx.step()).decision.reason, 'queue-restored');
-  assert.equal((await fx.row()).state, 'cancelled', 'the queue row cannot run later');
-};
-
 const cancelFixture = async (t, w, load, n, first) => {
   const fx = await next(t, w, load, n, first);
   fx.cancelCalls = 0;
@@ -492,7 +466,7 @@ const cancelFixture = async (t, w, load, n, first) => {
   return fx;
 };
 
-SCENARIOS['T16: cancel outcomes: queued, released, runner-confirmed and a normal finish are decided from the row, a quarantined cancel stays unproven'] = async (load, w, t) => {
+SCENARIOS['T16: cancel outcomes: queued, released, runner-confirmed and a normal finish are decided from the row, an operator-cancelled row stays unproven'] = async (load, w, t) => {
   const queued = await cancelFixture(t, w, load, 1);
   await queued.enqueue();
   const queuedOut = await queued.cancelStep();
@@ -521,7 +495,7 @@ SCENARIOS['T16: cancel outcomes: queued, released, runner-confirmed and a normal
 
   const quarantined = await cancelFixture(t, w, load, 5, queued);
   await quarantined.hold();
-  await quarantined.setRow("state = 'quarantined'");
+  await quarantined.setRow(UNPROVEN_CANCEL_ROW);
   const unproven = await quarantined.cancelStep();
   assert.deepEqual([unproven.state, unproven.exitCode], ['unresolved', 1]);
   assert.ok(readAttempt(quarantined.state, quarantined.id), 'the attempt is kept');
@@ -533,7 +507,7 @@ SCENARIOS['T16: cancel outcomes: queued, released, runner-confirmed and a normal
 
   const lostFirst = await cancelFixture(t, w, load, 6, queued);
   await lostFirst.hold();
-  await lostFirst.setRow("state = 'quarantined'");
+  await lostFirst.setRow(UNPROVEN_CANCEL_ROW);
   const droppedAfterCommit = { ...lostFirst.queue, cancel: async (id) => { lostFirst.cancelCalls += 1; await lostFirst.queue.cancel(id); throw LOST_RESPONSE; } };
   await assert.rejects(lostFirst.step({ queue: droppedAfterCommit, cancelRequested: () => true }), LOST_RESPONSE);
   assert.equal((await lostFirst.cancelStep()).state, 'unresolved', 'the lost first response never upgrades to confirmed');
@@ -554,11 +528,8 @@ const CANARIES = [
   ['a running row never needs the stream: a vanished stream is ignored and the refreshed URLs carry none', 'pull-ticket.js', ['const head = running ? { exists: true } : await run.s3.headObject(', 'const head = await run.s3.headObject(']],
   ['a claimed row with a vanished stream is cancelled durably and settles lost only once it leaves the held state, never while it may run', 'pull-ticket.js', ["  if (pull?.snapshotMissing && decision.kind === 'cancelled') decision = lost('snapshot-missing');\n", '']],
   ['a claimed row with a vanished stream is cancelled durably and settles lost only once it leaves the held state, never while it may run', 'pull-ticket.js', ['  await requestCancel(run);\n  if (run.now() - since <', '  if (run.now() - since <']],
-  ['a quarantined row settled after quarantineLostAfterMs is also cancelled in the queue', 'pull-ticket.js', ["  await run.queue.cancel(run.id).catch(() => {});\n  await hook(run, 'afterLedger');", "  await hook(run, 'afterLedger');"]],
-  ['T16: cancel outcomes: queued, released, runner-confirmed and a normal finish are decided from the row, a quarantined cancel stays unproven', 'pull-ticket.js', ["  await run.queue.cancel(run.id).catch(() => {});\n  await hook(run, 'afterLedger');", "  await hook(run, 'afterLedger');"]],
+  ['T16: cancel outcomes: queued, released, runner-confirmed and a normal finish are decided from the row, an operator-cancelled row stays unproven', 'pull-ticket.js', ["  await run.queue.cancel(run.id).catch(() => {});\n  await hook(run, 'afterLedger');", "  await hook(run, 'afterLedger');"]],
   ['a bound rejected result settles lost 75 with no second enqueue: snapshot-blob-missing for a cache reason, runner-rejected otherwise', 'pull-ticket.js', ["  if (result.kind === 'rejected' && provesNeverStarted(result, expected)) return lost(CACHE_REJECT_RE.test(result.reason ?? '') ? 'snapshot-blob-missing' : 'runner-rejected', result.reason);\n", '']],
-  ['a quarantined row settles lost 75 queue-restored only after quarantineLostAfterMs, and a reassert starts the clock over', 'pull-ticket.js', ["if (run.now() - since >= run.cfg.quarantineLostAfterMs) return settleAndCancel(run, entryFor(run, row, lost('queue-restored')));", "return settleAndCancel(run, entryFor(run, row, lost('queue-restored')));"]],
-  ['a quarantined row settles lost 75 queue-restored only after quarantineLostAfterMs, and a reassert starts the clock over', 'pull-ticket.js', ["  if (row.state !== 'quarantined' && attempt.pull.quarantinedSince !== undefined) await persistPull(run, { quarantinedSince: undefined });\n", '']],
   ['a snapshot object that vanished before the first send settles lost snapshot-missing and sends nothing', 'pull-ticket.js', ["    if (reason) return { outcome: 'lost', reason };\n", '']],
   ['enqueueOnce sends nothing once a decision is ledgered', 'pull-enqueue.js', ["    if (ledgered()) return { outcome: 'settled' };\n", '']],
   ['T3: a lost enqueue response is replayed with the same id and leaves exactly one row', 'pull-enqueue.js', ['    id: envelope.logicalId,', '    id: globalThis.crypto.randomUUID(),']],
@@ -573,8 +544,8 @@ const CANARIES = [
   ['T28: a death before the snapshot descriptor settles lost prepare-interrupted; after it the enqueue continues from the envelope, not the worktree', 'pull-ticket.js', ["    return settle(run, entryFor(run, null, lost('prepare-interrupted')));\n", "    return { state: 'preparing', next: 0 };\n"]],
   ['T28: a death before the snapshot descriptor settles lost prepare-interrupted; after it the enqueue continues from the envelope, not the worktree', 'pull-ticket.js', ["    if (supervisorAlive(attempt)) return { state: 'preparing', next: run.cfg.pollMs };\n", '']],
   ['T29: a stalled object fetch holds only its own ticket: another ticket\'s URL attach lands first, and the stalled one settles with a warning after 5 passes', 'pull-ticket.js', ['key, file, { deadlineMs: run.objectDeadlineMs }', 'key, file, { deadlineMs: 600_000 }'], /still running/],
-  ['T16: cancel outcomes: queued, released, runner-confirmed and a normal finish are decided from the row, a quarantined cancel stays unproven', 'pull-ticket.js', ["    return result.source === 'queued' ? { kind: 'cancelled', exit: 130, source: 'queued' } : { kind: 'unproven', source: result.source };", "    return { kind: 'cancelled', exit: 130, source: result.source };"]],
-  ['T16: cancel outcomes: queued, released, runner-confirmed and a normal finish are decided from the row, a quarantined cancel stays unproven', 'pull-ticket.js', ['  if (pull?.cancel?.answer !== undefined) return;\n', '']],
+  ['T16: cancel outcomes: queued, released, runner-confirmed and a normal finish are decided from the row, an operator-cancelled row stays unproven', 'pull-ticket.js', ["    return result.source === 'queued' ? { kind: 'cancelled', exit: 130, source: 'queued' } : { kind: 'unproven', source: result.source };", "    return { kind: 'cancelled', exit: 130, source: result.source };"]],
+  ['T16: cancel outcomes: queued, released, runner-confirmed and a normal finish are decided from the row, an operator-cancelled row stays unproven', 'pull-ticket.js', ['  if (pull?.cancel?.answer !== undefined) return;\n', '']],
 ];
 
 definePullSuite('pull ticket step machine on a disposable Postgres', SCENARIOS, CANARIES);

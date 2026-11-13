@@ -14,11 +14,11 @@ export const closeAgents = async () => {
 // statement_timeout=0 lets a blocked call outlive the role's 2 s default, so only the guard ends it.
 export const agentPg = (w, login = logins.a1) => ({ ...w.cluster.conn(w.db, login), options: '-c statement_timeout=0' });
 
-export async function openAgent(w, { login = logins.a1, snapshot = () => [], open = true, LdClient = RealLdClient, ...rest } = {}) {
+export async function openAgent(w, { login = logins.a1, open = true, LdClient = RealLdClient, ...rest } = {}) {
   const calls = [];
   const events = [];
   const client = new LdClient({
-    pg: agentPg(w, login), version: 'test', snapshot, onCall: (name, args) => calls.push([name, args]), onWake: (e) => events.push(e),
+    pg: agentPg(w, login), version: 'test', onCall: (name, args) => calls.push([name, args]), onWake: (e) => events.push(e),
     backoff: { minMs: 20, maxMs: 100 }, ...rest,
   });
   opened.add(client);
@@ -26,8 +26,9 @@ export async function openAgent(w, { login = logins.a1, snapshot = () => [], ope
   return { client, calls, events, names: () => calls.map(([name]) => name) };
 }
 
+// the world's own connection for the login (World.create registers the runner through it) is never the agent's
 export async function backendPids(w, like, login = logins.a1) {
-  const { rows } = await (await w.su()).query('SELECT pid FROM pg_stat_activity WHERE usename = $1 AND query LIKE $2', [login, like]);
+  const { rows } = await (await w.su()).query('SELECT pid FROM pg_stat_activity WHERE usename = $1 AND query LIKE $2 AND pid IS DISTINCT FROM $3', [login, like, w.connections.get(login)?.processID ?? null]);
   return rows.map((r) => r.pid);
 }
 
@@ -49,11 +50,10 @@ export async function guardUntilKill(w, maxMs = 15000) {
   throw new Error(`the guard killed nothing within ${maxMs} ms`);
 }
 
-export async function takeTicket(w, client, held, { n = 1, started = true, login = logins.s1 } = {}) {
+export async function takeTicket(w, client, { n = 1, started = true, login = logins.s1 } = {}) {
   await enqueue(await w.as(login), tid(n));
   const claimed = await client.claim(randomUUID(), 8, 1e9);
   if (claimed.status !== 'claimed') throw new Error(`expected a claim, got ${JSON.stringify(claimed)}`);
-  held.push({ id: claimed.id, epoch: claimed.epoch, token: claimed.token, phase: started ? 'running' : 'pre-start' });
   if (started && await client.start(claimed.id, claimed.epoch, claimed.token) !== true) throw new Error('ld_start refused');
   return claimed;
 }

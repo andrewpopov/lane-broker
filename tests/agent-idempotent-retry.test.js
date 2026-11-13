@@ -40,21 +40,21 @@ async function blockedThenGuarded(w, c, issue) {
 }
 
 const BLOCKED_THEN_KILLED = {
-  ld_start: async (w, client, calls, held) => {
-    const c = await takeTicket(w, client, held, { started: false });
+  ld_start: async (w, client, calls) => {
+    const c = await takeTicket(w, client, { started: false });
     assert.equal(await blockedThenGuarded(w, c, () => client.start(c.id, c.epoch, c.token)), true);
     assert.deepEqual(callsTo(calls, 'ld_start').map((a) => a.slice(0, 3)), [[c.id, c.epoch, c.token], [c.id, c.epoch, c.token]], 'the same call, twice');
     const row = await w.ticket(c.id);
     assert.deepEqual([row.state, row.started_at !== null], ['running', true]);
   },
-  ld_heartbeat: async (w, client, calls, held) => {
-    const c = await takeTicket(w, client, held);
+  ld_heartbeat: async (w, client, calls) => {
+    const c = await takeTicket(w, client);
     assert.equal((await blockedThenGuarded(w, c, () => client.heartbeat(c.id, c.epoch, c.token))).fenced, false);
     assert.deepEqual(callsTo(calls, 'ld_heartbeat').at(-2), callsTo(calls, 'ld_heartbeat').at(-1));
     assert.equal((await w.ticket(c.id)).state, 'running');
   },
-  ld_finish: async (w, client, calls, held) => {
-    const c = await takeTicket(w, client, held);
+  ld_finish: async (w, client, calls) => {
+    const c = await takeTicket(w, client);
     const result = { kind: 'ok', exitCode: 0, logSha256: 'abc' };
     assert.deepEqual(await blockedThenGuarded(w, c, () => client.finish(c.id, c.epoch, c.token, result)), { fenced: false, state: 'finished' });
     assert.deepEqual(callsTo(calls, 'ld_finish').map((a) => a[3]), [result, result]);
@@ -65,13 +65,13 @@ const BLOCKED_THEN_KILLED = {
 
 const LOST_RESPONSE = {
   ld_start: async (w, client, calls) => {
-    const c = await takeTicket(w, client, [], { started: false });
+    const c = await takeTicket(w, client, { started: false });
     assert.equal(await client.start(c.id, c.epoch, c.token), true);
     assert.equal(callsTo(calls, 'ld_start').length, 2, 'sent twice');
     assert.equal((await w.ticket(c.id)).state, 'running');
   },
   ld_log: async (w, client, calls) => {
-    const c = await takeTicket(w, client, []);
+    const c = await takeTicket(w, client);
     assert.equal(await client.log(c.id, c.epoch, c.token, 0, Buffer.from('hello')), 'ok');
     assert.equal(callsTo(calls, 'ld_log').length, 2, 'sent twice');
     const su = await w.su();
@@ -79,7 +79,7 @@ const LOST_RESPONSE = {
     assert.equal(Number((await su.query('SELECT log_bytes FROM lane_dispatch.attempts WHERE ticket = $1', [c.id])).rows[0].log_bytes), 5, 'the bytes are counted once');
   },
   ld_finish: async (w, client, calls) => {
-    const c = await takeTicket(w, client, []);
+    const c = await takeTicket(w, client);
     assert.deepEqual(await client.finish(c.id, c.epoch, c.token, { kind: 'ok', exitCode: 0 }), { fenced: false, state: 'finished' });
     assert.equal(callsTo(calls, 'ld_finish').length, 2, 'sent twice');
     const row = await w.ticket(c.id);
@@ -106,7 +106,7 @@ const SCENARIOS = {
 
   'T12 a lost release response is answered fenced by the retry, and the row is requeued once': async (w) => {
     const { client, calls } = await openAgent(w, { connect: loseFirstAnswerTo('ld_release') });
-    const c = await takeTicket(w, client, [], { started: false });
+    const c = await takeTicket(w, client, { started: false });
     assert.deepEqual(await client.release(c.id, c.epoch, c.token, 'never-started'), { fenced: true, state: 'queued' });
     assert.equal(callsTo(calls, 'ld_release').length, 2);
     const row = await w.ticket(c.id);
@@ -116,9 +116,8 @@ const SCENARIOS = {
 
 for (const [name, scenario] of Object.entries(BLOCKED_THEN_KILLED)) {
   SCENARIOS[`T12 ${name} that the guard kills while it waits on a row lock is retried verbatim and takes effect once`] = async (w) => {
-    const held = [];
-    const { client, calls } = await openAgent(w, { snapshot: () => held });
-    await scenario(w, client, calls, held);
+    const { client, calls } = await openAgent(w);
+    await scenario(w, client, calls);
   };
 }
 

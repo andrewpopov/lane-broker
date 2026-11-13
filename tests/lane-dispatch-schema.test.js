@@ -7,18 +7,41 @@ import { LANE_SQL_DIR, applyDatabaseAcls, applyMigrations } from '../src/lane-db
 import { pgSkipOption } from './lane-db-harness.js';
 import { startDispatchCluster, World, logins, call, enqueue, claim, tid } from './lane-dispatch-fixture.js';
 
-const AGENT_FUNCTIONS = ['ld_register', 'ld_claim', 'ld_start', 'ld_heartbeat', 'ld_finish', 'ld_release', 'ld_log', 'ld_reassert'];
+const AGENT_FUNCTIONS = ['ld_register', 'ld_claim', 'ld_start', 'ld_heartbeat', 'ld_finish', 'ld_release', 'ld_log'];
 const SUBMIT_FUNCTIONS = ['ld_enqueue', 'ld_get', 'ld_list_mine', 'ld_withdraw', 'ld_cancel', 'ld_attach_urls', 'ld_log_read', 'ld_log_ack', 'ld_queue_ref', 'ld_enqueue_fenced', 'ld_placeable'];
-const ADMIN_FUNCTIONS = ['ld_set_principal', 'ld_reap', 'ld_cancel_quarantined', 'ld_guard', 'ld_prune_candidates', 'ld_prune', 'ld_prune_chunks', 'ld_blobs_live'];
+const ADMIN_FUNCTIONS = ['ld_set_principal', 'ld_reap', 'ld_restore_reset', 'ld_guard', 'ld_prune_candidates', 'ld_prune', 'ld_prune_chunks', 'ld_blobs_live'];
 const GRANTED = { agent: AGENT_FUNCTIONS, submit: SUBMIT_FUNCTIONS, admin: ADMIN_FUNCTIONS, reader: [] };
 const CALLERS = { agent: logins.a1, submit: logins.s1, admin: logins.admin, reader: logins.reader, legacy: logins.legacy };
+
+async function functionAclMatrix(w) {
+  const su = await w.su();
+  const { rows: functions } = await su.query("SELECT proname, pronargs FROM pg_proc WHERE pronamespace = 'lane_dispatch'::regnamespace ORDER BY proname");
+  const unclassified = functions.map((f) => f.proname).filter((n) => !n.startsWith('ld_') && !['ld_entry'].includes(n));
+  assert.ok(unclassified.length > 0, 'internal helpers exist and must be refused to every caller');
+  for (const [kind, login] of Object.entries(CALLERS)) {
+    const c = await w.as(login);
+    const group = kind === 'legacy' ? 'agent' : kind;
+    for (const f of functions) {
+      const granted = GRANTED[group].includes(f.proname);
+      const { rows: [{ has }] } = await su.query(`SELECT has_function_privilege($1, 'lane_dispatch.${f.proname}'::regproc, 'EXECUTE') AS has`, [login]);
+      assert.equal(has, granted, `${login} EXECUTE on ${f.proname}`);
+      const nulls = Array(f.pronargs).fill('NULL').join(', ');
+      const attempt = c.query(`SELECT lane_dispatch.${f.proname}(${nulls})`);
+      if (granted) {
+        await attempt.catch((err) => assert.doesNotMatch(err.message, /permission denied for function/, `${login} calling ${f.proname}`));
+      } else {
+        await assert.rejects(attempt, /permission denied for (function|schema)/, `${login} calling ${f.proname}`);
+      }
+    }
+  }
+}
 
 async function legacyIsRefused(w) {
   const legacy = await w.as(logins.legacy);
   const id = randomUUID();
   const calls = {
-    ld_register: ['v', {}], ld_claim: [randomUUID(), 8, 1e9, []], ld_start: [id, 1, id], ld_heartbeat: [id, 1, id],
-    ld_finish: [id, 1, id, { kind: 'ok' }], ld_release: [id, 1, id, 'never-started'], ld_log: [id, 1, id, 1, Buffer.from('x')], ld_reassert: ['[]'],
+    ld_register: ['v', 1, {}], ld_claim: [randomUUID(), 8, 1e9, []], ld_start: [id, 1, id], ld_heartbeat: [id, 1, id],
+    ld_finish: [id, 1, id, { kind: 'ok' }], ld_release: [id, 1, id, 'never-started'], ld_log: [id, 1, id, 1, Buffer.from('x')],
   };
   assert.deepEqual(Object.keys(calls), AGENT_FUNCTIONS);
   for (const [name, args] of Object.entries(calls)) {
@@ -57,7 +80,7 @@ describe('lane_dispatch schema and ACLs', { skip: pgSkipOption, timeout: 180000 
     assert.ok(owners.length > 20);
     assert.deepEqual(owners.filter((o) => o.owner !== 'lane_definer'), []);
     const { rows: tables } = await su.query("SELECT relname FROM pg_class WHERE relnamespace = 'lane_dispatch'::regnamespace AND relkind = 'r' ORDER BY relname");
-    assert.deepEqual(tables.map((r) => r.relname), ['attempts', 'claim_lock', 'claim_requests', 'cluster', 'log_chunks', 'principals', 'runners', 'tickets']);
+    assert.deepEqual(tables.map((r) => r.relname), ['attempts', 'claim_requests', 'cluster', 'log_chunks', 'principals', 'runners', 'tickets']);
   });
 
   test('every ld function is SECURITY DEFINER with the pinned search_path and is not executable by PUBLIC', async () => {
@@ -74,35 +97,14 @@ describe('lane_dispatch schema and ACLs', { skip: pgSkipOption, timeout: 180000 
     }
   });
 
-  test('ACL matrix: every (role, function) pair is granted or refused exactly as the group table says', async () => {
-    const su = await world.su();
-    const { rows: functions } = await su.query("SELECT proname, pronargs FROM pg_proc WHERE pronamespace = 'lane_dispatch'::regnamespace ORDER BY proname");
-    const unclassified = functions.map((f) => f.proname).filter((n) => !n.startsWith('ld_') && !['ld_entry'].includes(n));
-    assert.ok(unclassified.length > 0, 'internal helpers exist and must be refused to every caller');
-    for (const [kind, login] of Object.entries(CALLERS)) {
-      const c = await world.as(login);
-      const group = kind === 'legacy' ? 'agent' : kind;
-      for (const f of functions) {
-        const granted = GRANTED[group].includes(f.proname);
-        const { rows: [{ has }] } = await su.query(`SELECT has_function_privilege($1, 'lane_dispatch.${f.proname}'::regproc, 'EXECUTE') AS has`, [login]);
-        assert.equal(has, granted, `${login} EXECUTE on ${f.proname}`);
-        const nulls = Array(f.pronargs).fill('NULL').join(', ');
-        const attempt = c.query(`SELECT lane_dispatch.${f.proname}(${nulls})`);
-        if (granted) {
-          await attempt.catch((err) => assert.doesNotMatch(err.message, /permission denied for function/, `${login} calling ${f.proname}`));
-        } else {
-          await assert.rejects(attempt, /permission denied for (function|schema)/, `${login} calling ${f.proname}`);
-        }
-      }
-    }
-  });
+  test('ACL matrix: every (role, function) pair is granted or refused exactly as the group table says', () => functionAclMatrix(world));
 
   test('ACL matrix: for every (caller role, table) SELECT, INSERT, UPDATE and DELETE are refused', async () => {
     const su = await world.su();
     const { rows: tables } = await su.query(
       `SELECT c.relname, (SELECT a.attname FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum LIMIT 1) AS col
          FROM pg_class c WHERE c.relnamespace = 'lane_dispatch'::regnamespace AND c.relkind = 'r'`);
-    assert.equal(tables.length, 8);
+    assert.equal(tables.length, 7);
     for (const login of Object.values(CALLERS)) {
       const c = await world.as(login);
       for (const { relname: t, col } of tables) {
@@ -164,23 +166,18 @@ describe('lane_dispatch schema and ACLs', { skip: pgSkipOption, timeout: 180000 
 
   test('legacy lane_agent_h1 has no lane_dispatch principal, so every agent function refuses it', () => legacyIsRefused(world));
 
-  test('claim_lock cannot be locked, read or written by any caller, and a held lock makes ld_claim answer busy, never wait', async () => {
-    for (const login of Object.values(CALLERS)) {
-      const c = await world.as(login);
-      await assert.rejects(c.query('SELECT 1 FROM lane_dispatch.claim_lock WHERE id = 1 FOR UPDATE NOWAIT'), /permission denied/, login);
-      await assert.rejects(c.query('BEGIN; LOCK TABLE lane_dispatch.claim_lock IN ACCESS EXCLUSIVE MODE'), /permission denied/, login);
-      await c.query('ROLLBACK');
-    }
-    const holder = await world.su();
-    const agent = await world.as(logins.a1);
-    await enqueue(await world.as(logins.s1), tid(1));
+  test('claim_lock is gone, and a held ticket and principal lock never makes ld_claim answer busy', async () => {
+    const su = await world.su();
+    assert.equal((await su.query("SELECT to_regclass('lane_dispatch.claim_lock') AS t")).rows[0].t, null);
+    const [s1, a1, a2] = [await world.as(logins.s1), await world.as(logins.a1), await world.as(logins.a2)];
+    await enqueue(s1, tid(1));
+    await enqueue(s1, tid(2));
+    const holder = await world.cluster.client(world.db, logins.x);
     await holder.query('BEGIN');
-    await holder.query('SELECT 1 FROM lane_dispatch.claim_lock WHERE id = 1 FOR UPDATE');
-    const started = Date.now();
-    assert.deepEqual(await claim(agent), { status: 'busy' });
-    assert.ok(Date.now() - started < 1500, 'busy is immediate');
-    await holder.query('COMMIT');
-    assert.equal((await claim(agent)).status, 'claimed');
+    assert.equal((await call(holder, 'ld_claim', randomUUID(), 8, 1e9, [])).id, tid(1));
+    assert.equal((await claim(a2)).id, tid(2), 'a second host claims while the first claim is uncommitted');
+    assert.deepEqual(await claim(a1), { status: 'none' }, 'nothing is left, and the answer is none, never busy');
+    await holder.query('ROLLBACK');
   });
 
   test('admin-owned fields: a runner cannot set its own tags or repos, and ld_register touches only informational fields', async () => {
@@ -188,10 +185,10 @@ describe('lane_dispatch schema and ACLs', { skip: pgSkipOption, timeout: 180000 
     await assert.rejects(call(agent, 'ld_set_principal', logins.a1, 'agent', 'a1', ['gpu'], ['*'], 99), /permission denied for function/);
     await assert.rejects(agent.query("UPDATE lane_dispatch.principals SET tags = '{gpu}'"), /permission denied/);
     const before = (await (await world.su()).query('SELECT * FROM lane_dispatch.principals WHERE login_role = $1', [logins.a1])).rows[0];
-    assert.deepEqual(await call(agent, 'ld_register', '1.2.3', { quiet: [1, 6] }), { host: 'a1', max_claims: 2 });
+    assert.deepEqual(await call(agent, 'ld_register', '1.2.3', 1, { quiet: [1, 6] }), { host: 'a1', max_claims: 2, protocol_min: 1 });
     const su = await world.su();
     assert.deepEqual((await su.query('SELECT * FROM lane_dispatch.principals WHERE login_role = $1', [logins.a1])).rows[0], before);
-    assert.deepEqual((await su.query('SELECT host, version, schedule FROM lane_dispatch.runners')).rows, [{ host: 'a1', version: '1.2.3', schedule: { quiet: [1, 6] } }]);
+    assert.deepEqual((await su.query("SELECT host, version, protocol, schedule FROM lane_dispatch.runners WHERE host = 'a1'")).rows, [{ host: 'a1', version: '1.2.3', protocol: 1, schedule: { quiet: [1, 6] } }]);
   });
 
   test("canary: with the principal check removed from me(), the legacy-login refusal test fails", async (t) => {
@@ -201,6 +198,16 @@ describe('lane_dispatch schema and ACLs', { skip: pgSkipOption, timeout: 180000 
     assert.ok(failure, 'the legacy refusal test still passed with the guard removed, so it proves nothing');
     t.diagnostic(`failed as expected: ${String(failure.message).split('\n')[0]}`);
   });
+
+  for (const [what, grant] of [['ld_restore_reset to an agent login', 'ld_restore_reset() TO lane_agent'], ['the re-signed ld_register to a submit login', 'ld_register(text, int, jsonb) TO lane_submit']]) {
+    test(`canary: with ${what} granted, the function ACL matrix fails`, async (t) => {
+      const mutated = await World.create(cluster, { mutate: ['GRANT EXECUTE ON FUNCTION lane_dispatch.ld_set_principal(', `GRANT EXECUTE ON FUNCTION lane_dispatch.${grant};\nGRANT EXECUTE ON FUNCTION lane_dispatch.ld_set_principal(`] });
+      let failure;
+      await functionAclMatrix(mutated).catch((err) => { failure = err; });
+      assert.ok(failure, 'the matrix still passed with the extra grant, so it proves nothing');
+      t.diagnostic(`failed as expected: ${String(failure.message).split('\n')[0]}`);
+    });
+  }
 
   test('cluster-level privileges stay out of the migration and functions SQL (they need a superuser; docs/lane-dispatch-db-runbook.md)', () => {
     const files = [path.join(LANE_SQL_DIR, 'functions.sql'), ...fs.readdirSync(path.join(LANE_SQL_DIR, 'migrations')).map((f) => path.join(LANE_SQL_DIR, 'migrations', f))];

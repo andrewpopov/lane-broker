@@ -1,18 +1,5 @@
-import { executionIdOf } from '../state.js';
 import { LdClient } from './ld-client.js';
-import { ExecutionTable, claimOwner, ensureAgentDirs, reassertPhase, reassertVerdict, writeStatus } from './store.js';
-
-const TRANSITION = { killing: 'KILLING', done: 'DONE' };
-
-function applyReassert(table, items, results, log) {
-  items.forEach((item, i) => {
-    const record = table.get(executionIdOf(item.id, item.epoch));
-    if (!record || reassertPhase(record) === null) return;
-    const verdict = reassertVerdict(record, results[i]);
-    if (verdict.anomaly) log(`anomaly: ${record.execId} reasserted ${item.phase} but the queue holds it ${results[i].state}; treating it as fenced (${verdict.next})`);
-    if (verdict.next !== 'resume') table.put({ ...record, subphase: TRANSITION[verdict.next], from: record.subphase, ...(verdict.tombstone && { tombstone: true }) });
-  });
-}
+import { ExecutionTable, claimOwner, ensureAgentDirs, writeStatus } from './store.js';
 
 /** Directories durable, then the single-owner claim, then the records, then the first database call: nothing reaches the queue before its local state is safe. */
 export async function openAgentCore({ remoteRoot, config, version, log = (line) => process.stderr.write(`${line}\n`), onWake, onCall, ...clientOptions }) {
@@ -33,8 +20,7 @@ export async function openAgentCore({ remoteRoot, config, version, log = (line) 
     onWake?.(event);
   };
   const ld = new LdClient({
-    pg: config.pg, version, schedule: config.schedule, snapshot: () => table.reassertItems(), onWake: wake, onCall,
-    onReassert: (items, results) => applyReassert(table, items, results, log), ...clientOptions,
+    pg: config.pg, version, schedule: config.schedule, onWake: wake, onCall, ...clientOptions,
   });
   try {
     await ld.open();

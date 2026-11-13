@@ -1,4 +1,4 @@
-import { call, claim, finish, heartbeat, logins, release, start } from '../lane-dispatch-fixture.js';
+import { call, claim, finish, heartbeat, liftBackoff, logins, release, start } from '../lane-dispatch-fixture.js';
 import { sha256Hex } from '../../src/s3-presign.js';
 
 // PUTs only through the URLs the supervisor attached, so a wrong key, epoch or signature fails at the S3 stub
@@ -12,6 +12,7 @@ export class StubRunner {
   }
 
   async claim(options) {
+    await liftBackoff(this.world);
     const claimed = await claim(await this.client(), options);
     if (claimed.status !== 'claimed') throw new Error(`stub runner claimed nothing: ${JSON.stringify(claimed)}`);
     this.claimed = claimed;
@@ -26,8 +27,10 @@ export class StubRunner {
 
   async heartbeat() {
     const answer = await heartbeat(await this.client(), this.claimed);
-    this.urls = answer.urls ?? null;
-    return answer;
+    const { rows: [{ urls }] } = await (await this.world.su()).query(
+      "SELECT CASE WHEN urls->>'epoch' = epoch::text THEN urls END AS urls FROM lane_dispatch.tickets WHERE id = $1", [this.claimed.id]);
+    this.urls = answer.fenced ? null : urls;
+    return { ...answer, urls: this.urls };
   }
 
   async log(text, seq = this.nextSeq++) {

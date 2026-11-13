@@ -6,9 +6,9 @@ import { pullTicketDir } from '../src/pull-envelope.js';
 import { ledgerDir, readLedger } from '../src/pull-ledger.js';
 import { sha256Hex } from '../src/s3-presign.js';
 import { paths, writeCancelMarkerFile } from '../src/state.js';
-import { definePullSuite, pullFixture, artifactsStream, ARTIFACT_PATH } from './helpers/pull-fixture.js';
+import { definePullSuite, pullFixture, artifactsStream, ARTIFACT_PATH, UNPROVEN_CANCEL_ROW } from './helpers/pull-fixture.js';
 import { recordFsyncs } from './helpers/fsync-recorder.js';
-import { logins, call, tid } from './lane-dispatch-fixture.js';
+import { tid } from './lane-dispatch-fixture.js';
 
 /** BRAIN-1036 R5: the ledger-first rule and the durability order of the effects it guards (T7, T25, T26, T33, T34, T37). */
 
@@ -119,7 +119,7 @@ const SCENARIOS = {
 
     const unproven = await next(t, w, load, 3, finished);
     await unproven.hold();
-    await unproven.setRow("state = 'quarantined'");
+    await unproven.setRow(UNPROVEN_CANCEL_ROW);
     await unproven.queue.cancel(unproven.id);
     writeCancelMarkerFile(unproven.state, unproven.id);
     const kept = await unproven.step();
@@ -242,21 +242,15 @@ const SCENARIOS = {
     assert.equal((await runningReleased.step()).decision.kind, 'cancelled');
     assert.equal(runningReleased.published().exit, 130);
 
-    const quarantined = await next(t, w, load, 4, queued);
-    await quarantined.hold();
-    await quarantined.setRow("state = 'quarantined'");
-    await quarantined.queue.cancel(quarantined.id);
-    assert.equal((await quarantined.step()).state, 'unresolved');
-    quarantined.clock.now += 31 * 60_000;
-    await crashAfterLedger(quarantined);
-    assert.equal((await quarantined.step()).decision.reason, 'cancel-unproven');
-    assert.equal(quarantined.published().exit, 75);
-
-    const operator = await next(t, w, load, 5, queued);
-    await operator.hold();
-    await operator.setRow("state = 'quarantined'");
-    assert.equal(await call(await w.as(logins.admin), 'ld_cancel_quarantined', operator.id), 'cancelled');
-    assert.equal((await operator.step()).state, 'unresolved', 'an operator cancel is not proof that the run stopped');
+    const unprovenCancel = await next(t, w, load, 4, queued);
+    await unprovenCancel.hold();
+    await unprovenCancel.setRow(UNPROVEN_CANCEL_ROW);
+    await unprovenCancel.queue.cancel(unprovenCancel.id);
+    assert.equal((await unprovenCancel.step()).state, 'unresolved');
+    unprovenCancel.clock.now += 31 * 60_000;
+    await crashAfterLedger(unprovenCancel);
+    assert.equal((await unprovenCancel.step()).decision.reason, 'cancel-unproven');
+    assert.equal(unprovenCancel.published().exit, 75);
   },
 
   'a runner-forged server cancel is never queue-authored: only author queue on a cancelled row is trusted': async (load, w, t) => {
