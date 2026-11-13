@@ -13,7 +13,7 @@ const LOCK_TIMEOUT_MS = 500;
 
 export const envelopeFile = (root, id) => path.join(pullTicketDir(root, id), 'envelope.json');
 
-// group 'broker', the one updateAttempt and publishTerminal take, so a step may call them while holding this lock
+// group 'broker' so updateAttempt/publishTerminal nest inside; never take it from a global-lock section (assertLockOrder can't see that order)
 export function withTicketLock(root, id, fn, { lockTimeoutMs = LOCK_TIMEOUT_MS } = {}) {
   if (!TICKET_ID_RE.test(id)) throw new Error('pull ticket id must be a ticket uuid');
   ensureDurableDir(pullTicketDir(root, id), { boundary: root });
