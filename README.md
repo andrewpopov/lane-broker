@@ -54,6 +54,7 @@ lane drain ["reason"] | lane undrain       # take a runner out of remote rotatio
 lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
 lane gc [--dry-run] [--max <n>]
 lane reconcile [--now] [--json]          # settle ORPHANED-REMOTE attempts from their runners (BRAIN-515)
+lane pull check [--json]                 # may pull dispatch be enabled against this storage (BRAIN-1036)
 lane runner [status] [--json]            # each runner's state, last-ok age and lost-settle time (BRAIN-597)
 lane runner watch                        # one heartbeat tick (ping every runner, then one reconcile sweep); schedule it every 60 s
 lane runner prewarm [--lane <n>] [--runner <n>] [--dry-run]   # warm a runner's per-machine caches with a lane's remoteSetup (BRAIN-649)
@@ -1439,6 +1440,34 @@ A runner that is powered down on a timetable (a workstation shut down every nigh
   time. A lane with no usable history is placed normally.
 
 Not covered: work already running when a window closes is left to the existing orphan handling (BRAIN-515); nothing requeues it.
+
+### Pull transport configuration (BRAIN-1036)
+
+A runner entry may take work by pull instead of ssh: the ticket waits in the lane queue (Postgres) and the runner claims it.
+Nothing dispatches this way until `lanePull.enabled` is true; this section is the config and the activation check only.
+
+```json
+{ "runners": [ { "name": "wintop", "transport": "pull" } ],
+  "laneQueueUrl": "postgres://lane_submit_train@pitelite:5432/lane_queue?sslmode=verify-full",
+  "lanePull": { "enabled": false, "passwordFile": "...", "caFile": "...",
+                "rustfs": { "endpoint": "https://pitelite:9000", "credentialsEnvFile": "..." } }
+}
+```
+
+- `runners[].transport` is `"push"` (default, ssh) or `"pull"`. A pull entry needs only `name`; `ssh` is optional. Placement,
+  rebind, rebalance, heartbeat pings, runner status and `lane runner prewarm` read `pushRunners(cfg)`, so those never dial a pull entry
+  (`prewarm --runner <pull runner>` is refused). Cancel, wait and reconcile still look runners up by name until the pull recovery surfaces land.
+- `laneQueueUrl` must be one direct `postgres://` endpoint of the `lane_queue` database. The config is refused, naming the key, for
+  a `svc:` host, a `pg-primary` first DNS label, a multi-host URL, any connection-routing query key (`host`, `hostaddr`, `port`, `dbname`, `database`, `service`, `target_session_attrs`), or any other database. It is checked as `pg-connection-string` parses it, which is what `pg` connects to.
+- `lanePull` defaults: `enabled false`, `pollMs 15000`, `urlTtlSec 900` (at most 604800, the SigV4 limit), `urlRefreshSec 300` (below the TTL),
+  `quarantineLostAfterMs 1800000`, `blobGc true`, `blobRefreshAfterDays 7`, `rustfs.region us-east-1`, buckets `lane-snap` and
+  `lane-out`. `enabled: true` needs `laneQueueUrl`, `passwordFile`, `caFile`, `rustfs.endpoint` and `rustfs.credentialsEnvFile`.
+  `pullConfigured(cfg)` answers from the config alone and does no I/O. The credentials file holds `AWS_ACCESS_KEY_ID` and
+  `AWS_SECRET_ACCESS_KEY`, mode 0600, owned by the user.
+- `lane pull check [--json]` exits 1 unless **neither** bucket has an enabled lifecycle rule and both lifecycle configurations are
+  readable (only the sweeper may delete objects, by ticket state). It also removes leftover probe objects, then PUTs, re-PUTs and deletes a probe object under
+  `lane-snap/probes/` to learn whether HEAD returns a `Last-Modified` and a re-PUT refreshes it, and prints `blobGc on` or
+  `blobGc off`; with `off`, set `lanePull.blobGc` to false.
 
 ### Taking a runner out of rotation (BRAIN-520)
 

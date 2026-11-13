@@ -192,7 +192,7 @@ export function patchAttemptLocked(root, id, patch) {
 /** Apply `patch` to the stored record, but only if its generation is still
  *  exactly `expectedGeneration` -- the fence against a stale writer acting
  *  on state that has since moved on (e.g. already fell back to local). */
-export async function updateAttempt(root, id, expectedGeneration, patch, { refuseWhileMigrating = false, lockTimeoutMs } = {}) {
+export async function updateAttempt(root, id, expectedGeneration, patch, { refuseWhileMigrating = false, lockTimeoutMs, fsync = false } = {}) {
   return withLock(root, () => {
     // BRAIN-380: the intake check and the write are one locked step, so a migration cannot start between them.
     if (refuseWhileMigrating) assertNotMigrating(root);
@@ -201,7 +201,7 @@ export async function updateAttempt(root, id, expectedGeneration, patch, { refus
       return { ok: false };
     }
     const next = { ...current, ...patch };
-    atomicWriteJson(attemptFile(root, id), next);
+    atomicWriteJson(attemptFile(root, id), next, { fsync });
     return { ok: true, attempt: next };
   }, { timeoutMs: lockTimeoutMs });
 }
@@ -249,6 +249,8 @@ export async function fallbackToLocal(root, id, reason) {
  *     real terminal outcome.
  * Either way (steps 2 or 4), the attempt record is removed once
  * `resultWriterFn` returns -- the attempt is over.
+ * `cancelPrecedence: 'decision'` (the pull transport only) skips step 2: the marker is ignored and the caller's own decision is
+ * always published (`{ cancelled: false }`), since a pull settles cancels from the queue row, not from this local marker.
  */
 /**
  * `resultWriterFn` MUST be synchronous. Everything that can take real time
@@ -272,7 +274,7 @@ function assertSyncWriter(returned) {
   }
 }
 
-export async function publishTerminal(root, id, generation, resultWriterFn, { expect, lockTimeoutMs } = {}) {
+export async function publishTerminal(root, id, generation, resultWriterFn, { expect, lockTimeoutMs, cancelPrecedence = 'marker' } = {}) {
   return withLock(root, () => {
     const current = readAttempt(root, id);
     if (!current) {
@@ -281,7 +283,7 @@ export async function publishTerminal(root, id, generation, resultWriterFn, { ex
     if (expect && !expect(current)) {
       return { ok: false, stale: true };
     }
-    if (isCancelled(root, id)) {
+    if (cancelPrecedence === 'marker' && isCancelled(root, id)) {
       assertSyncWriter(resultWriterFn({ cancelled: true }));
       removeAttempt(root, id);
       return { ok: true, cancelled: true };

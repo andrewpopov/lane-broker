@@ -40,6 +40,7 @@ import { costReportCommand } from '../src/cost-report.js';
 import { phasesReportCommand } from '../src/phases-report.js';
 import { lossesReportCommand } from '../src/losses-report.js';
 import { placementReportCommand } from '../src/placement-report.js';
+import { pullCheckCommand } from '../src/pull-check.js';
 
 function usage() {
   return `Usage:
@@ -61,6 +62,7 @@ function usage() {
   lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
   lane gc [--dry-run] [--max <n>] [--root <remoteRoot>]
   lane reconcile [--now] [--json]
+  lane pull check [--json]
   lane runner [status] [--json]
   lane runner watch
   lane runner prewarm [--lane <name>] [--runner <name>] [--dry-run]
@@ -392,6 +394,11 @@ async function main() {
     case 'reconcile': {
       const result = await reconcileCommand({ force: rest.includes('--now'), json: rest.includes('--json') });
       return result.exitCode;
+    }
+    case 'pull': {
+      if (rest[0] === 'check') return (await pullCheckCommand(rest.slice(1))).exitCode;
+      process.stderr.write(`lane pull: ${rest[0] === undefined ? 'missing subcommand' : `unknown subcommand "${rest[0]}"`} (only \`check\`)\n`);
+      return 2;
     }
     case 'report': {
       if (rest[0] === 'phases') return (await phasesReportCommand(rest.slice(1))).exitCode;

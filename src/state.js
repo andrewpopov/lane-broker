@@ -315,6 +315,35 @@ export function fsyncDirectory(dir) {
   }
 }
 
+/** Make a file's contents durable (its data, not the directory entry that names it: see `fsyncDirectory`). */
+export function fsyncFile(file) {
+  const fd = fs.openSync(file, 'r');
+  try {
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+/**
+ * `mkdir -p` that survives power loss. Fsyncs `dir` and every ancestor up to `boundary` inclusive, never above it, whether this
+ * call created a component or it already existed: an existing component may have been linked by a process that died before its own
+ * directory fsync. Outermost first. `boundary` is required and must contain `dir`.
+ */
+export function ensureDurableDir(dir, { boundary } = {}) {
+  if (!boundary) throw new TypeError('ensureDurableDir requires a boundary');
+  const target = path.resolve(dir);
+  const top = path.resolve(boundary);
+  if (target !== top && !target.startsWith(`${top}${path.sep}`)) throw new Error(`ensureDurableDir: ${target} is not inside ${top}`);
+  fs.mkdirSync(target, { recursive: true });
+  const chain = [];
+  for (let d = target; ; d = path.dirname(d)) {
+    chain.unshift(d);
+    if (d === top) break;
+  }
+  for (const d of chain) fsyncDirectory(d);
+}
+
 export function atomicWriteJson(file, obj, opts) {
   atomicWriteFile(file, `${JSON.stringify(obj, null, 2)}\n`, opts);
 }

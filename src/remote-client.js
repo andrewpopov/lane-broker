@@ -325,6 +325,10 @@ export async function selectRunner(runners, opts = {}) {
   const bestOf = (seq, cmp) => seq.reduce((best, cand) => (cmp(cand, best) ? cand : best), null);
   const now = opts.now ?? Date.now();
   for (const [order, runner] of runners.entries()) {
+    if (runner.transport === 'pull') {
+      skipped.push({ name: runner.name, reason: 'pull transport' });
+      continue;
+    }
     if (runner.offline) {
       skipped.push({ name: runner.name, reason: 'marked offline' });
       continue;
@@ -1170,6 +1174,66 @@ export async function dispatchRemote(opts) {
   return dispatchOnce({ ...opts, ticketId: crypto.randomUUID(), blobCache: false });
 }
 
+/** The exec header for one dispatch: the single place its fields and their omission rules live (the have-query adds `repoIdentity` afterwards). */
+export function buildExecHeader({
+  runner, ticketId, generation, repoKey, lane, weight, cpuCores, memoryBytes, argv, relCwd, remoteDeps, remoteSetup, remoteDepsCache,
+  remoteDepsCacheRootScriptsSafe, remoteDepsCacheKeyFiles, remoteDepsCacheKeyFilesCoverInstallScripts, remoteArtifacts, remoteArtifactsOn, minCpuCores,
+  maxExecutionCpuCores, queueTimeoutMs, noProgressTimeoutMs, silenceTimeoutMs, laneClass, classEnforcement, priorityRequested, priorityAccruedMs, group,
+}) {
+  // BRAIN-320 S1c (1d): the protocol this dispatch speaks is derived here,
+  // from `needsProtocol2`, and nowhere else -- `header.protocol` is the
+  // single source `encodeSnapshot` serializes and `expected.protocol` (below)
+  // binds the fetched result against. remoteDeps/remoteSetup only ever ride
+  // in the header when they are actually present (undefined, never null --
+  // a protocol-1 header must never carry either key at all, see
+  // remote-runner.js's `validateHeaderFields`).
+  const protocol = needsProtocol2({ remoteDeps, remoteSetup }) ? 2 : 1;
+  const header = { protocol, ticketId, generation, repoKey, lane, weight, cpuCores, memoryBytes, argv, relCwd };
+  // BRAIN-597: the runner's name in THIS submitter's config, exported to the command as LANE_BROKER_RUNNER (additive; an older runner ignores it).
+  header.runnerName = runner.name;
+  // BRAIN-901: exported as LANE_BROKER_RUNNER_SPEED_FACTOR so a repo can scale test time budgets (additive; an older runner ignores it).
+  if (runner.speedFactor !== undefined) header.runnerSpeedFactor = runner.speedFactor;
+  if (protocol === 2) {
+    if (Array.isArray(remoteDeps) && remoteDeps.length > 0) header.remoteDeps = remoteDeps;
+    if (Array.isArray(remoteSetup) && remoteSetup.length > 0) header.remoteSetup = remoteSetup;
+    if (remoteDepsCache === false) header.remoteDepsCache = false;
+    if (remoteDepsCacheRootScriptsSafe === true) {
+      header.remoteDepsCacheRootScriptsSafe = true;
+      if (Array.isArray(remoteDepsCacheKeyFiles) && remoteDepsCacheKeyFiles.length > 0) {
+        header.remoteDepsCacheKeyFiles = remoteDepsCacheKeyFiles;
+        if (remoteDepsCacheKeyFilesCoverInstallScripts === true) header.remoteDepsCacheKeyFilesCoverInstallScripts = true;
+      }
+    }
+  }
+  if (Array.isArray(remoteArtifacts) && remoteArtifacts.length > 0) {
+    header.remoteArtifacts = remoteArtifacts;
+    header.remoteArtifactsOn = remoteArtifactsOn;
+  }
+  if (Number.isFinite(minCpuCores)) header.minCpuCores = minCpuCores;
+  if (maxExecutionCpuCores !== undefined) header.maxExecutionCpuCores = maxExecutionCpuCores;
+  if (Number.isInteger(queueTimeoutMs) && queueTimeoutMs > 0) header.queueTimeoutMs = queueTimeoutMs;
+  if (Number.isInteger(noProgressTimeoutMs) && noProgressTimeoutMs >= 0) header.noProgressTimeoutMs = noProgressTimeoutMs;
+  if (Number.isInteger(silenceTimeoutMs) && silenceTimeoutMs >= 0) header.silenceTimeoutMs = silenceTimeoutMs;
+  if (laneClass === 'sim' || laneClass === 'test') header.laneClass = laneClass;
+  if (classEnforcement === 'required') header.classEnforcement = 'required';
+  if (isPriorityTier(priorityRequested)) header.priorityRequested = priorityRequested;
+  if (Number.isInteger(priorityAccruedMs) && priorityAccruedMs >= 0) header.priorityAccruedMs = priorityAccruedMs;
+  if (isValidGroupId(group)) header.group = group;
+  return header;
+}
+
+/** The send side of one dispatch: encode, count, optionally gzip, count. `stats` fills in as the stream is consumed. */
+export function snapshotPipeline({ worktreeRoot, header, manifest, cached, transferCache, transfer, gzipLevel }) {
+  // BRAIN-642: pipeline() so an upstream encode error (a file mutated since the manifest) reaches pipeSnapshot and tears every
+  // stage down. `transfer` is set only for a runner that lists `snapshot-gzip/1`; otherwise the stream is the legacy one.
+  const stats = { mode: transfer === TRANSFER_GZIP ? TRANSFER_GZIP : 'plain', rawBytes: 0, sentBytes: 0, treeBytes: manifest.entries.reduce((sum, e) => sum + (e.size || 0), 0), cacheFiles: transferCache ? manifest.entries.filter(isCacheable).length : 0, cachedFiles: cached.size };
+  const sendStages = [encodeSnapshot(worktreeRoot, header, manifest.entries, undefined, { cached }), countBytes((n) => { stats.rawBytes += n; })];
+  if (transfer === TRANSFER_GZIP) sendStages.push(zlib.createGzip({ level: gzipLevel }));
+  sendStages.push(countBytes((n) => { stats.sentBytes += n; }));
+  const stream = pipeline(...sendStages, () => {});
+  return { stream, stats };
+}
+
 async function dispatchOnce(opts) {
   const {
     runner,
@@ -1290,45 +1354,12 @@ async function dispatchOnce(opts) {
 
   if (abortSignal && abortSignal.aborted) return { outcome: 'cancelled' };
 
-  // BRAIN-320 S1c (1d): the protocol this dispatch speaks is derived here,
-  // from `needsProtocol2`, and nowhere else -- `header.protocol` is the
-  // single source `encodeSnapshot` serializes and `expected.protocol` (below)
-  // binds the fetched result against. remoteDeps/remoteSetup only ever ride
-  // in the header when they are actually present (undefined, never null --
-  // a protocol-1 header must never carry either key at all, see
-  // remote-runner.js's `validateHeaderFields`).
-  const protocol = needsProtocol2({ remoteDeps, remoteSetup }) ? 2 : 1;
-  const header = { protocol, ticketId, generation, repoKey, lane, weight, cpuCores, memoryBytes, argv, relCwd };
-  // BRAIN-597: the runner's name in THIS submitter's config, exported to the command as LANE_BROKER_RUNNER (additive; an older runner ignores it).
-  header.runnerName = runner.name;
-  // BRAIN-901: exported as LANE_BROKER_RUNNER_SPEED_FACTOR so a repo can scale test time budgets (additive; an older runner ignores it).
-  if (runner.speedFactor !== undefined) header.runnerSpeedFactor = runner.speedFactor;
-  if (protocol === 2) {
-    if (Array.isArray(remoteDeps) && remoteDeps.length > 0) header.remoteDeps = remoteDeps;
-    if (Array.isArray(remoteSetup) && remoteSetup.length > 0) header.remoteSetup = remoteSetup;
-    if (remoteDepsCache === false) header.remoteDepsCache = false;
-    if (remoteDepsCacheRootScriptsSafe === true) {
-      header.remoteDepsCacheRootScriptsSafe = true;
-      if (Array.isArray(remoteDepsCacheKeyFiles) && remoteDepsCacheKeyFiles.length > 0) {
-        header.remoteDepsCacheKeyFiles = remoteDepsCacheKeyFiles;
-        if (remoteDepsCacheKeyFilesCoverInstallScripts === true) header.remoteDepsCacheKeyFilesCoverInstallScripts = true;
-      }
-    }
-  }
-  if (Array.isArray(remoteArtifacts) && remoteArtifacts.length > 0) {
-    header.remoteArtifacts = remoteArtifacts;
-    header.remoteArtifactsOn = remoteArtifactsOn;
-  }
-  if (Number.isFinite(minCpuCores)) header.minCpuCores = minCpuCores;
-  if (maxExecutionCpuCores !== undefined) header.maxExecutionCpuCores = maxExecutionCpuCores;
-  if (Number.isInteger(queueTimeoutMs) && queueTimeoutMs > 0) header.queueTimeoutMs = queueTimeoutMs;
-  if (Number.isInteger(noProgressTimeoutMs) && noProgressTimeoutMs >= 0) header.noProgressTimeoutMs = noProgressTimeoutMs;
-  if (Number.isInteger(silenceTimeoutMs) && silenceTimeoutMs >= 0) header.silenceTimeoutMs = silenceTimeoutMs;
-  if (laneClass === 'sim' || laneClass === 'test') header.laneClass = laneClass;
-  if (classEnforcement === 'required') header.classEnforcement = 'required';
-  if (isPriorityTier(priorityRequested)) header.priorityRequested = priorityRequested;
-  if (Number.isInteger(priorityAccruedMs) && priorityAccruedMs >= 0) header.priorityAccruedMs = priorityAccruedMs;
-  if (isValidGroupId(group)) header.group = group;
+  const header = buildExecHeader({
+    runner, ticketId, generation, repoKey, lane, weight, cpuCores, memoryBytes, argv, relCwd, remoteDeps, remoteSetup, remoteDepsCache,
+    remoteDepsCacheRootScriptsSafe, remoteDepsCacheKeyFiles, remoteDepsCacheKeyFilesCoverInstallScripts, remoteArtifacts, remoteArtifactsOn, minCpuCores,
+    maxExecutionCpuCores, queueTimeoutMs, noProgressTimeoutMs, silenceTimeoutMs, laneClass, classEnforcement, priorityRequested, priorityAccruedMs, group,
+  });
+  const { protocol } = header;
 
   // BRAIN-642: the have-query. Any failure or timeout leaves `cached` empty and `transferCache` false: every body is sent, gzip or
   // plain by the runner's OTHER capability. The two capabilities are independent.
@@ -1380,13 +1411,7 @@ async function dispatchOnce(opts) {
     if (!persisted) return { outcome: 'unconfirmed', reason: 'could not persist the dispatch binding', neverStarted: true };
   }
 
-  // BRAIN-642: pipeline() so an upstream encode error (a file mutated since the manifest) reaches pipeSnapshot and tears every
-  // stage down. `transfer` is set only for a runner that lists `snapshot-gzip/1`; otherwise the stream is the legacy one.
-  const transferStats = { mode: transfer === TRANSFER_GZIP ? TRANSFER_GZIP : 'plain', rawBytes: 0, sentBytes: 0, treeBytes: manifest.entries.reduce((sum, e) => sum + (e.size || 0), 0), cacheFiles: transferCache ? manifest.entries.filter(isCacheable).length : 0, cachedFiles: cached.size };
-  const sendStages = [encodeSnapshot(worktreeRoot, header, manifest.entries, undefined, { cached }), countBytes((n) => { transferStats.rawBytes += n; })];
-  if (transfer === TRANSFER_GZIP) sendStages.push(zlib.createGzip({ level: gzipLevel }));
-  sendStages.push(countBytes((n) => { transferStats.sentBytes += n; }));
-  const snapshotStream = pipeline(...sendStages, () => {});
+  const { stream: snapshotStream, stats: transferStats } = snapshotPipeline({ worktreeRoot, header, manifest, cached, transferCache, transfer, gzipLevel });
 
   const execCommand = buildRemoteCommand(runner, 'remote-exec', [...(transfer === TRANSFER_GZIP ? ['--transfer', TRANSFER_GZIP] : []), ...(transferCache ? ['--transfer-cache'] : [])]);
   const child = spawn(sshBin, sshArgv(runner, execCommand), { stdio: ['pipe', 'pipe', 'pipe'], env });
