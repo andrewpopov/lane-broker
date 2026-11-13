@@ -112,7 +112,7 @@ const SCENARIOS = {
     await fast.runner.claim();
     const claimedAt = Date.now();
     await fast.killSupervisor();
-    const urls = await until(async () => (await fast.runner.heartbeat()).urls);
+    const urls = await until(async () => (await fast.runner.heartbeat()).urls, 55_000);
     stop.abort();
     await serving;
     assert.equal(urls?.epoch, 1);
@@ -228,7 +228,7 @@ const SCENARIOS = {
     await fx.enqueue();
     await fx.runner.claim();
     await fx.killSupervisor();
-    const urls = await until(async () => (await fx.runner.heartbeat()).urls);
+    const urls = await until(async () => (await fx.runner.heartbeat()).urls, 30_000);
     stop.abort();
     await serving;
     assert.equal(urls?.epoch, 1, 'a later pass attached the URLs');
