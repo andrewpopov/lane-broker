@@ -10,7 +10,7 @@ export const NOT_LIVE = Object.freeze({ skipped: 'not-live' });
 const RETRYABLE_SQLSTATES = new Set(['57P01', '57P02', '57P03', '57014', '55P03', '53300']);
 const NETWORK_ERRORS = new Set(['ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'EHOSTUNREACH', 'ENETUNREACH', 'ENOTFOUND', 'EAI_AGAIN']);
 // pg's client-side bounds (query_timeout, connectionTimeoutMillis) surface as message-only errors.
-const DEAD_CONNECTION_MESSAGE = /Connection terminated|not queryable|connection error|Connection ended|Query read timeout|timeout exceeded when trying to connect/i;
+const DEAD_CONNECTION_MESSAGE = /Connection terminated|not queryable|connection error|Connection ended|Query read timeout|^timeout expired$/i;
 
 const TURN_ATTEMPTS = 2;
 const YIELD = Symbol('yield');
@@ -87,7 +87,9 @@ export class LdClient {
     this.#assertOpen();
     this.onCall?.(name, args);
     const placeholders = args.map((_, i) => `$${i + 1}`).join(', ');
-    const { rows: [row] } = await this.#client.query(`SELECT lane_dispatch.${name}(${placeholders}) AS v`, args);
+    const client = this.#client;
+    if (!client) throw new Error('Connection ended before the call was sent');
+    const { rows: [row] } = await client.query(`SELECT lane_dispatch.${name}(${placeholders}) AS v`, args);
     return row.v;
   }
 
@@ -113,7 +115,7 @@ export class LdClient {
       const turn = async () => {
         try {
           const answer = await this.#turn(job, call);
-          if (answer === YIELD) return this.#enqueue(turn);
+          if (answer === YIELD) return void this.#sleep(backoffMs(job.failures, this.backoff, this.random)).then(() => this.#enqueue(turn));
           if (answer !== NOT_LIVE) await persist?.(answer);
           resolve(answer);
         } catch (err) {

@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'node:net';
 import { PG_LIVENESS } from '../src/agent/config.js';
-import { assertCanaryFails, mutateSrcTree } from './helpers/mutant-module.js';
+import path from 'node:path';
+import { LdClient } from '../src/agent/ld-client.js';
+import { assertCanaryFails, importMutant, mutateSrcTree } from './helpers/mutant-module.js';
 
 const CONFIG = 'agent/config.js';
 const REAL = 'connectionTimeoutMillis: 10_000, query_timeout: 20_000';
@@ -54,4 +56,42 @@ test('a server that stops answering is detected within the timeouts and the call
 test('canary: with query_timeout dropped, a stalled server is never detected', async () => {
   const failure = await assertCanaryFails(CONFIG, [REAL, 'connectionTimeoutMillis: 300'], detectsDeadServer);
   assert.match(failure.message, /never given up on/);
+});
+
+// Accepts TCP and never answers startup: pg's connectionTimeoutMillis is the only thing that ends the connect.
+async function silentServer() {
+  const server = { sockets: new Set(), accepted: 0 };
+  const tcp = net.createServer((socket) => {
+    server.accepted += 1;
+    server.sockets.add(socket);
+    socket.on('error', () => {});
+  });
+  await new Promise((resolve) => tcp.listen(0, '127.0.0.1', resolve));
+  server.port = tcp.address().port;
+  server.close = () => { for (const socket of server.sockets) socket.destroy(); tcp.close(); };
+  return server;
+}
+
+async function retriesAConnectTimeout(Client) {
+  const server = await silentServer();
+  const client = new Client({ pg: { host: '127.0.0.1', port: server.port, user: 'u', database: 'd', ...PG_LIVENESS, connectionTimeoutMillis: 200 }, version: 't', backoff: { minMs: 5, maxMs: 20 } });
+  const pending = client.claim('44444444-4444-4444-8444-444444444444', 8, 1e9).catch((err) => err);
+  try {
+    for (let i = 0; i < 100 && server.accepted < 2; i++) await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.ok(server.accepted >= 2, `a connect timeout was not retried (connections accepted: ${server.accepted})`);
+  } finally {
+    await client.close();
+    server.close();
+    await pending;
+  }
+}
+
+test('a server that accepts but never answers startup is given up on and the connect retried', () => retriesAConnectTimeout(LdClient));
+
+test('canary: with the connect timeout message not retryable, the connect is attempted once', async () => {
+  const mutant = await importMutant(path.join(import.meta.dirname, '..', 'src', 'agent', 'ld-client.js'), ['|^timeout expired$/i', '/i']);
+  const failure = await retriesAConnectTimeout(mutant.LdClient).then(() => null, (err) => err);
+  assert.ok(failure, 'the scenario still passed without the message in the retry list, so it proves nothing');
+  assert.equal(failure.code, 'ERR_ASSERTION', failure.stack);
+  assert.match(failure.message, /was not retried/);
 });

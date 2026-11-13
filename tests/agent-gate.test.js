@@ -58,10 +58,13 @@ const SCENARIOS = {
     const c = await takeTicket(w, client);
     const [callPid] = await backendPids(w, 'SELECT lane_dispatch%');
     await terminateBackend(w, callPid);
-    await sleep(100);
     const before = names().length;
     await Promise.all([client.heartbeat(c.id, c.epoch, c.token), client.claim(randomUUID(), 8, 1e9)]);
-    assert.deepEqual(names().slice(before), [...FIRST_CALLS, 'ld_heartbeat', 'ld_claim']);
+    const sent = names().slice(before);
+    const firstRegister = sent.indexOf('ld_register');
+    assert.ok(firstRegister >= 0, `no ld_register after the call backend died: ${sent}`);
+    assert.ok(sent.slice(0, firstRegister).every((n) => n === 'ld_heartbeat'), 'only the heartbeat that found the dead connection precedes register');
+    assert.deepEqual(sent.slice(firstRegister), [...FIRST_CALLS, 'ld_heartbeat', 'ld_claim']);
   },
 };
 

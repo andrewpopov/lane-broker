@@ -132,7 +132,7 @@ test('a LISTEN failure after startup is logged and recorded in status.json even 
 });
 
 test('a client-side timeout is retryable, like a dead connection', () => {
-  for (const message of ['Query read timeout', 'timeout exceeded when trying to connect', 'Connection terminated due to connection timeout']) assert.equal(isRetryable(new Error(message)), true, message);
+  for (const message of ['Query read timeout', 'timeout expired', 'Connection terminated due to connection timeout']) assert.equal(isRetryable(new Error(message)), true, message);
   assert.equal(isRetryable(new Error('syntax error')), false);
 });
 
@@ -171,10 +171,12 @@ const TURN_SCENARIOS = {
   },
 };
 
+const SLEEP_AFTER_YIELD = 'if (answer === YIELD) return void this.#sleep(backoffMs(job.failures, this.backoff, this.random)).then(() => this.#enqueue(turn));';
+
 const TURN_CANARIES = {
   'a heartbeat completes while another call keeps failing 57014: the failing call yields its turn after two attempts': ['const TURN_ATTEMPTS = 2;', 'const TURN_ATTEMPTS = Infinity;'],
   'a call re-queued at the tail keeps its promise and request, and persist runs once, on the real answer': [
-    'if (answer === YIELD) return this.#enqueue(turn);', 'await persist?.(answer);\n          if (answer === YIELD) return this.#enqueue(turn);',
+    SLEEP_AFTER_YIELD, `await persist?.(answer);\n          ${SLEEP_AFTER_YIELD}`,
   ],
 };
 
@@ -187,3 +189,69 @@ for (const [name, scenario] of Object.entries(TURN_SCENARIOS)) {
     assert.equal(failure.code, 'ERR_ASSERTION', failure.stack);
   });
 }
+
+const CADENCE = 'a lone failing call never retries twice without a backoff between the attempts, across the yield too';
+const MIN_BACKOFF_MS = 100;
+
+async function lonelyCallBacksOff(Client) {
+  const stub = makeStubPg({ answers: { ld_claim: () => { throw sqlError('57014'); } } });
+  const at = [];
+  const { client } = newClient(stub, { backoff: { minMs: MIN_BACKOFF_MS, maxMs: 15_000 }, random: () => 1, onCall: (name) => { if (name === 'ld_claim') at.push(Date.now()); } }, Client);
+  await client.open();
+  client.claim('44444444-4444-4444-8444-444444444444', 8, 1e9).catch(() => {});
+  await new Promise((resolve) => setTimeout(resolve, 700));
+  assert.ok(at.length >= 3, `expected several attempts, saw ${at.length}`);
+  const gaps = at.slice(1).map((t, i) => t - at[i]);
+  assert.ok(gaps.every((gap) => gap >= MIN_BACKOFF_MS - 10), `two attempts ran back to back: gaps ${gaps.join(',')} ms`);
+}
+
+test(CADENCE, () => lonelyCallBacksOff(LdClient));
+
+test(`canary: with the sleep after a yield removed, "${CADENCE}" fails on its own assertion`, async () => {
+  const mutant = await importMutant(LD_CLIENT, [SLEEP_AFTER_YIELD, 'if (answer === YIELD) return this.#enqueue(turn);']);
+  const failure = await lonelyCallBacksOff(mutant.LdClient).then(() => null, (err) => err);
+  assert.ok(failure, 'the scenario still passed without its guard, so it proves nothing');
+  assert.equal(failure.code, 'ERR_ASSERTION', failure.stack);
+  assert.match(failure.message, /back to back/);
+});
+
+test('close() while a call waits to be re-queued rejects it with LdClosedError and sends nothing more', async () => {
+  const stub = makeStubPg({ answers: { ld_claim: () => { throw sqlError('57014'); } } });
+  const { client } = newClient(stub, { backoff: { minMs: 5_000, maxMs: 5_000 } });
+  await client.open();
+  const claim = client.claim('44444444-4444-4444-8444-444444444444', 8, 1e9);
+  const settled = assert.rejects(claim, LdClosedError);
+  await untilTrue('the claim failed its turn', () => stub.names().filter((n) => n === 'ld_claim').length >= 1);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  await client.close();
+  await Promise.race([settled, new Promise((_, reject) => setTimeout(reject, 1000, new Error('close() left the call hanging')))]);
+  const sent = stub.names().length;
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.equal(stub.names().length, sent, 'nothing was sent after close');
+});
+
+const RACE = 'a connection that dies in the same tick register answers is retried, not a TypeError';
+const CLIENT_NULL_GUARD = "if (!client) throw new Error('Connection ended before the call was sent');";
+
+async function connectionDiesRightAfterRegister(Client) {
+  let registers = 0;
+  let stub;
+  stub = makeStubPg({ answers: { ld_register: () => new Promise((resolve) => setTimeout(() => {
+    resolve({ host: 'a1', max_claims: 2, protocol_min: 1 });
+    if (registers++ === 1) stub.clients.at(-1).emit('error', sqlError('57P01'));
+  }, 1)) } });
+  const { client } = newClient(stub, {}, Client);
+  await client.open();
+  stub.clients[0].emit('error', new Error('connection lost'));
+  assert.deepEqual(await client.heartbeat(ID, 1, TOKEN), null);
+  assert.deepEqual(stub.names().slice(-3), ['ld_register', 'ld_register', 'ld_heartbeat']);
+}
+
+test(RACE, () => connectionDiesRightAfterRegister(LdClient));
+
+test(`canary: with the null-client guard removed, "${RACE}" fails on its own assertion`, async () => {
+  const mutant = await importMutant(LD_CLIENT, [`\n    ${CLIENT_NULL_GUARD}`, '']);
+  const failure = await connectionDiesRightAfterRegister(mutant.LdClient).then(() => null, (err) => err);
+  assert.ok(failure, 'the scenario still passed without its guard, so it proves nothing');
+  assert.ok(failure instanceof TypeError, `it must fail on the TypeError the guard prevents: ${failure.stack}`);
+});
