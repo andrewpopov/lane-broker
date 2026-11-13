@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import os from 'node:os';
 import { createAttempt } from '../src/attempts.js';
 import { pullTicketDir, withTicketLock } from '../src/pull-envelope.js';
 import { ledgerAccept, readLedger } from '../src/pull-ledger.js';
@@ -10,6 +9,7 @@ import { ensureStateDirs, readJsonSafe } from '../src/state.js';
 import { freshEnv } from './helpers.js';
 import { ARTIFACT_PATH, artifactsStream, definePullSuite, pullFixture } from './helpers/pull-fixture.js';
 import { harnessClient } from './helpers/queue-fixture.js';
+import { makeTmpDir } from './helpers/tmp.js';
 import { startS3Stub, STUB_CREDS, STUB_REGION } from './helpers/s3-stub.js';
 import { call, enqueue, logins, tid } from './lane-dispatch-fixture.js';
 
@@ -129,7 +129,7 @@ const SCENARIOS = {
     const fx = await gcFixture(t, w, load);
     const key = `blobs/${NS}/${sha(7)}`;
     fx.put(SNAP, key, 20 * DAY * 1000);
-    const tmp = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gc-reput-')), 'blob');
+    const tmp = path.join(makeTmpDir('gc-reput-'), 'blob');
     fs.writeFileSync(tmp, 'x');
     let paused = false;
     const summary = await fx.run({ hooks: { beforeBlobDelete: async () => { paused = true; await fx.s3.putObjectFromFile(SNAP, key, tmp); } } });
