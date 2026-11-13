@@ -510,6 +510,8 @@ function guarded(run, fn) {
   return withTicketLock(run.root, run.id, async () => {
     const entry = readLedger(run.root, run.id);
     if (entry !== null) return applyEntry(run, entry);
+    const attempt = readAttempt(run.root, run.id);
+    if (attempt && attempt.generation !== run.generation) return { state: 'stale' };
     return fn(run);
   }, { lockTimeoutMs: run.lockTimeoutMs });
 }
