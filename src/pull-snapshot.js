@@ -26,7 +26,7 @@ function recordBlobUpload(root, indexKey, uploadedAt, refreshAfterMs) {
   atomicWriteJson(blobIndexFile(root), { ...Object.fromEntries(live), [indexKey]: uploadedAt });
 }
 
-async function mapBounded(items, limit, fn) {
+export async function mapBounded(items, limit, fn) {
   let next = 0;
   let failed = false;
   const worker = async () => {

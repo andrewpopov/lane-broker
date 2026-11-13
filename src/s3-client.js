@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { Readable } from 'node:stream';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { amzTimestamp, awsUriEncode, canonicalQueryString, credentialScope, objectPath, sha256Hex, signatureFor } from './s3-presign.js';
 
 /** The S3 operations the pull transport needs (path-style, header-signed SigV4) over `fetch`. Every operation has a deadline. */
@@ -60,10 +61,31 @@ async function sha256AndSize(file) {
   return { sha256: hash.digest('hex'), size };
 }
 
+async function spoolBody(body, file) {
+  const hash = crypto.createHash('sha256');
+  let size = 0;
+  const tap = new Transform({
+    transform(chunk, _encoding, done) {
+      hash.update(chunk);
+      size += chunk.length;
+      done(null, chunk);
+    },
+  });
+  const part = `${file}.${crypto.randomBytes(6).toString('hex')}.part`;
+  try {
+    await pipeline(Readable.fromWeb(body), tap, fs.createWriteStream(part));
+    fs.renameSync(part, file);
+  } catch (err) {
+    fs.rmSync(part, { force: true });
+    throw err;
+  }
+  return { sha256: hash.digest('hex'), size };
+}
+
 export function createS3Client({ endpoint, region, credentialsEnvFile, creds = loadS3Credentials(credentialsEnvFile), fetchImpl = globalThis.fetch, now = Date.now, deadlineMs = DEFAULT_S3_DEADLINE_MS }) {
   const base = new URL(endpoint);
 
-  async function send(op, { method, bucket, key, query = {}, payloadSha = EMPTY_SHA256, body, contentLength, deadline }) {
+  async function send(op, { method, bucket, key, query = {}, payloadSha = EMPTY_SHA256, body, contentLength, deadline, toFile }) {
     const path = key === undefined ? `/${awsUriEncode(bucket)}` : objectPath(bucket, key);
     const queryString = canonicalQueryString(query);
     const stamp = amzTimestamp(now());
@@ -80,8 +102,9 @@ export function createS3Client({ endpoint, region, credentialsEnvFile, creds = l
     const signal = AbortSignal.timeout(deadline ?? deadlineMs);
     try {
       const res = await fetchImpl(url, { method, headers, signal, ...(body === undefined ? {} : { body, duplex: 'half' }) });
-      const text = method === 'HEAD' ? '' : await res.text();
-      return { res, text };
+      const streamed = toFile && res.status === 200 ? await spoolBody(res.body, toFile) : null;
+      const text = method === 'HEAD' || streamed ? '' : await res.text();
+      return { res, text, streamed };
     } catch (err) {
       if (err?.name === 'TimeoutError' || err?.name === 'AbortError') throw new S3Error(`s3 ${op} timed out after ${deadline ?? deadlineMs}ms`, { code: 'Timeout' });
       throw new S3Error(`s3 ${op} failed: ${err?.cause?.code ?? err?.message}`, { code: 'Network' });
@@ -104,6 +127,14 @@ export function createS3Client({ endpoint, region, credentialsEnvFile, creds = l
       const reply = await send(`PUT ${bucket}/${key}`, { method: 'PUT', bucket, key, payloadSha: sha256, body: Readable.toWeb(fs.createReadStream(file)), contentLength: size, deadline });
       if (reply.res.status !== 200) throw fail(`PUT ${bucket}/${key}`, reply);
       return { sha256, size };
+    },
+
+    /** Streams the object to `file` (via `file.part`, renamed once whole) and reports the sha256 and size it saw; the caller compares them. */
+    async getObjectToFile(bucket, key, file, { deadlineMs: deadline } = {}) {
+      const reply = await send(`GET ${bucket}/${key}`, { method: 'GET', bucket, key, deadline, toFile: file });
+      if (reply.res.status === 404) return { exists: false };
+      if (reply.res.status !== 200) throw fail(`GET ${bucket}/${key}`, reply);
+      return { exists: true, ...reply.streamed };
     },
 
     async deleteObject(bucket, key, { deadlineMs: deadline } = {}) {

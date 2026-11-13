@@ -761,7 +761,7 @@ export function haveDeadlineFor(probe) {
   return Math.min(HAVE_DEADLINE_MAX_MS, Math.max(HAVE_DEADLINE_MIN_MS, 2 * roundTripMs));
 }
 /** The runner rejects with exactly these reasons when a `body:'cached'` frame could not be served from its store. */
-const CACHE_REJECT_RE = /^cache-(?:miss|corrupt): \d+$/;
+export const CACHE_REJECT_RE = /^cache-(?:miss|corrupt): \d+$/;
 
 /**
  * BRAIN-642: ask `runner` (`lane remote-have`, one ssh round trip) which of `hashes` its blob store holds. Resolves the Set of

@@ -1490,6 +1490,18 @@ Nothing dispatches this way until `lanePull.enabled` is true; this section is th
 - `src/pull-snapshot.js` uploads cached blobs to `lane-snap/blobs/<ns>/<sha256>` (HEAD first; a blob older than `blobRefreshAfterDays` is
   uploaded again, aged by HEAD `Last-Modified`, else `<state>/pull/blob-index.json`, else treated as old) and the gzipped stream to
   `lane-snap/streams/<ticketId>-<generation>-<sha256>.gz`. It returns the descriptor `{key, sha256, bytes, blobs}` (`key` is relative to the bucket) and the header with `repoIdentity` set.
+- `src/pull-ticket.js` is the per-ticket step machine, off until a later slice calls it. `stepPullTicket(ctx)` is one bounded, idempotent pass that returns `{state, next}`;
+  `runPullTicket` loops it (retry timing belongs to that loop; a queue, store or lock failure is waited out, never a state change). Every pass takes the ticket lock and
+  reads `<state>/pull-ledger/<id>.json` **first**: with an acceptance on disk nothing else is read, from the queue or the store, and the effects (the log gap fill, the artifacts
+  install, the publish) run from the entry alone. Otherwise it reads the row (`ld_get`) and decides: a runner result goes through `classifyRemoteResult` (a bound `rejected` result is lost 75,
+  `snapshot-blob-missing` for a `cache-miss|cache-corrupt` reason, else `runner-rejected`), a queue-authored cancel (`ld_cancel`, `ld_cancel_quarantined`, a release) by its `source`.
+  Only a queued or runner-confirmed stop is a cancel (130); a quarantine or operator cancel stays unresolved (exit 1, attempt kept) until `quarantineLostAfterMs`, then lost 75. A missing or `lost` row
+  settles lost 75 and a quarantined one lost 75 `queue-restored` after the same bound. The decision is ledgered before anything is done with it, then published with `cancelPrecedence: 'decision'`
+  so a local cancel marker cannot turn a completed run into 130. `withdrawQueued` proves a withdraw only from a committed `withdrawn`, re-reading the row when the answer is lost.
+- `src/pull-ledger.js` is that ledger: one file per ticket, created by `link` (so exactly one racing creator wins), its directory fsynced before anyone trusts an existing entry. A result is keyed
+  `(epoch, attempt_ref, resultSha256)`, a queue-authored decision `(epoch, kind, source|proof)`; a different acceptance for the same ticket is refused and the stored one stands.
+- `src/pull-log-cursor.js` is `<state>/pull/<id>/log-cursor.json`, `{epoch, ackedSeq, logBytes, epochStartBytes}`. A page is written, `durable()`, the cursor fsynced, then `ld_log_ack`; `ackedSeq` starts at -1.
+  A restart reconciles the file to `logBytes` (never upward) **before** the `CappedLogWriter` is built. At settle the verified log is only ever appended (the streamed log is never rewritten).
 
 ### Pull agent client core (BRAIN-1035)
 

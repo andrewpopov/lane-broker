@@ -58,6 +58,8 @@ export function paths(root = stateHome()) {
     withdraw: path.join(root, 'withdraw'),
     // BRAIN-1036: one directory per pull ticket (`pull/<id>/envelope.json`), the durable record a recovery rebuilds from.
     pull: path.join(root, 'pull'),
+    // BRAIN-1036: one acceptance entry per pull ticket (`pull-ledger/<id>.json`), created by link and never replaced.
+    pullLedger: path.join(root, 'pull-ledger'),
     // BRAIN-731: one file per ticket cancelled because a repeat of its push replaced it; the content is the superseding id.
     superseded: path.join(root, 'superseded'),
     // BRAIN-731: one file per push-gate ticket whose foreground client gave up at --timeout and left it queued for `lane wait`.
