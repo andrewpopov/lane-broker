@@ -348,17 +348,29 @@ SCENARIOS['a transient failure is waited out; any other server error or a store 
     await assert.rejects(waiting.run({ queue: failingGet(waiting, err), sleep }), STOP, String(err.code));
     assert.deepEqual(sleeps, [15_000, 15_000, 15_000], `${err.code} was waited out`);
   }
+  for (const code of ['57014', '55P03', '40P01', '40001', '57P02', '57P03']) {
+    const { sleeps, sleep } = retriesThenStops();
+    await assert.rejects(waiting.run({ queue: failingGet(waiting, sqlError(code)), sleep }), STOP, code);
+    assert.equal(sleeps.length, 3, `${code} is a retryable server answer`);
+  }
+  const tlsFailures = [
+    new QueueError('ld_get failed: self signed', { code: 'DEPTH_ZERO_SELF_SIGNED_CERT', cause: Object.assign(new Error('self signed'), { code: 'DEPTH_ZERO_SELF_SIGNED_CERT' }) }),
+    new QueueError('ld_get failed: altname', { code: 'ERR_TLS_CERT_ALTNAME_INVALID', cause: Object.assign(new Error('altname'), { code: 'ERR_TLS_CERT_ALTNAME_INVALID' }) }),
+  ];
+  for (const err of tlsFailures) assert.equal((await waiting.run({ queue: failingGet(waiting, err), sleep: mustNotWait })).outcome, 'unresolved', String(err.code));
   const denied = await next(t, w, load, ++n, first);
   await denied.prepare();
   const refused = { ...denied.s3, headObject: async () => { throw new S3Error('s3 HEAD answered 403', { status: 403, code: 'AccessDenied' }); } };
   assert.equal((await denied.run({ s3: refused, sleep: mustNotWait })).outcome, 'unresolved');
+  const expired = new S3Error('s3 HEAD failed: CERT_HAS_EXPIRED', { code: 'Network', cause: new TypeError('fetch failed', { cause: Object.assign(new Error('expired'), { code: 'CERT_HAS_EXPIRED' }) }) });
+  assert.equal((await denied.run({ s3: { ...denied.s3, headObject: async () => { throw expired; } }, sleep: mustNotWait })).outcome, 'unresolved', 'a TLS failure wrapped in an S3Error is permanent');
   for (const err of [new S3Error('s3 HEAD answered 503', { status: 503 }), new S3Error('s3 HEAD timed out', { code: 'Timeout' })]) {
     const { sleep } = retriesThenStops(2);
     await assert.rejects(denied.run({ s3: { ...denied.s3, headObject: async () => { throw err; } }, sleep }), STOP);
   }
 };
 
-SCENARIOS['a log that never drains is bounded: the result is ledgered after 5 passes with a log warning'] = async (load, w, t) => {
+SCENARIOS['a log that never drains is bounded: the result is ledgered after 5 passes and the gap hold, with a log warning'] = async (load, w, t) => {
   const fx = await pullFixture(t, w, { load });
   await fx.hold();
   await fx.runner.finish();
@@ -366,14 +378,15 @@ SCENARIOS['a log that never drains is bounded: the result is ledgered after 5 pa
   const endless = { ...fx.queue, logRead: async () => [{ seq: seq++, data: Buffer.from('x\n').toString('base64') }] };
   let settled;
   let passes = 0;
-  while (settled === undefined && passes < 10) {
+  while (settled === undefined && passes < 20) {
     passes += 1;
+    fx.clock.now += 1_000;
     const out = await fx.step({ queue: endless });
     if (out.state === 'settled') settled = out;
     else assert.equal(out.state, 'draining-log');
   }
   assert.ok(settled, 'the terminal result was never ledgered');
-  assert.equal(passes, 5);
+  assert.equal(passes, 13, 'never before the gap hold has had its 10 s plus a retry interval, however many passes');
   assert.match(settled.result.remoteLogWarning, /not fully drained after 5 passes/);
   assert.equal(settled.result.exit, 0);
 };
@@ -424,6 +437,41 @@ SCENARIOS['a claimed row with a vanished stream is cancelled durably and settles
   const unresolved = await stuck.step();
   assert.deepEqual([unresolved.state, unresolved.exitCode], ['unresolved', 1]);
   assert.equal(readLedger(stuck.state, stuck.id), null, 'a bounded wait is still not lost while it may run');
+};
+
+SCENARIOS['a stream that vanished while the agent started anyway never publishes 75: an unproven cancel stays unresolved'] = async (load, w, t) => {
+  const fx = await pullFixture(t, w, { load });
+  await fx.enqueue();
+  await fx.runner.claim();
+  fx.stub.objects.delete(`lane-snap/${readEnvelope(fx.state, fx.id).snapshot.key}`);
+  let started = false;
+  const racing = { ...fx.queue, get: async (id) => {
+    const row = await fx.queue.get(id);
+    if (!started) { started = true; await fx.runner.start(); }
+    return row;
+  } };
+  assert.equal((await fx.step({ queue: racing })).state, 'claimed', 'the row read claimed; the agent started behind it');
+  assert.equal((await fx.row()).state, 'running');
+  assert.equal((await fx.row()).cancel_requested, true);
+  await fx.runner.finishCancelled(false);
+  const out = await fx.step();
+  assert.deepEqual([out.state, out.exitCode], ['unresolved', 1]);
+  assert.equal(readLedger(fx.state, fx.id), null, 'not lost while the process may be alive');
+  assert.equal(fx.published(), null);
+};
+
+SCENARIOS['runPullTicket ends the run when a step is unresolved instead of looping on a renewed lease'] = async (load, w, t) => {
+  const fx = await pullFixture(t, w, { load });
+  await fx.enqueue();
+  await fx.runner.claim();
+  fx.stub.objects.delete(`lane-snap/${readEnvelope(fx.state, fx.id).snapshot.key}`);
+  let sleeps = 0;
+  const sleep = async () => {
+    if (++sleeps > 4) assert.fail('the run kept waiting on an unresolved step');
+    fx.clock.now += 31 * 60_000;
+  };
+  const outcome = await fx.run({ sleep });
+  assert.deepEqual([outcome.outcome, outcome.reason, outcome.exitCode], ['unresolved', 'snapshot-missing', 1]);
 };
 
 SCENARIOS['a quarantined row settled after quarantineLostAfterMs is also cancelled in the queue'] = async (load, w, t) => {
@@ -494,12 +542,17 @@ SCENARIOS['T16: cancel outcomes: queued, released, runner-confirmed and a normal
 };
 
 const CANARIES = [
+  ['a stream that vanished while the agent started anyway never publishes 75: an unproven cancel stays unresolved', 'pull-ticket.js', ["if (pull?.snapshotMissing && decision.kind === 'cancelled') decision", "if (pull?.snapshotMissing && (decision.kind === 'cancelled' || decision.kind === 'unproven')) decision"]],
+  ['runPullTicket ends the run when a step is unresolved instead of looping on a renewed lease', 'pull-ticket.js', ["    if (step.state === 'unresolved') return { outcome: 'unresolved', reason: step.reason, exitCode: step.exitCode };\n", '']],
+  ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'pull-ticket.js', ["['53300', '57P01', '57P02', '57P03', '57014', '55P03', '40P01', '40001']", "['53300', '57P01']"]],
+  ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'pull-ticket.js', ['  if (tlsFailure(err)) return false;\n', '']],
   ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'pull-ticket.js', ['  return err.cause !== undefined && typeof err.cause.severity !== \'string\';', '  return true;']],
   ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'pull-ticket.js', ['return err.status === null || err.status >= 500 || err.status === 408 || err.status === 429;', 'return true;']],
   ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'pull-ticket.js', ["if (TRANSIENT_SQLSTATES.has(code) || code.startsWith('08')) return true;\n", '']],
-  ['a log that never drains is bounded: the result is ledgered after 5 passes with a log warning', 'pull-ticket.js', ['    if (passes < LOG_DRAIN_PASSES) {', '    if (true) {']],
+  ['a log that never drains is bounded: the result is ledgered after 5 passes and the gap hold, with a log warning', 'pull-ticket.js', ['    if (passes < LOG_DRAIN_PASSES || run.now() - drainSince < run.cfg.logGapHoldMs + LOG_DRAIN_RETRY_MS) {', '    if (true) {']],
+  ['a log that never drains is bounded: the result is ledgered after 5 passes and the gap hold, with a log warning', 'pull-ticket.js', [' || run.now() - drainSince < run.cfg.logGapHoldMs + LOG_DRAIN_RETRY_MS', '']],
   ['a running row never needs the stream: a vanished stream is ignored and the refreshed URLs carry none', 'pull-ticket.js', ['const head = running ? { exists: true } : await run.s3.headObject(', 'const head = await run.s3.headObject(']],
-  ['a claimed row with a vanished stream is cancelled durably and settles lost only once it leaves the held state, never while it may run', 'pull-ticket.js', ["  if (pull?.snapshotMissing && (decision.kind === 'cancelled' || decision.kind === 'unproven')) decision = lost('snapshot-missing');\n", '']],
+  ['a claimed row with a vanished stream is cancelled durably and settles lost only once it leaves the held state, never while it may run', 'pull-ticket.js', ["  if (pull?.snapshotMissing && decision.kind === 'cancelled') decision = lost('snapshot-missing');\n", '']],
   ['a claimed row with a vanished stream is cancelled durably and settles lost only once it leaves the held state, never while it may run', 'pull-ticket.js', ['  await requestCancel(run);\n  if (run.now() - since <', '  if (run.now() - since <']],
   ['a quarantined row settled after quarantineLostAfterMs is also cancelled in the queue', 'pull-ticket.js', ["  await run.queue.cancel(run.id).catch(() => {});\n  await hook(run, 'afterLedger');", "  await hook(run, 'afterLedger');"]],
   ['T16: cancel outcomes: queued, released, runner-confirmed and a normal finish are decided from the row, a quarantined cancel stays unproven', 'pull-ticket.js', ["  await run.queue.cancel(run.id).catch(() => {});\n  await hook(run, 'afterLedger');", "  await hook(run, 'afterLedger');"]],

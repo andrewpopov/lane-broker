@@ -160,6 +160,41 @@ const SCENARIOS = {
     assert.deepEqual([readCursor(never.state, never.id).ackedSeq, readCursor(never.state, never.id).logGapSkipped], [2, true]);
   },
 
+  'T13d: a finished log with a hole is written only after the hold, and each hole gets its own hold, never a page consumed across several': async (load, w, t) => {
+    const finished = await pullFixture(t, w, { load });
+    await finished.hold();
+    await finished.runner.log('a\n', 0);
+    await finished.runner.log('c\n', 2);
+    await finished.runner.finish();
+    const start = finished.clock.now;
+    let settled;
+    for (let pass = 0; pass < 30 && !settled; pass++) {
+      const out = await finished.step();
+      if (out.state === 'settled') settled = out;
+      else finished.clock.now += 1_000;
+    }
+    assert.ok(settled, 'the finished log never settled');
+    assert.ok(finished.clock.now - start >= 10_000, 'the result was ledgered before the hold expired');
+    assert.equal(logText(finished), 'a\nc\n', 'seq 2 is written once the hole is skipped');
+
+    const holes = await next(t, w, load, 2, finished);
+    await holes.hold();
+    await holes.runner.log('a\n', 0);
+    await holes.runner.log('c\n', 2);
+    await holes.runner.log('e\n', 4);
+    await holes.step();
+    holes.clock.now += 11_000;
+    await holes.step();
+    assert.equal(logText(holes), 'a\nc\n', 'only the leading hole was skipped');
+    assert.equal(readCursor(holes.state, holes.id).ackedSeq, 2);
+    assert.equal(await chunkCount(holes), 1, 'seq 4 waits behind its own hole');
+    await holes.step();
+    assert.equal(logText(holes), 'a\nc\n', 'seq 3 has a fresh hold');
+    holes.clock.now += 11_000;
+    await holes.step();
+    assert.equal(logText(holes), 'a\nc\ne\n');
+  },
+
   'a gap fill with no cursor writes the cursor first, so a crash after the append does not duplicate the log': async (load, w, t) => {
     const fx = await pullFixture(t, w, { load });
     await fx.hold();
@@ -192,6 +227,8 @@ const SCENARIOS = {
 };
 
 const CANARIES = [
+  ['T13d: a finished log with a hole is written only after the hold, and each hole gets its own hold, never a page consumed across several', 'pull-ticket.js', ['const page = skippingGap ? contiguousFrom(chunks, chunks[0].seq) : contiguous;', 'const page = skippingGap ? chunks : contiguous;']],
+  ['T13d: a finished log with a hole is written only after the hold, and each hole gets its own hold, never a page consumed across several', 'pull-ticket.js', [' || run.now() - drainSince < run.cfg.logGapHoldMs + LOG_DRAIN_RETRY_MS', '']],
   ['T13c: a chunk is acked only while the seqs are contiguous, so a lower seq committing later is never lost; a gap that never fills is skipped after the hold', 'pull-ticket.js', ['    if (chunk.seq !== firstSeq + kept.length) break;\n', '']],
   ['T13c: a chunk is acked only while the seqs are contiguous, so a lower seq committing later is never lost; a gap that never fills is skipped after the hold', 'pull-ticket.js', ['        if (run.now() - since < run.cfg.logGapHoldMs) {', '        if (true) {']],
   ['a gap fill with no cursor writes the cursor first, so a crash after the append does not duplicate the log', 'pull-ticket.js', ['    if (session.cursor === null) writeCursor(run.root, run.id, cursor);\n', '']],

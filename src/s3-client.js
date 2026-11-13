@@ -13,8 +13,8 @@ const ACCESS_KEY_VAR = 'AWS_ACCESS_KEY_ID';
 const SECRET_KEY_VAR = 'AWS_SECRET_ACCESS_KEY';
 
 export class S3Error extends Error {
-  constructor(message, { status = null, code = null } = {}) {
-    super(message);
+  constructor(message, { status = null, code = null, cause } = {}) {
+    super(message, { cause });
     this.name = 'S3Error';
     this.status = status;
     this.code = code;
@@ -107,7 +107,7 @@ export function createS3Client({ endpoint, region, credentialsEnvFile, creds = l
       return { res, text, streamed };
     } catch (err) {
       if (err?.name === 'TimeoutError' || err?.name === 'AbortError') throw new S3Error(`s3 ${op} timed out after ${deadline ?? deadlineMs}ms`, { code: 'Timeout' });
-      throw new S3Error(`s3 ${op} failed: ${err?.cause?.code ?? err?.message}`, { code: 'Network' });
+      throw new S3Error(`s3 ${op} failed: ${err?.cause?.code ?? err?.message}`, { code: 'Network', cause: err });
     }
   }
 

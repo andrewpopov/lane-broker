@@ -159,6 +159,19 @@ const SCENARIOS = {
     assert.equal((await fx.step()).state, 'stale');
   },
 
+  'an entry ledgered for one generation applies nothing to an attempt bumped to the next, even when the caller follows the bump': async (load, w, t) => {
+    const fx = await pullFixture(t, w, { load });
+    await fx.hold();
+    await finishWithArtifacts(fx, '{"gen0":1}');
+    await crashAfterLedger(fx);
+    await updateAttempt(fx.state, fx.id, 0, { generation: 1, executor: 'local' });
+    const out = await fx.step({ generation: 1 }).catch((err) => err);
+    assert.equal(out.state, 'stale');
+    assert.equal(fs.existsSync(installed(fx)), false);
+    assert.equal(fx.published(), null);
+    assert.equal(readAttempt(fx.state, fx.id).generation, 1, 'the bumped attempt is untouched');
+  },
+
   'a queue outage never delays a local publish: the result is written before the divergence check, which has its own short deadline': async (load, w, t) => {
     const fx = await pullFixture(t, w, { load });
     await fx.hold();
@@ -275,7 +288,8 @@ const EARLY_MARKER = '  const result = installArtifacts(worktreeRoot, files, pat
 
 const CANARIES = [
   ['T37b: with the attempt and the result both gone, the ledger entry rebuilds the result durably, once', 'pull-ticket.js', ['reconstructResult(run, entry, extra);', "{ state: 'settled', already: true, decision: entry.decision };"]],
-  ['a stale generation applies no effect: nothing is appended, installed or published', 'pull-ticket.js', ["  if (attempt && attempt.generation !== run.generation) return { state: 'stale', decision: entry.decision };\n", '']],
+  ['an entry ledgered for one generation applies nothing to an attempt bumped to the next, even when the caller follows the bump', 'pull-ticket.js', ['attempt.generation !== run.generation || entry.generation !== attempt.generation', 'attempt.generation !== run.generation']],
+  ['a stale generation applies no effect: nothing is appended, installed or published', 'pull-ticket.js', ["  if (attempt && (attempt.generation !== run.generation || entry.generation !== attempt.generation)) return { state: 'stale', decision: entry.decision };\n", '']],
   ['a queue outage never delays a local publish: the result is written before the divergence check, which has its own short deadline', 'pull-ticket.js', ['const DIVERGENCE_DEADLINE_MS = 2_000;', 'const DIVERGENCE_DEADLINE_MS = 60_000;'], /still running/],
   ['T7: after a crash behind the ledger, a different result on the row is reported and refused: the accepted one is published, nothing of the other is read', 'pull-ticket.js', ['    if (entry !== null) return applyEntry(run, entry);\n', '']],
   ['T25: a ledger entry decides alone: an invalid result, a valid one with other artifacts, a restored non-terminal row and an unreachable queue change nothing', 'pull-ticket.js', ['    if (entry !== null) return applyEntry(run, entry);\n', '']],

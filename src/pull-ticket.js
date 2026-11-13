@@ -27,7 +27,8 @@ const BLOB_HEAD_CONCURRENCY = 8;
 const LOG_DRAIN_PASSES = 5;
 const LOG_DRAIN_RETRY_MS = 2_000;
 const DIVERGENCE_DEADLINE_MS = 2_000;
-const TRANSIENT_SQLSTATES = new Set(['53300', '57P01']);
+const TRANSIENT_SQLSTATES = new Set(['53300', '57P01', '57P02', '57P03', '57014', '55P03', '40P01', '40001']);
+const TLS_FAILURE_CODE = /^(ERR_TLS_|ERR_SSL_|CERT_|UNABLE_TO_|DEPTH_ZERO_|SELF_SIGNED_|HOSTNAME_MISMATCH)/;
 const SERVER_CANCEL_SOURCES = new Set(['queued', 'quarantine', 'operator']);
 export const GAP_MARKER = '\n[lane] streamed log differed from the verified log; verified log follows\n';
 
@@ -95,6 +96,7 @@ function entryFor(run, row, decision, extra = {}) {
     resultSha256: runnerResult ? sha256Hex(JSON.stringify(runnerResult)) : null,
     host: row?.host ?? null,
     startedAt: readAttempt(run.root, run.id)?.startedAt ?? null,
+    generation: run.generation,
     decision,
     ...(runnerResult ? { result: runnerResult } : {}),
     ...extra,
@@ -218,7 +220,7 @@ async function pumpLog(run, row) {
           return false;
         }
       }
-      const page = skippingGap ? chunks : contiguous;
+      const page = skippingGap ? contiguousFrom(chunks, chunks[0].seq) : contiguous;
       for (const chunk of page) {
         const bytes = Buffer.from(chunk.data, 'base64');
         writer.write(bytes);
@@ -355,7 +357,7 @@ async function applyEntry(run, entry) {
   run.envelope ??= readEnvelope(run.root, run.id);
   const attempt = readAttempt(run.root, run.id);
   if (fs.existsSync(run.resultPath)) return { state: 'settled', already: true, decision: entry.decision };
-  if (attempt && attempt.generation !== run.generation) return { state: 'stale', decision: entry.decision };
+  if (attempt && (attempt.generation !== run.generation || entry.generation !== attempt.generation)) return { state: 'stale', decision: entry.decision };
   const warnings = { ...entry.warnings };
   const extra = {};
   if (entry.decision.kind === 'finished') {
@@ -441,13 +443,14 @@ async function unprovenPass(run, row) {
 async function terminalPass(run, row) {
   const { pull } = readAttempt(run.root, run.id);
   let decision = classifyPullTerminal(row, run.envelope.binding);
-  if (pull?.snapshotMissing && (decision.kind === 'cancelled' || decision.kind === 'unproven')) decision = lost('snapshot-missing');
+  if (pull?.snapshotMissing && decision.kind === 'cancelled') decision = lost('snapshot-missing');
   if (decision.kind === 'unproven') return unprovenPass(run, row);
   const drainWarnings = {};
   if (decision.kind !== 'lost' && row.epoch != null && !(await pumpLog(run, row))) {
     const passes = (pull?.drainPasses ?? 0) + 1;
-    if (passes < LOG_DRAIN_PASSES) {
-      await persistPull(run, { drainPasses: passes });
+    const drainSince = pull?.drainSince ?? run.now();
+    if (passes < LOG_DRAIN_PASSES || run.now() - drainSince < run.cfg.logGapHoldMs + LOG_DRAIN_RETRY_MS) {
+      await persistPull(run, { drainPasses: passes, drainSince });
       return { state: 'draining-log', next: LOG_DRAIN_RETRY_MS };
     }
     drainWarnings.log = `the streamed log was not fully drained after ${LOG_DRAIN_PASSES} passes`;
@@ -563,8 +566,14 @@ const OUTCOME_OF = { finished: 'confirmed', cancelled: 'cancelled', lost: 'lost'
 const isNamed = (err, name) => err?.name === name;
 
 /** Only a transport failure, a timeout, 53300, 57P01, 08xxx or an S3 5xx is waited out; any other server SQLSTATE or an S3 4xx will answer the same way again. */
+function tlsFailure(err) {
+  for (let cause = err, depth = 0; cause && depth < 5; cause = cause.cause, depth++) if (TLS_FAILURE_CODE.test(String(cause.code ?? ''))) return true;
+  return false;
+}
+
 export function isTransientError(err) {
   if (isNamed(err, 'LockTimeoutError')) return true;
+  if (tlsFailure(err)) return false;
   if (isNamed(err, 'S3Error')) return err.status === null || err.status >= 500 || err.status === 408 || err.status === 429;
   if (!isNamed(err, 'QueueError')) return false;
   const code = String(err.code ?? '');
@@ -610,6 +619,7 @@ export async function runPullTicket(ctx) {
       return { outcome: 'unresolved', reason: 'pull-error', error: err.message, code: err.code ?? err.status ?? null };
     }
     if (step.state === 'settled') return { outcome: OUTCOME_OF[step.decision.kind], decision: step.decision, exitCode: step.decision.exit, result: step.result, already: step.already === true };
+    if (step.state === 'unresolved') return { outcome: 'unresolved', reason: step.reason, exitCode: step.exitCode };
     if (step.state === 'withdrawn' || step.state === 'gone' || step.state === 'stale') return { outcome: step.state };
     await sleep(step.next ?? settingsOf(ctx).pollMs);
   }
