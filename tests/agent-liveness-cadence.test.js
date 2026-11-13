@@ -4,7 +4,8 @@ import { SLEEP, happens, sleep, scenarioSuite } from './agent-run-harness.js';
 
 const INTERVAL = 200;
 const SLACK = 300;
-const LIVENESS = ['ld_claim', 'ld_heartbeat'];
+const LIVENESS = ['ld_claim', 'ld_heartbeat', 'ld_register'];
+const DAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 
 /** Every liveness call within `[from, to]` (and the edges themselves) is at most INTERVAL + SLACK after the one before it. */
 const assertCadence = (agent, from, to, what) => {
@@ -20,6 +21,23 @@ const scenarios = {
     const from = Date.now();
     await sleep(1500);
     assertCadence(agent, from, Date.now(), 'idle');
+  },
+
+  'a draining runner holding nothing still makes a call every interval': async (w, rw, load) => {
+    const agent = await rw.agent({ load, config: { pollMs: INTERVAL }, draining: () => true });
+    const from = Date.now();
+    await sleep(1500);
+    assertCadence(agent, from, Date.now(), 'draining');
+    assert.equal(agent.names().includes('ld_claim'), false, 'a draining runner claims nothing');
+  },
+
+  'a runner outside its schedule window holding nothing still makes a call every interval': async (w, rw, load) => {
+    const tomorrow = DAYS[(new Date().getUTCDay() + 1) % 7];
+    const agent = await rw.agent({ load, config: { pollMs: INTERVAL, schedule: { timezone: 'UTC', available: [{ days: [tomorrow], from: '00:00', to: '23:59' }] } } });
+    const from = Date.now();
+    await sleep(1500);
+    assertCadence(agent, from, Date.now(), 'outside the window');
+    assert.equal(agent.names().includes('ld_claim'), false, 'outside its window it claims nothing');
   },
 
   'at max_claims, with the claim poll far away, heartbeats keep the liveness calls coming': async (w, rw, load) => {
@@ -47,6 +65,8 @@ const scenarios = {
 
 const canaries = [
   ['a liveness call is made every interval while idle', 'agent/run.js', ['await waker.wait(Math.max(0, config.pollMs - (now() - startedAt)));', 'await waker.wait(1e9);']],
+  ['a draining runner holding nothing still makes a call every interval', 'agent/run.js', ['now() - lastCallAt >= config.pollMs / 2', 'false']],
+  ['a runner outside its schedule window holding nothing still makes a call every interval', 'agent/run.js', ['now() - lastCallAt >= config.pollMs / 2', 'false']],
   ['at max_claims, with the claim poll far away, heartbeats keep the liveness calls coming', 'agent/execution.js', ['>= this.timing.heartbeatMs) await this.#beat(execId, context);\n    const current', '>= 1e9) await this.#beat(execId, context);\n    const current']],
   ['while settling, with an upload that never answers, heartbeats keep the liveness calls coming', 'agent/execution.js',
     ['context.abort = abort;\n    const stopBeating = this.#keepBeating(execId, context, abort.signal);\n    try {\n      const since', 'context.abort = abort;\n    const stopBeating = async () => {};\n    try {\n      const since']],

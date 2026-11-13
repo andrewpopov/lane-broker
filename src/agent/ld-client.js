@@ -177,6 +177,11 @@ export class LdClient {
     if (!this.#closed) this.#connectListen({ reconnect: true });
   }
 
+  /** `ld_register` again through the same FIFO: an idempotent upsert, used as a liveness ping when no other call is due. */
+  register(opts) {
+    return this.#run('ld_register', [this.version, PROTOCOL, this.schedule === null ? null : JSON.stringify(this.schedule)], { ...opts, persist: (answer) => { this.registered = answer; } });
+  }
+
   claim(req, freeCpu, freeMem, heldKeys = [], opts) {
     return this.#run('ld_claim', [req, freeCpu, String(freeMem), heldKeys], opts);
   }

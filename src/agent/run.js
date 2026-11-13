@@ -10,13 +10,15 @@ export const s3ClientOf = ({ endpoint, region, creds }, options = {}) => createS
 /**
  * Open the agent core (directories durable, owner taken, registered), adopt every record on disk, and keep claiming: on a NOTIFY hint,
  * every `config.pollMs` (at most 15 s) as the fallback and liveness call, and again straight after each claim until the queue answers
- * `none`. An `upgrade` answer stops claiming for good and is logged on every tick; running executions carry on. Stopping leaves running
+ * `none`. A tick that made no `ld_*` call (draining, outside the window, no headroom, nothing held) pings with `ld_register`, so the queue hears from the runner at least every poll. An `upgrade` answer stops claiming for good and is logged on every tick; running executions carry on. Stopping leaves running
  * executions running: they outlive the agent.
  */
 export async function startAgent({ remoteRoot, config, version, log = (line) => process.stderr.write(`${line}\n`), figures = claimFigures, draining, now = Date.now, timing, s3 = s3ClientOf(config.rustfs), spawnEnv, laneBin, Driver = ExecutionDriver, coreOptions = {} }) {
   const waker = new Waker();
   let driver;
-  const core = await openAgentCore({ remoteRoot, config, version, log, onWake: (event) => { driver?.poke(event.channel); waker.poke(); }, ...coreOptions });
+  let lastCallAt = now();
+  const onCall = (name, args) => { lastCallAt = now(); coreOptions.onCall?.(name, args); };
+  const core = await openAgentCore({ remoteRoot, config, version, log, onWake: (event) => { driver?.poke(event.channel); waker.poke(); }, ...coreOptions, onCall });
   if (core.ld.registered.host !== config.runnerName) {
     await core.close();
     throw new AgentConfigError(`"runnerName" is ${config.runnerName} but the queue registers this login as ${core.ld.registered.host}`);
@@ -47,6 +49,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
       const startedAt = now();
       if (upgradeRequired) log('UPGRADE REQUIRED: the queue refuses this agent\'s protocol, so no claims are made; update lane-broker and restart the agent');
       else await claimRound();
+      if (!stopped && now() - lastCallAt >= config.pollMs / 2) await core.ld.register().catch((err) => log(`register ping: ${err.code ?? ''} ${err.message}`));
       core.tick({ claims: upgradeRequired ? 'stopped: upgrade required' : 'running' });
       if (!stopped) await waker.wait(Math.max(0, config.pollMs - (now() - startedAt)));
     }
