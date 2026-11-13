@@ -2,6 +2,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
+import { parse as parsePgConnectionString } from 'pg-connection-string';
+import { MAX_PRESIGN_EXPIRES_SEC } from './s3-presign.js';
 import { paths, stateHome } from './state.js';
 import { scheduleProblem } from './runner-schedule.js';
 import { isCanonicalRelPath, scrubbedGitEnv } from './remote-manifest.js';
@@ -553,23 +555,35 @@ const isPlainObject = (value) => value !== null && typeof value === 'object' && 
 export const LANE_QUEUE_DATABASE = 'lane_queue';
 const LANE_QUEUE_PRIMARY_LABEL = 'pg-primary';
 
-/** Why `laneQueueUrl` is not a single direct endpoint of the lane queue database, or null. Raw-string checks come first: a `svc:` host or a host list is not a parseable URL. */
+const ROUTING_QUERY_KEYS = new Set(['host', 'hostaddr', 'port', 'dbname', 'database', 'service', 'target_session_attrs']);
+
+const decodedQueryKeys = (raw) => {
+  const query = raw.includes('?') ? raw.slice(raw.indexOf('?') + 1).split('#')[0] : '';
+  return query.split('&').filter(Boolean).map((pair) => decodeURIComponent(pair.split('=')[0]).toLowerCase());
+};
+
+/** Why `laneQueueUrl` is not a single direct endpoint of the lane queue database, or null. Checked on what pg connects to (`parse`), not on the raw text. */
 function laneQueueUrlProblem(raw) {
   if (typeof raw !== 'string' || !/^postgres(ql)?:\/\//.test(raw)) return 'must be a postgres:// URL';
-  const authority = raw.replace(/^postgres(ql)?:\/\//, '').split(/[/?#]/)[0];
-  const hostPart = authority.slice(authority.lastIndexOf('@') + 1);
-  if (hostPart.startsWith('svc:')) return 'must not use a svc: host (a failover name); name the one direct endpoint';
-  if (hostPart.includes(',')) return 'must name exactly one host (multi-host URLs are refused)';
-  let url;
+  let parsed;
+  let keys;
   try {
-    url = new URL(raw);
+    parsed = parsePgConnectionString(raw);
+    keys = decodedQueryKeys(raw);
   } catch {
-    return 'is not a valid URL';
+    const authority = raw.replace(/^postgres(ql)?:\/\//, '').split(/[/?#]/)[0];
+    return authority.slice(authority.lastIndexOf('@') + 1).startsWith('svc:')
+      ? 'must not use a svc: host (a failover name); name the one direct endpoint'
+      : 'is not a valid single-host postgres:// URL (multi-host URLs are refused)';
   }
-  if (url.hostname === '') return 'must name a host';
-  if (url.hostname.split('.')[0].toLowerCase() === LANE_QUEUE_PRIMARY_LABEL) return `must not use the ${LANE_QUEUE_PRIMARY_LABEL} name (a moving primary); name the one direct endpoint`;
-  if ([...url.searchParams.keys()].some((k) => k.toLowerCase() === 'target_session_attrs')) return 'must not set target_session_attrs';
-  if (decodeURIComponent(url.pathname.slice(1)) !== LANE_QUEUE_DATABASE) return `must name the ${LANE_QUEUE_DATABASE} database`;
+  const routing = keys.find((k) => ROUTING_QUERY_KEYS.has(k));
+  if (routing !== undefined) return `must not set the "${routing}" query parameter (connection routing belongs in the URL authority and path)`;
+  const host = parsed.host ?? '';
+  if (host === '') return 'must name a host';
+  if (host.startsWith('svc:')) return 'must not use a svc: host (a failover name); name the one direct endpoint';
+  if (host.includes(',')) return 'must name exactly one host (multi-host URLs are refused)';
+  if (host.split('.')[0].toLowerCase() === LANE_QUEUE_PRIMARY_LABEL) return `must not use the ${LANE_QUEUE_PRIMARY_LABEL} name (a moving primary); name the one direct endpoint`;
+  if (parsed.database !== LANE_QUEUE_DATABASE) return `must name the ${LANE_QUEUE_DATABASE} database`;
   return null;
 }
 
@@ -587,6 +601,7 @@ function validateLanePull(cfg, sourcePath) {
   assert(typeof pull.enabled === 'boolean', `${sourcePath}: "lanePull.enabled" must be a boolean`);
   assert(typeof pull.blobGc === 'boolean', `${sourcePath}: "lanePull.blobGc" must be a boolean`);
   for (const field of LANE_PULL_NUMBERS) assert(Number.isInteger(pull[field]) && pull[field] > 0, `${sourcePath}: "lanePull.${field}" must be a positive integer`);
+  assert(pull.urlTtlSec <= MAX_PRESIGN_EXPIRES_SEC, `${sourcePath}: "lanePull.urlTtlSec" must be at most ${MAX_PRESIGN_EXPIRES_SEC} (the SigV4 limit)`);
   assert(pull.urlRefreshSec < pull.urlTtlSec, `${sourcePath}: "lanePull.urlRefreshSec" must be less than "lanePull.urlTtlSec"`);
   for (const field of LANE_PULL_PATHS) {
     if (pull[field] !== undefined) assert(typeof pull[field] === 'string' && pull[field].length > 0, `${sourcePath}: "lanePull.${field}" must be a non-empty string`);

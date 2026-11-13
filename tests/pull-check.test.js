@@ -13,6 +13,8 @@ import { makeTmpDir } from './helpers/tmp.js';
 
 const CFG = DEFAULT_GLOBAL_CONFIG;
 
+const fixtureClient = async (stub) => createS3Client({ endpoint: stub.endpoint, region: STUB_REGION, creds: STUB_CREDS });
+
 async function fixture(t, stubOptions = {}) {
   let clock = Date.parse('2026-11-12T00:00:00Z');
   const stub = await startS3Stub({ now: () => clock, ...stubOptions });
@@ -81,6 +83,31 @@ test('blobGc is off when a re-PUT does not refresh Last-Modified', async (t) => 
   assert.equal(report.ok, true);
   assert.deepEqual(report.blobGc, { verdict: 'off', reason: 'a re-PUT does not refresh Last-Modified' });
   assert.deepEqual([...stub.objects.keys()], [], 'the probe object is removed either way');
+});
+
+test('HEAD must report the object with a finite Last-Modified, both times, or blobGc is off with the reason', async (t) => {
+  const { stub } = await fixture(t);
+  let heads = 0;
+  const report = await pullCheck({
+    cfg: CFG,
+    s3: { ...(await fixtureClient(stub)), headObject: async () => (++heads === 1 ? { exists: true, size: 1, lastModified: 1_700_000_000_000 } : { exists: true, size: 1, lastModified: NaN }) },
+    settleMs: 0,
+    sleep: async () => {},
+  });
+  assert.deepEqual(report.blobGc, { verdict: 'off', reason: 'a re-PUT does not refresh Last-Modified' });
+  const missing = await pullCheck({ cfg: CFG, s3: { ...(await fixtureClient(stub)), headObject: async () => ({ exists: false }) }, settleMs: 0, sleep: async () => {} });
+  assert.deepEqual(missing.blobGc, { verdict: 'off', reason: 'HEAD returns no Last-Modified' });
+});
+
+test('a probe object that cannot be deleted fails the check and names bucket/key; leftovers from an earlier run are removed first', async (t) => {
+  const { stub, check } = await fixture(t);
+  stub.objects.set('lane-snap/probes/age-source-leftover', { body: Buffer.from('x'), lastModified: 1 });
+  assert.equal((await check()).ok, true);
+  assert.deepEqual([...stub.objects.keys()], [], 'the leftover and the new probe are both gone');
+  stub.denyDelete = true;
+  const report = await check();
+  assert.equal(report.ok, false);
+  assert.match(report.refusals.join('\n'), /probe object lane-snap\/probes\/age-source-[0-9a-f]{16} could not be deleted/);
 });
 
 test('an unreachable store refuses: neither lifecycle nor the age probe can be read', async (t) => {

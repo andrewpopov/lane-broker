@@ -33,9 +33,18 @@ test('T9 laneQueueUrl refuses svc: hosts, the pg-primary name, multi-host URLs, 
     ['postgres://lane_submit_train@svc:pg-primary/lane_queue', /svc: host/],
     ['postgres://lane_submit_train@pg-primary/lane_queue', /pg-primary name/],
     ['postgres://lane_submit_train@PG-Primary.tailnet.ts.net:5432/lane_queue', /pg-primary name/],
-    ['postgres://lane_submit_train@pitelite:5432,wintop:5432/lane_queue', /exactly one host/],
-    ['postgres://lane_submit_train@pitelite,wintop/lane_queue', /exactly one host/],
+    ['postgres://lane_submit_train@pitelite:5432,wintop:5432/lane_queue', /single-host|exactly one host/],
+    ['postgres://lane_submit_train@pitelite,wintop/lane_queue', /single-host|exactly one host/],
     [`${QUEUE_URL}&target_session_attrs=read-write`, /target_session_attrs/],
+    ['postgres://u@pitelite:5432/lane_queue?host=pg-primary', /"host" query parameter/],
+    ['postgres://u@pitelite/lane_queue?%68ost=svc%3Apg-primary', /"host" query parameter/],
+    ['postgres://u@pg%2Dprimary:5432/lane_queue', /pg-primary name/],
+    ['postgres://u@svc%3Apg-primary/lane_queue', /svc: host/],
+    ['postgres://u@pitelite/lane_queue?host=a,b', /"host" query parameter/],
+    ['postgres://u@pitelite/lane_queue?hostaddr=', /"hostaddr" query parameter/],
+    ['postgres://u@pitelite/lane_queue?port=', /"port" query parameter/],
+    ['postgres://u@pitelite/lane_queue?dbname=postgres', /"dbname" query parameter/],
+    ['postgres://u@pitelite/lane_queue?service=x', /"service" query parameter/],
     ['postgres://lane_submit_train@pitelite:5432/postgres', /lane_queue database/],
     ['postgres://lane_submit_train@pitelite:5432/', /lane_queue database/],
     ['postgres://lane_submit_train@pitelite:5432', /lane_queue database/],
@@ -90,6 +99,8 @@ test('lanePull: defaults merge under what the file sets, and bad values are refu
   refusesNaming({ lanePull: { enabled: 'yes' } }, 'lanePull.enabled');
   refusesNaming({ lanePull: { pollMs: 0 } }, 'lanePull.pollMs');
   refusesNaming({ lanePull: { urlRefreshSec: 900 } }, 'lanePull.urlRefreshSec');
+  refusesNaming({ lanePull: { urlTtlSec: 604_801 } }, 'lanePull.urlTtlSec');
+  assert.equal(load({ lanePull: { urlTtlSec: 604_800 } }).lanePull.urlTtlSec, 604_800);
   refusesNaming({ lanePull: { rustfs: { endpoint: 'pitelite:9000' } } }, 'lanePull.rustfs.endpoint');
   refusesNaming({ lanePull: 'on' }, 'lanePull');
 });

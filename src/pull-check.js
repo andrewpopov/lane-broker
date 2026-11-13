@@ -15,24 +15,41 @@ import { loadGlobalConfigOrError } from './config.js';
 const REPUT_SETTLE_MS = 1_100;
 const PROBE_PREFIX = 'probes/age-source-';
 
+const hasAge = (head) => head.exists && Number.isFinite(head.lastModified);
+
+async function probeAgeSource({ s3, bucket, key, file, settleMs, sleep }) {
+  await s3.putObjectFromFile(bucket, key, file);
+  const first = await s3.headObject(bucket, key);
+  if (!hasAge(first)) return { verdict: 'off', reason: 'HEAD returns no Last-Modified' };
+  await sleep(settleMs);
+  await s3.putObjectFromFile(bucket, key, file);
+  const second = await s3.headObject(bucket, key);
+  if (!hasAge(second) || second.lastModified <= first.lastModified) return { verdict: 'off', reason: 'a re-PUT does not refresh Last-Modified' };
+  return { verdict: 'on', reason: 'HEAD returns Last-Modified and a re-PUT refreshes it' };
+}
+
+/** Throws when the probe cannot run or its object cannot be removed: a leftover under the prefix is a refusal, never a quiet success. */
 export async function blobGcVerdict({ s3, bucket, settleMs = REPUT_SETTLE_MS, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) }) {
+  for (const leftover of await s3.listObjects(bucket, { prefix: PROBE_PREFIX })) await s3.deleteObject(bucket, leftover.key);
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lane-pull-check-'));
   const file = path.join(dir, 'probe');
   const key = `${PROBE_PREFIX}${crypto.randomBytes(8).toString('hex')}`;
   fs.writeFileSync(file, 'lane pull check age probe\n');
+  let verdict;
+  let probeError = null;
   try {
-    await s3.putObjectFromFile(bucket, key, file);
-    const first = await s3.headObject(bucket, key);
-    if (first.lastModified === null) return { verdict: 'off', reason: 'HEAD returns no Last-Modified' };
-    await sleep(settleMs);
-    await s3.putObjectFromFile(bucket, key, file);
-    const second = await s3.headObject(bucket, key);
-    if (second.lastModified === null || second.lastModified <= first.lastModified) return { verdict: 'off', reason: 'a re-PUT does not refresh Last-Modified' };
-    return { verdict: 'on', reason: 'HEAD returns Last-Modified and a re-PUT refreshes it' };
-  } finally {
-    fs.rmSync(dir, { recursive: true, force: true });
-    await s3.deleteObject(bucket, key).catch(() => {});
+    verdict = await probeAgeSource({ s3, bucket, key, file, settleMs, sleep });
+  } catch (err) {
+    probeError = err;
   }
+  fs.rmSync(dir, { recursive: true, force: true });
+  try {
+    await s3.deleteObject(bucket, key);
+  } catch (err) {
+    throw new Error(`probe object ${bucket}/${key} could not be deleted (${err.message}); remove it by hand`);
+  }
+  if (probeError) throw probeError;
+  return verdict;
 }
 
 /** `{ok, refusals, lifecycle, blobGc}`; `ok` is false on any refusal, and an unreadable bucket or failed probe is a refusal. */

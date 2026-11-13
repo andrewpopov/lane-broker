@@ -85,6 +85,7 @@ export async function startS3Stub({ creds = STUB_CREDS, region = STUB_REGION, no
     }
     const object = stub.objects.get(name);
     if (req.method === 'DELETE') {
+      if (stub.denyDelete) return error(403, 'AccessDenied');
       stub.objects.delete(name);
       return reply(204);
     }

@@ -42,6 +42,7 @@
     "hooks": "git config core.hooksPath .githooks"
   },
   "dependencies": {
-    "pg": "^8.23.1"
+    "pg": "^8.23.1",
+    "pg-connection-string": "^2.14.1"
   }
 }

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { presignRequest, presignUrl } from '../src/s3-presign.js';
+import { canonicalQueryString, presignRequest, presignUrl } from '../src/s3-presign.js';
 import { createS3Client, loadS3Credentials, S3Error } from '../src/s3-client.js';
 import { startS3Stub, STUB_CREDS, STUB_REGION } from './helpers/s3-stub.js';
 import { makeTmpDir } from './helpers/tmp.js';
@@ -126,4 +126,16 @@ test('credentials come from the env file: both variables required, mode 0600, ow
   fs.writeFileSync(file, 'AWS_ACCESS_KEY_ID=AKIA1\n');
   assert.throws(() => loadS3Credentials(file), /must define/);
   assert.throws(() => loadS3Credentials(path.join(dir, 'absent')), /unreadable/);
+});
+
+test('canonicalQueryString sorts by encoded name and encodes values, whatever order the params arrive in (hard-coded expectation)', () => {
+  assert.equal(canonicalQueryString({ 'max-keys': 2, 'list-type': 2, prefix: 'a b/' }), 'list-type=2&max-keys=2&prefix=a%20b%2F');
+  assert.equal(canonicalQueryString({ b: 1, a: 'z y', 'X-Amz-Date': 'd', Zed: 1 }), 'X-Amz-Date=d&Zed=1&a=z%20y&b=1');
+});
+
+test('presign expiry is an integer in 1..604800 seconds', () => {
+  const sign = (expiresSec) => presignUrl({ method: 'GET', bucket: 'b', key: 'k', expiresSec, creds: STUB_CREDS, endpoint: 'http://h:9000', region: STUB_REGION, now: 0 });
+  assert.match(sign(1), /X-Amz-Expires=1&/);
+  assert.match(sign(604_800), /X-Amz-Expires=604800&/);
+  for (const bad of [0, -1, 604_801, 1.5, '900', NaN, undefined]) assert.throws(() => sign(bad), RangeError, String(bad));
 });

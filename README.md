@@ -1454,18 +1454,19 @@ Nothing dispatches this way until `lanePull.enabled` is true; this section is th
 }
 ```
 
-- `runners[].transport` is `"push"` (default, ssh) or `"pull"`. A pull entry needs only `name`; `ssh` is optional. Every placement,
-  rebind, rebalance, heartbeat ping and runner-status path reads `pushRunners(cfg)`, so a pull entry is never dialled.
+- `runners[].transport` is `"push"` (default, ssh) or `"pull"`. A pull entry needs only `name`; `ssh` is optional. Placement,
+  rebind, rebalance, heartbeat pings, runner status and `lane runner prewarm` read `pushRunners(cfg)`, so those never dial a pull entry
+  (`prewarm --runner <pull runner>` is refused). Cancel, wait and reconcile still look runners up by name until the pull recovery surfaces land.
 - `laneQueueUrl` must be one direct `postgres://` endpoint of the `lane_queue` database. The config is refused, naming the key, for
-  a `svc:` host, a `pg-primary` first DNS label, a multi-host URL, `target_session_attrs`, or any other database.
-- `lanePull` defaults: `enabled false`, `pollMs 15000`, `urlTtlSec 900`, `urlRefreshSec 300` (below the TTL),
+  a `svc:` host, a `pg-primary` first DNS label, a multi-host URL, any connection-routing query key (`host`, `hostaddr`, `port`, `dbname`, `database`, `service`, `target_session_attrs`), or any other database. It is checked as `pg-connection-string` parses it, which is what `pg` connects to.
+- `lanePull` defaults: `enabled false`, `pollMs 15000`, `urlTtlSec 900` (at most 604800, the SigV4 limit), `urlRefreshSec 300` (below the TTL),
   `quarantineLostAfterMs 1800000`, `blobGc true`, `blobRefreshAfterDays 7`, `rustfs.region us-east-1`, buckets `lane-snap` and
   `lane-out`. `enabled: true` needs `laneQueueUrl`, `passwordFile`, `caFile`, `rustfs.endpoint` and `rustfs.credentialsEnvFile`.
   `pullConfigured(cfg)` answers from the config alone and does no I/O. The credentials file holds `AWS_ACCESS_KEY_ID` and
   `AWS_SECRET_ACCESS_KEY`, mode 0600, owned by the user.
 - `lane pull check [--json]` exits 1 unless **neither** bucket has an enabled lifecycle rule and both lifecycle configurations are
-  readable (only the sweeper may delete objects, by ticket state). It also PUTs, re-PUTs and deletes a probe object under
-  `lane-snap/probes/` to learn whether HEAD returns `Last-Modified` and a re-PUT refreshes it, and prints `blobGc on` or
+  readable (only the sweeper may delete objects, by ticket state). It also removes leftover probe objects, then PUTs, re-PUTs and deletes a probe object under
+  `lane-snap/probes/` to learn whether HEAD returns a `Last-Modified` and a re-PUT refreshes it, and prints `blobGc on` or
   `blobGc off`; with `off`, set `lanePull.blobGc` to false.
 
 ### Taking a runner out of rotation (BRAIN-520)

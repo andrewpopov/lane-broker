@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { loadGlobalConfigOrError, loadRepoConfig, resolveTicketConfig, ConfigError } from './config.js';
+import { loadGlobalConfigOrError, loadRepoConfig, resolveTicketConfig, ConfigError, pullRunners, pushRunners } from './config.js';
 import { dispatchRemote } from './remote-client.js';
 import { gitRevParse } from './run.js';
 
@@ -76,7 +76,11 @@ export async function runnerPrewarmCommand(
     err('lane runner prewarm: not inside a git checkout');
     return { exitCode: 64 };
   }
-  const runners = (globalCfg.runners ?? []).filter((r) => !r.offline && (!parsed.runner || r.name === parsed.runner));
+  if (parsed.runner && pullRunners(globalCfg).some((r) => r.name === parsed.runner)) {
+    err(`lane runner prewarm: runner "${parsed.runner}" uses pull transport; prewarm dials runners over ssh`);
+    return { exitCode: 64 };
+  }
+  const runners = pushRunners(globalCfg).filter((r) => !r.offline && (!parsed.runner || r.name === parsed.runner));
   if (runners.length === 0) {
     err(`lane runner prewarm: no ${parsed.runner ? `runner named "${parsed.runner}"` : 'usable runner'} configured`);
     return { exitCode: 64 };

@@ -9,7 +9,8 @@ import { sshTransport } from '../src/runner-transport.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { paths } from '../src/state.js';
 import { holdLaneLocally, IDLE, rebalanceSetup, resultOf, T, tmpDir } from './remote-harness.js';
-import { waitFor } from './helpers.js';
+import { runnerPrewarmCommand } from '../src/runner-prewarm.js';
+import { freshEnv, gitFixture, laneRun, waitFor, writeGlobalConfig, writeRepoConfig } from './helpers.js';
 
 /**
  * BRAIN-1036 R2 (T15): a `transport: "pull"` runner is never dialled. Every placement, rebind, rebalance, ping and status path reads
@@ -58,10 +59,10 @@ test('T15 the heartbeat pings push runners only, and records nothing for a pull 
 
 test('T15 runner states, down reasons and the up-list never include a pull runner', async () => {
   const root = tmpDir('pull-placement-states');
-  await recordPings(root, [{ name: 'skybox', ok: true }, { name: 'pullbox', ok: false }], NOW - 1000);
+  await recordPings(root, [{ name: 'skybox', ok: true }, { name: 'pullbox', ok: false }], NOW);
   assert.deepEqual(collectRunnerStates(root, CFG, NOW).map((r) => r.name), ['skybox']);
-  assert.deepEqual(downRunnerReasons(root, CFG, NOW + 3_600_000), {}, 'the failed pullbox ping started a clock, but a pull runner is never reported down');
-  assert.deepEqual(heartbeatUpRunners(root, CFG, NOW), ['skybox']);
+  assert.deepEqual(downRunnerReasons(root, CFG, NOW + 120_000), {}, 'a fresh heartbeat and a failed pullbox ping two minutes old: a pull runner is never reported down');
+  assert.deepEqual(heartbeatUpRunners(root, CFG, NOW + 1000), ['skybox']);
   assert.deepEqual(collectRunnerStates(root, { ...CFG, runners: [PULL] }, NOW), []);
 });
 
@@ -110,4 +111,34 @@ test('the ssh transport wraps fetchRemoteResult, remoteCancel and remoteWithdraw
   assert.deepEqual(answers, wrapped);
   assert.deepEqual(viaSeam.calls(), direct.calls());
   assert.deepEqual(viaSeam.calls().map((c) => /remote-(\w+)/.exec(c)[1]), ['result', 'cancel', 'withdraw']);
+});
+
+test('T15 prewarm never dials a pull runner: unnamed it is left out, named it is refused as pull transport', async () => {
+  const { base } = freshEnv();
+  const cwd = path.join(base, 'repo');
+  writeRepoConfig(cwd, { version: 1, lanes: { warm: { weight: 1, remoteSetup: [['true']], prewarm: true } } });
+  gitFixture(['init', '-q'], cwd);
+  const run = async (args) => {
+    const calls = [];
+    const err = [];
+    const result = await runnerPrewarmCommand(args, { cwd, cfg: { runners: [PULL, PUSH] }, dispatch: async (o) => (calls.push(o.runner.name), { outcome: 'confirmed', exitCode: 0 }), out: () => {}, err: (t) => err.push(t) });
+    return { ...result, calls, err: err.join('\n') };
+  };
+  const all = await run([]);
+  assert.equal(all.exitCode, 0, all.err);
+  assert.deepEqual(all.calls, ['skybox']);
+  const named = await run(['--runner', 'pullbox']);
+  assert.equal(named.exitCode, 64);
+  assert.match(named.err, /pull transport/);
+  assert.deepEqual(named.calls, []);
+});
+
+test('T15 every push runner too small for the ticket for good is exit 69 (neverPlaceable), a pull runner beside it does not make it retryable', T, async () => {
+  const ctx = rebalanceSetup({ names: ['pull-box', 'a'], paused: [], configOpts: { 'pull-box': { transport: 'pull' } } });
+  const file = path.join(ctx.home, 'config.json');
+  writeGlobalConfig(ctx.home, { ...JSON.parse(fs.readFileSync(file, 'utf8')), localExecution: 'refused' });
+  ctx.fake.setProbe('a', { ...IDLE, capacity: { weight: 0.5 } });
+  const res = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--', ...ctx.cmdArgv], { env: ctx.env, cwd: ctx.repoDir });
+  assert.equal(res.code, 69, `${res.stderr}\n${ctx.fake.calls().join(',')}`);
+  assert.deepEqual(ctx.runs(), []);
 });

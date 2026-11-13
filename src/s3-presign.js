@@ -5,6 +5,7 @@ import crypto from 'node:crypto';
 export const UNSIGNED_PAYLOAD = 'UNSIGNED-PAYLOAD';
 const ALGORITHM = 'AWS4-HMAC-SHA256';
 const SERVICE = 's3';
+export const MAX_PRESIGN_EXPIRES_SEC = 604_800;
 
 export const sha256Hex = (data) => crypto.createHash('sha256').update(data).digest('hex');
 const hmac = (key, data) => crypto.createHmac('sha256', key).update(data).digest();
@@ -42,6 +43,7 @@ export function signatureFor({ secretAccessKey, stamp, region, canonicalRequest 
  * query string. Split from `presignUrl` so the AWS documented vector (virtual-hosted style) and our path-style URLs share one signer.
  */
 export function presignRequest({ method, host, path, expiresSec, creds, region, now }) {
+  if (!Number.isInteger(expiresSec) || expiresSec < 1 || expiresSec > MAX_PRESIGN_EXPIRES_SEC) throw new RangeError(`expiresSec must be an integer in 1..${MAX_PRESIGN_EXPIRES_SEC} (got ${expiresSec})`);
   const stamp = amzTimestamp(now);
   const params = {
     'X-Amz-Algorithm': ALGORITHM,
