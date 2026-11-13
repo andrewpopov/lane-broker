@@ -127,10 +127,31 @@ export function paths(root = stateHome()) {
   };
 }
 
-const UUID_RE = /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+const UUID_PATTERN = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}';
+const UUID_RE = new RegExp(`^${UUID_PATTERN}$`);
 
 export function isUuid(v) {
   return typeof v === 'string' && UUID_RE.test(v);
+}
+
+const EXECUTION_ID_RE = new RegExp(`^(${UUID_PATTERN})(?:\\.e([1-9][0-9]{0,14}))?$`);
+
+/** A runner-side execution id: the submitter's ticket UUID, or that UUID plus `.e<epoch>` when a pull agent runs one epoch of it. */
+export function isExecutionId(v) {
+  return typeof v === 'string' && EXECUTION_ID_RE.test(v);
+}
+
+export function executionIdOf(ticketId, epoch) {
+  if (!isUuid(ticketId) || !Number.isSafeInteger(epoch) || epoch < 1) throw new Error(`invalid execution id parts: ${ticketId} e${epoch}`);
+  const id = `${ticketId}.e${epoch}`;
+  if (!isExecutionId(id)) throw new Error(`invalid execution id parts: ${ticketId} e${epoch}`);
+  return id;
+}
+
+/** The logical ticket UUID and epoch (null for a bare uuid) of an execution id, or null when `v` is not one. */
+export function parseExecutionId(v) {
+  const m = typeof v === 'string' ? EXECUTION_ID_RE.exec(v) : null;
+  return m ? { ticketId: m[1], epoch: m[2] === undefined ? null : Number(m[2]) } : null;
 }
 
 const TICKET_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
@@ -607,7 +628,7 @@ export function readRemoteDrain(root = stateHome()) {
 }
 
 /** Write the drain marker under the state lock (`shutdown` adds the BRAIN-350 shutdown form, bound to this boot). A re-drain keeps the original `since` and replaces the reason. Returns the marker. */
-export async function writeRemoteDrain(root, reason, { shutdown = false } = {}) {
+export async function writeRemoteDrain(root, reason, { shutdown = false, timeoutMs } = {}) {
   return withLock(root, () => {
     const prev = readRemoteDrain(root);
     const marker = {
@@ -619,7 +640,7 @@ export async function writeRemoteDrain(root, reason, { shutdown = false } = {}) 
     };
     atomicWriteJson(paths(root).remoteDrain, marker, { fsync: true });
     return { reason: marker.reason, since: marker.since, unreadable: false, ...(shutdown ? { shutdown: true } : {}) };
-  });
+  }, { timeoutMs });
 }
 
 /** Remove the drain marker under the state lock and make the removal durable. Idempotent; any other failure throws (naming the path). */

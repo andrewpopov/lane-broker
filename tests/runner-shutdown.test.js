@@ -173,16 +173,17 @@ test('plain drain is not a shutdown drain, survives a boot change, and undrain c
   }
 });
 
-test('shutdownStopReason: only a proven stop yields runner-shutdown (Codex P1s on BRAIN-350)', () => {
+test('shutdownStopReason: only a proven stop yields runner-shutdown, and names its proof (Codex P1s on BRAIN-350, rev 5 R5-2)', () => {
   const base = { cancelled: false, shutdownMarked: true, refusedAtStart: false };
-  const proven = 'runner-shutdown';
-  const unproven = 'runner-shutdown-unproven';
-  assert.equal(shutdownStopReason({ ...base, refusedAtStart: true, structured: null }), proven, 'refused before anything ran');
-  assert.equal(shutdownStopReason({ ...base, unstarted: true, structured: null }), proven, 'found unleased by the sweep: dequeued or fenced');
-  assert.equal(shutdownStopReason({ ...base, structured: { id: 'x', exit: null, signal: 'SIGKILL', startedAt: null, cancelled: true } }), unproven, 'an orphan-lease kill result is not proof');
-  assert.equal(shutdownStopReason({ ...base, structured: { cancelled: true, startedAt: 1, exit: 130, stopProven: true } }), proven, 'cancel ended it, reap complete');
-  assert.equal(shutdownStopReason({ ...base, structured: null }), unproven, 'supervisor died with no result: the child may live');
-  assert.equal(shutdownStopReason({ ...base, structured: { cancelled: true, startedAt: 1, exit: 130 } }), unproven, 'incomplete reap, or the command had already exited');
+  const proven = (proof) => ({ reason: 'runner-shutdown', proof });
+  const unproven = { reason: 'runner-shutdown-unproven', proof: null };
+  assert.deepEqual(shutdownStopReason({ ...base, refusedAtStart: true, structured: null }), proven('refused-at-start'), 'refused before anything ran');
+  assert.deepEqual(shutdownStopReason({ ...base, unstarted: true, structured: null }), proven('dequeued'), 'dequeued by the sweep');
+  assert.deepEqual(shutdownStopReason({ ...base, neverStarted: true, structured: { cancelled: true, neverStarted: true } }), proven('never-started'), 'an explicit pre-spawn flag');
+  assert.deepEqual(shutdownStopReason({ ...base, structured: null }), unproven, 'no lease and no result (the ambiguous missing-lease case): unproven now');
+  assert.deepEqual(shutdownStopReason({ ...base, structured: { id: 'x', exit: null, signal: 'SIGKILL', startedAt: null, cancelled: true } }), unproven, 'an orphan-lease kill result is not proof, and a null startedAt is not either');
+  assert.deepEqual(shutdownStopReason({ ...base, structured: { cancelled: true, startedAt: 1, exit: 130, stopProven: true } }), proven('stop-proven'), 'cancel ended it, reap complete');
+  assert.deepEqual(shutdownStopReason({ ...base, structured: { cancelled: true, startedAt: 1, exit: 130 } }), unproven, 'incomplete reap, or the command had already exited');
   assert.equal(shutdownStopReason({ ...base, structured: { cancelled: false, startedAt: 1, exit: 0 } }), null, 'completed on its own keeps its record');
   assert.equal(shutdownStopReason({ ...base, cancelled: true, refusedAtStart: true, structured: null }), null, 'a user cancel wins');
   assert.equal(shutdownStopReason({ ...base, shutdownMarked: false, unstarted: true, structured: null }), null, 'no shutdown, no say');
@@ -225,7 +226,8 @@ test('kernelBootId: the override wins, and a null current id never upgrades an u
 
 test('servedRecord: an unproven stop from an earlier boot is served as proven; the same boot stays unproven', () => {
   const unproven = { protocol: 1, ticketId: 't', generation: 0, manifestHash: 'h', kind: 'unfinished', reason: 'runner-shutdown-unproven', shutdownBootId: 'boot-1' };
-  assert.deepEqual(servedRecord(unproven, 'boot-2'), { ...unproven, reason: RUNNER_SHUTDOWN_REASON, provenBy: 'reboot' });
+  assert.deepEqual(servedRecord(unproven, 'boot-2'), { ...unproven, reason: RUNNER_SHUTDOWN_REASON, provenBy: 'reboot', shutdownProof: 'reboot' });
+  assert.equal(servedRecord({ ...unproven, shutdownBootId: '' }, 'boot-2').reason, 'runner-shutdown-unproven', 'an empty recorded id proves nothing');
   assert.equal(servedRecord(unproven, 'boot-1'), unproven, 'same boot: the job may still be alive');
   const { shutdownBootId: _, ...noBoot } = unproven;
   assert.equal(servedRecord(noBoot, 'boot-2'), noBoot, 'no recorded boot: cannot prove anything');

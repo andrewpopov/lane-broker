@@ -12,7 +12,7 @@ import { execFileSync } from 'node:child_process';
  */
 
 const READ_ATTEMPTS = 3;
-const KILL_WAIT_MS = 3000;
+export const KILL_WAIT_MS = 3000;
 
 let cachedUnits = null;
 

@@ -461,6 +461,11 @@ function acquireTreeLock(lockPath, shouldStop, pollMs, waitMs) {
   });
 }
 
+/** Is this process a descendant of a runner's `remote-exec` (it marks its env, see src/remote-runner.js)? */
+function isRemoteExecRunner(env = process.env) {
+  return env.LANE_BROKER_EXECUTOR === 'remote' && env.LANE_BROKER_LOCAL_REASON === 'remote-exec runner';
+}
+
 /**
  * Pure: fold one heartbeat's observed-CPU reading into a lease update
  * (BRAIN-207). A finite `observed` stamps observedCpuCores + observedAt on
@@ -480,7 +485,7 @@ export function childEnv(ticket, baseEnv = process.env, grantedCpuCores = ticket
   const env = { ...baseEnv, LANE_BROKER_LEASE: ticket.id, LANE_BROKER_KEY: ticket.key, ...(tmpDir ? tmpEnv(tmpDir) : {}) };
   // BRAIN-597: where the command runs. A runner's own `remote-exec` marked itself (src/remote-runner.js) and keeps `remote` (+ the submitter's runner name);
   // every other run is `local`, whatever a caller's shell exported.
-  if (baseEnv.LANE_BROKER_EXECUTOR === 'remote' && baseEnv.LANE_BROKER_LOCAL_REASON === 'remote-exec runner') env.LANE_BROKER_EXECUTOR = 'remote';
+  if (isRemoteExecRunner(baseEnv)) env.LANE_BROKER_EXECUTOR = 'remote';
   else {
     env.LANE_BROKER_EXECUTOR = 'local';
     delete env.LANE_BROKER_RUNNER;
@@ -1913,11 +1918,19 @@ async function main() {
    * or `remote-exec`'s own kind derivation (reading this exact result.json)
    * would never see it and would fall through to a bare, reasonless
    * 'unfinished'.
+   *
+   * BRAIN-1035: a runner-side ticket also publishes a plain queued cancel, carrying `neverStarted` (set only while no lease
+   * exists, under the lock), so `remote-exec` can prove a `lane drain --shutdown` cancel of a ticket that never ran. It never replaces a result already there.
    */
   async function finalizeQueuedAndExit(outcome = 'cancelled', { forcePublish = false } = {}) {
     // BRAIN-436: 'withdrawn' (a submitter took the queued ticket back to move it) finalizes exactly like a queue timeout:
     // a structured, unconditionally published exit-75 result that says the command never started.
     const isTimeout = outcome === 'queue-timeout' || outcome === 'withdrawn' || outcome === PUSH_ABANDONED;
+    // Explicit pre-spawn provenance for a pull agent (BRAIN-1035): this ticket was queued, never leased, and no lease exists under the lock.
+    // A lock timeout here leaves the flag off (conservative) and still publishes.
+    const neverStarted = await withLock(root, () => !readLease(root, ticket.id)).catch(() => false);
+    // The one publication that is new in BRAIN-1035 (a plain queued cancel nothing used to publish): remote-exec must not read it as a command result.
+    const provenanceOnly = attemptGeneration === null && !isTimeout && !forcePublish && isRemoteExecRunner() && readSupersededBy(root, ticket.id) === null;
     const buildResult = () =>
       isTimeout
         ? {
@@ -1929,15 +1942,16 @@ async function main() {
             waitedMs: null,
             cancelled: false,
             reason: outcome,
+            ...(neverStarted ? { neverStarted } : {}),
           }
-        : withSupersession(root, ticket.id, { ...remoteCancelledResult(enriched.id, null), executor: 'local', fallbackReason });
+        : withSupersession(root, ticket.id, { ...remoteCancelledResult(enriched.id, null), executor: 'local', fallbackReason, ...(neverStarted ? { neverStarted } : {}), ...(provenanceOnly ? { provenanceOnly } : {}) });
     const publish = (result) => {
       atomicWriteJson(ticket.resultPath, result);
       appendHistory(root, historyRow(ticket, result, { fallbackReason }));
     };
     if (attemptGeneration !== null) {
       await publishTerminal(root, ticket.id, attemptGeneration, () => publish(buildResult()));
-    } else if (isTimeout || forcePublish || readSupersededBy(root, ticket.id)) {
+    } else if (isTimeout || forcePublish || (provenanceOnly && !fs.existsSync(ticket.resultPath)) || readSupersededBy(root, ticket.id)) {
       // BRAIN-320 review fix B: `forcePublish` is only ever set by the
       // queue-timeout-then-cancel recheck above -- a ticket the queue-
       // timeout branch was ABOUT to publish (unconditionally, since it's

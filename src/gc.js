@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { atomicWriteFile, isCancelled, isExpired, isUuid, isWithdrawn, listJsonRecordsStrict, paths, readJsonSafe, stateHome, tombstonePath, withLock } from './state.js';
+import { atomicWriteFile, isCancelled, isExecutionId, isExpired, isWithdrawn, listJsonRecordsStrict, paths, readJsonSafe, stateHome, tombstonePath, withLock } from './state.js';
 import { isSupervisorAlive } from './lease.js';
 import { writeBrokerLog } from './admission.js';
 
@@ -244,7 +244,7 @@ export async function gcRemoteTickets({ remoteRoot, brokerRoot = stateHome(), re
     () => {
       let names = [];
       try {
-        names = fs.readdirSync(ticketsDir).filter(isUuid).sort();
+        names = fs.readdirSync(ticketsDir).filter(isExecutionId).sort();
       } catch {
         // no tickets yet
       }

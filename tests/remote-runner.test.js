@@ -1081,6 +1081,11 @@ test('a broker-level lane cancel landing after a queue-timeout expiry, before fi
   assert.ok(structured, 'the local broker must have published a result for the raced ticket');
   assert.equal(structured.cancelled, true);
   assert.notEqual(structured.reason, 'queue-timeout');
+  // BRAIN-1035: remote-exec's OWN record stays what it was: a deliberate cancel reads completed/130, never an unfinished
+  // never-started record the submitter would fall back on and re-run.
+  const published = await getResult(header.ticketId, root, env);
+  assert.equal(published.kind, 'completed', JSON.stringify(published));
+  assert.equal(published.exit, 130);
 });
 
 test('BRAIN-797: a queued ticket whose supervisor died is published as kind unfinished / supervisor-died-while-queued', async () => {
