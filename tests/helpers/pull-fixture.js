@@ -1,6 +1,7 @@
 import { after as afterAll, afterEach, before, describe, test } from 'node:test';
 import path from 'node:path';
-import { createAttempt, readAttempt } from '../../src/attempts.js';
+import { spawnSync } from 'node:child_process';
+import { createAttempt, readAttempt, updateAttempt } from '../../src/attempts.js';
 import { atomicWriteJson, paths, ensureStateDirs, readJsonSafe } from '../../src/state.js';
 import { buildExecHeader } from '../../src/remote-client.js';
 import { buildManifest } from '../../src/remote-manifest.js';
@@ -81,6 +82,10 @@ export async function pullFixture(t, w, { load = realSrc, id = ID, stub = null, 
       return (await w.su()).query(`UPDATE lane_dispatch.tickets SET ${sql} WHERE id = $1`, [id, ...params]);
     },
     pull: () => readAttempt(state, id)?.pull,
+    async killSupervisor() {
+      const { pid } = spawnSync(process.execPath, ['-e', '0']);
+      await updateAttempt(state, id, attempt.generation, (current) => ({ supervisor: { ...current.supervisor, pid, startTime: null } }));
+    },
     published: () => readJsonSafe(fx.resultPath),
   };
   return fx;
@@ -94,10 +99,10 @@ export function definePullSuite(title, scenarios, canaries) {
     afterAll(async () => { await cluster?.closeClients(); cluster?.stop(); });
     afterEach(() => cluster.closeClients());
     for (const [name, scenario] of Object.entries(scenarios)) test(name, async (t) => scenario(realSrc, await World.create(cluster), t));
-    for (const [name, file, mutation] of canaries) {
+    for (const [name, file, mutation, expected] of canaries) {
       test(`canary: with "${mutation[0].trim().slice(0, 70)}" removed, "${name}" fails`, async (t) => {
         const world = await World.create(cluster);
-        const failure = await assertCanaryFails(file, mutation, (load) => scenarios[name](load, world, t));
+        const failure = await assertCanaryFails(file, mutation, (load) => scenarios[name](load, world, t), expected);
         t.diagnostic(`failed as expected: ${String(failure.message).split('\n')[0].slice(0, 160)}`);
       });
     }

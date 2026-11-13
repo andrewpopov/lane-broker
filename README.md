@@ -1498,6 +1498,18 @@ Nothing dispatches this way until `lanePull.enabled` is true; this section is th
   Only a queued or runner-confirmed stop is a cancel (130); a quarantine or operator cancel stays unresolved (exit 1, attempt kept) until `quarantineLostAfterMs`, then lost 75. A missing or `lost` row
   settles lost 75 and a quarantined one lost 75 `queue-restored` after the same bound. The decision is ledgered before anything is done with it, then published with `cancelPrecedence: 'decision'`
   so a local cancel marker cannot turn a completed run into 130. `withdrawQueued` proves a withdraw only from a committed `withdrawn`, re-reading the row when the answer is lost.
+  Errors: only a transport failure, a timeout, SQLSTATE 53300/57P01/08xxx, an S3 5xx/408/429 or a lock timeout is waited out by `runPullTicket`; any other server SQLSTATE (23505, 42501, 22023, ...) or an S3 4xx
+  ends the run `unresolved` (attempt kept, `unresolved: pull-error: ...`), neither lost nor green. A terminal log that will not drain is bounded to 5 passes, then ledgered with `remoteLogWarning`.
+  Log chunks are written and acked only while their seqs are contiguous; a gap is held `logGapHoldMs` (10 s) and then skipped (`logGapSkipped`, healed by the verified-log fill). A **running** row never
+  needs the snapshot stream (URLs refreshed for it carry none); a **claimed** row whose stream vanished is cancelled durably (`pull.snapshotMissing`) and settles `snapshot-missing` only once it leaves the held state
+  (a run that happened anyway is published), never lost while it may run; the quarantine, unproven and snapshot settles also send a best-effort `ld_cancel`. An envelope with no snapshot is `prepare-interrupted`
+  only when the attempt's supervisor is dead (`supervisorAlive`); a live preparer yields `preparing`. With a ledger entry but no attempt and no `result.json`, the entry rebuilds the result durably, once
+  (the exit a waiter reads is the ledgered one). Effects are skipped when the attempt's generation is not the caller's (`stale`). The divergence report runs after publication and outside the ticket lock under a 2 s deadline.
+  A server-authored cancel is trusted only when the row is `cancelled` and its result carries `author: 'queue'`, which `ld_cancel` and `ld_cancel_quarantined` write and `ld_finish` strips from any runner result.
+  Where this differs from the plan (rev 2-5): the canary for "use `writer.bytes`" is "the cursor's `logBytes` is the file's size" (the writer's count cannot be injected without new code); T7's canary is removal of the
+  ledger-first branch; `objectRetries` and the drain count live in the attempt's `pull` record because R4's envelope has no update path; the divergence compare is the one queue call on the recovery path and never changes a decision;
+  every pump re-acks the cursor's `ackedSeq` (a crash between the cursor write and the ack otherwise left chunks forever); the published cancel result is the push-faithful 130 shape so the `cancelPrecedence` canary bites;
+  `getObjectToFile` writes a unique `.part` per call; T28's "different pid" is a fresh `ctx` with no in-memory state, not a second process.
 - `src/pull-ledger.js` is that ledger: one file per ticket, created by `link` (so exactly one racing creator wins), its directory fsynced before anyone trusts an existing entry. A result is keyed
   `(epoch, attempt_ref, resultSha256)`, a queue-authored decision `(epoch, kind, source|proof)`; a different acceptance for the same ticket is refused and the stored one stands.
 - `src/pull-log-cursor.js` is `<state>/pull/<id>/log-cursor.json`, `{epoch, ackedSeq, logBytes, epochStartBytes}`. A page is written, `durable()`, the cursor fsynced, then `ld_log_ack`; `ackedSeq` starts at -1.

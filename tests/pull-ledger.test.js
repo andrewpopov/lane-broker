@@ -93,7 +93,10 @@ const SCENARIOS = {
   },
 };
 
+const SAME = 'const sameAcceptance = (a, b) => isDeepStrictEqual(identityOf(a), identityOf(b)) && isDeepStrictEqual(a.decision, b.decision);';
+
 const CANARIES = [
+  ['T24: the same epoch and result body under a different attempt ref is refused, and the stored entry stands', 'pull-ledger.js', [SAME, 'const sameAcceptance = () => true;']],
   ['T25b: many processes racing with different entries yield exactly one created', 'pull-ledger.js', [LINK, LINK.replace('linkSync', 'renameSync')]],
   ['T33: an entry whose creator died right after the link is made durable by the reader before it is returned', 'pull-ledger.js', [PRE_ADOPT_SYNC, '  return validate(JSON.parse(text));']],
   ['T33: creating the ledger in a fresh root fsyncs every parent of its directory', 'pull-ledger.js', [PARENT_SYNC, '  fs.mkdirSync(dir, { recursive: true });\n  const tmp']],

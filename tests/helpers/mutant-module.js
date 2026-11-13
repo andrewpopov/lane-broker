@@ -40,11 +40,16 @@ export async function mutateSrcTree(file, [from, to]) {
 const realUrl = (module) => new URL(`../../src/${module}`, import.meta.url).href;
 export const realSrc = Object.assign((module) => import(realUrl(module)), { url: realUrl });
 
-/** Runs `run(load)` against the mutated tree and fails unless it throws: a guard that survives its own removal proves nothing. */
-export async function assertCanaryFails(file, mutation, run) {
+/**
+ * Runs `run(load)` against the mutated tree and demands that it fail on an assertion, or on an error whose message matches `expected`
+ * (the one named failure a guard's absence causes): a guard that survives its own removal, or a scenario that dies of something else, proves nothing.
+ */
+export async function assertCanaryFails(file, mutation, run, expected = null) {
   const load = await mutateSrcTree(file, mutation);
   let failure;
   await run(load).catch((err) => { failure = err; });
   assert.ok(failure, `with "${mutation[0]}" removed from ${file} the scenario still passed, so it proves nothing`);
+  const named = failure.code === 'ERR_ASSERTION' || (expected !== null && expected.test(String(failure.message)));
+  assert.ok(named, `with "${mutation[0]}" removed from ${file} the scenario failed, but not on an assertion or ${expected}: ${failure.stack}`);
   return failure;
 }

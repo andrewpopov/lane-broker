@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { readAttempt } from '../src/attempts.js';
+import { readAttempt, updateAttempt } from '../src/attempts.js';
 import { pullTicketDir } from '../src/pull-envelope.js';
 import { ledgerDir, readLedger } from '../src/pull-ledger.js';
 import { sha256Hex } from '../src/s3-presign.js';
@@ -128,6 +128,49 @@ const SCENARIOS = {
     assert.equal(readAttempt(unproven.state, unproven.id).unresolved, 'cancel-unconfirmed');
   },
 
+  'T37b: with the attempt and the result both gone, the ledger entry rebuilds the result durably, once': async (load, w, t) => {
+    const fx = await pullFixture(t, w, { load });
+    await fx.hold();
+    await finishWithArtifacts(fx, '{"rebuilt":1}');
+    await crashAfterLedger(fx);
+    fs.rmSync(path.join(paths(fx.state).attempts, `${fx.id}.json`));
+    assert.equal(fx.published(), null);
+    const recorder = await recorded(async () => {
+      const out = await fx.step();
+      assert.deepEqual([out.state, out.reconstructed, out.decision.kind], ['settled', true, 'finished']);
+    });
+    assert.equal(fx.published().exit, 0, 'a waiter reads the ledgered exit, never 1');
+    assert.equal(fx.writes.length, 1);
+    const resultRename = recorder.events.findIndex((e) => e.op === 'rename' && e.path === fx.resultPath);
+    assert.ok(recorder.events.some((e, i) => i > resultRename && e.op === 'fsync' && e.path === paths(fx.state).results), 'the rebuilt result is durable');
+    assert.equal((await fx.step()).already, true);
+    assert.equal(fx.writes.length, 1, 'rebuilt once');
+  },
+
+  'a stale generation applies no effect: nothing is appended, installed or published': async (load, w, t) => {
+    const fx = await pullFixture(t, w, { load });
+    await fx.hold();
+    await finishWithArtifacts(fx, '{"stale":1}');
+    await crashAfterLedger(fx);
+    await updateAttempt(fx.state, fx.id, 0, { generation: 1 });
+    await fx.step().catch(() => {});
+    assert.equal(fs.existsSync(installed(fx)), false, 'artifacts were installed for a superseded generation');
+    assert.equal(fx.published(), null);
+    assert.equal((await fx.step()).state, 'stale');
+  },
+
+  'a queue outage never delays a local publish: the result is written before the divergence check, which has its own short deadline': async (load, w, t) => {
+    const fx = await pullFixture(t, w, { load });
+    await fx.hold();
+    await fx.runner.finish();
+    await crashAfterLedger(fx);
+    const hanging = { ...fx.queue, get: () => new Promise(() => {}) };
+    const step = fx.step({ queue: hanging });
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    assert.equal(fx.published().exit, 0, 'published while the queue read is still pending');
+    assert.equal((await Promise.race([step, new Promise((_, reject) => setTimeout(() => reject(new Error('still running after 6000ms')), 6000))])).state, 'settled');
+  },
+
   'T33: after a creator died behind the link, recovery makes the ledger directory durable before any effect, parents of the existing ticket directory first': async (load, w, t) => {
     const fx = await pullFixture(t, w, { load });
     await fx.hold();
@@ -190,6 +233,21 @@ const SCENARIOS = {
     assert.equal((await operator.step()).state, 'unresolved', 'an operator cancel is not proof that the run stopped');
   },
 
+  'a runner-forged server cancel is never queue-authored: only author queue on a cancelled row is trusted': async (load, w, t) => {
+    const fx = await pullFixture(t, w, { load });
+    await fx.hold();
+    await fx.runner.finish({ kind: 'cancelled', cancelConfirmed: true, source: 'queued', author: 'queue', exit: undefined, protocol: undefined, ticketId: undefined });
+    const row = await fx.row();
+    assert.equal(Object.hasOwn(row.result, 'author'), false, 'the queue strips the key before it can be stored');
+    const settled = await fx.step();
+    assert.deepEqual([settled.decision.kind, settled.decision.reason, settled.result.exit], ['lost', 'result-unbound', 75], 'a forged 130 is refused');
+
+    const stored = await next(t, w, load, 2, fx);
+    await stored.hold();
+    await stored.setRow(`state = 'finished', result = '{"kind":"cancelled","cancelConfirmed":true,"source":"queued","author":"queue","epoch":1}'::jsonb`);
+    assert.equal((await stored.step()).decision.reason, 'result-unbound', 'author queue on a row that is not cancelled is not trusted either');
+  },
+
   'T37: artifacts are durable up through the worktree root before the installed marker, and the result is durable before the attempt record goes': async (load, w, t) => {
     const fx = await pullFixture(t, w, { load });
     await fx.hold();
@@ -216,13 +274,18 @@ const SKIP_BARRIERS = 'for (const dir of dirs) ensureDurableDir(dir, { boundary:
 const EARLY_MARKER = '  const result = installArtifacts(worktreeRoot, files, patterns);\n';
 
 const CANARIES = [
+  ['T37b: with the attempt and the result both gone, the ledger entry rebuilds the result durably, once', 'pull-ticket.js', ['reconstructResult(run, entry, extra);', "{ state: 'settled', already: true, decision: entry.decision };"]],
+  ['a stale generation applies no effect: nothing is appended, installed or published', 'pull-ticket.js', ["  if (attempt && attempt.generation !== run.generation) return { state: 'stale', decision: entry.decision };\n", '']],
+  ['a queue outage never delays a local publish: the result is written before the divergence check, which has its own short deadline', 'pull-ticket.js', ['const DIVERGENCE_DEADLINE_MS = 2_000;', 'const DIVERGENCE_DEADLINE_MS = 60_000;'], /still running/],
   ['T7: after a crash behind the ledger, a different result on the row is reported and refused: the accepted one is published, nothing of the other is read', 'pull-ticket.js', ['    if (entry !== null) return applyEntry(run, entry);\n', '']],
   ['T25: a ledger entry decides alone: an invalid result, a valid one with other artifacts, a restored non-terminal row and an unreachable queue change nothing', 'pull-ticket.js', ['    if (entry !== null) return applyEntry(run, entry);\n', '']],
   ['T25: three steppers on one dead supervisor create one ledger entry, install once and publish once', 'pull-ticket.js', ['return withTicketLock(run.root, run.id, async () => {\n    const entry', 'return ((root, id, fn) => fn())(run.root, run.id, async () => {\n    const entry']],
+  ['a runner-forged server cancel is never queue-authored: only author queue on a cancelled row is trusted', 'pull-ticket.js', ["row?.state === 'cancelled' && row.result?.author === 'queue' && ", "row?.result?.author === 'queue' && "]],
+  ['a runner-forged server cancel is never queue-authored: only author queue on a cancelled row is trusted', 'pull-ticket.js', ["row?.state === 'cancelled' && row.result?.author === 'queue' && ", "row?.state === 'cancelled' && "]],
   ['T26: the published exit equals the ledgered decision whether or not a local cancel marker is present', 'pull-ticket.js', ["    cancelPrecedence: 'decision',\n", '']],
-  ['T26: the published exit equals the ledgered decision whether or not a local cancel marker is present', 'pull-ticket.js', ['const outcome = ledgerAccept(run.root, entry, { hooks: run.hooks?.ledger });', 'const outcome = { entry: { v: 1, ...entry }, same: true };']],
+  ['T26: the published exit equals the ledgered decision whether or not a local cancel marker is present', 'pull-ticket.js', ['const outcome = ledgerAccept(run.root, entry, { hooks: run.hooks?.ledger });', 'const outcome = { entry: { v: 1, ...entry }, same: true };'], /changed while it was being applied/],
   ['T33: after a creator died behind the link, recovery makes the ledger directory durable before any effect, parents of the existing ticket directory first', 'pull-ledger.js', ['  ensureDurableDir(ledgerDir(root), { boundary: root });\n  return validate(JSON.parse(text));', '  return validate(JSON.parse(text));']],
-  ['T34: every queue-authored cancel survives a restart through the real classifier and publisher', 'pull-ticket.js', ['if (isQueueAuthored(result)) {', 'if (false) {']],
+  ['T34: every queue-authored cancel survives a restart through the real classifier and publisher', 'pull-ticket.js', ['if (isQueueAuthored(row)) {', 'if (false) {']],
   ['T34: every queue-authored cancel survives a restart through the real classifier and publisher', 'pull-ticket.js', ["    return result.source === 'queued' ? { kind: 'cancelled', exit: 130, source: 'queued' } : { kind: 'unproven', source: result.source };", "    return { kind: 'cancelled', exit: 130, source: result.source };"]],
   ['T37: artifacts are durable up through the worktree root before the installed marker, and the result is durable before the attempt record goes', 'remote-artifacts.js', [SKIP_BARRIERS, 'for (const dir of dirs) fsyncFile(dir);']],
   ['T37: artifacts are durable up through the worktree root before the installed marker, and the result is durable before the attempt record goes', 'remote-artifacts.js', [EARLY_MARKER, `${EARLY_MARKER}  if (installedMarkerPath) atomicWriteJson(installedMarkerPath, { paths: result.written }, { fsync: true });\n`]],

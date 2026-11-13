@@ -2,19 +2,17 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Readable } from 'node:stream';
-import { readAttempt, remoteCancelledResult, updateAttempt } from './attempts.js';
+import { readAttempt, remoteCancelledResult, supervisorAlive, updateAttempt } from './attempts.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { enqueueOnce } from './pull-enqueue.js';
 import { createEnvelope, pullTicketDir, readEnvelope, recordSnapshot, withTicketLock } from './pull-envelope.js';
 import { ledgerAccept, readLedger } from './pull-ledger.js';
 import { commitCursor, fileSize, newCursor, readCursor, reconcileLogFile, writeCursor } from './pull-log-cursor.js';
 import { blobKey, mapBounded, uploadSnapshot } from './pull-snapshot.js';
-import { QueueError } from './queue-client.js';
 import { artifactLimitsOf, installArtifactsDurable, receiveArtifacts } from './remote-artifacts.js';
 import { CACHE_REJECT_RE, classifyRemoteResult, provesNeverStarted } from './remote-client.js';
 import { lostResult } from './remote-reconcile.js';
 import { makeReader } from './remote-stream.js';
-import { S3Error } from './s3-client.js';
 import { presignUrl, sha256Hex } from './s3-presign.js';
 import { atomicWriteJson, ensureDurableDir, fsyncDirectory, fsyncFile, isCancelled, LockTimeoutError } from './state.js';
 import { CappedLogWriter, publishAttemptTerminal } from './supervisor.js';
@@ -26,6 +24,10 @@ const LOG_PAGES_PER_STEP = 32;
 const CLAIMED_WITHOUT_URLS_POLL_MS = 2_000;
 const OBJECT_RETRY_POLL_MS = 5_000;
 const BLOB_HEAD_CONCURRENCY = 8;
+const LOG_DRAIN_PASSES = 5;
+const LOG_DRAIN_RETRY_MS = 2_000;
+const DIVERGENCE_DEADLINE_MS = 2_000;
+const TRANSIENT_SQLSTATES = new Set(['53300', '57P01']);
 const SERVER_CANCEL_SOURCES = new Set(['queued', 'quarantine', 'operator']);
 export const GAP_MARKER = '\n[lane] streamed log differed from the verified log; verified log follows\n';
 
@@ -39,7 +41,7 @@ const installedMarkerOf = (root, id) => path.join(pullTicketDir(root, id), 'inst
 const hook = (run, name) => run.hooks?.[name]?.();
 
 const lost = (reason, detail) => ({ kind: 'lost', exit: 75, reason, ...(detail ? { detail } : {}) });
-const isQueueAuthored = (result) => SERVER_CANCEL_SOURCES.has(result?.source) && result.protocol === undefined && result.ticketId === undefined;
+const isQueueAuthored = (row) => row?.state === 'cancelled' && row.result?.author === 'queue' && SERVER_CANCEL_SOURCES.has(row.result.source);
 
 /**
  * The decision a terminal row carries, or `{kind:'unproven'}` when a cancel was recorded without proof that the run stopped. A runner
@@ -50,7 +52,7 @@ export function classifyPullTerminal(row, expected) {
   const { state, result } = row;
   if (state === 'lost') return lost('runner-lost');
   if (state === 'cancelled' && result == null) return { kind: 'cancelled', exit: 130, proof: 'released' };
-  if (isQueueAuthored(result)) {
+  if (isQueueAuthored(row)) {
     return result.source === 'queued' ? { kind: 'cancelled', exit: 130, source: 'queued' } : { kind: 'unproven', source: result.source };
   }
   if (result == null) return lost('result-unbound', 'a finished row carries no result');
@@ -68,7 +70,7 @@ export function gapFillBytes(segment, full, { capped, lossDetected }) {
   return Buffer.concat([Buffer.from(GAP_MARKER), full]);
 }
 
-const settingsOf = (ctx) => ({ ...DEFAULT_GLOBAL_CONFIG.lanePull, ...ctx.cfg, rustfs: { ...DEFAULT_GLOBAL_CONFIG.lanePull.rustfs, ...ctx.cfg?.rustfs } });
+const settingsOf = (ctx) => ({ logGapHoldMs: 10_000, ...DEFAULT_GLOBAL_CONFIG.lanePull, ...ctx.cfg, rustfs: { ...DEFAULT_GLOBAL_CONFIG.lanePull.rustfs, ...ctx.cfg?.rustfs } });
 
 function runOf(ctx) {
   const now = ctx.now ?? Date.now;
@@ -84,7 +86,7 @@ async function persistPull(run, patch, attemptFields = {}) {
 }
 
 function entryFor(run, row, decision, extra = {}) {
-  const runnerResult = row?.result && !isQueueAuthored(row.result) ? row.result : null;
+  const runnerResult = row?.result && !isQueueAuthored(row) ? row.result : null;
   return {
     logicalId: run.id,
     binding: run.envelope?.binding ?? null,
@@ -92,6 +94,7 @@ function entryFor(run, row, decision, extra = {}) {
     attemptRef: runnerResult ? row.attempt_ref ?? null : null,
     resultSha256: runnerResult ? sha256Hex(JSON.stringify(runnerResult)) : null,
     host: row?.host ?? null,
+    startedAt: readAttempt(run.root, run.id)?.startedAt ?? null,
     decision,
     ...(runnerResult ? { result: runnerResult } : {}),
     ...extra,
@@ -180,6 +183,15 @@ function openLogSession(run) {
   return { cursor, writer: new CappedLogWriter(run.logPath, { capBytes: run.logCapBytes, deriveTruncatedFromMarker: true }) };
 }
 
+function contiguousFrom(chunks, firstSeq) {
+  const kept = [];
+  for (const chunk of chunks) {
+    if (chunk.seq !== firstSeq + kept.length) break;
+    kept.push(chunk);
+  }
+  return kept;
+}
+
 async function pumpLog(run, row) {
   const session = openLogSession(run);
   const { writer } = session;
@@ -197,14 +209,24 @@ async function pumpLog(run, row) {
     for (let page = 0; page < LOG_PAGES_PER_STEP && !overBudget(run); page++) {
       const chunks = (await run.queue.logRead(run.id, row.epoch, cursor.ackedSeq)) ?? [];
       if (chunks.length === 0) return true;
-      for (const chunk of chunks) {
+      const contiguous = contiguousFrom(chunks, cursor.ackedSeq + 1);
+      const skippingGap = contiguous.length === 0;
+      if (skippingGap) {
+        const since = cursor.gapSince ?? run.now();
+        if (run.now() - since < run.cfg.logGapHoldMs) {
+          if (cursor.gapSince === undefined) writeCursor(run.root, run.id, { ...cursor, gapSince: since });
+          return false;
+        }
+      }
+      const page = skippingGap ? chunks : contiguous;
+      for (const chunk of page) {
         const bytes = Buffer.from(chunk.data, 'base64');
         writer.write(bytes);
         run.forward?.write(bytes);
       }
       const durable = await writer.durable();
       await hook(run, 'afterDurable');
-      cursor = commitCursor(run.root, run.id, run.logPath, cursor, { ackedSeq: chunks.at(-1).seq, ...(durable ? {} : { logDiscarded: true }) });
+      cursor = commitCursor(run.root, run.id, run.logPath, cursor, { ackedSeq: page.at(-1).seq, gapSince: undefined, ...(skippingGap ? { logGapSkipped: true } : {}), ...(durable ? {} : { logDiscarded: true }) });
       await hook(run, 'afterCursor');
       await run.queue.logAck(run.id, row.epoch, cursor.ackedSeq);
       await hook(run, 'afterAck');
@@ -234,6 +256,7 @@ async function fillLog(run, entry, warnings) {
   const { writer } = session;
   try {
     const cursor = session.cursor ?? newCursor(entry.epoch, run.logPath);
+    if (session.cursor === null) writeCursor(run.root, run.id, cursor);
     if (cursor.gapFilled) return;
     const end = Math.min(cursor.logBytes, fileSize(run.logPath));
     const segment = readSegment(run.logPath, Math.min(cursor.epochStartBytes, end), end);
@@ -277,16 +300,25 @@ function assertLedgerUnchanged(run, entry) {
   if (JSON.stringify(current) !== JSON.stringify(entry)) throw new Error(`pull ledger entry for ${run.id} changed while it was being applied`);
 }
 
-async function divergenceOf(run, entry) {
-  if (entry.resultSha256 === null) return null;
+function withDeadline(promise, ms) {
+  let timer;
+  const expiry = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`no answer within ${ms}ms`)), ms); });
+  return Promise.race([promise, expiry]).finally(() => clearTimeout(timer));
+}
+
+// after publication and outside the ticket lock, so a queue outage never delays a local publish
+async function reportDivergence(run, entry) {
+  if (entry.resultSha256 === null) return;
   try {
-    const row = await run.queue.get(run.id);
-    const other = row?.result && !isQueueAuthored(row.result) ? sha256Hex(JSON.stringify(row.result)) : null;
-    return other !== null && other !== entry.resultSha256 ? { epoch: row.epoch, resultSha256: other } : null;
+    const row = await withDeadline(run.queue.get(run.id), DIVERGENCE_DEADLINE_MS);
+    const other = row?.result && !isQueueAuthored(row) ? sha256Hex(JSON.stringify(row.result)) : null;
+    if (other !== null && other !== entry.resultSha256) run.report?.({ kind: 'ledger-divergence', entry, divergence: { epoch: row.epoch, resultSha256: other } });
   } catch {
-    return null;
+    // best effort: the entry already decided
   }
 }
+
+const resultWriterOf = (run) => run.writeResult ?? ((result, { fsync }) => atomicWriteJson(run.resultPath, result, { fsync }));
 
 function resultFor(run, attempt, entry, extra) {
   const { decision } = entry;
@@ -304,18 +336,26 @@ async function publish(run, attempt, entry, extra) {
     drain: async () => {},
     buildConfirmedResult: () => resultFor(run, attempt, entry, extra),
     buildCancelledResult: () => ({ ...remoteCancelledResult(run.id, attempt.startedAt), transport: 'pull' }),
-    writeResult: run.writeResult ?? ((result, { fsync }) => atomicWriteJson(run.resultPath, result, { fsync })),
+    writeResult: resultWriterOf(run),
     durable: true,
     cancelPrecedence: 'decision',
   });
   if (!published.ok && !published.alreadyPublished) throw new Error(`publishing ${run.id} was refused (${JSON.stringify(published)})`);
-  return { state: 'settled', decision: entry.decision, result: finalResult, published: published.ok === true };
+  return { state: 'settled', decision: entry.decision, result: finalResult, published: published.ok === true, entry };
+}
+
+function reconstructResult(run, entry, extra) {
+  const attempt = { id: run.id, startedAt: entry.startedAt ?? entry.acceptedAt, runner: null };
+  const result = resultFor(run, attempt, entry, extra);
+  resultWriterOf(run)(result, { fsync: true });
+  return { state: 'settled', decision: entry.decision, result, reconstructed: true, entry };
 }
 
 async function applyEntry(run, entry) {
   run.envelope ??= readEnvelope(run.root, run.id);
   const attempt = readAttempt(run.root, run.id);
-  if (!attempt || fs.existsSync(run.resultPath)) return { state: 'settled', already: true, decision: entry.decision };
+  if (fs.existsSync(run.resultPath)) return { state: 'settled', already: true, decision: entry.decision };
+  if (attempt && attempt.generation !== run.generation) return { state: 'stale', decision: entry.decision };
   const warnings = { ...entry.warnings };
   const extra = {};
   if (entry.decision.kind === 'finished') {
@@ -323,19 +363,17 @@ async function applyEntry(run, entry) {
     Object.assign(extra, await installStaged(run, entry, warnings));
     if (isCancelled(run.root, run.id)) extra.cancelRaced = true;
   }
-  const divergence = await divergenceOf(run, entry);
-  if (divergence) {
-    extra.ledgerDivergence = divergence;
-    run.report?.({ kind: 'ledger-divergence', entry, divergence });
-  }
   if (warnings.log) extra.remoteLogWarning = warnings.log;
   if (warnings.artifacts) extra.remoteArtifactsWarning = warnings.artifacts;
   assertLedgerUnchanged(run, entry);
-  return publish(run, attempt, entry, extra);
+  return attempt ? publish(run, attempt, entry, extra) : reconstructResult(run, entry, extra);
 }
 
 async function cancelIfRequested(run) {
-  if (!run.cancelRequested?.()) return;
+  if (run.cancelRequested?.()) await requestCancel(run);
+}
+
+async function requestCancel(run) {
   const { pull } = readAttempt(run.root, run.id);
   if (pull?.cancel?.answer !== undefined) return;
   await persistPull(run, { cancel: { ...pull?.cancel, requestedAt: pull?.cancel?.requestedAt ?? run.now() } });
@@ -345,7 +383,7 @@ async function cancelIfRequested(run) {
 
 const urlsNeeded = (run, row) => !row.urls || row.urls.epoch !== row.epoch || row.urls.expiresAt - run.now() < run.cfg.urlRefreshSec * 1000;
 
-function buildUrls(run, row) {
+function buildUrls(run, row, { withInputs }) {
   const { snapBucket, outBucket } = run.cfg.rustfs;
   const sign = (method, bucket, key) => run.presign({ method, bucket, key, expiresSec: run.cfg.urlTtlSec });
   const { snapshot, nonce } = run.envelope;
@@ -353,44 +391,71 @@ function buildUrls(run, row) {
     v: 1,
     epoch: row.epoch,
     expiresAt: run.now() + run.cfg.urlTtlSec * 1000,
-    stream: sign('GET', snapBucket, snapshot.key),
-    blobs: Object.fromEntries(snapshot.blobs.map((blob) => [blob.sha256, sign('GET', snapBucket, blobKey(blob.ns, blob.sha256))])),
+    ...(withInputs ? {
+      stream: sign('GET', snapBucket, snapshot.key),
+      blobs: Object.fromEntries(snapshot.blobs.map((blob) => [blob.sha256, sign('GET', snapBucket, blobKey(blob.ns, blob.sha256))])),
+    } : {}),
     log: sign('PUT', outBucket, outKey(run.id, row.epoch, nonce, 'log')),
     artifacts: sign('PUT', outBucket, outKey(run.id, row.epoch, nonce, 'artifacts')),
   };
 }
 
+async function snapshotMissingPass(run, row) {
+  const { pull } = readAttempt(run.root, run.id);
+  const since = pull?.snapshotMissing?.since ?? run.now();
+  if (!pull?.snapshotMissing) await persistPull(run, { snapshotMissing: { since } });
+  await requestCancel(run);
+  if (run.now() - since < run.cfg.quarantineLostAfterMs) return { state: row.state, next: run.cfg.pollMs };
+  await updateAttempt(run.root, run.id, run.generation, { unresolved: 'snapshot-missing' });
+  return { state: 'unresolved', reason: 'snapshot-missing', exitCode: 1, next: run.cfg.pollMs };
+}
+
 async function heldPass(run, row) {
+  const running = row.state === 'running';
   const needsUrls = urlsNeeded(run, row);
   if (needsUrls) {
-    const head = await run.s3.headObject(run.cfg.rustfs.snapBucket, run.envelope.snapshot.key, { deadlineMs: run.objectDeadlineMs });
-    if (!head.exists) {
-      const stored = accept(run, entryFor(run, row, lost('snapshot-missing')));
-      await run.queue.cancel(run.id).catch(() => {});
-      return applyEntry(run, stored);
-    }
-    await run.queue.attachUrls(run.id, row.epoch, buildUrls(run, row));
+    const head = running ? { exists: true } : await run.s3.headObject(run.cfg.rustfs.snapBucket, run.envelope.snapshot.key, { deadlineMs: run.objectDeadlineMs });
+    if (!head.exists) return snapshotMissingPass(run, row);
+    await run.queue.attachUrls(run.id, row.epoch, buildUrls(run, row, { withInputs: !running }));
   }
   await pumpLog(run, row);
   return { state: row.state, next: needsUrls && row.state === 'claimed' ? CLAIMED_WITHOUT_URLS_POLL_MS : run.cfg.pollMs };
+}
+
+async function settleAndCancel(run, entry) {
+  const stored = accept(run, entry);
+  await run.queue.cancel(run.id).catch(() => {});
+  await hook(run, 'afterLedger');
+  return applyEntry(run, stored);
 }
 
 async function unprovenPass(run, row) {
   const { pull } = readAttempt(run.root, run.id);
   const since = pull?.unprovenSince ?? run.now();
   if (pull?.unprovenSince === undefined) await persistPull(run, { unprovenSince: since });
-  if (run.now() - since >= run.cfg.quarantineLostAfterMs) return settle(run, entryFor(run, row, lost('cancel-unproven')));
+  if (run.now() - since >= run.cfg.quarantineLostAfterMs) return settleAndCancel(run, entryFor(run, row, lost('cancel-unproven')));
   await updateAttempt(run.root, run.id, run.generation, { unresolved: 'cancel-unconfirmed' });
   return { state: 'unresolved', reason: 'cancel-unconfirmed', exitCode: 1, next: run.cfg.pollMs };
 }
 
 async function terminalPass(run, row) {
-  const decision = classifyPullTerminal(row, run.envelope.binding);
+  const { pull } = readAttempt(run.root, run.id);
+  let decision = classifyPullTerminal(row, run.envelope.binding);
+  if (pull?.snapshotMissing && (decision.kind === 'cancelled' || decision.kind === 'unproven')) decision = lost('snapshot-missing');
   if (decision.kind === 'unproven') return unprovenPass(run, row);
-  if (decision.kind !== 'lost' && row.epoch != null && !(await pumpLog(run, row))) return { state: 'draining-log', next: 0 };
+  const drainWarnings = {};
+  if (decision.kind !== 'lost' && row.epoch != null && !(await pumpLog(run, row))) {
+    const passes = (pull?.drainPasses ?? 0) + 1;
+    if (passes < LOG_DRAIN_PASSES) {
+      await persistPull(run, { drainPasses: passes });
+      return { state: 'draining-log', next: LOG_DRAIN_RETRY_MS };
+    }
+    drainWarnings.log = `the streamed log was not fully drained after ${LOG_DRAIN_PASSES} passes`;
+  }
   if (decision.kind !== 'finished') return settle(run, entryFor(run, row, decision));
   const entry = entryFor(run, row, decision);
-  const { parts, warnings, transient } = await stageObjects(run, row, entry.resultSha256.slice(0, 16));
+  const { parts, warnings: stageWarnings, transient } = await stageObjects(run, row, entry.resultSha256.slice(0, 16));
+  const warnings = { ...drainWarnings, ...stageWarnings };
   if (transient.length > 0) {
     const retries = (readAttempt(run.root, run.id).pull?.objectRetries ?? 0) + 1;
     if (retries < OBJECT_RETRY_PASSES) {
@@ -406,7 +471,10 @@ async function observe(run) {
   const attempt = readAttempt(run.root, run.id);
   if (!attempt) return fs.existsSync(run.resultPath) ? { state: 'settled', already: true } : { state: 'gone' };
   run.envelope = readEnvelope(run.root, run.id);
-  if (run.envelope === null || run.envelope.snapshot === undefined) return settle(run, entryFor(run, null, lost('prepare-interrupted')));
+  if (run.envelope === null || run.envelope.snapshot === undefined) {
+    if (supervisorAlive(attempt)) return { state: 'preparing', next: run.cfg.pollMs };
+    return settle(run, entryFor(run, null, lost('prepare-interrupted')));
+  }
   if (!attempt.pull?.enqueue?.seenRowAt) return { state: 'needs-enqueue' };
   await cancelIfRequested(run);
   const row = await run.queue.get(run.id);
@@ -430,7 +498,7 @@ async function observe(run) {
 async function quarantinedPass(run, row, attempt) {
   const since = attempt.pull.quarantinedSince ?? run.now();
   if (attempt.pull.quarantinedSince === undefined) await persistPull(run, { quarantinedSince: since });
-  if (run.now() - since >= run.cfg.quarantineLostAfterMs) return settle(run, entryFor(run, row, lost('queue-restored')));
+  if (run.now() - since >= run.cfg.quarantineLostAfterMs) return settleAndCancel(run, entryFor(run, row, lost('queue-restored')));
   return { state: 'quarantined', next: run.cfg.pollMs };
 }
 
@@ -468,14 +536,20 @@ async function enqueueStage(run) {
   });
 }
 
+async function afterStep(run, out) {
+  const { entry, ...rest } = out;
+  if (entry && !out.already) await reportDivergence(run, entry);
+  return rest;
+}
+
 /** One bounded, idempotent pass. Returns `{state, next?}`; `settled` carries the decision and published result. Retry timing is the caller's. */
 export async function stepPullTicket(ctx) {
   const run = runOf(ctx);
   try {
     const first = await guarded(run, observe);
-    if (first.state !== 'needs-enqueue') return first;
+    if (first.state !== 'needs-enqueue') return afterStep(run, first);
     const sent = await enqueueStage(run);
-    if (sent.outcome === 'lost') return await guarded(run, () => settle(run, entryFor(run, null, lost(sent.reason))));
+    if (sent.outcome === 'lost') return await afterStep(run, await guarded(run, () => settle(run, entryFor(run, null, lost(sent.reason)))));
     if (sent.outcome === 'queued') await persistPull(run, { stage: 'QUEUED' }, { phase: 'running' });
     return { state: 'waiting', next: 0 };
   } catch (err) {
@@ -485,7 +559,20 @@ export async function stepPullTicket(ctx) {
 }
 
 const OUTCOME_OF = { finished: 'confirmed', cancelled: 'cancelled', lost: 'lost' };
-const RETRYABLE = [QueueError, S3Error, LockTimeoutError];
+
+const isNamed = (err, name) => err?.name === name;
+
+/** Only a transport failure, a timeout, 53300, 57P01, 08xxx or an S3 5xx is waited out; any other server SQLSTATE or an S3 4xx will answer the same way again. */
+export function isTransientError(err) {
+  if (isNamed(err, 'LockTimeoutError')) return true;
+  if (isNamed(err, 'S3Error')) return err.status === null || err.status >= 500 || err.status === 408 || err.status === 429;
+  if (!isNamed(err, 'QueueError')) return false;
+  const code = String(err.code ?? '');
+  if (TRANSIENT_SQLSTATES.has(code) || code.startsWith('08')) return true;
+  return err.cause !== undefined && typeof err.cause.severity !== 'string';
+}
+
+const isPullServiceError = (err) => isNamed(err, 'QueueError') || isNamed(err, 'S3Error');
 const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export async function preparePullTicket(ctx) {
@@ -514,12 +601,16 @@ export async function runPullTicket(ctx) {
     try {
       step = await stepPullTicket(ctx);
     } catch (err) {
-      if (!RETRYABLE.some((type) => err instanceof type)) throw err;
-      await sleep(settingsOf(ctx).pollMs);
-      continue;
+      if (isTransientError(err)) {
+        await sleep(settingsOf(ctx).pollMs);
+        continue;
+      }
+      if (!isPullServiceError(err)) throw err;
+      await updateAttempt(ctx.root, ctx.id, ctx.generation, { unresolved: `pull-error: ${err.message}` }).catch(() => {});
+      return { outcome: 'unresolved', reason: 'pull-error', error: err.message, code: err.code ?? err.status ?? null };
     }
     if (step.state === 'settled') return { outcome: OUTCOME_OF[step.decision.kind], decision: step.decision, exitCode: step.decision.exit, result: step.result, already: step.already === true };
-    if (step.state === 'withdrawn' || step.state === 'gone') return { outcome: step.state };
+    if (step.state === 'withdrawn' || step.state === 'gone' || step.state === 'stale') return { outcome: step.state };
     await sleep(step.next ?? settingsOf(ctx).pollMs);
   }
 }

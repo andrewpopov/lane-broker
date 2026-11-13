@@ -125,12 +125,51 @@ const SCENARIOS = {
     for (const chunk of chunks) await fx.runner.log(chunk);
     await fx.step({ logCapBytes: 100 });
     const capped = logText(fx);
-    assert.equal(capped.match(MARKER_RE).length, 1);
+    assert.equal((capped.match(MARKER_RE) ?? []).length, 1);
     assert.equal(capped.indexOf('\n[lane-broker]'), 100, 'the log holds exactly the cap before the marker');
     await finishWithLog(fx, chunks.join(''));
     await fx.step({ logCapBytes: 100 });
     assert.equal(logText(fx), capped);
     assert.equal(readCursor(fx.state, fx.id).logBytes, capped.length);
+  },
+
+  'T13c: a chunk is acked only while the seqs are contiguous, so a lower seq committing later is never lost; a gap that never fills is skipped after the hold': async (load, w, t) => {
+    const late = await pullFixture(t, w, { load });
+    await late.hold();
+    await late.runner.log('a\n', 0);
+    await late.runner.log('c\n', 2);
+    await late.step();
+    assert.equal(logText(late), 'a\n', 'seq 2 waits behind the gap');
+    assert.equal(readCursor(late.state, late.id).ackedSeq, 0);
+    assert.equal(await chunkCount(late), 1, 'seq 2 is still in the queue, not acked');
+    await late.runner.log('b\n', 1);
+    await late.step();
+    assert.equal(logText(late), 'a\nb\nc\n');
+    assert.equal(readCursor(late.state, late.id).ackedSeq, 2);
+    assert.equal(await chunkCount(late), 0);
+    await late.runner.finish();
+
+    const never = await next(t, w, load, 2, late);
+    await never.hold();
+    await never.runner.log('a\n', 0);
+    await never.runner.log('c\n', 2);
+    await never.step();
+    never.clock.now += 11_000;
+    await never.step();
+    assert.equal(logText(never), 'a\nc\n');
+    assert.deepEqual([readCursor(never.state, never.id).ackedSeq, readCursor(never.state, never.id).logGapSkipped], [2, true]);
+  },
+
+  'a gap fill with no cursor writes the cursor first, so a crash after the append does not duplicate the log': async (load, w, t) => {
+    const fx = await pullFixture(t, w, { load });
+    await fx.hold();
+    await finishWithLog(fx, 'l0\nl1\n');
+    await crashAt(fx, 'afterLedger');
+    fs.rmSync(cursorFile(fx.state, fx.id));
+    await crashAt(fx, 'afterFill');
+    assert.equal(logText(fx), 'l0\nl1\n');
+    assert.equal((await fx.step()).state, 'settled');
+    assert.equal(logText(fx), 'l0\nl1\n', 'the replay did not append it again');
   },
 
   'V4-2: the file is reconciled to the cursor before the writer exists, so a replay past a cap-hit crash has one marker and the replayed tail': async (load, w, t) => {
@@ -153,6 +192,9 @@ const SCENARIOS = {
 };
 
 const CANARIES = [
+  ['T13c: a chunk is acked only while the seqs are contiguous, so a lower seq committing later is never lost; a gap that never fills is skipped after the hold', 'pull-ticket.js', ['    if (chunk.seq !== firstSeq + kept.length) break;\n', '']],
+  ['T13c: a chunk is acked only while the seqs are contiguous, so a lower seq committing later is never lost; a gap that never fills is skipped after the hold', 'pull-ticket.js', ['        if (run.now() - since < run.cfg.logGapHoldMs) {', '        if (true) {']],
+  ['a gap fill with no cursor writes the cursor first, so a crash after the append does not duplicate the log', 'pull-ticket.js', ['    if (session.cursor === null) writeCursor(run.root, run.id, cursor);\n', '']],
   ['T13: a log replayed after a restart has every line exactly once, whichever point the supervisor died at', 'pull-log-cursor.js', ['    fs.truncateSync(logPath, cursor.logBytes);\n', '']],
   ['T13: a log replayed after a restart has every line exactly once, whichever point the supervisor died at', 'pull-log-cursor.js', ['export const INITIAL_ACKED_SEQ = -1;', 'export const INITIAL_ACKED_SEQ = 0;']],
   ['T13: a log replayed after a restart has every line exactly once, whichever point the supervisor died at', 'pull-log-cursor.js', ['logBytes: fileSize(logPath) };', 'logBytes: cursor.logBytes };']],
