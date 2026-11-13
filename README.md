@@ -1452,7 +1452,7 @@ Not covered: work already running when a window closes is left to the existing o
 ### Pull transport configuration (BRAIN-1036)
 
 A runner entry may take work by pull instead of ssh: the ticket waits in the lane queue (Postgres) and the runner claims it.
-Nothing dispatches this way until `lanePull.enabled` is true; this section is the config and the activation check only.
+Nothing dispatches this way until `lanePull.enabled` is true; this section is the config, the activation check and the client building blocks (no placement uses them yet).
 
 ```json
 { "runners": [ { "name": "wintop", "transport": "pull" } ],
@@ -1476,6 +1476,18 @@ Nothing dispatches this way until `lanePull.enabled` is true; this section is th
   readable (only the sweeper may delete objects, by ticket state). It also removes leftover probe objects, then PUTs, re-PUTs and deletes a probe object under
   `lane-snap/probes/` to learn whether HEAD returns a `Last-Modified` and a re-PUT refreshes it, and prints `blobGc on` or
   `blobGc off`; with `off`, set `lanePull.blobGc` to false.
+- `src/queue-client.js` is the one Postgres client for the submitter `ld_*` calls. It refuses a `laneQueueUrl` the config would refuse,
+  connects per call over TLS against `lanePull.caFile` with the password from `lanePull.passwordFile`, and gives every connection and query a deadline.
+  It retries SQLSTATE 53300 for every call (nothing was sent) and a guard kill or dropped connection only for idempotent calls (`ld_queue_ref`, `ld_get`,
+  `ld_list_mine`, `ld_attach_urls`, `ld_log_read`, `ld_log_ack`, `ld_placeable`), with jitter. `ld_enqueue_fenced`, `ld_withdraw` and `ld_cancel` are never sent twice by the client: they throw, and the caller decides what an unanswered call means.
+- `src/pull-envelope.js` is `<state>/pull/<id>/envelope.json`, written once and fsynced (with every ancestor directory) before any upload: everything a
+  recovery needs to enqueue without rebuilding from a changed worktree. The snapshot descriptor is added after the upload and never replaced.
+- `src/pull-enqueue.js` sends `ld_enqueue_fenced` from the envelope. Before **every** send it fsyncs a pending intent into the attempt record
+  (`pull.enqueue`). A replay reuses the ref of any attempt not durably recorded as stale. The ref is refreshed only when every earlier attempt is
+  recorded stale. A stale answer after an attempt that may have been sent settles lost (`enqueue-crossed-restore`, exit 75).
+- `src/pull-snapshot.js` uploads cached blobs to `lane-snap/blobs/<ns>/<sha256>` (HEAD first; a blob older than `blobRefreshAfterDays` is
+  uploaded again, aged by HEAD `Last-Modified`, else `<state>/pull/blob-index.json`, else treated as old) and the gzipped stream to
+  `lane-snap/streams/<ticketId>-<generation>-<sha256>.gz`. It returns the descriptor `{key, sha256, bytes, blobs}` (`key` is relative to the bucket) and the header with `repoIdentity` set.
 
 ### Pull agent client core (BRAIN-1035)
 

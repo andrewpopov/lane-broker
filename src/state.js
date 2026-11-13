@@ -56,6 +56,8 @@ export function paths(root = stateHome()) {
     expire: path.join(root, 'expire'),
     // BRAIN-436: a runner-side withdraw marker (see `writeWithdrawMarkerFile`).
     withdraw: path.join(root, 'withdraw'),
+    // BRAIN-1036: one directory per pull ticket (`pull/<id>/envelope.json`), the durable record a recovery rebuilds from.
+    pull: path.join(root, 'pull'),
     // BRAIN-731: one file per ticket cancelled because a repeat of its push replaced it; the content is the superseding id.
     superseded: path.join(root, 'superseded'),
     // BRAIN-731: one file per push-gate ticket whose foreground client gave up at --timeout and left it queued for `lane wait`.
