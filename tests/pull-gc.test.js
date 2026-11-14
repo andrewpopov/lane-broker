@@ -6,7 +6,9 @@ import { pullTicketDir, withTicketLock } from '../src/pull-envelope.js';
 import { ledgerAccept, readLedger } from '../src/pull-ledger.js';
 import { createS3Client, S3Error } from '../src/s3-client.js';
 import { ensureStateDirs, readJsonSafe } from '../src/state.js';
-import { freshEnv } from './helpers.js';
+import test from 'node:test';
+import { freshEnv, writeGlobalConfig } from './helpers.js';
+import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 import { ARTIFACT_PATH, artifactsStream, definePullSuite, pullFixture } from './helpers/pull-fixture.js';
 import { harnessClient } from './helpers/queue-fixture.js';
 import { makeTmpDir } from './helpers/tmp.js';
@@ -387,5 +389,45 @@ const CANARIES = [
   ['rows_after derives from lanePull.rowRetentionMs and a smaller value is refused', 'pull-gc.js', ['return requestedMs ?? settings.rowRetentionMs;', 'return requestedMs ?? 7 * 24 * HOUR_MS;']],
   ['rows_after derives from lanePull.rowRetentionMs and a smaller value is refused', 'pull-gc.js', ['if (requestedMs !== undefined && requestedMs < settings.rowRetentionMs) {', 'if (false) {']],
 ];
+
+const gcCommandOutcome = async (load, args, lanePull) => {
+  const { home } = freshEnv();
+  writeGlobalConfig(home, { version: 1, lanePull });
+  const [priorHome, priorWrite] = [process.env.LANE_BROKER_HOME, process.stderr.write];
+  let stderr = '';
+  process.env.LANE_BROKER_HOME = home;
+  process.stderr.write = (chunk) => { stderr += chunk; return true; };
+  try {
+    await (await load('pull-gc.js')).pullGcCommand(args);
+  } finally {
+    process.env.LANE_BROKER_HOME = priorHome;
+    process.stderr.write = priorWrite;
+  }
+  return stderr;
+};
+
+const GC_SOCKET_URL = 'postgres://lane_admin_pitelite@%2Fvar%2Frun%2Fpostgresql/lane_queue';
+const GC_TCP_URL = 'postgres://lane_admin_pitelite@pitelite:5432/lane_queue';
+const GC_STORE = { rustfs: { endpoint: 'https://pitelite:9000', credentialsEnvFile: '/nonexistent/rustfs.env' } };
+const GC_NAME = 'gc: a TCP queue-url needs its own --password-file and --ca-file, a socket queue-url needs neither and refuses both, and lanePull.caFile is never read';
+const GC_ARGUMENT_ERROR = /is required|must not be given|lanePull\.caFile|lanePull\.passwordFile/;
+
+async function gcFilesFollowTheQueueUrl(load) {
+  const outcome = (...args) => gcCommandOutcome(load, args, { ...GC_STORE, caFile: '/config/ca.pem' });
+  assert.doesNotMatch(await outcome('--queue-url', GC_SOCKET_URL), GC_ARGUMENT_ERROR, 'a socket URL gets past the argument and config checks');
+  assert.match(await outcome('--queue-url', GC_SOCKET_URL, '--password-file', '/pw'), /--password-file must not be given/);
+  assert.match(await outcome('--queue-url', GC_SOCKET_URL, '--ca-file', '/ca.pem'), /--ca-file must not be given/);
+  assert.match(await outcome('--queue-url', GC_TCP_URL), /--password-file is required/);
+  assert.match(await outcome('--queue-url', GC_TCP_URL, '--password-file', '/pw'), /--ca-file is required/);
+  assert.doesNotMatch(await outcome('--queue-url', GC_TCP_URL, '--password-file', '/pw', '--ca-file', '/ca.pem'), GC_ARGUMENT_ERROR);
+  assert.doesNotMatch(await outcome('--queue-url', `${GC_TCP_URL}?host=/tmp`, '--password-file', '/pw', '--ca-file', '/ca.pem'), /must not be given/, 'a ?host= URL is not a socket URL');
+}
+
+test(GC_NAME, async () => {
+  await gcFilesFollowTheQueueUrl(realSrc);
+  await assertCanaryFails('pull-gc.js', ["if (opts[flag] !== undefined) throw new Error(", "if (false) throw new Error("], gcFilesFollowTheQueueUrl);
+  await assertCanaryFails('pull-gc.js', ["} else if (opts[flag] === undefined) {", "} else if (false) {"], gcFilesFollowTheQueueUrl);
+  await assertCanaryFails('pull-gc.js', ["if (isSocketQueueUrl(opts['queue-url'])) {\n      if (opts[flag]", "if (false) {\n      if (opts[flag]"], gcFilesFollowTheQueueUrl);
+});
 
 definePullSuite('lane pull gc against the real retention SQL and the S3 stub', SCENARIOS, CANARIES);

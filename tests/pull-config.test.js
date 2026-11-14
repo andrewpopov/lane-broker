@@ -1,26 +1,27 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { ConfigError, DEFAULT_GLOBAL_CONFIG, loadGlobalConfig, pullConfigured, pullRunners, pushRunners } from '../src/config.js';
+import { ConfigError, DEFAULT_GLOBAL_CONFIG, isSocketQueueUrl, loadGlobalConfig, pullConfigured, pullRunners, pushRunners } from '../src/config.js';
 import { freshEnv, writeGlobalConfig } from './helpers.js';
 import { assertCanaryFails } from './helpers/mutant-module.js';
 
 /** BRAIN-1036 R2: the pull-transport config keys and their load-time refusals (T9, T20). */
 
 const QUEUE_URL = 'postgres://lane_submit_train@pitelite:5432/lane_queue?sslmode=verify-full';
+const SOCKET_URL = 'postgres://lane_submit_train@%2Fvar%2Frun%2Fpostgresql/lane_queue';
 const PULL_KEYS = {
   passwordFile: '/data/train/config/queue.pw',
   caFile: '/data/train/config/ca.pem',
   rustfs: { endpoint: 'https://pitelite:9000', credentialsEnvFile: '/data/train/config/rustfs.env' },
 };
 
-function load(extra) {
+function load(extra, loadFrom = loadGlobalConfig) {
   const { home } = freshEnv();
   writeGlobalConfig(home, { version: 1, ...extra });
   const prior = process.env.LANE_BROKER_HOME;
   process.env.LANE_BROKER_HOME = home;
   try {
-    return loadGlobalConfig();
+    return loadFrom();
   } finally {
     process.env.LANE_BROKER_HOME = prior;
   }
@@ -58,6 +59,30 @@ test('T9 laneQueueUrl refuses svc: hosts, the pg-primary name, multi-host URLs, 
   ]) {
     assert.throws(() => load({ laneQueueUrl: url }), (err) => err instanceof ConfigError && err.message.includes('"laneQueueUrl"') && reason.test(err.message), String(url));
   }
+});
+
+test('a Unix socket laneQueueUrl is accepted and every other laneQueueUrl rule still applies to it', () => {
+  assert.equal(load({ laneQueueUrl: SOCKET_URL }).laneQueueUrl, SOCKET_URL);
+  for (const [url, reason] of [
+    ['postgres://lane_submit_train@%2Fvar%2Frun%2Fpostgresql/postgres', /lane_queue database/],
+    [`${SOCKET_URL}?host=pitelite`, /"host" query parameter/],
+    [`${SOCKET_URL}?sslrootcert=/ca.pem`, /"sslrootcert" query parameter/],
+    ['postgres://lane_submit_train@%2Fvar%2Frun%2Fpostgresql,pitelite/lane_queue', /single-host|exactly one host/],
+  ]) {
+    assert.throws(() => load({ laneQueueUrl: url }), (err) => err instanceof ConfigError && err.message.includes('"laneQueueUrl"') && reason.test(err.message), url);
+  }
+});
+
+function socketUrlsAreOnlyValidSocketHosts({ isSocketQueueUrl: isSocket }) {
+  assert.equal(isSocket(SOCKET_URL), true);
+  for (const url of [QUEUE_URL, 'postgres://u@pitelite/lane_queue?host=/tmp', `${SOCKET_URL.replace('lane_queue', 'postgres')}`, 'postgres://u@%2Ftmp/lane_queue?dbname=x', 'not a url', undefined]) {
+    assert.equal(isSocket(url), false, String(url));
+  }
+}
+
+test('isSocketQueueUrl is true only for a valid laneQueueUrl whose host is a socket directory', async () => {
+  socketUrlsAreOnlyValidSocketHosts({ isSocketQueueUrl });
+  await assertCanaryFails('config.js', ['laneQueueUrlProblem(raw) === null && ', ''], (load) => load('config.js').then(socketUrlsAreOnlyValidSocketHosts));
 });
 
 test('T9 a host merely containing pg-primary is not the VIP name', () => {
@@ -132,6 +157,33 @@ test('lanePull.enabled needs every connection key, and names the missing ones', 
   assert.throws(() => load({ lanePull: { enabled: true } }), (err) => ['laneQueueUrl', 'lanePull.passwordFile', 'lanePull.caFile', 'lanePull.rustfs.endpoint', 'lanePull.rustfs.credentialsEnvFile'].every((k) => err.message.includes(`"${k}"`)));
   assert.throws(() => load({ laneQueueUrl: QUEUE_URL, lanePull: { enabled: true, ...PULL_KEYS, caFile: undefined } }), /"lanePull\.caFile"/);
   assert.ok(load({ laneQueueUrl: QUEUE_URL, lanePull: { enabled: true, ...PULL_KEYS } }));
+});
+
+const SOCKET_PULL = { rustfs: PULL_KEYS.rustfs };
+
+function socketPullRules({ loadGlobalConfig: loadFrom, pullConfigured: configured }) {
+  const loadWith = (extra) => load(extra, loadFrom);
+  const refuses = (extra, key) => assert.throws(() => loadWith(extra), (err) => err instanceof ConfigError && err.message.includes(`"${key}"`), JSON.stringify(extra));
+  assert.ok(loadWith({ laneQueueUrl: SOCKET_URL, lanePull: { enabled: true, ...SOCKET_PULL } }));
+  for (const key of ['passwordFile', 'caFile']) {
+    refuses({ laneQueueUrl: SOCKET_URL, lanePull: { enabled: true, ...SOCKET_PULL, [key]: PULL_KEYS[key] } }, `lanePull.${key}`);
+    refuses({ laneQueueUrl: SOCKET_URL, lanePull: { ...SOCKET_PULL, [key]: PULL_KEYS[key] } }, `lanePull.${key}`);
+  }
+  assert.throws(() => loadWith({ laneQueueUrl: QUEUE_URL, lanePull: { enabled: true, ...SOCKET_PULL } }), (err) => err.message.includes('"lanePull.passwordFile"') && err.message.includes('"lanePull.caFile"'));
+  const runners = [{ name: 'wintop', transport: 'pull' }];
+  assert.equal(configured(loadWith({ runners, laneQueueUrl: SOCKET_URL, lanePull: { enabled: true, ...SOCKET_PULL } })), true);
+  const tcpWithoutFiles = { ...loadWith({ runners, laneQueueUrl: QUEUE_URL, lanePull: { enabled: true, ...PULL_KEYS } }), lanePull: { enabled: true, ...SOCKET_PULL } };
+  assert.equal(configured(tcpWithoutFiles), false, 'a TCP URL without the files is not configured');
+}
+
+const SOCKET_PULL_TEST = 'a socket laneQueueUrl enables pull without passwordFile or caFile, refuses either, and a TCP URL still needs both';
+test(SOCKET_PULL_TEST, async () => {
+  socketPullRules({ loadGlobalConfig, pullConfigured });
+  const rules = (load) => load('config.js').then(socketPullRules);
+  await assertCanaryFails('config.js', ["...(isSocketQueueUrl(cfg.laneQueueUrl) ? [] : [['lanePull.passwordFile'", "...(false ? [] : [['lanePull.passwordFile'"], rules, /"lanePull\.enabled" needs/);
+  await assertCanaryFails('config.js', ["if (isSocketQueueUrl(cfg.laneQueueUrl)) {\n    for (const field of ['passwordFile', 'caFile']) assert(", "if (false) {\n    for (const field of ['passwordFile', 'caFile']) assert("], rules);
+  await assertCanaryFails('config.js', ["[...(isSocketQueueUrl(cfg.laneQueueUrl) ? [] : [pull.passwordFile, pull.caFile])", "[...(true ? [] : [pull.passwordFile, pull.caFile])"], rules);
+  await assertCanaryFails('config.js', ["[...(isSocketQueueUrl(cfg.laneQueueUrl) ? [] : [pull.passwordFile, pull.caFile])", "[...(false ? [] : [pull.passwordFile, pull.caFile])"], rules);
 });
 
 test('pullConfigured: enabled, a pull runner and every key, from the config alone (no file is read)', () => {

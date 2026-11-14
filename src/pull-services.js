@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { loadGlobalConfigOrError } from './config.js';
+import { isSocketQueueUrl, loadGlobalConfigOrError } from './config.js';
 import { publicationBindingsFor } from './pull-publication.js';
 import { createQueueClient } from './queue-client.js';
 import { createS3Client, loadS3Credentials } from './s3-client.js';
@@ -11,7 +11,8 @@ const unavailable = (reason) =>
 // no `enabled` check on purpose: tickets in flight must stay recoverable after the switch is turned off
 export function pullServices(cfg) {
   const pull = cfg?.lanePull;
-  const missing = [['laneQueueUrl', cfg?.laneQueueUrl], ['lanePull.passwordFile', pull?.passwordFile], ['lanePull.caFile', pull?.caFile],
+  const missing = [['laneQueueUrl', cfg?.laneQueueUrl],
+    ...(isSocketQueueUrl(cfg?.laneQueueUrl) ? [] : [['lanePull.passwordFile', pull?.passwordFile], ['lanePull.caFile', pull?.caFile]]),
     ['lanePull.rustfs.endpoint', pull?.rustfs?.endpoint], ['lanePull.rustfs.credentialsEnvFile', pull?.rustfs?.credentialsEnvFile]].filter(([, value]) => typeof value !== 'string');
   if (missing.length > 0) return { available: false, reason: `config lacks ${missing.map(([name]) => name).join(', ')}`, queue: unavailable('no queue'), s3: unavailable('no store') };
   const { endpoint, region, credentialsEnvFile } = pull.rustfs;

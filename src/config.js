@@ -598,6 +598,11 @@ export function laneQueueUrlProblem(raw) {
   return null;
 }
 
+/** A queue URL whose host is a Unix socket directory connects by peer auth: no TLS, no password, no CA. */
+export function isSocketQueueUrl(raw) {
+  return laneQueueUrlProblem(raw) === null && parsePgConnectionString(raw).host.startsWith('/');
+}
+
 const LANE_PULL_NUMBERS = ['pollMs', 'unprovenCancelLostAfterMs', 'queueUnreachableAfterMs', 'prepareBudgetMs', 'blobRefreshAfterDays', 'rowRetentionMs', 'ledgerRetentionMs'];
 // the queue's backup retention: a ledger entry must outlive every backup a restore could return
 export const LEDGER_RETENTION_FLOOR_MS = 35 * 24 * 3_600_000;
@@ -623,6 +628,9 @@ function validateLanePull(cfg, sourcePath) {
   for (const field of LANE_PULL_PATHS) {
     if (pull[field] !== undefined) assert(typeof pull[field] === 'string' && pull[field].length > 0, `${sourcePath}: "lanePull.${field}" must be a non-empty string`);
   }
+  if (isSocketQueueUrl(cfg.laneQueueUrl)) {
+    for (const field of ['passwordFile', 'caFile']) assert(pull[field] === undefined, `${sourcePath}: "lanePull.${field}" must not be set with a Unix socket "laneQueueUrl" (peer auth uses no password and no TLS)`);
+  }
   assert(isPlainObject(pull.rustfs), `${sourcePath}: "lanePull.rustfs" must be an object`);
   for (const field of RUSTFS_STRINGS) {
     if (pull.rustfs[field] !== undefined) assert(typeof pull.rustfs[field] === 'string' && pull.rustfs[field].length > 0, `${sourcePath}: "lanePull.rustfs.${field}" must be a non-empty string`);
@@ -633,8 +641,7 @@ function validateLanePull(cfg, sourcePath) {
   if (pull.enabled) {
     const missing = [
       ['laneQueueUrl', cfg.laneQueueUrl],
-      ['lanePull.passwordFile', pull.passwordFile],
-      ['lanePull.caFile', pull.caFile],
+      ...(isSocketQueueUrl(cfg.laneQueueUrl) ? [] : [['lanePull.passwordFile', pull.passwordFile], ['lanePull.caFile', pull.caFile]]),
       ['lanePull.rustfs.endpoint', pull.rustfs.endpoint],
       ['lanePull.rustfs.credentialsEnvFile', pull.rustfs.credentialsEnvFile],
     ].filter(([, value]) => value === undefined);
@@ -684,7 +691,7 @@ export function pullConfigured(cfg) {
     pull?.enabled === true &&
     pullRunners(cfg).length > 0 &&
     typeof cfg.laneQueueUrl === 'string' &&
-    [pull.passwordFile, pull.caFile, pull.rustfs?.endpoint, pull.rustfs?.credentialsEnvFile].every((value) => typeof value === 'string')
+    [...(isSocketQueueUrl(cfg.laneQueueUrl) ? [] : [pull.passwordFile, pull.caFile]), pull.rustfs?.endpoint, pull.rustfs?.credentialsEnvFile].every((value) => typeof value === 'string')
   );
 }
 

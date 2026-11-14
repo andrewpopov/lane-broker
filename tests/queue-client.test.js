@@ -2,7 +2,7 @@ import { describe, test, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { createQueueClient, QueueError } from '../src/queue-client.js';
-import { assertCanaryFails } from './helpers/mutant-module.js';
+import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 import { pgSkipOption } from './lane-db-harness.js';
 import { startDispatchCluster, World, logins, call, claim, start, tid } from './lane-dispatch-fixture.js';
 import { CA_TEXT, QUEUE_URL, harnessClient, secretFiles } from './helpers/queue-fixture.js';
@@ -135,6 +135,34 @@ const SCENARIOS = {
 const CANARIES = [
   ['enqueueFenced carries min_protocol to the row, and a caller that names none gets protocol 1', ['priority, minProtocol]),', 'priority, 1]),']],
 ];
+
+const SOCKET_URL = 'postgres://lane_submit_train@%2Fvar%2Frun%2Fpostgresql/lane_queue';
+
+async function socketPeerAuthAndTcpTls(t, load) {
+  const { connectionConfig, createQueueClient, QueueError } = await load('queue-client.js');
+  const socket = connectionConfig({ url: SOCKET_URL }, { connectTimeoutMs: 111, queryTimeoutMs: 222 });
+  assert.equal(socket.ssl, false);
+  assert.ok(!socket.password, 'no password');
+  assert.deepEqual([socket.host, socket.user, socket.database, socket.connectionTimeoutMillis, socket.query_timeout], ['/var/run/postgresql', 'lane_submit_train', 'lane_queue', 111, 222]);
+  assert.doesNotThrow(() => createQueueClient({ url: SOCKET_URL }));
+  const tcp = connectionConfig({ url: QUEUE_URL, ...secretFiles(t) }, { connectTimeoutMs: 111, queryTimeoutMs: 222 });
+  assert.deepEqual(tcp.ssl, { ca: CA_TEXT, rejectUnauthorized: true });
+  const disabled = connectionConfig({ url: `${QUEUE_URL.split('?')[0]}?sslmode=disable`, ...secretFiles(t) });
+  assert.deepEqual(disabled.ssl, { ca: CA_TEXT, rejectUnauthorized: true }, 'sslmode=disable in a TCP URL never turns TLS off');
+  assert.equal(tcp.password, 'queue-pass');
+  assert.deepEqual([tcp.connectionTimeoutMillis, tcp.query_timeout], [111, 222]);
+  assert.throws(() => connectionConfig({ url: QUEUE_URL, ...secretFiles(t, '\n') }), (err) => err instanceof QueueError && /password file .* is empty/.test(err.message));
+  assert.throws(() => connectionConfig({ url: QUEUE_URL }), (err) => err instanceof QueueError && /unreadable/.test(err.message));
+}
+
+const SOCKET_TEST = 'a socket URL connects by peer auth: no TLS, no password, no file read, the deadlines kept; a TCP URL keeps TLS with the CA and the password';
+test(SOCKET_TEST, async (t) => {
+  await socketPeerAuthAndTcpTls(t, realSrc);
+  await assertCanaryFails('queue-client.js', ['if (isSocketQueueUrl(url)) return', 'if (false) return'], (load) => socketPeerAuthAndTcpTls(t, load), /unreadable|password/);
+  await assertCanaryFails('queue-client.js', ['ssl: false, ...deadlines', 'ssl: { rejectUnauthorized: true }, ...deadlines'], (load) => socketPeerAuthAndTcpTls(t, load));
+  await assertCanaryFails('queue-client.js', ["ssl: { ca: readSecretFile(caFile, 'CA'), rejectUnauthorized: true },", "ssl: url.includes('sslmode=disable') ? false : { ca: readSecretFile(caFile, 'CA'), rejectUnauthorized: true },"], (load) => socketPeerAuthAndTcpTls(t, load));
+  await assertCanaryFails('queue-client.js', ["ssl: { ca: readSecretFile(caFile, 'CA'), rejectUnauthorized: true }", "ssl: { ca: readSecretFile(caFile, 'CA') }"], (load) => socketPeerAuthAndTcpTls(t, load));
+});
 
 describe('queue client against a disposable Postgres', { skip: pgSkipOption, timeout: 600000 }, () => {
   let cluster;
