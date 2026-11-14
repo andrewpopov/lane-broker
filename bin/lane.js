@@ -63,6 +63,7 @@ function usage() {
   lane gc [--dry-run] [--max <n>] [--root <remoteRoot>]
   lane reconcile [--now] [--json]
   lane pull check [--json]
+  lane agent [--check] [--root <remoteRoot>] [--config <dir>]
   lane runner [status] [--json]
   lane runner watch
   lane runner prewarm [--lane <name>] [--runner <name>] [--dry-run]
@@ -423,6 +424,10 @@ async function main() {
       if (rest[0] === 'check') return (await pullCheckCommand(rest.slice(1))).exitCode;
       process.stderr.write(`lane pull: ${rest[0] === undefined ? 'missing subcommand' : `unknown subcommand "${rest[0]}"`} (only \`check\`)\n`);
       return 2;
+    }
+    case 'agent': {
+      const { agentCommand } = await import('../src/agent/cli.js');
+      return (await agentCommand(rest, { remoteRoot: parseRootFlag(rest) || defaultRemoteRoot() })).exitCode;
     }
     case 'report': {
       if (rest[0] === 'phases') return (await phasesReportCommand(rest.slice(1))).exitCode;

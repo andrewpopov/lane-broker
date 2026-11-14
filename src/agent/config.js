@@ -2,7 +2,9 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parse as parsePgConnectionString } from 'pg-connection-string';
-import { loadGlobalConfig, laneQueueUrlProblem } from '../config.js';
+import { DEFAULT_GLOBAL_CONFIG, defaultBrokerHome, loadGlobalConfig, laneQueueUrlProblem } from '../config.js';
+import { defaultStateHome } from '../state.js';
+import { S3Error, parseS3Credentials } from '../s3-client.js';
 import { scheduleProblem } from '../runner-schedule.js';
 
 export class AgentConfigError extends Error {}
@@ -11,11 +13,19 @@ export const AGENT_CONFIG_DIR = path.join(os.homedir(), '.config', 'lane-agent')
 
 export const MAX_SPEED_FACTOR = 4;
 
-const DEFAULTS = { stopClaimingBeforeCloseMs: 30 * 60_000, requireAcPower: false, pollMs: 15_000, urlWaitMs: 60_000, speedFactor: 1 };
-const KNOWN = new Set(['laneQueueUrl', 'passwordFile', 'caFile', 'schedule', ...Object.keys(DEFAULTS)]);
+// A liveness call (claim or heartbeat) at least this often, in every state: the queue treats a runner silent for 8 of these as gone.
+export const LIVENESS_MS = 15_000;
+
+// A dead peer must surface as an error the client retries, not a hung query: keepalive probes, a connect bound, and a client-side bound above the role's 2 s statement_timeout.
+export const PG_LIVENESS = Object.freeze({ keepAlive: true, connectionTimeoutMillis: 10_000, query_timeout: 20_000 });
+
+const DEFAULTS = { stopClaimingBeforeCloseMs: 30 * 60_000, requireAcPower: false, pollMs: LIVENESS_MS, speedFactor: 1, fetchBudgetMs: 10 * 60_000 };
+const KNOWN = new Set(['laneQueueUrl', 'passwordFile', 'caFile', 'runnerName', 'rustfs', 'rustfsEnvFile', 'brokerHome', 'stateDir', 'schedule', ...Object.keys(DEFAULTS)]);
+const RUNNER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+const RUSTFS_KEYS = new Set(['endpoint', 'region', 'snapBucket', 'outBucket']);
 
 // One descriptor, no symlink followed: the mode and owner checked are those of the bytes returned.
-function readPrivateFile(file, uid) {
+export function readPrivateFile(file, uid) {
   let fd;
   try {
     fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
@@ -51,8 +61,32 @@ function positiveNumber(cfg, name, { max = Infinity } = {}) {
   return v;
 }
 
+function absolutePath(cfg, name, fallback) {
+  const v = cfg[name] ?? fallback;
+  if (typeof v !== 'string' || !path.isAbsolute(v)) throw new AgentConfigError(`"${name}" must be an absolute path`);
+  return v;
+}
+
+function parseRustfs(cfg, dir, uid) {
+  const block = cfg.rustfs;
+  if (block === null || typeof block !== 'object' || Array.isArray(block)) throw new AgentConfigError('"rustfs" must be an object with an "endpoint"');
+  const unknown = Object.keys(block).filter((k) => !RUSTFS_KEYS.has(k));
+  if (unknown.length) throw new AgentConfigError(`"rustfs": unknown field(s) ${unknown.join(', ')}`);
+  if (typeof block.endpoint !== 'string' || !/^https?:\/\/[^/\s]+\/?$/.test(block.endpoint)) throw new AgentConfigError('"rustfs.endpoint" must be an http(s) origin such as https://host:9000');
+  const defaults = DEFAULT_GLOBAL_CONFIG.lanePull.rustfs;
+  const named = { region: block.region ?? defaults.region, snapBucket: block.snapBucket ?? defaults.snapBucket, outBucket: block.outBucket ?? defaults.outBucket };
+  for (const [name, value] of Object.entries(named)) if (typeof value !== 'string' || value === '') throw new AgentConfigError(`"rustfs.${name}" must be a non-empty string`);
+  const envFile = path.resolve(dir, cfg.rustfsEnvFile ?? 'rustfs.env');
+  try {
+    return { endpoint: block.endpoint, ...named, creds: parseS3Credentials(readPrivateFile(envFile, uid), envFile) };
+  } catch (err) {
+    if (err instanceof S3Error) throw new AgentConfigError(err.message);
+    throw err;
+  }
+}
+
 // `config.json`, the password file and the CA are each 0600 and ours; TLS is verify-full and the password never enters a connection string.
-export function loadAgentConfig({ file = path.join(AGENT_CONFIG_DIR, 'config.json'), brokerConfig = loadGlobalConfig(), uid = process.getuid() } = {}) {
+export function loadAgentConfig({ file = path.join(AGENT_CONFIG_DIR, 'config.json'), brokerConfig, uid = process.getuid() } = {}) {
   let cfg;
   try {
     cfg = JSON.parse(readPrivateFile(file, uid));
@@ -63,7 +97,10 @@ export function loadAgentConfig({ file = path.join(AGENT_CONFIG_DIR, 'config.jso
   if (cfg === null || typeof cfg !== 'object' || Array.isArray(cfg)) throw new AgentConfigError(`${file}: must be a JSON object`);
   const unknown = Object.keys(cfg).filter((k) => !KNOWN.has(k));
   if (unknown.length) throw new AgentConfigError(`${file}: unknown field(s) ${unknown.join(', ')}`);
-  if (brokerConfig.remoteBlobCache !== true) throw new AgentConfigError('the broker config must have "remoteBlobCache": true: a pulled snapshot is only runnable from the blob cache');
+  const brokerHome = absolutePath(cfg, 'brokerHome', defaultBrokerHome());
+  const stateDir = absolutePath(cfg, 'stateDir', defaultStateHome());
+  const broker = brokerConfig ?? loadGlobalConfig({ home: brokerHome });
+  if (broker.remoteBlobCache !== true) throw new AgentConfigError('the broker config must have "remoteBlobCache": true: a pulled snapshot is only runnable from the blob cache');
 
   const target = parseQueueUrl(cfg.laneQueueUrl);
   const dir = path.dirname(file);
@@ -75,13 +112,20 @@ export function loadAgentConfig({ file = path.join(AGENT_CONFIG_DIR, 'config.jso
   }
   if (cfg.requireAcPower !== undefined && typeof cfg.requireAcPower !== 'boolean') throw new AgentConfigError('"requireAcPower" must be a boolean');
 
+  if (typeof cfg.runnerName !== 'string' || !RUNNER_NAME.test(cfg.runnerName)) throw new AgentConfigError('"runnerName" must be the runner\'s host name as the queue knows it (letters, digits, ".", "_", "-")');
+  const rustfs = parseRustfs(cfg, dir, uid);
+
   return {
-    pg: { ...target, password, ssl: { ca, rejectUnauthorized: true, servername: target.host } },
+    runnerName: cfg.runnerName,
+    brokerHome,
+    stateDir,
+    rustfs,
+    fetchBudgetMs: positiveNumber(cfg, 'fetchBudgetMs'),
+    pg: { ...target, ...PG_LIVENESS, password, ssl: { ca, rejectUnauthorized: true, servername: target.host } },
     schedule: cfg.schedule ?? null,
     stopClaimingBeforeCloseMs: positiveNumber(cfg, 'stopClaimingBeforeCloseMs'),
     requireAcPower: cfg.requireAcPower ?? DEFAULTS.requireAcPower,
-    pollMs: positiveNumber(cfg, 'pollMs'),
-    urlWaitMs: positiveNumber(cfg, 'urlWaitMs'),
+    pollMs: positiveNumber(cfg, 'pollMs', { max: LIVENESS_MS }),
     speedFactor: positiveNumber(cfg, 'speedFactor', { max: MAX_SPEED_FACTOR }),
   };
 }

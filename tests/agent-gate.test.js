@@ -13,17 +13,15 @@ async function untilEvent(events, reason) {
 }
 
 const SCENARIOS = {
-  'T19a terminating only the LISTEN backend makes the next call ld_register, and the new LISTEN connection still hears work': async (w) => {
+  'T19a terminating only the LISTEN backend does not re-register the call connection, and the new LISTEN connection still hears work': async (w) => {
     const { client, names, events } = await openAgent(w, {});
     const c = await takeTicket(w, client);
-    const gen = client.gen;
     const [listenPid] = await backendPids(w, 'LISTEN%');
     await terminateBackend(w, listenPid);
     await untilEvent(events, 'listen-reconnected');
-    assert.equal(client.gen, gen + 1, 'a LISTEN-only reconnect bumps gen');
     const before = names().length;
     await client.heartbeat(c.id, c.epoch, c.token);
-    assert.deepEqual(names().slice(before), [...FIRST_CALLS, 'ld_heartbeat']);
+    assert.deepEqual(names().slice(before), ['ld_heartbeat']);
     assert.ok(!(await backendPids(w, 'LISTEN%')).includes(listenPid));
     await enqueue(await w.as(logins.s1), tid(2));
     for (let i = 0; i < 100 && !events.some((e) => e.reason === 'notify' && e.channel === 'ld_work'); i++) await sleep(25);
@@ -55,41 +53,22 @@ const SCENARIOS = {
     assert.deepEqual(heartbeats[0][1], heartbeats[1][1]);
   },
 
-  'T19c calls queued while the gate is closed keep their order behind register': async (w) => {
-    const { client, names, events } = await openAgent(w);
+  'T19c calls queued behind a dead call connection keep their order behind register': async (w) => {
+    const { client, names } = await openAgent(w);
     const c = await takeTicket(w, client);
-    const [listenPid] = await backendPids(w, 'LISTEN%');
-    await terminateBackend(w, listenPid);
-    await untilEvent(events, 'listen-reconnected');
-    const before = names().length;
-    await Promise.all([
-      client.heartbeat(c.id, c.epoch, c.token),
-      client.log(c.id, c.epoch, c.token, 0, Buffer.from('x')),
-      client.claim(randomUUID(), 8, 1e9),
-    ]);
-    assert.deepEqual(names().slice(before), [...FIRST_CALLS, 'ld_heartbeat', 'ld_log', 'ld_claim']);
-  },
-
-  'T19 persist is told when gen moved during the call, and not otherwise': async (w) => {
-    const { client, events } = await openAgent(w, {});
-    const c = await takeTicket(w, client);
-    const stale = [];
-    const persist = (_answer, info) => stale.push(info.stale);
-    await client.heartbeat(c.id, c.epoch, c.token, { persist });
     const [callPid] = await backendPids(w, 'SELECT lane_dispatch%');
-    const hold = await holdLock(w, `SELECT 1 FROM lane_dispatch.tickets WHERE id = '${c.id}' FOR UPDATE`);
-    const blocked = client.heartbeat(c.id, c.epoch, c.token, { persist });
-    await waitBlocked(w, callPid);
-    const [listenPid] = await backendPids(w, 'LISTEN%');
-    await terminateBackend(w, listenPid);
-    await untilEvent(events, 'listen-reconnected');
-    await hold.release();
-    await blocked;
-    assert.deepEqual(stale, [false, true]);
+    await terminateBackend(w, callPid);
+    const before = names().length;
+    await Promise.all([client.heartbeat(c.id, c.epoch, c.token), client.claim(randomUUID(), 8, 1e9)]);
+    const sent = names().slice(before);
+    const firstRegister = sent.indexOf('ld_register');
+    assert.ok(firstRegister >= 0, `no ld_register after the call backend died: ${sent}`);
+    assert.ok(sent.slice(0, firstRegister).every((n) => n === 'ld_heartbeat'), 'only the heartbeat that found the dead connection precedes register');
+    assert.deepEqual(sent.slice(firstRegister), [...FIRST_CALLS, 'ld_heartbeat', 'ld_claim']);
   },
 };
 
-describe('agent ld client gate and queue on a disposable Postgres', { skip: pgSkipOption, timeout: 300000 }, () => {
+describe('agent ld client reconnects and queue on a disposable Postgres', { skip: pgSkipOption, timeout: 300000 }, () => {
   let cluster;
   before(async () => { cluster = await startDispatchCluster(); });
   after(async () => { await cluster?.closeClients(); cluster?.stop(); });

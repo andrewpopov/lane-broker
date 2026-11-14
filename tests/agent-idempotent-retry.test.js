@@ -70,14 +70,6 @@ const LOST_RESPONSE = {
     assert.equal(callsTo(calls, 'ld_start').length, 2, 'sent twice');
     assert.equal((await w.ticket(c.id)).state, 'running');
   },
-  ld_log: async (w, client, calls) => {
-    const c = await takeTicket(w, client);
-    assert.equal(await client.log(c.id, c.epoch, c.token, 0, Buffer.from('hello')), 'ok');
-    assert.equal(callsTo(calls, 'ld_log').length, 2, 'sent twice');
-    const su = await w.su();
-    assert.equal((await su.query('SELECT count(*)::int AS n FROM lane_dispatch.log_chunks WHERE ticket = $1', [c.id])).rows[0].n, 1);
-    assert.equal(Number((await su.query('SELECT log_bytes FROM lane_dispatch.attempts WHERE ticket = $1', [c.id])).rows[0].log_bytes), 5, 'the bytes are counted once');
-  },
   ld_finish: async (w, client, calls) => {
     const c = await takeTicket(w, client);
     assert.deepEqual(await client.finish(c.id, c.epoch, c.token, { kind: 'ok', exitCode: 0 }), { fenced: false, state: 'finished' });

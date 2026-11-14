@@ -21,7 +21,18 @@ export class S3Error extends Error {
   }
 }
 
-/** Credentials from the env file named in config: `KEY=value` lines, 0600 and ours, both variables required. */
+/** `KEY=value` lines, both credential variables required. */
+export function parseS3Credentials(text, file) {
+  const vars = {};
+  for (const line of text.split('\n')) {
+    const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
+    if (match) vars[match[1]] = match[2].trim().replace(/^(['"])(.*)\1$/, '$2');
+  }
+  if (!vars[ACCESS_KEY_VAR] || !vars[SECRET_KEY_VAR]) throw new S3Error(`s3 credentials file ${file} must define ${ACCESS_KEY_VAR} and ${SECRET_KEY_VAR}`);
+  return { accessKeyId: vars[ACCESS_KEY_VAR], secretAccessKey: vars[SECRET_KEY_VAR] };
+}
+
+/** Credentials from the env file named in config: 0600 and ours. */
 export function loadS3Credentials(file) {
   let stat;
   let text;
@@ -34,13 +45,7 @@ export function loadS3Credentials(file) {
   if ((stat.mode & 0o077) !== 0 || (typeof process.getuid === 'function' && stat.uid !== process.getuid())) {
     throw new S3Error(`s3 credentials file ${file} must be mode 0600 and owned by the current user`);
   }
-  const vars = {};
-  for (const line of text.split('\n')) {
-    const match = /^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$/.exec(line);
-    if (match) vars[match[1]] = match[2].trim().replace(/^(['"])(.*)\1$/, '$2');
-  }
-  if (!vars[ACCESS_KEY_VAR] || !vars[SECRET_KEY_VAR]) throw new S3Error(`s3 credentials file ${file} must define ${ACCESS_KEY_VAR} and ${SECRET_KEY_VAR}`);
-  return { accessKeyId: vars[ACCESS_KEY_VAR], secretAccessKey: vars[SECRET_KEY_VAR] };
+  return parseS3Credentials(text, file);
 }
 
 const XML_ENTITIES = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'" };
@@ -85,7 +90,7 @@ async function spoolBody(body, file) {
 export function createS3Client({ endpoint, region, credentialsEnvFile, creds = loadS3Credentials(credentialsEnvFile), fetchImpl = globalThis.fetch, now = Date.now, deadlineMs = DEFAULT_S3_DEADLINE_MS }) {
   const base = new URL(endpoint);
 
-  async function send(op, { method, bucket, key, query = {}, payloadSha = EMPTY_SHA256, body, contentLength, deadline, toFile }) {
+  async function send(op, { method, bucket, key, query = {}, payloadSha = EMPTY_SHA256, body, contentLength, deadline, toFile, abort }) {
     const path = key === undefined ? `/${awsUriEncode(bucket)}` : objectPath(bucket, key);
     const queryString = canonicalQueryString(query);
     const stamp = amzTimestamp(now());
@@ -99,13 +104,15 @@ export function createS3Client({ endpoint, region, credentialsEnvFile, creds = l
       ...(contentLength === undefined ? {} : { 'content-length': String(contentLength) }),
     };
     const url = `${base.protocol}//${base.host}${path}${queryString ? `?${queryString}` : ''}`;
-    const signal = AbortSignal.timeout(deadline ?? deadlineMs);
+    const timeout = AbortSignal.timeout(deadline ?? deadlineMs);
+    const signal = abort ? AbortSignal.any([timeout, abort]) : timeout;
     try {
       const res = await fetchImpl(url, { method, headers, signal, ...(body === undefined ? {} : { body, duplex: 'half' }) });
       const streamed = toFile && res.status === 200 ? await spoolBody(res.body, toFile) : null;
       const text = method === 'HEAD' || streamed ? '' : await res.text();
       return { res, text, streamed };
     } catch (err) {
+      if (abort?.aborted) throw err;
       if (err?.name === 'TimeoutError' || err?.name === 'AbortError') throw new S3Error(`s3 ${op} timed out after ${deadline ?? deadlineMs}ms`, { code: 'Timeout' });
       throw new S3Error(`s3 ${op} failed: ${err?.cause?.code ?? err?.message}`, { code: 'Network', cause: err });
     }
@@ -122,16 +129,16 @@ export function createS3Client({ endpoint, region, credentialsEnvFile, creds = l
       return { exists: true, size: Number(reply.res.headers.get('content-length')), lastModified: Number.isNaN(modified) ? null : modified, etag: reply.res.headers.get('etag') };
     },
 
-    async putObjectFromFile(bucket, key, file, { deadlineMs: deadline = DEFAULT_S3_PUT_DEADLINE_MS } = {}) {
+    async putObjectFromFile(bucket, key, file, { deadlineMs: deadline = DEFAULT_S3_PUT_DEADLINE_MS, signal } = {}) {
       const { sha256, size } = await sha256AndSize(file);
-      const reply = await send(`PUT ${bucket}/${key}`, { method: 'PUT', bucket, key, payloadSha: sha256, body: Readable.toWeb(fs.createReadStream(file)), contentLength: size, deadline });
+      const reply = await send(`PUT ${bucket}/${key}`, { method: 'PUT', bucket, key, payloadSha: sha256, body: Readable.toWeb(fs.createReadStream(file)), contentLength: size, deadline, abort: signal });
       if (reply.res.status !== 200) throw fail(`PUT ${bucket}/${key}`, reply);
       return { sha256, size };
     },
 
     /** Streams the object to `file` (via `file.part`, renamed once whole) and reports the sha256 and size it saw; the caller compares them. */
-    async getObjectToFile(bucket, key, file, { deadlineMs: deadline } = {}) {
-      const reply = await send(`GET ${bucket}/${key}`, { method: 'GET', bucket, key, deadline, toFile: file });
+    async getObjectToFile(bucket, key, file, { deadlineMs: deadline, signal } = {}) {
+      const reply = await send(`GET ${bucket}/${key}`, { method: 'GET', bucket, key, deadline, toFile: file, abort: signal });
       if (reply.res.status === 404) return { exists: false };
       if (reply.res.status !== 200) throw fail(`GET ${bucket}/${key}`, reply);
       return { exists: true, ...reply.streamed };

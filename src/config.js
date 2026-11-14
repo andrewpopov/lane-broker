@@ -279,8 +279,10 @@ export const DEFAULT_REPO_CONFIG = {
   conflicts: [],
 };
 
+export const defaultBrokerHome = () => path.join(os.homedir(), '.config', 'lane-broker');
+
 export function brokerHome() {
-  return process.env.LANE_BROKER_HOME || path.join(os.homedir(), '.config', 'lane-broker');
+  return process.env.LANE_BROKER_HOME || defaultBrokerHome();
 }
 
 /** Sanitize a repo/lane identifier down to [A-Za-z0-9_.-]. */
@@ -1026,8 +1028,7 @@ export function resolvePriority({ cli, env, configTier, exclusive = false }) {
   return configTier ?? (exclusive ? 'high' : DEFAULT_PRIORITY);
 }
 
-export function loadGlobalConfig() {
-  const home = brokerHome();
+export function loadGlobalConfig({ home = brokerHome() } = {}) {
   const file = path.join(home, 'config.json');
   let text;
   try {

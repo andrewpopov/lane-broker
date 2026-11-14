@@ -8,7 +8,7 @@ import { isProcessAlive } from '../process-liveness.js';
 export class AgentStoreError extends Error {}
 export class AgentOwnedError extends Error {}
 
-export const SUBPHASES = ['AWAIT_URLS', 'FETCHING', 'VERIFIED', 'STARTING', 'SPAWNING', 'RUNNING', 'SETTLING', 'HOLD', 'OUTBOX', 'KILLING', 'DONE'];
+export const SUBPHASES = ['FETCHING', 'STARTING', 'SPAWNING', 'RUNNING', 'SETTLING', 'OUTBOX', 'KILLING', 'DONE'];
 const OUTBOX_KINDS = ['finish', 'release'];
 
 export function agentPaths(remoteRoot) {
@@ -53,6 +53,33 @@ export async function claimOwner(remoteRoot, { pid = process.pid } = {}) {
   });
 }
 
+export const spoolPath = (remoteRoot, execId) => path.join(agentPaths(remoteRoot).spool, `${execId}.gz`);
+export const logPath = (remoteRoot, execId) => path.join(agentPaths(remoteRoot).out, `${execId}.log`);
+export const artifactsSpoolPath = (remoteRoot, execId) => path.join(agentPaths(remoteRoot).out, `${execId}.artifacts`);
+
+/** Every file of one execution under the spool (stream, blob temp, a torn `.part`) or the out dir (log, artifacts spool). */
+export function clearExecutionFiles(remoteRoot, execId, dirs = ['spool', 'out']) {
+  const p = agentPaths(remoteRoot);
+  for (const dir of dirs.map((d) => p[d])) {
+    for (const name of fs.readdirSync(dir).filter((n) => n.startsWith(`${execId}.`))) fs.rmSync(path.join(dir, name), { force: true });
+  }
+}
+
+export function readPendingClaim(remoteRoot) {
+  const pending = readJsonSafe(agentPaths(remoteRoot).pendingClaim);
+  return isUuid(pending?.req) ? pending : null;
+}
+
+export function writePendingClaim(remoteRoot, req) {
+  atomicWriteJson(agentPaths(remoteRoot).pendingClaim, { req }, { fsync: true });
+}
+
+export function clearPendingClaim(remoteRoot) {
+  const p = agentPaths(remoteRoot);
+  fs.rmSync(p.pendingClaim, { force: true });
+  fsyncDirectory(p.root);
+}
+
 export function writeStatus(remoteRoot, status) {
   atomicWriteJson(agentPaths(remoteRoot).status, { pid: process.pid, at: Date.now(), ...status });
 }
@@ -66,7 +93,7 @@ export function newExecutionRecord(claim, { now = Date.now() } = {}) {
   const { id, epoch, token, repo_key: repoKey, lane, lane_key: laneKey, binding, header, snapshot } = claim;
   return {
     id, epoch, token, execId: executionIdOf(id, epoch), claim: { repoKey, lane, laneKey, binding, header, snapshot },
-    subphase: 'AWAIT_URLS', claimedAt: now, kernelBootId: null, logCursor: { seq: 0, offset: 0, len: 0 },
+    subphase: 'FETCHING', claimedAt: now, kernelBootId: null,
   };
 }
 

@@ -89,7 +89,7 @@ export async function startS3Stub({ creds = STUB_CREDS, region = STUB_REGION, no
       stub.objects.delete(name);
       return reply(204);
     }
-    if (!object) return error(404, 'NoSuchKey');
+    if (!object) return stub.missingAs403 ? error(403, 'AccessDenied') : error(404, 'NoSuchKey');
     const headers = { 'content-length': String(object.body.length), etag: `"${sha256Hex(object.body).slice(0, 32)}"`, ...(stub.emitLastModified ? { 'last-modified': new Date(object.lastModified).toUTCString() } : {}) };
     if (req.method === 'HEAD') return reply(200, '', headers);
     res.writeHead(200, headers);

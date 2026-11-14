@@ -1,19 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { makeTmpDir } from './helpers/tmp.js';
 import { AgentConfigError, loadAgentConfig } from '../src/agent/config.js';
 
 const URL_OK = 'postgres://lane_agent_wintop@pitelite:5432/lane_queue';
+const RUSTFS = { endpoint: 'https://pitelite:9000' };
 
 function setup(overrides = {}, { mode = 0o600 } = {}) {
   const dir = makeTmpDir('agent-config-');
   fs.writeFileSync(path.join(dir, 'password'), 'hunter2\n', { mode: 0o600 });
   fs.writeFileSync(path.join(dir, 'ca.pem'), 'CA PEM\n', { mode: 0o600 });
+  fs.writeFileSync(path.join(dir, 'rustfs.env'), 'AWS_ACCESS_KEY_ID=AKIAX\nAWS_SECRET_ACCESS_KEY=s3cret\n', { mode: 0o600 });
   const file = path.join(dir, 'config.json');
-  fs.writeFileSync(file, JSON.stringify({ laneQueueUrl: URL_OK, ...overrides }), { mode });
-  for (const name of ['password', 'ca.pem']) fs.chmodSync(path.join(dir, name), 0o600);
+  fs.writeFileSync(file, JSON.stringify({ laneQueueUrl: URL_OK, runnerName: 'wintop', rustfs: RUSTFS, ...overrides }), { mode });
+  for (const name of ['password', 'ca.pem', 'rustfs.env']) fs.chmodSync(path.join(dir, name), 0o600);
   fs.chmodSync(file, mode);
   return { dir, file };
 }
@@ -26,9 +29,10 @@ test('T5 a valid config builds a verify-full pg config with the password from it
   const config = load(file);
   assert.deepEqual(config.pg, {
     host: 'pitelite', port: 5432, database: 'lane_queue', user: 'lane_agent_wintop', password: 'hunter2',
+    keepAlive: true, connectionTimeoutMillis: 10_000, query_timeout: 20_000,
     ssl: { ca: 'CA PEM\n', rejectUnauthorized: true, servername: 'pitelite' },
   });
-  assert.deepEqual([config.speedFactor, config.pollMs, config.urlWaitMs, config.requireAcPower, config.schedule], [1, 15_000, 60_000, false, null]);
+  assert.deepEqual([config.speedFactor, config.pollMs, config.requireAcPower, config.schedule, config.fetchBudgetMs, config.runnerName], [1, 15_000, false, null, 600_000, 'wintop']);
 });
 
 test('T5 a relative passwordFile and caFile resolve against the config directory, not the cwd', () => {
@@ -88,4 +92,49 @@ test('T5 speedFactor must satisfy 0 < x <= 4', () => {
 test('T5 unknown fields and a bad schedule are refused', () => {
   refused(setup({ speedfactor: 2 }).file, /unknown field\(s\) speedfactor/);
   refused(setup({ schedule: { timezone: 'Nowhere/Land', available: [] } }).file, /timezone/);
+});
+
+test('the RustFS key is read from rustfs.env under the private-file rule, with the broker defaults for region and buckets', () => {
+  const { rustfs } = load(setup().file);
+  assert.deepEqual(rustfs, { endpoint: 'https://pitelite:9000', region: 'us-east-1', snapBucket: 'lane-snap', outBucket: 'lane-out', creds: { accessKeyId: 'AKIAX', secretAccessKey: 's3cret' } });
+  const { dir, file } = setup();
+  fs.chmodSync(path.join(dir, 'rustfs.env'), 0o644);
+  refused(file, /rustfs\.env: mode must be 0600, is 0644/);
+  refused(setup().file, /must be owned by uid \d+, is owned by/, { uid: process.getuid() + 1 });
+  const missing = setup();
+  fs.rmSync(path.join(missing.dir, 'rustfs.env'));
+  refused(missing.file, /rustfs\.env: unreadable \(ENOENT\)/);
+  const partial = setup();
+  fs.writeFileSync(path.join(partial.dir, 'rustfs.env'), 'AWS_ACCESS_KEY_ID=AKIAX\n', { mode: 0o600 });
+  refused(partial.file, /must define AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY/);
+});
+
+test('rustfs needs an http(s) origin, runnerName a plain host name, and pollMs may not exceed the 15 s liveness bound', () => {
+  refused(setup({ rustfs: {} }).file, /"rustfs\.endpoint"/);
+  refused(setup({ rustfs: { endpoint: 'pitelite:9000' } }).file, /"rustfs\.endpoint"/);
+  refused(setup({ rustfs: { endpoint: 'https://p:9000', bucket: 'x' } }).file, /unknown field\(s\) bucket/);
+  for (const bad of [undefined, '', 'a/b', '../x']) refused(setup({ runnerName: bad }).file, /"runnerName"/);
+  refused(setup({ pollMs: 15_001 }).file, /"pollMs" must be a number in \(0, 15000\]/);
+  assert.equal(load(setup({ pollMs: 5000, fetchBudgetMs: 1000 }).file).fetchBudgetMs, 1000);
+});
+
+test('brokerHome and stateDir are absolute, default to the broker defaults, and the global config is read from brokerHome whatever LANE_BROKER_HOME says', () => {
+  const config = load(setup().file);
+  assert.deepEqual([config.brokerHome, config.stateDir], [path.join(os.homedir(), '.config', 'lane-broker'), path.join(os.homedir(), '.cache', 'lane-broker')]);
+  refused(setup({ brokerHome: 'relative/dir' }).file, /"brokerHome" must be an absolute path/);
+  refused(setup({ stateDir: '' }).file, /"stateDir" must be an absolute path/);
+  const mine = makeTmpDir('broker-home-');
+  const hostile = makeTmpDir('broker-hostile-');
+  fs.writeFileSync(path.join(mine, 'config.json'), JSON.stringify({ remoteBlobCache: true }));
+  fs.writeFileSync(path.join(hostile, 'config.json'), JSON.stringify({ remoteBlobCache: false }));
+  const saved = process.env.LANE_BROKER_HOME;
+  process.env.LANE_BROKER_HOME = hostile;
+  try {
+    const { file } = setup({ brokerHome: mine, stateDir: '/var/tmp/agent-state' });
+    const loaded = loadAgentConfig({ file });
+    assert.deepEqual([loaded.brokerHome, loaded.stateDir], [mine, '/var/tmp/agent-state']);
+  } finally {
+    if (saved === undefined) delete process.env.LANE_BROKER_HOME;
+    else process.env.LANE_BROKER_HOME = saved;
+  }
 });

@@ -8,8 +8,10 @@ import { isPidAlive, processStartTime, isProcessAlive } from './process-liveness
 
 export { isPidAlive, processStartTime };
 
+export const defaultStateHome = () => path.join(os.homedir(), '.cache', 'lane-broker');
+
 export function stateHome() {
-  return process.env.LANE_BROKER_STATE || path.join(os.homedir(), '.cache', 'lane-broker');
+  return process.env.LANE_BROKER_STATE || defaultStateHome();
 }
 
 /** What the migration leaves where old code expects the queue DIRECTORY, so old code fails on its own: `mkdir` and every
