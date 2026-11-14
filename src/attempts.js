@@ -17,6 +17,8 @@ export const remoteCancelExitDeadlineMs = () => remoteCancelDeadlineMs() + POST_
 export const cancelWaitMs = () => remoteCancelExitDeadlineMs() + 2 * CANCEL_MARGIN_MS;
 /** Exit code of a supervisor that gave up on a cancel it could not finish: the attempt, binding and cancel marker stay for the orphaned-remote path. */
 export const REMOTE_CANCEL_ABANDONED_EXIT = 74;
+/** A retried `--id` submission whose first supervisor owns the ticket: not 0, so no foreground caller can ever read it as a clean cancel. */
+export const DUPLICATE_SUBMISSION_EXIT = 78;
 
 /**
  * BRAIN-319 (.review-plan.md v3 C3/C4/C5): one durable ATTEMPT record per

@@ -18,9 +18,9 @@ export function secretFiles(t, password = 'queue-pass\n') {
 }
 
 /** A queue client whose connections reach the harness database as `login`; `onConnect(client, n)` may break the connection it just opened. */
-export function harnessClient(t, world, { login = logins.s1, onConnect, sleep = async () => {}, random = () => 0.5 } = {}) {
+export function harnessClient(t, world, { login = logins.s1, onConnect, sleep = async () => {}, random = () => 0.5, createClient = createQueueClient } = {}) {
   const seen = { configs: [], sleeps: [] };
-  const queue = createQueueClient({
+  const queue = createClient({
     url: QUEUE_URL,
     ...secretFiles(t),
     connectClient: async (config) => {

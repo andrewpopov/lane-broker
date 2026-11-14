@@ -7,7 +7,7 @@ import { suggestCommand } from '../src/suggest.js';
 import { estimatesCommand } from '../src/estimates-history.js';
 import { cancelCommand } from '../src/cancel.js';
 import { priorityCommand } from '../src/retier.js';
-import { waitCommand } from '../src/wait.js';
+import { waitAndExit } from '../src/wait.js';
 import { pauseCommand, resumeCommand, drainCommand, drainShutdownCommand, undrainCommand } from '../src/pause.js';
 import { migrateSchedulerCommand } from '../src/migrate.js';
 import { parseByteSize } from '../src/resources.js';
@@ -41,6 +41,7 @@ import { phasesReportCommand } from '../src/phases-report.js';
 import { lossesReportCommand } from '../src/losses-report.js';
 import { placementReportCommand } from '../src/placement-report.js';
 import { pullCheckCommand } from '../src/pull-check.js';
+import { pullGcCommand } from '../src/pull-gc.js';
 
 function usage() {
   return `Usage:
@@ -64,6 +65,7 @@ function usage() {
   lane reconcile [--now] [--json]
   lane pull check [--json]
   lane agent [--check] [--root <remoteRoot>] [--config <dir>]
+  lane pull gc --queue-url <admin url> --password-file <file> [--rows-after <dur>] [--budget <dur>]
   lane runner [status] [--json]
   lane runner watch
   lane runner prewarm [--lane <name>] [--runner <name>] [--dry-run]
@@ -308,8 +310,7 @@ async function main() {
       }
       const timeoutFlagIdx = rest.indexOf('--timeout');
       const timeoutMs = timeoutFlagIdx !== -1 ? parseDurationMs(rest[timeoutFlagIdx + 1]) : undefined;
-      const result = await waitCommand(id, { timeoutMs });
-      return result.exitCode;
+      return waitAndExit(id, { timeoutMs });
     }
     case 'pause': {
       const reason = rest.join(' ');
@@ -422,7 +423,8 @@ async function main() {
     }
     case 'pull': {
       if (rest[0] === 'check') return (await pullCheckCommand(rest.slice(1))).exitCode;
-      process.stderr.write(`lane pull: ${rest[0] === undefined ? 'missing subcommand' : `unknown subcommand "${rest[0]}"`} (only \`check\`)\n`);
+      if (rest[0] === 'gc') return (await pullGcCommand(rest.slice(1))).exitCode;
+      process.stderr.write(`lane pull: ${rest[0] === undefined ? 'missing subcommand' : `unknown subcommand "${rest[0]}"`} (\`check\`, \`gc\`)\n`);
       return 2;
     }
     case 'agent': {

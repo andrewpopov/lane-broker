@@ -2,54 +2,29 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { canonicalQueryString, presignRequest, presignUrl } from '../src/s3-presign.js';
+import { canonicalQueryString, credentialScope, signatureFor, UNSIGNED_PAYLOAD } from '../src/s3-presign.js';
 import { createS3Client, loadS3Credentials, S3Error } from '../src/s3-client.js';
 import { startS3Stub, STUB_CREDS, STUB_REGION } from './helpers/s3-stub.js';
+import { assertCanaryFails } from './helpers/mutant-module.js';
 import { makeTmpDir } from './helpers/tmp.js';
 
-/** BRAIN-1036 R2 (T17): hand-rolled SigV4, checked against AWS's published vector and against a stub that verifies signatures. */
+/** BRAIN-1036 R2 (T17): hand-rolled SigV4, checked against AWS's published vector and against a stub that verifies signatures. Runners sign their own requests, so nothing here presigns. */
 
-// AWS "Authenticating Requests: Using Query Parameters" GET example (virtual-hosted style, so presignRequest, not presignUrl)
-const AWS_EXAMPLE_CREDS = { accessKeyId: 'AKIAIOSFODNN7EXAMPLE', secretAccessKey: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY' };
+// AWS "Authenticating Requests: Using Query Parameters" GET example: the published anchor for the one signer every request here goes through
+const AWS_EXAMPLE_SECRET = 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY';
 const AWS_EXAMPLE_SIGNATURE = 'aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404';
 
-test('T17 presign reproduces the AWS documented GET example signature', () => {
-  const signed = presignRequest({ method: 'GET', host: 'examplebucket.s3.amazonaws.com', path: '/test.txt', expiresSec: 86400, creds: AWS_EXAMPLE_CREDS, region: 'us-east-1', now: Date.UTC(2013, 4, 24) });
-  assert.equal(
-    signed.query,
-    `X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=${AWS_EXAMPLE_SIGNATURE}`,
-  );
-});
-
-test('T17 a path-style presigned URL is accepted by the verifying stub, and only for its own method, key and lifetime', async (t) => {
-  let clock = Date.parse('2026-11-12T00:00:00Z');
-  const stub = await startS3Stub({ now: () => clock });
-  t.after(() => stub.close());
-  const s3 = createS3Client({ endpoint: stub.endpoint, region: STUB_REGION, creds: STUB_CREDS, now: () => clock });
-  const dir = makeTmpDir('presign-', t);
-  fs.writeFileSync(path.join(dir, 'obj'), 'payload bytes');
-  await s3.putObjectFromFile('lane-out', 'lane-out/t 1/log', path.join(dir, 'obj'));
-
-  const sign = (over = {}) => presignUrl({ method: 'GET', bucket: 'lane-out', key: 'lane-out/t 1/log', expiresSec: 900, creds: STUB_CREDS, endpoint: stub.endpoint, region: STUB_REGION, now: clock, ...over });
-  const ok = await fetch(sign());
-  assert.equal(ok.status, 200);
-  assert.equal(await ok.text(), 'payload bytes');
-  assert.equal((await fetch(`${sign()}0`)).status, 403, 'a tampered signature is refused');
-  assert.equal((await fetch(sign({ method: 'PUT' }))).status, 403, 'a URL signed for PUT does not serve a GET');
-  assert.equal((await fetch(sign().replace('log', 'lag'))).status, 403, 'a URL does not serve another key');
-  const stale = sign();
-  clock += 901_000;
-  assert.equal((await fetch(stale)).status, 403, 'an expired URL is refused');
-});
-
-test('presign encodes keys per RFC 3986 and keeps slashes', () => {
-  const url = presignUrl({ method: 'PUT', bucket: 'b', key: "a b/c+d'(e)*", expiresSec: 60, creds: STUB_CREDS, endpoint: 'http://h:9000', region: STUB_REGION, now: 0 });
-  assert.match(url, /^http:\/\/h:9000\/b\/a%20b\/c%2Bd%27%28e%29%2A\?/);
-});
-
-test('presign includes the session token as a signed query parameter when given', () => {
-  const url = presignUrl({ method: 'GET', bucket: 'b', key: 'k', expiresSec: 60, creds: { ...STUB_CREDS, sessionToken: 'tok/en' }, endpoint: 'http://h:9000', region: STUB_REGION, now: 0 });
-  assert.match(url, /X-Amz-Security-Token=tok%2Fen/);
+test('T17 signatureFor reproduces the AWS documented GET example signature', () => {
+  const stamp = '20130524T000000Z';
+  const query = canonicalQueryString({
+    'X-Amz-Algorithm': 'AWS4-HMAC-SHA256',
+    'X-Amz-Credential': `AKIAIOSFODNN7EXAMPLE/${credentialScope(stamp, 'us-east-1')}`,
+    'X-Amz-Date': stamp,
+    'X-Amz-Expires': 86400,
+    'X-Amz-SignedHeaders': 'host',
+  });
+  const canonicalRequest = ['GET', '/test.txt', query, 'host:examplebucket.s3.amazonaws.com\n', 'host', UNSIGNED_PAYLOAD].join('\n');
+  assert.equal(signatureFor({ secretAccessKey: AWS_EXAMPLE_SECRET, stamp, region: 'us-east-1', canonicalRequest }), AWS_EXAMPLE_SIGNATURE);
 });
 
 async function clientFor(t, options = {}) {
@@ -133,9 +108,21 @@ test('canonicalQueryString sorts by encoded name and encodes values, whatever or
   assert.equal(canonicalQueryString({ b: 1, a: 'z y', 'X-Amz-Date': 'd', Zed: 1 }), 'X-Amz-Date=d&Zed=1&a=z%20y&b=1');
 });
 
-test('presign expiry is an integer in 1..604800 seconds', () => {
-  const sign = (expiresSec) => presignUrl({ method: 'GET', bucket: 'b', key: 'k', expiresSec, creds: STUB_CREDS, endpoint: 'http://h:9000', region: STUB_REGION, now: 0 });
-  assert.match(sign(1), /X-Amz-Expires=1&/);
-  assert.match(sign(604_800), /X-Amz-Expires=604800&/);
-  for (const bad of [0, -1, 604_801, 1.5, '900', NaN, undefined]) assert.throws(() => sign(bad), RangeError, String(bad));
+async function maxBytesScenario(load, t) {
+  const stub = await startS3Stub();
+  t.after(() => stub.close());
+  const { createS3Client: create } = await load('s3-client.js');
+  const s3 = create({ endpoint: stub.endpoint, region: STUB_REGION, creds: STUB_CREDS });
+  const dir = makeTmpDir('s3-max-', t);
+  stub.objects.set('lane-out/big', { body: Buffer.alloc(100_000, 1), lastModified: Date.now() });
+  const refused = await s3.getObjectToFile('lane-out', 'big', path.join(dir, 'big'), { maxBytes: 99_999 });
+  assert.deepEqual(refused, { exists: true, tooLarge: true }, 'an object one byte past the bound is abandoned');
+  assert.deepEqual(fs.readdirSync(dir), [], 'nothing of it is kept, not even a partial file');
+  const whole = await s3.getObjectToFile('lane-out', 'big', path.join(dir, 'big'), { maxBytes: 100_000 });
+  assert.equal(whole.size, 100_000, 'an object exactly at the bound is read whole');
+}
+
+test('getObjectToFile stops reading an object past maxBytes and keeps nothing; the bound itself is allowed', async (t) => {
+  await maxBytesScenario((file) => import(`../src/${file}`), t);
+  await assertCanaryFails('s3-client.js', ['done(size > maxBytes ? new OverSize() : null, chunk);', 'done(null, chunk);'], (load) => maxBytesScenario(load, t));
 });

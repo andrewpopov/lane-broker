@@ -3,7 +3,8 @@ import path from 'node:path';
 import { paths, atomicWriteFile, ensureStateDirs, withLock } from './state.js';
 import { loadGlobalConfigOrError } from './config.js';
 import { listAttempts, supervisorAlive, isStrandedWithdrawingMove } from './attempts.js';
-import { reconcileRemoteAttempt } from './remote-reconcile.js';
+import { loadPullRecovery, reconcileRemoteAttempt } from './remote-reconcile.js';
+import { owedCancelIds } from './pull-envelope.js';
 import { heartbeatUpRunners } from './runner-unreachable.js';
 import { settleAbandonedLocalAttempts } from './local-reconcile.js';
 
@@ -50,8 +51,20 @@ async function claimSweep(root, now, force) {
   );
 }
 
+// a pull marker that cannot be delivered (config gone, a refused login) is recorded and left for the operator: it never costs the push recovery below its turn
+async function sendOwedPullCancels(root, globalCfg, pullContext) {
+  if (owedCancelIds(root).length === 0) return [];
+  try {
+    const recovery = await loadPullRecovery();
+    const owed = await recovery.sendOwedCancels(root, pullContext ?? recovery.pullContextFactory(root, globalCfg));
+    return owed.map((r) => ({ id: r.id, runner: null, state: r.state, ...(r.reason === undefined ? {} : { reason: r.reason }) }));
+  } catch (err) {
+    return [{ id: null, runner: null, state: 'failed', reason: `owed pull cancels: ${err.message}` }];
+  }
+}
+
 /** Returns `{ ran: false, reason }` or `{ ran: true, results: [{ id, runner, state, exit?, reason? }] }`; never throws. */
-export async function sweepOrphans(root, { globalCfg, force = false, now = Date.now(), sshBin, env, deadlineMs = 15_000 } = {}) {
+export async function sweepOrphans(root, { globalCfg, force = false, now = Date.now(), sshBin, env, deadlineMs = 15_000, pullContext } = {}) {
   try {
     if (!globalCfg) return { ran: false, reason: 'config unreadable' };
     if (!(await claimSweep(root, now, force))) return { ran: false, reason: 'recently swept' };
@@ -66,7 +79,8 @@ export async function sweepOrphans(root, { globalCfg, force = false, now = Date.
       const entry = { id: attempt.id, runner: attempt.runner };
       // a runner already found down this sweep is not asked again, but the operator flag and the unreachable bound still settle (BRAIN-594)
       const assumeDown = downRunners.has(attempt.runner);
-      const outcome = await reconcileRemoteAttempt(root, attempt.id, { globalCfg, sshBin, env, deadlineMs, now, assumeDown });
+      // a pull step has no ssh deadline of its own, so the sweep's budget bounds it
+      const outcome = await reconcileRemoteAttempt(root, attempt.id, { globalCfg, sshBin, env, deadlineMs, now, assumeDown, pullContext, ...(attempt.transport === 'pull' ? { deadlineAt: Date.now() + deadlineMs } : {}) });
       if (assumeDown && !outcome.settled) {
         results.push({ ...entry, state: 'skipped-runner-down' });
         continue;
@@ -79,6 +93,7 @@ export async function sweepOrphans(root, { globalCfg, force = false, now = Date.
         ...(outcome.reason === undefined ? {} : { reason: outcome.reason }),
       });
     }
+    results.push(...(await sendOwedPullCancels(root, globalCfg, pullContext)));
     results.push(...(await settleAbandonedLocalAttempts(root)));
     return { ran: true, results };
   } catch (err) {

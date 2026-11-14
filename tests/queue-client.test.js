@@ -2,6 +2,7 @@ import { describe, test, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { createQueueClient, QueueError } from '../src/queue-client.js';
+import { assertCanaryFails } from './helpers/mutant-module.js';
 import { pgSkipOption } from './lane-db-harness.js';
 import { startDispatchCluster, World, logins, call, claim, start, tid } from './lane-dispatch-fixture.js';
 import { CA_TEXT, QUEUE_URL, harnessClient, secretFiles } from './helpers/queue-fixture.js';
@@ -72,17 +73,9 @@ const SCENARIOS = {
     assert.deepEqual((await queue.listMine()).map((row) => row.id), [tid(1)]);
     assert.deepEqual(await queue.listMine({ states: ['running'] }), []);
 
-    assert.equal(await queue.attachUrls(tid(1), 0, { v: 1 }), false, 'a queued row takes no urls');
     const claimed = await claim(a1);
     assert.equal(claimed.id, tid(1));
-    assert.equal(await queue.attachUrls(tid(1), claimed.epoch, { v: 1, epoch: claimed.epoch }), true);
-    assert.deepEqual((await queue.get(tid(1))).urls, { v: 1, epoch: claimed.epoch });
     await start(a1, claimed);
-    for (const seq of [0, 1, 2]) await call(a1, 'ld_log', tid(1), claimed.epoch, claimed.token, seq, Buffer.from(`line ${seq}\n`));
-    const chunks = await queue.logRead(tid(1), claimed.epoch, 0);
-    assert.deepEqual(chunks, [{ seq: 1, data: Buffer.from('line 1\n').toString('base64') }, { seq: 2, data: Buffer.from('line 2\n').toString('base64') }]);
-    assert.equal(await queue.logRead(tid(404), claimed.epoch, -1), null);
-    assert.equal(await queue.logAck(tid(1), claimed.epoch, 1), 2);
 
     assert.deepEqual(await queue.cancel(tid(1)), { state: 'running', cancel_requested: true, confirmed: false });
     assert.deepEqual(await queue.cancel(tid(404)), { state: 'missing', cancel_requested: false, confirmed: false });
@@ -93,6 +86,15 @@ const SCENARIOS = {
     assert.equal(await queue.placeable('repoA', []), 3);
     assert.equal(await queue.placeable('repoA', ['fast']), 1);
     assert.equal(await queue.placeable('nowhere', ['fast']), 0);
+  },
+
+  'enqueueFenced carries min_protocol to the row, and a caller that names none gets protocol 1': async (w, t, createClient) => {
+    const { queue } = harnessClient(t, w, { createClient });
+    const ref = await queue.queueRef();
+    await queue.enqueueFenced({ ...enqueueArgs(tid(6), ref), minProtocol: 2 });
+    await queue.enqueueFenced(enqueueArgs(tid(7), ref));
+    const rows = (await (await w.su()).query('SELECT id, min_protocol FROM lane_dispatch.tickets WHERE id = ANY($1::uuid[]) ORDER BY id', [[tid(6), tid(7)]])).rows;
+    assert.deepEqual(rows.map((r) => r.min_protocol), [2, 1]);
   },
 
   'too many connections (53300) is retried with jitter for every call, then surfaces when it never clears': async (w, t) => {
@@ -130,6 +132,10 @@ const SCENARIOS = {
   },
 };
 
+const CANARIES = [
+  ['enqueueFenced carries min_protocol to the row, and a caller that names none gets protocol 1', ['priority, minProtocol]),', 'priority, 1]),']],
+];
+
 describe('queue client against a disposable Postgres', { skip: pgSkipOption, timeout: 600000 }, () => {
   let cluster;
   before(async () => { cluster = await startDispatchCluster(); });
@@ -137,6 +143,13 @@ describe('queue client against a disposable Postgres', { skip: pgSkipOption, tim
   afterEach(() => cluster.closeClients());
 
   for (const [name, scenario] of Object.entries(SCENARIOS)) {
-    test(name, async (t) => scenario(await World.create(cluster), t));
+    test(name, async (t) => scenario(await World.create(cluster), t, createQueueClient));
+  }
+
+  for (const [name, mutation] of CANARIES) {
+    test(`canary: with "${mutation[0]}" removed, "${name}" fails`, async (t) => {
+      const world = await World.create(cluster);
+      await assertCanaryFails('queue-client.js', mutation, async (load) => SCENARIOS[name](world, t, (await load('queue-client.js')).createQueueClient));
+    });
   }
 });

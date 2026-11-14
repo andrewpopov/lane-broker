@@ -209,7 +209,7 @@ test('the enqueue arguments carry the stamped header the stream was built with, 
   ensureStateDirs(state);
   const attempt = await createAttempt(state, args.ticketId);
   await createEnvelope(state, {
-    logicalId: args.ticketId, binding: { protocol: header.protocol, ticketId: args.ticketId, generation: args.generation, manifestHash: 'mh' }, nonce: 'n', header,
+    logicalId: args.ticketId, binding: { protocol: header.protocol, ticketId: args.ticketId, generation: args.generation, manifestHash: 'mh' }, header,
     repoKey: args.repoKey, lane: args.lane, laneKey: 'k', cpuCores: 1, memoryBytes: 1, requiresTags: [], priority: 0,
   });
   const { snapshot } = await upload({ header: readEnvelope(state, args.ticketId).header });

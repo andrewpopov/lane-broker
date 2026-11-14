@@ -1,0 +1,11 @@
+# TEMPLATE, not installed.
+[Unit]
+Description=lane pull gc: hourly retention
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=120
+Persistent=true
+
+[Install]
+WantedBy=timers.target

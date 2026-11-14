@@ -2,7 +2,7 @@ import { describe, test, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { pgSkipOption } from './lane-db-harness.js';
-import { startDispatchCluster, World, logins, call, enqueue, claim, finish, release, liftBackoff, tid, simulateRestore } from './lane-dispatch-fixture.js';
+import { startDispatchCluster, World, logins, call, enqueue, claim, finish, release, liftBackoff, tid, simulateRestore, waitBlocked, holdLock } from './lane-dispatch-fixture.js';
 
 const DAY = 86400;
 const fenced = (client, ref, id) =>
@@ -147,6 +147,18 @@ const GUARDS = {
     await assert.rejects(call(admin, 'ld_prune', sample(501).map((_, i) => tid(i + 1)), '7 days'), (err) => err.code === '22023');
   },
 
+  'ld_prune takes the cluster row lock before it touches a row, as ld_reap does, so the two queue instead of deadlocking on claim_requests': async (w) => {
+    const { admin, ids } = await pruneSetup(w);
+    await wasFinishedAgo(w, ids[0], 'finished', 10 * DAY);
+    const lock = await holdLock(w, 'SELECT 1 FROM lane_dispatch.cluster WHERE id = 1 FOR UPDATE');
+    const pruning = call(admin, 'ld_prune', [ids[0]], '7 days');
+    await waitBlocked(w, admin.processID);
+    assert.equal(await rowCount(w, ids[0]), 1, 'nothing was deleted while the cluster lock was held elsewhere');
+    await lock.release();
+    assert.equal(await pruning, 1);
+    assert.equal(await rowCount(w, ids[0]), 0);
+  },
+
   'ld_prune_chunks removes orphans and long-terminal chunks only, at most limit per call': async (w) => {
     const { admin, ids } = await pruneSetup(w);
     const [oldTerminal, freshTerminal, live] = ids;
@@ -276,6 +288,8 @@ const CANARIES = [
     "t.id = ANY (p_ids) AND t.state IN ('finished','cancelled','withdrawn','lost') AND", 't.id = ANY (p_ids) AND'],
   ['ld_prune deletes only terminal rows past the row age, with their chunks and attempts', 'AND t.finished_at < lane_dispatch.now() - p_rows_after', ''],
   ['ld_prune deletes only terminal rows past the row age, with their chunks and attempts', 'DELETE FROM lane_dispatch.log_chunks WHERE ticket = ANY (v_due);', ''],
+  ['ld_prune takes the cluster row lock before it touches a row, as ld_reap does, so the two queue instead of deadlocking on claim_requests',
+    "  PERFORM 1 FROM lane_dispatch.cluster WHERE id = 1 FOR UPDATE;\n  SELECT coalesce(array_agg(t.id), '{}') INTO v_due FROM (", "  SELECT coalesce(array_agg(t.id), '{}') INTO v_due FROM ("],
   ['ld_prune_chunks removes orphans and long-terminal chunks only, at most limit per call', 'LIMIT least(greatest(coalesce(p_limit, 10000), 1), 100000)', ''],
   ['ld_prune_chunks removes orphans and long-terminal chunks only, at most limit per call',
     "WHERE t.id IS NULL OR (t.state IN ('finished','cancelled','withdrawn','lost') AND t.finished_at < lane_dispatch.now() - p_terminal_after)", 'WHERE true'],

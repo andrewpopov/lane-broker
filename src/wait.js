@@ -5,7 +5,8 @@ import { listQueue } from './scheduler.js';
 import { readAttempt, supervisorAlive, moveInterruptedLabel, isStrandedWithdrawingMove } from './attempts.js';
 import { cancelCommand } from './cancel.js';
 import { loadGlobalConfigOrError } from './config.js';
-import { reconcileRemoteAttempt } from './remote-reconcile.js';
+import { loadPullRecovery, reconcileRemoteAttempt } from './remote-reconcile.js';
+import { readLedger } from './pull-ledger.js';
 import { settleAbandonedLocalAttempt } from './local-reconcile.js';
 import { isSuperseded } from './push-gate.js';
 import { readPending, settleDeadPending } from './pending.js';
@@ -17,10 +18,10 @@ const RECONCILE_MIN_REMAINING_MS = 1_000;
 const reconcileIntervalMs = () => Number(process.env.LANE_BROKER_TEST_RECONCILE_INTERVAL_MS) || 30_000;
 
 /** BRAIN-515: ask the runner about an ORPHANED-REMOTE attempt, never past `deadline` (ms epoch, or null). An unreadable global config means the runner cannot be reached. */
-async function reconcileOrphan(root, id, deadline) {
+async function reconcileOrphan(root, id, deadline, pullContext) {
   const { config, error } = loadGlobalConfigOrError();
   if (error) return { settled: false, state: 'unreachable', reason: `global config unreadable (${error})` };
-  return reconcileRemoteAttempt(root, id, { globalCfg: config, deadlineMs: RECONCILE_SSH_DEADLINE_MS, deadlineAt: deadline ?? undefined });
+  return reconcileRemoteAttempt(root, id, { globalCfg: config, deadlineMs: RECONCILE_SSH_DEADLINE_MS, deadlineAt: deadline ?? undefined, pullContext });
 }
 
 /** The exit `lane wait` reports for a published result. A reconciled-as-lost result (exit 75) says why on stderr (BRAIN-594). */
@@ -44,7 +45,7 @@ function sleep(ms) {
 }
 
 /** `lane wait <id>`: reattach to a running/queued lease and block until its result exists. */
-export async function waitCommand(id, { timeoutMs } = {}) {
+export async function waitCommand(id, { timeoutMs, pullContext } = {}) {
   const root = ensureStateDirs().root;
   const resultPath = `${paths(root).results}/${id}.json`;
 
@@ -149,7 +150,7 @@ export async function waitCommand(id, { timeoutMs } = {}) {
           // BRAIN-605: a post-fallback attempt that never reached admission is settled (exit 75) rather than reported forever
           if (!moveLabel && settledAttempt.executor === 'local' && (await settleAbandonedLocalAttempt(root, id)).settled) continue;
           if (reconcilableMove) {
-            const outcome = await reconcileOrphan(root, id, deadline);
+            const outcome = await reconcileOrphan(root, id, deadline, pullContext);
             if (outcome.settled) continue;
             if (outcome.timedOut || (deadline && Date.now() > deadline)) return timedOutResult();
           }
@@ -165,13 +166,13 @@ export async function waitCommand(id, { timeoutMs } = {}) {
           // outcome is read back by the top of the loop; a job the runner still has keeps polling like any in-flight
           // ticket, asking again at most every reconcileIntervalMs().
           if ((lastReconcileAt === null || Date.now() - lastReconcileAt >= reconcileIntervalMs()) && !(deadline && deadline - Date.now() < RECONCILE_MIN_REMAINING_MS)) {
-            const outcome = await reconcileOrphan(root, id, deadline);
+            const outcome = await reconcileOrphan(root, id, deadline, pullContext);
             if (outcome.settled) continue;
             // out of time is not an orphan verdict: the ordinary timeout answer (75) applies
             if (outcome.timedOut || (deadline && Date.now() > deadline)) return timedOutResult();
             if (outcome.state === 'running') lastReconcileAt = Date.now();
             else if (outcome.state !== 'skipped') {
-              const runnerName = settledAttempt.runner ?? 'unknown';
+              const runnerName = settledAttempt.transport === 'pull' ? 'the pull queue' : settledAttempt.runner ?? 'unknown';
               process.stderr.write(
                 `lane wait: ${id} is ORPHANED-REMOTE (runner ${runnerName}) -- its supervisor is gone and the runner could not settle it ` +
                   `(${outcome.state}${outcome.reason ? `: ${outcome.reason}` : ''}); it will be reconciled automatically once ${runnerName} ` +
@@ -192,6 +193,10 @@ export async function waitCommand(id, { timeoutMs } = {}) {
       if (found) {
         notFoundSince = null;
       } else {
+        if (readLedger(root, id) !== null) {
+          const recovery = await loadPullRecovery();
+          if (await recovery.reconstructLedgered(root, id, resultPath, pullContext ?? recovery.configuredPullContext(root), { deadlineAt: deadline ?? undefined })) continue;
+        }
         if (notFoundSince === null) notFoundSince = Date.now();
         if (Date.now() - notFoundSince > NOT_FOUND_GRACE_MS) {
           process.stderr.write(`lane wait: no queued ticket, running lease, or result for ${id} — nothing to wait for\n`);
@@ -205,4 +210,13 @@ export async function waitCommand(id, { timeoutMs } = {}) {
     process.off('SIGINT', forwardCancel);
     process.off('SIGTERM', forwardCancel);
   }
+}
+
+const flushed = (stream) => new Promise((resolve) => stream.write('', resolve));
+
+// a pull step that lost the race against --timeout may still be inside a network call: end the process here, not when the event loop drains
+export async function waitAndExit(id, options) {
+  const { exitCode } = await waitCommand(id, options);
+  await Promise.all([flushed(process.stdout), flushed(process.stderr)]);
+  process.exit(exitCode);
 }

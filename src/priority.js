@@ -32,6 +32,10 @@ export function tierRank(tier) {
   return isPriorityTier(tier) ? TIER_BASE[tier] : TIER_BASE[DEFAULT_PRIORITY];
 }
 
+// the first value of each band the queue's eff_score reads: 0-3 low, 4-6 medium, 7-9 high (9 is a release candidate's)
+const PULL_QUEUE_BAND_START = [0, 4, 7];
+export const pullQueuePriority = (tier) => PULL_QUEUE_BAND_START[tierRank(tier)];
+
 /**
  * BRAIN-627: the nice a lane runs at. An explicit lane `nice` (the ticket's `niceOverride`) wins, then the config's
  * `priorityNice` entry for the tier the ticket was ADMITTED at (after the high cap), then the global `laneNice`.

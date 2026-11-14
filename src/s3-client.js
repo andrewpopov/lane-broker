@@ -56,7 +56,7 @@ const xmlTag = (xml, tag) => {
 };
 const xmlBlocks = (xml, tag) => [...xml.matchAll(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`, 'g'))].map((m) => m[1]);
 
-async function sha256AndSize(file) {
+export async function sha256AndSize(file) {
   const hash = crypto.createHash('sha256');
   let size = 0;
   for await (const chunk of fs.createReadStream(file)) {
@@ -66,14 +66,17 @@ async function sha256AndSize(file) {
   return { sha256: hash.digest('hex'), size };
 }
 
-async function spoolBody(body, file) {
+class OverSize extends Error {}
+
+// past `maxBytes` the transfer is abandoned and nothing is kept
+async function spoolBody(body, file, maxBytes = Infinity) {
   const hash = crypto.createHash('sha256');
   let size = 0;
   const tap = new Transform({
     transform(chunk, _encoding, done) {
       hash.update(chunk);
       size += chunk.length;
-      done(null, chunk);
+      done(size > maxBytes ? new OverSize() : null, chunk);
     },
   });
   const part = `${file}.${crypto.randomBytes(6).toString('hex')}.part`;
@@ -82,6 +85,7 @@ async function spoolBody(body, file) {
     fs.renameSync(part, file);
   } catch (err) {
     fs.rmSync(part, { force: true });
+    if (err instanceof OverSize) return { tooLarge: true };
     throw err;
   }
   return { sha256: hash.digest('hex'), size };
@@ -90,7 +94,7 @@ async function spoolBody(body, file) {
 export function createS3Client({ endpoint, region, credentialsEnvFile, creds = loadS3Credentials(credentialsEnvFile), fetchImpl = globalThis.fetch, now = Date.now, deadlineMs = DEFAULT_S3_DEADLINE_MS }) {
   const base = new URL(endpoint);
 
-  async function send(op, { method, bucket, key, query = {}, payloadSha = EMPTY_SHA256, body, contentLength, deadline, toFile, abort }) {
+  async function send(op, { method, bucket, key, query = {}, payloadSha = EMPTY_SHA256, body, contentLength, deadline, toFile, abort, maxBytes }) {
     const path = key === undefined ? `/${awsUriEncode(bucket)}` : objectPath(bucket, key);
     const queryString = canonicalQueryString(query);
     const stamp = amzTimestamp(now());
@@ -108,7 +112,7 @@ export function createS3Client({ endpoint, region, credentialsEnvFile, creds = l
     const signal = abort ? AbortSignal.any([timeout, abort]) : timeout;
     try {
       const res = await fetchImpl(url, { method, headers, signal, ...(body === undefined ? {} : { body, duplex: 'half' }) });
-      const streamed = toFile && res.status === 200 ? await spoolBody(res.body, toFile) : null;
+      const streamed = toFile && res.status === 200 ? await spoolBody(res.body, toFile, maxBytes) : null;
       const text = method === 'HEAD' || streamed ? '' : await res.text();
       return { res, text, streamed };
     } catch (err) {
@@ -136,9 +140,9 @@ export function createS3Client({ endpoint, region, credentialsEnvFile, creds = l
       return { sha256, size };
     },
 
-    /** Streams the object to `file` (via `file.part`, renamed once whole) and reports the sha256 and size it saw; the caller compares them. */
-    async getObjectToFile(bucket, key, file, { deadlineMs: deadline, signal } = {}) {
-      const reply = await send(`GET ${bucket}/${key}`, { method: 'GET', bucket, key, deadline, toFile: file, abort: signal });
+    /** Streams the object to `file` (via `file.part`, renamed once whole) and reports the sha256 and size it saw; the caller compares them; past `maxBytes` it stops and answers `tooLarge`. */
+    async getObjectToFile(bucket, key, file, { deadlineMs: deadline, signal, maxBytes } = {}) {
+      const reply = await send(`GET ${bucket}/${key}`, { method: 'GET', bucket, key, deadline, toFile: file, abort: signal, maxBytes });
       if (reply.res.status === 404) return { exists: false };
       if (reply.res.status !== 200) throw fail(`GET ${bucket}/${key}`, reply);
       return { exists: true, ...reply.streamed };
@@ -162,6 +166,20 @@ export function createS3Client({ endpoint, region, credentialsEnvFile, creds = l
         token = xmlTag(reply.text, 'IsTruncated') === 'true' ? xmlTag(reply.text, 'NextContinuationToken') : undefined;
       } while (token);
       return objects;
+    },
+
+    /** The next path segment under `prefix`, each with its trailing slash (`/` delimiter), so a layout of `<host>/<ticket>/...` is walked without listing every object. */
+    async listCommonPrefixes(bucket, { prefix = '', deadlineMs: deadline } = {}) {
+      const prefixes = [];
+      let token;
+      do {
+        const query = { 'list-type': 2, delimiter: '/', ...(prefix ? { prefix } : {}), ...(token ? { 'continuation-token': token } : {}) };
+        const reply = await send(`LIST ${bucket}`, { method: 'GET', bucket, query, deadline });
+        if (reply.res.status !== 200) throw fail(`LIST ${bucket}`, reply);
+        for (const block of xmlBlocks(reply.text, 'CommonPrefixes')) prefixes.push(xmlTag(block, 'Prefix'));
+        token = xmlTag(reply.text, 'IsTruncated') === 'true' ? xmlTag(reply.text, 'NextContinuationToken') : undefined;
+      } while (token);
+      return prefixes;
     },
 
     /** `{rules: [{id, status, prefix}]}`; a bucket with no lifecycle configuration has none. Anything else unreadable throws. */

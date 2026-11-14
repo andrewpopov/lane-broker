@@ -5,7 +5,6 @@ import crypto from 'node:crypto';
 export const UNSIGNED_PAYLOAD = 'UNSIGNED-PAYLOAD';
 const ALGORITHM = 'AWS4-HMAC-SHA256';
 const SERVICE = 's3';
-export const MAX_PRESIGN_EXPIRES_SEC = 604_800;
 
 export const sha256Hex = (data) => crypto.createHash('sha256').update(data).digest('hex');
 const hmac = (key, data) => crypto.createHmac('sha256', key).update(data).digest();
@@ -38,32 +37,4 @@ export function signatureFor({ secretAccessKey, stamp, region, canonicalRequest 
   return crypto.createHmac('sha256', key).update(stringToSign).digest('hex');
 }
 
-/**
- * Presign `method` for `host` + `path` (path already URI-encoded). Returns `{host, path, query}` where `query` is the full signed
- * query string. Split from `presignUrl` so the AWS documented vector (virtual-hosted style) and our path-style URLs share one signer.
- */
-export function presignRequest({ method, host, path, expiresSec, creds, region, now }) {
-  if (!Number.isInteger(expiresSec) || expiresSec < 1 || expiresSec > MAX_PRESIGN_EXPIRES_SEC) throw new RangeError(`expiresSec must be an integer in 1..${MAX_PRESIGN_EXPIRES_SEC} (got ${expiresSec})`);
-  const stamp = amzTimestamp(now);
-  const params = {
-    'X-Amz-Algorithm': ALGORITHM,
-    'X-Amz-Credential': `${creds.accessKeyId}/${credentialScope(stamp, region)}`,
-    'X-Amz-Date': stamp,
-    'X-Amz-Expires': expiresSec,
-    'X-Amz-SignedHeaders': 'host',
-    ...(creds.sessionToken ? { 'X-Amz-Security-Token': creds.sessionToken } : {}),
-  };
-  const query = canonicalQueryString(params);
-  const canonicalRequest = [method, path, query, `host:${host}\n`, 'host', UNSIGNED_PAYLOAD].join('\n');
-  const signature = signatureFor({ secretAccessKey: creds.secretAccessKey, stamp, region, canonicalRequest });
-  return { host, path, query: `${query}&X-Amz-Signature=${signature}` };
-}
-
 export const objectPath = (bucket, key) => `/${awsUriEncode(bucket)}/${awsUriEncode(key, { keepSlash: true })}`;
-
-/** Path-style presigned URL (`<endpoint>/<bucket>/<key>?...`), `UNSIGNED-PAYLOAD`. */
-export function presignUrl({ method, bucket, key, expiresSec, creds, endpoint, region, now = Date.now() }) {
-  const base = new URL(endpoint);
-  const signed = presignRequest({ method, host: base.host, path: objectPath(bucket, key), expiresSec, creds, region, now });
-  return `${base.protocol}//${signed.host}${signed.path}?${signed.query}`;
-}

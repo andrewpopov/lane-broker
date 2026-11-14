@@ -113,9 +113,9 @@ export function writeMemoryFile(base, swapUsedBytes, swapTotalBytes, compressorB
  *  streaming made this observable -- a large forwarded stdout could resolve
  *  before its tail arrived), so an assertion on captured output must wait
  *  for 'close' the same way the supervisor's own child listener does. */
-export function laneRun(args, { env, cwd } = {}) {
+export function laneRun(args, { env, cwd, bin = BIN } = {}) {
   return new Promise((resolve) => {
-    const child = spawn(process.execPath, [BIN, ...args], { env, cwd: cwd || process.cwd() });
+    const child = spawn(process.execPath, [bin, ...args], { env, cwd: cwd || process.cwd() });
     let stdout = '';
     let stderr = '';
     child.stdout.on('data', (d) => {
@@ -129,8 +129,8 @@ export function laneRun(args, { env, cwd } = {}) {
 }
 
 /** Spawn `lane <args>` without waiting — caller controls lifecycle (signals, timing). */
-export function laneSpawn(args, { env, cwd } = {}) {
-  return spawn(process.execPath, [BIN, ...args], { env, cwd: cwd || process.cwd() });
+export function laneSpawn(args, { env, cwd, bin = BIN } = {}) {
+  return spawn(process.execPath, [bin, ...args], { env, cwd: cwd || process.cwd() });
 }
 
 let localEnvVarNames = null;

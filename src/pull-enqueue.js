@@ -22,6 +22,7 @@ export function enqueueArgs(envelope) {
     cpuCores: envelope.cpuCores,
     memoryBytes: envelope.memoryBytes,
     priority: envelope.priority,
+    ...(envelope.minProtocol === undefined ? {} : { minProtocol: envelope.minProtocol }),
   };
 }
 
@@ -45,7 +46,9 @@ async function persistIntent({ root, id, generation }, change) {
 }
 
 // takes the ticket lock itself; `ledgered` is asked inside it so a ledgered decision is never followed by a send; returns queued, refresh (call again), lost or settled; a throw leaves the intent pending for the replay
-export function enqueueOnce({ root, id, generation, queue, ledgered = () => false, now = Date.now, rowRetentionMs = DEFAULT_GLOBAL_CONFIG.lanePull.rowRetentionMs, lockTimeoutMs }) {
+export const CANCELLED_BEFORE_ENQUEUE = 'cancelled-before-enqueue';
+
+export function enqueueOnce({ root, id, generation, queue, ledgered = () => false, cancelRequested = () => false, settleCancelled = async () => null, now = Date.now, rowRetentionMs = DEFAULT_GLOBAL_CONFIG.lanePull.rowRetentionMs, lockTimeoutMs }) {
   return withTicketLock(root, id, async () => {
     if (ledgered()) return { outcome: 'settled' };
     const args = enqueueArgs(readEnvelope(root, id));
@@ -53,6 +56,9 @@ export function enqueueOnce({ root, id, generation, queue, ledgered = () => fals
     if (intent.seenRowAt !== null) return { outcome: 'queued', view: null };
     if (crossedRestore(intent.attempts)) return { outcome: 'lost', reason: ENQUEUE_CROSSED_RESTORE };
     if (pastRetention(intent.attempts, now(), rowRetentionMs)) return { outcome: 'lost', reason: ENQUEUE_PAST_RETENTION };
+    // nothing has been sent, so a cancel that has arrived ends the ticket here and no row is ever created; checked under the lock, before the intent is recorded
+    // settled here, still under the lock that proved nothing was sent, so no other stepper can record an intent between the proof and the decision
+    if (intent.attempts.length === 0 && cancelRequested()) return { outcome: CANCELLED_BEFORE_ENQUEUE, settled: await settleCancelled() };
 
     const ref = intent.attempts.find(mayHaveBeenSent)?.ref ?? (await queue.queueRef());
     let sending;
