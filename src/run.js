@@ -27,6 +27,7 @@ import { parseScrubCommandEnv, scrubCommandEnv, SCRUB_COMMAND_ENV_VAR } from './
 import { computeContentKey, configIdentityOf, decideReuse } from './result-cache.js';
 import { detectPushGate, isSuperseded, PUSH_GATE_LANE } from './push-gate.js';
 
+const SUPERVISOR_EXIT_WAIT_MS = 2000;
 const supervisorPath = fileURLToPath(new URL('./supervisor.js', import.meta.url));
 
 export function parseDuration(spec) {
@@ -917,6 +918,8 @@ export async function runCommand({
     return { exitCode: 1 };
   }
   supervisor.unref();
+  // how the supervisor really ended, so a missing result is read from its exit and never guessed from what the attempt record happens to hold
+  const supervisorEnded = new Promise((resolve) => supervisor.once('exit', (code, signal) => resolve({ code, signal })));
   let spawnFailure = null;
   supervisor.on('error', (err) => {
     spawnFailure = err;
@@ -1033,11 +1036,15 @@ export async function runCommand({
         }
         // The supervisor exited without ever writing a result: it was cancelled
         // while still queued (or crashed) before the child ever ran.
-        if (cancelling) {
+        // Only a supervisor that accepted the cancel and finished (exit 0 or 130; a signal leaves no exit code) cancelled the lane before it started.
+        // The watchdog's 74, any signal, and every other exit with no result is not a proven cancel.
+        const ended = await Promise.race([supervisorEnded, sleep(SUPERVISOR_EXIT_WAIT_MS).then(() => null)]);
+        if (cancelling && ended !== null && (ended.code === 0 || ended.code === 130)) {
           process.stderr.write(`lane run: cancelled before the lane started (id ${id})\n`);
           return abortReturn(130);
         }
-        process.stderr.write(`lane run: supervisor exited unexpectedly with no result (id ${id})\n`);
+        const how = ended === null ? 'exit unknown' : ended.signal !== null ? `signal ${ended.signal}` : `exit ${ended.code}`;
+        process.stderr.write(`lane run: supervisor exited with no result (${how}); the lane is not proven cancelled or finished (id ${id}; see lane status, lane cancel)\n`);
         return abortReturn(1);
       }
       await sleep(200);

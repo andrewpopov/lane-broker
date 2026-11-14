@@ -3,7 +3,6 @@ import path from 'node:path';
 import os from 'node:os';
 import { execFileSync } from 'node:child_process';
 import { parse as parsePgConnectionString } from 'pg-connection-string';
-import { MAX_PRESIGN_EXPIRES_SEC } from './s3-presign.js';
 import { paths, stateHome } from './state.js';
 import { scheduleProblem } from './runner-schedule.js';
 import { isCanonicalRelPath, scrubbedGitEnv } from './remote-manifest.js';
@@ -263,12 +262,14 @@ export const DEFAULT_GLOBAL_CONFIG = {
   lanePull: {
     enabled: false,
     pollMs: 15_000,
-    urlTtlSec: 900,
-    urlRefreshSec: 300,
-    quarantineLostAfterMs: 1_800_000,
+    unprovenCancelLostAfterMs: 600_000,
+    queueUnreachableAfterMs: 900_000,
+    prepareBudgetMs: 600_000,
     blobGc: true,
     blobRefreshAfterDays: 7,
     rowRetentionMs: 7 * 24 * 3_600_000,
+    ledgerRetentionMs: 45 * 24 * 3_600_000,
+    // no `queuedTimeoutMs` by default: a queued pull ticket waits as long as it takes, like a train/pr lane (BRAIN-509)
     rustfs: { region: 'us-east-1', snapBucket: 'lane-snap', outBucket: 'lane-out' },
   },
 };
@@ -597,7 +598,9 @@ export function laneQueueUrlProblem(raw) {
   return null;
 }
 
-const LANE_PULL_NUMBERS = ['pollMs', 'urlTtlSec', 'urlRefreshSec', 'quarantineLostAfterMs', 'blobRefreshAfterDays', 'rowRetentionMs'];
+const LANE_PULL_NUMBERS = ['pollMs', 'unprovenCancelLostAfterMs', 'queueUnreachableAfterMs', 'prepareBudgetMs', 'blobRefreshAfterDays', 'rowRetentionMs', 'ledgerRetentionMs'];
+// the queue's backup retention: a ledger entry must outlive every backup a restore could return
+export const LEDGER_RETENTION_FLOOR_MS = 35 * 24 * 3_600_000;
 const LANE_PULL_PATHS = ['passwordFile', 'caFile', 'ledgerDir'];
 const RUSTFS_STRINGS = ['region', 'snapBucket', 'outBucket', 'credentialsEnvFile'];
 
@@ -611,8 +614,12 @@ function validateLanePull(cfg, sourcePath) {
   assert(typeof pull.enabled === 'boolean', `${sourcePath}: "lanePull.enabled" must be a boolean`);
   assert(typeof pull.blobGc === 'boolean', `${sourcePath}: "lanePull.blobGc" must be a boolean`);
   for (const field of LANE_PULL_NUMBERS) assert(Number.isInteger(pull[field]) && pull[field] > 0, `${sourcePath}: "lanePull.${field}" must be a positive integer`);
-  assert(pull.urlTtlSec <= MAX_PRESIGN_EXPIRES_SEC, `${sourcePath}: "lanePull.urlTtlSec" must be at most ${MAX_PRESIGN_EXPIRES_SEC} (the SigV4 limit)`);
-  assert(pull.urlRefreshSec < pull.urlTtlSec, `${sourcePath}: "lanePull.urlRefreshSec" must be less than "lanePull.urlTtlSec"`);
+  assert(pull.ledgerRetentionMs >= LEDGER_RETENTION_FLOOR_MS, `${sourcePath}: "lanePull.ledgerRetentionMs" must be at least ${LEDGER_RETENTION_FLOOR_MS} (35 days, the queue's backup retention)`);
+  assert(pull.queuedTimeoutMs === undefined || (Number.isInteger(pull.queuedTimeoutMs) && pull.queuedTimeoutMs > 0), `${sourcePath}: "lanePull.queuedTimeoutMs" must be a positive integer`);
+  if (pull.queuedTimeoutMsByLane !== undefined) {
+    assert(isPlainObject(pull.queuedTimeoutMsByLane), `${sourcePath}: "lanePull.queuedTimeoutMsByLane" must be an object of lane name to milliseconds`);
+    for (const [lane, ms] of Object.entries(pull.queuedTimeoutMsByLane)) assert(Number.isInteger(ms) && ms > 0, `${sourcePath}: "lanePull.queuedTimeoutMsByLane.${lane}" must be a positive integer`);
+  }
   for (const field of LANE_PULL_PATHS) {
     if (pull[field] !== undefined) assert(typeof pull[field] === 'string' && pull[field].length > 0, `${sourcePath}: "lanePull.${field}" must be a non-empty string`);
   }
@@ -666,6 +673,9 @@ const RUNNER_TRANSPORTS = ['push', 'pull'];
 /** BRAIN-1036: the runners a dispatcher reaches over ssh. Every placement, rebind, ping and status path that dials a runner reads this list, never `cfg.runners`. */
 export const pushRunners = (cfg) => (cfg?.runners ?? []).filter((r) => r.transport !== 'pull');
 export const pullRunners = (cfg) => (cfg?.runners ?? []).filter((r) => r.transport === 'pull');
+
+/** How long a pull ticket may sit unclaimed before the supervisor withdraws it, per lane then globally; undefined is unbounded. */
+export const pullQueuedTimeoutMs = (cfg, lane) => cfg?.lanePull?.queuedTimeoutMsByLane?.[lane] ?? cfg?.lanePull?.queuedTimeoutMs;
 
 /** Whether the config alone says pull dispatch is usable: enabled, a pull runner, and every connection key present. Reads nothing from disk or the network. */
 export function pullConfigured(cfg) {

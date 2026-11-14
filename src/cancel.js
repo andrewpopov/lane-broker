@@ -7,7 +7,7 @@ import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult, c
 import { terminalRowDefaults } from './resources.js';
 import { remoteCancel } from './remote-client.js';
 import { loadGlobalConfigOrError } from './config.js';
-import { reconcileRemoteAttempt } from './remote-reconcile.js';
+import { loadPullRecovery, reconcileRemoteAttempt } from './remote-reconcile.js';
 import { writeBrokerLog } from './admission.js';
 import { stopLeaseCpuScope, CPU_SCOPE_STOP_WAIT_MS } from './cpu-limit.js';
 import { trackerForLease, reapLogLine, cancelGraceMs, KILL_WAIT_MS } from './descendants.js';
@@ -83,7 +83,7 @@ async function killGroupOnly(pgid, deadline = Infinity) {
  *    ordinary "nothing to cancel" branch above -- same as re-cancelling any
  *    already-finished ticket today.
  */
-export async function cancelAttempt(root, id, attempt, { orphanOnly = false } = {}) {
+export async function cancelAttempt(root, id, attempt, { orphanOnly = false, pullContext } = {}) {
   if (!orphanOnly && supervisorAlive(attempt)) {
     writeCancelMarkerFile(root, id);
     try {
@@ -99,7 +99,7 @@ export async function cancelAttempt(root, id, attempt, { orphanOnly = false } = 
     if (stillHeld && !supervisorAlive(stillHeld)) {
       // BRAIN-850 S3: the supervisor died or abandoned a cancel it could not finish, leaving its record (even an `unresolved` one): an orphaned
       // remote. The orphan path removes nothing without every named runner's confirmation, so it is safe; `orphanOnly` makes it a single pass.
-      return cancelAttempt(root, id, stillHeld, { orphanOnly: true });
+      return cancelAttempt(root, id, stillHeld, { orphanOnly: true, pullContext });
     }
     if (stillHeld) {
       process.stderr.write(
@@ -113,6 +113,10 @@ export async function cancelAttempt(root, id, attempt, { orphanOnly = false } = 
   }
 
   // ORPHANED-REMOTE: reconcile directly, no supervisor left to do it.
+  if (attempt.transport === 'pull' && attempt.executor !== 'local') {
+    const recovery = await loadPullRecovery();
+    return recovery.cancelPullAttempt(id, attempt, pullContext ?? recovery.configuredPullContext(root));
+  }
   const { config: globalCfg, error: configError } = loadGlobalConfigOrError();
   // BRAIN-594: a runner the operator marked offline cannot confirm anything and is never contacted: the attempt settles as lost
   // (exit 75, `runner-offline`) through the reconcile path, exactly as a sweep would. Ahead of the cancel marker, which would

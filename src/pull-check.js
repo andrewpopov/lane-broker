@@ -52,14 +52,14 @@ export async function blobGcVerdict({ s3, bucket, settleMs = REPUT_SETTLE_MS, sl
   return verdict;
 }
 
-/** `{ok, refusals, lifecycle, blobGc}`; `ok` is false on any refusal, and an unreadable bucket or failed probe is a refusal. */
-export async function pullCheck({ cfg, s3, settleMs, sleep }) {
+/** `{refusals, lifecycle}`: an enabled lifecycle rule on either bucket, or a bucket whose rules cannot be read, is a refusal. Reads only. */
+export async function lifecycleVerdict({ cfg, s3, deadlineMs }) {
   const { snapBucket, outBucket } = cfg.lanePull.rustfs;
   const refusals = [];
   const lifecycle = {};
   for (const bucket of [snapBucket, outBucket]) {
     try {
-      const { rules } = await s3.getBucketLifecycle(bucket);
+      const { rules } = await s3.getBucketLifecycle(bucket, { deadlineMs });
       lifecycle[bucket] = rules;
       for (const rule of rules.filter((r) => String(r.status).toLowerCase() === 'enabled')) {
         refusals.push(`bucket ${bucket} has an enabled lifecycle rule (${rule.id ?? 'unnamed'}${rule.prefix ? `, prefix ${rule.prefix}` : ''}); remove it before activation`);
@@ -69,6 +69,13 @@ export async function pullCheck({ cfg, s3, settleMs, sleep }) {
       refusals.push(`bucket ${bucket} lifecycle configuration is unreadable (${err.message}); cannot prove nothing expires`);
     }
   }
+  return { refusals, lifecycle };
+}
+
+/** `{ok, refusals, lifecycle, blobGc}`; `ok` is false on any refusal, and an unreadable bucket or failed probe is a refusal. */
+export async function pullCheck({ cfg, s3, settleMs, sleep }) {
+  const { snapBucket } = cfg.lanePull.rustfs;
+  const { refusals, lifecycle } = await lifecycleVerdict({ cfg, s3 });
   let blobGc;
   try {
     blobGc = await blobGcVerdict({ s3, bucket: snapBucket, settleMs, sleep });

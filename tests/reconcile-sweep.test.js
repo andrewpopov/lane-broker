@@ -12,6 +12,7 @@ import { sweepOrphans } from '../src/reconcile-sweep.js';
 import { recordPings } from '../src/runner-unreachable.js';
 import { selectRunner } from '../src/remote-client.js';
 import { loadGlobalConfig, ConfigError, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
+import { assertCanaryFails } from './helpers/mutant-module.js';
 
 /**
  * BRAIN-515 step 4: the background sweep that settles ORPHANED-REMOTE attempts without a `lane cancel`. Same fake-ssh transport as
@@ -477,4 +478,51 @@ test('a successful answer resets firstUnreachableAt: down, then up (adopted), th
   const out = await sweep(ctx, { now: t0 + 3 * HOUR, force: true });
   assert.deepEqual(out.results.map(({ id, state }) => ({ id, state })), [{ id: stranded, state: 'unreachable' }], 'not lost: the old clock was cleared');
   assert.deepEqual(unreachableAt(ctx), { a: t0 + 3 * HOUR });
+});
+
+const PUSH_ORPHAN = '00000000-0000-4000-8000-0000000000a1';
+const BAD_MARKER = '00000000-0000-4000-8000-0000000000b2';
+
+async function badMarkerScenario(load) {
+  const { sweepOrphans: sweepFrom } = await load('reconcile-sweep.js');
+  const { createAttempt, updateAttempt } = await import('../src/attempts.js');
+  const { writeOwedCancel, owedCancelIds } = await import('../src/pull-envelope.js');
+  const { state } = freshEnv();
+  ensureStateDirs(state);
+  const attempt = await createAttempt(state, PUSH_ORPHAN);
+  await updateAttempt(state, PUSH_ORPHAN, attempt.generation, { executor: 'local', supervisor: DEAD_SUPERVISOR });
+  fs.mkdirSync(path.join(paths(state).pull, BAD_MARKER), { recursive: true });
+  writeOwedCancel(state, BAD_MARKER, { generation: 0, at: Date.now() });
+  const swept = await sweepFrom(state, { globalCfg: { ...DEFAULT_GLOBAL_CONFIG, runners: [] }, force: true });
+  assert.equal(swept.ran, true, swept.reason);
+  const byId = Object.fromEntries(swept.results.map((r) => [r.id, r]));
+  assert.equal(byId[BAD_MARKER]?.state, 'failed', 'the marker that cannot be delivered is reported by name');
+  assert.equal(byId[PUSH_ORPHAN]?.state, 'lost', 'the push recovery after it still ran in the same sweep');
+  assert.deepEqual(owedCancelIds(state), [BAD_MARKER], 'and the marker is kept for when the pull side is back');
+}
+
+test('a pull cancel marker that can never be delivered (no pull config) never stops the push recovery that follows it in the same sweep', async () => {
+  await badMarkerScenario((file) => import(`../src/${file}`));
+  await assertCanaryFails('pull-recover.js', ["      results.push({ id, state: isTransientError(err) ? 'unreachable' : 'failed', reason: err.message });", '      throw err;'], badMarkerScenario);
+});
+
+async function badMarkerBesideRemoteOrphan(load) {
+  const ctx = context();
+  const orphan = seedOrphan(ctx, { record: completed(3) });
+  const { writeOwedCancel, owedCancelIds } = await import('../src/pull-envelope.js');
+  fs.mkdirSync(path.join(paths(ctx.state).pull, BAD_MARKER), { recursive: true });
+  writeOwedCancel(ctx.state, BAD_MARKER, { generation: 0, at: Date.now() });
+  const { sweepOrphans: sweepFrom } = await load('reconcile-sweep.js');
+  const swept = await sweepFrom(ctx.state, { globalCfg: ctx.globalCfg, env: ctx.env, deadlineMs: 20_000, force: true });
+  assert.equal(swept.ran, true, swept.reason);
+  const byId = Object.fromEntries(swept.results.map((r) => [r.id, r]));
+  assert.deepEqual([byId[orphan]?.state, byId[orphan]?.exit], ['adopted', 3], 'the remote push orphan still recovers in the same sweep');
+  assert.equal(resultOf(ctx.state, orphan).exit, 3);
+  assert.equal(byId[BAD_MARKER]?.state, 'failed', 'and the marker is reported by name');
+  assert.deepEqual(owedCancelIds(ctx.state), [BAD_MARKER]);
+}
+
+test('markers are swept after the remote orphans: an undeliverable pull marker is reported by name and leaves the remote orphan adoption and result untouched', async () => {
+  await badMarkerBesideRemoteOrphan((file) => import(`../src/${file}`));
+  await assertCanaryFails('pull-recover.js', ["      results.push({ id, state: isTransientError(err) ? 'unreachable' : 'failed', reason: err.message });", '      throw err;'], badMarkerBesideRemoteOrphan);
 });

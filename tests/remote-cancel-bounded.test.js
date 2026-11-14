@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { laneRun, waitFor, sleep } from './helpers.js';
+import { laneRun, laneSpawn, waitFor, sleep } from './helpers.js';
+import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 import { tmpDir, setup, resultOf, holdLaneLocally } from './remote-harness.js';
 import { readAttempt, remoteCancelExitDeadlineMs, remoteCancelDeadlineMs, cancelWaitMs, POST_ABORT_JOIN_MS, CANCELLING_LOCK_TIMEOUT_MS } from '../src/attempts.js';
 import { listQueue } from '../src/scheduler.js';
@@ -253,4 +254,87 @@ test('a ticket rebound from the local queue to a runner exits within the deadlin
     await hold.done;
     await reapOnFailure(state, id, env);
   }
+});
+
+async function foregroundRemoteRun(load, { env, repoDir }) {
+  const ranLog = path.join(tmpDir('ran'), 'ran.log');
+  const body = `require('fs').appendFileSync(${JSON.stringify(ranLog)}, 'x'); setInterval(() => {}, 1000);`;
+  const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', 'node', '-e', body], { env, cwd: repoDir, bin: load.laneBin });
+  const exited = new Promise((resolve) => child.on('close', (code) => resolve(code)));
+  child.stdout.resume();
+  child.stderr.resume();
+  await waitFor(() => fs.existsSync(ranLog), { timeoutMs: 30_000 });
+  return { child, exited };
+}
+
+const settleExit = (exited) => Promise.race([exited, sleep(60_000).then(() => 'timeout')]);
+
+async function cleanup(state, env, child) {
+  child.kill('SIGKILL');
+  for (const file of fs.existsSync(paths(state).attempts) ? fs.readdirSync(paths(state).attempts) : []) await reapOnFailure(state, file.replace('.json', ''), env);
+}
+
+async function watchdogExit(load) {
+  const base = setup();
+  const { env, setMode, releaseHolder } = withCancelWrapper(base.env);
+  const { child, exited } = await foregroundRemoteRun(load, { env, repoDir: base.repoDir });
+  try {
+    setMode('hang-first');
+    child.kill('SIGINT');
+    const code = await settleExit(exited);
+    assert.match(brokerLog(base.state), ABANDONED_LINE, 'the supervisor gave up on the cancel (exit 74, no result)');
+    assert.equal(code, 1, 'an abandoned cancel is not a proven one: never 130');
+  } finally {
+    setMode('');
+    releaseHolder();
+    await cleanup(base.state, env, child);
+  }
+}
+
+async function killedSupervisor(load) {
+  const base = setup();
+  const { env } = withCancelWrapper(base.env);
+  const { child, exited } = await foregroundRemoteRun(load, { env, repoDir: base.repoDir });
+  try {
+    const [file] = fs.readdirSync(paths(base.state).attempts);
+    process.kill(readAttempt(base.state, file.replace('.json', '')).supervisor.pid, 'SIGKILL');
+    child.kill('SIGINT');
+    assert.equal(await settleExit(exited), 1, 'a supervisor killed by a signal leaves no proof of a cancel, even though the caller was interrupted');
+  } finally {
+    await cleanup(base.state, env, child);
+  }
+}
+
+async function preStartCancel(load) {
+  const base = setup();
+  fs.writeFileSync(path.join(base.state, 'PAUSE'), 'the local queue is closed for the test');
+  const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--local', '--local-reason', 'needs ssh', '--', 'true'], { env: base.env, cwd: base.repoDir, bin: load.laneBin });
+  const exited = new Promise((resolve) => child.on('close', (code) => resolve(code)));
+  child.stdout.resume();
+  child.stderr.resume();
+  try {
+    await waitFor(() => listQueue(base.state).length === 1, { timeoutMs: 30_000 });
+    child.kill('SIGINT');
+    assert.equal(await settleExit(exited), 130, 'a ticket cancelled while still queued, which the supervisor ends cleanly with no result, is the one real cancel-before-start');
+  } finally {
+    child.kill('SIGKILL');
+  }
+}
+
+const EXIT_RULE = ['(ended.code === 0 || ended.code === 130)', 'true'];
+const SIGNAL_RULE = ['(ended.code === 0 || ended.code === 130)', '(ended.code === null || ended.code === 0 || ended.code === 130)'];
+
+test('a foreground lane run whose cancel the supervisor abandons (watchdog exit 74) exits 1, never 130', T, async () => {
+  await watchdogExit(realSrc);
+  await assertCanaryFails('run.js', EXIT_RULE, watchdogExit);
+});
+
+test('a foreground lane run whose supervisor is killed by a signal exits 1, never 130, whatever the caller did', T, async () => {
+  await killedSupervisor(realSrc);
+  await assertCanaryFails('run.js', SIGNAL_RULE, killedSupervisor);
+});
+
+test('a ticket cancelled while still queued exits 130: the supervisor ended cleanly with no result', T, async () => {
+  await preStartCancel(realSrc);
+  await assertCanaryFails('run.js', ["if (cancelling && ended !== null && ", 'if (false && ended !== null && '], preStartCancel);
 });

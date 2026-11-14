@@ -6,6 +6,7 @@ import { atomicWriteJson, paths, ensureStateDirs, readJsonSafe } from '../../src
 import { buildExecHeader } from '../../src/remote-client.js';
 import { buildManifest } from '../../src/remote-manifest.js';
 import { createS3Client } from '../../src/s3-client.js';
+import { makeTmpDir } from './tmp.js';
 import { sha256Hex } from '../../src/s3-presign.js';
 import { freshEnv } from '../helpers.js';
 import { makeDispatchArgs, makeGitWorktree } from '../remote-harness.js';
@@ -28,14 +29,13 @@ export function artifactsStream(ticketId, files) {
 }
 
 // `load` picks the module tree, so a canary runs the same scenario against mutated code
-export async function pullFixture(t, w, { load = realSrc, id = ID, stub = null, files = { 'a.txt': 'x\n' }, cfg = {}, runnerLogin } = {}) {
+export async function pullFixture(t, w, { load = realSrc, id = ID, stub = null, files = { 'a.txt': 'x\n' }, cfg = {}, runnerLogin, state: sharedState } = {}) {
   const clock = { now: Date.now() };
   const s3Stub = stub ?? await startS3Stub();
   if (!stub) t.after(() => s3Stub.close());
   const s3 = createS3Client({ endpoint: s3Stub.endpoint, region: STUB_REGION, creds: STUB_CREDS });
-  const { presignerFor, stepPullTicket, preparePullTicket, withdrawQueued, runPullTicket } = await load('pull-ticket.js');
-  const presign = presignerFor({ endpoint: s3Stub.endpoint, region: STUB_REGION, creds: STUB_CREDS, now: () => clock.now });
-  const { state } = freshEnv();
+  const { stepPullTicket, preparePullTicket, preparePullTicketWithRetry, withdrawQueued, proveNeverEnqueued, runPullTicket } = await load('pull-ticket.js');
+  const state = sharedState ?? freshEnv().state;
   ensureStateDirs(state);
   const worktreeRoot = makeGitWorktree(files);
   const manifest = buildManifest(worktreeRoot);
@@ -44,7 +44,7 @@ export async function pullFixture(t, w, { load = realSrc, id = ID, stub = null, 
   const attempt = await createAttempt(state, id);
   const binding = { protocol: header.protocol, ticketId: id, generation: 0, manifestHash: manifest.manifestHash };
   const fx = {
-    id, state, clock, stub: s3Stub, s3, queue: harnessClient(t, w).queue, runner: new StubRunner(w, runnerLogin ? { login: runnerLogin } : {}), worktreeRoot, manifest, header, binding,
+    id, state, clock, stub: s3Stub, s3, queue: harnessClient(t, w).queue, runner: new StubRunner(w, { ...(runnerLogin ? { login: runnerLogin } : {}), s3, tmpDir: makeTmpDir('pull-fixture-runner-', t) }), worktreeRoot, manifest, header, binding,
     generation: attempt.generation, reports: [], hooks: {}, logPath: path.join(paths(state).logs, `${id}.log`), resultPath: path.join(paths(state).results, `${id}.json`),
     writes: [],
     envelopeFields: {
@@ -53,15 +53,17 @@ export async function pullFixture(t, w, { load = realSrc, id = ID, stub = null, 
     },
     ctx(over = {}) {
       return {
-        root: state, id, generation: attempt.generation, queue: fx.queue, s3, presign, logPath: fx.logPath, resultPath: fx.resultPath, now: () => clock.now, hooks: fx.hooks,
+        root: state, id, generation: attempt.generation, queue: fx.queue, s3, logPath: fx.logPath, resultPath: fx.resultPath, now: () => clock.now, hooks: fx.hooks,
         report: (event) => fx.reports.push(event),
         writeResult: (result, { fsync }) => { fx.writes.push(result); atomicWriteJson(fx.resultPath, result, { fsync }); }, lockTimeoutMs: 2000, objectDeadlineMs: 3000, cfg, sleep: async () => {}, ...over,
       };
     },
     step: (over) => stepPullTicket(fx.ctx(over)),
     prepare: (over) => preparePullTicket(fx.ctx({ prepare: { envelopeFields: fx.envelopeFields, worktreeRoot, manifest }, ...over })),
+    prepareRetrying: (over) => preparePullTicketWithRetry(fx.ctx({ prepare: { envelopeFields: fx.envelopeFields, worktreeRoot, manifest }, ...over })),
     run: (over) => runPullTicket(fx.ctx(over)),
     withdraw: (over) => withdrawQueued(fx.ctx(over)),
+    proveNeverEnqueued: (over) => proveNeverEnqueued(fx.ctx(over)),
     async enqueue(over) {
       await fx.prepare(over);
       await fx.step(over);
@@ -104,10 +106,10 @@ export function definePullSuite(title, scenarios, canaries) {
     afterAll(async () => { await cluster?.closeClients(); cluster?.stop(); });
     afterEach(() => cluster.closeClients());
     for (const [name, scenario] of Object.entries(scenarios)) test(name, async (t) => scenario(realSrc, await World.create(cluster), t));
-    for (const [name, file, mutation, expected] of canaries) {
-      test(`canary: with "${mutation[0].trim().slice(0, 70)}" removed, "${name}" fails`, async (t) => {
+    for (const [name, file, mutation, expected, assertionPattern] of canaries) {
+      test(`canary: with "${(Array.isArray(mutation[0]) ? mutation[0][0] : mutation[0]).trim().slice(0, 70)}" removed, "${name}" fails`, async (t) => {
         const world = await World.create(cluster);
-        const failure = await assertCanaryFails(file, mutation, (load) => scenarios[name](load, world, t), expected);
+        const failure = await assertCanaryFails(file, mutation, (load) => scenarios[name](load, world, t), expected, assertionPattern);
         t.diagnostic(`failed as expected: ${String(failure.message).split('\n')[0].slice(0, 160)}`);
       });
     }

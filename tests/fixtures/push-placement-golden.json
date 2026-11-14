@@ -1,0 +1,157 @@
+{
+  "an idle push runner takes the ticket": {
+    "exit": 0,
+    "laneLines": [
+      "lane: finish-placement: ts=<time> <id>: unscored -> skybox",
+      "lane: running on skybox (cpu unenforced, memory unavailable)",
+      "lane: snapshot -> skybox: tree 0.0 MB, sent 0.0 MB (gzip)"
+    ],
+    "patches": [
+      {
+        "phase": "running",
+        "runner": "skybox",
+        "dispatchedRunners": [
+          "skybox"
+        ]
+      },
+      {
+        "binding": {
+          "protocol": 1,
+          "generation": 0,
+          "manifestHash": "eb72eb7d2c5dc40d05b7206e850857620bcf6300b30875345db60f812a0a98ca",
+          "runner": "skybox"
+        }
+      },
+      {
+        "remotePhase": null
+      }
+    ],
+    "fallbackOrRefuse": [],
+    "header": {
+      "protocol": 1,
+      "ticketId": "<id>",
+      "generation": 0,
+      "repoKey": "<repoKey>",
+      "lane": "default",
+      "weight": 1,
+      "cpuCores": 1,
+      "memoryBytes": 1073741824,
+      "argv": [
+        "node",
+        "-e",
+        "process.exit(0)"
+      ],
+      "relCwd": "",
+      "runnerName": "skybox",
+      "noProgressTimeoutMs": 0,
+      "silenceTimeoutMs": 0,
+      "priorityRequested": "medium",
+      "priorityAccruedMs": "<ms>",
+      "manifest": {
+        "entries": [
+          {
+            "path": ".lane-broker.json",
+            "type": "file",
+            "exec": false,
+            "size": 137,
+            "sha256": "b52512d14a0901a0ca549060ce55328aa940e6c3c35d8353cf9f07981943ea86"
+          }
+        ],
+        "manifestHash": "eb72eb7d2c5dc40d05b7206e850857620bcf6300b30875345db60f812a0a98ca"
+      }
+    }
+  },
+  "every runner busy and the ticket locally eligible": {
+    "exit": 0,
+    "laneLines": [
+      "lane: finish-placement: ts=<time> <id>: unscored -> skybox (queued)",
+      "lane: remote-skip: none: skybox: queued: 1; local can admit now, not queuing on skybox(1) — running locally"
+    ],
+    "patches": [],
+    "fallbackOrRefuse": [
+      {
+        "runner": null,
+        "reason": "skybox: queued: 1; local can admit now, not queuing on skybox(1)",
+        "rebindable": true,
+        "retryWhenBlocked": false,
+        "neverStarted": false,
+        "noRunner": false,
+        "retryable": false
+      }
+    ],
+    "header": null
+  },
+  "every runner busy on a dispatch-only host": {
+    "exit": 0,
+    "laneLines": [
+      "lane: finish-placement: ts=<time> <id>: unscored -> skybox (queued)",
+      "lane: queuing on skybox(1): not locally eligible (lane run: localExecution is refused on this host (dispatch-only) and lane \"default\" cannot run on a runner.)",
+      "lane: running on skybox (cpu unenforced, memory unavailable)",
+      "lane: snapshot -> skybox: tree 0.0 MB, sent 0.0 MB (gzip)"
+    ],
+    "patches": [
+      {
+        "phase": "running",
+        "runner": "skybox",
+        "dispatchedRunners": [
+          "skybox"
+        ],
+        "queuedAt": "skybox(1)"
+      },
+      {
+        "binding": {
+          "protocol": 1,
+          "generation": 0,
+          "manifestHash": "eb72eb7d2c5dc40d05b7206e850857620bcf6300b30875345db60f812a0a98ca",
+          "runner": "skybox"
+        }
+      },
+      {
+        "remotePhase": null
+      }
+    ],
+    "fallbackOrRefuse": [],
+    "header": null
+  },
+  "the only runner down on a dispatch-only host": {
+    "exit": 76,
+    "laneLines": [
+      "lane: finish-placement: ts=<time> <id>: unscored [excluded: skybox: probe exited 255] -> none",
+      "lane: remote-skip: none: skybox: probe exited 255 — not running locally (localExecution refused)",
+      "lane run: localExecution is refused on this host (dispatch-only) and no runner can take lane \"default\" now (skybox: probe exited 255). Retry later."
+    ],
+    "patches": [],
+    "fallbackOrRefuse": [
+      {
+        "runner": null,
+        "reason": "skybox: probe exited 255",
+        "rebindable": true,
+        "retryWhenBlocked": false,
+        "neverStarted": false,
+        "noRunner": true,
+        "retryable": true
+      }
+    ],
+    "header": null
+  },
+  "the only runner down and the ticket locally eligible": {
+    "exit": 0,
+    "laneLines": [
+      "lane: finish-placement: ts=<time> <id>: unscored [excluded: skybox: probe exited 255] -> none",
+      "lane: remote-skip: none: skybox: probe exited 255 — running locally"
+    ],
+    "patches": [],
+    "fallbackOrRefuse": [
+      {
+        "runner": null,
+        "reason": "skybox: probe exited 255",
+        "rebindable": true,
+        "retryWhenBlocked": false,
+        "neverStarted": false,
+        "noRunner": true,
+        "retryable": true
+      }
+    ],
+    "header": null
+  }
+}

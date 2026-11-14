@@ -1,10 +1,13 @@
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { call, claim, finish, heartbeat, liftBackoff, logins, release, start } from '../lane-dispatch-fixture.js';
 import { sha256Hex } from '../../src/s3-presign.js';
 
-// PUTs only through the URLs the supervisor attached, so a wrong key, epoch or signature fails at the S3 stub
+// Learns its host from the queue at registration, as an agent does, and derives its output keys the way a real runner does (`<host>/<ticket>/e<epoch>/<name>` in `lane-out`) and PUTs with its own signed request, so a wrong host, epoch or signature fails at the S3 stub
 export class StubRunner {
-  constructor(world, { login = logins.a1, fetchImpl = globalThis.fetch } = {}) {
-    Object.assign(this, { world, login, fetchImpl, claimed: null, urls: null, nextSeq: 0 });
+  constructor(world, { login = logins.a1, s3, tmpDir } = {}) {
+    Object.assign(this, { world, login, s3, tmpDir, host: null, claimed: null });
   }
 
   client() {
@@ -13,11 +16,10 @@ export class StubRunner {
 
   async claim(options) {
     await liftBackoff(this.world);
+    this.host = (await call(await this.client(), 'ld_register', 'test', 1, null)).host;
     const claimed = await claim(await this.client(), options);
     if (claimed.status !== 'claimed') throw new Error(`stub runner claimed nothing: ${JSON.stringify(claimed)}`);
     this.claimed = claimed;
-    this.urls = null;
-    this.nextSeq = 0;
     return claimed;
   }
 
@@ -26,20 +28,17 @@ export class StubRunner {
   }
 
   async heartbeat() {
-    const answer = await heartbeat(await this.client(), this.claimed);
-    const { rows: [{ urls }] } = await (await this.world.su()).query(
-      "SELECT CASE WHEN urls->>'epoch' = epoch::text THEN urls END AS urls FROM lane_dispatch.tickets WHERE id = $1", [this.claimed.id]);
-    this.urls = answer.fenced ? null : urls;
-    return { ...answer, urls: this.urls };
+    return heartbeat(await this.client(), this.claimed);
   }
 
-  async log(text, seq = this.nextSeq++) {
-    return call(await this.client(), 'ld_log', this.claimed.id, this.claimed.epoch, this.claimed.token, seq, Buffer.from(text));
+  outputKey(name) {
+    return `${this.host}/${this.claimed.id}/e${this.claimed.epoch}/${name}`;
   }
 
   async put(name, body) {
-    const res = await this.fetchImpl(this.urls[name], { method: 'PUT', body });
-    if (res.status !== 200) throw new Error(`stub runner PUT ${name} answered ${res.status}: ${await res.text()}`);
+    const file = path.join(this.tmpDir, `${name}-${crypto.randomBytes(4).toString('hex')}`);
+    fs.writeFileSync(file, body);
+    await this.s3.putObjectFromFile('lane-out', this.outputKey(name), file);
     return { sha256: sha256Hex(body), bytes: body.length };
   }
 

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { ConfigError, DEFAULT_GLOBAL_CONFIG, loadGlobalConfig, pullConfigured, pullRunners, pushRunners } from '../src/config.js';
 import { freshEnv, writeGlobalConfig } from './helpers.js';
+import { assertCanaryFails } from './helpers/mutant-module.js';
 
 /** BRAIN-1036 R2: the pull-transport config keys and their load-time refusals (T9, T20). */
 
@@ -95,17 +96,36 @@ test('runners[].transport: ssh is optional for pull only, and the value is check
 test('lanePull: defaults merge under what the file sets, and bad values are refused by name', () => {
   const cfg = load({ lanePull: { pollMs: 5000, rustfs: { endpoint: 'https://pitelite:9000' } } });
   assert.equal(cfg.lanePull.pollMs, 5000);
-  assert.equal(cfg.lanePull.urlTtlSec, 900);
   assert.equal(cfg.lanePull.rustfs.region, 'us-east-1');
   assert.equal(cfg.lanePull.rustfs.snapBucket, 'lane-snap');
   assert.equal(cfg.lanePull.rustfs.endpoint, 'https://pitelite:9000');
   refusesNaming({ lanePull: { enabled: 'yes' } }, 'lanePull.enabled');
   refusesNaming({ lanePull: { pollMs: 0 } }, 'lanePull.pollMs');
-  refusesNaming({ lanePull: { urlRefreshSec: 900 } }, 'lanePull.urlRefreshSec');
-  refusesNaming({ lanePull: { urlTtlSec: 604_801 } }, 'lanePull.urlTtlSec');
-  assert.equal(load({ lanePull: { urlTtlSec: 604_800 } }).lanePull.urlTtlSec, 604_800);
   refusesNaming({ lanePull: { rustfs: { endpoint: 'pitelite:9000' } } }, 'lanePull.rustfs.endpoint');
   refusesNaming({ lanePull: 'on' }, 'lanePull');
+});
+
+async function deadlineRefusals(loadModule) {
+  const { loadGlobalConfig: loadFrom } = await loadModule('config.js');
+  const { home } = freshEnv();
+  const prior = process.env.LANE_BROKER_HOME;
+  process.env.LANE_BROKER_HOME = home;
+  try {
+    for (const key of ['unprovenCancelLostAfterMs', 'queueUnreachableAfterMs']) {
+      writeGlobalConfig(home, { version: 1, lanePull: { [key]: 0 } });
+      assert.throws(() => loadFrom(), (err) => err.message.includes(`"lanePull.${key}"`), `${key} of 0 is refused by name`);
+    }
+  } finally {
+    process.env.LANE_BROKER_HOME = prior;
+  }
+}
+
+test('lanePull.unprovenCancelLostAfterMs (10 min) and queueUnreachableAfterMs (15 min) replace the quarantine and URL keys, and the validator is what refuses a bad value', async () => {
+  const { lanePull } = DEFAULT_GLOBAL_CONFIG;
+  assert.deepEqual([lanePull.unprovenCancelLostAfterMs, lanePull.queueUnreachableAfterMs], [600_000, 900_000]);
+  for (const gone of ['quarantineLostAfterMs', 'urlTtlSec', 'urlRefreshSec']) assert.equal(lanePull[gone], undefined, `${gone} is gone`);
+  await deadlineRefusals(async (file) => import(`../src/${file}`));
+  await assertCanaryFails('config.js', ["'unprovenCancelLostAfterMs', 'queueUnreachableAfterMs', 'prepareBudgetMs', 'blobRefreshAfterDays'", "'blobRefreshAfterDays'"], deadlineRefusals);
 });
 
 test('lanePull.enabled needs every connection key, and names the missing ones', () => {
@@ -140,4 +160,29 @@ test('pullConfigured: enabled, a pull runner and every key, from the config alon
   } finally {
     fs.readFileSync = real;
   }
+});
+
+const LEDGER_FLOOR = 35 * 24 * 3_600_000;
+
+async function ledgerRetentionRefusal(loadModule) {
+  const { loadGlobalConfig } = await loadModule('config.js');
+  const attempt = (ledgerRetentionMs) => {
+    const { home } = freshEnv();
+    writeGlobalConfig(home, { version: 1, lanePull: { ledgerRetentionMs } });
+    const prior = process.env.LANE_BROKER_HOME;
+    process.env.LANE_BROKER_HOME = home;
+    try {
+      return loadGlobalConfig().lanePull.ledgerRetentionMs;
+    } finally {
+      process.env.LANE_BROKER_HOME = prior;
+    }
+  };
+  assert.equal(attempt(LEDGER_FLOOR), LEDGER_FLOOR, 'the floor itself is allowed');
+  assert.throws(() => attempt(LEDGER_FLOOR - 1), /lanePull\.ledgerRetentionMs.*35 days/, 'below the queue backup retention is refused by name');
+}
+
+test('lanePull.ledgerRetentionMs defaults to 45 days and is refused below the 35 day backup retention; the check is what refuses', async () => {
+  assert.equal(DEFAULT_GLOBAL_CONFIG.lanePull.ledgerRetentionMs, 45 * 24 * 3_600_000);
+  await ledgerRetentionRefusal((file) => import(`../src/${file}`));
+  await assertCanaryFails('config.js', ['assert(pull.ledgerRetentionMs >= LEDGER_RETENTION_FLOOR_MS,', 'assert(true || pull.ledgerRetentionMs >= LEDGER_RETENTION_FLOOR_MS,'], ledgerRetentionRefusal);
 });

@@ -8,6 +8,7 @@ import { ensureStateDirs, paths } from '../src/state.js';
 import { freshEnv } from './helpers.js';
 import { recordFsyncs } from './helpers/fsync-recorder.js';
 import { harnessClient } from './helpers/queue-fixture.js';
+import { assertCanaryFails } from './helpers/mutant-module.js';
 import { pgSkipOption } from './lane-db-harness.js';
 import { startDispatchCluster, World, logins, call, claim, start, simulateRestore, tid } from './lane-dispatch-fixture.js';
 
@@ -22,7 +23,7 @@ async function preparedTicket() {
   ensureStateDirs(state);
   const attempt = await createAttempt(state, ID);
   await createEnvelope(state, {
-    logicalId: ID, binding: { protocol: 1, ticketId: ID, generation: 0, manifestHash: 'mh' }, nonce: 'n', header: { protocol: 1, ticketId: ID, argv: ['true'] },
+    logicalId: ID, binding: { protocol: 1, ticketId: ID, generation: 0, manifestHash: 'mh' }, header: { protocol: 1, ticketId: ID, argv: ['true'] },
     repoKey: 'repoA', lane: 'test', laneKey: 'repoA:test', cpuCores: 1, memoryBytes: 1000, requiresTags: [], priority: 0,
   });
   await recordSnapshot(state, ID, SNAPSHOT);
@@ -219,7 +220,7 @@ describe('enqueue intent without a database', () => {
     ensureStateDirs(state);
     const { generation } = await createAttempt(state, ID);
     await createEnvelope(state, {
-      logicalId: ID, binding: { protocol: 1, ticketId: ID, generation: 0, manifestHash: 'mh' }, nonce: 'n', header: {}, repoKey: 'repoA', lane: 'test',
+      logicalId: ID, binding: { protocol: 1, ticketId: ID, generation: 0, manifestHash: 'mh' }, header: {}, repoKey: 'repoA', lane: 'test',
       laneKey: 'k', cpuCores: 1, memoryBytes: 1, requiresTags: [], priority: 0,
     });
     const queue = instrumented({ queueRef: assert.fail, enqueueFenced: assert.fail });
@@ -269,4 +270,15 @@ describe('enqueue intent locking without a database', () => {
     await Promise.all([bump(), bump(), bump()]);
     assert.equal(readAttempt(state, ID).counter, 3);
   });
+});
+
+const minProtocolOf = async (load, envelope) => (await load('pull-enqueue.js')).enqueueArgs({ logicalId: ID, snapshot: SNAPSHOT, ...envelope }).minProtocol;
+const MIN_PROTOCOL_SCENARIO = async (load) => {
+  assert.equal(await minProtocolOf(load, { minProtocol: 2 }), 2, 'an envelope that names a minimum sends it');
+  assert.equal(await minProtocolOf(load, {}), undefined, 'one that names none leaves it to the queue default');
+};
+
+test('enqueueArgs sends the envelope\'s min_protocol and nothing when the envelope has none; the field is what carries it', async () => {
+  await MIN_PROTOCOL_SCENARIO((file) => import(`../src/${file}`));
+  await assertCanaryFails('pull-enqueue.js', ['    ...(envelope.minProtocol === undefined ? {} : { minProtocol: envelope.minProtocol }),\n', ''], MIN_PROTOCOL_SCENARIO);
 });

@@ -35,7 +35,7 @@ import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processSt
 import { isPidAlive, isProcessAlive } from './process-liveness.js';
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
-import { reloadGlobalConfig, isDispatchOnly, pushRunners } from './config.js';
+import { reloadGlobalConfig, isDispatchOnly, pushRunners, pullRunners, pullQueuedTimeoutMs } from './config.js';
 import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope, scopeMemoryPeakReader, scopeMemoryPeakTracker, enforcementLabel } from './cpu-limit.js';
 import { stateHome, RUNNER_SHUTDOWN_REASON, LOST_REASONS } from './state.js';
 import { childExitSafeFlags } from './node-exit-safe.js';
@@ -45,13 +45,18 @@ import { expectedRunMs } from './estimates-history.js';
 import { missingLocalDeps, speedRatio, localRunEstimateMs, localWaitMs, chooseSpeedPlacement, externalCpuSlots, DEFAULT_REMOTE_OVERHEAD_MS, runnerRunEstimateMs, runnerRunEstimatesMs, runnerWaitMs, placementOf, RUN_ESTIMATE_WINDOW_MS } from './speed-placement.js';
 import { starvedStaleMs } from './external-cpu.js';
 import { effectiveNow } from './priority-clock.js';
-import { isPriorityTier, priorityAuditOf, priorityOf, resolveLaneNice, waitedMs } from './priority.js';
+import { isPriorityTier, priorityAuditOf, priorityOf, pullQueuePriority, resolveLaneNice, waitedMs } from './priority.js';
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
-import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, noRunnerLocallyIneligibleRefusal, dispatchOnlyRefusal, LOCAL_REFUSED_EXIT_CODE, locallyRefusedNow, localWindowAllowing, leaseCpuCores, terminalRowDefaults } from './resources.js';
+import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, noRunnerLocallyIneligibleRefusal, dispatchOnlyRefusal, LOCAL_REFUSED_EXIT_CODE, NO_RUNNER_EXIT_CODE, locallyRefusedNow, localWindowAllowing, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness, recordEnforcement } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
-import { remoteCpuAllocation, selectRunner, dispatchRemote, remoteCancel, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, estimatedFinish, haveDeadlineFor, DRAIN_MOVE_REASON, SOURCE_LEAVING_REASONS, QUEUED_TOO_LONG_REASON, REFUSED_MOVE_TARGET } from './remote-client.js';
+import { placeForPull } from './pull-placement.js';
+import { publicationBindings, publicationOf } from './pull-publication.js';
+import { pullContextFor } from './pull-services.js';
+import { withRepoIdentity } from './pull-snapshot.js';
+import { assertWithdrawCommitted, PrepareAbandoned, preparePullTicketWithRetry, proveNeverEnqueued, pullExitCode, runPullTicket, sleepUnlessAborted, withdrawQueued as withdrawPullQueued } from './pull-ticket.js';
+import { remoteCpuAllocation, selectRunner, dispatchRemote, remoteCancel, buildExecHeader, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, estimatedFinish, haveDeadlineFor, DRAIN_MOVE_REASON, SOURCE_LEAVING_REASONS, QUEUED_TOO_LONG_REASON, REFUSED_MOVE_TARGET } from './remote-client.js';
 import { runnerUnavailableReason } from './runner-schedule.js';
 import { remoteExcludeWarnings } from './remote-exclude.js';
 import { buildManifest, RemoteIneligibleError, validateRemoteDeps } from './remote-manifest.js';
@@ -59,7 +64,7 @@ import { ARTIFACTS_CAPABILITY, artifactLimitsOf, installArtifacts } from './remo
 import { DEPS_KEY_FILES_CAPABILITY, DEPS_KEY_FILES_COVER_CAPABILITY, EXECUTION_CEILING_CAPABILITY, REMOTE_WITHDRAW_CAPABILITY } from './capabilities.js';
 import { SNAPSHOT_GZIP_CAPABILITY, TRANSFER_GZIP } from './remote-gzip.js';
 import { BLOB_CACHE_CAPABILITY } from './remote-blobs.js';
-import { createAttempt, readAttempt, updateAttempt, runnerPhaseRecorder, fallbackToLocal, publishTerminal, remoteCancelledResult, remoteCancelExitDeadlineMs, REMOTE_CANCEL_ABANDONED_EXIT, CANCELLING_LOCK_TIMEOUT_MS } from './attempts.js';
+import { createAttempt, readAttempt, updateAttempt, runnerPhaseRecorder, fallbackToLocal, publishTerminal, remoteCancelledResult, remoteCancelExitDeadlineMs, REMOTE_CANCEL_ABANDONED_EXIT, DUPLICATE_SUBMISSION_EXIT, CANCELLING_LOCK_TIMEOUT_MS } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX, hostCpuLoad, ticketCpuEstimate } from './admission.js';
 import { relayedUsage, relayedDeps, relayedTransfer, snapshotLine } from './remote-relay.js';
 import { maybeDailyGc, createLeaseTmpDir, retireLeaseTmpDir, tmpEnv } from './gc.js';
@@ -790,6 +795,19 @@ const estimateMsOf = (model, runner) => {
  */
 export const historyIncludeFor = (repoId) => JSON.stringify({ repo: repoId }).slice(1, -1);
 
+const historyHasRow = (root, id) => readRecentHistoryRows(paths(root).history, { include: JSON.stringify({ id }).slice(1, -1) }).some((row) => row.id === id);
+
+/**
+ * The result file, then its history row (BRAIN-549: settled before the result is published, so a caller that reads history once `lane run`
+ * returns finds the row). A pull result `rebuilt` from the ledger replaces one that was lost, so it never counts the ticket twice.
+ */
+export function recordSettledResult(root, enriched, result, { fsync = false, rebuilt = false, runner = null, placement = null } = {}) {
+  const contentKey = settledContentKey(enriched);
+  atomicWriteJson(enriched.resultPath, result, { fsync });
+  if (rebuilt && historyHasRow(root, enriched.id)) return;
+  appendHistory(root, historyRow(enriched, { ...result, ...(runner ? { runner } : {}), ...(placement ? { placement } : {}) }, { contentKey, contentKeyVerified: contentKey !== null }));
+}
+
 /** BRAIN-899 B2: the history a placement ranks on -- the run-estimate window of this repo's rows, read once and passed on. */
 const placementHistoryRows = (root, enriched, now = Date.now()) =>
   readRecentHistoryRows(paths(root).history, { sinceMs: now - RUN_ESTIMATE_WINDOW_MS, include: historyIncludeFor(enriched.repoId) });
@@ -943,10 +961,15 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   // the attempt generation every fence below acts on: 0 for a first attempt, the fallback's generation for a rebind
   const gen = rebind ? rebind.generation : 0;
   let withdrawn = null;
+  // set once this process queues the ticket for a runner's pull; a push attempt is then known not to be one, so its fallbacks read nothing extra
+  let viaPull = false;
+  const assertPullFallbackAllowed = () => {
+    if (viaPull) assertWithdrawCommitted(root, enriched.id);
+  };
   if (!rebind) {
     // BRAIN-321: a retried `--id` submission is the same ticket: dedup BEFORE any probe or dispatch, under the attempt's lock.
     const created = await createAttempt(root, enriched.id, { runner: null, resources: enriched.resources, logPath: enriched.logPath, cwd: enriched.cwd, key: enriched.key, ...(enriched.clientId ? { refuseIf: () => existingTicket(root, enriched.id) } : {}) });
-    if (created.existing) process.exit(0);
+    if (created.existing) process.exit(DUPLICATE_SUBMISSION_EXIT);
   }
 
   // Reuses the SAME two writers a local child's output goes through
@@ -967,16 +990,19 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     if (stderrForward) stderrForward.write(chunk);
   };
 
+  const finishOutput = async () => {
+    await logWriter.finish();
+    if (stdoutForward) await stdoutForward.drain();
+    if (stderrForward) await stderrForward.drain();
+  };
+
   let selectedRunner = null;
   // BRAIN-899 A2: the prediction of the FINAL dispatch of this attempt, so the history row it publishes can be joined to the wait
   // and run that dispatch actually saw. Every dispatch site sets it; an unranked one clears it.
   let placement = null;
   const placementField = () => (placement ? { placement } : { placement: undefined });
-  function writeResultSync(result, { fsync = false } = {}) {
-    // BRAIN-549: settled before the result is published, so a caller that reads history once `lane run` returns finds the row
-    const contentKey = settledContentKey(enriched);
-    atomicWriteJson(enriched.resultPath, result, { fsync });
-    appendHistory(root, historyRow(enriched, { ...result, ...(selectedRunner ? { runner: selectedRunner } : {}), ...(placement ? { placement } : {}) }, { contentKey, contentKeyVerified: contentKey !== null }));
+  function writeResultSync(result, { fsync = false, rebuilt = false } = {}) {
+    recordSettledResult(root, enriched, result, { fsync, rebuilt, runner: selectedRunner, placement });
   }
 
   /**
@@ -993,11 +1019,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
    */
   async function publishAndExit(generation, buildConfirmedResult) {
     const { published, finalResult } = await publishAttemptTerminal(root, enriched.id, generation, {
-      drain: async () => {
-        await logWriter.finish();
-        if (stdoutForward) await stdoutForward.drain();
-        if (stderrForward) await stderrForward.drain();
-      },
+      drain: finishOutput,
       buildConfirmedResult,
       buildCancelledResult: () => remoteCancelledResult(enriched.id, attemptStartedAt),
       writeResult: writeResultSync,
@@ -1030,6 +1052,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
    * names it ORPHANED-REMOTE and `lane cancel` cancels it on the runner -- because running it locally too could execute it twice.
    */
   async function abandonRebind(runner, reason, { neverStarted = false } = {}) {
+    assertPullFallbackAllowed();
     const where = runner ? runner.name : 'no runner';
     if (withdrawn && !neverStarted) {
       const line = `lane: remote-rebind: ${enriched.id}: ${where}: ${reason} — outcome unknown, the job may be running there; not re-running it locally (see lane status, lane cancel)\n`;
@@ -1058,6 +1081,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
    *  either, another runner may take it (BRAIN-727).
    *  `noRunner`: the fallback is "the fleet had no usable runner", which a `localRefused` lane reports as retryable. */
   async function fallbackOrRefuse(runner, reason, { rebindable = false, retryWhenBlocked = false, neverStarted = false, noRunner = false, retryable = noRunner, failureKind } = {}) {
+    assertPullFallbackAllowed();
     if (rebind) return abandonRebind(runner, reason, { neverStarted: neverStarted || withdrawn === null });
     const fb = await fallbackToLocal(root, enriched.id, reason);
     if (!fb.ok) {
@@ -1207,6 +1231,137 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   // BRAIN-623: `lane status` names a runner that lacked what the lane needs; a runner that passed is ready again
   if (placeOptions && Object.values(placeOptions.readinessNeeds).some(hasNeed)) {
     await recordReadiness(root, readiness ?? {}, ready ?? [], Date.now()).catch(() => {});
+  }
+  async function exitUnresolved(reason, exitCode = 1) {
+    const line = `lane: remote: ${enriched.id}: ${reason} (see lane status, lane cancel)\n`;
+    process.stderr.write(line);
+    writeBrokerLog(root, line);
+    await finishOutput();
+    process.exit(exitCode);
+    return { fallback: false };
+  }
+
+  async function exitSettled(exitCode) {
+    await finishOutput();
+    clearTicketMarkers(root, enriched.id);
+    process.exit(Number.isInteger(exitCode) ? exitCode : 1);
+    return { fallback: false };
+  }
+
+  /** The ticket waits in the lane queue for a runner to claim it. It only ever leaves by a settled result, an unresolved stop, or a withdraw the queue committed (then the never-started path). */
+  async function dispatchViaPull(services, reason) {
+    testDrainAt(root, 'dispatch');
+    viaPull = true;
+    try {
+      await updateAttempt(root, enriched.id, gen, { transport: 'pull', ...placementField() }, { refuseWhileMigrating: true });
+    } catch (err) {
+      if (!(err instanceof MigrationInProgressError)) throw err;
+      process.stderr.write(`lane: ${err.message}\n`);
+      await publishAndExit(gen, () => migrationRefusalResult(enriched));
+      return { fallback: false };
+    }
+    const line = `lane: queuing for pull dispatch: ${reason}\n`;
+    process.stderr.write(line);
+    writeBrokerLog(root, line);
+    const [pullRunner] = pullRunners(globalCfg);
+    const { worktreeRoot } = enriched.remote;
+    const header = withRepoIdentity(buildExecHeader({
+      ...enriched.remote,
+      runner: pullRunner,
+      argv: enriched.cmd,
+      lane: enriched.lane,
+      ticketId: enriched.id,
+      generation: gen,
+      noProgressTimeoutMs: enriched.noProgressTimeoutMs ?? globalCfg.noProgressTimeoutMs,
+      silenceTimeoutMs: enriched.silenceTimeoutMs ?? globalCfg.silenceTimeoutMs,
+      priorityRequested: enriched.priorityRequested,
+      group: enriched.group,
+      ...classTransport(enriched, resolveClasses(globalCfg, root)),
+      priorityAccruedMs: waitedMs(enriched, effectiveNow(root)),
+    }), worktreeRoot);
+    const publication = publicationOf(enriched, { placement, attemptStartedAt, refusalExit: isDispatchOnly(globalCfg) ? NO_RUNNER_EXIT_CODE : undefined });
+    const ctx = {
+      ...pullContextFor(root, globalCfg, services, { id: enriched.id, generation: gen }),
+      ...publicationBindings(root, publication),
+      prepare: {
+        worktreeRoot,
+        manifest,
+        envelopeFields: {
+          binding: { protocol: header.protocol, ticketId: enriched.id, generation: gen, manifestHash: manifest.manifestHash },
+          header,
+          repoKey: enriched.remote.repoKey,
+          lane: enriched.lane,
+          laneKey: enriched.key,
+          cpuCores: enriched.remote.cpuCores,
+          memoryBytes: enriched.remote.memoryBytes ?? 0,
+          requiresTags: enriched.remote.requiresTags ?? [],
+          priority: pullQueuePriority(enriched.priorityRequested),
+          queuedTimeoutMs: pullQueuedTimeoutMs(globalCfg, enriched.lane),
+          publication,
+          worktreeRoot,
+          declaredArtifacts: enriched.remote.remoteArtifacts ?? [],
+          artifactLimits: artifactLimitsOf(globalCfg),
+        },
+      },
+      forward: stdoutForward ?? undefined,
+      cancelRequested: () => abortSignal.aborted,
+      sleep: (ms) => sleepUnlessAborted(ms, abortSignal),
+    };
+    try {
+      await preparePullTicketWithRetry(ctx);
+    } catch (err) {
+      return prepareFailed(ctx, err);
+    }
+    const outcome = await runPullTicket({ ...ctx, prepare: undefined });
+    const exitCode = pullExitCode(outcome);
+    if (outcome.outcome === 'unresolved') return exitUnresolved(`pull dispatch unresolved: ${outcome.reason}${outcome.error ? ` (${outcome.error})` : ''}`, exitCode);
+    if (exitCode !== undefined) return exitSettled(exitCode);
+    if (outcome.outcome === 'withdrawn') {
+      const committed = outcome.proof === true || (await withdrawPullQueued(ctx)).proof;
+      if (!committed) {
+        await updateAttempt(root, enriched.id, gen, { unresolved: 'pull withdraw was not committed by the queue' });
+        return exitUnresolved('pull withdraw was not committed by the queue');
+      }
+      return fallbackOrRefuse(null, outcome.reason ?? 'withdrawn from the pull queue', { neverStarted: true, noRunner: true, retryable: true });
+    }
+    process.stderr.write(`lane-broker supervisor: could not settle pull ticket ${enriched.id} (${outcome.outcome})\n`);
+    await finishOutput();
+    process.exit(1);
+    return { fallback: false };
+  }
+
+  async function prepareFailed(ctx, err) {
+    const reason = `pull snapshot could not be prepared: ${err.message}`;
+    if (!(await proveNeverEnqueued(ctx)).proof) {
+      await updateAttempt(root, enriched.id, gen, { unresolved: reason });
+      return exitUnresolved(reason);
+    }
+    if (err instanceof PrepareAbandoned && err.reason === 'cancelled') {
+      await publishAndExit(gen, () => remoteCancelledResult(enriched.id, attemptStartedAt));
+      return { fallback: false };
+    }
+    return fallbackOrRefuse(null, reason, { neverStarted: true, noRunner: true, retryable: true });
+  }
+
+  if (!rebind) {
+    const skippedSummary = () => (skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : 'no runners configured');
+    const route = await placeForPull({
+      root,
+      pushChosen: Boolean(runner),
+      cfg: globalCfg,
+      repoKey: enriched.remote.repoKey,
+      requiresTags: enriched.remote.requiresTags,
+      locallyIneligible: () => localIneligibility() || isDispatchOnly(globalCfg),
+      couldRunLocally: async () => (await couldAdmitNow(root, globalCfg, enriched)).admit || (await couldBypassNow(root, globalCfg, enriched)).admit,
+    });
+    if (route.reason && route.route === 'legacy') {
+      const line = `lane: pull-dispatch: ${route.reason}; using the push flow\n`;
+      process.stderr.write(line);
+      writeBrokerLog(root, line);
+    }
+    if (route.route === 'refuse') return fallbackOrRefuse(null, `${skippedSummary()}; ${route.reason}`, { rebindable: true, noRunner: true, retryable: true });
+    if (route.route === 'local') return fallbackOrRefuse(null, `${skippedSummary()}; local can run it now, not queuing for pull`, { rebindable: true });
+    if (route.route === 'pull') return dispatchViaPull(route.services, skippedSummary());
   }
   // A ticket this machine would refuse has no local queue to wait in, so with every runner busy it waits on the best one: that
   // runner's own broker holds the ticket until it has room (what every empty-queue runner did before headroom ranking).
@@ -2021,7 +2176,7 @@ async function main() {
   try {
     const queued = await enqueue(root, enriched, globalCfg, { ownerGeneration: attemptGeneration });
     // BRAIN-321: this id was already submitted (a retried `lane run --detach --id`); its first supervisor owns it.
-    if (queued.existing) process.exit(0);
+    if (queued.existing) process.exit(DUPLICATE_SUBMISSION_EXIT);
     for (const target of queued.supersededTargets ?? []) await stopSupersededTicket(target);
     if (queued.priorityDemoted) process.stderr.write('lane run: priority high demoted to medium (repo already has a queued high ticket)\n');
   } catch (err) {
@@ -2040,6 +2195,7 @@ async function main() {
   async function tryRebind(localBlocked = false, heldByKey = null) {
     // A ticket never goes back to a runner it left, was refused by, or was ever dispatched to (nor to one it is on).
     const attempt = readAttempt(root, ticket.id);
+    if (attempt?.transport === 'pull') return;
     const left = new Set([...(attempt?.moves ?? []).flatMap((m) => [m.from, m.to]), ...(attempt?.refusedRunners ?? []), ...(attempt?.dispatchedRunners ?? [])]);
     const candidates = pushRunners(globalCfg).filter((r) => !left.has(r.name));
     if (candidates.length === 0) return;
@@ -2604,7 +2760,7 @@ async function main() {
   });
 }
 
-export { CappedLogWriter, recordConfigReloadError, clearConfigReloadWarning };
+export { CappedLogWriter, LOG_CAP_BYTES, recordConfigReloadError, clearConfigReloadWarning };
 
 // Guard so this module can be imported (e.g. by tests exercising
 // CappedLogWriter directly) without running the supervisor for real; it only

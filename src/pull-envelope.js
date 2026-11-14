@@ -1,15 +1,18 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { atomicWriteJson, ensureDurableDir, paths, withLock } from './state.js';
+import { atomicWriteJson, ensureDurableDir, fsyncDirectory, paths, readJsonSafe, withLock } from './state.js';
 
 export const ENVELOPE_VERSION = 1;
 const TICKET_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const REQUIRED_FIELDS = ['logicalId', 'binding', 'nonce', 'header', 'repoKey', 'lane', 'laneKey', 'cpuCores', 'memoryBytes', 'requiresTags', 'priority'];
+const REQUIRED_FIELDS = ['logicalId', 'binding', 'header', 'repoKey', 'lane', 'laneKey', 'cpuCores', 'memoryBytes', 'requiresTags', 'priority'];
 const REQUIRED_BINDING_FIELDS = ['protocol', 'generation', 'manifestHash'];
 
 export const pullTicketDir = (root, id) => path.join(paths(root).pull, id);
 const LOCK_TIMEOUT_MS = 500;
+
+const TICKET_DIR_NAME = /^[0-9a-f-]{36}$/;
+export const owedCancelFile = (root, id) => path.join(pullTicketDir(root, id), 'cancel-owed.json');
 
 export const envelopeFile = (root, id) => path.join(pullTicketDir(root, id), 'envelope.json');
 
@@ -70,3 +73,32 @@ export async function recordSnapshot(root, id, snapshot, { lockTimeoutMs } = {})
     return next;
   }, { lockTimeoutMs });
 }
+
+/** The cancel a ticket owes its queue row, kept apart from the attempt so it outlives the published result. */
+export const writeOwedCancel = (root, id, owed) => atomicWriteJson(owedCancelFile(root, id), owed, { fsync: true });
+
+export function owedCancelIds(root) {
+  try {
+    return fs.readdirSync(paths(root).pull).filter((name) => TICKET_DIR_NAME.test(name) && fs.existsSync(owedCancelFile(root, name)));
+  } catch {
+    return [];
+  }
+}
+
+/** Updates a marker that still exists, under the ticket lock; a marker that was delivered or expired meanwhile is never written back, and neither is its directory. Returns whether it wrote. */
+export async function touchOwedCancel(root, id, patch) {
+  if (!fs.existsSync(pullTicketDir(root, id))) return false;
+  return withTicketLock(root, id, () => {
+    const current = readJsonSafe(owedCancelFile(root, id));
+    if (current === null) return false;
+    writeOwedCancel(root, id, { ...current, ...patch });
+    return true;
+  });
+}
+
+export const readOwedCancel = (root, id) => readJsonSafe(owedCancelFile(root, id));
+
+export const clearOwedCancel = (root, id) => withTicketLock(root, id, () => {
+  fs.rmSync(owedCancelFile(root, id), { force: true });
+  fsyncDirectory(pullTicketDir(root, id));
+});

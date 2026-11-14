@@ -12,7 +12,6 @@ const ID = '00000000-0000-0000-0000-000000000042';
 const fields = (overrides = {}) => ({
   logicalId: ID,
   binding: { protocol: 1, ticketId: ID, generation: 3, manifestHash: 'mh' },
-  nonce: 'nonce-1',
   header: { protocol: 1, ticketId: ID, argv: ['true'] },
   repoKey: 'repoA',
   lane: 'test',
@@ -51,10 +50,10 @@ test('create refuses to overwrite, and a missing required field names itself', a
   const { state } = freshEnv();
   const created = await createEnvelope(state, fields());
   assert.deepEqual(readEnvelope(state, ID), created);
-  await assert.rejects(createEnvelope(state, fields({ nonce: 'other' })), { code: 'EEXIST' });
-  assert.equal(readEnvelope(state, ID).nonce, 'nonce-1');
-  const { nonce, ...withoutNonce } = fields();
-  await assert.rejects(createEnvelope(state, withoutNonce), /lacks nonce/);
+  await assert.rejects(createEnvelope(state, fields({ lane: 'other' })), { code: 'EEXIST' });
+  assert.equal(readEnvelope(state, ID).lane, 'test');
+  const { header, ...withoutHeader } = fields();
+  await assert.rejects(createEnvelope(state, withoutHeader), /lacks header/);
   await assert.rejects(createEnvelope(state, fields({ binding: { protocol: 1 } })), /binding\.generation, binding\.manifestHash/);
   await assert.rejects(createEnvelope(state, fields({ logicalId: '../escape' })), /ticket uuid/);
 });
@@ -113,12 +112,12 @@ test('create and recordSnapshot take the per-ticket lock: a held lock makes them
   let release;
   const holding = withTicketLock(state, ID, () => new Promise((resolve) => { release = resolve; }));
   try {
-    await assert.rejects(createEnvelope(state, fields({ nonce: 'racer' }), { lockTimeoutMs: 100 }), /lock|timed out|timeout/i);
+    await assert.rejects(createEnvelope(state, fields({ lane: 'racer' }), { lockTimeoutMs: 100 }), /lock|timed out|timeout/i);
     await assert.rejects(recordSnapshot(state, ID, SNAPSHOT, { lockTimeoutMs: 100 }), /lock|timed out|timeout/i);
   } finally {
     release();
     await holding;
   }
   assert.equal(readEnvelope(state, ID).snapshot, undefined);
-  assert.equal(readEnvelope(state, ID).nonce, 'nonce-1');
+  assert.equal(readEnvelope(state, ID).lane, 'test');
 });

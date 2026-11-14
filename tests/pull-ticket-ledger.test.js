@@ -96,6 +96,7 @@ const SCENARIOS = {
       await Promise.all([1, 2, 3].map(() => fx.step({ lockTimeoutMs: 10_000 })));
     });
     assert.equal(fx.writes.length, 1, 'one publishTerminal');
+    assert.equal(fx.stub.requests.filter((r) => r.method === 'GET' && r.path.endsWith('/artifacts')).length, 1, 'the artifacts were fetched once: the steppers that lost the lock found the decision and its staged copy');
     assert.equal(recorder.fsyncedPaths().filter((p) => p === installed(fx)).length, 1, 'one artifacts install');
     assert.equal(readLedger(fx.state, fx.id).decision.kind, 'finished');
     assert.equal(fs.readdirSync(ledgerDir(fx.state)).filter((f) => f.endsWith('.json')).length, 1);
@@ -156,7 +157,7 @@ const SCENARIOS = {
     await fx.step().catch(() => {});
     assert.equal(fs.existsSync(installed(fx)), false, 'artifacts were installed for a superseded generation');
     assert.equal(fx.published(), null);
-    assert.equal((await fx.step()).state, 'stale');
+    assert.equal((await fx.step().catch((err) => err)).state, 'stale');
   },
 
   'an entry ledgered for one generation applies nothing to an attempt bumped to the next, even when the caller follows the bump': async (load, w, t) => {
@@ -294,7 +295,7 @@ const SKIP_BARRIERS = 'for (const dir of dirs) ensureDurableDir(dir, { boundary:
 const EARLY_MARKER = '  const result = installArtifacts(worktreeRoot, files, patterns);\n';
 
 const CANARIES = [
-  ['T37b: with the attempt and the result both gone, the ledger entry rebuilds the result durably, once', 'pull-ticket.js', ['reconstructResult(run, entry, extra);', "{ state: 'settled', already: true, decision: entry.decision };"]],
+  ['T37b: with the attempt and the result both gone, the ledger entry rebuilds the result durably, once', 'pull-ticket.js', ['reconstructResult(run, entry, extra));', "{ state: 'settled', already: true, decision: entry.decision });"]],
   ['an entry ledgered for one generation applies nothing to an attempt bumped to the next, even when the caller follows the bump', 'pull-ticket.js', ['attempt.generation !== run.generation || entry.generation !== attempt.generation', 'attempt.generation !== run.generation']],
   ['a stale-generation caller creates no ledger entry, so the correct caller still settles the ticket', 'pull-ticket.js', ["    if (attempt && attempt.generation !== run.generation) return { state: 'stale' };\n", '']],
   ['a stale generation applies no effect: nothing is appended, installed or published', 'pull-ticket.js', ["  if (attempt && (attempt.generation !== run.generation || entry.generation !== attempt.generation)) return { state: 'stale', decision: entry.decision };\n", '']],
@@ -302,8 +303,8 @@ const CANARIES = [
   ['T7: after a crash behind the ledger, a different result on the row is reported and refused: the accepted one is published, nothing of the other is read', 'pull-ticket.js', ['    if (entry !== null) return applyEntry(run, entry);\n', '']],
   ['T25: a ledger entry decides alone: an invalid result, a valid one with other artifacts, a restored non-terminal row and an unreachable queue change nothing', 'pull-ticket.js', ['    if (entry !== null) return applyEntry(run, entry);\n', '']],
   ['T25: three steppers on one dead supervisor create one ledger entry, install once and publish once', 'pull-ticket.js', ['return withTicketLock(run.root, run.id, async () => {\n    const entry', 'return ((root, id, fn) => fn())(run.root, run.id, async () => {\n    const entry']],
-  ['a runner-forged server cancel is never queue-authored: only author queue on a cancelled row is trusted', 'pull-ticket.js', ["row?.state === 'cancelled' && row.result?.author === 'queue' && ", "row?.result?.author === 'queue' && "]],
-  ['a runner-forged server cancel is never queue-authored: only author queue on a cancelled row is trusted', 'pull-ticket.js', ["row?.state === 'cancelled' && row.result?.author === 'queue' && ", "row?.state === 'cancelled' && "]],
+  ['a runner-forged server cancel is never queue-authored: only author queue on a cancelled row is trusted', 'pull-ticket.js', ["(row.state === 'lost' || (row.state === 'cancelled' && SERVER_CANCEL_SOURCES.has(row.result.source)))", 'true']],
+  ['a runner-forged server cancel is never queue-authored: only author queue on a cancelled row is trusted', 'pull-ticket.js', ["row?.result?.author === 'queue' && (row.state", '(row.state']],
   ['T26: the published exit equals the ledgered decision whether or not a local cancel marker is present', 'pull-ticket.js', ["    cancelPrecedence: 'decision',\n", '']],
   ['T26: the published exit equals the ledgered decision whether or not a local cancel marker is present', 'pull-ticket.js', ['const outcome = ledgerAccept(run.root, entry, { hooks: run.hooks?.ledger });', 'const outcome = { entry: { v: 1, ...entry }, same: true };'], /changed while it was being applied/],
   ['T33: after a creator died behind the link, recovery makes the ledger directory durable before any effect, parents of the existing ticket directory first', 'pull-ledger.js', ['  ensureDurableDir(ledgerDir(root), { boundary: root });\n  return validate(JSON.parse(text));', '  return validate(JSON.parse(text));']],

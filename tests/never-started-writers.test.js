@@ -23,7 +23,7 @@ const SRC = fileURLToPath(new URL('../src/', import.meta.url));
 const ALLOWED = {
   // broker structured results (`results/<id>.json`): the only two writers that finalize a queued, never-leased ticket
   'scheduler.js': ['reapOrphanedQueue'],
-  'supervisor.js': ['finalizeQueuedAndExit', /* dispatch-control, never persisted as a result: */ 'abandonRebind', 'fallbackOrRefuse', 'runRemoteAttempt'],
+  'supervisor.js': ['finalizeQueuedAndExit', /* dispatch-control, never persisted as a result (the pull hooks nest in runRemoteAttempt): */ 'abandonRebind', 'fallbackOrRefuse', 'runRemoteAttempt', 'dispatchViaPull', 'prepareFailed'],
   // remote-exec's own result (`tickets/<id>/result.json`) and its classification
   'remote-runner.js': ['buildResult', 'remoteExecCommand', 'shutdownStopReason'],
   // the client's dispatch outcome objects
@@ -38,7 +38,7 @@ function occurrences() {
     fs.readFileSync(path.join(SRC, file), 'utf8').split('\n').forEach((text, i) => {
       const decl = /^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)/.exec(text);
       if (decl) fn = decl[1];
-      if (/neverStarted/.test(text) && !/^\s*(\/\/|\*|\/\*)/.test(text)) found.push({ file, line: i + 1, fn, text: text.trim() });
+      if (/\bneverStarted\b/.test(text) && !/^\s*(\/\/|\*|\/\*)/.test(text)) found.push({ file, line: i + 1, fn, text: text.trim() });
     });
   }
   return found;
