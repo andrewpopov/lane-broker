@@ -326,7 +326,8 @@ clean samples reopen a closed gate; a violating sample closes it at once. The ag
 the gate, and an unreadable config keeps the last good thresholds (logged once per distinct error). **An unknown reading is never a
 violation**: a sensor the platform lacks (Apple Silicon has no `CPU_Speed_Limit`, WSL has no thermal zones), a missing command, a
 parse failure or a failed sample leaves an open gate open and shows as `unknown`. A closed gate holds on a sample with nothing to
-judge by (no configured reading known; for `power`, AC state unknown): it neither reopens nor loses its countdown. Linux battery
+judge by (no configured reading known; for `power`, AC state unknown): it neither reopens nor loses its countdown, so editing a
+closed gate down to thresholds this platform cannot read holds it closed until a restart or until `deviceGates` is removed. Linux battery
 and thermal reads skip unreadable entries and `scope: Device` batteries (a wireless mouse), so a missing file is never read as 0. `lane status` samples live and prints one `device gates:` line; the agent's `status.json` carries each gate's
 `{closed, consecutiveOk, reading}` and its textfile metrics `lane_agent_device_gate_closed{gate="thermal|power"}` (0/1, configured
 gates only).
