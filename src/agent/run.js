@@ -56,6 +56,8 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
   let deviceGates = {};
   let deviceSampledAt = -Infinity;
   let deviceSampleError = null;
+  let deviceGatesConfig = config.deviceGates;
+  let deviceConfigError = null;
   const writeMetrics = () => {
     if (!textfileDir) return;
     try {
@@ -66,18 +68,33 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
   };
   const block = () => stopped ? 'stopping' : driver.scopeBlock() ?? claimBlock({ schedule: config.schedule, stopClaimingBeforeCloseMs: config.stopClaimingBeforeCloseMs, now: now(), draining: isDrainingNow, deviceGates });
 
+  const reloadDeviceGatesConfig = () => {
+    try {
+      deviceGatesConfig = loadGlobalConfig({ home: config.brokerHome }).deviceGates ?? null;
+      deviceConfigError = null;
+    } catch (err) {
+      if (err.message !== deviceConfigError) log(`device gates: broker config unreadable, keeping the last good thresholds: ${err.message}`);
+      deviceConfigError = err.message;
+    }
+  };
+
   async function refreshDeviceGates() {
-    if (!config.deviceGates || now() - deviceSampledAt < config.pollMs) return;
+    if (now() - deviceSampledAt < config.pollMs) return;
     deviceSampledAt = now();
+    reloadDeviceGatesConfig();
+    if (!deviceGatesConfig) {
+      deviceGates = {};
+      return;
+    }
     let sample = UNKNOWN_DEVICE_SAMPLE;
     try {
-      sample = await deviceSampler(config.deviceGates);
+      sample = await deviceSampler(deviceGatesConfig);
       deviceSampleError = null;
     } catch (err) {
       if (err.message !== deviceSampleError) log(`device gates: sampling failed, readings unknown: ${err.message}`);
       deviceSampleError = err.message;
     }
-    deviceGates = updateDeviceGates(deviceGates, config.deviceGates, sample);
+    deviceGates = updateDeviceGates(deviceGates, deviceGatesConfig, sample);
   }
 
   const deviceGateStatus = () => Object.fromEntries(Object.entries(deviceGates).map(([name, { closed, consecutiveOk, reading }]) => [name, { closed, consecutiveOk, reading }]));
@@ -111,7 +128,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
         if (upgradeRequired) log('UPGRADE REQUIRED: the queue refuses this agent\'s protocol, so no claims are made; update lane-broker and restart the agent');
         else await claimRound();
         const blocked = block();
-        core.tick({ claims: upgradeRequired ? 'stopped: upgrade required' : blocked ? `paused:${blocked}` : 'running', ...(config.deviceGates ? { deviceGates: deviceGateStatus() } : {}) });
+        core.tick({ claims: upgradeRequired ? 'stopped: upgrade required' : blocked ? `paused:${blocked}` : 'running', ...(deviceGatesConfig ? { deviceGates: deviceGateStatus() } : {}) });
         writeMetrics();
       }
       const lastSignOfLife = () => Math.max(lastLivenessAt, pingAt);

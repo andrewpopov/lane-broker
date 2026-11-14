@@ -3,7 +3,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { fingerprintOf } from './state.js';
 
-export const DEVICE_COMMAND_TIMEOUT_MS = 2000;
+const DEVICE_COMMAND_TIMEOUT_MS = 2000;
 
 const numberIn = (min, max, { integer = false } = {}) => ({
   expects: `${integer ? 'an integer' : 'a number'} from ${min} to ${max}`,
@@ -13,10 +13,12 @@ const flag = { expects: 'true or false', valid: (v) => typeof v === 'boolean' };
 const known = (v) => v !== null && v !== undefined;
 
 // One table drives validation, hysteresis and sampling; `violation` answers the block reason a reading earns, or null (unknown never violates).
+// `informative` says whether a sample carried anything to judge by: a closed gate holds, neither reopening nor resetting, on one that did not.
 const GATES = {
   thermal: {
     defaultOpenSamples: 3,
     thresholds: { maxPressureLevel: numberIn(0, 4, { integer: true }), minCpuSpeedLimit: numberIn(1, 100), maxTempC: numberIn(1, 150) },
+    informative: (cfg, { pressureLevel, cpuSpeedLimit, maxTempC }) => (cfg.maxPressureLevel !== undefined && known(pressureLevel)) || (cfg.minCpuSpeedLimit !== undefined && known(cpuSpeedLimit)) || (cfg.maxTempC !== undefined && known(maxTempC)),
     violation: (cfg, { pressureLevel, cpuSpeedLimit, maxTempC }) => {
       const hot = known(pressureLevel) && pressureLevel > cfg.maxPressureLevel
         || known(cpuSpeedLimit) && cpuSpeedLimit < cfg.minCpuSpeedLimit
@@ -27,6 +29,7 @@ const GATES = {
   power: {
     defaultOpenSamples: 1,
     thresholds: { requireAc: flag, minBatteryPercent: numberIn(0, 100) },
+    informative: (_cfg, { onAc }) => known(onAc),
     violation: (cfg, { onAc, batteryPercent }) => {
       if (onAc !== false) return null;
       if (cfg.requireAc) return 'on-battery';
@@ -41,11 +44,11 @@ const openSamplesOf = (name, gateCfg) => gateCfg.openSamples ?? GATES[name].defa
 export function deviceGatesProblem(deviceGates) {
   if (!isObject(deviceGates)) return '"deviceGates" must be an object';
   for (const [name, gateCfg] of Object.entries(deviceGates)) {
-    const gate = GATES[name];
+    const gate = Object.hasOwn(GATES, name) ? GATES[name] : null;
     if (!gate) return `"deviceGates" has unknown key "${name}"`;
     const where = `"deviceGates.${name}"`;
     if (!isObject(gateCfg)) return `${where} must be an object`;
-    for (const key of Object.keys(gateCfg)) if (key !== 'openSamples' && !gate.thresholds[key]) return `${where} has unknown key "${key}"`;
+    for (const key of Object.keys(gateCfg)) if (key !== 'openSamples' && !Object.hasOwn(gate.thresholds, key)) return `${where} has unknown key "${key}"`;
     for (const [key, { expects, valid }] of Object.entries(gate.thresholds)) if (gateCfg[key] !== undefined && !valid(gateCfg[key])) return `"deviceGates.${name}.${key}" must be ${expects}`;
     if (gateCfg.openSamples !== undefined && !(Number.isInteger(gateCfg.openSamples) && gateCfg.openSamples > 0)) return `"deviceGates.${name}.openSamples" must be a positive integer`;
     if (!Object.keys(gate.thresholds).some((key) => gateCfg[key] !== undefined)) return `${where} needs at least one of ${Object.keys(gate.thresholds).join(', ')}`;
@@ -55,10 +58,10 @@ export function deviceGatesProblem(deviceGates) {
 
 const configuredGates = (deviceGates) => Object.keys(GATES).filter((name) => deviceGates?.[name] !== undefined);
 
-export const gateViolation = (name, gateCfg, reading) => GATES[name].violation(gateCfg, reading);
+const gateViolation = (name, gateCfg, reading) => GATES[name].violation(gateCfg, reading);
 
-// Shaped like `updateGateState` in load.js. An unknown reading counts as a sample without a violation; a threshold edit restarts the
-// countdown but leaves `closed` alone, since it is no evidence the device cooled.
+// Shaped like `updateGateState` in load.js. An uninformative sample holds the state; a threshold edit restarts the countdown but
+// leaves `closed` alone, since it is no evidence the device cooled.
 export function updateDeviceGate(prev, name, gateCfg, reading) {
   const openSamples = openSamplesOf(name, gateCfg);
   const fingerprint = fingerprintOf(...Object.keys(GATES[name].thresholds).map((key) => gateCfg[key] ?? null), openSamples);
@@ -72,7 +75,7 @@ export function updateDeviceGate(prev, name, gateCfg, reading) {
     state.closed = true;
     state.consecutiveOk = 0;
     state.reason = reason;
-  } else if (state.closed) {
+  } else if (state.closed && GATES[name].informative(gateCfg, reading)) {
     state.consecutiveOk += 1;
     if (state.consecutiveOk >= openSamples) {
       state.closed = false;
@@ -114,29 +117,38 @@ const readText = (file) => {
   }
 };
 
-export function readSysfsPower(sysRoot) {
+const readNumber = (file) => {
+  const text = readText(file);
+  const value = text === null || text === '' ? null : Number(text);
+  return Number.isFinite(value) ? value : null;
+};
+
+function readSysfsPower(sysRoot) {
   const dir = path.join(sysRoot, 'class', 'power_supply');
-  const supplies = fs.readdirSync(dir).map((name) => ({ type: readText(path.join(dir, name, 'type')), online: readText(path.join(dir, name, 'online')), capacity: Number(readText(path.join(dir, name, 'capacity'))) }));
+  const supplies = fs.readdirSync(dir)
+    .map((name) => ({ type: readText(path.join(dir, name, 'type')), scope: readText(path.join(dir, name, 'scope')), online: readText(path.join(dir, name, 'online')), capacity: readNumber(path.join(dir, name, 'capacity')) }))
+    .filter((s) => s.scope !== 'Device');
   const mains = supplies.filter((s) => s.type === 'Mains');
-  const capacities = supplies.filter((s) => s.type === 'Battery' && Number.isFinite(s.capacity)).map((s) => s.capacity);
-  return { onAc: mains.length ? mains.some((s) => s.online === '1') : null, batteryPercent: capacities.length ? Math.min(...capacities) : null };
+  const capacities = supplies.filter((s) => s.type === 'Battery' && s.capacity !== null).map((s) => s.capacity);
+  const onAc = mains.some((s) => s.online === '1') ? true : mains.length > 0 && mains.every((s) => s.online === '0') ? false : null;
+  return { onAc, batteryPercent: capacities.length ? Math.min(...capacities) : null };
 }
 
-export function readSysfsMaxTempC(sysRoot) {
+function readSysfsMaxTempC(sysRoot) {
   const dir = path.join(sysRoot, 'class', 'thermal');
-  const temps = fs.readdirSync(dir).filter((name) => name.startsWith('thermal_zone')).map((name) => Number(readText(path.join(dir, name, 'temp')))).filter((t) => Number.isFinite(t));
+  const temps = fs.readdirSync(dir).filter((name) => name.startsWith('thermal_zone')).map((name) => readNumber(path.join(dir, name, 'temp'))).filter((t) => t !== null);
   return temps.length ? Math.max(...temps) / 1000 : null;
 }
 
-export const execCommand = (file, args) => new Promise((resolve, reject) => {
+const execCommand = (file, args) => new Promise((resolve, reject) => {
   execFile(file, args, { timeout: DEVICE_COMMAND_TIMEOUT_MS, encoding: 'utf8' }, (err, stdout) => (err ? reject(err) : resolve(stdout)));
 });
 
 const SENSORS = {
   darwin: {
-    pressureLevel: async ({ exec }) => parsePressureLevel(await exec('notifyutil', ['-g', 'com.apple.system.thermalpressurelevel'])),
-    cpuSpeedLimit: async ({ exec }) => parseCpuSpeedLimit(await exec('pmset', ['-g', 'therm'])),
-    power: async ({ exec }) => parsePmsetBatt(await exec('pmset', ['-g', 'batt'])),
+    pressureLevel: async ({ exec }) => parsePressureLevel(await exec('/usr/bin/notifyutil', ['-g', 'com.apple.system.thermalpressurelevel'])),
+    cpuSpeedLimit: async ({ exec }) => parseCpuSpeedLimit(await exec('/usr/bin/pmset', ['-g', 'therm'])),
+    power: async ({ exec }) => parsePmsetBatt(await exec('/usr/bin/pmset', ['-g', 'batt'])),
   },
   linux: {
     maxTempC: async ({ sysRoot }) => readSysfsMaxTempC(sysRoot),

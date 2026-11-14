@@ -7,6 +7,7 @@ import { logins, call, enqueue, claim, tid } from './lane-dispatch-fixture.js';
 import { agentPg } from './agent-harness.js';
 import { scenarioSuite, happens, sleep } from './agent-run-harness.js';
 import { readAgentStatus } from '../src/agent/store.js';
+import { writeGlobalConfig } from './helpers.js';
 
 const open = () => null;
 const offer = () => ({ freeCpu: 8, freeMem: 1e9 });
@@ -19,6 +20,23 @@ async function coreFor(rw, load, calls, onCall) {
   });
   rw.agents.push({ stop: () => core.close(), core });
   return core;
+}
+
+const brokerGates = (rw, deviceGates) => writeGlobalConfig(rw.ctx.home, { remoteBlobCache: true, deviceGates });
+
+/** A device sampler that answers only when the test feeds it a reading, so every sample is one deliberate step. */
+function scriptedSampler() {
+  const waiting = [];
+  const sampler = async () => {
+    const reading = await new Promise((resolve) => waiting.push(resolve));
+    return { thermal: reading, power: {} };
+  };
+  const asked = () => happens('the agent asked for a sample', () => waiting.length > 0);
+  const feed = async (reading) => {
+    await asked();
+    waiting.shift()(reading);
+  };
+  return { sampler, feed, asked, releaseAll: () => waiting.splice(0).forEach((resolve) => resolve({})) };
 }
 
 const SCHEDULE = { timezone: 'UTC', available: [{ days: ['mon'], from: '09:00', to: '10:00' }] };
@@ -138,8 +156,10 @@ const scenarios = {
       return { thermal: { ...readings }, power: {} };
     };
     const ticket = await rw.submit({ code: 'process.exit(0)' });
+    const deviceGates = { thermal: { maxPressureLevel: 1, openSamples: 2 } };
+    brokerGates(rw, deviceGates);
     try {
-      const agent = await rw.agent({ load, deviceSampler, config: { deviceGates: { thermal: { maxPressureLevel: 1, openSamples: 2 } } } });
+      const agent = await rw.agent({ load, deviceSampler, config: { deviceGates } });
       const gate = () => readAgentStatus(rw.root).deviceGates?.thermal;
       await happens('the gate closed and the status says why', () => gate()?.closed === true && readAgentStatus(rw.root).claims === 'paused:thermal');
       await sleep(400);
@@ -153,6 +173,62 @@ const scenarios = {
       await happens('the gate shows open', () => gate()?.closed === false);
     } finally {
       release();
+    }
+  },
+
+  'a closed thermal gate holds while the sampler fails or reads nothing: status stays paused:thermal and the countdown does not move': async (w, rw, load) => {
+    let mode = 'hot';
+    let failures = 0;
+    const deviceSampler = async () => {
+      if (mode === 'fail') {
+        failures += 1;
+        throw new Error('sensor exploded');
+      }
+      return { thermal: { pressureLevel: mode === 'hot' ? 2 : 0 }, power: {} };
+    };
+    const deviceGates = { thermal: { maxPressureLevel: 1, openSamples: 2 } };
+    brokerGates(rw, deviceGates);
+    const ticket = await rw.submit({ code: 'process.exit(0)' });
+    const agent = await rw.agent({ load, deviceSampler, config: { deviceGates } });
+    const gate = () => readAgentStatus(rw.root).deviceGates?.thermal;
+    await happens('the gate closed', () => gate()?.closed === true);
+    mode = 'fail';
+    await happens('the sampler failed more often than openSamples', () => failures >= 4);
+    await sleep(150);
+    assert.deepEqual([gate().closed, gate().consecutiveOk, readAgentStatus(rw.root).claims], [true, 0, 'paused:thermal']);
+    assert.equal(agent.names().includes('ld_claim'), false);
+    assert.equal(rw.logs.filter((line) => /sampling failed/.test(line)).length, 1, 'one log line for one distinct error');
+    mode = 'cool';
+    await rw.claimed(ticket);
+  },
+
+  'thresholds are re-read from the broker config on each sample: an edit restarts the countdown and leaves the gate closed': async (w, rw, load) => {
+    const { sampler, feed, asked, releaseAll } = scriptedSampler();
+    const gates = (openSamples) => ({ thermal: { maxPressureLevel: 1, openSamples } });
+    brokerGates(rw, gates(3));
+    const gate = () => readAgentStatus(rw.root).deviceGates?.thermal;
+    const hot = { pressureLevel: 2 };
+    const cool = { pressureLevel: 0 };
+    try {
+      await rw.agent({ load, deviceSampler: sampler, config: { deviceGates: gates(3) } });
+      await feed(hot);
+      await happens('closed', () => gate()?.closed === true);
+      await feed(cool);
+      await happens('one clean sample', () => gate()?.consecutiveOk === 1);
+      await asked();
+      brokerGates(rw, gates(4));
+      await feed(cool);
+      await happens('two clean samples under the old thresholds', () => gate()?.consecutiveOk === 2);
+      await feed(cool);
+      await happens('the edit restarted the countdown, and the gate is still closed', () => gate()?.consecutiveOk === 1 && gate().closed === true);
+      await asked();
+      brokerGates(rw, { thermal: { maxPressureLevel: 9 } });
+      await feed(cool);
+      await feed(cool);
+      await happens('the unreadable edit is logged once and the last good thresholds keep counting', () => gate()?.consecutiveOk === 3);
+      assert.equal(rw.logs.filter((line) => /broker config unreadable/.test(line)).length, 1);
+    } finally {
+      releaseAll();
     }
   },
 
@@ -174,7 +250,11 @@ const scenarios = {
 
 const CLAIMS = 'agent/claims.js';
 const gateName = 'a closed thermal gate takes no claim and shows paused:thermal; it reopens only after openSamples clean samples, then the claim goes through';
+const holdName = 'a closed thermal gate holds while the sampler fails or reads nothing: status stays paused:thermal and the countdown does not move';
+const liveName = 'thresholds are re-read from the broker config on each sample: an edit restarts the countdown and leaves the gate closed';
 const canaries = [
+  [holdName, 'device-gates.js', ['state.closed && GATES[name].informative(gateCfg, reading)', 'state.closed']],
+  [liveName, 'agent/run.js', ['    reloadDeviceGatesConfig();\n    if (!deviceGatesConfig)', '    if (!deviceGatesConfig)']],
   [gateName, CLAIMS, ['return closedGateReason(deviceGates);', 'return null;']],
   [gateName, 'agent/run.js', ['        await refreshDeviceGates();\n', '']],
   [gateName, 'device-gates.js', ['if (state.consecutiveOk >= openSamples) {', 'if (state.consecutiveOk >= 1) {']],

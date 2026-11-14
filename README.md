@@ -321,10 +321,13 @@ or `paused:battery-low`. Every gate and every threshold is optional, a gate need
 `pmset -g therm` `CPU_Speed_Limit`, Intel Macs only) and `maxTempC` (1-150; hottest `/sys/class/thermal/thermal_zone*/temp`, Linux
 only); `power` takes `requireAc` (boolean) and `minBatteryPercent` (0-100, applied only while on battery, so a desktop-like Mac with
 a dead battery on AC stays open). `openSamples` (positive integer; default 3 for `thermal`, 1 for `power`) is how many consecutive
-clean samples reopen a closed gate; a violating sample closes it at once, and editing a gate's thresholds restarts the countdown
-without reopening it. The agent samples once per `pollMs`. **An unknown reading is never a violation**: a sensor the platform lacks
-(Apple Silicon has no `CPU_Speed_Limit`, WSL has no thermal zones), a missing command or a parse failure leaves the gate open and
-shows as `unknown`. `lane status` samples live and prints one `device gates:` line; the agent's `status.json` carries each gate's
+clean samples reopen a closed gate; a violating sample closes it at once. The agent samples once per `pollMs` and re-reads
+`deviceGates` from the broker config on each sample, so an edit reaches a running agent: it restarts the countdown without reopening
+the gate, and an unreadable config keeps the last good thresholds (logged once per distinct error). **An unknown reading is never a
+violation**: a sensor the platform lacks (Apple Silicon has no `CPU_Speed_Limit`, WSL has no thermal zones), a missing command, a
+parse failure or a failed sample leaves an open gate open and shows as `unknown`. A closed gate holds on a sample with nothing to
+judge by (no configured reading known; for `power`, AC state unknown): it neither reopens nor loses its countdown. Linux battery
+and thermal reads skip unreadable entries and `scope: Device` batteries (a wireless mouse), so a missing file is never read as 0. `lane status` samples live and prints one `device gates:` line; the agent's `status.json` carries each gate's
 `{closed, consecutiveOk, reading}` and its textfile metrics `lane_agent_device_gate_closed{gate="thermal|power"}` (0/1, configured
 gates only).
 

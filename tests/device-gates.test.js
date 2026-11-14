@@ -76,9 +76,9 @@ const fakeExec = (answers) => {
   return Object.assign(exec, { calls });
 };
 const DARWIN = {
-  'notifyutil -g com.apple.system.thermalpressurelevel': 'com.apple.system.thermalpressurelevel 1\n',
-  'pmset -g therm': THERMAL_INTEL,
-  'pmset -g batt': BATT_AC_NOT_CHARGING,
+  '/usr/bin/notifyutil -g com.apple.system.thermalpressurelevel': 'com.apple.system.thermalpressurelevel 1\n',
+  '/usr/bin/pmset -g therm': THERMAL_INTEL,
+  '/usr/bin/pmset -g batt': BATT_AC_NOT_CHARGING,
 };
 
 test('sampleDevice on darwin runs the macOS commands with no shell and answers every reading it can', async () => {
@@ -91,12 +91,12 @@ test('sampleDevice on darwin runs the macOS commands with no shell and answers e
 test('sampleDevice skips readers no configured threshold uses', async () => {
   const exec = fakeExec(DARWIN);
   const sample = await sampleDevice({ thermal: { maxPressureLevel: 2 } }, { platform: 'darwin', exec });
-  assert.deepEqual(exec.calls, ['notifyutil -g com.apple.system.thermalpressurelevel']);
+  assert.deepEqual(exec.calls, ['/usr/bin/notifyutil -g com.apple.system.thermalpressurelevel']);
   assert.deepEqual(sample, { thermal: { pressureLevel: 1, cpuSpeedLimit: null, maxTempC: null }, power: { onAc: null, batteryPercent: null } });
 });
 
 test('a missing command, an Apple Silicon therm output or a throwing reader reads as unknown, never as an error', async () => {
-  const arm = await sampleDevice(ALL, { platform: 'darwin', exec: fakeExec({ ...DARWIN, 'pmset -g therm': THERMAL_ARM }) });
+  const arm = await sampleDevice(ALL, { platform: 'darwin', exec: fakeExec({ ...DARWIN, '/usr/bin/pmset -g therm': THERMAL_ARM }) });
   assert.equal(arm.thermal.cpuSpeedLimit, null);
   const missing = await sampleDevice(ALL, { platform: 'darwin', exec: fakeExec({}) });
   assert.deepEqual(missing, { thermal: { pressureLevel: null, cpuSpeedLimit: null, maxTempC: null }, power: { onAc: null, batteryPercent: null } });
@@ -125,6 +125,41 @@ test('sampleDevice reads a WSL-like sysfs: Mains online, the lowest battery, the
   assert.deepEqual(sample, { thermal: { pressureLevel: null, cpuSpeedLimit: null, maxTempC: 71.5 }, power: { onAc: true, batteryPercent: 64 } });
   writeSupply(sysRoot, 'AC1', { type: 'Mains', online: 0 });
   assert.equal((await sampleDevice(ALL, { platform: 'linux', sysRoot })).power.onAc, false);
+});
+
+test('sysfs: a battery with no capacity file and a Device-scope battery do not read as 0% or 5%, so a minBatteryPercent gate on battery stays open', async () => {
+  const sysRoot = makeTmpDir('sysfs-');
+  writeSupply(sysRoot, 'AC1', { type: 'Mains', online: 0 });
+  writeSupply(sysRoot, 'BAT0', { type: 'Battery', status: 'Unknown' });
+  writeSupply(sysRoot, 'hid-mouse', { type: 'Battery', scope: 'Device', capacity: 5 });
+  const sample = await sampleDevice({ power: { minBatteryPercent: 20 } }, { platform: 'linux', sysRoot });
+  assert.deepEqual(sample.power, { onAc: false, batteryPercent: null });
+  assert.equal(updateDeviceGate(undefined, 'power', { minBatteryPercent: 20 }, sample.power).closed, false);
+  writeSupply(sysRoot, 'BAT1', { type: 'Battery', capacity: 61 });
+  assert.equal((await sampleDevice({ power: { minBatteryPercent: 20 } }, { platform: 'linux', sysRoot })).power.batteryPercent, 61);
+});
+
+test('sysfs: Mains is on AC if any entry is online, off only if every entry reads 0, and unknown when an entry is unreadable', async () => {
+  const sysRoot = makeTmpDir('sysfs-');
+  const onAc = async () => (await sampleDevice({ power: { requireAc: true } }, { platform: 'linux', sysRoot })).power.onAc;
+  writeSupply(sysRoot, 'AC1', { type: 'Mains' });
+  assert.equal(await onAc(), null, 'a Mains entry with no online file is unknown');
+  writeSupply(sysRoot, 'AC2', { type: 'Mains', online: 0 });
+  assert.equal(await onAc(), null, 'one unreadable entry among offline ones is still unknown');
+  writeSupply(sysRoot, 'AC1', { type: 'Mains', online: 1 });
+  assert.equal(await onAc(), true);
+  writeSupply(sysRoot, 'AC1', { type: 'Mains', online: 0 });
+  assert.equal(await onAc(), false);
+});
+
+test('sysfs: an unreadable thermal zone is skipped, not read as 0 degrees', async () => {
+  const sysRoot = makeTmpDir('sysfs-');
+  fs.mkdirSync(path.join(sysRoot, 'class', 'thermal', 'thermal_zone0'), { recursive: true });
+  writeZone(sysRoot, 'thermal_zone1', 55000);
+  assert.equal((await sampleDevice({ thermal: { maxTempC: 90 } }, { platform: 'linux', sysRoot })).thermal.maxTempC, 55);
+  const only = makeTmpDir('sysfs-');
+  fs.mkdirSync(path.join(only, 'class', 'thermal', 'thermal_zone0'), { recursive: true });
+  assert.equal((await sampleDevice({ thermal: { maxTempC: 90 } }, { platform: 'linux', sysRoot: only })).thermal.maxTempC, null);
 });
 
 test('sampleDevice on a Linux box with no power or thermal entries reads everything as unknown', async () => {
@@ -179,13 +214,19 @@ test('thermal closes on each configured reading and only on a configured one', (
   assert.equal(updateDeviceGate(undefined, 'thermal', { maxTempC: 90 }, { pressureLevel: 4, cpuSpeedLimit: 1, maxTempC: 60 }).closed, false, 'an unconfigured reading never closes');
 });
 
-test('an unknown reading never closes a gate, and counts as clean while reopening', () => {
+test('an unknown reading never closes a gate, and a closed gate holds on one: no reopening, no countdown reset', () => {
   const unknown = { pressureLevel: null, cpuSpeedLimit: null, maxTempC: null };
   assert.equal(updateDeviceGate(undefined, 'thermal', { maxPressureLevel: 0, minCpuSpeedLimit: 100, maxTempC: 1 }, unknown).closed, false);
   assert.equal(updateDeviceGate(undefined, 'power', { requireAc: true, minBatteryPercent: 50 }, { onAc: null, batteryPercent: null }).closed, false);
   assert.equal(updateDeviceGate(undefined, 'power', { minBatteryPercent: 50 }, { onAc: false, batteryPercent: null }).closed, false);
-  const state = run({ maxPressureLevel: 1, openSamples: 2 }, 'thermal', [hot, unknown, unknown], undefined);
+  const cfg = { maxPressureLevel: 1, openSamples: 2 };
+  let state = run(cfg, 'thermal', [hot, cool, unknown, unknown, unknown], undefined);
+  assert.deepEqual([state.closed, state.consecutiveOk], [true, 1], 'unknown samples neither reopen nor reset the count');
+  state = run(cfg, 'thermal', [cool], state);
   assert.equal(state.closed, false);
+  const power = run({ requireAc: true }, 'power', [{ onAc: false }, { onAc: null }, { onAc: null }], undefined);
+  assert.equal(power.closed, true, 'a power gate holds while onAc is unknown');
+  assert.equal(run({ minBatteryPercent: 20 }, 'power', [{ onAc: false, batteryPercent: 5 }, { onAc: null, batteryPercent: 90 }], undefined).closed, true);
 });
 
 test('power: requireAc closes on battery; minBatteryPercent closes only on battery and is ignored on AC', () => {
@@ -257,6 +298,9 @@ test('deviceGates rejects each bad type and range, a gate with no threshold, and
     [{ power: { minBatteryPercent: -1 } }, /minBatteryPercent/],
     [{ thermal: { maxTempC: 90, openSamples: 0 } }, /"deviceGates.thermal.openSamples" must be a positive integer/],
     [{ power: { requireAc: true, openSamples: 1.5 } }, /openSamples/],
+    [{ thermal: { maxPressureLevel: 1, constructor: 123 } }, /"deviceGates.thermal" has unknown key "constructor"/],
+    [{ constructor: {} }, /"deviceGates" has unknown key "constructor"/],
+    [{ thermal: { maxPressureLevel: 1, toString: 1 } }, /unknown key "toString"/],
     [{ thermal: {} }, /"deviceGates.thermal" needs at least one of/],
     [{ power: { openSamples: 2 } }, /"deviceGates.power" needs at least one of/],
   ];
