@@ -13,7 +13,7 @@ import { isPriorityTier, isValidGroupId } from './priority.js';
 import { runnerAvailability } from './runner-schedule.js';
 import { runnerWaitMs, probeQueued, RANKED_WAIT_RESIDUAL, DEFAULT_REMOTE_OVERHEAD_MS } from './speed-placement.js';
 import { sanitizeDrainReason, RUNNER_SHUTDOWN_REASON, DEAD_QUEUED_SUPERVISOR_REASON } from './state.js';
-import { readinessProbeArgs, readinessGap } from './runner-readiness.js';
+import { readinessProbeArgs, readinessGap, avoidedTagsOf } from './runner-readiness.js';
 import { remoteCancelDeadlineMs, POST_ABORT_JOIN_MS } from './attempts.js';
 
 /**
@@ -302,12 +302,14 @@ function neverFits(reservation, probe) {
  * `opts.busyQueueable` (BRAIN-899, default false; needs `maxRemoteQueue > 0` and a ranking `finishModel`): the place path's
  * counterpart to `allowBusyQueue` -- a runner with an EMPTY queue but no headroom is a queued candidate too, because waiting for
  * a fast runner is the whole point of the model. Rebind keeps `allowBusyQueue` (a locally CPU-blocked ticket) as its only route.
+ * BRAIN-1072 `readinessNeeds.avoidTags`: while a runner without them is up (however deep its queue) or `opts.preferredRunnerUp` says one is
+ * (a rebalance source), runners declaring them are skipped as `avoided tag <t>`; with none up they rank with the rest (README "avoidTags").
  */
 export async function selectRunner(runners, opts = {}) {
   const deadlineMs = opts.deadlineMs ?? DEFAULT_GLOBAL_CONFIG.remoteProbeDeadlineMs;
   const retryTimedOut = new Set(opts.retryTimedOut ?? []);
   const sshBin = opts.sshBin ?? 'ssh';
-  const { env, requireProtocol2 = false, requireCapabilities = [], readinessNeeds = {}, reservation, maxRemoteQueue = 0, allowBusyQueue = false, downRunners = {}, queuedFilter = () => true, finishModel = null, busyQueueable = false, slotAwareWait = true } = opts;
+  const { env, requireProtocol2 = false, requireCapabilities = [], readinessNeeds = {}, reservation, maxRemoteQueue = 0, allowBusyQueue = false, downRunners = {}, queuedFilter = () => true, finishModel = null, busyQueueable = false, slotAwareWait = true, preferredRunnerUp = false } = opts;
   const skipped = [];
   const readiness = {};
   const ready = [];
@@ -320,6 +322,8 @@ export async function selectRunner(runners, opts = {}) {
   const idleSeq = [];
   const queuedSeq = [];
   const busySeq = []; // passed every check except headroom, empty queue: its own broker would hold the ticket until it has room
+  const avoided = new Map(); // runner name -> the avoidTags its probe declares
+  const preferredUp = []; // runners up for this ticket that declare none of them
   const better = (cand, best) => !best || cand.finish < best.finish || (cand.finish === best.finish && cand.cpuFree > best.cpuFree);
   const fewerQueued = (cand, best) => !best || cand.probe.queued < best.probe.queued || (cand.probe.queued === best.probe.queued && better(cand, best));
   const bestOf = (seq, cmp) => seq.reduce((best, cand) => (cmp(cand, best) ? cand : best), null);
@@ -397,6 +401,7 @@ export async function selectRunner(runners, opts = {}) {
       continue;
     }
     ready.push(runner.name);
+    const avoidedTags = avoidedTagsOf(probe, readinessNeeds);
     if (probe.configError) {
       skipped.push({ name: runner.name, reason: `runner config unreadable: ${probe.configError}` });
       continue;
@@ -419,6 +424,8 @@ export async function selectRunner(runners, opts = {}) {
       const never = Boolean(reservation && neverFits(reservation, probe));
       skipped[skipped.length - 1].neverFits = never;
       const fits = !never;
+      if (fits && avoidedTags.length > 0) avoided.set(runner.name, avoidedTags);
+      else if (fits) preferredUp.push(runner.name);
       const queueable = Number.isInteger(probe.queued) && probe.queued > 0 && probe.queued <= maxRemoteQueue;
       if (fits && queueable) {
         const cand = candidate(probe, 0, false);
@@ -434,6 +441,8 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason: 'runner capacity can never fit this ticket', neverFits: true });
       continue;
     }
+    if (avoidedTags.length > 0) avoided.set(runner.name, avoidedTags);
+    else preferredUp.push(runner.name);
     const { room, cpuFree, reason } = reservation ? runnerRoom(reservation, probe) : { room: true, cpuFree: 0 };
     if (!room) {
       skipped.push({ name: runner.name, reason });
@@ -450,71 +459,87 @@ export async function selectRunner(runners, opts = {}) {
     idleSeq.push(candidate(probe, cpuFree, true));
   }
   const readinessField = { ready, ...(Object.keys(readiness).length > 0 ? { readiness } : {}) };
-  const pool = [...idleSeq, ...queuedSeq];
-  const pooled = new Set(pool);
-  // every candidate the ranking below, or the schedule check under it, can inspect
-  const inspectable = [...pool, ...busySeq.filter((cand) => !pooled.has(cand))];
-  const estimates = new Map();
-  if (scoring) {
-    // BRAIN-899 B3: ONE `estimateAll` call over that whole field, so every runner is estimated at the same tier instead of each at
-    // its own most specific one. A model that answers only per-runner is folded into the same map, and a runner the answer leaves
-    // out is null, never undefined -- the `estimate.ms` reads below must not have a crash path.
-    const all = typeof finishModel.estimateAll === 'function' ? finishModel.estimateAll(inspectable.map((cand) => cand.runner)) : null;
-    for (const cand of inspectable) {
-      estimates.set(cand.runner, usableEstimate(all === null ? finishModel.estimateFor(cand.runner) : all?.get?.(cand.runner.name)));
+  function rankField(idleSeq, queuedSeq, busySeq) {
+    const drops = [];
+    const pool = [...idleSeq, ...queuedSeq];
+    const pooled = new Set(pool);
+    // every candidate the ranking below, or the schedule check under it, can inspect
+    const inspectable = [...pool, ...busySeq.filter((cand) => !pooled.has(cand))];
+    const estimates = new Map();
+    if (scoring) {
+      // BRAIN-899 B3: ONE `estimateAll` call over that whole field, so every runner is estimated at the same tier instead of each at
+      // its own most specific one. A model that answers only per-runner is folded into the same map, and a runner the answer leaves
+      // out is null, never undefined -- the `estimate.ms` reads below must not have a crash path.
+      const all = typeof finishModel.estimateAll === 'function' ? finishModel.estimateAll(inspectable.map((cand) => cand.runner)) : null;
+      for (const cand of inspectable) {
+        estimates.set(cand.runner, usableEstimate(all === null ? finishModel.estimateFor(cand.runner) : all?.get?.(cand.runner.name)));
+      }
+    }
+    const estimateOf = (runner) => estimates.get(runner) ?? null;
+    // BRAIN-899: all or nothing -- one candidate without an estimate leaves the whole field on today's ranking.
+    const ranked = scoring && pool.length > 0 && pool.every((cand) => estimateOf(cand.runner) !== null);
+    // BRAIN-899 A1: rebalance keeps the serial wait its gain gate was written against (`slotAwareWait: false`)
+    const slotsOf = (probe) => (slotAwareWait ? waitSlots(reservation, probe) : 1);
+    const residual = slotAwareWait ? RANKED_WAIT_RESIDUAL : 1;
+    const rankedWaitMs = (cand, estimate) => runnerWaitMs({ probe: cand.probe, estimateMs: estimate.ms, room: cand.idle, slots: slotsOf(cand.probe), residual });
+    const dropped = new Set();
+    if (scoring) {
+      for (const cand of inspectable) {
+        const estimate = ranked ? estimateOf(cand.runner) : null;
+        const waitMs = estimate === null ? null : rankedWaitMs(cand, estimate);
+        if (estimate === null || cand.closesAt === null) continue;
+        const needMs = waitMs + estimate.ms;
+        if (now + needMs <= cand.closesAt) continue;
+        dropped.add(cand);
+        drops.push({ name: cand.runner.name, reason: `schedule window closes at ${new Date(cand.closesAt).toISOString()}, before the predicted ${Math.round(needMs / 1000)}s finish (wait ${Math.round(waitMs / 1000)}s + run ${Math.round(estimate.ms / 1000)}s)` });
+      }
+    }
+    const droppedNames = new Set([...dropped].map((cand) => cand.runner.name));
+    const ranking = (result) => ({ result, drops, droppedNames });
+    const liveBusy = busySeq.filter((cand) => !dropped.has(cand));
+    const busyBest = bestOf(liveBusy, better);
+    if (!ranked) {
+      const idleBest = bestOf(idleSeq.filter((cand) => !dropped.has(cand)), better);
+      const queuedBest = bestOf(queuedSeq.filter((cand) => !dropped.has(cand) && !cand.queueableOnlyIfRanked), fewerQueued);
+      if (idleBest) return ranking({ runner: idleBest.runner, probe: idleBest.probe, ...readinessField });
+      if (queuedBest) return ranking({ runner: queuedBest.runner, probe: queuedBest.probe, ...readinessField, queuedChoice: true });
+      return ranking({ runner: null, ...readinessField, ...(busyBest ? { busy: { runner: busyBest.runner, probe: busyBest.probe } } : {}) });
+    }
+    const rows = pool
+      .filter((cand) => !dropped.has(cand))
+      .map((cand) => {
+        const estimate = estimateOf(cand.runner);
+        const slots = slotsOf(cand.probe);
+        const waitMs = runnerWaitMs({ probe: cand.probe, estimateMs: estimate.ms, room: cand.idle, slots, residual });
+        return { cand, estimate, slots, waitMs, runMs: estimate.ms, finishMs: waitMs + estimate.ms + DEFAULT_REMOTE_OVERHEAD_MS };
+      });
+    /** Lowest predicted finish wins; a tie goes to an idle runner, then to more free CPU, then to config order. */
+    const finishesSooner = (a, b) => {
+      if (a.finishMs !== b.finishMs) return a.finishMs < b.finishMs;
+      if (a.cand.idle !== b.cand.idle) return a.cand.idle;
+      if (a.cand.cpuFree !== b.cand.cpuFree) return a.cand.cpuFree > b.cand.cpuFree;
+      return a.cand.order < b.cand.order;
+    };
+    const winner = rows.reduce((best, row) => (best === null || finishesSooner(row, best) ? row : best), null);
+    const scores = [...rows]
+      .sort((a, b) => a.cand.order - b.cand.order)
+      .map(({ cand, estimate, slots, waitMs, runMs, finishMs }) => ({ name: cand.runner.name, finishMs, waitMs, runMs, tier: estimate.tier, n: estimate.n, idle: cand.idle, queued: probeQueued(cand.probe), slots }));
+    if (winner) {
+      return ranking({ runner: winner.cand.runner, probe: winner.cand.probe, ...readinessField, ...(winner.cand.idle ? {} : { queuedChoice: true }), scores });
+    }
+    return ranking({ runner: null, ...readinessField, ...(busyBest ? { busy: { runner: busyBest.runner, probe: busyBest.probe } } : {}), scores });
+  }
+  const isPreferred = (cand) => !avoided.has(cand.runner.name);
+  if (avoided.size > 0) {
+    const preferred = rankField(idleSeq.filter(isPreferred), queuedSeq.filter(isPreferred), busySeq.filter(isPreferred));
+    if (preferredRunnerUp || preferredUp.some((name) => !preferred.droppedNames.has(name))) {
+      for (const entry of skipped) if (avoided.has(entry.name)) delete entry.candidate;
+      const avoidSkips = [...avoided].map(([name, tags]) => ({ name, reason: `avoided tag ${tags.join(', ')} (avoidTags; a runner without it is up)` }));
+      return { ...preferred.result, skipped: [...skipped, ...preferred.drops, ...avoidSkips] };
     }
   }
-  const estimateOf = (runner) => estimates.get(runner) ?? null;
-  // BRAIN-899: all or nothing -- one candidate without an estimate leaves the whole field on today's ranking.
-  const ranked = scoring && pool.length > 0 && pool.every((cand) => estimateOf(cand.runner) !== null);
-  // BRAIN-899 A1: rebalance keeps the serial wait its gain gate was written against (`slotAwareWait: false`)
-  const slotsOf = (probe) => (slotAwareWait ? waitSlots(reservation, probe) : 1);
-  const residual = slotAwareWait ? RANKED_WAIT_RESIDUAL : 1;
-  const rankedWaitMs = (cand, estimate) => runnerWaitMs({ probe: cand.probe, estimateMs: estimate.ms, room: cand.idle, slots: slotsOf(cand.probe), residual });
-  const dropped = new Set();
-  if (scoring) {
-    for (const cand of inspectable) {
-      const estimate = ranked ? estimateOf(cand.runner) : null;
-      const waitMs = estimate === null ? null : rankedWaitMs(cand, estimate);
-      if (estimate === null || cand.closesAt === null) continue;
-      const needMs = waitMs + estimate.ms;
-      if (now + needMs <= cand.closesAt) continue;
-      dropped.add(cand);
-      skipped.push({ name: cand.runner.name, reason: `schedule window closes at ${new Date(cand.closesAt).toISOString()}, before the predicted ${Math.round(needMs / 1000)}s finish (wait ${Math.round(waitMs / 1000)}s + run ${Math.round(estimate.ms / 1000)}s)` });
-    }
-  }
-  const liveBusy = busySeq.filter((cand) => !dropped.has(cand));
-  const busyBest = bestOf(liveBusy, better);
-  if (!ranked) {
-    const idleBest = bestOf(idleSeq.filter((cand) => !dropped.has(cand)), better);
-    const queuedBest = bestOf(queuedSeq.filter((cand) => !dropped.has(cand) && !cand.queueableOnlyIfRanked), fewerQueued);
-    if (idleBest) return { runner: idleBest.runner, probe: idleBest.probe, skipped, ...readinessField };
-    if (queuedBest) return { runner: queuedBest.runner, probe: queuedBest.probe, skipped, ...readinessField, queuedChoice: true };
-    return { runner: null, skipped, ...readinessField, ...(busyBest ? { busy: { runner: busyBest.runner, probe: busyBest.probe } } : {}) };
-  }
-  const rows = pool
-    .filter((cand) => !dropped.has(cand))
-    .map((cand) => {
-      const estimate = estimateOf(cand.runner);
-      const slots = slotsOf(cand.probe);
-      const waitMs = runnerWaitMs({ probe: cand.probe, estimateMs: estimate.ms, room: cand.idle, slots, residual });
-      return { cand, estimate, slots, waitMs, runMs: estimate.ms, finishMs: waitMs + estimate.ms + DEFAULT_REMOTE_OVERHEAD_MS };
-    });
-  /** Lowest predicted finish wins; a tie goes to an idle runner, then to more free CPU, then to config order. */
-  const finishesSooner = (a, b) => {
-    if (a.finishMs !== b.finishMs) return a.finishMs < b.finishMs;
-    if (a.cand.idle !== b.cand.idle) return a.cand.idle;
-    if (a.cand.cpuFree !== b.cand.cpuFree) return a.cand.cpuFree > b.cand.cpuFree;
-    return a.cand.order < b.cand.order;
-  };
-  const winner = rows.reduce((best, row) => (best === null || finishesSooner(row, best) ? row : best), null);
-  const scores = [...rows]
-    .sort((a, b) => a.cand.order - b.cand.order)
-    .map(({ cand, estimate, slots, waitMs, runMs, finishMs }) => ({ name: cand.runner.name, finishMs, waitMs, runMs, tier: estimate.tier, n: estimate.n, idle: cand.idle, queued: probeQueued(cand.probe), slots }));
-  if (winner) {
-    return { runner: winner.cand.runner, probe: winner.cand.probe, skipped, ...readinessField, ...(winner.cand.idle ? {} : { queuedChoice: true }), scores };
-  }
-  return { runner: null, skipped, ...readinessField, ...(busyBest ? { busy: { runner: busyBest.runner, probe: busyBest.probe } } : {}), scores };
+  const whole = rankField(idleSeq, queuedSeq, busySeq);
+  return { ...whole.result, skipped: [...skipped, ...whole.drops] };
 }
 
 /**

@@ -84,6 +84,14 @@ const tagsCheck = {
   },
 };
 
+/** BRAIN-1072: asked via `--tags` so every runner answering `requiresTags` answers these; never a gap, placement reads `avoidedTagsOf`. */
+const avoidTagsCheck = {
+  id: 'avoidTags',
+  askVia: 'tags',
+  need: (lane) => [...new Set(lane?.avoidTags ?? [])],
+  gap: () => null,
+};
+
 /** The lane-broker release floor: `runnerVersionFloor` in the global config (null = none). Submitter side only, read from the probe's `version`. */
 const versionCheck = {
   id: 'version',
@@ -142,14 +150,19 @@ const integrityCheck = {
   },
 };
 
-export const READINESS_CHECKS = [toolsCheck, tagsCheck, versionCheck, integrityCheck];
+export const READINESS_CHECKS = [toolsCheck, tagsCheck, avoidTagsCheck, versionCheck, integrityCheck];
 
 /** Everything the lane needs of a runner, `{ <check id>: need }`, from its remote payload and the global config. */
 export const readinessNeeds = (remote, globalCfg) => Object.fromEntries(READINESS_CHECKS.map((c) => [c.id, c.need(remote, globalCfg)]));
 
+const askedVia = (check, needs) => [...new Set([check, ...READINESS_CHECKS.filter((c) => c.askVia === check.id)].flatMap((c) => (hasNeed(needs[c.id]) ? needs[c.id] : [])))];
+
 /** `remote-probe` argv for these needs (empty when nothing is needed, so a lane without needs sends today's command). */
 export function readinessProbeArgs(needs) {
-  return READINESS_CHECKS.flatMap((c) => (c.flag && hasNeed(needs[c.id]) ? [c.flag, needs[c.id].join(',')] : []));
+  return READINESS_CHECKS.flatMap((c) => {
+    const asked = c.flag ? askedVia(c, needs) : [];
+    return asked.length > 0 ? [c.flag, asked.join(',')] : [];
+  });
 }
 
 /** Runner side: parse `remote-probe` argv (flags only) into needs. */
@@ -176,4 +189,9 @@ export function readinessGap(probe, needs) {
     if (gap) return { check: c.id, ...gap };
   }
   return null;
+}
+
+export function avoidedTagsOf(probe, needs) {
+  const answered = probe?.tags && typeof probe.tags === 'object' ? probe.tags : {};
+  return (needs?.avoidTags ?? []).filter((tag) => answered[tag] === true);
 }

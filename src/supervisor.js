@@ -49,7 +49,7 @@ import { isPriorityTier, priorityAuditOf, priorityOf, pullQueuePriority, resolve
 import { CLASS_ENFORCEMENT_ENV, CLASSES_CAPABILITY, isEnforcementRequired, classTransport, resolveClasses } from './classes.js';
 import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, localSimRefusal, noRunnerRefusal, noRunnerLocallyIneligibleRefusal, dispatchOnlyRefusal, LOCAL_REFUSED_EXIT_CODE, NO_RUNNER_EXIT_CODE, locallyRefusedNow, localWindowAllowing, leaseCpuCores, terminalRowDefaults } from './resources.js';
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness, recordEnforcement } from './runner-unreachable.js';
-import { readinessNeeds, hasNeed } from './runner-readiness.js';
+import { readinessNeeds, hasNeed, avoidedTagsOf } from './runner-readiness.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
 import { placeForPull } from './pull-placement.js';
 import { publicationBindings, publicationOf } from './pull-publication.js';
@@ -865,13 +865,14 @@ export function rebalanceFinishAllows({ destScore, sourceEstimateMs, position, d
  * ticket, 'rebalance' a queued remote one), so what every path must carry (BRAIN-597's `downRunners`) cannot be dropped by one.
  * BRAIN-899: all four rank by predicted finish; only the place path may also queue on a busy runner.
  */
-export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHome(), stuckLocally = false, localBlocked = false, draining = false, cpuLimit, queuedMove = null } = {}) {
+export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHome(), stuckLocally = false, localBlocked = false, draining = false, cpuLimit, queuedMove = null, sourceProbe = null } = {}) {
   // BRAIN-899 B2: ONE windowed, repo-filtered read feeds both the finish model and the schedule pre-check.
   const rows = placementHistoryRows(root, enriched);
   const base = remoteSelectOptions(enriched, globalCfg, root, cpuLimit, rows);
   const finishModel = finishModelFor(enriched, globalCfg, rows, { commonTier: kind !== 'rebalance' });
   // a move or rebind picks a better home for a ticket that already has one
   if (kind === 'rebind') return { ...base, maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0, allowBusyQueue: localBlocked, finishModel };
+  const preferredRunnerUp = kind === 'rebalance' && sourceProbe !== null && !draining && avoidedTagsOf(sourceProbe, base.readinessNeeds).length === 0;
   if (kind === 'rebalance' && queuedMove) {
     const stayFinish = estimatedFinish(base.reservation, { queued: queuedMove.position - 1 }, queuedMove.sourceRunner);
     const sourceMs = estimateMsOf(finishModel, queuedMove.sourceRunner);
@@ -886,10 +887,10 @@ export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHom
       if (sourceMs === null || destMs === null) return finish < REBALANCE_QUEUED_GAIN * stayFinish;
       return runnerWaitMs({ probe, estimateMs: destMs, room: idle === true }) + destMs + DEFAULT_REMOTE_OVERHEAD_MS < REBALANCE_QUEUED_GAIN * queuedMove.position * sourceMs;
     };
-    return { ...base, maxRemoteQueue: globalCfg.remoteRebalanceQueuedMax, allowBusyQueue: true, queuedFilter, finishModel, slotAwareWait: false };
+    return { ...base, maxRemoteQueue: globalCfg.remoteRebalanceQueuedMax, allowBusyQueue: true, queuedFilter, finishModel, slotAwareWait: false, preferredRunnerUp };
   }
   if (kind === 'rebalance') {
-    return { ...base, maxRemoteQueue: 0, requireCapabilities: draining ? [...base.requireCapabilities, REMOTE_WITHDRAW_CAPABILITY] : base.requireCapabilities, finishModel, slotAwareWait: false };
+    return { ...base, maxRemoteQueue: 0, requireCapabilities: draining ? [...base.requireCapabilities, REMOTE_WITHDRAW_CAPABILITY] : base.requireCapabilities, finishModel, slotAwareWait: false, preferredRunnerUp };
   }
   // BRAIN-976: a ticket this machine can never run has no local alternative, so the cap would only turn waiting into a 76; 0 (never queue) stays 0
   const uncapped = globalCfg.maxRemoteQueue > 0 && localIneligibilityOf(enriched, globalCfg, cpuLimit);
@@ -1648,7 +1649,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
           if (!draining && rebalanceBlocked({ moves: countedMoves, maxMoves: liveCfg.remoteRebalanceMaxMoves, lastMoveAt, now: Date.now(), cooldownMs: liveCfg.remoteRebalanceCooldownMs })) return null;
           const candidates = pushRunners(liveCfg).filter((r) => !visited.includes(r.name) && r.rebalanceTarget !== false);
           if (candidates.length === 0) return null;
-          const idleOptions = selectionOptionsFor('rebalance', enriched, liveCfg, { draining, root, cpuLimit });
+          const idleOptions = selectionOptionsFor('rebalance', enriched, liveCfg, { draining, root, cpuLimit, sourceProbe: probe });
           const picked = await selectRunner(candidates, idleOptions);
           if (picked.runner) logFinishPlacement(root, enriched, picked, 'rebalance: ');
           // BRAIN-899 R5: a scored destination must also beat staying put by the gain; a drain or the refusal deadline is ungated
@@ -1662,7 +1663,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
           // BRAIN-888: behind another ticket's reservation with no idle runner on offer, a short non-idle queue elsewhere can be better
           const stuckBehindOwner = liveCfg.remoteRebalanceQueuedMax > 0 && sourceFacts?.position >= 1 && sourceFacts.behindOtherOwner === true && sourceFacts.reservationOwnerWaitedMs >= liveCfg.remoteRebalanceMinQueuedMs;
           if (!stuckBehindOwner) return null;
-          const queued = await selectRunner(candidates, selectionOptionsFor('rebalance', enriched, liveCfg, { draining, root, cpuLimit, queuedMove: { position: sourceFacts.position, sourceRunner: runner } }));
+          const queued = await selectRunner(candidates, selectionOptionsFor('rebalance', enriched, liveCfg, { draining, root, cpuLimit, sourceProbe: probe, queuedMove: { position: sourceFacts.position, sourceRunner: runner } }));
           if (queued.runner) logFinishPlacement(root, enriched, queued, 'rebalance: queued: ');
           // the cap may have run out while the probes were out: refusal must stay reachable
           if (refusalCapElapsed?.()) return (target = idleTarget);

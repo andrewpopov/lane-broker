@@ -93,8 +93,8 @@ test('no eligible runner: the refusal (exit 76) names the missing tool and each 
 test('remoteSelectOptions derives the needs from the ticket payload (empty without requires)', () => {
   const cfg = { ...DEFAULT_GLOBAL_CONFIG, runners: [] };
   const base = { id: 'x', lane: 'l', repoId: 'r', weight: 1, resources: {}, remote: {} };
-  assert.deepEqual(remoteSelectOptions(base, cfg, tmpDir('opts')).readinessNeeds, { tools: [], tags: [], version: null, integrity: true });
-  assert.deepEqual(remoteSelectOptions({ ...base, remote: { requires: ['rg', 'rg', 'jq'] } }, cfg, tmpDir('opts')).readinessNeeds, { tools: ['rg', 'jq'], tags: [], version: null, integrity: true });
+  assert.deepEqual(remoteSelectOptions(base, cfg, tmpDir('opts')).readinessNeeds, { tools: [], tags: [], avoidTags: [], version: null, integrity: true });
+  assert.deepEqual(remoteSelectOptions({ ...base, remote: { requires: ['rg', 'rg', 'jq'] } }, cfg, tmpDir('opts')).readinessNeeds, { tools: ['rg', 'jq'], tags: [], avoidTags: [], version: null, integrity: true });
   assert.equal(remoteSelectOptions(base, { ...cfg, runnerVersionFloor: '0.49.0' }, tmpDir('opts')).readinessNeeds.version, '0.49.0');
 });
 
