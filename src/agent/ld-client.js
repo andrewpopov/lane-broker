@@ -202,6 +202,10 @@ export class LdClient {
     return this.#run('ld_release', [id, epoch, token, proof], opts);
   }
 
+  get listening() {
+    return this.#listenClient !== null;
+  }
+
   async close() {
     this.#closed = true;
     for (const wake of [...this.#sleepers]) wake();

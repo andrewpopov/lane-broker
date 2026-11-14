@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
+import { probeCpuLimit, supervisorLaunch } from '../cpu-limit.js';
 import { kernelBootId, processStartTime, readJsonSafe } from '../state.js';
 import { isProcessAlive } from '../process-liveness.js';
 import { childExitSafeFlags } from '../node-exit-safe.js';
@@ -41,17 +42,20 @@ export class ExecutionDriver {
   #contexts = new Map();
   #leases = new Map();
   #closed = false;
+  #stopping = false;
+  #scope = null;
 
   constructor({ core, remoteRoot, config, s3, timing = {}, waker = new Waker(), log = () => {}, spawnEnv = process.env, laneBin = laneBinPath, draining = isDraining,
-    cancelExecution = cancelRemoteExecution, readResult = readRemoteResultRecord, now = Date.now, publish = publishBlob, makeLease = (root, hashes) => new BlobLease(root, hashes) }) {
-    Object.assign(this, { core, remoteRoot: path.resolve(remoteRoot), config, s3, waker, log, spawnEnv, laneBin, draining, cancelExecution, readResult, now, publish, makeLease });
+    cancelExecution = cancelRemoteExecution, readResult = readRemoteResultRecord, now = Date.now, publish = publishBlob, makeLease = (root, hashes) => new BlobLease(root, hashes),
+    probeScope = probeCpuLimit, spawnProcess = spawn }) {
+    Object.assign(this, { core, remoteRoot: path.resolve(remoteRoot), config, s3, waker, log, spawnEnv, laneBin, draining, cancelExecution, readResult, now, publish, makeLease, probeScope, spawnProcess });
     this.timing = { ...DEFAULT_TIMING, ...timing };
     this.ld = core.ld;
     this.table = core.table;
   }
 
   adopt(execId) {
-    if (this.#closed || this.#contexts.has(execId) || !this.table.get(execId)) return;
+    if (this.#stopping || this.#contexts.has(execId) || !this.table.get(execId)) return;
     const context = { abort: null, beatNow: false, lastBeatAt: this.now(), mayStart: false };
     this.#contexts.set(execId, context);
     context.promise = this.#drive(execId, context).finally(() => this.#contexts.delete(execId));
@@ -70,22 +74,32 @@ export class ExecutionDriver {
     return Promise.allSettled([...this.#contexts.values()].map((c) => c.promise));
   }
 
-  async close() {
-    this.#closed = true;
+  /**
+   * Stop driving, leaving running lanes alone: in-flight fetches and uploads are aborted, and a record already in OUTBOX keeps retrying its
+   * `ld_finish` or `ld_release` until it is acknowledged or `settleMs` passes. Whatever is left is picked up from disk by the next agent.
+   * Only those finishes are waited for; any other call in flight, and any left at the deadline, fails when the caller closes the queue.
+   */
+  async close({ settleMs = 0 } = {}) {
+    this.#stopping = true;
+    const finishing = [...this.#contexts].filter(([execId]) => this.table.get(execId)?.subphase === 'OUTBOX').map(([, context]) => context.promise);
     for (const context of this.#contexts.values()) context.abort?.abort();
     this.waker.poke();
-    await this.settled();
+    let timer;
+    await Promise.race([Promise.allSettled(finishing), new Promise((resolve) => { timer = setTimeout(resolve, settleMs); })]);
+    clearTimeout(timer);
+    this.#closed = true;
+    this.waker.poke();
     await Promise.all([...this.#leases.values()].map((lease) => lease.release()));
   }
 
   async #drive(execId, context) {
     while (!this.#closed) {
       const record = this.table.get(execId);
-      if (!record) return;
+      if (!record || (this.#stopping && record.subphase !== 'OUTBOX')) return;
       try {
         if (await this.#step(record, context) === 'end') return;
       } catch (err) {
-        if (err instanceof LdClosedError || this.#closed) return;
+        if (err instanceof LdClosedError || this.#closed || (this.#stopping && record.subphase !== 'OUTBOX')) return;
         this.log(`${execId}: ${record.subphase}: ${err.message}`);
         await this.waker.wait(this.timing.errorRetryMs);
       }
@@ -264,9 +278,10 @@ export class ExecutionDriver {
     const log = fs.openSync(logPath(this.remoteRoot, execId), 'a');
     const input = fs.openSync(spoolPath(this.remoteRoot, execId), 'r');
     try {
-      const args = [...childExitSafeFlags(), this.laneBin, 'remote-exec', '--root', this.remoteRoot, '--transfer', 'gzip', '--transfer-cache', '--epoch', String(record.epoch),
+      const argv = [process.execPath, ...childExitSafeFlags(), this.laneBin, 'remote-exec', '--root', this.remoteRoot, '--transfer', 'gzip', '--transfer-cache', '--epoch', String(record.epoch),
         '--runner-name', this.ld.registered.host, '--runner-speed-factor', String(this.config.speedFactor)];
-      const child = spawn(process.execPath, args, { detached: true, stdio: [input, log, log], env: this.spawnEnv });
+      const { cmd, args } = supervisorLaunch(execId, argv, this.#supervisorScope());
+      const child = this.spawnProcess(cmd, args, { detached: true, stdio: [input, log, log], env: this.spawnEnv });
       child.on('error', (err) => this.log(`${execId}: spawn failed: ${err.message}`));
       child.unref();
       if (child.pid !== undefined) this.#cas(execId, ['SPAWNING'], { subphase: 'RUNNING', pid: child.pid, pidStart: processStartTime(child.pid) ?? null });
@@ -274,6 +289,14 @@ export class ExecutionDriver {
       fs.closeSync(log);
       fs.closeSync(input);
     }
+  }
+
+  #supervisorScope() {
+    if (!this.#scope) {
+      this.#scope = this.probeScope();
+      if (!this.#scope.available) this.log(`remote-exec supervisors start detached with no scope of their own (${this.#scope.reason}); an agent or supervisor-manager restart that kills its cgroup also kills them`);
+    }
+    return this.#scope;
   }
 
   /** SPAWNING survives only a crash between the spawn and its record, or a failed spawn; the broker lock decides which. */

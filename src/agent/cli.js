@@ -69,7 +69,7 @@ export async function checkAgent({ loadConfig = loadAgentConfig, probePg = reach
 const FLAGS_WITH_VALUE = new Set(['--root', '--config']);
 
 /** `lane agent [--check] [--root <remoteRoot>] [--config <dir>]`. Without `--check` it runs until SIGTERM or SIGINT. Every credential comes from files under the config dir (default `~/.config/lane-agent`), never from the environment. */
-export async function agentCommand(args, { remoteRoot, configDir = flagValue(args, '--config') ?? AGENT_CONFIG_DIR, loadConfig = () => loadAgentConfig({ file: path.join(configDir, 'config.json') }), signals = process, err = process.stderr, ...checkOptions } = {}) {
+export async function agentCommand(args, { remoteRoot, configDir = flagValue(args, '--config') ?? AGENT_CONFIG_DIR, loadConfig = () => loadAgentConfig({ file: path.join(configDir, 'config.json') }), signals = process, err = process.stderr, start = startAgent, ...checkOptions } = {}) {
   const known = new Set(['--check', ...FLAGS_WITH_VALUE]);
   const unknown = args.find((a, i) => a.startsWith('--') && !known.has(a) && !FLAGS_WITH_VALUE.has(args[i - 1]));
   if (unknown !== undefined) {
@@ -78,7 +78,7 @@ export async function agentCommand(args, { remoteRoot, configDir = flagValue(arg
   }
   try {
     if (args.includes('--check')) return await checkAgent({ loadConfig, ...checkOptions });
-    const agent = await startAgent({ remoteRoot, config: loadConfig(), version: pkgVersion() });
+    const agent = await start({ remoteRoot, config: loadConfig(), version: pkgVersion() });
     await new Promise((resolve) => {
       for (const signal of ['SIGTERM', 'SIGINT']) signals.once(signal, resolve);
     });

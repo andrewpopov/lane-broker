@@ -69,10 +69,31 @@ export function cpuQuotaPercent(cores) {
   return percent;
 }
 
-/** The argv that runs `argv` in its own scope capped at `grantCores` cores (named `unit` when given; `measureMemory` turns memory accounting on, with no cap). Spawns nothing. */
+/** The argv that runs `argv` in its own scope capped at `grantCores` cores (named `unit` when given; `measureMemory` turns memory accounting on, with no cap). A `null` grant makes a scope for lifetime only, with no quota. Spawns nothing. */
 export function cpuLimitArgv(grantCores, argv, { unit, measureMemory = false } = {}) {
-  if (!Number.isFinite(grantCores) || grantCores <= 0) throw new Error(`cpuLimitArgv: grantCores must be positive and finite, got ${grantCores}`);
-  return ['systemd-run', '--user', '--scope', '--expand-environment=no', ...(unit ? [`--unit=${unit}`] : []), '-p', `CPUQuota=${cpuQuotaPercent(grantCores)}%`, ...(measureMemory ? ['-p', 'MemoryAccounting=yes'] : []), '--quiet', '--collect', '--', ...argv];
+  const uncapped = grantCores === null;
+  if (!uncapped && (!Number.isFinite(grantCores) || grantCores <= 0)) throw new Error(`cpuLimitArgv: grantCores must be positive and finite, got ${grantCores}`);
+  return ['systemd-run', '--user', '--scope', '--expand-environment=no', ...(unit ? [`--unit=${unit}`] : []), ...(uncapped ? [] : ['-p', `CPUQuota=${cpuQuotaPercent(grantCores)}%`]), ...(measureMemory ? ['-p', 'MemoryAccounting=yes'] : []), '--quiet', '--collect', '--', ...argv];
+}
+
+/** A pull agent's `remote-exec` supervisor scope: deterministic per execution, and a name systemd accepts. */
+export const supervisorScopeUnit = (execId) => `lane-exec-${execId.replace(/[^A-Za-z0-9:_.-]/g, '-')}`;
+
+/**
+ * What to spawn for a pull agent's `remote-exec` supervisor. When `scope.available` (a `probeCpuLimit` result) it runs in its own transient user scope with
+ * no quota, so it lives under `user@UID.service` and outlives the agent's cgroup; `systemd-run --scope` execs in place, so the spawned pid is the supervisor's.
+ * Otherwise the bare command. Returns `{cmd, args, scoped}`.
+ */
+export function supervisorLaunch(execId, argv, scope) {
+  if (!scope.available) return { cmd: argv[0], args: argv.slice(1), scoped: false };
+  const [cmd, ...args] = cpuLimitArgv(null, argv, { unit: supervisorScopeUnit(execId) });
+  return { cmd, args, scoped: true };
+}
+
+/** `systemd-run --user` reaches the user manager through XDG_RUNTIME_DIR, which a supervisor's minimal environment (bosun gives PATH, HOME, LANG, TZ) lacks. Returns what to add to `env`, or nothing. */
+export function userManagerEnv(env = process.env, { platform = process.platform, uid = process.getuid?.(), exists = fs.existsSync } = {}) {
+  const dir = `/run/user/${uid}`;
+  return platform === 'linux' && uid !== undefined && !env.XDG_RUNTIME_DIR && exists(dir) ? { XDG_RUNTIME_DIR: dir } : {};
 }
 
 /** Execution is distinct from admission: an exclusive reservation is never reduced by this ceiling. */
