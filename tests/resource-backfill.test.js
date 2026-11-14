@@ -439,15 +439,39 @@ test('13: a back-to-back sample reuses the last valid measurement (real sampler 
   assert.match(readLog(state), /sample=ok/);
 });
 
-test('13b: reuse is bounded by the window; without it (or past it) the raw stale reading stands', async () => {
+/** Runs fn with Date.now() returning clock.now, so same-millisecond calls are deterministic. */
+function withClock(fn) {
+  const realNow = Date.now;
+  const clock = { now: realNow() };
+  Date.now = () => clock.now;
+  try {
+    return fn(clock);
+  } finally {
+    Date.now = realNow;
+  }
+}
+
+test('13b: reuse is bounded by the window; without it (or past it) the raw stale reading stands', () => {
   const { state } = freshEnv();
-  sampleHostCpu(state, cpus10(0, 0.54));
-  const advanced = cpus10(1, 0.54);
-  assert.equal(sampleHostCpu(state, advanced).stale, false);
-  assert.equal(sampleHostCpu(state, advanced).stale, true, 'no window: today\'s behaviour');
-  assert.equal(sampleHostCpu(state, advanced, { reuseWindowMs: 60_000 }).reused, true);
-  await new Promise((r) => setTimeout(r, 15));
-  assert.equal(sampleHostCpu(state, advanced, { reuseWindowMs: 5 }).stale, true, 'older than the window: not reused');
+  withClock((clock) => {
+    sampleHostCpu(state, cpus10(0, 0.54));
+    const advanced = cpus10(1, 0.54);
+    assert.equal(sampleHostCpu(state, advanced).stale, false);
+    assert.equal(sampleHostCpu(state, advanced).stale, true, 'no window: today\'s behaviour');
+    assert.equal(sampleHostCpu(state, advanced, { reuseWindowMs: 60_000 }).reused, true);
+    clock.now += 15;
+    assert.equal(sampleHostCpu(state, advanced, { reuseWindowMs: 5 }).stale, true, 'older than the window: not reused');
+  });
+});
+
+test('13b-same-ms: samples in one millisecond still persist the newest, so the next call diffs against it (BRAIN-1078)', () => {
+  const { state } = freshEnv();
+  withClock(() => {
+    sampleHostCpu(state, cpus10(0, 0.54));
+    const advanced = cpus10(1, 0.54);
+    assert.equal(sampleHostCpu(state, advanced).stale, false);
+    assert.equal(sampleHostCpu(state, advanced).stale, true, 'the advanced snapshot was persisted, so identical counters read stale');
+  });
 });
 
 async function withStatusEnv(home, state, fn) {
