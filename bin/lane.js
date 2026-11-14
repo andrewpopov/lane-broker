@@ -41,7 +41,6 @@ import { phasesReportCommand } from '../src/phases-report.js';
 import { lossesReportCommand } from '../src/losses-report.js';
 import { placementReportCommand } from '../src/placement-report.js';
 import { pullCheckCommand } from '../src/pull-check.js';
-import { agentCommand } from '../src/agent/cli.js';
 
 function usage() {
   return `Usage:
@@ -426,8 +425,10 @@ async function main() {
       process.stderr.write(`lane pull: ${rest[0] === undefined ? 'missing subcommand' : `unknown subcommand "${rest[0]}"`} (only \`check\`)\n`);
       return 2;
     }
-    case 'agent':
+    case 'agent': {
+      const { agentCommand } = await import('../src/agent/cli.js');
       return (await agentCommand(rest, { remoteRoot: parseRootFlag(rest) || defaultRemoteRoot() })).exitCode;
+    }
     case 'report': {
       if (rest[0] === 'phases') return (await phasesReportCommand(rest.slice(1))).exitCode;
       if (rest[0] === 'losses') return (await lossesReportCommand(rest.slice(1))).exitCode;
