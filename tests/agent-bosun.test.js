@@ -118,9 +118,10 @@ const scenarios = {
 
   'XDG_RUNTIME_DIR missing at start is filled in for the agent and its supervisors, whether or not the directory exists yet': async (w, rw, load) => {
     const saved = process.env.XDG_RUNTIME_DIR;
+    const savedSpawn = rw.ctx.env.XDG_RUNTIME_DIR;
     delete process.env.XDG_RUNTIME_DIR;
+    delete rw.ctx.env.XDG_RUNTIME_DIR;
     try {
-      assert.equal(rw.ctx.env.XDG_RUNTIME_DIR, undefined);
       const calls = [];
       const agent = await rw.agent({ load, platform: 'linux', driverOptions: scopeOptions(calls, stubProbe({ available: false, reason: 'tests' })) });
       await rw.claimed(await rw.submit({ code: 'process.exit(0)' }));
@@ -132,6 +133,7 @@ const scenarios = {
     } finally {
       if (saved === undefined) delete process.env.XDG_RUNTIME_DIR;
       else process.env.XDG_RUNTIME_DIR = saved;
+      if (savedSpawn !== undefined) rw.ctx.env.XDG_RUNTIME_DIR = savedSpawn;
     }
   },
 
