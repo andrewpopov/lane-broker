@@ -214,7 +214,7 @@ export function sampleHostCpu(root, cpus = os.cpus(), { reuseWindowMs = 0, preem
   if (lastValid) snapshot.lastValid = lastValid;
   try {
     const latest = readJsonSafe(file);
-    if (!latest || !Number.isFinite(latest.at) || latest.at < snapshot.at) {
+    if (!latest || !Number.isFinite(latest.at) || latest.at <= snapshot.at) {
       atomicWriteJson(file, snapshot);
     }
   } catch {
