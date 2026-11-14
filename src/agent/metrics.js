@@ -9,7 +9,7 @@ const escapeLabel = (value) => String(value).replace(/\\/g, '\\\\').replace(/"/g
 const labelled = (name, labels) => `${name}{${Object.entries(labels).map(([k, v]) => `${k}="${escapeLabel(v)}"`).join(',')}}`;
 
 /** The agent's Prometheus text exposition for bosun's textfile collector: every subphase and claim answer is present, 0 when empty. */
-export function renderAgentMetrics({ now, records, claims, listening, registered, scopeAvailable, version }) {
+export function renderAgentMetrics({ now, records, claims, listening, registered, scopeAvailable, version, deviceGates = {} }) {
   const count = (subphase) => records.filter((r) => r.subphase === subphase).length;
   const families = [
     ['lane_agent_last_tick_timestamp_seconds', 'gauge', 'Unix time of the agent loop\'s last tick.', [['lane_agent_last_tick_timestamp_seconds', now / 1000]]],
@@ -18,6 +18,7 @@ export function renderAgentMetrics({ now, records, claims, listening, registered
     ['lane_agent_listen_up', 'gauge', '1 while the LISTEN connection is up.', [['lane_agent_listen_up', listening ? 1 : 0]]],
     ['lane_agent_registered', 'gauge', '1 once the queue has registered this runner.', [['lane_agent_registered', registered ? 1 : 0]]],
     ['lane_agent_scope_available', 'gauge', '1 while remote-exec supervisors can start in their own user scope.', [['lane_agent_scope_available', scopeAvailable ? 1 : 0]]],
+    ...(Object.keys(deviceGates).length ? [['lane_agent_device_gate_closed', 'gauge', '1 while a configured device gate (thermal, power) refuses new claims.', Object.entries(deviceGates).map(([gate, state]) => [labelled('lane_agent_device_gate_closed', { gate }), state.closed ? 1 : 0])]] : []),
     ['lane_agent_info', 'gauge', 'Always 1; the agent version is the label.', [[labelled('lane_agent_info', { version }), 1]]],
   ];
   return `${families.map(([name, type, help, samples]) => [`# HELP ${name} ${help}`, `# TYPE ${name} ${type}`, ...samples.map(([series, value]) => `${series} ${value}`)].join('\n')).join('\n')}\n`;

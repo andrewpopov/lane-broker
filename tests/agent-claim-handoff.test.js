@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { logins, call, enqueue, claim, tid } from './lane-dispatch-fixture.js';
 import { agentPg } from './agent-harness.js';
 import { scenarioSuite, happens, sleep } from './agent-run-harness.js';
+import { readAgentStatus } from '../src/agent/store.js';
 
 const open = () => null;
 const offer = () => ({ freeCpu: 8, freeMem: 1e9 });
@@ -127,6 +128,34 @@ const scenarios = {
     }
   },
 
+  'a closed thermal gate takes no claim and shows paused:thermal; it reopens only after openSamples clean samples, then the claim goes through': async (w, rw, load) => {
+    const readings = { pressureLevel: 2 };
+    let release;
+    const secondCleanSample = new Promise((resolve) => { release = resolve; });
+    let clean = 0;
+    const deviceSampler = async () => {
+      if (readings.pressureLevel === 0 && clean++ >= 1) await secondCleanSample;
+      return { thermal: { ...readings }, power: {} };
+    };
+    const ticket = await rw.submit({ code: 'process.exit(0)' });
+    try {
+      const agent = await rw.agent({ load, deviceSampler, config: { deviceGates: { thermal: { maxPressureLevel: 1, openSamples: 2 } } } });
+      const gate = () => readAgentStatus(rw.root).deviceGates?.thermal;
+      await happens('the gate closed and the status says why', () => gate()?.closed === true && readAgentStatus(rw.root).claims === 'paused:thermal');
+      await sleep(400);
+      assert.equal(agent.names().includes('ld_claim'), false, 'no claim while the gate is closed');
+      assert.equal((await w.ticket(ticket.id)).epoch, 0);
+      readings.pressureLevel = 0;
+      await happens('one clean sample is counted and the gate stays closed', () => gate()?.consecutiveOk === 1);
+      assert.deepEqual([gate().closed, gate().reading.pressureLevel, agent.names().includes('ld_claim')], [true, 0, false]);
+      release();
+      await rw.claimed(ticket);
+      await happens('the gate shows open', () => gate()?.closed === false);
+    } finally {
+      release();
+    }
+  },
+
   'the schedule window is respected: outside it, or too close to its close, no ld_claim is made': async (w, rw, load) => {
     const { claimBlock, claimOnce } = await load('agent/claims.js');
     const block = (now) => claimBlock({ schedule: SCHEDULE, stopClaimingBeforeCloseMs: 30 * 60_000, now, draining: () => false });
@@ -144,7 +173,11 @@ const scenarios = {
 };
 
 const CLAIMS = 'agent/claims.js';
+const gateName = 'a closed thermal gate takes no claim and shows paused:thermal; it reopens only after openSamples clean samples, then the claim goes through';
 const canaries = [
+  [gateName, CLAIMS, ['return closedGateReason(deviceGates);', 'return null;']],
+  [gateName, 'agent/run.js', ['        await refreshDeviceGates();\n', '']],
+  [gateName, 'device-gates.js', ['if (state.consecutiveOk >= openSamples) {', 'if (state.consecutiveOk >= 1) {']],
   ['the req is persisted before ld_claim is called, and a claimed answer leaves a FETCHING record and no pending req', CLAIMS, ['if (!pending) writePendingClaim(remoteRoot, req);', '']],
   ['a claim whose answer was lost is replayed under the same req however old it is, and adopts exactly one ticket', CLAIMS, ['const req = pending?.req ?? randomUUID();', 'const req = randomUUID();']],
   ['a crash after the record and before the pending delete: the replay adopts the record unchanged', CLAIMS, ['if (!core.table.get(execId)) core.table.put(', 'core.table.put(']],

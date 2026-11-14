@@ -14,6 +14,7 @@ import { queuedClaimsByClass } from './allocation-shadow.js';
 import { readLastSimDemandAt } from './sim-arm.js';
 import { listAttempts, supervisorAlive, moveInterruptedLabel, isStrandedWithdrawingMove } from './attempts.js';
 import { readGateState } from './load.js';
+import { liveDeviceGates, renderDeviceGatesLine, sampleDevice } from './device-gates.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfigOrError, isDispatchOnly } from './config.js';
 import { resolveCpuLimit, enforcementOf } from './cpu-limit.js';
@@ -175,7 +176,7 @@ export function renderRemoteDrainLine(remoteDrain, { running, queued }) {
   return `drain: draining (${remoteDrain.reason}) since ${since}; remaining here: ${running} running, ${queued} queued`;
 }
 
-export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false, scan = scanProcWindow, remoteRoot = defaultRemoteRoot() } = {}) {
+export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false, scan = scanProcWindow, remoteRoot = defaultRemoteRoot(), sampleDeviceGates = false } = {}) {
   const root = ensureStateDirs().root;
   const { config: cfg, error: configError } = loadGlobalConfigOrError();
   refreshCpuEstimates(cfg);
@@ -389,6 +390,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     // null whenever the sample itself is unavailable (non-macOS host, or a
     // failed probe), never a fabricated reading.
     memory: classifyMemorySample(readMemorySample()),
+    ...(sampleDeviceGates && cfg.deviceGates ? { deviceGates: liveDeviceGates(cfg.deviceGates, await sampleDevice(cfg.deviceGates)) } : {}),
     running,
     queued,
     remote,
@@ -625,6 +627,7 @@ export function renderStatusText(status) {
     );
   }
   lines.push(renderMemoryLine(status.memory));
+  if (status.deviceGates) lines.push(renderDeviceGatesLine(status.deviceGates));
   if (status.priority && !status.priority.active) {
     lines.push('priority: inactive (legacy scheduler; run lane migrate-scheduler)');
   } else if (status.priority) {
@@ -731,7 +734,7 @@ function spawnReconcileSweep(status) {
 
 export async function statusCommand({ json } = {}) {
   const root = ensureStateDirs().root;
-  const status = await collectStatus({ scanExternal: true });
+  const status = await collectStatus({ scanExternal: true, sampleDeviceGates: true });
   spawnReconcileSweep(status);
 
   // The lock diagnostic goes to stderr in BOTH modes, before either branch:

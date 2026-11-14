@@ -32,7 +32,17 @@ test('T5 a valid config builds a verify-full pg config with the password from it
     keepAlive: true, connectionTimeoutMillis: 10_000, query_timeout: 20_000,
     ssl: { ca: 'CA PEM\n', rejectUnauthorized: true, servername: 'pitelite' },
   });
-  assert.deepEqual([config.speedFactor, config.pollMs, config.requireAcPower, config.schedule, config.fetchBudgetMs, config.runnerName], [1, 15_000, false, null, 600_000, 'wintop']);
+  assert.deepEqual([config.speedFactor, config.pollMs, config.schedule, config.fetchBudgetMs, config.runnerName, config.deviceGates], [1, 15_000, null, 600_000, 'wintop', null]);
+  assert.equal('requireAcPower' in config, false);
+});
+
+test('deviceGates come from the broker config the agent loads', () => {
+  const deviceGates = { power: { requireAc: true, openSamples: 2 } };
+  assert.deepEqual(load(setup().file, { brokerConfig: { remoteBlobCache: true, deviceGates } }).deviceGates, deviceGates);
+});
+
+test('requireAcPower was never enforced here: it is refused with where it moved, whatever its value', () => {
+  for (const value of [true, false, 'yes']) refused(setup({ requireAcPower: value }).file, /^"requireAcPower" moved: set deviceGates\.power\.requireAc in the lane-broker config$/);
 });
 
 test('T5 a relative passwordFile and caFile resolve against the config directory, not the cwd', () => {

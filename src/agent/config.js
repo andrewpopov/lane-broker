@@ -19,7 +19,7 @@ export const LIVENESS_MS = 15_000;
 // A dead peer must surface as an error the client retries, not a hung query: keepalive probes, a connect bound, and a client-side bound above the role's 2 s statement_timeout.
 export const PG_LIVENESS = Object.freeze({ keepAlive: true, connectionTimeoutMillis: 10_000, query_timeout: 20_000 });
 
-const DEFAULTS = { stopClaimingBeforeCloseMs: 30 * 60_000, requireAcPower: false, pollMs: LIVENESS_MS, speedFactor: 1, fetchBudgetMs: 10 * 60_000 };
+const DEFAULTS = { stopClaimingBeforeCloseMs: 30 * 60_000, pollMs: LIVENESS_MS, speedFactor: 1, fetchBudgetMs: 10 * 60_000 };
 const KNOWN = new Set(['laneQueueUrl', 'passwordFile', 'caFile', 'runnerName', 'rustfs', 'rustfsEnvFile', 'brokerHome', 'stateDir', 'schedule', ...Object.keys(DEFAULTS)]);
 const RUNNER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const RUSTFS_KEYS = new Set(['endpoint', 'region', 'snapBucket', 'outBucket']);
@@ -95,6 +95,7 @@ export function loadAgentConfig({ file = path.join(AGENT_CONFIG_DIR, 'config.jso
     throw new AgentConfigError(`${file}: invalid JSON (${err.message})`);
   }
   if (cfg === null || typeof cfg !== 'object' || Array.isArray(cfg)) throw new AgentConfigError(`${file}: must be a JSON object`);
+  if ('requireAcPower' in cfg) throw new AgentConfigError('"requireAcPower" moved: set deviceGates.power.requireAc in the lane-broker config');
   const unknown = Object.keys(cfg).filter((k) => !KNOWN.has(k));
   if (unknown.length) throw new AgentConfigError(`${file}: unknown field(s) ${unknown.join(', ')}`);
   const brokerHome = absolutePath(cfg, 'brokerHome', defaultBrokerHome());
@@ -110,7 +111,6 @@ export function loadAgentConfig({ file = path.join(AGENT_CONFIG_DIR, 'config.jso
     const problem = scheduleProblem(cfg.schedule);
     if (problem) throw new AgentConfigError(`${file}: ${problem}`);
   }
-  if (cfg.requireAcPower !== undefined && typeof cfg.requireAcPower !== 'boolean') throw new AgentConfigError('"requireAcPower" must be a boolean');
 
   if (typeof cfg.runnerName !== 'string' || !RUNNER_NAME.test(cfg.runnerName)) throw new AgentConfigError('"runnerName" must be the runner\'s host name as the queue knows it (letters, digits, ".", "_", "-")');
   const rustfs = parseRustfs(cfg, dir, uid);
@@ -124,7 +124,7 @@ export function loadAgentConfig({ file = path.join(AGENT_CONFIG_DIR, 'config.jso
     pg: { ...target, ...PG_LIVENESS, password, ssl: { ca, rejectUnauthorized: true, servername: target.host } },
     schedule: cfg.schedule ?? null,
     stopClaimingBeforeCloseMs: positiveNumber(cfg, 'stopClaimingBeforeCloseMs'),
-    requireAcPower: cfg.requireAcPower ?? DEFAULTS.requireAcPower,
+    deviceGates: broker.deviceGates ?? null,
     pollMs: positiveNumber(cfg, 'pollMs', { max: LIVENESS_MS }),
     speedFactor: positiveNumber(cfg, 'speedFactor', { max: MAX_SPEED_FACTOR }),
   };

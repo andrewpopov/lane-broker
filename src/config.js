@@ -11,6 +11,7 @@ import { unsupportedHookKeys, hookRefusalMessage, EXCLUSIVE_PURPOSES, exclusiveD
 import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js';
 import { DEFAULT_DEPS_CACHE_MAX_BYTES, DEFAULT_DEPS_CACHE_REGISTRIES, registriesProblem } from './deps-cache.js';
 import { isValidRequiresShape, VERSION_FLOOR_RE } from './runner-readiness.js';
+import { deviceGatesProblem } from './device-gates.js';
 import { CPU_LIMIT_MODES, MEMORY_LIMIT_MODES, MIN_CPU_GRANT_CORES } from './cpu-limit.js';
 
 /** The largest delay Node's setTimeout honours; above it the timer fires after 1 ms. */
@@ -552,6 +553,10 @@ function validateGlobalConfig(cfg, sourcePath) {
   if (cfg.runners !== undefined) validateRunners(cfg.runners, sourcePath);
   validateLanePull(cfg, sourcePath);
   validatePriorityConfig(cfg, sourcePath);
+  if (cfg.deviceGates !== undefined) {
+    const problem = deviceGatesProblem(cfg.deviceGates);
+    assert(problem === null, `${sourcePath}: ${problem}`);
+  }
 }
 
 const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);

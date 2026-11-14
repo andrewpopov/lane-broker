@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { drainBlocksIntake, executionIdOf, readDrainMarker, readRemoteDrain, stateHome, ensureStateDirs } from '../state.js';
 import { runnerAvailability } from '../runner-schedule.js';
+import { closedGateReason } from '../device-gates.js';
 import { loadGlobalConfig } from '../config.js';
 import { collectStatus } from '../status.js';
 import { listLeases } from '../lease.js';
@@ -13,13 +14,13 @@ export const MAX_FREE_MEM = Number.MAX_SAFE_INTEGER;
 
 export const isDraining = (stateDir = stateHome()) => readRemoteDrain(stateDir) !== null || drainBlocksIntake(readDrainMarker(stateDir));
 
-/** Why this runner takes no new claim now, or null: a drain marker, outside its schedule window, or too close to the window closing. */
-export function claimBlock({ schedule, stopClaimingBeforeCloseMs, now = Date.now(), draining = isDraining }) {
+/** Why this runner takes no new claim now, or null: a drain marker, outside its schedule window, too close to the window closing, or a closed device gate. */
+export function claimBlock({ schedule, stopClaimingBeforeCloseMs, now = Date.now(), draining = isDraining, deviceGates }) {
   if (draining()) return 'draining';
   const { available, closesAt } = runnerAvailability(schedule, now);
   if (!available) return 'outside-schedule';
   if (closesAt !== null && closesAt - now <= stopClaimingBeforeCloseMs) return 'closing-soon';
-  return null;
+  return closedGateReason(deviceGates);
 }
 
 const clampMem = (bytes) => Math.min(Math.max(0, Math.floor(bytes)), MAX_FREE_MEM);
