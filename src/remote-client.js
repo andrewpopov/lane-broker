@@ -302,14 +302,14 @@ function neverFits(reservation, probe) {
  * `opts.busyQueueable` (BRAIN-899, default false; needs `maxRemoteQueue > 0` and a ranking `finishModel`): the place path's
  * counterpart to `allowBusyQueue` -- a runner with an EMPTY queue but no headroom is a queued candidate too, because waiting for
  * a fast runner is the whole point of the model. Rebind keeps `allowBusyQueue` (a locally CPU-blocked ticket) as its only route.
- * BRAIN-1072 `readinessNeeds.avoidTags`: while a runner without them is up (however deep its queue) or `opts.preferredRunnerUp` says one is
- * (a rebalance source), runners declaring them are skipped as `avoided tag <t>`; with none up they rank with the rest (README "avoidTags").
+ * BRAIN-1072 `readinessNeeds.avoidTags`: while a runner without them is up (however deep its queue, and not dropped by its schedule) runners
+ * declaring them are skipped as `avoided tag <t>`; `opts.observeOnly` names runners judged for that but never chosen (a rebalance source).
  */
 export async function selectRunner(runners, opts = {}) {
   const deadlineMs = opts.deadlineMs ?? DEFAULT_GLOBAL_CONFIG.remoteProbeDeadlineMs;
   const retryTimedOut = new Set(opts.retryTimedOut ?? []);
   const sshBin = opts.sshBin ?? 'ssh';
-  const { env, requireProtocol2 = false, requireCapabilities = [], readinessNeeds = {}, reservation, maxRemoteQueue = 0, allowBusyQueue = false, downRunners = {}, queuedFilter = () => true, finishModel = null, busyQueueable = false, slotAwareWait = true, preferredRunnerUp = false } = opts;
+  const { env, requireProtocol2 = false, requireCapabilities = [], readinessNeeds = {}, reservation, maxRemoteQueue = 0, allowBusyQueue = false, downRunners = {}, queuedFilter = () => true, finishModel = null, busyQueueable = false, slotAwareWait = true, observeOnly = [] } = opts;
   const skipped = [];
   const readiness = {};
   const ready = [];
@@ -323,7 +323,7 @@ export async function selectRunner(runners, opts = {}) {
   const queuedSeq = [];
   const busySeq = []; // passed every check except headroom, empty queue: its own broker would hold the ticket until it has room
   const avoided = new Map(); // runner name -> the avoidTags its probe declares
-  const preferredUp = []; // runners up for this ticket that declare none of them
+  const preferredUp = []; // candidates for runners up for this ticket that declare none of them
   const better = (cand, best) => !best || cand.finish < best.finish || (cand.finish === best.finish && cand.cpuFree > best.cpuFree);
   const fewerQueued = (cand, best) => !best || cand.probe.queued < best.probe.queued || (cand.probe.queued === best.probe.queued && better(cand, best));
   const bestOf = (seq, cmp) => seq.reduce((best, cand) => (cmp(cand, best) ? cand : best), null);
@@ -402,6 +402,11 @@ export async function selectRunner(runners, opts = {}) {
     }
     ready.push(runner.name);
     const avoidedTags = avoidedTagsOf(probe, readinessNeeds);
+    const observed = observeOnly.includes(runner.name);
+    const noteUp = (cand) => {
+      if (avoidedTags.length === 0) preferredUp.push(cand);
+      else if (!observed) avoided.set(runner.name, avoidedTags);
+    };
     if (probe.configError) {
       skipped.push({ name: runner.name, reason: `runner config unreadable: ${probe.configError}` });
       continue;
@@ -424,12 +429,11 @@ export async function selectRunner(runners, opts = {}) {
       const never = Boolean(reservation && neverFits(reservation, probe));
       skipped[skipped.length - 1].neverFits = never;
       const fits = !never;
-      if (fits && avoidedTags.length > 0) avoided.set(runner.name, avoidedTags);
-      else if (fits) preferredUp.push(runner.name);
       const queueable = Number.isInteger(probe.queued) && probe.queued > 0 && probe.queued <= maxRemoteQueue;
-      if (fits && queueable) {
+      if (fits) {
         const cand = candidate(probe, 0, false);
-        if (queuedFilter(cand)) {
+        noteUp(cand);
+        if (!observed && queueable && queuedFilter(cand)) {
           queuedSeq.push(cand);
           // BRAIN-899 A3: a runner still in the running for the queued choice is not an exclusion, however deep its queue
           skipped[skipped.length - 1].candidate = true;
@@ -441,12 +445,15 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason: 'runner capacity can never fit this ticket', neverFits: true });
       continue;
     }
-    if (avoidedTags.length > 0) avoided.set(runner.name, avoidedTags);
-    else preferredUp.push(runner.name);
     const { room, cpuFree, reason } = reservation ? runnerRoom(reservation, probe) : { room: true, cpuFree: 0 };
+    const cand = candidate(probe, cpuFree, room);
+    noteUp(cand);
+    if (observed) {
+      skipped.push({ name: runner.name, reason: 'observed only (the ticket is queued there)' });
+      continue;
+    }
     if (!room) {
       skipped.push({ name: runner.name, reason });
-      const cand = candidate(probe, cpuFree, false);
       busySeq.push(cand);
       const queueableToday = allowBusyQueue && maxRemoteQueue > 0;
       cand.queueableOnlyIfRanked = busyIsQueueable && !queueableToday;
@@ -456,15 +463,14 @@ export async function selectRunner(runners, opts = {}) {
       }
       continue;
     }
-    idleSeq.push(candidate(probe, cpuFree, true));
+    idleSeq.push(cand);
   }
   const readinessField = { ready, ...(Object.keys(readiness).length > 0 ? { readiness } : {}) };
-  function rankField(idleSeq, queuedSeq, busySeq) {
+  function rankField(idleSeq, queuedSeq, busySeq, { inspectOnly = [], exclude = new Set() } = {}) {
     const drops = [];
     const pool = [...idleSeq, ...queuedSeq];
-    const pooled = new Set(pool);
     // every candidate the ranking below, or the schedule check under it, can inspect
-    const inspectable = [...pool, ...busySeq.filter((cand) => !pooled.has(cand))];
+    const inspectable = [...new Set([...pool, ...busySeq, ...inspectOnly])];
     const estimates = new Map();
     if (scoring) {
       // BRAIN-899 B3: ONE `estimateAll` call over that whole field, so every runner is estimated at the same tier instead of each at
@@ -496,17 +502,18 @@ export async function selectRunner(runners, opts = {}) {
     }
     const droppedNames = new Set([...dropped].map((cand) => cand.runner.name));
     const ranking = (result) => ({ result, drops, droppedNames });
-    const liveBusy = busySeq.filter((cand) => !dropped.has(cand));
+    const live = (cand) => !dropped.has(cand) && !exclude.has(cand.runner.name);
+    const liveBusy = busySeq.filter(live);
     const busyBest = bestOf(liveBusy, better);
     if (!ranked) {
-      const idleBest = bestOf(idleSeq.filter((cand) => !dropped.has(cand)), better);
-      const queuedBest = bestOf(queuedSeq.filter((cand) => !dropped.has(cand) && !cand.queueableOnlyIfRanked), fewerQueued);
+      const idleBest = bestOf(idleSeq.filter(live), better);
+      const queuedBest = bestOf(queuedSeq.filter((cand) => live(cand) && !cand.queueableOnlyIfRanked), fewerQueued);
       if (idleBest) return ranking({ runner: idleBest.runner, probe: idleBest.probe, ...readinessField });
       if (queuedBest) return ranking({ runner: queuedBest.runner, probe: queuedBest.probe, ...readinessField, queuedChoice: true });
       return ranking({ runner: null, ...readinessField, ...(busyBest ? { busy: { runner: busyBest.runner, probe: busyBest.probe } } : {}) });
     }
     const rows = pool
-      .filter((cand) => !dropped.has(cand))
+      .filter(live)
       .map((cand) => {
         const estimate = estimateOf(cand.runner);
         const slots = slotsOf(cand.probe);
@@ -529,10 +536,9 @@ export async function selectRunner(runners, opts = {}) {
     }
     return ranking({ runner: null, ...readinessField, ...(busyBest ? { busy: { runner: busyBest.runner, probe: busyBest.probe } } : {}), scores });
   }
-  const isPreferred = (cand) => !avoided.has(cand.runner.name);
   if (avoided.size > 0) {
-    const preferred = rankField(idleSeq.filter(isPreferred), queuedSeq.filter(isPreferred), busySeq.filter(isPreferred));
-    if (preferredRunnerUp || preferredUp.some((name) => !preferred.droppedNames.has(name))) {
+    const preferred = rankField(idleSeq, queuedSeq, busySeq, { inspectOnly: preferredUp, exclude: new Set(avoided.keys()) });
+    if (preferredUp.some((cand) => !preferred.droppedNames.has(cand.runner.name))) {
       for (const entry of skipped) if (avoided.has(entry.name)) delete entry.candidate;
       const avoidSkips = [...avoided].map(([name, tags]) => ({ name, reason: `avoided tag ${tags.join(', ')} (avoidTags; a runner without it is up)` }));
       return { ...preferred.result, skipped: [...skipped, ...preferred.drops, ...avoidSkips] };

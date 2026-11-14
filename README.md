@@ -882,7 +882,8 @@ a runner whose OS or tooling the repo does not support (Playwright on an unsuppo
 
 `requiresTags` is a hard filter. `"avoidTags": ["gpu-d3d12-iris-xe"]` on a lane is a soft one: a runner that declares one of those tags in
 its `runnerTags` is **avoided**. It is placed on only when no runner without the tag is up for the ticket. "Up" means probed and ready,
-not paused or draining, able to fit the ticket, and not dropped by its schedule. Queue depth does not count, so a busy runner without
+not paused or draining, able to fit the ticket, and not dropped by its schedule window (judged by the predicted finish, for a busy
+runner or one queued past `maxRemoteQueue` too). Queue depth does not count, so a busy runner without
 the tag still keeps the lane off the avoided one. While such a runner is up, placement chooses among the others alone and logs each
 avoided runner as `avoided tag <t> (avoidTags; a runner without it is up)`. When none is up (switched off by its `schedule`, unreachable,
 drained), the avoided runners rank with the rest as before. Use it for a runner that another lane needs (the only runner carrying a
@@ -890,9 +891,10 @@ drained), the avoided runners rank with the rest as before. Use it for a runner 
 
 - **Exclusion, not a penalty.** The finish model already prices a slow runner (`speedFactor`). What it cannot see is the lane that has
   nowhere else to go. Any finite penalty would still lose to a deep enough queue elsewhere.
-- **Rebalance.** A ticket queued on a runner without the tag is never moved onto an avoided runner. That source runner is itself up.
-  Once the source is leaving (drained, `offline`, outside its schedule), the avoided runner is a destination again. A ticket queued on an
-  avoided runner moves to a runner without the tag by the ordinary rules.
+- **Rebalance.** The runner a ticket is queued on is probed with the destinations and judged by the same rule, but never chosen. While
+  it is up, the ticket is not moved onto an avoided runner. Once it is not (paused, drained, `offline`, outside its schedule), the
+  avoided runner is a destination again. At the `remoteRefusedMaxQueuedMs` deadline an idle avoided runner is taken rather than
+  refusing with `76`. A ticket queued on an avoided runner moves to a runner without the tag by the ordinary rules.
 - **Config.** Lane level only, the same name shape as `requiresTags`, deduplicated, inherited by an `undeclaredLanes: {"as": ...}`
   lane. A lane that both requires and avoids a tag, at lane or repo level, is a config error.
 - **Probe.** The tags are asked in the same `--tags` flag as `requiresTags`, so every runner that answers `requiresTags` answers these

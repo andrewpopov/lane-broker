@@ -153,8 +153,45 @@ test('avoidTags: with no runner without the tag up, the avoided runner is the fa
   assert.equal(down.skipped.some((s) => /avoided/.test(s.reason)), false);
   const paused = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet({ skybox: { paused: true } }), deadlineMs: 3000, readinessNeeds: AVOID });
   assert.equal(paused.runner.name, 'wintop');
-  const told = await selectRunner(runners('wintop'), { sshBin: avoidFleet(), deadlineMs: 3000, readinessNeeds: AVOID, preferredRunnerUp: true });
-  assert.equal(told.runner, null, 'a caller that knows a preferred runner is up (a rebalance source) keeps the avoided one out');
+});
+
+test('avoidTags: an observed-only runner (a rebalance source) counts as up by the same rule, and is never chosen', async () => {
+  const queuedThere = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet({ skybox: { queued: 1 } }), deadlineMs: 3000, readinessNeeds: AVOID, observeOnly: ['skybox'] });
+  assert.equal(queuedThere.runner, null, 'skybox holds the ticket and is up: wintop stays out');
+  const idleThere = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet(), deadlineMs: 3000, readinessNeeds: AVOID, observeOnly: ['skybox'] });
+  assert.equal(idleThere.runner, null, 'an observed runner is never the choice, idle or not');
+  const pausedThere = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet({ skybox: { queued: 1, paused: true } }), deadlineMs: 3000, readinessNeeds: AVOID, observeOnly: ['skybox'] });
+  assert.equal(pausedThere.runner.name, 'wintop', 'a paused source is not up');
+});
+
+// A Sunday 13:00 PDT, and a skybox window that closes 300s later: a 600s run there cannot finish inside it.
+const NOW = Date.parse('2026-10-11T20:00:00Z');
+const CLOSING_SOON = { timezone: 'America/Los_Angeles', available: [{ days: ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'], from: '06:00', to: '13:05' }] };
+const windowFleet = (closing) => [makeRunner({ ssh: 'wintop' }), { ...makeRunner({ ssh: 'skybox' }), ...(closing ? { schedule: CLOSING_SOON } : {}) }];
+const WINDOW_OPTS = {
+  deadlineMs: 3000,
+  now: NOW,
+  readinessNeeds: AVOID,
+  reservation: { weight: 1, cpuCores: 4, memoryBytes: 1e9 },
+  maxRemoteQueue: 6,
+  finishModel: { estimateFor: (runner) => ({ ms: runner.name === 'skybox' ? 600_000 : 900_000, tier: 'repo-lane', n: 3 }) },
+};
+const ROOMY = { headroom: { cpuCores: 8, memoryBytes: 1e12 } };
+
+test('avoidTags: a busy preferred runner whose window closes before the predicted finish is not up, so the avoided runner is chosen', async () => {
+  const sshBin = avoidFleet({ wintop: ROOMY, skybox: { headroom: { cpuCores: 0, memoryBytes: 1e12 } } });
+  const closing = await selectRunner(windowFleet(true), { ...WINDOW_OPTS, sshBin, busyQueueable: true });
+  assert.equal(closing.runner?.name, 'wintop', JSON.stringify(closing.skipped));
+  const open = await selectRunner(windowFleet(false), { ...WINDOW_OPTS, sshBin, busyQueueable: true });
+  assert.equal(open.runner.name, 'skybox', 'with its window open the busy skybox keeps wintop out');
+});
+
+test('avoidTags: a preferred runner queued past maxRemoteQueue whose window closes before the predicted finish is not up', async () => {
+  const sshBin = avoidFleet({ wintop: ROOMY, skybox: { queued: 9, ...ROOMY } });
+  const closing = await selectRunner(windowFleet(true), { ...WINDOW_OPTS, sshBin });
+  assert.equal(closing.runner?.name, 'wintop', JSON.stringify(closing.skipped));
+  const open = await selectRunner(windowFleet(false), { ...WINDOW_OPTS, sshBin });
+  assert.equal(open.runner, null, 'with its window open the over-cap skybox is up, so wintop is not taken');
 });
 
 test('avoidTags: asked with the requiresTags in one --tags flag, and never a readiness gap', () => {
@@ -165,17 +202,13 @@ test('avoidTags: asked with the requiresTags in one --tags flag, and never a rea
   assert.deepEqual(parseReadinessArgs(['--tags', 'browser,gpu']).tags, ['browser', 'gpu']);
 });
 
-test('avoidTags: a rebalance whose source runner lacks the tag never moves to an avoided runner; a draining or avoided source may', async () => {
+test('avoidTags: selection options carry the lane avoidTags, and ignoreAvoid (the refusal-deadline rescue) drops them', () => {
   const cfg = { ...DEFAULT_GLOBAL_CONFIG, runners: [] };
-  const enriched = { id: 'avoid', lane: 'train', repoId: 'r', weight: 1, resources: { cpuCores: 2 }, remote: { avoidTags: ['gpu'] } };
+  const enriched = { id: 'avoid', lane: 'train', repoId: 'r', weight: 1, resources: { cpuCores: 2 }, remote: { avoidTags: ['gpu'], requiresTags: ['browser'] } };
   const root = tmpDir('avoid-options');
-  const preferredSource = { tags: { gpu: false } };
-  const avoidedSource = { tags: { gpu: true } };
-  assert.equal(selectionOptionsFor('rebalance', enriched, cfg, { root, sourceProbe: preferredSource }).preferredRunnerUp, true);
-  assert.equal(selectionOptionsFor('rebalance', enriched, cfg, { root, sourceProbe: preferredSource, queuedMove: { position: 2, sourceRunner: { name: 'skybox' } } }).preferredRunnerUp, true);
-  assert.equal(selectionOptionsFor('rebalance', enriched, cfg, { root, sourceProbe: preferredSource, draining: { reason: 'outside its schedule' } }).preferredRunnerUp, false);
-  assert.equal(selectionOptionsFor('rebalance', enriched, cfg, { root, sourceProbe: avoidedSource }).preferredRunnerUp, false);
-  assert.equal(selectionOptionsFor('place', enriched, cfg, { root, sourceProbe: preferredSource }).preferredRunnerUp, undefined);
+  assert.deepEqual(selectionOptionsFor('rebalance', enriched, cfg, { root }).readinessNeeds.avoidTags, ['gpu']);
+  const open = selectionOptionsFor('rebalance', enriched, cfg, { root, ignoreAvoid: true }).readinessNeeds;
+  assert.deepEqual([open.avoidTags, open.tags], [[], ['browser']]);
 });
 
 test('config: avoidTags resolves per lane, is inherited by a template, and may not name a tag the lane requires', () => {
