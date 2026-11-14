@@ -26,7 +26,7 @@ async function refusedLoginAttempts(load) {
     if (broken) throw failure('28000', 'pg_hba.conf rejects connection');
     return client;
   };
-  class Driver { adoptAll() {} poke() {} async close() {} }
+  class Driver { adoptAll() {} poke() {} watchScope() {} scopeBlock() { return null; } async close() {} }
   const agent = await startAgent({
     remoteRoot: path.join(tmp, 'remote'), version: 't', s3: {}, Driver, figures: () => null, draining: () => true, log: () => {},
     config: { runnerName: 'a1', pollMs: POLL_MS, schedule: null, stopClaimingBeforeCloseMs: 0, brokerHome: path.join(tmp, 'home'), stateDir: path.join(tmp, 'state'), pg: {} },

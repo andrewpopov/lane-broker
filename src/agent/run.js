@@ -25,8 +25,8 @@ const LIVENESS_CALLS = new Set(['ld_claim', 'ld_heartbeat', 'ld_register']);
  * The broker's home and state directory come from `config` and replace whatever the environment says, here and in the lane processes this
  * agent spawns, so a supervisor's minimal environment and an operator's shell behave the same.
  */
-export async function startAgent({ remoteRoot, config, version, log = (line) => process.stderr.write(`${line}\n`), figures, draining, now = Date.now, timing, s3 = s3ClientOf(config.rustfs), spawnEnv = process.env, laneBin, Driver = ExecutionDriver, coreOptions = {}, textfileDir = process.env.BOSUN_TEXTFILE_DIR, stopSettleMs = STOP_SETTLE_MS }) {
-  const brokerEnv = { LANE_BROKER_HOME: config.brokerHome, LANE_BROKER_STATE: config.stateDir, ...userManagerEnv({ ...process.env, ...spawnEnv }) };
+export async function startAgent({ remoteRoot, config, version, log = (line) => process.stderr.write(`${line}\n`), figures, draining, now = Date.now, timing, s3 = s3ClientOf(config.rustfs), spawnEnv = process.env, laneBin, Driver = ExecutionDriver, coreOptions = {}, textfileDir = process.env.BOSUN_TEXTFILE_DIR, stopSettleMs = STOP_SETTLE_MS, platform = process.platform, driverOptions = {} }) {
+  const brokerEnv = { LANE_BROKER_HOME: config.brokerHome, LANE_BROKER_STATE: config.stateDir, ...userManagerEnv({ ...process.env, ...spawnEnv }, { platform }) };
   Object.assign(process.env, brokerEnv);
   const claimFiguresOf = figures ?? (() => claimFigures({ cfg: loadGlobalConfig({ home: config.brokerHome }) }));
   const isDrainingNow = draining ?? (() => isDraining(config.stateDir));
@@ -43,8 +43,9 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
     await core.close();
     throw new AgentConfigError(`"runnerName" is ${config.runnerName} but the queue registers this login as ${core.ld.registered.host}`);
   }
-  driver = new Driver({ core, remoteRoot, config, s3, timing, waker, log, spawnEnv: { ...spawnEnv, ...brokerEnv }, laneBin, draining: isDrainingNow, now });
+  driver = new Driver({ core, remoteRoot, config, s3, timing, waker, log, spawnEnv: { ...spawnEnv, ...brokerEnv }, laneBin, draining: isDrainingNow, now, onScopeChange: () => { poked = true; waker.poke(); }, ...driverOptions });
   driver.adoptAll();
+  driver.watchScope();
   let stopped = false;
   let upgradeRequired = false;
   const claims = {};
@@ -52,12 +53,12 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
   const writeMetrics = () => {
     if (!textfileDir) return;
     try {
-      writeAgentMetrics(textfileDir, { now: now(), records: core.table.all(), claims, listening: core.ld.listening, registered: core.ld.registered !== null, version });
+      writeAgentMetrics(textfileDir, { now: now(), records: core.table.all(), claims, listening: core.ld.listening, registered: core.ld.registeredOnConnection, scopeAvailable: driver.scopeAvailable, version });
     } catch (err) {
       log(`metrics: ${err.message}`);
     }
   };
-  const block = () => stopped ? 'stopping' : claimBlock({ schedule: config.schedule, stopClaimingBeforeCloseMs: config.stopClaimingBeforeCloseMs, now: now(), draining: isDrainingNow });
+  const block = () => stopped ? 'stopping' : driver.scopeBlock() ?? claimBlock({ schedule: config.schedule, stopClaimingBeforeCloseMs: config.stopClaimingBeforeCloseMs, now: now(), draining: isDrainingNow });
 
   async function claimRound() {
     while (!stopped && !upgradeRequired) {
@@ -83,6 +84,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
       if (poked || now() >= pollAt) {
         poked = false;
         pollAt = now() + config.pollMs;
+        driver.watchScope();
         if (upgradeRequired) log('UPGRADE REQUIRED: the queue refuses this agent\'s protocol, so no claims are made; update lane-broker and restart the agent');
         else await claimRound();
         core.tick({ claims: upgradeRequired ? 'stopped: upgrade required' : 'running' });

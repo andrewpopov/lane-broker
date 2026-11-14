@@ -44,8 +44,8 @@ export class LdClient {
   #closed = false;
   #sleepers = new Set();
 
-  constructor({ pg: pgConfig, version, schedule = null, onWake, onCall, backoff = { minMs: 250, maxMs: 15_000 }, random = Math.random, connect = connectPg }) {
-    Object.assign(this, { pgConfig, version, schedule, onWake, onCall, backoff, random, connect });
+  constructor({ pg: pgConfig, version, schedule = null, onWake, onCall, backoff = { minMs: 250, maxMs: 15_000 }, random = Math.random, connect = connectPg, closeTimeoutMs = 3000 }) {
+    Object.assign(this, { pgConfig, version, schedule, onWake, onCall, backoff, random, connect, closeTimeoutMs });
   }
 
   #sleep(ms) {
@@ -206,11 +206,24 @@ export class LdClient {
     return this.#listenClient !== null;
   }
 
+  /** True while a call connection exists that has registered: false after a drop, until the next call reconnects. */
+  get registeredOnConnection() {
+    return this.#client !== null && this.registered !== null;
+  }
+
+  /** `end()` waits for the socket to close, which a blackholed network never does: after `closeTimeoutMs` the socket is destroyed. */
+  #endBounded(client) {
+    if (!client) return Promise.resolve();
+    let timer;
+    const timedOut = new Promise((resolve) => { timer = setTimeout(() => { client.connection?.stream?.destroy(); resolve(); }, this.closeTimeoutMs); });
+    return Promise.race([client.end().catch(() => {}), timedOut]).finally(() => clearTimeout(timer));
+  }
+
   async close() {
     this.#closed = true;
     for (const wake of [...this.#sleepers]) wake();
     const [call, listen] = [this.#client, this.#listenClient];
     this.#client = this.#listenClient = null;
-    await Promise.all([call, listen].map((c) => c?.end().catch(() => {})));
+    await Promise.all([call, listen].map((c) => this.#endBounded(c)));
   }
 }

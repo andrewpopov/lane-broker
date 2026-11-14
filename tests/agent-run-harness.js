@@ -93,7 +93,7 @@ export class RunnerWorld {
   }
 
   /** The agent under `load` (the real tree, or a mutated copy: its S3 client and error classes must come from the same tree). */
-  async agent({ load = realSrc, config = {}, timing = {}, fetchImpl, s3, Driver, coreOptions, login, ...rest } = {}) {
+  async agent({ load = realSrc, config = {}, timing = {}, fetchImpl, s3, Driver, coreOptions, login, driverOptions, ...rest } = {}) {
     const calls = [];
     const { startAgent } = await load('agent/run.js');
     const { createS3Client } = await load('s3-client.js');
@@ -105,6 +105,7 @@ export class RunnerWorld {
       timing: { ...FAST_TIMING, ...timing },
       coreOptions: { onCall: (name, args) => calls.push([name, args, Date.now()]), backoff: { minMs: 20, maxMs: 100 }, ...coreOptions },
       ...(Driver ? { Driver } : {}),
+      driverOptions: { scopeRequired: false, probeScope: async () => ({ available: false, reason: 'tests: no scope' }), ...driverOptions },
       ...rest,
     });
     this.agents.push(agent);

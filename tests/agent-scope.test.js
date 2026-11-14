@@ -9,7 +9,7 @@ import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 import { sleep, waitFor } from './helpers.js';
 import { CLAIM_ANSWERS, renderAgentMetrics, writeAgentMetrics } from '../src/agent/metrics.js';
 import { SUBPHASES } from '../src/agent/store.js';
-import { userManagerEnv } from '../src/cpu-limit.js';
+import { probeLifetimeScope, userManagerEnv } from '../src/cpu-limit.js';
 
 const EXEC_ID = '11111111-2222-4333-8444-555555555555.e3';
 const ARGV = ['/usr/bin/node', '/opt/lane/bin/lane.js', 'remote-exec', '--epoch', '3'];
@@ -30,13 +30,25 @@ const launchScenarios = {
     assert.equal(supervisorScopeUnit(EXEC_ID), `lane-exec-${EXEC_ID}`);
     assert.equal(supervisorScopeUnit('a/b c\n'), 'lane-exec-a-b-c-');
   },
-  'XDG_RUNTIME_DIR is supplied on linux only when the user manager dir exists and the env has none': async (load) => {
+  'XDG_RUNTIME_DIR is supplied on linux whenever the env has none, even before its directory exists': async (load) => {
     const { userManagerEnv: env } = await load('cpu-limit.js');
-    const present = { platform: 'linux', uid: 1001, exists: () => true };
-    assert.deepEqual(env({ PATH: '/bin' }, present), { XDG_RUNTIME_DIR: '/run/user/1001' });
-    assert.deepEqual(env({ XDG_RUNTIME_DIR: '/custom' }, present), {});
-    assert.deepEqual(env({}, { ...present, exists: () => false }), {});
-    assert.deepEqual(env({}, { ...present, platform: 'darwin' }), {});
+    assert.deepEqual(env({ PATH: '/bin' }, { platform: 'linux', uid: 1001 }), { XDG_RUNTIME_DIR: '/run/user/1001' });
+    assert.deepEqual(env({ XDG_RUNTIME_DIR: '/custom' }, { platform: 'linux', uid: 1001 }), {});
+    assert.deepEqual(env({}, { platform: 'darwin', uid: 501 }), {});
+  },
+  'the lifetime-scope probe passes only for a scope under user@UID.service, and says why it failed': async (load) => {
+    const { probeLifetimeScope } = await load('cpu-limit.js');
+    const calls = [];
+    const answer = (res) => async (file, args, options) => { calls.push({ file, args, options }); return { error: null, status: 0, stdout: '', stderr: '', ...res }; };
+    const run = (res) => probeLifetimeScope({ platform: 'linux', env: { XDG_RUNTIME_DIR: '/run/user/1001' }, exec: answer(res) });
+    assert.deepEqual(await run({ stdout: '0::/user.slice/user-1001.slice/user@1001.service/app.slice/run-r1.scope\n' }), { available: true, reason: 'ok' });
+    assert.deepEqual(calls[0].args, ['--user', '--scope', '--expand-environment=no', '--quiet', '--collect', '--', 'sh', '-c', 'cat /proc/self/cgroup']);
+    assert.equal(calls[0].file, 'systemd-run');
+    assert.equal(calls[0].options.env.XDG_RUNTIME_DIR, '/run/user/1001');
+    assert.match((await run({ stdout: '0::/system.slice/bosun.service\n' })).reason, /^scope-not-under-user-manager: \/system\.slice\/bosun\.service$/);
+    assert.match((await run({ status: 1, error: Object.assign(new Error('x'), { code: 1 }), stderr: 'Failed to connect to bus\nmore' })).reason, /^systemd-run-exit-1: Failed to connect to bus$/);
+    assert.equal((await run({ status: null, error: Object.assign(new Error('x'), { code: 'ENOENT' }) })).reason, 'systemd-run-missing');
+    assert.deepEqual(await probeLifetimeScope({ platform: 'darwin', exec: answer({}) }), { available: false, reason: 'unsupported-platform' });
   },
 };
 const LIMIT = 'cpu-limit.js';
@@ -44,8 +56,10 @@ const launchCanaries = [
   ['a passing probe spawns the supervisor in its own quota-free transient scope, a failing one spawns it bare', ['if (!scope.available) return', 'if (false) return'], null],
   ['a passing probe spawns the supervisor in its own quota-free transient scope, a failing one spawns it bare', ['const uncapped = grantCores === null;', 'const uncapped = false;'], /grantCores must be positive/],
   ['the unit name keeps systemd-safe characters only', ["replace(/[^A-Za-z0-9:_.-]/g, '-')", "replace(/[^A-Za-z0-9:_.\\/ \\n-]/g, '-')"], null],
-  ['XDG_RUNTIME_DIR is supplied on linux only when the user manager dir exists and the env has none', ['!env.XDG_RUNTIME_DIR && ', ''], null],
-  ['XDG_RUNTIME_DIR is supplied on linux only when the user manager dir exists and the env has none', ["platform === 'linux' && uid !== undefined", 'uid !== undefined'], null],
+  ['XDG_RUNTIME_DIR is supplied on linux whenever the env has none, even before its directory exists', ['&& !env.XDG_RUNTIME_DIR ?', '?'], null],
+  ['XDG_RUNTIME_DIR is supplied on linux whenever the env has none, even before its directory exists', ["platform === 'linux' && uid !== undefined", 'uid !== undefined'], null],
+  ['the lifetime-scope probe passes only for a scope under user@UID.service, and says why it failed', ['.test(path) ?', '.test(path) || true ?'], null],
+  ['the lifetime-scope probe passes only for a scope under user@UID.service, and says why it failed', ["if (res.status !== 0) return", "if (false) return"], null],
 ];
 
 for (const [name, scenario] of Object.entries(launchScenarios)) test(name, () => scenario(realSrc));
@@ -57,6 +71,7 @@ for (const [name, mutation, expected] of launchCanaries) {
 }
 
 const SNAPSHOT = {
+  scopeAvailable: true,
   now: 1_700_000_123_456,
   records: [{ subphase: 'RUNNING' }, { subphase: 'RUNNING' }, { subphase: 'OUTBOX' }],
   claims: { claimed: 2, none: 5 },
@@ -76,6 +91,7 @@ const metricsScenarios = {
     assert.deepEqual(CLAIM_ANSWERS.map((a) => sample(text, `lane_agent_claims_total{answer="${a}"}`)), ['2', '5', '0', '0']);
     assert.equal(sample(text, 'lane_agent_listen_up'), '1');
     assert.equal(sample(text, 'lane_agent_registered'), '0');
+    assert.equal(sample(text, 'lane_agent_scope_available'), '1');
     assert.equal(sample(text, 'lane_agent_info{version="1.2\\"3"}'), '1');
     assert.match(text, /# TYPE lane_agent_claims_total counter\n/);
     assert.equal(text.endsWith('\n'), true);
@@ -128,8 +144,27 @@ const stopScenario = async (load) => {
   assert.deepEqual(events, ['stopped'], 'agent.stop() settled before the command returned');
   assert.equal(exitCode, 0, 'a clean stop exits 0');
 };
+const deadlineScenario = async (load) => {
+  const { agentCommand } = await load('agent/cli.js');
+  const signals = new EventEmitter();
+  const lines = [];
+  const start = async () => ({ stop: () => new Promise(() => {}) });
+  const running = agentCommand([], { loadConfig: () => ({}), signals, start, err: { write: (l) => lines.push(l) }, exitDeadlineMs: 150 });
+  await sleep(20);
+  signals.emit('SIGTERM');
+  const outcome = await Promise.race([running, sleep(3000).then(() => 'hung')]);
+  assert.notEqual(outcome, 'hung', 'a stop that never finishes still lets the command exit');
+  assert.equal(outcome.exitCode, 0);
+  assert.match(lines.join(''), /stop did not finish within 150 ms/);
+};
+test('a stop that never finishes still exits 0 at the deadline', () => deadlineScenario(realSrc));
+test('canary (agent/cli.js): without the deadline race, a hung stop hangs the command', async (t) => {
+  const failure = await assertCanaryFails('agent/cli.js', ['await Promise.race([agent.stop(), overdue]);', 'await agent.stop();'], deadlineScenario);
+  t.diagnostic(`failed as expected: ${failure.message.split('\n')[0]}`);
+});
+
 test('SIGTERM stops the agent and the command exits 0 only after stop() settled', () => stopScenario(realSrc));
-for (const mutation of [['    await agent.stop();\n', ''], ['return { exitCode: 0 };\n  } catch', 'return { exitCode: 1 };\n  } catch']]) {
+for (const mutation of [['    await Promise.race([agent.stop(), overdue]);\n', ''], ['return { exitCode: 0 };\n  } catch', 'return { exitCode: 1 };\n  } catch']]) {
   test(`canary (agent/cli.js): with ${JSON.stringify(mutation[0].trim())} changed, the SIGTERM scenario fails on its own assertion`, async (t) => {
     const failure = await assertCanaryFails('agent/cli.js', mutation, stopScenario);
     t.diagnostic(`failed as expected: ${failure.message.split('\n')[0]}`);
@@ -165,6 +200,7 @@ setInterval(() => {}, 1000);
     });
     await waitFor(() => fs.readFileSync(`/proc/${pid}/comm`, 'utf8').trim() === 'sleep', { timeoutMs: 10_000 });
     assert.match(readCgroup(pid), new RegExp(`user@\\d+\\.service/.*${unit.replace(/\./g, '\\.')}$`), 'the supervisor sits in its own scope under the user manager');
+    assert.deepEqual(await probeLifetimeScope({ env: systemdEnv }), { available: true, reason: 'ok' }, 'the lifetime-scope probe agrees');
     agent.kill('SIGKILL');
     await new Promise((resolve) => agent.once('exit', resolve));
     await sleep(500);
