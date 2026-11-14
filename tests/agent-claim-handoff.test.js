@@ -6,6 +6,8 @@ import { randomUUID } from 'node:crypto';
 import { logins, call, enqueue, claim, tid } from './lane-dispatch-fixture.js';
 import { agentPg } from './agent-harness.js';
 import { scenarioSuite, happens, sleep } from './agent-run-harness.js';
+import { readAgentStatus } from '../src/agent/store.js';
+import { writeGlobalConfig } from './helpers.js';
 
 const open = () => null;
 const offer = () => ({ freeCpu: 8, freeMem: 1e9 });
@@ -18,6 +20,23 @@ async function coreFor(rw, load, calls, onCall) {
   });
   rw.agents.push({ stop: () => core.close(), core });
   return core;
+}
+
+const brokerGates = (rw, deviceGates) => writeGlobalConfig(rw.ctx.home, { remoteBlobCache: true, deviceGates });
+
+/** A device sampler that answers only when the test feeds it a reading, so every sample is one deliberate step. */
+function scriptedSampler() {
+  const waiting = [];
+  const sampler = async () => {
+    const reading = await new Promise((resolve) => waiting.push(resolve));
+    return { thermal: reading, power: {} };
+  };
+  const asked = () => happens('the agent asked for a sample', () => waiting.length > 0);
+  const feed = async (reading) => {
+    await asked();
+    waiting.shift()(reading);
+  };
+  return { sampler, feed, asked, releaseAll: () => waiting.splice(0).forEach((resolve) => resolve({})) };
 }
 
 const SCHEDULE = { timezone: 'UTC', available: [{ days: ['mon'], from: '09:00', to: '10:00' }] };
@@ -127,6 +146,92 @@ const scenarios = {
     }
   },
 
+  'a closed thermal gate takes no claim and shows paused:thermal; it reopens only after openSamples clean samples, then the claim goes through': async (w, rw, load) => {
+    const readings = { pressureLevel: 2 };
+    let release;
+    const secondCleanSample = new Promise((resolve) => { release = resolve; });
+    let clean = 0;
+    const deviceSampler = async () => {
+      if (readings.pressureLevel === 0 && clean++ >= 1) await secondCleanSample;
+      return { thermal: { ...readings }, power: {} };
+    };
+    const ticket = await rw.submit({ code: 'process.exit(0)' });
+    const deviceGates = { thermal: { maxPressureLevel: 1, openSamples: 2 } };
+    brokerGates(rw, deviceGates);
+    try {
+      const agent = await rw.agent({ load, deviceSampler, config: { deviceGates } });
+      const gate = () => readAgentStatus(rw.root).deviceGates?.thermal;
+      await happens('the gate closed and the status says why', () => gate()?.closed === true && readAgentStatus(rw.root).claims === 'paused:thermal');
+      await sleep(400);
+      assert.equal(agent.names().includes('ld_claim'), false, 'no claim while the gate is closed');
+      assert.equal((await w.ticket(ticket.id)).epoch, 0);
+      readings.pressureLevel = 0;
+      await happens('one clean sample is counted and the gate stays closed', () => gate()?.consecutiveOk === 1);
+      assert.deepEqual([gate().closed, gate().reading.pressureLevel, agent.names().includes('ld_claim')], [true, 0, false]);
+      release();
+      await rw.claimed(ticket);
+      await happens('the gate shows open', () => gate()?.closed === false);
+    } finally {
+      release();
+    }
+  },
+
+  'a closed thermal gate holds while the sampler fails or reads nothing: status stays paused:thermal and the countdown does not move': async (w, rw, load) => {
+    let mode = 'hot';
+    let failures = 0;
+    const deviceSampler = async () => {
+      if (mode === 'fail') {
+        failures += 1;
+        throw new Error('sensor exploded');
+      }
+      return { thermal: { pressureLevel: mode === 'hot' ? 2 : 0 }, power: {} };
+    };
+    const deviceGates = { thermal: { maxPressureLevel: 1, openSamples: 2 } };
+    brokerGates(rw, deviceGates);
+    const ticket = await rw.submit({ code: 'process.exit(0)' });
+    const agent = await rw.agent({ load, deviceSampler, config: { deviceGates } });
+    const gate = () => readAgentStatus(rw.root).deviceGates?.thermal;
+    await happens('the gate closed', () => gate()?.closed === true);
+    mode = 'fail';
+    await happens('the sampler failed more often than openSamples', () => failures >= 4);
+    await sleep(150);
+    assert.deepEqual([gate().closed, gate().consecutiveOk, readAgentStatus(rw.root).claims], [true, 0, 'paused:thermal']);
+    assert.equal(agent.names().includes('ld_claim'), false);
+    assert.equal(rw.logs.filter((line) => /sampling failed/.test(line)).length, 1, 'one log line for one distinct error');
+    mode = 'cool';
+    await rw.claimed(ticket);
+  },
+
+  'thresholds are re-read from the broker config on each sample: an edit restarts the countdown and leaves the gate closed': async (w, rw, load) => {
+    const { sampler, feed, asked, releaseAll } = scriptedSampler();
+    const gates = (openSamples) => ({ thermal: { maxPressureLevel: 1, openSamples } });
+    brokerGates(rw, gates(3));
+    const gate = () => readAgentStatus(rw.root).deviceGates?.thermal;
+    const hot = { pressureLevel: 2 };
+    const cool = { pressureLevel: 0 };
+    try {
+      await rw.agent({ load, deviceSampler: sampler, config: { deviceGates: gates(3) } });
+      await feed(hot);
+      await happens('closed', () => gate()?.closed === true);
+      await feed(cool);
+      await happens('one clean sample', () => gate()?.consecutiveOk === 1);
+      await asked();
+      brokerGates(rw, gates(4));
+      await feed(cool);
+      await happens('two clean samples under the old thresholds', () => gate()?.consecutiveOk === 2);
+      await feed(cool);
+      await happens('the edit restarted the countdown, and the gate is still closed', () => gate()?.consecutiveOk === 1 && gate().closed === true);
+      await asked();
+      brokerGates(rw, { thermal: { maxPressureLevel: 9 } });
+      await feed(cool);
+      await feed(cool);
+      await happens('the unreadable edit is logged once and the last good thresholds keep counting', () => gate()?.consecutiveOk === 3);
+      assert.equal(rw.logs.filter((line) => /broker config unreadable/.test(line)).length, 1);
+    } finally {
+      releaseAll();
+    }
+  },
+
   'the schedule window is respected: outside it, or too close to its close, no ld_claim is made': async (w, rw, load) => {
     const { claimBlock, claimOnce } = await load('agent/claims.js');
     const block = (now) => claimBlock({ schedule: SCHEDULE, stopClaimingBeforeCloseMs: 30 * 60_000, now, draining: () => false });
@@ -144,7 +249,15 @@ const scenarios = {
 };
 
 const CLAIMS = 'agent/claims.js';
+const gateName = 'a closed thermal gate takes no claim and shows paused:thermal; it reopens only after openSamples clean samples, then the claim goes through';
+const holdName = 'a closed thermal gate holds while the sampler fails or reads nothing: status stays paused:thermal and the countdown does not move';
+const liveName = 'thresholds are re-read from the broker config on each sample: an edit restarts the countdown and leaves the gate closed';
 const canaries = [
+  [holdName, 'device-gates.js', ['state.closed && GATES[name].informative(gateCfg, reading)', 'state.closed']],
+  [liveName, 'agent/run.js', ['    reloadDeviceGatesConfig();\n    if (!deviceGatesConfig)', '    if (!deviceGatesConfig)']],
+  [gateName, CLAIMS, ['return closedGateReason(deviceGates);', 'return null;']],
+  [gateName, 'agent/run.js', ['        await refreshDeviceGates();\n', '']],
+  [gateName, 'device-gates.js', ['if (state.consecutiveOk >= openSamples) {', 'if (state.consecutiveOk >= 1) {']],
   ['the req is persisted before ld_claim is called, and a claimed answer leaves a FETCHING record and no pending req', CLAIMS, ['if (!pending) writePendingClaim(remoteRoot, req);', '']],
   ['a claim whose answer was lost is replayed under the same req however old it is, and adopts exactly one ticket', CLAIMS, ['const req = pending?.req ?? randomUUID();', 'const req = randomUUID();']],
   ['a crash after the record and before the pending delete: the replay adopts the record unchanged', CLAIMS, ['if (!core.table.get(execId)) core.table.put(', 'core.table.put(']],

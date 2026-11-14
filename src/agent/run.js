@@ -7,8 +7,11 @@ import { createS3Client } from '../s3-client.js';
 import { Waker } from './waker.js';
 import { writeAgentMetrics } from './metrics.js';
 import { userManagerEnv } from '../cpu-limit.js';
+import { sampleDevice, updateDeviceGates } from '../device-gates.js';
 
 export const STOP_SETTLE_MS = 45_000;
+
+const UNKNOWN_DEVICE_SAMPLE = { thermal: {}, power: {} };
 
 export const s3ClientOf = ({ endpoint, region, creds }, options = {}) => createS3Client({ endpoint, region, creds, ...options });
 
@@ -25,7 +28,7 @@ const LIVENESS_CALLS = new Set(['ld_claim', 'ld_heartbeat', 'ld_register']);
  * The broker's home and state directory come from `config` and replace whatever the environment says, here and in the lane processes this
  * agent spawns, so a supervisor's minimal environment and an operator's shell behave the same.
  */
-export async function startAgent({ remoteRoot, config, version, log = (line) => process.stderr.write(`${line}\n`), figures, draining, now = Date.now, timing, s3 = s3ClientOf(config.rustfs), spawnEnv = process.env, laneBin, Driver = ExecutionDriver, coreOptions = {}, textfileDir = process.env.BOSUN_TEXTFILE_DIR, stopSettleMs = STOP_SETTLE_MS, platform = process.platform, driverOptions = {} }) {
+export async function startAgent({ remoteRoot, config, version, log = (line) => process.stderr.write(`${line}\n`), figures, draining, now = Date.now, timing, s3 = s3ClientOf(config.rustfs), spawnEnv = process.env, laneBin, Driver = ExecutionDriver, coreOptions = {}, textfileDir = process.env.BOSUN_TEXTFILE_DIR, stopSettleMs = STOP_SETTLE_MS, platform = process.platform, driverOptions = {}, deviceSampler = (gates) => sampleDevice(gates, { platform }) }) {
   const brokerEnv = { LANE_BROKER_HOME: config.brokerHome, LANE_BROKER_STATE: config.stateDir, ...userManagerEnv({ ...process.env, ...spawnEnv }, { platform }) };
   Object.assign(process.env, brokerEnv);
   const claimFiguresOf = figures ?? (() => claimFigures({ cfg: loadGlobalConfig({ home: config.brokerHome }) }));
@@ -50,15 +53,51 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
   let upgradeRequired = false;
   const claims = {};
   const countClaim = (answer) => { claims[answer] = (claims[answer] ?? 0) + 1; };
+  let deviceGates = {};
+  let deviceSampledAt = -Infinity;
+  let deviceSampleError = null;
+  let deviceGatesConfig = config.deviceGates;
+  let deviceConfigError = null;
   const writeMetrics = () => {
     if (!textfileDir) return;
     try {
-      writeAgentMetrics(textfileDir, { now: now(), records: core.table.all(), claims, listening: core.ld.listening, registered: core.ld.registeredOnConnection, scopeAvailable: driver.scopeAvailable, version });
+      writeAgentMetrics(textfileDir, { now: now(), records: core.table.all(), claims, listening: core.ld.listening, registered: core.ld.registeredOnConnection, scopeAvailable: driver.scopeAvailable, version, deviceGates });
     } catch (err) {
       log(`metrics: ${err.message}`);
     }
   };
-  const block = () => stopped ? 'stopping' : driver.scopeBlock() ?? claimBlock({ schedule: config.schedule, stopClaimingBeforeCloseMs: config.stopClaimingBeforeCloseMs, now: now(), draining: isDrainingNow });
+  const block = () => stopped ? 'stopping' : driver.scopeBlock() ?? claimBlock({ schedule: config.schedule, stopClaimingBeforeCloseMs: config.stopClaimingBeforeCloseMs, now: now(), draining: isDrainingNow, deviceGates });
+
+  const reloadDeviceGatesConfig = () => {
+    try {
+      deviceGatesConfig = loadGlobalConfig({ home: config.brokerHome }).deviceGates ?? null;
+      deviceConfigError = null;
+    } catch (err) {
+      if (err.message !== deviceConfigError) log(`device gates: broker config unreadable, keeping the last good thresholds: ${err.message}`);
+      deviceConfigError = err.message;
+    }
+  };
+
+  async function refreshDeviceGates() {
+    if (now() - deviceSampledAt < config.pollMs) return;
+    deviceSampledAt = now();
+    reloadDeviceGatesConfig();
+    if (!deviceGatesConfig) {
+      deviceGates = {};
+      return;
+    }
+    let sample = UNKNOWN_DEVICE_SAMPLE;
+    try {
+      sample = await deviceSampler(deviceGatesConfig);
+      deviceSampleError = null;
+    } catch (err) {
+      if (err.message !== deviceSampleError) log(`device gates: sampling failed, readings unknown: ${err.message}`);
+      deviceSampleError = err.message;
+    }
+    deviceGates = updateDeviceGates(deviceGates, deviceGatesConfig, sample);
+  }
+
+  const deviceGateStatus = () => Object.fromEntries(Object.entries(deviceGates).map(([name, { closed, consecutiveOk, reading }]) => [name, { closed, consecutiveOk, reading }]));
 
   async function claimRound() {
     while (!stopped && !upgradeRequired) {
@@ -85,10 +124,11 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
         poked = false;
         pollAt = now() + config.pollMs;
         driver.watchScope();
+        await refreshDeviceGates();
         if (upgradeRequired) log('UPGRADE REQUIRED: the queue refuses this agent\'s protocol, so no claims are made; update lane-broker and restart the agent');
         else await claimRound();
         const blocked = block();
-        core.tick({ claims: upgradeRequired ? 'stopped: upgrade required' : blocked ? `paused:${blocked}` : 'running' });
+        core.tick({ claims: upgradeRequired ? 'stopped: upgrade required' : blocked ? `paused:${blocked}` : 'running', ...(deviceGatesConfig ? { deviceGates: deviceGateStatus() } : {}) });
         writeMetrics();
       }
       const lastSignOfLife = () => Math.max(lastLivenessAt, pingAt);
