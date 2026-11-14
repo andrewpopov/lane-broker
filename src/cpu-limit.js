@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { spawnSync } from 'node:child_process';
+import { execFile, spawnSync } from 'node:child_process';
 
 /** BRAIN-651 L1: advertised only when `cpuLimit` is not "off" and this host's probe passed. */
 export const CPU_LIMIT_CAPABILITY = 'cpu-limit/1';
@@ -69,10 +69,49 @@ export function cpuQuotaPercent(cores) {
   return percent;
 }
 
-/** The argv that runs `argv` in its own scope capped at `grantCores` cores (named `unit` when given; `measureMemory` turns memory accounting on, with no cap). Spawns nothing. */
+/** The argv that runs `argv` in its own scope capped at `grantCores` cores (named `unit` when given; `measureMemory` turns memory accounting on, with no cap). A `null` grant makes a scope for lifetime only, with no quota. Spawns nothing. */
 export function cpuLimitArgv(grantCores, argv, { unit, measureMemory = false } = {}) {
-  if (!Number.isFinite(grantCores) || grantCores <= 0) throw new Error(`cpuLimitArgv: grantCores must be positive and finite, got ${grantCores}`);
-  return ['systemd-run', '--user', '--scope', '--expand-environment=no', ...(unit ? [`--unit=${unit}`] : []), '-p', `CPUQuota=${cpuQuotaPercent(grantCores)}%`, ...(measureMemory ? ['-p', 'MemoryAccounting=yes'] : []), '--quiet', '--collect', '--', ...argv];
+  const uncapped = grantCores === null;
+  if (!uncapped && (!Number.isFinite(grantCores) || grantCores <= 0)) throw new Error(`cpuLimitArgv: grantCores must be positive and finite, got ${grantCores}`);
+  return ['systemd-run', '--user', '--scope', '--expand-environment=no', ...(unit ? [`--unit=${unit}`] : []), ...(uncapped ? [] : ['-p', `CPUQuota=${cpuQuotaPercent(grantCores)}%`]), ...(measureMemory ? ['-p', 'MemoryAccounting=yes'] : []), '--quiet', '--collect', '--', ...argv];
+}
+
+/** A pull agent's `remote-exec` supervisor scope: deterministic per execution, and a name systemd accepts. */
+export const supervisorScopeUnit = (execId) => `lane-exec-${execId.replace(/[^A-Za-z0-9:_.-]/g, '-')}`;
+
+/**
+ * What to spawn for a pull agent's `remote-exec` supervisor. When `scope.available` (a `probeCpuLimit` result) it runs in its own transient user scope with
+ * no quota, so it lives under `user@UID.service` and outlives the agent's cgroup; `systemd-run --scope` execs in place, so the spawned pid is the supervisor's.
+ * Otherwise the bare command. Returns `{cmd, args, scoped}`.
+ */
+export function supervisorLaunch(execId, argv, scope) {
+  if (!scope.available) return { cmd: argv[0], args: argv.slice(1), scoped: false };
+  const [cmd, ...args] = cpuLimitArgv(null, argv, { unit: supervisorScopeUnit(execId) });
+  return { cmd, args, scoped: true };
+}
+
+/** `systemd-run --user` reaches the user manager through XDG_RUNTIME_DIR, which a supervisor's minimal environment (bosun gives PATH, HOME, LANG, TZ) lacks. Returns what to add to `env`, or nothing. Set whether or not the directory exists yet: at boot the user manager may start after the agent. */
+export function userManagerEnv(env = process.env, { platform = process.platform, uid = process.getuid?.() } = {}) {
+  return platform === 'linux' && uid !== undefined && !env.XDG_RUNTIME_DIR ? { XDG_RUNTIME_DIR: `/run/user/${uid}` } : {};
+}
+
+const defaultAsyncExec = (file, args, options) => new Promise((resolve) => {
+  execFile(file, args, { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS, ...options }, (error, stdout, stderr) => resolve({ error, status: error ? (typeof error.code === 'number' ? error.code : null) : 0, stdout, stderr }));
+});
+
+/**
+ * Can this user start a lifetime-only transient scope that lands under its user manager (`user@UID.service`), outside the caller's own cgroup?
+ * Asynchronous, so a slow `systemd-run` never stalls the agent's loop. The readback runs inside the scope. Returns `{available, reason}`.
+ */
+export async function probeLifetimeScope({ platform = process.platform, exec = defaultAsyncExec, env = { ...process.env, ...userManagerEnv(process.env, { platform }) } } = {}) {
+  if (platform !== 'linux') return { available: false, reason: 'unsupported-platform' };
+  const [file, ...args] = cpuLimitArgv(null, ['sh', '-c', 'cat /proc/self/cgroup']);
+  const res = await exec(file, args, { env });
+  const detail = String(res.stderr ?? '').trim().split('\n')[0];
+  if (res.error && res.status === null) return { available: false, reason: res.error.code === 'ENOENT' ? 'systemd-run-missing' : `systemd-run-failed: ${res.error.message}` };
+  if (res.status !== 0) return { available: false, reason: `systemd-run-exit-${res.status}${detail ? `: ${detail}` : ''}` };
+  const path = String(res.stdout ?? '').split('\n').find((line) => line.startsWith('0::'))?.slice(3).trim() ?? '';
+  return /\/user@\d+\.service\//.test(path) ? { available: true, reason: 'ok' } : { available: false, reason: `scope-not-under-user-manager: ${path || 'empty readback'}` };
 }
 
 /** Execution is distinct from admission: an exclusive reservation is never reduced by this ceiling. */

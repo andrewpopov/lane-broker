@@ -110,7 +110,7 @@ const scenarios = {
 const EXEC = 'agent/execution.js';
 const canaries = [
   ['a cancel that lands after the last heartbeat and before ld_start: ld_start answers false, nothing is spawned, the row ends cancelled', EXEC, ['if (started !== true) this.#releasing(record);', 'if (false) this.#releasing(record);']],
-  ['a drain marker after the claim releases never-started before ld_start is ever called', EXEC, ['if (this.draining()) return this.#releasing(record);', '']],
+  ['a drain marker after the claim releases never-started before ld_start is ever called', EXEC, ['if (this.draining() || this.scopeBlock()) return this.#releasing(record);', '']],
   ['a STARTING record found on restart whose ld_start answers true finishes rejected start-uncertain and spawns nothing', EXEC, ["else if (!context.mayStart) this.#rejected(record, ['STARTING'], 'start-uncertain');", "else if (false) this.#rejected(record, ['STARTING'], 'start-uncertain');"]],
   ['a recovered STARTING release refused as started is converted to a finish, never acknowledged: cancelled with its stop proven when a cancel is pending', EXEC, ["(answer.refused === 'started' ? this.#cas(execId, ['OUTBOX'], { outbox: { ...outbox, refused: true } }) : ack())", 'ack()']],
   ['a recovered STARTING release refused as started is converted to a finish, never acknowledged: cancelled with its stop proven when a cancel is pending', EXEC, ['|| beat.cancel === true;', ';']],

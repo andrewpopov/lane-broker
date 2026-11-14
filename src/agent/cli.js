@@ -66,10 +66,13 @@ export async function checkAgent({ loadConfig = loadAgentConfig, probePg = reach
   return { exitCode: steps.every(([, error]) => error === null) ? 0 : 1 };
 }
 
+/** Bosun SIGKILLs at 60 s: a stop with a leftover handle must still exit 0 before that. */
+export const EXIT_DEADLINE_MS = 55_000;
+
 const FLAGS_WITH_VALUE = new Set(['--root', '--config']);
 
-/** `lane agent [--check] [--root <remoteRoot>] [--config <dir>]`. Without `--check` it runs until SIGTERM or SIGINT. Every credential comes from files under the config dir (default `~/.config/lane-agent`), never from the environment. */
-export async function agentCommand(args, { remoteRoot, configDir = flagValue(args, '--config') ?? AGENT_CONFIG_DIR, loadConfig = () => loadAgentConfig({ file: path.join(configDir, 'config.json') }), signals = process, err = process.stderr, ...checkOptions } = {}) {
+/** `lane agent [--check] [--root <remoteRoot>] [--config <dir>]`. Without `--check` it runs until SIGTERM or SIGINT, then ends the process through `exit` (when given) after the stop or `exitDeadlineMs`, so no leftover handle outlives bosun's deadline. Every credential comes from files under the config dir (default `~/.config/lane-agent`), never from the environment. */
+export async function agentCommand(args, { remoteRoot, configDir = flagValue(args, '--config') ?? AGENT_CONFIG_DIR, loadConfig = () => loadAgentConfig({ file: path.join(configDir, 'config.json') }), signals = process, err = process.stderr, start = startAgent, exitDeadlineMs = EXIT_DEADLINE_MS, exit, ...checkOptions } = {}) {
   const known = new Set(['--check', ...FLAGS_WITH_VALUE]);
   const unknown = args.find((a, i) => a.startsWith('--') && !known.has(a) && !FLAGS_WITH_VALUE.has(args[i - 1]));
   if (unknown !== undefined) {
@@ -78,11 +81,15 @@ export async function agentCommand(args, { remoteRoot, configDir = flagValue(arg
   }
   try {
     if (args.includes('--check')) return await checkAgent({ loadConfig, ...checkOptions });
-    const agent = await startAgent({ remoteRoot, config: loadConfig(), version: pkgVersion() });
+    const agent = await start({ remoteRoot, config: loadConfig(), version: pkgVersion() });
     await new Promise((resolve) => {
       for (const signal of ['SIGTERM', 'SIGINT']) signals.once(signal, resolve);
     });
-    await agent.stop();
+    let timer;
+    const overdue = new Promise((resolve) => { timer = setTimeout(() => { err.write(`lane agent: stop did not finish within ${exitDeadlineMs} ms; exiting anyway\n`); resolve(); }, exitDeadlineMs); });
+    await Promise.race([agent.stop(), overdue]);
+    clearTimeout(timer);
+    if (exit) await new Promise((resolve) => err.write('', resolve)).then(() => exit(0));
     return { exitCode: 0 };
   } catch (error) {
     if (!(error instanceof AgentConfigError || error instanceof AgentOwnedError)) throw error;
