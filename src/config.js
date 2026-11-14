@@ -928,6 +928,11 @@ function validateRepoConfig(cfg, sourcePath) {
     }
     if (lane.requires !== undefined) assertRequires(lane.requires, `${sourcePath}: lane "${name}".requires`);
     if (lane.requiresTags !== undefined) assertRequires(lane.requiresTags, `${sourcePath}: lane "${name}".requiresTags`);
+    if (lane.avoidTags !== undefined) {
+      assertRequires(lane.avoidTags, `${sourcePath}: lane "${name}".avoidTags`);
+      const both = lane.avoidTags.filter((tag) => [...(cfg.requiresTags ?? []), ...(lane.requiresTags ?? [])].includes(tag));
+      assert(both.length === 0, `${sourcePath}: lane "${name}" both requires and avoids tag ${both.join(', ')}`);
+    }
     if (lane.remoteDeps !== undefined) {
       assert(
         isValidRemoteDepsShape(lane.remoteDeps),
@@ -1493,6 +1498,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
       remote: templateCfg.remote,
       requires: templateCfg.requires,
       requiresTags: templateCfg.requiresTags,
+      avoidTags: templateCfg.avoidTags,
       remoteDeps: templateCfg.remoteDeps,
       remoteSetup: templateCfg.remoteSetup,
       remoteDepsCache: templateCfg.remoteDepsCache,
@@ -1587,6 +1593,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     requires: [...new Set([...(repoConfig.requires ?? []), ...(laneCfg.requires ?? [])])],
     // BRAIN-649: capability tags a runner must declare (`runnerTags` in the runner's own config), merged the same way
     requiresTags: [...new Set([...(repoConfig.requiresTags ?? []), ...(laneCfg.requiresTags ?? [])])],
+    avoidTags: [...new Set(laneCfg.avoidTags ?? [])],
     // BRAIN-649: opt this lane's remoteDeps/remoteSetup into `lane runner prewarm`
     prewarm: laneCfg.prewarm === true,
     remoteDeps: Array.isArray(laneCfg.remoteDeps) ? laneCfg.remoteDeps : null,

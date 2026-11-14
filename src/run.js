@@ -875,6 +875,7 @@ export async function runCommand({
       // this process resolved, not a re-derived value.
       requires: resolved.requires,
       requiresTags: resolved.requiresTags,
+      avoidTags: resolved.avoidTags,
       remoteDeps: resolved.remoteDeps,
       remoteSetup: resolved.remoteSetup,
       remoteDepsCache: resolved.remoteDepsCache,

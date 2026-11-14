@@ -865,10 +865,11 @@ export function rebalanceFinishAllows({ destScore, sourceEstimateMs, position, d
  * ticket, 'rebalance' a queued remote one), so what every path must carry (BRAIN-597's `downRunners`) cannot be dropped by one.
  * BRAIN-899: all four rank by predicted finish; only the place path may also queue on a busy runner.
  */
-export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHome(), stuckLocally = false, localBlocked = false, draining = false, cpuLimit, queuedMove = null } = {}) {
+export function selectionOptionsFor(kind, enriched, globalCfg, { root = stateHome(), stuckLocally = false, localBlocked = false, draining = false, cpuLimit, queuedMove = null, ignoreAvoid = false } = {}) {
   // BRAIN-899 B2: ONE windowed, repo-filtered read feeds both the finish model and the schedule pre-check.
   const rows = placementHistoryRows(root, enriched);
-  const base = remoteSelectOptions(enriched, globalCfg, root, cpuLimit, rows);
+  const selected = remoteSelectOptions(enriched, globalCfg, root, cpuLimit, rows);
+  const base = ignoreAvoid ? { ...selected, readinessNeeds: { ...selected.readinessNeeds, avoidTags: [] } } : selected;
   const finishModel = finishModelFor(enriched, globalCfg, rows, { commonTier: kind !== 'rebalance' });
   // a move or rebind picks a better home for a ticket that already has one
   if (kind === 'rebind') return { ...base, maxRemoteQueue: stuckLocally ? globalCfg.maxRemoteQueue : 0, allowBusyQueue: localBlocked, finishModel };
@@ -1649,7 +1650,10 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
           const candidates = pushRunners(liveCfg).filter((r) => !visited.includes(r.name) && r.rebalanceTarget !== false);
           if (candidates.length === 0) return null;
           const idleOptions = selectionOptionsFor('rebalance', enriched, liveCfg, { draining, root, cpuLimit });
-          const picked = await selectRunner(candidates, idleOptions);
+          const avoiding = idleOptions.readinessNeeds.avoidTags.length > 0;
+          const source = avoiding ? pushRunners(liveCfg).filter((r) => r.name === runner.name) : [];
+          const observing = (options) => (avoiding ? { ...options, observeOnly: [runner.name] } : options);
+          const picked = await selectRunner([...candidates, ...source], observing(idleOptions));
           if (picked.runner) logFinishPlacement(root, enriched, picked, 'rebalance: ');
           // BRAIN-899 R5: a scored destination must also beat staying put by the gain; a drain or the refusal deadline is ungated
           const sourceEstimateMs = estimateMsOf(idleOptions.finishModel, runner);
@@ -1658,14 +1662,19 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
           target = idleTarget && finishAllows(picked) ? idleTarget : null;
           if (target || draining) return target;
           // at the refusal deadline an idle destination the gain gate turned down is taken after all: refusal is the worse outcome
-          if (refusalCapElapsed?.()) return (target = idleTarget);
+          const rescue = async () => {
+            if (idleTarget || !avoiding) return idleTarget;
+            const open = await selectRunner(candidates, selectionOptionsFor('rebalance', enriched, liveCfg, { draining, root, cpuLimit, ignoreAvoid: true }));
+            return open.runner && hasMeasuredHeadroom(open.probe) ? { runner: open.runner, probe: open.probe, score: scoreOf(open, open.runner) } : null;
+          };
+          if (refusalCapElapsed?.()) return (target = await rescue());
           // BRAIN-888: behind another ticket's reservation with no idle runner on offer, a short non-idle queue elsewhere can be better
           const stuckBehindOwner = liveCfg.remoteRebalanceQueuedMax > 0 && sourceFacts?.position >= 1 && sourceFacts.behindOtherOwner === true && sourceFacts.reservationOwnerWaitedMs >= liveCfg.remoteRebalanceMinQueuedMs;
           if (!stuckBehindOwner) return null;
-          const queued = await selectRunner(candidates, selectionOptionsFor('rebalance', enriched, liveCfg, { draining, root, cpuLimit, queuedMove: { position: sourceFacts.position, sourceRunner: runner } }));
+          const queued = await selectRunner([...candidates, ...source], observing(selectionOptionsFor('rebalance', enriched, liveCfg, { draining, root, cpuLimit, queuedMove: { position: sourceFacts.position, sourceRunner: runner } })));
           if (queued.runner) logFinishPlacement(root, enriched, queued, 'rebalance: queued: ');
           // the cap may have run out while the probes were out: refusal must stay reachable
-          if (refusalCapElapsed?.()) return (target = idleTarget);
+          if (refusalCapElapsed?.()) return (target = await rescue());
           if (!queued.runner) return null;
           if (!finishAllows(queued)) return null;
           const viaQueue = queued.queuedChoice === true;
