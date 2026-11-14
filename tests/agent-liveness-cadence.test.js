@@ -81,10 +81,10 @@ const scenarios = {
 };
 
 const canaries = [
-  ['a liveness call is made every interval while idle', 'agent/run.js', ['await waker.wait(Math.max(0, Math.min(pollAt, lastLivenessAt + config.pollMs) - now()));', 'await waker.wait(1e9);']],
-  ['a draining runner holding nothing still makes a call every interval', 'agent/run.js', ['now() - lastLivenessAt >= config.pollMs', 'false']],
-  ['a runner outside its schedule window holding nothing still makes a call every interval', 'agent/run.js', ['now() - lastLivenessAt >= config.pollMs', 'false']],
-  ['a NOTIFY wake mid-interval does not stretch the gap to the next call: the wait is capped by the liveness deadline', 'agent/run.js', ['Math.min(pollAt, lastLivenessAt + config.pollMs)', 'pollAt']],
+  ['a liveness call is made every interval while idle', 'agent/run.js', ['await waker.wait(Math.max(0, Math.min(pollAt, lastSignOfLife() + config.pollMs) - now()));', 'await waker.wait(1e9);']],
+  ['a draining runner holding nothing still makes a call every interval', 'agent/run.js', ['now() - lastSignOfLife() >= config.pollMs', 'false']],
+  ['a runner outside its schedule window holding nothing still makes a call every interval', 'agent/run.js', ['now() - lastSignOfLife() >= config.pollMs', 'false']],
+  ['a NOTIFY wake mid-interval does not stretch the gap to the next call: the wait is capped by the liveness deadline', 'agent/run.js', ['Math.min(pollAt, lastSignOfLife() + config.pollMs)', 'pollAt']],
   ['at max_claims, with the claim poll far away, heartbeats keep the liveness calls coming', 'agent/execution.js', ['>= this.timing.heartbeatMs) await this.#beat(execId, context);\n    const current', '>= 1e9) await this.#beat(execId, context);\n    const current']],
   ['while settling, with an upload that never answers, heartbeats keep the liveness calls coming', 'agent/execution.js',
     ['context.abort = abort;\n    const stopBeating = this.#keepBeating(execId, context, abort.signal);\n    try {\n      const since', 'context.abort = abort;\n    const stopBeating = async () => {};\n    try {\n      const since']],

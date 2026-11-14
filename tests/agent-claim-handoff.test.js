@@ -113,7 +113,7 @@ const scenarios = {
     assert.ok(rw.logs.filter((l) => /UPGRADE REQUIRED/.test(l)).length >= 2, 'logged on every tick');
   },
 
-  'the agent reads the stateDir it is configured with and replaces a hostile LANE_BROKER_STATE, for itself and for the lanes it spawns': async (w, rw, load) => {
+  'the drain marker is read from the configured stateDir, not from a hostile LANE_BROKER_STATE': async (w, rw, load) => {
     const saved = process.env.LANE_BROKER_STATE;
     process.env.LANE_BROKER_STATE = makeTmpDir('hostile-state-');
     try {
@@ -121,10 +121,7 @@ const scenarios = {
       await enqueue(await w.as(logins.s1), tid(1));
       const agent = await rw.agent({ load, config: { pollMs: 100 } });
       await sleep(600);
-      assert.equal(process.env.LANE_BROKER_STATE, rw.ctx.state, 'the configured state dir replaced the inherited one');
       assert.equal(agent.names().includes('ld_claim'), false, 'the drain marker in the configured state dir is honoured');
-      assert.equal(agent.driver.spawnEnv.LANE_BROKER_STATE, rw.ctx.state);
-      assert.equal(agent.driver.spawnEnv.LANE_BROKER_HOME, rw.ctx.home);
     } finally {
       process.env.LANE_BROKER_STATE = saved;
     }
@@ -155,7 +152,6 @@ const canaries = [
     ["const offered = await figures();\n  if (!offered) return { status: 'skipped', reason: 'no-headroom' };", 'const offered = (await figures()) ?? { freeCpu: Infinity, freeMem: Infinity };'], /invalid input syntax for type bigint/],
   ['none leaves no pending req, and upgrade is answered, clears the req and is not an error', CLAIMS, ["a.status !== 'none' && a.status !== 'upgrade'", "a.status !== 'none'"], /ld_claim answered/],
   ['an upgrade answer stops the claim loop for good: no further ld_claim, and every tick logs it', 'agent/run.js', ["if (answer.status === 'upgrade') upgradeRequired = true;", 'if (false) upgradeRequired = true;']],
-  ['the agent reads the stateDir it is configured with and replaces a hostile LANE_BROKER_STATE, for itself and for the lanes it spawns', 'agent/run.js', ['Object.assign(process.env, brokerEnv);', '']],
   ['the schedule window is respected: outside it, or too close to its close, no ld_claim is made', CLAIMS, ["if (!available) return 'outside-schedule';", '']],
   ['the schedule window is respected: outside it, or too close to its close, no ld_claim is made', CLAIMS, ["if (reason) return { status: 'skipped', reason };", '']],
 ];

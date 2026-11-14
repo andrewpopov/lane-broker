@@ -184,7 +184,6 @@ export class ExecutionDriver {
     context.abort = abort;
     const stopBeating = this.#keepBeating(execId, context, abort.signal);
     try {
-      clearExecutionFiles(this.remoteRoot, execId, ['spool']);
       await this.#fetchWithinBudget(record, abort.signal);
       context.mayStart = true;
       this.#cas(execId, ['FETCHING'], { subphase: 'STARTING' });
@@ -213,6 +212,7 @@ export class ExecutionDriver {
     for (let attempt = 0; ; attempt++) {
       try {
         if (header === null) {
+          clearExecutionFiles(this.remoteRoot, record.execId, ['spool']);
           await downloadVerified(this.s3, rustfs.snapBucket, snapshot, spoolPath(this.remoteRoot, record.execId), { signal, remainingMs });
           header = await readSnapshotHeader(spoolPath(this.remoteRoot, record.execId), { compressedBytes: snapshot.bytes });
           const problem = bindingProblem(header, record);

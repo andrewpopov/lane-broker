@@ -61,6 +61,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
 
   const done = (async () => {
     let pollAt = now();
+    let pingAt = 0;
     while (!stopped) {
       if (poked || now() >= pollAt) {
         poked = false;
@@ -69,8 +70,12 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
         else await claimRound();
         core.tick({ claims: upgradeRequired ? 'stopped: upgrade required' : 'running' });
       }
-      if (!stopped && now() - lastLivenessAt >= config.pollMs) await core.ld.register().catch((err) => log(`register ping: ${err.code ?? ''} ${err.message}`));
-      if (!stopped && !poked) await waker.wait(Math.max(0, Math.min(pollAt, lastLivenessAt + config.pollMs) - now()));
+      const lastSignOfLife = () => Math.max(lastLivenessAt, pingAt);
+      if (!stopped && now() - lastSignOfLife() >= config.pollMs) {
+        pingAt = now();
+        await core.ld.register().catch((err) => log(`register ping: ${err.code ?? ''} ${err.message}`));
+      }
+      if (!stopped && !poked) await waker.wait(Math.max(0, Math.min(pollAt, lastSignOfLife() + config.pollMs) - now()));
     }
   })();
 

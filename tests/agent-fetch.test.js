@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { call, logins } from './lane-dispatch-fixture.js';
+import { agentPaths } from '../src/agent/store.js';
 import { REPO_IDENTITY, recordingFetch, cutShort, happens, scenarioSuite } from './agent-run-harness.js';
 import { blobNamespace, hasBlob } from '../src/remote-blobs.js';
 
@@ -57,6 +58,25 @@ const scenarios = {
     const agent = await rw.agent({ load, Driver, config: { fetchBudgetMs: 800 }, figures: oneOffer() });
     const row = await rw.claimed(ticket);
     await releasedNeverStarted(w, rw, { agent, ticket, execId: rw.execId(row) });
+  },
+
+  'a spool directory that cannot be cleared counts against the fetch budget, then releases never-started': async (w, rw, load) => {
+    const spool = agentPaths(rw.root).spool;
+    let armed = false;
+    const ticket = await rw.submit();
+    const agent = await rw.agent({ load, config: { fetchBudgetMs: 800 }, figures: () => (armed ? { freeCpu: 8, freeMem: 4e9 } : null) });
+    fs.chmodSync(spool, 0o000);
+    try {
+      armed = true;
+      const row = await rw.claimed(ticket);
+      await happens('the claim was released', () => agent.names().includes('ld_release'), 8000);
+      assert.deepEqual(agent.callsTo('ld_release').map((a) => a[3]), ['never-started']);
+      await happens('the row is queued again', async () => (await w.ticket(ticket.id)).state === 'queued', 4000);
+      assert.equal(agent.names().includes('ld_start'), false);
+      assert.ok(row);
+    } finally {
+      fs.chmodSync(spool, 0o700);
+    }
   },
 
   'a store that hangs is cut off at the fetch budget, not at a fresh GET deadline': async (w, rw, load) => {
@@ -168,6 +188,7 @@ const REJECT = ["if (err instanceof VerdictError) this.#rejected(record, ['FETCH
 const canaries = [
   ['a blob that downloads and matches but cannot be kept (publish skipped) is a local problem: retried for the budget, then released never-started, never rejected', FETCH, ['throw new LocalCacheError(`blob', 'throw new VerdictError(`blob']],
   ['a lease or filesystem error that keeps failing counts against the fetch budget, then releases never-started', EXEC, ['if (remainingMs() <= 0) throw new FetchBudgetError(err.message);', '']],
+  ['a spool directory that cannot be cleared counts against the fetch budget, then releases never-started', EXEC, ['if (remainingMs() <= 0) throw new FetchBudgetError(err.message);', '']],
   ['a store that hangs is cut off at the fetch budget, not at a fresh GET deadline', FETCH, ['Math.max(1, Math.min(GET_DEADLINE_MS, remainingMs()))', 'GET_DEADLINE_MS']],
   ['a cancel answered to a heartbeat during FETCHING aborts the fetch and releases cancel-confirmed', EXEC, ["if (record.subphase === 'FETCHING') {", 'if (false) {']],
   ['a fenced answer to a heartbeat during FETCHING aborts the fetch and ends the record with nothing sent', EXEC, ["PRE_START.has(record.subphase) ? 'DONE' : 'KILLING'", "'KILLING'"]],
