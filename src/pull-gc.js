@@ -230,11 +230,18 @@ function parseGcArgs(args) {
   const opts = {};
   for (let i = 0; i < args.length; i += 2) {
     const [flag, value] = [args[i], args[i + 1]];
-    if (value === undefined || !['--queue-url', '--password-file', '--rows-after', '--budget'].includes(flag)) throw new Error(`unknown or incomplete argument "${flag}"`);
+    if (value === undefined || !['--queue-url', '--password-file', '--ca-file', '--rows-after', '--budget'].includes(flag)) throw new Error(`unknown or incomplete argument "${flag}"`);
     opts[flag.slice(2)] = value;
   }
-  const socket = isSocketQueueUrl(opts['queue-url']);
-  for (const required of socket ? ['queue-url'] : ['queue-url', 'password-file']) if (opts[required] === undefined) throw new Error(`--${required} is required (the admin login's own, never the submitter's)`);
+  if (opts['queue-url'] === undefined) throw new Error('--queue-url is required');
+  const tcpOnly = ['password-file', 'ca-file'];
+  for (const flag of tcpOnly) {
+    if (isSocketQueueUrl(opts['queue-url'])) {
+      if (opts[flag] !== undefined) throw new Error(`--${flag} must not be given with a Unix socket --queue-url (peer auth uses no password and no TLS)`);
+    } else if (opts[flag] === undefined) {
+      throw new Error(`--${flag} is required with a TCP --queue-url (the admin login's own, never the submitter's)`);
+    }
+  }
   return opts;
 }
 
@@ -243,13 +250,12 @@ export async function pullGcCommand(args = []) {
     const opts = parseGcArgs(args);
     const { config, error } = loadGlobalConfigOrError();
     if (error) throw new Error(error);
-    const { rustfs, caFile } = config.lanePull;
-    const needed = [...(isSocketQueueUrl(opts['queue-url']) ? [] : [['lanePull.caFile', caFile]]), ['lanePull.rustfs.endpoint', rustfs.endpoint], ['lanePull.rustfs.credentialsEnvFile', rustfs.credentialsEnvFile]];
-    const missing = needed.filter(([, value]) => value === undefined);
+    const { rustfs } = config.lanePull;
+    const missing = [['lanePull.rustfs.endpoint', rustfs.endpoint], ['lanePull.rustfs.credentialsEnvFile', rustfs.credentialsEnvFile]].filter(([, value]) => value === undefined);
     if (missing.length > 0) throw new Error(`config needs ${missing.map(([name]) => `"${name}"`).join(', ')}`);
     const summary = await gcOnce({
       root: ensureStateDirs().root,
-      queue: createQueueClient({ url: opts['queue-url'], passwordFile: opts['password-file'], caFile }),
+      queue: createQueueClient({ url: opts['queue-url'], passwordFile: opts['password-file'], caFile: opts['ca-file'] }),
       s3: createS3Client({ endpoint: rustfs.endpoint, region: rustfs.region, credentialsEnvFile: rustfs.credentialsEnvFile }),
       cfg: config.lanePull,
       rowsAfterMs: opts['rows-after'] === undefined ? undefined : parseDuration(opts['rows-after']),

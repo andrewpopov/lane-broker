@@ -409,19 +409,25 @@ const gcCommandOutcome = async (load, args, lanePull) => {
 const GC_SOCKET_URL = 'postgres://lane_admin_pitelite@%2Fvar%2Frun%2Fpostgresql/lane_queue';
 const GC_TCP_URL = 'postgres://lane_admin_pitelite@pitelite:5432/lane_queue';
 const GC_STORE = { rustfs: { endpoint: 'https://pitelite:9000', credentialsEnvFile: '/nonexistent/rustfs.env' } };
-const GC_NAME = 'gc: a socket queue-url needs neither --password-file nor lanePull.caFile, and a TCP queue-url needs both';
+const GC_NAME = 'gc: a TCP queue-url needs its own --password-file and --ca-file, a socket queue-url needs neither and refuses both, and lanePull.caFile is never read';
+const GC_ARGUMENT_ERROR = /is required|must not be given|lanePull\.caFile|lanePull\.passwordFile/;
 
-async function socketGcSkipsTcpFiles(load) {
-  const socketErr = await gcCommandOutcome(load, ['--queue-url', GC_SOCKET_URL], GC_STORE);
-  assert.doesNotMatch(socketErr, /is required|lanePull\.caFile/, 'a socket URL gets past the argument and config checks');
-  assert.match(await gcCommandOutcome(load, ['--queue-url', GC_TCP_URL], GC_STORE), /--password-file is required/);
-  assert.match(await gcCommandOutcome(load, ['--queue-url', GC_TCP_URL, '--password-file', '/pw'], GC_STORE), /lanePull\.caFile/);
+async function gcFilesFollowTheQueueUrl(load) {
+  const outcome = (...args) => gcCommandOutcome(load, args, { ...GC_STORE, caFile: '/config/ca.pem' });
+  assert.doesNotMatch(await outcome('--queue-url', GC_SOCKET_URL), GC_ARGUMENT_ERROR, 'a socket URL gets past the argument and config checks');
+  assert.match(await outcome('--queue-url', GC_SOCKET_URL, '--password-file', '/pw'), /--password-file must not be given/);
+  assert.match(await outcome('--queue-url', GC_SOCKET_URL, '--ca-file', '/ca.pem'), /--ca-file must not be given/);
+  assert.match(await outcome('--queue-url', GC_TCP_URL), /--password-file is required/);
+  assert.match(await outcome('--queue-url', GC_TCP_URL, '--password-file', '/pw'), /--ca-file is required/);
+  assert.doesNotMatch(await outcome('--queue-url', GC_TCP_URL, '--password-file', '/pw', '--ca-file', '/ca.pem'), GC_ARGUMENT_ERROR);
+  assert.doesNotMatch(await outcome('--queue-url', `${GC_TCP_URL}?host=/tmp`, '--password-file', '/pw', '--ca-file', '/ca.pem'), /must not be given/, 'a ?host= URL is not a socket URL');
 }
 
 test(GC_NAME, async () => {
-  await socketGcSkipsTcpFiles(realSrc);
-  await assertCanaryFails('pull-gc.js', ["isSocketQueueUrl(opts['queue-url']) ? [] : [['lanePull.caFile', caFile]]", "false ? [] : [['lanePull.caFile', caFile]]"], socketGcSkipsTcpFiles);
-  await assertCanaryFails('pull-gc.js', ["const socket = isSocketQueueUrl(opts['queue-url']);", 'const socket = false;'], socketGcSkipsTcpFiles);
+  await gcFilesFollowTheQueueUrl(realSrc);
+  await assertCanaryFails('pull-gc.js', ["if (opts[flag] !== undefined) throw new Error(", "if (false) throw new Error("], gcFilesFollowTheQueueUrl);
+  await assertCanaryFails('pull-gc.js', ["} else if (opts[flag] === undefined) {", "} else if (false) {"], gcFilesFollowTheQueueUrl);
+  await assertCanaryFails('pull-gc.js', ["if (isSocketQueueUrl(opts['queue-url'])) {\n      if (opts[flag]", "if (false) {\n      if (opts[flag]"], gcFilesFollowTheQueueUrl);
 });
 
 definePullSuite('lane pull gc against the real retention SQL and the S3 stub', SCENARIOS, CANARIES);

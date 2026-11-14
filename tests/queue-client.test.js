@@ -147,6 +147,8 @@ async function socketPeerAuthAndTcpTls(t, load) {
   assert.doesNotThrow(() => createQueueClient({ url: SOCKET_URL }));
   const tcp = connectionConfig({ url: QUEUE_URL, ...secretFiles(t) }, { connectTimeoutMs: 111, queryTimeoutMs: 222 });
   assert.deepEqual(tcp.ssl, { ca: CA_TEXT, rejectUnauthorized: true });
+  const disabled = connectionConfig({ url: `${QUEUE_URL.split('?')[0]}?sslmode=disable`, ...secretFiles(t) });
+  assert.deepEqual(disabled.ssl, { ca: CA_TEXT, rejectUnauthorized: true }, 'sslmode=disable in a TCP URL never turns TLS off');
   assert.equal(tcp.password, 'queue-pass');
   assert.deepEqual([tcp.connectionTimeoutMillis, tcp.query_timeout], [111, 222]);
   assert.throws(() => connectionConfig({ url: QUEUE_URL, ...secretFiles(t, '\n') }), (err) => err instanceof QueueError && /password file .* is empty/.test(err.message));
@@ -158,6 +160,7 @@ test(SOCKET_TEST, async (t) => {
   await socketPeerAuthAndTcpTls(t, realSrc);
   await assertCanaryFails('queue-client.js', ['if (isSocketQueueUrl(url)) return', 'if (false) return'], (load) => socketPeerAuthAndTcpTls(t, load), /unreadable|password/);
   await assertCanaryFails('queue-client.js', ['ssl: false, ...deadlines', 'ssl: { rejectUnauthorized: true }, ...deadlines'], (load) => socketPeerAuthAndTcpTls(t, load));
+  await assertCanaryFails('queue-client.js', ["ssl: { ca: readSecretFile(caFile, 'CA'), rejectUnauthorized: true },", "ssl: url.includes('sslmode=disable') ? false : { ca: readSecretFile(caFile, 'CA'), rejectUnauthorized: true },"], (load) => socketPeerAuthAndTcpTls(t, load));
   await assertCanaryFails('queue-client.js', ["ssl: { ca: readSecretFile(caFile, 'CA'), rejectUnauthorized: true }", "ssl: { ca: readSecretFile(caFile, 'CA') }"], (load) => socketPeerAuthAndTcpTls(t, load));
 });
 

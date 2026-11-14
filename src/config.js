@@ -600,11 +600,7 @@ export function laneQueueUrlProblem(raw) {
 
 /** A queue URL whose host is a Unix socket directory connects by peer auth: no TLS, no password, no CA. */
 export function isSocketQueueUrl(raw) {
-  try {
-    return parsePgConnectionString(raw).host?.startsWith('/') === true;
-  } catch {
-    return false;
-  }
+  return laneQueueUrlProblem(raw) === null && parsePgConnectionString(raw).host.startsWith('/');
 }
 
 const LANE_PULL_NUMBERS = ['pollMs', 'unprovenCancelLostAfterMs', 'queueUnreachableAfterMs', 'prepareBudgetMs', 'blobRefreshAfterDays', 'rowRetentionMs', 'ledgerRetentionMs'];

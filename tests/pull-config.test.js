@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { ConfigError, DEFAULT_GLOBAL_CONFIG, loadGlobalConfig, pullConfigured, pullRunners, pushRunners } from '../src/config.js';
+import { ConfigError, DEFAULT_GLOBAL_CONFIG, isSocketQueueUrl, loadGlobalConfig, pullConfigured, pullRunners, pushRunners } from '../src/config.js';
 import { freshEnv, writeGlobalConfig } from './helpers.js';
 import { assertCanaryFails } from './helpers/mutant-module.js';
 
@@ -71,6 +71,18 @@ test('a Unix socket laneQueueUrl is accepted and every other laneQueueUrl rule s
   ]) {
     assert.throws(() => load({ laneQueueUrl: url }), (err) => err instanceof ConfigError && err.message.includes('"laneQueueUrl"') && reason.test(err.message), url);
   }
+});
+
+function socketUrlsAreOnlyValidSocketHosts({ isSocketQueueUrl: isSocket }) {
+  assert.equal(isSocket(SOCKET_URL), true);
+  for (const url of [QUEUE_URL, 'postgres://u@pitelite/lane_queue?host=/tmp', `${SOCKET_URL.replace('lane_queue', 'postgres')}`, 'postgres://u@%2Ftmp/lane_queue?dbname=x', 'not a url', undefined]) {
+    assert.equal(isSocket(url), false, String(url));
+  }
+}
+
+test('isSocketQueueUrl is true only for a valid laneQueueUrl whose host is a socket directory', async () => {
+  socketUrlsAreOnlyValidSocketHosts({ isSocketQueueUrl });
+  await assertCanaryFails('config.js', ['laneQueueUrlProblem(raw) === null && ', ''], (load) => load('config.js').then(socketUrlsAreOnlyValidSocketHosts));
 });
 
 test('T9 a host merely containing pg-primary is not the VIP name', () => {

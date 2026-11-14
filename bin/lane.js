@@ -65,7 +65,7 @@ function usage() {
   lane reconcile [--now] [--json]
   lane pull check [--json]
   lane agent [--check] [--root <remoteRoot>] [--config <dir>]
-  lane pull gc --queue-url <admin url> --password-file <file> [--rows-after <dur>] [--budget <dur>]
+  lane pull gc --queue-url <admin url> [--password-file <file>] [--ca-file <file>] [--rows-after <dur>] [--budget <dur>]
   lane runner [status] [--json]
   lane runner watch
   lane runner prewarm [--lane <name>] [--runner <name>] [--dry-run]
