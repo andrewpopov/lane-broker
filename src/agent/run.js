@@ -87,7 +87,8 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
         driver.watchScope();
         if (upgradeRequired) log('UPGRADE REQUIRED: the queue refuses this agent\'s protocol, so no claims are made; update lane-broker and restart the agent');
         else await claimRound();
-        core.tick({ claims: upgradeRequired ? 'stopped: upgrade required' : 'running' });
+        const blocked = block();
+        core.tick({ claims: upgradeRequired ? 'stopped: upgrade required' : blocked ? `paused:${blocked}` : 'running' });
         writeMetrics();
       }
       const lastSignOfLife = () => Math.max(lastLivenessAt, pingAt);

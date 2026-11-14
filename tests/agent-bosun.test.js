@@ -7,6 +7,9 @@ import { makeTmpDir } from './helpers/tmp.js';
 import { SLEEP, happens, recordingFetch, scenarioSuite, sleep } from './agent-run-harness.js';
 import { METRICS_FILE } from '../src/agent/metrics.js';
 import { paths, readJsonSafe } from '../src/state.js';
+import { readAgentStatus } from '../src/agent/store.js';
+import { holdLock, waitBlocked } from './lane-dispatch-fixture.js';
+import { backendPids } from './agent-harness.js';
 
 const groupAlive = (pgid) => { try { process.kill(-pgid, 0); return true; } catch { return false; } };
 const leaseOf = (rw) => {
@@ -101,11 +104,13 @@ const scenarios = {
     await happens('the first probes failed', () => probes >= 2);
     assert.equal(agent.names().includes('ld_claim'), false, 'no claim while there is no scope');
     assert.equal(series(readProm(dir), 'lane_agent_scope_available'), '0');
+    assert.equal(readAgentStatus(rw.root).claims, 'paused:no-scope', 'status says why claims are paused');
     assert.deepEqual((await w.ticket(ticket.id)).epoch, 0);
     const row = await rw.claimed(ticket);
     await rw.untilGone(agent, rw.execId(row));
     assert.ok(probes >= 3);
     assert.equal(calls[0].cmd, 'systemd-run', 'the resumed claim started its supervisor in a scope');
+    await happens('status goes back to running', () => readAgentStatus(rw.root).claims === 'running');
     await happens('the metric follows', () => series(readProm(dir), 'lane_agent_scope_available') === '1');
     assert.equal(rw.logs.filter((line) => /supervisor scope: unavailable/.test(line)).length, 1, 'one line for the failure, however many probes');
     assert.equal(rw.logs.filter((line) => /supervisor scope: available/.test(line)).length, 1);
@@ -249,6 +254,39 @@ const scenarios = {
     assert.equal((await w.ticket(quick.id)).state, 'finished');
   },
 
+  'an adopted FETCHING record is released never-started when no scope is available on Linux, never started bare': async (w, rw, load) => {
+    const ticket = await rw.submit({ code: 'process.exit(0)' });
+    const stuck = recordingFetch(async (url) => { if (url.includes('/lane-snap/streams/')) await new Promise(() => {}); return undefined; });
+    const first = await rw.agent({ load, fetchImpl: stuck, stopSettleMs: 200 });
+    const execId = rw.execId(await rw.claimed(ticket));
+    await happens('the record is FETCHING', () => first.core.table.get(execId)?.subphase === 'FETCHING');
+    await first.stop();
+    const calls = [];
+    const second = await rw.agent({ load, driverOptions: scopeOptions(calls, stubProbe({ available: false, reason: 'systemd-run-exit-1: no bus' }), { scopeRequired: true, scopeRetryMs: 60_000 }) });
+    await rw.untilGone(second, execId);
+    assert.equal(calls.length, 0, 'nothing was spawned');
+    assert.equal(second.callsTo('ld_start').length, 0, 'ld_start was never sent');
+    assert.equal(second.names().includes('ld_claim'), false, 'and no new claim was made');
+    assert.equal((await w.ticket(ticket.id)).state, 'queued');
+  },
+
+  'a stop while an ld_start is already in flight leaves the record STARTING for the next agent to recover': async (w, rw, load) => {
+    const ticket = await rw.submit();
+    let hold;
+    const holdAtStream = recordingFetch(async (url) => {
+      if (url.includes('/lane-snap/streams/')) hold = await holdLock(w, `SELECT 1 FROM lane_dispatch.tickets WHERE id = '${ticket.id}' FOR UPDATE`);
+      return undefined;
+    });
+    const agent = await rw.agent({ load, fetchImpl: holdAtStream, timing: { heartbeatMs: 60_000 }, stopSettleMs: 300 });
+    const execId = rw.execId(await rw.claimed(ticket));
+    await happens('ld_start is in flight', () => agent.names().includes('ld_start'));
+    const [callPid] = await backendPids(w, 'SELECT lane_dispatch%');
+    await waitBlocked(w, callPid);
+    await agent.stop();
+    await hold.release();
+    assert.equal(agent.core.table.get(execId).subphase, 'STARTING', 'a start whose outcome is unknown is not released');
+  },
+
   'a textfile directory that is a regular file logs a metrics error each failure and claims carry on': async (w, rw, load) => {
     const notDir = path.join(makeTmpDir('bosun-notdir-'), 'file');
     fs.writeFileSync(notDir, 'x');
@@ -271,6 +309,9 @@ const canaries = [
   [spawnName, EXEC, ['supervisorLaunch(execId, argv, this.#scope)', 'supervisorLaunch(execId, argv, { available: false })']],
   [bareName, 'cpu-limit.js', ['if (!scope.available) return', 'if (false) return']],
   [bareName, EXEC, ['const changed = !this.#scopeKnown || result.available !== this.#scope.available;', 'const changed = true;']],
+  ['an adopted FETCHING record is released never-started when no scope is available on Linux, never started bare', EXEC, ['this.draining() || this.scopeBlock()', 'this.draining()']],
+  ['a stop while an ld_start is already in flight leaves the record STARTING for the next agent to recover', EXEC, ['context.startSent !== true', 'true']],
+  [pauseName, RUN, ["blocked ? `paused:${blocked}` : 'running'", "'running'"]],
   [pauseName, EXEC, ["return this.scopeRequired && !this.#scope.available ? 'no-scope' : null;", 'return null;']],
   [pauseName, EXEC, ['this.now() - this.#scopeProbedAt < this.scopeRetryMs', 'this.#scopeKnown']],
   [xdgName, RUN, [', ...userManagerEnv({ ...process.env, ...spawnEnv }, { platform })', '']],

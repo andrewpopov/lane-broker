@@ -292,7 +292,7 @@ export class ExecutionDriver {
         context.mayStart = false;
         return this.#cas(execId, ['STARTING'], { subphase: 'FETCHING' });
       }
-      if (this.draining()) return this.#releasing(record);
+      if (this.draining() || this.scopeBlock()) return this.#releasing(record);
     }
     await this.ld.start(record.id, record.epoch, record.token, {
       live: () => {

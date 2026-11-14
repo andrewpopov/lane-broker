@@ -171,6 +171,40 @@ for (const mutation of [['    await Promise.race([agent.stop(), overdue]);\n', '
   });
 }
 
+const exitScenario = (stopHangs) => async (load) => {
+  const dir = makeTmpDir('agent-exit-');
+  const script = path.join(dir, 'child.mjs');
+  fs.writeFileSync(script, `import { agentCommand } from ${JSON.stringify(load.url('agent/cli.js'))};
+setInterval(() => {}, 1000);
+const stop = ${stopHangs ? '() => new Promise(() => {})' : 'async () => {}'};
+agentCommand([], { loadConfig: () => ({}), start: async () => ({ stop }), exitDeadlineMs: 400, exit: (code) => process.exit(code) }).then((r) => { process.exitCode = r.exitCode; });
+setTimeout(() => process.stdout.write('ready\\n'), 300);
+`);
+  const child = spawn(process.execPath, [script], { stdio: ['ignore', 'pipe', 'pipe'] });
+  const exited = new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
+  try {
+    await new Promise((resolve) => child.stdout.once('data', resolve));
+    const started = Date.now();
+    child.kill('SIGTERM');
+    const outcome = await Promise.race([exited, sleep(5000).then(() => 'hung')]);
+    assert.notEqual(outcome, 'hung', 'the process ended although a live handle remains');
+    assert.deepEqual(outcome, { code: 0, signal: null });
+    assert.ok(Date.now() - started < 4000);
+  } finally {
+    child.kill('SIGKILL');
+  }
+};
+test('a real lane agent process exits 0 on SIGTERM although a live handle remains: after a clean stop, and at the deadline when stop hangs', async () => {
+  await exitScenario(false)(realSrc);
+  await exitScenario(true)(realSrc);
+});
+for (const [name, hangs] of [['clean stop', false], ['hung stop', true]]) {
+  test(`canary (agent/cli.js): without the exit call, a live handle keeps the process up after a ${name}`, async (t) => {
+    const failure = await assertCanaryFails('agent/cli.js', ['.then(() => exit(0))', '.then(() => undefined)'], exitScenario(hangs));
+    t.diagnostic(`failed as expected: ${failure.message.split('\n')[0]}`);
+  });
+}
+
 const systemdEnv = { ...process.env, ...userManagerEnv() };
 const systemdUserWorks = process.platform === 'linux' && spawnSync('systemd-run', ['--user', '--scope', '--quiet', '--collect', 'true'], { env: systemdEnv, timeout: 10_000 }).status === 0;
 const readCgroup = (pid) => fs.readFileSync(`/proc/${pid}/cgroup`, 'utf8').trim();

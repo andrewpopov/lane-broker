@@ -427,7 +427,7 @@ async function main() {
     }
     case 'agent': {
       const { agentCommand } = await import('../src/agent/cli.js');
-      return (await agentCommand(rest, { remoteRoot: parseRootFlag(rest) || defaultRemoteRoot() })).exitCode;
+      return (await agentCommand(rest, { remoteRoot: parseRootFlag(rest) || defaultRemoteRoot(), exit: (code) => process.exit(code) })).exitCode;
     }
     case 'report': {
       if (rest[0] === 'phases') return (await phasesReportCommand(rest.slice(1))).exitCode;
