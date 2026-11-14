@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { parse as parsePgConnectionString } from 'pg-connection-string';
-import { laneQueueUrlProblem } from './config.js';
+import { isSocketQueueUrl, laneQueueUrlProblem } from './config.js';
 import { connect } from './lane-db.js';
 
 
@@ -55,15 +55,16 @@ const readSecretFile = (file, what) => {
   }
 };
 
-function connectionConfig({ url, passwordFile, caFile }, { connectTimeoutMs = QUEUE_CONNECT_TIMEOUT_MS, queryTimeoutMs = QUEUE_QUERY_TIMEOUT_MS } = {}) {
+export function connectionConfig({ url, passwordFile, caFile }, { connectTimeoutMs = QUEUE_CONNECT_TIMEOUT_MS, queryTimeoutMs = QUEUE_QUERY_TIMEOUT_MS } = {}) {
+  const deadlines = { connectionTimeoutMillis: connectTimeoutMs, query_timeout: queryTimeoutMs };
+  if (isSocketQueueUrl(url)) return { ...parsePgConnectionString(url), ssl: false, ...deadlines };
   const password = readSecretFile(passwordFile, 'password').replace(/\r?\n$/, '');
   if (password === '') throw new QueueError(`queue password file ${passwordFile} is empty`);
   return {
     ...parsePgConnectionString(url),
     password,
     ssl: { ca: readSecretFile(caFile, 'CA'), rejectUnauthorized: true },
-    connectionTimeoutMillis: connectTimeoutMs,
-    query_timeout: queryTimeoutMs,
+    ...deadlines,
   };
 }
 

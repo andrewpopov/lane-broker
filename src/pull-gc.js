@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { readAttempt } from './attempts.js';
-import { DEFAULT_GLOBAL_CONFIG, LEDGER_RETENTION_FLOOR_MS, loadGlobalConfigOrError } from './config.js';
+import { DEFAULT_GLOBAL_CONFIG, LEDGER_RETENTION_FLOOR_MS, isSocketQueueUrl, loadGlobalConfigOrError } from './config.js';
 import { ledgerDir, ledgerFile, readLedger } from './pull-ledger.js';
 import { owedCancelFile, pullTicketDir, withTicketLock } from './pull-envelope.js';
 import { createQueueClient } from './queue-client.js';
@@ -233,7 +233,8 @@ function parseGcArgs(args) {
     if (value === undefined || !['--queue-url', '--password-file', '--rows-after', '--budget'].includes(flag)) throw new Error(`unknown or incomplete argument "${flag}"`);
     opts[flag.slice(2)] = value;
   }
-  for (const required of ['queue-url', 'password-file']) if (opts[required] === undefined) throw new Error(`--${required} is required (the admin login's own, never the submitter's)`);
+  const socket = isSocketQueueUrl(opts['queue-url']);
+  for (const required of socket ? ['queue-url'] : ['queue-url', 'password-file']) if (opts[required] === undefined) throw new Error(`--${required} is required (the admin login's own, never the submitter's)`);
   return opts;
 }
 
@@ -243,7 +244,9 @@ export async function pullGcCommand(args = []) {
     const { config, error } = loadGlobalConfigOrError();
     if (error) throw new Error(error);
     const { rustfs, caFile } = config.lanePull;
-    if (caFile === undefined || rustfs.endpoint === undefined || rustfs.credentialsEnvFile === undefined) throw new Error('config needs "lanePull.caFile", "lanePull.rustfs.endpoint" and "lanePull.rustfs.credentialsEnvFile"');
+    const needed = [...(isSocketQueueUrl(opts['queue-url']) ? [] : [['lanePull.caFile', caFile]]), ['lanePull.rustfs.endpoint', rustfs.endpoint], ['lanePull.rustfs.credentialsEnvFile', rustfs.credentialsEnvFile]];
+    const missing = needed.filter(([, value]) => value === undefined);
+    if (missing.length > 0) throw new Error(`config needs ${missing.map(([name]) => `"${name}"`).join(', ')}`);
     const summary = await gcOnce({
       root: ensureStateDirs().root,
       queue: createQueueClient({ url: opts['queue-url'], passwordFile: opts['password-file'], caFile }),
