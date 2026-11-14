@@ -92,6 +92,9 @@ export function paths(root = stateHome()) {
     // BRAIN-597: guards every read-modify-write of runner-unreachable.json; and the one-tick-at-a-time lock of `lane runner watch`.
     runnerUnreachableLock: path.join(root, 'runner-unreachable.lock'),
     runnerWatchLock: path.join(root, 'runner-watch.lock'),
+    // BRAIN-1057: `{ [runner]: { at, by } }`, the runners `lane runner offline` marked; overlaid on `runners[].offline` when the global config loads (src/runner-offline.js). Lock group `heartbeat`.
+    runnerOffline: path.join(root, 'runner-offline.json'),
+    runnerOfflineLock: path.join(root, 'runner-offline.lock'),
     conflictSkipState: path.join(root, 'conflict-skip-state.json'),
     // BRAIN-249 part 2: the capacity-blocked head's own skip counter — kept
     // separate from conflictSkipState (see readCapacitySkipState's doc
