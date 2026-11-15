@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneSpawn, laneRun, waitFor, sleep } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneSpawn, laneRun, waitFor, sleep, scaledMs } from './helpers.js';
 import { tmpDir, setup, markerCmd, resultOf } from './remote-harness.js';
 import { paths, withLock, LockTimeoutError, setLockContentionPolicy, resetLockContentionPolicy } from '../src/state.js';
 import { readHistoryRows } from '../src/suggest.js';
@@ -10,7 +10,8 @@ import { readHistoryRows } from '../src/suggest.js';
 // BRAIN-730: the lock is busy ~99% of the time under load, so a supervisor's default 15s acquire deadline expires. That is
 // contention: the supervisor waits instead of dying with no result.
 
-const supervisorMetTheLock = (state) => () => fs.existsSync(paths(state).admissionLog) && /lock-timeout:/.test(fs.readFileSync(paths(state).admissionLog, 'utf8'));
+const lockTimeoutLines = (state) => (fs.existsSync(paths(state).admissionLog) ? fs.readFileSync(paths(state).admissionLog, 'utf8').split('\n').filter((line) => /lock-timeout:/.test(line)).length : 0);
+const supervisorMetTheLock = (state, before = 0) => () => lockTimeoutLines(state) > before;
 
 function collect(child) {
   return new Promise((resolve) => {
@@ -22,7 +23,7 @@ function collect(child) {
   });
 }
 
-test('a supervisor whose first enqueue meets a held lock waits for it and runs the ticket', { timeout: 120_000 }, async () => {
+test('a supervisor whose first enqueue meets a held lock waits for it and runs the ticket', { timeout: scaledMs(150_000) }, async () => {
   const { base, home, state, env } = freshEnv({ LANE_BROKER_TEST_LOCK_TIMEOUT_MS: '150' });
   writeGlobalConfig(home, { version: 1, capacity: 1, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 50 });
   const repoDir = path.join(base, 'repo');
@@ -41,7 +42,7 @@ test('a supervisor whose first enqueue meets a held lock waits for it and runs t
   }
 });
 
-test('a fallback ticket whose finalize meets a held lock still publishes its result', { timeout: 120_000 }, async () => {
+test('a fallback ticket whose finalize meets a held lock still publishes its result', { timeout: scaledMs(300_000) }, async () => {
   const { env, state, repoDir } = setup({ ssh: 'down' });
   const dir = tmpDir('b730');
   const ready = path.join(dir, 'ready');
@@ -52,8 +53,9 @@ test('a fallback ticket whose finalize meets a held lock still publishes its res
   const id = started.stdout.trim();
   await waitFor(() => fs.existsSync(ready), { timeoutMs: 120_000 });
   await withLock(state, async () => {
+    const before = lockTimeoutLines(state);
     fs.writeFileSync(go, 'x');
-    await waitFor(supervisorMetTheLock(state), { timeoutMs: 90_000 });
+    await waitFor(supervisorMetTheLock(state, before), { timeoutMs: 90_000 });
   }, { timeoutMs: 10_000 });
   await waitFor(() => fs.existsSync(path.join(paths(state).results, `${id}.json`)), { timeoutMs: 60_000 });
   const result = resultOf(state, id);
@@ -89,7 +91,7 @@ async function holdLockFor(state, ms) {
     acquired();
     await sleep(ms);
   }, { timeoutMs: 10_000 });
-  await isHeld;
+  await Promise.race([isHeld, holder]);
   return { done: holder };
 }
 

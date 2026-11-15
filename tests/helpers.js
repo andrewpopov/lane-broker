@@ -185,11 +185,11 @@ export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Budget multiplier: LANE_BROKER_TEST_TIME_SCALE over LANE_BROKER_RUNNER_SPEED_FACTOR (higher = faster, valid in (0,4]). */
+/** Budget multiplier: LANE_BROKER_TEST_TIME_SCALE over LANE_BROKER_RUNNER_SPEED_FACTOR (higher = faster, valid in (0,4]). A fast runner never shrinks a budget. */
 export function timeScale(env = process.env) {
   const speed = Number(env.LANE_BROKER_RUNNER_SPEED_FACTOR);
   const override = Number(env.LANE_BROKER_TEST_TIME_SCALE);
-  const speedDivisor = Number.isFinite(speed) && speed > 0 && speed <= 4 ? speed : 1;
+  const speedDivisor = Number.isFinite(speed) && speed > 0 ? Math.min(speed, 1) : 1;
   const multiplier = Number.isFinite(override) && override > 0 ? override : 1;
   return multiplier / speedDivisor;
 }

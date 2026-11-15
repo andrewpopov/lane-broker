@@ -424,31 +424,32 @@ test('selectRunner: a runner with a queued ticket is skipped', async () => {
   // pattern as tests/queued-cancel.test.js.
   const STARTUP_TIMEOUT_MS = Math.max(60_000, 30 * globalConfig.sampleMs);
   const release = path.join(tmpDir('remote-client-queue-release'), 'release');
-  const blockerPromise = laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'sh', '-c', `while [ ! -e '${release}' ]; do sleep 0.1; done`], { env: clientPath.env, cwd: repoDir });
-  await waitFor(
-    () => {
-      try {
-        return fs.readdirSync(path.join(state, 'leases')).filter((n) => n.endsWith('.json')).length > 0;
-      } catch {
-        return false;
-      }
-    },
-    { timeoutMs: STARTUP_TIMEOUT_MS },
-  );
-  const queuedPromise = laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'true'], { env: clientPath.env, cwd: repoDir });
-  await waitFor(
-    () => {
-      try {
-        return fs.readdirSync(path.join(state, 'queue')).length > 0;
-      } catch {
-        return false;
-      }
-    },
-    { timeoutMs: STARTUP_TIMEOUT_MS },
-  );
-
-  const runners = [makeRunner({ ssh: 'normal' })];
+  const blockerPromise = laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'sh', '-c', `i=0; while [ ! -e '${release}' ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done`], { env: clientPath.env, cwd: repoDir });
+  let queuedPromise;
   try {
+    await waitFor(
+      () => {
+        try {
+          return fs.readdirSync(path.join(state, 'leases')).filter((n) => n.endsWith('.json')).length > 0;
+        } catch {
+          return false;
+        }
+      },
+      { timeoutMs: STARTUP_TIMEOUT_MS },
+    );
+    queuedPromise = laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'true'], { env: clientPath.env, cwd: repoDir });
+    await waitFor(
+      () => {
+        try {
+          return fs.readdirSync(path.join(state, 'queue')).length > 0;
+        } catch {
+          return false;
+        }
+      },
+      { timeoutMs: STARTUP_TIMEOUT_MS },
+    );
+
+    const runners = [makeRunner({ ssh: 'normal' })];
     const { runner, skipped } = await selectRunner(runners, { sshBin, env: clientPath.env, deadlineMs: PROBE_DEADLINE_MS });
 
     assert.equal(runner, null);

@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { afterEach } from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, gitFixture, laneRun, laneSpawn, waitFor, timeScale, GENEROUS_PROBE_DEADLINE_MS, BIN } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, gitFixture, laneRun, laneSpawn, waitFor, scaledMs, timeScale, GENEROUS_PROBE_DEADLINE_MS, BIN } from './helpers.js';
 import { paths, readJsonSafe } from '../src/state.js';
 import { makeTmpDir } from './helpers/tmp.js';
 import { CAPABILITIES } from '../src/capabilities.js';
@@ -31,9 +31,9 @@ export function tmpDir(prefix) {
 }
 
 /** README "Testing hooks": a 200 ms first result-poll backoff (production 5 s) and a 1 s cancel grace (production 10 s). */
-export const scaledWaitTimeout = (timeout) => (/^\d+s$/.test(timeout) ? `${Math.ceil(Number.parseInt(timeout, 10) * timeScale())}s` : timeout);
-
 export const FAST_WAITS = { LANE_BROKER_TEST_RESULT_POLL_MS: '200', LANE_BROKER_TEST_CANCEL_GRACE_MS: '1000' };
+
+const scaledWaitTimeout = (timeout) => (/^\d+s$/.test(timeout) ? `${Math.ceil(Number.parseInt(timeout, 10) * timeScale())}s` : timeout);
 
 /** freshEnv() + shadow scheduler config: these tests exercise the client/protocol
  *  (or, in remote-dispatch.test.js, the supervisor's remote-dispatch wiring), not the
@@ -703,7 +703,7 @@ export function rebalanceSetup({ names = ['a', 'b'], paused = ['a'], rebalance =
   return { ...base, fake, runs, unpause, start, finish, runners, globalRunners, binDir, cmdArgv };
 }
 
-export const T = { timeout: 180_000 };
+export const T = { timeout: scaledMs(180_000) };
 
 /**
  * Wait until the exec on runner `name` has started AND enqueued its ticket (recorded `remote-id`). The ssh call starting is not the

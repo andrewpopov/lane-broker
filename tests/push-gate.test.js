@@ -369,17 +369,21 @@ test('a held ticket blocks no other ticket', async () => {
   const second = addWork(fx, 's');
   const holder = heldCmd(fx, 120);
   const first = push(fx, 'first', holder.cmd);
-  await waitFor(() => hasLease(fx), { timeoutMs: 60_000 });
-  await sleep(GATE_SECONDS_APART);
-  // A half-written atomicWriteFile temp sits in the queue folder until its rename; the listing must not parse it.
-  fs.mkdirSync(paths(fx.state).queue, { recursive: true });
-  fs.writeFileSync(path.join(paths(fx.state).queue, `.tmp-${process.pid}-inflight`), '');
-  const held = push(fx, 'second', 'true', PUSH_REF, '', second);
-  await waitFor(() => queuedRecords(fx).some((r) => r.pushGate), { timeoutMs: 60_000 });
-  const unrelated = await laneRun(['run', '--repo', 'r', '--lane', 'other', '--', 'true'], { env: fx.env, cwd: fx.work });
-  assert.equal(unrelated.code, 0);
-  assert.equal(queuedRecords(fx).filter((r) => r.pushGate).length, 1, 'the held push is still queued');
-  holder.release();
+  let held;
+  try {
+    await waitFor(() => hasLease(fx), { timeoutMs: 60_000 });
+    await sleep(GATE_SECONDS_APART);
+    // A half-written atomicWriteFile temp sits in the queue folder until its rename; the listing must not parse it.
+    fs.mkdirSync(paths(fx.state).queue, { recursive: true });
+    fs.writeFileSync(path.join(paths(fx.state).queue, `.tmp-${process.pid}-inflight`), '');
+    held = push(fx, 'second', 'true', PUSH_REF, '', second);
+    await waitFor(() => queuedRecords(fx).some((r) => r.pushGate), { timeoutMs: 60_000 });
+    const unrelated = await laneRun(['run', '--repo', 'r', '--lane', 'other', '--', 'true'], { env: fx.env, cwd: fx.work });
+    assert.equal(unrelated.code, 0);
+    assert.equal(queuedRecords(fx).filter((r) => r.pushGate).length, 1, 'the held push is still queued');
+  } finally {
+    holder.release();
+  }
   await Promise.all([first.done, held.done]);
 });
 

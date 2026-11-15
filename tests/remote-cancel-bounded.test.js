@@ -20,7 +20,7 @@ import { isPidAlive } from '../src/lease.js';
  * Deadlines under the harness's 1 s cancel grace: remote cancel 6 s, supervisor exit deadline 11.5 s, `lane cancel` wait 13.5 s.
  */
 
-const T = { timeout: 90_000 };
+const T = { timeout: scaledMs(90_000) };
 const ABANDONED_LINE = /cancel did not finish within \d+ms; exiting 74/;
 
 function withCancelWrapper(env) {

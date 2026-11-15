@@ -166,7 +166,7 @@ const SCENARIOS = {
   'T2: while the queue has not committed the withdraw the command never runs locally and the supervisor keeps waiting': async (load, w, t) => {
     const fx = await pullE2E(t, w, { load, localPaused: true, queueFail: 'ld_withdraw', lanePull: { queuedTimeoutMs: 1000 } });
     const id = await fx.detach(fx.markLocalRun);
-    await until(() => fx.injectedFailures('ld_withdraw') >= 2 || (fx.injectedFailures('ld_withdraw') === 1 && !supervisorAlive(fx.attempt(id))), 60_000, () => `a second failed withdraw (saw ${fx.injectedFailures('ld_withdraw')})`);
+    await until(() => fx.injectedFailures('ld_withdraw') >= 3 || (fx.injectedFailures('ld_withdraw') >= 1 && !supervisorAlive(fx.attempt(id))), 60_000, () => `a third failed withdraw (saw ${fx.injectedFailures('ld_withdraw')})`);
     const attempt = fx.attempt(id);
     assert.equal(fx.ranLocally(), false);
     assert.equal(supervisorAlive(attempt), true, 'the supervisor gave up waiting for a withdraw that never committed');
@@ -352,9 +352,9 @@ describe('pull placement and settlement through a real supervisor', { skip: pgSk
   before(async () => { cluster = await startDispatchCluster(); });
   afterAll(async () => { await cluster?.closeClients(); cluster?.stop(); });
   afterEach(() => cluster.closeClients());
-  for (const [name, scenario] of Object.entries(SCENARIOS)) test(name, { timeout: 120_000 }, async (t) => scenario(realSrc, await World.create(cluster), t));
+  for (const [name, scenario] of Object.entries(SCENARIOS)) test(name, { timeout: scaledMs(120_000) }, async (t) => scenario(realSrc, await World.create(cluster), t));
   for (const [name, file, mutation] of CANARIES) {
-    test(`canary: with "${mutation[0].trim().slice(0, 70)}" removed, "${name}" fails`, { timeout: 150_000 }, async (t) => {
+    test(`canary: with "${mutation[0].trim().slice(0, 70)}" removed, "${name}" fails`, { timeout: scaledMs(150_000) }, async (t) => {
       const world = await World.create(cluster);
       const failure = await assertCanaryFails(file, mutation, (load) => SCENARIOS[name](load, world, t));
       t.diagnostic(`failed as expected: ${String(failure.message).split('\n')[0].slice(0, 160)}`);

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor, sleep, scaledMs } from './helpers.js';
 import { listQueue } from '../src/scheduler.js';
 
 function markerScript(mark, viol, sleepSecs) {
@@ -47,7 +47,9 @@ test('capacity holds: lanes whose combined weight exceeds capacity do not all ru
   const startedLines = () => (fs.existsSync(events) ? fs.readFileSync(events, 'utf8').split('\n').filter(Boolean).length : 0);
   try {
     await waitFor(() => startedLines() === 2 && listQueue(state).length === 1, { timeoutMs: 60_000 });
+    await sleep(scaledMs(1000)); // a third lane admitted past capacity would show up in this window
     assert.equal(startedLines(), 2, 'the third lane is held in the queue while the first two run');
+    assert.equal(listQueue(state).length, 1, 'and it is still queued');
   } finally {
     fs.writeFileSync(release, '');
   }
