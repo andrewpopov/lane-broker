@@ -26,6 +26,9 @@ export const DEFAULT_TIMING = {
 
 class FetchBudgetError extends Error {}
 
+/** BRAIN-1099: the grant the queue claimed an elastic ticket at, for `remote-exec`; nothing for a claim the queue answered without one. */
+export const claimCpuArgs = (claim) => (Number.isFinite(claim.cpuCores) ? ['--claim-cpu-cores', String(claim.cpuCores)] : []);
+
 /** The header `buildResult` reads, rebuilt from what the queue bound this execution to (the stream is not trusted when it is the thing refused). */
 const headerOf = ({ id, claim: { binding, header } }) => ({ ...header, ticketId: id, generation: binding.generation, protocol: binding.protocol, manifest: { manifestHash: binding.manifestHash } });
 
@@ -320,7 +323,7 @@ export class ExecutionDriver {
     try {
       const argv = [process.execPath, ...childExitSafeFlags(), this.laneBin, 'remote-exec', '--root', this.remoteRoot, '--transfer', 'gzip', '--transfer-cache', '--epoch', String(record.epoch),
         '--runner-name', this.ld.registered.host, '--runner-speed-factor', String(this.config.speedFactor),
-        ...(Number.isFinite(record.claim.cpuCores) ? ['--claim-cpu-cores', String(record.claim.cpuCores)] : [])];
+        ...claimCpuArgs(record.claim)];
       const { cmd, args } = supervisorLaunch(execId, argv, this.#scope);
       const child = this.spawnProcess(cmd, args, { detached: true, stdio: [input, log, log], env: this.spawnEnv });
       child.on('error', (err) => this.log(`${execId}: spawn failed: ${err.message}`));

@@ -26,19 +26,30 @@ export function claimBlock({ schedule, stopClaimingBeforeCloseMs, now = Date.now
 const clampMem = (bytes) => Math.min(Math.max(0, Math.floor(bytes)), MAX_FREE_MEM);
 
 /**
- * The free CPU and memory a claim offers, and the whole CPU budget (`capacityCpu`, which lets the queue hold back for an aged head this host could fit,
- * BRAIN-1099). Active mode measures this host as `remote-probe` does and answers null (skip the tick) when the measurement is missing; shadow mode has
- * no measurement to trust and offers the static budget, which is finite.
+ * The free CPU and memory a claim offers, and the CPU budget. Active mode measures this host as `remote-probe` does and answers null (skip the tick)
+ * when the measurement is missing; shadow mode has no measurement to trust and offers the static budget, which is finite.
  */
 export async function claimFigures({ cfg = loadGlobalConfig(), host = detectResourceCapacity() } = {}) {
-  const capacityCpu = cpuBudgetCores(host, cfg);
-  if (cfg.schedulerMode !== 'active') return { freeCpu: capacityCpu, freeMem: clampMem(host.memoryBytes - cfg.memoryReserveBytes), capacityCpu };
+  const budgetCpu = cpuBudgetCores(host, cfg);
+  if (cfg.schedulerMode !== 'active') return { freeCpu: budgetCpu, freeMem: clampMem(host.memoryBytes - cfg.memoryReserveBytes), budgetCpu };
   const status = await collectStatus({ lockTimeoutMs: PROBE_LOCK_WAIT_MS });
   const brokerRoot = ensureStateDirs().root;
   const cpuHeadroom = await probeCpuHeadroom(brokerRoot, cfg, listLeases(brokerRoot).filter((l) => HELD_STATES.has(l.state)));
   const headroom = probeHeadroom(status.resources, cfg, true, undefined, cpuHeadroom);
   if (!headroom || !Number.isFinite(headroom.cpuCores) || !Number.isFinite(headroom.memoryBytes)) return null;
-  return { freeCpu: headroom.cpuCores, freeMem: clampMem(headroom.memoryBytes), capacityCpu };
+  return { freeCpu: headroom.cpuCores, freeMem: clampMem(headroom.memoryBytes), budgetCpu };
+}
+
+/**
+ * BRAIN-1099: what this runner could offer once its own claims end, its free figures plus what those claims hold (CPU capped at the budget). Outside
+ * load stays counted, so the queue holds back only for a head this runner can really reach. Null unless the queue supports the reservation.
+ */
+export function claimCapacity(offered, records, registered) {
+  if (registered?.head_reserve !== true || !Number.isFinite(offered.budgetCpu)) return null;
+  const live = records.filter((r) => r.subphase !== 'DONE');
+  const heldCpu = live.reduce((sum, r) => sum + (r.claim.cpuCores ?? r.claim.header?.cpuCores ?? 0), 0);
+  const heldMem = live.reduce((sum, r) => sum + (r.claim.header?.memoryBytes ?? 0), 0);
+  return { cpu: Math.min(offered.budgetCpu, offered.freeCpu + heldCpu), mem: clampMem(offered.freeMem + heldMem) };
 }
 
 /**
@@ -68,7 +79,7 @@ export async function claimOnce({ core, remoteRoot, figures = claimFigures, bloc
       }
       clearPendingClaim(remoteRoot);
     },
-  }, offered.capacityCpu ?? null);
+  }, claimCapacity(offered, core.table.all(), core.ld.registered));
   if (answer.skipped) return { status: 'skipped', reason: 'not-live' };
   return execId ? { status: 'claimed', execId } : { status: answer.status };
 }

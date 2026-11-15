@@ -2164,18 +2164,21 @@ that grant to `lane remote-exec --claim-cpu-cores <k>`, which runs the ticket wi
 final grant (it may shrink further, never below the floor), which is what the child
 sees as `LANE_BROKER_CPU_CORES`. A full fit keeps the declared claim.
 
-**Aged-head reservation on pull (BRAIN-1099).** `ld_claim` takes the runner's whole
-CPU budget as an optional fifth argument (`cpuBudgetCores`, sent by agents from
-0.106). When the top ticket that runner could claim (same eligibility and order,
-ignoring fit) has waited `age_horizon_s` (60 min), does not fit now (CPU at its
-`claim_need`, or memory), would fit the runner's budget, and the runner holds at
-least one claim of its own, the answer is `{status: 'none', reserved_for: <id>}`:
-nothing smaller is backfilled past it, and the freed cores go to the head. Scope is
-per runner and only runners that could ever fit the head: a runner whose budget is
-smaller backfills freely, so a large head never wedges a small runner, and a runner
-with nothing of its own running never holds (the head is futile there, as BRAIN-418
-judges a head on a drained host), so no runner is ever idled indefinitely. An agent
-that sends no budget (0.105 and older) never holds back.
+**Aged-head reservation on pull (BRAIN-1099).** `ld_claim` takes two optional
+arguments, the CPU and memory this runner could offer once its own claims end
+(its free figures plus what those claims hold, CPU capped at `cpuBudgetCores`;
+outside load stays counted). An agent sends them only when `ld_register` answers
+`head_reserve: true`, so a new agent keeps claiming from a queue still at schema 7.
+The head is the top ticket this runner could ever fit (same eligibility and order
+as the claim; a static test pins the two queries together). When it has waited
+`age_horizon_s` (60 min), does not fit now, and the runner holds at least one
+claim of its own, the answer is `{status: 'none', reserved_for: <id>}`: nothing
+smaller is backfilled past it, and the freed cores go to the head. A head too big
+for a runner on CPU or memory is passed over there, so a large head never wedges a
+small runner and the next aged ticket that runner could fit is reserved instead. A
+runner with nothing of its own running never holds (the head is futile there, as
+BRAIN-418 judges a head on a drained host), so no runner is idled indefinitely. An
+agent at 0.105 or older sends no capacity and never holds back.
 
 ### Right-sized CPU requests (`rightSizeFromHistory`, BRAIN-550)
 

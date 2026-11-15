@@ -77,8 +77,8 @@ export const enqueue = (client, id, { repo = 'repoA', laneKey = `lk-${id}`, tags
     ...(minCpu === undefined ? [] : [minCpu]));
 
 /** `capacity` (the runner's whole CPU budget, BRAIN-1099) is sent only when given, so the default is the 4-argument call an older agent makes. */
-export const claim = (client, { req = randomUUID(), cpu = 8, mem = 1e9, held = [], capacity } = {}) =>
-  call(client, 'ld_claim', req, cpu, mem, held, ...(capacity === undefined ? [] : [capacity]));
+export const claim = (client, { req = randomUUID(), cpu = 8, mem = 1e9, held = [], capacity, capacityMem = 1e10 } = {}) =>
+  call(client, 'ld_claim', req, cpu, mem, held, ...(capacity === undefined ? [] : [capacity, capacityMem]));
 
 export const finish = (client, claimed, result = { kind: 'ok', exitCode: 0 }) => call(client, 'ld_finish', claimed.id, claimed.epoch, claimed.token, result);
 export const start = (client, claimed) => call(client, 'ld_start', claimed.id, claimed.epoch, claimed.token);
@@ -122,7 +122,7 @@ export async function downgradeToV7(world) {
   await su.query(fs.readFileSync(new URL('./fixtures/lane-v7-functions.sql', import.meta.url), 'utf8'));
   await su.query('DROP FUNCTION lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], real)');
   await su.query('DROP FUNCTION lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], real)');
-  await su.query('DROP FUNCTION lane_dispatch.ld_claim(uuid, real, bigint, text[], real)');
+  await su.query('DROP FUNCTION lane_dispatch.ld_claim(uuid, real, bigint, text[], real, bigint)');
   await su.query('DROP FUNCTION lane_dispatch.claim_need(real, real, interval, interval)');
 }
 
