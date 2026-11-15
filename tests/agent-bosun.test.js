@@ -143,7 +143,7 @@ const scenarios = {
     process.env.BOSUN_TEXTFILE_DIR = dir;
     try {
       const agent = await rw.agent({ load });
-      await happens('a tick with an empty queue was written', () => Number(series(readProm(dir), 'lane_agent_claims_total{answer="none"}')) >= 1);
+      await happens('a tick with an empty queue was written', () => Number(series(readProm(dir), 'lane_agent_claim_attempts_total{answer="none"}')) >= 1);
       const idle = readProm(dir);
       assert.equal(series(idle, 'lane_agent_listen_up'), '1');
       assert.equal(series(idle, 'lane_agent_registered'), '1');
@@ -153,9 +153,28 @@ const scenarios = {
       assert.ok(Math.abs(Number(series(idle, 'lane_agent_last_tick_timestamp_seconds')) * 1000 - Date.now()) < 10_000);
       const ticket = await rw.submit({ code: SLEEP });
       await rw.claimed(ticket);
-      await happens('the running execution and the claim are counted', () => series(readProm(dir), 'lane_agent_executions{subphase="RUNNING"}') === '1' && series(readProm(dir), 'lane_agent_claims_total{answer="claimed"}') === '1');
+      await happens('the running execution and the claim are counted', () => series(readProm(dir), 'lane_agent_executions{subphase="RUNNING"}') === '1' && series(readProm(dir), 'lane_agent_claims_total') === '1');
+      assert.ok(Number(series(readProm(dir), 'lane_agent_claim_attempts_total{answer="none"}')) >= 1, 'the none answers are attempts, not claims');
       assert.deepEqual(fs.readdirSync(dir), [METRICS_FILE], 'only the finished file is ever left');
       assert.equal(agent.core.table.all().length, 1);
+    } finally {
+      if (saved === undefined) delete process.env.BOSUN_TEXTFILE_DIR;
+      else process.env.BOSUN_TEXTFILE_DIR = saved;
+    }
+  },
+
+  'config.metricsTextfileDir is where lane-agent.prom goes, ahead of BOSUN_TEXTFILE_DIR, and a poked tick inside pollMs does not rewrite it': async (w, rw, load) => {
+    const [configured, bosun] = [makeTmpDir('agent-config-textfile-'), makeTmpDir('bosun-textfile-')];
+    const saved = process.env.BOSUN_TEXTFILE_DIR;
+    process.env.BOSUN_TEXTFILE_DIR = bosun;
+    try {
+      const agent = await rw.agent({ load, textfileDir: undefined, config: { metricsTextfileDir: configured, pollMs: 30_000 } });
+      await happens('the first tick wrote the configured directory', () => series(readProm(configured), 'lane_agent_claims_total') === '0');
+      assert.deepEqual(fs.readdirSync(bosun), [], 'the bosun directory is not written when the config names one');
+      await rw.claimed(await rw.submit({ code: SLEEP }));
+      await happens('the claim round finished', () => agent.names().filter((n) => n === 'ld_claim').length >= 3);
+      await sleep(300);
+      assert.equal(series(readProm(configured), 'lane_agent_claims_total'), '0', 'the tick the claim poked came inside pollMs, so the file was not rewritten');
     } finally {
       if (saved === undefined) delete process.env.BOSUN_TEXTFILE_DIR;
       else process.env.BOSUN_TEXTFILE_DIR = saved;
@@ -306,6 +325,7 @@ const bareName = 'a failing scope probe off Linux starts remote-exec bare and de
 const pauseName = 'on Linux a failing scope probe pauses claims, logging once per change, and they resume when a re-probe passes';
 const xdgName = 'XDG_RUNTIME_DIR missing at start is filled in for the agent and its supervisors, whether or not the directory exists yet';
 const propName = 'with BOSUN_TEXTFILE_DIR set each tick writes lane-agent.prom: ticking, every subphase, claim counters, listen and registered up, version';
+const dirName = 'config.metricsTextfileDir is where lane-agent.prom goes, ahead of BOSUN_TEXTFILE_DIR, and a poked tick inside pollMs does not rewrite it';
 const inflightName = 'a stop waits for an in-flight ld_finish to settle, leaves the running lane running, and returns';
 const canaries = [
   [spawnName, EXEC, ['supervisorLaunch(execId, argv, this.#scope)', 'supervisorLaunch(execId, argv, { available: false })']],
@@ -319,7 +339,9 @@ const canaries = [
   [xdgName, RUN, [', ...userManagerEnv({ ...process.env, ...spawnEnv }, { platform })', '']],
   [propName, RUN, ['        writeMetrics();\n', '']],
   [propName, RUN, ['listening: core.ld.listening', 'listening: false']],
-  ['with no textfile directory the agent writes no file and logs no metrics error', RUN, ['if (!textfileDir) return;', 'if (false) return;'], /./],
+  [dirName, RUN, ['config.metricsTextfileDir ?? process.env.BOSUN_TEXTFILE_DIR', 'process.env.BOSUN_TEXTFILE_DIR']],
+  [dirName, RUN, ['!textfileDir || now() - metricsWrittenAt < config.pollMs', '!textfileDir']],
+  ['with no textfile directory the agent writes no file and logs no metrics error', RUN, ['if (!textfileDir || now() - metricsWrittenAt < config.pollMs) return;', 'if (false) return;'], /./],
   ['a textfile directory that is a regular file logs a metrics error each failure and claims carry on', RUN, ['log(`metrics: ${err.message}`);', '']],
   ['once stop begins no ld_claim is sent, even by a claim already past its gate', RUN, ["const block = () => stopped ? 'stopping' : driver.scopeBlock() ?? claimBlock(", 'const block = () => driver.scopeBlock() ?? claimBlock(']],
   [inflightName, EXEC, ['setTimeout(resolve, settleMs)', 'setTimeout(resolve, 0)']],

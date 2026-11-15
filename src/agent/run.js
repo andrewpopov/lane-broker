@@ -22,13 +22,13 @@ const LIVENESS_CALLS = new Set(['ld_claim', 'ld_heartbeat', 'ld_register']);
  * every `config.pollMs` (at most 15 s) as the fallback, and again straight after each claim until the queue answers `none`. Whatever wakes
  * the loop, no more than `pollMs` passes between two liveness calls (`ld_claim`, `ld_heartbeat`, `ld_register`): a runner that is draining,
  * outside its window or short of headroom, holding nothing, pings with `ld_register`. An `upgrade` answer stops claiming for good and is
- * logged on every tick; running executions carry on. Stopping leaves running executions running: they outlive the agent. With `textfileDir`
- * (bosun's `BOSUN_TEXTFILE_DIR`) each tick also writes `lane-agent.prom` there.
+ * logged on every tick; running executions carry on. Stopping leaves running executions running: they outlive the agent. With a textfile
+ * directory (`config.metricsTextfileDir`, else bosun's `BOSUN_TEXTFILE_DIR`) a tick writes `lane-agent.prom` there, at most once per `pollMs`.
  *
  * The broker's home and state directory come from `config` and replace whatever the environment says, here and in the lane processes this
  * agent spawns, so a supervisor's minimal environment and an operator's shell behave the same.
  */
-export async function startAgent({ remoteRoot, config, version, log = (line) => process.stderr.write(`${line}\n`), figures, draining, now = Date.now, timing, s3 = s3ClientOf(config.rustfs), spawnEnv = process.env, laneBin, Driver = ExecutionDriver, coreOptions = {}, textfileDir = process.env.BOSUN_TEXTFILE_DIR, stopSettleMs = STOP_SETTLE_MS, platform = process.platform, driverOptions = {}, tools, deviceSampler = (gates) => sampleDevice(gates, { platform }) }) {
+export async function startAgent({ remoteRoot, config, version, log = (line) => process.stderr.write(`${line}\n`), figures, draining, now = Date.now, timing, s3 = s3ClientOf(config.rustfs), spawnEnv = process.env, laneBin, Driver = ExecutionDriver, coreOptions = {}, textfileDir = config.metricsTextfileDir ?? process.env.BOSUN_TEXTFILE_DIR, stopSettleMs = STOP_SETTLE_MS, platform = process.platform, driverOptions = {}, tools, deviceSampler = (gates) => sampleDevice(gates, { platform }) }) {
   const brokerEnv = { LANE_BROKER_HOME: config.brokerHome, LANE_BROKER_STATE: config.stateDir, ...userManagerEnv({ ...process.env, ...spawnEnv }, { platform }) };
   Object.assign(process.env, brokerEnv);
   const claimFiguresOf = figures ?? (() => claimFigures({ cfg: loadGlobalConfig({ home: config.brokerHome }) }));
@@ -53,17 +53,20 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
   driver.watchScope();
   let stopped = false;
   let upgradeRequired = false;
-  const claims = {};
-  const countClaim = (answer) => { claims[answer] = (claims[answer] ?? 0) + 1; };
+  const claimAttempts = {};
+  let claimed = 0;
+  const countClaim = (answer) => { claimAttempts[answer] = (claimAttempts[answer] ?? 0) + 1; };
   let deviceGates = {};
   let deviceSampledAt = -Infinity;
   let deviceSampleError = null;
   let deviceGatesConfig = config.deviceGates;
   let deviceConfigError = null;
+  let metricsWrittenAt = -Infinity;
   const writeMetrics = () => {
-    if (!textfileDir) return;
+    if (!textfileDir || now() - metricsWrittenAt < config.pollMs) return;
+    metricsWrittenAt = now();
     try {
-      writeAgentMetrics(textfileDir, { now: now(), records: core.table.all(), claims, listening: core.ld.listening, registered: core.ld.registeredOnConnection, scopeAvailable: driver.scopeAvailable, version, deviceGates });
+      writeAgentMetrics(textfileDir, { now: now(), records: core.table.all(), claimed, claimAttempts, listening: core.ld.listening, registered: core.ld.registeredOnConnection, scopeAvailable: driver.scopeAvailable, version, deviceGates });
     } catch (err) {
       log(`metrics: ${err.message}`);
     }
@@ -113,7 +116,10 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
       }
       if (answer.status !== 'skipped') countClaim(answer.status);
       if (answer.status === 'upgrade') upgradeRequired = true;
-      else if (answer.status === 'claimed') driver.adopt(answer.execId);
+      else if (answer.status === 'claimed') {
+        claimed += 1;
+        driver.adopt(answer.execId);
+      }
       else return;
     }
   }

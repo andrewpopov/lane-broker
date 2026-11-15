@@ -74,7 +74,8 @@ const SNAPSHOT = {
   scopeAvailable: true,
   now: 1_700_000_123_456,
   records: [{ subphase: 'RUNNING' }, { subphase: 'RUNNING' }, { subphase: 'OUTBOX' }],
-  claims: { claimed: 2, none: 5 },
+  claimed: 2,
+  claimAttempts: { claimed: 3, none: 5, error: 1 },
   listening: true,
   registered: false,
   version: '1.2"3',
@@ -88,12 +89,14 @@ const metricsScenarios = {
     assert.equal(sample(text, 'lane_agent_last_tick_timestamp_seconds'), '1700000123.456');
     for (const [subphase, n] of Object.entries({ RUNNING: 2, OUTBOX: 1, FETCHING: 0, KILLING: 0, DONE: 0 })) assert.equal(sample(text, `lane_agent_executions{subphase="${subphase}"}`), String(n), subphase);
     assert.equal(SUBPHASES.filter((s) => sample(text, `lane_agent_executions{subphase="${s}"}`) === undefined).length, 0, 'every subphase has a series');
-    assert.deepEqual(CLAIM_ANSWERS.map((a) => sample(text, `lane_agent_claims_total{answer="${a}"}`)), ['2', '5', '0', '0']);
+    assert.deepEqual(CLAIM_ANSWERS.map((a) => sample(text, `lane_agent_claim_attempts_total{answer="${a}"}`)), ['3', '5', '0', '1']);
+    assert.equal(sample(text, 'lane_agent_claims_total'), '2', 'claims_total counts claims, not ld_claim answers');
     assert.equal(sample(text, 'lane_agent_listen_up'), '1');
     assert.equal(sample(text, 'lane_agent_registered'), '0');
     assert.equal(sample(text, 'lane_agent_scope_available'), '1');
     assert.equal(sample(text, 'lane_agent_info{version="1.2\\"3"}'), '1');
     assert.match(text, /# TYPE lane_agent_claims_total counter\n/);
+    assert.match(text, /# TYPE lane_agent_claim_attempts_total counter\n/);
     assert.equal(text.endsWith('\n'), true);
   },
   'the file is replaced by rename: a reader holding the old file still sees it whole, and no temp file is left': async (load) => {

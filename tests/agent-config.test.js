@@ -148,3 +148,9 @@ test('brokerHome and stateDir are absolute, default to the broker defaults, and 
     else process.env.LANE_BROKER_HOME = saved;
   }
 });
+
+test('metricsTextfileDir is null when absent, an absolute path when set, and refused otherwise', () => {
+  assert.equal(load(setup().file).metricsTextfileDir, null);
+  assert.equal(load(setup({ metricsTextfileDir: '/var/lib/node_exporter/textfile-lane' }).file).metricsTextfileDir, '/var/lib/node_exporter/textfile-lane');
+  for (const value of ['textfile', '', 7, null]) refused(setup({ metricsTextfileDir: value }).file, /^"metricsTextfileDir" must be an absolute path$/);
+});
