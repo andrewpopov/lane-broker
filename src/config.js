@@ -562,7 +562,8 @@ function validateGlobalConfig(cfg, sourcePath) {
 
 const isPlainObject = (value) => value !== null && typeof value === 'object' && !Array.isArray(value);
 
-export const LANE_QUEUE_DATABASE = 'lane_queue';
+// lane_queue_db is the name after the BRAIN-1098 rename; both are accepted until every host has moved.
+export const LANE_QUEUE_DATABASES = Object.freeze(['lane_queue', 'lane_queue_db']);
 const LANE_QUEUE_PRIMARY_LABEL = 'pg-primary';
 
 const ROUTING_QUERY_KEYS = new Set(['host', 'hostaddr', 'port', 'dbname', 'database', 'service', 'target_session_attrs']);
@@ -600,7 +601,7 @@ export function laneQueueUrlProblem(raw) {
   if (host.startsWith('svc:')) return 'must not use a svc: host (a failover name); name the one direct endpoint';
   if (host.includes(',')) return 'must name exactly one host (multi-host URLs are refused)';
   if (host.split('.')[0].toLowerCase() === LANE_QUEUE_PRIMARY_LABEL) return `must not use the ${LANE_QUEUE_PRIMARY_LABEL} name (a moving primary); name the one direct endpoint`;
-  if (parsed.database !== LANE_QUEUE_DATABASE) return `must name the ${LANE_QUEUE_DATABASE} database`;
+  if (!LANE_QUEUE_DATABASES.includes(parsed.database)) return `must name the lane queue database (${LANE_QUEUE_DATABASES.join(' or ')})`;
   return null;
 }
 
