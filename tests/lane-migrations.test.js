@@ -75,6 +75,23 @@ describe('lane schema versioning', { skip: PG_SKIP_REASON ?? false, timeout: 120
     assert.deepEqual((await applyMigrations(c, { dir })).applied, []);
   });
 
+  test('migration 007 adds avoid_tags and the grace to a v6 queue, and the re-signed enqueue functions leave no old overload behind', async () => {
+    const c = await emptyDb();
+    const dir = fixtureDir();
+    fs.rmSync(path.join(dir, 'migrations', '007-avoid-tags.sql'));
+    await applyMigrations(c, { dir });
+    const OLD_ARGS = 'uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real';
+    await c.query(`CREATE FUNCTION lane_dispatch.ld_enqueue(${OLD_ARGS}) RETURNS int LANGUAGE sql AS 'SELECT 1'`);
+    await c.query(`CREATE FUNCTION lane_dispatch.ld_enqueue_fenced(text, ${OLD_ARGS}) RETURNS int LANGUAGE sql AS 'SELECT 1'`);
+    const columns = async () => (await c.query("SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'lane_dispatch' AND column_name IN ('avoid_tags', 'avoid_grace_s') ORDER BY 1, 2")).rows;
+    assert.deepEqual(await columns(), []);
+    assert.deepEqual((await applyMigrations(c)).applied, ['007-avoid-tags.sql']);
+    assert.deepEqual(await columns(), [{ table_name: 'cluster', column_name: 'avoid_grace_s' }, { table_name: 'tickets', column_name: 'avoid_tags' }]);
+    assert.equal((await c.query('SELECT avoid_grace_s FROM lane_dispatch.cluster')).rows[0].avoid_grace_s, 120);
+    const args = async (name) => (await c.query("SELECT pronargs::int AS n FROM pg_proc WHERE proname = $1 AND pronamespace = 'lane_dispatch'::regnamespace", [name])).rows.map((r) => r.n);
+    assert.deepEqual([await args('ld_enqueue'), await args('ld_enqueue_fenced')], [[16], [17]]);
+  });
+
   test('a migration that fails rolls back whole: no partial change, no version row, and the error propagates', async () => {
     const c = await emptyDb();
     const next = REAL_MIGRATIONS.length + 1;
@@ -117,13 +134,13 @@ describe('lane schema versioning', { skip: PG_SKIP_REASON ?? false, timeout: 120
   test('migration 003 backfills the scheduling parents of principals that already existed', async () => {
     const c = await emptyDb();
     const dir = fixtureDir();
-    for (const f of fs.readdirSync(path.join(dir, 'migrations')).filter((x) => /^00[3456]-/.test(x))) fs.rmSync(path.join(dir, 'migrations', f));
+    for (const f of fs.readdirSync(path.join(dir, 'migrations')).filter((x) => /^00[34567]-/.test(x))) fs.rmSync(path.join(dir, 'migrations', f));
     // functions.sql must not reference what 003 adds, so the pre-003 state is applied with the schema as of version 2.
     await applyMigrations(c, { dir });
     await c.query("INSERT INTO lane.principals (login_role, kind, allowed_accounts) VALUES ('old_submit', 'submit', '{a1,a2}')");
     assert.equal((await c.query('SELECT count(*)::int AS n FROM lane.sched_parents')).rows[0].n, 0);
     const r = await applyMigrations(c);
-    assert.equal(r.applied.length, 4);                 // 003 (the backfill), 004, 005 and 006
+    assert.equal(r.applied.length, 5);                 // 003 (the backfill), 004, 005, 006 and 007
     assert.deepEqual((await c.query('SELECT account, count(*)::int AS n FROM lane.sched_parents GROUP BY account ORDER BY account')).rows, [{ account: 'a1', n: 5 }, { account: 'a2', n: 5 }]);
   });
 });

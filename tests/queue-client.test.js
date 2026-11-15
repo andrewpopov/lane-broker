@@ -97,6 +97,15 @@ const SCENARIOS = {
     assert.deepEqual(rows.map((r) => r.min_protocol), [2, 1]);
   },
 
+  'enqueueFenced carries the lane avoid_tags to the row, and a caller that names none avoids nothing': async (w, t, createClient) => {
+    const { queue } = harnessClient(t, w, { createClient });
+    const ref = await queue.queueRef();
+    await queue.enqueueFenced({ ...enqueueArgs(tid(6), ref), avoidTags: ['slow'] });
+    await queue.enqueueFenced(enqueueArgs(tid(7), ref));
+    const rows = (await (await w.su()).query('SELECT id, avoid_tags FROM lane_dispatch.tickets WHERE id = ANY($1::uuid[]) ORDER BY id', [[tid(6), tid(7)]])).rows;
+    assert.deepEqual(rows.map((r) => r.avoid_tags), [['slow'], []]);
+  },
+
   'too many connections (53300) is retried with jitter for every call, then surfaces when it never clears': async (w, t) => {
     const held = await holdConnections(w, 3);
     const release = async () => { while (held.length) await held.pop().end(); };
@@ -133,7 +142,8 @@ const SCENARIOS = {
 };
 
 const CANARIES = [
-  ['enqueueFenced carries min_protocol to the row, and a caller that names none gets protocol 1', ['priority, minProtocol]),', 'priority, 1]),']],
+  ['enqueueFenced carries min_protocol to the row, and a caller that names none gets protocol 1', ['priority, minProtocol, true,', 'priority, 1, true,']],
+  ['enqueueFenced carries the lane avoid_tags to the row, and a caller that names none avoids nothing', ['null, null, avoidTags]),', 'null, null, []]),']],
 ];
 
 const SOCKET_URL = 'postgres://lane_submit_train@%2Fvar%2Frun%2Fpostgresql/lane_queue';

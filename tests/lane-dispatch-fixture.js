@@ -71,8 +71,8 @@ export async function call(client, name, ...args) {
 
 export const tid = gid;
 
-export const enqueue = (client, id, { repo = 'repoA', laneKey = `lk-${id}`, tags = [], cpu = 1, mem = 1000, priority = 0, minProtocol = 1, ages = true, source = null, estRunS = null } = {}) =>
-  call(client, 'ld_enqueue', id, repo, 'test', laneKey, { protocol: 1 }, { cmd: ['true'] }, { key: 'snap', sha256: 'x' }, tags, cpu, mem, priority, minProtocol, ages, source, estRunS);
+export const enqueue = (client, id, { repo = 'repoA', laneKey = `lk-${id}`, tags = [], cpu = 1, mem = 1000, priority = 0, minProtocol = 1, ages = true, source = null, estRunS = null, avoidTags = [] } = {}) =>
+  call(client, 'ld_enqueue', id, repo, 'test', laneKey, { protocol: 1 }, { cmd: ['true'] }, { key: 'snap', sha256: 'x' }, tags, cpu, mem, priority, minProtocol, ages, source, estRunS, avoidTags);
 
 export const claim = (client, { req = randomUUID(), cpu = 8, mem = 1e9, held = [] } = {}) => call(client, 'ld_claim', req, cpu, mem, held);
 

@@ -925,7 +925,7 @@ drained), the avoided runners rank with the rest as before. Use it for a runner 
   lane. A lane that both requires and avoids a tag, at lane or repo level, is a config error.
 - **Probe.** The tags are asked in the same `--tags` flag as `requiresTags`, so every runner that answers `requiresTags` answers these
   too. A runner that answers no tags at all (one older than `requiresTags`) avoids nothing. An avoided tag is never a readiness gap.
-- **Pull dispatch** (`lanePull.enabled`) does not read `avoidTags` yet. `ld_placeable` and the agent's claim match `requiresTags` only.
+- **Pull dispatch** (`lanePull.enabled`) honours it softly, in the queue. The ticket is enqueued with the lane's `avoidTags` (`tickets.avoid_tags`), and `ld_claim` skips it for an agent whose principal tags overlap them until the ticket has waited `lane_dispatch.cluster.avoid_grace_s` (default 120; set it with `UPDATE lane_dispatch.cluster SET avoid_grace_s = <seconds>`). Other agents take it at once; after the grace period any agent may, so a lone avoided runner never starves a lane. The wait counts from the first enqueue, not from a requeue, and an avoided agent notices the end of the grace period on its next poll (at most 15 s). `ld_placeable` still counts avoided agents, so placement never refuses a ticket because every eligible agent is avoided. Ordering and `requiresTags` matching are unchanged.
 
 ### Prewarming a runner (`prewarm`, `lane runner prewarm`, BRAIN-649)
 
@@ -1551,7 +1551,7 @@ Nothing dispatches this way until `lanePull.enabled` is true; this section is th
   `ld_list_mine`, `ld_placeable`, and the admin `ld_prune_candidates`, `ld_prune`, `ld_blobs_live` that `lane pull gc` sends), with jitter. `ld_enqueue_fenced`, `ld_withdraw` and `ld_cancel` are never sent twice by the client: they throw, and the caller decides what an unanswered call means.
 - `src/pull-envelope.js` is `<state>/pull/<id>/envelope.json`, written once and fsynced (with every ancestor directory) before any upload: everything a
   recovery needs to enqueue without rebuilding from a changed worktree. The snapshot descriptor is added after the upload and never replaced.
-- `src/pull-enqueue.js` sends `ld_enqueue_fenced` from the envelope (an optional `minProtocol` in the envelope goes to `min_protocol`; the queue's default is 1). Before **every** send it fsyncs a pending intent into the attempt record
+- `src/pull-enqueue.js` sends `ld_enqueue_fenced` from the envelope (an optional `minProtocol` in the envelope goes to `min_protocol`; the queue's default is 1; the envelope's `avoidTags`, the lane's, go to `avoid_tags`). Before **every** send it fsyncs a pending intent into the attempt record
   (`pull.enqueue`). A replay reuses the ref of any attempt not durably recorded as stale. The ref is refreshed only when every earlier attempt is
   recorded stale. A stale answer after an attempt that may have been sent settles lost (`enqueue-crossed-restore`, exit 75), and so does an attempt
   that may have been sent more than `rowRetentionMs` ago (`enqueue-past-retention`: the queue may have pruned the row). Each attempt records `sentAt`. `enqueueOnce`,
