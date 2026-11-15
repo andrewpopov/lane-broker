@@ -4,11 +4,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { execFileSync } from 'node:child_process';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor, sleep } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor, sleep, GENEROUS_PROBE_DEADLINE_MS } from './helpers.js';
 import { tmpDir, makeFakeSshBin, makeRunner, clientEnv, makeGitWorktree, makeDispatchArgs, readCapturedHeader } from './remote-harness.js';
 import { remoteCpuAllocation, shellQuote, buildRemoteCommand, selectRunner, dispatchRemote, remoteWithdraw, isGreen, needsProtocol2, classifyRemoteResult, provesNeverStarted } from '../src/remote-client.js';
 import { MAX_HEADER_BYTES } from '../src/remote-stream.js';
 import { buildManifest } from '../src/remote-manifest.js';
+
+const PROBE_DEADLINE_MS = GENEROUS_PROBE_DEADLINE_MS;
 
 // ---- end-to-end dispatch: happy path ----
 
@@ -388,7 +390,7 @@ test('selectRunner: sequential order, skips an unreachable runner and picks the 
   const { env } = clientEnv(binDir);
   const runners = [makeRunner({ ssh: 'down' }), makeRunner({ ssh: 'normal', name: 'second' })];
 
-  const { runner, skipped, probe } = await selectRunner(runners, { sshBin, env, deadlineMs: 3000 });
+  const { runner, skipped, probe } = await selectRunner(runners, { sshBin, env, deadlineMs: PROBE_DEADLINE_MS });
 
   assert.equal(runner.name, 'second');
   assert.equal(Number.isInteger(probe.roundTripMs), true);
@@ -402,7 +404,7 @@ test('selectRunner: a paused runner is skipped', async () => {
   await laneRun(['pause', 'maintenance'], { env });
   const runners = [makeRunner({ ssh: 'normal' })];
 
-  const { runner, skipped } = await selectRunner(runners, { sshBin, env, deadlineMs: 3000 });
+  const { runner, skipped } = await selectRunner(runners, { sshBin, env, deadlineMs: PROBE_DEADLINE_MS });
 
   assert.equal(runner, null);
   assert.equal(skipped.length, 1);
@@ -421,7 +423,8 @@ test('selectRunner: a runner with a queued ticket is skipped', async () => {
   // Occupy the only capacity slot so a second ticket is stuck queued, same
   // pattern as tests/queued-cancel.test.js.
   const STARTUP_TIMEOUT_MS = Math.max(60_000, 30 * globalConfig.sampleMs);
-  const blockerPromise = laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'sleep', '5'], { env: clientPath.env, cwd: repoDir });
+  const release = path.join(tmpDir('remote-client-queue-release'), 'release');
+  const blockerPromise = laneRun(['run', '--repo', 'r', '--lane', 'default', '--', 'sh', '-c', `while [ ! -e '${release}' ]; do sleep 0.1; done`], { env: clientPath.env, cwd: repoDir });
   await waitFor(
     () => {
       try {
@@ -445,13 +448,16 @@ test('selectRunner: a runner with a queued ticket is skipped', async () => {
   );
 
   const runners = [makeRunner({ ssh: 'normal' })];
-  const { runner, skipped } = await selectRunner(runners, { sshBin, env: clientPath.env, deadlineMs: 3000 });
+  try {
+    const { runner, skipped } = await selectRunner(runners, { sshBin, env: clientPath.env, deadlineMs: PROBE_DEADLINE_MS });
 
-  assert.equal(runner, null);
-  assert.ok(skipped.length >= 1);
-  assert.match(skipped[0].reason, /queued/);
-
-  await Promise.all([blockerPromise, queuedPromise]);
+    assert.equal(runner, null);
+    assert.ok(skipped.length >= 1);
+    assert.match(skipped[0].reason, /queued/);
+  } finally {
+    fs.writeFileSync(release, '');
+    await Promise.all([blockerPromise, queuedPromise]);
+  }
 });
 
 test('selectRunner: a protocol-2 runner is skipped', async () => {
@@ -470,7 +476,7 @@ process.exit(0);
   const { env } = clientEnv(binDir);
   const runners = [makeRunner({ ssh: 'normal' })];
 
-  const { runner, skipped } = await selectRunner(runners, { sshBin, env, deadlineMs: 3000 });
+  const { runner, skipped } = await selectRunner(runners, { sshBin, env, deadlineMs: PROBE_DEADLINE_MS });
 
   assert.equal(runner, null);
   assert.match(skipped[0].reason, /protocol/);
@@ -481,7 +487,7 @@ test('selectRunner: none usable returns {runner:null, skipped:[...]}', async () 
   const { env } = clientEnv(binDir);
   const runners = [makeRunner({ ssh: 'down' }), makeRunner({ ssh: 'down', name: 'second' })];
 
-  const { runner, skipped } = await selectRunner(runners, { sshBin, env, deadlineMs: 3000 });
+  const { runner, skipped } = await selectRunner(runners, { sshBin, env, deadlineMs: PROBE_DEADLINE_MS });
 
   assert.equal(runner, null);
   assert.equal(skipped.length, 2);
@@ -517,11 +523,11 @@ test('selectRunner: a runner lacking protocol 2 is skipped for a remoteDeps lane
   const { env } = clientEnv(binDir);
   const runners = [makeRunner({ ssh: 'normal' })];
 
-  const needsV2 = await selectRunner(runners, { sshBin, env, deadlineMs: 3000, requireProtocol2: true });
+  const needsV2 = await selectRunner(runners, { sshBin, env, deadlineMs: PROBE_DEADLINE_MS, requireProtocol2: true });
   assert.equal(needsV2.runner, null);
   assert.match(needsV2.skipped[0].reason, /protocol 2/);
 
-  const optionless = await selectRunner(runners, { sshBin, env, deadlineMs: 3000, requireProtocol2: false });
+  const optionless = await selectRunner(runners, { sshBin, env, deadlineMs: PROBE_DEADLINE_MS, requireProtocol2: false });
   assert.equal(optionless.runner.name, runners[0].name);
 });
 
@@ -538,7 +544,7 @@ test('selectRunner: a runner offering protocol 2 is used for a remoteDeps lane',
   const { env } = clientEnv(binDir);
   const runners = [makeRunner({ ssh: 'normal' })];
 
-  const { runner, skipped } = await selectRunner(runners, { sshBin, env, deadlineMs: 3000, requireProtocol2: true });
+  const { runner, skipped } = await selectRunner(runners, { sshBin, env, deadlineMs: PROBE_DEADLINE_MS, requireProtocol2: true });
   assert.equal(runner.name, runners[0].name);
   assert.equal(skipped.length, 0);
 });
@@ -572,11 +578,11 @@ test('selectRunner: a runner whose capacity can never fit the ticket is skipped 
   const { env } = clientEnv(binDir);
   const reservation = { weight: 2, cpuCores: 4, memoryBytes: 8_000_000_000 };
 
-  const tooSmall = await selectRunner([makeRunner({ ssh: 'normal' })], { sshBin: smallSsh, env, deadlineMs: 3000, reservation });
+  const tooSmall = await selectRunner([makeRunner({ ssh: 'normal' })], { sshBin: smallSsh, env, deadlineMs: PROBE_DEADLINE_MS, reservation });
   assert.equal(tooSmall.runner, null);
   assert.match(tooSmall.skipped[0].reason, /capacity/);
 
-  const bigEnough = await selectRunner([makeRunner({ ssh: 'normal' })], { sshBin: bigSsh, env, deadlineMs: 3000, reservation });
+  const bigEnough = await selectRunner([makeRunner({ ssh: 'normal' })], { sshBin: bigSsh, env, deadlineMs: PROBE_DEADLINE_MS, reservation });
   assert.equal(bigEnough.runner.name, 'normal');
 });
 
@@ -595,7 +601,7 @@ test('selectRunner: temporary pressure (queued > 0) is unaffected by the fit che
   const { runner, skipped } = await selectRunner([makeRunner({ ssh: 'normal' })], {
     sshBin,
     env,
-    deadlineMs: 3000,
+    deadlineMs: PROBE_DEADLINE_MS,
     reservation: { weight: 1, cpuCores: 1, memoryBytes: 1_000_000_000 },
   });
   assert.equal(runner, null);
@@ -993,9 +999,9 @@ test('dispatchRemote: abort during the result wait is cancelled and remote-cance
 /**
  * A scripted runner for the rebalance tests. `remote-exec` stays open for `execMs` (0: closes as soon as the snapshot is
  * in) unless it is killed; `remote-result` replays `results` (last repeats; an entry may be `{delayMs, record}`; null is a failed
- * fetch); `remote-withdraw` replays `withdraws` the same way (null: a lost reply). Every subcommand is logged.
+ * fetch; `execUntilFetches` N keeps the session open until N fetches have started, so the watcher's samples never race the session's close); `remote-withdraw` replays `withdraws` the same way (null: a lost reply). Every subcommand is logged.
  */
-function makeRebalanceSsh({ results, withdraws = [], execMs = 0, closeExecOnWithdraw = false, cancelConfirmed = true }) {
+function makeRebalanceSsh({ results, withdraws = [], execMs = 0, execUntilFetches = 0, closeExecOnWithdraw = false, cancelConfirmed = true }) {
   const dir = tmpDir('rebalance-ssh');
   const logPath = path.join(dir, 'calls.log');
   const scriptPath = path.join(dir, 'script.json');
@@ -1024,7 +1030,9 @@ const ticketId = (/'([0-9a-f-]{36})'/.exec(cmd) || [])[1];
 if (cmd.includes('remote-exec')) {
   log('exec');
   process.stdin.resume();
-  process.stdin.on('end', () => setTimeout(() => { fs.writeFileSync(${JSON.stringify(path.join(dir, 'exec-exited'))}, '1'); process.exit(255); }, ${execMs}));
+  const fetches = () => Number(fs.readFileSync(${JSON.stringify(path.join(dir, 'result-count'))}, 'utf8'));
+  const closeSession = () => setTimeout(() => { fs.writeFileSync(${JSON.stringify(path.join(dir, 'exec-exited'))}, '1'); process.exit(255); }, ${execMs});
+  process.stdin.on('end', () => { const t = setInterval(() => { if (fetches() >= ${execUntilFetches}) { clearInterval(t); closeSession(); } }, 20); });
   if (${closeExecOnWithdraw}) setInterval(() => { if (fs.existsSync(${JSON.stringify(path.join(dir, 'withdrew'))})) process.exit(255); }, 30);
 } else if (cmd.includes('remote-result')) {
   log('result');
@@ -1053,8 +1061,8 @@ if (cmd.includes('remote-exec')) {
 const phaseRecord = (phase) => ({ protocol: 1, missing: true, state: phase === 'queued' ? 'queued' : 'running', phase });
 const TARGET = { name: 'B', ssh: 'b' };
 
-async function dispatchRebalance({ results, withdraws, execMs, rebalance, canWithdraw = true, clock = makeFakeClock(), abortSignal, abortWhen, onSnapshotSent, onRunnerPhase, closeExecOnWithdraw, cancelConfirmed, argsExtra, src = makeGitWorktree({ 'a.txt': 'hello' }) }) {
-  const ssh = makeRebalanceSsh({ results: [], withdraws, execMs, closeExecOnWithdraw, cancelConfirmed });
+async function dispatchRebalance({ results, withdraws, execMs, execUntilFetches, rebalance, canWithdraw = true, clock = makeFakeClock(), abortSignal, abortWhen, onSnapshotSent, onRunnerPhase, closeExecOnWithdraw, cancelConfirmed, argsExtra, src = makeGitWorktree({ 'a.txt': 'hello' }) }) {
+  const ssh = makeRebalanceSsh({ results: [], withdraws, execMs, execUntilFetches, closeExecOnWithdraw, cancelConfirmed });
   const args = makeDispatchArgs(argsExtra);
   const { manifestHash } = buildManifest(src);
   const bound = boundResult(args, { manifestHash });
@@ -1142,7 +1150,7 @@ test('rebalance (BRAIN-888): the picker gets the queue facts of the latest sampl
     queued,
     'RESULT',
   ];
-  await dispatchRebalance({ results, withdraws: [], execMs: 1500, rebalance: { minQueuedMs: 5_000, pickTarget: (args) => { seen.push(args.sourceFacts); return null; } } });
+  await dispatchRebalance({ results, withdraws: [], execMs: 0, execUntilFetches: results.length, rebalance: { minQueuedMs: 5_000, pickTarget: (args) => { seen.push(args.sourceFacts); return null; } } });
   const none = { position: null, behindOtherOwner: null, reservationOwnerWaitedMs: null };
   assert.deepEqual(seen, [
     { position: 2, behindOtherOwner: true, reservationOwnerWaitedMs: 90_000 },
@@ -1155,7 +1163,7 @@ test('rebalance (BRAIN-888): the picker gets the queue facts of the latest sampl
 
 test('rebalance (BRAIN-888): the picker is told whether the refusal cap has elapsed', { timeout: 60_000 }, async () => {
   const seen = [];
-  await dispatchRebalance({ results: [queued, queued, queued, queued, queued, 'RESULT'], withdraws: [], execMs: 1500, rebalance: { minQueuedMs: 5_000, refusedMaxQueuedMs: 25_000, pickTarget: (args) => { seen.push(args.refusalCapElapsed()); return null; } } });
+  await dispatchRebalance({ results: [queued, queued, queued, queued, queued, 'RESULT'], withdraws: [], execMs: 0, execUntilFetches: 6, rebalance: { minQueuedMs: 5_000, refusedMaxQueuedMs: 25_000, pickTarget: (args) => { seen.push(args.refusalCapElapsed()); return null; } } });
   assert.deepEqual(seen.slice(0, 2), [false, false]);
   assert.ok(seen.includes(true), JSON.stringify(seen));
 });
@@ -1427,12 +1435,12 @@ test('selectRunner: BRAIN-653 a runner whose budget net of outside memory is bel
   const { env } = clientEnv(binDir);
   // static budget 12 GB admits 8 GB, but only 6.5 GB can ever be admitted beside the outside process
   const starved = makeFixedProbeSsh(binDir, 'ssh-starved', { ...base, capacity: { ...capacity, memoryAdmissibleBytes: 6_500_000_000 } });
-  const never = await selectRunner([makeRunner({ ssh: 'normal' })], { sshBin: starved, env, deadlineMs: 3000, reservation });
+  const never = await selectRunner([makeRunner({ ssh: 'normal' })], { sshBin: starved, env, deadlineMs: PROBE_DEADLINE_MS, reservation });
   assert.equal(never.runner, null);
   assert.equal(never.skipped[0].neverFits, true);
   // enough admissible memory, only busy now: not never-fits (still chosen as busy/waitable)
   const busy = makeFixedProbeSsh(binDir, 'ssh-busy', { ...base, capacity: { ...capacity, memoryAdmissibleBytes: 9_000_000_000 }, headroom: { cpuCores: 8, memoryBytes: 1_000_000_000 } });
-  const waits = await selectRunner([makeRunner({ ssh: 'normal' })], { sshBin: busy, env, deadlineMs: 3000, reservation });
+  const waits = await selectRunner([makeRunner({ ssh: 'normal' })], { sshBin: busy, env, deadlineMs: PROBE_DEADLINE_MS, reservation });
   assert.notEqual(waits.skipped[0]?.neverFits, true);
 });
 

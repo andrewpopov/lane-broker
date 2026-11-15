@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, BIN } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, BIN, GENEROUS_PROBE_DEADLINE_MS } from './helpers.js';
 import { enqueue, tryStart, existingTicket } from '../src/scheduler.js';
 import { runCommand } from '../src/run.js';
 import { loadGlobalConfigOrError } from '../src/config.js';
@@ -297,12 +297,12 @@ test('P1: a ticket that requires class enforcement only goes to a runner adverti
   const runners = [makeRunner({ ssh: 'normal' })];
   const cfg = DEFAULT_GLOBAL_CONFIG;
   const enriched = (extra) => ({ weight: 1, resources: { cpuCores: 1, memoryBytes: GIB }, ...extra });
-  const old = await selectRunner(runners, { ...remoteSelectOptions(enriched({ classEnforcement: 'required' }), cfg), sshBin: ssh('ssh-old', probe(['elastic-claims/1'])), env, deadlineMs: 3000 });
+  const old = await selectRunner(runners, { ...remoteSelectOptions(enriched({ classEnforcement: 'required' }), cfg), sshBin: ssh('ssh-old', probe(['elastic-claims/1'])), env, deadlineMs: GENEROUS_PROBE_DEADLINE_MS });
   assert.equal(old.runner, null);
   assert.match(old.skipped[0].reason, /classes\/1/);
-  const newer = await selectRunner(runners, { ...remoteSelectOptions(enriched({ classEnforcement: 'required' }), cfg), sshBin: ssh('ssh-new', probe(['classes/1'])), env, deadlineMs: 3000 });
+  const newer = await selectRunner(runners, { ...remoteSelectOptions(enriched({ classEnforcement: 'required' }), cfg), sshBin: ssh('ssh-new', probe(['classes/1'])), env, deadlineMs: GENEROUS_PROBE_DEADLINE_MS });
   assert.equal(newer.runner.name, runners[0].name);
-  const plain = await selectRunner(runners, { ...remoteSelectOptions(enriched({}), cfg), sshBin: ssh('ssh-old2', probe(['elastic-claims/1'])), env, deadlineMs: 3000 });
+  const plain = await selectRunner(runners, { ...remoteSelectOptions(enriched({}), cfg), sshBin: ssh('ssh-old2', probe(['elastic-claims/1'])), env, deadlineMs: GENEROUS_PROBE_DEADLINE_MS });
   assert.equal(plain.runner.name, runners[0].name, 'a ticket without classEnforcement is unchanged on an old runner');
 });
 
@@ -319,13 +319,13 @@ test('PKG-277: a lane with remoteDepsCacheKeyFiles only goes to a runner adverti
   const runners = [makeRunner({ ssh: 'normal' })];
   const enriched = (remote) => ({ weight: 1, resources: { cpuCores: 1, memoryBytes: GIB }, remote });
   const keyed = { remoteDeps: ['.'], remoteDepsCacheRootScriptsSafe: true, remoteDepsCacheKeyFiles: ['gen-input.txt'] };
-  const old = await selectRunner(runners, { ...remoteSelectOptions(enriched(keyed), DEFAULT_GLOBAL_CONFIG), sshBin: ssh('ssh-old-keyfiles', probe(['elastic-claims/1'])), env, deadlineMs: 3000 });
+  const old = await selectRunner(runners, { ...remoteSelectOptions(enriched(keyed), DEFAULT_GLOBAL_CONFIG), sshBin: ssh('ssh-old-keyfiles', probe(['elastic-claims/1'])), env, deadlineMs: GENEROUS_PROBE_DEADLINE_MS });
   assert.equal(old.runner, null);
   assert.match(old.skipped[0].reason, /deps-key-files\/1/);
-  const newer = await selectRunner(runners, { ...remoteSelectOptions(enriched(keyed), DEFAULT_GLOBAL_CONFIG), sshBin: ssh('ssh-new-keyfiles', probe(['deps-key-files/1'])), env, deadlineMs: 3000 });
+  const newer = await selectRunner(runners, { ...remoteSelectOptions(enriched(keyed), DEFAULT_GLOBAL_CONFIG), sshBin: ssh('ssh-new-keyfiles', probe(['deps-key-files/1'])), env, deadlineMs: GENEROUS_PROBE_DEADLINE_MS });
   assert.equal(newer.runner.name, runners[0].name);
   const { remoteDepsCacheKeyFiles, ...unkeyed } = keyed;
-  const plain = await selectRunner(runners, { ...remoteSelectOptions(enriched(unkeyed), DEFAULT_GLOBAL_CONFIG), sshBin: ssh('ssh-old-plain', probe(['elastic-claims/1'])), env, deadlineMs: 3000 });
+  const plain = await selectRunner(runners, { ...remoteSelectOptions(enriched(unkeyed), DEFAULT_GLOBAL_CONFIG), sshBin: ssh('ssh-old-plain', probe(['elastic-claims/1'])), env, deadlineMs: GENEROUS_PROBE_DEADLINE_MS });
   assert.equal(plain.runner.name, runners[0].name, 'a lane without key files is unchanged on an old runner');
 });
 
@@ -811,7 +811,7 @@ test('P2: a runner with an unreadable config answers its probe but is skipped by
   fs.chmodSync(bin, 0o755);
   const { env: cenv } = clientEnv(binDir);
   const runners = [makeRunner({ ssh: 'normal' })];
-  const picked = await selectRunner(runners, { sshBin: bin, env: cenv, deadlineMs: 3000 });
+  const picked = await selectRunner(runners, { sshBin: bin, env: cenv, deadlineMs: GENEROUS_PROBE_DEADLINE_MS });
   assert.equal(picked.runner, null);
   assert.match(picked.skipped[0].reason, /runner config unreadable/);
   void state;

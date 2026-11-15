@@ -33,6 +33,14 @@ const scenarios = {
     assert.equal(readJsonSafe(path.join(rw.ticketDir(run.execId), 'result.json')).stopProven, true, 'the stop was proven by the runner');
   },
 
+  'the lane\'s command sees the agent\'s configured speedFactor as LANE_BROKER_RUNNER_SPEED_FACTOR, so a repo can scale its time budgets': async (w, rw, load) => {
+    const out = path.join(makeTmpDir('agent-speed-factor-'), 'speed');
+    const ticket = await rw.submit({ code: `require('fs').writeFileSync(${JSON.stringify(out)}, String(process.env.LANE_BROKER_RUNNER_SPEED_FACTOR))` });
+    const agent = await rw.agent({ load, config: { speedFactor: 2.5 } });
+    await rw.untilGone(agent, rw.execId(await rw.claimed(ticket)));
+    assert.equal(fs.readFileSync(out, 'utf8'), '2.5');
+  },
+
   'ld_cancel on a running ticket reaches the lane within a heartbeat and finishes cancelled with cancelConfirmed': async (w, rw, load) => {
     const run = await runningLane(w, rw, load);
     await call(await w.as(logins.s1), 'ld_cancel', run.ticket.id);
@@ -100,6 +108,7 @@ const scenarios = {
 
 const EXEC = 'agent/execution.js';
 const canaries = [
+  ['the lane\'s command sees the agent\'s configured speedFactor as LANE_BROKER_RUNNER_SPEED_FACTOR, so a repo can scale its time budgets', EXEC, ['String(this.config.speedFactor)', "'1'"]],
   ['a heartbeat answering fenced kills the lane and the record, and no ld_finish is ever sent', EXEC, ['if (answer.fenced === true) {', 'if (false) {']],
   ['ld_cancel on a running ticket reaches the lane within a heartbeat and finishes cancelled with cancelConfirmed', EXEC, ['} else if (answer.cancel === true) {', '} else if (false) {']],
   ['an agent killed mid-run leaves the lane running, and the next agent adopts it and finishes it without starting it again', 'agent/run.js', ['driver.adoptAll();', '']],

@@ -55,7 +55,18 @@ test('short run (shorter than sampleMs) still gets observedCpu from the early sa
   // The early sample fires a fixed second after the child is spawned. A `node -e` busy loop only starts burning once V8 has
   // booted, which under a saturated machine can take longer than that second (observed peak 0, BRAIN-453); a shell loop burns
   // from the first millisecond, so the sample lands inside the busy span whatever the load.
-  const result = await run(f, ['sh', '-c', 'while :; do :; done & p=$!; sleep 2.5; kill $p']);
+  // The run lasts until its early sample is on the lease (never a fixed span the sample can miss), and still ends long before the 60 s heartbeat.
+  const release = path.join(f.base, 'release');
+  const running = run(f, ['sh', '-c', `while :; do :; done & p=$!; while [ ! -e '${release}' ]; do sleep 0.1; done; kill $p`]);
+  try {
+    await waitFor(() => {
+      const name = fs.existsSync(paths(f.state).leases) && fs.readdirSync(paths(f.state).leases).find((n) => n.endsWith('.json'));
+      return name && readLease(f.state, name.replace(/\.json$/, ''))?.observedCpuStats?.samples >= 1;
+    }, { timeoutMs: 60_000 });
+  } finally {
+    fs.writeFileSync(release, '');
+  }
+  const result = await running;
   assert.equal(result.code, 0, result.stderr);
   const row = lastRow(f.state);
   assert.ok(row.observedCpu, 'a run shorter than one heartbeat interval must still be observed');

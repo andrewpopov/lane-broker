@@ -14,7 +14,7 @@ import { CAPABILITIES, EXECUTION_CEILING_CAPABILITY, advertisedCapabilities } fr
 import { runnerPrewarmCommand, pickPrewarmLane } from '../src/runner-prewarm.js';
 import { atomicWriteJson } from '../src/state.js';
 import { tmpDir, makeRunner } from './remote-harness.js';
-import { freshEnv, writeRepoConfig, writeGlobalConfig, laneRun, gitFixture } from './helpers.js';
+import { freshEnv, writeRepoConfig, writeGlobalConfig, laneRun, gitFixture, GENEROUS_PROBE_DEADLINE_MS } from './helpers.js';
 
 /** BRAIN-649: `requiresTags`/`runnerTags` (capability filter), `lane runner prewarm`. */
 
@@ -87,7 +87,7 @@ function setup(lane) {
 
 test('requiresTags: a runner without the tag is not chosen; one declaring it is, whatever the config order', async () => {
   const sshBin = makeProbeSsh({ probes: { bare: {}, full: {} }, tags: { bare: [], full: ['browser'] } });
-  const res = await selectRunner(runners('bare', 'full'), { sshBin, deadlineMs: 3000, readinessNeeds: { tags: ['browser'] } });
+  const res = await selectRunner(runners('bare', 'full'), { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, readinessNeeds: { tags: ['browser'] } });
   assert.equal(res.runner.name, 'full');
   assert.match(res.skipped[0].reason, /missing tag browser/);
   assert.deepEqual(res.readiness, { bare: { check: 'tags', missing: ['browser'] } });
@@ -95,7 +95,7 @@ test('requiresTags: a runner without the tag is not chosen; one declaring it is,
 
 test('requiresTags: an older runner that answers no tags is not ready; a lane with no tags sends the probe unchanged', async () => {
   const sshBin = makeProbeSsh({ probes: { old: { old: true } } });
-  const res = await selectRunner(runners('old'), { sshBin, deadlineMs: 3000, readinessNeeds: { tags: ['browser'] } });
+  const res = await selectRunner(runners('old'), { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, readinessNeeds: { tags: ['browser'] } });
   assert.equal(res.runner, null);
   assert.match(res.skipped[0].reason, /does not report tags/);
   assert.deepEqual(readinessProbeArgs({ tags: [] }), []);
@@ -137,30 +137,30 @@ const AVOID = { avoidTags: ['gpu'] };
 const avoidFleet = (probes = {}) => makeProbeSsh({ probes: { wintop: {}, skybox: {}, ...probes }, tags: { wintop: ['gpu'], skybox: [] } });
 
 test('avoidTags: while a runner without the tag is up, the avoided runner is never chosen, idle or not', async () => {
-  const idle = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet(), deadlineMs: 3000, readinessNeeds: AVOID });
+  const idle = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet(), deadlineMs: GENEROUS_PROBE_DEADLINE_MS, readinessNeeds: AVOID });
   assert.equal(idle.runner.name, 'skybox', 'config order alone would pick wintop');
   assert.match(idle.skipped.find((s) => s.name === 'wintop').reason, /avoided tag gpu/);
-  const queued = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet({ skybox: { queued: 3 } }), deadlineMs: 3000, readinessNeeds: AVOID, maxRemoteQueue: 6 });
+  const queued = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet({ skybox: { queued: 3 } }), deadlineMs: GENEROUS_PROBE_DEADLINE_MS, readinessNeeds: AVOID, maxRemoteQueue: 6 });
   assert.deepEqual([queued.runner.name, queued.queuedChoice], ['skybox', true], 'an idle avoided runner loses to a queued preferred one');
-  const overCap = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet({ skybox: { queued: 9 } }), deadlineMs: 3000, readinessNeeds: AVOID, maxRemoteQueue: 6 });
+  const overCap = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet({ skybox: { queued: 9 } }), deadlineMs: GENEROUS_PROBE_DEADLINE_MS, readinessNeeds: AVOID, maxRemoteQueue: 6 });
   assert.equal(overCap.runner, null, 'skybox is up, only over the cap: wintop is still not taken');
   assert.equal(overCap.skipped.find((s) => s.name === 'wintop' && /avoided/.test(s.reason)).candidate, undefined);
 });
 
 test('avoidTags: with no runner without the tag up, the avoided runner is the fallback', async () => {
-  const down = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet(), deadlineMs: 3000, readinessNeeds: AVOID, downRunners: { skybox: 'unreachable since 22:30' } });
+  const down = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet(), deadlineMs: GENEROUS_PROBE_DEADLINE_MS, readinessNeeds: AVOID, downRunners: { skybox: 'unreachable since 22:30' } });
   assert.equal(down.runner.name, 'wintop');
   assert.equal(down.skipped.some((s) => /avoided/.test(s.reason)), false);
-  const paused = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet({ skybox: { paused: true } }), deadlineMs: 3000, readinessNeeds: AVOID });
+  const paused = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet({ skybox: { paused: true } }), deadlineMs: GENEROUS_PROBE_DEADLINE_MS, readinessNeeds: AVOID });
   assert.equal(paused.runner.name, 'wintop');
 });
 
 test('avoidTags: an observed-only runner (a rebalance source) counts as up by the same rule, and is never chosen', async () => {
-  const queuedThere = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet({ skybox: { queued: 1 } }), deadlineMs: 3000, readinessNeeds: AVOID, observeOnly: ['skybox'] });
+  const queuedThere = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet({ skybox: { queued: 1 } }), deadlineMs: GENEROUS_PROBE_DEADLINE_MS, readinessNeeds: AVOID, observeOnly: ['skybox'] });
   assert.equal(queuedThere.runner, null, 'skybox holds the ticket and is up: wintop stays out');
-  const idleThere = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet(), deadlineMs: 3000, readinessNeeds: AVOID, observeOnly: ['skybox'] });
+  const idleThere = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet(), deadlineMs: GENEROUS_PROBE_DEADLINE_MS, readinessNeeds: AVOID, observeOnly: ['skybox'] });
   assert.equal(idleThere.runner, null, 'an observed runner is never the choice, idle or not');
-  const pausedThere = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet({ skybox: { queued: 1, paused: true } }), deadlineMs: 3000, readinessNeeds: AVOID, observeOnly: ['skybox'] });
+  const pausedThere = await selectRunner(runners('wintop', 'skybox'), { sshBin: avoidFleet({ skybox: { queued: 1, paused: true } }), deadlineMs: GENEROUS_PROBE_DEADLINE_MS, readinessNeeds: AVOID, observeOnly: ['skybox'] });
   assert.equal(pausedThere.runner.name, 'wintop', 'a paused source is not up');
 });
 
@@ -169,7 +169,7 @@ const NOW = Date.parse('2026-10-11T20:00:00Z');
 const CLOSING_SOON = { timezone: 'America/Los_Angeles', available: [{ days: ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'], from: '06:00', to: '13:05' }] };
 const windowFleet = (closing) => [makeRunner({ ssh: 'wintop' }), { ...makeRunner({ ssh: 'skybox' }), ...(closing ? { schedule: CLOSING_SOON } : {}) }];
 const WINDOW_OPTS = {
-  deadlineMs: 3000,
+  deadlineMs: GENEROUS_PROBE_DEADLINE_MS,
   now: NOW,
   readinessNeeds: AVOID,
   reservation: { weight: 1, cpuCores: 4, memoryBytes: 1e9 },

@@ -1,4 +1,5 @@
 import test from 'node:test';
+import { GENEROUS_PROBE_DEADLINE_MS } from './helpers.js';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -288,7 +289,7 @@ const est = (ms, extra = {}) => ({ ms, tier: 'repo-lane', n: 3, ...extra });
 const modelOf = (byName) => ({ estimateFor: (runner) => byName[runner.name] ?? null });
 const finishOf = (waitMs, runMs) => waitMs + runMs + DEFAULT_REMOTE_OVERHEAD_MS;
 const select = (probes, runners, opts = {}) =>
-  selectRunner(runners, { sshBin: makeProbeMapSsh(probes), deadlineMs: 3000, reservation: RESERVATION, maxRemoteQueue: 2, ...opts });
+  selectRunner(runners, { sshBin: makeProbeMapSsh(probes), deadlineMs: GENEROUS_PROBE_DEADLINE_MS, reservation: RESERVATION, maxRemoteQueue: 2, ...opts });
 const names = (res) => res.scores.map((s) => s.name);
 
 test('selectRunner finish: a busy fast runner beats an idle slow one on the place path, as a queuedChoice', async () => {

@@ -185,8 +185,24 @@ export function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** Budget multiplier: LANE_BROKER_TEST_TIME_SCALE over LANE_BROKER_RUNNER_SPEED_FACTOR (higher = faster, valid in (0,4]). */
+export function timeScale(env = process.env) {
+  const speed = Number(env.LANE_BROKER_RUNNER_SPEED_FACTOR);
+  const override = Number(env.LANE_BROKER_TEST_TIME_SCALE);
+  const speedDivisor = Number.isFinite(speed) && speed > 0 && speed <= 4 ? speed : 1;
+  const multiplier = Number.isFinite(override) && override > 0 ? override : 1;
+  return multiplier / speedDivisor;
+}
+
+export function scaledMs(budgetMs, env = process.env) {
+  return Math.ceil(budgetMs * timeScale(env));
+}
+
+/** A loaded runner can stall the probe subprocess past production's 10 s and skip the runner as "probe timed out". */
+export const GENEROUS_PROBE_DEADLINE_MS = scaledMs(60_000);
+
 export async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 20 } = {}) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaledMs(timeoutMs);
   for (;;) {
     const v = await predicate();
     if (v) return v;

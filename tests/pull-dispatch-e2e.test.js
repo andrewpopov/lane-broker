@@ -10,6 +10,7 @@ import { pgSkipOption } from './lane-db-harness.js';
 import { startDispatchCluster, World } from './lane-dispatch-fixture.js';
 import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 import { pullE2E } from './helpers/pull-e2e.js';
+import { scaledMs } from './helpers.js';
 
 /**
  * BRAIN-1036 R7: the placement hook and the settle mapping, through the shipped caller path. `lane run` spawns a real supervisor
@@ -19,7 +20,7 @@ import { pullE2E } from './helpers/pull-e2e.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until(fn, timeoutMs = 60_000, detail = () => '') {
-  for (const deadline = Date.now() + timeoutMs; !(await fn()); await sleep(100)) if (Date.now() > deadline) assert.fail(`timed out waiting for the ticket state ${detail()}`);
+  for (const deadline = Date.now() + scaledMs(timeoutMs); !(await fn()); await sleep(100)) if (Date.now() > deadline) assert.fail(`timed out waiting for the ticket state ${detail()}`);
 }
 const DISPATCH_ONLY = { localExecution: 'refused' };
 const supervisorExit = async (fx) => {
@@ -165,7 +166,7 @@ const SCENARIOS = {
   'T2: while the queue has not committed the withdraw the command never runs locally and the supervisor keeps waiting': async (load, w, t) => {
     const fx = await pullE2E(t, w, { load, localPaused: true, queueFail: 'ld_withdraw', lanePull: { queuedTimeoutMs: 1000 } });
     const id = await fx.detach(fx.markLocalRun);
-    await sleep(4000);
+    await until(() => fx.injectedFailures('ld_withdraw') >= 2 || (fx.injectedFailures('ld_withdraw') === 1 && !supervisorAlive(fx.attempt(id))), 60_000, () => `a second failed withdraw (saw ${fx.injectedFailures('ld_withdraw')})`);
     const attempt = fx.attempt(id);
     assert.equal(fx.ranLocally(), false);
     assert.equal(supervisorAlive(attempt), true, 'the supervisor gave up waiting for a withdraw that never committed');

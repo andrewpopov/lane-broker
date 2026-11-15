@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv, writeGlobalConfig, laneRun, waitFor, writeRepoConfig, writeCpuBusyFile } from './helpers.js';
+import { freshEnv, writeGlobalConfig, laneRun, waitFor, writeRepoConfig, writeCpuBusyFile, GENEROUS_PROBE_DEADLINE_MS } from './helpers.js';
 import { spawn } from 'node:child_process';
 import { tmpDir, makeRunner, setup, markerCmd, detachAndWait, resultOf, recordingCmd } from './remote-harness.js';
 import { selectRunner } from '../src/remote-client.js';
@@ -38,14 +38,14 @@ const runnersOf = (...names) => names.map((n) => makeRunner({ ssh: n }));
 
 test('selectRunner: an idle runner is preferred over a less-queued earlier one (pass 1 unchanged)', async () => {
   const sshBin = makeProbeMapSsh({ a: probe(1), b: probe(0) });
-  const res = await selectRunner(runnersOf('a', 'b'), { sshBin, deadlineMs: 3000, maxRemoteQueue: 2 });
+  const res = await selectRunner(runnersOf('a', 'b'), { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, maxRemoteQueue: 2 });
   assert.equal(res.runner.name, 'b');
   assert.equal(res.queuedChoice, undefined);
 });
 
 test('selectRunner: all runners queued -> the least-queued one, marked queuedChoice', async () => {
   const sshBin = makeProbeMapSsh({ a: probe(2), b: probe(1), c: probe(2) });
-  const res = await selectRunner(runnersOf('a', 'b', 'c'), { sshBin, deadlineMs: 3000, maxRemoteQueue: 2 });
+  const res = await selectRunner(runnersOf('a', 'b', 'c'), { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, maxRemoteQueue: 2 });
   assert.equal(res.runner.name, 'b');
   assert.equal(res.queuedChoice, true);
   assert.equal(res.probe.queued, 1);
@@ -54,14 +54,14 @@ test('selectRunner: all runners queued -> the least-queued one, marked queuedCho
 
 test('selectRunner: a queue-depth tie goes to config order', async () => {
   const sshBin = makeProbeMapSsh({ a: probe(1), b: probe(1) });
-  const res = await selectRunner(runnersOf('a', 'b'), { sshBin, deadlineMs: 3000, maxRemoteQueue: 2 });
+  const res = await selectRunner(runnersOf('a', 'b'), { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, maxRemoteQueue: 2 });
   assert.equal(res.runner.name, 'a');
   assert.equal(res.queuedChoice, true);
 });
 
 test('selectRunner: queued above maxRemoteQueue -> no runner, reason names the cap', async () => {
   const sshBin = makeProbeMapSsh({ a: probe(3), b: probe(5) });
-  const res = await selectRunner(runnersOf('a', 'b'), { sshBin, deadlineMs: 3000, maxRemoteQueue: 2 });
+  const res = await selectRunner(runnersOf('a', 'b'), { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, maxRemoteQueue: 2 });
   assert.equal(res.runner, null);
   assert.equal(res.queuedChoice, undefined);
   assert.match(res.skipped[0].reason, /queued: 3 \(over maxRemoteQueue 2\)/);
@@ -70,7 +70,7 @@ test('selectRunner: queued above maxRemoteQueue -> no runner, reason names the c
 test('selectRunner: maxRemoteQueue 0 (and unset) behaves exactly as before, reason unannotated', async () => {
   const sshBin = makeProbeMapSsh({ a: probe(1), b: probe(1) });
   for (const opts of [{ maxRemoteQueue: 0 }, {}]) {
-    const res = await selectRunner(runnersOf('a', 'b'), { sshBin, deadlineMs: 3000, ...opts });
+    const res = await selectRunner(runnersOf('a', 'b'), { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, ...opts });
     assert.equal(res.runner, null);
     assert.deepEqual(res.skipped.map((s) => s.reason), ['queued: 1', 'queued: 1']);
   }
@@ -84,7 +84,7 @@ test('selectRunner: paused, protocol-2 and capacity skips still exclude a queued
   });
   const res = await selectRunner(runnersOf('paused', 'v1', 'small'), {
     sshBin,
-    deadlineMs: 3000,
+    deadlineMs: GENEROUS_PROBE_DEADLINE_MS,
     maxRemoteQueue: 2,
     requireProtocol2: true,
     reservation: { weight: 4, cpuCores: 4, memoryBytes: 1 },
@@ -99,7 +99,7 @@ test('selectRunner: a queued runner that can never fit the ticket is not a queue
   const sshBin = makeProbeMapSsh({ small: probe(1, { capacity: { weight: 1 } }), big: probe(2, { capacity: { weight: 8 } }) });
   const res = await selectRunner(runnersOf('small', 'big'), {
     sshBin,
-    deadlineMs: 3000,
+    deadlineMs: GENEROUS_PROBE_DEADLINE_MS,
     maxRemoteQueue: 2,
     reservation: { weight: 4, cpuCores: 4, memoryBytes: 1 },
   });
@@ -288,7 +288,7 @@ test('selectRunner: an unenforced runner with only discounted room loses to an e
     mac: probe(0, { headroom, enforcement: { cpu: 'unenforced', reason: 'no cgroups on darwin; children get nice only' } }),
     fast: probe(1, { headroom, enforcement: { cpu: 'enforced' } }),
   });
-  const res = await selectRunner(runnersOf('mac', 'fast'), { sshBin, deadlineMs: 3000, maxRemoteQueue: 2, reservation: { weight: 2, cpuCores: 2, memoryBytes: 1 } });
+  const res = await selectRunner(runnersOf('mac', 'fast'), { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, maxRemoteQueue: 2, reservation: { weight: 2, cpuCores: 2, memoryBytes: 1 } });
   assert.equal(res.runner.name, 'fast');
   assert.equal(res.queuedChoice, true);
 });
@@ -296,11 +296,11 @@ test('selectRunner: an unenforced runner with only discounted room loses to an e
 test('BRAIN-746 selectRunner: allowBusyQueue admits a saturated empty-queue runner as a queued choice; without it, or with maxRemoteQueue 0, it stays `busy`', async () => {
   const reservation = { weight: 1, cpuCores: 4, memoryBytes: 1e9 };
   const sshBin = makeProbeMapSsh({ a: probe(0, { headroom: { cpuCores: 0, memoryBytes: 1e12 } }) });
-  const withOpt = await selectRunner(runnersOf('a'), { sshBin, deadlineMs: 3000, maxRemoteQueue: 2, allowBusyQueue: true, reservation });
+  const withOpt = await selectRunner(runnersOf('a'), { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, maxRemoteQueue: 2, allowBusyQueue: true, reservation });
   assert.equal(withOpt.runner.name, 'a');
   assert.equal(withOpt.queuedChoice, true);
   for (const opts of [{ maxRemoteQueue: 2 }, { maxRemoteQueue: 0, allowBusyQueue: true }]) {
-    const res = await selectRunner(runnersOf('a'), { sshBin, deadlineMs: 3000, reservation, ...opts });
+    const res = await selectRunner(runnersOf('a'), { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, reservation, ...opts });
     assert.equal(res.runner, null, JSON.stringify(opts));
     assert.equal(res.busy.runner.name, 'a');
   }
@@ -309,7 +309,7 @@ test('BRAIN-746 selectRunner: allowBusyQueue admits a saturated empty-queue runn
 test('BRAIN-746 selectRunner: allowBusyQueue prefers an idle runner, then the fewest queued, and never admits one that can never fit or is over the cap', async () => {
   const reservation = { weight: 1, cpuCores: 4, memoryBytes: 1e9 };
   const sat = { headroom: { cpuCores: 0, memoryBytes: 1e12 } };
-  const opts = { deadlineMs: 3000, maxRemoteQueue: 2, allowBusyQueue: true, reservation };
+  const opts = { deadlineMs: GENEROUS_PROBE_DEADLINE_MS, maxRemoteQueue: 2, allowBusyQueue: true, reservation };
   let res = await selectRunner(runnersOf('a', 'b'), { ...opts, sshBin: makeProbeMapSsh({ a: probe(0, sat), b: probe(0, { headroom: { cpuCores: 8, memoryBytes: 1e12 } }) }) });
   assert.equal(res.runner.name, 'b');
   assert.equal(res.queuedChoice, undefined);

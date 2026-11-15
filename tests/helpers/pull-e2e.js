@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { readAttempt, supervisorAlive } from '../../src/attempts.js';
-import { laneRun, laneSpawn, writeGlobalConfig } from '../helpers.js';
+import { laneRun, laneSpawn, writeGlobalConfig, scaledMs } from '../helpers.js';
 import { logins } from '../lane-dispatch-fixture.js';
 import { setup } from '../remote-harness.js';
 import { CA_TEXT, QUEUE_URL } from './queue-fixture.js';
@@ -16,7 +16,7 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 export const PULL_RUNNER = { name: 'pullbox', ssh: 'pullbox', shell: 'sh -c', transport: 'pull' };
 
 async function until(fn, what, { timeoutMs = 40_000 } = {}) {
-  const deadline = Date.now() + timeoutMs;
+  const deadline = Date.now() + scaledMs(timeoutMs);
   let lastError = null;
   for (;;) {
     const value = await fn().catch((err) => { lastError = err; return null; });
@@ -50,6 +50,7 @@ export async function pullE2E(t, w, { load, pullRunner = true, pushRunner = fals
   const pause = path.join(base.state, 'PAUSE');
   if (localPaused) fs.writeFileSync(pause, 'the local queue is closed for the test');
   const calls = path.join(secrets, 'queue-calls');
+  const failed = path.join(secrets, 'queue-failed');
   const exits = path.join(secrets, 'exits');
   const env = {
     ...base.env,
@@ -57,6 +58,7 @@ export async function pullE2E(t, w, { load, pullRunner = true, pushRunner = fals
     LANE_TEST_QUEUE_CONN: JSON.stringify(w.cluster.conn(w.db, logins.s1)),
     LANE_TEST_QUEUE_CALLS: calls,
     LANE_TEST_QUEUE_FAIL: queueFail,
+    LANE_TEST_QUEUE_FAILED: failed,
     LANE_TEST_EXIT_LOG: exits,
   };
   const runner = new StubRunner(w, { login: logins.a2, s3: createS3Client({ endpoint: stub.endpoint, region: STUB_REGION, creds: STUB_CREDS }), tmpDir: makeTmpDir('pull-e2e-runner-', t) });
@@ -72,6 +74,7 @@ export async function pullE2E(t, w, { load, pullRunner = true, pushRunner = fals
     ranLocally: () => fs.existsSync(ran),
     supervisorExits: () => (fs.existsSync(exits) ? fs.readFileSync(exits, 'utf8').split('\n').filter((line) => line.includes('supervisor.js')).map((line) => Number(line.split(' ').at(-1))) : []),
     unpauseLocal: () => fs.rmSync(pause, { force: true }),
+    injectedFailures: (name) => (fs.existsSync(failed) ? fs.readFileSync(failed, 'utf8').split('\n').filter((line) => line === name).length : 0),
     queueCalls: () => (fs.existsSync(calls) ? fs.readFileSync(calls, 'utf8').split('\n').filter(Boolean).length : 0),
     lane,
     // a foreground `lane run` the test can signal; killed with the test so a failing canary leaves nothing behind

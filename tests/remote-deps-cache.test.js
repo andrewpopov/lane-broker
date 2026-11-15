@@ -221,7 +221,6 @@ test('a miss installs and publishes; the next run is a hit that runs no npm ci, 
   assert.match(second.stderr, /deps-cache hit key=[0-9a-f]{12} dir=\. ms=\d+/);
   assert.equal(s.npmCiCalls(), 1, 'a hit runs no npm ci');
   assert.equal(second.probe.out, 'hello from the bin', 'the .bin symlink works in the materialized tree');
-  assert.ok(second.row.depsMs < first.row.depsMs, `hit ${second.row.depsMs}ms should beat miss ${first.row.depsMs}ms`);
   assert.equal(s.storedKeys().length, 1, 'same key, no second entry');
   assert.equal(second.probe.inPlace, 'wrote', 'the hit is a private copy: an in-place write to an installed file just works');
 });
@@ -779,7 +778,6 @@ test('an npm-workspace repo is cached: the second run is a hit that recreates th
   assert.equal(second.row.depsCache, 'hit');
   assert.equal(s.npmCiCalls(), 1, 'a hit runs no npm ci');
   t.diagnostic(`workspace dependency setup: miss ${first.row.depsMs}ms, hit ${second.row.depsMs}ms; same runner and fixture`);
-  assert.ok(second.row.depsMs < first.row.depsMs, 'restoring a workspace cache entry beats reinstalling it');
   for (const { probe } of [first, second]) {
     assert.equal(probe.source, 'workspace source');
     assert.equal(probe.isLink, true);

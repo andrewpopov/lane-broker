@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { afterEach } from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, gitFixture, laneRun, laneSpawn, waitFor, BIN } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, gitFixture, laneRun, laneSpawn, waitFor, timeScale, GENEROUS_PROBE_DEADLINE_MS, BIN } from './helpers.js';
 import { paths, readJsonSafe } from '../src/state.js';
 import { makeTmpDir } from './helpers/tmp.js';
 import { CAPABILITIES } from '../src/capabilities.js';
@@ -31,6 +31,8 @@ export function tmpDir(prefix) {
 }
 
 /** README "Testing hooks": a 200 ms first result-poll backoff (production 5 s) and a 1 s cancel grace (production 10 s). */
+export const scaledWaitTimeout = (timeout) => (/^\d+s$/.test(timeout) ? `${Math.ceil(Number.parseInt(timeout, 10) * timeScale())}s` : timeout);
+
 export const FAST_WAITS = { LANE_BROKER_TEST_RESULT_POLL_MS: '200', LANE_BROKER_TEST_CANCEL_GRACE_MS: '1000' };
 
 /** freshEnv() + shadow scheduler config: these tests exercise the client/protocol
@@ -439,6 +441,7 @@ export function setup({ ssh = 'normal', cpuAdmissionPercent, weight = 1, cpuCore
     loadOpenSamples: 1,
     sampleMs: 100,
     runners: [{ name: 'skybox', ssh, shell: 'sh -c', root: runnerRoot }],
+    remoteProbeDeadlineMs: GENEROUS_PROBE_DEADLINE_MS,
   };
   if (cpuAdmissionPercent !== undefined) {
     cfg.schedulerMode = 'active';
@@ -493,7 +496,7 @@ export async function detachAndWait(args, env, cwd, waitTimeout = '180s') {
   // Bounded: a ticket that should have been refused (or otherwise never
   // completes) must fail this test fast and by name, never hang the whole
   // suite waiting on a `lane wait` that has nothing to wait for.
-  const waited = await laneRun(['wait', id, '--timeout', waitTimeout], { env });
+  const waited = await laneRun(['wait', id, '--timeout', scaledWaitTimeout(waitTimeout)], { env });
   return { id, waited };
 }
 
@@ -544,7 +547,7 @@ export const detach = async (ctx, cmd, { env = ctx.env, extra = [] } = {}) => {
   return started.stdout.trim();
 };
 export const waitResult = async (ctx, id) => {
-  const waited = await laneRun(['wait', id, '--timeout', '60s'], { env: ctx.env });
+  const waited = await laneRun(['wait', id, '--timeout', scaledWaitTimeout('60s')], { env: ctx.env });
   assert.equal(waited.code, 0, `stderr: ${waited.stderr}\nadmission log:\n${fs.readFileSync(paths(ctx.state).admissionLog, 'utf8')}`);
   return readJsonSafe(path.join(paths(ctx.state).results, `${id}.json`));
 };
@@ -678,6 +681,7 @@ export function rebalanceSetup({ names = ['a', 'b'], paused = ['a'], rebalance =
   writeGlobalConfig(base.home, {
     version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100,
     runners: globalRunners,
+    remoteProbeDeadlineMs: GENEROUS_PROBE_DEADLINE_MS,
     remoteRebalanceMinQueuedMs: 400,
     remoteRebalanceIntervalMs: 150,
     remoteRebalanceCooldownMs: 0,
@@ -695,7 +699,7 @@ export function rebalanceSetup({ names = ['a', 'b'], paused = ['a'], rebalance =
     assert.equal(started.code, 0, started.stderr);
     return started.stdout.trim();
   };
-  const finish = (id, timeout = '60s') => laneRun(['wait', id, '--timeout', timeout], { env: base.env });
+  const finish = (id, timeout = '60s') => laneRun(['wait', id, '--timeout', scaledWaitTimeout(timeout)], { env: base.env });
   return { ...base, fake, runs, unpause, start, finish, runners, globalRunners, binDir, cmdArgv };
 }
 

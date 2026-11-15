@@ -11,7 +11,7 @@ import { writeLease } from '../src/lease.js';
 import { LEASE_STATE } from '../src/lease.js';
 import { bootId } from '../src/state.js';
 import { tmpDir } from './remote-harness.js';
-import { freshEnv, writeGlobalConfig, BIN, waitFor } from './helpers.js';
+import { freshEnv, writeGlobalConfig, BIN, waitFor, GENEROUS_PROBE_DEADLINE_MS } from './helpers.js';
 
 /** BRAIN-602: a busy but healthy runner must not read as unavailable. */
 
@@ -133,7 +133,7 @@ test('remoteProbeDeadlineMs: defaults to 10 s, is validated, and bounds the prob
   assert.equal(tight.runner, null);
   assert.equal(tight.skipped[0].reason, 'probe timed out');
   const slack = slowSsh({ hangFirst: 1, hangMs: 1500 });
-  const loose = await selectRunner([WINTOP], { sshBin: slack.bin, deadlineMs: 5000 });
+  const loose = await selectRunner([WINTOP], { sshBin: slack.bin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS });
   assert.equal(loose.runner?.name, 'wintop', 'a longer deadline lets the same slow answer through');
 });
 

@@ -367,7 +367,8 @@ test('without a session id each worktree is its own caller, so pushes from two w
 test('a held ticket blocks no other ticket', async () => {
   const fx = setup({}, 2);
   const second = addWork(fx, 's');
-  const first = push(fx, 'first', 'sleep 6');
+  const holder = heldCmd(fx, 120);
+  const first = push(fx, 'first', holder.cmd);
   await waitFor(() => hasLease(fx), { timeoutMs: 60_000 });
   await sleep(GATE_SECONDS_APART);
   // A half-written atomicWriteFile temp sits in the queue folder until its rename; the listing must not parse it.
@@ -378,6 +379,7 @@ test('a held ticket blocks no other ticket', async () => {
   const unrelated = await laneRun(['run', '--repo', 'r', '--lane', 'other', '--', 'true'], { env: fx.env, cwd: fx.work });
   assert.equal(unrelated.code, 0);
   assert.equal(queuedRecords(fx).filter((r) => r.pushGate).length, 1, 'the held push is still queued');
+  holder.release();
   await Promise.all([first.done, held.done]);
 });
 

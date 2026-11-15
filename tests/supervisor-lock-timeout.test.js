@@ -10,6 +10,8 @@ import { readHistoryRows } from '../src/suggest.js';
 // BRAIN-730: the lock is busy ~99% of the time under load, so a supervisor's default 15s acquire deadline expires. That is
 // contention: the supervisor waits instead of dying with no result.
 
+const supervisorMetTheLock = (state) => () => fs.existsSync(paths(state).admissionLog) && /lock-timeout:/.test(fs.readFileSync(paths(state).admissionLog, 'utf8'));
+
 function collect(child) {
   return new Promise((resolve) => {
     let stderr = '';
@@ -29,7 +31,7 @@ test('a supervisor whose first enqueue meets a held lock waits for it and runs t
   try {
     await withLock(state, async () => {
       child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', 'true'], { env, cwd: repoDir });
-      await sleep(1500);
+      await waitFor(supervisorMetTheLock(state), { timeoutMs: 90_000 });
     }, { timeoutMs: 10_000 });
     const { code, stderr } = await collect(child);
     assert.doesNotMatch(stderr, /exited unexpectedly|supervisor error/);
@@ -51,7 +53,7 @@ test('a fallback ticket whose finalize meets a held lock still publishes its res
   await waitFor(() => fs.existsSync(ready), { timeoutMs: 120_000 });
   await withLock(state, async () => {
     fs.writeFileSync(go, 'x');
-    await sleep(1500);
+    await waitFor(supervisorMetTheLock(state), { timeoutMs: 90_000 });
   }, { timeoutMs: 10_000 });
   await waitFor(() => fs.existsSync(path.join(paths(state).results, `${id}.json`)), { timeoutMs: 60_000 });
   const result = resultOf(state, id);
@@ -77,6 +79,19 @@ test('a supervisor crash leaves exactly one supervisor-error history row that re
   assert.equal('exit' in crashRows[0], false);
   assert.equal(readHistoryRows(paths(state).history).some((r) => r.event === 'supervisor-error'), false);
 });
+
+async function holdLockFor(state, ms) {
+  let acquired;
+  const isHeld = new Promise((resolve) => {
+    acquired = resolve;
+  });
+  const holder = withLock(state, async () => {
+    acquired();
+    await sleep(ms);
+  }, { timeoutMs: 10_000 });
+  await isHeld;
+  return { done: holder };
+}
 
 function withShortDeadline(fn) {
   return async () => {
@@ -111,8 +126,7 @@ test('under the contention policy a default-deadline withLock outlives a holder 
 
 test('without the policy a default-deadline withLock still throws LockTimeoutError', withShortDeadline(async () => {
   const { state } = freshEnv();
-  const holder = withLock(state, () => sleep(700), { timeoutMs: 10_000 });
-  await sleep(50);
+  const holder = (await holdLockFor(state, 700)).done;
   await assert.rejects(withLock(state, () => {}), LockTimeoutError);
   await holder;
 }));
@@ -120,8 +134,7 @@ test('without the policy a default-deadline withLock still throws LockTimeoutErr
 test('under the policy an explicit timeoutMs still throws LockTimeoutError', withShortDeadline(async () => {
   const { state } = freshEnv();
   setLockContentionPolicy({ onContention: () => {} });
-  const holder = withLock(state, () => sleep(700), { timeoutMs: 10_000 });
-  await sleep(50);
+  const holder = (await holdLockFor(state, 700)).done;
   await assert.rejects(withLock(state, () => {}, { timeoutMs: 100 }), LockTimeoutError);
   await holder;
 }));

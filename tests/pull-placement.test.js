@@ -10,7 +10,7 @@ import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { paths } from '../src/state.js';
 import { holdLaneLocally, IDLE, rebalanceSetup, resultOf, T, tmpDir } from './remote-harness.js';
 import { runnerPrewarmCommand } from '../src/runner-prewarm.js';
-import { freshEnv, gitFixture, laneRun, waitFor, writeGlobalConfig, writeRepoConfig } from './helpers.js';
+import { freshEnv, gitFixture, laneRun, waitFor, writeGlobalConfig, writeRepoConfig, GENEROUS_PROBE_DEADLINE_MS } from './helpers.js';
 
 /**
  * BRAIN-1036 R2 (T15): a `transport: "pull"` runner is never dialled. Every placement, rebind, rebalance, ping and status path reads
@@ -42,7 +42,7 @@ if (argv.join(' ').includes('remote-probe')) process.stdout.write(JSON.stringify
 
 test('T15 selectRunner never probes or chooses a pull runner, even one listed first with an ssh destination', async () => {
   const ssh = loggingSsh();
-  const res = await selectRunner([PULL, PUSH], { sshBin: ssh.bin, deadlineMs: 3000 });
+  const res = await selectRunner([PULL, PUSH], { sshBin: ssh.bin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS });
   assert.equal(res.runner.name, 'skybox');
   assert.equal(ssh.callsTo('pullbox-runner'), 0);
   assert.deepEqual(res.skipped, [{ name: 'pullbox', reason: 'pull transport' }]);

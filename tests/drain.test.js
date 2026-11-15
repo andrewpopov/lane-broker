@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, laneSpawn, waitFor } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, laneSpawn, waitFor, GENEROUS_PROBE_DEADLINE_MS } from './helpers.js';
 import { setup as remoteSetup, tmpDir, markerCmd, makeRunner, detachAndWait, resultOf } from './remote-harness.js';
 import { paths, readRemoteDrain, writeRemoteDrain, clearRemoteDrain, sanitizeDrainReason } from '../src/state.js';
 import { selectRunner } from '../src/remote-client.js';
@@ -227,7 +227,7 @@ function fakeProbeSsh(probe) {
   return sshBin;
 }
 const baseProbe = { protocol: 1, protocols: [1, 2], version: '0.0.0', draining: false, paused: false, queued: 0, running: 0, capacity: {} };
-const select = (probe) => selectRunner([makeRunner({ ssh: 'a' })], { sshBin: fakeProbeSsh(probe), deadlineMs: 3000, maxRemoteQueue: 2 });
+const select = (probe) => selectRunner([makeRunner({ ssh: 'a' })], { sshBin: fakeProbeSsh(probe), deadlineMs: GENEROUS_PROBE_DEADLINE_MS, maxRemoteQueue: 2 });
 
 test('selectRunner skips a drained runner naming the reason, and sanitizes the reason it was sent', async () => {
   const res = await select({ ...baseProbe, draining: true, paused: true, remoteDrain: { reason: 'maint', since: 1 } });

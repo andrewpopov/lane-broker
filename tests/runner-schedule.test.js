@@ -9,7 +9,7 @@ import { expectedRunMs } from '../src/estimates-history.js';
 import { remoteSelectOptions, selectionOptionsFor } from '../src/supervisor.js';
 import { RUN_ESTIMATE_WINDOW_MS } from '../src/speed-placement.js';
 import { tmpDir } from './remote-harness.js';
-import { freshEnv, writeGlobalConfig } from './helpers.js';
+import { freshEnv, writeGlobalConfig, GENEROUS_PROBE_DEADLINE_MS } from './helpers.js';
 
 const LA = 'America/Los_Angeles';
 const ALL = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
@@ -102,11 +102,11 @@ function recordingSsh() {
 test('selectRunner: a runner outside its window is skipped without being probed', async () => {
   const ssh = recordingSsh();
   const runners = [{ name: 'skybox', ssh: 'skybox', schedule: daytime }];
-  const off = await selectRunner(runners, { sshBin: ssh.bin, deadlineMs: 3000, now: at('2026-10-12T07:00:00Z') });
+  const off = await selectRunner(runners, { sshBin: ssh.bin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, now: at('2026-10-12T07:00:00Z') });
   assert.equal(off.runner, null);
   assert.deepEqual(off.skipped, [{ name: 'skybox', reason: 'outside schedule' }]);
   assert.equal(ssh.probes(), 0);
-  const on = await selectRunner(runners, { sshBin: ssh.bin, deadlineMs: 3000, now: at('2026-10-11T20:00:00Z') });
+  const on = await selectRunner(runners, { sshBin: ssh.bin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, now: at('2026-10-11T20:00:00Z') });
   assert.equal(on.runner.name, 'skybox');
   assert.equal(ssh.probes(), 1);
 });
@@ -115,12 +115,12 @@ test('selectRunner: a window closing before the expected run skips the runner; n
   const ssh = recordingSsh();
   const runners = [{ name: 'skybox', ssh: 'skybox', schedule: daytime }, { name: 'always', ssh: 'always' }];
   const now = at('2026-10-12T04:30:00Z'); // 21:30 PDT, window closes in an hour
-  const long = await selectRunner(runners, { sshBin: ssh.bin, deadlineMs: 3000, now, expectedRunMs: 2 * 3600_000 });
+  const long = await selectRunner(runners, { sshBin: ssh.bin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, now, expectedRunMs: 2 * 3600_000 });
   assert.equal(long.runner.name, 'always');
   assert.match(long.skipped[0].reason, /window closes at 2026-10-12T05:30:00.000Z, before the expected 7200s run/);
-  const short = await selectRunner(runners, { sshBin: ssh.bin, deadlineMs: 3000, now, expectedRunMs: 600_000 });
+  const short = await selectRunner(runners, { sshBin: ssh.bin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, now, expectedRunMs: 600_000 });
   assert.equal(short.runner.name, 'skybox');
-  const unknown = await selectRunner(runners, { sshBin: ssh.bin, deadlineMs: 3000, now });
+  const unknown = await selectRunner(runners, { sshBin: ssh.bin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, now });
   assert.equal(unknown.runner.name, 'skybox');
 });
 
