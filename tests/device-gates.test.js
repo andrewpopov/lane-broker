@@ -327,7 +327,7 @@ test('loadGlobalConfig carries a valid deviceGates block through and refuses a b
   }
 });
 
-const metricLines = (deviceGates) => renderAgentMetrics({ now: 0, records: [], claims: {}, listening: true, registered: true, scopeAvailable: true, version: 't', deviceGates }).split('\n');
+const metricLines = (deviceGates) => renderAgentMetrics({ now: 0, records: [], claimed: 0, claimAttempts: {}, listening: true, registered: true, scopeAvailable: true, version: 't', deviceGates }).split('\n');
 
 test('the agent metrics carry lane_agent_device_gate_closed for configured gates only', () => {
   assert.equal(metricLines(undefined).some((line) => line.includes('device_gate')), false);
