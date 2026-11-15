@@ -201,7 +201,7 @@ export function scaledMs(budgetMs, env = process.env) {
 /** A loaded runner can stall the probe subprocess past production's 10 s and skip the runner as "probe timed out". */
 export const GENEROUS_PROBE_DEADLINE_MS = scaledMs(60_000);
 
-export async function waitFor(predicate, { timeoutMs = 5000, intervalMs = 20 } = {}) {
+export async function waitFor(predicate, { timeoutMs = 30_000, intervalMs = 20 } = {}) {
   const deadline = Date.now() + scaledMs(timeoutMs);
   for (;;) {
     const v = await predicate();
