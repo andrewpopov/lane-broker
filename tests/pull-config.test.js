@@ -50,9 +50,9 @@ test('T9 laneQueueUrl refuses svc: hosts, the pg-primary name, multi-host URLs, 
     ['postgres://u@pitelite/lane_queue?sslrootcert=/nonexistent/ca.pem', /"sslrootcert" query parameter/],
     ['postgres://u@pitelite/lane_queue?sslkey=/nonexistent/k.pem', /"sslkey" query parameter/],
     ['postgres://u@pitelite/lane_queue?%E0%A4%A=1', /malformed query string/],
-    ['postgres://lane_submit_train@pitelite:5432/postgres', /lane_queue database/],
-    ['postgres://lane_submit_train@pitelite:5432/', /lane_queue database/],
-    ['postgres://lane_submit_train@pitelite:5432', /lane_queue database/],
+    ['postgres://lane_submit_train@pitelite:5432/postgres', /lane queue database \(lane_queue or lane_queue_db\)/],
+    ['postgres://lane_submit_train@pitelite:5432/', /lane queue database \(lane_queue or lane_queue_db\)/],
+    ['postgres://lane_submit_train@pitelite:5432', /lane queue database \(lane_queue or lane_queue_db\)/],
     ['https://pitelite/lane_queue', /postgres:\/\/ URL/],
     ['', /postgres:\/\/ URL/],
     [42, /postgres:\/\/ URL/],
@@ -64,7 +64,7 @@ test('T9 laneQueueUrl refuses svc: hosts, the pg-primary name, multi-host URLs, 
 test('a Unix socket laneQueueUrl is accepted and every other laneQueueUrl rule still applies to it', () => {
   assert.equal(load({ laneQueueUrl: SOCKET_URL }).laneQueueUrl, SOCKET_URL);
   for (const [url, reason] of [
-    ['postgres://lane_submit_train@%2Fvar%2Frun%2Fpostgresql/postgres', /lane_queue database/],
+    ['postgres://lane_submit_train@%2Fvar%2Frun%2Fpostgresql/postgres', /lane queue database \(lane_queue or lane_queue_db\)/],
     [`${SOCKET_URL}?host=pitelite`, /"host" query parameter/],
     [`${SOCKET_URL}?sslrootcert=/ca.pem`, /"sslrootcert" query parameter/],
     ['postgres://lane_submit_train@%2Fvar%2Frun%2Fpostgresql,pitelite/lane_queue', /single-host|exactly one host/],
@@ -83,6 +83,15 @@ function socketUrlsAreOnlyValidSocketHosts({ isSocketQueueUrl: isSocket }) {
 test('isSocketQueueUrl is true only for a valid laneQueueUrl whose host is a socket directory', async () => {
   socketUrlsAreOnlyValidSocketHosts({ isSocketQueueUrl });
   await assertCanaryFails('config.js', ['laneQueueUrlProblem(raw) === null && ', ''], (load) => load('config.js').then(socketUrlsAreOnlyValidSocketHosts));
+});
+
+test('laneQueueUrl accepts the lane_queue_db name and still refuses any other database', () => {
+  for (const url of ['postgres://u@pitelite:5432/lane_queue_db?sslmode=verify-full', 'postgres://u@%2Fvar%2Frun%2Fpostgresql/lane_queue_db']) {
+    assert.equal(load({ laneQueueUrl: url }).laneQueueUrl, url);
+  }
+  for (const url of ['postgres://u@pitelite:5432/lane_queue_db2', 'postgres://u@pitelite:5432/lane_queuedb', 'postgres://u@pitelite:5432/LANE_QUEUE_DB']) {
+    assert.throws(() => load({ laneQueueUrl: url }), (err) => err instanceof ConfigError && /lane queue database/.test(err.message), url);
+  }
 });
 
 test('T9 a host merely containing pg-primary is not the VIP name', () => {
