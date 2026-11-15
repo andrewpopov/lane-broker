@@ -62,9 +62,9 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
   let deviceGatesConfig = config.deviceGates;
   let deviceConfigError = null;
   let metricsWrittenAt = -Infinity;
-  const writeMetrics = () => {
-    if (!textfileDir || now() - metricsWrittenAt < config.pollMs) return;
-    metricsWrittenAt = now();
+  const writeMetrics = (tickAt) => {
+    if (!textfileDir || tickAt - metricsWrittenAt < config.pollMs) return;
+    metricsWrittenAt = tickAt;
     try {
       writeAgentMetrics(textfileDir, { now: now(), records: core.table.all(), claimed, claimAttempts, listening: core.ld.listening, registered: core.ld.registeredOnConnection, scopeAvailable: driver.scopeAvailable, version, deviceGates });
     } catch (err) {
@@ -130,14 +130,15 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
     while (!stopped) {
       if (poked || now() >= pollAt) {
         poked = false;
-        pollAt = now() + config.pollMs;
+        const tickAt = now();
+        pollAt = tickAt + config.pollMs;
         driver.watchScope();
         await refreshDeviceGates();
         if (upgradeRequired) log('UPGRADE REQUIRED: the queue refuses this agent\'s protocol, so no claims are made; update lane-broker and restart the agent');
         else await claimRound();
         const blocked = block();
         core.tick({ claims: upgradeRequired ? 'stopped: upgrade required' : blocked ? `paused:${blocked}` : 'running', ...(deviceGatesConfig ? { deviceGates: deviceGateStatus() } : {}) });
-        writeMetrics();
+        writeMetrics(tickAt);
       }
       const lastSignOfLife = () => Math.max(lastLivenessAt, pingAt);
       if (!stopped && now() - lastSignOfLife() >= config.pollMs) {
