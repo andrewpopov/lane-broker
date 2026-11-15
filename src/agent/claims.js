@@ -26,17 +26,19 @@ export function claimBlock({ schedule, stopClaimingBeforeCloseMs, now = Date.now
 const clampMem = (bytes) => Math.min(Math.max(0, Math.floor(bytes)), MAX_FREE_MEM);
 
 /**
- * The free CPU and memory a claim offers. Active mode measures this host as `remote-probe` does and answers null (skip the tick) when
- * the measurement is missing; shadow mode has no measurement to trust and offers the static budget, which is finite.
+ * The free CPU and memory a claim offers, and the whole CPU budget (`capacityCpu`, which lets the queue hold back for an aged head this host could fit,
+ * BRAIN-1099). Active mode measures this host as `remote-probe` does and answers null (skip the tick) when the measurement is missing; shadow mode has
+ * no measurement to trust and offers the static budget, which is finite.
  */
 export async function claimFigures({ cfg = loadGlobalConfig(), host = detectResourceCapacity() } = {}) {
-  if (cfg.schedulerMode !== 'active') return { freeCpu: cpuBudgetCores(host, cfg), freeMem: clampMem(host.memoryBytes - cfg.memoryReserveBytes) };
+  const capacityCpu = cpuBudgetCores(host, cfg);
+  if (cfg.schedulerMode !== 'active') return { freeCpu: capacityCpu, freeMem: clampMem(host.memoryBytes - cfg.memoryReserveBytes), capacityCpu };
   const status = await collectStatus({ lockTimeoutMs: PROBE_LOCK_WAIT_MS });
   const brokerRoot = ensureStateDirs().root;
   const cpuHeadroom = await probeCpuHeadroom(brokerRoot, cfg, listLeases(brokerRoot).filter((l) => HELD_STATES.has(l.state)));
   const headroom = probeHeadroom(status.resources, cfg, true, undefined, cpuHeadroom);
   if (!headroom || !Number.isFinite(headroom.cpuCores) || !Number.isFinite(headroom.memoryBytes)) return null;
-  return { freeCpu: headroom.cpuCores, freeMem: clampMem(headroom.memoryBytes) };
+  return { freeCpu: headroom.cpuCores, freeMem: clampMem(headroom.memoryBytes), capacityCpu };
 }
 
 /**
@@ -66,7 +68,7 @@ export async function claimOnce({ core, remoteRoot, figures = claimFigures, bloc
       }
       clearPendingClaim(remoteRoot);
     },
-  });
+  }, offered.capacityCpu ?? null);
   if (answer.skipped) return { status: 'skipped', reason: 'not-live' };
   return execId ? { status: 'claimed', execId } : { status: answer.status };
 }

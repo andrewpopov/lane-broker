@@ -16,7 +16,7 @@ const TOO_MANY_CONNECTIONS = '53300';
 // SQL parameter types in order (a call sends as many as it has arguments, so a call that names none of the trailing defaults runs against an older schema); `idempotent` says whether a call that may already have committed can be sent again
 const FUNCTIONS = {
   ld_queue_ref: { types: [], idempotent: true },
-  ld_enqueue_fenced: { types: ['text', 'uuid', 'text', 'text', 'text', 'jsonb', 'jsonb', 'jsonb', 'text[]', 'real', 'bigint', 'int', 'int', 'boolean', 'text', 'real', 'text[]'], idempotent: false },
+  ld_enqueue_fenced: { types: ['text', 'uuid', 'text', 'text', 'text', 'jsonb', 'jsonb', 'jsonb', 'text[]', 'real', 'bigint', 'int', 'int', 'boolean', 'text', 'real', 'text[]', 'real'], idempotent: false },
   ld_get: { types: ['uuid'], idempotent: true },
   ld_list_mine: { types: ['text[]', 'int'], idempotent: true },
   ld_withdraw: { types: ['uuid'], idempotent: false },
@@ -106,12 +106,12 @@ export function createQueueClient({
   return {
         queueRef: (options) => invoke('ld_queue_ref', [], options),
 
-        enqueueFenced: ({ expectRef, id, repoKey, lane, laneKey, binding, header, snapshot, requiresTags, avoidTags = [], cpuCores, memoryBytes, priority = 0, minProtocol = 1 }) =>
-      invoke('ld_enqueue_fenced', [
-        expectRef, id, repoKey, lane, laneKey, binding, header, snapshot, requiresTags, cpuCores, memoryBytes, priority, minProtocol,
-        // only a lane that sets avoidTags needs the 17-parameter function, so every other enqueue still works against a queue not yet migrated to 007
-        ...(avoidTags.length > 0 ? [true, null, null, avoidTags] : []),
-      ]),
+        enqueueFenced: ({ expectRef, id, repoKey, lane, laneKey, binding, header, snapshot, requiresTags, avoidTags = [], cpuCores, minCpuCores, memoryBytes, priority = 0, minProtocol = 1 }) => {
+      // only a lane that sets avoidTags (007) or an elastic floor (008) needs the longer function, so every other enqueue still works against an older queue
+      const elastic = Number.isFinite(minCpuCores) && minCpuCores < cpuCores;
+      const trailing = elastic ? [true, null, null, avoidTags, minCpuCores] : avoidTags.length > 0 ? [true, null, null, avoidTags] : [];
+      return invoke('ld_enqueue_fenced', [expectRef, id, repoKey, lane, laneKey, binding, header, snapshot, requiresTags, cpuCores, memoryBytes, priority, minProtocol, ...trailing]);
+    },
 
         get: (id) => invoke('ld_get', [id]),
 

@@ -21,6 +21,7 @@ export function enqueueArgs(envelope) {
     requiresTags: envelope.requiresTags,
     avoidTags: envelope.avoidTags ?? [],
     cpuCores: envelope.cpuCores,
+    ...(envelope.minCpuCores === undefined ? {} : { minCpuCores: envelope.minCpuCores }),
     memoryBytes: envelope.memoryBytes,
     priority: envelope.priority,
     ...(envelope.minProtocol === undefined ? {} : { minProtocol: envelope.minProtocol }),

@@ -319,7 +319,8 @@ export class ExecutionDriver {
     const input = fs.openSync(spoolPath(this.remoteRoot, execId), 'r');
     try {
       const argv = [process.execPath, ...childExitSafeFlags(), this.laneBin, 'remote-exec', '--root', this.remoteRoot, '--transfer', 'gzip', '--transfer-cache', '--epoch', String(record.epoch),
-        '--runner-name', this.ld.registered.host, '--runner-speed-factor', String(this.config.speedFactor)];
+        '--runner-name', this.ld.registered.host, '--runner-speed-factor', String(this.config.speedFactor),
+        ...(Number.isFinite(record.claim.cpuCores) ? ['--claim-cpu-cores', String(record.claim.cpuCores)] : [])];
       const { cmd, args } = supervisorLaunch(execId, argv, this.#scope);
       const child = this.spawnProcess(cmd, args, { detached: true, stdio: [input, log, log], env: this.spawnEnv });
       child.on('error', (err) => this.log(`${execId}: spawn failed: ${err.message}`));

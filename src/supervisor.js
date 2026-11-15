@@ -1294,6 +1294,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
           lane: enriched.lane,
           laneKey: enriched.key,
           cpuCores: enriched.remote.cpuCores,
+          ...(enriched.remote.minCpuCores !== undefined ? { minCpuCores: enriched.remote.minCpuCores } : {}),
           memoryBytes: enriched.remote.memoryBytes ?? 0,
           requiresTags: enriched.remote.requiresTags ?? [],
           avoidTags: enriched.remote.avoidTags ?? [],

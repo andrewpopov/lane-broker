@@ -251,6 +251,13 @@ describe('enqueue intent without a database', () => {
     assert.deepEqual(enqueueArgs({ ...envelope, avoidTags: ['slow'] }).avoidTags, ['slow']);
     assert.deepEqual(enqueueArgs(envelope).avoidTags, []);
   });
+
+  test('an elastic lane floor in the envelope is enqueued, and an envelope without one sends none', async () => {
+    const { state } = await preparedTicket();
+    const envelope = readEnvelope(state, ID);
+    assert.equal(enqueueArgs({ ...envelope, minCpuCores: 4 }).minCpuCores, 4);
+    assert.equal('minCpuCores' in enqueueArgs(envelope), false);
+  });
 });
 
 describe('enqueue intent locking without a database', () => {

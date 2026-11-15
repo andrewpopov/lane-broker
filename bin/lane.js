@@ -189,10 +189,10 @@ function parseRootFlag(args) {
   return idx === -1 ? undefined : args[idx + 1];
 }
 
-/** BRAIN-1035 `remote-exec` flags a pull agent passes: `--epoch N` (a positive integer), `--runner-name S`, `--runner-speed-factor X`. Values are validated downstream by the header rules. */
+/** BRAIN-1035 `remote-exec` flags a pull agent passes: `--epoch N` (a positive integer), `--runner-name S`, `--runner-speed-factor X`, and (BRAIN-1099) `--claim-cpu-cores K`, the grant the queue claimed. Values are validated downstream by the header rules. */
 function parseAgentExecFlags(args) {
   const options = {};
-  for (const [flag, key, convert] of [['--epoch', 'epoch', Number], ['--runner-name', 'runnerName', String], ['--runner-speed-factor', 'runnerSpeedFactor', Number]]) {
+  for (const [flag, key, convert] of [['--epoch', 'epoch', Number], ['--runner-name', 'runnerName', String], ['--runner-speed-factor', 'runnerSpeedFactor', Number], ['--claim-cpu-cores', 'claimCpuCores', Number]]) {
     const idx = args.indexOf(flag);
     if (idx === -1) continue;
     if (args[idx + 1] === undefined) return { ok: false, reason: `${flag} needs a value` };

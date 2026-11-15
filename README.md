@@ -2152,6 +2152,31 @@ judged on the FULL claim, since it would be dispatched the full claim and refuse
 it terminally (exit 64) if its budget is smaller. Upgrade runners before relying
 on elasticity.
 
+Pull dispatch (BRAIN-1099, queue migration 008): the ticket carries the floor as
+`tickets.min_cpu_cores` (only when it is below `cpuCores`). Until the ticket has
+waited `lane_dispatch.cluster.elastic_floor_after_s` (default 600, 10 min; set it with
+`UPDATE lane_dispatch.cluster SET elastic_floor_after_s = <seconds>`) `ld_claim`
+needs its full `cpuCores`; after that it needs `ceil(min_cpu_cores)`, and a runner
+whose free CPU is between the two claims it at the largest integer that fits
+(`tickets.claimed_cpu_cores`, answered as the claim's `cpu_cores`). The agent passes
+that grant to `lane remote-exec --claim-cpu-cores <k>`, which runs the ticket with
+`cpuCores` k and the floor kept below it; the runner's own admission then decides the
+final grant (it may shrink further, never below the floor), which is what the child
+sees as `LANE_BROKER_CPU_CORES`. A full fit keeps the declared claim.
+
+**Aged-head reservation on pull (BRAIN-1099).** `ld_claim` takes the runner's whole
+CPU budget as an optional fifth argument (`cpuBudgetCores`, sent by agents from
+0.106). When the top ticket that runner could claim (same eligibility and order,
+ignoring fit) has waited `age_horizon_s` (60 min), does not fit now (CPU at its
+`claim_need`, or memory), would fit the runner's budget, and the runner holds at
+least one claim of its own, the answer is `{status: 'none', reserved_for: <id>}`:
+nothing smaller is backfilled past it, and the freed cores go to the head. Scope is
+per runner and only runners that could ever fit the head: a runner whose budget is
+smaller backfills freely, so a large head never wedges a small runner, and a runner
+with nothing of its own running never holds (the head is futile there, as BRAIN-418
+judges a head on a drained host), so no runner is ever idled indefinitely. An agent
+that sends no budget (0.105 and older) never holds back.
+
 ### Right-sized CPU requests (`rightSizeFromHistory`, BRAIN-550)
 
 A lane's declared `cpuCores` is usually a ceiling, not what it uses (24 h of runs: the median run used about 68% of its

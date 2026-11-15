@@ -99,3 +99,15 @@ test('--runner-name and --runner-speed-factor override the header fields and are
   await execRemote(ctx, badName, { extraArgs: ['--runner-name', 'bad name!'] }).closed;
   assert.equal(readExecResult(ctx, badName.ticketId).reason, 'invalid runnerName');
 });
+
+test('--claim-cpu-cores runs an elastic ticket at the grant the queue claimed, keeping a floor below it; without it the declaration stands', async () => {
+  const ctx = setupRunner();
+  const seen = (name) => path.join(makeTmpDir(`exec-cores-${name}-`), 'cores.json');
+  const probeTo = (file) => `require('fs').writeFileSync(${JSON.stringify(file)}, JSON.stringify(process.env.LANE_BROKER_CPU_CORES))`;
+  const granted = seen('granted');
+  assert.equal((await execRemote(ctx, makeHeader(probeTo(granted), { cpuCores: 3, minCpuCores: 1 }), { extraArgs: ['--claim-cpu-cores', '2'] }).closed).code, 0);
+  assert.equal(JSON.parse(fs.readFileSync(granted, 'utf8')), '2');
+  const declared = seen('declared');
+  assert.equal((await execRemote(ctx, makeHeader(probeTo(declared), { cpuCores: 3, minCpuCores: 1 })).closed).code, 0);
+  assert.equal(JSON.parse(fs.readFileSync(declared, 'utf8')), '3');
+});
