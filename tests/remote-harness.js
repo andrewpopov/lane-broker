@@ -417,6 +417,7 @@ export function makeDispatchArgs(overrides = {}) {
     memoryBytes: undefined,
     relCwd: '',
     argv: [process.execPath, '-e', 'process.exit(0)'],
+    deadlines: { haveMs: GENEROUS_PROBE_DEADLINE_MS },
     ...overrides,
   };
 }
