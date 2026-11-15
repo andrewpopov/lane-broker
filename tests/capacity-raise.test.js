@@ -47,10 +47,10 @@ test('capacity raise: mid-flight config raise reaches already-queued heads witho
     writeRepoConfig(dir, { version: 1, lanes: { default: { weight: 2 } } });
   }
 
-  const idA = await spawnDetached(env, repoADir, 'ra', 30);
+  const idA = await spawnDetached(env, repoADir, 'ra', 120);
   assert.ok(idA, 'lane run --detach should print an id for A');
   // BRAIN-452: no lane may weigh over half the capacity, so two weight-2 holders fill capacity 4 together.
-  const idA2 = await spawnDetached(env, repoA2Dir, 'ra2', 30);
+  const idA2 = await spawnDetached(env, repoA2Dir, 'ra2', 120);
   const leaseA = await waitFor(() => leaseExists(state, idA) && leaseExists(state, idA2), { timeoutMs: 5000 });
   assert.ok(leaseA, 'A and A2 should hold all capacity (2 + 2 == capacity 4)');
 
@@ -71,15 +71,13 @@ test('capacity raise: mid-flight config raise reaches already-queued heads witho
   assert.equal(leaseExists(state, idC), false, 'C must not start while capacity is exhausted by A and A2');
 
   // Raise capacity mid-flight, with NO resubmission of B or C.
-  const raisedAt = Date.now();
   writeGlobalConfig(home, { version: 1, capacity: 12, loadClose: 100000, sampleMs: 150 });
 
   const leaseB = await waitFor(() => leaseExists(state, idB), { timeoutMs: 5000 });
   const leaseC = await waitFor(() => leaseExists(state, idC), { timeoutMs: 5000 });
   assert.ok(leaseB, 'B should start once the reloaded config raises capacity, without resubmission');
   assert.ok(leaseC, 'C should start once the reloaded config raises capacity, without resubmission');
-  assert.ok(leaseExists(state, idA), 'A should still be running throughout');
-  assert.ok(Date.now() - raisedAt < 2000, 'B/C should start within ~2s of the raise, not wait for A to finish (~30s)');
+  assert.ok(leaseExists(state, idA) && leaseExists(state, idA2), 'B/C started while A and A2 still hold their leases, so the raise admitted them rather than A finishing');
 
   await laneRun(['cancel', idA], { env, cwd: repoADir });
   await laneRun(['cancel', idA2], { env, cwd: repoA2Dir });
@@ -98,10 +96,10 @@ test('capacity raise control: without the raise, queued heads stay capacity-bloc
     writeRepoConfig(dir, { version: 1, lanes: { default: { weight: 2 } } });
   }
 
-  const idA = await spawnDetached(env, repoADir, 'ra', 30);
+  const idA = await spawnDetached(env, repoADir, 'ra', 120);
   assert.ok(idA, 'lane run --detach should print an id for A');
   // BRAIN-452: no lane may weigh over half the capacity, so two weight-2 holders fill capacity 4 together.
-  const idA2 = await spawnDetached(env, repoA2Dir, 'ra2', 30);
+  const idA2 = await spawnDetached(env, repoA2Dir, 'ra2', 120);
   const leaseA = await waitFor(() => leaseExists(state, idA) && leaseExists(state, idA2), { timeoutMs: 5000 });
   assert.ok(leaseA, 'A and A2 should hold all capacity (2 + 2 == capacity 4)');
 
