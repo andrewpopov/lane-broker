@@ -10,6 +10,7 @@ import { pgSkipOption } from './lane-db-harness.js';
 import { startDispatchCluster, World } from './lane-dispatch-fixture.js';
 import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 import { pullE2E } from './helpers/pull-e2e.js';
+import { scaledMs } from './helpers.js';
 
 /**
  * BRAIN-1036 R7: the placement hook and the settle mapping, through the shipped caller path. `lane run` spawns a real supervisor
@@ -19,7 +20,7 @@ import { pullE2E } from './helpers/pull-e2e.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 async function until(fn, timeoutMs = 60_000, detail = () => '') {
-  for (const deadline = Date.now() + timeoutMs; !(await fn()); await sleep(100)) if (Date.now() > deadline) assert.fail(`timed out waiting for the ticket state ${detail()}`);
+  for (const deadline = Date.now() + scaledMs(timeoutMs); !(await fn()); await sleep(100)) if (Date.now() > deadline) assert.fail(`timed out waiting for the ticket state ${detail()}`);
 }
 const DISPATCH_ONLY = { localExecution: 'refused' };
 const supervisorExit = async (fx) => {
@@ -165,7 +166,7 @@ const SCENARIOS = {
   'T2: while the queue has not committed the withdraw the command never runs locally and the supervisor keeps waiting': async (load, w, t) => {
     const fx = await pullE2E(t, w, { load, localPaused: true, queueFail: 'ld_withdraw', lanePull: { queuedTimeoutMs: 1000 } });
     const id = await fx.detach(fx.markLocalRun);
-    await sleep(4000);
+    await until(() => fx.injectedFailures('ld_withdraw') >= 3 || (fx.injectedFailures('ld_withdraw') >= 1 && !supervisorAlive(fx.attempt(id))), 60_000, () => `a third failed withdraw (saw ${fx.injectedFailures('ld_withdraw')})`);
     const attempt = fx.attempt(id);
     assert.equal(fx.ranLocally(), false);
     assert.equal(supervisorAlive(attempt), true, 'the supervisor gave up waiting for a withdraw that never committed');
@@ -346,14 +347,14 @@ const CANARIES = [
   ['a cancel the queue records without proof leaves the pull ticket unresolved: exit 1, the attempt kept', ...pullTicket("    case 'unresolved':\n      return 1;", "    case 'unresolved':\n      return 0;")],
 ];
 
-describe('pull placement and settlement through a real supervisor', { skip: pgSkipOption, timeout: 900_000 }, () => {
+describe('pull placement and settlement through a real supervisor', { skip: pgSkipOption, timeout: scaledMs(900_000) }, () => {
   let cluster;
   before(async () => { cluster = await startDispatchCluster(); });
   afterAll(async () => { await cluster?.closeClients(); cluster?.stop(); });
   afterEach(() => cluster.closeClients());
-  for (const [name, scenario] of Object.entries(SCENARIOS)) test(name, { timeout: 120_000 }, async (t) => scenario(realSrc, await World.create(cluster), t));
+  for (const [name, scenario] of Object.entries(SCENARIOS)) test(name, { timeout: scaledMs(120_000) }, async (t) => scenario(realSrc, await World.create(cluster), t));
   for (const [name, file, mutation] of CANARIES) {
-    test(`canary: with "${mutation[0].trim().slice(0, 70)}" removed, "${name}" fails`, { timeout: 150_000 }, async (t) => {
+    test(`canary: with "${mutation[0].trim().slice(0, 70)}" removed, "${name}" fails`, { timeout: scaledMs(150_000) }, async (t) => {
       const world = await World.create(cluster);
       const failure = await assertCanaryFails(file, mutation, (load) => SCENARIOS[name](load, world, t));
       t.diagnostic(`failed as expected: ${String(failure.message).split('\n')[0].slice(0, 160)}`);

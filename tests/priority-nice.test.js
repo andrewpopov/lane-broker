@@ -113,20 +113,27 @@ async function niceOfFirstLease(args, globalCfg, laneCfg) {
   writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100, ...globalCfg });
   const repoDir = path.join(base, 'repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, ...laneCfg } } });
-  const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', ...args, '--', 'sleep', '2'], { env, cwd: repoDir });
-  const lease = await waitFor(() => {
-    let names;
-    try {
-      names = fs.readdirSync(paths(state).leases).filter((n) => n.endsWith('.json'));
-    } catch {
-      return null;
-    }
-    const l = names[0] ? readLease(state, names[0].replace(/\.json$/, '')) : null;
-    return l && l.childPgid ? l : null;
-  });
-  const ps = Number(execFileSync('ps', ['-o', 'nice=', '-p', String(lease.childPgid)], { encoding: 'utf8' }).trim());
-  await new Promise((resolve) => child.on('exit', resolve));
-  return { leaseNice: lease.nice, ps };
+  const release = path.join(base, 'release');
+  const held = `i=0; while [ ! -e '${release}' ] && [ $i -lt 1200 ]; do sleep 0.1; i=$((i+1)); done`;
+  const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', ...args, '--', 'sh', '-c', held], { env, cwd: repoDir });
+  const childExit = new Promise((resolve) => child.on('exit', resolve));
+  try {
+    const lease = await waitFor(() => {
+      let names;
+      try {
+        names = fs.readdirSync(paths(state).leases).filter((n) => n.endsWith('.json'));
+      } catch {
+        return null;
+      }
+      const l = names[0] ? readLease(state, names[0].replace(/\.json$/, '')) : null;
+      return l && l.childPgid ? l : null;
+    }, { timeoutMs: 60_000 });
+    const ps = Number(execFileSync('ps', ['-o', 'nice=', '-p', String(lease.childPgid)], { encoding: 'utf8' }).trim());
+    return { leaseNice: lease.nice, ps };
+  } finally {
+    fs.writeFileSync(release, '');
+    await childExit;
+  }
 }
 
 test('a real high lane runs at priorityNice.high and records it on the lease; a medium lane runs at laneNice', async () => {

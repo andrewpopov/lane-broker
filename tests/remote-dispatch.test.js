@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 import path from 'node:path';
-import { gitFixture, laneRun, laneSpawn, waitFor, sleep, writeRepoConfig, writeGlobalConfig } from './helpers.js';
+import { gitFixture, laneRun, laneSpawn, waitFor, sleep, writeRepoConfig, writeGlobalConfig, GENEROUS_PROBE_DEADLINE_MS } from './helpers.js';
 import {
   tmpDir, setup, markerCmd, detachAndWait, resultOf, probeCount,
   makeFakeSshBin, makeRunner, clientEnv, makeGitWorktree, makeDispatchArgs, readCapturedHeader,
@@ -34,7 +34,7 @@ function seam(ssh = 'normal') {
     ...fake,
     env,
     runner: makeRunner({ ssh, name: 'skybox', root: tmpDir('seam-runner-root') }),
-    select: { sshBin: fake.sshBin, env, deadlineMs: 5000 },
+    select: { sshBin: fake.sshBin, env, deadlineMs: GENEROUS_PROBE_DEADLINE_MS },
   };
 }
 

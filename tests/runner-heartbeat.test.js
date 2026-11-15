@@ -13,7 +13,7 @@ import { loadGlobalConfig, ConfigError, DEFAULT_GLOBAL_CONFIG } from '../src/con
 import { paths, atomicWriteJson, readJsonSafe, ensureStateDirs, withLock } from '../src/state.js';
 import { readAttempt } from '../src/attempts.js';
 import { tmpDir, setup, resultOf, probeCount, markerCmd, detachAndWait } from './remote-harness.js';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor, GENEROUS_PROBE_DEADLINE_MS } from './helpers.js';
 
 /**
  * BRAIN-597: the runner heartbeat (`lane runner watch`) on top of BRAIN-594's runner-unreachable.json: the shared clock helper,
@@ -256,7 +256,7 @@ for (const kind of ['place', 'rebind', 'rebalance']) {
       seed(root, { skybox: now - unreachableFor }, beat(now - beatAge));
       const ssh = fakeSsh();
       const options = selectionOptionsFor(kind, ENRICHED, placementCfg, { root, stuckLocally: true, draining: true });
-      const res = await selectRunner(placementCfg.runners, { ...options, sshBin: ssh.bin, deadlineMs: 3000 });
+      const res = await selectRunner(placementCfg.runners, { ...options, sshBin: ssh.bin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS });
       return { ssh, res };
     };
     const down = await run(10 * MIN, MIN);
@@ -281,7 +281,7 @@ test('remoteSelectOptions carries downRunners only when a runner is down', () =>
 
 test('selectRunner: with every runner down nothing is probed and none is chosen', async () => {
   const ssh = fakeSsh();
-  const res = await selectRunner([SKYBOX], { sshBin: ssh.bin, deadlineMs: 3000, downRunners: { skybox: 'unreachable since 11:00' } });
+  const res = await selectRunner([SKYBOX], { sshBin: ssh.bin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, downRunners: { skybox: 'unreachable since 11:00' } });
   assert.equal(res.runner, null);
   assert.equal(ssh.calls().length, 0);
 });

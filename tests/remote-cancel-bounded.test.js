@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { laneRun, laneSpawn, waitFor, sleep } from './helpers.js';
+import { laneRun, laneSpawn, waitFor, sleep, scaledMs } from './helpers.js';
 import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 import { tmpDir, setup, resultOf, holdLaneLocally } from './remote-harness.js';
 import { readAttempt, remoteCancelExitDeadlineMs, remoteCancelDeadlineMs, cancelWaitMs, POST_ABORT_JOIN_MS, CANCELLING_LOCK_TIMEOUT_MS } from '../src/attempts.js';
@@ -20,7 +20,7 @@ import { isPidAlive } from '../src/lease.js';
  * Deadlines under the harness's 1 s cancel grace: remote cancel 6 s, supervisor exit deadline 11.5 s, `lane cancel` wait 13.5 s.
  */
 
-const T = { timeout: 90_000 };
+const T = { timeout: scaledMs(90_000) };
 const ABANDONED_LINE = /cancel did not finish within \d+ms; exiting 74/;
 
 function withCancelWrapper(env) {
@@ -214,7 +214,8 @@ test('the derived deadlines nest: remote cancel < supervisor exit deadline < lan
 
 test('a ticket rebound from the local queue to a runner exits within the deadline when its cancel hangs, and lane cancel settles the orphan', T, async () => {
   const base = setup();
-  const { env, setMode, setDown, patchProbe, releaseHolder } = withCancelWrapper(base.env);
+  // `lane cancel`'s orphan-path remote cancel is bounded by grace + 5 s; the 1 s harness grace's 6 s lost to a real ssh round trip on a loaded runner.
+  const { env, setMode, setDown, patchProbe, releaseHolder } = withCancelWrapper({ ...base.env, LANE_BROKER_TEST_CANCEL_GRACE_MS: String(scaledMs(5000)) });
   const { home, state, repoDir } = base;
   const configPath = path.join(home, 'config.json');
   fs.writeFileSync(configPath, JSON.stringify({ ...JSON.parse(fs.readFileSync(configPath, 'utf8')), remoteRebindIntervalMs: 300 }));

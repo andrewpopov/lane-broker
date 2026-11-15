@@ -10,7 +10,7 @@ import { recordReadiness, readReadiness, collectRunnerStates, renderRunnersLines
 import { noRunnerRefusal, NO_RUNNER_EXIT_CODE } from '../src/resources.js';
 import { tmpDir, makeRunner, setup as remoteSetup, markerCmd, detachAndWait } from './remote-harness.js';
 import { paths, readJsonSafe } from '../src/state.js';
-import { freshEnv, writeRepoConfig, writeGlobalConfig, laneRun } from './helpers.js';
+import { freshEnv, writeRepoConfig, writeGlobalConfig, laneRun, GENEROUS_PROBE_DEADLINE_MS } from './helpers.js';
 import { loadGlobalConfig } from '../src/config.js';
 
 /** BRAIN-623 slice 1: `requires` (executables a runner must have), its probe round trip, placement, config and status. */
@@ -49,7 +49,7 @@ const NEEDS = { tools: ['rg', 'poetry'] };
 
 test('a runner without the tool is not chosen; one with it is, whatever the config order', async () => {
   const ssh = makeToolSsh({ tools: { bare: ['poetry'], full: ['rg', 'poetry'] } });
-  const res = await selectRunner(runners('bare', 'full'), { sshBin: ssh.bin, deadlineMs: 3000, readinessNeeds: NEEDS });
+  const res = await selectRunner(runners('bare', 'full'), { sshBin: ssh.bin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, readinessNeeds: NEEDS });
   assert.equal(res.runner.name, 'full');
   assert.deepEqual(res.skipped, [{ name: 'bare', reason: 'missing tool rg (required by the lane)' }]);
   assert.deepEqual(res.readiness, { bare: { check: 'tools', missing: ['rg'] } });
@@ -57,13 +57,13 @@ test('a runner without the tool is not chosen; one with it is, whatever the conf
 
 test('the submitter sends the names it needs in the probe command', async () => {
   const ssh = makeToolSsh({ tools: { a: ['rg', 'poetry'] } });
-  await selectRunner(runners('a'), { sshBin: ssh.bin, deadlineMs: 3000, readinessNeeds: NEEDS });
+  await selectRunner(runners('a'), { sshBin: ssh.bin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, readinessNeeds: NEEDS });
   assert.match(ssh.calls()[0], /remote-probe --requires rg,poetry /);
 });
 
 test('an older runner that answers no tools is not ready for a lane with requires', async () => {
   const ssh = makeToolSsh({ tools: { old: ['rg'] }, old: ['old'] });
-  const res = await selectRunner(runners('old'), { sshBin: ssh.bin, deadlineMs: 3000, readinessNeeds: { tools: ['rg'] } });
+  const res = await selectRunner(runners('old'), { sshBin: ssh.bin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, readinessNeeds: { tools: ['rg'] } });
   assert.equal(res.runner, null);
   assert.match(res.skipped[0].reason, /does not report tools \(older lane-broker\).*rg/);
 });
@@ -71,7 +71,7 @@ test('an older runner that answers no tools is not ready for a lane with require
 test('requires absent behaves exactly as today: the probe command is unchanged and an old runner is chosen', async () => {
   const ssh = makeToolSsh({ old: ['old'] });
   for (const needs of [undefined, {}, { tools: [] }, readinessNeeds(undefined)]) {
-    const res = await selectRunner(runners('old'), { sshBin: ssh.bin, deadlineMs: 3000, ...(needs ? { readinessNeeds: needs } : {}) });
+    const res = await selectRunner(runners('old'), { sshBin: ssh.bin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, ...(needs ? { readinessNeeds: needs } : {}) });
     assert.equal(res.runner.name, 'old');
     assert.equal('readiness' in res, false);
   }
@@ -80,7 +80,7 @@ test('requires absent behaves exactly as today: the probe command is unchanged a
 
 test('no eligible runner: the refusal (exit 76) names the missing tool and each runner checked', async () => {
   const ssh = makeToolSsh({ tools: { a: [], b: ['poetry'] } });
-  const res = await selectRunner(runners('a', 'b'), { sshBin: ssh.bin, deadlineMs: 3000, readinessNeeds: NEEDS });
+  const res = await selectRunner(runners('a', 'b'), { sshBin: ssh.bin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, readinessNeeds: NEEDS });
   assert.equal(res.runner, null);
   const reason = res.skipped.map((s) => `${s.name}: ${s.reason}`).join('; '); // as the supervisor builds it
   const refusal = noRunnerRefusal('sim', reason);
@@ -237,10 +237,10 @@ test('config: runnerVersionFloor defaults to null, accepts X.Y.Z, rejects anythi
 /** BRAIN-623 slice 2b: a stored "not ready" note clears when a placement sees the runner pass, and expires. */
 test('selectRunner lists every runner that passed the readiness checks, chosen or not', async () => {
   const ssh = makeToolSsh({ tools: { a: [], b: ['rg', 'poetry'], c: ['rg', 'poetry'] } });
-  const res = await selectRunner(runners('a', 'b', 'c'), { sshBin: ssh.bin, deadlineMs: 3000, readinessNeeds: NEEDS });
+  const res = await selectRunner(runners('a', 'b', 'c'), { sshBin: ssh.bin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, readinessNeeds: NEEDS });
   assert.deepEqual(res.ready, ['b', 'c']);
   assert.deepEqual(Object.keys(res.readiness), ['a']);
-  assert.deepEqual((await selectRunner(runners('a'), { sshBin: ssh.bin, deadlineMs: 3000, readinessNeeds: NEEDS })).ready, [], 'present on the no-runner return too');
+  assert.deepEqual((await selectRunner(runners('a'), { sshBin: ssh.bin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, readinessNeeds: NEEDS })).ready, [], 'present on the no-runner return too');
 });
 
 test('a placement clears the gap of every runner that passed (not only the chosen one) and keeps the gap of one it could not probe', async () => {

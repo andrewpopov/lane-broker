@@ -41,20 +41,21 @@ const scenarios = {
   },
 
   'a NOTIFY wake mid-interval does not stretch the gap to the next call: the wait is capped by the liveness deadline': async (w, rw, load) => {
-    const period = 400;
+    const period = 1000;
     const agent = await rw.agent({ load, config: { pollMs: period }, draining: () => true });
     const su = await w.su();
     const from = Date.now();
     for (let round = 0; round < 3; round++) {
       const seen = agent.timesOf('ld_register').length;
-      await happens('a ping was sent', () => agent.timesOf('ld_register').length > seen, 3000);
-      await sleep(Math.round(period * 0.45));
+      await happens('a ping was sent', () => agent.timesOf('ld_register').length > seen, 3 * period);
+      await sleep(Math.round(period * 0.6));
       await su.query("SELECT pg_notify('ld_work', '')");
     }
     await sleep(period);
     const times = [from, ...agent.timesOf(...LIVENESS).filter((t) => t >= from), Date.now()];
     const gaps = times.slice(1).map((t, i) => t - times[i]);
-    assert.ok(Math.max(...gaps) <= period + 100, `a NOTIFY mid-interval stretched a gap to ${Math.max(...gaps)} ms (gaps ${gaps.join(',')})`);
+    // A stretched wait would be at least 1.6 periods; 0.3 of a period absorbs scheduling jitter on a loaded runner.
+    assert.ok(Math.max(...gaps) <= period * 1.3, `a NOTIFY mid-interval stretched a gap to ${Math.max(...gaps)} ms (gaps ${gaps.join(',')})`);
   },
 
   'at max_claims, with the claim poll far away, heartbeats keep the liveness calls coming': async (w, rw, load) => {

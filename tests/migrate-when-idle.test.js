@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, laneSpawn, waitFor } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, laneSpawn, waitFor, GENEROUS_PROBE_DEADLINE_MS } from './helpers.js';
 import { setup as remoteSetup, tmpDir, markerCmd, makeRunner } from './remote-harness.js';
 import { enqueue, tryStart, listQueue } from '../src/scheduler.js';
 import { createAttempt, readAttempt } from '../src/attempts.js';
@@ -192,7 +192,7 @@ test('selectRunner skips a draining runner with reason "draining"', async () => 
   const probe = { protocol: 1, protocols: [1, 2], version: '0.0.0', draining: true, paused: false, queued: 0, running: 0, capacity: {} };
   fs.writeFileSync(sshBin, `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(`${JSON.stringify(probe)}\n`)});\n`);
   fs.chmodSync(sshBin, 0o755);
-  const res = await selectRunner([makeRunner({ ssh: 'a' })], { sshBin, deadlineMs: 3000, maxRemoteQueue: 2 });
+  const res = await selectRunner([makeRunner({ ssh: 'a' })], { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, maxRemoteQueue: 2 });
   assert.equal(res.runner, null);
   assert.deepEqual(res.skipped.map((s) => s.reason), ['draining']);
 });

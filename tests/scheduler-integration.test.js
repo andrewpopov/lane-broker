@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor, sleep, scaledMs } from './helpers.js';
+import { listQueue } from '../src/scheduler.js';
 
 function markerScript(mark, viol, sleepSecs) {
   // Records a violation if it finds another run's marker still present.
@@ -33,15 +34,26 @@ test('two runs on the same key serialize: the second waits until the first relea
 });
 
 test('capacity holds: lanes whose combined weight exceeds capacity do not all run concurrently', async () => {
-  const { base, home, env } = freshEnv();
+  const { base, home, state, env } = freshEnv();
   // BRAIN-452: a lane may weigh at most half the capacity, so capacity 4 holds two weight-2 lanes and a third must wait.
   writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
   const repoDir = path.join(base, 'repo');
   writeRepoConfig(repoDir, { version: 1, lanes: { a: { weight: 2 }, b: { weight: 2 }, c: { weight: 2 } } });
 
   const events = path.join(base, 'events');
-  const script = ['sh', '-c', `echo S >> "${events}"; sleep 0.6; echo E >> "${events}"`];
-  const results = await Promise.all(['a', 'b', 'c'].map((lane) => laneRun(['run', '--repo', 'r', '--lane', lane, '--', ...script], { env, cwd: repoDir })));
+  const release = path.join(base, 'release');
+  const script = ['sh', '-c', `echo S >> "${events}"; while [ ! -e "${release}" ]; do sleep 0.05; done; echo E >> "${events}"`];
+  const started = ['a', 'b', 'c'].map((lane) => laneRun(['run', '--repo', 'r', '--lane', lane, '--', ...script], { env, cwd: repoDir }));
+  const startedLines = () => (fs.existsSync(events) ? fs.readFileSync(events, 'utf8').split('\n').filter(Boolean).length : 0);
+  try {
+    await waitFor(() => startedLines() === 2 && listQueue(state).length === 1, { timeoutMs: 60_000 });
+    await sleep(scaledMs(1000)); // a third lane admitted past capacity would show up in this window
+    assert.equal(startedLines(), 2, 'the third lane is held in the queue while the first two run');
+    assert.equal(listQueue(state).length, 1, 'and it is still queued');
+  } finally {
+    fs.writeFileSync(release, '');
+  }
+  const results = await Promise.all(started);
   for (const r of results) assert.equal(r.code, 0);
 
   let running = 0;

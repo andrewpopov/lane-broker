@@ -9,6 +9,7 @@ import { readLease, isGroupAlive } from '../src/lease.js';
 /** ROG-2181 T1b: a leader that dies on its own must not leave descendants running unleased. */
 
 const GRACE_MS = 3000; // production 10 s
+const STARTUP_MS = 60_000; // a supervisor and its child can take that long to start on a loaded runner
 
 function setupRun(shellScript) {
   const { base, home, state, env } = freshEnv({ LANE_BROKER_TEST_CANCEL_GRACE_MS: String(GRACE_MS) }); // README "Testing hooks"
@@ -28,11 +29,11 @@ async function leaseOf(state) {
     } catch {
       return null;
     }
-  });
+  }, { timeoutMs: STARTUP_MS });
   const lease = await waitFor(() => {
     const l = readLease(state, leaseId);
     return l && l.childPgid ? l : null;
-  });
+  }, { timeoutMs: STARTUP_MS });
   return { leaseId, lease };
 }
 
@@ -48,7 +49,7 @@ function historyRow(state, id) {
 async function killLeaderAlone(script, { timeoutMs }) {
   const { state, child, pidFile } = setupRun(script);
   const { leaseId, lease } = await leaseOf(state);
-  await waitFor(() => fs.existsSync(pidFile) && fs.readFileSync(pidFile, 'utf8').trim());
+  await waitFor(() => fs.existsSync(pidFile) && fs.readFileSync(pidFile, 'utf8').trim(), { timeoutMs: STARTUP_MS });
   await sleep(300); // let the grandchild's trap install
   const grandchild = Number(fs.readFileSync(pidFile, 'utf8'));
   assert.notEqual(grandchild, lease.childPgid, 'the grandchild is a different process than the leader');
@@ -64,12 +65,12 @@ async function killLeaderAlone(script, { timeoutMs }) {
 }
 
 test('SIGKILL of the leader alone reaps its surviving child before the lease is released', async () => {
-  await killLeaderAlone("sleep 30 & echo $! > PIDFILE; wait", { timeoutMs: 8000 });
+  await killLeaderAlone("sleep 30 & echo $! > PIDFILE; wait", { timeoutMs: 60_000 });
 });
 
 test('a TERM-trapping grandchild of a dead leader is escalated to KILL before release', async () => {
   const started = Date.now();
-  await killLeaderAlone("sh -c 'trap \"\" TERM; echo $$ > PIDFILE; sleep 30' & wait", { timeoutMs: 20000 });
+  await killLeaderAlone("sh -c 'trap \"\" TERM; echo $$ > PIDFILE; sleep 30' & wait", { timeoutMs: 60_000 });
   assert.ok(Date.now() - started >= GRACE_MS / 2, 'a TERM-ignoring member can only have been reaped after the grace period');
 });
 

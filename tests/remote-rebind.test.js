@@ -2,7 +2,7 @@ import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor, sleep } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, waitFor, sleep, GENEROUS_PROBE_DEADLINE_MS } from './helpers.js';
 import { tmpDir, makeRunner, setup, rebalanceSetup, probeCount, recordingCmd, linesOf, hasLease, holdLaneLocally, detach, waitResult } from './remote-harness.js';
 import { detectResourceCapacity } from '../src/resources.js';
 import { selectRunner } from '../src/remote-client.js';
@@ -48,61 +48,61 @@ const runner = (name, speedFactor) => ({ ...makeRunner({ ssh: name }), ...(speed
 
 test('selectRunner: of two runners with room, the earlier estimated finish wins, not the first in config order', async () => {
   const sshBin = makeProbeMapSsh({ slow: probe(room(8)), fast: probe(room(8)) });
-  const res = await selectRunner([runner('slow', 1), runner('fast', 4)], { sshBin, deadlineMs: 3000, reservation });
+  const res = await selectRunner([runner('slow', 1), runner('fast', 4)], { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, reservation });
   assert.equal(res.runner.name, 'fast');
 });
 
 test('selectRunner: equal estimated finish -> more free CPU, then config order', async () => {
   const sshBin = makeProbeMapSsh({ a: probe(room(6)), b: probe(room(12)), c: probe(room(12)) });
-  const res = await selectRunner([runner('a'), runner('b'), runner('c')], { sshBin, deadlineMs: 3000, reservation });
+  const res = await selectRunner([runner('a'), runner('b'), runner('c')], { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, reservation });
   assert.equal(res.runner.name, 'b');
 });
 
 test('selectRunner: a runner without real CPU headroom is not chosen even though its queue is empty', async () => {
   const sshBin = makeProbeMapSsh({ busy: probe(room(1.5)), free: probe(room(8)) });
-  const res = await selectRunner([runner('busy', 10), runner('free', 1)], { sshBin, deadlineMs: 3000, reservation });
+  const res = await selectRunner([runner('busy', 10), runner('free', 1)], { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, reservation });
   assert.equal(res.runner.name, 'free', 'busy is faster on paper but has 1.5 free cores for a 4-core ticket');
   assert.match(res.skipped.find((s) => s.name === 'busy').reason, /no CPU headroom/);
 });
 
 test('selectRunner: the only runner lacks headroom -> no runner, so the ticket stays local', async () => {
   const sshBin = makeProbeMapSsh({ busy: probe(room(0)) });
-  const res = await selectRunner([runner('busy')], { sshBin, deadlineMs: 3000, reservation });
+  const res = await selectRunner([runner('busy')], { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, reservation });
   assert.equal(res.runner, null);
 });
 
 test('selectRunner: headroom falls back to CPU budget minus reserved when the probe has no measurement', async () => {
   const sshBin = makeProbeMapSsh({ full: probe({ capacity: { cpuCores: 8 }, reservedCpuCores: 6 }), open: probe({ capacity: { cpuCores: 8 }, reservedCpuCores: 2 }) });
-  const res = await selectRunner([runner('full'), runner('open')], { sshBin, deadlineMs: 3000, reservation });
+  const res = await selectRunner([runner('full'), runner('open')], { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, reservation });
   assert.equal(res.runner.name, 'open');
 });
 
 test('selectRunner: not enough available memory is not room', async () => {
   const sshBin = makeProbeMapSsh({ tight: probe(room(8, 1e6)), roomy: probe(room(8, 1e12)) });
-  const res = await selectRunner([runner('tight'), runner('roomy')], { sshBin, deadlineMs: 3000, reservation });
+  const res = await selectRunner([runner('tight'), runner('roomy')], { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, reservation });
   assert.equal(res.runner.name, 'roomy');
 });
 
 test('selectRunner: an unmeasured runner (older probe) still counts as having room', async () => {
   const sshBin = makeProbeMapSsh({ old: probe() });
-  const res = await selectRunner([runner('old')], { sshBin, deadlineMs: 3000, reservation });
+  const res = await selectRunner([runner('old')], { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, reservation });
   assert.equal(res.runner.name, 'old');
 });
 
 test('selectRunner: an empty-queue runner without headroom is reported as `busy`, while `runner` stays null', async () => {
   const sshBin = makeProbeMapSsh({ slow: probe(room(0)), fast: probe(room(0.5)) });
-  const res = await selectRunner([runner('slow', 1), runner('fast', 4)], { sshBin, deadlineMs: 3000, reservation });
+  const res = await selectRunner([runner('slow', 1), runner('fast', 4)], { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, reservation });
   assert.equal(res.runner, null);
   assert.equal(res.busy.runner.name, 'fast', 'the best busy runner by estimated finish');
   assert.ok(res.busy.probe);
-  const withRoom = await selectRunner([runner('slow', 1), runner('fast', 4)], { sshBin: makeProbeMapSsh({ slow: probe(room(8)), fast: probe(room(0)) }), deadlineMs: 3000, reservation });
+  const withRoom = await selectRunner([runner('slow', 1), runner('fast', 4)], { sshBin: makeProbeMapSsh({ slow: probe(room(8)), fast: probe(room(0)) }), deadlineMs: GENEROUS_PROBE_DEADLINE_MS, reservation });
   assert.equal(withRoom.runner.name, 'slow');
   assert.equal(withRoom.busy, undefined);
 });
 
 test('selectRunner: a runner with room is preferred over any runner queue', async () => {
   const sshBin = makeProbeMapSsh({ queued: probe({ queued: 1, ...room(64) }), idle: probe(room(8)) });
-  const res = await selectRunner([runner('queued', 100), runner('idle')], { sshBin, deadlineMs: 3000, maxRemoteQueue: 2, reservation });
+  const res = await selectRunner([runner('queued', 100), runner('idle')], { sshBin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, maxRemoteQueue: 2, reservation });
   assert.equal(res.runner.name, 'idle');
   assert.equal(res.queuedChoice, undefined);
 });

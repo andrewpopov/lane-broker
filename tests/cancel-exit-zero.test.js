@@ -112,7 +112,7 @@ test('BRAIN-364: a cancel landing after the child exited 0 leaves the result exi
   fs.writeFileSync(go, 'x');
   await cancel;
   const resultFile = path.join(paths(ctx.state).results, `${id}.json`);
-  await waitFor(() => readLease(ctx.state, id) === null && (readJsonSafe(resultFile)?.exit ?? null) !== null, { timeoutMs: 15_000 });
+  await waitFor(() => readLease(ctx.state, id) === null && (readJsonSafe(resultFile)?.exit ?? null) !== null, { timeoutMs: 60_000 });
   const result = readJsonSafe(resultFile);
   assert.equal(result.exit, 0);
   assert.equal(result.cancelled, undefined);

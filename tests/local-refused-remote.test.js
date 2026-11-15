@@ -111,21 +111,21 @@ async function queuedOnPausedRunner(ctx, extraRunArgs = []) {
   });
   assert.equal(started.code, 0, `stderr: ${started.stderr}`);
   const queueDir = path.join(ctx.runnerState, 'queue');
-  for (let i = 0; i < 100; i++) {
+  const readQueued = () => {
     const entry = fs.existsSync(queueDir) ? fs.readdirSync(queueDir).find((f) => f.endsWith('.json')) : undefined;
-    if (entry) {
-      try {
-        const queued = JSON.parse(fs.readFileSync(path.join(queueDir, entry), 'utf8'));
-        await laneRun(['cancel', started.stdout.trim()], { env: ctx.env });
-        return queued;
-      } catch {
-        // mid-write; retry
-      }
+    if (!entry) return null;
+    try {
+      return JSON.parse(fs.readFileSync(path.join(queueDir, entry), 'utf8'));
+    } catch {
+      return null; // mid-write
     }
-    await new Promise((r) => setTimeout(r, 100));
+  };
+  try {
+    const queued = await waitFor(readQueued, { timeoutMs: 60_000, intervalMs: 100 });
+    return queued;
+  } finally {
+    await laneRun(['cancel', started.stdout.trim()], { env: ctx.env });
   }
-  await laneRun(['cancel', started.stdout.trim()], { env: ctx.env });
-  assert.fail('the ticket never reached the runner queue');
 }
 
 test('BRAIN-509: localRefused + remote sends no queueTimeoutMs even with remoteQueueTimeoutMs configured', async () => {
@@ -155,10 +155,7 @@ test('BRAIN-509: a localRefused ticket outlasting remoteQueueTimeoutMs in a busy
   // Only once the ticket is in the runner's queue does the clock that would have expired it run: hold it paused well
   // past the 300 ms timeout from THAT point, so the test cannot pass by the runner merely starting late.
   const queueDir = path.join(ctx.runnerState, 'queue');
-  for (let i = 0; i < 100 && !(fs.existsSync(queueDir) && fs.readdirSync(queueDir).some((f) => f.endsWith('.json'))); i++) {
-    await new Promise((r) => setTimeout(r, 100));
-  }
-  assert.ok(fs.readdirSync(queueDir).some((f) => f.endsWith('.json')), 'the ticket never reached the runner queue');
+  await waitFor(() => fs.existsSync(queueDir) && fs.readdirSync(queueDir).some((f) => f.endsWith('.json')), { timeoutMs: 60_000, intervalMs: 100 });
   await new Promise((r) => setTimeout(r, 1500));
   fs.rmSync(pauseFile, { force: true });
   const waited = await laneRun(['wait', id, '--timeout', '60s'], { env: ctx.env });

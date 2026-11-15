@@ -12,7 +12,7 @@ import { loadGlobalConfig, DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { applyOfflineMarks } from '../src/runner-offline.js';
 import { paths } from '../src/state.js';
 import { tmpDir } from './remote-harness.js';
-import { freshEnv, writeGlobalConfig, laneRun } from './helpers.js';
+import { freshEnv, writeGlobalConfig, laneRun, GENEROUS_PROBE_DEADLINE_MS } from './helpers.js';
 
 /** BRAIN-1057: exponential backoff of the watcher's pings for an unreachable runner, and `lane runner offline|online` (a state-file overlay). */
 
@@ -165,7 +165,7 @@ test('overlay: a marked runner is skipped by placement ("marked offline") and no
   const cfg = fx.load();
   const ssh = fakeSsh();
 
-  const picked = await selectRunner(cfg.runners, { sshBin: ssh.bin, deadlineMs: 3000 });
+  const picked = await selectRunner(cfg.runners, { sshBin: ssh.bin, deadlineMs: GENEROUS_PROBE_DEADLINE_MS });
   assert.deepEqual(picked.skipped.find((x) => x.name === 'skybox'), { name: 'skybox', reason: 'marked offline' });
   assert.equal(ssh.callsTo('skybox-runner'), 0);
 

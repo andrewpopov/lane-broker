@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneRun, laneSpawn, gitFixture, BIN, waitFor } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneRun, laneSpawn, gitFixture, BIN, waitFor, GENEROUS_PROBE_DEADLINE_MS } from './helpers.js';
 import { tmpDir, setup, markerCmd, makeFakeSshBin, clientEnv, makeRunner } from './remote-harness.js';
 import { selectRunner } from '../src/remote-client.js';
 import { enqueue, tryStart, listQueueCapped } from '../src/scheduler.js';
@@ -500,14 +500,14 @@ test('mixed versions: a runner without elastic-claims/1 is judged on the FULL cl
   const old = makeRunner({ ssh: 'old', name: 'old' });
   const neu = makeRunner({ ssh: 'new', name: 'new' });
 
-  const oldOnly = await selectRunner([old], { sshBin, env, deadlineMs: 3000, reservation });
+  const oldOnly = await selectRunner([old], { sshBin, env, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, reservation });
   assert.equal(oldOnly.runner, null, 'budget 3 < full claim 4: dispatching would be a terminal exit-64 refusal');
   assert.match(oldOnly.skipped[0].reason, /capacity/);
 
-  const both = await selectRunner([old, neu], { sshBin, env, deadlineMs: 3000, reservation });
+  const both = await selectRunner([old, neu], { sshBin, env, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, reservation });
   assert.equal(both.runner.name, 'new', 'the old runner is skipped and the elastic one used');
 
-  const neuOnly = await selectRunner([neu], { sshBin, env, deadlineMs: 3000, reservation });
+  const neuOnly = await selectRunner([neu], { sshBin, env, deadlineMs: GENEROUS_PROBE_DEADLINE_MS, reservation });
   assert.equal(neuOnly.runner.name, 'new', 'floor 2 <= budget 3');
 });
 

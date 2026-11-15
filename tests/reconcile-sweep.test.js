@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { laneRun, writeGlobalConfig, waitFor, sleep, freshEnv } from './helpers.js';
+import { laneRun, writeGlobalConfig, waitFor, sleep, freshEnv, GENEROUS_PROBE_DEADLINE_MS } from './helpers.js';
 import { tmpDir, setup, resultOf } from './remote-harness.js';
 import { readAttempt } from '../src/attempts.js';
 import { paths, atomicWriteJson, ensureStateDirs, bootId, kernelBootId, tombstonePath } from '../src/state.js';
@@ -387,7 +387,7 @@ test('placement never chooses an offline runner and does not probe it', async ()
   const ctx = context();
   const ssh = loggingSsh(ctx);
   const runners = [{ ...ctx.globalCfg.runners[0], offline: true }];
-  const picked = await selectRunner(runners, { sshBin: ssh.bin, env: ctx.env, deadlineMs: 3000 });
+  const picked = await selectRunner(runners, { sshBin: ssh.bin, env: ctx.env, deadlineMs: GENEROUS_PROBE_DEADLINE_MS });
   assert.equal(picked.runner, null);
   assert.deepEqual(picked.skipped, [{ name: 'skybox', reason: 'marked offline' }]);
   assert.equal(ssh.callsTo('normal'), 0);

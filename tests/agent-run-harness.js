@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import crypto, { randomUUID } from 'node:crypto';
-import { BIN, sleep, waitFor } from './helpers.js';
+import { BIN, sleep, waitFor, scaledMs } from './helpers.js';
 import { makeTmpDir } from './helpers/tmp.js';
 import { startS3Stub, STUB_CREDS, STUB_REGION } from './helpers/s3-stub.js';
 import { setupRunner, makeHeader } from './helpers/remote-exec-fixture.js';
@@ -177,7 +177,7 @@ export const happens = (what, check, timeoutMs = 15_000) => waitFor(check, { tim
  * its scenario against a copy of the tree with that one guard removed, and the scenario must fail on its own assertion.
  */
 export function scenarioSuite(title, { timeout = 300_000, scenarios, canaries = [] }) {
-  describe(title, { skip: pgSkipOption, timeout }, () => {
+  describe(title, { skip: pgSkipOption, timeout: scaledMs(timeout) }, () => {
     let cluster;
     let rw;
     before(async () => { cluster = await startDispatchCluster(); });

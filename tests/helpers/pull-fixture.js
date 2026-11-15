@@ -8,7 +8,7 @@ import { buildManifest } from '../../src/remote-manifest.js';
 import { createS3Client } from '../../src/s3-client.js';
 import { makeTmpDir } from './tmp.js';
 import { sha256Hex } from '../../src/s3-presign.js';
-import { freshEnv } from '../helpers.js';
+import { freshEnv, scaledMs } from '../helpers.js';
 import { makeDispatchArgs, makeGitWorktree } from '../remote-harness.js';
 import { pgSkipOption } from '../lane-db-harness.js';
 import { startDispatchCluster, tid, World } from '../lane-dispatch-fixture.js';
@@ -100,7 +100,7 @@ export async function pullFixture(t, w, { load = realSrc, id = ID, stub = null, 
 
 /** A describe block over one disposable cluster: every scenario once against the real tree, and each canary against a tree with one guard removed. */
 export function definePullSuite(title, scenarios, canaries) {
-  describe(title, { skip: pgSkipOption, timeout: 300_000 }, () => {
+  describe(title, { skip: pgSkipOption, timeout: scaledMs(300_000) }, () => {
     let cluster;
     before(async () => { cluster = await startDispatchCluster(); });
     afterAll(async () => { await cluster?.closeClients(); cluster?.stop(); });
