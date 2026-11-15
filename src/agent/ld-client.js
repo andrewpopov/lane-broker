@@ -182,8 +182,10 @@ export class LdClient {
     return this.#run('ld_register', [this.version, PROTOCOL, this.schedule === null ? null : JSON.stringify(this.schedule)], { ...opts, persist: (answer) => { this.registered = answer; } });
   }
 
-  claim(req, freeCpu, freeMem, heldKeys = [], opts) {
-    return this.#run('ld_claim', [req, freeCpu, String(freeMem), heldKeys], opts);
+  /** `capacity` (`{totalCpu, totalMem, freeWeight, totalWeight}`) is sent only when given: a call without it is the four-argument one an older queue also answers. */
+  claim(req, freeCpu, freeMem, heldKeys = [], opts, capacity) {
+    const trailing = capacity ? [capacity.totalCpu, String(capacity.totalMem), capacity.freeWeight, capacity.totalWeight] : [];
+    return this.#run('ld_claim', [req, freeCpu, String(freeMem), heldKeys, ...trailing], opts);
   }
 
   start(id, epoch, token, opts) {

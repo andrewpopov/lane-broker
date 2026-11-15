@@ -1,5 +1,5 @@
 -- BRAIN-1035 slice 1 (plan rev 6): the pull queue loses quarantine, reassert and claim_lock, and gains the requeue cap, protocol and scheduling columns.
--- Kept until a later migration, after the pull client stops calling them: tickets.urls, attempts.log_bytes and log_chunks (ld_attach_urls, ld_log, ld_log_read, ld_log_ack).
+-- Kept until a later migration, after the pull client stops calling them: tickets.urls (ld_attach_urls). attempts.log_bytes and log_chunks went in migration 009.
 
 UPDATE lane_dispatch.tickets SET state = 'lost', finished_at = coalesce(finished_at, now()),
        result = jsonb_build_object('kind', 'lost', 'reason', 'queue-restored', 'author', 'queue', 'epoch', epoch)

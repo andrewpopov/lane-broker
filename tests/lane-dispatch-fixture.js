@@ -72,10 +72,12 @@ export async function call(client, name, ...args) {
 
 export const tid = gid;
 
-export const enqueue = (client, id, { repo = 'repoA', laneKey = `lk-${id}`, tags = [], cpu = 1, mem = 1000, priority = 0, minProtocol = 1, ages = true, source = null, estRunS = null, avoidTags = [] } = {}) =>
-  call(client, 'ld_enqueue', id, repo, 'test', laneKey, { protocol: 1 }, { cmd: ['true'] }, { key: 'snap', sha256: 'x' }, tags, cpu, mem, priority, minProtocol, ages, source, estRunS, avoidTags);
+export const enqueue = (client, id, { repo = 'repoA', laneKey = `lk-${id}`, tags = [], cpu = 1, mem = 1000, priority = 0, minProtocol = 1, ages = true, source = null, estRunS = null, avoidTags = [], weight } = {}) =>
+  call(client, 'ld_enqueue', id, repo, 'test', laneKey, { protocol: 1 }, { cmd: ['true'], ...(weight === undefined ? {} : { weight }) }, { key: 'snap', sha256: 'x' }, tags, cpu, mem, priority, minProtocol, ages, source, estRunS, avoidTags);
 
-export const claim = (client, { req = randomUUID(), cpu = 8, mem = 1e9, held = [] } = {}) => call(client, 'ld_claim', req, cpu, mem, held);
+/** `capacity` is the agent's `{totalCpu, totalMem, freeWeight, totalWeight}`; without it the call is the four-argument one an old agent makes. */
+export const claim = (client, { req = randomUUID(), cpu = 8, mem = 1e9, held = [], capacity = null } = {}) =>
+  call(client, 'ld_claim', req, cpu, mem, held, ...(capacity ? [capacity.totalCpu, capacity.totalMem, capacity.freeWeight, capacity.totalWeight] : []));
 
 export const finish = (client, claimed, result = { kind: 'ok', exitCode: 0 }) => call(client, 'ld_finish', claimed.id, claimed.epoch, claimed.token, result);
 export const start = (client, claimed) => call(client, 'ld_start', claimed.id, claimed.epoch, claimed.token);
@@ -98,12 +100,16 @@ export async function setNow(world, iso) {
   }
 }
 
-/** Puts the world's queue back to schema version 6 (the 2fcebb0 functions.sql, a copy of the last release's): no 007 columns, none of the 007 function signatures. */
+/** Puts the world's queue back to schema version 6 (the 2fcebb0 functions.sql, a copy of the last release's): no 007, 008 or 009 changes: the log stream is back, and none of the 007 or 008 function signatures. */
 export async function downgradeToV6(world) {
   const su = await world.su();
+  await su.query('CREATE UNLOGGED TABLE lane_dispatch.log_chunks (ticket uuid NOT NULL, epoch int NOT NULL, seq int NOT NULL, bytes bytea NOT NULL, PRIMARY KEY (ticket, epoch, seq))');
+  await su.query('ALTER TABLE lane_dispatch.attempts ADD COLUMN log_bytes bigint NOT NULL DEFAULT 0');
+  await su.query('ALTER TABLE lane_dispatch.cluster DROP COLUMN reserve_after_s');
+  await su.query('DROP FUNCTION lane_dispatch.ld_claim(uuid, real, bigint, text[], real, bigint, real, real)');
   await su.query('ALTER TABLE lane_dispatch.tickets DROP COLUMN avoid_tags');
   await su.query('ALTER TABLE lane_dispatch.cluster DROP COLUMN avoid_grace_s');
-  await su.query('DELETE FROM lane.schema_version WHERE version = 7');
+  await su.query('DELETE FROM lane.schema_version WHERE version IN (7, 8, 9)');
   await su.query(fs.readFileSync(new URL('./fixtures/lane-v6-functions.sql', import.meta.url), 'utf8'));
   await su.query('DROP FUNCTION lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[])');
   await su.query('DROP FUNCTION lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[])');

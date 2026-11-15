@@ -46,15 +46,12 @@ function entryCalls(t1) {
     ld_heartbeat: [logins.a1, held],
     ld_finish: [logins.a1, [...held, { kind: 'ok' }]],
     ld_release: [logins.a1, [...held, 'never-started']],
-    ld_log: [logins.a1, [...held, 1, Buffer.from('x')]],
     ld_enqueue: [logins.s1, [tid(9), 'repoA', 'test', 'lk9', { protocol: 1 }, { cmd: ['true'] }, snapshot, [], 1, 1000, 0]],
     ld_get: [logins.s1, [id]],
     ld_list_mine: [logins.s1, [null, 10]],
     ld_withdraw: [logins.s1, [id]],
     ld_cancel: [logins.s1, [id]],
     ld_attach_urls: [logins.s1, [id, t1.epoch, { get: 'u' }]],
-    ld_log_read: [logins.s1, [id, t1.epoch, 0]],
-    ld_log_ack: [logins.s1, [id, t1.epoch, 0]],
     ld_set_principal: [logins.admin, [logins.a2, 'agent', 'a2', ['linux'], ['*'], 1]],
     ld_reap: [logins.admin, []],
     ld_queue_ref: [logins.s1, []],
@@ -62,7 +59,6 @@ function entryCalls(t1) {
     ld_placeable: [logins.s1, ['repoA', []]],
     ld_prune_candidates: [logins.admin, ['1 day', '7 days', null, null, 10]],
     ld_prune: [logins.admin, [[id], '7 days']],
-    ld_prune_chunks: [logins.admin, ['1 hour', 10]],
     ld_blobs_live: [logins.admin, ['[]']],
   };
 }
@@ -148,58 +144,6 @@ const GUARDS = {
     assert.deepEqual([lost.state, lost.result, lost.finished_at === null], ['lost', { kind: 'lost', reason: 'runner-lost', author: 'queue', epoch: running.epoch }, false]);
   },
 
-  'ld_log stores a repeated seq once and counts log_bytes once': async (w) => {
-    const [a1, a2] = [await w.as(logins.a1), await w.as(logins.a2)];
-    const t1 = await heldAndQueued(w, { started: true });
-    const log = (client, seq, text, token = t1.token) => call(client, 'ld_log', t1.id, t1.epoch, token, seq, Buffer.from(text));
-    assert.equal(await log(a1, 1, 'hello'), 'ok');
-    assert.equal(await log(a1, 1, 'hello'), 'ok', 'a retry of the same seq');
-    assert.equal(await log(a1, 2, 'abc'), 'ok');
-    assert.equal(await log(a1, 2, 'abc'), 'ok');
-    assert.equal(await log(a1, 1, 'ignored: the first write wins'), 'ok');
-    assert.equal(await log(a2, 3, 'x'), 'fenced', 'another host');
-    assert.equal(await log(a1, 3, 'x', randomUUID()), 'fenced', 'a stale token');
-    const su = await w.su();
-    const { rows: chunks } = await su.query('SELECT seq, convert_from(bytes, \'UTF8\') AS text FROM lane_dispatch.log_chunks ORDER BY seq');
-    assert.deepEqual(chunks, [{ seq: 1, text: 'hello' }, { seq: 2, text: 'abc' }]);
-    assert.equal(Number((await su.query('SELECT log_bytes FROM lane_dispatch.attempts')).rows[0].log_bytes), 8);
-  },
-
-  'ld_log caps one call at 256 KiB': async (w) => {
-    const a1 = await w.as(logins.a1);
-    const t1 = await heldAndQueued(w, { started: true });
-    const log = (seq, size) => call(a1, 'ld_log', t1.id, t1.epoch, t1.token, seq, Buffer.alloc(size, 97));
-    assert.equal(await log(1, 262144), 'ok');
-    assert.equal(await log(2, 262145), 'capped');
-    const su = await w.su();
-    assert.deepEqual((await su.query('SELECT seq FROM lane_dispatch.log_chunks')).rows, [{ seq: 1 }], 'a capped chunk is not stored');
-    assert.equal(Number((await su.query('SELECT log_bytes FROM lane_dispatch.attempts')).rows[0].log_bytes), 262144);
-  },
-
-  'ld_log caps one attempt at 64 MiB': async (w) => {
-    const a1 = await w.as(logins.a1);
-    const t1 = await heldAndQueued(w, { started: true });
-    const su = await w.su();
-    await su.query('UPDATE lane_dispatch.attempts SET log_bytes = 67108864 - 10');
-    const log = (seq, size) => call(a1, 'ld_log', t1.id, t1.epoch, t1.token, seq, Buffer.alloc(size, 97));
-    assert.equal(await log(1, 10), 'ok', 'exactly at the cap');
-    assert.equal(await log(2, 1), 'capped', 'one byte over');
-    assert.equal(Number((await su.query('SELECT log_bytes FROM lane_dispatch.attempts')).rows[0].log_bytes), 67108864);
-    assert.deepEqual((await su.query('SELECT seq FROM lane_dispatch.log_chunks')).rows, [{ seq: 1 }]);
-  },
-
-  'ld_log caps the whole table at 1 GiB': async (w) => {
-    const a1 = await w.as(logins.a1);
-    const t1 = await heldAndQueued(w, { started: true });
-    const su = await w.su();
-    await su.query(
-      "INSERT INTO lane_dispatch.log_chunks SELECT gen_random_uuid(), 1, 1, convert_to(repeat('a', 268435000), 'UTF8') FROM generate_series(1, 4)");
-    const log = (seq, size) => call(a1, 'ld_log', t1.id, t1.epoch, t1.token, seq, Buffer.alloc(size, 97));
-    assert.equal(await log(1, 2000), 'capped', 'the table holds 1,824 bytes of room');
-    assert.equal(await log(1, 1000), 'ok');
-    assert.equal(Number((await su.query('SELECT log_bytes FROM lane_dispatch.attempts WHERE ticket = $1', [t1.id])).rows[0].log_bytes), 1000);
-  },
-
   'a restore settles every non-terminal ticket lost with a queue-authored result and a finish time, keeps terminal rows, and clears every claim request': async (w) => {
     const [a1, a2, s1] = [await w.as(logins.a1), await w.as(logins.a2), await w.as(logins.s1)];
     for (const n of [1, 2, 3, 4]) await enqueue(s1, tid(n));
@@ -283,10 +227,6 @@ const CANARIES = [
     "WHERE t.state = 'claimed' AND t.lease_until < v_now ORDER BY t.id FOR UPDATE LOOP", "WHERE t.state IN ('claimed','running') AND t.lease_until < v_now ORDER BY t.id FOR UPDATE LOOP"],
   ["ld_entry refuses a transaction above READ COMMITTED, so a REPEATABLE READ runner cannot exceed max_claims",
     "RAISE EXCEPTION 'lane_dispatch must run at READ COMMITTED, not %', current_setting('transaction_isolation') USING ERRCODE = '25000';", "NULL;"],
-  ['ld_log stores a repeated seq once and counts log_bytes once', 'ON CONFLICT (ticket, epoch, seq) DO NOTHING;', ';'],
-  ['ld_log caps one attempt at 64 MiB', 'IF v_logged + v_len > 67108864 THEN', 'IF false THEN'],
-  ['ld_log caps one call at 256 KiB', 'IF v_len > 262144 THEN', 'IF false THEN'],
-  ['ld_log caps the whole table at 1 GiB', '+ v_len > 1073741824 THEN', '+ v_len > 1073741824000 THEN'],
   ['a restore settles every non-terminal ticket lost with a queue-authored result and a finish time, keeps terminal rows, and clears every claim request',
     "   WHERE state NOT IN ('finished','cancelled','withdrawn','lost');\n  GET DIAGNOSTICS v_lost", "   WHERE false;\n  GET DIAGNOSTICS v_lost"],
   ['a restore settles every non-terminal ticket lost with a queue-authored result and a finish time, keeps terminal rows, and clears every claim request',

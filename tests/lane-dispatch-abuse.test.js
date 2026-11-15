@@ -115,33 +115,6 @@ const GUARDS = {
   },
 };
 
-const SEMANTICS = {
-  'ld_log under contention: the guard kills a call blocked on the attempts row, the retry of the same seq stores one chunk and counts log_bytes once': async (w) => {
-    const [s1, a1, admin, su] = [await w.as(logins.s1), await w.as(logins.a1), await w.as(logins.admin), await w.su()];
-    await enqueue(s1, tid(1));
-    const held = await claim(a1);
-    await start(a1, held);
-    const hold = await holdLock(w, `SELECT 1 FROM lane_dispatch.attempts WHERE ticket = '${held.id}' AND epoch = ${held.epoch} FOR UPDATE`);
-    const log = (c) => call(c, 'ld_log', held.id, held.epoch, held.token, 1, Buffer.from('hello'));
-
-    const runner = await victim(w, logins.a1);
-    const blockedCall = settle(log(runner));
-    await waitBlocked(w, runner.processID);
-    const { elapsedMs } = await runGuardUntil(admin, blockedCall, { everyMs: 1000 });
-    assert.equal((await blockedCall).error?.code, ADMIN_SHUTDOWN);
-    assert.ok(elapsedMs >= 5000, `killed after ${elapsedMs} ms`);
-    await hold.release();
-    assert.equal((await su.query('SELECT count(*)::int AS n FROM lane_dispatch.log_chunks')).rows[0].n, 0, 'the killed call stored nothing');
-
-    const retrying = await victim(w, logins.a1);
-    assert.equal(await log(retrying), 'ok');
-    assert.equal(await log(retrying), 'ok', 'a second retry');
-    const { rows } = await su.query('SELECT seq FROM lane_dispatch.log_chunks');
-    assert.deepEqual(rows, [{ seq: 1 }]);
-    assert.equal(Number((await su.query('SELECT log_bytes FROM lane_dispatch.attempts')).rows[0].log_bytes), 5);
-  },
-};
-
 const CANARIES = [
   ['the guard spares a transaction younger than 5 s, a superuser and any other login prefix, and kills the rest on a lower threshold',
     'AND clock_timestamp() - a.xact_start > p_max_age', 'AND a.xact_start IS NOT NULL'],
@@ -159,7 +132,7 @@ describe('lane_dispatch backend guard and abuse limits on a disposable Postgres 
   after(async () => { await cluster?.closeClients(); cluster?.stop(); });
   afterEach(() => cluster.closeClients());
 
-  for (const [name, scenario] of Object.entries({ ...GUARDS, ...SEMANTICS })) {
+  for (const [name, scenario] of Object.entries(GUARDS)) {
     test(name, async () => scenario(await World.create(cluster), cluster));
   }
 
