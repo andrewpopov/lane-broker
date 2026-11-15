@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { createQueueClient, QueueError } from '../src/queue-client.js';
 import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 import { pgSkipOption } from './lane-db-harness.js';
-import { startDispatchCluster, World, logins, call, claim, start, tid } from './lane-dispatch-fixture.js';
+import { startDispatchCluster, World, logins, call, claim, start, tid, downgradeToV6 } from './lane-dispatch-fixture.js';
 import { CA_TEXT, QUEUE_URL, harnessClient, secretFiles } from './helpers/queue-fixture.js';
 
 /** BRAIN-1036 R4: the submitter queue client against a disposable Postgres. */
@@ -106,6 +106,26 @@ const SCENARIOS = {
     assert.deepEqual(rows.map((r) => r.avoid_tags), [['slow'], []]);
   },
 
+  'the v0.104 13-parameter typed call of ld_enqueue_fenced still resolves, and stores no avoided tags': async (w) => {
+    const s1 = await w.as(logins.s1);
+    const ref = await call(s1, 'ld_queue_ref');
+    const v0104 = ['text', 'uuid', 'text', 'text', 'text', 'jsonb', 'jsonb', 'jsonb', 'text[]', 'real', 'bigint', 'int', 'int'];
+    const { id, ...rest } = enqueueArgs(tid(8), ref);
+    const values = [ref, id, rest.repoKey, rest.lane, rest.laneKey, JSON.stringify(rest.binding), JSON.stringify(rest.header), JSON.stringify(rest.snapshot), [], 1, 1000, 0, 1];
+    await s1.query(`SELECT lane_dispatch.ld_enqueue_fenced(${v0104.map((type, i) => `$${i + 1}::${type}`).join(', ')})`, values);
+    assert.deepEqual((await w.ticket(tid(8))).avoid_tags, []);
+  },
+
+  'a queue still at schema version 6 accepts an enqueue from this client that sets no avoidTags, and refuses one that does with the missing function': async (w, t, createClient) => {
+    await downgradeToV6(w);
+    const { queue } = harnessClient(t, w, { createClient });
+    const ref = await queue.queueRef();
+    await assert.doesNotReject(queue.enqueueFenced(enqueueArgs(tid(6), ref)));
+    assert.equal((await w.ticket(tid(6))).state, 'queued');
+    await assert.rejects(queue.enqueueFenced({ ...enqueueArgs(tid(7), ref), avoidTags: ['slow'] }), (err) => err instanceof QueueError && err.code === '42883' && /ld_enqueue_fenced/.test(err.message));
+    assert.equal(await w.ticket(tid(7)), undefined);
+  },
+
   'too many connections (53300) is retried with jitter for every call, then surfaces when it never clears': async (w, t) => {
     const held = await holdConnections(w, 3);
     const release = async () => { while (held.length) await held.pop().end(); };
@@ -142,8 +162,9 @@ const SCENARIOS = {
 };
 
 const CANARIES = [
-  ['enqueueFenced carries min_protocol to the row, and a caller that names none gets protocol 1', ['priority, minProtocol, true,', 'priority, 1, true,']],
-  ['enqueueFenced carries the lane avoid_tags to the row, and a caller that names none avoids nothing', ['null, null, avoidTags]),', 'null, null, []]),']],
+  ['enqueueFenced carries min_protocol to the row, and a caller that names none gets protocol 1', ['priority, minProtocol,', 'priority, 1,']],
+  ['a queue still at schema version 6 accepts an enqueue from this client that sets no avoidTags, and refuses one that does with the missing function', ['...(avoidTags.length > 0 ? [true, null, null, avoidTags] : []),', 'true, null, null, avoidTags,']],
+  ['enqueueFenced carries the lane avoid_tags to the row, and a caller that names none avoids nothing', ['[true, null, null, avoidTags] : []', '[true, null, null, []] : []']],
 ];
 
 const SOCKET_URL = 'postgres://lane_submit_train@%2Fvar%2Frun%2Fpostgresql/lane_queue';
