@@ -347,7 +347,7 @@ const CANARIES = [
   ['a cancel the queue records without proof leaves the pull ticket unresolved: exit 1, the attempt kept', ...pullTicket("    case 'unresolved':\n      return 1;", "    case 'unresolved':\n      return 0;")],
 ];
 
-describe('pull placement and settlement through a real supervisor', { skip: pgSkipOption, timeout: 900_000 }, () => {
+describe('pull placement and settlement through a real supervisor', { skip: pgSkipOption, timeout: scaledMs(900_000) }, () => {
   let cluster;
   before(async () => { cluster = await startDispatchCluster(); });
   afterAll(async () => { await cluster?.closeClients(); cluster?.stop(); });
