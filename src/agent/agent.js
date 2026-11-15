@@ -20,7 +20,7 @@ export async function openAgentCore({ remoteRoot, config, version, log = (line) 
     onWake?.(event);
   };
   const ld = new LdClient({
-    pg: config.pg, version, schedule: config.schedule, onWake: wake, onCall, ...clientOptions,
+    pg: config.pg, version, schedule: config.schedule, onWake: wake, onCall, log, ...clientOptions,
   });
   try {
     await ld.open();

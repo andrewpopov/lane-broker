@@ -129,7 +129,7 @@ const GUARDS = {
     await assert.rejects(call(admin, 'ld_prune_candidates', '1 day', '7 days', p1.next.finished_at, null, 2), (err) => err.code === '22023');
   },
 
-  'ld_prune deletes only terminal rows past the row age, with their attempts': async (w) => {
+  'ld_prune deletes only terminal rows past the row age, with their chunks and attempts': async (w) => {
     const { admin, ids } = await pruneSetup(w);
     const [old, fresh, live, queued] = ids;
     const su = await w.su();
@@ -137,9 +137,12 @@ const GUARDS = {
     await wasFinishedAgo(w, fresh, 'finished', 60);
     await wasFinishedAgo(w, live, 'queued', 10 * DAY);
     await su.query("INSERT INTO lane_dispatch.attempts (ticket, epoch, host, claim_token) VALUES ($1, 1, 'a1', gen_random_uuid())", [old]);
+    for (const id of [old, fresh, live]) await su.query("INSERT INTO lane_dispatch.log_chunks (ticket, epoch, seq, bytes) VALUES ($1, 1, 1, 'x')", [id]);
     assert.equal(await call(admin, 'ld_prune', [old, fresh, live, queued], '7 days'), 1);
     assert.equal(await rowCount(w, old), 0);
     for (const id of [fresh, live, queued]) assert.equal(await rowCount(w, id), 1, 'fresh terminal, non-terminal and queued rows survive');
+    const chunks = (await su.query('SELECT ticket FROM lane_dispatch.log_chunks ORDER BY ticket')).rows.map((r) => r.ticket);
+    assert.deepEqual(chunks, [fresh, live], 'the pruned ticket chunks went with it, the survivors keep theirs');
     assert.equal((await su.query('SELECT count(*)::int AS n FROM lane_dispatch.attempts')).rows[0].n, 0, 'attempts cascade');
     await assert.rejects(call(admin, 'ld_prune', sample(501).map((_, i) => tid(i + 1)), '7 days'), (err) => err.code === '22023');
   },
@@ -154,6 +157,21 @@ const GUARDS = {
     await lock.release();
     assert.equal(await pruning, 1);
     assert.equal(await rowCount(w, ids[0]), 0);
+  },
+
+  'ld_prune_chunks removes orphans and long-terminal chunks only, at most limit per call': async (w) => {
+    const { admin, ids } = await pruneSetup(w);
+    const [oldTerminal, freshTerminal, live] = ids;
+    const su = await w.su();
+    await wasFinishedAgo(w, oldTerminal, 'finished', 7200);
+    await wasFinishedAgo(w, freshTerminal, 'finished', 60);
+    for (const id of [oldTerminal, freshTerminal, live, tid(40), tid(41), tid(42)]) {
+      await su.query("INSERT INTO lane_dispatch.log_chunks (ticket, epoch, seq, bytes) VALUES ($1, 1, 1, 'x')", [id]);
+    }
+    assert.equal(await call(admin, 'ld_prune_chunks', '1 hour', 2), 2, 'bounded by the limit');
+    assert.equal(await call(admin, 'ld_prune_chunks', '1 hour', 10), 2, 'the other two of the four removable chunks');
+    const left = (await su.query('SELECT ticket FROM lane_dispatch.log_chunks ORDER BY ticket')).rows.map((r) => r.ticket);
+    assert.deepEqual(left, [freshTerminal, live].sort());
   },
 
   'ld_blobs_live reports only blobs referenced by a non-terminal ticket and bounds its input': async (w) => {
@@ -266,11 +284,15 @@ const CANARIES = [
     'OR (p_after_finished IS NOT NULL AND p_after_id IS NOT NULL AND (t.finished_at, t.id) > (p_after_finished, p_after_id)))', 'OR true)'],
   ['ld_prune_candidates pages by keyset from a NULL first page and marks row_due; a half-null cursor raises',
     'IF (p_after_finished IS NULL) <> (p_after_id IS NULL) THEN', 'IF false THEN'],
-  ['ld_prune deletes only terminal rows past the row age, with their attempts',
+  ['ld_prune deletes only terminal rows past the row age, with their chunks and attempts',
     "t.id = ANY (p_ids) AND t.state IN ('finished','cancelled','withdrawn','lost') AND", 't.id = ANY (p_ids) AND'],
-  ['ld_prune deletes only terminal rows past the row age, with their attempts', 'AND t.finished_at < lane_dispatch.now() - p_rows_after', ''],
+  ['ld_prune deletes only terminal rows past the row age, with their chunks and attempts', 'AND t.finished_at < lane_dispatch.now() - p_rows_after', ''],
+  ['ld_prune deletes only terminal rows past the row age, with their chunks and attempts', 'DELETE FROM lane_dispatch.log_chunks WHERE ticket = ANY (v_due);', ''],
   ['ld_prune takes the cluster row lock before it touches a row, as ld_reap does, so the two queue instead of deadlocking on claim_requests',
     "  PERFORM 1 FROM lane_dispatch.cluster WHERE id = 1 FOR UPDATE;\n  SELECT coalesce(array_agg(t.id), '{}') INTO v_due FROM (", "  SELECT coalesce(array_agg(t.id), '{}') INTO v_due FROM ("],
+  ['ld_prune_chunks removes orphans and long-terminal chunks only, at most limit per call', 'LIMIT least(greatest(coalesce(p_limit, 10000), 1), 100000)', ''],
+  ['ld_prune_chunks removes orphans and long-terminal chunks only, at most limit per call',
+    "WHERE t.id IS NULL OR (t.state IN ('finished','cancelled','withdrawn','lost') AND t.finished_at < lane_dispatch.now() - p_terminal_after)", 'WHERE true'],
   ['ld_blobs_live reports only blobs referenced by a non-terminal ticket and bounds its input',
     "WHERE t.state NOT IN ('finished','cancelled','withdrawn','lost')\n       AND b->>", 'WHERE true\n       AND b->>'],
   ['ld_cancel reads a row released as cancelled after a cancel request as confirmed', "v_t.state = 'cancelled' AND v_t.result IS NULL)", 'false)'],

@@ -7,9 +7,9 @@ import { LANE_SQL_DIR, applyDatabaseAcls, applyMigrations } from '../src/lane-db
 import { pgSkipOption } from './lane-db-harness.js';
 import { startDispatchCluster, World, logins, call, enqueue, claim, tid } from './lane-dispatch-fixture.js';
 
-const AGENT_FUNCTIONS = ['ld_register', 'ld_claim', 'ld_start', 'ld_heartbeat', 'ld_finish', 'ld_release'];
-const SUBMIT_FUNCTIONS = ['ld_enqueue', 'ld_get', 'ld_list_mine', 'ld_withdraw', 'ld_cancel', 'ld_attach_urls', 'ld_queue_ref', 'ld_enqueue_fenced', 'ld_placeable'];
-const ADMIN_FUNCTIONS = ['ld_set_principal', 'ld_reap', 'ld_restore_reset', 'ld_guard', 'ld_prune_candidates', 'ld_prune', 'ld_blobs_live'];
+const AGENT_FUNCTIONS = ['ld_register', 'ld_claim', 'ld_start', 'ld_heartbeat', 'ld_finish', 'ld_release', 'ld_log'];
+const SUBMIT_FUNCTIONS = ['ld_enqueue', 'ld_get', 'ld_list_mine', 'ld_withdraw', 'ld_cancel', 'ld_attach_urls', 'ld_log_read', 'ld_log_ack', 'ld_queue_ref', 'ld_enqueue_fenced', 'ld_placeable'];
+const ADMIN_FUNCTIONS = ['ld_set_principal', 'ld_reap', 'ld_restore_reset', 'ld_guard', 'ld_prune_candidates', 'ld_prune', 'ld_prune_chunks', 'ld_blobs_live'];
 const GRANTED = { agent: AGENT_FUNCTIONS, submit: SUBMIT_FUNCTIONS, admin: ADMIN_FUNCTIONS, reader: [] };
 const CALLERS = { agent: logins.a1, submit: logins.s1, admin: logins.admin, reader: logins.reader, legacy: logins.legacy };
 
@@ -41,7 +41,7 @@ async function legacyIsRefused(w) {
   const id = randomUUID();
   const calls = {
     ld_register: ['v', 1, {}], ld_claim: [randomUUID(), 8, 1e9, []], ld_start: [id, 1, id], ld_heartbeat: [id, 1, id],
-    ld_finish: [id, 1, id, { kind: 'ok' }], ld_release: [id, 1, id, 'never-started'],
+    ld_finish: [id, 1, id, { kind: 'ok' }], ld_release: [id, 1, id, 'never-started'], ld_log: [id, 1, id, 1, Buffer.from('x')],
   };
   assert.deepEqual(Object.keys(calls), AGENT_FUNCTIONS);
   for (const [name, args] of Object.entries(calls)) {
@@ -80,7 +80,7 @@ describe('lane_dispatch schema and ACLs', { skip: pgSkipOption, timeout: 180000 
     assert.ok(owners.length > 20);
     assert.deepEqual(owners.filter((o) => o.owner !== 'lane_definer'), []);
     const { rows: tables } = await su.query("SELECT relname FROM pg_class WHERE relnamespace = 'lane_dispatch'::regnamespace AND relkind = 'r' ORDER BY relname");
-    assert.deepEqual(tables.map((r) => r.relname), ['attempts', 'claim_requests', 'cluster', 'principals', 'runners', 'tickets']);
+    assert.deepEqual(tables.map((r) => r.relname), ['attempts', 'claim_requests', 'cluster', 'log_chunks', 'principals', 'runners', 'tickets']);
   });
 
   test('every ld function is SECURITY DEFINER with the pinned search_path and is not executable by PUBLIC', async () => {
@@ -104,7 +104,7 @@ describe('lane_dispatch schema and ACLs', { skip: pgSkipOption, timeout: 180000 
     const { rows: tables } = await su.query(
       `SELECT c.relname, (SELECT a.attname FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0 AND NOT a.attisdropped ORDER BY a.attnum LIMIT 1) AS col
          FROM pg_class c WHERE c.relnamespace = 'lane_dispatch'::regnamespace AND c.relkind = 'r'`);
-    assert.equal(tables.length, 6);
+    assert.equal(tables.length, 7);
     for (const login of Object.values(CALLERS)) {
       const c = await world.as(login);
       for (const { relname: t, col } of tables) {

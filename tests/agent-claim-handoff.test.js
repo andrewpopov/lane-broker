@@ -262,7 +262,7 @@ const canaries = [
   ['a claim whose answer was lost is replayed under the same req however old it is, and adopts exactly one ticket', CLAIMS, ['const req = pending?.req ?? randomUUID();', 'const req = randomUUID();']],
   ['a crash after the record and before the pending delete: the replay adopts the record unchanged', CLAIMS, ['if (!core.table.get(execId)) core.table.put(', 'core.table.put(']],
   ['null headroom makes no claim and leaves no req; shadow mode claims a 64 GiB ticket with finite figures sent as a decimal string', CLAIMS,
-    ["const offered = await figures({ pendingWeights: unadmittedWeights(core.table.all()) });\n  if (!offered) return { status: 'skipped', reason: 'no-headroom' };", 'const offered = (await figures()) ?? { freeCpu: Infinity, freeMem: Infinity };'], /invalid input syntax for type bigint/],
+    ["const offered = await figures({ executions: liveExecutions(core.table.all(), remoteRoot) });\n  if (!offered) return { status: 'skipped', reason: 'no-headroom' };", 'const offered = (await figures()) ?? { freeCpu: Infinity, freeMem: Infinity };'], /invalid input syntax for type bigint/],
   ['none leaves no pending req, and upgrade is answered, clears the req and is not an error', CLAIMS, ["a.status !== 'none' && a.status !== 'upgrade'", "a.status !== 'none'"], /ld_claim answered/],
   ['an upgrade answer stops the claim loop for good: no further ld_claim, and every tick logs it', 'agent/run.js', ["if (answer.status === 'upgrade') upgradeRequired = true;", 'if (false) upgradeRequired = true;']],
   ['the schedule window is respected: outside it, or too close to its close, no ld_claim is made', CLAIMS, ["if (!available) return 'outside-schedule';", '']],

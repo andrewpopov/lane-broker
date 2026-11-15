@@ -1,3 +1,5 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { drainBlocksIntake, executionIdOf, readDrainMarker, readRemoteDrain, stateHome, ensureStateDirs } from '../state.js';
 import { runnerAvailability } from '../runner-schedule.js';
@@ -6,7 +8,7 @@ import { loadGlobalConfig } from '../config.js';
 import { collectStatus } from '../status.js';
 import { listLeases } from '../lease.js';
 import { HELD_STATES, listQueue } from '../scheduler.js';
-import { clampQueuedWeight } from '../exclusive.js';
+import { clampQueuedWeight, queuedWeightLimit } from '../exclusive.js';
 import { detectResourceCapacity, cpuBudgetCores, effectiveWeightCapacity } from '../resources.js';
 import { PROBE_LOCK_WAIT_MS, probeCpuHeadroom, probeHeadroom } from '../remote-runner.js';
 import { clearPendingClaim, newExecutionRecord, readPendingClaim, writePendingClaim } from './store.js';
@@ -26,35 +28,40 @@ export function claimBlock({ schedule, stopClaimingBeforeCloseMs, now = Date.now
 
 const clampMem = (bytes) => Math.min(Math.max(0, Math.floor(bytes)), MAX_FREE_MEM);
 
-/** Executions whose claimed ticket the local broker has not seen yet (no lease, no queue record), so their weight is in neither count of `claimFigures`. */
-const UNADMITTED_SUBPHASES = new Set(['FETCHING', 'STARTING', 'SPAWNING']);
+const UNADMITTED_SUBPHASES = new Set(['FETCHING', 'STARTING', 'SPAWNING', 'RUNNING']);
 
-/** The weight of the agent's executions that the local broker does not know yet. */
-export const unadmittedWeights = (records) => records.filter((r) => UNADMITTED_SUBPHASES.has(r.subphase)).map((r) => Number(r.claim?.header?.weight) || 0);
+const readLaneId = (remoteRoot, execId) => {
+  try {
+    return fs.readFileSync(path.join(path.resolve(remoteRoot), 'tickets', execId, 'remote-id'), 'utf8').trim() || null;
+  } catch {
+    return null;
+  }
+};
 
-/** The weight the local broker could still admit now: its capacity less the leases it holds (`used`), the tickets queued in it (clamped as its admission clamps them) and `pendingWeights`. */
+export const liveExecutions = (records, remoteRoot) => records.filter((r) => UNADMITTED_SUBPHASES.has(r.subphase))
+  .map((r) => ({ weight: Number(r.claim?.header?.weight) || 0, laneId: readLaneId(remoteRoot, r.execId) }));
+
+export const unadmittedWeights = (executions, knownLaneIds) => executions.filter((e) => e.laneId === null || !knownLaneIds.has(e.laneId)).map((e) => e.weight);
+
 export function freeWeightOf({ capacity, used, queued, pendingWeights, cfg }) {
+  const limit = queuedWeightLimit(cfg.maxLaneWeight, capacity);
   const queuedWeight = queued.filter(Boolean).reduce((sum, t) => sum + (Number(clampQueuedWeight(t, cfg, capacity).weight) || 0), 0);
-  return Math.max(0, capacity - used - queuedWeight - pendingWeights.reduce((sum, w) => sum + w, 0));
+  return Math.max(0, capacity - used - queuedWeight - pendingWeights.reduce((sum, w) => sum + Math.min(w, limit), 0));
 }
 
-/**
- * What a claim offers: free CPU, memory and weight now, and the totals the host could ever have (the queue reserves a host for an aged
- * ticket only if its totals fit it). Active mode measures free CPU and memory as `remote-probe` does and answers null (skip the tick)
- * when the measurement is missing. Free weight is the local broker's capacity less its held leases, its queued tickets and
- * `pendingWeights` (claims still being fetched), so a claim is made only for a ticket the broker can start now. Shadow mode has no
- * measurement to trust and offers the static budget, which is finite.
- */
-export async function claimFigures({ cfg = loadGlobalConfig(), host = detectResourceCapacity(), pendingWeights = [] } = {}) {
-  const totalWeight = effectiveWeightCapacity(cfg, host.cpuCores);
-  const totals = { totalCpu: cpuBudgetCores(host, cfg), totalMem: clampMem(host.memoryBytes - cfg.memoryReserveBytes), totalWeight };
-  if (cfg.schedulerMode !== 'active') return { freeCpu: totals.totalCpu, freeMem: totals.totalMem, freeWeight: totalWeight, ...totals };
+export async function claimFigures({ cfg = loadGlobalConfig(), host = detectResourceCapacity(), executions = [] } = {}) {
+  const capacity = effectiveWeightCapacity(cfg, host.cpuCores);
+  const totals = { totalCpu: cpuBudgetCores(host, cfg), totalMem: clampMem(host.memoryBytes - cfg.memoryReserveBytes), weightLimit: queuedWeightLimit(cfg.maxLaneWeight, capacity) };
+  if (cfg.schedulerMode !== 'active') return { freeCpu: totals.totalCpu, freeMem: totals.totalMem, freeWeight: capacity, ...totals };
   const status = await collectStatus({ lockTimeoutMs: PROBE_LOCK_WAIT_MS });
   const brokerRoot = ensureStateDirs().root;
-  const cpuHeadroom = await probeCpuHeadroom(brokerRoot, cfg, listLeases(brokerRoot).filter((l) => HELD_STATES.has(l.state)));
+  const leases = listLeases(brokerRoot);
+  const cpuHeadroom = await probeCpuHeadroom(brokerRoot, cfg, leases.filter((l) => HELD_STATES.has(l.state)));
   const headroom = probeHeadroom(status.resources, cfg, true, undefined, cpuHeadroom);
   if (!headroom || !Number.isFinite(headroom.cpuCores) || !Number.isFinite(headroom.memoryBytes)) return null;
-  const freeWeight = freeWeightOf({ capacity: status.capacity, used: status.used, queued: listQueue(brokerRoot), pendingWeights, cfg });
+  const queued = listQueue(brokerRoot);
+  const known = new Set([...leases, ...queued.filter(Boolean)].map((t) => t.id));
+  const freeWeight = freeWeightOf({ capacity: status.capacity, used: status.used, queued, pendingWeights: unadmittedWeights(executions, known), cfg });
   return { freeCpu: headroom.cpuCores, freeMem: clampMem(headroom.memoryBytes), freeWeight, ...totals };
 }
 
@@ -67,7 +74,7 @@ export async function claimFigures({ cfg = loadGlobalConfig(), host = detectReso
 export async function claimOnce({ core, remoteRoot, figures = claimFigures, block, now = Date.now }) {
   const reason = block();
   if (reason) return { status: 'skipped', reason };
-  const offered = await figures({ pendingWeights: unadmittedWeights(core.table.all()) });
+  const offered = await figures({ executions: liveExecutions(core.table.all(), remoteRoot) });
   if (!offered) return { status: 'skipped', reason: 'no-headroom' };
   const pending = readPendingClaim(remoteRoot);
   const req = pending?.req ?? randomUUID();
@@ -88,5 +95,6 @@ export async function claimOnce({ core, remoteRoot, figures = claimFigures, bloc
     },
   }, capacity);
   if (answer.skipped) return { status: 'skipped', reason: 'not-live' };
-  return execId ? { status: 'claimed', execId } : { status: answer.status };
+  const fallback = capacity !== undefined && core.ld.legacyQueue === true;
+  return { ...(execId ? { status: 'claimed', execId } : { status: answer.status }), ...(fallback ? { fallback: true } : {}) };
 }

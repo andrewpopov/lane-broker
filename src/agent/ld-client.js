@@ -42,10 +42,11 @@ export class LdClient {
   #listenClient = null;
   #tail = Promise.resolve();
   #closed = false;
+  #legacyQueue = false;
   #sleepers = new Set();
 
-  constructor({ pg: pgConfig, version, schedule = null, onWake, onCall, backoff = { minMs: 250, maxMs: 15_000 }, random = Math.random, connect = connectPg, closeTimeoutMs = 3000 }) {
-    Object.assign(this, { pgConfig, version, schedule, onWake, onCall, backoff, random, connect, closeTimeoutMs });
+  constructor({ pg: pgConfig, version, schedule = null, onWake, onCall, backoff = { minMs: 250, maxMs: 15_000 }, random = Math.random, connect = connectPg, closeTimeoutMs = 3000, log = () => {} }) {
+    Object.assign(this, { pgConfig, version, schedule, onWake, onCall, backoff, random, connect, closeTimeoutMs, log });
   }
 
   #sleep(ms) {
@@ -182,10 +183,21 @@ export class LdClient {
     return this.#run('ld_register', [this.version, PROTOCOL, this.schedule === null ? null : JSON.stringify(this.schedule)], { ...opts, persist: (answer) => { this.registered = answer; } });
   }
 
-  /** `capacity` (`{totalCpu, totalMem, freeWeight, totalWeight}`) is sent only when given: a call without it is the four-argument one an older queue also answers. */
-  claim(req, freeCpu, freeMem, heldKeys = [], opts, capacity) {
-    const trailing = capacity ? [capacity.totalCpu, String(capacity.totalMem), capacity.freeWeight, capacity.totalWeight] : [];
-    return this.#run('ld_claim', [req, freeCpu, String(freeMem), heldKeys, ...trailing], opts);
+  /** `capacity` (`{totalCpu, totalMem, freeWeight, weightLimit}`) goes after the held keys. A queue without migration 008 has no such function (42883): the call is repeated in its four-argument form, here and for every later claim. */
+  get legacyQueue() {
+    return this.#legacyQueue;
+  }
+
+  async claim(req, freeCpu, freeMem, heldKeys = [], opts, capacity) {
+    const trailing = capacity && !this.#legacyQueue ? [capacity.totalCpu, String(capacity.totalMem), capacity.freeWeight, capacity.weightLimit] : [];
+    try {
+      return await this.#run('ld_claim', [req, freeCpu, String(freeMem), heldKeys, ...trailing], opts);
+    } catch (err) {
+      if (trailing.length === 0 || err.code !== '42883') throw err;
+      this.#legacyQueue = true;
+      this.log('ld_claim: the queue predates migration 008; claiming without capacity figures (no weight check, no aged-head reservation)');
+      return this.claim(req, freeCpu, freeMem, heldKeys, opts);
+    }
   }
 
   start(id, epoch, token, opts) {

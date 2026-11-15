@@ -593,13 +593,9 @@ DROP FUNCTION IF EXISTS lane_dispatch.ld_reap(interval, interval, interval);
 -- BRAIN-1089 (migration 007) adds the trailing p_avoid_tags, which CREATE OR REPLACE cannot do.
 DROP FUNCTION IF EXISTS lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real);
 DROP FUNCTION IF EXISTS lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real);
--- BRAIN-1106 (migration 008) adds the trailing capacity and weight parameters to ld_claim. A four-argument call, an old agent's, still resolves to the new function through their defaults.
 DROP FUNCTION IF EXISTS lane_dispatch.ld_claim(uuid, real, bigint, text[]);
--- BRAIN-1108 (migration 009) drops the log stream, which nothing ever wrote.
-DROP FUNCTION IF EXISTS lane_dispatch.ld_log(uuid, int, uuid, int, bytea);
-DROP FUNCTION IF EXISTS lane_dispatch.ld_log_read(uuid, int, int);
-DROP FUNCTION IF EXISTS lane_dispatch.ld_log_ack(uuid, int, int);
-DROP FUNCTION IF EXISTS lane_dispatch.ld_prune_chunks(interval, int);
+DROP FUNCTION IF EXISTS lane_dispatch.ld_claim(uuid, real, bigint, text[], real, bigint, real, real);
+DROP FUNCTION IF EXISTS lane_dispatch.ticket_weight(jsonb, real);
 
 -- Every clock read in lane_dispatch goes through now(). The GUC lane.test_now moves it for tests, but only when the value is the one stored by ALTER DATABASE or
 -- ALTER ROLE (pg_db_role_setting): a session SET to anything else, which any login can issue, is ignored, so a runner cannot move the queue's clock.
@@ -872,18 +868,17 @@ BEGIN
   RETURN jsonb_build_object('host', v_me.host, 'max_claims', v_me.max_claims, 'protocol_min', lane_dispatch.protocol_min());
 END $$;
 
--- The weight the runner's own broker will charge a queued ticket, from the submitter's header: absent or not a number is 0, and it never exceeds the runner's total weight
--- (an oversized ticket is clamped there too, so it fits an empty runner).
-CREATE OR REPLACE FUNCTION lane_dispatch.ticket_weight(p_header jsonb, p_total_weight real) RETURNS numeric
+CREATE OR REPLACE FUNCTION lane_dispatch.ticket_weight(p_header jsonb, p_weight_limit real) RETURNS numeric
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 BEGIN
-  RETURN least(greatest(CASE WHEN jsonb_typeof(p_header->'weight') = 'number' THEN (p_header->>'weight')::numeric ELSE 0 END, 0), coalesce(p_total_weight::numeric, 'Infinity'::numeric));
+  RETURN least(greatest(CASE WHEN jsonb_typeof(p_header->'weight') = 'number' THEN (p_header->>'weight')::numeric ELSE 0 END, 0), coalesce(p_weight_limit::numeric, 'Infinity'::numeric));
 END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_claim(p_req uuid, p_free_cpu real, p_free_mem bigint, p_held_keys text[] DEFAULT '{}',
-                                                  p_total_cpu real DEFAULT NULL, p_total_mem bigint DEFAULT NULL, p_free_weight real DEFAULT NULL, p_total_weight real DEFAULT NULL) RETURNS jsonb
+                                                  p_total_cpu real DEFAULT NULL, p_total_mem bigint DEFAULT NULL, p_free_weight real DEFAULT NULL, p_weight_limit real DEFAULT NULL) RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
-DECLARE v_me record; v_out jsonb; v_now timestamptz; v_protocol int; v_held int; v_id uuid; v_epoch int; v_token uuid; v_avoid_grace interval; v_reserve_after interval; v_reserved uuid;
+DECLARE v_me record; v_out jsonb; v_now timestamptz; v_protocol int; v_held int; v_held_cpu numeric; v_held_mem numeric; v_id uuid; v_epoch int; v_token uuid;
+        v_avoid_grace interval; v_reserve_after interval; v_reserved uuid;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT p.host, p.tags, p.allowed_repos, p.max_claims INTO v_me FROM lane_dispatch.principals p WHERE p.login_role = session_user AND p.kind = 'agent' FOR UPDATE;
@@ -898,25 +893,29 @@ BEGIN
   END IF;
   v_now := lane_dispatch.now();
   SELECT make_interval(secs => c.avoid_grace_s), make_interval(secs => c.reserve_after_s) INTO v_avoid_grace, v_reserve_after FROM lane_dispatch.cluster c WHERE c.id = 1;
-  SELECT count(*) INTO v_held FROM lane_dispatch.tickets t WHERE t.host = v_me.host AND t.state IN ('claimed','running');
+  SELECT count(*), coalesce(sum(t.cpu_cores), 0), coalesce(sum(t.memory_bytes), 0) INTO v_held, v_held_cpu, v_held_mem
+    FROM lane_dispatch.tickets t WHERE t.host = v_me.host AND t.state IN ('claimed','running');
   IF v_held >= v_me.max_claims THEN RETURN jsonb_build_object('status', 'none'); END IF;
-  -- Aged-head reservation: the oldest ticket this agent may take and could ever fit, once it has waited reserve_after_s, is the only one it takes, so its own running work
-  -- drains toward fitting it. An agent with nothing held has nothing to drain (what keeps it from fitting is outside the queue), and an old client sends no totals, which fit nothing.
-  IF v_reserve_after > interval '0' AND v_held > 0 THEN
-    SELECT h.id INTO v_reserved FROM lane_dispatch.tickets h
-     WHERE h.state = 'queued' AND NOT h.cancel_requested AND h.min_protocol <= v_protocol AND h.not_before <= v_now
-       AND lane_dispatch.eligible(h.requires_tags, h.repo_key, v_me.tags, v_me.allowed_repos)
-       AND (NOT h.avoid_tags && v_me.tags OR v_now - h.created_at >= v_avoid_grace)
-       AND h.cpu_cores <= p_total_cpu AND h.memory_bytes <= p_total_mem AND NOT (h.lane_key = ANY (coalesce(p_held_keys, '{}')))
-       AND v_now - h.created_at >= v_reserve_after
-     ORDER BY h.created_at, h.id LIMIT 1;
+  -- Aged-head reservation: the top claimable ticket this agent could ever fit, once aged, is the only one it takes while it fits after the host's own held work drains.
+  IF v_reserve_after > interval '0' THEN
+    SELECT hd.id INTO v_reserved FROM (
+      SELECT h.id, h.cpu_cores, h.memory_bytes, CASE WHEN h.ages THEN v_now - h.created_at ELSE interval '0' END AS credited FROM lane_dispatch.tickets h
+       WHERE h.state = 'queued' AND NOT h.cancel_requested AND h.min_protocol <= v_protocol AND h.not_before <= v_now
+         AND lane_dispatch.eligible(h.requires_tags, h.repo_key, v_me.tags, v_me.allowed_repos)
+         AND (NOT h.avoid_tags && v_me.tags OR v_now - h.created_at >= v_avoid_grace)
+         AND h.cpu_cores <= p_total_cpu AND h.memory_bytes <= p_total_mem AND NOT (h.lane_key = ANY (coalesce(p_held_keys, '{}')))
+       ORDER BY lane_dispatch.eff_score(h.priority, h.ages, extract(epoch FROM v_now - h.created_at)) DESC,
+                CASE WHEN lane_dispatch.eff_score(h.priority, h.ages, extract(epoch FROM v_now - h.created_at)) >= 2.0
+                      AND extract(epoch FROM v_now - h.created_at) >= lane_dispatch.age_horizon_s() THEN h.created_at END NULLS LAST,
+                lane_dispatch.scarcity(h.requires_tags, h.repo_key), h.created_at, h.id LIMIT 1) hd
+     WHERE hd.credited >= v_reserve_after AND hd.cpu_cores <= p_free_cpu + v_held_cpu AND hd.memory_bytes <= p_free_mem + v_held_mem;
   END IF;
   SELECT t.id INTO v_id FROM lane_dispatch.tickets t
    WHERE t.state = 'queued' AND NOT t.cancel_requested AND t.min_protocol <= v_protocol AND t.not_before <= v_now
      AND lane_dispatch.eligible(t.requires_tags, t.repo_key, v_me.tags, v_me.allowed_repos)
      AND (NOT t.avoid_tags && v_me.tags OR v_now - t.created_at >= v_avoid_grace)
      AND t.cpu_cores <= p_free_cpu AND t.memory_bytes <= p_free_mem AND NOT (t.lane_key = ANY (coalesce(p_held_keys, '{}')))
-     AND lane_dispatch.ticket_weight(t.header, p_total_weight) <= coalesce(p_free_weight::numeric, 'Infinity'::numeric)
+     AND lane_dispatch.ticket_weight(t.header, p_weight_limit) <= coalesce(p_free_weight::numeric, 'Infinity'::numeric)
      AND (v_reserved IS NULL OR t.id = v_reserved)
    ORDER BY lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) DESC,
             CASE WHEN lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) >= 2.0
@@ -963,17 +962,21 @@ END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_finish(p_id uuid, p_epoch int, p_token uuid, p_result jsonb) RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
-DECLARE v_me record; v_t record; v_state text;
+DECLARE v_me record; v_t record; v_state text; v_dead boolean;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT * INTO v_me FROM lane_dispatch.me('agent');
   SELECT * INTO v_t FROM lane_dispatch.tickets t WHERE t.id = p_id FOR UPDATE;
   IF lane_dispatch.fence_ok(p_epoch, p_token, v_me.host, v_t.epoch, v_t.claim_token, v_t.host, v_t.state) THEN
-    -- The runner's own broker dequeued the run because its supervisor died before admitting it: nothing ran, so the ticket goes back to the queue (at most 3 times, then it finishes unfinished).
-    IF p_result->>'kind' = 'unfinished' AND p_result->>'reason' = 'supervisor-died-while-queued' AND p_result->>'neverStarted' = 'true' AND NOT v_t.cancel_requested AND v_t.requeues < 3 THEN
-      v_state := lane_dispatch.return_to_queue(p_id, lane_dispatch.now());
-      PERFORM pg_notify('ld_work', '');
-      RETURN jsonb_build_object('fenced', false, 'state', v_state);
+    -- Supervisor died before the broker admitted the run: nothing ran, so it requeues (at most 3 times), then finishes marked requeuesExhausted.
+    v_dead := coalesce(p_result->>'kind' = 'unfinished' AND p_result->>'reason' = 'supervisor-died-while-queued' AND p_result->>'neverStarted' = 'true', false);
+    IF v_dead AND NOT v_t.cancel_requested THEN
+      IF v_t.requeues < 3 THEN
+        v_state := lane_dispatch.return_to_queue(p_id, lane_dispatch.now());
+        PERFORM pg_notify('ld_work', '');
+        RETURN jsonb_build_object('fenced', false, 'state', v_state);
+      END IF;
+      p_result := p_result || jsonb_build_object('requeuesExhausted', true, 'requeues', v_t.requeues);
     END IF;
     v_state := CASE WHEN p_result->>'kind' = 'cancelled' THEN 'cancelled' ELSE 'finished' END;
     UPDATE lane_dispatch.tickets SET state = v_state, result = (p_result - 'author') || jsonb_build_object('epoch', p_epoch), finished_at = lane_dispatch.now() WHERE id = p_id;
@@ -1129,8 +1132,22 @@ BEGIN
     SELECT t.id FROM lane_dispatch.tickets t
      WHERE t.id = ANY (p_ids) AND t.state IN ('finished','cancelled','withdrawn','lost') AND t.finished_at < lane_dispatch.now() - p_rows_after
        ORDER BY t.id FOR UPDATE) t;
+  DELETE FROM lane_dispatch.log_chunks WHERE ticket = ANY (v_due);
   DELETE FROM lane_dispatch.claim_requests WHERE ticket = ANY (v_due);
   DELETE FROM lane_dispatch.tickets WHERE id = ANY (v_due);
+  GET DIAGNOSTICS v_deleted = ROW_COUNT;
+  RETURN v_deleted;
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_prune_chunks(p_terminal_after interval DEFAULT interval '1 hour', p_limit int DEFAULT 10000) RETURNS int
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_deleted int;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  DELETE FROM lane_dispatch.log_chunks WHERE ctid IN (
+    SELECT c.ctid FROM lane_dispatch.log_chunks c LEFT JOIN lane_dispatch.tickets t ON t.id = c.ticket
+     WHERE t.id IS NULL OR (t.state IN ('finished','cancelled','withdrawn','lost') AND t.finished_at < lane_dispatch.now() - p_terminal_after)
+     LIMIT least(greatest(coalesce(p_limit, 10000), 1), 100000));
   GET DIAGNOSTICS v_deleted = ROW_COUNT;
   RETURN v_deleted;
 END $$;
@@ -1146,6 +1163,53 @@ BEGIN
     SELECT 1 FROM lane_dispatch.tickets t, jsonb_array_elements(CASE WHEN jsonb_typeof(t.snapshot->'blobs') = 'array' THEN t.snapshot->'blobs' ELSE '[]'::jsonb END) b
      WHERE t.state NOT IN ('finished','cancelled','withdrawn','lost')
        AND b->>'sha256' = r->>'sha256' AND b->>'ns' = r->>'ns')), '[]'::jsonb);
+END $$;
+
+-- Live logs. Every call is idempotent on (ticket, epoch, seq): a call the guard killed is retried verbatim.
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_log(p_id uuid, p_epoch int, p_token uuid, p_seq int, p_bytes bytea) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record; v_t record; v_logged bigint; v_len int; v_inserted int;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('agent');
+  SELECT t.epoch, t.claim_token, t.host, t.state INTO v_t FROM lane_dispatch.tickets t WHERE t.id = p_id;
+  IF NOT lane_dispatch.fence_ok(p_epoch, p_token, v_me.host, v_t.epoch, v_t.claim_token, v_t.host, v_t.state) THEN RETURN 'fenced'; END IF;
+  v_len := octet_length(p_bytes);
+  IF v_len > 262144 THEN RETURN 'capped'; END IF;
+  SELECT a.log_bytes INTO v_logged FROM lane_dispatch.attempts a WHERE a.ticket = p_id AND a.epoch = p_epoch FOR UPDATE;
+  IF NOT FOUND THEN RETURN 'fenced'; END IF;
+  IF v_logged + v_len > 67108864 THEN RETURN 'capped'; END IF;
+  IF (SELECT coalesce(sum(octet_length(c.bytes)), 0) FROM lane_dispatch.log_chunks c) + v_len > 1073741824 THEN RETURN 'capped'; END IF;
+  INSERT INTO lane_dispatch.log_chunks (ticket, epoch, seq, bytes) VALUES (p_id, p_epoch, p_seq, p_bytes) ON CONFLICT (ticket, epoch, seq) DO NOTHING;
+  GET DIAGNOSTICS v_inserted = ROW_COUNT;
+  IF v_inserted = 1 THEN
+    UPDATE lane_dispatch.attempts SET log_bytes = log_bytes + v_len WHERE ticket = p_id AND epoch = p_epoch;
+  END IF;
+  RETURN 'ok';
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_log_read(p_id uuid, p_epoch int, p_after_seq int) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('submit');
+  IF NOT EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user) THEN RETURN NULL; END IF;
+  RETURN coalesce((SELECT jsonb_agg(jsonb_build_object('seq', m.seq, 'data', encode(m.bytes, 'base64')) ORDER BY m.seq)
+                     FROM (SELECT c.seq, c.bytes FROM lane_dispatch.log_chunks c
+                            WHERE c.ticket = p_id AND c.epoch = p_epoch AND c.seq > p_after_seq ORDER BY c.seq LIMIT 64) m), '[]'::jsonb);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_log_ack(p_id uuid, p_epoch int, p_upto_seq int) RETURNS int
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record; v_deleted int;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('submit');
+  DELETE FROM lane_dispatch.log_chunks c USING lane_dispatch.tickets t
+   WHERE t.id = p_id AND t.owner = session_user AND c.ticket = t.id AND c.epoch = p_epoch AND c.seq <= p_upto_seq;
+  GET DIAGNOSTICS v_deleted = ROW_COUNT;
+  RETURN v_deleted;
 END $$;
 
 -- The backend guard (design section 2 item 4). SECURITY INVOKER on purpose: it runs as the lane_admin login, whose cluster-level grants
@@ -1198,10 +1262,12 @@ REVOKE ALL ON SCHEMA lane_dispatch FROM PUBLIC;
 REVOKE ALL ON ALL TABLES IN SCHEMA lane_dispatch FROM PUBLIC, lane_agent, lane_submit, lane_admin, lane_reader;
 GRANT USAGE ON SCHEMA lane_dispatch TO lane_agent, lane_submit, lane_admin;
 GRANT EXECUTE ON FUNCTION lane_dispatch.ld_register(text, int, jsonb), lane_dispatch.ld_claim(uuid, real, bigint, text[], real, bigint, real, real), lane_dispatch.ld_start(uuid, int, uuid),
-  lane_dispatch.ld_heartbeat(uuid, int, uuid), lane_dispatch.ld_finish(uuid, int, uuid, jsonb), lane_dispatch.ld_release(uuid, int, uuid, text) TO lane_agent;
+  lane_dispatch.ld_heartbeat(uuid, int, uuid), lane_dispatch.ld_finish(uuid, int, uuid, jsonb), lane_dispatch.ld_release(uuid, int, uuid, text),
+  lane_dispatch.ld_log(uuid, int, uuid, int, bytea) TO lane_agent;
 GRANT EXECUTE ON FUNCTION lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[]), lane_dispatch.ld_get(uuid),
-  lane_dispatch.ld_list_mine(text[], int), lane_dispatch.ld_withdraw(uuid), lane_dispatch.ld_cancel(uuid), lane_dispatch.ld_attach_urls(uuid, int, jsonb), lane_dispatch.ld_queue_ref(),
+  lane_dispatch.ld_list_mine(text[], int), lane_dispatch.ld_withdraw(uuid), lane_dispatch.ld_cancel(uuid), lane_dispatch.ld_attach_urls(uuid, int, jsonb),
+  lane_dispatch.ld_log_read(uuid, int, int), lane_dispatch.ld_log_ack(uuid, int, int), lane_dispatch.ld_queue_ref(),
   lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[]), lane_dispatch.ld_placeable(text, text[]) TO lane_submit;
 GRANT EXECUTE ON FUNCTION lane_dispatch.ld_set_principal(text, text, text, text[], text[], int), lane_dispatch.ld_reap(interval, interval, interval),
   lane_dispatch.ld_restore_reset(), lane_dispatch.ld_guard(interval), lane_dispatch.ld_prune_candidates(interval, interval, timestamptz, uuid, int),
-  lane_dispatch.ld_prune(uuid[], interval), lane_dispatch.ld_blobs_live(jsonb) TO lane_admin;
+  lane_dispatch.ld_prune(uuid[], interval), lane_dispatch.ld_prune_chunks(interval, int), lane_dispatch.ld_blobs_live(jsonb) TO lane_admin;
