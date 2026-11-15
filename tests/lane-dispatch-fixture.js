@@ -1,3 +1,4 @@
+import fs from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { applyDatabaseAcls } from '../src/lane-db.js';
 import { PgCluster, roleNames, gid } from './lane-db-harness.js';
@@ -71,8 +72,8 @@ export async function call(client, name, ...args) {
 
 export const tid = gid;
 
-export const enqueue = (client, id, { repo = 'repoA', laneKey = `lk-${id}`, tags = [], cpu = 1, mem = 1000, priority = 0, minProtocol = 1, ages = true, source = null, estRunS = null } = {}) =>
-  call(client, 'ld_enqueue', id, repo, 'test', laneKey, { protocol: 1 }, { cmd: ['true'] }, { key: 'snap', sha256: 'x' }, tags, cpu, mem, priority, minProtocol, ages, source, estRunS);
+export const enqueue = (client, id, { repo = 'repoA', laneKey = `lk-${id}`, tags = [], cpu = 1, mem = 1000, priority = 0, minProtocol = 1, ages = true, source = null, estRunS = null, avoidTags = [] } = {}) =>
+  call(client, 'ld_enqueue', id, repo, 'test', laneKey, { protocol: 1 }, { cmd: ['true'] }, { key: 'snap', sha256: 'x' }, tags, cpu, mem, priority, minProtocol, ages, source, estRunS, avoidTags);
 
 export const claim = (client, { req = randomUUID(), cpu = 8, mem = 1e9, held = [] } = {}) => call(client, 'ld_claim', req, cpu, mem, held);
 
@@ -95,6 +96,17 @@ export async function setNow(world, iso) {
     world.cluster.clients.delete(client);
     world.connections.delete(login);
   }
+}
+
+/** Puts the world's queue back to schema version 6 (the 2fcebb0 functions.sql, a copy of the last release's): no 007 columns, none of the 007 function signatures. */
+export async function downgradeToV6(world) {
+  const su = await world.su();
+  await su.query('ALTER TABLE lane_dispatch.tickets DROP COLUMN avoid_tags');
+  await su.query('ALTER TABLE lane_dispatch.cluster DROP COLUMN avoid_grace_s');
+  await su.query('DELETE FROM lane.schema_version WHERE version = 7');
+  await su.query(fs.readFileSync(new URL('./fixtures/lane-v6-functions.sql', import.meta.url), 'utf8'));
+  await su.query('DROP FUNCTION lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[])');
+  await su.query('DROP FUNCTION lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[])');
 }
 
 /** A restore, as far as the queue can tell: the recorded timeline no longer matches the cluster's. */

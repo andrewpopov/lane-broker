@@ -287,6 +287,55 @@ const GUARDS = {
     await call(s1, 'ld_enqueue_fenced', ref, tid(4), 'repoA', 'test', 'lk4', { protocol: 1 }, { cmd: ['true'] }, { key: 'snap', sha256: 'x' }, [], 1, 1000, 0);
     assert.deepEqual(fields(await w.ticket(tid(4))), [1, true, null, null, null, null], 'the 12-argument call still resolves');
   },
+
+  'a ticket stores its avoid_tags from ld_enqueue and ld_enqueue_fenced, and an old call without them avoids nothing': async (w) => {
+    const s1 = await w.as(logins.s1);
+    await enqueue(s1, tid(1), { avoidTags: ['slow'] });
+    await enqueue(s1, tid(2));
+    const ref = await call(s1, 'ld_queue_ref');
+    const fenced = (id, ...rest) => call(s1, 'ld_enqueue_fenced', ref, id, 'repoA', 'test', `lk${id}`, { protocol: 1 }, { cmd: ['true'] }, { key: 'snap', sha256: 'x' }, [], 1, 1000, ...rest);
+    await fenced(tid(3), 0, 1, true, null, null, ['slow', 'gpu']);
+    await fenced(tid(4), 0);
+    await fenced(tid(5), 0, 1, true, null, null, null);
+    assert.deepEqual(await Promise.all([1, 2, 3, 4, 5].map(async (n) => (await w.ticket(tid(n))).avoid_tags)), [['slow'], [], ['slow', 'gpu'], [], []]);
+  },
+
+  'a runner whose tags overlap a ticket avoid_tags gets none until the ticket has waited the grace period, then claims it': async (w) => {
+    await setNow(w, at(0));
+    await enqueue(await w.as(logins.s1), tid(1), { avoidTags: ['fast'] });
+    await setNow(w, at(119_000));
+    assert.deepEqual(await claim(await w.as(logins.a1)), { status: 'none' });
+    await setNow(w, at(120_000));
+    assert.equal((await claim(await w.as(logins.a1))).id, tid(1));
+  },
+
+  'the grace period is the cluster avoid_grace_s': async (w) => {
+    await (await w.su()).query('UPDATE lane_dispatch.cluster SET avoid_grace_s = 10');
+    await setNow(w, at(0));
+    await enqueue(await w.as(logins.s1), tid(1), { avoidTags: ['fast'] });
+    await setNow(w, at(9_000));
+    assert.deepEqual(await claim(await w.as(logins.a1)), { status: 'none' });
+    await setNow(w, at(10_000));
+    assert.equal((await claim(await w.as(logins.a1))).id, tid(1));
+  },
+
+  'a runner without an avoided tag claims at once even when the avoided runner asked first, and the avoided runner still takes other tickets': async (w) => {
+    await setNow(w, at(0));
+    const s1 = await w.as(logins.s1);
+    await enqueue(s1, tid(1), { avoidTags: ['fast'] });
+    await enqueue(s1, tid(2), { priority: 0 });
+    const [a1, a2] = [await w.as(logins.a1), await w.as(logins.a2)];
+    assert.equal((await claim(a1)).id, tid(2), 'a1 skips the ticket it avoids and takes the other');
+    assert.deepEqual(await claim(a1), { status: 'none' });
+    assert.equal((await claim(a2)).id, tid(1), 'a2 does not overlap the avoided tags and claims at once');
+  },
+
+  'ld_placeable counts a runner the lane avoids, since it can take the ticket after the grace period': async (w) => {
+    await setNow(w, at(0));
+    const s1 = await w.as(logins.s1);
+    await enqueue(s1, tid(1), { tags: ['fast'], avoidTags: ['fast'] });
+    assert.equal(await call(s1, 'ld_placeable', 'repoA', ['fast']), 1);
+  },
 };
 
 const MIGRATION_NOT_BEFORE = "ADD COLUMN not_before timestamptz NOT NULL DEFAULT '-infinity'";
@@ -338,9 +387,17 @@ const CANARIES = [
   ['amnesty fires when the gap between reaper ticks passes 60 s, not at 5 s', '> p_amnesty_after;', "> interval '1 hour';"],
   ['a session SET of lane.test_now never moves the queue clock', "AND 'lane.test_now=' || v_set = ANY (s.setconfig)", 'AND true'],
   ['ld_enqueue and ld_enqueue_fenced store min_protocol, ages, source and est_run_s, and default them for the old call shape',
-    '                                  p_min_protocol, p_ages, p_source, p_est_run_s);', '                                  1, true, NULL, NULL);'],
+    '                                  p_min_protocol, p_ages, p_source, p_est_run_s, p_avoid_tags);', '                                  1, true, NULL, NULL, p_avoid_tags);'],
   ['ld_enqueue and ld_enqueue_fenced store min_protocol, ages, source and est_run_s, and default them for the old call shape',
     'coalesce(p_min_protocol, 1), coalesce(p_ages, true), p_source, p_est_run_s,', '1, true, NULL, NULL,'],
+  ['a runner whose tags overlap a ticket avoid_tags gets none until the ticket has waited the grace period, then claims it', 'NOT t.avoid_tags && v_me.tags OR', 'true OR'],
+  ['a runner whose tags overlap a ticket avoid_tags gets none until the ticket has waited the grace period, then claims it', 'v_now - t.created_at >= v_avoid_grace', 'v_now - t.created_at >= interval \'0 seconds\''],
+  ['a runner whose tags overlap a ticket avoid_tags gets none until the ticket has waited the grace period, then claims it', 'v_now - t.created_at >= v_avoid_grace', 'v_now - t.created_at > v_avoid_grace + interval \'1 hour\''],
+  ['the grace period is the cluster avoid_grace_s', 'make_interval(secs => c.avoid_grace_s)', "interval '120 seconds'"],
+  ['a runner without an avoided tag claims at once even when the avoided runner asked first, and the avoided runner still takes other tickets', 'NOT t.avoid_tags && v_me.tags OR', 'NOT t.avoid_tags && \'{}\'::text[] OR'],
+  ['a runner without an avoided tag claims at once even when the avoided runner asked first, and the avoided runner still takes other tickets', 'NOT t.avoid_tags && v_me.tags OR', 'false OR'],
+  ['a ticket stores its avoid_tags from ld_enqueue and ld_enqueue_fenced, and an old call without them avoids nothing', "coalesce(p_avoid_tags, '{}'), lane_dispatch.now())", "'{}', lane_dispatch.now())"],
+  ['a ticket stores its avoid_tags from ld_enqueue and ld_enqueue_fenced, and an old call without them avoids nothing', 'p_est_run_s, p_avoid_tags);', 'p_est_run_s);'],
 ];
 
 describe('lane_dispatch pull dispatch queue SQL (rev 6) on a disposable Postgres', { skip: pgSkipOption, timeout: 900000 }, () => {

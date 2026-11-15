@@ -240,9 +240,16 @@ describe('enqueue intent without a database', () => {
   test('the arguments come from the envelope alone', async () => {
     const { state } = await preparedTicket();
     const args = enqueueArgs(readEnvelope(state, ID));
-    assert.deepEqual(Object.keys(args).sort(), ['binding', 'cpuCores', 'header', 'id', 'lane', 'laneKey', 'memoryBytes', 'priority', 'repoKey', 'requiresTags', 'snapshot']);
+    assert.deepEqual(Object.keys(args).sort(), ['avoidTags', 'binding', 'cpuCores', 'header', 'id', 'lane', 'laneKey', 'memoryBytes', 'priority', 'repoKey', 'requiresTags', 'snapshot']);
     assert.equal(args.id, ID);
     assert.deepEqual(args.snapshot, SNAPSHOT);
+  });
+
+  test('the lane avoidTags in the envelope are enqueued, and an envelope written before they existed avoids nothing', async () => {
+    const { state } = await preparedTicket();
+    const envelope = readEnvelope(state, ID);
+    assert.deepEqual(enqueueArgs({ ...envelope, avoidTags: ['slow'] }).avoidTags, ['slow']);
+    assert.deepEqual(enqueueArgs(envelope).avoidTags, []);
   });
 });
 

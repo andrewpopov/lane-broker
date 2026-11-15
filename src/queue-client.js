@@ -13,10 +13,10 @@ const BACKOFF_CAP_MS = 2_000;
 const TOO_MANY_CONNECTIONS = '53300';
 // a 53300 happens before anything is sent, so every call retries it; a guard kill may follow a commit, so only idempotent calls retry that
 
-// SQL parameter types in order; `idempotent` says whether a call that may already have committed can be sent again
+// SQL parameter types in order (a call sends as many as it has arguments, so a call that names none of the trailing defaults runs against an older schema); `idempotent` says whether a call that may already have committed can be sent again
 const FUNCTIONS = {
   ld_queue_ref: { types: [], idempotent: true },
-  ld_enqueue_fenced: { types: ['text', 'uuid', 'text', 'text', 'text', 'jsonb', 'jsonb', 'jsonb', 'text[]', 'real', 'bigint', 'int', 'int'], idempotent: false },
+  ld_enqueue_fenced: { types: ['text', 'uuid', 'text', 'text', 'text', 'jsonb', 'jsonb', 'jsonb', 'text[]', 'real', 'bigint', 'int', 'int', 'boolean', 'text', 'real', 'text[]'], idempotent: false },
   ld_get: { types: ['uuid'], idempotent: true },
   ld_list_mine: { types: ['text[]', 'int'], idempotent: true },
   ld_withdraw: { types: ['uuid'], idempotent: false },
@@ -78,7 +78,8 @@ export function createQueueClient({
   if (problem !== null) throw new QueueError(`laneQueueUrl ${problem}`);
 
   async function invoke(name, args, { attempts = MAX_ATTEMPTS, ...timeouts } = {}) {
-    const { types, idempotent } = FUNCTIONS[name];
+    const { idempotent } = FUNCTIONS[name];
+    const types = FUNCTIONS[name].types.slice(0, args.length);
     const sql = `SELECT lane_dispatch.${name}(${types.map((type, i) => `$${i + 1}::${type}`).join(', ')}) AS v`;
     const values = args.map((value, i) => (types[i] === 'jsonb' ? JSON.stringify(value) : value));
     for (let attempt = 1; ; attempt++) {
@@ -105,8 +106,12 @@ export function createQueueClient({
   return {
         queueRef: (options) => invoke('ld_queue_ref', [], options),
 
-        enqueueFenced: ({ expectRef, id, repoKey, lane, laneKey, binding, header, snapshot, requiresTags, cpuCores, memoryBytes, priority = 0, minProtocol = 1 }) =>
-      invoke('ld_enqueue_fenced', [expectRef, id, repoKey, lane, laneKey, binding, header, snapshot, requiresTags, cpuCores, memoryBytes, priority, minProtocol]),
+        enqueueFenced: ({ expectRef, id, repoKey, lane, laneKey, binding, header, snapshot, requiresTags, avoidTags = [], cpuCores, memoryBytes, priority = 0, minProtocol = 1 }) =>
+      invoke('ld_enqueue_fenced', [
+        expectRef, id, repoKey, lane, laneKey, binding, header, snapshot, requiresTags, cpuCores, memoryBytes, priority, minProtocol,
+        // only a lane that sets avoidTags needs the 17-parameter function, so every other enqueue still works against a queue not yet migrated to 007
+        ...(avoidTags.length > 0 ? [true, null, null, avoidTags] : []),
+      ]),
 
         get: (id) => invoke('ld_get', [id]),
 
