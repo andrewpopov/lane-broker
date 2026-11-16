@@ -593,6 +593,10 @@ DROP FUNCTION IF EXISTS lane_dispatch.ld_reap(interval, interval, interval);
 -- BRAIN-1089 (migration 007) adds the trailing p_avoid_tags, which CREATE OR REPLACE cannot do.
 DROP FUNCTION IF EXISTS lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real);
 DROP FUNCTION IF EXISTS lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real);
+-- BRAIN-1135 (migration 008) adds the trailing p_requires to both enqueues and p_has_tools to ld_claim.
+DROP FUNCTION IF EXISTS lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[]);
+DROP FUNCTION IF EXISTS lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[]);
+DROP FUNCTION IF EXISTS lane_dispatch.ld_claim(uuid, real, bigint, text[]);
 
 -- Every clock read in lane_dispatch goes through now(). The GUC lane.test_now moves it for tests, but only when the value is the one stored by ALTER DATABASE or
 -- ALTER ROLE (pg_db_role_setting): a session SET to anything else, which any login can issue, is ignored, so a runner cannot move the queue's clock.
@@ -737,7 +741,7 @@ BEGIN
   RETURN (SELECT jsonb_build_object('status', 'claimed', 'id', t.id, 'epoch', p_epoch, 'token', p_token,
                                     'execution_id', t.id::text || '.e' || p_epoch::text, 'repo_key', t.repo_key, 'lane', t.lane,
                                     'lane_key', t.lane_key, 'binding', t.binding, 'header', t.header, 'snapshot', t.snapshot,
-                                    'lease_until', t.lease_until)
+                                    'requires', t.requires, 'lease_until', t.lease_until)
             FROM lane_dispatch.tickets t WHERE t.id = p_id);
 END $$;
 
@@ -765,17 +769,18 @@ END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_enqueue(p_id uuid, p_repo_key text, p_lane text, p_lane_key text, p_binding jsonb, p_header jsonb, p_snapshot jsonb,
                                                     p_requires_tags text[], p_cpu_cores real, p_memory_bytes bigint, p_priority int DEFAULT 0, p_min_protocol int DEFAULT 1,
-                                                    p_ages boolean DEFAULT true, p_source text DEFAULT NULL, p_est_run_s real DEFAULT NULL, p_avoid_tags text[] DEFAULT '{}')
+                                                    p_ages boolean DEFAULT true, p_source text DEFAULT NULL, p_est_run_s real DEFAULT NULL, p_avoid_tags text[] DEFAULT '{}',
+                                                    p_requires text[] DEFAULT '{}')
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 DECLARE v_me record;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT * INTO v_me FROM lane_dispatch.me('submit');
   INSERT INTO lane_dispatch.tickets (id, owner, repo_key, lane, lane_key, binding, header, snapshot, requires_tags, cpu_cores, memory_bytes, priority, incarnation,
-                                     min_protocol, ages, source, est_run_s, avoid_tags, created_at)
+                                     min_protocol, ages, source, est_run_s, avoid_tags, requires, created_at)
     VALUES (p_id, session_user, p_repo_key, p_lane, p_lane_key, p_binding, p_header, p_snapshot, coalesce(p_requires_tags, '{}'), p_cpu_cores, p_memory_bytes,
             coalesce(p_priority, 0), (SELECT c.incarnation FROM lane_dispatch.cluster c), coalesce(p_min_protocol, 1), coalesce(p_ages, true), p_source, p_est_run_s,
-            coalesce(p_avoid_tags, '{}'), lane_dispatch.now())
+            coalesce(p_avoid_tags, '{}'), coalesce(p_requires, '{}'), lane_dispatch.now())
     ON CONFLICT (id) DO NOTHING;
   IF FOUND THEN PERFORM pg_notify('ld_work', ''); END IF;
   IF NOT EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user) THEN
@@ -865,7 +870,8 @@ BEGIN
   RETURN jsonb_build_object('host', v_me.host, 'max_claims', v_me.max_claims, 'protocol_min', lane_dispatch.protocol_min());
 END $$;
 
-CREATE OR REPLACE FUNCTION lane_dispatch.ld_claim(p_req uuid, p_free_cpu real, p_free_mem bigint, p_held_keys text[] DEFAULT '{}') RETURNS jsonb
+-- p_has_tools: the ld_needed_tools names on the agent's PATH; a 4-argument claim (an agent older than BRAIN-1135) never takes a ticket that requires a tool.
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_claim(p_req uuid, p_free_cpu real, p_free_mem bigint, p_held_keys text[] DEFAULT '{}', p_has_tools text[] DEFAULT '{}') RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 DECLARE v_me record; v_out jsonb; v_now timestamptz; v_protocol int; v_held int; v_id uuid; v_epoch int; v_token uuid; v_avoid_grace interval;
 BEGIN
@@ -889,6 +895,7 @@ BEGIN
      AND lane_dispatch.eligible(t.requires_tags, t.repo_key, v_me.tags, v_me.allowed_repos)
      AND (NOT t.avoid_tags && v_me.tags OR v_now - t.created_at >= v_avoid_grace)
      AND t.cpu_cores <= p_free_cpu AND t.memory_bytes <= p_free_mem AND NOT (t.lane_key = ANY (coalesce(p_held_keys, '{}')))
+     AND t.requires <@ coalesce(p_has_tools, '{}')
    ORDER BY lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) DESC,
             CASE WHEN lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) >= 2.0
                   AND extract(epoch FROM v_now - t.created_at) >= lane_dispatch.age_horizon_s() THEN t.created_at END NULLS LAST,
@@ -900,6 +907,16 @@ BEGIN
   INSERT INTO lane_dispatch.attempts (ticket, epoch, host, claim_token) VALUES (v_id, v_epoch, v_me.host, v_token);
   INSERT INTO lane_dispatch.claim_requests (login_role, req, ticket, epoch, claim_token) VALUES (session_user, p_req, v_id, v_epoch, v_token);
   RETURN lane_dispatch.claim_view(v_id, v_epoch, v_token);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_needed_tools() RETURNS text[]
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('agent');
+  RETURN (SELECT coalesce(array_agg(DISTINCT r.name ORDER BY r.name), '{}') FROM lane_dispatch.tickets t, unnest(t.requires) AS r(name)
+           WHERE t.state = 'queued' AND lane_dispatch.eligible(t.requires_tags, t.repo_key, v_me.tags, v_me.allowed_repos));
 END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_start(p_id uuid, p_epoch int, p_token uuid) RETURNS boolean
@@ -1033,7 +1050,8 @@ END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_enqueue_fenced(p_expect_ref text, p_id uuid, p_repo_key text, p_lane text, p_lane_key text, p_binding jsonb,
                                                            p_header jsonb, p_snapshot jsonb, p_requires_tags text[], p_cpu_cores real, p_memory_bytes bigint, p_priority int DEFAULT 0, p_min_protocol int DEFAULT 1,
-                                                           p_ages boolean DEFAULT true, p_source text DEFAULT NULL, p_est_run_s real DEFAULT NULL, p_avoid_tags text[] DEFAULT '{}')
+                                                           p_ages boolean DEFAULT true, p_source text DEFAULT NULL, p_est_run_s real DEFAULT NULL, p_avoid_tags text[] DEFAULT '{}',
+                                                           p_requires text[] DEFAULT '{}')
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 DECLARE v_me record; v_ref text;
 BEGIN
@@ -1047,7 +1065,7 @@ BEGIN
     RETURN jsonb_build_object('state', 'stale-queue-ref', 'queue_ref', v_ref);
   END IF;
   RETURN lane_dispatch.ld_enqueue(p_id, p_repo_key, p_lane, p_lane_key, p_binding, p_header, p_snapshot, p_requires_tags, p_cpu_cores, p_memory_bytes, p_priority,
-                                  p_min_protocol, p_ages, p_source, p_est_run_s, p_avoid_tags);
+                                  p_min_protocol, p_ages, p_source, p_est_run_s, p_avoid_tags, p_requires);
 END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_placeable(p_repo_key text, p_requires_tags text[]) RETURNS int
@@ -1223,13 +1241,13 @@ GRANT EXECUTE ON FUNCTION lane.record_eta(uuid, real, boolean, timestamptz) TO l
 REVOKE ALL ON SCHEMA lane_dispatch FROM PUBLIC;
 REVOKE ALL ON ALL TABLES IN SCHEMA lane_dispatch FROM PUBLIC, lane_agent, lane_submit, lane_admin, lane_reader;
 GRANT USAGE ON SCHEMA lane_dispatch TO lane_agent, lane_submit, lane_admin;
-GRANT EXECUTE ON FUNCTION lane_dispatch.ld_register(text, int, jsonb), lane_dispatch.ld_claim(uuid, real, bigint, text[]), lane_dispatch.ld_start(uuid, int, uuid),
+GRANT EXECUTE ON FUNCTION lane_dispatch.ld_register(text, int, jsonb), lane_dispatch.ld_claim(uuid, real, bigint, text[], text[]), lane_dispatch.ld_needed_tools(), lane_dispatch.ld_start(uuid, int, uuid),
   lane_dispatch.ld_heartbeat(uuid, int, uuid), lane_dispatch.ld_finish(uuid, int, uuid, jsonb), lane_dispatch.ld_release(uuid, int, uuid, text),
   lane_dispatch.ld_log(uuid, int, uuid, int, bytea) TO lane_agent;
-GRANT EXECUTE ON FUNCTION lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[]), lane_dispatch.ld_get(uuid),
+GRANT EXECUTE ON FUNCTION lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[]), lane_dispatch.ld_get(uuid),
   lane_dispatch.ld_list_mine(text[], int), lane_dispatch.ld_withdraw(uuid), lane_dispatch.ld_cancel(uuid), lane_dispatch.ld_attach_urls(uuid, int, jsonb),
   lane_dispatch.ld_log_read(uuid, int, int), lane_dispatch.ld_log_ack(uuid, int, int), lane_dispatch.ld_queue_ref(),
-  lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[]), lane_dispatch.ld_placeable(text, text[]) TO lane_submit;
+  lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[]), lane_dispatch.ld_placeable(text, text[]) TO lane_submit;
 GRANT EXECUTE ON FUNCTION lane_dispatch.ld_set_principal(text, text, text, text[], text[], int), lane_dispatch.ld_reap(interval, interval, interval),
   lane_dispatch.ld_restore_reset(), lane_dispatch.ld_guard(interval), lane_dispatch.ld_prune_candidates(interval, interval, timestamptz, uuid, int),
   lane_dispatch.ld_prune(uuid[], interval), lane_dispatch.ld_prune_chunks(interval, int), lane_dispatch.ld_blobs_live(jsonb) TO lane_admin;

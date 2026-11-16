@@ -106,6 +106,15 @@ const SCENARIOS = {
     assert.deepEqual(rows.map((r) => r.avoid_tags), [['slow'], []]);
   },
 
+  'enqueueFenced carries the lane requires to the row, and a caller that names none requires nothing (BRAIN-1135)': async (w, t, createClient) => {
+    const { queue } = harnessClient(t, w, { createClient });
+    const ref = await queue.queueRef();
+    await queue.enqueueFenced({ ...enqueueArgs(tid(6), ref), requires: ['ffmpeg'] });
+    await queue.enqueueFenced({ ...enqueueArgs(tid(7), ref), avoidTags: ['slow'] });
+    const rows = (await (await w.su()).query('SELECT id, requires, avoid_tags FROM lane_dispatch.tickets WHERE id = ANY($1::uuid[]) ORDER BY id', [[tid(6), tid(7)]])).rows;
+    assert.deepEqual(rows.map((r) => [r.requires, r.avoid_tags]), [[['ffmpeg'], []], [[], ['slow']]]);
+  },
+
   'the v0.104 13-parameter typed call of ld_enqueue_fenced still resolves, and stores no avoided tags': async (w) => {
     const s1 = await w.as(logins.s1);
     const ref = await call(s1, 'ld_queue_ref');
@@ -163,7 +172,8 @@ const SCENARIOS = {
 
 const CANARIES = [
   ['enqueueFenced carries min_protocol to the row, and a caller that names none gets protocol 1', ['priority, minProtocol,', 'priority, 1,']],
-  ['a queue still at schema version 6 accepts an enqueue from this client that sets no avoidTags, and refuses one that does with the missing function', ['...(avoidTags.length > 0 ? [true, null, null, avoidTags] : []),', 'true, null, null, avoidTags,']],
+  ['a queue still at schema version 6 accepts an enqueue from this client that sets no avoidTags, and refuses one that does with the missing function', ['...(avoidTags.length > 0 || requires.length > 0 ? [true, null, null, avoidTags] : []),', 'true, null, null, avoidTags,']],
+  ['enqueueFenced carries the lane requires to the row, and a caller that names none requires nothing (BRAIN-1135)', ['...(requires.length > 0 ? [requires] : []),', '']],
   ['enqueueFenced carries the lane avoid_tags to the row, and a caller that names none avoids nothing', ['[true, null, null, avoidTags] : []', '[true, null, null, []] : []']],
 ];
 

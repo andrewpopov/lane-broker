@@ -1296,6 +1296,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
           cpuCores: enriched.remote.cpuCores,
           memoryBytes: enriched.remote.memoryBytes ?? 0,
           requiresTags: enriched.remote.requiresTags ?? [],
+          requires: enriched.remote.requires ?? [],
           avoidTags: enriched.remote.avoidTags ?? [],
           priority: pullQueuePriority(enriched.priorityRequested),
           queuedTimeoutMs: pullQueuedTimeoutMs(globalCfg, enriched.lane),

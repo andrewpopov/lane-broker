@@ -80,7 +80,7 @@ export class RunnerWorld {
     return { endpoint: this.s3.endpoint, region: STUB_REGION, snapBucket: 'lane-snap', outBucket: 'lane-out', creds: STUB_CREDS };
   }
 
-  async submit({ code = 'process.exit(0)', files = [{ path: 'a.txt', bytes: Buffer.from('x') }], headerOverrides = {}, repo = 'repoA' } = {}) {
+  async submit({ code = 'process.exit(0)', files = [{ path: 'a.txt', bytes: Buffer.from('x') }], headerOverrides = {}, repo = 'repoA', requires = [] } = {}) {
     const id = randomUUID();
     const { header, gz, blobs, binding } = await buildSnapshot({ id, code, files, headerOverrides });
     const streamKey = `streams/${id}-${binding.generation}-${sha256Of(gz)}.gz`;
@@ -88,7 +88,7 @@ export class RunnerWorld {
     for (const blob of blobs) this.s3.objects.set(`lane-snap/blobs/${blob.ns}/${blob.sha256}`, { body: blob.bytes, lastModified: Date.now() });
     const { manifest: _manifest, ...rowHeader } = header;
     const snapshot = { key: streamKey, sha256: sha256Of(gz), bytes: gz.length, blobs: blobs.map(({ ns, sha256, size }) => ({ ns, sha256, size })) };
-    await call(await this.w.as(logins.s1), 'ld_enqueue', id, repo, 'default', `lk-${id}`, binding, rowHeader, snapshot, [], 1, 1000, 0);
+    await call(await this.w.as(logins.s1), 'ld_enqueue', id, repo, 'default', `lk-${id}`, binding, rowHeader, snapshot, [], 1, 1000, 0, ...(requires.length > 0 ? [1, true, null, null, [], requires] : []));
     return { id, header, gz, blobs, binding, snapshot, streamKey };
   }
 
