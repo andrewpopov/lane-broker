@@ -528,15 +528,22 @@ edits `config.json`. It writes an overlay file next to it.
 | `config.d/50-bosun.json` | bosun |
 | `config.d/90-*.json` | humans, for overrides that must beat bosun |
 
-**Precedence.** A later file wins, per top-level key. Nested objects (`deviceGates`, `priorityNice`, `runners`, ...) are replaced
-whole, never deep-merged: an overlay that sets `deviceGates` must carry every gate it wants. (The built-in defaults for
-`priorityWeights` and `lanePull` still fill in the parts the winning file omits, as they do for `config.json`.) Validation runs
-on the merged result, so a value is only wrong if the config that results is wrong. A failure names the overlay file that set a key
-the message mentions, as `(overlay config.d/50-bosun.json)`; an unparseable overlay names its path. Under a supervisor or agent a bad edit keeps the last good config, as it
-does for `config.json`.
+**What an overlay may set.** Only the live-reload keys listed below. An overlay with any other top-level key (`runners`,
+`lanePull`, `laneQueueUrl`, `classes`, `localWindow`, credential paths, ...) is set aside whole, so those stay in the
+human-owned `config.json`.
 
-**`_` keys.** Any key that starts with `_` is ignored at every level, in `config.json` and in overlays. Use them for notes and
-for provenance such as `"_writtenBy": "bosun"`.
+**Precedence.** A later file wins, per top-level key. Nested objects (`deviceGates`, `priorityNice`) are replaced whole, never
+deep-merged: an overlay that sets `deviceGates` must carry every gate it wants. Validation runs on the merged result.
+
+**A bad overlay is contained.** An overlay that is unparseable, not an object, sets a key outside the list, or makes the merged
+config invalid is dropped, and the config loads without it. The cost is that overlay's tuning, never the rest of the config and never a fall back to
+defaults. The failure is recorded as `config: WARNING` in `lane status` (written by the supervisors) and logged once by the
+agent, and `lane config effective` prints it as `WARNING:` (`warnings` in `--json`). The warning starts with the overlay's path. A fault in
+`config.json` itself is not contained: supervisors and the agent keep their last good config, as they always have, and a fresh
+process with no earlier config falls back to defaults.
+
+**`_` keys.** A top-level key that starts with `_` is ignored in every config file. Use it for notes and for provenance such as
+`"_writtenBy": "bosun"`. Nested keys are data, so a lane named `_lint` keeps its entry in `lanePull.queuedTimeoutMsByLane`.
 
 **`lane config effective [--json]`** prints the merged config and, for each top-level key, the file that set it: `config.json`,
 `config.d/<name>` or `default`. `--json` prints `{home, files, config, sources, liveReload}`. It reads the files and changes none
@@ -544,13 +551,13 @@ of them.
 
 **Live reload.** Overlays are re-read wherever `config.json` is, so every live-reload key below takes effect without restarting
 the agent or any supervisor: the supervisor's poll loop re-reads the config every `sampleMs`, and the agent re-reads it on every
-claim and device-gate sample. The list is the exported `LIVE_RELOAD_KEYS` and appears as `liveReload` in `lane config effective --json`:
+claim and device-gate sample, keeping its last good config if the file cannot be read. The list is the exported `LIVE_RELOAD_KEYS` and appears as `liveReload` in `lane config effective --json`:
 
 `capacity`, `cpuAdmissionPercent`, `cpuReserveCores`, `memoryReserveBytes`, `schedulerMode`, `sampleMs`, `laneNice`,
 `priorityNice`, `localExecution`, `deviceGates`.
 
-A lane that is already running keeps the nice and CPU quota it started with; `laneNice` and `priorityNice` apply to the next lane
-that starts. Every other key is read when a process starts or needs it, so a change reaches new processes but is not a promise for
+A lane that is already running keeps the nice, the CPU quota and the heartbeat (from `sampleMs`) it got at spawn; the new values
+apply to the next lane that starts. Every other key is read when a process starts or needs it, so a change reaches new processes but is not a promise for
 a long-running one: treat it as needing a restart. The pull agent's own `~/.config/lane-agent/config.json` (`pollMs`,
 `speedFactor`, `schedule`, ...) is never live.
 

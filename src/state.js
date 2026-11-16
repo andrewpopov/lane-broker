@@ -126,7 +126,6 @@ export function paths(root = stateHome()) {
     // BRAIN-520: the operator's `lane drain` marker (`{version, reason, since, host}`). Unrelated to `draining` above: this one
     // only takes the runner out of REMOTE selection, is owned by no pid, and outlives processes and reboots.
     remoteDrain: path.join(root, 'remote-drain.json'),
-    // The same marker for every other owner (`<owner>.json`; `human` stays in `remoteDrain`): bosun and other automation, each with an optional expiry.
     drainOwners: path.join(root, 'drain-owners'),
     // BRAIN-380 slice 3: a queue record without `schedVersion` found behind the fence is moved here and never selected.
     queueQuarantine: path.join(root, 'queue-quarantine'),
@@ -611,12 +610,7 @@ const DRAIN_UNREADABLE = (owner) => ({ owner, reason: DRAIN_UNREADABLE_REASON, s
 
 const drainFileOf = (root, owner) => (owner === HUMAN_DRAIN_OWNER ? paths(root).remoteDrain : path.join(paths(root).drainOwners, `${owner}.json`));
 
-/**
- * One drain marker file: null when absent (or a shutdown marker from an earlier boot), else `{owner, reason, since, unreadable, expiresAt?, shutdown?}`.
- * Anything present that is not a well-formed marker (unparseable, null, array, wrong version, non-string reason, non-finite since or expiresAt)
- * FAILS CLOSED: draining, with the `drain marker unreadable` reason and an unknown `since` -- shape is checked here, not via readJsonSafe,
- * which cannot tell a parse failure from a JSON `null`. Expiry is judged by the caller.
- */
+// A malformed marker FAILS CLOSED (draining, unreadable, unknown since); shape is checked here because readJsonSafe cannot tell a parse failure from JSON `null`.
 function loadDrainFile(file, owner) {
   let text;
   try {
@@ -646,7 +640,6 @@ function loadDrainFile(file, owner) {
 
 const drainExpired = (marker, now) => Number.isFinite(marker.expiresAt) && marker.expiresAt <= now;
 
-/** The owners holding a marker file: `human` first, then every `<owner>.json` in the owners directory. An unreadable directory fails closed as one unreadable owner. */
 function drainOwnersOnDisk(root) {
   let names;
   try {
@@ -658,7 +651,6 @@ function drainOwnersOnDisk(root) {
   return [HUMAN_DRAIN_OWNER, ...owners];
 }
 
-/** Every unexpired drain marker, `human` first then by owner. The host is draining while this is non-empty. */
 export function readDrainMarkers(root = stateHome(), now = Date.now()) {
   return drainOwnersOnDisk(root).flatMap((owner) => {
     if (owner === null) return [DRAIN_UNREADABLE('unknown')];
@@ -667,7 +659,6 @@ export function readDrainMarkers(root = stateHome(), now = Date.now()) {
   });
 }
 
-/** BRAIN-520: the first active drain marker in its legacy shape `{reason, since, unreadable, shutdown?}`, or null when not draining. */
 export function readRemoteDrain(root = stateHome()) {
   const first = readDrainMarkers(root)[0];
   if (!first) return null;
@@ -675,7 +666,7 @@ export function readRemoteDrain(root = stateHome()) {
   return { reason, since, unreadable, ...(shutdown ? { shutdown } : {}) };
 }
 
-/** Delete every expired marker file. The caller holds the state lock, so a re-drain cannot land between the read and the unlink. */
+// Called under the state lock, so a re-drain cannot land between the read and the unlink.
 export function pruneExpiredDrains(root, now = Date.now()) {
   for (const owner of drainOwnersOnDisk(root)) {
     if (owner === null) continue;
@@ -685,10 +676,6 @@ export function pruneExpiredDrains(root, now = Date.now()) {
   }
 }
 
-/**
- * Write `owner`'s drain marker under the state lock (`shutdown` adds the BRAIN-350 shutdown form, bound to this boot). A re-drain by the
- * same owner keeps the original `since` and replaces the reason and expiry. Returns the marker.
- */
 export async function writeRemoteDrain(root, reason, { shutdown = false, timeoutMs, owner = HUMAN_DRAIN_OWNER, expiresAt } = {}) {
   return withLock(root, () => {
     pruneExpiredDrains(root);
@@ -709,7 +696,6 @@ export async function writeRemoteDrain(root, reason, { shutdown = false, timeout
   }, { timeoutMs });
 }
 
-/** Remove `owner`'s drain marker (and any expired ones) under the state lock and make the removal durable. Idempotent; any other failure throws (naming the path). */
 export async function clearRemoteDrain(root, owner = HUMAN_DRAIN_OWNER) {
   const file = drainFileOf(root, owner);
   return withLock(root, () => {

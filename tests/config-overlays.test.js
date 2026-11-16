@@ -2,10 +2,12 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { loadGlobalConfig, loadEffectiveGlobalConfig, reloadGlobalConfig, assertHostConfigHookless, isDispatchOnly, ConfigError, DEFAULT_GLOBAL_CONFIG, LIVE_RELOAD_KEYS, CONFIG_OVERLAY_DIR } from '../src/config.js';
+import { loadGlobalConfig, loadEffectiveGlobalConfig, reloadGlobalConfig, isDispatchOnly, ConfigError, DEFAULT_GLOBAL_CONFIG, LIVE_RELOAD_KEYS, CONFIG_OVERLAY_DIR } from '../src/config.js';
 import { effectiveWeightCapacity, checkResourceBudget } from '../src/resources.js';
 import { resolveLaneNice } from '../src/priority.js';
-import { claimFigures } from '../src/agent/claims.js';
+import { claimFigures, brokerConfigReader } from '../src/agent/claims.js';
+import { noteOverlayWarnings } from '../src/supervisor.js';
+import { paths } from '../src/state.js';
 import { freshEnv, writeGlobalConfig, laneRun } from './helpers.js';
 
 /** BRAIN-1141: `<home>/config.d/*.json` overlays, `lane config effective`, and the live-reload contract bosun relies on. */
@@ -70,42 +72,64 @@ test('only *.json files are overlays', () => {
   assert.equal(loadGlobalConfig({ home: env.home }).capacity, DEFAULT_GLOBAL_CONFIG.capacity);
 });
 
-test('keys starting with _ are ignored at every level, in config.json and in overlays', () => {
+test('top-level keys starting with _ are ignored in config.json and in overlays; nested keys are real data', () => {
   const env = freshEnv();
-  writeGlobalConfig(env.home, { _note: 'human', capacity: 4, deviceGates: { _why: 'x', thermal: { _n: 1, maxPressureLevel: 1 } } });
-  writeOverlay(env.home, '50-bosun.json', { _writtenBy: 'bosun', _capacity: 99, runners: [{ _comment: 'c', name: 'a-box', ssh: 'a-box', _x: { y: 1 } }] });
+  writeGlobalConfig(env.home, { _note: 'human', capacity: 4, lanePull: { queuedTimeoutMsByLane: { _lint: 5000 } } });
+  writeOverlay(env.home, '50-bosun.json', { _writtenBy: 'bosun', _capacity: 99, laneNice: 12 });
   const cfg = loadGlobalConfig({ home: env.home });
-  assert.equal(cfg._note, undefined);
-  assert.equal(cfg._writtenBy, undefined);
-  assert.equal(cfg._capacity, undefined);
-  assert.deepEqual(cfg.deviceGates, { thermal: { maxPressureLevel: 1 } });
-  assert.deepEqual(Object.keys(cfg.runners[0]).filter((key) => key.startsWith('_')), []);
+  assert.deepEqual([cfg._note, cfg._writtenBy, cfg._capacity, cfg.laneNice], [undefined, undefined, undefined, 12]);
+  assert.deepEqual(cfg.lanePull.queuedTimeoutMsByLane, { _lint: 5000 });
 });
 
-test('validation runs on the merged result: a bad overlay value names the overlay file', () => {
+test('an overlay may set only LIVE_RELOAD_KEYS: anything else is dropped whole with a warning naming the file and the key', () => {
+  const env = freshEnv();
+  writeGlobalConfig(env.home, { capacity: 4, runners: [{ name: 'a-box', ssh: 'a-box' }] });
+  for (const key of ['runners', 'lanePull', 'laneQueueUrl', 'classes', 'localWindow', 'remoteBlobCache']) {
+    writeOverlay(env.home, '50-bosun.json', { laneNice: 12, [key]: {} });
+    const cfg = loadGlobalConfig({ home: env.home });
+    assert.equal(cfg.laneNice, DEFAULT_GLOBAL_CONFIG.laneNice, `${key}: the whole overlay is set aside`);
+    assert.deepEqual(cfg.runners.map((r) => r.name), ['a-box'], `${key}: config.json keeps its own`);
+    assert.match(cfg.overlayWarnings[0], new RegExp(`^${path.join(env.home, CONFIG_OVERLAY_DIR, '50-bosun.json').replace(/[.]/g, '\\.')}: "${key}" cannot be set in an overlay`));
+  }
+});
+
+test('a failed overlay costs only its own tuning: the rest of config.json and the other overlays stay in force, and reload never falls back to defaults', () => {
+  const env = freshEnv();
+  writeGlobalConfig(env.home, { capacity: 4, cpuReserveCores: 3, runners: [{ name: 'a-box', ssh: 'a-box' }] });
+  writeOverlay(env.home, '50-bosun.json', { capacity: -1 });
+  writeOverlay(env.home, '60-other.json', { laneNice: 12 });
+  inEnv(env, () => {
+    const cfg = reloadGlobalConfig(undefined);
+    assert.deepEqual([cfg.capacity, cfg.cpuReserveCores, cfg.laneNice, cfg.runners.length], [4, 3, 12, 1]);
+    assert.equal(cfg.overlayWarnings.length, 1);
+    assert.ok(cfg.overlayWarnings[0].startsWith(path.join(env.home, CONFIG_OVERLAY_DIR, '50-bosun.json')), cfg.overlayWarnings[0]);
+    assert.match(cfg.overlayWarnings[0], /"capacity" must be/);
+    writeOverlay(env.home, '50-bosun.json', { capacity: 6 });
+    const healed = reloadGlobalConfig(cfg);
+    assert.deepEqual([healed.capacity, healed.overlayWarnings], [6, undefined]);
+  });
+});
+
+test('an unparseable, non-object or unreadable overlay is set aside with a warning naming its path; other layers load', () => {
   const env = freshEnv();
   writeGlobalConfig(env.home, { capacity: 4 });
-  writeOverlay(env.home, '50-bosun.json', { capacity: -1 });
-  assert.throws(() => loadGlobalConfig({ home: env.home }), (err) => err instanceof ConfigError && /"capacity" must be/.test(err.message) && /overlay config\.d\/50-bosun\.json/.test(err.message));
-});
-
-test('an invalid pair across files is judged merged: loadOpen from an overlay against loadClose from config.json', () => {
-  const env = freshEnv();
-  writeGlobalConfig(env.home, { loadClose: 15, loadOpen: 11 });
-  writeOverlay(env.home, '50-bosun.json', { loadOpen: 20 });
-  writeOverlay(env.home, '60-other.json', { sampleMs: 1000 });
-  assert.throws(() => loadGlobalConfig({ home: env.home }), (err) => /"loadOpen" must be less than "loadClose"/.test(err.message) && /50-bosun\.json/.test(err.message) && !/60-other/.test(err.message));
-});
-
-test('an unparseable or non-object overlay is a ConfigError naming its file', () => {
-  const env = freshEnv();
   writeOverlay(env.home, '50-bosun.json', '{ nope');
-  assert.throws(() => loadGlobalConfig({ home: env.home }), (err) => err instanceof ConfigError && err.message.includes(path.join(env.home, CONFIG_OVERLAY_DIR, '50-bosun.json')) && /invalid JSON/.test(err.message));
-  writeOverlay(env.home, '50-bosun.json', '[1]');
-  assert.throws(() => loadGlobalConfig({ home: env.home }), (err) => /50-bosun\.json: overlay must be a JSON object/.test(err.message));
+  writeOverlay(env.home, '60-other.json', '[1]');
+  writeOverlay(env.home, '70-ok.json', { laneNice: 12 });
+  const cfg = loadGlobalConfig({ home: env.home });
+  assert.deepEqual([cfg.capacity, cfg.laneNice], [4, 12]);
+  assert.match(cfg.overlayWarnings[0], new RegExp(`${path.join(env.home, CONFIG_OVERLAY_DIR, '50-bosun.json').replace(/[.]/g, '\\.')}: invalid JSON`));
+  assert.match(cfg.overlayWarnings[1], /60-other\.json: overlay must be a JSON object/);
 });
 
-test('reloadGlobalConfig covers overlays: an edit is picked up, a broken overlay keeps the last good config', () => {
+test('a config.json fault is still an error that starts with the config.json path, whatever the overlays say', () => {
+  const env = freshEnv();
+  writeGlobalConfig(env.home, { capacity: -1 });
+  writeOverlay(env.home, '50-bosun.json', { laneNice: 12 });
+  assert.throws(() => loadGlobalConfig({ home: env.home }), (err) => err instanceof ConfigError && err.message.startsWith(path.join(env.home, 'config.json')));
+});
+
+test('reloadGlobalConfig covers overlays: an edit is picked up and removing the overlay reverts to config.json', () => {
   const env = freshEnv();
   writeGlobalConfig(env.home, { capacity: 4 });
   inEnv(env, () => {
@@ -113,22 +137,40 @@ test('reloadGlobalConfig covers overlays: an edit is picked up, a broken overlay
     writeOverlay(env.home, '50-bosun.json', { capacity: 6 });
     const second = reloadGlobalConfig(first);
     assert.equal(second.capacity, 6);
-    writeOverlay(env.home, '50-bosun.json', { capacity: 'lots' });
-    const errors = [];
-    assert.equal(reloadGlobalConfig(second, { onError: (err) => errors.push(err.message) }).capacity, 6);
-    assert.match(errors[0], /50-bosun\.json/);
     fs.rmSync(path.join(env.home, CONFIG_OVERLAY_DIR, '50-bosun.json'));
-    assert.equal(reloadGlobalConfig(second).capacity, 4, 'removing the overlay reverts to config.json');
+    assert.equal(reloadGlobalConfig(second).capacity, 4);
   });
 });
 
-test('the exclusive-hook refusal sees keys that arrive in an overlay', () => {
+test('the supervisor records a config warning for a dropped overlay and none for a clean config', () => {
   const env = freshEnv();
   writeGlobalConfig(env.home, { capacity: 4 });
+  writeOverlay(env.home, '50-bosun.json', { capacity: -1 });
   inEnv(env, () => {
-    assertHostConfigHookless();
-    writeOverlay(env.home, '50-bosun.json', { exclusiveHooks: { before: 'x' } });
-    assert.throws(() => assertHostConfigHookless(), ConfigError);
+    assert.equal(noteOverlayWarnings(env.state, loadGlobalConfig()), true);
+    const warning = JSON.parse(fs.readFileSync(paths(env.state).configWarning, 'utf8'));
+    assert.match(warning.message, /50-bosun\.json: "capacity" must be .*; ignored/);
+    assert.equal(noteOverlayWarnings(env.state, { capacity: 4 }), false);
+  });
+});
+
+test('the agent keeps its last good broker config when the file breaks, and says so once', () => {
+  const env = freshEnv();
+  writeGlobalConfig(env.home, { cpuReserveCores: 3 });
+  const logs = [];
+  inEnv(env, () => {
+    const read = brokerConfigReader({ log: (line) => logs.push(line) });
+    assert.equal(read().cpuReserveCores, 3);
+    fs.writeFileSync(path.join(env.home, 'config.json'), '{ torn');
+    assert.equal(read().cpuReserveCores, 3);
+    assert.equal(read().cpuReserveCores, 3);
+    assert.equal(logs.length, 1);
+    assert.match(logs[0], /unreadable, keeping the last good config/);
+    writeGlobalConfig(env.home, { cpuReserveCores: 5 });
+    writeOverlay(env.home, '50-bosun.json', { capacity: -1 });
+    assert.equal(read().cpuReserveCores, 5);
+    assert.equal(logs.length, 2);
+    assert.match(logs[1], /50-bosun\.json/);
   });
 });
 
@@ -174,12 +216,19 @@ test('lane config effective prints one line per key with its source, and changes
   assert.deepEqual(fs.readdirSync(env.home, { recursive: true }).sort(), before);
 });
 
-test('lane config effective: an invalid overlay exits 1 naming the file; bad arguments exit 2', async () => {
+test('lane config effective: a dropped overlay is reported as a warning and the config shown is the one in force; bad arguments exit 2', async () => {
   const env = freshEnv();
+  writeGlobalConfig(env.home, { capacity: 4 });
   writeOverlay(env.home, '50-bosun.json', { capacity: -1 });
-  const bad = await laneRun(['config', 'effective'], { env: env.env });
-  assert.equal(bad.code, 1);
-  assert.match(bad.stderr, /50-bosun\.json/);
+  const shown = await laneRun(['config', 'effective', '--json'], { env: env.env });
+  assert.equal(shown.code, 0, shown.stderr);
+  const out = JSON.parse(shown.stdout);
+  assert.deepEqual([out.config.capacity, out.sources.capacity, out.files], [4, 'config.json', ['config.json']]);
+  assert.match(out.warnings[0], /50-bosun\.json: "capacity" must be/);
+  assert.match((await laneRun(['config', 'effective'], { env: env.env })).stdout, /^WARNING: .*50-bosun\.json/m);
+  const broken = freshEnv();
+  writeGlobalConfig(broken.home, { capacity: -1 });
+  assert.equal((await laneRun(['config', 'effective'], { env: broken.env })).code, 1);
   for (const args of [['config'], ['config', 'show'], ['config', 'effective', '--yaml']]) assert.equal((await laneRun(args, { env: env.env })).code, 2, args.join(' '));
 });
 

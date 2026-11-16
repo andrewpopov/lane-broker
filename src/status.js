@@ -169,7 +169,6 @@ function logMtimeAgeMs(logPath) {
   }
 }
 
-/** One line per active drain marker: who holds it, why, and when it lapses. */
 export function renderDrainMarkerLines(markers) {
   return markers.map((m) => `  drain marker: ${m.owner}: ${m.reason}${Number.isFinite(m.expiresAt) ? ` (expires ${new Date(m.expiresAt).toISOString()})` : ' (no expiry)'}`).join('\n');
 }

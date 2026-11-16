@@ -219,7 +219,6 @@ function parseDurationMs(spec) {
   return n * mult;
 }
 
-/** `lane drain ["reason" | --reason <r>] [--owner <o>] [--expires <iso|duration>]` and `lane undrain [--owner <o>]`; no owner is `human`. */
 function parseDrainArgs(args, { allowReason = true } = {}) {
   let owner = HUMAN_DRAIN_OWNER;
   let expiresAt;

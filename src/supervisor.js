@@ -117,6 +117,12 @@ function recordConfigReloadError(root, err) {
   }
 }
 
+function noteOverlayWarnings(root, cfg) {
+  if (!cfg.overlayWarnings) return false;
+  recordConfigReloadError(root, new Error(cfg.overlayWarnings.join('; ')));
+  return true;
+}
+
 /** Clear a previously recorded config warning once a reload succeeds again. */
 function clearConfigReloadWarning(root) {
   if (lastConfigErrorMessage === null) return; // nothing was ever recorded this run
@@ -1975,6 +1981,7 @@ async function main() {
   // on defaults rather than crash before it ever reaches the resilient
   // polling loop below — the exact torn-read window this fix exists for.
   let globalCfg = reloadGlobalConfig(undefined, { onError: (err) => recordConfigReloadError(root, err) });
+  noteOverlayWarnings(root, globalCfg);
   // BRAIN-438: not awaited, so it never delays the first admission; at most once a day per broker (see maybeDailyGc).
   void maybeDailyGc(root, globalCfg);
   const supervisorStart = processStartTime(process.pid);
@@ -2273,6 +2280,7 @@ async function main() {
         recordConfigReloadError(root, err);
       },
     });
+    if (!reloadFailed && noteOverlayWarnings(root, globalCfg)) reloadFailed = true;
     if (!reloadFailed) clearConfigReloadWarning(root);
     if (cancelledBeforeStart || cancelRequested(root, ticket.id)) {
       // BRAIN-436: a withdrawn ticket that is also cancelled must still leave the queue (retrying) and publish its
@@ -2772,7 +2780,7 @@ async function main() {
   });
 }
 
-export { CappedLogWriter, LOG_CAP_BYTES, recordConfigReloadError, clearConfigReloadWarning };
+export { CappedLogWriter, LOG_CAP_BYTES, recordConfigReloadError, clearConfigReloadWarning, noteOverlayWarnings };
 
 // Guard so this module can be imported (e.g. by tests exercising
 // CappedLogWriter directly) without running the supervisor for real; it only

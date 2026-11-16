@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { freshEnv, laneRun } from './helpers.js';
+import { setup as remoteSetup, tmpDir, markerCmd, detachAndWait, resultOf } from './remote-harness.js';
 import { paths, readRemoteDrain, readDrainMarkers, writeRemoteDrain, clearRemoteDrain, pruneExpiredDrains } from '../src/state.js';
 import { claimBlock, drainOwners, isDraining } from '../src/agent/claims.js';
 
@@ -187,4 +188,32 @@ test('the agent pauses claims with every owner in the reason, and resumes when t
 
 test('a claim block with no owners named keeps the plain reason', () => {
   assert.equal(claimBlock({ schedule: null, stopClaimingBeforeCloseMs: 0, draining: () => true }), 'draining');
+});
+
+test('remote-probe sees a host drained only by a bosun marker, with no remote-drain.json', async () => {
+  const { state, env } = freshEnv();
+  const marker = await writeRemoteDrain(state, 'tuning', { owner: 'bosun' });
+  assert.equal(fs.existsSync(paths(state).remoteDrain), false);
+  const probe = JSON.parse((await laneRun(['remote-probe'], { env })).stdout);
+  assert.deepEqual(probe.remoteDrain, { reason: 'tuning', since: marker.since });
+  assert.deepEqual([probe.draining, probe.paused], [true, true]);
+  await clearRemoteDrain(state, 'bosun');
+  assert.equal(JSON.parse((await laneRun(['remote-probe'], { env })).stdout).draining, false);
+});
+
+test('end to end: a fresh dispatch skips a runner drained only by bosun, and runs there again once that marker is removed', async () => {
+  const { env, state, repoDir } = remoteSetup();
+  await writeRemoteDrain(state, 'tuning', { owner: 'bosun' });
+  assert.equal(fs.existsSync(paths(state).remoteDrain), false);
+  const where = path.join(tmpDir('marker'), 'where');
+  const drained = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(where, 0)], env, repoDir);
+  assert.equal(drained.waited.code, 0, drained.waited.stderr);
+  assert.equal(fs.readFileSync(where, 'utf8'), 'local', 'never dispatched to the drained runner');
+  assert.match(resultOf(state, drained.id).fallbackReason, /draining: tuning/);
+
+  await clearRemoteDrain(state, 'bosun');
+  const where2 = path.join(tmpDir('marker'), 'where');
+  const open = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(where2, 0)], env, repoDir);
+  assert.equal(open.waited.code, 0, open.waited.stderr);
+  assert.equal(fs.readFileSync(where2, 'utf8'), 'remote', 'dispatched once the bosun marker was removed');
 });

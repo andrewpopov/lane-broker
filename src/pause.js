@@ -26,10 +26,7 @@ export async function resumeCommand() {
   return { exitCode: 0 };
 }
 
-/**
- * BRAIN-520: take this host out of remote selection. Local admission, queued tickets and running leases are untouched.
- * `owner` (default `human`, the ownerless `lane drain`) names who holds this marker; `expiresAt` (ms epoch) makes it lapse by itself.
- */
+/** BRAIN-520: take this host out of remote selection. Local admission, queued tickets and running leases are untouched. */
 export async function drainCommand(reason = '', { owner = HUMAN_DRAIN_OWNER, expiresAt } = {}) {
   const p = ensureStateDirs();
   const marker = await writeRemoteDrain(p.root, reason, { owner, expiresAt });
@@ -38,7 +35,6 @@ export async function drainCommand(reason = '', { owner = HUMAN_DRAIN_OWNER, exp
   return { exitCode: 0 };
 }
 
-/** Removes only `owner`'s marker: another owner's drain keeps the host draining, and says so. */
 export async function undrainCommand({ owner = HUMAN_DRAIN_OWNER } = {}) {
   const p = ensureStateDirs();
   try {
