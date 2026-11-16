@@ -407,7 +407,18 @@ function transferLimitsFromEnv() {
  * one of `<root>/tickets/<ticketId>/result.json` (exit 0) or nothing (exit
  * nonzero) -- see the module-level comment on kind derivation below.
  */
-export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = process.stdin, transfer, transferCache = false, transferLimits = transferLimitsFromEnv(), epoch, runnerName, runnerSpeedFactor } = {}) {
+/**
+ * BRAIN-1099: an elastic pull ticket the queue claimed at fewer cores than it declared runs at that grant: the claim becomes `cpuCores`, and a floor at or
+ * above it is dropped. This host's own admission still decides the final grant (it may shrink further, never below the floor), so it sets the child's
+ * LANE_BROKER_CPU_CORES. A grant that is absent, not a positive number, or not below the declaration changes nothing.
+ */
+export function claimedResources(header, claimCpuCores) {
+  if (!(Number.isFinite(claimCpuCores) && claimCpuCores > 0 && Number.isFinite(header.cpuCores) && claimCpuCores < header.cpuCores)) return {};
+  const floor = Number.isFinite(header.minCpuCores) && header.minCpuCores < claimCpuCores ? header.minCpuCores : undefined;
+  return { cpuCores: claimCpuCores, minCpuCores: floor };
+}
+
+export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = process.stdin, transfer, transferCache = false, transferLimits = transferLimitsFromEnv(), epoch, runnerName, runnerSpeedFactor, claimCpuCores } = {}) {
   const execStartedAt = Date.now();
   // BRAIN-320 review fix A: resolve once, up front -- every path derived
   // below (ticketDir, workDir, and the protocol-2 pipeline argv) is passed
@@ -482,6 +493,7 @@ export async function remoteExecCommand({ root = defaultRemoteRoot(), stdin = pr
   // The overrides replace the submitter's fields and go through the same validation below.
   if (runnerName !== undefined) header.runnerName = runnerName;
   if (runnerSpeedFactor !== undefined) header.runnerSpeedFactor = runnerSpeedFactor;
+  Object.assign(header, claimedResources(header, claimCpuCores));
   const execId = epoch === undefined ? header.ticketId : executionIdOf(header.ticketId, epoch);
   testDrainAt(stateHome(), 'remote-exec');
   const ticketsDir = path.join(root, 'tickets');

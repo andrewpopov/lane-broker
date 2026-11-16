@@ -42,6 +42,7 @@ function entryCalls(t1) {
   return {
     ld_register: [logins.a1, ['v', 1, {}]],
     ld_claim: [logins.a1, [randomUUID(), 8, 1e9, []]],
+    ld_needed_tools: [logins.a1, []],
     ld_start: [logins.a1, held],
     ld_heartbeat: [logins.a1, held],
     ld_finish: [logins.a1, [...held, { kind: 'ok' }]],

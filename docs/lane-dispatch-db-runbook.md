@@ -1,6 +1,6 @@
 # lane_dispatch database setup (cluster level)
 
-`sql/lane/migrations/005-lane-dispatch.sql`, `006-pull-simplify.sql`, `007-avoid-tags.sql`, `008-requires.sql` and `sql/lane/functions.sql` create the `lane_dispatch` schema, its functions and every
+`sql/lane/migrations/005-lane-dispatch.sql`, `006-pull-simplify.sql`, `007-avoid-tags.sql`, `008-requires.sql`, `009-elastic-head-reserve.sql` and `sql/lane/functions.sql` create the `lane_dispatch` schema, its functions and every
 grant that lives inside the database. `applyDatabaseAcls` (`src/lane-db.js`) revokes CONNECT, CREATE and TEMP on the current
 database from PUBLIC and grants CONNECT to the four lane group roles. It is opt-in (`applyMigrations(client, { databaseAcls: true })`
 or a direct call), and it throws before revoking anything when the database holds a schema other than `lane`, `lane_dispatch`
@@ -87,7 +87,7 @@ Each `ld_reap` tick deletes at most 1000 `claim_requests` rows: claimed mappings
 
 ## Pull client surface and retention
 
-Submit logins (the pull client) also hold `ld_queue_ref()` (the queue's `timeline.incarnation`, which moves after a restore), `ld_enqueue_fenced(expected_ref, ...)` (the `ld_enqueue` arguments after a leading ref; a stale ref returns `{state: 'stale-queue-ref', queue_ref}` and inserts nothing, otherwise it calls `ld_enqueue` unchanged, including the trailing `avoid_tags` and `requires`) and `ld_placeable(repo_key, requires_tags)` (the number of agent principals with `max_claims > 0` that are eligible for the tags and repo). `ticket_view` carries `attempt_ref`, `sha256('lane-attempt-ref:' || claim_token)`, NULL while the row holds no token; `claim_token` itself never reaches a submitter. `ld_heartbeat` answers only `{fenced, cancel}`.
+Submit logins (the pull client) also hold `ld_queue_ref()` (the queue's `timeline.incarnation`, which moves after a restore), `ld_enqueue_fenced(expected_ref, ...)` (the `ld_enqueue` arguments after a leading ref; a stale ref returns `{state: 'stale-queue-ref', queue_ref}` and inserts nothing, otherwise it calls `ld_enqueue` unchanged, including the trailing `avoid_tags`, `requires` and `min_cpu_cores`) and `ld_placeable(repo_key, requires_tags)` (the number of agent principals with `max_claims > 0` that are eligible for the tags and repo). `ticket_view` carries `attempt_ref`, `sha256('lane-attempt-ref:' || claim_token)`, NULL while the row holds no token; `claim_token` itself never reaches a submitter. `ld_heartbeat` answers only `{fenced, cancel}`.
 
 `ld_cancel` of a queued row stores a server-authored result `{kind: 'cancelled', cancelConfirmed: true, source: 'queued', epoch}`; a cancel of a claimed or running row only sets `cancel_requested`. A replayed `ld_cancel` reports `confirmed` from the stored `cancelConfirmed` (a non-boolean value reads as false), so it never upgrades an unproven cancel. A cancelled row with no stored result (released with `cancel-confirmed`, or a claimed row reaped after a cancel request) reads as confirmed.
 
