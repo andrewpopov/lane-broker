@@ -116,7 +116,7 @@ async function activeScenario(load) {
     writeLease(state, { id: 'leased', key: 'r:leased', bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight: 1, state: LEASE_STATE.RUNNING });
     await enqueue(state, { id: 'queued', key: 'r:queued', repoId: 'queued', weight: 1, cwd: process.cwd(), cmd: ['true'], supervisorPid: process.pid, supervisorStart: null, logPath: '/dev/null', resultPath: '/dev/null' });
     const executions = [{ weight: 2, laneId: 'preparing' }, { weight: 9, laneId: null }, { weight: 1, laneId: 'queued' }, { weight: 1, laneId: 'leased' }];
-    const offered = await claimFigures({ cfg: loadGlobalConfig({ home }), executions });
+    const offered = await claimFigures({ cfg: loadGlobalConfig({ home }), executions: () => executions });
     assert.notEqual(offered, null, 'headroom could be measured');
     assert.deepEqual([offered.freeWeight, offered.weightLimit], [10 - 1 - 1 - 2 - 4, 4], 'capacity 10 less the lease, the queued ticket, the preparing lane and the unstarted one at the limit of 4');
   } finally {
@@ -135,6 +135,36 @@ test('canary: active mode that ignores the local queue fails the active-mode tes
 test('canary: active mode that ignores the leases fails the active-mode test', () => assertCanaryFails(CLAIMS,
   ['const known = new Set([...leases, ...queued.filter(Boolean)].map((t) => t.id));', 'const known = new Set(queued.filter(Boolean).map((t) => t.id));'], activeScenario));
 
+async function midCallLeaseScenario(load) {
+  const { claimFigures } = await load(CLAIMS);
+  const { state, home } = freshEnv();
+  const saved = [process.env.LANE_BROKER_HOME, process.env.LANE_BROKER_STATE];
+  process.env.LANE_BROKER_HOME = home;
+  process.env.LANE_BROKER_STATE = state;
+  try {
+    writeGlobalConfig(home, { schedulerMode: 'active', capacity: 10, maxLaneWeight: 4, cpuAdmissionPercent: 100, cpuReserveCores: 1, memoryReserveBytes: 0 });
+    const leaseOf = (id, weight) => ({ id, key: `r:${id}`, bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight, state: LEASE_STATE.RUNNING });
+    writeLease(state, leaseOf('leased', 1));
+    const executions = () => {
+      writeLease(state, leaseOf('late', 2));
+      return [{ weight: 2, laneId: 'late' }];
+    };
+    const offered = await claimFigures({ cfg: loadGlobalConfig({ home }), executions });
+    assert.equal(offered.freeWeight, 10 - 1 - 2, 'an execution leased while the figures are read is charged once, not as both a lease and a pending execution');
+  } finally {
+    for (const [key, value] of [['LANE_BROKER_HOME', saved[0]], ['LANE_BROKER_STATE', saved[1]]]) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+test('active mode charges an execution leased mid-call exactly once', () => midCallLeaseScenario(realSrc));
+
+test('canary: active mode that charges used from a later lease read than known fails the mid-call test', () => assertCanaryFails(CLAIMS,
+  ['{ capacity: status.capacity, used, queued,', '{ capacity: status.capacity, used: (executions(), listLeases(brokerRoot)).filter((l) => HELD_STATES.has(l.state)).reduce((s, l) => s + (l.weight || 0), 0), queued,'],
+  midCallLeaseScenario));
+
 async function claimedWith(load, { figures, table = [], registered = WEIGHTING, log }) {
   const { claimOnce } = await load(CLAIMS);
   const calls = [];
@@ -146,7 +176,7 @@ async function claimedWith(load, { figures, table = [], registered = WEIGHTING, 
 
 async function planScenario(load) {
   const seen = [];
-  const { calls } = await claimedWith(load, { figures: (ask) => { seen.push(ask); return OFFER; }, table: [record('FETCHING', 2), record('RUNNING', 4), record('DONE', 6)] });
+  const { calls } = await claimedWith(load, { figures: (ask) => { seen.push({ executions: ask?.executions?.() }); return OFFER; }, table: [record('FETCHING', 2), record('RUNNING', 4), record('DONE', 6)] });
   assert.deepEqual(seen, [{ executions: [{ weight: 2, laneId: null }, { weight: 4, laneId: null }] }], 'the figures are asked with the live executions');
   assert.deepEqual(calls[0][6], { cpu: 8, mem: 1e9, freeWeight: 3, weightLimit: 4 }, 'the offer reaches ld_claim as one capacity');
 }
@@ -154,7 +184,7 @@ async function planScenario(load) {
 test('claimOnce asks the figures with the live executions and passes the weights inside the capacity', () => planScenario(realSrc));
 
 test('canary: claimOnce that never asks with the live executions fails the plan test', () => assertCanaryFails(CLAIMS,
-  ['await figures({ executions: liveExecutions(core.table.all(), remoteRoot) })', 'await figures()'], planScenario));
+  ['await figures({ executions: () => liveExecutions(core.table.all(), remoteRoot) })', 'await figures()'], planScenario));
 
 async function fallbackScenario(load) {
   const logs = [];

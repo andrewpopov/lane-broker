@@ -53,8 +53,10 @@ export function freeWeightOf({ capacity, used, queued, pendingWeights, cfg }) {
 /**
  * The free CPU, memory and weight a claim offers, the CPU budget and the broker's per-ticket weight limit. Active mode measures this host as
  * `remote-probe` does and answers null (skip the tick) when the measurement is missing; shadow mode offers the static budget, which is finite.
+ * `executions` is read after the lease and queue snapshots, and `used` comes from that same lease snapshot, so an execution that is enqueued or
+ * leased mid-call is charged exactly once.
  */
-export async function claimFigures({ cfg = loadGlobalConfig(), host = detectResourceCapacity(), executions = [] } = {}) {
+export async function claimFigures({ cfg = loadGlobalConfig(), host = detectResourceCapacity(), executions = () => [] } = {}) {
   const budgetCpu = cpuBudgetCores(host, cfg);
   const capacity = effectiveWeightCapacity(cfg, host.cpuCores);
   const weightLimit = queuedWeightLimit(cfg.maxLaneWeight, capacity);
@@ -67,7 +69,8 @@ export async function claimFigures({ cfg = loadGlobalConfig(), host = detectReso
   if (!headroom || !Number.isFinite(headroom.cpuCores) || !Number.isFinite(headroom.memoryBytes)) return null;
   const queued = listQueue(brokerRoot);
   const known = new Set([...leases, ...queued.filter(Boolean)].map((t) => t.id));
-  const freeWeight = freeWeightOf({ capacity: status.capacity, used: status.used, queued, pendingWeights: unadmittedWeights(executions, known), cfg });
+  const used = leases.filter((l) => HELD_STATES.has(l.state)).reduce((sum, l) => sum + (l.weight || 0), 0);
+  const freeWeight = freeWeightOf({ capacity: status.capacity, used, queued, pendingWeights: unadmittedWeights(executions(), known), cfg });
   return { freeCpu: headroom.cpuCores, freeMem: clampMem(headroom.memoryBytes), budgetCpu, freeWeight, weightLimit };
 }
 
@@ -115,7 +118,7 @@ let fallbackLogged = false;
 export async function claimOnce({ core, remoteRoot, figures = claimFigures, block, now = Date.now, tools = () => presentTools({ ld: core.ld, envPath: process.env.PATH }), log = () => {} }) {
   const reason = block();
   if (reason) return { status: 'skipped', reason };
-  const offered = await figures({ executions: liveExecutions(core.table.all(), remoteRoot) });
+  const offered = await figures({ executions: () => liveExecutions(core.table.all(), remoteRoot) });
   if (!offered) return { status: 'skipped', reason: 'no-headroom' };
   const hasTools = await tools();
   const pending = readPendingClaim(remoteRoot);
