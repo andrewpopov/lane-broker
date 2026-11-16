@@ -7,7 +7,35 @@ or a direct call), and it throws before revoking anything when the database hold
 and `public`, or any object in `public`, so it refuses a shared application database. Design:
 `agent_brain/knowledge/lane-pull-dispatch.md` section 2.
 
-Cluster-level privileges need a superuser and stay out of those files, because the applier is a CREATEROLE non-superuser
+## Applying migrations
+
+On pitelite the migrations are applied by `lane_migrate`, never by `postgres` or `zirk` (BRAIN-1146). It owns nothing: it is
+`LOGIN NOSUPERUSER NOCREATEROLE`, a member of `lane_definer` with INHERIT and SET, and holds CONNECT and CREATE on `lane_queue`.
+CREATE is required because `functions.sql`'s `CREATE SCHEMA IF NOT EXISTS lane_dispatch` checks it even when the schema exists
+(`tests/lane-owner-apply.test.js`, the BRAIN-1146 case). Created once by a superuser:
+
+```sql
+CREATE ROLE lane_migrate LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 2;
+GRANT lane_definer TO lane_migrate WITH INHERIT TRUE, SET TRUE;
+GRANT CONNECT, CREATE ON DATABASE lane_queue TO lane_migrate;
+```
+
+It has no password. It logs in only as OS `postgres` over pitelite's socket: `local lane_queue lane_migrate peer map=lanequeue`,
+rendered from zirkbot `ops/pitelite/failover/cluster.toml` (consumer `lane-migrate`) and `fence.py` `PG_IDENT_ROWS`. Apply from a
+lane-broker checkout of the version being deployed, with its dependencies installed:
+
+```sh
+sudo -u postgres node --input-type=module -e "
+import { connect, applyMigrations } from './src/lane-db.js';
+const c = await connect({ host: '/var/run/postgresql', user: 'lane_migrate', database: 'lane_queue', options: '-c lock_timeout=5s' });
+try { console.log(JSON.stringify(await applyMigrations(c))); } finally { await c.end(); }"
+```
+
+It prints `{"version":N,"applied":[...]}`. A run with nothing new prints `"applied":[]` and only re-applies `functions.sql`.
+
+## Cluster-level privileges
+
+Cluster-level privileges need a superuser and stay out of those files, because the applier is not a superuser
 (`tests/lane-owner-apply.test.js`). Run this once per cluster as a superuser, after the first apply has created the group roles.
 Each runner or submitter login is one role per host, named `lane_agent_<host>` or `lane_submit_<name>` (the guard terminates by that prefix).
 
