@@ -32,6 +32,14 @@ SELECT lane_dispatch.ld_set_principal('lane_submit_<name>', 'submit', NULL, '{}'
 `pg_hba` pins each login to its host: `hostssl lane_queue lane_agent_<host> <host tailnet IP>/32 scram-sha-256`. A login with no
 `lane_dispatch.principals` row (for example the legacy `lane_agent_h1`) is refused by every `ld_*` function.
 
+## Reading the queue as lane_reader
+
+`lane_reader` has no USAGE on `lane_dispatch` and no grant on its tables. Monitoring reads three views in schema `lane`, owned by
+`lane_definer` and granted SELECT in `sql/lane/functions.sql`, so every apply keeps them: `lane.pull_tickets` (no `claim_token`;
+the header only as `argv_md5`), `lane.pull_principals` (agent principals' `host, tags, allowed_repos, max_claims`, no
+`login_role`) and `lane.pull_runners` (`host, last_seen`). A reader that needs another column gets it added to a view; never grant
+`lane_reader` anything in `lane_dispatch` by hand, because the next apply's REVOKE removes it (BRAIN-1154).
+
 ## Timers on the database host
 
 Two systemd units on pitelite run as a `lane_admin` login (a member of `lane_admin`, so it holds the `pg_signal_backend` and `pg_read_all_stats` grants above). Both are required: the guard is the enforcement behind the per-role `statement_timeout`, which a caller can override.
