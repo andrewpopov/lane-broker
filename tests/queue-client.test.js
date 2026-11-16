@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import { createQueueClient, QueueError } from '../src/queue-client.js';
 import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 import { pgSkipOption } from './lane-db-harness.js';
-import { startDispatchCluster, World, logins, call, claim, start, tid, downgradeToV6 } from './lane-dispatch-fixture.js';
+import { startDispatchCluster, World, logins, call, claim, start, tid, downgradeToV6, downgradeToV8 } from './lane-dispatch-fixture.js';
 import { CA_TEXT, QUEUE_URL, harnessClient, secretFiles } from './helpers/queue-fixture.js';
 
 /** BRAIN-1036 R4: the submitter queue client against a disposable Postgres. */
@@ -135,6 +135,39 @@ const SCENARIOS = {
     assert.equal(await w.ticket(tid(7)), undefined);
   },
 
+  'enqueueFenced carries an elastic floor to min_cpu_cores, and a caller with no floor, or a floor at its claim, stores none': async (w, t, createClient) => {
+    const { queue } = harnessClient(t, w, { createClient });
+    const ref = await queue.queueRef();
+    await queue.enqueueFenced({ ...enqueueArgs(tid(6), ref), cpuCores: 8, minCpuCores: 4 });
+    await queue.enqueueFenced({ ...enqueueArgs(tid(7), ref), cpuCores: 8, minCpuCores: 4, avoidTags: ['slow'] });
+    await queue.enqueueFenced({ ...enqueueArgs(tid(8), ref), cpuCores: 8, minCpuCores: 8 });
+    await queue.enqueueFenced(enqueueArgs(tid(9), ref));
+    const rows = (await (await w.su()).query('SELECT min_cpu_cores, avoid_tags FROM lane_dispatch.tickets WHERE id = ANY($1::uuid[]) ORDER BY id', [[tid(6), tid(7), tid(8), tid(9)]])).rows;
+    assert.deepEqual(rows.map((r) => r.min_cpu_cores), [4, 4, null, null]);
+    assert.deepEqual(rows.map((r) => r.avoid_tags), [[], ['slow'], [], []]);
+  },
+
+  'the v0.105 17-parameter typed call of ld_enqueue_fenced still resolves, and stores no floor': async (w) => {
+    const s1 = await w.as(logins.s1);
+    const ref = await call(s1, 'ld_queue_ref');
+    const v0105 = ['text', 'uuid', 'text', 'text', 'text', 'jsonb', 'jsonb', 'jsonb', 'text[]', 'real', 'bigint', 'int', 'int', 'boolean', 'text', 'real', 'text[]'];
+    const { id, ...rest } = enqueueArgs(tid(8), ref);
+    const values = [ref, id, rest.repoKey, rest.lane, rest.laneKey, JSON.stringify(rest.binding), JSON.stringify(rest.header), JSON.stringify(rest.snapshot), [], 8, 1000, 0, 1, true, null, null, ['slow']];
+    await s1.query(`SELECT lane_dispatch.ld_enqueue_fenced(${v0105.map((type, i) => `$${i + 1}::${type}`).join(', ')})`, values);
+    assert.equal((await w.ticket(tid(8))).min_cpu_cores, null);
+    assert.deepEqual((await w.ticket(tid(8))).avoid_tags, ['slow']);
+  },
+
+  'a queue still at schema version 8 accepts an enqueue from this client with no floor, and refuses an elastic one with the missing function': async (w, t, createClient) => {
+    await downgradeToV8(w);
+    const { queue } = harnessClient(t, w, { createClient });
+    const ref = await queue.queueRef();
+    await assert.doesNotReject(queue.enqueueFenced({ ...enqueueArgs(tid(6), ref), avoidTags: ['slow'] }));
+    await assert.doesNotReject(queue.enqueueFenced({ ...enqueueArgs(tid(7), ref), cpuCores: 8, minCpuCores: 8 }));
+    await assert.rejects(queue.enqueueFenced({ ...enqueueArgs(tid(8), ref), cpuCores: 8, minCpuCores: 4 }), (err) => err instanceof QueueError && err.code === '42883' && /ld_enqueue_fenced/.test(err.message));
+    assert.equal(await w.ticket(tid(8)), undefined);
+  },
+
   'too many connections (53300) is retried with jitter for every call, then surfaces when it never clears': async (w, t) => {
     const held = await holdConnections(w, 3);
     const release = async () => { while (held.length) await held.pop().end(); };
@@ -172,8 +205,11 @@ const SCENARIOS = {
 
 const CANARIES = [
   ['enqueueFenced carries min_protocol to the row, and a caller that names none gets protocol 1', ['priority, minProtocol,', 'priority, 1,']],
-  ['a queue still at schema version 6 accepts an enqueue from this client that sets no avoidTags, and refuses one that does with the missing function', ['...(avoidTags.length > 0 || requires.length > 0 ? [true, null, null, avoidTags] : []),', 'true, null, null, avoidTags,']],
-  ['enqueueFenced carries the lane requires to the row, and a caller that names none requires nothing (BRAIN-1135)', ['...(requires.length > 0 ? [requires] : []),', '']],
+  ['a queue still at schema version 6 accepts an enqueue from this client that sets no avoidTags, and refuses one that does with the missing function', ['avoidTags.length > 0 ? [true, null, null, avoidTags] : [];', '[true, null, null, avoidTags];']],
+  ['enqueueFenced carries the lane requires to the row, and a caller that names none requires nothing (BRAIN-1135)', [': requires.length > 0 ? [true, null, null, avoidTags, requires]', ': requires.length > 0 ? [true, null, null, avoidTags]']],
+  ['a queue still at schema version 8 accepts an enqueue from this client with no floor, and refuses an elastic one with the missing function',
+    ['const elastic = Number.isFinite(minCpuCores) && minCpuCores < cpuCores;', 'const elastic = Number.isFinite(minCpuCores);']],
+  ['enqueueFenced carries an elastic floor to min_cpu_cores, and a caller with no floor, or a floor at its claim, stores none', ['[true, null, null, avoidTags, requires, minCpuCores]', '[true, null, null, avoidTags, requires, null]']],
   ['enqueueFenced carries the lane avoid_tags to the row, and a caller that names none avoids nothing', ['[true, null, null, avoidTags] : []', '[true, null, null, []] : []']],
 ];
 

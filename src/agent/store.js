@@ -90,9 +90,9 @@ export function readAgentStatus(remoteRoot) {
 }
 
 export function newExecutionRecord(claim, { now = Date.now() } = {}) {
-  const { id, epoch, token, repo_key: repoKey, lane, lane_key: laneKey, binding, header, snapshot, requires = [] } = claim;
+  const { id, epoch, token, repo_key: repoKey, lane, lane_key: laneKey, binding, header, snapshot, requires = [], cpu_cores: cpuCores } = claim;
   return {
-    id, epoch, token, execId: executionIdOf(id, epoch), claim: { repoKey, lane, laneKey, binding, header, snapshot, requires },
+    id, epoch, token, execId: executionIdOf(id, epoch), claim: { repoKey, lane, laneKey, binding, header, snapshot, requires, ...(Number.isFinite(cpuCores) ? { cpuCores } : {}) },
     subphase: 'FETCHING', claimedAt: now, kernelBootId: null,
   };
 }
