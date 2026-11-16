@@ -7,7 +7,7 @@ import { AgentStoreError, ExecutionTable, ensureAgentDirs, newExecutionRecord } 
 
 const ID = '11111111-1111-4111-8111-111111111111';
 const TOKEN = '22222222-2222-4222-8222-222222222222';
-const claim = { id: ID, epoch: 2, token: TOKEN, repo_key: 'repoA', lane: 'test', lane_key: 'lk', binding: { protocol: 1 }, header: { cmd: ['true'] }, snapshot: { key: 'snap' } };
+const claim = { id: ID, epoch: 2, token: TOKEN, repo_key: 'repoA', lane: 'test', lane_key: 'lk', binding: { protocol: 1 }, header: { cmd: ['true'] }, snapshot: { key: 'snap' }, requires: ['redis-server'] };
 
 const at = (subphase, outbox) => ({ ...newExecutionRecord(claim), subphase, ...(outbox && { outbox }) });
 const freshRoot = () => path.join(makeTmpDir('agent-records-'), 'remote');
@@ -15,7 +15,7 @@ const freshRoot = () => path.join(makeTmpDir('agent-records-'), 'remote');
 test('a new record carries the claim, and the execution id', () => {
   const record = newExecutionRecord(claim, { now: 1234 });
   assert.deepEqual(record, {
-    id: ID, epoch: 2, token: TOKEN, execId: `${ID}.e2`, claim: { repoKey: 'repoA', lane: 'test', laneKey: 'lk', binding: { protocol: 1 }, header: { cmd: ['true'] }, snapshot: { key: 'snap' } },
+    id: ID, epoch: 2, token: TOKEN, execId: `${ID}.e2`, claim: { repoKey: 'repoA', lane: 'test', laneKey: 'lk', binding: { protocol: 1 }, header: { cmd: ['true'] }, snapshot: { key: 'snap' }, requires: ['redis-server'] },
     subphase: 'FETCHING', claimedAt: 1234, kernelBootId: null,
   });
 });
