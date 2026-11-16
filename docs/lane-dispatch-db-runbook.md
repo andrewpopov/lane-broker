@@ -1,6 +1,6 @@
 # lane_dispatch database setup (cluster level)
 
-`sql/lane/migrations/005-lane-dispatch.sql`, `006-pull-simplify.sql`, `007-avoid-tags.sql`, `008-requires.sql`, `009-elastic-head-reserve.sql` and `sql/lane/functions.sql` create the `lane_dispatch` schema, its functions and every
+`sql/lane/migrations/005-lane-dispatch.sql`, `006-pull-simplify.sql`, `007-avoid-tags.sql`, `008-requires.sql`, `009-elastic-head-reserve.sql`, `010-claim-weight.sql` and `sql/lane/functions.sql` create the `lane_dispatch` schema, its functions and every
 grant that lives inside the database. `applyDatabaseAcls` (`src/lane-db.js`) revokes CONNECT, CREATE and TEMP on the current
 database from PUBLIC and grants CONNECT to the four lane group roles. It is opt-in (`applyMigrations(client, { databaseAcls: true })`
 or a direct call), and it throws before revoking anything when the database holds a schema other than `lane`, `lane_dispatch`
@@ -99,3 +99,15 @@ Retention is admin-only (`lane_admin` login, run by `lane pull gc`; none of thes
 - `ld_enqueue_fenced` refuses (22023) a snapshot whose `blobs` is present but not an array, and `ld_blobs_live` treats a non-array `blobs` as empty. `ld_blobs_live(refs)` takes a JSON array of at most 500 `{ns, sha256}` and returns the subset referenced by a non-terminal ticket's `snapshot.blobs`. A blob is deleted from object storage only when it is old enough and absent from this set.
 
 One unit on pitelite runs the client side (templates in `ops/pull/`): `lane-pull-gc.timer` hourly (`lane-pull-gc.service`, an admin login whose password `/etc/lane-pull/gc-admin.pass` is root:root 0600 and reaches only that unit through `LoadCredential=`, with the submitter password `/etc/lane-pull/submit.pass` hidden from it by `InaccessiblePaths=`). There is no tender unit: a dead supervisor's ticket is settled by the reconcile sweep, `lane wait` or `lane cancel`. **`train-lane-runner-watch.timer` (every 60 s, `lane runner watch`, which calls `sweepOrphans`) is required for pull**: it settles those tickets, sends the cancel a ticket owes its row after a queue outage (`<state>/pull/<id>/cancel-owed.json`) and is the only thing that does so unattended; keep it enabled on every host that runs `lane run` for pull. `lane pull gc` passes `rows_after = lanePull.rowRetentionMs` (default 7 days) and refuses a smaller `--rows-after`, because the client's enqueue horizon assumes a row survives that long. Paging state is `<state>/pull/gc-state.json`. gc also expires local state: a ticket's ledger entry and `pull/<id>/` (envelope, staged copies) after `lanePull.ledgerRetentionMs` (default 45 days; the config refuses below 35 days, the queue's backup retention), never while an attempt record exists.
+
+## Weight-aware claims and requeue (migration 010, BRAIN-1106)
+
+`010-claim-weight.sql` changes no table: it versions the function set. `ld_claim` gains two trailing parameters after the 1099 capacity pair, `p_free_weight` and `p_weight_limit` (NULL for an older agent: no weight check). `ld_register` answers `claim_weight: true`, and an agent sends the weights only to a queue that does. `functions.sql` drops the seven-argument `ld_claim`, so a 1099 agent's seven-argument call resolves to the new function through the defaults. `ld_finish` of `{kind: 'unfinished', reason: 'supervisor-died-while-queued', neverStarted: true}` requeues the ticket (the shared `not_before` backoff, token and host cleared, so a late `ld_finish`, `ld_start` or `ld_heartbeat` of the old attempt is fenced) while `requeues < 3` and no cancel is pending, answering `{fenced: false, state: 'queued'}`; after that it finishes unfinished with `requeuesExhausted: true` and `requeues` added. The reason stays `supervisor-died-while-queued`, which the submitter treats as proof nothing ran.
+
+**Apply order.** Migrate the queue first, then upgrade agents. From a checkout of this release, as the database owner (the connection comes from the standard `PG*` variables):
+
+```
+PGHOST=<host or socket dir> PGUSER=<owner> PGDATABASE=<db> node --input-type=module -e "import { connect, applyMigrations } from './src/lane-db.js'; const c = await connect({}); console.log(await applyMigrations(c)); await c.end();"
+```
+
+It prints `{ version: 10, applied: [...] }` and is safe to repeat. An agent that reaches a queue below 010 claims without weights, logs it once and reports `fallback: true`; that fallback is removed once every agent and queue is on schema 10.

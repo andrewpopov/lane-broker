@@ -1607,7 +1607,7 @@ Pull recovery surfaces (BRAIN-1036 R6). All act only on pull attempts that alrea
 - **Claims.** `pending-claim.json` (a `randomUUID` req, no age window) is fsynced before `ld_claim` and cleared only after the claimed record is persisted, so a lost answer is replayed and adopts exactly one ticket. `none` clears it; `upgrade` clears it, stops claiming for good and logs `UPGRADE REQUIRED` on every poll tick while running executions carry on. A tick is skipped when drain, the schedule window (or `stopClaimingBeforeCloseMs`) or a null headroom measurement says so. The loop runs on NOTIFY plus a poll of at most 15 s, which is also a liveness call; heartbeats are the liveness at `max_claims` and while settling.
 - **Fetch (no URL wait).** A claim goes straight to FETCHING: signed GETs through `src/s3-client.js` with the runner's own RustFS key, `lane-snap/<snapshot.key>` and `lane-snap/blobs/<ns>/<sha256>`. A 404 (or a 403 while `lane-snap/.probe` still reads, since the key has no List) and a hash or binding mismatch finish the ticket `rejected` (`stream-missing`, `stream-corrupt`, `binding-mismatch`, `cache-miss: 1`, `cache-corrupt: 1`); an unreachable store is retried with backoff and heartbeats for `fetchBudgetMs` after the claim, then released `never-started`. A blob failure never releases.
 - **Start.** STARTING re-hashes the spool, checks the drain marker, then calls `ld_start`; `true` goes SPAWNING (with the kernel boot id) and a detached `lane remote-exec --epoch N --runner-name <host> --runner-speed-factor <f>`, then RUNNING. A STARTING record found on restart means "start attempted, outcome unknown": `ld_start` is called again, `true` finishes `rejected` `start-uncertain` and nothing is ever spawned after a restart, `false` releases. A release answered `{refused: 'started'}` is converted to that finish; a release answered `fenced` is an acknowledgement.
-- **Running and settling.** Heartbeats every 15 s; `fenced` goes to KILLING with no finish, `cancel` goes to `cancelRemoteExecution` (`cancelConfirmed` only when the runner proved the stop). Every exit after `ld_start` finishes; nothing after start releases. Logs go up at finish only: a signed PUT of the full log and the artifacts (spooled to a temp file first) to `lane-out/<host>/<ticketId>/e<epoch>/{log,artifacts}`, retried for 10 min, then `uploadError`; `ld_finish` carries `logSha256`, `artifactsSha256` and sizes. KILLING retries the local cancel every 5 s until stop evidence, a boot-id change or 24 h, sends the queue nothing, then DONE.
+- **Running and settling.** Heartbeats every 15 s; `fenced` goes to KILLING with no finish, `cancel` goes to `cancelRemoteExecution` (`cancelConfirmed` only when the runner proved the stop). Every exit after `ld_start` finishes, except a run whose local supervisor died before the broker admitted it: the queue requeues that finish (see Weight-aware claims). Logs go up at finish only: a signed PUT of the full log and the artifacts (spooled to a temp file first) to `lane-out/<host>/<ticketId>/e<epoch>/{log,artifacts}`, retried for 10 min, then `uploadError`; `ld_finish` carries `logSha256`, `artifactsSha256` and sizes. KILLING retries the local cancel every 5 s until stop evidence, a boot-id change or 24 h, sends the queue nothing, then DONE.
 - **Under bosun (S2g).** The agent is a bosun child (`restart: always`, `stopSignal: SIGTERM`, `stopDeadlineSeconds: 60`) with a minimal environment, and running lanes must survive an agent or bosun restart.
   - **Supervisor scope.** On Linux the agent starts `remote-exec` as `systemd-run --user --scope --collect --quiet --unit=lane-exec-<execId> -- …` (`supervisorLaunch` in `src/cpu-limit.js`, built by `cpuLimitArgv(null, …)`: lifetime only, no quota). The scope lives under `user@UID.service`, outside bosun's system cgroup, so `KillMode=mixed` cannot reach it; this needs linger for the runner user. `systemd-run --scope` execs in place, so the recorded `pid` and `pidStart` are the supervisor's. The lane command inside keeps whatever CPU-quota scope `remote-exec` already gives it.
   - **Scope probe and claim gate.** `probeLifetimeScope` runs `systemd-run --user --scope … -- sh -c 'cat /proc/self/cgroup'` asynchronously at agent start, never inside a call's persist path, and passes only when the scope's cgroup is under `user@<uid>.service`. Only a success is kept; a failure is re-probed every 60 s. **On Linux, while no scope is available the agent claims nothing** (`no-scope`: a supervisor started bare would die with the agent's cgroup; an adopted record that reaches its start is released `never-started` for the same reason), logs each change of state once, reports `lane_agent_scope_available`, and shows `claims: paused:no-scope` in `agent/status.json`. On macOS the detached setsid spawn plus bosun's `AbandonProcessGroup=true` suffice and claiming is unaffected. `systemd-run --user` reaches the user manager through `XDG_RUNTIME_DIR`, which bosun's environment lacks, so on Linux the agent sets `XDG_RUNTIME_DIR=/run/user/<uid>` whenever none is set (the directory may not exist yet at boot), in its own environment and its children's.
@@ -2180,7 +2180,7 @@ sees as `LANE_BROKER_CPU_CORES`. A full fit keeps the declared claim.
 arguments, the CPU and memory this runner could offer once its own claims end
 (its free figures plus what those claims hold, CPU capped at `cpuBudgetCores`;
 outside load stays counted). An agent sends them only when `ld_register` answers
-`head_reserve: true`, so a new agent keeps claiming from a queue still at schema 7.
+`head_reserve: true`, so a new agent keeps claiming from a queue still at schema 8.
 The head is the top ticket this runner could ever fit (same eligibility and order
 as the claim; a static test pins the two queries together). When it has waited
 `age_horizon_s` (60 min), does not fit now, and the runner holds at least one
@@ -2191,6 +2191,23 @@ small runner and the next aged ticket that runner could fit is reserved instead.
 runner with nothing of its own running never holds (the head is futile there, as
 BRAIN-418 judges a head on a drained host), so no runner is idled indefinitely. An
 agent at 0.105 or older sends no capacity and never holds back.
+
+**Weight-aware claims and requeue (BRAIN-1106, queue migration 010).** The capacity an
+agent sends gains the broker's free weight and its per-ticket weight limit
+(`max(1, min(maxLaneWeight, floor(capacity / 2)))`), sent only when `ld_register` answers
+`claim_weight: true`. Free weight is the broker capacity less held leases, its queued
+tickets and every execution whose lane has neither a lease nor a queue record yet
+(fetching, or preparing the snapshot, git and deps), each charged at the limit. `ld_claim`
+offers only a ticket whose `header.weight` (absent or not a number counts 0, capped at the
+limit) fits, so a claim is made only for work the broker can start now. The aged head must fit
+the weight now as well as cores and memory, or the answer is `reserved_for`; its age is the
+credited age (a ticket with `ages = false` never reserves) and it is picked in claim order,
+so a fresh priority-9 ticket outranks an aged low one. An agent on a queue below 010 claims
+without weights; `claimOnce` flags that as `fallback: true` and logs it once. A ticket whose
+local supervisor died before the broker admitted it (`supervisor-died-while-queued`,
+`neverStarted`) is requeued by `ld_finish` at most 3 times, with the release backoff and a
+cleared token, so a late call of the old attempt is fenced; after that it finishes
+`unfinished` with `requeuesExhausted: true`.
 
 ### Right-sized CPU requests (`rightSizeFromHistory`, BRAIN-550)
 

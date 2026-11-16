@@ -601,6 +601,8 @@ DROP FUNCTION IF EXISTS lane_dispatch.ld_claim(uuid, real, bigint, text[]);
 DROP FUNCTION IF EXISTS lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[]);
 DROP FUNCTION IF EXISTS lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[]);
 DROP FUNCTION IF EXISTS lane_dispatch.ld_claim(uuid, real, bigint, text[], text[]);
+-- BRAIN-1106 (migration 010) adds the trailing p_free_weight, p_weight_limit to ld_claim.
+DROP FUNCTION IF EXISTS lane_dispatch.ld_claim(uuid, real, bigint, text[], text[], real, bigint);
 
 -- Every clock read in lane_dispatch goes through now(). The GUC lane.test_now moves it for tests, but only when the value is the one stored by ALTER DATABASE or
 -- ALTER ROLE (pg_db_role_setting): a session SET to anything else, which any login can issue, is ignored, so a runner cannot move the queue's clock.
@@ -871,7 +873,14 @@ BEGIN
   SELECT * INTO v_me FROM lane_dispatch.me('agent');
   INSERT INTO lane_dispatch.runners (host, version, protocol, schedule, last_seen) VALUES (v_me.host, p_version, coalesce(p_protocol, 1), p_schedule, lane_dispatch.now())
     ON CONFLICT (host) DO UPDATE SET version = EXCLUDED.version, protocol = EXCLUDED.protocol, schedule = EXCLUDED.schedule, last_seen = EXCLUDED.last_seen;
-  RETURN jsonb_build_object('host', v_me.host, 'max_claims', v_me.max_claims, 'protocol_min', lane_dispatch.protocol_min(), 'head_reserve', true);
+  RETURN jsonb_build_object('host', v_me.host, 'max_claims', v_me.max_claims, 'protocol_min', lane_dispatch.protocol_min(), 'head_reserve', true, 'claim_weight', true);
+END $$;
+
+-- A ticket's weight for the claim: its header weight (0 when absent or not a number), charged at most p_weight_limit, the most the runner's broker charges one ticket (BRAIN-1106).
+CREATE OR REPLACE FUNCTION lane_dispatch.ticket_weight(p_header jsonb, p_weight_limit real) RETURNS numeric
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  RETURN least(greatest(CASE WHEN jsonb_typeof(p_header->'weight') = 'number' THEN (p_header->>'weight')::numeric ELSE 0 END, 0), coalesce(p_weight_limit::numeric, 'Infinity'::numeric));
 END $$;
 
 -- A ticket's claim size: its floor once it has waited p_floor_after (elastic, BRAIN-1099), otherwise its full cpu_cores.
@@ -883,9 +892,11 @@ END $$;
 
 -- p_capacity_cpu / p_capacity_mem: what this runner could offer once its own claims end (BRAIN-1099). A runner that sends them holds back: while the top
 -- ticket it could ever fit has waited age_horizon_s and does not fit now, and the runner holds a claim whose end frees room, it claims nothing past it.
+-- p_free_weight / p_weight_limit: the weight its broker can admit now and the most it charges one ticket (BRAIN-1106); the head must fit it too.
 -- p_has_tools: the ld_needed_tools names on the agent's PATH; a 4-argument claim (an agent older than BRAIN-1135) never takes a ticket that requires a tool.
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_claim(p_req uuid, p_free_cpu real, p_free_mem bigint, p_held_keys text[] DEFAULT '{}', p_has_tools text[] DEFAULT '{}',
-                                                  p_capacity_cpu real DEFAULT NULL, p_capacity_mem bigint DEFAULT NULL) RETURNS jsonb
+                                                  p_capacity_cpu real DEFAULT NULL, p_capacity_mem bigint DEFAULT NULL,
+                                                  p_free_weight real DEFAULT NULL, p_weight_limit real DEFAULT NULL) RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 DECLARE v_me record; v_out jsonb; v_now timestamptz; v_protocol int; v_held int; v_id uuid; v_epoch int; v_token uuid; v_avoid_grace interval; v_floor_after interval;
         v_head record; v_t record; v_grant real;
@@ -912,6 +923,7 @@ BEGIN
      AND lane_dispatch.claim_need(t.cpu_cores, t.min_cpu_cores, v_now - t.created_at, v_floor_after) <= p_free_cpu AND t.memory_bytes <= p_free_mem
      AND NOT (t.lane_key = ANY (coalesce(p_held_keys, '{}')))
      AND t.requires <@ coalesce(p_has_tools, '{}')
+     AND lane_dispatch.ticket_weight(t.header, p_weight_limit) <= coalesce(p_free_weight::numeric, 'Infinity'::numeric)
    ORDER BY lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) DESC,
             CASE WHEN lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) >= 2.0
                   AND extract(epoch FROM v_now - t.created_at) >= lane_dispatch.age_horizon_s() THEN t.created_at END NULLS LAST,
@@ -919,7 +931,8 @@ BEGIN
   IF NOT FOUND THEN RETURN jsonb_build_object('status', 'none'); END IF;
   v_token := gen_random_uuid();
   IF p_capacity_cpu IS NOT NULL AND v_held > 0 THEN
-    SELECT t.id, lane_dispatch.claim_need(t.cpu_cores, t.min_cpu_cores, v_now - t.created_at, v_floor_after) AS need, t.memory_bytes, t.created_at INTO v_head FROM lane_dispatch.tickets t
+    SELECT t.id, lane_dispatch.claim_need(t.cpu_cores, t.min_cpu_cores, v_now - t.created_at, v_floor_after) AS need, t.memory_bytes,
+           lane_dispatch.ticket_weight(t.header, p_weight_limit) AS weight, CASE WHEN t.ages THEN v_now - t.created_at ELSE interval '0' END AS credited INTO v_head FROM lane_dispatch.tickets t
    WHERE t.state = 'queued' AND NOT t.cancel_requested AND t.min_protocol <= v_protocol AND t.not_before <= v_now
      AND lane_dispatch.eligible(t.requires_tags, t.repo_key, v_me.tags, v_me.allowed_repos)
      AND (NOT t.avoid_tags && v_me.tags OR v_now - t.created_at >= v_avoid_grace)
@@ -930,8 +943,8 @@ BEGIN
             CASE WHEN lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) >= 2.0
                   AND extract(epoch FROM v_now - t.created_at) >= lane_dispatch.age_horizon_s() THEN t.created_at END NULLS LAST,
             lane_dispatch.scarcity(t.requires_tags, t.repo_key), t.created_at, t.id LIMIT 1;
-    IF FOUND AND extract(epoch FROM v_now - v_head.created_at) >= lane_dispatch.age_horizon_s()
-       AND NOT (v_head.need <= p_free_cpu AND v_head.memory_bytes <= p_free_mem) THEN
+    IF FOUND AND extract(epoch FROM v_head.credited) >= lane_dispatch.age_horizon_s()
+       AND NOT (v_head.need <= p_free_cpu AND v_head.memory_bytes <= p_free_mem AND v_head.weight <= coalesce(p_free_weight::numeric, 'Infinity'::numeric)) THEN
       RETURN jsonb_build_object('status', 'none', 'reserved_for', v_head.id);
     END IF;
   END IF;
@@ -987,12 +1000,22 @@ END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_finish(p_id uuid, p_epoch int, p_token uuid, p_result jsonb) RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
-DECLARE v_me record; v_t record; v_state text;
+DECLARE v_me record; v_t record; v_state text; v_dead boolean;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT * INTO v_me FROM lane_dispatch.me('agent');
   SELECT * INTO v_t FROM lane_dispatch.tickets t WHERE t.id = p_id FOR UPDATE;
   IF lane_dispatch.fence_ok(p_epoch, p_token, v_me.host, v_t.epoch, v_t.claim_token, v_t.host, v_t.state) THEN
+    -- Supervisor died before the broker admitted the run: nothing ran, so it requeues (at most 3 times), then finishes marked requeuesExhausted.
+    v_dead := coalesce(p_result->>'kind' = 'unfinished' AND p_result->>'reason' = 'supervisor-died-while-queued' AND p_result->>'neverStarted' = 'true', false);
+    IF v_dead AND NOT v_t.cancel_requested THEN
+      IF v_t.requeues < 3 THEN
+        v_state := lane_dispatch.return_to_queue(p_id, lane_dispatch.now());
+        PERFORM pg_notify('ld_work', '');
+        RETURN jsonb_build_object('fenced', false, 'state', v_state);
+      END IF;
+      p_result := p_result || jsonb_build_object('requeuesExhausted', true, 'requeues', v_t.requeues);
+    END IF;
     v_state := CASE WHEN p_result->>'kind' = 'cancelled' THEN 'cancelled' ELSE 'finished' END;
     UPDATE lane_dispatch.tickets SET state = v_state, result = (p_result - 'author') || jsonb_build_object('epoch', p_epoch), finished_at = lane_dispatch.now() WHERE id = p_id;
     RETURN jsonb_build_object('fenced', false, 'state', v_state);
@@ -1277,7 +1300,7 @@ GRANT EXECUTE ON FUNCTION lane.record_eta(uuid, real, boolean, timestamptz) TO l
 REVOKE ALL ON SCHEMA lane_dispatch FROM PUBLIC;
 REVOKE ALL ON ALL TABLES IN SCHEMA lane_dispatch FROM PUBLIC, lane_agent, lane_submit, lane_admin, lane_reader;
 GRANT USAGE ON SCHEMA lane_dispatch TO lane_agent, lane_submit, lane_admin;
-GRANT EXECUTE ON FUNCTION lane_dispatch.ld_register(text, int, jsonb), lane_dispatch.ld_claim(uuid, real, bigint, text[], text[], real, bigint), lane_dispatch.ld_needed_tools(), lane_dispatch.ld_start(uuid, int, uuid),
+GRANT EXECUTE ON FUNCTION lane_dispatch.ld_register(text, int, jsonb), lane_dispatch.ld_claim(uuid, real, bigint, text[], text[], real, bigint, real, real), lane_dispatch.ld_needed_tools(), lane_dispatch.ld_start(uuid, int, uuid),
   lane_dispatch.ld_heartbeat(uuid, int, uuid), lane_dispatch.ld_finish(uuid, int, uuid, jsonb), lane_dispatch.ld_release(uuid, int, uuid, text),
   lane_dispatch.ld_log(uuid, int, uuid, int, bytea) TO lane_agent;
 GRANT EXECUTE ON FUNCTION lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real), lane_dispatch.ld_get(uuid),

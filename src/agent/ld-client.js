@@ -183,7 +183,8 @@ export class LdClient {
   }
 
   claim(req, freeCpu, freeMem, heldKeys = [], hasTools = null, opts, capacity = null) {
-    const trailing = capacity !== null ? [hasTools ?? [], capacity.cpu, String(capacity.mem)] : hasTools !== null ? [hasTools] : [];
+    const weights = capacity?.freeWeight === undefined ? [] : [capacity.freeWeight, capacity.weightLimit];
+    const trailing = capacity !== null ? [hasTools ?? [], capacity.cpu, String(capacity.mem), ...weights] : hasTools !== null ? [hasTools] : [];
     return this.#run('ld_claim', [req, freeCpu, String(freeMem), heldKeys, ...trailing], opts);
   }
 
