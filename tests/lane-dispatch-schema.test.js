@@ -7,7 +7,7 @@ import { LANE_SQL_DIR, applyDatabaseAcls, applyMigrations } from '../src/lane-db
 import { pgSkipOption } from './lane-db-harness.js';
 import { startDispatchCluster, World, logins, call, enqueue, claim, tid } from './lane-dispatch-fixture.js';
 
-const AGENT_FUNCTIONS = ['ld_register', 'ld_claim', 'ld_start', 'ld_heartbeat', 'ld_finish', 'ld_release', 'ld_log'];
+const AGENT_FUNCTIONS = ['ld_register', 'ld_claim', 'ld_needed_tools', 'ld_start', 'ld_heartbeat', 'ld_finish', 'ld_release', 'ld_log'];
 const SUBMIT_FUNCTIONS = ['ld_enqueue', 'ld_get', 'ld_list_mine', 'ld_withdraw', 'ld_cancel', 'ld_attach_urls', 'ld_log_read', 'ld_log_ack', 'ld_queue_ref', 'ld_enqueue_fenced', 'ld_placeable'];
 const ADMIN_FUNCTIONS = ['ld_set_principal', 'ld_reap', 'ld_restore_reset', 'ld_guard', 'ld_prune_candidates', 'ld_prune', 'ld_prune_chunks', 'ld_blobs_live'];
 const GRANTED = { agent: AGENT_FUNCTIONS, submit: SUBMIT_FUNCTIONS, admin: ADMIN_FUNCTIONS, reader: [] };
@@ -40,7 +40,7 @@ async function legacyIsRefused(w) {
   const legacy = await w.as(logins.legacy);
   const id = randomUUID();
   const calls = {
-    ld_register: ['v', 1, {}], ld_claim: [randomUUID(), 8, 1e9, []], ld_start: [id, 1, id], ld_heartbeat: [id, 1, id],
+    ld_register: ['v', 1, {}], ld_claim: [randomUUID(), 8, 1e9, []], ld_needed_tools: [], ld_start: [id, 1, id], ld_heartbeat: [id, 1, id],
     ld_finish: [id, 1, id, { kind: 'ok' }], ld_release: [id, 1, id, 'never-started'], ld_log: [id, 1, id, 1, Buffer.from('x')],
   };
   assert.deepEqual(Object.keys(calls), AGENT_FUNCTIONS);

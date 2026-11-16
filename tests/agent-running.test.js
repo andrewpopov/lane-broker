@@ -116,7 +116,7 @@ const canaries = [
   ['ld_cancel on a running ticket reaches the lane within a heartbeat and finishes cancelled with cancelConfirmed', EXEC, ['} else if (answer.cancel === true) {', '} else if (false) {']],
   ['an agent killed mid-run leaves the lane running, and the next agent adopts it and finishes it without starting it again', 'agent/run.js', ['driver.adoptAll();', '']],
   ['under a hostile inherited LANE_BROKER_STATE, the agent and the lane it spawns use the configured stateDir', 'agent/run.js', ['Object.assign(process.env, brokerEnv);', '']],
-  ['under a hostile inherited LANE_BROKER_STATE, the agent and the lane it spawns use the configured stateDir', 'agent/run.js', ['spawnEnv: { ...spawnEnv, ...brokerEnv }', 'spawnEnv']],
+  ['under a hostile inherited LANE_BROKER_STATE, the agent and the lane it spawns use the configured stateDir', 'agent/run.js', ['const laneEnv = { ...spawnEnv, ...brokerEnv };', 'const laneEnv = spawnEnv;']],
   ['a post-start shutdown result is finished with its proof, and nothing is released', EXEC,
     ['return this.#upload(record, context, result);', "if (result.reason === 'runner-shutdown') return this.#cas(execId, ['SETTLING'], { subphase: 'OUTBOX', outbox: { kind: 'release', proof: 'never-started' } });\n    return this.#upload(record, context, result);"]],
 ];
