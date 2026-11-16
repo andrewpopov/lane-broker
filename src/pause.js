@@ -1,7 +1,7 @@
 import fs from 'node:fs';
-import { ensureStateDirs, paths, atomicWriteFile, withLock, LockTimeoutError, readRemoteDrain, writeRemoteDrain, clearRemoteDrain } from './state.js';
+import { ensureStateDirs, paths, atomicWriteFile, withLock, LockTimeoutError, readRemoteDrain, readDrainMarkers, writeRemoteDrain, clearRemoteDrain, HUMAN_DRAIN_OWNER } from './state.js';
 import { remoteShutdownCommand } from './remote-runner.js';
-import { collectStatus, renderRemoteDrainLine } from './status.js';
+import { collectStatus, renderRemoteDrainLine, renderDrainMarkerLines } from './status.js';
 
 export async function pauseCommand(reason = '') {
   const p = ensureStateDirs();
@@ -26,25 +26,34 @@ export async function resumeCommand() {
   return { exitCode: 0 };
 }
 
-/** BRAIN-520: take this host out of remote selection. Local admission, queued tickets and running leases are untouched. */
-export async function drainCommand(reason = '') {
+/**
+ * BRAIN-520: take this host out of remote selection. Local admission, queued tickets and running leases are untouched.
+ * `owner` (default `human`, the ownerless `lane drain`) names who holds this marker; `expiresAt` (ms epoch) makes it lapse by itself.
+ */
+export async function drainCommand(reason = '', { owner = HUMAN_DRAIN_OWNER, expiresAt } = {}) {
   const p = ensureStateDirs();
-  const marker = await writeRemoteDrain(p.root, reason);
+  const marker = await writeRemoteDrain(p.root, reason, { owner, expiresAt });
   const status = await collectStatus();
-  process.stdout.write(`lane draining: no new remote work is sent here; this host still runs its own\n${renderRemoteDrainLine(marker, { running: status.running.length, queued: status.queued.length })}\n`);
+  process.stdout.write(`lane draining: no new remote work is sent here; this host still runs its own\n${renderRemoteDrainLine(marker, { running: status.running.length, queued: status.queued.length })}\n${renderDrainMarkerLines(readDrainMarkers(p.root))}\n`);
   return { exitCode: 0 };
 }
 
-export async function undrainCommand() {
+/** Removes only `owner`'s marker: another owner's drain keeps the host draining, and says so. */
+export async function undrainCommand({ owner = HUMAN_DRAIN_OWNER } = {}) {
   const p = ensureStateDirs();
   try {
-    await clearRemoteDrain(p.root);
+    await clearRemoteDrain(p.root, owner);
   } catch (err) {
     process.stderr.write(`lane undrain: ${err.message}\n`);
     return { exitCode: 1 };
   }
   const pausedReason = fs.existsSync(paths(p.root).pause) ? fs.readFileSync(paths(p.root).pause, 'utf8').trim() : null;
-  process.stdout.write(`lane undrained${pausedReason ? ` (still paused: ${pausedReason}; lane resume to admit work again)` : ''}\n`);
+  const holders = readDrainMarkers(p.root);
+  const hints = [
+    ...(pausedReason ? [`still paused: ${pausedReason}; lane resume to admit work again`] : []),
+    ...(holders.length ? [`still draining: ${holders.map((m) => `${m.owner}: ${m.reason}`).join(', ')}`] : []),
+  ];
+  process.stdout.write(`lane undrained${hints.length ? ` (${hints.join('; ')})` : ''}\n`);
   return { exitCode: 0 };
 }
 

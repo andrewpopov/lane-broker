@@ -1057,25 +1057,91 @@ export function resolvePriority({ cli, env, configTier, exclusive = false }) {
   return configTier ?? (exclusive ? 'high' : DEFAULT_PRIORITY);
 }
 
-export function loadGlobalConfig({ home = brokerHome() } = {}) {
-  const file = path.join(home, 'config.json');
-  let text;
-  try {
-    text = fs.readFileSync(file, 'utf8');
-  } catch (err) {
-    // BRAIN-321: only a genuinely ABSENT file is "no config". An inaccessible one (EACCES, a parent dir we cannot enter, ...) leaves the
-    // class policy unknown (`ConfigError`), and a file that disappeared after a `classes` block was in force keeps the fence; either way sims are denied.
-    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') {
-      return classesFenceHeld() ? { ...DEFAULT_GLOBAL_CONFIG, classesInvalid: `${file} is gone but a classes block was in force; restore it (or remove ${paths(stateHome()).classesConfigured})` } : { ...DEFAULT_GLOBAL_CONFIG };
-    }
-    // thrown, so `reloadGlobalConfig` keeps the PREVIOUS config's other settings (capacity, reserves, runners) and marks only the class policy invalid
-    throw new ConfigError(`${file}: unreadable (${err.code ?? err.message})`);
-  }
+export const CONFIG_OVERLAY_DIR = 'config.d';
+
+/**
+ * BRAIN-1141: the keys every long-running process (the supervisor's poll loop, the pull agent) picks up from a changed config file
+ * without a restart: each is re-read from `loadGlobalConfig` on the next poll. Anything else is read when a process starts or
+ * needs it, so only this list is a contract. The agent's own `~/.config/lane-agent/config.json` is never live.
+ */
+export const LIVE_RELOAD_KEYS = Object.freeze(['capacity', 'cpuAdmissionPercent', 'cpuReserveCores', 'memoryReserveBytes', 'schedulerMode', 'sampleMs', 'laneNice', 'priorityNice', 'localExecution', 'deviceGates']);
+
+/** Drop every key that starts with `_` at every level: a place for comments and notes in a config file. */
+function withoutUnderscoreKeys(value) {
+  if (Array.isArray(value)) return value.map(withoutUnderscoreKeys);
+  if (!isPlainObject(value)) return value;
+  return Object.fromEntries(Object.entries(value).filter(([key]) => !key.startsWith('_')).map(([key, inner]) => [key, withoutUnderscoreKeys(inner)]));
+}
+
+function parseConfigFile(file, text, { mustBeObject = false } = {}) {
   let parsed;
   try {
     parsed = JSON.parse(text);
   } catch (err) {
     throw new ConfigError(`${file}: invalid JSON (${err.message})`);
+  }
+  if (mustBeObject && !isPlainObject(parsed)) throw new ConfigError(`${file}: overlay must be a JSON object`);
+  return withoutUnderscoreKeys(parsed);
+}
+
+/** `<home>/config.d/*.json` in lexical filename order; an absent directory is no overlays. */
+function readOverlays(home) {
+  const dir = path.join(home, CONFIG_OVERLAY_DIR);
+  let names;
+  try {
+    names = fs.readdirSync(dir);
+  } catch (err) {
+    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return [];
+    throw new ConfigError(`${dir}: unreadable (${err.code ?? err.message})`);
+  }
+  return names.filter((name) => name.endsWith('.json')).sort().map((name) => {
+    const file = path.join(dir, name);
+    let text;
+    try {
+      text = fs.readFileSync(file, 'utf8');
+    } catch (err) {
+      throw new ConfigError(`${file}: unreadable (${err.code ?? err.message})`);
+    }
+    return { source: `${CONFIG_OVERLAY_DIR}/${name}`, file, parsed: parseConfigFile(file, text, { mustBeObject: true }) };
+  });
+}
+
+/** The error for a merged config that fails validation names the overlay files that set a key the message mentions, else every overlay applied. */
+function blameOverlays(err, layers, keySource) {
+  const overlays = layers.filter((layer) => layer.source !== 'config.json');
+  if (!(err instanceof ConfigError) || overlays.length === 0) return err;
+  const mentioned = new Set(Object.entries(keySource).filter(([key, source]) => source !== 'config.json' && err.message.includes(`"${key}`)).map(([, source]) => source));
+  const blamed = mentioned.size > 0 ? [...mentioned] : overlays.map((layer) => layer.source);
+  return new ConfigError(`${err.message} (overlay ${blamed.join(', ')})`);
+}
+
+/**
+ * The global config and, for each top-level key, where it came from: `config.json`, `config.d/<name>` or `default`. The human-owned
+ * `config.json` loads first, then each overlay in lexical filename order; a later file replaces a top-level key whole (no deep merge).
+ * Validation runs on the merged result.
+ */
+export function loadEffectiveGlobalConfig({ home = brokerHome() } = {}) {
+  const file = path.join(home, 'config.json');
+  const layers = [];
+  let missing = false;
+  try {
+    layers.push({ source: 'config.json', file, parsed: parseConfigFile(file, fs.readFileSync(file, 'utf8')) });
+  } catch (err) {
+    if (err instanceof ConfigError) throw err;
+    // BRAIN-321: only a genuinely ABSENT file is "no config". An inaccessible one (EACCES, a parent dir we cannot enter, ...) leaves the
+    // class policy unknown (`ConfigError`), and a file that disappeared after a `classes` block was in force keeps the fence; either way sims are denied.
+    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') missing = true;
+    // thrown, so `reloadGlobalConfig` keeps the PREVIOUS config's other settings (capacity, reserves, runners) and marks only the class policy invalid
+    else throw new ConfigError(`${file}: unreadable (${err.code ?? err.message})`);
+  }
+  layers.push(...readOverlays(home));
+  const parsed = {};
+  const keySource = {};
+  for (const layer of layers) {
+    for (const [key, value] of Object.entries(layer.parsed ?? {})) {
+      parsed[key] = value;
+      keySource[key] = layer.source;
+    }
   }
   const cfg = { ...DEFAULT_GLOBAL_CONFIG, ...parsed };
   // A partial `priorityWeights` overrides only the weights it names; the age cap follows the aging step unless set.
@@ -1092,20 +1158,31 @@ export function loadGlobalConfig({ home = brokerHome() } = {}) {
   if (parsed.priorityAgeMaxMs === undefined && Number.isInteger(cfg.priorityAgingMs)) {
     cfg.priorityAgeMaxMs = 2 * cfg.priorityAgingMs;
   }
-  validateGlobalConfig(cfg, file);
+  try {
+    validateGlobalConfig(cfg, file);
+  } catch (err) {
+    throw blameOverlays(err, layers, keySource);
+  }
   // BRAIN-321: a broken `classes` block must not take the whole config (and every lane) down with it, nor read as "no caps":
   // it is set aside and the sim class is ineligible until it is fixed (see resolveClasses).
   if (cfg.classes !== undefined) {
     try {
-      validateClasses(cfg.classes, file);
+      validateClasses(cfg.classes, layers.find((layer) => layer.source === keySource.classes).file);
     } catch (err) {
       if (!(err instanceof ClassesConfigError)) throw err;
       delete cfg.classes;
       cfg.classesInvalid = err.message;
     }
+  } else if (missing && classesFenceHeld()) {
+    cfg.classesInvalid = `${file} is gone but a classes block was in force; restore it (or remove ${paths(stateHome()).classesConfigured})`;
   }
   setClassesFence(cfg.classes !== undefined || cfg.classesInvalid !== undefined);
-  return applyOfflineMarks(cfg, readOfflineMarks(stateHome()));
+  const config = applyOfflineMarks(cfg, readOfflineMarks(stateHome()));
+  return { config, sources: Object.fromEntries(Object.keys(config).map((key) => [key, keySource[key] ?? 'default'])), files: layers.map((layer) => layer.source) };
+}
+
+export function loadGlobalConfig({ home = brokerHome() } = {}) {
+  return loadEffectiveGlobalConfig({ home }).config;
 }
 
 const classesFenceFile = () => paths(stateHome()).classesConfigured;
@@ -1185,13 +1262,18 @@ export function reloadGlobalConfig(previous, { onError } = {}) {
  */
 export function assertHostConfigHookless() {
   const file = path.join(brokerHome(), 'config.json');
-  let parsed;
+  const merged = {};
   try {
-    parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    Object.assign(merged, parseConfigFile(file, fs.readFileSync(file, 'utf8')));
   } catch {
-    return;
+    // a missing or unparseable config.json is not this check's concern
   }
-  const keys = unsupportedHookKeys(parsed);
+  try {
+    for (const layer of readOverlays(brokerHome())) Object.assign(merged, layer.parsed);
+  } catch {
+    // an unreadable overlay is reported by the config load itself
+  }
+  const keys = unsupportedHookKeys(merged);
   if (keys.length > 0) throw new ConfigError(hookRefusalMessage(file, keys));
 }
 

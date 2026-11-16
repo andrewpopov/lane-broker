@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { drainBlocksIntake, executionIdOf, readDrainMarker, readRemoteDrain, stateHome, ensureStateDirs } from '../state.js';
+import { drainBlocksIntake, executionIdOf, readDrainMarker, readDrainMarkers, stateHome, ensureStateDirs } from '../state.js';
 import { runnerAvailability } from '../runner-schedule.js';
 import { closedGateReason } from '../device-gates.js';
 import { loadGlobalConfig } from '../config.js';
@@ -16,11 +16,17 @@ import { reportReadiness } from '../runner-readiness.js';
 
 export const MAX_FREE_MEM = Number.MAX_SAFE_INTEGER;
 
-export const isDraining = (stateDir = stateHome()) => readRemoteDrain(stateDir) !== null || drainBlocksIntake(readDrainMarker(stateDir));
+/** Who is draining this host: every unexpired drain marker's owner, plus `migration` while a scheduler migration holds intake. */
+export const drainOwners = (stateDir = stateHome()) => [...readDrainMarkers(stateDir).map((m) => m.owner), ...(drainBlocksIntake(readDrainMarker(stateDir)) ? ['migration'] : [])];
 
-/** Why this runner takes no new claim now, or null: a drain marker, outside its schedule window, too close to the window closing, or a closed device gate. */
-export function claimBlock({ schedule, stopClaimingBeforeCloseMs, now = Date.now(), draining = isDraining, deviceGates }) {
-  if (draining()) return 'draining';
+export const isDraining = (stateDir = stateHome()) => drainOwners(stateDir).length > 0;
+
+/** Why this runner takes no new claim now, or null: a drain marker (`draining (bosun)`, naming its owners), outside its schedule window, too close to the window closing, or a closed device gate. */
+export function claimBlock({ schedule, stopClaimingBeforeCloseMs, now = Date.now(), draining = isDraining, owners = () => [], deviceGates }) {
+  if (draining()) {
+    const by = owners();
+    return by.length ? `draining (${by.join(', ')})` : 'draining';
+  }
   const { available, closesAt } = runnerAvailability(schedule, now);
   if (!available) return 'outside-schedule';
   if (closesAt !== null && closesAt - now <= stopClaimingBeforeCloseMs) return 'closing-soon';

@@ -1,7 +1,7 @@
 import { openAgentCore } from './agent.js';
 import { AgentConfigError } from './config.js';
 import { loadGlobalConfig } from '../config.js';
-import { claimBlock, claimFigures, claimOnce, isDraining, presentTools } from './claims.js';
+import { claimBlock, claimFigures, claimOnce, drainOwners, isDraining, presentTools } from './claims.js';
 import { ExecutionDriver } from './execution.js';
 import { createS3Client } from '../s3-client.js';
 import { Waker } from './waker.js';
@@ -68,7 +68,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
       log(`metrics: ${err.message}`);
     }
   };
-  const block = () => stopped ? 'stopping' : driver.scopeBlock() ?? claimBlock({ schedule: config.schedule, stopClaimingBeforeCloseMs: config.stopClaimingBeforeCloseMs, now: now(), draining: isDrainingNow, deviceGates });
+  const block = () => stopped ? 'stopping' : driver.scopeBlock() ?? claimBlock({ schedule: config.schedule, stopClaimingBeforeCloseMs: config.stopClaimingBeforeCloseMs, now: now(), draining: isDrainingNow, owners: () => drainOwners(config.stateDir), deviceGates });
 
   const reloadDeviceGatesConfig = () => {
     try {

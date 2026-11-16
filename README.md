@@ -514,6 +514,67 @@ within one `sampleMs`, not only for supervisors started afterward. A missing
 or invalid config file during a reload is ignored and the last known-good
 config keeps being used; it never crashes or wedges a running supervisor.
 
+## Config overlays and bosun
+
+bosun, the per-machine supervisor, tunes this broker's worker config within per-host bounds and journals every change. It never
+edits `config.json`. It writes an overlay file next to it.
+
+**Files.** `<home>/config.json` (`~/.config/lane-broker/config.json`, or `$LANE_BROKER_HOME/config.json`) loads first. Then every
+`<home>/config.d/*.json` loads in lexical filename order. A missing `config.d` is fine; files that do not end in `.json` are ignored.
+
+| File | Owner |
+|---|---|
+| `config.json` | humans |
+| `config.d/50-bosun.json` | bosun |
+| `config.d/90-*.json` | humans, for overrides that must beat bosun |
+
+**Precedence.** A later file wins, per top-level key. Nested objects (`deviceGates`, `priorityNice`, `runners`, ...) are replaced
+whole, never deep-merged: an overlay that sets `deviceGates` must carry every gate it wants. (The built-in defaults for
+`priorityWeights` and `lanePull` still fill in the parts the winning file omits, as they do for `config.json`.) Validation runs
+on the merged result, so a value is only wrong if the config that results is wrong. A failure names the overlay file that set a key
+the message mentions, as `(overlay config.d/50-bosun.json)`; an unparseable overlay names its path. Under a supervisor or agent a bad edit keeps the last good config, as it
+does for `config.json`.
+
+**`_` keys.** Any key that starts with `_` is ignored at every level, in `config.json` and in overlays. Use them for notes and
+for provenance such as `"_writtenBy": "bosun"`.
+
+**`lane config effective [--json]`** prints the merged config and, for each top-level key, the file that set it: `config.json`,
+`config.d/<name>` or `default`. `--json` prints `{home, files, config, sources, liveReload}`. It reads the files and changes none
+of them.
+
+**Live reload.** Overlays are re-read wherever `config.json` is, so every live-reload key below takes effect without restarting
+the agent or any supervisor: the supervisor's poll loop re-reads the config every `sampleMs`, and the agent re-reads it on every
+claim and device-gate sample. The list is the exported `LIVE_RELOAD_KEYS` and appears as `liveReload` in `lane config effective --json`:
+
+`capacity`, `cpuAdmissionPercent`, `cpuReserveCores`, `memoryReserveBytes`, `schedulerMode`, `sampleMs`, `laneNice`,
+`priorityNice`, `localExecution`, `deviceGates`.
+
+A lane that is already running keeps the nice and CPU quota it started with; `laneNice` and `priorityNice` apply to the next lane
+that starts. Every other key is read when a process starts or needs it, so a change reaches new processes but is not a promise for
+a long-running one: treat it as needing a restart. The pull agent's own `~/.config/lane-agent/config.json` (`pollMs`,
+`speedFactor`, `schedule`, ...) is never live.
+
+**Drain owners.**
+
+```
+lane drain --owner bosun --reason "tuning" [--expires 30m|2026-11-16T09:00:00Z]
+lane undrain --owner bosun
+```
+
+Several owners can hold a drain at once, each with its own marker, and the host is draining while any marker is unexpired. A marker
+with `--expires` (an ISO time, or a duration such as `30m`, `2h`) is ignored from that moment and removed by the next `lane
+drain`, `lane undrain` or `lane status`. `lane undrain --owner x` removes only `x`'s marker; when others remain it prints who.
+Re-draining under the same owner keeps `since` and replaces the reason and expiry. An owner is lowercase letters, digits, `.`, `_`
+or `-`. `lane drain ["reason"]` and `lane undrain` with no `--owner` are owner `human`, with the same file (`remote-drain.json`) and
+output as before, so an ownerless `lane undrain` no longer clears another owner's drain. Other owners' markers are
+`drain-owners/<owner>.json` in the state root. `lane status` lists each active marker with owner, reason and expiry (`drainMarkers` in `--json`), and the
+agent's status shows `claims: paused:draining (bosun)`, naming every owner.
+
+**What bosun reads.** The agent's textfile metrics are the `lane_agent_*` families documented under "Textfile metrics" in
+[Pull agent client core](#pull-agent-client-core-brain-1035) (`lane_agent_last_tick_timestamp_seconds`,
+`lane_agent_executions{subphase}`, `lane_agent_claims_total{answer}`, `lane_agent_listen_up`, `lane_agent_registered`,
+`lane_agent_scope_available`, `lane_agent_device_gate_closed{gate}`, `lane_agent_info{version}`).
+
 ## Remote runners (BRAIN-319)
 
 A lane can run on another machine instead of this one, and fall back to this
@@ -1628,6 +1689,8 @@ Run these on the runner itself (the machine whose `lane remote-exec` receives th
 original `since` and replaces the reason. A marker that cannot be read counts as draining (`drain marker unreadable`), and
 `lane undrain` still removes it. Pause and drain are independent: `lane resume` does not undrain, `lane undrain` does not
 resume, and each prints a hint when the other is still set.
+
+Owned and expiring drains (`--owner`, `--reason`, `--expires`) are in "Config overlays and bosun" above; this section describes the ownerless drain, which is owner `human`.
 
 **What drain does.** The runner's probe reports `remoteDrain` (and sets `draining` and `paused`, so a submitter older than 0.33
 skips it too), so no submitter sends it new remote work. Submitters that hold a ticket queued on it move that ticket away
