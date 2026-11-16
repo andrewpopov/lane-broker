@@ -298,11 +298,11 @@ test('live reload, agent claims: the figures a claim offers follow the reserves 
   const env = freshEnv();
   writeGlobalConfig(env.home, { schedulerMode: 'shadow', cpuAdmissionPercent: 100, cpuReserveCores: 1, memoryReserveBytes: 1_000_000_000 });
   await inEnv(env, async () => {
-    assert.deepEqual(await claimFigures({ host: HOST }), { freeCpu: 7, freeMem: 15_000_000_000 });
+    assert.deepEqual(await claimFigures({ host: HOST }), { freeCpu: 7, freeMem: 15_000_000_000, budgetCpu: 7 });
     writeOverlay(env.home, '50-bosun.json', { cpuReserveCores: 4, memoryReserveBytes: 6_000_000_000 });
-    assert.deepEqual(await claimFigures({ host: HOST }), { freeCpu: 4, freeMem: 10_000_000_000 });
+    assert.deepEqual(await claimFigures({ host: HOST }), { freeCpu: 4, freeMem: 10_000_000_000, budgetCpu: 4 });
     writeOverlay(env.home, '90-human.json', { cpuAdmissionPercent: 25 });
-    assert.deepEqual(await claimFigures({ host: HOST }), { freeCpu: 2, freeMem: 10_000_000_000 });
+    assert.deepEqual(await claimFigures({ host: HOST }), { freeCpu: 2, freeMem: 10_000_000_000, budgetCpu: 2 });
   });
 });
 
