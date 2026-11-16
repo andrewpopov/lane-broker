@@ -185,7 +185,7 @@ describe('lane_dispatch schema and ACLs', { skip: pgSkipOption, timeout: 180000 
     await assert.rejects(call(agent, 'ld_set_principal', logins.a1, 'agent', 'a1', ['gpu'], ['*'], 99), /permission denied for function/);
     await assert.rejects(agent.query("UPDATE lane_dispatch.principals SET tags = '{gpu}'"), /permission denied/);
     const before = (await (await world.su()).query('SELECT * FROM lane_dispatch.principals WHERE login_role = $1', [logins.a1])).rows[0];
-    assert.deepEqual(await call(agent, 'ld_register', '1.2.3', 1, { quiet: [1, 6] }), { host: 'a1', max_claims: 2, protocol_min: 1 });
+    assert.deepEqual(await call(agent, 'ld_register', '1.2.3', 1, { quiet: [1, 6] }), { host: 'a1', max_claims: 2, protocol_min: 1, head_reserve: true, claim_weight: true });
     const su = await world.su();
     assert.deepEqual((await su.query('SELECT * FROM lane_dispatch.principals WHERE login_role = $1', [logins.a1])).rows[0], before);
     assert.deepEqual((await su.query("SELECT host, version, protocol, schedule FROM lane_dispatch.runners WHERE host = 'a1'")).rows, [{ host: 'a1', version: '1.2.3', protocol: 1, schedule: { quiet: [1, 6] } }]);

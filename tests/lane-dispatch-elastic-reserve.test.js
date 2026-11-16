@@ -170,7 +170,7 @@ const CANARIES = [
     "coalesce(p_avoid_tags, '{}'), CASE WHEN p_min_cpu_cores < p_cpu_cores THEN p_min_cpu_cores END,", "coalesce(p_avoid_tags, '{}'), p_min_cpu_cores,"],
   ['a runner holds back for an aged head it could fit: no backfill until the head fits, then it takes the head', RESERVE, ''],
   ['the reservation holds only on a runner that could fit the head, holds a claim, reports its budget, and only for an aged head',
-    'IF FOUND AND extract(epoch FROM v_now - v_head.created_at) >= lane_dispatch.age_horizon_s()', 'IF FOUND'],
+    'IF FOUND AND extract(epoch FROM v_head.credited) >= lane_dispatch.age_horizon_s()', 'IF FOUND'],
   ['the reservation holds only on a runner that could fit the head, holds a claim, reports its budget, and only for an aged head', CAPACITY_FIT, 'true'],
   ['a head this runner could never fit on memory holds nothing, so the runner backfills', 'AND t.memory_bytes <= coalesce(p_capacity_mem, p_free_mem)', ''],
   ['a head too big for this runner is passed over, and the reservation goes to the next aged ticket it could fit', CAPACITY_FIT, 'true AND t.memory_bytes <= coalesce(p_capacity_mem, p_free_mem)'],
@@ -181,7 +181,7 @@ const CANARIES = [
 test('the head query shares the claim query\'s eligibility and order, so the reservation never names a ticket the claim would rank differently', () => {
   const sql = fs.readFileSync(new URL('../sql/lane/functions.sql', import.meta.url), 'utf8');
   const body = sql.slice(sql.indexOf('CREATE OR REPLACE FUNCTION lane_dispatch.ld_claim('), sql.indexOf('CREATE OR REPLACE FUNCTION lane_dispatch.ld_start('));
-  const queries = [...body.matchAll(/FROM lane_dispatch\.tickets t\n([\s\S]*?)LIMIT 1/g)].map((m) => m[1].split('\n').filter((line) => !/<= p_(free|capacity)_cpu/.test(line)).join('\n'));
+  const queries = [...body.matchAll(/FROM lane_dispatch\.tickets t\n([\s\S]*?)LIMIT 1/g)].map((m) => m[1].split('\n').filter((line) => !/<= p_(free|capacity)_cpu|ticket_weight/.test(line)).join('\n'));
   assert.equal(queries.length, 2);
   assert.equal(queries[1], queries[0]);
 });

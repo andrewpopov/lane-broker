@@ -72,13 +72,13 @@ export async function call(client, name, ...args) {
 
 export const tid = gid;
 
-export const enqueue = (client, id, { repo = 'repoA', laneKey = `lk-${id}`, tags = [], cpu = 1, mem = 1000, priority = 0, minProtocol = 1, ages = true, source = null, estRunS = null, avoidTags = [], minCpu } = {}) =>
-  call(client, 'ld_enqueue', id, repo, 'test', laneKey, { protocol: 1 }, { cmd: ['true'] }, { key: 'snap', sha256: 'x' }, tags, cpu, mem, priority, minProtocol, ages, source, estRunS, avoidTags,
+export const enqueue = (client, id, { repo = 'repoA', laneKey = `lk-${id}`, tags = [], cpu = 1, mem = 1000, priority = 0, minProtocol = 1, ages = true, source = null, estRunS = null, avoidTags = [], minCpu, weight } = {}) =>
+  call(client, 'ld_enqueue', id, repo, 'test', laneKey, { protocol: 1 }, { cmd: ['true'], ...(weight === undefined ? {} : { weight }) }, { key: 'snap', sha256: 'x' }, tags, cpu, mem, priority, minProtocol, ages, source, estRunS, avoidTags,
     ...(minCpu === undefined ? [] : [minCpu]));
 
-/** `capacity` (the runner's whole CPU budget, BRAIN-1099) is sent only when given, so the default is the 4-argument call an older agent makes. */
-export const claim = (client, { req = randomUUID(), cpu = 8, mem = 1e9, held = [], capacity, capacityMem = 1e10 } = {}) =>
-  call(client, 'ld_claim', req, cpu, mem, held, ...(capacity === undefined ? [] : [capacity, capacityMem]));
+/** `capacity` (the runner's whole CPU budget, BRAIN-1099) and `freeWeight` with `weightLimit` (BRAIN-1106) are sent only when given, so the default is the 4-argument call an older agent makes. */
+export const claim = (client, { req = randomUUID(), cpu = 8, mem = 1e9, held = [], capacity, capacityMem = 1e10, freeWeight, weightLimit = null } = {}) =>
+  call(client, 'ld_claim', req, cpu, mem, held, ...(capacity === undefined && freeWeight === undefined ? [] : [capacity ?? null, capacityMem, ...(freeWeight === undefined ? [] : [freeWeight, weightLimit])]));
 
 export const finish = (client, claimed, result = { kind: 'ok', exitCode: 0 }) => call(client, 'ld_finish', claimed.id, claimed.epoch, claimed.token, result);
 export const start = (client, claimed) => call(client, 'ld_start', claimed.id, claimed.epoch, claimed.token);
@@ -115,6 +115,7 @@ export async function downgradeToV6(world) {
 
 /** Puts the world's queue back to schema version 7 (the 0abb77e functions.sql, a copy of the v0.105 release's): no 008 columns, none of the 008 function signatures. */
 export async function downgradeToV7(world) {
+  await downgradeToV8(world);
   const su = await world.su();
   await su.query('ALTER TABLE lane_dispatch.tickets DROP COLUMN min_cpu_cores, DROP COLUMN claimed_cpu_cores');
   await su.query('ALTER TABLE lane_dispatch.cluster DROP COLUMN elastic_floor_after_s');
@@ -124,6 +125,14 @@ export async function downgradeToV7(world) {
   await su.query('DROP FUNCTION lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], real)');
   await su.query('DROP FUNCTION lane_dispatch.ld_claim(uuid, real, bigint, text[], real, bigint)');
   await su.query('DROP FUNCTION lane_dispatch.claim_need(real, real, interval, interval)');
+}
+
+/** Puts the world's queue back to schema version 8 (the 6b4d948 functions.sql, BRAIN-1099): no 009 function signatures. */
+export async function downgradeToV8(world) {
+  const su = await world.su();
+  await su.query('DELETE FROM lane.schema_version WHERE version = 9');
+  await su.query('DROP FUNCTION lane_dispatch.ld_claim(uuid, real, bigint, text[], real, bigint, real, real)');
+  await su.query(fs.readFileSync(new URL('./fixtures/lane-v8-functions.sql', import.meta.url), 'utf8'));
 }
 
 /** A restore, as far as the queue can tell: the recorded timeline no longer matches the cluster's. */

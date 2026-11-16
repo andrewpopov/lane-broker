@@ -183,7 +183,8 @@ export class LdClient {
   }
 
   claim(req, freeCpu, freeMem, heldKeys = [], opts, capacity = null) {
-    return this.#run('ld_claim', [req, freeCpu, String(freeMem), heldKeys, ...(capacity === null ? [] : [capacity.cpu, String(capacity.mem)])], opts);
+    const weights = capacity?.freeWeight === undefined ? [] : [capacity.freeWeight, capacity.weightLimit];
+    return this.#run('ld_claim', [req, freeCpu, String(freeMem), heldKeys, ...(capacity === null ? [] : [capacity.cpu, String(capacity.mem), ...weights])], opts);
   }
 
   start(id, epoch, token, opts) {
