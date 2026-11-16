@@ -10,8 +10,8 @@
     },
     "train": {
       "weight": 2,
-      "cpuCores": 6,
-      "minCpuCores": 4,
+      "cpuCores": 3,
+      "minCpuCores": 3,
       "silenceTimeoutMs": 1200000
     },
     "pr": {
