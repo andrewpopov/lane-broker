@@ -9,6 +9,7 @@ import { HELD_STATES } from '../scheduler.js';
 import { detectResourceCapacity, cpuBudgetCores } from '../resources.js';
 import { PROBE_LOCK_WAIT_MS, probeCpuHeadroom, probeHeadroom } from '../remote-runner.js';
 import { clearPendingClaim, newExecutionRecord, readPendingClaim, writePendingClaim } from './store.js';
+import { reportReadiness } from '../runner-readiness.js';
 
 export const MAX_FREE_MEM = Number.MAX_SAFE_INTEGER;
 
@@ -39,23 +40,44 @@ export async function claimFigures({ cfg = loadGlobalConfig(), host = detectReso
   return { freeCpu: headroom.cpuCores, freeMem: clampMem(headroom.memoryBytes) };
 }
 
+const UNDEFINED_FUNCTION = '42883';
+
+/** The names in `names` that the readiness `tools` check finds on `envPath`: the one answer to "does this runner have the tool", push or pull. */
+export const toolsOnPath = (names, envPath) => {
+  const found = reportReadiness({ tools: names }, { envPath }).tools ?? {};
+  return names.filter((name) => found[name] === true);
+};
+
+/** BRAIN-1135: the tools the queued tickets this agent may claim require that are on `envPath` (its lanes' PATH); null on a queue before migration 008. */
+export async function presentTools({ ld, envPath }) {
+  let needed;
+  try {
+    needed = await ld.neededTools();
+  } catch (err) {
+    if (err.code === UNDEFINED_FUNCTION) return null;
+    throw err;
+  }
+  return toolsOnPath(needed ?? [], envPath);
+}
+
 /**
  * One `ld_claim`. The request id is persisted before the call and kept until a definite answer, however long ago: a replay returns the
  * claim the lost answer carried. A `claimed` answer persists the execution record (adopting one that a replay already wrote) before the
  * request is deleted. Returns `{status}`: `claimed` (with `execId`), `none`, `upgrade` (this agent's protocol is below the queue's
- * minimum: claims must stop), or `skipped` (with `reason`).
+ * minimum: claims must stop), or `skipped` (with `reason`). Only tickets whose required tools `tools()` names are offered.
  */
-export async function claimOnce({ core, remoteRoot, figures = claimFigures, block, now = Date.now }) {
+export async function claimOnce({ core, remoteRoot, figures = claimFigures, block, now = Date.now, tools = () => presentTools({ ld: core.ld, envPath: process.env.PATH }) }) {
   const reason = block();
   if (reason) return { status: 'skipped', reason };
   const offered = await figures();
   if (!offered) return { status: 'skipped', reason: 'no-headroom' };
+  const hasTools = await tools();
   const pending = readPendingClaim(remoteRoot);
   const req = pending?.req ?? randomUUID();
   if (!pending) writePendingClaim(remoteRoot, req);
   const heldKeys = core.table.all().filter((r) => r.subphase !== 'DONE').map((r) => r.claim.laneKey);
   let execId;
-  const answer = await core.ld.claim(req, offered.freeCpu, offered.freeMem, heldKeys, {
+  const answer = await core.ld.claim(req, offered.freeCpu, offered.freeMem, heldKeys, hasTools, {
     live: () => block() === null,
     persist: (a) => {
       if (a.status === 'claimed') {

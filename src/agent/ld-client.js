@@ -182,8 +182,12 @@ export class LdClient {
     return this.#run('ld_register', [this.version, PROTOCOL, this.schedule === null ? null : JSON.stringify(this.schedule)], { ...opts, persist: (answer) => { this.registered = answer; } });
   }
 
-  claim(req, freeCpu, freeMem, heldKeys = [], opts) {
-    return this.#run('ld_claim', [req, freeCpu, String(freeMem), heldKeys], opts);
+  claim(req, freeCpu, freeMem, heldKeys = [], hasTools = null, opts) {
+    return this.#run('ld_claim', [req, freeCpu, String(freeMem), heldKeys, ...(hasTools === null ? [] : [hasTools])], opts);
+  }
+
+  neededTools(opts) {
+    return this.#run('ld_needed_tools', [], opts);
   }
 
   start(id, epoch, token, opts) {

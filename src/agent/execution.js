@@ -12,7 +12,7 @@ import { publishBlob } from '../remote-blobs.js';
 import { BlobLease, VerdictError, bindingProblem, downloadVerified, hashFile, prefetchBlobs, readSnapshotHeader } from './fetch.js';
 import { artifactsDirOf, uploadOutputs } from './upload.js';
 import { stopEvidence } from './stop-proof.js';
-import { isDraining } from './claims.js';
+import { isDraining, toolsOnPath } from './claims.js';
 import { Waker } from './waker.js';
 
 const PRE_START = new Set(['FETCHING', 'STARTING']);
@@ -293,6 +293,13 @@ export class ExecutionDriver {
         return this.#cas(execId, ['STARTING'], { subphase: 'FETCHING' });
       }
       if (this.draining() || this.scopeBlock()) return this.#releasing(record);
+      const required = record.claim.requires ?? [];
+      const present = toolsOnPath(required, this.spawnEnv.PATH);
+      const missing = required.filter((name) => !present.includes(name));
+      if (missing.length > 0) {
+        this.log(`${execId}: missing tool ${missing.join(', ')} on this runner's PATH; released, never started`);
+        return this.#releasing(record);
+      }
     }
     await this.ld.start(record.id, record.epoch, record.token, {
       live: () => {

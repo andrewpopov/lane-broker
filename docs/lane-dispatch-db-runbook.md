@@ -1,6 +1,6 @@
 # lane_dispatch database setup (cluster level)
 
-`sql/lane/migrations/005-lane-dispatch.sql`, `006-pull-simplify.sql`, `007-avoid-tags.sql` and `sql/lane/functions.sql` create the `lane_dispatch` schema, its functions and every
+`sql/lane/migrations/005-lane-dispatch.sql`, `006-pull-simplify.sql`, `007-avoid-tags.sql`, `008-requires.sql` and `sql/lane/functions.sql` create the `lane_dispatch` schema, its functions and every
 grant that lives inside the database. `applyDatabaseAcls` (`src/lane-db.js`) revokes CONNECT, CREATE and TEMP on the current
 database from PUBLIC and grants CONNECT to the four lane group roles. It is opt-in (`applyMigrations(client, { databaseAcls: true })`
 or a direct call), and it throws before revoking anything when the database holds a schema other than `lane`, `lane_dispatch`
@@ -67,6 +67,8 @@ Every `ld_*` call must run at READ COMMITTED; any other isolation level is refus
 
 `ld_register(version, protocol, schedule)` stores `runners.protocol` and answers `{host, max_claims, protocol_min}`. `ld_claim` answers `{status: 'upgrade', protocol_min}` when the host has no `runners` row or its protocol is below `protocol_min()` (a constant, 1), and writes no `claim_requests` row for it. A ticket's `min_protocol` (an `ld_enqueue` argument) hides it from older runners.
 
+`ld_claim(req, free_cpu, free_mem, held_keys, has_tools)` takes a ticket only when its `requires` (the lane's tools, the trailing `ld_enqueue` argument since migration 008) is a subset of `has_tools`. The agent builds `has_tools` from `ld_needed_tools()`, the sorted, distinct tools of the queued tickets that agent is eligible for, by checking each one on the PATH it spawns lanes with. A 4-argument claim (an agent older than BRAIN-1135) passes no tools, so it never takes a ticket that requires one. `claim_view` returns `requires`, so the agent can check again before `ld_start`.
+
 `ld_release` takes the proofs `never-started` and `cancel-confirmed` only. A `claimed` row returns to `queued` (or `cancelled` when a cancel was requested); a `running` row with a cancel requested and proof `cancel-confirmed` settles `cancelled`; any other `running` row is left unchanged and the answer is `{refused: 'started'}`. `ld_start` on a running row whose cancel was requested answers false, and a heartbeat answers `cancel: true`.
 
 ### Claim order
@@ -85,7 +87,7 @@ Each `ld_reap` tick deletes at most 1000 `claim_requests` rows: claimed mappings
 
 ## Pull client surface and retention
 
-Submit logins (the pull client) also hold `ld_queue_ref()` (the queue's `timeline.incarnation`, which moves after a restore), `ld_enqueue_fenced(expected_ref, ...)` (the `ld_enqueue` arguments after a leading ref; a stale ref returns `{state: 'stale-queue-ref', queue_ref}` and inserts nothing, otherwise it calls `ld_enqueue` unchanged, including the trailing `avoid_tags`) and `ld_placeable(repo_key, requires_tags)` (the number of agent principals with `max_claims > 0` that are eligible for the tags and repo). `ticket_view` carries `attempt_ref`, `sha256('lane-attempt-ref:' || claim_token)`, NULL while the row holds no token; `claim_token` itself never reaches a submitter. `ld_heartbeat` answers only `{fenced, cancel}`.
+Submit logins (the pull client) also hold `ld_queue_ref()` (the queue's `timeline.incarnation`, which moves after a restore), `ld_enqueue_fenced(expected_ref, ...)` (the `ld_enqueue` arguments after a leading ref; a stale ref returns `{state: 'stale-queue-ref', queue_ref}` and inserts nothing, otherwise it calls `ld_enqueue` unchanged, including the trailing `avoid_tags` and `requires`) and `ld_placeable(repo_key, requires_tags)` (the number of agent principals with `max_claims > 0` that are eligible for the tags and repo). `ticket_view` carries `attempt_ref`, `sha256('lane-attempt-ref:' || claim_token)`, NULL while the row holds no token; `claim_token` itself never reaches a submitter. `ld_heartbeat` answers only `{fenced, cancel}`.
 
 `ld_cancel` of a queued row stores a server-authored result `{kind: 'cancelled', cancelConfirmed: true, source: 'queued', epoch}`; a cancel of a claimed or running row only sets `cancel_requested`. A replayed `ld_cancel` reports `confirmed` from the stored `cancelConfirmed` (a non-boolean value reads as false), so it never upgrades an unproven cancel. A cancelled row with no stored result (released with `cancel-confirmed`, or a claimed row reaped after a cancel request) reads as confirmed.
 

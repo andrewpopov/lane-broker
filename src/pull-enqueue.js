@@ -20,6 +20,7 @@ export function enqueueArgs(envelope) {
     snapshot: envelope.snapshot,
     requiresTags: envelope.requiresTags,
     avoidTags: envelope.avoidTags ?? [],
+    requires: envelope.requires ?? [],
     cpuCores: envelope.cpuCores,
     memoryBytes: envelope.memoryBytes,
     priority: envelope.priority,

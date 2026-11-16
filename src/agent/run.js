@@ -1,7 +1,7 @@
 import { openAgentCore } from './agent.js';
 import { AgentConfigError } from './config.js';
 import { loadGlobalConfig } from '../config.js';
-import { claimBlock, claimFigures, claimOnce, isDraining } from './claims.js';
+import { claimBlock, claimFigures, claimOnce, isDraining, presentTools } from './claims.js';
 import { ExecutionDriver } from './execution.js';
 import { createS3Client } from '../s3-client.js';
 import { Waker } from './waker.js';
@@ -28,7 +28,7 @@ const LIVENESS_CALLS = new Set(['ld_claim', 'ld_heartbeat', 'ld_register']);
  * The broker's home and state directory come from `config` and replace whatever the environment says, here and in the lane processes this
  * agent spawns, so a supervisor's minimal environment and an operator's shell behave the same.
  */
-export async function startAgent({ remoteRoot, config, version, log = (line) => process.stderr.write(`${line}\n`), figures, draining, now = Date.now, timing, s3 = s3ClientOf(config.rustfs), spawnEnv = process.env, laneBin, Driver = ExecutionDriver, coreOptions = {}, textfileDir = process.env.BOSUN_TEXTFILE_DIR, stopSettleMs = STOP_SETTLE_MS, platform = process.platform, driverOptions = {}, deviceSampler = (gates) => sampleDevice(gates, { platform }) }) {
+export async function startAgent({ remoteRoot, config, version, log = (line) => process.stderr.write(`${line}\n`), figures, draining, now = Date.now, timing, s3 = s3ClientOf(config.rustfs), spawnEnv = process.env, laneBin, Driver = ExecutionDriver, coreOptions = {}, textfileDir = process.env.BOSUN_TEXTFILE_DIR, stopSettleMs = STOP_SETTLE_MS, platform = process.platform, driverOptions = {}, tools, deviceSampler = (gates) => sampleDevice(gates, { platform }) }) {
   const brokerEnv = { LANE_BROKER_HOME: config.brokerHome, LANE_BROKER_STATE: config.stateDir, ...userManagerEnv({ ...process.env, ...spawnEnv }, { platform }) };
   Object.assign(process.env, brokerEnv);
   const claimFiguresOf = figures ?? (() => claimFigures({ cfg: loadGlobalConfig({ home: config.brokerHome }) }));
@@ -46,7 +46,9 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
     await core.close();
     throw new AgentConfigError(`"runnerName" is ${config.runnerName} but the queue registers this login as ${core.ld.registered.host}`);
   }
-  driver = new Driver({ core, remoteRoot, config, s3, timing, waker, log, spawnEnv: { ...spawnEnv, ...brokerEnv }, laneBin, draining: isDrainingNow, now, onScopeChange: () => { poked = true; waker.poke(); }, ...driverOptions });
+  const laneEnv = { ...spawnEnv, ...brokerEnv };
+  const claimTools = tools ?? (() => presentTools({ ld: core.ld, envPath: laneEnv.PATH }));
+  driver = new Driver({ core, remoteRoot, config, s3, timing, waker, log, spawnEnv: laneEnv, laneBin, draining: isDrainingNow, now, onScopeChange: () => { poked = true; waker.poke(); }, ...driverOptions });
   driver.adoptAll();
   driver.watchScope();
   let stopped = false;
@@ -103,7 +105,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
     while (!stopped && !upgradeRequired) {
       let answer;
       try {
-        answer = await claimOnce({ core, remoteRoot, figures: claimFiguresOf, block, now });
+        answer = await claimOnce({ core, remoteRoot, figures: claimFiguresOf, block, now, tools: claimTools });
       } catch (err) {
         if (!stopped) log(`claim: ${err.code ?? ''} ${err.message}`);
         countClaim('error');

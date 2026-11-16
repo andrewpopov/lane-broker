@@ -873,6 +873,18 @@ shows `not ready: missing poetry (<age> ago)` on that runner until a placement p
 flag and answers no `tools`, so it counts as **not ready** for a lane with `requires` (it cannot vouch for the tool); a lane without
 `requires` sends the probe command it always did and is unaffected.
 
+**Pull dispatch** (`lanePull.enabled`, BRAIN-1135) checks the same names on the agent, in the queue. The ticket is enqueued with the lane's
+`requires` (`tickets.requires`, migration 008). Before each `ld_claim`, the agent asks `ld_needed_tools()` for the tools the queued tickets it may
+claim require. It answers them with the same `tools` check (`READINESS_CHECKS`) against the `PATH` its lanes are spawned with, which is the
+agent's own environment (a macOS LaunchDaemon's plist `PATH`, a bosun service's), not a login shell's. It then passes the tools it found as
+`ld_claim`'s `p_has_tools`. `ld_claim` offers a ticket only when every tool it requires is among them, so a runner without the tool never takes
+the lane, and another runner claims it at once with no requeue. An agent older than this release sends no `p_has_tools` and so never claims a
+ticket that requires a tool. Just before `ld_start`, the agent checks the claimed ticket's tools again: a tool gone since the claim releases
+the ticket `never-started` (logged `missing tool <name> on this runner's PATH`), which counts toward the queue's requeue cap. `ld_placeable`
+cannot see tools, so a lane whose tool no agent has waits queued until `queuedTimeoutMs`. Apply migration 008 before agents of this
+release start: an agent on an older queue sends the old 4-argument claim and checks nothing, and a submitter sends the 18-argument enqueue
+only for a lane that sets `requires`.
+
 With no eligible runner a remote-eligible lane runs locally (the local machine is not checked for the tool), and a remote-only
 (`localRefused`) lane exits `76` ("no runner can take it now", retryable) with the message naming each runner and its reason.
 A remote-eligible lane that no runner can take right now AND this machine cannot run either (a `maxExecutionCpuCores` ceiling the host cannot
