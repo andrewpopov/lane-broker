@@ -325,7 +325,7 @@ test('BRAIN-746 selectRunner: allowBusyQueue prefers an idle runner, then the fe
 // ---- queue-bypass placement: a predicted-short ticket stays local rather than join a runner's queue ----
 
 async function runBehindQueuedLocalTicket({ seedHistory, globalExtra = {}, laneExtra = {} }) {
-  const { env, state, repoDir } = setup({ globalExtra: { schedulerMode: 'active', cpuAdmissionPercent: 100, cpuReserveCores: 0, queueBypassCap: 3, ...globalExtra } });
+  const { env, state, repoDir } = setup({ globalExtra: { schedulerMode: 'active', cpuAdmissionPercent: 100, cpuReserveCores: 0, memoryReserveBytes: 0, defaultMemoryBytesPerWeight: 1, queueBypassCap: 3, ...globalExtra } });
   writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, remotePolicy: 'remote-first', ...laneExtra }, hold: { weight: 1 } } });
   // active admission reads host CPU: stub an idle host, or a loaded CI runner holds the local ticket until its real load drops
   env.LANE_BROKER_CPU_BUSY_FILE = writeCpuBusyFile(tmpDir('bypass-cpu'), 0, detectResourceCapacity().cpuCores);
