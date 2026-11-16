@@ -31,7 +31,7 @@ const LIVENESS_CALLS = new Set(['ld_claim', 'ld_heartbeat', 'ld_register']);
 export async function startAgent({ remoteRoot, config, version, log = (line) => process.stderr.write(`${line}\n`), figures, draining, now = Date.now, timing, s3 = s3ClientOf(config.rustfs), spawnEnv = process.env, laneBin, Driver = ExecutionDriver, coreOptions = {}, textfileDir = process.env.BOSUN_TEXTFILE_DIR, stopSettleMs = STOP_SETTLE_MS, platform = process.platform, driverOptions = {}, tools, deviceSampler = (gates) => sampleDevice(gates, { platform }) }) {
   const brokerEnv = { LANE_BROKER_HOME: config.brokerHome, LANE_BROKER_STATE: config.stateDir, ...userManagerEnv({ ...process.env, ...spawnEnv }, { platform }) };
   Object.assign(process.env, brokerEnv);
-  const claimFiguresOf = figures ?? (() => claimFigures({ cfg: loadGlobalConfig({ home: config.brokerHome }) }));
+  const claimFiguresOf = figures ?? ((pending) => claimFigures({ cfg: loadGlobalConfig({ home: config.brokerHome }), ...pending }));
   const isDrainingNow = draining ?? (() => isDraining(config.stateDir));
   const waker = new Waker();
   let driver;
@@ -105,7 +105,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
     while (!stopped && !upgradeRequired) {
       let answer;
       try {
-        answer = await claimOnce({ core, remoteRoot, figures: claimFiguresOf, block, now, tools: claimTools });
+        answer = await claimOnce({ core, remoteRoot, figures: claimFiguresOf, block, now, tools: claimTools, log });
       } catch (err) {
         if (!stopped) log(`claim: ${err.code ?? ''} ${err.message}`);
         countClaim('error');
