@@ -1,10 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { drainBlocksIntake, executionIdOf, readDrainMarker, readRemoteDrain, stateHome, ensureStateDirs } from '../state.js';
+import { drainBlocksIntake, executionIdOf, readDrainMarker, readDrainMarkers, stateHome, ensureStateDirs } from '../state.js';
 import { runnerAvailability } from '../runner-schedule.js';
 import { closedGateReason } from '../device-gates.js';
-import { loadGlobalConfig } from '../config.js';
+import { loadGlobalConfig, reloadGlobalConfig } from '../config.js';
 import { collectStatus } from '../status.js';
 import { listLeases } from '../lease.js';
 import { HELD_STATES, listQueue } from '../scheduler.js';
@@ -16,15 +16,33 @@ import { reportReadiness } from '../runner-readiness.js';
 
 export const MAX_FREE_MEM = Number.MAX_SAFE_INTEGER;
 
-export const isDraining = (stateDir = stateHome()) => readRemoteDrain(stateDir) !== null || drainBlocksIntake(readDrainMarker(stateDir));
+export const drainOwners = (stateDir = stateHome()) => [...readDrainMarkers(stateDir).map((m) => m.owner), ...(drainBlocksIntake(readDrainMarker(stateDir)) ? ['migration'] : [])];
+
+export const isDraining = (stateDir = stateHome()) => drainOwners(stateDir).length > 0;
 
 /** Why this runner takes no new claim now, or null: a drain marker, outside its schedule window, too close to the window closing, or a closed device gate. */
-export function claimBlock({ schedule, stopClaimingBeforeCloseMs, now = Date.now(), draining = isDraining, deviceGates }) {
-  if (draining()) return 'draining';
+export function claimBlock({ schedule, stopClaimingBeforeCloseMs, now = Date.now(), draining = isDraining, owners = () => [], deviceGates }) {
+  if (draining()) {
+    const by = owners();
+    return by.length ? `draining (${by.join(', ')})` : 'draining';
+  }
   const { available, closesAt } = runnerAvailability(schedule, now);
   if (!available) return 'outside-schedule';
   if (closesAt !== null && closesAt - now <= stopClaimingBeforeCloseMs) return 'closing-soon';
   return closedGateReason(deviceGates);
+}
+
+export function brokerConfigReader({ log }) {
+  let cfg;
+  let reported = null;
+  return () => {
+    let problem = null;
+    cfg = reloadGlobalConfig(cfg, { onError: (err) => { problem = `unreadable, keeping the last good config: ${err.message}`; } });
+    problem ??= cfg.overlayWarnings?.join('; ') ?? null;
+    if (problem && problem !== reported) log(`broker config ${problem}`);
+    reported = problem;
+    return cfg;
+  };
 }
 
 const clampMem = (bytes) => Math.min(Math.max(0, Math.floor(bytes)), MAX_FREE_MEM);

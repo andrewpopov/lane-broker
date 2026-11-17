@@ -12,7 +12,7 @@ import { pauseCommand, resumeCommand, drainCommand, drainShutdownCommand, undrai
 import { migrateSchedulerCommand } from '../src/migrate.js';
 import { parseByteSize } from '../src/resources.js';
 import { MIN_CPU_GRANT_CORES } from '../src/cpu-limit.js';
-import { isTicketId, stateHome, executionIdOf } from '../src/state.js';
+import { isTicketId, stateHome, executionIdOf, HUMAN_DRAIN_OWNER, DRAIN_OWNER_RE } from '../src/state.js';
 import { writeBrokerLog } from '../src/admission.js';
 import { leaseCheckCommand } from '../src/lease.js';
 import { parseTransferFlag } from '../src/remote-gzip.js';
@@ -35,6 +35,7 @@ import { runnerWatchCommand, runnerStatusCommand, runnerMarkCommand } from '../s
 import { runnerPrewarmCommand } from '../src/runner-prewarm.js';
 import { reconcileCommand } from '../src/reconcile-sweep.js';
 import { capabilitiesCommand } from '../src/capabilities.js';
+import { configCommand } from '../src/config-effective.js';
 import { remotePipelineCommand } from '../src/remote-pipeline.js';
 import { costReportCommand } from '../src/cost-report.js';
 import { phasesReportCommand } from '../src/phases-report.js';
@@ -57,9 +58,10 @@ function usage() {
   lane wait <id> [--timeout <duration>]
   lane pause ["reason"]
   lane resume
-  lane drain ["reason"]
+  lane config effective [--json]
+  lane drain ["reason" | --reason <text>] [--owner <name>] [--expires <iso|duration>]
   lane drain --shutdown ["reason"] [--wait-ms N]
-  lane undrain
+  lane undrain [--owner <name>]
   lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
   lane gc [--dry-run] [--max <n>] [--root <remoteRoot>]
   lane reconcile [--now] [--json]
@@ -217,6 +219,45 @@ function parseDurationMs(spec) {
   return n * mult;
 }
 
+function parseDrainArgs(args, { allowReason = true } = {}) {
+  let owner = HUMAN_DRAIN_OWNER;
+  let expiresAt;
+  const positional = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--owner') {
+      owner = args[i + 1];
+      i += 1;
+      if (typeof owner !== 'string' || !DRAIN_OWNER_RE.test(owner)) return { error: `--owner needs a name of lowercase letters, digits, ".", "_" or "-" (got ${JSON.stringify(owner)})` };
+    } else if (arg === '--reason' && allowReason) {
+      positional.push(args[i + 1] ?? '');
+      i += 1;
+    } else if (arg === '--expires' && allowReason) {
+      const spec = args[i + 1];
+      i += 1;
+      expiresAt = parseExpiry(spec);
+      if (expiresAt === null) return { error: `--expires needs an ISO time or a duration such as 30m, 2h (got ${JSON.stringify(spec)})` };
+      if (expiresAt <= Date.now()) return { error: `--expires ${spec} is already in the past` };
+    } else if (arg.startsWith('-')) return { error: `unknown option "${arg}"` };
+    else positional.push(arg);
+  }
+  if (positional.length > (allowReason ? 1 : 0)) return { error: `unexpected argument "${positional[allowReason ? 1 : 0]}"${allowReason ? ' (quote a multi-word reason)' : ''}` };
+  return { owner, expiresAt, reason: positional[0] ?? '' };
+}
+
+function parseExpiry(spec) {
+  if (typeof spec !== 'string') return null;
+  if (/^\d/.test(spec) && !/^\d{4}-/.test(spec)) {
+    try {
+      return Date.now() + parseDurationMs(spec);
+    } catch {
+      return null;
+    }
+  }
+  const at = Date.parse(spec);
+  return Number.isFinite(at) ? at : null;
+}
+
 async function main() {
   const [sub, ...rest] = process.argv.slice(2);
 
@@ -354,24 +395,21 @@ async function main() {
         await flushStdio(stateHome(), Math.max(0, deadline - Date.now()));
         process.exit(result.exitCode);
       }
-      const unknownOption = rest.find((arg) => arg.startsWith('-'));
-      if (unknownOption !== undefined) {
-        process.stderr.write(`lane drain: unknown option "${unknownOption}"\n${usage()}`);
+      const parsed = parseDrainArgs(rest);
+      if (parsed.error) {
+        process.stderr.write(`lane drain: ${parsed.error}\n${usage()}`);
         return 2;
       }
-      if (rest.length > 1) {
-        process.stderr.write(`lane drain: unexpected argument "${rest[1]}" (quote a multi-word reason)\n${usage()}`);
-        return 2;
-      }
-      const result = await drainCommand(rest[0] ?? '');
+      const result = await drainCommand(parsed.reason, { owner: parsed.owner, expiresAt: parsed.expiresAt });
       return result.exitCode;
     }
     case 'undrain': {
-      if (rest.length > 0) {
-        process.stderr.write(`lane undrain: unexpected argument "${rest[0]}"\n${usage()}`);
+      const parsed = parseDrainArgs(rest, { allowReason: false });
+      if (parsed.error) {
+        process.stderr.write(`lane undrain: ${parsed.error}\n${usage()}`);
         return 2;
       }
-      const result = await undrainCommand();
+      const result = await undrainCommand({ owner: parsed.owner });
       return result.exitCode;
     }
     case 'migrate-scheduler': {
@@ -446,6 +484,8 @@ async function main() {
       }
       return (await costReportCommand(rest.slice(1))).exitCode;
     }
+    case 'config':
+      return configCommand(rest).exitCode;
     case 'capabilities': {
       if (!rest.includes('--json')) {
         process.stderr.write('lane capabilities: only --json is supported\n');

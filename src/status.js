@@ -3,7 +3,7 @@ import path from 'node:path';
 import { childExitSafeFlags } from './node-exit-safe.js';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { ensureStateDirs, paths, withLock, bootId, readJsonSafe, readDrainMarker, readRemoteDrain } from './state.js';
+import { ensureStateDirs, paths, withLock, bootId, readJsonSafe, readDrainMarker, readRemoteDrain, readDrainMarkers, pruneExpiredDrains } from './state.js';
 import { listLeases, reapAll, LEASE_STATE } from './lease.js';
 import { listQueueCapped, reapOrphanedQueue, HELD_STATES, blockedBy, readSkipState, readCapacitySkipState, readResourceSkipState, futileFresh } from './scheduler.js';
 import { refreshCpuEstimates } from './cpu-estimates.js';
@@ -169,6 +169,10 @@ function logMtimeAgeMs(logPath) {
   }
 }
 
+export function renderDrainMarkerLines(markers) {
+  return markers.map((m) => `  drain marker: ${m.owner}: ${m.reason}${Number.isFinite(m.expiresAt) ? ` (expires ${new Date(m.expiresAt).toISOString()})` : ' (no expiry)'}`).join('\n');
+}
+
 /** BRAIN-520: the `drain:` line shared by `lane status` and `lane drain`. A drained host keeps admitting its own queued and local work, hence the counts. */
 export function renderRemoteDrainLine(remoteDrain, { running, queued }) {
   if (!remoteDrain) return 'drain: not draining';
@@ -187,6 +191,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       () => {
         reapAll(root, bootId());
         reapOrphanedQueue(root);
+        pruneExpiredDrains(root);
       },
       { timeoutMs: lockTimeoutMs },
     );
@@ -209,6 +214,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
   const paused = fs.existsSync(p.pause) ? fs.readFileSync(p.pause, 'utf8').trim() : null;
   const draining = readDrainMarker(root);
   const remoteDrain = readRemoteDrain(root);
+  const drainMarkers = readDrainMarkers(root);
   const configWarning = readJsonSafe(p.configWarning);
 
   // BRAIN-518: one scan of the runner's remote tickets, shared by every running and queued entry.
@@ -360,6 +366,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     enforcement: enforcementOf(cpuLimit),
     draining,
     remoteDrain,
+    drainMarkers,
     exclusiveHold: exclusiveHoldView(queue, held),
     priority: sched.v2 ? { active: true, mode: 'v2', nowEff, reservationOwner: reservationOwnerId } : { active: false, mode: 'legacy', nowEff },
     classes: computeClasses(cfg, root, held, resourceCapacity),
@@ -647,6 +654,7 @@ export function renderStatusText(status) {
   if (status.localExecution === 'refused') lines.push('local execution: refused (dispatch-only host)');
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
   lines.push(renderRemoteDrainLine(status.remoteDrain, { running: status.running.length, queued: status.queued.length }));
+  if (status.drainMarkers?.length) lines.push(renderDrainMarkerLines(status.drainMarkers));
   if (status.configError) lines.push(`config: global config unreadable: ${status.configError}`);
   if (status.configWarning) {
     lines.push(

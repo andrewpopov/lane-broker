@@ -1,7 +1,7 @@
 import { openAgentCore } from './agent.js';
 import { AgentConfigError } from './config.js';
 import { loadGlobalConfig } from '../config.js';
-import { claimBlock, claimFigures, claimOnce, isDraining, presentTools } from './claims.js';
+import { brokerConfigReader, claimBlock, claimFigures, claimOnce, drainOwners, isDraining, presentTools } from './claims.js';
 import { ExecutionDriver } from './execution.js';
 import { createS3Client } from '../s3-client.js';
 import { Waker } from './waker.js';
@@ -31,7 +31,8 @@ const LIVENESS_CALLS = new Set(['ld_claim', 'ld_heartbeat', 'ld_register']);
 export async function startAgent({ remoteRoot, config, version, log = (line) => process.stderr.write(`${line}\n`), figures, draining, now = Date.now, timing, s3 = s3ClientOf(config.rustfs), spawnEnv = process.env, laneBin, Driver = ExecutionDriver, coreOptions = {}, textfileDir = process.env.BOSUN_TEXTFILE_DIR, stopSettleMs = STOP_SETTLE_MS, platform = process.platform, driverOptions = {}, tools, deviceSampler = (gates) => sampleDevice(gates, { platform }) }) {
   const brokerEnv = { LANE_BROKER_HOME: config.brokerHome, LANE_BROKER_STATE: config.stateDir, ...userManagerEnv({ ...process.env, ...spawnEnv }, { platform }) };
   Object.assign(process.env, brokerEnv);
-  const claimFiguresOf = figures ?? ((pending) => claimFigures({ cfg: loadGlobalConfig({ home: config.brokerHome }), ...pending }));
+  const readBrokerConfig = brokerConfigReader({ log });
+  const claimFiguresOf = figures ?? ((pending) => claimFigures({ cfg: readBrokerConfig(), ...pending }));
   const isDrainingNow = draining ?? (() => isDraining(config.stateDir));
   const waker = new Waker();
   let driver;
@@ -68,7 +69,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
       log(`metrics: ${err.message}`);
     }
   };
-  const block = () => stopped ? 'stopping' : driver.scopeBlock() ?? claimBlock({ schedule: config.schedule, stopClaimingBeforeCloseMs: config.stopClaimingBeforeCloseMs, now: now(), draining: isDrainingNow, deviceGates });
+  const block = () => stopped ? 'stopping' : driver.scopeBlock() ?? claimBlock({ schedule: config.schedule, stopClaimingBeforeCloseMs: config.stopClaimingBeforeCloseMs, now: now(), draining: isDrainingNow, owners: () => drainOwners(config.stateDir), deviceGates });
 
   const reloadDeviceGatesConfig = () => {
     try {
