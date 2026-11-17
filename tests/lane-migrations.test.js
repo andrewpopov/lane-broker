@@ -161,12 +161,22 @@ describe('lane schema versioning', { skip: PG_SKIP_REASON ?? false, timeout: 120
     }
   });
 
+  const withoutPullViews = (sql, file) => {
+    if (file !== 'functions.sql') return sql;
+    const views = /-- Read-only pull-queue views for lane_reader[\s\S]*?FROM lane_dispatch\.runners;\n/;
+    const grant = ', lane.pull_tickets, lane.pull_principals, lane.pull_runners';
+    assert.match(sql, views, 'functions.sql still holds the pull-queue view block this test strips');
+    assert.ok(sql.includes(grant), 'functions.sql still grants the pull-queue views in one statement');
+    return sql.replace(views, '').replace(grant, '');
+  };
+
   test('migration 003 backfills the scheduling parents of principals that already existed', async () => {
     const c = await emptyDb();
     const dir = fixtureDir();
     for (const f of fs.readdirSync(path.join(dir, 'migrations')).filter((x) => /^(00[3-9]|010)-/.test(x))) fs.rmSync(path.join(dir, 'migrations', f));
-    // functions.sql must not reference what 003 adds, so the pre-003 state is applied with the schema as of version 2.
-    await applyMigrations(c, { dir });
+    // The pre-003 state is built with today's functions.sql over the version-2 schema. Function bodies are not resolved at CREATE time,
+    // but views are, so the pull-queue views (BRAIN-1154, over lane_dispatch tables added later) are left out of that one apply.
+    await applyMigrations(c, { dir, transform: withoutPullViews });
     await c.query("INSERT INTO lane.principals (login_role, kind, allowed_accounts) VALUES ('old_submit', 'submit', '{a1,a2}')");
     assert.equal((await c.query('SELECT count(*)::int AS n FROM lane.sched_parents')).rows[0].n, 0);
     const r = await applyMigrations(c);
