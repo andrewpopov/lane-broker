@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { applyMigrations, claimNext, LANE_SQL_DIR } from '../src/lane-db.js';
+import { makeTmpDir } from './helpers/tmp.js';
 import { PgCluster, PG_SKIP_REASON, roleNames, addGroup, gid, FREE } from './lane-db-harness.js';
 
 const MIGRATIONS = fs.readdirSync(path.join(LANE_SQL_DIR, 'migrations')).filter((f) => f.endsWith('.sql')).length;
@@ -77,7 +78,7 @@ describe('applying sql/lane as a non-superuser database owner', { skip: PG_SKIP_
       await admin.query('CREATE ROLE lane_migrate_t LOGIN NOSUPERUSER NOCREATEROLE');
       await admin.query('GRANT lane_definer TO lane_migrate_t WITH INHERIT TRUE, SET TRUE');
       await admin.query(`GRANT CONNECT ON DATABASE ${db} TO lane_migrate_t`);
-      dir = fs.mkdtempSync(path.join(cluster.dir, 'sql-'));
+      dir = makeTmpDir('lane-migrate-sql-');
       fs.cpSync(LANE_SQL_DIR, dir, { recursive: true });
       fs.writeFileSync(path.join(dir, 'migrations', `${next}-probe.sql`),
         'ALTER TABLE lane_dispatch.tickets ADD COLUMN probe text;\nCREATE TABLE lane.migrate_probe (id int);\n');
