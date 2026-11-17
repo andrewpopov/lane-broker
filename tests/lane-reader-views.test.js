@@ -67,7 +67,7 @@ describe('lane_reader pull-queue views (BRAIN-1154)', { skip: pgSkipOption, time
     await applyMigrations(su);
     await readerCanReadEveryView(world);
 
-    const dropGrant = (sql, file) => (file === 'functions.sql' ? sql.replace(/^GRANT SELECT ON lane\.job_state_counts.*$/m, '') : sql);
+    const dropGrant = (sql, file) => (file === 'functions.sql' ? sql.replace(/^\s*GRANT SELECT ON lane\.pull_tickets.*$/m, '') : sql);
     await su.query('REVOKE SELECT ON lane.pull_tickets, lane.pull_principals, lane.pull_runners FROM lane_reader');
     await applyMigrations(su, { transform: dropGrant });
     const reader = await world.as(logins.reader);
