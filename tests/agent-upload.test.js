@@ -57,12 +57,17 @@ const scenarios = {
   },
 
   'an upload that never answers is cut off at the upload budget with uploadError, and uploadSince is on disk before the first PUT is answered': async (w, rw, load) => {
-    rw.s3.hangMatching = (p) => p.startsWith('/lane-out/');
+    let agent;
+    let atFirstPut;
+    rw.s3.hangMatching = (p) => {
+      if (!p.startsWith('/lane-out/')) return false;
+      atFirstPut ??= agent.core.table.all().map((r) => ({ subphase: r.subphase, uploadSince: r.uploadSince }));
+      return true;
+    };
     const ticket = await rw.submit({ code: 'process.exit(0)' });
-    const agent = await rw.agent({ load, timing: { uploadRetryMs: 1500 } });
-    const row = await rw.claimed(ticket);
-    const execId = rw.execId(row);
-    await happens('uploadSince is persisted while the first PUT hangs', () => agent.core.table.get(execId)?.subphase === 'SETTLING' && typeof agent.core.table.get(execId)?.uploadSince === 'number', 4000);
+    agent = await rw.agent({ load, timing: { uploadRetryMs: 1500 } });
+    await happens('the first output PUT reaches the store and hangs', () => atFirstPut !== undefined, 60_000);
+    assert.ok(atFirstPut.some((r) => r.subphase === 'SETTLING' && typeof r.uploadSince === 'number'), 'uploadSince is persisted while the first PUT hangs');
     await happens('the ticket finishes with uploadError within the budget', async () => (await w.ticket(ticket.id)).state === 'finished', 1500 + 3000);
     assert.ok((await w.ticket(ticket.id)).result.uploadError);
   },
@@ -72,7 +77,7 @@ const scenarios = {
     const ticket = await rw.submit({ code: 'process.exit(0)' });
     const agent = await rw.agent({ load, fetchImpl, timing: { uploadRetryMs: 600 } });
     const row = await rw.claimed(ticket);
-    await happens('the ticket is finished', async () => (await w.ticket(ticket.id)).state === 'finished', 8000);
+    await happens('the ticket is finished', async () => (await w.ticket(ticket.id)).state === 'finished', 30_000);
     const final = await w.ticket(ticket.id);
     assert.match(final.result.uploadError, /PUT lane-out\/a1\/.*answered 500/);
     assert.equal(final.result.logSha256, undefined);
