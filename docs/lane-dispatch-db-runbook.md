@@ -72,7 +72,7 @@ the header only as `argv_md5`), `lane.pull_principals` (agent principals' `host,
 
 Two systemd units on pitelite run as a `lane_admin` login (a member of `lane_admin`, so it holds the `pg_signal_backend` and `pg_read_all_stats` grants above). Both are required: the guard is the enforcement behind the per-role `statement_timeout`, which a caller can override.
 
-One `lane-dispatch-reap.timer` fires every 15 s (`AccuracySec=1s`) and runs two separate transactions, one SET per parameter, and the guard runs whether or not the reap succeeded:
+One `lane-dispatch-reap.timer` (templates `ops/pull/lane-dispatch-reap.{sh,service,timer}`; the script installs at `/opt/lane-dispatch-reap/`) fires every 15 s (`AccuracySec=1s`) and runs two separate transactions, one SET per parameter, and the guard runs whether or not the reap succeeded:
 
 ```sql
 BEGIN; SET LOCAL lock_timeout = '5s'; SET LOCAL statement_timeout = '10s'; SELECT lane_dispatch.ld_reap(); COMMIT;

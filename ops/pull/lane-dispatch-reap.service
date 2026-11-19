@@ -1,0 +1,14 @@
+# TEMPLATE. pitelite: settles expired leases (ld_reap) and terminates pinned runner/submitter transactions (ld_guard) on the ADMIN login, by peer auth over the local socket.
+[Unit]
+Description=lane dispatch reap: settle expired leases, then guard long transactions
+After=postgresql.service
+
+[Service]
+Type=oneshot
+User=postgres
+Group=postgres
+Environment=LANE_QUEUE_URL=postgresql://lane_admin_pitelite@%%2Fvar%%2Frun%%2Fpostgresql/lane_queue
+ExecStart=/opt/lane-dispatch-reap/lane-dispatch-reap.sh
+TimeoutStartSec=30s
+NoNewPrivileges=true
+PrivateTmp=true
