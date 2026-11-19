@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { applyMigrations, claimNext, LANE_SQL_DIR } from '../src/lane-db.js';
+import { makeTmpDir } from './helpers/tmp.js';
 import { PgCluster, PG_SKIP_REASON, roleNames, addGroup, gid, FREE } from './lane-db-harness.js';
 
 const MIGRATIONS = fs.readdirSync(path.join(LANE_SQL_DIR, 'migrations')).filter((f) => f.endsWith('.sql')).length;
@@ -63,5 +64,44 @@ describe('applying sql/lane as a non-superuser database owner', { skip: PG_SKIP_
     assert.equal((await applyMigrations(owner)).applied.length, MIGRATIONS);
     assert.deepEqual((await applyMigrations(owner)).applied, []);
     await assertDefinerOwnsEverything(await notSuper(db, 'lane_owner_plain'));
+  });
+
+  describe('BRAIN-1146: a migrator role that owns nothing, on a database a superuser owns and applied (pitelite)', () => {
+    const next = String(MIGRATIONS + 1).padStart(3, '0');
+    let db;
+    let dir;
+    before(async () => {
+      const admin = await cluster.admin();
+      db = `m_${randomUUID().replaceAll('-', '').slice(0, 12)}`;
+      await admin.query(`CREATE DATABASE ${db}`);
+      await applyMigrations(await cluster.client(db), { databaseAcls: true });
+      await admin.query('CREATE ROLE lane_migrate_t LOGIN NOSUPERUSER NOCREATEROLE');
+      await admin.query('GRANT lane_definer TO lane_migrate_t WITH INHERIT TRUE, SET TRUE');
+      await admin.query(`GRANT CONNECT ON DATABASE ${db} TO lane_migrate_t`);
+      dir = makeTmpDir('lane-migrate-sql-');
+      fs.cpSync(LANE_SQL_DIR, dir, { recursive: true });
+      fs.writeFileSync(path.join(dir, 'migrations', `${next}-probe.sql`),
+        'ALTER TABLE lane_dispatch.tickets ADD COLUMN probe text;\nCREATE TABLE lane.migrate_probe (id int);\n');
+    });
+
+    test('without CREATE on the database, re-applying functions.sql is refused', async () => {
+      const migrator = await cluster.client(db, 'lane_migrate_t');
+      await assert.rejects(applyMigrations(migrator), /permission denied for database/);
+    });
+
+    test('with CONNECT and CREATE it applies a new migration, re-applies, and lane_definer still owns everything', async () => {
+      await (await cluster.admin()).query(`GRANT CREATE ON DATABASE ${db} TO lane_migrate_t`);
+      const migrator = await cluster.client(db, 'lane_migrate_t');
+      assert.deepEqual((await applyMigrations(migrator, { dir })).applied, [`${next}-probe.sql`]);
+      assert.deepEqual((await applyMigrations(migrator, { dir })).applied, []);
+      const su = await notSuper(db, 'lane_migrate_t');
+      await assertDefinerOwnsEverything(su);
+      const { rows } = await su.query(
+        `SELECT n.nspname AS name, r.rolname AS owner FROM pg_namespace n JOIN pg_roles r ON r.oid = n.nspowner WHERE n.nspname = 'lane_dispatch'
+         UNION ALL SELECT c.relname, r.rolname FROM pg_class c JOIN pg_roles r ON r.oid = c.relowner
+          WHERE c.relnamespace = 'lane_dispatch'::regnamespace AND c.relkind IN ('r','v','c')`);
+      assert.ok(rows.some((r) => r.name === 'tickets'));
+      assert.deepEqual(rows.filter((r) => r.owner !== 'lane_definer'), []);
+    });
   });
 });
