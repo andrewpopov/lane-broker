@@ -55,7 +55,9 @@ describe('lane.claim_next at scale', { skip: PG_SKIP_REASON ?? false, timeout: 6
   before(() => { cluster = PgCluster.start(); });
   after(async () => { await cluster?.closeClients(); cluster?.stop(); });
 
-  test(`${CALLS} claims on 60,000 queued jobs: p50 under ${P50_BOUND_MS} ms, p99 under ${P99_BOUND_MS} ms`, async () => {
+  test(`${CALLS} claims on 60,000 queued jobs: p50 under ${P50_BOUND_MS} ms, p99 under ${P99_BOUND_MS} ms`, {
+    skip: 'BRAIN-1149: the absolute p50 bound flaps on wintop (152 then 262 ms at 0abb77e4) while skybox is offline; re-enable with a host-relative bound',
+  }, async () => {
     const db = await cluster.freshDb();
     const su = await cluster.client(db);
     const agents = await seedScale(su, { jobs: 60000, groups: 40, hosts: 5 });
