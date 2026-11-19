@@ -385,7 +385,7 @@ test('speed-aware (BRAIN-839): a ticket placed locally while the runner is down 
 const fs = require('fs');
 const { spawnSync } = require('child_process');
 const argv = process.argv.slice(2);
-if (fs.readFileSync(${JSON.stringify(control)}, 'utf8').trim() === 'down') process.exit(255);
+if (fs.readFileSync(${JSON.stringify(control)}, 'utf8').trim() === 'down') { fs.appendFileSync(${JSON.stringify(control)} + '.refused', 'x'); process.exit(255); }
 const res = spawnSync(${JSON.stringify(path.join(binDir, 'ssh-real'))}, argv, { encoding: 'utf8', stdio: ['inherit', 'pipe', 'inherit'] });
 if ((argv[argv.length - 1] || '').includes('remote-probe')) {
   const p = JSON.parse(res.stdout.trim());
@@ -402,7 +402,12 @@ process.exit(res.status == null ? 1 : res.status);
     const started = await laneRun(['run', '--detach', '--lane', 'default', '--', ...markerCmd(marker)], { env: ctx.env, cwd: ctx.repoDir });
     assert.equal(started.code, 0, started.stderr);
     const ticketId = started.stdout.trim();
-    await new Promise((resolve) => setTimeout(resolve, 1500));
+    // Bring the runner up only after placement has probed it and been refused, so the first placement saw it down however slow the host.
+    const refused = `${control}.refused`;
+    for (const deadline = Date.now() + 60_000; !fs.existsSync(refused); ) {
+      assert.ok(Date.now() < deadline, 'placement probed the runner while it was down');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
     assert.doesNotMatch(admissionLog(ctx), /rebind: local finish/, 'no runner yet: it waits locally');
     fs.writeFileSync(control, 'ok');
     const waited = await laneRun(['wait', ticketId, '--timeout', '60s'], { env: ctx.env });
