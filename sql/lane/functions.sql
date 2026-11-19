@@ -1268,14 +1268,20 @@ END $$;
 
 -- Read-only pull-queue views for lane_reader (BRAIN-1154): they run as their owner, so lane_reader needs neither USAGE on
 -- lane_dispatch nor a column grant there, and they never expose claim_token, login_role, or a ticket's header beyond its argv hash.
-CREATE OR REPLACE VIEW lane.pull_tickets AS
-  SELECT id, repo_key, lane, state, host, cpu_cores, requeues, result, created_at, started_at, finished_at, requires_tags,
-         md5(header ->> 'argv') AS argv_md5
-    FROM lane_dispatch.tickets;
-CREATE OR REPLACE VIEW lane.pull_principals AS
-  SELECT host, tags, allowed_repos, max_claims FROM lane_dispatch.principals WHERE kind = 'agent';
-CREATE OR REPLACE VIEW lane.pull_runners AS
-  SELECT host, last_seen FROM lane_dispatch.runners;
+-- A view is checked when it is created, unlike a plpgsql body, so they wait for the columns they read (migration 006's requeues).
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('lane_dispatch.tickets') AND attname = 'requeues' AND NOT attisdropped) THEN
+    CREATE OR REPLACE VIEW lane.pull_tickets AS
+      SELECT id, repo_key, lane, state, host, cpu_cores, requeues, result, created_at, started_at, finished_at, requires_tags,
+             md5(header ->> 'argv') AS argv_md5
+        FROM lane_dispatch.tickets;
+    CREATE OR REPLACE VIEW lane.pull_principals AS
+      SELECT host, tags, allowed_repos, max_claims FROM lane_dispatch.principals WHERE kind = 'agent';
+    CREATE OR REPLACE VIEW lane.pull_runners AS
+      SELECT host, last_seen FROM lane_dispatch.runners;
+  END IF;
+END $$;
 
 -- Ownership and grants for everything in the schema. Re-applied on every run so drift is corrected.
 DO $$
@@ -1300,7 +1306,13 @@ REVOKE ALL ON ALL SEQUENCES IN SCHEMA lane FROM lane_agent, lane_submit, lane_re
 GRANT USAGE ON SCHEMA lane TO lane_admin, lane_agent, lane_submit, lane_reader;
 GRANT ALL ON ALL TABLES IN SCHEMA lane TO lane_admin;
 GRANT ALL ON ALL SEQUENCES IN SCHEMA lane TO lane_admin;
-GRANT SELECT ON lane.job_state_counts, lane.pull_tickets, lane.pull_principals, lane.pull_runners TO lane_reader;
+GRANT SELECT ON lane.job_state_counts TO lane_reader;
+DO $$
+BEGIN
+  IF to_regclass('lane.pull_tickets') IS NOT NULL THEN
+    GRANT SELECT ON lane.pull_tickets, lane.pull_principals, lane.pull_runners TO lane_reader;
+  END IF;
+END $$;
 GRANT EXECUTE ON FUNCTION lane.claim_next(bigint, real, jsonb, text[], bigint, text[], uuid) TO lane_agent, lane_admin;
 GRANT EXECUTE ON FUNCTION lane.submit_group(uuid, text, text, text, jsonb, text, jsonb, timestamptz) TO lane_submit, lane_admin;
 GRANT EXECUTE ON FUNCTION lane.activate_group(uuid) TO lane_submit, lane_admin;
