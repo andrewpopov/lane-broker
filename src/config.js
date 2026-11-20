@@ -114,7 +114,7 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // load can make a big lane unsatisfiable even with nothing running).
   // 0 disables the exemption.
   resourceIdleOvershootCores: 1,
-  // BRAIN-740: how many cores over the CPU budget the one floor-slot push gate may project; 0 disables the floor slot.
+  // BRAIN-740: how many cores over the CPU budget the lane load (held leases plus the push gate, external CPU excluded, BRAIN-627) may project for the one floor-slot push gate; 0 disables the floor slot.
   floorOvershootCores: 6,
   // BRAIN-338: how many tickets may already be queued on the least-loaded
   // runner for a remote-eligible ticket to be queued there instead of

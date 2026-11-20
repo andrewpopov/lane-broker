@@ -2150,14 +2150,18 @@ local stamped push gate (a ticket submitted under a real `git push`,
 BRAIN-731; a hand-run `lane run --lane prepush` is not one) (not `remote: true`, not
 forced `--local`; never `sim` or exclusive). The head may take it as well as a
 ticket behind a blocked head: the earliest such ticket in selection order whose
-projection, held leases charged as usual, is within `floorOvershootCores`
-(default 6; `0` disables the floor slot) of the budget and whose memory admits.
+lane load (held leases charged as usual, plus the ticket itself) is within
+`floorOvershootCores` (default 6; `0` disables the floor slot) of the budget and
+whose memory admits. External load, CPU outside any lease, does not count
+against the floor (BRAIN-627): 9-11 cores of agent and app load alone filled the
+budget and starved pushes for hours, while the floor exists for exactly that case.
 Ordinary lanes and hand-run tests never use it. A head waiting on a conflict
 does not disable it, and the floor start spends none of the head's conflict skip allowance. A closed CPU gate is judged by the projection
 alone; a push held by BRAIN-731 is never chosen. At most one floor lease exists
 at a time (`floor: true` on the lease; an orphaned one counts). It spends no
 skip, express or yield allowance, and is logged `floor=1` with
-`current=start:floor-slot`. This is what keeps a push gate moving when the
+`current=start:floor-slot` (the event also logs `laneOvershoot`, the lane-only
+overshoot that authorised it). This is what keeps a push gate moving when the
 Mac's own use leaves lanes no room.
 
 ### Elastic CPU claims (`minCpuCores`, BRAIN-360)

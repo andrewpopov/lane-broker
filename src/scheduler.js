@@ -1179,24 +1179,28 @@ function isFloorTicket(t) {
 }
 
 /**
- * BRAIN-727 floor slot: the earliest local stamped push gate (the head included, BRAIN-740) whose CPU projection, with the held leases charged, fits within
- * floorOvershootCores of the budget (the CPU gate's state is not judged), once the head cannot start. Pure over
- * the poll's inputs, so every polling supervisor names the same ticket. Null when the head can start or nobody qualifies.
+ * BRAIN-727 floor slot: the earliest local stamped push gate (the head included, BRAIN-740) whose lane load (the projection minus
+ * external, non-lease CPU, BRAIN-627; held leases charged) fits within floorOvershootCores of the budget (the CPU gate's state is
+ * not judged), once the head cannot start. Pure over the poll's inputs, so every polling supervisor names the same ticket.
+ * Null when the floor is disabled or taken, the head can start, or nobody qualifies.
  */
 export function floorWinner(cfg, queue, held, cpuSample, memInfo, gateClosed, loadGateClosed, weightCapacity) {
+  if (!(cfg.floorOvershootCores > 0) || held.some((l) => l.floor === true)) return null;
   if (memInfo?.macPressure === 'critical' || (cfg.admissionLoadGate && loadGateClosed && held.length > 0)) return null;
   const runningWeight = held.reduce((sum, l) => sum + (l.weight || 0), 0);
   const cooldown = cooldownActive(held, cfg);
   const decide = (t, closed) => decideAdmission(cfg, t, held, cpuSample, memInfo, { closed }, cooldown);
   const runnable = (t) => !blockedBy(held, t) && runningWeight + t.weight <= weightCapacity && !elasticBelowFloor(t, cfg);
   const withinOvershoot = (d) => d.memoryReason === 'ok' && d.cpuReason !== 'cooldown' && (d.admit || (Number.isFinite(d.projectedBusy) && d.projectedBusy - d.budget <= cfg.floorOvershootCores));
+  const laneOvershoot = (d) => d.projectedBusy - d.externalBusy - d.budget;
+  const floorFits = (d) => d.memoryReason === 'ok' && d.cpuReason !== 'cooldown' && (d.admit || (Number.isFinite(d.projectedBusy) && Number.isFinite(d.externalBusy) && laneOvershoot(d) <= cfg.floorOvershootCores));
   const head = queue[0];
   const headDecision = decide(head, gateClosed);
   const headStarts = runnable(head) && (headDecision.admit || evaluateElasticAdmission(cfg, head, held, cpuSample, memInfo, headDecision) !== null || (held.length === 0 && headDecision.cpuReason === 'projected-over-budget' && withinOvershoot(headDecision)));
   if (headStarts) return null;
   for (const t of queue) {
     if (!t || isExclusive(t)) return null;
-    if (isFloorTicket(t) && runnable(t) && withinOvershoot(decide(t, false))) return t;
+    if (isFloorTicket(t) && runnable(t) && floorFits(decide(t, false))) return t;
   }
   return null;
 }
@@ -1670,7 +1674,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     const floorAdmit = floorTrial && !ordinarilyAdmitted && floorWinner(cfg, queue, held, cpuSample, memInfo, fullDecision.cpuGateClosed, gate.closed, weightCapacity)?.id === ticket.id;
     // A bypass yields to a waiting real push gate (the floor winner) and to an aged head that only the bypass leases hold back.
     const bypassYields = () => {
-      const winner = cfg.floorOvershootCores > 0 ? floorWinner(cfg, queue, held, cpuSample, memInfo, fullDecision.cpuGateClosed, gate.closed, weightCapacity) : null;
+      const winner = floorWinner(cfg, queue, held, cpuSample, memInfo, fullDecision.cpuGateClosed, gate.closed, weightCapacity);
       if (winner && winner.id !== ticket.id) return 'yields-push-gate';
       if (ticket.id === headTicket.id || !expressHeadProtected) return null;
       // a replacement on a key the aged head conflicts with would keep it conflicted for as long as they keep arriving
@@ -2004,9 +2008,9 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       events.push(['elastic-grant', { candidateId: ticket.id, declared: submitted.resources.cpuCores, granted: grantedCpuCores, min: submitted.resources.minCpuCores }]);
     }
     if (bypassAdmit) events.push(['queue-bypass', { headId: headTicket.id, candidateId: ticket.id, expectedMs: bypass.ms, source: bypass.source, inWindow: `${bypassInWindow + 1}/${cfg.queueBypassCap}`, cpuReason: cpuDecision.cpuReason }]);
-    if (floorAdmit) events.push(['floor-slot', { headId: headTicket.id, candidateId: ticket.id, overshoot: (cpuDecision.projectedBusy - cpuDecision.budget).toFixed(2) }]);
+    if (floorAdmit) events.push(['floor-slot', { headId: headTicket.id, candidateId: ticket.id, overshoot: (cpuDecision.projectedBusy - cpuDecision.budget).toFixed(2), laneOvershoot: (cpuDecision.projectedBusy - cpuDecision.externalBusy - cpuDecision.budget).toFixed(2) }]);
     if (idleExempt) {
-      events.push(['resource-idle-exempt', { headId: headTicket.id, overshoot: (cpuDecision.projectedBusy - cpuDecision.budget).toFixed(2) }]);
+      events.push(['resource-idle-exempt', { headId: headTicket.id, overshoot: (cpuDecision.projectedBusy - cpuDecision.budget).toFixed(2), laneOvershoot: (cpuDecision.projectedBusy - cpuDecision.externalBusy - cpuDecision.budget).toFixed(2) }]);
     }
     // Legacy: the head's own start clears the singleton. Behind the fence every starting ticket's records leave
     // with it (a displaced ticket may start as a backfill), and with them any reservation it owned.

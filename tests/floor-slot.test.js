@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { freshEnv } from './helpers.js';
-import { enqueue, tryStart, listQueue, readSkipState } from '../src/scheduler.js';
+import { enqueue, tryStart, listQueue, readSkipState, floorWinner } from '../src/scheduler.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { writeLease, listLeases, LEASE_STATE } from '../src/lease.js';
 import { bootId, paths, readJsonSafe } from '../src/state.js';
@@ -131,7 +131,8 @@ test('floor slot: applies while ordinary leases are held when the projection inc
   const tooMuch = freshEnv();
   await queueAll(tooMuch.state, [head, gate]);
   ordinaryLease(tooMuch.state);
-  const refused = await poll(tooMuch.state, gate, 12.5); // 12.5 + 1 + 1 = 14.5 > 11 + 3
+  writeLease(tooMuch.state, { id: 'big', key: 'held:big', bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight: 13, state: LEASE_STATE.RUNNING });
+  const refused = await poll(tooMuch.state, gate, 0); // lane load 13 + 1 (busy) + 1 = 15 > 11 + 3
   assert.equal(refused.started, false);
 
   const idle = freshEnv();
@@ -216,8 +217,9 @@ test('floor slot (BRAIN-740): an ordinary lane-local ticket never takes the floo
 test('floor slot (BRAIN-740): denied past floorOvershootCores, and floorOvershootCores 0 disables it', async () => {
   const over = freshEnv();
   const gate = ticket('gate');
-  await queueAll(over.state, [gate]);
-  assert.equal((await poll(over.state, gate, 13.5)).started, false, '13.5 + 1 - 11 = 3.5 > 3');
+  const hungryGate = ticket('gate', { resources: { cpuCores: 14.5 } });
+  await queueAll(over.state, [hungryGate]);
+  assert.equal((await poll(over.state, hungryGate, 0)).started, false, 'lane load 14.5 - 11 = 3.5 > 3');
   const off = freshEnv();
   await queueAll(off.state, [gate]);
   const result = await tryStart(off.state, gate, { ...cfg, floorOvershootCores: 0 }, undefined, sampler(11.5), undefined, memory());
@@ -308,4 +310,53 @@ test('floor slot (BRAIN-740): a push gate that itself conflicts with a held leas
   assert.equal(result.started, false);
   assert.notEqual(result.floor, true);
   assert.deepEqual(listLeases(state).map((l) => l.id), ['blocker']);
+});
+
+// BRAIN-627: the floor judges lane load only. External 11 on a budget of 11 (cores 12, reserve 1) left no room for the push before.
+const ext = 11;
+const heldLease = (state, id, weight, extra = {}) =>
+  writeLease(state, { id, key: `held:${id}`, bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight, state: LEASE_STATE.RUNNING, ...extra });
+const winnerOf = (queue, held, { config = cfg, busy = ext, mem = memory()(), closed = false } = {}) =>
+  floorWinner(config, queue, held, sampler(busy)(), mem, closed, false, 12)?.id ?? null;
+const blockedHead = () => ticket('head', { lane: 'local', pushGate: undefined, weight: 6 });
+const leaseOf = (id, weight, extra = {}) => ({ id, key: `held:${id}`, weight, state: LEASE_STATE.RUNNING, heartbeatAt: Date.now(), ...extra });
+
+test('floor slot (BRAIN-627): external load is not charged: lane load 6 under external 11 on budget 11 gives the push the floor', () => {
+  const queue = [blockedHead(), ticket('push')];
+  // total overshoot 11 + 4 + 1 - 11 = 5 > 3 (the old arithmetic denied); lane load 4 + 1 - 11 < 3
+  assert.equal(winnerOf(queue, [leaseOf('busy', 4)], { busy: 15 }), 'push');
+  assert.equal(winnerOf(queue, [leaseOf('busy', 4)], { busy: 11 }), 'push');
+});
+
+test('floor slot (BRAIN-627): lane load over budget + overshoot still denies, whatever the external load', () => {
+  const queue = [blockedHead(), ticket('push')];
+  assert.equal(winnerOf(queue, [leaseOf('busy', 14)], { busy: 0 }), null, '14 + 1 - 11 = 4 > 3');
+  assert.equal(winnerOf(queue, [leaseOf('busy', 14)], { busy: 11 }), null);
+});
+
+test('floor slot (BRAIN-627): floorWinner is null with a floor lease held, floorOvershootCores 0, memory denial, cooldown, or an unstamped prepush', () => {
+  const push = ticket('push');
+  const queue = [blockedHead(), push];
+  assert.equal(winnerOf(queue, []), 'push', 'control');
+  assert.equal(winnerOf(queue, [leaseOf('f', 1, { floor: true })]), null);
+  assert.equal(winnerOf(queue, [], { config: { ...cfg, floorOvershootCores: 0 } }), null);
+  const hungry = ticket('hungry', { resources: { cpuCores: 1, memoryBytes: 80 * GIB } });
+  assert.equal(winnerOf([blockedHead(), hungry], []), null);
+  assert.equal(winnerOf(queue, [leaseOf('busy', 1, { admittedAt: Date.now() })], { config: { ...cfg, admissionCooldownMs: 60_000 }, busy: 0 }), null, 'cooldown');
+  assert.equal(winnerOf(queue, [leaseOf('busy', 1, { admittedAt: Date.now() - 120_000 })], { config: { ...cfg, admissionCooldownMs: 60_000 }, busy: 0 }), 'push', 'cooldown over');
+  assert.equal(winnerOf([blockedHead(), ticket('plain', { pushGate: undefined })], []), null);
+});
+
+test('floor slot (BRAIN-627): at tryStart, a stamped push behind a blocked head starts with floor:true under external load 11, gate open and closed', async () => {
+  for (const busy of [11, 11.5]) {
+    const { state } = freshEnv();
+    const gate = ticket('gate');
+    await queueAll(state, [blockedHead(), gate]);
+    heldLease(state, 'busy', 4);
+    const result = await poll(state, gate, busy);
+    assert.equal(result.started, true, `busy ${busy}`);
+    assert.equal(result.floor, true);
+    assert.equal(readJsonSafe(paths(state).cpuGate).closed, busy === 11.5, 'gate state as expected');
+    assert.match(readLog(state), /floor-slot|floor=1/);
+  }
 });
