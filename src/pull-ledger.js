@@ -23,17 +23,27 @@ function validate(entry) {
   return entry;
 }
 
-// the creator may have died before its directory fsync, so a reader makes the link durable before anyone acts on the entry
-export function readLedger(root, id) {
-  let text;
+function readLedgerText(root, id) {
   try {
-    text = fs.readFileSync(ledgerFile(root, id), 'utf8');
+    return fs.readFileSync(ledgerFile(root, id), 'utf8');
   } catch (err) {
     if (err.code === 'ENOENT') return null;
     throw err;
   }
+}
+
+// the creator may have died before its directory fsync, so a reader makes the link durable before anyone acts on the entry
+export function readLedger(root, id) {
+  const text = readLedgerText(root, id);
+  if (text === null) return null;
   ensureDurableDir(ledgerDir(root), { boundary: root });
   return validate(JSON.parse(text));
+}
+
+/** `readLedger` for a read-only caller: same validation, but never touches the directory. */
+export function peekLedger(root, id) {
+  const text = readLedgerText(root, id);
+  return text === null ? null : validate(JSON.parse(text));
 }
 
 // link fails with EEXIST when any entry exists, so exactly one of any number of racing callers creates it; the stored entry always stands

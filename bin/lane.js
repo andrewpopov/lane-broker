@@ -15,6 +15,7 @@ import { MIN_CPU_GRANT_CORES } from '../src/cpu-limit.js';
 import { isTicketId, stateHome, executionIdOf, HUMAN_DRAIN_OWNER, DRAIN_OWNER_RE } from '../src/state.js';
 import { writeBrokerLog } from '../src/admission.js';
 import { leaseCheckCommand } from '../src/lease.js';
+import { resultCommand } from '../src/result.js';
 import { parseTransferFlag } from '../src/remote-gzip.js';
 import { parseTransferCacheFlag } from '../src/remote-blobs.js';
 import {
@@ -56,6 +57,7 @@ function usage() {
   lane lease-check <id>
   lane priority <id> high|medium|low
   lane wait <id> [--timeout <duration>]
+  lane result <id> [--json]
   lane pause ["reason"]
   lane resume
   lane config effective [--json]
@@ -355,6 +357,8 @@ async function main() {
       const timeoutMs = timeoutFlagIdx !== -1 ? parseDurationMs(rest[timeoutFlagIdx + 1]) : undefined;
       return waitAndExit(id, { timeoutMs });
     }
+    case 'result':
+      return resultCommand(rest).exitCode;
     case 'pause': {
       const reason = rest.join(' ');
       const result = await pauseCommand(reason);

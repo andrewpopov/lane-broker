@@ -49,6 +49,7 @@ lane cancel <id>
 lane lease-check <id>                    # exit 0 only if <id> is a live lease on this host (BRAIN-553)
 lane priority <id> high|medium|low       # re-tier a queued ticket in place (BRAIN-518)
 lane wait <id> [--timeout 5m]
+lane result <id> --json                  # read a finished job's stored result; exit 0 found, 82 not finished, 83 unknown, 84 state unreadable (BRAIN-1198)
 lane pause "reason" | lane resume
 lane drain ["reason"] | lane undrain       # take a runner out of remote rotation (BRAIN-520)
 lane migrate-scheduler [--dry-run | --when-idle [--timeout <duration>]]
@@ -2456,6 +2457,13 @@ or memory reservation. Any other nested key — a
 different repo, or a different lane that isn't `prepush` — is refused with
 exit `64`; v1 has no general lane hierarchy.
 
+**Reading a finished job's result (`lane result <id> [--json]`, BRAIN-1198).** Prints the stored result record
+(`<state>/results/<id>.json`: `{ exit }` or `{ signal }`, plus whatever the settling path added, such as `reused`,
+`reconciled`, `reason`) verbatim as one JSON object line on stdout with `--json`, or one summary line without. It only
+reads state and takes no lock, and creates nothing (the pull-ledger lookup does not fsync or create directories). Because the supervisor writes the result before it removes the lease, and admission moves a ticket between queue, pending and lease, a single pass can see neither: the lookup re-reads result then live state up to 3 passes, 5 ms apart, before answering `83`. Callers detect support through the `result/1` capability (`lane capabilities --json`). Exit `0` found (the job's own exit is in the record, not the exit code), `82` known but not
+finished (same notion of "known" as `lane wait`), `83` unknown id (confirmed absent from the result, lease, attempt, pending, queue and pull ledger), `84` state unreadable (a result file or live record that is malformed or cannot be read, named on stderr; never reported as 83), `2` a malformed id or arguments (rejected before any
+file is read). Use it instead of reading `results/` directly.
+
 **Checking an inherited lease (`lane lease-check <id>`, BRAIN-553).** A non-empty
 `LANE_BROKER_LEASE` proves nothing: anyone can set it, and a hook that runs its suite
 directly whenever it is set lets a made-up value skip the queue. `lane lease-check
@@ -2935,6 +2943,9 @@ released and cancel markers are removed with their ticket and nothing sweeps one
 | `79` | BRAIN-700: refused to re-run byte-identical content that already failed ("Known-red refusal"); pass `--retry "<why>"`. |
 | `80` | `lane priority`: no such ticket, or it already finished (result, cancel, expire or withdraw marker). |
 | `81` | `lane priority`: the ticket is in the wrong state: running, or queued on a runner / owned by a submitter (cancel and resubmit with `--priority`). |
+| `82` | `lane result`: the id is a known job (queued, running, or settling) with no result yet. |
+| `83` | `lane result`: no such job: the id is neither queued, leased, attempted nor resulted. |
+| `84` | `lane result`: the result file or a live record for the id is malformed or unreadable; absence is not claimed. |
 | `85` | `lane priority`: the queued ticket's supervisor is no longer alive. |
 | `89` | `lane priority`: legacy scheduler (no valid fence or `fairness-v2.json`); priority reorders nothing until `lane migrate-scheduler`. |
 | `124` | Killed by the no-progress watchdog (`reason: "no-progress"`) or the silence watchdog (`reason: "silence"`), see below. |
