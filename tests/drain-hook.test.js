@@ -277,3 +277,14 @@ test('wait reads leases and queue under the admission lock: while another holder
   await holding;
   assert.equal((await status).exitCode, 0);
 });
+
+test('wait never reaps a lease that lacks boot evidence: a live remote lease with no bootId is 75 and its file survives', async () => {
+  const { state, remoteRoot, run, observe } = hookWorld();
+  await run('--apply', WAIT);
+  observe();
+  const file = path.join(paths(state).leases, 'remote-live.json');
+  leaseOf(state, 'remote-live', true, { bootId: undefined, cwd: path.join(remoteRoot, 'tickets', 'sub-1', 'work') });
+  submittedBy(remoteRoot, 'sub-1', 'remote-live');
+  assert.equal((await run('--status', WAIT, REAL)).exitCode, 75);
+  assert.equal(fs.existsSync(file), true, 'the lease was not deleted');
+});

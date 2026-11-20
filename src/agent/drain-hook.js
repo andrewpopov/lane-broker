@@ -42,15 +42,19 @@ const within = (dir, file) => { const rel = path.relative(dir, file); return rel
 /** Local only on positive evidence: a runner-side remote ticket works under `<remote root>/tickets/`, a local `lane run` anywhere else. A record with no id or cwd is not known to be local. */
 const isLocal = (entry, ticketsDir) => typeof entry.id === 'string' && typeof entry.cwd === 'string' && path.isAbsolute(entry.cwd) && !within(ticketsDir, entry.cwd);
 
-/** Dead owners reaped, then leases and queue read together under the lock admission takes, so a ticket cannot move between the two reads. Anything not positively local, or that cannot be read, counts as remote work left. */
+/** `reapAll` treats a lease with no `bootId` as left over from an earlier boot and deletes it without asking whether its supervisor lives; such a lease is never reaped from here. */
+const hasBootEvidence = (lease) => typeof lease.id === 'string' && typeof lease.bootId === 'string' && lease.bootId !== '' && Number.isInteger(lease.supervisorPid);
+
+/** Dead owners reaped (once every lease has boot evidence), then leases and queue read together under the lock admission takes, so a ticket cannot move between the two reads. Anything not positively local, or that cannot be read, counts as remote work left. */
 async function remoteWorkLeft(remoteRoot, { stateDir }) {
   try {
     const entries = await withLock(stateDir, () => {
+      if (!listLeasesStrict(stateDir).every(hasBootEvidence)) return null;
       reapAll(stateDir, bootId());
       reapOrphanedQueue(stateDir);
       return [...listLeasesStrict(stateDir).filter((l) => l.state !== LEASE_STATE.DONE), ...listQueueStrict(stateDir)];
     }, { timeoutMs: LOCK_WAIT_MS });
-    if (entries.length === 0) return false;
+    if (entries === null || entries.length === 0) return entries === null;
     const owners = remoteOwnerMapStrict(remoteRoot);
     const ticketsDir = path.join(path.resolve(remoteRoot), 'tickets');
     return entries.some((entry) => !isLocal(entry, ticketsDir) || owners.has(entry.id));
