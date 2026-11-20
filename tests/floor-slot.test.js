@@ -352,8 +352,9 @@ test('floor slot (BRAIN-627): floorWinner is null with a floor lease held, floor
   assert.equal(winnerOf([blockedHead(), ticket('plain', { pushGate: undefined })], []), null);
 });
 
-test('floor slot (BRAIN-627): at tryStart, a stamped push behind a blocked head starts with floor:true under external load 11, gate open and closed', async () => {
-  for (const busy of [11, 11.5]) {
+test('floor slot (BRAIN-627): at tryStart, a stamped push behind a blocked head starts with floor:true under external load 10.5 (gate open) and 11.5 (gate closed)', async () => {
+  // 10.5 is under cpuClosePercent 90 of 12 cores; old arithmetic 10.5 + 4 + 1 - 11 = 4.5 > 3 denied it
+  for (const busy of [10.5, 11.5]) {
     const { state } = freshEnv();
     const gate = ticket('gate');
     await queueAll(state, [blockedHead(), gate]);
