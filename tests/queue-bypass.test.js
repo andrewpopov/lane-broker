@@ -287,6 +287,18 @@ test('a real push gate waiting for the floor slot keeps it: the bypass is refuse
   assert.equal((await poll(state, t, baseCfg())).started, true, 'floor slot off: the bypass proceeds');
 });
 
+test('a bypass does not yield to a push gate when a floor lease is already held', async () => {
+  const push = ticket('push', { lane: 'prepush', cmdFingerprint: 'p', command: 'p', pushGate: { caller: 'push', gitPid: 4242, gitStartEpoch: 1, worktree: '/wt/push', branch: 'push', pushArgsHash: 'push' } });
+  const cfg = baseCfg({ floorOvershootCores: 3 });
+  const { state } = freshEnv();
+  seedRuns(state);
+  writeLease(state, held('floored', { floor: true }));
+  await queued(state, ticket('head', { key: 'r:head', cmdFingerprint: 'h', command: 'h' }));
+  await queued(state, push);
+  const t = await queued(state, ticket('a'));
+  assert.equal((await poll(state, t, cfg)).started, true, 'the floor is taken: the push is not a winner, so the bypass proceeds');
+});
+
 const agedHead = (extra = {}) => ticket('head', { key: 'r:head', cmdFingerprint: 'h', command: 'h', resources: { cpuCores: 4 }, prioOriginAt: Date.now() - 2 * 900_000, ...extra });
 
 test('an aged head held back only by bypass leases is not delayed further; external load alone does not refuse', async () => {
