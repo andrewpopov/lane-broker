@@ -537,6 +537,7 @@ test('remote-probe advertises elastic-claims/1', () => {
     'deps-key-files/1',
     'deps-key-files/2',
     'priority-group/1',
+    'result/1',
     'blob-cache/1',
   ]);
 });

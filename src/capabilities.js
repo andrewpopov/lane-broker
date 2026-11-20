@@ -45,6 +45,9 @@ export const DEPS_KEY_FILES_COVER_CAPABILITY = 'deps-key-files/2';
 // BRAIN-894: a runner reads the header's `group`, so shards of one job share one slot of its per-repo high cap.
 export const PRIORITY_GROUP_CAPABILITY = 'priority-group/1';
 
+// BRAIN-1198: `lane result <id> --json` reads a finished job's result; a caller probes this before relying on it.
+export const RESULT_READ_CAPABILITY = 'result/1';
+
 /** The ONE list: `lane remote-probe` advertises it and `lane capabilities --json` prints it. */
 export const CAPABILITIES = [
   ELASTIC_CLAIMS_CAPABILITY,
@@ -67,6 +70,7 @@ export const CAPABILITIES = [
   DEPS_KEY_FILES_CAPABILITY,
   DEPS_KEY_FILES_COVER_CAPABILITY,
   PRIORITY_GROUP_CAPABILITY,
+  RESULT_READ_CAPABILITY,
 ];
 
 /** `CAPABILITIES` plus what depends on this host's config: `blob-cache/1` only while the runner blob store is enabled, `cpu-limit/1` only when `cpuLimit` is not "off" and its probe passed, `enforced-leases/1` on top of that unless `memoryLimit` is "off". */
