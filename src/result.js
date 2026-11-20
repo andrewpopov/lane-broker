@@ -13,7 +13,7 @@ export const RESULT_UNREADABLE_EXIT = 84;
 const PASSES = 3;
 const PASS_PAUSE_MS = 5;
 
-/** The parsed JSON in `file`, null only when it does not exist; anything unreadable or malformed throws `UnreadableRecordError`. */
+/** The parsed JSON in `file`, null only when it does not exist; anything unreadable, malformed or not a JSON object throws `UnreadableRecordError`. */
 function readRecordStrict(file) {
   let text;
   try {
@@ -22,11 +22,14 @@ function readRecordStrict(file) {
     if (err.code === 'ENOENT') return null;
     throw new UnreadableRecordError(file, err.message);
   }
+  let record;
   try {
-    return JSON.parse(text);
+    record = JSON.parse(text);
   } catch (err) {
     throw new UnreadableRecordError(file, err.message);
   }
+  if (record === null || typeof record !== 'object' || Array.isArray(record)) throw new UnreadableRecordError(file, 'not a JSON object');
+  return record;
 }
 
 function peekLedgerStrict(root, id) {

@@ -1,4 +1,4 @@
-import test from 'node:test';
+import test, { mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -172,19 +172,42 @@ test('result: a malformed lease file exits 84, not 83', async () => {
   assert.equal(res.code, 84, res.stderr);
 });
 
+test('result: a result file that is not a JSON object exits 84', async () => {
+  const { state, env } = freshEnv();
+  for (const text of ['null', 'false', '0', '""', '[]', 'true']) {
+    const id = plantResult(state, {});
+    fs.writeFileSync(path.join(paths(state).results, `${id}.json`), text);
+    const res = await laneRun(['result', id, '--json'], { env });
+    assert.equal(res.code, 84, `${text}: ${res.stderr}`);
+    assert.equal(res.stdout, '');
+  }
+});
+
+test('result: a lease file that is not a JSON object exits 84', async () => {
+  const { state, env } = freshEnv();
+  const id = crypto.randomUUID();
+  writeLease(state, { id, key: 'r:default', bootId: 'b', supervisorPid: process.pid, weight: 1, heartbeatAt: Date.now(), state: LEASE_STATE.RUNNING });
+  fs.writeFileSync(path.join(paths(state).leases, `${id}.json`), 'null');
+  const res = await laneRun(['result', id], { env });
+  assert.equal(res.code, 84, res.stderr);
+});
+
 function snapshotTree(dir) {
   return fs.readdirSync(dir, { recursive: true }).sort();
 }
 
-test('result: a ledger-only ticket is 82 and the lookup creates nothing and leaves the ledger directory untouched', async () => {
-  const { state, env } = freshEnv();
+test('result: a ledger-only ticket is 82 and the lookup neither creates a directory nor fsyncs', () => {
+  const { state } = freshEnv();
   const id = crypto.randomUUID();
   ledgerAccept(state, { logicalId: id, epoch: 1, decision: { kind: 'result' } });
-  const ledgerDir = paths(state).pullLedger;
-  const before = { tree: snapshotTree(state), mtime: fs.statSync(ledgerDir).mtimeMs };
-  await new Promise((resolve) => setTimeout(resolve, 20));
-  const res = await laneRun(['result', id, '--json'], { env });
-  assert.equal(res.code, 82, res.stderr);
-  assert.deepEqual(snapshotTree(state), before.tree);
-  assert.equal(fs.statSync(ledgerDir).mtimeMs, before.mtime);
+  const mkdir = mock.method(fs, 'mkdirSync');
+  const fsync = mock.method(fs, 'fsyncSync');
+  try {
+    const res = runInProcess([id, '--json'], state, { ...defaultReaders, ...noPause });
+    assert.equal(res.exitCode, 82);
+  } finally {
+    mock.restoreAll();
+  }
+  assert.equal(mkdir.mock.callCount(), 0);
+  assert.equal(fsync.mock.callCount(), 0);
 });
