@@ -1,7 +1,7 @@
 import { openAgentCore } from './agent.js';
 import { AgentConfigError } from './config.js';
 import { loadGlobalConfig } from '../config.js';
-import { brokerConfigReader, claimBlock, claimFigures, claimOnce, drainOwners, isDraining, presentTools } from './claims.js';
+import { brokerConfigReader, claimBlock, claimFigures, claimOnce, drainOwners, drainsOf, isDraining, presentTools } from './claims.js';
 import { ExecutionDriver } from './execution.js';
 import { createS3Client } from '../s3-client.js';
 import { Waker } from './waker.js';
@@ -138,7 +138,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
         if (upgradeRequired) log('UPGRADE REQUIRED: the queue refuses this agent\'s protocol, so no claims are made; update lane-broker and restart the agent');
         else await claimRound();
         const blocked = block();
-        core.tick({ claims: upgradeRequired ? 'stopped: upgrade required' : blocked ? `paused:${blocked}` : 'running', ...(deviceGatesConfig ? { deviceGates: deviceGateStatus() } : {}) });
+        core.tick({ claims: upgradeRequired ? 'stopped: upgrade required' : blocked ? `paused:${blocked}` : 'running', drains: drainsOf(config.stateDir), ...(deviceGatesConfig ? { deviceGates: deviceGateStatus() } : {}) });
         writeMetrics(tickAt);
       }
       const lastSignOfLife = () => Math.max(lastLivenessAt, pingAt);

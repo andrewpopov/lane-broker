@@ -605,6 +605,7 @@ export function sanitizeDrainReason(raw) {
 }
 
 export const HUMAN_DRAIN_OWNER = 'human';
+export const DRAIN_MODES = ['wait', 'interrupt'];
 export const DRAIN_OWNER_RE = /^[a-z0-9][a-z0-9._-]{0,62}$/;
 const DRAIN_UNREADABLE = (owner) => ({ owner, reason: DRAIN_UNREADABLE_REASON, since: null, unreadable: true });
 
@@ -627,7 +628,12 @@ function loadDrainFile(file, owner) {
   }
   const ok = m && typeof m === 'object' && !Array.isArray(m) && m.version === DRAIN_MARKER_VERSION && typeof m.reason === 'string' && Number.isFinite(m.since) && (m.expiresAt === undefined || Number.isFinite(m.expiresAt));
   if (!ok) return DRAIN_UNREADABLE(owner);
-  const marker = { owner, reason: sanitizeDrainReason(m.reason) || DEFAULT_DRAIN_REASON, since: m.since, unreadable: false, ...(m.expiresAt === undefined ? {} : { expiresAt: m.expiresAt }) };
+  const marker = {
+    owner, reason: sanitizeDrainReason(m.reason) || DEFAULT_DRAIN_REASON, since: m.since, unreadable: false,
+    ...(m.expiresAt === undefined ? {} : { expiresAt: m.expiresAt }),
+    ...(typeof m.drainId === 'string' ? { drainId: m.drainId } : {}),
+    ...(DRAIN_MODES.includes(m.mode) ? { mode: m.mode } : {}),
+  };
   // BRAIN-350: a shutdown drain ends with the boot it was written in (the host is about to go down, so it comes back taking work).
   if (m.shutdown === true) {
     // the kernel boot id survives a wall-clock correction that shifts `bootId`; an old marker (none stored) or a host without one keeps `bootId`
@@ -676,7 +682,7 @@ export function pruneExpiredDrains(root, now = Date.now()) {
   }
 }
 
-export async function writeRemoteDrain(root, reason, { shutdown = false, timeoutMs, owner = HUMAN_DRAIN_OWNER, expiresAt } = {}) {
+export async function writeRemoteDrain(root, reason, { shutdown = false, timeoutMs, owner = HUMAN_DRAIN_OWNER, expiresAt, drainId, mode } = {}) {
   return withLock(root, () => {
     pruneExpiredDrains(root);
     const file = drainFileOf(root, owner);
@@ -688,11 +694,13 @@ export async function writeRemoteDrain(root, reason, { shutdown = false, timeout
       host: os.hostname(),
       ...(owner === HUMAN_DRAIN_OWNER ? {} : { owner }),
       ...(expiresAt === undefined ? {} : { expiresAt }),
+      ...(drainId === undefined ? {} : { drainId }),
+      ...(mode === undefined ? {} : { mode }),
       ...(shutdown ? { shutdown: true, bootId: bootId(), ...(kernelBootId() ? { kernelBootId: kernelBootId() } : {}) } : {}),
     };
     fs.mkdirSync(path.dirname(file), { recursive: true });
     atomicWriteJson(file, marker, { fsync: true });
-    return { owner, reason: marker.reason, since: marker.since, unreadable: false, ...(expiresAt === undefined ? {} : { expiresAt }), ...(shutdown ? { shutdown: true } : {}) };
+    return { owner, reason: marker.reason, since: marker.since, unreadable: false, ...(expiresAt === undefined ? {} : { expiresAt }), ...(drainId === undefined ? {} : { drainId }), ...(mode === undefined ? {} : { mode }), ...(shutdown ? { shutdown: true } : {}) };
   }, { timeoutMs });
 }
 
