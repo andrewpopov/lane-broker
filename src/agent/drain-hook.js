@@ -2,9 +2,9 @@ import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { AGENT_CONFIG_DIR, loadAgentConfig } from './config.js';
 import { ExecutionTable, readAgentStatus } from './store.js';
-import { DRAIN_MODES, clearRemoteDrain, readDrainMarkers, writeRemoteDrain } from '../state.js';
-import { listLeasesStrict, LEASE_STATE } from '../lease.js';
-import { listQueueStrict } from '../scheduler.js';
+import { DRAIN_MODES, bootId, clearRemoteDrain, readDrainMarkers, withLock, writeRemoteDrain } from '../state.js';
+import { LEASE_STATE, listLeasesStrict, reapAll } from '../lease.js';
+import { listQueueStrict, reapOrphanedQueue } from '../scheduler.js';
 import { remoteOwnerMapStrict } from '../retier.js';
 
 export const BOSUN_OWNER = 'bosun';
@@ -36,13 +36,24 @@ function recordsAllDone(remoteRoot) {
   }
 }
 
-/** Any running or queued ticket here that a submitter owns. Whatever cannot be read leaves ownership unknown, and unknown counts as work left. */
+const LOCK_WAIT_MS = 5000;
+
+const within = (dir, file) => { const rel = path.relative(dir, file); return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel); };
+/** Local only on positive evidence: a runner-side remote ticket works under `<remote root>/tickets/`, a local `lane run` anywhere else. A record with no id or cwd is not known to be local. */
+const isLocal = (entry, ticketsDir) => typeof entry.id === 'string' && typeof entry.cwd === 'string' && path.isAbsolute(entry.cwd) && !within(ticketsDir, entry.cwd);
+
+/** Dead owners reaped, then leases and queue read together under the lock admission takes, so a ticket cannot move between the two reads. Anything not positively local, or that cannot be read, counts as remote work left. */
 async function remoteWorkLeft(remoteRoot, { stateDir }) {
   try {
-    const entries = [...listLeasesStrict(stateDir).filter((l) => l.state !== LEASE_STATE.DONE), ...listQueueStrict(stateDir)];
+    const entries = await withLock(stateDir, () => {
+      reapAll(stateDir, bootId());
+      reapOrphanedQueue(stateDir);
+      return [...listLeasesStrict(stateDir).filter((l) => l.state !== LEASE_STATE.DONE), ...listQueueStrict(stateDir)];
+    }, { timeoutMs: LOCK_WAIT_MS });
     if (entries.length === 0) return false;
     const owners = remoteOwnerMapStrict(remoteRoot);
-    return entries.some((entry) => owners.has(entry.id));
+    const ticketsDir = path.join(path.resolve(remoteRoot), 'tickets');
+    return entries.some((entry) => !isLocal(entry, ticketsDir) || owners.has(entry.id));
   } catch {
     return true;
   }

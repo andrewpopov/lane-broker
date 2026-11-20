@@ -6,7 +6,8 @@ import { freshEnv, laneRun } from './helpers.js';
 import { drainHookCommand } from '../src/agent/drain-hook.js';
 import { claimBlock, drainsOf, isDraining } from '../src/agent/claims.js';
 import { ExecutionTable, ensureAgentDirs, newExecutionRecord } from '../src/agent/store.js';
-import { paths, readDrainMarkers, readRemoteDrain, writeRemoteDrain } from '../src/state.js';
+import { spawnSync } from 'node:child_process';
+import { bootId, paths, processStartTime, readDrainMarkers, readRemoteDrain, withLock, writeRemoteDrain } from '../src/state.js';
 import { randomUUID } from 'node:crypto';
 import os from 'node:os';
 
@@ -188,7 +189,9 @@ test('an unreadable agent config is an error exit that is neither 0 nor 75, for 
 });
 
 const writeJson = (file, value) => { fs.mkdirSync(path.dirname(file), { recursive: true }); fs.writeFileSync(file, JSON.stringify(value)); };
-const leaseOf = (state, id, running = true) => writeJson(path.join(paths(state).leases, `${id}.json`), { id, state: running ? 'RUNNING' : 'DONE' });
+const LOCAL_CWD = '/work/some-repo';
+const leaseOf = (state, id, running = true, extra = {}) => writeJson(path.join(paths(state).leases, `${id}.json`), { id, state: running ? 'RUNNING' : 'DONE', cwd: LOCAL_CWD, bootId: bootId(), supervisorPid: process.pid, supervisorStart: processStartTime(process.pid), childPgid: process.pid, ...extra });
+const queuedOf = (state, id, extra = {}) => writeJson(path.join(paths(state).queue, `000000000001-${id}.json`), { id, cwd: LOCAL_CWD, ...extra });
 const submittedBy = (remoteRoot, ticket, id) => {
   fs.mkdirSync(path.join(remoteRoot, 'tickets', ticket), { recursive: true });
   fs.writeFileSync(path.join(remoteRoot, 'tickets', ticket, 'remote-id'), id);
@@ -200,17 +203,17 @@ test('wait with the real remote-work reader: a remote lease or queued ticket hol
   await run('--apply', wait);
   observe();
   const real = { remoteWork: undefined };
-  assert.equal((await run('--status', wait, real)).exitCode, 0, 'nothing running');
+  assert.equal((await run('--status', WAIT, REAL)).exitCode, 0, 'nothing running');
   leaseOf(state, 'local-1');
   leaseOf(state, 'remote-done', false);
   submittedBy(remoteRoot, 'sub-1', 'remote-done');
-  assert.equal((await run('--status', wait, real)).exitCode, 0, 'a local lease and a finished remote one');
+  assert.equal((await run('--status', WAIT, REAL)).exitCode, 0, 'a local lease and a finished remote one');
   leaseOf(state, 'remote-1');
   submittedBy(remoteRoot, 'sub-2', 'remote-1');
-  assert.equal((await run('--status', wait, real)).exitCode, 75, 'a running remote lease');
+  assert.equal((await run('--status', WAIT, REAL)).exitCode, 75, 'a running remote lease');
   fs.rmSync(path.join(paths(state).leases, 'remote-1.json'));
-  writeJson(path.join(paths(state).queue, '000000000001-remote-1.json'), { id: 'remote-1' });
-  assert.equal((await run('--status', wait, real)).exitCode, 75, 'a queued remote ticket');
+  queuedOf(state, 'remote-1');
+  assert.equal((await run('--status', WAIT, REAL)).exitCode, 75, 'a queued remote ticket');
 });
 
 test('wait fails closed when ticket ownership cannot be read: any lease or queued ticket then counts as work left', async () => {
@@ -227,4 +230,50 @@ test('wait fails closed when ticket ownership cannot be read: any lease or queue
     damage(remoteRoot);
     assert.equal((await run('--status', wait, { remoteWork: undefined })).exitCode, 75, what);
   }
+});
+
+const WAIT = env({ BOSUN_DRAIN_MODE: 'wait' });
+const REAL = { remoteWork: undefined };
+
+test('wait counts a lease or queued entry as remote work unless it is positively local: no cwd, a cwd under the tickets dir, no id, or {} all hold it', async () => {
+  for (const [what, make] of [
+    ['a lease with no cwd', (state) => leaseOf(state, 'x', true, { cwd: undefined })],
+    ['a lease working under the remote tickets dir', (state, remoteRoot) => leaseOf(state, 'x', true, { cwd: path.join(remoteRoot, 'tickets', 'sub-9', 'work') })],
+    ['an empty lease', (state) => writeJson(path.join(paths(state).leases, 'e.json'), {})],
+    ['an empty queue entry', (state) => writeJson(path.join(paths(state).queue, '000000000001-e.json'), {})],
+    ['a queue entry with no cwd', (state) => queuedOf(state, 'x', { cwd: undefined })],
+  ]) {
+    const { state, remoteRoot, run, observe } = hookWorld();
+    await run('--apply', WAIT);
+    observe();
+    make(state, remoteRoot);
+    assert.equal((await run('--status', WAIT, REAL)).exitCode, 75, what);
+  }
+});
+
+test('wait reaps a lease whose supervisor is gone before counting, so a dead remote lease ends at 0', async () => {
+  const { state, remoteRoot, run, observe } = hookWorld();
+  await run('--apply', WAIT);
+  observe();
+  const dead = spawnSync(process.execPath, ['-e', '0']).pid;
+  leaseOf(state, 'remote-dead', true, { supervisorPid: dead, supervisorStart: null, childPgid: dead, cwd: path.join(remoteRoot, 'tickets', 'sub-1', 'work') });
+  submittedBy(remoteRoot, 'sub-1', 'remote-dead');
+  assert.equal((await run('--status', WAIT, REAL)).exitCode, 0);
+  assert.equal(fs.existsSync(path.join(paths(state).leases, 'remote-dead.json')), false, 'the reaper removed it');
+});
+
+test('wait reads leases and queue under the admission lock: while another holder has it, --status does not answer', async () => {
+  const { state, run, observe } = hookWorld();
+  await run('--apply', WAIT);
+  observe();
+  let release;
+  const held = new Promise((resolve) => { release = resolve; });
+  const holding = withLock(state, () => held);
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  const status = run('--status', WAIT, REAL);
+  const early = await Promise.race([status, new Promise((resolve) => setTimeout(() => resolve('still waiting'), 500))]);
+  assert.equal(early, 'still waiting', 'the read waited for the lock');
+  release();
+  await holding;
+  assert.equal((await status).exitCode, 0);
 });
