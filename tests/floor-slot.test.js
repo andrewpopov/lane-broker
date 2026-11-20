@@ -100,7 +100,7 @@ test('floor slot: applies under a closed CPU gate when the projection fits withi
 test('floor slot: a later small gate passes an earlier lane-local ticket that does not fit; an earlier memory-denied one does not pin it', async () => {
   const { state } = freshEnv();
   const head = ticket('head', { lane: 'local', pushGate: undefined, weight: 6 });
-  const big = ticket('big', { weight: 4 }); // 10.5 + 4 = 14.5 > 14
+  const big = ticket('big', { resources: { cpuCores: 15 } }); // lane load 15 > 11 + 3
   const starved = ticket('starved', { resources: { cpuCores: 1, memoryBytes: 80 * GIB } });
   const small = ticket('small');
   await queueAll(state, [head, big, starved, small]);
@@ -128,11 +128,15 @@ test('floor slot: applies while ordinary leases are held when the projection inc
   assert.equal(started.floor, true);
   assert.deepEqual(listLeases(held.state).map((l) => l.id).sort(), ['busy', 'gate']);
 
-  const tooMuch = freshEnv();
-  await queueAll(tooMuch.state, [head, gate]);
-  ordinaryLease(tooMuch.state);
-  writeLease(tooMuch.state, { id: 'big', key: 'held:big', bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight: 13, state: LEASE_STATE.RUNNING });
-  const refused = await poll(tooMuch.state, gate, 0); // lane load 13 + 1 (busy) + 1 = 15 > 11 + 3
+  const withBig = async (grantedCpuCores) => {
+    const env = freshEnv();
+    await queueAll(env.state, [head, gate]);
+    ordinaryLease(env.state);
+    heldLease(env.state, 'big', 1, { grantedCpuCores });
+    return poll(env.state, gate, 3);
+  };
+  assert.equal((await withBig(4)).started, true, 'control: 4 + 1 + 1 fits, so the denial below is by CPU');
+  const refused = await withBig(13); // lane load 13 + 1 (busy) + 1 = 15 > 11 + 3
   assert.equal(refused.started, false);
 
   const idle = freshEnv();
@@ -330,8 +334,9 @@ test('floor slot (BRAIN-627): external load is not charged: lane load 6 under ex
 
 test('floor slot (BRAIN-627): lane load over budget + overshoot still denies, whatever the external load', () => {
   const queue = [blockedHead(), ticket('push')];
-  assert.equal(winnerOf(queue, [leaseOf('busy', 14)], { busy: 0 }), null, '14 + 1 - 11 = 4 > 3');
-  assert.equal(winnerOf(queue, [leaseOf('busy', 14)], { busy: 11 }), null);
+  assert.equal(winnerOf(queue, [leaseOf('busy', 1, { grantedCpuCores: 4 })], { busy: 3 }), 'push', 'control: the same setup with 4 cores wins');
+  assert.equal(winnerOf(queue, [leaseOf('busy', 1, { grantedCpuCores: 14 })], { busy: 3 }), null, '14 + 1 - 11 = 4 > 3');
+  assert.equal(winnerOf(queue, [leaseOf('busy', 1, { grantedCpuCores: 14 })], { busy: 11 }), null);
 });
 
 test('floor slot (BRAIN-627): floorWinner is null with a floor lease held, floorOvershootCores 0, memory denial, cooldown, or an unstamped prepush', () => {
@@ -342,8 +347,8 @@ test('floor slot (BRAIN-627): floorWinner is null with a floor lease held, floor
   assert.equal(winnerOf(queue, [], { config: { ...cfg, floorOvershootCores: 0 } }), null);
   const hungry = ticket('hungry', { resources: { cpuCores: 1, memoryBytes: 80 * GIB } });
   assert.equal(winnerOf([blockedHead(), hungry], []), null);
-  assert.equal(winnerOf(queue, [leaseOf('busy', 1, { admittedAt: Date.now() })], { config: { ...cfg, admissionCooldownMs: 60_000 }, busy: 0 }), null, 'cooldown');
-  assert.equal(winnerOf(queue, [leaseOf('busy', 1, { admittedAt: Date.now() - 120_000 })], { config: { ...cfg, admissionCooldownMs: 60_000 }, busy: 0 }), 'push', 'cooldown over');
+  assert.equal(winnerOf(queue, [leaseOf('busy', 1, { admittedAt: Date.now() })], { config: { ...cfg, admissionCooldownMs: 60_000 }, busy: 6 }), null, 'cooldown');
+  assert.equal(winnerOf(queue, [leaseOf('busy', 1, { admittedAt: Date.now() - 120_000 })], { config: { ...cfg, admissionCooldownMs: 60_000 }, busy: 6 }), 'push', 'cooldown over');
   assert.equal(winnerOf([blockedHead(), ticket('plain', { pushGate: undefined })], []), null);
 });
 
