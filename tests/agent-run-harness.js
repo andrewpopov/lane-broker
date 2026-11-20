@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, test, before, after, afterEach } from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
+import pg from 'pg';
 import zlib from 'node:zlib';
 import crypto, { randomUUID } from 'node:crypto';
 import { BIN, sleep, waitFor, scaledMs } from './helpers.js';
@@ -154,6 +155,29 @@ export class RunnerWorld {
       else process.env[name] = this.saved[key];
     }
   }
+}
+
+/** Queries naming `fragment` held at a gate (while `armed`) until `release()`, or failed when their connection is ended (as pg does to an in-flight query). Pass `gate.connect` as the agent's `coreOptions.connect`. */
+export function gatedQuery(fragment, { armed = true } = {}) {
+  const gate = { sent: false, armed };
+  const open = new Promise((resolve) => { gate.release = resolve; });
+  gate.connect = async (config) => {
+    const client = new pg.Client(config);
+    client.on('error', () => {});
+    await client.connect();
+    const query = client.query.bind(client);
+    const end = client.end.bind(client);
+    let ended;
+    const closed = new Promise((_, reject) => { ended = reject; });
+    closed.catch(() => {});
+    client.query = async (...args) => {
+      if (gate.armed && String(args[0]).includes(fragment)) { gate.sent = true; await Promise.race([open, closed]); }
+      return query(...args);
+    };
+    client.end = () => { ended(new Error('Connection terminated')); return end(); };
+    return client;
+  };
+  return gate;
 }
 
 /** A fetch for `fetchImpl` that records every request and lets `intercept(url, init, count)` answer some of them (a Response), else passes through. */

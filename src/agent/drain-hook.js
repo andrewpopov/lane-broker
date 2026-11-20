@@ -1,10 +1,11 @@
-import fs from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { AGENT_CONFIG_DIR, loadAgentConfig } from './config.js';
 import { ExecutionTable, readAgentStatus } from './store.js';
-import { drainsOf } from './claims.js';
 import { DRAIN_MODES, clearRemoteDrain, readDrainMarkers, writeRemoteDrain } from '../state.js';
-import { collectStatus } from '../status.js';
+import { listLeasesStrict, LEASE_STATE } from '../lease.js';
+import { listQueueStrict } from '../scheduler.js';
+import { remoteOwnerMapStrict } from '../retier.js';
 
 export const BOSUN_OWNER = 'bosun';
 const NOT_YET = 75;
@@ -35,24 +36,43 @@ function recordsAllDone(remoteRoot) {
   }
 }
 
-async function remoteWorkLeft(remoteRoot, config) {
-  Object.assign(process.env, { LANE_BROKER_HOME: config.brokerHome, LANE_BROKER_STATE: config.stateDir });
-  const status = await collectStatus({ remoteRoot });
-  return [...status.running, ...status.queued].some((entry) => entry.remoteOwner !== null);
+/** Any running or queued ticket here that a submitter owns. Whatever cannot be read leaves ownership unknown, and unknown counts as work left. */
+async function remoteWorkLeft(remoteRoot, { stateDir }) {
+  try {
+    const entries = [...listLeasesStrict(stateDir).filter((l) => l.state !== LEASE_STATE.DONE), ...listQueueStrict(stateDir)];
+    if (entries.length === 0) return false;
+    const owners = remoteOwnerMapStrict(remoteRoot);
+    return entries.some((entry) => owners.has(entry.id));
+  } catch {
+    return true;
+  }
 }
 
-/** Exit 0 once this drain is in force for its mode, 75 until then, 1 if the marker is not this drain's. */
-async function drainStatus({ request, remoteRoot, config, readStatus, remoteWork, err }) {
-  const marker = readDrainMarkers(config.stateDir).find((m) => m.owner === BOSUN_OWNER);
-  if (marker?.drainId !== request.id) {
-    err.write(`lane drain-hook: no bosun drain ${request.id} is in force\n`);
-    return 1;
-  }
-  const agent = readStatus(remoteRoot);
-  const observed = agent.state === 'no-owner' || (agent.drains ?? []).some((d) => d.owner === BOSUN_OWNER && d.id === request.id);
-  if (!observed) return NOT_YET;
+const bosunMarker = (stateDir) => readDrainMarkers(stateDir).find((m) => m.owner === BOSUN_OWNER);
+const isRequested = (marker, request) => marker?.drainId === request.id && marker.mode === request.mode;
+const observedBy = (agent, marker) => agent.state === 'no-owner' || (agent.drains ?? []).some((d) => d.owner === BOSUN_OWNER && d.id === marker.drainId && d.applied === marker.applied);
+
+/** The verdict for the marker as first read; `drainStatus` re-reads the marker before it lets a 0 stand. */
+async function observedVerdict({ request, remoteRoot, config, readStatus, remoteWork }, marker) {
+  if (!observedBy(readStatus(remoteRoot), marker)) return NOT_YET;
   if (request.mode === 'interrupt') return 0;
   return recordsAllDone(remoteRoot) && !await remoteWork(remoteRoot, config) ? 0 : NOT_YET;
+}
+
+/** Exit 0 once this application of this drain is in force for its mode, 75 until then, 1 if the marker is not this drain's. */
+async function drainStatus(context) {
+  const { request, config, err } = context;
+  const notInForce = () => {
+    err.write(`lane drain-hook: no bosun drain ${request.id} (${request.mode}) is in force\n`);
+    return 1;
+  };
+  const marker = bosunMarker(config.stateDir);
+  if (!isRequested(marker, request)) return notInForce();
+  const verdict = await observedVerdict(context, marker);
+  if (verdict !== 0) return verdict;
+  const after = bosunMarker(config.stateDir);
+  if (!isRequested(after, request)) return notInForce();
+  return after.applied === marker.applied ? 0 : NOT_YET;
 }
 
 /**
@@ -75,7 +95,7 @@ export async function drainHookCommand(args, { remoteRoot, env = process.env, co
     }
     const request = drainRequest(env);
     if (verbs[0] === '--apply') {
-      await writeRemoteDrain(config.stateDir, request.reason, { owner: BOSUN_OWNER, expiresAt: request.expiresAt, drainId: request.id, mode: request.mode });
+      await writeRemoteDrain(config.stateDir, request.reason, { owner: BOSUN_OWNER, expiresAt: request.expiresAt, drainId: request.id, mode: request.mode, applied: randomUUID() });
       return { exitCode: 0 };
     }
     return { exitCode: await drainStatus({ request, remoteRoot, config, readStatus, remoteWork, err }) };

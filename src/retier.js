@@ -60,6 +60,31 @@ export function remoteOwnerOf(id, remoteRoot = defaultRemoteRoot()) {
 /** Most submitter ticket dirs one status call will read; a runner's remote root is pruned long before this. */
 const MAX_OWNER_SCAN = 5000;
 
+/** `remoteOwnerMap` for a reader that must not take a failed read for "no owner": it throws on an unreadable tickets dir or `remote-id`, and on a dir past the scan cap. */
+export function remoteOwnerMapStrict(remoteRoot = defaultRemoteRoot()) {
+  const ticketsDir = path.join(remoteRoot, 'tickets');
+  const owners = new Map();
+  let names;
+  try {
+    names = fs.readdirSync(ticketsDir);
+  } catch (err) {
+    if (err.code === 'ENOENT') return owners;
+    throw err;
+  }
+  if (names.length > MAX_OWNER_SCAN) throw new Error(`${ticketsDir} holds more than ${MAX_OWNER_SCAN} tickets`);
+  for (const name of names) {
+    let id;
+    try {
+      id = fs.readFileSync(path.join(ticketsDir, name, 'remote-id'), 'utf8').trim();
+    } catch (err) {
+      if (err.code === 'ENOENT') continue;
+      throw err;
+    }
+    if (id && !owners.has(id)) owners.set(id, name);
+  }
+  return owners;
+}
+
 /** broker ticket id -> submitter ticket id, from one scan of `<remote root>/tickets/*\/remote-id`. An unreadable dir is skipped, never thrown. */
 export function remoteOwnerMap(remoteRoot = defaultRemoteRoot()) {
   const ticketsDir = path.join(remoteRoot, 'tickets');

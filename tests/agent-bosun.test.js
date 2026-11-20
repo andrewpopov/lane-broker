@@ -2,9 +2,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
-import pg from 'pg';
 import { makeTmpDir } from './helpers/tmp.js';
-import { SLEEP, happens, recordingFetch, scenarioSuite, sleep } from './agent-run-harness.js';
+import { SLEEP, gatedQuery, happens, recordingFetch, scenarioSuite, sleep } from './agent-run-harness.js';
 import { METRICS_FILE } from '../src/agent/metrics.js';
 import { paths, readJsonSafe } from '../src/state.js';
 import { readAgentStatus } from '../src/agent/store.js';
@@ -32,28 +31,7 @@ const scopeOptions = (calls, probe, extra = {}) => ({
 });
 const stubProbe = (scope) => async () => scope;
 
-/** `ld_finish` queries held at a gate until `release()`, or failed when their connection is ended (as pg does to an in-flight query). */
-function gatedFinish() {
-  const gate = { sent: false };
-  const open = new Promise((resolve) => { gate.release = resolve; });
-  gate.connect = async (config) => {
-    const client = new pg.Client(config);
-    client.on('error', () => {});
-    await client.connect();
-    const query = client.query.bind(client);
-    const end = client.end.bind(client);
-    let ended;
-    const closed = new Promise((_, reject) => { ended = reject; });
-    closed.catch(() => {});
-    client.query = async (...args) => {
-      if (String(args[0]).includes('ld_finish')) { gate.sent = true; await Promise.race([open, closed]); }
-      return query(...args);
-    };
-    client.end = () => { ended(new Error('Connection terminated')); return end(); };
-    return client;
-  };
-  return gate;
-}
+const gatedFinish = () => gatedQuery('ld_finish');
 
 const scenarios = {
   'a passing scope probe starts remote-exec as systemd-run --scope with a lane-exec unit and no quota, and the record keeps the supervisor pid': async (w, rw, load) => {

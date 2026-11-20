@@ -632,6 +632,7 @@ function loadDrainFile(file, owner) {
     owner, reason: sanitizeDrainReason(m.reason) || DEFAULT_DRAIN_REASON, since: m.since, unreadable: false,
     ...(m.expiresAt === undefined ? {} : { expiresAt: m.expiresAt }),
     ...(typeof m.drainId === 'string' ? { drainId: m.drainId } : {}),
+    ...(typeof m.applied === 'string' ? { applied: m.applied } : {}),
     ...(DRAIN_MODES.includes(m.mode) ? { mode: m.mode } : {}),
   };
   // BRAIN-350: a shutdown drain ends with the boot it was written in (the host is about to go down, so it comes back taking work).
@@ -682,7 +683,7 @@ export function pruneExpiredDrains(root, now = Date.now()) {
   }
 }
 
-export async function writeRemoteDrain(root, reason, { shutdown = false, timeoutMs, owner = HUMAN_DRAIN_OWNER, expiresAt, drainId, mode } = {}) {
+export async function writeRemoteDrain(root, reason, { shutdown = false, timeoutMs, owner = HUMAN_DRAIN_OWNER, expiresAt, drainId, mode, applied } = {}) {
   return withLock(root, () => {
     pruneExpiredDrains(root);
     const file = drainFileOf(root, owner);
@@ -695,12 +696,13 @@ export async function writeRemoteDrain(root, reason, { shutdown = false, timeout
       ...(owner === HUMAN_DRAIN_OWNER ? {} : { owner }),
       ...(expiresAt === undefined ? {} : { expiresAt }),
       ...(drainId === undefined ? {} : { drainId }),
+      ...(applied === undefined ? {} : { applied }),
       ...(mode === undefined ? {} : { mode }),
       ...(shutdown ? { shutdown: true, bootId: bootId(), ...(kernelBootId() ? { kernelBootId: kernelBootId() } : {}) } : {}),
     };
     fs.mkdirSync(path.dirname(file), { recursive: true });
     atomicWriteJson(file, marker, { fsync: true });
-    return { owner, reason: marker.reason, since: marker.since, unreadable: false, ...(expiresAt === undefined ? {} : { expiresAt }), ...(drainId === undefined ? {} : { drainId }), ...(mode === undefined ? {} : { mode }), ...(shutdown ? { shutdown: true } : {}) };
+    return { owner, reason: marker.reason, since: marker.since, unreadable: false, ...(expiresAt === undefined ? {} : { expiresAt }), ...(drainId === undefined ? {} : { drainId }), ...(applied === undefined ? {} : { applied }), ...(mode === undefined ? {} : { mode }), ...(shutdown ? { shutdown: true } : {}) };
   }, { timeoutMs });
 }
 

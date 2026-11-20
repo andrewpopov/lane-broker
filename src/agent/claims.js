@@ -18,8 +18,8 @@ export const MAX_FREE_MEM = Number.MAX_SAFE_INTEGER;
 
 export const drainOwners = (stateDir = stateHome()) => [...readDrainMarkers(stateDir).map((m) => m.owner), ...(drainBlocksIntake(readDrainMarker(stateDir)) ? ['migration'] : [])];
 
-/** What a tick publishes so a drain's owner can see its marker took hold: each unexpired marker's owner and, when it carries one, its drain id. */
-export const drainsOf = (stateDir = stateHome()) => readDrainMarkers(stateDir).map(({ owner, drainId }) => ({ owner, ...(drainId === undefined ? {} : { id: drainId }) }));
+/** What a tick publishes so a drain's owner can see its marker took hold: each unexpired marker's owner and, when it carries them, its drain id and the application nonce, so an acknowledgement names one application of the drain. */
+export const drainsOf = (stateDir = stateHome()) => readDrainMarkers(stateDir).map(({ owner, drainId, applied }) => ({ owner, ...(drainId === undefined ? {} : { id: drainId }), ...(applied === undefined ? {} : { applied }) }));
 
 export const isDraining = (stateDir = stateHome()) => drainOwners(stateDir).length > 0;
 
