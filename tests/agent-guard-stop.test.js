@@ -106,6 +106,22 @@ const GUARDS = {
     }
   },
 
+  'a group that empties while its ownership is being checked is settled, not reported unproven': async (load) => {
+    const { killGroupOnly } = await load('cancel.js');
+    // the member is backgrounded by a shell that then exits, so it is reparented to init, which reaps it (our own child would stay a zombie while this thread blocks)
+    const member = spawn('sh', ['-c', `${JSON.stringify(process.execPath)} -e 'setInterval(() => {}, 1000)' >/dev/null 2>&1 &`], { detached: true, stdio: 'ignore' });
+    unrelated.push(member);
+    await new Promise((resolve) => member.on('exit', resolve));
+    for (const deadline = Date.now() + 10_000; !alive(-member.pid) && Date.now() < deadline;) await sleep(20);
+    assert.ok(alive(-member.pid), 'the reparented member is running in the shell\'s group');
+    const owns = () => {
+      process.kill(-member.pid, 'SIGKILL');
+      for (const deadline = Date.now() + 5000; alive(-member.pid) && Date.now() < deadline;) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      return false;
+    };
+    assert.equal(await killGroupOnly(member.pid, Date.now() + 5000, owns), true);
+  },
+
   'an unmarked orphaned leader with no descendants is killed and proven through its recorded identity': async (load) => {
     const { readProcessTable } = await load('descendants.js');
     const leader = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore', env: { PATH: process.env.PATH } });
@@ -121,13 +137,15 @@ const GUARDS = {
 };
 
 const CANARIES = [
-  ['a group that gains a stranger after the original member leaves is not SIGKILLed: ownership is re-verified before every signal', "    if (!owns()) return false;\n", ''],
+  ['a group that empties while its ownership is being checked is settled, not reported unproven', 'if (!owns()) return !isGroupAlive(pgid);', 'if (!owns()) return false;'],
+  ['a group that gains a stranger after the original member leaves is not SIGKILLed: ownership is re-verified before every signal', 'if (!owns()) return !isGroupAlive(pgid);', ''],
   ['an unmarked orphaned leader with no descendants is killed and proven through its recorded identity', [['(row.marked || recorded.has(row.pid) || isLeader(row))', '(row.marked || recorded.has(row.pid))'], ['  if (leaderStillOurs(lease)) return true;\n', '']]],
   ['a supervisor whose start time is unknown is never signalled and the stop is unproven', 'if (!isVerifiedProcess(pid, start)) return false;', ''],
-  ['a process group that no live lease member proves is ours is not signalled, and the stop is unproven', [['groupLive && groupHasLeaseMember(lease)', 'groupLive'], ['    if (!owns()) return false;\n', '']]],
+  ['a process group that no live lease member proves is ours is not signalled, and the stop is unproven', [['groupLive && groupHasLeaseMember(lease)', 'groupLive'], ['if (!owns()) return !isGroupAlive(pgid);', '']]],
   ['a lease that cannot be read is not proof: the read error surfaces and nothing is killed', 'if (err.code === \'ENOENT\') return null;\n    throw err;', 'return null;'],
 ];
 const FILE_OF = {
+  'a group that empties while its ownership is being checked is settled, not reported unproven': 'cancel.js',
   'a process group that no live lease member proves is ours is not signalled, and the stop is unproven': 'cancel.js',
   'a group that gains a stranger after the original member leaves is not SIGKILLed: ownership is re-verified before every signal': 'cancel.js',
   'an unmarked orphaned leader with no descendants is killed and proven through its recorded identity': 'descendants.js',
