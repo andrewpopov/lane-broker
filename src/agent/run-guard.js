@@ -34,7 +34,7 @@ export class WorkloadTree {
     if (this.#tracker === null) this.#tracker = DescendantTracker.fromSnapshot(lease.childPgid, lease.descendants, { leaseId });
     else this.#tracker.adopt(lease.descendants);
     const rows = this.#tracker.scan(hostTable.map((row) => ({ ...row, marked: row.markedLeases?.includes(leaseId) ?? false })));
-    return [this.#tracker.rootPid, ...this.#tracker.live(rows)];
+    return [...new Set([this.#tracker.rootPid, ...this.#tracker.live(rows)])];
   }
 }
 

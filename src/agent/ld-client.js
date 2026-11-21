@@ -131,10 +131,8 @@ export class LdClient {
   }
 
   #run(name, args, { persist, live } = {}) {
-    let sent = false;
     return this.#submit(() => {
-      if (!sent && live && !live()) return NOT_LIVE;
-      sent = true;
+      if (live && !live()) return NOT_LIVE; // asked again on every retry: a call that stopped being wanted is dropped, never retried to an answer
       return this.#sql(name, args);
     }, persist);
   }

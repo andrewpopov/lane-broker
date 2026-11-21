@@ -253,6 +253,11 @@ export class DescendantTracker {
       .map(([pid]) => pid);
   }
 
+  /** The command leader's own identity (pid and start token), once a scan has seen it; kept out of `recorded`, which holds only members below it. */
+  leader() {
+    return this.rootPid != null && this.rootToken !== null ? { pid: this.rootPid, token: this.rootToken } : null;
+  }
+
   /** Take over the identities another tracker (the supervisor's, via the lease) recorded since; a reused pid still fails its token check in `live`. */
   adopt(snapshot) {
     for (const { pid, token } of snapshot ?? []) if (!this.protectedPids.has(pid)) this.recorded.set(pid, token);
@@ -328,7 +333,9 @@ export function groupHasLeaseMember(lease, tracker = trackerForLease(lease)) {
   const rows = tracker.readRows();
   if (rows === null) return false;
   const recorded = new Set(tracker.live(rows));
-  return rows.some((row) => row.pgid === lease.childPgid && (row.marked || recorded.has(row.pid)));
+  const leader = lease.leader;
+  const isLeader = (row) => leader != null && row.pid === leader.pid && row.token === leader.token;
+  return rows.some((row) => row.pgid === lease.childPgid && (row.marked || recorded.has(row.pid) || isLeader(row)));
 }
 
 /** Does a lease whose supervisor is gone still have live recorded/marked members? Fails closed: unreadable = yes. */

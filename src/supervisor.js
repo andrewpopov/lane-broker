@@ -2549,6 +2549,7 @@ async function main() {
           }),
           ...(cgroupPeak === null ? {} : { observedCgroupMemoryPeakBytes: Math.max(lease.observedCgroupMemoryPeakBytes ?? 0, cgroupPeak) }),
           descendants: descendants.snapshot(),
+          leader: descendants.leader(),
           noProgressSinceMs: Math.round(idleMs),
           ...(watchdog.lastOutputAt === null ? {} : { lastOutputAt: watchdog.lastOutputAt }),
         });

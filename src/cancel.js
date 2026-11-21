@@ -30,7 +30,7 @@ async function killGroupDirectly(lease, root, exec, deadline) {
   const reaping = trackerForLease(lease).reap({ graceMs, killWaitMs: Math.max(0, killWaitMs) });
   let groupGone = true;
   try {
-    if (groupLive) groupGone = groupIsOurs ? await killGroupOnly(lease.childPgid, deadline) : false;
+    if (groupLive) groupGone = groupIsOurs ? await killGroupOnly(lease.childPgid, deadline, () => groupHasLeaseMember(lease)) : false;
   } finally {
     const result = await reaping;
     writeBrokerLog(root, reapLogLine(lease.id, result));
@@ -44,22 +44,25 @@ async function killGroupDirectly(lease, root, exec, deadline) {
 }
 
 /** Resolves true once the group is gone, false when the optional absolute `deadline` passes with it still alive. */
-async function killGroupOnly(pgid, deadline = Infinity) {
-  try {
-    process.kill(-pgid, 'SIGTERM');
-  } catch {
+async function killGroupOnly(pgid, deadline = Infinity, owns = () => true) {
+  // ownership is re-verified immediately before every signal: a group that outlives its proof (its pgid reused meanwhile) is left alone and unproven
+  const signal = (name) => {
+    if (!isGroupAlive(pgid)) return true;
+    if (!owns()) return false;
+    try {
+      process.kill(-pgid, name);
+    } catch {
+      // gone
+    }
     return true;
-  }
+  };
+  if (!signal('SIGTERM')) return false;
   const graceEnd = Math.min(Date.now() + cancelGraceMs(), deadline);
   while (Date.now() < graceEnd && isGroupAlive(pgid)) {
     await sleep(100);
   }
   if (isGroupAlive(pgid)) {
-    try {
-      process.kill(-pgid, 'SIGKILL');
-    } catch {
-      // gone
-    }
+    if (!signal('SIGKILL')) return false;
     while (isGroupAlive(pgid)) {
       if (Date.now() >= deadline) return false;
       await sleep(50);

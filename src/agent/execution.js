@@ -199,7 +199,7 @@ export class ExecutionDriver {
     context.beatNow = false;
     context.lastBeatAt = this.now();
     return this.ld.heartbeat(record.id, record.epoch, record.token, {
-      live: () => BEATING.has(this.table.get(execId)?.subphase),
+      live: () => BEATING.has(this.table.get(execId)?.subphase) && !this.table.get(execId)?.guardStop?.unproven && !context.escalating,
       persist: (answer) => this.#applyBeat(execId, context, answer),
     });
   }
