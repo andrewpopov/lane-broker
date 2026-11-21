@@ -7,6 +7,7 @@ import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun } from './helpers
 import { makeTmpDir } from './helpers/tmp.js';
 import { stopCpuScope, stopLeaseCpuScope, spawnInCpuScope, cpuScopeUnit, resolveCpuLimit } from '../src/cpu-limit.js';
 import { cancelCommand } from '../src/cancel.js';
+import { leaderIdentityOf } from '../src/descendants.js';
 import { readLease, writeLease, reapIfStale, leaseFile } from '../src/lease.js';
 import { paths, bootId } from '../src/state.js';
 
@@ -174,7 +175,7 @@ test('CPU_SCOPE_EMPTY_BEFORE_RELEASE: cancel leaves the scope with no process, a
   });
   assert.ok(reported.cgroup.endsWith(`/${unit}`), `the holder ran in ${reported.cgroup}, not in scope ${unit}`);
   assert.ok(procAlive(reported.grandchild), 'the detached grandchild is running before the cancel');
-  orphanedLease(state, { id: leaseId, childPgid: child.pid, cpuScopeUnit: unit, resultPath: path.join(state, 'result.json') });
+  orphanedLease(state, { id: leaseId, childPgid: child.pid, leader: leaderIdentityOf(child.pid), cpuScopeUnit: unit, resultPath: path.join(state, 'result.json') });
 
   const res = await withState(state, () => cancelCommand(leaseId));
   assert.equal(res.exitCode, 0);
