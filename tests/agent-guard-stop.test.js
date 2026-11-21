@@ -89,12 +89,14 @@ const GUARDS = {
     process.env.LANE_BROKER_TEST_CANCEL_GRACE_MS = '300';
     const leaseId = '5d8c54f7-3540-4c44-9fcf-cbee1c6c5cde';
     const stranger = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)";
-    const member = `process.on('SIGTERM', () => { const env = { ...process.env }; delete env.LANE_BROKER_LEASE; require('child_process').spawn(process.execPath, ['-e', ${JSON.stringify(stranger)}], { stdio: 'ignore', env }).unref(); process.exit(0); }); setInterval(() => {}, 1000)`;
+    const ready = path.join(makeTmpDir('guard-ready-'), 'ready');
+    const member = `process.on('SIGTERM', () => { const env = { ...process.env }; delete env.LANE_BROKER_LEASE; require('child_process').spawn(process.execPath, ['-e', ${JSON.stringify(stranger)}], { stdio: 'ignore', env }).unref(); process.exit(0); }); require('fs').writeFileSync(${JSON.stringify(ready)}, 'x'); setInterval(() => {}, 1000)`;
     const leader = spawn(process.execPath, ['-e', member], { detached: true, stdio: 'ignore', env: { ...process.env, LANE_BROKER_LEASE: leaseId } });
     leader.unref();
     unrelated.push(leader);
     try {
-      await sleep(500);
+      for (const deadline = Date.now() + 30_000; !fs.existsSync(ready) && Date.now() < deadline;) await sleep(20);
+      assert.ok(fs.existsSync(ready), 'the member installed its SIGTERM handler');
       const w = world({ supervisorPid: 2 ** 22 - 9, supervisorStart: 'Mon Jan  1 00:00:00 1990', childPgid: leader.pid });
       assert.equal(await stopWith(load, w).catch(() => false), false);
       await sleep(300);
@@ -109,7 +111,7 @@ const GUARDS = {
     const leader = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore', env: { PATH: process.env.PATH } });
     leader.unref();
     unrelated.push(leader);
-    await sleep(500);
+    for (const deadline = Date.now() + 30_000; !readProcessTable().some((row) => row.pid === leader.pid) && Date.now() < deadline;) await sleep(50);
     const token = readProcessTable().find((row) => row.pid === leader.pid)?.token;
     assert.ok(token, 'the leader is in the process table');
     const w = world({ supervisorPid: 2 ** 22 - 9, supervisorStart: 'Mon Jan  1 00:00:00 1990', childPgid: leader.pid, leader: { pid: leader.pid, token } });
@@ -120,7 +122,7 @@ const GUARDS = {
 
 const CANARIES = [
   ['a group that gains a stranger after the original member leaves is not SIGKILLed: ownership is re-verified before every signal', "    if (!owns()) return false;\n", ''],
-  ['an unmarked orphaned leader with no descendants is killed and proven through its recorded identity', '(row.marked || recorded.has(row.pid) || isLeader(row))', '(row.marked || recorded.has(row.pid))'],
+  ['an unmarked orphaned leader with no descendants is killed and proven through its recorded identity', [['(row.marked || recorded.has(row.pid) || isLeader(row))', '(row.marked || recorded.has(row.pid))'], ['  if (leaderStillOurs(lease)) return true;\n', '']]],
   ['a supervisor whose start time is unknown is never signalled and the stop is unproven', 'if (!isVerifiedProcess(pid, start)) return false;', ''],
   ['a process group that no live lease member proves is ours is not signalled, and the stop is unproven', [['groupLive && groupHasLeaseMember(lease)', 'groupLive'], ['    if (!owns()) return false;\n', '']]],
   ['a lease that cannot be read is not proof: the read error surfaces and nothing is killed', 'if (err.code === \'ENOENT\') return null;\n    throw err;', 'return null;'],

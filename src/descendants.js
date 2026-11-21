@@ -325,18 +325,32 @@ export function trackerForLease(lease, options = {}) {
   return DescendantTracker.fromSnapshot(null, lease.descendants, { leaseId: lease.id, ...options });
 }
 
-/** One process's identity as the tracker records it (pid plus start token, the same token format), or null when it cannot be read. A cheap single-pid read, for the moment of spawn. */
-export function leaderIdentityOf(pid) {
+/** One process's row (pid, pgid, token in the tracker's format) by a cheap single-pid read, or null when it cannot be read: no whole-host table, so it stays fast on a loaded machine. */
+function readSingleRow(pid) {
   try {
     const row = process.platform === 'linux'
       ? readProcRow(String(pid), undefined, 0, fs, procUnits())
       : parsePsTable(execFileSync('ps', ['-ww', '-p', String(pid), '-o', 'pid=,ppid=,pgid=,pcpu=,rss=,lstart=,command='], {
-        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000, env: { ...process.env, TZ: 'UTC0', LC_ALL: 'C', LC_TIME: 'C' },
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, env: { ...process.env, TZ: 'UTC0', LC_ALL: 'C', LC_TIME: 'C' },
       }))[0];
-    return row && !row.unknown && row.token ? { pid, token: row.token } : null;
+    return row && !row.unknown && row.token ? row : null;
   } catch {
     return null;
   }
+}
+
+/** The identity `lease.leader` records for a freshly spawned command leader: pid plus start token, or null when it could not be read. */
+export function leaderIdentityOf(pid) {
+  const row = readSingleRow(pid);
+  return row ? { pid, token: row.token } : null;
+}
+
+/** Is the lease's recorded leader still alive, with the same start token, in the lease's own group? Positive evidence from one cheap read, no process table. */
+function leaderStillOurs(lease) {
+  const { leader } = lease;
+  if (leader == null) return false;
+  const row = readSingleRow(leader.pid);
+  return row !== null && row.token === leader.token && row.pgid === lease.childPgid;
 }
 
 /**
@@ -344,6 +358,7 @@ export function leaderIdentityOf(pid) {
  * proves it: a bare pgid may have been reused by an unrelated group, which must never be signalled. Unreadable table = no.
  */
 export function groupHasLeaseMember(lease, tracker = trackerForLease(lease)) {
+  if (leaderStillOurs(lease)) return true;
   const rows = tracker.readRows();
   if (rows === null) return false;
   const recorded = new Set(tracker.live(rows));

@@ -3042,7 +3042,7 @@ stop proof without positive evidence; unknown means unproven.**
   proves the group is still this lease's: one carrying the lease marker, a recorded descendant identity, or the lease's `leader`
   identity (the command leader's pid and start token, which the supervisor writes into the lease; it counts as positive evidence only
   while a live row matches both and sits in the lease's group). Ownership is re-verified immediately before every group signal, SIGTERM
-  and the post-grace SIGKILL alike, so a group whose pgid was reused meanwhile is never signalled. This applies to every orphaned
+  and the post-grace SIGKILL alike, so a group whose pgid was reused meanwhile is never signalled. The `leader` identity is checked first by one cheap single-pid read (same pid, same start token, same group), so ownership does not depend on a whole-host process-table read that can time out on a loaded machine; only without it does the check fall back to the table (marker or recorded identity). This applies to every orphaned
   `lane cancel`, not only the agent's. A live group nobody can vouch for is left alone and counts as unproven. On macOS the environment
   of SIP-protected binaries (e.g. `/bin/sleep`) is hidden, so such a member is vouched for only by a recorded identity, in particular
   the lease's `leader` when it has no descendants. The supervisor writes `leader` in the very same lease write that first names the command's group

@@ -26,7 +26,7 @@ const POST_START = ['SPAWNING', 'RUNNING', 'SETTLING'];
 
 export const DEFAULT_TIMING = {
   tickMs: 1000, heartbeatMs: 15_000, killRetryMs: 5000, killGiveUpMs: 24 * 3_600_000, errorRetryMs: 15_000,
-  uploadRetryMs: 10 * 60_000, guardMs: 15_000, guardEscalateMs: 60_000, guardStopMs: 30_000, blobLeaseRenewMs: 5 * 60_000, backoff: { minMs: 250, maxMs: 15_000 },
+  uploadRetryMs: 10 * 60_000, guardMs: 15_000, guardEscalateMs: 60_000, guardStopMs: 30_000, guardStopSlackMs: 5000, blobLeaseRenewMs: 5 * 60_000, backoff: { minMs: 250, maxMs: 15_000 },
 };
 
 class FetchBudgetError extends Error {}
@@ -463,7 +463,7 @@ export class ExecutionDriver {
   async #forceStop(record) {
     const { execId } = record;
     let timer;
-    const bound = new Promise((resolve) => { timer = setTimeout(() => resolve(false), this.timing.guardStopMs + 5000); timer.unref(); });
+    const bound = new Promise((resolve) => { timer = setTimeout(() => resolve(false), this.timing.guardStopMs + this.timing.guardStopSlackMs); timer.unref(); });
     const proven = await Promise.race([this.forceStop({ remoteRoot: this.remoteRoot, record, deadline: Date.now() + this.timing.guardStopMs }), bound])
       .catch((err) => { this.log(`${execId}: forced stop: ${err.message}`); return false; });
     clearTimeout(timer);
