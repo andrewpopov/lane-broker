@@ -2506,6 +2506,9 @@ async function main() {
   // BRAIN-419: processes that left the leader's group (setsid/setpgid) are invisible to killGroup, so track the tree.
   const descendants = new DescendantTracker(child.pid, { leaseId: ticket.id });
   descendants.scan();
+  // the leader's identity goes into the lease at once, not at the first telemetry sample, so a supervisor that dies in between still leaves an orphan the takeover can prove it owns
+  const spawnedLease = readLease(root, ticket.id);
+  if (spawnedLease) writeLease(root, { ...spawnedLease, descendants: descendants.snapshot(), leader: descendants.leader() });
   async function killTree(reason) {
     descendants.scan(); // the leader may still be alive: catches anything spawned since the last heartbeat
     const [, result] = await Promise.all([killGroup(child.pid), descendants.reap({ graceMs: cancelGraceMs() })]);
