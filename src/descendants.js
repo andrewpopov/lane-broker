@@ -90,6 +90,7 @@ export function envSuffix(command, withEnv) {
  */
 export function parsePsTable(text, leaseId, envText = '') {
   const envOf = parseCommandMap(envText);
+  const ids = Array.isArray(leaseId) ? leaseId : null;
   const rows = [];
   for (const line of String(text ?? '').split('\n')) {
     const m = PS_LINE.exec(line);
@@ -98,6 +99,8 @@ export function parsePsTable(text, leaseId, envText = '') {
     const command = m[7].trim();
     const withEnv = envOf.get(pid);
     const env = envSuffix(command, withEnv);
+    const envWords = env.split(/\s+/);
+    const markedLeases = ids?.filter((id) => envWords.includes(leaseMarker(id)));
     rows.push({
       pid,
       ppid: Number(m[2]),
@@ -105,7 +108,8 @@ export function parsePsTable(text, leaseId, envText = '') {
       pcpu: Number(m[4]),
       rss: Number(m[5]),
       token: m[6].replace(/\s+/g, ' '),
-      marked: leaseId !== undefined && env.split(/\s+/).includes(leaseMarker(leaseId)),
+      marked: ids ? markedLeases.length > 0 : leaseId !== undefined && envWords.includes(leaseMarker(leaseId)),
+      ...(ids ? { markedLeases } : {}),
     });
   }
   return rows;
@@ -129,8 +133,15 @@ export function readProcRow(name, leaseId, uptimeSec, fsApi = fs, units) {
   if (!row) return unknownRow(pid);
   if (leaseId !== undefined) {
     try {
-      row.marked = fsApi.readFileSync(`/proc/${name}/environ`, 'utf8').split('\0').includes(leaseMarker(leaseId));
+      const env = fsApi.readFileSync(`/proc/${name}/environ`, 'utf8').split('\0');
+      if (Array.isArray(leaseId)) {
+        row.markedLeases = leaseId.filter((id) => env.includes(leaseMarker(id)));
+        row.marked = row.markedLeases.length > 0;
+      } else {
+        row.marked = env.includes(leaseMarker(leaseId));
+      }
     } catch {
+      if (Array.isArray(leaseId)) row.markedLeases = [];
       // another uid's environ is unreadable by design; such a process is found by the ppid walk, not the marker
     }
   }
@@ -162,7 +173,7 @@ export function readProcessTable(leaseId) {
       env: { ...process.env, TZ: 'UTC0', LC_ALL: 'C', LC_TIME: 'C' },
     });
   const out = ps(['-A', '-ww', '-o', 'pid=,ppid=,pgid=,pcpu=,rss=,lstart=,command=']);
-  const envOut = leaseId === undefined ? '' : ps(['-A', '-E', '-ww', '-o', 'pid=,command=']);
+  const envOut = leaseId === undefined || (Array.isArray(leaseId) && leaseId.length === 0) ? '' : ps(['-A', '-E', '-ww', '-o', 'pid=,command=']);
   return parsePsTable(out, leaseId, envOut);
 }
 
@@ -242,6 +253,16 @@ export class DescendantTracker {
       .map(([pid]) => pid);
   }
 
+  /** The command leader's own identity (pid and start token), once a scan has seen it; kept out of `recorded`, which holds only members below it. */
+  leader() {
+    return this.rootPid != null && this.rootToken !== null ? { pid: this.rootPid, token: this.rootToken } : null;
+  }
+
+  /** Take over the identities another tracker (the supervisor's, via the lease) recorded since; a reused pid still fails its token check in `live`. */
+  adopt(snapshot) {
+    for (const { pid, token } of snapshot ?? []) if (!this.protectedPids.has(pid)) this.recorded.set(pid, token);
+  }
+
   /** Serializable form for the lease, so a canceller without this supervisor can still reap them. */
   snapshot() {
     return [...this.recorded].map(([pid, token]) => ({ pid, token }));
@@ -302,6 +323,48 @@ export class DescendantTracker {
  *  `lane cancel` (to reap) and the stale-lease check (to see that evidence is still alive). */
 export function trackerForLease(lease, options = {}) {
   return DescendantTracker.fromSnapshot(null, lease.descendants, { leaseId: lease.id, ...options });
+}
+
+/** One process's row (pid, pgid, token in the tracker's format) by a cheap single-pid read, or null when it cannot be read: no whole-host table, so it stays fast on a loaded machine. */
+function readSingleRow(pid) {
+  try {
+    const row = process.platform === 'linux'
+      ? readProcRow(String(pid), undefined, 0, fs, procUnits())
+      : parsePsTable(execFileSync('ps', ['-ww', '-p', String(pid), '-o', 'pid=,ppid=,pgid=,pcpu=,rss=,lstart=,command='], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 5000, env: { ...process.env, TZ: 'UTC0', LC_ALL: 'C', LC_TIME: 'C' },
+      }))[0];
+    return row && !row.unknown && row.token ? row : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The identity `lease.leader` records for a freshly spawned command leader: pid plus start token, or null when it could not be read. */
+export function leaderIdentityOf(pid) {
+  const row = readSingleRow(pid);
+  return row ? { pid, token: row.token } : null;
+}
+
+/** Is the lease's recorded leader still alive, with the same start token, in the lease's own group? Positive evidence from one cheap read, no process table. */
+function leaderStillOurs(lease) {
+  const { leader } = lease;
+  if (leader == null) return false;
+  const row = readSingleRow(leader.pid);
+  return row !== null && row.token === leader.token && row.pgid === lease.childPgid;
+}
+
+/**
+ * Does the process group `lease.childPgid` still belong to this lease? Only a live member carrying the lease marker or a recorded identity
+ * proves it: a bare pgid may have been reused by an unrelated group, which must never be signalled. Unreadable table = no.
+ */
+export function groupHasLeaseMember(lease, tracker = trackerForLease(lease)) {
+  if (leaderStillOurs(lease)) return true;
+  const rows = tracker.readRows();
+  if (rows === null) return false;
+  const recorded = new Set(tracker.live(rows));
+  const leader = lease.leader;
+  const isLeader = (row) => leader != null && row.pid === leader.pid && row.token === leader.token;
+  return rows.some((row) => row.pgid === lease.childPgid && (row.marked || recorded.has(row.pid) || isLeader(row)));
 }
 
 /** Does a lease whose supervisor is gone still have live recorded/marked members? Fails closed: unreadable = yes. */

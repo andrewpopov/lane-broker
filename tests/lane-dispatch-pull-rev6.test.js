@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { pgSkipOption } from './lane-db-harness.js';
 import {
-  startDispatchCluster, World, logins, call, enqueue, claim, start, release, liftBackoff, setNow, tid,
+  startDispatchCluster, World, logins, call, enqueue, claim, start, release, liftBackoff, setNow, tid, finish,
 } from './lane-dispatch-fixture.js';
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -35,6 +35,22 @@ const GUARDS = {
     assert.equal((await w.ticket(tid(2))).state, 'running');
     assert.deepEqual(await release(a1, cancelling, 'cancel-confirmed'), { fenced: false, state: 'cancelled' });
     assert.notEqual((await w.ticket(tid(2))).finished_at, null);
+  },
+
+  'an agent guard kill finished after the queue recorded a cancel is cancelled, while the same finish with no cancel stays finished': async (w) => {
+    const [s1, a1] = [await w.as(logins.s1), await w.as(logins.a1)];
+    const guardResult = { kind: 'completed', exit: 124, reason: 'run-limit', runLimitMs: 1000, guard: 'run-limit' };
+    await enqueue(s1, tid(1));
+    await enqueue(s1, tid(2));
+    const [plain, cancelled] = [await claim(a1), await claim(a1)];
+    await start(a1, plain);
+    await start(a1, cancelled);
+    await call(s1, 'ld_cancel', tid(2));
+    assert.deepEqual(await finish(a1, cancelled, { ...guardResult, stopProven: true }), { fenced: false, state: 'cancelled' });
+    const row = await w.ticket(tid(2));
+    assert.deepEqual([row.result.kind, row.result.cancelConfirmed, row.result.guard, row.result.reason], ['cancelled', true, undefined, undefined]);
+    assert.deepEqual(await finish(a1, plain, guardResult), { fenced: false, state: 'finished' });
+    assert.deepEqual([(await w.ticket(tid(1))).result.exit, (await w.ticket(tid(1))).result.reason], [124, 'run-limit']);
   },
 
   'the sixth requeue settles lost with release-cap, and each requeue backs off 5, 10, 20, 40 and 60 s': async (w) => {
@@ -341,6 +357,7 @@ const GUARDS = {
 const MIGRATION_NOT_BEFORE = "ADD COLUMN not_before timestamptz NOT NULL DEFAULT '-infinity'";
 const RESTORE_STAMP = "SET state = 'lost', finished_at = lane_dispatch.now(), result = lane_dispatch.lost_result('queue-restored', epoch)";
 const CANARIES = [
+  ['an agent guard kill finished after the queue recorded a cancel is cancelled, while the same finish with no cancel stays finished', 'IF p_result ? \'guard\' AND v_t.cancel_requested THEN', 'IF false THEN'],
   ['a release of a running row is refused and changes nothing, unless a cancel was requested',
     "IF NOT (v_t.cancel_requested AND p_proof = 'cancel-confirmed') THEN RETURN jsonb_build_object('refused', 'started'); END IF;", ''],
   ['a release of a running row is refused and changes nothing, unless a cancel was requested',
