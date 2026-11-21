@@ -3017,20 +3017,28 @@ longest legitimate quiet stretch. A lane may set both.
 #### Pull-lane guard in the agent (PKG-397)
 
 A pull lane runs under a runner-side supervisor whose watchdog uses the submitter's header values, `0` by default, and a hung
-supervisor never runs it. So `lane agent` carries its own guard, `src/agent/run-guard.js`, which reuses `NoProgressWatchdog`
-(log-file growth is the output, the execution's process tree is read with `readProcCpuRows`, `ps` on macOS) and checks every
-15 s while a lane is RUNNING:
+supervisor never runs it. So `lane agent` carries its own guard (`src/agent/run-guard.js`), on a timer of its own (every 15 s,
+`guardMs`) that does not wait on the heartbeat, so a lost queue connection never stops local enforcement. It reuses
+`NoProgressWatchdog`: the output is growth of the lane's log, and the process tree is the one the supervisor's watchdog samples,
+the command leader plus every descendant or `LANE_BROKER_LEASE`-marked process recorded by identity (a worker that daemonised
+and reparented to PID 1 stays in; the supervisor and broker housekeeping are not). CPU comes from one `readProcCpuRows` scan
+per tick (`ps` on macOS) shared by all running lanes, and is not taken at all when no lane has a no-progress window.
 
 | Setting | Where | Default | Meaning |
 |---|---|---|---|
-| `noProgressTimeoutMs`, `silenceTimeoutMs` | the runner's global broker `config.json` | `0` | A floor under the dispatch header's value: the header's value wins when above `0`, otherwise the runner's applies. `0` never kills. |
-| `maxRunMs` | agent `config.json` | `7200000` (2 h) | Wall-clock cap on a run, whatever its CPU and output do. |
+| `noProgressTimeoutMs`, `silenceTimeoutMs` | the runner's global broker `config.json` | `0` | Used only when the dispatch header carries no value. An explicit `0` in the header is the lane's own "off" and is kept. `0` never kills. |
+| `maxRunMs` | agent `config.json` | `7200000` (2 h) | Wall-clock cap on a run, whatever its CPU and output do. Anchored on `runningSince`, which is persisted when the run starts, on spawn recovery, and at the first guard observation of an older record, so an agent restart never resets it. |
 
 A kill appends the usual message to the lane log (`lane run: no progress for ...`, `... no output for ...`, or `lane run: still
-running after 2h — killed (run limit)`), stops the run through the same cancel path as `ld_cancel`, and, once the runner proves
-the stop, finishes the ticket `completed` with `exit: 124` and `reason` `no-progress`, `silence` or `run-limit` (with the
-window), so the merge train sees a red verdict. A user cancel still wins. The queue's own `ld_reap` already settles a ticket
-whose runner stopped heartbeating (120 s lease TTL, lost after 2 h). `run-limit` is not yet relayed into the history row's `reason`.
+running after 2h — killed (run limit)`) and records `guardKill`. The agent then cancels through the same path as `ld_cancel`,
+retrying. If the run is still alive `guardEscalateMs` (60 s) later (a stopped or wedged supervisor, which `lane cancel` will not
+take over), it SIGKILLs the supervisor by identity and lets `lane cancel`'s orphaned-lease takeover reap the command group and its
+recorded descendants. The stop is proven only when the supervisor, the group and every recorded or marked member are gone; an
+unproven stop marks the record and stops heartbeating it, so the queue's lease expiry settles the ticket (`ld_reap`: 120 s lease
+TTL, lost after 2 h). A proven stop finishes the ticket `completed` with `exit: 124`, `stopProven`, `guard: "<reason>"` and
+`reason` `no-progress`, `silence` or `run-limit` (with the window), so the merge train sees a red verdict. `ld_finish` settles the
+race with a user cancel: a guard result finished for a ticket whose `cancel_requested` is set is recorded `cancelled`. `run-limit`
+is not yet relayed into the history row's `reason`.
 
 **Hung and silent runs (BRAIN-532, warning only; nothing is ever cancelled).** The supervisor stamps `lastOutputAt` from the
 bytes the command writes (immune to the log writer's discard mode) and keeps CPU-idle anchors from per-interval cores

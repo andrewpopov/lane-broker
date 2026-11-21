@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { probeLifetimeScope, supervisorLaunch } from '../cpu-limit.js';
-import { kernelBootId, processStartTime, readJsonSafe } from '../state.js';
+import { ensureStateDirs, kernelBootId, processStartTime, readJsonSafe } from '../state.js';
 import { NO_PROGRESS_EXIT } from '../no-progress.js';
 import { readProcCpuRows } from '../preemptible.js';
 import { isProcessAlive } from '../process-liveness.js';
@@ -14,9 +14,10 @@ import { publishBlob } from '../remote-blobs.js';
 import { BlobLease, VerdictError, bindingProblem, downloadVerified, hashFile, prefetchBlobs, readSnapshotHeader } from './fetch.js';
 import { artifactsDirOf, uploadOutputs } from './upload.js';
 import { stopEvidence } from './stop-proof.js';
-import { isDraining, toolsOnPath } from './claims.js';
+import { isDraining, readLaneId, toolsOnPath } from './claims.js';
 import { Waker } from './waker.js';
-import { RunGuard } from './run-guard.js';
+import { RunGuard, WorkloadTree, windowOf } from './run-guard.js';
+import { forceStopRun } from './guard-stop.js';
 
 const PRE_START = new Set(['FETCHING', 'STARTING']);
 const BEATING = new Set(['FETCHING', 'SPAWNING', 'RUNNING', 'SETTLING']);
@@ -24,7 +25,7 @@ const POST_START = ['SPAWNING', 'RUNNING', 'SETTLING'];
 
 export const DEFAULT_TIMING = {
   tickMs: 1000, heartbeatMs: 15_000, killRetryMs: 5000, killGiveUpMs: 24 * 3_600_000, errorRetryMs: 15_000,
-  uploadRetryMs: 10 * 60_000, guardMs: 15_000, blobLeaseRenewMs: 5 * 60_000, backoff: { minMs: 250, maxMs: 15_000 },
+  uploadRetryMs: 10 * 60_000, guardMs: 15_000, guardEscalateMs: 60_000, blobLeaseRenewMs: 5 * 60_000, backoff: { minMs: 250, maxMs: 15_000 },
 };
 
 class FetchBudgetError extends Error {}
@@ -53,6 +54,7 @@ export class ExecutionDriver {
   #scopeKnown = false;
   #scopeProbing = false;
   #scopeProbedAt = -Infinity;
+  #guardTimer = null;
 
   constructor({ core, remoteRoot, config, s3, timing = {}, waker = new Waker(), log = () => {}, spawnEnv = process.env, laneBin = laneBinPath, draining = isDraining,
     cancelExecution = cancelRemoteExecution, readResult = readRemoteResultRecord, now = Date.now, publish = publishBlob, makeLease = (root, hashes) => new BlobLease(root, hashes),
@@ -68,6 +70,7 @@ export class ExecutionDriver {
     const context = { abort: null, beatNow: false, lastBeatAt: this.now(), mayStart: false };
     this.#contexts.set(execId, context);
     context.promise = this.#drive(execId, context).finally(() => this.#contexts.delete(execId));
+    this.#scheduleGuard();
   }
 
   adoptAll() {
@@ -119,6 +122,7 @@ export class ExecutionDriver {
    */
   async close({ settleMs = 0 } = {}) {
     this.#stopping = true;
+    clearTimeout(this.#guardTimer);
     for (const [execId, context] of this.#contexts) {
       const record = this.table.get(execId);
       if (record?.subphase === 'STARTING' && context.startSent !== true) this.#releasing(record);
@@ -352,7 +356,7 @@ export class ExecutionDriver {
     if (!fs.existsSync(dir) && await tombstoneAbsentTicket(this.remoteRoot, execId)) return this.#rejected(record, ['SPAWNING'], 'never-admitted');
     if (this.#resultExists(execId)) return this.#cas(execId, ['SPAWNING'], { subphase: 'SETTLING' });
     const publisher = readJsonSafe(path.join(dir, 'publisher.json'));
-    if (publisher && isProcessAlive(publisher.pid, publisher.start)) return this.#cas(execId, ['SPAWNING'], { subphase: 'RUNNING', pid: publisher.pid, pidStart: publisher.start });
+    if (publisher && isProcessAlive(publisher.pid, publisher.start)) return this.#cas(execId, ['SPAWNING'], { subphase: 'RUNNING', pid: publisher.pid, pidStart: publisher.start, runningSince: this.now() });
     return this.#publisherGone(record);
   }
 
@@ -369,33 +373,88 @@ export class ExecutionDriver {
   async #running(record, context) {
     const { execId } = record;
     await this.#renewBlobLease(record, context);
-    if (context.beatNow || this.now() - context.lastBeatAt >= this.timing.heartbeatMs) await this.#beat(execId, context);
+    if (!this.table.get(execId)?.guardStop?.unproven && (context.beatNow || this.now() - context.lastBeatAt >= this.timing.heartbeatMs)) await this.#beat(execId, context);
     const current = this.table.get(execId);
     if (current?.subphase !== 'RUNNING') return;
-    await this.#guardRun(current, context);
-    if ((current.cancel?.requested || this.table.get(execId)?.guardKill) && this.now() - (context.lastCancelAt ?? 0) >= this.timing.killRetryMs) {
+    if (current.cancel?.requested && this.now() - (context.lastCancelAt ?? 0) >= this.timing.killRetryMs) {
       context.lastCancelAt = this.now();
       await this.cancelExecution(execId, { root: this.remoteRoot });
     }
+    if (context.escalating || (current.guardStop?.unproven && !this.#resultExists(execId))) return this.waker.wait(this.timing.tickMs);
     if (this.#resultExists(execId) || !this.#childAlive(current)) return this.#cas(execId, ['RUNNING'], { subphase: 'SETTLING' });
     await this.waker.wait(this.timing.tickMs);
   }
 
-  /** PKG-397: the agent's own no-progress, silence and wall-clock backstop; a kill is recorded and the existing cancel path stops the run. */
-  async #guardRun(record, context) {
-    if (record.guardKill || this.now() - (context.guardAt ?? -Infinity) < this.timing.guardMs) return;
-    context.guardAt = this.now();
+  // ---- guard (PKG-397): its own timer, so lost queue connectivity never stops local enforcement ----
+
+  #scheduleGuard() {
+    if (this.#guardTimer !== null || this.#stopping || this.#closed) return;
+    this.#guardTimer = setTimeout(async () => {
+      try {
+        await this.#guardTick();
+      } catch (err) {
+        this.log(`guard: ${err.message}`);
+      }
+      this.#guardTimer = null;
+      if (this.#contexts.size > 0) this.#scheduleGuard();
+    }, this.timing.guardMs);
+    this.#guardTimer.unref();
+  }
+
+  async #guardTick() {
+    const running = this.table.all().filter((r) => r.subphase === 'RUNNING' && this.#contexts.has(r.execId));
+    const guards = running.map((record) => [record, this.#guardOf(record, this.#contexts.get(record.execId))]);
+    const cpuRows = guards.some(([record, guard]) => !record.guardKill && guard.needsCpu) ? this.#readRowsOnce() : null;
+    await Promise.all(guards.map(([record, guard]) => this.#guardRecord(record, guard, this.#contexts.get(record.execId), cpuRows)));
+  }
+
+  #readRowsOnce() {
+    try {
+      return this.readRows();
+    } catch {
+      return null;
+    }
+  }
+
+  #guardOf(record, context) {
+    if (context.guard) return context.guard;
     const header = record.claim.header ?? {};
-    const window = (fromHeader, fromConfig) => (fromHeader > 0 ? fromHeader : fromConfig ?? 0);
-    context.guard ??= new RunGuard({
-      pid: record.pid, startedAt: record.runningSince ?? this.now(), now: this.now, logFile: logPath(this.remoteRoot, record.execId), maxRunMs: this.config.maxRunMs,
-      noProgressTimeoutMs: window(header.noProgressTimeoutMs, this.config.noProgressTimeoutMs), silenceTimeoutMs: window(header.silenceTimeoutMs, this.config.silenceTimeoutMs), readRows: this.readRows,
+    const startedAt = record.runningSince ?? this.now();
+    if (record.runningSince === undefined) this.#cas(record.execId, ['RUNNING'], { runningSince: startedAt });
+    context.guard = new RunGuard({
+      startedAt, now: this.now, logFile: logPath(this.remoteRoot, record.execId), maxRunMs: this.config.maxRunMs,
+      noProgressTimeoutMs: windowOf(header.noProgressTimeoutMs, this.config.noProgressTimeoutMs), silenceTimeoutMs: windowOf(header.silenceTimeoutMs, this.config.silenceTimeoutMs),
+      tree: new WorkloadTree({ root: ensureStateDirs().root, readLeaseId: () => readLaneId(this.remoteRoot, record.execId) }),
     });
-    const { message, ...guardKill } = context.guard.check() ?? {};
+    return context.guard;
+  }
+
+  async #guardRecord(record, guard, context, cpuRows) {
+    const { execId } = record;
+    if (record.guardKill) return this.#guardEnforce(record, context);
+    const { message, ...guardKill } = guard.check(cpuRows) ?? {};
     if (message === undefined) return;
-    fs.appendFileSync(logPath(this.remoteRoot, record.execId), message);
-    this.log(`${record.execId}: ${guardKill.reason}: killing the run`);
-    this.#cas(record.execId, ['RUNNING'], { guardKill });
+    fs.appendFileSync(logPath(this.remoteRoot, execId), message);
+    this.log(`${execId}: ${guardKill.reason}: killing the run`);
+    await this.#guardEnforce(this.#cas(execId, ['RUNNING'], { guardKill, guardKillAt: this.now() }) ?? record, context);
+  }
+
+  /** Graceful cancel first, retried; once `guardEscalateMs` has passed without the run stopping, SIGKILL it and verify the stop independently. */
+  async #guardEnforce(record, context) {
+    const { execId } = record;
+    if (this.#resultExists(execId) || !this.#childAlive(record) || context.escalating || record.guardStop?.proven) return;
+    if (this.now() - Math.max(record.guardKillAt, context.escalatedAt ?? -Infinity) >= this.timing.guardEscalateMs) {
+      context.escalatedAt = this.now();
+      context.escalating = forceStopRun({ remoteRoot: this.remoteRoot, record })
+        .then((proven) => { this.#cas(execId, ['RUNNING'], { guardStop: proven ? { proven: true } : { unproven: true }, ...(proven ? { subphase: 'SETTLING' } : {}) }); })
+        .catch((err) => this.log(`${execId}: forced stop: ${err.message}`))
+        .finally(() => { context.escalating = null; });
+      return;
+    }
+    if (this.now() - (context.lastGuardCancelAt ?? -Infinity) >= this.timing.killRetryMs && !context.cancelling) {
+      context.lastGuardCancelAt = this.now();
+      context.cancelling = this.cancelExecution(execId, { root: this.remoteRoot }).catch(() => {}).finally(() => { context.cancelling = null; });
+    }
   }
 
   async #renewBlobLease(record, context) {
@@ -415,6 +474,7 @@ export class ExecutionDriver {
   async #settling(record, context) {
     const { execId } = record;
     const result = await this.readResult(execId, { root: this.remoteRoot });
+    if (result.missing && record.guardStop?.proven) return this.#upload(record, context, buildResult(headerOf(record), this.#ticketDir(execId), { kind: 'cancelled', stopProven: true }));
     if (result.missing) return this.#childAlive(record) ? this.#cas(execId, ['SETTLING'], { subphase: 'RUNNING' }) : this.#publisherGone(record);
     return this.#upload(record, context, result);
   }
@@ -450,10 +510,10 @@ export class ExecutionDriver {
           else await this.waker.wait(Math.min(backoffMs(attempt, this.timing.backoff), remainingMs()), abort.signal);
         }
       }
-      const current = this.table.get(execId);
-      const guardKilled = current?.guardKill !== undefined && current.cancel?.requested !== true && result.kind === 'cancelled' && result.stopProven === true;
-      const cancelled = !guardKilled && (current?.cancel?.requested === true || result.kind === 'cancelled');
-      const payload = { ...result, ...(guardKilled ? { kind: 'completed', exit: NO_PROGRESS_EXIT, signal: null, ...current.guardKill } : {}), ...outputs, ...(uploadError === undefined ? {} : { uploadError }), ...(cancelled ? { cancelConfirmed: result.stopProven === true } : {}) };
+      const { guardKill, guardStop, cancel } = this.table.get(execId) ?? {};
+      const guardKilled = guardKill !== undefined && result.kind === 'cancelled' && (result.stopProven === true || guardStop?.proven === true);
+      const cancelled = !guardKilled && (cancel?.requested === true || result.kind === 'cancelled');
+      const payload = { ...result, ...(guardKilled ? { kind: 'completed', exit: NO_PROGRESS_EXIT, signal: null, stopProven: true, guard: guardKill.reason, ...guardKill } : {}), ...outputs, ...(uploadError === undefined ? {} : { uploadError }), ...(cancelled ? { cancelConfirmed: result.stopProven === true } : {}) };
       this.#finishing(record, ['SETTLING'], payload);
     } finally {
       await stopBeating();
