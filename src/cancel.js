@@ -10,7 +10,7 @@ import { loadGlobalConfigOrError } from './config.js';
 import { loadPullRecovery, reconcileRemoteAttempt } from './remote-reconcile.js';
 import { writeBrokerLog } from './admission.js';
 import { stopLeaseCpuScope, CPU_SCOPE_STOP_WAIT_MS } from './cpu-limit.js';
-import { trackerForLease, reapLogLine, cancelGraceMs, KILL_WAIT_MS } from './descendants.js';
+import { trackerForLease, groupHasLeaseMember, reapLogLine, cancelGraceMs, KILL_WAIT_MS } from './descendants.js';
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -24,10 +24,13 @@ const msUntil = (deadline) => Math.max(0, deadline - Date.now());
 async function killGroupDirectly(lease, root, exec, deadline) {
   const graceMs = deadline === undefined ? cancelGraceMs() : Math.min(cancelGraceMs(), msUntil(deadline));
   const killWaitMs = deadline === undefined ? KILL_WAIT_MS : Math.min(KILL_WAIT_MS, msUntil(deadline) - graceMs);
+  // the numeric pgid is signalled only while a live member proves the group is still this lease's (checked before the reap thins it out); otherwise it counts as unproven, never as gone
+  const groupLive = Boolean(lease.childPgid) && isGroupAlive(lease.childPgid);
+  const groupIsOurs = groupLive && groupHasLeaseMember(lease);
   const reaping = trackerForLease(lease).reap({ graceMs, killWaitMs: Math.max(0, killWaitMs) });
   let groupGone = true;
   try {
-    if (lease.childPgid) groupGone = await killGroupOnly(lease.childPgid, deadline);
+    if (groupLive) groupGone = groupIsOurs ? await killGroupOnly(lease.childPgid, deadline) : false;
   } finally {
     const result = await reaping;
     writeBrokerLog(root, reapLogLine(lease.id, result));

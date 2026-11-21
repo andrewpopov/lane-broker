@@ -18,6 +18,7 @@ import { isDraining, readLaneId, toolsOnPath } from './claims.js';
 import { Waker } from './waker.js';
 import { RunGuard, WorkloadTree, windowOf } from './run-guard.js';
 import { forceStopRun } from './guard-stop.js';
+import { readProcessTable } from '../descendants.js';
 
 const PRE_START = new Set(['FETCHING', 'STARTING']);
 const BEATING = new Set(['FETCHING', 'SPAWNING', 'RUNNING', 'SETTLING']);
@@ -25,7 +26,7 @@ const POST_START = ['SPAWNING', 'RUNNING', 'SETTLING'];
 
 export const DEFAULT_TIMING = {
   tickMs: 1000, heartbeatMs: 15_000, killRetryMs: 5000, killGiveUpMs: 24 * 3_600_000, errorRetryMs: 15_000,
-  uploadRetryMs: 10 * 60_000, guardMs: 15_000, guardEscalateMs: 60_000, blobLeaseRenewMs: 5 * 60_000, backoff: { minMs: 250, maxMs: 15_000 },
+  uploadRetryMs: 10 * 60_000, guardMs: 15_000, guardEscalateMs: 60_000, guardStopMs: 30_000, blobLeaseRenewMs: 5 * 60_000, backoff: { minMs: 250, maxMs: 15_000 },
 };
 
 class FetchBudgetError extends Error {}
@@ -58,8 +59,8 @@ export class ExecutionDriver {
 
   constructor({ core, remoteRoot, config, s3, timing = {}, waker = new Waker(), log = () => {}, spawnEnv = process.env, laneBin = laneBinPath, draining = isDraining,
     cancelExecution = cancelRemoteExecution, readResult = readRemoteResultRecord, now = Date.now, publish = publishBlob, makeLease = (root, hashes) => new BlobLease(root, hashes),
-    probeScope = probeLifetimeScope, readRows = readProcCpuRows, spawnProcess = spawn, scopeRequired = process.platform === 'linux', scopeRetryMs = 60_000, onScopeChange = () => {} }) {
-    Object.assign(this, { core, remoteRoot: path.resolve(remoteRoot), config, s3, waker, log, spawnEnv, laneBin, draining, cancelExecution, readResult, now, publish, makeLease, probeScope, readRows, spawnProcess, scopeRequired, scopeRetryMs, onScopeChange });
+    probeScope = probeLifetimeScope, readRows = readProcCpuRows, readTable = readProcessTable, forceStop = forceStopRun, spawnProcess = spawn, scopeRequired = process.platform === 'linux', scopeRetryMs = 60_000, onScopeChange = () => {} }) {
+    Object.assign(this, { core, remoteRoot: path.resolve(remoteRoot), config, s3, waker, log, spawnEnv, laneBin, draining, cancelExecution, readResult, now, publish, makeLease, probeScope, readRows, readTable, forceStop, spawnProcess, scopeRequired, scopeRetryMs, onScopeChange });
     this.timing = { ...DEFAULT_TIMING, ...timing };
     this.ld = core.ld;
     this.table = core.table;
@@ -225,7 +226,7 @@ export class ExecutionDriver {
       while (!signal.aborted && !this.#closed) {
         await this.waker.wait(this.timing.tickMs, signal);
         if (signal.aborted || this.#closed) break;
-        if (context.beatNow || this.now() - context.lastBeatAt >= this.timing.heartbeatMs) await this.#beat(execId, context).catch((err) => this.log(`${execId}: heartbeat: ${err.message}`));
+        if (!this.table.get(execId)?.guardStop?.unproven && (context.beatNow || this.now() - context.lastBeatAt >= this.timing.heartbeatMs)) await this.#beat(execId, context).catch((err) => this.log(`${execId}: heartbeat: ${err.message}`));
       }
     })();
     return async () => { context.abort?.abort(); await loop; };
@@ -373,7 +374,7 @@ export class ExecutionDriver {
   async #running(record, context) {
     const { execId } = record;
     await this.#renewBlobLease(record, context);
-    if (!this.table.get(execId)?.guardStop?.unproven && (context.beatNow || this.now() - context.lastBeatAt >= this.timing.heartbeatMs)) await this.#beat(execId, context);
+    if (!context.escalating && !this.table.get(execId)?.guardStop?.unproven && (context.beatNow || this.now() - context.lastBeatAt >= this.timing.heartbeatMs)) await this.#beat(execId, context);
     const current = this.table.get(execId);
     if (current?.subphase !== 'RUNNING') return;
     if (current.cancel?.requested && this.now() - (context.lastCancelAt ?? 0) >= this.timing.killRetryMs) {
@@ -404,13 +405,16 @@ export class ExecutionDriver {
   async #guardTick() {
     const running = this.table.all().filter((r) => r.subphase === 'RUNNING' && this.#contexts.has(r.execId));
     const guards = running.map((record) => [record, this.#guardOf(record, this.#contexts.get(record.execId))]);
-    const cpuRows = guards.some(([record, guard]) => !record.guardKill && guard.needsCpu) ? this.#readRowsOnce() : null;
-    await Promise.all(guards.map(([record, guard]) => this.#guardRecord(record, guard, this.#contexts.get(record.execId), cpuRows)));
+    const sampled = guards.filter(([record, guard]) => !record.guardKill && guard.needsCpu);
+    const cpuRows = sampled.length > 0 ? this.#attempt(() => this.readRows()) : null;
+    const leaseIds = sampled.map(([, guard]) => guard.tree.leaseId()).filter(Boolean);
+    const hostTable = leaseIds.length > 0 ? this.#attempt(() => this.readTable(leaseIds)) : null;
+    await Promise.all(guards.map(([record, guard]) => this.#guardRecord(record, guard, this.#contexts.get(record.execId), cpuRows, hostTable)));
   }
 
-  #readRowsOnce() {
+  #attempt(read) {
     try {
-      return this.readRows();
+      return read();
     } catch {
       return null;
     }
@@ -429,10 +433,10 @@ export class ExecutionDriver {
     return context.guard;
   }
 
-  async #guardRecord(record, guard, context, cpuRows) {
+  async #guardRecord(record, guard, context, cpuRows, hostTable) {
     const { execId } = record;
-    if (record.guardKill) return this.#guardEnforce(record, context);
-    const { message, ...guardKill } = guard.check(cpuRows) ?? {};
+    if (record.guardKill) return this.#guardEnforce(record.guardKillAt === undefined ? this.#cas(execId, ['RUNNING'], { guardKillAt: this.now() }) ?? record : record, context);
+    const { message, ...guardKill } = guard.check(cpuRows, hostTable) ?? {};
     if (message === undefined) return;
     fs.appendFileSync(logPath(this.remoteRoot, execId), message);
     this.log(`${execId}: ${guardKill.reason}: killing the run`);
@@ -445,16 +449,24 @@ export class ExecutionDriver {
     if (this.#resultExists(execId) || !this.#childAlive(record) || context.escalating || record.guardStop?.proven) return;
     if (this.now() - Math.max(record.guardKillAt, context.escalatedAt ?? -Infinity) >= this.timing.guardEscalateMs) {
       context.escalatedAt = this.now();
-      context.escalating = forceStopRun({ remoteRoot: this.remoteRoot, record })
-        .then((proven) => { this.#cas(execId, ['RUNNING'], { guardStop: proven ? { proven: true } : { unproven: true }, ...(proven ? { subphase: 'SETTLING' } : {}) }); })
-        .catch((err) => this.log(`${execId}: forced stop: ${err.message}`))
-        .finally(() => { context.escalating = null; });
+      context.escalating = this.#forceStop(record).finally(() => { context.escalating = null; });
       return;
     }
     if (this.now() - (context.lastGuardCancelAt ?? -Infinity) >= this.timing.killRetryMs && !context.cancelling) {
       context.lastGuardCancelAt = this.now();
       context.cancelling = this.cancelExecution(execId, { root: this.remoteRoot }).catch(() => {}).finally(() => { context.cancelling = null; });
     }
+  }
+
+  /** Bounded: whatever happens (a deadline, an error, a member that never dies) ends as proven or persisted unproven, which also stops heartbeating. */
+  async #forceStop(record) {
+    const { execId } = record;
+    let timer;
+    const bound = new Promise((resolve) => { timer = setTimeout(() => resolve(false), this.timing.guardStopMs + 5000); timer.unref(); });
+    const proven = await Promise.race([this.forceStop({ remoteRoot: this.remoteRoot, record, deadline: Date.now() + this.timing.guardStopMs }), bound])
+      .catch((err) => { this.log(`${execId}: forced stop: ${err.message}`); return false; });
+    clearTimeout(timer);
+    this.#cas(execId, ['RUNNING'], proven ? { guardStop: { proven: true }, subphase: 'SETTLING' } : { guardStop: { unproven: true } });
   }
 
   async #renewBlobLease(record, context) {

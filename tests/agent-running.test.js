@@ -217,6 +217,72 @@ const scenarios = {
     for (const target of [run.lease.supervisorPid, -run.lease.childPgid]) { try { process.kill(target, 'SIGKILL'); } catch { /* gone */ } }
   },
 
+  'a stop that never completes hits its deadline, is persisted unproven, and the RUNNING path stops heartbeating': async (w, rw, load) => {
+    const graceVar = 'LANE_BROKER_TEST_CANCEL_GRACE_MS';
+    process.env[graceVar] = '200';
+    const run = await runningLane(w, rw, load, { config: { maxRunMs: 1500 }, timing: { guardMs: 200, guardEscalateMs: 400, guardStopMs: 500, heartbeatMs: 100 }, driverOptions: { forceStop: () => new Promise(() => {}) } });
+    process.kill(run.lease.supervisorPid, 'SIGSTOP');
+    try {
+      await happens('the stop was persisted unproven after its deadline', () => run.agent.core.table.get(run.execId)?.guardStop?.unproven === true, 30_000);
+      await sleep(500);
+      const beats = run.agent.timesOf('ld_heartbeat').length;
+      await sleep(1500);
+      assert.equal(run.agent.timesOf('ld_heartbeat').length, beats, 'no heartbeat is sent once the stop is unproven');
+    } finally {
+      delete process.env[graceVar];
+      for (const signal of ['SIGKILL', 'SIGCONT']) { try { process.kill(run.lease.supervisorPid, signal); } catch { /* gone */ } }
+      try { process.kill(-run.lease.childPgid, 'SIGKILL'); } catch { /* gone */ }
+    }
+  },
+
+  'an unproven stop whose result exists does not renew the queue lease while it uploads': async (w, rw, load) => {
+    const failPut = (url, init) => (init?.method === 'PUT' ? Promise.reject(new Error('storage down')) : fetch(url, init));
+    const run = await runningLane(w, rw, load, { code: 'setTimeout(() => process.exit(0), 1500); setInterval(() => {}, 1000)', fetchImpl: failPut, timing: { guardMs: 60_000, heartbeatMs: 100, uploadRetryMs: 3000 } });
+    run.agent.core.table.put({ ...run.agent.core.table.get(run.execId), guardStop: { unproven: true } });
+    await happens('the upload started', () => run.agent.core.table.get(run.execId)?.uploadSince !== undefined, 30_000);
+    await sleep(300);
+    const beats = run.agent.timesOf('ld_heartbeat').length;
+    await sleep(1500);
+    assert.equal(run.agent.timesOf('ld_heartbeat').length, beats, 'the upload path sent no heartbeat');
+  },
+
+  'a legacy guard-kill record without guardKillAt is stamped at first sight and still escalates': async (w, rw, load) => {
+    const graceVar = 'LANE_BROKER_TEST_CANCEL_GRACE_MS';
+    process.env[graceVar] = '200';
+    const run = await runningLane(w, rw, load, { config: { maxRunMs: 3_600_000 }, timing: { guardMs: 200, guardEscalateMs: 1000 } });
+    process.kill(run.lease.supervisorPid, 'SIGSTOP');
+    run.agent.core.table.put({ ...run.agent.core.table.get(run.execId), guardKill: { reason: 'run-limit', runLimitMs: 1 } });
+    try {
+      await rw.untilGone(run.agent, run.execId, 60_000);
+    } finally {
+      delete process.env[graceVar];
+      for (const signal of ['SIGKILL', 'SIGCONT']) { try { process.kill(run.lease.supervisorPid, signal); } catch { /* gone */ } }
+    }
+    const final = await w.ticket(run.ticket.id);
+    assert.deepEqual([final.result.kind, final.result.exit, final.result.stopProven], ['completed', 124, true]);
+  },
+
+  'two running lanes share one host table read and one CPU read per guard tick': async (w, rw, load) => {
+    const { readProcCpuRows } = await load('preemptible.js');
+    const { readProcessTable } = await load('descendants.js');
+    const cpuReads = [];
+    const tableReads = [];
+    const tickA = await rw.submit({ code: SLEEP });
+    const tickB = await rw.submit({ code: SLEEP });
+    const agent = await rw.agent({
+      load, config: { noProgressTimeoutMs: 600_000 }, timing: { guardMs: 300 },
+      driverOptions: { readRows: () => { cpuReads.push(1); return readProcCpuRows(); }, readTable: (ids) => { tableReads.push(ids.length); return readProcessTable(ids); } },
+    });
+    await rw.claimed(tickA);
+    await rw.claimed(tickB);
+    await happens('both lanes were sampled in one tick', () => tableReads.includes(2), 30_000);
+    await sleep(1500);
+    assert.ok(tableReads.length <= cpuReads.length, `at most one table read per CPU read, whatever the lane count (${tableReads.length} table, ${cpuReads.length} cpu)`);
+    assert.ok(Math.max(...tableReads) === 2);
+    for (const target of [tickA, tickB]) await call(await w.as(logins.s1), 'ld_cancel', target.id);
+    void agent;
+  },
+
   'a post-start shutdown result is finished with its proof, and nothing is released': async (w, rw, load) => {
     const { ExecutionDriver } = await load('agent/execution.js');
     const { readRemoteResultRecord } = await load('remote-runner.js');
@@ -241,6 +307,12 @@ const scenarios = {
 
 const EXEC = 'agent/execution.js';
 const canaries = [
+  ['a stop that never completes hits its deadline, is persisted unproven, and the RUNNING path stops heartbeating', EXEC, ['resolve(false), this.timing.guardStopMs + 5000', 'resolve(new Promise(() => {})), this.timing.guardStopMs + 5000']],
+  ['a stop that never completes hits its deadline, is persisted unproven, and the RUNNING path stops heartbeating', EXEC, ['if (!context.escalating && !this.table.get(execId)?.guardStop?.unproven && (context.beatNow', 'if ((context.beatNow']],
+  ['an unproven stop whose result exists does not renew the queue lease while it uploads', EXEC, ['if (!this.table.get(execId)?.guardStop?.unproven && (context.beatNow', 'if ((context.beatNow']],
+  ['a legacy guard-kill record without guardKillAt is stamped at first sight and still escalates', EXEC, ["record.guardKillAt === undefined ? this.#cas(execId, ['RUNNING'], { guardKillAt: this.now() }) ?? record : record", 'record']],
+  ['two running lanes share one host table read and one CPU read per guard tick', EXEC, ['this.#attempt(() => this.readTable(leaseIds)) : null', '(leaseIds.map((id) => this.#attempt(() => this.readTable([id]))), this.#attempt(() => this.readTable(leaseIds))) : null']],
+
   ['a SIGSTOPped supervisor that ignores the graceful cancel is SIGKILLed after the grace, the stop is verified, and the run finishes completed 124', EXEC, ['      context.escalatedAt = this.now();', '      return;\n      context.escalatedAt = this.now();']],
   ['an explicit 0 in the dispatch header turns the guard off for the lane, while an absent value takes the runner\'s global', 'agent/run-guard.js', ['fromHeader ?? fromConfig ?? 0', 'fromHeader > 0 ? fromHeader : fromConfig ?? 0']],
   ['a worker that daemonised and reparented to PID 1 keeps the lane alive while it burns CPU, even though the command itself is idle', 'agent/run-guard.js', ['[this.#tracker.rootPid, ...this.#tracker.live(rows)]', '[this.#tracker.rootPid]']],
@@ -248,7 +320,7 @@ const canaries = [
   ['the guard keeps enforcing the run limit while a heartbeat never answers', EXEC, ['    this.#guardTimer = setTimeout(async () => {', '    this.#guardTimer = setTimeout(async () => {\n      await this.#contexts.values().next().value.promise;']],
   ['a record without runningSince gets its first observation persisted once, and two agent restarts never reset the wall-clock anchor', EXEC, ["if (record.runningSince === undefined) this.#cas(record.execId, ['RUNNING'], { runningSince: startedAt });", '']],
 
-  ['a pull lane that hangs idle is killed by the agent\'s own no-progress guard and finishes red with exit 124', EXEC, ['const { message, ...guardKill } = guard.check(cpuRows) ?? {};', 'const { message, ...guardKill } = {};']],
+  ['a pull lane that hangs idle is killed by the agent\'s own no-progress guard and finishes red with exit 124', EXEC, ['const { message, ...guardKill } = guard.check(cpuRows, hostTable) ?? {};', 'const { message, ...guardKill } = {};']],
   ['a pull lane still running at maxRunMs is killed by the wall-clock backstop even while it burns CPU', 'agent/run-guard.js', ['if (this.now() - this.startedAt >= this.maxRunMs)', 'if (false)']],
 
   ['the lane\'s command sees the agent\'s configured speedFactor as LANE_BROKER_RUNNER_SPEED_FACTOR, so a repo can scale its time budgets', EXEC, ['String(this.config.speedFactor)', "'1'"]],

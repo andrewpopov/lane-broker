@@ -63,3 +63,21 @@ export function isProcessAlive(pid, startTime) {
   if (current === null) return isPidAlive(pid); // `ps` alone cannot declare a pid that kill(0) just saw alive dead
   return current === startTime;
 }
+
+/**
+ * Positive identity: the pid is alive AND its readable start time equals the recorded one. A missing recorded start time or a failed probe
+ * is NOT identity, so this is the only gate that may authorise a destructive signal (`isProcessAlive` fails closed the other way, for liveness).
+ */
+export function isVerifiedProcess(pid, startTime) {
+  if (!startTime || !isPidAlive(pid)) return false;
+  const current = processStartTime(pid);
+  return typeof current === 'string' && current === startTime;
+}
+
+/** Positively gone: the pid no longer signals, or `ps` read a different start time for it. A failed probe, or no recorded start time, is not gone. */
+export function isConfirmedGone(pid, startTime) {
+  if (!isPidAlive(pid)) return true;
+  if (!startTime) return false;
+  const current = processStartTime(pid);
+  return typeof current === 'string' && current !== startTime;
+}

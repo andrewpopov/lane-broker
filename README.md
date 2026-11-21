@@ -3030,15 +3030,32 @@ per tick (`ps` on macOS) shared by all running lanes, and is not taken at all wh
 | `maxRunMs` | agent `config.json` | `7200000` (2 h) | Wall-clock cap on a run, whatever its CPU and output do. Anchored on `runningSince`, which is persisted when the run starts, on spawn recovery, and at the first guard observation of an older record, so an agent restart never resets it. |
 
 A kill appends the usual message to the lane log (`lane run: no progress for ...`, `... no output for ...`, or `lane run: still
-running after 2h — killed (run limit)`) and records `guardKill`. The agent then cancels through the same path as `ld_cancel`,
-retrying. If the run is still alive `guardEscalateMs` (60 s) later (a stopped or wedged supervisor, which `lane cancel` will not
-take over), it SIGKILLs the supervisor by identity and lets `lane cancel`'s orphaned-lease takeover reap the command group and its
-recorded descendants. The stop is proven only when the supervisor, the group and every recorded or marked member are gone; an
-unproven stop marks the record and stops heartbeating it, so the queue's lease expiry settles the ticket (`ld_reap`: 120 s lease
-TTL, lost after 2 h). A proven stop finishes the ticket `completed` with `exit: 124`, `stopProven`, `guard: "<reason>"` and
-`reason` `no-progress`, `silence` or `run-limit` (with the window), so the merge train sees a red verdict. `ld_finish` settles the
-race with a user cancel: a guard result finished for a ticket whose `cancel_requested` is set is recorded `cancelled`. `run-limit`
-is not yet relayed into the history row's `reason`.
+running after 2h — killed (run limit)`) and records `guardKill` (with `guardKillAt`, stamped at first sight on an older record). The
+agent then cancels through the same path as `ld_cancel`, retrying. If the run is still alive `guardEscalateMs` (60 s) later (a
+stopped or wedged supervisor, which `lane cancel` will not take over), it escalates under one rule: **no destructive signal and no
+stop proof without positive evidence; unknown means unproven.**
+
+- The supervisor is SIGKILLed only when the lease and its `remote-id` are readable and the supervisor's recorded start time equals
+  the one `ps` reads now (`isVerifiedProcess`). A missing start time, a failed probe or a mismatch (a reused pid) sends nothing.
+  A missing or unreadable lease or `remote-id` is never proof: read errors surface, and killing the publisher alone never proves a stop.
+- `lane cancel`'s orphaned-lease takeover then reaps the rest, and it now signals the numeric process group only while a live member
+  carrying the lease marker or a recorded identity proves the group is still this lease's (checked before the reap). This applies to
+  every orphaned `lane cancel`, not only the agent's. A live group nobody can vouch for is left alone and counts as unproven. On macOS
+  the environment of SIP-protected binaries (e.g. `/bin/sleep`) is hidden, so such a member is vouched for only by an identity the
+  supervisor recorded earlier.
+- The whole escalation is bounded by `guardStopMs` (30 s; the takeover gets it as its deadline). A deadline, an error or a member that
+  never dies (uninterruptible I/O) persists `guardStop.unproven`; the escalation retries every `guardEscalateMs`.
+- An unproven stop stops heartbeating on both paths: RUNNING checks it (and an escalation in flight) before it heartbeats, and the
+  upload's background heartbeat skips it too, so the queue's lease expiry settles the ticket (`ld_reap`: 120 s lease TTL, lost after 2 h).
+- The stop is proven only when the supervisor, the command group and every recorded or marked member are positively gone. A proven
+  stop finishes the ticket `completed` with `exit: 124`, `stopProven`, `guard: "<reason>"` and `reason` `no-progress`, `silence` or
+  `run-limit` (with the window), so the merge train sees a red verdict.
+
+`ld_finish` settles the race with a user cancel: a guard result finished for a ticket whose `cancel_requested` is set is recorded
+`cancelled`. `run-limit` is not yet relayed into the history row's `reason`.
+
+Scans are shared: each tick takes one host process table (with every sampled lane's markers, `readProcessTable(leaseIds)`) and one CPU
+read, however many lanes run. On macOS that is two whole-host `ps` calls plus `ps -E` for the markers per tick, constant in the lane count.
 
 **Hung and silent runs (BRAIN-532, warning only; nothing is ever cancelled).** The supervisor stamps `lastOutputAt` from the
 bytes the command writes (immune to the log writer's discard mode) and keeps CPU-idle anchors from per-interval cores

@@ -12,7 +12,8 @@ export const windowOf = (fromHeader, fromConfig) => fromHeader ?? fromConfig ?? 
 /**
  * The command's own process tree, as the supervisor's watchdog samples it: the command leader the lease names, plus every descendant or
  * lease-marked process recorded BY IDENTITY, so a worker that daemonised and reparented to PID 1 stays in. The supervisor and broker
- * housekeeping are not in it. Null while the lease is not readable (an unobserved interval, never an idle one).
+ * housekeeping are not in it. The supervisor's recorded snapshot is re-read from the lease on every call. Null while the lease is not
+ * readable (an unobserved interval, never an idle one). The host table is read once per tick by the caller and shared by every lane.
  */
 export class WorkloadTree {
   #tracker = null;
@@ -22,15 +23,18 @@ export class WorkloadTree {
     Object.assign(this, { root, readLeaseId });
   }
 
-  pids() {
-    if (this.#tracker === null) {
-      const leaseId = this.readLeaseId();
-      const lease = leaseId ? readLease(this.root, leaseId) : null;
-      if (!lease?.childPgid) return null;
-      this.#tracker = DescendantTracker.fromSnapshot(lease.childPgid, lease.descendants, { leaseId });
-    }
-    const rows = this.#tracker.scan();
-    return rows ? [this.#tracker.rootPid, ...this.#tracker.live(rows)] : null;
+  leaseId() {
+    return this.readLeaseId();
+  }
+
+  pids(hostTable) {
+    const leaseId = this.readLeaseId();
+    const lease = leaseId ? readLease(this.root, leaseId) : null;
+    if (!hostTable || !lease?.childPgid) return null;
+    if (this.#tracker === null) this.#tracker = DescendantTracker.fromSnapshot(lease.childPgid, lease.descendants, { leaseId });
+    else this.#tracker.adopt(lease.descendants);
+    const rows = this.#tracker.scan(hostTable.map((row) => ({ ...row, marked: row.markedLeases?.includes(leaseId) ?? false })));
+    return [this.#tracker.rootPid, ...this.#tracker.live(rows)];
   }
 }
 
@@ -52,14 +56,14 @@ export class RunGuard {
     return this.watchdog.killEnabled;
   }
 
-  check(cpuRows) {
+  check(cpuRows, hostTable) {
     if (this.now() - this.startedAt >= this.maxRunMs) return { reason: RUN_LIMIT_REASON, runLimitMs: this.maxRunMs, message: runLimitMessage(this.maxRunMs) };
     this.#noteOutput();
     const { watchdog } = this;
     if (watchdog.shouldKillSilent()) return { reason: SILENCE_REASON, silenceTimeoutMs: watchdog.silenceTimeoutMs, message: silenceMessage(watchdog.silenceTimeoutMs) };
     if (!this.needsCpu) return null;
     this.cpuRows = cpuRows ?? [];
-    const idleMs = watchdog.observe(cpuRows ? this.tree.pids() : null);
+    const idleMs = watchdog.observe(cpuRows ? this.tree.pids(hostTable) : null);
     return watchdog.shouldKill(idleMs) ? { reason: NO_PROGRESS_REASON, noProgressTimeoutMs: watchdog.timeoutMs, message: noProgressMessage(watchdog.timeoutMs) } : null;
   }
 
