@@ -34,7 +34,7 @@ import { cancelCommand } from './cancel.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { isPidAlive, isProcessAlive } from './process-liveness.js';
 import { selectLeaseTree } from './cpu.js';
-import { DescendantTracker, hasLiveMembers, reapLogLine, cancelGraceMs } from './descendants.js';
+import { DescendantTracker, hasLiveMembers, leaderIdentityOf, reapLogLine, cancelGraceMs } from './descendants.js';
 import { reloadGlobalConfig, isDispatchOnly, pushRunners, pullRunners, pullQueuedTimeoutMs } from './config.js';
 import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope, scopeMemoryPeakReader, scopeMemoryPeakTracker, enforcementLabel } from './cpu-limit.js';
 import { stateHome, RUNNER_SHUTDOWN_REASON, LOST_REASONS } from './state.js';
@@ -2489,6 +2489,7 @@ async function main() {
   const exclusiveDeadlineMs = ticket.exclusive === true ? Number(process.env.LANE_BROKER_TEST_EXCLUSIVE_DEADLINE_MS) || ticket.exclusiveDeadlineMs : undefined;
   writeLease(root, {
     ...runningLease(started.lease, { childPgid: child.pid, cpuScopeUnit: cpuScope, startedAt }),
+    leader: leaderIdentityOf(child.pid), // in the same write that names the command's group: a supervisor killed right after still leaves an orphan whose leader is provably the lease's
     ...(leaseTmpDir ? { tmpDir: leaseTmpDir } : {}),
     ...(ticket.exclusivePurpose ? { exclusivePurpose: ticket.exclusivePurpose } : {}),
     ...(exclusiveDeadlineMs ? { exclusiveDeadlineAt: startedAt + exclusiveDeadlineMs } : {}),
@@ -2506,9 +2507,8 @@ async function main() {
   // BRAIN-419: processes that left the leader's group (setsid/setpgid) are invisible to killGroup, so track the tree.
   const descendants = new DescendantTracker(child.pid, { leaseId: ticket.id });
   descendants.scan();
-  // the leader's identity goes into the lease at once, not at the first telemetry sample, so a supervisor that dies in between still leaves an orphan the takeover can prove it owns
   const spawnedLease = readLease(root, ticket.id);
-  if (spawnedLease) writeLease(root, { ...spawnedLease, descendants: descendants.snapshot(), leader: descendants.leader() });
+  if (spawnedLease) writeLease(root, { ...spawnedLease, descendants: descendants.snapshot(), leader: descendants.leader() ?? spawnedLease.leader ?? null });
   async function killTree(reason) {
     descendants.scan(); // the leader may still be alive: catches anything spawned since the last heartbeat
     const [, result] = await Promise.all([killGroup(child.pid), descendants.reap({ graceMs: cancelGraceMs() })]);
@@ -2552,7 +2552,7 @@ async function main() {
           }),
           ...(cgroupPeak === null ? {} : { observedCgroupMemoryPeakBytes: Math.max(lease.observedCgroupMemoryPeakBytes ?? 0, cgroupPeak) }),
           descendants: descendants.snapshot(),
-          leader: descendants.leader(),
+          leader: descendants.leader() ?? lease.leader ?? null,
           noProgressSinceMs: Math.round(idleMs),
           ...(watchdog.lastOutputAt === null ? {} : { lastOutputAt: watchdog.lastOutputAt }),
         });

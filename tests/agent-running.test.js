@@ -283,14 +283,18 @@ const scenarios = {
     void agent;
   },
 
-  'the lease names its command leader as soon as it is written, before the first telemetry sample': async (w, rw, load) => {
+  'the very first lease that names the command group already names its leader, so a supervisor killed right away leaves a provable orphan': async (w, rw, load) => {
     const ticket = await rw.submit({ code: SLEEP });
     await rw.agent({ load, laneBin: load.laneBin });
-    let lease = null;
-    await happens('the lease has its command pgid', () => leaseOf(rw)?.childPgid, 30_000);
-    await happens('the leader is named well before the 1 s telemetry sample', () => { lease = leaseOf(rw); return lease?.leader; }, 800);
-    assert.equal(lease.leader.pid, lease.childPgid, 'the leader pid is in the lease at once');
-    assert.equal(typeof lease.leader?.token, 'string', 'with its start token');
+    let first = null;
+    for (const deadline = Date.now() + 30_000; first === null && Date.now() < deadline;) {
+      const lease = leaseOf(rw);
+      if (lease?.childPgid) first = lease;
+      else await sleep(1);
+    }
+    assert.ok(first, 'a lease with a command group appeared');
+    assert.equal(first.leader?.pid, first.childPgid, 'the leader pid is in that same lease');
+    assert.equal(typeof first.leader?.token, 'string', 'with its start token');
     void ticket;
   },
 
@@ -318,7 +322,7 @@ const scenarios = {
 
 const EXEC = 'agent/execution.js';
 const canaries = [
-  ['the lease names its command leader as soon as it is written, before the first telemetry sample', 'supervisor.js', ['  if (spawnedLease) writeLease(root, { ...spawnedLease, descendants: descendants.snapshot(), leader: descendants.leader() });', '']],
+  ['the very first lease that names the command group already names its leader, so a supervisor killed right away leaves a provable orphan', 'supervisor.js', ['    leader: leaderIdentityOf(child.pid),', '    leader: null,']],
   ['a stop that never completes hits its deadline, is persisted unproven, and the RUNNING path stops heartbeating', EXEC, ['resolve(false), this.timing.guardStopMs + 5000', 'resolve(new Promise(() => {})), this.timing.guardStopMs + 5000']],
   ['a stop that never completes hits its deadline, is persisted unproven, and the RUNNING path stops heartbeating', EXEC, [['if (!context.escalating && !this.table.get(execId)?.guardStop?.unproven && (context.beatNow', 'if ((context.beatNow'], ['BEATING.has(this.table.get(execId)?.subphase) && !this.table.get(execId)?.guardStop?.unproven && !context.escalating,', 'BEATING.has(this.table.get(execId)?.subphase),']]],
   ['an unproven stop whose result exists does not renew the queue lease while it uploads', EXEC, [['if (!this.table.get(execId)?.guardStop?.unproven && (context.beatNow', 'if ((context.beatNow'], ['BEATING.has(this.table.get(execId)?.subphase) && !this.table.get(execId)?.guardStop?.unproven && !context.escalating,', 'BEATING.has(this.table.get(execId)?.subphase),']]],

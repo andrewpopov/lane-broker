@@ -3045,8 +3045,9 @@ stop proof without positive evidence; unknown means unproven.**
   and the post-grace SIGKILL alike, so a group whose pgid was reused meanwhile is never signalled. This applies to every orphaned
   `lane cancel`, not only the agent's. A live group nobody can vouch for is left alone and counts as unproven. On macOS the environment
   of SIP-protected binaries (e.g. `/bin/sleep`) is hidden, so such a member is vouched for only by a recorded identity, in particular
-  the lease's `leader` when it has no descendants. The supervisor writes `leader` (and the descendant snapshot) into the lease right after its first scan
-  of the spawned command, not at the first telemetry sample, so a supervisor that dies in that first second still leaves a provable orphan.
+  the lease's `leader` when it has no descendants. The supervisor writes `leader` in the very same lease write that first names the command's group
+  (`childPgid`), read from the spawned pid with a single-pid read, so a supervisor killed the instant the lease appears still leaves an
+  orphan whose leader is provably the lease's; the descendant snapshot follows after the first full scan.
 - The whole escalation is bounded by `guardStopMs` (30 s; the takeover gets it as its deadline). A deadline, an error or a member that
   never dies (uninterruptible I/O) persists `guardStop.unproven`; the escalation retries every `guardEscalateMs`.
 - An unproven stop stops heartbeating on both paths: RUNNING checks it (and an escalation in flight) before it heartbeats, and the

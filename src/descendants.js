@@ -325,6 +325,20 @@ export function trackerForLease(lease, options = {}) {
   return DescendantTracker.fromSnapshot(null, lease.descendants, { leaseId: lease.id, ...options });
 }
 
+/** One process's identity as the tracker records it (pid plus start token, the same token format), or null when it cannot be read. A cheap single-pid read, for the moment of spawn. */
+export function leaderIdentityOf(pid) {
+  try {
+    const row = process.platform === 'linux'
+      ? readProcRow(String(pid), undefined, 0, fs, procUnits())
+      : parsePsTable(execFileSync('ps', ['-ww', '-p', String(pid), '-o', 'pid=,ppid=,pgid=,pcpu=,rss=,lstart=,command='], {
+        encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000, env: { ...process.env, TZ: 'UTC0', LC_ALL: 'C', LC_TIME: 'C' },
+      }))[0];
+    return row && !row.unknown && row.token ? { pid, token: row.token } : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Does the process group `lease.childPgid` still belong to this lease? Only a live member carrying the lease marker or a recorded identity
  * proves it: a bare pgid may have been reused by an unrelated group, which must never be signalled. Unreadable table = no.
