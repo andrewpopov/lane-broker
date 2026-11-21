@@ -3,13 +3,13 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { freshEnv, laneRun } from './helpers.js';
+import { makeTmpDir } from './helpers/tmp.js';
 import { drainHookCommand } from '../src/agent/drain-hook.js';
 import { claimBlock, drainsOf, isDraining } from '../src/agent/claims.js';
 import { ExecutionTable, ensureAgentDirs, newExecutionRecord } from '../src/agent/store.js';
 import { spawnSync } from 'node:child_process';
 import { bootId, paths, processStartTime, readDrainMarkers, readRemoteDrain, withLock, writeRemoteDrain } from '../src/state.js';
 import { randomUUID } from 'node:crypto';
-import os from 'node:os';
 
 const EXPIRES = '2099-01-01T00:00:00.000Z';
 const env = (extra = {}) => ({ BOSUN_DRAIN_ID: 'd1', BOSUN_DRAIN_MODE: 'interrupt', BOSUN_DRAIN_REASON: 'deploy', BOSUN_DRAIN_EXPIRES_AT: EXPIRES, ...extra });
@@ -179,7 +179,7 @@ test('an expired marker is not in force: --status is 1', async () => {
 
 test('an unreadable agent config is an error exit that is neither 0 nor 75, for every verb', async () => {
   const { run } = hookWorld();
-  const empty = fs.mkdtempSync(path.join(os.tmpdir(), 'drain-hook-noconfig-'));
+  const empty = makeTmpDir('drain-hook-noconfig-');
   for (const verb of ['--apply', '--lift', '--status']) {
     const { exitCode, errors } = await run(verb, env(), { configDir: empty, loadConfig: undefined });
     assert.equal(exitCode, 1, verb);
