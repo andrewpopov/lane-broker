@@ -87,6 +87,35 @@ const scenarios = {
     }
   },
 
+  'a pull lane that hangs idle is killed by the agent\'s own no-progress guard and finishes red with exit 124': async (w, rw, load) => {
+    const ticket = await rw.submit({ code: SLEEP });
+    const agent = await rw.agent({ load, config: { noProgressTimeoutMs: 1500 }, timing: { guardMs: 200 } });
+    const row = await rw.claimed(ticket);
+    await rw.untilGone(agent, rw.execId(row), 30_000);
+    const final = await w.ticket(ticket.id);
+    assert.equal(final.state, 'finished');
+    assert.deepEqual([final.result.kind, final.result.exit, final.result.reason, final.result.noProgressTimeoutMs], ['completed', 124, 'no-progress', 1500]);
+    assert.match(rw.s3.objects.get(`lane-out/a1/${ticket.id}/e${row.epoch}/log`).body.toString(), /no progress for/);
+  },
+
+  'a pull lane that burns CPU past the no-progress window is not killed': async (w, rw, load) => {
+    const ticket = await rw.submit({ code: 'const end = Date.now() + 4000; while (Date.now() < end) {}' });
+    const agent = await rw.agent({ load, config: { noProgressTimeoutMs: 1500 }, timing: { guardMs: 200 } });
+    await rw.untilGone(agent, rw.execId(await rw.claimed(ticket)), 30_000);
+    const final = await w.ticket(ticket.id);
+    assert.deepEqual([final.result.kind, final.result.exit], ['completed', 0]);
+  },
+
+  'a pull lane still running at maxRunMs is killed by the wall-clock backstop even while it burns CPU': async (w, rw, load) => {
+    const ticket = await rw.submit({ code: 'while (true) {}' });
+    const agent = await rw.agent({ load, config: { maxRunMs: 2000 }, timing: { guardMs: 200 } });
+    const row = await rw.claimed(ticket);
+    await rw.untilGone(agent, rw.execId(row), 30_000);
+    const final = await w.ticket(ticket.id);
+    assert.deepEqual([final.result.kind, final.result.exit, final.result.reason, final.result.runLimitMs], ['completed', 124, 'run-limit', 2000]);
+    assert.match(rw.s3.objects.get(`lane-out/a1/${ticket.id}/e${row.epoch}/log`).body.toString(), /run limit/);
+  },
+
   'a post-start shutdown result is finished with its proof, and nothing is released': async (w, rw, load) => {
     const { ExecutionDriver } = await load('agent/execution.js');
     const { readRemoteResultRecord } = await load('remote-runner.js');
@@ -111,6 +140,9 @@ const scenarios = {
 
 const EXEC = 'agent/execution.js';
 const canaries = [
+  ['a pull lane that hangs idle is killed by the agent\'s own no-progress guard and finishes red with exit 124', EXEC, ['const { message, ...guardKill } = context.guard.check() ?? {};', 'const { message, ...guardKill } = {};']],
+  ['a pull lane still running at maxRunMs is killed by the wall-clock backstop even while it burns CPU', 'agent/run-guard.js', ['if (this.now() - this.startedAt >= this.maxRunMs)', 'if (false)']],
+
   ['the lane\'s command sees the agent\'s configured speedFactor as LANE_BROKER_RUNNER_SPEED_FACTOR, so a repo can scale its time budgets', EXEC, ['String(this.config.speedFactor)', "'1'"]],
   ['a heartbeat answering fenced kills the lane and the record, and no ld_finish is ever sent', EXEC, ['if (answer.fenced === true) {', 'if (false) {']],
   ['ld_cancel on a running ticket reaches the lane within a heartbeat and finishes cancelled with cancelConfirmed', EXEC, ['} else if (answer.cancel === true) {', '} else if (false) {']],

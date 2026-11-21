@@ -3,6 +3,8 @@ import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { probeLifetimeScope, supervisorLaunch } from '../cpu-limit.js';
 import { kernelBootId, processStartTime, readJsonSafe } from '../state.js';
+import { NO_PROGRESS_EXIT } from '../no-progress.js';
+import { readProcCpuRows } from '../preemptible.js';
 import { isProcessAlive } from '../process-liveness.js';
 import { childExitSafeFlags } from '../node-exit-safe.js';
 import { buildResult, cancelRemoteExecution, laneBinPath, readRemoteResultRecord, remoteArtifactsReleaseCommand, tombstoneAbsentTicket } from '../remote-runner.js';
@@ -14,6 +16,7 @@ import { artifactsDirOf, uploadOutputs } from './upload.js';
 import { stopEvidence } from './stop-proof.js';
 import { isDraining, toolsOnPath } from './claims.js';
 import { Waker } from './waker.js';
+import { RunGuard } from './run-guard.js';
 
 const PRE_START = new Set(['FETCHING', 'STARTING']);
 const BEATING = new Set(['FETCHING', 'SPAWNING', 'RUNNING', 'SETTLING']);
@@ -21,7 +24,7 @@ const POST_START = ['SPAWNING', 'RUNNING', 'SETTLING'];
 
 export const DEFAULT_TIMING = {
   tickMs: 1000, heartbeatMs: 15_000, killRetryMs: 5000, killGiveUpMs: 24 * 3_600_000, errorRetryMs: 15_000,
-  uploadRetryMs: 10 * 60_000, blobLeaseRenewMs: 5 * 60_000, backoff: { minMs: 250, maxMs: 15_000 },
+  uploadRetryMs: 10 * 60_000, guardMs: 15_000, blobLeaseRenewMs: 5 * 60_000, backoff: { minMs: 250, maxMs: 15_000 },
 };
 
 class FetchBudgetError extends Error {}
@@ -53,8 +56,8 @@ export class ExecutionDriver {
 
   constructor({ core, remoteRoot, config, s3, timing = {}, waker = new Waker(), log = () => {}, spawnEnv = process.env, laneBin = laneBinPath, draining = isDraining,
     cancelExecution = cancelRemoteExecution, readResult = readRemoteResultRecord, now = Date.now, publish = publishBlob, makeLease = (root, hashes) => new BlobLease(root, hashes),
-    probeScope = probeLifetimeScope, spawnProcess = spawn, scopeRequired = process.platform === 'linux', scopeRetryMs = 60_000, onScopeChange = () => {} }) {
-    Object.assign(this, { core, remoteRoot: path.resolve(remoteRoot), config, s3, waker, log, spawnEnv, laneBin, draining, cancelExecution, readResult, now, publish, makeLease, probeScope, spawnProcess, scopeRequired, scopeRetryMs, onScopeChange });
+    probeScope = probeLifetimeScope, readRows = readProcCpuRows, spawnProcess = spawn, scopeRequired = process.platform === 'linux', scopeRetryMs = 60_000, onScopeChange = () => {} }) {
+    Object.assign(this, { core, remoteRoot: path.resolve(remoteRoot), config, s3, waker, log, spawnEnv, laneBin, draining, cancelExecution, readResult, now, publish, makeLease, probeScope, readRows, spawnProcess, scopeRequired, scopeRetryMs, onScopeChange });
     this.timing = { ...DEFAULT_TIMING, ...timing };
     this.ld = core.ld;
     this.table = core.table;
@@ -335,7 +338,7 @@ export class ExecutionDriver {
       const child = this.spawnProcess(cmd, args, { detached: true, stdio: [input, log, log], env: this.spawnEnv });
       child.on('error', (err) => this.log(`${execId}: spawn failed: ${err.message}`));
       child.unref();
-      if (child.pid !== undefined) this.#cas(execId, ['SPAWNING'], { subphase: 'RUNNING', pid: child.pid, pidStart: processStartTime(child.pid) ?? null });
+      if (child.pid !== undefined) this.#cas(execId, ['SPAWNING'], { subphase: 'RUNNING', pid: child.pid, pidStart: processStartTime(child.pid) ?? null, runningSince: this.now() });
     } finally {
       fs.closeSync(log);
       fs.closeSync(input);
@@ -369,12 +372,30 @@ export class ExecutionDriver {
     if (context.beatNow || this.now() - context.lastBeatAt >= this.timing.heartbeatMs) await this.#beat(execId, context);
     const current = this.table.get(execId);
     if (current?.subphase !== 'RUNNING') return;
-    if (current.cancel?.requested && this.now() - (context.lastCancelAt ?? 0) >= this.timing.killRetryMs) {
+    await this.#guardRun(current, context);
+    if ((current.cancel?.requested || this.table.get(execId)?.guardKill) && this.now() - (context.lastCancelAt ?? 0) >= this.timing.killRetryMs) {
       context.lastCancelAt = this.now();
       await this.cancelExecution(execId, { root: this.remoteRoot });
     }
     if (this.#resultExists(execId) || !this.#childAlive(current)) return this.#cas(execId, ['RUNNING'], { subphase: 'SETTLING' });
     await this.waker.wait(this.timing.tickMs);
+  }
+
+  /** PKG-397: the agent's own no-progress, silence and wall-clock backstop; a kill is recorded and the existing cancel path stops the run. */
+  async #guardRun(record, context) {
+    if (record.guardKill || this.now() - (context.guardAt ?? -Infinity) < this.timing.guardMs) return;
+    context.guardAt = this.now();
+    const header = record.claim.header ?? {};
+    const window = (fromHeader, fromConfig) => (fromHeader > 0 ? fromHeader : fromConfig ?? 0);
+    context.guard ??= new RunGuard({
+      pid: record.pid, startedAt: record.runningSince ?? this.now(), now: this.now, logFile: logPath(this.remoteRoot, record.execId), maxRunMs: this.config.maxRunMs,
+      noProgressTimeoutMs: window(header.noProgressTimeoutMs, this.config.noProgressTimeoutMs), silenceTimeoutMs: window(header.silenceTimeoutMs, this.config.silenceTimeoutMs), readRows: this.readRows,
+    });
+    const { message, ...guardKill } = context.guard.check() ?? {};
+    if (message === undefined) return;
+    fs.appendFileSync(logPath(this.remoteRoot, record.execId), message);
+    this.log(`${record.execId}: ${guardKill.reason}: killing the run`);
+    this.#cas(record.execId, ['RUNNING'], { guardKill });
   }
 
   async #renewBlobLease(record, context) {
@@ -429,8 +450,10 @@ export class ExecutionDriver {
           else await this.waker.wait(Math.min(backoffMs(attempt, this.timing.backoff), remainingMs()), abort.signal);
         }
       }
-      const cancelled = this.table.get(execId)?.cancel?.requested === true || result.kind === 'cancelled';
-      const payload = { ...result, ...outputs, ...(uploadError === undefined ? {} : { uploadError }), ...(cancelled ? { cancelConfirmed: result.stopProven === true } : {}) };
+      const current = this.table.get(execId);
+      const guardKilled = current?.guardKill !== undefined && current.cancel?.requested !== true && result.kind === 'cancelled' && result.stopProven === true;
+      const cancelled = !guardKilled && (current?.cancel?.requested === true || result.kind === 'cancelled');
+      const payload = { ...result, ...(guardKilled ? { kind: 'completed', exit: NO_PROGRESS_EXIT, signal: null, ...current.guardKill } : {}), ...outputs, ...(uploadError === undefined ? {} : { uploadError }), ...(cancelled ? { cancelConfirmed: result.stopProven === true } : {}) };
       this.#finishing(record, ['SETTLING'], payload);
     } finally {
       await stopBeating();
