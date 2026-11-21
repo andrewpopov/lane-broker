@@ -578,6 +578,12 @@ output as before, so an ownerless `lane undrain` no longer clears another owner'
 `drain-owners/<owner>.json` in the state root. `lane status` lists each active marker with owner, reason and expiry (`drainMarkers` in `--json`), and the
 agent's status shows `claims: paused:draining (bosun)`, naming every owner.
 
+**Drain hook (bosun `drain: kind: exec`).** `lane drain-hook --apply|--lift|--status [--config <dir>] [--root <remoteRoot>]` is a top-level verb (an older lane-broker exits 2 on it) that bosun runs against a runner's agent config (`stateDir` and the agent root come from it). The drain arrives as `BOSUN_DRAIN_ID`, `BOSUN_DRAIN_MODE` (`wait` or `interrupt`), `BOSUN_DRAIN_REASON` and `BOSUN_DRAIN_EXPIRES_AT` (ISO, optional); `BOSUN_DRAIN_OWNER` is not read, the marker is always owner `bosun`. All verbs are idempotent and the agent keeps running: it stops claiming, and running lanes keep heartbeating and finish.
+
+- `--apply` writes the `bosun` marker with the drain id, mode, expiry and a fresh `applied` nonce on every call (extra keys, so an older lane-broker still loads it). Exit 0, or 2 for a missing or invalid variable.
+- `--lift` removes the `bosun` marker. Exit 0, also when there was none.
+- `--status` exits 1 when there is no unexpired `bosun` marker, or it carries another id or mode. It is 75 until the agent's last tick lists this id with this marker's `applied` under `drains` in its status (a host with no live agent counts as observed), so a reapplied id is never acknowledged by an earlier application. Then `interrupt` is 0. `wait` is 0 only when, in addition, every execution record on disk is DONE and no remote (submitter-owned) ticket is leased or queued here. Stale leases and orphaned queue entries are reaped first, and leases and queue are read under the broker lock. Only an entry positively identified as local (a cwd outside `<remote root>/tickets/`, and no `remote-id` naming it) is ignored; one that is malformed, lacks a cwd, or whose ownership cannot be read counts as remote. The marker is read again before a 0 is returned, and a change gives 1 or 75. Any other failure, such as an unreadable agent config, exits 1.
+
 **What bosun reads.** The agent's textfile metrics are the `lane_agent_*` families documented under "Textfile metrics" in
 [Pull agent client core](#pull-agent-client-core-brain-1035) (`lane_agent_last_tick_timestamp_seconds`,
 `lane_agent_executions{subphase}`, `lane_agent_claims_total{answer}`, `lane_agent_listen_up`, `lane_agent_registered`,

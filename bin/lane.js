@@ -69,6 +69,7 @@ function usage() {
   lane reconcile [--now] [--json]
   lane pull check [--json]
   lane agent [--check] [--root <remoteRoot>] [--config <dir>]
+  lane drain-hook --apply|--lift|--status [--root <remoteRoot>] [--config <dir>]
   lane pull gc --queue-url <admin url> [--password-file <file>] [--ca-file <file>] [--rows-after <dur>] [--budget <dur>]
   lane runner [status] [--json]
   lane runner watch
@@ -473,6 +474,10 @@ async function main() {
       if (rest[0] === 'gc') return (await pullGcCommand(rest.slice(1))).exitCode;
       process.stderr.write(`lane pull: ${rest[0] === undefined ? 'missing subcommand' : `unknown subcommand "${rest[0]}"`} (\`check\`, \`gc\`)\n`);
       return 2;
+    }
+    case 'drain-hook': {
+      const { drainHookCommand } = await import('../src/agent/drain-hook.js');
+      return (await drainHookCommand(rest, { remoteRoot: parseRootFlag(rest) || defaultRemoteRoot() })).exitCode;
     }
     case 'agent': {
       const { agentCommand } = await import('../src/agent/cli.js');
