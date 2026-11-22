@@ -7,7 +7,7 @@ After=postgresql.service
 Type=oneshot
 User=postgres
 Group=postgres
-Environment=LANE_QUEUE_URL=postgresql://lane_admin_pitelite@%%2Fvar%%2Frun%%2Fpostgresql/lane_queue
+Environment=LANE_QUEUE_URL=postgresql://lane_admin_pitelite@%%2Fvar%%2Frun%%2Fpostgresql/lane_queue_db
 ExecStart=/opt/lane-dispatch-reap/lane-dispatch-reap.sh
 TimeoutStartSec=30s
 NoNewPrivileges=true

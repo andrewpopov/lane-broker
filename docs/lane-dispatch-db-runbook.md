@@ -10,24 +10,24 @@ and `public`, or any object in `public`, so it refuses a shared application data
 ## Applying migrations
 
 On pitelite the migrations are applied by `lane_migrate`, never by `postgres` or `zirk` (BRAIN-1146). It owns nothing: it is
-`LOGIN NOSUPERUSER NOCREATEROLE`, a member of `lane_definer` with INHERIT and SET, and holds CONNECT and CREATE on `lane_queue`.
+`LOGIN NOSUPERUSER NOCREATEROLE`, a member of `lane_definer` with INHERIT and SET, and holds CONNECT and CREATE on `lane_queue_db`.
 CREATE is required because `functions.sql`'s `CREATE SCHEMA IF NOT EXISTS lane_dispatch` checks it even when the schema exists
 (`tests/lane-owner-apply.test.js`, the BRAIN-1146 case). Created once by a superuser:
 
 ```sql
 CREATE ROLE lane_migrate LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION NOBYPASSRLS CONNECTION LIMIT 2;
 GRANT lane_definer TO lane_migrate WITH INHERIT TRUE, SET TRUE;
-GRANT CONNECT, CREATE ON DATABASE lane_queue TO lane_migrate;
+GRANT CONNECT, CREATE ON DATABASE lane_queue_db TO lane_migrate;
 ```
 
-It has no password. It logs in only as OS `postgres` over pitelite's socket: `local lane_queue lane_migrate peer map=lanequeue`,
+It has no password. It logs in only as OS `postgres` over pitelite's socket: `local lane_queue_db lane_migrate peer map=lanequeue`,
 rendered from zirkbot `ops/pitelite/failover/cluster.toml` (consumer `lane-migrate`) and `fence.py` `PG_IDENT_ROWS`. Apply from a
 lane-broker checkout of the version being deployed, with its dependencies installed:
 
 ```sh
 sudo -u postgres node --input-type=module -e "
 import { connect, applyMigrations } from './src/lane-db.js';
-const c = await connect({ host: '/var/run/postgresql', user: 'lane_migrate', database: 'lane_queue', options: '-c lock_timeout=5s' });
+const c = await connect({ host: '/var/run/postgresql', user: 'lane_migrate', database: 'lane_queue_db', options: '-c lock_timeout=5s' });
 try { console.log(JSON.stringify(await applyMigrations(c))); } finally { await c.end(); }"
 ```
 
@@ -57,7 +57,7 @@ SELECT lane_dispatch.ld_set_principal('lane_agent_<host>', 'agent', '<host>', '{
 SELECT lane_dispatch.ld_set_principal('lane_submit_<name>', 'submit', NULL, '{}', '{}', 1);
 ```
 
-`pg_hba` pins each login to its host: `hostssl lane_queue lane_agent_<host> <host tailnet IP>/32 scram-sha-256`. A login with no
+`pg_hba` pins each login to its host: `hostssl lane_queue_db lane_agent_<host> <host tailnet IP>/32 scram-sha-256`. A login with no
 `lane_dispatch.principals` row (for example the legacy `lane_agent_h1`) is refused by every `ld_*` function.
 
 ## Reading the queue as lane_reader
