@@ -1,0 +1,35 @@
+schema: 1
+contract: 1
+name: lane
+version: 1
+kind: service
+platforms: [darwin]
+compat:
+  bosun: ">=0.1.0"
+  capabilities: [exec-drain]
+params:
+  survivesStop: { type: string, default: "false", overridable: true }
+  runnerPath: { type: string, default: "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", overridable: true }
+setup:
+  argv: ["${self}/bosun/mac-runner-prereqs.sh", "--path", "${param:runnerPath}"]
+  timeoutSeconds: 1800
+run:
+  argv: ["${node}", "${self}/bin/lane.js", "agent"]
+  cwd: "${home}"
+  restart: always
+  stopSignal: SIGTERM
+  stopDeadlineSeconds: 60
+readiness:
+  kind: textfile-fresh
+  file: "${textfileDir}/lane-agent.prom"
+  maxAgeSeconds: 120
+  graceSeconds: 120
+drain:
+  kind: exec
+  argv: ["${node}", "${self}/bin/lane.js", "drain-hook"]
+  ack: exec
+  modes: [wait, interrupt]
+  hookTimeoutSeconds: 60
+resources:
+  class: lane
+  elastic: false

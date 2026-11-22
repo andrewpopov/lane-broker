@@ -1,0 +1,7 @@
+# What lanes need on a Mac lane runner beyond node and lane (BRAIN-1150). Installed by
+# mac-runner-prereqs.sh --install; README "Installing", the lane agent system daemon.
+brew "bash"       # bash 5: test scripts use features /bin/bash 3.2 lacks
+brew "coreutils"  # GNU timeout (--kill-after) and the gnubin tools
+brew "flock"      # flock(1), which macOS does not ship
+brew "python"     # python3 >= 3.11 (tomllib); /usr/bin/python3 is Apple's 3.9
+# numpy and pillow come from PyPI wheels (requirements.lane-runner.txt): Homebrew has no Intel bottles for them.
