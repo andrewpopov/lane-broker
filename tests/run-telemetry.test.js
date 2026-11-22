@@ -139,7 +139,7 @@ test('firstCores is the first reading, not the whole-span average (4 -> 0 -> 0 c
   assert.equal(integratedCpuSeconds(s, 0, 3000), 8);
 });
 
-test('the exit path takes no process-table scan of its own: only the constructor, the early sample and the reap check', { skip: process.platform !== 'darwin' && 'counts ps scans, but readProcessTable reads /proc on Linux (src/descendants.js)' }, async () => {
+test('the exit path takes no whole-table scan of its own: only the constructor, the early sample and the reap check (the single-pid leader read is not a scan)', { skip: process.platform !== 'darwin' && 'counts ps scans, but readProcessTable reads /proc on Linux (src/descendants.js)' }, async () => {
   const f = localEnv(60_000);
   const shimDir = tmpDir('ps-shim');
   const log = path.join(shimDir, 'ps.log');
@@ -157,7 +157,7 @@ test('the exit path takes no process-table scan of its own: only the constructor
     }
   });
   await closed;
-  const calls = fs.readFileSync(log, 'utf8').split('\n').filter((l) => Number(l.split(' ')[0]) === supervisorPid && l.includes('pcpu=,rss=,lstart=,command=')).length;
+  const calls = fs.readFileSync(log, 'utf8').split('\n').filter((l) => Number(l.split(' ')[0]) === supervisorPid && l.includes(' -A -ww -o pid=,ppid=,pgid=,pcpu=,rss=,lstart=,command=')).length;
   assert.equal(calls, 3, `supervisor process-table scans: ${calls}\n${fs.readFileSync(log, 'utf8')}`);
 });
 
