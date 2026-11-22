@@ -389,6 +389,14 @@ test('BRAIN-1266 selectRunner: external load that leaves no admissible room skip
   const floor = await selectRunner(runnersOf('a'), { ...base, sshBin: makeProbeMapSsh({ a: probe(0, elastic) }), reservation: { ...six, minCpuCores: 1.2 } });
   assert.equal(floor.runner, null);
   assert.match(floor.skipped[0].reason, /admissible 1\.50, need 2\)/);
+  const fractional = { capacity: { cpuCores: 6 }, headroom: headroom(1.5) };
+  const full = await selectRunner(runnersOf('a'), { ...base, sshBin: makeProbeMapSsh({ a: probe(0, { ...fractional, headroom: { cpuCores: 1.5, cpuAdmissibleCores: 1.5, memoryBytes: 1e12 } }) }), reservation: { ...six, cpuCores: 1.2 } });
+  assert.equal(full.runner.name, 'a', 'a fractional full claim is not rounded up');
+  const elasticFits = await selectRunner(runnersOf('a'), { ...base, sshBin: makeProbeMapSsh({ a: probe(0, { ...elastic, headroom: { cpuCores: 6, cpuAdmissibleCores: 6, memoryBytes: 1e12 } }) }), reservation: six });
+  assert.equal(elasticFits.runner.name, 'a', 'an elastic runner with no floor in the reservation judges the full claim');
+  const undiscounted = { capacity: { cpuCores: 6 }, headroom: { cpuCores: 6, cpuAdmissibleCores: 6, cpuAdmissibleCoresUndiscounted: 1, laneNice: 10, cpuCoresUndiscounted: 6, memoryBytes: 1e12 } };
+  const overridden = await selectRunner(runnersOf('a'), { ...base, sshBin: makeProbeMapSsh({ a: probe(0, undiscounted) }), reservation: { ...six, cpuCores: 2, niceOverride: 15 } });
+  assert.equal(overridden.runner, null, 'a nice override above laneNice is judged on the undiscounted admissible figure');
   const noField = await selectRunner(runnersOf('a'), { ...base, sshBin: makeProbeMapSsh({ a: probe(0, { capacity: { cpuCores: 6 }, headroom: { cpuCores: 6, memoryBytes: 1e12 } }) }), reservation: six });
   assert.equal(noField.runner.name, 'a');
 });
