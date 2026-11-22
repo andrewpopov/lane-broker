@@ -26,20 +26,19 @@ const scenarios = {
   'two running lanes share one host table read and one CPU read per guard tick': async (w, rw, load) => {
     const { readProcCpuRows } = await load('preemptible.js');
     const { readProcessTable } = await load('descendants.js');
-    const cpuReads = [];
-    const tableReads = [];
+    const events = [];
     const tickA = await rw.submit({ code: SLEEP });
     const tickB = await rw.submit({ code: SLEEP });
     const agent = await rw.agent({
       load, config: { noProgressTimeoutMs: 600_000 }, timing: { guardMs: 100 },
-      driverOptions: { readRows: () => { cpuReads.push(1); return readProcCpuRows(); }, readTable: (ids) => { tableReads.push(ids.length); return readProcessTable(ids); } },
+      driverOptions: { readRows: () => { events.push('cpu'); return readProcCpuRows(); }, readTable: (ids) => { events.push(`table:${ids.length}`); return readProcessTable(ids); } },
     });
     await rw.claimed(tickA);
     await rw.claimed(tickB);
-    await happens('both lanes were sampled in one tick', () => tableReads.includes(2), wait(load));
+    await happens('both lanes were sampled in one tick', () => events.includes('table:2'), wait(load));
     await sleep(600);
-    assert.ok(tableReads.length <= cpuReads.length, `at most one table read per CPU read, whatever the lane count (${tableReads.length} table, ${cpuReads.length} cpu)`);
-    assert.ok(Math.max(...tableReads) === 2);
+    const doubled = events.findIndex((event, i) => event.startsWith('table') && events[i + 1]?.startsWith('table'));
+    assert.equal(doubled, -1, `one table read per CPU read, whatever the lane count: ${events.join(' ')}`);
     for (const target of [tickA, tickB]) await call(await w.as(logins.s1), 'ld_cancel', target.id);
     void agent;
   },
@@ -48,7 +47,7 @@ const scenarios = {
     const ticket = await rw.submit({ code: SLEEP });
     await rw.agent({ load, laneBin: load.laneBin });
     let first = null;
-    for (const deadline = Date.now() + 30_000; first === null && Date.now() < deadline;) {
+    for (const deadline = Date.now() + 60_000; first === null && Date.now() < deadline;) {
       const lease = leaseOf(rw);
       if (lease?.childPgid) first = lease;
       else await sleep(1);

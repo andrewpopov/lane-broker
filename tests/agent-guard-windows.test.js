@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { SLEEP, scenarioSuite } from './agent-run-harness.js';
-import { wait } from './helpers/agent-guard-fixture.js';
+import { wait, runningLane, skewClock } from './helpers/agent-guard-fixture.js';
 
 const EXEC = 'agent/execution.js';
 
@@ -25,12 +25,12 @@ const scenarios = {
   },
 
   'a pull lane still running at maxRunMs is killed by the wall-clock backstop even while it burns CPU': async (w, rw, load) => {
-    const ticket = await rw.submit({ code: 'while (true) {}' });
-    const agent = await rw.agent({ load, config: { maxRunMs: 1500 }, timing: { guardMs: 100 } });
-    const row = await rw.claimed(ticket);
-    await rw.untilGone(agent, rw.execId(row), wait(load));
+    const clock = skewClock();
+    const { ticket, agent, row, execId } = await runningLane(w, rw, load, { code: 'while (true) {}', config: { maxRunMs: 60_000 }, timing: { guardMs: 100 }, now: clock.now });
+    clock.advance(60_000);
+    await rw.untilGone(agent, execId, wait(load));
     const final = await w.ticket(ticket.id);
-    assert.deepEqual([final.result.kind, final.result.exit, final.result.reason, final.result.runLimitMs], ['completed', 124, 'run-limit', 1500]);
+    assert.deepEqual([final.result.kind, final.result.exit, final.result.reason, final.result.runLimitMs], ['completed', 124, 'run-limit', 60_000]);
     assert.match(rw.s3.objects.get(`lane-out/a1/${ticket.id}/e${row.epoch}/log`).body.toString(), /run limit/);
   },
 };

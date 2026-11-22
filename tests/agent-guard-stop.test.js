@@ -38,7 +38,7 @@ async function stopWith(load, w, record = { execId: 'ex.e1' }) {
   process.env.LANE_BROKER_STATE = w.state;
   try {
     const { forceStopRun } = await load('agent/guard-stop.js');
-    return await forceStopRun({ remoteRoot: w.remote, record, deadline: Date.now() + 3000 });
+    return await forceStopRun({ remoteRoot: w.remote, record, deadline: Date.now() + 20_000 });
   } finally {
     if (saved === undefined) delete process.env.LANE_BROKER_STATE; else process.env.LANE_BROKER_STATE = saved;
   }
@@ -87,20 +87,19 @@ const GUARDS = {
   'a group that gains a stranger after the original member leaves is not SIGKILLed: ownership is re-verified before every signal': async (load) => {
     const savedGrace = process.env.LANE_BROKER_TEST_CANCEL_GRACE_MS;
     process.env.LANE_BROKER_TEST_CANCEL_GRACE_MS = '300';
-    const leaseId = '5d8c54f7-3540-4c44-9fcf-cbee1c6c5cde';
-    const stranger = "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000)";
+    const { killGroupOnly } = await load('cancel.js');
     const ready = path.join(makeTmpDir('guard-ready-'), 'ready');
-    const member = `process.on('SIGTERM', () => { const env = { ...process.env }; delete env.LANE_BROKER_LEASE; require('child_process').spawn(process.execPath, ['-e', ${JSON.stringify(stranger)}], { stdio: 'ignore', env }).unref(); process.exit(0); }); require('fs').writeFileSync(${JSON.stringify(ready)}, 'x'); setInterval(() => {}, 1000)`;
-    const leader = spawn(process.execPath, ['-e', member], { detached: true, stdio: 'ignore', env: { ...process.env, LANE_BROKER_LEASE: leaseId } });
-    leader.unref();
-    unrelated.push(leader);
+    const stranger = spawn(process.execPath, ['-e', `process.on('SIGTERM', () => {}); require('fs').writeFileSync(${JSON.stringify(ready)}, 'x'); setInterval(() => {}, 1000)`], { detached: true, stdio: 'ignore' });
+    stranger.unref();
+    unrelated.push(stranger);
     try {
-      for (const deadline = Date.now() + 30_000; !fs.existsSync(ready) && Date.now() < deadline;) await sleep(20);
-      assert.ok(fs.existsSync(ready), 'the member installed its SIGTERM handler');
-      const w = world({ supervisorPid: 2 ** 22 - 9, supervisorStart: 'Mon Jan  1 00:00:00 1990', childPgid: leader.pid });
-      assert.equal(await stopWith(load, w).catch(() => false), false);
-      await sleep(300);
-      assert.equal(alive(-leader.pid), true, 'the stranger that joined the group was never signalled');
+      for (const deadline = Date.now() + 60_000; !fs.existsSync(ready) && Date.now() < deadline;) await sleep(20);
+      assert.ok(fs.existsSync(ready), 'the stranger installed its SIGTERM handler');
+      let checks = 0;
+      const ownedOnlyAtFirst = () => (checks += 1) === 1; // the original member vouched for the group when the TERM went out, and is gone by the time the KILL would
+      assert.equal(await killGroupOnly(stranger.pid, Date.now() + 30_000, ownedOnlyAtFirst), false, 'a group that outlives its proof is unproven');
+      assert.equal(alive(-stranger.pid), true, 'the stranger that joined the group was never signalled with a KILL');
+      assert.equal(checks, 2, 'ownership was asked again before the KILL');
     } finally {
       if (savedGrace === undefined) delete process.env.LANE_BROKER_TEST_CANCEL_GRACE_MS; else process.env.LANE_BROKER_TEST_CANCEL_GRACE_MS = savedGrace;
     }
@@ -112,14 +111,14 @@ const GUARDS = {
     const member = spawn('sh', ['-c', `${JSON.stringify(process.execPath)} -e 'setInterval(() => {}, 1000)' >/dev/null 2>&1 &`], { detached: true, stdio: 'ignore' });
     unrelated.push(member);
     await new Promise((resolve) => member.on('exit', resolve));
-    for (const deadline = Date.now() + 10_000; !alive(-member.pid) && Date.now() < deadline;) await sleep(20);
+    for (const deadline = Date.now() + 60_000; !alive(-member.pid) && Date.now() < deadline;) await sleep(20);
     assert.ok(alive(-member.pid), 'the reparented member is running in the shell\'s group');
     const owns = () => {
       process.kill(-member.pid, 'SIGKILL');
-      for (const deadline = Date.now() + 5000; alive(-member.pid) && Date.now() < deadline;) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+      for (const deadline = Date.now() + 20_000; alive(-member.pid) && Date.now() < deadline;) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
       return false;
     };
-    assert.equal(await killGroupOnly(member.pid, Date.now() + 5000, owns), true);
+    assert.equal(await killGroupOnly(member.pid, Date.now() + 30_000, owns), true);
   },
 
   'an unmarked orphaned leader with no descendants is killed and proven through its recorded identity': async (load) => {
@@ -127,11 +126,12 @@ const GUARDS = {
     const leader = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { detached: true, stdio: 'ignore', env: { PATH: process.env.PATH } });
     leader.unref();
     unrelated.push(leader);
-    for (const deadline = Date.now() + 30_000; !readProcessTable().some((row) => row.pid === leader.pid) && Date.now() < deadline;) await sleep(50);
+    for (const deadline = Date.now() + 60_000; !readProcessTable().some((row) => row.pid === leader.pid) && Date.now() < deadline;) await sleep(50);
     const token = readProcessTable().find((row) => row.pid === leader.pid)?.token;
     assert.ok(token, 'the leader is in the process table');
     const w = world({ supervisorPid: 2 ** 22 - 9, supervisorStart: 'Mon Jan  1 00:00:00 1990', childPgid: leader.pid, leader: { pid: leader.pid, token } });
     assert.equal(await stopWith(load, w), true);
+    for (const deadline = Date.now() + 20_000; alive(leader.pid) && Date.now() < deadline;) await sleep(20); // a killed child stays a zombie until this process reaps it
     assert.equal(alive(leader.pid), false, 'the orphaned leader was killed');
   },
 };

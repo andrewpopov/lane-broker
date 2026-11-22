@@ -3,24 +3,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { logins, call } from './lane-dispatch-fixture.js';
 import { makeTmpDir } from './helpers/tmp.js';
-import { SLEEP, happens, scenarioSuite } from './agent-run-harness.js';
+import { happens, scenarioSuite } from './agent-run-harness.js';
+import { runningLane, PRECONDITION_MS } from './helpers/agent-guard-fixture.js';
 import { RUNNER_SHUTDOWN_REASON, paths, readJsonSafe } from '../src/state.js';
 
-const leaseOf = (rw) => {
-  const dir = paths(rw.ctx.state).leases;
-  const name = fs.existsSync(dir) ? fs.readdirSync(dir).find((n) => n.endsWith('.json')) : undefined;
-  return name ? readJsonSafe(path.join(dir, name)) : null;
-};
 const groupAlive = (pgid) => { try { process.kill(-pgid, 0); return true; } catch { return false; } };
-
-async function runningLane(w, rw, load, { code = SLEEP, ...agentOptions } = {}) {
-  const ticket = await rw.submit({ code });
-  const agent = await rw.agent({ load, ...agentOptions });
-  const row = await rw.claimed(ticket);
-  const execId = rw.execId(row);
-  await happens('the lane is running', () => agent.core.table.get(execId)?.subphase === 'RUNNING' && leaseOf(rw)?.childPgid);
-  return { ticket, agent, row, execId, lease: leaseOf(rw) };
-}
 
 const scenarios = {
   'a heartbeat answering fenced kills the lane and the record, and no ld_finish is ever sent': async (w, rw, load) => {
@@ -44,7 +31,7 @@ const scenarios = {
   'ld_cancel on a running ticket reaches the lane within a heartbeat and finishes cancelled with cancelConfirmed': async (w, rw, load) => {
     const run = await runningLane(w, rw, load);
     await call(await w.as(logins.s1), 'ld_cancel', run.ticket.id);
-    await rw.untilGone(run.agent, run.execId, 8000);
+    await rw.untilGone(run.agent, run.execId, PRECONDITION_MS);
     const final = await w.ticket(run.ticket.id);
     assert.equal(final.state, 'cancelled');
     assert.equal(final.result.kind, 'cancelled');
@@ -61,7 +48,7 @@ const scenarios = {
     assert.equal(groupAlive(run.lease.childPgid), true, 'the lane outlived its agent');
     const second = await rw.agent({ load });
     fs.writeFileSync(release, '');
-    await happens('the adopted lane finished', async () => (await w.ticket(run.ticket.id)).state === 'finished', 20_000);
+    await happens('the adopted lane finished', async () => (await w.ticket(run.ticket.id)).state === 'finished', PRECONDITION_MS);
     await rw.untilGone(second, run.execId);
     const final = await w.ticket(run.ticket.id);
     assert.deepEqual([final.result.kind, final.result.exit], ['completed', 0]);

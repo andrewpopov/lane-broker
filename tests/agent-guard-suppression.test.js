@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { logins, call } from './lane-dispatch-fixture.js';
 import { happens, scenarioSuite, sleep } from './agent-run-harness.js';
-import { wait, groupAlive, runningLane } from './helpers/agent-guard-fixture.js';
+import { wait, groupAlive, runningLane, skewClock } from './helpers/agent-guard-fixture.js';
 
 const EXEC = 'agent/execution.js';
 
@@ -21,8 +21,10 @@ const scenarios = {
       }
     }
     try {
-      const run = await runningLane(w, rw, load, { config: { maxRunMs: 1500 }, timing: { guardMs: 100, heartbeatMs: 100 }, Driver: StuckHeartbeat });
+      const clock = skewClock();
+      const run = await runningLane(w, rw, load, { config: { maxRunMs: 60_000 }, timing: { guardMs: 100, heartbeatMs: 100 }, Driver: StuckHeartbeat, now: clock.now });
       armed = true;
+      clock.advance(60_000);
       await happens('the command group was killed although every heartbeat hangs', () => !groupAlive(run.lease.childPgid), wait(load));
     } finally {
       release();
@@ -30,7 +32,9 @@ const scenarios = {
   },
 
   'a cancel the queue recorded before an agent guard kill finishes is a cancelled ticket, not exit 124': async (w, rw, load) => {
-    const run = await runningLane(w, rw, load, { config: { maxRunMs: 1500 }, timing: { guardMs: 100, heartbeatMs: 3_600_000 } });
+    const clock = skewClock();
+    const run = await runningLane(w, rw, load, { config: { maxRunMs: 60_000 }, timing: { guardMs: 100, heartbeatMs: 3_600_000 }, now: clock.now });
+    clock.advance(60_000);
     await happens('the guard decided to kill', () => run.agent.core.table.get(run.execId)?.guardKill, wait(load));
     await call(await w.as(logins.s1), 'ld_cancel', run.ticket.id);
     await rw.untilGone(run.agent, run.execId, wait(load));

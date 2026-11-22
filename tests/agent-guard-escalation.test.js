@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import { happens, scenarioSuite, sleep } from './agent-run-harness.js';
-import { wait, groupAlive, runningLane } from './helpers/agent-guard-fixture.js';
+import { wait, groupAlive, runningLane, skewClock } from './helpers/agent-guard-fixture.js';
 
 const EXEC = 'agent/execution.js';
 
@@ -11,9 +11,11 @@ const scenarios = {
     const savedGrace = process.env[graceVar];
     process.env[graceVar] = '100';
     const { isProcessAlive } = await load('process-liveness.js');
-    const run = await runningLane(w, rw, load, { config: { maxRunMs: 1500 }, timing: { guardMs: 100, guardEscalateMs: 400 } });
+    const clock = skewClock();
+    const run = await runningLane(w, rw, load, { config: { maxRunMs: 60_000 }, timing: { guardMs: 100, guardEscalateMs: 400 }, now: clock.now });
     const { supervisorPid, supervisorStart, childPgid } = run.lease;
     process.kill(supervisorPid, 'SIGSTOP');
+    clock.advance(60_000);
     try {
       await rw.untilGone(run.agent, run.execId, wait(load));
     } finally {
@@ -29,8 +31,10 @@ const scenarios = {
   'a stop that never completes hits its deadline, is persisted unproven, and the RUNNING path stops heartbeating': async (w, rw, load) => {
     const graceVar = 'LANE_BROKER_TEST_CANCEL_GRACE_MS';
     process.env[graceVar] = '100';
-    const run = await runningLane(w, rw, load, { config: { maxRunMs: 1500 }, timing: { guardMs: 100, guardEscalateMs: 200, guardStopMs: 200, guardStopSlackMs: 200, heartbeatMs: 100 }, driverOptions: { forceStop: () => new Promise(() => {}) } });
+    const clock = skewClock();
+    const run = await runningLane(w, rw, load, { config: { maxRunMs: 60_000 }, timing: { guardMs: 100, guardEscalateMs: 200, guardStopMs: 200, guardStopSlackMs: 200, heartbeatMs: 100 }, driverOptions: { forceStop: () => new Promise(() => {}) }, now: clock.now });
     process.kill(run.lease.supervisorPid, 'SIGSTOP');
+    clock.advance(60_000);
     try {
       await happens('the stop was persisted unproven after its deadline', () => run.agent.core.table.get(run.execId)?.guardStop?.unproven === true, wait(load));
       await sleep(300);
