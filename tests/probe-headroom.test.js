@@ -169,3 +169,28 @@ test('(f) BRAIN-743: an unenforced (nice-only) runner is judged on the undiscoun
   assert.equal(runnerRoom(need, older).room, true, 'no undiscounted figure: discounted figure kept');
   assert.equal(runnerRoom(need, older).cpuFree, 2.3);
 });
+
+test('BRAIN-1266: admissible CPU is budget minus external load plus the idle overshoot, undiscounted', async () => {
+  const { state } = freshEnv();
+  const now = Date.now();
+  const lease = { id: 'lease-x', key: 'k:x', weight: 2, resources: { cpuCores: 2 }, observedCpuCores: 2.5, observedAt: now };
+  // 9.3 busy, 2.5 of it the lease's own, a 4-core niced non-lane row (preemptible) ignored: external 6.8 -> 12 - 6.8 + 1
+  const both = await headroomBoth(state, [lease], measuring(9.3, window(row(4242, 15, 4))), now);
+  assert.ok(Math.abs(both.cpuAdmissibleCores - (BUDGET - 6.8 + cfg.resourceIdleOvershootCores)) < 1e-9, `got ${both.cpuAdmissibleCores}`);
+  const probed = probeHeadroom({ cpuBudgetCores: BUDGET, reservedCpuCores: 0 }, cfg, true, 0, both);
+  assert.ok(Math.abs(probed.cpuAdmissibleCores - 6.2) < 1e-9);
+});
+
+test('BRAIN-1266: admissible CPU is null when a held lease has no fresh CPU observation, and omitted when not enforced', async () => {
+  const { state } = freshEnv();
+  const now = Date.now();
+  const unobserved = { id: 'lease-y', key: 'k:y', weight: 2, resources: { cpuCores: 2 } };
+  const stale = { id: 'lease-z', key: 'k:z', weight: 2, resources: { cpuCores: 2 }, observedCpuCores: 2, observedAt: now - 120_000 };
+  for (const held of [[unobserved], [stale]]) {
+    const both = await headroomBoth(state, held, measuring(8), now);
+    assert.equal(both.cpuAdmissibleCores, null);
+    assert.equal('cpuAdmissibleCores' in probeHeadroom({ cpuBudgetCores: BUDGET, reservedCpuCores: 0 }, cfg, true, 0, both), false);
+  }
+  const measured = await headroomBoth(state, [], measuring(8), now);
+  assert.equal(probeHeadroom({ cpuBudgetCores: BUDGET }, cfg, false, 0, measured), null);
+});

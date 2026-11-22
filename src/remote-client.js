@@ -148,6 +148,18 @@ function cpuNeedOf(reservation, probe) {
 }
 
 /**
+ * BRAIN-1266: a TEMPORARY verdict (never `neverFits`): load outside the broker leaves this runner's admissible CPU below the ticket's
+ * need even once its lanes drain, so queueing here would wait on that load. Whole cores, since admission grants whole cores.
+ */
+function externalLoadStarves(reservation, probe) {
+  const admissible = probe.headroom?.cpuAdmissibleCores;
+  const need = cpuNeedOf(reservation, probe);
+  if (!Number.isFinite(admissible) || !Number.isFinite(need)) return null;
+  const cores = Math.ceil(need);
+  return cores > admissible ? `external load leaves no room (admissible ${admissible.toFixed(2)}, need ${cores})` : null;
+}
+
+/**
  * BRAIN-405: true iff the runner has REAL room for this ticket right now: free CPU (the probe's measured `headroom`, else its
  * CPU budget minus reserved; the undiscounted figure on an unenforced runner) covers the ticket's CPU (its elastic floor on an elastic runner) and available memory covers its
  * memory. An unmeasured figure never counts against a runner (an older probe or shadow mode degrades to "assume room").
@@ -428,7 +440,9 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason: `queued: ${probe.queued}${overCap ? ` (over maxRemoteQueue ${maxRemoteQueue})` : ''}` });
       const never = Boolean(reservation && neverFits(reservation, probe));
       skipped[skipped.length - 1].neverFits = never;
-      const fits = !never;
+      const starved = !never && reservation ? externalLoadStarves(reservation, probe) : null;
+      if (starved) skipped[skipped.length - 1].reason = `${skipped[skipped.length - 1].reason}; ${starved}`;
+      const fits = !never && !starved;
       const queueable = Number.isInteger(probe.queued) && probe.queued > 0 && probe.queued <= maxRemoteQueue;
       if (fits) {
         const cand = candidate(probe, 0, false);
@@ -450,6 +464,12 @@ export async function selectRunner(runners, opts = {}) {
     noteUp(cand);
     if (observed) {
       skipped.push({ name: runner.name, reason: 'observed only (the ticket is queued there)' });
+      continue;
+    }
+    const starved = reservation ? externalLoadStarves(reservation, probe) : null;
+    if (starved) {
+      skipped.push({ name: runner.name, reason: starved, neverFits: false });
+      busySeq.push(cand);
       continue;
     }
     if (!room) {

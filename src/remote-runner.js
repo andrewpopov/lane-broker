@@ -29,7 +29,7 @@ import { readAttempt, listAttemptsStrict } from './attempts.js';
 import { listQueue, listQueueStrict, queueReadable, dequeueSync, HELD_STATES } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
 import { createOwnedTmpDir, gcRemoteTickets, removeDetached, tmpEnv } from './gc.js';
-import { writeBrokerLog, cpuHeadroomCores } from './admission.js';
+import { writeBrokerLog, cpuHeadroomCores, hostCpuLoad, freshObservedCores } from './admission.js';
 import { measureHostCpuReadOnly } from './cpu.js';
 import { preemptibleCores } from './preemptible.js';
 import { starvedStaleMs } from './external-cpu.js';
@@ -870,6 +870,7 @@ export function probeHeadroom(resources, cfg, enforced, loadAvg1 = os.loadavg()[
     // BRAIN-506: the nice the discount assumed, and the same projection with no discount, so a client whose ticket runs at a higher nice
     // than laneNice (which admission would discount less) can judge room without the discount. Absent when CPU was not measured.
     ...(measured ? { laneNice: cfg.laneNice, cpuCoresUndiscounted: Math.max(0, cpuHeadroom.cpuCoresUndiscounted) } : {}),
+    ...(measured && Number.isFinite(cpuHeadroom.cpuAdmissibleCores) ? { cpuAdmissibleCores: cpuHeadroom.cpuAdmissibleCores } : {}),
     memoryBytes: Number.isFinite(resources.availableMemoryBytes) ? Math.max(0, resources.availableMemoryBytes - cfg.memoryReserveBytes) : null,
   };
 }
@@ -902,7 +903,18 @@ export async function probeCpuHeadroom(root, cfg, heldLeases, { now = Date.now()
   // a partial process table can only shrink the discount; the busy baseline is always the host counters
   const preemptible = discountable ? Math.min(preemptibleCores({ ...base.procWindow, laneNice: cfg.laneNice, niceMin: cfg.preemptibleNiceMin, heldLeases }), base.hostBusyCores) : 0;
   const headroomAt = (preemptibleBusyCores) => cpuHeadroomCores({ hostBusyCores: base.hostBusyCores, preemptibleBusyCores, cores: base.cores }, heldLeases, cfg, now);
-  return { cpuCores: headroomAt(preemptible), cpuCoresUndiscounted: headroomAt(0) };
+  return { cpuCores: headroomAt(preemptible), cpuCoresUndiscounted: headroomAt(0), cpuAdmissibleCores: admissibleCpuCores(base, heldLeases, cfg, now) };
+}
+
+/**
+ * BRAIN-1266: the most cores a new ticket could be admitted with once this broker's held leases drain: the budget minus load outside
+ * the broker (undiscounted, as the scheduler's headFutility judges it) plus the idle overshoot admission tolerates. Null unless every
+ * held lease has a fresh CPU observation, since an unobserved lane's CPU would otherwise read as external load.
+ */
+function admissibleCpuCores(base, heldLeases, cfg, now) {
+  if (heldLeases.some((lease) => freshObservedCores(lease, now) === null)) return null;
+  const { externalBusy, budget } = hostCpuLoad({ hostBusyCores: base.hostBusyCores, preemptibleBusyCores: 0, cores: base.cores }, heldLeases, cfg, now);
+  return Math.max(0, budget - externalBusy + cfg.resourceIdleOvershootCores);
 }
 
 /** The have-query's stdin cap: eight megabytes holds ~120k hashes, far more than any snapshot has cacheable files. */
