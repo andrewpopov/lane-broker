@@ -1016,6 +1016,10 @@ BEGIN
       END IF;
       p_result := p_result || jsonb_build_object('requeuesExhausted', true, 'requeues', v_t.requeues);
     END IF;
+    -- PKG-397: the agent's own guard kill (no-progress, silence, run limit) is a completed-124 result; a cancel the queue recorded first wins, whatever the agent last heard.
+    IF p_result ? 'guard' AND v_t.cancel_requested THEN
+      p_result := (p_result - 'guard' - 'reason' - 'noProgressTimeoutMs' - 'silenceTimeoutMs' - 'runLimitMs') || jsonb_build_object('kind', 'cancelled', 'exit', null, 'cancelConfirmed', true);
+    END IF;
     v_state := CASE WHEN p_result->>'kind' = 'cancelled' THEN 'cancelled' ELSE 'finished' END;
     UPDATE lane_dispatch.tickets SET state = v_state, result = (p_result - 'author') || jsonb_build_object('epoch', p_epoch), finished_at = lane_dispatch.now() WHERE id = p_id;
     RETURN jsonb_build_object('fenced', false, 'state', v_state);

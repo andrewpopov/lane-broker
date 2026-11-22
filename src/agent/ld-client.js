@@ -130,10 +130,11 @@ export class LdClient {
     this.#tail = this.#tail.then(turn);
   }
 
-  #run(name, args, { persist, live } = {}) {
+  /** `live()` is asked before the first send, so a NOT_LIVE answer always means "never sent"; only a caller that declares its call dispensable (`dropWhenNotLive`) has it asked again before every retry too. */
+  #run(name, args, { persist, live, dropWhenNotLive = false } = {}) {
     let sent = false;
     return this.#submit(() => {
-      if (!sent && live && !live()) return NOT_LIVE;
+      if (live && !live() && (!sent || dropWhenNotLive)) return NOT_LIVE;
       sent = true;
       return this.#sql(name, args);
     }, persist);

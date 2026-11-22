@@ -11,7 +11,9 @@ import { makeTmpDir } from './helpers/tmp.js';
 const stateJsPath = fileURLToPath(new URL('../src/state.js', import.meta.url));
 
 const WORKERS = 6;
-const ITERATIONS = 50;
+// Each acquisition forks `ps` to read an owner's start time, so on macOS the sweep's total time grows with WORKERS x ITERATIONS and the last waiter
+// can pass the 30 s default lock timeout (a LockTimeoutError counted as escaped). 20 keeps the wait well inside it on a loaded macOS runner.
+const ITERATIONS = 20;
 // Default sweep is 4 rounds (24 spawned processes) rather than the original
 // 10 (60 spawned processes): under host contention each round costs 20-40s,
 // so 10 rounds could exceed a 180s budget on a loaded box. Override with

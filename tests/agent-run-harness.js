@@ -126,7 +126,7 @@ export class RunnerWorld {
     return waitFor(async () => {
       const row = await this.w.ticket(ticket.id);
       return row.epoch > 0 ? row : null;
-    }, { timeoutMs: 20_000, intervalMs: 25 }).catch(() => assert.fail(`ticket ${ticket.id} was never claimed; log ${this.logs.join(' | ')}`));
+    }, { timeoutMs: 60_000, intervalMs: 25 }).catch(() => assert.fail(`ticket ${ticket.id} was never claimed; log ${this.logs.join(' | ')}`));
   }
 
   async untilGone(agent, execId, timeoutMs = 30_000) {

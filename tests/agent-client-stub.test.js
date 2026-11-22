@@ -96,20 +96,51 @@ test('a call whose live() turns false is resolved without being sent, and persis
   assert.equal(stub.names().at(-1), 'ld_heartbeat');
 });
 
-test('a call that has been sent keeps retrying to a real answer when live() turns false meanwhile', async () => {
-  let registers = 0;
+const KEEP_CLAIM = 'a claim that has been sent keeps retrying to its answer, and persists it, when live() turns false meanwhile';
+
+async function claimKeptToAnswer(Client) {
+  let claims = 0;
   let alive = true;
-  let finishes = 0;
-  const stub = makeStubPg({ answers: {
-    ld_register: () => { if (++registers > 1) alive = false; return { host: 'a1', max_claims: 2, protocol_min: 1 }; },
-    ld_finish: () => { if (finishes++ === 0) throw sqlError('57P01'); return { fenced: false, state: 'finished' }; },
-  } });
-  const { client } = newClient(stub);
+  let persisted = 0;
+  const stub = makeStubPg({ answers: { ld_claim: () => { if (claims++ === 0) { alive = false; throw sqlError('57P01'); } return { status: 'none' }; } } });
+  const { client } = newClient(stub, {}, Client);
   await client.open();
-  const answer = await client.finish(ID, 1, TOKEN, { kind: 'ok' }, { live: () => alive });
-  assert.deepEqual(answer, { fenced: false, state: 'finished' });
-  assert.equal(alive, false, 'live() did turn false during the reconnect');
-  assert.equal(stub.names().filter((n) => n === 'ld_finish').length, 2);
+  const answer = await client.claim('44444444-4444-4444-8444-444444444444', 8, 1e9, [], null, { live: () => alive, persist: () => { persisted += 1; } });
+  assert.deepEqual(answer, { status: 'none' }, 'the sent claim was retried to its real answer');
+  assert.equal(persisted, 1, 'and its answer was persisted');
+  assert.equal(stub.names().filter((n) => n === 'ld_claim').length, 2);
+}
+
+test(KEEP_CLAIM, () => claimKeptToAnswer(LdClient));
+
+test(`canary: with every call dropped on retry, "${KEEP_CLAIM}" fails on its own assertion`, async () => {
+  const mutant = await importMutant(LD_CLIENT, [LIVE_CHECK, 'if (live && !live()) return NOT_LIVE;']);
+  const failure = await claimKeptToAnswer(mutant.LdClient).then(() => null, (err) => err);
+  assert.ok(failure, 'the scenario still passed without its guard, so it proves nothing');
+  assert.equal(failure.code, 'ERR_ASSERTION', failure.stack);
+});
+
+const RETRY_DROP = 'a call that declares itself dispensable is dropped on its next retry once live() turns false, and nothing further is sent';
+
+async function droppedOnRetry(Client) {
+  let heartbeats = 0;
+  let wanted = true;
+  const stub = makeStubPg({ answers: { ld_heartbeat: () => { heartbeats += 1; wanted = false; if (heartbeats > 4) return { fenced: false, cancel: false }; throw sqlError('57P01'); } } });
+  const { client } = newClient(stub, {}, Client);
+  await client.open();
+  const answer = await client.heartbeat(ID, 1, TOKEN, { live: () => wanted, dropWhenNotLive: true });
+  assert.deepEqual(answer, NOT_LIVE, 'the retry was dropped');
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(heartbeats, 1, 'no heartbeat was sent after live() turned false');
+}
+
+test(RETRY_DROP, () => droppedOnRetry(LdClient));
+
+test(`canary: with live() asked only before the first send, "${RETRY_DROP}" fails on its own assertion`, async () => {
+  const mutant = await importMutant(LD_CLIENT, [LIVE_CHECK, 'if (live && !live() && !sent) return NOT_LIVE;']);
+  const failure = await droppedOnRetry(mutant.LdClient).then(() => null, (err) => err);
+  assert.ok(failure, 'the scenario still passed without its guard, so it proves nothing');
+  assert.equal(failure.code, 'ERR_ASSERTION', failure.stack);
 });
 
 test('a LISTEN failure after startup is logged and recorded in status.json even with no onWake from the caller', async () => {
@@ -270,7 +301,7 @@ test(`canary: with the null-client guard removed, "${RACE}" fails on its own ass
 });
 
 const LIVE_RACE = 'a live()-guarded call whose connection dies right after register is not sent once live() turns false';
-const LIVE_CHECK = 'if (!sent && live && !live()) return NOT_LIVE;';
+const LIVE_CHECK = 'if (live && !live() && (!sent || dropWhenNotLive)) return NOT_LIVE;';
 
 async function liveRechecked(Client) {
   let registers = 0;

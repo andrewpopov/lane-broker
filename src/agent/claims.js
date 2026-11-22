@@ -52,7 +52,7 @@ const clampMem = (bytes) => Math.min(Math.max(0, Math.floor(bytes)), MAX_FREE_ME
 
 const UNADMITTED_SUBPHASES = new Set(['FETCHING', 'STARTING', 'SPAWNING', 'RUNNING']);
 
-const readLaneId = (remoteRoot, execId) => {
+export const readLaneId = (remoteRoot, execId) => {
   try {
     return fs.readFileSync(path.join(path.resolve(remoteRoot), 'tickets', execId, 'remote-id'), 'utf8').trim() || null;
   } catch {
