@@ -1354,7 +1354,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   }
 
   if (!rebind) {
-    const skippedSummary = () => (skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : 'no runners configured');
+    const skippedSummary = () => (skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : pullRunners(globalCfg).length > 0 ? 'no push runner configured' : 'no runners configured');
     const route = await placeForPull({
       root,
       pushChosen: Boolean(runner),
@@ -1364,6 +1364,9 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       locallyIneligible: () => localIneligibility() || isDispatchOnly(globalCfg),
       couldRunLocally: async () => (await couldAdmitNow(root, globalCfg, enriched)).admit || (await couldBypassNow(root, globalCfg, enriched)).admit,
     });
+    if (route.reason && route.route === 'legacy' && pushRunners(globalCfg).length === 0) {
+      return fallbackOrRefuse(null, route.reason, { rebindable: true, noRunner: true, retryable: true });
+    }
     if (route.reason && route.route === 'legacy') {
       const line = `lane: pull-dispatch: ${route.reason}; using the push flow\n`;
       process.stderr.write(line);

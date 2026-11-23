@@ -142,7 +142,16 @@ const SCENARIOS = {
     await (await w.su()).query("UPDATE lane_dispatch.principals SET max_claims = 0 WHERE kind = 'agent'");
     const res = await fx.run();
     assert.equal(res.code, 76, res.stderr);
+    assert.match(res.stderr, /no push runner configured/);
     assert.equal((await (await w.su()).query('SELECT count(*)::int AS n FROM lane_dispatch.tickets')).rows[0].n, 0);
+  },
+
+  'a pull-only host whose placement probe keeps failing refuses 76 saying pull dispatch is unavailable, not that no runners are configured (BRAIN-1275)': async (load, w, t) => {
+    const fx = await pullE2E(t, w, { load, globalExtra: DISPATCH_ONLY, queueFail: 'ld_placeable' });
+    const res = await fx.run();
+    assert.equal(res.code, 76, res.stderr);
+    assert.match(res.stderr, /pull dispatch unavailable: ld_placeable failed/);
+    assert.doesNotMatch(res.stderr, /no runners configured/);
   },
 
   'T32: a withdraw the queue committed on a dispatch-only host is a retryable refusal, exit 76': async (load, w, t) => {
@@ -335,7 +344,8 @@ const CANARIES = [
   [NOT_PREPARED, ...supervisor('if (!(await proveNeverEnqueued(ctx)).proof) {', 'if (true) {')],
   [NOT_PREPARED, ...pullTicket('    await persistPull(run, { neverEnqueued: true });\n', '')],
 
-  ['T32: no eligible principal on a dispatch-only host is a retryable refusal, exit 76, and nothing is enqueued', ...supervisor('{ rebindable: true, noRunner: true, retryable: true }', '{ rebindable: true, noRunner: true, retryable: false }')],
+  ['T32: no eligible principal on a dispatch-only host is a retryable refusal, exit 76, and nothing is enqueued', ...supervisor('`${skippedSummary()}; ${route.reason}`, { rebindable: true, noRunner: true, retryable: true }', '`${skippedSummary()}; ${route.reason}`, { rebindable: true, noRunner: true, retryable: false }')],
+  ['a pull-only host whose placement probe keeps failing refuses 76 saying pull dispatch is unavailable, not that no runners are configured (BRAIN-1275)', ...supervisor("    if (route.reason && route.route === 'legacy' && pushRunners(globalCfg).length === 0) {", "    if (false) {")],
   ['T32: a withdraw the queue committed on a dispatch-only host is a retryable refusal, exit 76', ...supervisor("'withdrawn from the pull queue', { neverStarted: true, noRunner: true, retryable: true }", "'withdrawn from the pull queue', { neverStarted: true, noRunner: true, retryable: false }")],
   ['a ticket nobody claims within its queued timeout is withdrawn and, where this host may run it, runs locally', ...pullTicket('return queuedTooLong(run, attempt) ? expireQueued(run, attempt) :', 'return false ? expireQueued(run, attempt) :')],
   ['T2: while the queue has not committed the withdraw the command never runs locally and the supervisor keeps waiting', ...pullTicket("if (!(await withdrawLocked(run)).proof) return { state: 'queued', next: run.cfg.pollMs };", 'if (false) return { state: \'queued\', next: run.cfg.pollMs };')],
