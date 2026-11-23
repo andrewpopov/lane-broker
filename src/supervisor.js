@@ -1089,18 +1089,22 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     return toolsOnPath(required, process.env.PATH).length === required.length;
   };
   let movedByPullFallback = false;
-  const pullFallbackNow = (onPullUnreachablePath) => movedByPullFallback || (onPullUnreachablePath && localFallbackActive(root, globalCfg, enriched) && requiredToolsPresent());
+  let onPullUnreachablePath = false;
+  const pullFallbackNow = () => movedByPullFallback || (onPullUnreachablePath && localFallbackActive(root, globalCfg, enriched) && requiredToolsPresent());
+  const fallbackFromPull = (pullUnreachable, runner, reason, options) => {
+    onPullUnreachablePath = pullUnreachable;
+    return fallbackOrRefuse(runner, reason, options);
+  };
   const localIneligibility = () => localIneligibilityOf(enriched, globalCfg, cpuLimit);
 
   /** `rebindable`: this fallback is only "no runner had room right now", so a later probe may still find one.
    *  `retryWhenBlocked`: a runner proved it never started the ticket (rejecting it included), so while this machine cannot admit it
    *  either, another runner may take it (BRAIN-727).
    *  `noRunner`: the fallback is "the fleet had no usable runner", which a `localRefused` lane reports as retryable. */
-  async function fallbackOrRefuse(runner, reason, { rebindable = false, retryWhenBlocked = false, neverStarted = false, noRunner = false, retryable = noRunner, failureKind, alreadyLocal = false, pullUnreachable = false } = {}) {
+  async function fallbackOrRefuse(runner, reason, { rebindable = false, retryWhenBlocked = false, neverStarted = false, noRunner = false, retryable = noRunner, failureKind } = {}) {
     assertPullFallbackAllowed();
     if (rebind) return abandonRebind(runner, reason, { neverStarted: neverStarted || withdrawn === null });
-    movedByPullFallback ||= alreadyLocal;
-    const fb = alreadyLocal ? { ok: true, attempt: readAttempt(root, enriched.id) } : await fallbackToLocal(root, enriched.id, reason);
+    const fb = movedByPullFallback ? { ok: true, attempt: readAttempt(root, enriched.id) } : await fallbackToLocal(root, enriched.id, reason);
     if (!fb.ok) {
       if (fb.cancelled) {
         await publishAndExit(0, () => {
@@ -1112,7 +1116,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     }
 
     const dispatchOnly = isDispatchOnly(globalCfg);
-    const pullFallback = pullFallbackNow(pullUnreachable);
+    const pullFallback = pullFallbackNow();
     const fallbackIneligibility = () => localIneligibilityOf(enriched, globalCfg, cpuLimit, { pullFallback });
     const refusedHere = dispatchOnly || (!pullFallback && locallyRefusedNow(enriched, globalCfg));
     const otherwiseIneligible = fallbackIneligibility();
@@ -1339,7 +1343,10 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     const exitCode = pullExitCode(outcome);
     if (outcome.outcome === 'unresolved') return exitUnresolved(`pull dispatch unresolved: ${outcome.reason}${outcome.error ? ` (${outcome.error})` : ''}`, exitCode);
     if (exitCode !== undefined) return exitSettled(exitCode);
-    if (outcome.outcome === 'local-fallback') return fallbackOrRefuse(null, PULL_UNREACHABLE_REASON, { alreadyLocal: true });
+    if (outcome.outcome === 'local-fallback') {
+      movedByPullFallback = true;
+      return fallbackFromPull(true, null, PULL_UNREACHABLE_REASON, {});
+    }
     if (outcome.outcome === 'withdrawn') {
       const committed = outcome.proof === true || (await withdrawPullQueued(ctx)).proof;
       if (!committed) {
@@ -1364,7 +1371,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       await publishAndExit(gen, () => remoteCancelledResult(enriched.id, attemptStartedAt));
       return { fallback: false };
     }
-    return fallbackOrRefuse(null, reason, { neverStarted: true, noRunner: true, retryable: true, pullUnreachable: true });
+    return fallbackFromPull(true, null, reason, { neverStarted: true, noRunner: true, retryable: true });
   }
 
   let pullUnavailable = false;
@@ -1403,7 +1410,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     const reason = skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : 'no runners configured';
     // every configured runner is too small for this ticket for good: no retry will place it
     const neverPlaceable = skipped.length > 0 && skipped.length === pushRunners(globalCfg).length && skipped.every((s) => s.neverFits === true);
-    return fallbackOrRefuse(null, reason, { rebindable: true, noRunner: true, retryable: !neverPlaceable, pullUnreachable: pullUnavailable });
+    return fallbackFromPull(pullUnavailable, null, reason, { rebindable: true, noRunner: true, retryable: !neverPlaceable });
   }
 
   if (speed && !busyQueuedAt) {
