@@ -5,7 +5,9 @@ import { createAttempt, readAttempt, updateAttempt } from '../../src/attempts.js
 import { atomicWriteJson, paths, ensureStateDirs, readJsonSafe } from '../../src/state.js';
 import { buildExecHeader } from '../../src/remote-client.js';
 import { buildManifest } from '../../src/remote-manifest.js';
-import { createS3Client } from '../../src/s3-client.js';
+import assert from 'node:assert/strict';
+import { QueueError } from '../../src/queue-client.js';
+import { createS3Client, S3Error } from '../../src/s3-client.js';
 import { makeTmpDir } from './tmp.js';
 import { sha256Hex } from '../../src/s3-presign.js';
 import { freshEnv, scaledMs } from '../helpers.js';
@@ -115,3 +117,11 @@ export function definePullSuite(title, scenarios, canaries) {
     }
   });
 }
+
+export const transportError = new QueueError('ld_get failed: connection reset', { code: 'ECONNRESET', cause: new Error('reset') });
+export const deadQueue = (fx) => ({ ...fx.queue, ...Object.fromEntries(['get', 'cancel', 'withdraw', 'queueRef', 'enqueueFenced'].map((name) => [name, async () => { throw transportError; }])) });
+export const advancing = (fx, limit = 20) => {
+  const sleeps = [];
+  return { sleeps, sleep: async (ms) => { assert.ok(sleeps.push(ms) <= limit, 'the run never gave up on the dead queue'); fx.clock.now += ms; } };
+};
+export const prepareOver = (fx, over) => fx.prepareRetrying({ s3: { ...fx.s3, putObjectFromFile: async () => { throw new S3Error('s3 PUT answered 503', { status: 503 }); } }, ...over });
