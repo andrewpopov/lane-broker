@@ -1693,10 +1693,12 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     // head's own arithmetic, so those keep today's handling.
     // BRAIN-805: past the starvation horizon a projected verdict stops excusing backfill, or the head never earns its reservation.
     const agedProjection = held.length > 0 && waitedMs(headTicket, nowEff) >= starvationHorizonMs(cfg);
-    const headFutile =
-      cfg.schedulerMode === 'active' && ticket.id === headTicket.id && !headConflicted && !agedProjection && !cpuDecision.admit && (cpuDecision.cpuReason === 'projected-over-budget' || cpuDecision.cpuReason === 'ok')
+    // BRAIN-1266: external CPU load is no lane's to drain, so an aged head it alone rules out stops holding its reservation; an aged memory projection still does not.
+    const futility =
+      cfg.schedulerMode === 'active' && ticket.id === headTicket.id && !headConflicted && !cpuDecision.admit && (cpuDecision.cpuReason === 'projected-over-budget' || cpuDecision.cpuReason === 'ok')
         ? headFutility(cfg, headTicket, held, cpuSample, cpuDecision, memInfo, now)
         : null;
+    const headFutile = agedProjection && futility?.cause !== 'cpu' ? null : futility;
     const ownAgedPoll = agedProjection && ticket.id === headTicket.id;
     const futileView = headFutile ?? (!ownAgedPoll && resourceFutile(resourceRecord, cfg, now) ? { cause: resourceRecord.futile, headCpu: resourceRecord.headCpu } : null);
     if (shadow.inputs) {

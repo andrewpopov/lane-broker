@@ -199,6 +199,19 @@ order of magnitude on macOS. `capacity: "auto"` derives the legacy weight cap
 from the detected CPU budget. A numeric capacity remains supported as an
 additional compatibility cap.
 
+`lane remote-probe` also reports `headroom.cpuAdmissibleCores` and
+`headroom.cpuAdmissibleCoresUndiscounted` (BRAIN-1266): the CPU budget minus load
+outside the broker plus `resourceIdleOvershootCores`, with and without the
+preemptible discount, i.e. the most cores a new ticket could be admitted with once
+the runner's own leases drain. It is omitted when budgets are not enforced, CPU was
+not measured, or any held lease's CPU is unobserved. External load moves, so this is
+a *temporary* verdict, never never-fits: placement skips a runner whose figure is
+below the ticket's need (the claim, or the elastic floor rounded up to whole cores;
+the undiscounted figure exactly when `runnerRoom` uses it) for this placement only,
+never queues on it, and the ticket is re-probed on the next rebind tick. A lane that
+cannot run locally may still wait on it as the best busy runner. Seen 2026-11-22: a
+6-core lane queued on a 6-core runner with 3.7 cores of bot load waited 400+ minutes.
+
 `lane remote-probe` reports `capacity.memoryAdmissibleBytes` (BRAIN-653): the most
 memory a new ticket could ever be admitted with once the runner's own leases drain,
 that is available memory plus the memory its leases observably hold, minus
@@ -2043,10 +2056,10 @@ ending in strict FIFO for that head once spent:
   while its latest verdict is fresh, and each futile verdict resets its count.
   With leases held that verdict is a *projection*, and on macOS (vm_stat
   available memory, RSS that under-counts what a lane tree frees) it can be
-  wrong for hours. **An aged head is judged futile only on a drained broker**
+  wrong for hours. **An aged head is judged memory-futile only on a drained broker**
   (BRAIN-805): once a head has waited the starvation horizon (3 x
   `priorityAgeMaxMs`, default 60 min, the same bound as "Priority" below), a
-  denial while lanes are held is recorded as an ordinary resource denial, so it
+  memory denial while lanes are held is recorded as an ordinary resource denial, so it
   earns its reservation after `resourceSkipLimit` overtakes and the host drains
   for it. With nothing held the verdict is a direct observation: if the head
   still does not fit, it is futile again and backfill reopens until its next
@@ -2057,6 +2070,10 @@ ending in strict FIFO for that head once spent:
   that fits nowhere on this host is the submitter's rebalance, not this rule.
   Seen on zirkbot 2026-11-03: a 6 GiB train lane was memory-futile on every poll
   for 399 minutes while smaller lanes backfilled one after another.
+  A CPU verdict stays exact with lanes held, because every held lease's CPU must be
+  observed before futility is judged, so an aged head that external CPU alone rules
+  out is still futile (BRAIN-1266): on 2026-11-22 a 6-core head kept its reservation
+  for about 6 hours with only a 0.5-core lane held and blocked everything behind it.
 
 **Express admission** (BRAIN-551). A ticket expected to run under `expressMaxMs`
 (default 30000) starts past a waiting head as soon as it fits *now*, so a

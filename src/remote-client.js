@@ -143,8 +143,31 @@ export function runWithDeadline(cmdBin, argv, deadlineMs, env, maxCaptureBytes =
 
 /** The CPU a runner must be able to give this ticket: the elastic floor only on a runner that admits below the declared claim. */
 function cpuNeedOf(reservation, probe) {
+  return usesElasticFloor(reservation, probe) ? reservation.minCpuCores : reservation.cpuCores;
+}
+
+function usesElasticFloor(reservation, probe) {
   const elastic = Array.isArray(probe.capabilities) && probe.capabilities.includes(ELASTIC_CLAIMS_CAPABILITY);
-  return elastic && Number.isFinite(reservation.minCpuCores) ? reservation.minCpuCores : reservation.cpuCores;
+  return elastic && Number.isFinite(reservation.minCpuCores);
+}
+
+/** BRAIN-506/743: whether the ticket is judged on the undiscounted CPU figure (a nice override above the runner's laneNice, or nice-only CPU). Shared by runnerRoom and externalLoadStarves. */
+function judgedUndiscounted(reservation, probe, headroom) {
+  const niceOverridden = Number.isFinite(headroom?.laneNice) && Number.isInteger(reservation.niceOverride) && reservation.niceOverride > headroom.laneNice;
+  return niceOverridden || probe.enforcement?.cpu === 'unenforced';
+}
+
+/**
+ * BRAIN-1266: a TEMPORARY verdict (never `neverFits`): load outside the broker leaves this runner's admissible CPU below the ticket's
+ * need even once its lanes drain, so queueing here would wait on that load. A reduced elastic floor is granted in whole cores, so it is rounded up.
+ */
+function externalLoadStarves(reservation, probe) {
+  const headroom = probe.headroom;
+  const admissible = judgedUndiscounted(reservation, probe, headroom) ? headroom?.cpuAdmissibleCoresUndiscounted : headroom?.cpuAdmissibleCores;
+  const need = cpuNeedOf(reservation, probe);
+  if (!Number.isFinite(admissible) || !Number.isFinite(need)) return null;
+  const cores = usesElasticFloor(reservation, probe) ? Math.ceil(need) : need;
+  return cores > admissible ? `external load leaves no room (admissible ${admissible.toFixed(2)}, need ${cores})` : null;
 }
 
 /**
@@ -160,9 +183,7 @@ export function runnerRoom(reservation, probe) {
   // the runner's admission, so it is judged on the undiscounted figure. With no override the ticket runs at the runner's laneNice (the discounted figure);
   // a runner without the fields is judged as before. BRAIN-743: a runner whose CPU is `unenforced` (nice only, no cgroup weight) cannot
   // let a lane outrank the load the discount assumes it can preempt, so it is always judged on the undiscounted figure.
-  const niceOverridden = Number.isFinite(headroom?.laneNice) && Number.isInteger(reservation.niceOverride) && reservation.niceOverride > headroom.laneNice;
-  const unenforced = probe.enforcement?.cpu === 'unenforced';
-  if (cpuFree !== null && Number.isFinite(headroom.cpuCoresUndiscounted) && (niceOverridden || unenforced)) {
+  if (cpuFree !== null && Number.isFinite(headroom.cpuCoresUndiscounted) && judgedUndiscounted(reservation, probe, headroom)) {
     cpuFree = headroom.cpuCoresUndiscounted;
   }
   if (cpuFree === null && Number.isFinite(probe.capacity?.cpuCores) && Number.isFinite(probe.reservedCpuCores)) {
@@ -428,7 +449,9 @@ export async function selectRunner(runners, opts = {}) {
       skipped.push({ name: runner.name, reason: `queued: ${probe.queued}${overCap ? ` (over maxRemoteQueue ${maxRemoteQueue})` : ''}` });
       const never = Boolean(reservation && neverFits(reservation, probe));
       skipped[skipped.length - 1].neverFits = never;
-      const fits = !never;
+      const starved = !never && reservation ? externalLoadStarves(reservation, probe) : null;
+      if (starved) skipped[skipped.length - 1].reason = `${skipped[skipped.length - 1].reason}; ${starved}`;
+      const fits = !never && !starved;
       const queueable = Number.isInteger(probe.queued) && probe.queued > 0 && probe.queued <= maxRemoteQueue;
       if (fits) {
         const cand = candidate(probe, 0, false);
@@ -450,6 +473,12 @@ export async function selectRunner(runners, opts = {}) {
     noteUp(cand);
     if (observed) {
       skipped.push({ name: runner.name, reason: 'observed only (the ticket is queued there)' });
+      continue;
+    }
+    const starved = reservation ? externalLoadStarves(reservation, probe) : null;
+    if (starved) {
+      skipped.push({ name: runner.name, reason: starved, neverFits: false });
+      busySeq.push(cand);
       continue;
     }
     if (!room) {

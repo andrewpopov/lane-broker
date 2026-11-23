@@ -370,3 +370,97 @@ test('BRAIN-805 transition: the head poll that crosses the horizon does not log 
   assert.ok(headLine, 'the crossing poll writes a decision line');
   assert.doesNotMatch(headLine, /reservation=futile/);
 });
+
+// BRAIN-1266: an aged head that external CPU load alone rules out stops holding its reservation; held lanes do not change that.
+const agedCpuHead = (overrides = {}) => ticket('head', { weight: 4, prioOriginAt: agedOrigin(), ...overrides });
+
+async function backfillAt(state, head, host, count) {
+  const results = [];
+  for (let i = 0; i < count; i += 1) {
+    const small = ticket(`b${i}`);
+    await enqueue(state, small);
+    await poll(state, head, { ext: host });
+    results.push(await poll(state, small, { ext: host }));
+    removeLease(state, small.id);
+  }
+  return results;
+}
+
+test('BRAIN-1266 aged cpu-futile head with an observed lane held releases the reservation, so backfill proceeds past it', async () => {
+  const { state } = freshEnv();
+  const head = agedCpuHead();
+  await enqueue(state, head);
+  holdLease(state, 'lane-a', 1, observed(0.5));
+  const denied = await poll(state, head, { ext: 7.5 }); // 7 external + 4 > 9 even with lane-a drained
+  assert.equal(denied.reason, 'cpu-admission');
+  assert.equal(readResourceSkipState(state).futile, 'cpu');
+  const started = await backfillAt(state, head, 7.5, cfg.resourceSkipLimit + 3);
+  assert.ok(started.every((r) => r.started === true), JSON.stringify(started.map((r) => r.reason)));
+  const record = readResourceSkipState(state);
+  assert.deepEqual({ count: record.count, reserved: record.reserved, futile: record.futile }, { count: 0, reserved: false, futile: 'cpu' });
+});
+
+test('BRAIN-1266 aged head with an unobserved lane held keeps its reservation', async () => {
+  const { state } = freshEnv();
+  const head = agedCpuHead();
+  await enqueue(state, head);
+  holdLease(state, 'unobserved', 1);
+  await poll(state, head, { ext: 6.5 });
+  assert.equal(readResourceSkipState(state).futile, undefined);
+  const started = await backfillAt(state, head, 6.5, cfg.resourceSkipLimit);
+  assert.ok(started.every((r) => r.started === true), JSON.stringify(started.map((r) => r.reason)));
+  assert.equal(readResourceSkipState(state).reserved, true);
+  const extra = ticket('extra');
+  await enqueue(state, extra);
+  assert.equal((await poll(state, extra, { ext: 6.5 })).reason, 'not-head');
+});
+
+test('BRAIN-1266 idle overshoot: an aged head within resourceIdleOvershootCores on a drained host is not futile and keeps its reservation', async () => {
+  const { state } = freshEnv();
+  const idle = { ...cfg, resourceIdleOvershootCores: 1 };
+  const head = agedCpuHead({ weight: 5 });
+  await enqueue(state, head);
+  holdLease(state, 'lane-a', 1, observed(0.1));
+  const denied = await poll(state, head, { ext: 5.1, cfg: idle }); // 5 external + 5 = 10 > 9, inside the 1-core overshoot
+  assert.equal(denied.cpuReason, 'projected-over-budget');
+  assert.equal(readResourceSkipState(state).futile, undefined);
+  for (let i = 0; i < cfg.resourceSkipLimit; i += 1) {
+    const small = ticket(`i${i}`);
+    await enqueue(state, small);
+    await poll(state, head, { ext: 5.1, cfg: idle });
+    assert.equal((await poll(state, small, { ext: 5.1, cfg: idle })).started, true);
+    removeLease(state, small.id);
+  }
+  assert.equal(readResourceSkipState(state).reserved, true);
+});
+
+test('BRAIN-1266 an existing reservation is cleared once the aged head becomes cpu-futile', async () => {
+  const { state } = freshEnv();
+  const head = agedCpuHead();
+  await enqueue(state, head);
+  holdLease(state, 'lane-a', 1, observed(0.5));
+  atomicWriteJson(paths(state).resourceSkipState, { headId: 'head', count: 3, reserved: true, inScope: true, deniedAt: Date.now(), budget: 9, externalBusy: 2 });
+  const small = ticket('small');
+  await enqueue(state, small);
+  assert.equal((await poll(state, small, { ext: 2.5 })).reason, 'not-head', 'reserved while the head only waits on lanes');
+  await poll(state, head, { ext: 7.5 });
+  const record = readResourceSkipState(state);
+  assert.deepEqual({ count: record.count, reserved: record.reserved, futile: record.futile }, { count: 0, reserved: false, futile: 'cpu' });
+  assert.equal((await poll(state, small, { ext: 7.5 })).started, true);
+});
+
+test('BRAIN-1266 when external load drops the aged head is no longer futile and earns its reservation again', async () => {
+  const { state } = freshEnv();
+  const head = agedCpuHead();
+  await enqueue(state, head);
+  holdLease(state, 'light', 2, observed(0.5));
+  await poll(state, head, { ext: 7.5 }); // 7 external + 4 > 9 + overshoot
+  assert.equal(readResourceSkipState(state).futile, 'cpu');
+  removeLease(state, 'light');
+  holdLease(state, 'busy', 2, { ...observed(5), resources: { cpuCores: 5 } });
+  await poll(state, head, { ext: 5.5 }); // 0.5 external: fits once busy drains, denied while it runs
+  assert.equal(readResourceSkipState(state).futile, undefined);
+  const started = await backfillAt(state, head, 5.5, cfg.resourceSkipLimit);
+  assert.ok(started.every((r) => r.started === true), JSON.stringify(started.map((r) => r.reason)));
+  assert.equal(readResourceSkipState(state).reserved, true);
+});

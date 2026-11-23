@@ -366,3 +366,37 @@ test('supervisor: a predicted-short ticket this machine refuses to run (localRef
   assert.equal(result.queuedAt, 'skybox(1)');
   assert.equal(result.fallbackReason, undefined);
 });
+
+test('BRAIN-1266 selectRunner: external load that leaves no admissible room skips the runner for this placement, retryably, and never queues it', async () => {
+  const headroom = (cpuAdmissibleCores) => ({ cpuCores: 0, cpuAdmissibleCores, memoryBytes: 1e12 });
+  const six = { weight: 1, cpuCores: 6, memoryBytes: 1 };
+  const base = { deadlineMs: GENEROUS_PROBE_DEADLINE_MS, maxRemoteQueue: 2 };
+  const starved = makeProbeMapSsh({ a: probe(0, { capacity: { cpuCores: 6 }, headroom: headroom(3.26) }) });
+  for (const opts of [{}, { allowBusyQueue: true }, { busyQueueable: true, finishModel: null }]) {
+    const res = await selectRunner(runnersOf('a'), { ...base, ...opts, sshBin: starved, reservation: six });
+    assert.equal(res.runner, null, JSON.stringify(opts));
+    assert.notEqual(res.queuedChoice, true, JSON.stringify(opts));
+    assert.deepEqual(res.skipped.map((s) => [s.reason, s.neverFits]), [['external load leaves no room (admissible 3.26, need 6)', false]]);
+    assert.equal(res.busy.runner.name, 'a', 'stays a busy candidate so a locally ineligible ticket can still wait on it');
+  }
+  const queued = makeProbeMapSsh({ a: probe(1, { capacity: { cpuCores: 6 }, headroom: headroom(3.26) }) });
+  const behind = await selectRunner(runnersOf('a'), { ...base, sshBin: queued, reservation: six });
+  assert.equal(behind.runner, null);
+  assert.equal(behind.skipped[0].neverFits, false);
+  const two = await selectRunner(runnersOf('a'), { ...base, sshBin: makeProbeMapSsh({ a: probe(0, { capacity: { cpuCores: 6 }, headroom: { cpuCores: 3, cpuAdmissibleCores: 3.26, memoryBytes: 1e12 } }) }), reservation: { ...six, cpuCores: 2 } });
+  assert.equal(two.runner.name, 'a');
+  const elastic = { capabilities: ['elastic-claims/1'], capacity: { cpuCores: 6 }, headroom: headroom(1.5) };
+  const floor = await selectRunner(runnersOf('a'), { ...base, sshBin: makeProbeMapSsh({ a: probe(0, elastic) }), reservation: { ...six, minCpuCores: 1.2 } });
+  assert.equal(floor.runner, null);
+  assert.match(floor.skipped[0].reason, /admissible 1\.50, need 2\)/);
+  const fractional = { capacity: { cpuCores: 6 }, headroom: headroom(1.5) };
+  const full = await selectRunner(runnersOf('a'), { ...base, sshBin: makeProbeMapSsh({ a: probe(0, { ...fractional, headroom: { cpuCores: 1.5, cpuAdmissibleCores: 1.5, memoryBytes: 1e12 } }) }), reservation: { ...six, cpuCores: 1.2 } });
+  assert.equal(full.runner.name, 'a', 'a fractional full claim is not rounded up');
+  const elasticFits = await selectRunner(runnersOf('a'), { ...base, sshBin: makeProbeMapSsh({ a: probe(0, { ...elastic, headroom: { cpuCores: 6, cpuAdmissibleCores: 6, memoryBytes: 1e12 } }) }), reservation: six });
+  assert.equal(elasticFits.runner.name, 'a', 'an elastic runner with no floor in the reservation judges the full claim');
+  const undiscounted = { capacity: { cpuCores: 6 }, headroom: { cpuCores: 6, cpuAdmissibleCores: 6, cpuAdmissibleCoresUndiscounted: 1, laneNice: 10, cpuCoresUndiscounted: 6, memoryBytes: 1e12 } };
+  const overridden = await selectRunner(runnersOf('a'), { ...base, sshBin: makeProbeMapSsh({ a: probe(0, undiscounted) }), reservation: { ...six, cpuCores: 2, niceOverride: 15 } });
+  assert.equal(overridden.runner, null, 'a nice override above laneNice is judged on the undiscounted admissible figure');
+  const noField = await selectRunner(runnersOf('a'), { ...base, sshBin: makeProbeMapSsh({ a: probe(0, { capacity: { cpuCores: 6 }, headroom: { cpuCores: 6, memoryBytes: 1e12 } }) }), reservation: six });
+  assert.equal(noField.runner.name, 'a');
+});
