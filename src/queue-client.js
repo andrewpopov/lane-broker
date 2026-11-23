@@ -8,8 +8,9 @@ export const QUEUE_CONNECT_TIMEOUT_MS = 5_000;
 export const QUEUE_QUERY_TIMEOUT_MS = 15_000;
 // Readiness and placement probes decide whether a lane runs at all: every runner is pull, so a failed probe is a refusal with no push fallback.
 // A DERP-relayed tailnet (UDP blocked) needs 1.4-1.7s for a TLS login plus a query and can time out once in a while, so a probe gets 4 attempts
-// with a 6s connect and a 6s query deadline: one transient timeout is retried, and a dead queue still fails in about 25s (4 x 6s + backoff).
-export const QUEUE_PROBE = { attempts: 4, connectTimeoutMs: 6_000, queryTimeoutMs: 6_000 };
+// with a 6s connect and a 3s query deadline (ld_queue_ref and ld_placeable are tiny): one transient timeout is retried, a dead queue fails in about 25s
+// (4 x 6s connect + backoff) and a queue that logs in but answers slowly in about 37s (4 x (6s + 3s) + backoff).
+export const QUEUE_PROBE = { attempts: 4, connectTimeoutMs: 6_000, queryTimeoutMs: 3_000 };
 const MAX_ATTEMPTS = 6;
 const BACKOFF_BASE_MS = 100;
 const BACKOFF_CAP_MS = 2_000;
@@ -41,13 +42,20 @@ export class QueueError extends Error {
   }
 }
 
+export const TLS_FAILURE_CODE = /^(ERR_TLS_|ERR_SSL_|CERT_|UNABLE_TO_|DEPTH_ZERO_|SELF_SIGNED_|HOSTNAME_MISMATCH)/;
+
+export function tlsFailure(err) {
+  for (let cause = err, depth = 0; cause && depth < 5; cause = cause.cause, depth++) if (TLS_FAILURE_CODE.test(String(cause.code ?? ''))) return true;
+  return false;
+}
+
 const isServerError = (err) => typeof err?.severity === 'string';
 
 const outcomeUnknown = (err) => !isServerError(err) || err.code === '57P01';
 
 function retryable(err, { phase, idempotent }) {
   if (err.code === TOO_MANY_CONNECTIONS) return true;
-  if (phase === 'connect') return !isServerError(err) && !(err instanceof QueueError);
+  if (phase === 'connect') return !isServerError(err) && !(err instanceof QueueError) && !tlsFailure(err);
   return idempotent && outcomeUnknown(err);
 }
 

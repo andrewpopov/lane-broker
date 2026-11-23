@@ -91,7 +91,7 @@ const PLACEMENT = {
     s.input.couldRunLocally = async () => assert.fail('a locally ineligible ticket asked whether it could run locally');
     const placed = await placeForPull({ ...s.input, pushChosen: false });
     assert.deepEqual([placed.route, placed.services === s.services], ['pull', true]);
-    assert.deepEqual(s.probes.placeable, [QUEUE_PROBE], 'ld_placeable decides placement, so it is one short attempt too');
+    assert.deepEqual(s.probes.placeable, [QUEUE_PROBE], 'ld_placeable decides placement, so it uses the bounded QUEUE_PROBE budget too');
   },
 
   'a ticket this machine can admit or bypass now runs locally; otherwise it is enqueued': async (load) => {
@@ -153,7 +153,7 @@ const PLACEMENT = {
     assert.ok((await probes({ ...cfg, lanePull: { ...cfg.lanePull, rustfs: { ...cfg.lanePull.rustfs, region: 'eu-west-1' } } })) > 0);
   },
 
-  'the readiness probes are one short attempt each: lifecycle reads carry a deadline and the queue login does not retry': async (load) => {
+  'the readiness probes are bounded: lifecycle reads carry a deadline and the queue login uses the bounded QUEUE_PROBE budget': async (load) => {
     const { createPullReadiness, PULL_PROBE_DEADLINE_MS } = await load('pull-placement.js');
     const s = spies();
     await createPullReadiness({ root: freshEnv().state })(CFG, s.services);
@@ -233,12 +233,30 @@ const PLACEMENT = {
     assert.equal(sleeps, 0, 'an unreadable password file is a QueueError raised before any send, so it is not retried');
   },
 
-  'the probe budget fits a relayed tailnet and still fails a dead queue within 30 seconds (BRAIN-1275)': async (load) => {
+  'the probe budget fits a relayed tailnet and still fails a dead or slow queue within 40 seconds (BRAIN-1275)': async (load) => {
     const { QUEUE_PROBE } = await load('queue-client.js');
     const { attempts, connectTimeoutMs, queryTimeoutMs } = QUEUE_PROBE;
     assert.ok(attempts >= 3, 'one transient timeout must leave retries');
     assert.ok(connectTimeoutMs >= 5_000, 'a TLS login over a DERP relay takes 1.5s and spikes');
-    assert.ok(attempts * connectTimeoutMs <= 30_000, 'a dead queue refuses in time');
+    const backoffMs = [1, 2, 3].reduce((sum, attempt) => sum + 100 * 2 ** attempt, 0);
+    assert.ok(attempts * connectTimeoutMs + backoffMs <= 30_000, 'a dead queue refuses in time');
+    assert.ok(attempts * (connectTimeoutMs + queryTimeoutMs) + backoffMs <= 40_000, 'a queue that logs in and answers slowly refuses in time');
+  },
+
+  'a TLS certificate failure on connect is attempted exactly once, since waiting never fixes an expired or mismatched certificate (BRAIN-1275)': async (load) => {
+    const { createQueueClient } = await load('queue-client.js');
+    const dir = makeTmpDir('queue-probe-tls-');
+    fs.writeFileSync(path.join(dir, 'pw'), 'pw\n');
+    fs.writeFileSync(path.join(dir, 'ca'), 'ca\n');
+    for (const code of ['CERT_HAS_EXPIRED', 'ERR_TLS_CERT_ALTNAME_INVALID']) {
+      let connects = 0;
+      const client = createQueueClient({
+        url: QUEUE_URL, passwordFile: path.join(dir, 'pw'), caFile: path.join(dir, 'ca'), sleep: async () => {},
+        connectClient: async () => { connects++; throw Object.assign(new Error('certificate rejected'), { code }); },
+      });
+      await assert.rejects(client.queueRef(QUEUE_PROBE), /certificate rejected/);
+      assert.equal(connects, 1, `${code} is permanent`);
+    }
   },
 
   'readiness refuses a missing credential file, an enabled lifecycle rule and a queue login that fails': async (load) => {
@@ -368,6 +386,7 @@ const PUBLICATION = {
 const ALL = { ...PLACEMENT, ...EXIT_MAPPING, ...GUARD, ...HISTORY, ...TIMEOUT, ...PRIORITY, ...PUBLICATION };
 
 const CANARIES = [
+  ['a TLS certificate failure on connect is attempted exactly once, since waiting never fixes an expired or mismatched certificate (BRAIN-1275)', 'queue-client.js', ['!(err instanceof QueueError) && !tlsFailure(err);', '!(err instanceof QueueError);']],
   ['D6: a chosen push runner returns before any pull config, file, store or queue is touched', 'pull-placement.js', ["  if (pushChosen) return { route: 'push' };\n", '']],
   ['T14: pull off, no pull runner, or an incomplete pull config leaves today\'s flow untouched with no call', 'pull-placement.js', ["  if (!pullConfigured(cfg)) return { route: 'legacy' };\n", '']],
   ['an unready or unreachable pull side is today\'s flow with the reason, never an enqueue', 'pull-placement.js', ["  if (!verdict.ready) return { route: 'legacy', reason: `pull dispatch unavailable: ${verdict.reason}` };\n", '']],
@@ -376,13 +395,13 @@ const CANARIES = [
   ['a ticket this machine can admit or bypass now runs locally; otherwise it is enqueued', 'pull-placement.js', ["return (await couldRunLocally()) ? { route: 'local' } : { route: 'pull', services };", "return { route: 'pull', services };"]],
   ['readiness is kept under the state root: another process within five minutes reuses the verdict, a failure included, and does no I/O', 'pull-placement.js', ['if (stored?.key === key && age >= 0 && age < ttlMs) return stored.verdict;', '']],
   ['readiness is kept under the state root: another process within five minutes reuses the verdict, a failure included, and does no I/O', 'pull-placement.js', ['stored?.key === key && ', '']],
-  ['the readiness probes are one short attempt each: lifecycle reads carry a deadline and the queue login does not retry', 'pull-placement.js', ['deadlineMs: PULL_PROBE_DEADLINE_MS', 'deadlineMs: undefined']],
-  ['the readiness probes are one short attempt each: lifecycle reads carry a deadline and the queue login does not retry', 'pull-placement.js', ['services.queue.queueRef(QUEUE_PROBE)', 'services.queue.queueRef()']],
+  ['the readiness probes are bounded: lifecycle reads carry a deadline and the queue login uses the bounded QUEUE_PROBE budget', 'pull-placement.js', ['deadlineMs: PULL_PROBE_DEADLINE_MS', 'deadlineMs: undefined']],
+  ['the readiness probes are bounded: lifecycle reads carry a deadline and the queue login uses the bounded QUEUE_PROBE budget', 'pull-placement.js', ['services.queue.queueRef(QUEUE_PROBE)', 'services.queue.queueRef()']],
   ['a ticket this machine could never run is enqueued without asking whether it could run now', 'pull-placement.js', ['services.queue.placeable(repoKey, requiresTags, QUEUE_PROBE)', 'services.queue.placeable(repoKey, requiresTags)']],
   ['a probe option of one attempt makes the queue client send once; without it a transient failure is retried', 'queue-client.js', ['if (attempt < attempts && retryable', 'if (attempt < MAX_ATTEMPTS && retryable']],
-  ['a probe survives one transient connect or query timeout on a relayed link and answers from the next attempt (BRAIN-1275)', 'queue-client.js', ["  if (phase === 'connect') return !isServerError(err) && !(err instanceof QueueError);\n", '']],
+  ['a probe survives one transient connect or query timeout on a relayed link and answers from the next attempt (BRAIN-1275)', 'queue-client.js', ["  if (phase === 'connect') return !isServerError(err) && !(err instanceof QueueError) && !tlsFailure(err);\n", '']],
   ['a probe that keeps timing out stops after its attempt budget, and a probe that cannot be sent twice (a bad password file) is not retried', 'queue-client.js', ['&& !(err instanceof QueueError)', '']],
-  ['the probe budget fits a relayed tailnet and still fails a dead queue within 30 seconds (BRAIN-1275)', 'queue-client.js', ['attempts: 4, connectTimeoutMs: 6_000', 'attempts: 1, connectTimeoutMs: 2_000']],
+  ['the probe budget fits a relayed tailnet and still fails a dead or slow queue within 40 seconds (BRAIN-1275)', 'queue-client.js', ['attempts: 4, connectTimeoutMs: 6_000', 'attempts: 1, connectTimeoutMs: 2_000']],
   ['a ticket\'s requested tier maps onto the queue\'s 0-9 priority column, higher claimed first, unrequested as medium', 'priority.js', ['PULL_QUEUE_BAND_START[tierRank(tier)]', '0']],
   ['the finished result is a pure function of the publication block and the ledger entry, and the writer records one history row', 'pull-publication.js', ['const endedAt = acceptedAt ?? Date.now();', 'const endedAt = Date.now();']],
   ['the finished result is a pure function of the publication block and the ledger entry, and the writer records one history row', 'pull-publication.js', ['rebuilt, placement: publication.placement', 'placement: publication.placement']],

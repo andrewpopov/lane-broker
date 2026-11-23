@@ -6,6 +6,7 @@ import { CANCELLED_BEFORE_ENQUEUE, enqueueOnce } from './pull-enqueue.js';
 import { createEnvelope, pullTicketDir, readEnvelope, recordSnapshot, withTicketLock, writeOwedCancel } from './pull-envelope.js';
 import { ledgerAccept, readLedger } from './pull-ledger.js';
 import { blobKey, mapBounded, uploadSnapshot } from './pull-snapshot.js';
+import { tlsFailure } from './queue-client.js';
 import { artifactLimitsOf, installArtifactsDurable, receiveArtifacts } from './remote-artifacts.js';
 import { CACHE_REJECT_RE, classifyRemoteResult, provesNeverStarted } from './remote-client.js';
 import { lostResult } from './remote-reconcile.js';
@@ -26,7 +27,6 @@ export const OUTPUT_MARGIN_BYTES = 1024 * 1024;
 const BLOB_HEAD_CONCURRENCY = 8;
 const DIVERGENCE_DEADLINE_MS = 2_000;
 const TRANSIENT_SQLSTATES = new Set(['53300', '57P01', '57P02', '57P03', '57014', '55P03', '40P01', '40001']);
-const TLS_FAILURE_CODE = /^(ERR_TLS_|ERR_SSL_|CERT_|UNABLE_TO_|DEPTH_ZERO_|SELF_SIGNED_|HOSTNAME_MISMATCH)/;
 const SERVER_CANCEL_SOURCES = new Set(['queued', 'operator']);
 const QUEUE_LOST_REASONS = new Set(['queue-restored', 'release-cap', 'runner-lost']);
 const OUTPUTS = [['log', 'logSha256', 'logBytes'], ['artifacts', 'artifactsSha256', 'artifactsBytes']];
@@ -542,11 +542,6 @@ export function pullExitCode(outcome) {
 const isNamed = (err, name) => err?.name === name;
 
 /** Only a transport failure, a timeout, 53300, 57P01, 08xxx or an S3 5xx is waited out; any other server SQLSTATE or an S3 4xx will answer the same way again. */
-function tlsFailure(err) {
-  for (let cause = err, depth = 0; cause && depth < 5; cause = cause.cause, depth++) if (TLS_FAILURE_CODE.test(String(cause.code ?? ''))) return true;
-  return false;
-}
-
 export function isTransientError(err) {
   if (isNamed(err, 'LockTimeoutError')) return true;
   if (tlsFailure(err)) return false;
