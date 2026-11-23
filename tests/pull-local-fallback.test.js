@@ -123,6 +123,19 @@ const SCENARIOS = {
     assert.equal(readQueueHealth(state).downSince, T0);
   },
 
+  'queue health records arriving out of order never move the newest failure back, and a success no newer than it does not start recovery': async (load) => {
+    const { recordQueueCall, readQueueHealth } = await load('queue-health.js');
+    const { state } = freshEnv();
+    await recordQueueCall(state, false, T0 + 110);
+    await recordQueueCall(state, false, T0 + 100);
+    assert.equal(readQueueHealth(state).lastFailureAt, T0 + 110, 'a late record of an older failure keeps the newest');
+    await recordQueueCall(state, true, T0 + 105);
+    assert.equal(readQueueHealth(state).okAt, null, 'a success older than the newest failure does not count toward recovery');
+    await recordQueueCall(state, true, T0 + 200);
+    await recordQueueCall(state, false, T0 + 150);
+    assert.equal(readQueueHealth(state).okAt, T0 + 200, 'a late record of a failure older than a recorded success leaves that success standing');
+  },
+
   'a failure recorded while the readiness probe ran is not hidden: the verdict is stamped when the probe started': async (load) => {
     const { createPullReadiness } = await load('pull-placement.js');
     const { recordQueueCall } = await load('queue-health.js');
@@ -217,6 +230,8 @@ const CANARIES = [
   ['a localRefused lane (and so an out-of-window e2e or train lane) is runnable here only under the fallback; a dispatch-only host stays refused', 'supervisor.js', ['if (!pullFallback && locallyRefusedNow(enriched, globalCfg))', 'if (locallyRefusedNow(enriched, globalCfg))']],
   ['the history row of a ticket that fell back from the pull queue says transport local and fallbackReason pull-unreachable', 'supervisor.js', ["    ...(fallbackReason === PULL_UNREACHABLE_REASON ? { transport: 'local', fallbackReason } : {}),\n", '']],
   ['queue health is written under a lock: a write waits for whoever holds it, so a stale read can never erase a failure', 'queue-health.js', ["  return withLock(root, () => apply(root, ok, now), { lockPath: queueHealthLock(root), group: 'broker', timeoutMs: LOCK_WAIT_MS });", '  return apply(root, ok, now);']],
+  ['queue health records arriving out of order never move the newest failure back, and a success no newer than it does not start recovery', 'queue-health.js', ['lastFailureAt: Math.max(health.lastFailureAt ?? now, now)', 'lastFailureAt: now']],
+  ['queue health records arriving out of order never move the newest failure back, and a success no newer than it does not start recovery', 'queue-health.js', [' || (health.lastFailureAt !== null && now <= health.lastFailureAt)', '']],
   ['a failure recorded while the readiness probe ran is not hidden: the verdict is stamped when the probe started', 'pull-placement.js', ['{ key, at: probedAt, verdict }', '{ key, at: now(), verdict }']],
   ['a host that has not opted in is unchanged: no health file is written, a failed call does not invalidate a positive verdict and a negative one keeps its 5 minute TTL', 'pull-services.js', ['cfg?.lanePull?.localFallbackWhenUnreachable === true ? trackQueueHealth', 'cfg?.lanePull ? trackQueueHealth']],
   ['a host that has not opted in is unchanged: no health file is written, a failed call does not invalidate a positive verdict and a negative one keeps its 5 minute TTL', 'pull-placement.js', ['cfg.lanePull?.localFallbackWhenUnreachable === true ? readQueueHealth(root) : null', 'readQueueHealth(root)']],

@@ -26,13 +26,16 @@ function write(root, health) {
   atomicWriteJson(healthFile(root), health);
 }
 
+// Calls are timed before the lock is waited for, so records can arrive out of order: the newest failure is kept, and a success
+// no newer than it, or a failure older than a recorded success, changes nothing it should not.
 function apply(root, ok, now) {
   const health = readQueueHealth(root);
   if (!ok) {
-    write(root, { downSince: health.downSince ?? now, lastFailureAt: now, okAt: null });
+    const okAt = health.okAt !== null && health.okAt > now ? health.okAt : null;
+    write(root, { downSince: health.downSince ?? now, lastFailureAt: Math.max(health.lastFailureAt ?? now, now), okAt });
     return;
   }
-  if (health.downSince === null) return;
+  if (health.downSince === null || (health.lastFailureAt !== null && now <= health.lastFailureAt)) return;
   if (health.okAt === null) write(root, { ...health, okAt: now });
   else if (now - health.okAt >= QUEUE_RECOVERY_SPACING_MS) write(root, { downSince: null, lastFailureAt: health.lastFailureAt, okAt: null });
 }
