@@ -159,7 +159,7 @@ test('lanePull.unprovenCancelLostAfterMs (10 min) and queueUnreachableAfterMs (1
   assert.deepEqual([lanePull.unprovenCancelLostAfterMs, lanePull.queueUnreachableAfterMs], [600_000, 900_000]);
   for (const gone of ['quarantineLostAfterMs', 'urlTtlSec', 'urlRefreshSec']) assert.equal(lanePull[gone], undefined, `${gone} is gone`);
   await deadlineRefusals(async (file) => import(`../src/${file}`));
-  await assertCanaryFails('config.js', ["'unprovenCancelLostAfterMs', 'queueUnreachableAfterMs', 'prepareBudgetMs', 'blobRefreshAfterDays'", "'blobRefreshAfterDays'"], deadlineRefusals);
+  await assertCanaryFails('config.js', ["'unprovenCancelLostAfterMs', 'queueUnreachableAfterMs', 'prepareBudgetMs', 'localFallbackAfterMs', 'blobRefreshAfterDays'", "'localFallbackAfterMs', 'blobRefreshAfterDays'"], deadlineRefusals);
 });
 
 test('lanePull.enabled needs every connection key, and names the missing ones', () => {
@@ -246,4 +246,12 @@ test('lanePull.ledgerRetentionMs defaults to 45 days and is refused below the 35
   assert.equal(DEFAULT_GLOBAL_CONFIG.lanePull.ledgerRetentionMs, 45 * 24 * 3_600_000);
   await ledgerRetentionRefusal((file) => import(`../src/${file}`));
   await assertCanaryFails('config.js', ['assert(pull.ledgerRetentionMs >= LEDGER_RETENTION_FLOOR_MS,', 'assert(true || pull.ledgerRetentionMs >= LEDGER_RETENTION_FLOOR_MS,'], ledgerRetentionRefusal);
+});
+
+test('PKG-401 lanePull.localFallbackWhenUnreachable defaults to false and must be a boolean, localFallbackAfterMs defaults to 10 minutes and must be a positive integer', () => {
+  const { lanePull } = load({});
+  assert.deepEqual([lanePull.localFallbackWhenUnreachable, lanePull.localFallbackAfterMs], [false, 600_000]);
+  assert.equal(load({ lanePull: { localFallbackWhenUnreachable: true } }).lanePull.localFallbackWhenUnreachable, true);
+  refusesNaming({ lanePull: { localFallbackWhenUnreachable: 'yes' } }, 'lanePull.localFallbackWhenUnreachable');
+  refusesNaming({ lanePull: { localFallbackAfterMs: 0 } }, 'lanePull.localFallbackAfterMs');
 });

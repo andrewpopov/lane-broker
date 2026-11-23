@@ -682,13 +682,83 @@ SCENARIOS['T16: cancel outcomes: queued, released, runner-confirmed and a normal
   assert.equal(lostFirst.cancelCalls, 2, 'the first answer is persisted, so the cancel is not sent again');
 };
 
+
+const FALLBACK_CFG = { queueUnreachableAfterMs: 900_000, localFallbackAfterMs: 120_000 };
+const admitsNow = { enabled: true, couldAdmitNow: async () => true };
+// the first poll is answered (the row is observed), then the queue is gone
+const answeredOnce = (fx) => {
+  let answered = false;
+  return { ...deadQueue(fx), get: async (id) => { if (answered) throw transportError; answered = true; return fx.queue.get(id); } };
+};
+const fallbackRun = async (fx, over = {}, limit = 40) => {
+  const { recordQueueCall } = await over.load('queue-health.js');
+  recordQueueCall(fx.state, false, fx.clock.now);
+  const polls = advancing(fx, limit);
+  const outcome = await fx.run({ queue: answeredOnce(fx), localFallback: admitsNow, ...over.ctx, sleep: polls.sleep });
+  return { outcome, sleeps: polls.sleeps };
+};
+
+SCENARIOS['PKG-401: a ticket last seen queued moves to local once the host has lost the queue for localFallbackAfterMs: attempt A settles lost queue-unreachable-local, the owed cancel is written once, and the ticket continues at generation + 1'] = async (load, w, t) => {
+  const { owedCancelIds, readOwedCancel } = await load('pull-envelope.js');
+  const fx = await pullFixture(t, w, { load, cfg: FALLBACK_CFG });
+  await fx.enqueue();
+  const { outcome, sleeps } = await fallbackRun(fx, { load });
+  assert.deepEqual([outcome.outcome, outcome.reason], ['local-fallback', 'pull-unreachable']);
+  assert.ok(sleeps.length >= 8, `it waited the whole 120 s (${sleeps.length} polls) before moving`);
+  assert.equal(readLedger(fx.state, fx.id).decision.reason, 'queue-unreachable-local', 'attempt A is ledgered lost');
+  const attempt = readAttempt(fx.state, fx.id);
+  assert.deepEqual([attempt.executor, attempt.generation, attempt.fallbackReason, attempt.pull.localFallback.fromGeneration], ['local', fx.generation + 1, 'pull-unreachable', fx.generation]);
+  assert.equal(fx.published(), null, 'nothing is published: the caller waits for the local run');
+  assert.deepEqual(owedCancelIds(fx.state), [fx.id]);
+  const owed = readOwedCancel(fx.state, fx.id);
+  assert.equal((await fx.row()).state, 'queued', 'the row stays until the owed cancel is sent');
+
+  const again = await fx.run({ queue: deadQueue(fx), localFallback: admitsNow, sleep: async () => {} });
+  assert.equal(again.outcome, 'stale', 'a second run finds the ticket already moved');
+  assert.deepEqual(readOwedCancel(fx.state, fx.id), owed, 'the owed cancel was written once and not touched again');
+  assert.deepEqual(owedCancelIds(fx.state), [fx.id]);
+};
+
+SCENARIOS['PKG-401: a ticket last seen claimed or running keeps today\'s behaviour: it never moves to local and settles lost queue-unreachable'] = async (load, w, t) => {
+  let first;
+  for (const [n, hold] of [[1, 'claimed'], [2, 'running']]) {
+    const fx = await pullFixture(t, w, { load, id: tid(n), stub: first?.stub, cfg: { ...FALLBACK_CFG, queueUnreachableAfterMs: 300_000 } });
+    first ??= fx;
+    await (hold === 'running' ? fx.hold() : fx.claimed());
+    const { outcome } = await fallbackRun(fx, { load });
+    assert.deepEqual([outcome.outcome, outcome.decision?.reason], ['lost', 'queue-unreachable'], hold);
+    assert.notEqual(readAttempt(fx.state, fx.id)?.executor, 'local', hold);
+  }
+};
+
+SCENARIOS['PKG-401: a ticket stays put when the lane opted out, or this host cannot admit it locally now, and settles lost queue-unreachable'] = async (load, w, t) => {
+  let first;
+  const cases = [[1, { enabled: false, couldAdmitNow: async () => true }], [2, { enabled: true, couldAdmitNow: async () => false }], [3, undefined]];
+  for (const [n, localFallback] of cases) {
+    const fx = await pullFixture(t, w, { load, id: tid(n), stub: first?.stub, cfg: { ...FALLBACK_CFG, queueUnreachableAfterMs: 300_000 } });
+    first ??= fx;
+    await fx.enqueue();
+    const { outcome } = await fallbackRun(fx, { load, ctx: { localFallback } });
+    assert.deepEqual([outcome.outcome, outcome.decision?.reason], ['lost', 'queue-unreachable'], `case ${n}`);
+  }
+};
+
+SCENARIOS['PKG-401: while the host is marked down the preparation budget is 60 s, not prepareBudgetMs, for a ticket that may fall back'] = async (load, w, t) => {
+  const { recordQueueCall } = await load('queue-health.js');
+  const fx = await pullFixture(t, w, { load, cfg: { prepareBudgetMs: 600_000 } });
+  recordQueueCall(fx.state, false, fx.clock.now);
+  const { sleeps, sleep } = advancing(fx);
+  await assert.rejects(prepareOver(fx, { sleep, localFallback: admitsNow }), /could not be prepared within the budget/);
+  assert.equal(sleeps.length, 4, 'four polls of 15 s, then the shortened budget is spent');
+};
+
 const CANARIES = [
   ['runPullTicket ends the run when a step is unresolved instead of looping on a renewed lease', 'pull-ticket.js', ["    if (step.state === 'unresolved') return { outcome: 'unresolved', reason: step.reason, exitCode: step.exitCode };\n", '']],
-  ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'pull-ticket.js', ["['53300', '57P01', '57P02', '57P03', '57014', '55P03', '40P01', '40001']", "['53300', '57P01']"]],
+  ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'queue-client.js', ["['53300', '57P01', '57P02', '57P03', '57014', '55P03', '40P01', '40001']", "['53300', '57P01']"]],
   ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'pull-ticket.js', ['  if (tlsFailure(err)) return false;\n', '']],
-  ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'pull-ticket.js', ['  return err.cause !== undefined && typeof err.cause.severity !== \'string\';', '  return true;']],
+  ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'queue-client.js', ['  return err.cause !== undefined && typeof err.cause.severity !== \'string\';', '  return true;']],
   ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'pull-ticket.js', ['return err.status === null || err.status >= 500 || err.status === 408 || err.status === 429;', 'return true;']],
-  ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'pull-ticket.js', ["if (TRANSIENT_SQLSTATES.has(code) || code.startsWith('08')) return true;\n", '']],
+  ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'queue-client.js', ["if (TRANSIENT_SQLSTATES.has(code) || code.startsWith('08')) return true;\n", '']],
   ['a bound rejected result settles lost 75 with no second enqueue: snapshot-blob-missing for a cache reason, runner-rejected otherwise', 'pull-ticket.js', ["  if (result.kind === 'rejected' && provesNeverStarted(result, expected)) return lost(CACHE_REJECT_RE.test(result.reason ?? '') ? 'snapshot-blob-missing' : 'runner-rejected', result.reason);\n", '']],
   ['a snapshot object that vanished before the first send settles lost snapshot-missing and sends nothing', 'pull-ticket.js', ["    if (reason) return { outcome: 'lost', reason };\n", '']],
   ['enqueueOnce sends nothing once a decision is ledgered', 'pull-enqueue.js', ["    if (ledgered()) return { outcome: 'settled' };\n", '']],
@@ -705,7 +775,7 @@ const CANARIES = [
   ['T27: output keys are derived from the row, never sent: a reclaimed ticket reads only its current epoch and its own host, whatever else sits in the bucket', 'pull-ticket.js', ['`${host}/${id}/e${epoch}/${name}`', '`a2/${id}/e${epoch}/${name}`']],
   ['T27: output keys are derived from the row, never sent: a reclaimed ticket reads only its current epoch and its own host, whatever else sits in the bucket', 'pull-ticket.js', ['`${host}/${id}/e${epoch}/${name}`', '`${host}/${id}/e1/${name}`']],
   ['the priority a requested tier is enqueued at sits in the band the queue scores for that tier: low, medium and high score 0, 1 and 2', 'priority.js', ['const PULL_QUEUE_BAND_START = [0, 4, 7];', 'const PULL_QUEUE_BAND_START = [0, 3, 6];']],
-  ['a store outage during preparation ends within prepareBudgetMs (the snapshot could not be prepared), and a cancel during it ends it at once', 'pull-ticket.js', ['      if (now() - startedAt >= prepareBudgetMs) throw new PrepareAbandoned(\'budget\', err);\n', '']],
+  ['a store outage during preparation ends within prepareBudgetMs (the snapshot could not be prepared), and a cancel during it ends it at once', 'pull-ticket.js', ['      if (now() - startedAt >= budgetMs()) throw new PrepareAbandoned(\'budget\', err);\n', '']],
   ['a store outage during preparation ends within prepareBudgetMs (the snapshot could not be prepared), and a cancel during it ends it at once', 'pull-ticket.js', ["      if (ctx.cancelRequested?.()) throw new PrepareAbandoned('cancelled', err);\n", '']],
   ['a store outage during preparation ends within prepareBudgetMs (the snapshot could not be prepared), and a cancel during it ends it at once', 'pull-ticket.js', ["    if (ctx.cancelRequested?.()) throw new PrepareAbandoned('cancelled');\n", '']],
   ['a cancel that is in force when the enqueue is about to be recorded ends the ticket cancelled 130 with no row and no send, whatever the earlier checks saw', 'pull-enqueue.js', ['    if (intent.attempts.length === 0 && cancelRequested()) return { outcome: CANCELLED_BEFORE_ENQUEUE, settled: await settleCancelled() };\n', '']],
@@ -727,7 +797,7 @@ const CANARIES = [
   ['an unproven cancel stays unresolved until unprovenCancelLostAfterMs (10 min by default), then settles lost 75 cancel-unproven', 'pull-ticket.js', ['run.cfg.unprovenCancelLostAfterMs', '600_000']],
   ['an unproven cancel stays unresolved until unprovenCancelLostAfterMs (10 min by default), then settles lost 75 cancel-unproven', 'pull-ticket.js', ['if (run.now() - since >= run.cfg.unprovenCancelLostAfterMs) return settle(', 'if (true) return settle(']],
   ['after queueUnreachableAfterMs of a dead queue the ticket settles lost 75 queue-unreachable at once; the cancel it owes the row waits in a marker the reconcile sweep sends once the queue answers', 'pull-ticket.js', ['        if (queueDownSince !== null && now() - queueDownSince >= queueUnreachableAfterMs) return abandonUnreachableQueue(ctx);\n', '']],
-  ['after queueUnreachableAfterMs of a dead queue the ticket settles lost 75 queue-unreachable at once; the cancel it owes the row waits in a marker the reconcile sweep sends once the queue answers', 'pull-ticket.js', ['    writeOwedCancel(run.root, run.id, { generation: run.generation, at: run.now() });\n', '']],
+  ['after queueUnreachableAfterMs of a dead queue the ticket settles lost 75 queue-unreachable at once; the cancel it owes the row waits in a marker the reconcile sweep sends once the queue answers', 'pull-ticket.js', ['    run.envelope = readEnvelope(run.root, run.id);\n    writeOwedCancel(run.root, run.id, { generation: run.generation, at: run.now() });\n', '    run.envelope = readEnvelope(run.root, run.id);\n']],
   ['after queueUnreachableAfterMs of a dead queue the ticket settles lost 75 queue-unreachable at once; the cancel it owes the row waits in a marker the reconcile sweep sends once the queue answers', 'pull-recover.js', ['      await withDeadline(ctxFor({ id, generation: owed?.generation ?? 0 }).queue.cancel(id), Math.max(1, deadline - now()));\n', '']],
   ['after queueUnreachableAfterMs of a dead queue the ticket settles lost 75 queue-unreachable at once; the cancel it owes the row waits in a marker the reconcile sweep sends once the queue answers', 'pull-recover.js', ['      await withDeadline(ctxFor({ id, generation: owed?.generation ?? 0 }).queue.cancel(id), Math.max(1, deadline - now()));\n      await clearOwedCancel(root, id);', '      await clearOwedCancel(root, id);\n      await withDeadline(ctxFor({ id, generation: owed?.generation ?? 0 }).queue.cancel(id), Math.max(1, deadline - now()));']],
   ['the unreachable clock counts a dead queue only: a store outage never abandons the run, and one answered call starts the count over', 'pull-ticket.js', ["if (isNamed(err, 'QueueError')) queueDownSince ??= now();", 'queueDownSince ??= now();']],
@@ -737,6 +807,12 @@ const CANARIES = [
   ['T29: a stalled object fetch holds only its own ticket: another ticket\'s step lands first, and the stalled one settles with a warning after 5 passes', 'pull-ticket.js', ['{ deadlineMs: run.objectDeadlineMs, maxBytes: expected.bytes }', '{ deadlineMs: 600_000, maxBytes: expected.bytes }'], /still running/],
   ['T16: cancel outcomes: queued, released, runner-confirmed and a normal finish are decided from the row, an operator-cancelled row stays unproven', 'pull-ticket.js', ["    return result.source === 'queued' ? { kind: 'cancelled', exit: 130, source: 'queued' } : { kind: 'unproven', source: result.source };", "    return { kind: 'cancelled', exit: 130, source: result.source };"]],
   ['T16: cancel outcomes: queued, released, runner-confirmed and a normal finish are decided from the row, an operator-cancelled row stays unproven', 'pull-ticket.js', ['  if (pull?.cancel?.answer !== undefined) return;\n', '']],
+  ['PKG-401: a ticket last seen queued moves to local once the host has lost the queue for localFallbackAfterMs: attempt A settles lost queue-unreachable-local, the owed cancel is written once, and the ticket continues at generation + 1', 'pull-ticket.js', ['downFor >= afterMs && ', '']],
+  ['PKG-401: a ticket last seen queued moves to local once the host has lost the queue for localFallbackAfterMs: attempt A settles lost queue-unreachable-local, the owed cancel is written once, and the ticket continues at generation + 1', 'pull-ticket.js', ["    await persistPull(run, { localFallback: { at: run.now(), fromGeneration: run.generation } });\n    writeOwedCancel(run.root, run.id, { generation: run.generation, at: run.now() });\n", "    await persistPull(run, { localFallback: { at: run.now(), fromGeneration: run.generation } });\n"]],
+  ['PKG-401: a ticket last seen claimed or running keeps today\'s behaviour: it never moves to local and settles lost queue-unreachable', 'pull-ticket.js', ["lastRowState === 'queued' && ", '']],
+  ['PKG-401: a ticket stays put when the lane opted out, or this host cannot admit it locally now, and settles lost queue-unreachable', 'pull-ticket.js', ['ctx.localFallback?.enabled === true && lastRowState', 'lastRowState']],
+  ['PKG-401: a ticket stays put when the lane opted out, or this host cannot admit it locally now, and settles lost queue-unreachable', 'pull-ticket.js', [' && (await ctx.localFallback.couldAdmitNow())', '']],
+  ['PKG-401: while the host is marked down the preparation budget is 60 s, not prepareBudgetMs, for a ticket that may fall back', 'pull-ticket.js', ['Math.min(prepareBudgetMs, FALLBACK_PREPARE_BUDGET_MS)', 'prepareBudgetMs']],
 ];
 
 definePullSuite('pull ticket step machine on a disposable Postgres', SCENARIOS, CANARIES);

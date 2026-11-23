@@ -38,6 +38,23 @@ export class QueueError extends Error {
   }
 }
 
+const TRANSIENT_SQLSTATES = new Set(['53300', '57P01', '57P02', '57P03', '57014', '55P03', '40P01', '40001']);
+const TLS_FAILURE_CODE = /^(ERR_TLS_|ERR_SSL_|CERT_|UNABLE_TO_|DEPTH_ZERO_|SELF_SIGNED_|HOSTNAME_MISMATCH)/;
+
+/** A certificate or protocol failure answers the same way on every retry, so it is a fault to fix and never an outage to wait out. */
+export function tlsFailure(err) {
+  for (let cause = err, depth = 0; cause && depth < 5; cause = cause.cause, depth++) if (TLS_FAILURE_CODE.test(String(cause.code ?? ''))) return true;
+  return false;
+}
+
+/** Only a transport failure, a timeout, 53300, 57P01 or 08xxx says the queue cannot be reached; any other server SQLSTATE will answer the same way again. */
+export function isQueueUnreachable(err) {
+  if (err?.name !== 'QueueError' || tlsFailure(err)) return false;
+  const code = String(err.code ?? '');
+  if (TRANSIENT_SQLSTATES.has(code) || code.startsWith('08')) return true;
+  return err.cause !== undefined && typeof err.cause.severity !== 'string';
+}
+
 const isServerError = (err) => typeof err?.severity === 'string';
 
 const outcomeUnknown = (err) => !isServerError(err) || err.code === '57P01';

@@ -2,14 +2,17 @@ import path from 'node:path';
 import { isSocketQueueUrl, loadGlobalConfigOrError } from './config.js';
 import { publicationBindingsFor } from './pull-publication.js';
 import { createQueueClient } from './queue-client.js';
+import { trackQueueHealth } from './queue-health.js';
 import { createS3Client, loadS3Credentials } from './s3-client.js';
 import { paths } from './state.js';
 
 const unavailable = (reason) =>
   new Proxy({}, { get: () => async () => { throw new Error(`pull dispatch is not available here: ${reason}`); } });
 
+const healthTracked = (queue, root) => (root === undefined ? queue : trackQueueHealth(queue, root));
+
 // no `enabled` check on purpose: tickets in flight must stay recoverable after the switch is turned off
-export function pullServices(cfg) {
+export function pullServices(cfg, root) {
   const pull = cfg?.lanePull;
   const missing = [['laneQueueUrl', cfg?.laneQueueUrl],
     ...(isSocketQueueUrl(cfg?.laneQueueUrl) ? [] : [['lanePull.passwordFile', pull?.passwordFile], ['lanePull.caFile', pull?.caFile]]),
@@ -20,7 +23,7 @@ export function pullServices(cfg) {
     const creds = loadS3Credentials(credentialsEnvFile);
     return {
       available: true,
-      queue: createQueueClient({ url: cfg.laneQueueUrl, passwordFile: pull.passwordFile, caFile: pull.caFile }),
+      queue: healthTracked(createQueueClient({ url: cfg.laneQueueUrl, passwordFile: pull.passwordFile, caFile: pull.caFile }), root),
       s3: createS3Client({ endpoint, region, creds }),
     };
   } catch (err) {
@@ -45,7 +48,7 @@ export function pullContextFor(root, cfg, services, ticket, extra = {}) {
 }
 
 export function pullContextFactory(root, cfg, extra = {}) {
-  const services = pullServices(cfg);
+  const services = pullServices(cfg, root);
   return (ticket) => pullContextFor(root, cfg, services, ticket, extra);
 }
 

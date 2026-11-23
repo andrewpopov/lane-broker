@@ -4,10 +4,12 @@ import { pullConfigured } from './config.js';
 import { lifecycleVerdict } from './pull-check.js';
 import { pullServices } from './pull-services.js';
 import { QUEUE_PROBE } from './queue-client.js';
+import { readQueueHealth } from './queue-health.js';
 import { atomicWriteJson, paths, readJsonSafe } from './state.js';
 
 export const PULL_READY_TTL_MS = 5 * 60_000;
 export const PULL_PROBE_DEADLINE_MS = 3_000;
+export const PULL_DOWN_NEGATIVE_TTL_MS = 30_000;
 
 const readinessFile = (root) => path.join(paths(root).pull, 'readiness.json');
 function fileStamp(file) {
@@ -40,7 +42,10 @@ export function createPullReadiness({ root, ttlMs = PULL_READY_TTL_MS, now = Dat
     const key = connectionKey(cfg);
     const stored = readJsonSafe(readinessFile(root));
     const age = now() - (stored?.at ?? -Infinity);
-    if (stored?.key === key && age >= 0 && age < ttlMs) return stored.verdict;
+    const health = readQueueHealth(root);
+    const failedSince = stored?.verdict?.ready === true && health.lastFailureAt !== null && health.lastFailureAt > stored.at;
+    const ttl = stored?.verdict?.ready === false && health.downSince !== null ? Math.min(ttlMs, PULL_DOWN_NEGATIVE_TTL_MS) : ttlMs;
+    if (stored?.key === key && age >= 0 && age < ttl && !failedSince) return stored.verdict;
     const verdict = await readinessOf(cfg, services);
     fs.mkdirSync(paths(root).pull, { recursive: true });
     atomicWriteJson(readinessFile(root), { key, at: now(), verdict });
@@ -54,7 +59,7 @@ export async function placeForPull({
 }) {
   if (pushChosen) return { route: 'push' };
   if (!pullConfigured(cfg)) return { route: 'legacy' };
-  const services = servicesFor(cfg);
+  const services = servicesFor(cfg, root);
   const verdict = await readiness(cfg, services);
   if (!verdict.ready) return { route: 'legacy', reason: `pull dispatch unavailable: ${verdict.reason}` };
   let placeable;

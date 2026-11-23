@@ -1,12 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { readAttempt, remoteCancelledResult, supervisorAlive, updateAttempt } from './attempts.js';
+import { fallbackToLocal, readAttempt, remoteCancelledResult, supervisorAlive, updateAttempt } from './attempts.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { CANCELLED_BEFORE_ENQUEUE, enqueueOnce } from './pull-enqueue.js';
 import { createEnvelope, pullTicketDir, readEnvelope, recordSnapshot, withTicketLock, writeOwedCancel } from './pull-envelope.js';
 import { ledgerAccept, readLedger } from './pull-ledger.js';
+import { queueDownSince as hostQueueDownSince } from './queue-health.js';
 import { blobKey, mapBounded, uploadSnapshot } from './pull-snapshot.js';
 import { artifactLimitsOf, installArtifactsDurable, receiveArtifacts } from './remote-artifacts.js';
+import { isQueueUnreachable, tlsFailure } from './queue-client.js';
 import { CACHE_REJECT_RE, classifyRemoteResult, provesNeverStarted } from './remote-client.js';
 import { lostResult } from './remote-reconcile.js';
 import { makeReader } from './remote-stream.js';
@@ -18,6 +20,7 @@ import { CappedLogWriter, LOG_CAP_BYTES, publishAttemptTerminal } from './superv
 export const OBJECT_RETRY_PASSES = 5;
 export const DEFAULT_OBJECT_DEADLINE_MS = 20_000;
 export const DEFAULT_STEP_BUDGET_MS = 60_000;
+export const FALLBACK_PREPARE_BUDGET_MS = 60_000;
 const OBJECT_RETRY_POLL_MS = 5_000;
 const MIN_DEFERRED_POLL_MS = 1_000;
 export const STREAM_CHUNK_BYTES = 1024 * 1024;
@@ -25,8 +28,6 @@ export const STREAM_CHUNK_BYTES = 1024 * 1024;
 export const OUTPUT_MARGIN_BYTES = 1024 * 1024;
 const BLOB_HEAD_CONCURRENCY = 8;
 const DIVERGENCE_DEADLINE_MS = 2_000;
-const TRANSIENT_SQLSTATES = new Set(['53300', '57P01', '57P02', '57P03', '57014', '55P03', '40P01', '40001']);
-const TLS_FAILURE_CODE = /^(ERR_TLS_|ERR_SSL_|CERT_|UNABLE_TO_|DEPTH_ZERO_|SELF_SIGNED_|HOSTNAME_MISMATCH)/;
 const SERVER_CANCEL_SOURCES = new Set(['queued', 'operator']);
 const QUEUE_LOST_REASONS = new Set(['queue-restored', 'release-cap', 'runner-lost']);
 const OUTPUTS = [['log', 'logSha256', 'logBytes'], ['artifacts', 'artifactsSha256', 'artifactsBytes']];
@@ -516,12 +517,16 @@ export async function stepPullTicket(ctx) {
   }
 }
 
+const HELD_ROW_STATES = new Set(['claimed', 'running']);
+const rowStateAfter = (step, previous) => (step.state === 'waiting' ? 'queued' : step.state === 'queued' || HELD_ROW_STATES.has(step.state) ? step.state : previous);
+
 const OUTCOME_OF = { finished: 'confirmed', cancelled: 'cancelled', lost: 'lost' };
 
 const settledOutcome = (step) => ({ outcome: OUTCOME_OF[step.decision.kind], decision: step.decision, exitCode: step.decision.exit, result: step.result, already: step.already === true });
 
 const CANCELLED_EXIT = 130;
 const LOST_EXIT = 75;
+export const PULL_UNREACHABLE_REASON = 'pull-unreachable';
 
 /** The process exit a `runPullTicket` outcome ends the supervisor with; undefined for an outcome that is not an exit (a committed withdraw goes to the never-started path). */
 export function pullExitCode(outcome) {
@@ -542,19 +547,11 @@ export function pullExitCode(outcome) {
 const isNamed = (err, name) => err?.name === name;
 
 /** Only a transport failure, a timeout, 53300, 57P01, 08xxx or an S3 5xx is waited out; any other server SQLSTATE or an S3 4xx will answer the same way again. */
-function tlsFailure(err) {
-  for (let cause = err, depth = 0; cause && depth < 5; cause = cause.cause, depth++) if (TLS_FAILURE_CODE.test(String(cause.code ?? ''))) return true;
-  return false;
-}
-
 export function isTransientError(err) {
   if (isNamed(err, 'LockTimeoutError')) return true;
   if (tlsFailure(err)) return false;
   if (isNamed(err, 'S3Error')) return err.status === null || err.status >= 500 || err.status === 408 || err.status === 429;
-  if (!isNamed(err, 'QueueError')) return false;
-  const code = String(err.code ?? '');
-  if (TRANSIENT_SQLSTATES.has(code) || code.startsWith('08')) return true;
-  return err.cause !== undefined && typeof err.cause.severity !== 'string';
+  return isQueueUnreachable(err);
 }
 
 const isPullServiceError = (err) => isNamed(err, 'QueueError') || isNamed(err, 'S3Error');
@@ -603,6 +600,7 @@ export async function preparePullTicketWithRetry(ctx) {
   const sleep = ctx.sleep ?? sleepMs;
   const now = ctx.now ?? Date.now;
   const { pollMs, prepareBudgetMs } = settingsOf(ctx);
+  const budgetMs = () => (ctx.localFallback?.enabled === true && hostQueueDownSince(ctx.root) !== null ? Math.min(prepareBudgetMs, FALLBACK_PREPARE_BUDGET_MS) : prepareBudgetMs);
   const startedAt = now();
   for (;;) {
     if (ctx.cancelRequested?.()) throw new PrepareAbandoned('cancelled');
@@ -611,7 +609,7 @@ export async function preparePullTicketWithRetry(ctx) {
     } catch (err) {
       if (!isTransientError(err)) throw err;
       if (ctx.cancelRequested?.()) throw new PrepareAbandoned('cancelled', err);
-      if (now() - startedAt >= prepareBudgetMs) throw new PrepareAbandoned('budget', err);
+      if (now() - startedAt >= budgetMs()) throw new PrepareAbandoned('budget', err);
       await sleep(pollMs);
     }
   }
@@ -634,21 +632,51 @@ async function abandonUnreachableQueue(ctx) {
   return settled.decision === undefined ? { outcome: settled.state } : settledOutcome(settled);
 }
 
+/**
+ * The host has lost the queue for `localFallbackAfterMs` and the last row state seen was `queued`: attempt A settles lost
+ * `queue-unreachable-local` (ledgered), the cancel its row is owed is written, and the same ticket moves to local generation +1, all
+ * under one ticket lock. Null when something else decided first (a ledgered decision, a cancel), so the loop carries on.
+ */
+async function fallBackToLocalRun(ctx) {
+  const run = runOf(ctx);
+  return withTicketLock(run.root, run.id, async () => {
+    if (readLedger(run.root, run.id) !== null || isCancelled(run.root, run.id)) return null;
+    const attempt = readAttempt(run.root, run.id);
+    if (!attempt || attempt.generation !== run.generation || attempt.executor === 'local') return null;
+    run.envelope = readEnvelope(run.root, run.id);
+    await persistPull(run, { localFallback: { at: run.now(), fromGeneration: run.generation } });
+    writeOwedCancel(run.root, run.id, { generation: run.generation, at: run.now() });
+    const entry = accept(run, entryFor(run, null, lost('queue-unreachable-local')));
+    const moved = await fallbackToLocal(run.root, run.id, PULL_UNREACHABLE_REASON);
+    if (moved.ok) return { outcome: 'local-fallback', reason: PULL_UNREACHABLE_REASON };
+    return settledOutcome(await applyEntry(run, entry));
+  }, { lockTimeoutMs: run.lockTimeoutMs });
+}
+
+const fallbackDue = async (ctx, lastRowState, afterMs, downFor) => ctx.localFallback?.enabled === true && lastRowState === 'queued' && downFor >= afterMs && (await ctx.localFallback.couldAdmitNow());
+
 /** Prepares (when `ctx.prepare` is given), then steps until the ticket settles; a queue, store or lock failure is waited out, never a state change. */
 export async function runPullTicket(ctx) {
   const sleep = ctx.sleep ?? sleepMs;
   const now = ctx.now ?? Date.now;
-  const { pollMs, queueUnreachableAfterMs } = settingsOf(ctx);
+  const { pollMs, queueUnreachableAfterMs, localFallbackAfterMs } = settingsOf(ctx);
   let queueDownSince = null;
+  let lastRowState = null;
   if (ctx.prepare) await preparePullTicketWithRetry(ctx);
   for (;;) {
     let step;
     try {
       step = await stepPullTicket(ctx);
       queueDownSince = null;
+      lastRowState = rowStateAfter(step, lastRowState);
     } catch (err) {
       if (isTransientError(err)) {
         if (isNamed(err, 'QueueError')) queueDownSince ??= now();
+        const hostDownSince = hostQueueDownSince(ctx.root);
+        if (isNamed(err, 'QueueError') && hostDownSince !== null && (await fallbackDue(ctx, lastRowState, localFallbackAfterMs, now() - hostDownSince))) {
+          const moved = await fallBackToLocalRun(ctx);
+          if (moved !== null) return moved;
+        }
         if (queueDownSince !== null && now() - queueDownSince >= queueUnreachableAfterMs) return abandonUnreachableQueue(ctx);
         await sleep(pollMs);
         continue;
@@ -698,5 +726,5 @@ export async function proveNeverEnqueued(ctx) {
 
 export function assertWithdrawCommitted(root, id) {
   const attempt = readAttempt(root, id);
-  if (attempt?.transport === 'pull' && !provenNeverStarted(attempt.pull)) throw new Error(`pull attempt ${id} may not fall back to local before the queue has committed a withdraw or no enqueue was ever recorded`);
+  if (attempt?.transport === 'pull' && !provenNeverStarted(attempt.pull) && attempt.pull?.localFallback === undefined) throw new Error(`pull attempt ${id} may not fall back to local before the queue has committed a withdraw or no enqueue was ever recorded`);
 }

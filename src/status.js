@@ -16,7 +16,8 @@ import { listAttempts, supervisorAlive, moveInterruptedLabel, isStrandedWithdraw
 import { readGateState } from './load.js';
 import { liveDeviceGates, renderDeviceGatesLine, sampleDevice } from './device-gates.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
-import { loadGlobalConfigOrError, isDispatchOnly } from './config.js';
+import { loadGlobalConfigOrError, isDispatchOnly, pullLocalFallbackEnabled } from './config.js';
+import { queueDownSince } from './queue-health.js';
 import { resolveCpuLimit, enforcementOf } from './cpu-limit.js';
 import { collectRunnerStates, renderRunnersLines } from './runner-unreachable.js';
 import { remoteOwnerMap } from './retier.js';
@@ -361,6 +362,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     externalCpu,
     paused,
     ...(isDispatchOnly(cfg) ? { localExecution: 'refused' } : {}),
+    ...(queueDownSince(root) === null ? {} : { pullQueue: { downSince: queueDownSince(root), localFallback: pullLocalFallbackEnabled(cfg) } }),
     // BRAIN-651 L1: whether lane CPU grants can be enforced with a systemd quota here (never probes while mode is "off")
     cpuLimit,
     enforcement: enforcementOf(cpuLimit),
@@ -652,6 +654,7 @@ export function renderStatusText(status) {
     lines.push(`HOLD (exclusive) ${h.id} (${h.key}) waiting for ${h.waitingFor} running lane(s)`);
   }
   if (status.localExecution === 'refused') lines.push('local execution: refused (dispatch-only host)');
+  if (status.pullQueue) lines.push(`pull queue: unreachable since ${new Date(status.pullQueue.downSince).toTimeString().slice(0, 8)}, local fallback ${status.pullQueue.localFallback ? 'active' : 'off'}`);
   lines.push(`pause: ${status.paused ? `PAUSED — ${status.paused}` : 'not paused'}`);
   lines.push(renderRemoteDrainLine(status.remoteDrain, { running: status.running.length, queued: status.queued.length }));
   if (status.drainMarkers?.length) lines.push(renderDrainMarkerLines(status.drainMarkers));

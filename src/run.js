@@ -783,6 +783,7 @@ export async function runCommand({
     // refusal if/when a remote-eligible localRefused lane falls back to
     // running locally -- see the immediate-refusal comment above.
     localRefused: resolved.localRefused,
+    pullLocalFallback: resolved.pullLocalFallback,
     allowLocalSim: Boolean(allowLocalSim),
     cwd,
     cmd,
