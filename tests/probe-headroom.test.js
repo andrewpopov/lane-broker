@@ -174,19 +174,19 @@ test('BRAIN-1266: admissible CPU is budget minus external load plus the idle ove
   const { state } = freshEnv();
   const now = Date.now();
   const lease = { id: 'lease-x', key: 'k:x', weight: 2, resources: { cpuCores: 2 }, observedCpuCores: 2.5, observedAt: now };
-  // 9.3 busy: 2.5 the lease's, 4 niced non-lane (preemptible, 0.8 counted as free). Undiscounted external 6.8; discounted 6.8 - 3.2
+  // 9.3 busy, 2.5 of it the lease's: external 6.8. The niced row is not discounted while a lease without a pgid is held (preemptibleCores fails closed)
   const both = await headroomBoth(state, [lease], measuring(9.3, window(row(4242, 15, 4))), now);
   assert.ok(Math.abs(both.cpuAdmissibleCoresUndiscounted - (BUDGET - 6.8 + cfg.resourceIdleOvershootCores)) < 1e-9, `got ${both.cpuAdmissibleCoresUndiscounted}`);
-  assert.ok(Math.abs(both.cpuAdmissibleCores - (BUDGET - 3.6 + cfg.resourceIdleOvershootCores)) < 1e-9, `got ${both.cpuAdmissibleCores}`);
+  assert.ok(Math.abs(both.cpuAdmissibleCores - both.cpuAdmissibleCoresUndiscounted) < 1e-9, `got ${both.cpuAdmissibleCores}`);
   const probed = probeHeadroom({ cpuBudgetCores: BUDGET, reservedCpuCores: 0 }, cfg, true, 0, both);
-  assert.ok(Math.abs(probed.cpuAdmissibleCores - 9.4) < 1e-9);
+  assert.ok(Math.abs(probed.cpuAdmissibleCores - 6.2) < 1e-9);
   assert.ok(Math.abs(probed.cpuAdmissibleCoresUndiscounted - 6.2) < 1e-9);
 });
 
 test('BRAIN-1266: a preemptible-heavy runner still places a 2-core ticket (the discount is not discarded)', async () => {
   const { state } = freshEnv();
   const both = await headroomBoth(state, [], measuring(14, window(row(4242, 15, 11))));
-  assert.equal(both.cpuAdmissibleCoresUndiscounted, cfg.resourceIdleOvershootCores);
+  assert.equal(both.cpuAdmissibleCoresUndiscounted, 0); // 12 - 14 + 1, clamped
   assert.ok(Math.abs(both.cpuAdmissibleCores - (BUDGET - 5.2 + cfg.resourceIdleOvershootCores)) < 1e-9);
   const probe = { headroom: probeHeadroom({ cpuBudgetCores: BUDGET, reservedCpuCores: 0 }, cfg, true, 0, both) };
   assert.ok(probe.headroom.cpuAdmissibleCores >= 2, 'the 2-core ticket is not starved');

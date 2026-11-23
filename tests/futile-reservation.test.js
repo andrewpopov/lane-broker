@@ -453,12 +453,14 @@ test('BRAIN-1266 when external load drops the aged head is no longer futile and 
   const { state } = freshEnv();
   const head = agedCpuHead();
   await enqueue(state, head);
-  holdLease(state, 'busy', 6, observed(5.5));
-  await poll(state, head, { ext: 12.5 }); // 7 external + 4 > 9
+  holdLease(state, 'light', 2, observed(0.5));
+  await poll(state, head, { ext: 7.5 }); // 7 external + 4 > 9 + overshoot
   assert.equal(readResourceSkipState(state).futile, 'cpu');
-  await poll(state, head, { ext: 7.5 }); // 2 external: fits once busy drains, denied while it runs
+  removeLease(state, 'light');
+  holdLease(state, 'busy', 2, { ...observed(5), resources: { cpuCores: 5 } });
+  await poll(state, head, { ext: 5.5 }); // 0.5 external: fits once busy drains, denied while it runs
   assert.equal(readResourceSkipState(state).futile, undefined);
-  const started = await backfillAt(state, head, 7.5, cfg.resourceSkipLimit);
+  const started = await backfillAt(state, head, 5.5, cfg.resourceSkipLimit);
   assert.ok(started.every((r) => r.started === true), JSON.stringify(started.map((r) => r.reason)));
   assert.equal(readResourceSkipState(state).reserved, true);
 });
