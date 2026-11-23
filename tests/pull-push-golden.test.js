@@ -74,4 +74,10 @@ if (process.env.T14_GOLDEN_RECORD) {
     const failure = await assertCanaryFails('pull-placement.js', mutation, scenario(dispatchOnlyDown));
     assert.match(failure.message, new RegExp(dispatchOnlyDown));
   });
+  const noRunnerLocal = 'the only runner down and the ticket locally eligible';
+  test('canary: with an option added to the fallbackOrRefuse signature the recorder cannot wrap it, and the push no-runner fixture fails by name', { timeout: 180_000 }, async () => {
+    const mutation = ['retryable = noRunner, failureKind } = {}) {', 'retryable = noRunner, failureKind, extra = false } = {}) {'];
+    const failure = await assertCanaryFails('supervisor.js', mutation, scenario(noRunnerLocal));
+    assert.match(failure.message, new RegExp(noRunnerLocal));
+  });
 }

@@ -5,6 +5,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { laneRun, writeRepoConfig, gitFixture, waitFor } from './helpers.js';
 import { paths } from '../src/state.js';
+import { recordQueueCall } from '../src/queue-health.js';
 import { locallyRefusedNow, localWindowAllowing } from '../src/resources.js';
 import { setup as remoteSetup, tmpDir, markerCmd, detachAndWait, resultOf } from './remote-harness.js';
 
@@ -496,4 +497,17 @@ test('BRAIN-769: a tree-lock wait past localTreeLockWaitMs exits 77, removes the
   assert.equal(fs.existsSync(path.join(paths(ctx.state).leases, `${idB}.json`)), false, 'lease released');
   await laneRun(['cancel', a.stdout.trim()], { env: ctx.env });
   await laneRun(['wait', a.stdout.trim(), '--timeout', '20s'], { env: ctx.env });
+});
+
+test('PKG-401: a marked-down pull queue on an opted-in host does not lift localRefused for a ticket a runner can take: a local-first localRefused lane still runs REMOTELY', async () => {
+  const { env, state, repoDir, home } = remoteSetup({ ssh: 'normal' });
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, remote: true, localRefused: true, remotePolicy: 'local-first' } } });
+  const globalFile = path.join(home, 'config.json');
+  fs.writeFileSync(globalFile, JSON.stringify({ ...JSON.parse(fs.readFileSync(globalFile, 'utf8')), lanePull: { localFallbackWhenUnreachable: true } }));
+  await recordQueueCall(state, false, Date.now());
+  const marker = path.join(tmpDir('marker'), 'where');
+  const { id, waited } = await detachAndWait(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', ...markerCmd(marker, 0)], env, repoDir);
+  assert.equal(waited.code, 0, `stderr: ${waited.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'remote', 'the bypass is only for a ticket taking the pull-unreachable path');
+  assert.equal(resultOf(state, id).executor, 'remote');
 });

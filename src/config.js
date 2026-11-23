@@ -267,6 +267,9 @@ export const DEFAULT_GLOBAL_CONFIG = {
     unprovenCancelLostAfterMs: 600_000,
     queueUnreachableAfterMs: 900_000,
     prepareBudgetMs: 600_000,
+    // PKG-401: while the queue is marked unreachable this host runs its own pull tickets locally (opt-in); the mark needs `localFallbackAfterMs` of unreachability before a ticket already in the queue is moved
+    localFallbackWhenUnreachable: false,
+    localFallbackAfterMs: 600_000,
     blobGc: true,
     blobRefreshAfterDays: 7,
     rowRetentionMs: 7 * 24 * 3_600_000,
@@ -610,7 +613,7 @@ export function isSocketQueueUrl(raw) {
   return laneQueueUrlProblem(raw) === null && parsePgConnectionString(raw).host.startsWith('/');
 }
 
-const LANE_PULL_NUMBERS = ['pollMs', 'unprovenCancelLostAfterMs', 'queueUnreachableAfterMs', 'prepareBudgetMs', 'blobRefreshAfterDays', 'rowRetentionMs', 'ledgerRetentionMs'];
+const LANE_PULL_NUMBERS = ['pollMs', 'unprovenCancelLostAfterMs', 'queueUnreachableAfterMs', 'prepareBudgetMs', 'localFallbackAfterMs', 'blobRefreshAfterDays', 'rowRetentionMs', 'ledgerRetentionMs'];
 // the queue's backup retention: a ledger entry must outlive every backup a restore could return
 export const LEDGER_RETENTION_FLOOR_MS = 35 * 24 * 3_600_000;
 const LANE_PULL_PATHS = ['passwordFile', 'caFile', 'ledgerDir'];
@@ -625,6 +628,7 @@ function validateLanePull(cfg, sourcePath) {
   assert(isPlainObject(pull), `${sourcePath}: "lanePull" must be an object`);
   assert(typeof pull.enabled === 'boolean', `${sourcePath}: "lanePull.enabled" must be a boolean`);
   assert(typeof pull.blobGc === 'boolean', `${sourcePath}: "lanePull.blobGc" must be a boolean`);
+  assert(typeof pull.localFallbackWhenUnreachable === 'boolean', `${sourcePath}: "lanePull.localFallbackWhenUnreachable" must be a boolean`);
   for (const field of LANE_PULL_NUMBERS) assert(Number.isInteger(pull[field]) && pull[field] > 0, `${sourcePath}: "lanePull.${field}" must be a positive integer`);
   assert(pull.ledgerRetentionMs >= LEDGER_RETENTION_FLOOR_MS, `${sourcePath}: "lanePull.ledgerRetentionMs" must be at least ${LEDGER_RETENTION_FLOOR_MS} (35 days, the queue's backup retention)`);
   assert(pull.queuedTimeoutMs === undefined || (Number.isInteger(pull.queuedTimeoutMs) && pull.queuedTimeoutMs > 0), `${sourcePath}: "lanePull.queuedTimeoutMs" must be a positive integer`);
@@ -689,6 +693,9 @@ export const pushRunners = (cfg) => (cfg?.runners ?? []).filter((r) => r.transpo
 export const pullRunners = (cfg) => (cfg?.runners ?? []).filter((r) => r.transport === 'pull');
 
 /** How long a pull ticket may sit unclaimed before the supervisor withdraws it, per lane then globally; undefined is unbounded. */
+/** Whether this host may run `ticket` itself while the pull queue is unreachable: opted in per host, not opted out per lane, and never a dispatch-only host. */
+export const pullLocalFallbackEnabled = (cfg, ticket) => cfg?.lanePull?.localFallbackWhenUnreachable === true && ticket?.pullLocalFallback !== false && !isDispatchOnly(cfg);
+
 export const pullQueuedTimeoutMs = (cfg, lane) => cfg?.lanePull?.queuedTimeoutMsByLane?.[lane] ?? cfg?.lanePull?.queuedTimeoutMs;
 
 /** Whether the config alone says pull dispatch is usable: enabled, a pull runner, and every connection key present. Reads nothing from disk or the network. */
@@ -882,6 +889,9 @@ function validateRepoConfig(cfg, sourcePath) {
     }
     if (lane.localRefused !== undefined) {
       assert(typeof lane.localRefused === 'boolean', `${sourcePath}: lane "${name}".localRefused must be a boolean`);
+    }
+    if (lane.pullLocalFallback !== undefined) {
+      assert(typeof lane.pullLocalFallback === 'boolean', `${sourcePath}: lane "${name}".pullLocalFallback must be a boolean`);
     }
     if (lane.nice !== undefined) {
       assert(
@@ -1638,6 +1648,8 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     ...(laneCfg.maxExecutionCpuCores !== undefined ? { maxExecutionCpuCores: laneCfg.maxExecutionCpuCores } : {}),
     memoryBytes: Number.isFinite(laneCfg.memoryBytes) ? laneCfg.memoryBytes : null,
     localRefused: Boolean(laneCfg.localRefused),
+    // PKG-401: false opts this lane out of the local fallback while the pull queue is unreachable
+    pullLocalFallback: laneCfg.pullLocalFallback !== false,
     // null (not defaulted here) when the lane doesn't declare its own nice:
     // the caller (run.js) applies the global `laneNice` fallback, the same
     // "per-lane overrides global" shape as everything else in this file.

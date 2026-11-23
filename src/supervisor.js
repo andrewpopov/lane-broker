@@ -35,7 +35,9 @@ import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processSt
 import { isPidAlive, isProcessAlive } from './process-liveness.js';
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, leaderIdentityOf, reapLogLine, cancelGraceMs } from './descendants.js';
-import { reloadGlobalConfig, isDispatchOnly, pushRunners, pullRunners, pullQueuedTimeoutMs } from './config.js';
+import { reloadGlobalConfig, isDispatchOnly, pushRunners, pullRunners, pullQueuedTimeoutMs, pullLocalFallbackEnabled } from './config.js';
+import { toolsOnPath } from './agent/claims.js';
+import { localFallbackActive } from './queue-health.js';
 import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope, scopeMemoryPeakReader, scopeMemoryPeakTracker, enforcementLabel } from './cpu-limit.js';
 import { stateHome, RUNNER_SHUTDOWN_REASON, LOST_REASONS } from './state.js';
 import { childExitSafeFlags } from './node-exit-safe.js';
@@ -55,7 +57,7 @@ import { placeForPull } from './pull-placement.js';
 import { publicationBindings, publicationOf } from './pull-publication.js';
 import { pullContextFor } from './pull-services.js';
 import { withRepoIdentity } from './pull-snapshot.js';
-import { assertWithdrawCommitted, PrepareAbandoned, preparePullTicketWithRetry, proveNeverEnqueued, pullExitCode, runPullTicket, sleepUnlessAborted, withdrawQueued as withdrawPullQueued } from './pull-ticket.js';
+import { assertWithdrawCommitted, PrepareAbandoned, PULL_UNREACHABLE_REASON, preparePullTicketWithRetry, proveNeverEnqueued, pullExitCode, runPullTicket, sleepUnlessAborted, withdrawQueued as withdrawPullQueued } from './pull-ticket.js';
 import { remoteCpuAllocation, selectRunner, dispatchRemote, remoteCancel, buildExecHeader, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, estimatedFinish, haveDeadlineFor, DRAIN_MOVE_REASON, SOURCE_LEAVING_REASONS, QUEUED_TOO_LONG_REASON, REFUSED_MOVE_TARGET } from './remote-client.js';
 import { runnerUnavailableReason } from './runner-schedule.js';
 import { remoteExcludeWarnings } from './remote-exclude.js';
@@ -644,6 +646,7 @@ export function historyRow(ticket, result, { fallbackReason, lease, contentKey =
     // BRAIN-700: the tree still hashed to the key when the run ended, so a failure on it is a verdict about that content
     ...(contentKey && contentKeyVerified ? { contentKeyVerified: true } : {}),
     ...(ticket.retryReason ? { retryReason: ticket.retryReason } : {}),
+    ...(fallbackReason === PULL_UNREACHABLE_REASON ? { transport: 'local', fallbackReason } : {}),
     ...(ticket.pushGate ? { ...pushGateRowFields(ticket.pushGate), ...pushHoldFields() } : {}),
     ...(ticket.logPath ? { logPath: ticket.logPath } : {}),
     // BRAIN-380 §8: only a ticket that was admitted has a lease, so only its row carries the admission audit
@@ -667,11 +670,11 @@ function migrationRefusalResult(ticket) {
 /** Why this machine can never run the ticket (a refusal result), or null: a `localRefused` lane without --allow-local-sim,
  *  an explicit execution ceiling without usable quotas, or a claim over the local budget. The one definition behind local-first, the queued-runner choice, the fallback and
  *  whether the ticket carries a queue timeout (which exists only to enable a local fallback). */
-export function localIneligibilityOf(enriched, globalCfg, cpuLimit) {
+export function localIneligibilityOf(enriched, globalCfg, cpuLimit, { pullFallback = false } = {}) {
   // BRAIN-634: a dispatch-only host can never run anything; every caller treats that as "no local fallback" (no queue timeout,
   // no local-first, no speed-aware local choice, wait on a busy runner). It wins over a BRAIN-629 localWindow.
   if (isDispatchOnly(globalCfg)) return dispatchOnlyRefusal(enriched.lane);
-  if (locallyRefusedNow(enriched, globalCfg)) return localSimRefusal(enriched.lane, enriched.class);
+  if (!pullFallback && locallyRefusedNow(enriched, globalCfg)) return localSimRefusal(enriched.lane, enriched.class);
   if (enriched.maxExecutionCpuCores !== undefined && (cpuLimit?.mode === 'off' || cpuLimit?.available !== true)) {
     const error = new CpuLimitUnavailableError(cpuLimit?.reason ?? 'quota support unavailable', 'maxExecutionCpuCores was requested');
     return { exitCode: LOCAL_REFUSED_EXIT_CODE, message: `lane run: ${error.message}\n` };
@@ -1081,6 +1084,17 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     return { fallback: true, rebindFailed: true, attemptGeneration: gen };
   }
 
+  const requiredToolsPresent = () => {
+    const required = enriched.remote?.requires ?? [];
+    return toolsOnPath(required, process.env.PATH).length === required.length;
+  };
+  let movedByPullFallback = false;
+  let onPullUnreachablePath = false;
+  const pullFallbackNow = () => movedByPullFallback || (onPullUnreachablePath && localFallbackActive(root, globalCfg, enriched) && requiredToolsPresent());
+  const fallbackFromPull = (pullUnreachable, runner, reason, options) => {
+    onPullUnreachablePath = pullUnreachable;
+    return fallbackOrRefuse(runner, reason, options);
+  };
   const localIneligibility = () => localIneligibilityOf(enriched, globalCfg, cpuLimit);
 
   /** `rebindable`: this fallback is only "no runner had room right now", so a later probe may still find one.
@@ -1090,7 +1104,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   async function fallbackOrRefuse(runner, reason, { rebindable = false, retryWhenBlocked = false, neverStarted = false, noRunner = false, retryable = noRunner, failureKind } = {}) {
     assertPullFallbackAllowed();
     if (rebind) return abandonRebind(runner, reason, { neverStarted: neverStarted || withdrawn === null });
-    const fb = await fallbackToLocal(root, enriched.id, reason);
+    const fb = movedByPullFallback ? { ok: true, attempt: readAttempt(root, enriched.id) } : await fallbackToLocal(root, enriched.id, reason);
     if (!fb.ok) {
       if (fb.cancelled) {
         await publishAndExit(0, () => {
@@ -1102,9 +1116,11 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     }
 
     const dispatchOnly = isDispatchOnly(globalCfg);
-    const refusedHere = dispatchOnly || locallyRefusedNow(enriched, globalCfg);
-    const otherwiseIneligible = localIneligibility();
-    const windowLabel = !refusedHere && enriched.localRefused && !enriched.allowLocalSim ? localWindowAllowing(enriched, globalCfg) : null;
+    const pullFallback = pullFallbackNow();
+    const fallbackIneligibility = () => localIneligibilityOf(enriched, globalCfg, cpuLimit, { pullFallback });
+    const refusedHere = dispatchOnly || (!pullFallback && locallyRefusedNow(enriched, globalCfg));
+    const otherwiseIneligible = fallbackIneligibility();
+    const windowLabel = !refusedHere && !pullFallback && enriched.localRefused && !enriched.allowLocalSim ? localWindowAllowing(enriched, globalCfg) : null;
     const where = dispatchOnly
       ? 'not running locally (localExecution refused)'
       : refusedHere
@@ -1138,7 +1154,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       return { fallback: false };
     }
 
-    const localRefusal = localIneligibility();
+    const localRefusal = fallbackIneligibility();
     if (localRefusal) {
       // a busy fleet is retryable: a local POLICY refusal (69) becomes 76; a budget refusal (64) and a lane no runner can EVER take keep their codes (TPWR-674)
       const refusal = noRunner && retryable && localRefusal.exitCode === LOCAL_REFUSED_EXIT_CODE ? noRunnerLocallyIneligibleRefusal(enriched.lane, reason, localRefusal.message) : localRefusal;
@@ -1290,6 +1306,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     const ctx = {
       ...pullContextFor(root, globalCfg, services, { id: enriched.id, generation: gen }),
       ...publicationBindings(root, publication),
+      localFallback: { enabled: pullLocalFallbackEnabled(globalCfg, enriched) && requiredToolsPresent(), couldAdmitNow: async () => (await couldAdmitNow(root, globalCfg, enriched)).admit },
       prepare: {
         worktreeRoot,
         manifest,
@@ -1326,6 +1343,10 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     const exitCode = pullExitCode(outcome);
     if (outcome.outcome === 'unresolved') return exitUnresolved(`pull dispatch unresolved: ${outcome.reason}${outcome.error ? ` (${outcome.error})` : ''}`, exitCode);
     if (exitCode !== undefined) return exitSettled(exitCode);
+    if (outcome.outcome === 'local-fallback') {
+      movedByPullFallback = true;
+      return fallbackFromPull(true, null, PULL_UNREACHABLE_REASON, {});
+    }
     if (outcome.outcome === 'withdrawn') {
       const committed = outcome.proof === true || (await withdrawPullQueued(ctx)).proof;
       if (!committed) {
@@ -1350,9 +1371,10 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       await publishAndExit(gen, () => remoteCancelledResult(enriched.id, attemptStartedAt));
       return { fallback: false };
     }
-    return fallbackOrRefuse(null, reason, { neverStarted: true, noRunner: true, retryable: true });
+    return fallbackFromPull(true, null, reason, { neverStarted: true, noRunner: true, retryable: true });
   }
 
+  let pullUnavailable = false;
   if (!rebind) {
     const skippedSummary = () => (skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : 'no runners configured');
     const route = await placeForPull({
@@ -1365,6 +1387,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       couldRunLocally: async () => (await couldAdmitNow(root, globalCfg, enriched)).admit || (await couldBypassNow(root, globalCfg, enriched)).admit,
     });
     if (route.reason && route.route === 'legacy') {
+      pullUnavailable = true;
       const line = `lane: pull-dispatch: ${route.reason}; using the push flow\n`;
       process.stderr.write(line);
       writeBrokerLog(root, line);
@@ -1387,7 +1410,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     const reason = skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : 'no runners configured';
     // every configured runner is too small for this ticket for good: no retry will place it
     const neverPlaceable = skipped.length > 0 && skipped.length === pushRunners(globalCfg).length && skipped.every((s) => s.neverFits === true);
-    return fallbackOrRefuse(null, reason, { rebindable: true, noRunner: true, retryable: !neverPlaceable });
+    return fallbackFromPull(pullUnavailable, null, reason, { rebindable: true, noRunner: true, retryable: !neverPlaceable });
   }
 
   if (speed && !busyQueuedAt) {

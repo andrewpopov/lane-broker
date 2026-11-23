@@ -7,7 +7,7 @@ import { readLedger } from '../src/pull-ledger.js';
 import { S3Error } from '../src/s3-client.js';
 import { QueueError } from '../src/queue-client.js';
 import { sha256Hex } from '../src/s3-presign.js';
-import { definePullSuite, pullFixture, artifactsStream, ARTIFACT_PATH, UNPROVEN_CANCEL_ROW } from './helpers/pull-fixture.js';
+import { advancing, deadQueue, definePullSuite, pullFixture, prepareOver, artifactsStream, ARTIFACT_PATH, transportError, UNPROVEN_CANCEL_ROW } from './helpers/pull-fixture.js';
 import { call, logins, simulateRestore, tid } from './lane-dispatch-fixture.js';
 
 /** BRAIN-1036 R5: the step machine against a disposable queue, a stub runner and the S3 stub (T1, T3, T4-T6, T8, T12, T16, T23, T27-T29). */
@@ -307,7 +307,6 @@ SCENARIOS['enqueueOnce sends nothing once a decision is ledgered'] = async (load
 };
 
 const sqlError = (code) => new QueueError('ld_get failed', { code, cause: Object.assign(new Error('server said no'), { severity: 'ERROR', code }) });
-const transportError = new QueueError('ld_get failed: connection reset', { code: 'ECONNRESET', cause: new Error('reset') });
 const STOP = new Error('stopped waiting');
 const failingGet = (fx, err) => ({ ...fx.queue, get: async () => { throw err; } });
 const retriesThenStops = (limit = 3) => { const sleeps = []; return { sleeps, sleep: async (ms) => { sleeps.push(ms); if (sleeps.length >= limit) throw STOP; } }; };
@@ -418,11 +417,6 @@ SCENARIOS['an unproven cancel stays unresolved until unprovenCancelLostAfterMs (
   assert.equal(lastly.decision.reason, 'cancel-unproven');
 };
 
-const deadQueue = (fx) => ({ ...fx.queue, ...Object.fromEntries(['get', 'cancel', 'withdraw', 'queueRef', 'enqueueFenced'].map((name) => [name, async () => { throw transportError; }])) });
-const advancing = (fx, limit = 20) => {
-  const sleeps = [];
-  return { sleeps, sleep: async (ms) => { assert.ok(sleeps.push(ms) <= limit, 'the run never gave up on the dead queue'); fx.clock.now += ms; } };
-};
 
 SCENARIOS['after queueUnreachableAfterMs of a dead queue the ticket settles lost 75 queue-unreachable at once; the cancel it owes the row waits in a marker the reconcile sweep sends once the queue answers'] = async (load, w, t) => {
   const { sweepOrphans } = await load('reconcile-sweep.js');
@@ -481,7 +475,6 @@ SCENARIOS['the priority a requested tier is enqueued at sits in the band the que
   assert.deepEqual(scores, [0, 1, 2]);
 };
 
-const prepareOver = (fx, over) => fx.prepareRetrying({ s3: { ...fx.s3, putObjectFromFile: async () => { throw new S3Error('s3 PUT answered 503', { status: 503 }); } }, ...over });
 
 SCENARIOS['a store outage during preparation ends within prepareBudgetMs (the snapshot could not be prepared), and a cancel during it ends it at once'] = async (load, w, t) => {
   const { PrepareAbandoned } = await load('pull-ticket.js');
@@ -682,13 +675,14 @@ SCENARIOS['T16: cancel outcomes: queued, released, runner-confirmed and a normal
   assert.equal(lostFirst.cancelCalls, 2, 'the first answer is persisted, so the cancel is not sent again');
 };
 
+
 const CANARIES = [
   ['runPullTicket ends the run when a step is unresolved instead of looping on a renewed lease', 'pull-ticket.js', ["    if (step.state === 'unresolved') return { outcome: 'unresolved', reason: step.reason, exitCode: step.exitCode };\n", '']],
-  ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'pull-ticket.js', ["['53300', '57P01', '57P02', '57P03', '57014', '55P03', '40P01', '40001']", "['53300', '57P01']"]],
+  ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'queue-client.js', ["['53300', '57P01', '57P02', '57P03', '57014', '55P03', '40P01', '40001']", "['53300', '57P01']"]],
   ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'pull-ticket.js', ['  if (tlsFailure(err)) return false;\n', '']],
-  ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'pull-ticket.js', ['  return err.cause !== undefined && typeof err.cause.severity !== \'string\';', '  return true;']],
+  ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'queue-client.js', ['  return err.cause !== undefined && typeof err.cause.severity !== \'string\';', '  return true;']],
   ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'pull-ticket.js', ['return err.status === null || err.status >= 500 || err.status === 408 || err.status === 429;', 'return true;']],
-  ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'pull-ticket.js', ["if (TRANSIENT_SQLSTATES.has(code) || code.startsWith('08')) return true;\n", '']],
+  ['a transient failure is waited out; any other server error or a store 4xx ends the run unresolved, neither lost nor green', 'queue-client.js', ["if (TRANSIENT_SQLSTATES.has(code) || code.startsWith('08')) return true;\n", '']],
   ['a bound rejected result settles lost 75 with no second enqueue: snapshot-blob-missing for a cache reason, runner-rejected otherwise', 'pull-ticket.js', ["  if (result.kind === 'rejected' && provesNeverStarted(result, expected)) return lost(CACHE_REJECT_RE.test(result.reason ?? '') ? 'snapshot-blob-missing' : 'runner-rejected', result.reason);\n", '']],
   ['a snapshot object that vanished before the first send settles lost snapshot-missing and sends nothing', 'pull-ticket.js', ["    if (reason) return { outcome: 'lost', reason };\n", '']],
   ['enqueueOnce sends nothing once a decision is ledgered', 'pull-enqueue.js', ["    if (ledgered()) return { outcome: 'settled' };\n", '']],
@@ -705,7 +699,7 @@ const CANARIES = [
   ['T27: output keys are derived from the row, never sent: a reclaimed ticket reads only its current epoch and its own host, whatever else sits in the bucket', 'pull-ticket.js', ['`${host}/${id}/e${epoch}/${name}`', '`a2/${id}/e${epoch}/${name}`']],
   ['T27: output keys are derived from the row, never sent: a reclaimed ticket reads only its current epoch and its own host, whatever else sits in the bucket', 'pull-ticket.js', ['`${host}/${id}/e${epoch}/${name}`', '`${host}/${id}/e1/${name}`']],
   ['the priority a requested tier is enqueued at sits in the band the queue scores for that tier: low, medium and high score 0, 1 and 2', 'priority.js', ['const PULL_QUEUE_BAND_START = [0, 4, 7];', 'const PULL_QUEUE_BAND_START = [0, 3, 6];']],
-  ['a store outage during preparation ends within prepareBudgetMs (the snapshot could not be prepared), and a cancel during it ends it at once', 'pull-ticket.js', ['      if (now() - startedAt >= prepareBudgetMs) throw new PrepareAbandoned(\'budget\', err);\n', '']],
+  ['a store outage during preparation ends within prepareBudgetMs (the snapshot could not be prepared), and a cancel during it ends it at once', 'pull-ticket.js', ['      if (now() - startedAt >= budgetMs()) throw new PrepareAbandoned(\'budget\', err);\n', '']],
   ['a store outage during preparation ends within prepareBudgetMs (the snapshot could not be prepared), and a cancel during it ends it at once', 'pull-ticket.js', ["      if (ctx.cancelRequested?.()) throw new PrepareAbandoned('cancelled', err);\n", '']],
   ['a store outage during preparation ends within prepareBudgetMs (the snapshot could not be prepared), and a cancel during it ends it at once', 'pull-ticket.js', ["    if (ctx.cancelRequested?.()) throw new PrepareAbandoned('cancelled');\n", '']],
   ['a cancel that is in force when the enqueue is about to be recorded ends the ticket cancelled 130 with no row and no send, whatever the earlier checks saw', 'pull-enqueue.js', ['    if (intent.attempts.length === 0 && cancelRequested()) return { outcome: CANCELLED_BEFORE_ENQUEUE, settled: await settleCancelled() };\n', '']],
@@ -727,7 +721,7 @@ const CANARIES = [
   ['an unproven cancel stays unresolved until unprovenCancelLostAfterMs (10 min by default), then settles lost 75 cancel-unproven', 'pull-ticket.js', ['run.cfg.unprovenCancelLostAfterMs', '600_000']],
   ['an unproven cancel stays unresolved until unprovenCancelLostAfterMs (10 min by default), then settles lost 75 cancel-unproven', 'pull-ticket.js', ['if (run.now() - since >= run.cfg.unprovenCancelLostAfterMs) return settle(', 'if (true) return settle(']],
   ['after queueUnreachableAfterMs of a dead queue the ticket settles lost 75 queue-unreachable at once; the cancel it owes the row waits in a marker the reconcile sweep sends once the queue answers', 'pull-ticket.js', ['        if (queueDownSince !== null && now() - queueDownSince >= queueUnreachableAfterMs) return abandonUnreachableQueue(ctx);\n', '']],
-  ['after queueUnreachableAfterMs of a dead queue the ticket settles lost 75 queue-unreachable at once; the cancel it owes the row waits in a marker the reconcile sweep sends once the queue answers', 'pull-ticket.js', ['    writeOwedCancel(run.root, run.id, { generation: run.generation, at: run.now() });\n', '']],
+  ['after queueUnreachableAfterMs of a dead queue the ticket settles lost 75 queue-unreachable at once; the cancel it owes the row waits in a marker the reconcile sweep sends once the queue answers', 'pull-ticket.js', ['    writeOwedCancel(run.root, run.id, { generation: run.generation, at: run.now() });\n    return settle(run, entryFor(run, null, lost(\'queue-unreachable\')));\n', '    return settle(run, entryFor(run, null, lost(\'queue-unreachable\')));\n']],
   ['after queueUnreachableAfterMs of a dead queue the ticket settles lost 75 queue-unreachable at once; the cancel it owes the row waits in a marker the reconcile sweep sends once the queue answers', 'pull-recover.js', ['      await withDeadline(ctxFor({ id, generation: owed?.generation ?? 0 }).queue.cancel(id), Math.max(1, deadline - now()));\n', '']],
   ['after queueUnreachableAfterMs of a dead queue the ticket settles lost 75 queue-unreachable at once; the cancel it owes the row waits in a marker the reconcile sweep sends once the queue answers', 'pull-recover.js', ['      await withDeadline(ctxFor({ id, generation: owed?.generation ?? 0 }).queue.cancel(id), Math.max(1, deadline - now()));\n      await clearOwedCancel(root, id);', '      await clearOwedCancel(root, id);\n      await withDeadline(ctxFor({ id, generation: owed?.generation ?? 0 }).queue.cancel(id), Math.max(1, deadline - now()));']],
   ['the unreachable clock counts a dead queue only: a store outage never abandons the run, and one answered call starts the count over', 'pull-ticket.js', ["if (isNamed(err, 'QueueError')) queueDownSince ??= now();", 'queueDownSince ??= now();']],
