@@ -6,7 +6,10 @@ import { connect } from './lane-db.js';
 
 export const QUEUE_CONNECT_TIMEOUT_MS = 5_000;
 export const QUEUE_QUERY_TIMEOUT_MS = 15_000;
-export const QUEUE_PROBE = { attempts: 1, connectTimeoutMs: 2_000, queryTimeoutMs: 3_000 };
+// Readiness and placement probes decide whether a lane runs at all: every runner is pull, so a failed probe is a refusal with no push fallback.
+// A DERP-relayed tailnet (UDP blocked) needs 1.4-1.7s for a TLS login plus a query and can time out once in a while, so a probe gets 4 attempts
+// with a 6s connect and a 6s query deadline: one transient timeout is retried, and a dead queue still fails in about 25s (4 x 6s + backoff).
+export const QUEUE_PROBE = { attempts: 4, connectTimeoutMs: 6_000, queryTimeoutMs: 6_000 };
 const MAX_ATTEMPTS = 6;
 const BACKOFF_BASE_MS = 100;
 const BACKOFF_CAP_MS = 2_000;
@@ -44,7 +47,8 @@ const outcomeUnknown = (err) => !isServerError(err) || err.code === '57P01';
 
 function retryable(err, { phase, idempotent }) {
   if (err.code === TOO_MANY_CONNECTIONS) return true;
-  return phase === 'query' && idempotent && outcomeUnknown(err);
+  if (phase === 'connect') return !isServerError(err) && !(err instanceof QueueError);
+  return idempotent && outcomeUnknown(err);
 }
 
 const readSecretFile = (file, what) => {
