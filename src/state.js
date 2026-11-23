@@ -315,8 +315,9 @@ export function ensureStateDirs(root = stateHome()) {
 
 /**
  * Write `data` to `file` atomically: write to a temp file in the same dir, then rename. Never follows symlinks.
- * `fsync` (BRAIN-380's migration writes only) makes the result durable across power loss: the file is fsynced before
- * the rename and the directory after it, so neither the bytes nor the rename can be lost behind a later write.
+ * `fsync` makes the result durable across power loss: the file is fsynced before the rename and the directory after it,
+ * so neither the bytes nor the rename can be lost behind a later write. Without it a crash can leave a zero-byte file,
+ * so every record a later read must find intact (queue records, the queue seq, migration and pending writes) passes it.
  */
 export function atomicWriteFile(file, data, { fsync = false } = {}) {
   const dir = path.dirname(file);

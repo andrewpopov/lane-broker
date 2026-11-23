@@ -35,7 +35,7 @@ function nextSeq(root) {
   const cur = readJsonSafe(file);
   if (cur && Number.isFinite(cur.n)) n = cur.n;
   n += 1;
-  atomicWriteJson(file, { n });
+  atomicWriteJson(file, { n }, { fsync: true });
   return n;
 }
 
@@ -118,16 +118,25 @@ function quarantineLegacyRecords(root) {
   } catch {
     return;
   }
-  for (const name of names.filter((n) => n.endsWith('.json'))) {
-    const record = readJsonSafe(path.join(dir, name));
-    if (record === null || typeof record !== 'object' || record.schedVersion === 2) continue;
+  const quarantine = (name, event, fields) => {
     try {
       fs.mkdirSync(paths(root).queueQuarantine, { recursive: true });
       fs.renameSync(path.join(dir, name), path.join(paths(root).queueQuarantine, name));
-      logResourceEvent(root, 'legacy-record-after-fence', { ticket: record.id ?? 'unknown', file: name, action: 'quarantined' });
+      logResourceEvent(root, event, { ...fields, file: name, action: 'quarantined' });
     } catch (err) {
-      logResourceEvent(root, 'legacy-record-after-fence', { ticket: record.id ?? 'unknown', file: name, action: 'quarantine-failed', error: err.code ?? 'error' });
+      logResourceEvent(root, event, { ...fields, file: name, action: 'quarantine-failed', error: err.code ?? 'error' });
     }
+  };
+  for (const name of names.filter((n) => n.endsWith('.json'))) {
+    const file = path.join(dir, name);
+    const record = readJsonSafe(file);
+    // BRAIN-1217: a zero-byte or corrupt record (an unclean reboot) is a barrier admission can never get past, so it is contained too.
+    if (record === null || typeof record !== 'object' || Array.isArray(record)) {
+      if (fs.existsSync(file)) quarantine(name, 'unreadable-queue-record', {});
+      continue;
+    }
+    if (record.schedVersion === 2) continue;
+    quarantine(name, 'legacy-record-after-fence', { ticket: record.id ?? 'unknown' });
   }
 }
 

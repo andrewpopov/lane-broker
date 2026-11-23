@@ -184,6 +184,14 @@ export function renderRemoteDrainLine(remoteDrain, { running, queued }) {
 
 const pullQueueDownSince = (root, cfg) => (pullLocalFallbackEnabled(cfg) ? queueDownSince(root) : null);
 
+const countJsonFiles = (dir) => {
+  try {
+    return fs.readdirSync(dir).filter((n) => n.endsWith('.json')).length;
+  } catch {
+    return 0;
+  }
+};
+
 export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false, scan = scanProcWindow, remoteRoot = defaultRemoteRoot(), sampleDeviceGates = false } = {}) {
   const root = ensureStateDirs().root;
   const { config: cfg, error: configError } = loadGlobalConfigOrError();
@@ -281,7 +289,9 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     ? effectiveView(rawQueue, nowEff, cfg, store, classPolicy.eligible, { simsAfterTests: classPolicy.simsAfterTests })
     : { queue: rawQueue, ownerId: null };
   // BRAIN-1217: an unreadable record (a zero-byte file left by an unclean reboot) is counted, never listed: it has no id or key to show.
+  // The next admission poll quarantines it; until then it still blocks the head, so no ticket behind it is reported as the head.
   const unreadableQueue = rawQueue.filter((t) => t === null).length;
+  const headReadable = fullQueue[0] !== null;
   const queue = [...fullQueue.filter((t) => t !== null && classPolicy.eligible(t)), ...fullQueue.filter((t) => t !== null && !classPolicy.eligible(t))];
   // BRAIN-551: built only for a non-empty queue, in memory (status never writes).
   const expressTable = queue.some(Boolean) ? loadExpressTable(root, now, { write: false, bypassMaxMs: cfg.queueBypassMaxMs }) : null;
@@ -340,11 +350,12 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
       awaitingProof: supervisorAlive(a) ? (a.awaitingProof ?? null) : null,
     }));
 
-  const resourceBlock = computeResourceBlock(root, store, cfg, queue[0], held, now);
+  const resourceBlock = computeResourceBlock(root, store, cfg, headReadable ? queue[0] : undefined, held, now);
   return {
     capacity: effectiveWeightCapacity(cfg, resourceCapacity.cpuCores),
     used: runningWeight,
     unreadableQueue,
+    quarantinedQueue: countJsonFiles(paths(root).queueQuarantine),
     resources: {
       source: resourceCapacity.source,
       cpuCores: resourceCapacity.cpuCores,
@@ -381,7 +392,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     ...(cfg.allocationShadow ? { allocation: computeAllocation(root, cfg, queue.filter(Boolean), held, resourceCapacity.cpuCores, now) } : {}),
     // BRAIN-249: null unless the queue is genuinely stalled (a conflict-
     // blocked head whose skip allowance is exhausted) — see computeHeadBlock.
-    headBlock: computeHeadBlock(root, store, cfg, queue, leases, now, effectiveWeightCapacity(cfg, resourceCapacity.cpuCores)),
+    headBlock: computeHeadBlock(root, store, cfg, headReadable ? queue : [], leases, now, effectiveWeightCapacity(cfg, resourceCapacity.cpuCores)),
     // BRAIN-346: the projected-over-budget head's backfill allowance / reservation, if any.
     resourceBlock,
     ...(cfg.idleCreditMode === 'off' ? {} : { idleCredit: computeIdleCredit(cfg, held, queue[0], lastCpuSample, resourceCapacity.cpuCores, now) }),
@@ -691,7 +702,8 @@ export function renderStatusText(status) {
   }
   lines.push('');
   lines.push(status.priority?.active ? 'QUEUE (priority order):' : 'QUEUE (FIFO):');
-  if (status.unreadableQueue > 0) lines.push(`  ${status.unreadableQueue} unreadable queue record(s) skipped (zero-byte or corrupt file in the queue directory)`);
+  if (status.unreadableQueue > 0) lines.push(`  ${status.unreadableQueue} unreadable queue record(s) blocking the head until the next admission poll quarantines them`);
+  if (status.quarantinedQueue > 0) lines.push(`  ${status.quarantinedQueue} queue record(s) in quarantine (queue-quarantine/: unreadable or legacy files removed from the queue)`);
   if (status.queued.length === 0) {
     lines.push('  (none)');
   } else {
