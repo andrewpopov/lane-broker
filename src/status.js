@@ -280,7 +280,9 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
   const { queue: fullQueue, ownerId: reservationOwnerId } = sched.v2
     ? effectiveView(rawQueue, nowEff, cfg, store, classPolicy.eligible, { simsAfterTests: classPolicy.simsAfterTests })
     : { queue: rawQueue, ownerId: null };
-  const queue = [...fullQueue.filter((t) => t === null || classPolicy.eligible(t)), ...fullQueue.filter((t) => t !== null && !classPolicy.eligible(t))];
+  // BRAIN-1217: an unreadable record (a zero-byte file left by an unclean reboot) is counted, never listed: it has no id or key to show.
+  const unreadableQueue = rawQueue.filter((t) => t === null).length;
+  const queue = [...fullQueue.filter((t) => t !== null && classPolicy.eligible(t)), ...fullQueue.filter((t) => t !== null && !classPolicy.eligible(t))];
   // BRAIN-551: built only for a non-empty queue, in memory (status never writes).
   const expressTable = queue.some(Boolean) ? loadExpressTable(root, now, { write: false, bypassMaxMs: cfg.queueBypassMaxMs }) : null;
   const queued = queue.map((t, i) => {
@@ -342,6 +344,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
   return {
     capacity: effectiveWeightCapacity(cfg, resourceCapacity.cpuCores),
     used: runningWeight,
+    unreadableQueue,
     resources: {
       source: resourceCapacity.source,
       cpuCores: resourceCapacity.cpuCores,
@@ -688,6 +691,7 @@ export function renderStatusText(status) {
   }
   lines.push('');
   lines.push(status.priority?.active ? 'QUEUE (priority order):' : 'QUEUE (FIFO):');
+  if (status.unreadableQueue > 0) lines.push(`  ${status.unreadableQueue} unreadable queue record(s) skipped (zero-byte or corrupt file in the queue directory)`);
   if (status.queued.length === 0) {
     lines.push('  (none)');
   } else {
