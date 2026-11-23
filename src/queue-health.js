@@ -2,11 +2,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { pullLocalFallbackEnabled } from './config.js';
 import { isQueueUnreachable } from './queue-client.js';
-import { atomicWriteJson, paths, readJsonSafe } from './state.js';
+import { atomicWriteJson, paths, readJsonSafe, withLock } from './state.js';
 
 export const QUEUE_RECOVERY_SPACING_MS = 30_000;
+const LOCK_WAIT_MS = 2_000;
 
 const healthFile = (root) => path.join(paths(root).pull, 'queue-health.json');
+export const queueHealthLock = (root) => path.join(paths(root).pull, 'queue-health.lock');
 
 const EMPTY = { downSince: null, lastFailureAt: null, okAt: null };
 
@@ -24,8 +26,7 @@ function write(root, health) {
   atomicWriteJson(healthFile(root), health);
 }
 
-// last writer wins and nothing is locked: a queue call may run under the ticket lock, and no other lock group may be taken beneath it
-export function recordQueueCall(root, ok, now = Date.now()) {
+function apply(root, ok, now) {
   const health = readQueueHealth(root);
   if (!ok) {
     write(root, { downSince: health.downSince ?? now, lastFailureAt: now, okAt: null });
@@ -36,9 +37,15 @@ export function recordQueueCall(root, ok, now = Date.now()) {
   else if (now - health.okAt >= QUEUE_RECOVERY_SPACING_MS) write(root, { downSince: null, lastFailureAt: health.lastFailureAt, okAt: null });
 }
 
-const recordQuietly = (root, ok, now) => {
+// a leaf lock, held only for this read-modify-write; same group as the ticket lock a queue call may run under
+export function recordQueueCall(root, ok, now = Date.now()) {
+  fs.mkdirSync(paths(root).pull, { recursive: true });
+  return withLock(root, () => apply(root, ok, now), { lockPath: queueHealthLock(root), group: 'broker', timeoutMs: LOCK_WAIT_MS });
+}
+
+const recordQuietly = async (root, ok, now) => {
   try {
-    recordQueueCall(root, ok, now());
+    await recordQueueCall(root, ok, now());
   } catch {
     return;
   }
@@ -49,11 +56,11 @@ export function trackQueueHealth(queue, root, { now = Date.now } = {}) {
   return Object.fromEntries(Object.entries(queue).map(([name, call]) => [name, async (...args) => {
     try {
       const answer = await call(...args);
-      recordQuietly(root, true, now);
+      await recordQuietly(root, true, now);
       return answer;
     } catch (err) {
-      if (isQueueUnreachable(err)) recordQuietly(root, false, now);
-      else if (err?.name === 'QueueError') recordQuietly(root, true, now);
+      if (isQueueUnreachable(err)) await recordQuietly(root, false, now);
+      else if (err?.name === 'QueueError') await recordQuietly(root, true, now);
       throw err;
     }
   }]));

@@ -42,13 +42,14 @@ export function createPullReadiness({ root, ttlMs = PULL_READY_TTL_MS, now = Dat
     const key = connectionKey(cfg);
     const stored = readJsonSafe(readinessFile(root));
     const age = now() - (stored?.at ?? -Infinity);
-    const health = readQueueHealth(root);
-    const failedSince = stored?.verdict?.ready === true && health.lastFailureAt !== null && health.lastFailureAt > stored.at;
-    const ttl = stored?.verdict?.ready === false && health.downSince !== null ? Math.min(ttlMs, PULL_DOWN_NEGATIVE_TTL_MS) : ttlMs;
+    const health = cfg.lanePull?.localFallbackWhenUnreachable === true ? readQueueHealth(root) : null;
+    const failedSince = health !== null && stored?.verdict?.ready === true && health.lastFailureAt !== null && health.lastFailureAt > stored.at;
+    const ttl = health !== null && stored?.verdict?.ready === false && health.downSince !== null ? Math.min(ttlMs, PULL_DOWN_NEGATIVE_TTL_MS) : ttlMs;
     if (stored?.key === key && age >= 0 && age < ttl && !failedSince) return stored.verdict;
+    const probedAt = now();
     const verdict = await readinessOf(cfg, services);
     fs.mkdirSync(paths(root).pull, { recursive: true });
-    atomicWriteJson(readinessFile(root), { key, at: now(), verdict });
+    atomicWriteJson(readinessFile(root), { key, at: probedAt, verdict });
     return verdict;
   };
 }

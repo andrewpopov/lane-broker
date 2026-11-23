@@ -24,17 +24,17 @@ const SCENARIOS = {
     const { recordQueueCall, readQueueHealth } = await load('queue-health.js');
     const { state } = freshEnv();
     assert.equal(readQueueHealth(state).downSince, null);
-    recordQueueCall(state, false, T0);
-    recordQueueCall(state, false, T0 + 5_000);
+    await recordQueueCall(state, false, T0);
+    await recordQueueCall(state, false, T0 + 5_000);
     assert.equal(readQueueHealth(state).downSince, T0, 'the outage keeps the time of its first failure');
-    recordQueueCall(state, true, T0 + 6_000);
-    recordQueueCall(state, true, T0 + 6_000 + SPACING - 1);
+    await recordQueueCall(state, true, T0 + 6_000);
+    await recordQueueCall(state, true, T0 + 6_000 + SPACING - 1);
     assert.equal(readQueueHealth(state).downSince, T0, 'two answers 29.999 s apart do not clear it');
-    recordQueueCall(state, false, T0 + 40_000);
-    recordQueueCall(state, true, T0 + 41_000);
-    recordQueueCall(state, true, T0 + 60_000);
+    await recordQueueCall(state, false, T0 + 40_000);
+    await recordQueueCall(state, true, T0 + 41_000);
+    await recordQueueCall(state, true, T0 + 60_000);
     assert.equal(readQueueHealth(state).downSince, T0, 'a failure between the answers dropped the first one');
-    recordQueueCall(state, true, T0 + 41_000 + SPACING);
+    await recordQueueCall(state, true, T0 + 41_000 + SPACING);
     assert.equal(readQueueHealth(state).downSince, null, 'two answers 30 s apart with no failure between clear it');
     assert.equal(readQueueHealth(state).lastFailureAt, T0 + 40_000);
   },
@@ -51,7 +51,7 @@ const SCENARIOS = {
     const cached = [];
     await verdictFor(readiness(cached));
     assert.deepEqual(cached, [], 'without a failure the positive verdict is reused');
-    recordQueueCall(state, false, clock.now);
+    await recordQueueCall(state, false, clock.now);
     clock.now += 1_000;
     const probed = [];
     await verdictFor(readiness(probed));
@@ -70,7 +70,7 @@ const SCENARIOS = {
     clock.now = T0;
     const down = freshEnv().state;
     const downVerdict = (services) => createPullReadiness({ root: down, now: () => clock.now })(CFG, services);
-    recordQueueCall(down, false, clock.now - 1);
+    await recordQueueCall(down, false, clock.now - 1);
     assert.equal((await downVerdict(readiness([], refusing))).ready, false);
     clock.now += 29_000;
     const young = [];
@@ -105,6 +105,75 @@ const SCENARIOS = {
     assert.equal(readQueueHealth(state).okAt, T0 + 1_000, 'a server error is an answer, so it starts the recovery');
   },
 
+  'queue health is written under a lock: a write waits for whoever holds it, so a stale read can never erase a failure': async (load) => {
+    const { recordQueueCall, readQueueHealth, queueHealthLock } = await load('queue-health.js');
+    const { withLock } = await load('state.js');
+    const { state } = freshEnv();
+    const { paths } = await load('state.js');
+    (await import('node:fs')).mkdirSync(paths(state).pull, { recursive: true });
+    let release;
+    const held = withLock(state, () => new Promise((resolve) => { release = resolve; }), { lockPath: queueHealthLock(state), group: 'broker' });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const writing = recordQueueCall(state, false, T0);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.equal(readQueueHealth(state).downSince, null, 'the write has not happened while the lock is held');
+    release();
+    await held;
+    await writing;
+    assert.equal(readQueueHealth(state).downSince, T0);
+  },
+
+  'a failure recorded while the readiness probe ran is not hidden: the verdict is stamped when the probe started': async (load) => {
+    const { createPullReadiness } = await load('pull-placement.js');
+    const { recordQueueCall } = await load('queue-health.js');
+    const { state } = freshEnv();
+    const clock = { now: T0 };
+    const verdictFor = (services) => createPullReadiness({ root: state, now: () => clock.now })(CFG, services);
+    const racing = readiness([], { queueRef: async () => { clock.now += 10; await recordQueueCall(state, false, clock.now); return 'ref'; } });
+    assert.deepEqual(await verdictFor(racing), { ready: true });
+    clock.now += 1;
+    const again = [];
+    await verdictFor(readiness(again));
+    assert.ok(again.includes('queueRef'), 'the failure that landed during the probe made the verdict stale');
+  },
+
+  'a host that has not opted in is unchanged: no health file is written, a failed call does not invalidate a positive verdict and a negative one keeps its 5 minute TTL': async (load) => {
+    const { createPullReadiness, PULL_READY_TTL_MS } = await load('pull-placement.js');
+    const { queueWithHealth } = await load('pull-services.js');
+    const { readQueueHealth, recordQueueCall } = await load('queue-health.js');
+    const { QueueError } = await load('queue-client.js');
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const { paths } = await load('state.js');
+    const plain = { ...CFG, lanePull: { ...CFG.lanePull, localFallbackWhenUnreachable: false } };
+    const { state } = freshEnv();
+    const queue = { get: async () => { throw new QueueError('ld_get failed', { code: 'ECONNRESET', cause: new Error('reset') }); } };
+    assert.equal(queueWithHealth(queue, plain, state), queue, 'the queue client is not wrapped');
+    await assert.rejects(queueWithHealth(queue, plain, state).get());
+    assert.equal(fs.existsSync(path.join(paths(state).pull, 'queue-health.json')), false, 'no health file');
+    assert.notEqual(queueWithHealth(queue, CFG, state), queue, 'an opted-in host is wrapped');
+
+    const clock = { now: T0 };
+    const verdictFor = (services) => createPullReadiness({ root: state, now: () => clock.now })(plain, services);
+    await verdictFor(readiness([]));
+    await recordQueueCall(state, false, clock.now + 1);
+    clock.now += 2;
+    const cached = [];
+    await verdictFor(readiness(cached));
+    assert.deepEqual(cached, [], 'a failure on record does not make a positive verdict stale for a host that did not opt in');
+
+    const negative = freshEnv().state;
+    const refusing = { queueRef: async () => { throw new Error('connection refused'); } };
+    const negativeFor = (services) => createPullReadiness({ root: negative, now: () => clock.now })(plain, services);
+    await recordQueueCall(negative, false, clock.now);
+    await negativeFor(readiness([], refusing));
+    clock.now += 31_000;
+    const reused = [];
+    await negativeFor(readiness(reused));
+    assert.deepEqual(reused, [], 'the negative verdict keeps its full TTL');
+    assert.ok(readQueueHealth(negative).downSince !== null && PULL_READY_TTL_MS > 31_000);
+  },
+
   'local fallback is off by default, on by the host key, off for a lane that opted out, and never on a dispatch-only host; it is active only while the queue is marked down': async (load) => {
     const { pullLocalFallbackEnabled } = await load('config.js');
     const { localFallbackActive, recordQueueCall } = await load('queue-health.js');
@@ -115,7 +184,7 @@ const SCENARIOS = {
     assert.equal(pullLocalFallbackEnabled({ ...CFG, localExecution: 'refused' }, {}), false, 'a dispatch-only host never falls back');
     const { state } = freshEnv();
     assert.equal(localFallbackActive(state, CFG, {}), false, 'a reachable queue changes nothing');
-    recordQueueCall(state, false, T0);
+    await recordQueueCall(state, false, T0);
     assert.equal(localFallbackActive(state, CFG, {}), true);
     assert.equal(localFallbackActive(state, CFG, { pullLocalFallback: false }), false);
     assert.equal(localFallbackActive(state, DEFAULT_GLOBAL_CONFIG, {}), false);
@@ -147,6 +216,10 @@ const CANARIES = [
   ['local fallback is off by default, on by the host key, off for a lane that opted out, and never on a dispatch-only host; it is active only while the queue is marked down', 'config.js', [' && !isDispatchOnly(cfg);', ';']],
   ['a localRefused lane (and so an out-of-window e2e or train lane) is runnable here only under the fallback; a dispatch-only host stays refused', 'supervisor.js', ['if (!pullFallback && locallyRefusedNow(enriched, globalCfg))', 'if (locallyRefusedNow(enriched, globalCfg))']],
   ['the history row of a ticket that fell back from the pull queue says transport local and fallbackReason pull-unreachable', 'supervisor.js', ["    ...(fallbackReason === PULL_UNREACHABLE_REASON ? { transport: 'local', fallbackReason } : {}),\n", '']],
+  ['queue health is written under a lock: a write waits for whoever holds it, so a stale read can never erase a failure', 'queue-health.js', ["  return withLock(root, () => apply(root, ok, now), { lockPath: queueHealthLock(root), group: 'broker', timeoutMs: LOCK_WAIT_MS });", '  return apply(root, ok, now);']],
+  ['a failure recorded while the readiness probe ran is not hidden: the verdict is stamped when the probe started', 'pull-placement.js', ['{ key, at: probedAt, verdict }', '{ key, at: now(), verdict }']],
+  ['a host that has not opted in is unchanged: no health file is written, a failed call does not invalidate a positive verdict and a negative one keeps its 5 minute TTL', 'pull-services.js', ['cfg?.lanePull?.localFallbackWhenUnreachable === true ? trackQueueHealth', 'cfg?.lanePull ? trackQueueHealth']],
+  ['a host that has not opted in is unchanged: no health file is written, a failed call does not invalidate a positive verdict and a negative one keeps its 5 minute TTL', 'pull-placement.js', ['cfg.lanePull?.localFallbackWhenUnreachable === true ? readQueueHealth(root) : null', 'readQueueHealth(root)']],
 ];
 
 for (const [name, scenario] of Object.entries(SCENARIOS)) test(name, () => scenario(realSrc));

@@ -517,8 +517,8 @@ export async function stepPullTicket(ctx) {
   }
 }
 
-const HELD_ROW_STATES = new Set(['claimed', 'running']);
-const rowStateAfter = (step, previous) => (step.state === 'waiting' ? 'queued' : step.state === 'queued' || HELD_ROW_STATES.has(step.state) ? step.state : previous);
+const OBSERVED_ROW_STATES = new Set(['queued', 'claimed', 'running', 'fetching', 'withdrawn', 'unresolved']);
+const rowStateAfter = (step, previous) => (step.state === 'waiting' ? 'queued' : OBSERVED_ROW_STATES.has(step.state) ? step.state : previous);
 
 const OUTCOME_OF = { finished: 'confirmed', cancelled: 'cancelled', lost: 'lost' };
 
@@ -635,7 +635,9 @@ async function abandonUnreachableQueue(ctx) {
 /**
  * The host has lost the queue for `localFallbackAfterMs` and the last row state seen was `queued`: attempt A settles lost
  * `queue-unreachable-local` (ledgered), the cancel its row is owed is written, and the same ticket moves to local generation +1, all
- * under one ticket lock. Null when something else decided first (a ledgered decision, a cancel), so the loop carries on.
+ * under one ticket lock. The move comes before the ledger entry, so a death between them leaves a local attempt whose owed cancel is
+ * written, which the local-attempt recovery already settles; the reverse order would let recovery publish the lost entry instead.
+ * Null when something else decided first (a ledgered decision, a cancel), so the loop carries on.
  */
 async function fallBackToLocalRun(ctx) {
   const run = runOf(ctx);
@@ -644,12 +646,13 @@ async function fallBackToLocalRun(ctx) {
     const attempt = readAttempt(run.root, run.id);
     if (!attempt || attempt.generation !== run.generation || attempt.executor === 'local') return null;
     run.envelope = readEnvelope(run.root, run.id);
-    await persistPull(run, { localFallback: { at: run.now(), fromGeneration: run.generation } });
     writeOwedCancel(run.root, run.id, { generation: run.generation, at: run.now() });
-    const entry = accept(run, entryFor(run, null, lost('queue-unreachable-local')));
     const moved = await fallbackToLocal(run.root, run.id, PULL_UNREACHABLE_REASON);
-    if (moved.ok) return { outcome: 'local-fallback', reason: PULL_UNREACHABLE_REASON };
-    return settledOutcome(await applyEntry(run, entry));
+    if (!moved.ok) return null;
+    await hook(run, 'afterLocalMove');
+    await updateAttempt(run.root, run.id, moved.attempt.generation, (current) => ({ pull: { ...current.pull, localFallback: { at: run.now(), fromGeneration: run.generation } } }), { fsync: true });
+    accept(run, entryFor(run, null, lost('queue-unreachable-local')));
+    return { outcome: 'local-fallback', reason: PULL_UNREACHABLE_REASON };
   }, { lockTimeoutMs: run.lockTimeoutMs });
 }
 

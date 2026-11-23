@@ -9,7 +9,7 @@ import { paths } from './state.js';
 const unavailable = (reason) =>
   new Proxy({}, { get: () => async () => { throw new Error(`pull dispatch is not available here: ${reason}`); } });
 
-const healthTracked = (queue, root) => (root === undefined ? queue : trackQueueHealth(queue, root));
+export const queueWithHealth = (queue, cfg, root) => (root !== undefined && cfg?.lanePull?.localFallbackWhenUnreachable === true ? trackQueueHealth(queue, root) : queue);
 
 // no `enabled` check on purpose: tickets in flight must stay recoverable after the switch is turned off
 export function pullServices(cfg, root) {
@@ -23,7 +23,7 @@ export function pullServices(cfg, root) {
     const creds = loadS3Credentials(credentialsEnvFile);
     return {
       available: true,
-      queue: healthTracked(createQueueClient({ url: cfg.laneQueueUrl, passwordFile: pull.passwordFile, caFile: pull.caFile }), root),
+      queue: queueWithHealth(createQueueClient({ url: cfg.laneQueueUrl, passwordFile: pull.passwordFile, caFile: pull.caFile }), cfg, root),
       s3: createS3Client({ endpoint, region, creds }),
     };
   } catch (err) {
