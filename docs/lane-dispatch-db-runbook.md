@@ -65,7 +65,8 @@ SELECT lane_dispatch.ld_set_principal('lane_submit_<name>', 'submit', NULL, '{}'
 `lane_reader` has no USAGE on `lane_dispatch` and no grant on its tables. Monitoring reads three views in schema `lane`, owned by
 `lane_definer` and granted SELECT in `sql/lane/functions.sql`, so every apply keeps them: `lane.pull_tickets` (no `claim_token`;
 the header only as `argv_md5`), `lane.pull_principals` (agent principals' `host, tags, allowed_repos, max_claims`, no
-`login_role`) and `lane.pull_runners` (`host, last_seen`). A reader that needs another column gets it added to a view; never grant
+`login_role`) and `lane.pull_runners` (`host, last_seen`). `last_seen` is liveness: `ld_register`, `ld_claim` and `ld_heartbeat`
+all refresh it, at most once per 30 s per host, so a live agent's row is under about 45 s old (BRAIN-1301). A reader that needs another column gets it added to a view; never grant
 `lane_reader` anything in `lane_dispatch` by hand, because the next apply's REVOKE removes it (BRAIN-1154).
 
 ## Timers on the database host

@@ -865,6 +865,13 @@ BEGIN
   RETURN FOUND;
 END $$;
 
+-- Liveness (BRAIN-1301): a claim or heartbeat proves the agent alive as much as a register does. At most one write per host per 30 s.
+CREATE OR REPLACE FUNCTION lane_dispatch.runner_seen(p_host text) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  UPDATE lane_dispatch.runners SET last_seen = lane_dispatch.now() WHERE host = p_host AND last_seen < lane_dispatch.now() - interval '30 seconds';
+END $$;
+
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_register(p_version text, p_protocol int, p_schedule jsonb) RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 DECLARE v_me record;
@@ -906,6 +913,7 @@ BEGIN
   IF NOT FOUND THEN
     RAISE EXCEPTION 'no agent principal for %', session_user USING ERRCODE = '42501';
   END IF;
+  PERFORM lane_dispatch.runner_seen(v_me.host);
   v_out := lane_dispatch.claim_replay(p_req);
   IF v_out IS NOT NULL THEN RETURN v_out; END IF;
   SELECT r.protocol INTO v_protocol FROM lane_dispatch.runners r WHERE r.host = v_me.host;
@@ -990,6 +998,7 @@ DECLARE v_me record; v_t record;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT * INTO v_me FROM lane_dispatch.me('agent');
+  PERFORM lane_dispatch.runner_seen(v_me.host);
   SELECT * INTO v_t FROM lane_dispatch.tickets t WHERE t.id = p_id FOR UPDATE;
   IF NOT lane_dispatch.fence_ok(p_epoch, p_token, v_me.host, v_t.epoch, v_t.claim_token, v_t.host, v_t.state) THEN
     RETURN jsonb_build_object('fenced', true, 'cancel', false);

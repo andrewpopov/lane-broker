@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import { ConfigError, DEFAULT_GLOBAL_CONFIG, isSocketQueueUrl, loadGlobalConfig, pullConfigured, pullRunners, pushRunners } from '../src/config.js';
+import { ConfigError, DEFAULT_GLOBAL_CONFIG, isSocketQueueUrl, loadGlobalConfig, noPushRunnersReason, pullConfigured, pullRunners, pushRunners } from '../src/config.js';
 import { freshEnv, writeGlobalConfig } from './helpers.js';
 import { assertCanaryFails } from './helpers/mutant-module.js';
 
@@ -254,4 +254,11 @@ test('PKG-401 lanePull.localFallbackWhenUnreachable defaults to false and must b
   assert.equal(load({ lanePull: { localFallbackWhenUnreachable: true } }).lanePull.localFallbackWhenUnreachable, true);
   refusesNaming({ lanePull: { localFallbackWhenUnreachable: 'yes' } }, 'lanePull.localFallbackWhenUnreachable');
   refusesNaming({ lanePull: { localFallbackAfterMs: 0 } }, 'lanePull.localFallbackAfterMs');
+});
+
+test('a pull-only fleet says so instead of "no runners configured" (BRAIN-1301)', () => {
+  const pullOnly = { runners: [{ name: 'wintop', transport: 'pull' }, { name: 'skybox', transport: 'pull', offline: true }] };
+  assert.equal(noPushRunnersReason(pullOnly), 'no push runners; pull runners claim from the lane queue: wintop, skybox (offline)');
+  assert.equal(noPushRunnersReason({ runners: [] }), 'no runners configured');
+  assert.equal(noPushRunnersReason({}), 'no runners configured');
 });

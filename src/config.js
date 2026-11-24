@@ -691,6 +691,11 @@ const RUNNER_TRANSPORTS = ['push', 'pull'];
 /** BRAIN-1036: the runners a dispatcher reaches over ssh. Every placement, rebind, ping and status path that dials a runner reads this list, never `cfg.runners`. */
 export const pushRunners = (cfg) => (cfg?.runners ?? []).filter((r) => r.transport !== 'pull');
 export const pullRunners = (cfg) => (cfg?.runners ?? []).filter((r) => r.transport === 'pull');
+/** Why no push runner was tried. A pull-only fleet is not an empty one: its runners claim from the lane queue (BRAIN-1301). */
+export function noPushRunnersReason(cfg) {
+  const pull = pullRunners(cfg).map((r) => (r.offline ? `${r.name} (offline)` : r.name));
+  return pull.length ? `no push runners; pull runners claim from the lane queue: ${pull.join(', ')}` : 'no runners configured';
+}
 
 /** How long a pull ticket may sit unclaimed before the supervisor withdraws it, per lane then globally; undefined is unbounded. */
 /** Whether this host may run `ticket` itself while the pull queue is unreachable: opted in per host, not opted out per lane, and never a dispatch-only host. */

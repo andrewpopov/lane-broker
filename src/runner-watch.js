@@ -1,5 +1,5 @@
 import { paths, ensureStateDirs, withLock, LockTimeoutError } from './state.js';
-import { loadGlobalConfigOrError } from './config.js';
+import { loadGlobalConfigOrError, noPushRunnersReason } from './config.js';
 import { runWithDeadline, sshArgv } from './remote-client.js';
 import { sweepOrphans } from './reconcile-sweep.js';
 import { markOffline, clearOffline, readOfflineMarks, offlineMarksWarning } from './runner-offline.js';
@@ -69,7 +69,7 @@ export function runnerStatusCommand({ json = false } = {}) {
   }
   const runners = collectRunnerStates(root, config);
   if (json) say(JSON.stringify(runners, null, 2));
-  else say(runners.length === 0 ? 'no runners configured' : renderRunnersLines(runners).join('\n'));
+  else say(runners.length === 0 ? noPushRunnersReason(config) : renderRunnersLines(runners).join('\n'));
   return { exitCode: 0 };
 }
 
