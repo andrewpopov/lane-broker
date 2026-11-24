@@ -213,19 +213,6 @@ order of magnitude on macOS. `capacity: "auto"` derives the legacy weight cap
 from the detected CPU budget. A numeric capacity remains supported as an
 additional compatibility cap.
 
-`lane remote-probe` also reports `headroom.cpuAdmissibleCores` and
-`headroom.cpuAdmissibleCoresUndiscounted` (BRAIN-1266): the CPU budget minus load
-outside the broker plus `resourceIdleOvershootCores`, with and without the
-preemptible discount, i.e. the most cores a new ticket could be admitted with once
-the runner's own leases drain. It is omitted when budgets are not enforced, CPU was
-not measured, or any held lease's CPU is unobserved. External load moves, so this is
-a *temporary* verdict, never never-fits: placement skips a runner whose figure is
-below the ticket's need (the claim, or the elastic floor rounded up to whole cores;
-the undiscounted figure exactly when `runnerRoom` uses it) for this placement only,
-never queues on it, and the ticket is re-probed on the next rebind tick. A lane that
-cannot run locally may still wait on it as the best busy runner. Seen 2026-11-22: a
-6-core lane queued on a 6-core runner with 3.7 cores of bot load waited 400+ minutes.
-
 `lane remote-probe` reports `capacity.memoryAdmissibleBytes` (BRAIN-653): the most
 memory a new ticket could ever be admitted with once the runner's own leases drain,
 that is available memory plus the memory its leases observably hold, minus
