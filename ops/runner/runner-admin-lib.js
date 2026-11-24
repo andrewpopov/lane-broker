@@ -99,7 +99,9 @@ export const dropRoleSql = (role) => [
   '',
 ].join('\n');
 
-const MC_NOT_FOUND = /not found|does not exist|doesn't exist|no such/i;
+const MC_USER_MISSING = /The specified user does not exist|NoSuchUser|user .* not found/i;
+const MC_POLICY_MISSING = /The canned policy does not exist|NoSuchPolicy|policy .* (?:does not exist|not found)/i;
+const MC_EITHER_MISSING = new RegExp(`${MC_USER_MISSING.source}|${MC_POLICY_MISSING.source}`, 'i');
 
 const BEGIN_MARK = (host) => `# BEGIN lane-runner-admin ${host}`;
 const END_MARK = (host) => `# END lane-runner-admin ${host}`;
@@ -123,10 +125,8 @@ const rulesAllowing = (lines, role) => lines.filter((line) => {
 
 const opaque = (entry) => entry.startsWith('/') || entry.startsWith('@');
 
-const laneRejectAt = (lines, pattern) => lines.findIndex((line) => {
-  const roles = pattern.exec(line)?.[2].split(',');
-  return roles?.some((r) => r.startsWith('lane_agent_'));
-});
+// Only a reject line in the main file that editRejectList will extend (the lane-logins line) can protect a role that is added to it.
+const laneRejectAt = (entries, pattern) => entries.findIndex(({ text, main }) => main && pattern.exec(text)?.[2].split(',').some((r) => r.startsWith('lane_agent_')));
 
 const INCLUDE_RE = /^\s*(include|include_if_exists|include_dir)\s+(\S+)/;
 const includeTarget = (raw) => raw.replace(/^'(.*)'$/, '$1').replace(/^"(.*)"$/, '$1');
@@ -138,33 +138,36 @@ export function hbaIncludes(text) {
   });
 }
 
-// The rules pg_hba evaluates, in order: each include spliced in where it appears. Constructs this guard cannot evaluate are refused.
+// The rules pg_hba evaluates, in order, each include spliced in where it appears. This is only the dry-run early warning: the
+// edit script asks Postgres's own parse of the files on disk at commit time. Constructs this cannot read are refused.
 function evaluatedRules(lines, included) {
   const out = [];
+  const check = (line, where) => {
+    if (/\\\s*$/.test(line)) throw new Error(`${where} has a line ending in a backslash (a continuation), which this tool cannot check: "${line.trim()}"; join it first`);
+    if (!/^\s*#/.test(line) && line.includes('"')) throw new Error(`${where} has a quoted field, which this tool cannot check: "${line.trim()}"`);
+  };
   for (const line of lines) {
-    if (!/^\s*#/.test(line) && /\\\s*$/.test(line)) throw new Error(`pg_hba.conf has a continued line this tool cannot check: "${line.trim()}"; join it first`);
     const match = INCLUDE_RE.exec(line);
-    if (!match) { out.push(line); continue; }
+    if (!match) { check(line, 'pg_hba.conf'); out.push({ text: line, main: true }); continue; }
     if (match[1] === 'include_dir') throw new Error(`pg_hba.conf uses include_dir (${match[2]}), which this tool cannot check`);
     const body = included?.[includeTarget(match[2])];
     if (body === undefined) throw new Error(`pg_hba.conf includes ${match[2]}, which was not read`);
     for (const inner of body.split('\n')) {
       if (INCLUDE_RE.test(inner)) throw new Error(`${match[2]} has a nested include, which this tool cannot check`);
-      if (!/^\s*#/.test(inner) && /\\\s*$/.test(inner)) throw new Error(`${match[2]} has a continued line this tool cannot check`);
-      out.push(inner);
+      check(inner, match[2]);
+      out.push({ text: inner, main: false });
     }
   }
   return out;
 }
 
-// A rule that might admit `role` before the lane-logins reject line of its kind; first match wins, so a broad rule below that line
-// can never be reached by a listed lane login. A rule naming the role itself is refused wherever it is. +groups, /regex and @file
-// entries are refused rather than evaluated.
+// A rule that might admit `role` before the main file's lane-logins reject line of its kind: first match wins, so a broad rule
+// below that line is unreachable for a listed lane login. A rule naming the role itself is refused wherever it is.
 const rulesThatMayAdmit = (rawLines, role, included) => {
-  const lines = evaluatedRules(rawLines, included);
-  const cutoff = { local: laneRejectAt(lines, LOCAL_REJECT), host: laneRejectAt(lines, HOST_REJECT) };
-  return lines.filter((line, i) => {
-    const rule = parseHbaRule(line);
+  const entries = evaluatedRules(rawLines, included);
+  const cutoff = { local: laneRejectAt(entries, LOCAL_REJECT), host: laneRejectAt(entries, HOST_REJECT) };
+  return entries.filter(({ text }, i) => {
+    const rule = parseHbaRule(text);
     if (!rule || rule.method === 'reject') return false;
     const database = rule.databases.some((name) => [DB_NAME, 'all', 'sameuser', 'samerole'].includes(name) || opaque(name));
     if (!database) return false;
@@ -172,7 +175,7 @@ const rulesThatMayAdmit = (rawLines, role, included) => {
     const broad = rule.users.some((name) => name === 'all' || name.startsWith('+') || opaque(name));
     const reject = cutoff[rule.type === 'local' ? 'local' : 'host'];
     return broad && (reject < 0 || i < reject);
-  });
+  }).map(({ text }) => text);
 };
 
 function hbaBlock({ role, host, ip, note }) {
@@ -478,22 +481,69 @@ class Context {
 }
 
 const LOCK_FILE = '/run/lock/lane-runner-admin.lock';
+
+// Postgres's own parse of the files on disk (includes, quoting and continuations resolved) decides whether the edit is safe.
+// psql variables: :'role' :'ip' :'db'. Returns 'ok' or one reason naming file:line.
+export const HBA_ADD_INVARIANT_SQL = `WITH cand AS (
+  SELECT rule_number, file_name, line_number, type, database, user_name, address, netmask, auth_method
+  FROM pg_hba_file_rules
+  WHERE error IS NULL
+    AND (database && ARRAY[:'db', 'all', 'sameuser', 'samerole'] OR EXISTS (SELECT 1 FROM unnest(database) d WHERE d LIKE '/%'))
+    AND (user_name && ARRAY[:'role', 'all'] OR EXISTS (SELECT 1 FROM unnest(user_name) u WHERE u LIKE '+%' OR u LIKE '/%'))
+), tcp AS (
+  SELECT *, row_number() OVER (ORDER BY rule_number) AS n FROM cand WHERE type <> 'local'
+), loc AS (
+  SELECT * FROM cand WHERE type = 'local' ORDER BY rule_number LIMIT 1
+)
+SELECT coalesce(
+  (SELECT format('%s:%s: rule error: %s', file_name, line_number, error) FROM pg_hba_file_rules WHERE error IS NOT NULL ORDER BY rule_number LIMIT 1),
+  (SELECT format('no TCP rule can match %s on %s', :'role', :'db') WHERE NOT EXISTS (SELECT 1 FROM tcp)),
+  (SELECT CASE WHEN type = 'hostssl' AND user_name = ARRAY[:'role'] AND database = ARRAY[:'db'] AND address = :'ip' AND netmask = '255.255.255.255' AND auth_method = 'scram-sha-256'
+               THEN NULL ELSE format('%s:%s: the first TCP rule that can match %s on %s is not its own hostssl %s/32 scram-sha-256 line', file_name, line_number, :'role', :'db', :'ip') END
+   FROM tcp WHERE n = 1),
+  (SELECT CASE WHEN type = 'host' AND auth_method = 'reject' AND (address IS NULL OR address = 'all')
+               THEN NULL ELSE format('%s:%s: the TCP rule after the hostssl line is not a catch-all reject', file_name, line_number) END
+   FROM tcp WHERE n = 2),
+  (SELECT 'no catch-all reject follows the hostssl line' WHERE NOT EXISTS (SELECT 1 FROM tcp WHERE n = 2)),
+  (SELECT CASE WHEN auth_method = 'reject' THEN NULL ELSE format('%s:%s: the first local rule that can match %s on %s is not a reject', file_name, line_number, :'role', :'db') END FROM loc),
+  (SELECT format('no local rule rejects %s on %s', :'role', :'db') WHERE NOT EXISTS (SELECT 1 FROM loc)),
+  'ok');
+`;
+
+export const HBA_REMOVE_INVARIANT_SQL = `SELECT coalesce(
+  (SELECT format('%s:%s: rule error: %s', file_name, line_number, error) FROM pg_hba_file_rules WHERE error IS NOT NULL ORDER BY rule_number LIMIT 1),
+  (SELECT format('%s:%s: a rule other than reject still names %s', file_name, line_number, :'role') FROM pg_hba_file_rules WHERE error IS NULL AND auth_method <> 'reject' AND user_name && ARRAY[:'role'] ORDER BY rule_number LIMIT 1),
+  'ok');
+`;
+
+export const invariantFunctionBody = (psql) => `  if [ "$action" = add ]; then
+    ${psql} -X -At -v ON_ERROR_STOP=1 -v "role=$role" -v "ip=$ip" -v "db=$db" -f - <<'LRA_SQL_ADD'
+${HBA_ADD_INVARIANT_SQL}LRA_SQL_ADD
+  else
+    ${psql} -X -At -v ON_ERROR_STOP=1 -v "role=$role" -v "ip=$ip" -v "db=$db" -f - <<'LRA_SQL_REMOVE'
+${HBA_REMOVE_INVARIANT_SQL}LRA_SQL_REMOVE
+  fi`;
+
 const SCRIPT_HOOKS = {
   sha: 'sha256sum',
   chown: 'chown',
-  hbaErrors: `sudo -n -u postgres psql -At -c "SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL"`,
+  invariant: invariantFunctionBody('sudo -n -u postgres psql'),
   reload: `sudo -n -u postgres psql -At -c 'SELECT pg_reload_conf()'`,
   jsonCheck: `python3 -c 'import json,sys; json.load(open(sys.argv[1]))'`,
 };
 
-// Runs as root under `flock ... bash -s -- <path> <expected-sha256> <owner:group> <mode> <kind>`; `hooks` lets a test run it on a laptop.
+// Runs as root under `flock ... bash -s -- <path> <expected-sha256> <owner:group> <mode> <kind> [<add|remove> <role> <ip> <db>]`; `hooks` lets a test run it on a laptop.
 export function buildEditScript({ content, hooks = {} }) {
   const h = { ...SCRIPT_HOOKS, ...hooks };
   const payload = Buffer.from(content).toString('base64').replace(/(.{76})/g, '$1\n');
   return `set -euo pipefail
 path=$1; expect=$2; owner=$3; mode=$4; kind=$5
+action=\${6:-}; role=\${7:-}; ip=\${8:-}; db=\${9:-}
 want=${sha256(content)}
 sha() { ${h.sha} "$1" | cut -d' ' -f1; }
+invariant() {
+${h.invariant}
+}
 payload() { base64 -d <<'LRA_PAYLOAD_EOF'
 ${payload}
 LRA_PAYLOAD_EOF
@@ -528,7 +578,10 @@ else
   rm -f "$stage"; stage=
 fi
 case "$kind" in
-  hba) errors=$(${h.hbaErrors} | tr -d '[:space:]'); [ "$errors" = 0 ] || { echo "pg_hba_file_rules reports '$errors' rule errors" >&2; exit 6; } ;;
+  hba)
+    [ "$action" = add ] || [ "$action" = remove ] || { echo "hba edits need an action of add or remove" >&2; exit 2; }
+    verdict=$(invariant | tr -d '\r') || verdict="the invariant query failed"
+    [ "$verdict" = ok ] || { echo "pg_hba invariant violated: $verdict" >&2; exit 6; } ;;
   json) ${h.jsonCheck} "$path" || { echo "not valid JSON: $path" >&2; exit 6; } ;;
   *) echo "unknown kind $kind" >&2; exit 2 ;;
 esac
@@ -541,7 +594,7 @@ if [ "$moved" = 1 ]; then echo "backup=$backup"; else echo "unchanged=$path"; fi
 `;
 }
 
-async function editRemoteFile(ctx, { kind, path: file, readAs = [], edit, label, beforeEdit }) {
+async function editRemoteFile(ctx, { kind, path: file, readAs = [], edit, label, beforeEdit, scriptArgs = [] }) {
   const before = (await ctx.remote(['sudo', '-n', ...readAs, 'cat', file], { label: `read ${label}` })).stdout;
   if (beforeEdit) await beforeEdit(before);
   const after = edit(before);
@@ -552,7 +605,7 @@ async function editRemoteFile(ctx, { kind, path: file, readAs = [], edit, label,
       const stat = (await ctx.remote(['sudo', '-n', 'stat', '-c', '%U:%G %a', file], { label: `stat ${label}` })).stdout.trim();
       const [owner, mode] = stat.split(' ');
       if (!/^[\w.-]+:[\w.-]+$/.test(owner ?? '') || !/^[0-7]{3,4}$/.test(mode ?? '')) throw new Error(`unreadable owner and mode for ${file}: ${JSON.stringify(stat)}`);
-      const result = await ctx.remote(['sudo', '-n', 'flock', LOCK_FILE, 'bash', '-s', '--', file, sha256(before), owner, mode, kind], { input: buildEditScript({ content: after }), label: `edit ${label}`, allow: /^/ });
+      const result = await ctx.remote(['sudo', '-n', 'flock', LOCK_FILE, 'bash', '-s', '--', file, sha256(before), owner, mode, kind, ...scriptArgs], { input: buildEditScript({ content: after }), label: `edit ${label}`, allow: /^/ });
       if (result.code === 3) throw new Error(`${label} changed on ${DB_HOST} since it was read; nothing was written. Re-run to plan against the new content`);
       if (result.code !== 0) throw new Error(`${label} edit failed (exit ${result.code}): ${ctx.scrub(result.stderr).trim()}`);
       return result.stdout.match(/^backup=(.*)$/m)?.[1] ?? null;
@@ -573,7 +626,10 @@ async function readIncludes(ctx, text) {
 
 async function hbaEdit(ctx, mode) {
   let included = {};
-  const edit = editRemoteFile(ctx, { kind: 'hba', path: HBA_PATH, label: 'pg_hba.conf', beforeEdit: async (text) => { included = await readIncludes(ctx, text); }, edit: (text) => editHba(text, ctx.hbaEntry, mode, { included }) });
+  const { role, ip } = ctx.hbaEntry;
+  if (!/^lane_agent_[a-z0-9_]+$/.test(role)) throw new Error(`refusing to check pg_hba.conf for the unexpected role ${JSON.stringify(role)}`);
+  if (mode === 'add') validateTailnetIp(ip);
+  const edit = editRemoteFile(ctx, { kind: 'hba', path: HBA_PATH, label: 'pg_hba.conf', scriptArgs: [mode, role, mode === 'add' ? ip : '-', DB_NAME], beforeEdit: async (text) => { included = await readIncludes(ctx, text); }, edit: (text) => editHba(text, ctx.hbaEntry, mode, { included }) });
   return edit;
 }
 
@@ -703,7 +759,6 @@ function buildRemovePlan(ctx) {
   const role = pgRole(host);
   ctx.hbaEntry = { role, host };
   const held = () => ctx.psqlRows(heldTicketsSql(host), 'list held tickets').then(parseTickets);
-  const tolerate = /not found|does not exist|doesn't exist|no such/i;
   const accessKeyOf = async () => (await ctx.getItem())?.accessKey ?? null;
   return [
     {
@@ -743,10 +798,10 @@ function buildRemovePlan(ctx) {
       async apply() {
         const accessKey = await accessKeyOf();
         if (accessKey) {
-          await ctx.mc(['admin', 'policy', 'detach', MC_ALIAS, rustfsName(host), '--user', accessKey], { allow: tolerate });
-          await ctx.mc(['admin', 'user', 'remove', MC_ALIAS, accessKey], { allow: tolerate });
+          await ctx.mc(['admin', 'policy', 'detach', MC_ALIAS, rustfsName(host), '--user', accessKey], { allow: MC_EITHER_MISSING });
+          await ctx.mc(['admin', 'user', 'remove', MC_ALIAS, accessKey], { allow: MC_USER_MISSING });
         }
-        await ctx.mc(['admin', 'policy', 'remove', MC_ALIAS, rustfsName(host)], { allow: tolerate });
+        await ctx.mc(['admin', 'policy', 'remove', MC_ALIAS, rustfsName(host)], { allow: MC_POLICY_MISSING });
         return accessKey ? 'detached, removed' : `no 1Password item, so the user's access key is unknown: user not removed, policy removed`;
       },
     },
@@ -795,15 +850,15 @@ async function statusReport(ctx, out) {
   line('pg_hba reject lists', `local all: ${hba.localRejected ? 'listed' : 'not listed'}, host all: ${hba.hostRejected ? 'listed' : 'not listed'}`);
   const item = await ctx.getItem();
   line('1Password item', item ? `present (${opItemTitle(host)})` : 'absent');
-  const presence = (result, name) => {
+  const presence = (result, name, missing) => {
     if (result.code === 0) return `present${name ? ` (${name})` : ''}`;
-    if (MC_NOT_FOUND.test(`${result.stderr}${result.stdout}`)) return 'absent';
+    if (missing.test(`${result.stderr}${result.stdout}`)) return 'absent';
     failures.push(name ?? 'rustfs user');
     return `unknown (mc failed, exit ${result.code}: ${ctx.scrub(result.stderr || result.stdout).trim().split('\n')[0]})`;
   };
   const user = item ? await ctx.mc(['admin', 'user', 'info', MC_ALIAS, item.accessKey], { allow: /^/ }) : null;
-  line('rustfs user', user ? presence(user) : 'unknown (no 1Password item holds its access key)');
-  line('rustfs policy', presence(await ctx.mc(['admin', 'policy', 'info', MC_ALIAS, rustfsName(host)], { allow: /^/ }), rustfsName(host)));
+  line('rustfs user', user ? presence(user, undefined, MC_USER_MISSING) : 'unknown (no 1Password item holds its access key)');
+  line('rustfs policy', presence(await ctx.mc(['admin', 'policy', 'info', MC_ALIAS, rustfsName(host)], { allow: /^/ }), rustfsName(host), MC_POLICY_MISSING));
   const train = (await ctx.remote(['sudo', '-n', '-u', 'train', 'cat', TRAIN_CONFIG_PATH], { label: 'read train config' })).stdout;
   line('train runners entry', trainHasRunner(train, host) ? 'present' : 'absent');
   const tickets = parseTickets(await ctx.psqlRows(heldTicketsSql(host), 'list held tickets'));

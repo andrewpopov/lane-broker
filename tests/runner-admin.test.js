@@ -162,7 +162,7 @@ test('the hand-written-rule guard reads tokens: host, hostnossl, indentation and
     'host lane_queue_db lane_agent_evo_x2 100.64.0.0/10 scram-sha-256',
     '  hostnossl lane_queue_db lane_agent_evo_x2 10.0.0.0/8 md5',
     'hostgssenc all other,lane_agent_evo_x2 0.0.0.0/0 trust',
-    'local all "lane_agent_evo_x2" peer',
+    'local all lane_agent_evo_x2 peer',
     'hostssl lane_queue_db lane_agent_evo_x2 100.1.1.1/32 scram-sha-256 # why',
   ];
   for (const rule of rules) assert.throws(() => add(rule), /already has a rule outside .* may let lane_agent_evo_x2 in/, rule);
@@ -209,7 +209,7 @@ test('the guard reads included files in place and refuses constructs it cannot c
   assert.throws(() => lib.editHba(withInclude, entry, 'add', { included: { '/etc/postgresql/17/main/fence.conf': 'hostssl lane_queue_db +lane_agent 100.64.0.0/10 scram-sha-256\n' } }), /may let lane_agent_evo_x2 in/);
   assert.throws(() => lib.editHba(withInclude, entry, 'add'), /was not read/);
   assert.throws(() => lib.editHba(`include_dir conf.d\n${HBA}`, entry, 'add'), /include_dir/);
-  assert.throws(() => lib.editHba(`hostssl lane_queue_db \\\n  +lane_agent 100.64.0.0/10 scram-sha-256\n${HBA}`, entry, 'add'), /continued line/);
+  assert.throws(() => lib.editHba(`hostssl lane_queue_db \\\n  +lane_agent 100.64.0.0/10 scram-sha-256\n${HBA}`, entry, 'add'), /ending in a backslash/);
   assert.deepEqual(lib.hbaIncludes("include 'a.conf'\ninclude_if_exists b.conf\n"), [{ kind: 'include', path: 'a.conf' }, { kind: 'include_if_exists', path: 'b.conf' }]);
 });
 
@@ -271,7 +271,7 @@ function fakeWorld({ hba = HBA, train = TRAIN, held = [], hbaErrors = 0, item = 
     if (cmd === 'mc') {
       world.mcEnvs.push(env);
       if (world.fail.mc && args.slice(0, 3).join(' ') === world.fail.mc) return bad(`mc: <ERROR> boom http://${ROOT.accessKey}:${ROOT.secretKey}@x`);
-      if (world.mcInfo && args[1] !== undefined && args[2] === 'info') return bad(world.mcInfo);
+      if (world.mcInfo && args[2] === 'info') return bad(typeof world.mcInfo === 'string' ? world.mcInfo : world.mcInfo[args[1]]);
       if (args[1] === 'policy' && args[2] === 'create') world.policyFile = fs.readFileSync(args[5], 'utf8');
       return ok();
     }
@@ -358,7 +358,7 @@ test('apply runs the steps in order, keeps every secret out of argv and output, 
   const order = world.calls.map((c) => {
     if (c.cmd === 'op-bot') return `op-bot ${c.args[1]}`;
     if (c.cmd === 'mc') return `mc ${c.args.slice(0, 3).join(' ')}`;
-    if (isEditCall(c)) return `edit ${c.args.at(-1)}`;
+    if (isEditCall(c)) return `edit ${c.args[c.args.indexOf('--') + 5]}`;
     return c.input?.includes('CREATE ROLE') ? 'create role' : null;
   }).filter(Boolean);
   assert.deepEqual(order, ['op-bot get', 'op-bot create', 'op-bot list', 'op-bot get', 'create role', 'edit hba', 'mc admin user add', 'mc admin policy create', 'mc admin policy attach', 'edit json']);
@@ -520,16 +520,16 @@ test('a file that changed between the read and the write is refused with nothing
   assert.equal(mcOps(world).length, 0);
 });
 
-async function runScript({ current, content, expect = sha256(current), kind = 'hba', hbaErrors = 0, jsonCheck, reloadOutput = 't' }) {
+async function runScript({ current, content, expect = sha256(current), kind = 'hba', verdict = 'ok', jsonCheck, reloadOutput = 't' }) {
   const dir = makeTmpDir('runner-admin-script-');
   const target = path.join(dir, kind === 'hba' ? 'pg_hba.conf' : 'config.json');
   fs.writeFileSync(target, current, { mode: 0o600 });
   const log = path.join(dir, 'reload.log');
   const script = lib.buildEditScript({ content, hooks: {
-    sha: 'shasum -a 256', chown: 'true', hbaErrors: `echo ${hbaErrors}`, reload: `echo reloaded >> '${log}'; echo ${reloadOutput}`,
+    sha: 'shasum -a 256', chown: 'true', invariant: `echo '${verdict}'`, reload: `echo reloaded >> '${log}'; echo ${reloadOutput}`,
     ...(jsonCheck ? { jsonCheck } : { jsonCheck: `'${process.execPath}' -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))'` }),
   } });
-  const result = await lib.spawnExec('bash', ['-s', '--', target, expect, 'whoever:whatever', '640', kind], { input: script });
+  const result = await lib.spawnExec('bash', ['-s', '--', target, expect, 'whoever:whatever', '640', kind, ...(kind === 'hba' ? HBA_ARGS : [])], { input: script });
   const files = fs.readdirSync(dir);
   return {
     ...result, target, files,
@@ -541,14 +541,15 @@ async function runScript({ current, content, expect = sha256(current), kind = 'h
 }
 
 const NEW_HBA = lib.editHba(HBA, ENTRY, 'add');
+const HBA_ARGS = ['add', 'lane_agent_evo_x2', '100.82.26.77', 'lane_queue_db'];
 
 async function validationFailureScenario(mod = lib) {
   const script = mod.buildEditScript;
   const dir = makeTmpDir('runner-admin-script-');
   const target = path.join(dir, 'pg_hba.conf');
   fs.writeFileSync(target, HBA);
-  const text = script({ content: NEW_HBA, hooks: { sha: 'shasum -a 256', chown: 'true', hbaErrors: 'echo 2', reload: `echo reloaded >> '${dir}/reload.log'; echo t` } });
-  const result = await lib.spawnExec('bash', ['-s', '--', target, sha256(HBA), 'a:b', '640', 'hba'], { input: text });
+  const text = script({ content: NEW_HBA, hooks: { sha: 'shasum -a 256', chown: 'true', invariant: "echo 'pg_hba.conf:12: a rule lets everyone in'", reload: `echo reloaded >> '${dir}/reload.log'; echo t` } });
+  const result = await lib.spawnExec('bash', ['-s', '--', target, sha256(HBA), 'a:b', '640', 'hba', ...HBA_ARGS], { input: text });
   assert.notEqual(result.code, 0, 'a rejected pg_hba must fail the script');
   assert.equal(fs.readFileSync(target, 'utf8'), HBA, 'the live file is restored from the backup');
   assert.match(result.stderr, /restored .*\.bak-lane-runner-admin-/);
@@ -560,8 +561,8 @@ async function changedSinceReadScenario(mod = lib) {
   const dir = makeTmpDir('runner-admin-script-');
   const target = path.join(dir, 'pg_hba.conf');
   fs.writeFileSync(target, `${HBA}# edited meanwhile\n`);
-  const text = mod.buildEditScript({ content: NEW_HBA, hooks: { sha: 'shasum -a 256', chown: 'true', hbaErrors: 'echo 0', reload: 'echo t' } });
-  const result = await lib.spawnExec('bash', ['-s', '--', target, sha256(HBA), 'a:b', '640', 'hba'], { input: text });
+  const text = mod.buildEditScript({ content: NEW_HBA, hooks: { sha: 'shasum -a 256', chown: 'true', invariant: 'echo ok', reload: 'echo t' } });
+  const result = await lib.spawnExec('bash', ['-s', '--', target, sha256(HBA), 'a:b', '640', 'hba', ...HBA_ARGS], { input: text });
   assert.equal(result.code, 3, 'a file that changed since it was read must stop the script');
   assert.equal(fs.readFileSync(target, 'utf8'), `${HBA}# edited meanwhile\n`, 'nothing is written over the concurrent edit');
   assert.deepEqual(fs.readdirSync(dir), ['pg_hba.conf']);
@@ -595,7 +596,7 @@ test('the edit script on a real shell: an unchanged hba is still validated and r
   assert.deepEqual(run.backups, []);
   assert.match(run.stdout, /^unchanged=/);
   assert.equal(run.reloaded, 'reloaded\n');
-  const rejected = await runScript({ current: NEW_HBA, content: NEW_HBA, hbaErrors: 3 });
+  const rejected = await runScript({ current: NEW_HBA, content: NEW_HBA, verdict: 'pg_hba.conf:3: bad' });
   assert.notEqual(rejected.code, 0);
   assert.equal(rejected.reloaded, '');
 });
@@ -674,7 +675,7 @@ test('remove refuses while the host holds claimed or running tickets, and --forc
   assert.deepEqual(mcOps(forced), ['admin policy detach', 'admin user remove', 'admin policy remove']);
   const txAt = forced.calls.findIndex((c) => c.input?.includes('NOLOGIN'));
   const dropAt = forced.calls.findIndex((c) => c.input?.includes('DROP ROLE'));
-  const hbaAt = forced.calls.findIndex((c) => isEditCall(c) && c.args.at(-1) === 'hba');
+  const hbaAt = forced.calls.findIndex((c) => isEditCall(c) && c.args.includes('hba'));
   assert.ok(txAt >= 0 && dropAt > txAt && hbaAt > dropAt);
   assert.ok(!forced.calls[txAt].input.includes('held tickets'), '--force drops the in-transaction check');
   assert.match(done.text, /op-bot item delete "lane-agent evo-x2" --vault BotAccess --archive/);
@@ -695,7 +696,7 @@ test('status reports each piece and is read-only', async () => {
 });
 
 test('status says absent only on an explicit not-found answer; any other mc failure is unknown and exits 1', async () => {
-  const notFound = fakeWorld({ item: heldItem, mcInfo: 'mc: <ERROR> Unable to get user info. The specified user does not exist.' });
+  const notFound = fakeWorld({ item: heldItem, mcInfo: { user: 'mc: <ERROR> Unable to get user info. The specified user does not exist. (NoSuchUser)', policy: 'mc: <ERROR> Unable to get policy info. The canned policy does not exist. (XMinioAdminNoSuchPolicy)' } });
   const absent = await cli(notFound, ['status', 'evo-x2']);
   assert.equal(absent.code, 0);
   assert.match(absent.text, /rustfs user +absent/);
@@ -705,6 +706,37 @@ test('status says absent only on an explicit not-found answer; any other mc fail
   assert.equal(unknown.code, 1);
   assert.match(unknown.text, /rustfs user +unknown \(mc failed, exit 1/);
   assert.match(unknown.text, /rustfs policy +unknown \(mc failed/);
+});
+
+test('status treats a DNS "no such host" as unknown, and a user-not-found message does not make a policy absent', async () => {
+  const dns = fakeWorld({ item: heldItem, mcInfo: 'mc: <ERROR> Unable to get user info. Get "http://pitelite.tail615381.ts.net:9000/minio/admin/v3/info-access-key": dial tcp: lookup pitelite.tail615381.ts.net: no such host' });
+  const named = await cli(dns, ['status', 'evo-x2']);
+  assert.equal(named.code, 1);
+  assert.match(named.text, /rustfs user +unknown \(mc failed/);
+  assert.match(named.text, /rustfs policy +unknown \(mc failed/);
+  const exact = fakeWorld({ item: heldItem, mcInfo: 'lookup pitelite.tail615381.ts.net: no such host' });
+  const bare = await cli(exact, ['status', 'evo-x2']);
+  assert.equal(bare.code, 1);
+  assert.doesNotMatch(bare.text, /rustfs (user|policy) +absent/);
+  const crossed = fakeWorld({ item: heldItem, mcInfo: { user: 'mc: <ERROR> The specified user does not exist.', policy: 'mc: <ERROR> The specified user does not exist.' } });
+  const mixed = await cli(crossed, ['status', 'evo-x2']);
+  assert.match(mixed.text, /rustfs user +absent/);
+  assert.match(mixed.text, /rustfs policy +unknown/);
+});
+
+test('remove tolerates only the not-found of the resource it removes, never a DNS failure', async () => {
+  const registered = () => ({ hba: lib.editHba(HBA, ENTRY, 'add'), train: lib.editTrainRunners(TRAIN, 'evo-x2', 'add'), item: heldItem, roleExists: true });
+  const failing = (message) => {
+    const world = fakeWorld(registered());
+    const inner = world.exec;
+    world.exec = async (cmd, args, opts) => (cmd === 'mc' && args[2] === 'remove' && args[1] === 'user' ? { code: 1, stdout: '', stderr: message } : inner(cmd, args, opts));
+    return world;
+  };
+  const dns = await cli(failing('lookup pitelite.tail615381.ts.net: no such host'), ['remove', 'evo-x2', '--apply']);
+  assert.equal(dns.code, 1);
+  assert.match(dns.text, /mc admin user remove failed/);
+  const gone = await cli(failing('mc: <ERROR> Unable to remove user. The specified user does not exist.'), ['remove', 'evo-x2', '--apply']);
+  assert.equal(gone.code, 0, gone.text);
 });
 
 test('bad arguments exit 2 with a message and touch nothing', async () => {
@@ -730,7 +762,7 @@ test('the guard refuses broad earlier rules: +group, all, /regex and @file in th
     'host lane_queue_db @users.txt 10.0.0.0/8 md5',
     'host @dbs.txt lane_agent_evo_x2 10.0.0.0/8 md5',
     'local sameuser all peer',
-    'host a,lane_queue_db,b x,"lane_agent_evo_x2" 10.0.0.0/8 md5',
+    'host a,lane_queue_db,b x,lane_agent_evo_x2 10.0.0.0/8 md5',
   ];
   for (const rule of refused) assert.throws(() => add(rule), /already has a rule outside .* may let lane_agent_evo_x2 in: /, rule);
   assert.throws(() => add(refused[0]), new RegExp(refused[0].replaceAll('+', '\\+').replaceAll('/', '\\/')));
@@ -799,7 +831,7 @@ test('add stops before the rustfs and train steps when the role disappears after
   const inner = world.exec;
   world.exec = async (cmd, args, opts) => {
     const result = await inner(cmd, args, opts);
-    if (args[1]?.includes(' flock ') && args[1].endsWith(' hba')) { world.roleExists = false; world.principalExists = false; }
+    if (args[1]?.includes(' flock ') && args[1].includes(' hba ')) { world.roleExists = false; world.principalExists = false; }
     return result;
   };
   const { code, text } = await cli(world, [...ADD, '--apply']);
@@ -825,8 +857,8 @@ async function reloadUnconfirmedScenario(mod = lib) {
   const dir = makeTmpDir('runner-admin-script-');
   const target = path.join(dir, 'pg_hba.conf');
   fs.writeFileSync(target, HBA);
-  const script = (output) => mod.buildEditScript({ content: NEW_HBA, hooks: { sha: 'shasum -a 256', chown: 'true', hbaErrors: 'echo 0', reload: `echo ${output}` } });
-  const run = (sha, output) => lib.spawnExec('bash', ['-s', '--', target, sha, 'a:b', '640', 'hba'], { input: script(output) });
+  const script = (output) => mod.buildEditScript({ content: NEW_HBA, hooks: { sha: 'shasum -a 256', chown: 'true', invariant: 'echo ok', reload: `echo ${output}` } });
+  const run = (sha, output) => lib.spawnExec('bash', ['-s', '--', target, sha, 'a:b', '640', 'hba', ...HBA_ARGS], { input: script(output) });
   const failed = await run(sha256(HBA), 'f');
   assert.notEqual(failed.code, 0, 'a reload that answers f must not report success');
   assert.doesNotMatch(failed.stdout, /backup=|unchanged=/);
@@ -868,6 +900,129 @@ test('the resume command names the script as invoked: relative from the repo, ab
   assert.match(await resumeFrom({ scriptPath: 'ops/runner/lane-runner-admin.js' }), /: node ops\/runner\/lane-runner-admin\.js add/);
   assert.match(await resumeFrom({ cwd: makeTmpDir('runner-admin-cwd-') }), new RegExp(`: node ${SCRIPT.replaceAll('/', '\\/')} add`));
   assert.match(await resumeFrom({ cwd: path.join(REPO, 'ops') }), /: node runner\/lane-runner-admin\.js add/);
+});
+
+test('the dry-run guard: an included reject list never sets the cutoff, a continued comment or a quoted field is refused', () => {
+  const reviewed = (extra) => lib.editHba(HBA.replace('local   lane_queue_db  all  reject', `include extra.conf\nlocal   lane_queue_db  all  reject`), ENTRY, 'add', { included: { 'extra.conf': extra } });
+  assert.throws(() => reviewed('host all lane_agent_old all reject\nhost lane_queue_db all all trust'), /may let lane_agent_evo_x2 in: "host lane_queue_db all all trust"/);
+  assert.doesNotThrow(() => reviewed('host all lane_agent_old all reject'));
+  const inMain = (rule) => lib.editHba(HBA.replace('local   lane_queue_db  all  reject', `${rule}\nlocal   lane_queue_db  all  reject`), ENTRY, 'add');
+  assert.throws(() => inMain('# a note \\\nhost all lane_agent_evo_x2 all reject'), /ending in a backslash/);
+  assert.throws(() => reviewed('# a note \\\nhost all lane_agent_old all reject'), /extra\.conf has a line ending in a backslash/);
+  assert.throws(() => inMain('host "other db",lane_queue_db all all trust'), /quoted field/);
+  assert.throws(() => reviewed('host "other db",lane_queue_db all all trust'), /extra\.conf has a quoted field/);
+  assert.doesNotThrow(() => inMain('# "quoted" in a comment'));
+});
+
+test('the live-like layout has no double quote and no continuation, so the dry-run guard accepts it', () => {
+  assert.ok(!HBA.split('\n').some((line) => !/^\s*#/.test(line) && line.includes('"')));
+  assert.ok(!HBA.split('\n').some((line) => /\\\s*$/.test(line)));
+  assert.doesNotThrow(() => lib.editHba(HBA, ENTRY, 'add'));
+});
+
+test('the edit call carries the action, role, address and database for the invariant query', async () => {
+  const world = fakeWorld();
+  await cli(world, [...ADD, '--apply']);
+  const edit = world.calls.find(isEditCall);
+  assert.deepEqual(edit.args.slice(edit.args.indexOf('hba')), ['hba', 'add', 'lane_agent_evo_x2', '100.82.26.77', 'lane_queue_db']);
+  const removal = fakeWorld({ hba: NEW_HBA, train: lib.editTrainRunners(TRAIN, 'evo-x2', 'add'), item: heldItem, roleExists: true });
+  await cli(removal, ['remove', 'evo-x2', '--apply']);
+  const removeEdit = removal.calls.find((c) => isEditCall(c) && c.args.includes('hba'));
+  assert.deepEqual(removeEdit.args.slice(removeEdit.args.indexOf('hba')), ['hba', 'remove', 'lane_agent_evo_x2', '-', 'lane_queue_db']);
+});
+
+test('the edit script passes its action, role, address and database to the invariant', async () => {
+  const dir = makeTmpDir('runner-admin-script-');
+  const target = path.join(dir, 'pg_hba.conf');
+  fs.writeFileSync(target, HBA);
+  const script = lib.buildEditScript({ content: NEW_HBA, hooks: { sha: 'shasum -a 256', chown: 'true', invariant: 'echo "$action $role $ip $db"', reload: 'echo t' } });
+  const result = await lib.spawnExec('bash', ['-s', '--', target, sha256(HBA), 'a:b', '640', 'hba', ...HBA_ARGS], { input: script });
+  assert.equal(result.code, 6);
+  assert.match(result.stderr, /pg_hba invariant violated: add lane_agent_evo_x2 100\.82\.26\.77 lane_queue_db/);
+  const bare = await lib.spawnExec('bash', ['-s', '--', target, sha256(HBA), 'a:b', '640', 'hba'], { input: script });
+  assert.equal(bare.code, 2, 'an hba edit without an action is refused');
+});
+
+test('canary: with the invariant step removed, the violation scenario fails', async () => {
+  const mutant = await importMutant(LIB_FILE, ['[ "$verdict" = ok ]', 'true']);
+  await assert.rejects(validationFailureScenario(mutant), (err) => err.code === 'ERR_ASSERTION');
+});
+
+function findPostgres() {
+  for (const dir of [process.env.PG_BIN, '/opt/homebrew/opt/postgresql@17/bin', '/usr/lib/postgresql/17/bin', '/usr/pgsql-17/bin', '']) {
+    if (dir === undefined) continue;
+    const bin = (name) => (dir ? path.join(dir, name) : name);
+    const probe = (name) => spawnSync(bin(name), ['--version']).status === 0;
+    if (['initdb', 'pg_ctl', 'psql'].every(probe) && spawnSync('openssl', ['version']).status === 0) return bin;
+  }
+  return null;
+}
+const PG = findPostgres();
+
+test('real postgres: the invariant query accepts the live-like layout and refuses every way of being admitted earlier', { skip: PG ? false : 'no initdb, pg_ctl, psql and openssl on this machine' }, async (t) => {
+  const root = fs.mkdtempSync('/tmp/lrapg-');
+  const data = path.join(root, 'data');
+  const hbaDir = path.join(root, 'hba');
+  const sock = path.join(root, 's');
+  const hbaFile = path.join(hbaDir, 'pg_hba.conf');
+  fs.mkdirSync(hbaDir);
+  fs.mkdirSync(sock);
+  const must = (cmd, args) => { const r = spawnSync(PG(cmd), args, { encoding: 'utf8' }); assert.equal(r.status, 0, `${cmd} ${args.join(' ')}: ${r.stderr}`); return r; };
+  const admin = (hba) => `local   all  me  trust\n${hba}`;
+  must('initdb', ['-D', data, '-U', 'me', '--auth=trust']);
+  assert.equal(spawnSync('openssl', ['req', '-x509', '-nodes', '-newkey', 'rsa:2048', '-subj', '/CN=localhost', '-days', '1', '-keyout', path.join(data, 'server.key'), '-out', path.join(data, 'server.crt')]).status, 0);
+  fs.chmodSync(path.join(data, 'server.key'), 0o600);
+  fs.writeFileSync(hbaFile, admin(HBA));
+  must('pg_ctl', ['-D', data, '-w', '-l', path.join(root, 'log'), '-o', `-c listen_addresses='' -c unix_socket_directories=${sock} -c port=55433 -c ssl=on -c ssl_cert_file=${data}/server.crt -c ssl_key_file=${data}/server.key -c hba_file=${hbaFile}`, 'start']);
+  t.after(() => { spawnSync(PG('pg_ctl'), ['-D', data, '-m', 'immediate', 'stop']); fs.rmSync(root, { recursive: true, force: true }); });
+  const psql = `'${PG('psql')}' -h '${sock}' -p 55433 -U me -d postgres`;
+
+  const run = async (content, { action = 'add', current }) => {
+    fs.writeFileSync(hbaFile, current);
+    const script = lib.buildEditScript({ content, hooks: { sha: 'shasum -a 256', chown: 'true', invariant: lib.invariantFunctionBody(psql), reload: `${psql} -At -c 'SELECT pg_reload_conf()'` } });
+    const result = await lib.spawnExec('bash', ['-s', '--', hbaFile, sha256(current), 'a:b', '640', 'hba', action, 'lane_agent_evo_x2', action === 'add' ? '100.82.26.77' : '-', 'lane_queue_db'], { input: script });
+    return { ...result, after: fs.readFileSync(hbaFile, 'utf8') };
+  };
+  const CUR = admin(HBA);
+  const ADDED = admin(NEW_HBA);
+  const BEGIN = '# BEGIN lane-runner-admin evo-x2';
+  const before = (rule) => ADDED.replace(BEGIN, `${rule}\n${BEGIN}`);
+  const refused = async (label, content, reason, opts = { current: CUR }) => {
+    const result = await run(content, opts);
+    assert.equal(result.code, 6, `${label}: ${result.stderr}`);
+    assert.equal(result.after, opts.current, `${label}: the file is restored`);
+    assert.match(result.stderr, reason, label);
+    assert.match(result.stderr, /pg_hba invariant violated: /, label);
+  };
+
+  const ok = await run(ADDED, { current: CUR });
+  assert.equal(ok.code, 0, ok.stderr);
+  assert.equal(ok.after, ADDED);
+  assert.match(ok.stdout, /^backup=/);
+
+  fs.writeFileSync(path.join(hbaDir, 'extra.conf'), 'host all lane_agent_old all reject\nhost lane_queue_db all all trust\n');
+  await refused('an include whose reject list names another lane login, then a trust rule', before('include extra.conf'), /extra\.conf:2: the first TCP rule that can match lane_agent_evo_x2 on lane_queue_db is not its own hostssl 100\.82\.26\.77\/32 scram-sha-256 line/);
+  await refused('a quoted database list', before('host "other db",lane_queue_db all all trust'), /pg_hba\.conf:\d+: the first TCP rule/);
+  await refused('a continued comment that swallows the hostssl line', ADDED.replace('forward\nhostssl lane_queue_db  lane_agent_evo_x2', 'forward \\\nhostssl lane_queue_db  lane_agent_evo_x2'), /pg_hba\.conf:\d+: the first TCP rule/);
+  await refused('a group rule', before('host lane_queue_db +lane_agent 10.0.0.0/8 scram-sha-256'), /the first TCP rule/);
+  await refused('an all/all trust rule', before('host all all 10.0.0.0/8 trust'), /the first TCP rule/);
+  await refused('a wrong address', ADDED.replace('100.82.26.77/32', '100.82.26.78/32'), /the first TCP rule/);
+  await refused('a wider mask', ADDED.replace('100.82.26.77/32', '100.82.26.0/24'), /the first TCP rule/);
+  await refused('a weaker method', ADDED.replace('100.82.26.77/32  scram-sha-256', '100.82.26.77/32  md5'), /the first TCP rule/);
+  await refused('a reject that is not a catch-all', ADDED.replace('host    lane_queue_db  all  all  reject', 'host    lane_queue_db  all  10.0.0.0/8  reject'), /the TCP rule after the hostssl line is not a catch-all reject/);
+  await refused('a local trust rule', ADDED.replace('local   lane_queue_db  all  reject', 'local   lane_queue_db  all  trust'), /the first local rule that can match lane_agent_evo_x2 on lane_queue_db is not a reject/);
+  await refused('a syntax error anywhere', `${ADDED}host bogus\n`, /rule error/);
+
+  const unreachable = ADDED.replace('host    lane_queue_db  all  all  reject\n', 'host    lane_queue_db  all  all  reject\nhost    lane_queue_db  all  all  trust\n');
+  const reached = await run(unreachable, { current: CUR });
+  assert.equal(reached.code, 0, `a trust rule after the catch-all reject is unreachable: ${reached.stderr}`);
+
+  const removed = await run(CUR, { action: 'remove', current: ADDED });
+  assert.equal(removed.code, 0, removed.stderr);
+  assert.equal(removed.after, CUR);
+  const leftover = await run(ADDED, { action: 'remove', current: ADDED });
+  assert.equal(leftover.code, 6);
+  assert.match(leftover.stderr, /a rule other than reject still names lane_agent_evo_x2/);
 });
 
 test('spawnExec runs without a shell, feeds stdin and merges env', async () => {
