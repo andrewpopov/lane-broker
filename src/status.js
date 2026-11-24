@@ -14,7 +14,7 @@ import { queuedClaimsByClass } from './allocation-shadow.js';
 import { readLastSimDemandAt } from './sim-arm.js';
 import { listAttempts, supervisorAlive, moveInterruptedLabel, isStrandedWithdrawingMove } from './attempts.js';
 import { readGateState } from './load.js';
-import { liveDeviceGates, renderDeviceGatesLine, sampleDevice } from './device-gates.js';
+import { liveDeviceGates, readMemoryGate, renderDeviceGatesLine, sampleDevice } from './device-gates.js';
 import { readMemorySample, classifyMemorySample } from './memory.js';
 import { loadGlobalConfigOrError, isDispatchOnly, pullLocalFallbackEnabled } from './config.js';
 import { queueDownSince } from './queue-health.js';
@@ -32,6 +32,7 @@ import { leaseOverrun, leaseSilence } from './observed.js';
 import { idleCreditCores } from './idle-credit.js';
 import { topExternalCpu, externalBusyCores, windowExternalCores, scanProcWindow, starvedStaleMs, starvedForMs } from './external-cpu.js';
 import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores, cpuBudgetCores } from './resources.js';
+import { fmtMB } from './memory.js';
 
 const LANE_BIN = fileURLToPath(new URL('../bin/lane.js', import.meta.url));
 
@@ -401,7 +402,8 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     // null whenever the sample itself is unavailable (non-macOS host, or a
     // failed probe), never a fabricated reading.
     memory: classifyMemorySample(readMemorySample()),
-    ...(sampleDeviceGates && cfg.deviceGates ? { deviceGates: liveDeviceGates(cfg.deviceGates, await sampleDevice(cfg.deviceGates)) } : {}),
+    ...(sampleDeviceGates ? { deviceGates: liveDeviceGates(cfg.deviceGates, await sampleDevice(cfg.deviceGates), { memory: readMemoryGate(root, cfg.deviceGates).reading }) } : {}),
+    memoryGate: readMemoryGate(root, cfg.deviceGates),
     running,
     queued,
     remote,
@@ -506,11 +508,6 @@ function fmtMs(ms) {
   return `${m}m${s % 60}s`;
 }
 
-function fmtMB(bytes) {
-  if (bytes == null || !Number.isFinite(bytes)) return '?';
-  return `${(bytes / (1024 * 1024)).toFixed(0)}MB`;
-}
-
 /** BRAIN-211/BRAIN-273: the memory line is informational-only, always —
  *  there is no admission flag to gate it on like loadGate.admission, since
  *  nothing ever reads this reading back for a start decision. The verdict
@@ -533,6 +530,9 @@ function renderMemoryLine(memory) {
     ` ${memory.availablePct.toFixed(1)}%${context ? `; ${context}` : ''}) [informational]`
   );
 }
+
+export const renderMemoryGateLine = ({ consecutiveOk = 0, openSamples }) =>
+  `memory gate: CLOSED (memory-pressure) — no new local lane starts beside a running one; reopens after ${openSamples ?? '?'} clean samples (${consecutiveOk} so far)`;
 
 export function renderStatusText(status) {
   const lines = [];
@@ -639,6 +639,7 @@ export function renderStatusText(status) {
   }
   lines.push(renderMemoryLine(status.memory));
   if (status.deviceGates) lines.push(renderDeviceGatesLine(status.deviceGates));
+  if (status.memoryGate?.closed) lines.push(renderMemoryGateLine(status.memoryGate));
   if (status.priority && !status.priority.active) {
     lines.push('priority: inactive (legacy scheduler; run lane migrate-scheduler)');
   } else if (status.priority) {

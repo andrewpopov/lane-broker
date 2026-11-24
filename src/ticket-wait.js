@@ -99,6 +99,8 @@ export function waitLabel(reason, detail = {}) {
       return `the load gate (load ${detail.load})`;
     case 'memory-critical':
       return `memory pressure (${detail.macPressure})`;
+    case 'memory-pressure':
+      return 'the memory gate (this host is paging)';
     case 'class-cap':
       return `a class cap (${detail.capReason})`;
     case 'conflict':

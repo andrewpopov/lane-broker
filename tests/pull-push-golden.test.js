@@ -37,6 +37,8 @@ const normalize = (text) => text
   .replace(/\b\d+(\.\d+)?\s?(ms|s)\b/g, '<duration>')
   .replace(/\/(?:private\/)?(?:var|tmp)\/[^\s"',;)]+/g, '<path>');
 
+const isRanOnLine = (line) => line.startsWith('lane: executing on ');
+
 const jsonLines = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split('\n').filter(Boolean).map((line) => JSON.parse(line)) : []);
 
 export async function observeFixture(spec, laneBin) {
@@ -49,7 +51,7 @@ export async function observeFixture(spec, laneBin) {
   const recorded = jsonLines(log);
   return JSON.parse(normalize(JSON.stringify({
     exit: res.code,
-    laneLines: res.stderr.split('\n').filter((line) => line.startsWith('lane')),
+    laneLines: res.stderr.split('\n').filter((line) => line.startsWith('lane') && !isRanOnLine(line)),
     patches: recorded.filter((r) => 'patch' in r).map((r) => r.patch),
     fallbackOrRefuse: recorded.filter((r) => 'fallbackOrRefuse' in r).map((r) => r.fallbackOrRefuse),
     header: header === null ? null : JSON.parse(header),

@@ -79,6 +79,20 @@ removed when the ticket starts or ends, and files of tickets no longer queued ar
 pruned by the next admission pass; status ignores them. Telemetry only: admission
 never reads it.
 
+**Where a lane ran (PKG-402).** Whichever supervisor spawns the command writes one line to the lane's log, and to
+`lane run`'s stderr when it waits, just before the command's first output:
+`lane: executing on <host> via <local|push|pull> (ticket <id>, cpu <n>, mem <m>[, runner <name>])`. `<host>` is that
+machine's hostname; `<id>` is the ticket `lane run` printed, also for a remote run, where the runner's own lane id
+never appears; `cpu` is the grant the command was spawned with (the same number as `LANE_BROKER_CPU_CORES`), `mem` the
+lane's memory claim (its `memoryBytes`, else `defaultMemoryBytesPerWeight` times its weight), and `runner` the runner name a push or pull dispatch used. On a
+runner the line comes from the runner's supervisor, so it travels back with the command's output; a runner older than
+this records nothing. The result record (`lane result <id> --json`) carries the same fields as `ranOn`:
+`{ host, transport, ticket, cpuCores, memoryBytes, runner }` (null where unknown), relayed by push, pull and
+`lane reconcile` from the runner's own record. A pull run cancelled after it started keeps `ranOn`, relayed from the runner's
+cancelled result. A cancelled push run has none: push brings back no structured runner record for a cancel, and the log line is
+output the command could forge, so it is never parsed back. A cached pass, a refusal and a run cancelled before it started have no
+`ranOn`, since nothing executed.
+
 Everything after `--` is the command, passed as `argv` (not through a shell —
 `spawn(cmd[0], cmd.slice(1))`). Use `sh -c '...'` explicitly if you need shell
 features like pipes or globbing.
@@ -329,7 +343,7 @@ blocks a start — not for an idle broker, not for one already holding
 non-conflicting leases. Set `true` to make a closed gate hard-deny again
 (pre-BRAIN-207 behaviour, including the BRAIN-197 idle exemption).
 
-`deviceGates` (BRAIN-1088, optional; absent means off): worker-side limits on device state. While a gate is closed the pull
+`deviceGates` (BRAIN-1088, optional; absent means only the default `memory` gate): worker-side limits on device state. While a gate is closed the pull
 agent (`lane agent`) takes no new claim; running work continues, and `status.json` shows `claims: paused:thermal`, `paused:on-battery`
 or `paused:battery-low`. Every gate and every threshold is optional, a gate needs at least one, and unknown keys are refused.
 `thermal` takes `maxPressureLevel` (0-4; macOS `notifyutil -g com.apple.system.thermalpressurelevel`), `minCpuSpeedLimit` (1-100;
@@ -344,13 +358,39 @@ parse failure or a failed sample leaves an open gate open and shows as `unknown`
 judge by (no configured reading known; for `power`, AC state unknown): it neither reopens nor loses its countdown, so editing a
 closed gate down to thresholds this platform cannot read holds it closed until a restart or until `deviceGates` is removed. Linux battery
 and thermal reads skip unreadable entries and `scope: Device` batteries (a wireless mouse), so a missing file is never read as 0. `lane status` samples live and prints one `device gates:` line; the agent's `status.json` carries each gate's
-`{closed, consecutiveOk, reading}` and its textfile metrics `lane_agent_device_gate_closed{gate="thermal|power"}` (0/1, configured
+`{closed, consecutiveOk, reading}` and its textfile metrics `lane_agent_device_gate_closed{gate="thermal|power|memory"}` (0/1, active
 gates only).
+
+**The `memory` gate (PKG-404) is on by default**; `"memory": false` turns it off (and clears local admission's stored state), and
+`"memory": {}` or any subset of its keys keeps the defaults for the rest. It closes only on signs the host is paging now, never on how
+much sits in swap or the compressor (BRAIN-273: occupancy outlives the pressure, so a recovered host would stay excluded):
+`maxVmPressureLevel` (1-4, default 1; macOS `kern.memorystatus_vm_pressure_level`, 1 normal, 2 warn, 4 critical), `maxPsiSomeAvg10`
+(0-100, default 10; Linux `/proc/pressure/memory` `some avg10`, the share of the last 10 s some task stalled on memory) and
+`maxSwapMiBPerSec` (0.1-10000, default 10; swap traffic between two samples: macOS `vm_stat` Swapins plus Swapouts at the page size
+its header states, Linux `/proc/vmstat` pswpin plus pswpout at the host's page size from `getconf PAGESIZE`, read once, and read only
+where PSI is missing). A rate needs two samples that each carry a counter and a time, no more than 60 s apart: a failed read, a switch
+from PSI to the fallback, a counter that went backwards (a reboot) or a longer gap gives that sample no rate and starts a new baseline,
+so a fresh process judges its first sample by the other signals and a recovered counter is never read as one huge burst. An unknown
+page size means no counter, never a guess. **Why 10 MiB/s** (VictoriaMetrics, the 7 days to 2026-11-23, 5-minute rate of
+`macos_swap_in/out_bytes_total` on workbook-pro): p50 0.01, p95 4.85 and max 299 MiB/s; above 10 MiB/s 2.5% of the week and above
+5 MiB/s 4.5%. That day's thrash (swap 22016/23552 MB, compressor 20757 MB, a train shard about 3x slow until it failed) averaged
+14.5 MiB/s with a 54.5 MiB/s peak. The kernel level never left normal (max 1) on any host all week, even at 98% swap, so on macOS the
+rate is the signal that actually fires; the kernel level stays as a backstop. `openSamples` defaults to 3. **Unknown never holds the gate closed for good:** after 3 consecutive samples with no
+readable signal a closed memory gate reopens and reports `sensor-unavailable` (agent log line, `status.json` `sensor`, and
+`lane_agent_device_gate_sensor_unavailable{gate="memory"}`); the other gates keep holding on unknown as described above. The pull agent
+stops claiming while the gate is closed (`claims: paused:memory-pressure`) and publishes the readings as
+`lane_agent_memory_pressure{signal="vm_pressure_level|psi_some_avg10|swap_mib_per_second"}`. Local admission keeps its own copy of the
+same gate in `<state>/memory-gate.json`, sampled under the broker lock and reused for 5 s (which is also its rate window): in
+`schedulerMode: "active"` a closed gate denies a start (`memory-pressure`, waiting label "the memory gate") while another lane holds a
+lease, like the load gate, so a paging host runs one lane at a time rather than none, and a local-first lane goes to a runner instead.
+`lane status` adds a `memory gate: CLOSED` line while it is closed, and its `device gates:` line shows the live rate against the stored
+sample. macOS `critical` still denies every start, idle or not (`memory-critical`, BRAIN-207).
 
 ```json
 "deviceGates": {
   "thermal": { "maxPressureLevel": 1, "minCpuSpeedLimit": 100, "maxTempC": 90, "openSamples": 3 },
-  "power":   { "requireAc": true, "minBatteryPercent": 20, "openSamples": 1 }
+  "power":   { "requireAc": true, "minBatteryPercent": 20, "openSamples": 1 },
+  "memory":  { "maxVmPressureLevel": 1, "maxPsiSomeAvg10": 10, "maxSwapMiBPerSec": 10, "openSamples": 3 }
 }
 ```
 
@@ -602,7 +642,7 @@ agent's status shows `claims: paused:draining (bosun)`, naming every owner.
 **What bosun reads.** The agent's textfile metrics are the `lane_agent_*` families documented under "Textfile metrics" in
 [Pull agent client core](#pull-agent-client-core-brain-1035) (`lane_agent_last_tick_timestamp_seconds`,
 `lane_agent_executions{subphase}`, `lane_agent_claims_total{answer}`, `lane_agent_listen_up`, `lane_agent_registered`,
-`lane_agent_scope_available`, `lane_agent_device_gate_closed{gate}`, `lane_agent_info{version}`).
+`lane_agent_scope_available`, `lane_agent_device_gate_closed{gate}`, `lane_agent_memory_pressure{signal}`, `lane_agent_info{version}`).
 
 ## Remote runners (BRAIN-319)
 
@@ -1571,11 +1611,31 @@ work-stealing restricted to tasks that have not started; a started task is never
 |---|---|
 | `LANE_BROKER_EXECUTOR` | `remote` when the command (and `remoteDeps` / `remoteSetup`) runs on a runner; `local` otherwise. |
 | `LANE_BROKER_RUNNER` | On a runner: the runner's name as the submitter's `runners[]` config names it, carried in the dispatch header (`runnerName`). Never set for a local run; absent when the submitter is older than 0.45.0, in which case only `LANE_BROKER_EXECUTOR` is exported. |
+| `LANE_BROKER_CPU_CORES` | The CPU grant the command was spawned with, local, push or pull alike: the declared `cpuCores`, an elastic or pull claim's smaller grant, or the `maxExecutionCpuCores` ceiling, whichever applies. Unset when the lane declares no CPU. Size worker pools from it (below). |
+| `LANE_BROKER_MEMORY_BYTES` | The lane's memory claim in bytes: its `memoryBytes`, else `defaultMemoryBytesPerWeight` times its weight. |
 | `LANE_BROKER_RUNNER_SPEED_FACTOR` | On a runner: that runner's `speedFactor` from the submitter's `runners[]` config (carried as `runnerSpeedFactor`, a number in (0, 4]), so a repo can scale test time budgets on slow runners. Never set for a local run; absent when the runner has no `speedFactor` or the submitter is older than this feature. |
 | `TMPDIR`, `TMP`, `TEMP` (BRAIN-937) | A per-lease `lb-*` directory (mode 0700) under `/var/tmp` (`LANE_BROKER_TMP_BASE` overrides it, for tests), as a runner already provides. It is renamed away and removed in a detached `rm` before the result is published, so a suite that skips its own cleanup cannot fill the shared temp volume, and a file the command left there is gone once `lane run` returns. Tool caches kept under `os.tmpdir()` go cold on every run, as they already do on runners. A nested `lane run` inherits its parent's directory, which outlives the nested run. If the directory cannot be created the run proceeds with the inherited `TMPDIR` and a line in the admission log. |
 
-Both are set by the broker, so a value exported in the caller's shell is replaced. `LANE_BROKER_LOCAL_REASON` is unchanged. The two
-variables reach the `remoteDeps` install and so are part of its deps-cache key.
+All of these are set by the broker, so a value exported in the caller's shell is replaced. `LANE_BROKER_LOCAL_REASON` is unchanged.
+`LANE_BROKER_EXECUTOR`, `LANE_BROKER_RUNNER` and `LANE_BROKER_RUNNER_SPEED_FACTOR` reach the `remoteDeps` install and so are part of its deps-cache key.
+
+**Sizing a test runner to the grant (PKG-403).** Nothing stops a command from using more cores than it claimed: macOS has
+no cgroups, and `cpuLimit` is off by default. A test runner sizes its pool from the host's core count, so a 1-core lane
+runs several files at once beside whatever else the host is doing, and a fixed time budget fails under it. Read the grant
+instead, keeping the runner's own default when the variable is unset (outside a lane):
+
+```sh
+# node --test (this repo's scripts/test-run.sh, which test-shard.sh and the train gate run through, also caps it at 4)
+node --test --test-concurrency="${LANE_BROKER_CPU_CORES:-2}" ...
+# vitest / jest
+vitest run --maxWorkers="${LANE_BROKER_CPU_CORES:-50%}"
+jest --maxWorkers="${LANE_BROKER_CPU_CORES:-50%}"
+# playwright
+playwright test --workers="${LANE_BROKER_CPU_CORES:-50%}"
+```
+
+A fractional grant (an elastic `1.5`) needs rounding down to a whole worker count, at least 1, before a runner that
+takes only integers sees it. Declare the lane's `cpuCores` as what its runner really uses at that count.
 
 ### Keeping client credentials from a local command (TPWR-674)
 
@@ -1689,7 +1749,7 @@ Pull recovery surfaces (BRAIN-1036 R6). All act only on pull attempts that alrea
 
 `src/agent/` is the library a runner's `lane agent` is built from and `lane agent [--check] [--root <remoteRoot>]` runs it. It runs as a bosun child on Linux/WSL (wintop, skybox) and as a root LaunchDaemon on the Macs (below).
 
-- **Config** is read from `~/.config/lane-agent/` by `loadAgentConfig`: `config.json`, the password file (default `password`) and the CA (default `ca.pem`) must each be a regular file, not a symlink, mode 0600 and owned by the running uid. Keys: `laneQueueUrl` (the same single-endpoint rules as the broker's, with no password and no query: TLS is always verify-full), `passwordFile`, `caFile`, `schedule`, `stopClaimingBeforeCloseMs` (30 min), `pollMs` (15000), `speedFactor` (1; at most 4), `runnerName` (required: the host name the queue registers this login as, checked after `ld_register`), `fetchBudgetMs` (10 min), `maxRunMs` (2 h; see *Pull-lane guard in the agent*), `rustfs` (`endpoint`, `region`, `snapBucket`, `outBucket`) and `rustfsEnvFile` (default `rustfs.env`, `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, read under the same private-file rule), and the optional absolute paths `brokerHome`, `stateDir` and `metricsTextfileDir` (see *Textfile metrics*; the first two default to the broker's own defaults; the agent never reads `LANE_BROKER_HOME` or `LANE_BROKER_STATE`, because under bosun it gets a minimal environment). `lane drain` and `lane status` aimed at an agent must use the same `stateDir`, or they act on a different broker. `pollMs` may not exceed 15000. Every pg connection carries `keepAlive`, `connectionTimeoutMillis` 10000 and `query_timeout` 20000, so a dead server surfaces as a retryable error instead of a hung call. It refuses to load unless the broker config has `remoteBlobCache: true`. Device limits (thermal, power) are the broker config's `deviceGates`, which the agent reads from that same config; `requireAcPower`, a key that was accepted but never enforced, is refused with a pointer to `deviceGates.power.requireAc`.
+- **Config** is read from `~/.config/lane-agent/` by `loadAgentConfig`: `config.json`, the password file (default `password`) and the CA (default `ca.pem`) must each be a regular file, not a symlink, mode 0600 and owned by the running uid. Keys: `laneQueueUrl` (the same single-endpoint rules as the broker's, with no password and no query: TLS is always verify-full), `passwordFile`, `caFile`, `schedule`, `stopClaimingBeforeCloseMs` (30 min), `pollMs` (15000), `speedFactor` (1; at most 4), `runnerName` (required: the host name the queue registers this login as, checked after `ld_register`), `fetchBudgetMs` (10 min), `maxRunMs` (2 h; see *Pull-lane guard in the agent*), `rustfs` (`endpoint`, `region`, `snapBucket`, `outBucket`) and `rustfsEnvFile` (default `rustfs.env`, `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`, read under the same private-file rule), and the optional absolute paths `brokerHome`, `stateDir` and `metricsTextfileDir` (see *Textfile metrics*; the first two default to the broker's own defaults; the agent never reads `LANE_BROKER_HOME` or `LANE_BROKER_STATE`, because under bosun it gets a minimal environment). `lane drain` and `lane status` aimed at an agent must use the same `stateDir`, or they act on a different broker. `pollMs` may not exceed 15000. Every pg connection carries `keepAlive`, `connectionTimeoutMillis` 10000 and `query_timeout` 20000, so a dead server surfaces as a retryable error instead of a hung call. It refuses to load unless the broker config has `remoteBlobCache: true`. Device limits (thermal, power, memory) are the broker config's `deviceGates`, which the agent reads from that same config; `requireAcPower`, a key that was accepted but never enforced, is refused with a pointer to `deviceGates.power.requireAc`.
 - **One owner per remote root.** `<remoteRoot>/agent/owner.json` is `{pid, start, kernelBootId}`, written under a lock file in `<remoteRoot>/agent/` (not the state home, so two state homes over one root still serialise); a second agent refuses while that process is alive (pid and start time) and takes over a dead owner. The owner writes `agent/status.json` on each tick; `readAgentStatus` reports `no-owner` when nothing live owns the root.
 - **Records.** `agent/executions/<execId>.json` holds one execution (`subphase`, the claim, the outbox). Subphases are `FETCHING`, `STARTING`, `SPAWNING`, `RUNNING`, `SETTLING`, `OUTBOX`, `KILLING`, `DONE`. A write is fsynced with its directory before memory sees it, and a record that cannot be read or does not match its name stops the agent rather than being skipped. Startup fsyncs every directory up to the remote root's parent before the first database call.
 - **One queue (`LdClient`).** Every `ld_*` call runs through one FIFO on one connection (a second connection only LISTENs on `ld_work` and `ld_host_<host>`; reconnecting it does not re-register). Each new call connection starts with `ld_register(version, protocol, schedule)`, before any queued call. A job is the call plus its `persist` callback. Retries are verbatim after connection errors, client-side timeouts (`Query read timeout`, `timeout exceeded when trying to connect`), `57P01`, `57014`, `57P02`, `57P03`, `55P03`, `53300` and class `08`; `42501`, `22023` and anything else fail loud. A FIFO turn makes at most two attempts. A call that fails retryably twice goes to the tail with the same request and the same req id, and the next job runs, so a heartbeat waits behind at most one turn of any other call. The caller's promise stays pending until the call's real answer, and `persist` runs once, on that answer. The LISTEN loop keeps backing off on any error until `close()` (reporting `listen-failed`); `close()` during a pending connect ends that connection and sends nothing.
@@ -1702,7 +1762,7 @@ Pull recovery surfaces (BRAIN-1036 R6). All act only on pull attempts that alrea
 - **Under bosun (S2g).** The agent is a bosun child (`restart: always`, `stopSignal: SIGTERM`, `stopDeadlineSeconds: 60`) with a minimal environment, and running lanes must survive an agent or bosun restart.
   - **Supervisor scope.** On Linux the agent starts `remote-exec` as `systemd-run --user --scope --collect --quiet --unit=lane-exec-<execId> -- …` (`supervisorLaunch` in `src/cpu-limit.js`, built by `cpuLimitArgv(null, …)`: lifetime only, no quota). The scope lives under `user@UID.service`, outside bosun's system cgroup, so `KillMode=mixed` cannot reach it; this needs linger for the runner user. `systemd-run --scope` execs in place, so the recorded `pid` and `pidStart` are the supervisor's. The lane command inside keeps whatever CPU-quota scope `remote-exec` already gives it.
   - **Scope probe and claim gate.** `probeLifetimeScope` runs `systemd-run --user --scope … -- sh -c 'cat /proc/self/cgroup'` asynchronously at agent start, never inside a call's persist path, and passes only when the scope's cgroup is under `user@<uid>.service`. Only a success is kept; a failure is re-probed every 60 s. **On Linux, while no scope is available the agent claims nothing** (`no-scope`: a supervisor started bare would die with the agent's cgroup; an adopted record that reaches its start is released `never-started` for the same reason), logs each change of state once, reports `lane_agent_scope_available`, and shows `claims: paused:no-scope` in `agent/status.json`. On macOS the detached setsid spawn plus bosun's `AbandonProcessGroup=true` suffice and claiming is unaffected. `systemd-run --user` reaches the user manager through `XDG_RUNTIME_DIR`, which bosun's environment lacks, so on Linux the agent sets `XDG_RUNTIME_DIR=/run/user/<uid>` whenever none is set (the directory may not exist yet at boot), in its own environment and its children's.
-  - **Textfile metrics.** The agent itself writes `lane-agent.prom` atomically (temp file and rename), once per poll tick and at most once per `pollMs`, into one directory: `metricsTextfileDir` in the agent config, else `BOSUN_TEXTFILE_DIR` (which bosun sets for the agent it supervises); neither set writes nothing. This is the only export path: bosun does not scrape the agent, it only supplies the directory, so a host with no bosun (the Macs, whose agents run as root LaunchDaemons) sets `metricsTextfileDir` to a directory its node_exporter textfile collector reads. The file must be readable by node_exporter (the writer's umask must allow 0644). Series: `lane_agent_last_tick_timestamp_seconds`, `lane_agent_executions{subphase}` (every subphase, 0 when empty), `lane_agent_claims_total` (executions this process claimed; use this for claim volume), `lane_agent_claim_attempts_total{answer}` (every `ld_claim` answer: `claimed`, `none`, `upgrade`, `error`; a `skipped` tick is not an answer, and an idle agent adds a `none` per poll), `lane_agent_listen_up`, `lane_agent_registered` (the call connection exists and has registered, so it reads 0 after a drop until the next call reconnects), `lane_agent_scope_available`, `lane_agent_device_gate_closed{gate}` (only when device gates are configured) and `lane_agent_info{version}`. Both counters are monotonic within a process and restart at 0 with it, which `increase()` and `rate()` handle. A write failure is logged and never stops the agent.
+  - **Textfile metrics.** The agent itself writes `lane-agent.prom` atomically (temp file and rename), once per poll tick and at most once per `pollMs`, into one directory: `metricsTextfileDir` in the agent config, else `BOSUN_TEXTFILE_DIR` (which bosun sets for the agent it supervises); neither set writes nothing. This is the only export path: bosun does not scrape the agent, it only supplies the directory, so a host with no bosun (the Macs, whose agents run as root LaunchDaemons) sets `metricsTextfileDir` to a directory its node_exporter textfile collector reads. The file must be readable by node_exporter (the writer's umask must allow 0644). Series: `lane_agent_last_tick_timestamp_seconds`, `lane_agent_executions{subphase}` (every subphase, 0 when empty), `lane_agent_claims_total` (executions this process claimed; use this for claim volume), `lane_agent_claim_attempts_total{answer}` (every `ld_claim` answer: `claimed`, `none`, `upgrade`, `error`; a `skipped` tick is not an answer, and an idle agent adds a `none` per poll), `lane_agent_listen_up`, `lane_agent_registered` (the call connection exists and has registered, so it reads 0 after a drop until the next call reconnects), `lane_agent_scope_available`, `lane_agent_device_gate_closed{gate}` (each active gate; `memory` is on by default), `lane_agent_memory_pressure{signal}` (the memory gate's readings this platform has) and `lane_agent_info{version}`. Both counters are monotonic within a process and restart at 0 with it, which `increase()` and `rate()` handle. A write failure is logged and never stops the agent.
   - **SIGTERM.** Claiming stops at once (an `ld_claim` not yet sent is not sent). In-flight fetches and uploads are aborted. A STARTING record whose `ld_start` is not yet sent is released as `never-started`, so a start that never landed requeues cleanly. A record in `OUTBOX` (a finish, or that release) keeps retrying until acknowledged or `STOP_SETTLE_MS` (45 s) passes; a call already in flight when it began (an `ld_start`, a claim) is cut when the queue closes, and a start whose outcome is unknown is recovered by the next agent. Closing a queue connection waits at most 3 s before destroying its socket, and `lane agent` ends the process with exit 0 by 55 s after the signal whatever handles are left, inside bosun's 60 s. Running lanes are left running; the next agent adopts their records.
 - **`lane agent --check`** loads the config, connects to pg, GETs `lane-snap/.probe`, and PUTs then HEADs `lane-out/<runnerName>/.probe`; it registers nothing.
 
@@ -2485,7 +2545,7 @@ exit `64`; v1 has no general lane hierarchy.
 
 **Reading a finished job's result (`lane result <id> [--json]`, BRAIN-1198).** Prints the stored result record
 (`<state>/results/<id>.json`: `{ exit }` or `{ signal }`, plus whatever the settling path added, such as `reused`,
-`reconciled`, `reason`) verbatim as one JSON object line on stdout with `--json`, or one summary line without. It only
+`reconciled`, `reason`, and `ranOn` once the command started, see "Where a lane ran") verbatim as one JSON object line on stdout with `--json`, or one summary line without. It only
 reads state and takes no lock, and creates nothing (the pull-ledger lookup does not fsync or create directories). Because the supervisor writes the result before it removes the lease, and admission moves a ticket between queue, pending and lease, a single pass can see neither: the lookup re-reads result then live state up to 3 passes, 5 ms apart, before answering `83`. Callers detect support through the `result/1` capability (`lane capabilities --json`). Exit `0` found (the job's own exit is in the record, not the exit code), `82` known but not
 finished (same notion of "known" as `lane wait`), `83` unknown id (confirmed absent from the result, lease, attempt, pending, queue and pull ledger), `84` state unreadable (a result file or live record that is malformed or cannot be read, named on stderr; never reported as 83), `2` a malformed id or arguments (rejected before any
 file is read). Use it instead of reading `results/` directly.
@@ -3316,6 +3376,8 @@ What a run leaves behind is collected; what a live one owns never is. Everything
   `os.availableParallelism()` and the cgroup's `cpu.max`/`cpuset` (BRAIN-860); a caller's explicit
   `parallelism` (a sampler's fixture CPU list) still wins. `npm test` sets it to
   the machine's core count, so the suite behaves the same inside a 1-core runner lane as on a bare host.
+- `LANE_BROKER_TEST_MEMORY_PRESSURE` — `vmPressureLevel,psiSomeAvg10,swapBytes` (a blank field is unknown; `swapBytes` is the since-boot counter) replaces
+  the memory gate's reading (PKG-404). `npm test` sets it to `,,`, so a busy test host's real paging never closes the gate mid-suite.
 - `LANE_BROKER_BOOT_ID` — override the detected boot id, to simulate a reboot.
 - `LANE_BROKER_BOOT_TIME_MS` — override the host boot time (epoch ms; non-numeric means unknown). BRAIN-1013: a lock whose
   `owner.json` is empty or unparsable and was last written before this boot (a power cut; the file is now fsynced at acquire, but older

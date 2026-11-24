@@ -343,6 +343,8 @@ export async function runCommand({
   // supervisor is spawned, so before any child can start). Returning
   // `false` aborts the run without ever spawning the supervisor.
   onTicketCreated,
+  // PKG-402 (`lane remote-exec` only): `{transport, ticket, runner}` of the dispatch that brought this job here, for the ran-on record.
+  dispatchedAs,
 }) {
   if (!cmd || cmd.length === 0) {
     process.stderr.write('lane run: no command given (pass it after --)\n');
@@ -800,6 +802,7 @@ export async function runCommand({
     // side (BRAIN-308): a `--detach` caller's own stdio is irrelevant to the
     // supervisor, which never even inherits it (stdio stays 'ignore' below).
     forwardOutput: !detach,
+    ...(dispatchedAs ? { dispatchedAs } : {}),
     // BRAIN-347: history provenance, stamped once here and read back by the
     // supervisor's single history-row builder. `headTree` is omitted outside
     // a git repo; it must never fail the run.

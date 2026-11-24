@@ -48,6 +48,11 @@ function readMemoryOverride() {
   return null;
 }
 
+export function fmtMB(bytes) {
+  if (bytes == null || !Number.isFinite(bytes)) return '?';
+  return `${(bytes / (1024 * 1024)).toFixed(0)}MB`;
+}
+
 const SWAP_USAGE_RE = /total\s*=\s*([\d.]+)M\s+used\s*=\s*([\d.]+)M/;
 
 /**
@@ -89,6 +94,17 @@ export function parseVmStat(text) {
     return { pageSize: null, compressorPages: null };
   }
   return { pageSize, compressorPages };
+}
+
+const SWAPINS_RE = /Swapins:\s*(\d+)\./;
+const SWAPOUTS_RE = /Swapouts:\s*(\d+)\./;
+
+// PKG-404: bytes swapped in plus out since boot; the memory gate turns two of these into a paging rate.
+export function parseVmStatSwapBytes(text) {
+  const pageSize = parseVmStatPageSize(text);
+  const swapins = Number(SWAPINS_RE.exec(text || '')?.[1]);
+  const swapouts = Number(SWAPOUTS_RE.exec(text || '')?.[1]);
+  return Number.isFinite(pageSize) && Number.isFinite(swapins) && Number.isFinite(swapouts) ? pageSize * (swapins + swapouts) : null;
 }
 
 /**

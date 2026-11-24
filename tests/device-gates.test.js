@@ -75,6 +75,8 @@ const fakeExec = (answers) => {
   };
   return Object.assign(exec, { calls });
 };
+const NO_MEMORY_READING = { vmPressureLevel: null, psiSomeAvg10: null, swapBytes: null, at: null };
+
 const DARWIN = {
   '/usr/bin/notifyutil -g com.apple.system.thermalpressurelevel': 'com.apple.system.thermalpressurelevel 1\n',
   '/usr/bin/pmset -g therm': THERMAL_INTEL,
@@ -83,23 +85,23 @@ const DARWIN = {
 
 test('sampleDevice on darwin runs the macOS commands with no shell and answers every reading it can', async () => {
   const exec = fakeExec(DARWIN);
-  const sample = await sampleDevice(ALL, { platform: 'darwin', exec });
-  assert.deepEqual(sample, { thermal: { pressureLevel: 1, cpuSpeedLimit: 100, maxTempC: null }, power: { onAc: true, batteryPercent: 79 } });
+  const sample = await sampleDevice(ALL, { platform: 'darwin', exec, memoryPressure: () => null });
+  assert.deepEqual(sample, { thermal: { pressureLevel: 1, cpuSpeedLimit: 100, maxTempC: null }, power: { onAc: true, batteryPercent: 79 }, memory: NO_MEMORY_READING });
   assert.deepEqual(exec.calls.sort(), Object.keys(DARWIN).sort());
 });
 
 test('sampleDevice skips readers no configured threshold uses', async () => {
   const exec = fakeExec(DARWIN);
-  const sample = await sampleDevice({ thermal: { maxPressureLevel: 2 } }, { platform: 'darwin', exec });
+  const sample = await sampleDevice({ thermal: { maxPressureLevel: 2 }, memory: false }, { platform: 'darwin', exec, memoryPressure: () => assert.fail('memory is off') });
   assert.deepEqual(exec.calls, ['/usr/bin/notifyutil -g com.apple.system.thermalpressurelevel']);
-  assert.deepEqual(sample, { thermal: { pressureLevel: 1, cpuSpeedLimit: null, maxTempC: null }, power: { onAc: null, batteryPercent: null } });
+  assert.deepEqual(sample, { thermal: { pressureLevel: 1, cpuSpeedLimit: null, maxTempC: null }, power: { onAc: null, batteryPercent: null }, memory: NO_MEMORY_READING });
 });
 
 test('a missing command, an Apple Silicon therm output or a throwing reader reads as unknown, never as an error', async () => {
   const arm = await sampleDevice(ALL, { platform: 'darwin', exec: fakeExec({ ...DARWIN, '/usr/bin/pmset -g therm': THERMAL_ARM }) });
   assert.equal(arm.thermal.cpuSpeedLimit, null);
-  const missing = await sampleDevice(ALL, { platform: 'darwin', exec: fakeExec({}) });
-  assert.deepEqual(missing, { thermal: { pressureLevel: null, cpuSpeedLimit: null, maxTempC: null }, power: { onAc: null, batteryPercent: null } });
+  const missing = await sampleDevice(ALL, { platform: 'darwin', exec: fakeExec({}), memoryPressure: () => { throw new Error('sysctl gone'); } });
+  assert.deepEqual(missing, { thermal: { pressureLevel: null, cpuSpeedLimit: null, maxTempC: null }, power: { onAc: null, batteryPercent: null }, memory: NO_MEMORY_READING });
 });
 
 test('sampleDevice reads macOS commands only on darwin and sysfs only on linux', async () => {
@@ -121,8 +123,8 @@ test('sampleDevice reads a WSL-like sysfs: Mains online, the lowest battery, the
   writeSupply(sysRoot, 'BAT0', { type: 'Battery', capacity: 64, status: 'Discharging' });
   writeZone(sysRoot, 'thermal_zone0', 48000);
   writeZone(sysRoot, 'thermal_zone1', 71500);
-  const sample = await sampleDevice(ALL, { platform: 'linux', sysRoot });
-  assert.deepEqual(sample, { thermal: { pressureLevel: null, cpuSpeedLimit: null, maxTempC: 71.5 }, power: { onAc: true, batteryPercent: 64 } });
+  const sample = await sampleDevice(ALL, { platform: 'linux', sysRoot, memoryPressure: () => null });
+  assert.deepEqual(sample, { thermal: { pressureLevel: null, cpuSpeedLimit: null, maxTempC: 71.5 }, power: { onAc: true, batteryPercent: 64 }, memory: NO_MEMORY_READING });
   writeSupply(sysRoot, 'AC1', { type: 'Mains', online: 0 });
   assert.equal((await sampleDevice(ALL, { platform: 'linux', sysRoot })).power.onAc, false);
 });
@@ -165,8 +167,8 @@ test('sysfs: an unreadable thermal zone is skipped, not read as 0 degrees', asyn
 test('sampleDevice on a Linux box with no power or thermal entries reads everything as unknown', async () => {
   const sysRoot = makeTmpDir('sysfs-');
   fs.mkdirSync(path.join(sysRoot, 'class', 'power_supply'), { recursive: true });
-  const sample = await sampleDevice(ALL, { platform: 'linux', sysRoot });
-  assert.deepEqual(sample, { thermal: { pressureLevel: null, cpuSpeedLimit: null, maxTempC: null }, power: { onAc: null, batteryPercent: null } });
+  const sample = await sampleDevice(ALL, { platform: 'linux', sysRoot, memoryPressure: () => null });
+  assert.deepEqual(sample, { thermal: { pressureLevel: null, cpuSpeedLimit: null, maxTempC: null }, power: { onAc: null, batteryPercent: null }, memory: NO_MEMORY_READING });
 });
 
 const THERMAL_GATE = { maxPressureLevel: 1, openSamples: 3 };
@@ -254,11 +256,11 @@ test('updateDeviceGates keeps one state per configured gate and closedGateReason
   const cfg = { thermal: { maxPressureLevel: 1 }, power: { requireAc: true } };
   const cleanSample = { thermal: cool, power: { onAc: true } };
   let states = updateDeviceGates(undefined, cfg, cleanSample);
-  assert.deepEqual(Object.keys(states), ['thermal', 'power']);
+  assert.deepEqual(Object.keys(states), ['thermal', 'power', 'memory'], 'memory is on by default');
   assert.equal(closedGateReason(states), null);
   states = updateDeviceGates(states, cfg, { thermal: cool, power: { onAc: false } });
   assert.equal(closedGateReason(states), 'on-battery');
-  states = updateDeviceGates(states, { thermal: cfg.thermal }, cleanSample);
+  states = updateDeviceGates(states, { thermal: cfg.thermal, memory: false }, cleanSample);
   assert.deepEqual(Object.keys(states), ['thermal']);
   assert.equal(closedGateReason(undefined), null);
 });
@@ -314,7 +316,7 @@ test('loadGlobalConfig carries a valid deviceGates block through and refuses a b
   process.env.LANE_BROKER_STATE = state;
   try {
     writeGlobalConfig(home, {});
-    assert.equal(loadGlobalConfig({ home }).deviceGates, undefined, 'absent means off');
+    assert.equal(loadGlobalConfig({ home }).deviceGates, undefined, 'absent stays absent; only the memory gate defaults on, in gateConfigOf');
     writeGlobalConfig(home, { deviceGates: ALL });
     assert.deepEqual(loadGlobalConfig({ home }).deviceGates, ALL);
     writeGlobalConfig(home, { deviceGates: { thermal: { maxPressureLevel: 9 } } });
@@ -340,7 +342,7 @@ test('the agent metrics carry lane_agent_device_gate_closed for configured gates
 });
 
 test('lane status prints one device gates line with each reading against its thresholds, and none when unconfigured', () => {
-  const cfg = { thermal: { maxPressureLevel: 1, minCpuSpeedLimit: 100 }, power: { requireAc: true, minBatteryPercent: 20 } };
+  const cfg = { thermal: { maxPressureLevel: 1, minCpuSpeedLimit: 100 }, power: { requireAc: true, minBatteryPercent: 20 }, memory: false };
   const live = liveDeviceGates(cfg, { thermal: { pressureLevel: 0, cpuSpeedLimit: 100, maxTempC: null }, power: { onAc: true, batteryPercent: 79 } });
   assert.equal(renderDeviceGatesLine(live), 'device gates: thermal ok (pressure 0/≤1, speed 100/≥100) · power ok (AC, battery 79%)');
   const closed = liveDeviceGates(cfg, { thermal: { pressureLevel: 2, cpuSpeedLimit: null }, power: { onAc: false, batteryPercent: null } });

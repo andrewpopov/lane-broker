@@ -19,7 +19,8 @@ test('a child writing 200k lines has every line present in the log -- no tail lo
   });
   assert.equal(result.code, 0, `stderr: ${result.stderr}`);
 
-  const lines = fs.readFileSync(logPath, 'utf8').split('\n').filter(Boolean);
+  const [ranOn, ...lines] = fs.readFileSync(logPath, 'utf8').split('\n').filter(Boolean);
+  assert.match(ranOn, /^lane: executing on /, 'the log opens with where the lane ran');
   assert.equal(lines.length, 200000, `expected all 200000 lines, got ${lines.length}`);
   assert.equal(lines[lines.length - 1], 'line 199999', 'the last line must not be truncated');
 });

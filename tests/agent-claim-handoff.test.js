@@ -254,7 +254,7 @@ const holdName = 'a closed thermal gate holds while the sampler fails or reads n
 const liveName = 'thresholds are re-read from the broker config on each sample: an edit restarts the countdown and leaves the gate closed';
 const canaries = [
   [holdName, 'device-gates.js', ['state.closed && GATES[name].informative(gateCfg, reading)', 'state.closed']],
-  [liveName, 'agent/run.js', ['    reloadDeviceGatesConfig();\n    if (!deviceGatesConfig)', '    if (!deviceGatesConfig)']],
+  [liveName, 'agent/run.js', ['    reloadDeviceGatesConfig();\n    let sample', '    let sample']],
   [gateName, CLAIMS, ['return closedGateReason(deviceGates);', 'return null;']],
   [gateName, 'agent/run.js', ['        await refreshDeviceGates();\n', '']],
   [gateName, 'device-gates.js', ['if (state.consecutiveOk >= openSamples) {', 'if (state.consecutiveOk >= 1) {']],

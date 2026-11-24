@@ -69,6 +69,7 @@ import { BLOB_CACHE_CAPABILITY } from './remote-blobs.js';
 import { createAttempt, readAttempt, updateAttempt, runnerPhaseRecorder, fallbackToLocal, publishTerminal, remoteCancelledResult, remoteCancelExitDeadlineMs, REMOTE_CANCEL_ABANDONED_EXIT, DUPLICATE_SUBMISSION_EXIT, CANCELLING_LOCK_TIMEOUT_MS } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX, hostCpuLoad, ticketCpuEstimate } from './admission.js';
 import { relayedUsage, relayedDeps, relayedTransfer, snapshotLine } from './remote-relay.js';
+import { ranOnLine, ranOnRecord, relayedRanOn } from './ran-on.js';
 import { maybeDailyGc, createLeaseTmpDir, retireLeaseTmpDir, tmpEnv } from './gc.js';
 import { EXCLUSIVE_DEADLINE_EXIT, EXCLUSIVE_DEADLINE_REASON, exclusiveDeadlineExpiredMessage } from './exclusive.js';
 import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, SILENCE_REASON, noProgressMessage, silenceMessage } from './no-progress.js';
@@ -1893,6 +1894,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       ...remoteCpuAllocation(dispatch.result),
       ...relayedUsage(dispatch.result),
       ...relayedDeps(dispatch.result),
+      ...relayedRanOn(dispatch.result),
       ...relayedTransfer(lastTransferStats, dispatch.result),
       ...relayedPhases(dispatch),
       ...rebalanceFields(),
@@ -2485,6 +2487,9 @@ async function main() {
   const forwardOutput = ticket.forwardOutput === true;
   const stdoutForward = forwardOutput ? new ForwardWriter(process.stdout) : null;
   const stderrForward = forwardOutput ? new ForwardWriter(process.stderr) : null;
+  const ranOn = ranOnRecord({ transport: ticket.dispatchedAs?.transport ?? 'local', ticket: ticket.dispatchedAs?.ticket ?? ticket.id, runner: ticket.dispatchedAs?.runner, cpuCores: executionCpuCores, memoryBytes: ticket.resources?.memoryBytes });
+  logWriter.write(ranOnLine(ranOn));
+  stderrForward?.write(ranOnLine(ranOn));
   const stdoutGate = backpressureGate(child.stdout);
   const stderrGate = backpressureGate(child.stderr);
   // BRAIN-431: bytes the command wrote, one of the progress signals the heartbeat watches; the kill itself is opt-in
@@ -2719,7 +2724,7 @@ async function main() {
       const cpuSeconds = integratedCpuSeconds(finalLease?.observedCpuStats, startedAt, finalResult.endedAt);
       if (cpuSeconds !== undefined) finalResult = { ...finalResult, cpuSeconds };
       // BRAIN-431: the longest stretch with no output and no CPU, whether or not the opt-in kill is on (monitoring reads it)
-      finalResult = { ...finalResult, maxNoProgressMs: Math.round(watchdog.maxIdleMs), ...pushHoldFields() };
+      finalResult = { ...finalResult, maxNoProgressMs: Math.round(watchdog.maxIdleMs), ranOn, ...pushHoldFields() };
       // BRAIN-549: settled before the result is published, so a caller that reads history once `lane run` returns finds the row
       const contentKey = settledContentKey(ticket);
       atomicWriteJson(ticket.resultPath, finalResult);
