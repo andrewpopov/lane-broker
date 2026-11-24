@@ -16,6 +16,7 @@ export const OP_VAULT = 'BotAccess';
 export const REDACTED = '<redacted>';
 const MC_ALIAS = 'pl';
 const HOST_RE = /^[a-z][a-z0-9-]{0,30}$/;
+const NOTE_RE = /^[A-Za-z0-9 .,:;()~#+_/-]{0,120}$/;
 const LIST_ITEM_RE = /^[\w.*:/@+-]+$/;
 
 export const pgRole = (host) => `lane_agent_${host.replaceAll('-', '_')}`;
@@ -34,6 +35,11 @@ export function validateTailnetIp(ip) {
     throw new Error(`invalid ip ${JSON.stringify(ip)}: must be an IPv4 address inside 100.64.0.0/10`);
   }
   return ip;
+}
+
+export function validateNote(note) {
+  if (!NOTE_RE.test(note)) throw new Error(`invalid --note ${JSON.stringify(note)}: at most 120 characters from [A-Za-z0-9 .,:;()~#+_/-] (a backslash would continue the pg_hba comment over the rule)`);
+  return note;
 }
 
 export const sqlIdent = (name) => `"${String(name).replaceAll('"', '""')}"`;
@@ -56,30 +62,41 @@ const sqlTextArray = (items) => (items.length === 0 ? 'ARRAY[]::text[]' : `ARRAY
 
 export function roleSql({ role, host, password, roleExists, tags, repos, maxClaims }) {
   return [
+    'BEGIN;',
     roleExists
       ? `ALTER ROLE ${sqlIdent(role)} PASSWORD ${sqlLit(password)};`
       : `CREATE ROLE ${sqlIdent(role)} LOGIN PASSWORD ${sqlLit(password)} IN ROLE lane_agent CONNECTION LIMIT 3;`,
     `ALTER ROLE ${sqlIdent(role)} SET statement_timeout = '2s';`,
     `ALTER ROLE ${sqlIdent(role)} SET idle_in_transaction_session_timeout = '5s';`,
     `SELECT lane_dispatch.ld_set_principal(${sqlLit(role)}, 'agent', ${sqlLit(host)}, ${sqlTextArray(tags)}, ${sqlTextArray(repos)}, ${Number(maxClaims)});`,
+    'COMMIT;',
     '',
   ].join('\n');
 }
 
 export const roleExistsSql = (role) => `SELECT count(*) FROM pg_roles WHERE rolname = ${sqlLit(role)};\n`;
 export const heldTicketsSql = (host) => `SELECT id, lane FROM lane_dispatch.tickets WHERE host = ${sqlLit(host)} AND state IN ('claimed','running') ORDER BY created_at;\n`;
-export const hbaErrorCountSql = () => 'SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL;\n';
 export const reloadSql = () => 'SELECT pg_reload_conf();\n';
 
-export function removeSql({ role, host }) {
+export function removeTxSql({ role, host, force }) {
+  const held = `FROM lane_dispatch.tickets WHERE host = ${sqlLit(host)} AND state IN ('claimed','running')`;
   return [
+    'BEGIN;',
+    `SELECT 1 FROM lane_dispatch.principals WHERE login_role = ${sqlLit(role)} FOR UPDATE;`,
+    ...(force ? [] : [`DO $lra$ BEGIN IF EXISTS (SELECT 1 ${held}) THEN RAISE EXCEPTION 'held tickets: %', (SELECT string_agg(id::text || ' (' || lane || ')', ', ' ORDER BY created_at) ${held}); END IF; END $lra$;`]),
+    `DO $lra$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ${sqlLit(role)}) THEN ALTER ROLE ${sqlIdent(role)} NOLOGIN; END IF; END $lra$;`,
     `DELETE FROM lane_dispatch.principals WHERE login_role = ${sqlLit(role)};`,
     `DELETE FROM lane_dispatch.runners WHERE host = ${sqlLit(host)};`,
-    `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = ${sqlLit(role)};`,
-    `DROP ROLE IF EXISTS ${sqlIdent(role)};`,
+    'COMMIT;',
     '',
   ].join('\n');
 }
+
+export const dropRoleSql = (role) => [
+  `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = ${sqlLit(role)};`,
+  `DROP ROLE IF EXISTS ${sqlIdent(role)};`,
+  '',
+].join('\n');
 
 const BEGIN_MARK = (host) => `# BEGIN lane-runner-admin ${host}`;
 const END_MARK = (host) => `# END lane-runner-admin ${host}`;
@@ -87,7 +104,21 @@ const BLOCK_ANCHOR = /^local\s+lane_queue_db\s+all\s+reject/;
 const LOCAL_REJECT = /^(local\s+all\s+)(\S+)(\s+reject.*)$/;
 const HOST_REJECT = /^(host\s+all\s+)(\S+)(\s+all\s+reject.*)$/;
 
+const HBA_TYPES = new Set(['local', 'host', 'hostssl', 'hostnossl', 'hostgssenc', 'hostnogssenc']);
+
+export function parseHbaRule(line) {
+  const tokens = line.replace(/\s#.*$/, '').trim().split(/\s+/);
+  if (tokens[0].startsWith('#') || !HBA_TYPES.has(tokens[0]) || tokens.length < 4) return null;
+  return { users: tokens[2].split(',').map((user) => user.replace(/^"(.*)"$/, '$1')), method: tokens.at(-1) };
+}
+
+const rulesAllowing = (lines, role) => lines.filter((line) => {
+  const rule = parseHbaRule(line);
+  return rule && rule.method !== 'reject' && rule.users.includes(role);
+});
+
 function hbaBlock({ role, host, ip, note }) {
+  if (note) validateNote(note);
   const why = `# lane-agent-${host}: from its own source address only, never through the svc:pg-primary forward${note ? `; ${note}` : ''}`;
   return [BEGIN_MARK(host), why, `hostssl ${DB_NAME}  ${role}  ${ip}/32  scram-sha-256`, END_MARK(host)];
 }
@@ -126,8 +157,8 @@ export function editHba(text, { role, host, ip, note }, mode) {
     at = begin;
   }
   if (mode === 'add') {
-    const handWritten = new RegExp(`^hostssl?\\s+${DB_NAME}\\s+${role}\\s`);
-    if (lines.some((line) => handWritten.test(line))) throw new Error(`pg_hba.conf already has a hand-written ${DB_NAME} line for ${role}; remove it first`);
+    const [clash] = rulesAllowing(lines, role);
+    if (clash) throw new Error(`pg_hba.conf already has a rule outside the ${BEGIN_MARK(host)} block that lets ${role} in: "${clash.trim()}"; remove it first`);
     if (at < 0) at = lines.findIndex((line) => BLOCK_ANCHOR.test(line));
     if (at < 0) throw new Error(`pg_hba.conf has no "local ${DB_NAME} all reject" line to anchor the block before`);
     lines.splice(at, 0, ...hbaBlock({ role, host, ip, note }));
@@ -142,7 +173,7 @@ export function hbaState(text, { role, host }) {
   const listed = (pattern) => lines.some((line) => pattern.exec(line)?.[2].split(',').includes(role));
   return {
     block: lines.includes(BEGIN_MARK(host)),
-    line: lines.find((line) => new RegExp(`^hostssl?\\s+${DB_NAME}\\s+${role}\\s`).test(line)) ?? null,
+    line: rulesAllowing(lines, role)[0] ?? null,
     localRejected: listed(LOCAL_REJECT),
     hostRejected: listed(HOST_REJECT),
   };
@@ -275,25 +306,39 @@ export const defaultRandom = {
   alnum: (length) => Array.from({ length }, () => ALNUM[crypto.randomInt(ALNUM.length)]).join(''),
 };
 
-const utcStamp = (date) => date.toISOString().replace(/[-:]/g, '').replace(/\.\d+Z$/, 'Z');
+const sha256 = (text) => crypto.createHash('sha256').update(text).digest('hex');
+
+const secretForms = (value) => [
+  value, value.replaceAll("'", "''"), encodeURIComponent(value), JSON.stringify(value).slice(1, -1),
+  Buffer.from(value).toString('base64'), Buffer.from(value).toString('base64url'),
+];
 
 class Context {
-  constructor({ exec, random = defaultRandom, now = () => new Date(), fsImpl = fs, opts }) {
-    Object.assign(this, { exec, random, now, fs: fsImpl, opts, secrets: null, rootCreds: null });
+  constructor({ exec, random = defaultRandom, fsImpl = fs, opts }) {
+    Object.assign(this, { exec, random, fs: fsImpl, opts, secrets: null, rootCreds: null });
     this.known = new Set();
   }
 
-  learn(...values) { for (const value of values) if (value) this.known.add(value); }
+  learn(...values) { for (const value of values) if (value) for (const form of secretForms(value)) this.known.add(form); }
 
   scrub(text) {
     let clean = String(text);
-    for (const secret of this.known) clean = clean.replaceAll(secret, REDACTED);
+    for (const secret of [...this.known].sort((a, b) => b.length - a.length)) clean = clean.replaceAll(secret, REDACTED);
     return clean;
   }
 
-  async run(cmd, args, { input, env, label, allow } = {}) {
+  assertNoSecrets(text, what) {
+    if ([...this.known].some((secret) => text.includes(secret))) throw new Error(`${what} would carry a secret; refusing to write it`);
+  }
+
+  // `quiet` is for calls whose input carries a secret: the child's output is never forwarded, only its exit code and SQLSTATE.
+  async run(cmd, args, { input, env, label, allow, quiet = false } = {}) {
     const result = await this.exec(cmd, args, { input, env });
     if (result.code !== 0 && !allow?.test(`${result.stderr}${result.stdout}`)) {
+      if (quiet) {
+        const sqlstate = /ERROR:\s+([0-9A-Z]{5})\s*$/m.exec(result.stderr)?.[1];
+        throw new Error(`${label ?? cmd} failed (exit ${result.code}${sqlstate ? `, SQLSTATE ${sqlstate}` : ''}; output withheld because the call carries a secret)`);
+      }
       throw new Error(`${label ?? cmd} failed (exit ${result.code}): ${this.scrub(result.stderr || result.stdout).trim()}`);
     }
     return result;
@@ -301,9 +346,9 @@ class Context {
 
   remote(args, opts) { return this.run('ssh', [DB_HOST, args.map(shellQuote).join(' ')], opts); }
 
-  psql(sql, { query = false, label = 'psql' } = {}) {
-    const flags = query ? ['-X', '-tAq', '-F', '|'] : [];
-    return this.remote(['sudo', '-n', '-u', 'postgres', 'psql', '-d', DB_NAME, '-v', 'ON_ERROR_STOP=1', ...flags], { input: sql, label });
+  psql(sql, { query = false, quiet = false, label = 'psql' } = {}) {
+    const flags = query ? ['-X', '-tAq', '-F', '|'] : quiet ? ['-v', 'VERBOSITY=sqlstate'] : [];
+    return this.remote(['sudo', '-n', '-u', 'postgres', 'psql', '-d', DB_NAME, '-v', 'ON_ERROR_STOP=1', ...flags], { input: sql, label, quiet });
   }
 
   async psqlRows(sql, label) {
@@ -364,85 +409,117 @@ class Context {
     await this.withPrivateDir(async (dir) => {
       const file = path.join(dir, 'item.json');
       this.fs.writeFileSync(file, JSON.stringify(template), { mode: 0o600 });
-      await this.run('op-bot', ['item', 'create', '--vault', OP_VAULT, '--template', file], { label: 'op-bot item create' });
+      await this.run('op-bot', ['item', 'create', '--vault', OP_VAULT, '--template', file], { label: 'op-bot item create', quiet: true });
     });
     return 'created the item with generated values';
   }
 }
 
-async function editRemoteFile(ctx, { readArgs, writeArgs, copyArgs, path: file, edit, validate, label }) {
-  const before = (await ctx.remote(readArgs, { label: `read ${label}` })).stdout;
-  const after = edit(before);
-  return { before, after, file, changed: after !== before, write: async () => {
-    const backup = `${file}.bak-lane-runner-admin-${utcStamp(ctx.now())}`;
-    await ctx.remote([...copyArgs, '-p', file, backup], { label: `back up ${label}` });
-    await ctx.remote(writeArgs, { input: after, label: `write ${label}` });
-    const problem = await validate(after);
-    if (problem) {
-      await ctx.remote([...copyArgs, '-p', backup, file], { label: `RESTORE ${label} from ${backup}` });
-      throw new Error(`${label} was rejected (${problem}); restored ${backup}`);
-    }
-    return backup;
-  } };
+const LOCK_FILE = '/run/lock/lane-runner-admin.lock';
+const SCRIPT_HOOKS = {
+  sha: 'sha256sum',
+  chown: 'chown',
+  hbaErrors: `sudo -n -u postgres psql -At -c "SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL"`,
+  reload: `sudo -n -u postgres psql -At -c "SELECT pg_reload_conf()"`,
+  jsonCheck: `python3 -c 'import json,sys; json.load(open(sys.argv[1]))'`,
+};
+
+// Runs as root under `flock ... bash -s -- <path> <expected-sha256> <owner:group> <mode> <kind>`; `hooks` lets a test run it on a laptop.
+export function buildEditScript({ content, hooks = {} }) {
+  const h = { ...SCRIPT_HOOKS, ...hooks };
+  const payload = Buffer.from(content).toString('base64').replace(/(.{76})/g, '$1\n');
+  return `set -euo pipefail
+path=$1; expect=$2; owner=$3; mode=$4; kind=$5
+want=${sha256(content)}
+sha() { ${h.sha} "$1" | cut -d' ' -f1; }
+payload() { base64 -d <<'LRA_PAYLOAD_EOF'
+${payload}
+LRA_PAYLOAD_EOF
+}
+stage=; backup=; moved=0; ok=0
+cleanup() {
+  rc=$?
+  trap - EXIT
+  if [ "$ok" != 1 ]; then
+    [ -z "$stage" ] || rm -f "$stage"
+    if [ "$moved" = 1 ]; then
+      restore="$path.restore.$$"
+      cp -p "$backup" "$restore" && mv -f "$restore" "$path" && echo "restored $backup" >&2 || echo "RESTORE FAILED: copy $backup over $path by hand" >&2
+    fi
+  fi
+  exit $rc
+}
+trap cleanup EXIT
+[ "$(sha "$path")" = "$expect" ] || { echo "changed since read: $path" >&2; exit 3; }
+stage=$(mktemp "$path.stage.XXXXXX")
+payload > "$stage"
+[ "$(sha "$stage")" = "$want" ] || { echo "payload damaged in transit" >&2; exit 4; }
+if [ "$want" != "$expect" ]; then
+  ${h.chown} "$owner" "$stage"
+  chmod "$mode" "$stage"
+  backup="$path.bak-lane-runner-admin-$(date -u +%Y%m%dT%H%M%S%NZ)"
+  [ ! -e "$backup" ] || { echo "backup name exists: $backup" >&2; exit 5; }
+  cp -p "$path" "$backup"
+  mv -f "$stage" "$path"
+  stage=; moved=1
+else
+  rm -f "$stage"; stage=
+fi
+case "$kind" in
+  hba) errors=$(${h.hbaErrors} | tr -d '[:space:]'); [ "$errors" = 0 ] || { echo "pg_hba_file_rules reports '$errors' rule errors" >&2; exit 6; } ;;
+  json) ${h.jsonCheck} "$path" || { echo "not valid JSON: $path" >&2; exit 6; } ;;
+  *) echo "unknown kind $kind" >&2; exit 2 ;;
+esac
+ok=1
+if [ "$kind" = hba ]; then { ${h.reload}; } > /dev/null; fi
+if [ "$moved" = 1 ]; then echo "backup=$backup"; else echo "unchanged=$path"; fi
+`;
 }
 
-const hbaEdit = (ctx, mode) => editRemoteFile(ctx, {
-  readArgs: ['sudo', '-n', 'cat', HBA_PATH],
-  writeArgs: ['sudo', '-n', 'tee', HBA_PATH],
-  copyArgs: ['sudo', '-n', 'cp'],
-  path: HBA_PATH,
-  label: 'pg_hba.conf',
-  edit: (text) => editHba(text, ctx.hbaEntry, mode),
-  validate: async () => {
-    const errorCount = Number((await ctx.psql(hbaErrorCountSql(), { query: true, label: 'validate pg_hba.conf' })).stdout.trim());
-    if (errorCount > 0) return `${errorCount} rule errors in pg_hba_file_rules`;
-    if (!Number.isInteger(errorCount)) return 'pg_hba_file_rules count unreadable';
-    return null;
-  },
-});
+async function editRemoteFile(ctx, { kind, path: file, readAs = [], edit, label }) {
+  const before = (await ctx.remote(['sudo', '-n', ...readAs, 'cat', file], { label: `read ${label}` })).stdout;
+  const after = edit(before);
+  return {
+    before, after, file, kind, changed: after !== before,
+    async apply() {
+      ctx.assertNoSecrets(after, label);
+      const stat = (await ctx.remote(['sudo', '-n', 'stat', '-c', '%U:%G %a', file], { label: `stat ${label}` })).stdout.trim();
+      const [owner, mode] = stat.split(' ');
+      if (!/^[\w.-]+:[\w.-]+$/.test(owner ?? '') || !/^[0-7]{3,4}$/.test(mode ?? '')) throw new Error(`unreadable owner and mode for ${file}: ${JSON.stringify(stat)}`);
+      const result = await ctx.remote(['sudo', '-n', 'flock', LOCK_FILE, 'bash', '-s', '--', file, sha256(before), owner, mode, kind], { input: buildEditScript({ content: after }), label: `edit ${label}`, allow: /^/ });
+      if (result.code === 3) throw new Error(`${label} changed on ${DB_HOST} since it was read; nothing was written. Re-run to plan against the new content`);
+      if (result.code !== 0) throw new Error(`${label} edit failed (exit ${result.code}): ${ctx.scrub(result.stderr).trim()}`);
+      return result.stdout.match(/^backup=(.*)$/m)?.[1] ?? null;
+    },
+  };
+}
 
-const trainEdit = (ctx, mode) => editRemoteFile(ctx, {
-  readArgs: ['sudo', '-n', '-u', 'train', 'cat', TRAIN_CONFIG_PATH],
-  writeArgs: ['sudo', '-n', '-u', 'train', 'tee', TRAIN_CONFIG_PATH],
-  copyArgs: ['sudo', '-n', '-u', 'train', 'cp'],
-  path: TRAIN_CONFIG_PATH,
-  label: 'train config',
-  edit: (text) => editTrainRunners(text, ctx.opts.host, mode),
-  validate: async (after) => {
-    try { JSON.parse(after); return null; } catch (err) { return err.message; }
-  },
-});
+const hbaEdit = (ctx, mode) => editRemoteFile(ctx, { kind: 'hba', path: HBA_PATH, label: 'pg_hba.conf', edit: (text) => editHba(text, ctx.hbaEntry, mode) });
+
+const trainEdit = (ctx, mode) => editRemoteFile(ctx, { kind: 'json', path: TRAIN_CONFIG_PATH, readAs: ['-u', 'train'], label: 'train config', edit: (text) => editTrainRunners(text, ctx.opts.host, mode) });
 
 const PROVISION_REMINDER = 'agent_brain/ops/pitelite-controller/provision.sh writes this file: a re-provision drops the runner unless it is added there too.';
 
 function editStep(ctx, { title, kind, load, extra }) {
+  const tail = extra ? `\n${extra}` : '';
   return {
     title,
     kind,
     async preview() {
       const edit = await load();
-      return `${edit.changed ? unifiedDiff(edit.before, edit.after, edit.file) : `${edit.file}: no change`}${extra ? `\n${extra}` : ''}`;
+      const note = edit.kind === 'hba' ? `\nthen validate with pg_hba_file_rules and ${reloadSql().trim()}` : '';
+      return `${edit.changed ? unifiedDiff(edit.before, edit.after, edit.file) : `${edit.file}: no change`}${note}${tail}`;
     },
     async apply() {
       const edit = await load();
-      if (!edit.changed) return `${edit.file}: already converged${extra ? `\n${extra}` : ''}`;
-      return `backed up to ${await edit.write()}${extra ? `\n${extra}` : ''}`;
+      if (!edit.changed && edit.kind !== 'hba') return `${edit.file}: already converged${tail}`;
+      const backup = await edit.apply();
+      return `${backup ? `backed up to ${backup}` : `${edit.file}: already converged, validated and reloaded`}${tail}`;
     },
   };
 }
 
-function hbaStep(ctx, mode) {
-  const step = editStep(ctx, { title: `pg_hba.conf: ${mode} the ${ctx.hbaEntry.role} block and reject-list entries`, kind: 'hba', load: () => hbaEdit(ctx, mode) });
-  const apply = step.apply;
-  step.apply = async () => {
-    const message = await apply();
-    await ctx.psql(reloadSql(), { label: 'pg_reload_conf' });
-    return `${message}\nreloaded postgres configuration`;
-  };
-  const preview = step.preview;
-  step.preview = async () => `${await preview()}\nthen: ${reloadSql().trim()}`;
-  return step;
-}
+const hbaStep = (ctx, mode) => editStep(ctx, { title: `pg_hba.conf: ${mode} the ${ctx.hbaEntry.role} block and reject-list entries`, kind: 'hba', load: () => hbaEdit(ctx, mode) });
 
 const trainStep = (ctx, mode) => editStep(ctx, { title: `train config: ${mode} runner ${ctx.opts.host}`, kind: 'train', load: () => trainEdit(ctx, mode), extra: `note: ${PROVISION_REMINDER}` });
 
@@ -464,7 +541,7 @@ function buildAddPlan(ctx) {
       kind: 'postgres',
       async preview() { return roleSql({ ...principal, password: REDACTED, roleExists: await roleExists() }); },
       async apply() {
-        await ctx.psql(roleSql({ ...principal, password: ctx.secrets.password, roleExists: await roleExists() }), { label: 'create role and principal' });
+        await ctx.psql(roleSql({ ...principal, password: ctx.secrets.password, roleExists: await roleExists() }), { label: 'create role and principal', quiet: true });
         return `role ${role} and its principal row are in place`;
       },
     },
@@ -476,7 +553,7 @@ function buildAddPlan(ctx) {
       async apply() {
         const { accessKey, secretKey } = ctx.secrets;
         // mc has no stdin form for `user add`: the secret is briefly visible in this machine's process list.
-        await ctx.mc(['admin', 'user', 'add', MC_ALIAS, accessKey, secretKey]);
+        await ctx.mc(['admin', 'user', 'add', MC_ALIAS, accessKey, secretKey], { quiet: true });
         await ctx.withPrivateDir(async (dir) => {
           const file = path.join(dir, 'policy.json');
           ctx.fs.writeFileSync(file, rustfsPolicy(host), { mode: 0o600 });
@@ -542,10 +619,20 @@ function buildRemovePlan(ctx) {
       },
     },
     {
-      title: `postgres: delete principal and runners rows, terminate sessions, drop role ${role}`,
+      title: `postgres: in one transaction lock the principal, re-check held tickets, set NOLOGIN, delete the principal and runners rows; then terminate sessions and drop role ${role}`,
       kind: 'postgres',
-      preview: async () => removeSql({ role, host }),
-      async apply() { await ctx.psql(removeSql({ role, host }), { label: 'drop role' }); return `role ${role} dropped`; },
+      preview: async () => `${removeTxSql({ role, host, force })}\n${dropRoleSql(role)}`,
+      async apply() {
+        try {
+          await ctx.psql(removeTxSql({ role, host, force }), { label: 'disable role and delete principal' });
+        } catch (err) {
+          const raced = /held tickets: (.*)/.exec(err.message)?.[1];
+          if (raced) throw new Error(`${host} claimed ticket(s) while it was being removed: ${raced.trim()}; nothing was changed. Re-run with --force to remove it anyway`);
+          throw err;
+        }
+        await ctx.psql(dropRoleSql(role), { label: 'drop role' });
+        return `role ${role} disabled, its rows deleted and the role dropped`;
+      },
     },
     hbaStep(ctx, 'remove'),
     {
@@ -648,7 +735,7 @@ export function parseCli(argv) {
   for (const item of [...tags, ...repos]) if (!LIST_ITEM_RE.test(item)) throw new Error(`invalid tag or repo ${JSON.stringify(item)}`);
   const maxClaims = values['max-claims'] === undefined ? 1 : Number(values['max-claims']);
   if (!Number.isInteger(maxClaims) || maxClaims < 0) throw new Error(`--max-claims must be a non-negative integer, not ${values['max-claims']}`);
-  if (/[\r\n]/.test(values.note ?? '')) throw new Error('--note must be a single line');
+  validateNote(values.note ?? '');
   return { ...opts, ip: values.ip, tags, repos, maxClaims, out: values.out ? path.resolve(values.out) : null, note: values.note ?? '' };
 }
 
@@ -659,7 +746,7 @@ export async function runCli(argv, { exec, out = (text) => process.stdout.write(
   try {
     if (opts.command === 'status') { await statusReport(ctx, out); return 0; }
     const steps = opts.command === 'add' ? buildAddPlan(ctx) : buildRemovePlan(ctx);
-    const resume = `lane-runner-admin ${[...argv.filter((arg) => arg !== '--apply'), '--apply'].join(' ')}`;
+    const resume = ['lane-runner-admin', ...argv.filter((arg) => arg !== '--apply'), '--apply'].map(shellQuote).join(' ');
     out(`${opts.command} ${opts.host}: ${opts.apply ? 'APPLY' : 'dry run'}`);
     const { ok } = await runPlan(steps, { apply: opts.apply, out: (text) => out(ctx.scrub(text)), resume });
     return ok ? 0 : 1;
