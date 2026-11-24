@@ -644,7 +644,7 @@ function localGates(root, cfg, ticket, held, memoryReader, { cooldown }) {
     memInfo = null;
   }
   if (memInfo && memInfo.macPressure === 'critical') return { admit: false, reason: 'memory-critical' };
-  if (cfg.schedulerMode === 'active' && held.length > 0 && readMemoryGate(root).closed) return { admit: false, reason: 'memory-pressure' };
+  if (cfg.schedulerMode === 'active' && held.length > 0 && readMemoryGate(root, cfg.deviceGates).closed) return { admit: false, reason: 'memory-pressure' };
   if (cfg.schedulerMode === 'active') {
     if (cooldown && cooldownActive(held, cfg)) return { admit: false, reason: 'cooldown' };
     if (memInfo) {

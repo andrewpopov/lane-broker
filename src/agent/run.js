@@ -96,10 +96,12 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
       if (err.message !== deviceSampleError) log(`device gates: sampling failed, readings unknown: ${err.message}`);
       deviceSampleError = err.message;
     }
+    const sensorWas = deviceGates.memory?.sensor;
     deviceGates = updateDeviceGates(deviceGates, deviceGatesConfig, sample);
+    if (deviceGates.memory?.sensor === 'unavailable' && sensorWas !== 'unavailable') log('device gates: memory sensor-unavailable; the gate cannot close on unknown readings and reopens after 3 of them');
   }
 
-  const deviceGateStatus = () => Object.fromEntries(Object.entries(deviceGates).map(([name, { closed, consecutiveOk, reading }]) => [name, { closed, consecutiveOk, reading }]));
+  const deviceGateStatus = () => Object.fromEntries(Object.entries(deviceGates).map(([name, { closed, consecutiveOk, reading, sensor }]) => [name, { closed, consecutiveOk, reading, ...(sensor ? { sensor } : {}) }]));
 
   async function claimRound() {
     while (!stopped && !upgradeRequired) {

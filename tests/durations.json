@@ -81,7 +81,7 @@
 "tests/log-writer-backpressure-error.test.js": 1,
 "tests/losses-report.test.js": 1,
 "tests/max-concurrent.test.js": 3,
-"tests/memory-gate.test.js": 17,
+"tests/memory-gate.test.js": 30,
 "tests/memory.test.js": 1,
 "tests/migrate-queue-fence.test.js": 3,
 "tests/migrate-scheduler.test.js": 3,

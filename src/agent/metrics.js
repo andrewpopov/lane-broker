@@ -8,12 +8,17 @@ export const METRICS_FILE = 'lane-agent.prom';
 const escapeLabel = (value) => String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '\\n');
 const labelled = (name, labels) => `${name}{${Object.entries(labels).map(([k, v]) => `${k}="${escapeLabel(v)}"`).join(',')}}`;
 
-const MEMORY_SIGNALS = [['vm_pressure_level', 'vmPressureLevel'], ['psi_some_avg10', 'psiSomeAvg10'], ['offload_percent', 'offloadPercent']];
+const MEMORY_SIGNALS = [['vm_pressure_level', 'vmPressureLevel'], ['psi_some_avg10', 'psiSomeAvg10'], ['swap_mib_per_second', 'swapMiBPerSec']];
+
+function sensorFamily(deviceGates) {
+  const reporting = Object.entries(deviceGates).filter(([, state]) => state.sensor !== undefined);
+  return reporting.length ? [['lane_agent_device_gate_sensor_unavailable', 'gauge', '1 while a gate\'s last sample read nothing it can judge by (sensor-unavailable).', reporting.map(([gate, state]) => [labelled('lane_agent_device_gate_sensor_unavailable', { gate }), state.sensor === 'unavailable' ? 1 : 0])]] : [];
+}
 
 function memoryPressureFamily(reading) {
   const known = MEMORY_SIGNALS.filter(([, key]) => Number.isFinite(reading?.[key]));
   if (known.length === 0) return [];
-  return [['lane_agent_memory_pressure', 'gauge', 'The memory gate\'s last readings: macOS vm pressure level, Linux PSI some avg10, swap plus compressor as a percent of RAM.', known.map(([signal, key]) => [labelled('lane_agent_memory_pressure', { signal }), reading[key]])]];
+  return [['lane_agent_memory_pressure', 'gauge', 'The memory gate\'s last readings: macOS vm pressure level, Linux PSI some avg10, swap traffic in MiB/s.', known.map(([signal, key]) => [labelled('lane_agent_memory_pressure', { signal }), reading[key]])]];
 }
 
 /** The agent's Prometheus text exposition for a node_exporter-style textfile collector: every subphase and claim answer is present, 0 when empty. */
@@ -29,6 +34,7 @@ export function renderAgentMetrics({ now, records, claimed, claimAttempts, liste
     ['lane_agent_scope_available', 'gauge', '1 while remote-exec supervisors can start in their own user scope.', [['lane_agent_scope_available', scopeAvailable ? 1 : 0]]],
     ...(Object.keys(deviceGates).length ? [['lane_agent_device_gate_closed', 'gauge', '1 while a device gate (thermal, power, memory) refuses new claims.', Object.entries(deviceGates).map(([gate, state]) => [labelled('lane_agent_device_gate_closed', { gate }), state.closed ? 1 : 0])]] : []),
     ...memoryPressureFamily(deviceGates.memory?.reading),
+    ...sensorFamily(deviceGates),
     ['lane_agent_info', 'gauge', 'Always 1; the agent version is the label.', [[labelled('lane_agent_info', { version }), 1]]],
   ];
   return `${families.map(([name, type, help, samples]) => [`# HELP ${name} ${help}`, `# TYPE ${name} ${type}`, ...samples.map(([series, value]) => `${series} ${value}`)].join('\n')).join('\n')}\n`;

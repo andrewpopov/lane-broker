@@ -2,79 +2,83 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneSpawn, laneRun, sleep, waitFor } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, writeCpuBusyFile, laneRun, sleep, waitFor } from './helpers.js';
 import { makeTmpDir } from './helpers/tmp.js';
 import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
-import { paths, readJsonSafe } from '../src/state.js';
+import { atomicWriteJson, paths, readJsonSafe } from '../src/state.js';
 
-// PKG-404: memory pressure (paging), not only free memory, stops pull claims and extra local starts.
+// PKG-404: current paging (kernel level, PSI, swap traffic), never how much sits in swap, stops pull claims and extra local starts.
 
 const MiB = 1024 * 1024;
-const GiB = 1024 * MiB;
-const MAC_RAM = 48 * GiB;
-const INCIDENT = { swapUsedBytes: 22016 * MiB, swapTotalBytes: 23552 * MiB, compressorBytes: 20757 * MiB, availableBytes: 16 * GiB, totalMemoryBytes: MAC_RAM };
-const CALM_MAC = { swapUsedBytes: 5881 * MiB, swapTotalBytes: 7168 * MiB, compressorBytes: 8290 * MiB, availableBytes: 16 * GiB, totalMemoryBytes: MAC_RAM };
 const PSI = (some) => `some avg10=${some} avg60=1.00 avg300=0.50 total=12345\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0\n`;
-const MEMINFO = (swapUsedKb) => `MemTotal:       16000000 kB\nMemFree:         1000000 kB\nSwapTotal:       8000000 kB\nSwapFree:        ${8000000 - swapUsedKb} kB\n`;
-const sysctl = (level) => () => `${level}\n`;
+const VMSTAT_MAC = 'Mach Virtual Memory Statistics: (page size of 16384 bytes)\nPages free:                               10.\nSwapins:                                    14706337.\nSwapouts:                                   31464770.\n';
+const PROC_VMSTAT = 'nr_free_pages 100\npswpin 1000\npswpout 3000\n';
+const macExec = (level) => (cmd) => (cmd === 'sysctl' ? `${level}\n` : VMSTAT_MAC);
 const noHook = {};
 const happens = (what, check, timeoutMs = 10_000) => waitFor(check, { timeoutMs }).then(() => true, () => false).then((ok) => assert.ok(ok, what));
+// a host that swapped 22 GiB long ago and has since stopped: a huge counter that no longer moves
+const RETAINED = 22 * 1024 * MiB;
 
-test('readMemoryPressure on macOS: the kernel level and swap plus compressor as a share of RAM, from the 2026-11-23 figures', async () => {
+test('readMemoryPressure on macOS: the kernel level and the since-boot swap traffic counter from vm_stat', async () => {
   const { readMemoryPressure } = await realSrc('memory-pressure.js');
-  const incident = readMemoryPressure({ platform: 'darwin', env: noHook, exec: sysctl(1), sampleMemory: () => INCIDENT });
-  assert.equal(incident.vmPressureLevel, 1);
-  assert.equal(Math.round(incident.offloadPercent), 87);
-  assert.equal(incident.psiSomeAvg10, null);
-  assert.equal(Math.round(readMemoryPressure({ platform: 'darwin', env: noHook, exec: sysctl(1), sampleMemory: () => CALM_MAC }).offloadPercent), 29);
-  const broken = readMemoryPressure({ platform: 'darwin', env: noHook, exec: () => { throw new Error('no sysctl'); }, sampleMemory: () => null });
-  assert.deepEqual(broken, { vmPressureLevel: null, offloadPercent: null, psiSomeAvg10: null }, 'a failed probe is unknown, never an error');
+  assert.deepEqual(readMemoryPressure({ platform: 'darwin', env: noHook, exec: macExec(1), now: 5 }), { vmPressureLevel: 1, psiSomeAvg10: null, swapBytes: 16384 * (14706337 + 31464770), at: 5 });
+  const broken = readMemoryPressure({ platform: 'darwin', env: noHook, exec: () => { throw new Error('no sysctl'); }, now: 5 });
+  assert.deepEqual(broken, { vmPressureLevel: null, psiSomeAvg10: null, swapBytes: null, at: 5 }, 'a failed probe is unknown, never an error');
 });
 
-test('readMemoryPressure on Linux: PSI some avg10, and swap use only where PSI is missing', async () => {
+test('readMemoryPressure on Linux: PSI some avg10, and the pswpin/pswpout counter only where PSI is missing', async () => {
   const { readMemoryPressure } = await realSrc('memory-pressure.js');
   const files = (psi) => (f) => {
     if (f === '/proc/pressure/memory' && psi !== null) return psi;
-    if (f === '/proc/meminfo') return MEMINFO(4000000);
+    if (f === '/proc/vmstat') return PROC_VMSTAT;
     throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
   };
-  assert.deepEqual(readMemoryPressure({ platform: 'linux', env: noHook, readFile: files(PSI(12.5)) }), { vmPressureLevel: null, offloadPercent: null, psiSomeAvg10: 12.5 });
-  assert.deepEqual(readMemoryPressure({ platform: 'linux', env: noHook, readFile: files(null) }), { vmPressureLevel: null, offloadPercent: 25, psiSomeAvg10: null });
-  assert.deepEqual(readMemoryPressure({ platform: 'win32', env: noHook }), { vmPressureLevel: null, offloadPercent: null, psiSomeAvg10: null });
-  assert.deepEqual(readMemoryPressure({ env: { LANE_BROKER_TEST_MEMORY_PRESSURE: '2,,7' } }), { vmPressureLevel: 2, offloadPercent: null, psiSomeAvg10: 7 });
+  assert.deepEqual(readMemoryPressure({ platform: 'linux', env: noHook, readFile: files(PSI(12.5)), now: 5 }), { vmPressureLevel: null, psiSomeAvg10: 12.5, swapBytes: null, at: 5 });
+  assert.deepEqual(readMemoryPressure({ platform: 'linux', env: noHook, readFile: files(null), now: 5 }), { vmPressureLevel: null, psiSomeAvg10: null, swapBytes: 4096 * 4000, at: 5 });
+  assert.deepEqual(readMemoryPressure({ platform: 'win32', env: noHook, now: 5 }), { vmPressureLevel: null, psiSomeAvg10: null, swapBytes: null, at: 5 });
+  assert.deepEqual(readMemoryPressure({ env: { LANE_BROKER_TEST_MEMORY_PRESSURE: '2,7,' }, now: 5 }), { vmPressureLevel: 2, psiSomeAvg10: 7, swapBytes: null, at: 5 });
 });
+
+/** The gate after `readings` in order, each `at` seconds apart from the first. */
+const gateAfter = (update, cfg, readings) => readings.reduce((state, reading) => update(state, 'memory', cfg, reading), undefined);
 
 const gateScenario = async (load) => {
   const { gateConfigOf, updateDeviceGate } = await load('device-gates.js');
   const cfg = gateConfigOf('memory', undefined);
-  const verdict = (reading) => updateDeviceGate(undefined, 'memory', cfg, reading).closed;
-  assert.equal(verdict({ vmPressureLevel: 1, offloadPercent: 87 }), true, 'the 2026-11-23 thrash closes the gate');
-  assert.equal(verdict({ vmPressureLevel: 1, offloadPercent: 29 }), false, 'the same Mac at rest stays open');
-  assert.equal(verdict({ vmPressureLevel: 2, offloadPercent: 10 }), true, 'macOS warn closes it');
-  assert.equal(verdict({ psiSomeAvg10: 12, offloadPercent: 0 }), true, 'Linux PSI over 10 closes it');
-  assert.equal(verdict({ psiSomeAvg10: 3, offloadPercent: 95 }), false, 'swap use is only a fallback: PSI says the host is not stalling');
-  assert.equal(verdict({ offloadPercent: 70 }), true, 'without PSI, swap use decides');
-  assert.equal(verdict({}), false, 'unknown never closes');
+  const closed = (...readings) => gateAfter(updateDeviceGate, cfg, readings).closed;
+  assert.equal(closed({ vmPressureLevel: 2 }), true, 'macOS warn closes it');
+  assert.equal(closed({ vmPressureLevel: 1 }), false, 'macOS normal leaves it open');
+  assert.equal(closed({ psiSomeAvg10: 12 }), true, 'Linux PSI over 10 closes it');
+  assert.equal(closed({ psiSomeAvg10: 3 }), false);
+  assert.equal(closed({ swapBytes: 0, at: 0 }, { swapBytes: 20 * 15 * MiB, at: 15_000 }), true, '20 MiB/s of swap traffic over a 15 s poll closes it');
+  assert.equal(closed({ swapBytes: 0, at: 0 }, { swapBytes: 5 * 15 * MiB, at: 15_000 }), false, '5 MiB/s does not');
+  assert.equal(closed({ vmPressureLevel: 1, swapBytes: RETAINED, at: 0 }, { vmPressureLevel: 1, swapBytes: RETAINED, at: 15_000 }), false, 'retained swap that no longer moves is not pressure');
+  assert.equal(closed({ swapBytes: RETAINED, at: 0 }), false, 'one sample has no rate, and an unknown never closes');
+  assert.equal(closed({ swapBytes: RETAINED, at: 0 }, { swapBytes: 0, at: 15_000 }), false, 'a counter that went backwards (a reboot) is unknown');
 };
 
-test('the memory gate is on by default and closes on the incident shape, on macOS warn, on Linux PSI, and on swap only without PSI', async () => gateScenario(realSrc));
+test('the gate closes on the kernel level, PSI or a swap traffic rate, and never on swap a host merely retains', async () => gateScenario(realSrc));
 
 test('canary: with the memory violation removed, the gate scenario fails by name', async () => {
   await assertCanaryFails('device-gates.js', ["      return paging ? 'memory-pressure' : null;", '      return null;'], gateScenario);
 });
 
+test('canary: with occupancy (the swap counter itself) read as the signal, retained swap closes the gate and the scenario fails by name', async () => {
+  await assertCanaryFails('device-gates.js', ['    derive: (prev, reading) => ({ ...reading, swapMiBPerSec: swapRate(prev, reading) }),', '    derive: (prev, reading) => ({ ...reading, swapMiBPerSec: Number.isFinite(reading.swapBytes) ? reading.swapBytes / 1048576 : null }),'], gateScenario);
+});
+
 const defaultOnScenario = async (load) => {
   const { gateConfigOf, updateDeviceGates, deviceGatesProblem } = await load('device-gates.js');
-  const defaults = { maxVmPressureLevel: 1, maxOffloadPercent: 60, maxPsiSomeAvg10: 10 };
+  const defaults = { maxVmPressureLevel: 1, maxPsiSomeAvg10: 10, maxSwapMiBPerSec: 10 };
   assert.deepEqual(gateConfigOf('memory', undefined), defaults, 'no deviceGates at all');
   assert.deepEqual(gateConfigOf('memory', { thermal: { maxPressureLevel: 1 } }), defaults, 'an overlay that sets only thermal keeps it');
-  assert.deepEqual(gateConfigOf('memory', { memory: { maxOffloadPercent: 75 } }), { ...defaults, maxOffloadPercent: 75 });
+  assert.deepEqual(gateConfigOf('memory', { memory: { maxSwapMiBPerSec: 40 } }), { ...defaults, maxSwapMiBPerSec: 40 });
   assert.equal(gateConfigOf('memory', { memory: false }), null, '"memory": false turns it off');
   assert.equal(gateConfigOf('thermal', undefined), null, 'the other gates stay opt-in');
   assert.deepEqual(Object.keys(updateDeviceGates(undefined, null, {})), ['memory']);
   assert.deepEqual(Object.keys(updateDeviceGates(undefined, { memory: false }, {})), []);
-  for (const good of [{ memory: false }, { memory: {} }, { memory: { maxVmPressureLevel: 4, maxOffloadPercent: 150, maxPsiSomeAvg10: 0, openSamples: 1 } }]) assert.equal(deviceGatesProblem(good), null, JSON.stringify(good));
-  for (const [bad, pattern] of [[{ memory: { maxVmPressureLevel: 0 } }, /maxVmPressureLevel" must be an integer from 1 to 4/], [{ memory: { maxPsiSomeAvg10: 101 } }, /maxPsiSomeAvg10/], [{ memory: { swap: 1 } }, /"deviceGates.memory" has unknown key "swap"/], [{ thermal: false }, /"deviceGates.thermal" must be an object/]]) {
+  for (const good of [{ memory: false }, { memory: {} }, { memory: { maxVmPressureLevel: 4, maxSwapMiBPerSec: 150, maxPsiSomeAvg10: 0, openSamples: 1 } }]) assert.equal(deviceGatesProblem(good), null, JSON.stringify(good));
+  for (const [bad, pattern] of [[{ memory: { maxVmPressureLevel: 0 } }, /maxVmPressureLevel" must be an integer from 1 to 4/], [{ memory: { maxPsiSomeAvg10: 101 } }, /maxPsiSomeAvg10/], [{ memory: { maxOffloadPercent: 60 } }, /"deviceGates.memory" has unknown key "maxOffloadPercent"/], [{ thermal: false }, /"deviceGates.thermal" must be an object/]]) {
     assert.match(deviceGatesProblem(bad) ?? 'accepted', pattern, JSON.stringify(bad));
   }
 };
@@ -85,7 +89,7 @@ test('canary: with the memory defaults ignored, the default-on scenario fails by
   await assertCanaryFails('device-gates.js', ['  if (own === false || (own === undefined && !defaults)) return null;', '  if (own === false || own === undefined) return null;'], defaultOnScenario);
 });
 
-test('hysteresis: one paging sample closes the gate; it reopens only after openSamples clean ones; an unknown sample holds it', async () => {
+test('hysteresis: one paging sample closes the gate; it reopens only after openSamples clean ones', async () => {
   const { gateConfigOf, updateDeviceGate } = await realSrc('device-gates.js');
   const cfg = gateConfigOf('memory', undefined);
   let state = updateDeviceGate(undefined, 'memory', cfg, { vmPressureLevel: 2 });
@@ -95,25 +99,62 @@ test('hysteresis: one paging sample closes the gate; it reopens only after openS
   }
 });
 
-test('local admission samples the gate at most once a second into one shared state file', async () => {
-  const { sampleMemoryGate, readMemoryGate } = await realSrc('device-gates.js');
+const unknownScenario = async (load) => {
+  const { gateConfigOf, updateDeviceGate, updateDeviceGates } = await load('device-gates.js');
+  const cfg = gateConfigOf('memory', undefined);
+  let state = updateDeviceGate(undefined, 'memory', cfg, { vmPressureLevel: 4 });
+  assert.equal(state.sensor, 'ok');
+  for (const n of [1, 2]) {
+    state = updateDeviceGate(state, 'memory', cfg, {});
+    assert.deepEqual([state.closed, state.sensor, state.consecutiveUnknown], [true, 'unavailable', n], `unknown sample ${n} holds it`);
+  }
+  state = updateDeviceGate(state, 'memory', cfg, {});
+  assert.deepEqual([state.closed, state.sensor, state.reason], [false, 'unavailable', null], 'the third unknown sample reopens it: unknown never holds claims closed');
+  assert.equal(updateDeviceGate(state, 'memory', cfg, { vmPressureLevel: 1 }).sensor, 'ok');
+  const thermal = updateDeviceGates(updateDeviceGates(undefined, { thermal: { maxPressureLevel: 1 }, memory: false }, { thermal: { pressureLevel: 3 } }), { thermal: { maxPressureLevel: 1 }, memory: false }, { thermal: {} });
+  assert.equal(thermal.thermal.closed, true, 'the bound is the memory gate\'s; thermal keeps holding (BRAIN-1088)');
+};
+
+test('a closed memory gate whose sensor reads nothing reopens after 3 unknown samples and reports sensor-unavailable', async () => unknownScenario(realSrc));
+
+test('canary: without the unknown-sample bound, the closed gate latches and the scenario fails by name', async () => {
+  await assertCanaryFails('device-gates.js', ['  if (state.closed && state.consecutiveUnknown >= limit) Object.assign(state, { closed: false, consecutiveOk: 0, reason: null });', ''], unknownScenario);
+});
+
+test('local admission reuses a reading for 5 s and derives the swap rate from the state file', async () => {
+  const { sampleMemoryGate } = await realSrc('device-gates.js');
   const root = makeTmpDir('memory-gate-root-');
   let reads = 0;
   const read = (reading) => () => { reads += 1; return reading; };
-  assert.equal(sampleMemoryGate(root, undefined, { read: read({ vmPressureLevel: 2 }), now: 1000 }).closed, true);
-  assert.equal(sampleMemoryGate(root, undefined, { read: read({ vmPressureLevel: 1 }), now: 1500 }).consecutiveOk, 0, 'reused inside the second');
+  assert.equal(sampleMemoryGate(root, undefined, { read: read({ swapBytes: 0, at: 0 }), now: 0 }).closed, false);
+  assert.equal(sampleMemoryGate(root, undefined, { read: read({ swapBytes: 999 * MiB, at: 4000 }), now: 4000 }).closed, false, 'reused inside 5 s');
   assert.equal(reads, 1);
-  assert.equal(sampleMemoryGate(root, undefined, { read: read({ vmPressureLevel: 1 }), now: 2100 }).consecutiveOk, 1);
-  assert.deepEqual([readMemoryGate(root).closed, readMemoryGate(root).openSamples], [true, 3]);
-  assert.equal(sampleMemoryGate(root, { memory: false }, { read: read({ vmPressureLevel: 4 }), now: 9000 }).closed, false, 'off means never closed');
+  const paging = sampleMemoryGate(root, undefined, { read: read({ swapBytes: 200 * MiB, at: 10_000 }), now: 10_000 });
+  assert.deepEqual([paging.closed, paging.reading.swapMiBPerSec, paging.openSamples], [true, 20, 3]);
 });
 
-test('lane status renders a closed local memory gate and the live memory reading', async () => {
+const disabledScenario = async (load) => {
+  const { sampleMemoryGate, readMemoryGate } = await load('device-gates.js');
+  const root = makeTmpDir('memory-gate-off-');
+  atomicWriteJson(paths(root).memoryGate, { closed: true, consecutiveOk: 0, reason: 'memory-pressure', sampledAt: Date.now() });
+  assert.equal(readMemoryGate(root, { memory: false }).closed, false, 'a disabled gate is never closed, whatever the file says');
+  assert.equal(readMemoryGate(root, undefined).closed, true, 'the file still holds while the gate is on');
+  assert.equal(sampleMemoryGate(root, { memory: false }).closed, false);
+  assert.equal(fs.existsSync(paths(root).memoryGate), false, 'disabling it clears the persisted state');
+};
+
+test('"memory": false is never closed: reads ignore the persisted state and sampling clears it', async () => disabledScenario(realSrc));
+
+test('canary: with reads ignoring the config, a disabled gate stays closed and the scenario fails by name', async () => {
+  await assertCanaryFails('device-gates.js', ["export const readMemoryGate = (root, deviceGates) => (gateConfigOf('memory', deviceGates) === null ? OPEN_MEMORY_GATE : readJsonSafe(paths(root).memoryGate) ?? OPEN_MEMORY_GATE);", 'export const readMemoryGate = (root) => readJsonSafe(paths(root).memoryGate) ?? OPEN_MEMORY_GATE;'], disabledScenario);
+});
+
+test('lane status renders a closed local memory gate and the live memory reading, with a rate against the stored one', async () => {
   const { renderMemoryGateLine } = await realSrc('status.js');
   const { liveDeviceGates, renderDeviceGatesLine } = await realSrc('device-gates.js');
   assert.equal(renderMemoryGateLine({ closed: true, consecutiveOk: 1, openSamples: 3 }), 'memory gate: CLOSED (memory-pressure) — no new local lane starts beside a running one; reopens after 3 clean samples (1 so far)');
-  const live = liveDeviceGates(undefined, { memory: { vmPressureLevel: 1, offloadPercent: 87.4, psiSomeAvg10: null } });
-  assert.equal(renderDeviceGatesLine(live), 'device gates: memory CLOSED (vm pressure 1/≤1, swap+compressor 87% of RAM/≤60%)');
+  const live = liveDeviceGates(undefined, { memory: { vmPressureLevel: 1, swapBytes: 300 * MiB, at: 10_000 } }, { memory: { swapBytes: 0, at: 0 } });
+  assert.equal(renderDeviceGatesLine(live), 'device gates: memory CLOSED (vm pressure 1/≤1, swap 30.0 MiB/s/≤10)');
   assert.equal(renderDeviceGatesLine(liveDeviceGates(undefined, {})), 'device gates: memory ok (readings unknown)');
 });
 
@@ -124,9 +165,16 @@ const agentScenario = async (load) => {
   const textfileDir = makeTmpDir('memory-agent-prom-');
   const client = { on() {}, end: async () => {}, escapeIdentifier: (s) => `"${s}"`, query: async () => ({ rows: [{ v: { host: 'a1', max_claims: 1, protocol_min: 1 } }] }) };
   class Driver { adoptAll() {} poke() {} watchScope() {} scopeBlock() { return null; } async close() {} }
+  const logs = [];
+  let sensorDead = false;
+  let swapBytes = 0;
+  const deviceSampler = async () => {
+    if (sensorDead) throw new Error('sysctl gone');
+    swapBytes += 1024 * MiB;
+    return { thermal: {}, power: {}, memory: { vmPressureLevel: 2, psiSomeAvg10: null, swapBytes, at: Date.now() } };
+  };
   const agent = await startAgent({
-    remoteRoot, version: 't', s3: {}, Driver, figures: () => null, draining: () => false, log: () => {}, textfileDir,
-    deviceSampler: async () => ({ thermal: {}, power: {}, memory: { vmPressureLevel: 1, offloadPercent: 87, psiSomeAvg10: null } }),
+    remoteRoot, version: 't', s3: {}, Driver, figures: () => null, draining: () => false, log: (line) => logs.push(line), textfileDir, deviceSampler,
     config: { runnerName: 'a1', pollMs: 200, schedule: null, stopClaimingBeforeCloseMs: 0, brokerHome: path.join(tmp, 'home'), stateDir: path.join(tmp, 'state'), pg: {} },
     coreOptions: { connect: async () => client },
   });
@@ -135,14 +183,19 @@ const agentScenario = async (load) => {
     await happens('with no deviceGates configured the agent still pauses claims', () => readAgentStatus(remoteRoot).claims === 'paused:memory-pressure', 5000);
     const prom = () => (fs.existsSync(path.join(textfileDir, 'lane-agent.prom')) ? fs.readFileSync(path.join(textfileDir, 'lane-agent.prom'), 'utf8') : '');
     await happens('the prom file says the memory gate is closed', () => prom().includes('lane_agent_device_gate_closed{gate="memory"} 1'), 5000);
-    assert.match(prom(), /^lane_agent_memory_pressure\{signal="vm_pressure_level"\} 1$/m);
-    assert.match(prom(), /^lane_agent_memory_pressure\{signal="offload_percent"\} 87$/m);
+    assert.match(prom(), /^lane_agent_memory_pressure\{signal="vm_pressure_level"\} 2$/m);
+    await happens('the prom file carries the swap rate once two samples exist', () => /^lane_agent_memory_pressure\{signal="swap_mib_per_second"\} \d/m.test(prom()), 5000);
+    sensorDead = true;
+    await happens('a dead sensor reopens the gate after 3 unknown samples and claims resume', () => readAgentStatus(remoteRoot).claims === 'running', 5000);
+    await happens('the prom file says sensor-unavailable', () => prom().includes('lane_agent_device_gate_sensor_unavailable{gate="memory"} 1'), 5000);
+    assert.equal(readAgentStatus(remoteRoot).deviceGates.memory.sensor, 'unavailable');
+    assert.equal(logs.filter((line) => /memory sensor-unavailable/.test(line)).length, 1, 'logged once on the transition');
   } finally {
     await agent.stop();
   }
 };
 
-test('the pull agent with no deviceGates config pauses claims as paused:memory-pressure and exports the gate and its readings', async () => agentScenario(realSrc));
+test('the pull agent with no deviceGates config pauses claims on paging, exports the readings, and a dead sensor reopens it as sensor-unavailable', async () => agentScenario(realSrc));
 
 test('canary: with the agent skipping device sampling when deviceGates is unset, the agent scenario fails by name', async () => {
   await assertCanaryFails('agent/run.js', ['    reloadDeviceGatesConfig();\n    let sample', '    reloadDeviceGatesConfig();\n    if (!deviceGatesConfig) {\n      deviceGates = {};\n      return;\n    }\n    let sample'], agentScenario);
@@ -166,7 +219,7 @@ const localScenario = async (load) => {
   const holder = await detached('holder', ['--', 'node', '-e', `const fs=require('fs');const t=setInterval(()=>{if(fs.existsSync(${JSON.stringify(release)}))clearInterval(t)},50)`], env, repoDir, load.laneBin);
   try {
     await happens('the first lane starts on a calm host', () => leased(state, holder), 30_000);
-    await sleep(1200);
+    await sleep(5500);
     const paging = { ...env, LANE_BROKER_TEST_MEMORY_PRESSURE: '2,,' };
     const second = await detached('second', ['--', 'node', '-e', '0'], paging, repoDir, load.laneBin);
     await happens('the second lane sampled the paging host', () => readJsonSafe(paths(state).memoryGate)?.closed === true, 30_000);

@@ -361,28 +361,33 @@ and thermal reads skip unreadable entries and `scope: Device` batteries (a wirel
 `{closed, consecutiveOk, reading}` and its textfile metrics `lane_agent_device_gate_closed{gate="thermal|power|memory"}` (0/1, active
 gates only).
 
-**The `memory` gate (PKG-404) is on by default**; `"memory": false` turns it off, and `"memory": {}` or any subset of its keys keeps the
-defaults for the rest. It closes while the host is paging: `maxVmPressureLevel` (1-4, default 1; macOS
-`kern.memorystatus_vm_pressure_level`, 1 normal, 2 warn, 4 critical), `maxPsiSomeAvg10` (0-100, default 10; Linux `/proc/pressure/memory`
-`some avg10`, the share of the last 10 s some task stalled on memory) and `maxOffloadPercent` (1-1000, default 60; memory pushed out
-of RAM, as a percent of RAM: macOS swap used plus the compressor's footprint, the two figures `lane status` prints on its `memory:`
-line; Linux swap used, read only where PSI is missing). `openSamples` defaults to 3. Available memory alone does not see this: on
-2026-11-23 workbook-pro reported HEALTHY availability while swap stood at 22016/23552 MB and the compressor at 20757 MB (87% of its
-48 GB of RAM offloaded), claimed a train shard, and ran it about 3x slow until it failed; later that day, under its usual agent
-load (load average 20-30) with the kernel level at normal, the same Mac read 29-45%. The swap
-ratio on its own stays excluded (BRAIN-273): macOS keeps a grown swap file, so used/total reads high on a calm machine. The pull
-agent stops claiming while the gate is closed (`claims: paused:memory-pressure`) and publishes the readings as
-`lane_agent_memory_pressure{signal="vm_pressure_level|psi_some_avg10|offload_percent"}`. Local admission keeps its own copy of the
-same gate, sampled under the broker lock at most once a second (`<state>/memory-gate.json`): in `schedulerMode: "active"` a closed
-gate denies a start (`memory-pressure`, waiting label "the memory gate") while another lane holds a lease, like the load gate, so a
-paging host runs one lane at a time rather than none, and a local-first lane goes to a runner instead. `lane status` adds a
-`memory gate: CLOSED` line while it is closed. macOS `critical` still denies every start, idle or not (`memory-critical`, BRAIN-207).
+**The `memory` gate (PKG-404) is on by default**; `"memory": false` turns it off (and clears local admission's stored state), and
+`"memory": {}` or any subset of its keys keeps the defaults for the rest. It closes only on signs the host is paging now, never on how
+much sits in swap or the compressor (BRAIN-273: occupancy outlives the pressure, so a recovered host would stay excluded):
+`maxVmPressureLevel` (1-4, default 1; macOS `kern.memorystatus_vm_pressure_level`, 1 normal, 2 warn, 4 critical), `maxPsiSomeAvg10`
+(0-100, default 10; Linux `/proc/pressure/memory` `some avg10`, the share of the last 10 s some task stalled on memory) and
+`maxSwapMiBPerSec` (0.1-10000, default 10; swap traffic between two samples: macOS `vm_stat` Swapins plus Swapouts, Linux
+`/proc/vmstat` pswpin plus pswpout at 4 KiB pages, read only where PSI is missing). A rate needs two samples, so a fresh process judges
+its first sample by the other signals; a counter that went backwards (a reboot) reads unknown. The 10 MiB/s default comes from
+workbook-pro on 2026-11-23: busy but healthy (load 17-24, kernel level normal) it swapped 0 MiB/s across 10 s windows, and its
+since-boot average over 10 days that include thrashes was 0.86 MiB/s. Nobody measured the rate during that day's thrash (swap 22016/23552
+MB, compressor 20757 MB, a train shard about 3x slow until it failed), so whether 10 MiB/s, or the kernel level, would have caught it
+is unverified. `openSamples` defaults to 3. **Unknown never holds the gate closed for good:** after 3 consecutive samples with no
+readable signal a closed memory gate reopens and reports `sensor-unavailable` (agent log line, `status.json` `sensor`, and
+`lane_agent_device_gate_sensor_unavailable{gate="memory"}`); the other gates keep holding on unknown as described above. The pull agent
+stops claiming while the gate is closed (`claims: paused:memory-pressure`) and publishes the readings as
+`lane_agent_memory_pressure{signal="vm_pressure_level|psi_some_avg10|swap_mib_per_second"}`. Local admission keeps its own copy of the
+same gate in `<state>/memory-gate.json`, sampled under the broker lock and reused for 5 s (which is also its rate window): in
+`schedulerMode: "active"` a closed gate denies a start (`memory-pressure`, waiting label "the memory gate") while another lane holds a
+lease, like the load gate, so a paging host runs one lane at a time rather than none, and a local-first lane goes to a runner instead.
+`lane status` adds a `memory gate: CLOSED` line while it is closed, and its `device gates:` line shows the live rate against the stored
+sample. macOS `critical` still denies every start, idle or not (`memory-critical`, BRAIN-207).
 
 ```json
 "deviceGates": {
   "thermal": { "maxPressureLevel": 1, "minCpuSpeedLimit": 100, "maxTempC": 90, "openSamples": 3 },
   "power":   { "requireAc": true, "minBatteryPercent": 20, "openSamples": 1 },
-  "memory":  { "maxVmPressureLevel": 1, "maxOffloadPercent": 60, "maxPsiSomeAvg10": 10, "openSamples": 3 }
+  "memory":  { "maxVmPressureLevel": 1, "maxPsiSomeAvg10": 10, "maxSwapMiBPerSec": 10, "openSamples": 3 }
 }
 ```
 
@@ -3368,7 +3373,7 @@ What a run leaves behind is collected; what a live one owns never is. Everything
   `os.availableParallelism()` and the cgroup's `cpu.max`/`cpuset` (BRAIN-860); a caller's explicit
   `parallelism` (a sampler's fixture CPU list) still wins. `npm test` sets it to
   the machine's core count, so the suite behaves the same inside a 1-core runner lane as on a bare host.
-- `LANE_BROKER_TEST_MEMORY_PRESSURE` — `vmPressureLevel,offloadPercent,psiSomeAvg10` (a blank field is unknown) replaces
+- `LANE_BROKER_TEST_MEMORY_PRESSURE` — `vmPressureLevel,psiSomeAvg10,swapBytes` (a blank field is unknown; `swapBytes` is the since-boot counter) replaces
   the memory gate's reading (PKG-404). `npm test` sets it to `,,`, so a busy test host's real paging never closes the gate mid-suite.
 - `LANE_BROKER_BOOT_ID` — override the detected boot id, to simulate a reboot.
 - `LANE_BROKER_BOOT_TIME_MS` — override the host boot time (epoch ms; non-numeric means unknown). BRAIN-1013: a lock whose

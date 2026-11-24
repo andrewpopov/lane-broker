@@ -96,6 +96,17 @@ export function parseVmStat(text) {
   return { pageSize, compressorPages };
 }
 
+const SWAPINS_RE = /Swapins:\s*(\d+)\./;
+const SWAPOUTS_RE = /Swapouts:\s*(\d+)\./;
+
+// PKG-404: bytes swapped in plus out since boot; the memory gate turns two of these into a paging rate.
+export function parseVmStatSwapBytes(text) {
+  const pageSize = parseVmStatPageSize(text);
+  const swapins = Number(SWAPINS_RE.exec(text || '')?.[1]);
+  const swapouts = Number(SWAPOUTS_RE.exec(text || '')?.[1]);
+  return Number.isFinite(pageSize) && Number.isFinite(swapins) && Number.isFinite(swapouts) ? pageSize * (swapins + swapouts) : null;
+}
+
 /**
  * Pure parse of `vm_stat`'s raw text into macOS's actually-available memory,
  * in bytes: (free + inactive + speculative) pages × page size (BRAIN-252).
@@ -122,11 +133,13 @@ export function parseVmStatAvailable(text) {
 }
 
 /**
- * Best-effort swap/compressor/availability reading for the `lane status`
- * memory line (BRAIN-211), and the macOS input to the PKG-404 memory gate,
- * which reads swap plus compressor as a share of RAM (never the swap ratio)
- * and, like the load gate, only stops a second local lane, so a thrash
- * like BRAIN-207's 2026-09-09 `coreaudiod` one never starves every lane.
+ * Best-effort swap/compressor/availability reading. INFORMATIONAL ONLY
+ * (BRAIN-211) — sampled fresh on every `lane status` call, never persisted,
+ * and never fed into an admission decision. See BRAIN-207's postmortem: on
+ * 2026-09-09 a runaway `coreaudiod` (nothing to do with any lane) thrashed
+ * this machine for 8 hours at 42GB swap; a memory GATE would have starved
+ * every lane over it, exactly the mistake BRAIN-207 already reversed for
+ * load average. This is detection, not admission.
  *
  * Never throws: a non-macOS host, or any probe failure, degrades to null —
  * the same fail-safe shape as readMemoryInfo's macPressure probe in cpu.js
@@ -194,8 +207,8 @@ export function readMemorySample(exec = execFileSync) {
 // under real pressure pages OUT, and this one wasn't. Compressor footprint
 // has the identical flaw for the identical reason (a large compressor is
 // macOS reclaiming memory well, not a sign of a squeeze) and was already
-// demoted to display-only context alongside swap; neither must be reinstated
-// as this classifier. The PKG-404 memory gate reads their sum against RAM.
+// demoted to display-only context alongside swap; neither is exported as a
+// threshold anymore, and neither must be reinstated as the classifier.
 export const AVAILABLE_TIGHT_PCT = 15;
 export const AVAILABLE_EXHAUSTED_PCT = 8;
 

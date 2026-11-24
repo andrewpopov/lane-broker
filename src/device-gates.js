@@ -39,17 +39,26 @@ const GATES = {
   },
   memory: {
     defaultOpenSamples: 3,
-    // PKG-404: on by default. 60% sits between a busy but healthy 48 GB Mac (29-45% of RAM swapped or compressed) and the 2026-11-23 thrash (87%).
-    defaults: { maxVmPressureLevel: 1, maxOffloadPercent: 60, maxPsiSomeAvg10: 10 },
-    thresholds: { maxVmPressureLevel: numberIn(1, 4, { integer: true }), maxOffloadPercent: numberIn(1, 1000), maxPsiSomeAvg10: numberIn(0, 100) },
-    informative: (_cfg, { vmPressureLevel, offloadPercent, psiSomeAvg10 }) => known(vmPressureLevel) || known(offloadPercent) || known(psiSomeAvg10),
-    violation: (cfg, { vmPressureLevel, offloadPercent, psiSomeAvg10 }) => {
+    unknownOpenSamples: 3,
+    // PKG-404: a busy but healthy 48 GB Mac (load 17-24) swapped 0 MiB/s in 10 s windows, and 0.86 MiB/s averaged over 10 days that include thrashes.
+    defaults: { maxVmPressureLevel: 1, maxPsiSomeAvg10: 10, maxSwapMiBPerSec: 10 },
+    thresholds: { maxVmPressureLevel: numberIn(1, 4, { integer: true }), maxPsiSomeAvg10: numberIn(0, 100), maxSwapMiBPerSec: numberIn(0.1, 10_000) },
+    derive: (prev, reading) => ({ ...reading, swapMiBPerSec: swapRate(prev, reading) }),
+    informative: (_cfg, { vmPressureLevel, psiSomeAvg10, swapMiBPerSec }) => known(vmPressureLevel) || known(psiSomeAvg10) || known(swapMiBPerSec),
+    violation: (cfg, { vmPressureLevel, psiSomeAvg10, swapMiBPerSec }) => {
       const paging = known(vmPressureLevel) && vmPressureLevel > cfg.maxVmPressureLevel
-        || (known(psiSomeAvg10) ? psiSomeAvg10 > cfg.maxPsiSomeAvg10 : known(offloadPercent) && offloadPercent > cfg.maxOffloadPercent);
+        || known(psiSomeAvg10) && psiSomeAvg10 > cfg.maxPsiSomeAvg10
+        || known(swapMiBPerSec) && swapMiBPerSec > cfg.maxSwapMiBPerSec;
       return paging ? 'memory-pressure' : null;
     },
   },
 };
+
+function swapRate(prev, reading) {
+  const seconds = (reading.at - prev?.at) / 1000;
+  const bytes = reading.swapBytes - prev?.swapBytes;
+  return Number.isFinite(seconds) && seconds > 0 && Number.isFinite(bytes) && bytes >= 0 ? bytes / seconds / (1024 * 1024) : null;
+}
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const openSamplesOf = (name, gateCfg) => gateCfg.openSamples ?? GATES[name].defaultOpenSamples;
@@ -87,6 +96,7 @@ export function updateDeviceGate(prev, name, gateCfg, reading) {
   const openSamples = openSamplesOf(name, gateCfg);
   const fingerprint = fingerprintOf(...Object.keys(GATES[name].thresholds).map((key) => gateCfg[key] ?? null), openSamples);
   const state = prev ? { ...prev } : { closed: false, consecutiveOk: 0, reason: null };
+  reading = GATES[name].derive?.(prev?.reading, reading) ?? reading;
   if (state.fingerprint !== fingerprint) {
     state.consecutiveOk = 0;
     state.fingerprint = fingerprint;
@@ -104,20 +114,32 @@ export function updateDeviceGate(prev, name, gateCfg, reading) {
       state.reason = null;
     }
   }
+  if (GATES[name].unknownOpenSamples) boundUnknown(state, GATES[name].unknownOpenSamples, GATES[name].informative(gateCfg, reading));
   state.reading = reading;
   return state;
+}
+
+// PKG-404: a gate that only reads unknown cannot hold claims closed for good; it reopens and says its sensor is unavailable.
+function boundUnknown(state, limit, informative) {
+  state.consecutiveUnknown = informative ? 0 : (state.consecutiveUnknown ?? 0) + 1;
+  state.sensor = informative ? 'ok' : 'unavailable';
+  if (state.closed && state.consecutiveUnknown >= limit) Object.assign(state, { closed: false, consecutiveOk: 0, reason: null });
 }
 
 export function updateDeviceGates(prev, deviceGates, sample) {
   return Object.fromEntries(configuredGates(deviceGates).map((name) => [name, updateDeviceGate(prev?.[name], name, gateConfigOf(name, deviceGates), sample[name] ?? {})]));
 }
 
-const MEMORY_SAMPLE_REUSE_MS = 1000;
+const MEMORY_SAMPLE_REUSE_MS = 5000;
+const OPEN_MEMORY_GATE = Object.freeze({ closed: false, consecutiveOk: 0, reason: null });
 
-// PKG-404: one state file per host for local admission; a reading under a second old is reused, so a busy queue samples once a second.
-export function sampleMemoryGate(root, deviceGates, { read = readMemoryPressure, now = Date.now() } = {}) {
+// PKG-404: one state file per host for local admission. A reading under 5 s old is reused, which also keeps the rate window that long.
+export function sampleMemoryGate(root, deviceGates, { read = () => readMemoryPressure(), now = Date.now() } = {}) {
   const gateCfg = gateConfigOf('memory', deviceGates);
-  if (gateCfg === null) return { closed: false, reason: null };
+  if (gateCfg === null) {
+    fs.rmSync(paths(root).memoryGate, { force: true });
+    return OPEN_MEMORY_GATE;
+  }
   const prev = readJsonSafe(paths(root).memoryGate);
   if (prev && now - prev.sampledAt >= 0 && now - prev.sampledAt < MEMORY_SAMPLE_REUSE_MS) return prev;
   const next = { ...updateDeviceGate(prev, 'memory', gateCfg, read()), openSamples: openSamplesOf('memory', gateCfg), sampledAt: now };
@@ -125,7 +147,7 @@ export function sampleMemoryGate(root, deviceGates, { read = readMemoryPressure,
   return next;
 }
 
-export const readMemoryGate = (root) => readJsonSafe(paths(root).memoryGate) ?? { closed: false, consecutiveOk: 0, reason: null };
+export const readMemoryGate = (root, deviceGates) => (gateConfigOf('memory', deviceGates) === null ? OPEN_MEMORY_GATE : readJsonSafe(paths(root).memoryGate) ?? OPEN_MEMORY_GATE);
 
 export const closedGateReason = (states) => Object.values(states ?? {}).find((state) => state.closed)?.reason ?? null;
 
@@ -215,12 +237,15 @@ export async function sampleDevice(deviceGates, { platform = process.platform, e
   return {
     thermal: { pressureLevel, cpuSpeedLimit, maxTempC },
     power: { onAc: power?.onAc ?? null, batteryPercent: power?.batteryPercent ?? null },
-    memory: { vmPressureLevel: memory?.vmPressureLevel ?? null, offloadPercent: memory?.offloadPercent ?? null, psiSomeAvg10: memory?.psiSomeAvg10 ?? null },
+    memory: { vmPressureLevel: memory?.vmPressureLevel ?? null, psiSomeAvg10: memory?.psiSomeAvg10 ?? null, swapBytes: memory?.swapBytes ?? null, at: memory?.at ?? null },
   };
 }
 
-export function liveDeviceGates(deviceGates, sample) {
-  return Object.fromEntries(configuredGates(deviceGates).map((name) => [name, { reason: gateViolation(name, gateConfigOf(name, deviceGates), sample[name]), reading: sample[name] ?? {}, thresholds: gateConfigOf(name, deviceGates) }]));
+export function liveDeviceGates(deviceGates, sample, previous = {}) {
+  return Object.fromEntries(configuredGates(deviceGates).map((name) => {
+    const reading = GATES[name].derive?.(previous[name], sample[name] ?? {}) ?? sample[name] ?? {};
+    return [name, { reason: gateViolation(name, gateConfigOf(name, deviceGates), reading), reading, thresholds: gateConfigOf(name, deviceGates) }];
+  }));
 }
 
 const show = (value, format) => (known(value) ? format(value) : 'unknown');
@@ -231,11 +256,11 @@ const GATE_PARTS = {
     t.minCpuSpeedLimit !== undefined && `speed ${show(cpuSpeedLimit, String)}/≥${t.minCpuSpeedLimit}`,
     t.maxTempC !== undefined && `temp ${show(maxTempC, (v) => `${v}C`)}/≤${t.maxTempC}C`,
   ],
-  memory: ({ vmPressureLevel, offloadPercent, psiSomeAvg10 }, t) => {
+  memory: ({ vmPressureLevel, psiSomeAvg10, swapMiBPerSec }, t) => {
     const parts = [
       known(vmPressureLevel) && `vm pressure ${vmPressureLevel}/≤${t.maxVmPressureLevel}`,
       known(psiSomeAvg10) && `psi some avg10 ${psiSomeAvg10}/≤${t.maxPsiSomeAvg10}`,
-      known(offloadPercent) && `swap+compressor ${Math.round(offloadPercent)}% of RAM/≤${t.maxOffloadPercent}%`,
+      known(swapMiBPerSec) && `swap ${swapMiBPerSec.toFixed(1)} MiB/s/≤${t.maxSwapMiBPerSec}`,
     ];
     return parts.some(Boolean) ? parts : ['readings unknown'];
   },

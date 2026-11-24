@@ -402,8 +402,8 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     // null whenever the sample itself is unavailable (non-macOS host, or a
     // failed probe), never a fabricated reading.
     memory: classifyMemorySample(readMemorySample()),
-    ...(sampleDeviceGates ? { deviceGates: liveDeviceGates(cfg.deviceGates, await sampleDevice(cfg.deviceGates)) } : {}),
-    memoryGate: readMemoryGate(root),
+    ...(sampleDeviceGates ? { deviceGates: liveDeviceGates(cfg.deviceGates, await sampleDevice(cfg.deviceGates), { memory: readMemoryGate(root, cfg.deviceGates).reading }) } : {}),
+    memoryGate: readMemoryGate(root, cfg.deviceGates),
     running,
     queued,
     remote,

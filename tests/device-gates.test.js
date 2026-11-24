@@ -75,7 +75,7 @@ const fakeExec = (answers) => {
   };
   return Object.assign(exec, { calls });
 };
-const NO_MEMORY_READING = { vmPressureLevel: null, offloadPercent: null, psiSomeAvg10: null };
+const NO_MEMORY_READING = { vmPressureLevel: null, psiSomeAvg10: null, swapBytes: null, at: null };
 
 const DARWIN = {
   '/usr/bin/notifyutil -g com.apple.system.thermalpressurelevel': 'com.apple.system.thermalpressurelevel 1\n',
@@ -123,7 +123,7 @@ test('sampleDevice reads a WSL-like sysfs: Mains online, the lowest battery, the
   writeSupply(sysRoot, 'BAT0', { type: 'Battery', capacity: 64, status: 'Discharging' });
   writeZone(sysRoot, 'thermal_zone0', 48000);
   writeZone(sysRoot, 'thermal_zone1', 71500);
-  const sample = await sampleDevice(ALL, { platform: 'linux', sysRoot });
+  const sample = await sampleDevice(ALL, { platform: 'linux', sysRoot, memoryPressure: () => null });
   assert.deepEqual(sample, { thermal: { pressureLevel: null, cpuSpeedLimit: null, maxTempC: 71.5 }, power: { onAc: true, batteryPercent: 64 }, memory: NO_MEMORY_READING });
   writeSupply(sysRoot, 'AC1', { type: 'Mains', online: 0 });
   assert.equal((await sampleDevice(ALL, { platform: 'linux', sysRoot })).power.onAc, false);
@@ -167,7 +167,7 @@ test('sysfs: an unreadable thermal zone is skipped, not read as 0 degrees', asyn
 test('sampleDevice on a Linux box with no power or thermal entries reads everything as unknown', async () => {
   const sysRoot = makeTmpDir('sysfs-');
   fs.mkdirSync(path.join(sysRoot, 'class', 'power_supply'), { recursive: true });
-  const sample = await sampleDevice(ALL, { platform: 'linux', sysRoot });
+  const sample = await sampleDevice(ALL, { platform: 'linux', sysRoot, memoryPressure: () => null });
   assert.deepEqual(sample, { thermal: { pressureLevel: null, cpuSpeedLimit: null, maxTempC: null }, power: { onAc: null, batteryPercent: null }, memory: NO_MEMORY_READING });
 });
 
