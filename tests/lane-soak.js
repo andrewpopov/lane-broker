@@ -13,7 +13,7 @@ import { PgCluster, PG_SKIP_REASON, roleNames, seedScale, SCALE_CLASSES } from '
  *
  *   node tests/lane-soak.js --minutes 30 [--claimers 8]
  * `mutate` ([from, to]) breaks sql/lane the way the harness does for the ordering canaries.
- * `injectBadOrder` adds one actor that locks job then group, the reverse of every other transaction. It exists to prove
+ * `injectBadOrder` adds one actor that locks job then group, the reverse of every other transaction, and a partner in the global order; a barrier makes the two always deadlock. It exists to prove
  * the detector fires; a soak that cannot report a deadlock proves nothing.
  */
 const TERMINAL = "('succeeded','failed','cancelled','skipped','lost')";
@@ -236,22 +236,27 @@ export async function runSoak({ minutes, claimers = 8, injectBadOrder = false, m
       }
     }
 
-    // The reverse order (job, then group) held open long enough to meet a claimer that took the group first.
+    // Racing a claimer for the group loses on a slow host (PKG-408); the barrier makes the job/group cycle form every time.
     async function badOrder() {
-      const client = await admin();
+      const reversed = await admin();
+      const ordered = await admin();
+      const lockJob = (c, id) => c.query('SELECT 1 FROM lane.jobs WHERE id = $1 FOR UPDATE', [id]);
       while (!stopping) {
         await sleep(2);
-        await tx(client, 'bad order', async (c) => {
-          // The longest queued job of a random active group: exactly the head a claimer picks for that group, so the two meet.
-          const { rows } = await c.query(
-            `SELECT j.id, j.group_id FROM lane.jobs j
-              WHERE j.group_id = (SELECT id FROM lane.groups WHERE state = 'active' ORDER BY random() LIMIT 1) AND j.state = 'queued'
-              ORDER BY j.est_p50_s DESC, j.seq LIMIT 1`);
-          if (!rows.length) return;
-          await c.query('SELECT 1 FROM lane.jobs WHERE id = $1 FOR UPDATE', [rows[0].id]);
-          await sleep(15);
-          await lockGroup(c, rows[0].group_id);
-        });
+        const { rows: [job] } = await reversed.query("SELECT id, group_id FROM lane.jobs WHERE state = 'queued' ORDER BY random() LIMIT 1");
+        if (!job) continue;
+        let arrived = 0;
+        let release;
+        const bothHoldFirstLock = new Promise((r) => { release = r; });
+        const holdThen = async (first, second) => {
+          try { await first(); } finally { if (++arrived === 2) release(); }
+          await bothHoldFirstLock;
+          await second();
+        };
+        await Promise.all([
+          tx(reversed, 'bad order', (c) => holdThen(() => lockJob(c, job.id), () => lockGroup(c, job.group_id))),
+          tx(ordered, 'bad order partner', (c) => holdThen(() => lockGroup(c, job.group_id), () => lockJob(c, job.id))),
+        ]);
       }
     }
 
