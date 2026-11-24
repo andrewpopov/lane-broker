@@ -64,10 +64,11 @@ export function roleSql({ role, host, password, roleExists, tags, repos, maxClai
   return [
     'BEGIN;',
     roleExists
-      ? `ALTER ROLE ${sqlIdent(role)} LOGIN PASSWORD ${sqlLit(password)} CONNECTION LIMIT 3;`
-      : `CREATE ROLE ${sqlIdent(role)} LOGIN PASSWORD ${sqlLit(password)} IN ROLE lane_agent CONNECTION LIMIT 3;`,
+      ? `ALTER ROLE ${sqlIdent(role)} LOGIN NOSUPERUSER NOREPLICATION NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD ${sqlLit(password)} CONNECTION LIMIT 3;`
+      : `CREATE ROLE ${sqlIdent(role)} LOGIN NOSUPERUSER NOREPLICATION NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD ${sqlLit(password)} IN ROLE lane_agent CONNECTION LIMIT 3;`,
     `ALTER ROLE ${sqlIdent(role)} SET statement_timeout = '2s';`,
     `ALTER ROLE ${sqlIdent(role)} SET idle_in_transaction_session_timeout = '5s';`,
+    `DO $lra$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ${sqlLit(role)} AND (rolsuper OR rolreplication OR rolbypassrls OR rolcreatedb OR rolcreaterole)) THEN RAISE EXCEPTION 'role ${role} still holds an elevated attribute'; END IF; END $lra$;`,
     `SELECT lane_dispatch.ld_set_principal(${sqlLit(role)}, 'agent', ${sqlLit(host)}, ${sqlTextArray(tags)}, ${sqlTextArray(repos)}, ${Number(maxClaims)});`,
     'COMMIT;',
     '',
@@ -145,6 +146,7 @@ function evaluatedRules(lines, included) {
   const check = (line, where) => {
     if (/\\\s*$/.test(line)) throw new Error(`${where} has a line ending in a backslash (a continuation), which this tool cannot check: "${line.trim()}"; join it first`);
     if (!/^\s*#/.test(line) && line.includes('"')) throw new Error(`${where} has a quoted field, which this tool cannot check: "${line.trim()}"`);
+    if (!/^\s*#/.test(line) && /(^|[\s,])@/.test(line)) throw new Error(`${where} has an @file list, which this tool cannot check: "${line.trim()}"`);
   };
   for (const line of lines) {
     const match = INCLUDE_RE.exec(line);
@@ -592,6 +594,7 @@ case "$kind" in
     while IFS= read -r f; do
       [ -r "$f" ] || { echo "pg_hba invariant violated: cannot read $f" >&2; exit 6; }
       if grep -v '^[[:space:]]*#' "$f" | grep '"' > /dev/null; then echo "pg_hba invariant violated: $f has a quoted field, which pg_hba_file_rules cannot tell from a keyword" >&2; exit 6; fi
+      if grep -v '^[[:space:]]*#' "$f" | grep -E '(^|[[:space:],])@' > /dev/null; then echo "pg_hba invariant violated: $f has an @file list, whose quoting pg_hba_file_rules cannot show" >&2; exit 6; fi
     done <<LRA_FILES_EOF
 $files
 LRA_FILES_EOF

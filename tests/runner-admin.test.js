@@ -118,13 +118,13 @@ test('SQL builders quote identifiers and literals, and a dry run shows the passw
   assert.throws(() => lib.sqlLit('a\0b'), /NUL/);
   const base = { role: 'lane_agent_evo_x2', host: 'evo-x2', tags: ['linux', "it's"], repos: ['*'], maxClaims: 14 };
   const create = lib.roleSql({ ...base, password: "pw'x", roleExists: false });
-  assert.match(create, /^BEGIN;\nCREATE ROLE "lane_agent_evo_x2" LOGIN PASSWORD 'pw''x' IN ROLE lane_agent CONNECTION LIMIT 3;/);
+  assert.match(create, /^BEGIN;\nCREATE ROLE "lane_agent_evo_x2" LOGIN NOSUPERUSER NOREPLICATION NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD 'pw''x' IN ROLE lane_agent CONNECTION LIMIT 3;/);
   assert.match(create, /ALTER ROLE "lane_agent_evo_x2" SET statement_timeout = '2s';/);
   assert.match(create, /SET idle_in_transaction_session_timeout = '5s';/);
   assert.match(create, /COMMIT;\n$/);
   assert.match(create, /ld_set_principal\('lane_agent_evo_x2', 'agent', 'evo-x2', ARRAY\['linux','it''s'\]::text\[\], ARRAY\['\*'\]::text\[\], 14\);/);
   const redacted = lib.roleSql({ ...base, tags: [], password: lib.REDACTED, roleExists: true });
-  assert.match(redacted, /^BEGIN;\nALTER ROLE "lane_agent_evo_x2" LOGIN PASSWORD '<redacted>' CONNECTION LIMIT 3;/);
+  assert.match(redacted, /^BEGIN;\nALTER ROLE "lane_agent_evo_x2" LOGIN NOSUPERUSER NOREPLICATION NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD '<redacted>' CONNECTION LIMIT 3;/);
   assert.match(redacted, /ARRAY\[\]::text\[\]/);
   const tx = lib.removeTxSql({ role: 'lane_agent_evo_x2', host: 'evo-x2', force: false });
   const order = ['BEGIN;', "FROM lane_dispatch.principals WHERE login_role = 'lane_agent_evo_x2' FOR UPDATE;", "RAISE EXCEPTION 'held tickets: %'", 'NOLOGIN', "DELETE FROM lane_dispatch.principals WHERE login_role = 'lane_agent_evo_x2';", "DELETE FROM lane_dispatch.runners WHERE host = 'evo-x2';", 'COMMIT;'];
@@ -211,6 +211,16 @@ test('the guard reads included files in place and refuses constructs it cannot c
   assert.throws(() => lib.editHba(`include_dir conf.d\n${HBA}`, entry, 'add'), /include_dir/);
   assert.throws(() => lib.editHba(`hostssl lane_queue_db \\\n  +lane_agent 100.64.0.0/10 scram-sha-256\n${HBA}`, entry, 'add'), /ending in a backslash/);
   assert.deepEqual(lib.hbaIncludes("include 'a.conf'\ninclude_if_exists b.conf\n"), [{ kind: 'include', path: 'a.conf' }, { kind: 'include_if_exists', path: 'b.conf' }]);
+});
+
+test('the role SQL strips every elevated attribute on create and re-add, and verifies it in the same transaction', () => {
+  for (const roleExists of [false, true]) {
+    const sql = lib.roleSql({ role: 'lane_agent_evo_x2', host: 'evo-x2', password: 'p', roleExists, tags: [], repos: ['*'], maxClaims: 1 });
+    assert.match(sql, /LOGIN NOSUPERUSER NOREPLICATION NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD/, `roleExists=${roleExists}`);
+    assert.match(sql, /rolsuper OR rolreplication OR rolbypassrls OR rolcreatedb OR rolcreaterole\)\) THEN RAISE EXCEPTION/);
+    assert.ok(sql.indexOf('RAISE EXCEPTION') < sql.indexOf('ld_set_principal'), 'checked before the principal is registered');
+  }
+  assert.throws(() => lib.editHba(`host @dbs.txt all all reject\n${HBA}`, ENTRY, 'add'), /@file list/);
 });
 
 test('shellQuote survives the remote shell: a psql field separator stays one word, not a pipe', () => {
@@ -339,7 +349,7 @@ test('a dry run changes nothing, prints every step with the password redacted, a
   const { code, text } = await cli(world, ADD);
   assert.equal(code, 0);
   for (const kind of ['secrets', 'postgres', 'hba', 'rustfs', 'train']) assert.match(text, new RegExp(`\\[${kind}\\]`));
-  assert.match(text, /BEGIN;\n {4}CREATE ROLE "lane_agent_evo_x2" LOGIN PASSWORD '<redacted>' IN ROLE lane_agent CONNECTION LIMIT 3;/);
+  assert.match(text, /BEGIN;\n {4}CREATE ROLE "lane_agent_evo_x2" LOGIN NOSUPERUSER NOREPLICATION NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD '<redacted>' IN ROLE lane_agent CONNECTION LIMIT 3;/);
   assert.match(text, /\+hostssl lane_queue_db {2}lane_agent_evo_x2 {2}100\.82\.26\.77\/32 {2}scram-sha-256/);
   assert.match(text, /provision\.sh/);
   assert.match(text, /nothing changed/);
@@ -419,7 +429,7 @@ test('re-running add converges: the item is reused, the role is altered, and the
   const { code } = await cli(world, [...ADD, '--apply']);
   assert.equal(code, 0);
   assert.equal(world.templates.length, 1);
-  assert.match(world.calls.find((c) => c.input?.includes('ALTER ROLE')).input, new RegExp(`^BEGIN;\\nALTER ROLE "lane_agent_evo_x2" LOGIN PASSWORD '${password}' CONNECTION LIMIT 3;`));
+  assert.match(world.calls.find((c) => c.input?.includes('ALTER ROLE')).input, new RegExp(`^BEGIN;\\nALTER ROLE "lane_agent_evo_x2" LOGIN NOSUPERUSER NOREPLICATION NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD '${password}' CONNECTION LIMIT 3;`));
   assert.deepEqual(world.scripts.map((s) => s.kind), ['hba']);
   assert.equal(world.reloads, 2);
   assert.equal(world.hba.split('BEGIN lane-runner-admin evo-x2').length, 2);
@@ -428,7 +438,7 @@ test('re-running add converges: the item is reused, the role is altered, and the
 test('a psql error that echoes the statement never reaches the output: only the exit code and a fixed message', async () => {
   const password = "pw'x";
   const world = fakeWorld({ item: itemWith(password) });
-  world.fail.psql = `ERROR:  syntax error at or near "x"\nLINE 1: ...LOGIN PASSWORD 'pw''x' IN ROLE lane_agent...`;
+  world.fail.psql = `ERROR:  syntax error at or near "x"\nLINE 1: ...LOGIN NOSUPERUSER NOREPLICATION NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD 'pw''x' IN ROLE lane_agent...`;
   const { code, text, errs } = await cli(world, [...ADD, '--apply']);
   assert.equal(code, 1);
   assert.match(text, /FAILED: create role and principal failed \(exit 3; output withheld/);
@@ -765,7 +775,7 @@ test('the guard refuses broad earlier rules: +group, all, /regex and @file in th
     'local sameuser all peer',
     'host a,lane_queue_db,b x,lane_agent_evo_x2 10.0.0.0/8 md5',
   ];
-  for (const rule of refused) assert.throws(() => add(rule), /already has a rule outside .* may let lane_agent_evo_x2 in: /, rule);
+  for (const rule of refused) assert.throws(() => add(rule), rule.includes('@') ? /has an @file list, which this tool cannot check/ : /already has a rule outside .* may let lane_agent_evo_x2 in: /, rule);
   assert.throws(() => add(refused[0]), new RegExp(refused[0].replaceAll('+', '\\+').replaceAll('/', '\\/')));
   const passes = [
     'host all postgres 127.0.0.1/32 scram-sha-256',
@@ -886,7 +896,7 @@ test('re-adding a half-removed runner undoes its NOLOGIN: an existing role is al
   assert.equal(code, 0);
   assert.equal(world.roleLogin, true);
   const sql = world.calls.find((c) => c.input?.includes('ALTER ROLE')).input;
-  assert.match(sql, /ALTER ROLE "lane_agent_evo_x2" LOGIN PASSWORD 'pw-value-1' CONNECTION LIMIT 3;/);
+  assert.match(sql, /ALTER ROLE "lane_agent_evo_x2" LOGIN NOSUPERUSER NOREPLICATION NOBYPASSRLS NOCREATEDB NOCREATEROLE PASSWORD 'pw-value-1' CONNECTION LIMIT 3;/);
   assert.match(sql, /SET statement_timeout = '2s';/);
   assert.match(sql, /SET idle_in_transaction_session_timeout = '5s';/);
 });
@@ -1017,6 +1027,8 @@ async function pgScenario(t, mod = lib, { only = false } = {}) {
   await refused('an include whose reject list names another lane login, then a trust rule', before('include extra.conf'), /extra\.conf:2: a rule before the catch-all reject may admit lane_agent_evo_x2: host lane_queue_db all trust/);
   fs.writeFileSync(path.join(hbaDir, 'quoted.conf'), 'host all "all" all reject\n');
   await refused('a quoted "all" in an included file', before('include quoted.conf'), /quoted\.conf has a quoted field/);
+  fs.writeFileSync(path.join(hbaDir, 'dbs.txt'), '"all"\n');
+  await refused('an @file database list forging a catch-all, then otherdb trust', ADDED.replace(END, `${END}\nhost @dbs.txt all all reject\nhost otherdb all all trust`), /pg_hba\.conf has an @file list/);
   await refused('a quoted database list in the main file', before('host "other db",lane_queue_db all all trust'), /pg_hba\.conf has a quoted field/);
   await refused('a continued comment that swallows the hostssl line', ADDED.replace('forward\nhostssl lane_queue_db  lane_agent_evo_x2', 'forward \\\nhostssl lane_queue_db  lane_agent_evo_x2'), /no hostssl line for lane_agent_evo_x2 before the catch-all reject/);
   await refused('a group rule', before('host lane_queue_db +lane_agent 10.0.0.0/8 scram-sha-256'), MAY);
