@@ -35,7 +35,7 @@ function nextSeq(root) {
   const cur = readJsonSafe(file);
   if (cur && Number.isFinite(cur.n)) n = cur.n;
   n += 1;
-  atomicWriteJson(file, { n });
+  atomicWriteJson(file, { n }, { fsync: true });
   return n;
 }
 
@@ -118,16 +118,25 @@ function quarantineLegacyRecords(root) {
   } catch {
     return;
   }
-  for (const name of names.filter((n) => n.endsWith('.json'))) {
-    const record = readJsonSafe(path.join(dir, name));
-    if (record === null || typeof record !== 'object' || record.schedVersion === 2) continue;
+  const quarantine = (name, event, fields) => {
     try {
       fs.mkdirSync(paths(root).queueQuarantine, { recursive: true });
       fs.renameSync(path.join(dir, name), path.join(paths(root).queueQuarantine, name));
-      logResourceEvent(root, 'legacy-record-after-fence', { ticket: record.id ?? 'unknown', file: name, action: 'quarantined' });
+      logResourceEvent(root, event, { ...fields, file: name, action: 'quarantined' });
     } catch (err) {
-      logResourceEvent(root, 'legacy-record-after-fence', { ticket: record.id ?? 'unknown', file: name, action: 'quarantine-failed', error: err.code ?? 'error' });
+      logResourceEvent(root, event, { ...fields, file: name, action: 'quarantine-failed', error: err.code ?? 'error' });
     }
+  };
+  for (const name of names.filter((n) => n.endsWith('.json'))) {
+    const file = path.join(dir, name);
+    const record = readJsonSafe(file);
+    // BRAIN-1217: a zero-byte or corrupt record (an unclean reboot) is a barrier admission can never get past, so it is contained too.
+    if (record === null || typeof record !== 'object' || Array.isArray(record)) {
+      if (fs.existsSync(file)) quarantine(name, 'unreadable-queue-record', {});
+      continue;
+    }
+    if (record.schedVersion === 2) continue;
+    quarantine(name, 'legacy-record-after-fence', { ticket: record.id ?? 'unknown' });
   }
 }
 
@@ -233,7 +242,7 @@ export async function enqueue(root, ticket, cfg = DEFAULT_GLOBAL_CONFIG, { owner
       prioOriginAt: originOrNow(ticket.prioOriginAt, nowEff),
       schedVersion: 2,
     };
-    atomicWriteJson(queueFile(root, seq, ticket.id), record);
+    atomicWriteJson(queueFile(root, seq, ticket.id), record, { fsync: true });
     touchSimArmFor(root, record);
     return record.pushGate ? { ...record, supersededTargets: supersedeRepeatedPushes(root, record) } : record;
   });
@@ -327,7 +336,7 @@ export async function withdrawQueued(root, id) {
       return null;
     }
     try {
-      if (legacyFairness) atomicWriteJson(parked, { ...record, legacyFairness });
+      if (legacyFairness) atomicWriteJson(parked, { ...record, legacyFairness }, { fsync: true });
     } catch {
       // The snapshot is written atomically, so the parked file still holds the original record: put it back in the queue.
       fs.renameSync(parked, file);
@@ -371,9 +380,9 @@ function restoreLocked(root, record) {
     if (parked) {
       const { legacyFairness: snapshot, ...parkedRecord } = readJsonSafe(parked) ?? record;
       legacyFairness = snapshot ?? null;
-      atomicWriteJson(parked.slice(0, -'.rebinding'.length), { ...parkedRecord, localSince: Date.now() });
+      atomicWriteJson(parked.slice(0, -'.rebinding'.length), { ...parkedRecord, localSince: Date.now() }, { fsync: true });
       fs.unlinkSync(parked);
-    } else atomicWriteJson(queueFile(root, record.seq, record.id), { ...record, localSince: Date.now() });
+    } else atomicWriteJson(queueFile(root, record.seq, record.id), { ...record, localSince: Date.now() }, { fsync: true });
   }
   patchAttemptLocked(root, record.id, { rebinding: undefined });
   // it keeps its original seq, so it is the head again; what another head wrote meanwhile was only valid while it was away
@@ -532,7 +541,7 @@ export async function retierQueued(root, id, tier, cfg, { reloadConfig = (c) => 
     if (beforeWrite) await beforeWrite();
     // A1: the file may have been removed (a cancel) while we classified; writing the record back would resurrect it.
     if (findQueueFile(root, id) !== file || readJsonSafe(file)?.id !== id) return readLease(root, id) ? refuse('running') : refuse('finished', 'gone');
-    atomicWriteJson(file, { ...record, ...after, priorityRetiered: true, priorityRetieredAt: Date.now() });
+    atomicWriteJson(file, { ...record, ...after, priorityRetiered: true, priorityRetieredAt: Date.now() }, { fsync: true });
     writeBrokerLog(
       root,
       `lane-broker-priority event=retier ticket=${id} repo=${record.repoId} seq=${record.seq} from=${before.priorityRequested}/${before.priorityAdmitted} requested=${after.priorityRequested} admitted=${after.priorityAdmitted} demoted=${after.priorityDemoted} pid=${process.pid}\n`,

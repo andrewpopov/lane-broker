@@ -178,21 +178,38 @@ test('a low ticket aged 20 minutes waits behind a fresh high with a higher seq (
   });
 });
 
-test('ordering does not cross a null barrier, and a reservation owner behind one is not promoted', async () => {
-  await withClock(async () => {
-    const { state } = fenced(activeCfg());
-    const cfg = activeCfg();
-    const first = ticket('first', { priorityRequested: 'low' });
-    await enqueue(state, first);
-    fs.writeFileSync(path.join(paths(state).queue, '000000000001-zzz-garbage.json'), '{not json');
-    const high = ticket('high', { priorityRequested: 'high' });
-    await enqueue(state, high);
-    assert.deepEqual(viewOf(state, cfg).ids, ['first', null, 'high'], 'the high stays behind the unreadable record');
-    assert.equal((await poll(state, high, cfg, 0)).reason, 'not-head');
+async function nullBarrierFixture() {
+  const { state } = fenced(activeCfg());
+  const cfg = activeCfg();
+  const first = ticket('first', { priorityRequested: 'low' });
+  await enqueue(state, first);
+  fs.writeFileSync(path.join(paths(state).queue, '000000000001-zzz-garbage.json'), '{not json');
+  const high = ticket('high', { priorityRequested: 'high' });
+  await enqueue(state, high);
+  assert.deepEqual(viewOf(state, cfg).ids, ['first', null, 'high'], 'the high stays behind the unreadable record');
+  writeFairness(state, { high: { resource: reservedRec(5) } });
+  assert.deepEqual(viewOf(state, cfg), { ids: ['first', null, 'high'], ownerId: null }, 'the owner is not promoted across the null; its reservation is suspended');
+  return { state, cfg, first, high };
+}
 
-    writeFairness(state, { high: { resource: reservedRec(5) } });
-    assert.deepEqual(viewOf(state, cfg), { ids: ['first', null, 'high'], ownerId: null }, 'the owner is not promoted across the null; its reservation is suspended');
+test('ordering does not cross a null barrier, and a reservation owner behind one is not promoted, while the record cannot be quarantined', async () => {
+  await withClock(async () => {
+    const { state, cfg, first, high } = await nullBarrierFixture();
+    fs.writeFileSync(paths(state).queueQuarantine, 'a file where the quarantine directory should be');
+    assert.equal((await poll(state, high, cfg, 0)).reason, 'not-head');
+    assert.deepEqual(viewOf(state, cfg).ids, ['first', null, 'high'], 'a failed quarantine leaves the barrier');
+    assert.match(fs.readFileSync(paths(state).admissionLog, 'utf8'), /unreadable-queue-record.*quarantine-failed/);
     assert.equal((await poll(state, first, cfg, 0)).started, true);
+  });
+});
+
+test('an unreadable record is quarantined by the next poll: ordering then crosses it and the reservation owner is promoted', async () => {
+  await withClock(async () => {
+    const { state, cfg, first } = await nullBarrierFixture();
+    assert.equal((await poll(state, first, cfg, 0)).reason, 'not-head', 'the high now leads: nothing stands between it and the head');
+    assert.equal(fs.existsSync(path.join(paths(state).queue, '000000000001-zzz-garbage.json')), false);
+    assert.deepEqual(fs.readdirSync(paths(state).queueQuarantine), ['000000000001-zzz-garbage.json']);
+    assert.deepEqual(viewOf(state, cfg), { ids: ['high', 'first'], ownerId: 'high' }, 'the owner is promoted once the barrier is gone');
   });
 });
 
@@ -492,12 +509,22 @@ test('a ticket\'s fairness record is deleted when the ticket departs: start, can
       expectGone(state, 'reap');
     }
     {
-      // an unreadable record has no id: nothing can be proven departed, so nothing is dropped
+      // an unreadable record has no id: while it stands in the queue nothing can be proven departed, so nothing is dropped
+      const { state, cfg, stay } = await setup();
+      dequeueSync(state, 'gone');
+      fs.writeFileSync(path.join(paths(state).queue, '000000000000-garbage.json'), '{not json');
+      fs.writeFileSync(paths(state).queueQuarantine, 'a file where the quarantine directory should be');
+      await poll(state, stay, cfg);
+      assert.ok(readFairness(state).gone, 'kept while the queue holds an unreadable record that could not be quarantined');
+    }
+    {
+      // once the record is quarantined the queue is fully readable again, so the departed ticket's record is dropped
       const { state, cfg, stay } = await setup();
       dequeueSync(state, 'gone');
       fs.writeFileSync(path.join(paths(state).queue, '000000000000-garbage.json'), '{not json');
       await poll(state, stay, cfg);
-      assert.ok(readFairness(state).gone, 'kept while the queue holds an unreadable record');
+      assert.deepEqual(fs.readdirSync(paths(state).queueQuarantine), ['000000000000-garbage.json']);
+      expectGone(state, 'quarantined unreadable record');
     }
   });
 });
