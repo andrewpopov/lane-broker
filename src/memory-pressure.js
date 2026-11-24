@@ -3,7 +3,6 @@ import { execFileSync } from 'node:child_process';
 import { parseVmStatSwapBytes } from './memory.js';
 
 const finite = (n) => (Number.isFinite(n) ? n : null);
-const LINUX_PAGE_BYTES = 4096;
 const EXEC_OPTIONS = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], timeout: 2000 };
 
 export function parsePsiSomeAvg10(text) {
@@ -11,9 +10,19 @@ export function parsePsiSomeAvg10(text) {
   return avg10 === undefined ? null : finite(Number(avg10));
 }
 
-export function parseProcVmstatSwapBytes(text) {
+export function parseProcVmstatSwapBytes(text, pageBytes) {
   const pages = (name) => Number(new RegExp(`^${name} (\\d+)$`, 'm').exec(text ?? '')?.[1]);
-  return finite(LINUX_PAGE_BYTES * (pages('pswpin') + pages('pswpout')));
+  return Number.isFinite(pageBytes) && pageBytes > 0 ? finite(pageBytes * (pages('pswpin') + pages('pswpout'))) : null;
+}
+
+let hostPageBytes = null;
+
+// pswpin/pswpout count kernel pages (4 KiB, 16 KiB or 64 KiB by kernel), so the size is the host's own; unreadable means no counter.
+function linuxPageBytes(exec) {
+  if (exec === execFileSync && hostPageBytes !== null) return hostPageBytes;
+  const bytes = quietly(() => finite(Number(exec('getconf', ['PAGESIZE'], EXEC_OPTIONS).trim())));
+  if (exec === execFileSync && bytes !== null) hostPageBytes = bytes;
+  return bytes;
 }
 
 const TEST_HOOK = 'LANE_BROKER_TEST_MEMORY_PRESSURE';
@@ -45,7 +54,7 @@ export function readMemoryPressure({ platform = process.platform, env = process.
   }
   if (platform === 'linux') {
     const psiSomeAvg10 = quietly(() => parsePsiSomeAvg10(readFile('/proc/pressure/memory')));
-    return { vmPressureLevel: null, psiSomeAvg10, swapBytes: psiSomeAvg10 === null ? quietly(() => parseProcVmstatSwapBytes(readFile('/proc/vmstat'))) : null, at: now };
+    return { vmPressureLevel: null, psiSomeAvg10, swapBytes: psiSomeAvg10 === null ? quietly(() => parseProcVmstatSwapBytes(readFile('/proc/vmstat'), linuxPageBytes(exec))) : null, at: now };
   }
   return { vmPressureLevel: null, psiSomeAvg10: null, swapBytes: null, at: now };
 }

@@ -26,17 +26,30 @@ test('readMemoryPressure on macOS: the kernel level and the since-boot swap traf
   assert.deepEqual(broken, { vmPressureLevel: null, psiSomeAvg10: null, swapBytes: null, at: 5 }, 'a failed probe is unknown, never an error');
 });
 
-test('readMemoryPressure on Linux: PSI some avg10, and the pswpin/pswpout counter only where PSI is missing', async () => {
-  const { readMemoryPressure } = await realSrc('memory-pressure.js');
+const linuxPressure = async (load) => {
+  const { readMemoryPressure } = await load('memory-pressure.js');
+  const getconf = (bytes) => (cmd, args) => {
+    assert.deepEqual([cmd, args], ['getconf', ['PAGESIZE']]);
+    if (bytes === null) throw new Error('getconf: not found');
+    return `${bytes}\n`;
+  };
   const files = (psi) => (f) => {
     if (f === '/proc/pressure/memory' && psi !== null) return psi;
     if (f === '/proc/vmstat') return PROC_VMSTAT;
     throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
   };
   assert.deepEqual(readMemoryPressure({ platform: 'linux', env: noHook, readFile: files(PSI(12.5)), now: 5 }), { vmPressureLevel: null, psiSomeAvg10: 12.5, swapBytes: null, at: 5 });
-  assert.deepEqual(readMemoryPressure({ platform: 'linux', env: noHook, readFile: files(null), now: 5 }), { vmPressureLevel: null, psiSomeAvg10: null, swapBytes: 4096 * 4000, at: 5 });
+  assert.equal(readMemoryPressure({ platform: 'linux', env: noHook, exec: getconf(65536), readFile: files(null), now: 5 }).swapBytes, 65536 * 4000, 'a 64 KiB kernel counts 64 KiB pages');
+  assert.equal(readMemoryPressure({ platform: 'linux', env: noHook, exec: getconf(4096), readFile: files(null), now: 5 }).swapBytes, 4096 * 4000);
+  assert.equal(readMemoryPressure({ platform: 'linux', env: noHook, exec: getconf(null), readFile: files(null), now: 5 }).swapBytes, null, 'an unknown page size is no counter, never a guess');
   assert.deepEqual(readMemoryPressure({ platform: 'win32', env: noHook, now: 5 }), { vmPressureLevel: null, psiSomeAvg10: null, swapBytes: null, at: 5 });
   assert.deepEqual(readMemoryPressure({ env: { LANE_BROKER_TEST_MEMORY_PRESSURE: '2,7,' }, now: 5 }), { vmPressureLevel: 2, psiSomeAvg10: 7, swapBytes: null, at: 5 });
+};
+
+test('readMemoryPressure on Linux: PSI some avg10, and the pswpin/pswpout counter at the host page size only where PSI is missing', async () => linuxPressure(realSrc));
+
+test('canary: with Linux pages assumed to be 4 KiB, the 64 KiB kernel undercounts and the scenario fails by name', async () => {
+  await assertCanaryFails('memory-pressure.js', ["parseProcVmstatSwapBytes(readFile('/proc/vmstat'), linuxPageBytes(exec))", "parseProcVmstatSwapBytes(readFile('/proc/vmstat'), 4096)"], linuxPressure);
 });
 
 /** The gate after `readings` in order, each `at` seconds apart from the first. */
@@ -58,6 +71,33 @@ const gateScenario = async (load) => {
 };
 
 test('the gate closes on the kernel level, PSI or a swap traffic rate, and never on swap a host merely retains', async () => gateScenario(realSrc));
+
+const rateScenario = async (load) => {
+  const { gateConfigOf, updateDeviceGate } = await load('device-gates.js');
+  const cfg = gateConfigOf('memory', undefined);
+  const after = (...readings) => gateAfter(updateDeviceGate, cfg, readings);
+  const rate = (...readings) => after(...readings).reading.swapMiBPerSec;
+  assert.equal(rate({ swapBytes: null, at: 0 }, { swapBytes: RETAINED, at: 15_000 }), null, 'a recovered counter after a failed read is no rate, not 22 GiB in 15 s');
+  assert.equal(rate({ swapBytes: RETAINED, at: 0 }, { swapBytes: null, at: 15_000 }), null);
+  assert.equal(rate({ swapBytes: RETAINED, at: null }, { swapBytes: RETAINED, at: 15_000 }), null, 'a missing time is no rate either');
+  assert.equal(rate({ psiSomeAvg10: 1, swapBytes: null, at: 0 }, { psiSomeAvg10: null, swapBytes: RETAINED, at: 15_000 }), null, 'switching from PSI to the fallback starts a baseline');
+  assert.equal(rate({ swapBytes: 0, at: 0 }, { swapBytes: 5 * MiB, at: 5000 }), 1);
+  assert.equal(rate({ swapBytes: 0, at: 0 }, { swapBytes: 100 * MiB, at: 3_600_000 }), null, 'an hour-old baseline would average a burst away: no rate');
+  assert.equal(rate({ swapBytes: 0, at: 0 }, { swapBytes: 100 * MiB, at: 3_600_000 }, { swapBytes: 200 * MiB, at: 3_605_000 }), 20, 'the stale sample re-baselines, and the next one decides');
+  let unknown;
+  for (let n = 0; n < 4; n += 1) unknown = updateDeviceGate(unknown ?? updateDeviceGate(undefined, 'memory', cfg, { psiSomeAvg10: 30 }), 'memory', cfg, { swapBytes: null, at: 15_000 * n });
+  assert.deepEqual([unknown.closed, unknown.sensor], [false, 'unavailable'], 'null counters are unknown, so the sensor-unavailable countdown runs');
+};
+
+test('a swap rate needs two finite counters and times no more than a minute apart; otherwise the sample is unknown', async () => rateScenario(realSrc));
+
+test('canary: with null counters coerced to 0, a recovered counter fabricates a rate and the scenario fails by name', async () => {
+  await assertCanaryFails('device-gates.js', ['  if (!allFinite(prev?.swapBytes, prev?.at, reading.swapBytes, reading.at)) return null;', '  if (prev === undefined) return null;'], rateScenario);
+});
+
+test('canary: without the one-minute window, an hour-old baseline yields a rate and the scenario fails by name', async () => {
+  await assertCanaryFails('device-gates.js', ['ms > 0 && ms <= MAX_RATE_WINDOW_MS && bytes >= 0', 'ms > 0 && bytes >= 0'], rateScenario);
+});
 
 test('canary: with the memory violation removed, the gate scenario fails by name', async () => {
   await assertCanaryFails('device-gates.js', ["      return paging ? 'memory-pressure' : null;", '      return null;'], gateScenario);

@@ -40,7 +40,7 @@ const GATES = {
   memory: {
     defaultOpenSamples: 3,
     unknownOpenSamples: 3,
-    // PKG-404: a busy but healthy 48 GB Mac (load 17-24) swapped 0 MiB/s in 10 s windows, and 0.86 MiB/s averaged over 10 days that include thrashes.
+    // PKG-404: workbook-pro's week to 2026-11-23: p95 4.85 MiB/s, over 10 MiB/s 2.5% of it; the thrash that day averaged 14.5 (README).
     defaults: { maxVmPressureLevel: 1, maxPsiSomeAvg10: 10, maxSwapMiBPerSec: 10 },
     thresholds: { maxVmPressureLevel: numberIn(1, 4, { integer: true }), maxPsiSomeAvg10: numberIn(0, 100), maxSwapMiBPerSec: numberIn(0.1, 10_000) },
     derive: (prev, reading) => ({ ...reading, swapMiBPerSec: swapRate(prev, reading) }),
@@ -54,10 +54,15 @@ const GATES = {
   },
 };
 
+const MAX_RATE_WINDOW_MS = 60_000;
+const allFinite = (...values) => values.every((v) => typeof v === 'number' && Number.isFinite(v));
+
+// PKG-404: no rate unless both samples carry a counter and a time; a baseline older than a minute averages a burst into the gap.
 function swapRate(prev, reading) {
-  const seconds = (reading.at - prev?.at) / 1000;
-  const bytes = reading.swapBytes - prev?.swapBytes;
-  return Number.isFinite(seconds) && seconds > 0 && Number.isFinite(bytes) && bytes >= 0 ? bytes / seconds / (1024 * 1024) : null;
+  if (!allFinite(prev?.swapBytes, prev?.at, reading.swapBytes, reading.at)) return null;
+  const ms = reading.at - prev.at;
+  const bytes = reading.swapBytes - prev.swapBytes;
+  return ms > 0 && ms <= MAX_RATE_WINDOW_MS && bytes >= 0 ? bytes / (ms / 1000) / (1024 * 1024) : null;
 }
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);

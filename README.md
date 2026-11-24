@@ -366,13 +366,16 @@ gates only).
 much sits in swap or the compressor (BRAIN-273: occupancy outlives the pressure, so a recovered host would stay excluded):
 `maxVmPressureLevel` (1-4, default 1; macOS `kern.memorystatus_vm_pressure_level`, 1 normal, 2 warn, 4 critical), `maxPsiSomeAvg10`
 (0-100, default 10; Linux `/proc/pressure/memory` `some avg10`, the share of the last 10 s some task stalled on memory) and
-`maxSwapMiBPerSec` (0.1-10000, default 10; swap traffic between two samples: macOS `vm_stat` Swapins plus Swapouts, Linux
-`/proc/vmstat` pswpin plus pswpout at 4 KiB pages, read only where PSI is missing). A rate needs two samples, so a fresh process judges
-its first sample by the other signals; a counter that went backwards (a reboot) reads unknown. The 10 MiB/s default comes from
-workbook-pro on 2026-11-23: busy but healthy (load 17-24, kernel level normal) it swapped 0 MiB/s across 10 s windows, and its
-since-boot average over 10 days that include thrashes was 0.86 MiB/s. Nobody measured the rate during that day's thrash (swap 22016/23552
-MB, compressor 20757 MB, a train shard about 3x slow until it failed), so whether 10 MiB/s, or the kernel level, would have caught it
-is unverified. `openSamples` defaults to 3. **Unknown never holds the gate closed for good:** after 3 consecutive samples with no
+`maxSwapMiBPerSec` (0.1-10000, default 10; swap traffic between two samples: macOS `vm_stat` Swapins plus Swapouts at the page size
+its header states, Linux `/proc/vmstat` pswpin plus pswpout at the host's page size from `getconf PAGESIZE`, read once, and read only
+where PSI is missing). A rate needs two samples that each carry a counter and a time, no more than 60 s apart: a failed read, a switch
+from PSI to the fallback, a counter that went backwards (a reboot) or a longer gap gives that sample no rate and starts a new baseline,
+so a fresh process judges its first sample by the other signals and a recovered counter is never read as one huge burst. An unknown
+page size means no counter, never a guess. **Why 10 MiB/s** (VictoriaMetrics, the 7 days to 2026-11-23, 5-minute rate of
+`macos_swap_in/out_bytes_total` on workbook-pro): p50 0.01, p95 4.85 and max 299 MiB/s; above 10 MiB/s 2.5% of the week and above
+5 MiB/s 4.5%. That day's thrash (swap 22016/23552 MB, compressor 20757 MB, a train shard about 3x slow until it failed) averaged
+14.5 MiB/s with a 54.5 MiB/s peak. The kernel level never left normal (max 1) on any host all week, even at 98% swap, so on macOS the
+rate is the signal that actually fires; the kernel level stays as a backstop. `openSamples` defaults to 3. **Unknown never holds the gate closed for good:** after 3 consecutive samples with no
 readable signal a closed memory gate reopens and reports `sensor-unavailable` (agent log line, `status.json` `sensor`, and
 `lane_agent_device_gate_sensor_unavailable{gate="memory"}`); the other gates keep holding on unknown as described above. The pull agent
 stops claiming while the gate is closed (`claims: paused:memory-pressure`) and publishes the readings as
