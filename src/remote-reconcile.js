@@ -7,6 +7,7 @@ import { readAttempt, supervisorAlive, publishTerminal, remoteCancelledResult, i
 import { terminalRowDefaults, noRunnerRefusal } from './resources.js';
 import { fetchRemoteResult, classifyRemoteResult, provesNeverStarted, provesStopped, remoteCancel, remoteWithdraw, REFUSED_CAP_REASON } from './remote-client.js';
 import { relayedUsage, relayedDeps } from './remote-relay.js';
+import { relayedRanOn } from './ran-on.js';
 import { writeBrokerLog } from './admission.js';
 
 /**
@@ -285,6 +286,7 @@ async function adoptOrAmbiguous(attempt, id, record, publish) {
     remotePhase: record.phase ?? null,
     ...relayedUsage(record),
     ...relayedDeps(record),
+    ...relayedRanOn(record),
     startedAt: attempt.startedAt,
     endedAt: Date.now(),
     reconciled: true,

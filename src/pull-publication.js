@@ -2,6 +2,7 @@ import { NO_PROGRESS_REASON, SILENCE_REASON } from './no-progress.js';
 import { readEnvelope } from './pull-envelope.js';
 import { remoteCpuAllocation } from './remote-client.js';
 import { relayedDeps, relayedTransfer, relayedUsage } from './remote-relay.js';
+import { relayedRanOn } from './ran-on.js';
 import { recordSettledResult, relayedPhases } from './supervisor.js';
 
 // exactly what `historyRow` and `settledContentKey` read from the ticket, so a result published by anyone lands as the supervisor's would
@@ -34,6 +35,7 @@ export function pullFinishedResult(publication, { result, decision, host, accept
     runner: host,
     ...remoteCpuAllocation(result),
     ...relayedUsage(result),
+    ...relayedRanOn(result),
     ...relayedDeps(result),
     ...relayedTransfer(null, result),
     ...relayedPhases({ result }),

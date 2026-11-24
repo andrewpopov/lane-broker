@@ -48,6 +48,11 @@ function readMemoryOverride() {
   return null;
 }
 
+export function fmtMB(bytes) {
+  if (bytes == null || !Number.isFinite(bytes)) return '?';
+  return `${(bytes / (1024 * 1024)).toFixed(0)}MB`;
+}
+
 const SWAP_USAGE_RE = /total\s*=\s*([\d.]+)M\s+used\s*=\s*([\d.]+)M/;
 
 /**

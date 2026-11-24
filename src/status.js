@@ -32,6 +32,7 @@ import { leaseOverrun, leaseSilence } from './observed.js';
 import { idleCreditCores } from './idle-credit.js';
 import { topExternalCpu, externalBusyCores, windowExternalCores, scanProcWindow, starvedStaleMs, starvedForMs } from './external-cpu.js';
 import { detectResourceCapacity, effectiveWeightCapacity, leaseResources, leaseCpuCores, cpuBudgetCores } from './resources.js';
+import { fmtMB } from './memory.js';
 
 const LANE_BIN = fileURLToPath(new URL('../bin/lane.js', import.meta.url));
 
@@ -504,11 +505,6 @@ function fmtMs(ms) {
   if (s < 60) return `${s}s`;
   const m = Math.floor(s / 60);
   return `${m}m${s % 60}s`;
-}
-
-function fmtMB(bytes) {
-  if (bytes == null || !Number.isFinite(bytes)) return '?';
-  return `${(bytes / (1024 * 1024)).toFixed(0)}MB`;
 }
 
 /** BRAIN-211/BRAIN-273: the memory line is informational-only, always —

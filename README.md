@@ -79,6 +79,18 @@ removed when the ticket starts or ends, and files of tickets no longer queued ar
 pruned by the next admission pass; status ignores them. Telemetry only: admission
 never reads it.
 
+**Where a lane ran (PKG-402).** Whichever supervisor spawns the command writes one line to the lane's log, and to
+`lane run`'s stderr when it waits, just before the command's first output:
+`lane: executing on <host> via <local|push|pull> (ticket <id>, cpu <n>, mem <m>[, runner <name>])`. `<host>` is that
+machine's hostname; `<id>` is the ticket `lane run` printed, also for a remote run, where the runner's own lane id
+never appears; `cpu` is the grant the command was spawned with (the same number as `LANE_BROKER_CPU_CORES`), `mem` the
+lane's memory claim (its `memoryBytes`, else `defaultMemoryBytesPerWeight` times its weight), and `runner` the runner name a push or pull dispatch used. On a
+runner the line comes from the runner's supervisor, so it travels back with the command's output; a runner older than
+this records nothing. The result record (`lane result <id> --json`) carries the same fields as `ranOn`:
+`{ host, transport, ticket, cpuCores, memoryBytes, runner }` (null where unknown), relayed by push, pull and
+`lane reconcile` from the runner's own record. A cached pass, a refusal and a run cancelled before it started have no
+`ranOn`, since nothing executed.
+
 Everything after `--` is the command, passed as `argv` (not through a shell —
 `spawn(cmd[0], cmd.slice(1))`). Use `sh -c '...'` explicitly if you need shell
 features like pipes or globbing.
@@ -2485,7 +2497,7 @@ exit `64`; v1 has no general lane hierarchy.
 
 **Reading a finished job's result (`lane result <id> [--json]`, BRAIN-1198).** Prints the stored result record
 (`<state>/results/<id>.json`: `{ exit }` or `{ signal }`, plus whatever the settling path added, such as `reused`,
-`reconciled`, `reason`) verbatim as one JSON object line on stdout with `--json`, or one summary line without. It only
+`reconciled`, `reason`, and `ranOn` once the command started, see "Where a lane ran") verbatim as one JSON object line on stdout with `--json`, or one summary line without. It only
 reads state and takes no lock, and creates nothing (the pull-ledger lookup does not fsync or create directories). Because the supervisor writes the result before it removes the lease, and admission moves a ticket between queue, pending and lease, a single pass can see neither: the lookup re-reads result then live state up to 3 passes, 5 ms apart, before answering `83`. Callers detect support through the `result/1` capability (`lane capabilities --json`). Exit `0` found (the job's own exit is in the record, not the exit code), `82` known but not
 finished (same notion of "known" as `lane wait`), `83` unknown id (confirmed absent from the result, lease, attempt, pending, queue and pull ledger), `84` state unreadable (a result file or live record that is malformed or cannot be read, named on stderr; never reported as 83), `2` a malformed id or arguments (rejected before any
 file is read). Use it instead of reading `results/` directly.

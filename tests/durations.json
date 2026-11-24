@@ -116,6 +116,7 @@
 "tests/queue-bypass.test.js": 3,
 "tests/queued-cancel.test.js": 6,
 "tests/queued-lock-timeout.test.js": 5,
+"tests/ran-on.test.js": 12,
 "tests/reap-descendants.test.js": 5,
 "tests/reap.test.js": 1,
 "tests/reconcile-sweep.test.js": 25,
