@@ -64,7 +64,7 @@ export function roleSql({ role, host, password, roleExists, tags, repos, maxClai
   return [
     'BEGIN;',
     roleExists
-      ? `ALTER ROLE ${sqlIdent(role)} PASSWORD ${sqlLit(password)};`
+      ? `ALTER ROLE ${sqlIdent(role)} LOGIN PASSWORD ${sqlLit(password)} CONNECTION LIMIT 3;`
       : `CREATE ROLE ${sqlIdent(role)} LOGIN PASSWORD ${sqlLit(password)} IN ROLE lane_agent CONNECTION LIMIT 3;`,
     `ALTER ROLE ${sqlIdent(role)} SET statement_timeout = '2s';`,
     `ALTER ROLE ${sqlIdent(role)} SET idle_in_transaction_session_timeout = '5s';`,
@@ -74,6 +74,7 @@ export function roleSql({ role, host, password, roleExists, tags, repos, maxClai
   ].join('\n');
 }
 
+export const roleAndPrincipalSql = (role) => `SELECT (SELECT count(*) FROM pg_roles WHERE rolname = ${sqlLit(role)}), (SELECT count(*) FROM lane_dispatch.principals WHERE login_role = ${sqlLit(role)});\n`;
 export const roleExistsSql = (role) => `SELECT count(*) FROM pg_roles WHERE rolname = ${sqlLit(role)};\n`;
 export const heldTicketsSql = (host) => `SELECT id, lane FROM lane_dispatch.tickets WHERE host = ${sqlLit(host)} AND state IN ('claimed','running') ORDER BY created_at;\n`;
 export const reloadSql = () => 'SELECT pg_reload_conf();\n';
@@ -109,13 +110,38 @@ const HBA_TYPES = new Set(['local', 'host', 'hostssl', 'hostnossl', 'hostgssenc'
 export function parseHbaRule(line) {
   const tokens = line.replace(/\s#.*$/, '').trim().split(/\s+/);
   if (tokens[0].startsWith('#') || !HBA_TYPES.has(tokens[0]) || tokens.length < 4) return null;
-  return { users: tokens[2].split(',').map((user) => user.replace(/^"(.*)"$/, '$1')), method: tokens.at(-1) };
+  const list = (field) => field.split(',').map((entry) => entry.replace(/^"(.*)"$/, '$1'));
+  return { type: tokens[0], databases: list(tokens[1]), users: list(tokens[2]), method: tokens.at(-1) };
 }
 
 const rulesAllowing = (lines, role) => lines.filter((line) => {
   const rule = parseHbaRule(line);
   return rule && rule.method !== 'reject' && rule.users.includes(role);
 });
+
+const opaque = (entry) => entry.startsWith('/') || entry.startsWith('@');
+
+const laneRejectAt = (lines, pattern) => lines.findIndex((line) => {
+  const roles = pattern.exec(line)?.[2].split(',');
+  return roles?.some((r) => r.startsWith('lane_agent_'));
+});
+
+// A rule that might admit `role` before the lane-logins reject line of its kind; first match wins, so a broad rule below that line
+// can never be reached by a listed lane login. A rule naming the role itself is refused wherever it is. +groups, /regex and @file
+// entries are refused rather than evaluated.
+const rulesThatMayAdmit = (lines, role) => {
+  const cutoff = { local: laneRejectAt(lines, LOCAL_REJECT), host: laneRejectAt(lines, HOST_REJECT) };
+  return lines.filter((line, i) => {
+    const rule = parseHbaRule(line);
+    if (!rule || rule.method === 'reject') return false;
+    const database = rule.databases.some((name) => [DB_NAME, 'all', 'sameuser', 'samerole'].includes(name) || opaque(name));
+    if (!database) return false;
+    if (rule.users.includes(role)) return true;
+    const broad = rule.users.some((name) => name === 'all' || name.startsWith('+') || opaque(name));
+    const reject = cutoff[rule.type === 'local' ? 'local' : 'host'];
+    return broad && (reject < 0 || i < reject);
+  });
+};
 
 function hbaBlock({ role, host, ip, note }) {
   if (note) validateNote(note);
@@ -157,8 +183,8 @@ export function editHba(text, { role, host, ip, note }, mode) {
     at = begin;
   }
   if (mode === 'add') {
-    const [clash] = rulesAllowing(lines, role);
-    if (clash) throw new Error(`pg_hba.conf already has a rule outside the ${BEGIN_MARK(host)} block that lets ${role} in: "${clash.trim()}"; remove it first`);
+    const [clash] = rulesThatMayAdmit(lines, role);
+    if (clash) throw new Error(`pg_hba.conf already has a rule outside the ${BEGIN_MARK(host)} block that may let ${role} in: "${clash.trim()}"; narrow or remove it first`);
     if (at < 0) at = lines.findIndex((line) => BLOCK_ANCHOR.test(line));
     if (at < 0) throw new Error(`pg_hba.conf has no "local ${DB_NAME} all reject" line to anchor the block before`);
     lines.splice(at, 0, ...hbaBlock({ role, host, ip, note }));
@@ -411,6 +437,10 @@ class Context {
       this.fs.writeFileSync(file, JSON.stringify(template), { mode: 0o600 });
       await this.run('op-bot', ['item', 'create', '--vault', OP_VAULT, '--template', file], { label: 'op-bot item create', quiet: true });
     });
+    const title = opItemTitle(this.opts.host);
+    const same = JSON.parse((await this.run('op-bot', ['item', 'list', '--vault', OP_VAULT, '--format', 'json'], { label: 'op-bot item list' })).stdout).filter((item) => item.title === title);
+    if (same.length !== 1) throw new Error(`${same.length} 1Password items titled "${title}" exist (ids ${same.map((item) => item.id).join(', ')}): another admin run raced this one. Delete the extra by hand, then re-run`);
+    this.secrets = await this.getItem();
     return 'created the item with generated values';
   }
 }
@@ -420,7 +450,7 @@ const SCRIPT_HOOKS = {
   sha: 'sha256sum',
   chown: 'chown',
   hbaErrors: `sudo -n -u postgres psql -At -c "SELECT count(*) FROM pg_hba_file_rules WHERE error IS NOT NULL"`,
-  reload: `sudo -n -u postgres psql -At -c "SELECT pg_reload_conf()"`,
+  reload: `sudo -n -u postgres psql -At -c 'SELECT pg_reload_conf()'`,
   jsonCheck: `python3 -c 'import json,sys; json.load(open(sys.argv[1]))'`,
 };
 
@@ -471,7 +501,10 @@ case "$kind" in
   *) echo "unknown kind $kind" >&2; exit 2 ;;
 esac
 ok=1
-if [ "$kind" = hba ]; then { ${h.reload}; } > /dev/null; fi
+if [ "$kind" = hba ]; then
+  reloaded=$({ ${h.reload}; } 2>/dev/null | tr -d '[:space:]') || reloaded=
+  [ "$reloaded" = t ] || { echo "reload failed: the file is valid but not live; re-run to reload" >&2; exit 7; }
+fi
 if [ "$moved" = 1 ]; then echo "backup=$backup"; else echo "unchanged=$path"; fi
 `;
 }
@@ -523,11 +556,45 @@ const hbaStep = (ctx, mode) => editStep(ctx, { title: `pg_hba.conf: ${mode} the 
 
 const trainStep = (ctx, mode) => editStep(ctx, { title: `train config: ${mode} runner ${ctx.opts.host}`, kind: 'train', load: () => trainEdit(ctx, mode), extra: `note: ${PROVISION_REMINDER}` });
 
+export function acquireHostLock(host, { dir = path.join(os.homedir(), '.cache', 'lane-runner-admin'), fsImpl = fs, pid = process.pid, now = () => new Date() } = {}) {
+  fsImpl.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const file = path.join(dir, `${host}.lock`);
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const fd = fsImpl.openSync(file, 'wx', 0o600);
+      fsImpl.writeSync(fd, JSON.stringify({ pid, start: now().toISOString() }));
+      fsImpl.closeSync(fd);
+      return () => fsImpl.rmSync(file, { force: true });
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      let holder;
+      try { holder = JSON.parse(fsImpl.readFileSync(file, 'utf8')); } catch { throw new Error(`${file} exists but is unreadable; if no other run is active, delete it`); }
+      if (isPidAlive(holder.pid)) throw new Error(`another lane-runner-admin run for ${host} holds ${file} (pid ${holder.pid}, since ${holder.start}); only one admin may run it at a time`);
+      fsImpl.rmSync(file, { force: true });
+    }
+  }
+  throw new Error(`could not take ${file}`);
+}
+
+function isPidAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; }
+}
+
+function recheckRole(ctx, role) {
+  return async () => {
+    const [row] = await ctx.psqlRows(roleAndPrincipalSql(role), 'recheck role and principal');
+    if (row?.join('|') !== '1|1') throw new Error(`the role was removed while this add ran (${role} or its principal row is gone); re-run add`);
+  };
+}
+
+const guarded = (step, precondition) => ({ ...step, async apply() { await precondition(); return step.apply(); } });
+
 function buildAddPlan(ctx) {
   const { host, ip, out } = ctx.opts;
   const role = pgRole(host);
   const principal = { role, host, tags: ctx.opts.tags, repos: ctx.opts.repos, maxClaims: ctx.opts.maxClaims };
   ctx.hbaEntry = { role, host, ip, note: ctx.opts.note };
+  const stillThere = recheckRole(ctx, role);
   const roleExists = async () => Number((await ctx.psql(roleExistsSql(role), { query: true, label: 'check role' })).stdout.trim()) > 0;
   const steps = [
     {
@@ -545,8 +612,8 @@ function buildAddPlan(ctx) {
         return `role ${role} and its principal row are in place`;
       },
     },
-    hbaStep(ctx, 'add'),
-    {
+    guarded(hbaStep(ctx, 'add'), stillThere),
+    guarded({
       title: `rustfs: user and policy ${rustfsName(host)} (mc on this machine, root credentials only in the child's environment)`,
       kind: 'rustfs',
       preview: async () => [`mc admin user add ${MC_ALIAS} <access key> ${REDACTED}`, `mc admin policy create ${MC_ALIAS} ${rustfsName(host)} <policy file>`, `mc admin policy attach ${MC_ALIAS} ${rustfsName(host)} --user <access key>`, rustfsPolicy(host).trimEnd()].join('\n'),
@@ -562,8 +629,8 @@ function buildAddPlan(ctx) {
         await ctx.mc(['admin', 'policy', 'attach', MC_ALIAS, rustfsName(host), '--user', accessKey], { allow: /already/i });
         return `user and policy ${rustfsName(host)} are in place`;
       },
-    },
-    trainStep(ctx, 'add'),
+    }, stillThere),
+    guarded(trainStep(ctx, 'add'), stillThere),
   ];
   if (out) steps.push(workerFilesStep(ctx, out));
   return steps;
@@ -739,19 +806,25 @@ export function parseCli(argv) {
   return { ...opts, ip: values.ip, tags, repos, maxClaims, out: values.out ? path.resolve(values.out) : null, note: values.note ?? '' };
 }
 
-export async function runCli(argv, { exec, out = (text) => process.stdout.write(`${text}\n`), err = (text) => process.stderr.write(`${text}\n`), ...injected }) {
+export async function runCli(argv, { exec, out = (text) => process.stdout.write(`${text}\n`), err = (text) => process.stderr.write(`${text}\n`), lockDir, scriptPath = process.argv[1], cwd = process.cwd(), ...injected }) {
   let opts;
   try { opts = parseCli(argv); } catch (e) { err(e.message); return 2; }
   const ctx = new Context({ exec, opts, ...injected });
+  let release = () => {};
   try {
     if (opts.command === 'status') { await statusReport(ctx, out); return 0; }
+    if (opts.apply) release = acquireHostLock(opts.host, { dir: lockDir, fsImpl: ctx.fs });
     const steps = opts.command === 'add' ? buildAddPlan(ctx) : buildRemovePlan(ctx);
-    const resume = ['lane-runner-admin', ...argv.filter((arg) => arg !== '--apply'), '--apply'].map(shellQuote).join(' ');
+    const relative = path.relative(cwd, path.resolve(cwd, scriptPath));
+    const script = relative.startsWith('..') || path.isAbsolute(relative) ? path.resolve(cwd, scriptPath) : relative;
+    const resume = ['node', script, ...argv.filter((arg) => arg !== '--apply'), '--apply'].map(shellQuote).join(' ');
     out(`${opts.command} ${opts.host}: ${opts.apply ? 'APPLY' : 'dry run'}`);
     const { ok } = await runPlan(steps, { apply: opts.apply, out: (text) => out(ctx.scrub(text)), resume });
     return ok ? 0 : 1;
   } catch (e) {
     err(ctx.scrub(e.message));
     return 1;
+  } finally {
+    release();
   }
 }

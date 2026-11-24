@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -11,6 +12,7 @@ import { makeTmpDir } from './helpers/tmp.js';
 const LIB_FILE = fileURLToPath(new URL('../ops/runner/runner-admin-lib.js', import.meta.url));
 const HBA_PATH = '/etc/postgresql/17/main/pg_hba.conf';
 const HBA = `# header
+local   all  postgres  peer
 host    all  postgres  127.0.0.1/32  scram-sha-256
 # lane-agent-mac-grandy: from its own source address only, never through the svc:pg-primary forward
 hostssl lane_queue_db  lane_agent_mac_grandy  100.80.159.90/32  scram-sha-256
@@ -122,7 +124,7 @@ test('SQL builders quote identifiers and literals, and a dry run shows the passw
   assert.match(create, /COMMIT;\n$/);
   assert.match(create, /ld_set_principal\('lane_agent_evo_x2', 'agent', 'evo-x2', ARRAY\['linux','it''s'\]::text\[\], ARRAY\['\*'\]::text\[\], 14\);/);
   const redacted = lib.roleSql({ ...base, tags: [], password: lib.REDACTED, roleExists: true });
-  assert.match(redacted, /^BEGIN;\nALTER ROLE "lane_agent_evo_x2" PASSWORD '<redacted>';/);
+  assert.match(redacted, /^BEGIN;\nALTER ROLE "lane_agent_evo_x2" LOGIN PASSWORD '<redacted>' CONNECTION LIMIT 3;/);
   assert.match(redacted, /ARRAY\[\]::text\[\]/);
   const tx = lib.removeTxSql({ role: 'lane_agent_evo_x2', host: 'evo-x2', force: false });
   const order = ['BEGIN;', "FROM lane_dispatch.principals WHERE login_role = 'lane_agent_evo_x2' FOR UPDATE;", "RAISE EXCEPTION 'held tickets: %'", 'NOLOGIN', "DELETE FROM lane_dispatch.principals WHERE login_role = 'lane_agent_evo_x2';", "DELETE FROM lane_dispatch.runners WHERE host = 'evo-x2';", 'COMMIT;'];
@@ -163,7 +165,7 @@ test('the hand-written-rule guard reads tokens: host, hostnossl, indentation and
     'local all "lane_agent_evo_x2" peer',
     'hostssl lane_queue_db lane_agent_evo_x2 100.1.1.1/32 scram-sha-256 # why',
   ];
-  for (const rule of rules) assert.throws(() => add(rule), /already has a rule outside .* lets lane_agent_evo_x2 in/, rule);
+  for (const rule of rules) assert.throws(() => add(rule), /already has a rule outside .* may let lane_agent_evo_x2 in/, rule);
   assert.doesNotThrow(() => add('host all lane_agent_evo_x2 all reject'));
   assert.doesNotThrow(() => add('# host lane_queue_db lane_agent_evo_x2 100.64.0.0/10 scram-sha-256'));
   const hand = 'host lane_queue_db lane_agent_evo_x2 100.64.0.0/10 scram-sha-256';
@@ -190,6 +192,16 @@ test("editHba adds the role only to the lane-logins reject lines, never to other
   assert.equal(lib.editHba(added, ENTRY, 'remove'), HBA);
 });
 
+test('a broad rule below the lane-logins reject line is unreachable and allowed; the same rule above it is refused', () => {
+  const entry = { role: 'lane_agent_evo_x2', host: 'evo-x2', ip: '100.82.26.77' };
+  const below = `${HBA}hostssl all  all  100.64.0.0/10  scram-sha-256\nlocal   all  all  peer\n`;
+  assert.doesNotThrow(() => lib.editHba(below, entry, 'add'));
+  const above = HBA.replace('local   lane_queue_db  all  reject\n', 'hostssl all  all  100.64.0.0/10  scram-sha-256\nlocal   lane_queue_db  all  reject\n');
+  assert.throws(() => lib.editHba(above, entry, 'add'), /may let lane_agent_evo_x2 in: "hostssl all  all  100.64.0.0\/10/);
+  const literalBelow = `${HBA}host lane_queue_db lane_agent_evo_x2 100.64.0.0/10 scram-sha-256\n`;
+  assert.throws(() => lib.editHba(literalBelow, entry, 'add'), /may let lane_agent_evo_x2 in/);
+});
+
 test('shellQuote survives the remote shell: a psql field separator stays one word, not a pipe', () => {
   const words = ['psql', '-F', '|', "it's", 'a b', '-tAq'];
   assert.deepEqual(lib.shellSplit(words.map(lib.shellQuote).join(' ')), words);
@@ -202,7 +214,7 @@ const TRAIN_STAT = 'train:train 644';
 function fakeWorld({ hba = HBA, train = TRAIN, held = [], hbaErrors = 0, item = null, roleExists = false } = {}) {
   const world = {
     calls: [], hba, train, held, heldInTx: [], hbaErrors, item, roleExists, templates: [], mcEnvs: [], policyFile: null,
-    fail: {}, scripts: [], reloads: 0, backup: null, principalDeleted: false, beforeScript: null,
+    fail: {}, scripts: [], reloads: 0, principalExists: false, roleLogin: true, afterRole: null, extraItems: [], backup: null, principalDeleted: false, beforeScript: null,
   };
   const ok = (stdout = '') => ({ code: 0, stdout, stderr: '' });
   const bad = (stderr, code = 1) => ({ code, stdout: '', stderr });
@@ -224,6 +236,7 @@ function fakeWorld({ hba = HBA, train = TRAIN, held = [], hbaErrors = 0, item = 
       return bad(world.fail.hba === 'throw' ? 'psql: connection to server failed' : `pg_hba_file_rules reports '${world.hbaErrors}' rule errors\nrestored ${file}.bak-lane-runner-admin-FAKE`, 6);
     }
     if (key === 'train' && world.fail.train === 'validate') { world[key] = before; return bad('not valid JSON\nrestored', 6); }
+    if (key === 'hba' && world.fail.reload) return bad('reload failed: the file is valid but not live; re-run to reload', 7);
     if (key === 'hba') world.reloads += 1;
     return ok(changed ? `backup=${file}.bak-lane-runner-admin-FAKE\n` : `unchanged=${file}\n`);
   }
@@ -237,6 +250,7 @@ function fakeWorld({ hba = HBA, train = TRAIN, held = [], hbaErrors = 0, item = 
       if (!world.item) return bad('"lane-agent evo-x2" isn\'t an item in vault BotAccess');
       return ok(JSON.stringify({ fields: world.item.fields }));
     }
+    if (cmd === 'op-bot' && args[1] === 'list') return ok(JSON.stringify([...(world.item ? [{ id: 'item-1', title: 'lane-agent evo-x2' }] : []), ...world.extraItems]));
     if (cmd === 'op-bot' && args[1] === 'create') {
       const template = JSON.parse(fs.readFileSync(args[args.indexOf('--template') + 1], 'utf8'));
       world.templates.push(template);
@@ -261,14 +275,19 @@ function fakeWorld({ hba = HBA, train = TRAIN, held = [], hbaErrors = 0, item = 
       if (input.includes('NOLOGIN')) {
         if (input.includes("RAISE EXCEPTION 'held tickets") && world.heldInTx.length) return bad(`ERROR:  held tickets: ${world.heldInTx.map(([id, lane]) => `${id} (${lane})`).join(', ')}\nCONTEXT:  PL/pgSQL function inline_code_block`);
         world.principalDeleted = true;
+        world.principalExists = false;
         return ok();
       }
       if (input.includes('DROP ROLE')) { world.roleExists = false; return ok(); }
       if (input.includes('CREATE ROLE') || input.includes('ALTER ROLE')) {
         if (world.fail.psql) return bad(world.fail.psql, 3);
         world.roleExists = true;
+        world.principalExists = true;
+        world.roleLogin = /\bLOGIN\b/.test(input);
+        world.afterRole?.();
         return ok();
       }
+      if (input.includes('login_role') && input.includes('count(*) FROM pg_roles')) return ok(`${world.roleExists ? 1 : 0}|${world.principalExists ? 1 : 0}\n`);
       if (input.includes('FROM pg_roles')) return ok(world.roleExists ? '1\n' : '0\n');
       if (input.includes('lane_dispatch.tickets')) return ok(world.held.map((t) => t.join('|')).join('\n'));
       return ok();
@@ -278,10 +297,13 @@ function fakeWorld({ hba = HBA, train = TRAIN, held = [], hbaErrors = 0, item = 
   return world;
 }
 
-async function cli(world, argv, mod = lib) {
+const REPO = fileURLToPath(new URL('..', import.meta.url));
+const SCRIPT = path.join(REPO, 'ops/runner/lane-runner-admin.js');
+
+async function cli(world, argv, mod = lib, extra = {}) {
   const lines = [];
   const errs = [];
-  const code = await mod.runCli(argv, { exec: world.exec, out: (t) => lines.push(t), err: (t) => errs.push(t) });
+  const code = await mod.runCli(argv, { exec: world.exec, out: (t) => lines.push(t), err: (t) => errs.push(t), lockDir: makeTmpDir('runner-admin-lock-'), scriptPath: SCRIPT, cwd: REPO, ...extra });
   return { code, text: lines.join('\n'), errs: errs.join('\n') };
 }
 
@@ -326,7 +348,7 @@ test('apply runs the steps in order, keeps every secret out of argv and output, 
     if (isEditCall(c)) return `edit ${c.args.at(-1)}`;
     return c.input?.includes('CREATE ROLE') ? 'create role' : null;
   }).filter(Boolean);
-  assert.deepEqual(order, ['op-bot get', 'op-bot create', 'create role', 'edit hba', 'mc admin user add', 'mc admin policy create', 'mc admin policy attach', 'edit json']);
+  assert.deepEqual(order, ['op-bot get', 'op-bot create', 'op-bot list', 'op-bot get', 'create role', 'edit hba', 'mc admin user add', 'mc admin policy create', 'mc admin policy attach', 'edit json']);
 
   const password = passwordOf(world);
   const secretKey = secretKeyOf(world);
@@ -384,7 +406,7 @@ test('re-running add converges: the item is reused, the role is altered, and the
   const { code } = await cli(world, [...ADD, '--apply']);
   assert.equal(code, 0);
   assert.equal(world.templates.length, 1);
-  assert.match(world.calls.find((c) => c.input?.includes('ALTER ROLE')).input, new RegExp(`^BEGIN;\\nALTER ROLE "lane_agent_evo_x2" PASSWORD '${password}';`));
+  assert.match(world.calls.find((c) => c.input?.includes('ALTER ROLE')).input, new RegExp(`^BEGIN;\\nALTER ROLE "lane_agent_evo_x2" LOGIN PASSWORD '${password}' CONNECTION LIMIT 3;`));
   assert.deepEqual(world.scripts.map((s) => s.kind), ['hba']);
   assert.equal(world.reloads, 2);
   assert.equal(world.hba.split('BEGIN lane-runner-admin evo-x2').length, 2);
@@ -438,13 +460,14 @@ test('the resume command keeps shell quoting for every argument', async () => {
   const world = fakeWorld();
   world.fail.psql = 'x';
   const { text } = await cli(world, ['add', 'evo-x2', '--ip', '100.82.26.77', '--repos', '*', '--out', '/tmp/a b/$(x)', '--note', 'two words', '--apply']);
-  assert.match(text, /resume \(every step converges\): lane-runner-admin add evo-x2 --ip 100\.82\.26\.77 --repos '\*' --out '\/tmp\/a b\/\$\(x\)' --note 'two words' --apply\n?$/);
+  assert.match(text, /resume \(every step converges\): node ops\/runner\/lane-runner-admin\.js add evo-x2 --ip 100\.82\.26\.77 --repos '\*' --out '\/tmp\/a b\/\$\(x\)' --note 'two words' --apply\n?$/);
 });
 
 const FAILURES = [
   { name: 'a write failure on pg_hba.conf', set: (w) => { w.fail.hba = 'write'; }, clear: (w) => { w.fail.hba = null; }, stoppedBefore: 'mc', hbaChanged: false, message: /pg_hba\.conf edit failed \(exit 1\): mv: cannot move/ },
   { name: 'a validation that throws on pg_hba.conf', set: (w) => { w.fail.hba = 'throw'; }, clear: (w) => { w.fail.hba = null; }, stoppedBefore: 'mc', hbaChanged: false, message: /pg_hba\.conf edit failed \(exit 6\): psql: connection/ },
   { name: 'a validation that rejects pg_hba.conf', set: (w) => { w.hbaErrors = 2; }, clear: (w) => { w.hbaErrors = 0; }, stoppedBefore: 'mc', hbaChanged: false, message: /rule errors/ },
+  { name: 'a reload that postgres does not confirm', set: (w) => { w.fail.reload = true; }, clear: (w) => { w.fail.reload = false; }, stoppedBefore: 'mc', hbaChanged: true, message: /reload failed: the file is valid but not live/ },
   { name: 'a mc failure', set: (w) => { w.fail.mc = 'admin user add'; }, clear: (w) => { w.fail.mc = null; }, stoppedBefore: 'train', hbaChanged: true, message: /mc admin user add failed/ },
   { name: 'a write failure on the train config', set: (w) => { w.fail.train = 'write'; }, clear: (w) => { w.fail.train = null; }, stoppedBefore: null, hbaChanged: true, message: /train config edit failed/ },
   { name: 'a train config that does not parse after the write', set: (w) => { w.fail.train = 'validate'; }, clear: (w) => { w.fail.train = null; }, stoppedBefore: null, hbaChanged: true, message: /not valid JSON/ },
@@ -457,7 +480,7 @@ for (const failure of FAILURES) {
     const first = await cli(world, [...ADD, '--apply']);
     assert.equal(first.code, 1, first.text);
     assert.match(first.text, failure.message);
-    assert.match(first.text, /resume \(every step converges\): lane-runner-admin add evo-x2 .* --apply/);
+    assert.match(first.text, /resume \(every step converges\): node ops\/runner\/lane-runner-admin\.js add evo-x2 .* --apply/);
     assert.ok(world.item && world.roleExists, 'the earlier secret and role steps stand');
     assert.equal(world.hba === HBA, !failure.hbaChanged, 'hba is either untouched or fully changed, never half');
     assert.equal(world.train, TRAIN);
@@ -484,13 +507,13 @@ test('a file that changed between the read and the write is refused with nothing
   assert.equal(mcOps(world).length, 0);
 });
 
-async function runScript({ current, content, expect = sha256(current), kind = 'hba', hbaErrors = 0, jsonCheck }) {
+async function runScript({ current, content, expect = sha256(current), kind = 'hba', hbaErrors = 0, jsonCheck, reloadOutput = 't' }) {
   const dir = makeTmpDir('runner-admin-script-');
   const target = path.join(dir, kind === 'hba' ? 'pg_hba.conf' : 'config.json');
   fs.writeFileSync(target, current, { mode: 0o600 });
   const log = path.join(dir, 'reload.log');
   const script = lib.buildEditScript({ content, hooks: {
-    sha: 'shasum -a 256', chown: 'true', hbaErrors: `echo ${hbaErrors}`, reload: `echo reloaded >> '${log}'`,
+    sha: 'shasum -a 256', chown: 'true', hbaErrors: `echo ${hbaErrors}`, reload: `echo reloaded >> '${log}'; echo ${reloadOutput}`,
     ...(jsonCheck ? { jsonCheck } : { jsonCheck: `'${process.execPath}' -e 'JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"))'` }),
   } });
   const result = await lib.spawnExec('bash', ['-s', '--', target, expect, 'whoever:whatever', '640', kind], { input: script });
@@ -511,7 +534,7 @@ async function validationFailureScenario(mod = lib) {
   const dir = makeTmpDir('runner-admin-script-');
   const target = path.join(dir, 'pg_hba.conf');
   fs.writeFileSync(target, HBA);
-  const text = script({ content: NEW_HBA, hooks: { sha: 'shasum -a 256', chown: 'true', hbaErrors: 'echo 2', reload: `echo reloaded >> '${dir}/reload.log'` } });
+  const text = script({ content: NEW_HBA, hooks: { sha: 'shasum -a 256', chown: 'true', hbaErrors: 'echo 2', reload: `echo reloaded >> '${dir}/reload.log'; echo t` } });
   const result = await lib.spawnExec('bash', ['-s', '--', target, sha256(HBA), 'a:b', '640', 'hba'], { input: text });
   assert.notEqual(result.code, 0, 'a rejected pg_hba must fail the script');
   assert.equal(fs.readFileSync(target, 'utf8'), HBA, 'the live file is restored from the backup');
@@ -524,7 +547,7 @@ async function changedSinceReadScenario(mod = lib) {
   const dir = makeTmpDir('runner-admin-script-');
   const target = path.join(dir, 'pg_hba.conf');
   fs.writeFileSync(target, `${HBA}# edited meanwhile\n`);
-  const text = mod.buildEditScript({ content: NEW_HBA, hooks: { sha: 'shasum -a 256', chown: 'true', hbaErrors: 'echo 0', reload: 'true' } });
+  const text = mod.buildEditScript({ content: NEW_HBA, hooks: { sha: 'shasum -a 256', chown: 'true', hbaErrors: 'echo 0', reload: 'echo t' } });
   const result = await lib.spawnExec('bash', ['-s', '--', target, sha256(HBA), 'a:b', '640', 'hba'], { input: text });
   assert.equal(result.code, 3, 'a file that changed since it was read must stop the script');
   assert.equal(fs.readFileSync(target, 'utf8'), `${HBA}# edited meanwhile\n`, 'nothing is written over the concurrent edit');
@@ -667,6 +690,163 @@ test('bad arguments exit 2 with a message and touch nothing', async () => {
     assert.ok(errs.length > 0);
   }
   assert.equal(world.calls.length, 0);
+});
+
+test('the guard refuses broad earlier rules: +group, all, /regex and @file in the user or database field', () => {
+  const add = (rule) => lib.editHba(HBA.replace('local   lane_queue_db  all  reject', `${rule}\nlocal   lane_queue_db  all  reject`), ENTRY, 'add');
+  const refused = [
+    'hostssl lane_queue_db +lane_agent 100.64.0.0/10 scram-sha-256',
+    'host lane_queue_db +some_group 100.64.0.0/10 scram-sha-256',
+    'host lane_queue_db all 100.64.0.0/10 scram-sha-256',
+    'host all all 127.0.0.1/32 scram-sha-256',
+    'host samerole /^lane_ 10.0.0.0/8 md5',
+    'host lane_queue_db /^lane_ 10.0.0.0/8 md5',
+    'host lane_queue_db @users.txt 10.0.0.0/8 md5',
+    'host @dbs.txt lane_agent_evo_x2 10.0.0.0/8 md5',
+    'local sameuser all peer',
+    'host a,lane_queue_db,b x,"lane_agent_evo_x2" 10.0.0.0/8 md5',
+  ];
+  for (const rule of refused) assert.throws(() => add(rule), /already has a rule outside .* may let lane_agent_evo_x2 in: /, rule);
+  assert.throws(() => add(refused[0]), new RegExp(refused[0].replaceAll('+', '\\+').replaceAll('/', '\\/')));
+  const passes = [
+    'host all postgres 127.0.0.1/32 scram-sha-256',
+    'local all postgres peer',
+    'host otherdb all 10.0.0.0/8 md5',
+    'host replication all 10.0.0.0/8 md5',
+    'host lane_queue_db lane_submit_other 10.0.0.1/32 scram-sha-256',
+    'host all all 10.0.0.0/8 reject',
+  ];
+  for (const rule of passes) assert.doesNotThrow(() => add(rule), rule);
+  assert.doesNotThrow(() => lib.editHba(HBA, ENTRY, 'add'), 'the live-like layout is accepted');
+  assert.match(HBA, /^host {4}all {2}postgres {2}127\.0\.0\.1\/32 {2}scram-sha-256$/m);
+});
+
+test('the per-host lock: a live holder refuses the run, a dead one is reclaimed, and the lock is released afterwards', async () => {
+  const dir = makeTmpDir('runner-admin-lock-');
+  const file = path.join(dir, 'evo-x2.lock');
+  const release = lib.acquireHostLock('evo-x2', { dir, now: NOW });
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { pid: process.pid, start: '2026-11-24T10:11:12.345Z' });
+  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
+  assert.throws(() => lib.acquireHostLock('evo-x2', { dir }), /another lane-runner-admin run for evo-x2 holds .*pid \d+/);
+  assert.doesNotThrow(() => lib.acquireHostLock('other-host', { dir })());
+  release();
+  assert.ok(!fs.existsSync(file));
+
+  const dead = spawnSync(process.execPath, ['-e', '']).pid;
+  fs.writeFileSync(file, JSON.stringify({ pid: dead, start: 'long ago' }));
+  lib.acquireHostLock('evo-x2', { dir })();
+  fs.writeFileSync(file, 'half');
+  assert.throws(() => lib.acquireHostLock('evo-x2', { dir }), /unreadable/);
+  fs.rmSync(file);
+
+  const world = fakeWorld();
+  const held = lib.acquireHostLock('evo-x2', { dir });
+  const refused = await cli(world, [...ADD, '--apply'], lib, { lockDir: dir });
+  assert.equal(refused.code, 1);
+  assert.match(refused.errs, /only one admin may run it at a time/);
+  assert.equal(world.calls.length, 0);
+  assert.equal((await cli(world, ADD, lib, { lockDir: dir })).code, 0, 'a dry run takes no lock');
+  held();
+  assert.equal((await cli(world, [...ADD, '--apply'], lib, { lockDir: dir })).code, 0);
+  assert.deepEqual(fs.readdirSync(dir), [], 'released after success');
+  world.fail.psql = 'x';
+  world.roleExists = true;
+  assert.equal((await cli(world, [...ADD, '--apply'], lib, { lockDir: dir })).code, 1);
+  assert.deepEqual(fs.readdirSync(dir), [], 'released after failure');
+});
+
+async function roleRemovedScenario(mod = lib) {
+  const world = fakeWorld();
+  world.afterRole = () => { world.roleExists = false; world.principalExists = false; };
+  const { code, text } = await cli(world, [...ADD, '--apply'], mod);
+  assert.equal(code, 1, 'an add whose role vanished must stop');
+  assert.match(text, /the role was removed while this add ran/);
+  assert.equal(world.scripts.length, 0, 'no file was edited');
+  assert.equal(mcOps(world).length, 0, 'no rustfs user was created');
+  assert.equal(world.hba, HBA);
+}
+
+test('add re-checks the role and principal before the hba, rustfs and train steps', () => roleRemovedScenario());
+
+test('canary: with the per-step role re-check removed, the role-removed scenario fails', async () => {
+  const mutant = await importMutant(LIB_FILE, ["if (row?.join('|') !== '1|1') throw", 'if (false) throw']);
+  await assert.rejects(roleRemovedScenario(mutant), (err) => err.code === 'ERR_ASSERTION');
+});
+
+test('add stops before the rustfs and train steps when the role disappears after the hba step', async () => {
+  const world = fakeWorld();
+  const inner = world.exec;
+  world.exec = async (cmd, args, opts) => {
+    const result = await inner(cmd, args, opts);
+    if (args[1]?.includes(' flock ') && args[1].endsWith(' hba')) { world.roleExists = false; world.principalExists = false; }
+    return result;
+  };
+  const { code, text } = await cli(world, [...ADD, '--apply']);
+  assert.equal(code, 1);
+  assert.match(text, /the role was removed while this add ran/);
+  assert.equal(mcOps(world).length, 0);
+  assert.deepEqual(world.scripts.map((script) => script.kind), ['hba']);
+});
+
+test('1Password create is re-read, and two items with the title fail loudly naming both', async () => {
+  const world = fakeWorld();
+  world.extraItems = [{ id: 'item-2', title: 'lane-agent evo-x2' }];
+  const { code, text } = await cli(world, [...ADD, '--apply']);
+  assert.equal(code, 1);
+  assert.match(text, /2 1Password items titled "lane-agent evo-x2" exist \(ids item-1, item-2\): another admin run raced this one/);
+  assert.ok(!world.calls.some((c) => c.input?.includes('CREATE ROLE')), 'nothing after the secrets step ran');
+  const fine = fakeWorld();
+  assert.equal((await cli(fine, [...ADD, '--apply'])).code, 0);
+  assert.deepEqual(fine.calls.filter((c) => c.cmd === 'op-bot').map((c) => c.args[1]), ['get', 'create', 'list', 'get']);
+});
+
+async function reloadUnconfirmedScenario(mod = lib) {
+  const dir = makeTmpDir('runner-admin-script-');
+  const target = path.join(dir, 'pg_hba.conf');
+  fs.writeFileSync(target, HBA);
+  const script = (output) => mod.buildEditScript({ content: NEW_HBA, hooks: { sha: 'shasum -a 256', chown: 'true', hbaErrors: 'echo 0', reload: `echo ${output}` } });
+  const run = (sha, output) => lib.spawnExec('bash', ['-s', '--', target, sha, 'a:b', '640', 'hba'], { input: script(output) });
+  const failed = await run(sha256(HBA), 'f');
+  assert.notEqual(failed.code, 0, 'a reload that answers f must not report success');
+  assert.doesNotMatch(failed.stdout, /backup=|unchanged=/);
+  assert.match(failed.stderr, /reload failed: the file is valid but not live; re-run to reload/);
+  assert.equal(fs.readFileSync(target, 'utf8'), NEW_HBA, 'the validated file is kept');
+  const empty = await run(sha256(NEW_HBA), '');
+  assert.notEqual(empty.code, 0, 'an empty reload answer is not a confirmation');
+  const converged = await run(sha256(NEW_HBA), 't');
+  assert.equal(converged.code, 0, converged.stderr);
+  assert.match(converged.stdout, /^unchanged=/);
+}
+
+test('the edit script on a real shell: an unconfirmed reload keeps the valid file, fails, and a re-run converges', () => reloadUnconfirmedScenario());
+
+test('canary: with the reload confirmation removed, the unconfirmed-reload scenario fails', async () => {
+  const mutant = await importMutant(LIB_FILE, ['[ "$reloaded" = t ]', 'true']);
+  await assert.rejects(reloadUnconfirmedScenario(mutant), (err) => err.code === 'ERR_ASSERTION');
+});
+
+test('re-adding a half-removed runner undoes its NOLOGIN: an existing role is altered with LOGIN, the limit and both timeouts', async () => {
+  const world = fakeWorld({ roleExists: true, item: itemWith('pw-value-1') });
+  world.roleLogin = false;
+  const { code } = await cli(world, [...ADD, '--apply']);
+  assert.equal(code, 0);
+  assert.equal(world.roleLogin, true);
+  const sql = world.calls.find((c) => c.input?.includes('ALTER ROLE')).input;
+  assert.match(sql, /ALTER ROLE "lane_agent_evo_x2" LOGIN PASSWORD 'pw-value-1' CONNECTION LIMIT 3;/);
+  assert.match(sql, /SET statement_timeout = '2s';/);
+  assert.match(sql, /SET idle_in_transaction_session_timeout = '5s';/);
+});
+
+test('the resume command names the script as invoked: relative from the repo, absolute from elsewhere', async () => {
+  const resumeFrom = async (extra) => {
+    const world = fakeWorld();
+    world.fail.psql = 'x';
+    return (await cli(world, [...ADD, '--apply'], lib, extra)).text;
+  };
+  assert.match(await resumeFrom({}), /resume \(every step converges\): node ops\/runner\/lane-runner-admin\.js add evo-x2 --ip 100\.82\.26\.77 --max-claims 14 --apply/);
+  assert.match(await resumeFrom({ scriptPath: 'ops/runner/lane-runner-admin.js' }), /: node ops\/runner\/lane-runner-admin\.js add/);
+  assert.match(await resumeFrom({ cwd: makeTmpDir('runner-admin-cwd-') }), new RegExp(`: node ${SCRIPT.replaceAll('/', '\\/')} add`));
+  assert.match(await resumeFrom({ cwd: path.join(REPO, 'ops') }), /: node runner\/lane-runner-admin\.js add/);
 });
 
 test('spawnExec runs without a shell, feeds stdin and merges env', async () => {
