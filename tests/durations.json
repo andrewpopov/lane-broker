@@ -50,6 +50,7 @@
 "tests/gate-integration.test.js": 4,
 "tests/gc.test.js": 17,
 "tests/git-env-isolation.test.js": 1,
+"tests/grant-concurrency.test.js": 7,
 "tests/grant-env.test.js": 1,
 "tests/head-block-grace.test.js": 1,
 "tests/held-by-key-placement.test.js": 1,

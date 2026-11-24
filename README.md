@@ -1583,11 +1583,31 @@ work-stealing restricted to tasks that have not started; a started task is never
 |---|---|
 | `LANE_BROKER_EXECUTOR` | `remote` when the command (and `remoteDeps` / `remoteSetup`) runs on a runner; `local` otherwise. |
 | `LANE_BROKER_RUNNER` | On a runner: the runner's name as the submitter's `runners[]` config names it, carried in the dispatch header (`runnerName`). Never set for a local run; absent when the submitter is older than 0.45.0, in which case only `LANE_BROKER_EXECUTOR` is exported. |
+| `LANE_BROKER_CPU_CORES` | The CPU grant the command was spawned with, local, push or pull alike: the declared `cpuCores`, an elastic or pull claim's smaller grant, or the `maxExecutionCpuCores` ceiling, whichever applies. Unset when the lane declares no CPU. Size worker pools from it (below). |
+| `LANE_BROKER_MEMORY_BYTES` | The lane's memory claim in bytes: its `memoryBytes`, else `defaultMemoryBytesPerWeight` times its weight. |
 | `LANE_BROKER_RUNNER_SPEED_FACTOR` | On a runner: that runner's `speedFactor` from the submitter's `runners[]` config (carried as `runnerSpeedFactor`, a number in (0, 4]), so a repo can scale test time budgets on slow runners. Never set for a local run; absent when the runner has no `speedFactor` or the submitter is older than this feature. |
 | `TMPDIR`, `TMP`, `TEMP` (BRAIN-937) | A per-lease `lb-*` directory (mode 0700) under `/var/tmp` (`LANE_BROKER_TMP_BASE` overrides it, for tests), as a runner already provides. It is renamed away and removed in a detached `rm` before the result is published, so a suite that skips its own cleanup cannot fill the shared temp volume, and a file the command left there is gone once `lane run` returns. Tool caches kept under `os.tmpdir()` go cold on every run, as they already do on runners. A nested `lane run` inherits its parent's directory, which outlives the nested run. If the directory cannot be created the run proceeds with the inherited `TMPDIR` and a line in the admission log. |
 
-Both are set by the broker, so a value exported in the caller's shell is replaced. `LANE_BROKER_LOCAL_REASON` is unchanged. The two
-variables reach the `remoteDeps` install and so are part of its deps-cache key.
+All of these are set by the broker, so a value exported in the caller's shell is replaced. `LANE_BROKER_LOCAL_REASON` is unchanged.
+`LANE_BROKER_EXECUTOR`, `LANE_BROKER_RUNNER` and `LANE_BROKER_RUNNER_SPEED_FACTOR` reach the `remoteDeps` install and so are part of its deps-cache key.
+
+**Sizing a test runner to the grant (PKG-403).** Nothing stops a command from using more cores than it claimed: macOS has
+no cgroups, and `cpuLimit` is off by default. A test runner sizes its pool from the host's core count, so a 1-core lane
+runs several files at once beside whatever else the host is doing, and a fixed time budget fails under it. Read the grant
+instead, keeping the runner's own default when the variable is unset (outside a lane):
+
+```sh
+# node --test (this repo's scripts/test-run.sh, which test-shard.sh and the train gate run through, also caps it at 4)
+node --test --test-concurrency="${LANE_BROKER_CPU_CORES:-2}" ...
+# vitest / jest
+vitest run --maxWorkers="${LANE_BROKER_CPU_CORES:-50%}"
+jest --maxWorkers="${LANE_BROKER_CPU_CORES:-50%}"
+# playwright
+playwright test --workers="${LANE_BROKER_CPU_CORES:-50%}"
+```
+
+A fractional grant (an elastic `1.5`) needs rounding down to a whole worker count, at least 1, before a runner that
+takes only integers sees it. Declare the lane's `cpuCores` as what its runner really uses at that count.
 
 ### Keeping client credentials from a local command (TPWR-674)
 
