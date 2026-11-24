@@ -14,6 +14,7 @@ import { lostResult } from './remote-reconcile.js';
 import { makeReader } from './remote-stream.js';
 import { sha256AndSize } from './s3-client.js';
 import { sha256Hex } from './s3-presign.js';
+import { relayedRanOn } from './ran-on.js';
 import { atomicWriteJson, ensureDurableDir, fsyncDirectory, fsyncFile, isCancelled, LockTimeoutError, readJsonSafe } from './state.js';
 import { CappedLogWriter, LOG_CAP_BYTES, publishAttemptTerminal } from './supervisor.js';
 
@@ -312,9 +313,11 @@ const defaultFinishedResult = (run, entry, attempt, extra) => ({
   ...(entry.decision.phase ? { phase: entry.decision.phase } : {}), ...extra,
 });
 
+export const pullCancelledResult = (id, startedAt, runnerResult) => ({ ...remoteCancelledResult(id, startedAt), transport: 'pull', ...relayedRanOn(runnerResult) });
+
 function resultFor(run, attempt, entry, extra) {
   const { decision } = entry;
-  if (decision.kind === 'cancelled') return { ...remoteCancelledResult(run.id, attempt.startedAt), transport: 'pull', remoteCancelConfirmed: true, ...extra };
+  if (decision.kind === 'cancelled') return { ...pullCancelledResult(run.id, attempt.startedAt, entry.result), remoteCancelConfirmed: true, ...extra };
   if (decision.kind === 'lost') return { ...lostResult(run.id, attempt, decision.reason, decision.detail ?? decision.reason), exit: decision.exit, transport: 'pull' };
   return (run.buildFinishedResult ?? ((...args) => defaultFinishedResult(run, ...args)))(entry, attempt, extra);
 }
@@ -323,7 +326,7 @@ async function publish(run, attempt, entry, extra) {
   const { published, finalResult } = await publishAttemptTerminal(run.root, run.id, run.generation, {
     drain: async () => {},
     buildConfirmedResult: () => resultFor(run, attempt, entry, extra),
-    buildCancelledResult: () => ({ ...remoteCancelledResult(run.id, attempt.startedAt), transport: 'pull' }),
+    buildCancelledResult: () => pullCancelledResult(run.id, attempt.startedAt, entry.result),
     writeResult: resultWriterOf(run),
     durable: true,
     cancelPrecedence: 'decision',
