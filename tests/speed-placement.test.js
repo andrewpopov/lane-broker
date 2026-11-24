@@ -118,6 +118,17 @@ const holdLocal = (ctx) =>
   writeLease(ctx.state, { id: 'held', key: 'x:held', bootId: bootId(), supervisorPid: process.pid, supervisorStart: null, childPgid: null, heartbeatAt: Date.now(), weight: 4, state: LEASE_STATE.RUNNING });
 const admissionLog = (ctx) => fs.readFileSync(paths(ctx.state).admissionLog, 'utf8');
 
+function releaseHeldAfterPlacement(ctx, deadlineMs = 60_000) {
+  const until = Date.now() + deadlineMs;
+  const poll = setInterval(() => {
+    let placed = false;
+    try { placed = /speed-placement:/.test(admissionLog(ctx)); } catch { placed = false; }
+    if (!placed && Date.now() < until) return;
+    clearInterval(poll);
+    removeLease(ctx.state, 'held');
+  }, 50);
+}
+
 async function runDefault(ctx) {
   const marker = path.join(tmpDir('sp-marker'), 'm');
   const started = await laneRun(['run', '--detach', '--lane', 'default', '--', ...markerCmd(marker)], { env: ctx.env, cwd: ctx.repoDir });
@@ -206,7 +217,7 @@ test('speed-aware: a 3x runner while this machine is only briefly blocked -> wai
   fs.writeFileSync(busyFile, `0,${cpuCores}\n`);
   ctx.env.LANE_BROKER_CPU_BUSY_FILE = busyFile;
   fs.writeFileSync(paths(ctx.state).cpuSample, JSON.stringify({ lastValid: { at: Date.now(), hostBusyCores: 0, cores: cpuCores } }));
-  setTimeout(() => removeLease(ctx.state, 'held'), 2500);
+  releaseHeldAfterPlacement(ctx);
   const { result } = await runDefault(ctx);
   assert.notEqual(result.executor, 'remote');
   assert.match(admissionLog(ctx), /speed-placement: ts=\S+ \S+: local: local finish 13s \(estimate 10s\), skybox finish 90s \(ratio 3\.00, configured n=0\)/);
@@ -218,7 +229,7 @@ test('speed-aware: host CPU gate closed by load outside any lease -> goes remote
   const { cpuCores } = detectResourceCapacity();
   fs.writeFileSync(paths(ctx.state).cpuSample, JSON.stringify({ lastValid: { at: Date.now(), hostBusyCores: cpuCores, cores: cpuCores } }));
   fs.writeFileSync(paths(ctx.state).cpuGate, JSON.stringify({ closed: true, consecutiveUnder: 0 }));
-  setTimeout(() => removeLease(ctx.state, 'held'), 2500);
+  releaseHeldAfterPlacement(ctx);
   const { result } = await runDefault(ctx);
   assert.equal(result.executor, 'remote');
   assert.match(admissionLog(ctx), /speed-placement: ts=\S+ \S+: remote: local finish unbounded \(estimate 10s\), skybox finish 90s \(ratio 3\.00, configured n=0, local blocked by host CPU load\)/);
@@ -368,7 +379,7 @@ test('speed-aware (BRAIN-839): an unrelated-key holder is not same-key evidence 
   fs.writeFileSync(busyFile, `0,${cpuCores}\n`);
   ctx.env.LANE_BROKER_CPU_BUSY_FILE = busyFile;
   fs.writeFileSync(paths(ctx.state).cpuSample, JSON.stringify({ lastValid: { at: Date.now(), hostBusyCores: 0, cores: cpuCores } }));
-  setTimeout(() => removeLease(ctx.state, 'held'), 2500);
+  releaseHeldAfterPlacement(ctx);
   const { result } = await runDefault(ctx);
   assert.notEqual(result.executor, 'remote');
   assert.doesNotMatch(admissionLog(ctx), /same-key holder/);
