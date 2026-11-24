@@ -35,7 +35,7 @@ import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processSt
 import { isPidAlive, isProcessAlive } from './process-liveness.js';
 import { selectLeaseTree } from './cpu.js';
 import { DescendantTracker, hasLiveMembers, leaderIdentityOf, reapLogLine, cancelGraceMs } from './descendants.js';
-import { reloadGlobalConfig, isDispatchOnly, pushRunners, pullRunners, pullQueuedTimeoutMs, pullLocalFallbackEnabled } from './config.js';
+import { reloadGlobalConfig, isDispatchOnly, pushRunners, pullRunners, pullQueuedTimeoutMs, pullLocalFallbackEnabled, noPushRunnersReason } from './config.js';
 import { toolsOnPath } from './agent/claims.js';
 import { localFallbackActive } from './queue-health.js';
 import { enforceCpuLimitStartup, CpuLimitUnavailableError, resolveExecutionCpuCores, CPU_LIMIT_CAPABILITY, spawnInCpuScope, stopLeaseCpuScope, scopeMemoryPeakReader, scopeMemoryPeakTracker, enforcementLabel } from './cpu-limit.js';
@@ -1376,8 +1376,8 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   }
 
   let pullUnavailable = false;
+  const skippedSummary = () => (skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : noPushRunnersReason(globalCfg));
   if (!rebind) {
-    const skippedSummary = () => (skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : 'no runners configured');
     const route = await placeForPull({
       root,
       pushChosen: Boolean(runner),
@@ -1408,7 +1408,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     writeBrokerLog(root, line);
   }
   if (!runner) {
-    const reason = skipped.length ? skipped.map((s) => `${s.name}: ${s.reason}`).join('; ') : 'no runners configured';
+    const reason = skippedSummary();
     // every configured runner is too small for this ticket for good: no retry will place it
     const neverPlaceable = skipped.length > 0 && skipped.length === pushRunners(globalCfg).length && skipped.every((s) => s.neverFits === true);
     return fallbackFromPull(pullUnavailable, null, reason, { rebindable: true, noRunner: true, retryable: !neverPlaceable });
