@@ -69,7 +69,7 @@ import { BLOB_CACHE_CAPABILITY } from './remote-blobs.js';
 import { createAttempt, readAttempt, updateAttempt, runnerPhaseRecorder, fallbackToLocal, publishTerminal, remoteCancelledResult, remoteCancelExitDeadlineMs, REMOTE_CANCEL_ABANDONED_EXIT, DUPLICATE_SUBMISSION_EXIT, CANCELLING_LOCK_TIMEOUT_MS } from './attempts.js';
 import { writeBrokerLog, OBSERVED_HISTORY_MAX, hostCpuLoad, ticketCpuEstimate } from './admission.js';
 import { relayedUsage, relayedDeps, relayedTransfer, snapshotLine } from './remote-relay.js';
-import { ranOnFromLog, ranOnLine, ranOnRecord, relayedRanOn } from './ran-on.js';
+import { ranOnLine, ranOnRecord, relayedRanOn } from './ran-on.js';
 import { maybeDailyGc, createLeaseTmpDir, retireLeaseTmpDir, tmpEnv } from './gc.js';
 import { EXCLUSIVE_DEADLINE_EXIT, EXCLUSIVE_DEADLINE_REASON, exclusiveDeadlineExpiredMessage } from './exclusive.js';
 import { NoProgressWatchdog, NO_PROGRESS_EXIT, NO_PROGRESS_REASON, SILENCE_REASON, noProgressMessage, silenceMessage } from './no-progress.js';
@@ -1032,7 +1032,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     const { published, finalResult } = await publishAttemptTerminal(root, enriched.id, generation, {
       drain: finishOutput,
       buildConfirmedResult,
-      buildCancelledResult: () => ({ ...remoteCancelledResult(enriched.id, attemptStartedAt), ...ranOnFromLog(enriched.logPath, enriched.id) }),
+      buildCancelledResult: () => remoteCancelledResult(enriched.id, attemptStartedAt),
       writeResult: writeResultSync,
       resolvePublishOptions: whileCancelling,
     });

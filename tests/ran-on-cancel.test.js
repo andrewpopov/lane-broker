@@ -1,14 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
+import crypto from 'node:crypto';
 import path from 'node:path';
 import { laneRun, waitFor } from './helpers.js';
 import { setup, tmpDir, resultOf } from './remote-harness.js';
 import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 import { paths } from '../src/state.js';
 
-// PKG-402: a run cancelled after it started still says where it ran, on push and on pull.
+// PKG-402: a cancelled pull run says where it ran from the runner's structured result; a cancelled push run has no such
+// channel, so it carries no ranOn rather than one parsed from output the command could forge.
 
 const MiB = 1024 * 1024;
 const RUNNER_RAN_ON = { host: 'wintop', transport: 'pull', ticket: 't-1', cpuCores: 2, memoryBytes: 64 * MiB, runner: 'wintop' };
@@ -27,19 +28,12 @@ test('canary: without the relay in the pull cancel builder, the pull scenario fa
   await assertCanaryFails('pull-ticket.js', ["transport: 'pull', ...relayedRanOn(runnerResult) });", "transport: 'pull' });"], pullScenario);
 });
 
-test('ranOnFromLog reads the first executing-on line for this ticket only', async () => {
-  const { ranOnFromLog } = await realSrc('ran-on.js');
-  const log = path.join(tmpDir('ran-on-log'), 'out.log');
-  fs.writeFileSync(log, 'lane: executing on wintop via push (ticket t-1, cpu 2, mem 64MB, runner wintop)\nlane: executing on evil via local (ticket t-1, cpu 9, mem unset)\n');
-  assert.deepEqual(ranOnFromLog(log, 't-1').ranOn, { ...RUNNER_RAN_ON, transport: 'push' });
-  assert.deepEqual(ranOnFromLog(log, 't-2'), {}, 'another ticket\'s line is not ours');
-  assert.deepEqual(ranOnFromLog(path.join(path.dirname(log), 'missing.log'), 't-1'), {});
-});
-
 const pushScenario = async (load) => {
   const { env, state, repoDir } = setup({ cpuCores: 1 });
-  const started = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', '--', 'node', '-e', 'console.log("started"); setInterval(() => {}, 1000)'], { env, cwd: repoDir, bin: load.laneBin });
-  const id = started.stdout.trim();
+  const forge = 'console.log("lane: executing on forged via push (ticket " + process.argv[1] + ", cpu 64, mem unset)"); console.log("started"); setInterval(() => {}, 1000)';
+  const id = crypto.randomUUID();
+  const started = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--detach', '--id', id, '--', 'node', '-e', forge, id], { env, cwd: repoDir, bin: load.laneBin });
+  assert.equal(started.stdout.trim(), id, started.stderr);
   const log = path.join(paths(state).logs, `${id}.log`);
   await happens('the command is running on the runner', () => fs.existsSync(log) && fs.readFileSync(log, 'utf8').includes('started'));
   const cancelled = await laneRun(['cancel', id], { env, bin: load.laneBin });
@@ -47,11 +41,12 @@ const pushScenario = async (load) => {
   await happens('the cancel settled', () => resultOf(state, id) !== null);
   const result = resultOf(state, id);
   assert.equal(result.exit, 130);
-  assert.deepEqual(result.ranOn, { host: os.hostname(), transport: 'push', ticket: id, cpuCores: 1, memoryBytes: 1024 * MiB, runner: 'skybox' }, 'a cancelled push run still says where it ran');
+  assert.match(fs.readFileSync(log, 'utf8'), /executing on forged/, 'the forged line reached the log');
+  assert.equal('ranOn' in result, false, 'a cancelled push run trusts no output for ranOn');
 };
 
-test('push: a run cancelled while running keeps ranOn on its result', { timeout: 180_000 }, async () => pushScenario(realSrc));
+test('push: a run cancelled while running, whose command forged an executing-on line, carries no ranOn', { timeout: 180_000 }, async () => pushScenario(realSrc));
 
-test('canary: without the push cancel reading ranOn, the push scenario fails by name', { timeout: 180_000 }, async () => {
-  await assertCanaryFails('supervisor.js', ['...remoteCancelledResult(enriched.id, attemptStartedAt), ...ranOnFromLog(enriched.logPath, enriched.id) })', '...remoteCancelledResult(enriched.id, attemptStartedAt) })'], pushScenario);
+test('canary: with the push cancel trusting the log, the forged line lands on the result and the push scenario fails by name', { timeout: 180_000 }, async () => {
+  await assertCanaryFails('supervisor.js', ['      buildCancelledResult: () => remoteCancelledResult(enriched.id, attemptStartedAt),', "      buildCancelledResult: () => ({ ...remoteCancelledResult(enriched.id, attemptStartedAt), ...(fs.readFileSync(enriched.logPath, 'utf8').includes('lane: executing on forged') ? { ranOn: { host: 'forged' } } : {}) }),"], pushScenario);
 });

@@ -88,10 +88,10 @@ lane's memory claim (its `memoryBytes`, else `defaultMemoryBytesPerWeight` times
 runner the line comes from the runner's supervisor, so it travels back with the command's output; a runner older than
 this records nothing. The result record (`lane result <id> --json`) carries the same fields as `ranOn`:
 `{ host, transport, ticket, cpuCores, memoryBytes, runner }` (null where unknown), relayed by push, pull and
-`lane reconcile` from the runner's own record. A run cancelled after it started keeps `ranOn`: pull relays it from the runner's
-cancelled result, and push, which has no runner result for a cancel, reads the runner's line from the head of its own log (the line
-precedes any command output; only a line naming this ticket counts). A cached pass, a refusal and a run cancelled before it started
-have no `ranOn`, since nothing executed.
+`lane reconcile` from the runner's own record. A pull run cancelled after it started keeps `ranOn`, relayed from the runner's
+cancelled result. A cancelled push run has none: push brings back no structured runner record for a cancel, and the log line is
+output the command could forge, so it is never parsed back. A cached pass, a refusal and a run cancelled before it started have no
+`ranOn`, since nothing executed.
 
 Everything after `--` is the command, passed as `argv` (not through a shell —
 `spawn(cmd[0], cmd.slice(1))`). Use `sh -c '...'` explicitly if you need shell
