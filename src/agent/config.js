@@ -19,7 +19,9 @@ export const LIVENESS_MS = 15_000;
 // A dead peer must surface as an error the client retries, not a hung query: keepalive probes, a connect bound, and a client-side bound above the role's 2 s statement_timeout.
 export const PG_LIVENESS = Object.freeze({ keepAlive: true, connectionTimeoutMillis: 10_000, query_timeout: 20_000 });
 
-const DEFAULTS = { stopClaimingBeforeCloseMs: 30 * 60_000, pollMs: LIVENESS_MS, speedFactor: 1, fetchBudgetMs: 10 * 60_000, maxRunMs: 2 * 3_600_000 };
+/** A backstop, not the stuck-run kill: silence (`silenceTimeoutMs`) ends a run that stops writing; this only catches one that never stops. */
+export const DEFAULT_MAX_RUN_MS = 6 * 3_600_000;
+const DEFAULTS = { stopClaimingBeforeCloseMs: 30 * 60_000, pollMs: LIVENESS_MS, speedFactor: 1, fetchBudgetMs: 10 * 60_000, maxRunMs: DEFAULT_MAX_RUN_MS };
 const KNOWN = new Set(['laneQueueUrl', 'passwordFile', 'caFile', 'runnerName', 'rustfs', 'rustfsEnvFile', 'brokerHome', 'stateDir', 'metricsTextfileDir', 'schedule', ...Object.keys(DEFAULTS)]);
 const RUNNER_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 const RUSTFS_KEYS = new Set(['endpoint', 'region', 'snapBucket', 'outBucket']);
