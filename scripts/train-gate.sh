@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 # The merge train's command. With no argument: lint and the suite (PR CI and
-# batches), or this shard's share of it when the train sets TRAIN_SHARD=i/N. With `heavy`: the scale, perf and soak tests under tests/heavy/,
+# batches), or this shard's share of it when the train sets TRAIN_SHARD=i/N. With `heavy`: this shard's share of the scale, perf and soak tests under tests/heavy/,
 # which the master verify runs (`masterCommand`) so PR CI stays short. A failed
 # install stays infra; only a failed suite prints the train's red line.
 set -e
@@ -19,7 +19,10 @@ rerun_files() {
 }
 
 case "${1:-}" in
-  heavy) step='npm run test:heavy' ;;
+  heavy)
+    heavy=$(node scripts/test-files.js tests/heavy)
+    if [ -z "$heavy" ]; then echo "train-gate.sh: shard ${TRAIN_SHARD:-1/1} holds no heavy files"; step=true
+    else step="node --test --test-concurrency=1 --import ./tests/helpers/hermetic-host.js $(echo $heavy)"; fi ;;
   '')
     if rerun_files; then step="sh scripts/test-shard.sh $(printf '%s\n' "$TRAIN_FAILED_FILES" | grep -v '^$' | tr '\n' ' ')"
     elif [ -n "$TRAIN_SHARDS" ]; then step="sh scripts/test-shard.sh"
