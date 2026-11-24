@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
@@ -202,6 +202,17 @@ test('a broad rule below the lane-logins reject line is unreachable and allowed;
   assert.throws(() => lib.editHba(literalBelow, entry, 'add'), /may let lane_agent_evo_x2 in/);
 });
 
+test('the guard reads included files in place and refuses constructs it cannot check', () => {
+  const entry = { role: 'lane_agent_evo_x2', host: 'evo-x2', ip: '100.82.26.77' };
+  const withInclude = `include /etc/postgresql/17/main/fence.conf\n${HBA}`;
+  assert.doesNotThrow(() => lib.editHba(withInclude, entry, 'add', { included: { '/etc/postgresql/17/main/fence.conf': '# empty fence\nhost all all 0.0.0.0/0 reject\n' } }));
+  assert.throws(() => lib.editHba(withInclude, entry, 'add', { included: { '/etc/postgresql/17/main/fence.conf': 'hostssl lane_queue_db +lane_agent 100.64.0.0/10 scram-sha-256\n' } }), /may let lane_agent_evo_x2 in/);
+  assert.throws(() => lib.editHba(withInclude, entry, 'add'), /was not read/);
+  assert.throws(() => lib.editHba(`include_dir conf.d\n${HBA}`, entry, 'add'), /include_dir/);
+  assert.throws(() => lib.editHba(`hostssl lane_queue_db \\\n  +lane_agent 100.64.0.0/10 scram-sha-256\n${HBA}`, entry, 'add'), /continued line/);
+  assert.deepEqual(lib.hbaIncludes("include 'a.conf'\ninclude_if_exists b.conf\n"), [{ kind: 'include', path: 'a.conf' }, { kind: 'include_if_exists', path: 'b.conf' }]);
+});
+
 test('shellQuote survives the remote shell: a psql field separator stays one word, not a pipe', () => {
   const words = ['psql', '-F', '|', "it's", 'a b', '-tAq'];
   assert.deepEqual(lib.shellSplit(words.map(lib.shellQuote).join(' ')), words);
@@ -211,9 +222,9 @@ test('shellQuote survives the remote shell: a psql field separator stays one wor
 const HBA_STAT = 'postgres:postgres 640';
 const TRAIN_STAT = 'train:train 644';
 
-function fakeWorld({ hba = HBA, train = TRAIN, held = [], hbaErrors = 0, item = null, roleExists = false } = {}) {
+function fakeWorld({ hba = HBA, train = TRAIN, held = [], hbaErrors = 0, item = null, roleExists = false, mcInfo = null } = {}) {
   const world = {
-    calls: [], hba, train, held, heldInTx: [], hbaErrors, item, roleExists, templates: [], mcEnvs: [], policyFile: null,
+    calls: [], hba, train, held, heldInTx: [], hbaErrors, item, roleExists, templates: [], mcEnvs: [], policyFile: null, mcInfo,
     fail: {}, scripts: [], reloads: 0, principalExists: false, roleLogin: true, afterRole: null, extraItems: [], backup: null, principalDeleted: false, beforeScript: null,
   };
   const ok = (stdout = '') => ({ code: 0, stdout, stderr: '' });
@@ -260,6 +271,7 @@ function fakeWorld({ hba = HBA, train = TRAIN, held = [], hbaErrors = 0, item = 
     if (cmd === 'mc') {
       world.mcEnvs.push(env);
       if (world.fail.mc && args.slice(0, 3).join(' ') === world.fail.mc) return bad(`mc: <ERROR> boom http://${ROOT.accessKey}:${ROOT.secretKey}@x`);
+      if (world.mcInfo && args[1] !== undefined && args[2] === 'info') return bad(world.mcInfo);
       if (args[1] === 'policy' && args[2] === 'create') world.policyFile = fs.readFileSync(args[5], 'utf8');
       return ok();
     }
@@ -303,7 +315,8 @@ const SCRIPT = path.join(REPO, 'ops/runner/lane-runner-admin.js');
 async function cli(world, argv, mod = lib, extra = {}) {
   const lines = [];
   const errs = [];
-  const code = await mod.runCli(argv, { exec: world.exec, out: (t) => lines.push(t), err: (t) => errs.push(t), lockDir: makeTmpDir('runner-admin-lock-'), scriptPath: SCRIPT, cwd: REPO, ...extra });
+  const env = { [lib.LOCK_ENV]: argv[1] };
+  const code = await mod.runCli(argv, { exec: world.exec, out: (t) => lines.push(t), err: (t) => errs.push(t), scriptPath: SCRIPT, cwd: REPO, env, ...extra });
   return { code, text: lines.join('\n'), errs: errs.join('\n') };
 }
 
@@ -681,6 +694,19 @@ test('status reports each piece and is read-only', async () => {
   assert.ok(!world.calls.some((c) => isEditCall(c) || c.input?.includes('DELETE')));
 });
 
+test('status says absent only on an explicit not-found answer; any other mc failure is unknown and exits 1', async () => {
+  const notFound = fakeWorld({ item: heldItem, mcInfo: 'mc: <ERROR> Unable to get user info. The specified user does not exist.' });
+  const absent = await cli(notFound, ['status', 'evo-x2']);
+  assert.equal(absent.code, 0);
+  assert.match(absent.text, /rustfs user +absent/);
+  assert.match(absent.text, /rustfs policy +absent/);
+  const down = fakeWorld({ item: heldItem, mcInfo: 'mc: <ERROR> dial tcp 100.64.0.1:9000: connect: connection refused' });
+  const unknown = await cli(down, ['status', 'evo-x2']);
+  assert.equal(unknown.code, 1);
+  assert.match(unknown.text, /rustfs user +unknown \(mc failed, exit 1/);
+  assert.match(unknown.text, /rustfs policy +unknown \(mc failed/);
+});
+
 test('bad arguments exit 2 with a message and touch nothing', async () => {
   const world = fakeWorld();
   const bad = [['add', 'evo-x2'], ['add', 'Evo', '--ip', '100.82.26.77'], ['add', 'evo-x2', '--ip', '10.0.0.1'], ['remove', 'evo-x2', '--ip', '100.82.26.77'], ['frob', 'x'], ['add', 'evo-x2', '--ip', '100.82.26.77', '--force']];
@@ -721,38 +747,33 @@ test('the guard refuses broad earlier rules: +group, all, /regex and @file in th
   assert.match(HBA, /^host {4}all {2}postgres {2}127\.0\.0\.1\/32 {2}scram-sha-256$/m);
 });
 
-test('the per-host lock: a live holder refuses the run, a dead one is reclaimed, and the lock is released afterwards', async () => {
+test('--apply re-runs under flock -n with a conflict exit, and runCli refuses an apply that does not hold the lock', async () => {
   const dir = makeTmpDir('runner-admin-lock-');
-  const file = path.join(dir, 'evo-x2.lock');
-  const release = lib.acquireHostLock('evo-x2', { dir, now: NOW });
-  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')), { pid: process.pid, start: '2026-11-24T10:11:12.345Z' });
-  assert.equal(fs.statSync(file).mode & 0o777, 0o600);
-  assert.throws(() => lib.acquireHostLock('evo-x2', { dir }), /another lane-runner-admin run for evo-x2 holds .*pid \d+/);
-  assert.doesNotThrow(() => lib.acquireHostLock('other-host', { dir })());
-  release();
-  assert.ok(!fs.existsSync(file));
-
-  const dead = spawnSync(process.execPath, ['-e', '']).pid;
-  fs.writeFileSync(file, JSON.stringify({ pid: dead, start: 'long ago' }));
-  lib.acquireHostLock('evo-x2', { dir })();
-  fs.writeFileSync(file, 'half');
-  assert.throws(() => lib.acquireHostLock('evo-x2', { dir }), /unreadable/);
-  fs.rmSync(file);
-
+  const plan = lib.lockedReexec({ argv: [...ADD, '--apply'], host: 'evo-x2', env: {}, execPath: '/node', scriptPath: SCRIPT, dir });
+  assert.deepEqual(plan.args.slice(0, 4), ['-n', '-E', String(lib.LOCK_CONFLICT_EXIT), path.join(dir, 'evo-x2.lock')]);
+  assert.equal(plan.cmd, 'flock');
+  assert.deepEqual(plan.args.slice(4), ['/node', SCRIPT, ...ADD, '--apply']);
+  assert.equal(plan.env[lib.LOCK_ENV], 'evo-x2');
+  assert.equal(lib.lockedReexec({ argv: ADD, host: 'evo-x2', env: { [lib.LOCK_ENV]: 'evo-x2' }, dir }), null, 'already inside the lock');
   const world = fakeWorld();
-  const held = lib.acquireHostLock('evo-x2', { dir });
-  const refused = await cli(world, [...ADD, '--apply'], lib, { lockDir: dir });
+  const refused = await cli(world, [...ADD, '--apply'], lib, { env: {} });
   assert.equal(refused.code, 1);
-  assert.match(refused.errs, /only one admin may run it at a time/);
+  assert.match(refused.errs, /must run under the per-host lock/);
   assert.equal(world.calls.length, 0);
-  assert.equal((await cli(world, ADD, lib, { lockDir: dir })).code, 0, 'a dry run takes no lock');
-  held();
-  assert.equal((await cli(world, [...ADD, '--apply'], lib, { lockDir: dir })).code, 0);
-  assert.deepEqual(fs.readdirSync(dir), [], 'released after success');
-  world.fail.psql = 'x';
-  world.roleExists = true;
-  assert.equal((await cli(world, [...ADD, '--apply'], lib, { lockDir: dir })).code, 1);
-  assert.deepEqual(fs.readdirSync(dir), [], 'released after failure');
+  assert.equal((await cli(world, ADD, lib, { env: {} })).code, 0, 'a dry run needs no lock');
+});
+
+test('flock(1) refuses a second holder with the conflict exit and frees the lock when its holder dies', { skip: spawnSync('flock', ['-h']).error ? 'flock not installed' : false }, () => {
+  const file = path.join(makeTmpDir('runner-admin-flock-'), 'evo-x2.lock');
+  const holder = spawn('flock', ['-n', file, 'sleep', '30'], { stdio: 'ignore', detached: true });
+  const deadline = Date.now() + 5000;
+  let second;
+  do { second = spawnSync('flock', ['-n', '-E', String(lib.LOCK_CONFLICT_EXIT), file, 'true']); } while (second.status === 0 && Date.now() < deadline);
+  assert.equal(second.status, lib.LOCK_CONFLICT_EXIT);
+  process.kill(-holder.pid, 'SIGKILL');
+  const freed = Date.now() + 5000;
+  while (spawnSync('flock', ['-n', '-E', String(lib.LOCK_CONFLICT_EXIT), file, 'true']).status !== 0 && Date.now() < freed) spawnSync('sleep', ['0.1']);
+  assert.equal(spawnSync('flock', ['-n', '-E', String(lib.LOCK_CONFLICT_EXIT), file, 'true']).status, 0, 'a dead holder leaves no stale lock');
 });
 
 async function roleRemovedScenario(mod = lib) {

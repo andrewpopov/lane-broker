@@ -99,6 +99,8 @@ export const dropRoleSql = (role) => [
   '',
 ].join('\n');
 
+const MC_NOT_FOUND = /not found|does not exist|doesn't exist|no such/i;
+
 const BEGIN_MARK = (host) => `# BEGIN lane-runner-admin ${host}`;
 const END_MARK = (host) => `# END lane-runner-admin ${host}`;
 const BLOCK_ANCHOR = /^local\s+lane_queue_db\s+all\s+reject/;
@@ -126,10 +128,40 @@ const laneRejectAt = (lines, pattern) => lines.findIndex((line) => {
   return roles?.some((r) => r.startsWith('lane_agent_'));
 });
 
+const INCLUDE_RE = /^\s*(include|include_if_exists|include_dir)\s+(\S+)/;
+const includeTarget = (raw) => raw.replace(/^'(.*)'$/, '$1').replace(/^"(.*)"$/, '$1');
+
+export function hbaIncludes(text) {
+  return text.split('\n').flatMap((line) => {
+    const match = INCLUDE_RE.exec(line);
+    return match ? [{ kind: match[1], path: includeTarget(match[2]) }] : [];
+  });
+}
+
+// The rules pg_hba evaluates, in order: each include spliced in where it appears. Constructs this guard cannot evaluate are refused.
+function evaluatedRules(lines, included) {
+  const out = [];
+  for (const line of lines) {
+    if (!/^\s*#/.test(line) && /\\\s*$/.test(line)) throw new Error(`pg_hba.conf has a continued line this tool cannot check: "${line.trim()}"; join it first`);
+    const match = INCLUDE_RE.exec(line);
+    if (!match) { out.push(line); continue; }
+    if (match[1] === 'include_dir') throw new Error(`pg_hba.conf uses include_dir (${match[2]}), which this tool cannot check`);
+    const body = included?.[includeTarget(match[2])];
+    if (body === undefined) throw new Error(`pg_hba.conf includes ${match[2]}, which was not read`);
+    for (const inner of body.split('\n')) {
+      if (INCLUDE_RE.test(inner)) throw new Error(`${match[2]} has a nested include, which this tool cannot check`);
+      if (!/^\s*#/.test(inner) && /\\\s*$/.test(inner)) throw new Error(`${match[2]} has a continued line this tool cannot check`);
+      out.push(inner);
+    }
+  }
+  return out;
+}
+
 // A rule that might admit `role` before the lane-logins reject line of its kind; first match wins, so a broad rule below that line
 // can never be reached by a listed lane login. A rule naming the role itself is refused wherever it is. +groups, /regex and @file
 // entries are refused rather than evaluated.
-const rulesThatMayAdmit = (lines, role) => {
+const rulesThatMayAdmit = (rawLines, role, included) => {
+  const lines = evaluatedRules(rawLines, included);
   const cutoff = { local: laneRejectAt(lines, LOCAL_REJECT), host: laneRejectAt(lines, HOST_REJECT) };
   return lines.filter((line, i) => {
     const rule = parseHbaRule(line);
@@ -171,7 +203,7 @@ function editRejectList(lines, pattern, label, role, mode) {
   return edited;
 }
 
-export function editHba(text, { role, host, ip, note }, mode) {
+export function editHba(text, { role, host, ip, note }, mode, { included = {} } = {}) {
   if (mode !== 'add' && mode !== 'remove') throw new Error(`editHba mode must be add or remove, not ${mode}`);
   let lines = text.split('\n');
   const begin = lines.indexOf(BEGIN_MARK(host));
@@ -183,7 +215,7 @@ export function editHba(text, { role, host, ip, note }, mode) {
     at = begin;
   }
   if (mode === 'add') {
-    const [clash] = rulesThatMayAdmit(lines, role);
+    const [clash] = rulesThatMayAdmit(lines, role, included);
     if (clash) throw new Error(`pg_hba.conf already has a rule outside the ${BEGIN_MARK(host)} block that may let ${role} in: "${clash.trim()}"; narrow or remove it first`);
     if (at < 0) at = lines.findIndex((line) => BLOCK_ANCHOR.test(line));
     if (at < 0) throw new Error(`pg_hba.conf has no "local ${DB_NAME} all reject" line to anchor the block before`);
@@ -509,8 +541,9 @@ if [ "$moved" = 1 ]; then echo "backup=$backup"; else echo "unchanged=$path"; fi
 `;
 }
 
-async function editRemoteFile(ctx, { kind, path: file, readAs = [], edit, label }) {
+async function editRemoteFile(ctx, { kind, path: file, readAs = [], edit, label, beforeEdit }) {
   const before = (await ctx.remote(['sudo', '-n', ...readAs, 'cat', file], { label: `read ${label}` })).stdout;
+  if (beforeEdit) await beforeEdit(before);
   const after = edit(before);
   return {
     before, after, file, kind, changed: after !== before,
@@ -527,7 +560,22 @@ async function editRemoteFile(ctx, { kind, path: file, readAs = [], edit, label 
   };
 }
 
-const hbaEdit = (ctx, mode) => editRemoteFile(ctx, { kind: 'hba', path: HBA_PATH, label: 'pg_hba.conf', edit: (text) => editHba(text, ctx.hbaEntry, mode) });
+async function readIncludes(ctx, text) {
+  const included = {};
+  for (const { kind, path: target } of hbaIncludes(text)) {
+    if (kind === 'include_dir') continue;
+    const file = path.posix.isAbsolute(target) ? target : path.posix.join(path.posix.dirname(HBA_PATH), target);
+    const result = await ctx.remote(['sudo', '-n', 'cat', file], { label: `read ${file}`, allow: kind === 'include_if_exists' ? /No such file/ : undefined });
+    included[target] = result.code === 0 ? result.stdout : '';
+  }
+  return included;
+}
+
+async function hbaEdit(ctx, mode) {
+  let included = {};
+  const edit = editRemoteFile(ctx, { kind: 'hba', path: HBA_PATH, label: 'pg_hba.conf', beforeEdit: async (text) => { included = await readIncludes(ctx, text); }, edit: (text) => editHba(text, ctx.hbaEntry, mode, { included }) });
+  return edit;
+}
 
 const trainEdit = (ctx, mode) => editRemoteFile(ctx, { kind: 'json', path: TRAIN_CONFIG_PATH, readAs: ['-u', 'train'], label: 'train config', edit: (text) => editTrainRunners(text, ctx.opts.host, mode) });
 
@@ -556,28 +604,14 @@ const hbaStep = (ctx, mode) => editStep(ctx, { title: `pg_hba.conf: ${mode} the 
 
 const trainStep = (ctx, mode) => editStep(ctx, { title: `train config: ${mode} runner ${ctx.opts.host}`, kind: 'train', load: () => trainEdit(ctx, mode), extra: `note: ${PROVISION_REMINDER}` });
 
-export function acquireHostLock(host, { dir = path.join(os.homedir(), '.cache', 'lane-runner-admin'), fsImpl = fs, pid = process.pid, now = () => new Date() } = {}) {
-  fsImpl.mkdirSync(dir, { recursive: true, mode: 0o700 });
-  const file = path.join(dir, `${host}.lock`);
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      const fd = fsImpl.openSync(file, 'wx', 0o600);
-      fsImpl.writeSync(fd, JSON.stringify({ pid, start: now().toISOString() }));
-      fsImpl.closeSync(fd);
-      return () => fsImpl.rmSync(file, { force: true });
-    } catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-      let holder;
-      try { holder = JSON.parse(fsImpl.readFileSync(file, 'utf8')); } catch { throw new Error(`${file} exists but is unreadable; if no other run is active, delete it`); }
-      if (isPidAlive(holder.pid)) throw new Error(`another lane-runner-admin run for ${host} holds ${file} (pid ${holder.pid}, since ${holder.start}); only one admin may run it at a time`);
-      fsImpl.rmSync(file, { force: true });
-    }
-  }
-  throw new Error(`could not take ${file}`);
-}
+export const LOCK_ENV = 'LANE_RUNNER_ADMIN_LOCKED';
+export const LOCK_CONFLICT_EXIT = 75;
 
-function isPidAlive(pid) {
-  try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; }
+// --apply re-runs itself under flock(1): the kernel holds the lock for the process's lifetime, so a dead run never leaves a stale lock.
+export function lockedReexec({ argv, host, env = process.env, execPath = process.execPath, scriptPath = process.argv[1], dir = path.join(os.homedir(), '.cache', 'lane-runner-admin') }) {
+  if (env[LOCK_ENV] === host) return null;
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  return { cmd: 'flock', args: ['-n', '-E', String(LOCK_CONFLICT_EXIT), path.join(dir, `${host}.lock`), execPath, scriptPath, ...argv], env: { ...env, [LOCK_ENV]: host } };
 }
 
 function recheckRole(ctx, role) {
@@ -750,6 +784,7 @@ async function statusReport(ctx, out) {
   const { host } = ctx.opts;
   const role = pgRole(host);
   const line = (name, value) => out(`${name.padEnd(22)} ${value}`);
+  const failures = [];
   line('postgres role', Number((await ctx.psql(roleExistsSql(role), { query: true, label: 'check role' })).stdout.trim()) > 0 ? `present (${role})` : `absent (${role})`);
   const principal = (await ctx.psqlRows(`SELECT login_role, host, kind, tags, allowed_repos, max_claims FROM lane_dispatch.principals WHERE login_role = ${sqlLit(role)};\n`, 'read principal'))[0];
   line('principal row', principal ? `host=${principal[1]} kind=${principal[2]} tags=${principal[3]} repos=${principal[4]} max_claims=${principal[5]}` : 'absent');
@@ -760,13 +795,20 @@ async function statusReport(ctx, out) {
   line('pg_hba reject lists', `local all: ${hba.localRejected ? 'listed' : 'not listed'}, host all: ${hba.hostRejected ? 'listed' : 'not listed'}`);
   const item = await ctx.getItem();
   line('1Password item', item ? `present (${opItemTitle(host)})` : 'absent');
+  const presence = (result, name) => {
+    if (result.code === 0) return `present${name ? ` (${name})` : ''}`;
+    if (MC_NOT_FOUND.test(`${result.stderr}${result.stdout}`)) return 'absent';
+    failures.push(name ?? 'rustfs user');
+    return `unknown (mc failed, exit ${result.code}: ${ctx.scrub(result.stderr || result.stdout).trim().split('\n')[0]})`;
+  };
   const user = item ? await ctx.mc(['admin', 'user', 'info', MC_ALIAS, item.accessKey], { allow: /^/ }) : null;
-  line('rustfs user', user ? (user.code === 0 ? 'present' : 'absent') : 'unknown (no 1Password item holds its access key)');
-  line('rustfs policy', (await ctx.mc(['admin', 'policy', 'info', MC_ALIAS, rustfsName(host)], { allow: /^/ })).code === 0 ? `present (${rustfsName(host)})` : 'absent');
+  line('rustfs user', user ? presence(user) : 'unknown (no 1Password item holds its access key)');
+  line('rustfs policy', presence(await ctx.mc(['admin', 'policy', 'info', MC_ALIAS, rustfsName(host)], { allow: /^/ }), rustfsName(host)));
   const train = (await ctx.remote(['sudo', '-n', '-u', 'train', 'cat', TRAIN_CONFIG_PATH], { label: 'read train config' })).stdout;
   line('train runners entry', trainHasRunner(train, host) ? 'present' : 'absent');
   const tickets = parseTickets(await ctx.psqlRows(heldTicketsSql(host), 'list held tickets'));
   line('claimed/running', tickets.length ? tickets.join(', ') : 'none');
+  return failures;
 }
 
 const USAGE = `usage:
@@ -806,14 +848,13 @@ export function parseCli(argv) {
   return { ...opts, ip: values.ip, tags, repos, maxClaims, out: values.out ? path.resolve(values.out) : null, note: values.note ?? '' };
 }
 
-export async function runCli(argv, { exec, out = (text) => process.stdout.write(`${text}\n`), err = (text) => process.stderr.write(`${text}\n`), lockDir, scriptPath = process.argv[1], cwd = process.cwd(), ...injected }) {
+export async function runCli(argv, { exec, out = (text) => process.stdout.write(`${text}\n`), err = (text) => process.stderr.write(`${text}\n`), scriptPath = process.argv[1], cwd = process.cwd(), env = process.env, ...injected }) {
   let opts;
   try { opts = parseCli(argv); } catch (e) { err(e.message); return 2; }
   const ctx = new Context({ exec, opts, ...injected });
-  let release = () => {};
   try {
-    if (opts.command === 'status') { await statusReport(ctx, out); return 0; }
-    if (opts.apply) release = acquireHostLock(opts.host, { dir: lockDir, fsImpl: ctx.fs });
+    if (opts.command === 'status') return (await statusReport(ctx, out)).length ? 1 : 0;
+    if (opts.apply && env[LOCK_ENV] !== opts.host) throw new Error(`--apply must run under the per-host lock; run it as node ${scriptPath} …`);
     const steps = opts.command === 'add' ? buildAddPlan(ctx) : buildRemovePlan(ctx);
     const relative = path.relative(cwd, path.resolve(cwd, scriptPath));
     const script = relative.startsWith('..') || path.isAbsolute(relative) ? path.resolve(cwd, scriptPath) : relative;
@@ -824,7 +865,5 @@ export async function runCli(argv, { exec, out = (text) => process.stdout.write(
   } catch (e) {
     err(ctx.scrub(e.message));
     return 1;
-  } finally {
-    release();
   }
 }
