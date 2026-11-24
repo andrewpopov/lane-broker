@@ -1,6 +1,7 @@
 {
   "version": 1,
   "lane": "train",
+  "shards": 4,
   "command": [
     "sh",
     "scripts/train-gate.sh"

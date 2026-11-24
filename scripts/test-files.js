@@ -30,7 +30,8 @@ export function parseShard(value) {
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const { shard, total } = parseShard(process.env.TRAIN_SHARD);
-  const files = fs.readdirSync('tests').filter((n) => n.endsWith('.test.js')).map((n) => path.posix.join('tests', n)).sort();
-  const durations = JSON.parse(fs.readFileSync('tests/durations.json', 'utf8'));
+  const dir = process.argv[2] ?? 'tests';
+  const files = fs.readdirSync(dir).filter((n) => n.endsWith('.test.js')).map((n) => path.posix.join(dir, n)).sort();
+  const durations = dir === 'tests' ? JSON.parse(fs.readFileSync('tests/durations.json', 'utf8')) : {};
   process.stdout.write(`${shardFiles(files, durations, shard, total).join('\n')}\n`);
 }

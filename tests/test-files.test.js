@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { shardFiles, parseShard } from '../scripts/test-files.js';
 
 const LAST = 'tests/zz-tmp-leak-guard.test.js';
@@ -34,4 +35,11 @@ test('tests/durations.json names only test files that exist', () => {
   const durationsFile = JSON.parse(fs.readFileSync(new URL('./durations.json', import.meta.url), 'utf8'));
   const missing = Object.keys(durationsFile).filter((f) => !fs.existsSync(new URL(`../${f}`, import.meta.url)));
   assert.deepEqual(missing, []);
+});
+
+test('the heavy tier deals tests/heavy across the train shards: each file once, none duplicated', () => {
+  const heavy = fs.readdirSync('tests/heavy').filter((n) => n.endsWith('.test.js')).map((n) => `tests/heavy/${n}`).sort();
+  const shards = [1, 2, 3, 4].map((i) => execFileSync(process.execPath, ['scripts/test-files.js', 'tests/heavy'], { env: { ...process.env, TRAIN_SHARD: `${i}/4` }, encoding: 'utf8' }).split('\n').filter(Boolean));
+  assert.deepEqual(shards.flat().sort(), heavy);
+  assert.ok(heavy.length > 0);
 });
