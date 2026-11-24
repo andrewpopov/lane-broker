@@ -328,9 +328,20 @@ test('legacy scheduler: a failed snapshot write rolls the withdrawal back, so th
   const before = listQueue(state).map((r) => [r.id, r.seq]);
   const queueDir = path.dirname(listQueue(state)[0].file ?? path.join(paths(state).queue, 'x'));
   const realWrite = fs.writeFileSync;
-  // Fail only the snapshot's temp-file write in the queue dir (the broker lock and everything else still write).
+  const realOpen = fs.openSync;
+  const isQueueTemp = (target) => typeof target === 'string' && path.dirname(target) === queueDir && path.basename(target).startsWith('.tmp-');
+  const queueTempFds = new Set();
+  let injected = 0;
+  // Fail only the snapshot's temp-file write in the queue dir (the broker lock and everything else still write). The durable write
+  // opens the temp file and writes through its fd, so the fds opened on queue temp files are failed too.
+  const open = mock.method(fs, 'openSync', function (target, ...rest) {
+    const fd = realOpen.call(this, target, ...rest);
+    if (isQueueTemp(target)) queueTempFds.add(fd);
+    return fd;
+  });
   const write = mock.method(fs, 'writeFileSync', function (target, ...rest) {
-    if (typeof target === 'string' && path.dirname(target) === queueDir && path.basename(target).startsWith('.tmp-')) {
+    if (isQueueTemp(target) || queueTempFds.has(target)) {
+      injected += 1;
       throw Object.assign(new Error('ENOSPC: no space left on device'), { code: 'ENOSPC' });
     }
     return realWrite.call(this, target, ...rest);
@@ -340,7 +351,9 @@ test('legacy scheduler: a failed snapshot write rolls the withdrawal back, so th
     taken = await withdrawQueued(state, 'a');
   } finally {
     write.mock.restore();
+    open.mock.restore();
   }
+  assert.ok(injected > 0, 'the snapshot write was reached and failed');
   assert.equal(taken, null, 'the withdrawal reports failure');
   assert.deepEqual(listQueue(state).map((r) => [r.id, r.seq]), before, 'the ticket is back in the queue at its original seq');
 });
