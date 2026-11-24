@@ -130,7 +130,10 @@ test('SQL builders quote identifiers and literals, and a dry run shows the passw
   const order = ['BEGIN;', "FROM lane_dispatch.principals WHERE login_role = 'lane_agent_evo_x2' FOR UPDATE;", "RAISE EXCEPTION 'held tickets: %'", 'NOLOGIN', "DELETE FROM lane_dispatch.principals WHERE login_role = 'lane_agent_evo_x2';", "DELETE FROM lane_dispatch.runners WHERE host = 'evo-x2';", 'COMMIT;'];
   assert.deepEqual(order.map((part) => tx.indexOf(part)).every((at, k, all) => at >= 0 && (k === 0 || at > all[k - 1])), true, tx);
   assert.ok(!lib.removeTxSql({ role: 'lane_agent_evo_x2', host: 'evo-x2', force: true }).includes('held tickets'));
-  assert.equal(lib.dropRoleSql('lane_agent_evo_x2', 'evo-x2'), "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'lane_agent_evo_x2';\nDELETE FROM lane_dispatch.runners WHERE host = 'evo-x2';\nDROP ROLE IF EXISTS \"lane_agent_evo_x2\";\n");
+  const drop = lib.dropRoleSql('lane_agent_evo_x2', 'evo-x2').split('\n');
+  assert.match(drop[0], /FOR target IN SELECT pid FROM pg_stat_activity WHERE usename = 'lane_agent_evo_x2' AND pid <> pg_backend_pid\(\) LOOP IF NOT pg_terminate_backend\(target, 10000\)/);
+  assert.ok(!drop[0].includes('pg_terminate_backend(pid'), 'pg_terminate_backend is never applied to a scanned pid inside the filter');
+  assert.deepEqual(drop.slice(1), ["DELETE FROM lane_dispatch.runners WHERE host = 'evo-x2';", 'DROP ROLE IF EXISTS "lane_agent_evo_x2";', '']);
 });
 
 test("the policy is wintop's with the host swapped, and the worker config carries the agent's keys", () => {
@@ -1059,6 +1062,31 @@ async function pgScenario(t, mod = lib, { only = false } = {}) {
   assert.equal(leftover.code, 6);
   assert.match(leftover.stderr, /a rule other than reject still names lane_agent_evo_x2/);
 }
+
+test('real postgres: dropping a role terminates only that role\'s sessions, never another login\'s', { skip: NO_PG }, async (t) => {
+  const root = fs.mkdtempSync('/tmp/lrapgdrop-');
+  const data = path.join(root, 'data');
+  const sock = path.join(root, 's');
+  fs.mkdirSync(sock);
+  const must = (cmd, args) => { const r = spawnSync(PG(cmd), args, { encoding: 'utf8' }); assert.equal(r.status, 0, `${cmd}: ${r.stderr}`); return r; };
+  must('initdb', ['-D', data, '-U', 'me', '--auth=trust']);
+  must('pg_ctl', ['-D', data, '-w', '-l', path.join(root, 'log'), '-o', `-c listen_addresses='' -c unix_socket_directories=${sock} -c port=55434`, 'start']);
+  t.after(() => { spawnSync(PG('pg_ctl'), ['-D', data, '-m', 'immediate', 'stop']); fs.rmSync(root, { recursive: true, force: true }); });
+  const psql = (user, sql) => spawnSync(PG('psql'), ['-X', '-At', '-h', sock, '-p', '55434', '-U', user, '-d', 'postgres', '-v', 'ON_ERROR_STOP=1', '-c', sql], { encoding: 'utf8' });
+  assert.equal(psql('me', "CREATE ROLE lane_agent_evo_x2 LOGIN; CREATE ROLE bystander LOGIN; CREATE SCHEMA lane_dispatch; CREATE TABLE lane_dispatch.runners (host text); INSERT INTO lane_dispatch.runners VALUES ('evo-x2'), ('other');").status, 0);
+  const hold = (user) => spawn(PG('psql'), ['-X', '-h', sock, '-p', '55434', '-U', user, '-d', 'postgres', '-c', 'SELECT pg_sleep(60)'], { stdio: 'ignore' });
+  const target = hold('lane_agent_evo_x2');
+  const bystander = hold('bystander');
+  t.after(() => { target.kill('SIGKILL'); bystander.kill('SIGKILL'); });
+  const sessions = (user) => Number(psql('me', `SELECT count(*) FROM pg_stat_activity WHERE usename = '${user}'`).stdout.trim());
+  const ready = Date.now() + 10000;
+  while ((sessions('lane_agent_evo_x2') < 1 || sessions('bystander') < 1) && Date.now() < ready) spawnSync('sleep', ['0.1']);
+  const drop = spawnSync(PG('psql'), ['-X', '-At', '-h', sock, '-p', '55434', '-U', 'me', '-d', 'postgres', '-v', 'ON_ERROR_STOP=1', '-f', '-'], { input: lib.dropRoleSql('lane_agent_evo_x2', 'evo-x2'), encoding: 'utf8' });
+  assert.equal(drop.status, 0, drop.stderr);
+  assert.equal(sessions('bystander'), 1, 'the other login keeps its session');
+  assert.equal(psql('me', "SELECT count(*) FROM pg_roles WHERE rolname = 'lane_agent_evo_x2'").stdout.trim(), '0');
+  assert.equal(psql('me', 'SELECT string_agg(host, \',\') FROM lane_dispatch.runners').stdout.trim(), 'other');
+});
 
 test('real postgres: the invariant query accepts the live-like layout and refuses every way of being admitted earlier', { skip: NO_PG }, (t) => pgScenario(t));
 

@@ -94,9 +94,10 @@ export function removeTxSql({ role, host, force }) {
   ].join('\n');
 }
 
-// The login is already NOLOGIN; once its sessions are gone, a registration that committed in that window is deleted again.
+// The login is already NOLOGIN; once its sessions are confirmed gone (the timeout form waits), a registration that committed in that window is deleted again.
+// The pids are selected first and terminated in a loop: pg_terminate_backend in a WHERE clause can run before the usename filter and kill other sessions.
 export const dropRoleSql = (role, host) => [
-  `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = ${sqlLit(role)};`,
+  `DO $lra$ DECLARE target int; BEGIN FOR target IN SELECT pid FROM pg_stat_activity WHERE usename = ${sqlLit(role)} AND pid <> pg_backend_pid() LOOP IF NOT pg_terminate_backend(target, 10000) THEN RAISE EXCEPTION 'sessions of ${role} did not end within 10 s; re-run remove'; END IF; END LOOP; END $lra$;`,
   `DELETE FROM lane_dispatch.runners WHERE host = ${sqlLit(host)};`,
   `DROP ROLE IF EXISTS ${sqlIdent(role)};`,
   '',
