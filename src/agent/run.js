@@ -11,7 +11,7 @@ import { sampleDevice, updateDeviceGates } from '../device-gates.js';
 
 export const STOP_SETTLE_MS = 45_000;
 
-const UNKNOWN_DEVICE_SAMPLE = { thermal: {}, power: {} };
+const UNKNOWN_DEVICE_SAMPLE = { thermal: {}, power: {}, memory: {} };
 
 export const s3ClientOf = ({ endpoint, region, creds }, options = {}) => createS3Client({ endpoint, region, creds, ...options });
 
@@ -88,10 +88,6 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
     if (now() - deviceSampledAt < config.pollMs) return;
     deviceSampledAt = now();
     reloadDeviceGatesConfig();
-    if (!deviceGatesConfig) {
-      deviceGates = {};
-      return;
-    }
     let sample = UNKNOWN_DEVICE_SAMPLE;
     try {
       sample = await deviceSampler(deviceGatesConfig);
@@ -138,7 +134,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
         if (upgradeRequired) log('UPGRADE REQUIRED: the queue refuses this agent\'s protocol, so no claims are made; update lane-broker and restart the agent');
         else await claimRound();
         const blocked = block();
-        core.tick({ claims: upgradeRequired ? 'stopped: upgrade required' : blocked ? `paused:${blocked}` : 'running', drains: drainsOf(config.stateDir), ...(deviceGatesConfig ? { deviceGates: deviceGateStatus() } : {}) });
+        core.tick({ claims: upgradeRequired ? 'stopped: upgrade required' : blocked ? `paused:${blocked}` : 'running', drains: drainsOf(config.stateDir), ...(Object.keys(deviceGates).length ? { deviceGates: deviceGateStatus() } : {}) });
         writeMetrics(tickAt);
       }
       const lastSignOfLife = () => Math.max(lastLivenessAt, pingAt);

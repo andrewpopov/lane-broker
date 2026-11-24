@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
-import { fingerprintOf } from './state.js';
+import { atomicWriteJson, fingerprintOf, paths, readJsonSafe } from './state.js';
+import { readMemoryPressure } from './memory-pressure.js';
 
 const DEVICE_COMMAND_TIMEOUT_MS = 2000;
 
@@ -36,10 +37,29 @@ const GATES = {
       return known(batteryPercent) && batteryPercent < cfg.minBatteryPercent ? 'battery-low' : null;
     },
   },
+  memory: {
+    defaultOpenSamples: 3,
+    // PKG-404: on by default. 60% sits between a busy but healthy 48 GB Mac (29-45% of RAM swapped or compressed) and the 2026-11-23 thrash (87%).
+    defaults: { maxVmPressureLevel: 1, maxOffloadPercent: 60, maxPsiSomeAvg10: 10 },
+    thresholds: { maxVmPressureLevel: numberIn(1, 4, { integer: true }), maxOffloadPercent: numberIn(1, 1000), maxPsiSomeAvg10: numberIn(0, 100) },
+    informative: (_cfg, { vmPressureLevel, offloadPercent, psiSomeAvg10 }) => known(vmPressureLevel) || known(offloadPercent) || known(psiSomeAvg10),
+    violation: (cfg, { vmPressureLevel, offloadPercent, psiSomeAvg10 }) => {
+      const paging = known(vmPressureLevel) && vmPressureLevel > cfg.maxVmPressureLevel
+        || (known(psiSomeAvg10) ? psiSomeAvg10 > cfg.maxPsiSomeAvg10 : known(offloadPercent) && offloadPercent > cfg.maxOffloadPercent);
+      return paging ? 'memory-pressure' : null;
+    },
+  },
 };
 
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const openSamplesOf = (name, gateCfg) => gateCfg.openSamples ?? GATES[name].defaultOpenSamples;
+
+export function gateConfigOf(name, deviceGates) {
+  const own = deviceGates?.[name];
+  const { defaults } = GATES[name];
+  if (own === false || (own === undefined && !defaults)) return null;
+  return { ...defaults, ...own };
+}
 
 export function deviceGatesProblem(deviceGates) {
   if (!isObject(deviceGates)) return '"deviceGates" must be an object';
@@ -47,18 +67,19 @@ export function deviceGatesProblem(deviceGates) {
     const gate = Object.hasOwn(GATES, name) ? GATES[name] : null;
     if (!gate) return `"deviceGates" has unknown key "${name}"`;
     const where = `"deviceGates.${name}"`;
+    if (gateCfg === false && gate.defaults) continue;
     if (!isObject(gateCfg)) return `${where} must be an object`;
     for (const key of Object.keys(gateCfg)) if (key !== 'openSamples' && !Object.hasOwn(gate.thresholds, key)) return `${where} has unknown key "${key}"`;
     for (const [key, { expects, valid }] of Object.entries(gate.thresholds)) if (gateCfg[key] !== undefined && !valid(gateCfg[key])) return `"deviceGates.${name}.${key}" must be ${expects}`;
     if (gateCfg.openSamples !== undefined && !(Number.isInteger(gateCfg.openSamples) && gateCfg.openSamples > 0)) return `"deviceGates.${name}.openSamples" must be a positive integer`;
-    if (!Object.keys(gate.thresholds).some((key) => gateCfg[key] !== undefined)) return `${where} needs at least one of ${Object.keys(gate.thresholds).join(', ')}`;
+    if (!gate.defaults && !Object.keys(gate.thresholds).some((key) => gateCfg[key] !== undefined)) return `${where} needs at least one of ${Object.keys(gate.thresholds).join(', ')}`;
   }
   return null;
 }
 
-const configuredGates = (deviceGates) => Object.keys(GATES).filter((name) => deviceGates?.[name] !== undefined);
+const configuredGates = (deviceGates) => Object.keys(GATES).filter((name) => gateConfigOf(name, deviceGates) !== null);
 
-const gateViolation = (name, gateCfg, reading) => GATES[name].violation(gateCfg, reading);
+const gateViolation = (name, gateCfg, reading = {}) => GATES[name].violation(gateCfg, reading);
 
 // Shaped like `updateGateState` in load.js. An uninformative sample holds the state; a threshold edit restarts the countdown but
 // leaves `closed` alone, since it is no evidence the device cooled.
@@ -88,8 +109,23 @@ export function updateDeviceGate(prev, name, gateCfg, reading) {
 }
 
 export function updateDeviceGates(prev, deviceGates, sample) {
-  return Object.fromEntries(configuredGates(deviceGates).map((name) => [name, updateDeviceGate(prev?.[name], name, deviceGates[name], sample[name])]));
+  return Object.fromEntries(configuredGates(deviceGates).map((name) => [name, updateDeviceGate(prev?.[name], name, gateConfigOf(name, deviceGates), sample[name] ?? {})]));
 }
+
+const MEMORY_SAMPLE_REUSE_MS = 1000;
+
+// PKG-404: one state file per host for local admission; a reading under a second old is reused, so a busy queue samples once a second.
+export function sampleMemoryGate(root, deviceGates, { read = readMemoryPressure, now = Date.now() } = {}) {
+  const gateCfg = gateConfigOf('memory', deviceGates);
+  if (gateCfg === null) return { closed: false, reason: null };
+  const prev = readJsonSafe(paths(root).memoryGate);
+  if (prev && now - prev.sampledAt >= 0 && now - prev.sampledAt < MEMORY_SAMPLE_REUSE_MS) return prev;
+  const next = { ...updateDeviceGate(prev, 'memory', gateCfg, read()), openSamples: openSamplesOf('memory', gateCfg), sampledAt: now };
+  atomicWriteJson(paths(root).memoryGate, next);
+  return next;
+}
+
+export const readMemoryGate = (root) => readJsonSafe(paths(root).memoryGate) ?? { closed: false, consecutiveOk: 0, reason: null };
 
 export const closedGateReason = (states) => Object.values(states ?? {}).find((state) => state.closed)?.reason ?? null;
 
@@ -165,21 +201,26 @@ const read = async (sensor, io) => {
 };
 
 // A sensor this platform lacks, no threshold needs, or that fails reads null (unknown). Never throws.
-export async function sampleDevice(deviceGates, { platform = process.platform, exec = execCommand, sysRoot = '/sys' } = {}) {
+export async function sampleDevice(deviceGates, { platform = process.platform, exec = execCommand, sysRoot = '/sys', memoryPressure = () => readMemoryPressure({ platform }) } = {}) {
   const io = { exec, sysRoot };
   const sensors = SENSORS[platform] ?? {};
-  const uses = (name, ...keys) => keys.some((key) => deviceGates?.[name]?.[key] !== undefined);
-  const [pressureLevel, cpuSpeedLimit, maxTempC, power] = await Promise.all([
+  const uses = (name, ...keys) => keys.some((key) => gateConfigOf(name, deviceGates)?.[key] !== undefined);
+  const [pressureLevel, cpuSpeedLimit, maxTempC, power, memory] = await Promise.all([
     uses('thermal', 'maxPressureLevel') ? read(sensors.pressureLevel, io) : null,
     uses('thermal', 'minCpuSpeedLimit') ? read(sensors.cpuSpeedLimit, io) : null,
     uses('thermal', 'maxTempC') ? read(sensors.maxTempC, io) : null,
     uses('power', 'requireAc', 'minBatteryPercent') ? read(sensors.power, io) : null,
+    gateConfigOf('memory', deviceGates) ? read(memoryPressure, io) : null,
   ]);
-  return { thermal: { pressureLevel, cpuSpeedLimit, maxTempC }, power: { onAc: power?.onAc ?? null, batteryPercent: power?.batteryPercent ?? null } };
+  return {
+    thermal: { pressureLevel, cpuSpeedLimit, maxTempC },
+    power: { onAc: power?.onAc ?? null, batteryPercent: power?.batteryPercent ?? null },
+    memory: { vmPressureLevel: memory?.vmPressureLevel ?? null, offloadPercent: memory?.offloadPercent ?? null, psiSomeAvg10: memory?.psiSomeAvg10 ?? null },
+  };
 }
 
 export function liveDeviceGates(deviceGates, sample) {
-  return Object.fromEntries(configuredGates(deviceGates).map((name) => [name, { reason: gateViolation(name, deviceGates[name], sample[name]), reading: sample[name], thresholds: deviceGates[name] }]));
+  return Object.fromEntries(configuredGates(deviceGates).map((name) => [name, { reason: gateViolation(name, gateConfigOf(name, deviceGates), sample[name]), reading: sample[name] ?? {}, thresholds: gateConfigOf(name, deviceGates) }]));
 }
 
 const show = (value, format) => (known(value) ? format(value) : 'unknown');
@@ -190,6 +231,14 @@ const GATE_PARTS = {
     t.minCpuSpeedLimit !== undefined && `speed ${show(cpuSpeedLimit, String)}/≥${t.minCpuSpeedLimit}`,
     t.maxTempC !== undefined && `temp ${show(maxTempC, (v) => `${v}C`)}/≤${t.maxTempC}C`,
   ],
+  memory: ({ vmPressureLevel, offloadPercent, psiSomeAvg10 }, t) => {
+    const parts = [
+      known(vmPressureLevel) && `vm pressure ${vmPressureLevel}/≤${t.maxVmPressureLevel}`,
+      known(psiSomeAvg10) && `psi some avg10 ${psiSomeAvg10}/≤${t.maxPsiSomeAvg10}`,
+      known(offloadPercent) && `swap+compressor ${Math.round(offloadPercent)}% of RAM/≤${t.maxOffloadPercent}%`,
+    ];
+    return parts.some(Boolean) ? parts : ['readings unknown'];
+  },
   power: ({ onAc, batteryPercent }, t) => [
     show(onAc, (v) => (v ? 'AC' : 'on battery')),
     t.minBatteryPercent !== undefined && `battery ${show(batteryPercent, (v) => `${v}%`)}`,

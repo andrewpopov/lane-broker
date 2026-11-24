@@ -72,6 +72,7 @@ export function paths(root = stateHome()) {
     pause: path.join(root, 'PAUSE'),
     lock: path.join(root, 'lock'),
     loadGate: path.join(root, 'load-gate.json'),
+    memoryGate: path.join(root, 'memory-gate.json'),
     configWarning: path.join(root, 'config-warning.json'),
     cpuSample: path.join(root, 'cpu-sample.json'),
     cpuGate: path.join(root, 'cpu-gate.json'),

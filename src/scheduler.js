@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { paths, atomicWriteJson, readJsonSafe, withLock, bootId, isCancelled, isExpired, writeExpireMarkerFile, writeCancelMarkerFile, writeSupersededMarkerFile, readSupersededBy, withSupersession, removeSupersededMarker, removeReleasedMarker, isWithdrawn, DEAD_QUEUED_SUPERVISOR_REASON, appendHistory, assertNotMigrating, listJsonRecordsStrict, MigrationInProgressError } from './state.js';
 import { sampleAndUpdateGate, readGateState } from './load.js';
+import { readMemoryGate, sampleMemoryGate } from './device-gates.js';
 import { patchAttemptLocked, readAttempt } from './attempts.js';
 import { listLeases, readLease, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
 import { refreshCpuEstimates } from './cpu-estimates.js';
@@ -643,6 +644,7 @@ function localGates(root, cfg, ticket, held, memoryReader, { cooldown }) {
     memInfo = null;
   }
   if (memInfo && memInfo.macPressure === 'critical') return { admit: false, reason: 'memory-critical' };
+  if (cfg.schedulerMode === 'active' && held.length > 0 && readMemoryGate(root).closed) return { admit: false, reason: 'memory-pressure' };
   if (cfg.schedulerMode === 'active') {
     if (cooldown && cooldownActive(held, cfg)) return { admit: false, reason: 'cooldown' };
     if (memInfo) {
@@ -1650,6 +1652,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     } catch {
       memInfo = null;
     }
+    const memoryGate = sampleMemoryGate(root, cfg.deviceGates);
     // BRAIN-355: a safe backfill must leave room for the blocked head once its conflict clears, so
     // the head's claim joins the held leases for the CPU projection and memory admission.
     const headReservation = { id: headTicket.id, key: headTicket.key, configLane: headTicket.configLane, cmdFingerprint: headTicket.cmdFingerprint, weight: headTicket.weight, resources: headTicket.resources };
@@ -1816,6 +1819,16 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
       return {
         result: { started: false, reason: 'memory-critical', macPressure: memInfo.macPressure },
         logFields: { ...logBase, currentDecision: 'deny', currentReason: 'memory-critical' },
+      };
+    }
+    // PKG-404: like the load gate, a host that is paging runs one lane at a time rather than none, so a lone host still drains its queue.
+    if (cfg.schedulerMode === 'active' && memoryGate.closed && !brokerIdle && !exclusiveHolder) {
+      if (bypassTrial) refuseBypass('memory');
+      if (ticket.id === headTicket.id) markResourceOutOfScope(root, store, headTicket.id, now, writeResourceState);
+      dropPickRecord();
+      return {
+        result: { started: false, reason: 'memory-pressure' },
+        logFields: { ...logBase, currentDecision: 'deny', currentReason: 'memory-pressure' },
       };
     }
     // Phase 1's predicate is an ADDITIONAL constraint, never a replacement
