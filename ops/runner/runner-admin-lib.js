@@ -169,7 +169,7 @@ const rulesThatMayAdmit = (rawLines, role, included) => {
   return entries.filter(({ text }, i) => {
     const rule = parseHbaRule(text);
     if (!rule || rule.method === 'reject') return false;
-    const database = rule.databases.some((name) => [DB_NAME, 'all', 'sameuser', 'samerole'].includes(name) || opaque(name));
+    const database = rule.databases.some((name) => [DB_NAME, 'all', 'sameuser', 'samerole', 'samegroup'].includes(name) || opaque(name));
     if (!database) return false;
     if (rule.users.includes(role)) return true;
     const broad = rule.users.some((name) => name === 'all' || name.startsWith('+') || opaque(name));
@@ -484,29 +484,32 @@ const LOCK_FILE = '/run/lock/lane-runner-admin.lock';
 
 // Postgres's own parse of the files on disk (includes, quoting and continuations resolved) decides whether the edit is safe.
 // psql variables: :'role' :'ip' :'db'. Returns 'ok' or one reason naming file:line.
-export const HBA_ADD_INVARIANT_SQL = `WITH cand AS (
-  SELECT rule_number, file_name, line_number, type, database, user_name, address, netmask, auth_method
-  FROM pg_hba_file_rules
-  WHERE error IS NULL
-    AND (database && ARRAY[:'db', 'all', 'sameuser', 'samerole'] OR EXISTS (SELECT 1 FROM unnest(database) d WHERE d LIKE '/%'))
-    AND (user_name && ARRAY[:'role', 'all'] OR EXISTS (SELECT 1 FROM unnest(user_name) u WHERE u LIKE '+%' OR u LIKE '/%'))
-), tcp AS (
-  SELECT *, row_number() OVER (ORDER BY rule_number) AS n FROM cand WHERE type <> 'local'
-), loc AS (
-  SELECT * FROM cand WHERE type = 'local' ORDER BY rule_number LIMIT 1
+export const HBA_ADD_INVARIANT_SQL = `WITH r AS (
+  SELECT rule_number, file_name, line_number, type, database, user_name, address, netmask, auth_method,
+    type = 'local' AS is_local,
+    (user_name && ARRAY[:'role', 'all'] OR EXISTS (SELECT 1 FROM unnest(user_name) u WHERE u LIKE '+%' OR u LIKE '/%')) AS may,
+    (auth_method = 'reject' AND database && ARRAY['all'] AND user_name && ARRAY[:'role', 'all']
+      AND (type = 'local' OR (type = 'host' AND (address IS NULL OR address = 'all')))) AS barrier,
+    (type = 'hostssl' AND user_name = ARRAY[:'role'] AND database = ARRAY[:'db'] AND address = :'ip' AND netmask = '255.255.255.255' AND auth_method = 'scram-sha-256') AS ours,
+    (database && ARRAY[:'db', 'all', 'sameuser', 'samerole', 'samegroup'] OR EXISTS (SELECT 1 FROM unnest(database) d WHERE d LIKE '/%')) AS db_may,
+    format('%s %s %s %s', type, array_to_string(database, ','), array_to_string(user_name, ','), auth_method) AS what
+  FROM pg_hba_file_rules WHERE error IS NULL
+), m AS (
+  SELECT * FROM r WHERE may
+), c AS (
+  SELECT is_local, min(rule_number) AS rn FROM m WHERE barrier GROUP BY is_local
+), pre AS (
+  SELECT m.* FROM m JOIN c USING (is_local) WHERE m.rule_number < c.rn
 )
 SELECT coalesce(
   (SELECT format('%s:%s: rule error: %s', file_name, line_number, error) FROM pg_hba_file_rules WHERE error IS NOT NULL ORDER BY rule_number LIMIT 1),
-  (SELECT format('no TCP rule can match %s on %s', :'role', :'db') WHERE NOT EXISTS (SELECT 1 FROM tcp)),
-  (SELECT CASE WHEN type = 'hostssl' AND user_name = ARRAY[:'role'] AND database = ARRAY[:'db'] AND address = :'ip' AND netmask = '255.255.255.255' AND auth_method = 'scram-sha-256'
-               THEN NULL ELSE format('%s:%s: the first TCP rule that can match %s on %s is not its own hostssl %s/32 scram-sha-256 line', file_name, line_number, :'role', :'db', :'ip') END
-   FROM tcp WHERE n = 1),
-  (SELECT CASE WHEN type = 'host' AND auth_method = 'reject' AND (address IS NULL OR address = 'all')
-               THEN NULL ELSE format('%s:%s: the TCP rule after the hostssl line is not a catch-all reject', file_name, line_number) END
-   FROM tcp WHERE n = 2),
-  (SELECT 'no catch-all reject follows the hostssl line' WHERE NOT EXISTS (SELECT 1 FROM tcp WHERE n = 2)),
-  (SELECT CASE WHEN auth_method = 'reject' THEN NULL ELSE format('%s:%s: the first local rule that can match %s on %s is not a reject', file_name, line_number, :'role', :'db') END FROM loc),
-  (SELECT format('no local rule rejects %s on %s', :'role', :'db') WHERE NOT EXISTS (SELECT 1 FROM loc)),
+  (SELECT format('no catch-all reject covers %s over TCP', :'role') WHERE NOT EXISTS (SELECT 1 FROM c WHERE NOT is_local)),
+  (SELECT format('%s:%s: a rule before the catch-all reject may admit %s: %s', file_name, line_number, :'role', what) FROM pre WHERE NOT is_local AND auth_method <> 'reject' AND NOT ours ORDER BY rule_number LIMIT 1),
+  (SELECT format('no hostssl line for %s before the catch-all reject', :'role') WHERE (SELECT count(*) FROM pre WHERE NOT is_local AND ours) <> 1),
+  (SELECT format('%s:%s: a reject before the hostssl line of %s would block it: %s', file_name, line_number, :'role', what) FROM pre
+   WHERE NOT is_local AND auth_method = 'reject' AND db_may AND rule_number < (SELECT min(rule_number) FROM pre WHERE NOT is_local AND ours) ORDER BY rule_number LIMIT 1),
+  (SELECT format('no catch-all reject covers %s on local connections', :'role') WHERE NOT EXISTS (SELECT 1 FROM c WHERE is_local)),
+  (SELECT format('%s:%s: a local rule before the catch-all reject may admit %s: %s', file_name, line_number, :'role', what) FROM pre WHERE is_local AND auth_method <> 'reject' ORDER BY rule_number LIMIT 1),
   'ok');
 `;
 
@@ -515,6 +518,8 @@ export const HBA_REMOVE_INVARIANT_SQL = `SELECT coalesce(
   (SELECT format('%s:%s: a rule other than reject still names %s', file_name, line_number, :'role') FROM pg_hba_file_rules WHERE error IS NULL AND auth_method <> 'reject' AND user_name && ARRAY[:'role'] ORDER BY rule_number LIMIT 1),
   'ok');
 `;
+
+export const listFilesCommand = (psql) => `${psql} -X -At -c "SELECT DISTINCT file_name FROM pg_hba_file_rules ORDER BY 1"`;
 
 export const invariantFunctionBody = (psql) => `  if [ "$action" = add ]; then
     ${psql} -X -At -v ON_ERROR_STOP=1 -v "role=$role" -v "ip=$ip" -v "db=$db" -f - <<'LRA_SQL_ADD'
@@ -528,6 +533,7 @@ const SCRIPT_HOOKS = {
   sha: 'sha256sum',
   chown: 'chown',
   invariant: invariantFunctionBody('sudo -n -u postgres psql'),
+  files: listFilesCommand('sudo -n -u postgres psql'),
   reload: `sudo -n -u postgres psql -At -c 'SELECT pg_reload_conf()'`,
   jsonCheck: `python3 -c 'import json,sys; json.load(open(sys.argv[1]))'`,
 };
@@ -541,6 +547,7 @@ path=$1; expect=$2; owner=$3; mode=$4; kind=$5
 action=\${6:-}; role=\${7:-}; ip=\${8:-}; db=\${9:-}
 want=${sha256(content)}
 sha() { ${h.sha} "$1" | cut -d' ' -f1; }
+listfiles() { ${h.files}; }
 invariant() {
 ${h.invariant}
 }
@@ -580,6 +587,14 @@ fi
 case "$kind" in
   hba)
     [ "$action" = add ] || [ "$action" = remove ] || { echo "hba edits need an action of add or remove" >&2; exit 2; }
+    files=$(listfiles) || { echo "could not list the files pg_hba_file_rules read" >&2; exit 6; }
+    [ -n "$files" ] || { echo "pg_hba_file_rules lists no files" >&2; exit 6; }
+    while IFS= read -r f; do
+      [ -r "$f" ] || { echo "pg_hba invariant violated: cannot read $f" >&2; exit 6; }
+      if grep -v '^[[:space:]]*#' "$f" | grep '"' > /dev/null; then echo "pg_hba invariant violated: $f has a quoted field, which pg_hba_file_rules cannot tell from a keyword" >&2; exit 6; fi
+    done <<LRA_FILES_EOF
+$files
+LRA_FILES_EOF
     verdict=$(invariant | tr -d '\r') || verdict="the invariant query failed"
     [ "$verdict" = ok ] || { echo "pg_hba invariant violated: $verdict" >&2; exit 6; } ;;
   json) ${h.jsonCheck} "$path" || { echo "not valid JSON: $path" >&2; exit 6; } ;;
