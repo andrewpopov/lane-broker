@@ -19,6 +19,7 @@ const SPIN_CHATTY = node(`let last = 0; const end = Date.now() + 4500; while (Da
 // silent for longer than the window but not CPU-busy: both watchdogs could fire
 const PRINT_THEN_SLEEP = node(`process.stdout.write('started\\n'); setInterval(() => {}, 1000);`);
 const SILENT_FOR_4S = node(`setTimeout(() => process.stdout.write('late\\n'), 4000);`);
+const SILENT_FOR_30S = node(`setTimeout(() => process.stdout.write('late\\n'), 30000);`);
 
 function localSetup(laneCfg = { silenceTimeoutMs: WINDOW_MS }, globalCfg = {}) {
   const { base, home, state, env } = freshEnv({ LANE_BROKER_TEST_CANCEL_GRACE_MS: '4000' });
@@ -75,7 +76,7 @@ test('local: the per-lane value beats the global one, in both directions', async
   assert.equal(permissive.code, 0, `lane 0 must override the global window; stderr: ${permissive.stderr}`);
 
   const laneStrict = localSetup({ silenceTimeoutMs: WINDOW_MS }, { silenceTimeoutMs: 600_000 });
-  const strict = await run(laneStrict, SILENT_FOR_4S);
+  const strict = await run(laneStrict, SILENT_FOR_30S);
   assert.equal(strict.code, 124, `lane window must override the global one; stderr: ${strict.stderr}`);
   assert.equal(historyOf(laneStrict.state)[0].reason, 'silence');
 });
