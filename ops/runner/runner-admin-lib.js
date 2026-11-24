@@ -94,8 +94,10 @@ export function removeTxSql({ role, host, force }) {
   ].join('\n');
 }
 
-export const dropRoleSql = (role) => [
+// The login is already NOLOGIN; once its sessions are gone, a registration that committed in that window is deleted again.
+export const dropRoleSql = (role, host) => [
   `SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = ${sqlLit(role)};`,
+  `DELETE FROM lane_dispatch.runners WHERE host = ${sqlLit(host)};`,
   `DROP ROLE IF EXISTS ${sqlIdent(role)};`,
   '',
 ].join('\n');
@@ -795,7 +797,7 @@ function buildRemovePlan(ctx) {
     {
       title: `postgres: in one transaction lock the principal, re-check held tickets, set NOLOGIN, delete the principal and runners rows; then terminate sessions and drop role ${role}`,
       kind: 'postgres',
-      preview: async () => `${removeTxSql({ role, host, force })}\n${dropRoleSql(role)}`,
+      preview: async () => `${removeTxSql({ role, host, force })}\n${dropRoleSql(role, host)}`,
       async apply() {
         try {
           await ctx.psql(removeTxSql({ role, host, force }), { label: 'disable role and delete principal' });
@@ -804,7 +806,7 @@ function buildRemovePlan(ctx) {
           if (raced) throw new Error(`${host} claimed ticket(s) while it was being removed: ${raced.trim()}; nothing was changed. Re-run with --force to remove it anyway`);
           throw err;
         }
-        await ctx.psql(dropRoleSql(role), { label: 'drop role' });
+        await ctx.psql(dropRoleSql(role, host), { label: 'drop role' });
         return `role ${role} disabled, its rows deleted and the role dropped`;
       },
     },

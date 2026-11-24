@@ -130,7 +130,7 @@ test('SQL builders quote identifiers and literals, and a dry run shows the passw
   const order = ['BEGIN;', "FROM lane_dispatch.principals WHERE login_role = 'lane_agent_evo_x2' FOR UPDATE;", "RAISE EXCEPTION 'held tickets: %'", 'NOLOGIN', "DELETE FROM lane_dispatch.principals WHERE login_role = 'lane_agent_evo_x2';", "DELETE FROM lane_dispatch.runners WHERE host = 'evo-x2';", 'COMMIT;'];
   assert.deepEqual(order.map((part) => tx.indexOf(part)).every((at, k, all) => at >= 0 && (k === 0 || at > all[k - 1])), true, tx);
   assert.ok(!lib.removeTxSql({ role: 'lane_agent_evo_x2', host: 'evo-x2', force: true }).includes('held tickets'));
-  assert.equal(lib.dropRoleSql('lane_agent_evo_x2'), "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'lane_agent_evo_x2';\nDROP ROLE IF EXISTS \"lane_agent_evo_x2\";\n");
+  assert.equal(lib.dropRoleSql('lane_agent_evo_x2', 'evo-x2'), "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE usename = 'lane_agent_evo_x2';\nDELETE FROM lane_dispatch.runners WHERE host = 'evo-x2';\nDROP ROLE IF EXISTS \"lane_agent_evo_x2\";\n");
 });
 
 test("the policy is wintop's with the host swapped, and the worker config carries the agent's keys", () => {
