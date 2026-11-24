@@ -60,6 +60,31 @@ SELECT lane_dispatch.ld_set_principal('lane_submit_<name>', 'submit', NULL, '{}'
 `pg_hba` pins each login to its host: `hostssl lane_queue_db lane_agent_<host> <host tailnet IP>/32 scram-sha-256`. A login with no
 `lane_dispatch.principals` row (for example the legacy `lane_agent_h1`) is refused by every `ld_*` function.
 
+## Adding and removing a pull runner
+
+`ops/runner/lane-runner-admin.js` (logic in `ops/runner/runner-admin-lib.js`) registers a pull runner on pitelite from the admin's Mac. It reaches pitelite with `ssh pitelite sudo -n` and runs `mc` and `op-bot` locally. The default is a dry run that prints every action (the SQL with the password as `'<redacted>'`, a unified diff of each file it would edit); `--apply` performs the steps in order and stops at the first failure, printing what succeeded and the command to resume. Every step converges, so re-running `add` after a partial failure finishes the job.
+
+```sh
+node ops/runner/lane-runner-admin.js add <host> --ip <tailnet IPv4> [--tags a,b] [--repos '*'|a,b] [--max-claims N] [--out <dir>] [--note <text>] [--apply]
+node ops/runner/lane-runner-admin.js remove <host> [--force] [--apply]
+node ops/runner/lane-runner-admin.js status <host>
+```
+
+`<host>` matches `^[a-z][a-z0-9-]{0,30}$` and `--ip` is inside 100.64.0.0/10. The Postgres role is `lane_agent_<host with - as _>`; the RustFS policy is `lane-runner-<host>`. Run the dry run first, read it, then add `--apply`.
+
+`add` changes, in order:
+
+1. **1Password.** Item `lane-agent <host>` in vault `BotAccess` (via `op-bot`): the role password (32 random bytes, base64url) and the RustFS `rustfs_access_key` / `rustfs_secret_key`. An existing item is read back, never regenerated. Secrets reach `op-bot` through a template file in a 0700 temp dir, removed afterwards.
+2. **Postgres.** `CREATE ROLE ... IN ROLE lane_agent CONNECTION LIMIT 3` (an existing role gets `ALTER ROLE ... PASSWORD` instead), the two per-role timeouts, and `ld_set_principal`. The SQL, password included, goes to `psql` on stdin.
+3. **`pg_hba.conf`.** A `# BEGIN/END lane-runner-admin <host>` block with the `hostssl ... <ip>/32 scram-sha-256` line goes before `local lane_queue_db all reject`, and the role joins the two catch-all reject lists. The file is backed up to `pg_hba.conf.bak-lane-runner-admin-<UTC stamp>`, written, checked with `pg_hba_file_rules`, restored from the backup if any rule has an error, and only then reloaded.
+4. **RustFS.** `mc admin user add`, a policy `lane-runner-<host>` (read `lane-snap/*`, write `lane-out/<host>/*`, read `lane-out/<host>/.probe`) and its attachment. The root credentials come from pitelite's `rustfs.env` into the `mc` child's `MC_HOST_pl` only. `mc admin user add` has no stdin form, so the runner's secret key is briefly in `mc`'s argv on the admin's Mac.
+5. **Train submitter config.** `{"name":"<host>","transport":"pull"}` is added to `.runners` in `/data/train/config/lane-broker/config.json` (backed up, written as user `train`, parse-checked). **`agent_brain/ops/pitelite-controller/provision.sh` writes this file**, so a re-provision drops the runner unless it is added there too.
+6. **Worker files** (with `--out <dir>`, mode 0600 in a 0700 dir): `config.json`, `password`, `rustfs.env` and `ca.pem`. Copy them to `~/.config/lane-agent/` on the worker (see *Config* under `lane agent` in the README).
+
+`remove` first refuses while `lane_dispatch.tickets` has `claimed` or `running` rows for the host (it prints their ids and lanes; `--force` goes on). It then deletes the `principals` and `runners` rows (no foreign key links them), terminates the role's sessions and drops the role; removes the `pg_hba` block and reject-list entries with the same backup, check and reload; detaches and removes the RustFS user and policy (the user is found through the access key in the 1Password item; "not found" is tolerated); and removes the train entry. The 1Password item stays: archive it with `op-bot item delete "lane-agent <host>" --vault BotAccess --archive`.
+
+`status` is read-only and reports the role, principal row, runners row (version, `last_seen`), the `pg_hba` line and reject-list membership, the RustFS user and policy, the train entry, the 1Password item and the host's claimed and running tickets.
+
 ## Reading the queue as lane_reader
 
 `lane_reader` has no USAGE on `lane_dispatch` and no grant on its tables. Monitoring reads three views in schema `lane`, owned by
