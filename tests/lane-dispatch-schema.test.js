@@ -8,7 +8,7 @@ import { pgSkipOption } from './lane-db-harness.js';
 import { startDispatchCluster, World, logins, call, enqueue, claim, tid } from './lane-dispatch-fixture.js';
 
 const AGENT_FUNCTIONS = ['ld_register', 'ld_claim', 'ld_needed_tools', 'ld_start', 'ld_heartbeat', 'ld_finish', 'ld_release', 'ld_log'];
-const SUBMIT_FUNCTIONS = ['ld_enqueue', 'ld_get', 'ld_list_mine', 'ld_withdraw', 'ld_cancel', 'ld_attach_urls', 'ld_log_read', 'ld_log_ack', 'ld_queue_ref', 'ld_enqueue_fenced', 'ld_placeable'];
+const SUBMIT_FUNCTIONS = ['ld_enqueue', 'ld_get', 'ld_list_mine', 'ld_withdraw', 'ld_cancel', 'ld_attach_urls', 'ld_log_read', 'ld_log_ack', 'ld_queue_ref', 'ld_enqueue_fenced', 'ld_placeable', 'ld_ticket_by_key'];
 const ADMIN_FUNCTIONS = ['ld_set_principal', 'ld_reap', 'ld_restore_reset', 'ld_guard', 'ld_prune_candidates', 'ld_prune', 'ld_prune_chunks', 'ld_blobs_live'];
 const GRANTED = { agent: AGENT_FUNCTIONS, submit: SUBMIT_FUNCTIONS, admin: ADMIN_FUNCTIONS, reader: [] };
 const CALLERS = { agent: logins.a1, submit: logins.s1, admin: logins.admin, reader: logins.reader, legacy: logins.legacy };

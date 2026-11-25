@@ -44,12 +44,14 @@ import { lossesReportCommand } from '../src/losses-report.js';
 import { placementReportCommand } from '../src/placement-report.js';
 import { pullCheckCommand } from '../src/pull-check.js';
 import { pullGcCommand } from '../src/pull-gc.js';
+import { ticketByKeyCommand } from '../src/ticket-by-key.js';
 
 function usage() {
   return `Usage:
-  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--group <id>] [--exclusive [--exclusive-purpose upgrade|calibration] [--exclusive-deadline <dur>]] [--no-cache] [--no-reuse] [--retry "<why>"] [--detach [--id <ticket-id>]]
+  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--group <id>] [--exclusive [--exclusive-purpose upgrade|calibration] [--exclusive-deadline <dur>]] [--no-cache] [--no-reuse] [--retry "<why>"] [--detach [--id <ticket-id>]] [--dispatch-key <key>]
            [--timeout <duration>] [--allow-local-sim] [--local] [--log <path>] -- <command...>
   lane status [--json]
+  lane status --dispatch-key <key> [--json]
   lane capabilities --json
   lane suggest [--repo <name>] [--days <n>] [--json]
   lane estimates [--json] [--root <stateHome>]
@@ -173,6 +175,10 @@ function parseRunArgs(args) {
       }
       case '--log':
         opts.log = flagArgs[++i];
+        break;
+      // Validated (exit 64) by runCommand; a missing value is invalid, not absent.
+      case '--dispatch-key':
+        opts.dispatchKey = flagArgs[++i] ?? '';
         break;
       case '--id': {
         const raw = flagArgs[++i];
@@ -300,12 +306,15 @@ async function main() {
         localReason: opts.localReason,
         log: opts.log,
         ticketId: opts.ticketId,
+        dispatchKey: opts.dispatchKey,
         cmd,
       });
       return result.exitCode;
     }
     case 'status': {
       const json = rest.includes('--json');
+      const keyAt = rest.indexOf('--dispatch-key');
+      if (keyAt !== -1) return (await ticketByKeyCommand({ dispatchKey: rest[keyAt + 1] ?? '', json })).exitCode;
       const result = await statusCommand({ json });
       return result.exitCode;
     }

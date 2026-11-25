@@ -605,6 +605,9 @@ DROP FUNCTION IF EXISTS lane_dispatch.ld_claim(uuid, real, bigint, text[], text[
 DROP FUNCTION IF EXISTS lane_dispatch.ld_claim(uuid, real, bigint, text[], text[], real, bigint);
 -- PKG-437 adds the trailing p_reason to return_to_queue (an internal function; no caller outside this file).
 DROP FUNCTION IF EXISTS lane_dispatch.return_to_queue(uuid, timestamptz);
+-- PKG-438 (migration 012) adds the trailing p_dispatch_key to both enqueues; a default on a longer overload would make the old 18- and 19-argument calls ambiguous.
+DROP FUNCTION IF EXISTS lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real);
+DROP FUNCTION IF EXISTS lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real);
 
 -- Every clock read in lane_dispatch goes through now(). The GUC lane.test_now moves it for tests, but only when the value is the one stored by ALTER DATABASE or
 -- ALTER ROLE (pg_db_role_setting): a session SET to anything else, which any login can issue, is ignored, so a runner cannot move the queue's clock.
@@ -789,26 +792,65 @@ BEGIN
                                            allowed_repos = EXCLUDED.allowed_repos, max_claims = EXCLUDED.max_claims;
 END $$;
 
+-- The one definition of "this key is taken": a withdrawn row has given its key up, a terminal ticket keeps it.
+CREATE OR REPLACE FUNCTION lane_dispatch.key_holder(p_dispatch_key text) RETURNS TABLE (id uuid, owner text)
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  RETURN QUERY SELECT t.id, t.owner FROM lane_dispatch.tickets t WHERE t.dispatch_key = p_dispatch_key AND t.state <> 'withdrawn';
+END $$;
+
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_enqueue(p_id uuid, p_repo_key text, p_lane text, p_lane_key text, p_binding jsonb, p_header jsonb, p_snapshot jsonb,
                                                     p_requires_tags text[], p_cpu_cores real, p_memory_bytes bigint, p_priority int DEFAULT 0, p_min_protocol int DEFAULT 1,
                                                     p_ages boolean DEFAULT true, p_source text DEFAULT NULL, p_est_run_s real DEFAULT NULL, p_avoid_tags text[] DEFAULT '{}',
-                                                    p_requires text[] DEFAULT '{}', p_min_cpu_cores real DEFAULT NULL)
+                                                    p_requires text[] DEFAULT '{}', p_min_cpu_cores real DEFAULT NULL, p_dispatch_key text DEFAULT NULL)
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record; v_held record;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('submit');
+  IF p_dispatch_key IS NOT NULL THEN
+    IF p_dispatch_key !~ '^[A-Za-z0-9:._/-]{1,200}$' THEN
+      RAISE EXCEPTION 'dispatch key must be 1-200 characters of [A-Za-z0-9:._/-]' USING ERRCODE = '22023';
+    END IF;
+    -- a live ticket under this key is the submission: the same ticket whatever id this call carries
+    SELECT h.id, h.owner INTO v_held FROM lane_dispatch.key_holder(p_dispatch_key) h;
+    IF FOUND THEN
+      IF v_held.owner <> session_user THEN RAISE EXCEPTION 'dispatch key % is held by another owner', p_dispatch_key USING ERRCODE = 'LK409'; END IF;
+      RETURN lane_dispatch.ticket_view(v_held.id, session_user);
+    END IF;
+  END IF;
+  BEGIN
+    INSERT INTO lane_dispatch.tickets (id, owner, repo_key, lane, lane_key, binding, header, snapshot, requires_tags, cpu_cores, memory_bytes, priority, incarnation,
+                                       min_protocol, ages, source, est_run_s, avoid_tags, requires, min_cpu_cores, dispatch_key, created_at, status_changed_at)
+      VALUES (p_id, session_user, p_repo_key, p_lane, p_lane_key, p_binding, p_header, p_snapshot, coalesce(p_requires_tags, '{}'), p_cpu_cores, p_memory_bytes,
+              coalesce(p_priority, 0), (SELECT c.incarnation FROM lane_dispatch.cluster c), coalesce(p_min_protocol, 1), coalesce(p_ages, true), p_source, p_est_run_s,
+              coalesce(p_avoid_tags, '{}'), coalesce(p_requires, '{}'), CASE WHEN p_min_cpu_cores < p_cpu_cores THEN p_min_cpu_cores END, p_dispatch_key, lane_dispatch.now(), lane_dispatch.now())
+      ON CONFLICT (id) DO NOTHING;
+    IF FOUND THEN PERFORM pg_notify('ld_work', ''); END IF;
+  EXCEPTION WHEN unique_violation THEN
+    -- only the key index can raise here (the id conflict is absorbed above): a concurrent submit with this key committed first, so its ticket is the answer
+    SELECT h.id, h.owner INTO v_held FROM lane_dispatch.key_holder(p_dispatch_key) h;
+    IF NOT FOUND THEN RAISE; END IF;
+    IF v_held.owner <> session_user THEN RAISE EXCEPTION 'dispatch key % is held by another owner', p_dispatch_key USING ERRCODE = 'LK409'; END IF;
+    RETURN lane_dispatch.ticket_view(v_held.id, session_user);
+  END;
+  IF NOT EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user) THEN
+    RAISE EXCEPTION 'ticket % already exists', p_id USING ERRCODE = '23505';
+  END IF;
+  -- the id is taken by a ticket that never held this key (the key was not attached), so it is not the submission the caller means
+  IF p_dispatch_key IS NOT NULL AND EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.dispatch_key IS DISTINCT FROM p_dispatch_key) THEN
+    RAISE EXCEPTION 'ticket % already exists under another dispatch key', p_id USING ERRCODE = '23505';
+  END IF;
+  RETURN lane_dispatch.ticket_view(p_id, session_user);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_ticket_by_key(p_dispatch_key text) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 DECLARE v_me record;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT * INTO v_me FROM lane_dispatch.me('submit');
-  INSERT INTO lane_dispatch.tickets (id, owner, repo_key, lane, lane_key, binding, header, snapshot, requires_tags, cpu_cores, memory_bytes, priority, incarnation,
-                                     min_protocol, ages, source, est_run_s, avoid_tags, requires, min_cpu_cores, created_at, status_changed_at)
-    VALUES (p_id, session_user, p_repo_key, p_lane, p_lane_key, p_binding, p_header, p_snapshot, coalesce(p_requires_tags, '{}'), p_cpu_cores, p_memory_bytes,
-            coalesce(p_priority, 0), (SELECT c.incarnation FROM lane_dispatch.cluster c), coalesce(p_min_protocol, 1), coalesce(p_ages, true), p_source, p_est_run_s,
-            coalesce(p_avoid_tags, '{}'), coalesce(p_requires, '{}'), CASE WHEN p_min_cpu_cores < p_cpu_cores THEN p_min_cpu_cores END, lane_dispatch.now(), lane_dispatch.now())
-    ON CONFLICT (id) DO NOTHING;
-  IF FOUND THEN PERFORM pg_notify('ld_work', ''); END IF;
-  IF NOT EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user) THEN
-    RAISE EXCEPTION 'ticket % already exists', p_id USING ERRCODE = '23505';
-  END IF;
-  RETURN lane_dispatch.ticket_view(p_id, session_user);
+  RETURN (SELECT lane_dispatch.ticket_view(h.id, session_user) FROM lane_dispatch.key_holder(p_dispatch_key) h WHERE h.owner = session_user);
 END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_get(p_id uuid) RETURNS jsonb
@@ -1160,7 +1202,7 @@ END $$;
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_enqueue_fenced(p_expect_ref text, p_id uuid, p_repo_key text, p_lane text, p_lane_key text, p_binding jsonb,
                                                            p_header jsonb, p_snapshot jsonb, p_requires_tags text[], p_cpu_cores real, p_memory_bytes bigint, p_priority int DEFAULT 0, p_min_protocol int DEFAULT 1,
                                                            p_ages boolean DEFAULT true, p_source text DEFAULT NULL, p_est_run_s real DEFAULT NULL, p_avoid_tags text[] DEFAULT '{}',
-                                                           p_requires text[] DEFAULT '{}', p_min_cpu_cores real DEFAULT NULL)
+                                                           p_requires text[] DEFAULT '{}', p_min_cpu_cores real DEFAULT NULL, p_dispatch_key text DEFAULT NULL)
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 DECLARE v_me record; v_ref text;
 BEGIN
@@ -1174,7 +1216,7 @@ BEGIN
     RETURN jsonb_build_object('state', 'stale-queue-ref', 'queue_ref', v_ref);
   END IF;
   RETURN lane_dispatch.ld_enqueue(p_id, p_repo_key, p_lane, p_lane_key, p_binding, p_header, p_snapshot, p_requires_tags, p_cpu_cores, p_memory_bytes, p_priority,
-                                  p_min_protocol, p_ages, p_source, p_est_run_s, p_avoid_tags, p_requires, p_min_cpu_cores);
+                                  p_min_protocol, p_ages, p_source, p_est_run_s, p_avoid_tags, p_requires, p_min_cpu_cores, p_dispatch_key);
 END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_placeable(p_repo_key text, p_requires_tags text[]) RETURNS int
@@ -1331,7 +1373,7 @@ BEGIN
     CREATE OR REPLACE VIEW lane.pull_runners AS
       SELECT host, last_seen FROM lane_dispatch.runners;
   END IF;
-  -- PKG-437: merge-train's read contract. The _v1 column list is final; a change is a new view. dispatch_key is filled in place by PKG-438.
+  -- PKG-437: merge-train's read contract. The _v1 column list is final; a change is a new view. dispatch_key is NULL until migration 012 adds the column (PKG-438), then the ticket's key.
   -- updated_at is monotonic: status_changed_at is stamped at every state transition and log_state mark, late_result_at at every late result.
   IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('lane_dispatch.tickets') AND attname = 'status_changed_at' AND NOT attisdropped) THEN
     CREATE OR REPLACE VIEW lane.ticket_status_v1 AS
@@ -1339,6 +1381,14 @@ BEGIN
              (result ->> 'logSha256') IS NOT NULL AS log_ready, result ->> 'logSha256' AS log_sha256, log_state, late_result_at,
              greatest(status_changed_at, late_result_at) AS updated_at
         FROM lane_dispatch.tickets;
+  END IF;
+  -- PKG-438: the same view with the real key, once migration 012 has added the column (the column list and order are the _v1 contract).
+  IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('lane_dispatch.tickets') AND attname = 'dispatch_key' AND NOT attisdropped) THEN
+    CREATE OR REPLACE VIEW lane.ticket_status_v1 AS
+      SELECT t.dispatch_key, t.id AS ticket_id, t.repo_key, t.lane, t.state, t.epoch AS claim_generation, t.host, t.lease_until, t.result,
+             (t.result ->> 'logSha256') IS NOT NULL AS log_ready, t.result ->> 'logSha256' AS log_sha256, t.log_state, t.late_result_at,
+             greatest(t.status_changed_at, t.late_result_at) AS updated_at
+        FROM lane_dispatch.tickets t;
   END IF;
 END $$;
 
@@ -1410,10 +1460,10 @@ GRANT USAGE ON SCHEMA lane_dispatch TO lane_agent, lane_submit, lane_admin;
 GRANT EXECUTE ON FUNCTION lane_dispatch.ld_register(text, int, jsonb), lane_dispatch.ld_claim(uuid, real, bigint, text[], text[], real, bigint, real, real), lane_dispatch.ld_needed_tools(), lane_dispatch.ld_start(uuid, int, uuid),
   lane_dispatch.ld_heartbeat(uuid, int, uuid), lane_dispatch.ld_finish(uuid, int, uuid, jsonb), lane_dispatch.ld_release(uuid, int, uuid, text),
   lane_dispatch.ld_log(uuid, int, uuid, int, bytea) TO lane_agent;
-GRANT EXECUTE ON FUNCTION lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real), lane_dispatch.ld_get(uuid),
+GRANT EXECUTE ON FUNCTION lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real, text), lane_dispatch.ld_get(uuid), lane_dispatch.ld_ticket_by_key(text),
   lane_dispatch.ld_list_mine(text[], int), lane_dispatch.ld_withdraw(uuid), lane_dispatch.ld_cancel(uuid), lane_dispatch.ld_attach_urls(uuid, int, jsonb),
   lane_dispatch.ld_log_read(uuid, int, int), lane_dispatch.ld_log_ack(uuid, int, int), lane_dispatch.ld_queue_ref(),
-  lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real), lane_dispatch.ld_placeable(text, text[]) TO lane_submit;
+  lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real, text), lane_dispatch.ld_placeable(text, text[]) TO lane_submit;
 GRANT EXECUTE ON FUNCTION lane_dispatch.ld_set_principal(text, text, text, text[], text[], int), lane_dispatch.ld_reap(interval, interval, interval),
   lane_dispatch.ld_restore_reset(), lane_dispatch.ld_guard(interval), lane_dispatch.ld_prune_candidates(interval, interval, timestamptz, uuid, int),
   lane_dispatch.ld_prune(uuid[], interval), lane_dispatch.ld_prune_chunks(interval, int), lane_dispatch.ld_blobs_live(jsonb) TO lane_admin;

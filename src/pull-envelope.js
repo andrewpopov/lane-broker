@@ -1,11 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
+import { isDispatchKey } from './dispatch-key.js';
 import { atomicWriteJson, ensureDurableDir, fsyncDirectory, paths, readJsonSafe, withLock } from './state.js';
 
 export const ENVELOPE_VERSION = 1;
 const TICKET_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const REQUIRED_FIELDS = ['logicalId', 'binding', 'header', 'repoKey', 'lane', 'laneKey', 'cpuCores', 'memoryBytes', 'requiresTags', 'priority'];
+// optional, so an envelope written before PKG-438 still reads: dispatchKey (the caller's idempotency key)
 const REQUIRED_BINDING_FIELDS = ['protocol', 'generation', 'manifestHash'];
 
 export const pullTicketDir = (root, id) => path.join(paths(root).pull, id);
@@ -28,6 +30,7 @@ function validate(envelope) {
   if (!TICKET_ID_RE.test(envelope.logicalId ?? '')) throw new Error('pull envelope logicalId must be a ticket uuid');
   const missing = REQUIRED_FIELDS.filter((field) => envelope[field] === undefined);
   const missingBinding = REQUIRED_BINDING_FIELDS.filter((field) => envelope.binding?.[field] === undefined);
+  if (envelope.dispatchKey !== undefined && !isDispatchKey(envelope.dispatchKey)) throw new Error('pull envelope dispatchKey is not a valid dispatch key');
   if (missing.length + missingBinding.length > 0) throw new Error(`pull envelope lacks ${[...missing, ...missingBinding.map((f) => `binding.${f}`)].join(', ')}`);
   return envelope;
 }
