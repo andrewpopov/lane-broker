@@ -73,7 +73,7 @@ is_on_path() {
 
 system_lacks() {
   on_path bash -c '[ "${BASH_VERSINFO[0]}" -ge 5 ]' > /dev/null 2>&1 || echo "bash >= 5 ($hint_bash)"
-  on_path timeout --version 2> /dev/null | grep -q 'GNU coreutils' || echo "GNU timeout ($hint_timeout)"
+  on_path timeout -k 1 5 true > /dev/null 2>&1 || echo "timeout with -k ($hint_timeout)"
   local lock
   lock=$(mktemp "${TMPDIR:-/tmp}/runner-prereqs.XXXXXX")
   on_path flock "$lock" true > /dev/null 2>&1 || echo "flock ($hint_flock)"
