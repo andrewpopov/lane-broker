@@ -133,9 +133,9 @@ test('a detached niced lane descendant carrying the lease marker is excluded; on
 });
 
 test('marker readers: Linux /proc/<pid>/environ and macOS ps -E with the argv prefix stripped', () => {
-  const env = { '/proc/7/environ': 'A=1\0LANE_BROKER_LEASE=L9\0', '/proc/8/environ': 'A=1\0' };
+  const env = { '/proc/7/environ': 'A=1\0LANE_BROKER_LEASE=L9\0', '/proc/8/environ': 'A=1\0', '/proc/10/environ': 'A=1\0LANE_BROKER_REAP_TAG=L9\0' };
   const fsApi = { readFileSync: (f) => { if (f in env) return env[f]; throw Object.assign(new Error('x'), { code: 'EACCES' }); } };
-  assert.deepEqual([...readLeaseMarkers([7, 8, 9], ['L9'], { platform: 'linux', fsApi })], [[7, true], [8, false], [9, null]]);
+  assert.deepEqual([...readLeaseMarkers([7, 8, 9, 10], ['L9'], { platform: 'linux', fsApi })], [[7, true], [8, false], [9, null], [10, true]]);
   // 7: marker in the environment. 8: an argument spells the marker but ps shows no environment (SIP-hidden) -> unknown.
   // 10: environment visible, no marker -> genuinely external. 11: argv changed between the two reads -> unknown.
   const exec = (_cmd, args) =>

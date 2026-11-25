@@ -8,7 +8,8 @@ import { execFileSync } from 'node:child_process';
  * token at cancel / leader exit. A recorded pid whose token changed was reused by an unrelated process.
  *
  * A process is in the tree when it descends from the leader (ppid walk), descends from a recorded member, or carries
- * `LANE_BROKER_LEASE=<lease id>` in its environment (inherited from the leader, so it survives reparenting to init).
+ * `LANE_BROKER_LEASE=<lease id>` or `LANE_BROKER_REAP_TAG=<lease id>` in its environment (inherited, so it survives
+ * reparenting to init; the reap tag survives a suite that deletes LANE_BROKER_LEASE, BRAIN-1197).
  */
 
 const READ_ATTEMPTS = 3;
@@ -44,8 +45,15 @@ export function resetProcUnitsCache() {
 // Test-only seam (README "Testing hooks"): the grace between TERM and KILL when a cancel reaps a lease's group and descendants.
 export const cancelGraceMs = () => Number(process.env.LANE_BROKER_TEST_CANCEL_GRACE_MS) || 10_000;
 
-export function leaseMarker(leaseId) {
-  return `LANE_BROKER_LEASE=${leaseId}`;
+export const REAP_TAG_VAR = 'LANE_BROKER_REAP_TAG';
+
+export function leaseMarkers(leaseId) {
+  return [`LANE_BROKER_LEASE=${leaseId}`, `${REAP_TAG_VAR}=${leaseId}`];
+}
+
+/** Does an environment (as `NAME=value` entries) carry either marker of `leaseId`? */
+export function carriesLeaseMarker(entries, leaseId) {
+  return leaseMarkers(leaseId).some((marker) => entries.includes(marker));
 }
 
 /** Linux: /proc/<pid>/stat. comm may hold spaces/parens, so split after the last ')'. `uptimeSec` turns starttime into pcpu like ps does. */
@@ -100,7 +108,7 @@ export function parsePsTable(text, leaseId, envText = '') {
     const withEnv = envOf.get(pid);
     const env = envSuffix(command, withEnv);
     const envWords = env.split(/\s+/);
-    const markedLeases = ids?.filter((id) => envWords.includes(leaseMarker(id)));
+    const markedLeases = ids?.filter((id) => carriesLeaseMarker(envWords, id));
     rows.push({
       pid,
       ppid: Number(m[2]),
@@ -108,7 +116,7 @@ export function parsePsTable(text, leaseId, envText = '') {
       pcpu: Number(m[4]),
       rss: Number(m[5]),
       token: m[6].replace(/\s+/g, ' '),
-      marked: ids ? markedLeases.length > 0 : leaseId !== undefined && envWords.includes(leaseMarker(leaseId)),
+      marked: ids ? markedLeases.length > 0 : leaseId !== undefined && carriesLeaseMarker(envWords, leaseId),
       ...(ids ? { markedLeases } : {}),
     });
   }
@@ -135,10 +143,10 @@ export function readProcRow(name, leaseId, uptimeSec, fsApi = fs, units) {
     try {
       const env = fsApi.readFileSync(`/proc/${name}/environ`, 'utf8').split('\0');
       if (Array.isArray(leaseId)) {
-        row.markedLeases = leaseId.filter((id) => env.includes(leaseMarker(id)));
+        row.markedLeases = leaseId.filter((id) => carriesLeaseMarker(env, id));
         row.marked = row.markedLeases.length > 0;
       } else {
-        row.marked = env.includes(leaseMarker(leaseId));
+        row.marked = carriesLeaseMarker(env, leaseId);
       }
     } catch {
       if (Array.isArray(leaseId)) row.markedLeases = [];
