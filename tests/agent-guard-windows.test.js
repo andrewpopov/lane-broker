@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { SLEEP, scenarioSuite } from './agent-run-harness.js';
+import { DEFAULT_MAX_RUN_MS } from '../src/agent/config.js';
 import { wait, runningLane, skewClock } from './helpers/agent-guard-fixture.js';
 
 const EXEC = 'agent/execution.js';
@@ -32,6 +33,24 @@ const scenarios = {
     const final = await w.ticket(ticket.id);
     assert.deepEqual([final.result.kind, final.result.exit, final.result.reason, final.result.runLimitMs], ['completed', 124, 'run-limit', 60_000]);
     assert.match(rw.s3.objects.get(`lane-out/a1/${ticket.id}/e${row.epoch}/log`).body.toString(), /run limit/);
+  },
+
+  'a pull lane whose output keeps growing past 2 h is not killed under the default run limit': async (w, rw, load) => {
+    const clock = skewClock();
+    const code = 'let n = 0; const t = setInterval(() => { console.log(`test ${++n} ok`); if (n === 25) { clearInterval(t); process.exit(0); } }, 100);';
+    const { ticket, agent, execId } = await runningLane(w, rw, load, { code, config: { maxRunMs: DEFAULT_MAX_RUN_MS }, timing: { guardMs: 100 }, now: clock.now });
+    clock.advance(2 * 3_600_000 + 60_000);
+    await rw.untilGone(agent, execId, wait(load));
+    const final = await w.ticket(ticket.id);
+    assert.deepEqual([final.result.kind, final.result.exit], ['completed', 0]);
+  },
+
+  'a pull lane that stops writing is killed by silence at its window, long before the run limit': async (w, rw, load) => {
+    const ticket = await rw.submit({ code: SLEEP });
+    const agent = await rw.agent({ load, config: { maxRunMs: DEFAULT_MAX_RUN_MS, silenceTimeoutMs: 600 }, timing: { guardMs: 100 } });
+    await rw.untilGone(agent, rw.execId(await rw.claimed(ticket)), wait(load));
+    const final = await w.ticket(ticket.id);
+    assert.deepEqual([final.result.kind, final.result.exit, final.result.reason, final.result.silenceTimeoutMs, final.result.runLimitMs ?? null], ['completed', 124, 'silence', 600, null]);
   },
 };
 

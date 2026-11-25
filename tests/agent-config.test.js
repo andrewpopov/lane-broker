@@ -33,6 +33,7 @@ test('T5 a valid config builds a verify-full pg config with the password from it
     ssl: { ca: 'CA PEM\n', rejectUnauthorized: true, servername: 'pitelite' },
   });
   assert.deepEqual([config.speedFactor, config.pollMs, config.schedule, config.fetchBudgetMs, config.runnerName, config.deviceGates], [1, 15_000, null, 600_000, 'wintop', null]);
+  assert.equal(config.maxRunMs, 21_600_000);
   assert.equal('requireAcPower' in config, false);
 });
 
