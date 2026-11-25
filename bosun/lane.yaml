@@ -1,7 +1,7 @@
 schema: 1
 contract: 1
 name: lane
-version: 1
+version: 2
 kind: service
 platforms: [darwin, linux]
 compat:
@@ -13,12 +13,16 @@ params:
 setup:
   argv: ["${self}/bosun/runner-prereqs.sh", "--path", "${param:runnerPath}"]
   timeoutSeconds: 1800
+requires:
+  - { phase: install, userManager: true }
 run:
   argv: ["${node}", "${self}/bin/lane.js", "agent"]
   cwd: "${home}"
   restart: always
   stopSignal: SIGTERM
   stopDeadlineSeconds: 60
+  platforms:
+    linux: { requiresUserManager: true }
 readiness:
   kind: textfile-fresh
   file: "${textfileDir}/lane-agent.prom"
