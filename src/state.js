@@ -277,6 +277,11 @@ export function releasedMarkerPath(root, id) {
   return path.join(paths(root).released, id);
 }
 
+/** Every per-ticket marker file for `id`: the one list `clearTicketMarkers` and GC both delete from. */
+export function ticketMarkerPaths(root, id) {
+  return [cancelMarkerPath(root, id), expireMarkerPath(root, id), withdrawMarkerPath(root, id), supersededMarkerPath(root, id), releasedMarkerPath(root, id)];
+}
+
 export function removeReleasedMarker(root, id) {
   try {
     fs.unlinkSync(releasedMarkerPath(root, id));

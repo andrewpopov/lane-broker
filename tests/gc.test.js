@@ -9,7 +9,7 @@ import { makeTmpDir } from './helpers/tmp.js';
 import { gcRemoteTickets, gcLogsAndResults, maybeDailyGc, tmpBase, TMP_OWNER_FILE } from '../src/gc.js';
 import { enqueue } from '../src/scheduler.js';
 import { writeLease } from '../src/lease.js';
-import { paths, atomicWriteFile, processStartTime, tombstonePath, writeCancelMarkerFile, writeWithdrawMarkerFile, writeExpireMarkerFile } from '../src/state.js';
+import { paths, atomicWriteFile, processStartTime, tombstonePath, ticketMarkerPaths, writeCancelMarkerFile, writeWithdrawMarkerFile, writeExpireMarkerFile } from '../src/state.js';
 import { appendRotatingLog, logAdmissionDecision, ADMISSION_LOG_MAX_BYTES } from '../src/admission.js';
 import { DEFAULT_GLOBAL_CONFIG, loadGlobalConfig } from '../src/config.js';
 import { serializeHeader, encodeSnapshot } from '../src/remote-stream.js';
@@ -121,21 +121,6 @@ const LIVE_CASES = {
     await enqueue(state, ticketOf(laneId));
     return { laneId };
   },
-  'a cancel marker is pending': async (state) => {
-    const laneId = crypto.randomUUID();
-    writeCancelMarkerFile(state, laneId);
-    return { laneId };
-  },
-  'a withdraw marker is pending': async (state) => {
-    const laneId = crypto.randomUUID();
-    writeWithdrawMarkerFile(state, laneId);
-    return { laneId };
-  },
-  'an expiry marker is pending': async (state) => {
-    const laneId = crypto.randomUUID();
-    writeExpireMarkerFile(state, laneId);
-    return { laneId };
-  },
   'it is tombstoned': async () => ({ tombstone: true }),
 };
 
@@ -153,6 +138,76 @@ for (const [why, arrange] of Object.entries(LIVE_CASES)) {
       fs.rmSync(t.tmpDir, { recursive: true, force: true });
     });
   }
+}
+
+// ---- cancel/withdraw/expire markers hold a ticket only until it is provably finished ----
+
+const MARKERS = { cancel: writeCancelMarkerFile, withdraw: writeWithdrawMarkerFile, expire: writeExpireMarkerFile };
+const markerFiles = (state, laneId) => ticketMarkerPaths(state, laneId).filter((f) => fs.existsSync(f));
+
+for (const [kind, writeMarker] of Object.entries(MARKERS)) {
+  const markedTicket = (state, remoteRoot, opts) => {
+    const laneId = crypto.randomUUID();
+    writeMarker(state, laneId);
+    return { laneId, t: makeTicket(remoteRoot, { laneId, work: false, ...opts }) };
+  };
+
+  test(`PKG-424: an expired, finished, unleased ticket with a ${kind} marker is collected and its markers removed`, async () => {
+    const { state, remoteRoot } = setup();
+    const { laneId, t } = markedTicket(state, remoteRoot, { ageMs: RETENTION + DAY });
+    const summary = await gc(remoteRoot, state);
+    assert.equal(summary.tickets, 1);
+    assert.equal(summary.skippedLive + summary.skippedMarker, 0);
+    assert.equal(fs.existsSync(t.dir), false);
+    assert.deepEqual(markerFiles(state, laneId), []);
+  });
+
+  test(`PKG-424: a ${kind} marker keeps a ticket still inside retention, and the marker stays`, async () => {
+    const { state, remoteRoot } = setup();
+    const { laneId, t } = markedTicket(state, remoteRoot, { ageMs: RETENTION - DAY });
+    const summary = await gc(remoteRoot, state);
+    assert.equal(summary.skippedLive, 1);
+    assert.equal(summary.skippedMarker, 0);
+    assert.ok(fs.existsSync(t.dir));
+    assert.equal(markerFiles(state, laneId).length, 1);
+  });
+
+  test(`PKG-424: a ${kind} marker keeps an expired ticket that never published a result, counted as skippedMarker`, async () => {
+    const { state, remoteRoot } = setup();
+    const { laneId, t } = markedTicket(state, remoteRoot, { ageMs: RETENTION + DAY, result: false });
+    const summary = await gc(remoteRoot, state);
+    assert.equal(summary.skippedMarker, 1);
+    assert.equal(summary.skippedLive, 0);
+    assert.equal(summary.tickets, 0);
+    assert.ok(fs.existsSync(t.dir));
+    assert.equal(markerFiles(state, laneId).length, 1);
+  });
+
+  test(`PKG-424: --dry-run counts a collectable ${kind}-marked ticket and changes nothing`, async () => {
+    const { state, remoteRoot } = setup();
+    const { laneId, t } = markedTicket(state, remoteRoot, { ageMs: RETENTION + DAY });
+    const summary = await gc(remoteRoot, state, { dryRun: true });
+    assert.equal(summary.tickets, 1);
+    assert.ok(fs.existsSync(t.dir));
+    assert.equal(markerFiles(state, laneId).length, 1);
+  });
+}
+
+for (const [how, hold] of Object.entries({
+  leased: async (state, laneId) => writeLease(state, { ...ticketOf(laneId), supervisorPid: process.pid }),
+  queued: async (state, laneId) => enqueue(state, ticketOf(laneId)),
+})) {
+  test(`PKG-424: an expired, finished ticket with a cancel marker is kept while its id is ${how}`, async () => {
+    const { state, remoteRoot } = setup();
+    const laneId = crypto.randomUUID();
+    await hold(state, laneId);
+    writeCancelMarkerFile(state, laneId);
+    const t = makeTicket(remoteRoot, { laneId, work: false, ageMs: RETENTION + DAY });
+    const summary = await gc(remoteRoot, state);
+    assert.equal(summary.skippedLive, 1);
+    assert.ok(fs.existsSync(t.dir));
+    assert.equal(markerFiles(state, laneId).length, 1);
+  });
 }
 
 // ---- whole ticket dirs past retention ----
