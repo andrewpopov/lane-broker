@@ -17,6 +17,7 @@ function sleep(ms) {
 }
 
 const msUntil = (deadline) => Math.max(0, deadline - Date.now());
+export const CANCEL_REQUESTED_EXIT_CODE = 75;
 
 /** TERM the group, wait a grace period, KILL, verify gone. Used when there is no supervisor left to do it.
  *  Also reaps the descendants the dead supervisor last recorded on the lease (BRAIN-419), token-checked.
@@ -207,10 +208,12 @@ export async function cancelCommand(id, { exec, quiet = false, deadline } = {}) 
     }, { timeoutMs: deadline === undefined ? undefined : msUntil(deadline) });
   } catch (err) {
     if (!(err instanceof LockTimeoutError)) throw err;
-    // PKG-462: the marker is durable and the waiting supervisor checks it every poll and dequeues under its own lock
+    // PKG-462: only a ticket still queued (no lease, no attempt) has a waiting supervisor that consumes the marker; 75 is "requested, not confirmed"
+    const queuedOnly = listQueue(root).some((t) => t && t.id === id) && !readLease(root, id) && !readAttempt(root, id);
+    if (!queuedOnly) throw err;
     writeCancelMarkerFile(root, id);
-    say(`lane cancel: cancel requested for ${id} (marker written; the waiting supervisor will dequeue it)\n`);
-    return { exitCode: 0 };
+    say(`lane cancel: cancel requested for ${id} (the broker lock is busy; the waiting supervisor will dequeue it)\n`);
+    return { exitCode: CANCEL_REQUESTED_EXIT_CODE };
   }
   if (dequeuedHere) {
     say(`lane cancel: removed queued ticket ${id}\n`);

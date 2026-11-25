@@ -7,7 +7,7 @@ import { paths, withLock, isCancelled } from '../src/state.js';
 import { isPidAlive } from '../src/lease.js';
 
 // PKG-462: a cancel that cannot get the global lock still lands, as the durable marker the waiting supervisor acts on.
-test('lane cancel under a held global lock writes the marker, exits 0, and the supervisor then finalizes it cancelled', async () => {
+test('lane cancel of a queued ticket under a held global lock writes the marker, exits 75 (requested, not confirmed), and the supervisor then finalizes it cancelled', async () => {
   const { base, home, state, env } = freshEnv({ LANE_BROKER_TEST_LOCK_TIMEOUT_MS: '300' });
   writeGlobalConfig(home, { version: 1, capacity: 1, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
   const repoDir = path.join(base, 'repo');
@@ -33,14 +33,24 @@ test('lane cancel under a held global lock writes the marker, exits 0, and the s
     let cancel;
     await withLock(state, async () => {
       cancel = await laneRun(['cancel', id], { env, cwd: repoDir });
-      assert.equal(cancel.code, 0, `cancel under a held lock: ${cancel.stderr}`);
-      assert.match(cancel.stdout, /cancel requested .*marker written/);
+      assert.equal(cancel.code, 75, `cancel under a held lock: ${cancel.stderr}`);
+      assert.match(cancel.stdout, /cancel requested .*the broker lock is busy/);
       assert.equal(isCancelled(state, id), true, 'the durable cancel marker must exist');
       assert.ok(listing(paths(state).queue).some((n) => n.includes(id)), 'the ticket is still queued until the supervisor dequeues it');
     }, { timeoutMs: 10_000 });
 
     await waitFor(() => !isPidAlive(ticket.supervisorPid), { timeoutMs: 30_000 });
     assert.equal(listing(paths(state).queue).some((n) => n.includes(id)), false, 'the supervisor must dequeue the cancelled ticket');
+
+    const running = listing(paths(state).leases)[0].replace(/\.json$/, '');
+    await withLock(state, async () => {
+      for (const target of ['no-such-ticket-id', running]) {
+        const res = await laneRun(['cancel', target], { env, cwd: repoDir });
+        assert.notEqual(res.code, 0, `${target}: a lock timeout is not a confirmed cancel`);
+        assert.notEqual(res.code, 75, `${target}: only a queued ticket takes the marker-only path`);
+        if (target === 'no-such-ticket-id') assert.equal(isCancelled(state, target), false, 'an unknown id gets no marker that could cancel a later submission');
+      }
+    }, { timeoutMs: 20_000 });
   } finally {
     if (blocker.exitCode === null) blocker.kill('SIGKILL');
   }
