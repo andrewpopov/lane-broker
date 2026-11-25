@@ -141,6 +141,16 @@ export function paths(root = stateHome()) {
 const UUID_PATTERN = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}';
 const UUID_RE = new RegExp(`^${UUID_PATTERN}$`);
 
+/** The text of `file`, or null only when it genuinely does not exist (ENOENT/ENOTDIR). Any other read error throws. */
+export function readIfExists(file) {
+  try {
+    return fs.readFileSync(file, 'utf8').trim();
+  } catch (err) {
+    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return null;
+    throw err;
+  }
+}
+
 export function isUuid(v) {
   return typeof v === 'string' && UUID_RE.test(v);
 }
@@ -275,6 +285,11 @@ export function withSupersession(root, id, result) {
 
 export function releasedMarkerPath(root, id) {
   return path.join(paths(root).released, id);
+}
+
+/** Every per-ticket marker file for `id`: the one list `clearTicketMarkers` and GC both delete from. */
+export function ticketMarkerPaths(root, id) {
+  return [cancelMarkerPath(root, id), expireMarkerPath(root, id), withdrawMarkerPath(root, id), supersededMarkerPath(root, id), releasedMarkerPath(root, id)];
 }
 
 export function removeReleasedMarker(root, id) {

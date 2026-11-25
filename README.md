@@ -3316,7 +3316,10 @@ What a run leaves behind is collected; what a live one owns never is. Everything
   `tmp-dir` file) are removed once it has a terminal `result.json`; the whole ticket directory is removed once it is older
   than the retention. Either way only if all of these hold, checked under the broker lock: its `publisher.json` pid is
   dead, its broker ticket (`remote-id`) has no lease and no queue entry, no cancel/withdraw/expiry marker is pending for
-  it, and its id has no tombstone. A directory is first renamed into `<remoteRoot>/gc-trash` inside the lock and deleted
+  it, and its id has no tombstone. A marker stops holding a ticket once it is finished (`result.json` published) and past the
+  retention (PKG-424: a supervisor that died never clears its markers); GC then removes the ticket's markers with the directory.
+  A marker on a past-retention ticket with no result still holds it and is counted as `skippedMarker` (`skippedLive` counts
+  publisher, lease, queue and within-retention marker holds). A directory is first renamed into `<remoteRoot>/gc-trash` inside the lock and deleted
   afterwards (detached from `remote-exec`, so the submitter's ssh session never waits on it). `tickets/` and `gc-trash/` must
   be real directories inside the runner root (a symlink is refused, and only real directories inside `gc-trash` are ever
   deleted). At most `remoteGcMaxTicketsPerRun` directories are acted on and `remoteGcMaxExaminedPerRun` (default 50) even

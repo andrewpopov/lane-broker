@@ -12,15 +12,11 @@ import {
   atomicWriteJson,
   readJsonSafe,
   isCancelled,
-  cancelMarkerPath,
-  expireMarkerPath,
-  withdrawMarkerPath,
   isWithdrawn,
   writeCancelMarkerFile,
-  supersededMarkerPath,
   readSupersededBy,
   withSupersession,
-  releasedMarkerPath,
+  ticketMarkerPaths,
   isReleased,
   withLock,
   setLockContentionPolicy,
@@ -160,7 +156,7 @@ function endPushHold() {
 
 function clearTicketMarkers(root, id) {
   discardRebinding(root, id);
-  for (const marker of [cancelMarkerPath(root, id), expireMarkerPath(root, id), withdrawMarkerPath(root, id), supersededMarkerPath(root, id), releasedMarkerPath(root, id)]) {
+  for (const marker of ticketMarkerPaths(root, id)) {
     try {
       fs.unlinkSync(marker);
     } catch {
