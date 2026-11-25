@@ -977,7 +977,7 @@ const PG = findPostgres();
 const NO_PG = PG ? false : 'no initdb, pg_ctl, psql and openssl on this machine';
 
 async function pgScenario(t, mod = lib, { only = false } = {}) {
-  const root = fs.mkdtempSync('/tmp/lrapg-');
+  const root = makeTmpDir('lrapg-');
   const data = path.join(root, 'data');
   const hbaDir = path.join(root, 'hba');
   const sock = path.join(root, 's');
@@ -1064,7 +1064,7 @@ async function pgScenario(t, mod = lib, { only = false } = {}) {
 }
 
 test('real postgres: dropping a role terminates only that role\'s sessions, never another login\'s', { skip: NO_PG }, async (t) => {
-  const root = fs.mkdtempSync('/tmp/lrapgdrop-');
+  const root = makeTmpDir('lrapgdrop-');
   const data = path.join(root, 'data');
   const sock = path.join(root, 's');
   fs.mkdirSync(sock);
