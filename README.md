@@ -3177,7 +3177,10 @@ A command can start processes in their own session or process group (Playwright'
 does), which a group kill never reaches. While a lease runs, each heartbeat reads the process table once and records
 every member of the lease's tree, with a start token, on the lease (`descendants`). A process is a member when it
 descends from the leader or from a recorded member (ppid walk), or when its environment carries
-`LANE_BROKER_LEASE=<lease id>`, which the leader's descendants inherit even after being reparented to init (read from
+`LANE_BROKER_LEASE=<lease id>` or `LANE_BROKER_REAP_TAG=<lease id>`, which the leader's descendants inherit even after
+being reparented to init. The reap tag only marks membership, so it survives a suite that deletes `LANE_BROKER_LEASE`
+to stay out of the reentrancy path (BRAIN-1197: lane-broker's own tests do, and `pg_ctl` detaches the test Postgres;
+both were needed to strand it) (read from
 `/proc/<pid>/environ` on Linux; on macOS a second `ps -E` listing with each pid's plain command stripped as a
 prefix, so an argument that merely spells the marker never matches). macOS hides the environment of SIP-protected
 binaries, so one of those, detached by a short-lived leader and reparented before any scan saw it, cannot be found;

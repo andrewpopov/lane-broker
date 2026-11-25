@@ -34,7 +34,7 @@ import { cancelCommand } from './cancel.js';
 import { readLease, writeLease, removeLease, listLeases, isGroupAlive, processStartTime } from './lease.js';
 import { isPidAlive, isProcessAlive } from './process-liveness.js';
 import { selectLeaseTree } from './cpu.js';
-import { DescendantTracker, hasLiveMembers, leaderIdentityOf, reapLogLine, cancelGraceMs } from './descendants.js';
+import { DescendantTracker, hasLiveMembers, leaderIdentityOf, reapLogLine, cancelGraceMs, REAP_TAG_VAR } from './descendants.js';
 import { reloadGlobalConfig, isDispatchOnly, pushRunners, pullRunners, pullQueuedTimeoutMs, pullLocalFallbackEnabled, noPushRunnersReason } from './config.js';
 import { toolsOnPath } from './agent/claims.js';
 import { localFallbackActive } from './queue-health.js';
@@ -497,7 +497,7 @@ function isRemoteExecRunner(env = process.env) {
  * cores-1 workers and was measured averaging 4.2 cores on a 2-core lease.
  */
 export function childEnv(ticket, baseEnv = process.env, grantedCpuCores = ticket.resources?.cpuCores, classEnforcement = null, tmpDir = null) {
-  const env = { ...baseEnv, LANE_BROKER_LEASE: ticket.id, LANE_BROKER_KEY: ticket.key, ...(tmpDir ? tmpEnv(tmpDir) : {}) };
+  const env = { ...baseEnv, LANE_BROKER_LEASE: ticket.id, [REAP_TAG_VAR]: ticket.id, LANE_BROKER_KEY: ticket.key, ...(tmpDir ? tmpEnv(tmpDir) : {}) };
   // BRAIN-597: where the command runs. A runner's own `remote-exec` marked itself (src/remote-runner.js) and keeps `remote` (+ the submitter's runner name);
   // every other run is `local`, whatever a caller's shell exported.
   if (isRemoteExecRunner(baseEnv)) env.LANE_BROKER_EXECUTOR = 'remote';

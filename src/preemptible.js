@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { DescendantTracker, procUnits, leaseMarker, parseCommandMap, envSuffix } from './descendants.js';
+import { DescendantTracker, procUnits, leaseMarkers, parseCommandMap, envSuffix } from './descendants.js';
 
 /**
  * BRAIN-428: CPU that yields to an admitted lane, measured per process BY IDENTITY over the same window as the host
@@ -92,12 +92,12 @@ export function withDeltas(rows, prevProcs) {
 }
 
 /**
- * Which of `pids` carry `LANE_BROKER_LEASE=<one of leaseIds>` in their environment: Map pid -> true | false | null
+ * Which of `pids` carry a lease marker (descendants.js `leaseMarkers`) of one of `leaseIds` in their environment: Map pid -> true | false | null
  * (null = environment unreadable, e.g. another uid: callers fail closed). Linux reads /proc/<pid>/environ; macOS runs
  * two `ps` listings limited to those pids and strips the plain command from the `-E` one (descendants.js).
  */
 export function readLeaseMarkers(pids, leaseIds, { platform = process.platform, exec = execFileSync, fsApi = fs } = {}) {
-  const wanted = leaseIds.map(leaseMarker);
+  const wanted = leaseIds.flatMap(leaseMarkers);
   const result = new Map();
   if (pids.length === 0) return result;
   if (platform === 'linux') {

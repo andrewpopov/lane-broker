@@ -35,8 +35,9 @@ process.on('SIGTERM', () => {
 const LEADER = `
 const { spawn } = require('node:child_process');
 const fs = require('node:fs');
+if (process.argv[4] === 'now-scrubbed') delete process.env.LANE_BROKER_LEASE; // what a hermetic test setup does (BRAIN-1197)
 spawn(process.execPath, ['-e', fs.readFileSync(process.argv[2], 'utf8'), process.argv[3]], { detached: true, stdio: 'ignore' }).unref();
-if (process.argv[4] === 'now') {
+if (process.argv[4].startsWith('now')) {
   const wait = setInterval(() => {
     if (fs.existsSync(process.argv[3])) process.exit(0);
   }, 20);
@@ -89,7 +90,7 @@ async function startLane(t, mode, { serverSource = SERVER, sampleMs = 100 } = {}
       await new Promise((resolve) => lane.on('exit', resolve));
     }
   });
-  if (mode === 'now') {
+  if (mode.startsWith('now')) {
     // the leader exits as soon as the server is up, so there is no stable lease to read
     await waitFor(() => fs.existsSync(portFile) && fs.readFileSync(portFile, 'utf8').includes(' '));
     const [pid, port] = fs.readFileSync(portFile, 'utf8').split(' ').map(Number);
@@ -161,6 +162,13 @@ test('a leader that exits right after spawning a detached grandchild leaves noth
   const { lane, server } = await startLane(t, 'now', { sampleMs: 5000 });
   await exited(lane);
   assert.equal(alive(server.pid), false, 'the detached grandchild outlived its short-lived leader');
+  assert.equal(await portFree(server.port), true, 'its port is still held');
+});
+
+test('a detached grandchild whose parent deleted LANE_BROKER_LEASE is still found by the reap tag', async (t) => {
+  const { lane, server } = await startLane(t, 'now-scrubbed', { sampleMs: 5000 });
+  await exited(lane);
+  assert.equal(alive(server.pid), false, 'a scrubbed LANE_BROKER_LEASE hid the detached grandchild from the reap');
   assert.equal(await portFree(server.port), true, 'its port is still held');
 });
 
@@ -287,17 +295,20 @@ test('process table parsers read ps lstart and /proc stat starttime', () => {
     '  12     1    12   0.5  1024 Mon Oct  6 12:00:00 2026 /usr/bin/node a.js',
     '  13     1    13   0.0    10 Mon Oct  6 12:00:01 2026 /bin/grep LANE_BROKER_LEASE=abc',
     '  14     1    14   0.0    10 Mon Oct  6 12:00:02 2026 /bin/sleep 5',
+    '  15     1    15   0.0    10 Mon Oct  6 12:00:03 2026 /usr/bin/node b.js',
     'bad',
   ].join('\n');
   const envPs = [
     '  12 /usr/bin/node a.js HOME=/h LANE_BROKER_LEASE=abc LANE_BROKER_KEY=k',
     '  13 /bin/grep LANE_BROKER_LEASE=abc HOME=/h', // the marker is only an ARGUMENT here
     '  14 /bin/sleep 5',
+    '  15 /usr/bin/node b.js HOME=/h LANE_BROKER_REAP_TAG=abc',
   ].join('\n');
   assert.deepEqual(parsePsTable(ps, 'abc', envPs), [
     { pid: 12, ppid: 1, pgid: 12, pcpu: 0.5, rss: 1024, token: 'Mon Oct 6 12:00:00 2026', marked: true },
     { pid: 13, ppid: 1, pgid: 13, pcpu: 0, rss: 10, token: 'Mon Oct 6 12:00:01 2026', marked: false },
     { pid: 14, ppid: 1, pgid: 14, pcpu: 0, rss: 10, token: 'Mon Oct 6 12:00:02 2026', marked: false },
+    { pid: 15, ppid: 1, pgid: 15, pcpu: 0, rss: 10, token: 'Mon Oct 6 12:00:03 2026', marked: true },
   ]);
   const stat = '77 (we ird) name)) S 5 66 77 0 -1 4194560 1 0 0 0 100 100 0 0 20 0 1 0 987654 1 25 18446744073709551615';
   assert.deepEqual(parseProcStat(77, stat, 9876.54 + 20, { pageKib: 4, clkTck: 100 }), { pid: 77, ppid: 5, pgid: 66, pcpu: 10, rss: 100, token: '987654', marked: false });
