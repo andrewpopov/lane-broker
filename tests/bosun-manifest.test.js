@@ -58,6 +58,12 @@ test('the manifest covers darwin and linux, and the old script name still reache
   assert.match(wrapper.stderr, /usage: .*runner-prereqs\.sh \(--check \| --install \| --dry-run \| --apply\)/);
 });
 
+test('on linux the agent needs the systemd user manager: run orders after it and install checks linger', () => {
+  const { run, requires } = loadManifest();
+  assert.deepEqual(run.platforms, { linux: { requiresUserManager: true } });
+  assert.deepEqual(requires, [{ phase: 'install', userManager: true }]);
+});
+
 test('the four lane-runner assets ship in the package and the script reads its siblings', () => {
   const { files } = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 'utf8'));
   assert.ok(files.includes('bosun'));
