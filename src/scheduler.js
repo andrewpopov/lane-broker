@@ -8,7 +8,7 @@ import { patchAttemptLocked, readAttempt } from './attempts.js';
 import { listLeases, readLease, reapAll, writeLease, isSupervisorAlive, LEASE_STATE } from './lease.js';
 import { refreshCpuEstimates } from './cpu-estimates.js';
 import { recordTicketWait, pruneTicketWaits } from './ticket-wait.js';
-import { evaluateCpuAdmission, freshObservedCores, evaluateNewAdmission, decideAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, logHeadBlock, logCapacityBlock, logResourceEvent, writeBrokerLog, projectBusy, ticketCpuEstimate, headClearWithoutBypass } from './admission.js';
+import { evaluateCpuAdmission, freshObservedCores, evaluateNewAdmission, decideAdmission, evaluateElasticAdmission, cooldownActive, sampleCpuSafe, logAdmissionDecision, appendRotatingLog, logHeadBlock, logCapacityBlock, logResourceEvent, writeBrokerLog, projectBusy, ticketCpuEstimate, headClearWithoutBypass } from './admission.js';
 import { readMemoryInfo } from './cpu.js';
 import { idleCreditCores, wouldAdmitWithCredit, recordIdleCreditShadow } from './idle-credit.js';
 import { recordExternalDenial, clearExternalStarved } from './external-cpu.js';
@@ -2073,7 +2073,9 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
   // Pure telemetry: nothing reads this back to make a decision, so it never
   // needs to be atomic with anything above — write it after the lock has
   // already been released, on both the admit and deny paths.
-  if (logFields) logAdmissionDecision(root, { ...logFields, lockWaitMs, lockHeldMs });
+  if (logFields) logAdmissionDecision(root, logFields);
+  // PKG-462: its own log, so the admission trace stays byte-identical for the golden-trace tests
+  appendRotatingLog(path.join(root, 'lock-timing.log'), `lane-broker-lock-timing ticket=${submitted.id} lockWaitMs=${lockWaitMs} lockHeldMs=${lockHeldMs}\n`);
   recordTicketWait(root, submitted.id, result);
   for (const [event, fields] of events || []) logResourceEvent(root, event, fields);
   if (bypassRefusedChange) writeBrokerLog(root, `lane-broker-bypass-refused candidate=${submitted.id} reason=${bypassRefusedChange.reason} previous=${bypassRefusedChange.previous ?? 'none'}\n`);

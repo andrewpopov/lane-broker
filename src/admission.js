@@ -567,7 +567,6 @@ export function formatAdmissionLog(f) {
     ...(f.classCap ? [`classCap=${f.classCap}`] : []),
     ...(f.floor ? ['floor=1'] : []),
     ...(f.bypass ? ['bypass=1'] : []),
-    ...(f.lockWaitMs !== undefined ? [`lockWaitMs=${f.lockWaitMs}`, `lockHeldMs=${f.lockHeldMs}`] : []),
     `bias=${KNOWN_BIAS_NOTE}`,
   ].join(' ');
 }

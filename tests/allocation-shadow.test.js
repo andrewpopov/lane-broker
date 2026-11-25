@@ -112,6 +112,15 @@ test('a throw inside the shadow evaluation is logged as a shadow error and leave
   assert.equal(liveLines(state).filter((l) => l.startsWith('lane-broker-admission ')).length, 1, 'the live admission line is still written');
 });
 
+test('PKG-462: each poll writes its lock wait and hold times to lock-timing.log, never into the admission line', async () => {
+  const { state } = freshEnv();
+  await enqueue(state, ticket('head'));
+  await poll(state, ticket('head'), baseCfg({}));
+  const timing = fs.readFileSync(path.join(state, 'lock-timing.log'), 'utf8');
+  assert.match(timing, /lane-broker-lock-timing ticket=head lockWaitMs=\d+ lockHeldMs=\d+/);
+  assert.equal(/lock(Wait|Held)Ms/.test(readLog(state)), false, 'the admission log stays free of timings');
+});
+
 // ---- the record --------------------------------------------------------------------------------
 
 test('a shadow record is written for a blocked head evaluation, carrying the actual live outcome', async () => {
