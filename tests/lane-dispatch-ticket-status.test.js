@@ -1,6 +1,10 @@
 import { describe, test, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
-import { pgSkipOption } from './lane-db-harness.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { applyMigrations, LANE_SQL_DIR } from '../src/lane-db.js';
+import { makeTmpDir } from './helpers/tmp.js';
+import { pgSkipOption, PgCluster } from './lane-db-harness.js';
 import { startDispatchCluster, World, logins, call, enqueue, claim, start, finish, release, liftBackoff, tid } from './lane-dispatch-fixture.js';
 
 const WAIT_MS = 1500;
@@ -35,8 +39,8 @@ const su = (w) => w.su();
 const GUARDS = {
   'a LISTEN session sees claimed, running, finished in order with the ticket, epoch, repo and lane': async (w) => {
     const [s1, a1] = [await w.as(logins.s1), await w.as(logins.a1)];
-    await enqueue(s1, tid(1));
     const l = await listen(w);
+    await enqueue(s1, tid(1));
     const got = await claim(a1);
     await start(a1, got);
     await finish(a1, got, { kind: 'ok', exitCode: 0, logSha256: 'abc' });
@@ -44,7 +48,7 @@ const GUARDS = {
     assert.deepEqual(states(events), ['claimed', 'running', 'finished']);
     for (const e of events) assert.deepEqual([e.ticket, e.epoch, e.repo, e.lane], [tid(1), 1, 'repoA', 'test']);
     assert.equal(events[2].reason, 'ok');
-    assert.equal((await l.all()).length, 3, 'the enqueue sent nothing');
+    assert.equal((await l.all()).length, 3, 'the enqueue sent nothing, and the finish sent one event');
   },
 
   'a requeue sends queued with its reason, and the next claim sends claimed with epoch + 1': async (w) => {
@@ -196,6 +200,85 @@ const GUARDS = {
     assert.equal(usage, false);
   },
 
+  'a late finish with a scalar or null result is kept without raising, and answers fenced as before': async (w) => {
+    const [s1, a1, admin, db] = [await w.as(logins.s1), await w.as(logins.a1), await w.as(logins.admin), await su(w)];
+    await enqueue(s1, tid(1));
+    const got = await claim(a1);
+    await start(a1, got);
+    await db.query("UPDATE lane_dispatch.tickets SET lease_until = now() - interval '3 hours'");
+    await call(admin, 'ld_reap');
+    assert.deepEqual(await finish(a1, got, JSON.stringify('oops')), { fenced: true, state: 'lost' });
+    assert.equal((await w.ticket(tid(1))).late_result, 'oops');
+    assert.deepEqual(await finish(a1, got, 'null'), { fenced: true, state: 'lost' });
+    assert.equal((await w.ticket(tid(1))).state, 'lost');
+  },
+
+  'a rolled-back transition and an idempotent replay send no event': async (w) => {
+    const [s1, a1] = [await w.as(logins.s1), await w.as(logins.a1)];
+    await enqueue(s1, tid(1));
+    const l = await listen(w);
+    await a1.query('BEGIN');
+    await claim(a1);
+    await a1.query('ROLLBACK');
+    assert.deepEqual(await l.all(), [], 'a rolled-back claim sends nothing');
+    const got = await claim(a1);
+    await start(a1, got);
+    const result = { kind: 'ok', exitCode: 0, logSha256: 'abc' };
+    assert.equal((await finish(a1, got, result)).fenced, false);
+    assert.equal((await finish(a1, got, result)).fenced, false, 'the replay is accepted');
+    assert.deepEqual(states(await l.all()), ['claimed', 'running', 'finished'], 'and sends no second finished');
+  },
+
+  'the sixth return to the queue sends lost with release-cap': async (w) => {
+    const [s1, a1, db] = [await w.as(logins.s1), await w.as(logins.a1), await su(w)];
+    await enqueue(s1, tid(1));
+    await db.query('UPDATE lane_dispatch.tickets SET requeues = 5');
+    const got = await claim(a1);
+    const l = await listen(w);
+    assert.equal((await release(a1, got)).state, 'lost');
+    const [e] = await l.events(1);
+    assert.deepEqual([e.ticket, e.state, e.reason, e.epoch], [tid(1), 'lost', 'release-cap', got.epoch]);
+  },
+
+  'a cancel-confirmed release of a running ticket sends cancelled with that reason': async (w) => {
+    const [s1, a1] = [await w.as(logins.s1), await w.as(logins.a1)];
+    await enqueue(s1, tid(1));
+    const got = await claim(a1);
+    await start(a1, got);
+    const l = await listen(w);
+    await call(s1, 'ld_cancel', tid(1));
+    assert.deepEqual(await l.all(), [], 'the request is not a transition');
+    assert.equal((await release(a1, got, 'cancel-confirmed')).state, 'cancelled');
+    const [e] = await l.events(1);
+    assert.deepEqual([e.state, e.reason, e.epoch], ['cancelled', 'cancel-confirmed', got.epoch]);
+  },
+
+  'a supervisor that died unstarted requeues with its reason, and updated_at does not move backwards': async (w) => {
+    const [s1, a1, db] = [await w.as(logins.s1), await w.as(logins.a1), await su(w)];
+    await enqueue(s1, tid(1));
+    const got = await claim(a1);
+    await start(a1, got);
+    const updatedAt = async () => (await db.query('SELECT updated_at FROM lane.ticket_status_v1')).rows[0].updated_at;
+    const before = await updatedAt();
+    const l = await listen(w);
+    assert.equal((await finish(a1, got, { kind: 'unfinished', reason: 'supervisor-died-while-queued', neverStarted: true })).state, 'queued');
+    const [e] = await l.events(1);
+    assert.deepEqual([e.state, e.reason, e.epoch], ['queued', 'supervisor-died-while-queued', got.epoch]);
+    assert.ok((await updatedAt()) >= before, 'updated_at moved forward or stayed');
+  },
+
+  'lane_admin reads the status and pull views but an UPDATE through them is refused': async (w) => {
+    const [s1, admin] = [await w.as(logins.s1), await w.as(logins.admin)];
+    await enqueue(s1, tid(1));
+    for (const view of ['ticket_status_v1', 'pull_tickets', 'pull_runners', 'pull_principals']) {
+      await admin.query(`SELECT * FROM lane.${view}`);
+    }
+    await assert.rejects(admin.query("UPDATE lane.ticket_status_v1 SET state = 'lost'"), /permission denied/);
+    await assert.rejects(admin.query("UPDATE lane.pull_tickets SET state = 'lost'"), /permission denied/);
+    await assert.rejects(admin.query('DELETE FROM lane.pull_principals'), /permission denied/);
+    assert.equal((await w.ticket(tid(1))).state, 'queued');
+  },
+
   'a restore sends lost with queue-restored for each settled ticket': async (w) => {
     const [s1, a1, admin] = [await w.as(logins.s1), await w.as(logins.a1), await w.as(logins.admin)];
     await enqueue(s1, tid(1));
@@ -204,7 +287,7 @@ const GUARDS = {
     const l = await listen(w);
     assert.equal(await call(admin, 'ld_restore_reset'), 2);
     const events = await l.events(2);
-    assert.deepEqual(events.map((e) => [e.state, e.reason]), [['lost', 'queue-restored'], ['lost', 'queue-restored']]);
+    assert.deepEqual(events.map((e) => [e.ticket, e.state, e.reason]).sort(), [[tid(1), 'lost', 'queue-restored'], [tid(2), 'lost', 'queue-restored']]);
   },
 };
 
@@ -213,7 +296,7 @@ const CANARIES = [
   ['a LISTEN session sees claimed, running, finished in order with the ticket, epoch, repo and lane', "PERFORM lane_dispatch.notify_ticket(v_id, 'claimed', v_epoch, NULL);", ''],
   ['a requeue sends queued with its reason, and the next claim sends claimed with epoch + 1', "PERFORM lane_dispatch.notify_ticket(p_id, v_state, v_t.epoch, CASE WHEN v_state = 'lost' THEN 'release-cap' ELSE p_reason END);", ''],
   ['the reaper sends lost for a running row past lost_after, and log-missing once for a finished row with no log after 10 minutes', "SET log_state = 'missing'", "SET log_state = NULL"],
-  ['a late finish after lost keeps state lost, stores late_result and answers fenced', "SET late_result = p_result - 'author', late_result_at = lane_dispatch.now()", "SET late_result_at = late_result_at"],
+  ['a late finish after lost keeps state lost, stores late_result and answers fenced', "SET late_result = CASE WHEN jsonb_typeof(p_result) = 'object' THEN p_result - 'author' ELSE p_result END, late_result_at = lane_dispatch.now()", "SET late_result_at = late_result_at"],
   ['train_reader selects the view only: no table, no ld_* function, no lane_dispatch schema', 'GRANT SELECT ON lane.ticket_status_v1 TO train_reader;', ''],
 ];
 
@@ -240,4 +323,40 @@ describe('lane ticket status: view, change events, late results, log-missing (PK
       t.diagnostic(`failed as expected: ${String(failure.message).split('\n')[0]}`);
     });
   }
+});
+
+/** The production applier (lane_migrate) is NOCREATEROLE, so migration 011 must not need CREATE ROLE (PKG-437). Own cluster: roles are cluster-wide. */
+describe('train_reader provisioning under a NOCREATEROLE migrator (PKG-437)', { skip: pgSkipOption, timeout: 120000 }, () => {
+  let cluster;
+  before(() => { cluster = PgCluster.start(); });
+  after(async () => { await cluster?.closeClients(); cluster?.stop(); });
+
+  test('011 applies without the role, a superuser creates it, and the next apply grants it; a fresh login connects and selects with PUBLIC CONNECT revoked', async () => {
+    const admin = await cluster.admin();
+    const db = 'p437';
+    await admin.query(`CREATE DATABASE ${db}`);
+    const v10 = makeTmpDir('lane-v10-sql-');
+    fs.cpSync(LANE_SQL_DIR, v10, { recursive: true });
+    fs.rmSync(path.join(v10, 'migrations', '011-ticket-status.sql'));
+    const su = await cluster.client(db);
+    assert.equal((await applyMigrations(su, { dir: v10 })).version, 10);
+    await admin.query('CREATE ROLE lane_migrate_p LOGIN NOSUPERUSER NOCREATEROLE');
+    await admin.query('GRANT lane_definer TO lane_migrate_p WITH INHERIT TRUE, SET TRUE');
+    await admin.query(`GRANT CONNECT, CREATE ON DATABASE ${db} TO lane_migrate_p`);
+    const migrator = await cluster.client(db, 'lane_migrate_p');
+    assert.deepEqual((await applyMigrations(migrator)).applied, ['011-ticket-status.sql']);
+    assert.equal((await admin.query("SELECT 1 FROM pg_roles WHERE rolname = 'train_reader'")).rowCount, 0, 'the migrator created no role');
+    assert.equal((await su.query('SELECT 1 FROM lane.ticket_status_v1')).rowCount, 0, 'the view exists');
+    assert.equal((await su.query("SELECT 1 FROM pg_attribute WHERE attrelid = 'lane_dispatch.tickets'::regclass AND attname = 'status_changed_at'")).rowCount, 1);
+
+    await admin.query('CREATE ROLE train_reader NOLOGIN');
+    await admin.query('CREATE ROLE lane_train_p LOGIN IN ROLE train_reader');
+    await admin.query(`REVOKE CONNECT ON DATABASE ${db} FROM PUBLIC`);
+    await admin.query(`GRANT CONNECT ON DATABASE ${db} TO train_reader`);
+    const reader = await cluster.client(db, 'lane_train_p');
+    await assert.rejects(reader.query('SELECT 1 FROM lane.ticket_status_v1'), /permission denied/, 'no grant before the re-apply');
+    assert.deepEqual((await applyMigrations(migrator)).applied, []);
+    assert.equal((await (await cluster.client(db, 'lane_train_p')).query('SELECT 1 FROM lane.ticket_status_v1')).rowCount, 0);
+    await assert.rejects((await cluster.client(db, 'lane_train_p')).query('SELECT 1 FROM lane_dispatch.tickets'), /permission denied/);
+  });
 });

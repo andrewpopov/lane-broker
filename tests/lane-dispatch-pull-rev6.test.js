@@ -355,7 +355,7 @@ const GUARDS = {
 };
 
 const MIGRATION_NOT_BEFORE = "ADD COLUMN not_before timestamptz NOT NULL DEFAULT '-infinity'";
-const RESTORE_STAMP = "SET state = 'lost', finished_at = lane_dispatch.now(), result = lane_dispatch.lost_result('queue-restored', epoch)";
+const RESTORE_STAMP = "SET state = 'lost', finished_at = lane_dispatch.now(), status_changed_at = lane_dispatch.now(), result = lane_dispatch.lost_result('queue-restored', epoch)";
 const CANARIES = [
   ['an agent guard kill finished after the queue recorded a cancel is cancelled, while the same finish with no cancel stays finished', 'IF p_result ? \'guard\' AND v_t.cancel_requested THEN', 'IF false THEN'],
   ['a release of a running row is refused and changes nothing, unless a cancel was requested',
@@ -399,7 +399,7 @@ const CANARIES = [
   ['retention selects every queue-authored lost row: reaped, release-capped and restored', RESTORE_STAMP, "SET state = 'lost', result = lane_dispatch.lost_result('queue-restored', epoch)"],
   ['retention selects every queue-authored lost row: reaped, release-capped and restored', "finished_at = CASE WHEN v_state = 'queued' THEN NULL ELSE p_now END", 'finished_at = NULL'],
   ['retention selects every queue-authored lost row: reaped, release-capped and restored',
-    "SET state = 'lost', finished_at = v_now, result = lane_dispatch.lost_result('runner-lost', t.epoch)", "SET state = 'lost', result = lane_dispatch.lost_result('runner-lost', t.epoch)"],
+    "SET state = 'lost', finished_at = v_now, status_changed_at = v_now, result = lane_dispatch.lost_result('runner-lost', t.epoch)", "SET state = 'lost', status_changed_at = v_now, result = lane_dispatch.lost_result('runner-lost', t.epoch)"],
   ['amnesty fires when the gap between reaper ticks passes 60 s, not at 5 s', '> p_amnesty_after;', "> interval '1 second';"],
   ['amnesty fires when the gap between reaper ticks passes 60 s, not at 5 s', '> p_amnesty_after;', "> interval '1 hour';"],
   ['a session SET of lane.test_now never moves the queue clock', "AND 'lane.test_now=' || v_set = ANY (s.setconfig)", 'AND true'],

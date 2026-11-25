@@ -91,7 +91,8 @@ export async function applyDatabaseAcls(client) {
   const { rows: [{ db }] } = await client.query('SELECT quote_ident(current_database()) AS db');
   await client.query(`REVOKE CONNECT, CREATE, TEMPORARY ON DATABASE ${db} FROM PUBLIC`);
   await client.query('REVOKE ALL ON SCHEMA public FROM PUBLIC');
-  await client.query(`GRANT CONNECT ON DATABASE ${db} TO ${CONNECT_GROUPS.join(', ')}`);
+  const { rows: present } = await client.query('SELECT rolname FROM pg_roles WHERE rolname = ANY ($1)', [CONNECT_GROUPS]);
+  await client.query(`GRANT CONNECT ON DATABASE ${db} TO ${CONNECT_GROUPS.filter((g) => present.some((r) => r.rolname === g)).join(', ')}`);
 }
 
 /**
