@@ -839,6 +839,30 @@ export function resetLockContentionPolicy() {
   lockContentionPolicy = null;
 }
 
+const BUSY_WAIT_CAP_MS = 250;
+
+/**
+ * PKG-462: how a contender waits on a lock whose owner is alive. Full-jitter exponential backoff from `pollMs`, capped at
+ * BUSY_WAIT_CAP_MS (never below `pollMs`), restarting whenever the holder (its token) changes or `reset()` is called.
+ */
+function createBusyBackoff(pollMs, random = Math.random) {
+  let streak = 0;
+  let holderToken;
+  return {
+    next(token) {
+      if (token !== holderToken) streak = 0;
+      holderToken = token;
+      const ceiling = Math.min(pollMs * 2 ** streak, Math.max(BUSY_WAIT_CAP_MS, pollMs));
+      streak = Math.min(streak + 1, 30);
+      return random() * ceiling;
+    },
+    reset() {
+      streak = 0;
+      holderToken = undefined;
+    },
+  };
+}
+
 const CONTENTION_BACKOFF_MIN_MS = 100;
 const CONTENTION_BACKOFF_MAX_MS = 2000;
 const UNREADABLE_OWNER_DEADLINES_MAX = 3;
@@ -1107,11 +1131,32 @@ export async function withLock(root, fn, { timeoutMs, pollMs = 25, lockPath = pa
   };
   const token = crypto.randomUUID();
   const start = processStartTime(process.pid);
+  const busyBackoff = createBusyBackoff(pollMs);
+  // The deadline and wait for a live holder; staging while one is visible only burns filesystem operations for a rename that cannot win.
+  const waitOnLiveOwner = async (owner) => {
+    if (Date.now() > deadline) {
+      const err = new LockTimeoutError(`lane-broker: timed out waiting for the global lock held by pid ${owner.pid}`);
+      // our own process holding it may be an awaited nested acquisition, which waiting can never end
+      if (!retryContention || owner.pid === process.pid) throw err;
+      await backOff(err);
+      return;
+    }
+    await sleep(busyBackoff.next(owner.token));
+  };
 
   gcTombs(root);
   gcStages(root);
 
   for (;;) {
+    if (fs.existsSync(lockDir)) {
+      const holder = observeLockOwner(ownerFile);
+      if (holder && isLockOwnerAlive(holder)) {
+        unreadableDeadlines = 0;
+        await waitOnLiveOwner(holder);
+        continue;
+      }
+    }
+    busyBackoff.reset();
     const staging = path.join(root, `.lock-stage-${process.pid}-${crypto.randomBytes(6).toString('hex')}`);
     let acquired = false;
     try {
@@ -1192,14 +1237,7 @@ export async function withLock(root, fn, { timeoutMs, pollMs = 25, lockPath = pa
       await sleep(pollMs);
       continue;
     }
-    if (Date.now() > deadline) {
-      const err = new LockTimeoutError(`lane-broker: timed out waiting for the global lock held by pid ${owner.pid}`);
-      // our own process holding it may be an awaited nested acquisition, which waiting can never end
-      if (!retryContention || owner.pid === process.pid) throw err;
-      await backOff(err);
-      continue;
-    }
-    await sleep(pollMs);
+    await waitOnLiveOwner(owner);
   }
 
   try {
@@ -1319,4 +1357,4 @@ export function bootTimeMs() {
 }
 
 /** Test-only access to the lock takeover's internal steps, so tests can drive the CAS directly instead of racing real processes. Not part of the public API. */
-export const __test = { tombPath, recoverDeadLock, isLockOwnerAlive, gcTombs, gcStages, observeLockOwner };
+export const __test = { tombPath, recoverDeadLock, isLockOwnerAlive, gcTombs, gcStages, observeLockOwner, createBusyBackoff };

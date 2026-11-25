@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { ensureStateDirs, paths, appendHistory, atomicWriteJson, withLock, writeCancelMarkerFile, withSupersession, removeSupersededMarker } from './state.js';
+import { ensureStateDirs, paths, appendHistory, atomicWriteJson, withLock, LockTimeoutError, writeCancelMarkerFile, withSupersession, removeSupersededMarker } from './state.js';
 import { readLease, removeLease, isSupervisorAlive, isGroupAlive } from './lease.js';
 import { dequeueSync, listQueue } from './scheduler.js';
 import { touchSimArmFor } from './sim-arm.js';
@@ -195,14 +195,23 @@ export async function cancelCommand(id, { exec, quiet = false, deadline } = {}) 
   // can win the race and start the ticket between our (unlocked) read of the
   // queue and the dequeue, and we'd report "removed" for a ticket that is
   // actually now running.
-  const dequeuedHere = await withLock(root, () => {
-    const stillQueued = listQueue(root).find((t) => t && t.id === id);
-    if (!stillQueued) return false;
-    dequeueSync(root, id);
+  let dequeuedHere;
+  try {
+    dequeuedHere = await withLock(root, () => {
+      const stillQueued = listQueue(root).find((t) => t && t.id === id);
+      if (!stillQueued) return false;
+      dequeueSync(root, id);
+      writeCancelMarkerFile(root, id);
+      touchSimArmFor(root, stillQueued);
+      return true;
+    }, { timeoutMs: deadline === undefined ? undefined : msUntil(deadline) });
+  } catch (err) {
+    if (!(err instanceof LockTimeoutError)) throw err;
+    // PKG-462: the marker is durable and the waiting supervisor checks it every poll and dequeues under its own lock
     writeCancelMarkerFile(root, id);
-    touchSimArmFor(root, stillQueued);
-    return true;
-  }, { timeoutMs: deadline === undefined ? undefined : msUntil(deadline) });
+    say(`lane cancel: cancel requested for ${id} (marker written; the waiting supervisor will dequeue it)\n`);
+    return { exitCode: 0 };
+  }
   if (dequeuedHere) {
     say(`lane cancel: removed queued ticket ${id}\n`);
     return { exitCode: 0 };

@@ -85,6 +85,17 @@ function readTicketFromEnv() {
   return JSON.parse(Buffer.from(raw, 'base64').toString('utf8'));
 }
 
+const QUEUE_POLL_POSITIONS_PER_STEP = 8;
+const QUEUE_POLL_MAX_MULTIPLE = 4;
+const QUEUE_POLL_JITTER = 0.2;
+
+/** PKG-462: a deep-queued waiter polls admission less often (x1 per 8 positions, up to x4), jittered +-20% so waiters do not synchronise. */
+export function queuedPollDelayMs(started, sampleMs, random = Math.random) {
+  const position = started.reason === 'not-head' ? started.position : null;
+  const multiple = position >= 1 ? Math.min(1 + Math.floor((position - 1) / QUEUE_POLL_POSITIONS_PER_STEP), QUEUE_POLL_MAX_MULTIPLE) : 1;
+  return sampleMs * multiple * (1 - QUEUE_POLL_JITTER + 2 * QUEUE_POLL_JITTER * random());
+}
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -2412,7 +2423,7 @@ async function main() {
         return exitMigrating(err);
       }
     }
-    await sleep(globalCfg.sampleMs);
+    await sleep(queuedPollDelayMs(started, globalCfg.sampleMs));
   }
 
   enterPhase('running');

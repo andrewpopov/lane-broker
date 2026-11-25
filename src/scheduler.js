@@ -2054,7 +2054,12 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
     return changed ? { ...outcome, bypassRefusedChange: { reason, previous } } : outcome;
   };
   refreshCpuEstimates(globalCfg);
-  const { result: decided, logFields, events, bypassRefusedChange } = await withLock(root, decide);
+  const lockRequestedAt = Date.now();
+  const { result: decided, logFields, events, bypassRefusedChange, lockWaitMs, lockHeldMs } = await withLock(root, () => {
+    const acquiredAt = Date.now();
+    const outcome = decide();
+    return { ...outcome, lockWaitMs: acquiredAt - lockRequestedAt, lockHeldMs: Date.now() - acquiredAt };
+  });
   // BRAIN-839: every non-start verdict (head or not-head) carries the same-key holder the locked snapshot saw
   const result = decided.started !== true && ownKeyTrace.holder ? { ...decided, localHeldByKey: ownKeyTrace.holder } : decided;
 
@@ -2068,7 +2073,7 @@ export async function tryStart(root, submitted, globalCfg, loadSampler, cpuSampl
   // Pure telemetry: nothing reads this back to make a decision, so it never
   // needs to be atomic with anything above — write it after the lock has
   // already been released, on both the admit and deny paths.
-  if (logFields) logAdmissionDecision(root, logFields);
+  if (logFields) logAdmissionDecision(root, { ...logFields, lockWaitMs, lockHeldMs });
   recordTicketWait(root, submitted.id, result);
   for (const [event, fields] of events || []) logResourceEvent(root, event, fields);
   if (bypassRefusedChange) writeBrokerLog(root, `lane-broker-bypass-refused candidate=${submitted.id} reason=${bypassRefusedChange.reason} previous=${bypassRefusedChange.previous ?? 'none'}\n`);
