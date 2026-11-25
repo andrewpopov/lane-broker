@@ -7,7 +7,7 @@ import { childExitSafeFlags } from './node-exit-safe.js';
 import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { pipeline } from 'node:stream/promises';
-import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, readRemoteDrain, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, LockTimeoutError, isUuid, isExecutionId, executionIdOf, parseExecutionId, tombstonePath, RUNNER_SHUTDOWN_REASON, RUNNER_SHUTDOWN_UNPROVEN_REASON, DEAD_QUEUED_SUPERVISOR_REASON, kernelBootId } from './state.js';
+import { atomicWriteFile, atomicWriteJson, ensureStateDirs, paths, processStartTime, readJsonSafe, readRemoteDrain, stateHome, writeCancelMarkerFile, writeWithdrawMarkerFile, syncWithdrawMarkers, isWithdrawn, isCancelled, assertNotMigrating, drainBlocksIntake, testDrainAt, testHoldAt, withLock, MigrationInProgressError, LockTimeoutError, isUuid, isExecutionId, readIfExists, executionIdOf, parseExecutionId, tombstonePath, RUNNER_SHUTDOWN_REASON, RUNNER_SHUTDOWN_UNPROVEN_REASON, DEAD_QUEUED_SUPERVISOR_REASON, kernelBootId } from './state.js';
 import { checkRemoteDepsDirsOnDisk, manifestHashOf, scrubbedGitEnv, validateRemoteDeps, verifyManifestNoGit } from './remote-manifest.js';
 import { isValidDepsKeyFilesShape, isValidRemoteDepsShape, isValidRemoteSetupShape, isValidRemoteArtifactsShape, REMOTE_ARTIFACTS_ON, RUNNER_NAME_RE, loadGlobalConfig, loadGlobalConfigOrError } from './config.js';
 import { advertisedCapabilities } from './capabilities.js';
@@ -358,16 +358,6 @@ function cleanupWork(workDir, tmpDir) {
 function isRegisteredInBroker(brokerRoot, id) {
   const has = (records) => records.some((r) => r.id === id);
   return has(listLeasesStrict(brokerRoot)) || has(listAttemptsStrict(brokerRoot)) || has(listQueueStrict(brokerRoot));
-}
-
-/** The text of `file`, or null only when it genuinely does not exist (ENOENT/ENOTDIR). Any other read error throws. */
-function readIfExists(file) {
-  try {
-    return fs.readFileSync(file, 'utf8').trim();
-  } catch (err) {
-    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return null;
-    throw err;
-  }
 }
 
 export const brokerLock = (fn) => withLock(stateHome(), fn);

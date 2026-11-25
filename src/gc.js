@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { atomicWriteFile, isCancelled, isExecutionId, isExpired, isWithdrawn, listJsonRecordsStrict, paths, readJsonSafe, stateHome, ticketMarkerPaths, tombstonePath, withLock } from './state.js';
+import { atomicWriteFile, isCancelled, isExecutionId, isExpired, isUuid, isWithdrawn, listJsonRecordsStrict, paths, readIfExists, readJsonSafe, stateHome, ticketMarkerPaths, tombstonePath, withLock } from './state.js';
 import { isSupervisorAlive } from './lease.js';
 import { writeBrokerLog } from './admission.js';
 
@@ -121,10 +121,9 @@ function readTrimmed(file) {
  * writer, or a marker a later request still consults, keeps the ticket. A cancel/withdraw/expire marker stops blocking once
  * the ticket is provably finished (`finishedAndExpired`: result published and past retention); a dead supervisor never clears it.
  */
-function liveReason(ticketDir, brokerRoot, live, finishedAndExpired) {
+function liveReason(ticketDir, brokerRoot, live, laneId, finishedAndExpired) {
   const publisher = readJsonSafe(path.join(ticketDir, 'publisher.json'));
   if (publisher && isSupervisorAlive({ supervisorPid: publisher.pid, supervisorStart: publisher.start })) return 'publisher-alive';
-  const laneId = readTrimmed(path.join(ticketDir, 'remote-id'));
   if (!laneId) return null;
   if (live.has(laneId)) return 'leased-or-queued';
   if (!finishedAndExpired && (isCancelled(brokerRoot, laneId) || isWithdrawn(brokerRoot, laneId) || isExpired(brokerRoot, laneId))) return 'marker-pending';
@@ -274,12 +273,18 @@ export async function gcRemoteTickets({ remoteRoot, brokerRoot = stateHome(), re
         if (!stat?.isDirectory()) continue;
         if (exists(tombstonePath(remoteRoot, name))) continue;
         const expired = now - stat.mtimeMs >= retentionMs;
-        const reason = liveReason(ticketDir, brokerRoot, live, expired && isTerminal(ticketDir));
+        let laneId;
+        try {
+          laneId = readIfExists(path.join(ticketDir, 'remote-id'));
+        } catch {
+          summary.skippedLive += 1;
+          continue;
+        }
+        const reason = liveReason(ticketDir, brokerRoot, live, laneId, expired && isTerminal(ticketDir));
         if (reason) {
           summary[reason === 'marker-pending' && expired ? 'skippedMarker' : 'skippedLive'] += 1;
           continue;
         }
-        const laneId = readTrimmed(path.join(ticketDir, 'remote-id'));
         const workDir = path.join(ticketDir, 'work');
         const recordedTmp = exists(path.join(ticketDir, TMP_DIR_FILE));
         const tmpDir = recordedTmp ? ownedTmpDir(ticketDir, name) : null;
@@ -292,9 +297,9 @@ export async function gcRemoteTickets({ remoteRoot, brokerRoot = stateHome(), re
         if (dryRun) continue;
         fs.mkdirSync(trashDir, { recursive: true });
         const doomed = expired ? ticketDir : workDir;
+        if (expired && isUuid(laneId)) removeTicketMarkers(brokerRoot, laneId);
         if (exists(doomed)) fs.renameSync(doomed, path.join(trashDir, `${name}-${crypto.randomBytes(4).toString('hex')}`));
         if (!expired) fs.rmSync(path.join(ticketDir, TMP_DIR_FILE), { force: true });
-        else if (laneId) removeTicketMarkers(brokerRoot, laneId);
       }
     },
     lockOptions,

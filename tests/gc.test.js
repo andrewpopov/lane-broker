@@ -210,6 +210,32 @@ for (const [how, hold] of Object.entries({
   });
 }
 
+test('PKG-424: collecting a finished, expired ticket removes all five of its markers', async () => {
+  const { state, remoteRoot } = setup();
+  const laneId = crypto.randomUUID();
+  for (const marker of ticketMarkerPaths(state, laneId)) {
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    atomicWriteFile(marker, String(NOW));
+  }
+  const t = makeTicket(remoteRoot, { laneId, work: false, ageMs: RETENTION + DAY });
+  await gc(remoteRoot, state);
+  assert.equal(fs.existsSync(t.dir), false);
+  assert.deepEqual(markerFiles(state, laneId), []);
+});
+
+test('PKG-424: an unreadable remote-id keeps the ticket and its markers', async () => {
+  const { state, remoteRoot } = setup();
+  const laneId = crypto.randomUUID();
+  writeCancelMarkerFile(state, laneId);
+  const t = makeTicket(remoteRoot, { work: false, ageMs: RETENTION + DAY });
+  fs.mkdirSync(path.join(t.dir, 'remote-id'));
+  setAge(t.dir, RETENTION + DAY);
+  const summary = await gc(remoteRoot, state);
+  assert.equal(summary.skippedLive, 1);
+  assert.ok(fs.existsSync(t.dir));
+  assert.equal(markerFiles(state, laneId).length, 1);
+});
+
 // ---- whole ticket dirs past retention ----
 
 test('a dead ticket directory older than the retention is removed whole; a younger one is kept', async () => {

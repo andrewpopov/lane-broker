@@ -141,6 +141,16 @@ export function paths(root = stateHome()) {
 const UUID_PATTERN = '[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}';
 const UUID_RE = new RegExp(`^${UUID_PATTERN}$`);
 
+/** The text of `file`, or null only when it genuinely does not exist (ENOENT/ENOTDIR). Any other read error throws. */
+export function readIfExists(file) {
+  try {
+    return fs.readFileSync(file, 'utf8').trim();
+  } catch (err) {
+    if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return null;
+    throw err;
+  }
+}
+
 export function isUuid(v) {
   return typeof v === 'string' && UUID_RE.test(v);
 }
