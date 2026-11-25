@@ -73,7 +73,7 @@ async function inTransaction(client, fn) {
   }
 }
 
-const CONNECT_GROUPS = ['lane_admin', 'lane_agent', 'lane_submit', 'lane_reader'];
+const CONNECT_GROUPS = ['lane_admin', 'lane_agent', 'lane_submit', 'lane_reader', 'train_reader'];
 
 /**
  * The database-level ACLs: nothing is open to PUBLIC, and only the lane group roles may connect. A database cloned from a template

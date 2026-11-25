@@ -366,7 +366,7 @@ const CANARIES = [
   ['the sixth requeue settles lost with release-cap, and each requeue backs off 5, 10, 20, 40 and 60 s', "interval '5 seconds' * 2 ^ requeues", "interval '5 seconds'"],
   ['the sixth requeue settles lost with release-cap, and each requeue backs off 5, 10, 20, 40 and 60 s', "THEN lane_dispatch.lost_result('release-cap', epoch)", 'THEN NULL'],
   ['a lease expiry returns a claimed ticket to the queue with the same requeue count and backoff as a release',
-    'v_state := lane_dispatch.return_to_queue(v_id, v_now);', "v_state := 'queued'; UPDATE lane_dispatch.tickets SET state = 'queued', claim_token = NULL, host = NULL, lease_until = NULL WHERE id = v_id;"],
+    'v_state := lane_dispatch.return_to_queue(v_id, v_now, \'lease-expired\');', "v_state := 'queued'; UPDATE lane_dispatch.tickets SET state = 'queued', claim_token = NULL, host = NULL, lease_until = NULL WHERE id = v_id;"],
   ['not_before is honoured on a fresh ticket and on a requeued one', 'AND t.not_before <= v_now', ''],
   ['not_before is honoured on a fresh ticket and on a requeued one', MIGRATION_NOT_BEFORE, "ADD COLUMN not_before timestamptz NOT NULL DEFAULT 'infinity'"],
   ['a none answer writes no claim request, whether nothing is queued or the host is full',
