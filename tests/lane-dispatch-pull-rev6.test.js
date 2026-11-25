@@ -404,7 +404,7 @@ const CANARIES = [
   ['amnesty fires when the gap between reaper ticks passes 60 s, not at 5 s', '> p_amnesty_after;', "> interval '1 hour';"],
   ['a session SET of lane.test_now never moves the queue clock', "AND 'lane.test_now=' || v_set = ANY (s.setconfig)", 'AND true'],
   ['ld_enqueue and ld_enqueue_fenced store min_protocol, ages, source and est_run_s, and default them for the old call shape',
-    '                                  p_min_protocol, p_ages, p_source, p_est_run_s, p_avoid_tags, p_requires, p_min_cpu_cores);', '                                  1, true, NULL, NULL, p_avoid_tags, p_requires, p_min_cpu_cores);'],
+    '                                  p_min_protocol, p_ages, p_source, p_est_run_s, p_avoid_tags, p_requires, p_min_cpu_cores, p_dispatch_key);', '                                  1, true, NULL, NULL, p_avoid_tags, p_requires, p_min_cpu_cores, p_dispatch_key);'],
   ['ld_enqueue and ld_enqueue_fenced store min_protocol, ages, source and est_run_s, and default them for the old call shape',
     'coalesce(p_min_protocol, 1), coalesce(p_ages, true), p_source, p_est_run_s,', '1, true, NULL, NULL,'],
   ['a runner whose tags overlap a ticket avoid_tags gets none until the ticket has waited the grace period, then claims it', 'NOT t.avoid_tags && v_me.tags OR', 'true OR'],
@@ -414,7 +414,7 @@ const CANARIES = [
   ['a runner without an avoided tag claims at once even when the avoided runner asked first, and the avoided runner still takes other tickets', 'NOT t.avoid_tags && v_me.tags OR', 'NOT t.avoid_tags && \'{}\'::text[] OR'],
   ['a runner without an avoided tag claims at once even when the avoided runner asked first, and the avoided runner still takes other tickets', 'NOT t.avoid_tags && v_me.tags OR', 'false OR'],
   ['a ticket stores its avoid_tags from ld_enqueue and ld_enqueue_fenced, and an old call without them avoids nothing', "coalesce(p_avoid_tags, '{}'), coalesce(p_requires", "'{}', coalesce(p_requires"],
-  ['a ticket stores its avoid_tags from ld_enqueue and ld_enqueue_fenced, and an old call without them avoids nothing', 'p_est_run_s, p_avoid_tags, p_requires, p_min_cpu_cores);', 'p_est_run_s, NULL, p_requires, p_min_cpu_cores);'],
+  ['a ticket stores its avoid_tags from ld_enqueue and ld_enqueue_fenced, and an old call without them avoids nothing', 'p_est_run_s, p_avoid_tags, p_requires, p_min_cpu_cores, p_dispatch_key);', 'p_est_run_s, NULL, p_requires, p_min_cpu_cores, p_dispatch_key);'],
 ];
 
 describe('lane_dispatch pull dispatch queue SQL (rev 6) on a disposable Postgres', { skip: pgSkipOption, timeout: 900000 }, () => {

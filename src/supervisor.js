@@ -50,6 +50,7 @@ import { downRunnerReasons, heartbeatUpRunners, recordReadiness, recordEnforceme
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
 import { placeForPull } from './pull-placement.js';
+import { dispatchKeyPullRefusal } from './dispatch-key.js';
 import { publicationBindings, publicationOf } from './pull-publication.js';
 import { pullContextFor } from './pull-services.js';
 import { withRepoIdentity } from './pull-snapshot.js';
@@ -1123,6 +1124,14 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       throw new Error(`lane-broker supervisor: could not fall back to local for ${enriched.id} (attempt record missing)`);
     }
 
+    // PKG-438: a keyed submission is found again by its key in the pull queue, so it never runs anywhere else
+    if (enriched.dispatchKey) {
+      const refusal = dispatchKeyPullRefusal(enriched.lane, reason);
+      process.stderr.write(refusal.message);
+      await publishAndExit(fb.attempt.generation, () => localRefusalResult(enriched, refusal));
+      return { fallback: false };
+    }
+
     const dispatchOnly = isDispatchOnly(globalCfg);
     const pullFallback = pullFallbackNow();
     const fallbackIneligibility = () => localIneligibilityOf(enriched, globalCfg, cpuLimit, { pullFallback });
@@ -1314,7 +1323,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     const ctx = {
       ...pullContextFor(root, globalCfg, services, { id: enriched.id, generation: gen }),
       ...publicationBindings(root, publication),
-      localFallback: { enabled: pullLocalFallbackEnabled(globalCfg, enriched) && requiredToolsPresent(), couldAdmitNow: async () => (await couldAdmitNow(root, globalCfg, enriched)).admit },
+      localFallback: { enabled: !enriched.dispatchKey && pullLocalFallbackEnabled(globalCfg, enriched) && requiredToolsPresent(), couldAdmitNow: async () => (await couldAdmitNow(root, globalCfg, enriched)).admit },
       prepare: {
         worktreeRoot,
         manifest,
@@ -1324,6 +1333,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
           repoKey: enriched.remote.repoKey,
           lane: enriched.lane,
           laneKey: enriched.key,
+          ...(enriched.dispatchKey ? { dispatchKey: enriched.dispatchKey } : {}),
           cpuCores: enriched.remote.cpuCores,
           ...(enriched.remote.minCpuCores !== undefined ? { minCpuCores: enriched.remote.minCpuCores } : {}),
           memoryBytes: enriched.remote.memoryBytes ?? 0,
@@ -1349,6 +1359,13 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     }
     const outcome = await runPullTicket({ ...ctx, prepare: undefined });
     const exitCode = pullExitCode(outcome);
+    // a keyed enqueue the queue refused inserted nothing: it ends with a published refusal, so `lane run` reports its exit
+    if (outcome.outcome === 'unresolved' && outcome.refused) {
+      const refusal = { exitCode, message: `lane run: ${outcome.reason}\n` };
+      process.stderr.write(refusal.message);
+      await publishAndExit(gen, () => localRefusalResult(enriched, refusal));
+      return { fallback: false };
+    }
     if (outcome.outcome === 'unresolved') return exitUnresolved(`pull dispatch unresolved: ${outcome.reason}${outcome.error ? ` (${outcome.error})` : ''}`, exitCode);
     if (exitCode !== undefined) return exitSettled(exitCode);
     if (outcome.outcome === 'local-fallback') {
@@ -1400,6 +1417,8 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       process.stderr.write(line);
       writeBrokerLog(root, line);
     }
+    // a keyed ticket that is not queued for pull (a push runner, local, legacy) would run where its key cannot find it
+    if (enriched.dispatchKey && route.route !== 'pull') return fallbackOrRefuse(null, route.reason ?? `route ${route.route}`, { noRunner: true });
     if (route.route === 'refuse') return fallbackOrRefuse(null, `${skippedSummary()}; ${route.reason}`, { rebindable: true, noRunner: true, retryable: true });
     if (route.route === 'local') return fallbackOrRefuse(null, `${skippedSummary()}; local can run it now, not queuing for pull`, { rebindable: true });
     if (route.route === 'pull') return dispatchViaPull(route.services, skippedSummary());

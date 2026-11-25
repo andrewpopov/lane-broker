@@ -1,10 +1,13 @@
 import { readAttempt, updateAttempt } from './attempts.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
+import { DISPATCH_KEY_REFUSED_EXIT, dispatchKeyRefusal } from './dispatch-key.js';
 import { readEnvelope, withTicketLock } from './pull-envelope.js';
 
 export const STALE_QUEUE_REF = 'stale-queue-ref';
 export const ENQUEUE_CROSSED_RESTORE = 'enqueue-crossed-restore';
 export const ENQUEUE_PAST_RETENTION = 'enqueue-past-retention';
+
+export const DISPATCH_KEY_REFUSED = 'dispatch-key-refused';
 
 const EMPTY_INTENT = { attempts: [], seenRowAt: null };
 
@@ -26,13 +29,14 @@ export function enqueueArgs(envelope) {
     memoryBytes: envelope.memoryBytes,
     priority: envelope.priority,
     ...(envelope.minProtocol === undefined ? {} : { minProtocol: envelope.minProtocol }),
+    ...(envelope.dispatchKey === undefined ? {} : { dispatchKey: envelope.dispatchKey }),
   };
 }
 
 const intentOf = (attempt) => attempt?.pull?.enqueue ?? EMPTY_INTENT;
 
-// an attempt not durably stale may have inserted a row, so it pins the ref and, if the ref later goes stale, the ticket is lost
-const mayHaveBeenSent = (attempt) => attempt.answer !== 'stale';
+// an attempt not durably stale may have inserted a row, so it pins the ref and, if the ref later goes stale, the ticket is lost; a refused one (the key's queue answer) inserted none
+const mayHaveBeenSent = (attempt) => attempt.answer !== 'stale' && attempt.answer !== 'refused';
 
 const crossedRestore = (attempts) => attempts.some((attempt, i) => attempt.answer === 'stale' && attempts.slice(0, i).some(mayHaveBeenSent));
 
@@ -70,7 +74,23 @@ export function enqueueOnce({ root, id, generation, queue, ledgered = () => fals
       return { ...current, attempts: [...current.attempts, sending] };
     });
 
-    const view = await queue.enqueueFenced({ expectRef: ref, ...args });
+    // a refused attempt inserted no row, so it does not pin the ref (mayHaveBeenSent)
+    const refuse = async (refusal) => {
+      await persistIntent({ root, id, generation }, (current) => ({ ...current, attempts: current.attempts.map((attempt) => (attempt.n === sending.n ? { ...attempt, answer: 'refused' } : attempt)) }));
+      return { outcome: DISPATCH_KEY_REFUSED, ...refusal };
+    };
+    let view;
+    try {
+      view = await queue.enqueueFenced({ expectRef: ref, ...args });
+    } catch (err) {
+      const refusal = args.dispatchKey === undefined ? null : dispatchKeyRefusal(err);
+      if (refusal === null) throw err;
+      return refuse(refusal);
+    }
+    // the key already names another of this owner's tickets (a concurrent or earlier submit): nothing was inserted, and this id must not shadow that ticket
+    if (args.dispatchKey !== undefined && view.id !== undefined && view.id !== id) {
+      return refuse({ reason: `dispatch key ${args.dispatchKey} is already ticket ${view.id}; resubmit to adopt it`, exitCode: DISPATCH_KEY_REFUSED_EXIT, ticketId: view.id });
+    }
     const stale = view.state === STALE_QUEUE_REF;
     const settled = await persistIntent({ root, id, generation }, (current) => ({
       attempts: current.attempts.map((attempt) => (attempt.n === sending.n ? { ...attempt, answer: stale ? 'stale' : 'row' } : attempt)),

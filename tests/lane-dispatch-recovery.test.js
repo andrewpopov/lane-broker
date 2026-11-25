@@ -61,6 +61,7 @@ function entryCalls(t1) {
     ld_queue_ref: [logins.s1, []],
     ld_enqueue_fenced: [logins.s1, ['0.0', tid(8), 'repoA', 'test', 'lk8', { protocol: 1 }, { cmd: ['true'] }, snapshot, [], 1, 1000, 0]],
     ld_placeable: [logins.s1, ['repoA', []]],
+    ld_ticket_by_key: [logins.s1, ['k']],
     ld_prune_candidates: [logins.admin, ['1 day', '7 days', null, null, 10]],
     ld_prune: [logins.admin, [[id], '7 days']],
     ld_prune_chunks: [logins.admin, ['1 hour', 10]],

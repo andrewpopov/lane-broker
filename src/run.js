@@ -9,10 +9,14 @@ import { ensureStateDirs, writeReleasedMarkerFile, withLock, paths, stateHome, r
 import { classTransportMismatch } from './classes.js';
 import { remoteExcludePreflight } from './remote-exclude.js';
 import { MIN_CPU_GRANT_CORES } from './cpu-limit.js';
-import { resolveTicketConfig, reloadGlobalConfig, isDispatchOnly, resolvePriority, assertHostConfigHookless, ConfigError, CONFIG_FROM_ENV } from './config.js';
+import { resolveTicketConfig, reloadGlobalConfig, isDispatchOnly, pullConfigured, resolvePriority, assertHostConfigHookless, ConfigError, CONFIG_FROM_ENV } from './config.js';
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
 import { writePending } from './pending.js';
+import { dispatchKeyPullRefusal, isDispatchKey } from './dispatch-key.js';
+import { lookupTicketByKey } from './ticket-by-key.js';
+import { readAttempt } from './attempts.js';
+import { waitCommand } from './wait.js';
 import { stampPriorityOrigin } from './priority-clock.js';
 import { isValidGroupId } from './priority.js';
 import { detectResourceCapacity, leaseResources, resolveTicketResources, capUnapprovedCpu, checkResourceBudget, localSimRefusal, dispatchOnlyRefusal, locallyRefusedNow } from './resources.js';
@@ -339,6 +343,10 @@ export async function runCommand({
   // BRAIN-321: `lane run --detach --id <id>`: a client-supplied ticket id, so a retried submission is idempotent
   // (the broker's enqueue returns the existing ticket for an id it already knows). Same use as idOverride below.
   ticketId,
+  // PKG-438: `lane run --dispatch-key <key>`: a caller-supplied idempotency key (raw text, validated here, exit 64). A key the queue already holds is that ticket, whatever id this call would have made.
+  dispatchKey,
+  // PKG-438 test seam: how the key is looked up in the queue
+  lookupKey = lookupTicketByKey,
   // BRAIN-319: called with the ticket id as soon as it exists (before the
   // supervisor is spawned, so before any child can start). Returning
   // `false` aborts the run without ever spawning the supervisor.
@@ -473,6 +481,22 @@ export async function runCommand({
     if (hostOnly.length > 0) {
       for (const line of hostPathsRefusal(resolved.lane, hostOnly, { dispatchOnly })) process.stderr.write(`${line}\n`);
       return { exitCode: 64 };
+    }
+  }
+  if (dispatchKey !== undefined) {
+    if (!isDispatchKey(dispatchKey)) {
+      process.stderr.write('lane run: --dispatch-key must be 1-200 characters of [A-Za-z0-9:._/-]\n');
+      return { exitCode: 64 };
+    }
+    if (ticketId !== undefined) {
+      process.stderr.write('lane run: --dispatch-key and --id both name the ticket; pass one\n');
+      return { exitCode: 64 };
+    }
+    // the caller finds the run again by its key, so a run that never reaches the pull queue is refused, not run unkeyed
+    if (!remoteEligible || !pullConfigured(globalCfg)) {
+      const refusal = dispatchKeyPullRefusal(resolved.lane, remoteEligible ? 'pull dispatch is not configured here' : 'this lane would not be dispatched');
+      process.stderr.write(refusal.message);
+      return { exitCode: refusal.exitCode };
     }
   }
   const localReason = localReasonFor(resolved, remoteEligible, forced, exclusive);
@@ -648,8 +672,8 @@ export async function runCommand({
   const contentKey = !runnerIntake && !exclusive && resolved.cache && (passTtlMs > 0 || redTtlMs > 0) ? computeContentKey({ cwd, key: resolved.key, cmdFingerprint, configIdentity: configIdentityOf(configProvenance) }) : null;
   const envRetry = (process.env.LANE_BROKER_RETRY_REASON ?? '').trim();
   const retryReason = (retryReasonFlag !== undefined ? retryReasonFlag.trim() : envRetry).slice(0, RETRY_REASON_MAX) || undefined;
-  // A client-supplied --id may be a resubmission of a ticket that already ran: its idempotent answer is that ticket, never a history verdict.
-  if (contentKey && !noReuse && !retryReason && !ticketId) {
+  // A client-supplied --id or --dispatch-key may be a resubmission of a ticket that already ran: its idempotent answer is that ticket, never a history verdict.
+  if (contentKey && !noReuse && !retryReason && !ticketId && dispatchKey === undefined) {
     const now = Date.now();
     // A detached caller waits on a ticket id, which a cached answer has none of, so it always runs (and still records its key).
     // `--no-cache` skips only the pass; the known-red refusal also covers detached runs and ignores `--no-cache`.
@@ -740,7 +764,29 @@ export async function runCommand({
     process.stderr.write(`lane run: --id "${ticketId}" must be a UUID for a remote-eligible lane\n`);
     return { exitCode: 64 };
   }
-  const id = ticketId || idOverride || crypto.randomUUID();
+  // PKG-438: a ticket the queue already holds under this key is this submission. This machine reports it when it knows it (its own supervisor
+  // owns it); otherwise this run adopts its id, so the out keys, logs and attempt state are keyed by the one id. A lookup that fails is not
+  // fatal: the enqueue is keyed too, and the queue refuses a second ticket under the key.
+  let adoptedId;
+  if (dispatchKey !== undefined && !idOverride) {
+    let held = null;
+    try {
+      held = await lookupKey(globalCfg, root, dispatchKey);
+    } catch (err) {
+      process.stderr.write(`lane run: dispatch key lookup failed (${err.message}); the queue will decide at enqueue\n`);
+    }
+    if (held !== null) {
+      const known = readAttempt(root, held.id) !== null || fs.existsSync(path.join(paths(root).results, `${held.id}.json`));
+      process.stderr.write(`lane run: dispatch key ${dispatchKey} is ticket ${held.id} (${held.state}); not submitting again\n`);
+      if (known && detach) {
+        process.stdout.write(`${held.id}\n`);
+        return { exitCode: 0 };
+      }
+      if (known) return waitCommand(held.id, { timeoutMs });
+      adoptedId = held.id;
+    }
+  }
+  const id = adoptedId || ticketId || idOverride || crypto.randomUUID();
   if (onTicketCreated) {
     const proceed = await onTicketCreated(id);
     if (proceed === false) {
@@ -756,7 +802,8 @@ export async function runCommand({
   const ticket = {
     id,
     ...(pushGate ? { pushGate } : {}),
-    ...(ticketId ? { clientId: true } : {}),
+    ...(ticketId || adoptedId ? { clientId: true } : {}),
+    ...(dispatchKey !== undefined ? { dispatchKey } : {}),
     key: resolved.key,
     repoId: resolved.repoId,
     lane: resolved.lane,

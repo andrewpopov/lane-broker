@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fallbackToLocal, readAttempt, remoteCancelledResult, supervisorAlive, updateAttempt } from './attempts.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
-import { CANCELLED_BEFORE_ENQUEUE, enqueueOnce } from './pull-enqueue.js';
+import { CANCELLED_BEFORE_ENQUEUE, DISPATCH_KEY_REFUSED, enqueueOnce } from './pull-enqueue.js';
 import { createEnvelope, pullTicketDir, readEnvelope, recordSnapshot, withTicketLock, writeOwedCancel } from './pull-envelope.js';
 import { ledgerAccept, readLedger } from './pull-ledger.js';
 import { queueDownSince as hostQueueDownSince } from './queue-health.js';
@@ -512,6 +512,7 @@ export async function stepPullTicket(ctx) {
     await hook(run, 'afterEnqueueStage');
     if (sent.outcome === 'lost') return await afterStep(run, await guarded(run, () => settle(run, entryFor(run, null, lost(sent.reason)))));
     if (sent.outcome === CANCELLED_BEFORE_ENQUEUE) return await afterStep(run, sent.settled);
+    if (sent.outcome === DISPATCH_KEY_REFUSED) return { state: 'unresolved', reason: sent.reason, exitCode: sent.exitCode, refused: true, next: run.cfg.pollMs };
     if (sent.outcome === 'queued') await persistPull(run, { stage: 'QUEUED' }, { phase: 'running' });
     return { state: 'waiting', next: 0 };
   } catch (err) {
@@ -541,7 +542,7 @@ export function pullExitCode(outcome) {
     case 'lost':
       return Number.isInteger(outcome.exitCode) ? outcome.exitCode : LOST_EXIT;
     case 'unresolved':
-      return 1;
+      return Number.isInteger(outcome.exitCode) ? outcome.exitCode : 1;
     default:
       return undefined;
   }
@@ -693,7 +694,7 @@ export async function runPullTicket(ctx) {
     }
     if (step.state === 'settled' && step.decision === undefined) return settledElsewhere(ctx);
     if (step.state === 'settled') return settledOutcome(step);
-    if (step.state === 'unresolved') return { outcome: 'unresolved', reason: step.reason, exitCode: step.exitCode };
+    if (step.state === 'unresolved') return { outcome: 'unresolved', reason: step.reason, exitCode: step.exitCode, ...(step.refused ? { refused: true } : {}) };
     if (step.state === 'withdrawn') return { outcome: 'withdrawn', ...(step.proof ? { proof: true, reason: step.reason } : {}) };
     if (step.state === 'gone' || step.state === 'stale') return { outcome: step.state };
     await sleep(step.next ?? settingsOf(ctx).pollMs);

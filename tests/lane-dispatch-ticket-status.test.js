@@ -338,13 +338,14 @@ describe('train_reader provisioning under a NOCREATEROLE migrator (PKG-437)', { 
     const v10 = makeTmpDir('lane-v10-sql-');
     fs.cpSync(LANE_SQL_DIR, v10, { recursive: true });
     fs.rmSync(path.join(v10, 'migrations', '011-ticket-status.sql'));
+    fs.rmSync(path.join(v10, 'migrations', '012-dispatch-key.sql'));
     const su = await cluster.client(db);
     assert.equal((await applyMigrations(su, { dir: v10 })).version, 10);
     await admin.query('CREATE ROLE lane_migrate_p LOGIN NOSUPERUSER NOCREATEROLE');
     await admin.query('GRANT lane_definer TO lane_migrate_p WITH INHERIT TRUE, SET TRUE');
     await admin.query(`GRANT CONNECT, CREATE ON DATABASE ${db} TO lane_migrate_p`);
     const migrator = await cluster.client(db, 'lane_migrate_p');
-    assert.deepEqual((await applyMigrations(migrator)).applied, ['011-ticket-status.sql']);
+    assert.deepEqual((await applyMigrations(migrator)).applied, ['011-ticket-status.sql', '012-dispatch-key.sql']);
     assert.equal((await admin.query("SELECT 1 FROM pg_roles WHERE rolname = 'train_reader'")).rowCount, 0, 'the migrator created no role');
     assert.equal((await su.query('SELECT 1 FROM lane.ticket_status_v1')).rowCount, 0, 'the view exists');
     assert.equal((await su.query("SELECT 1 FROM pg_attribute WHERE attrelid = 'lane_dispatch.tickets'::regclass AND attname = 'status_changed_at'")).rowCount, 1);
