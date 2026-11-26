@@ -4,7 +4,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { runTagFromFlag, noOnlineRunnerMessage, checkRunnable, RUNNER_ONLINE_WITHIN_S } from '../src/run-tags.js';
 import { effectiveRequiresTags, hostTag, isValidRunTag } from '../src/runner-readiness.js';
-import { computeContentKey } from '../src/result-cache.js';
+import { computeContentKey, settledContentKey } from '../src/result-cache.js';
+import { localIneligibilityOf } from '../src/supervisor.js';
+import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { loadGlobalConfig, ConfigError } from '../src/config.js';
 import { freshEnv, gitFixture, laneRun, writeGlobalConfig, writeRepoConfig } from './helpers.js';
 
@@ -57,7 +59,9 @@ test('checkRunnable refuses from the queue answer, and never blocks a run when t
   assert.deepEqual(await checkWith(unmigrated, undefined, undefined, { count: 1 }), { ok: true }, 'a queue without the function but with a claimer');
   assert.match((await checkWith(unmigrated, undefined, undefined, { count: 0 })).message, /^waiting: no runner has \[host:evo-x2\]/, 'a queue without the function and no claimer');
   assert.deepEqual(await checkWith(unmigrated, undefined, undefined, { count: new Error('down') }), { ok: true }, 'an unreachable queue');
-  assert.deepEqual(await checkWith(offline, [hostTag('x')], { ...PULL_CFG, lanePull: { enabled: false } }), { ok: true }, 'pull not configured');
+  const noPull = { ...PULL_CFG, lanePull: { enabled: false } };
+  assert.match((await checkWith(offline, [hostTag('x')], noPull)).message, /does not use pull dispatch/, 'a pin without pull dispatch has nowhere to go');
+  assert.deepEqual(await checkWith(offline, ['browser'], noPull), { ok: true }, 'a plain tag is not blocked');
 });
 
 test('the same content aimed at another machine is not the same run: required tags are part of the content key, none leaves it unchanged', () => {
@@ -75,6 +79,9 @@ test('the same content aimed at another machine is not the same run: required ta
   const mac = computeContentKey({ ...args, requiredTags: ['host:mac'] });
   assert.equal(new Set([plain, evo, mac]).size, 3);
   assert.equal(computeContentKey({ ...args, requiredTags: ['host:evo-x2'] }), evo, 'deterministic');
+  const ticket = { cwd: repo, key: args.key, cmdFingerprint: 'fp', contentKey: evo, contentKeyTags: ['host:evo-x2'] };
+  assert.equal(settledContentKey(ticket), evo, 'the history row of a finished pinned run keeps its tagged key');
+  assert.equal(settledContentKey({ ...ticket, contentKeyTags: undefined }), null, 'without the tags the recomputed key differs and the row gets none');
 });
 
 test('runnerTags may not claim the reserved host: prefix', () => {
@@ -97,4 +104,11 @@ test('lane run --runner on a lane that runs here is refused (exit 64), and a bad
   const bad = await laneRun(['run', '--repo', 'r', '--lane', 'default', '--runner', 'Evo', '--', 'true'], { env, cwd: repoDir });
   assert.equal(bad.code, 2, bad.stderr);
   assert.match(bad.stderr, /--runner needs a runner name/);
+});
+
+test('a ticket pinned to a runner is never locally eligible, whatever the lane policy; an unpinned one is not refused for pinning', () => {
+  const pinned = localIneligibilityOf({ lane: 'e2e', remote: { requiresTags: ['host:evo-x2'] } }, DEFAULT_GLOBAL_CONFIG, null);
+  assert.match(pinned.message, /pinned to a runner \(host:evo-x2\) and never runs here/);
+  const unpinned = localIneligibilityOf({ lane: 'e2e', resources: { cpuCores: 1, memoryBytes: 1 }, remote: { requiresTags: ['browser'] } }, DEFAULT_GLOBAL_CONFIG, null);
+  assert.doesNotMatch(unpinned?.message ?? '', /pinned/);
 });

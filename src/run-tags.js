@@ -1,5 +1,6 @@
 import { pullConfigured } from './config.js';
 import { effectiveRequiresTags, hostTag, isValidRunTag, HOST_TAG_PREFIX } from './runner-readiness.js';
+import { isPinnedToHost } from './pull-placement.js';
 import { pullServices } from './pull-services.js';
 import { QUEUE_PROBE } from './queue-client.js';
 
@@ -34,7 +35,7 @@ export function noOnlineRunnerMessage(detail, tags) {
  * Best effort beyond that: pull not configured or a queue that cannot be reached never blocks the run.
  */
 export async function checkRunnable({ cfg, root, repoKey, tags, servicesFor = pullServices }) {
-  if (!pullConfigured(cfg)) return { ok: true };
+  if (!pullConfigured(cfg)) return isPinnedToHost(tags) ? { ok: false, message: `no runner can claim [${tags.join(', ')}]: this host does not use pull dispatch, and a run pinned to a runner never runs here` } : { ok: true };
   try {
     const services = servicesFor(cfg, root);
     if (!services.available) return { ok: true };

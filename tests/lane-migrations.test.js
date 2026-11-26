@@ -173,4 +173,16 @@ describe('lane schema versioning', { skip: PG_SKIP_REASON ?? false, timeout: 120
     assert.equal(r.applied.length, 10);                // 003 (the backfill), 004 to 012
     assert.deepEqual((await c.query('SELECT account, count(*)::int AS n FROM lane.sched_parents GROUP BY account ORDER BY account')).rows, [{ account: 'a1', n: 5 }, { account: 'a2', n: 5 }]);
   });
+
+  test('migration 012 adds host:<host> to the tags of agent principals that already existed, keeping their own tags', async () => {
+    const c = await emptyDb();
+    const dir = fixtureDir();
+    fs.rmSync(path.join(dir, 'migrations', '012-host-identity-tag.sql'));
+    await applyMigrations(c, { dir });
+    await c.query("INSERT INTO lane_dispatch.principals (login_role, host, kind, tags, allowed_repos) VALUES ('lane_agent_old', 'old', 'agent', '{linux,host:other}', '{*}'), ('lane_submit_old', NULL, 'submit', '{}', '{}')");
+    await applyMigrations(c);
+    const tags = async (host) => (await c.query('SELECT tags FROM lane_dispatch.principals WHERE host IS NOT DISTINCT FROM $1', [host])).rows[0].tags;
+    assert.deepEqual(await tags('old'), ['linux', 'host:old']);
+    assert.deepEqual(await tags(null), [], 'a submit principal is untouched');
+  });
 });

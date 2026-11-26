@@ -49,7 +49,7 @@ import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, l
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness, recordEnforcement } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
-import { placeForPull } from './pull-placement.js';
+import { placeForPull, isPinnedToHost } from './pull-placement.js';
 import { publicationBindings, publicationOf } from './pull-publication.js';
 import { pullContextFor } from './pull-services.js';
 import { withRepoIdentity } from './pull-snapshot.js';
@@ -682,6 +682,8 @@ export function localIneligibilityOf(enriched, globalCfg, cpuLimit, { pullFallba
   // BRAIN-634: a dispatch-only host can never run anything; every caller treats that as "no local fallback" (no queue timeout,
   // no local-first, no speed-aware local choice, wait on a busy runner). It wins over a BRAIN-629 localWindow.
   if (isDispatchOnly(globalCfg)) return dispatchOnlyRefusal(enriched.lane);
+  // PKG-468: a ticket pinned to a runner runs there or nowhere, so no local-first, speed-aware, queue-timeout or fallback path may run it here
+  if (isPinnedToHost(enriched.remote?.requiresTags ?? [])) return { exitCode: LOCAL_REFUSED_EXIT_CODE, message: `lane run: lane "${enriched.lane}" is pinned to a runner (${enriched.remote.requiresTags.filter((t) => t.startsWith('host:')).join(', ')}) and never runs here\n` };
   if (!pullFallback && locallyRefusedNow(enriched, globalCfg)) return localSimRefusal(enriched.lane, enriched.class);
   if (enriched.maxExecutionCpuCores !== undefined && (cpuLimit?.mode === 'off' || cpuLimit?.available !== true)) {
     const error = new CpuLimitUnavailableError(cpuLimit?.reason ?? 'quota support unavailable', 'maxExecutionCpuCores was requested');
@@ -1401,7 +1403,6 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       process.stderr.write(line);
       writeBrokerLog(root, line);
     }
-    if (route.route === 'refuse' && route.pinned) return exitUnresolved(`${route.reason}: a run pinned to a runner never falls back to another`, NO_RUNNER_EXIT_CODE);
     if (route.route === 'refuse') return fallbackOrRefuse(null, `${skippedSummary()}; ${route.reason}`, { rebindable: true, noRunner: true, retryable: true });
     if (route.route === 'local') return fallbackOrRefuse(null, `${skippedSummary()}; local can run it now, not queuing for pull`, { rebindable: true });
     if (route.route === 'pull') return dispatchViaPull(route.services, skippedSummary());

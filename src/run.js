@@ -828,6 +828,7 @@ export async function runCommand({
     ...(cmdFingerprint ? { cmdFingerprint } : {}),
     ...(headTree ? { headTree } : {}),
     ...(contentKey ? { contentKey } : {}),
+    ...(contentKey && perRunTags.length > 0 ? { contentKeyTags: resolved.requiresTags } : {}),
     ...(retryReason ? { retryReason } : {}),
     ...(localReason ? { localReason } : {}),
     ...(localReason && localReason === forced && localReasonText ? { localReasonText } : {}),

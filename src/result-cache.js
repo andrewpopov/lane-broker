@@ -139,6 +139,6 @@ export const isCleanPass =(result) => result.exit === 0 && !result.signal;
  */
 export function settledContentKey(ticket) {
   if (!ticket.contentKey) return null;
-  const after = computeContentKey({ cwd: ticket.cwd, key: ticket.key, cmdFingerprint: ticket.cmdFingerprint, configIdentity: configIdentityOf(ticket) });
+  const after = computeContentKey({ cwd: ticket.cwd, key: ticket.key, cmdFingerprint: ticket.cmdFingerprint, configIdentity: configIdentityOf(ticket), requiredTags: ticket.contentKeyTags ?? [] });
   return after === ticket.contentKey ? after : null;
 }
