@@ -235,9 +235,9 @@ test('shellQuote survives the remote shell: a psql field separator stays one wor
 const HBA_STAT = 'postgres:postgres 640';
 const TRAIN_STAT = 'train:train 644';
 
-function fakeWorld({ hba = HBA, train = TRAIN, held = [], hbaErrors = 0, item = null, roleExists = false, mcInfo = null } = {}) {
+function fakeWorld({ hba = HBA, train = TRAIN, held = [], hbaErrors = 0, item = null, roleExists = false, mcInfo = null, principalRow = null } = {}) {
   const world = {
-    calls: [], hba, train, held, heldInTx: [], hbaErrors, item, roleExists, templates: [], mcEnvs: [], policyFile: null, mcInfo,
+    principalRow, calls: [], hba, train, held, heldInTx: [], hbaErrors, item, roleExists, templates: [], mcEnvs: [], policyFile: null, mcInfo,
     fail: {}, scripts: [], reloads: 0, principalExists: false, roleLogin: true, afterRole: null, extraItems: [], backup: null, principalDeleted: false, beforeScript: null,
   };
   const ok = (stdout = '') => ({ code: 0, stdout, stderr: '' });
@@ -310,6 +310,14 @@ function fakeWorld({ hba = HBA, train = TRAIN, held = [], hbaErrors = 0, item = 
         world.principalExists = true;
         world.roleLogin = /\bLOGIN\b/.test(input);
         world.afterRole?.();
+        return ok();
+      }
+      if (input.includes('FROM lane_dispatch.principals WHERE host =')) return ok(world.principalRow ? `${world.principalRow.join('|')}\n` : '');
+      if (input.includes('ld_set_platform')) {
+        const platform = /ld_set_platform\('[^']+', (?:'(\w+)'|NULL)\)/.exec(input)[1] ?? '-';
+        world.platformSets = [...(world.platformSets ?? []), platform];
+        if (world.principalRow) world.principalRow = [...world.principalRow.slice(0, 3), platform];
+        world.afterPlatform?.();
         return ok();
       }
       if (input.includes('login_role') && input.includes('count(*) FROM pg_roles')) return ok(`${world.roleExists ? 1 : 0}|${world.principalExists ? 1 : 0}\n`);
@@ -751,6 +759,77 @@ test('remove tolerates only the not-found of the resource it removes, never a DN
   assert.match(dns.text, /mc admin user remove failed/);
   const gone = await cli(failing('mc: <ERROR> Unable to remove user. The specified user does not exist.'), ['remove', 'evo-x2', '--apply']);
   assert.equal(gone.code, 0, gone.text);
+});
+
+const RESTRICTED = ['{browser}', '{rouge,jun}', '3', '-'];
+const SET = ['set-platform', 'evo-x2', 'linux'];
+
+test('set-platform dry run reads the principal, shows the one call that changes it, and writes nothing', async () => {
+  const world = fakeWorld({ principalRow: [...RESTRICTED] });
+  const { code, text } = await cli(world, SET);
+  assert.equal(code, 0);
+  assert.match(text, /current: tags=\{browser\} repos=\{rouge,jun\} max_claims=3 platform=-/);
+  assert.match(text, /SELECT lane_dispatch\.ld_set_platform\('evo-x2', 'linux'\);/);
+  assert.ok(!/ld_set_principal/.test(text), 'the principal is never rewritten');
+  assert.equal(world.platformSets, undefined, 'nothing was changed');
+  assert.ok(world.calls.every((c) => !c.input?.includes('ld_set_platform')), 'no write was sent');
+  assert.match(text, /dry run: 1 steps shown, nothing changed/);
+});
+
+test('set-platform --apply changes the platform alone and says that tags, repos and max_claims are unchanged', async () => {
+  const world = fakeWorld({ principalRow: [...RESTRICTED] });
+  const { code, text } = await cli(world, [...SET, '--apply']);
+  assert.equal(code, 0, text);
+  assert.deepEqual(world.platformSets, ['linux']);
+  assert.deepEqual(world.principalRow, ['{browser}', '{rouge,jun}', '3', 'linux']);
+  assert.match(text, /platform=- -> platform=linux; tags, repos and max_claims unchanged/);
+  assert.ok(!world.calls.some((c) => c.input?.includes('ld_set_principal')));
+});
+
+test('set-platform none clears the platform, and an unknown host is refused with nothing sent', async () => {
+  const world = fakeWorld({ principalRow: ['{}', '{*}', '1', 'darwin'] });
+  assert.equal((await cli(world, ['set-platform', 'evo-x2', 'none', '--apply'])).code, 0);
+  assert.deepEqual(world.platformSets, ['-']);
+  const missing = fakeWorld({ principalRow: null });
+  const { code, text } = await cli(missing, [...SET, '--apply']);
+  assert.equal(code, 1);
+  assert.match(text, /no agent principal for evo-x2; nothing changed/);
+  assert.equal(missing.platformSets, undefined);
+});
+
+test('set-platform --apply fails loudly if tags, repos or max_claims differ after the update', async () => {
+  const world = fakeWorld({ principalRow: [...RESTRICTED] });
+  world.afterPlatform = () => { world.principalRow[2] = '0'; };
+  const { code, text } = await cli(world, [...SET, '--apply']);
+  assert.equal(code, 1);
+  assert.match(text, /differ after the update/);
+});
+
+test('add --platform sets the platform in the same transaction as the principal; without it the SQL is as before', async () => {
+  const withPlatform = fakeWorld();
+  assert.equal((await cli(withPlatform, [...ADD, '--platform', 'linux', '--apply'])).code, 0);
+  const roleCall = withPlatform.calls.find((c) => c.input?.includes('ld_set_principal'));
+  assert.match(roleCall.input, /ld_set_principal[^\n]*\n(?:[^\n]*\n)?SELECT lane_dispatch\.ld_set_platform\('evo-x2', 'linux'\);\nCOMMIT;/);
+  const without = fakeWorld();
+  assert.equal((await cli(without, [...ADD, '--apply'])).code, 0);
+  assert.ok(!without.calls.some((c) => c.input?.includes('ld_set_platform')));
+});
+
+test('platform arguments are validated: a platform outside the three, a missing one, --platform on remove or set-platform exit 2', async () => {
+  const world = fakeWorld();
+  for (const argv of [['set-platform', 'evo-x2', 'plan9'], ['set-platform', 'evo-x2'], ['set-platform', 'evo-x2', 'linux', 'extra'], ['add', 'evo-x2', '--ip', '100.82.26.77', '--platform', 'beos'], ['remove', 'evo-x2', '--platform', 'linux'], ['set-platform', 'evo-x2', 'linux', '--platform', 'linux'], ['set-platform', 'evo-x2', 'linux', '--ip', '100.82.26.77']]) {
+    const { code } = await cli(world, argv);
+    assert.equal(code, 2, argv.join(' '));
+  }
+  assert.equal(world.calls.length, 0);
+});
+
+test('canary: with the after-update check of tags, repos and max_claims removed, the changed-row scenario fails', async () => {
+  const mutant = await importMutant(LIB_FILE, ["if (!after || before.slice(0, 3).join('|') !== after.slice(0, 3).join('|')) throw", 'if (false) throw']);
+  const world = fakeWorld({ principalRow: [...RESTRICTED] });
+  world.afterPlatform = () => { world.principalRow[2] = '0'; };
+  const { code } = await cli(world, [...SET, '--apply'], mutant);
+  assert.equal(code, 0, 'the mutant lets a changed row through, which the real code refuses');
 });
 
 test('bad arguments exit 2 with a message and touch nothing', async () => {

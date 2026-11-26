@@ -60,8 +60,12 @@ function entryCalls(t1) {
     ld_reap: [logins.admin, []],
     ld_queue_ref: [logins.s1, []],
     ld_enqueue_fenced: [logins.s1, ['0.0', tid(8), 'repoA', 'test', 'lk8', { protocol: 1 }, { cmd: ['true'] }, snapshot, [], 1, 1000, 0]],
-    ld_placeable: [logins.s1, ['repoA', []]],
-    ld_ticket_by_key: [logins.s1, ['k']],
+    'ld_placeable/2': [logins.s1, ['repoA', []]],
+    'ld_placeable/5': [logins.s1, ['repoA', [], 'linux', [], null]],
+    'ld_ticket_by_key/1': [logins.s1, ['k']],
+    'ld_ticket_by_key/2': [logins.s1, ['k', { capability_class: 'linux' }]],
+    ld_known_hosts: [logins.s1, []],
+    ld_set_platform: [logins.admin, ['a2', 'linux']],
     ld_prune_candidates: [logins.admin, ['1 day', '7 days', null, null, 10]],
     ld_prune: [logins.admin, [[id], '7 days']],
     ld_prune_chunks: [logins.admin, ['1 hour', 10]],
@@ -72,15 +76,16 @@ function entryCalls(t1) {
 const GUARDS = {
   'the timeline restore settles the queue from each ld_* function': async (w, makeWorld) => {
     const su = await w.su();
-    const { rows } = await su.query("SELECT proname FROM pg_proc WHERE pronamespace = 'lane_dispatch'::regnamespace AND proname LIKE 'ld\\_%' ORDER BY proname");
+    // every overload is probed on its own, named `name/arity` where a name has more than one
+    const { rows } = await su.query("SELECT CASE WHEN count(*) OVER (PARTITION BY proname) > 1 THEN proname || '/' || pronargs ELSE proname END AS probe, proname FROM pg_proc WHERE pronamespace = 'lane_dispatch'::regnamespace AND proname LIKE 'ld\\_%' ORDER BY 1");
     const probe = entryCalls({ id: tid(1), epoch: 1, token: randomUUID() });
-    assert.deepEqual(Object.keys(probe).sort(), rows.map((r) => r.proname).filter((n) => !NOT_ENTRY_CHECKED.includes(n)), 'every ld_* function is in the loop');
+    assert.deepEqual(Object.keys(probe).sort(), rows.filter((r) => !NOT_ENTRY_CHECKED.includes(r.proname)).map((r) => r.probe).sort(), 'every ld_* function and overload is in the loop');
     for (const name of Object.keys(probe)) {
       const world = await makeWorld();
       const t1 = await heldAndQueued(world);
       await simulateRestore(world);
       const [login, args] = entryCalls(t1)[name];
-      await call(await world.as(login), name, ...args).catch(() => {});
+      await call(await world.as(login), name.split('/')[0], ...args).catch(() => {});
       const { rows: [c] } = await (await world.su()).query(
         'SELECT c.incarnation, c.timeline = (SELECT timeline_id FROM pg_control_checkpoint()) AS synced FROM lane_dispatch.cluster c');
       assert.deepEqual(c, { incarnation: 1, synced: true }, `${name}: cluster resynced and incarnation bumped once`);

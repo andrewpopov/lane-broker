@@ -3,6 +3,7 @@ import path from 'node:path';
 import { pullConfigured } from './config.js';
 import { lifecycleVerdict } from './pull-check.js';
 import { pullServices } from './pull-services.js';
+import { PLACEMENT_USAGE_EXIT, placementRefusal } from './placement.js';
 import { QUEUE_PROBE } from './queue-client.js';
 import { readQueueHealth } from './queue-health.js';
 import { atomicWriteJson, paths, readJsonSafe } from './state.js';
@@ -55,21 +56,43 @@ export function createPullReadiness({ root, ttlMs = PULL_READY_TTL_MS, now = Dat
 }
 
 // a chosen push runner returns before any pull config, file or network is read; an unreachable pull side is `legacy`, never a half-placed enqueue
+// a placed ticket (`placement.constrained`) is never routed local or push: the queue refuses it (`refuse`, with the exit its answer calls for) or it is queued
 export async function placeForPull({
-  root, pushChosen, cfg, repoKey, requiresTags = [], locallyIneligible, couldRunLocally, servicesFor = pullServices, readiness = createPullReadiness({ root }),
+  root, pushChosen, cfg, repoKey, requiresTags = [], placement, aliasesApplied = [], locallyIneligible, couldRunLocally, servicesFor = pullServices, readiness = createPullReadiness({ root }),
 }) {
   if (pushChosen) return { route: 'push' };
   if (!pullConfigured(cfg)) return { route: 'legacy' };
   const services = servicesFor(cfg, root);
   const verdict = await readiness(cfg, services);
   if (!verdict.ready) return { route: 'legacy', reason: `pull dispatch unavailable: ${verdict.reason}` };
+  const constrained = placement?.constrained === true;
+  if (constrained && aliasesApplied.length > 0) {
+    const shadowed = await shadowedAlias(services, aliasesApplied);
+    if (shadowed !== null) return shadowed;
+  }
   let placeable;
   try {
-    placeable = await services.queue.placeable(repoKey, requiresTags, QUEUE_PROBE);
+    placeable = await services.queue.placeable(repoKey, constrained ? placement.requiresTags : requiresTags, QUEUE_PROBE, placement);
   } catch (err) {
+    const refusal = constrained ? placementRefusal(err) : null;
+    if (refusal !== null) return { route: 'refuse', ...refusal };
     return { route: 'legacy', reason: `pull dispatch unavailable: ld_placeable failed: ${err.message}` };
   }
-  if (placeable === 0) return { route: 'refuse', reason: 'no queue principal is eligible for this ticket' };
+  if (placeable === 0) return { route: 'refuse', reason: constrained ? 'no queue principal satisfies the requested placement' : 'no queue principal is eligible for this ticket' };
+  if (constrained) return { route: 'pull', services };
   if (locallyIneligible()) return { route: 'pull', services };
   return (await couldRunLocally()) ? { route: 'local' } : { route: 'pull', services };
+}
+
+// an alias that is itself a runner id would silently send a request for one real host to another
+async function shadowedAlias(services, aliasesApplied) {
+  let known;
+  try {
+    known = await services.queue.knownHosts(QUEUE_PROBE);
+  } catch (err) {
+    const refusal = placementRefusal(err);
+    return refusal === null ? { route: 'legacy', reason: `pull dispatch unavailable: ld_known_hosts failed: ${err.message}` } : { route: 'refuse', ...refusal };
+  }
+  const shadow = aliasesApplied.find((alias) => known.includes(alias));
+  return shadow === undefined ? null : { route: 'refuse', exitCode: PLACEMENT_USAGE_EXIT, reason: `hostAliases key "${shadow}" is itself a runner id the queue knows; an alias must never map one real runner to another` };
 }

@@ -65,7 +65,8 @@ SELECT lane_dispatch.ld_set_principal('lane_submit_<name>', 'submit', NULL, '{}'
 `ops/runner/lane-runner-admin.js` (logic in `ops/runner/runner-admin-lib.js`) registers a pull runner on pitelite from the admin's Mac. It reaches pitelite with `ssh pitelite sudo -n` and runs `mc` and `op-bot` locally. The default is a dry run that prints every action (the SQL with the password as `'<redacted>'`, a unified diff of each file it would edit); `--apply` performs the steps in order and stops at the first failure, printing what succeeded and the command to resume. Every step converges, so re-running `add` after a partial failure finishes the job.
 
 ```sh
-node ops/runner/lane-runner-admin.js add <host> --ip <tailnet IPv4> [--tags a,b] [--repos '*'|a,b] [--max-claims N] [--out <dir>] [--note <text>] [--apply]
+node ops/runner/lane-runner-admin.js add <host> --ip <tailnet IPv4> [--tags a,b] [--repos '*'|a,b] [--max-claims N] [--platform darwin|linux|win32] [--out <dir>] [--note <text>] [--apply]
+node ops/runner/lane-runner-admin.js set-platform <host> darwin|linux|win32|none [--apply]
 node ops/runner/lane-runner-admin.js remove <host> [--force] [--apply]
 node ops/runner/lane-runner-admin.js status <host>
 ```
@@ -210,6 +211,39 @@ The key is global, not per owner: callers namespace it (merge-train: `train:<rep
 - `ld_ticket_by_key(key)` (granted to `lane_submit`) returns the caller's own live ticket under the key as `ticket_view`, or null. `lane status --dispatch-key <key> [--json]` prints its id, state and host (exit 0; 1 when there is none; 64 for an invalid key).
 
 `lane run --dispatch-key <key>` never falls back: a key needs the pull queue. The run is refused (exit 76, "dispatch key needs the pull queue") when the lane would not be dispatched, pull dispatch is off, or placement would choose a push runner, local execution or the legacy flow; and when the queue lacks the 19-argument enqueue (42883, a queue below migration 012) the key is never trimmed off. A key the queue already holds is observed, never submitted again: for a ticket this machine has a record of, the run answers with `lane wait` semantics; otherwise it attaches to the queue ticket (no placement, no snapshot, no supervisor), waits until it ends and reports its exit from the stored result, which it keeps as a local result so a later run answers from it (no history row: this machine ran nothing). `--detach` prints the held id at once. A `--detach` that submits prints an id only after the queue answered the enqueue, and it is the id the queue holds for the key, so two callers racing on one key print the same id. A refusal (old queue, foreign owner, a withdrawn ticket) is a ledgered decision published with its exit (76 or 64), so a recovery after a crash publishes it instead of sending the enqueue again. A keyed submission's envelope is version 2, which a release older than the key refuses (it checks for version 1), so it can never enqueue the run without its key. `--dispatch-key` and `--id` are exclusive (exit 64).
+
+## Placement constraints (migration 013, PKG-439)
+
+`013-placement-constraints.sql` adds `lane_dispatch.principals.platform` (`darwin`, `linux`, `win32` or NULL) and four columns to `tickets`: `capability_class` (`<platform>[+tag...]`, CHECKed), `class_platform`, `avoid_hosts text[] NOT NULL DEFAULT '{}'` and `target_host`. No backfill: every existing ticket is unconstrained. It touches no role, so a NOCREATEROLE migrator applies it. `functions.sql` then:
+
+- adds `placeable_on(class_platform, avoid_hosts, target_host, host, platform)`, the one claim-side predicate. `ld_claim` (the candidate query and the `v_head` head-reserve query), `ld_needed_tools` and `scarcity` all call it. `ld_claim` reads the platform in its existing `FOR UPDATE` principal projection (so a `ld_set_platform` committed while a claim waits is seen by that claim); `ld_needed_tools` reads it through the new unlocked `me_platform()`; `me()` keeps its return type.
+- re-signs `ld_enqueue` (19 to 22 arguments) and `ld_enqueue_fenced` (20 to 23) with trailing `p_capability_class text`, `p_avoid_hosts text[]`, `p_target_host text` (the old arities are dropped), and `scarcity` (2 to 5 arguments, the new ones defaulting to no constraint; the 2-argument form is dropped). `ld_placeable(repo, tags)` stays; `ld_placeable(repo, tags, class_platform, avoid_hosts, target_host)` and `ld_ticket_by_key(key, placement jsonb)` are overloads beside the old forms, and `ld_known_hosts()` is new, all granted to `lane_submit`. `ld_set_platform(host, platform)` is granted to `lane_admin` only.
+- stores placement canonical: class platform first with the class's tags de-duplicated and sorted (and added to `requires_tags`), host ids lower-case, lists sorted and de-duplicated (C collation). A malformed value raises `22023`. `avoid_hosts` must be a known id (a current agent principal host, or a host on a retained `tickets.host` or `attempts.host`), `target_host` a current agent principal, else `LK422` "unknown host <id>"; a target that is also avoided is `LK422`.
+- answers a repeat first: after the ownership check an existing row with the same id (or the live row under the same dispatch key) is returned before the hosts are looked up, so a retry after the targeted runner was removed still returns the ticket. A holder or id placed otherwise is refused `LK423` ("different placement"). A request is compared to the row's canonical values, so an unconstrained request is refused against a placed holder as well.
+- adds `unplaceable` (NULL, or `no-runner`, `tags`, `class`, `avoid`, `target`) and the three placement fields to `ticket_view`, which is what `ld_get`, `ld_list_mine`, `ld_enqueue` and `ld_ticket_by_key` return; the reason is computed over the scarcity set (agent, `max_claims > 0`) with the same `eligible` and `placeable_on` tests, in that order.
+- appends `capability_class`, `avoid_hosts`, `target_host` to `lane.pull_tickets` and `platform` to `lane.pull_principals` once the columns exist (`ticket_status_v1` is unchanged).
+
+**Setting platforms is a step of the rollout**, because a runner with no platform never claims a ticket that names one. Production values (pitelite, read 2026-11-26):
+
+| host | platform |
+|---|---|
+| `evo-x2` | `linux` (WSL) |
+| `wintop` | `linux` (WSL) |
+| `skybox` | `linux` |
+| `mac` | `darwin` |
+| `mac-grandy` | `darwin` |
+| `zirkbot` | `darwin` |
+
+For each, run the dry run, read the printed `current:` row and the single call, then apply:
+
+```sh
+node ops/runner/lane-runner-admin.js set-platform wintop linux            # dry run
+node ops/runner/lane-runner-admin.js set-platform wintop linux --apply
+```
+
+Do not use `add` for this: it rewrites tags, repos and max_claims through `ld_set_principal`. `status <host>` shows the platform on the principal row.
+
+Rollout order: apply 013 (the migrator), set the platforms, then update the clients (`lane` on the submitters, the merge-train host). A queue below 013 refuses a placed run (`76`, "queue too old for placement constraints") and never runs it without its placement; an old client against a migrated queue is unaffected. The zirkbot collector `ops/monitoring/collectors/lane-pull.sql` reimplements `eligible` and does not know placement; it needs its own change.
 
 ## Weight-aware claims and requeue (migration 010, BRAIN-1106)
 

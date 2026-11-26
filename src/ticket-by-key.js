@@ -4,11 +4,11 @@ import { pullServices } from './pull-services.js';
 import { ensureStateDirs } from './state.js';
 
 /** The caller's own live ticket under `dispatchKey` as the queue shows it, or null when there is none. Throws when the queue cannot answer. */
-/** `root` is only for the queue-health record: leave it out and the lookup writes nothing here. `options` bounds the query (`attempts`, `connectTimeoutMs`, `queryTimeoutMs`). */
-export async function lookupTicketByKey(cfg, root, dispatchKey, { servicesFor = pullServices, options } = {}) {
+/** `root` is only for the queue-health record: leave it out and the lookup writes nothing here. `options` bounds the query (`attempts`, `connectTimeoutMs`, `queryTimeoutMs`). `placement` (PKG-439) makes the queue refuse, with LK423, a holder placed otherwise. */
+export async function lookupTicketByKey(cfg, root, dispatchKey, { servicesFor = pullServices, options, placement } = {}) {
   const services = servicesFor(cfg, root);
   if (!services.available) throw new Error(`pull dispatch is not available here: ${services.reason}`);
-  return (await services.queue.ticketByKey(dispatchKey, options)) ?? null;
+  return (await services.queue.ticketByKey(dispatchKey, options, placement)) ?? null;
 }
 
 /** `lane status --dispatch-key <k>`: the ticket's id, state and host. Exit 0 found, 1 none (or the queue cannot answer), 64 an invalid key. */

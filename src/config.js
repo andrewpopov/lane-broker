@@ -12,6 +12,7 @@ import { PRIORITY_TIERS, DEFAULT_PRIORITY, isPriorityTier } from './priority.js'
 import { DEFAULT_DEPS_CACHE_MAX_BYTES, DEFAULT_DEPS_CACHE_REGISTRIES, registriesProblem } from './deps-cache.js';
 import { isValidRequiresShape, VERSION_FLOOR_RE } from './runner-readiness.js';
 import { deviceGatesProblem } from './device-gates.js';
+import { HOST_ID_RE } from './placement.js';
 import { CPU_LIMIT_MODES, MEMORY_LIMIT_MODES, MIN_CPU_GRANT_CORES } from './cpu-limit.js';
 import { readOfflineMarks, applyOfflineMarks } from './runner-offline.js';
 
@@ -190,6 +191,8 @@ export const DEFAULT_GLOBAL_CONFIG = {
   // niceing (spawns the bare command). A `.lane-broker.json` lane's own
   // `nice` overrides this per-lane.
   laneNice: 10,
+  // PKG-439: spellings of a runner that `--avoid-host` and `--target-host` accept, mapped to its one canonical id (the runner's `principals.host`); keys are lower-case.
+  hostAliases: {},
   // BRAIN-634: `refused` makes this host dispatch-only: no lane payload ever executes here, whatever a repo config says.
   localExecution: 'allowed',
   // BRAIN-627: the nice a lane runs at, by the tier it was ADMITTED at; a tier not named uses laneNice, and a lane's own
@@ -353,6 +356,16 @@ export function validateClasses(classes, sourcePath) {
 // A retention below a day could expire a tombstone while its submitter's dispatch is still in flight (see src/gc.js).
 const MIN_RETENTION_MS = 86_400_000;
 
+export function validateHostAliases(aliases, sourcePath) {
+  assert(isPlainObject(aliases), `${sourcePath}: "hostAliases" must be an object of alias to runner id`);
+  const targets = new Set(Object.values(aliases));
+  for (const [alias, id] of Object.entries(aliases)) {
+    assert(alias === alias.toLowerCase() && alias.trim() === alias && alias !== '', `${sourcePath}: "hostAliases" key "${alias}" must be lower-case`);
+    assert(typeof id === 'string' && HOST_ID_RE.test(id), `${sourcePath}: "hostAliases.${alias}" must be a runner id matching ${HOST_ID_RE}`);
+    assert(!targets.has(alias), `${sourcePath}: "hostAliases" key "${alias}" is also a mapped runner id; an alias must never rewrite a canonical id`);
+  }
+}
+
 function validateGlobalConfig(cfg, sourcePath) {
   assert(cfg && typeof cfg === 'object', `${sourcePath}: config must be an object`);
   assert(Number.isInteger(cfg.version), `${sourcePath}: "version" must be an integer`);
@@ -491,6 +504,7 @@ function validateGlobalConfig(cfg, sourcePath) {
     Number.isInteger(cfg.laneNice) && cfg.laneNice >= 0 && cfg.laneNice <= 19,
     `${sourcePath}: "laneNice" must be an integer in [0, 19]`,
   );
+  validateHostAliases(cfg.hostAliases, sourcePath);
   assert(cfg.priorityNice && typeof cfg.priorityNice === 'object' && !Array.isArray(cfg.priorityNice), `${sourcePath}: "priorityNice" must be an object`);
   for (const [tier, value] of Object.entries(cfg.priorityNice)) {
     assert(isPriorityTier(tier), `${sourcePath}: "priorityNice.${tier}" is not a tier (one of ${PRIORITY_TIERS.join(', ')})`);

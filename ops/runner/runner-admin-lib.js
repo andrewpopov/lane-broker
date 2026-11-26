@@ -60,7 +60,7 @@ export function shellSplit(command) {
 
 const sqlTextArray = (items) => (items.length === 0 ? 'ARRAY[]::text[]' : `ARRAY[${items.map(sqlLit).join(',')}]::text[]`);
 
-export function roleSql({ role, host, password, roleExists, tags, repos, maxClaims }) {
+export function roleSql({ role, host, password, roleExists, tags, repos, maxClaims, platform }) {
   return [
     'BEGIN;',
     roleExists
@@ -70,10 +70,15 @@ export function roleSql({ role, host, password, roleExists, tags, repos, maxClai
     `ALTER ROLE ${sqlIdent(role)} SET idle_in_transaction_session_timeout = '5s';`,
     `DO $lra$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ${sqlLit(role)} AND (rolsuper OR rolreplication OR rolbypassrls OR rolcreatedb OR rolcreaterole)) THEN RAISE EXCEPTION 'role ${role} still holds an elevated attribute'; END IF; END $lra$;`,
     `SELECT lane_dispatch.ld_set_principal(${sqlLit(role)}, 'agent', ${sqlLit(host)}, ${sqlTextArray(tags)}, ${sqlTextArray(repos)}, ${Number(maxClaims)});`,
+    ...(platform ? [`SELECT lane_dispatch.ld_set_platform(${sqlLit(host)}, ${sqlLit(platform)});`] : []),
     'COMMIT;',
     '',
   ].join('\n');
 }
+
+export const PLATFORMS = ['darwin', 'linux', 'win32'];
+export const principalSql = (host) => `SELECT tags, allowed_repos, max_claims, coalesce(platform, '-') FROM lane_dispatch.principals WHERE host = ${sqlLit(host)} AND kind = 'agent';\n`;
+export const setPlatformSql = (host, platform) => ['BEGIN;', `SELECT lane_dispatch.ld_set_platform(${sqlLit(host)}, ${platform === null ? 'NULL' : sqlLit(platform)});`, 'COMMIT;', ''].join('\n');
 
 export const roleAndPrincipalSql = (role) => `SELECT (SELECT count(*) FROM pg_roles WHERE rolname = ${sqlLit(role)}), (SELECT count(*) FROM lane_dispatch.principals WHERE login_role = ${sqlLit(role)});\n`;
 export const roleExistsSql = (role) => `SELECT count(*) FROM pg_roles WHERE rolname = ${sqlLit(role)};\n`;
@@ -703,7 +708,7 @@ const guarded = (step, precondition) => ({ ...step, async apply() { await precon
 function buildAddPlan(ctx) {
   const { host, ip, out } = ctx.opts;
   const role = pgRole(host);
-  const principal = { role, host, tags: ctx.opts.tags, repos: ctx.opts.repos, maxClaims: ctx.opts.maxClaims };
+  const principal = { role, host, tags: ctx.opts.tags, repos: ctx.opts.repos, maxClaims: ctx.opts.maxClaims, platform: ctx.opts.platform };
   ctx.hbaEntry = { role, host, ip, note: ctx.opts.note };
   const stillThere = recheckRole(ctx, role);
   const roleExists = async () => Number((await ctx.psql(roleExistsSql(role), { query: true, label: 'check role' })).stdout.trim()) > 0;
@@ -771,6 +776,26 @@ function workerFilesStep(ctx, out) {
       return `wrote ${Object.keys(files).join(', ')} to ${out}; copy them to ~/.config/lane-agent/ on ${ctx.opts.host}`;
     },
   };
+}
+
+// Only the platform changes: ld_set_principal would rewrite tags, repos and max_claims too, so a runner restricted to some repos could be widened by using `add` for this.
+function buildSetPlatformPlan(ctx) {
+  const { host, platform } = ctx.opts;
+  const describe = (row) => (row ? `tags=${row[0]} repos=${row[1]} max_claims=${row[2]} platform=${row[3]}` : 'absent');
+  const read = async () => (await ctx.psqlRows(principalSql(host), 'read principal'))[0];
+  return [{
+    title: `postgres: set the platform of principal ${host} to ${platform ?? 'NULL (cleared)'}, and nothing else (lane_dispatch.ld_set_platform)`,
+    kind: 'postgres',
+    async preview() { return `current: ${describe(await read())}\n${setPlatformSql(host, platform)}`; },
+    async apply() {
+      const before = await read();
+      if (!before) throw new Error(`no agent principal for ${host}; nothing changed`);
+      await ctx.psql(setPlatformSql(host, platform), { label: 'set platform' });
+      const after = await read();
+      if (!after || before.slice(0, 3).join('|') !== after.slice(0, 3).join('|')) throw new Error(`tags, repos or max_claims of ${host} differ after the update (before ${describe(before)}, after ${describe(after)}); inspect with: lane-runner-admin status ${host}`);
+      return `${describe(before)} -> platform=${after[3]}; tags, repos and max_claims unchanged`;
+    },
+  }];
 }
 
 const parseTickets = (rows) => rows.map(([id, lane]) => `${id} (${lane})`);
@@ -862,8 +887,8 @@ async function statusReport(ctx, out) {
   const line = (name, value) => out(`${name.padEnd(22)} ${value}`);
   const failures = [];
   line('postgres role', Number((await ctx.psql(roleExistsSql(role), { query: true, label: 'check role' })).stdout.trim()) > 0 ? `present (${role})` : `absent (${role})`);
-  const principal = (await ctx.psqlRows(`SELECT login_role, host, kind, tags, allowed_repos, max_claims FROM lane_dispatch.principals WHERE login_role = ${sqlLit(role)};\n`, 'read principal'))[0];
-  line('principal row', principal ? `host=${principal[1]} kind=${principal[2]} tags=${principal[3]} repos=${principal[4]} max_claims=${principal[5]}` : 'absent');
+  const principal = (await ctx.psqlRows(`SELECT login_role, host, kind, tags, allowed_repos, max_claims, coalesce(platform, '-') FROM lane_dispatch.principals WHERE login_role = ${sqlLit(role)};\n`, 'read principal'))[0];
+  line('principal row', principal ? `host=${principal[1]} kind=${principal[2]} tags=${principal[3]} repos=${principal[4]} max_claims=${principal[5]} platform=${principal[6]}` : 'absent');
   const runner = (await ctx.psqlRows(`SELECT host, version, last_seen FROM lane_dispatch.runners WHERE host = ${sqlLit(host)};\n`, 'read runner'))[0];
   line('runners row', runner ? `version=${runner[1]} last_seen=${runner[2]}` : 'absent');
   const hba = hbaState((await ctx.remote(['sudo', '-n', 'cat', HBA_PATH], { label: 'read pg_hba.conf' })).stdout, { role, host });
@@ -888,11 +913,17 @@ async function statusReport(ctx, out) {
 }
 
 const USAGE = `usage:
-  lane-runner-admin add <host> --ip <tailnet IPv4> [--tags a,b] [--repos '*'|a,b] [--max-claims N] [--out <dir>] [--note <text>] [--apply]
+  lane-runner-admin add <host> --ip <tailnet IPv4> [--tags a,b] [--repos '*'|a,b] [--max-claims N] [--platform darwin|linux|win32] [--out <dir>] [--note <text>] [--apply]
+  lane-runner-admin set-platform <host> darwin|linux|win32|none [--apply]
   lane-runner-admin remove <host> [--force] [--apply]
   lane-runner-admin status <host>
 Dry run unless --apply is given.`;
 
+const platformOf = (value) => {
+  if (value === 'none') return null;
+  if (!PLATFORMS.includes(value)) throw new Error(`invalid platform ${JSON.stringify(value)}: one of ${PLATFORMS.join(', ')}, or none to clear it`);
+  return value;
+};
 const csv = (value, fallback) => (value === undefined ? fallback : value.split(',').map((s) => s.trim()).filter(Boolean));
 
 export function parseCli(argv) {
@@ -901,16 +932,17 @@ export function parseCli(argv) {
     allowPositionals: true,
     options: {
       ip: { type: 'string' }, tags: { type: 'string' }, repos: { type: 'string' }, 'max-claims': { type: 'string' },
-      out: { type: 'string' }, note: { type: 'string' }, apply: { type: 'boolean' }, force: { type: 'boolean' },
+      out: { type: 'string' }, note: { type: 'string' }, apply: { type: 'boolean' }, force: { type: 'boolean' }, platform: { type: 'string' },
     },
   });
   const [command, host, ...rest] = positionals;
-  if (!['add', 'remove', 'status'].includes(command) || rest.length) throw new Error(USAGE);
+  if (!['add', 'remove', 'status', 'set-platform'].includes(command) || rest.length !== (command === 'set-platform' ? 1 : 0)) throw new Error(USAGE);
   validateHost(host);
   const opts = { command, host, apply: values.apply === true, force: values.force === true };
   if (command !== 'add') {
-    const stray = ['ip', 'tags', 'repos', 'max-claims', 'out', 'note'].filter((name) => values[name] !== undefined);
+    const stray = ['ip', 'tags', 'repos', 'max-claims', 'out', 'note', 'platform'].filter((name) => values[name] !== undefined);
     if (stray.length) throw new Error(`--${stray[0]} only applies to add`);
+    if (command === 'set-platform') return { ...opts, platform: platformOf(rest[0]) };
     return opts;
   }
   if (values.force) throw new Error('--force only applies to remove');
@@ -921,7 +953,7 @@ export function parseCli(argv) {
   const maxClaims = values['max-claims'] === undefined ? 1 : Number(values['max-claims']);
   if (!Number.isInteger(maxClaims) || maxClaims < 0) throw new Error(`--max-claims must be a non-negative integer, not ${values['max-claims']}`);
   validateNote(values.note ?? '');
-  return { ...opts, ip: values.ip, tags, repos, maxClaims, out: values.out ? path.resolve(values.out) : null, note: values.note ?? '' };
+  return { ...opts, ip: values.ip, tags, repos, maxClaims, platform: values.platform === undefined ? null : platformOf(values.platform), out: values.out ? path.resolve(values.out) : null, note: values.note ?? '' };
 }
 
 export async function runCli(argv, { exec, out = (text) => process.stdout.write(`${text}\n`), err = (text) => process.stderr.write(`${text}\n`), scriptPath = process.argv[1], cwd = process.cwd(), env = process.env, ...injected }) {
@@ -931,7 +963,7 @@ export async function runCli(argv, { exec, out = (text) => process.stdout.write(
   try {
     if (opts.command === 'status') return (await statusReport(ctx, out)).length ? 1 : 0;
     if (opts.apply && env[LOCK_ENV] !== opts.host) throw new Error(`--apply must run under the per-host lock; run it as node ${scriptPath} …`);
-    const steps = opts.command === 'add' ? buildAddPlan(ctx) : buildRemovePlan(ctx);
+    const steps = { add: buildAddPlan, remove: buildRemovePlan, 'set-platform': buildSetPlatformPlan }[opts.command](ctx);
     const relative = path.relative(cwd, path.resolve(cwd, scriptPath));
     const script = relative.startsWith('..') || path.isAbsolute(relative) ? path.resolve(cwd, scriptPath) : relative;
     const resume = ['node', script, ...argv.filter((arg) => arg !== '--apply'), '--apply'].map(shellQuote).join(' ');

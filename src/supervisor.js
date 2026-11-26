@@ -51,6 +51,7 @@ import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
 import { placeForPull } from './pull-placement.js';
 import { dispatchKeyPullRefusal } from './dispatch-key.js';
+import { PLACEMENT_REFUSED_EXIT, PLACEMENT_UNREACHABLE_EXIT, isConstrained, isPullOnly, placementKey, placementPullRefusal, resolvedPlacement } from './placement.js';
 import { DISPATCH_KEY_REFUSED_REASON } from './pull-enqueue.js';
 import { publicationBindings, publicationOf, refusalExitOf } from './pull-publication.js';
 import { pullContextFor } from './pull-services.js';
@@ -611,6 +612,9 @@ function returnRemoteArtifacts(root, enriched, dispatch) {
  *  local -- run.js skipped both checks specifically so a runner could still take an oversized
  *  or local-refused request (BRAIN-319 T3b-1, BRAIN-320). Shared by both refusal reasons since
  *  they carry the same {exitCode, message} shape. */
+/** What the envelope records of a placement: the canonical request, without the config aliases that were applied to it. */
+const envelopePlacement = ({ capabilityClass, classPlatform, classTags, avoidHosts, targetHost }) => ({ capabilityClass, classPlatform, classTags, avoidHosts, targetHost });
+
 function localRefusalResult(ticket, refusal) {
   return { id: ticket.id, exit: refusal.exitCode, signal: null, startedAt: null, endedAt: Date.now(), waitedMs: 0, error: refusal.message.trim(), ...(refusal.failureKind ? { failureKind: refusal.failureKind } : {}) };
 }
@@ -988,7 +992,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   };
   if (!rebind) {
     // BRAIN-321: a retried `--id` submission is the same ticket: dedup BEFORE any probe or dispatch, under the attempt's lock.
-    const created = await createAttempt(root, enriched.id, { runner: null, resources: enriched.resources, logPath: enriched.logPath, cwd: enriched.cwd, key: enriched.key, ...(enriched.clientId ? { refuseIf: () => existingTicket(root, enriched.id) } : {}) });
+    const created = await createAttempt(root, enriched.id, { runner: null, resources: enriched.resources, logPath: enriched.logPath, cwd: enriched.cwd, key: enriched.key, ...(isConstrained(enriched.placementRequest) ? { placement: placementKey(enriched.placementRequest) } : {}), ...(enriched.clientId ? { refuseIf: () => existingTicket(root, enriched.id) } : {}) });
     if (created.existing) process.exit(DUPLICATE_SUBMISSION_EXIT);
   }
 
@@ -1107,6 +1111,14 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   };
   const localIneligibility = () => localIneligibilityOf(enriched, globalCfg, cpuLimit);
 
+  async function refusePullOnly(reason, { exitCode } = {}) {
+    const refusal = isConstrained(enriched.placementRequest) ? placementPullRefusal(enriched.lane, reason, exitCode) : dispatchKeyPullRefusal(enriched.lane, reason);
+    process.stderr.write(refusal.message);
+    await testHoldAt('keyed-refusal');
+    await publishAndExit(gen, () => localRefusalResult(enriched, refusal));
+    return { fallback: false };
+  }
+
   /** `rebindable`: this fallback is only "no runner had room right now", so a later probe may still find one.
    *  `retryWhenBlocked`: a runner proved it never started the ticket (rejecting it included), so while this machine cannot admit it
    *  either, another runner may take it (BRAIN-727).
@@ -1116,13 +1128,8 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     if (rebind) return abandonRebind(runner, reason, { neverStarted: neverStarted || withdrawn === null });
     // PKG-438: a keyed submission is found again by its key in the pull queue, so it never runs anywhere else. Its refusal is published from the attempt as it
     // is, never after the move to local: a supervisor that died in between would leave an abandoned local attempt, which recovery publishes as 75.
-    if (enriched.dispatchKey) {
-      const refusal = dispatchKeyPullRefusal(enriched.lane, reason);
-      process.stderr.write(refusal.message);
-      await testHoldAt('keyed-refusal');
-      await publishAndExit(gen, () => localRefusalResult(enriched, refusal));
-      return { fallback: false };
-    }
+    // PKG-439: so is a placed one, whose placement only the pull queue's claim enforces
+    if (isPullOnly(enriched)) return refusePullOnly(reason);
     const fb = movedByPullFallback ? { ok: true, attempt: readAttempt(root, enriched.id) } : await fallbackToLocal(root, enriched.id, reason);
     if (!fb.ok) {
       if (fb.cancelled) {
@@ -1187,7 +1194,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
 
   // BRAIN-442: a local-first ticket skips the initial dispatch and queues locally; only `tryRebind` may move it, after its wait.
   // A ticket this machine would refuse (local-refused lane, over the local budget) can never run here, so it ignores the policy.
-  if (enriched.localFirst && !rebind) {
+  if (enriched.localFirst && !rebind && !isConstrained(enriched.placementRequest)) {
     const localRefusal = localIneligibility();
     if (localRefusal) {
       enriched.localFirst = false;
@@ -1239,7 +1246,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   }
 
   // BRAIN-548: a speed-aware ticket this machine can start right now runs here, without probing a (slower) runner.
-  let speed = rebind || localIneligibility() ? null : speedInputs(root, enriched);
+  let speed = rebind || isConstrained(enriched.placementRequest) || localIneligibility() ? null : speedInputs(root, enriched);
   // BRAIN-663: this tree lacks what the runner would install for the lane's remoteDeps, so a local run would fail: stay remote
   const lackingDeps = speed ? missingLocalDeps(enriched.remote.worktreeRoot, enriched.remote.remoteDeps) : [];
   if (lackingDeps.length > 0) {
@@ -1262,13 +1269,15 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   // own protocol (inside dispatchRemote) still derives from
   // `needsProtocol2(enriched.remote)` alone, so an optionless lane still
   // sends a protocol-1 header even when this is true.
-  const placeOptions = rebind ? null : selectionOptionsFor('place', enriched, globalCfg, { root, cpuLimit });
+  // PKG-439: a placed ticket is never offered to a push runner: the pull queue's claim is the only thing that enforces its placement
+  const pullOnlyPlacement = isConstrained(enriched.placementRequest);
+  const placeOptions = rebind || pullOnlyPlacement ? null : selectionOptionsFor('place', enriched, globalCfg, { root, cpuLimit });
   const placed = rebind
     ? { runner: rebind.runner, skipped: [], queuedChoice: false, probe: rebind.probe }
-    : await selectRunner(pushRunners(globalCfg), placeOptions);
+    : pullOnlyPlacement ? { runner: null, skipped: [], queuedChoice: false } : await selectRunner(pushRunners(globalCfg), placeOptions);
   let { runner, skipped, queuedChoice, probe, busy, readiness, ready } = placed;
   // a rebind's own selection is logged by tryRebind, which holds the scores this synthetic `placed` deliberately drops
-  if (!rebind) logFinishPlacement(root, enriched, placed);
+  if (!rebind && !pullOnlyPlacement) logFinishPlacement(root, enriched, placed);
   placement = placementOf(rebind?.score);
   // BRAIN-623: `lane status` names a runner that lacked what the lane needs; a runner that passed is ready again
   if (placeOptions && Object.values(placeOptions.readinessNeeds).some(hasNeed)) {
@@ -1321,11 +1330,11 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       ...classTransport(enriched, resolveClasses(globalCfg, root)),
       priorityAccruedMs: waitedMs(enriched, effectiveNow(root)),
     }), worktreeRoot);
-    const publication = publicationOf(enriched, { placement, attemptStartedAt, refusalExit: refusalExitOf({ dispatchOnly: isDispatchOnly(globalCfg), dispatchKey: enriched.dispatchKey }, NO_RUNNER_EXIT_CODE) });
+    const publication = publicationOf(enriched, { placement, attemptStartedAt, refusalExit: refusalExitOf({ dispatchOnly: isDispatchOnly(globalCfg), pullOnly: isPullOnly(enriched) }, NO_RUNNER_EXIT_CODE) });
     const ctx = {
       ...pullContextFor(root, globalCfg, services, { id: enriched.id, generation: gen }),
       ...publicationBindings(root, publication),
-      localFallback: { enabled: !enriched.dispatchKey && pullLocalFallbackEnabled(globalCfg, enriched) && requiredToolsPresent(), couldAdmitNow: async () => (await couldAdmitNow(root, globalCfg, enriched)).admit },
+      localFallback: { enabled: !isPullOnly(enriched) && pullLocalFallbackEnabled(globalCfg, enriched) && requiredToolsPresent(), couldAdmitNow: async () => (await couldAdmitNow(root, globalCfg, enriched)).admit },
       prepare: {
         worktreeRoot,
         manifest,
@@ -1339,7 +1348,8 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
           cpuCores: enriched.remote.cpuCores,
           ...(enriched.remote.minCpuCores !== undefined ? { minCpuCores: enriched.remote.minCpuCores } : {}),
           memoryBytes: enriched.remote.memoryBytes ?? 0,
-          requiresTags: enriched.remote.requiresTags ?? [],
+          requiresTags: resolvedPlacement(enriched.remote.requiresTags ?? [], enriched.placementRequest).requiresTags,
+          ...(isConstrained(enriched.placementRequest) ? { placementRequest: envelopePlacement(enriched.placementRequest) } : {}),
           requires: enriched.remote.requires ?? [],
           avoidTags: enriched.remote.avoidTags ?? [],
           priority: pullQueuePriority(enriched.priorityRequested),
@@ -1405,6 +1415,8 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       cfg: globalCfg,
       repoKey: enriched.remote.repoKey,
       requiresTags: enriched.remote.requiresTags,
+      placement: resolvedPlacement(enriched.remote.requiresTags ?? [], enriched.placementRequest),
+      aliasesApplied: enriched.placementRequest?.aliasesApplied,
       locallyIneligible: () => localIneligibility() || isDispatchOnly(globalCfg),
       couldRunLocally: async () => (await couldAdmitNow(root, globalCfg, enriched)).admit || (await couldBypassNow(root, globalCfg, enriched)).admit,
     });
@@ -1413,6 +1425,11 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       const line = `lane: pull-dispatch: ${route.reason}; using the push flow\n`;
       process.stderr.write(line);
       writeBrokerLog(root, line);
+    }
+    // a placed ticket that cannot be queued is refused whole: 76 when the queue decided (no runner fits, an unknown host, a queue too old), 75 when it was not reached, so nothing was enqueued and retrying is safe
+    if (pullOnlyPlacement && route.route !== 'pull') {
+      return route.route === 'refuse' ? refusePullOnly(route.reason, { exitCode: route.exitCode ?? PLACEMENT_REFUSED_EXIT })
+        : refusePullOnly(`${route.reason ?? `route ${route.route}`}; nothing was enqueued, retry`, { exitCode: PLACEMENT_UNREACHABLE_EXIT });
     }
     // a keyed ticket that is not queued for pull (a push runner, local, legacy) would run where its key cannot find it
     if (enriched.dispatchKey && route.route !== 'pull') return fallbackOrRefuse(null, route.reason ?? `route ${route.route}`, { noRunner: true });
@@ -1667,7 +1684,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       onRunnerPhase: runnerPhaseRecorder(root, enriched.id, gen),
       onBinding: async ({ protocol, ticketId, generation, manifestHash }) =>
         (await updateAttempt(root, enriched.id, gen, { binding: { protocol, generation, manifestHash, runner: runner.name, ...(ticketId === enriched.id ? {} : { ticketId }) } })).ok,
-      rebalance: rebalanceOn && canWithdraw ? {
+      rebalance: rebalanceOn && canWithdraw && !isPullOnly(enriched) ? {
         minQueuedMs: globalCfg.remoteRebalanceMinQueuedMs,
         intervalMs: globalCfg.remoteRebalanceIntervalMs,
         // BRAIN-770: a ticket with no local fallback is refused (76) after this long queued with no runner to move it to
@@ -2262,7 +2279,7 @@ async function main() {
   async function tryRebind(localBlocked = false, heldByKey = null) {
     // A ticket never goes back to a runner it left, was refused by, or was ever dispatched to (nor to one it is on).
     const attempt = readAttempt(root, ticket.id);
-    if (attempt?.transport === 'pull') return;
+    if (attempt?.transport === 'pull' || isPullOnly(enriched)) return;
     const left = new Set([...(attempt?.moves ?? []).flatMap((m) => [m.from, m.to]), ...(attempt?.refusedRunners ?? []), ...(attempt?.dispatchedRunners ?? [])]);
     const candidates = pushRunners(globalCfg).filter((r) => !left.has(r.name));
     if (candidates.length === 0) return;

@@ -2,15 +2,18 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { isDispatchKey } from './dispatch-key.js';
+import { isPlacementRecord } from './placement.js';
 import { atomicWriteJson, ensureDurableDir, fsyncDirectory, paths, readJsonSafe, withLock } from './state.js';
 
 export const ENVELOPE_VERSION = 1;
 /** An envelope that carries a dispatch key is version 2: a reader older than the key checks `v === 1` and refuses it, so it can never enqueue the run without its key. */
 export const KEYED_ENVELOPE_VERSION = 2;
-const versionOf = (envelope) => (envelope.dispatchKey === undefined ? ENVELOPE_VERSION : KEYED_ENVELOPE_VERSION);
+/** PKG-439: an envelope that carries a placement (keyed or not) is version 3, which a PKG-438 reader (it accepts 1 and 2 only) refuses instead of enqueueing the run without its placement. */
+export const PLACED_ENVELOPE_VERSION = 3;
+const versionOf = (envelope) => (envelope.placementRequest !== undefined ? PLACED_ENVELOPE_VERSION : envelope.dispatchKey === undefined ? ENVELOPE_VERSION : KEYED_ENVELOPE_VERSION);
 const TICKET_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const REQUIRED_FIELDS = ['logicalId', 'binding', 'header', 'repoKey', 'lane', 'laneKey', 'cpuCores', 'memoryBytes', 'requiresTags', 'priority'];
-// optional, so an envelope written before PKG-438 still reads: dispatchKey (the caller's idempotency key)
+// optional, so an envelope written before PKG-438 or PKG-439 still reads: dispatchKey (the caller's idempotency key), placement
 const REQUIRED_BINDING_FIELDS = ['protocol', 'generation', 'manifestHash'];
 
 export const pullTicketDir = (root, id) => path.join(paths(root).pull, id);
@@ -29,12 +32,13 @@ export function withTicketLock(root, id, fn, { lockTimeoutMs = LOCK_TIMEOUT_MS }
 }
 
 function validate(envelope) {
-  if (envelope?.v !== ENVELOPE_VERSION && envelope?.v !== KEYED_ENVELOPE_VERSION) throw new Error(`pull envelope version ${envelope?.v} is not ${ENVELOPE_VERSION} or ${KEYED_ENVELOPE_VERSION}`);
-  if (envelope.v !== versionOf(envelope)) throw new Error(`pull envelope version ${envelope.v} does not match its dispatch key`);
+  if (![ENVELOPE_VERSION, KEYED_ENVELOPE_VERSION, PLACED_ENVELOPE_VERSION].includes(envelope?.v)) throw new Error(`pull envelope version ${envelope?.v} is not ${ENVELOPE_VERSION}, ${KEYED_ENVELOPE_VERSION} or ${PLACED_ENVELOPE_VERSION}`);
+  if (envelope.v !== versionOf(envelope)) throw new Error(`pull envelope version ${envelope.v} does not match its dispatch key or placement`);
   if (!TICKET_ID_RE.test(envelope.logicalId ?? '')) throw new Error('pull envelope logicalId must be a ticket uuid');
   const missing = REQUIRED_FIELDS.filter((field) => envelope[field] === undefined);
   const missingBinding = REQUIRED_BINDING_FIELDS.filter((field) => envelope.binding?.[field] === undefined);
   if (envelope.dispatchKey !== undefined && !isDispatchKey(envelope.dispatchKey)) throw new Error('pull envelope dispatchKey is not a valid dispatch key');
+  if (envelope.placementRequest !== undefined && !isPlacementRecord(envelope.placementRequest)) throw new Error('pull envelope placement is not a placement');
   if (missing.length + missingBinding.length > 0) throw new Error(`pull envelope lacks ${[...missing, ...missingBinding.map((f) => `binding.${f}`)].join(', ')}`);
   return envelope;
 }

@@ -316,7 +316,7 @@ const CANARIES = [
   ['T26b: an orphan cancel of a queued row publishes 130 confirmed, and of a running row stays held until the runner proves the stop', 'pull-recover.js', ['cancelRequested: () => true', 'cancelRequested: () => false']],
   ['T37b: lane wait returns the ledgered exit when the attempt and the result are both gone', 'wait.js', ['if (readLedger(root, id) !== null) {', 'if (false) {']],
   ['lane wait --timeout bounds a pull step that never answers and a ledger rebuild that never finishes', 'pull-recover.js', ['return Promise.race([stepPullTicket(ctx), expiry]).finally(() => clearTimeout(timer));', 'return stepPullTicket(ctx);']],
-  ['status shows a pull attempt as pull@host with no runner, and marks an orphan for pull recovery', 'status.js', ["...(a.transport === 'pull' ? { transport: 'pull', pullHost: a.pull?.host ?? null, pullStage: a.pull?.stage ?? null } : {}),", '']],
+  ['status shows a pull attempt as pull@host with no runner, and marks an orphan for pull recovery', 'status.js', ["...(a.transport === 'pull' ? { transport: 'pull', pullHost: a.pull?.host ?? null, pullStage: a.pull?.stage ?? null, pullUnplaceable: a.pull?.unplaceable ?? null } : {}),", '']],
   ['the pull transport adapter answers in the ssh shapes: a record, {missing, state}, a confirmed bool, an {action}', 'runner-transport.js', ["row.result && row.result.author !== 'queue' ? row.result", 'row.result ? row.result']],
   ['T26b: a cancel arriving while the publisher holds the ticket lock waits for it and then finds the finish already settled', 'pull-envelope.js', ["return withLock(root, fn, { lockPath: path.join(pullTicketDir(root, id), 'recover.lock'), group: 'broker', timeoutMs: lockTimeoutMs });", 'return fn();']],
 ];

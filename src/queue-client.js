@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import { parse as parsePgConnectionString } from 'pg-connection-string';
 import { isSocketQueueUrl, laneQueueUrlProblem } from './config.js';
 import { connect } from './lane-db.js';
+import { placementArgument } from './placement.js';
 
 
 export const QUEUE_CONNECT_TIMEOUT_MS = 5_000;
@@ -16,13 +17,14 @@ const TOO_MANY_CONNECTIONS = '53300';
 // SQL parameter types in order (a call sends as many as it has arguments, so a call that names none of the trailing defaults runs against an older schema); `idempotent` says whether a call that may already have committed can be sent again
 const FUNCTIONS = {
   ld_queue_ref: { types: [], idempotent: true },
-  ld_enqueue_fenced: { types: ['text', 'uuid', 'text', 'text', 'text', 'jsonb', 'jsonb', 'jsonb', 'text[]', 'real', 'bigint', 'int', 'int', 'boolean', 'text', 'real', 'text[]', 'text[]', 'real', 'text'], idempotent: false },
-  ld_ticket_by_key: { types: ['text'], idempotent: true },
+  ld_enqueue_fenced: { types: ['text', 'uuid', 'text', 'text', 'text', 'jsonb', 'jsonb', 'jsonb', 'text[]', 'real', 'bigint', 'int', 'int', 'boolean', 'text', 'real', 'text[]', 'text[]', 'real', 'text', 'text', 'text[]', 'text'], idempotent: false },
+  ld_ticket_by_key: { types: ['text', 'jsonb'], idempotent: true },
   ld_get: { types: ['uuid'], idempotent: true },
   ld_list_mine: { types: ['text[]', 'int'], idempotent: true },
   ld_withdraw: { types: ['uuid'], idempotent: false },
   ld_cancel: { types: ['uuid'], idempotent: false },
-  ld_placeable: { types: ['text', 'text[]'], idempotent: true },
+  ld_placeable: { types: ['text', 'text[]', 'text', 'text[]', 'text'], idempotent: true },
+  ld_known_hosts: { types: [], idempotent: true },
   // lane_admin only (`lane pull gc`); every one is safe to send again
   ld_prune_candidates: { types: ['interval', 'interval', 'timestamptz', 'uuid', 'int'], idempotent: true },
   ld_prune: { types: ['uuid[]', 'interval'], idempotent: true },
@@ -124,19 +126,24 @@ export function createQueueClient({
   return {
         queueRef: (options) => invoke('ld_queue_ref', [], options),
 
-        enqueueFenced: ({ expectRef, id, repoKey, lane, laneKey, binding, header, snapshot, requiresTags, avoidTags = [], requires = [], cpuCores, minCpuCores, memoryBytes, priority = 0, minProtocol = 1, dispatchKey }) => {
-      // only a lane that sets avoidTags (007), requires (008), an elastic floor (009) or a dispatch key (012) needs the longer function, so every other enqueue still works against an older queue
-      // a dispatch key is never trimmed off: the long form carries it, and a queue without it answers 42883, which the caller turns into a refusal
+        enqueueFenced: ({ expectRef, id, repoKey, lane, laneKey, binding, header, snapshot, requiresTags, avoidTags = [], requires = [], cpuCores, minCpuCores, memoryBytes, priority = 0, minProtocol = 1, dispatchKey, capabilityClass, avoidHosts = [], targetHost }) => {
+      // only a lane that sets avoidTags (007), requires (008), an elastic floor (009), a dispatch key (012) or a placement (013) needs the longer function, so every other enqueue still works against an older queue
+      // a dispatch key or a placement is never trimmed off: the long form carries it, and a queue without it answers 42883, which the caller turns into a refusal
       const elastic = Number.isFinite(minCpuCores) && minCpuCores < cpuCores;
-      const trailing = dispatchKey !== undefined ? [true, null, null, avoidTags, requires, elastic ? minCpuCores : null, dispatchKey]
+      const placed = capabilityClass !== undefined || avoidHosts.length > 0 || targetHost !== undefined;
+      const trailing = placed ? [true, null, null, avoidTags, requires, elastic ? minCpuCores : null, dispatchKey ?? null, capabilityClass ?? null, avoidHosts, targetHost ?? null]
+        : dispatchKey !== undefined ? [true, null, null, avoidTags, requires, elastic ? minCpuCores : null, dispatchKey]
         : elastic ? [true, null, null, avoidTags, requires, minCpuCores]
         : requires.length > 0 ? [true, null, null, avoidTags, requires]
         : avoidTags.length > 0 ? [true, null, null, avoidTags] : [];
       return invoke('ld_enqueue_fenced', [expectRef, id, repoKey, lane, laneKey, binding, header, snapshot, requiresTags, cpuCores, memoryBytes, priority, minProtocol, ...trailing]);
     },
 
-        /** The caller's own live ticket under `dispatchKey`, or null. */
-        ticketByKey: (dispatchKey, options) => invoke('ld_ticket_by_key', [dispatchKey], options),
+        /** The caller's own live ticket under `dispatchKey`, or null. With a `placement` ({capabilityClass, avoidHosts, targetHost}) the queue refuses (LK423) a holder placed otherwise. */
+        ticketByKey: (dispatchKey, options, placement) => invoke('ld_ticket_by_key', placement === undefined ? [dispatchKey] : [dispatchKey, placementArgument(placement)], options),
+
+        /** Every host id the queue knows: current runners, and hosts on retained tickets and attempts. */
+        knownHosts: (options) => invoke('ld_known_hosts', [], options),
 
         get: (id) => invoke('ld_get', [id]),
 
@@ -146,7 +153,8 @@ export function createQueueClient({
 
         cancel: (id) => invoke('ld_cancel', [id]),
 
-        placeable: (repoKey, requiresTags, options) => invoke('ld_placeable', [repoKey, requiresTags], options),
+        /** `placement` is a resolvedPlacement: the longer call carries the class platform, avoided and target hosts; an unconstrained ticket keeps the two-argument call, which an older queue answers too. */
+        placeable: (repoKey, requiresTags, options, placement) => invoke('ld_placeable', placement?.constrained ? [repoKey, requiresTags, placement.classPlatform, placement.avoidHosts, placement.targetHost] : [repoKey, requiresTags], options),
 
         pruneCandidates: ({ objectsAfterMs, rowsAfterMs, after = null, limit = 200 }) =>
       invoke('ld_prune_candidates', [intervalOf(objectsAfterMs), intervalOf(rowsAfterMs), after?.finished_at ?? null, after?.id ?? null, limit]),

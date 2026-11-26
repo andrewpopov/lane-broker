@@ -8,29 +8,33 @@ import { pgSkipOption } from './lane-db-harness.js';
 import { startDispatchCluster, World, logins, call, enqueue, claim, tid } from './lane-dispatch-fixture.js';
 
 const AGENT_FUNCTIONS = ['ld_register', 'ld_claim', 'ld_needed_tools', 'ld_start', 'ld_heartbeat', 'ld_finish', 'ld_release', 'ld_log'];
-const SUBMIT_FUNCTIONS = ['ld_enqueue', 'ld_get', 'ld_list_mine', 'ld_withdraw', 'ld_cancel', 'ld_attach_urls', 'ld_log_read', 'ld_log_ack', 'ld_queue_ref', 'ld_enqueue_fenced', 'ld_placeable', 'ld_ticket_by_key'];
-const ADMIN_FUNCTIONS = ['ld_set_principal', 'ld_reap', 'ld_restore_reset', 'ld_guard', 'ld_prune_candidates', 'ld_prune', 'ld_prune_chunks', 'ld_blobs_live'];
+const SUBMIT_FUNCTIONS = ['ld_enqueue', 'ld_get', 'ld_list_mine', 'ld_withdraw', 'ld_cancel', 'ld_attach_urls', 'ld_log_read', 'ld_log_ack', 'ld_queue_ref', 'ld_enqueue_fenced', 'ld_placeable', 'ld_ticket_by_key', 'ld_known_hosts'];
+const ADMIN_FUNCTIONS = ['ld_set_principal', 'ld_set_platform', 'ld_reap', 'ld_restore_reset', 'ld_guard', 'ld_prune_candidates', 'ld_prune', 'ld_prune_chunks', 'ld_blobs_live'];
 const GRANTED = { agent: AGENT_FUNCTIONS, submit: SUBMIT_FUNCTIONS, admin: ADMIN_FUNCTIONS, reader: [] };
 const CALLERS = { agent: logins.a1, submit: logins.s1, admin: logins.admin, reader: logins.reader, legacy: logins.legacy };
 
+/** Every function by its full signature: ld_placeable and ld_ticket_by_key have two overloads each, and each is granted (or refused) on its own. */
+const ARG_TYPES = "(SELECT coalesce(array_agg(format_type(u.t, NULL) ORDER BY u.ord), '{}') FROM unnest(p.proargtypes) WITH ORDINALITY AS u(t, ord))";
+
 async function functionAclMatrix(w) {
   const su = await w.su();
-  const { rows: functions } = await su.query("SELECT proname, pronargs FROM pg_proc WHERE pronamespace = 'lane_dispatch'::regnamespace ORDER BY proname");
+  const { rows: functions } = await su.query(`SELECT p.oid, p.proname, p.oid::regprocedure::text AS signature, ${ARG_TYPES} AS argtypes FROM pg_proc p WHERE p.pronamespace = 'lane_dispatch'::regnamespace ORDER BY p.oid::regprocedure::text`);
   const unclassified = functions.map((f) => f.proname).filter((n) => !n.startsWith('ld_') && !['ld_entry'].includes(n));
   assert.ok(unclassified.length > 0, 'internal helpers exist and must be refused to every caller');
+  for (const overloaded of ['ld_placeable', 'ld_ticket_by_key']) assert.equal(functions.filter((f) => f.proname === overloaded).length, 2, `${overloaded} has its two overloads`);
   for (const [kind, login] of Object.entries(CALLERS)) {
     const c = await w.as(login);
     const group = kind === 'legacy' ? 'agent' : kind;
     for (const f of functions) {
       const granted = GRANTED[group].includes(f.proname);
-      const { rows: [{ has }] } = await su.query(`SELECT has_function_privilege($1, 'lane_dispatch.${f.proname}'::regproc, 'EXECUTE') AS has`, [login]);
-      assert.equal(has, granted, `${login} EXECUTE on ${f.proname}`);
-      const nulls = Array(f.pronargs).fill('NULL').join(', ');
+      const { rows: [{ has }] } = await su.query("SELECT has_function_privilege($1, $2::oid, 'EXECUTE') AS has", [login, f.oid]);
+      assert.equal(has, granted, `${login} EXECUTE on ${f.signature}`);
+      const nulls = f.argtypes.map((type) => `NULL::${type}`).join(', ');
       const attempt = c.query(`SELECT lane_dispatch.${f.proname}(${nulls})`);
       if (granted) {
-        await attempt.catch((err) => assert.doesNotMatch(err.message, /permission denied for function/, `${login} calling ${f.proname}`));
+        await attempt.catch((err) => assert.doesNotMatch(err.message, /permission denied for function/, `${login} calling ${f.signature}`));
       } else {
-        await assert.rejects(attempt, /permission denied for (function|schema)/, `${login} calling ${f.proname}`);
+        await assert.rejects(attempt, /permission denied for (function|schema)/, `${login} calling ${f.signature}`);
       }
     }
   }
@@ -199,7 +203,7 @@ describe('lane_dispatch schema and ACLs', { skip: pgSkipOption, timeout: 180000 
     t.diagnostic(`failed as expected: ${String(failure.message).split('\n')[0]}`);
   });
 
-  for (const [what, grant] of [['ld_restore_reset to an agent login', 'ld_restore_reset() TO lane_agent'], ['the re-signed ld_register to a submit login', 'ld_register(text, int, jsonb) TO lane_submit']]) {
+  for (const [what, grant] of [['ld_restore_reset to an agent login', 'ld_restore_reset() TO lane_agent'], ['the re-signed ld_register to a submit login', 'ld_register(text, int, jsonb) TO lane_submit'], ['ld_set_platform to a submit login', 'ld_set_platform(text, text) TO lane_submit'], ['the five-argument ld_placeable to an agent login', 'ld_placeable(text, text[], text, text[], text) TO lane_agent'], ['the placement ld_ticket_by_key to an agent login', 'ld_ticket_by_key(text, jsonb) TO lane_agent']]) {
     test(`canary: with ${what} granted, the function ACL matrix fails`, async (t) => {
       const mutated = await World.create(cluster, { mutate: ['GRANT EXECUTE ON FUNCTION lane_dispatch.ld_set_principal(', `GRANT EXECUTE ON FUNCTION lane_dispatch.${grant};\nGRANT EXECUTE ON FUNCTION lane_dispatch.ld_set_principal(`] });
       let failure;

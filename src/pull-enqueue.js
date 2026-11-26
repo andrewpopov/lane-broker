@@ -2,6 +2,7 @@ import path from 'node:path';
 import { readAttempt, updateAttempt } from './attempts.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
 import { DISPATCH_KEY_REFUSED_EXIT, dispatchKeyRefusal } from './dispatch-key.js';
+import { placementRefusal } from './placement.js';
 import { pullTicketDir, readEnvelope, withTicketLock } from './pull-envelope.js';
 import { atomicWriteJson, readJsonSafe } from './state.js';
 
@@ -19,6 +20,12 @@ const writeEnqueueAck = (root, id, view) => atomicWriteJson(enqueueAckFile(root,
 const readEnqueueAck = (root, id) => readJsonSafe(enqueueAckFile(root, id));
 
 const EMPTY_INTENT = { attempts: [], seenRowAt: null };
+
+const placementArgs = ({ capabilityClass, avoidHosts, targetHost }) => ({
+  ...(capabilityClass === null ? {} : { capabilityClass }),
+  avoidHosts,
+  ...(targetHost === null ? {} : { targetHost }),
+});
 
 export function enqueueArgs(envelope) {
   if (envelope.snapshot === undefined) throw new Error(`pull envelope for ${envelope.logicalId} has no snapshot descriptor, so nothing may be enqueued`);
@@ -39,6 +46,7 @@ export function enqueueArgs(envelope) {
     priority: envelope.priority,
     ...(envelope.minProtocol === undefined ? {} : { minProtocol: envelope.minProtocol }),
     ...(envelope.dispatchKey === undefined ? {} : { dispatchKey: envelope.dispatchKey }),
+    ...(envelope.placementRequest === undefined ? {} : placementArgs(envelope.placementRequest)),
   };
 }
 
@@ -67,7 +75,8 @@ export const CANCELLED_BEFORE_ENQUEUE = 'cancelled-before-enqueue';
 export function enqueueOnce({ root, id, generation, queue, ledgered = () => false, cancelRequested = () => false, settleCancelled = async () => null, now = Date.now, rowRetentionMs = DEFAULT_GLOBAL_CONFIG.lanePull.rowRetentionMs, lockTimeoutMs }) {
   return withTicketLock(root, id, async () => {
     if (ledgered()) return { outcome: 'settled' };
-    const args = enqueueArgs(readEnvelope(root, id));
+    const envelope = readEnvelope(root, id);
+    const args = enqueueArgs(envelope);
     const intent = intentOf(readAttempt(root, id));
     if (intent.seenRowAt !== null) return { outcome: 'queued', view: null };
     // the queue already refused this submission for good: it is decided again from the record, never sent again
@@ -101,7 +110,7 @@ export function enqueueOnce({ root, id, generation, queue, ledgered = () => fals
     try {
       view = await queue.enqueueFenced({ expectRef: ref, ...args });
     } catch (err) {
-      const refusal = args.dispatchKey === undefined ? null : dispatchKeyRefusal(err);
+      const refusal = (envelope.placementRequest === undefined ? null : placementRefusal(err)) ?? (args.dispatchKey === undefined ? null : dispatchKeyRefusal(err));
       if (refusal === null) throw err;
       return refuse(refusal);
     }
@@ -119,7 +128,8 @@ export function enqueueOnce({ root, id, generation, queue, ledgered = () => fals
       return refuse({ reason: `dispatch key ${args.dispatchKey} names a withdrawn ticket; resubmit with a new key`, exitCode: DISPATCH_KEY_REFUSED_EXIT });
     }
     const stale = view.state === STALE_QUEUE_REF;
-    if (args.dispatchKey !== undefined && !stale) writeEnqueueAck(root, id, view);
+    // a keyed or placed submission is answered to a detached caller by this ack (a refusal by the published result), so the caller learns of a refusal instead of an id
+    if ((args.dispatchKey !== undefined || envelope.placementRequest !== undefined) && !stale) writeEnqueueAck(root, id, view);
     const settled = await persistIntent({ root, id, generation }, (current) => ({
       attempts: current.attempts.map((attempt) => (attempt.n === sending.n ? { ...attempt, answer: stale ? 'stale' : 'row' } : attempt)),
       seenRowAt: stale ? null : new Date(now()).toISOString(),

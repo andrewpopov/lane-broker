@@ -63,7 +63,7 @@ const SCENARIOS = {
     assert.deepEqual(await queue.enqueueFenced(enqueueArgs(tid(9), 'stale')), { state: 'stale-queue-ref', queue_ref: ref });
     const queued = await queue.enqueueFenced(enqueueArgs(tid(1), ref));
     assert.deepEqual(Object.keys(queued).sort(), [
-      'attempt_ref', 'cancel_requested', 'created_at', 'epoch', 'execution_id', 'finished_at', 'host', 'id', 'incarnation', 'lease_until', 'result', 'started_at', 'state', 'urls',
+      'attempt_ref', 'avoid_hosts', 'cancel_requested', 'capability_class', 'created_at', 'epoch', 'execution_id', 'finished_at', 'host', 'id', 'incarnation', 'lease_until', 'result', 'started_at', 'state', 'target_host', 'unplaceable', 'urls',
     ]);
     assert.equal(queued.state, 'queued');
     assert.deepEqual(await queue.get(tid(1)), queued);

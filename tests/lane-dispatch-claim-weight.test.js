@@ -201,7 +201,7 @@ const GUARDS = {
 
 };
 
-const HEAD_ORDER = "AND NOT (t.lane_key = ANY (coalesce(p_held_keys, '{}')))\n     AND t.requires <@ coalesce(p_has_tools, '{}')\n   ORDER BY lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) DESC,\n            CASE WHEN lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) >= 2.0\n                  AND extract(epoch FROM v_now - t.created_at) >= lane_dispatch.age_horizon_s() THEN t.created_at END NULLS LAST,\n            lane_dispatch.scarcity(t.requires_tags, t.repo_key), t.created_at, t.id LIMIT 1;";
+const HEAD_ORDER = "AND NOT (t.lane_key = ANY (coalesce(p_held_keys, '{}')))\n     AND t.requires <@ coalesce(p_has_tools, '{}')\n   ORDER BY lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) DESC,\n            CASE WHEN lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) >= 2.0\n                  AND extract(epoch FROM v_now - t.created_at) >= lane_dispatch.age_horizon_s() THEN t.created_at END NULLS LAST,\n            lane_dispatch.scarcity(t.requires_tags, t.repo_key, t.class_platform, t.avoid_hosts, t.target_host), t.created_at, t.id LIMIT 1;";
 const WEIGHT_FIT = "AND lane_dispatch.ticket_weight(t.header, p_weight_limit) <= coalesce(p_free_weight::numeric, 'Infinity'::numeric)";
 const HEAD_WEIGHT_FIT = " AND v_head.weight <= coalesce(p_free_weight::numeric, 'Infinity'::numeric)";
 const HEAD_FITS = 'a head whose weight does not fit now is reserved even though its cores and memory fit, and is claimed once the weight is free';

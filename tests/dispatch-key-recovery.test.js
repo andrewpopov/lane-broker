@@ -83,7 +83,7 @@ const CANARIES = [
   ['a refusal the queue gave is ledgered and published with its exit, and a recovery after the supervisor died never sends the enqueue again', 'pull-ticket.js', ['    if (sent.outcome === DISPATCH_KEY_REFUSED) return await afterStep', '    if (false) return await afterStep'], /Cannot read properties of undefined/],
   ['a supervisor that died between recording the refusal and publishing it is recovered to the same published refusal, without a second send', 'pull-enqueue.js', ['      return { outcome: DISPATCH_KEY_REFUSED, ...intent.refusal };\n', '      return { outcome: \'queued\', view: null };\n'], /Cannot read properties of undefined/],
   ['a keyed row withdrawn after a lost enqueue response is a refusal on replay, never a queued ticket', 'pull-enqueue.js', ["args.dispatchKey !== undefined && view.state === 'withdrawn'", 'false'], /Cannot read properties of undefined/],
-  ['a proven withdrawal of a keyed ticket publishes the same exit whether the live supervisor or a recovery does', 'pull-publication.js', ['(dispatchOnly || dispatchKey ? noRunnerExit : undefined)', '(dispatchOnly ? noRunnerExit : undefined)']],
+  ['a proven withdrawal of a keyed ticket publishes the same exit whether the live supervisor or a recovery does', 'pull-publication.js', ['(dispatchOnly || dispatchKey || pullOnly ? noRunnerExit : undefined)', '(dispatchOnly || pullOnly ? noRunnerExit : undefined)']],
 ];
 
 assert.equal(refusalExitOf({ dispatchKey: KEY }, 76), 76);

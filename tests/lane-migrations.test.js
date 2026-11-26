@@ -78,25 +78,25 @@ describe('lane schema versioning', { skip: PG_SKIP_REASON ?? false, timeout: 120
   test('migration 007 adds avoid_tags and the grace to a v6 queue, and the re-signed enqueue functions leave no old overload behind', async () => {
     const c = await emptyDb();
     const dir = fixtureDir();
-    for (const f of ['007-avoid-tags.sql', '008-requires.sql', '009-elastic-head-reserve.sql', '010-claim-weight.sql', '011-ticket-status.sql', '012-dispatch-key.sql']) fs.rmSync(path.join(dir, 'migrations', f));
+    for (const f of ['007-avoid-tags.sql', '008-requires.sql', '009-elastic-head-reserve.sql', '010-claim-weight.sql', '011-ticket-status.sql', '012-dispatch-key.sql', '013-placement-constraints.sql']) fs.rmSync(path.join(dir, 'migrations', f));
     await applyMigrations(c, { dir });
     const OLD_ARGS = 'uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real';
     await c.query(`CREATE FUNCTION lane_dispatch.ld_enqueue(${OLD_ARGS}) RETURNS int LANGUAGE sql AS 'SELECT 1'`);
     await c.query(`CREATE FUNCTION lane_dispatch.ld_enqueue_fenced(text, ${OLD_ARGS}) RETURNS int LANGUAGE sql AS 'SELECT 1'`);
     const columns = async () => (await c.query("SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'lane_dispatch' AND column_name IN ('avoid_tags', 'avoid_grace_s') ORDER BY 1, 2")).rows;
     assert.deepEqual(await columns(), []);
-    assert.deepEqual((await applyMigrations(c)).applied, ['007-avoid-tags.sql', '008-requires.sql', '009-elastic-head-reserve.sql', '010-claim-weight.sql', '011-ticket-status.sql', '012-dispatch-key.sql']);
+    assert.deepEqual((await applyMigrations(c)).applied, ['007-avoid-tags.sql', '008-requires.sql', '009-elastic-head-reserve.sql', '010-claim-weight.sql', '011-ticket-status.sql', '012-dispatch-key.sql', '013-placement-constraints.sql']);
     assert.deepEqual(await columns(), [{ table_name: 'cluster', column_name: 'avoid_grace_s' }, { table_name: 'tickets', column_name: 'avoid_tags' }]);
     assert.equal((await c.query('SELECT avoid_grace_s FROM lane_dispatch.cluster')).rows[0].avoid_grace_s, 120);
     const args = async (name) => (await c.query("SELECT pronargs::int AS n FROM pg_proc WHERE proname = $1 AND pronamespace = 'lane_dispatch'::regnamespace", [name])).rows.map((r) => r.n);
-    assert.deepEqual([await args('ld_enqueue'), await args('ld_enqueue_fenced'), await args('ld_claim')], [[19], [20], [9]]);
+    assert.deepEqual([await args('ld_enqueue'), await args('ld_enqueue_fenced'), await args('ld_claim')], [[22], [23], [9]]);
     assert.equal((await c.query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_schema = 'lane_dispatch' AND table_name = 'tickets' AND column_name = 'requires'")).rows[0].n, 1);
   });
 
   test('migration 009 adds the elastic floor, the grant and the floor wait to a v8 queue, and leaves no v8 enqueue or claim overload behind', async () => {
     const c = await emptyDb();
     const dir = fixtureDir();
-    for (const f of ['009-elastic-head-reserve.sql', '010-claim-weight.sql', '011-ticket-status.sql', '012-dispatch-key.sql']) fs.rmSync(path.join(dir, 'migrations', f));
+    for (const f of ['009-elastic-head-reserve.sql', '010-claim-weight.sql', '011-ticket-status.sql', '012-dispatch-key.sql', '013-placement-constraints.sql']) fs.rmSync(path.join(dir, 'migrations', f));
     await applyMigrations(c, { dir });
     const V8_ARGS = 'uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[]';
     await c.query(`CREATE FUNCTION lane_dispatch.ld_enqueue(${V8_ARGS}) RETURNS int LANGUAGE sql AS 'SELECT 1'`);
@@ -104,22 +104,41 @@ describe('lane schema versioning', { skip: PG_SKIP_REASON ?? false, timeout: 120
     await c.query("CREATE FUNCTION lane_dispatch.ld_claim(uuid, real, bigint, text[], text[]) RETURNS int LANGUAGE sql AS 'SELECT 1'");
     const columns = async () => (await c.query("SELECT table_name, column_name FROM information_schema.columns WHERE table_schema = 'lane_dispatch' AND column_name IN ('min_cpu_cores', 'claimed_cpu_cores', 'elastic_floor_after_s') ORDER BY 1, 2")).rows;
     assert.deepEqual(await columns(), []);
-    assert.deepEqual((await applyMigrations(c)).applied, ['009-elastic-head-reserve.sql', '010-claim-weight.sql', '011-ticket-status.sql', '012-dispatch-key.sql']);
+    assert.deepEqual((await applyMigrations(c)).applied, ['009-elastic-head-reserve.sql', '010-claim-weight.sql', '011-ticket-status.sql', '012-dispatch-key.sql', '013-placement-constraints.sql']);
     assert.deepEqual(await columns(), [{ table_name: 'cluster', column_name: 'elastic_floor_after_s' }, { table_name: 'tickets', column_name: 'claimed_cpu_cores' }, { table_name: 'tickets', column_name: 'min_cpu_cores' }]);
     assert.equal((await c.query('SELECT elastic_floor_after_s FROM lane_dispatch.cluster')).rows[0].elastic_floor_after_s, 600);
     const args = async (name) => (await c.query("SELECT pronargs::int AS n FROM pg_proc WHERE proname = $1 AND pronamespace = 'lane_dispatch'::regnamespace", [name])).rows.map((r) => r.n);
-    assert.deepEqual([await args('ld_enqueue'), await args('ld_enqueue_fenced'), await args('ld_claim')], [[19], [20], [9]]);
+    assert.deepEqual([await args('ld_enqueue'), await args('ld_enqueue_fenced'), await args('ld_claim')], [[22], [23], [9]]);
   });
 
   test('migration 010 versions the weight-aware claim: a v9 queue gains the nine-argument ld_claim and keeps no seven-argument overload', async () => {
     const c = await emptyDb();
     const dir = fixtureDir();
-    for (const f of ['010-claim-weight.sql', '011-ticket-status.sql', '012-dispatch-key.sql']) fs.rmSync(path.join(dir, 'migrations', f));
+    for (const f of ['010-claim-weight.sql', '011-ticket-status.sql', '012-dispatch-key.sql', '013-placement-constraints.sql']) fs.rmSync(path.join(dir, 'migrations', f));
     await applyMigrations(c, { dir });
     await c.query("CREATE FUNCTION lane_dispatch.ld_claim(uuid, real, bigint, text[], text[], real, bigint) RETURNS int LANGUAGE sql AS 'SELECT 1'");
-    assert.deepEqual((await applyMigrations(c)).applied, ['010-claim-weight.sql', '011-ticket-status.sql', '012-dispatch-key.sql']);
+    assert.deepEqual((await applyMigrations(c)).applied, ['010-claim-weight.sql', '011-ticket-status.sql', '012-dispatch-key.sql', '013-placement-constraints.sql']);
     const { rows } = await c.query("SELECT pronargs::int AS n FROM pg_proc WHERE proname = 'ld_claim' AND pronamespace = 'lane_dispatch'::regnamespace");
     assert.deepEqual(rows.map((r) => r.n), [9]);
+  });
+
+  test('migration 013 upgrades a queue running 012 with its real functions: the placement columns, one overload per arity, the views, and an old ticket still unconstrained', async () => {
+    const c = await emptyDb();
+    const dir = fixtureDir();
+    fs.rmSync(path.join(dir, 'migrations', '013-placement-constraints.sql'));
+    fs.copyFileSync(new URL('./fixtures/lane-v12-functions.sql', import.meta.url), path.join(dir, 'functions.sql'));
+    assert.equal((await applyMigrations(c, { dir })).version, 12);
+    const old = randomUUID();
+    await c.query(`INSERT INTO lane_dispatch.tickets (id, owner, repo_key, lane, lane_key, binding, header, snapshot, cpu_cores, memory_bytes, incarnation)
+                   VALUES ($1, 'lane_old_submit', 'repoA', 'test', 'lk', '{}', '{}', '{}', 1, 1000, 0)`, [old]);
+    assert.deepEqual((await applyMigrations(c)).applied, ['013-placement-constraints.sql']);
+    const args = async (name) => (await c.query("SELECT pronargs::int AS n FROM pg_proc WHERE proname = $1 AND pronamespace = 'lane_dispatch'::regnamespace ORDER BY 1", [name])).rows.map((r) => r.n);
+    assert.deepEqual([await args('ld_enqueue'), await args('ld_enqueue_fenced'), await args('scarcity'), await args('ld_placeable'), await args('ld_ticket_by_key'), await args('ld_set_principal')], [[22], [23], [5], [2, 5], [1, 2], [6]]);
+    const view = (await c.query('SELECT lane_dispatch.ticket_view($1, $2) AS v', [old, 'lane_old_submit'])).rows[0].v;
+    assert.deepEqual([view.capability_class, view.avoid_hosts, view.target_host, view.unplaceable], [null, [], null, 'no-runner']);
+    assert.deepEqual((await c.query("SELECT column_name FROM information_schema.columns WHERE table_schema = 'lane' AND table_name = 'pull_tickets' AND column_name IN ('capability_class', 'avoid_hosts', 'target_host') ORDER BY 1")).rows.map((r) => r.column_name), ['avoid_hosts', 'capability_class', 'target_host']);
+    assert.equal((await c.query("SELECT count(*)::int AS n FROM information_schema.columns WHERE table_schema = 'lane' AND table_name = 'pull_principals' AND column_name = 'platform'")).rows[0].n, 1);
+    assert.deepEqual((await applyMigrations(c)).applied, [], 're-applying the functions keeps the wider views');
   });
 
   test('a migration that fails rolls back whole: no partial change, no version row, and the error propagates', async () => {
@@ -164,13 +183,13 @@ describe('lane schema versioning', { skip: PG_SKIP_REASON ?? false, timeout: 120
   test('migration 003 backfills the scheduling parents of principals that already existed', async () => {
     const c = await emptyDb();
     const dir = fixtureDir();
-    for (const f of fs.readdirSync(path.join(dir, 'migrations')).filter((x) => /^(00[3-9]|01[0-2])-/.test(x))) fs.rmSync(path.join(dir, 'migrations', f));
+    for (const f of fs.readdirSync(path.join(dir, 'migrations')).filter((x) => /^(00[3-9]|01[0-3])-/.test(x))) fs.rmSync(path.join(dir, 'migrations', f));
     // functions.sql must not reference what 003 adds, so the pre-003 state is applied with the schema as of version 2.
     await applyMigrations(c, { dir });
     await c.query("INSERT INTO lane.principals (login_role, kind, allowed_accounts) VALUES ('old_submit', 'submit', '{a1,a2}')");
     assert.equal((await c.query('SELECT count(*)::int AS n FROM lane.sched_parents')).rows[0].n, 0);
     const r = await applyMigrations(c);
-    assert.equal(r.applied.length, 10);                // 003 (the backfill), 004 to 012
+    assert.equal(r.applied.length, 11);                // 003 (the backfill), 004 to 013
     assert.deepEqual((await c.query('SELECT account, count(*)::int AS n FROM lane.sched_parents GROUP BY account ORDER BY account')).rows, [{ account: 'a1', n: 5 }, { account: 'a2', n: 5 }]);
   });
 });

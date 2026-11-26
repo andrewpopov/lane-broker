@@ -48,7 +48,7 @@ import { ticketByKeyCommand } from '../src/ticket-by-key.js';
 
 function usage() {
   return `Usage:
-  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--group <id>] [--exclusive [--exclusive-purpose upgrade|calibration] [--exclusive-deadline <dur>]] [--no-cache] [--no-reuse] [--retry "<why>"] [--detach [--id <ticket-id>]] [--dispatch-key <key> [--json]]
+  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--group <id>] [--exclusive [--exclusive-purpose upgrade|calibration] [--exclusive-deadline <dur>]] [--no-cache] [--no-reuse] [--retry "<why>"] [--detach [--id <ticket-id>]] [--dispatch-key <key> [--json]] [--class <platform[+tag...]>] [--avoid-host <host>]... [--target-host <host>]
            [--timeout <duration>] [--allow-local-sim] [--local] [--log <path>] -- <command...>
   lane status [--json]
   lane status --dispatch-key <key> [--json]
@@ -184,6 +184,16 @@ function parseRunArgs(args) {
       case '--dispatch-key':
         opts.dispatchKey = flagArgs[++i] ?? '';
         break;
+      // Validated (exit 64) by runCommand, which also maps the hosts through the config's hostAliases; a missing value is invalid, not absent.
+      case '--class':
+        opts.capabilityClass = flagArgs[++i] ?? '';
+        break;
+      case '--avoid-host':
+        opts.avoidHosts = [...(opts.avoidHosts ?? []), flagArgs[++i] ?? ''];
+        break;
+      case '--target-host':
+        opts.targetHost = flagArgs[++i] ?? '';
+        break;
       case '--id': {
         const raw = flagArgs[++i];
         if (!isTicketId(raw)) throw new Error(`--id must be 1-128 characters of [A-Za-z0-9._-] (got "${raw}")`);
@@ -311,6 +321,9 @@ async function main() {
         log: opts.log,
         ticketId: opts.ticketId,
         dispatchKey: opts.dispatchKey,
+        capabilityClass: opts.capabilityClass,
+        avoidHosts: opts.avoidHosts,
+        targetHost: opts.targetHost,
         json: opts.json === true,
         cmd,
       });

@@ -445,6 +445,9 @@ async function observe(run) {
   const row = await run.queue.get(run.id);
   if (row === null) return settle(run, entryFor(run, null, lost('queue-row-missing')));
   if (row.host && row.host !== attempt.pull.host) await persistPull(run, { host: row.host });
+  // PKG-439: why no runner can take the ticket now (class, avoid, target, tags, no-runner), which `lane status` shows beside the stage
+  const unplaceable = row.state === 'queued' ? row.unplaceable ?? null : null;
+  if (unplaceable !== (attempt.pull.unplaceable ?? null)) await persistPull(run, { unplaceable });
   switch (row.state) {
     case 'queued':
       return queuedTooLong(run, attempt) ? expireQueued(run, attempt) : { state: 'queued', next: run.cfg.pollMs };

@@ -210,13 +210,13 @@ const CANARIES = [
   [REMOTE_LOSER, ...run('      return heldLocally(root, ack.ticketId) ? { id: ack.ticketId } : {', '      return true ? { id: ack.ticketId } : {')],
   [REMOTE_LOSER, ...run('      if (collided?.ticketId && collided.ticketId !== id) {', '      if (false) {')],
   [UNSEEN, ...run('    const probeRoot = stateHome();', '    const probeRoot = ensureStateDirs().root;')],
-  [KEYED_REFUSAL, ...supervisor('      await testHoldAt(\'keyed-refusal\');\n      await publishAndExit(gen, () => localRefusalResult(enriched, refusal));', '      await fallbackToLocal(root, enriched.id, reason);\n      await testHoldAt(\'keyed-refusal\');\n      await publishAndExit(gen + 1, () => localRefusalResult(enriched, refusal));')],
+  [KEYED_REFUSAL, ...supervisor('    await testHoldAt(\'keyed-refusal\');\n    await publishAndExit(gen, () => localRefusalResult(enriched, refusal));', '    await fallbackToLocal(root, enriched.id, reason);\n    await testHoldAt(\'keyed-refusal\');\n    await publishAndExit(gen + 1, () => localRefusalResult(enriched, refusal));')],
   ['two detached callers racing on one key print the same ticket id, and the command is queued once', ...run('      printedId = answer.id;', '      printedId = id;')],
   ['two detached callers racing on one key print the same ticket id, and the command is queued once', ...run('      return heldLocally(root, ack.ticketId) ? { id: ack.ticketId } : {', '      return heldLocally(root, ack.ticketId) ? { id } : {')],
-  ['a keyed run that would run locally is refused 76 "dispatch key needs the pull queue" and nothing runs or queues', ...supervisor('    if (enriched.dispatchKey) {\n      const refusal', '    if (false) {\n      const refusal')],
+  ['a keyed run that would run locally is refused 76 "dispatch key needs the pull queue" and nothing runs or queues', ...supervisor('    if (isPullOnly(enriched)) return refusePullOnly(reason);', '    if (false) return refusePullOnly(reason);')],
   ['a keyed run a push runner would take is refused 76 and the runner is never used', ...supervisor("if (enriched.dispatchKey && route.route !== 'pull')", 'if (false)')],
   ['a keyed run with pull dispatch off is refused 76 before a supervisor starts', ...run('if (!remoteEligible || !pullConfigured(globalCfg)) {', 'if (false) {')],
-  ['a queue that predates the dispatch key refuses a keyed run 76 and never enqueues it unkeyed', ...pullEnqueue('const refusal = args.dispatchKey === undefined ? null : dispatchKeyRefusal(err);', 'const refusal = null;')],
+  ['a queue that predates the dispatch key refuses a keyed run 76 and never enqueues it unkeyed', ...pullEnqueue('const refusal = (envelope.placementRequest === undefined ? null : placementRefusal(err)) ?? (args.dispatchKey === undefined ? null : dispatchKeyRefusal(err));', 'const refusal = null;')],
 ];
 
 describe('dispatch keys through a real supervisor', { skip: pgSkipOption, timeout: scaledMs(1_200_000) }, () => {

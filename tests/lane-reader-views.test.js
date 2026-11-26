@@ -6,8 +6,8 @@ import { pgSkipOption } from './lane-db-harness.js';
 import { startDispatchCluster, World, logins, enqueue, claim, tid } from './lane-dispatch-fixture.js';
 
 const VIEWS = {
-  pull_tickets: ['id', 'repo_key', 'lane', 'state', 'host', 'cpu_cores', 'requeues', 'result', 'created_at', 'started_at', 'finished_at', 'requires_tags', 'argv_md5'],
-  pull_principals: ['host', 'tags', 'allowed_repos', 'max_claims'],
+  pull_tickets: ['id', 'repo_key', 'lane', 'state', 'host', 'cpu_cores', 'requeues', 'result', 'created_at', 'started_at', 'finished_at', 'requires_tags', 'argv_md5', 'capability_class', 'avoid_hosts', 'target_host'],
+  pull_principals: ['host', 'tags', 'allowed_repos', 'max_claims', 'platform'],
   pull_runners: ['host', 'last_seen'],
 };
 

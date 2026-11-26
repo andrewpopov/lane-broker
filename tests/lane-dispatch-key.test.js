@@ -181,7 +181,7 @@ const SQL_CANARIES = [
   ['a duplicate submit with the same key returns the same ticket, also when the second call carries a different id', "WHERE t.dispatch_key = p_dispatch_key AND t.state <> 'withdrawn';", "WHERE false AND t.dispatch_key = p_dispatch_key AND t.state <> 'withdrawn';"],
   ['two concurrent submits with one key produce one ticket, and the loser is answered with the winner', "  EXCEPTION WHEN unique_violation THEN", "  EXCEPTION WHEN no_data_found THEN"],
   ['a key held by one of the callers live tickets wins over an id that belongs to an unkeyed ticket', "    SELECT h.id, h.owner INTO v_held FROM lane_dispatch.key_holder(p_dispatch_key) h;\n    IF FOUND THEN", "    SELECT h.id, h.owner INTO v_held FROM lane_dispatch.key_holder(p_dispatch_key) h;\n    IF false THEN"],
-  ['a key held by one of the callers live tickets wins over an id that belongs to an unkeyed ticket', "IF p_dispatch_key IS NOT NULL AND EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.dispatch_key IS DISTINCT FROM p_dispatch_key) THEN", 'IF false THEN'],
+  ['a key held by one of the callers live tickets wins over an id that belongs to an unkeyed ticket', "IF p_dispatch_key IS NOT NULL AND v_t.dispatch_key IS DISTINCT FROM p_dispatch_key THEN", 'IF false THEN'],
   ['another owner holding the key is refused with its own SQLSTATE, not the id conflict, and inserts nothing', "    IF FOUND THEN\n      IF v_held.owner <> session_user THEN", "    IF FOUND THEN\n      IF false THEN"],
   ['a concurrent submit from another owner loses the race with the distinct refusal', "      END IF;\n      IF v_held.owner <> session_user THEN", "      END IF;\n      IF false THEN"],
   ['a submit whose holder keeps vanishing between the violation and the lookup retries up to three times, answers with the holder it then finds, and raises only when the key never settles', 'IF v_try = 3 THEN RAISE; END IF;', 'RAISE;'],
@@ -195,8 +195,8 @@ const SQL_CANARIES = [
 ];
 
 const CLIENT_CANARIES = [
-  ['enqueueFenced carries the key, answers a second id with the first ticket, and ticketByKey finds it', ['const trailing = dispatchKey !== undefined ?', 'const trailing = false ?']],
-  ['against a queue without the dispatch key signature a keyed enqueue is refused with the missing function, never sent without its key, and an unkeyed one still enqueues', ['const trailing = dispatchKey !== undefined ?', 'const trailing = false ?']],
+  ['enqueueFenced carries the key, answers a second id with the first ticket, and ticketByKey finds it', ['        : dispatchKey !== undefined ?', '        : false ?']],
+  ['against a queue without the dispatch key signature a keyed enqueue is refused with the missing function, never sent without its key, and an unkeyed one still enqueues', ['        : dispatchKey !== undefined ?', '        : false ?']],
 ];
 
 describe('dispatch keys on a disposable Postgres', { skip: pgSkipOption, timeout: 900000 }, () => {
@@ -219,7 +219,7 @@ describe('dispatch keys on a disposable Postgres', { skip: pgSkipOption, timeout
   }
 
   for (const [name, mutation] of CLIENT_CANARIES) {
-    test(`canary: with "${mutation[0]}" removed, "${name}" fails`, async (t) => {
+    test(`canary: with "${mutation[0].trim()}" removed, "${name}" fails`, async (t) => {
       const world = await World.create(cluster);
       await assertCanaryFails('queue-client.js', mutation, async (load) => GUARDS[name](world, t, (await load('queue-client.js')).createQueueClient));
     });

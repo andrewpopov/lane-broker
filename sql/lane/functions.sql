@@ -608,6 +608,10 @@ DROP FUNCTION IF EXISTS lane_dispatch.return_to_queue(uuid, timestamptz);
 -- PKG-438 (migration 012) adds the trailing p_dispatch_key to both enqueues; a default on a longer overload would make the old 18- and 19-argument calls ambiguous.
 DROP FUNCTION IF EXISTS lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real);
 DROP FUNCTION IF EXISTS lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real);
+-- PKG-439 (migration 013) adds the trailing p_capability_class, p_avoid_hosts, p_target_host to both enqueues, and the three placement arguments to scarcity.
+DROP FUNCTION IF EXISTS lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real, text);
+DROP FUNCTION IF EXISTS lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real, text);
+DROP FUNCTION IF EXISTS lane_dispatch.scarcity(text[], text);
 
 -- Every clock read in lane_dispatch goes through now(). The GUC lane.test_now moves it for tests, but only when the value is the one stored by ALTER DATABASE or
 -- ALTER ROLE (pg_db_role_setting): a session SET to anything else, which any login can issue, is ignored, so a runner cannot move the queue's clock.
@@ -708,6 +712,13 @@ BEGIN
   END IF;
 END $$;
 
+-- PKG-439: the calling agent's platform, read without a lock (ld_claim reads it from its own locked principal row instead). me() is deliberately unchanged.
+CREATE OR REPLACE FUNCTION lane_dispatch.me_platform() RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  RETURN (SELECT p.platform FROM lane_dispatch.principals p WHERE p.login_role = session_user AND p.kind = 'agent');
+END $$;
+
 CREATE OR REPLACE FUNCTION lane_dispatch.fence_ok(p_epoch int, p_token uuid, p_host text, p_row_epoch int, p_row_token uuid, p_row_host text, p_row_state text)
 RETURNS boolean LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 BEGIN
@@ -720,12 +731,41 @@ BEGIN
   RETURN p_requires_tags <@ p_tags AND (p_repo_key = ANY (p_allowed_repos) OR '*' = ANY (p_allowed_repos));
 END $$;
 
+-- PKG-439: the one placement predicate. A ticket that names a class platform runs only on a principal of that platform (a principal with no platform never matches one), never on a host it avoids,
+-- and, when it names a target host, only there. Every claim-side copy of "may this runner take this ticket" (ld_claim's candidate and head-reserve queries, ld_needed_tools, scarcity) calls it.
+CREATE OR REPLACE FUNCTION lane_dispatch.placeable_on(p_class_platform text, p_avoid_hosts text[], p_target_host text, p_host text, p_platform text) RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  RETURN (p_class_platform IS NULL OR coalesce(p_class_platform = p_platform, false))
+     AND NOT coalesce(p_host = ANY (coalesce(p_avoid_hosts, '{}')), false)
+     AND (p_target_host IS NULL OR coalesce(p_target_host = p_host, false));
+END $$;
+
 -- Agent principals that could ever run the ticket: the order key that lets a host take what few hosts can run first, and what ld_placeable reports.
-CREATE OR REPLACE FUNCTION lane_dispatch.scarcity(p_requires_tags text[], p_repo_key text) RETURNS int
+-- The placement arguments default to "unconstrained", so an unconstrained ticket orders exactly as before PKG-439.
+CREATE OR REPLACE FUNCTION lane_dispatch.scarcity(p_requires_tags text[], p_repo_key text, p_class_platform text DEFAULT NULL, p_avoid_hosts text[] DEFAULT '{}', p_target_host text DEFAULT NULL) RETURNS int
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 BEGIN
   RETURN (SELECT count(*)::int FROM lane_dispatch.principals p
-           WHERE p.kind = 'agent' AND p.max_claims > 0 AND lane_dispatch.eligible(coalesce(p_requires_tags, '{}'), p_repo_key, p.tags, p.allowed_repos));
+           WHERE p.kind = 'agent' AND p.max_claims > 0 AND lane_dispatch.eligible(coalesce(p_requires_tags, '{}'), p_repo_key, p.tags, p.allowed_repos)
+             AND lane_dispatch.placeable_on(p_class_platform, p_avoid_hosts, p_target_host, p.host, p.platform));
+END $$;
+
+-- Why a queued ticket can run on no agent principal now, or NULL: the scarcity principal set (agent, max_claims > 0), narrowed one test at a time in this order:
+-- no-runner (none allows the repo), tags, class, avoid, target. The same eligible and placeable_on tests as scarcity, so it is non-NULL exactly when scarcity is 0.
+CREATE OR REPLACE FUNCTION lane_dispatch.unplaceable_reason(p_state text, p_requires_tags text[], p_repo_key text, p_class_platform text, p_avoid_hosts text[], p_target_host text) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_repo int; v_tags int; v_class int; v_avoid int; v_target int;
+BEGIN
+  IF p_state <> 'queued' THEN RETURN NULL; END IF;
+  SELECT count(*) FILTER (WHERE r), count(*) FILTER (WHERE r AND t), count(*) FILTER (WHERE r AND t AND c),
+         count(*) FILTER (WHERE r AND t AND c AND NOT coalesce(h = ANY (coalesce(p_avoid_hosts, '{}')), false)),
+         count(*) FILTER (WHERE r AND t AND c AND lane_dispatch.placeable_on(p_class_platform, p_avoid_hosts, p_target_host, h, pf))
+    INTO v_repo, v_tags, v_class, v_avoid, v_target
+    FROM (SELECT (p_repo_key = ANY (p.allowed_repos) OR '*' = ANY (p.allowed_repos)) AS r, coalesce(p_requires_tags, '{}') <@ p.tags AS t,
+                 (p_class_platform IS NULL OR coalesce(p_class_platform = p.platform, false)) AS c, p.host AS h, p.platform AS pf
+            FROM lane_dispatch.principals p WHERE p.kind = 'agent' AND p.max_claims > 0) x;
+  RETURN CASE WHEN v_repo = 0 THEN 'no-runner' WHEN v_tags = 0 THEN 'tags' WHEN v_class = 0 THEN 'class' WHEN v_avoid = 0 THEN 'avoid' WHEN v_target = 0 THEN 'target' END;
 END $$;
 
 -- Seconds a non-high must wait before it ties a high (3 x the 20 minute age window); eff_score and the claim order share it.
@@ -755,7 +795,9 @@ BEGIN
                                     'result', t.result, 'incarnation', t.incarnation, 'created_at', t.created_at,
                                     'started_at', t.started_at, 'finished_at', t.finished_at,
                                     'attempt_ref', CASE WHEN t.claim_token IS NULL THEN NULL
-                                                        ELSE encode(sha256(convert_to('lane-attempt-ref:' || t.claim_token::text, 'UTF8')), 'hex') END)
+                                                        ELSE encode(sha256(convert_to('lane-attempt-ref:' || t.claim_token::text, 'UTF8')), 'hex') END,
+                                    'capability_class', t.capability_class, 'avoid_hosts', to_jsonb(t.avoid_hosts), 'target_host', t.target_host,
+                                    'unplaceable', lane_dispatch.unplaceable_reason(t.state, t.requires_tags, t.repo_key, t.class_platform, t.avoid_hosts, t.target_host))
             FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = p_owner);
 END $$;
 
@@ -792,6 +834,83 @@ BEGIN
                                            allowed_repos = EXCLUDED.allowed_repos, max_claims = EXCLUDED.max_claims;
 END $$;
 
+-- PKG-439: sets a runner's platform and nothing else (tags, repos and max_claims are left as they are, which ld_set_principal cannot promise). NULL clears it.
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_set_platform(p_host text, p_platform text)
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  IF p_platform IS NOT NULL AND p_platform NOT IN ('darwin', 'linux', 'win32') THEN
+    RAISE EXCEPTION 'platform % is not one of darwin, linux, win32', p_platform USING ERRCODE = '22023';
+  END IF;
+  UPDATE lane_dispatch.principals SET platform = p_platform WHERE host = p_host AND kind = 'agent';
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'no agent principal for host %', p_host USING ERRCODE = '22023';
+  END IF;
+END $$;
+
+-- PKG-439: placement values are canonical at rest: a class is `<platform>[+tag...]` with its tags de-duplicated and sorted, host ids are lower-case, and lists are de-duplicated and sorted
+-- (C collation, so the client's sort of the same ASCII agrees). A malformed value is refused with 22023.
+CREATE OR REPLACE FUNCTION lane_dispatch.canonical_class(p_class text) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_parts text[]; v_tags text[];
+BEGIN
+  IF p_class IS NULL THEN RETURN NULL; END IF;
+  v_parts := string_to_array(lower(p_class), '+');
+  IF v_parts[1] IS NULL OR v_parts[1] NOT IN ('darwin', 'linux', 'win32') THEN
+    RAISE EXCEPTION 'capability class % must start with darwin, linux or win32', p_class USING ERRCODE = '22023';
+  END IF;
+  IF EXISTS (SELECT 1 FROM unnest(v_parts[2:]) AS g(tag) WHERE g.tag !~ '^[a-z0-9][a-z0-9-]{0,62}$') THEN
+    RAISE EXCEPTION 'capability class % has a malformed tag', p_class USING ERRCODE = '22023';
+  END IF;
+  SELECT array_agg(DISTINCT g.tag COLLATE "C" ORDER BY g.tag COLLATE "C") INTO v_tags FROM unnest(v_parts[2:]) AS g(tag);
+  RETURN v_parts[1] || coalesce('+' || array_to_string(v_tags, '+'), '');
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.canonical_host(p_host text) RETURNS text
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  IF p_host IS NULL THEN RETURN NULL; END IF;
+  IF lower(p_host) !~ '^[a-z0-9][a-z0-9-]{0,54}$' THEN
+    RAISE EXCEPTION 'host id % is malformed', p_host USING ERRCODE = '22023';
+  END IF;
+  RETURN lower(p_host);
+END $$;
+
+CREATE OR REPLACE FUNCTION lane_dispatch.canonical_hosts(p_hosts text[]) RETURNS text[]
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  RETURN coalesce((SELECT array_agg(DISTINCT h COLLATE "C" ORDER BY h COLLATE "C") FROM (SELECT lane_dispatch.canonical_host(x) AS h FROM unnest(coalesce(p_hosts, '{}')) AS u(x)) c WHERE c.h IS NOT NULL), '{}');
+END $$;
+
+-- The one definition of "same placement": the stored canonical values against the request's.
+CREATE OR REPLACE FUNCTION lane_dispatch.same_placement(p_class text, p_avoid_hosts text[], p_target_host text, p_want_class text, p_want_avoid text[], p_want_target text) RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  RETURN p_class IS NOT DISTINCT FROM p_want_class AND coalesce(p_avoid_hosts, '{}') = coalesce(p_want_avoid, '{}') AND p_target_host IS NOT DISTINCT FROM p_want_target;
+END $$;
+
+-- A host id the queue has ever known: a current agent principal, or a host on a retained ticket or attempt, so the failed host of a removed runner can still be avoided.
+CREATE OR REPLACE FUNCTION lane_dispatch.known_host(p_host text) RETURNS boolean
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  RETURN EXISTS (SELECT 1 FROM lane_dispatch.principals p WHERE p.kind = 'agent' AND p.host = p_host)
+      OR EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.host = p_host)
+      OR EXISTS (SELECT 1 FROM lane_dispatch.attempts a WHERE a.host = p_host);
+END $$;
+
+-- LK422: an unknown spelling never silently bypasses avoidance. avoid_hosts takes any known id; target_host must be a current agent principal.
+CREATE OR REPLACE FUNCTION lane_dispatch.check_placement_hosts(p_avoid_hosts text[], p_target_host text) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_host text;
+BEGIN
+  FOREACH v_host IN ARRAY coalesce(p_avoid_hosts, '{}') LOOP
+    IF NOT lane_dispatch.known_host(v_host) THEN RAISE EXCEPTION 'unknown host %', v_host USING ERRCODE = 'LK422'; END IF;
+  END LOOP;
+  IF p_target_host IS NOT NULL AND NOT EXISTS (SELECT 1 FROM lane_dispatch.principals p WHERE p.kind = 'agent' AND p.host = p_target_host) THEN
+    RAISE EXCEPTION 'unknown host %', p_target_host USING ERRCODE = 'LK422';
+  END IF;
+END $$;
+
 -- The one definition of "this key is taken": a withdrawn row has given its key up, a terminal ticket keeps it.
 CREATE OR REPLACE FUNCTION lane_dispatch.key_holder(p_dispatch_key text) RETURNS TABLE (id uuid, owner text)
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
@@ -799,15 +918,60 @@ BEGIN
   RETURN QUERY SELECT t.id, t.owner FROM lane_dispatch.tickets t WHERE t.dispatch_key = p_dispatch_key AND t.state <> 'withdrawn';
 END $$;
 
+-- The answer to a repeated submission: the caller's own row, which must carry the placement now asked for (LK423 otherwise; the id, or the key, was used by a ticket with another).
+CREATE OR REPLACE FUNCTION lane_dispatch.replay_view(p_id uuid, p_dispatch_key text, p_class text, p_avoid_hosts text[], p_target_host text) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_t record;
+BEGIN
+  SELECT t.dispatch_key, t.capability_class, t.avoid_hosts, t.target_host INTO v_t FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user;
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'ticket % already exists', p_id USING ERRCODE = '23505';
+  END IF;
+  -- the id is taken by a ticket that never held this key (the key was not attached), so it is not the submission the caller means
+  IF p_dispatch_key IS NOT NULL AND v_t.dispatch_key IS DISTINCT FROM p_dispatch_key THEN
+    RAISE EXCEPTION 'ticket % already exists under another dispatch key', p_id USING ERRCODE = '23505';
+  END IF;
+  IF NOT lane_dispatch.same_placement(v_t.capability_class, v_t.avoid_hosts, v_t.target_host, p_class, p_avoid_hosts, p_target_host) THEN
+    RAISE EXCEPTION 'ticket % already exists with different placement', p_id USING ERRCODE = 'LK423';
+  END IF;
+  RETURN lane_dispatch.ticket_view(p_id, session_user);
+END $$;
+
+-- The view of the live ticket that holds the key, for its owner, when it was placed as asked; LK423 when it was not.
+CREATE OR REPLACE FUNCTION lane_dispatch.held_view(p_id uuid, p_dispatch_key text, p_class text, p_avoid_hosts text[], p_target_host text) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_t record;
+BEGIN
+  SELECT t.capability_class, t.avoid_hosts, t.target_host INTO v_t FROM lane_dispatch.tickets t WHERE t.id = p_id;
+  IF FOUND AND NOT lane_dispatch.same_placement(v_t.capability_class, v_t.avoid_hosts, v_t.target_host, p_class, p_avoid_hosts, p_target_host) THEN
+    RAISE EXCEPTION 'dispatch key % is held by a ticket with different placement', p_dispatch_key USING ERRCODE = 'LK423';
+  END IF;
+  RETURN lane_dispatch.ticket_view(p_id, session_user);
+END $$;
+
+-- p_capability_class, p_avoid_hosts, p_target_host (PKG-439): the ticket's placement. The values are canonicalised here too, so a caller that skipped the client's own cannot store another spelling.
+-- A repeat of an earlier submission (same id, or the live ticket under the key) is answered before the hosts are looked up, so it still works after the targeted runner is removed.
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_enqueue(p_id uuid, p_repo_key text, p_lane text, p_lane_key text, p_binding jsonb, p_header jsonb, p_snapshot jsonb,
                                                     p_requires_tags text[], p_cpu_cores real, p_memory_bytes bigint, p_priority int DEFAULT 0, p_min_protocol int DEFAULT 1,
                                                     p_ages boolean DEFAULT true, p_source text DEFAULT NULL, p_est_run_s real DEFAULT NULL, p_avoid_tags text[] DEFAULT '{}',
-                                                    p_requires text[] DEFAULT '{}', p_min_cpu_cores real DEFAULT NULL, p_dispatch_key text DEFAULT NULL)
+                                                    p_requires text[] DEFAULT '{}', p_min_cpu_cores real DEFAULT NULL, p_dispatch_key text DEFAULT NULL,
+                                                    p_capability_class text DEFAULT NULL, p_avoid_hosts text[] DEFAULT '{}', p_target_host text DEFAULT NULL)
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
-DECLARE v_me record; v_held record; v_try int;
+DECLARE v_me record; v_held record; v_try int; v_class text; v_class_platform text; v_avoid text[]; v_target text; v_requires_tags text[];
 BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT * INTO v_me FROM lane_dispatch.me('submit');
+  v_class := lane_dispatch.canonical_class(p_capability_class);
+  v_class_platform := split_part(v_class, '+', 1);
+  v_avoid := lane_dispatch.canonical_hosts(p_avoid_hosts);
+  v_target := lane_dispatch.canonical_host(p_target_host);
+  IF v_target = ANY (v_avoid) THEN
+    RAISE EXCEPTION 'target host % is also in avoid_hosts', v_target USING ERRCODE = 'LK422';
+  END IF;
+  v_requires_tags := coalesce(p_requires_tags, '{}');
+  IF v_class IS NOT NULL THEN
+    SELECT coalesce(array_agg(DISTINCT g.tag COLLATE "C" ORDER BY g.tag COLLATE "C"), '{}') INTO v_requires_tags FROM unnest(v_requires_tags || coalesce((string_to_array(v_class, '+'))[2:], '{}')) AS g(tag);
+  END IF;
   IF p_dispatch_key IS NOT NULL THEN
     IF p_dispatch_key !~ '^[A-Za-z0-9:._/-]{1,200}$' THEN
       RAISE EXCEPTION 'dispatch key must be 1-200 characters of [A-Za-z0-9:._/-]' USING ERRCODE = '22023';
@@ -816,17 +980,24 @@ BEGIN
     SELECT h.id, h.owner INTO v_held FROM lane_dispatch.key_holder(p_dispatch_key) h;
     IF FOUND THEN
       IF v_held.owner <> session_user THEN RAISE EXCEPTION 'dispatch key % is held by another owner', p_dispatch_key USING ERRCODE = 'LK409'; END IF;
-      RETURN lane_dispatch.ticket_view(v_held.id, session_user);
+      RETURN lane_dispatch.held_view(v_held.id, p_dispatch_key, v_class, v_avoid, v_target);
     END IF;
   END IF;
+  -- the caller's own row under this id is the submission again, whatever has happened to the hosts since
+  IF EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user) THEN
+    RETURN lane_dispatch.replay_view(p_id, p_dispatch_key, v_class, v_avoid, v_target);
+  END IF;
+  PERFORM lane_dispatch.check_placement_hosts(v_avoid, v_target);
   -- another try (up to three) only when the holder that beat this insert is already gone (withdrawn in between): the key is free again
   FOR v_try IN 1..3 LOOP
     BEGIN
       INSERT INTO lane_dispatch.tickets (id, owner, repo_key, lane, lane_key, binding, header, snapshot, requires_tags, cpu_cores, memory_bytes, priority, incarnation,
-                                         min_protocol, ages, source, est_run_s, avoid_tags, requires, min_cpu_cores, dispatch_key, created_at, status_changed_at)
-        VALUES (p_id, session_user, p_repo_key, p_lane, p_lane_key, p_binding, p_header, p_snapshot, coalesce(p_requires_tags, '{}'), p_cpu_cores, p_memory_bytes,
+                                         min_protocol, ages, source, est_run_s, avoid_tags, requires, min_cpu_cores, dispatch_key, capability_class, class_platform, avoid_hosts, target_host,
+                                         created_at, status_changed_at)
+        VALUES (p_id, session_user, p_repo_key, p_lane, p_lane_key, p_binding, p_header, p_snapshot, v_requires_tags, p_cpu_cores, p_memory_bytes,
                 coalesce(p_priority, 0), (SELECT c.incarnation FROM lane_dispatch.cluster c), coalesce(p_min_protocol, 1), coalesce(p_ages, true), p_source, p_est_run_s,
-                coalesce(p_avoid_tags, '{}'), coalesce(p_requires, '{}'), CASE WHEN p_min_cpu_cores < p_cpu_cores THEN p_min_cpu_cores END, p_dispatch_key, lane_dispatch.now(), lane_dispatch.now())
+                coalesce(p_avoid_tags, '{}'), coalesce(p_requires, '{}'), CASE WHEN p_min_cpu_cores < p_cpu_cores THEN p_min_cpu_cores END, p_dispatch_key,
+                v_class, v_class_platform, v_avoid, v_target, lane_dispatch.now(), lane_dispatch.now())
         ON CONFLICT (id) DO NOTHING;
       IF FOUND THEN PERFORM pg_notify('ld_work', ''); END IF;
       EXIT;
@@ -838,17 +1009,10 @@ BEGIN
         CONTINUE;
       END IF;
       IF v_held.owner <> session_user THEN RAISE EXCEPTION 'dispatch key % is held by another owner', p_dispatch_key USING ERRCODE = 'LK409'; END IF;
-      RETURN lane_dispatch.ticket_view(v_held.id, session_user);
+      RETURN lane_dispatch.held_view(v_held.id, p_dispatch_key, v_class, v_avoid, v_target);
     END;
   END LOOP;
-  IF NOT EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user) THEN
-    RAISE EXCEPTION 'ticket % already exists', p_id USING ERRCODE = '23505';
-  END IF;
-  -- the id is taken by a ticket that never held this key (the key was not attached), so it is not the submission the caller means
-  IF p_dispatch_key IS NOT NULL AND EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.dispatch_key IS DISTINCT FROM p_dispatch_key) THEN
-    RAISE EXCEPTION 'ticket % already exists under another dispatch key', p_id USING ERRCODE = '23505';
-  END IF;
-  RETURN lane_dispatch.ticket_view(p_id, session_user);
+  RETURN lane_dispatch.replay_view(p_id, p_dispatch_key, v_class, v_avoid, v_target);
 END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_ticket_by_key(p_dispatch_key text) RETURNS jsonb
@@ -858,6 +1022,34 @@ BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT * INTO v_me FROM lane_dispatch.me('submit');
   RETURN (SELECT lane_dispatch.ticket_view(h.id, session_user) FROM lane_dispatch.key_holder(p_dispatch_key) h WHERE h.owner = session_user);
+END $$;
+
+-- PKG-439: the same lookup for a caller that asks for a placement ({capability_class, avoid_hosts, target_host}); a holder that was placed otherwise is refused with LK423, never adopted.
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_ticket_by_key(p_dispatch_key text, p_placement jsonb) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record; v_held record; v_class text; v_avoid text[]; v_target text;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('submit');
+  v_class := lane_dispatch.canonical_class(p_placement ->> 'capability_class');
+  v_avoid := lane_dispatch.canonical_hosts(ARRAY(SELECT jsonb_array_elements_text(coalesce(p_placement -> 'avoid_hosts', '[]'::jsonb))));
+  v_target := lane_dispatch.canonical_host(p_placement ->> 'target_host');
+  SELECT h.id INTO v_held FROM lane_dispatch.key_holder(p_dispatch_key) h WHERE h.owner = session_user;
+  IF NOT FOUND THEN RETURN NULL; END IF;
+  RETURN lane_dispatch.held_view(v_held.id, p_dispatch_key, v_class, v_avoid, v_target);
+END $$;
+
+-- PKG-439: every host id the queue knows (the tests of an alias map: an alias must never shadow one).
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_known_hosts() RETURNS text[]
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('submit');
+  RETURN coalesce((SELECT array_agg(DISTINCT k.h COLLATE "C" ORDER BY k.h COLLATE "C") FROM (
+                     SELECT p.host AS h FROM lane_dispatch.principals p WHERE p.kind = 'agent'
+                     UNION SELECT t.host FROM lane_dispatch.tickets t WHERE t.host IS NOT NULL
+                     UNION SELECT a.host FROM lane_dispatch.attempts a) k), '{}');
 END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_get(p_id uuid) RETURNS jsonb
@@ -976,7 +1168,7 @@ DECLARE v_me record; v_out jsonb; v_now timestamptz; v_protocol int; v_held int;
         v_head record; v_t record; v_grant real;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
-  SELECT p.host, p.tags, p.allowed_repos, p.max_claims INTO v_me FROM lane_dispatch.principals p WHERE p.login_role = session_user AND p.kind = 'agent' FOR UPDATE;
+  SELECT p.host, p.tags, p.allowed_repos, p.max_claims, p.platform INTO v_me FROM lane_dispatch.principals p WHERE p.login_role = session_user AND p.kind = 'agent' FOR UPDATE;
   IF NOT FOUND THEN
     RAISE EXCEPTION 'no agent principal for %', session_user USING ERRCODE = '42501';
   END IF;
@@ -994,6 +1186,7 @@ BEGIN
   SELECT t.id, t.cpu_cores, lane_dispatch.claim_need(t.cpu_cores, t.min_cpu_cores, v_now - t.created_at, v_floor_after) AS need INTO v_t FROM lane_dispatch.tickets t
    WHERE t.state = 'queued' AND NOT t.cancel_requested AND t.min_protocol <= v_protocol AND t.not_before <= v_now
      AND lane_dispatch.eligible(t.requires_tags, t.repo_key, v_me.tags, v_me.allowed_repos)
+     AND lane_dispatch.placeable_on(t.class_platform, t.avoid_hosts, t.target_host, v_me.host, v_me.platform)
      AND (NOT t.avoid_tags && v_me.tags OR v_now - t.created_at >= v_avoid_grace)
      AND lane_dispatch.claim_need(t.cpu_cores, t.min_cpu_cores, v_now - t.created_at, v_floor_after) <= p_free_cpu AND t.memory_bytes <= p_free_mem
      AND NOT (t.lane_key = ANY (coalesce(p_held_keys, '{}')))
@@ -1002,7 +1195,7 @@ BEGIN
    ORDER BY lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) DESC,
             CASE WHEN lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) >= 2.0
                   AND extract(epoch FROM v_now - t.created_at) >= lane_dispatch.age_horizon_s() THEN t.created_at END NULLS LAST,
-            lane_dispatch.scarcity(t.requires_tags, t.repo_key), t.created_at, t.id LIMIT 1 FOR UPDATE SKIP LOCKED;
+            lane_dispatch.scarcity(t.requires_tags, t.repo_key, t.class_platform, t.avoid_hosts, t.target_host), t.created_at, t.id LIMIT 1 FOR UPDATE SKIP LOCKED;
   IF NOT FOUND THEN RETURN jsonb_build_object('status', 'none'); END IF;
   v_token := gen_random_uuid();
   IF p_capacity_cpu IS NOT NULL AND v_held > 0 THEN
@@ -1010,6 +1203,7 @@ BEGIN
            lane_dispatch.ticket_weight(t.header, p_weight_limit) AS weight, CASE WHEN t.ages THEN v_now - t.created_at ELSE interval '0' END AS credited INTO v_head FROM lane_dispatch.tickets t
    WHERE t.state = 'queued' AND NOT t.cancel_requested AND t.min_protocol <= v_protocol AND t.not_before <= v_now
      AND lane_dispatch.eligible(t.requires_tags, t.repo_key, v_me.tags, v_me.allowed_repos)
+     AND lane_dispatch.placeable_on(t.class_platform, t.avoid_hosts, t.target_host, v_me.host, v_me.platform)
      AND (NOT t.avoid_tags && v_me.tags OR v_now - t.created_at >= v_avoid_grace)
      AND lane_dispatch.claim_need(t.cpu_cores, t.min_cpu_cores, v_now - t.created_at, v_floor_after) <= p_capacity_cpu AND t.memory_bytes <= coalesce(p_capacity_mem, p_free_mem)
      AND NOT (t.lane_key = ANY (coalesce(p_held_keys, '{}')))
@@ -1017,7 +1211,7 @@ BEGIN
    ORDER BY lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) DESC,
             CASE WHEN lane_dispatch.eff_score(t.priority, t.ages, extract(epoch FROM v_now - t.created_at)) >= 2.0
                   AND extract(epoch FROM v_now - t.created_at) >= lane_dispatch.age_horizon_s() THEN t.created_at END NULLS LAST,
-            lane_dispatch.scarcity(t.requires_tags, t.repo_key), t.created_at, t.id LIMIT 1;
+            lane_dispatch.scarcity(t.requires_tags, t.repo_key, t.class_platform, t.avoid_hosts, t.target_host), t.created_at, t.id LIMIT 1;
     IF FOUND AND extract(epoch FROM v_head.credited) >= lane_dispatch.age_horizon_s()
        AND NOT (v_head.need <= p_free_cpu AND v_head.memory_bytes <= p_free_mem AND v_head.weight <= coalesce(p_free_weight::numeric, 'Infinity'::numeric)) THEN
       RETURN jsonb_build_object('status', 'none', 'reserved_for', v_head.id);
@@ -1036,12 +1230,14 @@ END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_needed_tools() RETURNS text[]
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
-DECLARE v_me record;
+DECLARE v_me record; v_platform text;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT * INTO v_me FROM lane_dispatch.me('agent');
+  v_platform := lane_dispatch.me_platform();
   RETURN (SELECT coalesce(array_agg(DISTINCT r.name ORDER BY r.name), '{}') FROM lane_dispatch.tickets t, unnest(t.requires) AS r(name)
-           WHERE t.state = 'queued' AND lane_dispatch.eligible(t.requires_tags, t.repo_key, v_me.tags, v_me.allowed_repos));
+           WHERE t.state = 'queued' AND lane_dispatch.eligible(t.requires_tags, t.repo_key, v_me.tags, v_me.allowed_repos)
+             AND lane_dispatch.placeable_on(t.class_platform, t.avoid_hosts, t.target_host, v_me.host, v_platform));
 END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_start(p_id uuid, p_epoch int, p_token uuid) RETURNS boolean
@@ -1209,7 +1405,8 @@ END $$;
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_enqueue_fenced(p_expect_ref text, p_id uuid, p_repo_key text, p_lane text, p_lane_key text, p_binding jsonb,
                                                            p_header jsonb, p_snapshot jsonb, p_requires_tags text[], p_cpu_cores real, p_memory_bytes bigint, p_priority int DEFAULT 0, p_min_protocol int DEFAULT 1,
                                                            p_ages boolean DEFAULT true, p_source text DEFAULT NULL, p_est_run_s real DEFAULT NULL, p_avoid_tags text[] DEFAULT '{}',
-                                                           p_requires text[] DEFAULT '{}', p_min_cpu_cores real DEFAULT NULL, p_dispatch_key text DEFAULT NULL)
+                                                           p_requires text[] DEFAULT '{}', p_min_cpu_cores real DEFAULT NULL, p_dispatch_key text DEFAULT NULL,
+                                                           p_capability_class text DEFAULT NULL, p_avoid_hosts text[] DEFAULT '{}', p_target_host text DEFAULT NULL)
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 DECLARE v_me record; v_ref text;
 BEGIN
@@ -1223,7 +1420,8 @@ BEGIN
     RETURN jsonb_build_object('state', 'stale-queue-ref', 'queue_ref', v_ref);
   END IF;
   RETURN lane_dispatch.ld_enqueue(p_id, p_repo_key, p_lane, p_lane_key, p_binding, p_header, p_snapshot, p_requires_tags, p_cpu_cores, p_memory_bytes, p_priority,
-                                  p_min_protocol, p_ages, p_source, p_est_run_s, p_avoid_tags, p_requires, p_min_cpu_cores, p_dispatch_key);
+                                  p_min_protocol, p_ages, p_source, p_est_run_s, p_avoid_tags, p_requires, p_min_cpu_cores, p_dispatch_key,
+                                  p_capability_class, p_avoid_hosts, p_target_host);
 END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_placeable(p_repo_key text, p_requires_tags text[]) RETURNS int
@@ -1233,6 +1431,22 @@ BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT * INTO v_me FROM lane_dispatch.me('submit');
   RETURN lane_dispatch.scarcity(p_requires_tags, p_repo_key);
+END $$;
+
+-- PKG-439: the same count for a ticket with a placement. p_requires_tags already carries the class's tags (the client unions them, as ld_enqueue does). An id the queue does not know is refused (LK422).
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_placeable(p_repo_key text, p_requires_tags text[], p_class_platform text, p_avoid_hosts text[], p_target_host text) RETURNS int
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record; v_avoid text[]; v_target text;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('submit');
+  v_avoid := lane_dispatch.canonical_hosts(p_avoid_hosts);
+  v_target := lane_dispatch.canonical_host(p_target_host);
+  IF v_target = ANY (v_avoid) THEN
+    RAISE EXCEPTION 'target host % is also in avoid_hosts', v_target USING ERRCODE = 'LK422';
+  END IF;
+  PERFORM lane_dispatch.check_placement_hosts(v_avoid, v_target);
+  RETURN lane_dispatch.scarcity(p_requires_tags, p_repo_key, p_class_platform, v_avoid, v_target);
 END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_prune_candidates(p_objects_after interval, p_rows_after interval, p_after_finished timestamptz DEFAULT NULL,
@@ -1371,12 +1585,23 @@ END $$;
 DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('lane_dispatch.tickets') AND attname = 'requeues' AND NOT attisdropped) THEN
-    CREATE OR REPLACE VIEW lane.pull_tickets AS
-      SELECT id, repo_key, lane, state, host, cpu_cores, requeues, result, created_at, started_at, finished_at, requires_tags,
-             md5(header ->> 'argv') AS argv_md5
-        FROM lane_dispatch.tickets;
-    CREATE OR REPLACE VIEW lane.pull_principals AS
-      SELECT host, tags, allowed_repos, max_claims FROM lane_dispatch.principals WHERE kind = 'agent';
+    -- PKG-439: the placement columns are appended once migration 013 has added them (a view cannot lose a column, so a re-apply must not fall back to the shorter list).
+    IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('lane_dispatch.tickets') AND attname = 'capability_class' AND NOT attisdropped)
+       AND EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('lane_dispatch.principals') AND attname = 'platform' AND NOT attisdropped) THEN
+      CREATE OR REPLACE VIEW lane.pull_tickets AS
+        SELECT id, repo_key, lane, state, host, cpu_cores, requeues, result, created_at, started_at, finished_at, requires_tags,
+               md5(header ->> 'argv') AS argv_md5, capability_class, avoid_hosts, target_host
+          FROM lane_dispatch.tickets;
+      CREATE OR REPLACE VIEW lane.pull_principals AS
+        SELECT host, tags, allowed_repos, max_claims, platform FROM lane_dispatch.principals WHERE kind = 'agent';
+    ELSE
+      CREATE OR REPLACE VIEW lane.pull_tickets AS
+        SELECT id, repo_key, lane, state, host, cpu_cores, requeues, result, created_at, started_at, finished_at, requires_tags,
+               md5(header ->> 'argv') AS argv_md5
+          FROM lane_dispatch.tickets;
+      CREATE OR REPLACE VIEW lane.pull_principals AS
+        SELECT host, tags, allowed_repos, max_claims FROM lane_dispatch.principals WHERE kind = 'agent';
+    END IF;
     CREATE OR REPLACE VIEW lane.pull_runners AS
       SELECT host, last_seen FROM lane_dispatch.runners;
   END IF;
@@ -1467,10 +1692,11 @@ GRANT USAGE ON SCHEMA lane_dispatch TO lane_agent, lane_submit, lane_admin;
 GRANT EXECUTE ON FUNCTION lane_dispatch.ld_register(text, int, jsonb), lane_dispatch.ld_claim(uuid, real, bigint, text[], text[], real, bigint, real, real), lane_dispatch.ld_needed_tools(), lane_dispatch.ld_start(uuid, int, uuid),
   lane_dispatch.ld_heartbeat(uuid, int, uuid), lane_dispatch.ld_finish(uuid, int, uuid, jsonb), lane_dispatch.ld_release(uuid, int, uuid, text),
   lane_dispatch.ld_log(uuid, int, uuid, int, bytea) TO lane_agent;
-GRANT EXECUTE ON FUNCTION lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real, text), lane_dispatch.ld_get(uuid), lane_dispatch.ld_ticket_by_key(text),
+GRANT EXECUTE ON FUNCTION lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real, text, text, text[], text), lane_dispatch.ld_get(uuid), lane_dispatch.ld_ticket_by_key(text), lane_dispatch.ld_ticket_by_key(text, jsonb), lane_dispatch.ld_known_hosts(),
   lane_dispatch.ld_list_mine(text[], int), lane_dispatch.ld_withdraw(uuid), lane_dispatch.ld_cancel(uuid), lane_dispatch.ld_attach_urls(uuid, int, jsonb),
   lane_dispatch.ld_log_read(uuid, int, int), lane_dispatch.ld_log_ack(uuid, int, int), lane_dispatch.ld_queue_ref(),
-  lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real, text), lane_dispatch.ld_placeable(text, text[]) TO lane_submit;
-GRANT EXECUTE ON FUNCTION lane_dispatch.ld_set_principal(text, text, text, text[], text[], int), lane_dispatch.ld_reap(interval, interval, interval),
+  lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real, text, text, text[], text), lane_dispatch.ld_placeable(text, text[]),
+  lane_dispatch.ld_placeable(text, text[], text, text[], text) TO lane_submit;
+GRANT EXECUTE ON FUNCTION lane_dispatch.ld_set_principal(text, text, text, text[], text[], int), lane_dispatch.ld_set_platform(text, text), lane_dispatch.ld_reap(interval, interval, interval),
   lane_dispatch.ld_restore_reset(), lane_dispatch.ld_guard(interval), lane_dispatch.ld_prune_candidates(interval, interval, timestamptz, uuid, int),
   lane_dispatch.ld_prune(uuid[], interval), lane_dispatch.ld_prune_chunks(interval, int), lane_dispatch.ld_blobs_live(jsonb) TO lane_admin;
