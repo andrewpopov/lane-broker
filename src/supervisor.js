@@ -665,6 +665,7 @@ export function historyRow(ticket, result, { fallbackReason, lease, contentKey =
     ...terminalRowDefaults({ resources: ticket.resources, grantedCpuCores: lease?.grantedCpuCores }),
     ...withoutUndefinedPlacement(result),
     executor,
+    ...(executor === 'local' && ticket.configLocal ? { configLocal: true, ...(ticket.configLocalReason ? { configLocalReason: ticket.configLocalReason } : {}), configLocalAccepted: ticket.configLocalAccepted === true } : {}),
     ...(localReason ? { localReason } : {}),
     ...(localReason && localReason === ticket.localReason && ticket.localReasonText ? { localReasonText: ticket.localReasonText } : {}),
   };
