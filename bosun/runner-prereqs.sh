@@ -1,11 +1,12 @@
 #!/bin/bash
 # BRAIN-1150/BRAIN-1157/BRAIN-1145, bosun README "Installing"; also the lane child's bosun setup (--dry-run/--apply). Keep /bin/bash 3.2 compatible: it runs before brew bash exists.
 # Darwin installs system tools with Homebrew; Linux never uses root and only reports a missing system tool with its apt fix.
+# --wheels-only (PKG-464) covers only python3 and the PyPI wheels, for a dispatch host that is no runner but runs lanes locally on fallback.
 # RUNNER_PREREQS_UNAME overrides `uname -s`; tests use it to force a platform branch.
 set -u
 
 usage() {
-  echo "usage: $0 (--check | --install | --dry-run | --apply) [--path <dir>:<dir>...]" >&2
+  echo "usage: $0 (--check | --install | --dry-run | --apply) [--wheels-only] [--path <dir>:<dir>...]" >&2
   exit 2
 }
 
@@ -15,6 +16,7 @@ wheels="$here/requirements.lane-runner.txt"
 playwrights="$here/playwright.lane-runner.txt"
 browsers="chromium chromium-headless-shell webkit"
 mode=""
+scope=all
 os=${RUNNER_PREREQS_UNAME:-$(uname -s)}
 case "$os" in
   Darwin)
@@ -42,6 +44,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --check | --dry-run) mode=check ;;
     --install | --apply) mode=install ;;
+    --wheels-only) scope=wheels ;;
     --path)
       [ $# -ge 2 ] || usage
       path=$2
@@ -87,21 +90,29 @@ check() {
     echo "missing: $1" >&2
     missing=$((missing + 1))
   }
-  while IFS= read -r item; do miss "$item"; done < <(system_lacks)
+  if [ "$scope" = wheels ]; then
+    on_path python3 -c 'import tomllib' > /dev/null 2>&1 || miss "python3 >= 3.11 with tomllib ($hint_python)"
+  else
+    while IFS= read -r item; do miss "$item"; done < <(system_lacks)
+  fi
   on_path python3 -c 'import numpy' > /dev/null 2>&1 || miss "python3 numpy (pip numpy)"
   on_path python3 -c 'import PIL' > /dev/null 2>&1 || miss "python3 Pillow (pip pillow)"
-  if is_on_path npx; then
+  if [ "$scope" = wheels ]; then
+    :
+  elif is_on_path npx; then
     for version in $(playwright_versions); do
       has_browsers "$version" || miss "playwright $version browsers ($browsers)"
     done
   else
     miss "npx (node), for the playwright browsers$hint_node"
   fi
+  local what="lane-runner prerequisite"
+  [ "$scope" = wheels ] && what="lane Python wheel prerequisite"
   if [ "$missing" -gt 0 ]; then
-    echo "$missing lane-runner prerequisite(s) missing on PATH=$path" >&2
+    echo "$missing $what(s) missing on PATH=$path" >&2
     return 1
   fi
-  echo "ok: every lane-runner prerequisite is on PATH=$path"
+  echo "ok: every $what is on PATH=$path"
 }
 
 # Neither `brew bundle check` nor `brew list` works for a user who does not own Homebrew, so the capability checks decide.
@@ -132,16 +143,18 @@ if [ "$mode" = install ]; then
     exit 2
   fi
   failed=0
-  [ "$os" = Darwin ] && install_system_darwin
+  [ "$os" = Darwin ] && [ "$scope" = all ] && install_system_darwin
   if on_path python3 -c 'import tomllib' > /dev/null 2>&1; then
     on_path python3 -m pip install --quiet --disable-pip-version-check --user --break-system-packages \
       --only-binary=:all: -r "$wheels" || failed=1
   else
     echo "skipping the PyPI wheels: no python3 >= 3.11 yet" >&2
   fi
-  for version in $(playwright_versions); do
-    (cd /tmp && on_path npx -y "playwright@$version" install $browsers) || failed=1
-  done
+  if [ "$scope" = all ]; then
+    for version in $(playwright_versions); do
+      (cd /tmp && on_path npx -y "playwright@$version" install $browsers) || failed=1
+    done
+  fi
   check || exit 1
   exit "$failed"
 fi
