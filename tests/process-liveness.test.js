@@ -62,3 +62,17 @@ test('a zombie is not alive on Linux (kill(0) succeeds on one)', { skip: process
   assert.equal(isPidAlive(zombiePid), false);
   assert.equal(isPidAlive(parent.pid), true);
 });
+
+test('a stuck ps is killed at the timeout and reads as indeterminate, so a liveness check fails closed instead of hanging', { timeout: 10_000 }, (t) => {
+  const bin = makeTmpDir('lane-ps-stuck-', t);
+  fs.writeFileSync(path.join(bin, 'ps'), '#!/bin/sh\nexec sleep 30\n', { mode: 0o755 });
+  const saved = process.env.PATH;
+  process.env.PATH = `${bin}${path.delimiter}${saved}`;
+  try {
+    const started = Date.now();
+    assert.equal(processStartTime(process.pid, { timeoutMs: 200 }), undefined);
+    assert.ok(Date.now() - started < 5_000, 'the probe ended at its timeout');
+  } finally {
+    process.env.PATH = saved;
+  }
+});

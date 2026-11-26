@@ -1,5 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import { PS_TIMEOUT_MS } from '@andrewpopov/bosun/module';
 
 /** The state letter in a `/proc/<pid>/stat` line: the first field after the LAST `)`, since comm may itself contain parens. */
 export function procStatState(stat) {
@@ -33,11 +34,13 @@ export function isPidAlive(pid) {
  *    callers must treat this as "could not determine", never as "gone".
  * Pinned to the C locale so the output format is stable across environments.
  */
-export function processStartTime(pid) {
+export function processStartTime(pid, { timeoutMs = PS_TIMEOUT_MS } = {}) {
   try {
+    // A stuck ps is killed at the timeout and reads as indeterminate, so it never holds the event loop.
     const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
       encoding: 'utf8',
       env: { ...process.env, LC_ALL: 'C', LC_TIME: 'C' },
+      timeout: timeoutMs,
     }).trim();
     return out || null;
   } catch (err) {
