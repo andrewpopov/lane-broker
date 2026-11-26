@@ -146,18 +146,19 @@ const HISTORY_COMMAND_MAX = 300;
 const REFUSED_KNOWN_RED_EXIT = 79;
 const RETRY_REASON_MAX = 200;
 
-/** BRAIN-752: a non-push-gate lane that runs here by config is stamped, and warned about when its declared reason names no need for this machine. */
-function configLocalStamp(resolved) {
-  if (resolved.remote === true || PUSH_GATE_LANE.test(resolved.lane)) return {};
+/** BRAIN-752: a non-push-gate lane this machine runs by its own config (not a runner's intake, not a dispatch) is stamped. */
+function configLocalStamp(resolved, { remoteEligible, runnerIntake }) {
+  if (resolved.remote === true || remoteEligible || runnerIntake || PUSH_GATE_LANE.test(resolved.lane)) return {};
   const text = resolved.localReason;
-  const accepted = text ? acceptedLocalReason(text) : false;
-  if (!accepted) {
-    const declared = text ? `declared localReason "${text}" names no need for this machine` : 'it declares no localReason';
-    process.stderr.write(
-      `lane: warning: lane ${resolved.lane} runs on this machine by config and ${declared}. Set remote: true with remoteSetup/remoteDeps, or declare a localReason naming one of: ${LOCAL_REASON_CATEGORIES.map((c) => c.label).join('; ')}.\n`,
-    );
-  }
-  return { configLocal: true, ...(text ? { configLocalReason: text } : {}), configLocalAccepted: accepted };
+  return { configLocal: true, ...(text ? { configLocalReason: text } : {}), configLocalAccepted: text ? acceptedLocalReason(text) : false };
+}
+
+function warnConfigLocal(lane, stamp) {
+  if (!stamp.configLocal || stamp.configLocalAccepted) return;
+  const declared = stamp.configLocalReason ? `declared localReason "${stamp.configLocalReason}" names no need for this machine` : 'it declares no localReason';
+  process.stderr.write(
+    `lane: warning: lane ${lane} runs on this machine by config and ${declared}. Set remote: true with remoteSetup/remoteDeps, or declare a localReason naming one of: ${LOCAL_REASON_CATEGORIES.map((c) => c.label).join('; ')}.\n`,
+  );
 }
 
 /** Why a run of a remote-capable lane (`remote: true`) is executing locally,
@@ -490,7 +491,7 @@ export async function runCommand({
     }
   }
   const localReason = localReasonFor(resolved, remoteEligible, forced, exclusive);
-  const configLocal = configLocalStamp(resolved);
+  const configLocal = configLocalStamp(resolved, { remoteEligible, runnerIntake });
   const { headTree, checkoutRoot } = gitTreeAndRoot(cwd);
   // No fingerprint (so no history relief, charge declared) when the checkout root is
   // unknown: falling back to cwd would fold a sub-package into the repo-root workload.
@@ -767,6 +768,7 @@ export async function runCommand({
   const resultPath = path.join(p.results, `${id}.json`);
 
   const scrubNames = parseScrubCommandEnv(process.env[SCRUB_COMMAND_ENV_VAR]);
+  warnConfigLocal(resolved.lane, configLocal);
   const pushGate = !detach && PUSH_GATE_LANE.test(resolved.lane) ? detectPushGate({ cwd }) : null;
   const ticket = {
     id,

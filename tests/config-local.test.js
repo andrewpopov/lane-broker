@@ -27,14 +27,22 @@ async function runLane(lanes, lane) {
   return { res, row: lastRow(state) };
 }
 
-test('config resolves a declared localReason, null when absent, and an undeclared lane inherits its template value', () => {
-  const { repoDir } = repoWith({ default: { weight: 1, localReason: ` ${GOOD} ` }, plain: { weight: 1 } });
+test('config resolves a declared localReason, and null when absent or blank', () => {
+  const { repoDir } = repoWith({ default: { weight: 1, localReason: ` ${GOOD} ` }, plain: { weight: 1 }, blank: { weight: 1, localReason: '  ' } });
   assert.equal(resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' }).localReason, GOOD);
   assert.equal(resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'plain' }).localReason, null);
+  assert.equal(resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'blank' }).localReason, null);
 });
 
-test('config rejects a non-string or empty localReason', () => {
-  for (const bad of [true, 3, '  ']) {
+test('an undeclared lane inherits its template localReason', () => {
+  const { base } = freshEnv();
+  const repoDir = path.join(base, 'repo');
+  writeRepoConfig(repoDir, { version: 1, undeclaredLanes: { as: 'tmpl' }, lanes: { default: { weight: 1 }, tmpl: { weight: 1, localReason: GOOD } } });
+  assert.equal(resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'adhoc' }).localReason, GOOD);
+});
+
+test('config rejects a non-string localReason', () => {
+  for (const bad of [true, 3]) {
     const { repoDir } = repoWith({ default: { weight: 1, localReason: bad } });
     assert.throws(() => resolveTicketConfig({ cwd: repoDir, repo: 'r', lane: 'default' }), ConfigError);
   }

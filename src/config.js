@@ -896,7 +896,7 @@ function validateRepoConfig(cfg, sourcePath) {
       assert(typeof lane.localRefused === 'boolean', `${sourcePath}: lane "${name}".localRefused must be a boolean`);
     }
     if (lane.localReason !== undefined) {
-      assert(typeof lane.localReason === 'string' && lane.localReason.trim() !== '', `${sourcePath}: lane "${name}".localReason must be a non-empty string`);
+      assert(typeof lane.localReason === 'string', `${sourcePath}: lane "${name}".localReason must be a string`);
     }
     if (lane.pullLocalFallback !== undefined) {
       assert(typeof lane.pullLocalFallback === 'boolean', `${sourcePath}: lane "${name}".pullLocalFallback must be a boolean`);
@@ -1658,7 +1658,7 @@ export function resolveTicketConfig({ cwd, repo, lane, configRoot, repoIdentityO
     memoryBytes: Number.isFinite(laneCfg.memoryBytes) ? laneCfg.memoryBytes : null,
     localRefused: Boolean(laneCfg.localRefused),
     // BRAIN-752: why a lane that runs here by config needs this machine
-    localReason: typeof laneCfg.localReason === 'string' ? laneCfg.localReason.trim() : null,
+    localReason: typeof laneCfg.localReason === 'string' && laneCfg.localReason.trim() !== '' ? laneCfg.localReason.trim() : null,
     // PKG-401: false opts this lane out of the local fallback while the pull queue is unreachable
     pullLocalFallback: laneCfg.pullLocalFallback !== false,
     // null (not defaulted here) when the lane doesn't declare its own nice:
