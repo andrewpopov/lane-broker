@@ -111,7 +111,6 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
     while (!stopped && !upgradeRequired) {
       if (loadApproaching(deviceGates, deviceGatesConfig) && now() - hotClaimAt < config.pollMs) return;
       let answer;
-      const startedAt = now();
       try {
         answer = await claimOnce({ core, remoteRoot, figures: claimFiguresOf, block, now, tools: claimTools, log });
       } catch (err) {
@@ -124,8 +123,10 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
       else if (answer.status === 'claimed') {
         claimed += 1;
         driver.adopt(answer.execId);
+        const claimedAt = now();
+        await refreshDeviceGates(); // self-gating: a sample that fell due during a long round is taken before the next claim, so block() and the pacing see it
         if (loadApproaching(deviceGates, deviceGatesConfig)) {
-          hotClaimAt = startedAt;
+          hotClaimAt = claimedAt;
           return;
         }
       }

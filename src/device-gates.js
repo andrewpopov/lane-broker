@@ -4,7 +4,6 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { atomicWriteJson, fingerprintOf, paths, readJsonSafe } from './state.js';
 import { readMemoryPressure } from './memory-pressure.js';
-import { measureHostCpuReadOnly } from './cpu.js';
 
 const DEVICE_COMMAND_TIMEOUT_MS = 2000;
 
@@ -241,14 +240,43 @@ const SENSORS = {
   },
 };
 
-// PKG-440: 5-minute loadavg per logical core, and the host busy fraction from `measureHostCpuReadOnly`, the counters probeCpuHeadroom and admission use.
-// Host counters only: the per-process rows (a `ps` or /proc walk) are not needed for a busy fraction.
-export async function readCpuLoad({ loadavg = os.loadavg, cores = () => os.cpus().length, measure = () => measureHostCpuReadOnly({ readRows: () => null }) } = {}) {
+// PKG-440: a whole-host CPU snapshot `{ busy, total }` in ticks, uncapped by any cgroup. On Linux the aggregate `cpu` line of /proc/stat:
+// libuv's os.cpus() drops iowait, which would read an I/O-bound window as busy, so iowait and steal count as not-busy but stay in the total.
+// Elsewhere os.cpus() (user + nice + sys + irq busy, plus idle).
+export function parseProcStatCpu(text) {
+  const fields = /^cpu\s+(.+)$/m.exec(text ?? '')?.[1].trim().split(/\s+/).map(Number);
+  if (!fields || fields.length < 4 || !fields.every(Number.isFinite)) return null;
+  const [user, nice, system, idle, iowait = 0, irq = 0, softirq = 0, steal = 0] = fields; // guest time is already inside user and nice
+  return { busy: user + nice + system + irq + softirq, total: user + nice + system + idle + iowait + irq + softirq + steal };
+}
+
+export function readCpuSnapshot({ platform = process.platform, readStat = () => fs.readFileSync('/proc/stat', 'utf8'), cpus = os.cpus } = {}) {
+  if (platform === 'linux') {
+    try {
+      const snapshot = parseProcStatCpu(readStat());
+      if (snapshot) return snapshot;
+    } catch {
+      // fall through to os.cpus()
+    }
+  }
+  const sums = cpus().reduce((sum, { times: t }) => ({ busy: sum.busy + t.user + t.nice + t.sys + t.irq, total: sum.total + t.user + t.nice + t.sys + t.irq + t.idle }), { busy: 0, total: 0 });
+  return Number.isFinite(sums.total) && sums.total > 0 ? sums : null;
+}
+
+const CPU_WINDOW_MS = 250;
+
+// PKG-440: 5-minute loadavg per logical core, and the host busy fraction over two whole-host snapshots about 250 ms apart (busy delta / total delta
+// across every logical CPU). It does not use measureHostCpuReadOnly: that caps busy cores at cgroup capacity and runs a synchronous vm_stat.
+export async function readCpuLoad({ loadavg = os.loadavg, cores = () => os.cpus().length, platform = process.platform, readSnapshot = () => readCpuSnapshot({ platform }), gapMs = CPU_WINDOW_MS, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
   const logical = cores();
-  const busy = await measure();
+  const first = readSnapshot();
+  await sleep(gapMs);
+  const second = readSnapshot();
+  const total = second && first ? second.total - first.total : NaN;
+  const busy = second && first ? second.busy - first.busy : NaN;
   return {
     load5PerCore: logical > 0 ? loadavg()[1] / logical : null,
-    busyFraction: busy && Number.isFinite(busy.hostBusyCores) && busy.cores > 0 ? busy.hostBusyCores / busy.cores : null,
+    busyFraction: Number.isFinite(total) && Number.isFinite(busy) && total > 0 && busy >= 0 ? Math.min(1, busy / total) : null,
   };
 }
 
@@ -262,7 +290,7 @@ const read = async (sensor, io) => {
 
 // A sensor this platform lacks, no threshold needs, or that fails reads null (unknown). Never throws.
 export async function sampleDevice(deviceGates, { platform = process.platform, exec = execCommand, sysRoot = '/sys', memoryPressure = () => readMemoryPressure({ platform }), cpuLoad = readCpuLoad } = {}) {
-  const io = { exec, sysRoot };
+  const io = { exec, sysRoot, platform };
   const sensors = SENSORS[platform] ?? {};
   const uses = (name, ...keys) => keys.some((key) => gateConfigOf(name, deviceGates)?.[key] !== undefined);
   const [pressureLevel, cpuSpeedLimit, maxTempC, power, memory, load] = await Promise.all([
@@ -281,10 +309,14 @@ export async function sampleDevice(deviceGates, { platform = process.platform, e
   };
 }
 
-export function liveDeviceGates(deviceGates, sample, previous = {}) {
+// `recorded` holds a running agent's own state ({closed}) per gate: it is what the agent enforces, so a gate it still holds closed shows CLOSED
+// whatever one fresh reading says (hysteresis); without it the gate is judged by the fresh reading alone.
+export function liveDeviceGates(deviceGates, sample, previous = {}, recorded = {}) {
   return Object.fromEntries(configuredGates(deviceGates).map((name) => {
     const reading = GATES[name].derive?.(previous[name], sample[name] ?? {}) ?? sample[name] ?? {};
-    return [name, { reason: gateViolation(name, gateConfigOf(name, deviceGates), reading), reading, thresholds: gateConfigOf(name, deviceGates) }];
+    const fresh = gateViolation(name, gateConfigOf(name, deviceGates), reading);
+    const held = typeof recorded[name]?.closed === 'boolean' ? recorded[name].closed : null;
+    return [name, { reason: held === null ? fresh : held ? fresh ?? name : null, reading, thresholds: gateConfigOf(name, deviceGates) }];
   }));
 }
 

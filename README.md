@@ -347,7 +347,7 @@ judge by (no configured reading known; for `power`, AC state unknown): it neithe
 closed gate down to thresholds this platform cannot read holds it closed until a restart or until `deviceGates` is removed. Linux battery
 and thermal reads skip unreadable entries and `scope: Device` batteries (a wireless mouse), so a missing file is never read as 0. `lane status` samples live and prints one `device gates:` line; the agent's `status.json` carries each gate's
 `{closed, consecutiveOk, reading}` and its textfile metrics `lane_agent_device_gate_closed{gate="thermal|power|memory|load"}` (0/1, active
-gates only).
+gates only; the raw gate state, so a closed `load` gate reads 1 even while an idle runner still claims).
 
 **The `memory` gate (PKG-404) is on by default**; `"memory": false` turns it off (and clears local admission's stored state), and
 `"memory": {}` or any subset of its keys keeps the defaults for the rest. It closes only on signs the host is paging now, never on how
@@ -379,8 +379,7 @@ for the rest. Pull runners stop claiming while the host is genuinely overloaded 
 workbook-pro ran an 8-slot runner at load 23 on 12 cores and merge-train's suite took 2 h against a 36-minute median). **Load average alone
 misleads** (Linux counts uninterruptible I/O waiters: zirkbot showed load 16 at 56% idle, workbook-pro load 35 at 0.5% idle), so the gate
 closes only when BOTH signals hold: the 5-minute load average per logical core (`os.loadavg()[1] / os.cpus().length`) exceeds
-`maxLoadPerCore` (0.1-100, default 1.2) AND the host's busy fraction is at least `minBusyFraction` (0.01-1, default 0.85), measured from the
-same host CPU counters admission and `remote-probe` use (`measureHostCpuReadOnly`, a 250 ms window per sample). A reading that is
+`maxLoadPerCore` (0.1-100, default 1.2) AND the host's busy fraction is at least `minBusyFraction` (0.01-1, default 0.85), measured as busy delta over total delta across every logical CPU between two whole-host snapshots about 250 ms apart, uncapped by any cgroup limit. On Linux the snapshots are the aggregate `cpu` line of `/proc/stat` with iowait and steal counted as not busy (so an I/O-bound window reads low), elsewhere `os.cpus()`. A reading that is
 unavailable never violates, and like `memory` a closed load gate reopens and reports `sensor-unavailable` after 3 samples missing a signal.
 `openSamples` defaults to 3. **Idle exemption:** a runner with no non-terminal execution is never blocked by the load gate, so a runner
 always keeps at least one lane ("nothing should ever hold the machine"; a held agent reserves nothing in the queue, and a ticket only this

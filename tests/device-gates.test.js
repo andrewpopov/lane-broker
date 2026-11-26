@@ -10,7 +10,7 @@ import { renderAgentMetrics } from '../src/agent/metrics.js';
 import { renderStatusText } from '../src/status.js';
 import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 import {
-  closedGateReason, deviceGatesProblem, gateConfigOf, liveDeviceGates, loadApproaching, readCpuLoad, parseCpuSpeedLimit, parsePmsetBatt, parsePressureLevel, renderDeviceGatesLine,
+  closedGateReason, deviceGatesProblem, gateConfigOf, liveDeviceGates, loadApproaching, parseProcStatCpu, readCpuLoad, readCpuSnapshot, parseCpuSpeedLimit, parsePmsetBatt, parsePressureLevel, renderDeviceGatesLine,
   sampleDevice, updateDeviceGate, updateDeviceGates,
 } from '../src/device-gates.js';
 
@@ -427,11 +427,52 @@ test('sampleDevice asks for the load reading only while the gate is on, and an u
   assert.deepEqual(broken.load, NO_LOAD_READING);
 });
 
-test('readCpuLoad is the 5-minute loadavg per logical core and the busy fraction of the host counters, unknown when either is missing', async () => {
-  const measure = async () => ({ hostBusyCores: 10.2, cores: 12, procWindow: null });
-  assert.deepEqual(await readCpuLoad({ loadavg: () => [30, 29.6, 20], cores: () => 12, measure }), { load5PerCore: 29.6 / 12, busyFraction: 0.85 });
-  assert.deepEqual(await readCpuLoad({ loadavg: () => [1, 2, 3], cores: () => 4, measure: async () => null }), { load5PerCore: 0.5, busyFraction: null });
-  assert.equal((await readCpuLoad({ loadavg: () => [1, 2, 3], cores: () => 0, measure })).load5PerCore, null);
+const snapshots = (...list) => { const queue = [...list]; return () => queue.shift() ?? null; };
+const noSleep = async () => {};
+
+test('readCpuLoad is the 5-minute loadavg per logical core and the busy fraction between two whole-host snapshots, unknown when either is missing', async () => {
+  const read = (over) => readCpuLoad({ loadavg: () => [30, 29.6, 20], cores: () => 12, sleep: noSleep, ...over });
+  assert.deepEqual(await read({ readSnapshot: snapshots({ busy: 100, total: 1000 }, { busy: 1020, total: 2200 }) }), { load5PerCore: 29.6 / 12, busyFraction: 920 / 1200 });
+  assert.equal((await read({ readSnapshot: snapshots({ busy: 1, total: 2 }, null) })).busyFraction, null);
+  assert.equal((await read({ readSnapshot: snapshots({ busy: 5, total: 10 }, { busy: 5, total: 10 }) })).busyFraction, null, 'no time passed');
+  assert.equal((await read({ readSnapshot: snapshots({ busy: 5, total: 10 }, { busy: 4, total: 20 }) })).busyFraction, null, 'a counter that went backwards');
+  assert.equal((await read({ cores: () => 0, readSnapshot: snapshots({ busy: 0, total: 1 }, { busy: 1, total: 2 }) })).load5PerCore, null);
+});
+
+const procStat = (user, nice, system, idle, iowait, irq, softirq, steal) => `cpu  ${[user, nice, system, idle, iowait, irq, softirq, steal, 0, 0].join(' ')}\ncpu0 1 1 1 1 1 1 1 1 0 0\nintr 1\n`;
+const linuxBusy = (...stats) => {
+  const queue = [...stats];
+  return readCpuLoad({ loadavg: () => [0, 0, 0], cores: () => 12, platform: 'linux', sleep: noSleep, readSnapshot: () => readCpuSnapshot({ platform: 'linux', readStat: () => queue.shift() }) }).then((r) => r.busyFraction);
+};
+
+test('on Linux the busy fraction counts iowait and steal as not busy but in the total: an 80% iowait window reads low', async () => {
+  assert.equal(await linuxBusy(procStat(1000, 0, 0, 0, 0, 0, 0, 0), procStat(1200, 0, 0, 0, 800, 0, 0, 0)), 0.2, '20% user, 80% iowait, no idle');
+  assert.equal(await linuxBusy(procStat(1000, 0, 0, 500, 0, 0, 0, 0), procStat(1100, 0, 100, 500, 0, 0, 0, 800)), 0.2, 'steal is not busy');
+  assert.equal(await linuxBusy(procStat(0, 0, 0, 100, 0, 0, 0, 0), procStat(100, 50, 100, 100, 0, 25, 25, 0)), 1, 'user, nice, system, irq and softirq are busy');
+  assert.equal(parseProcStatCpu('intr 1\n'), null);
+  assert.equal(parseProcStatCpu('cpu  1 2 x 4\n'), null);
+});
+
+test('a cgroup-limited host is not inflated: two busy cores of 16 read 12.5%, not 100% of a two-core quota', async () => {
+  const cpus = (tick) => Array.from({ length: 16 }, (_, i) => ({ times: { user: i < 2 ? tick * 250 : 0, nice: 0, sys: 0, irq: 0, idle: i < 2 ? 0 : tick * 250 } }));
+  const ticks = [1, 2];
+  const busy = (await readCpuLoad({ loadavg: () => [0, 0, 0], cores: () => 16, platform: 'darwin', sleep: noSleep, readSnapshot: () => readCpuSnapshot({ platform: 'darwin', cpus: () => cpus(ticks.shift()) }) })).busyFraction;
+  assert.equal(busy, 0.125);
+});
+
+test('the Linux reader falls back to os.cpus() when /proc/stat is unreadable', () => {
+  const cpus = () => [{ times: { user: 3, nice: 0, sys: 1, irq: 0, idle: 4 } }];
+  assert.deepEqual(readCpuSnapshot({ platform: 'linux', readStat: () => { throw new Error('ENOENT'); }, cpus }), { busy: 4, total: 8 });
+  assert.equal(readCpuSnapshot({ platform: 'linux', readStat: () => 'garbage', cpus: () => [] }), null);
+});
+
+test('lane status shows a gate the agent still holds closed as CLOSED whatever one fresh reading says, and judges by the fresh reading without agent state', () => {
+  const sample = { thermal: {}, power: {}, memory: {}, load: { load5PerCore: 0.3, busyFraction: 0.2 } };
+  const render = (recorded) => renderDeviceGatesLine(liveDeviceGates({ memory: false }, sample, {}, recorded));
+  assert.equal(render({ load: { closed: true, consecutiveOk: 1 } }), 'device gates: load CLOSED (load5/core 0.30/≤1.2, busy 20%/≥85%)');
+  assert.equal(render({ load: { closed: false } }), 'device gates: load ok (load5/core 0.30/≤1.2, busy 20%/≥85%)');
+  assert.equal(render({}), 'device gates: load ok (load5/core 0.30/≤1.2, busy 20%/≥85%)');
+  assert.equal(renderDeviceGatesLine(liveDeviceGates({ memory: false }, { load: { load5PerCore: 2, busyFraction: 0.9 } }, {}, { load: { closed: false } })), 'device gates: load ok (load5/core 2.00/≤1.2, busy 90%/≥85%)', 'the agent is the one that enforces; it has not closed yet');
 });
 
 test('closedGateReason skips an idle-exempt gate only while idle, and loadApproaching is the 0.8 band below the limit', () => {
@@ -478,6 +519,22 @@ test('canary: with the AND weakened to an OR, or the idle exemption removed, the
     const { updateDeviceGate: step } = await load('device-gates.js');
     assert.equal(step(undefined, 'load', LOAD_CFG, loadSample(null, 0.99)).closed, false, 'unknown load');
     assert.equal(step(undefined, 'load', LOAD_CFG, loadSample(3, null)).closed, false, 'unknown busy');
+  });
+});
+
+test('canary: counting iowait as busy, dropping it from the total, or judging status by the fresh reading alone fails the load readers by name', async () => {
+  const ioWait = async (load) => {
+    const { readCpuSnapshot: snap } = await load('device-gates.js');
+    const a = snap({ platform: 'linux', readStat: () => procStat(1000, 0, 0, 0, 0, 0, 0, 0) });
+    const b = snap({ platform: 'linux', readStat: () => procStat(1200, 0, 0, 0, 800, 0, 0, 0) });
+    assert.equal((b.busy - a.busy) / (b.total - a.total), 0.2);
+  };
+  await ioWait(realSrc);
+  await assertCanaryFails('device-gates.js', ['busy: user + nice + system + irq + softirq, total', 'busy: user + nice + system + irq + softirq + iowait, total'], ioWait);
+  await assertCanaryFails('device-gates.js', ['total: user + nice + system + idle + iowait + irq + softirq + steal', 'total: user + nice + system + idle + irq + softirq + steal'], ioWait);
+  await assertCanaryFails('device-gates.js', ['reason: held === null ? fresh : held ? fresh ?? name : null', 'reason: fresh'], async (load) => {
+    const { liveDeviceGates: live } = await load('device-gates.js');
+    assert.equal(live({ memory: false }, { load: { load5PerCore: 0.3, busyFraction: 0.2 } }, {}, { load: { closed: true } }).load.reason, 'load');
   });
 });
 
