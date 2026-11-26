@@ -8,6 +8,7 @@ export const ENQUEUE_CROSSED_RESTORE = 'enqueue-crossed-restore';
 export const ENQUEUE_PAST_RETENTION = 'enqueue-past-retention';
 
 export const DISPATCH_KEY_REFUSED = 'dispatch-key-refused';
+export const DISPATCH_KEY_REFUSED_REASON = 'dispatch-key-refused';
 
 const EMPTY_INTENT = { attempts: [], seenRowAt: null };
 
@@ -35,8 +36,8 @@ export function enqueueArgs(envelope) {
 
 const intentOf = (attempt) => attempt?.pull?.enqueue ?? EMPTY_INTENT;
 
-// an attempt not durably stale may have inserted a row, so it pins the ref and, if the ref later goes stale, the ticket is lost; a refused one (the key's queue answer) inserted none
-const mayHaveBeenSent = (attempt) => attempt.answer !== 'stale' && attempt.answer !== 'refused';
+// an attempt not durably stale may have inserted a row, so it pins the ref and, if the ref later goes stale, the ticket is lost
+const mayHaveBeenSent = (attempt) => attempt.answer !== 'stale';
 
 const crossedRestore = (attempts) => attempts.some((attempt, i) => attempt.answer === 'stale' && attempts.slice(0, i).some(mayHaveBeenSent));
 
@@ -61,6 +62,8 @@ export function enqueueOnce({ root, id, generation, queue, ledgered = () => fals
     const args = enqueueArgs(readEnvelope(root, id));
     const intent = intentOf(readAttempt(root, id));
     if (intent.seenRowAt !== null) return { outcome: 'queued', view: null };
+    // the queue already refused this submission for good: it is decided again from the record, never sent again
+    if (intent.refusal !== undefined) return { outcome: DISPATCH_KEY_REFUSED, ...intent.refusal };
     if (crossedRestore(intent.attempts)) return { outcome: 'lost', reason: ENQUEUE_CROSSED_RESTORE };
     if (pastRetention(intent.attempts, now(), rowRetentionMs)) return { outcome: 'lost', reason: ENQUEUE_PAST_RETENTION };
     // nothing has been sent, so a cancel that has arrived ends the ticket here and no row is ever created; checked under the lock, before the intent is recorded
@@ -74,9 +77,9 @@ export function enqueueOnce({ root, id, generation, queue, ledgered = () => fals
       return { ...current, attempts: [...current.attempts, sending] };
     });
 
-    // a refused attempt inserted no row, so it does not pin the ref (mayHaveBeenSent)
+    // `ticketId` (the ticket the key already names) is kept on the intent so a detached caller can print it
     const refuse = async (refusal) => {
-      await persistIntent({ root, id, generation }, (current) => ({ ...current, attempts: current.attempts.map((attempt) => (attempt.n === sending.n ? { ...attempt, answer: 'refused' } : attempt)) }));
+      await persistIntent({ root, id, generation }, (current) => ({ ...current, refusal, ...(refusal.ticketId === undefined ? {} : { heldTicketId: refusal.ticketId }), attempts: current.attempts.map((attempt) => (attempt.n === sending.n ? { ...attempt, answer: 'refused' } : attempt)) }));
       return { outcome: DISPATCH_KEY_REFUSED, ...refusal };
     };
     let view;
@@ -90,6 +93,10 @@ export function enqueueOnce({ root, id, generation, queue, ledgered = () => fals
     // the key already names another of this owner's tickets (a concurrent or earlier submit): nothing was inserted, and this id must not shadow that ticket
     if (args.dispatchKey !== undefined && view.id !== undefined && view.id !== id) {
       return refuse({ reason: `dispatch key ${args.dispatchKey} is already ticket ${view.id}; resubmit to adopt it`, exitCode: DISPATCH_KEY_REFUSED_EXIT, ticketId: view.id });
+    }
+    // a replay of a keyed enqueue whose row was withdrawn meanwhile is answered with that withdrawn row: not a queued ticket, so it is refused
+    if (args.dispatchKey !== undefined && view.state === 'withdrawn') {
+      return refuse({ reason: `dispatch key ${args.dispatchKey} names a withdrawn ticket; resubmit with a new key`, exitCode: DISPATCH_KEY_REFUSED_EXIT });
     }
     const stale = view.state === STALE_QUEUE_REF;
     const settled = await persistIntent({ root, id, generation }, (current) => ({

@@ -51,7 +51,8 @@ import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
 import { placeForPull } from './pull-placement.js';
 import { dispatchKeyPullRefusal } from './dispatch-key.js';
-import { publicationBindings, publicationOf } from './pull-publication.js';
+import { DISPATCH_KEY_REFUSED_REASON } from './pull-enqueue.js';
+import { publicationBindings, publicationOf, refusalExitOf } from './pull-publication.js';
 import { pullContextFor } from './pull-services.js';
 import { withRepoIdentity } from './pull-snapshot.js';
 import { assertWithdrawCommitted, PrepareAbandoned, PULL_UNREACHABLE_REASON, preparePullTicketWithRetry, proveNeverEnqueued, pullExitCode, runPullTicket, sleepUnlessAborted, withdrawQueued as withdrawPullQueued } from './pull-ticket.js';
@@ -1308,7 +1309,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       ...classTransport(enriched, resolveClasses(globalCfg, root)),
       priorityAccruedMs: waitedMs(enriched, effectiveNow(root)),
     }), worktreeRoot);
-    const publication = publicationOf(enriched, { placement, attemptStartedAt, refusalExit: isDispatchOnly(globalCfg) ? NO_RUNNER_EXIT_CODE : undefined });
+    const publication = publicationOf(enriched, { placement, attemptStartedAt, refusalExit: refusalExitOf({ dispatchOnly: isDispatchOnly(globalCfg), dispatchKey: enriched.dispatchKey }, NO_RUNNER_EXIT_CODE) });
     const ctx = {
       ...pullContextFor(root, globalCfg, services, { id: enriched.id, generation: gen }),
       ...publicationBindings(root, publication),
@@ -1348,13 +1349,8 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     }
     const outcome = await runPullTicket({ ...ctx, prepare: undefined });
     const exitCode = pullExitCode(outcome);
-    // a keyed enqueue the queue refused inserted nothing: it ends with a published refusal, so `lane run` reports its exit
-    if (outcome.outcome === 'unresolved' && outcome.refused) {
-      const refusal = { exitCode, message: `lane run: ${outcome.reason}\n` };
-      process.stderr.write(refusal.message);
-      await publishAndExit(gen, () => localRefusalResult(enriched, refusal));
-      return { fallback: false };
-    }
+    // a keyed enqueue the queue refused inserted nothing: it settled as a published decision, whose reason is the caller's explanation
+    if (outcome.decision?.reason === DISPATCH_KEY_REFUSED_REASON) process.stderr.write(`lane run: ${outcome.decision.detail}\n`);
     if (outcome.outcome === 'unresolved') return exitUnresolved(`pull dispatch unresolved: ${outcome.reason}${outcome.error ? ` (${outcome.error})` : ''}`, exitCode);
     if (exitCode !== undefined) return exitSettled(exitCode);
     if (outcome.outcome === 'local-fallback') {

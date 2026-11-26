@@ -89,7 +89,7 @@ const GUARDS = {
 };
 
 const CANARIES = [
-  ['ld_enqueue sends an empty ld_work hint', "IF FOUND THEN PERFORM pg_notify('ld_work', ''); END IF;\n  EXCEPTION", 'EXCEPTION'],
+  ['ld_enqueue sends an empty ld_work hint', "IF FOUND THEN PERFORM pg_notify('ld_work', ''); END IF;\n      EXIT;", 'EXIT;'],
   ['ld_release to queued sends an empty ld_work hint', "IF v_state = 'queued' THEN PERFORM pg_notify('ld_work', ''); END IF;", ''],
   ['ld_reap that requeues an expired claim sends an empty ld_work hint', "IF v_requeued > 0 THEN PERFORM pg_notify('ld_work', ''); END IF;", ''],
   ['ld_cancel of a claimed row sends an empty ld_host_<host> hint to its host', "PERFORM pg_notify('ld_host_' || v_t.host, '');", ''],
