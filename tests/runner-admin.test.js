@@ -973,6 +973,8 @@ function findPostgres() {
   return null;
 }
 const PG = findPostgres();
+// macOS postgres refuses to start without a valid locale ("postmaster became multithreaded"); lane-db-harness pins the same.
+const PG_ENV = { ...process.env, LC_ALL: 'C' };
 
 const NO_PG = PG ? false : 'no initdb, pg_ctl, psql and openssl on this machine';
 
@@ -984,14 +986,14 @@ async function pgScenario(t, mod = lib, { only = false } = {}) {
   const hbaFile = path.join(hbaDir, 'pg_hba.conf');
   fs.mkdirSync(hbaDir);
   fs.mkdirSync(sock);
-  const must = (cmd, args) => { const r = spawnSync(PG(cmd), args, { encoding: 'utf8' }); assert.equal(r.status, 0, `${cmd} ${args.join(' ')}: ${r.stderr}`); return r; };
+  const must = (cmd, args) => { const r = spawnSync(PG(cmd), args, { env: PG_ENV, encoding: 'utf8' }); assert.equal(r.status, 0, `${cmd} ${args.join(' ')}: ${r.stderr}`); return r; };
   const admin = (hba) => `local   all  me  trust\n${hba}`;
   must('initdb', ['-D', data, '-U', 'me', '--auth=trust']);
   assert.equal(spawnSync('openssl', ['req', '-x509', '-nodes', '-newkey', 'rsa:2048', '-subj', '/CN=localhost', '-days', '1', '-keyout', path.join(data, 'server.key'), '-out', path.join(data, 'server.crt')]).status, 0);
   fs.chmodSync(path.join(data, 'server.key'), 0o600);
   fs.writeFileSync(hbaFile, admin(HBA));
   must('pg_ctl', ['-D', data, '-w', '-l', path.join(root, 'log'), '-o', `-c listen_addresses='' -c unix_socket_directories=${sock} -c port=55433 -c ssl=on -c ssl_cert_file=${data}/server.crt -c ssl_key_file=${data}/server.key -c hba_file=${hbaFile}`, 'start']);
-  t.after(() => { spawnSync(PG('pg_ctl'), ['-D', data, '-m', 'immediate', 'stop']); fs.rmSync(root, { recursive: true, force: true }); });
+  t.after(() => { spawnSync(PG('pg_ctl'), ['-D', data, '-m', 'immediate', 'stop'], { env: PG_ENV }); fs.rmSync(root, { recursive: true, force: true }); });
   const psql = `'${PG('psql')}' -h '${sock}' -p 55433 -U me -d postgres`;
 
   const run = async (content, { action = 'add', current }) => {
@@ -1068,11 +1070,11 @@ test('real postgres: dropping a role terminates only that role\'s sessions, neve
   const data = path.join(root, 'data');
   const sock = path.join(root, 's');
   fs.mkdirSync(sock);
-  const must = (cmd, args) => { const r = spawnSync(PG(cmd), args, { encoding: 'utf8' }); assert.equal(r.status, 0, `${cmd}: ${r.stderr}`); return r; };
+  const must = (cmd, args) => { const r = spawnSync(PG(cmd), args, { env: PG_ENV, encoding: 'utf8' }); assert.equal(r.status, 0, `${cmd}: ${r.stderr}`); return r; };
   must('initdb', ['-D', data, '-U', 'me', '--auth=trust']);
   must('pg_ctl', ['-D', data, '-w', '-l', path.join(root, 'log'), '-o', `-c listen_addresses='' -c unix_socket_directories=${sock} -c port=55434`, 'start']);
-  t.after(() => { spawnSync(PG('pg_ctl'), ['-D', data, '-m', 'immediate', 'stop']); fs.rmSync(root, { recursive: true, force: true }); });
-  const psql = (user, sql) => spawnSync(PG('psql'), ['-X', '-At', '-h', sock, '-p', '55434', '-U', user, '-d', 'postgres', '-v', 'ON_ERROR_STOP=1', '-c', sql], { encoding: 'utf8' });
+  t.after(() => { spawnSync(PG('pg_ctl'), ['-D', data, '-m', 'immediate', 'stop'], { env: PG_ENV }); fs.rmSync(root, { recursive: true, force: true }); });
+  const psql = (user, sql) => spawnSync(PG('psql'), ['-X', '-At', '-h', sock, '-p', '55434', '-U', user, '-d', 'postgres', '-v', 'ON_ERROR_STOP=1', '-c', sql], { env: PG_ENV, encoding: 'utf8' });
   assert.equal(psql('me', "CREATE ROLE lane_agent_evo_x2 LOGIN; CREATE ROLE bystander LOGIN; CREATE SCHEMA lane_dispatch; CREATE TABLE lane_dispatch.runners (host text); INSERT INTO lane_dispatch.runners VALUES ('evo-x2'), ('other');").status, 0);
   const hold = (user) => spawn(PG('psql'), ['-X', '-h', sock, '-p', '55434', '-U', user, '-d', 'postgres', '-c', 'SELECT pg_sleep(60)'], { stdio: 'ignore' });
   const target = hold('lane_agent_evo_x2');
@@ -1081,7 +1083,7 @@ test('real postgres: dropping a role terminates only that role\'s sessions, neve
   const sessions = (user) => Number(psql('me', `SELECT count(*) FROM pg_stat_activity WHERE usename = '${user}'`).stdout.trim());
   const ready = Date.now() + 10000;
   while ((sessions('lane_agent_evo_x2') < 1 || sessions('bystander') < 1) && Date.now() < ready) spawnSync('sleep', ['0.1']);
-  const drop = spawnSync(PG('psql'), ['-X', '-At', '-h', sock, '-p', '55434', '-U', 'me', '-d', 'postgres', '-v', 'ON_ERROR_STOP=1', '-f', '-'], { input: lib.dropRoleSql('lane_agent_evo_x2', 'evo-x2'), encoding: 'utf8' });
+  const drop = spawnSync(PG('psql'), ['-X', '-At', '-h', sock, '-p', '55434', '-U', 'me', '-d', 'postgres', '-v', 'ON_ERROR_STOP=1', '-f', '-'], { input: lib.dropRoleSql('lane_agent_evo_x2', 'evo-x2'), env: PG_ENV, encoding: 'utf8' });
   assert.equal(drop.status, 0, drop.stderr);
   assert.equal(sessions('bystander'), 1, 'the other login keeps its session');
   assert.equal(psql('me', "SELECT count(*) FROM pg_roles WHERE rolname = 'lane_agent_evo_x2'").stdout.trim(), '0');
