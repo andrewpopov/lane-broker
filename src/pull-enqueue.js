@@ -71,7 +71,11 @@ export function enqueueOnce({ root, id, generation, queue, ledgered = () => fals
     const intent = intentOf(readAttempt(root, id));
     if (intent.seenRowAt !== null) return { outcome: 'queued', view: null };
     // the queue already refused this submission for good: it is decided again from the record, never sent again
-    if (intent.refusal !== undefined) return { outcome: DISPATCH_KEY_REFUSED, ...intent.refusal };
+    if (intent.refusal !== undefined) {
+      // the ack the parent reads is rebuilt from the durable refusal if it was lost with the crash
+      if (intent.refusal.ticketId && readEnqueueAck(root, id) === null) writeEnqueueAck(root, id, { id: intent.refusal.ticketId, state: intent.refusal.holderState, host: intent.refusal.holderHost });
+      return { outcome: DISPATCH_KEY_REFUSED, ...intent.refusal };
+    }
     // an ack naming another ticket is that same refusal, made durable before the intent could record it: the winner may have been withdrawn since, and this command must not take its place
     const acked = readEnqueueAck(root, id);
     if (acked?.ticketId && acked.ticketId !== id) return { outcome: DISPATCH_KEY_REFUSED, reason: `dispatch key ${args.dispatchKey} is already ticket ${acked.ticketId}; resubmit to adopt it`, exitCode: DISPATCH_KEY_REFUSED_EXIT, ticketId: acked.ticketId };
@@ -106,7 +110,7 @@ export function enqueueOnce({ root, id, generation, queue, ledgered = () => fals
       // a holder that was withdrawn between the queue's lookup and its view holds nothing: no id is offered for it
       if (view.state === 'withdrawn') return refuse({ reason: `dispatch key ${args.dispatchKey} was held by ticket ${view.id}, which was withdrawn; resubmit`, exitCode: DISPATCH_KEY_REFUSED_EXIT });
       // the refusal is recorded first, then the winner is told: a crash between the two leaves the ack, which recovery reads as the same refusal
-      const refused = await refuse({ reason: `dispatch key ${args.dispatchKey} is already ticket ${view.id}; resubmit to adopt it`, exitCode: DISPATCH_KEY_REFUSED_EXIT, ticketId: view.id });
+      const refused = await refuse({ reason: `dispatch key ${args.dispatchKey} is already ticket ${view.id}; resubmit to adopt it`, exitCode: DISPATCH_KEY_REFUSED_EXIT, ticketId: view.id, holderState: view.state ?? null, holderHost: view.host ?? null });
       writeEnqueueAck(root, id, view);
       return refused;
     }
