@@ -460,10 +460,23 @@ test('a cgroup-limited host is not inflated: two busy cores of 16 read 12.5%, no
   assert.equal(busy, 0.125);
 });
 
-test('the Linux reader falls back to os.cpus() when /proc/stat is unreadable', () => {
+test('on Linux an unreadable /proc/stat is unknown, never an os.cpus() fallback that drops iowait or mixes units within one window', () => {
   const cpus = () => [{ times: { user: 3, nice: 0, sys: 1, irq: 0, idle: 4 } }];
-  assert.deepEqual(readCpuSnapshot({ platform: 'linux', readStat: () => { throw new Error('ENOENT'); }, cpus }), { busy: 4, total: 8 });
-  assert.equal(readCpuSnapshot({ platform: 'linux', readStat: () => 'garbage', cpus: () => [] }), null);
+  assert.equal(readCpuSnapshot({ platform: 'linux', readStat: () => { throw new Error('ENOENT'); }, cpus }), null);
+  assert.equal(readCpuSnapshot({ platform: 'linux', readStat: () => 'garbage', cpus }), null);
+});
+
+test('a sampling window that overran (the agent was suspended) reads busy as unknown', async () => {
+  const snaps = [{ busy: 0, total: 100 }, { busy: 100, total: 200 }];
+  let t = 0;
+  const clock = () => t;
+  const sleep = async () => { t += 60_000; };
+  const r = await readCpuLoad({ loadavg: () => [0, 3, 0], cores: () => 2, readSnapshot: () => snaps.shift(), sleep, clock });
+  assert.equal(r.busyFraction, null);
+  assert.equal(r.load5PerCore, 1.5);
+  const ok = [{ busy: 0, total: 100 }, { busy: 90, total: 200 }];
+  let u = 0;
+  assert.equal((await readCpuLoad({ loadavg: () => [0, 0, 0], cores: () => 1, readSnapshot: () => ok.shift(), sleep: async () => { u += 250; }, clock: () => u })).busyFraction, 0.9);
 });
 
 test('lane status shows a gate the agent still holds closed as CLOSED whatever one fresh reading says, and judges by the fresh reading without agent state', () => {

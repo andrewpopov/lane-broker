@@ -22,7 +22,7 @@ import { resolveCpuLimit, enforcementOf } from './cpu-limit.js';
 import { collectRunnerStates, renderRunnersLines } from './runner-unreachable.js';
 import { remoteOwnerMap } from './retier.js';
 import { defaultRemoteRoot } from './remote-runner.js';
-import { readAgentStatus } from './agent/store.js';
+import { readAgentStatus, readCurrentAgentGates } from './agent/store.js';
 import { effectiveNow } from './priority-clock.js';
 import { resolveScheduler, legacyStore, fairnessStore, effectiveView } from './fairness.js';
 import { readTicketWait, waitLabel } from './ticket-wait.js';
@@ -417,7 +417,7 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     // null whenever the sample itself is unavailable (non-macOS host, or a
     // failed probe), never a fabricated reading.
     memory: classifyMemorySample(readMemorySample()),
-    ...(sampleDeviceGates ? { deviceGates: liveDeviceGates(cfg.deviceGates, await sampleDevice(cfg.deviceGates), { memory: readMemoryGate(root, cfg.deviceGates).reading }, { load: readAgentStatus(remoteRoot).deviceGates?.load }) } : {}),
+    ...(sampleDeviceGates ? { deviceGates: liveDeviceGates(cfg.deviceGates, await sampleDevice(cfg.deviceGates), { memory: readMemoryGate(root, cfg.deviceGates).reading }, { load: readCurrentAgentGates(remoteRoot)?.load }) } : {}),
     memoryGate: readMemoryGate(root, cfg.deviceGates),
     running,
     queued,

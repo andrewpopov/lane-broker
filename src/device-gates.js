@@ -252,11 +252,11 @@ export function parseProcStatCpu(text) {
 
 export function readCpuSnapshot({ platform = process.platform, readStat = () => fs.readFileSync('/proc/stat', 'utf8'), cpus = os.cpus } = {}) {
   if (platform === 'linux') {
+    // No os.cpus() fallback here: it drops iowait, and a window mixing /proc/stat ticks with os.cpus() milliseconds is meaningless. Unknown never closes the gate.
     try {
-      const snapshot = parseProcStatCpu(readStat());
-      if (snapshot) return snapshot;
+      return parseProcStatCpu(readStat());
     } catch {
-      // fall through to os.cpus()
+      return null;
     }
   }
   const sums = cpus().reduce((sum, { times: t }) => ({ busy: sum.busy + t.user + t.nice + t.sys + t.irq, total: sum.total + t.user + t.nice + t.sys + t.irq + t.idle }), { busy: 0, total: 0 });
@@ -264,15 +264,19 @@ export function readCpuSnapshot({ platform = process.platform, readStat = () => 
 }
 
 const CPU_WINDOW_MS = 250;
+const MAX_CPU_WINDOW_OVERRUN_MS = 5000;
 
 // PKG-440: 5-minute loadavg per logical core, and the host busy fraction over two whole-host snapshots about 250 ms apart (busy delta / total delta
 // across every logical CPU). It does not use measureHostCpuReadOnly: that caps busy cores at cgroup capacity and runs a synchronous vm_stat.
-export async function readCpuLoad({ loadavg = os.loadavg, cores = () => os.cpus().length, platform = process.platform, readSnapshot = () => readCpuSnapshot({ platform }), gapMs = CPU_WINDOW_MS, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)) } = {}) {
+export async function readCpuLoad({ loadavg = os.loadavg, cores = () => os.cpus().length, platform = process.platform, readSnapshot = () => readCpuSnapshot({ platform }), gapMs = CPU_WINDOW_MS, sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)), clock = Date.now } = {}) {
   const logical = cores();
   const first = readSnapshot();
+  const startedAt = clock();
   await sleep(gapMs);
   const second = readSnapshot();
-  const total = second && first ? second.total - first.total : NaN;
+  // A window far longer than asked (the process was suspended) averages CPU over minutes against a current loadavg: treat it as unknown.
+  const fresh = clock() - startedAt <= gapMs + MAX_CPU_WINDOW_OVERRUN_MS;
+  const total = fresh && second && first ? second.total - first.total : NaN;
   const busy = second && first ? second.busy - first.busy : NaN;
   return {
     load5PerCore: logical > 0 ? loadavg()[1] / logical : null,

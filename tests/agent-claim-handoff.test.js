@@ -264,7 +264,7 @@ const scenarios = {
     const claimedCount = async () => (await Promise.all(tickets.map((t) => w.ticket(t.id)))).filter((row) => row.epoch > 0).length;
     await rw.agent({ load, deviceSampler, config: { pollMs: 1500, deviceGates: { memory: false } } });
     await happens('the first claim', async () => (await claimedCount()) >= 1);
-    await sleep(1100); // pollMs 1500 less the slack of noticing the first claim: a NOTIFY-woken tick must not claim again inside the window
+    await sleep(1300); // pollMs 1500 less the slack of noticing the first claim: a NOTIFY-woken tick must not claim again inside the window
     assert.equal(await claimedCount(), 1, 'load 1.0 per core is within 0.8 of the 1.2 limit: one claim per pollMs');
     await happens('the next tick claims the second', async () => (await claimedCount()) === 2, 30_000);
   },
