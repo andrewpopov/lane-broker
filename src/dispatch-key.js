@@ -7,6 +7,16 @@ export const DISPATCH_KEY_REFUSED_EXIT = 76;
 /** A key another principal holds will not free up for this caller, so it is a usage error. */
 export const DISPATCH_KEY_FOREIGN_EXIT = 64;
 
+/**
+ * Exit of `lane run --dispatch-key` when the queue holds a live ticket under the key that this machine did not submit (no attempt, result or ledger entry here):
+ * a definite answer. Nothing was submitted, polled or written; the id, state and host are printed and the caller follows the ticket through
+ * `lane status --dispatch-key` or `lane.ticket_status_v1`.
+ */
+export const DISPATCH_KEY_HELD_ELSEWHERE_EXIT = 73;
+
+/** The held ticket as `lane run` prints it: `<id> <state> <host>`, or one JSON object with --json. */
+export const heldTicketLine = (dispatchKey, { id, state, host }, json) => (json ? `${JSON.stringify({ dispatchKey, id, state: state ?? null, host: host ?? null })}\n` : `${id} ${state ?? '-'} ${host ?? '-'}\n`);
+
 /** SQLSTATE the queue raises when the key belongs to another owner (migration 012). */
 export const DISPATCH_KEY_HELD_SQLSTATE = 'LK409';
 const UNDEFINED_FUNCTION_SQLSTATE = '42883';

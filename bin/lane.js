@@ -48,7 +48,7 @@ import { ticketByKeyCommand } from '../src/ticket-by-key.js';
 
 function usage() {
   return `Usage:
-  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--group <id>] [--exclusive [--exclusive-purpose upgrade|calibration] [--exclusive-deadline <dur>]] [--no-cache] [--no-reuse] [--retry "<why>"] [--detach [--id <ticket-id>]] [--dispatch-key <key>]
+  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--group <id>] [--exclusive [--exclusive-purpose upgrade|calibration] [--exclusive-deadline <dur>]] [--no-cache] [--no-reuse] [--retry "<why>"] [--detach [--id <ticket-id>]] [--dispatch-key <key> [--json]]
            [--timeout <duration>] [--allow-local-sim] [--local] [--log <path>] -- <command...>
   lane status [--json]
   lane status --dispatch-key <key> [--json]
@@ -178,6 +178,9 @@ function parseRunArgs(args) {
         opts.log = flagArgs[++i];
         break;
       // Validated (exit 64) by runCommand; a missing value is invalid, not absent.
+      case '--json':
+        opts.json = true;
+        break;
       case '--dispatch-key':
         opts.dispatchKey = flagArgs[++i] ?? '';
         break;
@@ -308,6 +311,7 @@ async function main() {
         log: opts.log,
         ticketId: opts.ticketId,
         dispatchKey: opts.dispatchKey,
+        json: opts.json === true,
         cmd,
       });
       return result.exitCode;

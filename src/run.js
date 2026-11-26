@@ -13,9 +13,10 @@ import { resolveTicketConfig, reloadGlobalConfig, isDispatchOnly, pullConfigured
 import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.js';
 import { listQueue } from './scheduler.js';
 import { writePending } from './pending.js';
-import { dispatchKeyPullRefusal, isDispatchKey } from './dispatch-key.js';
+import { DISPATCH_KEY_HELD_ELSEWHERE_EXIT, dispatchKeyPullRefusal, heldTicketLine, isDispatchKey } from './dispatch-key.js';
 import { lookupTicketByKey } from './ticket-by-key.js';
-import { attachToHeldTicket } from './dispatch-key-attach.js';
+import { readLedger } from './pull-ledger.js';
+import { enqueueAckFile } from './pull-enqueue.js';
 import { readAttempt } from './attempts.js';
 import { waitCommand } from './wait.js';
 import { stampPriorityOrigin } from './priority-clock.js';
@@ -49,21 +50,29 @@ function sleep(ms) {
 }
 
 const KEYED_ENQUEUE_POLL_MS = 100;
+const KEYED_ENQUEUE_CAP_MS = 60_000;
 
 /**
- * PKG-438: waits for what the keyed supervisor's enqueue came to: `{id}` once the queue holds the ticket (this run's id, or the one the key already named
- * when another submit won the race), or `{exitCode, note}` when the run was refused or the supervisor ended without an answer.
+ * PKG-438: waits for what the keyed supervisor's enqueue came to. The supervisor writes the queue-chosen ticket id to a durable ack file before anything
+ * is published, so a ticket that finishes at once still tells us its id. Returns `{id}` (print it), or `{exitCode, note, held?}`: a refusal's exit, 73 when
+ * the winner is a ticket this machine did not submit, 1 when the supervisor ended without an answer, 75 when the deadline passed (`--timeout`, else a fixed cap).
  */
-async function awaitKeyedEnqueue({ root, id, resultPath, supervisorEnded }) {
+export async function awaitKeyedEnqueue({ root, id, resultPath, supervisorEnded, timeoutMs, now = Date.now }) {
   let ended = false;
   supervisorEnded.then(() => { ended = true; });
+  const deadline = now() + (timeoutMs ?? KEYED_ENQUEUE_CAP_MS);
   for (;;) {
-    const enqueue = readAttempt(root, id)?.pull?.enqueue;
-    if (enqueue?.seenRowAt) return { id };
-    if (enqueue?.heldTicketId) return { id: enqueue.heldTicketId };
+    // the result is read before the ack: the ack is always written first, so a published result implies an ack that is already there
     const published = readJsonSafe(resultPath);
+    const ack = readJsonSafe(enqueueAckFile(root, id));
+    if (ack?.ticketId === id) return { id };
+    if (ack?.ticketId) {
+      const here = readAttempt(root, ack.ticketId) !== null || fs.existsSync(path.join(paths(root).results, `${ack.ticketId}.json`)) || readLedger(root, ack.ticketId) !== null;
+      return here ? { id: ack.ticketId } : { exitCode: DISPATCH_KEY_HELD_ELSEWHERE_EXIT, held: { id: ack.ticketId }, note: `dispatch key is held by ticket ${ack.ticketId}, which this machine did not submit` };
+    }
     if (published !== null) return { exitCode: Number.isInteger(published.exit) ? published.exit : 1, note: published.error ?? `${id} ended (exit ${published.exit}) before it was queued` };
     if (ended) return { exitCode: 1, note: `the supervisor of ${id} ended before the queue answered the enqueue` };
+    if (now() >= deadline) return { exitCode: 75, note: `the queue had not answered the enqueue of ${id} within ${timeoutMs ?? KEYED_ENQUEUE_CAP_MS}ms; not failed, retry the same key` };
     await sleep(KEYED_ENQUEUE_POLL_MS);
   }
 }
@@ -366,9 +375,10 @@ export async function runCommand({
   ticketId,
   // PKG-438: `lane run --dispatch-key <key>`: a caller-supplied idempotency key (raw text, validated here, exit 64). A key the queue already holds is that ticket, whatever id this call would have made.
   dispatchKey,
+  // PKG-438: `lane run --json` prints a held ticket as one JSON object
+  json = false,
   // PKG-438 test seam: how the key is looked up in the queue
   lookupKey = lookupTicketByKey,
-  attachHeld = attachToHeldTicket,
   // BRAIN-319: called with the ticket id as soon as it exists (before the
   // supervisor is spawned, so before any child can start). Returning
   // `false` aborts the run without ever spawning the supervisor.
@@ -786,9 +796,10 @@ export async function runCommand({
     process.stderr.write(`lane run: --id "${ticketId}" must be a UUID for a remote-eligible lane\n`);
     return { exitCode: 64 };
   }
-  // PKG-438: a ticket the queue already holds under this key is this submission, and it is observed, never submitted again: this machine reports its
-  // own record of it, or else attaches to the queue ticket (no placement, no snapshot, no supervisor). A lookup that fails is not fatal: the
-  // enqueue is keyed too, and the queue refuses a second ticket under the key.
+  // PKG-438: a ticket the queue already holds under this key is this submission, so nothing is submitted again. A ticket this machine has a record of
+  // is answered from that record (`lane wait` semantics); one it never submitted is reported (id, state, host) and ended with a distinct exit, and
+  // the caller follows it through `lane status --dispatch-key` or the status view. A lookup that fails is not fatal: the enqueue is keyed too,
+  // and the queue refuses a second ticket under the key.
   if (dispatchKey !== undefined && !idOverride) {
     let held = null;
     try {
@@ -797,15 +808,18 @@ export async function runCommand({
       process.stderr.write(`lane run: dispatch key lookup failed (${err.message}); the queue will decide at enqueue\n`);
     }
     if (held !== null) {
+      const knownHere = readAttempt(root, held.id) !== null || fs.existsSync(path.join(paths(root).results, `${held.id}.json`)) || readLedger(root, held.id) !== null;
+      if (!knownHere) {
+        process.stderr.write(`lane run: dispatch key ${dispatchKey} is held by ticket ${held.id} (${held.state}), which this machine did not submit; nothing was submitted\n`);
+        process.stdout.write(heldTicketLine(dispatchKey, held, json));
+        return { exitCode: DISPATCH_KEY_HELD_ELSEWHERE_EXIT };
+      }
       process.stderr.write(`lane run: dispatch key ${dispatchKey} is ticket ${held.id} (${held.state}); not submitting again\n`);
       if (detach) {
         process.stdout.write(`${held.id}\n`);
         return { exitCode: 0 };
       }
-      if (readAttempt(root, held.id) !== null || fs.existsSync(path.join(paths(root).results, `${held.id}.json`))) return waitCommand(held.id, { timeoutMs });
-      const attached = await attachHeld({ cfg: globalCfg, root, held, timeoutMs });
-      process.stderr.write(`lane run: ${attached.note}\n`);
-      return { exitCode: attached.exitCode };
+      return waitCommand(held.id, { timeoutMs });
     }
   }
   const id = ticketId || idOverride || crypto.randomUUID();
@@ -1021,8 +1035,9 @@ export async function runCommand({
     // PKG-438: a keyed caller is told an id only once the queue has answered the enqueue, and the id is the one the queue holds for the key
     let printedId = id;
     if (dispatchKey !== undefined) {
-      const answer = await awaitKeyedEnqueue({ root, id, resultPath, supervisorEnded });
+      const answer = await awaitKeyedEnqueue({ root, id, resultPath, supervisorEnded, timeoutMs });
       if (answer.exitCode !== undefined) {
+        if (answer.held) process.stdout.write(heldTicketLine(dispatchKey, answer.held, json));
         process.stderr.write(`lane run: ${answer.note}\n`);
         return { exitCode: answer.exitCode };
       }
