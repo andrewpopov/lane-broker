@@ -49,7 +49,7 @@ export function brokerConfigReader({ log }) {
   };
 }
 
-const clampMem = (bytes) => Math.min(Math.max(0, Math.floor(bytes)), MAX_FREE_MEM);
+export const clampMem = (bytes) => Math.min(Math.max(0, Math.floor(bytes)), MAX_FREE_MEM);
 
 const readMemoryOrNull = (reader) => {
   try {
