@@ -12,12 +12,11 @@ export async function lookupTicketByKey(cfg, root, dispatchKey, { servicesFor = 
   return (await services.queue.ticketByKey(dispatchKey, options, placement)) ?? null;
 }
 
-/** PKG-439: the refusal (`{route: 'refuse', exitCode, reason}`) of a request whose applied `hostAliases` key is itself a host the queue knows, or null; an unreachable queue answers null here and is asked again at placement. Read-only. */
-export async function aliasShadow(cfg, aliasesApplied, { servicesFor = pullServices } = {}) {
+/** PKG-439: the refusal (`{route: 'refuse', exitCode, reason}`) of a request whose applied `hostAliases` key is itself a host the queue knows, or null for a clean check; an unreachable queue answers `{route: 'legacy', reason}`, an old one a 76 refusal. Read-only. */
+export async function aliasShadow(cfg, aliasesApplied, { servicesFor = pullServices, options } = {}) {
   const services = servicesFor(cfg, undefined);
-  if (!services.available) return null;
-  const answer = await shadowedAlias(services, aliasesApplied);
-  return answer?.route === 'refuse' ? answer : null;
+  if (!services.available) return { route: 'legacy', reason: `pull dispatch is not available here: ${services.reason}` };
+  return shadowedAlias(services, aliasesApplied, options);
 }
 
 /** `lane status --dispatch-key <k>`: the ticket's id, state and host. Exit 0 found, 1 none (or the queue cannot answer), 64 an invalid key. */

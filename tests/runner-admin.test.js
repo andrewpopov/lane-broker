@@ -834,8 +834,31 @@ test('the add transaction itself refuses an existing principal when --platform i
   assert.doesNotMatch(lib.roleSql({ role: 'lane_agent_evo_x2', host: 'evo-x2', password: 'x', roleExists: false, tags: [], repos: ['*'], maxClaims: 1 }), /exists/);
 });
 
+test('add --platform none is refused: none is for set-platform, and an unrestricted add never reaches the database', async () => {
+  const world = fakeWorld({ principalRow: [...RESTRICTED] });
+  const { code } = await cli(world, [...ADD, '--platform', 'none', '--apply']);
+  assert.equal(code, 2);
+  assert.equal(world.calls.length, 0);
+});
+
+test('an add re-run after a partial failure succeeds when the principal already has exactly the requested policy, and refuses one whose policy differs', async () => {
+  const same = fakeWorld({ principalRow: ['{}', '{*}', '14', 'linux'] });
+  const resumed = await cli(same, [...ADD, '--platform', 'linux', '--apply']);
+  assert.equal(resumed.code, 0, resumed.text);
+  const widened = fakeWorld({ principalRow: ['{}', '{*}', '14', 'darwin'] });
+  assert.equal((await cli(widened, [...ADD, '--platform', 'linux', '--apply'])).code, 1, 'another platform is another policy');
+  const restricted = fakeWorld({ principalRow: ['{}', '{rouge}', '14', 'linux'] });
+  assert.equal((await cli(restricted, [...ADD, '--platform', 'linux', '--apply'])).code, 1, 'other repos are another policy');
+});
+
+test('the add transaction locks the principals table before it compares policy, so no writer can slip between the check and the upsert', () => {
+  const sql = lib.roleSql({ role: 'lane_agent_evo_x2', host: 'evo-x2', password: 'x', roleExists: false, tags: [], repos: ['*'], maxClaims: 1, platform: 'linux' });
+  assert.ok(sql.indexOf('LOCK TABLE lane_dispatch.principals') !== -1 && sql.indexOf('LOCK TABLE') < sql.indexOf('exists with another policy') && sql.indexOf('exists with another policy') < sql.indexOf('ld_set_principal'));
+  assert.match(sql, /max_claims = 1 AND platform IS NOT DISTINCT FROM 'linux'/);
+});
+
 test('canary: with the existing-principal refusal removed, add --platform writes through ld_set_principal', async () => {
-  const mutant = await importMutant(LIB_FILE, ['(await ctx.psqlRows(principalSql(host), \'read principal\')).length > 0', 'false']);
+  const mutant = await importMutant(LIB_FILE, ['existing !== undefined && !sameAsRequested(existing)', 'false']);
   const world = fakeWorld({ principalRow: [...RESTRICTED] });
   const { code } = await cli(world, [...ADD, '--platform', 'linux', '--apply'], mutant);
   assert.equal(code, 0, 'the mutant resets the existing runner, which the real code refuses');

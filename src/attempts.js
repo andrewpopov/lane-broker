@@ -138,7 +138,7 @@ export const isStrandedWithdrawingMove = (attempt) =>
  *  phase 'probe'), stamped with THIS process's own identity as the owning
  *  supervisor. `runner` is not yet known at this point in the real dispatch
  *  flow (selection happens after), so it defaults to null. */
-export async function createAttempt(root, id, { runner = null, resources, logPath, cwd, key, placement, refuseIf } = {}) {
+export async function createAttempt(root, id, { runner = null, resources, logPath, cwd, key, refuseIf } = {}) {
   const attempt = {
     id,
     generation: 0,
@@ -153,8 +153,6 @@ export async function createAttempt(root, id, { runner = null, resources, logPat
     ...(cwd ? { cwd } : {}),
     // BRAIN-782: the dispatch key (`repo:lane`), so `lane status` can say what the remote run is
     ...(key ? { key } : {}),
-    // PKG-439: the canonical placement the submission asked for, so a replay of this id with another one is told apart from the same one
-    ...(placement ? { placementRequest: placement } : {}),
     startedAt: Date.now(),
     supervisor: {
       pid: process.pid,

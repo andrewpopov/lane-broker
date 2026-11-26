@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import { adoptsPlacement } from './placement.js';
 import path from 'node:path';
 import { fallbackToLocal, readAttempt, remoteCancelledResult, supervisorAlive, updateAttempt } from './attempts.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
@@ -45,7 +44,7 @@ const hook = (run, name) => run.hooks?.[name]?.();
 const lost = (reason, detail) => ({ kind: 'lost', exit: 75, reason, ...(detail ? { detail } : {}) });
 const provenNeverStarted = (pull) => pull?.withdrawProof === true || pull?.neverEnqueued === true;
 // a supervisor that died after the proof and before the fallback leaves a ticket nothing ran: the retryable refusal its host would have answered (76 where dispatch-only)
-const neverStartedDecision = (run, pull) => ({ ...lost(pull.withdrawProof === true ? 'withdrawn-never-started' : 'never-enqueued'), exit: run.envelope?.publication?.refusalExit ?? LOST_EXIT });
+const neverStartedDecision = (run, pull) => ({ ...lost(pull.withdrawProof === true ? 'withdrawn-never-started' : 'never-enqueued'), exit: pull.neverEnqueuedExit ?? run.envelope?.publication?.refusalExit ?? LOST_EXIT });
 const isQueueAuthored = (row) => row?.result?.author === 'queue' && (row.state === 'lost' || (row.state === 'cancelled' && SERVER_CANCEL_SOURCES.has(row.result.source)));
 const lostReasonOf = (row) => (QUEUE_LOST_REASONS.has(row.result?.reason) ? row.result.reason : 'runner-lost');
 
@@ -581,8 +580,6 @@ export async function preparePullTicket(ctx) {
   const run = runOf(ctx);
   const { envelopeFields, worktreeRoot, manifest } = ctx.prepare;
   const existing = readEnvelope(run.root, run.id);
-  // a retained envelope answers this id only for the placement it was made for: a placed request never reuses another's
-  if (existing !== null && !adoptsPlacement(existing.placementRequest, envelopeFields.placementRequest)) throw new Error(`pull envelope for ${run.id} was made for a different placement`);
   await persistPull(run, { stage: 'PREPARING' }, { transport: 'pull', phase: 'probe' });
   await hook(run, 'afterMarker');
   const envelope = existing ?? await createEnvelope(run.root, { ...envelopeFields, logicalId: run.id });
@@ -733,7 +730,7 @@ export async function proveNeverEnqueued(ctx) {
   return withTicketLock(run.root, run.id, async () => {
     if (readLedger(run.root, run.id) !== null) return { proof: false, ledgered: true };
     if ((readAttempt(run.root, run.id)?.pull?.enqueue?.attempts ?? []).length > 0) return { proof: false };
-    await persistPull(run, { neverEnqueued: true });
+    await persistPull(run, { neverEnqueued: true, ...(ctx.neverEnqueuedExit === undefined ? {} : { neverEnqueuedExit: ctx.neverEnqueuedExit }) });
     return { proof: true };
   }, { lockTimeoutMs: run.lockTimeoutMs });
 }

@@ -96,7 +96,10 @@ const GUARDS = {
       const t1 = await heldAndQueued(world);
       await simulateRestore(world);
       const [login, args] = entryCalls(t1)[probeName(r)];
-      await (await world.as(login)).query(`SELECT lane_dispatch.${r.proname}(${r.types.slice(0, args.length).map((type, i) => `$${i + 1}::${type}`).join(', ')})`, args).catch(() => {});
+      const fromClient = QUEUE_FUNCTIONS[r.proname] !== undefined;
+      const casts = (fromClient ? QUEUE_FUNCTIONS[r.proname].types : r.types).slice(0, args.length);
+      await (await world.as(login)).query(`SELECT lane_dispatch.${r.proname}(${casts.map((type, i) => `$${i + 1}::${type}`).join(', ')})`, args)
+        .catch((err) => { if (fromClient && err.code === '42883') throw new Error(`${r.signature}: the queue client's own casts (${casts.join(', ')}) find no such function`); });
       const { rows: [c] } = await (await world.su()).query(
         'SELECT c.incarnation, c.timeline = (SELECT timeline_id FROM pg_control_checkpoint()) AS synced FROM lane_dispatch.cluster c');
       assert.deepEqual(c, { incarnation: 1, synced: true }, `${r.signature}: cluster resynced and incarnation bumped once`);

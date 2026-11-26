@@ -51,8 +51,7 @@ import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
 import { placeForPull } from './pull-placement.js';
 import { dispatchKeyPullRefusal } from './dispatch-key.js';
-import { duplicateSubmission } from './placement-record.js';
-import { PLACEMENT_MISMATCH_SUPERVISOR_EXIT, PLACEMENT_REFUSED_EXIT, PLACEMENT_UNREACHABLE_EXIT, isConstrained, isPullOnly, placementKey, placementPullRefusal, resolvedPlacement } from './placement.js';
+import { PLACEMENT_REFUSED_EXIT, PLACEMENT_UNREACHABLE_EXIT, isConstrained, isPullOnly, placementKey, placementPullRefusal, resolvedPlacement } from './placement.js';
 import { DISPATCH_KEY_REFUSED_REASON } from './pull-enqueue.js';
 import { publicationBindings, publicationOf, refusalExitOf } from './pull-publication.js';
 import { pullContextFor } from './pull-services.js';
@@ -617,7 +616,7 @@ function returnRemoteArtifacts(root, enriched, dispatch) {
 const envelopePlacement = ({ capabilityClass, classPlatform, classTags, avoidHosts, targetHost }) => ({ capabilityClass, classPlatform, classTags, avoidHosts, targetHost });
 
 function localRefusalResult(ticket, refusal) {
-  return { id: ticket.id, ...(ticket.placementRequest ? { placementRequest: placementKey(ticket.placementRequest) } : {}), exit: refusal.exitCode, signal: null, startedAt: null, endedAt: Date.now(), waitedMs: 0, error: refusal.message.trim(), ...(refusal.failureKind ? { failureKind: refusal.failureKind } : {}) };
+  return { id: ticket.id, exit: refusal.exitCode, signal: null, startedAt: null, endedAt: Date.now(), waitedMs: 0, error: refusal.message.trim(), ...(refusal.failureKind ? { failureKind: refusal.failureKind } : {}) };
 }
 
 /**
@@ -991,11 +990,10 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   const assertPullFallbackAllowed = () => {
     if (viaPull) assertWithdrawCommitted(root, enriched.id);
   };
-  const duplicateOf = () => duplicateSubmission(root, enriched.id, enriched.placementRequest ?? null);
   if (!rebind) {
     // BRAIN-321: a retried `--id` submission is the same ticket: dedup BEFORE any probe or dispatch, under the attempt's lock.
-    const created = await createAttempt(root, enriched.id, { runner: null, resources: enriched.resources, logPath: enriched.logPath, cwd: enriched.cwd, key: enriched.key, ...(isConstrained(enriched.placementRequest) ? { placement: placementKey(enriched.placementRequest) } : {}), ...(enriched.clientId ? { refuseIf: duplicateOf } : {}) });
-    if (created.existing) process.exit(created.existing.placementMismatch ? PLACEMENT_MISMATCH_SUPERVISOR_EXIT : DUPLICATE_SUBMISSION_EXIT);
+    const created = await createAttempt(root, enriched.id, { runner: null, resources: enriched.resources, logPath: enriched.logPath, cwd: enriched.cwd, key: enriched.key, ...(enriched.clientId ? { refuseIf: () => existingTicket(root, enriched.id) } : {}) });
+    if (created.existing) process.exit(DUPLICATE_SUBMISSION_EXIT);
   }
 
   // Reuses the SAME two writers a local child's output goes through
@@ -1335,6 +1333,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     const publication = publicationOf(enriched, { placement, attemptStartedAt, refusalExit: refusalExitOf({ dispatchOnly: isDispatchOnly(globalCfg), pullOnly: isPullOnly(enriched) }, NO_RUNNER_EXIT_CODE) });
     const ctx = {
       ...pullContextFor(root, globalCfg, services, { id: enriched.id, generation: gen }),
+      ...(isConstrained(enriched.placementRequest) ? { neverEnqueuedExit: PLACEMENT_UNREACHABLE_EXIT } : {}),
       ...publicationBindings(root, publication),
       localFallback: { enabled: !isPullOnly(enriched) && pullLocalFallbackEnabled(globalCfg, enriched) && requiredToolsPresent(), couldAdmitNow: async () => (await couldAdmitNow(root, globalCfg, enriched)).admit },
       prepare: {

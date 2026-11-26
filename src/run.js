@@ -15,8 +15,8 @@ import { listQueue } from './scheduler.js';
 import { writePending } from './pending.js';
 import { DISPATCH_KEY_HELD_ELSEWHERE_EXIT, dispatchKeyPullRefusal, heldTicketLine, isDispatchKey, liveHolder } from './dispatch-key.js';
 import { aliasShadow, lookupTicketByKey } from './ticket-by-key.js';
-import { PLACEMENT_MISMATCH_SQLSTATE, PLACEMENT_MISMATCH_SUPERVISOR_EXIT, PLACEMENT_REFUSED_EXIT, PLACEMENT_USAGE_EXIT, PlacementUsageError, adoptsPlacement, canonicalPlacement, placementKeyOfView, placementPullRefusal, placementRefusal } from './placement.js';
-import { idAdoptsPlacement } from './placement-record.js';
+import { PLACEMENT_MISMATCH_SQLSTATE, PLACEMENT_REFUSED_EXIT, PLACEMENT_UNREACHABLE_EXIT, PLACEMENT_USAGE_EXIT, PlacementUsageError, adoptsPlacement, canonicalPlacement, placementKeyOfView, placementPullRefusal, placementRefusal } from './placement.js';
+import { claimSubmissionId, hasLocalRecord } from './placement-record.js';
 import { QUEUE_CONNECT_TIMEOUT_MS, QUEUE_QUERY_TIMEOUT_MS } from './queue-client.js';
 import { peekLedger } from './pull-ledger.js';
 import { enqueueAckFile } from './pull-enqueue.js';
@@ -48,6 +48,9 @@ export function parseDuration(spec) {
   return n * mult;
 }
 
+/** The alias probe's queue limits, held under what is left of a caller's `--timeout`. */
+const probeOptions = (timeoutMs) => (timeoutMs === undefined ? undefined : { attempts: 1, connectTimeoutMs: Math.max(LOOKUP_MIN_TIMEOUT_MS, Math.min(2_000, timeoutMs)), queryTimeoutMs: Math.max(LOOKUP_MIN_TIMEOUT_MS, Math.min(3_000, timeoutMs)) });
+
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -65,7 +68,7 @@ const KEYED_ENQUEUE_CAP_MS = 60_000;
  * is published, so a ticket that finishes at once still tells us its id. Returns `{id}` (print it), or `{exitCode, note, held?}`: a refusal's exit, 73 when
  * the winner is a ticket this machine did not submit, 1 when the supervisor ended without an answer, 75 when the deadline passed (`--timeout`, else a fixed cap).
  */
-export async function awaitKeyedEnqueue({ root, id, resultPath, supervisorEnded, timeoutMs, keyed = true, placement = null, now = Date.now }) {
+export async function awaitKeyedEnqueue({ root, id, resultPath, supervisorEnded, timeoutMs, keyed = true, now = Date.now }) {
   let ended = null;
   supervisorEnded.then((how) => { ended = how ?? {}; });
   const deadline = now() + (timeoutMs ?? KEYED_ENQUEUE_CAP_MS);
@@ -73,8 +76,6 @@ export async function awaitKeyedEnqueue({ root, id, resultPath, supervisorEnded,
     // the result is read before the ack: the ack is always written first, so a published result implies an ack that is already there
     const published = readJsonSafe(resultPath);
     const ack = readJsonSafe(enqueueAckFile(root, id));
-    // another submission of this id with another placement won the lock: its ack is not ours, whether or not this supervisor has been seen to end yet
-    if (ended?.code === PLACEMENT_MISMATCH_SUPERVISOR_EXIT || (ack?.ticketId === id && !idAdoptsPlacement(root, id, placement))) return { exitCode: PLACEMENT_USAGE_EXIT, note: `id ${id} was used with different placement; use a new id (or the same placement)` };
     if (ack?.ticketId === id) return { id };
     if (ack?.ticketId) {
       return heldLocally(root, ack.ticketId) ? { id: ack.ticketId } : { exitCode: DISPATCH_KEY_HELD_ELSEWHERE_EXIT, held: { id: ack.ticketId, state: ack.state, host: ack.host }, note: `dispatch key is held by ticket ${ack.ticketId}, which this machine did not submit` };
@@ -729,10 +730,16 @@ export async function runCommand({
     return { exitCode: 64 };
   }
 
-  // a host alias that is itself a known runner is refused before anything can be adopted or replayed under it
+  // one clock for `--timeout` over the alias probe, the lookup, the ack wait and the foreground wait, so no later wait gets a fresh full timeout
+  const runStartedAt = Date.now();
+  // a host alias that is itself a known runner is refused before anything can be adopted; a probe that could not reach the queue is not a clean check
   if (placement !== null && placement.aliasesApplied.length > 0) {
-    const shadowed = await shadowCheck(globalCfg, placement.aliasesApplied);
-    if (shadowed !== null) {
+    const shadowed = await shadowCheck(globalCfg, placement.aliasesApplied, { options: probeOptions(timeoutMs) });
+    if (shadowed?.route === 'legacy') {
+      process.stderr.write(`lane run: ${shadowed.reason}; nothing was submitted, retry\n`);
+      return { exitCode: PLACEMENT_UNREACHABLE_EXIT };
+    }
+    if (shadowed?.exitCode === PLACEMENT_USAGE_EXIT) {
       process.stderr.write(`lane run: ${shadowed.reason}\n`);
       return { exitCode: shadowed.exitCode };
     }
@@ -743,8 +750,6 @@ export async function runCommand({
   // is stamped, and reads only: a hit writes nothing here. The one write before it is the config reload's `classes-configured` marker (config.js
   // `setClassesFence`), made only when a `classes` block comes into or goes out of force, which happens before any run can be told apart. A lookup that fails is not fatal: the enqueue is keyed too, and the queue refuses a second
   // ticket under the key. A withdrawn view holds nothing, so it counts as no holder and the enqueue decides.
-  // one clock for `--timeout` over the lookup, the ack wait and the foreground wait, so no later wait gets a fresh full timeout
-  const runStartedAt = Date.now();
   if (dispatchKey !== undefined && !idOverride) {
     const probeRoot = stateHome();
     let held = null;
@@ -880,8 +885,9 @@ export async function runCommand({
     process.stderr.write(`lane run: --id "${ticketId}" must be a UUID for a remote-eligible lane\n`);
     return { exitCode: 64 };
   }
-  if (placement !== null && ticketId !== undefined && !idAdoptsPlacement(root, ticketId, placement)) {
-    process.stderr.write(`lane run: id ${ticketId} was used with different placement; use a new id (or the same placement)\n`);
+  // a placed submission takes its id once: any record of the id here, or another caller holding the claim, is a refusal (an id is not an idempotency key for a placement)
+  if (placement !== null && ticketId !== undefined && (hasLocalRecord(root, ticketId) || !claimSubmissionId(root, ticketId))) {
+    process.stderr.write('lane run: a placed submission needs a fresh --id; use --dispatch-key for idempotent resubmission\n');
     return { exitCode: PLACEMENT_USAGE_EXIT };
   }
   const id = ticketId || idOverride || crypto.randomUUID();
@@ -1099,7 +1105,7 @@ export async function runCommand({
     // PKG-439: so is a placed one, whose refusal (an unknown host, a queue too old) must reach the caller as an exit, not as an id
     let printedId = id;
     if (dispatchKey !== undefined || placement !== null) {
-      const answer = await awaitKeyedEnqueue({ root, id, resultPath, supervisorEnded, keyed: dispatchKey !== undefined, placement, timeoutMs: timeoutMs === undefined ? undefined : Math.max(0, timeoutMs - (Date.now() - runStartedAt)) });
+      const answer = await awaitKeyedEnqueue({ root, id, resultPath, supervisorEnded, keyed: dispatchKey !== undefined, timeoutMs: timeoutMs === undefined ? undefined : Math.max(0, timeoutMs - (Date.now() - runStartedAt)) });
       if (answer.exitCode !== undefined) {
         if (answer.held) process.stdout.write(heldTicketLine(dispatchKey, answer.held, json));
         // an unkeyed submission that the queue had not answered yet still exists: its id is the only handle on it

@@ -69,7 +69,7 @@ export function roleSql({ role, host, password, roleExists, tags, repos, maxClai
     `ALTER ROLE ${sqlIdent(role)} SET statement_timeout = '2s';`,
     `ALTER ROLE ${sqlIdent(role)} SET idle_in_transaction_session_timeout = '5s';`,
     `DO $lra$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ${sqlLit(role)} AND (rolsuper OR rolreplication OR rolbypassrls OR rolcreatedb OR rolcreaterole)) THEN RAISE EXCEPTION 'role ${role} still holds an elevated attribute'; END IF; END $lra$;`,
-    ...(platform ? [`DO $lra$ BEGIN IF EXISTS (SELECT 1 FROM lane_dispatch.principals WHERE login_role = ${sqlLit(role)}) THEN RAISE EXCEPTION 'principal ${role} exists; --platform is for a new runner, use set-platform'; END IF; END $lra$;`] : []),
+    ...(platform ? ['LOCK TABLE lane_dispatch.principals IN SHARE ROW EXCLUSIVE MODE;', `DO $lra$ BEGIN IF EXISTS (SELECT 1 FROM lane_dispatch.principals WHERE login_role = ${sqlLit(role)} AND NOT (host IS NOT DISTINCT FROM ${sqlLit(host)} AND kind = 'agent' AND tags = ${sqlTextArray(tags)} AND allowed_repos = ${sqlTextArray(repos)} AND max_claims = ${Number(maxClaims)} AND platform IS NOT DISTINCT FROM ${sqlLit(platform)})) THEN RAISE EXCEPTION 'principal ${role} exists with another policy; --platform is for a new runner, use set-platform'; END IF; END $lra$;`] : []),
     `SELECT lane_dispatch.ld_set_principal(${sqlLit(role)}, 'agent', ${sqlLit(host)}, ${sqlTextArray(tags)}, ${sqlTextArray(repos)}, ${Number(maxClaims)});`,
     ...(platform ? [`SELECT lane_dispatch.ld_set_platform(${sqlLit(host)}, ${sqlLit(platform)});`] : []),
     'COMMIT;',
@@ -714,8 +714,11 @@ function buildAddPlan(ctx) {
   const stillThere = recheckRole(ctx, role);
   const roleExists = async () => Number((await ctx.psql(roleExistsSql(role), { query: true, label: 'check role' })).stdout.trim()) > 0;
   // `--platform` is for a new runner: ld_set_principal would rewrite an existing one's tags, repos and max_claims
+  const arrayText = (items) => `{${items.join(',')}}`;
+  const sameAsRequested = (row) => row[0] === arrayText(ctx.opts.tags) && row[1] === arrayText(ctx.opts.repos) && Number(row[2]) === ctx.opts.maxClaims && row[3] === ctx.opts.platform;
   const refuseExistingForPlatform = async () => {
-    if (ctx.opts.platform && (await ctx.psqlRows(principalSql(host), 'read principal')).length > 0) throw new Error(`principal ${host} already exists: add --platform would reset its tags, repos and max_claims; change only the platform with: lane-runner-admin set-platform ${host} ${ctx.opts.platform}`);
+    const existing = ctx.opts.platform ? (await ctx.psqlRows(principalSql(host), 'read principal'))[0] : undefined;
+    if (existing !== undefined && !sameAsRequested(existing)) throw new Error(`principal ${host} already exists with another policy: add --platform would reset its tags, repos and max_claims; change only the platform with: lane-runner-admin set-platform ${host} ${ctx.opts.platform}`);
   };
   const steps = [
     {
@@ -955,6 +958,7 @@ export function parseCli(argv) {
     return opts;
   }
   if (values.force) throw new Error('--force only applies to remove');
+  if (values.platform === 'none') throw new Error('--platform none is only for set-platform; add needs darwin, linux or win32');
   validateTailnetIp(values.ip);
   const tags = csv(values.tags, []);
   const repos = csv(values.repos, ['*']);

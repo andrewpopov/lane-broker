@@ -85,10 +85,10 @@ export async function placeForPull({
 }
 
 // an alias that is itself a runner id would silently send a request for one real host to another
-export async function shadowedAlias(services, aliasesApplied) {
+export async function shadowedAlias(services, aliasesApplied, options = QUEUE_PROBE) {
   let known;
   try {
-    known = await services.queue.knownHosts(QUEUE_PROBE);
+    known = await services.queue.knownHosts(options);
   } catch (err) {
     const refusal = placementRefusal(err);
     return refusal === null ? { route: 'legacy', reason: `pull dispatch unavailable: ld_known_hosts failed: ${err.message}` } : { route: 'refuse', ...refusal };

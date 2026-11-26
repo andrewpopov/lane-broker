@@ -101,8 +101,8 @@ export function isPlacementRecord(value) {
     }
   }
   const sameList = (a, b) => a.length === b.length && a.every((item, i) => item === b[i]);
-  const hostsOk = avoidHosts.every((host) => HOST_ID_RE.test(host)) && sameList(avoidHosts, sortedUnique(avoidHosts));
-  const targetOk = targetHost === null || (HOST_ID_RE.test(targetHost) && !avoidHosts.includes(targetHost));
+  const hostsOk = avoidHosts.every((host) => typeof host === 'string' && HOST_ID_RE.test(host)) && sameList(avoidHosts, sortedUnique(avoidHosts));
+  const targetOk = targetHost === null || (typeof targetHost === 'string' && HOST_ID_RE.test(targetHost) && !avoidHosts.includes(targetHost));
   const constrained = capabilityClass !== null || avoidHosts.length > 0 || targetHost !== null;
   return capabilityClass === parsed.capabilityClass && classPlatform === parsed.classPlatform && sameList(classTags, parsed.classTags) && hostsOk && targetOk && constrained;
 }
@@ -110,5 +110,3 @@ export function isPlacementRecord(value) {
 /** What a holder placed as `held` may answer: an unconstrained request adopts any holder (it ran under a placement at least as strict), a placed one needs the exact canonical placement. */
 export const adoptsPlacement = (held, requested) => requested == null || samePlacement(held, requested);
 
-/** The exit of a supervisor that found its `--id` already used with another placement: the parent reports it as 64 even when the winner's ack is already visible. */
-export const PLACEMENT_MISMATCH_SUPERVISOR_EXIT = 90;

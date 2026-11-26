@@ -45,26 +45,31 @@ const SCENARIOS = {
   'a committed enqueue whose reply was dropped is recovered as the one row it made, with its placement': async (load, w, t) => {
     const fx = await pullFixture(t, w, { load, id: tid(5) });
     fx.envelopeFields.placementRequest = { capabilityClass: 'linux', classPlatform: 'linux', classTags: [], avoidHosts: ['x'], targetHost: 'a2' };
+    const sends = [];
+    const dropping = { ...fx.queue, enqueueFenced: async (args) => { sends.push('dropping'); await fx.queue.enqueueFenced(args); throw Object.assign(new Error('connection reset'), { name: 'QueueError' }); } };
+    const counting = { ...fx.queue, enqueueFenced: async (args) => { sends.push('real'); return fx.queue.enqueueFenced(args); } };
     await fx.prepare();
-    const dropping = { ...fx.queue, enqueueFenced: async (args) => { await fx.queue.enqueueFenced(args); throw Object.assign(new Error('connection reset'), { name: 'QueueError' }); } };
-    await fx.step();
     await fx.step({ queue: dropping }).catch(() => {});
     const rows = async () => (await (await w.su()).query('SELECT id, capability_class, avoid_hosts, target_host FROM lane_dispatch.tickets')).rows;
-    assert.deepEqual(await rows(), [{ id: tid(5), capability_class: 'linux', avoid_hosts: ['x'], target_host: 'a2' }], 'the first send committed');
-    for (let i = 0; i < 3; i++) await fx.step();
-    assert.deepEqual(await rows(), [{ id: tid(5), capability_class: 'linux', avoid_hosts: ['x'], target_host: 'a2' }], 'the recovery found it and sent nothing else');
-    assert.ok(fx.pull().enqueue.seenRowAt, 'the recovery saw the row');
+    const expected = [{ id: tid(5), capability_class: 'linux', avoid_hosts: ['x'], target_host: 'a2' }];
+    assert.deepEqual(sends, ['dropping'], 'the first send was the one whose reply was lost');
+    assert.deepEqual(await rows(), expected, 'it had committed');
+    for (let i = 0; i < 3; i++) await fx.step({ queue: counting });
+    assert.deepEqual(sends, ['dropping', 'real'], 'the recovery replayed the send once');
+    assert.deepEqual(await rows(), expected, 'and found the row it had made');
+    assert.ok(fx.pull().enqueue.seenRowAt);
   },
 
-  'a retained envelope answers its own placement only: preparing for another is refused, the same one reuses it': async (load, w, t) => {
-    const fx = await pullFixture(t, w, { load, id: tid(6) });
+  'recovery after a proven never-enqueued placed ticket publishes 75, as the live path does': async (load, w, t) => {
+    const fx = await pullFixture(t, w, { load, id: tid(7) });
     fx.envelopeFields.placementRequest = { capabilityClass: null, classPlatform: null, classTags: [], avoidHosts: [], targetHost: 'a2' };
+    fx.envelopeFields.publication = { refusalExit: 76 };
     await fx.prepare();
-    await fx.prepare();
-    fx.envelopeFields.placementRequest = { ...fx.envelopeFields.placementRequest, targetHost: 'x' };
-    await assert.rejects(fx.prepare(), /different placement/);
-    fx.envelopeFields.placementRequest = undefined;
-    await fx.prepare();
+    assert.deepEqual(await fx.proveNeverEnqueued({ neverEnqueuedExit: 75 }), { proof: true });
+    await fx.killSupervisor();
+    await fx.step();
+    assert.equal(fx.published().exit, 75);
+    assert.equal((await (await w.su()).query('SELECT count(*)::int AS n FROM lane_dispatch.tickets')).rows[0].n, 0);
   },
 
   'an unconstrained ticket keeps no placement and reports no reason while a runner can take it': async (load, w, t) => {
@@ -77,13 +82,13 @@ const SCENARIOS = {
   },
 };
 
+const NEVER = 'recovery after a proven never-enqueued placed ticket publishes 75, as the live path does';
 const REPLY = 'a committed enqueue whose reply was dropped is recovered as the one row it made, with its placement';
-const RETAINED = 'a retained envelope answers its own placement only: preparing for another is refused, the same one reuses it';
 const FIRST = 'a placed envelope is enqueued with its placement, and the poller copies why no runner can take it into the attempt until one can';
 const CANARIES = [
-  [RETAINED, 'pull-ticket.js', ['!adoptsPlacement(existing.placementRequest, envelopeFields.placementRequest)', 'false'], null, null],
   [FIRST, 'status.js', ["${r.pullUnplaceable ? ` queued (unplaceable: ${r.pullUnplaceable})` : ''}", ''], null, null],
-  [REPLY, 'pull-enqueue.js', ['...(envelope.placementRequest === undefined ? {} : placementArgs(envelope.placementRequest)),', ''], null, null],
+  [REPLY, 'pull-enqueue.js', ['view = await queue.enqueueFenced({ expectRef: ref, ...args });', 'view = await queue.enqueueFenced({ expectRef: ref, ...args, ...(intent.attempts.length > 0 ? { id: \'00000000-0000-4000-8000-0000000000ff\' } : {}) });'], null, null],
+  [NEVER, 'pull-ticket.js', ['exit: pull.neverEnqueuedExit ?? ', 'exit: '], null, null],
   ['a placed envelope is enqueued with its placement, and the poller copies why no runner can take it into the attempt until one can', 'pull-ticket.js',
     ["if (unplaceable !== (attempt.pull.unplaceable ?? null)) await persistPull(run, { unplaceable });", ''], null, /no principal runs win32|unplaceable|expected/i],
 ];
