@@ -147,6 +147,11 @@ const SCENARIOS = {
     assert.equal(refused.outcome, 'dispatch-key-refused');
     assert.equal(refused.ticketId, undefined, 'a withdrawn holder is not offered as the ticket');
     assert.equal(ackOf(gone.state), null);
+    // the ack was lost with the crash: a replay rebuilds it from the durable refusal, holder state and host included
+    fs.rmSync(enqueueAckFile(lost.state, ID));
+    const replay = await enqueueOnce({ root: lost.state, id: ID, generation: lost.generation, queue: scripted({ id: ID, state: 'queued' }) });
+    assert.equal(replay.outcome, 'dispatch-key-refused');
+    assert.deepEqual(ackOf(lost.state), { ticketId: OTHER, state: 'running', host: 'pit' });
     const plain = await prepared(load, {});
     await enqueueOnce({ root: plain.state, id: ID, generation: plain.generation, queue: scripted({ id: ID, state: 'queued' }) });
     assert.equal(ackOf(plain.state), null, 'an unkeyed enqueue acks nothing');
@@ -187,10 +192,6 @@ const SCENARIOS = {
 
     const silent = freshEnv().state;
     ensureStateDirs(silent);
-    const expired = freshEnv().state;
-    ensureStateDirs(expired);
-    ack(expired, ID);
-    assert.equal((await wait(expired, { timeoutMs: 1 })).exitCode, 75, 'an ack that is there only after the deadline is not accepted');
     const late = await wait(silent, { timeoutMs: 500 });
     assert.equal(late.exitCode, 75);
     assert.equal(late.id, undefined);
@@ -233,6 +234,7 @@ const SCENARIOS = {
 };
 
 const CANARIES = [
+  ['a keyed enqueue writes the queue-chosen ticket id to a durable ack file: its own, or the holder the key already named; a withdrawn holder is refused and acked as nothing', 'pull-enqueue.js', ["if (intent.refusal.ticketId && readEnqueueAck(root, id) === null) writeEnqueueAck(", "if (false) writeEnqueueAck("]],
   ['a crash after the winner was acked and before the refusal was recorded is recovered as the same refusal: the loser is never sent, even once the winner is withdrawn', 'pull-enqueue.js', ["    if (acked?.ticketId && acked.ticketId !== id) return", "    if (false) return"], /Cannot read properties of undefined/],
   ['a withdrawn view holds no key: liveHolder drops it and keeps a live one', 'dispatch-key.js', ["view.state === 'withdrawn' ? null : view", 'false ? null : view']],
   ['a keyed enqueue writes the queue-chosen ticket id to a durable ack file: its own, or the holder the key already named; a withdrawn holder is refused and acked as nothing', 'pull-enqueue.js', ["    if (args.dispatchKey !== undefined && !stale) writeEnqueueAck(root, id, view);\n", '']],

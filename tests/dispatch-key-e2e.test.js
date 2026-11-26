@@ -203,7 +203,7 @@ const DETACH = 'a key the queue holds for a ticket this machine knows is that ti
 const FINISHED = 'once the keyed ticket finished a foreground run reports its exit and does not run again, and lane status finds it by key';
 
 const CANARIES = [
-  [FINISHED, ...run('      return waitCommand(held.id, { timeoutMs });', '      return { exitCode: 99 };')],
+  [FINISHED, ...run('      return waitCommand(held.id, {', '      return { exitCode: 99 }; waitCommand(held.id, {')],
   [DETACH, ...run('      if (detach) {\n        process.stdout.write(`${held.id}\\n`);', '      if (false) {\n        process.stdout.write(`${held.id}\\n`);')],
   [UNSEEN, ...run('      if (!heldLocally(probeRoot, held.id)) {', '      if (false) {')],
   [ADOPTED, ...run('      if (!heldLocally(probeRoot, held.id)) {', '      if (false) {')],
