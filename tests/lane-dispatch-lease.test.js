@@ -239,7 +239,7 @@ const SEMANTICS = {
 const CANARIES = [
   ['ld_claim refuses past max_claims', 'IF v_held >= v_me.max_claims THEN', 'IF false THEN'],
   ['ld_claim never hands out a ticket whose requires_tags the principal lacks', 'p_requires_tags <@ p_tags AND ', ''],
-  ['ld_claim never hands out a ticket outside the principal allowed_repos', " AND (p_repo_key = ANY (p_allowed_repos) OR '*' = ANY (p_allowed_repos))", ''],
+  ['ld_claim never hands out a ticket outside the principal allowed_repos', "p_repo_mode <> 'enforce' OR (p_repo_name = ANY (p_allowed_repos)) IS TRUE", 'true'],
   ['ld_start refuses a ticket with cancel_requested', 'IF v_t.cancel_requested THEN RETURN false; END IF;', ''],
   ['ld_start refuses a running row whose cancel was requested', 'RETURN NOT v_t.cancel_requested;', 'RETURN true;'],
   ['ld_start refuses an expired lease', 'IF v_t.lease_until <= lane_dispatch.now() THEN RETURN false; END IF;', ''],

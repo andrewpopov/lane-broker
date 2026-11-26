@@ -9,13 +9,13 @@ import { startDispatchCluster, World, logins, call, enqueue, claim, tid } from '
 
 const AGENT_FUNCTIONS = ['ld_register', 'ld_claim', 'ld_needed_tools', 'ld_start', 'ld_heartbeat', 'ld_finish', 'ld_release', 'ld_log'];
 const SUBMIT_FUNCTIONS = ['ld_enqueue', 'ld_get', 'ld_list_mine', 'ld_withdraw', 'ld_cancel', 'ld_attach_urls', 'ld_log_read', 'ld_log_ack', 'ld_queue_ref', 'ld_enqueue_fenced', 'ld_placeable'];
-const ADMIN_FUNCTIONS = ['ld_set_principal', 'ld_reap', 'ld_restore_reset', 'ld_guard', 'ld_prune_candidates', 'ld_prune', 'ld_prune_chunks', 'ld_blobs_live'];
-const GRANTED = { agent: AGENT_FUNCTIONS, submit: SUBMIT_FUNCTIONS, admin: ADMIN_FUNCTIONS, reader: [] };
+const ADMIN_FUNCTIONS = ['ld_set_principal', 'ld_set_repo_mode', 'ld_reap', 'ld_restore_reset', 'ld_guard', 'ld_prune_candidates', 'ld_prune', 'ld_prune_chunks', 'ld_blobs_live'];
+const GRANTED = { agent: AGENT_FUNCTIONS, submit: SUBMIT_FUNCTIONS, admin: ADMIN_FUNCTIONS, reader: ['ticket_repo'] };   // the audit view calls ticket_repo as lane_reader; the function reads only its argument
 const CALLERS = { agent: logins.a1, submit: logins.s1, admin: logins.admin, reader: logins.reader, legacy: logins.legacy };
 
 async function functionAclMatrix(w) {
   const su = await w.su();
-  const { rows: functions } = await su.query("SELECT proname, pronargs FROM pg_proc WHERE pronamespace = 'lane_dispatch'::regnamespace ORDER BY proname");
+  const { rows: functions } = await su.query("SELECT oid, proname, pronargs FROM pg_proc WHERE pronamespace = 'lane_dispatch'::regnamespace ORDER BY proname, pronargs");
   const unclassified = functions.map((f) => f.proname).filter((n) => !n.startsWith('ld_') && !['ld_entry'].includes(n));
   assert.ok(unclassified.length > 0, 'internal helpers exist and must be refused to every caller');
   for (const [kind, login] of Object.entries(CALLERS)) {
@@ -23,8 +23,8 @@ async function functionAclMatrix(w) {
     const group = kind === 'legacy' ? 'agent' : kind;
     for (const f of functions) {
       const granted = GRANTED[group].includes(f.proname);
-      const { rows: [{ has }] } = await su.query(`SELECT has_function_privilege($1, 'lane_dispatch.${f.proname}'::regproc, 'EXECUTE') AS has`, [login]);
-      assert.equal(has, granted, `${login} EXECUTE on ${f.proname}`);
+      const { rows: [{ has }] } = await su.query("SELECT has_function_privilege($1, $2::oid, 'EXECUTE') AS has", [login, f.oid]);
+      assert.equal(has, granted, `${login} EXECUTE on ${f.proname}/${f.pronargs}`);
       const nulls = Array(f.pronargs).fill('NULL').join(', ');
       const attempt = c.query(`SELECT lane_dispatch.${f.proname}(${nulls})`);
       if (granted) {

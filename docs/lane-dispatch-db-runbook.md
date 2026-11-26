@@ -1,6 +1,6 @@
 # lane_dispatch database setup (cluster level)
 
-`sql/lane/migrations/005-lane-dispatch.sql`, `006-pull-simplify.sql`, `007-avoid-tags.sql`, `008-requires.sql`, `009-elastic-head-reserve.sql`, `010-claim-weight.sql`, `011-ticket-status.sql` and `sql/lane/functions.sql` create the `lane_dispatch` schema, its functions and every
+`sql/lane/migrations/005-lane-dispatch.sql`, `006-pull-simplify.sql`, `007-avoid-tags.sql`, `008-requires.sql`, `009-elastic-head-reserve.sql`, `010-claim-weight.sql`, `011-ticket-status.sql`, `012-repo-authz.sql` and `sql/lane/functions.sql` create the `lane_dispatch` schema, its functions and every
 grant that lives inside the database. `applyDatabaseAcls` (`src/lane-db.js`) revokes CONNECT, CREATE and TEMP on the current
 database from PUBLIC and grants CONNECT to the lane group roles (`lane_admin`, `lane_agent`, `lane_submit`, `lane_reader`, `train_reader`). It is opt-in (`applyMigrations(client, { databaseAcls: true })`
 or a direct call), and it throws before revoking anything when the database holds a schema other than `lane`, `lane_dispatch`
@@ -87,10 +87,10 @@ node ops/runner/lane-runner-admin.js status <host>
 
 ## Reading the queue as lane_reader
 
-`lane_reader` has no USAGE on `lane_dispatch` and no grant on its tables. Monitoring reads three views in schema `lane`, owned by
+`lane_reader` has no USAGE on `lane_dispatch` and no grant on its tables. Monitoring reads these views in schema `lane`, owned by
 `lane_definer` and granted SELECT in `sql/lane/functions.sql`, so every apply keeps them: `lane.pull_tickets` (no `claim_token`;
-the header only as `argv_md5`), `lane.pull_principals` (agent principals' `host, tags, allowed_repos, max_claims`, no
-`login_role`) and `lane.pull_runners` (`host, last_seen`). `last_seen` is liveness: `ld_register`, `ld_claim` and `ld_heartbeat`
+the header only as `argv_md5`), `lane.pull_principals` (agent principals' `host, tags, allowed_repos, max_claims, repo_mode`, no
+`login_role`), `lane.pull_runners` (`host, last_seen`) and `lane.pull_repo_audit` (below). `last_seen` is liveness: `ld_register`, `ld_claim` and `ld_heartbeat`
 all refresh it, at most once per 30 s per host, so a live agent's row is under about 45 s old (BRAIN-1301). A reader that needs another column gets it added to a view; never grant
 `lane_reader` anything in `lane_dispatch` by hand, because the next apply's REVOKE removes it (BRAIN-1154).
 
@@ -195,6 +195,14 @@ Then re-apply `functions.sql` as `lane_migrate` (the command under *Applying mig
 **Late results.** `ld_finish` keeps its answer and its fence. When the ticket is already terminal (`finished`, `cancelled`, `withdrawn`, `lost`), the call is not an idempotent replay, and the caller's host, epoch and token match an `attempts` row, the result (minus `author` when it is a JSON object; a scalar or null is stored as is) is stored in `late_result` with `late_result_at`, latest wins. The state and `result` never change: the first terminal wins.
 
 **Log missing.** Each `ld_reap` marks `log_state = 'missing'`, once, on a `finished` ticket with no `result->>'logSha256'` that finished more than 10 minutes and less than 24 hours ago, and sends `log-missing`. It runs under the `cluster` row lock like the rest of the reaper. A ticket that finished more than 24 hours ago is never marked, so the first reap after migration 011 sends no burst of old events.
+
+## Repo authorization (migration 012, BRAIN-1116)
+
+`principals.repo_mode` is `open`, `audit` or `enforce`. **open** and **audit** ignore `allowed_repos` (both claim any repo; `audit` is the staging mode before enforce and behaves as `open` for now). **enforce** claims only a ticket whose repo name the list names: `*` names nothing, an empty list claims nothing. The migration sets every agent that exists to `open`, so applying it changes nothing a runner sees; a principal created afterwards starts at `enforce`. The repo name is `header->>'repoName'` as the submitter stamped it (`lane_dispatch.ticket_repo(header)`); a ticket with no name is `adhoc`, and only a runner whose list names `adhoc` takes it under enforce. Tool discovery (`ld_needed_tools`), both selects of `ld_claim`, `scarcity` and `ld_placeable` all go through the one `lane_dispatch.eligible(tags, name, ptags, list, mode)`. `ld_placeable(text, text[])` (a submitter that sends no name) scores the ticket as `adhoc`; `ld_placeable(text, text[], text)` takes the name.
+
+`ld_set_principal` has a 7-argument form with the mode; the 6-argument form (an older `lane-runner-admin`) keeps an existing principal's mode and gives a new one `enforce`. `ld_set_repo_mode(host, mode)` changes one agent's mode and nothing else: the per-host rollback is `SELECT lane_dispatch.ld_set_repo_mode('<host>', 'open');`. A per-row trigger on `principals` refuses `*` in the list of an enforcing principal, and a change to enforce or to the list that leaves an enforcing list empty; a row whose mode and list are unchanged passes (a credential re-add, tags, `max_claims`), and a new principal may start enforcing an empty list. A new host added by an older `lane-runner-admin` with `*` is refused, and its transaction rolls back.
+
+`lane.pull_repo_audit` (read by `lane_reader`; `lane_admin` holds SELECT only) counts the tickets that are queued, held (`claimed`, `running`), `quarantined`, or finished/cancelled/withdrawn/lost in the last 15 minutes, per `repo`, `named` (false when the header carries no name), `submitter` (`tickets.owner`, a role name), `submitter_version` (`header->>'brokerVersion'`), `state`, `host`, `covered_configured` (some agent with `max_claims > 0` has the tags and lists the repo, modes ignored), `covered_live` (the same agent was seen in the last 10 minutes) and `holder_would_deny` (the host holding the ticket does not list the repo, or has no principal). Each state is one branch of a `UNION ALL`, so each uses its partial index (`tickets_queued`, `tickets_held`, `tickets_quarantined`, `tickets_terminal_recent`), and coverage is worked out once per distinct `(repo, requires_tags)`. The view calls `ticket_repo`, so `lane_reader` holds EXECUTE on that one pure function.
 
 ## Weight-aware claims and requeue (migration 010, BRAIN-1106)
 

@@ -7,8 +7,9 @@ import { startDispatchCluster, World, logins, enqueue, claim, tid } from './lane
 
 const VIEWS = {
   pull_tickets: ['id', 'repo_key', 'lane', 'state', 'host', 'cpu_cores', 'requeues', 'result', 'created_at', 'started_at', 'finished_at', 'requires_tags', 'argv_md5'],
-  pull_principals: ['host', 'tags', 'allowed_repos', 'max_claims'],
+  pull_principals: ['host', 'tags', 'allowed_repos', 'max_claims', 'repo_mode'],
   pull_runners: ['host', 'last_seen'],
+  pull_repo_audit: ['repo', 'named', 'submitter', 'submitter_version', 'state', 'host', 'covered_configured', 'covered_live', 'holder_would_deny', 'n'],
 };
 
 async function viewColumns(su, view) {
@@ -63,12 +64,12 @@ describe('lane_reader pull-queue views (BRAIN-1154)', { skip: pgSkipOption, time
 
   test('a functions.sql re-apply restores a revoked view grant, and a re-apply without the grant line leaves the reader refused', async () => {
     const su = await world.su();
-    await su.query('REVOKE SELECT ON lane.pull_tickets, lane.pull_principals, lane.pull_runners FROM lane_reader');
+    await su.query('REVOKE SELECT ON lane.pull_tickets, lane.pull_principals, lane.pull_runners, lane.pull_repo_audit FROM lane_reader');
     await applyMigrations(su);
     await readerCanReadEveryView(world);
 
-    const dropGrant = (sql, file) => (file === 'functions.sql' ? sql.replace(/^\s*GRANT SELECT ON lane\.pull_tickets.*$/m, '') : sql);
-    await su.query('REVOKE SELECT ON lane.pull_tickets, lane.pull_principals, lane.pull_runners FROM lane_reader');
+    const dropGrant = (sql, file) => (file === 'functions.sql' ? sql.replace(/^\s*GRANT SELECT ON lane\.pull_(tickets|repo_audit).*$/gm, '') : sql);
+    await su.query('REVOKE SELECT ON lane.pull_tickets, lane.pull_principals, lane.pull_runners, lane.pull_repo_audit FROM lane_reader');
     await applyMigrations(su, { transform: dropGrant });
     const reader = await world.as(logins.reader);
     for (const view of Object.keys(VIEWS)) {
