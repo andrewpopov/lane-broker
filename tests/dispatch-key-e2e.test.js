@@ -65,6 +65,8 @@ const SCENARIOS = {
     const nothingHere = () => {
       for (const dir of [paths(fx.state).attempts, paths(fx.state).results, paths(fx.state).pull]) assert.deepEqual(fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f !== 'readiness.json') : [], [], `${dir} was written`);
     };
+    const listing = (dir) => (fs.existsSync(dir) ? fs.readdirSync(dir, { recursive: true }).sort().join('|') : 'absent');
+    const before = listing(fx.state);
     for (const extra of [[], ['--detach']]) {
       const res = await fx.lane(['run', '--repo', 'r', '--lane', 'default', ...extra, ...keyed, '--', 'true']);
       assert.equal(res.code, 73, res.stderr);
@@ -74,6 +76,7 @@ const SCENARIOS = {
     const json = await fx.lane(['run', '--repo', 'r', '--lane', 'default', '--json', ...keyed, '--', 'true']);
     assert.deepEqual([json.code, JSON.parse(json.stdout)], [73, { dispatchKey: KEY, id: held, state: 'queued', host: null }]);
     nothingHere();
+    assert.equal(listing(fx.state), before, 'the state directory is exactly as it was: nothing was created or stamped');
     assert.deepEqual(fx.supervisorExits(), []);
     assert.equal(await ticketCount(w), 1);
   },
@@ -102,18 +105,25 @@ const SCENARIOS = {
     assert.deepEqual(JSON.parse(status.stdout), { dispatchKey: KEY, found: true, id, state: 'finished', host: 'a2' }, 'the caller follows it through status');
   },
 
-  'a detached caller that loses the key to a ticket another machine submitted exits 73 with that id, and prints no id of its own': async (load, w, t) => {
+  'a caller, detached or foreground, that loses the key to a ticket another machine submitted exits 73 with that holder printed (id, state, host), and prints no id of its own': async (load, w, t) => {
     const fx = await pullE2E(t, w, { load, localPaused: true });
-    fx.stub.delayMatching = (method, pathname) => (method === 'PUT' && pathname.includes('/streams/') ? 4000 : 0);
-    const held = crypto.randomUUID();
-    const detaching = fx.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', ...keyed, '--', 'true']);
-    // the lookup missed and the snapshot is uploading: another machine's submit takes the key now
-    await until(async () => fs.existsSync(paths(fx.state).attempts) && fs.readdirSync(paths(fx.state).attempts).length > 0);
-    await enqueue(await w.as(logins.s1), held, { dispatchKey: KEY });
-    const res = await detaching;
-    assert.equal(res.code, 73, res.stderr);
-    assert.equal(res.stdout, `${held} - -\n`);
-    assert.equal(await ticketCount(w), 1);
+    fx.stub.delayMatching = (method, pathname) => (method === 'PUT' && pathname.includes('/streams/') ? 3000 : 0);
+    for (const [n, extra] of [[1, ['--detach']], [2, []], [3, ['--json']]]) {
+      const key = `${KEY}:${n}`;
+      const held = crypto.randomUUID();
+      const attemptFiles = () => (fs.existsSync(paths(fx.state).attempts) ? fs.readdirSync(paths(fx.state).attempts) : []);
+      const attemptsBefore = new Set(attemptFiles());
+      const running = fx.lane(['run', '--repo', 'r', '--lane', 'default', ...extra, '--dispatch-key', key, '--', 'true']);
+      // the lookup missed and the snapshot is uploading: another machine's submit takes the key now, and its runner already has it
+      await until(async () => attemptFiles().some((file) => !attemptsBefore.has(file)));
+      await enqueue(await w.as(logins.s1), held, { dispatchKey: key });
+      await (await w.su()).query("UPDATE lane_dispatch.tickets SET state = 'running', host = 'pit', claim_token = gen_random_uuid(), lease_until = now() + interval '1 hour' WHERE id = $1", [held]);
+      const res = await running;
+      assert.equal(res.code, 73, `${extra}: ${res.stderr}`);
+      if (extra[0] === '--json') assert.deepEqual(JSON.parse(res.stdout), { dispatchKey: key, id: held, state: 'running', host: 'pit' });
+      else assert.equal(res.stdout, `${held} running pit\n`, `${extra}`);
+    }
+    assert.equal(await ticketCount(w), 3);
   },
 
   'a keyed refusal is published from the attempt as it is, never after the move to local: a supervisor parked at the refusal still holds a non-local attempt': async (load, w, t) => {
@@ -187,7 +197,7 @@ const supervisor = (from, to) => ['supervisor.js', [from, to]];
 const pullEnqueue = (from, to) => ['pull-enqueue.js', [from, to]];
 const UNSEEN = 'a key the queue holds for a ticket this machine never submitted ends 73 with its id, state and host printed, and writes, polls and starts nothing';
 const ADOPTED = 'a finished ticket this machine never submitted, with a different checkout here, ends 73 naming its state and host: the original result is not re-validated, cached or re-run';
-const REMOTE_LOSER = 'a detached caller that loses the key to a ticket another machine submitted exits 73 with that id, and prints no id of its own';
+const REMOTE_LOSER = 'a caller, detached or foreground, that loses the key to a ticket another machine submitted exits 73 with that holder printed (id, state, host), and prints no id of its own';
 const KEYED_REFUSAL = 'a keyed refusal is published from the attempt as it is, never after the move to local: a supervisor parked at the refusal still holds a non-local attempt';
 const DETACH = 'a key the queue holds for a ticket this machine knows is that ticket: a second detach prints its id and starts nothing';
 const FINISHED = 'once the keyed ticket finished a foreground run reports its exit and does not run again, and lane status finds it by key';
@@ -195,12 +205,14 @@ const FINISHED = 'once the keyed ticket finished a foreground run reports its ex
 const CANARIES = [
   [FINISHED, ...run('      return waitCommand(held.id, { timeoutMs });', '      return { exitCode: 99 };')],
   [DETACH, ...run('      if (detach) {\n        process.stdout.write(`${held.id}\\n`);', '      if (false) {\n        process.stdout.write(`${held.id}\\n`);')],
-  [UNSEEN, ...run('      if (!knownHere) {', '      if (false) {')],
-  [ADOPTED, ...run('      if (!knownHere) {', '      if (false) {')],
-  [REMOTE_LOSER, ...run('      return here ? { id: ack.ticketId } : {', '      return true ? { id: ack.ticketId } : {')],
+  [UNSEEN, ...run('      if (!heldLocally(probeRoot, held.id)) {', '      if (false) {')],
+  [ADOPTED, ...run('      if (!heldLocally(probeRoot, held.id)) {', '      if (false) {')],
+  [REMOTE_LOSER, ...run('      return heldLocally(root, ack.ticketId) ? { id: ack.ticketId } : {', '      return true ? { id: ack.ticketId } : {')],
+  [REMOTE_LOSER, ...run('      if (collided?.ticketId && collided.ticketId !== id) {', '      if (false) {')],
+  [UNSEEN, ...run('    const probeRoot = stateHome();', '    const probeRoot = ensureStateDirs().root;')],
   [KEYED_REFUSAL, ...supervisor('      await testHoldAt(\'keyed-refusal\');\n      await publishAndExit(gen, () => localRefusalResult(enriched, refusal));', '      await fallbackToLocal(root, enriched.id, reason);\n      await testHoldAt(\'keyed-refusal\');\n      await publishAndExit(gen + 1, () => localRefusalResult(enriched, refusal));')],
   ['two detached callers racing on one key print the same ticket id, and the command is queued once', ...run('      printedId = answer.id;', '      printedId = id;')],
-  ['two detached callers racing on one key print the same ticket id, and the command is queued once', ...run('      return here ? { id: ack.ticketId } : {', '      return here ? { id } : {')],
+  ['two detached callers racing on one key print the same ticket id, and the command is queued once', ...run('      return heldLocally(root, ack.ticketId) ? { id: ack.ticketId } : {', '      return heldLocally(root, ack.ticketId) ? { id } : {')],
   ['a keyed run that would run locally is refused 76 "dispatch key needs the pull queue" and nothing runs or queues', ...supervisor('    if (enriched.dispatchKey) {\n      const refusal', '    if (false) {\n      const refusal')],
   ['a keyed run a push runner would take is refused 76 and the runner is never used', ...supervisor("if (enriched.dispatchKey && route.route !== 'pull')", 'if (false)')],
   ['a keyed run with pull dispatch off is refused 76 before a supervisor starts', ...run('if (!remoteEligible || !pullConfigured(globalCfg)) {', 'if (false) {')],

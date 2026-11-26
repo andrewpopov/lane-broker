@@ -21,6 +21,9 @@ export const heldTicketLine = (dispatchKey, { id, state, host }, json) => (json 
 export const DISPATCH_KEY_HELD_SQLSTATE = 'LK409';
 const UNDEFINED_FUNCTION_SQLSTATE = '42883';
 
+/** A ticket view that holds the key: a withdrawn one has given it up (a withdrawal can commit between the queue's lookup and its read of the view). */
+export const liveHolder = (view) => (view == null || view.state === 'withdrawn' ? null : view);
+
 export const isDispatchKey = (value) => typeof value === 'string' && DISPATCH_KEY_RE.test(value);
 
 /**
