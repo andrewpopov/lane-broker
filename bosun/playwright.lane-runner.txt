@@ -1,6 +1,3 @@
 # Playwright versions the train repos pin (package-lock.json); each needs its own browser build (BRAIN-1157).
-# Installed by runner-prereqs.sh --install. Add a version when a repo bumps Playwright.
-1.61.1
-1.62.1
-1.63.0
-1.64.1
+# Installed by runner-prereqs.sh --install. The fleet pins exactly one version (BRAIN-1346); move it here first.
+1.65.1
