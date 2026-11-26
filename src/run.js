@@ -682,15 +682,18 @@ export async function runCommand({
       });
       return { exitCode: REFUSED_KNOWN_RED_EXIT };
     }
-    const hit = decision.action === 'serve' ? decision.row : null;
+    const served = decision.action === 'serve' ? decision.row : null;
+    // BRAIN-1204: a caller that passed `--log` reads the output afterwards (a gate looks for its completion line), so a pass whose log is gone is not served.
+    const sourceLog = served ? [served.logPath, path.join(paths(root).logs, `${served.id}.log`)].find((candidate) => candidate && fs.existsSync(candidate)) : undefined;
+    const hit = served && (!log || sourceLog) ? served : null;
     if (hit) {
       const cachedLine = `lane: cached pass from ${hit.id} at ${new Date(hit.endedAt).toISOString()} (pass --no-cache to re-run)\n`;
       process.stderr.write(cachedLine);
-      // BRAIN-558: a gate that checks `--log` is non-empty after exit 0 must see a record of the cached answer too.
       if (log) {
-        const sourceLog = path.join(paths(root).logs, `${hit.id}.log`);
         fs.mkdirSync(path.dirname(log), { recursive: true });
-        fs.appendFileSync(log, cachedLine + (fs.existsSync(sourceLog) ? `source log: ${sourceLog}\n` : ''));
+        fs.appendFileSync(log, cachedLine);
+        // The original run may have written to this very path, where its output is already.
+        if (path.resolve(sourceLog) !== path.resolve(log)) fs.appendFileSync(log, fs.readFileSync(sourceLog));
       }
       appendHistory(root, {
         id: crypto.randomUUID(),

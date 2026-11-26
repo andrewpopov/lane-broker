@@ -2857,7 +2857,10 @@ factor is 1.0 (no calibration) and is printed.
 
 `lane run` answers from history when the same command already **passed** on byte-identical worktree content: it prints
 `lane: cached pass from <id> at <time> (pass --no-cache to re-run)` to stderr, exits `0` without running anything, and
-appends a history row with `cachedFrom: <id>` and `runMs: 0` (so `lane report cost` counts no work for it). The lookup
+appends a history row with `cachedFrom: <id>` and `runMs: 0` (so `lane report cost` counts no work for it).
+With `--log <path>` (BRAIN-1204) the cached-pass line and then the source run's recorded output (its `--log` file, else its
+state-dir log) are written to that path, so a gate that looks for a completion line there finds it. A pass whose log no longer
+exists is not served to a `--log` caller: the command runs. The lookup
 happens before admission: no ticket, no queue, no lease.
 
 The content key is a sha256 over: the lane key (repo + lane), the command fingerprint (argv and cwd), HEAD's tree, the

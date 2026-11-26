@@ -253,6 +253,34 @@ test('BRAIN-558: a cached answer writes a non-empty --log naming the source run'
   assert.match(written, new RegExp(`lane: cached pass from ${original.id} at `));
 });
 
+test('BRAIN-1204: a cached answer copies the source run output into --log', async () => {
+  const t = setup();
+  const script = 'echo x >> "$0"; echo gate-complete';
+  const first = await t.lane([], { script });
+  assert.equal(first.code, 0, first.stderr);
+  await t.settled(1);
+  const logFile = path.join(t.base, 'out', 'gate.log');
+  const second = await t.lane(['--log', logFile], { script });
+  assert.equal(second.code, 0, second.stderr);
+  assert.equal(t.runs(), 1, 'the child must not have run again');
+  const written = fs.readFileSync(logFile, 'utf8');
+  assert.match(written, /lane: cached pass from /);
+  assert.match(written, /^gate-complete$/m);
+});
+
+test('BRAIN-1204: a pass whose log is gone is not served to a --log caller, so the command runs', async () => {
+  const t = setup();
+  const first = await t.lane();
+  assert.equal(first.code, 0, first.stderr);
+  await t.settled(1);
+  fs.rmSync(path.join(t.state, 'logs', `${t.rows()[0].id}.log`));
+  const logFile = path.join(t.base, 'out', 'gate.log');
+  const second = await t.lane(['--log', logFile]);
+  assert.equal(second.code, 0, second.stderr);
+  assert.equal(t.runs(), 2, 'with no log to hand over the command must run');
+  assert.doesNotMatch(second.stderr, /cached pass/);
+});
+
 // ---------------------------------------------------------------- BRAIN-700: known-red refusal
 
 const NOW = 10_000_000;
