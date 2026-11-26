@@ -819,8 +819,8 @@ BEGIN
       RETURN lane_dispatch.ticket_view(v_held.id, session_user);
     END IF;
   END IF;
-  -- a second try only when the holder that beat this insert is already gone (withdrawn in between): the key is free again
-  FOR v_try IN 1..2 LOOP
+  -- another try (up to three) only when the holder that beat this insert is already gone (withdrawn in between): the key is free again
+  FOR v_try IN 1..3 LOOP
     BEGIN
       INSERT INTO lane_dispatch.tickets (id, owner, repo_key, lane, lane_key, binding, header, snapshot, requires_tags, cpu_cores, memory_bytes, priority, incarnation,
                                          min_protocol, ages, source, est_run_s, avoid_tags, requires, min_cpu_cores, dispatch_key, created_at, status_changed_at)
@@ -834,7 +834,7 @@ BEGIN
       -- only the key index can raise here (the id conflict is absorbed above): a concurrent submit with this key committed first, so its ticket is the answer
       SELECT h.id, h.owner INTO v_held FROM lane_dispatch.key_holder(p_dispatch_key) h;
       IF NOT FOUND THEN
-        IF v_try = 2 THEN RAISE; END IF;
+        IF v_try = 3 THEN RAISE; END IF;
         CONTINUE;
       END IF;
       IF v_held.owner <> session_user THEN RAISE EXCEPTION 'dispatch key % is held by another owner', p_dispatch_key USING ERRCODE = 'LK409'; END IF;

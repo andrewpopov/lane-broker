@@ -70,22 +70,25 @@ const GUARDS = {
     assert.equal(await rowCount(w), 1);
   },
 
-  'a submit whose holder is gone by the time the loser looks it up retries the insert once, and still answers with a holder that is there': async (w) => {
+  'a submit whose holder keeps vanishing between the violation and the lookup retries up to three times, answers with the holder it then finds, and raises only when the key never settles': async (w) => {
     const holder = await enqueue(await w.as(logins.s1), tid(1), { dispatchKey: KEY });
-    // the lookup misses twice, as it does when the winner is withdrawn between the violation and the read, and then sees the holder
-    await (await w.su()).query(`
-      CREATE OR REPLACE FUNCTION lane_dispatch.key_holder(p_dispatch_key text) RETURNS TABLE (id uuid, owner text)
-      LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
-      DECLARE n int;
-      BEGIN
-        n := coalesce(nullif(current_setting('lane.kh_calls', true), '')::int, 0) + 1;
-        PERFORM set_config('lane.kh_calls', n::text, false);
-        IF n > 2 THEN
-          RETURN QUERY SELECT t.id, t.owner FROM lane_dispatch.tickets t WHERE t.dispatch_key = p_dispatch_key AND t.state <> 'withdrawn';
-        END IF;
-      END $$`);
-    const fresh = await w.cluster.client(w.db, logins.s1);
-    assert.deepEqual(await enqueue(fresh, tid(2), { dispatchKey: KEY }), holder);
+    // the lookup misses (the early read, then two handler reads), as it does when winners are withdrawn in between, and then sees the holder
+    const lookupMisses = async (misses) => {
+      await (await w.su()).query(`
+        CREATE OR REPLACE FUNCTION lane_dispatch.key_holder(p_dispatch_key text) RETURNS TABLE (id uuid, owner text)
+        LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+        DECLARE n int;
+        BEGIN
+          n := coalesce(nullif(current_setting('lane.kh_calls', true), '')::int, 0) + 1;
+          PERFORM set_config('lane.kh_calls', n::text, false);
+          IF n > ${misses} THEN
+            RETURN QUERY SELECT t.id, t.owner FROM lane_dispatch.tickets t WHERE t.dispatch_key = p_dispatch_key AND t.state <> 'withdrawn';
+          END IF;
+        END $$`);
+      return w.cluster.client(w.db, logins.s1);
+    };
+    assert.deepEqual(await enqueue(await lookupMisses(3), tid(2), { dispatchKey: KEY }), holder);
+    await assert.rejects(enqueue(await lookupMisses(4), tid(3), { dispatchKey: KEY }), (err) => err.code === '23505');
     assert.equal(await rowCount(w), 1);
   },
 
@@ -181,7 +184,7 @@ const SQL_CANARIES = [
   ['a key held by one of the callers live tickets wins over an id that belongs to an unkeyed ticket', "IF p_dispatch_key IS NOT NULL AND EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.dispatch_key IS DISTINCT FROM p_dispatch_key) THEN", 'IF false THEN'],
   ['another owner holding the key is refused with its own SQLSTATE, not the id conflict, and inserts nothing', "    IF FOUND THEN\n      IF v_held.owner <> session_user THEN", "    IF FOUND THEN\n      IF false THEN"],
   ['a concurrent submit from another owner loses the race with the distinct refusal', "      END IF;\n      IF v_held.owner <> session_user THEN", "      END IF;\n      IF false THEN"],
-  ['a submit whose holder is gone by the time the loser looks it up retries the insert once, and still answers with a holder that is there', 'IF v_try = 2 THEN RAISE; END IF;', 'RAISE;'],
+  ['a submit whose holder keeps vanishing between the violation and the lookup retries up to three times, answers with the holder it then finds, and raises only when the key never settles', 'IF v_try = 3 THEN RAISE; END IF;', 'RAISE;'],
   ['a withdrawn row frees the key for a new ticket', "WHERE t.dispatch_key = p_dispatch_key AND t.state <> 'withdrawn';", 'WHERE t.dispatch_key = p_dispatch_key;'],
   ['a withdrawn row frees the key for a new ticket', "WHERE dispatch_key IS NOT NULL AND state <> 'withdrawn';", 'WHERE dispatch_key IS NOT NULL;'],
   ['a withdrawn row that is the only holder reads as no ticket by key', "WHERE t.dispatch_key = p_dispatch_key AND t.state <> 'withdrawn';", 'WHERE t.dispatch_key = p_dispatch_key;'],

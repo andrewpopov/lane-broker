@@ -1103,6 +1103,15 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   async function fallbackOrRefuse(runner, reason, { rebindable = false, retryWhenBlocked = false, neverStarted = false, noRunner = false, retryable = noRunner, failureKind } = {}) {
     assertPullFallbackAllowed();
     if (rebind) return abandonRebind(runner, reason, { neverStarted: neverStarted || withdrawn === null });
+    // PKG-438: a keyed submission is found again by its key in the pull queue, so it never runs anywhere else. Its refusal is published from the attempt as it
+    // is, never after the move to local: a supervisor that died in between would leave an abandoned local attempt, which recovery publishes as 75.
+    if (enriched.dispatchKey) {
+      const refusal = dispatchKeyPullRefusal(enriched.lane, reason);
+      process.stderr.write(refusal.message);
+      await testHoldAt('keyed-refusal');
+      await publishAndExit(gen, () => localRefusalResult(enriched, refusal));
+      return { fallback: false };
+    }
     const fb = movedByPullFallback ? { ok: true, attempt: readAttempt(root, enriched.id) } : await fallbackToLocal(root, enriched.id, reason);
     if (!fb.ok) {
       if (fb.cancelled) {
@@ -1112,14 +1121,6 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
         return { fallback: false };
       }
       throw new Error(`lane-broker supervisor: could not fall back to local for ${enriched.id} (attempt record missing)`);
-    }
-
-    // PKG-438: a keyed submission is found again by its key in the pull queue, so it never runs anywhere else
-    if (enriched.dispatchKey) {
-      const refusal = dispatchKeyPullRefusal(enriched.lane, reason);
-      process.stderr.write(refusal.message);
-      await publishAndExit(fb.attempt.generation, () => localRefusalResult(enriched, refusal));
-      return { fallback: false };
     }
 
     const dispatchOnly = isDispatchOnly(globalCfg);

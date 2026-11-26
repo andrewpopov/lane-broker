@@ -8,7 +8,7 @@ import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 import { pullE2E } from './helpers/pull-e2e.js';
 import { pgSkipOption } from './lane-db-harness.js';
 import { startDispatchCluster, World, logins, enqueue, downgradeToV9 } from './lane-dispatch-fixture.js';
-import { scaledMs } from './helpers.js';
+import { laneRun, scaledMs } from './helpers.js';
 
 /** PKG-438: `lane run --dispatch-key` through a real supervisor against a disposable queue. */
 
@@ -16,6 +16,9 @@ const KEY = 'train:r:3:1';
 const keyed = ['--dispatch-key', KEY];
 const ticketCount = async (w) => (await (await w.su()).query('SELECT count(*)::int AS n FROM lane_dispatch.tickets')).rows[0].n;
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function until(fn, timeoutMs = 60_000) {
+  for (const deadline = Date.now() + scaledMs(timeoutMs); !(await fn()); await sleep(100)) if (Date.now() > deadline) assert.fail('timed out waiting');
+}
 
 const SCENARIOS = {
   'a key the queue holds for a ticket this machine knows is that ticket: a second detach prints its id and starts nothing': async (load, w, t) => {
@@ -41,7 +44,6 @@ const SCENARIOS = {
     const rerun = await fx.run(fx.markLocalRun, keyed);
     assert.equal(rerun.code, 3, rerun.stderr);
     assert.match(rerun.stderr, new RegExp(`dispatch key ${KEY} is ticket ${id}`));
-    assert.doesNotMatch(rerun.stderr, /finished with exit/, 'this machine answered from its own record, without attaching to the queue');
     assert.equal(fx.ranLocally(), false);
     assert.equal(await ticketCount(w), 1, 'the resubmit queued nothing');
     await sleep(1500);
@@ -56,21 +58,27 @@ const SCENARIOS = {
     assert.equal((await fx.run(['true'], [...keyed, '--detach', '--id', crypto.randomUUID()])).code, 64);
   },
 
-  'a key the queue holds for a ticket this machine has never seen is observed, not run again: a detach prints its id, and no attempt or supervisor starts here': async (load, w, t) => {
+  'a key the queue holds for a ticket this machine never submitted ends 73 with its id, state and host printed, and writes, polls and starts nothing': async (load, w, t) => {
     const fx = await pullE2E(t, w, { load, localPaused: true });
     const held = crypto.randomUUID();
     await enqueue(await w.as(logins.s1), held, { dispatchKey: KEY });
-    const started = await fx.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', ...keyed, '--', 'true']);
-    assert.equal(started.code, 0, started.stderr);
-    assert.equal(started.stdout.trim(), held);
-    await sleep(1500);
-    assert.equal(fx.attempt(held), null, 'no local attempt was made for the held ticket');
+    const nothingHere = () => {
+      for (const dir of [paths(fx.state).attempts, paths(fx.state).results, paths(fx.state).pull]) assert.deepEqual(fs.existsSync(dir) ? fs.readdirSync(dir).filter((f) => f !== 'readiness.json') : [], [], `${dir} was written`);
+    };
+    for (const extra of [[], ['--detach']]) {
+      const res = await fx.lane(['run', '--repo', 'r', '--lane', 'default', ...extra, ...keyed, '--', 'true']);
+      assert.equal(res.code, 73, res.stderr);
+      assert.equal(res.stdout, `${held} queued -\n`);
+      assert.match(res.stderr, /did not submit/);
+    }
+    const json = await fx.lane(['run', '--repo', 'r', '--lane', 'default', '--json', ...keyed, '--', 'true']);
+    assert.deepEqual([json.code, JSON.parse(json.stdout)], [73, { dispatchKey: KEY, id: held, state: 'queued', host: null }]);
+    nothingHere();
     assert.deepEqual(fx.supervisorExits(), []);
-    assert.equal(fs.existsSync(paths(fx.state).attempts) ? fs.readdirSync(paths(fx.state).attempts).length : 0, 0, 'no supervisor was started for anything');
     assert.equal(await ticketCount(w), 1);
   },
 
-  'a finished ticket adopted from an empty state directory with a different checkout reports the original result, queues nothing and starts no supervisor': async (load, w, t) => {
+  'a finished ticket this machine never submitted, with a different checkout here, ends 73 naming its state and host: the original result is not re-validated, cached or re-run': async (load, w, t) => {
     const fx = await pullE2E(t, w, { load, localPaused: true });
     const id = await fx.detach(['true'], keyed);
     await fx.enqueued();
@@ -79,18 +87,50 @@ const SCENARIOS = {
     await sleep(1500);
     assert.deepEqual(fx.supervisorExits(), [3]);
     // this machine forgets the ticket, and the checkout is no longer the one that was submitted
-    for (const file of [path.join(paths(fx.state).results, `${id}.json`), path.join(paths(fx.state).attempts, `${id}.json`), path.join(paths(fx.state).pull, id)]) fs.rmSync(file, { recursive: true, force: true });
+    for (const file of [path.join(paths(fx.state).results, `${id}.json`), path.join(paths(fx.state).attempts, `${id}.json`), path.join(paths(fx.state).pull, id), path.join(paths(fx.state).pullLedger, `${id}.json`)]) fs.rmSync(file, { recursive: true, force: true });
     fs.writeFileSync(path.join(fx.repoDir, 'changed.txt'), 'a different checkout\n');
     const rerun = await fx.run(fx.markLocalRun, keyed);
-    assert.equal(rerun.code, 3, rerun.stderr);
-    assert.match(rerun.stderr, new RegExp(`ticket ${id} finished with exit 3`));
+    assert.equal(rerun.code, 73, rerun.stderr);
+    assert.equal(rerun.stdout, `${id} finished a2\n`);
     assert.equal(fx.ranLocally(), false);
     assert.equal(await ticketCount(w), 1);
     await sleep(1500);
     assert.deepEqual(fx.supervisorExits(), [3], 'no second supervisor was started');
-    assert.equal(fx.attempt(id), null, 'no attempt was made for it');
-    assert.equal(readJsonSafe(path.join(paths(fx.state).results, `${id}.json`)).exit, 3, 'the result is kept here, so a later run answers from it');
-    assert.equal((await fx.run(fx.markLocalRun, keyed)).code, 3);
+    assert.equal(fx.attempt(id), null);
+    assert.equal(fs.existsSync(path.join(paths(fx.state).results, `${id}.json`)), false, 'nothing was written for the ticket');
+    const status = await fx.lane(['status', '--dispatch-key', KEY, '--json']);
+    assert.deepEqual(JSON.parse(status.stdout), { dispatchKey: KEY, found: true, id, state: 'finished', host: 'a2' }, 'the caller follows it through status');
+  },
+
+  'a detached caller that loses the key to a ticket another machine submitted exits 73 with that id, and prints no id of its own': async (load, w, t) => {
+    const fx = await pullE2E(t, w, { load, localPaused: true });
+    fx.stub.delayMatching = (method, pathname) => (method === 'PUT' && pathname.includes('/streams/') ? 4000 : 0);
+    const held = crypto.randomUUID();
+    const detaching = fx.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', ...keyed, '--', 'true']);
+    // the lookup missed and the snapshot is uploading: another machine's submit takes the key now
+    await until(async () => fs.existsSync(paths(fx.state).attempts) && fs.readdirSync(paths(fx.state).attempts).length > 0);
+    await enqueue(await w.as(logins.s1), held, { dispatchKey: KEY });
+    const res = await detaching;
+    assert.equal(res.code, 73, res.stderr);
+    assert.equal(res.stdout, `${held} - -\n`);
+    assert.equal(await ticketCount(w), 1);
+  },
+
+  'a keyed refusal is published from the attempt as it is, never after the move to local: a supervisor parked at the refusal still holds a non-local attempt': async (load, w, t) => {
+    const fx = await pullE2E(t, w, { load });
+    const dir = path.dirname(fx.state);
+    const [ready, go] = [path.join(dir, 'keyed-ready'), path.join(dir, 'keyed-go')];
+    const env = { ...fx.env, LANE_BROKER_TEST_HOLD_AT: 'keyed-refusal', LANE_BROKER_TEST_HOLD_READY: ready, LANE_BROKER_TEST_HOLD_GO: go };
+    t.after(() => fs.writeFileSync(go, 'x'));
+    const running = laneRun(['run', '--repo', 'r', '--lane', 'default', ...keyed, '--', ...fx.markLocalRun], { env, cwd: fx.repoDir, bin: load.laneBin });
+    await until(async () => fs.existsSync(ready));
+    const [file] = fs.readdirSync(paths(fx.state).attempts);
+    const attempt = fx.attempt(file.replace('.json', ''));
+    assert.notEqual(attempt.executor, 'local', 'the attempt was not moved to local before the refusal');
+    fs.writeFileSync(go, 'x');
+    const res = await running;
+    assert.equal(res.code, 76, res.stderr);
+    assert.equal(fx.ranLocally(), false);
   },
 
   'two detached callers racing on one key print the same ticket id, and the command is queued once': async (load, w, t) => {
@@ -145,18 +185,22 @@ const SCENARIOS = {
 const run = (from, to) => ['run.js', [from, to]];
 const supervisor = (from, to) => ['supervisor.js', [from, to]];
 const pullEnqueue = (from, to) => ['pull-enqueue.js', [from, to]];
-const UNSEEN = 'a key the queue holds for a ticket this machine has never seen is observed, not run again: a detach prints its id, and no attempt or supervisor starts here';
-const ADOPTED = 'a finished ticket adopted from an empty state directory with a different checkout reports the original result, queues nothing and starts no supervisor';
+const UNSEEN = 'a key the queue holds for a ticket this machine never submitted ends 73 with its id, state and host printed, and writes, polls and starts nothing';
+const ADOPTED = 'a finished ticket this machine never submitted, with a different checkout here, ends 73 naming its state and host: the original result is not re-validated, cached or re-run';
+const REMOTE_LOSER = 'a detached caller that loses the key to a ticket another machine submitted exits 73 with that id, and prints no id of its own';
+const KEYED_REFUSAL = 'a keyed refusal is published from the attempt as it is, never after the move to local: a supervisor parked at the refusal still holds a non-local attempt';
 const DETACH = 'a key the queue holds for a ticket this machine knows is that ticket: a second detach prints its id and starts nothing';
 const FINISHED = 'once the keyed ticket finished a foreground run reports its exit and does not run again, and lane status finds it by key';
 
 const CANARIES = [
-  [FINISHED, ...run('if (readAttempt(root, held.id) !== null || fs.existsSync(path.join(paths(root).results, `${held.id}.json`))) return waitCommand(held.id, { timeoutMs });', 'if (false) return waitCommand(held.id, { timeoutMs });')],
+  [FINISHED, ...run('      return waitCommand(held.id, { timeoutMs });', '      return { exitCode: 99 };')],
   [DETACH, ...run('      if (detach) {\n        process.stdout.write(`${held.id}\\n`);', '      if (false) {\n        process.stdout.write(`${held.id}\\n`);')],
-  [UNSEEN, ...run('    if (held !== null) {\n      process.stderr.write(`lane run: dispatch key', '    if (false) {\n      process.stderr.write(`lane run: dispatch key')],
-  [ADOPTED, ...run('    if (held !== null) {\n      process.stderr.write(`lane run: dispatch key', '    if (false) {\n      process.stderr.write(`lane run: dispatch key')],
+  [UNSEEN, ...run('      if (!knownHere) {', '      if (false) {')],
+  [ADOPTED, ...run('      if (!knownHere) {', '      if (false) {')],
+  [REMOTE_LOSER, ...run('      return here ? { id: ack.ticketId } : {', '      return true ? { id: ack.ticketId } : {')],
+  [KEYED_REFUSAL, ...supervisor('      await testHoldAt(\'keyed-refusal\');\n      await publishAndExit(gen, () => localRefusalResult(enriched, refusal));', '      await fallbackToLocal(root, enriched.id, reason);\n      await testHoldAt(\'keyed-refusal\');\n      await publishAndExit(gen + 1, () => localRefusalResult(enriched, refusal));')],
   ['two detached callers racing on one key print the same ticket id, and the command is queued once', ...run('      printedId = answer.id;', '      printedId = id;')],
-  ['two detached callers racing on one key print the same ticket id, and the command is queued once', ...run('    if (enqueue?.heldTicketId) return { id: enqueue.heldTicketId };\n', '')],
+  ['two detached callers racing on one key print the same ticket id, and the command is queued once', ...run('      return here ? { id: ack.ticketId } : {', '      return here ? { id } : {')],
   ['a keyed run that would run locally is refused 76 "dispatch key needs the pull queue" and nothing runs or queues', ...supervisor('    if (enriched.dispatchKey) {\n      const refusal', '    if (false) {\n      const refusal')],
   ['a keyed run a push runner would take is refused 76 and the runner is never used', ...supervisor("if (enriched.dispatchKey && route.route !== 'pull')", 'if (false)')],
   ['a keyed run with pull dispatch off is refused 76 before a supervisor starts', ...run('if (!remoteEligible || !pullConfigured(globalCfg)) {', 'if (false) {')],
