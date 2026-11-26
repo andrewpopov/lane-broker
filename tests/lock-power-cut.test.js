@@ -88,7 +88,8 @@ async function acquisitionEvents(load, { contend = false } = {}) {
   if (contend) {
     const lockDir = paths(state).lock;
     fs.mkdirSync(lockDir);
-    fs.writeFileSync(path.join(lockDir, 'owner.json'), JSON.stringify({ pid: process.pid, token: 'someone-else', start: null, at: Date.now() }));
+    // An unreadable owner is the one held state in which a contender still stages and loses the rename (a live owner is waited on without staging, PKG-462).
+    fs.writeFileSync(path.join(lockDir, 'owner.json'), '');
   }
   const events = [];
   const { fsyncSync, renameSync, openSync } = fs;
