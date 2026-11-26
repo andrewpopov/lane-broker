@@ -13,7 +13,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 brewfile="$here/Brewfile.lane-runner"
 wheels="$here/requirements.lane-runner.txt"
 playwrights="$here/playwright.lane-runner.txt"
-browsers="chromium chromium-headless-shell"
+browsers="chromium chromium-headless-shell webkit"
 mode=""
 os=${RUNNER_PREREQS_UNAME:-$(uname -s)}
 case "$os" in
