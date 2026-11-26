@@ -289,7 +289,7 @@ const CANARIES = [
   ['ld_log caps one call at 256 KiB', 'IF v_len > 262144 THEN', 'IF false THEN'],
   ['ld_log caps the whole table at 1 GiB', '+ v_len > 1073741824 THEN', '+ v_len > 1073741824000 THEN'],
   ['a restore settles every non-terminal ticket lost with a queue-authored result and a finish time, keeps terminal rows, and clears every claim request',
-    "   WHERE state NOT IN ('finished','cancelled','withdrawn','lost');\n  GET DIAGNOSTICS v_lost", "   WHERE false;\n  GET DIAGNOSTICS v_lost"],
+    " WHERE state NOT IN ('finished','cancelled','withdrawn','lost') RETURNING id)", " WHERE false RETURNING id)"],
   ['a restore settles every non-terminal ticket lost with a queue-authored result and a finish time, keeps terminal rows, and clears every claim request',
     "DELETE FROM lane_dispatch.claim_requests;\n  RETURN v_lost;", "RETURN v_lost;"],
   ['a restore settles every non-terminal ticket lost with a queue-authored result and a finish time, keeps terminal rows, and clears every claim request',
@@ -301,7 +301,7 @@ const CANARIES = [
   ['ld_restore_reset settles every non-terminal ticket lost on an unchanged timeline, bumps the incarnation and clears claim requests; only the admin may call it',
     "lane_dispatch.ld_restore_reset(), lane_dispatch.ld_guard(interval)", "lane_dispatch.ld_guard(interval)"],
   ['ld_start racing the restore: either order ends lost with the same epoch, token and host',
-    "   WHERE state NOT IN ('finished','cancelled','withdrawn','lost');\n  GET DIAGNOSTICS v_lost", "   WHERE state = 'queued';\n  GET DIAGNOSTICS v_lost"],
+    " WHERE state NOT IN ('finished','cancelled','withdrawn','lost') RETURNING id)", " WHERE state = 'queued' RETURNING id)"],
   ['concurrent callers that both find the restore settle once: one incarnation bump',
     "IF v_timeline <> (SELECT c.timeline FROM lane_dispatch.cluster c WHERE c.id = 1) THEN\n    PERFORM lane_dispatch.settle_restore(v_timeline);\n  END IF;", "PERFORM lane_dispatch.settle_restore(v_timeline);"],
 ];

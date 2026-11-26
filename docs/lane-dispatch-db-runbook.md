@@ -1,8 +1,8 @@
 # lane_dispatch database setup (cluster level)
 
-`sql/lane/migrations/005-lane-dispatch.sql`, `006-pull-simplify.sql`, `007-avoid-tags.sql`, `008-requires.sql`, `009-elastic-head-reserve.sql`, `010-claim-weight.sql` and `sql/lane/functions.sql` create the `lane_dispatch` schema, its functions and every
+`sql/lane/migrations/005-lane-dispatch.sql`, `006-pull-simplify.sql`, `007-avoid-tags.sql`, `008-requires.sql`, `009-elastic-head-reserve.sql`, `010-claim-weight.sql`, `011-ticket-status.sql` and `sql/lane/functions.sql` create the `lane_dispatch` schema, its functions and every
 grant that lives inside the database. `applyDatabaseAcls` (`src/lane-db.js`) revokes CONNECT, CREATE and TEMP on the current
-database from PUBLIC and grants CONNECT to the four lane group roles. It is opt-in (`applyMigrations(client, { databaseAcls: true })`
+database from PUBLIC and grants CONNECT to the lane group roles (`lane_admin`, `lane_agent`, `lane_submit`, `lane_reader`, `train_reader`). It is opt-in (`applyMigrations(client, { databaseAcls: true })`
 or a direct call), and it throws before revoking anything when the database holds a schema other than `lane`, `lane_dispatch`
 and `public`, or any object in `public`, so it refuses a shared application database. Design:
 `agent_brain/knowledge/lane-pull-dispatch.md` section 2.
@@ -163,6 +163,38 @@ Retention is admin-only (`lane_admin` login, run by `lane pull gc`; none of thes
 When this database is unreachable from a host that sets `lanePull.localFallbackWhenUnreachable`, that host runs its pull-eligible lanes locally instead of waiting out `queueUnreachableAfterMs` (README, pull dispatch: *Local fallback while the queue is unreachable*). Its marker is `<state>/pull/queue-health.json`; `lane status` shows `pull queue: unreachable since <time>` while it is set. The cancel a moved ticket owes its row is delivered by the same sweep as the `queue-unreachable` one, so a queue that comes back cancels the stale row (a row a runner already claimed is told to stop).
 
 One unit on pitelite runs the client side (templates in `ops/pull/`): `lane-pull-gc.timer` hourly (`lane-pull-gc.service`, an admin login whose password `/etc/lane-pull/gc-admin.pass` is root:root 0600 and reaches only that unit through `LoadCredential=`, with the submitter password `/etc/lane-pull/submit.pass` hidden from it by `InaccessiblePaths=`). There is no tender unit: a dead supervisor's ticket is settled by the reconcile sweep, `lane wait` or `lane cancel`. **`train-lane-runner-watch.timer` (every 60 s, `lane runner watch`, which calls `sweepOrphans`) is required for pull**: it settles those tickets, sends the cancel a ticket owes its row after a queue outage (`<state>/pull/<id>/cancel-owed.json`) and is the only thing that does so unattended; keep it enabled on every host that runs `lane run` for pull. `lane pull gc` passes `rows_after = lanePull.rowRetentionMs` (default 7 days) and refuses a smaller `--rows-after`, because the client's enqueue horizon assumes a row survives that long. Paging state is `<state>/pull/gc-state.json`. gc also expires local state: a ticket's ledger entry and `pull/<id>/` (envelope, staged copies) after `lanePull.ledgerRetentionMs` (default 45 days; the config refuses below 35 days, the queue's backup retention), never while an attempt record exists.
+
+## Ticket status for merge-train (migration 011, PKG-437)
+
+`011-ticket-status.sql` adds four `lane_dispatch.tickets` columns: `late_result jsonb`, `late_result_at timestamptz`, `log_state text` (null or `missing`) and `status_changed_at timestamptz` (stamped at every transition). `train_reader` is a NOLOGIN group role holding USAGE on schema `lane` and SELECT on `lane.ticket_status_v1`, nothing else: no table, no `ld_*` function, no USAGE on `lane_dispatch` (grants in `functions.sql`, so every apply keeps them, and only once the role exists). The production login that gets `train_reader` is cluster-level and out of this repo's scope (zirkbot `cluster.toml`); until it is mapped, nothing logs in as the role.
+
+**Provisioning `train_reader` (once per cluster).** The migration creates the role only when the applier is a superuser or has CREATEROLE; `lane_migrate` has neither, so on pitelite it skips the role with a NOTICE and still applies the columns. Then a superuser (or a CREATEROLE role) runs once, and the database owner or a superuser grants CONNECT, because `applyMigrations` leaves database ACLs alone (`databaseAcls` is false) and PUBLIC has no CONNECT:
+
+```sql
+CREATE ROLE train_reader NOLOGIN;
+GRANT CONNECT ON DATABASE lane_queue_db TO train_reader;
+```
+
+Then re-apply `functions.sql` as `lane_migrate` (the command under *Applying migrations*; a run with nothing new prints `"applied":[]` and re-applies it), which grants the role. An explicit `applyDatabaseAcls` by an authorized role also grants CONNECT, to every lane group role that exists. A login whose only membership is `train_reader` can then connect and select the view (`tests/lane-dispatch-ticket-status.test.js`, the provisioning case).
+
+`lane_admin` holds SELECT only on `lane.ticket_status_v1`, `lane.pull_tickets`, `lane.pull_principals` and `lane.pull_runners`: they are single-table views, so the blanket `GRANT ALL` on schema `lane` would let it write ticket state through them past the fence; `functions.sql` revokes that after the blanket grant.
+
+`lane.ticket_status_v1` has these columns, in this order, and the list is final for `_v1` (a change is a `_v2`): `dispatch_key` (always NULL until PKG-438 fills it in place), `ticket_id`, `repo_key`, `lane`, `state`, `claim_generation` (the `epoch`), `host`, `lease_until`, `result` (as stored), `log_ready`, `log_sha256`, `log_state`, `late_result_at`, `updated_at`. It never carries `claim_token`, the header or the snapshot. `log_ready` is `result->>'logSha256' IS NOT NULL`: the agent uploads the log and puts the hash in the result before `ld_finish`. `updated_at` is `greatest(status_changed_at, late_result_at)`: `status_changed_at` is stamped at every transition (enqueue, claim, start, finish, requeue, cancel, withdraw, lost, restore) and at the log-missing mark, so it never moves backwards and a reader may use it as a change cursor. A held `ld_cancel` and a heartbeat change nothing in the view and do not move it.
+
+**Change events.** Each transition sends `pg_notify('lane_ticket_events', json)` from `lane_dispatch.notify_ticket(id, state, epoch, reason)`, called explicitly in the transaction that makes the change (a rollback sends nothing). The payload is `{"ticket": id, "state": ..., "epoch": n, "reason": ... | null, "repo": ..., "lane": ...}`, `repo` and `lane` cut to 200 characters. This is a new contract and is distinct from the empty-payload hint channels above (`ld_work`, `ld_host_*`), which stay empty. `state` is one of:
+
+- `claimed` (`ld_claim`) and `running` (`ld_start`), both without a reason;
+- `finished`, or `cancelled` when the result's kind is `cancelled` (`ld_finish`; the reason is the result kind), and `cancelled` with reason `cancel-confirmed` (`ld_release` of a running row);
+- `queued` (a claim returned to the queue, with reason `released-never-started`, `released-cancel-confirmed`, `lease-expired` or `supervisor-died-while-queued`; `epoch` is the attempt that ended, the next `claimed` carries epoch + 1), and `cancelled` or `lost` (`release-cap`) from the same return path;
+- `cancelled` with reason `cancelled-while-queued` (`ld_cancel` of an unheld row) and `withdrawn` (`ld_withdraw`);
+- `lost` with reason `runner-lost` (`ld_reap`) or `queue-restored` (a restore);
+- `log-missing` (`ld_reap`, reason `no-log-sha256`).
+
+`ld_cancel` of a held row only sets `cancel_requested` and sends no event; `cancelled` follows at the real transition. `ld_enqueue`'s insert and `ld_prune` send none. The events are untrusted hints: any connected queue login can LISTEN on the channel (and so see other submitters' ticket ids, repos, lanes and outcomes) and any connected login can NOTIFY on it, so a reader must confirm the state in the view before acting, and the payload carries only ids, repo, lane, state, epoch and reason. NOTIFY is lossy for a listener that is down, so a reader must also poll the view, and a pruned row vanishes: a reader treats a ticket missing from the view as terminal and pruned.
+
+**Late results.** `ld_finish` keeps its answer and its fence. When the ticket is already terminal (`finished`, `cancelled`, `withdrawn`, `lost`), the call is not an idempotent replay, and the caller's host, epoch and token match an `attempts` row, the result (minus `author` when it is a JSON object; a scalar or null is stored as is) is stored in `late_result` with `late_result_at`, latest wins. The state and `result` never change: the first terminal wins.
+
+**Log missing.** Each `ld_reap` marks `log_state = 'missing'`, once, on a `finished` ticket with no `result->>'logSha256'` that finished more than 10 minutes and less than 24 hours ago, and sends `log-missing`. It runs under the `cluster` row lock like the rest of the reaper. A ticket that finished more than 24 hours ago is never marked, so the first reap after migration 011 sends no burst of old events.
 
 ## Weight-aware claims and requeue (migration 010, BRAIN-1106)
 

@@ -603,6 +603,8 @@ DROP FUNCTION IF EXISTS lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, 
 DROP FUNCTION IF EXISTS lane_dispatch.ld_claim(uuid, real, bigint, text[], text[]);
 -- BRAIN-1106 (migration 010) adds the trailing p_free_weight, p_weight_limit to ld_claim.
 DROP FUNCTION IF EXISTS lane_dispatch.ld_claim(uuid, real, bigint, text[], text[], real, bigint);
+-- PKG-437 adds the trailing p_reason to return_to_queue (an internal function; no caller outside this file).
+DROP FUNCTION IF EXISTS lane_dispatch.return_to_queue(uuid, timestamptz);
 
 -- Every clock read in lane_dispatch goes through now(). The GUC lane.test_now moves it for tests, but only when the value is the one stored by ALTER DATABASE or
 -- ALTER ROLE (pg_db_role_setting): a session SET to anything else, which any login can issue, is ignored, so a runner cannot move the queue's clock.
@@ -633,15 +635,29 @@ BEGIN
   RETURN jsonb_build_object('kind', 'lost', 'reason', p_reason, 'author', 'queue', 'epoch', p_epoch);
 END $$;
 
+-- PKG-437: the JSON change event for a ticket, on channel lane_ticket_events. Unlike the empty-payload hint channels (ld_work, ld_host_*) this payload is
+-- a contract: merge-train reads it. Called at each transition site in the transaction that makes the change, so a rollback sends nothing. repo and lane are
+-- cut so the payload stays far under pg_notify's 8000-byte limit (an oversized payload would abort the transition).
+CREATE OR REPLACE FUNCTION lane_dispatch.notify_ticket(p_id uuid, p_state text, p_epoch int, p_reason text) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+BEGIN
+  PERFORM pg_notify('lane_ticket_events', (SELECT jsonb_build_object('ticket', p_id, 'state', p_state, 'epoch', p_epoch, 'reason', left(p_reason, 200),
+                                                                     'repo', left(t.repo_key, 200), 'lane', left(t.lane, 200))::text
+                                             FROM lane_dispatch.tickets t WHERE t.id = p_id));
+END $$;
+
 -- A restore settles every non-terminal ticket lost and forgets every claim request; runners are fenced on their next heartbeat. The caller holds the cluster row lock.
 CREATE OR REPLACE FUNCTION lane_dispatch.settle_restore(p_timeline int) RETURNS int
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
-DECLARE v_lost int;
+DECLARE v_lost int; v_id uuid;
 BEGIN
   UPDATE lane_dispatch.cluster SET timeline = p_timeline, incarnation = incarnation + 1 WHERE id = 1;
-  UPDATE lane_dispatch.tickets SET state = 'lost', finished_at = lane_dispatch.now(), result = lane_dispatch.lost_result('queue-restored', epoch)
-   WHERE state NOT IN ('finished','cancelled','withdrawn','lost');
-  GET DIAGNOSTICS v_lost = ROW_COUNT;
+  v_lost := 0;
+  FOR v_id IN WITH u AS (UPDATE lane_dispatch.tickets SET state = 'lost', finished_at = lane_dispatch.now(), status_changed_at = lane_dispatch.now(), result = lane_dispatch.lost_result('queue-restored', epoch)
+                          WHERE state NOT IN ('finished','cancelled','withdrawn','lost') RETURNING id) SELECT u.id FROM u LOOP
+    PERFORM lane_dispatch.notify_ticket(v_id, 'lost', (SELECT t.epoch FROM lane_dispatch.tickets t WHERE t.id = v_id), 'queue-restored');
+    v_lost := v_lost + 1;
+  END LOOP;
   DELETE FROM lane_dispatch.claim_requests;
   RETURN v_lost;
 END $$;
@@ -783,10 +799,10 @@ BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT * INTO v_me FROM lane_dispatch.me('submit');
   INSERT INTO lane_dispatch.tickets (id, owner, repo_key, lane, lane_key, binding, header, snapshot, requires_tags, cpu_cores, memory_bytes, priority, incarnation,
-                                     min_protocol, ages, source, est_run_s, avoid_tags, requires, min_cpu_cores, created_at)
+                                     min_protocol, ages, source, est_run_s, avoid_tags, requires, min_cpu_cores, created_at, status_changed_at)
     VALUES (p_id, session_user, p_repo_key, p_lane, p_lane_key, p_binding, p_header, p_snapshot, coalesce(p_requires_tags, '{}'), p_cpu_cores, p_memory_bytes,
             coalesce(p_priority, 0), (SELECT c.incarnation FROM lane_dispatch.cluster c), coalesce(p_min_protocol, 1), coalesce(p_ages, true), p_source, p_est_run_s,
-            coalesce(p_avoid_tags, '{}'), coalesce(p_requires, '{}'), CASE WHEN p_min_cpu_cores < p_cpu_cores THEN p_min_cpu_cores END, lane_dispatch.now())
+            coalesce(p_avoid_tags, '{}'), coalesce(p_requires, '{}'), CASE WHEN p_min_cpu_cores < p_cpu_cores THEN p_min_cpu_cores END, lane_dispatch.now(), lane_dispatch.now())
     ON CONFLICT (id) DO NOTHING;
   IF FOUND THEN PERFORM pg_notify('ld_work', ''); END IF;
   IF NOT EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user) THEN
@@ -818,14 +834,15 @@ END $$;
 
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_withdraw(p_id uuid) RETURNS text
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
-DECLARE v_me record; v_state text;
+DECLARE v_me record; v_state text; v_epoch int;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT * INTO v_me FROM lane_dispatch.me('submit');
-  SELECT t.state INTO v_state FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user FOR UPDATE;
+  SELECT t.state, t.epoch INTO v_state, v_epoch FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user FOR UPDATE;
   IF NOT FOUND THEN RETURN 'missing'; END IF;
   IF v_state = 'queued' THEN
-    UPDATE lane_dispatch.tickets SET state = 'withdrawn', finished_at = lane_dispatch.now() WHERE id = p_id;
+    UPDATE lane_dispatch.tickets SET state = 'withdrawn', finished_at = lane_dispatch.now(), status_changed_at = lane_dispatch.now() WHERE id = p_id;
+    PERFORM lane_dispatch.notify_ticket(p_id, 'withdrawn', v_epoch, NULL);
     RETURN 'withdrawn';
   END IF;
   RETURN v_state;
@@ -840,9 +857,10 @@ BEGIN
   SELECT t.state, t.cancel_requested, t.claim_token, t.host, t.epoch, t.result INTO v_t FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user FOR UPDATE;
   IF NOT FOUND THEN RETURN jsonb_build_object('state', 'missing', 'cancel_requested', false, 'confirmed', false); END IF;
   IF v_t.state = 'queued' THEN
-    UPDATE lane_dispatch.tickets SET state = 'cancelled', cancel_requested = true, finished_at = lane_dispatch.now(),
+    UPDATE lane_dispatch.tickets SET state = 'cancelled', cancel_requested = true, finished_at = lane_dispatch.now(), status_changed_at = lane_dispatch.now(),
            result = jsonb_build_object('kind', 'cancelled', 'cancelConfirmed', true, 'source', 'queued', 'epoch', v_t.epoch, 'author', 'queue')
      WHERE id = p_id;
+    PERFORM lane_dispatch.notify_ticket(p_id, 'cancelled', v_t.epoch, 'cancelled-while-queued');
     RETURN jsonb_build_object('state', 'cancelled', 'cancel_requested', true, 'confirmed', true);
   END IF;
   IF v_t.state IN ('claimed','running') THEN
@@ -958,10 +976,11 @@ BEGIN
   END IF;
   v_id := v_t.id;
   v_grant := CASE WHEN v_t.cpu_cores <= p_free_cpu THEN v_t.cpu_cores ELSE greatest(v_t.need, floor(p_free_cpu)) END;
-  UPDATE lane_dispatch.tickets SET state = 'claimed', epoch = epoch + 1, claim_token = v_token, host = v_me.host, lease_until = v_now + interval '120 seconds',
+  UPDATE lane_dispatch.tickets SET state = 'claimed', epoch = epoch + 1, claim_token = v_token, host = v_me.host, status_changed_at = v_now, lease_until = v_now + interval '120 seconds',
          claimed_cpu_cores = v_grant
    WHERE id = v_id RETURNING epoch INTO v_epoch;
   INSERT INTO lane_dispatch.attempts (ticket, epoch, host, claim_token) VALUES (v_id, v_epoch, v_me.host, v_token);
+  PERFORM lane_dispatch.notify_ticket(v_id, 'claimed', v_epoch, NULL);
   INSERT INTO lane_dispatch.claim_requests (login_role, req, ticket, epoch, claim_token) VALUES (session_user, p_req, v_id, v_epoch, v_token);
   RETURN lane_dispatch.claim_view(v_id, v_epoch, v_token);
 END $$;
@@ -988,7 +1007,8 @@ BEGIN
   IF v_t.state <> 'claimed' THEN RETURN false; END IF;
   IF v_t.cancel_requested THEN RETURN false; END IF;
   IF v_t.lease_until <= lane_dispatch.now() THEN RETURN false; END IF;
-  UPDATE lane_dispatch.tickets SET state = 'running', started_at = lane_dispatch.now(), lease_until = lane_dispatch.now() + interval '120 seconds' WHERE id = p_id;
+  UPDATE lane_dispatch.tickets SET state = 'running', started_at = lane_dispatch.now(), status_changed_at = lane_dispatch.now(), lease_until = lane_dispatch.now() + interval '120 seconds' WHERE id = p_id;
+  PERFORM lane_dispatch.notify_ticket(p_id, 'running', p_epoch, NULL);
   RETURN true;
 END $$;
 
@@ -1019,7 +1039,7 @@ BEGIN
     v_dead := coalesce(p_result->>'kind' = 'unfinished' AND p_result->>'reason' = 'supervisor-died-while-queued' AND p_result->>'neverStarted' = 'true', false);
     IF v_dead AND NOT v_t.cancel_requested THEN
       IF v_t.requeues < 3 THEN
-        v_state := lane_dispatch.return_to_queue(p_id, lane_dispatch.now());
+        v_state := lane_dispatch.return_to_queue(p_id, lane_dispatch.now(), 'supervisor-died-while-queued');
         PERFORM pg_notify('ld_work', '');
         RETURN jsonb_build_object('fenced', false, 'state', v_state);
       END IF;
@@ -1030,29 +1050,37 @@ BEGIN
       p_result := (p_result - 'guard' - 'reason' - 'noProgressTimeoutMs' - 'silenceTimeoutMs' - 'runLimitMs') || jsonb_build_object('kind', 'cancelled', 'exit', null, 'cancelConfirmed', true);
     END IF;
     v_state := CASE WHEN p_result->>'kind' = 'cancelled' THEN 'cancelled' ELSE 'finished' END;
-    UPDATE lane_dispatch.tickets SET state = v_state, result = (p_result - 'author') || jsonb_build_object('epoch', p_epoch), finished_at = lane_dispatch.now() WHERE id = p_id;
+    UPDATE lane_dispatch.tickets SET state = v_state, result = (p_result - 'author') || jsonb_build_object('epoch', p_epoch), finished_at = lane_dispatch.now(), status_changed_at = lane_dispatch.now() WHERE id = p_id;
+    PERFORM lane_dispatch.notify_ticket(p_id, v_state, p_epoch, p_result->>'kind');
     RETURN jsonb_build_object('fenced', false, 'state', v_state);
   END IF;
   IF v_t.state IN ('finished','cancelled') AND v_t.result IS NOT NULL AND v_t.epoch = p_epoch AND v_t.claim_token = p_token AND v_t.host = v_me.host THEN
     RETURN jsonb_build_object('fenced', false, 'state', v_t.state);
   END IF;
+  -- PKG-437: a result that arrives after the ticket settled (lost, cancelled, ...) is kept for diagnostics, never applied: the state stays. Only an
+  -- attempt this agent really held is kept, so a guessed id and epoch store nothing. Latest wins.
+  IF v_t.state IN ('finished','cancelled','withdrawn','lost')
+     AND EXISTS (SELECT 1 FROM lane_dispatch.attempts a WHERE a.ticket = p_id AND a.epoch = p_epoch AND a.claim_token = p_token AND a.host = v_me.host) THEN
+    UPDATE lane_dispatch.tickets SET late_result = CASE WHEN jsonb_typeof(p_result) = 'object' THEN p_result - 'author' ELSE p_result END, late_result_at = lane_dispatch.now() WHERE id = p_id;
+  END IF;
   RETURN jsonb_build_object('fenced', true, 'state', v_t.state);
 END $$;
 
 -- A claimed ticket that goes back to the queue (release or lease expiry), the one place the requeue cap and backoff live. The caller holds the row lock.
--- Returns the state it settled: cancelled when a cancel was requested, lost (release-cap) on the sixth return, otherwise queued with a not_before backoff.
-CREATE OR REPLACE FUNCTION lane_dispatch.return_to_queue(p_id uuid, p_now timestamptz) RETURNS text
+-- Sends the queued / cancelled / lost event, p_reason saying why the claim ended. Returns the state it settled: cancelled when a cancel was requested, lost (release-cap) on the sixth return, otherwise queued with a not_before backoff.
+CREATE OR REPLACE FUNCTION lane_dispatch.return_to_queue(p_id uuid, p_now timestamptz, p_reason text DEFAULT NULL) RETURNS text
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 DECLARE v_t record; v_state text;
 BEGIN
   SELECT t.cancel_requested, t.requeues, t.epoch INTO v_t FROM lane_dispatch.tickets t WHERE t.id = p_id;
   v_state := CASE WHEN v_t.cancel_requested THEN 'cancelled' WHEN v_t.requeues >= 5 THEN 'lost' ELSE 'queued' END;
-  UPDATE lane_dispatch.tickets SET state = v_state, claim_token = NULL, host = NULL, lease_until = NULL, started_at = NULL, claimed_cpu_cores = NULL,
+  UPDATE lane_dispatch.tickets SET state = v_state, status_changed_at = p_now, claim_token = NULL, host = NULL, lease_until = NULL, started_at = NULL, claimed_cpu_cores = NULL,
          requeues = requeues + CASE WHEN v_state = 'queued' THEN 1 ELSE 0 END,
          not_before = CASE WHEN v_state = 'queued' THEN p_now + least(interval '5 seconds' * 2 ^ requeues, interval '60 seconds') ELSE not_before END,
          finished_at = CASE WHEN v_state = 'queued' THEN NULL ELSE p_now END,
          result = CASE WHEN v_state = 'lost' THEN lane_dispatch.lost_result('release-cap', epoch) ELSE result END
    WHERE id = p_id;
+  PERFORM lane_dispatch.notify_ticket(p_id, v_state, v_t.epoch, CASE WHEN v_state = 'lost' THEN 'release-cap' ELSE p_reason END);
   RETURN v_state;
 END $$;
 
@@ -1071,10 +1099,11 @@ BEGIN
   END IF;
   IF v_t.state = 'running' THEN
     IF NOT (v_t.cancel_requested AND p_proof = 'cancel-confirmed') THEN RETURN jsonb_build_object('refused', 'started'); END IF;
-    UPDATE lane_dispatch.tickets SET state = 'cancelled', claim_token = NULL, host = NULL, lease_until = NULL, finished_at = lane_dispatch.now() WHERE id = p_id;
+    UPDATE lane_dispatch.tickets SET state = 'cancelled', claim_token = NULL, host = NULL, lease_until = NULL, finished_at = lane_dispatch.now(), status_changed_at = lane_dispatch.now() WHERE id = p_id;
+    PERFORM lane_dispatch.notify_ticket(p_id, 'cancelled', p_epoch, 'cancel-confirmed');
     RETURN jsonb_build_object('fenced', false, 'state', 'cancelled');
   END IF;
-  v_state := lane_dispatch.return_to_queue(p_id, lane_dispatch.now());
+  v_state := lane_dispatch.return_to_queue(p_id, lane_dispatch.now(), 'released-' || p_proof);
   IF v_state = 'queued' THEN PERFORM pg_notify('ld_work', ''); END IF;
   RETURN jsonb_build_object('fenced', false, 'state', v_state);
 END $$;
@@ -1084,7 +1113,7 @@ END $$;
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_reap(p_lease_ttl interval DEFAULT interval '120 seconds', p_lost_after interval DEFAULT interval '2 hours',
                                                  p_amnesty_after interval DEFAULT interval '60 seconds') RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
-DECLARE v_now timestamptz; v_amnesty boolean; v_id uuid; v_state text; v_requeued int := 0; v_cancelled int := 0; v_lost int := 0; v_runner_lost int;
+DECLARE v_now timestamptz; v_amnesty boolean; v_id uuid; v_state text; v_requeued int := 0; v_cancelled int := 0; v_lost int := 0; v_runner_lost int := 0; v_epoch int;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
   PERFORM 1 FROM lane_dispatch.cluster WHERE id = 1 FOR UPDATE;
@@ -1095,14 +1124,22 @@ BEGIN
   END IF;
   UPDATE lane_dispatch.cluster SET last_tick = v_now WHERE id = 1;
   FOR v_id IN SELECT t.id FROM lane_dispatch.tickets t WHERE t.state = 'claimed' AND t.lease_until < v_now ORDER BY t.id FOR UPDATE LOOP
-    v_state := lane_dispatch.return_to_queue(v_id, v_now);
+    v_state := lane_dispatch.return_to_queue(v_id, v_now, 'lease-expired');
     v_requeued := v_requeued + (v_state = 'queued')::int;
     v_cancelled := v_cancelled + (v_state = 'cancelled')::int;
     v_lost := v_lost + (v_state = 'lost')::int;
   END LOOP;
-  UPDATE lane_dispatch.tickets t SET state = 'lost', finished_at = v_now, result = lane_dispatch.lost_result('runner-lost', t.epoch)
-   WHERE t.state = 'running' AND t.lease_until + (p_lost_after - p_lease_ttl) < v_now;
-  GET DIAGNOSTICS v_runner_lost = ROW_COUNT;
+  FOR v_id, v_epoch IN WITH u AS (UPDATE lane_dispatch.tickets t SET state = 'lost', finished_at = v_now, status_changed_at = v_now, result = lane_dispatch.lost_result('runner-lost', t.epoch)
+                                   WHERE t.state = 'running' AND t.lease_until + (p_lost_after - p_lease_ttl) < v_now RETURNING t.id, t.epoch) SELECT u.id, u.epoch FROM u LOOP
+    PERFORM lane_dispatch.notify_ticket(v_id, 'lost', v_epoch, 'runner-lost');
+    v_runner_lost := v_runner_lost + 1;
+  END LOOP;
+  -- PKG-437: the agent puts logSha256 in the result before ld_finish, so a finished ticket still without one 10 minutes on has no log. Marked once, and only within 24 hours of finishing, so old rows never burst events.
+  FOR v_id, v_epoch IN WITH u AS (UPDATE lane_dispatch.tickets t SET log_state = 'missing', status_changed_at = v_now
+                                   WHERE t.state = 'finished' AND t.log_state IS NULL AND t.result->>'logSha256' IS NULL AND t.finished_at < v_now - interval '10 minutes' AND t.finished_at > v_now - interval '24 hours'
+                                   RETURNING t.id, t.epoch) SELECT u.id, u.epoch FROM u LOOP
+    PERFORM lane_dispatch.notify_ticket(v_id, 'log-missing', v_epoch, 'no-log-sha256');
+  END LOOP;
   IF v_requeued > 0 THEN PERFORM pg_notify('ld_work', ''); END IF;
   DELETE FROM lane_dispatch.claim_requests WHERE ctid IN (
     SELECT c.ctid FROM lane_dispatch.claim_requests c JOIN lane_dispatch.tickets t ON t.id = c.ticket
@@ -1294,6 +1331,15 @@ BEGIN
     CREATE OR REPLACE VIEW lane.pull_runners AS
       SELECT host, last_seen FROM lane_dispatch.runners;
   END IF;
+  -- PKG-437: merge-train's read contract. The _v1 column list is final; a change is a new view. dispatch_key is filled in place by PKG-438.
+  -- updated_at is monotonic: status_changed_at is stamped at every state transition and log_state mark, late_result_at at every late result.
+  IF EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass('lane_dispatch.tickets') AND attname = 'status_changed_at' AND NOT attisdropped) THEN
+    CREATE OR REPLACE VIEW lane.ticket_status_v1 AS
+      SELECT NULL::text AS dispatch_key, id AS ticket_id, repo_key, lane, state, epoch AS claim_generation, host, lease_until, result,
+             (result ->> 'logSha256') IS NOT NULL AS log_ready, result ->> 'logSha256' AS log_sha256, log_state, late_result_at,
+             greatest(status_changed_at, late_result_at) AS updated_at
+        FROM lane_dispatch.tickets;
+  END IF;
 END $$;
 
 -- Ownership and grants for everything in the schema. Re-applied on every run so drift is corrected.
@@ -1324,6 +1370,31 @@ DO $$
 BEGIN
   IF to_regclass('lane.pull_tickets') IS NOT NULL THEN
     GRANT SELECT ON lane.pull_tickets, lane.pull_principals, lane.pull_runners TO lane_reader;
+  END IF;
+END $$;
+-- The views are single-table and so auto-updatable: the blanket grant above would let lane_admin write ticket state through them, past the fence.
+DO $$
+DECLARE v text;
+BEGIN
+  FOREACH v IN ARRAY ARRAY['pull_tickets', 'pull_principals', 'pull_runners', 'ticket_status_v1'] LOOP
+    IF to_regclass('lane.' || v) IS NOT NULL THEN
+      EXECUTE format('REVOKE ALL ON lane.%I FROM lane_admin', v);
+      EXECUTE format('GRANT SELECT ON lane.%I TO lane_admin', v);
+    END IF;
+  END LOOP;
+END $$;
+-- PKG-437: train_reader is created by migration 011 only when the applier may create roles (a superuser, or CREATEROLE); otherwise a superuser creates it once
+-- (docs/lane-dispatch-db-runbook.md) and the next apply grants it. SELECT on the one view and USAGE on schema lane, nothing else.
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'train_reader') THEN
+    REVOKE ALL ON ALL TABLES IN SCHEMA lane FROM train_reader;
+    REVOKE ALL ON ALL SEQUENCES IN SCHEMA lane FROM train_reader;
+    REVOKE ALL ON ALL TABLES IN SCHEMA lane_dispatch FROM train_reader;
+    GRANT USAGE ON SCHEMA lane TO train_reader;
+    IF to_regclass('lane.ticket_status_v1') IS NOT NULL THEN
+      GRANT SELECT ON lane.ticket_status_v1 TO train_reader;
+    END IF;
   END IF;
 END $$;
 GRANT EXECUTE ON FUNCTION lane.claim_next(bigint, real, jsonb, text[], bigint, text[], uuid) TO lane_agent, lane_admin;

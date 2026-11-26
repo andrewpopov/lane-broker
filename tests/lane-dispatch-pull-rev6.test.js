@@ -355,7 +355,7 @@ const GUARDS = {
 };
 
 const MIGRATION_NOT_BEFORE = "ADD COLUMN not_before timestamptz NOT NULL DEFAULT '-infinity'";
-const RESTORE_STAMP = "SET state = 'lost', finished_at = lane_dispatch.now(), result = lane_dispatch.lost_result('queue-restored', epoch)";
+const RESTORE_STAMP = "SET state = 'lost', finished_at = lane_dispatch.now(), status_changed_at = lane_dispatch.now(), result = lane_dispatch.lost_result('queue-restored', epoch)";
 const CANARIES = [
   ['an agent guard kill finished after the queue recorded a cancel is cancelled, while the same finish with no cancel stays finished', 'IF p_result ? \'guard\' AND v_t.cancel_requested THEN', 'IF false THEN'],
   ['a release of a running row is refused and changes nothing, unless a cancel was requested',
@@ -366,7 +366,7 @@ const CANARIES = [
   ['the sixth requeue settles lost with release-cap, and each requeue backs off 5, 10, 20, 40 and 60 s', "interval '5 seconds' * 2 ^ requeues", "interval '5 seconds'"],
   ['the sixth requeue settles lost with release-cap, and each requeue backs off 5, 10, 20, 40 and 60 s', "THEN lane_dispatch.lost_result('release-cap', epoch)", 'THEN NULL'],
   ['a lease expiry returns a claimed ticket to the queue with the same requeue count and backoff as a release',
-    'v_state := lane_dispatch.return_to_queue(v_id, v_now);', "v_state := 'queued'; UPDATE lane_dispatch.tickets SET state = 'queued', claim_token = NULL, host = NULL, lease_until = NULL WHERE id = v_id;"],
+    'v_state := lane_dispatch.return_to_queue(v_id, v_now, \'lease-expired\');', "v_state := 'queued'; UPDATE lane_dispatch.tickets SET state = 'queued', claim_token = NULL, host = NULL, lease_until = NULL WHERE id = v_id;"],
   ['not_before is honoured on a fresh ticket and on a requeued one', 'AND t.not_before <= v_now', ''],
   ['not_before is honoured on a fresh ticket and on a requeued one', MIGRATION_NOT_BEFORE, "ADD COLUMN not_before timestamptz NOT NULL DEFAULT 'infinity'"],
   ['a none answer writes no claim request, whether nothing is queued or the host is full',
@@ -399,7 +399,7 @@ const CANARIES = [
   ['retention selects every queue-authored lost row: reaped, release-capped and restored', RESTORE_STAMP, "SET state = 'lost', result = lane_dispatch.lost_result('queue-restored', epoch)"],
   ['retention selects every queue-authored lost row: reaped, release-capped and restored', "finished_at = CASE WHEN v_state = 'queued' THEN NULL ELSE p_now END", 'finished_at = NULL'],
   ['retention selects every queue-authored lost row: reaped, release-capped and restored',
-    "SET state = 'lost', finished_at = v_now, result = lane_dispatch.lost_result('runner-lost', t.epoch)", "SET state = 'lost', result = lane_dispatch.lost_result('runner-lost', t.epoch)"],
+    "SET state = 'lost', finished_at = v_now, status_changed_at = v_now, result = lane_dispatch.lost_result('runner-lost', t.epoch)", "SET state = 'lost', status_changed_at = v_now, result = lane_dispatch.lost_result('runner-lost', t.epoch)"],
   ['amnesty fires when the gap between reaper ticks passes 60 s, not at 5 s', '> p_amnesty_after;', "> interval '1 second';"],
   ['amnesty fires when the gap between reaper ticks passes 60 s, not at 5 s', '> p_amnesty_after;', "> interval '1 hour';"],
   ['a session SET of lane.test_now never moves the queue clock', "AND 'lane.test_now=' || v_set = ANY (s.setconfig)", 'AND true'],
