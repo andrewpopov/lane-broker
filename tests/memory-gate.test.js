@@ -115,8 +115,8 @@ const defaultOnScenario = async (load) => {
   assert.deepEqual(gateConfigOf('memory', { memory: { maxSwapMiBPerSec: 40 } }), { ...defaults, maxSwapMiBPerSec: 40 });
   assert.equal(gateConfigOf('memory', { memory: false }), null, '"memory": false turns it off');
   assert.equal(gateConfigOf('thermal', undefined), null, 'the other gates stay opt-in');
-  assert.deepEqual(Object.keys(updateDeviceGates(undefined, null, {})), ['memory']);
-  assert.deepEqual(Object.keys(updateDeviceGates(undefined, { memory: false }, {})), []);
+  assert.deepEqual(Object.keys(updateDeviceGates(undefined, null, {})), ['memory', 'load']);
+  assert.deepEqual(Object.keys(updateDeviceGates(undefined, { memory: false, load: false }, {})), []);
   for (const good of [{ memory: false }, { memory: {} }, { memory: { maxVmPressureLevel: 4, maxSwapMiBPerSec: 150, maxPsiSomeAvg10: 0, openSamples: 1 } }]) assert.equal(deviceGatesProblem(good), null, JSON.stringify(good));
   for (const [bad, pattern] of [[{ memory: { maxVmPressureLevel: 0 } }, /maxVmPressureLevel" must be an integer from 1 to 4/], [{ memory: { maxPsiSomeAvg10: 101 } }, /maxPsiSomeAvg10/], [{ memory: { maxOffloadPercent: 60 } }, /"deviceGates.memory" has unknown key "maxOffloadPercent"/], [{ thermal: false }, /"deviceGates.thermal" must be an object/]]) {
     assert.match(deviceGatesProblem(bad) ?? 'accepted', pattern, JSON.stringify(bad));

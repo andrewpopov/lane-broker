@@ -652,7 +652,8 @@ export function renderStatusText(status) {
     );
   }
   lines.push(renderMemoryLine(status.memory));
-  if (status.deviceGates) lines.push(renderDeviceGatesLine(status.deviceGates));
+  const gatesLine = status.deviceGates ? renderDeviceGatesLine(status.deviceGates) : null;
+  if (gatesLine) lines.push(gatesLine);
   if (status.memoryGate?.closed) lines.push(renderMemoryGateLine(status.memoryGate));
   if (status.priority && !status.priority.active) {
     lines.push('priority: inactive (legacy scheduler; run lane migrate-scheduler)');
