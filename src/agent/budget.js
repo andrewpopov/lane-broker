@@ -1,4 +1,4 @@
-import { budgetClient, ENV, processStart, requestSocket } from '@andrewpopov/bosun/module';
+import { budgetClient, ENV, processStart, requestSocket, usageRoots } from '@andrewpopov/bosun/module';
 import { clampMem } from './claims.js';
 import { isProcessAlive } from '../process-liveness.js';
 import { cpuBudgetCores, detectResourceCapacity } from '../resources.js';
@@ -24,24 +24,12 @@ export function usageOf(records) {
   return { held: { ...held, items: live.length }, demand: held };
 }
 
-// Bosun matches a root by its own start identity, which differs from the `pidStart` lane-broker records, so each lane's is read once and kept while it lives.
+// Bosun matches a root by its own start identity, which differs from the `pidStart` lane-broker records; the SDK reads it once per lane (keyed by pid and pidStart, so a
+// reused pid reads afresh) and applies bosun's root limit.
 export function rootsReader({ startOf = processStart, alive = isProcessAlive } = {}) {
-  const known = new Map();
-  return (records) => {
-    const roots = [];
-    const seen = new Set();
-    for (const { pid, pidStart } of records.filter((r) => isLive(r) && Number.isInteger(r.pid) && typeof r.pidStart === 'string')) {
-      const key = `${pid}:${pidStart}`;
-      if (!alive(pid, pidStart)) continue;
-      if (!known.has(key)) {
-        try { known.set(key, startOf(pid)); } catch { continue; }
-      }
-      seen.add(key);
-      roots.push({ pid, start: known.get(key) });
-    }
-    for (const key of known.keys()) if (!seen.has(key)) known.delete(key);
-    return roots;
-  };
+  const read = usageRoots({ startOf });
+  const lanes = (records) => records.filter((r) => isLive(r) && Number.isInteger(r.pid) && typeof r.pidStart === 'string' && alive(r.pid, r.pidStart));
+  return (records) => read(lanes(records).map(({ pid, pidStart }) => ({ pid, key: `${pid}:${pidStart}` })));
 }
 
 // Shadow only (M6a): bosun's budget is exported beside the standalone one and `claimFigures` stays authoritative. It never fails closed.
@@ -65,8 +53,10 @@ export function openBudgetShadow({ readConfig, records, log, now = Date.now, env
     if (!socket || !module || !token || !Number.isInteger(incarnation)) return;
     try {
       const live = records();
-      const response = await call(socket, { method: 'PUT', path: `/v1/modules/${encodeURIComponent(module)}/usage`, authorization: `Bearer ${token}`, body: { incarnation, ...usageOf(live), roots: rootsOf(live) } });
-      report(response.status === 204 ? null : `usage heartbeat refused: ${response.status}`);
+      // A lane left out by the root limit counts as unmanaged until a later beat, which only under-grants.
+      const { roots, omitted } = rootsOf(live);
+      const response = await call(socket, { method: 'PUT', path: `/v1/modules/${encodeURIComponent(module)}/usage`, authorization: `Bearer ${token}`, body: { incarnation, ...usageOf(live), roots } });
+      report(response.status !== 204 ? `usage heartbeat refused: ${response.status}` : omitted ? `usage heartbeat declares ${roots.length} of ${roots.length + omitted} lane roots (bosun's limit)` : null);
     } catch (err) {
       report(`usage heartbeat failed: ${err.message}`);
     }

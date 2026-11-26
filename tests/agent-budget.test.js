@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
 import test from 'node:test';
-import { requestSocket } from '@andrewpopov/bosun/module';
+import { MAX_USAGE_ROOTS, requestSocket } from '@andrewpopov/bosun/module';
 import { createFakeBudget } from '@andrewpopov/bosun/testing/budget';
 import { openBudgetShadow, rootsReader, standaloneBudget, USAGE_HEARTBEAT_MS } from '../src/agent/budget.js';
 import { claimFigures } from '../src/agent/claims.js';
@@ -113,6 +113,17 @@ test('the usage heartbeat declares what the live lanes hold and their roots, at 
   assert.equal(puts.length, 2);
 });
 
+test('a heartbeat declares at most MAX_USAGE_ROOTS roots, which bosun accepts, and says once that the rest were left out', async (t) => {
+  const lanes = Array.from({ length: MAX_USAGE_ROOTS + 1 }, (_, i) => record(`run${i}`, { pid: 100 + i, pidStart: `Mon Nov 24 10:00:${i} 2026` }));
+  const { shadow, clock, logs, puts } = await harness(t, { records: () => lanes });
+  await shadow.heartbeat();
+  clock.advance(USAGE_HEARTBEAT_MS);
+  await shadow.heartbeat();
+  assert.deepEqual(puts.map((put) => put.body.roots.length), [MAX_USAGE_ROOTS, MAX_USAGE_ROOTS]);
+  assert.equal(puts[0].body.held.items, MAX_USAGE_ROOTS + 1, 'held still counts every live lane');
+  assert.deepEqual(logs.filter((line) => /heartbeat/.test(line)), [`budget: usage heartbeat declares ${MAX_USAGE_ROOTS} of ${MAX_USAGE_ROOTS + 1} lane roots (bosun's limit)`]);
+});
+
 test('a refused or failed heartbeat is logged once and never throws', async (t) => {
   const clock = scheduler();
   const logs = [];
@@ -132,7 +143,7 @@ test('a root declares the identity bosun reads for the pid, once per lane, and s
   const alive = (pid, start) => start !== 'reused';
   const roots = rootsReader({ startOf: (pid) => { reads.push(pid); return bosunIdentity(pid); }, alive });
   const lanes = [record('a', { pid: 41, pidStart: 'Mon Nov 24 10:00:00 2026' }), record('b', { pid: 42, pidStart: 'reused' }), record('c', { pid: 99, pidStart: 'Mon Nov 24 10:00:02 2026' })];
-  assert.deepEqual(roots(lanes), [{ pid: 41, start: 'linux:boot-1:410' }]);
+  assert.deepEqual(roots(lanes).roots, [{ pid: 41, start: 'linux:boot-1:410' }]);
   roots(lanes);
   assert.deepEqual(reads, [41, 99, 99]);
 });
