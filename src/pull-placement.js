@@ -4,8 +4,12 @@ import { pullConfigured } from './config.js';
 import { lifecycleVerdict } from './pull-check.js';
 import { pullServices } from './pull-services.js';
 import { QUEUE_PROBE } from './queue-client.js';
+import { HOST_TAG_PREFIX } from './runner-readiness.js';
 import { readQueueHealth } from './queue-health.js';
 import { atomicWriteJson, paths, readJsonSafe } from './state.js';
+
+/** PKG-468: a ticket whose tags name a runner (`host:<name>`) runs there or nowhere: never here, never on another runner. */
+export const isPinnedToHost = (requiresTags) => requiresTags.some((tag) => tag.startsWith(HOST_TAG_PREFIX));
 
 export const PULL_READY_TTL_MS = 5 * 60_000;
 export const PULL_PROBE_DEADLINE_MS = 3_000;
@@ -69,7 +73,8 @@ export async function placeForPull({
   } catch (err) {
     return { route: 'legacy', reason: `pull dispatch unavailable: ld_placeable failed: ${err.message}` };
   }
-  if (placeable === 0) return { route: 'refuse', reason: 'no queue principal is eligible for this ticket' };
+  if (placeable === 0) return { route: 'refuse', reason: 'no queue principal is eligible for this ticket', ...(isPinnedToHost(requiresTags) ? { pinned: true } : {}) };
+  if (isPinnedToHost(requiresTags)) return { route: 'pull', services };
   if (locallyIneligible()) return { route: 'pull', services };
   return (await couldRunLocally()) ? { route: 'local' } : { route: 'pull', services };
 }

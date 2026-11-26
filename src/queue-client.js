@@ -22,6 +22,7 @@ const FUNCTIONS = {
   ld_withdraw: { types: ['uuid'], idempotent: false },
   ld_cancel: { types: ['uuid'], idempotent: false },
   ld_placeable: { types: ['text', 'text[]'], idempotent: true },
+  ld_placeable_detail: { types: ['text', 'text[]'], idempotent: true },
   // lane_admin only (`lane pull gc`); every one is safe to send again
   ld_prune_candidates: { types: ['interval', 'interval', 'timestamptz', 'uuid', 'int'], idempotent: true },
   ld_prune: { types: ['uuid[]', 'interval'], idempotent: true },
@@ -141,6 +142,8 @@ export function createQueueClient({
         cancel: (id) => invoke('ld_cancel', [id]),
 
         placeable: (repoKey, requiresTags, options) => invoke('ld_placeable', [repoKey, requiresTags], options),
+
+        placeableDetail: (repoKey, requiresTags, options) => invoke('ld_placeable_detail', [repoKey, requiresTags], options),
 
         pruneCandidates: ({ objectsAfterMs, rowsAfterMs, after = null, limit = 200 }) =>
       invoke('ld_prune_candidates', [intervalOf(objectsAfterMs), intervalOf(rowsAfterMs), after?.finished_at ?? null, after?.id ?? null, limit]),

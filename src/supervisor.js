@@ -1283,15 +1283,16 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   async function dispatchViaPull(services, reason) {
     testDrainAt(root, 'dispatch');
     viaPull = true;
+    const requiredTags = enriched.remote.requiresTags ?? [];
     try {
-      await updateAttempt(root, enriched.id, gen, { transport: 'pull', ...placementField() }, { refuseWhileMigrating: true });
+      await updateAttempt(root, enriched.id, gen, { transport: 'pull', ...placementField(), ...(requiredTags.length > 0 ? { requiredTags } : {}) }, { refuseWhileMigrating: true });
     } catch (err) {
       if (!(err instanceof MigrationInProgressError)) throw err;
       process.stderr.write(`lane: ${err.message}\n`);
       await publishAndExit(gen, () => migrationRefusalResult(enriched));
       return { fallback: false };
     }
-    const line = `lane: queuing for pull dispatch: ${reason}\n`;
+    const line = `lane: queuing for pull dispatch: ${reason}${requiredTags.length > 0 ? `; waiting for a runner with [${requiredTags.join(', ')}]` : ''}\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);
     const [pullRunner] = pullRunners(globalCfg);
@@ -1400,6 +1401,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       process.stderr.write(line);
       writeBrokerLog(root, line);
     }
+    if (route.route === 'refuse' && route.pinned) return exitUnresolved(`${route.reason}: a run pinned to a runner never falls back to another`, NO_RUNNER_EXIT_CODE);
     if (route.route === 'refuse') return fallbackOrRefuse(null, `${skippedSummary()}; ${route.reason}`, { rebindable: true, noRunner: true, retryable: true });
     if (route.route === 'local') return fallbackOrRefuse(null, `${skippedSummary()}; local can run it now, not queuing for pull`, { rebindable: true });
     if (route.route === 'pull') return dispatchViaPull(route.services, skippedSummary());

@@ -2,6 +2,7 @@
 // First import on purpose (ESM hoists imports): BRAIN-577, see src/node-exit-safe.js.
 import '../src/node-exit-safe-boot.js';
 import { runCommand } from '../src/run.js';
+import { runTagFromFlag } from '../src/run-tags.js';
 import { statusCommand } from '../src/status.js';
 import { suggestCommand } from '../src/suggest.js';
 import { estimatesCommand } from '../src/estimates-history.js';
@@ -47,7 +48,7 @@ import { pullGcCommand } from '../src/pull-gc.js';
 
 function usage() {
   return `Usage:
-  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--group <id>] [--exclusive [--exclusive-purpose upgrade|calibration] [--exclusive-deadline <dur>]] [--no-cache] [--no-reuse] [--retry "<why>"] [--detach [--id <ticket-id>]]
+  lane run [--repo <name>] [--lane <name>] [--weight <n>] [--cpu <cores>] [--memory <size>] [--priority high|medium|low] [--group <id>] [--exclusive [--exclusive-purpose upgrade|calibration] [--exclusive-deadline <dur>]] [--tag <tag>]... [--runner <name>] [--no-cache] [--no-reuse] [--retry "<why>"] [--detach [--id <ticket-id>]]
            [--timeout <duration>] [--allow-local-sim] [--local] [--log <path>] -- <command...>
   lane status [--json]
   lane capabilities --json
@@ -137,6 +138,11 @@ function parseRunArgs(args) {
         break;
       case '--exclusive-deadline':
         opts.exclusiveDeadline = flagArgs[++i] ?? '';
+        break;
+      // PKG-468: extra required tags for this one run; `--runner x` is `--tag host:x`
+      case '--tag':
+      case '--runner':
+        opts.runTags = [...(opts.runTags ?? []), runTagFromFlag(a, flagArgs[++i])];
         break;
       case '--no-cache':
         opts.noCache = true;
@@ -290,6 +296,7 @@ async function main() {
         exclusive: opts.exclusive,
         exclusivePurpose: opts.exclusivePurpose,
         exclusiveDeadline: opts.exclusiveDeadline,
+        runTags: opts.runTags,
         noCache: opts.noCache,
         noReuse: opts.noReuse,
         retryReason: opts.retryReason,
