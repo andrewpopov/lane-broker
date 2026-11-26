@@ -191,7 +191,7 @@ const GUARDS = {
     await assert.rejects(enqueue(s1, tid(3), { targetHost: 'a2' }), code('LK422'));
   },
 
-  'a dispatch key adopts only a ticket placed as asked: another placement is refused LK423 on every holder path': async (w) => {
+  'a placed request adopts only a ticket placed as asked (LK423 on every holder path), while an unconstrained request adopts any holder': async (w) => {
     const s1 = await submit(w);
     const holder = await enqueue(s1, tid(1), { dispatchKey: KEY });
     assert.equal(holder.target_host, null);
@@ -206,6 +206,10 @@ const GUARDS = {
     const placed = await enqueue(s1, tid(5), { dispatchKey: 'train:placed', targetHost: 'a2', avoidHosts: ['x', 'a1'] });
     assert.deepEqual([placed.capability_class, placed.avoid_hosts, placed.target_host], [null, ['a1', 'x'], 'a2'], 'the view carries the placement');
     assert.equal((await call(s1, 'ld_ticket_by_key', 'train:placed', { avoid_hosts: ['A1', 'x'], target_host: 'A2' })).id, tid(5), 'compared canonical');
+    assert.equal((await enqueue(s1, tid(6), { dispatchKey: 'train:placed' })).id, tid(5), 'an unconstrained request adopts the placed holder');
+    assert.equal((await enqueue(s1, tid(5))).id, tid(5), 'and replays the placed id');
+    assert.equal((await call(s1, 'ld_ticket_by_key', 'train:placed', { capability_class: null, avoid_hosts: [], target_host: null })).id, tid(5));
+    await assert.rejects(enqueue(s1, tid(7), { dispatchKey: 'train:placed', targetHost: 'a1' }), code('LK423'));
   },
 
   'two concurrent submits of one key with different placement: the loser is refused LK423, the winner stands': async (w) => {
@@ -218,6 +222,20 @@ const GUARDS = {
     await first.query('COMMIT');
     assert.equal((await answer).error?.code, 'LK423');
     assert.equal((await w.ticket(tid(2))), undefined);
+  },
+
+  'an unconstrained submit that loses the key race to a placed holder adopts it instead of failing': async (w) => {
+    const first = await w.cluster.client(w.db, logins.s1);
+    await first.query('BEGIN');
+    await enqueue(first, tid(1), { dispatchKey: KEY, targetHost: 'a2' });
+    const second = await w.cluster.client(w.db, logins.s1);
+    const answer = enqueue(second, tid(2), { dispatchKey: KEY }).then((value) => ({ value }), (error) => ({ error }));
+    await waitBlocked(w, second.processID);
+    await first.query('COMMIT');
+    const { value, error } = await answer;
+    assert.equal(error, undefined, error?.message);
+    assert.equal(value.id, tid(1));
+    assert.equal(await w.ticket(tid(2)), undefined);
   },
 
   'an avoided host may be the failed host of a runner that has since been removed, an unknown spelling may not, and a target must be a current runner': async (w) => {
@@ -300,8 +318,10 @@ const SQL_CANARIES = [
     '             AND lane_dispatch.placeable_on(p_class_platform, p_avoid_hosts, p_target_host, p.host, p.platform));', ');'],
   ['a replay is validated against the current hosts', 'a repeat of a committed targeted enqueue is answered after the target runner is removed, keyed or not, and a new one is refused',
     "  -- the caller's own row under this id is the submission again, whatever has happened to the hosts since\n  IF EXISTS", "  PERFORM lane_dispatch.check_placement_hosts(v_avoid, v_target);\n  IF EXISTS"],
-  ['a holder placed otherwise is adopted', 'a dispatch key adopts only a ticket placed as asked: another placement is refused LK423 on every holder path',
+  ['a holder placed otherwise is adopted', 'a placed request adopts only a ticket placed as asked (LK423 on every holder path), while an unconstrained request adopts any holder',
     'IF FOUND AND NOT lane_dispatch.same_placement(v_t.capability_class, v_t.avoid_hosts, v_t.target_host, p_class, p_avoid_hosts, p_target_host) THEN\n    RAISE EXCEPTION \'dispatch key', 'IF false THEN\n    RAISE EXCEPTION \'dispatch key'],
+  ['an unconstrained request is held to the holder placement', 'an unconstrained submit that loses the key race to a placed holder adopts it instead of failing',
+    "(p_want_class IS NULL AND coalesce(cardinality(p_want_avoid), 0) = 0 AND p_want_target IS NULL)\n      OR ", 'false\n      OR '],
   ['the claim reads the platform without the principal lock', 'ld_claim reads the platform under the principal lock: a platform change committed while a claim waits is seen by that claim',
     "p.kind = 'agent' FOR UPDATE;", "p.kind = 'agent';"],
   ['an unknown avoided host is accepted', 'a malformed or unknown placement is refused before anything is stored',

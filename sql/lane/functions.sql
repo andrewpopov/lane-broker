@@ -882,11 +882,12 @@ BEGIN
   RETURN coalesce((SELECT array_agg(DISTINCT h COLLATE "C" ORDER BY h COLLATE "C") FROM (SELECT lane_dispatch.canonical_host(x) AS h FROM unnest(coalesce(p_hosts, '{}')) AS u(x)) c WHERE c.h IS NOT NULL), '{}');
 END $$;
 
--- The one definition of "same placement": the stored canonical values against the request's.
+-- The one definition of "this stored placement answers that request": an unconstrained request adopts any holder (it ran under a placement at least as strict, and an older client must never meet a new SQLSTATE), a placed one needs the exact canonical values.
 CREATE OR REPLACE FUNCTION lane_dispatch.same_placement(p_class text, p_avoid_hosts text[], p_target_host text, p_want_class text, p_want_avoid text[], p_want_target text) RETURNS boolean
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
 BEGIN
-  RETURN p_class IS NOT DISTINCT FROM p_want_class AND coalesce(p_avoid_hosts, '{}') = coalesce(p_want_avoid, '{}') AND p_target_host IS NOT DISTINCT FROM p_want_target;
+  RETURN (p_want_class IS NULL AND coalesce(cardinality(p_want_avoid), 0) = 0 AND p_want_target IS NULL)
+      OR (p_class IS NOT DISTINCT FROM p_want_class AND coalesce(p_avoid_hosts, '{}') = coalesce(p_want_avoid, '{}') AND p_target_host IS NOT DISTINCT FROM p_want_target);
 END $$;
 
 -- A host id the queue has ever known: a current agent principal, or a host on a retained ticket or attempt, so the failed host of a removed runner can still be avoided.

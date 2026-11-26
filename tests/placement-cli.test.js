@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { after as afterAll, afterEach, before, describe, test } from 'node:test';
 import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 import { pullE2E } from './helpers/pull-e2e.js';
 import { pgSkipOption } from './lane-db-harness.js';
 import { startDispatchCluster, World, downgradeToV9 } from './lane-dispatch-fixture.js';
+import { paths } from '../src/state.js';
 import { gitFixture, scaledMs } from './helpers.js';
 
 /** PKG-439: `lane run --class / --avoid-host / --target-host` through a real supervisor against a disposable queue. */
@@ -145,6 +148,8 @@ const SCENARIOS = {
     assert.equal(placed.code, 0, placed.stderr);
     const again = await fx.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', ...placedKey, ...target('a2'), '--avoid-host', 'X', '--', 'true']);
     assert.equal(again.stdout.trim(), placed.stdout.trim(), 'the same canonical placement adopts');
+    const bare = await fx.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', ...placedKey, '--', 'true']);
+    assert.equal(bare.stdout.trim(), placed.stdout.trim(), 'an unconstrained request adopts the placed holder');
     const elsewhere = await fx.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', ...placedKey, ...target('a2'), '--avoid-host', 'a1', '--', 'true']);
     assert.equal(elsewhere.code, 76, elsewhere.stderr);
     assert.equal(await ticketCount(w), 2);
@@ -177,6 +182,100 @@ const SCENARIOS = {
     assert.equal((await (await w.su()).query('SELECT state FROM lane_dispatch.tickets')).rows[0].state, 'withdrawn');
   },
 
+  'two concurrent --id submissions with different placement: one wins, the loser exits 64, and one ticket exists': async (load, w, t) => {
+    const fx = await pullE2E(t, w, { load, localPaused: true });
+    const id = crypto.randomUUID();
+    const detached = (extra) => fx.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', '--id', id, ...extra, '--', 'true']);
+    const [a, b] = await Promise.all([detached(target('a2')), detached(['--avoid-host', 'a1'])]);
+    t.after(() => fx.lane(['cancel', id]));
+    assert.deepEqual([a.code, b.code].sort(), [0, 64], `${a.stderr}\n${b.stderr}`);
+    assert.equal(await ticketCount(w), 1);
+    const row = await ticketRow(w, id);
+    assert.deepEqual([row.target_host, row.avoid_hosts], a.code === 0 ? ['a2', []] : [null, ['a1']], 'the ticket is the winner placement, whichever won');
+  },
+
+  'a host alias that is itself a runner is refused before any adoption or replay, by key or by id': async (load, w, t) => {
+    const fx = await pullE2E(t, w, { load, localPaused: true, globalExtra: { hostAliases: { a1: 'a2' } } });
+    const keyed = (host) => fx.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', '--dispatch-key', 'train:r:5:1', ...target(host), '--', 'true']);
+    const first = await keyed('a2');
+    assert.equal(first.code, 0, first.stderr);
+    t.after(() => fx.lane(['cancel', first.stdout.trim()]));
+    const viaAlias = await keyed('a1');
+    assert.equal(viaAlias.code, 64, viaAlias.stderr);
+    assert.match(viaAlias.stderr, /alias must never map one real runner to another/);
+    assert.equal(viaAlias.stdout, '', 'the ticket on another runner was not adopted');
+    const id = crypto.randomUUID();
+    const byId = (host) => fx.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', '--id', id, ...target(host), '--', 'true']);
+    assert.equal((await byId('a2')).code, 0);
+    t.after(() => fx.lane(['cancel', id]));
+    await fx.enqueued([first.stdout.trim()]);
+    assert.equal((await byId('a1')).code, 64, 'the replay through the alias is refused, though its ack is there');
+    assert.equal(await ticketCount(w), 2);
+  },
+
+  'a retained envelope and ack answer only their own placement once the result is gone': async (load, w, t) => {
+    const fx = await pullE2E(t, w, { load, localPaused: true });
+    const id = crypto.randomUUID();
+    const detached = (extra) => fx.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', '--id', id, ...extra, '--', 'true']);
+    assert.equal((await detached(target('a2'))).code, 0);
+    await fx.enqueued();
+    assert.equal((await fx.lane(['cancel', id])).code, 0);
+    assert.equal((await fx.wait(id)).code, 130);
+    await sleep(1500);
+    for (const file of [path.join(paths(fx.state).results, `${id}.json`), path.join(paths(fx.state).attempts, `${id}.json`), path.join(paths(fx.state).pullLedger, `${id}.json`)]) fs.rmSync(file, { force: true });
+    assert.ok(fs.existsSync(path.join(paths(fx.state).pull, id, 'envelope.json')) && fs.existsSync(path.join(paths(fx.state).pull, id, 'ack.json')), 'the envelope and ack are retained');
+    const other = await detached(target('x'));
+    assert.equal(other.code, 64, other.stderr);
+    assert.match(other.stderr, /different placement/);
+    const same = await detached(target('a2'));
+    assert.equal(same.code, 0, same.stderr);
+    assert.equal(same.stdout.trim(), id);
+  },
+
+  'a same-placement retry before the first submission is acknowledged follows it to its ack and prints the same id': async (load, w, t) => {
+    const fx = await pullE2E(t, w, { load, localPaused: true });
+    fx.stub.delayMatching = (method, pathname) => (method === 'PUT' && pathname.includes('/streams/') ? 4000 : 0);
+    const id = crypto.randomUUID();
+    const detached = () => fx.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', '--id', id, ...target('a2'), '--', 'true']);
+    const original = detached();
+    await sleep(1200);
+    const retry = await detached();
+    t.after(() => fx.lane(['cancel', id]));
+    assert.deepEqual([retry.code, retry.stdout.trim()], [0, id], retry.stderr);
+    assert.deepEqual([(await original).code, (await original).stdout.trim()], [0, id]);
+    assert.equal(await ticketCount(w), 1);
+  },
+
+  'a refusal before anything is queued is replayed as the same refusal by an identical repeat of the id': async (load, w, t) => {
+    const fx = await pullE2E(t, w, { load, localPaused: true });
+    const id = crypto.randomUUID();
+    const detached = () => fx.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', '--id', id, ...target('nobody'), '--', 'true']);
+    assert.equal((await detached()).code, 76);
+    await sleep(1000);
+    const again = await detached();
+    assert.equal(again.code, 76, again.stderr);
+    assert.equal(await ticketCount(w), 0);
+  },
+
+  'a snapshot that cannot be uploaded before anything is sent is an infra failure, exit 75, and queues nothing': async (load, w, t) => {
+    const fx = await pullE2E(t, w, { load, localPaused: true, lanePull: { pollMs: 200, prepareBudgetMs: 3000 } });
+    fx.stub.failMatching = (method, pathname) => (method === 'PUT' && pathname.includes('/streams/') ? 503 : 0);
+    const res = await fx.run(fx.markLocalRun, target('a2'));
+    assert.equal(res.code, 75, res.stderr);
+    await nothingRan(fx, w);
+  },
+
+  'a keyed placed run against a queue below migration 013 is refused 76 by a published supervisor refusal, not by an unrecorded early exit': async (load, w, t) => {
+    await downgradeToV9(w);
+    const fx = await pullE2E(t, w, { load, localPaused: true });
+    const res = await fx.run(fx.markLocalRun, ['--dispatch-key', 'train:r:6:1', ...target('a2')]);
+    assert.equal(res.code, 76, res.stderr);
+    assert.match(res.stderr, /queue too old for placement constraints/);
+    await sleep(1000);
+    assert.deepEqual(fx.supervisorExits(), [76], 'a supervisor published the refusal');
+    await nothingRan(fx, w);
+  },
+
   'a detached placed run that the queue has not answered in time prints its id and says wait, exits 75, and the ticket still ends with its real outcome': async (load, w, t) => {
     const fx = await pullE2E(t, w, { load, localPaused: true });
     fx.stub.delayMatching = (method, pathname) => (method === 'PUT' && pathname.includes('/streams/') ? 4000 : 0);
@@ -205,9 +304,21 @@ const DETACHED = 'a detached placed run answers with the supervisor outcome, not
 const CACHE = 'a placed run bypasses the result cache: a cached pass of the same content does not answer a canary on a named host';
 const ADOPT = 'a dispatch key adopts only a ticket placed as asked: another placement is refused 76 and queues nothing, the same placement is the same ticket';
 const WITHDRAWN = 'a placed ticket nobody claims in time is withdrawn and refused 76: the committed withdrawal never runs it locally, though this machine is free';
-const IDREUSE = 'an id reused with another placement is refused 64 and the same placement is the same ticket';
 
+const SHADOW = 'a host alias that is itself a runner is refused before any adoption or replay, by key or by id';
+const RETAINED = 'a retained envelope and ack answer only their own placement once the result is gone';
+const FOLLOW = 'a same-placement retry before the first submission is acknowledged follows it to its ack and prints the same id';
+const PREFLIGHT = 'a refusal before anything is queued is replayed as the same refusal by an identical repeat of the id';
+const INFRA = 'a snapshot that cannot be uploaded before anything is sent is an infra failure, exit 75, and queues nothing';
+const OLDKEYED = 'a keyed placed run against a queue below migration 013 is refused 76 by a published supervisor refusal, not by an unrecorded early exit';
+const placementRecord = (from, to) => ['placement-record.js', [from, to]];
 const CANARIES = [
+  [SHADOW, ...run('if (placement !== null && placement.aliasesApplied.length > 0) {', 'if (false) {')],
+  [RETAINED, ...placementRecord('  if (envelope !== null) return envelope.placementRequest ?? null;\n', '')],
+  [FOLLOW, ...run('if (ended !== null && ended.code !== DUPLICATE_SUBMISSION_EXIT) return', 'if (ended !== null) return')],
+  [PREFLIGHT, ...supervisor(', ...(ticket.placementRequest ? { placementRequest: placementKey(ticket.placementRequest) } : {})', '')],
+  [INFRA, ...supervisor('    if (isConstrained(enriched.placementRequest)) return refusePullOnly(`${reason}; nothing was enqueued, retry`, { exitCode: PLACEMENT_UNREACHABLE_EXIT });', '')],
+  [OLDKEYED, ...run('placement === null || err.code !== PLACEMENT_MISMATCH_SQLSTATE ? null : placementRefusal(err)', 'placement === null ? null : placementRefusal(err)')],
   [WITHDRAWN, ...supervisor('    if (isPullOnly(enriched)) return refusePullOnly(reason);', '    if (false) return refusePullOnly(reason);')],
   [MIXED, ...supervisor('const pullOnlyPlacement = isConstrained(enriched.placementRequest);', 'const pullOnlyPlacement = false;')],
   [UNREACHABLE, ...supervisor("if (pullOnlyPlacement && route.route !== 'pull') {", 'if (false) {')],
@@ -215,10 +326,9 @@ const CANARIES = [
   [DETACHED, ...run('if (dispatchKey !== undefined || placement !== null) {', 'if (dispatchKey !== undefined) {')],
   [CACHE, ...run('dispatchKey === undefined && placement === null) {', 'dispatchKey === undefined) {')],
   [ADOPT, 'run.js', [
-    ['      const refusal = placement === null ? null : placementRefusal(err);', '      const refusal = null;'],
-    ['    if (held !== null && placement !== null && !samePlacement(placementKeyOfView(held), placement)) {', '    if (false) {'],
+    ['      const refusal = placement === null || err.code !== PLACEMENT_MISMATCH_SQLSTATE ? null : placementRefusal(err);', '      const refusal = null;'],
+    ['    if (held !== null && !adoptsPlacement(placementKeyOfView(held), placement)) {', '    if (false) {'],
   ]],
-  [IDREUSE, ...run('if (placement !== null && ticketId !== undefined && heldLocally(root, ticketId) && !samePlacement(localPlacementOf(root, ticketId), placement)) {', 'if (false) {')],
 ];
 
 describe('placement constraints through a real supervisor', { skip: pgSkipOption, timeout: scaledMs(1_800_000) }, () => {

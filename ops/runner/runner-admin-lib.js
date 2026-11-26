@@ -69,6 +69,7 @@ export function roleSql({ role, host, password, roleExists, tags, repos, maxClai
     `ALTER ROLE ${sqlIdent(role)} SET statement_timeout = '2s';`,
     `ALTER ROLE ${sqlIdent(role)} SET idle_in_transaction_session_timeout = '5s';`,
     `DO $lra$ BEGIN IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = ${sqlLit(role)} AND (rolsuper OR rolreplication OR rolbypassrls OR rolcreatedb OR rolcreaterole)) THEN RAISE EXCEPTION 'role ${role} still holds an elevated attribute'; END IF; END $lra$;`,
+    ...(platform ? [`DO $lra$ BEGIN IF EXISTS (SELECT 1 FROM lane_dispatch.principals WHERE login_role = ${sqlLit(role)}) THEN RAISE EXCEPTION 'principal ${role} exists; --platform is for a new runner, use set-platform'; END IF; END $lra$;`] : []),
     `SELECT lane_dispatch.ld_set_principal(${sqlLit(role)}, 'agent', ${sqlLit(host)}, ${sqlTextArray(tags)}, ${sqlTextArray(repos)}, ${Number(maxClaims)});`,
     ...(platform ? [`SELECT lane_dispatch.ld_set_platform(${sqlLit(host)}, ${sqlLit(platform)});`] : []),
     'COMMIT;',
@@ -712,18 +713,26 @@ function buildAddPlan(ctx) {
   ctx.hbaEntry = { role, host, ip, note: ctx.opts.note };
   const stillThere = recheckRole(ctx, role);
   const roleExists = async () => Number((await ctx.psql(roleExistsSql(role), { query: true, label: 'check role' })).stdout.trim()) > 0;
+  // `--platform` is for a new runner: ld_set_principal would rewrite an existing one's tags, repos and max_claims
+  const refuseExistingForPlatform = async () => {
+    if (ctx.opts.platform && (await ctx.psqlRows(principalSql(host), 'read principal')).length > 0) throw new Error(`principal ${host} already exists: add --platform would reset its tags, repos and max_claims; change only the platform with: lane-runner-admin set-platform ${host} ${ctx.opts.platform}`);
+  };
   const steps = [
     {
       title: `1Password: item "${opItemTitle(host)}" in vault ${OP_VAULT} (password, rustfs_access_key, rustfs_secret_key)`,
       kind: 'secrets',
-      async preview() { return (await ctx.getItem()) ? 'item exists: its values will be reused' : 'item absent: would generate a 32-byte password, a 20-char access key and a 40-char secret and create it'; },
-      apply: () => ctx.ensureSecrets(),
+      async preview() { await refuseExistingForPlatform(); return (await ctx.getItem()) ? 'item exists: its values will be reused' : 'item absent: would generate a 32-byte password, a 20-char access key and a 40-char secret and create it'; },
+      async apply() { await refuseExistingForPlatform(); return ctx.ensureSecrets(); },
     },
     {
       title: `postgres: role ${role} and principal row (via ssh ${DB_HOST}, sudo -u postgres psql, SQL on stdin)`,
       kind: 'postgres',
-      async preview() { return roleSql({ ...principal, password: REDACTED, roleExists: await roleExists() }); },
+      async preview() {
+        await refuseExistingForPlatform();
+        return roleSql({ ...principal, password: REDACTED, roleExists: await roleExists() });
+      },
       async apply() {
+        await refuseExistingForPlatform();
         await ctx.psql(roleSql({ ...principal, password: ctx.secrets.password, roleExists: await roleExists() }), { label: 'create role and principal', quiet: true });
         return `role ${role} and its principal row are in place`;
       },

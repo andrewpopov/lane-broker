@@ -815,6 +815,32 @@ test('add --platform sets the platform in the same transaction as the principal;
   assert.ok(!without.calls.some((c) => c.input?.includes('ld_set_platform')));
 });
 
+test('add --platform on a runner whose principal exists is refused before anything changes, and points at set-platform', async () => {
+  for (const argv of [[...ADD, '--platform', 'linux'], [...ADD, '--platform', 'linux', '--apply']]) {
+    const world = fakeWorld({ principalRow: [...RESTRICTED] });
+    const { code, text, errs } = await cli(world, argv);
+    assert.equal(code, 1, argv.join(' '));
+    assert.match(`${text}${errs}`, /already exists.*set-platform evo-x2 linux/);
+    assert.ok(!world.calls.some((c) => c.input?.includes('ld_set_principal') || c.cmd === 'mc' || (c.cmd === 'op-bot' && c.args[1] === 'create')), 'nothing was written');
+    assert.deepEqual(world.principalRow, RESTRICTED, 'the principal is as it was');
+  }
+  const plain = fakeWorld({ principalRow: [...RESTRICTED] });
+  assert.equal((await cli(plain, [...ADD, '--apply'])).code, 0, 'add without --platform is the existing re-run, unchanged');
+});
+
+test('the add transaction itself refuses an existing principal when --platform is given, so a race cannot reset it', () => {
+  const sql = lib.roleSql({ role: 'lane_agent_evo_x2', host: 'evo-x2', password: 'x', roleExists: false, tags: [], repos: ['*'], maxClaims: 1, platform: 'linux' });
+  assert.ok(sql.indexOf('principal lane_agent_evo_x2 exists') !== -1 && sql.indexOf('principal lane_agent_evo_x2 exists') < sql.indexOf('ld_set_principal'));
+  assert.doesNotMatch(lib.roleSql({ role: 'lane_agent_evo_x2', host: 'evo-x2', password: 'x', roleExists: false, tags: [], repos: ['*'], maxClaims: 1 }), /exists/);
+});
+
+test('canary: with the existing-principal refusal removed, add --platform writes through ld_set_principal', async () => {
+  const mutant = await importMutant(LIB_FILE, ['(await ctx.psqlRows(principalSql(host), \'read principal\')).length > 0', 'false']);
+  const world = fakeWorld({ principalRow: [...RESTRICTED] });
+  const { code } = await cli(world, [...ADD, '--platform', 'linux', '--apply'], mutant);
+  assert.equal(code, 0, 'the mutant resets the existing runner, which the real code refuses');
+});
+
 test('platform arguments are validated: a platform outside the three, a missing one, --platform on remove or set-platform exit 2', async () => {
   const world = fakeWorld();
   for (const argv of [['set-platform', 'evo-x2', 'plan9'], ['set-platform', 'evo-x2'], ['set-platform', 'evo-x2', 'linux', 'extra'], ['add', 'evo-x2', '--ip', '100.82.26.77', '--platform', 'beos'], ['remove', 'evo-x2', '--platform', 'linux'], ['set-platform', 'evo-x2', 'linux', '--platform', 'linux'], ['set-platform', 'evo-x2', 'linux', '--ip', '100.82.26.77']]) {

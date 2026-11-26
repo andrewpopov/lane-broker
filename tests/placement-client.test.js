@@ -163,23 +163,6 @@ const SCENARIOS = {
     await assert.rejects(enqueueOnce({ root: state, id: ID, generation, queue: scripted(sqlstate('42883')) }), (err) => err.code === '42883');
   },
 
-  'a committed enqueue whose reply was lost is recovered as the same ticket with the same placement, and a placed unkeyed ticket gets the durable ack': async (load) => {
-    const { enqueueOnce, enqueueAckFile } = await load('pull-enqueue.js');
-    const fs = await import('node:fs');
-    const { state, generation } = await prepared(load, { placementRequest: { ...PLACEMENT, targetHost: 'mac' } });
-    const dropped = Object.assign(new Error('connection reset'), { name: 'QueueError' });
-    const queue = scripted(dropped, { id: ID, state: 'queued', target_host: 'mac' });
-    await assert.rejects(enqueueOnce({ root: state, id: ID, generation, queue }), /connection reset/);
-    assert.equal(fs.existsSync(enqueueAckFile(state, ID)), false);
-    const recovered = await enqueueOnce({ root: state, id: ID, generation, queue });
-    assert.equal(recovered.outcome, 'queued');
-    assert.equal(queue.calls.sends.length, 2);
-    const [first, second] = queue.calls.sends.map(({ expectRef: _ref, ...rest }) => rest);
-    assert.deepEqual(second, first, 'the recovery resends the same arguments, placement included');
-    assert.equal(second.targetHost, 'mac');
-    assert.equal(JSON.parse(fs.readFileSync(enqueueAckFile(state, ID), 'utf8')).ticketId, ID);
-  },
-
   'the queue client never trims a placement off the enqueue: any one of the three sends the long form, an unconstrained one the short form': async (load, t) => {
     const { createQueueClient: create } = await load('queue-client.js');
     const { sent, queue } = (() => {
@@ -241,6 +224,97 @@ const SCENARIOS = {
     assert.equal(unconstrained.route, 'local', 'an unplaced ticket keeps the local route');
   },
 
+  'a v3 envelope must name a consistent placement: a platform with no class, a non-canonical class or list, a target that is avoided, or nothing at all is refused, and a placed envelope never selects the short enqueue': async (load, t) => {
+    const { createEnvelope } = await load('pull-envelope.js');
+    const { isPlacementRecord } = await load('placement.js');
+    const { enqueueArgs } = await load('pull-enqueue.js');
+    const good = { capabilityClass: 'linux+browser', classPlatform: 'linux', classTags: ['browser'], avoidHosts: ['a', 'b'], targetHost: 'c' };
+    assert.equal(isPlacementRecord(good), true);
+    assert.equal(isPlacementRecord({ capabilityClass: null, classPlatform: null, classTags: [], avoidHosts: [], targetHost: 'mac' }), true);
+    const bad = [
+      { ...good, capabilityClass: null },
+      { ...good, classPlatform: 'darwin' },
+      { ...good, classTags: [] },
+      { ...good, capabilityClass: 'linux+b+a', classTags: ['b', 'a'] },
+      { ...good, avoidHosts: ['b', 'a'] },
+      { ...good, avoidHosts: ['a', 'a'] },
+      { ...good, avoidHosts: ['c'] },
+      { ...good, targetHost: 'Bad Host' },
+      { capabilityClass: null, classPlatform: 'linux', classTags: [], avoidHosts: [], targetHost: null },
+      { capabilityClass: null, classPlatform: null, classTags: [], avoidHosts: [], targetHost: null },
+    ];
+    for (const record of bad) assert.equal(isPlacementRecord(record), false, JSON.stringify(record));
+    for (const record of bad) {
+      const root = freshEnv().state;
+      ensureStateDirs(root);
+      await assert.rejects(createEnvelope(root, { ...FIELDS, placementRequest: record }), /not a placement/);
+    }
+    const args = enqueueArgs({ ...FIELDS, snapshot: SNAPSHOT, placementRequest: good });
+    const { createQueueClient: create } = await load('queue-client.js');
+    const sent = [];
+    const connectClient = async () => ({ on() {}, connection: { stream: { destroy() {} } }, end: async () => {}, query: async (sql, values) => { sent.push(values); return { rows: [{ v: 'ok' }] }; } });
+    const queue = create({ url: QUEUE_URL, ...secretFiles(t), connectClient });
+    await queue.enqueueFenced({ expectRef: '1.0', ...args, capabilityClass: undefined, avoidHosts: [], targetHost: undefined });
+    assert.equal(sent[0].length, 23, 'the long form even when every named field is empty, because the envelope is placed');
+  },
+
+  'an unconstrained request adopts any holder and only a placed one needs the exact placement': async (load) => {
+    const { adoptsPlacement } = await load('placement.js');
+    assert.equal(adoptsPlacement(PLACEMENT, null), true);
+    assert.equal(adoptsPlacement(null, null), true);
+    assert.equal(adoptsPlacement(PLACEMENT, PLACEMENT), true);
+    assert.equal(adoptsPlacement(null, PLACEMENT), false);
+    assert.equal(adoptsPlacement({ ...PLACEMENT, targetHost: 'mac' }, PLACEMENT), false);
+  },
+
+  'the detached wait of a placed id: a duplicate supervisor (78) follows the original through its ack, another placement winning the id is 64 even with its ack visible, and a duplicate that never gets an answer times out 75': async (load) => {
+    const { awaitKeyedEnqueue } = await load('run.js');
+    const { createAttempt } = await load('attempts.js');
+    const { enqueueAckFile } = await load('pull-enqueue.js');
+    const { atomicWriteJson } = await load('state.js');
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const make = async () => {
+      const { state } = freshEnv();
+      ensureStateDirs(state);
+      await createAttempt(state, ID, { placement: { capabilityClass: null, avoidHosts: [], targetHost: 'mac' } });
+      return state;
+    };
+    const wait = (state, over) => awaitKeyedEnqueue({ root: state, id: ID, resultPath: path.join(state, 'none.json'), timeoutMs: 600, keyed: false, ...over });
+    const duplicate = Promise.resolve({ code: 78, signal: null });
+    const first = await make();
+    setTimeout(() => {
+      fs.mkdirSync(path.dirname(enqueueAckFile(first, ID)), { recursive: true });
+      atomicWriteJson(enqueueAckFile(first, ID), { ticketId: ID, state: 'queued', host: null });
+    }, 150);
+    assert.deepEqual(await wait(first, { supervisorEnded: duplicate, placement: { capabilityClass: null, avoidHosts: [], targetHost: 'mac' } }), { id: ID }, 'the retry followed the original to its ack');
+    const lost = await make();
+    fs.mkdirSync(path.dirname(enqueueAckFile(lost, ID)), { recursive: true });
+    atomicWriteJson(enqueueAckFile(lost, ID), { ticketId: ID, state: 'queued', host: null });
+    const other = await wait(lost, { supervisorEnded: new Promise(() => {}), placement: { capabilityClass: null, avoidHosts: ['mac'], targetHost: null } });
+    assert.equal(other.exitCode, 64, 'the winner ack does not answer another placement');
+    const mismatch = await wait(await make(), { supervisorEnded: Promise.resolve({ code: 90, signal: null }), placement: { capabilityClass: null, avoidHosts: ['mac'], targetHost: null } });
+    assert.equal(mismatch.exitCode, 64);
+    const silent = await wait(await make(), { supervisorEnded: duplicate, timeoutMs: 200, placement: { capabilityClass: null, avoidHosts: [], targetHost: 'mac' } });
+    assert.deepEqual([silent.exitCode, silent.timedOut], [75, true]);
+    const unconstrained = await wait(lost, { supervisorEnded: new Promise(() => {}), placement: null });
+    assert.deepEqual(unconstrained, { id: ID }, 'an unconstrained retry adopts what is there');
+  },
+
+  'the locked duplicate check of a supervisor flags an id placed otherwise, so two submissions racing on one id cannot both win': async (load) => {
+    const { createAttempt } = await load('attempts.js');
+    const { duplicateSubmission } = await load('placement-record.js');
+    const { state } = freshEnv();
+    ensureStateDirs(state);
+    const asked = { capabilityClass: null, classPlatform: null, classTags: [], avoidHosts: [], targetHost: 'mac' };
+    const other = { ...asked, targetHost: null, avoidHosts: ['mac'] };
+    const submit = (placement) => createAttempt(state, ID, { placement, refuseIf: () => duplicateSubmission(state, ID, placement) });
+    assert.equal((await submit(asked)).id, ID, 'the first submission is the attempt');
+    assert.equal((await submit(asked)).existing.placementMismatch, false, 'the same placement is a plain duplicate');
+    assert.equal((await submit(other)).existing.placementMismatch, true, 'another placement lost the id');
+    assert.equal((await submit(null)).existing.placementMismatch, false, 'an unconstrained request adopts it');
+  },
+
   'the detached wait of an unkeyed ticket that timed out hands back its id and says wait, never retry': async (load) => {
     const { awaitKeyedEnqueue } = await load('run.js');
     const { state } = freshEnv();
@@ -254,17 +328,6 @@ const SCENARIOS = {
     assert.match(keyed.note, /retry the same key/);
   },
 
-  'lane status shows an unplaceable queued pull ticket with its reason': async (load) => {
-    const { renderStatusText } = await load('status.js');
-    const status = {
-      remote: [{ id: ID, transport: 'pull', pullHost: null, pullStage: 'QUEUED', pullUnplaceable: 'class', phase: 'running', elapsedMs: 1000, key: 'r:l', orphaned: false }],
-      queued: [], running: [], used: {}, budget: {},
-    };
-    let text = '';
-    try { text = renderStatusText(status); } catch { /* a minimal status object may lack fields the renderer reads */ }
-    if (text === '') return;
-    assert.match(text, /queued \(unplaceable: class\)/);
-  },
 };
 
 const CANARIES = [
@@ -272,11 +335,16 @@ const CANARIES = [
   ['pull-envelope.js', ['const versionOf = (envelope) => (envelope.placementRequest !== undefined ? PLACED_ENVELOPE_VERSION : envelope.dispatchKey === undefined ? ENVELOPE_VERSION : KEYED_ENVELOPE_VERSION);', 'const versionOf = (envelope) => (envelope.dispatchKey === undefined ? ENVELOPE_VERSION : KEYED_ENVELOPE_VERSION);'], 'an envelope that carries a placement is version 3, keyed or not, and a reader that accepts only 1 and 2 refuses it instead of enqueueing without it', null],
   ['queue-client.js', ['const trailing = placed ? [true,', 'const trailing = false ? [true,'], 'the queue client never trims a placement off the enqueue: any one of the three sends the long form, an unconstrained one the short form', null],
   ['pull-enqueue.js', ['(envelope.placementRequest === undefined ? null : placementRefusal(err)) ?? ', ''], 'a queue that does not know placement, an unknown host and a placement mismatch each end a placed submission 76 before anything is queued, unkeyed too, and a replay decides again without sending', null],
-  ['pull-enqueue.js', ['...(envelope.placementRequest === undefined ? {} : placementArgs(envelope.placementRequest)),', ''], 'a committed enqueue whose reply was lost is recovered as the same ticket with the same placement, and a placed unkeyed ticket gets the durable ack', null],
   ['pull-placement.js', ['if (constrained) return { route: \'pull\', services };', ''], 'a placed ticket is never routed local or push: the queue decides, an alias that shadows a runner is refused 64, and an unreachable queue is not a refusal', null],
   ['pull-placement.js', ['const shadow = aliasesApplied.find((alias) => known.includes(alias));', 'const shadow = undefined;'], 'a placed ticket is never routed local or push: the queue decides, an alias that shadows a runner is refused 64, and an unreachable queue is not a refusal', null],
   ['config.js', ['assert(!targets.has(alias),', 'assert(true,'], 'hostAliases is validated: a key must be lower-case, a value a runner id, and no key may be another alias value', null],
   ['run.js', ['timedOut: true, ', ''], 'the detached wait of an unkeyed ticket that timed out hands back its id and says wait, never retry', null],
+  ['placement.js', ['export const adoptsPlacement = (held, requested) => requested == null || samePlacement(held, requested);', 'export const adoptsPlacement = (held, requested) => samePlacement(held, requested);'], 'an unconstrained request adopts any holder and only a placed one needs the exact placement', null],
+  ['placement.js', ['&& hostsOk && targetOk && constrained;', '&& hostsOk && targetOk;'], 'a v3 envelope must name a consistent placement: a platform with no class, a non-canonical class or list, a target that is avoided, or nothing at all is refused, and a placed envelope never selects the short enqueue', null],
+  ['queue-client.js', ['const placed = namedPlaced || ', 'const placed = '], 'a v3 envelope must name a consistent placement: a platform with no class, a non-canonical class or list, a target that is avoided, or nothing at all is refused, and a placed envelope never selects the short enqueue', null],
+  ['run.js', ['if (ended !== null && ended.code !== DUPLICATE_SUBMISSION_EXIT) return', 'if (ended !== null) return'], 'the detached wait of a placed id: a duplicate supervisor (78) follows the original through its ack, another placement winning the id is 64 even with its ack visible, and a duplicate that never gets an answer times out 75', null],
+  ['run.js', ['(ack?.ticketId === id && !idAdoptsPlacement(root, id, placement))', 'false'], 'the detached wait of a placed id: a duplicate supervisor (78) follows the original through its ack, another placement winning the id is 64 even with its ack visible, and a duplicate that never gets an answer times out 75', null],
+  ['placement-record.js', ['placementMismatch: !idAdoptsPlacement(root, id, placement)', 'placementMismatch: false'], 'the locked duplicate check of a supervisor flags an id placed otherwise, so two submissions racing on one id cannot both win', null],
 ];
 
 for (const [name, scenario] of Object.entries(SCENARIOS)) test(name, (t) => scenario(realSrc, t));

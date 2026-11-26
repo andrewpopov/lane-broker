@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import { adoptsPlacement } from './placement.js';
 import path from 'node:path';
 import { fallbackToLocal, readAttempt, remoteCancelledResult, supervisorAlive, updateAttempt } from './attempts.js';
 import { DEFAULT_GLOBAL_CONFIG } from './config.js';
@@ -580,6 +581,8 @@ export async function preparePullTicket(ctx) {
   const run = runOf(ctx);
   const { envelopeFields, worktreeRoot, manifest } = ctx.prepare;
   const existing = readEnvelope(run.root, run.id);
+  // a retained envelope answers this id only for the placement it was made for: a placed request never reuses another's
+  if (existing !== null && !adoptsPlacement(existing.placementRequest, envelopeFields.placementRequest)) throw new Error(`pull envelope for ${run.id} was made for a different placement`);
   await persistPull(run, { stage: 'PREPARING' }, { transport: 'pull', phase: 'probe' });
   await hook(run, 'afterMarker');
   const envelope = existing ?? await createEnvelope(run.root, { ...envelopeFields, logicalId: run.id });

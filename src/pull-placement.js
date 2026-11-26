@@ -85,7 +85,7 @@ export async function placeForPull({
 }
 
 // an alias that is itself a runner id would silently send a request for one real host to another
-async function shadowedAlias(services, aliasesApplied) {
+export async function shadowedAlias(services, aliasesApplied) {
   let known;
   try {
     known = await services.queue.knownHosts(QUEUE_PROBE);

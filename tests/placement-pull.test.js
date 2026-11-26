@@ -42,6 +42,31 @@ const SCENARIOS = {
     assert.equal((await fx.row()).state, 'queued', 'the ticket stayed queued throughout');
   },
 
+  'a committed enqueue whose reply was dropped is recovered as the one row it made, with its placement': async (load, w, t) => {
+    const fx = await pullFixture(t, w, { load, id: tid(5) });
+    fx.envelopeFields.placementRequest = { capabilityClass: 'linux', classPlatform: 'linux', classTags: [], avoidHosts: ['x'], targetHost: 'a2' };
+    await fx.prepare();
+    const dropping = { ...fx.queue, enqueueFenced: async (args) => { await fx.queue.enqueueFenced(args); throw Object.assign(new Error('connection reset'), { name: 'QueueError' }); } };
+    await fx.step();
+    await fx.step({ queue: dropping }).catch(() => {});
+    const rows = async () => (await (await w.su()).query('SELECT id, capability_class, avoid_hosts, target_host FROM lane_dispatch.tickets')).rows;
+    assert.deepEqual(await rows(), [{ id: tid(5), capability_class: 'linux', avoid_hosts: ['x'], target_host: 'a2' }], 'the first send committed');
+    for (let i = 0; i < 3; i++) await fx.step();
+    assert.deepEqual(await rows(), [{ id: tid(5), capability_class: 'linux', avoid_hosts: ['x'], target_host: 'a2' }], 'the recovery found it and sent nothing else');
+    assert.ok(fx.pull().enqueue.seenRowAt, 'the recovery saw the row');
+  },
+
+  'a retained envelope answers its own placement only: preparing for another is refused, the same one reuses it': async (load, w, t) => {
+    const fx = await pullFixture(t, w, { load, id: tid(6) });
+    fx.envelopeFields.placementRequest = { capabilityClass: null, classPlatform: null, classTags: [], avoidHosts: [], targetHost: 'a2' };
+    await fx.prepare();
+    await fx.prepare();
+    fx.envelopeFields.placementRequest = { ...fx.envelopeFields.placementRequest, targetHost: 'x' };
+    await assert.rejects(fx.prepare(), /different placement/);
+    fx.envelopeFields.placementRequest = undefined;
+    await fx.prepare();
+  },
+
   'an unconstrained ticket keeps no placement and reports no reason while a runner can take it': async (load, w, t) => {
     const fx = await pullFixture(t, w, { load, id: tid(2) });
     await fx.enqueue();
@@ -52,7 +77,13 @@ const SCENARIOS = {
   },
 };
 
+const REPLY = 'a committed enqueue whose reply was dropped is recovered as the one row it made, with its placement';
+const RETAINED = 'a retained envelope answers its own placement only: preparing for another is refused, the same one reuses it';
+const FIRST = 'a placed envelope is enqueued with its placement, and the poller copies why no runner can take it into the attempt until one can';
 const CANARIES = [
+  [RETAINED, 'pull-ticket.js', ['!adoptsPlacement(existing.placementRequest, envelopeFields.placementRequest)', 'false'], null, null],
+  [FIRST, 'status.js', ["${r.pullUnplaceable ? ` queued (unplaceable: ${r.pullUnplaceable})` : ''}", ''], null, null],
+  [REPLY, 'pull-enqueue.js', ['...(envelope.placementRequest === undefined ? {} : placementArgs(envelope.placementRequest)),', ''], null, null],
   ['a placed envelope is enqueued with its placement, and the poller copies why no runner can take it into the attempt until one can', 'pull-ticket.js',
     ["if (unplaceable !== (attempt.pull.unplaceable ?? null)) await persistPull(run, { unplaceable });", ''], null, /no principal runs win32|unplaceable|expected/i],
 ];

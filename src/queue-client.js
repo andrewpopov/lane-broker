@@ -15,7 +15,7 @@ const TOO_MANY_CONNECTIONS = '53300';
 // a 53300 happens before anything is sent, so every call retries it; a guard kill may follow a commit, so only idempotent calls retry that
 
 // SQL parameter types in order (a call sends as many as it has arguments, so a call that names none of the trailing defaults runs against an older schema); `idempotent` says whether a call that may already have committed can be sent again
-const FUNCTIONS = {
+export const FUNCTIONS = {
   ld_queue_ref: { types: [], idempotent: true },
   ld_enqueue_fenced: { types: ['text', 'uuid', 'text', 'text', 'text', 'jsonb', 'jsonb', 'jsonb', 'text[]', 'real', 'bigint', 'int', 'int', 'boolean', 'text', 'real', 'text[]', 'text[]', 'real', 'text', 'text', 'text[]', 'text'], idempotent: false },
   ld_ticket_by_key: { types: ['text', 'jsonb'], idempotent: true },
@@ -126,11 +126,11 @@ export function createQueueClient({
   return {
         queueRef: (options) => invoke('ld_queue_ref', [], options),
 
-        enqueueFenced: ({ expectRef, id, repoKey, lane, laneKey, binding, header, snapshot, requiresTags, avoidTags = [], requires = [], cpuCores, minCpuCores, memoryBytes, priority = 0, minProtocol = 1, dispatchKey, capabilityClass, avoidHosts = [], targetHost }) => {
+        enqueueFenced: ({ expectRef, id, repoKey, lane, laneKey, binding, header, snapshot, requiresTags, avoidTags = [], requires = [], cpuCores, minCpuCores, memoryBytes, priority = 0, minProtocol = 1, dispatchKey, capabilityClass, avoidHosts = [], targetHost, placed: namedPlaced = false }) => {
       // only a lane that sets avoidTags (007), requires (008), an elastic floor (009), a dispatch key (012) or a placement (013) needs the longer function, so every other enqueue still works against an older queue
       // a dispatch key or a placement is never trimmed off: the long form carries it, and a queue without it answers 42883, which the caller turns into a refusal
       const elastic = Number.isFinite(minCpuCores) && minCpuCores < cpuCores;
-      const placed = capabilityClass !== undefined || avoidHosts.length > 0 || targetHost !== undefined;
+      const placed = namedPlaced || capabilityClass !== undefined || avoidHosts.length > 0 || targetHost !== undefined;
       const trailing = placed ? [true, null, null, avoidTags, requires, elastic ? minCpuCores : null, dispatchKey ?? null, capabilityClass ?? null, avoidHosts, targetHost ?? null]
         : dispatchKey !== undefined ? [true, null, null, avoidTags, requires, elastic ? minCpuCores : null, dispatchKey]
         : elastic ? [true, null, null, avoidTags, requires, minCpuCores]

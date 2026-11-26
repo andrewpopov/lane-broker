@@ -14,13 +14,13 @@ import { isPidAlive, readLease, LEASE_STATE, NOT_FOUND_GRACE_MS } from './lease.
 import { listQueue } from './scheduler.js';
 import { writePending } from './pending.js';
 import { DISPATCH_KEY_HELD_ELSEWHERE_EXIT, dispatchKeyPullRefusal, heldTicketLine, isDispatchKey, liveHolder } from './dispatch-key.js';
-import { lookupTicketByKey } from './ticket-by-key.js';
-import { PLACEMENT_REFUSED_EXIT, PLACEMENT_USAGE_EXIT, PlacementUsageError, canonicalPlacement, placementKeyOfView, placementPullRefusal, placementRefusal, samePlacement } from './placement.js';
-import { readEnvelope } from './pull-envelope.js';
+import { aliasShadow, lookupTicketByKey } from './ticket-by-key.js';
+import { PLACEMENT_MISMATCH_SQLSTATE, PLACEMENT_MISMATCH_SUPERVISOR_EXIT, PLACEMENT_REFUSED_EXIT, PLACEMENT_USAGE_EXIT, PlacementUsageError, adoptsPlacement, canonicalPlacement, placementKeyOfView, placementPullRefusal, placementRefusal } from './placement.js';
+import { idAdoptsPlacement } from './placement-record.js';
 import { QUEUE_CONNECT_TIMEOUT_MS, QUEUE_QUERY_TIMEOUT_MS } from './queue-client.js';
 import { peekLedger } from './pull-ledger.js';
 import { enqueueAckFile } from './pull-enqueue.js';
-import { readAttempt } from './attempts.js';
+import { DUPLICATE_SUBMISSION_EXIT, readAttempt } from './attempts.js';
 import { waitCommand } from './wait.js';
 import { stampPriorityOrigin } from './priority-clock.js';
 import { isValidGroupId } from './priority.js';
@@ -55,17 +55,6 @@ function sleep(ms) {
 /** Whether this machine submitted (or has any record of) the ticket: reads only. */
 const heldLocally = (root, id) => readAttempt(root, id) !== null || fs.existsSync(path.join(paths(root).results, `${id}.json`)) || peekLedger(root, id) !== null;
 
-/** The placement this machine recorded for a ticket id: its attempt's, else its pull envelope's; unconstrained when neither says (a settled ticket with no envelope left cannot vouch for a placement). */
-const localPlacementOf = (root, id) => {
-  const attempt = readAttempt(root, id);
-  if (attempt !== null) return attempt.placementRequest ?? null;
-  try {
-    return readEnvelope(root, id)?.placementRequest ?? null;
-  } catch {
-    return null;
-  }
-};
-
 // a zero or tiny --timeout never reaches pg as a zero (no deadline) or a few milliseconds
 const LOOKUP_MIN_TIMEOUT_MS = 1000;
 const KEYED_ENQUEUE_POLL_MS = 100;
@@ -76,20 +65,23 @@ const KEYED_ENQUEUE_CAP_MS = 60_000;
  * is published, so a ticket that finishes at once still tells us its id. Returns `{id}` (print it), or `{exitCode, note, held?}`: a refusal's exit, 73 when
  * the winner is a ticket this machine did not submit, 1 when the supervisor ended without an answer, 75 when the deadline passed (`--timeout`, else a fixed cap).
  */
-export async function awaitKeyedEnqueue({ root, id, resultPath, supervisorEnded, timeoutMs, keyed = true, now = Date.now }) {
-  let ended = false;
-  supervisorEnded.then(() => { ended = true; });
+export async function awaitKeyedEnqueue({ root, id, resultPath, supervisorEnded, timeoutMs, keyed = true, placement = null, now = Date.now }) {
+  let ended = null;
+  supervisorEnded.then((how) => { ended = how ?? {}; });
   const deadline = now() + (timeoutMs ?? KEYED_ENQUEUE_CAP_MS);
   for (;;) {
     // the result is read before the ack: the ack is always written first, so a published result implies an ack that is already there
     const published = readJsonSafe(resultPath);
     const ack = readJsonSafe(enqueueAckFile(root, id));
+    // another submission of this id with another placement won the lock: its ack is not ours, whether or not this supervisor has been seen to end yet
+    if (ended?.code === PLACEMENT_MISMATCH_SUPERVISOR_EXIT || (ack?.ticketId === id && !idAdoptsPlacement(root, id, placement))) return { exitCode: PLACEMENT_USAGE_EXIT, note: `id ${id} was used with different placement; use a new id (or the same placement)` };
     if (ack?.ticketId === id) return { id };
     if (ack?.ticketId) {
       return heldLocally(root, ack.ticketId) ? { id: ack.ticketId } : { exitCode: DISPATCH_KEY_HELD_ELSEWHERE_EXIT, held: { id: ack.ticketId, state: ack.state, host: ack.host }, note: `dispatch key is held by ticket ${ack.ticketId}, which this machine did not submit` };
     }
     if (published !== null) return { exitCode: Number.isInteger(published.exit) ? published.exit : 1, note: published.error ?? `${id} ended (exit ${published.exit}) before it was queued` };
-    if (ended) return { exitCode: 1, note: `the supervisor of ${id} ended before the queue answered the enqueue` };
+    // a duplicate supervisor (exit 78) is the same submission arriving twice: the original one is followed through its ack, refusal or the deadline
+    if (ended !== null && ended.code !== DUPLICATE_SUBMISSION_EXIT) return { exitCode: 1, note: `the supervisor of ${id} ended before the queue answered the enqueue` };
     // the read above was the last one at or after the deadline, so an answer that was there on time is never discarded
     const remaining = deadline - now();
     if (remaining <= 0) return { exitCode: 75, timedOut: true, note: `the queue had not answered the enqueue of ${id} within the time left (${timeoutMs ?? KEYED_ENQUEUE_CAP_MS}ms); not failed, ${keyed ? 'retry the same key' : `follow it with: lane wait ${id}`}` };
@@ -403,6 +395,8 @@ export async function runCommand({
   targetHost,
   // PKG-438 test seam: how the key is looked up in the queue
   lookupKey = lookupTicketByKey,
+  // PKG-439 test seam: how an applied host alias is checked against the queue's known hosts
+  shadowCheck = aliasShadow,
   // BRAIN-319: called with the ticket id as soon as it exists (before the
   // supervisor is spawned, so before any child can start). Returning
   // `false` aborts the run without ever spawning the supervisor.
@@ -735,6 +729,14 @@ export async function runCommand({
     return { exitCode: 64 };
   }
 
+  // a host alias that is itself a known runner is refused before anything can be adopted or replayed under it
+  if (placement !== null && placement.aliasesApplied.length > 0) {
+    const shadowed = await shadowCheck(globalCfg, placement.aliasesApplied);
+    if (shadowed !== null) {
+      process.stderr.write(`lane run: ${shadowed.reason}\n`);
+      return { exitCode: shadowed.exitCode };
+    }
+  }
   // PKG-438: a ticket the queue already holds under this key is this submission, so nothing is submitted again. A ticket this machine has a record of
   // is answered from that record (`lane wait` semantics); one it never submitted is reported (id, state, host) and ended with a distinct exit, and
   // the caller follows it through `lane status --dispatch-key` or the status view. This runs before the state directory is created or the priority clock
@@ -750,7 +752,8 @@ export async function runCommand({
       held = await lookupKey(globalCfg, undefined, dispatchKey, { options: timeoutMs === undefined ? undefined : { attempts: 1, connectTimeoutMs: Math.max(LOOKUP_MIN_TIMEOUT_MS, Math.min(QUEUE_CONNECT_TIMEOUT_MS, timeoutMs)), queryTimeoutMs: Math.max(LOOKUP_MIN_TIMEOUT_MS, Math.min(QUEUE_QUERY_TIMEOUT_MS, timeoutMs)) }, ...(placement === null ? {} : { placement }) });
     } catch (err) {
       // a queue that answers the lookup with a placement refusal (a holder placed otherwise, or no placement support at all) has decided: nothing is adopted and nothing is submitted
-      const refusal = placement === null ? null : placementRefusal(err);
+      // a holder placed otherwise (LK423) is final; a queue without the placement lookup (42883) is left to the supervisor, whose refusal is published and durable
+      const refusal = placement === null || err.code !== PLACEMENT_MISMATCH_SQLSTATE ? null : placementRefusal(err);
       if (refusal !== null) {
         process.stderr.write(`lane run: ${refusal.reason}; nothing was submitted\n`);
         return { exitCode: refusal.exitCode };
@@ -758,7 +761,7 @@ export async function runCommand({
       process.stderr.write(`lane run: dispatch key lookup failed (${err.message}); the queue will decide at enqueue\n`);
     }
     held = liveHolder(held);
-    if (held !== null && placement !== null && !samePlacement(placementKeyOfView(held), placement)) {
+    if (held !== null && !adoptsPlacement(placementKeyOfView(held), placement)) {
       process.stderr.write(`lane run: dispatch key ${dispatchKey} is held by ticket ${held.id} with different placement; use a fresh dispatch key for a placed re-run\n`);
       return { exitCode: PLACEMENT_REFUSED_EXIT };
     }
@@ -877,7 +880,7 @@ export async function runCommand({
     process.stderr.write(`lane run: --id "${ticketId}" must be a UUID for a remote-eligible lane\n`);
     return { exitCode: 64 };
   }
-  if (placement !== null && ticketId !== undefined && heldLocally(root, ticketId) && !samePlacement(localPlacementOf(root, ticketId), placement)) {
+  if (placement !== null && ticketId !== undefined && !idAdoptsPlacement(root, ticketId, placement)) {
     process.stderr.write(`lane run: id ${ticketId} was used with different placement; use a new id (or the same placement)\n`);
     return { exitCode: PLACEMENT_USAGE_EXIT };
   }
@@ -1096,7 +1099,7 @@ export async function runCommand({
     // PKG-439: so is a placed one, whose refusal (an unknown host, a queue too old) must reach the caller as an exit, not as an id
     let printedId = id;
     if (dispatchKey !== undefined || placement !== null) {
-      const answer = await awaitKeyedEnqueue({ root, id, resultPath, supervisorEnded, keyed: dispatchKey !== undefined, timeoutMs: timeoutMs === undefined ? undefined : Math.max(0, timeoutMs - (Date.now() - runStartedAt)) });
+      const answer = await awaitKeyedEnqueue({ root, id, resultPath, supervisorEnded, keyed: dispatchKey !== undefined, placement, timeoutMs: timeoutMs === undefined ? undefined : Math.max(0, timeoutMs - (Date.now() - runStartedAt)) });
       if (answer.exitCode !== undefined) {
         if (answer.held) process.stdout.write(heldTicketLine(dispatchKey, answer.held, json));
         // an unkeyed submission that the queue had not answered yet still exists: its id is the only handle on it

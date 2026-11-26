@@ -1,5 +1,6 @@
 import { isDispatchKey } from './dispatch-key.js';
 import { loadGlobalConfigOrError } from './config.js';
+import { shadowedAlias } from './pull-placement.js';
 import { pullServices } from './pull-services.js';
 import { ensureStateDirs } from './state.js';
 
@@ -9,6 +10,14 @@ export async function lookupTicketByKey(cfg, root, dispatchKey, { servicesFor = 
   const services = servicesFor(cfg, root);
   if (!services.available) throw new Error(`pull dispatch is not available here: ${services.reason}`);
   return (await services.queue.ticketByKey(dispatchKey, options, placement)) ?? null;
+}
+
+/** PKG-439: the refusal (`{route: 'refuse', exitCode, reason}`) of a request whose applied `hostAliases` key is itself a host the queue knows, or null; an unreachable queue answers null here and is asked again at placement. Read-only. */
+export async function aliasShadow(cfg, aliasesApplied, { servicesFor = pullServices } = {}) {
+  const services = servicesFor(cfg, undefined);
+  if (!services.available) return null;
+  const answer = await shadowedAlias(services, aliasesApplied);
+  return answer?.route === 'refuse' ? answer : null;
 }
 
 /** `lane status --dispatch-key <k>`: the ticket's id, state and host. Exit 0 found, 1 none (or the queue cannot answer), 64 an invalid key. */

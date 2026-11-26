@@ -89,7 +89,26 @@ export const placementPullRefusal = (lane, reason, exitCode = PLACEMENT_REFUSED_
   message: `lane run: placement constraints need the pull queue, so lane "${lane}" was not run${reason ? ` (${reason})` : ''}.\n`,
 });
 
-export const isPlacementRecord = (value) => value !== null && typeof value === 'object'
-  && (value.capabilityClass === null || typeof value.capabilityClass === 'string') && (value.classPlatform === null || PLATFORMS.includes(value.classPlatform))
-  && Array.isArray(value.avoidHosts) && value.avoidHosts.every((host) => HOST_ID_RE.test(host)) && Array.isArray(value.classTags)
-  && (value.targetHost === null || HOST_ID_RE.test(value.targetHost));
+export function isPlacementRecord(value) {
+  if (value === null || typeof value !== 'object' || !Array.isArray(value.avoidHosts) || !Array.isArray(value.classTags)) return false;
+  const { capabilityClass, classPlatform, classTags, avoidHosts, targetHost } = value;
+  let parsed = { capabilityClass: null, classPlatform: null, classTags: [] };
+  if (capabilityClass !== null) {
+    try {
+      parsed = parseCapabilityClass(capabilityClass);
+    } catch {
+      return false;
+    }
+  }
+  const sameList = (a, b) => a.length === b.length && a.every((item, i) => item === b[i]);
+  const hostsOk = avoidHosts.every((host) => HOST_ID_RE.test(host)) && sameList(avoidHosts, sortedUnique(avoidHosts));
+  const targetOk = targetHost === null || (HOST_ID_RE.test(targetHost) && !avoidHosts.includes(targetHost));
+  const constrained = capabilityClass !== null || avoidHosts.length > 0 || targetHost !== null;
+  return capabilityClass === parsed.capabilityClass && classPlatform === parsed.classPlatform && sameList(classTags, parsed.classTags) && hostsOk && targetOk && constrained;
+}
+
+/** What a holder placed as `held` may answer: an unconstrained request adopts any holder (it ran under a placement at least as strict), a placed one needs the exact canonical placement. */
+export const adoptsPlacement = (held, requested) => requested == null || samePlacement(held, requested);
+
+/** The exit of a supervisor that found its `--id` already used with another placement: the parent reports it as 64 even when the winner's ack is already visible. */
+export const PLACEMENT_MISMATCH_SUPERVISOR_EXIT = 90;

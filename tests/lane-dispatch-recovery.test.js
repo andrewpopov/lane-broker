@@ -1,6 +1,7 @@
 import { describe, test, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
+import { FUNCTIONS as QUEUE_FUNCTIONS } from '../src/queue-client.js';
 import { pgSkipOption } from './lane-db-harness.js';
 import {
   startDispatchCluster, World, logins, call, enqueue, claim, start, heartbeat, finish, liftBackoff, tid, simulateRestore, waitBlocked, holdLock,
@@ -76,20 +77,30 @@ function entryCalls(t1) {
 const GUARDS = {
   'the timeline restore settles the queue from each ld_* function': async (w, makeWorld) => {
     const su = await w.su();
-    // every overload is probed on its own, named `name/arity` where a name has more than one
-    const { rows } = await su.query("SELECT CASE WHEN count(*) OVER (PARTITION BY proname) > 1 THEN proname || '/' || pronargs ELSE proname END AS probe, proname FROM pg_proc WHERE pronamespace = 'lane_dispatch'::regnamespace AND proname LIKE 'ld\\_%' ORDER BY 1");
+    // every function is probed by its full signature (a regprocedure), called with the types it declares; an overloaded name is keyed `name/arity` in entryCalls
+    const { rows } = await su.query(`SELECT p.oid::regprocedure::text AS signature, p.proname, p.pronargs::int AS arity, count(*) OVER (PARTITION BY p.proname)::int AS same_name,
+        (SELECT coalesce(array_agg(format_type(u.t, NULL) ORDER BY u.ord), '{}') FROM unnest(p.proargtypes) WITH ORDINALITY AS u(t, ord)) AS types,
+        (SELECT coalesce(array_agg(u.t::int ORDER BY u.ord), '{}') FROM unnest(p.proargtypes) WITH ORDINALITY AS u(t, ord)) AS oids
+      FROM pg_proc p WHERE p.pronamespace = 'lane_dispatch'::regnamespace AND p.proname LIKE 'ld\\_%' ORDER BY p.oid::regprocedure::text`);
+    const probeName = (r) => (r.same_name > 1 ? `${r.proname}/${r.arity}` : r.proname);
+    const probed = rows.filter((r) => !NOT_ENTRY_CHECKED.includes(r.proname));
     const probe = entryCalls({ id: tid(1), epoch: 1, token: randomUUID() });
-    assert.deepEqual(Object.keys(probe).sort(), rows.filter((r) => !NOT_ENTRY_CHECKED.includes(r.proname)).map((r) => r.probe).sort(), 'every ld_* function and overload is in the loop');
-    for (const name of Object.keys(probe)) {
+    assert.deepEqual(Object.keys(probe).sort(), probed.map(probeName).sort(), 'every ld_* function and overload is in the loop');
+    // the queue client casts each argument to a type of its table: every function it calls has a signature of exactly those types
+    for (const [name, { types }] of Object.entries(QUEUE_FUNCTIONS)) {
+      const oids = (await Promise.all(types.map((type) => su.query('SELECT to_regtype($1)::oid::int AS o', [type])))).map(({ rows: [{ o }] }) => o);
+      assert.ok(rows.some((r) => r.proname === name && r.oids.length === oids.length && r.oids.every((o, i) => o === oids[i])), `${name}(${types.join(', ')}) is a signature the queue has`);
+    }
+    for (const r of probed) {
       const world = await makeWorld();
       const t1 = await heldAndQueued(world);
       await simulateRestore(world);
-      const [login, args] = entryCalls(t1)[name];
-      await call(await world.as(login), name.split('/')[0], ...args).catch(() => {});
+      const [login, args] = entryCalls(t1)[probeName(r)];
+      await (await world.as(login)).query(`SELECT lane_dispatch.${r.proname}(${r.types.slice(0, args.length).map((type, i) => `$${i + 1}::${type}`).join(', ')})`, args).catch(() => {});
       const { rows: [c] } = await (await world.su()).query(
         'SELECT c.incarnation, c.timeline = (SELECT timeline_id FROM pg_control_checkpoint()) AS synced FROM lane_dispatch.cluster c');
-      assert.deepEqual(c, { incarnation: 1, synced: true }, `${name}: cluster resynced and incarnation bumped once`);
-      assert.equal((await world.ticket(tid(2))).state, 'lost', `${name}: the untouched queued row is settled lost`);
+      assert.deepEqual(c, { incarnation: 1, synced: true }, `${r.signature}: cluster resynced and incarnation bumped once`);
+      assert.equal((await world.ticket(tid(2))).state, 'lost', `${r.signature}: the untouched queued row is settled lost`);
       await w.cluster.closeClients();
     }
   },

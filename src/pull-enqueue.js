@@ -21,7 +21,9 @@ const readEnqueueAck = (root, id) => readJsonSafe(enqueueAckFile(root, id));
 
 const EMPTY_INTENT = { attempts: [], seenRowAt: null };
 
+// `placed` names a placement even when every field of it is empty, so no envelope can select the short, unconstrained signature
 const placementArgs = ({ capabilityClass, avoidHosts, targetHost }) => ({
+  placed: true,
   ...(capabilityClass === null ? {} : { capabilityClass }),
   avoidHosts,
   ...(targetHost === null ? {} : { targetHost }),
