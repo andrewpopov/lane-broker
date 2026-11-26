@@ -5,6 +5,9 @@ import { isDispatchKey } from './dispatch-key.js';
 import { atomicWriteJson, ensureDurableDir, fsyncDirectory, paths, readJsonSafe, withLock } from './state.js';
 
 export const ENVELOPE_VERSION = 1;
+/** An envelope that carries a dispatch key is version 2: a reader older than the key checks `v === 1` and refuses it, so it can never enqueue the run without its key. */
+export const KEYED_ENVELOPE_VERSION = 2;
+const versionOf = (envelope) => (envelope.dispatchKey === undefined ? ENVELOPE_VERSION : KEYED_ENVELOPE_VERSION);
 const TICKET_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const REQUIRED_FIELDS = ['logicalId', 'binding', 'header', 'repoKey', 'lane', 'laneKey', 'cpuCores', 'memoryBytes', 'requiresTags', 'priority'];
 // optional, so an envelope written before PKG-438 still reads: dispatchKey (the caller's idempotency key)
@@ -26,7 +29,8 @@ export function withTicketLock(root, id, fn, { lockTimeoutMs = LOCK_TIMEOUT_MS }
 }
 
 function validate(envelope) {
-  if (envelope?.v !== ENVELOPE_VERSION) throw new Error(`pull envelope version ${envelope?.v} is not ${ENVELOPE_VERSION}`);
+  if (envelope?.v !== ENVELOPE_VERSION && envelope?.v !== KEYED_ENVELOPE_VERSION) throw new Error(`pull envelope version ${envelope?.v} is not ${ENVELOPE_VERSION} or ${KEYED_ENVELOPE_VERSION}`);
+  if (envelope.v !== versionOf(envelope)) throw new Error(`pull envelope version ${envelope.v} does not match its dispatch key`);
   if (!TICKET_ID_RE.test(envelope.logicalId ?? '')) throw new Error('pull envelope logicalId must be a ticket uuid');
   const missing = REQUIRED_FIELDS.filter((field) => envelope[field] === undefined);
   const missingBinding = REQUIRED_BINDING_FIELDS.filter((field) => envelope.binding?.[field] === undefined);
@@ -54,7 +58,7 @@ function writeEnvelope(root, envelope) {
 }
 
 export async function createEnvelope(root, fields, { now = Date.now, lockTimeoutMs } = {}) {
-  const envelope = validate({ ...fields, v: ENVELOPE_VERSION, createdAt: now() });
+  const envelope = validate({ ...fields, v: versionOf(fields), createdAt: now() });
   return withTicketLock(root, envelope.logicalId, () => {
     if (fs.existsSync(envelopeFile(root, envelope.logicalId))) throw Object.assign(new Error(`pull envelope for ${envelope.logicalId} already exists`), { code: 'EEXIST' });
     writeEnvelope(root, envelope);

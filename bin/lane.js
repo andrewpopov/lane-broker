@@ -52,6 +52,7 @@ function usage() {
            [--timeout <duration>] [--allow-local-sim] [--local] [--log <path>] -- <command...>
   lane status [--json]
   lane status --dispatch-key <key> [--json]
+           (--dispatch-key idempotency lasts while the queue keeps the ticket row, 7 days by default: use attempt-scoped keys, never resubmit one after that)
   lane capabilities --json
   lane suggest [--repo <name>] [--days <n>] [--json]
   lane estimates [--json] [--root <stateHome>]

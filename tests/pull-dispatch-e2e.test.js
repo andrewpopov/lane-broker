@@ -344,7 +344,7 @@ const CANARIES = [
   ['a finished pull ticket exits with the job\'s own exit code, publishes one result and writes one history row', ...pullTicket("case 'confirmed':\n      return Number.isInteger(outcome.exitCode) ? outcome.exitCode : 1;", "case 'confirmed':\n      return 0;")],
   ['a proven cancel of a queued pull ticket exits 130', ...pullTicket('return CANCELLED_EXIT;', 'return 0;')],
   ['a pull ticket the queue marks lost exits 75', ...pullTicket('return Number.isInteger(outcome.exitCode) ? outcome.exitCode : LOST_EXIT;', 'return 0;')],
-  ['a cancel the queue records without proof leaves the pull ticket unresolved: exit 1, the attempt kept', ...pullTicket("    case 'unresolved':\n      return Number.isInteger(outcome.exitCode) ? outcome.exitCode : 1;", "    case 'unresolved':\n      return 0;")],
+  ['a cancel the queue records without proof leaves the pull ticket unresolved: exit 1, the attempt kept', ...pullTicket("    case 'unresolved':\n      return 1;", "    case 'unresolved':\n      return 0;")],
 ];
 
 describe('pull placement and settlement through a real supervisor', { skip: pgSkipOption, timeout: scaledMs(900_000) }, () => {

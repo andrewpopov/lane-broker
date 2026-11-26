@@ -804,7 +804,7 @@ CREATE OR REPLACE FUNCTION lane_dispatch.ld_enqueue(p_id uuid, p_repo_key text, 
                                                     p_ages boolean DEFAULT true, p_source text DEFAULT NULL, p_est_run_s real DEFAULT NULL, p_avoid_tags text[] DEFAULT '{}',
                                                     p_requires text[] DEFAULT '{}', p_min_cpu_cores real DEFAULT NULL, p_dispatch_key text DEFAULT NULL)
 RETURNS jsonb LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
-DECLARE v_me record; v_held record;
+DECLARE v_me record; v_held record; v_try int;
 BEGIN
   PERFORM lane_dispatch.ld_entry();
   SELECT * INTO v_me FROM lane_dispatch.me('submit');
@@ -819,21 +819,28 @@ BEGIN
       RETURN lane_dispatch.ticket_view(v_held.id, session_user);
     END IF;
   END IF;
-  BEGIN
-    INSERT INTO lane_dispatch.tickets (id, owner, repo_key, lane, lane_key, binding, header, snapshot, requires_tags, cpu_cores, memory_bytes, priority, incarnation,
-                                       min_protocol, ages, source, est_run_s, avoid_tags, requires, min_cpu_cores, dispatch_key, created_at, status_changed_at)
-      VALUES (p_id, session_user, p_repo_key, p_lane, p_lane_key, p_binding, p_header, p_snapshot, coalesce(p_requires_tags, '{}'), p_cpu_cores, p_memory_bytes,
-              coalesce(p_priority, 0), (SELECT c.incarnation FROM lane_dispatch.cluster c), coalesce(p_min_protocol, 1), coalesce(p_ages, true), p_source, p_est_run_s,
-              coalesce(p_avoid_tags, '{}'), coalesce(p_requires, '{}'), CASE WHEN p_min_cpu_cores < p_cpu_cores THEN p_min_cpu_cores END, p_dispatch_key, lane_dispatch.now(), lane_dispatch.now())
-      ON CONFLICT (id) DO NOTHING;
-    IF FOUND THEN PERFORM pg_notify('ld_work', ''); END IF;
-  EXCEPTION WHEN unique_violation THEN
-    -- only the key index can raise here (the id conflict is absorbed above): a concurrent submit with this key committed first, so its ticket is the answer
-    SELECT h.id, h.owner INTO v_held FROM lane_dispatch.key_holder(p_dispatch_key) h;
-    IF NOT FOUND THEN RAISE; END IF;
-    IF v_held.owner <> session_user THEN RAISE EXCEPTION 'dispatch key % is held by another owner', p_dispatch_key USING ERRCODE = 'LK409'; END IF;
-    RETURN lane_dispatch.ticket_view(v_held.id, session_user);
-  END;
+  -- a second try only when the holder that beat this insert is already gone (withdrawn in between): the key is free again
+  FOR v_try IN 1..2 LOOP
+    BEGIN
+      INSERT INTO lane_dispatch.tickets (id, owner, repo_key, lane, lane_key, binding, header, snapshot, requires_tags, cpu_cores, memory_bytes, priority, incarnation,
+                                         min_protocol, ages, source, est_run_s, avoid_tags, requires, min_cpu_cores, dispatch_key, created_at, status_changed_at)
+        VALUES (p_id, session_user, p_repo_key, p_lane, p_lane_key, p_binding, p_header, p_snapshot, coalesce(p_requires_tags, '{}'), p_cpu_cores, p_memory_bytes,
+                coalesce(p_priority, 0), (SELECT c.incarnation FROM lane_dispatch.cluster c), coalesce(p_min_protocol, 1), coalesce(p_ages, true), p_source, p_est_run_s,
+                coalesce(p_avoid_tags, '{}'), coalesce(p_requires, '{}'), CASE WHEN p_min_cpu_cores < p_cpu_cores THEN p_min_cpu_cores END, p_dispatch_key, lane_dispatch.now(), lane_dispatch.now())
+        ON CONFLICT (id) DO NOTHING;
+      IF FOUND THEN PERFORM pg_notify('ld_work', ''); END IF;
+      EXIT;
+    EXCEPTION WHEN unique_violation THEN
+      -- only the key index can raise here (the id conflict is absorbed above): a concurrent submit with this key committed first, so its ticket is the answer
+      SELECT h.id, h.owner INTO v_held FROM lane_dispatch.key_holder(p_dispatch_key) h;
+      IF NOT FOUND THEN
+        IF v_try = 2 THEN RAISE; END IF;
+        CONTINUE;
+      END IF;
+      IF v_held.owner <> session_user THEN RAISE EXCEPTION 'dispatch key % is held by another owner', p_dispatch_key USING ERRCODE = 'LK409'; END IF;
+      RETURN lane_dispatch.ticket_view(v_held.id, session_user);
+    END;
+  END LOOP;
   IF NOT EXISTS (SELECT 1 FROM lane_dispatch.tickets t WHERE t.id = p_id AND t.owner = session_user) THEN
     RAISE EXCEPTION 'ticket % already exists', p_id USING ERRCODE = '23505';
   END IF;
