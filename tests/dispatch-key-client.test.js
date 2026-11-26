@@ -138,10 +138,10 @@ const SCENARIOS = {
     const ackOf = (root) => (fs.existsSync(enqueueAckFile(root, ID)) ? JSON.parse(fs.readFileSync(enqueueAckFile(root, ID), 'utf8')) : null);
     const own = await prepared(load, { dispatchKey: KEY });
     await enqueueOnce({ root: own.state, id: ID, generation: own.generation, queue: scripted({ id: ID, state: 'queued' }) });
-    assert.deepEqual(ackOf(own.state), { ticketId: ID });
+    assert.deepEqual(ackOf(own.state), { ticketId: ID, state: 'queued', host: null });
     const lost = await prepared(load, { dispatchKey: KEY });
-    await enqueueOnce({ root: lost.state, id: ID, generation: lost.generation, queue: scripted({ id: OTHER, state: 'queued' }) });
-    assert.deepEqual(ackOf(lost.state), { ticketId: OTHER });
+    await enqueueOnce({ root: lost.state, id: ID, generation: lost.generation, queue: scripted({ id: OTHER, state: 'running', host: 'pit' }) });
+    assert.deepEqual(ackOf(lost.state), { ticketId: OTHER, state: 'running', host: 'pit' }, 'the holder state and host the queue gave are kept');
     const gone = await prepared(load, { dispatchKey: KEY });
     const refused = await enqueueOnce({ root: gone.state, id: ID, generation: gone.generation, queue: scripted({ id: OTHER, state: 'withdrawn' }) });
     assert.equal(refused.outcome, 'dispatch-key-refused');
@@ -177,7 +177,7 @@ const SCENARIOS = {
     ack(remote, OTHER);
     atomicWriteJson(resultIn(remote), { id: ID, exit: 76 });
     const elsewhere = await wait(remote);
-    assert.deepEqual([elsewhere.exitCode, elsewhere.held], [73, { id: OTHER }]);
+    assert.deepEqual([elsewhere.exitCode, elsewhere.held.id], [73, OTHER]);
 
     const local = freshEnv().state;
     ensureStateDirs(local);
@@ -187,6 +187,10 @@ const SCENARIOS = {
 
     const silent = freshEnv().state;
     ensureStateDirs(silent);
+    const expired = freshEnv().state;
+    ensureStateDirs(expired);
+    ack(expired, ID);
+    assert.equal((await wait(expired, { timeoutMs: 1 })).exitCode, 75, 'an ack that is there only after the deadline is not accepted');
     const late = await wait(silent, { timeoutMs: 500 });
     assert.equal(late.exitCode, 75);
     assert.equal(late.id, undefined);
@@ -196,6 +200,26 @@ const SCENARIOS = {
     ensureStateDirs(refused);
     atomicWriteJson(resultIn(refused), { id: ID, exit: 64, error: 'lane run: held by another owner' });
     assert.deepEqual([(await wait(refused)).exitCode], [64]);
+  },
+
+  'a crash after the winner was acked and before the refusal was recorded is recovered as the same refusal: the loser is never sent, even once the winner is withdrawn': async (load) => {
+    const { enqueueOnce, enqueueAckFile, DISPATCH_KEY_REFUSED } = await load('pull-enqueue.js');
+    const { atomicWriteJson } = await load('state.js');
+    const { state, generation } = await prepared(load, { dispatchKey: KEY });
+    // the record a supervisor left when it died between the ack and the refusal: an ack naming another ticket, no refusal in the intent
+    atomicWriteJson(enqueueAckFile(state, ID), { ticketId: OTHER, state: 'running', host: 'pit' });
+    const queue = scripted({ id: ID, state: 'queued' });
+    const recovered = await enqueueOnce({ root: state, id: ID, generation, queue });
+    assert.deepEqual([recovered.outcome, recovered.exitCode, recovered.ticketId], [DISPATCH_KEY_REFUSED, 76, OTHER]);
+    assert.deepEqual(queue.calls.sends, [], 'the queue would take the command now (the winner is gone), and it is not sent');
+  },
+
+  'a withdrawn view holds no key: liveHolder drops it and keeps a live one': async (load) => {
+    const { liveHolder } = await load('dispatch-key.js');
+    assert.equal(liveHolder({ id: OTHER, state: 'withdrawn' }), null);
+    assert.equal(liveHolder(null), null);
+    const live = { id: OTHER, state: 'queued' };
+    assert.equal(liveHolder(live), live);
   },
 
   'a keyed enqueue answered with its own ticket is queued; an unkeyed one answered with a missing function throws it': async (load) => {
@@ -209,10 +233,12 @@ const SCENARIOS = {
 };
 
 const CANARIES = [
-  ['a keyed enqueue writes the queue-chosen ticket id to a durable ack file: its own, or the holder the key already named; a withdrawn holder is refused and acked as nothing', 'pull-enqueue.js', ["    if (args.dispatchKey !== undefined && !stale) writeEnqueueAck(root, id, id);\n", '']],
+  ['a crash after the winner was acked and before the refusal was recorded is recovered as the same refusal: the loser is never sent, even once the winner is withdrawn', 'pull-enqueue.js', ["    if (acked?.ticketId && acked.ticketId !== id) return", "    if (false) return"], /Cannot read properties of undefined/],
+  ['a withdrawn view holds no key: liveHolder drops it and keeps a live one', 'dispatch-key.js', ["view.state === 'withdrawn' ? null : view", 'false ? null : view']],
+  ['a keyed enqueue writes the queue-chosen ticket id to a durable ack file: its own, or the holder the key already named; a withdrawn holder is refused and acked as nothing', 'pull-enqueue.js', ["    if (args.dispatchKey !== undefined && !stale) writeEnqueueAck(root, id, view);\n", '']],
   ['a keyed enqueue writes the queue-chosen ticket id to a durable ack file: its own, or the holder the key already named; a withdrawn holder is refused and acked as nothing', 'pull-enqueue.js', ["      if (view.state === 'withdrawn') return refuse({ reason: `dispatch key ${args.dispatchKey} was held by ticket ${view.id}, which was withdrawn; resubmit`, exitCode: DISPATCH_KEY_REFUSED_EXIT });\n", '']],
   ['the detached parent reads the ack, not the attempt: a ticket that already finished still tells its id, a winner this machine did not submit is exit 73, and silence ends at the deadline with 75 and nothing printed', 'run.js', ["    if (ack?.ticketId === id) return { id };\n", '']],
-  ['the detached parent reads the ack, not the attempt: a ticket that already finished still tells its id, a winner this machine did not submit is exit 73, and silence ends at the deadline with 75 and nothing printed', 'run.js', ['return here ? { id: ack.ticketId } : {', 'return true ? { id: ack.ticketId } : {']],
+  ['the detached parent reads the ack, not the attempt: a ticket that already finished still tells its id, a winner this machine did not submit is exit 73, and silence ends at the deadline with 75 and nothing printed', 'run.js', ['return heldLocally(root, ack.ticketId) ? { id: ack.ticketId } : {', 'return true ? { id: ack.ticketId } : {'], /Cannot read properties of undefined/],
   ['a keyed enqueue whose row was withdrawn meanwhile is refused 76, not reported queued; an unkeyed one keeps its answer', 'pull-enqueue.js', ["args.dispatchKey !== undefined && view.state === 'withdrawn'", 'false']],
   ['a keyed envelope is version 2 and an unkeyed one version 1; a reader that checks for version 1, as every release before the key did, refuses the keyed one instead of enqueueing it without its key', 'pull-envelope.js', ['v: versionOf(fields), createdAt', 'v: ENVELOPE_VERSION, createdAt']],
   ['a keyed envelope is version 2 and an unkeyed one version 1; a reader that checks for version 1, as every release before the key did, refuses the keyed one instead of enqueueing it without its key', 'pull-envelope.js', ["  if (envelope.v !== versionOf(envelope)) throw new Error(`pull envelope version ${envelope.v} does not match its dispatch key`);\n", '']],
@@ -226,8 +252,8 @@ const CANARIES = [
 
 for (const [name, scenario] of Object.entries(SCENARIOS)) test(name, async () => scenario(realSrc));
 
-for (const [name, file, mutation] of CANARIES) {
+for (const [name, file, mutation, expected] of CANARIES) {
   test(`canary: with "${mutation[0].trim().slice(0, 70)}" removed, "${name}" fails`, async () => {
-    await assertCanaryFails(file, mutation, (load) => SCENARIOS[name](load), /function does not exist|held by another owner|does not match its dispatch key/);
+    await assertCanaryFails(file, mutation, (load) => SCENARIOS[name](load), expected ?? /function does not exist|held by another owner|does not match its dispatch key/);
   });
 }
