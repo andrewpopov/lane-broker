@@ -48,7 +48,7 @@ test('every command resolves under ${self}, the store path, and names a file the
   for (const argv of [manifest.run.argv, manifest.drain.argv]) assert.ok(fs.existsSync(expandSelf(argv[1], store, process.execPath)), `${argv[1]} exists`);
   const usage = spawnSync('/bin/bash', [setup[0], '--bogus'], { encoding: 'utf8', env: { PATH: '/usr/bin:/bin' } });
   assert.equal(usage.status, 2);
-  assert.match(usage.stderr, /usage: .*runner-prereqs\.sh \(--check \| --install \| --dry-run \| --apply\) \[--path/);
+  assert.match(usage.stderr, /usage: .*runner-prereqs\.sh \(--check \| --install \| --dry-run \| --apply\) \[--wheels-only\] \[--path/);
 });
 
 test('the manifest covers darwin and linux, and the old script name still reaches the same usage', () => {
