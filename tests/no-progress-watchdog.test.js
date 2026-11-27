@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, laneSpawn, waitFor, sleep, stripLogTimestamps, releaseAndReap } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, laneSpawn, waitFor, sleep, stripLogTimestamps, releaseAndReap, scaledMs } from './helpers.js';
 import { setup, resultOf } from './remote-harness.js';
 import { paths } from '../src/state.js';
 import { readLease } from '../src/lease.js';
@@ -113,18 +113,19 @@ test('default config: a silent run is NEVER killed, but the stall is recorded in
   // Silent until released, not for a fixed 3.5 s: on a slow host a timed command can finish before status ever reports its stall.
   // Released only after the stall outlasts WINDOW_MS, so a kill at that window (which this default config must never make) would be seen.
   const release = path.join(s.repoDir, 'release-quiet-run');
-  const quietUntilReleased = node(`process.stdout.write('started\\n'); const t0 = Date.now(); const poll = setInterval(() => { if (require('fs').existsSync(${JSON.stringify(release)}) || Date.now() - t0 > 600000) clearInterval(poll); }, 100);`);
+  // never shorter than the longest this test waits (the scaled stall wait) plus the teardown's own grace
+  const HOLD_MS = scaledMs(60_000) + scaledMs(30_000);
+  const quietUntilReleased = node(`process.stdout.write('started\\n'); const t0 = Date.now(); const poll = setInterval(() => { if (require('fs').existsSync(${JSON.stringify(release)}) || Date.now() - t0 > ${HOLD_MS}) clearInterval(poll); }, 100);`);
   const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', ...quietUntilReleased], { env: s.env, cwd: s.repoDir });
-  t.after(() => releaseAndReap(child, release));
+  t.after(() => releaseAndReap(child, release, { state: s.state }));
   const seen = await waitFor(async () => {
     const status = JSON.parse((await laneRun(['status', '--json'], { env: s.env })).stdout);
     const stalled = status.running[0]?.noProgressSinceMs;
     return stalled >= WINDOW_MS + 500 ? stalled : null;
   }, { timeoutMs: 60_000, intervalMs: 300 });
-  fs.writeFileSync(release, '');
+  const released = await releaseAndReap(child, release, { state: s.state });
   assert.ok(seen >= WINDOW_MS + 500, 'status reports the running stall, past the window an opt-in lane would be killed at');
-  await new Promise((resolve) => (child.exitCode !== null ? resolve() : child.on('exit', resolve)));
-  assert.equal(child.exitCode, 0);
+  assert.deepEqual([released.code, released.signal, released.escalated], [0, null, false], 'the released run exits 0 by itself');
   const [row] = historyOf(s.state);
   assert.equal(row.reason, undefined);
   assert.ok(row.maxNoProgressMs >= WINDOW_MS, `longest stretch recorded; got ${row.maxNoProgressMs}`);

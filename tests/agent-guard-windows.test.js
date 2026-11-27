@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { SLEEP, scenarioSuite, happens } from './agent-run-harness.js';
 import { scaledMs } from './helpers.js';
 import { DEFAULT_MAX_RUN_MS } from '../src/agent/config.js';
@@ -47,21 +48,40 @@ const scenarios = {
   },
 
   'a pull lane that stops writing is killed by silence at its window, long before the run limit': async (w, rw, load) => {
-    // The silence window runs on the watchdog's own monotonic clock (not the injected `now`), from the first guard tick on a RUNNING record:
-    // a window shorter than a starved runner's spawn would kill the lane before it exists (never-admitted). So the window is generous and scaled.
-    const silenceTimeoutMs = scaledMs(4_000);
-    const ticket = await rw.submit({ code: SLEEP });
-    const agent = await rw.agent({ load, config: { maxRunMs: DEFAULT_MAX_RUN_MS, silenceTimeoutMs }, timing: { guardMs: 100 } });
-    const execId = rw.execId(await rw.claimed(ticket));
-    let killed;
-    await happens('the silence kill is recorded', () => (killed = agent.core.table.get(execId))?.guardKillAt !== undefined, wait(load));
-    await rw.untilGone(agent, execId, wait(load));
-    const final = await w.ticket(ticket.id);
-    assert.deepEqual([final.result.kind, final.result.exit, final.result.reason, final.result.silenceTimeoutMs, final.result.runLimitMs ?? null], ['completed', 124, 'silence', silenceTimeoutMs, null]);
-    // The reported window is the agent's own claim; this is the observed one: silent from the spawn, the kill may not come early (nor anywhere near the run limit).
-    const silentMs = killed.guardKillAt - killed.runningSince;
-    assert.ok(silentMs >= silenceTimeoutMs - 250, `killed after ${silentMs} ms of silence, before the ${silenceTimeoutMs} ms window`);
-    assert.ok(silentMs < DEFAULT_MAX_RUN_MS / 2, `killed after ${silentMs} ms, nowhere near the window`);
+    // The silence window runs on the watchdog's own monotonic clock (not the injected `now`), from the first guard tick on a RUNNING record
+    // and restarting whenever the log grows. A window shorter than a starved runner's spawn would kill the lane before it exists (never-admitted),
+    // so the window is generous and stretches on a slow runner. It never shrinks below 4 s: LANE_BROKER_TEST_TIME_SCALE < 1 models a slow
+    // runner, whose spawn takes longer, not shorter (at 0.25 a 1 s window killed the lane mid-spawn: 'cancelled' instead of 'silence').
+    const silenceTimeoutMs = Math.max(4_000, scaledMs(4_000));
+    const stats = [];
+    const realStatSync = fs.statSync;
+    fs.statSync = (target, ...rest) => {
+      const stat = realStatSync(target, ...rest);
+      stats.push({ target: String(target), size: stat.size, at: Date.now() });
+      return stat;
+    };
+    try {
+      const ticket = await rw.submit({ code: SLEEP });
+      const agent = await rw.agent({ load, config: { maxRunMs: DEFAULT_MAX_RUN_MS, silenceTimeoutMs }, timing: { guardMs: 100 } });
+      const execId = rw.execId(await rw.claimed(ticket));
+      let killed;
+      await happens('the silence kill is recorded', () => (killed = agent.core.table.get(execId))?.guardKillAt !== undefined, wait(load));
+      await rw.untilGone(agent, execId, wait(load));
+      const final = await w.ticket(ticket.id);
+      assert.deepEqual([final.result.kind, final.result.exit, final.result.reason, final.result.silenceTimeoutMs, final.result.runLimitMs ?? null], ['completed', 124, 'silence', silenceTimeoutMs, null]);
+      // The reported window is the agent's own claim. The observed one: the guard stats the lane's log on every tick, so the first such stat
+      // is where the silent stretch begins and the last tick that saw the log grow is where it restarts; the kill comes on a later tick.
+      const ticks = stats.filter((stat) => stat.target.includes(execId) && stat.target.endsWith('log') && stat.at >= killed.runningSince);
+      assert.ok(ticks.length > 1, `the guard never stat the lane's log: ${JSON.stringify(stats.map((stat) => stat.target))}`);
+      let sinceMs = ticks[0].at;
+      ticks.forEach((tick, i) => { if (i > 0 && tick.size > ticks[i - 1].size) sinceMs = tick.at; });
+      const killTickMs = ticks.filter((tick) => tick.at <= killed.guardKillAt).at(-1).at;
+      const silentMs = killTickMs - sinceMs;
+      assert.ok(silentMs >= silenceTimeoutMs - 50, `killed after ${silentMs} ms of observed silence, before the ${silenceTimeoutMs} ms window`);
+      assert.ok(silentMs <= silenceTimeoutMs + scaledMs(1_000), `killed after ${silentMs} ms of observed silence, long after the ${silenceTimeoutMs} ms window`);
+    } finally {
+      fs.statSync = realStatSync;
+    }
   },
 };
 

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneSpawn, laneRun, waitFor, sleep, releaseAndReap } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneSpawn, laneRun, waitFor, sleep, releaseAndReap, scaledMs } from './helpers.js';
 import { paths } from '../src/state.js';
 import { isPidAlive } from '../src/lease.js';
 
@@ -19,12 +19,14 @@ test('cancelling a queued ticket lets its supervisor exit instead of polling for
   // generous, load-scaled budget rather than a fixed one calibrated for an
   // idle box.
   const STARTUP_TIMEOUT_MS = Math.max(60_000, 30 * globalConfig.sampleMs);
-  // The blocker holds the slot until released (bounded at 10 min, released and reaped on any exit): a fixed sleep can end on a slow host before
+  // The blocker holds the slot until released (bounded by the test's own scaled waits, released and reaped on any exit): a fixed sleep can end on a slow host before
   // the second ticket is queued, which then starts and finishes, leaving the cancel nothing to cancel.
   const release = path.join(base, 'release-blocker');
-  const holdSlot = `i=0; while [ ! -e "${release}" ] && [ $i -lt 3000 ]; do sleep 0.2; i=$((i+1)); done`;
+  // never shorter than the longest this test waits (two scaled startup waits and the scaled supervisor-exit wait) plus the teardown's own grace
+  const holdMs = scaledMs(2 * STARTUP_TIMEOUT_MS + 20 * globalConfig.sampleMs) + scaledMs(30_000);
+  const holdSlot = `i=0; while [ ! -e "${release}" ] && [ $i -lt ${Math.ceil(holdMs / 200)} ]; do sleep 0.2; i=$((i+1)); done`;
   const blocker = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', 'sh', '-c', holdSlot], { env, cwd: repoDir });
-  t.after(() => releaseAndReap(blocker, release));
+  t.after(() => releaseAndReap(blocker, release, { state }));
   await waitFor(
     () => {
       try {
@@ -74,9 +76,5 @@ test('cancelling a queued ticket lets its supervisor exit instead of polling for
   // forever must still fail this assertion by name.
   await waitFor(() => !isPidAlive(supervisorPid), { timeoutMs: 20 * globalConfig.sampleMs });
 
-  fs.writeFileSync(release, '');
-  await new Promise((resolve) => {
-    if (blocker.exitCode !== null || blocker.signalCode !== null) return resolve();
-    blocker.on('exit', resolve);
-  });
+  assert.equal((await releaseAndReap(blocker, release, { state })).escalated, false, 'the released blocker exits by itself');
 });

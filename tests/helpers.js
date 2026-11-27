@@ -133,18 +133,67 @@ export function laneSpawn(args, { env, cwd, bin = BIN } = {}) {
   return spawn(process.execPath, [bin, ...args], { env, cwd: cwd || process.cwd() });
 }
 
-/** Teardown for a `lane run` held by a release file: release it, wait for it to exit, and on a bounded deadline SIGTERM then SIGKILL it so a failed precondition never leaves it running. */
-export async function releaseAndReap(child, releaseFile, { graceMs = 15_000, killMs = 5_000 } = {}) {
+/** The pids a test's broker state names: supervisors (leased or still queued) and the leased commands' process groups. */
+async function brokerProcesses(state) {
+  const { paths, readJsonSafe } = await import('../src/state.js');
+  const records = (dir) => {
+    try {
+      return fs.readdirSync(dir).filter((n) => n.endsWith('.json')).map((n) => readJsonSafe(path.join(dir, n))).filter(Boolean);
+    } catch {
+      return [];
+    }
+  };
+  const { leases, queue } = paths(state);
+  return {
+    supervisors: [...records(leases), ...records(queue)].map((r) => r.supervisorPid).filter(Number.isInteger),
+    groups: records(leases).map((r) => r.childPgid).filter(Number.isInteger),
+  };
+}
+
+/**
+ * Release a `lane run` held by a release file and wait, bounded, for it and the broker processes `state` names (its detached supervisor,
+ * its command's group) to be gone. A deadline escalates to SIGTERM then SIGKILL on all of them; anything still alive after the last deadline throws.
+ * Resolves `{ code, signal, escalated }` so a success path can assert the exit it released into.
+ */
+export async function releaseAndReap(child, releaseFile, { state, graceMs = scaledMs(15_000), killMs = scaledMs(5_000) } = {}) {
+  const { isPidAlive, isGroupAlive } = await import('../src/lease.js');
   fs.writeFileSync(releaseFile, '');
-  const exited = () => child.exitCode !== null || child.signalCode !== null;
-  const exitedWithin = (ms) => (exited() ? Promise.resolve(true) : new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(false), ms);
-    child.once('exit', () => { clearTimeout(timer); resolve(true); });
-  }));
+  const childGone = () => child.exitCode !== null || child.signalCode !== null;
+  // a lease vanishes when its supervisor does, so remember every pid seen: an orphaned command group must still be waited for and killed
+  const known = { supervisors: new Set(), groups: new Set() };
+  const remember = async () => {
+    const seen = await brokerProcesses(state);
+    seen.supervisors.forEach((pid) => known.supervisors.add(pid));
+    seen.groups.forEach((pgid) => known.groups.add(pgid));
+    return { supervisors: [...known.supervisors], groups: [...known.groups] };
+  };
+  const alive = async () => {
+    const { supervisors, groups } = await remember();
+    return [...(childGone() ? [] : [`cli ${child.pid}`]), ...supervisors.filter(isPidAlive).map((pid) => `supervisor ${pid}`), ...groups.filter(isGroupAlive).map((pgid) => `group ${pgid}`)];
+  };
+  const kill = async (signal) => {
+    const { supervisors, groups } = await remember();
+    if (!childGone()) child.kill(signal);
+    for (const pid of supervisors) try { process.kill(pid, signal); } catch { /* gone */ }
+    for (const pgid of groups) try { process.kill(-pgid, signal); } catch { /* gone */ }
+  };
+  const settle = async (ms) => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if ((await alive()).length === 0) return true;
+      await sleep(50);
+    }
+    return (await alive()).length === 0;
+  };
+  let escalated = false;
   for (const [signal, ms] of [[null, graceMs], ['SIGTERM', killMs], ['SIGKILL', killMs]]) {
-    if (signal) child.kill(signal);
-    if (await exitedWithin(ms)) return;
+    if (signal) {
+      escalated = true;
+      await kill(signal);
+    }
+    if (await settle(ms)) return { code: child.exitCode, signal: child.signalCode, escalated };
   }
+  throw new Error(`teardown left processes running: ${(await alive()).join(', ')}`);
 }
 
 let localEnvVarNames = null;
