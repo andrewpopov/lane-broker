@@ -523,7 +523,8 @@ const REFUSALS = {
   sim: { head: otherHead(), overrides: { class: 'sim' } },
   conflict: { head: otherHead(), setup: (state) => writeLease(state, held('holder', { key: 'r:a' })) },
   capacity: { head: otherHead(), setup: (state) => writeLease(state, held('holder', { weight: 6 })) },
-  'elastic-floor': { overrides: { resources: { cpuCores: 40, minCpuCores: 30 } } },
+  // the floor is checked against THIS host's cores (a 32-thread runner admits a floor of 30), so it must exceed any host
+  'elastic-floor': { overrides: { resources: { cpuCores: 100_000, minCpuCores: 90_000 } } },
   'yields-push-gate': { cfg: { floorOvershootCores: 3 }, head: otherHead(), setup: (state) => queued(state, ticket('push', { lane: 'prepush', cmdFingerprint: 'p', command: 'p', pushGate })) },
   'yields-aged-head': { head: agedHead({ conflicts: ['r:b', 'r:a'] }), setup: (state) => writeLease(state, bypassLease('b0', 1000, { key: 'r:b' })) },
   memory: { mem: memory({ availableBytes: 1 }) },

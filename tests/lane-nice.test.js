@@ -13,6 +13,9 @@ import { resolveNicedSpawn } from '../src/supervisor.js';
 // and signal propagation must all be unaffected -- verified against a real
 // supervisor run, not just read off the source.
 
+// Waiting for the detached supervisor's result file measures host startup, not nice: event-driven, so a generous ceiling costs nothing when it passes.
+const RESULT_TIMEOUT_MS = 60_000;
+
 async function firstLeaseWithPgid(state) {
   const leaseId = await waitFor(() => {
     let names;
@@ -93,7 +96,7 @@ test('a missing command under nice surfaces exit 127 by name (the wrapper, not a
   assert.ok(id, 'lane run --detach should print an id even though the command will fail');
 
   const resultPath = path.join(paths(state).results, `${id}.json`);
-  const result = await waitFor(() => readJsonSafe(resultPath), { timeoutMs: 5000 });
+  const result = await waitFor(() => readJsonSafe(resultPath), { timeoutMs: RESULT_TIMEOUT_MS });
   assert.equal(result.exit, 127, `nice execs the missing command in place and reports its own not-found exit; got ${JSON.stringify(result)}`);
   assert.equal(result.error, undefined, 'this is the wrapper exiting 127, not a structured node spawn-error result');
 });
@@ -118,7 +121,7 @@ test('with laneNice: 0, the SAME missing command still produces the old structur
   assert.ok(id, 'lane run --detach should print an id even though the command will fail');
 
   const resultPath = path.join(paths(state).results, `${id}.json`);
-  const result = await waitFor(() => readJsonSafe(resultPath), { timeoutMs: 5000 });
+  const result = await waitFor(() => readJsonSafe(resultPath), { timeoutMs: RESULT_TIMEOUT_MS });
   assert.equal(result.exit, 1, `a bare spawn of a missing command hits Node's spawn-error handler; got ${JSON.stringify(result)}`);
   assert.equal(typeof result.error, 'string', 'the old shape carries a structured spawn-error message');
 });

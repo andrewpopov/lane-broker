@@ -6,7 +6,7 @@ import { freshEnv, writeGlobalConfig, writeRepoConfig, laneSpawn, laneRun, waitF
 import { paths } from '../src/state.js';
 import { isPidAlive } from '../src/lease.js';
 
-test('cancelling a queued ticket lets its supervisor exit instead of polling forever', async () => {
+test('cancelling a queued ticket lets its supervisor exit instead of polling forever', async (t) => {
   const { base, home, state, env } = freshEnv();
   const globalConfig = { version: 1, capacity: 1, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 };
   writeGlobalConfig(home, globalConfig);
@@ -19,7 +19,12 @@ test('cancelling a queued ticket lets its supervisor exit instead of polling for
   // generous, load-scaled budget rather than a fixed one calibrated for an
   // idle box.
   const STARTUP_TIMEOUT_MS = Math.max(60_000, 30 * globalConfig.sampleMs);
-  const blocker = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', 'sleep', '5'], { env, cwd: repoDir });
+  // The blocker holds the slot until released (bounded at 2 min, released on any exit): a fixed sleep can end on a slow host before
+  // the second ticket is queued, which then starts and finishes, leaving the cancel nothing to cancel.
+  const release = path.join(base, 'release-blocker');
+  t.after(() => fs.writeFileSync(release, ''));
+  const holdSlot = `i=0; while [ ! -e "${release}" ] && [ $i -lt 600 ]; do sleep 0.2; i=$((i+1)); done`;
+  const blocker = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', 'sh', '-c', holdSlot], { env, cwd: repoDir });
   await waitFor(
     () => {
       try {
@@ -69,6 +74,7 @@ test('cancelling a queued ticket lets its supervisor exit instead of polling for
   // forever must still fail this assertion by name.
   await waitFor(() => !isPidAlive(supervisorPid), { timeoutMs: 20 * globalConfig.sampleMs });
 
+  fs.writeFileSync(release, '');
   await new Promise((resolve) => {
     if (blocker.exitCode !== null || blocker.signalCode !== null) return resolve();
     blocker.on('exit', resolve);

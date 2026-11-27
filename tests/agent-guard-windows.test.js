@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { SLEEP, scenarioSuite } from './agent-run-harness.js';
+import { scaledMs } from './helpers.js';
 import { DEFAULT_MAX_RUN_MS } from '../src/agent/config.js';
 import { wait, runningLane, skewClock } from './helpers/agent-guard-fixture.js';
 
@@ -46,11 +47,14 @@ const scenarios = {
   },
 
   'a pull lane that stops writing is killed by silence at its window, long before the run limit': async (w, rw, load) => {
+    // The silence window runs on the watchdog's own monotonic clock (not the injected `now`), from the first guard tick on a RUNNING record:
+    // a window shorter than a starved runner's spawn would kill the lane before it exists (never-admitted). So the window is generous and scaled.
+    const silenceTimeoutMs = scaledMs(4_000);
     const ticket = await rw.submit({ code: SLEEP });
-    const agent = await rw.agent({ load, config: { maxRunMs: DEFAULT_MAX_RUN_MS, silenceTimeoutMs: 600 }, timing: { guardMs: 100 } });
+    const agent = await rw.agent({ load, config: { maxRunMs: DEFAULT_MAX_RUN_MS, silenceTimeoutMs }, timing: { guardMs: 100 } });
     await rw.untilGone(agent, rw.execId(await rw.claimed(ticket)), wait(load));
     const final = await w.ticket(ticket.id);
-    assert.deepEqual([final.result.kind, final.result.exit, final.result.reason, final.result.silenceTimeoutMs, final.result.runLimitMs ?? null], ['completed', 124, 'silence', 600, null]);
+    assert.deepEqual([final.result.kind, final.result.exit, final.result.reason, final.result.silenceTimeoutMs, final.result.runLimitMs ?? null], ['completed', 124, 'silence', silenceTimeoutMs, null]);
   },
 };
 
