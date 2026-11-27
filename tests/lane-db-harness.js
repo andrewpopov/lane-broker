@@ -61,6 +61,32 @@ INSERT INTO lane.command_templates (template_id, version) VALUES ('t', 1);
 UPDATE lane.cluster SET claims_enabled = true;
 UPDATE lane.config SET wsjf_enabled = true, deadlines_enabled = true;`;
 
+const CLUSTER_PREFIX = 'lbpg-';
+const OWNER_FILE = 'owner.pid';
+const STOP_SIGNALS = ['SIGTERM', 'SIGINT', 'SIGHUP'];
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code !== 'ESRCH';
+  }
+}
+
+/** Stale only on positive evidence: an owner file naming a dead process. No owner file may be a live pre-owner-file worker or a sibling mid-initdb. */
+function isStale(dir) {
+  let owner;
+  try {
+    owner = fs.readFileSync(path.join(dir, OWNER_FILE), 'utf8').trim();
+  } catch (err) {
+    if (err.code === 'ENOENT') return false;
+    throw err;
+  }
+  const pid = Number(owner);
+  return Number.isInteger(pid) && pid > 0 && !pidAlive(pid);
+}
+
 export class PgCluster {
   constructor(dir, port) {
     this.dir = dir;
@@ -69,9 +95,22 @@ export class PgCluster {
     this.templateReady = false;
   }
 
+  /** Stop and remove clusters whose test process died without running its exit hook (SIGKILL, lane cancel). Dirs this user cannot read are skipped. */
+  static reapStale() {
+    for (const name of fs.readdirSync('/tmp')) {
+      if (!name.startsWith(CLUSTER_PREFIX)) continue;
+      const dir = path.join('/tmp', name);
+      try {
+        if (isStale(dir)) new PgCluster(dir, 0).stop();
+      } catch { /* another user's dir, or one that vanished mid-reap */ }
+    }
+  }
+
   static start() {
     if (PG_SKIP_REASON) throw new Error(PG_SKIP_REASON);
+    PgCluster.reapStale();
     const dir = fs.mkdtempSync('/tmp/lbpg-');
+    fs.writeFileSync(path.join(dir, OWNER_FILE), String(process.pid));
     const port = 20000 + Math.floor(Math.random() * 40000);
     const cluster = new PgCluster(dir, port);
     const data = path.join(dir, 'data');
@@ -85,6 +124,15 @@ export class PgCluster {
     }
     cluster.exitHook = () => cluster.stop();
     process.on('exit', cluster.exitHook);
+    // 'exit' does not fire when a signal kills the process, so stop first and then die from the same signal.
+    cluster.signalHooks = STOP_SIGNALS.map((sig) => {
+      const hook = () => {
+        cluster.stop();
+        process.kill(process.pid, sig);
+      };
+      process.on(sig, hook);
+      return [sig, hook];
+    });
     return cluster;
   }
 
@@ -165,9 +213,12 @@ export class PgCluster {
 
   stop() {
     if (this.exitHook) process.removeListener('exit', this.exitHook);
+    for (const [sig, hook] of this.signalHooks ?? []) process.removeListener(sig, hook);
     const data = path.join(this.dir, 'data');
-    if (fs.existsSync(path.join(data, 'postmaster.pid'))) {
-      spawnSync(path.join(findBin(), 'pg_ctl'), ['-D', data, '-m', 'immediate', '-w', 'stop'], { env: cleanEnv() });
+    const pidFile = path.join(data, 'postmaster.pid');
+    if (fs.existsSync(pidFile)) {
+      const stopped = spawnSync(path.join(findBin(), 'pg_ctl'), ['-D', data, '-m', 'immediate', '-w', 'stop'], { env: cleanEnv() });
+      if (stopped.status !== 0 && fs.existsSync(pidFile)) return; // still running: keep the dir so the next reap retries
     }
     fs.rmSync(this.dir, { recursive: true, force: true });
   }
