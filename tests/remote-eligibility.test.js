@@ -140,7 +140,7 @@ test('BRAIN-547: LANE_BROKER_LOCAL=1 without a reason is ignored the same way', 
 test('BRAIN-547: --local with a reason stays local and the ticket carries localReasonText', async () => {
   const { env, repoDir } = setup({ runners: RUNNERS, remote: true });
   const { ticket, stderr } = await captureTicket({ env, cwd: repoDir, local: true, localReason: 'needs ssh' });
-  assert.doesNotMatch(stderr, /ignored/);
+  assert.doesNotMatch(stderr, IGNORED);
   assert.equal(Object.prototype.hasOwnProperty.call(ticket, 'remote'), false);
   assert.equal(ticket.localReason, 'forced-flag');
   assert.equal(ticket.localReasonText, 'needs ssh');
@@ -159,11 +159,11 @@ test('BRAIN-547: a reason alone (flag or env) implies local, env origin is force
   assert.equal(Object.prototype.hasOwnProperty.call(envOnly.ticket, 'remote'), false);
 });
 
-test('BRAIN-547: --local on a lane that is not remote-eligible is unchanged and silent', async () => {
+test('BRAIN-547: --local on a lane that is not remote-eligible is unchanged and never says --local is ignored', async () => {
   const { env, repoDir } = setup({ runners: RUNNERS, remote: false });
   const { result, stderr } = await captureTicket({ env, cwd: repoDir, local: true });
   assert.equal(result.exitCode, 0);
-  assert.doesNotMatch(stderr, /ignored/);
+  assert.doesNotMatch(stderr, IGNORED);
 });
 
 test('an allowed undeclared lane is never remote-eligible even when runners are configured', async () => {

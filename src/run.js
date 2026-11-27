@@ -17,7 +17,7 @@ import { stampPriorityOrigin } from './priority-clock.js';
 import { isValidGroupId } from './priority.js';
 import { detectResourceCapacity, leaseResources, resolveTicketResources, capUnapprovedCpu, checkResourceBudget, localSimRefusal, dispatchOnlyRefusal, locallyRefusedNow } from './resources.js';
 import { hostOnlyPaths, hostPathsRefusal } from './host-paths.js';
-import { acceptedLocalReason, localReasonRefusal } from './local-reason.js';
+import { acceptedLocalReason, LOCAL_REASON_CATEGORIES, localReasonRefusal } from './local-reason.js';
 import { argvFingerprint } from './cpu-estimates.js';
 import { readHistoryRows } from './suggest.js';
 import { rightSizedCpuCores } from './right-size.js';
@@ -145,6 +145,21 @@ const HISTORY_COMMAND_MAX = 300;
 /** BRAIN-700: the `lane run` exit when byte-identical content already failed (README "Known-red refusal"). */
 const REFUSED_KNOWN_RED_EXIT = 79;
 const RETRY_REASON_MAX = 200;
+
+/** BRAIN-752: a non-push-gate lane this machine runs by its own config (not a runner's intake, not a dispatch) is stamped. */
+function configLocalStamp(resolved, { remoteEligible, runnerIntake }) {
+  if (resolved.remote === true || remoteEligible || runnerIntake || PUSH_GATE_LANE.test(resolved.lane)) return {};
+  const text = resolved.localReason;
+  return { configLocal: true, ...(text ? { configLocalReason: text } : {}), configLocalAccepted: text ? acceptedLocalReason(text) : false };
+}
+
+function warnConfigLocal(lane, stamp) {
+  if (!stamp.configLocal || stamp.configLocalAccepted) return;
+  const declared = stamp.configLocalReason ? `declared localReason "${stamp.configLocalReason}" names no need for this machine` : 'it declares no localReason';
+  process.stderr.write(
+    `lane: warning: lane ${lane} runs on this machine by config and ${declared}. Set remote: true with remoteSetup/remoteDeps, or declare a localReason naming one of: ${LOCAL_REASON_CATEGORIES.map((c) => c.label).join('; ')}.\n`,
+  );
+}
 
 /** Why a run of a remote-capable lane (`remote: true`) is executing locally,
  *  decided at ticket creation. A remote attempt that later falls back is
@@ -476,6 +491,7 @@ export async function runCommand({
     }
   }
   const localReason = localReasonFor(resolved, remoteEligible, forced, exclusive);
+  const configLocal = configLocalStamp(resolved, { remoteEligible, runnerIntake });
   const { headTree, checkoutRoot } = gitTreeAndRoot(cwd);
   // No fingerprint (so no history relief, charge declared) when the checkout root is
   // unknown: falling back to cwd would fold a sub-package into the repo-root workload.
@@ -755,6 +771,7 @@ export async function runCommand({
   const resultPath = path.join(p.results, `${id}.json`);
 
   const scrubNames = parseScrubCommandEnv(process.env[SCRUB_COMMAND_ENV_VAR]);
+  warnConfigLocal(resolved.lane, configLocal);
   const pushGate = !detach && PUSH_GATE_LANE.test(resolved.lane) ? detectPushGate({ cwd }) : null;
   const ticket = {
     id,
@@ -814,6 +831,7 @@ export async function runCommand({
     ...(headTree ? { headTree } : {}),
     ...(contentKey ? { contentKey } : {}),
     ...(retryReason ? { retryReason } : {}),
+    ...configLocal,
     ...(localReason ? { localReason } : {}),
     ...(localReason && localReason === forced && localReasonText ? { localReasonText } : {}),
     // BRAIN-442: a local-first lane enqueues locally and only becomes rebind-eligible after its wait (lane value, else global)

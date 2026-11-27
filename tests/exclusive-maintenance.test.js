@@ -20,7 +20,7 @@ function setup({ lane = {}, extraEnv = {} } = {}) {
   const { base, home, state, env } = freshEnv({ LANE_BROKER_TEST_CANCEL_GRACE_MS: '4000', ...extraEnv });
   writeGlobalConfig(home, { version: 1, capacity: 4, loadClose: 1000, loadOpen: 900, loadOpenSamples: 1, sampleMs: 100 });
   const repoDir = path.join(base, 'repo');
-  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, ...lane }, plain: { weight: 1 } } });
+  writeRepoConfig(repoDir, { version: 1, lanes: { default: { weight: 1, localReason: 'macOS host maintenance', ...lane }, plain: { weight: 1 } } });
   gitFixture(['init', '-q'], repoDir);
   return { base, home, state, env, repoDir };
 }

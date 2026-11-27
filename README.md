@@ -2403,6 +2403,7 @@ additive: readers must ignore unknown keys and tolerate absent ones.
 | Field | Meaning |
 |---|---|
 | `id`, `key`, `repo`, `lane`, `configLane`, `weight`, `resources`, `command`, `headTree` | identity and the declaration (`configLane` only for an ad-hoc lane inheriting a template) |
+| `configLocal`, `configLocalReason`, `configLocalAccepted` | BRAIN-752: a local run of a non-push-gate lane that is not `remote: true`; the lane's declared `localReason` (when any) and whether it names an accepted need for this machine (same categories as `--local-reason`). Unaccepted prints a warning at run start (never a refusal): set `remote: true` with `remoteSetup`/`remoteDeps`, or declare a `localReason` in the lane config. Distinct from `localReason` below, which is a forced `--local` |
 | `executor`, `runner`, `localReason`, `remoteKind`, `remotePhase` | where it ran (`local`/`remote`), which runner, why local, and the runner's result kind/last phase |
 | `exit`, `signal` | present on **every** finished row: `exit` is the code (130 for a cancel, `null` when killed by a signal or never run), `signal` the terminating signal or `null` |
 | `cancelled`, `reason`, `error` | cancel flag; refusal/reap reason; supervisor-level error text |
