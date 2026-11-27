@@ -32,7 +32,19 @@ export function rootsReader({ startOf = processStart, alive = isProcessAlive } =
   return (records) => read(lanes(records).map(({ pid, pidStart }) => ({ pid, key: `${pid}:${pidStart}` })));
 }
 
-// Shadow only (M6a): bosun's budget is exported beside the standalone one and `claimFigures` stays authoritative. It never fails closed.
+/** M6b: an enforced bosun grant caps what a claim offers. A standalone budget (no bosun, or an expired grant) leaves the claim as admission computed it, so enforcement never fails closed. */
+export function capByGrant(offered, budget) {
+  if (!offered || budget?.source !== 'bosun') return offered;
+  return {
+    ...offered,
+    freeCpu: Math.max(0, Math.min(offered.freeCpu, budget.cpu.free)),
+    freeMem: Math.min(offered.freeMem, clampMem(budget.mem.free)),
+    budgetCpu: Math.min(offered.budgetCpu, budget.cpu.ceiling),
+  };
+}
+
+export const budgetEnforced = (cfg) => cfg?.lanePull?.budgetEnforce === true;
+
 export function openBudgetShadow({ readConfig, records, log, now = Date.now, env = process.env, host = detectResourceCapacity, call = requestSocket, heartbeatMs = USAGE_HEARTBEAT_MS, clientOptions = {}, rootStartOf, rootAlive }) {
   let capacity;
   const standalone = () => standaloneBudget({ cfg: readConfig(), host: capacity ??= host() });
@@ -72,8 +84,16 @@ export function openBudgetShadow({ readConfig, records, log, now = Date.now, env
       return null;
     }
   };
+  let lastEnforced = false;
+  const enforced = (cfg) => {
+    const on = budgetEnforced(cfg);
+    if (on !== lastEnforced) log(`budget: claims ${on ? 'capped by the bosun grant' : 'no longer capped by bosun'}`);
+    lastEnforced = on;
+    return on ? client.current() : null;
+  };
   return {
     shadow,
+    enforced,
     heartbeat() {
       if (inFlight || now() - lastBeatAt < heartbeatMs) return inFlight ?? Promise.resolve();
       lastBeatAt = now();
