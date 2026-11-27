@@ -154,7 +154,7 @@ test('a probe that cannot complete keeps every live lane, as isProcessAlive fail
   assert.deepEqual((await roots([record('a', { pid: 41, pidStart: 'x' })])).roots, [{ pid: 41, start: 'linux:boot-1:410' }]);
 });
 
-test('processStartTimes reads this process and a missing pid in one ps, matching processStartTime', async () => {
+test('processStartTimes reads this process and a missing pid in one probe, matching processStartTime on every platform', async () => {
   const missing = spawnSync('true').pid;
   const starts = await processStartTimes([process.pid, missing]);
   assert.equal(starts.get(process.pid), processStartTime(process.pid));
