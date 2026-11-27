@@ -9,7 +9,8 @@ import { collectStatus } from '../status.js';
 import { listLeases } from '../lease.js';
 import { HELD_STATES, listQueue } from '../scheduler.js';
 import { clampQueuedWeight, queuedWeightLimit } from '../exclusive.js';
-import { detectResourceCapacity, cpuBudgetCores, effectiveWeightCapacity } from '../resources.js';
+import { readMemoryInfo } from '../cpu.js';
+import { admissibleMemoryBytes, detectResourceCapacity, cpuBudgetCores, effectiveWeightCapacity, leaseResources } from '../resources.js';
 import { PROBE_LOCK_WAIT_MS, probeCpuHeadroom, probeHeadroom } from '../remote-runner.js';
 import { clearPendingClaim, newExecutionRecord, readPendingClaim, writePendingClaim } from './store.js';
 import { reportReadiness } from '../runner-readiness.js';
@@ -50,6 +51,14 @@ export function brokerConfigReader({ log }) {
 
 const clampMem = (bytes) => Math.min(Math.max(0, Math.floor(bytes)), MAX_FREE_MEM);
 
+const readMemoryOrNull = (reader) => {
+  try {
+    return reader();
+  } catch {
+    return null;
+  }
+};
+
 const UNADMITTED_SUBPHASES = new Set(['FETCHING', 'STARTING', 'SPAWNING', 'RUNNING']);
 
 export const readLaneId = (remoteRoot, execId) => {
@@ -61,9 +70,11 @@ export const readLaneId = (remoteRoot, execId) => {
 };
 
 export const liveExecutions = (records, remoteRoot) => records.filter((r) => UNADMITTED_SUBPHASES.has(r.subphase))
-  .map((r) => ({ weight: Number(r.claim?.header?.weight) || 0, laneId: readLaneId(remoteRoot, r.execId) }));
+  .map((r) => ({ weight: Number(r.claim?.header?.weight) || 0, memoryBytes: Number(r.claim?.header?.memoryBytes) || 0, laneId: readLaneId(remoteRoot, r.execId) }));
 
-export const unadmittedWeights = (executions, knownLaneIds) => executions.filter((e) => e.laneId === null || !knownLaneIds.has(e.laneId)).map((e) => e.weight);
+export const unadmittedExecutions = (executions, knownLaneIds) => executions.filter((e) => e.laneId === null || !knownLaneIds.has(e.laneId));
+
+export const unadmittedWeights = (executions, knownLaneIds) => unadmittedExecutions(executions, knownLaneIds).map((e) => e.weight);
 
 export function freeWeightOf({ capacity, used, queued, pendingWeights, cfg }) {
   const limit = queuedWeightLimit(cfg.maxLaneWeight, capacity);
@@ -75,9 +86,10 @@ export function freeWeightOf({ capacity, used, queued, pendingWeights, cfg }) {
  * The free CPU, memory and weight a claim offers, the CPU budget and the broker's per-ticket weight limit. Active mode measures this host as
  * `remote-probe` does and answers null (skip the tick) when the measurement is missing; shadow mode offers the static budget, which is finite.
  * `executions` is read after the lease and queue snapshots, and `used` comes from that same lease snapshot, so an execution that is enqueued or
- * leased mid-call is charged exactly once.
+ * leased mid-call is charged exactly once. Active free memory is what this host's own admission would accept (`admissibleMemoryBytes`, over
+ * the held leases) less the memory of locally queued lanes and of executions not yet queued, which neither the leases nor the OS's available figure show yet.
  */
-export async function claimFigures({ cfg = loadGlobalConfig(), host = detectResourceCapacity(), executions = () => [] } = {}) {
+export async function claimFigures({ cfg = loadGlobalConfig(), host = detectResourceCapacity(), executions = () => [], memoryReader = readMemoryInfo } = {}) {
   const budgetCpu = cpuBudgetCores(host, cfg);
   const capacity = effectiveWeightCapacity(cfg, host.cpuCores);
   const weightLimit = queuedWeightLimit(cfg.maxLaneWeight, capacity);
@@ -87,12 +99,18 @@ export async function claimFigures({ cfg = loadGlobalConfig(), host = detectReso
   const leases = listLeases(brokerRoot);
   const cpuHeadroom = await probeCpuHeadroom(brokerRoot, cfg, leases.filter((l) => HELD_STATES.has(l.state)));
   const headroom = probeHeadroom(status.resources, cfg, true, undefined, cpuHeadroom);
-  if (!headroom || !Number.isFinite(headroom.cpuCores) || !Number.isFinite(headroom.memoryBytes)) return null;
+  if (!headroom || !Number.isFinite(headroom.cpuCores)) return null;
+  const heldLeases = leases.filter((l) => HELD_STATES.has(l.state));
+  const admissibleMem = admissibleMemoryBytes({ memoryInfo: readMemoryOrNull(memoryReader), heldLeases, cfg });
+  if (admissibleMem === null) return null;
   const queued = listQueue(brokerRoot);
   const known = new Set([...leases, ...queued.filter(Boolean)].map((t) => t.id));
-  const used = leases.filter((l) => HELD_STATES.has(l.state)).reduce((sum, l) => sum + (l.weight || 0), 0);
-  const freeWeight = freeWeightOf({ capacity: status.capacity, used, queued, pendingWeights: unadmittedWeights(executions(), known), cfg });
-  return { freeCpu: headroom.cpuCores, freeMem: clampMem(headroom.memoryBytes), budgetCpu, freeWeight, weightLimit };
+  const used = heldLeases.reduce((sum, l) => sum + (l.weight || 0), 0);
+  const pending = unadmittedExecutions(executions(), known);
+  const freeWeight = freeWeightOf({ capacity: status.capacity, used, queued, pendingWeights: pending.map((e) => e.weight), cfg });
+  const queuedMem = queued.filter(Boolean).reduce((sum, t) => sum + leaseResources(t, cfg).memoryBytes, 0);
+  const pendingMem = pending.reduce((sum, e) => sum + e.memoryBytes, 0);
+  return { freeCpu: headroom.cpuCores, freeMem: clampMem(admissibleMem - queuedMem - pendingMem), budgetCpu, freeWeight, weightLimit };
 }
 
 /**
