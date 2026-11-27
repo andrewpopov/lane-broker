@@ -60,6 +60,8 @@ export function processStartTime(pid, { timeoutMs = PS_TIMEOUT_MS } = {}) {
  */
 export function processStartTimes(pids, { timeoutMs = PS_TIMEOUT_MS, signal } = {}) {
   if (pids.length === 0) return Promise.resolve(new Map());
+  // Linux tokens are whatever processStartTime records (a /proc tick count once PKG-410 lands), never comparable to ps lstart.
+  if (process.platform === 'linux') return Promise.resolve(signal?.aborted ? undefined : linuxStartTimes(pids, timeoutMs));
   return new Promise((resolve) => {
     const options = { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C', LC_TIME: 'C' }, timeout: timeoutMs, killSignal: 'SIGKILL', ...(signal ? { signal } : {}) };
     execFile('ps', ['-o', 'pid=,lstart=', '-p', pids.join(',')], options, (err, stdout) => {
@@ -72,6 +74,15 @@ export function processStartTimes(pids, { timeoutMs = PS_TIMEOUT_MS, signal } = 
       resolve(starts);
     });
   });
+}
+
+function linuxStartTimes(pids, timeoutMs) {
+  const starts = new Map();
+  for (const pid of pids) {
+    const start = processStartTime(pid, { timeoutMs });
+    if (typeof start === 'string') starts.set(pid, start);
+  }
+  return starts;
 }
 
 /**
