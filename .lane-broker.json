@@ -19,6 +19,7 @@
       "weight": 2,
       "cpuCores": 2,
       "minCpuCores": 2,
+      "rightSize": false,
       "maxConcurrent": 8,
       "silenceTimeoutMs": 1200000
     }

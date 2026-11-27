@@ -133,6 +133,20 @@ export function laneSpawn(args, { env, cwd, bin = BIN } = {}) {
   return spawn(process.execPath, [bin, ...args], { env, cwd: cwd || process.cwd() });
 }
 
+/** Teardown for a `lane run` held by a release file: release it, wait for it to exit, and on a bounded deadline SIGTERM then SIGKILL it so a failed precondition never leaves it running. */
+export async function releaseAndReap(child, releaseFile, { graceMs = 15_000, killMs = 5_000 } = {}) {
+  fs.writeFileSync(releaseFile, '');
+  const exited = () => child.exitCode !== null || child.signalCode !== null;
+  const exitedWithin = (ms) => (exited() ? Promise.resolve(true) : new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms);
+    child.once('exit', () => { clearTimeout(timer); resolve(true); });
+  }));
+  for (const [signal, ms] of [[null, graceMs], ['SIGTERM', killMs], ['SIGKILL', killMs]]) {
+    if (signal) child.kill(signal);
+    if (await exitedWithin(ms)) return;
+  }
+}
+
 let localEnvVarNames = null;
 
 /**

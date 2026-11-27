@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { SLEEP, scenarioSuite } from './agent-run-harness.js';
+import { SLEEP, scenarioSuite, happens } from './agent-run-harness.js';
 import { scaledMs } from './helpers.js';
 import { DEFAULT_MAX_RUN_MS } from '../src/agent/config.js';
 import { wait, runningLane, skewClock } from './helpers/agent-guard-fixture.js';
@@ -52,9 +52,16 @@ const scenarios = {
     const silenceTimeoutMs = scaledMs(4_000);
     const ticket = await rw.submit({ code: SLEEP });
     const agent = await rw.agent({ load, config: { maxRunMs: DEFAULT_MAX_RUN_MS, silenceTimeoutMs }, timing: { guardMs: 100 } });
-    await rw.untilGone(agent, rw.execId(await rw.claimed(ticket)), wait(load));
+    const execId = rw.execId(await rw.claimed(ticket));
+    let killed;
+    await happens('the silence kill is recorded', () => (killed = agent.core.table.get(execId))?.guardKillAt !== undefined, wait(load));
+    await rw.untilGone(agent, execId, wait(load));
     const final = await w.ticket(ticket.id);
     assert.deepEqual([final.result.kind, final.result.exit, final.result.reason, final.result.silenceTimeoutMs, final.result.runLimitMs ?? null], ['completed', 124, 'silence', silenceTimeoutMs, null]);
+    // The reported window is the agent's own claim; this is the observed one: silent from the spawn, the kill may not come early (nor anywhere near the run limit).
+    const silentMs = killed.guardKillAt - killed.runningSince;
+    assert.ok(silentMs >= silenceTimeoutMs - 250, `killed after ${silentMs} ms of silence, before the ${silenceTimeoutMs} ms window`);
+    assert.ok(silentMs < DEFAULT_MAX_RUN_MS / 2, `killed after ${silentMs} ms, nowhere near the window`);
   },
 };
 

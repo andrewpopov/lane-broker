@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, laneSpawn, waitFor, sleep, stripLogTimestamps } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneRun, laneSpawn, waitFor, sleep, stripLogTimestamps, releaseAndReap } from './helpers.js';
 import { setup, resultOf } from './remote-harness.js';
 import { paths } from '../src/state.js';
 import { readLease } from '../src/lease.js';
@@ -111,22 +111,23 @@ test('default config: a silent run is NEVER killed, but the stall is recorded in
   const s = localSetup();
   writeRepoConfig(s.repoDir, { version: 1, lanes: { default: { weight: 1 } } });
   // Silent until released, not for a fixed 3.5 s: on a slow host a timed command can finish before status ever reports its stall.
+  // Released only after the stall outlasts WINDOW_MS, so a kill at that window (which this default config must never make) would be seen.
   const release = path.join(s.repoDir, 'release-quiet-run');
-  t.after(() => fs.writeFileSync(release, ''));
-  const quietUntilReleased = node(`process.stdout.write('started\\n'); const t0 = Date.now(); const poll = setInterval(() => { if (require('fs').existsSync(${JSON.stringify(release)}) || Date.now() - t0 > 120000) clearInterval(poll); }, 100);`);
+  const quietUntilReleased = node(`process.stdout.write('started\\n'); const t0 = Date.now(); const poll = setInterval(() => { if (require('fs').existsSync(${JSON.stringify(release)}) || Date.now() - t0 > 600000) clearInterval(poll); }, 100);`);
   const child = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', ...quietUntilReleased], { env: s.env, cwd: s.repoDir });
+  t.after(() => releaseAndReap(child, release));
   const seen = await waitFor(async () => {
     const status = JSON.parse((await laneRun(['status', '--json'], { env: s.env })).stdout);
     const stalled = status.running[0]?.noProgressSinceMs;
-    return stalled >= 1600 ? stalled : null;
+    return stalled >= WINDOW_MS + 500 ? stalled : null;
   }, { timeoutMs: 60_000, intervalMs: 300 });
   fs.writeFileSync(release, '');
-  assert.ok(seen >= 1600, 'status reports the running stall');
+  assert.ok(seen >= WINDOW_MS + 500, 'status reports the running stall, past the window an opt-in lane would be killed at');
   await new Promise((resolve) => (child.exitCode !== null ? resolve() : child.on('exit', resolve)));
   assert.equal(child.exitCode, 0);
   const [row] = historyOf(s.state);
   assert.equal(row.reason, undefined);
-  assert.ok(row.maxNoProgressMs >= 1500, `longest stretch recorded; got ${row.maxNoProgressMs}`);
+  assert.ok(row.maxNoProgressMs >= WINDOW_MS, `longest stretch recorded; got ${row.maxNoProgressMs}`);
 });
 
 test('opt-in lane: a CPU burst between two idle stretches resets the window (the kill needs CONSECUTIVE idle time)', async () => {

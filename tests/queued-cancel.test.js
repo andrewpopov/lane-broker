@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import fs from 'node:fs';
-import { freshEnv, writeGlobalConfig, writeRepoConfig, laneSpawn, laneRun, waitFor, sleep } from './helpers.js';
+import { freshEnv, writeGlobalConfig, writeRepoConfig, laneSpawn, laneRun, waitFor, sleep, releaseAndReap } from './helpers.js';
 import { paths } from '../src/state.js';
 import { isPidAlive } from '../src/lease.js';
 
@@ -19,12 +19,12 @@ test('cancelling a queued ticket lets its supervisor exit instead of polling for
   // generous, load-scaled budget rather than a fixed one calibrated for an
   // idle box.
   const STARTUP_TIMEOUT_MS = Math.max(60_000, 30 * globalConfig.sampleMs);
-  // The blocker holds the slot until released (bounded at 2 min, released on any exit): a fixed sleep can end on a slow host before
+  // The blocker holds the slot until released (bounded at 10 min, released and reaped on any exit): a fixed sleep can end on a slow host before
   // the second ticket is queued, which then starts and finishes, leaving the cancel nothing to cancel.
   const release = path.join(base, 'release-blocker');
-  t.after(() => fs.writeFileSync(release, ''));
-  const holdSlot = `i=0; while [ ! -e "${release}" ] && [ $i -lt 600 ]; do sleep 0.2; i=$((i+1)); done`;
+  const holdSlot = `i=0; while [ ! -e "${release}" ] && [ $i -lt 3000 ]; do sleep 0.2; i=$((i+1)); done`;
   const blocker = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', 'sh', '-c', holdSlot], { env, cwd: repoDir });
+  t.after(() => releaseAndReap(blocker, release));
   await waitFor(
     () => {
       try {
