@@ -193,7 +193,13 @@ const countJsonFiles = (dir) => {
   }
 };
 
-export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false, scan = scanProcWindow, remoteRoot = defaultRemoteRoot(), sampleDeviceGates = false } = {}) {
+async function liveStatusGates(deviceGates, root, remoteRoot, sampleGates) {
+  const recorded = readCurrentAgentGates(remoteRoot);
+  const cpuLoad = async () => recorded?.load?.reading ?? null;
+  return { deviceGates: liveDeviceGates(deviceGates, await sampleGates(deviceGates, { cpuLoad }), { memory: readMemoryGate(root, deviceGates).reading }, { load: recorded?.load }) };
+}
+
+export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false, scan = scanProcWindow, remoteRoot = defaultRemoteRoot(), sampleDeviceGates = false, sampleGates = sampleDevice } = {}) {
   const root = ensureStateDirs().root;
   const { config: cfg, error: configError } = loadGlobalConfigOrError();
   refreshCpuEstimates(cfg);
@@ -417,7 +423,8 @@ export async function collectStatus({ lockTimeoutMs = 5000, scanExternal = false
     // null whenever the sample itself is unavailable (non-macOS host, or a
     // failed probe), never a fabricated reading.
     memory: classifyMemorySample(readMemorySample()),
-    ...(sampleDeviceGates ? { deviceGates: liveDeviceGates(cfg.deviceGates, await sampleDevice(cfg.deviceGates), { memory: readMemoryGate(root, cfg.deviceGates).reading }, { load: readCurrentAgentGates(remoteRoot)?.load }) } : {}),
+    // PKG-440: status never opens a CPU sampling window (a 250 ms sleep on every call); the load gate shows the running agent's own recorded reading.
+    ...(sampleDeviceGates ? await liveStatusGates(cfg.deviceGates, root, remoteRoot, sampleGates) : {}),
     memoryGate: readMemoryGate(root, cfg.deviceGates),
     running,
     queued,
