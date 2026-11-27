@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { overBudgetShadow } from './over-budget.js';
 import fs from 'node:fs';
 import os from 'node:os';
 import { spawn } from 'node:child_process';
@@ -2578,14 +2579,18 @@ async function main() {
         const observed = tree?.cores ?? null;
         const observedMemory = tree?.memoryBytes ?? null;
         const cgroupPeak = memoryPeak.sample();
+        const now = Date.now();
+        const overBudget = overBudgetShadow(lease, { cores: observed, memoryBytes: observedMemory, now, sampleMs: globalCfg.sampleMs });
+        if (overBudget.line) writeBrokerLog(root, overBudget.line);
         // a gap of more than two heartbeats between good readings ends an overrun streak
         writeLease(root, {
-          ...applyHeartbeatObservation(lease, observed, Date.now(), observedMemory, 2 * globalCfg.sampleMs, {
+          ...applyHeartbeatObservation(lease, observed, now, observedMemory, 2 * globalCfg.sampleMs, {
             intervalCores: watchdog.lastIntervalCores,
             belowFraction: globalCfg.idleCreditBelowFraction,
             hungCores: globalCfg.hungCpuCores,
           }),
           ...(cgroupPeak === null ? {} : { observedCgroupMemoryPeakBytes: Math.max(lease.observedCgroupMemoryPeakBytes ?? 0, cgroupPeak) }),
+          ...overBudget.fields,
           descendants: descendants.snapshot(),
           leader: descendants.leader() ?? lease.leader ?? null,
           noProgressSinceMs: Math.round(idleMs),
