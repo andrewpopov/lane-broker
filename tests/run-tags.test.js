@@ -107,8 +107,8 @@ test('lane run --runner on a lane that runs here is refused (exit 64), and a bad
 });
 
 test('a ticket pinned to a runner is never locally eligible, whatever the lane policy; an unpinned one is not refused for pinning', () => {
-  const pinned = localIneligibilityOf({ lane: 'e2e', remote: { requiresTags: ['host:evo-x2'] } }, DEFAULT_GLOBAL_CONFIG, null);
+  const ticket = (requiresTags) => ({ lane: 'e2e', resources: { cpuCores: 1, memoryBytes: 1024 * 1024 }, remote: { requiresTags } });
+  const pinned = localIneligibilityOf(ticket(['host:evo-x2']), DEFAULT_GLOBAL_CONFIG, null);
   assert.match(pinned.message, /pinned to a runner \(host:evo-x2\) and never runs here/);
-  const unpinned = localIneligibilityOf({ lane: 'e2e', resources: { cpuCores: 1, memoryBytes: 1 }, remote: { requiresTags: ['browser'] } }, DEFAULT_GLOBAL_CONFIG, null);
-  assert.doesNotMatch(unpinned?.message ?? '', /pinned/);
+  assert.equal(localIneligibilityOf(ticket(['browser']), DEFAULT_GLOBAL_CONFIG, null), null, 'an unpinned tag leaves the lane locally eligible');
 });
