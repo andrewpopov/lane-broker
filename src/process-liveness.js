@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import { PS_TIMEOUT_MS } from '@andrewpopov/bosun/module';
 
@@ -81,6 +81,26 @@ export function sameProcessStart(pid, recorded) {
   const current = String(recorded).startsWith(TICKS_PREFIX) ? procStartTicks(pid) : psStartTime(pid);
   if (current === undefined || current === null) return current;
   return current === recorded;
+}
+
+/**
+ * `processStartTime` for many pids in one non-blocking `ps`: a Map of pid to start line, where a pid `ps` did not list is absent, or undefined when the
+ * probe could not complete (spawn failure, timeout, or `signal` aborted it).
+ */
+export function processStartTimes(pids, { timeoutMs = PS_TIMEOUT_MS, signal } = {}) {
+  if (pids.length === 0) return Promise.resolve(new Map());
+  return new Promise((resolve) => {
+    const options = { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C', LC_TIME: 'C' }, timeout: timeoutMs, killSignal: 'SIGKILL', ...(signal ? { signal } : {}) };
+    execFile('ps', ['-o', 'pid=,lstart=', '-p', pids.join(',')], options, (err, stdout) => {
+      if (err && typeof err.code !== 'number') return resolve(undefined);
+      const starts = new Map();
+      for (const line of stdout.split('\n')) {
+        const match = /^\s*(\d+)\s+(.*\S)\s*$/.exec(line);
+        if (match) starts.set(Number(match[1]), match[2]);
+      }
+      resolve(starts);
+    });
+  });
 }
 
 /**

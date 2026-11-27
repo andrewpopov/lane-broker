@@ -1,6 +1,6 @@
-import { budgetClient, ENV, processStart, requestSocket, usageRoots } from '@andrewpopov/bosun/module';
+import { budgetClient, ENV, PS_TIMEOUT_MS, requestSocket, usageRootReader } from '@andrewpopov/bosun/module';
 import { clampMem } from './claims.js';
-import { isProcessAlive } from '../process-liveness.js';
+import { isPidAlive, processStartTimes } from '../process-liveness.js';
 import { cpuBudgetCores, detectResourceCapacity } from '../resources.js';
 
 export const USAGE_HEARTBEAT_MS = 20_000;
@@ -24,32 +24,42 @@ export function usageOf(records) {
   return { held: { ...held, items: live.length }, demand: held };
 }
 
-// Bosun matches a root by its own start identity, which differs from the `pidStart` lane-broker records; the SDK reads it once per lane (keyed by pid and pidStart, so a
-// reused pid reads afresh) and applies bosun's root limit.
-export function rootsReader({ startOf = processStart, alive = isProcessAlive } = {}) {
-  const read = usageRoots({ startOf });
-  const lanes = (records) => records.filter((r) => isLive(r) && Number.isInteger(r.pid) && typeof r.pidStart === 'string' && alive(r.pid, r.pidStart));
-  return (records) => read(lanes(records).map(({ pid, pidStart }) => ({ pid, key: `${pid}:${pidStart}` })));
+// Bosun matches a root by its own start identity, which differs from the `pidStart` lane-broker records. Both reads are one async `ps` each under one
+// deadline (BRAIN-1368), so a stuck `ps` never holds the event loop. A lane whose start could not be read is kept, as `isProcessAlive` fails closed.
+export function rootsReader({ startsOf, lstartsOf = processStartTimes, pidAlive = isPidAlive, deadlineMs = PS_TIMEOUT_MS } = {}) {
+  const read = usageRootReader({ ...(startsOf ? { startsOf } : {}), deadlineMs });
+  return async (records) => {
+    const signal = AbortSignal.timeout(deadlineMs);
+    const lanes = records.filter((r) => isLive(r) && Number.isInteger(r.pid) && typeof r.pidStart === 'string' && pidAlive(r.pid));
+    const current = await lstartsOf(lanes.map((r) => r.pid), { timeoutMs: deadlineMs, signal });
+    const unchanged = lanes.filter((r) => [undefined, r.pidStart].includes(current?.get(r.pid)));
+    return read(unchanged.map(({ pid, pidStart }) => ({ pid, key: `${pid}:${pidStart}` })), { signal });
+  };
 }
 
-/** M6b: an enforced bosun grant caps what a claim offers. A standalone budget (no bosun, or an expired grant) leaves the claim as admission computed it, so enforcement never fails closed. */
-export function capByGrant(offered, budget) {
+/**
+ * M6b: an enforced bosun grant caps what a claim offers. Bosun's `free` trails the last usage heartbeat, so each figure is also capped at the ceiling
+ * less what this agent's live claims hold now, or a burst of claims would spend one grant several times. A standalone budget (no bosun, or an expired
+ * grant) leaves the claim as admission computed it, so enforcement never fails closed.
+ */
+export function capByGrant(offered, budget, records = []) {
   if (!offered || budget?.source !== 'bosun') return offered;
+  const { held } = usageOf(records);
   return {
     ...offered,
-    freeCpu: Math.max(0, Math.min(offered.freeCpu, budget.cpu.free)),
-    freeMem: Math.min(offered.freeMem, clampMem(budget.mem.free)),
+    freeCpu: Math.max(0, Math.min(offered.freeCpu, budget.cpu.free, budget.cpu.ceiling - held.cpu)),
+    freeMem: Math.min(offered.freeMem, clampMem(budget.mem.free), clampMem(budget.mem.ceiling - held.mem)),
     budgetCpu: Math.min(offered.budgetCpu, budget.cpu.ceiling),
   };
 }
 
 export const budgetEnforced = (cfg) => cfg?.lanePull?.budgetEnforce === true;
 
-export function openBudgetShadow({ readConfig, records, log, now = Date.now, env = process.env, host = detectResourceCapacity, call = requestSocket, heartbeatMs = USAGE_HEARTBEAT_MS, clientOptions = {}, rootStartOf, rootAlive }) {
+export function openBudgetShadow({ readConfig, records, log, now = Date.now, env = process.env, host = detectResourceCapacity, call = requestSocket, heartbeatMs = USAGE_HEARTBEAT_MS, clientOptions = {}, rootOptions = {} }) {
   let capacity;
   const standalone = () => standaloneBudget({ cfg: readConfig(), host: capacity ??= host() });
   const client = budgetClient({ standalone: { get cpu() { return standalone().cpu; }, get mem() { return standalone().mem; } }, env, now, call, ...clientOptions });
-  const rootsOf = rootsReader({ startOf: rootStartOf, alive: rootAlive });
+  const rootsOf = rootsReader(rootOptions);
   const abort = new AbortController();
   const following = client.follow(abort.signal, (budget) => log(`budget: bosun grants ${JSON.stringify(shadowSamples(budget).figures)}${budget.gates.length ? ` gates ${budget.gates.map((g) => g.name).join(',')}` : ''}`)).catch((err) => log(`budget: ${err.message}`));
   let lastBeatAt = -Infinity;
@@ -66,7 +76,7 @@ export function openBudgetShadow({ readConfig, records, log, now = Date.now, env
     try {
       const live = records();
       // A lane left out by the root limit counts as unmanaged until a later beat, which only under-grants.
-      const { roots, omitted } = rootsOf(live);
+      const { roots, omitted } = await rootsOf(live);
       const response = await call(socket, { method: 'PUT', path: `/v1/modules/${encodeURIComponent(module)}/usage`, authorization: `Bearer ${token}`, body: { incarnation, ...usageOf(live), roots } });
       report(response.status !== 204 ? `usage heartbeat refused: ${response.status}` : omitted ? `usage heartbeat declares ${roots.length} of ${roots.length + omitted} lane roots (bosun's limit)` : null);
     } catch (err) {
@@ -89,7 +99,13 @@ export function openBudgetShadow({ readConfig, records, log, now = Date.now, env
     const on = budgetEnforced(cfg);
     if (on !== lastEnforced) log(`budget: claims ${on ? 'capped by the bosun grant' : 'no longer capped by bosun'}`);
     lastEnforced = on;
-    return on ? client.current() : null;
+    if (!on) return null;
+    try {
+      return client.current();
+    } catch (err) {
+      report(`budget unreadable: ${err.message}`);
+      return null;
+    }
   };
   return {
     shadow,
