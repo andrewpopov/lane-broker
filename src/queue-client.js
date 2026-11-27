@@ -118,8 +118,10 @@ export function createQueueClient({
       let client;
       let phase = 'connect';
       try {
-        if (deadlineAt !== undefined && deadlineAt - Date.now() <= 0) throw new QueueError(`${name} failed: the caller's deadline passed`, { code: 'ETIMEDOUT' });
-        client = await connectClient(connectionConfig({ url, passwordFile, caFile }, deadlineAt === undefined ? timeouts : { ...timeouts, connectTimeoutMs: Math.min(timeouts.connectTimeoutMs ?? QUEUE_CONNECT_TIMEOUT_MS, deadlineAt - Date.now()) }));
+        // one clock read decides both the expiry and the connect cap: a second read could reach 0, which pg takes as "no connect timeout"
+        const left = deadlineAt === undefined ? undefined : deadlineAt - Date.now();
+        if (left !== undefined && left <= 0) throw new QueueError(`${name} failed: the caller's deadline passed`, { code: 'ETIMEDOUT' });
+        client = await connectClient(connectionConfig({ url, passwordFile, caFile }, left === undefined ? timeouts : { ...timeouts, connectTimeoutMs: Math.min(timeouts.connectTimeoutMs ?? QUEUE_CONNECT_TIMEOUT_MS, left) }));
         client.on('error', () => {});
         phase = 'query';
         // under a caller's deadline the query is allowed what is left of it once connected, not a share fixed beforehand

@@ -345,6 +345,29 @@ const SCENARIOS = {
     assert.ok(fs);
   },
 
+  'a deadline read as 1 ms left never reaches the connector as a 0 (no) connect timeout': async (load, t) => {
+    const { createQueueClient: create } = await load('queue-client.js');
+    const files = secretFiles(t);
+    const deadlineAt = 1_000_000;
+    const realNow = Date.now;
+    let reads = 0;
+    // the first read sees 1 ms left; every later read sees the deadline itself, so a second read would compute 0
+    Date.now = () => (reads++ === 0 ? deadlineAt - 1 : deadlineAt);
+    let seen;
+    try {
+      const connectClient = async (config) => {
+        seen = config;
+        return { on: () => {}, query: async () => ({ rows: [{ v: 'answer' }] }), end: async () => {}, connection: { stream: { destroy: () => {} } } };
+      };
+      await create({ url: QUEUE_URL, ...files, connectClient }).knownHosts({ attempts: 1, connectTimeoutMs: 2000, queryTimeoutMs: 3000, deadlineAt }).catch(() => {});
+    } finally {
+      Date.now = realNow;
+    }
+    assert.ok(seen, 'the connector was called');
+    const connectTimeout = seen.connectionTimeoutMillis ?? seen.connectTimeoutMs;
+    assert.ok(connectTimeout > 0, `the connect timeout handed to pg is positive (got ${connectTimeout})`);
+  },
+
   'the detached wait of an unkeyed ticket that timed out hands back its id and says wait, never retry': async (load) => {
     const { awaitKeyedEnqueue } = await load('run.js');
     const { state } = freshEnv();
@@ -377,6 +400,7 @@ const CANARIES = [
   ['run-budget.js', ['return ms <= 0 ? { expired: true }', 'return ms < 0 ? { expired: true }'], 'one deadline bounds the alias probe, the key lookup, the teardown and the waits: each call gets the instant, a wait gets what is left read once, and none or 0 is no deadline', null],
   ['queue-client.js', ['if ((await Promise.race([client.end().then(() => \'ended\', () => \'ended\'), expired])) === \'expired\') client.connection?.stream?.destroy();', 'await client.end();'], 'a queue call under a deadline lets the query use what connecting left, and cuts off a peer that stalls during shutdown while still returning the row', null],
   ['queue-client.js', ['Math.min(timeouts.queryTimeoutMs ?? QUEUE_QUERY_TIMEOUT_MS, deadlineAt - Date.now())', 'Math.floor((deadlineAt - Date.now()) / 2)'], 'a queue call under a deadline lets the query use what connecting left, and cuts off a peer that stalls during shutdown while still returning the row', null],
+  ['queue-client.js', ['connectTimeoutMs: Math.min(timeouts.connectTimeoutMs ?? QUEUE_CONNECT_TIMEOUT_MS, left)', 'connectTimeoutMs: Math.min(timeouts.connectTimeoutMs ?? QUEUE_CONNECT_TIMEOUT_MS, deadlineAt - Date.now())'], 'a deadline read as 1 ms left never reaches the connector as a 0 (no) connect timeout', null],
 ];
 
 for (const [name, scenario] of Object.entries(SCENARIOS)) test(name, (t) => scenario(realSrc, t));
