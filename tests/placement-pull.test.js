@@ -60,6 +60,18 @@ const SCENARIOS = {
     assert.ok(fx.pull().enqueue.seenRowAt);
   },
 
+  'a preparation failure caused by a cancel recovers as cancelled 130 after the proof, as the live path publishes it': async (load, w, t) => {
+    const fx = await pullFixture(t, w, { load, id: tid(8) });
+    fx.envelopeFields.placementRequest = { capabilityClass: null, classPlatform: null, classTags: [], avoidHosts: [], targetHost: 'a2' };
+    fx.envelopeFields.publication = { refusalExit: 76 };
+    await fx.prepare();
+    assert.deepEqual(await fx.proveNeverEnqueued({ neverEnqueuedExit: 75, neverEnqueuedCause: 'cancelled' }), { proof: true });
+    await fx.killSupervisor();
+    await fx.step();
+    assert.equal(fx.published().exit, 130);
+    assert.equal((await (await w.su()).query('SELECT count(*)::int AS n FROM lane_dispatch.tickets')).rows[0].n, 0);
+  },
+
   'recovery after a proven never-enqueued placed ticket publishes 75, as the live path does': async (load, w, t) => {
     const fx = await pullFixture(t, w, { load, id: tid(7) });
     fx.envelopeFields.placementRequest = { capabilityClass: null, classPlatform: null, classTags: [], avoidHosts: [], targetHost: 'a2' };
@@ -82,12 +94,14 @@ const SCENARIOS = {
   },
 };
 
+const CANCELLED = 'a preparation failure caused by a cancel recovers as cancelled 130 after the proof, as the live path publishes it';
 const NEVER = 'recovery after a proven never-enqueued placed ticket publishes 75, as the live path does';
 const REPLY = 'a committed enqueue whose reply was dropped is recovered as the one row it made, with its placement';
 const FIRST = 'a placed envelope is enqueued with its placement, and the poller copies why no runner can take it into the attempt until one can';
 const CANARIES = [
   [FIRST, 'status.js', ["${r.pullUnplaceable ? ` queued (unplaceable: ${r.pullUnplaceable})` : ''}", ''], null, null],
   [REPLY, 'pull-enqueue.js', ['view = await queue.enqueueFenced({ expectRef: ref, ...args });', 'view = await queue.enqueueFenced({ expectRef: ref, ...args, ...(intent.attempts.length > 0 ? { id: \'00000000-0000-4000-8000-0000000000ff\' } : {}) });'], null, null],
+  [CANCELLED, 'pull-ticket.js', ["pull.neverEnqueuedCause === 'cancelled' ?", 'false ?'], null, null],
   [NEVER, 'pull-ticket.js', ['exit: pull.neverEnqueuedExit ?? ', 'exit: '], null, null],
   ['a placed envelope is enqueued with its placement, and the poller copies why no runner can take it into the attempt until one can', 'pull-ticket.js',
     ["if (unplaceable !== (attempt.pull.unplaceable ?? null)) await persistPull(run, { unplaceable });", ''], null, /no principal runs win32|unplaceable|expected/i],

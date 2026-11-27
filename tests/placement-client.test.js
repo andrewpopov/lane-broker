@@ -297,37 +297,22 @@ const SCENARIOS = {
     assert.deepEqual(await wait(realExit90, { supervisorEnded: Promise.resolve({ code: 90, signal: null }) }), { id: ID }, 'a command that exits 90 is not a placement signal');
   },
 
-  'a placed --id is taken once: any per-id artifact here, including a ledger entry GC left alone, refuses it, and the claim goes to one caller': async (load) => {
-    const { hasLocalRecord, claimSubmissionId } = await load('placement-record.js');
-    const { createAttempt } = await load('attempts.js');
-    const { atomicWriteJson, paths } = await load('state.js');
-    const { ledgerFile } = await load('pull-ledger.js');
-    const { writePending } = await load('pending.js');
-    const fs = await import('node:fs');
-    const path = await import('node:path');
-    const fresh = () => {
-      const { state } = freshEnv();
-      ensureStateDirs(state);
-      return state;
-    };
-    const artifacts = {
-      attempt: (root) => createAttempt(root, ID),
-      result: (root) => atomicWriteJson(path.join(paths(root).results, `${ID}.json`), { id: ID, exit: 0 }),
-      'pull directory': (root) => fs.mkdirSync(path.join(paths(root).pull, ID), { recursive: true }),
-      'ledger entry alone': (root) => { fs.mkdirSync(paths(root).pullLedger, { recursive: true }); atomicWriteJson(ledgerFile(root, ID), { id: ID }); },
-      'pending record': (root) => writePending(root, { id: ID, pid: 1, logPath: 'x', cwd: '/', repo: 'r', lane: 'l' }),
-      'cancel marker': (root) => { fs.mkdirSync(paths(root).cancel, { recursive: true }); fs.writeFileSync(path.join(paths(root).cancel, ID), ''); },
-      log: (root) => fs.writeFileSync(path.join(paths(root).logs, `${ID}.log`), ''),
-    };
-    assert.equal(hasLocalRecord(fresh(), ID), false, 'a fresh state has no record');
-    for (const [kind, make] of Object.entries(artifacts)) {
-      const root = fresh();
-      await make(root);
-      assert.equal(hasLocalRecord(root, ID), true, kind);
+  'one deadline bounds the alias probe, the key lookup and the waits: each call gets what is left, connect and query together never exceed it, and none or 0 is no deadline': async (load) => {
+    const { timeoutBudget } = await load('run-budget.js');
+    let clock = 1000;
+    const budget = timeoutBudget(3000, 1000, () => clock);
+    assert.deepEqual([budget.bounded, budget.left(), budget.expired()], [true, 3000, false]);
+    assert.deepEqual(budget.limits(2000, 3000), { attempts: 1, connectTimeoutMs: 1500, queryTimeoutMs: 1500 });
+    clock += 2500;
+    const late = budget.limits(5000, 15000);
+    assert.deepEqual(late, { attempts: 1, connectTimeoutMs: 250, queryTimeoutMs: 250 }, 'the second call gets the remainder, not its cap');
+    assert.ok(late.connectTimeoutMs + late.queryTimeoutMs <= budget.left());
+    clock += 500;
+    assert.equal(budget.expired(), true);
+    for (const none of [undefined, 0]) {
+      const open = timeoutBudget(none, 0, () => 1e12);
+      assert.deepEqual([open.bounded, open.expired(), open.left(), open.limits(1, 1)], [false, false, null, undefined]);
     }
-    const root = fresh();
-    assert.deepEqual([claimSubmissionId(root, ID), claimSubmissionId(root, ID)], [true, false]);
-    assert.equal(hasLocalRecord(root, ID), true, 'a claim is a record too');
   },
 
   'the detached wait of an unkeyed ticket that timed out hands back its id and says wait, never retry': async (load) => {
@@ -358,9 +343,8 @@ const CANARIES = [
   ['placement.js', ['&& hostsOk && targetOk && constrained;', '&& hostsOk && targetOk;'], 'a v3 envelope must name a consistent placement: a platform with no class, a non-canonical class or list, a target that is avoided, or nothing at all is refused, and a placed envelope never selects the short enqueue', null],
   ['queue-client.js', ['const placed = namedPlaced || ', 'const placed = '], 'a v3 envelope must name a consistent placement: a platform with no class, a non-canonical class or list, a target that is avoided, or nothing at all is refused, and a placed envelope never selects the short enqueue', null],
   ['run.js', ['if (ended !== null && ended.code !== DUPLICATE_SUBMISSION_EXIT) return', 'if (ended !== null) return'], 'the detached wait of a duplicate supervisor (78) follows the original through its ack and a duplicate that never gets an answer times out 75', null],
-  ['placement-record.js', ["{ flag: 'wx' }", "{ flag: 'w' }"], 'a placed --id is taken once: any per-id artifact here, including a ledger entry GC left alone, refuses it, and the claim goes to one caller', null],
-  ['placement-record.js', ['files.some((file) => fs.existsSync(file))', 'false'], 'a placed --id is taken once: any per-id artifact here, including a ledger entry GC left alone, refuses it, and the claim goes to one caller', null],
   ['placement.js', ['typeof targetHost === \'string\' && ', ''], 'a v3 envelope must name a consistent placement: a platform with no class, a non-canonical class or list, a target that is avoided, or nothing at all is refused, and a placed envelope never selects the short enqueue', null],
+  ['run-budget.js', ['Math.max(1, Math.floor(left() / 2))', 'Math.floor(left())'], 'one deadline bounds the alias probe, the key lookup and the waits: each call gets what is left, connect and query together never exceed it, and none or 0 is no deadline', null],
 ];
 
 for (const [name, scenario] of Object.entries(SCENARIOS)) test(name, (t) => scenario(realSrc, t));

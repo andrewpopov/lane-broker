@@ -312,6 +312,12 @@ function fakeWorld({ hba = HBA, train = TRAIN, held = [], hbaErrors = 0, item = 
         world.afterRole?.();
         return ok();
       }
+      if (input.includes('AS policy_matches')) {
+        const [tags, repos, max, platform] = world.principalRow ?? [];
+        const asked = (list) => `{${[...input.matchAll(new RegExp(`${list} = ARRAY\\[([^\\]]*)\\]`, 'g'))].flatMap((m) => m[1].split(',').filter(Boolean).map((x) => x.replaceAll("'", ''))).join(',')}}`;
+        if (!world.principalRow) return ok('');
+        return ok(`${tags === asked('tags') && repos === asked('allowed_repos') && max === /max_claims = (\d+)/.exec(input)[1] && platform === /platform IS NOT DISTINCT FROM '(\w+)'/.exec(input)[1] ? 't' : 'f'}\n`);
+      }
       if (input.includes('FROM lane_dispatch.principals WHERE host =')) return ok(world.principalRow ? `${world.principalRow.join('|')}\n` : '');
       if (input.includes('ld_set_platform')) {
         const platform = /ld_set_platform\('[^']+', (?:'(\w+)'|NULL)\)/.exec(input)[1] ?? '-';
@@ -858,7 +864,7 @@ test('the add transaction locks the principals table before it compares policy, 
 });
 
 test('canary: with the existing-principal refusal removed, add --platform writes through ld_set_principal', async () => {
-  const mutant = await importMutant(LIB_FILE, ['existing !== undefined && !sameAsRequested(existing)', 'false']);
+  const mutant = await importMutant(LIB_FILE, ["existing !== undefined && existing[0] !== 't'", 'false']);
   const world = fakeWorld({ principalRow: [...RESTRICTED] });
   const { code } = await cli(world, [...ADD, '--platform', 'linux', '--apply'], mutant);
   assert.equal(code, 0, 'the mutant resets the existing runner, which the real code refuses');

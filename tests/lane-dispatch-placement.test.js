@@ -1,5 +1,6 @@
 import { describe, test, before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
+import { parseCli, policyMatchSql } from '../ops/runner/runner-admin-lib.js';
 import { pgSkipOption } from './lane-db-harness.js';
 import { startDispatchCluster, World, logins, call, enqueue, claim, finish, setNow, tid, waitBlocked } from './lane-dispatch-fixture.js';
 
@@ -274,6 +275,19 @@ const GUARDS = {
     await assert.rejects(call(admin, 'ld_set_platform', 'nobody', 'linux'), code('22023'));
     await assert.rejects(call(admin, 'ld_set_platform', 'a1', 'plan9'), code('22023'));
     assert.deepEqual(await row(), { ...before, platform: null }, 'refusals changed nothing');
+  },
+
+  'the add policy comparison is exact for a tag named NULL, and the tag grammar admits no quote and splits on commas': async (w) => {
+    const su = await w.su();
+    await call(await w.as(logins.admin), 'ld_set_principal', logins.x, 'agent', 'x', ['NULL', 'a'], ['*', 'repoA'], 3);
+    await call(await w.as(logins.admin), 'ld_set_platform', 'x', 'linux');
+    const matches = async (policy) => (await su.query(policyMatchSql('x', policy))).rows[0].policy_matches;
+    const same = { tags: ['NULL', 'a'], repos: ['*', 'repoA'], maxClaims: 3, platform: 'linux' };
+    assert.equal(await matches(same), true);
+    for (const other of [{ tags: ['a', 'NULL'] }, { tags: ['NULL'] }, { tags: ['null', 'a'] }, { repos: ['*'] }, { maxClaims: 2 }, { platform: 'darwin' }]) assert.equal(await matches({ ...same, ...other }), false, JSON.stringify(other));
+    assert.equal((await su.query(policyMatchSql('nobody', same))).rows.length, 0);
+    assert.deepEqual(parseCli(['add', 'x', '--ip', '100.80.0.1', '--tags', 'NULL,a']).tags, ['NULL', 'a']);
+    assert.throws(() => parseCli(['add', 'x', '--ip', '100.80.0.1', '--tags', 'a"b']), /invalid tag or repo/);
   },
 
   'ld_claim reads the platform under the principal lock: a platform change committed while a claim waits is seen by that claim': async (w) => {

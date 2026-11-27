@@ -332,8 +332,8 @@ const CANARIES = [
   ['a SIGINT with no proven stop never makes `lane run` exit 130: the unconfirmed cancel is unresolved, exit 1', 'run.js', ['(ended.code === 0 || ended.code === 130)', 'true']],
   ['a requested priority tier reaches the queue\'s priority column: medium 4 by default, high 7', ...supervisor('priority: pullQueuePriority(enriched.priorityRequested)', 'priority: 0')],
   ['a second supervisor reuses the readiness verdict the first stored: no lifecycle read, no queue login', 'pull-placement.js', ['if (stored?.key === key && age >= 0 && age < ttl && !failedSince) return stored.verdict;', '']],
-  [NOT_PREPARED, ...supervisor('if (!(await proveNeverEnqueued(ctx)).proof) {', 'if (true) {')],
-  [NOT_PREPARED, ...pullTicket('    await persistPull(run, { neverEnqueued: true, ...(ctx.neverEnqueuedExit === undefined ? {} : { neverEnqueuedExit: ctx.neverEnqueuedExit }) });\n', '')],
+  [NOT_PREPARED, ...supervisor('if (!(await proveNeverEnqueued({ ...ctx, ...(cancelled ? { neverEnqueuedCause: \'cancelled\' } : {}) })).proof) {', 'if (true) {')],
+  [NOT_PREPARED, ...pullTicket('    await persistPull(run, { neverEnqueued: true, ...(ctx.neverEnqueuedExit === undefined ? {} : { neverEnqueuedExit: ctx.neverEnqueuedExit }), ...(ctx.neverEnqueuedCause === undefined ? {} : { neverEnqueuedCause: ctx.neverEnqueuedCause }) });\n', '')],
 
   ['T32: no eligible principal on a dispatch-only host is a retryable refusal, exit 76, and nothing is enqueued', ...supervisor('{ rebindable: true, noRunner: true, retryable: true }', '{ rebindable: true, noRunner: true, retryable: false }')],
   ['T32: a withdraw the queue committed on a dispatch-only host is a retryable refusal, exit 76', ...supervisor("'withdrawn from the pull queue', { neverStarted: true, noRunner: true, retryable: true }", "'withdrawn from the pull queue', { neverStarted: true, noRunner: true, retryable: false }")],

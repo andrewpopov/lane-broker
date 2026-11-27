@@ -27,7 +27,7 @@ async function until(fn, what, { timeoutMs = 40_000 } = {}) {
 }
 
 // a real `lane run` supervisor whose queue connections land on the harness database and whose object store is an in-process stub
-export async function pullE2E(t, w, { load, pullRunner = true, pushRunner = false, localPaused = false, ssh, globalExtra = {}, lanePull = {}, queueFail = '' } = {}) {
+export async function pullE2E(t, w, { load, pullRunner = true, pushRunner = false, localPaused = false, ssh, globalExtra = {}, lanePull = {}, queueFail = '', queueFailCode = '', queueStall = '' } = {}) {
   const stub = await startS3Stub();
   t.after(() => stub.close());
   const secrets = makeTmpDir('pull-e2e-secrets-', t);
@@ -58,6 +58,8 @@ export async function pullE2E(t, w, { load, pullRunner = true, pushRunner = fals
     LANE_TEST_QUEUE_CONN: JSON.stringify(w.cluster.conn(w.db, logins.s1)),
     LANE_TEST_QUEUE_CALLS: calls,
     LANE_TEST_QUEUE_FAIL: queueFail,
+    LANE_TEST_QUEUE_FAIL_CODE: queueFailCode,
+    LANE_TEST_QUEUE_STALL: queueStall,
     LANE_TEST_QUEUE_FAILED: failed,
     LANE_TEST_EXIT_LOG: exits,
   };

@@ -79,6 +79,7 @@ export function roleSql({ role, host, password, roleExists, tags, repos, maxClai
 
 export const PLATFORMS = ['darwin', 'linux', 'win32'];
 export const principalSql = (host) => `SELECT tags, allowed_repos, max_claims, coalesce(platform, '-') FROM lane_dispatch.principals WHERE host = ${sqlLit(host)} AND kind = 'agent';\n`;
+export const policyMatchSql = (host, { tags, repos, maxClaims, platform }) => `SELECT tags = ${sqlTextArray(tags)} AND allowed_repos = ${sqlTextArray(repos)} AND max_claims = ${Number(maxClaims)} AND platform IS NOT DISTINCT FROM ${sqlLit(platform)} AS policy_matches FROM lane_dispatch.principals WHERE host = ${sqlLit(host)} AND kind = 'agent';\n`;
 export const setPlatformSql = (host, platform) => ['BEGIN;', `SELECT lane_dispatch.ld_set_platform(${sqlLit(host)}, ${platform === null ? 'NULL' : sqlLit(platform)});`, 'COMMIT;', ''].join('\n');
 
 export const roleAndPrincipalSql = (role) => `SELECT (SELECT count(*) FROM pg_roles WHERE rolname = ${sqlLit(role)}), (SELECT count(*) FROM lane_dispatch.principals WHERE login_role = ${sqlLit(role)});\n`;
@@ -714,11 +715,9 @@ function buildAddPlan(ctx) {
   const stillThere = recheckRole(ctx, role);
   const roleExists = async () => Number((await ctx.psql(roleExistsSql(role), { query: true, label: 'check role' })).stdout.trim()) > 0;
   // `--platform` is for a new runner: ld_set_principal would rewrite an existing one's tags, repos and max_claims
-  const arrayText = (items) => `{${items.join(',')}}`;
-  const sameAsRequested = (row) => row[0] === arrayText(ctx.opts.tags) && row[1] === arrayText(ctx.opts.repos) && Number(row[2]) === ctx.opts.maxClaims && row[3] === ctx.opts.platform;
   const refuseExistingForPlatform = async () => {
-    const existing = ctx.opts.platform ? (await ctx.psqlRows(principalSql(host), 'read principal'))[0] : undefined;
-    if (existing !== undefined && !sameAsRequested(existing)) throw new Error(`principal ${host} already exists with another policy: add --platform would reset its tags, repos and max_claims; change only the platform with: lane-runner-admin set-platform ${host} ${ctx.opts.platform}`);
+    const existing = ctx.opts.platform ? (await ctx.psqlRows(policyMatchSql(host, ctx.opts), 'compare principal policy'))[0] : undefined;
+    if (existing !== undefined && existing[0] !== 't') throw new Error(`principal ${host} already exists with another policy: add --platform would reset its tags, repos and max_claims; change only the platform with: lane-runner-admin set-platform ${host} ${ctx.opts.platform}`);
   };
   const steps = [
     {

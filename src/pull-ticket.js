@@ -44,7 +44,7 @@ const hook = (run, name) => run.hooks?.[name]?.();
 const lost = (reason, detail) => ({ kind: 'lost', exit: 75, reason, ...(detail ? { detail } : {}) });
 const provenNeverStarted = (pull) => pull?.withdrawProof === true || pull?.neverEnqueued === true;
 // a supervisor that died after the proof and before the fallback leaves a ticket nothing ran: the retryable refusal its host would have answered (76 where dispatch-only)
-const neverStartedDecision = (run, pull) => ({ ...lost(pull.withdrawProof === true ? 'withdrawn-never-started' : 'never-enqueued'), exit: pull.neverEnqueuedExit ?? run.envelope?.publication?.refusalExit ?? LOST_EXIT });
+const neverStartedDecision = (run, pull) => (pull.neverEnqueuedCause === 'cancelled' ? { kind: 'cancelled', exit: 130, source: 'never-enqueued' } : { ...lost(pull.withdrawProof === true ? 'withdrawn-never-started' : 'never-enqueued'), exit: pull.neverEnqueuedExit ?? run.envelope?.publication?.refusalExit ?? LOST_EXIT });
 const isQueueAuthored = (row) => row?.result?.author === 'queue' && (row.state === 'lost' || (row.state === 'cancelled' && SERVER_CANCEL_SOURCES.has(row.result.source)));
 const lostReasonOf = (row) => (QUEUE_LOST_REASONS.has(row.result?.reason) ? row.result.reason : 'runner-lost');
 
@@ -730,7 +730,7 @@ export async function proveNeverEnqueued(ctx) {
   return withTicketLock(run.root, run.id, async () => {
     if (readLedger(run.root, run.id) !== null) return { proof: false, ledgered: true };
     if ((readAttempt(run.root, run.id)?.pull?.enqueue?.attempts ?? []).length > 0) return { proof: false };
-    await persistPull(run, { neverEnqueued: true, ...(ctx.neverEnqueuedExit === undefined ? {} : { neverEnqueuedExit: ctx.neverEnqueuedExit }) });
+    await persistPull(run, { neverEnqueued: true, ...(ctx.neverEnqueuedExit === undefined ? {} : { neverEnqueuedExit: ctx.neverEnqueuedExit }), ...(ctx.neverEnqueuedCause === undefined ? {} : { neverEnqueuedCause: ctx.neverEnqueuedCause }) });
     return { proof: true };
   }, { lockTimeoutMs: run.lockTimeoutMs });
 }

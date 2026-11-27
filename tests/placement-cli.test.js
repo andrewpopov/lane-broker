@@ -165,41 +165,48 @@ const SCENARIOS = {
     assert.equal((await (await w.su()).query('SELECT state FROM lane_dispatch.tickets')).rows[0].state, 'withdrawn');
   },
 
-  'a placed --id is accepted only when this machine holds no record of it: any artifact, a ledger entry left alone included, makes it 64': async (load, w, t) => {
+  'placement constraints cannot be combined with --id, in either order, before any network call or file write; a dispatch key is still allowed': async (load, w, t) => {
     const fx = await pullE2E(t, w, { load, localPaused: true });
     const id = crypto.randomUUID();
-    const detached = (name, extra) => fx.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', '--id', name, ...extra, '--', 'true']);
-    const first = await detached(id, target('a2'));
-    assert.equal(first.code, 0, first.stderr);
-    t.after(() => fx.lane(['cancel', id]));
-    await fx.enqueued();
-    for (const extra of [target('a2'), ['--avoid-host', 'a1'], ['--class', 'linux']]) {
-      const again = await detached(id, extra);
-      assert.equal(again.code, 64, again.stderr);
-      assert.match(again.stderr, /needs a fresh --id; use --dispatch-key for idempotent resubmission/);
+    const before = fs.existsSync(paths(fx.state).attempts) ? fs.readdirSync(paths(fx.state).attempts) : [];
+    for (const flags of [target('a2'), ['--avoid-host', 'a1'], ['--class', 'linux']]) {
+      for (const argv of [['--id', id, ...flags], [...flags, '--id', id]]) {
+        const res = await fx.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', ...argv, '--', 'true']);
+        assert.equal(res.code, 64, `${argv.join(' ')}: ${res.stderr}`);
+        assert.match(res.stderr, /placement constraints cannot be combined with --id; use --dispatch-key for idempotent resubmission/);
+        assert.equal(res.stdout, '');
+      }
     }
-    assert.equal(await ticketCount(w), 1);
-    const ledgerOnly = crypto.randomUUID();
-    fs.mkdirSync(paths(fx.state).pullLedger, { recursive: true });
-    fs.writeFileSync(path.join(paths(fx.state).pullLedger, `${ledgerOnly}.json`), '{}');
-    assert.equal((await detached(ledgerOnly, target('a2'))).code, 64, 'a ledger entry GC left behind is a record');
-    const unconstrained = await detached(id, []);
-    assert.notEqual(unconstrained.code, 64, 'an unconstrained --id keeps its idempotent meaning');
-    assert.equal(await ticketCount(w), 1);
+    assert.equal(fx.queueCalls(), 0, 'no queue connection was made');
+    assert.deepEqual(fx.supervisorExits(), []);
+    assert.deepEqual(fs.existsSync(paths(fx.state).attempts) ? fs.readdirSync(paths(fx.state).attempts) : [], before, 'nothing was written');
+    await nothingRan(fx, w);
+    const keyed = await fx.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', '--dispatch-key', 'train:r:11:1', ...target('a2'), '--', 'true']);
+    assert.equal(keyed.code, 0, keyed.stderr);
+    t.after(() => fx.lane(['cancel', keyed.stdout.trim()]));
+    const plain = await fx.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', '--id', id, '--', 'true']);
+    assert.equal(plain.code, 0, `an unconstrained --id is unchanged: ${plain.stderr}`);
+    t.after(() => fx.lane(['cancel', id]));
   },
 
-  'two concurrent --id submissions of one fresh id, whatever their placement: one wins, the other exits 64, and one ticket exists': async (load, w, t) => {
-    const fx = await pullE2E(t, w, { load, localPaused: true });
-    for (const [first, second] of [[target('a2'), ['--avoid-host', 'a1']], [target('a2'), target('a2')]]) {
-      const fresh = crypto.randomUUID();
-      const race = (extra) => fx.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', '--id', fresh, ...extra, '--', 'true']);
-      const [a, b] = await Promise.all([race(first), race(second)]);
-      t.after(() => fx.lane(['cancel', fresh]));
-      assert.deepEqual([a.code, b.code].sort(), [0, 64], `${a.stderr}\n${b.stderr}`);
-      assert.equal([a, b].find((r) => r.code === 0).stdout.trim(), fresh);
-      assert.equal([a, b].find((r) => r.code === 64).stdout, '', 'the loser is never told the winner id');
-    }
-    assert.equal(await ticketCount(w), 2);
+  'an alias probe that stalls is held to the --timeout budget, the key lookup after it gets only what is left, and a probe that answers 42883 adopts nothing': async (load, w, t) => {
+    const aliased = { hostAliases: { 'a2-fleet': 'a2' } };
+    const seed = await pullE2E(t, w, { load, localPaused: true });
+    const held = await seed.lane(['run', '--repo', 'r', '--lane', 'default', '--detach', '--dispatch-key', 'train:r:12:1', ...target('a2'), '--', 'true']);
+    assert.equal(held.code, 0, held.stderr);
+    t.after(() => seed.lane(['cancel', held.stdout.trim()]));
+    const stalled = await pullE2E(t, w, { load, localPaused: true, globalExtra: aliased, queueStall: 'ld_known_hosts' });
+    const startedAt = Date.now();
+    const res = await stalled.lane(['run', '--repo', 'r', '--lane', 'default', '--timeout', '3s', ...target('a2-fleet'), '--', 'true']);
+    const elapsedMs = Date.now() - startedAt;
+    assert.equal(res.code, 75, res.stderr);
+    assert.ok(elapsedMs < scaledMs(3000) + 6000, `the probe held the run for ${elapsedMs}ms against a 3 s budget`);
+    assert.equal(await ticketCount(w), 1, 'nothing was submitted');
+    const old = await pullE2E(t, w, { load, localPaused: true, globalExtra: aliased, queueFail: 'ld_known_hosts', queueFailCode: '42883' });
+    const adopted = await old.lane(['run', '--repo', 'r', '--lane', 'default', '--dispatch-key', 'train:r:12:1', ...target('a2-fleet'), '--', 'true']);
+    assert.equal(adopted.code, 76, `the held ticket was adopted without a successful alias check: ${adopted.stderr}`);
+    assert.doesNotMatch(adopted.stdout, new RegExp(held.stdout.trim()));
+    assert.equal(await ticketCount(w), 1);
   },
 
   'an alias probe that cannot reach the queue is 75 and submits nothing; against a queue too old for it the supervisor publishes the 76': async (load, w, t) => {
@@ -281,12 +288,14 @@ const ADOPT = 'a dispatch key adopts only a ticket placed as asked: another plac
 const WITHDRAWN = 'a placed ticket nobody claims in time is withdrawn and refused 76: the committed withdrawal never runs it locally, though this machine is free';
 
 const SHADOW = 'a host alias that is itself a runner is refused before any adoption';
-const FRESH = 'a placed --id is accepted only when this machine holds no record of it: any artifact, a ledger entry left alone included, makes it 64';
 const PROBE = 'an alias probe that cannot reach the queue is 75 and submits nothing; against a queue too old for it the supervisor publishes the 76';
 const INFRA = 'a snapshot that cannot be uploaded before anything is sent is an infra failure, exit 75, and queues nothing';
 const OLDKEYED = 'a keyed placed run against a queue below migration 013 is refused 76 by a published supervisor refusal, not by an unrecorded early exit';
+const NOID = 'placement constraints cannot be combined with --id, in either order, before any network call or file write; a dispatch key is still allowed';
+const BUDGET = 'an alias probe that stalls is held to the --timeout budget, the key lookup after it gets only what is left, and a probe that answers 42883 adopts nothing';
 const CANARIES = [
-  [FRESH, ...run('(hasLocalRecord(root, ticketId) || !claimSubmissionId(root, ticketId))', '(false)')],
+  [NOID, ...run('if (ticketId !== undefined && (capabilityClass !== undefined', 'if (false && (capabilityClass !== undefined')],
+  [BUDGET, ...run('adoptionBlocked = shadowed !== null;', 'adoptionBlocked = false;')],
   [PROBE, ...run("if (shadowed?.route === 'legacy') {", 'if (false) {')],
   [SHADOW, ...run('if (placement !== null && placement.aliasesApplied.length > 0) {', 'if (false) {')],
   [INFRA, ...supervisor('    if (isConstrained(enriched.placementRequest)) return refusePullOnly(`${reason}; nothing was enqueued, retry`, { exitCode: PLACEMENT_UNREACHABLE_EXIT });', '')],

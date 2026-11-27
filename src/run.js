@@ -16,7 +16,7 @@ import { writePending } from './pending.js';
 import { DISPATCH_KEY_HELD_ELSEWHERE_EXIT, dispatchKeyPullRefusal, heldTicketLine, isDispatchKey, liveHolder } from './dispatch-key.js';
 import { aliasShadow, lookupTicketByKey } from './ticket-by-key.js';
 import { PLACEMENT_MISMATCH_SQLSTATE, PLACEMENT_REFUSED_EXIT, PLACEMENT_UNREACHABLE_EXIT, PLACEMENT_USAGE_EXIT, PlacementUsageError, adoptsPlacement, canonicalPlacement, placementKeyOfView, placementPullRefusal, placementRefusal } from './placement.js';
-import { claimSubmissionId, hasLocalRecord } from './placement-record.js';
+import { timeoutBudget } from './run-budget.js';
 import { QUEUE_CONNECT_TIMEOUT_MS, QUEUE_QUERY_TIMEOUT_MS } from './queue-client.js';
 import { peekLedger } from './pull-ledger.js';
 import { enqueueAckFile } from './pull-enqueue.js';
@@ -48,9 +48,6 @@ export function parseDuration(spec) {
   return n * mult;
 }
 
-/** The alias probe's queue limits, held under what is left of a caller's `--timeout`. */
-const probeOptions = (timeoutMs) => (timeoutMs === undefined ? undefined : { attempts: 1, connectTimeoutMs: Math.max(LOOKUP_MIN_TIMEOUT_MS, Math.min(2_000, timeoutMs)), queryTimeoutMs: Math.max(LOOKUP_MIN_TIMEOUT_MS, Math.min(3_000, timeoutMs)) });
-
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -59,7 +56,6 @@ function sleep(ms) {
 const heldLocally = (root, id) => readAttempt(root, id) !== null || fs.existsSync(path.join(paths(root).results, `${id}.json`)) || peekLedger(root, id) !== null;
 
 // a zero or tiny --timeout never reaches pg as a zero (no deadline) or a few milliseconds
-const LOOKUP_MIN_TIMEOUT_MS = 1000;
 const KEYED_ENQUEUE_POLL_MS = 100;
 const KEYED_ENQUEUE_CAP_MS = 60_000;
 
@@ -409,6 +405,10 @@ export async function runCommand({
     process.stderr.write('lane run: no command given (pass it after --)\n');
     return { exitCode: 2 };
   }
+  if (ticketId !== undefined && (capabilityClass !== undefined || avoidHosts.length > 0 || targetHost !== undefined)) {
+    process.stderr.write('lane run: placement constraints cannot be combined with --id; use --dispatch-key for idempotent resubmission\n');
+    return { exitCode: PLACEMENT_USAGE_EXIT };
+  }
 
   let resolved;
   try {
@@ -732,9 +732,17 @@ export async function runCommand({
 
   // one clock for `--timeout` over the alias probe, the lookup, the ack wait and the foreground wait, so no later wait gets a fresh full timeout
   const runStartedAt = Date.now();
+  const budget = timeoutBudget(timeoutMs, runStartedAt);
+  const timedOut = (what) => {
+    process.stderr.write(`lane run: waited ${timeoutMs}ms, not failed: ${what}\n`);
+    return { exitCode: 75 };
+  };
+  const waitWithinBudget = (waitId) => (budget.expired() ? timedOut(`the budget ran out before ${waitId} could be followed; next: lane wait ${waitId}`) : waitCommand(waitId, { timeoutMs: budget.bounded ? Math.ceil(budget.left()) : undefined }));
+  let adoptionBlocked = false;
   // a host alias that is itself a known runner is refused before anything can be adopted; a probe that could not reach the queue is not a clean check
   if (placement !== null && placement.aliasesApplied.length > 0) {
-    const shadowed = await shadowCheck(globalCfg, placement.aliasesApplied, { options: probeOptions(timeoutMs) });
+    const shadowed = await shadowCheck(globalCfg, placement.aliasesApplied, { options: budget.limits(2_000, 3_000) });
+    if (budget.expired()) return timedOut('nothing was submitted');
     if (shadowed?.route === 'legacy') {
       process.stderr.write(`lane run: ${shadowed.reason}; nothing was submitted, retry\n`);
       return { exitCode: PLACEMENT_UNREACHABLE_EXIT };
@@ -743,6 +751,8 @@ export async function runCommand({
       process.stderr.write(`lane run: ${shadowed.reason}\n`);
       return { exitCode: shadowed.exitCode };
     }
+    // a queue that cannot answer the alias check (42883) adopts nothing: the supervisor publishes the refusal
+    adoptionBlocked = shadowed !== null;
   }
   // PKG-438: a ticket the queue already holds under this key is this submission, so nothing is submitted again. A ticket this machine has a record of
   // is answered from that record (`lane wait` semantics); one it never submitted is reported (id, state, host) and ended with a distinct exit, and
@@ -750,11 +760,12 @@ export async function runCommand({
   // is stamped, and reads only: a hit writes nothing here. The one write before it is the config reload's `classes-configured` marker (config.js
   // `setClassesFence`), made only when a `classes` block comes into or goes out of force, which happens before any run can be told apart. A lookup that fails is not fatal: the enqueue is keyed too, and the queue refuses a second
   // ticket under the key. A withdrawn view holds nothing, so it counts as no holder and the enqueue decides.
-  if (dispatchKey !== undefined && !idOverride) {
+  if (dispatchKey !== undefined && !idOverride && !adoptionBlocked) {
+    if (budget.expired()) return timedOut('nothing was submitted');
     const probeRoot = stateHome();
     let held = null;
     try {
-      held = await lookupKey(globalCfg, undefined, dispatchKey, { options: timeoutMs === undefined ? undefined : { attempts: 1, connectTimeoutMs: Math.max(LOOKUP_MIN_TIMEOUT_MS, Math.min(QUEUE_CONNECT_TIMEOUT_MS, timeoutMs)), queryTimeoutMs: Math.max(LOOKUP_MIN_TIMEOUT_MS, Math.min(QUEUE_QUERY_TIMEOUT_MS, timeoutMs)) }, ...(placement === null ? {} : { placement }) });
+      held = await lookupKey(globalCfg, undefined, dispatchKey, { options: budget.limits(QUEUE_CONNECT_TIMEOUT_MS, QUEUE_QUERY_TIMEOUT_MS), ...(placement === null ? {} : { placement }) });
     } catch (err) {
       // a queue that answers the lookup with a placement refusal (a holder placed otherwise, or no placement support at all) has decided: nothing is adopted and nothing is submitted
       // a holder placed otherwise (LK423) is final; a queue without the placement lookup (42883) is left to the supervisor, whose refusal is published and durable
@@ -781,7 +792,7 @@ export async function runCommand({
         process.stdout.write(`${held.id}\n`);
         return { exitCode: 0 };
       }
-      return waitCommand(held.id, { timeoutMs: timeoutMs === undefined ? undefined : Math.max(0, timeoutMs - (Date.now() - runStartedAt)) });
+      return waitWithinBudget(held.id);
     }
   }
 
@@ -884,11 +895,6 @@ export async function runCommand({
   if (ticketId && remoteEligible && !isUuid(ticketId)) {
     process.stderr.write(`lane run: --id "${ticketId}" must be a UUID for a remote-eligible lane\n`);
     return { exitCode: 64 };
-  }
-  // a placed submission takes its id once: any record of the id here, or another caller holding the claim, is a refusal (an id is not an idempotency key for a placement)
-  if (placement !== null && ticketId !== undefined && (hasLocalRecord(root, ticketId) || !claimSubmissionId(root, ticketId))) {
-    process.stderr.write('lane run: a placed submission needs a fresh --id; use --dispatch-key for idempotent resubmission\n');
-    return { exitCode: PLACEMENT_USAGE_EXIT };
   }
   const id = ticketId || idOverride || crypto.randomUUID();
   if (onTicketCreated) {
@@ -1105,7 +1111,7 @@ export async function runCommand({
     // PKG-439: so is a placed one, whose refusal (an unknown host, a queue too old) must reach the caller as an exit, not as an id
     let printedId = id;
     if (dispatchKey !== undefined || placement !== null) {
-      const answer = await awaitKeyedEnqueue({ root, id, resultPath, supervisorEnded, keyed: dispatchKey !== undefined, timeoutMs: timeoutMs === undefined ? undefined : Math.max(0, timeoutMs - (Date.now() - runStartedAt)) });
+      const answer = await awaitKeyedEnqueue({ root, id, resultPath, supervisorEnded, keyed: dispatchKey !== undefined, timeoutMs: budget.bounded ? Math.max(0, budget.left()) : undefined });
       if (answer.exitCode !== undefined) {
         if (answer.held) process.stdout.write(heldTicketLine(dispatchKey, answer.held, json));
         // an unkeyed submission that the queue had not answered yet still exists: its id is the only handle on it
@@ -1198,7 +1204,7 @@ export async function runCommand({
           process.stderr.off('error', onStderrError);
           supervisor.stdout.destroy();
           supervisor.stderr.destroy();
-          return await waitCommand(collided.ticketId, { timeoutMs: timeoutMs ? Math.max(0, timeoutMs - (Date.now() - runStartedAt)) : timeoutMs });
+          return await waitWithinBudget(collided.ticketId);
         }
         process.stdout.write(heldTicketLine(dispatchKey, { id: collided.ticketId, state: collided.state, host: collided.host }, json));
         process.stderr.write(`lane run: dispatch key ${dispatchKey} is held by ticket ${collided.ticketId}, which this machine did not submit\n`);

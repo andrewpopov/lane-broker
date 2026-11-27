@@ -1396,11 +1396,12 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
 
   async function prepareFailed(ctx, err) {
     const reason = `pull snapshot could not be prepared: ${err.message}`;
-    if (!(await proveNeverEnqueued(ctx)).proof) {
+    const cancelled = err instanceof PrepareAbandoned && err.reason === 'cancelled';
+    if (!(await proveNeverEnqueued({ ...ctx, ...(cancelled ? { neverEnqueuedCause: 'cancelled' } : {}) })).proof) {
       await updateAttempt(root, enriched.id, gen, { unresolved: reason });
       return exitUnresolved(reason);
     }
-    if (err instanceof PrepareAbandoned && err.reason === 'cancelled') {
+    if (cancelled) {
       await publishAndExit(gen, () => remoteCancelledResult(enriched.id, attemptStartedAt));
       return { fallback: false };
     }
