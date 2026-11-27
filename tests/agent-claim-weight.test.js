@@ -96,7 +96,7 @@ const liveScenario = async (load) => {
   fs.writeFileSync(path.join(root, 'tickets', 'RUNNING-4', 'remote-id'), 'lane-4\n');
   const records = [record('FETCHING', 2), record('STARTING', 1), record('SPAWNING', 3), record('RUNNING', 4), record('SETTLING', 9), record('OUTBOX', 5), record('DONE', 6), { execId: 'x', subphase: 'FETCHING', claim: { header: {} } }];
   assert.deepEqual(liveExecutions(records, root), [
-    { weight: 2, laneId: null }, { weight: 1, laneId: null }, { weight: 3, laneId: null }, { weight: 4, laneId: 'lane-4' }, { weight: 0, laneId: null },
+    { weight: 2, memoryBytes: 0, laneId: null }, { weight: 1, memoryBytes: 0, laneId: null }, { weight: 3, memoryBytes: 0, laneId: null }, { weight: 4, memoryBytes: 0, laneId: 'lane-4' }, { weight: 0, memoryBytes: 0, laneId: null },
   ], 'RUNNING counts, with the lane id from remote-id; settling and later subphases do not');
 };
 
@@ -177,7 +177,7 @@ async function claimedWith(load, { figures, table = [], registered = WEIGHTING, 
 async function planScenario(load) {
   const seen = [];
   const { calls } = await claimedWith(load, { figures: (ask) => { seen.push({ executions: ask?.executions?.() }); return OFFER; }, table: [record('FETCHING', 2), record('RUNNING', 4), record('DONE', 6)] });
-  assert.deepEqual(seen, [{ executions: [{ weight: 2, laneId: null }, { weight: 4, laneId: null }] }], 'the figures are asked with the live executions');
+  assert.deepEqual(seen, [{ executions: [{ weight: 2, memoryBytes: 0, laneId: null }, { weight: 4, memoryBytes: 0, laneId: null }] }], 'the figures are asked with the live executions');
   assert.deepEqual(calls[0][6], { cpu: 8, mem: 1e9, freeWeight: 3, weightLimit: 4 }, 'the offer reaches ld_claim as one capacity');
 }
 

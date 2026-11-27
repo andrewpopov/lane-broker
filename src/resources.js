@@ -423,26 +423,46 @@ export function dispatchOnlyRefusal(lane, { retryable = false, reason, failureKi
   };
 }
 
-export function evaluateMemoryAdmission({ memoryInfo, heldLeases, candidateResources, cfg, now = Date.now() }) {
-  if (!memoryInfo || !Number.isFinite(memoryInfo.availableBytes)) {
-    return { admit: false, reason: 'memory-unavailable', projectedAvailableBytes: null, memoryBudgetBytes: null };
-  }
-  const growthReserve = heldLeases.reduce((sum, lease) => {
+/** The memory the held leases have requested but not yet shown in use: admission holds it back from what the OS reports available. */
+function growthReserveBytes(heldLeases, cfg, now) {
+  return heldLeases.reduce((sum, lease) => {
     const requested = leaseResources(lease, cfg).memoryBytes;
     const fresh = Number.isFinite(lease.observedAt) && now - lease.observedAt <= 30_000;
     const observed = fresh && Number.isFinite(lease.observedMemoryBytes) ? lease.observedMemoryBytes : 0;
     return sum + Math.max(0, requested - observed);
   }, 0);
-  const projectedAvailableBytes = memoryInfo.availableBytes - growthReserve - candidateResources.memoryBytes;
-  const reserveBytes = Number.isFinite(cfg.memoryReserveBytes) ? cfg.memoryReserveBytes : 0;
-  const memoryBudgetBytes = Number.isFinite(memoryInfo.totalBytes)
-    ? Math.max(0, memoryInfo.totalBytes - reserveBytes)
-    : Infinity;
-  const reservedBytes = heldLeases.reduce((sum, lease) => sum + leaseResources(lease, cfg).memoryBytes, 0);
-  if (reservedBytes + candidateResources.memoryBytes > memoryBudgetBytes) {
+}
+
+const reserveBytesOf = (cfg) => (Number.isFinite(cfg.memoryReserveBytes) ? cfg.memoryReserveBytes : 0);
+
+const memoryBudgetBytesOf = (memoryInfo, cfg) => (Number.isFinite(memoryInfo.totalBytes)
+  ? Math.max(0, memoryInfo.totalBytes - reserveBytesOf(cfg))
+  : Infinity);
+
+const reservedBytesOf = (heldLeases, cfg) => heldLeases.reduce((sum, lease) => sum + leaseResources(lease, cfg).memoryBytes, 0);
+
+/**
+ * The largest candidate memory `evaluateMemoryAdmission` would admit now (admit exactly when candidate <= this), floored at 0; null when the
+ * host's available memory is unknown. A runner claiming from a queue offers this, so the claim and its own admission cannot disagree.
+ */
+export function admissibleMemoryBytes({ memoryInfo, heldLeases, cfg, now = Date.now() }) {
+  if (!memoryInfo || !Number.isFinite(memoryInfo.availableBytes)) return null;
+  const byHeadroom = memoryInfo.availableBytes - growthReserveBytes(heldLeases, cfg, now) - reserveBytesOf(cfg);
+  const byReservations = memoryBudgetBytesOf(memoryInfo, cfg) - reservedBytesOf(heldLeases, cfg);
+  return Math.max(0, Math.min(byHeadroom, byReservations));
+}
+
+export function evaluateMemoryAdmission({ memoryInfo, heldLeases, candidateResources, cfg, now = Date.now() }) {
+  const admissible = admissibleMemoryBytes({ memoryInfo, heldLeases, cfg, now });
+  if (admissible === null) {
+    return { admit: false, reason: 'memory-unavailable', projectedAvailableBytes: null, memoryBudgetBytes: null };
+  }
+  const projectedAvailableBytes = memoryInfo.availableBytes - growthReserveBytes(heldLeases, cfg, now) - candidateResources.memoryBytes;
+  const memoryBudgetBytes = memoryBudgetBytesOf(memoryInfo, cfg);
+  if (reservedBytesOf(heldLeases, cfg) + candidateResources.memoryBytes > memoryBudgetBytes) {
     return { admit: false, reason: 'memory-reservations', projectedAvailableBytes, memoryBudgetBytes };
   }
-  if (projectedAvailableBytes < reserveBytes) {
+  if (projectedAvailableBytes < reserveBytesOf(cfg)) {
     return { admit: false, reason: 'memory-headroom', projectedAvailableBytes, memoryBudgetBytes };
   }
   return { admit: true, reason: 'ok', projectedAvailableBytes, memoryBudgetBytes };
