@@ -79,7 +79,7 @@ test('bosun absent: standalone figures from the config keys, source=standalone, 
   assert.match(series(text, 'cpu_ceiling'), /source="standalone"/);
 });
 
-test('a grant that expires without a renewal falls back to the standalone budget, and a new grant takes over again', async (t) => {
+test('a grant that expires without a renewal falls back to the standalone budget once it expires', async (t) => {
   const { shadow, clock, fake, logs } = await harness(t);
   await waitFor(() => shadow.shadow().source === 'bosun');
   await fake.close();
@@ -113,7 +113,7 @@ test('the usage heartbeat declares what the live lanes hold and their roots, at 
   assert.equal(puts.length, 2);
 });
 
-test('a heartbeat declares at most MAX_USAGE_ROOTS roots, which bosun accepts, and says once that the rest were left out', async (t) => {
+test('a heartbeat declares at most MAX_USAGE_ROOTS roots and says once that the rest were left out', async (t) => {
   const lanes = Array.from({ length: MAX_USAGE_ROOTS + 1 }, (_, i) => record(`run${i}`, { pid: 100 + i, pidStart: `Mon Nov 24 10:00:${i} 2026` }));
   const { shadow, clock, logs, puts } = await harness(t, { records: () => lanes });
   await shadow.heartbeat();

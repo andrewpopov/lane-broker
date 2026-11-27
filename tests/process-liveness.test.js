@@ -63,9 +63,9 @@ test('a zombie is not alive on Linux (kill(0) succeeds on one)', { skip: process
   assert.equal(isPidAlive(parent.pid), true);
 });
 
-test('a stuck ps is killed at the timeout and reads as indeterminate, so a liveness check fails closed instead of hanging', { timeout: 10_000 }, (t) => {
+test('a stuck ps that ignores SIGTERM is killed at the timeout and reads as indeterminate, so a liveness check fails closed instead of hanging', { timeout: 10_000 }, (t) => {
   const bin = makeTmpDir('lane-ps-stuck-', t);
-  fs.writeFileSync(path.join(bin, 'ps'), '#!/bin/sh\nexec sleep 30\n', { mode: 0o755 });
+  fs.writeFileSync(path.join(bin, 'ps'), "#!/bin/sh\ntrap '' TERM\ni=0\nwhile [ $i -lt 20 ]; do sleep 1; i=$((i+1)); done\n", { mode: 0o755 });
   const saved = process.env.PATH;
   process.env.PATH = `${bin}${path.delimiter}${saved}`;
   try {

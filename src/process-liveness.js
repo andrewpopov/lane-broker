@@ -36,11 +36,12 @@ export function isPidAlive(pid) {
  */
 export function processStartTime(pid, { timeoutMs = PS_TIMEOUT_MS } = {}) {
   try {
-    // A stuck ps is killed at the timeout and reads as indeterminate, so it never holds the event loop.
+    // A stuck ps is SIGKILLed at the timeout (it may ignore SIGTERM) and reads as indeterminate, so it never holds the event loop.
     const out = execFileSync('ps', ['-o', 'lstart=', '-p', String(pid)], {
       encoding: 'utf8',
       env: { ...process.env, LC_ALL: 'C', LC_TIME: 'C' },
       timeout: timeoutMs,
+      killSignal: 'SIGKILL',
     }).trim();
     return out || null;
   } catch (err) {
