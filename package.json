@@ -43,7 +43,7 @@
     "hooks": "git config core.hooksPath .githooks"
   },
   "dependencies": {
-    "@andrewpopov/bosun": "1.12.2",
+    "@andrewpopov/bosun": "1.13.0",
     "pg": "^8.23.1",
     "pg-connection-string": "^2.14.1"
   },

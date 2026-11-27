@@ -36,7 +36,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
   let budget;
   const claimFiguresOf = figures ?? (async (pending) => {
     const cfg = readBrokerConfig();
-    return capByGrant(await claimFigures({ cfg, ...pending }), budget.enforced(cfg));
+    return capByGrant(await claimFigures({ cfg, ...pending }), budget.enforced(cfg), core.table.all());
   });
   const isDrainingNow = draining ?? (() => isDraining(config.stateDir));
   const waker = new Waker();
