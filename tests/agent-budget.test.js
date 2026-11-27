@@ -3,12 +3,13 @@ import { join } from 'node:path';
 import test from 'node:test';
 import { MAX_USAGE_ROOTS, requestSocket } from '@andrewpopov/bosun/module';
 import { createFakeBudget } from '@andrewpopov/bosun/testing/budget';
-import { openBudgetShadow, rootsReader, standaloneBudget, USAGE_HEARTBEAT_MS } from '../src/agent/budget.js';
+import { capByGrant, openBudgetShadow, rootsReader, standaloneBudget, USAGE_HEARTBEAT_MS } from '../src/agent/budget.js';
 import { claimFigures } from '../src/agent/claims.js';
 import { renderAgentMetrics } from '../src/agent/metrics.js';
 import { DEFAULT_GLOBAL_CONFIG } from '../src/config.js';
 import { waitFor } from './helpers.js';
 import { makeTmpDir } from './helpers/tmp.js';
+import { assertCanaryFails, realSrc } from './helpers/mutant-module.js';
 
 const GIB = 1024 ** 3;
 const HOST = { cpuCores: 8, memoryBytes: 16 * GIB };
@@ -146,4 +147,32 @@ test('a root declares the identity bosun reads for the pid, once per lane, and s
   assert.deepEqual(roots(lanes).roots, [{ pid: 41, start: 'linux:boot-1:410' }]);
   roots(lanes);
   assert.deepEqual(reads, [41, 99, 99]);
+});
+
+const ENFORCE = { ...CFG, lanePull: { ...CFG.lanePull, budgetEnforce: true } };
+const OFFERED = { freeCpu: 5, freeMem: 10 * GIB, budgetCpu: 7, freeWeight: 4, weightLimit: 4 };
+
+async function enforcementScenario(load) {
+  const { capByGrant: cap } = await load('agent/budget.js');
+  assert.deepEqual(cap(OFFERED, { source: 'bosun', ...GRANT }), { ...OFFERED, freeCpu: 3.5, freeMem: 8 * GIB, budgetCpu: 6.5 }, 'a grant below admission caps every figure');
+  const roomy = { source: 'bosun', cpu: { free: 9, ceiling: 9 }, mem: { free: 20 * GIB, ceiling: 20 * GIB } };
+  assert.deepEqual(cap(OFFERED, roomy), OFFERED, 'a grant above admission changes nothing');
+  assert.deepEqual(cap(OFFERED, { source: 'bosun', cpu: { free: -1, ceiling: 2 }, mem: { free: -GIB, ceiling: GIB } }), { ...OFFERED, freeCpu: 0, freeMem: 0, budgetCpu: 2 }, 'an overdrawn grant offers nothing, never a negative');
+  assert.deepEqual(cap(OFFERED, { source: 'standalone', ...GRANT }), OFFERED, 'a standalone budget never caps');
+  assert.equal(cap(null, { source: 'bosun', ...GRANT }), null, 'an unmeasurable claim stays unmeasurable');
+}
+
+test('an enforced bosun grant caps what a claim offers, and a standalone budget leaves it alone', () => enforcementScenario(realSrc));
+
+test('canary: a claim the grant does not cap fails the enforcement test', () => assertCanaryFails('agent/budget.js',
+  ["if (!offered || budget?.source !== 'bosun') return offered;", 'return offered;'], enforcementScenario));
+
+test('the grant is enforced only while lanePull.budgetEnforce is set, and each switch is logged once', async (t) => {
+  const { shadow, logs } = await harness(t);
+  await waitFor(() => shadow.shadow().source === 'bosun');
+  assert.equal(shadow.enforced(CFG), null, 'off by default');
+  assert.deepEqual(shadow.enforced(ENFORCE), { source: 'bosun', ...GRANT, gates: [] });
+  shadow.enforced(ENFORCE);
+  assert.equal(shadow.enforced(CFG), null);
+  assert.deepEqual(logs.filter((line) => line.startsWith('budget: claims')), ['budget: claims capped by the bosun grant', 'budget: claims no longer capped by bosun']);
 });

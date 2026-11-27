@@ -5,7 +5,7 @@ import { ExecutionDriver } from './execution.js';
 import { createS3Client } from '../s3-client.js';
 import { Waker } from './waker.js';
 import { writeAgentMetrics } from './metrics.js';
-import { openBudgetShadow } from './budget.js';
+import { capByGrant, openBudgetShadow } from './budget.js';
 import { userManagerEnv } from '../cpu-limit.js';
 import { loadApproaching, sampleDevice, updateDeviceGates } from '../device-gates.js';
 
@@ -32,7 +32,11 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
   const brokerEnv = { LANE_BROKER_HOME: config.brokerHome, LANE_BROKER_STATE: config.stateDir, ...userManagerEnv({ ...process.env, ...spawnEnv }, { platform }) };
   Object.assign(process.env, brokerEnv);
   const readBrokerConfig = brokerConfigReader({ log });
-  const claimFiguresOf = figures ?? ((pending) => claimFigures({ cfg: readBrokerConfig(), ...pending }));
+  let budget;
+  const claimFiguresOf = figures ?? (async (pending) => {
+    const cfg = readBrokerConfig();
+    return capByGrant(await claimFigures({ cfg, ...pending }), budget.enforced(cfg));
+  });
   const isDrainingNow = draining ?? (() => isDraining(config.stateDir));
   const waker = new Waker();
   let driver;
@@ -47,7 +51,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
     await core.close();
     throw new AgentConfigError(`"runnerName" is ${config.runnerName} but the queue registers this login as ${core.ld.registered.host}`);
   }
-  const budget = openBudgetShadow({ readConfig: readBrokerConfig, records: () => core.table.all(), log, now, ...budgetOptions });
+  budget = openBudgetShadow({ readConfig: readBrokerConfig, records: () => core.table.all(), log, now, ...budgetOptions });
   const laneEnv = { ...spawnEnv, ...brokerEnv };
   const claimTools = tools ?? (() => presentTools({ ld: core.ld, envPath: laneEnv.PATH }));
   driver = new Driver({ core, remoteRoot, config, s3, timing, waker, log, spawnEnv: laneEnv, laneBin, draining: isDrainingNow, now, onScopeChange: () => { poked = true; waker.poke(); }, ...driverOptions });
