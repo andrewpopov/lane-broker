@@ -66,7 +66,7 @@ const PLACEMENT = {
     }
   },
 
-  'PKG-468: a ticket pinned to host:<name> is enqueued even when this machine could run it now, and a pin nobody can claim is refused as pinned, never run here': async (load) => {
+  'PKG-468: a ticket pinned to host:<name> is enqueued even when this machine could run it now, and a pin nobody can claim is refused': async (load) => {
     const { placeForPull } = await load('pull-placement.js');
     const runnableHere = spies();
     runnableHere.input.couldRunLocally = async () => true;
@@ -75,7 +75,6 @@ const PLACEMENT = {
     const nobody = spies({ placeable: 0 });
     const refused = await placeForPull({ ...nobody.input, requiresTags: ['host:evo-x2'], pushChosen: false });
     assert.equal(refused.route, 'refuse');
-    assert.equal(refused.pinned, true);
   },
 
   'an unready or unreachable pull side is today\'s flow with the reason, never an enqueue': async (load) => {

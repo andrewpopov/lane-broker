@@ -73,7 +73,7 @@ export async function placeForPull({
   } catch (err) {
     return { route: 'legacy', reason: `pull dispatch unavailable: ld_placeable failed: ${err.message}` };
   }
-  if (placeable === 0) return { route: 'refuse', reason: 'no queue principal is eligible for this ticket', ...(isPinnedToHost(requiresTags) ? { pinned: true } : {}) };
+  if (placeable === 0) return { route: 'refuse', reason: 'no queue principal is eligible for this ticket' };
   if (isPinnedToHost(requiresTags)) return { route: 'pull', services };
   if (locallyIneligible()) return { route: 'pull', services };
   return (await couldRunLocally()) ? { route: 'local' } : { route: 'pull', services };
