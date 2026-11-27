@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { PgCluster, PG_SKIP_REASON } from './lane-db-harness.js';
+import { PgCluster, pgSkipOption } from './lane-db-harness.js';
 
 /**
  * BRAIN-1373: the Postgres harness must not leak clusters when its test process is killed. SIGTERM stops the cluster
@@ -16,7 +16,7 @@ const CHILD_SOURCE = `
 import { PgCluster } from ${JSON.stringify(harnessUrl)};
 const cluster = PgCluster.start();
 console.log(cluster.dir);
-setInterval(() => {}, 1000);
+process.on('disconnect', () => { cluster.stop(); process.exit(0); });
 `;
 
 const alive = (pid) => {
@@ -24,9 +24,14 @@ const alive = (pid) => {
 };
 const postmasterPid = (dir) => Number(fs.readFileSync(path.join(dir, 'data', 'postmaster.pid'), 'utf8').split('\n')[0]);
 
-async function startChild() {
-  const child = spawn(process.execPath, ['--input-type=module', '-e', CHILD_SOURCE], { stdio: ['ignore', 'pipe', 'inherit'] });
+/** The helper stops its cluster and exits when the parent disconnects, so t.after reaps it even when an assertion failed. */
+async function startChild(t) {
+  const child = spawn(process.execPath, ['--input-type=module', '-e', CHILD_SOURCE], { stdio: ['ignore', 'pipe', 'inherit', 'ipc'] });
   const exited = new Promise((resolve) => child.once('exit', (code, signal) => resolve({ code, signal })));
+  t.after(async () => {
+    if (child.connected) child.disconnect();
+    await exited;
+  });
   const dir = await new Promise((resolve, reject) => {
     let out = '';
     child.stdout.on('data', (d) => { out += d; if (out.includes('\n')) resolve(out.trim()); });
@@ -39,9 +44,9 @@ const waitGone = async (pid) => {
   for (let i = 0; i < 100 && alive(pid); i++) await new Promise((r) => setTimeout(r, 100));
 };
 
-describe('PgCluster leak protection', { skip: PG_SKIP_REASON ?? false, timeout: 120000 }, () => {
-  test('SIGTERM to the owning process stops the postmaster and removes the dir', async () => {
-    const { child, dir, exited, postmaster } = await startChild();
+describe('PgCluster leak protection', { skip: pgSkipOption, timeout: 120000 }, () => {
+  test('SIGTERM to the owning process stops the postmaster and removes the dir', async (t) => {
+    const { child, dir, exited, postmaster } = await startChild(t);
     assert.ok(alive(postmaster), 'postmaster should be running before the signal');
     child.kill('SIGTERM');
     const { signal } = await exited;
@@ -51,8 +56,8 @@ describe('PgCluster leak protection', { skip: PG_SKIP_REASON ?? false, timeout: 
     assert.equal(fs.existsSync(dir), false, 'cluster dir survived SIGTERM of its owner');
   });
 
-  test('a cluster whose owner was SIGKILLed is reaped by the next start()', async () => {
-    const { child, dir, exited, postmaster } = await startChild();
+  test('a cluster whose owner was SIGKILLed is reaped by the next start()', async (t) => {
+    const { child, dir, exited, postmaster } = await startChild(t);
     child.kill('SIGKILL');
     await exited;
     assert.ok(alive(postmaster), 'SIGKILL should have orphaned the postmaster');
@@ -72,6 +77,19 @@ describe('PgCluster leak protection', { skip: PG_SKIP_REASON ?? false, timeout: 
     const next = PgCluster.start();
     try {
       assert.equal(fs.existsSync(dir), true, 'a live owner cluster was reaped');
+    } finally {
+      next.stop();
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('a cluster dir with no owner file is not reaped, however old', () => {
+    const dir = fs.mkdtempSync('/tmp/lbpg-');
+    const longAgo = new Date(Date.now() - 24 * 3600 * 1000);
+    fs.utimesSync(dir, longAgo, longAgo);
+    const next = PgCluster.start();
+    try {
+      assert.equal(fs.existsSync(dir), true, 'an ownerless cluster dir was reaped without positive evidence');
     } finally {
       next.stop();
       fs.rmSync(dir, { recursive: true, force: true });
