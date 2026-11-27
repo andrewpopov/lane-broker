@@ -53,6 +53,7 @@ import { placeForPull, isPinnedToHost } from './pull-placement.js';
 import { publicationBindings, publicationOf } from './pull-publication.js';
 import { pullContextFor } from './pull-services.js';
 import { withRepoIdentity } from './pull-snapshot.js';
+import { withSubmitterStamp } from './repo-name.js';
 import { assertWithdrawCommitted, PrepareAbandoned, PULL_UNREACHABLE_REASON, preparePullTicketWithRetry, proveNeverEnqueued, pullExitCode, runPullTicket, sleepUnlessAborted, withdrawQueued as withdrawPullQueued } from './pull-ticket.js';
 import { remoteCpuAllocation, selectRunner, dispatchRemote, remoteCancel, buildExecHeader, needsProtocol2, rebalanceBlocked, hasMeasuredHeadroom, estimatedFinish, haveDeadlineFor, DRAIN_MOVE_REASON, SOURCE_LEAVING_REASONS, QUEUED_TOO_LONG_REASON, REFUSED_MOVE_TARGET } from './remote-client.js';
 import { runnerUnavailableReason } from './runner-schedule.js';
@@ -1300,7 +1301,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
     writeBrokerLog(root, line);
     const [pullRunner] = pullRunners(globalCfg);
     const { worktreeRoot } = enriched.remote;
-    const header = withRepoIdentity(buildExecHeader({
+    const header = withRepoIdentity(withSubmitterStamp(buildExecHeader({
       ...enriched.remote,
       runner: pullRunner,
       argv: enriched.cmd,
@@ -1313,7 +1314,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       group: enriched.group,
       ...classTransport(enriched, resolveClasses(globalCfg, root)),
       priorityAccruedMs: waitedMs(enriched, effectiveNow(root)),
-    }), worktreeRoot);
+    }), enriched.remote.repoName), worktreeRoot);
     const publication = publicationOf(enriched, { placement, attemptStartedAt, refusalExit: isDispatchOnly(globalCfg) ? NO_RUNNER_EXIT_CODE : undefined });
     const ctx = {
       ...pullContextFor(root, globalCfg, services, { id: enriched.id, generation: gen }),
@@ -1394,6 +1395,7 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
       pushChosen: Boolean(runner),
       cfg: globalCfg,
       repoKey: enriched.remote.repoKey,
+      repoName: enriched.remote.repoName,
       requiresTags: enriched.remote.requiresTags,
       locallyIneligible: () => localIneligibility() || isDispatchOnly(globalCfg),
       couldRunLocally: async () => (await couldAdmitNow(root, globalCfg, enriched)).admit || (await couldBypassNow(root, globalCfg, enriched)).admit,

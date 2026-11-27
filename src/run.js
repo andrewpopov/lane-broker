@@ -22,6 +22,7 @@ import { argvFingerprint } from './cpu-estimates.js';
 import { readHistoryRows } from './suggest.js';
 import { rightSizedCpuCores } from './right-size.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
+import { repoName, originUrlOf } from './repo-name.js';
 import { isExclusive, oversizedWeight, oversizedWeightMessage, EXCLUSIVE_PURPOSES, exclusiveDeadlineProblem } from './exclusive.js';
 import { parseScrubCommandEnv, scrubCommandEnv, SCRUB_COMMAND_ENV_VAR } from './scrub-command-env.js';
 import { checkRunnable, effectiveRequiresTags } from './run-tags.js';
@@ -907,6 +908,7 @@ export async function runCommand({
       worktreeRoot: remoteWorktreeRoot,
       relCwd,
       repoKey: resolved.repoId,
+      repoName: repoName(originUrlOf(remoteWorktreeRoot), { baseDir: remoteWorktreeRoot }),
       weight,
       cpuCores: resources.cpuCores,
       ...(maxExecutionCpuCores !== undefined ? { maxExecutionCpuCores } : {}),

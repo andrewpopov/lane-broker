@@ -267,6 +267,29 @@ describe('enqueue intent without a database', () => {
   });
 });
 
+const STAMPED_HEADER = { protocol: 1, ticketId: ID, argv: ['true'], repoName: 'popovlabs/towerpower', brokerVersion: '0.200.0' };
+const OLD_HEADER = { protocol: 1, ticketId: ID, argv: ['true'] };
+
+const replayedHeader = async (load, header) => {
+  const { state } = freshEnv();
+  ensureStateDirs(state);
+  await createEnvelope(state, {
+    logicalId: ID, binding: { protocol: 1, ticketId: ID, generation: 0, manifestHash: 'mh' }, header, repoKey: 'repoA', lane: 'test', laneKey: 'repoA:test',
+    cpuCores: 1, memoryBytes: 1000, requiresTags: [], priority: 0,
+  });
+  await recordSnapshot(state, ID, SNAPSHOT);
+  return (await load('pull-enqueue.js')).enqueueArgs(readEnvelope(state, ID)).header;
+};
+const REPLAY_SCENARIO = async (load) => {
+  assert.deepEqual(await replayedHeader(load, STAMPED_HEADER), STAMPED_HEADER, 'a replay sends the name and version the submit stamped');
+  assert.deepEqual(await replayedHeader(load, OLD_HEADER), OLD_HEADER, 'an envelope written before the stamp replays unchanged, with no name added');
+};
+
+test('a replayed enqueue sends the header as persisted: the stamped name and version are kept, and an old envelope gains none', async () => {
+  await REPLAY_SCENARIO((file) => import(`../src/${file}`));
+  await assertCanaryFails('pull-enqueue.js', ['    header: envelope.header,\n', "    header: { ...envelope.header, repoName: 'recomputed/at-replay' },\n"], REPLAY_SCENARIO);
+});
+
 describe('enqueue intent locking without a database', () => {
   test('enqueueOnce takes the per-ticket lock: a held lock makes it time out before any read or send', async () => {
     const { state, generation } = await preparedTicket();
