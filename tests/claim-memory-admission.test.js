@@ -7,6 +7,7 @@ import { loadGlobalConfig } from '../src/config.js';
 import { writeLease, LEASE_STATE } from '../src/lease.js';
 import { bootId } from '../src/state.js';
 import { evaluateMemoryAdmission } from '../src/resources.js';
+import { enqueue } from '../src/scheduler.js';
 
 const CLAIMS = 'agent/claims.js';
 const GIB = 2 ** 30;
@@ -19,7 +20,7 @@ const lease = (id, { requested, observed, observedAgeMs = 0 }) => ({
   ...(observed === undefined ? {} : { observedMemoryBytes: observed, observedAt: Date.now() - observedAgeMs }),
 });
 
-async function figuresFor(load, { total, available, reserve, leases }, executions = () => []) {
+async function figuresFor(load, { total, available, reserve, leases, queued = [] }, executions = () => []) {
   const { claimFigures } = await load(CLAIMS);
   const { state, home } = freshEnv();
   const saved = [process.env.LANE_BROKER_HOME, process.env.LANE_BROKER_STATE];
@@ -29,6 +30,9 @@ async function figuresFor(load, { total, available, reserve, leases }, execution
     writeGlobalConfig(home, { ...GLOBAL, memoryReserveBytes: reserve });
     const held = leases.map((spec, i) => lease(`held${i}`, spec));
     held.forEach((l) => writeLease(state, l));
+    for (const [id, memoryBytes] of queued) {
+      await enqueue(state, { id, key: `r:${id}`, repoId: id, weight: 1, resources: { cpuCores: 1, memoryBytes }, cwd: process.cwd(), cmd: ['true'], supervisorPid: process.pid, supervisorStart: null, logPath: '/dev/null', resultPath: '/dev/null' });
+    }
     const cfg = loadGlobalConfig({ home });
     const offered = await claimFigures({ cfg, executions, memoryReader: () => ({ totalBytes: total, availableBytes: available, macPressure: null }) });
     assert.notEqual(offered, null, 'headroom could be measured');
@@ -60,7 +64,7 @@ async function growthReserveScenario(load) {
 test('a claim does not offer the memory held leases have requested but not yet used', () => growthReserveScenario(realSrc));
 
 test('canary: offering the OS-available memory less the reserve fails the growth-reserve test', () => assertCanaryFails(CLAIMS,
-  ['clampMem(admissibleMem - pendingMem)', 'clampMem(headroom.memoryBytes)'], growthReserveScenario));
+  ['clampMem(admissibleMem - queuedMem - pendingMem)', 'clampMem(headroom.memoryBytes)'], growthReserveScenario));
 
 const FIXTURES = [
   MAC_GRANDY,
@@ -82,7 +86,7 @@ async function agreementScenario(load) {
 test('what a claim offers is the largest memory the same host admits, over varied leases', () => agreementScenario(realSrc));
 
 test('canary: offering the OS-available memory less the reserve fails the agreement test', () => assertCanaryFails(CLAIMS,
-  ['clampMem(admissibleMem - pendingMem)', 'clampMem(headroom.memoryBytes)'], agreementScenario));
+  ['clampMem(admissibleMem - queuedMem - pendingMem)', 'clampMem(headroom.memoryBytes)'], agreementScenario));
 
 async function pendingScenario(load) {
   const fixture = FIXTURES[1];
@@ -95,4 +99,17 @@ async function pendingScenario(load) {
 test('a claimed execution not yet admitted is charged against the offered memory once', () => pendingScenario(realSrc));
 
 test('canary: not charging unadmitted executions fails the pending-memory test', () => assertCanaryFails(CLAIMS,
-  ['clampMem(admissibleMem - pendingMem)', 'clampMem(admissibleMem)'], pendingScenario));
+  ['clampMem(admissibleMem - queuedMem - pendingMem)', 'clampMem(admissibleMem - queuedMem)'], pendingScenario));
+
+async function queuedScenario(load) {
+  const fixture = FIXTURES[1];
+  const base = (await figuresFor(load, fixture)).freeMem;
+  const executions = () => [{ weight: 1, memoryBytes: 3 * GIB, laneId: 'q1' }];
+  const { freeMem } = await figuresFor(load, { ...fixture, queued: [['q1', 3 * GIB]] }, executions);
+  assert.equal(freeMem, base - 3 * GIB, 'a lane queued locally is charged its memory once, by the queue, not again as a pending execution');
+}
+
+test('a lane waiting in the local queue is charged against the offered memory once', () => queuedScenario(realSrc));
+
+test('canary: not charging locally queued lanes fails the queued-memory test', () => assertCanaryFails(CLAIMS,
+  ['clampMem(admissibleMem - queuedMem - pendingMem)', 'clampMem(admissibleMem - pendingMem)'], queuedScenario));

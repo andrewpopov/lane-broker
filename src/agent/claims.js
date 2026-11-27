@@ -10,7 +10,7 @@ import { listLeases } from '../lease.js';
 import { HELD_STATES, listQueue } from '../scheduler.js';
 import { clampQueuedWeight, queuedWeightLimit } from '../exclusive.js';
 import { readMemoryInfo } from '../cpu.js';
-import { admissibleMemoryBytes, detectResourceCapacity, cpuBudgetCores, effectiveWeightCapacity } from '../resources.js';
+import { admissibleMemoryBytes, detectResourceCapacity, cpuBudgetCores, effectiveWeightCapacity, leaseResources } from '../resources.js';
 import { PROBE_LOCK_WAIT_MS, probeCpuHeadroom, probeHeadroom } from '../remote-runner.js';
 import { clearPendingClaim, newExecutionRecord, readPendingClaim, writePendingClaim } from './store.js';
 import { reportReadiness } from '../runner-readiness.js';
@@ -87,7 +87,7 @@ export function freeWeightOf({ capacity, used, queued, pendingWeights, cfg }) {
  * `remote-probe` does and answers null (skip the tick) when the measurement is missing; shadow mode offers the static budget, which is finite.
  * `executions` is read after the lease and queue snapshots, and `used` comes from that same lease snapshot, so an execution that is enqueued or
  * leased mid-call is charged exactly once. Active free memory is what this host's own admission would accept (`admissibleMemoryBytes`, over
- * the held leases) less the memory of executions not yet admitted, which neither the leases nor the OS's available figure show yet.
+ * the held leases) less the memory of locally queued lanes and of executions not yet queued, which neither the leases nor the OS's available figure show yet.
  */
 export async function claimFigures({ cfg = loadGlobalConfig(), host = detectResourceCapacity(), executions = () => [], memoryReader = readMemoryInfo } = {}) {
   const budgetCpu = cpuBudgetCores(host, cfg);
@@ -108,8 +108,9 @@ export async function claimFigures({ cfg = loadGlobalConfig(), host = detectReso
   const used = heldLeases.reduce((sum, l) => sum + (l.weight || 0), 0);
   const pending = unadmittedExecutions(executions(), known);
   const freeWeight = freeWeightOf({ capacity: status.capacity, used, queued, pendingWeights: pending.map((e) => e.weight), cfg });
+  const queuedMem = queued.filter(Boolean).reduce((sum, t) => sum + leaseResources(t, cfg).memoryBytes, 0);
   const pendingMem = pending.reduce((sum, e) => sum + e.memoryBytes, 0);
-  return { freeCpu: headroom.cpuCores, freeMem: clampMem(admissibleMem - pendingMem), budgetCpu, freeWeight, weightLimit };
+  return { freeCpu: headroom.cpuCores, freeMem: clampMem(admissibleMem - queuedMem - pendingMem), budgetCpu, freeWeight, weightLimit };
 }
 
 /**
