@@ -1528,4 +1528,4 @@ GRANT EXECUTE ON FUNCTION lane_dispatch.ld_set_principal(text, text, text, text[
   lane_dispatch.ld_restore_reset(), lane_dispatch.ld_guard(interval), lane_dispatch.ld_prune_candidates(interval, interval, timestamptz, uuid, int),
   lane_dispatch.ld_prune(uuid[], interval), lane_dispatch.ld_prune_chunks(interval, int), lane_dispatch.ld_blobs_live(jsonb) TO lane_admin;
 -- The audit view calls ticket_repo as lane_reader, and EXECUTE is checked against the caller, not the view owner. The function is pure: it reads only its argument.
-GRANT EXECUTE ON FUNCTION lane_dispatch.ticket_repo(jsonb) TO lane_reader;
+GRANT EXECUTE ON FUNCTION lane_dispatch.ticket_repo(jsonb) TO lane_reader, lane_admin;

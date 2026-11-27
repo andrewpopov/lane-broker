@@ -206,6 +206,7 @@ const GUARDS = {
     await enqueue(await w.as(logins.s1), tid(1));
     const [reader, su] = [await w.as(logins.reader), await w.su()];
     assert.equal((await reader.query('SELECT * FROM lane.pull_repo_audit')).rows.length, 1);
+    assert.equal((await (await w.as(logins.admin)).query('SELECT * FROM lane.pull_repo_audit')).rows.length, 1, 'an admin login reads the view too');
     const { rows: [priv] } = await su.query(
       `SELECT has_table_privilege('lane_admin', 'lane.pull_repo_audit', 'SELECT') AS admin_select,
               has_table_privilege('lane_admin', 'lane.pull_repo_audit', 'INSERT,UPDATE,DELETE,TRUNCATE,REFERENCES,TRIGGER') AS admin_write,
@@ -254,7 +255,8 @@ const CANARIES = [
   [KEEP_MODE, "coalesce(p_repo_mode, v_mode, 'enforce')", "coalesce(p_repo_mode, 'enforce')"],
   [RACE, 'repo_mode = CASE WHEN p_repo_mode IS NULL THEN lane_dispatch.principals.repo_mode ELSE EXCLUDED.repo_mode END', 'repo_mode = EXCLUDED.repo_mode'],
   [AUDIT, '(g.repo = ANY (h.allowed_repos)) IS NOT TRUE', 'NOT (g.repo = ANY (h.allowed_repos))'],
-  [ACCESS, 'GRANT EXECUTE ON FUNCTION lane_dispatch.ticket_repo(jsonb) TO lane_reader;', ''],
+  [ACCESS, 'GRANT EXECUTE ON FUNCTION lane_dispatch.ticket_repo(jsonb) TO lane_reader, lane_admin;', ''],
+  [ACCESS, 'TO lane_reader, lane_admin;', 'TO lane_reader;'],
   [ACCESS, "'pull_runners', 'pull_repo_audit', 'ticket_status_v1'", "'pull_runners', 'ticket_status_v1'"],
 ];
 

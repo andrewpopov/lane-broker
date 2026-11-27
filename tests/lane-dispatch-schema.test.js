@@ -10,7 +10,7 @@ import { startDispatchCluster, World, logins, call, enqueue, claim, tid } from '
 const AGENT_FUNCTIONS = ['ld_register', 'ld_claim', 'ld_needed_tools', 'ld_start', 'ld_heartbeat', 'ld_finish', 'ld_release', 'ld_log'];
 const SUBMIT_FUNCTIONS = ['ld_enqueue', 'ld_get', 'ld_list_mine', 'ld_withdraw', 'ld_cancel', 'ld_attach_urls', 'ld_log_read', 'ld_log_ack', 'ld_queue_ref', 'ld_enqueue_fenced', 'ld_placeable'];
 const ADMIN_FUNCTIONS = ['ld_set_principal', 'ld_set_repo_mode', 'ld_reap', 'ld_restore_reset', 'ld_guard', 'ld_prune_candidates', 'ld_prune', 'ld_prune_chunks', 'ld_blobs_live'];
-const GRANTED = { agent: AGENT_FUNCTIONS, submit: SUBMIT_FUNCTIONS, admin: ADMIN_FUNCTIONS, reader: ['ticket_repo'] };   // the audit view calls ticket_repo as lane_reader; the function reads only its argument
+const GRANTED = { agent: AGENT_FUNCTIONS, submit: SUBMIT_FUNCTIONS, admin: [...ADMIN_FUNCTIONS, 'ticket_repo'], reader: ['ticket_repo'] };   // the audit view's readers call ticket_repo; it reads only its argument
 const CALLERS = { agent: logins.a1, submit: logins.s1, admin: logins.admin, reader: logins.reader, legacy: logins.legacy };
 
 async function functionAclMatrix(w) {
