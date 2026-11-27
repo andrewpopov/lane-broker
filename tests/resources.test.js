@@ -253,7 +253,9 @@ test('the env hook reaches readMemoryInfo, the default memoryReader of tryStart'
   process.env.LANE_BROKER_TEST_HOST_MEMORY = '1000,250';
   try {
     const info = readMemoryInfo(() => '1');
-    assert.deepEqual([info.totalBytes, info.availableBytes, info.source], [1000, 250, 'test-memory']);
+    // A runner inside a CPU-limited cgroup also reports cgroup-cpu/cpuset; only the memory sources are pinned.
+    const memorySources = info.source.split('+').filter((s) => s.includes('memory'));
+    assert.deepEqual([info.totalBytes, info.availableBytes, memorySources], [1000, 250, ['test-memory']]);
   } finally {
     delete process.env.LANE_BROKER_TEST_HOST_MEMORY;
   }
