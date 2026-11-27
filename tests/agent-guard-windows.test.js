@@ -70,15 +70,21 @@ const scenarios = {
       const final = await w.ticket(ticket.id);
       assert.deepEqual([final.result.kind, final.result.exit, final.result.reason, final.result.silenceTimeoutMs, final.result.runLimitMs ?? null], ['completed', 124, 'silence', silenceTimeoutMs, null]);
       // The reported window is the agent's own claim. The observed one: the guard stats the lane's log on every tick, so the first such stat
-      // is where the silent stretch begins and the last tick that saw the log grow is where it restarts; the kill comes on a later tick.
+      // is where the silent stretch begins and a tick that saw the log grow restarts it. The kill must come on the first tick whose silence has
+      // reached the window (one tick of tolerance for Date.now() against the watchdog's monotonic clock); how long the lane then takes to
+      // finish is the scenario's own, generous deadline, not part of this check.
       const ticks = stats.filter((stat) => stat.target.includes(execId) && stat.target.endsWith('log') && stat.at >= killed.runningSince);
       assert.ok(ticks.length > 1, `the guard never stat the lane's log: ${JSON.stringify(stats.map((stat) => stat.target))}`);
+      const tickMs = 100;
       let sinceMs = ticks[0].at;
-      ticks.forEach((tick, i) => { if (i > 0 && tick.size > ticks[i - 1].size) sinceMs = tick.at; });
-      const killTickMs = ticks.filter((tick) => tick.at <= killed.guardKillAt).at(-1).at;
-      const silentMs = killTickMs - sinceMs;
-      assert.ok(silentMs >= silenceTimeoutMs - 50, `killed after ${silentMs} ms of observed silence, before the ${silenceTimeoutMs} ms window`);
-      assert.ok(silentMs <= silenceTimeoutMs + scaledMs(1_000), `killed after ${silentMs} ms of observed silence, long after the ${silenceTimeoutMs} ms window`);
+      const silences = ticks.map((tick, i) => {
+        if (i > 0 && tick.size > ticks[i - 1].size) sinceMs = tick.at;
+        return tick.at - sinceMs;
+      });
+      const killTick = ticks.findLastIndex((tick) => tick.at <= killed.guardKillAt);
+      const firstEligible = silences.findIndex((silent) => silent >= silenceTimeoutMs - tickMs);
+      assert.ok(silences[killTick] >= silenceTimeoutMs - tickMs, `killed after ${silences[killTick]} ms of observed silence, before the ${silenceTimeoutMs} ms window`);
+      assert.ok(firstEligible !== -1 && killTick <= firstEligible + 1, `killed on guard tick ${killTick}, but tick ${firstEligible} had already been silent for ${silences[firstEligible]} ms of the ${silenceTimeoutMs} ms window`);
     } finally {
       fs.statSync = realStatSync;
     }

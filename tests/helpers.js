@@ -133,8 +133,8 @@ export function laneSpawn(args, { env, cwd, bin = BIN } = {}) {
   return spawn(process.execPath, [bin, ...args], { env, cwd: cwd || process.cwd() });
 }
 
-/** The pids a test's broker state names: supervisors (leased or still queued) and the leased commands' process groups. */
-async function brokerProcesses(state) {
+/** The records a test's broker state names: leases (supervisor, and the command's group) and still-queued tickets (supervisor). */
+async function brokerRecords(state) {
   const { paths, readJsonSafe } = await import('../src/state.js');
   const records = (dir) => {
     try {
@@ -144,38 +144,43 @@ async function brokerProcesses(state) {
     }
   };
   const { leases, queue } = paths(state);
-  return {
-    supervisors: [...records(leases), ...records(queue)].map((r) => r.supervisorPid).filter(Number.isInteger),
-    groups: records(leases).map((r) => r.childPgid).filter(Number.isInteger),
-  };
+  return { leases: records(leases), queued: records(queue) };
 }
 
 /**
  * Release a `lane run` held by a release file and wait, bounded, for it and the broker processes `state` names (its detached supervisor,
- * its command's group) to be gone. A deadline escalates to SIGTERM then SIGKILL on all of them; anything still alive after the last deadline throws.
+ * its command's group) to be gone. A deadline escalates to SIGTERM then SIGKILL; anything still alive after the last deadline throws.
+ * Every target is kept with its identity (supervisor start time, lease leader/marker) and re-verified before each signal, so a pid or pgid the OS
+ * reused is neither signalled nor waited for. `known` is `[{ pid, start }]` supervisors the caller already holds (one whose queue record is gone).
  * Resolves `{ code, signal, escalated }` so a success path can assert the exit it released into.
  */
-export async function releaseAndReap(child, releaseFile, { state, graceMs = scaledMs(15_000), killMs = scaledMs(5_000) } = {}) {
+export async function releaseAndReap(child, releaseFile, { state, known = [], graceMs = scaledMs(15_000), killMs = scaledMs(5_000) } = {}) {
   const { isPidAlive, isGroupAlive } = await import('../src/lease.js');
+  const { isVerifiedProcess, isConfirmedGone } = await import('../src/process-liveness.js');
+  const { groupHasLeaseMember } = await import('../src/descendants.js');
   fs.writeFileSync(releaseFile, '');
   const childGone = () => child.exitCode !== null || child.signalCode !== null;
-  // a lease vanishes when its supervisor does, so remember every pid seen: an orphaned command group must still be waited for and killed
-  const known = { supervisors: new Set(), groups: new Set() };
+  // a lease vanishes when its supervisor does, so remember every target seen: an orphaned command group must still be waited for and killed
+  const supervisors = new Map(known.map(({ pid, start }) => [pid, { pid, start }]));
+  const leases = new Map();
   const remember = async () => {
-    const seen = await brokerProcesses(state);
-    seen.supervisors.forEach((pid) => known.supervisors.add(pid));
-    seen.groups.forEach((pgid) => known.groups.add(pgid));
-    return { supervisors: [...known.supervisors], groups: [...known.groups] };
+    const seen = await brokerRecords(state);
+    for (const r of [...seen.leases, ...seen.queued]) {
+      if (Number.isInteger(r.supervisorPid) && !supervisors.get(r.supervisorPid)?.start) supervisors.set(r.supervisorPid, { pid: r.supervisorPid, start: r.supervisorStart ?? null });
+    }
+    for (const lease of seen.leases) if (Number.isInteger(lease.childPgid)) leases.set(lease.id, lease);
   };
+  const aliveSupervisors = () => [...supervisors.values()].filter(({ pid, start }) => !isConfirmedGone(pid, start) && isPidAlive(pid));
+  const aliveGroups = () => [...leases.values()].filter((lease) => isGroupAlive(lease.childPgid) && groupHasLeaseMember(lease));
   const alive = async () => {
-    const { supervisors, groups } = await remember();
-    return [...(childGone() ? [] : [`cli ${child.pid}`]), ...supervisors.filter(isPidAlive).map((pid) => `supervisor ${pid}`), ...groups.filter(isGroupAlive).map((pgid) => `group ${pgid}`)];
+    await remember();
+    return [...(childGone() ? [] : [`cli ${child.pid}`]), ...aliveSupervisors().map(({ pid }) => `supervisor ${pid}`), ...aliveGroups().map((lease) => `group ${lease.childPgid}`)];
   };
   const kill = async (signal) => {
-    const { supervisors, groups } = await remember();
+    await remember();
     if (!childGone()) child.kill(signal);
-    for (const pid of supervisors) try { process.kill(pid, signal); } catch { /* gone */ }
-    for (const pgid of groups) try { process.kill(-pgid, signal); } catch { /* gone */ }
+    for (const { pid, start } of supervisors.values()) if (isVerifiedProcess(pid, start)) try { process.kill(pid, signal); } catch { /* gone */ }
+    for (const lease of aliveGroups()) try { process.kill(-lease.childPgid, signal); } catch { /* gone */ }
   };
   const settle = async (ms) => {
     const deadline = Date.now() + ms;

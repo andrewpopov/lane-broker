@@ -26,7 +26,8 @@ test('cancelling a queued ticket lets its supervisor exit instead of polling for
   const holdMs = scaledMs(2 * STARTUP_TIMEOUT_MS + 20 * globalConfig.sampleMs) + scaledMs(30_000);
   const holdSlot = `i=0; while [ ! -e "${release}" ] && [ $i -lt ${Math.ceil(holdMs / 200)} ]; do sleep 0.2; i=$((i+1)); done`;
   const blocker = laneSpawn(['run', '--repo', 'r', '--lane', 'default', '--', 'sh', '-c', holdSlot], { env, cwd: repoDir });
-  t.after(() => releaseAndReap(blocker, release, { state }));
+  const queuedSupervisors = [];
+  t.after(() => releaseAndReap(blocker, release, { state, known: queuedSupervisors }));
   await waitFor(
     () => {
       try {
@@ -63,6 +64,8 @@ test('cancelling a queued ticket lets its supervisor exit instead of polling for
   const queueFileName = fs.readdirSync(queueDir).find((n) => n.includes(queuedId));
   const ticket = JSON.parse(fs.readFileSync(path.join(queueDir, queueFileName), 'utf8'));
   const supervisorPid = ticket.supervisorPid;
+  // the cancel removes this ticket's queue file, so teardown can no longer find a supervisor that hangs afterwards: hand it over
+  queuedSupervisors.push({ pid: supervisorPid, start: ticket.supervisorStart });
   assert.ok(isPidAlive(supervisorPid), 'the queued ticket supervisor should be alive before cancel');
 
   const cancelResult = await laneRun(['cancel', queuedId], { env, cwd: repoDir });
@@ -76,5 +79,5 @@ test('cancelling a queued ticket lets its supervisor exit instead of polling for
   // forever must still fail this assertion by name.
   await waitFor(() => !isPidAlive(supervisorPid), { timeoutMs: 20 * globalConfig.sampleMs });
 
-  assert.equal((await releaseAndReap(blocker, release, { state })).escalated, false, 'the released blocker exits by itself');
+  assert.equal((await releaseAndReap(blocker, release, { state, known: queuedSupervisors })).escalated, false, 'the released blocker exits by itself');
 });
