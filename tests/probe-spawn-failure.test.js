@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import { processStartTime, isSupervisorAlive } from '../src/lease.js';
+import { isSupervisorAlive } from '../src/lease.js';
+import { psStartTime, procStartTicks } from '../src/process-liveness.js';
 import { freshEnv, writeGlobalConfig, writeRepoConfig } from './helpers.js';
 import { enqueue, tryStart, listQueue } from '../src/scheduler.js';
 import { loadGlobalConfig, resolveTicketConfig } from '../src/config.js';
@@ -22,9 +23,17 @@ function withBrokenPs(fn) {
 
 test('a failed probe spawn (status: null, e.g. ENOENT/EAGAIN) is indeterminate, not confirmed-gone', () => {
   withBrokenPs(() => {
-    const result = processStartTime(process.pid);
+    const result = psStartTime(process.pid);
     assert.equal(result, undefined, 'a spawn-level probe failure must return undefined (indeterminate), never null (confirmed gone)');
   });
+});
+
+test('the Linux /proc probe: an unreadable stat is indeterminate, only a vanished one is confirmed gone (PKG-423)', () => {
+  const failing = (code) => () => { throw Object.assign(new Error(code), { code }); };
+  assert.equal(procStartTicks(process.pid, failing('EACCES')), undefined);
+  assert.equal(procStartTicks(process.pid, failing('EAGAIN')), undefined);
+  assert.equal(procStartTicks(process.pid, failing('ENOENT')), null);
+  assert.equal(procStartTicks(process.pid, () => '1 (x) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 4242 0'), 'ticks:4242');
 });
 
 test('isSupervisorAlive fails closed when the liveness probe itself cannot run', () => {
