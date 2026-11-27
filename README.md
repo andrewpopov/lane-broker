@@ -112,6 +112,7 @@ features like pipes or globbing.
 | `--exclusive` | BRAIN-403 v1: claim the whole host for this run. A maintenance class (host upgrade, calibration), not a way to run tests: it requires both `--exclusive-purpose` and `--exclusive-deadline` (exit `64` without). See "Exclusive lanes (BRAIN-403 v1)" below. The lane config key `lanes.<name>.exclusive: true` does the same. |
 | `--exclusive-purpose upgrade\|calibration` | BRAIN-695: why the run needs the whole host. Config key `exclusivePurpose`. Without `--exclusive` it exits `64`. |
 | `--exclusive-deadline <dur>` | BRAIN-695: the hard limit on an exclusive run, from 60000 ms to 2 h: an integer in ms, or `30s`, `20m`, `2h`. Config key `exclusiveDeadlineMs` (integer ms). Without `--exclusive` it exits `64`. Not `--timeout`, which only stops *waiting* (exit `75`). |
+| `--tag <tag>` (repeatable), `--runner <name>` | PKG-468: tags this one ticket requires of a runner, added to the lane's `requiresTags`; `--runner x` is `--tag host:x`. See "Pinning a run to a runner" below. Needs a remote-eligible lane (exit `64` otherwise); no online runner can claim it: exit `76` with `waiting: no online runner has [host:x]`. |
 | `--no-cache` | BRAIN-549: run even if the same command already passed on identical content (env `LANE_BROKER_NO_CACHE=1` does the same). See "Result cache" below. |
 | `--no-reuse` | BRAIN-700: answer nothing from history: neither a cached pass nor a known-red refusal. Advertised as capability `reuse-green/1`. See "Known-red refusal" below. |
 | `--retry "<why>"` | BRAIN-700: re-run content that already failed (env `LANE_BROKER_RETRY_REASON`; the flag wins; blank is usage exit `2`). Also bypasses serving a pass. The reason is recorded on the history row as `retryReason`. |
@@ -1032,6 +1033,17 @@ the repo) lists `"requiresTags": ["browser"]`; the sets merge like `requires`. I
 the submitter sends `--tags browser` in the probe it already makes, the runner answers `tags: { browser: true|false }`, and a runner that
 lacks a tag, or an older one that answers nothing, is **not ready** and shows `missing tag browser` in `lane status`. Use it to keep a lane off
 a runner whose OS or tooling the repo does not support (Playwright on an unsupported distro) by leaving the tag off that runner.
+
+### Pinning a run to a runner (`--tag` / `--runner`, PKG-468)
+
+`lane run --runner evo-x2` runs the ticket only on the pull runner named `evo-x2`; `--tag t` (repeatable) adds any tag. It stays a **claim filter**, not a push: the ticket is enqueued with
+`requires_tags = <lane requiresTags> + <per-run tags>` and the queue's `eligible()` lets a runner claim it only when its principal's tags cover all of them.
+
+- **Identity tag.** Every agent principal carries `host:<its host>` in `lane_dispatch.principals.tags` (migration 012: a trigger adds it on insert and update, and drops any other `host:` tag an admin sets), so no runner needs config. `runnerTags` in a runner's own config stays plain names and cannot start with `host:`. Pinning is pull dispatch only: a push runner is not matched.
+- **Fail fast.** Before enqueuing, `lane run` asks `ld_placeable_detail(repo, tags)`: the agent principals that could claim it and when each last polled the queue. None registered: `waiting: no runner has [host:x]`; all of them silent for more than 120 s: `waiting: no online runner has [host:x]; offline: x (last seen 3h ago)`; both exit **76**, and nothing is enqueued. A host without pull dispatch refuses a `host:` pin outright (exit 76). A queue without migration 012 is asked `ld_placeable` instead, which still catches "no runner has it"; an unreachable queue skips the check. A pinned ticket is never locally eligible (`localIneligibilityOf`): no local-first, speed-aware choice, queue timeout or fallback runs it here, so a runner that goes offline after enqueue leaves the ticket queued; `lane status` shows `tags=[...]` on it.
+- **Result cache.** The effective tags join the content key of a run that has per-run tags, so the same content pinned to another machine is neither served another machine's pass nor refused (exit `79`) for another machine's failure; the ticket carries them as `contentKeyTags` so the finished run's history row is keyed the same way. A run without per-run tags keeps its old key.
+- **Old runners.** The filter is in the queue, so a runner of any version sees only tickets whose tags its principal covers; none needs an upgrade for pinning. The lane-broker release must be installed on the Mac that submits.
+- **Use.** `--runner` is a debugging and canary tool: it takes the ticket off every other runner, so a pin to a busy or drained runner waits for it.
 
 ### Keeping a lane off a scarce runner (`avoidTags`, BRAIN-1072)
 
@@ -3014,7 +3026,7 @@ released and cancel markers are removed with their ticket and nothing sweeps one
 | `2` | Bad CLI usage (missing command / argument). |
 | `64` | Nested `lane run` would widen the inherited lease — refused; or an invalid `--priority` / `LANE_BROKER_PRIORITY` / lane `priority`; or an invalid tier given to `lane priority`; or an `--exclusive` lane nested under another lane; or `exclusiveHooks` in host or repo config (not supported yet); or a remote-eligible command naming a path that exists only on this machine (BRAIN-721). |
 | `69` | Local-sim lane refused (fleet-offload message); use `--allow-local-sim`. |
-| `76` | A remote-only (`localRefused` + `remote`) lane found no runner able to take it right now (BRAIN-455). Retryable, unlike `69`; `--allow-local-sim` runs it here. |
+| `76` | A remote-only (`localRefused` + `remote`) lane found no runner able to take it right now (BRAIN-455). Also `lane run --tag/--runner` when no online runner carries the tags (PKG-468). Retryable, unlike `69`; `--allow-local-sim` runs it here. |
 | `74` | `lane wait`: the attempt's supervisor is gone (ORPHANED post-fallback, or MOVE-INTERRUPTED) and no result will ever be produced; `lane cancel` it. |
 | `75` | `--timeout` elapsed while still queued/running — **"waited, not failed."** Not a test failure; report it as such. Also `lane run` / `remote-exec` refused with "scheduler migration in progress" while `lane migrate-scheduler` runs, or "scheduler migration pending (draining)" while `--when-idle` waits. `lane priority` also exits `75` (nothing changed, retry) on a lock timeout, a migration in progress, or a ticket mid-rebind to a runner. `lane wait` also exits `75` for an ORPHANED-REMOTE attempt its runner could not settle (unreachable, unreadable global config): it may still settle. |
 | `77` | BRAIN-769: a ticket that fell back from a remote attempt to a local run failed to prepare the tree (`remoteDeps` install or `remoteSetup`); the command never ran, or the tree stayed held by another run past `localTreeLockWaitMs` (global config, positive integer ms, default 6 h). Prints `lane: local-setup failed (<phase>) — infrastructure, not the command`. |

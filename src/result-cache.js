@@ -59,9 +59,10 @@ function untrackedFingerprint(root) {
  * The content key of the worktree at `cwd` for one (lane key, command): sha256 over the lane key, the command
  * fingerprint, HEAD's tree, the binary `git diff HEAD` (every tracked edit, staged or not, and mode changes) and the
  * sorted path/mode/content-hash list of untracked non-ignored files. Ignored files are NOT in it (node_modules, build
- * output), nor is the environment: the key says "same source", not "same machine". Null = never cache this run.
+ * output), nor is the environment: the key says "same source", not "same machine", except that a run pinned by `--tag`/`--runner` (PKG-468) adds its required tags, so
+ * the same content aimed at another machine is its own run. Null = never cache this run.
  */
-export function computeContentKey({ cwd, key, cmdFingerprint, configIdentity = null }) {
+export function computeContentKey({ cwd, key, cmdFingerprint, configIdentity = null, requiredTags = [] }) {
   if (!key || !cmdFingerprint) return null;
   try {
     const [headTree, root] = git(cwd, ['rev-parse', 'HEAD^{tree}', '--show-toplevel']).toString('utf8').trim().split('\n');
@@ -72,7 +73,7 @@ export function computeContentKey({ cwd, key, cmdFingerprint, configIdentity = n
     const diff = git(root, ['diff', 'HEAD', '--binary', '--full-index', '--no-ext-diff', '--no-textconv', '--no-color', '--ignore-submodules=none']);
     const untracked = untrackedFingerprint(root);
     if (untracked === null) return null;
-    return digest([KEY_VERSION, key, cmdFingerprint, headTree, diff, untracked, ...(configIdentity ? [configIdentity] : [])]);
+    return digest([KEY_VERSION, key, cmdFingerprint, headTree, diff, untracked, ...(configIdentity ? [configIdentity] : []), ...(requiredTags.length > 0 ? [`required-tags:${requiredTags.join(',')}`] : [])]);
   } catch {
     return null;
   }
@@ -138,6 +139,6 @@ export const isCleanPass =(result) => result.exit === 0 && !result.signal;
  */
 export function settledContentKey(ticket) {
   if (!ticket.contentKey) return null;
-  const after = computeContentKey({ cwd: ticket.cwd, key: ticket.key, cmdFingerprint: ticket.cmdFingerprint, configIdentity: configIdentityOf(ticket) });
+  const after = computeContentKey({ cwd: ticket.cwd, key: ticket.key, cmdFingerprint: ticket.cmdFingerprint, configIdentity: configIdentityOf(ticket), requiredTags: ticket.contentKeyTags ?? [] });
   return after === ticket.contentKey ? after : null;
 }

@@ -15,7 +15,7 @@ import { listQueue } from './scheduler.js';
 import { writePending } from './pending.js';
 import { stampPriorityOrigin } from './priority-clock.js';
 import { isValidGroupId } from './priority.js';
-import { detectResourceCapacity, leaseResources, resolveTicketResources, capUnapprovedCpu, checkResourceBudget, localSimRefusal, dispatchOnlyRefusal, locallyRefusedNow } from './resources.js';
+import { NO_RUNNER_EXIT_CODE, detectResourceCapacity, leaseResources, resolveTicketResources, capUnapprovedCpu, checkResourceBudget, localSimRefusal, dispatchOnlyRefusal, locallyRefusedNow } from './resources.js';
 import { hostOnlyPaths, hostPathsRefusal } from './host-paths.js';
 import { acceptedLocalReason, LOCAL_REASON_CATEGORIES, localReasonRefusal } from './local-reason.js';
 import { argvFingerprint } from './cpu-estimates.js';
@@ -24,6 +24,7 @@ import { rightSizedCpuCores } from './right-size.js';
 import { scrubbedGitEnv } from './remote-manifest.js';
 import { isExclusive, oversizedWeight, oversizedWeightMessage, EXCLUSIVE_PURPOSES, exclusiveDeadlineProblem } from './exclusive.js';
 import { parseScrubCommandEnv, scrubCommandEnv, SCRUB_COMMAND_ENV_VAR } from './scrub-command-env.js';
+import { checkRunnable, effectiveRequiresTags } from './run-tags.js';
 import { computeContentKey, configIdentityOf, decideReuse } from './result-cache.js';
 import { detectPushGate, isSuperseded, PUSH_GATE_LANE } from './push-gate.js';
 
@@ -299,6 +300,8 @@ export async function runCommand({
   exclusivePurpose: exclusivePurposeOverride,
   exclusiveDeadline: exclusiveDeadlineOverride,
   // BRAIN-549: `--no-cache` (env LANE_BROKER_NO_CACHE=1 is the other way): run even when a cached pass exists
+  // PKG-468: `--tag <t>` / `--runner <name>` (= `--tag host:<name>`): tags this one ticket requires of a runner, on top of the lane's `requiresTags`
+  runTags,
   noCache,
   // BRAIN-700: `--no-reuse` (answer nothing from history) and `--retry "<why>"` (env LANE_BROKER_RETRY_REASON): re-run content that already failed
   noReuse,
@@ -490,6 +493,14 @@ export async function runCommand({
       return { exitCode: 64 };
     }
   }
+  const perRunTags = [...new Set(runTags ?? [])].sort();
+  if (perRunTags.length > 0) {
+    if (!remoteEligible) {
+      process.stderr.write(`lane run: --tag/--runner pins a run to a runner, but this run is not remote-eligible (lane "${resolved.lane}" runs here)\n`);
+      return { exitCode: 64 };
+    }
+    resolved = { ...resolved, requiresTags: effectiveRequiresTags(resolved.requiresTags, perRunTags) };
+  }
   const localReason = localReasonFor(resolved, remoteEligible, forced, exclusive);
   const configLocal = configLocalStamp(resolved, { remoteEligible, runnerIntake });
   const { headTree, checkoutRoot } = gitTreeAndRoot(cwd);
@@ -661,7 +672,7 @@ export async function runCommand({
   // BRAIN-549/700: a run gets a content key unless caching is off for it or both TTLs are 0; a runner (snapshot intake) and an exclusive never key.
   const passTtlMs = globalCfg.resultCacheTtlSec * 1000;
   const redTtlMs = globalCfg.knownRedTtlSec * 1000;
-  const contentKey = !runnerIntake && !exclusive && resolved.cache && (passTtlMs > 0 || redTtlMs > 0) ? computeContentKey({ cwd, key: resolved.key, cmdFingerprint, configIdentity: configIdentityOf(configProvenance) }) : null;
+  const contentKey = !runnerIntake && !exclusive && resolved.cache && (passTtlMs > 0 || redTtlMs > 0) ? computeContentKey({ cwd, key: resolved.key, cmdFingerprint, configIdentity: configIdentityOf(configProvenance), requiredTags: perRunTags.length > 0 ? resolved.requiresTags : [] }) : null;
   const envRetry = (process.env.LANE_BROKER_RETRY_REASON ?? '').trim();
   const retryReason = (retryReasonFlag !== undefined ? retryReasonFlag.trim() : envRetry).slice(0, RETRY_REASON_MAX) || undefined;
   // A client-supplied --id may be a resubmission of a ticket that already ran: its idempotent answer is that ticket, never a history verdict.
@@ -738,6 +749,13 @@ export async function runCommand({
   // advances the high-water mark. Under lock contention there is no trustworthy `nowEff` to read: an unlocked read
   // can be BEHIND the mark, which would back-date the origin and invent age. The origin is left null instead, and
   // `enqueue` assigns `nowEff` under the lock, so the ticket starts with zero age. `lane run` must not fail here.
+  if (perRunTags.length > 0) {
+    const runnable = await checkRunnable({ cfg: globalCfg, root, repoKey: resolved.repoId, tags: resolved.requiresTags });
+    if (!runnable.ok) {
+      process.stderr.write(`lane run: ${runnable.message}\n`);
+      return { exitCode: NO_RUNNER_EXIT_CODE };
+    }
+  }
   let prioOriginAt = null;
   try {
     prioOriginAt = await stampPriorityOrigin(root);
@@ -830,6 +848,7 @@ export async function runCommand({
     ...(cmdFingerprint ? { cmdFingerprint } : {}),
     ...(headTree ? { headTree } : {}),
     ...(contentKey ? { contentKey } : {}),
+    ...(contentKey && perRunTags.length > 0 ? { contentKeyTags: resolved.requiresTags } : {}),
     ...(retryReason ? { retryReason } : {}),
     ...configLocal,
     ...(localReason ? { localReason } : {}),

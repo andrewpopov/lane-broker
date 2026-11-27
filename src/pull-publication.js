@@ -6,7 +6,7 @@ import { relayedRanOn } from './ran-on.js';
 import { recordSettledResult, relayedPhases } from './supervisor.js';
 
 // exactly what `historyRow` and `settledContentKey` read from the ticket, so a result published by anyone lands as the supervisor's would
-const ENRICHED_FIELDS = ['id', 'key', 'repoId', 'lane', 'configLane', 'configFrom', 'configBlob', 'localFirst', 'exclusive', 'weight', 'resources', 'declaredCpuCores', 'command', 'cmdFingerprint', 'headTree', 'contentKey', 'retryReason', 'pushGate', 'localReason', 'localReasonText', 'cwd'];
+const ENRICHED_FIELDS = ['id', 'key', 'repoId', 'lane', 'configLane', 'configFrom', 'configBlob', 'localFirst', 'exclusive', 'weight', 'resources', 'declaredCpuCores', 'command', 'cmdFingerprint', 'headTree', 'contentKey', 'contentKeyTags', 'retryReason', 'pushGate', 'localReason', 'localReasonText', 'cwd'];
 
 export function publicationOf(enriched, { placement, attemptStartedAt, refusalExit }) {
   return {

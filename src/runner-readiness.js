@@ -21,6 +21,17 @@ export function isValidRequiresShape(requires) {
   return Array.isArray(requires) && requires.every((name) => typeof name === 'string' && EXECUTABLE_NAME_RE.test(name));
 }
 
+/** PKG-468: every pull runner implicitly carries `host:<runner name>` (the queue adds it to its principal's tags), so a ticket can be pinned to one runner. */
+export const HOST_TAG_PREFIX = 'host:';
+export const hostTag = (runnerName) => `${HOST_TAG_PREFIX}${runnerName}`;
+const TAG_NAME_RE = new RegExp(`^(${HOST_TAG_PREFIX})?${EXECUTABLE_NAME_RE.source.slice(1)}`);
+
+/** A per-run tag as `lane run --tag` may spell it: a plain tag name or a `host:<runner>` identity tag. */
+export const isValidRunTag = (tag) => typeof tag === 'string' && TAG_NAME_RE.test(tag);
+
+/** The tags a ticket requires: the lane's configured `requiresTags` plus this run's own, deduplicated and sorted. */
+export const effectiveRequiresTags = (configured = [], perRun = []) => [...new Set([...configured, ...perRun])].sort();
+
 /** True iff an executable file called `name` sits in a directory of `envPath`. */
 export function isOnPath(name, envPath = process.env.PATH ?? '') {
   return envPath.split(path.delimiter).some((dir) => {

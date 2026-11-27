@@ -49,7 +49,7 @@ import { effectiveWeightCapacity, detectResourceCapacity, checkResourceBudget, l
 import { downRunnerReasons, heartbeatUpRunners, recordReadiness, recordEnforcement } from './runner-unreachable.js';
 import { readinessNeeds, hasNeed } from './runner-readiness.js';
 import { reconcileRemoteAttempt } from './remote-reconcile.js';
-import { placeForPull } from './pull-placement.js';
+import { placeForPull, isPinnedToHost } from './pull-placement.js';
 import { publicationBindings, publicationOf } from './pull-publication.js';
 import { pullContextFor } from './pull-services.js';
 import { withRepoIdentity } from './pull-snapshot.js';
@@ -683,6 +683,8 @@ export function localIneligibilityOf(enriched, globalCfg, cpuLimit, { pullFallba
   // BRAIN-634: a dispatch-only host can never run anything; every caller treats that as "no local fallback" (no queue timeout,
   // no local-first, no speed-aware local choice, wait on a busy runner). It wins over a BRAIN-629 localWindow.
   if (isDispatchOnly(globalCfg)) return dispatchOnlyRefusal(enriched.lane);
+  // PKG-468: a ticket pinned to a runner runs there or nowhere, so no local-first, speed-aware, queue-timeout or fallback path may run it here
+  if (isPinnedToHost(enriched.remote?.requiresTags ?? [])) return { exitCode: LOCAL_REFUSED_EXIT_CODE, message: `lane run: lane "${enriched.lane}" is pinned to a runner (${enriched.remote.requiresTags.filter((t) => t.startsWith('host:')).join(', ')}) and never runs here\n` };
   if (!pullFallback && locallyRefusedNow(enriched, globalCfg)) return localSimRefusal(enriched.lane, enriched.class);
   if (enriched.maxExecutionCpuCores !== undefined && (cpuLimit?.mode === 'off' || cpuLimit?.available !== true)) {
     const error = new CpuLimitUnavailableError(cpuLimit?.reason ?? 'quota support unavailable', 'maxExecutionCpuCores was requested');
@@ -1284,15 +1286,16 @@ async function dispatchRemoteAttempt(root, enriched, globalCfg, abortSignal, reb
   async function dispatchViaPull(services, reason) {
     testDrainAt(root, 'dispatch');
     viaPull = true;
+    const requiredTags = enriched.remote.requiresTags ?? [];
     try {
-      await updateAttempt(root, enriched.id, gen, { transport: 'pull', ...placementField() }, { refuseWhileMigrating: true });
+      await updateAttempt(root, enriched.id, gen, { transport: 'pull', ...placementField(), ...(requiredTags.length > 0 ? { requiredTags } : {}) }, { refuseWhileMigrating: true });
     } catch (err) {
       if (!(err instanceof MigrationInProgressError)) throw err;
       process.stderr.write(`lane: ${err.message}\n`);
       await publishAndExit(gen, () => migrationRefusalResult(enriched));
       return { fallback: false };
     }
-    const line = `lane: queuing for pull dispatch: ${reason}\n`;
+    const line = `lane: queuing for pull dispatch: ${reason}${requiredTags.length > 0 ? `; waiting for a runner with [${requiredTags.join(', ')}]` : ''}\n`;
     process.stderr.write(line);
     writeBrokerLog(root, line);
     const [pullRunner] = pullRunners(globalCfg);

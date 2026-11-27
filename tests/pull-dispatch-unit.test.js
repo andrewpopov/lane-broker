@@ -66,6 +66,17 @@ const PLACEMENT = {
     }
   },
 
+  'PKG-468: a ticket pinned to host:<name> is enqueued even when this machine could run it now, and a pin nobody can claim is refused': async (load) => {
+    const { placeForPull } = await load('pull-placement.js');
+    const runnableHere = spies();
+    runnableHere.input.couldRunLocally = async () => true;
+    assert.equal((await placeForPull({ ...runnableHere.input, requiresTags: ['host:evo-x2'], pushChosen: false })).route, 'pull', 'a pin never runs here');
+    assert.equal((await placeForPull({ ...runnableHere.input, requiresTags: ['browser'], pushChosen: false })).route, 'local', 'an unpinned tag keeps today\'s local-first flow');
+    const nobody = spies({ placeable: 0 });
+    const refused = await placeForPull({ ...nobody.input, requiresTags: ['host:evo-x2'], pushChosen: false });
+    assert.equal(refused.route, 'refuse');
+  },
+
   'an unready or unreachable pull side is today\'s flow with the reason, never an enqueue': async (load) => {
     const { placeForPull } = await load('pull-placement.js');
     const unready = spies({ ready: { ready: false, reason: 'lifecycle rule' } });

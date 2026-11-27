@@ -109,6 +109,30 @@ const GUARDS = {
     assert.equal(await call(s1, 'ld_placeable', 'repoA', []), 2, 'a principal with max_claims 0 never counts');
   },
 
+  'every agent principal carries host:<its host>, an admin cannot set another host: tag, and a ticket pinned to one host is claimable only by it': async (w) => {
+    const [s1, admin, a1, a2] = [await w.as(logins.s1), await w.as(logins.admin), await w.as(logins.a1), await w.as(logins.a2)];
+    const tagsOf = async () => Object.fromEntries((await (await w.su()).query("SELECT host, tags FROM lane_dispatch.principals WHERE kind = 'agent'")).rows.map((r) => [r.host, r.tags]));
+    assert.deepEqual((await tagsOf()).a1, ['linux', 'fast', 'host:a1']);
+    assert.deepEqual((await tagsOf()).x, ['host:x']);
+    await call(admin, 'ld_set_principal', logins.a2, 'agent', 'a2', ['host:a1', 'linux'], ['*'], 1);
+    assert.deepEqual((await tagsOf()).a2, ['linux', 'host:a2'], 'a foreign host: tag is dropped');
+    assert.equal(await call(s1, 'ld_placeable', 'repoA', ['host:a2']), 1);
+    assert.equal(await call(s1, 'ld_placeable', 'repoA', ['host:nowhere']), 0);
+    await enqueue(s1, tid(1), { tags: ['host:a2'] });
+    assert.equal((await claim(a1, {})).status, 'none', 'a1 is eligible for the repo but is not host a2');
+    assert.equal((await claim(a2, {})).id, tid(1));
+  },
+
+  'ld_placeable_detail names the runners that could claim a ticket and when each last polled the queue': async (w) => {
+    const s1 = await w.as(logins.s1);
+    const detail = await call(s1, 'ld_placeable_detail', 'repoA', ['host:a2']);
+    assert.equal(detail.eligible, 1);
+    assert.equal(detail.runners[0].host, 'a2');
+    assert.ok(detail.runners[0].seenAgoS >= 0 && detail.runners[0].seenAgoS < 60);
+    assert.deepEqual(await call(s1, 'ld_placeable_detail', 'repoA', ['host:nowhere']), { eligible: 0, runners: [] });
+    assert.equal((await call(s1, 'ld_placeable_detail', 'repoB', [])).eligible, 2, 'a1 does not allow repoB');
+  },
+
   'ld_prune_candidates pages by keyset from a NULL first page and marks row_due; a half-null cursor raises': async (w) => {
     const { admin, ids } = await pruneSetup(w);
     const [a, b, c, d] = ids;
@@ -280,6 +304,12 @@ const CANARIES = [
   ['ld_cancel stores a server-authored result and a replay never upgrades confirmation', "'epoch', v_t.epoch, 'author', 'queue')", "'epoch', v_t.epoch)"],
   ['ld_placeable counts the agents eligible for the repo and tags', ' AND lane_dispatch.eligible(coalesce(p_requires_tags, \'{}\'), p_repo_key, p.tags, p.allowed_repos));', ');'],
   ['ld_placeable counts the agents eligible for the repo and tags', "p.kind = 'agent' AND p.max_claims > 0", "p.kind = 'agent'"],
+  ['every agent principal carries host:<its host>, an admin cannot set another host: tag, and a ticket pinned to one host is claimable only by it',
+    "|| ARRAY['host:' || NEW.host];", "|| '{}'::text[];"],
+  ['every agent principal carries host:<its host>, an admin cannot set another host: tag, and a ticket pinned to one host is claimable only by it',
+    "WHERE t NOT LIKE 'host:%'", 'WHERE true'],
+  ['ld_placeable_detail names the runners that could claim a ticket and when each last polled the queue',
+    "WHERE p.kind = 'agent' AND p.max_claims > 0 AND lane_dispatch.eligible(coalesce(p_requires_tags, '{}'), p_repo_key, p.tags, p.allowed_repos);", "WHERE p.kind = 'agent' AND p.max_claims > 0;"],
   ['ld_prune_candidates pages by keyset from a NULL first page and marks row_due; a half-null cursor raises',
     'OR (p_after_finished IS NOT NULL AND p_after_id IS NOT NULL AND (t.finished_at, t.id) > (p_after_finished, p_after_id)))', 'OR true)'],
   ['ld_prune_candidates pages by keyset from a NULL first page and marks row_due; a half-null cursor raises',

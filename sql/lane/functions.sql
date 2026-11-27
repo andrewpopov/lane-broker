@@ -1186,6 +1186,19 @@ BEGIN
   RETURN lane_dispatch.scarcity(p_requires_tags, p_repo_key);
 END $$;
 
+-- PKG-468: who could claim a ticket with these tags, and when each last polled the queue (NULL = never registered), so `lane run --runner x` can say why nothing will take it.
+CREATE OR REPLACE FUNCTION lane_dispatch.ld_placeable_detail(p_repo_key text, p_requires_tags text[]) RETURNS jsonb
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
+DECLARE v_me record; v_runners jsonb;
+BEGIN
+  PERFORM lane_dispatch.ld_entry();
+  SELECT * INTO v_me FROM lane_dispatch.me('submit');
+  SELECT coalesce(jsonb_agg(jsonb_build_object('host', p.host, 'seenAgoS', floor(extract(epoch FROM lane_dispatch.now() - r.last_seen))) ORDER BY p.host), '[]'::jsonb) INTO v_runners
+    FROM lane_dispatch.principals p LEFT JOIN lane_dispatch.runners r ON r.host = p.host
+   WHERE p.kind = 'agent' AND p.max_claims > 0 AND lane_dispatch.eligible(coalesce(p_requires_tags, '{}'), p_repo_key, p.tags, p.allowed_repos);
+  RETURN jsonb_build_object('eligible', jsonb_array_length(v_runners), 'runners', v_runners);
+END $$;
+
 CREATE OR REPLACE FUNCTION lane_dispatch.ld_prune_candidates(p_objects_after interval, p_rows_after interval, p_after_finished timestamptz DEFAULT NULL,
                                                              p_after_id uuid DEFAULT NULL, p_limit int DEFAULT 200) RETURNS jsonb
 LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, lane_dispatch, pg_temp AS $$
@@ -1413,7 +1426,7 @@ GRANT EXECUTE ON FUNCTION lane_dispatch.ld_register(text, int, jsonb), lane_disp
 GRANT EXECUTE ON FUNCTION lane_dispatch.ld_enqueue(uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real), lane_dispatch.ld_get(uuid),
   lane_dispatch.ld_list_mine(text[], int), lane_dispatch.ld_withdraw(uuid), lane_dispatch.ld_cancel(uuid), lane_dispatch.ld_attach_urls(uuid, int, jsonb),
   lane_dispatch.ld_log_read(uuid, int, int), lane_dispatch.ld_log_ack(uuid, int, int), lane_dispatch.ld_queue_ref(),
-  lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real), lane_dispatch.ld_placeable(text, text[]) TO lane_submit;
+  lane_dispatch.ld_enqueue_fenced(text, uuid, text, text, text, jsonb, jsonb, jsonb, text[], real, bigint, int, int, boolean, text, real, text[], text[], real), lane_dispatch.ld_placeable(text, text[]), lane_dispatch.ld_placeable_detail(text, text[]) TO lane_submit;
 GRANT EXECUTE ON FUNCTION lane_dispatch.ld_set_principal(text, text, text, text[], text[], int), lane_dispatch.ld_reap(interval, interval, interval),
   lane_dispatch.ld_restore_reset(), lane_dispatch.ld_guard(interval), lane_dispatch.ld_prune_candidates(interval, interval, timestamptz, uuid, int),
   lane_dispatch.ld_prune(uuid[], interval), lane_dispatch.ld_prune_chunks(interval, int), lane_dispatch.ld_blobs_live(jsonb) TO lane_admin;
