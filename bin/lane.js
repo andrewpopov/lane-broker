@@ -204,7 +204,8 @@ function parseRunArgs(args) {
         throw new Error(`lane run: unknown flag "${a}"`);
     }
   }
-  if (opts.ticketId !== undefined && !opts.detach) throw new Error('--id requires --detach');
+  const placed = opts.capabilityClass !== undefined || opts.avoidHosts !== undefined || opts.targetHost !== undefined;
+  if (opts.ticketId !== undefined && !opts.detach && !placed) throw new Error('--id requires --detach');
   return { opts, cmd };
 }
 

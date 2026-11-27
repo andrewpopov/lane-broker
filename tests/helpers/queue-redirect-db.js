@@ -14,9 +14,10 @@ export async function connect(config) {
   const failing = (process.env.LANE_TEST_QUEUE_FAIL ?? '').split(',').filter(Boolean);
   const query = client.query.bind(client);
   client.query = (sql, ...rest) => {
-    const stalled = typeof sql === 'string' && process.env.LANE_TEST_QUEUE_STALL && sql.includes(process.env.LANE_TEST_QUEUE_STALL);
-    if (stalled) return query('SELECT pg_sleep(60)');
-    const injected = typeof sql === 'string' ? failing.find((name) => sql.includes(name)) : undefined;
+    const text = typeof sql === 'string' ? sql : sql?.text;
+    const stalled = typeof text === 'string' && process.env.LANE_TEST_QUEUE_STALL && text.includes(process.env.LANE_TEST_QUEUE_STALL);
+    if (stalled) return query(typeof sql === 'string' ? 'SELECT pg_sleep(60)' : { text: 'SELECT pg_sleep(60)', query_timeout: sql.query_timeout });
+    const injected = typeof text === 'string' ? failing.find((name) => text.includes(name)) : undefined;
     if (injected === undefined) return query(sql, ...rest);
     if (process.env.LANE_TEST_QUEUE_FAILED) fs.appendFileSync(process.env.LANE_TEST_QUEUE_FAILED, `${injected}\n`);
     const code = process.env.LANE_TEST_QUEUE_FAIL_CODE;

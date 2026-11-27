@@ -15,6 +15,18 @@ const TOO_MANY_CONNECTIONS = '53300';
 // a 53300 happens before anything is sent, so every call retries it; a guard kill may follow a commit, so only idempotent calls retry that
 
 // SQL parameter types in order (a call sends as many as it has arguments, so a call that names none of the trailing defaults runs against an older schema); `idempotent` says whether a call that may already have committed can be sent again
+/** Closes the connection, but never past the caller's deadline: a peer that stalls during shutdown is cut off, and the row already received is still returned. */
+async function endWithin(client, deadlineAt) {
+  if (deadlineAt === undefined) return client.end();
+  let timer;
+  const expired = new Promise((resolve) => { timer = setTimeout(() => resolve('expired'), Math.max(0, deadlineAt - Date.now())); });
+  try {
+    if ((await Promise.race([client.end().then(() => 'ended', () => 'ended'), expired])) === 'expired') client.connection?.stream?.destroy();
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export const FUNCTIONS = {
   ld_queue_ref: { types: [], idempotent: true },
   ld_enqueue_fenced: { types: ['text', 'uuid', 'text', 'text', 'text', 'jsonb', 'jsonb', 'jsonb', 'text[]', 'real', 'bigint', 'int', 'int', 'boolean', 'text', 'real', 'text[]', 'text[]', 'real', 'text', 'text', 'text[]', 'text'], idempotent: false },
@@ -97,7 +109,7 @@ export function createQueueClient({
   const problem = laneQueueUrlProblem(url);
   if (problem !== null) throw new QueueError(`laneQueueUrl ${problem}`);
 
-  async function invoke(name, args, { attempts = MAX_ATTEMPTS, ...timeouts } = {}) {
+  async function invoke(name, args, { attempts = MAX_ATTEMPTS, deadlineAt, ...timeouts } = {}) {
     const { idempotent } = FUNCTIONS[name];
     const types = FUNCTIONS[name].types.slice(0, args.length);
     const sql = `SELECT lane_dispatch.${name}(${types.map((type, i) => `$${i + 1}::${type}`).join(', ')}) AS v`;
@@ -106,11 +118,15 @@ export function createQueueClient({
       let client;
       let phase = 'connect';
       try {
-        client = await connectClient(connectionConfig({ url, passwordFile, caFile }, timeouts));
+        if (deadlineAt !== undefined && deadlineAt - Date.now() <= 0) throw new QueueError(`${name} failed: the caller's deadline passed`, { code: 'ETIMEDOUT' });
+        client = await connectClient(connectionConfig({ url, passwordFile, caFile }, deadlineAt === undefined ? timeouts : { ...timeouts, connectTimeoutMs: Math.min(timeouts.connectTimeoutMs ?? QUEUE_CONNECT_TIMEOUT_MS, deadlineAt - Date.now()) }));
         client.on('error', () => {});
         phase = 'query';
-        const { rows: [row] } = await client.query(sql, values);
-        await client.end();
+        // under a caller's deadline the query is allowed what is left of it once connected, not a share fixed beforehand
+        const { rows: [row] } = deadlineAt === undefined
+          ? await client.query(sql, values)
+          : await client.query({ text: sql, values, query_timeout: Math.max(1, Math.min(timeouts.queryTimeoutMs ?? QUEUE_QUERY_TIMEOUT_MS, deadlineAt - Date.now())) });
+        await endWithin(client, deadlineAt);
         return row.v;
       } catch (err) {
         client?.connection?.stream?.destroy();

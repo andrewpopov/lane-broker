@@ -177,6 +177,13 @@ const SCENARIOS = {
         assert.equal(res.stdout, '');
       }
     }
+    for (const flags of [target('a2'), ['--class', 'linux']]) {
+      for (const argv of [['--id', id, ...flags], [...flags, '--id', id]]) {
+        const foreground = await fx.lane(['run', '--repo', 'r', '--lane', 'default', ...argv, '--', 'true']);
+        assert.equal(foreground.code, 64, `${argv.join(' ')} without --detach: ${foreground.stderr}`);
+        assert.match(foreground.stderr, /cannot be combined with --id; use --dispatch-key/);
+      }
+    }
     assert.equal(fx.queueCalls(), 0, 'no queue connection was made');
     assert.deepEqual(fx.supervisorExits(), []);
     assert.deepEqual(fs.existsSync(paths(fx.state).attempts) ? fs.readdirSync(paths(fx.state).attempts) : [], before, 'nothing was written');

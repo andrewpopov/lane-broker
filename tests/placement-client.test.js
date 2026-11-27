@@ -297,22 +297,52 @@ const SCENARIOS = {
     assert.deepEqual(await wait(realExit90, { supervisorEnded: Promise.resolve({ code: 90, signal: null }) }), { id: ID }, 'a command that exits 90 is not a placement signal');
   },
 
-  'one deadline bounds the alias probe, the key lookup and the waits: each call gets what is left, connect and query together never exceed it, and none or 0 is no deadline': async (load) => {
+  'one deadline bounds the alias probe, the key lookup, the teardown and the waits: each call gets the instant, a wait gets what is left read once, and none or 0 is no deadline': async (load) => {
     const { timeoutBudget } = await load('run-budget.js');
     let clock = 1000;
     const budget = timeoutBudget(3000, 1000, () => clock);
     assert.deepEqual([budget.bounded, budget.left(), budget.expired()], [true, 3000, false]);
-    assert.deepEqual(budget.limits(2000, 3000), { attempts: 1, connectTimeoutMs: 1500, queryTimeoutMs: 1500 });
+    assert.deepEqual(budget.limits(2000, 3000), { attempts: 1, connectTimeoutMs: 2000, queryTimeoutMs: 3000, deadlineAt: 4000 });
     clock += 2500;
-    const late = budget.limits(5000, 15000);
-    assert.deepEqual(late, { attempts: 1, connectTimeoutMs: 250, queryTimeoutMs: 250 }, 'the second call gets the remainder, not its cap');
-    assert.ok(late.connectTimeoutMs + late.queryTimeoutMs <= budget.left());
+    assert.deepEqual(budget.waitLeft(), { expired: false, timeoutMs: 500 });
     clock += 500;
-    assert.equal(budget.expired(), true);
+    assert.deepEqual([budget.expired(), budget.waitLeft()], [true, { expired: true }]);
     for (const none of [undefined, 0]) {
       const open = timeoutBudget(none, 0, () => 1e12);
-      assert.deepEqual([open.bounded, open.expired(), open.left(), open.limits(1, 1)], [false, false, null, undefined]);
+      assert.deepEqual([open.bounded, open.expired(), open.left(), open.limits(1, 1), open.waitLeft()], [false, false, null, undefined, { expired: false, timeoutMs: undefined }]);
     }
+    const reads = [1, 0];
+    const boundary = timeoutBudget(5, 0, () => 5 - reads.shift());
+    assert.deepEqual(boundary.waitLeft(), { expired: false, timeoutMs: 1 }, 'one clock read decides: 1 ms left is a wait of 1 ms, never 0 (no deadline)');
+    assert.equal(reads.length, 1, 'the clock was read once');
+  },
+
+  'a queue call under a deadline lets the query use what connecting left, and cuts off a peer that stalls during shutdown while still returning the row': async (load) => {
+    const { createQueueClient: create } = await load('queue-client.js');
+    const fs = await import('node:fs');
+    const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const files = secretFiles({ after() {} });
+    let destroyed = 0;
+    const stub = (queryMs, endsMs) => async () => ({
+      on() {},
+      connection: { stream: { destroy() { destroyed += 1; } } },
+      query: async (request) => {
+        const limit = request.query_timeout ?? 15_000;
+        await sleep(Math.min(queryMs, limit));
+        if (queryMs > limit) throw Object.assign(new Error('Query read timeout'), { code: 'ETIMEDOUT' });
+        return { rows: [{ v: 'answer' }] };
+      },
+      end: () => (endsMs === Infinity ? new Promise(() => {}) : sleep(endsMs)),
+    });
+    const callWith = (connectClient, deadlineIn) => create({ url: QUEUE_URL, ...files, connectClient }).knownHosts({ attempts: 1, connectTimeoutMs: 2000, queryTimeoutMs: 3000, deadlineAt: Date.now() + deadlineIn });
+    assert.equal(await callWith(stub(1400, 0), 2000), 'answer', 'a 1.4 s query under a 2 s deadline is not cut at half of it');
+    await assert.rejects(callWith(stub(2500, 0), 2000), /Query read timeout/, 'a query that cannot fit is still cut at the deadline');
+    const startedAt = Date.now();
+    assert.equal(await Promise.race([callWith(stub(10, Infinity), 600), sleep(4000).then(() => assert.fail('the caller was held past its deadline by a stalled shutdown'))]), 'answer', 'the row received is returned');
+    assert.ok(Date.now() - startedAt < 1500, 'a peer that stalls on shutdown does not hold the caller past the deadline');
+    assert.equal(destroyed >= 1, true, 'the stalled socket was destroyed');
+    await assert.rejects(callWith(stub(10, 0), -5), /deadline passed/);
+    assert.ok(fs);
   },
 
   'the detached wait of an unkeyed ticket that timed out hands back its id and says wait, never retry': async (load) => {
@@ -344,13 +374,15 @@ const CANARIES = [
   ['queue-client.js', ['const placed = namedPlaced || ', 'const placed = '], 'a v3 envelope must name a consistent placement: a platform with no class, a non-canonical class or list, a target that is avoided, or nothing at all is refused, and a placed envelope never selects the short enqueue', null],
   ['run.js', ['if (ended !== null && ended.code !== DUPLICATE_SUBMISSION_EXIT) return', 'if (ended !== null) return'], 'the detached wait of a duplicate supervisor (78) follows the original through its ack and a duplicate that never gets an answer times out 75', null],
   ['placement.js', ['typeof targetHost === \'string\' && ', ''], 'a v3 envelope must name a consistent placement: a platform with no class, a non-canonical class or list, a target that is avoided, or nothing at all is refused, and a placed envelope never selects the short enqueue', null],
-  ['run-budget.js', ['Math.max(1, Math.floor(left() / 2))', 'Math.floor(left())'], 'one deadline bounds the alias probe, the key lookup and the waits: each call gets what is left, connect and query together never exceed it, and none or 0 is no deadline', null],
+  ['run-budget.js', ['return ms <= 0 ? { expired: true }', 'return ms < 0 ? { expired: true }'], 'one deadline bounds the alias probe, the key lookup, the teardown and the waits: each call gets the instant, a wait gets what is left read once, and none or 0 is no deadline', null],
+  ['queue-client.js', ['if ((await Promise.race([client.end().then(() => \'ended\', () => \'ended\'), expired])) === \'expired\') client.connection?.stream?.destroy();', 'await client.end();'], 'a queue call under a deadline lets the query use what connecting left, and cuts off a peer that stalls during shutdown while still returning the row', null],
+  ['queue-client.js', ['Math.min(timeouts.queryTimeoutMs ?? QUEUE_QUERY_TIMEOUT_MS, deadlineAt - Date.now())', 'Math.floor((deadlineAt - Date.now()) / 2)'], 'a queue call under a deadline lets the query use what connecting left, and cuts off a peer that stalls during shutdown while still returning the row', null],
 ];
 
 for (const [name, scenario] of Object.entries(SCENARIOS)) test(name, (t) => scenario(realSrc, t));
 
 for (const [file, mutation, name] of CANARIES) {
   test(`canary (${file}): with "${mutation[0].slice(0, 60)}" mutated, "${name.slice(0, 70)}" fails`, async (t) => {
-    await assertCanaryFails(file, mutation, (load) => SCENARIOS[name](load, t), /^(Error: )?42883|^42883/);
+    await assertCanaryFails(file, mutation, (load) => SCENARIOS[name](load, t), /^(Error: )?42883|^42883|QueueError|Query read timeout/);
   });
 }

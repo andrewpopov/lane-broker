@@ -737,7 +737,10 @@ export async function runCommand({
     process.stderr.write(`lane run: waited ${timeoutMs}ms, not failed: ${what}\n`);
     return { exitCode: 75 };
   };
-  const waitWithinBudget = (waitId) => (budget.expired() ? timedOut(`the budget ran out before ${waitId} could be followed; next: lane wait ${waitId}`) : waitCommand(waitId, { timeoutMs: budget.bounded ? Math.ceil(budget.left()) : undefined }));
+  const waitWithinBudget = (waitId) => {
+    const wait = budget.waitLeft();
+    return wait.expired ? timedOut(`the budget ran out before ${waitId} could be followed; next: lane wait ${waitId}`) : waitCommand(waitId, { timeoutMs: wait.timeoutMs });
+  };
   let adoptionBlocked = false;
   // a host alias that is itself a known runner is refused before anything can be adopted; a probe that could not reach the queue is not a clean check
   if (placement !== null && placement.aliasesApplied.length > 0) {
