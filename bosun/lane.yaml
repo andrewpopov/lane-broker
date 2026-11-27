@@ -32,4 +32,4 @@ drain:
   hookTimeoutSeconds: 60
 resources:
   class: lane
-  elastic: false
+  elastic: true

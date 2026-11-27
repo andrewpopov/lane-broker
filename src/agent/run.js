@@ -6,6 +6,7 @@ import { ExecutionDriver } from './execution.js';
 import { createS3Client } from '../s3-client.js';
 import { Waker } from './waker.js';
 import { writeAgentMetrics } from './metrics.js';
+import { openBudgetShadow } from './budget.js';
 import { userManagerEnv } from '../cpu-limit.js';
 import { sampleDevice, updateDeviceGates } from '../device-gates.js';
 
@@ -28,7 +29,7 @@ const LIVENESS_CALLS = new Set(['ld_claim', 'ld_heartbeat', 'ld_register']);
  * The broker's home and state directory come from `config` and replace whatever the environment says, here and in the lane processes this
  * agent spawns, so a supervisor's minimal environment and an operator's shell behave the same.
  */
-export async function startAgent({ remoteRoot, config, version, log = (line) => process.stderr.write(`${line}\n`), figures, draining, now = Date.now, timing, s3 = s3ClientOf(config.rustfs), spawnEnv = process.env, laneBin, Driver = ExecutionDriver, coreOptions = {}, textfileDir = config.metricsTextfileDir ?? process.env.BOSUN_TEXTFILE_DIR, stopSettleMs = STOP_SETTLE_MS, platform = process.platform, driverOptions = {}, tools, deviceSampler = (gates) => sampleDevice(gates, { platform }) }) {
+export async function startAgent({ remoteRoot, config, version, log = (line) => process.stderr.write(`${line}\n`), figures, draining, now = Date.now, timing, s3 = s3ClientOf(config.rustfs), spawnEnv = process.env, laneBin, Driver = ExecutionDriver, coreOptions = {}, textfileDir = config.metricsTextfileDir ?? process.env.BOSUN_TEXTFILE_DIR, stopSettleMs = STOP_SETTLE_MS, platform = process.platform, driverOptions = {}, tools, deviceSampler = (gates) => sampleDevice(gates, { platform }), budgetOptions = {} }) {
   const brokerEnv = { LANE_BROKER_HOME: config.brokerHome, LANE_BROKER_STATE: config.stateDir, ...userManagerEnv({ ...process.env, ...spawnEnv }, { platform }) };
   Object.assign(process.env, brokerEnv);
   const readBrokerConfig = brokerConfigReader({ log });
@@ -47,6 +48,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
     await core.close();
     throw new AgentConfigError(`"runnerName" is ${config.runnerName} but the queue registers this login as ${core.ld.registered.host}`);
   }
+  const budget = openBudgetShadow({ readConfig: readBrokerConfig, records: () => core.table.all(), log, now, ...budgetOptions });
   const laneEnv = { ...spawnEnv, ...brokerEnv };
   const claimTools = tools ?? (() => presentTools({ ld: core.ld, envPath: laneEnv.PATH }));
   driver = new Driver({ core, remoteRoot, config, s3, timing, waker, log, spawnEnv: laneEnv, laneBin, draining: isDrainingNow, now, onScopeChange: () => { poked = true; waker.poke(); }, ...driverOptions });
@@ -67,7 +69,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
     if (!textfileDir || tickAt - metricsWrittenAt < config.pollMs) return;
     metricsWrittenAt = tickAt;
     try {
-      writeAgentMetrics(textfileDir, { now: now(), records: core.table.all(), claimed, claimAttempts, listening: core.ld.listening, registered: core.ld.registeredOnConnection, scopeAvailable: driver.scopeAvailable, version, deviceGates });
+      writeAgentMetrics(textfileDir, { now: now(), records: core.table.all(), claimed, claimAttempts, listening: core.ld.listening, registered: core.ld.registeredOnConnection, scopeAvailable: driver.scopeAvailable, version, deviceGates, budgetShadow: budget.shadow() });
     } catch (err) {
       log(`metrics: ${err.message}`);
     }
@@ -138,6 +140,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
         const blocked = block();
         core.tick({ claims: upgradeRequired ? 'stopped: upgrade required' : blocked ? `paused:${blocked}` : 'running', drains: drainsOf(config.stateDir), ...(Object.keys(deviceGates).length ? { deviceGates: deviceGateStatus() } : {}) });
         writeMetrics(tickAt);
+        budget.heartbeat();
       }
       const lastSignOfLife = () => Math.max(lastLivenessAt, pingAt);
       if (!stopped && now() - lastSignOfLife() >= config.pollMs) {
@@ -157,6 +160,7 @@ export async function startAgent({ remoteRoot, config, version, log = (line) => 
       await driver.close({ settleMs: stopSettleMs });
       await core.close();
       await done;
+      await budget.close();
     },
   };
 }

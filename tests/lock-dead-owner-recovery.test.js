@@ -160,7 +160,8 @@ test('MUTATION: the pre-fix blind rmSync reintroduces overlap on the same dead-o
   const source = fs.readFileSync(stateJsPath, 'utf8');
   const guarded = 'const won = recoverDeadLock(root, lockDir, ownerFile, owner);';
   assert.ok(source.includes(guarded), 'expected the atomic-takeover call site in state.js; test needs updating');
-  const mutated = source.replace(
+  const livenessUrl = new URL('../src/process-liveness.js', import.meta.url).href;
+  const mutated = source.replace("from './process-liveness.js'", `from '${livenessUrl}'`).replace(
     guarded,
     `const gate = path.join(root, '..');
       fs.writeFileSync(path.join(gate, 'observed-' + process.pid), '');
@@ -186,7 +187,6 @@ test('MUTATION: the pre-fix blind rmSync reintroduces overlap on the same dead-o
   const mutantDir = fs.realpathSync(makeTmpDir('lane-broker-mutant-state-'));
   const mutantPath = path.join(mutantDir, 'state.js');
   fs.writeFileSync(mutantPath, mutated);
-  fs.copyFileSync(fileURLToPath(new URL('../src/process-liveness.js', import.meta.url)), path.join(mutantDir, 'process-liveness.js')); // state.js imports it
   const stateJsUrl = pathToFileURL(mutantPath).href;
 
   const env = freshEnv();
